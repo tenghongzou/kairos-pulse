@@ -3,9 +3,8 @@ use std::io::Result;
 use tokio_native_tls::TlsConnector;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use native_tls::TlsConnector as NativeTlsConnector;
-use tokio::time::{sleep, Duration};
-use log::{info, error};
+// use native_tls::TlsConnector as NativeTlsConnector;
+use log::{info};
 use std::io;
 
 #[derive(Serialize)]
@@ -16,41 +15,52 @@ struct SystemInfo {
     hostname: String,
 }
 
-pub async fn send_system_info_periodically() {
+pub async fn send_system_info_periodically(
+    server_address: String,
+    server_port: u16,
+    max_retries: usize,
+    initial_delay: u64,
+) {
+    let server = format!("{}:{}", server_address, server_port);
+
     loop {
-        if let Err(e) = send_system_info_with_retry(5).await {
-            error!("重試失敗，放棄本次發送: {}", e);
+        if let Err(e) = send_system_info_with_retry(&server, max_retries, initial_delay).await {
+            log::error!("重試失敗，放棄本次發送: {}", e);
         }
-        sleep(Duration::from_secs(10)).await; // 等待後繼續下一次週期性發送
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
 }
 
-async fn send_system_info_with_retry(max_retries: usize) -> Result<()> {
+async fn send_system_info_with_retry(
+    server: &str,
+    max_retries: usize,
+    initial_delay: u64,
+) -> Result<()> {
     let mut retries = 0;
-    let mut delay = 2; // 初始重試延遲（秒）
+    let mut delay = initial_delay;
 
     while retries < max_retries {
-        match send_system_info().await {
+        match send_system_info(server).await {
             Ok(_) => {
-                info!("資料成功發送");
-                return Ok(()); // 發送成功，退出重試
+                log::info!("資料成功發送");
+                return Ok(());
             }
             Err(e) => {
                 retries += 1;
-                error!(
+                log::error!(
                     "連線失敗 (第 {}/{}) 次嘗試: {}，將在 {} 秒後重試",
                     retries, max_retries, e, delay
                 );
-                sleep(Duration::from_secs(delay)).await;
-                delay *= 2; // 指數回退策略：延長重試間隔
+                tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+                delay *= 2;
             }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::Other, "重試次數已達上限"))
 }
 
-async fn send_system_info() -> Result<()> {
-    let server_address = "127.0.0.1:8080"; // 使用伺服器的域名與端口
+async fn send_system_info(server: &str) -> Result<()> {
+    let server_address = server; // 使用伺服器的域名與端口
 
     // 建立不驗證憑證的 TLS Connector
     let mut builder = native_tls::TlsConnector::builder();

@@ -1,0 +1,13 @@
+[server]
+address = "127.0.0.1"
+port = 8080
+
+[retry]
+max_retries = 5
+initial_delay = 2  # 初始延遲（秒）
+
+[heartbeat]
+interval = 1  # 心跳間隔（秒）
+
+[log]
+level = "info"  # 日誌級別（trace, debug, info, warn, error）
