@@ -3,8 +3,39 @@ mod system_info;
 mod network;
 mod config_manager;
 
-use log::LevelFilter;
 use config_manager::AppConfig;
+use log::{debug, info};
+use std::fs::create_dir_all;
+
+fn setup_logger(log_level: &str) -> Result<(), fern::InitError> {
+    // 確保日誌目錄存在
+    create_dir_all("logs")?;
+
+    let log_level = match log_level {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info,
+    };
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                message
+            ))
+        })
+        .level(log_level)
+        .chain(std::io::stdout()) // 日誌輸出到終端
+        .chain(fern::log_file("logs/pulse.log")?) // 日誌輸出到檔案
+        .apply()?;
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -12,19 +43,10 @@ async fn main() {
     let config = AppConfig::from_file("config.toml").expect("無法讀取配置檔案");
 
     // 初始化日誌
-    env_logger::Builder::new()
-        .filter(None, match config.log.level.as_str() {
-            "trace" => LevelFilter::Trace,
-            "debug" => LevelFilter::Debug,
-            "info" => LevelFilter::Info,
-            "warn" => LevelFilter::Warn,
-            "error" => LevelFilter::Error,
-            _ => LevelFilter::Info,
-        })
-        .init();
+    setup_logger(&config.log.level).expect("無法初始化日誌");
 
-    log::info!("Pulse 地端程式啟動...");
-    log::debug!("使用的配置: {:?}", config);
+    info!("Pulse 地端程式啟動...");
+    debug!("使用的配置: {:?}", config);
 
     // 收集並顯示系統資訊
     system_info::get_system_info();
@@ -42,7 +64,7 @@ async fn main() {
             config.retry.max_retries,
             config.retry.initial_delay,
         )
-            .await;
+        .await;
     });
 
     // 保持主程式運行
