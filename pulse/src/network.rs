@@ -3,17 +3,10 @@ use std::io::Result;
 use tokio_native_tls::TlsConnector;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
-// use native_tls::TlsConnector as NativeTlsConnector;
-use log::{info};
+use log::info;
 use std::io;
 
-#[derive(Serialize)]
-struct SystemInfo {
-    cpu_usage: f32,
-    total_memory: u64,
-    used_memory: u64,
-    hostname: String,
-}
+use crate::system_info::{SystemInfo, get_real_system_info};
 
 pub async fn send_system_info_periodically(
     server_address: String,
@@ -76,13 +69,8 @@ async fn send_system_info(server: &str) -> Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     info!("已建立 TLS 加密連線");
 
-    // 模擬系統資訊（可改為從 `system_info` 模組獲取真實數據）
-    let system_info = SystemInfo {
-        cpu_usage: 12.5,
-        total_memory: 8192,
-        used_memory: 2048,
-        hostname: "localhost".to_string(),
-    };
+    // 獲取真實系統資訊
+    let system_info = get_real_system_info();
 
     // 序列化為 JSON
     let json_data = serde_json::to_string(&system_info)?;

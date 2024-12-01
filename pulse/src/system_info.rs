@@ -1,6 +1,15 @@
+use serde::Serialize;
 use sysinfo::{
     Components, Disks, Networks, System,
 };
+
+#[derive(Serialize)]
+pub(crate) struct SystemInfo {
+    cpu_usage: f32,
+    total_memory: u64,
+    used_memory: u64,
+    hostname: String,
+}
 
 pub fn get_system_info() {
     // 初始化系統資訊
@@ -65,5 +74,27 @@ pub fn get_system_info() {
             component.label(),
             component.temperature()
         );
+    }
+}
+
+pub fn get_real_system_info() -> SystemInfo {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // 計算 CPU 使用率
+    let cpu_usage: f32 = sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum();
+
+    // 獲取記憶體資訊
+    let total_memory = sys.total_memory() / 1024; // MB
+    let used_memory = sys.used_memory() / 1024;   // MB
+
+    // 獲取主機名稱
+    let hostname = System::host_name().unwrap_or_else(|| "Unknown".to_string());
+
+    SystemInfo {
+        cpu_usage,
+        total_memory,
+        used_memory,
+        hostname,
     }
 }
