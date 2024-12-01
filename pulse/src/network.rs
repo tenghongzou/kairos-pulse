@@ -1,12 +1,13 @@
-use serde::Serialize;
 use std::io::Result;
 use tokio_native_tls::TlsConnector;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use log::info;
 use std::io;
 
-use crate::system_info::{SystemInfo, get_real_system_info};
+use crate::system_info::{get_real_system_info};
 
 pub async fn send_system_info_periodically(
     server_address: String,
@@ -14,13 +15,20 @@ pub async fn send_system_info_periodically(
     max_retries: usize,
     initial_delay: u64,
 ) {
-    let server = format!("{}:{}", server_address, server_port);
+    let server = Arc::new(format!("{}:{}", server_address, server_port));
+    let semaphore = Arc::new(Semaphore::new(100));
 
     loop {
-        if let Err(e) = send_system_info_with_retry(&server, max_retries, initial_delay).await {
-            log::error!("重試失敗，放棄本次發送: {}", e);
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        let server_owned = Arc::clone(&server);
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            if let Err(e) = send_system_info_with_retry(&server_owned, max_retries, initial_delay).await {
+                eprintln!("Error: {}", e);
+            }
+            drop(permit);
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await; // 每秒啟動一次任務
     }
 }
 

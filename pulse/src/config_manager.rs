@@ -1,5 +1,4 @@
-use std::path::Path;
-use config::{Config, ConfigError, File};
+use config::{Config};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -33,21 +32,10 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn from_file(path: &str) -> Result<Self, ConfigError> {
-        let path = Path::new(path);
-
-        let builder = Config::builder()
-            .add_source(File::from(path).required(true));
-
-        let settings = builder.build()?;
-
-        settings.try_deserialize()
-    }
-
     pub fn from_embedded() -> Self {
         // 使用 include_str! 讀取嵌入的配置
         let embedded_config = include_str!("../config.toml");
-        let mut cfg = Config::builder()
+        let cfg = Config::builder()
             .add_source(config::File::from_str(embedded_config, config::FileFormat::Toml))
             .build()
             .unwrap();
