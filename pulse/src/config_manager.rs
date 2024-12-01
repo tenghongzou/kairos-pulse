@@ -43,4 +43,14 @@ impl AppConfig {
 
         settings.try_deserialize()
     }
+
+    pub fn from_embedded() -> Self {
+        // 使用 include_str! 讀取嵌入的配置
+        let embedded_config = include_str!("../config.toml");
+        let mut cfg = Config::builder()
+            .add_source(config::File::from_str(embedded_config, config::FileFormat::Toml))
+            .build()
+            .unwrap();
+        cfg.try_deserialize().unwrap()
+    }
 }

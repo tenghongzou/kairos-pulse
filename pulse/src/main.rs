@@ -40,7 +40,8 @@ fn setup_logger(log_level: &str) -> Result<(), fern::InitError> {
 #[tokio::main]
 async fn main() {
     // 讀取配置檔案
-    let config = AppConfig::from_file("config.toml").expect("無法讀取配置檔案");
+    // let config = AppConfig::from_file("config.toml").expect("無法讀取配置檔案");
+    let config = AppConfig::from_embedded();
 
     // 初始化日誌
     setup_logger(&config.log.level).expect("無法初始化日誌");
