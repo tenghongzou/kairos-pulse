@@ -39,9 +39,8 @@ fn setup_logger(log_level: &str) -> Result<(), fern::InitError> {
 
 #[tokio::main]
 async fn main() {
-    // 讀取配置檔案
-    // let config = AppConfig::from_file("config.toml").expect("無法讀取配置檔案");
-    let config = AppConfig::from_embedded();
+    // 讀取編譯時嵌入的配置檔案
+    let config = AppConfig::from_embedded().expect("無法解析嵌入的設定檔 config.toml");
 
     // 初始化日誌
     setup_logger(&config.log.level).expect("無法初始化日誌");
@@ -53,8 +52,9 @@ async fn main() {
     system_info::get_system_info();
 
     // 啟動心跳功能
+    let heartbeat_interval = config.heartbeat.interval;
     tokio::spawn(async move {
-        heartbeat::send_heartbeat(config.heartbeat.interval).await;
+        heartbeat::send_heartbeat(heartbeat_interval).await;
     });
 
     // 啟動週期性發送系統資訊
@@ -62,6 +62,9 @@ async fn main() {
         network::send_system_info_periodically(
             config.server.address,
             config.server.port,
+            config.server.domain,
+            config.server.accept_invalid_certs,
+            config.report.interval,
             config.retry.max_retries,
             config.retry.initial_delay,
         )

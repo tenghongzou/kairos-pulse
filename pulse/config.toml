@@ -1,6 +1,11 @@
 [server]
 address = "127.0.0.1"
 port = 8080
+# TLS 用的主機名稱（SNI / 憑證 CN/SAN 驗證）；正式環境請填實際伺服器域名
+domain = "localhost"
+# 是否略過 TLS 憑證驗證。⚠️ 僅供本機自簽憑證的開發測試使用，
+# 正式環境務必設為 false，否則容易遭中間人攻擊。
+accept_invalid_certs = true
 
 [retry]
 max_retries = 5
@@ -8,6 +13,9 @@ initial_delay = 2  # 初始延遲（秒）
 
 [heartbeat]
 interval = 1  # 心跳間隔（秒）
+
+[report]
+interval = 5  # 系統資訊回報間隔（秒）
 
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error）
