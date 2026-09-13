@@ -2,11 +2,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::{ServerConfig, Certificate, PrivateKey};
-use rustls_pemfile::Item;
-use std::fs::File;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use std::future::Future;
-use std::io::{BufRead, BufReader, Error, ErrorKind};
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,23 +79,18 @@ async fn with_timeout<T>(
 
 // 載入證書與私鑰檔案
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, Error> {
-    let cert_file = &mut BufReader::new(open_file(cert_path)?);
-    let key_file = &mut BufReader::new(open_file(key_path)?);
-
-    let certs: Vec<Certificate> = rustls_pemfile::certs(cert_file)?
-        .into_iter()
-        .map(Certificate)
-        .collect();
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| pem_error(cert_path, "證書", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pem_error(cert_path, "證書", e))?;
     if certs.is_empty() {
         return Err(Error::new(ErrorKind::InvalidInput, format!("{} 中找不到證書", cert_path)));
     }
 
-    let key = read_private_key(key_file)?.ok_or_else(|| {
-        Error::new(ErrorKind::InvalidInput, format!("{} 中找不到私鑰", key_path))
-    })?;
+    // 讀取第一把私鑰，接受 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
+    let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| pem_error(key_path, "私鑰", e))?;
 
     let config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| Error::new(ErrorKind::InvalidData, e))?; // 手動將錯誤轉換為 std::io::Error
@@ -103,18 +98,11 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, Erro
     Ok(config)
 }
 
-// 開啟檔案，錯誤訊息附上路徑以便判斷是哪個檔案出問題
-fn open_file(path: &str) -> Result<File, Error> {
-    File::open(path).map_err(|e| Error::new(e.kind(), format!("無法開啟 {}: {}", path, e)))
-}
-
-// 讀取第一把私鑰，接受 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
-fn read_private_key(reader: &mut dyn BufRead) -> Result<Option<PrivateKey>, Error> {
-    while let Some(item) = rustls_pemfile::read_one(reader)? {
-        match item {
-            Item::PKCS8Key(key) | Item::RSAKey(key) | Item::ECKey(key) => return Ok(Some(PrivateKey(key))),
-            _ => {}
-        }
+// 將 PEM 解析錯誤轉換為 std::io::Error，錯誤訊息附上路徑以便判斷是哪個檔案出問題
+fn pem_error(path: &str, item: &str, e: pem::Error) -> Error {
+    match e {
+        pem::Error::Io(e) => Error::new(e.kind(), format!("無法開啟 {}: {}", path, e)),
+        pem::Error::NoItemsFound => Error::new(ErrorKind::InvalidInput, format!("{} 中找不到{}", path, item)),
+        e => Error::new(ErrorKind::InvalidData, format!("{} 中的{}格式錯誤: {}", path, item, e)),
     }
-    Ok(None)
 }
