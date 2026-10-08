@@ -32,3 +32,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 tokio-util = { version = "0.7", features = ["codec"] }
 # agent_id 產生
 uuid = { version = "1.27", features = ["v4"] }
+
+[dev-dependencies]
+# 不是新依賴：只為測試多開 tokio 的 test-util（tokio::time::pause / 自動推進時間）
+tokio = { version = "1.53", features = ["test-util"] }

@@ -2,12 +2,16 @@
 //!
 //! - 讀檔時去除 UTF-8 BOM 與前後空白，並要求為 UUID 文字格式（8-4-4-4-12 十六進位，共 36 字元）。
 //!   格式不合法時回傳錯誤讓程式結束，**不會**默默換新 ID（避免伺服器端身分改變）。
+//!   檔案超過 `MAX_ID_FILE_SIZE` 時不讀完整個檔案，直接報錯。
+//! - 識別不分大小寫：讀入後一律轉為小寫（與伺服器的正規化一致），檔案本身不改寫。
+//! - 未啟用 mTLS 時 agent_id 就是身分憑據：Unix 上新建的檔案權限為 0600（僅擁有者可讀寫），
+//!   既有檔案若可被其他使用者讀取會記 warn。Windows 上權限繼承自所在目錄。
 //! - 寫檔不會覆蓋既有檔案：先寫入暫存檔並 sync，再以 hard link 發佈（目的檔已存在則失敗）；
 //!   檔案系統不支援 hard link 時退回以 create_new 直接建立。
 //!   兩個實例同時首次啟動時，後到者會改讀先到者的檔案，兩者使用同一個 ID。
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// UTF-8 BOM（Windows 記事本存檔時可能加上）。
@@ -16,6 +20,10 @@ const UTF8_BOM: char = '\u{feff}';
 /// 讀到空的 agent_id 檔案（可能是另一個實例尚未寫完）時的重試次數與間隔（合計約 1 秒）。
 const EMPTY_FILE_RETRIES: u32 = 20;
 const EMPTY_FILE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// agent_id 檔案大小上限（bytes）。合法內容只有 36 字元加上 BOM / 空白，
+/// 上限只是避免誤指到大型檔案時把整個檔案讀進記憶體。
+const MAX_ID_FILE_SIZE: u64 = 1024;
 
 /// 讀取 `path` 中的 agent_id；檔案不存在時產生新的 UUID v4 並寫入。
 ///
@@ -59,21 +67,49 @@ fn read_existing(path: &Path) -> io::Result<Option<String>> {
     validate(path, read_trimmed(path)?)
 }
 
-/// 讀檔並去除 UTF-8 BOM 與前後空白；檔案不存在時回傳 `Ok(None)`。
+/// 讀檔（最多 `MAX_ID_FILE_SIZE` bytes）並去除 UTF-8 BOM 與前後空白；檔案不存在時回傳 `Ok(None)`。
 fn read_trimmed(path: &Path) -> io::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(
-            content.trim_start_matches(UTF8_BOM).trim().to_string(),
-        )),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io::Error::new(
+    let read_err = |e: io::Error| {
+        io::Error::new(
             e.kind(),
             format!("無法讀取 agent_id 檔案 {}：{e}", path.display()),
-        )),
+        )
+    };
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(read_err(e)),
+    };
+    // 多讀 1 byte 以判斷是否超過上限
+    let mut buf = Vec::new();
+    file.take(MAX_ID_FILE_SIZE + 1)
+        .read_to_end(&mut buf)
+        .map_err(read_err)?;
+    if buf.len() as u64 > MAX_ID_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "agent_id 檔案 {} 超過 {MAX_ID_FILE_SIZE} bytes，不是有效的 agent_id 檔案；\
+                 請確認 agent.id_file 是否指錯檔案，或刪除此檔案後重新啟動以產生新的 agent_id",
+                path.display()
+            ),
+        ));
     }
+    let content = String::from_utf8(buf).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "agent_id 檔案 {} 不是 UTF-8 文字；若要重新產生 agent_id，請刪除此檔案後重新啟動",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(Some(
+        content.trim_start_matches(UTF8_BOM).trim().to_string(),
+    ))
 }
 
-/// 驗證內容為 UUID 文字格式。
+/// 驗證內容為 UUID 文字格式，並轉為小寫（agent_id 不分大小寫，伺服器以小寫為準）。
 fn validate(path: &Path, content: Option<String>) -> io::Result<Option<String>> {
     let Some(id) = content else {
         return Ok(None);
@@ -89,7 +125,31 @@ fn validate(path: &Path, content: Option<String>) -> io::Result<Option<String>> 
             ),
         ));
     }
-    Ok(Some(id))
+    Ok(Some(id.to_ascii_lowercase()))
+}
+
+/// Unix：agent_id 檔案可被群組或其他使用者讀取時，回傳警告訊息（不自動修改權限）。
+///
+/// 由呼叫端決定輸出方式（一般模式寫日誌；`--print-agent-id` 尚未初始化日誌，改寫 stderr）。
+/// 讀不到檔案資訊時回傳 `None`。
+#[cfg(unix)]
+pub fn permission_warning(path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "agent_id 檔案 {} 的權限為 {mode:o}，其他使用者可讀取；未啟用 mTLS 時 agent_id 等同身分憑據，\
+             建議執行 chmod 600 {}",
+            path.display(),
+            path.display()
+        )
+    })
+}
+
+/// 非 Unix：權限由所在目錄的 ACL 決定，不檢查。
+#[cfg(not(unix))]
+pub fn permission_warning(_path: &Path) -> Option<String> {
+    None
 }
 
 /// 以原子方式寫入新檔，不覆蓋既有檔案。
@@ -139,8 +199,18 @@ fn publish_with_create_new(path: &Path, content: &str) -> io::Result<bool> {
 }
 
 /// 建立新檔（已存在則以 `AlreadyExists` 失敗）、寫入並 `sync_all`。
+///
+/// Unix 上以 0600 建立（僅擁有者可讀寫）；暫存檔以 hard link 發佈，目的檔共用同一個 inode，
+/// 權限相同。
 fn write_new_file(path: &Path, content: &str) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()
 }
@@ -257,7 +327,62 @@ mod tests {
 
         let (id, created) = load_or_create(&path).unwrap();
         assert!(!created);
-        assert_eq!(id, "6F1C0E4A-1b2c-4d3e-9f00-112233445566");
+        // X3：讀入後轉為小寫，檔案本身不改寫
+        assert_eq!(id, "6f1c0e4a-1b2c-4d3e-9f00-112233445566");
+        assert!(fs::read_to_string(&path).unwrap().contains("6F1C0E4A-1b2c"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_or_non_utf8_file_is_rejected() {
+        // P11：超過上限不讀完整個檔案，直接報錯
+        let dir = temp_dir("oversize");
+        let path = dir.join("agent.id");
+        let id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        // 剛好在上限內（前後空白）仍可接受
+        let padded = format!("{id}{}", " ".repeat(MAX_ID_FILE_SIZE as usize - id.len()));
+        fs::write(&path, &padded).unwrap();
+        assert_eq!(load_or_create(&path).unwrap().0, id);
+        // 超過 1 byte → 錯誤，且不會換新 ID
+        fs::write(&path, format!("{padded} ")).unwrap();
+        let err = load_or_create(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("超過 1024 bytes"), "{err}");
+        // 大型檔案
+        fs::write(&path, vec![b'a'; 10 * 1024 * 1024]).unwrap();
+        assert!(load_or_create(&path).is_err());
+        // 非 UTF-8
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let err = load_or_create(&path).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_file_is_owner_only_on_unix() {
+        // P3：未啟用 mTLS 時 agent_id 等同身分憑據
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        let path = dir.join("agent.id");
+        load_or_create(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        // 退回路徑（create_new）同樣是 0600
+        let path2 = dir.join("agent2.id");
+        assert!(publish_with_create_new(&path2, "11111111-2222-4333-8444-555555555555\n").unwrap());
+        let mode = fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        assert_eq!(permission_warning(&path2), None);
+        // 權限過寬 → 回傳警告（由呼叫端輸出）
+        fs::set_permissions(&path2, fs::Permissions::from_mode(0o644)).unwrap();
+        let warning = permission_warning(&path2).unwrap();
+        assert!(
+            warning.contains("644") && warning.contains("chmod 600"),
+            "{warning}"
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -422,6 +547,16 @@ mod tests {
         assert_eq!(id, "11111111-2222-4333-8444-555555555555");
         writer.join().unwrap();
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn permission_warning_is_unix_only() {
+        let dir = temp_dir("perm");
+        let path = dir.join("agent.id");
+        load_or_create(&path).unwrap();
+        assert_eq!(permission_warning(&path), None);
         fs::remove_dir_all(dir).unwrap();
     }
 

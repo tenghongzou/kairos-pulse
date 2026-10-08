@@ -8,6 +8,8 @@ mod network;
 mod protocol;
 mod shutdown;
 mod system_info;
+#[cfg(test)]
+mod test_log;
 mod tls;
 
 use config_manager::AppConfig;
@@ -146,6 +148,10 @@ fn print_agent_id(config: &AppConfig) -> ExitCode {
             if created {
                 eprintln!("已產生新的 agent_id，存放於 {}", path.display());
             }
+            // 此模式不初始化日誌，警告直接寫到 stderr（stdout 只放 ID）
+            if let Some(warning) = agent_id::permission_warning(&path) {
+                eprintln!("警告：{warning}");
+            }
             println!("{id}");
             ExitCode::SUCCESS
         }
@@ -233,19 +239,34 @@ async fn run(config: AppConfig, shutdown: CancellationToken) -> Result<(), Strin
     );
     debug!("使用的配置: {:?}", config);
 
-    // TLS 設定只在啟動時建立一次；憑證 / 私鑰讀不到、格式錯誤、不成對都會在這裡直接失敗
-    let tls = tls::build(&config.server).map_err(|e| format!("啟動失敗：{e}"))?;
-
-    // agent_id：讀檔沿用，不存在則產生；格式不合法則結束（檔案 I/O 放到 blocking 執行緒）
-    let id_path = PathBuf::from(&config.agent.id_file);
-    let path = id_path.clone();
-    let Some(loaded) = blocking_or_shutdown(&shutdown, move || agent_id::load_or_create(&path))
+    // TLS 設定只在啟動時建立一次；憑證 / 私鑰讀不到、格式錯誤、不成對、過期都會在這裡直接失敗。
+    // 讀取系統信任庫與憑證檔是阻塞 I/O（系統信任庫可能很慢），放到 blocking 執行緒，
+    // 且收到 Ctrl+C 時不等它完成
+    let server_config = config.server.clone();
+    let Some(tls) = blocking_or_shutdown(&shutdown, move || tls::build(&server_config))
         .await
         .map_err(|e| format!("啟動失敗：{e}"))?
     else {
         return Ok(());
     };
+    let tls = tls.map_err(|e| format!("啟動失敗：{e}"))?;
+
+    // agent_id：讀檔沿用，不存在則產生；格式不合法則結束（檔案 I/O 放到 blocking 執行緒）
+    let id_path = PathBuf::from(&config.agent.id_file);
+    let path = id_path.clone();
+    let Some((loaded, permission_warning)) = blocking_or_shutdown(&shutdown, move || {
+        let loaded = agent_id::load_or_create(&path);
+        (loaded, agent_id::permission_warning(&path))
+    })
+    .await
+    .map_err(|e| format!("啟動失敗：{e}"))?
+    else {
+        return Ok(());
+    };
     let (agent_id, created) = loaded.map_err(|e| format!("啟動失敗：{e}"))?;
+    if let Some(warning) = permission_warning {
+        warn!("{warning}");
+    }
     if created {
         info!(
             "已產生新的 agent_id {agent_id}，存放於 {}",

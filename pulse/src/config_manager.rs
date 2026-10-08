@@ -27,9 +27,11 @@ pub struct ServerConfig {
     pub accept_invalid_certs: bool,
     /// 額外信任的 CA / 自簽憑證 PEM 路徑；空字串代表只用系統信任庫
     pub ca_cert: String,
+    /// 是否信任作業系統信任庫；false 時只信任 `ca_cert`（此時 `ca_cert` 必填）
+    pub use_system_roots: bool,
     /// 客戶端憑證 PEM 路徑（mTLS，可含中繼 CA 鏈）；空字串代表不出示客戶端憑證
     pub client_cert: String,
-    /// 客戶端憑證私鑰 PEM 路徑，需為 PKCS#8（`BEGIN PRIVATE KEY`）；須與 `client_cert` 成對設定
+    /// 客戶端憑證私鑰 PEM 路徑（PKCS#8 / PKCS#1 / SEC1，不可加密）；須與 `client_cert` 成對設定
     pub client_key: String,
 }
 
@@ -161,6 +163,16 @@ impl AppConfig {
                 "retry.max_delay 不可小於 retry.initial_delay".to_string(),
             ));
         }
+        // accept_invalid_certs = true 時不使用信任庫，不需要 ca_cert
+        if !self.server.use_system_roots
+            && self.server.ca_cert.trim().is_empty()
+            && !self.server.accept_invalid_certs
+        {
+            return Err(ConfigError::Message(
+                "server.use_system_roots = false 時必須設定 server.ca_cert（否則沒有任何可信任的伺服器憑證）"
+                    .to_string(),
+            ));
+        }
         let has_cert = !self.server.client_cert.trim().is_empty();
         let has_key = !self.server.client_key.trim().is_empty();
         if has_cert != has_key {
@@ -219,6 +231,7 @@ mod tests {
         assert_eq!(cfg.server.domain, "localhost");
         assert!(!cfg.server.accept_invalid_certs);
         assert_eq!(cfg.server.ca_cert, "");
+        assert!(cfg.server.use_system_roots);
         assert_eq!(cfg.retry.max_retries, 5);
         assert_eq!(cfg.retry.initial_delay, 2);
         assert_eq!(cfg.retry.max_delay, 60);
@@ -342,5 +355,42 @@ mod tests {
             ("PULSE__SERVER__CLIENT_KEY", "  "),
         ]);
         assert!(err.contains("未設定 server.client_key"), "{err}");
+    }
+
+    #[test]
+    fn use_system_roots_false_requires_ca_cert() {
+        let err = build_err(&[("PULSE__SERVER__USE_SYSTEM_ROOTS", "false")]);
+        assert!(
+            err.contains("server.use_system_roots") && err.contains("server.ca_cert"),
+            "{err}"
+        );
+        // 只有空白視同未設定
+        let err = build_err(&[
+            ("PULSE__SERVER__USE_SYSTEM_ROOTS", "false"),
+            ("PULSE__SERVER__CA_CERT", "  "),
+        ]);
+        assert!(err.contains("server.ca_cert"), "{err}");
+
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__SERVER__USE_SYSTEM_ROOTS", "false"),
+                ("PULSE__SERVER__CA_CERT", "ca.pem"),
+            ])),
+        )
+        .unwrap();
+        assert!(!cfg.server.use_system_roots);
+        assert_eq!(cfg.server.ca_cert, "ca.pem");
+
+        // accept_invalid_certs = true 時不檢查信任庫，可不設 ca_cert
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__SERVER__USE_SYSTEM_ROOTS", "false"),
+                ("PULSE__SERVER__ACCEPT_INVALID_CERTS", "true"),
+            ])),
+        )
+        .unwrap();
+        assert!(!cfg.server.use_system_roots && cfg.server.accept_invalid_certs);
     }
 }

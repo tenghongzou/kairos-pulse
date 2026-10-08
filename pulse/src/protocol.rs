@@ -52,12 +52,65 @@ pub enum ServerMsg {
     Ack {
         seq: u64,
     },
+    /// 欄位缺漏時仍視為 error，不整則忽略：缺 `seq` → null、缺 `code` / `message` → 空字串、
+    /// 缺 `fatal` → 視為 fatal（保守處理：結束連線並退避重連）。
     Error {
+        #[serde(default)]
         seq: Option<u64>,
+        #[serde(default)]
         code: String,
+        #[serde(default)]
         message: String,
+        #[serde(default = "fatal_by_default")]
         fatal: bool,
     },
+}
+
+/// error 訊息缺少 `fatal` 欄位時的預設值。
+fn fatal_by_default() -> bool {
+    true
+}
+
+/// Unicode 一般類別 Cf（格式字元，例如 U+200B 零寬空格、U+202E 由右至左覆寫、U+FEFF BOM）
+/// 的所有碼位範圍（Unicode 15.1）。std 沒有提供一般類別查詢，這裡直接列表。
+///
+/// 與 Kairos `protocol.rs` 的同名表完全相同：Kairos 拒絕 hostname / agent_version 含這些字元，
+/// 兩邊必須一致，否則 Pulse 會因 `bad_request` 無法註冊。
+const FORMAT_CHAR_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// 不得出現在顯示用字串（hello 的 hostname / agent_version、日誌）中的字元：
+/// 控制字元（Cc）、格式字元（Cf）、行分隔（Zl, U+2028）、段落分隔（Zp, U+2029）。
+/// 規則與 Kairos 的 `is_forbidden_display_char` 相同。
+pub fn is_forbidden_display_char(c: char) -> bool {
+    if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+        return true;
+    }
+    let cp = u32::from(c);
+    FORMAT_CHAR_RANGES
+        .iter()
+        .any(|&(lo, hi)| (lo..=hi).contains(&cp))
 }
 
 /// 目前時間，RFC 3339 UTC 毫秒格式（例如 `2026-10-08T03:15:40.001Z`）。
@@ -80,6 +133,10 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    // 下列 serialize_* / deserialize_hello_ack / deserialize_acks / deserialize_errors 使用的
+    // JSON 字串是 PROTOCOL.md「範例」節的測試向量（與 Kairos 的 src/protocol.rs 相同），
+    // 修改協定時兩邊一起更新。
+
     /// 序列化後轉成 `Value` 與測試向量比對（不比字串，避免欄位順序 / 浮點表示差異）。
     fn assert_serializes_to(msg: &ClientMsg, expected: &str) {
         let actual: Value = serde_json::from_str(&serde_json::to_string(msg).unwrap()).unwrap();
@@ -99,6 +156,7 @@ mod tests {
 
     #[test]
     fn serialize_hello() {
+        // PROTOCOL.md「範例」節的測試向量（P hello）
         let msg = ClientMsg::Hello {
             seq: 1,
             proto: 1,
@@ -116,6 +174,7 @@ mod tests {
 
     #[test]
     fn serialize_heartbeat() {
+        // PROTOCOL.md「範例」節的測試向量（P heartbeat）
         let msg = ClientMsg::Heartbeat {
             seq: 2,
             ts: "2026-10-08T03:15:41.002Z".into(),
@@ -128,6 +187,7 @@ mod tests {
 
     #[test]
     fn serialize_report() {
+        // PROTOCOL.md「範例」節的測試向量（P report）
         let msg = ClientMsg::Report {
             seq: 6,
             ts: "2026-10-08T03:15:45.210Z".into(),
@@ -154,6 +214,7 @@ mod tests {
 
     #[test]
     fn deserialize_hello_ack() {
+        // PROTOCOL.md「範例」節的測試向量（K hello_ack）
         let msg: ServerMsg = serde_json::from_str(
             r#"{"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000}"#,
         )
@@ -170,6 +231,7 @@ mod tests {
 
     #[test]
     fn deserialize_acks() {
+        // PROTOCOL.md「範例」節的測試向量（K ack seq=2 / seq=6）
         let msg: ServerMsg = serde_json::from_str(r#"{"type":"ack","seq":2}"#).unwrap();
         assert_eq!(msg, ServerMsg::Ack { seq: 2 });
         let msg: ServerMsg = serde_json::from_str(r#"{"type":"ack","seq":6}"#).unwrap();
@@ -178,6 +240,7 @@ mod tests {
 
     #[test]
     fn deserialize_errors() {
+        // PROTOCOL.md「範例」節「錯誤範例」的測試向量
         let msg: ServerMsg = serde_json::from_str(
             r#"{"type":"error","seq":1,"code":"unsupported_version","message":"supported proto: 1","fatal":true}"#,
         )
@@ -208,6 +271,41 @@ mod tests {
     }
 
     #[test]
+    fn error_with_missing_fields_is_not_ignored() {
+        // P4：缺 message / fatal 也要能解析；缺 fatal 視為 fatal
+        let msg: ServerMsg =
+            serde_json::from_str(r#"{"type":"error","seq":3,"code":"auth_failed"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ServerMsg::Error {
+                seq: Some(3),
+                code: "auth_failed".into(),
+                message: String::new(),
+                fatal: true
+            }
+        );
+        let msg: ServerMsg = serde_json::from_str(r#"{"type":"error"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ServerMsg::Error {
+                seq: None,
+                code: String::new(),
+                message: String::new(),
+                fatal: true
+            }
+        );
+        // 明確給 fatal:false 時照給的值
+        let msg: ServerMsg =
+            serde_json::from_str(r#"{"type":"error","code":"unknown_type","fatal":false}"#)
+                .unwrap();
+        assert!(matches!(msg, ServerMsg::Error { fatal: false, .. }));
+        // 型別錯誤仍是解析失敗
+        assert!(
+            serde_json::from_str::<ServerMsg>(r#"{"type":"error","code":1,"fatal":true}"#).is_err()
+        );
+    }
+
+    #[test]
     fn unknown_fields_are_ignored() {
         let msg: ServerMsg =
             serde_json::from_str(r#"{"type":"ack","seq":3,"future_field":"x"}"#).unwrap();
@@ -224,6 +322,67 @@ mod tests {
         assert_eq!(sanitize_cpu_usage(f32::NAN), 0.0);
         assert_eq!(sanitize_cpu_usage(f32::INFINITY), 0.0);
         assert_eq!(sanitize_cpu_usage(f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn forbidden_display_chars_match_kairos_rules() {
+        // Cc
+        for c in ['\u{0}', '\n', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}'] {
+            assert!(is_forbidden_display_char(c), "{c:?}");
+        }
+        // Cf（表的頭尾與中間各取樣）與 Zl / Zp
+        for c in [
+            '\u{ad}',
+            '\u{600}',
+            '\u{605}',
+            '\u{61c}',
+            '\u{200b}',
+            '\u{200f}',
+            '\u{202a}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{206f}',
+            '\u{feff}',
+            '\u{fffb}',
+            '\u{110bd}',
+            '\u{1343f}',
+            '\u{e0001}',
+            '\u{e007f}',
+            '\u{2028}',
+            '\u{2029}',
+        ] {
+            assert!(is_forbidden_display_char(c), "{c:?}");
+        }
+        // 範圍邊界外與一般字元
+        for c in [
+            'a',
+            ' ',
+            '-',
+            '主',
+            'é',
+            '\u{ac}',
+            '\u{ae}',
+            '\u{606}',
+            '\u{2010}',
+            '\u{2065}',
+            '\u{2070}',
+            '\u{fffc}',
+            '\u{e0002}',
+            '\u{e0080}',
+        ] {
+            assert!(!is_forbidden_display_char(c), "{c:?}");
+        }
+        // 表需由小到大排列且不重疊（與 Kairos 相同的整理方式，方便逐行比對）
+        assert!(FORMAT_CHAR_RANGES.windows(2).all(|w| w[0].1 < w[1].0));
+        assert!(FORMAT_CHAR_RANGES.iter().all(|&(lo, hi)| lo <= hi));
+    }
+
+    #[test]
+    fn agent_version_has_no_forbidden_chars() {
+        // agent_version 取自編譯時的 CARGO_PKG_VERSION（semver），不會含禁止字元
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(!v.is_empty() && v.len() <= 64);
+        assert!(!v.chars().any(is_forbidden_display_char), "{v:?}");
     }
 
     #[test]

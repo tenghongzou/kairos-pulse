@@ -1,15 +1,20 @@
 //! TLS 設定（rustls）。
 //!
-//! - 信任：作業系統信任庫（rustls-native-certs）+ `server.ca_cert`（可含多張）。
+//! - 信任：作業系統信任庫（rustls-native-certs，`server.use_system_roots = false` 時不載入）
+//!   + `server.ca_cert`（可含多張）。
 //! - 客戶端憑證（mTLS）：`server.client_cert`（可含中繼 CA 鏈）+ `server.client_key`
-//!   （PKCS#8 / PKCS#1 / SEC1，RSA / ECDSA / Ed25519）。金鑰與憑證不成對時在啟動時即報錯。
+//!   （PKCS#8 / PKCS#1 / SEC1，RSA / ECDSA / Ed25519，不可加密）。金鑰與憑證不成對、
+//!   憑證已過期時在啟動時即報錯；30 天內到期記 warn。
 //! - `accept_invalid_certs = true`：只略過伺服器憑證的信任鏈與名稱驗證，握手簽章仍會正確驗證。
+//!   啟動時以 error 等級警告（`log.level` 設為 error 也看得到），每次連線成功的日誌也會標註。
 //! - 握手失敗時把 rustls 錯誤轉成具體的處置提示（[`describe_tls_error`]）。
 
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use chrono::{DateTime, NaiveDate, Utc};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -26,6 +31,9 @@ use tokio_rustls::rustls::{
 
 use crate::config_manager::ServerConfig;
 
+/// 客戶端憑證剩餘有效期限少於此值時，啟動時記 warn。
+const CERT_EXPIRY_WARNING: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// 啟動時建立一次、所有連線共用的 TLS 設定。
 #[derive(Clone)]
 pub struct TlsSetup {
@@ -36,6 +44,8 @@ pub struct TlsSetup {
     client_cert_requested: Arc<AtomicBool>,
     /// 客戶端憑證的路徑與葉憑證（用於啟動時檢查 SAN）
     client_leaf: Option<(String, CertificateDer<'static>)>,
+    /// 是否驗證伺服器憑證（`accept_invalid_certs = true` 時為 false）
+    verifies_server_cert: bool,
 }
 
 impl TlsSetup {
@@ -49,6 +59,11 @@ impl TlsSetup {
     /// 伺服器是否在本次連線的握手中要求了客戶端憑證（送出 CertificateRequest）。
     pub fn client_cert_was_requested(&self) -> bool {
         self.client_cert_requested.load(Ordering::Relaxed)
+    }
+
+    /// 是否驗證伺服器憑證的信任鏈與名稱（`accept_invalid_certs = true` 時為 false）。
+    pub fn verifies_server_cert(&self) -> bool {
+        self.verifies_server_cert
     }
 
     /// 確認客戶端憑證的 SAN 含 `DNS:<agent_id>`（伺服器以此比對 hello 的 agent_id，不分大小寫）。
@@ -75,20 +90,24 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
         .map_err(|e| format!("無法建立 TLS 設定：{e}"))?;
 
     let builder = if server.accept_invalid_certs {
+        // ⚠️ 僅供開發測試，正式環境不應開啟。以 error 等級記錄：log.level 最高只能設為 error，
+        // 因此不論設定為何都一定會出現在終端與日誌檔
         if !server.ca_cert.trim().is_empty() {
-            log::warn!(
+            log::error!(
                 "同時設定了 server.ca_cert 與 accept_invalid_certs = true：憑證驗證已停用，ca_cert 形同無效"
             );
         }
-        // ⚠️ 僅供開發測試，正式環境不應開啟
-        log::warn!("已停用 TLS 憑證驗證（accept_invalid_certs = true），請勿用於正式環境");
+        log::error!(
+            "已停用 TLS 伺服器憑證驗證（accept_invalid_certs = true）：無法確認連到的是真正的伺服器，\
+             連線可能遭中間人竊聽或竄改，請勿用於正式環境"
+        );
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert {
                 provider: provider.clone(),
             }))
     } else {
-        let roots = load_roots(server.ca_cert.trim())?;
+        let roots = load_roots(server.ca_cert.trim(), server.use_system_roots)?;
         let verifier =
             WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
                 .build()
@@ -102,7 +121,13 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
         (None, None)
     } else {
         let (chain, key) = load_client_cert(cert_path, key_path)?;
+        for warning in check_chain_validity(cert_path, &chain, Utc::now())? {
+            log::warn!("{warning}");
+        }
         let leaf = chain[0].clone();
+        if let Some(warning) = multiple_dns_san_warning(cert_path, &leaf) {
+            log::warn!("{warning}");
+        }
         let count = chain.len();
         // from_der 會檢查私鑰與憑證是否成對（keys_match）
         let certified = CertifiedKey::from_der(chain, key, &provider)
@@ -124,6 +149,7 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
         server_name,
         client_cert_requested,
         client_leaf,
+        verifies_server_cert: !server.accept_invalid_certs,
     })
 }
 
@@ -154,21 +180,25 @@ impl ResolvesClientCert for RecordingClientCertResolver {
     }
 }
 
-/// 信任庫：作業系統信任庫 + `ca_cert`（可含多張）。
+/// 信任庫：作業系統信任庫（`use_system_roots` 為 true 時）+ `ca_cert`（可含多張）。
 ///
 /// 系統信任庫中個別憑證載入失敗只記 warn；兩者合計沒有任何可用憑證時回傳錯誤。
-fn load_roots(ca_path: &str) -> Result<RootCertStore, String> {
+fn load_roots(ca_path: &str, use_system_roots: bool) -> Result<RootCertStore, String> {
     let mut roots = RootCertStore::empty();
 
-    let native = rustls_native_certs::load_native_certs();
-    for e in &native.errors {
-        log::warn!("載入作業系統信任庫時發生錯誤（略過）：{e}");
+    if use_system_roots {
+        let native = rustls_native_certs::load_native_certs();
+        for e in &native.errors {
+            log::warn!("載入作業系統信任庫時發生錯誤（略過）：{e}");
+        }
+        let (added, ignored) = roots.add_parsable_certificates(native.certs);
+        if ignored > 0 {
+            log::warn!("作業系統信任庫中有 {ignored} 張憑證無法使用，已略過");
+        }
+        log::debug!("已從作業系統信任庫載入 {added} 張憑證");
+    } else {
+        log::info!("server.use_system_roots = false：不信任作業系統信任庫，只信任 server.ca_cert");
     }
-    let (added, ignored) = roots.add_parsable_certificates(native.certs);
-    if ignored > 0 {
-        log::warn!("作業系統信任庫中有 {ignored} 張憑證無法使用，已略過");
-    }
-    log::debug!("已從作業系統信任庫載入 {added} 張憑證");
 
     if !ca_path.is_empty() {
         let certs = load_certs(ca_path, "server.ca_cert", "CA 憑證")?;
@@ -182,9 +212,12 @@ fn load_roots(ca_path: &str) -> Result<RootCertStore, String> {
     }
 
     if roots.is_empty() {
-        return Err(
-            "沒有任何可信任的憑證：作業系統信任庫無法載入，且未設定 server.ca_cert".to_string(),
-        );
+        return Err(if use_system_roots {
+            "沒有任何可信任的憑證：作業系統信任庫無法載入，且未設定 server.ca_cert".to_string()
+        } else {
+            "沒有任何可信任的憑證：server.use_system_roots = false 且未設定 server.ca_cert"
+                .to_string()
+        });
     }
     Ok(roots)
 }
@@ -209,10 +242,159 @@ fn load_client_cert(
     key_path: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let chain = load_certs(cert_path, "server.client_cert", "客戶端憑證")?;
+    let pem = std::fs::read(key_path)
+        .map_err(|e| pem_error(key_path, "server.client_key", "私鑰", pem::Error::Io(e)))?;
+    // 加密私鑰（BEGIN ENCRYPTED PRIVATE KEY，或傳統格式的 Proc-Type: 4,ENCRYPTED）
+    // 會被 PEM 解析器略過或解成無效金鑰，只會得到「找不到私鑰」之類的誤導訊息，因此先行偵測
+    if is_encrypted_key_pem(&pem) {
+        return Err(format!(
+            "server.client_key「{key_path}」是加密的私鑰，Pulse 不支援加密私鑰：\
+             請以 `openssl pkey -in <加密私鑰> -out <新檔案>` 解密後使用，並限制該檔案只有執行帳號可讀"
+        ));
+    }
     // 讀取第一把私鑰，接受 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
-    let key = PrivateKeyDer::from_pem_file(key_path)
+    let key = PrivateKeyDer::from_pem_slice(&pem)
         .map_err(|e| pem_error(key_path, "server.client_key", "私鑰", e))?;
     Ok((chain, key))
+}
+
+/// PEM 內容是否為加密私鑰：PKCS#8 的 `ENCRYPTED PRIVATE KEY` 區塊，
+/// 或 OpenSSL 傳統格式（`BEGIN RSA/EC PRIVATE KEY` 加上 `Proc-Type: 4,ENCRYPTED` 標頭）。
+fn is_encrypted_key_pem(pem: &[u8]) -> bool {
+    let contains = |needle: &[u8]| pem.windows(needle.len()).any(|w| w == needle);
+    contains(b"-----BEGIN ENCRYPTED PRIVATE KEY-----") || contains(b"Proc-Type: 4,ENCRYPTED")
+}
+
+/// 檢查客戶端憑證鏈中每張憑證的有效期限（以 `now` 為準）。
+///
+/// - 任何一張已過期 → `Err`（伺服器必然拒絕，啟動時就結束，而不是無限重連）
+/// - 尚未生效、或 30 天內到期 → 回傳警告訊息（可能是本機時鐘不正確，不阻止啟動）
+/// - 無法解析有效期限 → 回傳警告訊息（實際驗證交給伺服器）
+fn check_chain_validity(
+    path: &str,
+    chain: &[CertificateDer<'_>],
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, String> {
+    let fmt = |t: DateTime<Utc>| t.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let mut warnings = Vec::new();
+    for (i, cert) in chain.iter().enumerate() {
+        let label = if i == 0 {
+            "客戶端憑證".to_string()
+        } else {
+            format!("憑證鏈第 {} 張（中繼 CA）", i + 1)
+        };
+        let Some((not_before, not_after)) = cert_validity(cert) else {
+            warnings.push(format!(
+                "無法解析 server.client_cert「{path}」中{label}的有效期限，略過到期檢查"
+            ));
+            continue;
+        };
+        if now > not_after {
+            return Err(format!(
+                "server.client_cert「{path}」中的{label}已於 {} 過期（本機時間 {}），伺服器會拒絕連線：\
+                 請聯絡管理者重新簽發；若憑證其實仍有效，請確認本機時鐘",
+                fmt(not_after),
+                fmt(now)
+            ));
+        }
+        if now < not_before {
+            warnings.push(format!(
+                "server.client_cert「{path}」中的{label}要到 {} 才生效（本機時間 {}）：伺服器會拒絕連線，請確認本機時鐘",
+                fmt(not_before),
+                fmt(now)
+            ));
+        }
+        let remaining = (not_after - now).to_std().unwrap_or_default();
+        if remaining < CERT_EXPIRY_WARNING {
+            warnings.push(format!(
+                "server.client_cert「{path}」中的{label}將於 {} 到期（剩不到 {} 天），請儘快聯絡管理者重新簽發",
+                fmt(not_after),
+                remaining.as_secs() / 86400 + 1
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
+/// 從 X.509 憑證 DER 取出 `(notBefore, notAfter)`；格式不符時回傳 `None`（不 panic）。
+///
+/// ```text
+/// Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { [0] version OPTIONAL,
+///   serialNumber INTEGER, signature AlgorithmIdentifier, issuer Name,
+///   validity SEQUENCE { notBefore Time, notAfter Time }, ... }, ... }
+/// ```
+fn cert_validity(cert: &CertificateDer<'_>) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    const SEQUENCE: u8 = 0x30;
+    const INTEGER: u8 = 0x02;
+    const VERSION: u8 = 0xa0;
+    let (cert, _) = der_expect(cert.as_ref(), SEQUENCE)?;
+    let (tbs, _) = der_expect(cert, SEQUENCE)?;
+    let (tag, _, rest) = der_next(tbs)?;
+    let rest = match tag {
+        VERSION => der_expect(rest, INTEGER)?.1, // 略過 serialNumber
+        INTEGER => rest,                         // 沒有 version（v1 憑證）
+        _ => return None,
+    };
+    let (_, rest) = der_expect(rest, SEQUENCE)?; // signature
+    let (_, rest) = der_expect(rest, SEQUENCE)?; // issuer
+    let (validity, _) = der_expect(rest, SEQUENCE)?;
+    let (tag, not_before, rest) = der_next(validity)?;
+    let not_before = der_time(tag, not_before)?;
+    let (tag, not_after, _) = der_next(rest)?;
+    let not_after = der_time(tag, not_after)?;
+    Some((not_before, not_after))
+}
+
+/// 讀取一個 DER TLV：回傳 `(tag, 內容, 其後剩餘)`。只支援單一位元組的 tag 與至多 4 位元組的長度。
+fn der_next(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let n = usize::from(first & 0x7f);
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        let (bytes, rest) = rest.split_at(n);
+        let len = bytes
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+        (len, rest)
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (content, rest) = rest.split_at(len);
+    Some((tag, content, rest))
+}
+
+/// 同 [`der_next`]，但 tag 必須是 `tag`；回傳 `(內容, 其後剩餘)`。
+fn der_expect(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (t, content, rest) = der_next(input)?;
+    (t == tag).then_some((content, rest))
+}
+
+/// 解析 UTCTime（`YYMMDDHHMMSSZ`，YY < 50 為 20YY）或 GeneralizedTime（`YYYYMMDDHHMMSSZ`）。
+fn der_time(tag: u8, content: &[u8]) -> Option<DateTime<Utc>> {
+    const UTC_TIME: u8 = 0x17;
+    const GENERALIZED_TIME: u8 = 0x18;
+    let digits = std::str::from_utf8(content).ok()?.strip_suffix('Z')?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let num = |s: &str| s.parse::<u32>().ok();
+    let (year, rest) = match (tag, digits.len()) {
+        (UTC_TIME, 12) => {
+            let yy = i32::try_from(num(&digits[..2])?).ok()?;
+            (if yy < 50 { 2000 + yy } else { 1900 + yy }, &digits[2..])
+        }
+        (GENERALIZED_TIME, 14) => (i32::try_from(num(&digits[..4])?).ok()?, &digits[4..]),
+        _ => return None,
+    };
+    let date = NaiveDate::from_ymd_opt(year, num(&rest[..2])?, num(&rest[2..4])?)?;
+    let time = date.and_hms_opt(num(&rest[4..6])?, num(&rest[6..8])?, num(&rest[8..10])?)?;
+    Some(time.and_utc())
 }
 
 /// 檢查憑證的 SAN 是否含 `DNS:<agent_id>`。
@@ -226,6 +408,21 @@ fn check_cert_san(path: &str, leaf: &CertificateDer<'_>, agent_id: &str) -> Resu
             "server.client_cert「{path}」的 SAN 不含 DNS:{agent_id}（本機 agent_id）：伺服器會以 auth_failed 拒絕。\
              請以此 agent_id 重新簽發客戶端憑證（subjectAltName=DNS:{agent_id}），\
              或確認 agent.id 沒有被重新產生（可用 `pulse --print-agent-id` 查看）"
+        )
+    })
+}
+
+/// 客戶端憑證含多個 DNS SAN 時的警告：Kairos 預設（`auth.allow_multiple_dns_sans = false`）
+/// 只接受恰好一個 DNS SAN 的客戶端憑證，否則以 auth_failed 拒絕。
+/// 伺服器可能放寬此限制，因此只警告、不阻止啟動。無法解析憑證時回傳 `None`（SAN 檢查會另外報錯）。
+fn multiple_dns_san_warning(path: &str, leaf: &CertificateDer<'_>) -> Option<String> {
+    let cert = webpki::EndEntityCert::try_from(leaf).ok()?;
+    let count = cert.valid_dns_names().count();
+    (count > 1).then(|| {
+        format!(
+            "server.client_cert「{path}」含 {count} 個 DNS SAN：伺服器預設只接受恰好一個 DNS SAN（DNS:<agent_id>）\
+             的客戶端憑證，除非伺服器設定了 auth.allow_multiple_dns_sans = true，否則會以 auth_failed 拒絕；\
+             請以單一 SAN 重新簽發"
         )
     })
 }
@@ -396,6 +593,7 @@ mod tests {
             } else {
                 data(ca)
             },
+            use_system_roots: true,
             client_cert: if cert.is_empty() {
                 String::new()
             } else {
@@ -418,10 +616,23 @@ mod tests {
 
     #[test]
     fn ca_cert_with_multiple_certificates() {
-        let roots = load_roots(&data("ca-bundle.pem")).unwrap();
+        let roots = load_roots(&data("ca-bundle.pem"), true).unwrap();
         // 系統信任庫 + bundle 中的 2 張
         assert!(roots.len() >= 2);
         assert!(build(&server("ca-bundle.pem", "", "")).is_ok());
+    }
+
+    #[test]
+    fn use_system_roots_false_trusts_only_ca_cert() {
+        // P7：只信任 ca_cert 中的 2 張，不含任何系統信任庫的憑證
+        let roots = load_roots(&data("ca-bundle.pem"), false).unwrap();
+        assert_eq!(roots.len(), 2);
+        let mut cfg = server("ca-bundle.pem", "", "");
+        cfg.use_system_roots = false;
+        assert!(build(&cfg).is_ok());
+        // 兩者皆無 → 錯誤（設定驗證會先擋下，這裡是第二道防線）
+        let err = load_roots("", false).unwrap_err();
+        assert!(err.contains("use_system_roots"), "{err}");
     }
 
     #[test]
@@ -495,6 +706,27 @@ mod tests {
         assert!(setup.verify_client_cert_identity("anything").is_ok());
     }
     #[test]
+    fn multiple_dns_sans_warn_at_startup() {
+        // 單一 DNS SAN（IP SAN 不算）→ 不警告
+        for name in ["client-rsa.pem", "client-ec-chain.pem", "server.pem"] {
+            assert_eq!(
+                multiple_dns_san_warning(name, &first_cert(name)),
+                None,
+                "{name}"
+            );
+        }
+        let warning = multiple_dns_san_warning("multi.pem", &first_cert("multi-san.pem")).unwrap();
+        assert!(
+            warning.contains("2 個 DNS SAN") && warning.contains("恰好一個"),
+            "{warning}"
+        );
+        assert_eq!(
+            multiple_dns_san_warning("x", &CertificateDer::from(vec![1, 2, 3])),
+            None
+        );
+    }
+
+    #[test]
     fn mismatched_key_is_rejected_at_startup() {
         let err = build_err(&server("root.pem", "client-rsa.pem", "client-ec.key"));
         assert!(err.contains("不成對"), "{err}");
@@ -523,11 +755,356 @@ mod tests {
     fn accept_invalid_certs_builds_without_ca() {
         let mut cfg = server("", "", "");
         cfg.accept_invalid_certs = true;
-        assert!(build(&cfg).is_ok());
+        assert!(!build(&cfg).unwrap().verifies_server_cert());
+        assert!(
+            build(&server("root.pem", "", ""))
+                .unwrap()
+                .verifies_server_cert()
+        );
         // 搭配客戶端憑證也可以
         let mut cfg = server("", "client-ec-chain.pem", "client-ec.key");
         cfg.accept_invalid_certs = true;
         assert!(build(&cfg).is_ok());
+    }
+
+    #[test]
+    fn accept_invalid_certs_warning_is_error_level() {
+        // P2：log.level = error 時也必須看得到
+        let mut cfg = server("root.pem", "", "");
+        cfg.accept_invalid_certs = true;
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok());
+        let errors: Vec<_> = logs
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Error)
+            .map(|(_, msg)| msg.as_str())
+            .collect();
+        assert!(
+            errors.iter().any(|m| m.contains("accept_invalid_certs")),
+            "{logs:?}"
+        );
+        // 同時設定 ca_cert 的提醒也是 error 等級
+        assert!(errors.iter().any(|m| m.contains("ca_cert")), "{logs:?}");
+        assert!(
+            !logs
+                .iter()
+                .any(|(level, msg)| *level > log::Level::Error && msg.contains("accept_invalid")),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_private_key_has_specific_error() {
+        // P10
+        let dir = std::env::temp_dir()
+            .join("pulse-tls-tests")
+            .join(format!("enc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, content) in [
+            (
+                "pkcs8.key",
+                "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBvTBXBgkqhkiG9w0BBQ0w\n-----END ENCRYPTED PRIVATE KEY-----\n",
+            ),
+            (
+                "legacy.key",
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0011\n\nAAAA\n-----END RSA PRIVATE KEY-----\n",
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            let mut cfg = server("root.pem", "client-rsa.pem", "");
+            cfg.client_key = path.to_string_lossy().into_owned();
+            let err = build_err(&cfg);
+            assert!(
+                err.contains("加密的私鑰") && err.contains(name),
+                "{name}: {err}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        // 未加密的私鑰不受影響
+        assert!(!is_encrypted_key_pem(
+            &std::fs::read(data("client-rsa.key")).unwrap()
+        ));
+        assert!(!is_encrypted_key_pem(
+            &std::fs::read(data("client-ec.sec1.key")).unwrap()
+        ));
+    }
+
+    fn parse_utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn first_cert(name: &str) -> CertificateDer<'static> {
+        load_certs(&data(name), "test", "憑證").unwrap().remove(0)
+    }
+
+    #[test]
+    fn cert_validity_is_parsed_from_der() {
+        // 測試憑證以 -days 36500 簽發，notAfter 落在 2126 年（GeneralizedTime）
+        for name in ["client-rsa.pem", "client-ec-chain.pem", "root.pem"] {
+            let (not_before, not_after) = cert_validity(&first_cert(name)).unwrap();
+            assert!(
+                not_before.format("%Y").to_string().starts_with("20"),
+                "{name}"
+            );
+            assert_eq!(not_after.format("%Y").to_string(), "2126", "{name}");
+            assert!(not_before < not_after);
+        }
+        // UTCTime 兩位數年份
+        assert_eq!(
+            der_time(0x17, b"491231235959Z"),
+            Some(parse_utc("2049-12-31T23:59:59Z"))
+        );
+        assert_eq!(
+            der_time(0x17, b"500101000000Z"),
+            Some(parse_utc("1950-01-01T00:00:00Z"))
+        );
+        assert_eq!(
+            der_time(0x18, b"21260914213853Z"),
+            Some(parse_utc("2126-09-14T21:38:53Z"))
+        );
+        // 格式錯誤一律 None，不 panic
+        for (tag, bad) in [
+            (0x17, &b"4912312359Z"[..]),
+            (0x17, b"491231235959"),
+            (0x18, b"491231235959Z"),
+            (0x17, b"491331235959Z"),
+            (0x17, b"49123123595aZ"),
+            (0x05, b"491231235959Z"),
+            (0x17, "４91231235959Z".as_bytes()),
+        ] {
+            assert_eq!(der_time(tag, bad), None, "{bad:?}");
+        }
+        for bad in [
+            &[][..],
+            &[0x30],
+            &[0x30, 0x85, 0, 0, 0, 0, 1],
+            &[0x30, 0x82, 0xff],
+            &[0x30, 0x03, 0x30, 0x01],
+        ] {
+            assert_eq!(
+                cert_validity(&CertificateDer::from(bad.to_vec())),
+                None,
+                "{bad:?}"
+            );
+        }
+        // 截斷的真實憑證也不 panic
+        let der = first_cert("client-rsa.pem").as_ref().to_vec();
+        for len in 0..der.len().min(400) {
+            let _ = cert_validity(&CertificateDer::from(der[..len].to_vec()));
+        }
+    }
+
+    #[test]
+    fn expired_client_cert_is_rejected_and_near_expiry_warns() {
+        // P9：以注入的「現在時間」驗證判斷規則
+        let chain = load_certs(&data("client-ec-chain.pem"), "test", "憑證").unwrap();
+        let (not_before, not_after) = cert_validity(&chain[0]).unwrap();
+        let day = chrono::Duration::days(1);
+
+        // 有效期間內、離到期還很久 → 無警告
+        assert!(
+            check_chain_validity("c.pem", &chain, not_before + day)
+                .unwrap()
+                .is_empty()
+        );
+        // 已過期 → 錯誤，訊息含路徑與「過期」
+        let err = check_chain_validity("c.pem", &chain, not_after + day).unwrap_err();
+        assert!(err.contains("c.pem") && err.contains("過期"), "{err}");
+        // 10 天後到期 → 警告
+        let warnings = check_chain_validity("c.pem", &chain, not_after - day * 10).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("到期") && w.contains("10 天")),
+            "{warnings:?}"
+        );
+        // 尚未生效 → 警告（可能是本機時鐘不正確），不阻止啟動
+        let warnings = check_chain_validity("c.pem", &chain, not_before - day).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("才生效")),
+            "{warnings:?}"
+        );
+        // 無法解析的憑證 → 警告，不阻止啟動
+        let warnings =
+            check_chain_validity("c.pem", &[CertificateDer::from(vec![1, 2, 3])], Utc::now())
+                .unwrap();
+        assert!(warnings[0].contains("無法解析"), "{warnings:?}");
+        // 目前的測試憑證可正常建立
+        assert!(build(&server("root.pem", "client-ec-chain.pem", "client-ec.key")).is_ok());
+    }
+
+    // ---- 實際 TLS 握手（T5）：127.0.0.1 隨機埠上的 rustls 伺服器 ----
+
+    /// 啟動只接受一條連線的 TLS 伺服器。`client_ca` 非空時要求並驗證客戶端憑證。
+    ///
+    /// 回傳位址與伺服器結果：握手成功時為客戶端送出的憑證鏈長度。
+    async fn spawn_tls_server(
+        client_ca: Option<&str>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<io::Result<usize>>,
+    ) {
+        use tokio_rustls::rustls::server::WebPkiClientVerifier;
+        let provider = Arc::new(crypto::ring::default_provider());
+        let chain = load_certs(&data("server.pem"), "test", "憑證").unwrap();
+        let key = PrivateKeyDer::from_pem_file(data("server.key")).unwrap();
+        let builder = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap();
+        let config = match client_ca {
+            Some(ca) => {
+                let mut roots = RootCertStore::empty();
+                for cert in load_certs(&data(ca), "test", "憑證").unwrap() {
+                    roots.add(cert).unwrap();
+                }
+                let verifier =
+                    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                        .build()
+                        .unwrap();
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(chain, key)
+            }
+            None => builder.with_no_client_auth().with_single_cert(chain, key),
+        }
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await?;
+            let stream = acceptor.accept(tcp).await?;
+            let (_, conn) = stream.get_ref();
+            Ok(conn.peer_certificates().map_or(0, <[_]>::len))
+        });
+        (addr, handle)
+    }
+
+    /// 以 `cfg` 建立的 TLS 設定連到 `addr`，回傳握手結果與 TlsSetup。
+    async fn handshake(
+        cfg: &ServerConfig,
+        addr: std::net::SocketAddr,
+    ) -> (
+        io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        TlsSetup,
+    ) {
+        let setup = build(cfg).unwrap();
+        setup.reset_client_cert_request();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let res = setup
+            .connector
+            .connect(setup.server_name.clone(), tcp)
+            .await;
+        (res, setup)
+    }
+
+    fn trusting_test_server() -> ServerConfig {
+        let mut cfg = server("", "", "");
+        cfg.ca_cert = data("server-ca.pem");
+        cfg.use_system_roots = false;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn handshake_succeeds_with_trusted_server_cert() {
+        for domain in ["localhost", "127.0.0.1"] {
+            let (addr, server) = spawn_tls_server(None).await;
+            let mut cfg = trusting_test_server();
+            cfg.domain = domain.into();
+            let (res, setup) = handshake(&cfg, addr).await;
+            let stream = res.unwrap_or_else(|e| panic!("{domain}: {e}"));
+            assert_eq!(server.await.unwrap().unwrap(), 0);
+            assert!(!setup.client_cert_was_requested());
+            drop(stream);
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_untrusted_server_cert() {
+        // 只用系統信任庫（不含測試 CA）、或信任另一個 CA → 簽發者不受信任
+        let mut other_ca = server("root.pem", "", "");
+        other_ca.use_system_roots = false;
+        for cfg in [server("", "", ""), other_ca] {
+            let (addr, _server) = spawn_tls_server(None).await;
+            let (res, _) = handshake(&cfg, addr).await;
+            let err = res.unwrap_err();
+            let tls_err = rustls_error(&err).expect("應為 rustls 錯誤");
+            assert!(
+                matches!(
+                    tls_err,
+                    TlsError::InvalidCertificate(CertificateError::UnknownIssuer)
+                ),
+                "{tls_err:?}"
+            );
+            assert!(
+                describe_tls_error(tls_err, &cfg.domain, false)
+                    .unwrap()
+                    .contains("server.ca_cert")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_name_mismatch() {
+        let (addr, _server) = spawn_tls_server(None).await;
+        let mut cfg = trusting_test_server();
+        cfg.domain = "kairos.example.com".into();
+        let (res, _) = handshake(&cfg, addr).await;
+        let err = res.unwrap_err();
+        let tls_err = rustls_error(&err).expect("應為 rustls 錯誤");
+        assert!(
+            matches!(
+                tls_err,
+                TlsError::InvalidCertificate(
+                    CertificateError::NotValidForName
+                        | CertificateError::NotValidForNameContext { .. }
+                )
+            ),
+            "{tls_err:?}"
+        );
+        assert!(
+            describe_tls_error(tls_err, "kairos.example.com", false)
+                .unwrap()
+                .contains("kairos.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_invalid_certs_skips_chain_and_name_checks() {
+        let (addr, srv) = spawn_tls_server(None).await;
+        let mut cfg = server("", "", "");
+        cfg.accept_invalid_certs = true;
+        cfg.domain = "kairos.example.com".into();
+        let (res, setup) = handshake(&cfg, addr).await;
+        let stream = res.unwrap();
+        assert!(!setup.verifies_server_cert());
+        assert_eq!(srv.await.unwrap().unwrap(), 0);
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn mtls_sends_client_cert_chain() {
+        // 伺服器信任 root.pem；EC 客戶端憑證由中繼 CA 簽發，需送出整條鏈才能驗證
+        let (addr, server) = spawn_tls_server(Some("root.pem")).await;
+        let mut cfg = trusting_test_server();
+        cfg.client_cert = data("client-ec-chain.pem");
+        cfg.client_key = data("client-ec.key");
+        let (res, setup) = handshake(&cfg, addr).await;
+        let stream = res.unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), 2, "葉憑證 + 中繼 CA");
+        assert!(setup.client_cert_was_requested());
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn mtls_without_client_cert_is_rejected_by_server() {
+        let (addr, server) = spawn_tls_server(Some("root.pem")).await;
+        let (res, setup) = handshake(&trusting_test_server(), addr).await;
+        // TLS 1.3 下客戶端的握手可能先完成，拒絕由伺服器端發生
+        assert!(server.await.unwrap().is_err());
+        assert!(setup.client_cert_was_requested());
+        drop(res);
     }
 
     #[test]

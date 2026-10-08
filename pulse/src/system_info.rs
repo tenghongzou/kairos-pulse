@@ -4,7 +4,7 @@ use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::protocol::now_ts;
+use crate::protocol::{is_forbidden_display_char, now_ts};
 
 /// 一個 MB 的位元組數，用來把 sysinfo 回傳的 bytes 換算成 MB。
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -47,7 +47,9 @@ pub fn hostname() -> String {
 
 /// 讓主機名稱符合 hello 的限制：
 /// - 去除前後空白（含結尾的 `\r\n`）
-/// - 其餘控制字元（C0、DEL、C1）替換為 `?`
+/// - 其餘控制字元（Cc：C0、DEL、C1）、格式字元（Cf，例如 U+200B、U+202E、U+FEFF）與
+///   行／段落分隔（U+2028、U+2029）替換為 `?`（與 Kairos 的 hostname 驗證規則相同，
+///   見 [`is_forbidden_display_char`]）
 /// - 取不到或結果為空時為 `"unknown"`
 /// - 超過 255 bytes 時在字元邊界截斷
 fn normalize_hostname(name: Option<String>) -> String {
@@ -55,7 +57,7 @@ fn normalize_hostname(name: Option<String>) -> String {
         .unwrap_or_default()
         .trim()
         .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if is_forbidden_display_char(c) { '?' } else { c })
         .collect();
     if name.is_empty() {
         return "unknown".to_string();
@@ -250,6 +252,34 @@ mod tests {
         // 替換後再截斷：結果不含控制字元且不超過 255 bytes
         let h = normalize_hostname(Some(format!("{}\u{85}", "主".repeat(85))));
         assert!(h.len() <= 255 && !h.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn hostname_format_and_separator_chars_replaced() {
+        // Kairos 會以 bad_request 拒絕含 Cf / Zl / Zp 的 hostname，送出前必須替換
+        assert_eq!(
+            normalize_hostname(Some("web\u{200b}01".into())),
+            "web?01",
+            "零寬空格"
+        );
+        assert_eq!(
+            normalize_hostname(Some("abc\u{202e}fed".into())),
+            "abc?fed",
+            "由右至左覆寫"
+        );
+        assert_eq!(
+            normalize_hostname(Some("a\u{2028}b\u{2029}c".into())),
+            "a?b?c"
+        );
+        assert_eq!(normalize_hostname(Some("\u{feff}host".into())), "?host");
+        assert_eq!(normalize_hostname(Some("x\u{ad}y\u{e0041}".into())), "x?y?");
+        // 一般非 ASCII 主機名稱不受影響
+        assert_eq!(normalize_hostname(Some("伺服器-01".into())), "伺服器-01");
+        // 替換為 ? 後再截斷：4 bytes 的字元換成 1 byte，結果不超過 255 bytes 且不含禁止字元
+        let h = normalize_hostname(Some("\u{e0041}".repeat(100)));
+        assert_eq!(h, "?".repeat(100));
+        let h = normalize_hostname(Some(format!("{}\u{200b}", "主".repeat(85))));
+        assert!(h.len() <= 255 && !h.chars().any(is_forbidden_display_char));
     }
 
     #[tokio::test]
