@@ -2,7 +2,9 @@
 //!
 //! 本模組只包含純函式與資料型別，不做任何 I/O，方便單元測試。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use std::fmt;
 use std::io::{Error, ErrorKind};
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder, LinesCodec, LinesCodecError};
@@ -13,7 +15,8 @@ pub const PROTO_VERSION: u32 = 1;
 /// 單行上限（bytes，不含換行字元）
 pub const MAX_LINE_LENGTH: usize = 65536;
 
-/// 同一條連線連續幾次 `bad_request` 後改送 fatal 並斷線
+/// 同一條連線連續幾則無效訊息（`bad_request` 與 `unknown_type` 合計，中間沒有合法訊息）後，
+/// 該則錯誤改為 fatal 並斷線
 pub const MAX_CONSECUTIVE_BAD_REQUESTS: u32 = 5;
 
 /// 離線判定的下限（毫秒）
@@ -33,16 +36,68 @@ pub const MAX_AGENT_VERSION_BYTES: usize = 64;
 /// `ts` 欄位長度上限（bytes）
 pub const MAX_TS_BYTES: usize = 64;
 
+/// 日誌中顯示無效 `proto` 原始值的長度上限（字元）
+const MAX_PROTO_DISPLAY_CHARS: usize = 32;
+
+/// hello 的 `proto` 欄位。不是合法 u32 的值（字串、負數、小數、超出 u32）不視為格式錯誤，
+/// 而是「不受支援的版本」，回 `unsupported_version`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Proto {
+    Version(u32),
+    /// 不是合法 u32；內含截短後的原始 JSON 文字（只供日誌）
+    Invalid(String),
+}
+
+impl fmt::Display for Proto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Proto::Version(v) => write!(f, "{}", v),
+            Proto::Invalid(raw) => write!(f, "{}", raw.escape_debug()),
+        }
+    }
+}
+
+fn de_proto<'de, D: Deserializer<'de>>(d: D) -> Result<Proto, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+        Some(n) => Proto::Version(n),
+        None => Proto::Invalid(
+            value
+                .to_string()
+                .chars()
+                .take(MAX_PROTO_DISPLAY_CHARS)
+                .collect(),
+        ),
+    })
+}
+
+/// `heartbeat_interval_ms`：任何 JSON 數字都接受（規格規定超出範圍不視為錯誤），
+/// 負數視為 0、小數捨去、超出 u64 視為 `u64::MAX`，之後再由 [`clamp_heartbeat_interval_ms`] 夾值。
+/// 不是數字（字串、null 等）仍是格式錯誤。
+fn de_heartbeat_interval<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    match Value::deserialize(d)? {
+        Value::Number(n) => Ok(n
+            .as_u64()
+            // `as` 轉換會飽和：負數 → 0、過大 → u64::MAX
+            .unwrap_or_else(|| n.as_f64().map_or(0, |f| f as u64))),
+        _ => Err(serde::de::Error::custom(
+            "heartbeat_interval_ms must be a number",
+        )),
+    }
+}
+
 /// Client → Server 訊息
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Hello {
         seq: u64,
-        proto: u32,
+        #[serde(deserialize_with = "de_proto")]
+        proto: Proto,
         agent_id: String,
         hostname: String,
         agent_version: String,
+        #[serde(deserialize_with = "de_heartbeat_interval")]
         heartbeat_interval_ms: u64,
         ts: String,
     },
@@ -212,7 +267,45 @@ pub fn is_uuid_text(s: &str) -> bool {
         })
 }
 
-/// 檢查顯示用字串：長度 1..=max bytes，且不得含控制字元（換行、ESC 等，避免日誌注入）
+/// Unicode 一般類別 Cf（格式字元，例如 U+200B 零寬空格、U+202E 由右至左覆寫、U+FEFF BOM）
+/// 的所有碼位範圍（Unicode 15.1）。std 沒有提供一般類別查詢，這裡直接列表。
+const FORMAT_CHAR_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// 不得出現在顯示用字串中的字元：控制字元（Cc）、格式字元（Cf）、行分隔（Zl, U+2028）、
+/// 段落分隔（Zp, U+2029）。這些字元可能偽造日誌行、在 agents.json 或終端中改變文字方向或隱藏內容。
+pub fn is_forbidden_display_char(c: char) -> bool {
+    if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+        return true;
+    }
+    let cp = u32::from(c);
+    FORMAT_CHAR_RANGES
+        .iter()
+        .any(|&(lo, hi)| (lo..=hi).contains(&cp))
+}
+
+/// 檢查顯示用字串：長度 1..=max bytes，且不得含控制、格式、行／段落分隔字元（避免日誌注入）
 fn validate_display_text(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
     if value.is_empty() || value.len() > max_bytes {
         return Err(format!(
@@ -222,10 +315,19 @@ fn validate_display_text(field: &str, value: &str, max_bytes: usize) -> Result<(
             value.len()
         ));
     }
-    if value.chars().any(char::is_control) {
-        return Err(format!("{} must not contain control characters", field));
+    if value.chars().any(is_forbidden_display_char) {
+        return Err(format!(
+            "{} must not contain control, format or line/paragraph separator characters",
+            field
+        ));
     }
     Ok(())
+}
+
+/// agent_id 的正規化形式：UUID 不分大小寫，伺服器一律以小寫識別、註冊、比對與寫檔。
+/// 應在 [`validate_hello`] 通過後呼叫。
+pub fn normalize_agent_id(agent_id: &str) -> String {
+    agent_id.to_ascii_lowercase()
 }
 
 /// 驗證 hello 的欄位限制（違反時回 `bad_request`）
@@ -341,7 +443,7 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    // 規格第 3 節的測試向量
+    // PROTOCOL.md「範例」節的測試向量
     const V_HELLO: &str = r#"{"type":"hello","seq":1,"proto":1,"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.1.0","heartbeat_interval_ms":1000,"ts":"2026-10-08T03:15:40.001Z"}"#;
     const V_HELLO_ACK: &str = r#"{"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000}"#;
     const V_HEARTBEAT: &str = r#"{"type":"heartbeat","seq":2,"ts":"2026-10-08T03:15:41.002Z"}"#;
@@ -363,7 +465,7 @@ mod tests {
             parse_client_msg(V_HELLO).unwrap(),
             ClientMsg::Hello {
                 seq: 1,
-                proto: 1,
+                proto: Proto::Version(1),
                 agent_id: "6f1c0e4a-1b2c-4d3e-9f00-112233445566".into(),
                 hostname: "web-01".into(),
                 agent_version: "0.1.0".into(),
@@ -457,6 +559,92 @@ mod tests {
         ] {
             assert!(parse_client_msg(line).is_err(), "應解析失敗: {line}");
         }
+    }
+
+    fn hello_line(proto: &str, heartbeat: &str) -> String {
+        format!(
+            r#"{{"type":"hello","seq":1,"proto":{proto},"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"h","agent_version":"v","heartbeat_interval_ms":{heartbeat},"ts":"t"}}"#
+        )
+    }
+
+    fn parsed_hello(proto: &str, heartbeat: &str) -> Result<(Proto, u64), String> {
+        match parse_client_msg(&hello_line(proto, heartbeat))? {
+            ClientMsg::Hello {
+                proto,
+                heartbeat_interval_ms,
+                ..
+            } => Ok((proto, heartbeat_interval_ms)),
+            other => panic!("應解析為 hello: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_proto_is_unsupported_version_not_bad_request() {
+        assert_eq!(parsed_hello("1", "1000").unwrap().0, Proto::Version(1));
+        assert_eq!(parsed_hello("2", "1000").unwrap().0, Proto::Version(2));
+        assert_eq!(
+            parsed_hello("4294967295", "1000").unwrap().0,
+            Proto::Version(u32::MAX)
+        );
+        for bad in [
+            "4294967296",
+            "-1",
+            "1.5",
+            "1.0",
+            r#""1""#,
+            "null",
+            "true",
+            "[1]",
+        ] {
+            let (proto, _) = parsed_hello(bad, "1000").unwrap();
+            assert!(matches!(proto, Proto::Invalid(_)), "{bad}: {proto:?}");
+        }
+        // 日誌用的原始值有長度上限
+        let long = format!(r#""{}""#, "x".repeat(1000));
+        match parsed_hello(&long, "1000").unwrap().0 {
+            Proto::Invalid(raw) => assert_eq!(raw.chars().count(), MAX_PROTO_DISPLAY_CHARS),
+            other => panic!("{other:?}"),
+        }
+        // 缺少 proto 仍是格式錯誤
+        let missing = r#"{"type":"hello","seq":1,"agent_id":"a","hostname":"h","agent_version":"v","heartbeat_interval_ms":1000,"ts":"t"}"#;
+        assert!(parse_client_msg(missing).is_err());
+    }
+
+    #[test]
+    fn out_of_range_heartbeat_interval_is_not_an_error() {
+        assert_eq!(parsed_hello("1", "1000").unwrap().1, 1000);
+        assert_eq!(parsed_hello("1", "0").unwrap().1, 0);
+        assert_eq!(parsed_hello("1", "-5").unwrap().1, 0);
+        assert_eq!(parsed_hello("1", "1500.9").unwrap().1, 1500);
+        assert_eq!(parsed_hello("1", "1e30").unwrap().1, u64::MAX);
+        assert_eq!(
+            parsed_hello("1", "18446744073709551616").unwrap().1,
+            u64::MAX
+        );
+        // 夾值後都落在 1000..=60000
+        assert_eq!(offline_after_ms(parsed_hello("1", "-5").unwrap().1), 5000);
+        assert_eq!(
+            offline_after_ms(parsed_hello("1", "1e30").unwrap().1),
+            300000
+        );
+        // 不是數字、或缺少欄位仍是格式錯誤
+        for bad in [r#""1000""#, "null", "{}"] {
+            assert!(parsed_hello("1", bad).is_err(), "{bad}");
+        }
+        let missing = r#"{"type":"hello","seq":1,"proto":1,"agent_id":"a","hostname":"h","agent_version":"v","ts":"t"}"#;
+        assert!(parse_client_msg(missing).is_err());
+    }
+
+    #[test]
+    fn agent_id_is_normalized_to_lowercase() {
+        assert_eq!(
+            normalize_agent_id("6F1C0E4A-1B2C-4D3E-9F00-112233445566"),
+            "6f1c0e4a-1b2c-4d3e-9f00-112233445566"
+        );
+        assert_eq!(
+            normalize_agent_id("6f1c0e4a-1b2c-4d3e-9f00-112233445566"),
+            "6f1c0e4a-1b2c-4d3e-9f00-112233445566"
+        );
     }
 
     #[test]
@@ -579,6 +767,38 @@ mod tests {
     }
 
     #[test]
+    fn hello_rejects_format_and_separator_characters() {
+        let id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        for bad in [
+            "web\u{202e}10-bew", // 由右至左覆寫
+            "web\u{2028}fake",   // 行分隔（Zl）
+            "web\u{2029}fake",   // 段落分隔（Zp）
+            "web\u{200b}01",     // 零寬空格
+            "\u{feff}web",       // BOM
+            "web\u{2066}01",     // 方向隔離
+            "soft\u{ad}hyphen",  // 軟連字號
+            "tag\u{e0041}",      // 標籤字元
+            "web\u{061c}01",     // 阿拉伯字母標記
+        ] {
+            let err = validate_hello(id, bad, "0.1.0").unwrap_err();
+            assert!(err.contains("format"), "{bad:?}: {err}");
+            assert!(validate_hello(id, "web-01", bad).is_err(), "{bad:?}");
+        }
+        // 一般的非 ASCII 文字不受影響
+        for ok in ["主機-01", "café", "サーバー", "web 01", "\u{2027}"] {
+            assert!(validate_hello(id, ok, "0.1.0").is_ok(), "{ok:?}");
+        }
+        // 表格中每個範圍的兩端都會被拒絕，範圍外的鄰近碼位則否
+        for &(lo, hi) in FORMAT_CHAR_RANGES {
+            for cp in [lo, hi] {
+                assert!(is_forbidden_display_char(char::from_u32(cp).unwrap()));
+            }
+        }
+        assert!(!is_forbidden_display_char('\u{200a}'));
+        assert!(!is_forbidden_display_char('\u{2030}'));
+    }
+
+    #[test]
     fn ts_length_limit() {
         let ts_ok = "2".repeat(MAX_TS_BYTES);
         let ts_bad = "2".repeat(MAX_TS_BYTES + 1);
@@ -688,6 +908,34 @@ mod tests {
             Some(Frame::Line("{\"ok\":true}".into()))
         );
         assert_eq!(codec.decode(&mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn codec_line_length_counts_carriage_return() {
+        // T2：上限 65536 bytes 不含 `\n` 但含 `\r`
+        // 65535 bytes + `\r\n` → 接受，去掉 `\r` 後為 65535 bytes
+        let mut codec = NdjsonCodec::new();
+        let mut ok = vec![b'a'; MAX_LINE_LENGTH - 1];
+        ok.extend_from_slice(b"\r\n");
+        let mut buf = BytesMut::from(&ok[..]);
+        assert!(
+            matches!(codec.decode(&mut buf).unwrap(), Some(Frame::Line(l)) if l.len() == MAX_LINE_LENGTH - 1)
+        );
+
+        // 65536 bytes + `\r\n` → 含 `\r` 共 65537 bytes，回報 TooLong
+        let mut codec = NdjsonCodec::new();
+        let mut bad = vec![b'a'; MAX_LINE_LENGTH];
+        bad.extend_from_slice(b"\r\n");
+        let mut buf = BytesMut::from(&bad[..]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), Some(Frame::TooLong));
+
+        // 分批到達時邊界相同
+        let mut codec = NdjsonCodec::new();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&vec![b'a'; MAX_LINE_LENGTH]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"\r");
+        assert_eq!(codec.decode(&mut buf).unwrap(), Some(Frame::TooLong));
     }
 
     #[test]

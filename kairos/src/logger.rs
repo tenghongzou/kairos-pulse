@@ -1,15 +1,15 @@
 //! 日誌：輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（依 UTC 日期分檔），並依保留天數清除舊檔。
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use log::{LevelFilter, info};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::retention::DatedFiles;
+use crate::retention::{DateGuard, DatedFiles, GUARD_STATE_FILE};
 use crate::shutdown::Shutdown;
 
 pub const LOG_DIR: &str = "logs";
@@ -28,9 +28,12 @@ pub const LEGACY_LOG_FILE: &str = "kairos.log";
 pub const LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// 初始化日誌。檔名依 UTC 日期，換日時由 fern 自動切換到新檔；每筆日誌寫入後即 flush。
-pub fn setup(level: LevelFilter) -> Result<(), Error> {
+///
+/// 回傳建立今天的日誌檔**之前**既有最新日誌檔的日期，作為日誌保留清除的日期基準（見 [`run_cleanup`]）。
+pub fn setup(level: LevelFilter) -> Result<Option<NaiveDate>, Error> {
     create_dir_all(LOG_DIR)
         .map_err(|e| Error::new(e.kind(), format!("無法建立日誌目錄 {}: {}", LOG_DIR, e)))?;
+    let newest_before_start = LOG_FILES.newest(Path::new(LOG_DIR), Utc::now().date_naive());
 
     // fern 在第一次寫入時才開檔；先開一次今天的檔案，讓權限等問題在啟動時就被發現
     let today = Path::new(LOG_DIR).join(LOG_FILES.file_name(Utc::now().date_naive()));
@@ -64,11 +67,17 @@ pub fn setup(level: LevelFilter) -> Result<(), Error> {
         .chain(std::io::stdout()) // 日誌輸出到終端
         .chain(file) // 日誌輸出到按日分檔的檔案
         .apply()
-        .map_err(|e| Error::other(format!("無法初始化日誌: {}", e)))
+        .map_err(|e| Error::other(format!("無法初始化日誌: {}", e)))?;
+    Ok(newest_before_start)
 }
 
-/// 啟動時清除一次舊日誌、提示舊版日誌檔，之後每小時清除一次，直到關機
-pub async fn run_cleanup(retention_days: u32, shutdown: Arc<Shutdown>) {
+/// 啟動時清除一次舊日誌、提示舊版日誌檔，之後每小時清除一次，直到關機。
+/// `newest_before_start` 為啟動前既有最新日誌檔的日期（[`setup`] 的回傳值）。
+pub async fn run_cleanup(
+    retention_days: u32,
+    newest_before_start: Option<NaiveDate>,
+    shutdown: Arc<Shutdown>,
+) {
     let dir = Path::new(LOG_DIR);
     let legacy = dir.join(LEGACY_LOG_FILE);
     if tokio::fs::metadata(&legacy).await.is_ok() {
@@ -80,6 +89,16 @@ pub async fn run_cleanup(retention_days: u32, shutdown: Arc<Shutdown>) {
 
     let mut ticker = interval(LOG_CLEANUP_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 時鐘被誤校到未來時不清除（見 DateGuard）。狀態以 logs/ 中的狀態檔為準；沒有（或損毀）時
+    // 比照 report，以啟動前最新的日誌檔日期為基準（不晚於今天）
+    let baseline = LOG_FILES.guard_baseline(newest_before_start, Utc::now().date_naive());
+    let mut guard = DateGuard::load_or_new(
+        LOG_FILES.label,
+        dir.join(GUARD_STATE_FILE),
+        baseline,
+        Instant::now(),
+        Utc::now(),
+    );
     loop {
         // 第一次 tick 立即完成：啟動時先清除一次
         tokio::select! {
@@ -87,8 +106,12 @@ pub async fn run_cleanup(retention_days: u32, shutdown: Arc<Shutdown>) {
             _ = shutdown.cancelled() => break,
             _ = ticker.tick() => {}
         }
-        LOG_FILES
-            .cleanup(dir, Utc::now().date_naive(), retention_days)
-            .await;
+        if retention_days == 0 {
+            continue;
+        }
+        let now_wall = Utc::now();
+        if let Some(today) = guard.check(now_wall.date_naive(), Instant::now(), now_wall) {
+            LOG_FILES.cleanup(dir, today, retention_days).await;
+        }
     }
 }

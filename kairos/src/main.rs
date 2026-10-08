@@ -1,14 +1,19 @@
 mod auth;
 mod config;
 mod connection;
+#[cfg(test)]
+mod integration_tests;
 mod logger;
 mod monitor;
+mod per_ip;
 mod protocol;
 mod registry;
 mod reload;
 mod retention;
 mod shutdown;
 mod storage;
+#[cfg(test)]
+mod test_pki;
 mod throttle;
 mod tls;
 
@@ -20,12 +25,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::BindingPolicy;
 use crate::config::{AppConfig, CliAction, USAGE, parse_args};
 use crate::connection::{ConnContext, handle_connection, is_peer_disconnect};
+use crate::per_ip::PerIpLimiter;
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::{CONNECTIONS_DEADLINE, MONITOR_DEADLINE, Shutdown, WRITER_DEADLINE};
 use crate::throttle::{Category, LogThrottle};
@@ -40,6 +47,36 @@ const SATURATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// 將 std 的 Instant 轉成 tokio 的 Instant，供 `timeout_at` 使用
 fn tokio_deadline(at: Instant) -> tokio::time::Instant {
     tokio::time::Instant::from_std(at)
+}
+
+/// 監看應持續執行到關機的背景工作（report writer、monitor、TLS 重載）。
+/// 在關機前結束（不論 panic 或正常返回）都是異常：記 ERROR 並觸發關機，
+/// 而不是等到關機時才發現。關機期間的結束屬正常，只有 panic 才記錄。
+fn supervise(name: &'static str, task: JoinHandle<()>, shutdown: Arc<Shutdown>) -> JoinHandle<()> {
+    supervise_with(name, task, shutdown, shutdown::fatal)
+}
+
+/// [`supervise`] 的實作；`on_fatal` 可替換，方便測試（正式程式會啟動關機看門狗）
+fn supervise_with(
+    name: &'static str,
+    task: JoinHandle<()>,
+    shutdown: Arc<Shutdown>,
+    on_fatal: fn(&Shutdown, String),
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = task.await;
+        let shutting_down = shutdown.started_at().is_some();
+        let reason = match result {
+            Ok(()) if shutting_down => return,
+            Ok(()) => format!("{}意外結束", name),
+            Err(e) => format!("{}異常結束: {}", name, e),
+        };
+        if shutting_down {
+            error!("{}", reason);
+        } else {
+            on_fatal(&shutdown, reason);
+        }
+    })
 }
 
 /// 連線上限的飽和狀態。只在進入與解除飽和時各回報一次，避免日誌洗版。
@@ -74,6 +111,125 @@ impl Saturation {
     }
 }
 
+/// accept 迴圈：先取得全域連線名額再 accept，再取得來源 IP 的名額，為每條連線啟動
+/// [`handle_connection`]，直到關機。回傳仍在執行的連線（listener 隨之釋放，不再接受新連線）。
+pub(crate) async fn accept_loop(
+    listener: TcpListener,
+    ctx: Arc<ConnContext>,
+    max_connections: usize,
+    per_ip: Arc<PerIpLimiter>,
+) -> Result<JoinSet<()>, Error> {
+    let shutdown = ctx.shutdown.clone();
+    let throttle = ctx.throttle.clone();
+    let limit = Arc::new(Semaphore::new(max_connections));
+    let mut connections = JoinSet::new();
+    let mut saturation = Saturation::new(max_connections);
+    let mut saturation_check = interval(SATURATION_CHECK_INTERVAL);
+    saturation_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    'accept: loop {
+        // 回收已結束的連線工作
+        while let Some(res) = connections.try_join_next() {
+            if let Err(e) = res
+                && e.is_panic()
+            {
+                error!("連線工作異常結束: {}", e);
+            }
+        }
+        // 先取得連線名額再 accept；名額用盡時暫停接受新連線
+        let permit: OwnedSemaphorePermit = match limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                if saturation.enter() {
+                    warn!("已達連線上限 {}，暫停接受新連線", max_connections);
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'accept,
+                    res = limit.clone().acquire_owned() => {
+                        res.map_err(|_| Error::other("連線上限的 Semaphore 已關閉"))?
+                    }
+                }
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(Error::other("連線上限的 Semaphore 已關閉"));
+            }
+        };
+
+        // 等待新連線；期間定期檢查是否已解除飽和，名額釋放後即時記錄，而不是等到下一條連線
+        let accepted = loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break 'accept,
+                res = listener.accept() => break res,
+                _ = saturation_check.tick() => {
+                    // 手上這個名額尚未使用，也算可用
+                    if saturation.check_resume(limit.available_permits() + 1) {
+                        info!(
+                            "連線數已降至上限 {} 以下，恢復接受新連線",
+                            max_connections
+                        );
+                    }
+                }
+            }
+        };
+        let (socket, peer) = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                // 接受連線失敗（例如檔案描述符用盡）不應讓整個伺服器結束，稍候再重試；
+                // 可能每 100 ms 發生一次，節流記錄
+                throttled!(throttle, Category::Accept, error, "接受連線失敗: {}", e);
+                drop(permit);
+                sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        // 每個來源 IP 的同時連線數上限：超過時立即關閉，不進行 TLS 握手
+        let Some(ip_permit) = per_ip.try_acquire(peer.ip()) else {
+            throttled!(
+                throttle,
+                (Category::PerIpLimit, per_ip::normalize_ip(peer.ip())),
+                warn,
+                "來自 {} 的同時連線數已達上限 {}（server.max_connections_per_ip），拒絕新連線",
+                peer.ip(),
+                per_ip.max_per_ip()
+            );
+            drop(socket);
+            drop(permit);
+            continue;
+        };
+        let conn_id = next_conn_id();
+        debug!("[#{}] 接收到來自 {} 的連線", conn_id, peer);
+
+        // 每條連線使用接受當下的 TLS 設定；熱重載只影響之後的新連線
+        let acceptor = ctx.tls.current().acceptor.clone();
+        let ctx = ctx.clone();
+        let throttle = throttle.clone();
+        connections.spawn(async move {
+            // permit 在連線結束時釋放
+            let _permit = permit;
+            let _ip_permit = ip_permit;
+            match handle_connection(ctx, acceptor, socket, peer, conn_id).await {
+                Ok(()) => {}
+                // 對方未送 close_notify 就斷線、連線被重設或中止：屬正常的斷線情境
+                Err(e) if is_peer_disconnect(&e) => {
+                    debug!("[#{}] {} 中斷連線: {}", conn_id, peer, e);
+                }
+                Err(e) => throttled!(
+                    throttle,
+                    Category::ConnectionError,
+                    warn,
+                    "[#{}] 處理來自 {} 的連線時發生錯誤: {}",
+                    conn_id,
+                    peer,
+                    e
+                ),
+            }
+        });
+    }
+
+    Ok(connections)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // 日誌尚未初始化前的錯誤只能輸出到 stderr
@@ -105,13 +261,21 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = logger::setup(level) {
-        eprintln!("Kairos 啟動失敗: {}", e);
-        return ExitCode::FAILURE;
-    }
+    let newest_log = match logger::setup(level) {
+        Ok(newest) => newest,
+        Err(e) => {
+            eprintln!("Kairos 啟動失敗: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match run(config, config_path.as_deref()).await {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(config, config_path.as_deref(), newest_log).await {
+        Ok(None) => ExitCode::SUCCESS,
+        Ok(Some(reason)) => {
+            error!("Kairos 因內部錯誤而結束: {}", reason);
+            log::logger().flush();
+            ExitCode::FAILURE
+        }
         Err(e) => {
             error!("Kairos 啟動失敗: {}", e);
             ExitCode::FAILURE
@@ -119,7 +283,13 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error> {
+/// 執行伺服器直到關機。正常關機回傳 `Ok(None)`；因背景工作異常而關機時回傳 `Ok(Some(原因))`
+/// `newest_log` 為啟動前最新日誌檔的日期（日誌保留清除的日期基準）
+async fn run(
+    config: AppConfig,
+    config_path: Option<&Path>,
+    newest_log: Option<chrono::NaiveDate>,
+) -> Result<Option<String>, Error> {
     let default_file = Path::new(config::DEFAULT_CONFIG_FILE);
     match config_path {
         Some(p) => info!("設定檔: {}", p.display()),
@@ -174,17 +344,26 @@ async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error>
     let shutdown = Arc::new(Shutdown::new());
     tokio::spawn(shutdown::watch(shutdown::Signals::new()?, shutdown.clone()));
 
-    let registry = Arc::new(Registry::new());
-    let writer = tokio::spawn(writer_task);
+    let registry = Arc::new(Registry::with_max_agents(config.max_agents()));
+    let writer = supervise(
+        "report 寫入工作",
+        tokio::spawn(writer_task),
+        shutdown.clone(),
+    );
     // monitor 要等所有連線結束後才停止，才能寫出「全部離線」的最後快照，因此使用獨立的 token
     let monitor_stop = CancellationToken::new();
-    let monitor = tokio::spawn(monitor::run(
-        registry.clone(),
-        paths.clone(),
-        monitor_stop.clone(),
-    ));
+    let monitor = supervise(
+        "監控工作",
+        tokio::spawn(monitor::run(
+            registry.clone(),
+            paths.clone(),
+            monitor_stop.clone(),
+        )),
+        shutdown.clone(),
+    );
     tokio::spawn(logger::run_cleanup(
         config.log.retention_days,
+        newest_log,
         shutdown.clone(),
     ));
 
@@ -195,13 +374,21 @@ async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error>
         ),
         secs => {
             info!("每 {} 秒檢查憑證、私鑰、客戶端 CA 與 CRL 是否變更", secs);
-            tokio::spawn(reload::run(
-                reload::Reloader::new(tls_paths.clone(), initial_fingerprint, tls_state.clone()),
-                registry.clone(),
-                tls_state.clone(),
-                Duration::from_secs(secs),
+            supervise(
+                "TLS 重載工作",
+                tokio::spawn(reload::run(
+                    reload::Reloader::new(
+                        tls_paths.clone(),
+                        initial_fingerprint,
+                        tls_state.clone(),
+                    ),
+                    registry.clone(),
+                    tls_state.clone(),
+                    Duration::from_secs(secs),
+                    shutdown.clone(),
+                )),
                 shutdown.clone(),
-            ));
+            );
         }
     }
 
@@ -213,110 +400,27 @@ async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error>
         shutdown: shutdown.clone(),
         tls: tls_state.clone(),
         throttle: throttle.clone(),
+        binding: BindingPolicy {
+            allow_multiple_dns_sans: config.auth.allow_multiple_dns_sans,
+        },
     });
-    let limit = Arc::new(Semaphore::new(config.server.max_connections));
-    let mut connections = JoinSet::new();
+    let per_ip = PerIpLimiter::new(config.max_connections_per_ip());
 
     info!(
-        "Kairos 已啟動，監聽 {}（連線上限 {}，資料目錄 {}）",
-        local_addr, config.server.max_connections, config.storage.data_dir
+        "Kairos 已啟動，監聽 {}（連線上限 {}，每個來源 IP {}，狀態表上限 {}，資料目錄 {}）",
+        local_addr,
+        config.server.max_connections,
+        config.max_connections_per_ip(),
+        config.max_agents(),
+        config.storage.data_dir
     );
 
-    let mut saturation = Saturation::new(config.server.max_connections);
-    let mut saturation_check = interval(SATURATION_CHECK_INTERVAL);
-    saturation_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    'accept: loop {
-        // 回收已結束的連線工作
-        while let Some(res) = connections.try_join_next() {
-            if let Err(e) = res
-                && e.is_panic()
-            {
-                error!("連線工作異常結束: {}", e);
-            }
-        }
-        // 先取得連線名額再 accept；名額用盡時暫停接受新連線
-        let permit: OwnedSemaphorePermit = match limit.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                if saturation.enter() {
-                    warn!(
-                        "已達連線上限 {}，暫停接受新連線",
-                        config.server.max_connections
-                    );
-                }
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => break 'accept,
-                    res = limit.clone().acquire_owned() => {
-                        res.map_err(|_| Error::other("連線上限的 Semaphore 已關閉"))?
-                    }
-                }
-            }
-            Err(TryAcquireError::Closed) => {
-                return Err(Error::other("連線上限的 Semaphore 已關閉"));
-            }
-        };
-
-        // 等待新連線；期間定期檢查是否已解除飽和，名額釋放後即時記錄，而不是等到下一條連線
-        let accepted = loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => break 'accept,
-                res = listener.accept() => break res,
-                _ = saturation_check.tick() => {
-                    // 手上這個名額尚未使用，也算可用
-                    if saturation.check_resume(limit.available_permits() + 1) {
-                        info!(
-                            "連線數已降至上限 {} 以下，恢復接受新連線",
-                            config.server.max_connections
-                        );
-                    }
-                }
-            }
-        };
-        let (socket, peer) = match accepted {
-            Ok(conn) => conn,
-            Err(e) => {
-                // 接受連線失敗（例如檔案描述符用盡）不應讓整個伺服器結束，稍候再重試
-                error!("接受連線失敗: {}", e);
-                drop(permit);
-                sleep(ACCEPT_RETRY_DELAY).await;
-                continue;
-            }
-        };
-        let conn_id = next_conn_id();
-        debug!("[#{}] 接收到來自 {} 的連線", conn_id, peer);
-
-        // 每條連線使用接受當下的 TLS 設定；熱重載只影響之後的新連線
-        let acceptor = tls_state.current().acceptor.clone();
-        let ctx = ctx.clone();
-        let throttle = throttle.clone();
-        connections.spawn(async move {
-            // permit 在連線結束時釋放
-            let _permit = permit;
-            match handle_connection(ctx, acceptor, socket, peer, conn_id).await {
-                Ok(()) => {}
-                // 對方未送 close_notify 就斷線、連線被重設或中止：屬正常的斷線情境
-                Err(e) if is_peer_disconnect(&e) => {
-                    debug!("[#{}] {} 中斷連線: {}", conn_id, peer, e);
-                }
-                Err(e) => throttled!(
-                    throttle,
-                    Category::ConnectionError,
-                    warn,
-                    "[#{}] 處理來自 {} 的連線時發生錯誤: {}",
-                    conn_id,
-                    peer,
-                    e
-                ),
-            }
-        });
-    }
+    let mut connections =
+        accept_loop(listener, ctx.clone(), config.server.max_connections, per_ip).await?;
 
     // ---- 關機 ----
     // 所有階段共用以 T0（收到訊號的時間）起算的期限
     let t0 = shutdown.started_at().unwrap_or_else(Instant::now);
-    drop(listener);
     info!("已停止接受新連線");
 
     while connections.try_join_next().is_some() {}
@@ -345,8 +449,8 @@ async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error>
     drop(ctx);
     info!("寫入剩餘 {} 筆 report", pending);
     match timeout_at(tokio_deadline(t0 + WRITER_DEADLINE), writer).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("report 寫入工作異常結束: {}", e),
+        // 異常結束已由 supervise 記錄
+        Ok(_) => {}
         Err(_) => error!(
             "report 寫入未在訊號後 {:.1} 秒內完成，佇列中的資料可能遺失",
             WRITER_DEADLINE.as_secs_f64()
@@ -356,8 +460,7 @@ async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error>
     // 最後寫一次 agents.json
     monitor_stop.cancel();
     match timeout_at(tokio_deadline(t0 + MONITOR_DEADLINE), monitor).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("監控工作異常結束: {}", e),
+        Ok(_) => {}
         Err(_) => error!(
             "最後的 agent 快照未在訊號後 {:.1} 秒內寫完",
             MONITOR_DEADLINE.as_secs_f64()
@@ -368,7 +471,7 @@ async fn run(config: AppConfig, config_path: Option<&Path>) -> Result<(), Error>
         "Kairos 已結束（關機耗時 {:.2} 秒）",
         t0.elapsed().as_secs_f64()
     );
-    Ok(())
+    Ok(shutdown.fatal_reason().map(str::to_string))
 }
 
 #[cfg(test)]
@@ -391,6 +494,52 @@ mod tests {
         assert!(!s.check_resume(50));
         // 再次飽和會再回報
         assert!(s.enter());
+    }
+
+    /// 測試用的 fatal 處理：只觸發關機，不啟動看門狗
+    fn fatal_without_watchdog(s: &Shutdown, reason: String) {
+        s.trigger_fatal(reason);
+    }
+
+    #[tokio::test]
+    async fn supervise_triggers_shutdown_when_task_ends_early() {
+        // K-C9：背景工作在關機前 panic，立即觸發關機並記下原因
+        let s = Arc::new(Shutdown::new());
+        let panicking = tokio::spawn(async { panic!("boom") });
+        supervise_with("測試工作", panicking, s.clone(), fatal_without_watchdog)
+            .await
+            .unwrap();
+        assert!(s.started_at().is_some());
+        assert!(s.fatal_reason().unwrap().contains("測試工作異常結束"));
+
+        // 在關機前正常返回也是異常
+        let s = Arc::new(Shutdown::new());
+        supervise_with(
+            "測試工作",
+            tokio::spawn(async {}),
+            s.clone(),
+            fatal_without_watchdog,
+        )
+        .await
+        .unwrap();
+        assert!(s.fatal_reason().unwrap().contains("測試工作意外結束"));
+
+        // 關機期間結束屬正常（panic 只記錄），不設定 fatal 原因
+        let s = Arc::new(Shutdown::new());
+        s.trigger();
+        supervise_with(
+            "測試工作",
+            tokio::spawn(async {}),
+            s.clone(),
+            fatal_without_watchdog,
+        )
+        .await
+        .unwrap();
+        let panicking = tokio::spawn(async { panic!("boom") });
+        supervise_with("測試工作", panicking, s.clone(), fatal_without_watchdog)
+            .await
+            .unwrap();
+        assert_eq!(s.fatal_reason(), None);
     }
 
     #[test]

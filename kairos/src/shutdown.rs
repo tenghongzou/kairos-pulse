@@ -12,6 +12,9 @@
 //! Windows 在關閉主控台或系統關機時約 5 秒後會強制終止行程，因此整個流程必須遠低於 5 秒。
 //! 第二次收到訊號時直接以 130 結束行程。
 //!
+//! 背景工作（report writer、monitor、TLS 重載）異常結束時，以 [`fatal`] 走同一套關機流程，
+//! 並在最後以非 0 的結束代碼結束，讓服務管理程式能發現並重新啟動。
+//!
 //! - Windows：Ctrl+C、Ctrl+Break、關閉主控台視窗、系統關機
 //! - 其他平台：SIGINT、SIGTERM
 
@@ -42,6 +45,8 @@ pub const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_millis(200);
 pub struct Shutdown {
     token: CancellationToken,
     started: OnceLock<Instant>,
+    /// 因內部錯誤而關機時的原因（只記第一個）
+    fatal: OnceLock<String>,
 }
 
 impl Shutdown {
@@ -64,6 +69,27 @@ impl Shutdown {
     /// 關機開始的時間（尚未關機時為 `None`）
     pub fn started_at(&self) -> Option<Instant> {
         self.started.get().copied()
+    }
+
+    /// 因內部錯誤開始關機：記下原因（只記第一個）並觸發關機。回傳 T0。
+    pub fn trigger_fatal(&self, reason: impl Into<String>) -> Instant {
+        let _ = self.fatal.set(reason.into());
+        self.trigger()
+    }
+
+    /// 因內部錯誤而關機時的原因；正常關機（收到訊號）時為 `None`
+    pub fn fatal_reason(&self) -> Option<&str> {
+        self.fatal.get().map(String::as_str)
+    }
+}
+
+/// 背景工作異常時呼叫：記錄 ERROR、開始關機，並啟動看門狗確保行程會結束
+pub fn fatal(shutdown: &Shutdown, reason: String) {
+    error!("{}，開始關機", reason);
+    let first = shutdown.started_at().is_none();
+    let t0 = shutdown.trigger_fatal(reason);
+    if first {
+        start_watchdog(t0);
     }
 }
 
@@ -183,6 +209,21 @@ mod tests {
         assert_eq!(s.started_at(), Some(t0));
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(s.trigger(), t0);
+    }
+
+    #[test]
+    fn fatal_reason_is_recorded_once() {
+        let s = Shutdown::new();
+        assert_eq!(s.fatal_reason(), None);
+        let t0 = s.trigger_fatal("writer 異常結束");
+        assert_eq!(s.started_at(), Some(t0));
+        assert_eq!(s.trigger_fatal("monitor 異常結束"), t0);
+        assert_eq!(s.fatal_reason(), Some("writer 異常結束"));
+
+        // 收到訊號的正常關機沒有原因
+        let s = Shutdown::new();
+        s.trigger();
+        assert_eq!(s.fatal_reason(), None);
     }
 
     #[test]

@@ -3,12 +3,13 @@ listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080
 cert_path = "cert.pem"
 key_path = "key.pem"
 max_connections = 1024
+# max_connections_per_ip = 32 # 同一來源 IP 的同時連線數上限（含握手中的連線），1..=max_connections；未設定時為 min(32, max_connections)
 reload_interval_secs = 30     # 每隔幾秒檢查憑證／私鑰／客戶端 CA／CRL 是否變更並重新驗證現役連線，0 = 停用，上限 3600
 
 [timeouts]
-handshake_secs = 10
+handshake_secs = 5
 hello_secs = 5
-write_secs = 5
+write_secs = 5                # 寫出訊息與等待 report 寫檔的上限，1..=6（回應延遲須小於 Pulse 的 10 秒讀取閒置）
 
 [storage]
 data_dir = "data"
@@ -17,6 +18,10 @@ retention_days = 30           # reports-YYYY-MM-DD.jsonl 保留天數（今天�
 [auth]
 client_ca = ""                # 非空：要求客戶端憑證（mTLS），以此 PEM（可含多張 CA）驗證，並強制 agent_id 綁定
 crl = []                      # CRL 檔路徑清單（PEM 或 DER），例如 ["agents.crl"]；只在設定 client_ca 時有效
+allow_multiple_dns_sans = false  # false：客戶端憑證必須恰好有一個 DNS SAN（避免一張憑證冒用多個 agent）
+
+[limits]
+# max_agents = 10000          # 狀態表最多保留幾個 agent（達上限先淘汰離線最久者），max_connections..=100000；未設定時為 max(10000, max_connections)
 
 [log]
 level = "info"

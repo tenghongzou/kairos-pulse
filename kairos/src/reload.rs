@@ -1,6 +1,10 @@
 //! TLS 熱重載：定期檢查伺服器憑證、私鑰、客戶端 CA 與 CRL 檔的內容，有變化就重建設定並
 //! 原子替換；重建失敗時保留舊設定。每個週期也以目前的驗證器重新驗證所有現役連線的
 //! 客戶端憑證（撤銷、過期、不再受信任），不通過的連線收到 `certificate_rejected` 並被關閉。
+//!
+//! 檢查檔案與重新驗證都是同步、可能耗時的工作，一律在 blocking 執行緒執行，不佔用 async worker。
+//! 檢查檔案的工作異常結束（panic）時重建 [`Reloader`]，下個週期強制重建設定；
+//! 重新驗證的工作異常結束時無法確保已撤銷的憑證會被斷線（fail-open），因此觸發關機。
 
 use log::{debug, error, info, warn};
 use std::io::Error;
@@ -10,7 +14,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_rustls::rustls::pki_types::UnixTime;
 
 use crate::registry::{KickReason, Registry};
-use crate::shutdown::Shutdown;
+use crate::shutdown::{self, Shutdown};
 use crate::tls::{self, Fingerprint, TlsMaterial, TlsPaths, TlsState};
 
 /// 一次檢查的結果
@@ -39,6 +43,11 @@ impl Reloader {
             last: initial,
             state,
         }
+    }
+
+    /// 重建一個「下次檢查一定重建設定」的 Reloader（用於檢查工作異常結束後）
+    fn recreate(paths: TlsPaths, state: Arc<TlsState>) -> Self {
+        Self::new(paths, Fingerprint::new(), state)
     }
 
     /// 檢查檔案是否變化，有變化就重建（同步讀檔，請在 blocking 執行緒呼叫）
@@ -103,17 +112,25 @@ pub async fn run(
             _ = ticker.tick() => {}
         }
 
+        let (paths, reloader_state) = (reloader.paths.clone(), reloader.state.clone());
         let joined = tokio::task::spawn_blocking(move || {
             let outcome = reloader.check();
             (reloader, outcome)
         })
         .await;
-        let outcome;
-        (reloader, outcome) = match joined {
-            Ok(pair) => pair,
+        let outcome = match joined {
+            Ok((r, outcome)) => {
+                reloader = r;
+                outcome
+            }
             Err(e) => {
-                error!("TLS 重載工作異常結束，停止熱重載: {}", e);
-                return;
+                // 不停止整個工作：重新驗證仍要繼續；下個週期強制重建設定
+                error!(
+                    "檢查 TLS 設定檔的工作異常結束，下個週期重新載入，期間沿用目前的設定: {}",
+                    e
+                );
+                reloader = Reloader::recreate(paths, reloader_state);
+                ReloadOutcome::Unchanged
             }
         };
 
@@ -134,7 +151,24 @@ pub async fn run(
             }
         }
 
-        let kicked = revalidate(&registry, &material, UnixTime::now());
+        let registry_for_check = registry.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            revalidate(&registry_for_check, &material, UnixTime::now())
+        })
+        .await;
+        let kicked = match joined {
+            Ok(kicked) => kicked,
+            Err(e) => {
+                shutdown::fatal(
+                    &shutdown,
+                    format!(
+                        "重新驗證客戶端憑證的工作異常結束（{}），無法確保已撤銷或過期的憑證會被斷線",
+                        e
+                    ),
+                );
+                break;
+            }
+        };
         for (agent_id, reason) in &kicked {
             warn!(
                 "agent {} 的客戶端憑證已不再有效（{}），關閉連線",
@@ -271,6 +305,54 @@ mod tests {
     }
 
     #[test]
+    fn recreated_reloader_rebuilds_on_next_check() {
+        // K-S11：檢查工作異常結束後重建的 Reloader 下次一定重建設定
+        let fx = Fixture::new("recreate");
+        let (_r, state) = fx.reloader();
+        let before = state.current();
+        let mut r = Reloader::recreate(fx.paths.clone(), state.clone());
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert!(!Arc::ptr_eq(&state.current(), &before));
+        assert!(matches!(r.check(), ReloadOutcome::Unchanged));
+    }
+
+    #[tokio::test]
+    async fn run_revalidates_on_blocking_thread_and_stops_on_shutdown() {
+        // K-S12：重新驗證在 blocking 執行緒執行；撤銷的連線在一個週期內被踢
+        let fx = Fixture::new("run");
+        let (r, state) = fx.reloader();
+        let registry = Arc::new(Registry::new());
+        let mut a = registry
+            .register(
+                1,
+                hello(A, Some(chain("client-a.crt"))),
+                Instant::now(),
+                Utc::now(),
+            )
+            .unwrap();
+        let stop = Arc::new(Shutdown::new());
+        let task = tokio::spawn(run(
+            r,
+            registry.clone(),
+            state.clone(),
+            Duration::from_millis(30),
+            stop.clone(),
+        ));
+        fx.write("crl.crl", "crl-revoke-a.crl");
+        let kicked = tokio::time::timeout(Duration::from_secs(5), &mut a.kick)
+            .await
+            .expect("應在數個週期內被踢")
+            .unwrap();
+        assert!(matches!(kicked, KickReason::CertificateRejected(_)));
+        stop.trigger();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stop.fatal_reason(), None);
+    }
+
+    #[test]
     fn missing_file_is_a_failed_reload() {
         let fx = Fixture::new("missing");
         let (mut r, state) = fx.reloader();
@@ -286,14 +368,20 @@ mod tests {
         let (mut r, state) = fx.reloader();
         let registry = Registry::new();
         let t0 = Instant::now();
-        let mut a = registry.register(1, hello(A, Some(chain("client-a.crt"))), t0, Utc::now());
-        let mut b = registry.register(2, hello(B, Some(chain("client-b.crt"))), t0, Utc::now());
-        let mut no_cert = registry.register(
-            3,
-            hello("cccccccc-0000-4000-8000-000000000000", None),
-            t0,
-            Utc::now(),
-        );
+        let mut a = registry
+            .register(1, hello(A, Some(chain("client-a.crt"))), t0, Utc::now())
+            .unwrap();
+        let mut b = registry
+            .register(2, hello(B, Some(chain("client-b.crt"))), t0, Utc::now())
+            .unwrap();
+        let mut no_cert = registry
+            .register(
+                3,
+                hello("cccccccc-0000-4000-8000-000000000000", None),
+                t0,
+                Utc::now(),
+            )
+            .unwrap();
 
         // 空 CRL：只有沒有憑證的連線不通過
         let kicked = revalidate(&registry, &state.current(), UnixTime::now());
@@ -325,15 +413,17 @@ mod tests {
         let fx = Fixture::new("expired");
         let (_r, state) = fx.reloader();
         let registry = Registry::new();
-        let mut e = registry.register(
-            1,
-            hello(
-                "11111111-2222-4333-8444-555555555555",
-                Some(chain("client-expired.crt")),
-            ),
-            Instant::now(),
-            Utc::now(),
-        );
+        let mut e = registry
+            .register(
+                1,
+                hello(
+                    "11111111-2222-4333-8444-555555555555",
+                    Some(chain("client-expired.crt")),
+                ),
+                Instant::now(),
+                Utc::now(),
+            )
+            .unwrap();
         let kicked = revalidate(&registry, &state.current(), UnixTime::now());
         assert_eq!(kicked.len(), 1);
         assert!(
@@ -350,7 +440,9 @@ mod tests {
         fx.paths.client_ca = None;
         let (_r, state) = fx.reloader();
         let registry = Registry::new();
-        let _x = registry.register(1, hello(A, None), Instant::now(), Utc::now());
+        let _x = registry
+            .register(1, hello(A, None), Instant::now(), Utc::now())
+            .unwrap();
         assert!(revalidate(&registry, &state.current(), UnixTime::now()).is_empty());
     }
 }

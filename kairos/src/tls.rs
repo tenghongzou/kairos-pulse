@@ -10,9 +10,9 @@ use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, UnixTime,
 };
-use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::server::danger::ClientCertVerifier;
-use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+use tokio_rustls::rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
+use tokio_rustls::rustls::{CertificateError, RootCertStore, ServerConfig};
 
 /// 組成 TLS 設定所需的檔案
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,12 +74,20 @@ pub fn build(paths: &TlsPaths) -> Result<TlsMaterial, Error> {
         Some(v) => builder.with_client_cert_verifier(v.clone()),
         None => builder.with_no_client_auth(),
     };
-    let config = builder.with_single_cert(certs, key).map_err(|e| {
+    let mut config = builder.with_single_cert(certs, key).map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
             format!("{} 與 {} 無法組成 TLS 設定: {}", paths.cert, paths.key, e),
         )
     })?;
+    if verifier.is_some() {
+        // 啟用 mTLS 時停用 session resumption：恢復的 session 不會重新驗證客戶端憑證，
+        // 過期或已撤銷的憑證可藉由 resumption 繼續連線。
+        // 不保存 session（TLS 1.2 session ID 與 TLS 1.3 stateful resumption），也不發 TLS 1.3 ticket；
+        // 預設的 ticketer 本來就不產生 stateless ticket。
+        config.session_storage = Arc::new(NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+    }
 
     Ok(TlsMaterial {
         acceptor: TlsAcceptor::from(Arc::new(config)),
@@ -230,6 +238,30 @@ impl TlsState {
     }
 }
 
+/// 握手失敗原因中與撤銷相關的部分，用來把這類日誌與一般的握手失敗分開節流
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationFailure {
+    /// 客戶端憑證已被撤銷
+    Revoked,
+    /// CRL 已過期（超過 nextUpdate）或無法判定撤銷狀態：多半是伺服器端的 CRL 需要更新
+    StatusUnavailable,
+}
+
+/// 從握手錯誤（tokio-rustls 以 `io::Error` 包裝的 `rustls::Error`）判斷是否與撤銷相關
+pub fn revocation_failure(e: &Error) -> Option<RevocationFailure> {
+    use tokio_rustls::rustls::Error as TlsError;
+    let inner = e.get_ref()?.downcast_ref::<TlsError>()?;
+    match inner {
+        TlsError::InvalidCertificate(CertificateError::Revoked) => Some(RevocationFailure::Revoked),
+        TlsError::InvalidCertificate(
+            CertificateError::UnknownRevocationStatus
+            | CertificateError::ExpiredRevocationList
+            | CertificateError::ExpiredRevocationListContext { .. },
+        ) => Some(RevocationFailure::StatusUnavailable),
+        _ => None,
+    }
+}
+
 /// 以驗證器檢查握手時取得的客戶端憑證鏈（[0] 為 end-entity，其餘為中繼憑證）。
 /// 用於重載 CA/CRL 後與定期檢查憑證是否過期。
 pub fn verify_chain(
@@ -303,6 +335,48 @@ mod tests {
         let mtls = build(&paths(Some("test-ca.crt"), &["crl-revoke-a.crl"])).unwrap();
         assert!(mtls.auth_enabled());
         assert_eq!(mtls.crl_count, 1);
+    }
+
+    #[test]
+    fn session_resumption_is_disabled_only_with_mtls() {
+        // K-S4：恢復的 session 不會重新驗證客戶端憑證，啟用 mTLS 時必須停用
+        let mtls = build(&paths(Some("test-ca.crt"), &[])).unwrap();
+        let config = mtls.acceptor.config();
+        assert_eq!(config.send_tls13_tickets, 0);
+        assert!(!config.session_storage.can_cache());
+        assert!(!config.ticketer.enabled());
+
+        let plain = build(&paths(None, &[])).unwrap();
+        assert!(plain.acceptor.config().session_storage.can_cache());
+    }
+
+    #[test]
+    fn revocation_failures_are_classified() {
+        use tokio_rustls::rustls::Error as TlsError;
+        let wrap = |e: TlsError| Error::new(ErrorKind::InvalidData, e);
+        assert_eq!(
+            revocation_failure(&wrap(TlsError::InvalidCertificate(
+                CertificateError::Revoked
+            ))),
+            Some(RevocationFailure::Revoked)
+        );
+        for status in [
+            CertificateError::ExpiredRevocationList,
+            CertificateError::UnknownRevocationStatus,
+        ] {
+            assert_eq!(
+                revocation_failure(&wrap(TlsError::InvalidCertificate(status))),
+                Some(RevocationFailure::StatusUnavailable)
+            );
+        }
+        assert_eq!(
+            revocation_failure(&wrap(TlsError::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            ))),
+            None
+        );
+        assert_eq!(revocation_failure(&Error::other("x")), None);
+        assert_eq!(revocation_failure(&Error::from(ErrorKind::TimedOut)), None);
     }
 
     #[test]
