@@ -1,21 +1,49 @@
+# Pulse 預設設定（編譯時以 include_str! 嵌入二進位檔）
+#
+# 載入順序（後者覆蓋前者）：
+#   1. 本檔（嵌入的預設值）
+#   2. 目前工作目錄下的 pulse.toml（可省略；只需寫要覆蓋的欄位）
+#   3. 環境變數 PULSE__<SECTION>__<KEY>，例如 PULSE__SERVER__PORT=9000
+#
+# 設定中的相對路徑一律以「目前工作目錄」解析。
+
 [server]
 address = "127.0.0.1"
 port = 8080
-# TLS 用的主機名稱（SNI / 憑證 CN/SAN 驗證）；正式環境請填實際伺服器域名
+# TLS 用的主機名稱（SNI / 憑證 SAN 驗證）；正式環境請填實際伺服器域名
 domain = "localhost"
-# 是否略過 TLS 憑證驗證。⚠️ 僅供本機自簽憑證的開發測試使用，
-# 正式環境務必設為 false，否則容易遭中間人攻擊。
-accept_invalid_certs = true
+# 是否略過 TLS 憑證驗證。⚠️ 僅供開發測試，正式環境務必維持 false，
+# 否則容易遭中間人攻擊。使用自簽憑證時請改用下方的 ca_cert。
+accept_invalid_certs = false
+# 額外信任的 CA 或自簽憑證（PEM，可含多張）路徑；空字串 = 只使用作業系統信任庫。
+# 非空時於啟動時讀取，讀不到檔案或格式錯誤會直接結束程式。
+ca_cert = ""
+# mTLS 客戶端憑證（伺服器要求客戶端憑證時才需要）。兩者須同時設定或同時留空。
+# 憑證的 SAN 必須是 DNS:<本機 agent_id>（可用 `pulse --print-agent-id` 取得），EKU 需含 clientAuth。
+client_cert = ""   # 客戶端憑證 PEM：第一張為客戶端憑證本身，之後可接中繼 CA（整條鏈都會送出）
+client_key = ""    # 對應私鑰 PEM：PKCS#8 / PKCS#1 / SEC1 皆可，支援 RSA、ECDSA P-256 / P-384、Ed25519；
+                   # 不可加密。與憑證不成對時啟動即報錯
 
 [retry]
+# 連續連線失敗達此次數後，重連日誌由 warn 升級為 error（重試本身不設上限）
 max_retries = 5
-initial_delay = 2  # 初始延遲（秒）
+initial_delay = 2  # 第一次重連前的延遲（秒，1～3600），之後每次加倍
+max_delay = 60     # 重連延遲上限（秒，1～3600）；實際延遲另加 ±20% 抖動（不超過此上限）
+# 註冊後連線穩定維持 30 秒以上才會重置退避；更早斷線仍視為連續失敗
 
 [heartbeat]
-interval = 1  # 心跳間隔（秒）
+interval = 1  # 心跳間隔（秒，1～60）
 
 [report]
-interval = 5  # 系統資訊回報間隔（秒）
+interval = 5  # 系統資訊回報間隔（秒，1～3600）
+
+[agent]
+# 存放 agent_id（UUID v4）的檔案；第一次啟動時自動產生，之後沿用。
+# 內容須為 8-4-4-4-12 格式的 UUID，不合法時啟動即報錯（刪除檔案可重新產生）
+id_file = "agent.id"
 
 [log]
-level = "info"  # 日誌級別（trace, debug, info, warn, error）
+level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）
+# 日誌檔按日分檔：logs/pulse-YYYY-MM-DD.log（檔名日期為 UTC）。
+# 保留今天與前 N 天，更早的於啟動時與每小時清除；0 = 永久保留，上限 3650
+retention_days = 14

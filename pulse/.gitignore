@@ -3,3 +3,8 @@
 
 /target
 /logs
+
+# 執行期產生 / 本機專用檔案
+agent.id
+pulse.toml
+logs/
