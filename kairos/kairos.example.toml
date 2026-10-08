@@ -1,0 +1,23 @@
+[server]
+listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080
+cert_path = "cert.pem"
+key_path = "key.pem"
+max_connections = 1024
+reload_interval_secs = 30     # 每隔幾秒檢查憑證／私鑰／客戶端 CA／CRL 是否變更並重新驗證現役連線，0 = 停用，上限 3600
+
+[timeouts]
+handshake_secs = 10
+hello_secs = 5
+write_secs = 5
+
+[storage]
+data_dir = "data"
+retention_days = 30           # reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
+
+[auth]
+client_ca = ""                # 非空：要求客戶端憑證（mTLS），以此 PEM（可含多張 CA）驗證，並強制 agent_id 綁定
+crl = []                      # CRL 檔路徑清單（PEM 或 DER），例如 ["agents.crl"]；只在設定 client_ca 時有效
+
+[log]
+level = "info"
+retention_days = 14           # logs/kairos-YYYY-MM-DD.log（UTC 日期）保留天數，0 = 永久保留，上限 3650

@@ -1,0 +1,356 @@
+//! TLS 熱重載：定期檢查伺服器憑證、私鑰、客戶端 CA 與 CRL 檔的內容，有變化就重建設定並
+//! 原子替換；重建失敗時保留舊設定。每個週期也以目前的驗證器重新驗證所有現役連線的
+//! 客戶端憑證（撤銷、過期、不再受信任），不通過的連線收到 `certificate_rejected` 並被關閉。
+
+use log::{debug, error, info, warn};
+use std::io::Error;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::{MissedTickBehavior, interval};
+use tokio_rustls::rustls::pki_types::UnixTime;
+
+use crate::registry::{KickReason, Registry};
+use crate::shutdown::Shutdown;
+use crate::tls::{self, Fingerprint, TlsMaterial, TlsPaths, TlsState};
+
+/// 一次檢查的結果
+#[derive(Debug)]
+pub enum ReloadOutcome {
+    /// 檔案內容沒有變化
+    Unchanged,
+    /// 已重建並替換設定
+    Reloaded,
+    /// 檔案有變化但重建失敗，仍使用舊設定
+    Failed(Error),
+}
+
+pub struct Reloader {
+    paths: TlsPaths,
+    /// 最近一次「嘗試」重建時的指紋；重建失敗後，檔案沒有再變化就不重試（避免每個週期重複記錄同一個錯誤）
+    last: Fingerprint,
+    state: Arc<TlsState>,
+}
+
+impl Reloader {
+    /// `initial` 應在建立目前設定**之前**取得，確保之間的變更不會被漏掉
+    pub fn new(paths: TlsPaths, initial: Fingerprint, state: Arc<TlsState>) -> Self {
+        Self {
+            paths,
+            last: initial,
+            state,
+        }
+    }
+
+    /// 檢查檔案是否變化，有變化就重建（同步讀檔，請在 blocking 執行緒呼叫）
+    pub fn check(&mut self) -> ReloadOutcome {
+        let current = tls::fingerprint(&self.paths);
+        if current == self.last {
+            return ReloadOutcome::Unchanged;
+        }
+        self.last = current;
+        match tls::build(&self.paths) {
+            Ok(material) => {
+                self.state.replace(material);
+                ReloadOutcome::Reloaded
+            }
+            Err(e) => ReloadOutcome::Failed(e),
+        }
+    }
+}
+
+/// 以目前設定的驗證器重新驗證所有現役連線；不通過者送出 kick。回傳被踢的 (agent_id, 原因)。
+pub fn revalidate(
+    registry: &Registry,
+    material: &TlsMaterial,
+    now: UnixTime,
+) -> Vec<(String, String)> {
+    let Some(verifier) = &material.verifier else {
+        return Vec::new();
+    };
+    let mut kicked = Vec::new();
+    // 先取出清單再驗證，驗證期間不持有 registry 的鎖
+    for conn in registry.live_connections() {
+        if let Err(reason) = tls::verify_chain(verifier.as_ref(), conn.client_chain.as_deref(), now)
+            && registry.kick(
+                &conn.agent_id,
+                conn.conn_id,
+                KickReason::CertificateRejected(reason.clone()),
+            )
+        {
+            kicked.push((conn.agent_id, reason));
+        }
+    }
+    kicked
+}
+
+/// 重載工作：每 `period` 檢查一次，直到關機
+pub async fn run(
+    mut reloader: Reloader,
+    registry: Arc<Registry>,
+    state: Arc<TlsState>,
+    period: Duration,
+    shutdown: Arc<Shutdown>,
+) {
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 第一次 tick 立即完成；啟動時設定剛載入，跳過
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+
+        let joined = tokio::task::spawn_blocking(move || {
+            let outcome = reloader.check();
+            (reloader, outcome)
+        })
+        .await;
+        let outcome;
+        (reloader, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!("TLS 重載工作異常結束，停止熱重載: {}", e);
+                return;
+            }
+        };
+
+        let material = state.current();
+        match outcome {
+            ReloadOutcome::Unchanged => {}
+            ReloadOutcome::Reloaded => info!(
+                "已重新載入 TLS 設定（mTLS：{}，CRL {} 份）",
+                if material.auth_enabled() {
+                    "啟用"
+                } else {
+                    "未啟用"
+                },
+                material.crl_count
+            ),
+            ReloadOutcome::Failed(e) => {
+                error!("重新載入 TLS 設定失敗，繼續使用目前的設定: {}", e)
+            }
+        }
+
+        let kicked = revalidate(&registry, &material, UnixTime::now());
+        for (agent_id, reason) in &kicked {
+            warn!(
+                "agent {} 的客戶端憑證已不再有效（{}），關閉連線",
+                agent_id, reason
+            );
+        }
+        if !kicked.is_empty() {
+            debug!("本次檢查關閉 {} 條連線", kicked.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{ClientChain, HelloInfo};
+    use chrono::Utc;
+    use std::path::PathBuf;
+    use std::time::Instant;
+    use tokio::sync::oneshot::error::TryRecvError;
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+
+    const PKI: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/pki/");
+    const A: &str = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+    const B: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    fn pki(name: &str) -> PathBuf {
+        PathBuf::from(format!("{PKI}{name}"))
+    }
+
+    /// 在暫存目錄放一份可被改寫的設定檔組
+    struct Fixture {
+        dir: PathBuf,
+        paths: TlsPaths,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "kairos-reload-{}-{}-{}",
+                tag,
+                std::process::id(),
+                crate::registry::next_conn_id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in ["server.crt", "server.key", "test-ca.crt"] {
+                std::fs::copy(pki(f), dir.join(f)).unwrap();
+            }
+            std::fs::copy(pki("crl-empty.crl"), dir.join("crl.crl")).unwrap();
+            let s = |n: &str| dir.join(n).to_string_lossy().to_string();
+            let paths = TlsPaths {
+                cert: s("server.crt"),
+                key: s("server.key"),
+                client_ca: Some(s("test-ca.crt")),
+                crls: vec![s("crl.crl")],
+            };
+            Self { dir, paths }
+        }
+
+        fn reloader(&self) -> (Reloader, Arc<TlsState>) {
+            let fp = tls::fingerprint(&self.paths);
+            let state = Arc::new(TlsState::new(tls::build(&self.paths).unwrap()));
+            (Reloader::new(self.paths.clone(), fp, state.clone()), state)
+        }
+
+        fn write(&self, name: &str, from: &str) {
+            std::fs::copy(pki(from), self.dir.join(name)).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn chain(name: &str) -> ClientChain {
+        Arc::from(vec![CertificateDer::from_pem_file(pki(name)).unwrap()])
+    }
+
+    fn hello(agent_id: &str, chain: Option<ClientChain>) -> HelloInfo {
+        HelloInfo {
+            agent_id: agent_id.into(),
+            hostname: "h".into(),
+            agent_version: "1".into(),
+            peer: "p".into(),
+            offline_after: Duration::from_secs(5),
+            client_chain: chain,
+        }
+    }
+
+    #[test]
+    fn unchanged_files_do_not_reload() {
+        let fx = Fixture::new("same");
+        let (mut r, state) = fx.reloader();
+        let before = Arc::as_ptr(&state.current());
+        assert!(matches!(r.check(), ReloadOutcome::Unchanged));
+        assert_eq!(Arc::as_ptr(&state.current()), before);
+    }
+
+    #[test]
+    fn changed_crl_triggers_reload() {
+        let fx = Fixture::new("crl");
+        let (mut r, state) = fx.reloader();
+        let before = Arc::as_ptr(&state.current());
+        fx.write("crl.crl", "crl-revoke-a.crl");
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert_ne!(Arc::as_ptr(&state.current()), before);
+        // 再檢查一次：沒有新變化
+        assert!(matches!(r.check(), ReloadOutcome::Unchanged));
+    }
+
+    #[test]
+    fn failed_reload_keeps_old_material_and_retries_after_fix() {
+        let fx = Fixture::new("fail");
+        let (mut r, state) = fx.reloader();
+        let before = state.current();
+        std::fs::write(fx.dir.join("test-ca.crt"), "broken").unwrap();
+
+        match r.check() {
+            ReloadOutcome::Failed(e) => assert!(e.to_string().contains("test-ca.crt"), "{e}"),
+            other => panic!("應失敗: {other:?}"),
+        }
+        // 舊設定仍在使用
+        assert!(Arc::ptr_eq(&state.current(), &before));
+        assert!(state.current().auth_enabled());
+        // 檔案沒有再變化：不重試、不重複報錯
+        assert!(matches!(r.check(), ReloadOutcome::Unchanged));
+        // 修好後重建成功
+        fx.write("test-ca.crt", "test-ca.crt");
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert!(!Arc::ptr_eq(&state.current(), &before));
+    }
+
+    #[test]
+    fn missing_file_is_a_failed_reload() {
+        let fx = Fixture::new("missing");
+        let (mut r, state) = fx.reloader();
+        let before = state.current();
+        std::fs::remove_file(fx.dir.join("server.key")).unwrap();
+        assert!(matches!(r.check(), ReloadOutcome::Failed(_)));
+        assert!(Arc::ptr_eq(&state.current(), &before));
+    }
+
+    #[test]
+    fn revalidate_kicks_revoked_and_untrusted_connections() {
+        let fx = Fixture::new("revalidate");
+        let (mut r, state) = fx.reloader();
+        let registry = Registry::new();
+        let t0 = Instant::now();
+        let mut a = registry.register(1, hello(A, Some(chain("client-a.crt"))), t0, Utc::now());
+        let mut b = registry.register(2, hello(B, Some(chain("client-b.crt"))), t0, Utc::now());
+        let mut no_cert = registry.register(
+            3,
+            hello("cccccccc-0000-4000-8000-000000000000", None),
+            t0,
+            Utc::now(),
+        );
+
+        // 空 CRL：只有沒有憑證的連線不通過
+        let kicked = revalidate(&registry, &state.current(), UnixTime::now());
+        assert_eq!(kicked.len(), 1);
+        assert!(matches!(
+            no_cert.kick.try_recv(),
+            Ok(KickReason::CertificateRejected(_))
+        ));
+
+        // 換成撤銷 A 的 CRL → A 被踢，B 不受影響
+        fx.write("crl.crl", "crl-revoke-a.der");
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        let kicked = revalidate(&registry, &state.current(), UnixTime::now());
+        assert_eq!(kicked.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), [A]);
+        match a.kick.try_recv() {
+            Ok(KickReason::CertificateRejected(reason)) => {
+                assert!(reason.to_lowercase().contains("revoked"), "{reason}")
+            }
+            other => panic!("A 應被踢: {other:?}"),
+        }
+        assert_eq!(b.kick.try_recv(), Err(TryRecvError::Empty));
+
+        // 已踢過的不會重複處理
+        assert!(revalidate(&registry, &state.current(), UnixTime::now()).is_empty());
+    }
+
+    #[test]
+    fn revalidate_detects_expired_certificates() {
+        let fx = Fixture::new("expired");
+        let (_r, state) = fx.reloader();
+        let registry = Registry::new();
+        let mut e = registry.register(
+            1,
+            hello(
+                "11111111-2222-4333-8444-555555555555",
+                Some(chain("client-expired.crt")),
+            ),
+            Instant::now(),
+            Utc::now(),
+        );
+        let kicked = revalidate(&registry, &state.current(), UnixTime::now());
+        assert_eq!(kicked.len(), 1);
+        assert!(
+            kicked[0].1.to_lowercase().contains("expired"),
+            "{}",
+            kicked[0].1
+        );
+        assert!(e.kick.try_recv().is_ok());
+    }
+
+    #[test]
+    fn revalidate_is_noop_without_mtls() {
+        let mut fx = Fixture::new("nomtls");
+        fx.paths.client_ca = None;
+        let (_r, state) = fx.reloader();
+        let registry = Registry::new();
+        let _x = registry.register(1, hello(A, None), Instant::now(), Utc::now());
+        assert!(revalidate(&registry, &state.current(), UnixTime::now()).is_empty());
+    }
+}

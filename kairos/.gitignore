@@ -5,3 +5,10 @@
 
 # TLS 憑證與私鑰
 *.pem
+
+# 執行時產生的資料與日誌
+data/
+logs/
+
+# 本機設定（範本請見 kairos.example.toml）
+kairos.toml
