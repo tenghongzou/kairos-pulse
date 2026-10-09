@@ -23,8 +23,9 @@ use crate::config::TimeoutSettings;
 use crate::per_ip::source_key;
 use crate::protocol::{
     ClientMsg, ErrorCode, Frame, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, NdjsonCodec,
-    PROTO_VERSION, Proto, ServerMsg, clamp_heartbeat_interval_ms, normalize_agent_id,
-    offline_after_ms, parse_client_msg, validate_client_msg, validate_hello, validate_report,
+    PROTO_VERSION, Proto, ServerMsg, clamp_heartbeat_interval_ms, hello_seq_of_invalid,
+    normalize_agent_id, offline_after_ms, parse_client_msg, validate_client_msg, validate_hello,
+    validate_report,
 };
 use crate::rate::{
     MAX_REPORT_PACING_DELAY, Pace, REPORT_BURST, REPORT_RATE_PER_SEC, ReportLimiter, ReportSource,
@@ -35,7 +36,7 @@ use crate::registry::{
 };
 use crate::shutdown::{CONNECTIONS_DEADLINE, Shutdown, drain_limit};
 use crate::storage::{ReportRecord, ReportSink, WriteStatus, fmt_time};
-use crate::throttle::{Category, LogThrottle};
+use crate::throttle::{Category, Key, LogThrottle};
 use crate::throttled;
 use crate::tls::{RevocationFailure, TlsState, revocation_failure, verify_chain};
 
@@ -153,19 +154,35 @@ impl Handled {
 enum Incoming {
     Msg(ClientMsg),
     TooLong,
-    BadRequest(String),
+    /// 無效訊息；`seq` 只在能辨識為 hello 並取得 seq 時才有值（F5），回應的 `bad_request` 帶回它
+    BadRequest {
+        message: String,
+        seq: Option<u64>,
+    },
 }
 
 fn classify(frame: Frame) -> Incoming {
     match frame {
         Frame::TooLong => Incoming::TooLong,
-        Frame::InvalidUtf8 => Incoming::BadRequest("line is not valid UTF-8".to_string()),
+        Frame::InvalidUtf8 => Incoming::BadRequest {
+            message: "line is not valid UTF-8".to_string(),
+            seq: None,
+        },
         Frame::Line(line) => match parse_client_msg(&line) {
             Ok(msg) => match validate_client_msg(&msg) {
                 Ok(()) => Incoming::Msg(msg),
-                Err(e) => Incoming::BadRequest(e),
+                Err(message) => Incoming::BadRequest {
+                    seq: match &msg {
+                        ClientMsg::Hello { seq, .. } => Some(*seq),
+                        _ => None,
+                    },
+                    message,
+                },
             },
-            Err(e) => Incoming::BadRequest(e),
+            Err(message) => Incoming::BadRequest {
+                seq: hello_seq_of_invalid(&line),
+                message,
+            },
         },
     }
 }
@@ -463,7 +480,12 @@ pub async fn handle_connection(
     if guard.disconnect() {
         throttled!(
             ctx.throttle,
-            (Category::AgentOffline, peer.ip()),
+            Key::agent_event(
+                Category::AgentOffline,
+                peer.ip(),
+                &agent.agent_id,
+                agent.authenticated
+            ),
             info,
             "[#{}] agent {}（{}）連線關閉，標記為離線",
             conn_id,
@@ -570,7 +592,12 @@ impl Conn {
 
     /// 回覆無效訊息（`bad_request` 或 `unknown_type`）。兩者合計連續達上限（中間沒有合法訊息）時，
     /// 該則改為 fatal 並關閉連線，避免交錯送出兩種無效訊息來繞過上限。
-    async fn reply_invalid(&mut self, code: ErrorCode, message: String) -> Result<Flow, Error> {
+    async fn reply_invalid(
+        &mut self,
+        code: ErrorCode,
+        seq: Option<u64>,
+        message: String,
+    ) -> Result<Flow, Error> {
         self.bad_requests += 1;
         let fatal = self.bad_requests >= MAX_CONSECUTIVE_BAD_REQUESTS;
         if fatal {
@@ -593,17 +620,27 @@ impl Conn {
                 message.escape_debug()
             );
         }
-        self.reply(ServerMsg::error_with_fatal(None, code, message, fatal))
+        self.reply(ServerMsg::error_with_fatal(seq, code, message, fatal))
             .await
     }
 
-    async fn reply_bad_request(&mut self, message: String) -> Result<Flow, Error> {
-        self.reply_invalid(ErrorCode::BadRequest, message).await
+    /// `seq` 為能從無效的 hello 取得的 seq（F5），其他情況為 `None`
+    async fn reply_bad_request(
+        &mut self,
+        seq: Option<u64>,
+        message: String,
+    ) -> Result<Flow, Error> {
+        self.reply_invalid(ErrorCode::BadRequest, seq, message)
+            .await
     }
 
     async fn reply_unknown_type(&mut self) -> Result<Flow, Error> {
-        self.reply_invalid(ErrorCode::UnknownType, "unknown message type".to_string())
-            .await
+        self.reply_invalid(
+            ErrorCode::UnknownType,
+            None,
+            "unknown message type".to_string(),
+        )
+        .await
     }
 
     async fn reply_too_long(&mut self) -> Result<Flow, Error> {
@@ -624,10 +661,20 @@ impl Conn {
         .await
     }
 
+    /// 已註冊 agent 的事件（上線、離線、被取代等）的節流 key：通過 mTLS 驗證時以 agent_id 節流（F1）
+    fn agent_key(&self, category: Category, agent: &Agent) -> Key {
+        Key::agent_event(
+            category,
+            self.peer.ip(),
+            &agent.agent_id,
+            agent.authenticated,
+        )
+    }
+
     async fn reply_superseded(&mut self, agent: &Agent) -> Result<Flow, Error> {
         throttled!(
             self.throttle,
-            (Category::AgentOffline, self.peer.ip()),
+            self.agent_key(Category::AgentOffline, agent),
             info,
             "[#{}] agent {} 已由新連線取代，關閉舊連線",
             self.conn_id,
@@ -770,7 +817,9 @@ impl Conn {
 
             let flow = match classify(frame) {
                 Incoming::TooLong => self.reply_too_long().await?,
-                Incoming::BadRequest(message) => self.reply_bad_request(message).await?,
+                Incoming::BadRequest { message, seq } => {
+                    self.reply_bad_request(seq, message).await?
+                }
                 Incoming::Msg(ClientMsg::Hello {
                     seq,
                     proto,
@@ -817,8 +866,8 @@ impl Conn {
                                 authenticated,
                             }));
                         }
-                        // 欄位不合規定：計入連續無效訊息，繼續等待 hello
-                        Err(message) => self.reply_bad_request(message).await?,
+                        // 欄位不合規定：計入連續無效訊息，繼續等待 hello；回應帶回 hello 的 seq（F5）
+                        Err(message) => self.reply_bad_request(Some(seq), message).await?,
                     }
                 }
                 Incoming::Msg(ClientMsg::Heartbeat { seq, .. } | ClientMsg::Report { seq, .. }) => {
@@ -923,7 +972,7 @@ impl Conn {
         // hostname / agent_version 由對方提供：已在 hello 驗證拒絕控制與格式字元，日誌輸出時再跳脫一次
         throttled!(
             self.throttle,
-            (Category::AgentOnline, self.peer.ip()),
+            self.agent_key(Category::AgentOnline, agent),
             info,
             "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms",
             self.conn_id,
@@ -980,7 +1029,7 @@ impl Conn {
                         Err(_) => {
                             throttled!(
                                 self.throttle,
-                                (Category::AgentOffline, self.peer.ip()),
+                                self.agent_key(Category::AgentOffline, agent),
                                 info,
                                 "[#{}] agent {} 超過 {} ms 沒有合法訊息，關閉連線",
                                 self.conn_id,
@@ -1016,7 +1065,7 @@ impl Conn {
             Touch::Revived => {
                 throttled!(
                     self.throttle,
-                    (Category::AgentOnline, self.peer.ip()),
+                    self.agent_key(Category::AgentOnline, agent),
                     info,
                     "[#{}] agent {}（{}）恢復上線",
                     self.conn_id,
@@ -1100,8 +1149,10 @@ impl Conn {
     ) -> Result<Handled, Error> {
         let msg = match classify(frame) {
             Incoming::TooLong => return Ok(Handled::not_alive(self.reply_too_long().await?)),
-            Incoming::BadRequest(message) => {
-                return Ok(Handled::not_alive(self.reply_bad_request(message).await?));
+            Incoming::BadRequest { message, seq } => {
+                return Ok(Handled::not_alive(
+                    self.reply_bad_request(seq, message).await?,
+                ));
             }
             Incoming::Msg(msg) => msg,
         };
@@ -1767,7 +1818,7 @@ mod tests {
         );
         assert!(matches!(
             classify(Frame::Line(line)),
-            Incoming::BadRequest(m) if m.contains("ts")
+            Incoming::BadRequest { message: m, seq: None } if m.contains("ts")
         ));
         let line = format!(
             r#"{{"type":"heartbeat","seq":1,"ts":"{}"}}"#,
@@ -1778,7 +1829,37 @@ mod tests {
         let line = r#"{"type":"heartbeat","seq":1,"ts":"2026 x"}"#.to_string();
         assert!(matches!(
             classify(Frame::Line(line)),
-            Incoming::BadRequest(m) if m.contains("ts")
+            Incoming::BadRequest { message: m, seq: None } if m.contains("ts")
+        ));
+    }
+
+    #[test]
+    fn classify_keeps_the_seq_of_an_invalid_hello() {
+        // F5：hello 的 ts 不合規定 → bad_request 帶回 hello 的 seq
+        let hello = r#"{"type":"hello","seq":7,"proto":1,"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"h","agent_version":"1","heartbeat_interval_ms":1000,"ts":"TS"}"#;
+        let line = hello.replace("TS", &"x".repeat(65));
+        assert!(matches!(
+            classify(Frame::Line(line)),
+            Incoming::BadRequest { message: m, seq: Some(7) } if m.contains("ts")
+        ));
+        // 欄位缺漏（無法解析）仍能取回 seq
+        let line = hello.replace(r#""hostname":"h","#, "");
+        assert!(matches!(
+            classify(Frame::Line(line)),
+            Incoming::BadRequest { seq: Some(7), .. }
+        ));
+        // 壞 JSON、不是 hello：不帶 seq
+        assert!(matches!(
+            classify(Frame::Line("{".to_string())),
+            Incoming::BadRequest { seq: None, .. }
+        ));
+        assert!(matches!(
+            classify(Frame::Line(r#"{"type":"report","seq":3}"#.to_string())),
+            Incoming::BadRequest { seq: None, .. }
+        ));
+        assert!(matches!(
+            classify(Frame::InvalidUtf8),
+            Incoming::BadRequest { seq: None, .. }
         ));
     }
 }

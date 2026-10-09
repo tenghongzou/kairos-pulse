@@ -225,6 +225,22 @@ pub fn parse_client_msg(line: &str) -> Result<ClientMsg, String> {
     serde_json::from_str(line).map_err(|e| format!("invalid message: {}", e))
 }
 
+/// 無法解析為合法訊息的一行（欄位缺漏、型別錯誤等）：若仍是 JSON 物件、`type` 為 `"hello"`
+/// 且 `seq` 為 u64，回傳該 seq，讓 `bad_request` 能帶回（F5）；否則回傳 `None`
+pub fn hello_seq_of_invalid(line: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(rename = "type")]
+        kind: Option<Value>,
+        seq: Option<Value>,
+    }
+    let probe: Probe = serde_json::from_str(line).ok()?;
+    if probe.kind?.as_str()? != "hello" {
+        return None;
+    }
+    probe.seq?.as_u64()
+}
+
 /// 由 client 宣告的心跳間隔計算離線門檻：`max(5 × heartbeat_interval_ms, 5000)`
 /// 將 client 宣告的心跳間隔夾在 [`MIN_HEARTBEAT_INTERVAL_MS`]..=[`MAX_HEARTBEAT_INTERVAL_MS`]
 pub fn clamp_heartbeat_interval_ms(heartbeat_interval_ms: u64) -> u64 {
@@ -1055,5 +1071,26 @@ mod tests {
             .encode("{\"type\":\"ack\",\"seq\":1}".to_string(), &mut buf)
             .unwrap();
         assert_eq!(&buf[..], b"{\"type\":\"ack\",\"seq\":1}\n");
+    }
+
+    #[test]
+    fn hello_seq_is_recovered_from_unparsable_hello() {
+        // F5：hello 欄位缺漏或型別錯誤，仍能取回 seq
+        let missing_host = V_HELLO.replace(r#""hostname":"web-01","#, "");
+        assert!(parse_client_msg(&missing_host).is_err());
+        assert_eq!(hello_seq_of_invalid(&missing_host), Some(1));
+        let numeric_host = V_HELLO.replace(r#""web-01""#, "42");
+        assert_eq!(hello_seq_of_invalid(&numeric_host), Some(1));
+        // 不是 hello、seq 不是 u64、不是 JSON 物件：不帶 seq
+        assert_eq!(
+            hello_seq_of_invalid(r#"{"type":"heartbeat","seq":3}"#),
+            None
+        );
+        assert_eq!(hello_seq_of_invalid(r#"{"type":"hello","seq":-1}"#), None);
+        assert_eq!(hello_seq_of_invalid(r#"{"type":"hello","seq":"1"}"#), None);
+        assert_eq!(hello_seq_of_invalid(r#"{"type":"hello"}"#), None);
+        assert_eq!(hello_seq_of_invalid(r#"{"seq":1}"#), None);
+        assert_eq!(hello_seq_of_invalid("[1,2]"), None);
+        assert_eq!(hello_seq_of_invalid("not json"), None);
     }
 }

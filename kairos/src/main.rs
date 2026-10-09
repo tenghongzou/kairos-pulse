@@ -40,6 +40,16 @@ use crate::shutdown::{CONNECTIONS_DEADLINE, MONITOR_DEADLINE, Shutdown, WRITER_D
 use crate::throttle::{Category, LogThrottle};
 use crate::tls::{TlsPaths, TlsState};
 
+/// 版本字串（`--version` 與啟動日誌第一行；D3）：`kairos <版本> (<commit>)`。
+/// commit 由 build.rs 決定：環境變數 `BUILD_COMMIT`、`git rev-parse --short HEAD`，都失敗時為 `unknown`
+pub const VERSION: &str = concat!(
+    "kairos ",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("KAIROS_BUILD_COMMIT"),
+    ")"
+);
+
 /// accept 因資源問題失敗（例如檔案描述符用盡）後的等待時間
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
@@ -316,6 +326,10 @@ fn main() -> ExitCode {
             println!("{}", USAGE);
             return ExitCode::SUCCESS;
         }
+        Ok(CliAction::Version) => {
+            println!("{}", VERSION);
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             eprintln!("{}\n\n{}", e, USAGE);
             return ExitCode::FAILURE;
@@ -403,23 +417,48 @@ fn parse_nofile_soft_limit(limits: &str) -> Option<u64> {
     }
 }
 
+/// 建議的 `LimitNOFILE`：不小於所需數量的 2 的冪次，且至少 4096
+const MIN_SUGGESTED_NOFILE: u64 = 4096;
+
+/// soft limit 低於 `max_connections` 加上預留量時的警告訊息（D4：具體指出建議做法）；足夠時回傳 `None`
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fd_limit_warning(soft: u64, max_connections: usize) -> Option<String> {
+    let needed = max_connections as u64 + FD_RESERVE;
+    if soft >= needed {
+        return None;
+    }
+    let suggested = needed
+        .checked_next_power_of_two()
+        .unwrap_or(needed)
+        .max(MIN_SUGGESTED_NOFILE);
+    let lower = if soft > FD_RESERVE {
+        format!(
+            "；或將 server.max_connections 調低至 {} 以下（= 目前上限 {} − 預留 {}）",
+            soft - FD_RESERVE,
+            soft,
+            FD_RESERVE
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）加上預留的 {}（共 {}）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE={}，手動執行時先執行 ulimit -n {}{}",
+        soft, max_connections, FD_RESERVE, needed, suggested, suggested, lower
+    ))
+}
+
 /// 可開啟檔案數的 soft limit 低於 `max_connections` 加上預留量時警告（R2-K25）。
 /// 只在 Linux 讀取 `/proc/self/limits`（不需額外依賴）；其他平台不檢查。
 fn warn_if_fd_limit_low(max_connections: usize) {
     #[cfg(target_os = "linux")]
     if let Ok(text) = std::fs::read_to_string("/proc/self/limits")
         && let Some(soft) = parse_nofile_soft_limit(&text)
+        && let Some(message) = fd_limit_warning(soft, max_connections)
     {
-        let needed = max_connections as u64 + FD_RESERVE;
-        if soft < needed {
-            warn!(
-                "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）加上預留的 {}；連線數接近上限時可能 accept 失敗（EMFILE），請提高 ulimit -n 或 systemd 的 LimitNOFILE",
-                soft, max_connections, FD_RESERVE
-            );
-        }
+        warn!("{}", message);
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (max_connections, FD_RESERVE);
+    let _ = max_connections;
 }
 
 /// 執行伺服器直到關機。正常關機回傳 `Ok(None)`；因背景工作異常而關機時回傳 `Ok(Some(原因))`
@@ -430,6 +469,7 @@ async fn run(
     newest_log: Option<chrono::NaiveDate>,
     opts: RunOptions,
 ) -> Result<Option<String>, Error> {
+    info!("{}", VERSION);
     let default_file = Path::new(config::DEFAULT_CONFIG_FILE);
     match config_path {
         Some(p) => info!("設定檔: {}", p.display()),
@@ -736,6 +776,36 @@ Max open files            1024                 524288               files     \n
         let text = "Max open files            unlimited            unlimited            files\n";
         assert_eq!(parse_nofile_soft_limit(text), Some(u64::MAX));
         assert_eq!(parse_nofile_soft_limit("nothing"), None);
+    }
+
+    #[test]
+    fn fd_limit_warning_suggests_concrete_fixes() {
+        // D4：Ubuntu 預設 soft 1024、範例設定 max_connections = 1024
+        let message = fd_limit_warning(1024, 1024).unwrap();
+        assert_eq!(
+            message,
+            "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 1024，低於 server.max_connections（1024）加上預留的 64（共 1088）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE=4096，手動執行時先執行 ulimit -n 4096；或將 server.max_connections 調低至 960 以下（= 目前上限 1024 − 預留 64）"
+        );
+        // 足夠時不警告
+        assert_eq!(fd_limit_warning(1088, 1024), None);
+        assert_eq!(fd_limit_warning(u64::MAX, 65535), None);
+        // 需要量較大時建議值隨之提高；soft 小於預留量時不建議調低 max_connections
+        let message = fd_limit_warning(32, 10_000).unwrap();
+        assert!(message.contains("LimitNOFILE=16384"), "{message}");
+        assert!(!message.contains("調低"), "{message}");
+    }
+
+    #[test]
+    fn version_string_has_package_version_and_commit() {
+        // D3：`kairos <版本> (<commit>)`
+        let expected_prefix = format!("kairos {} (", env!("CARGO_PKG_VERSION"));
+        assert!(VERSION.starts_with(&expected_prefix), "{VERSION}");
+        assert!(VERSION.ends_with(')'), "{VERSION}");
+        let commit = &VERSION[expected_prefix.len()..VERSION.len() - 1];
+        assert!(
+            !commit.is_empty() && !commit.contains(char::is_whitespace),
+            "{VERSION}"
+        );
     }
 
     fn run_config(dir: &Path) -> AppConfig {

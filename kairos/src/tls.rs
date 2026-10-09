@@ -25,13 +25,45 @@ pub struct TlsPaths {
     pub crls: Vec<String>,
 }
 
+/// 監看的 TLS 設定檔種類（熱重載日誌用；F8）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TlsFileKind {
+    Cert,
+    Key,
+    ClientCa,
+    Crl,
+}
+
+impl TlsFileKind {
+    /// 與設定鍵相近的名稱：`cert`、`key`、`client_ca`、`crl`
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsFileKind::Cert => "cert",
+            TlsFileKind::Key => "key",
+            TlsFileKind::ClientCa => "client_ca",
+            TlsFileKind::Crl => "crl",
+        }
+    }
+}
+
 impl TlsPaths {
     /// 需要監看變化的所有檔案
     pub fn watched_files(&self) -> Vec<&str> {
-        let mut files = vec![self.cert.as_str(), self.key.as_str()];
+        self.watched_files_with_kind()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect()
+    }
+
+    /// 需要監看變化的所有檔案及其種類，順序與 [`TlsPaths::watched_files`]（及 [`fingerprint`]）相同
+    pub fn watched_files_with_kind(&self) -> Vec<(TlsFileKind, &str)> {
+        let mut files = vec![
+            (TlsFileKind::Cert, self.cert.as_str()),
+            (TlsFileKind::Key, self.key.as_str()),
+        ];
         if let Some(ca) = &self.client_ca {
-            files.push(ca);
-            files.extend(self.crls.iter().map(String::as_str));
+            files.push((TlsFileKind::ClientCa, ca.as_str()));
+            files.extend(self.crls.iter().map(|p| (TlsFileKind::Crl, p.as_str())));
         }
         files
     }

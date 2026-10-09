@@ -23,13 +23,14 @@
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
 - 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除
-- 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP）節流，每 10 秒最多一行並附上略過的則數（見「日誌」的節流說明）
+- 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP；啟用 mTLS 時 agent 的上線、離線等事件改依 `agent_id`）節流，每 10 秒最多一行並附上略過的則數，未啟用 mTLS 時另列出被略過的 agent_id（見「日誌」的節流說明）
 
 ## 需求
 
 - Rust 1.99（edition 2024）；專案根目錄的 `rust-toolchain.toml` 會讓 rustup 自動使用 1.99.0 與 rustfmt、clippy
 - OpenSSL 命令列工具（產生憑證與手動測試；私有 CA 流程需 OpenSSL 3.0+）
-- Linux 上可開啟的檔案數（`ulimit -n`／systemd 的 `LimitNOFILE`）需大於 `server.max_connections` + 64；啟動時讀取 `/proc/self/limits`，soft limit 不足時記 `WARN`（否則連線數接近上限時可能 accept 失敗，`EMFILE`）。其他平台不檢查，請自行確認
+- Linux 上可開啟的檔案數（`ulimit -n`／systemd 的 `LimitNOFILE`）需大於 `server.max_connections` + 64；啟動時讀取 `/proc/self/limits`，soft limit 不足時記 `WARN` 並附上建議值（否則連線數接近上限時可能 accept 失敗，`EMFILE`）。其他平台不檢查，請自行確認
+- 以 systemd 執行時請在 unit 的 `[Service]` 設定 `LimitNOFILE`，例如 `LimitNOFILE=8192`（發佈包的 `kairos.service` 已設定）：Ubuntu 預設的 soft limit 1024 在預設的 `server.max_connections = 1024` 下就不夠，每次啟動都會記 `WARN`。調高 `server.max_connections` 時一併調高
 
 ## 升級注意事項（與 Pulse 混用版本）
 
@@ -42,6 +43,23 @@ Kairos 與 Pulse 必須搭配升級。新舊版本混用時可能出現下列問
 | 新版 Pulse 連舊版 Kairos（`572b955` 之前，`timeouts.write_secs` 沒有 6 秒上限） | Kairos 的 `timeouts.write_secs` 大於約 8 秒時，伺服器寫檔緩慢期間的回應延遲可能超過 Pulse 讀取閒置中的 10 秒餘裕，Pulse **誤判斷線**並重連 |
 
 **部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
+
+## 從發佈包安裝
+
+地端正式部署請使用預編譯的發佈包 `kairos-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件與 `PROTOCOL.md`。
+
+完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
+
+1. `sha256sum -c SHA256SUMS` 驗證後解壓（`tar xzf … --strip-components=1`），`./kairos --version` 確認版本與 commit（輸出 `kairos <版本> (<commit>)`，見「設定」最後的命令列參數）。
+2. 建立系統使用者 `kairos` 與 `/opt/kairos`、`/opt/kairos/data`、`/opt/kairos/logs`。
+3. 在管理主機建立伺服器 CA 與以 `openssl ca` 管理的代理 CA（可撤銷、產生 CRL），簽發伺服器憑證與各 Pulse 送來的 CSR。
+4. 放置 `cert.pem`、`key.pem`、`client-ca.pem`、`agents.crl`，以 `kairos.example.toml` 建立 `kairos.toml`（至少改 `server.listen` 並啟用 `auth.client_ca`、`auth.crl`）。
+5. 安裝 `kairos.service`（`User=kairos`、`WorkingDirectory=/opt/kairos`、`ExecStart=/opt/kairos/kairos --config /opt/kairos/kairos.toml`、`LimitNOFILE=8192`、`Restart=on-failure`、`KillSignal=SIGINT`、`ProtectSystem=strict` 且只開放 `data/`、`logs/` 可寫），`systemctl enable --now kairos`。
+6. 確認 `--version`、`journalctl -u kairos` 與 `data/agents.json`。
+
+不要以 `systemd-run --user` 執行正式服務：沒有開啟 linger 時，最後一個登入 session 結束就會一起被停掉。升級時先升級全部 Pulse，再升級 Kairos（見上一節）。
+
+發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine` 建置 musl 靜態執行檔，輸出 `dist/kairos-<commit>-linux-x86_64.tar.gz` 與 `dist/SHA256SUMS`（工作目錄有未提交的變更時檔名加上 `-dirty`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。
 
 ## 快速開始
 
@@ -79,6 +97,7 @@ cargo run
 伺服器會從**目前工作目錄**讀取 `cert.pem`、`key.pem` 與（若存在）`kairos.toml`，並監聽 `127.0.0.1:8080`。啟動成功時會顯示：
 
 ```
+2026-10-08 11:15:40 [INFO] kairos 0.1.0 (4223101)
 2026-10-08 11:15:40 [INFO] 未找到 kairos.toml，使用程式內預設值
 2026-10-08 11:15:40 [INFO] Kairos 已啟動，監聽 127.0.0.1:8080（連線上限 1024，其中握手中 512，每個來源 IP 32，狀態表上限 10000，資料目錄 data）
 ```
@@ -107,17 +126,31 @@ cargo run
 2026-10-08 11:15:42 [INFO] [#1] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566（web-01，v0.1.0，127.0.0.1:50123）上線，離線門檻 5000 ms
 ```
 
-之後 agent 不再送訊息，約 5 秒後會被判定離線並關閉連線。每秒一次的存活檢查與連線本身的閒置逾時使用同一個門檻，哪一個先觸發不一定，因此會看到下列**其中一種**日誌：
+之後 agent 不再送訊息，約 5 秒後會被判定離線並關閉連線。離線由兩個機制處理，門檻相同：
+
+- **連線的閒置逾時**：記 `INFO`「超過 5000 ms 沒有合法訊息，關閉連線」，送出 `close_notify` 後最多再等對方 1 秒才釋放連線；釋放時若這個 agent 仍是線上，才記 `INFO`「連線關閉，標記為離線」。
+- **每秒一次的存活檢查**：`last_seen` 超過門檻時記 `WARN`「已 N 秒沒有合法訊息，標記為離線」。
+
+哪一個先觸發、對方多快回應 `close_notify` 都不固定，因此會看到下列**其中一種**組合：
 
 ```
-# 情況一：連線的閒置逾時先觸發
+# 情況一：閒置逾時先觸發，對方立即回應 close_notify，釋放連線時標記離線
 2026-10-08 11:15:47 [INFO] [#1] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566 超過 5000 ms 沒有合法訊息，關閉連線
 2026-10-08 11:15:47 [INFO] [#1] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566（web-01）連線關閉，標記為離線
 
-# 情況二：存活檢查先觸發（連線隨後關閉時已是離線狀態，不再重複記錄「標記為離線」）
+# 情況二：閒置逾時先觸發，但對方沒有回應 close_notify（例如 agent 程序被凍結、網路中斷），
+# 等待的這段時間內存活檢查先標記離線；連線釋放時已是離線狀態，不再記「連線關閉，標記為離線」
+2026-10-08 11:15:47 [INFO] [#1] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566 超過 5000 ms 沒有合法訊息，關閉連線
+2026-10-08 11:15:48 [WARN] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566（web-01）已 5.8 秒沒有合法訊息，標記為離線
+
+# 情況三：存活檢查先觸發（連線隨後關閉時已是離線狀態，不再記「連線關閉，標記為離線」）
 2026-10-08 11:15:47 [WARN] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566（web-01）已 5.1 秒沒有合法訊息，標記為離線
 2026-10-08 11:15:47 [INFO] [#1] agent 6f1c0e4a-1b2c-4d3e-9f00-112233445566 超過 5000 ms 沒有合法訊息，關閉連線
 ```
+
+地端測試以 `kill -STOP` 凍結 Pulse 時，觀察到的是情況二。
+
+兩行 `INFO` 屬於同一個節流類別（agent 離線，見「日誌」的節流說明）：未啟用 mTLS 時（例如本例）以來源 IP 節流，10 秒內同一來源只記第一行，因此情況一的第二行可能不會出現，而是在同一來源下一次記錄離線事件時附註「（上次記錄後另有 1 則略過，涉及 agent：6f1c0e4a-1b2c-4d3e-9f00-112233445566）」；啟用 mTLS 時以 `agent_id` 節流，兩行都會記錄。存活檢查的 `WARN` 不受這個節流影響。
 
 > [!NOTE]
 > `agent_id` 必須是 UUID 文字格式（`8-4-4-4-12` 個十六進位字元），自行測試時請照範例填寫，否則伺服器會回 `bad_request`。大寫的 `agent_id` 也接受，但伺服器一律轉成小寫後識別與記錄。
@@ -317,15 +350,18 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 - 每條連線的訊息速率上限也是固定值：所有訊息（含無效的行）可連續 50 則，之後每秒 20 則；超過時延後處理（每則最多 0.05 秒，期間不讀取該連線），不回錯誤，並記 `WARN`（依來源 IP 節流）。
 - 環境變數的值一律以字串讀入，數值與布林欄位在載入時才轉型；路徑、位址等字串欄位保持原樣（例如 `KAIROS__STORAGE__DATA_DIR=0001` 就是 `0001`，不會變成 `1`）。`KAIROS__AUTH__CRL` 仍以逗號分隔多個檔案（設定檔中的 `auth.crl` 可為陣列或逗號分隔的字串）。
 - 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days` 與 `log.retention_days` 必須介於 0～3650、`log.level` 必須是可用值。
-- 熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL **檔案的內容**（以內容雜湊比對，不依賴修改時間）；`kairos.toml` 本身的設定變更（例如改監聽位址、改 `auth.client_ca` 的路徑）仍需重新啟動。
+- 熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL **檔案的內容**（以內容雜湊比對，不依賴修改時間），套用時的日誌會列出變更的檔案種類，例如「已重新載入 TLS 設定（變更：cert、key；mTLS：啟用，CRL 1 份）」；`kairos.toml` 本身的設定變更（例如改監聽位址、改 `auth.client_ca` 的路徑）仍需重新啟動。
 - 熱重載讀檔卡住時（例如網路磁碟、FIFO），每個週期最多等 `min(10 秒, server.reload_interval_secs)`：逾時記 `ERROR`（「檢查 TLS 設定檔超過 … 秒仍未完成」），不再啟動新的檢查，但現役連線的客戶端憑證仍以目前的設定照常重新驗證；檢查完成後記「檢查 TLS 設定檔已恢復」。
 
 命令列參數：
 
 ```
 kairos [--config <path>]
-kairos --help
+kairos --version      # 或 -V
+kairos --help         # 或 -h
 ```
+
+`--version` 印出 `kairos <版本> (<commit>)`（例如 `kairos 0.1.0 (4223101)`）後結束。commit 在建置時決定：環境變數 `BUILD_COMMIT`（`packaging/build-release.sh` 會傳入）→ `git rev-parse --short HEAD` → 都取不到時為 `unknown`。啟動日誌的第一行也會印出同樣的字串，可從日誌確認正在執行的版本。
 
 ## 協定概述
 
@@ -373,7 +409,7 @@ sequenceDiagram
 | `certificate_rejected` | 啟用 mTLS 時，收到 hello 時重新驗證、或連線期間重新驗證時，客戶端憑證已被撤銷、過期或不再受信任（`client certificate has been revoked or is no longer trusted`）；無法判定撤銷狀態（CRL 已過期或缺少某一層 CA 的 CRL）時 message 為 `revocation status unavailable`，屬伺服器端問題 | 是 |
 | `storage_unavailable` | 伺服器確定沒有寫入這筆 report，這筆資料未保存：寫入失敗（磁碟已滿、資料目錄無法寫入、等待寫入逾時且已取消、當天的檔案已達 `storage.max_daily_bytes`）時 message 為 `report could not be stored`；report 送得太快、需延後超過 0.5 秒時為 `report rate limit exceeded` | 否 |
 
-**hello 欄位限制**（違反時回 `bad_request` 並計入連續無效訊息，連線繼續等待 hello）：
+**hello 欄位限制**（違反時回 `bad_request` 並計入連續無效訊息，連線繼續等待 hello；回應的 `seq` 帶回該則 hello 的 `seq`，其他無效訊息的 `seq` 為 `null`，見 PROTOCOL.md）：
 
 | 欄位 | 限制 |
 |---|---|
@@ -488,10 +524,13 @@ sequenceDiagram
 - **舊版 `logs/kairos.log`**：啟動時若存在，記錄一次 `INFO`；不再寫入，也不會被自動刪除。
 - **節流**：可能被掃描或攻擊大量觸發的日誌，每個節流 key 每 10 秒最多記錄一行，下一次記錄時附上「上次記錄後另有 N 則略過」。略過的則數要等到該 key 下一次記錄時才會出現。
   - **只以類別為 key**（全域共用）：TLS 握手失敗、hello 前後的協定違規（`hello_required`、`unsupported_version`、`too_long`、連續無效訊息）、hello 逾時、其他連線錯誤、accept 失敗、握手中連線數已達上限、狀態表已滿、狀態表淘汰離線 agent（與「狀態表已滿」分開節流）、寫入結果未知、report 檔開檔／寫入失敗與達到每日大小上限。
-  - **以類別 + 來源為 key**（來源為 IP，IPv6 以 /64 合併）：agent 上線（含取代舊連線、恢復上線）、離線（連線關閉、被取代、閒置逾時）、握手時客戶端憑證已撤銷、`auth_failed` 與 hello 時憑證已失效、超過每來源連線上限、超過每來源新連線速率、心跳間隔被夾值、`invalid_report`、report 速率限制、訊息速率限制。攻擊來源只會壓掉自己的訊息；同一類別所有來源合計每 10 秒最多 20 行，因此總量上限而未記錄的則數會在該類別下一次記錄時附註（「先前此類訊息另有 N 則因每 10 秒 20 則的總量上限未記錄」）。每個類別各自最多追蹤 1024 個來源，超過時只有該類別退回以類別為 key，不影響其他類別。
+  - **agent 事件**：上線（含取代舊連線、恢復上線）、離線（連線關閉、被取代、閒置逾時）。
+    - 啟用 mTLS 時以 `agent_id` 為 key：能走到這一步的連線都已通過客戶端憑證驗證，`agent_id` 與憑證綁定、無法偽造，因此同一來源 IP（例如同一個 NAT 後）的多個 agent 各自記錄。每個 agent、每個類別每 10 秒最多 10 行（互踢、短暫重連仍逐筆記錄），不套用下述每類別 20 行的總量上限；每個類別最多追蹤 65536 個 agent，超過時退回以類別為 key。
+    - 未啟用 mTLS 時 `agent_id` 可任意宣告，仍以來源 IP 為 key（規則同下一項）。被略過的事件會在該來源下一次記錄時列出涉及的 agent_id，最多列 5 個，例如「（上次記錄後另有 2 則略過，涉及 agent：68891ed6-…、7d25e84f-…）」，更多時附註「等其餘 N 個」。多個 agent 經同一個 NAT 連入時，請以 `agents.json` 作為上線狀態的依據。
+  - **以類別 + 來源為 key**（來源為 IP，IPv6 以 /64 合併）：握手時客戶端憑證已撤銷、`auth_failed` 與 hello 時憑證已失效、超過每來源連線上限、超過每來源新連線速率、心跳間隔被夾值、`invalid_report`、report 速率限制、訊息速率限制。攻擊來源只會壓掉自己的訊息；同一類別所有來源合計每 10 秒最多 20 行，因此總量上限而未記錄的則數會在該類別下一次記錄時附註（「先前此類訊息另有 N 則因每 10 秒 20 則的總量上限未記錄」）。每個類別各自最多追蹤 1024 個來源，超過時只有該類別退回以類別為 key，不影響其他類別。
   - 握手時無法判定撤銷狀態（例如 CRL 過期）屬伺服器端設定問題，獨立成一個類別並以 `ERROR` 記錄，不會被一般握手失敗掩蓋。
 
-heartbeat 只在 `trace` 等級記錄；agent 未送 `close_notify` 就斷線、連線被重設或中止等常見斷線只在 `debug` 等級記錄（「連線關閉，標記為離線」仍以 `INFO` 記錄，但依來源 IP 節流）。
+heartbeat 只在 `trace` 等級記錄；agent 未送 `close_notify` 就斷線、連線被重設或中止等常見斷線只在 `debug` 等級記錄（「連線關閉，標記為離線」仍以 `INFO` 記錄，依上述 agent 事件的規則節流）。
 
 ### 資料目錄被刪除時
 
@@ -544,7 +583,7 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 | `[WARN] 來自 <IP> 的新連線超過每秒 10 條（IPv6 以 /64 合併計算），拒絕新連線` | 同一來源建立新連線太快（可連續 `max(32, 2 × server.max_connections_per_ip)` 條，之後每秒 10 條），超過的連線未握手即被關閉。正常的 Pulse 以退避重連，不會觸發；大量代理經同一個 NAT 在伺服器重新啟動後同時重連時，可調高 `server.max_connections_per_ip` 以提高可連續的條數。 |
 | `[WARN] 握手中（尚未通過 hello）的連線數已達上限 N，拒絕來自 <IP> 的新連線` | 已 accept、尚未通過 hello 的連線達到 `server.max_connections` 的一半，新連線未握手即被關閉；其餘名額保留給已通過 hello 的連線。通常代表有大量慢速握手或只連不送 hello 的連線（掃描或攻擊）。 |
 | `[WARN] [#N] <IP:port> 送出訊息超過每秒 20 則（可連續 50 則），延後處理` | 該連線送訊息的速度超過每條連線的訊息速率上限；伺服器已延後處理（期間不讀取該連線）。正常的 Pulse 不會觸發。 |
-| `[WARN] 可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 N，低於 server.max_connections（N）加上預留的 64…` | 僅 Linux：`ulimit -n`（或 systemd 的 `LimitNOFILE`）太小，連線數接近上限時可能 accept 失敗（`EMFILE`）。請提高上限或調低 `server.max_connections`。 |
+| `[WARN] 可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 N，低於 server.max_connections（N）加上預留的 64（共 N）…建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE=N…` | 僅 Linux：`ulimit -n`（或 systemd 的 `LimitNOFILE`）太小，連線數接近上限時可能 accept 失敗（`EMFILE`）。依訊息中的建議值在 systemd unit 設定 `LimitNOFILE`（發佈包的 `kairos.service` 預設 8192）、手動執行前先 `ulimit -n`，或調低 `server.max_connections`。 |
 | `[WARN] [#N] 狀態表已達上限 N（limits.max_agents）且沒有可淘汰的離線 agent，拒絕 ... 的新 agent ...` | 狀態表已滿且都是線上 agent，新的 `agent_id` 收到 fatal 的 `bad_request`（`server agent registry is full`）。未啟用 mTLS 時可能是有人以大量隨機 `agent_id` 灌入；正式環境請啟用 mTLS，或調高 `limits.max_agents`。 |
 | `[INFO] 狀態表已達上限（limits.max_agents），移除離線最久的 agent ...` | 為了登記新的 agent，提前移除了離線最久的 agent；該 agent 之後重新連線會被視為新 agent。 |
 | `[WARN] [#N] agent ... 的 report 超過每秒 2 則（可連續 10 則），延後處理` | 該 agent（或來源 IP）送 report 的速度超過速率限制；伺服器已延後處理，不影響資料。正常的 Pulse 不會觸發。 |
@@ -558,10 +597,10 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 | `[ERROR] 檢查 TLS 設定檔超過 N 秒仍未完成（檔案系統可能卡住），先以目前的設定重新驗證現役連線` | 熱重載讀取憑證、私鑰、CA 或 CRL 檔時卡住（例如網路磁碟、FIFO）；在檢查完成前不會套用新檔案，但現役連線仍照常重新驗證。完成後記「檢查 TLS 設定檔已恢復」。 |
 | `[ERROR] ... 異常結束: ...，開始關機`／`Kairos 因內部錯誤而結束` | 背景工作 panic 或意外結束；Kairos 已關機並以結束代碼 1 結束。請保留日誌回報問題，並由服務管理員重新啟動。 |
 | `[ERROR] 重新載入 TLS 設定失敗，繼續使用目前的設定: ...` | 熱重載時新的憑證、私鑰、CA 或 CRL 有問題（訊息附路徑）；伺服器繼續使用舊設定。同一份有問題的檔案只記錄一次，修正後下一個週期會自動重載。 |
-| `[INFO] 已重新載入 TLS 設定（...）` | 偵測到檔案變更並已套用；之後的新連線使用新設定，既有連線不中斷（客戶端憑證仍有效者）。 |
+| `[INFO] 已重新載入 TLS 設定（變更：crl；mTLS：啟用，CRL 1 份）` | 偵測到檔案變更並已套用；「變更」列出內容有變動的檔案種類（`cert`、`key`、`client_ca`、`crl`，多個時以「、」分隔），方便稽核。之後的新連線使用新設定，既有連線不中斷（客戶端憑證仍有效者）。 |
 | `[WARN] agent ... 的客戶端憑證已不再有效（invalid peer certificate: Revoked），關閉連線` | 該代理的憑證已列入 CRL；也可能是 `Expired`（憑證過期）、`UnknownIssuer`（CA 已更換）或 `ExpiredRevocationList`（CRL 已過期，見「撤銷客戶端憑證」）。 |
 | `[WARN] 已停用 TLS 熱重載` | `server.reload_interval_secs = 0`；更換憑證、CA、CRL 需重新啟動，現役連線的客戶端憑證也不會定期重新檢查（新連線送出 hello 時仍會驗證一次）。 |
-| 日誌行尾的「（上次記錄後另有 N 則略過）」 | 該節流 key 在 10 秒內發生多次，只記錄第一次；N 為期間略過的則數。大量出現通常代表有掃描或設定錯誤的客戶端。 |
+| 日誌行尾的「（上次記錄後另有 N 則略過）」 | 該節流 key 在 10 秒內發生多次，只記錄第一次；N 為期間略過的則數。未啟用 mTLS 時 agent 的上線、離線事件會附上「涉及 agent：…」（最多列 5 個 agent_id）。大量出現通常代表有掃描或設定錯誤的客戶端。 |
 | 日誌行尾的「（先前此類訊息另有 N 則因每 10 秒 20 則的總量上限未記錄）」 | 以來源區分的類別在 10 秒內所有來源合計超過 20 行，超過的則數在該類別下一次記錄時附註。通常代表大量來源同時觸發（例如網路中斷後大量代理重連，或分散式掃描）。 |
 | `[WARN] data\reports-YYYY-MM-DD.jsonl 已不存在或正被刪除...，重新建立` | 執行中資料目錄或當天的 report 檔被刪除；伺服器已重建，之後的 report 寫入新檔案，刪除前已寫入的資料不會還原。 |
 | `[INFO] 發現舊版的 data\reports.jsonl ...` | 舊版的單一檔案；已改為按日分檔，舊檔不再寫入也不會被自動刪除，可自行搬移或刪除。 |
@@ -587,6 +626,8 @@ Kairos/
 ├── kairos.example.toml    設定檔範本
 ├── PROTOCOL.md            Pulse ↔ Kairos 協定規格
 ├── rust-toolchain.toml    固定 Rust 1.99.0（含 rustfmt、clippy）
+├── build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
+├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、INSTALL.md（安裝指南）
 ├── testdata/              單元測試用的憑證樣本；pki/ 為測試用 CA、代理憑證與 CRL（見其中的 README）；含測試用私鑰，不可部署
 └── src/
     ├── main.rs            元件組裝、accept 迴圈與連線上限、背景工作監看、關機流程

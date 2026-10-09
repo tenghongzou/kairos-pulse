@@ -19,7 +19,7 @@ use tokio_rustls::rustls::pki_types::UnixTime;
 
 use crate::registry::{KickReason, Registry};
 use crate::shutdown::{self, Shutdown};
-use crate::tls::{self, ChainRejection, Fingerprint, TlsMaterial, TlsPaths, TlsState};
+use crate::tls::{self, ChainRejection, Fingerprint, TlsFileKind, TlsMaterial, TlsPaths, TlsState};
 
 /// 每個週期等待檔案檢查完成的上限（不超過檢查間隔）
 pub const CHECK_WAIT: Duration = Duration::from_secs(10);
@@ -29,8 +29,8 @@ pub const CHECK_WAIT: Duration = Duration::from_secs(10);
 pub enum ReloadOutcome {
     /// 檔案內容沒有變化
     Unchanged,
-    /// 已重建並替換設定
-    Reloaded,
+    /// 已重建並替換設定；內含內容有變化的檔案種類（依 cert、key、client_ca、crl 排序、不重複）
+    Reloaded(Vec<TlsFileKind>),
     /// 檔案有變化但重建失敗，仍使用舊設定
     Failed(Error),
 }
@@ -39,6 +39,8 @@ pub struct Reloader {
     paths: TlsPaths,
     /// 最近一次「嘗試」重建時的指紋；重建失敗後，檔案沒有再變化就不重試（避免每個週期重複記錄同一個錯誤）
     last: Fingerprint,
+    /// 目前生效的設定建立時的指紋（判斷這次重新載入變更了哪些檔案；重建失敗的嘗試不算）
+    loaded: Fingerprint,
     state: Arc<TlsState>,
     /// 測試用：檢查檔案前等待（模擬卡住的檔案系統）
     #[cfg(test)]
@@ -73,6 +75,7 @@ impl Reloader {
     pub fn new(paths: TlsPaths, initial: Fingerprint, state: Arc<TlsState>) -> Self {
         Self {
             paths,
+            loaded: initial.clone(),
             last: initial,
             state,
             #[cfg(test)]
@@ -95,15 +98,44 @@ impl Reloader {
         if current == self.last {
             return ReloadOutcome::Unchanged;
         }
-        self.last = current;
+        self.last = current.clone();
         match tls::build(&self.paths) {
             Ok(material) => {
                 self.state.replace(material);
-                ReloadOutcome::Reloaded
+                let changed = changed_kinds(&self.paths, &self.loaded, &current);
+                self.loaded = current;
+                ReloadOutcome::Reloaded(changed)
             }
             Err(e) => ReloadOutcome::Failed(e),
         }
     }
+}
+
+/// 比較前後兩次的指紋，回傳內容有變化（含新出現、消失、無法讀取）的檔案種類（F8）。
+/// 指紋的順序與 [`TlsPaths::watched_files_with_kind`] 相同；`old` 為空（強制重建）時所有種類都算變更。
+pub fn changed_kinds(paths: &TlsPaths, old: &Fingerprint, new: &Fingerprint) -> Vec<TlsFileKind> {
+    let mut kinds: Vec<TlsFileKind> = paths
+        .watched_files_with_kind()
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| old.get(*i) != new.get(*i))
+        .map(|(_, (kind, _))| kind)
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+/// 例如 `cert、key`；沒有可辨識的變更時為 `未知`
+fn describe_kinds(kinds: &[TlsFileKind]) -> String {
+    if kinds.is_empty() {
+        return "未知".to_string();
+    }
+    kinds
+        .iter()
+        .map(|k| k.as_str())
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 /// 以目前設定的驗證器重新驗證所有現役連線；不通過者送出 kick。回傳被踢的 (agent_id, 原因)。
@@ -225,8 +257,9 @@ async fn run_with_wait(
         let material = state.current();
         match outcome {
             ReloadOutcome::Unchanged => {}
-            ReloadOutcome::Reloaded => info!(
-                "已重新載入 TLS 設定（mTLS：{}，CRL {} 份）",
+            ReloadOutcome::Reloaded(changed) => info!(
+                "已重新載入 TLS 設定（變更：{}；mTLS：{}，CRL {} 份）",
+                describe_kinds(&changed),
                 if material.auth_enabled() {
                     "啟用"
                 } else {
@@ -364,10 +397,77 @@ mod tests {
         let (mut r, state) = fx.reloader();
         let before = Arc::as_ptr(&state.current());
         fx.write("crl.crl", "crl-revoke-a.crl");
-        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded(k) if k == [TlsFileKind::Crl]));
         assert_ne!(Arc::as_ptr(&state.current()), before);
         // 再檢查一次：沒有新變化
         assert!(matches!(r.check(), ReloadOutcome::Unchanged));
+    }
+
+    #[test]
+    fn reload_reports_which_kinds_of_files_changed() {
+        // F8：日誌附上變更的檔案種類
+        let fx = Fixture::new("kinds");
+        let (mut r, _state) = fx.reloader();
+        // 伺服器憑證與私鑰一起更新（只要內容不同即可：寫入原內容再加一個換行）
+        let cert = std::fs::read(pki("server.crt")).unwrap();
+        let key = std::fs::read(pki("server.key")).unwrap();
+        std::fs::write(fx.dir.join("server.crt"), [cert.as_slice(), b"\n"].concat()).unwrap();
+        std::fs::write(fx.dir.join("server.key"), [key.as_slice(), b"\n"].concat()).unwrap();
+        match r.check() {
+            ReloadOutcome::Reloaded(k) => {
+                assert_eq!(k, [TlsFileKind::Cert, TlsFileKind::Key]);
+                assert_eq!(describe_kinds(&k), "cert、key");
+            }
+            other => panic!("應重新載入: {other:?}"),
+        }
+        // 只換客戶端 CA（內容不同但仍是同一張 CA）
+        let ca = std::fs::read(pki("test-ca.crt")).unwrap();
+        std::fs::write(fx.dir.join("test-ca.crt"), [ca.as_slice(), b"\n"].concat()).unwrap();
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded(k) if k == [TlsFileKind::ClientCa]));
+    }
+
+    #[test]
+    fn changed_kinds_compares_fingerprints_by_position() {
+        let mut paths = TlsPaths {
+            cert: "c".into(),
+            key: "k".into(),
+            client_ca: Some("ca".into()),
+            crls: vec!["crl1".into(), "crl2".into()],
+        };
+        let fp = |paths: &TlsPaths, hashes: &[Option<u64>]| -> Fingerprint {
+            paths
+                .watched_files()
+                .into_iter()
+                .zip(hashes)
+                .map(|(p, h)| (p.to_string(), *h))
+                .collect()
+        };
+        let old = fp(&paths, &[Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        assert!(changed_kinds(&paths, &old, &old).is_empty());
+        // 兩份 CRL 都變更：只列一次 crl
+        let new = fp(&paths, &[Some(1), Some(2), Some(3), Some(40), None]);
+        assert_eq!(changed_kinds(&paths, &old, &new), [TlsFileKind::Crl]);
+        let new = fp(&paths, &[Some(10), Some(2), None, Some(4), Some(5)]);
+        assert_eq!(
+            changed_kinds(&paths, &old, &new),
+            [TlsFileKind::Cert, TlsFileKind::ClientCa]
+        );
+        // 強制重建（沒有上次的指紋）：所有種類都算變更
+        assert_eq!(
+            changed_kinds(&paths, &Fingerprint::new(), &old),
+            [
+                TlsFileKind::Cert,
+                TlsFileKind::Key,
+                TlsFileKind::ClientCa,
+                TlsFileKind::Crl
+            ]
+        );
+        assert_eq!(describe_kinds(&[]), "未知");
+        // 未啟用 mTLS：只監看 cert 與 key
+        paths.client_ca = None;
+        let old = fp(&paths, &[Some(1), Some(2)]);
+        let new = fp(&paths, &[Some(1), Some(3)]);
+        assert_eq!(changed_kinds(&paths, &old, &new), [TlsFileKind::Key]);
     }
 
     #[test]
@@ -386,9 +486,10 @@ mod tests {
         assert!(state.current().auth_enabled());
         // 檔案沒有再變化：不重試、不重複報錯
         assert!(matches!(r.check(), ReloadOutcome::Unchanged));
-        // 修好後重建成功
+        // 修好後重建成功；變更的種類以目前生效的設定為準（CA 內容與原本相同，但 CRL 有變）
+        fx.write("crl.crl", "crl-revoke-a.crl");
         fx.write("test-ca.crt", "test-ca.crt");
-        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded(k) if k == [TlsFileKind::Crl]));
         assert!(!Arc::ptr_eq(&state.current(), &before));
     }
 
@@ -399,7 +500,7 @@ mod tests {
         let (_r, state) = fx.reloader();
         let before = state.current();
         let mut r = Reloader::recreate(fx.paths.clone(), state.clone());
-        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded(k) if k.len() == 4));
         assert!(!Arc::ptr_eq(&state.current(), &before));
         assert!(matches!(r.check(), ReloadOutcome::Unchanged));
     }
@@ -523,7 +624,7 @@ mod tests {
 
         // 換成撤銷 A 的 CRL → A 被踢，B 不受影響
         fx.write("crl.crl", "crl-revoke-a.der");
-        assert!(matches!(r.check(), ReloadOutcome::Reloaded));
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded(_)));
         let kicked = revalidate(&registry, &state.current(), UnixTime::now());
         assert_eq!(kicked.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), [A]);
         match a.kick.try_recv() {

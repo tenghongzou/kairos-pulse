@@ -59,6 +59,8 @@ struct Options {
     timeouts: TimeoutSettings,
     /// 取代真正的 report writer（例如模擬卡住的磁碟）
     reports: Option<ReportSink>,
+    /// 日誌節流的時間窗
+    throttle_interval: Duration,
 }
 
 impl Default for Options {
@@ -70,6 +72,7 @@ impl Default for Options {
             max_connections_per_ip: 32,
             timeouts: TimeoutSettings::default(),
             reports: None,
+            throttle_interval: crate::throttle::DEFAULT_INTERVAL,
         }
     }
 }
@@ -80,6 +83,7 @@ struct Server {
     registry: Arc<Registry>,
     tls: Arc<TlsState>,
     shutdown: Arc<Shutdown>,
+    throttle: Arc<LogThrottle>,
     accept: JoinHandle<()>,
 }
 
@@ -111,13 +115,14 @@ impl Server {
         };
         let registry = Arc::new(Registry::with_max_agents(opts.max_agents));
         let shutdown = Arc::new(Shutdown::new());
+        let throttle = Arc::new(LogThrottle::new(opts.throttle_interval));
         let ctx = Arc::new(ConnContext {
             registry: registry.clone(),
             reports,
             timeouts: opts.timeouts,
             shutdown: shutdown.clone(),
             tls: tls.clone(),
-            throttle: Arc::new(LogThrottle::default()),
+            throttle: throttle.clone(),
             binding: BindingPolicy::default(),
             report_limiter: Arc::new(ReportLimiter::new(opts.max_connections_per_ip)),
         });
@@ -139,7 +144,22 @@ impl Server {
             registry,
             tls,
             shutdown,
+            throttle,
             accept,
+        }
+    }
+
+    /// 等待輸出的節流日誌中出現符合 `pred` 的 `count` 行（連線收尾在背景進行，日誌可能稍晚出現），
+    /// 回傳目前為止所有輸出的節流日誌
+    async fn wait_for_logs(&self, count: usize, pred: impl Fn(&str) -> bool) -> Vec<String> {
+        let deadline = Instant::now() + RECV_TIMEOUT;
+        let mut all = Vec::new();
+        loop {
+            all.extend(self.throttle.take_emitted());
+            if all.iter().filter(|l| pred(l)).count() >= count || Instant::now() >= deadline {
+                return all;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -389,13 +409,44 @@ async fn hello_state_machine_before_registration() {
     // K-S10：hostname 含格式字元 → bad_request（非 fatal）
     let bad_host = hello(1, ID, 1000).replace("web-01", "web\u{202e}10");
     c.send(&bad_host).await;
-    c.expect_error("bad_request", false).await;
+    let err = c.expect_error("bad_request", false).await;
+    // F5：hello 的 JSON 合法、只有欄位驗證失敗時，回應帶回 hello 的 seq
+    assert_eq!(err["seq"], 1, "{err}");
     // hello 前送 heartbeat → hello_required（fatal）並關閉
     c.send(&heartbeat(2)).await;
     let err = c.expect_error("hello_required", true).await;
     assert_eq!(err["seq"], 2);
     c.expect_clean_close().await;
     assert!(server.agent_ids().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_hello_fields_echo_the_seq() {
+    // F5：hello 能取得 seq 但欄位驗證失敗時，bad_request 帶回該 seq（非 fatal）
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    // agent_id 格式錯誤
+    c.send(&hello(5, "not-a-uuid", 1000)).await;
+    assert_eq!(c.expect_error("bad_request", false).await["seq"], 5);
+    // hostname 過長
+    c.send(&hello(6, ID, 1000).replace("web-01", &"h".repeat(256)))
+        .await;
+    assert_eq!(c.expect_error("bad_request", false).await["seq"], 6);
+    // hostname 型別錯誤（無法解析為 hello，但仍能取得 seq）
+    c.send(&hello(7, ID, 1000).replace(r#""web-01""#, "42"))
+        .await;
+    assert_eq!(c.expect_error("bad_request", false).await["seq"], 7);
+    // 壞 JSON：無法取得 seq
+    c.send("{").await;
+    assert_eq!(
+        c.expect_error("bad_request", false).await["seq"],
+        Value::Null
+    );
+    // 之後仍可正常註冊，hello_ack 帶回該則 hello 的 seq
+    c.send(&hello(8, ID, 1000)).await;
+    let ack = c.recv().await;
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    assert_eq!(ack["seq"], 8);
 }
 
 #[tokio::test]
@@ -986,4 +1037,105 @@ async fn per_ip_limit_is_enforced_by_the_accept_loop() {
     assert!(admitted.is_some(), "名額歸還後應可再建立連線");
     b.send(&heartbeat(1)).await;
     b.expect_error("hello_required", true).await;
+}
+
+/// 含有 `agent_id` 與 `needle` 的日誌行數
+fn count_lines(lines: &[String], agent_id: &str, needle: &str) -> usize {
+    lines
+        .iter()
+        .filter(|l| l.contains(&format!("agent {agent_id}")) && l.contains(needle))
+        .count()
+}
+
+#[tokio::test]
+async fn mtls_agent_events_behind_one_ip_are_logged_per_agent() {
+    // F1：啟用 mTLS 時，同一來源 IP 的多個 agent 的上線、取代、被取代、關機離線都逐筆記錄
+    let server = Server::start(Options {
+        mtls_crls: Some(vec![test_pki::CRL_EMPTY]),
+        ..Options::default()
+    })
+    .await;
+    // 空 CRL 下兩張憑證都有效：兩個不同的 agent，都從 127.0.0.1 連入
+    let ids = [test_pki::GOOD_ID, test_pki::REVOKED_ID];
+    let a = connector(Some((test_pki::GOOD_CERT, test_pki::GOOD_KEY)));
+    let b = connector(Some((test_pki::REVOKED_CERT, test_pki::REVOKED_KEY)));
+    let mut old_a = Client::connect_with(&a, server.addr).await;
+    old_a.register(ids[0]).await;
+    let mut old_b = Client::connect_with(&b, server.addr).await;
+    old_b.register(ids[1]).await;
+    let logs = server.wait_for_logs(2, |l| l.contains("）上線，")).await;
+    for id in ids {
+        assert_eq!(count_lines(&logs, id, "）上線，"), 1, "{id}: {logs:#?}");
+    }
+
+    // 兩個 agent 幾乎同時重新連線（互踢）：取代與被取代各自記錄
+    let mut new_a = Client::connect_with(&a, server.addr).await;
+    new_a.register(ids[0]).await;
+    let mut new_b = Client::connect_with(&b, server.addr).await;
+    new_b.register(ids[1]).await;
+    old_a.expect_error("superseded", true).await;
+    old_b.expect_error("superseded", true).await;
+    let logs = server
+        .wait_for_logs(4, |l| {
+            l.contains("取代舊連線") || l.contains("已由新連線取代")
+        })
+        .await;
+    for id in ids {
+        assert_eq!(count_lines(&logs, id, "取代舊連線"), 1, "{id}: {logs:#?}");
+        assert_eq!(
+            count_lines(&logs, id, "已由新連線取代"),
+            1,
+            "{id}: {logs:#?}"
+        );
+    }
+
+    // 關機：每條連線都記錄「連線關閉，標記為離線」
+    server.shutdown.trigger();
+    new_a.expect_clean_close().await;
+    new_b.expect_clean_close().await;
+    let logs = server
+        .wait_for_logs(2, |l| l.contains("連線關閉，標記為離線"))
+        .await;
+    for id in ids {
+        assert_eq!(
+            count_lines(&logs, id, "連線關閉，標記為離線"),
+            1,
+            "{id}: {logs:#?}"
+        );
+    }
+    // 沒有任何一則被略過
+    assert!(logs.iter().all(|l| !l.contains("略過")), "{logs:#?}");
+}
+
+#[tokio::test]
+async fn unauthenticated_agent_events_are_throttled_by_ip_and_list_skipped_agents() {
+    // F1：未啟用 mTLS 時仍以來源 IP 節流，但下一則附註列出被略過的 agent_id
+    let third = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    let server = Server::start(Options {
+        throttle_interval: Duration::from_millis(300),
+        ..Options::default()
+    })
+    .await;
+    let mut a = Client::connect(server.addr).await;
+    a.register(ID).await;
+    let mut b = Client::connect(server.addr).await;
+    b.register(OTHER_ID).await;
+    let logs = server.wait_for_logs(1, |l| l.contains("）上線，")).await;
+    assert_eq!(count_lines(&logs, ID, "）上線，"), 1, "{logs:#?}");
+    assert_eq!(count_lines(&logs, OTHER_ID, "）上線，"), 0, "{logs:#?}");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut c = Client::connect(server.addr).await;
+    c.register(third).await;
+    let logs = server.wait_for_logs(1, |l| l.contains("）上線，")).await;
+    let line = logs
+        .iter()
+        .find(|l| l.contains(&format!("agent {third}")))
+        .unwrap_or_else(|| panic!("{logs:#?}"));
+    assert!(
+        line.ends_with(&format!(
+            "（上次記錄後另有 1 則略過，涉及 agent：{OTHER_ID}）"
+        )),
+        "{line}"
+    );
 }

@@ -54,6 +54,7 @@ pub const LIST_SEPARATOR: &str = ",";
 pub const USAGE: &str = "用法: kairos [--config <path>]\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
+-V, --version    顯示版本與建置的 commit\n  \
 -h, --help       顯示此說明\n\n\
 環境變數 KAIROS__<SECTION>__<KEY> 可覆寫設定，例如 KAIROS__SERVER__LISTEN=0.0.0.0:8080";
 
@@ -226,9 +227,11 @@ impl LogSettings {
 pub enum CliAction {
     Run { config_path: Option<PathBuf> },
     Help,
+    Version,
 }
 
-/// 解析命令列參數（不含程式名稱）。只支援 `--config <path>`、`--config=<path>` 與 `-h/--help`。
+/// 解析命令列參數（不含程式名稱）。只支援 `--config <path>`、`--config=<path>`、`-V/--version`
+/// 與 `-h/--help`。
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, String> {
     let mut config_path = None;
     let mut iter = args.into_iter();
@@ -245,6 +248,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, 
             p.to_string()
         } else if arg == "-h" || arg == "--help" {
             return Ok(CliAction::Help);
+        } else if arg == "-V" || arg == "--version" {
+            return Ok(CliAction::Version);
         } else {
             return Err(format!("無法辨識的參數: {}", arg));
         };
@@ -792,6 +797,14 @@ mod tests {
             })
         );
         assert_eq!(parse_args(args(&["--help"])), Ok(CliAction::Help));
+        assert_eq!(parse_args(args(&["--version"])), Ok(CliAction::Version));
+        assert_eq!(parse_args(args(&["-V"])), Ok(CliAction::Version));
+        assert_eq!(
+            parse_args(args(&["--config", "a.toml", "--version"])),
+            Ok(CliAction::Version)
+        );
+        assert!(parse_args(args(&["-v"])).is_err());
+        assert!(USAGE.contains("--version"));
         assert!(parse_args(args(&["--config"])).is_err());
         assert!(parse_args(args(&["--config="])).is_err());
         assert!(parse_args(args(&["--config", "a", "--config", "b"])).is_err());
