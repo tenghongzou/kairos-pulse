@@ -175,6 +175,11 @@ fn main() -> ExitCode {
         println!("{}", cli::USAGE);
         return ExitCode::SUCCESS;
     }
+    // 不讀取設定：設定有誤時也能確認版本
+    if command == cli::Command::Version {
+        println!("{}", cli::VERSION);
+        return ExitCode::SUCCESS;
+    }
 
     // 設定：嵌入預設 → pulse.toml → PULSE__* 環境變數（含數值範圍與 log.level 驗證）
     let config = match AppConfig::load() {
@@ -318,10 +323,8 @@ async fn run(
     retention: log_files::LogRetention,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
-    info!(
-        "Pulse 地端程式啟動（版本 {}）...",
-        env!("CARGO_PKG_VERSION")
-    );
+    // 完整版本字串（含 commit）；hello 的 agent_version 仍只送 CARGO_PKG_VERSION
+    info!("Pulse 地端程式啟動（{}）...", cli::VERSION);
     let cwd = std::env::current_dir().ok();
     for (level, msg) in startup_location_messages(cwd.as_deref(), config.local_file_found) {
         log::log!(level, "{msg}");

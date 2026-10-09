@@ -1,0 +1,4 @@
+# 腳本與 systemd unit 必須是 LF（core.autocrlf=true 的 Windows checkout 也一樣）
+*.sh      text eol=lf
+*.service text eol=lf
+*.md      text eol=lf

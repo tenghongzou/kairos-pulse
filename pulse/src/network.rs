@@ -31,7 +31,8 @@ use crate::backoff::Backoff;
 use crate::config_manager::AppConfig;
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
-    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, ServerMsg, now_ts, sanitize_cpu_usage,
+    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, ServerMsg, now_ts, report_cpu_usage,
+    sanitize_cpu_usage,
 };
 use crate::system_info::Sample;
 use crate::tls::{self, TlsSetup};
@@ -316,8 +317,8 @@ type Result<T> = std::result::Result<T, SessionError>;
 trait Dialer {
     type Stream: AsyncRead + AsyncWrite + Unpin;
 
-    /// 建立一條連線（含 TLS 握手）。
-    async fn dial(&self) -> Result<Self::Stream>;
+    /// 建立一條連線（含 TLS 握手），並回傳這條連線的 TLS 資訊（註冊成功時寫進日誌）。
+    async fn dial(&self) -> Result<(Self::Stream, TlsInfo)>;
 
     /// 最近一次 `dial` 的握手中，伺服器是否要求了客戶端憑證（用於錯誤提示）。
     fn client_cert_was_requested(&self) -> bool;
@@ -332,7 +333,7 @@ struct TlsDialer<'a> {
 impl Dialer for TlsDialer<'_> {
     type Stream = TlsStream<TcpStream>;
 
-    async fn dial(&self) -> Result<Self::Stream> {
+    async fn dial(&self) -> Result<(Self::Stream, TlsInfo)> {
         self.tls.reset_client_cert_request();
         connect(self.settings, self.tls).await
     }
@@ -589,14 +590,14 @@ async fn session<D: Dialer>(
     throttles: &mut ServerLogThrottles,
     shutdown: &CancellationToken,
 ) -> Result<Infallible> {
-    let stream = tokio::select! {
+    let (stream, tls_info) = tokio::select! {
         res = dialer.dial() => res?,
         _ = shutdown.cancelled() => return Err(SessionError::Shutdown),
     };
     let mut conn = Connection::new(stream);
 
     let result = tokio::select! {
-        res = serve(&mut conn, settings, reports, registered_at, throttles) => res,
+        res = serve(&mut conn, settings, Some(&tls_info), reports, registered_at, throttles) => res,
         _ = shutdown.cancelled() => Err(SessionError::Shutdown),
     };
     if matches!(result, Err(SessionError::Shutdown)) {
@@ -606,9 +607,12 @@ async fn session<D: Dialer>(
 }
 
 /// 在已建立的連線上：hello / hello_ack，之後進入主迴圈。
+///
+/// `tls_info` 為這條連線的 TLS 資訊，註冊成功時附在日誌中（測試中直接使用記憶體內串流時為 `None`）。
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Connection<S>,
     settings: &Settings,
+    tls_info: Option<&TlsInfo>,
     reports: &mut mpsc::Receiver<Sample>,
     registered_at: &mut Option<Instant>,
     throttles: &mut ServerLogThrottles,
@@ -630,11 +634,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
 
     let offline_after_ms = wait_hello_ack(conn, seq, throttles).await?;
     *registered_at = Some(Instant::now());
-    log::info!(
-        "已向伺服器註冊（agent_id={}，伺服器離線判定 {} ms）",
-        settings.agent_id,
-        offline_after_ms
-    );
+    let (level, msg) = registered_log(settings, offline_after_ms, tls_info);
+    log::log!(level, "{msg}");
 
     // 斷線期間殘留在佇列中的舊取樣直接丟棄（at-most-once，不重送舊資料）
     while reports.try_recv().is_ok() {}
@@ -675,10 +676,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     continue;
                 }
                 let seq = conn.next_seq();
-                let cpu_usage = sanitize_cpu_usage(sample.cpu_usage);
-                if cpu_usage != sample.cpu_usage {
-                    log::debug!("CPU 使用率 {} 不合理，送出前調整為 {cpu_usage}", sample.cpu_usage);
+                let sanitized = sanitize_cpu_usage(sample.cpu_usage);
+                if sanitized != sample.cpu_usage {
+                    log::debug!("CPU 使用率 {} 不合理，送出前調整為 {sanitized}", sample.cpu_usage);
                 }
+                // 四捨五入到小數 2 位（f64），JSON 中不會出現 f32 的精度雜訊
+                let cpu_usage = report_cpu_usage(sample.cpu_usage);
                 conn.send(&ClientMsg::Report {
                     seq,
                     ts: sample.ts,
@@ -723,8 +726,32 @@ fn after(d: Duration) -> Instant {
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600))
 }
 
+/// 一條已完成握手的 TLS 連線的資訊（寫進日誌用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TlsInfo {
+    /// 協商出的 TLS 版本（例如 `TLSv1_3`）
+    version: String,
+    /// 是否驗證了伺服器憑證（`accept_invalid_certs = true` 時為 false）
+    verified: bool,
+}
+
+impl TlsInfo {
+    /// 日誌中描述這條連線的文字（目標、domain、TLS 版本、伺服器憑證驗證狀態）。
+    fn describe(&self, settings: &Settings) -> String {
+        let note = if self.verified {
+            "，已驗證伺服器憑證"
+        } else {
+            "；⚠️ 未驗證伺服器憑證（accept_invalid_certs = true），無法確認對方身分"
+        };
+        format!(
+            "{}:{}，domain={}，{}{note}",
+            settings.address, settings.port, settings.domain, self.version
+        )
+    }
+}
+
 /// TCP 連線 + TLS 握手，各自有逾時。
-async fn connect(settings: &Settings, tls: &TlsSetup) -> Result<TlsStream<TcpStream>> {
+async fn connect(settings: &Settings, tls: &TlsSetup) -> Result<(TlsStream<TcpStream>, TlsInfo)> {
     let target = (settings.address.as_str(), settings.port);
     let tcp = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
         .await
@@ -743,29 +770,58 @@ async fn connect(settings: &Settings, tls: &TlsSetup) -> Result<TlsStream<TcpStr
     .map_err(|_| SessionError::TlsTimeout)?
     .map_err(SessionError::Tls)?;
     let (_, state) = stream.get_ref();
-    let version = state
-        .protocol_version()
-        .map_or_else(|| "未知版本".to_string(), |v| format!("{v:?}"));
-    let msg = established_message(settings, &version, tls.verifies_server_cert());
-    if tls.verifies_server_cert() {
-        log::info!("{msg}");
-    } else {
-        log::warn!("{msg}");
-    }
-    Ok(stream)
+    let info = TlsInfo {
+        version: state
+            .protocol_version()
+            .map_or_else(|| "未知版本".to_string(), |v| format!("{v:?}")),
+        verified: tls.verifies_server_cert(),
+    };
+    let (level, msg) = established_log(settings, &info);
+    log::log!(level, "{msg}");
+    Ok((stream, info))
 }
 
-/// 「已建立 TLS 連線」的日誌內容；未驗證伺服器憑證時明確標註。
-fn established_message(settings: &Settings, version: &str, verified: bool) -> String {
-    let note = if verified {
-        ""
+/// 「已建立 TLS 加密連線」的日誌等級與內容。
+///
+/// 握手完成不代表連線成功（TLS 1.3 下伺服器在握手後才驗證客戶端憑證，可能緊接著拒絕），
+/// 因此一般情況只記 debug，成功與否以註冊成功的 INFO（[`registered_log`]）為準。
+/// 未驗證伺服器憑證時仍記 warn：hello（含 agent_id）即將送給身分未確認的對象，
+/// 即使之後註冊失敗也不能漏掉這個警告。
+fn established_log(settings: &Settings, info: &TlsInfo) -> (log::Level, String) {
+    let level = if info.verified {
+        log::Level::Debug
     } else {
-        "；⚠️ 未驗證伺服器憑證（accept_invalid_certs = true），無法確認對方身分"
+        log::Level::Warn
     };
-    format!(
-        "已建立 TLS 加密連線：{}:{}（domain={}，{version}{note}）",
-        settings.address, settings.port, settings.domain
+    (
+        level,
+        format!("已建立 TLS 加密連線（{}）", info.describe(settings)),
     )
+}
+
+/// 註冊成功（收到 hello_ack）的日誌等級與內容，附上這條連線的 TLS 資訊。
+///
+/// 未驗證伺服器憑證時記 warn，讓只看 INFO 以上的人每次連上都看得到警告。
+fn registered_log(
+    settings: &Settings,
+    offline_after_ms: u64,
+    tls_info: Option<&TlsInfo>,
+) -> (log::Level, String) {
+    let base = format!(
+        "已向伺服器註冊（agent_id={}，伺服器離線判定 {offline_after_ms} ms",
+        settings.agent_id
+    );
+    match tls_info {
+        Some(info) => (
+            if info.verified {
+                log::Level::Info
+            } else {
+                log::Level::Warn
+            },
+            format!("{base}；TLS 加密連線 {}）", info.describe(settings)),
+        ),
+        None => (log::Level::Info, format!("{base}）")),
+    }
 }
 
 /// 等待 hello_ack（整體 5 s）。回傳伺服器給的 `offline_after_ms`。
@@ -1606,17 +1662,58 @@ mod tests {
         assert!(!needs_attention(&SessionError::ClosedByServer, 0));
     }
 
+    fn tls_info(verified: bool) -> TlsInfo {
+        TlsInfo {
+            version: "TLSv1_3".into(),
+            verified,
+        }
+    }
+
     #[test]
-    fn established_message_marks_unverified_server() {
-        // P2
+    fn established_log_is_debug_unless_server_unverified() {
+        // F4：握手完成不代表連線成功（客戶端憑證可能緊接著被拒），一般情況只記 debug
         let s = settings(1);
-        let msg = established_message(&s, "TLSv1_3", true);
+        let (level, msg) = established_log(&s, &tls_info(true));
+        assert_eq!(level, log::Level::Debug);
+        assert!(
+            msg.contains("已建立 TLS 加密連線") && msg.contains("TLSv1_3"),
+            "{msg}"
+        );
         assert!(!msg.contains("未驗證"), "{msg}");
-        let msg = established_message(&s, "TLSv1_3", false);
+        // P2：未驗證伺服器憑證時仍在連線當下記 warn，不因之後註冊失敗而遺漏
+        let (level, msg) = established_log(&s, &tls_info(false));
+        assert_eq!(level, log::Level::Warn);
         assert!(
             msg.contains("未驗證伺服器憑證") && msg.contains("accept_invalid_certs"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn registered_log_carries_tls_details() {
+        // F4：原本「已建立 TLS 加密連線」INFO 的資訊改附在註冊成功的 INFO
+        let s = settings(1);
+        let (level, msg) = registered_log(&s, 5000, Some(&tls_info(true)));
+        assert_eq!(level, log::Level::Info);
+        assert_eq!(
+            msg,
+            "已向伺服器註冊（agent_id=a，伺服器離線判定 5000 ms；\
+             TLS 加密連線 127.0.0.1:1，domain=localhost，TLSv1_3，已驗證伺服器憑證）"
+        );
+        // 未驗證伺服器憑證：註冊成功的那一行升為 warn 並帶警告
+        let (level, msg) = registered_log(&s, 5000, Some(&tls_info(false)));
+        assert_eq!(level, log::Level::Warn);
+        assert!(
+            msg.starts_with("已向伺服器註冊")
+                && msg.contains("TLSv1_3")
+                && msg.contains("未驗證伺服器憑證")
+                && msg.contains("accept_invalid_certs"),
+            "{msg}"
+        );
+        // 沒有 TLS 資訊（測試用的記憶體內串流）
+        let (level, msg) = registered_log(&s, 6000, None);
+        assert_eq!(level, log::Level::Info);
+        assert_eq!(msg, "已向伺服器註冊（agent_id=a，伺服器離線判定 6000 ms）");
     }
 
     // ---- P1：伺服器送來的文字寫進日誌前必須清理 ----
@@ -1768,7 +1865,7 @@ mod tests {
         let mut conn = Connection::new(stream);
         let mut registered_at = None;
         let mut throttles = ServerLogThrottles::default();
-        let err = match serve(&mut conn, s, rx, &mut registered_at, &mut throttles).await {
+        let err = match serve(&mut conn, s, None, rx, &mut registered_at, &mut throttles).await {
             Ok(never) => match never {},
             Err(e) => e,
         };
@@ -1975,13 +2072,13 @@ mod tests {
     impl Dialer for FakeDialer {
         type Stream = DuplexStream;
 
-        async fn dial(&self) -> Result<DuplexStream> {
+        async fn dial(&self) -> Result<(DuplexStream, TlsInfo)> {
             self.dial_times.borrow_mut().push(Instant::now());
             let (client, server) = duplex(64 * 1024);
             self.servers
                 .send(server)
                 .map_err(|_| SessionError::Connect(io::Error::other("測試伺服器已結束")))?;
-            Ok(client)
+            Ok((client, tls_info(true)))
         }
 
         fn client_cert_was_requested(&self) -> bool {
@@ -2036,6 +2133,34 @@ mod tests {
                 times.iter().map(|t| *t - start).collect()
             })
         })
+    }
+
+    #[test]
+    fn registration_info_line_includes_tls_details() {
+        // F4：連線流程中註冊成功的 INFO 帶有 dial 回傳的 TLS 資訊
+        let (_, logs) = run_script(settings(1), 1, |_, mut f| async move {
+            accept_hello(&mut f).await;
+        });
+        let registered: Vec<_> = logs
+            .iter()
+            .filter(|(_, m)| m.starts_with("已向伺服器註冊"))
+            .collect();
+        assert_eq!(registered.len(), 1, "{logs:?}");
+        let (level, msg) = registered[0];
+        assert_eq!(*level, log::Level::Info);
+        assert!(
+            msg.contains("伺服器離線判定 5000 ms")
+                && msg.contains("TLSv1_3")
+                && msg.contains("已驗證伺服器憑證"),
+            "{msg}"
+        );
+        // 不再有 INFO 等級的「已建立 TLS 加密連線」
+        assert!(
+            !logs
+                .iter()
+                .any(|(l, m)| *l <= log::Level::Info && m.contains("已建立 TLS 加密連線")),
+            "{logs:?}"
+        );
     }
 
     /// 斷線日誌（「連線中斷」開頭）的等級與內容。

@@ -8,3 +8,6 @@
 agent.id
 pulse.toml
 logs/
+
+# 發佈包輸出（packaging/build-release.sh）
+/dist/

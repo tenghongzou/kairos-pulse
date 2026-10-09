@@ -6,7 +6,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ## 功能特色
 
-- 🖥️ 收集系統資訊：CPU 使用率、記憶體（啟動時另印出一次完整資訊：磁碟、網路、元件溫度）
+- 🖥️ 收集系統資訊：CPU 使用率、記憶體（啟動時另印出一次系統資訊：磁碟、網路、元件溫度；`info` 等級略過虛擬檔案系統與虛擬網路介面）
 - 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON），預設**驗證伺服器憑證**（作業系統信任庫 + 自訂 CA；可設定為只信任自訂 CA）
 - 🪪 每台主機有固定的 `agent_id`（UUID v4，存於 `agent.id`），換主機名稱也不影響識別
 - 💓 每秒送出 heartbeat，伺服器據此判斷上線 / 離線
@@ -32,6 +32,21 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 | 新版 Pulse 連舊版 Kairos（`572b955` 之前，`timeouts.write_secs` 沒有 6 秒上限） | Kairos 的 `timeouts.write_secs` 大於約 8 秒時，伺服器寫檔緩慢期間的回應延遲可能超過讀取閒置中的 10 秒餘裕，Pulse **誤判斷線**並重連 |
 
 **部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
+
+## 從發佈包安裝
+
+地端正式部署請使用預編譯的發佈包 `pulse-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件與 `PROTOCOL.md`。
+
+完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
+
+1. `sha256sum -c SHA256SUMS` 驗證後解壓（`tar xzf … --strip-components=1`），`./pulse --version` 確認版本與 commit。
+2. 建立系統使用者 `pulse` 與 `/opt/pulse`、`/opt/pulse/logs`。
+3. 在 `/opt/pulse` 執行 `pulse --print-agent-id` 產生 `agent.id`；在本機產生私鑰與 CSR，把 CSR 交給 Kairos 管理者以 `openssl ca` 簽發（見「啟用 mTLS」）。
+4. 建立只含覆蓋欄位的 `pulse.toml`，放好 `ca.pem`、`client.pem`、`client.key` 並設定權限。
+5. 安裝 `pulse.service`（`WorkingDirectory=/opt/pulse`、`Restart=always`、`KillSignal=SIGINT`、`StandardOutput=null`：日誌只保留 `logs/` 一份，stderr 仍進 journal），`systemctl enable --now pulse`。
+6. 確認日誌出現「已向伺服器註冊」，以及 Kairos 的 `agents.json` 中此 agent 為 `online`。
+
+升級時先升級全部 Pulse，再升級 Kairos（見上一節）。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine` 建置 musl 靜態執行檔，輸出到 `dist/`（含 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。
 
 ## 快速開始（搭配 Kairos，本機測試）
 
@@ -72,9 +87,10 @@ PULSE__SERVER__CA_CERT=path/to/cert.pem cargo run
 成功時日誌會出現：
 
 ```
-[INFO] 已建立 TLS 加密連線：127.0.0.1:8080（domain=localhost，TLSv1_3）
-[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 5000 ms）
+[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 5000 ms；TLS 加密連線 127.0.0.1:8080，domain=localhost，TLSv1_3，已驗證伺服器憑證）
 ```
+
+判斷連線成功以這一行為準。TLS 握手完成的「已建立 TLS 加密連線（…）」只在 `debug` 等級記錄：TLS 1.3 下伺服器在握手**之後**才驗證客戶端憑證，握手完成不代表會被接受（例如憑證已撤銷時，接著就會被拒）。
 
 > 若伺服器尚未啟動，日誌會出現「TCP 連線失敗」並依退避策略重連，屬正常現象。
 
@@ -122,24 +138,25 @@ pulse --print-agent-id
 
 ### 2. 由管理者簽發客戶端憑證
 
-完整流程以 Kairos README 為準，精簡版如下（`<id>` 換成上一步的 agent_id）：
+代理 CA 一開始就要用 `openssl ca` 的資料庫管理，之後才能**撤銷**單一代理的憑證（以 `openssl x509 -req` 簽發的憑證沒有簽發紀錄，要撤銷時只能整套重建）。代理 CA 的建立（`agent-ca/ca.cnf`）、CRL 的產生與撤銷流程以 Kairos README 的「啟用 mTLS」與「撤銷客戶端憑證（CRL）」為準，從發佈包部署時見 Kairos 的 `INSTALL.md`。以下為與 Pulse 相關的部分（`<id>` 換成上一步的 agent_id）：
 
 ```bash
-# 管理者：建立 client CA（只需一次；client-ca.key 請離線保存）
-MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:4096 -nodes \
-  -keyout client-ca.key -out client-ca.pem -days 3650 -subj "/CN=Pulse Client CA"
-
-# 產生私鑰與 CSR（RSA 或 EC 皆可，例如 EC P-256 改用：-newkey ec -pkeyopt ec_paramgen_curve:P-256）
+# Pulse 主機：產生私鑰與 CSR（私鑰不離開這台主機；RSA 或 EC 皆可，
+# 例如 EC P-256 改用：-newkey ec -pkeyopt ec_paramgen_curve:P-256）
 MSYS_NO_PATHCONV=1 openssl req -new -newkey rsa:2048 -nodes \
   -keyout client.key -out client.csr -subj "/CN=<id>" \
   -addext "subjectAltName=DNS:<id>" -addext "extendedKeyUsage=clientAuth"
 
-# 用 client CA 簽發（-copy_extensions copyall 需 OpenSSL 3.0+，保留 CSR 中的 SAN 與 EKU）
-openssl x509 -req -in client.csr -CA client-ca.pem -CAkey client-ca.key -CAcreateserial \
-  -out client.pem -days 825 -copy_extensions copyall
+# 管理者：以代理 CA 的 openssl ca 資料庫簽發（agent-ca/ca.cnf 依 Kairos README 建立；
+# 在 agent-ca/ 的上層目錄執行，ca.cnf 中的路徑是相對路徑）
+MSYS_NO_PATHCONV=1 openssl ca -batch -config agent-ca/ca.cnf -extensions client_ext \
+  -in client.csr -out client.pem -notext
+
+# 確認 SAN 只有 DNS:<id>、EKU 為 clientAuth
+openssl x509 -in client.pem -noout -ext subjectAltName,extendedKeyUsage
 ```
 
-`client-ca.pem` 交給 Kairos（`auth.client_ca`）；`client.pem`、`client.key` 交給該台 Pulse。
+只把 `client.csr` 交給管理者，取回 `client.pem`（以及伺服器 CA 的 `ca.pem`）；`client-ca.pem` 與 CRL 由管理者設定在 Kairos（`auth.client_ca`、`auth.crl`）。要撤銷某台代理時，管理者以 `openssl ca -revoke` 撤銷並重新產生 CRL，Kairos 熱重載後該代理會收到 `certificate_rejected` 並被斷線。
 
 若客戶端憑證是由**中繼 CA** 簽發，把中繼 CA 接在客戶端憑證後面即可（`cat client.pem intermediate.pem > client-chain.pem`），Pulse 會在握手時送出整條鏈，伺服器只需信任根 CA。
 
@@ -229,16 +246,19 @@ cargo run
 |---|---|
 | （無） | 啟動監控代理 |
 | `--print-agent-id` | 印出本機 agent_id 後結束（見「啟用 mTLS」） |
+| `-V`, `--version` | 印出 `pulse <版本> (<commit>)` 後結束（不讀取設定，設定有誤時也能確認版本） |
 | `-h`, `--help` | 顯示使用說明 |
 
 未知參數會印出錯誤與用法，並以 exit code 2 結束。
+
+`--version` 的 commit 在建置時決定：環境變數 `BUILD_COMMIT`（`packaging/build-release.sh` 會傳入）→ `git rev-parse --short HEAD` → 都取不到時為 `unknown`。啟動日誌的第一行也會印出同樣的版本字串；送給伺服器的 hello 中的 `agent_version` 仍只有版本號（例如 `0.1.0`）。
 
 程式啟動後會：
 
 1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、`use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
 2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
-4. 印出一次完整的系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）
+4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點、網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`
 5. 啟動系統資訊收集背景任務（每 `report.interval` 秒取樣一次）
 6. 連線到伺服器、送出 hello、收到 hello_ack 後開始送 heartbeat 與 report
 
@@ -255,7 +275,7 @@ cargo run
 
 設定依下列順序疊加，**後者覆蓋前者**：
 
-1. 專案根目錄的 `config.toml`：於**編譯時**以 `include_str!` 嵌入，作為預設值（修改它需重新編譯）
+1. 專案根目錄的 `config.toml`：於**編譯時**以 `include_str!` 嵌入，作為預設值（修改它需重新編譯）；發佈包中的 `pulse.example.toml` 就是這份檔案，只供參考，程式不會讀取
 2. 目前工作目錄下的 `pulse.toml`：可不存在；只需寫要覆蓋的欄位，**不需重新編譯**
 3. 環境變數 `PULSE__<SECTION>__<KEY>`（雙底線分隔，不分大小寫），例如 `PULSE__SERVER__PORT=9000`、`PULSE__LOG__LEVEL=debug`
 
@@ -324,7 +344,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 - `accept_invalid_certs` **預設為 `false`**，Pulse 會驗證伺服器憑證是否受信任、`server.domain` 是否與憑證 SAN 相符。
 - 使用自簽憑證或私有 CA 時，請用 `ca_cert` 指定要信任的憑證，**不要**改成 `accept_invalid_certs = true`；並建議設定 `use_system_roots = false`，只信任 `ca_cert`。
-- `accept_invalid_certs = true` 會略過伺服器憑證的信任鏈與名稱驗證，任何人都能冒充伺服器（中間人攻擊），僅限臨時除錯使用。啟用時啟動階段會以 `ERROR` 記錄警告（`log.level` 最高只能設為 `error`，因此一定看得到），每次連線成功的「已建立 TLS 加密連線」日誌也改以 `WARN` 記錄並標註「未驗證伺服器憑證」。握手簽章仍會正確驗證（確保對方持有該憑證的私鑰），但這無法防止中間人使用自己的憑證。若同時設定了 `ca_cert`，也會以 `ERROR` 警告 `ca_cert` 此時形同無效。
+- `accept_invalid_certs = true` 會略過伺服器憑證的信任鏈與名稱驗證，任何人都能冒充伺服器（中間人攻擊），僅限臨時除錯使用。啟用時啟動階段會以 `ERROR` 記錄警告（`log.level` 最高只能設為 `error`，因此一定看得到），每次連線時，連線當下（「已建立 TLS 加密連線」）與註冊成功時（「已向伺服器註冊」）各記一行 `WARN`，並標註「⚠️ 未驗證伺服器憑證」。握手簽章仍會正確驗證（確保對方持有該憑證的私鑰），但這無法防止中間人使用自己的憑證。若同時設定了 `ca_cert`，也會以 `ERROR` 警告 `ca_cert` 此時形同無效。
 - 未啟用 mTLS 時，`agent.id` 的內容就是本機在伺服器上的身分憑據，請妥善保護（見「agent.id」）。
 
 ## 協定概述
@@ -342,7 +362,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
   - `error` 缺少欄位時不會被忽略：缺 `message` 視為空字串、缺 `code` 時日誌顯示「（未提供錯誤碼）」、缺 `fatal` 視為 fatal
 - `hello_ack` 的 `seq` 應為 1（對應 `hello`），不符時只記 `WARN`，仍視為註冊成功
 - `agent_id` 一律以小寫送出（伺服器也不分大小寫、以小寫為準）
-- `hostname` 送出前會去除前後空白、把控制字元（Cc）、格式字元（Cf，例如 U+200B、U+202E、U+FEFF）、U+2028、U+2029，以及顯示為空白或不可見的碼位（U+034F、Hangul filler U+115F／U+1160／U+3164／U+FFA0、變體選擇字元 U+FE00–U+FE0F／U+E0100–U+E01EF、私用區 U+E000–U+F8FF／U+F0000–U+FFFFD／U+100000–U+10FFFD）替換成 `?`（與 Kairos 驗證 hostname 的規則相同，因此不會因主機名稱含這些字元而被拒絕）、截到 255 bytes 以內的字元邊界（取不到時為 `unknown`）；`cpu_usage` 送出前若非有限值改為 0，再夾在 0～100
+- `hostname` 送出前會去除前後空白、把控制字元（Cc）、格式字元（Cf，例如 U+200B、U+202E、U+FEFF）、U+2028、U+2029，以及顯示為空白或不可見的碼位（U+034F、Hangul filler U+115F／U+1160／U+3164／U+FFA0、變體選擇字元 U+FE00–U+FE0F／U+E0100–U+E01EF、私用區 U+E000–U+F8FF／U+F0000–U+FFFFD／U+100000–U+10FFFD）替換成 `?`（與 Kairos 驗證 hostname 的規則相同，因此不會因主機名稱含這些字元而被拒絕）、截到 255 bytes 以內的字元邊界（取不到時為 `unknown`）；`cpu_usage` 送出前若非有限值改為 0，再夾在 0～100，並四捨五入到小數 2 位
 
 | 項目 | 逾時 |
 |---|---|
@@ -363,7 +383,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
   "type": "report",
   "seq": 6,
   "ts": "2026-10-08T03:15:45.210Z",   // Pulse 取樣時間（RFC 3339 UTC，毫秒）
-  "cpu_usage": 17.84,                 // 全機 CPU 平均使用率（%，0～100；上次取樣到這次取樣之間的平均）
+  "cpu_usage": 17.84,                 // 全機 CPU 平均使用率（%，0～100，四捨五入到小數 2 位；上次取樣到這次取樣之間的平均）
   "total_memory": 49152,              // 總記憶體（MB）
   "used_memory": 37034                // 已使用記憶體（MB）
 }
@@ -417,7 +437,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 ```
 src/
 ├── main.rs            進入點：載入設定、初始化日誌、建立 TLS 設定、啟動並監看背景任務
-├── cli.rs             命令列參數解析（--print-agent-id、--help）
+├── cli.rs             命令列參數解析（--print-agent-id、--version、--help）與版本字串
 ├── config_manager.rs  設定管理（嵌入預設 → pulse.toml → PULSE__ 環境變數）與範圍驗證
 ├── tls.rs             rustls 設定：信任庫、客戶端憑證、SAN 與有效期限檢查、TLS 錯誤提示
 ├── protocol.rs        協定訊息定義（ClientMsg / ServerMsg）
@@ -432,7 +452,9 @@ src/
 testdata/              測試用的憑證與私鑰（僅供測試、不可部署，見 testdata/README.md）：客戶端 CA / 中繼 CA / 客戶端憑證、
                        TLS 握手測試用的伺服器 CA 與伺服器憑證（server-ca.pem、server.pem、server.key）、
                        多個 DNS SAN 的客戶端憑證（multi-san.pem）
-config.toml            預設設定（編譯時嵌入）
+config.toml            預設設定（編譯時嵌入；發佈包中改名為 pulse.example.toml）
+build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
+packaging/             發佈包：build-release.sh（打包腳本）、pulse.service（systemd unit）、INSTALL.md（安裝指南）
 rust-toolchain.toml    固定使用 Rust 1.99.0
 ```
 

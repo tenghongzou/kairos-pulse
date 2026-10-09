@@ -32,7 +32,9 @@ pub enum ClientMsg {
     Report {
         seq: u64,
         ts: String,
-        cpu_usage: f32,
+        /// 全機 CPU 平均使用率（%，0～100）；以 [`report_cpu_usage`] 產生（已四捨五入到小數 2 位）。
+        /// 型別用 f64：f32 直接序列化會出現 `7.5000005` 這類精度雜訊
+        cpu_usage: f64,
         /// 總記憶體（MB）
         total_memory: u64,
         /// 已使用記憶體（MB）
@@ -146,6 +148,16 @@ pub fn sanitize_cpu_usage(cpu: f32) -> f32 {
     }
 }
 
+/// report 實際送出的 `cpu_usage`：先以 [`sanitize_cpu_usage`] 整理，再轉成 f64 四捨五入到小數 2 位。
+///
+/// 在 f64 上以「乘 100 → round → 除以 100」計算，結果是最接近 `n / 100` 的 f64，
+/// serde_json 以最短表示法輸出，因此 JSON 中最多只有 2 位小數（例如 f32 的 `7.5000005` → `7.5`）。
+/// 結果仍是 0～100 的有限值，符合 PROTOCOL.md 的範圍。
+pub fn report_cpu_usage(cpu: f32) -> f64 {
+    let cpu = f64::from(sanitize_cpu_usage(cpu));
+    ((cpu * 100.0).round() / 100.0).clamp(0.0, 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,20 +167,11 @@ mod tests {
     // JSON 字串是 PROTOCOL.md「範例」節的測試向量（與 Kairos 的 src/protocol.rs 相同），
     // 修改協定時兩邊一起更新。
 
-    /// 序列化後轉成 `Value` 與測試向量比對（不比字串，避免欄位順序 / 浮點表示差異）。
+    /// 序列化後轉成 `Value` 與測試向量比對（不比字串，避免欄位順序差異）。
+    /// cpu_usage 為 f64，與測試向量逐位元比對，不需容差。
     fn assert_serializes_to(msg: &ClientMsg, expected: &str) {
         let actual: Value = serde_json::from_str(&serde_json::to_string(msg).unwrap()).unwrap();
-        let mut expected: Value = serde_json::from_str(expected).unwrap();
-        // cpu_usage 為 f32，轉成 f64 後會有微小誤差，改以容差比對後移除
-        if let (Some(a), Some(e)) = (actual.get("cpu_usage"), expected.get("cpu_usage")) {
-            let (a, e) = (a.as_f64().unwrap(), e.as_f64().unwrap());
-            assert!((a - e).abs() < 1e-4, "cpu_usage {a} != {e}");
-            let mut actual = actual.clone();
-            actual.as_object_mut().unwrap().remove("cpu_usage");
-            expected.as_object_mut().unwrap().remove("cpu_usage");
-            assert_eq!(actual, expected);
-            return;
-        }
+        let expected: Value = serde_json::from_str(expected).unwrap();
         assert_eq!(actual, expected);
     }
 
@@ -340,6 +343,51 @@ mod tests {
         assert_eq!(sanitize_cpu_usage(f32::NAN), 0.0);
         assert_eq!(sanitize_cpu_usage(f32::INFINITY), 0.0);
         assert_eq!(sanitize_cpu_usage(f32::NEG_INFINITY), 0.0);
+    }
+
+    /// report 序列化後的 `"cpu_usage":...` 數值字串。
+    fn serialized_cpu(cpu: f32) -> String {
+        let line = serde_json::to_string(&ClientMsg::Report {
+            seq: 1,
+            ts: "2026-10-09T00:00:00.000Z".into(),
+            cpu_usage: report_cpu_usage(cpu),
+            total_memory: 2,
+            used_memory: 1,
+        })
+        .unwrap();
+        let start = line.find("\"cpu_usage\":").unwrap() + "\"cpu_usage\":".len();
+        let rest = &line[start..];
+        rest[..rest.find(',').unwrap()].to_string()
+    }
+
+    #[test]
+    fn cpu_usage_is_rounded_to_two_decimals_without_f32_noise() {
+        // F7：部署測試看到的 f32 雜訊
+        assert_eq!(serialized_cpu(7.500_000_5), "7.5");
+        assert_eq!(serialized_cpu(2.304_609_3), "2.3");
+        assert_eq!(serialized_cpu(17.84), "17.84");
+        assert_eq!(serialized_cpu(33.333_336), "33.33");
+        assert_eq!(serialized_cpu(66.666_67), "66.67");
+        assert_eq!(serialized_cpu(0.004), "0.0");
+        assert_eq!(serialized_cpu(0.005_1), "0.01");
+        assert_eq!(serialized_cpu(99.996), "100.0");
+        // 範圍與非有限值的處理不變（PROTOCOL.md：有限值、0～100）
+        assert_eq!(serialized_cpu(100.5), "100.0");
+        assert_eq!(serialized_cpu(-3.0), "0.0");
+        assert_eq!(serialized_cpu(f32::NAN), "0.0");
+        assert_eq!(serialized_cpu(f32::INFINITY), "0.0");
+        // 全範圍掃描：JSON 數值最多 2 位小數、仍在 0～100、與原值相差不超過 0.005（加上 f32 誤差）
+        let mut cpu = 0.0_f32;
+        while cpu <= 100.0 {
+            let text = serialized_cpu(cpu);
+            let decimals = text.split('.').nth(1).map_or(0, str::len);
+            assert!(decimals <= 2, "{cpu} → {text}");
+            let v: f64 = text.parse().unwrap();
+            assert!((0.0..=100.0).contains(&v), "{cpu} → {text}");
+            assert!((v - f64::from(cpu)).abs() <= 0.005 + 1e-6, "{cpu} → {text}");
+            assert_eq!(v, report_cpu_usage(cpu), "反序列化後與送出的值相同");
+            cpu += 0.013_7;
+        }
     }
 
     #[test]

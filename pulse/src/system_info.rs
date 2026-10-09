@@ -1,4 +1,4 @@
-use log::info;
+use log::{debug, info};
 use std::time::Duration;
 use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
 use tokio::sync::mpsc;
@@ -72,7 +72,81 @@ fn normalize_hostname(name: Option<String>) -> String {
     name[..end].to_string()
 }
 
-/// 在啟動時印出一次完整的系統資訊（同時寫入日誌）。
+/// 虛擬或偽檔案系統（不對應實體儲存空間），啟動時的 INFO 磁碟清單中略過（完整清單見 debug）。
+///
+/// 例如 docker 主機上每個容器都有一個 overlay 掛載點，snap 套件是 squashfs。比對時不分大小寫；
+/// `fuse.` 開頭的 FUSE 子類型只略過已知的虛擬類型（例如 `fuse.lxcfs`），sshfs 等仍會列出。
+const VIRTUAL_FILESYSTEMS: &[&str] = &[
+    "overlay",
+    "overlayfs",
+    "aufs",
+    "tmpfs",
+    "devtmpfs",
+    "ramfs",
+    "squashfs",
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "devpts",
+    "mqueue",
+    "debugfs",
+    "tracefs",
+    "securityfs",
+    "pstore",
+    "bpf",
+    "configfs",
+    "fusectl",
+    "hugetlbfs",
+    "autofs",
+    "nsfs",
+    "efivarfs",
+    "binfmt_misc",
+    "rpc_pipefs",
+    "fuse.lxcfs",
+    "fuse.portal",
+    "fuse.gvfsd-fuse",
+    "nullfs",
+    "devfs",
+];
+
+/// 檔案系統類型是否為虛擬檔案系統（見 [`VIRTUAL_FILESYSTEMS`]）。
+fn is_virtual_filesystem(fs_type: &str) -> bool {
+    let fs_type = fs_type.trim();
+    VIRTUAL_FILESYSTEMS
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(fs_type))
+}
+
+/// 磁碟是否列在啟動時的 INFO 清單：略過虛擬檔案系統與總容量為 0 的掛載點。
+fn is_meaningful_disk(fs_type: &str, total_space: u64) -> bool {
+    total_space > 0 && !is_virtual_filesystem(fs_type)
+}
+
+/// 虛擬網路介面的名稱前綴（docker / bridge / veth pair / CNI 等），啟動時的 INFO 清單中略過。
+const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
+    "veth", "docker", "br-", "virbr", "cni", "flannel", "cali", "vxlan", "tunl", "kube-", "lxcbr",
+    "lxdbr",
+];
+
+/// 迴路介面的完整名稱（Linux `lo`、macOS / BSD `lo0`）。
+const LOOPBACK_INTERFACES: &[&str] = &["lo", "lo0"];
+
+/// 網路介面是否列在啟動時的 INFO 清單：略過迴路介面與虛擬介面（見 [`VIRTUAL_INTERFACE_PREFIXES`]）。
+///
+/// 前綴比對區分大小寫（Linux 介面名稱區分大小寫；例如 Hyper-V 的 `vEthernet (...)` 可能是實際對外的
+/// 介面，不會被 `veth` 誤判）。
+fn is_meaningful_interface(name: &str) -> bool {
+    !LOOPBACK_INTERFACES.contains(&name)
+        && !VIRTUAL_INTERFACE_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// 在啟動時印出一次系統資訊（同時寫入日誌）。
+///
+/// 磁碟與網路介面在 INFO 只列有意義的項目（略過虛擬檔案系統、容量為 0 的掛載點、迴路與虛擬介面），
+/// 略過的項目逐一記在 debug 等級，因此 `log.level = "debug"` 時可看到完整清單。
 pub fn get_system_info() {
     // 初始化系統資訊
     let mut sys = System::new_all();
@@ -95,37 +169,63 @@ pub fn get_system_info() {
     info!("系統版本: {:?}", System::os_version());
     info!("主機名稱: {:?}", System::host_name());
 
-    // CPU 數量與平均使用率
-    info!("CPU 數量: {}", sys.cpus().len());
-    info!("CPU 平均使用率: {:.2}%", average_cpu_usage(&sys));
-    info!("=> 各核心 CPU 使用率:");
+    // CPU：INFO 只記一行摘要（核心數、平均使用率），各核心使用率記 debug
+    info!(
+        "{}",
+        cpu_summary_line(sys.cpus().len(), average_cpu_usage(&sys))
+    );
     for cpu in sys.cpus() {
-        info!("CPU {}: {:.2}% 使用率", cpu.name(), cpu.cpu_usage());
+        debug!("{}", cpu_core_line(cpu.name(), cpu.cpu_usage()));
     }
 
-    // 磁碟資訊
+    // 磁碟資訊（虛擬檔案系統與容量為 0 的掛載點只記 debug）
     info!("=> 磁碟資訊:");
     let disks = Disks::new_with_refreshed_list();
+    let mut hidden_disks = 0usize;
     for disk in &disks {
-        info!(
-            "掛載位置: {:?}, 硬碟種類: {:?}, 磁碟名稱: {:?}, 總容量: {} GB, 可用空間: {} GB",
+        let fs_type = disk.file_system().to_string_lossy();
+        let line = format!(
+            "掛載位置: {:?}, 檔案系統: {fs_type}, 硬碟種類: {:?}, 磁碟名稱: {:?}, 總容量: {} GB, 可用空間: {} GB",
             disk.mount_point(),
             disk.kind(),
             disk.name(),
             disk.total_space() / 1_000_000_000,
             disk.available_space() / 1_000_000_000,
         );
+        if is_meaningful_disk(&fs_type, disk.total_space()) {
+            info!("{line}");
+        } else {
+            hidden_disks += 1;
+            debug!("（虛擬或容量為 0，INFO 不列出）{line}");
+        }
+    }
+    if hidden_disks > 0 {
+        info!(
+            "另有 {hidden_disks} 個虛擬檔案系統或容量為 0 的掛載點未列出（log.level = \"debug\" 可看完整清單）"
+        );
     }
 
-    // 網路介面資訊
+    // 網路介面資訊（迴路與虛擬介面只記 debug）
     info!("=> 網路資訊:");
     let networks = Networks::new_with_refreshed_list();
+    let mut hidden_interfaces = 0usize;
     for (interface_name, data) in &networks {
-        info!(
+        let line = format!(
             "介面: {}, 已下載: {} B, 已上傳: {} B",
             interface_name,
             data.total_received(),
             data.total_transmitted(),
+        );
+        if is_meaningful_interface(interface_name) {
+            info!("{line}");
+        } else {
+            hidden_interfaces += 1;
+            debug!("（迴路或虛擬介面，INFO 不列出）{line}");
+        }
+    }
+    if hidden_interfaces > 0 {
+        info!(
+            "另有 {hidden_interfaces} 個迴路或虛擬網路介面（lo、veth*、docker*、br-* 等）未列出（log.level = \"debug\" 可看完整清單）"
         );
     }
 
@@ -139,6 +239,16 @@ pub fn get_system_info() {
             None => info!("元件: {:?}, 溫度: 無法讀取", component.label()),
         }
     }
+}
+
+/// 啟動時 CPU 的 INFO 摘要行（核心數、平均使用率）。
+fn cpu_summary_line(cores: usize, average: f32) -> String {
+    format!("CPU: {cores} 個核心，平均使用率 {average:.2}%（各核心使用率見 debug 等級）")
+}
+
+/// 啟動時單一核心使用率的 debug 行。
+fn cpu_core_line(name: &str, usage: f32) -> String {
+    format!("各核心 CPU 使用率：{name}：{usage:.2}%")
 }
 
 /// 在 blocking 執行緒執行 `f`。
@@ -351,6 +461,117 @@ mod tests {
         assert_eq!(h, "?".repeat(100));
         let h = normalize_hostname(Some(format!("{}\u{e000}", "主".repeat(85))));
         assert!(h.len() <= 255 && !h.chars().any(is_forbidden_display_char));
+    }
+
+    #[test]
+    fn virtual_filesystems_and_empty_mounts_are_hidden() {
+        // F6：docker 主機上的 overlay 掛載點、tmpfs 等不列在 INFO
+        for fs in [
+            "overlay",
+            "tmpfs",
+            "devtmpfs",
+            "squashfs",
+            "proc",
+            "sysfs",
+            "cgroup2",
+            "TMPFS",
+            "fuse.lxcfs",
+            " overlay ",
+        ] {
+            assert!(!is_meaningful_disk(fs, 10_000_000_000), "{fs}");
+        }
+        // 實體或網路檔案系統照常列出
+        for fs in [
+            "ext4",
+            "xfs",
+            "btrfs",
+            "zfs",
+            "vfat",
+            "NTFS",
+            "ReFS",
+            "apfs",
+            "nfs4",
+            "cifs",
+            "fuse.sshfs",
+            "",
+        ] {
+            assert!(is_meaningful_disk(fs, 10_000_000_000), "{fs}");
+        }
+        // 總容量為 0 的掛載點一律略過；小於 1 GB（顯示為 0 GB）但非 0 的仍列出（例如 /boot/efi）
+        assert!(!is_meaningful_disk("ext4", 0));
+        assert!(is_meaningful_disk("vfat", 512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn loopback_and_virtual_interfaces_are_hidden() {
+        // F6：docker 主機上的 veth、docker0、br-xxxx 與 lo 不列在 INFO
+        for name in [
+            "lo",
+            "lo0",
+            "veth1a2b3c4",
+            "docker0",
+            "docker_gwbridge",
+            "br-0123456789ab",
+            "virbr0",
+            "cni0",
+            "flannel.1",
+            "cali1234abcd",
+            "vxlan.calico",
+            "tunl0",
+            "kube-ipvs0",
+            "lxcbr0",
+        ] {
+            assert!(!is_meaningful_interface(name), "{name}");
+        }
+        for name in [
+            "eth0",
+            "ens18",
+            "enp3s0",
+            "eno1",
+            "wlan0",
+            "wlp2s0",
+            "bond0",
+            "en0",
+            "wg0",
+            "tailscale0",
+            "local0",
+            "乙太網路",
+            "Wi-Fi",
+            "vEthernet (Default Switch)",
+            "bridge0",
+        ] {
+            assert!(is_meaningful_interface(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn cpu_summary_and_core_lines() {
+        assert_eq!(
+            cpu_summary_line(24, 37.375),
+            "CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）"
+        );
+        assert_eq!(cpu_core_line("cpu3", 5.0), "各核心 CPU 使用率：cpu3：5.00%");
+    }
+
+    #[test]
+    fn startup_info_lists_cpu_cores_only_at_debug() {
+        // INFO 只有一行 CPU 摘要；每個核心一行的使用率只在 debug
+        let ((), logs) = crate::test_log::capture(get_system_info);
+        let cores = System::new_all().cpus().len();
+        let info_cpu: Vec<_> = logs
+            .iter()
+            .filter(|(l, m)| *l == log::Level::Info && m.contains("CPU"))
+            .collect();
+        assert_eq!(info_cpu.len(), 1, "{info_cpu:?}");
+        assert!(
+            info_cpu[0].1.starts_with(&format!("CPU: {cores} 個核心")),
+            "{info_cpu:?}"
+        );
+        let debug_cores = logs
+            .iter()
+            .filter(|(l, m)| *l == log::Level::Debug && m.starts_with("各核心 CPU 使用率"))
+            .count();
+        assert_eq!(debug_cores, cores, "{logs:?}");
     }
 
     #[tokio::test]

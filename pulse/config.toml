@@ -1,14 +1,24 @@
-# Pulse 預設設定（編譯時以 include_str! 嵌入二進位檔）
+# Pulse 設定範例與預設值
 #
-# 載入順序（後者覆蓋前者）：
-#   1. 本檔（嵌入的預設值）
-#   2. 目前工作目錄下的 pulse.toml（可省略；只需寫要覆蓋的欄位）
-#   3. 環境變數 PULSE__<SECTION>__<KEY>，例如 PULSE__SERVER__PORT=9000
+# 這份檔案有兩種用途，內容相同：
+#   - 原始碼中的 config.toml：編譯時嵌入執行檔，作為所有欄位的預設值。
+#   - 發佈包中的 pulse.example.toml：供參考的範例，程式「不會」讀取這個檔名。
+#
+# 如何修改設定（不要直接修改本檔，修改它不會生效）：
+#   1. 在 Pulse 的工作目錄下另外建立 pulse.toml。
+#   2. 只寫要覆蓋的欄位，其餘沿用內建預設值；不需要把整份檔案複製過去。例如：
+#        [server]
+#        address = "kairos.example.com"
+#        domain = "kairos.example.com"
+#   3. 也可以改用環境變數 PULSE__<SECTION>__<KEY>，例如 PULSE__SERVER__PORT=9000
 #      （環境變數的值一律當字串讀入：數值與布林欄位再轉成對應型別，
 #       路徑、domain、address 等字串欄位保持原樣，例如 0001 不會變成 1）
 #
+# 載入順序（後者覆蓋前者）：內建預設值（本檔內容）→ 工作目錄下的 pulse.toml（可省略）→ PULSE__* 環境變數
+#
 # 設定中的相對路徑一律以「目前工作目錄」解析；啟動時會在日誌記錄工作目錄與是否讀到 pulse.toml。
-# 以 Windows 服務執行時預設工作目錄是 C:\Windows\System32，請在服務設定中指定工作目錄。
+# 以 systemd 執行時請設定 WorkingDirectory；以 Windows 服務執行時預設工作目錄是 C:\Windows\System32，
+# 請在服務設定中指定工作目錄。
 
 [server]
 address = "127.0.0.1"  # 不可為空字串
