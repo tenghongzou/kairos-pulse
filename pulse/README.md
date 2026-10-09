@@ -21,6 +21,18 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 - 搭配的伺服器：Kairos（同一個 repo 群組中的 `Kairos` 專案）
 - 不需要 OpenSSL 或其他 C 函式庫：TLS 使用 rustls（ring 加密後端）
 
+## 升級注意事項（與 Kairos 混用版本）
+
+Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問題：
+
+| 組合 | 風險 |
+|---|---|
+| 舊版 Pulse（`44dcee5` 之前，即 `081f859` 及更早）連新版 Kairos | 舊版只把主機名稱中的控制字元替換成 `?`，`hostname` 含格式字元（Cf）時被以 `bad_request` 拒絕，**無法註冊**；舊版的讀取閒置固定為 `max(10 秒, 2 × min(heartbeat, report))`，心跳間隔較大時（例如 5 秒）小於「心跳間隔 + 伺服器最壞回應延遲 8 秒」，伺服器寫檔緩慢時**可能誤斷線** |
+| 第一輪修正版 Pulse（`44dcee5`）連新版 Kairos | 新版 Kairos 另外禁止 U+034F、Hangul filler、變體選擇字元與私用區（見「協定概述」），`44dcee5` 不會替換這些字元；主機名稱含這些字元時**無法註冊** |
+| 新版 Pulse 連舊版 Kairos（`572b955` 之前，`timeouts.write_secs` 沒有 6 秒上限） | Kairos 的 `timeouts.write_secs` 大於約 8 秒時，伺服器寫檔緩慢期間的回應延遲可能超過讀取閒置中的 10 秒餘裕，Pulse **誤判斷線**並重連 |
+
+**部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
+
 ## 快速開始（搭配 Kairos，本機測試）
 
 ### 1. 產生含 SAN 的自簽憑證
@@ -149,8 +161,9 @@ client_key = "client.key"     # 對應私鑰
   - 檔案讀不到、找不到憑證或私鑰、格式錯誤、私鑰有加密
   - **私鑰與憑證不成對**（私鑰的公鑰與憑證不符）
   - **憑證的 SAN 不含 `DNS:<本機 agent_id>`**（伺服器一定會以 `auth_failed` 拒絕，所以不必連線就先報錯）
-  - **憑證鏈中有已過期的憑證**
-- 憑證鏈中有憑證在 30 天內到期、或尚未生效（可能是本機時鐘不正確）時，記 `WARN` 但照常啟動。
+- 憑證有效期限在啟動時與之後**每 24 小時**檢查一次，都不阻止啟動或連線：
+  - 憑證鏈中有已過期的憑證時記 `ERROR`，並提醒檢查本機時鐘；Pulse 仍會繼續嘗試連線，以伺服器的判定為準（本機時鐘超前時，憑證可能其實仍有效）。
+  - 有憑證在 30 天內到期（日誌顯示「剩餘不超過 N 天」，天數無條件進位）、或尚未生效（可能是本機時鐘不正確）時，記 `WARN`。
 - 客戶端憑證含多個 DNS SAN 時記 `WARN` 但照常啟動：Kairos 預設會以 `auth_failed` 拒絕，除非伺服器設定了 `auth.allow_multiple_dns_sans = true`。
 - 成功載入時日誌會出現 `已載入客戶端憑證：<路徑>（憑證鏈 N 張；私鑰：<路徑>）`。
 
@@ -164,11 +177,12 @@ TLS 失敗時，Pulse 會在重連日誌中附上具體原因，例如：
 |---|---|
 | 伺服器要求客戶端憑證但未設定 | 伺服器要求客戶端憑證（mTLS），但未設定 server.client_cert / server.client_key |
 | 伺服器不信任此客戶端憑證（簽發 CA 不對、缺中繼 CA、EKU 不含 clientAuth） | 伺服器不信任此客戶端憑證…／伺服器可能不接受此客戶端憑證… |
-| 伺服器表示客戶端憑證已撤銷或過期 | 伺服器表示此客戶端憑證已被撤銷（或過期），請聯絡管理者重新簽發 |
+| 伺服器表示客戶端憑證已撤銷（TLS alert `certificate_revoked`） | 伺服器表示此客戶端憑證已被撤銷，請聯絡管理者重新簽發 |
+| 伺服器表示客戶端憑證已過期（TLS alert `certificate_expired`） | 伺服器表示此客戶端憑證已過期，請聯絡管理者重新簽發 |
 | 伺服器憑證的簽發者不受信任 | 伺服器憑證不受信任…請以 server.ca_cert 指定 |
 | 伺服器憑證名稱與 `server.domain` 不符 | 伺服器憑證的名稱與 server.domain「…」不符 |
 | 伺服器憑證被標記為 CA | 伺服器憑證被標記為 CA（basicConstraints CA:TRUE）…加上 basicConstraints=critical,CA:FALSE |
-| TLS 握手完成前連線就被關閉（例如超過 Kairos 的每 IP 連線上限 `server.max_connections_per_ip`，多台代理經同一個 NAT 連入時常見） | 伺服器在 TLS 握手完成前就關閉了連線：可能超過伺服器的每 IP 連線上限（同一 IP 的連線過多），或伺服器正在重新啟動、連到的連接埠不是 TLS 服務 |
+| TLS 握手完成前連線就被關閉（例如超過 Kairos 的每 IP 連線上限 `server.max_connections_per_ip`，多台代理經同一個 NAT 連入時常見；或超過新連線速率、伺服器握手中的連線數上限） | 伺服器在 TLS 握手完成前就關閉了連線：可能超過伺服器的每 IP 連線上限（同一 IP 位址的連線過多）、新連線速率過快（同一 IP，IPv6 為同一 /64）或伺服器握手中的連線過多，或伺服器正在重新啟動、連到的連接埠不是 TLS 服務 |
 
 TLS 1.3 下伺服器在握手**之後**才驗證客戶端憑證，拒絕時送出的 alert 可能因連線被立即重設而收不到。Pulse 會記錄伺服器在握手時是否送出了客戶端憑證要求（CertificateRequest），因此即使沒收到 alert 也能指出是客戶端憑證的問題。
 
@@ -179,10 +193,11 @@ TLS 1.3 下伺服器在握手**之後**才驗證客戶端憑證，拒絕時送�
 | `auth_failed` | hello 的 `agent_id` 與客戶端憑證的 SAN 不符 | 客戶端憑證的 SAN 必須是 `DNS:<本機 agent_id>`，且伺服器預設只接受恰好一個 DNS SAN（附上實際的 agent_id 與憑證路徑） |
 | `auth_failed`（message 為 `client certificate must contain exactly one DNS SAN`） | 客戶端憑證含多個 DNS SAN | 客戶端憑證含有多個 DNS SAN，請以單一 SAN `DNS:<本機 agent_id>` 重新簽發（或由管理者設定 `auth.allow_multiple_dns_sans = true`） |
 | `certificate_rejected` | 伺服器在 hello 時、或連線期間重新載入 CA / CRL 後重新驗證，發現憑證已被撤銷、過期或不再受信任 | 客戶端憑證已被撤銷、過期或不再受伺服器信任，請聯絡管理者重新簽發 |
+| `certificate_rejected`（message 為 `revocation status unavailable`） | 伺服器的 CRL 已過期、或缺少某一層 CA 的 CRL，無法判定撤銷狀態 | 伺服器的 CRL 已過期或無法判定此憑證的撤銷狀態，屬伺服器端問題（不是本機憑證的問題，不需要重新簽發），請聯絡伺服器管理者更新 CRL |
 
 另外，Kairos 狀態表已滿時會以 fatal 的 `bad_request`（message 為 `server agent registry is full`）拒絕新的 agent_id，Pulse 會提示「伺服器狀態表已滿，無法登記新的 agent，請管理者調高 limits.max_agents」。
 
-這些都是 fatal 錯誤，照一般流程退避重連，延遲逐次加長，避免設定錯誤時狂打伺服器。被撤銷的憑證之後重連會在 TLS 握手階段就被拒絕。
+這些都是 fatal 錯誤，照一般流程退避重連，延遲逐次加長，避免設定錯誤時狂打伺服器。被撤銷的憑證之後重連會在 TLS 握手階段就被拒絕。這類錯誤每次重連都會重複發生，因此同一錯誤碼的 `ERROR` 每 10 分鐘最多記一則，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明期間改記 `WARN` 的次數（見「重連行為」）。
 
 ## 建置與執行
 
@@ -202,7 +217,11 @@ cargo run
 ./target/release/pulse
 ```
 
-測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試，目前共 115 個。
+測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試，目前共 158 個。
+
+> **`testdata/` 中的私鑰（`*.key`）只供測試使用，已公開在 repo 中，絕對不可用於任何部署環境。** 正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
+
+建議在 CI 加上 `cargo audit`（需先 `cargo install cargo-audit`），檢查依賴套件是否有已公告的安全漏洞。
 
 命令列參數：
 
@@ -216,8 +235,8 @@ cargo run
 
 程式啟動後會：
 
-1. 載入並驗證設定；設定值超出範圍、`log.level` 無效、`use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密、憑證已過期）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束
-2. 清除過期日誌檔（之後每小時一次）
+1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、`use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
+2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
 4. 印出一次完整的系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）
 5. 啟動系統資訊收集背景任務（每 `report.interval` 秒取樣一次）
@@ -240,7 +259,15 @@ cargo run
 2. 目前工作目錄下的 `pulse.toml`：可不存在；只需寫要覆蓋的欄位，**不需重新編譯**
 3. 環境變數 `PULSE__<SECTION>__<KEY>`（雙底線分隔，不分大小寫），例如 `PULSE__SERVER__PORT=9000`、`PULSE__LOG__LEVEL=debug`
 
-設定中的相對路徑（`ca_cert`、`client_cert`、`client_key`、`agent.id_file`）與日誌目錄 `logs/` 一律以**目前工作目錄**解析。
+設定中的相對路徑（`ca_cert`、`client_cert`、`client_key`、`agent.id_file`）、`pulse.toml` 與日誌目錄 `logs/` 一律以**目前工作目錄**解析。啟動時會以 `INFO` 記錄工作目錄與 `pulse.toml` 的完整路徑、是否讀到，例如：
+
+```
+[INFO] 工作目錄：/opt/pulse（設定中的相對路徑都以此為準）；設定檔：已讀取 /opt/pulse/pulse.toml
+```
+
+> **以 Windows 服務執行時**，預設工作目錄是 `C:\Windows\System32`：`pulse.toml` 必須放在那裡才會被讀取，`agent.id` 與 `logs/` 也會建立在那裡。Pulse 偵測到工作目錄是 `System32` 或 `SysWOW64` 時會記 `WARN`。請在服務設定中把工作目錄指定為 Pulse 所在的目錄（例如以服務包裝工具設定啟動目錄）。
+
+環境變數的值一律以字串讀入：數值與布林欄位在載入時才轉成對應型別，路徑、`domain`、`address` 等字串欄位保持原樣（例如 `PULSE__AGENT__ID_FILE=0001` 就是 `0001`，不會被改寫成 `1`）。
 
 ```toml
 [server]
@@ -280,6 +307,8 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 | 欄位 | 範圍 | 說明 |
 |---|---|---|
+| `server.address` | 非空白字串 | 伺服器的 IP 或主機名稱 |
+| `server.port` | 1～65535 | |
 | `heartbeat.interval` | 1～60 秒 | 與伺服器將 `heartbeat_interval_ms` 夾在 60000 一致 |
 | `report.interval` | 1～3600 秒 | |
 | `retry.initial_delay` | 1～3600 秒 | |
@@ -287,7 +316,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `log.level` | `trace` / `debug` / `info` / `warn` / `error` | 不分大小寫（`DEBUG`、`Warn` 皆可）；其他值啟動即報錯，不會默默改用 `info` |
 | `log.retention_days` | 0～3650 天 | 0 = 永久保留 |
 | `agent.id_file` | 非空字串 | |
-| `server.domain` | 有效的 DNS 名稱或 IP 位址 | |
+| `server.domain` | 有效的 DNS 名稱或 IP 位址，不可空白 | |
 | `server.use_system_roots` | `true` / `false` | `false` 時 `server.ca_cert` 必填，否則啟動即報錯（`accept_invalid_certs = true` 時不使用信任庫，不檢查此項） |
 | `server.client_cert` / `server.client_key` | 同時設定或同時留空 | 只設定一個時啟動即報錯 |
 
@@ -305,14 +334,15 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 - 一條長 TLS 連線，**NDJSON**（UTF-8，一行一則 JSON，以 `\n` 結尾），單行上限 65536 bytes
 - 每則訊息有 `type` 與 `seq`；`seq` 每條連線從 1 開始遞增，重連後重新計算
 - 流程：Pulse 送 `hello` → Kairos 回 `hello_ack` → 之後 Pulse 每 `heartbeat.interval` 秒送 `heartbeat`、每 `report.interval` 秒送 `report`，Kairos 對每則訊息回 `ack`
-- `report` 的 `ack` 代表該筆資料已寫入伺服器的資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`。Pulse 收到時記 `WARN`（與其他伺服器異常訊息一樣節流），**該筆 report 視為未送達、不重送**，連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連，該筆同樣不重送
+- `report` 的 `ack` 代表該筆資料已寫入伺服器的資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`（message 為 `report could not be stored`：寫入失敗或達到伺服器的每日檔案大小上限；或 `report rate limit exceeded`：同一來源送得太快）。Pulse 收到時記 `WARN`（節流，見「日誌」），**該筆 report 視為未送達、不重送**，連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連，該筆同樣不重送
+- **同一時間只有一筆 report 在途**：送出 report 後，到收到伺服器對它（或之後的訊息）的回應（`ack` 或帶 `seq` 的 `error`，含 `storage_unavailable`）之前，新的取樣直接略過（記 `WARN`，節流，附這條連線已略過的次數）；斷線時清除。伺服器寫檔緩慢時不會在伺服器端無限積壓
 - Kairos 也可能回其他 `error`：
   - 收到 `hello_ack` **之前**收到任何 `error`（不論是否 fatal，例如 `bad_request`），Pulse 立即結束該連線並退避重連，不會等到 5 秒逾時；這次斷線以 `ERROR` 記錄錯誤碼與訊息
-  - 註冊之後收到非 fatal 的 `error` 只記 `WARN`（節流）；`fatal: true` 時結束連線並退避重連，以 `ERROR` 記錄。例外是 `superseded`：單次被取代記 `WARN`，連續被取代才記 `ERROR`（見「重連行為」）
+  - 註冊之後收到非 fatal 的 `error` 只記 `WARN`（節流）；`fatal: true` 時結束連線並退避重連，以 `ERROR` 記錄（同一錯誤碼每 10 分鐘最多一則 `ERROR`，其餘記 `WARN`）。例外是 `superseded`：單次被取代記 `WARN`，連續被取代才記 `ERROR`（見「重連行為」）
   - `error` 缺少欄位時不會被忽略：缺 `message` 視為空字串、缺 `code` 時日誌顯示「（未提供錯誤碼）」、缺 `fatal` 視為 fatal
 - `hello_ack` 的 `seq` 應為 1（對應 `hello`），不符時只記 `WARN`，仍視為註冊成功
 - `agent_id` 一律以小寫送出（伺服器也不分大小寫、以小寫為準）
-- `hostname` 送出前會去除前後空白、把控制字元（Cc）、格式字元（Cf，例如 U+200B、U+202E、U+FEFF）、U+2028 與 U+2029 替換成 `?`（與 Kairos 驗證 hostname 的規則相同，因此不會因主機名稱含這些字元而被拒絕）、截到 255 bytes 以內的字元邊界（取不到時為 `unknown`）；`cpu_usage` 送出前若非有限值改為 0，再夾在 0～100
+- `hostname` 送出前會去除前後空白、把控制字元（Cc）、格式字元（Cf，例如 U+200B、U+202E、U+FEFF）、U+2028、U+2029，以及顯示為空白或不可見的碼位（U+034F、Hangul filler U+115F／U+1160／U+3164／U+FFA0、變體選擇字元 U+FE00–U+FE0F／U+E0100–U+E01EF、私用區 U+E000–U+F8FF／U+F0000–U+FFFFD／U+100000–U+10FFFD）替換成 `?`（與 Kairos 驗證 hostname 的規則相同，因此不會因主機名稱含這些字元而被拒絕）、截到 255 bytes 以內的字元邊界（取不到時為 `unknown`）；`cpu_usage` 送出前若非有限值改為 0，再夾在 0～100
 
 | 項目 | 逾時 |
 |---|---|
@@ -320,9 +350,9 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | TLS 握手 | 10 秒 |
 | 送出 hello 後等 hello_ack | 5 秒 |
 | 每則訊息寫出 | 5 秒 |
-| 讀取閒置（沒收到任何**合法**的伺服器訊息；無法解析的行不算） | `max(2 × m, m + 10 秒)`，`m = min(heartbeat.interval, report.interval)` → 視為斷線並重連 |
+| 讀取閒置（沒收到任何**合法**的伺服器訊息；無法解析的行不算） | `max(2 × h, h + 10 秒)`，`h = heartbeat.interval`（與 `report.interval` 無關）→ 視為斷線並重連 |
 
-以預設值（heartbeat 1 秒、report 5 秒）而言，讀取閒置逾時為 11 秒。只有能解析的伺服器訊息（`ack`、`hello_ack`、`error`）才會重置閒置計時，持續送垃圾行的伺服器仍會被判定為閒置。逾時在最短間隔 `m` 上加 10 秒餘裕，是為了容忍伺服器最多 8 秒的回應延遲：Kairos 等待 report 寫入資料檔期間，同一連線的 heartbeat 也要排隊；Kairos 把寫入逾時（`timeouts.write_secs`，預設 5 秒）的上限定為 6 秒，從收到 report 到回應最壞 0.5 + 6 + 1 = 7.5 秒 ≤ 8 秒。Pulse 每 `m` 秒內一定會送出訊息，因此最久 `m + 8` 秒內一定會收到伺服器訊息，對任何心跳間隔都小於逾時。
+以預設值（heartbeat 1 秒）而言，讀取閒置逾時為 `max(2, 1 + 10)` = 11 秒；heartbeat 30 秒時為 60 秒。只有能解析的伺服器訊息（`ack`、`hello_ack`、`error`）才會重置閒置計時，持續送垃圾行的伺服器仍會被判定為閒置。逾時在心跳間隔 `h` 上加 10 秒餘裕，是為了容忍伺服器最多 8 秒的回應延遲：Kairos 等待 report 寫入資料檔期間，同一連線的 heartbeat 也要排隊；Kairos 把寫入逾時（`timeouts.write_secs`，預設 5 秒）的上限定為 6 秒，從收到 report 到回應最壞 0.05（訊息速率）+ 0.5（report 速率限制）+ 6 + 1（寫入寬限）= 7.55 秒 ≤ 8 秒。Pulse 每 `h` 秒內一定會送出 heartbeat，因此最久 `h + 8` 秒內一定會收到伺服器訊息，對任何心跳間隔都小於逾時。逾時不看 `report.interval`：report 依賴取樣任務，取樣卡住時不會送出，不能拿來保證伺服器有回應。
 
 ## 回報資料格式
 
@@ -333,7 +363,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
   "type": "report",
   "seq": 6,
   "ts": "2026-10-08T03:15:45.210Z",   // Pulse 取樣時間（RFC 3339 UTC，毫秒）
-  "cpu_usage": 17.84,                 // 全機 CPU 平均使用率（%，0～100）
+  "cpu_usage": 17.84,                 // 全機 CPU 平均使用率（%，0～100；上次取樣到這次取樣之間的平均）
   "total_memory": 49152,              // 總記憶體（MB）
   "used_memory": 37034                // 已使用記憶體（MB）
 }
@@ -341,18 +371,20 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。
 
-Report 為 **at-most-once**：斷線期間的取樣、以及伺服器回 `storage_unavailable` 的那一筆，都會直接丟棄，不補送。
+`cpu_usage` 是「上次取樣到這次取樣之間」（約等於 `report.interval`）所有 CPU 的平均使用率：取樣任務沿用同一個 sysinfo `System`，每次取樣只刷新一次，而不是只量約 200 ms 的瞬間值。
+
+Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收到回應時的取樣、以及伺服器回 `storage_unavailable` 的那一筆，都會直接丟棄，不補送。
 
 ## 重連行為
 
 - 任何錯誤（連線失敗、TLS 失敗、逾時、伺服器關閉連線、收到 fatal error、註冊前收到任何 error）都會關閉目前連線，等待後重連。
 - 等待時間從 `retry.initial_delay` 秒開始，每次加倍，最多 `retry.max_delay` 秒，並加上 ±20% 隨機抖動，避免大量 agent 同時重連。到達上限後，延遲在 `[0.8 × max_delay, max_delay]` 間均勻分佈（不會全部集中在上限值）。
 - **不限重試次數**，程式不會因伺服器暫時不在而結束。
-- 每次斷線只記**一則**日誌，內容包含斷線原因、處置提示（若有）、本次連線維持多久與退避是否重置，以及下次重連的等待時間。連續失敗未達 `retry.max_retries` 次時以 `WARN` 記錄，達到後改用 `ERROR`；伺服器送來的 fatal error、註冊前收到的 error 與協定版本不符一律以 `ERROR` 記錄（`superseded` 例外，見下）。
+- 每次斷線只記**一則**日誌，內容包含斷線原因、處置提示（若有）、本次連線維持多久與退避是否重置，以及下次重連的等待時間。連續失敗未達 `retry.max_retries` 次時以 `WARN` 記錄，達到後改用 `ERROR`；伺服器送來的 fatal error、註冊前收到的 error 與協定版本不符以 `ERROR` 記錄（`superseded` 例外，見下）。這些錯誤每次重連都會重複，因此依錯誤碼節流：同一錯誤碼每 10 分鐘最多一則 `ERROR`，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次相同原因的斷線已改記 WARN」；錯誤碼改變時立即以 `ERROR` 記錄。
 - **連線需在註冊（收到 `hello_ack`）後穩定維持 30 秒以上**，斷線時才會把退避與連續失敗次數歸零。註冊後不到 30 秒就斷仍算一次失敗，延遲繼續加倍。
 - **被 `superseded`（同一 `agent_id` 的新連線取代）**：
   - 第一次被取代視同一般斷線：連線已維持 30 秒以上就照常重置退避，記 `WARN`。
-  - **連續第 2 次**起，不論連線維持多久都**不重置退避**，且重連延遲**至少 30 秒**（不受 `retry.max_delay` 限制）：兩台主機共用同一份 `agent.id` 時，雙方各自維持 30 秒以上再被對方踢掉，若重置或延遲太短就會永久快速互踢。這時以 `ERROR` 記錄並提示極可能有多台主機共用同一份 `agent.id`；互踢會持續發生，因此 `ERROR` 每 10 分鐘最多一則，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次「連續被取代」的斷線已改記 WARN」。
+  - **連續第 2 次**起，不論連線維持多久都**不重置退避**，且重連延遲**至少 30 秒**（不受 `retry.max_delay` 限制）：兩台主機共用同一份 `agent.id` 時，雙方各自維持 30 秒以上再被對方踢掉，若重置或延遲太短就會永久快速互踢。這時以 `ERROR` 記錄並提示極可能有多台主機共用同一份 `agent.id`（設定了客戶端憑證時另外提示：產生新的 agent_id 後必須以新的 agent_id 重新簽發客戶端憑證，否則 Pulse 會因 SAN 不符而無法啟動）；互踢會持續發生，因此 `ERROR` 每 10 分鐘最多一則，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次「連續被取代」的斷線已改記 WARN」。
   - 因其他原因斷線時，連續被取代的次數歸零。
 - 日誌範例：
 
@@ -377,7 +409,7 @@ Report 為 **at-most-once**：斷線期間的取樣、以及伺服器回 `storag
   - 正式環境建議啟用 mTLS，讓身分改由客戶端憑證與私鑰保護。
 - Kairos 以 `agent_id` 識別主機；主機名稱只用於顯示。
 - 啟用 mTLS 時，客戶端憑證的 SAN 綁定 `agent_id`；重新產生 `agent.id` 就必須重新簽發憑證。可用 `pulse --print-agent-id` 查看目前的 ID。
-- **不要把同一份 `agent.id` 複製到多台主機**（例如複製 VM 映像檔時）：兩台會互相把對方踢下線（伺服器回 `superseded`）；連續被取代時退避不再重置、重連間隔至少 30 秒，日誌以 `ERROR` 提示。若需要重新產生，刪除 `agent.id` 後重新啟動即可。
+- **不要把同一份 `agent.id` 複製到多台主機**（例如複製 VM 映像檔時）：兩台會互相把對方踢下線（伺服器回 `superseded`）；連續被取代時退避不再重置、重連間隔至少 30 秒，日誌以 `ERROR` 提示。若需要重新產生，刪除 `agent.id` 後重新啟動即可；**啟用 mTLS 時**還必須請管理者以新的 agent_id 重新簽發客戶端憑證並更新 `server.client_cert`／`server.client_key`，否則 Pulse 啟動時會因憑證 SAN 不符而報錯結束。
 - `agent.id` 已列入 `.gitignore`。
 
 ## 專案結構
@@ -391,13 +423,13 @@ src/
 ├── protocol.rs        協定訊息定義（ClientMsg / ServerMsg）
 ├── network.rs         長 TLS 連線：hello / heartbeat / report / 逾時 / 重連 / 日誌清理
 ├── backoff.rs         指數退避與抖動
-├── log_files.rs       日誌按日分檔與保留清除
-├── log_throttle.rs    日誌節流（伺服器異常訊息每 10 秒最多記錄一次）
+├── log_files.rs       日誌按日分檔與保留清除（含系統日期異常時暫停清除）
+├── log_throttle.rs    日誌節流（同類訊息每個視窗最多記錄一則）
 ├── agent_id.rs        agent_id 產生、驗證與讀取
 ├── shutdown.rs        結束訊號監聽（Ctrl+C、Ctrl+Break、主控台關閉、系統關機）
 ├── system_info.rs     以 sysinfo 收集系統資訊、週期性取樣
 └── test_log.rs        測試用：擷取日誌輸出（僅測試建置）
-testdata/              測試用的憑證與私鑰（僅供測試，見 testdata/README.md）：客戶端 CA / 中繼 CA / 客戶端憑證、
+testdata/              測試用的憑證與私鑰（僅供測試、不可部署，見 testdata/README.md）：客戶端 CA / 中繼 CA / 客戶端憑證、
                        TLS 握手測試用的伺服器 CA 與伺服器憑證（server-ca.pem、server.pem、server.key）、
                        多個 DNS SAN 的客戶端憑證（multi-san.pem）
 config.toml            預設設定（編譯時嵌入）
@@ -409,24 +441,34 @@ rust-toolchain.toml    固定使用 Rust 1.99.0
 - 同時輸出到終端（stdout）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）
 - **按日分檔**：檔名日期為 **UTC**（與 Kairos 相同），UTC 午夜換新檔；每行開頭的時間戳記則是本機時間
 - **保留**：保留今天與前 `log.retention_days` 天（預設 14），更早的檔案於啟動時與之後每小時刪除；`0` 表示永久保留。只會刪除檔名**完全符合** `pulse-YYYY-MM-DD.log` 的檔案，其他檔案（例如舊版的 `pulse.log`）一律不碰
+- **系統日期異常時暫停清除**（規則與 Kairos 相同；`log.retention_days = 0` 時不檢查）：系統時鐘被誤校到未來時，以「今天」計算的保留期限會把所有日誌檔判定為過期，因此清除前先檢查日期是否合理，「已接受的日期」只能隨實際經過的時間推進：
+  - 基準點（可信的日期與當時的時間）只在三種情況設定：啟動時沒有狀態、接受跳躍後的日期、日期回撥後降回已接受的日期。
+  - 經過時間在同一次執行內用單調時鐘；跨重新啟動時為「存檔時已經過的時間 + min(max(0, 現在 − 存檔時間), 24 小時)」（每次檢查都存檔）。
+  - 日期往前推進時，允許的最晚日期 = 基準日期 + ceil(經過時間 / 1 天) + 1 天；在範圍內照常清除。超過時記 `WARN` 並暫停清除，新的日期持續 24 小時後才接受（並重設基準點）、恢復清除；暫停期間日期比「偵測到跳躍時的日期」再往前超過 2 天時重新起算。
+  - 日期回撥（早於已接受的日期）時照常以較早的日期清除（只會刪得更少）；持續 24 小時後把已接受的日期降回目前日期。
+  - 跳躍暫停跨重新啟動時以「存檔時已累積的暫停時間」延續，只再加上停機時間（最多 1 小時），停機時把時鐘調快再啟動不會被立即接受；回撥計時延續 min(max(0, 現在 − 起點), 24 小時)，起點在未來時改寫為現在。
+  - 狀態存在 `logs/.retention-guard.json`（原子寫入）。沒有狀態檔或內容無效時，以啟動前 `logs/` 中不晚於今天的最新日誌檔日期為基準（基準在初始化日誌、建立今天的日誌檔之前決定）。
+  - 副作用：Pulse 停機超過約 2 天後重新啟動時，會記 `WARN` 並暫停清除日誌 24 小時。
+  - **請勿刪除 `logs/.retention-guard.json`**：刪掉時若系統時鐘仍停在未來，重新建立的基準可能採用時鐘錯誤期間產生的日誌檔日期而誤刪。搬移或備份日誌目錄時請一併保留。
 - 級別由 `[log] level` 控制，不分大小寫（可用 `PULSE__LOG__LEVEL` 臨時調整）
 - 每則 heartbeat 為 `trace`、每則 report 為 `debug`；在 `info` 級別下只會看到連線 / 註冊 / 斷線等事件
-- **伺服器送來的文字一律清理後才寫入日誌**：`error` 的 `code`、`message` 與無法解析的原始行中，換行、ESC 等控制字元（Cc）、所有格式字元（Cf，例如零寬空格 U+200B、方向控制 U+202E、BOM U+FEFF）與 U+2028 / U+2029 都會轉成跳脫字串（判定規則與 hostname 正規化、Kairos 的 hello 欄位驗證相同）（例如 `\n`、`\u{001b}`）；`code` 最多保留 64 個字元，其他文字最多 200 個字元，超過時截斷並註明原始長度。避免惡意或故障的伺服器偽造日誌行、夾帶終端跳脫序列或以超長內容灌爆日誌
-- **伺服器異常訊息節流**：伺服器送來無法解析的行、註冊後重複的 `hello_ack`、`storage_unavailable`、其他非致命 `error`、不合預期的 `ack` 這幾類訊息，各自每 10 秒最多記錄一則，期間被略過的數量會在下一則一併註明，例如：
+- **伺服器送來的文字一律清理後才寫入日誌**：`error` 的 `code`、`message`、無法解析的原始行，以及可能夾帶伺服器內容的 TLS／TCP／連線 I/O 錯誤文字（例如憑證名稱不符時列出的伺服器憑證 SAN）中，換行、ESC 等控制字元（Cc）、所有格式字元（Cf，例如零寬空格 U+200B、方向控制 U+202E、BOM U+FEFF）、U+2028 / U+2029，以及 Hangul filler、變體選擇字元、私用區等不可見碼位都會轉成跳脫字串（判定規則與 hostname 正規化、Kairos 的 hello 欄位驗證相同）（例如 `\n`、`\u{001b}`）；反斜線本身轉成兩個反斜線（`\\`），因此原文中的字面 `\n` 與被跳脫的換行可以區分。`code` 最多保留 64 個字元，TLS／I/O 錯誤文字最多 400 個字元，其他文字最多 200 個字元，超過時截斷並註明原始長度。避免惡意或故障的伺服器偽造日誌行、夾帶終端跳脫序列或以超長內容灌爆日誌
+- **伺服器異常訊息節流**：伺服器送來無法解析的行、註冊後重複的 `hello_ack`、其他非致命 `error`、不合預期的 `ack`、因上一筆 report 尚未收到回應而略過取樣，這幾類訊息各自每 10 秒最多記錄一則；`storage_unavailable` 每 5 分鐘最多一則（伺服器的每日檔案大小上限滿時，每筆 report 都會收到，會持續到換日）。期間被略過的數量會在下一則一併註明，例如：
 
   ```
-  [WARN] 已註冊後又收到 hello_ack（seq=1），忽略（上次記錄後的 10 秒內另有 5737 則相同訊息被略過）
+  [WARN] 已註冊後又收到 hello_ack（seq=1），忽略（自上次記錄以來另有 5737 則同類訊息被略過；同類訊息每 10 秒最多記錄一則）
   ```
 
-  避免故障或惡意的伺服器在短時間內灌爆日誌檔。會結束連線的錯誤（fatal error、註冊前的 error）不節流，但每次斷線只記一則（見「重連行為」），其頻率由重連退避限制。
+  避免故障或惡意的伺服器在短時間內灌爆日誌檔。會結束連線的錯誤（fatal error、註冊前的 error）每次斷線只記一則（見「重連行為」），其頻率由重連退避限制；其中需要人工處理的錯誤另依錯誤碼節流 `ERROR`（每 10 分鐘最多一則，其餘記 `WARN`）。
 
 ## 目前限制
 
 - 只回報 CPU 使用率與記憶體；磁碟、網路、溫度僅在啟動時印出到日誌，不會送給伺服器。
-- 斷線期間或伺服器無法保存（`storage_unavailable`）的 report 不會暫存補送（at-most-once，協定設計如此）。
+- 斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會暫存補送（at-most-once，協定設計如此）。
+- Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
-- `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）與 U+2028 / U+2029 替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
+- `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
 - Windows 上不檢查 `agent.id` 的檔案權限，需自行放在受保護的目錄。
 
 ## 授權

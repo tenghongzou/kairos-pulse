@@ -6,7 +6,7 @@ use serde::Deserialize;
 const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
 
 /// 本機覆蓋設定檔（目前工作目錄，可不存在）。
-const LOCAL_CONFIG_FILE: &str = "pulse.toml";
+pub const LOCAL_CONFIG_FILE: &str = "pulse.toml";
 
 /// `heartbeat.interval` 上限（秒），與伺服器將 heartbeat_interval_ms 夾在 60000 一致。
 pub const MAX_HEARTBEAT_INTERVAL: u64 = 60;
@@ -96,17 +96,33 @@ pub struct AppConfig {
     pub report: ReportConfig,
     pub agent: AgentConfig,
     pub log: LogConfig,
+    /// 載入時目前工作目錄下是否有 `pulse.toml`（啟動時記錄，方便確認設定來源）
+    #[serde(skip)]
+    pub local_file_found: bool,
 }
 
 impl AppConfig {
     /// 依序疊加：嵌入的 config.toml → `pulse.toml`（可不存在）→ `PULSE__*` 環境變數。
     pub fn load() -> Result<Self, ConfigError> {
-        Self::build(Some(LOCAL_CONFIG_FILE), None)
+        let found = std::path::Path::new(LOCAL_CONFIG_FILE).is_file();
+        let mut config = Self::build(Some(LOCAL_CONFIG_FILE), None)?;
+        config.local_file_found = found;
+        Ok(config)
+    }
+
+    /// 測試用：只用嵌入的預設值（不讀 pulse.toml 與行程環境變數）。
+    #[cfg(test)]
+    pub fn default_for_tests() -> Self {
+        Self::build(None, Some(Map::new())).expect("嵌入的預設設定必須合法")
     }
 
     /// 實際的載入邏輯。
     ///
     /// `env_override` 為 `Some` 時改用給定的鍵值取代真正的行程環境變數（供測試使用）。
+    ///
+    /// 環境變數一律以字串讀入（不開 `try_parsing`）：數值與布林欄位在反序列化時由 config
+    /// 把字串轉成對應型別；字串欄位（路徑、domain、address）則保持原樣，
+    /// 例如 `PULSE__AGENT__ID_FILE=0001` 不會被改寫成 `"1"`。
     fn build(
         local_file: Option<&str>,
         env_override: Option<Map<String, String>>,
@@ -119,7 +135,7 @@ impl AppConfig {
         let env = Environment::with_prefix("PULSE")
             .prefix_separator("__")
             .separator("__")
-            .try_parsing(true)
+            .try_parsing(false)
             .source(env_override);
 
         let mut config: Self = builder.add_source(env).build()?.try_deserialize()?;
@@ -138,6 +154,17 @@ impl AppConfig {
                     "{name} 必須介於 {min} 到 {max} 之間（目前為 {value}）"
                 )))
             }
+        }
+        if self.server.address.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "server.address 不可為空字串（請填伺服器的 IP 或主機名稱）".to_string(),
+            ));
+        }
+        range("server.port", u64::from(self.server.port), 1, 65535)?;
+        if self.server.domain.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "server.domain 不可為空字串（TLS 以此驗證伺服器憑證的名稱）".to_string(),
+            ));
         }
         range(
             "heartbeat.interval",
@@ -270,6 +297,71 @@ mod tests {
     fn invalid_values_rejected() {
         assert!(build_err(&[("PULSE__HEARTBEAT__INTERVAL", "0")]).contains("heartbeat.interval"));
         assert!(build_err(&[("PULSE__RETRY__MAX_DELAY", "1")]).contains("max_delay"));
+    }
+
+    #[test]
+    fn port_zero_and_blank_address_or_domain_rejected() {
+        // R2-P13
+        let err = build_err(&[("PULSE__SERVER__PORT", "0")]);
+        assert!(err.contains("server.port"), "{err}");
+        for blank in ["", "   "] {
+            let err = build_err(&[("PULSE__SERVER__ADDRESS", blank)]);
+            assert!(err.contains("server.address"), "{blank:?}: {err}");
+            let err = build_err(&[("PULSE__SERVER__DOMAIN", blank)]);
+            assert!(err.contains("server.domain"), "{blank:?}: {err}");
+        }
+        // 超出 u16 → 反序列化錯誤
+        assert!(AppConfig::build(None, Some(env(&[("PULSE__SERVER__PORT", "65536")]))).is_err());
+        let cfg = AppConfig::build(None, Some(env(&[("PULSE__SERVER__PORT", "65535")]))).unwrap();
+        assert_eq!(cfg.server.port, 65535);
+    }
+
+    #[test]
+    fn string_settings_from_env_are_not_reinterpreted() {
+        // R2-P13：看似數字或布林的字串保持原樣
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__AGENT__ID_FILE", "0001"),
+                ("PULSE__SERVER__CA_CERT", "00.10"),
+                ("PULSE__SERVER__CLIENT_CERT", "1e3"),
+                ("PULSE__SERVER__CLIENT_KEY", "007"),
+                ("PULSE__SERVER__DOMAIN", "true"),
+                ("PULSE__SERVER__ADDRESS", "0010"),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(cfg.agent.id_file, "0001");
+        assert_eq!(cfg.server.ca_cert, "00.10");
+        assert_eq!(cfg.server.client_cert, "1e3");
+        assert_eq!(cfg.server.client_key, "007");
+        assert_eq!(cfg.server.domain, "true");
+        assert_eq!(cfg.server.address, "0010");
+        // 數值與布林仍可從環境變數的字串解析
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__SERVER__PORT", "09000"),
+                ("PULSE__SERVER__USE_SYSTEM_ROOTS", "false"),
+                ("PULSE__SERVER__CA_CERT", "ca.pem"),
+                ("PULSE__REPORT__INTERVAL", "30"),
+                ("PULSE__LOG__RETENTION_DAYS", "7"),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(cfg.server.port, 9000);
+        assert!(!cfg.server.use_system_roots);
+        assert_eq!(cfg.report.interval, 30);
+        assert_eq!(cfg.log.retention_days, 7);
+        // 非數字的數值欄位仍是錯誤
+        assert!(AppConfig::build(None, Some(env(&[("PULSE__SERVER__PORT", "abc")]))).is_err());
+        assert!(
+            AppConfig::build(
+                None,
+                Some(env(&[("PULSE__SERVER__ACCEPT_INVALID_CERTS", "maybe")]))
+            )
+            .is_err()
+        );
     }
 
     #[test]

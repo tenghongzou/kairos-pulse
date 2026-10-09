@@ -3,8 +3,10 @@
 //! - 信任：作業系統信任庫（rustls-native-certs，`server.use_system_roots = false` 時不載入）
 //!   + `server.ca_cert`（可含多張）。
 //! - 客戶端憑證（mTLS）：`server.client_cert`（可含中繼 CA 鏈）+ `server.client_key`
-//!   （PKCS#8 / PKCS#1 / SEC1，RSA / ECDSA / Ed25519，不可加密）。金鑰與憑證不成對、
-//!   憑證已過期時在啟動時即報錯；30 天內到期記 warn。
+//!   （PKCS#8 / PKCS#1 / SEC1，RSA / ECDSA / Ed25519，不可加密）。金鑰與憑證不成對時在啟動時即報錯。
+//!   憑證有效期限在啟動時與之後每 24 小時檢查一次（[`TlsSetup::log_client_cert_validity`]）：
+//!   已過期記 error（仍會嘗試連線，以伺服器判定為準：可能只是本機時鐘不正確）、
+//!   尚未生效或 30 天內到期記 warn。
 //! - `accept_invalid_certs = true`：只略過伺服器憑證的信任鏈與名稱驗證，握手簽章仍會正確驗證。
 //!   啟動時以 error 等級警告（`log.level` 設為 error 也看得到），每次連線成功的日誌也會標註。
 //! - 握手失敗時把 rustls 錯誤轉成具體的處置提示（[`describe_tls_error`]）。
@@ -15,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use log::Level;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -31,8 +34,37 @@ use tokio_rustls::rustls::{
 
 use crate::config_manager::ServerConfig;
 
-/// 客戶端憑證剩餘有效期限少於此值時，啟動時記 warn。
+/// 客戶端憑證剩餘有效期限少於此值時記 warn。
 const CERT_EXPIRY_WARNING: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// 啟動後重新檢查客戶端憑證有效期限的間隔。
+pub const CERT_RECHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// 一天的秒數（換算剩餘天數用）。
+const SECS_PER_DAY: u64 = 24 * 3600;
+
+/// 客戶端憑證有效期限的檢查結果（要記錄的等級與訊息）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertFinding {
+    pub level: Level,
+    pub message: String,
+}
+
+impl CertFinding {
+    fn error(message: String) -> Self {
+        Self {
+            level: Level::Error,
+            message,
+        }
+    }
+
+    fn warn(message: String) -> Self {
+        Self {
+            level: Level::Warn,
+            message,
+        }
+    }
+}
 
 /// 啟動時建立一次、所有連線共用的 TLS 設定。
 #[derive(Clone)]
@@ -42,8 +74,8 @@ pub struct TlsSetup {
     pub server_name: ServerName<'static>,
     /// 伺服器是否在最近一次握手中要求客戶端憑證（見 [`RecordingClientCertResolver`]）
     client_cert_requested: Arc<AtomicBool>,
-    /// 客戶端憑證的路徑與葉憑證（用於啟動時檢查 SAN）
-    client_leaf: Option<(String, CertificateDer<'static>)>,
+    /// 客戶端憑證的路徑與整條憑證鏈（第一張為葉憑證；用於檢查 SAN 與有效期限）
+    client_chain: Option<(String, Vec<CertificateDer<'static>>)>,
     /// 是否驗證伺服器憑證（`accept_invalid_certs = true` 時為 false）
     verifies_server_cert: bool,
 }
@@ -71,10 +103,35 @@ impl TlsSetup {
     /// 未設定客戶端憑證時直接通過。不符時回傳具體的錯誤訊息，讓程式在啟動時就結束，
     /// 而不是連上伺服器後才收到 `auth_failed`。
     pub fn verify_client_cert_identity(&self, agent_id: &str) -> Result<(), String> {
-        let Some((path, leaf)) = &self.client_leaf else {
+        let Some((path, chain)) = &self.client_chain else {
             return Ok(());
         };
-        check_cert_san(path, leaf, agent_id)
+        check_cert_san(path, &chain[0], agent_id)
+    }
+
+    /// 是否設定了客戶端憑證。
+    pub fn has_client_cert(&self) -> bool {
+        self.client_chain.is_some()
+    }
+
+    /// 以 `now` 檢查客戶端憑證鏈的有效期限；未設定客戶端憑證時為空。
+    pub fn client_cert_validity(&self, now: DateTime<Utc>) -> Vec<CertFinding> {
+        match &self.client_chain {
+            Some((path, chain)) => check_chain_validity(path, chain, now),
+            None => Vec::new(),
+        }
+    }
+
+    /// 以目前時間檢查客戶端憑證鏈的有效期限並記錄結果（啟動時與之後每 24 小時呼叫）。
+    pub fn log_client_cert_validity(&self) {
+        log_findings(&self.client_cert_validity(Utc::now()));
+    }
+}
+
+/// 依各自的等級記錄檢查結果。
+fn log_findings(findings: &[CertFinding]) {
+    for finding in findings {
+        log::log!(finding.level, "{}", finding.message);
     }
 }
 
@@ -117,25 +174,23 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
 
     let cert_path = server.client_cert.trim();
     let key_path = server.client_key.trim();
-    let (client_key, client_leaf) = if cert_path.is_empty() || key_path.is_empty() {
+    let (client_key, client_chain) = if cert_path.is_empty() || key_path.is_empty() {
         (None, None)
     } else {
         let (chain, key) = load_client_cert(cert_path, key_path)?;
-        for warning in check_chain_validity(cert_path, &chain, Utc::now())? {
-            log::warn!("{warning}");
-        }
-        let leaf = chain[0].clone();
-        if let Some(warning) = multiple_dns_san_warning(cert_path, &leaf) {
+        // 已過期也不阻止啟動（記 error）：本機時鐘可能不正確，以伺服器的判定為準
+        log_findings(&check_chain_validity(cert_path, &chain, Utc::now()));
+        if let Some(warning) = multiple_dns_san_warning(cert_path, &chain[0]) {
             log::warn!("{warning}");
         }
         let count = chain.len();
         // from_der 會檢查私鑰與憑證是否成對（keys_match）
-        let certified = CertifiedKey::from_der(chain, key, &provider)
+        let certified = CertifiedKey::from_der(chain.clone(), key, &provider)
             .map_err(|e| client_cert_error(cert_path, key_path, &e))?;
         log::info!("已載入客戶端憑證：{cert_path}（憑證鏈 {count} 張；私鑰：{key_path}）");
         (
             Some(Arc::new(certified)),
-            Some((cert_path.to_string(), leaf)),
+            Some((cert_path.to_string(), chain)),
         )
     };
     let client_cert_requested = Arc::new(AtomicBool::new(false));
@@ -148,7 +203,7 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
         connector: TlsConnector::from(Arc::new(config)),
         server_name,
         client_cert_requested,
-        client_leaf,
+        client_chain,
         verifies_server_cert: !server.accept_invalid_certs,
     })
 }
@@ -265,18 +320,18 @@ fn is_encrypted_key_pem(pem: &[u8]) -> bool {
     contains(b"-----BEGIN ENCRYPTED PRIVATE KEY-----") || contains(b"Proc-Type: 4,ENCRYPTED")
 }
 
-/// 檢查客戶端憑證鏈中每張憑證的有效期限（以 `now` 為準）。
+/// 檢查客戶端憑證鏈中每張憑證的有效期限（以 `now` 為準）。不阻止啟動，只回傳要記錄的結果：
 ///
-/// - 任何一張已過期 → `Err`（伺服器必然拒絕，啟動時就結束，而不是無限重連）
-/// - 尚未生效、或 30 天內到期 → 回傳警告訊息（可能是本機時鐘不正確，不阻止啟動）
-/// - 無法解析有效期限 → 回傳警告訊息（實際驗證交給伺服器）
+/// - 已過期 → error（伺服器多半會拒絕；但也可能是本機時鐘超前，因此仍嘗試連線，以伺服器判定為準）
+/// - 尚未生效、或 30 天內到期 → warn
+/// - 無法解析有效期限 → warn（實際驗證交給伺服器）
 fn check_chain_validity(
     path: &str,
     chain: &[CertificateDer<'_>],
     now: DateTime<Utc>,
-) -> Result<Vec<String>, String> {
+) -> Vec<CertFinding> {
     let fmt = |t: DateTime<Utc>| t.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-    let mut warnings = Vec::new();
+    let mut findings = Vec::new();
     for (i, cert) in chain.iter().enumerate() {
         let label = if i == 0 {
             "客戶端憑證".to_string()
@@ -284,36 +339,43 @@ fn check_chain_validity(
             format!("憑證鏈第 {} 張（中繼 CA）", i + 1)
         };
         let Some((not_before, not_after)) = cert_validity(cert) else {
-            warnings.push(format!(
+            findings.push(CertFinding::warn(format!(
                 "無法解析 server.client_cert「{path}」中{label}的有效期限，略過到期檢查"
-            ));
+            )));
             continue;
         };
         if now > not_after {
-            return Err(format!(
-                "server.client_cert「{path}」中的{label}已於 {} 過期（本機時間 {}），伺服器會拒絕連線：\
-                 請聯絡管理者重新簽發；若憑證其實仍有效，請確認本機時鐘",
+            findings.push(CertFinding::error(format!(
+                "server.client_cert「{path}」中的{label}已於 {} 過期（本機時間 {}），伺服器多半會拒絕連線：\
+                 請聯絡管理者重新簽發；若憑證其實仍有效，請檢查本機時鐘是否正確\
+                 （Pulse 仍會繼續嘗試連線，以伺服器的判定為準）",
                 fmt(not_after),
                 fmt(now)
-            ));
+            )));
+            continue;
         }
         if now < not_before {
-            warnings.push(format!(
+            findings.push(CertFinding::warn(format!(
                 "server.client_cert「{path}」中的{label}要到 {} 才生效（本機時間 {}）：伺服器會拒絕連線，請確認本機時鐘",
                 fmt(not_before),
                 fmt(now)
-            ));
+            )));
         }
         let remaining = (not_after - now).to_std().unwrap_or_default();
         if remaining < CERT_EXPIRY_WARNING {
-            warnings.push(format!(
-                "server.client_cert「{path}」中的{label}將於 {} 到期（剩不到 {} 天），請儘快聯絡管理者重新簽發",
+            findings.push(CertFinding::warn(format!(
+                "server.client_cert「{path}」中的{label}將於 {} 到期（剩餘不超過 {} 天），請儘快聯絡管理者重新簽發",
                 fmt(not_after),
-                remaining.as_secs() / 86400 + 1
-            ));
+                remaining_days(remaining)
+            )));
         }
     }
-    Ok(warnings)
+    findings
+}
+
+/// 剩餘時間換算成天數（無條件進位，至少 1）：剩 9.5 天 → 10，剛好 10 天 → 10。
+fn remaining_days(remaining: Duration) -> u64 {
+    remaining.as_secs().div_ceil(SECS_PER_DAY).max(1)
 }
 
 /// 從 X.509 憑證 DER 取出 `(notBefore, notAfter)`；格式不符時回傳 `None`（不 panic）。
@@ -896,42 +958,98 @@ mod tests {
     }
 
     #[test]
-    fn expired_client_cert_is_rejected_and_near_expiry_warns() {
-        // P9：以注入的「現在時間」驗證判斷規則
+    fn expired_client_cert_is_error_but_not_fatal_and_near_expiry_warns() {
+        // P9 / R2-P10：以注入的「現在時間」驗證判斷規則
         let chain = load_certs(&data("client-ec-chain.pem"), "test", "憑證").unwrap();
         let (not_before, not_after) = cert_validity(&chain[0]).unwrap();
         let day = chrono::Duration::days(1);
 
         // 有效期間內、離到期還很久 → 無警告
+        assert!(check_chain_validity("c.pem", &chain, not_before + day).is_empty());
+        // 已過期 → error（不再阻止啟動），訊息含路徑、「過期」並提醒檢查本機時鐘
+        let findings = check_chain_validity("c.pem", &chain[..1], not_after + day);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].level, Level::Error);
+        let msg = &findings[0].message;
         assert!(
-            check_chain_validity("c.pem", &chain, not_before + day)
-                .unwrap()
-                .is_empty()
+            msg.contains("c.pem") && msg.contains("過期") && msg.contains("本機時鐘"),
+            "{msg}"
         );
-        // 已過期 → 錯誤，訊息含路徑與「過期」
-        let err = check_chain_validity("c.pem", &chain, not_after + day).unwrap_err();
-        assert!(err.contains("c.pem") && err.contains("過期"), "{err}");
-        // 10 天後到期 → 警告
-        let warnings = check_chain_validity("c.pem", &chain, not_after - day * 10).unwrap();
+        assert!(msg.contains("繼續嘗試連線"), "{msg}");
+        // 尚未生效 → 警告（可能是本機時鐘不正確）
+        let findings = check_chain_validity("c.pem", &chain[..1], not_before - day);
         assert!(
-            warnings
+            findings
                 .iter()
-                .any(|w| w.contains("到期") && w.contains("10 天")),
-            "{warnings:?}"
+                .any(|f| f.level == Level::Warn && f.message.contains("才生效")),
+            "{findings:?}"
         );
-        // 尚未生效 → 警告（可能是本機時鐘不正確），不阻止啟動
-        let warnings = check_chain_validity("c.pem", &chain, not_before - day).unwrap();
-        assert!(
-            warnings.iter().any(|w| w.contains("才生效")),
-            "{warnings:?}"
-        );
-        // 無法解析的憑證 → 警告，不阻止啟動
-        let warnings =
-            check_chain_validity("c.pem", &[CertificateDer::from(vec![1, 2, 3])], Utc::now())
-                .unwrap();
-        assert!(warnings[0].contains("無法解析"), "{warnings:?}");
+        // 無法解析的憑證 → 警告
+        let findings =
+            check_chain_validity("c.pem", &[CertificateDer::from(vec![1, 2, 3])], Utc::now());
+        assert_eq!(findings[0].level, Level::Warn);
+        assert!(findings[0].message.contains("無法解析"), "{findings:?}");
         // 目前的測試憑證可正常建立
         assert!(build(&server("root.pem", "client-ec-chain.pem", "client-ec.key")).is_ok());
+    }
+
+    #[test]
+    fn remaining_days_are_rounded_up_for_leaf_only() {
+        // R2-P4：只針對葉憑證（避免中繼 CA 的到期日讓測試碰巧通過），剩餘天數無條件進位
+        let chain = load_certs(&data("client-ec-chain.pem"), "test", "憑證").unwrap();
+        let leaf = &chain[..1];
+        let (_, not_after) = cert_validity(&leaf[0]).unwrap();
+        let secs = chrono::Duration::seconds;
+        let expiry_days = |now| {
+            let findings = check_chain_validity("c.pem", leaf, now);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(findings[0].level, Level::Warn);
+            findings[0].message.clone()
+        };
+        // 剛好 10 天 → 10；差 1 秒不到 10 天 → 10；多 1 秒 → 11
+        let day10 = chrono::Duration::days(10);
+        assert!(expiry_days(not_after - day10).contains("不超過 10 天"));
+        assert!(expiry_days(not_after - day10 + secs(1)).contains("不超過 10 天"));
+        assert!(expiry_days(not_after - day10 - secs(1)).contains("不超過 11 天"));
+        // 剩 1 秒、剛好到期 → 1 天
+        assert!(expiry_days(not_after - secs(1)).contains("不超過 1 天"));
+        assert!(expiry_days(not_after).contains("不超過 1 天"));
+        assert_eq!(remaining_days(Duration::from_secs(86_400 * 30)), 30);
+        assert_eq!(remaining_days(Duration::from_secs(86_400 * 29 + 1)), 30);
+        assert_eq!(remaining_days(Duration::ZERO), 1);
+    }
+
+    #[test]
+    fn client_cert_validity_can_be_rechecked_later() {
+        // R2-P10：TlsSetup 保留憑證鏈，之後（每 24 小時）可用新的時間重新檢查
+        let setup = build(&server("root.pem", "client-ec-chain.pem", "client-ec.key")).unwrap();
+        assert!(setup.has_client_cert());
+        let chain = load_certs(&data("client-ec-chain.pem"), "test", "憑證").unwrap();
+        let (_, leaf_not_after) = cert_validity(&chain[0]).unwrap();
+        assert!(setup.client_cert_validity(Utc::now()).is_empty());
+        let later = setup.client_cert_validity(leaf_not_after - chrono::Duration::days(3));
+        assert!(
+            later
+                .iter()
+                .any(|f| f.level == Level::Warn && f.message.contains("不超過 3 天")),
+            "{later:?}"
+        );
+        let expired = setup.client_cert_validity(leaf_not_after + chrono::Duration::days(1));
+        assert!(
+            expired.iter().any(|f| f.level == Level::Error),
+            "{expired:?}"
+        );
+        // 記錄時依各自的等級輸出
+        let ((), logs) = crate::test_log::capture(|| log_findings(&expired));
+        assert!(
+            logs.iter()
+                .any(|(l, m)| *l == Level::Error && m.contains("過期"))
+        );
+        // 未設定客戶端憑證：沒有可檢查的項目
+        let none = build(&server("root.pem", "", "")).unwrap();
+        assert!(!none.has_client_cert());
+        assert!(none.client_cert_validity(Utc::now()).is_empty());
+        assert_eq!(CERT_RECHECK_INTERVAL, Duration::from_secs(86_400));
     }
 
     // ---- 實際 TLS 握手（T5）：127.0.0.1 隨機埠上的 rustls 伺服器 ----

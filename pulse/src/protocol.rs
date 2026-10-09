@@ -100,8 +100,25 @@ const FORMAT_CHAR_RANGES: &[(u32, u32)] = &[
     (0xE0020, 0xE007F),
 ];
 
+/// Cf 以外、但同樣不可見或可用來偽裝外觀的碼位（R2-K23，與 Kairos 同步）：
+/// U+034F 組合字形連接符、Hangul filler（U+115F、U+1160、U+3164、U+FFA0）、
+/// 變體選擇字元（U+FE00–U+FE0F、U+E0100–U+E01EF）與私用區
+/// （U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD）。
+const INVISIBLE_OR_PRIVATE_RANGES: &[(u32, u32)] = &[
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x3164, 0x3164),
+    (0xE000, 0xF8FF),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xE0100, 0xE01EF),
+    (0xF0000, 0xFFFFD),
+    (0x100000, 0x10FFFD),
+];
+
 /// 不得出現在顯示用字串（hello 的 hostname / agent_version、日誌）中的字元：
-/// 控制字元（Cc）、格式字元（Cf）、行分隔（Zl, U+2028）、段落分隔（Zp, U+2029）。
+/// 控制字元（Cc）、格式字元（Cf）、行分隔（Zl, U+2028）、段落分隔（Zp, U+2029），
+/// 以及 [`INVISIBLE_OR_PRIVATE_RANGES`]（Hangul filler、變體選擇字元、私用區等）。
 /// 規則與 Kairos 的 `is_forbidden_display_char` 相同。
 pub fn is_forbidden_display_char(c: char) -> bool {
     if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
@@ -110,6 +127,7 @@ pub fn is_forbidden_display_char(c: char) -> bool {
     let cp = u32::from(c);
     FORMAT_CHAR_RANGES
         .iter()
+        .chain(INVISIBLE_OR_PRIVATE_RANGES)
         .any(|&(lo, hi)| (lo..=hi).contains(&cp))
 }
 
@@ -373,8 +391,30 @@ mod tests {
             assert!(!is_forbidden_display_char(c), "{c:?}");
         }
         // 表需由小到大排列且不重疊（與 Kairos 相同的整理方式，方便逐行比對）
-        assert!(FORMAT_CHAR_RANGES.windows(2).all(|w| w[0].1 < w[1].0));
-        assert!(FORMAT_CHAR_RANGES.iter().all(|&(lo, hi)| lo <= hi));
+        for table in [FORMAT_CHAR_RANGES, INVISIBLE_OR_PRIVATE_RANGES] {
+            assert!(table.windows(2).all(|w| w[0].1 < w[1].0));
+            assert!(table.iter().all(|&(lo, hi)| lo <= hi));
+        }
+    }
+
+    #[test]
+    fn invisible_fillers_selectors_and_private_use_are_forbidden() {
+        // R2-K23：每個範圍的頭尾都禁止
+        for cp in [
+            0x034F, 0x115F, 0x1160, 0x3164, 0xE000, 0xF8FF, 0xFE00, 0xFE0F, 0xFFA0, 0xE0100,
+            0xE01EF, 0xF0000, 0xFFFFD, 0x100000, 0x10FFFD,
+        ] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(is_forbidden_display_char(c), "U+{cp:04X}");
+        }
+        // 範圍外緊鄰的碼位不受影響
+        for cp in [
+            0x034E, 0x0350, 0x115E, 0x1161, 0x3163, 0x3165, 0xF900, 0xFDFF, 0xFE10, 0xFF9F, 0xFFA1,
+            0xE00FF, 0xE01F0, 0xEFFFF, 0xFFFFE, 0x10FFFE,
+        ] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(!is_forbidden_display_char(c), "U+{cp:04X}");
+        }
     }
 
     #[test]

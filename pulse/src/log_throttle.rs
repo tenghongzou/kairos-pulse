@@ -2,8 +2,13 @@
 //!
 //! 用於「伺服器送了怪東西」這類可能被大量觸發的訊息，避免惡意或故障的伺服器
 //! 在短時間內灌爆日誌檔。時間由呼叫端以參數傳入，方便單元測試。
+//!
+//! 時間使用 `tokio::time::Instant`：在 tokio 的暫停時鐘（`tokio::time::pause`）下也能測試
+//! 長視窗（例如 10 分鐘）的節流；沒有 runtime 時行為與 `std::time::Instant` 相同。
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 /// 預設節流視窗。
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(10);
@@ -53,12 +58,15 @@ impl Default for LogThrottle {
 }
 
 /// 日誌訊息尾端的「另有 N 則被略過」說明；`n == 0` 時為空字串。
+///
+/// 被略過的次數是「自上次實際記錄以來」累計的，距上次記錄可能遠超過一個視窗，
+/// 因此不寫成「N 秒內」。
 pub fn suppressed_note(n: u64, window: Duration) -> String {
     if n == 0 {
         String::new()
     } else {
         format!(
-            "（上次記錄後的 {} 秒內另有 {n} 則相同訊息被略過）",
+            "（自上次記錄以來另有 {n} 則同類訊息被略過；同類訊息每 {} 秒最多記錄一則）",
             window.as_secs()
         )
     }
@@ -114,7 +122,7 @@ mod tests {
         assert_eq!(suppressed_note(0, W), "");
         assert_eq!(
             suppressed_note(42, W),
-            "（上次記錄後的 10 秒內另有 42 則相同訊息被略過）"
+            "（自上次記錄以來另有 42 則同類訊息被略過；同類訊息每 10 秒最多記錄一則）"
         );
     }
 }

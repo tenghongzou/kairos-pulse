@@ -128,22 +128,42 @@ fn validate(path: &Path, content: Option<String>) -> io::Result<Option<String>> 
     Ok(Some(id.to_ascii_lowercase()))
 }
 
-/// Unix：agent_id 檔案可被群組或其他使用者讀取時，回傳警告訊息（不自動修改權限）。
+/// Unix：agent_id 檔案對群組或其他使用者開放任何權限（讀取、寫入或執行）時，
+/// 回傳警告訊息（不自動修改權限）。
 ///
 /// 由呼叫端決定輸出方式（一般模式寫日誌；`--print-agent-id` 尚未初始化日誌，改寫 stderr）。
 /// 讀不到檔案資訊時回傳 `None`。
 #[cfg(unix)]
 pub fn permission_warning(path: &Path) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path).ok()?.permissions().mode() & 0o777;
-    (mode & 0o077 != 0).then(|| {
-        format!(
-            "agent_id 檔案 {} 的權限為 {mode:o}，其他使用者可讀取；未啟用 mTLS 時 agent_id 等同身分憑據，\
-             建議執行 chmod 600 {}",
-            path.display(),
-            path.display()
-        )
-    })
+    let mode = fs::metadata(path).ok()?.permissions().mode();
+    mode_warning(path, mode)
+}
+
+/// 依權限位元產生警告（與平台無關，方便在任何平台測試用語）。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn mode_warning(path: &Path, mode: u32) -> Option<String> {
+    let mode = mode & 0o777;
+    if mode & 0o077 == 0 {
+        return None;
+    }
+    let mut granted = Vec::new();
+    if mode & 0o044 != 0 {
+        granted.push("讀取");
+    }
+    if mode & 0o022 != 0 {
+        granted.push("寫入");
+    }
+    if mode & 0o011 != 0 {
+        granted.push("執行");
+    }
+    Some(format!(
+        "agent_id 檔案 {} 的權限為 {mode:o}，群組或其他使用者可{}；未啟用 mTLS 時 agent_id 等同身分憑據\
+         （可寫入者還能竄改本機身分），建議執行 chmod 600 {}",
+        path.display(),
+        granted.join("、"),
+        path.display()
+    ))
 }
 
 /// 非 Unix：權限由所在目錄的 ACL 決定，不檢查。
@@ -548,6 +568,25 @@ mod tests {
         writer.join().unwrap();
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mode_warning_names_the_granted_access() {
+        // R2-P11：寫入／執行位元不可說成「可讀取」
+        let p = Path::new("agent.id");
+        assert_eq!(mode_warning(p, 0o600), None);
+        assert_eq!(mode_warning(p, 0o100_700), None);
+        let w = mode_warning(p, 0o644).unwrap();
+        assert!(w.contains("644") && w.contains("可讀取；"), "{w}");
+        let w = mode_warning(p, 0o620).unwrap();
+        assert!(w.contains("可寫入；") && !w.contains("讀取"), "{w}");
+        let w = mode_warning(p, 0o601).unwrap();
+        assert!(w.contains("可執行；") && !w.contains("讀取"), "{w}");
+        let w = mode_warning(p, 0o666).unwrap();
+        assert!(
+            w.contains("可讀取、寫入；") && w.contains("chmod 600"),
+            "{w}"
+        );
     }
 
     #[cfg(not(unix))]

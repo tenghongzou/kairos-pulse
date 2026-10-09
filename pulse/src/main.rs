@@ -13,10 +13,11 @@ mod test_log;
 mod tls;
 
 use config_manager::AppConfig;
-use log::{LevelFilter, debug, error, info, warn};
+use log::{Level, LevelFilter, debug, error, info, warn};
 use std::fs::create_dir_all;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -61,10 +62,13 @@ fn setup_logger(log_level: LevelFilter) -> Result<(), fern::InitError> {
 }
 
 /// 每小時清除一次過期日誌檔（啟動時的清除已在 `main` 完成）。`retention_days == 0` 時不啟動。
-fn spawn_log_cleanup(retention_days: u32) {
+///
+/// 清除前的時鐘跳躍保護狀態保存在 `retention` 中，跨次延續。
+fn spawn_log_cleanup(retention: log_files::LogRetention, retention_days: u32) {
     if retention_days == 0 {
         return;
     }
+    let retention = Arc::new(Mutex::new(retention));
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + LOG_CLEANUP_INTERVAL,
@@ -73,13 +77,85 @@ fn spawn_log_cleanup(retention_days: u32) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || log_files::cleanup_now(retention_days)).await
+            let retention = retention.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                // 上一次清除 panic 時鎖會被標記為 poisoned；狀態本身仍可用，繼續使用
+                retention
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .run()
+            })
+            .await
             {
                 warn!("清除過期日誌檔時發生錯誤：{e}");
             }
         }
     });
+}
+
+/// 每 24 小時重新檢查一次客戶端憑證的有效期限（啟動時的檢查已在 `tls::build` 完成）。
+/// 未設定客戶端憑證時不啟動。
+fn spawn_client_cert_recheck(tls: tls::TlsSetup) {
+    if !tls.has_client_cert() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + tls::CERT_RECHECK_INTERVAL,
+            tls::CERT_RECHECK_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            tls.log_client_cert_validity();
+        }
+    });
+}
+
+/// 啟動時記錄工作目錄與設定檔來源的訊息（等級、內容）。
+///
+/// 設定中的相對路徑（`pulse.toml`、`agent.id`、`logs/`）都以工作目錄為準；Windows 服務的預設工作目錄
+/// 是 `C:\Windows\System32`，檔案會落在那裡，因此遇到系統目錄時另外記 warn。
+fn startup_location_messages(cwd: Option<&Path>, local_file_found: bool) -> Vec<(Level, String)> {
+    let Some(cwd) = cwd else {
+        return vec![(
+            Level::Warn,
+            "無法取得目前的工作目錄；設定中的相對路徑（pulse.toml、agent.id、logs/）可能不在預期的位置"
+                .to_string(),
+        )];
+    };
+    let source = if local_file_found {
+        format!(
+            "已讀取 {}",
+            cwd.join(config_manager::LOCAL_CONFIG_FILE).display()
+        )
+    } else {
+        format!(
+            "{} 不存在，只使用內建預設值與 PULSE__* 環境變數",
+            cwd.join(config_manager::LOCAL_CONFIG_FILE).display()
+        )
+    };
+    let mut messages = vec![(
+        Level::Info,
+        format!(
+            "工作目錄：{}（設定中的相對路徑都以此為準）；設定檔：{source}",
+            cwd.display()
+        ),
+    )];
+    let last = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase());
+    if matches!(last.as_deref(), Some("system32" | "syswow64")) {
+        messages.push((
+            Level::Warn,
+            format!(
+                "工作目錄是系統目錄 {}（以 Windows 服務執行時的預設值）：pulse.toml 需放在這裡才會被讀取，\
+                 agent.id 與 logs/ 也會建立在這裡。建議在服務設定中把工作目錄設為 Pulse 所在的目錄",
+                cwd.display()
+            ),
+        ));
+    }
+    messages
 }
 
 fn main() -> ExitCode {
@@ -113,13 +189,18 @@ fn main() -> ExitCode {
         return print_agent_id(&config);
     }
 
+    // 日誌清除的日期基準必須在初始化日誌之前決定：fern 一初始化就會建立今天的日誌檔，
+    // 時鐘被誤校到未來時，那個檔案不能被當成「最新日誌檔的日期」
+    let mut retention =
+        log_files::LogRetention::open(Path::new(log_files::LOG_DIR), config.log.retention_days);
+
     // 初始化日誌
     if let Err(e) = setup_logger(config.log.level_filter()) {
         eprintln!("錯誤：無法初始化日誌：{e}");
         return ExitCode::FAILURE;
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
-    log_files::cleanup_now(config.log.retention_days);
+    retention.run();
 
     // 自建 runtime（而非 #[tokio::main]），以便結束時用 shutdown_timeout：
     // 不必等待仍在 blocking 執行緒上跑的系統呼叫（例如很慢的 WMI 查詢）。
@@ -133,7 +214,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(async_main(config));
+    let code = runtime.block_on(async_main(config, retention));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     code
 }
@@ -166,7 +247,7 @@ fn print_agent_id(config: &AppConfig) -> ExitCode {
 ///
 /// 收到結束訊號（見 [`shutdown::Signals`]）後通知各任務結束（已連線時會先送 TLS close_notify），
 /// 最多等待 `GRACEFUL_SHUTDOWN_TIMEOUT`；期間再收到一次訊號就直接強制結束。
-async fn async_main(config: AppConfig) -> ExitCode {
+async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> ExitCode {
     let mut signals = match shutdown::Signals::new() {
         Ok(s) => s,
         Err(e) => {
@@ -175,7 +256,7 @@ async fn async_main(config: AppConfig) -> ExitCode {
         }
     };
     let shutdown = CancellationToken::new();
-    let work = run(config, shutdown.clone());
+    let work = run(config, retention, shutdown.clone());
     tokio::pin!(work);
 
     let result = tokio::select! {
@@ -232,11 +313,19 @@ where
 ///
 /// 正常情況下會一直執行到 `shutdown` 被觸發後返回 `Ok(())`；
 /// 啟動失敗或背景任務異常結束時回傳 `Err`，程式以非 0 結束。
-async fn run(config: AppConfig, shutdown: CancellationToken) -> Result<(), String> {
+async fn run(
+    config: AppConfig,
+    retention: log_files::LogRetention,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
     info!(
         "Pulse 地端程式啟動（版本 {}）...",
         env!("CARGO_PKG_VERSION")
     );
+    let cwd = std::env::current_dir().ok();
+    for (level, msg) in startup_location_messages(cwd.as_deref(), config.local_file_found) {
+        log::log!(level, "{msg}");
+    }
     debug!("使用的配置: {:?}", config);
 
     // TLS 設定只在啟動時建立一次；憑證 / 私鑰讀不到、格式錯誤、不成對、過期都會在這裡直接失敗。
@@ -294,7 +383,8 @@ async fn run(config: AppConfig, shutdown: CancellationToken) -> Result<(), Strin
         return Ok(());
     };
 
-    spawn_log_cleanup(config.log.retention_days);
+    spawn_log_cleanup(retention, config.log.retention_days);
+    spawn_client_cert_recheck(tls.clone());
 
     // 系統資訊收集 task → 連線 task
     let (report_tx, report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
@@ -318,5 +408,48 @@ async fn run(config: AppConfig, shutdown: CancellationToken) -> Result<(), Strin
             Err(e) if e.is_panic() => format!("系統資訊收集任務發生 panic：{e}"),
             Err(e) => format!("系統資訊收集任務異常結束：{e}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_logs_working_directory_and_config_source() {
+        // R2-P6
+        let dir = Path::new("/opt/pulse");
+        let msgs = startup_location_messages(Some(dir), true);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].0, Level::Info);
+        assert!(
+            msgs[0].1.contains("工作目錄")
+                && msgs[0].1.contains("已讀取")
+                && msgs[0].1.contains("pulse.toml"),
+            "{msgs:?}"
+        );
+        let msgs = startup_location_messages(Some(dir), false);
+        assert!(msgs[0].1.contains("不存在"), "{msgs:?}");
+
+        // Windows 服務的預設工作目錄（大小寫不拘）→ 另外記 warn
+        for sys in [
+            r"C:\Windows\System32",
+            r"C:\WINDOWS\system32",
+            r"C:\Windows\SysWOW64",
+        ] {
+            let msgs = startup_location_messages(Some(Path::new(sys)), false);
+            if cfg!(windows) {
+                assert_eq!(msgs.len(), 2, "{sys}: {msgs:?}");
+                assert_eq!(msgs[1].0, Level::Warn);
+                assert!(msgs[1].1.contains("系統目錄"), "{msgs:?}");
+            }
+        }
+        assert_eq!(
+            startup_location_messages(Some(Path::new("/srv/system32/pulse")), false).len(),
+            1
+        );
+        // 取不到工作目錄 → warn
+        let msgs = startup_location_messages(None, true);
+        assert_eq!(msgs[0].0, Level::Warn);
     }
 }

@@ -6,8 +6,12 @@
 //! 收到結束要求（Ctrl+C 等）時，若已建立 TLS 連線會先送 close_notify 再結束
 //! （訊息只送出一部分時例外，見 [`Connection::close_gracefully`]）。
 //!
-//! 伺服器送來的文字（error 的 code / message、無法解析的原始行）一律經
+//! 伺服器送來的文字（error 的 code / message、無法解析的原始行），以及可能夾帶伺服器內容的
+//! TLS／I/O 錯誤文字（例如憑證名稱不符時列出的伺服器憑證 SAN），一律經
 //! [`sanitize_for_log`] 轉義控制字元並截斷後才寫進日誌，避免偽造日誌行或夾帶終端跳脫序列。
+//!
+//! report 一次只有一筆在途：上一筆 report 尚未收到伺服器回應（ack 或 error）時，
+//! 新的取樣直接略過（節流 WARN 記錄略過次數），避免伺服器寫檔緩慢時在伺服器端無限積壓。
 
 use std::convert::Infallible;
 use std::fmt;
@@ -41,7 +45,8 @@ const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// 每則訊息寫出的逾時。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 讀取閒置逾時中，容忍伺服器延遲回應的餘裕（實際值見 `Settings::read_idle_timeout`）。
-/// 需大於伺服器最壞的回應延遲（Kairos 寫檔逾時上限 8 秒）。
+/// 需大於 Kairos 最壞的回應延遲 7.55 秒：訊息速率延後 0.05 + report 限速延後 0.5
+/// + `timeouts.write_secs` 上限 6 + 寬限 1。
 const READ_IDLE_MARGIN: Duration = Duration::from_secs(10);
 /// 註冊後連線需穩定維持這麼久，斷線時才重置退避與失敗計數。
 const STABLE_CONNECTION: Duration = Duration::from_secs(30);
@@ -53,24 +58,33 @@ const SUPERSEDED_STREAK_ERROR: u32 = 2;
 /// 連續被取代時的最短重連延遲。這是「`retry.max_delay` 為延遲上限」的明文例外：
 /// 兩台主機共用同一份 agent.id 時，即使 max_delay 很小也不會每秒互踢。
 const SUPERSEDED_MIN_DELAY: Duration = STABLE_CONNECTION;
-/// 「連續被取代」的 error 日誌節流視窗；視窗內的其他次數改記 warn。
-const SUPERSEDED_LOG_WINDOW: Duration = Duration::from_secs(600);
+/// 「連續被取代」與「伺服器致命錯誤」的 error 日誌節流視窗；視窗內的其他次數改記 warn。
+const ATTENTION_LOG_WINDOW: Duration = Duration::from_secs(600);
 /// 伺服器 error 的 `code` 寫進日誌時的長度上限（字元）。
 const LOG_CODE_LIMIT: usize = 64;
 /// 伺服器送來的其他文字（error 的 `message`、無法解析的行）寫進日誌時的長度上限（字元）。
 const LOG_TEXT_LIMIT: usize = 200;
+/// TLS／I/O 錯誤文字寫進日誌時的長度上限（字元）；憑證名稱不符時會列出伺服器憑證的名稱，
+/// 因此比 `LOG_TEXT_LIMIT` 寬一些。
+const LOG_ERROR_LIMIT: usize = 400;
+/// Kairos 因 CRL 過期或無法判定撤銷狀態而拒絕時，`certificate_rejected` 的 message（與 Kairos 約定）。
+const REVOCATION_UNAVAILABLE: &str = "revocation status unavailable";
 
 /// 依節流狀態記錄日誌：同一類別每 `DEFAULT_WINDOW` 最多一則，並附上被略過的次數。
 macro_rules! throttled {
     ($throttle:expr, $level:ident, $($arg:tt)+) => {
-        if let Some(n) = $throttle.check(std::time::Instant::now()) {
+        if let Some(n) = $throttle.check(Instant::now()) {
             log::$level!("{}{}", format_args!($($arg)+), suppressed_note(n, DEFAULT_WINDOW));
         }
     };
 }
 
+/// `storage_unavailable` 的 WARN 節流視窗：Kairos 的每日檔案大小上限滿時，
+/// 每筆 report 都會收到 storage_unavailable 並持續到換日，10 秒一則會洗版一整天。
+const STORAGE_UNAVAILABLE_LOG_WINDOW: Duration = Duration::from_secs(300);
+
 /// 「伺服器送了怪東西」各類日誌的節流狀態；跨連線保留，避免重連後又重新灌爆日誌。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ServerLogThrottles {
     /// 無法解析的行
     unparsable: LogThrottle,
@@ -82,6 +96,57 @@ struct ServerLogThrottles {
     storage_unavailable: LogThrottle,
     /// 不合預期的 ack（註冊前收到、或 seq 超前）
     unexpected_ack: LogThrottle,
+    /// 上一筆 report 尚未收到回應而略過的取樣
+    report_skipped: LogThrottle,
+}
+
+impl Default for ServerLogThrottles {
+    fn default() -> Self {
+        Self {
+            unparsable: LogThrottle::default(),
+            unexpected_hello_ack: LogThrottle::default(),
+            nonfatal_error: LogThrottle::default(),
+            storage_unavailable: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
+            unexpected_ack: LogThrottle::default(),
+            report_skipped: LogThrottle::default(),
+        }
+    }
+}
+
+/// 依「類別」節流的 error 日誌：同一類別每 `ATTENTION_LOG_WINDOW` 最多一則 error，
+/// 其餘改記 warn；類別改變時立即以 error 記錄。用於每次重連都會重複發生、需要人工處理的錯誤
+/// （伺服器致命錯誤、協定版本不符），避免退避上限很小時每分鐘一則 ERROR。
+#[derive(Debug)]
+struct AttentionLog {
+    key: Option<String>,
+    throttle: LogThrottle,
+}
+
+impl AttentionLog {
+    fn new() -> Self {
+        Self {
+            key: None,
+            throttle: LogThrottle::new(ATTENTION_LOG_WINDOW),
+        }
+    }
+
+    /// 同 [`LogThrottle::check`]；`key` 與上次不同時重新起算。
+    fn check(&mut self, key: &str, now: Instant) -> Option<u64> {
+        if self.key.as_deref() != Some(key) {
+            self.key = Some(key.to_string());
+            self.throttle = LogThrottle::new(ATTENTION_LOG_WINDOW);
+        }
+        self.throttle.check(now)
+    }
+}
+
+/// 依節流結果以 error 或 warn 記錄斷線訊息。
+fn log_attention(check: Option<u64>, msg: &str, what: &str) {
+    match check {
+        Some(0) => log::error!("{msg}"),
+        Some(n) => log::error!("{msg}（上次以 ERROR 記錄後，另有 {n} 次{what}已改記 WARN）"),
+        None => log::warn!("{msg}"),
+    }
 }
 
 /// 連線 task 所需的設定（啟動時由 `AppConfig` 建立）。
@@ -94,7 +159,6 @@ pub struct Settings {
     pub agent_id: String,
     pub hostname: String,
     pub heartbeat_interval: Duration,
-    pub report_interval: Duration,
     pub max_retries: u32,
     pub initial_delay: Duration,
     pub max_delay: Duration,
@@ -111,7 +175,6 @@ impl Settings {
             agent_id,
             hostname,
             heartbeat_interval: Duration::from_secs(config.heartbeat.interval),
-            report_interval: Duration::from_secs(config.report.interval),
             max_retries: config.retry.max_retries,
             initial_delay: Duration::from_secs(config.retry.initial_delay),
             max_delay: Duration::from_secs(config.retry.max_delay),
@@ -120,13 +183,16 @@ impl Settings {
         }
     }
 
-    /// 讀取閒置逾時：`max(2 × m, m + 10 秒)`，`m = min(heartbeat.interval, report.interval)`。
+    /// 讀取閒置逾時：`max(2 × hb, hb + 10 秒)`，`hb = heartbeat.interval`。
     ///
-    /// 最壞情況下，距上一則伺服器訊息約 `m` 之後才送出下一則訊息，伺服器再延遲最多 8 秒才回應；
-    /// `m + 10 秒` 確保這種情況不會被誤判為斷線，`2 × m` 則讓長間隔時至少容忍漏掉一次回應。
+    /// 只看 heartbeat：report 依賴取樣任務（sysinfo 可能卡住），不保證按時送出；
+    /// heartbeat 由連線任務自己定時送出。最壞情況下，距上一則伺服器訊息約 `hb` 之後才送出
+    /// 下一則 heartbeat，伺服器再延遲最多約 8 秒才回應；`hb + 10 秒` 確保這種情況不會被誤判為斷線，
+    /// `2 × hb` 則讓長間隔時至少容忍漏掉一次回應。
     fn read_idle_timeout(&self) -> Duration {
-        let m = self.heartbeat_interval.min(self.report_interval);
-        m.saturating_mul(2).max(m.saturating_add(READ_IDLE_MARGIN))
+        let hb = self.heartbeat_interval;
+        hb.saturating_mul(2)
+            .max(hb.saturating_add(READ_IDLE_MARGIN))
     }
 }
 
@@ -183,18 +249,23 @@ impl SessionError {
     }
 }
 
+/// I/O 錯誤（含 rustls 錯誤）的日誌用文字：可能含伺服器憑證中的名稱等外部內容，一律清理。
+fn io_error_text(e: &io::Error) -> String {
+    sanitize_for_log(&e.to_string(), LOG_ERROR_LIMIT)
+}
+
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConnectTimeout => write!(f, "TCP 連線逾時（{} 秒）", CONNECT_TIMEOUT.as_secs()),
-            Self::Connect(e) => write!(f, "TCP 連線失敗：{e}"),
+            Self::Connect(e) => write!(f, "TCP 連線失敗：{}", io_error_text(e)),
             Self::TlsTimeout => write!(f, "TLS 握手逾時（{} 秒）", TLS_TIMEOUT.as_secs()),
-            Self::Tls(e) => write!(f, "TLS 握手失敗：{e}"),
+            Self::Tls(e) => write!(f, "TLS 握手失敗：{}", io_error_text(e)),
             Self::WriteTimeout => write!(f, "寫出逾時（{} 秒）", WRITE_TIMEOUT.as_secs()),
             Self::Codec(LinesCodecError::MaxLineLengthExceeded) => {
                 write!(f, "伺服器送來的單行超過 {MAX_LINE_LENGTH} bytes")
             }
-            Self::Codec(LinesCodecError::Io(e)) => write!(f, "連線 I/O 錯誤：{e}"),
+            Self::Codec(LinesCodecError::Io(e)) => write!(f, "連線 I/O 錯誤：{}", io_error_text(e)),
             Self::Serialize(e) => write!(f, "訊息序列化失敗：{e}"),
             Self::HelloAckTimeout => write!(
                 f,
@@ -332,7 +403,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 true
             }
             Ok(Err(e)) => {
-                log::warn!("送出 TLS close_notify 失敗：{e}");
+                log::warn!("送出 TLS close_notify 失敗：{}", io_error_text(&e));
                 false
             }
             Err(_) => {
@@ -372,7 +443,9 @@ async fn run_with<D: Dialer>(
     // 連續因 superseded 而斷線的次數（其他原因斷線即歸零）
     let mut superseded_streak: u32 = 0;
     // 「連續被取代」的 error 日誌節流（跨連線保留）
-    let mut superseded_log = LogThrottle::new(SUPERSEDED_LOG_WINDOW);
+    let mut superseded_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
+    // 伺服器致命錯誤、協定版本不符的 error 日誌節流（跨連線保留，依錯誤碼分類）
+    let mut attention_log = AttentionLog::new();
 
     loop {
         let mut registered_at = None;
@@ -452,15 +525,21 @@ async fn run_with<D: Dialer>(
             delay.as_secs_f64()
         );
         if repeated_superseded {
-            // 互踢會持續發生：error 每 SUPERSEDED_LOG_WINDOW 最多一則，其餘記 warn
-            match superseded_log.check(std::time::Instant::now()) {
-                Some(0) => log::error!("{msg}"),
-                Some(n) => log::error!(
-                    "{msg}（上次以 ERROR 記錄後，另有 {n} 次「連續被取代」的斷線已改記 WARN）"
-                ),
-                None => log::warn!("{msg}"),
-            }
-        } else if failures >= settings.max_retries || needs_attention(&err, superseded_streak) {
+            // 互踢會持續發生：error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
+            log_attention(
+                superseded_log.check(Instant::now()),
+                &msg,
+                "「連續被取代」的斷線",
+            );
+        } else if let Some(key) = attention_key(&err) {
+            // 伺服器致命錯誤（auth_failed、certificate_rejected、狀態表滿等）每次重連都會重複：
+            // 同一錯誤碼的 error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
+            log_attention(
+                attention_log.check(&key, Instant::now()),
+                &msg,
+                "相同原因的斷線",
+            );
+        } else if failures >= settings.max_retries {
             log::error!("{msg}");
         } else {
             log::warn!("{msg}");
@@ -476,16 +555,26 @@ async fn run_with<D: Dialer>(
     }
 }
 
-/// 斷線原因是否需要人工處理（以 error 等級記錄，不論連續失敗次數）：
+/// 斷線原因是否需要人工處理（以 error 等級記錄，不論連續失敗次數；實際記錄時另有節流）：
 /// 伺服器送來的致命錯誤或註冊前的錯誤、協定版本不符；
 /// `superseded` 只在連續發生 `SUPERSEDED_STREAK_ERROR` 次以上時才算。
+#[cfg(test)]
 fn needs_attention(err: &SessionError, superseded_streak: u32) -> bool {
     match err {
         SessionError::Server { code, .. } if code == "superseded" => {
             superseded_streak >= SUPERSEDED_STREAK_ERROR
         }
-        SessionError::Server { .. } | SessionError::ProtoMismatch(_) => true,
-        _ => false,
+        _ => attention_key(err).is_some(),
+    }
+}
+
+/// 需要人工處理的斷線原因（`superseded` 除外，另有規則）的節流分類鍵；其他原因回傳 `None`。
+fn attention_key(err: &SessionError) -> Option<String> {
+    match err {
+        SessionError::Server { code, .. } if code == "superseded" => None,
+        SessionError::Server { code, fatal, .. } => Some(format!("server:{code}:{fatal}")),
+        SessionError::ProtoMismatch(p) => Some(format!("proto:{p}")),
+        _ => None,
     }
 }
 
@@ -559,6 +648,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut heartbeat = time::interval_at(after(hb_period), hb_period);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // 已送出、尚未收到伺服器回應（ack 或帶 seq 的 error）的 report seq；同一時間最多一筆。
+    // 屬於這條連線的狀態，斷線時隨之清除
+    let mut pending_report: Option<u64> = None;
+    // 這條連線上因上一筆 report 未回應而略過的取樣數
+    let mut skipped_reports: u64 = 0;
+
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -567,6 +662,18 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 log::trace!("已送出 heartbeat（seq={seq}）");
             }
             Some(sample) = reports.recv() => {
+                if let Some(pending) = pending_report {
+                    // 伺服器寫檔緩慢時不再堆送：report 為 at-most-once，這次取樣直接丟棄
+                    skipped_reports = skipped_reports.saturating_add(1);
+                    throttled!(
+                        throttles.report_skipped,
+                        warn,
+                        "上一筆 report（seq={pending}）尚未收到伺服器回應，略過此次取樣（ts={}，這條連線已略過 {skipped_reports} 次）；\
+                         伺服器寫入可能較慢",
+                        sample.ts
+                    );
+                    continue;
+                }
                 let seq = conn.next_seq();
                 let cpu_usage = sanitize_cpu_usage(sample.cpu_usage);
                 if cpu_usage != sample.cpu_usage {
@@ -580,6 +687,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     used_memory: sample.used_memory,
                 })
                 .await?;
+                pending_report = Some(seq);
                 log::debug!(
                     "已送出 report（seq={seq}，CPU {cpu_usage:.2}%，記憶體 {}/{} MB）",
                     sample.used_memory,
@@ -588,10 +696,17 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             }
             line = conn.framed.next() => {
                 let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
+                let outcome = handle_server_line(&line, conn.seq, throttles)?;
                 // 只有合法的協定訊息才算「伺服器還活著」（與 Kairos 的閒置判定一致）；
                 // 無法解析的行不重置閒置計時，持續送垃圾的伺服器仍會被判定為閒置
-                if handle_server_line(&line, conn.seq, throttles)? {
+                if outcome.valid {
                     idle.as_mut().reset(after(read_idle));
+                }
+                // 伺服器依序回應：回應到 report 或其後的訊息，代表該 report 已有結果
+                if let (Some(pending), Some(answered)) = (pending_report, outcome.answered)
+                    && answered >= pending
+                {
+                    pending_report = None;
                 }
             }
             _ = &mut idle => {
@@ -721,18 +836,47 @@ fn handle_pre_ack_line(
     }
 }
 
+/// 註冊後一行伺服器訊息的處理結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineOutcome {
+    /// 是否為合法的協定訊息（用於重置讀取閒置計時）
+    valid: bool,
+    /// 這則訊息回應的 seq（ack 或帶 seq 的 error；只計 1..=已送出的最大 seq）
+    answered: Option<u64>,
+}
+
+impl LineOutcome {
+    const IGNORED: Self = Self {
+        valid: false,
+        answered: None,
+    };
+
+    fn valid(answered: Option<u64>) -> Self {
+        Self {
+            valid: true,
+            answered,
+        }
+    }
+}
+
+/// 伺服器回應的 seq 是否對應到已送出的訊息。
+fn answered_seq(seq: Option<u64>, last_sent_seq: u64) -> Option<u64> {
+    seq.filter(|&s| s != 0 && s <= last_sent_seq)
+}
+
 /// 處理註冊後收到的一行伺服器訊息。`last_sent_seq` 用於比對 ack。
 ///
-/// 回傳 `Ok(true)` 表示這是一則合法的協定訊息（用於重置讀取閒置計時），
-/// `Ok(false)` 表示無法解析而被忽略；fatal error 回傳 `Err` 結束連線。
+/// 回傳的 [`LineOutcome`] 說明這是否為合法的協定訊息（用於重置讀取閒置計時），
+/// 以及它回應了哪個 seq（用於追蹤在途的 report）；fatal error 回傳 `Err` 結束連線。
 fn handle_server_line(
     line: &str,
     last_sent_seq: u64,
     throttles: &mut ServerLogThrottles,
-) -> Result<bool> {
+) -> Result<LineOutcome> {
     match serde_json::from_str::<ServerMsg>(line) {
         Ok(ServerMsg::Ack { seq }) => {
-            if seq == 0 || seq > last_sent_seq {
+            let answered = answered_seq(Some(seq), last_sent_seq);
+            if answered.is_none() {
                 throttled!(
                     throttles.unexpected_ack,
                     debug,
@@ -741,7 +885,7 @@ fn handle_server_line(
             } else {
                 log::trace!("收到 ack seq={seq}");
             }
-            Ok(true)
+            Ok(LineOutcome::valid(answered))
         }
         Ok(ServerMsg::HelloAck { seq, .. }) => {
             throttled!(
@@ -749,7 +893,7 @@ fn handle_server_line(
                 warn,
                 "已註冊後又收到 hello_ack（seq={seq}），忽略"
             );
-            Ok(true)
+            Ok(LineOutcome::valid(None))
         }
         Ok(ServerMsg::Error {
             code,
@@ -762,14 +906,16 @@ fn handle_server_line(
         }) if code == "storage_unavailable" => {
             // report 的 ack 代表已寫入伺服器資料檔；storage_unavailable 代表這筆沒有保存。
             // report 為 at-most-once：視為未送達，不重送，連線保持。
-            throttled!(
-                throttles.storage_unavailable,
-                warn,
-                "伺服器無法保存 report（seq={}，storage_unavailable）：{}；此筆資料未送達，不會重送",
-                seq_text(seq),
-                sanitize_for_log(&message, LOG_TEXT_LIMIT)
-            );
-            Ok(true)
+            // 節流視窗較長（STORAGE_UNAVAILABLE_LOG_WINDOW），不用 throttled!（固定 10 秒）
+            if let Some(n) = throttles.storage_unavailable.check(Instant::now()) {
+                log::warn!(
+                    "伺服器無法保存 report（seq={}，storage_unavailable）：{}；此筆資料未送達，不會重送{}",
+                    seq_text(seq),
+                    sanitize_for_log(&message, LOG_TEXT_LIMIT),
+                    suppressed_note(n, STORAGE_UNAVAILABLE_LOG_WINDOW)
+                );
+            }
+            Ok(LineOutcome::valid(answered_seq(seq, last_sent_seq)))
         }
         Ok(ServerMsg::Error {
             seq, code, message, ..
@@ -782,11 +928,11 @@ fn handle_server_line(
                 sanitize_for_log(&code, LOG_CODE_LIMIT),
                 sanitize_for_log(&message, LOG_TEXT_LIMIT)
             );
-            Ok(true)
+            Ok(LineOutcome::valid(answered_seq(seq, last_sent_seq)))
         }
         Err(e) => {
             log_unparsable(throttles, line, &e);
-            Ok(false)
+            Ok(LineOutcome::IGNORED)
         }
     }
 }
@@ -814,11 +960,21 @@ fn server_error_hint(
     superseded_streak: u32,
 ) -> Option<String> {
     match err.server_code()? {
-        "superseded" if superseded_streak >= SUPERSEDED_STREAK_ERROR => Some(format!(
-            "已連續 {superseded_streak} 次被同一 agent_id（{}）的其他連線取代：極可能有多台主機共用同一份 agent.id\
-             （例如複製了 VM 映像檔），請在多出來的主機上刪除 agent.id 後重新啟動，以產生新的 agent_id",
-            settings.agent_id
-        )),
+        "superseded" if superseded_streak >= SUPERSEDED_STREAK_ERROR => {
+            // 啟用 mTLS 時客戶端憑證的 SAN 綁定 agent_id：只刪 agent.id 會因 SAN 不符而無法啟動
+            let mtls_note = if settings.client_cert.is_some() {
+                "；本機已啟用 mTLS：產生新的 agent_id 後，必須請管理者以新的 agent_id（SAN 為 DNS:<新 agent_id>，\
+                 可用 `pulse --print-agent-id` 取得）重新簽發客戶端憑證並更新 server.client_cert / server.client_key，\
+                 否則 Pulse 會因憑證 SAN 不符而無法啟動"
+            } else {
+                ""
+            };
+            Some(format!(
+                "已連續 {superseded_streak} 次被同一 agent_id（{}）的其他連線取代：極可能有多台主機共用同一份 agent.id\
+                 （例如複製了 VM 映像檔），請在多出來的主機上刪除 agent.id 後重新啟動，以產生新的 agent_id{mtls_note}",
+                settings.agent_id
+            ))
+        }
         "superseded" => Some(
             "此連線已被同一 agent_id 的新連線取代；若非預期，請確認是否有多台主機共用同一份 agent.id"
                 .to_string(),
@@ -853,6 +1009,12 @@ fn auth_error_hint(settings: &Settings, code: &str, message: &str) -> Option<Str
         None => "目前未設定 server.client_cert".to_string(),
     };
     match code {
+        // Kairos 的 CRL 過期或無法判定撤銷狀態：伺服器端問題，重新簽發也無濟於事
+        "certificate_rejected" if message.trim() == REVOCATION_UNAVAILABLE => Some(
+            "伺服器的 CRL 已過期或無法判定此憑證的撤銷狀態，屬伺服器端問題（不是本機憑證的問題，\
+             不需要重新簽發），請聯絡伺服器管理者更新 CRL"
+                .to_string(),
+        ),
         "certificate_rejected" => Some(format!(
             "客戶端憑證已被撤銷、過期或不再受伺服器信任，請聯絡管理者重新簽發；{cert}"
         )),
@@ -890,14 +1052,15 @@ fn connection_hint(
         return Some(hint);
     }
     // TLS 握手尚未完成、伺服器也還沒要求客戶端憑證就被關閉（EOF / RST）：
-    // 常見原因是超過伺服器的每 IP 連線上限（Kairos 會在握手前直接關閉）
+    // 常見原因是超過伺服器的每 IP 連線上限或新連線速率限制（Kairos 會在握手前直接關閉）
     if let SessionError::Tls(e) = err
         && !client_cert_requested
         && closed_before_handshake(e)
     {
         return Some(
             "伺服器在 TLS 握手完成前就關閉了連線：可能超過伺服器的每 IP 連線上限\
-             （同一 IP 的連線過多），或伺服器正在重新啟動、連到的連接埠不是 TLS 服務"
+             （同一 IP 位址的連線過多）、新連線速率過快（同一 IP，IPv6 為同一 /64）或伺服器握手中的連線過多，\
+             或伺服器正在重新啟動、連到的連接埠不是 TLS 服務"
                 .to_string(),
         );
     }
@@ -934,9 +1097,11 @@ fn closed_before_handshake(e: &io::Error) -> bool {
 
 /// 日誌用：把不受信任的文字（伺服器送來的內容）轉成安全的單行文字。
 ///
-/// - `\n`、`\r`、`\t` 轉成對應的跳脫字串；其他控制字元（C0 / DEL / C1，含 ESC）與
-///   會改變顯示方向或不可見的字元（Unicode 格式字元 Cf，例如 U+200B、U+202E、U+FEFF，
-///   以及 U+2028、U+2029）轉成 `\u{XXXX}`，避免偽造日誌行或夾帶終端跳脫序列
+/// - `\n`、`\r`、`\t` 轉成對應的跳脫字串，反斜線本身轉成 `\\`（字面的 `\n` 與轉義後的換行
+///   才能區分）；其他控制字元（C0 / DEL / C1，含 ESC）與會改變顯示方向、不可見或無法辨識的字元
+///   （Unicode 格式字元 Cf，例如 U+200B、U+202E、U+FEFF，U+2028、U+2029，以及 Hangul filler、
+///   變體選擇字元、私用區等，見 [`crate::protocol::is_forbidden_display_char`]）轉成 `\u{XXXX}`，
+///   避免偽造日誌行或夾帶終端跳脫序列
 /// - 超過 `limit` 個字元時截斷，並附上原始長度
 fn sanitize_for_log(s: &str, limit: usize) -> String {
     use std::fmt::Write as _;
@@ -947,6 +1112,7 @@ fn sanitize_for_log(s: &str, limit: usize) -> String {
             break;
         }
         match c {
+            '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -961,8 +1127,8 @@ fn sanitize_for_log(s: &str, limit: usize) -> String {
 
 /// 寫進日誌前必須轉義的字元（見 [`sanitize_for_log`]）。
 ///
-/// 與 hello 顯示用字串的規則相同（Cc、全部 Cf、U+2028、U+2029），見
-/// [`crate::protocol::is_forbidden_display_char`]。
+/// 與 hello 顯示用字串的規則相同（Cc、全部 Cf、U+2028、U+2029、Hangul filler、
+/// 變體選擇字元、私用區等），見 [`crate::protocol::is_forbidden_display_char`]。
 fn is_unsafe_for_log(c: char) -> bool {
     crate::protocol::is_forbidden_display_char(c)
 }
@@ -974,7 +1140,7 @@ mod tests {
     use tokio::io::{DuplexStream, duplex};
     use tokio_rustls::rustls::{AlertDescription, Error as TlsError};
 
-    fn settings(hb: u64, report: u64) -> Settings {
+    fn settings(hb: u64) -> Settings {
         Settings {
             address: "127.0.0.1".into(),
             port: 1,
@@ -982,7 +1148,6 @@ mod tests {
             agent_id: "a".into(),
             hostname: "h".into(),
             heartbeat_interval: Duration::from_secs(hb),
-            report_interval: Duration::from_secs(report),
             max_retries: 5,
             initial_delay: Duration::from_secs(2),
             max_delay: Duration::from_secs(60),
@@ -993,19 +1158,41 @@ mod tests {
     #[test]
     fn ack_and_nonfatal_error_keep_connection() {
         let mut t = ServerLogThrottles::default();
-        assert!(handle_server_line(r#"{"type":"ack","seq":2}"#, 2, &mut t).unwrap());
-        assert!(handle_server_line(r#"{"type":"ack","seq":9}"#, 2, &mut t).unwrap());
-        assert!(
-            handle_server_line(
+        let outcome =
+            |line: &str, t: &mut ServerLogThrottles| handle_server_line(line, 2, t).unwrap();
+        assert_eq!(
+            outcome(r#"{"type":"ack","seq":2}"#, &mut t),
+            LineOutcome::valid(Some(2))
+        );
+        // seq 超前或為 0 的 ack 仍是合法訊息，但不算回應了任何已送出的訊息
+        assert_eq!(
+            outcome(r#"{"type":"ack","seq":9}"#, &mut t),
+            LineOutcome::valid(None)
+        );
+        assert_eq!(
+            outcome(r#"{"type":"ack","seq":0}"#, &mut t),
+            LineOutcome::valid(None)
+        );
+        assert_eq!(
+            outcome(
                 r#"{"type":"error","seq":null,"code":"unknown_type","message":"unknown message type","fatal":false}"#,
-                2,
                 &mut t
-            )
-            .unwrap()
+            ),
+            LineOutcome::valid(None)
+        );
+        assert_eq!(
+            outcome(
+                r#"{"type":"error","seq":1,"code":"invalid_report","message":"x","fatal":false}"#,
+                &mut t
+            ),
+            LineOutcome::valid(Some(1))
         );
         // 無法解析的行只記錄，不斷線，但不算合法訊息（不重置閒置計時）
-        assert!(!handle_server_line("not json", 2, &mut t).unwrap());
-        assert!(!handle_server_line(r#"{"type":"future_msg"}"#, 2, &mut t).unwrap());
+        assert_eq!(outcome("not json", &mut t), LineOutcome::IGNORED);
+        assert_eq!(
+            outcome(r#"{"type":"future_msg"}"#, &mut t),
+            LineOutcome::IGNORED
+        );
     }
 
     #[test]
@@ -1013,11 +1200,50 @@ mod tests {
         let mut t = ServerLogThrottles::default();
         let line = r#"{"type":"error","seq":6,"code":"storage_unavailable","message":"disk full","fatal":false}"#;
         for _ in 0..100 {
-            assert!(handle_server_line(line, 6, &mut t).unwrap());
+            assert_eq!(
+                handle_server_line(line, 6, &mut t).unwrap(),
+                LineOutcome::valid(Some(6))
+            );
         }
         // 走自己的節流類別：已記錄過一次，其餘被略過；一般非致命錯誤的類別未被使用
-        assert_eq!(t.storage_unavailable.check(std::time::Instant::now()), None);
-        assert_eq!(t.nonfatal_error.check(std::time::Instant::now()), Some(0));
+        assert_eq!(t.storage_unavailable.check(Instant::now()), None);
+        assert_eq!(t.nonfatal_error.check(Instant::now()), Some(0));
+    }
+
+    #[test]
+    fn storage_unavailable_warn_uses_longer_window() {
+        // 每日大小上限滿時會持續一整天：每 300 秒最多一則 WARN，而不是 10 秒
+        let mut t = ServerLogThrottles::default();
+        let t0 = Instant::now();
+        assert_eq!(t.storage_unavailable.check(t0), Some(0));
+        assert_eq!(
+            t.storage_unavailable.check(t0 + Duration::from_secs(60)),
+            None
+        );
+        assert_eq!(
+            t.storage_unavailable.check(t0 + Duration::from_secs(299)),
+            None
+        );
+        assert_eq!(
+            t.storage_unavailable
+                .check(t0 + STORAGE_UNAVAILABLE_LOG_WINDOW),
+            Some(2)
+        );
+        // 其他類別仍是 10 秒
+        assert_eq!(t.nonfatal_error.check(t0), Some(0));
+        assert_eq!(t.nonfatal_error.check(t0 + DEFAULT_WINDOW), Some(0));
+        let line = r#"{"type":"error","seq":1,"code":"storage_unavailable","message":"daily size limit reached","fatal":false}"#;
+        let ((), logs) = crate::test_log::capture(|| {
+            let mut t = ServerLogThrottles::default();
+            for _ in 0..50 {
+                handle_server_line(line, 1, &mut t).unwrap();
+            }
+        });
+        let warns: Vec<_> = logs
+            .iter()
+            .filter(|(_, m)| m.contains("storage_unavailable"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
     }
 
     #[test]
@@ -1035,11 +1261,8 @@ mod tests {
             );
         }
         // 第一則有記錄，其餘 999 則被略過並等待下次記錄時回報
-        assert_eq!(t.unparsable.check(std::time::Instant::now()), None);
-        assert_eq!(
-            t.unexpected_hello_ack.check(std::time::Instant::now()),
-            None
-        );
+        assert_eq!(t.unparsable.check(Instant::now()), None);
+        assert_eq!(t.unexpected_hello_ack.check(Instant::now()), None);
     }
 
     #[test]
@@ -1122,31 +1345,26 @@ mod tests {
 
     #[test]
     fn read_idle_timeout_rules() {
-        // max(2 × m, m + 10 秒)，m = min(heartbeat, report)
-        assert_eq!(settings(1, 5).read_idle_timeout(), Duration::from_secs(11));
-        assert_eq!(settings(5, 5).read_idle_timeout(), Duration::from_secs(15));
-        assert_eq!(settings(10, 5).read_idle_timeout(), Duration::from_secs(15));
-        assert_eq!(
-            settings(10, 10).read_idle_timeout(),
-            Duration::from_secs(20)
-        );
-        assert_eq!(
-            settings(30, 3600).read_idle_timeout(),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            settings(60, 20).read_idle_timeout(),
-            Duration::from_secs(40)
-        );
-        assert_eq!(
-            settings(60, 3600).read_idle_timeout(),
-            Duration::from_secs(120)
-        );
+        // R2-P2：max(2 × hb, hb + 10 秒)，只看 heartbeat.interval（report.interval 不影響）
+        assert_eq!(settings(1).read_idle_timeout(), Duration::from_secs(11));
+        assert_eq!(settings(5).read_idle_timeout(), Duration::from_secs(15));
+        assert_eq!(settings(10).read_idle_timeout(), Duration::from_secs(20));
+        assert_eq!(settings(30).read_idle_timeout(), Duration::from_secs(60));
+        assert_eq!(settings(60).read_idle_timeout(), Duration::from_secs(120));
         // 極大值也不 panic
-        let mut s = settings(1, 1);
+        let mut s = settings(1);
         s.heartbeat_interval = Duration::MAX;
-        s.report_interval = Duration::MAX;
         assert_eq!(s.read_idle_timeout(), Duration::MAX);
+    }
+
+    #[test]
+    fn read_idle_timeout_ignores_report_interval() {
+        // R2-P2：hb 大、report 小時，舊公式取 min 會得到 15 秒；取樣卡住時就會誤斷線
+        let mut config = crate::config_manager::AppConfig::default_for_tests();
+        config.heartbeat.interval = 60;
+        config.report.interval = 5;
+        let s = Settings::new(&config, "a".into(), "h".into());
+        assert_eq!(s.read_idle_timeout(), Duration::from_secs(120));
     }
 
     #[test]
@@ -1181,7 +1399,7 @@ mod tests {
     #[test]
     fn connection_hint_rules() {
         let io_err = || SessionError::Codec(LinesCodecError::Io(io::Error::other("reset")));
-        let mut s = settings(1, 5);
+        let mut s = settings(1);
         // 伺服器要求客戶端憑證、未設定、註冊前斷線 → 提示設定
         let hint = connection_hint(&io_err(), &s, true, false).unwrap();
         assert!(hint.contains("未設定 server.client_cert"), "{hint}");
@@ -1218,7 +1436,7 @@ mod tests {
 
     #[test]
     fn auth_failed_hint_names_agent_id_and_cert() {
-        let mut s = settings(1, 5);
+        let mut s = settings(1);
         s.agent_id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566".into();
         let hint = auth_error_hint(&s, "auth_failed", "").unwrap();
         assert!(
@@ -1238,7 +1456,7 @@ mod tests {
 
     #[test]
     fn certificate_rejected_hint_is_selected_by_code() {
-        let s = settings(1, 5);
+        let s = settings(1);
         let hint = auth_error_hint(&s, "certificate_rejected", "").unwrap();
         assert!(hint.contains("撤銷"), "{hint}");
         assert!(!hint.contains("SAN"), "{hint}");
@@ -1252,7 +1470,7 @@ mod tests {
 
     #[test]
     fn auth_failed_hint_mentions_single_dns_san_rule() {
-        let mut s = settings(1, 5);
+        let mut s = settings(1);
         s.agent_id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566".into();
         // 一般 auth_failed：提示中也說明伺服器預設只接受恰好一個 DNS SAN
         let hint = auth_error_hint(&s, "auth_failed", "agent_id mismatch").unwrap();
@@ -1276,7 +1494,7 @@ mod tests {
 
     #[test]
     fn closed_before_handshake_hints_per_ip_limit() {
-        let s = settings(1, 5);
+        let s = settings(1);
         let closed = |kind: io::ErrorKind| SessionError::Tls(io::Error::from(kind));
         for kind in [
             io::ErrorKind::UnexpectedEof,
@@ -1285,6 +1503,12 @@ mod tests {
         ] {
             let hint = connection_hint(&closed(kind), &s, false, false).unwrap();
             assert!(hint.contains("每 IP 連線上限"), "{kind:?}: {hint}");
+            assert!(
+                hint.contains("同一 /64")
+                    && hint.contains("新連線速率過快")
+                    && hint.contains("握手中的連線過多"),
+                "{hint}"
+            );
         }
         // 伺服器已要求客戶端憑證 → 握手已進行到一半，改為客戶端憑證的提示
         assert!(
@@ -1317,7 +1541,7 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             drop(tcp);
         });
-        let mut s = settings(1, 5);
+        let mut s = settings(1);
         s.port = port;
         let tls = tls::build(&crate::config_manager::ServerConfig {
             address: "127.0.0.1".into(),
@@ -1339,7 +1563,7 @@ mod tests {
 
     #[test]
     fn server_error_hints() {
-        let s = settings(1, 5);
+        let s = settings(1);
         let err = |code: &str| SessionError::server(code, "m", true);
         assert!(
             server_error_hint(&s, &err("superseded"), 1)
@@ -1385,7 +1609,7 @@ mod tests {
     #[test]
     fn established_message_marks_unverified_server() {
         // P2
-        let s = settings(1, 5);
+        let s = settings(1);
         let msg = established_message(&s, "TLSv1_3", true);
         assert!(!msg.contains("未驗證"), "{msg}");
         let msg = established_message(&s, "TLSv1_3", false);
@@ -1452,15 +1676,15 @@ mod tests {
             let line = format!(
                 r#"{{"type":"error","seq":1,"code":{evil_json},"message":{evil_json},"fatal":false}}"#
             );
-            assert!(handle_server_line(&line, 1, &mut t).unwrap());
+            assert!(handle_server_line(&line, 1, &mut t).unwrap().valid);
             // storage_unavailable 的 message
             let line = format!(
                 r#"{{"type":"error","seq":1,"code":"storage_unavailable","message":{evil_json},"fatal":false}}"#
             );
-            assert!(handle_server_line(&line, 1, &mut t).unwrap());
+            assert!(handle_server_line(&line, 1, &mut t).unwrap().valid);
             // 無法解析的原始行（含 serde 錯誤訊息中的原始內容），且超長
             let line = format!(r#"{{"type":{evil_json}}}{}"#, "y".repeat(10_000));
-            assert!(!handle_server_line(&line, 1, &mut t).unwrap());
+            assert!(!handle_server_line(&line, 1, &mut t).unwrap().valid);
             assert_eq!(handle_pre_ack_line(evil, 1, &mut t).unwrap(), None);
         });
         assert!(logs.len() >= 3, "{logs:?}");
@@ -1532,10 +1756,19 @@ mod tests {
     /// 在 `stream` 上執行 serve()，回傳結束原因與是否完成註冊。
     async fn serve_once(stream: DuplexStream, s: &Settings) -> (SessionError, bool) {
         let (_tx, mut rx) = mpsc::channel::<Sample>(1);
+        serve_with_reports(stream, s, &mut rx).await
+    }
+
+    /// 同 [`serve_once`]，取樣由呼叫端從 `rx` 的另一端送入。
+    async fn serve_with_reports(
+        stream: DuplexStream,
+        s: &Settings,
+        rx: &mut mpsc::Receiver<Sample>,
+    ) -> (SessionError, bool) {
         let mut conn = Connection::new(stream);
         let mut registered_at = None;
         let mut throttles = ServerLogThrottles::default();
-        let err = match serve(&mut conn, s, &mut rx, &mut registered_at, &mut throttles).await {
+        let err = match serve(&mut conn, s, rx, &mut registered_at, &mut throttles).await {
             Ok(never) => match never {},
             Err(e) => e,
         };
@@ -1551,7 +1784,7 @@ mod tests {
             drain(&mut f).await; // 之後只收不回
         });
         let start = Instant::now();
-        let (err, registered) = serve_once(client, &settings(1, 5)).await;
+        let (err, registered) = serve_once(client, &settings(1)).await;
         assert!(registered);
         assert!(
             matches!(err, SessionError::IdleTimeout(d) if d == Duration::from_secs(11)),
@@ -1582,7 +1815,7 @@ mod tests {
             }
         });
         let start = Instant::now();
-        let (err, _) = serve_once(client, &settings(1, 5)).await;
+        let (err, _) = serve_once(client, &settings(1)).await;
         assert!(matches!(err, SessionError::IdleTimeout(_)), "{err:?}");
         assert!(start.elapsed() < Duration::from_secs(12));
         srv.abort();
@@ -1598,7 +1831,7 @@ mod tests {
             ack_for(&mut f, Duration::from_secs(60)).await;
         });
         let start = Instant::now();
-        let (err, _) = serve_once(client, &settings(1, 5)).await;
+        let (err, _) = serve_once(client, &settings(1)).await;
         assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
         assert!(start.elapsed() >= Duration::from_secs(60));
         srv.await.unwrap();
@@ -1628,7 +1861,7 @@ mod tests {
             }
         });
         let start = Instant::now();
-        let (err, _) = serve_once(client, &settings(5, 5)).await;
+        let (err, _) = serve_once(client, &settings(5)).await;
         assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
         assert!(start.elapsed() >= Duration::from_secs(60));
         srv.await.unwrap();
@@ -1650,7 +1883,7 @@ mod tests {
             f.send("x".repeat(MAX_LINE_LENGTH + 1)).await.unwrap();
             drain(&mut f).await;
         });
-        let (err, registered) = serve_once(client, &settings(1, 5)).await;
+        let (err, registered) = serve_once(client, &settings(1)).await;
         assert!(registered);
         assert!(
             matches!(
@@ -1671,7 +1904,7 @@ mod tests {
             f.get_mut().write_all(b"\xff\xfe{}\n").await.unwrap();
             drain(&mut f).await;
         });
-        let (err, _) = serve_once(client, &settings(1, 5)).await;
+        let (err, _) = serve_once(client, &settings(1)).await;
         assert!(
             matches!(&err, SessionError::Codec(LinesCodecError::Io(e)) if e.kind() == io::ErrorKind::InvalidData),
             "{err:?}"
@@ -1691,7 +1924,7 @@ mod tests {
             drain(&mut f).await;
         });
         let start = Instant::now();
-        let (err, registered) = serve_once(client, &settings(1, 5)).await;
+        let (err, registered) = serve_once(client, &settings(1)).await;
         assert!(!registered);
         assert!(matches!(err, SessionError::HelloAckTimeout), "{err:?}");
         let elapsed = start.elapsed();
@@ -1817,7 +2050,7 @@ mod tests {
     fn backoff_reset_rules_including_superseded() {
         // X1 + T6：穩定連線後正常斷線 → 重置；短連線 → 不重置；
         // 穩定連線後第一次被 superseded → 照常重置；連續被取代 → 不重置、error、延遲至少 30 秒
-        let (dials, logs) = run_script(settings(1, 5), 5, |i, mut f| async move {
+        let (dials, logs) = run_script(settings(1), 5, |i, mut f| async move {
             accept_hello(&mut f).await;
             let up = if matches!(i, 1 | 3) { 1 } else { 31 };
             ack_for(&mut f, Duration::from_secs(up)).await;
@@ -1876,7 +2109,7 @@ mod tests {
     #[test]
     fn repeated_superseded_delay_ignores_small_max_delay() {
         // X1：max_delay = 1 時，連續被取代後延遲仍至少 30 秒，不會每秒互踢；error 有節流
-        let mut s = settings(1, 5);
+        let mut s = settings(1);
         s.initial_delay = Duration::from_secs(1);
         s.max_delay = Duration::from_secs(1);
         let (dials, logs) = run_script(s, 4, |_, mut f| async move {
@@ -1915,7 +2148,7 @@ mod tests {
     #[test]
     fn superseded_streak_is_broken_by_other_errors() {
         let superseded = r#"{"type":"error","code":"superseded","message":"","fatal":true}"#;
-        let (_, logs) = run_script(settings(1, 5), 3, move |i, mut f| async move {
+        let (_, logs) = run_script(settings(1), 3, move |i, mut f| async move {
             accept_hello(&mut f).await;
             ack_for(&mut f, Duration::from_secs(1)).await;
             // 第 0、2 次被取代；中間第 1 次是一般斷線
@@ -1938,7 +2171,7 @@ mod tests {
     #[test]
     fn fatal_auth_error_is_logged_once_with_hint() {
         // P6：同一錯誤只產生一則日誌，提示合併在同一行
-        let mut s = settings(1, 5);
+        let mut s = settings(1);
         s.agent_id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566".into();
         let (_, logs) = run_script(s, 1, |_, mut f| async move {
             let _ = f.next().await; // hello
@@ -1962,5 +2195,348 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("  "), "{msg:?}");
+    }
+
+    // ---- 第二輪審計的回歸測試 ----
+
+    #[test]
+    fn tls_and_io_error_text_is_sanitized() {
+        // R2-P1：TLS／I/O 錯誤的文字可能含伺服器憑證的 SAN 原文
+        let evil = "bad\\name\n2026-10-09 00:00:00 [INFO] 偽造\u{1b}[2J\u{202e}\u{e000}";
+        let errors = [
+            SessionError::Tls(io::Error::other(evil)),
+            SessionError::Codec(LinesCodecError::Io(io::Error::other(evil))),
+            SessionError::Connect(io::Error::other(evil)),
+        ];
+        for err in &errors {
+            let text = err.to_string();
+            assert!(!text.chars().any(is_unsafe_for_log), "{text:?}");
+            assert!(text.contains("bad\\\\name\\n2026-10-09"), "{text}");
+        }
+        // 實際的 rustls 錯誤：名稱不符時會列出伺服器憑證中的名稱
+        let presented = TlsError::InvalidCertificate(
+            tokio_rustls::rustls::CertificateError::NotValidForNameContext {
+                expected: tokio_rustls::rustls::pki_types::ServerName::try_from("kairos.local")
+                    .unwrap(),
+                presented: vec!["evil\n[ERROR] 偽造的日誌行\u{1b}[31m".to_string()],
+            },
+        );
+        let err = SessionError::Tls(io::Error::new(io::ErrorKind::InvalidData, presented));
+        let text = err.to_string();
+        assert!(!text.chars().any(is_unsafe_for_log), "{text:?}");
+        assert!(text.contains("evil\\n[ERROR]"), "{text}");
+        // 仍可取出 rustls 錯誤給處置提示使用
+        assert!(err.rustls_error().is_some());
+        // 超長的錯誤文字會被截斷
+        let long = SessionError::Tls(io::Error::other("x".repeat(100_000)));
+        assert!(long.to_string().len() < 1000);
+    }
+
+    #[test]
+    fn sanitize_escapes_backslash() {
+        // R2-P12：字面的 `\n` 與轉義後的換行必須可區分
+        assert_eq!(sanitize_for_log("a\\nb", 200), "a\\\\nb");
+        assert_eq!(sanitize_for_log("a\nb", 200), "a\\nb");
+        assert_ne!(
+            sanitize_for_log("a\\nb", 200),
+            sanitize_for_log("a\nb", 200)
+        );
+        assert_eq!(sanitize_for_log("\\u{1b}", 200), "\\\\u{1b}");
+        assert_eq!(sanitize_for_log("\u{1b}", 200), "\\u{001b}");
+    }
+
+    #[test]
+    fn sanitize_escapes_fillers_selectors_and_private_use() {
+        // R2-K23：與 hostname 規則相同的新增碼位
+        assert_eq!(
+            sanitize_for_log("a\u{3164}b\u{fe0f}c\u{e000}d\u{115f}", 200),
+            "a\\u{3164}b\\u{fe0f}c\\u{e000}d\\u{115f}"
+        );
+        assert_eq!(
+            sanitize_for_log("\u{34f}\u{ffa0}\u{e0100}\u{10fffd}", 200),
+            "\\u{034f}\\u{ffa0}\\u{e0100}\\u{10fffd}"
+        );
+    }
+
+    #[test]
+    fn repeated_superseded_hint_mentions_reissuing_client_cert_under_mtls() {
+        // R2-P8：mTLS 下只刪 agent.id 會因 SAN 不符而無法啟動
+        let mut s = settings(1);
+        let err = SessionError::server("superseded", "", true);
+        let hint = server_error_hint(&s, &err, 2).unwrap();
+        assert!(hint.contains("刪除 agent.id"), "{hint}");
+        assert!(!hint.contains("mTLS"), "{hint}");
+        s.client_cert = Some("certs/client.pem".into());
+        let hint = server_error_hint(&s, &err, 2).unwrap();
+        assert!(
+            hint.contains("mTLS") && hint.contains("重新簽發客戶端憑證"),
+            "{hint}"
+        );
+        assert!(hint.contains("--print-agent-id"), "{hint}");
+        // 第一次被取代的提示不變
+        assert!(!server_error_hint(&s, &err, 1).unwrap().contains("重新簽發"));
+    }
+
+    #[test]
+    fn revocation_unavailable_is_reported_as_server_side_problem() {
+        // R2-P14：Kairos 的 CRL 過期時不可叫使用者重新簽發
+        let mut s = settings(1);
+        s.client_cert = Some("certs/client.pem".into());
+        let err = SessionError::server("certificate_rejected", REVOCATION_UNAVAILABLE, true);
+        let hint = server_error_hint(&s, &err, 0).unwrap();
+        assert!(
+            hint.contains("CRL") && hint.contains("伺服器端問題") && hint.contains("管理者"),
+            "{hint}"
+        );
+        assert!(hint.contains("不需要重新簽發"), "{hint}");
+        // 其他 certificate_rejected 仍提示重新簽發
+        let err = SessionError::server("certificate_rejected", "certificate revoked", true);
+        let hint = server_error_hint(&s, &err, 0).unwrap();
+        assert!(
+            hint.contains("聯絡管理者重新簽發") && hint.contains("certs/client.pem"),
+            "{hint}"
+        );
+        assert!(!hint.contains("CRL"), "{hint}");
+    }
+
+    #[test]
+    fn attention_log_restarts_when_reason_changes() {
+        let mut log = AttentionLog::new();
+        let t0 = Instant::now();
+        assert_eq!(log.check("a", t0), Some(0));
+        assert_eq!(log.check("a", t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.check("a", t0 + Duration::from_secs(2)), None);
+        // 原因改變：立即記 error
+        assert_eq!(log.check("b", t0 + Duration::from_secs(3)), Some(0));
+        assert_eq!(log.check("a", t0 + Duration::from_secs(4)), Some(0));
+        assert_eq!(log.check("a", t0 + Duration::from_secs(5)), None);
+        // 視窗到期：記 error 並附上被改記 warn 的次數
+        assert_eq!(
+            log.check("a", t0 + Duration::from_secs(4) + ATTENTION_LOG_WINDOW),
+            Some(1)
+        );
+        // 分類鍵：superseded 與非伺服器錯誤不在此列
+        assert_eq!(
+            attention_key(&SessionError::server("superseded", "", true)),
+            None
+        );
+        assert_eq!(attention_key(&SessionError::ClosedByServer), None);
+        assert_ne!(
+            attention_key(&SessionError::server("auth_failed", "", true)),
+            attention_key(&SessionError::server("certificate_rejected", "", true))
+        );
+        assert!(attention_key(&SessionError::ProtoMismatch(2)).is_some());
+    }
+
+    /// 斷線日誌中，ERROR 的索引與其「另有 n 次…已改記 WARN」中的 n（沒有時為 0）。
+    fn error_positions(d: &[(log::Level, String)]) -> Vec<(usize, u64)> {
+        d.iter()
+            .enumerate()
+            .filter(|(_, (level, _))| *level == log::Level::Error)
+            .map(|(i, (_, m))| {
+                let n = m
+                    .split("另有 ")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                (i, n)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_superseded_error_is_logged_again_after_ten_minutes() {
+        // R2-T3：暫停的時鐘下驗證 10 分鐘節流：視窗內改記 WARN，視窗到期再記 ERROR 並附上次數
+        let (dials, logs) = run_script(settings(1), 16, |_, mut f| async move {
+            accept_hello(&mut f).await;
+            ack_for(&mut f, Duration::from_secs(1)).await;
+            f.send(r#"{"type":"error","code":"superseded","fatal":true}"#.to_string())
+                .await
+                .unwrap();
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 16, "{d:?}");
+        let errors = error_positions(&d);
+        // 第 1 次被取代為 warn；連續第 2 次起為 error；之後要到 10 分鐘後才再記 error
+        assert!(errors.len() >= 2, "{d:?}");
+        assert_eq!(errors[0], (1, 0), "{d:?}");
+        let (second, n) = errors[1];
+        assert_eq!(
+            n,
+            u64::try_from(second - 2).unwrap(),
+            "第二則 ERROR 應附上中間改記 WARN 的次數：{}",
+            d[second].1
+        );
+        assert!(d[second].1.contains("「連續被取代」的斷線已改記 WARN"));
+        for (level, msg) in &d[2..second] {
+            assert_eq!(*level, log::Level::Warn, "{msg}");
+        }
+        // 第 i 則斷線日誌在第 i + 1 次 dial 之前；兩則 ERROR 之間至少相隔 10 分鐘，
+        // 且第二則 ERROR 之前那一則 WARN 距第一則 ERROR 不到 10 分鐘
+        let first_error_at = dials[1];
+        let second_error_at = dials[second];
+        assert!(second_error_at - first_error_at >= ATTENTION_LOG_WINDOW);
+        assert!(dials[second - 1] - first_error_at < ATTENTION_LOG_WINDOW + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn repeated_fatal_server_errors_are_throttled() {
+        // R2-P7：auth_failed 等致命錯誤每次重連都會重複，ERROR 每 10 分鐘最多一則
+        let mut s = settings(1);
+        s.max_delay = Duration::from_secs(30);
+        let (dials, logs) = run_script(s, 30, |_, mut f| async move {
+            let _ = f.next().await; // hello
+            f.send(
+                r#"{"type":"error","seq":1,"code":"auth_failed","message":"agent_id does not match certificate","fatal":true}"#
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 30, "{d:?}");
+        let errors = error_positions(&d);
+        assert_eq!(errors[0], (0, 0), "第一次立即以 ERROR 記錄：{d:?}");
+        assert!(errors.len() >= 2, "{d:?}");
+        let (second, n) = errors[1];
+        assert_eq!(n, u64::try_from(second - 1).unwrap(), "{}", d[second].1);
+        assert!(
+            d[second].1.contains("相同原因的斷線已改記 WARN"),
+            "{}",
+            d[second].1
+        );
+        // 視窗內（即使連續失敗已超過 retry.max_retries）改記 WARN，提示仍在
+        for (level, msg) in &d[1..second] {
+            assert_eq!(*level, log::Level::Warn, "{msg}");
+            assert!(msg.contains("auth_failed") && msg.contains("SAN"), "{msg}");
+        }
+        assert!(second > 5, "應涵蓋超過 max_retries 的情況：{second}");
+        assert!(dials[second] - dials[0] >= ATTENTION_LOG_WINDOW);
+        assert!(dials[second - 1] - dials[0] < ATTENTION_LOG_WINDOW);
+    }
+
+    fn test_sample(n: u32) -> Sample {
+        Sample {
+            ts: format!("t{n}"),
+            cpu_usage: 1.0,
+            total_memory: 2,
+            used_memory: 1,
+        }
+    }
+
+    /// 測試用伺服器：回覆 hello_ack，把收到的 report 交給回傳的接收端，並送出 `lines` 送來的每一行；
+    /// `lines` 的傳送端全部關閉時關閉連線。
+    fn spawn_report_server(
+        server: DuplexStream,
+    ) -> (
+        mpsc::UnboundedReceiver<serde_json::Value>,
+        mpsc::UnboundedSender<String>,
+    ) {
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello(&mut f).await;
+            loop {
+                tokio::select! {
+                    line = f.next() => {
+                        let Some(Ok(line)) = line else { return };
+                        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if v["type"] == "report" {
+                            let _ = seen_tx.send(v);
+                        }
+                    }
+                    line = line_rx.recv() => {
+                        let Some(line) = line else { return };
+                        if f.send(line).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        (seen_rx, line_tx)
+    }
+
+    #[test]
+    fn report_is_skipped_while_previous_one_is_unanswered() {
+        // R2-P9：上一筆 report 尚未收到回應時略過新取樣；ack 或帶 seq 的 error 都算回應；
+        // 斷線後未確認狀態清除
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let ((), logs) = crate::test_log::capture(|| {
+            rt.block_on(async {
+                let s = settings(60);
+                let (tx, mut rx) = mpsc::channel::<Sample>(1);
+                let (client1, server1) = duplex(64 * 1024);
+                let (client2, server2) = duplex(64 * 1024);
+                let (mut seen1, lines1) = spawn_report_server(server1);
+                let (mut seen2, lines2) = spawn_report_server(server2);
+                let one_sec = || time::sleep(Duration::from_secs(1));
+
+                let client = async {
+                    let (err, registered) = serve_with_reports(client1, &s, &mut rx).await;
+                    assert!(registered && matches!(err, SessionError::ClosedByServer), "{err:?}");
+                    let (err, registered) = serve_with_reports(client2, &s, &mut rx).await;
+                    assert!(registered && matches!(err, SessionError::ClosedByServer), "{err:?}");
+                };
+                let driver = async {
+                    one_sec().await;
+                    tx.send(test_sample(1)).await.unwrap();
+                    let r1 = seen1.recv().await.unwrap();
+                    assert_eq!(r1["ts"], "t1");
+                    // 未回應期間的取樣全部略過
+                    for n in 2..=4 {
+                        tx.send(test_sample(n)).await.unwrap();
+                        one_sec().await;
+                    }
+                    assert!(seen1.try_recv().is_err(), "未回應時不得再送 report");
+                    // 收到 ack 後恢復送出
+                    lines1
+                        .send(format!(r#"{{"type":"ack","seq":{}}}"#, r1["seq"]))
+                        .unwrap();
+                    one_sec().await;
+                    tx.send(test_sample(5)).await.unwrap();
+                    let r2 = seen1.recv().await.unwrap();
+                    assert_eq!(r2["ts"], "t5");
+                    // storage_unavailable（帶 seq 的 error）也算回應
+                    lines1
+                        .send(format!(
+                            r#"{{"type":"error","seq":{},"code":"storage_unavailable","message":"disk full","fatal":false}}"#,
+                            r2["seq"]
+                        ))
+                        .unwrap();
+                    one_sec().await;
+                    tx.send(test_sample(6)).await.unwrap();
+                    let r3 = seen1.recv().await.unwrap();
+                    assert_eq!(r3["ts"], "t6");
+                    // r3 未回應就斷線
+                    drop(lines1);
+                    one_sec().await;
+                    // 新連線不受上一條連線未確認的 report 影響
+                    tx.send(test_sample(7)).await.unwrap();
+                    let r4 = seen2.recv().await.unwrap();
+                    assert_eq!(r4["ts"], "t7");
+                    drop(lines2);
+                };
+                tokio::join!(client, driver);
+            })
+        });
+        let skipped: Vec<_> = logs
+            .iter()
+            .filter(|(_, m)| m.contains("尚未收到伺服器回應"))
+            .collect();
+        // 3 次略過在 10 秒節流視窗內只記一則 WARN
+        assert_eq!(skipped.len(), 1, "{logs:?}");
+        assert_eq!(skipped[0].0, log::Level::Warn);
+        assert!(
+            skipped[0].1.contains("ts=t2") && skipped[0].1.contains("已略過 1 次"),
+            "{}",
+            skipped[0].1
+        );
     }
 }
