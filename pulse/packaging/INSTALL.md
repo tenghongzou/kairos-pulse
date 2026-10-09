@@ -286,7 +286,7 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
    | `無法註冊：unsupported_version（…）`、`無法註冊：proto_mismatch（…）` | 協定版本不符，請更新 Pulse 或 Kairos |
    | `無法註冊：superseded（…）` | 連續被同一 agent_id 的其他連線取代，多台主機可能共用同一份 `agent.id` |
 
-   括號內是簡短的處理提示，完整訊息在日誌。`Status:` 行需要 unit 中的 `NotifyAccess=main`（只用來更新狀態文字，`Type` 仍為 `simple`）；**舊版 unit 沒有這一行時不會出現 `Status:` 行**，升級時請一併更新 unit（第 10 節）。
+   括號內是簡短的處理提示，完整訊息在日誌。狀態文字會隨每次重連更新：例如憑證被撤銷時，`無法註冊：certificate_rejected（…）` 只維持到下一次重連（約 1～2 秒），之後都是 `無法註冊：TLS alert CertificateRevoked（…）`；Kairos 停機時，即使本機憑證已被撤銷，也只會顯示 `重新連線中`（連不到伺服器就無法得知是否被撤銷）。監控腳本請以 `無法註冊：`、`無法連線：` 開頭判斷，不要比對完整字串。`Status:` 行需要 unit 中的 `NotifyAccess=main`（只用來更新狀態文字，`Type` 仍為 `simple`）；**舊版 unit 沒有這一行時不會出現 `Status:` 行**，升級時請一併更新 unit（第 10 節）。
 
 2. **`journalctl -u pulse -p err`**：上述錯誤（伺服器憑證驗證失敗、伺服器送來的致命錯誤與註冊前的錯誤、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕），以及本機客戶端憑證已過期，會在寫 `ERROR` 日誌的同時寫一行到 stderr，內容與日誌的 `ERROR` 行相同，在 journal 中以 err 等級記錄，可用 `-p err` 篩選。第一次發生就記 `ERROR`，同一原因每 10 分鐘最多一行（其餘次數在 `logs/` 記 `WARN`），原因改變時立即再記。一般連線錯誤（`重新連線中`：拒絕連線、逾時、連線被重設等）不寫 stderr，只在 `logs/`。
 
@@ -346,7 +346,7 @@ install -m 644 "$AGENT_ID.csr" /tmp/  # 把 /tmp/<agent_id>.csr 交給 Kairos �
 
 ```bash
 # 5. 憑證與設定（第 6、6.1 節）
-cd /home/<帳號>/pulse-files                                    # 取回的 client.pem 所在目錄
+cd /home/<帳號>/pulse-files-$N                                # 這個實例的 client.pem 所在目錄；每個實例用不同目錄，避免同名的 client.pem 互相覆蓋
 install -o root -g pulse -m 644 client.pem          /opt/pulse-$N/client.pem
 install -o root -g pulse -m 644 /opt/pulse/ca.pem   /opt/pulse-$N/ca.pem
 # pulse.toml 中的路徑都是相對於工作目錄，可直接沿用第一個實例的設定
@@ -431,7 +431,10 @@ rm -rf /etc/systemd/system/pulse.service.d
 systemctl daemon-reload
 systemctl reset-failed 'pulse.service' 'pulse-*.service' 2>/dev/null
 
-# 5. 最後才刪除目錄與使用者
+# 5. 最後才刪除目錄與使用者（先刪第 5、9 節放在 /tmp 的 CSR 副本，需要 agent.id 才找得到）
+for id in $(cat /opt/pulse/agent.id /opt/pulse-[0-9]*/agent.id 2>/dev/null); do
+  rm -f "/tmp/$id.csr"
+done
 rm -rf /opt/pulse-[0-9]*   # 多實例的工作目錄（含私鑰、agent.id 與日誌）
 rm -rf /opt/pulse          # 含共用執行檔、客戶端私鑰、agent.id 與日誌
 userdel pulse              # 同名群組 pulse 會一併移除
