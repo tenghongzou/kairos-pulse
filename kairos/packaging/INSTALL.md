@@ -298,6 +298,8 @@ systemctl status kairos --no-pager
 
 ### 9.1 確認清單
 
+以下指令需要 root（`/opt/kairos` 與其下的 `logs/`、`data/` 只有 `kairos` 使用者與 root 可讀）：請在 `sudo -i` 的 shell 中執行，或在每行前加 `sudo`。
+
 ```bash
 /opt/kairos/kairos --version                 # kairos <版本> (<commit>)
 journalctl -u kairos -n 50 --no-pager        # 啟動日誌
