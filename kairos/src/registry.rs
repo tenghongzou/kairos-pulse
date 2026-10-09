@@ -2,10 +2,18 @@
 //!
 //! 使用 `std::sync::Mutex`，所有方法都是同步的，鎖不會跨 `.await`。
 //! 時間由呼叫端傳入，方便單元測試。
+//!
+//! 持鎖時間（R2-K15）：除了主表之外另維護兩個索引，讓常見操作不必掃描整張表：
+//! - `connected`：連線工作仍在的 agent（數量不超過 `server.max_connections`）；sweep 判定離線、
+//!   現役連線清單與線上數都只走訪它。
+//! - `offline`：連線已結束的 agent，依離線時間排序；狀態表已滿時淘汰最舊者、sweep 清除離線超過
+//!   24 小時者都是 O(log n)。
+//!
+//! 字串欄位以 `Arc<str>` 保存，snapshot 在鎖內只複製參考計數，格式化與排序都在鎖外進行。
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -13,6 +21,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use crate::storage::fmt_time;
+use crate::tls::ChainRejection;
 
 /// 離線超過此時間的 agent 會在 sweep 時從註冊表移除
 pub const OFFLINE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -48,8 +57,8 @@ pub type ClientChain = Arc<[CertificateDer<'static>]>;
 pub enum KickReason {
     /// 同 agent_id 有新連線
     Superseded,
-    /// 重新載入 CA/CRL 後或定期檢查時，客戶端憑證已被撤銷、過期或不再受信任
-    CertificateRejected(String),
+    /// 重新載入 CA/CRL 後或定期檢查時，客戶端憑證已被撤銷、過期、不再受信任，或無法判定撤銷狀態
+    CertificateRejected(ChainRejection),
 }
 
 /// 一條現役連線（用於重新驗證客戶端憑證）
@@ -74,17 +83,17 @@ pub struct LastReport {
 #[derive(Debug)]
 pub struct AgentState {
     pub conn_id: u64,
-    pub peer: String,
-    pub hostname: String,
-    pub agent_version: String,
+    pub peer: Arc<str>,
+    pub hostname: Arc<str>,
+    pub agent_version: Arc<str>,
     pub online: bool,
     pub offline_after: Duration,
     pub last_seen: Instant,
     pub last_seen_wall: DateTime<Utc>,
     pub connected_at: DateTime<Utc>,
-    /// 被標記為離線的時間（線上時為 `None`），用於 24 小時清除
+    /// 被標記為離線的時間（線上時為 `None`），用於淘汰與 24 小時清除
     pub offline_since: Option<Instant>,
-    pub last_report: Option<LastReport>,
+    pub last_report: Option<Arc<LastReport>>,
     /// 握手時的客戶端憑證鏈；只在連線期間保留（重新驗證用），斷線時清除
     pub client_chain: Option<ClientChain>,
     /// 連線仍在且尚未被通知結束時為 Some；用來通知該連線結束
@@ -92,22 +101,12 @@ pub struct AgentState {
     /// 連線工作是否仍在（從 register 到 disconnect）。被 kick 後、連線尚未結束前 `kick` 已是
     /// `None`，但這裡仍為 `true`
     pub connected: bool,
+    /// 在離線索引中的 key（連線已結束時為 `Some`）
+    offline_key: Option<OfflineKey>,
 }
 
-impl AgentState {
-    fn mark_offline(&mut self, now: Instant) {
-        self.online = false;
-        self.offline_since.get_or_insert(now);
-    }
-
-    /// 連線結束：標記離線，並釋放只在連線期間需要的資源
-    fn mark_disconnected(&mut self, now: Instant) {
-        self.kick = None;
-        self.connected = false;
-        self.client_chain = None;
-        self.mark_offline(now);
-    }
-}
+/// 離線索引的 key：(離線時間, 序號)；序號讓同一時間離線的多個 agent 不會衝突
+type OfflineKey = (Instant, u64);
 
 /// 註冊結果的種類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +136,11 @@ pub struct Registration {
     pub evicted: Option<Evicted>,
 }
 
-/// 狀態表已達上限，且沒有可淘汰的離線 agent
+/// 狀態表已達上限，且沒有可淘汰的離線 agent。
+///
+/// 防禦性檢查：設定要求 `limits.max_agents >= server.max_connections`，而連線工作仍在的 agent
+/// 不超過同時連線數（含這次註冊的連線），因此表滿時一定有連線已結束、可淘汰的 agent，
+/// 正常情況下走不到這裡（R2-K22）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistryFull {
     pub max_agents: usize,
@@ -150,7 +153,7 @@ pub enum Touch {
     Updated,
     /// 本連線是現役連線，且 agent 先前被 sweep 判定離線，現已恢復上線
     Revived,
-    /// 本連線已不是該 agent 的現役連線（已被取代或已被清除），未做任何更新
+    /// 本連線已不是該 agent 的現役連線（已被取代、已結束或已被清除），未做任何更新
     Stale,
 }
 
@@ -200,23 +203,80 @@ pub struct RegistrySnapshot {
     pub agents: Vec<AgentSnapshot>,
 }
 
-/// 持鎖期間只複製原始欄位，時間格式化與排序在鎖外進行
+/// 持鎖期間只複製參考計數與數值欄位，字串複製、時間格式化與排序在鎖外進行
 struct RawAgent {
-    agent_id: String,
-    hostname: String,
-    agent_version: String,
-    peer: String,
+    agent_id: Arc<str>,
+    hostname: Arc<str>,
+    agent_version: Arc<str>,
+    peer: Arc<str>,
     online: bool,
     conn_id: u64,
     connected_at: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     offline_after: Duration,
-    last_report: Option<LastReport>,
+    last_report: Option<Arc<LastReport>>,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    agents: HashMap<Arc<str>, AgentState>,
+    /// 連線工作仍在的 agent
+    connected: HashSet<Arc<str>>,
+    /// 連線已結束的 agent，依離線時間排序
+    offline: BTreeMap<OfflineKey, Arc<str>>,
+    next_offline_seq: u64,
+}
+
+impl Inner {
+    /// 連線結束：標記離線、釋放只在連線期間需要的資源，並移入離線索引
+    fn mark_disconnected(&mut self, agent_id: &Arc<str>, now: Instant) {
+        let seq = self.next_offline_seq;
+        let Some(state) = self.agents.get_mut(agent_id) else {
+            return;
+        };
+        state.kick = None;
+        state.connected = false;
+        state.client_chain = None;
+        state.online = false;
+        let since = *state.offline_since.get_or_insert(now);
+        if state.offline_key.is_none() {
+            let key = (since, seq);
+            state.offline_key = Some(key);
+            self.offline.insert(key, agent_id.clone());
+            self.next_offline_seq += 1;
+        }
+        self.connected.remove(agent_id);
+    }
+
+    /// 從主表與兩個索引移除
+    fn remove(&mut self, agent_id: &str) -> Option<AgentState> {
+        let state = self.agents.remove(agent_id)?;
+        if let Some(key) = state.offline_key {
+            self.offline.remove(&key);
+        }
+        self.connected.remove(agent_id);
+        Some(state)
+    }
+
+    /// 移除連線已結束、離線最久的 agent；沒有可淘汰者時回傳 `None`
+    fn evict_oldest_offline(&mut self, now: Instant) -> Option<Evicted> {
+        let (_, agent_id) = self.offline.first_key_value()?;
+        let agent_id = agent_id.clone();
+        let state = self.remove(&agent_id)?;
+        Some(Evicted {
+            agent_id: agent_id.to_string(),
+            hostname: state.hostname.to_string(),
+            offline_for: state
+                .offline_since
+                .map(|since| now.saturating_duration_since(since))
+                .unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Debug)]
 pub struct Registry {
-    agents: Mutex<HashMap<String, AgentState>>,
+    inner: Mutex<Inner>,
     /// 狀態表最多保留的 agent 數（`limits.max_agents`）
     max_agents: usize,
 }
@@ -235,14 +295,14 @@ impl Registry {
 
     pub fn with_max_agents(max_agents: usize) -> Self {
         Self {
-            agents: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner::default()),
             max_agents: max_agents.max(1),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, AgentState>> {
+    fn lock(&self) -> MutexGuard<'_, Inner> {
         // 持鎖期間不會 panic（只有簡單的欄位更新），即使被污染也沿用內部資料
-        self.agents.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 以 hello 登記連線。若同 agent_id 已有連線，通知舊連線被取代。
@@ -256,19 +316,19 @@ impl Registry {
         now: Instant,
         now_wall: DateTime<Utc>,
     ) -> Result<Registration, RegistryFull> {
-        let mut agents = self.lock();
+        let mut inner = self.lock();
         let mut evicted = None;
-        if !agents.contains_key(&info.agent_id) && agents.len() >= self.max_agents {
-            evicted = Some(
-                Self::evict_oldest_offline(&mut agents, now).ok_or(RegistryFull {
-                    max_agents: self.max_agents,
-                })?,
-            );
+        if !inner.agents.contains_key(info.agent_id.as_str())
+            && inner.agents.len() >= self.max_agents
+        {
+            evicted = Some(inner.evict_oldest_offline(now).ok_or(RegistryFull {
+                max_agents: self.max_agents,
+            })?);
         }
         let (tx, rx) = oneshot::channel();
-        let (kind, last_report) = match agents.get_mut(&info.agent_id) {
-            None => (RegisterKind::New, None),
-            Some(prev) => {
+        let (kind, last_report, key) = match inner.remove(&info.agent_id) {
+            None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
+            Some(mut prev) => {
                 let previous_conn_id = prev.conn_id;
                 let kind = match prev.kick.take() {
                     // 舊連線仍在：通知它被取代。接收端已結束時 send 會失敗，可忽略。
@@ -280,16 +340,21 @@ impl Registry {
                     None if prev.connected => RegisterKind::Superseded { previous_conn_id },
                     None => RegisterKind::Reconnected,
                 };
-                (kind, prev.last_report.take())
+                (
+                    kind,
+                    prev.last_report.take(),
+                    Arc::<str>::from(info.agent_id),
+                )
             }
         };
-        agents.insert(
-            info.agent_id,
+        inner.connected.insert(key.clone());
+        inner.agents.insert(
+            key,
             AgentState {
                 conn_id,
-                peer: info.peer,
-                hostname: info.hostname,
-                agent_version: info.agent_version,
+                peer: info.peer.into(),
+                hostname: info.hostname.into(),
+                agent_version: info.agent_version.into(),
                 online: true,
                 offline_after: info.offline_after,
                 last_seen: now,
@@ -300,6 +365,7 @@ impl Registry {
                 client_chain: info.client_chain,
                 kick: Some(tx),
                 connected: true,
+                offline_key: None,
             },
         );
         Ok(Registration {
@@ -309,45 +375,27 @@ impl Registry {
         })
     }
 
-    /// 移除連線已結束、離線最久的 agent；沒有可淘汰者時回傳 `None`
-    fn evict_oldest_offline(
-        agents: &mut HashMap<String, AgentState>,
-        now: Instant,
-    ) -> Option<Evicted> {
-        let agent_id = agents
-            .iter()
-            .filter(|(_, s)| !s.connected && !s.online)
-            .min_by_key(|(_, s)| s.offline_since.unwrap_or(now))
-            .map(|(id, _)| id.clone())?;
-        let state = agents.remove(&agent_id)?;
-        Some(Evicted {
-            agent_id,
-            hostname: state.hostname,
-            offline_for: state
-                .offline_since
-                .map(|since| now.saturating_duration_since(since))
-                .unwrap_or_default(),
-        })
-    }
-
-    /// 列出仍有連線的 agent 與其客戶端憑證鏈
+    /// 列出仍有連線（且尚未被通知結束）的 agent 與其客戶端憑證鏈
     pub fn live_connections(&self) -> Vec<LiveConnection> {
-        let agents = self.lock();
-        agents
+        let inner = self.lock();
+        inner
+            .connected
             .iter()
-            .filter(|(_, s)| s.kick.is_some())
-            .map(|(agent_id, s)| LiveConnection {
-                agent_id: agent_id.clone(),
-                conn_id: s.conn_id,
-                client_chain: s.client_chain.clone(),
+            .filter_map(|agent_id| {
+                let s = inner.agents.get(agent_id)?;
+                s.kick.is_some().then(|| LiveConnection {
+                    agent_id: agent_id.to_string(),
+                    conn_id: s.conn_id,
+                    client_chain: s.client_chain.clone(),
+                })
             })
             .collect()
     }
 
     /// 通知指定連線結束；conn_id 不符或連線已結束時回傳 `false`
     pub fn kick(&self, agent_id: &str, conn_id: u64, reason: KickReason) -> bool {
-        let mut agents = self.lock();
-        match agents.get_mut(agent_id) {
+        let mut inner = self.lock();
+        match inner.agents.get_mut(agent_id) {
             Some(state) if state.conn_id == conn_id => match state.kick.take() {
                 Some(kick) => kick.send(reason).is_ok(),
                 None => false,
@@ -356,7 +404,7 @@ impl Registry {
         }
     }
 
-    /// 收到合法訊息時更新 last_seen。conn_id 不符（已被取代或已被清除）時不做任何更新。
+    /// 收到合法訊息時更新 last_seen。conn_id 不符（已被取代或已被清除）或連線已結束時不做任何更新。
     pub fn touch(
         &self,
         agent_id: &str,
@@ -364,9 +412,9 @@ impl Registry {
         now: Instant,
         now_wall: DateTime<Utc>,
     ) -> Touch {
-        let mut agents = self.lock();
-        match agents.get_mut(agent_id) {
-            Some(state) if state.conn_id == conn_id => {
+        let mut inner = self.lock();
+        match inner.agents.get_mut(agent_id) {
+            Some(state) if state.conn_id == conn_id && state.connected => {
                 state.last_seen = now;
                 state.last_seen_wall = now_wall;
                 let revived = !state.online;
@@ -382,29 +430,30 @@ impl Registry {
         }
     }
 
-    /// report 已成功放入寫檔佇列後才呼叫，記錄為最近一次 report，確保 agents.json 與
-    /// reports.jsonl 一致。conn_id 不符時不更新並回傳 `false`。
+    /// report 已寫入資料檔並 flush 後才呼叫，記錄為最近一次 report，確保 agents.json 與
+    /// `reports-YYYY-MM-DD.jsonl` 一致。conn_id 不符時不更新並回傳 `false`。
     pub fn set_last_report(&self, agent_id: &str, conn_id: u64, report: LastReport) -> bool {
-        let mut agents = self.lock();
-        match agents.get_mut(agent_id) {
+        let mut inner = self.lock();
+        match inner.agents.get_mut(agent_id) {
             Some(state) if state.conn_id == conn_id => {
-                state.last_report = Some(report);
+                state.last_report = Some(Arc::new(report));
                 true
             }
             _ => false,
         }
     }
 
-    /// 關機時呼叫：把仍標記為線上的 agent 全部標為離線（例如連線工作逾時被中止，
-    /// 來不及自行 disconnect）。回傳被標記的數量。
+    /// 關機時呼叫：把仍有連線的 agent 全部標為離線（例如連線工作逾時被中止，
+    /// 來不及自行 disconnect）。回傳其中仍標記為線上的數量。
     pub fn mark_all_offline(&self, now: Instant) -> usize {
-        let mut agents = self.lock();
+        let mut inner = self.lock();
+        let ids: Vec<Arc<str>> = inner.connected.iter().cloned().collect();
         let mut count = 0;
-        for state in agents.values_mut() {
-            if state.online {
+        for agent_id in &ids {
+            if inner.agents.get(agent_id).is_some_and(|s| s.online) {
                 count += 1;
             }
-            state.mark_disconnected(now);
+            inner.mark_disconnected(agent_id, now);
         }
         count
     }
@@ -412,54 +461,62 @@ impl Registry {
     /// 連線結束。conn_id 不符（舊連線被取代後才結束）時忽略。
     /// 回傳 `true` 表示這次呼叫把 agent 從線上改為離線。
     pub fn disconnect(&self, agent_id: &str, conn_id: u64, now: Instant) -> bool {
-        let mut agents = self.lock();
-        match agents.get_mut(agent_id) {
-            Some(state) if state.conn_id == conn_id => {
-                let was_online = state.online;
-                state.mark_disconnected(now);
-                was_online
-            }
-            _ => false,
+        let mut inner = self.lock();
+        let Some((key, state)) = inner.agents.get_key_value(agent_id) else {
+            return false;
+        };
+        if state.conn_id != conn_id || !state.connected {
+            return false;
         }
+        let was_online = state.online;
+        let key = key.clone();
+        inner.mark_disconnected(&key, now);
+        was_online
     }
 
     /// 將 last_seen 超過 offline_after 的線上 agent 標為離線，
     /// 並移除離線超過 [`OFFLINE_RETENTION`] 且已無連線的 agent。
     pub fn sweep(&self, now: Instant) -> SweepResult {
         let mut result = SweepResult::default();
-        let mut agents = self.lock();
-        agents.retain(|agent_id, state| {
-            if state.online {
-                let silent_for = now.saturating_duration_since(state.last_seen);
-                if silent_for > state.offline_after {
-                    state.mark_offline(now);
-                    result.went_offline.push(WentOffline {
-                        agent_id: agent_id.clone(),
-                        hostname: state.hostname.clone(),
-                        silent_for,
-                    });
-                }
-                return true;
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        // 只走訪仍有連線的 agent（線上的 agent 一定仍有連線）
+        for agent_id in &inner.connected {
+            let Some(state) = inner.agents.get_mut(agent_id) else {
+                continue;
+            };
+            if !state.online {
+                continue;
             }
-            // 仍有連線時不移除，等連線結束後再計算
-            if state.connected {
-                return true;
+            let silent_for = now.saturating_duration_since(state.last_seen);
+            if silent_for > state.offline_after {
+                state.online = false;
+                state.offline_since.get_or_insert(now);
+                result.went_offline.push(WentOffline {
+                    agent_id: agent_id.to_string(),
+                    hostname: state.hostname.to_string(),
+                    silent_for,
+                });
             }
-            let offline_for = state
-                .offline_since
-                .map(|since| now.saturating_duration_since(since))
-                .unwrap_or_default();
-            if offline_for > OFFLINE_RETENTION {
+        }
+        // 離線索引依時間排序：從最舊的開始，直到遇到未滿 24 小時者
+        while let Some((&(since, _), _)) = inner.offline.first_key_value() {
+            let offline_for = now.saturating_duration_since(since);
+            if offline_for <= OFFLINE_RETENTION {
+                break;
+            }
+            let Some((_, agent_id)) = inner.offline.pop_first() else {
+                break;
+            };
+            if let Some(state) = inner.agents.remove(&agent_id) {
                 result.removed.push(Removed {
-                    agent_id: agent_id.clone(),
-                    hostname: state.hostname.clone(),
+                    agent_id: agent_id.to_string(),
+                    hostname: state.hostname.to_string(),
                     offline_for,
                 });
-                return false;
             }
-            true
-        });
-        drop(agents);
+        }
+        drop(guard);
         result
             .went_offline
             .sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -469,17 +526,22 @@ impl Registry {
 
     /// （線上數, 總數）
     pub fn counts(&self) -> (usize, usize) {
-        let agents = self.lock();
-        let online = agents.values().filter(|s| s.online).count();
-        (online, agents.len())
+        let inner = self.lock();
+        let online = inner
+            .connected
+            .iter()
+            .filter(|id| inner.agents.get(*id).is_some_and(|s| s.online))
+            .count();
+        (online, inner.agents.len())
     }
 
     /// 產生 agents.json 用的快照（依 agent_id 排序）。
-    /// 持鎖期間只複製欄位；時間格式化、排序與序列化都在鎖外進行。
+    /// 持鎖期間只複製參考計數與數值；字串複製、時間格式化、排序與序列化都在鎖外進行。
     pub fn snapshot(&self, now_wall: DateTime<Utc>) -> RegistrySnapshot {
         let raw: Vec<RawAgent> = {
-            let agents = self.lock();
-            agents
+            let inner = self.lock();
+            inner
+                .agents
                 .iter()
                 .map(|(agent_id, s)| RawAgent {
                     agent_id: agent_id.clone(),
@@ -499,16 +561,16 @@ impl Registry {
         let mut list: Vec<AgentSnapshot> = raw
             .into_iter()
             .map(|r| AgentSnapshot {
-                agent_id: r.agent_id,
-                hostname: r.hostname,
-                agent_version: r.agent_version,
-                peer: r.peer,
+                agent_id: r.agent_id.to_string(),
+                hostname: r.hostname.to_string(),
+                agent_version: r.agent_version.to_string(),
+                peer: r.peer.to_string(),
                 online: r.online,
                 conn_id: r.conn_id,
                 connected_at: fmt_time(r.connected_at),
                 last_seen: fmt_time(r.last_seen),
                 offline_after_ms: u64::try_from(r.offline_after.as_millis()).unwrap_or(u64::MAX),
-                last_report: r.last_report,
+                last_report: r.last_report.map(|r| (*r).clone()),
             })
             .collect();
         list.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -518,6 +580,38 @@ impl Registry {
             total: list.len(),
             agents: list,
         }
+    }
+
+    /// 兩個索引與主表一致（測試用）
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        let inner = self.lock();
+        for (id, s) in &inner.agents {
+            assert_eq!(s.connected, inner.connected.contains(id), "{id}");
+            assert_eq!(s.connected, s.offline_key.is_none(), "{id}");
+            if s.online {
+                assert!(s.connected, "{id}");
+            }
+            if let Some(key) = s.offline_key {
+                assert_eq!(inner.offline.get(&key), Some(id));
+            }
+        }
+        assert!(
+            inner
+                .connected
+                .iter()
+                .all(|id| inner.agents.contains_key(id))
+        );
+        assert!(
+            inner
+                .offline
+                .values()
+                .all(|id| inner.agents.contains_key(id))
+        );
+        assert_eq!(
+            inner.connected.len() + inner.offline.len(),
+            inner.agents.len()
+        );
     }
 }
 
@@ -548,6 +642,10 @@ mod tests {
         }
     }
 
+    fn rejected(reason: &str) -> KickReason {
+        KickReason::CertificateRejected(ChainRejection::new(reason, None))
+    }
+
     fn ids_offline(r: &SweepResult) -> Vec<&str> {
         r.went_offline.iter().map(|g| g.agent_id.as_str()).collect()
     }
@@ -572,6 +670,7 @@ mod tests {
             .unwrap();
         assert_eq!(reg.kind, RegisterKind::New);
         assert_eq!(r.counts(), (1, 1));
+        r.assert_consistent();
     }
 
     #[test]
@@ -609,6 +708,9 @@ mod tests {
         assert_eq!(r.counts(), (0, 1));
         // 重複呼叫不再回報狀態變化
         assert!(!r.disconnect("a", 2, t0));
+        // 連線已結束：touch 不再更新
+        assert_eq!(r.touch("a", 2, t0, Utc::now()), Touch::Stale);
+        r.assert_consistent();
     }
 
     #[test]
@@ -626,6 +728,7 @@ mod tests {
         assert_eq!(snap.agents[0].last_report.as_ref().map(|r| r.seq), Some(7));
         assert_eq!(snap.agents[0].conn_id, 2);
         assert!(snap.agents[0].online);
+        r.assert_consistent();
     }
 
     #[test]
@@ -671,14 +774,11 @@ mod tests {
         assert!(live[1].client_chain.is_none());
 
         // conn_id 不符不踢
-        assert!(!r.kick("a", 99, KickReason::CertificateRejected("x".into())));
+        assert!(!r.kick("a", 99, rejected("x")));
         assert_eq!(a.kick.try_recv(), Err(TryRecvError::Empty));
         // 踢掉 a
-        assert!(r.kick("a", 1, KickReason::CertificateRejected("revoked".into())));
-        assert_eq!(
-            a.kick.try_recv(),
-            Ok(KickReason::CertificateRejected("revoked".into()))
-        );
+        assert!(r.kick("a", 1, rejected("revoked")));
+        assert_eq!(a.kick.try_recv(), Ok(rejected("revoked")));
         // 已踢過不再出現在現役清單，也不能重複踢
         assert!(!r.kick("a", 1, KickReason::Superseded));
         assert_eq!(r.live_connections().len(), 1);
@@ -686,6 +786,7 @@ mod tests {
         // 連線結束後不在清單中
         r.disconnect("b", 2, t0);
         assert!(r.live_connections().is_empty());
+        r.assert_consistent();
     }
 
     #[test]
@@ -699,6 +800,7 @@ mod tests {
         assert_eq!(r.counts(), (0, 2));
         assert!(r.snapshot(Utc::now()).agents.iter().all(|a| !a.online));
         assert_eq!(r.mark_all_offline(t0), 0);
+        r.assert_consistent();
     }
 
     #[test]
@@ -729,6 +831,7 @@ mod tests {
         let res = r.sweep(t0 + Duration::from_millis(8001));
         assert_eq!(ids_offline(&res), ["b"]);
         assert_eq!(r.counts(), (0, 2));
+        r.assert_consistent();
     }
 
     #[test]
@@ -746,6 +849,7 @@ mod tests {
             Touch::Revived
         );
         assert_eq!(r.counts(), (1, 1));
+        r.assert_consistent();
     }
 
     #[test]
@@ -790,10 +894,12 @@ mod tests {
         // c 仍有連線，保留
         assert_eq!(r.counts(), (0, 1));
         assert_eq!(r.snapshot(Utc::now()).agents[0].agent_id, "c");
+        r.assert_consistent();
 
         // 被移除的 agent 再出現時視為新 agent
         let reg = r.register(4, hello("a", "p"), t0, Utc::now()).unwrap();
         assert_eq!(reg.kind, RegisterKind::New);
+        r.assert_consistent();
     }
 
     #[test]
@@ -815,6 +921,7 @@ mod tests {
             ids_removed(&r.sweep(t1 + OFFLINE_RETENTION + Duration::from_secs(1))),
             ["a"]
         );
+        r.assert_consistent();
     }
 
     #[test]
@@ -850,6 +957,7 @@ mod tests {
             .map(|a| a.agent_id)
             .collect();
         assert_eq!(ids, ["a", "c", "d"]);
+        r.assert_consistent();
     }
 
     #[test]
@@ -867,7 +975,7 @@ mod tests {
 
         // 被 sweep 判定離線但連線仍在、或已被 kick 但尚未關閉的連線都不可淘汰
         r.sweep(t0 + Duration::from_secs(10));
-        assert!(r.kick("a", 1, KickReason::CertificateRejected("x".into())));
+        assert!(r.kick("a", 1, rejected("x")));
         assert!(r.register(3, hello("c", "p"), t0, Utc::now()).is_err());
 
         // 既有 agent 的取代不受上限影響
@@ -892,6 +1000,29 @@ mod tests {
             }
             assert!(r.counts().1 <= 2);
         }
+        r.assert_consistent();
+    }
+
+    #[test]
+    fn eviction_uses_the_offline_index_in_time_order() {
+        // R2-K15：表滿時依離線時間淘汰，不必掃描整張表；索引與主表保持一致
+        let r = Registry::with_max_agents(100);
+        let t0 = Instant::now();
+        for i in 0..100u64 {
+            let id = format!("a{i:03}");
+            let _ = r.register(i, hello(&id, "p"), t0, Utc::now()).unwrap();
+            // 反向的離線時間：a099 最早離線
+            assert!(r.disconnect(&id, i, t0 + Duration::from_secs(1000 - i)));
+        }
+        for (n, expected) in ["a099", "a098", "a097"].into_iter().enumerate() {
+            let id = format!("new{n}");
+            let reg = r
+                .register(1000 + n as u64, hello(&id, "p"), t0, Utc::now())
+                .unwrap();
+            assert_eq!(reg.evicted.unwrap().agent_id, expected);
+        }
+        assert_eq!(r.counts(), (3, 100));
+        r.assert_consistent();
     }
 
     #[test]
@@ -900,7 +1031,7 @@ mod tests {
         let r = Registry::new();
         let t0 = Instant::now();
         let _old = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
-        assert!(r.kick("a", 1, KickReason::CertificateRejected("revoked".into())));
+        assert!(r.kick("a", 1, rejected("revoked")));
         let new = r.register(2, hello("a", "p"), t0, Utc::now()).unwrap();
         assert_eq!(
             new.kind,
@@ -911,6 +1042,7 @@ mod tests {
         // 舊連線之後才結束：conn_id 不符，不影響新連線
         assert!(!r.disconnect("a", 1, t0));
         assert_eq!(r.counts(), (1, 1));
+        r.assert_consistent();
     }
 
     #[test]
@@ -928,9 +1060,9 @@ mod tests {
         assert_eq!(Arc::strong_count(&chain), 3);
 
         assert!(r.disconnect("a", 1, t0));
-        assert!(r.lock().get("a").unwrap().client_chain.is_none());
+        assert!(r.lock().agents.get("a").unwrap().client_chain.is_none());
         r.mark_all_offline(t0);
-        assert!(r.lock().get("b").unwrap().client_chain.is_none());
+        assert!(r.lock().agents.get("b").unwrap().client_chain.is_none());
         assert_eq!(Arc::strong_count(&chain), 1);
     }
 
@@ -948,5 +1080,6 @@ mod tests {
         assert_eq!(snap.agents[1].agent_id, "b");
         assert!(!snap.agents[1].online);
         assert_eq!(snap.agents[0].offline_after_ms, 5000);
+        assert_eq!(snap.agents[0].hostname, "host-a");
     }
 }

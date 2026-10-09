@@ -7,6 +7,7 @@ mod logger;
 mod monitor;
 mod per_ip;
 mod protocol;
+mod rate;
 mod registry;
 mod reload;
 mod retention;
@@ -18,8 +19,8 @@ mod throttle;
 mod tls;
 
 use log::{debug, error, info, warn};
-use std::io::Error;
-use std::path::Path;
+use std::io::{Error, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,24 +33,51 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::BindingPolicy;
 use crate::config::{AppConfig, CliAction, USAGE, parse_args};
 use crate::connection::{ConnContext, handle_connection, is_peer_disconnect};
-use crate::per_ip::PerIpLimiter;
+use crate::per_ip::{PerIpLimiter, Rejected};
+use crate::rate::ReportLimiter;
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::{CONNECTIONS_DEADLINE, MONITOR_DEADLINE, Shutdown, WRITER_DEADLINE};
 use crate::throttle::{Category, LogThrottle};
 use crate::tls::{TlsPaths, TlsState};
 
-/// accept 失敗後的等待時間（例如檔案描述符用盡）
+/// accept 因資源問題失敗（例如檔案描述符用盡）後的等待時間
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// 等待新連線期間檢查「是否已解除飽和」的間隔
 const SATURATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `block_on` 返回後，等待 blocking 執行緒（例如卡住的 fsync）結束的上限；
+/// 超過就不再等待，讓行程以 `run` 的結果結束（R2-K17）
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 除了連線之外，行程需要的檔案描述符（日誌、資料檔、TLS 設定檔、listener 等）的估計量
+const FD_RESERVE: u64 = 64;
+
+/// 「握手中」（已 accept、尚未通過 hello）連線數的上限：`max_connections` 的一半（至少 1）。
+/// 其餘名額保留給已通過 hello 的連線，慢速握手無法佔滿全域名額（R2-K2）
+pub fn handshake_limit(max_connections: usize) -> usize {
+    (max_connections / 2).max(1)
+}
 
 /// 將 std 的 Instant 轉成 tokio 的 Instant，供 `timeout_at` 使用
 fn tokio_deadline(at: Instant) -> tokio::time::Instant {
     tokio::time::Instant::from_std(at)
 }
 
-/// 監看應持續執行到關機的背景工作（report writer、monitor、TLS 重載）。
+/// accept 失敗是否只與該條連線有關（對方在 accept 前就重設或中止連線、被訊號中斷等）。
+/// 這類錯誤直接接受下一條連線；其他錯誤（例如檔案描述符用盡）才等待後重試（R2-K14）
+fn accept_error_is_per_connection(e: &Error) -> bool {
+    is_peer_disconnect(e)
+        || matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::Interrupted
+                | ErrorKind::WouldBlock
+                | ErrorKind::TimedOut
+        )
+}
+
+/// 監看應持續執行到關機的背景工作（report writer、monitor、TLS 重載、日誌清除）。
 /// 在關機前結束（不論 panic 或正常返回）都是異常：記 ERROR 並觸發關機，
 /// 而不是等到關機時才發現。關機期間的結束屬正常，只有 panic 才記錄。
 fn supervise(name: &'static str, task: JoinHandle<()>, shutdown: Arc<Shutdown>) -> JoinHandle<()> {
@@ -111,8 +139,9 @@ impl Saturation {
     }
 }
 
-/// accept 迴圈：先取得全域連線名額再 accept，再取得來源 IP 的名額，為每條連線啟動
-/// [`handle_connection`]，直到關機。回傳仍在執行的連線（listener 隨之釋放，不再接受新連線）。
+/// accept 迴圈：先取得全域連線名額再 accept，再取得來源的名額（同時連線數與新連線速率）與
+/// 「握手中」的名額，為每條連線啟動 [`handle_connection`]，直到關機。
+/// 回傳仍在執行的連線（listener 隨之釋放，不再接受新連線）。
 pub(crate) async fn accept_loop(
     listener: TcpListener,
     ctx: Arc<ConnContext>,
@@ -122,6 +151,8 @@ pub(crate) async fn accept_loop(
     let shutdown = ctx.shutdown.clone();
     let throttle = ctx.throttle.clone();
     let limit = Arc::new(Semaphore::new(max_connections));
+    let max_handshakes = handshake_limit(max_connections);
+    let handshakes = Arc::new(Semaphore::new(max_handshakes));
     let mut connections = JoinSet::new();
     let mut saturation = Saturation::new(max_connections);
     let mut saturation_check = interval(SATURATION_CHECK_INTERVAL);
@@ -174,28 +205,67 @@ pub(crate) async fn accept_loop(
         };
         let (socket, peer) = match accepted {
             Ok(conn) => conn,
+            // 只與該條連線有關的錯誤：直接接受下一條，不等待
+            Err(e) if accept_error_is_per_connection(&e) => {
+                debug!("接受連線失敗（只影響該條連線）: {}", e);
+                drop(permit);
+                continue;
+            }
             Err(e) => {
-                // 接受連線失敗（例如檔案描述符用盡）不應讓整個伺服器結束，稍候再重試；
-                // 可能每 100 ms 發生一次，節流記錄
+                // 資源問題（例如檔案描述符用盡）不應讓整個伺服器結束，稍候再重試；
+                // 可能每 100 ms 發生一次，節流記錄。等待期間仍可關機
                 throttled!(throttle, Category::Accept, error, "接受連線失敗: {}", e);
                 drop(permit);
-                sleep(ACCEPT_RETRY_DELAY).await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'accept,
+                    _ = sleep(ACCEPT_RETRY_DELAY) => {}
+                }
                 continue;
             }
         };
-        // 每個來源 IP 的同時連線數上限：超過時立即關閉，不進行 TLS 握手
-        let Some(ip_permit) = per_ip.try_acquire(peer.ip()) else {
-            throttled!(
-                throttle,
-                (Category::PerIpLimit, per_ip::normalize_ip(peer.ip())),
-                warn,
-                "來自 {} 的同時連線數已達上限 {}（server.max_connections_per_ip），拒絕新連線",
-                peer.ip(),
-                per_ip.max_per_ip()
-            );
-            drop(socket);
-            drop(permit);
-            continue;
+        // 每個來源的同時連線數與新連線速率上限：超過時立即關閉，不進行 TLS 握手
+        // 依序檢查：該位址的同時連線數 → 握手中的連線數上限（保留名額給已通過 hello 的連線）→
+        // 該來源（IPv6 /64）的新連線速率。被前兩者拒絕的連線不扣速率額度。超過時立即關閉，不進行 TLS 握手
+        let mut pre_auth = None;
+        let ip_permit = match per_ip.try_acquire(peer.ip(), || {
+            pre_auth = handshakes.clone().try_acquire_owned().ok();
+            pre_auth.is_some()
+        }) {
+            Ok(p) => p,
+            Err(Rejected::Concurrency) => {
+                throttled!(
+                    throttle,
+                    (Category::PerIpLimit, peer.ip()),
+                    warn,
+                    "來自 {} 的同時連線數已達上限 {}（server.max_connections_per_ip），拒絕新連線",
+                    peer.ip(),
+                    per_ip.max_per_ip()
+                );
+                continue;
+            }
+            Err(Rejected::Gate) => {
+                throttled!(
+                    throttle,
+                    Category::HandshakeLimit,
+                    warn,
+                    "握手中（尚未通過 hello）的連線數已達上限 {}，拒絕來自 {} 的新連線",
+                    max_handshakes,
+                    peer.ip()
+                );
+                continue;
+            }
+            Err(Rejected::Rate) => {
+                throttled!(
+                    throttle,
+                    (Category::ConnectionRate, peer.ip()),
+                    warn,
+                    "來自 {} 的新連線超過每秒 {} 條（IPv6 以 /64 合併計算），拒絕新連線",
+                    peer.ip(),
+                    per_ip::NEW_CONNECTIONS_PER_SEC
+                );
+                continue;
+            }
         };
         let conn_id = next_conn_id();
         debug!("[#{}] 接收到來自 {} 的連線", conn_id, peer);
@@ -208,7 +278,7 @@ pub(crate) async fn accept_loop(
             // permit 在連線結束時釋放
             let _permit = permit;
             let _ip_permit = ip_permit;
-            match handle_connection(ctx, acceptor, socket, peer, conn_id).await {
+            match handle_connection(ctx, acceptor, socket, peer, conn_id, pre_auth).await {
                 Ok(()) => {}
                 // 對方未送 close_notify 就斷線、連線被重設或中止：屬正常的斷線情境
                 Err(e) if is_peer_disconnect(&e) => {
@@ -230,8 +300,15 @@ pub(crate) async fn accept_loop(
     Ok(connections)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// `run` 的結果對應的結束代碼：正常關機 0；因內部錯誤而關機或啟動失敗 1
+fn exit_code(result: &Result<Option<String>, Error>) -> u8 {
+    match result {
+        Ok(None) => 0,
+        Ok(Some(_)) | Err(_) => 1,
+    }
+}
+
+fn main() -> ExitCode {
     // 日誌尚未初始化前的錯誤只能輸出到 stderr
     let config_path = match parse_args(std::env::args().skip(1)) {
         Ok(CliAction::Run { config_path }) => config_path,
@@ -269,18 +346,80 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(config, config_path.as_deref(), newest_log).await {
-        Ok(None) => ExitCode::SUCCESS,
-        Ok(Some(reason)) => {
-            error!("Kairos 因內部錯誤而結束: {}", reason);
-            log::logger().flush();
-            ExitCode::FAILURE
-        }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
         Err(e) => {
-            error!("Kairos 啟動失敗: {}", e);
-            ExitCode::FAILURE
+            error!("Kairos 啟動失敗: 無法建立 tokio runtime: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(run(
+        config,
+        config_path.as_deref(),
+        newest_log,
+        RunOptions {
+            log_dir: PathBuf::from(logger::LOG_DIR),
+            shutdown: Arc::new(Shutdown::new()),
+            install_signal_handlers: true,
+        },
+    ));
+    // 不無限期等待仍在執行的 blocking 工作（例如卡住的 fsync）；看門狗另外保證行程會結束
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+
+    match &result {
+        Ok(None) => {}
+        Ok(Some(reason)) => error!("Kairos 因內部錯誤而結束: {}", reason),
+        Err(e) => error!("Kairos 啟動失敗: {}", e),
+    }
+    log::logger().flush();
+    ExitCode::from(exit_code(&result))
+}
+
+/// [`run`] 的執行環境（測試可替換）
+pub(crate) struct RunOptions {
+    /// 日誌目錄（日誌保留清除用）
+    pub log_dir: PathBuf,
+    /// 關機狀態；測試可由外部觸發
+    pub shutdown: Arc<Shutdown>,
+    /// 是否註冊 OS 關機訊號（第二次訊號強制結束、看門狗）
+    pub install_signal_handlers: bool,
+}
+
+/// 從 `/proc/self/limits` 取得可開啟檔案數的 soft limit（`unlimited` 為 `u64::MAX`）
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_nofile_soft_limit(limits: &str) -> Option<u64> {
+    let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+    let soft = line
+        .strip_prefix("Max open files")?
+        .split_whitespace()
+        .next()?;
+    if soft == "unlimited" {
+        Some(u64::MAX)
+    } else {
+        soft.parse().ok()
+    }
+}
+
+/// 可開啟檔案數的 soft limit 低於 `max_connections` 加上預留量時警告（R2-K25）。
+/// 只在 Linux 讀取 `/proc/self/limits`（不需額外依賴）；其他平台不檢查。
+fn warn_if_fd_limit_low(max_connections: usize) {
+    #[cfg(target_os = "linux")]
+    if let Ok(text) = std::fs::read_to_string("/proc/self/limits")
+        && let Some(soft) = parse_nofile_soft_limit(&text)
+    {
+        let needed = max_connections as u64 + FD_RESERVE;
+        if soft < needed {
+            warn!(
+                "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）加上預留的 {}；連線數接近上限時可能 accept 失敗（EMFILE），請提高 ulimit -n 或 systemd 的 LimitNOFILE",
+                soft, max_connections, FD_RESERVE
+            );
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (max_connections, FD_RESERVE);
 }
 
 /// 執行伺服器直到關機。正常關機回傳 `Ok(None)`；因背景工作異常而關機時回傳 `Ok(Some(原因))`
@@ -289,12 +428,20 @@ async fn run(
     config: AppConfig,
     config_path: Option<&Path>,
     newest_log: Option<chrono::NaiveDate>,
+    opts: RunOptions,
 ) -> Result<Option<String>, Error> {
     let default_file = Path::new(config::DEFAULT_CONFIG_FILE);
     match config_path {
         Some(p) => info!("設定檔: {}", p.display()),
         None if default_file.is_file() => info!("設定檔: {}", default_file.display()),
         None => info!("未找到 {}，使用程式內預設值", default_file.display()),
+    }
+    warn_if_fd_limit_low(config.server.max_connections);
+    if let Some((max, estimate)) = config.daily_limit_below_estimate() {
+        warn!(
+            "storage.max_daily_bytes（{} bytes）小於以 {} 條連線、每條每秒 1 則 report 估算的每日量（約 {} bytes）；達到上限後當天的 report 會回 storage_unavailable 而不寫入",
+            max, config.server.max_connections, estimate
+        );
     }
 
     // 載入 TLS 設定；設定 auth.client_ca 時啟用 mTLS。先取指紋再建立，之間的變更會在下一次重載偵測到。
@@ -322,6 +469,7 @@ async fn run(
     let (reports, writer_task) = storage::start_report_writer(
         paths.data_dir.clone(),
         config.storage.retention_days,
+        config.storage.max_daily_bytes,
         chrono::Utc::now,
         storage::RETENTION_SWEEP_INTERVAL,
     )
@@ -341,8 +489,10 @@ async fn run(
         .unwrap_or_else(|_| config.server.listen.clone());
 
     // 關機訊號：第一次記下 T0 並取消，第二次直接結束行程
-    let shutdown = Arc::new(Shutdown::new());
-    tokio::spawn(shutdown::watch(shutdown::Signals::new()?, shutdown.clone()));
+    let shutdown = opts.shutdown.clone();
+    if opts.install_signal_handlers {
+        tokio::spawn(shutdown::watch(shutdown::Signals::new()?, shutdown.clone()));
+    }
 
     let registry = Arc::new(Registry::with_max_agents(config.max_agents()));
     let writer = supervise(
@@ -350,7 +500,7 @@ async fn run(
         tokio::spawn(writer_task),
         shutdown.clone(),
     );
-    // monitor 要等所有連線結束後才停止，才能寫出「全部離線」的最後快照，因此使用獨立的 token
+    // monitor 要等所有連線結束後才停止，因此使用獨立的 token
     let monitor_stop = CancellationToken::new();
     let monitor = supervise(
         "監控工作",
@@ -361,11 +511,16 @@ async fn run(
         )),
         shutdown.clone(),
     );
-    tokio::spawn(logger::run_cleanup(
-        config.log.retention_days,
-        newest_log,
+    supervise(
+        "日誌清除工作",
+        tokio::spawn(logger::run_cleanup(
+            opts.log_dir.clone(),
+            config.log.retention_days,
+            newest_log,
+            shutdown.clone(),
+        )),
         shutdown.clone(),
-    ));
+    );
 
     // TLS 熱重載與現役連線的客戶端憑證重新驗證
     match config.server.reload_interval_secs {
@@ -403,13 +558,15 @@ async fn run(
         binding: BindingPolicy {
             allow_multiple_dns_sans: config.auth.allow_multiple_dns_sans,
         },
+        report_limiter: Arc::new(ReportLimiter::new(config.max_connections_per_ip())),
     });
     let per_ip = PerIpLimiter::new(config.max_connections_per_ip());
 
     info!(
-        "Kairos 已啟動，監聽 {}（連線上限 {}，每個來源 IP {}，狀態表上限 {}，資料目錄 {}）",
+        "Kairos 已啟動，監聽 {}（連線上限 {}，其中握手中 {}，每個來源 IP {}，狀態表上限 {}，資料目錄 {}）",
         local_addr,
         config.server.max_connections,
+        handshake_limit(config.server.max_connections),
         config.max_connections_per_ip(),
         config.max_agents(),
         config.storage.data_dir
@@ -457,14 +614,18 @@ async fn run(
         ),
     }
 
-    // 最後寫一次 agents.json
+    // 停止 monitor，再寫一次 agents.json。最後的快照由這裡寫出，monitor 異常結束時也不會漏掉（R2-K17）
     monitor_stop.cancel();
-    match timeout_at(tokio_deadline(t0 + MONITOR_DEADLINE), monitor).await {
-        Ok(_) => {}
-        Err(_) => error!(
+    let deadline = tokio_deadline(t0 + MONITOR_DEADLINE);
+    let _ = timeout_at(deadline, monitor).await;
+    if timeout_at(deadline, monitor::write_final_snapshot(&registry, &paths))
+        .await
+        .is_err()
+    {
+        error!(
             "最後的 agent 快照未在訊號後 {:.1} 秒內寫完",
             MONITOR_DEADLINE.as_secs_f64()
-        ),
+        );
     }
 
     info!(
@@ -540,6 +701,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.fatal_reason(), None);
+    }
+
+    #[test]
+    fn handshake_limit_reserves_half_for_registered_connections() {
+        assert_eq!(handshake_limit(1024), 512);
+        assert_eq!(handshake_limit(3), 1);
+        assert_eq!(handshake_limit(1), 1);
+    }
+
+    #[test]
+    fn accept_errors_are_classified() {
+        // R2-K14：只影響單一連線的錯誤不等待；資源問題才等待重試
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(accept_error_is_per_connection(&Error::new(kind, "x")));
+        }
+        assert!(!accept_error_is_per_connection(&Error::other("EMFILE")));
+        assert!(!accept_error_is_per_connection(&Error::new(
+            ErrorKind::OutOfMemory,
+            "x"
+        )));
+    }
+
+    #[test]
+    fn nofile_soft_limit_is_parsed_from_proc_limits() {
+        let text = "Limit                     Soft Limit           Hard Limit           Units     \n\
+Max cpu time              unlimited            unlimited            seconds   \n\
+Max open files            1024                 524288               files     \n";
+        assert_eq!(parse_nofile_soft_limit(text), Some(1024));
+        let text = "Max open files            unlimited            unlimited            files\n";
+        assert_eq!(parse_nofile_soft_limit(text), Some(u64::MAX));
+        assert_eq!(parse_nofile_soft_limit("nothing"), None);
+    }
+
+    fn run_config(dir: &Path) -> AppConfig {
+        let pki = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/pki/");
+        let mut c = AppConfig::default();
+        c.server.listen = "127.0.0.1:0".into();
+        c.server.cert_path = format!("{pki}server.crt");
+        c.server.key_path = format!("{pki}server.key");
+        c.server.reload_interval_secs = 1;
+        c.storage.data_dir = dir.join("data").to_string_lossy().into_owned();
+        c
+    }
+
+    fn run_options(dir: &Path) -> (RunOptions, Arc<Shutdown>) {
+        let shutdown = Arc::new(Shutdown::new());
+        (
+            RunOptions {
+                log_dir: dir.join("logs"),
+                shutdown: shutdown.clone(),
+                install_signal_handlers: false,
+            },
+            shutdown,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_shuts_down_within_the_deadline_and_reports_exit_code() {
+        // R2-T1：main::run 收到關機後在期限內結束、寫出最後的 agents.json，結束代碼 0；
+        // 因內部錯誤而關機時回傳原因，結束代碼 1
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-run-{}-{}",
+            std::process::id(),
+            next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (opts, shutdown) = run_options(&dir);
+        let task = tokio::spawn(run(run_config(&dir), None, None, opts));
+        // 等到啟動完成（資料目錄與日誌清除的狀態檔都已建立）
+        for _ in 0..250 {
+            if dir.join("data").join(storage::AGENTS_FILE).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::remove_file(dir.join("data").join(storage::AGENTS_FILE)).unwrap();
+        let t0 = shutdown.trigger();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run 應在關機後結束")
+            .unwrap();
+        assert!(
+            t0.elapsed() < shutdown::WATCHDOG_DEADLINE,
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        assert_eq!(exit_code(&result), 0);
+        // 最後的快照由 run 寫出
+        assert!(dir.join("data").join(storage::AGENTS_FILE).exists());
+
+        // 內部錯誤：結束代碼 1
+        let (opts, shutdown) = run_options(&dir);
+        let task = tokio::spawn(run(run_config(&dir), None, None, opts));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.trigger_fatal("測試用的內部錯誤");
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.as_ref().unwrap().as_deref(),
+            Some("測試用的內部錯誤")
+        );
+        assert_eq!(exit_code(&result), 1);
+
+        // 啟動失敗（憑證不存在）：結束代碼 1
+        let (opts, _) = run_options(&dir);
+        let mut bad = run_config(&dir);
+        bad.server.cert_path = dir.join("missing.crt").to_string_lossy().into_owned();
+        let result = run(bad, None, None, opts).await;
+        assert!(result.is_err());
+        assert_eq!(exit_code(&result), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

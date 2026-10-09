@@ -247,11 +247,10 @@ pub enum RevocationFailure {
     StatusUnavailable,
 }
 
-/// 從握手錯誤（tokio-rustls 以 `io::Error` 包裝的 `rustls::Error`）判斷是否與撤銷相關
-pub fn revocation_failure(e: &Error) -> Option<RevocationFailure> {
+/// 判斷 rustls 的憑證驗證錯誤是否與撤銷相關
+fn classify_tls_error(e: &tokio_rustls::rustls::Error) -> Option<RevocationFailure> {
     use tokio_rustls::rustls::Error as TlsError;
-    let inner = e.get_ref()?.downcast_ref::<TlsError>()?;
-    match inner {
+    match e {
         TlsError::InvalidCertificate(CertificateError::Revoked) => Some(RevocationFailure::Revoked),
         TlsError::InvalidCertificate(
             CertificateError::UnknownRevocationStatus
@@ -262,20 +261,65 @@ pub fn revocation_failure(e: &Error) -> Option<RevocationFailure> {
     }
 }
 
+/// 從握手錯誤（tokio-rustls 以 `io::Error` 包裝的 `rustls::Error`）判斷是否與撤銷相關
+pub fn revocation_failure(e: &Error) -> Option<RevocationFailure> {
+    classify_tls_error(e.get_ref()?.downcast_ref::<tokio_rustls::rustls::Error>()?)
+}
+
+/// `certificate_rejected` 的 message：憑證已被撤銷、過期或不再受信任
+pub const MSG_CERTIFICATE_REJECTED: &str =
+    "client certificate has been revoked or is no longer trusted";
+
+/// `certificate_rejected` 的 message：伺服器無法判定撤銷狀態（CRL 過期或缺少該層 CA 的 CRL），
+/// 屬於伺服器端的問題，客戶端不需要重新簽發憑證（R2-K26；Pulse 依此字串提示聯絡管理者）
+pub const MSG_REVOCATION_STATUS_UNAVAILABLE: &str = "revocation status unavailable";
+
+/// 重新驗證客戶端憑證鏈失敗的原因
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRejection {
+    /// 給日誌的說明
+    pub reason: String,
+    /// 與撤銷相關時的分類
+    pub revocation: Option<RevocationFailure>,
+}
+
+impl ChainRejection {
+    pub fn new(reason: impl Into<String>, revocation: Option<RevocationFailure>) -> Self {
+        Self {
+            reason: reason.into(),
+            revocation,
+        }
+    }
+
+    /// 回給客戶端的 `certificate_rejected` message
+    pub fn client_message(&self) -> &'static str {
+        match self.revocation {
+            Some(RevocationFailure::StatusUnavailable) => MSG_REVOCATION_STATUS_UNAVAILABLE,
+            _ => MSG_CERTIFICATE_REJECTED,
+        }
+    }
+}
+
+impl std::fmt::Display for ChainRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// 以驗證器檢查握手時取得的客戶端憑證鏈（[0] 為 end-entity，其餘為中繼憑證）。
 /// 用於重載 CA/CRL 後與定期檢查憑證是否過期。
 pub fn verify_chain(
     verifier: &dyn ClientCertVerifier,
     chain: Option<&[CertificateDer<'static>]>,
     now: UnixTime,
-) -> Result<(), String> {
+) -> Result<(), ChainRejection> {
     let Some((end_entity, intermediates)) = chain.and_then(|c| c.split_first()) else {
-        return Err("連線沒有客戶端憑證".to_string());
+        return Err(ChainRejection::new("連線沒有客戶端憑證", None));
     };
     verifier
         .verify_client_cert(end_entity, intermediates, now)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| ChainRejection::new(e.to_string(), classify_tls_error(&e)))
 }
 
 #[cfg(test)]
@@ -420,7 +464,9 @@ mod tests {
         let now = UnixTime::now();
         let v = verifier(&["crl-revoke-a.der"]);
         let err = verify_chain(v.as_ref(), Some(&chain("client-a.crt")), now).unwrap_err();
-        assert!(err.to_lowercase().contains("revoked"), "{err}");
+        assert!(err.reason.to_lowercase().contains("revoked"), "{err}");
+        assert_eq!(err.revocation, Some(RevocationFailure::Revoked));
+        assert_eq!(err.client_message(), MSG_CERTIFICATE_REJECTED);
         assert!(verify_chain(v.as_ref(), Some(&chain("client-b.crt")), now).is_ok());
 
         // 沒有撤銷任何憑證的 CRL：兩者都接受
@@ -440,13 +486,52 @@ mod tests {
             UnixTime::now(),
         )
         .unwrap_err();
-        assert!(err.to_lowercase().contains("expired"), "{err}");
+        assert!(err.reason.to_lowercase().contains("expired"), "{err}");
+        assert_eq!(err.client_message(), MSG_CERTIFICATE_REJECTED);
         // 在效期內的時間點則通過（2020-06-01）
         let in_validity = UnixTime::since_unix_epoch(Duration::from_secs(1_590_969_600));
         assert!(verify_chain(v.as_ref(), Some(&chain("client-expired.crt")), in_validity).is_ok());
 
         assert!(verify_chain(v.as_ref(), None, UnixTime::now()).is_err());
         assert!(verify_chain(v.as_ref(), Some(&[]), UnixTime::now()).is_err());
+    }
+
+    #[test]
+    fn unknown_revocation_status_has_a_distinct_client_message() {
+        // R2-K26：CRL 不涵蓋該憑證的簽發者（或已過期）→ 無法判定撤銷狀態，屬伺服器端問題。
+        // test_pki 的 CRL 由另一個 CA 簽發，不適用於 testdata/pki 的憑證
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-tls-unknown-crl-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let crl = dir.join("other-ca.crl");
+        std::fs::write(&crl, crate::test_pki::CRL_EMPTY).unwrap();
+        let mut tp = paths(Some("test-ca.crt"), &[]);
+        tp.crls = vec![crl.to_string_lossy().to_string()];
+        let v = build(&tp).unwrap().verifier.unwrap();
+        let err =
+            verify_chain(v.as_ref(), Some(&chain("client-b.crt")), UnixTime::now()).unwrap_err();
+        assert_eq!(
+            err.revocation,
+            Some(RevocationFailure::StatusUnavailable),
+            "{err}"
+        );
+        assert_eq!(err.client_message(), "revocation status unavailable");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // 過期的 CRL 也歸為同一類
+        use tokio_rustls::rustls::Error as TlsError;
+        assert_eq!(
+            classify_tls_error(&TlsError::InvalidCertificate(
+                CertificateError::ExpiredRevocationList
+            )),
+            Some(RevocationFailure::StatusUnavailable)
+        );
+        // 沒有客戶端憑證、或其他原因：維持原本的 message
+        let none = verify_chain(v.as_ref(), None, UnixTime::now()).unwrap_err();
+        assert_eq!(none.client_message(), MSG_CERTIFICATE_REJECTED);
     }
 
     #[test]

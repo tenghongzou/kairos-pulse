@@ -293,8 +293,26 @@ const FORMAT_CHAR_RANGES: &[(u32, u32)] = &[
     (0xE0020, 0xE007F),
 ];
 
+/// 雖不屬於 Cc／Cf，但顯示為空白或不可見、可用來偽裝或隱藏內容的碼位（R2-K23；Pulse 端使用相同的表）：
+/// - U+034F 組合用字形連接抑制符（CGJ）
+/// - Hangul filler：U+115F、U+1160、U+3164、U+FFA0（顯示為空白）
+/// - 變體選擇字元：U+FE00–U+FE0F、U+E0100–U+E01EF
+/// - 私用區：U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD（顯示結果取決於字型，無法預期）
+const INVISIBLE_CHAR_RANGES: &[(u32, u32)] = &[
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x3164, 0x3164),
+    (0xFFA0, 0xFFA0),
+    (0xFE00, 0xFE0F),
+    (0xE0100, 0xE01EF),
+    (0xE000, 0xF8FF),
+    (0xF0000, 0xFFFFD),
+    (0x100000, 0x10FFFD),
+];
+
 /// 不得出現在顯示用字串中的字元：控制字元（Cc）、格式字元（Cf）、行分隔（Zl, U+2028）、
-/// 段落分隔（Zp, U+2029）。這些字元可能偽造日誌行、在 agents.json 或終端中改變文字方向或隱藏內容。
+/// 段落分隔（Zp, U+2029），以及 [`INVISIBLE_CHAR_RANGES`] 列出的不可見／偽裝用碼位。
+/// 這些字元可能偽造日誌行、在 agents.json 或終端中改變文字方向、隱藏或偽裝內容。
 pub fn is_forbidden_display_char(c: char) -> bool {
     if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
         return true;
@@ -302,6 +320,7 @@ pub fn is_forbidden_display_char(c: char) -> bool {
     let cp = u32::from(c);
     FORMAT_CHAR_RANGES
         .iter()
+        .chain(INVISIBLE_CHAR_RANGES)
         .any(|&(lo, hi)| (lo..=hi).contains(&cp))
 }
 
@@ -340,7 +359,9 @@ pub fn validate_hello(agent_id: &str, hostname: &str, agent_version: &str) -> Re
     Ok(())
 }
 
-/// 解析後、依狀態處理前的共通驗證（違反時回 `bad_request`）：`ts` 最長 64 bytes
+/// 解析後、依狀態處理前的共通驗證（違反時回 `bad_request`）：`ts` 最長 64 bytes，
+/// 且不得含 [`is_forbidden_display_char`] 的字元（`ts` 會原樣寫入 JSONL 與 agents.json；R2-K8）。
+/// 不要求 RFC 3339：規格只把 `ts` 定義為參考用字串，伺服器不解析它。
 pub fn validate_client_msg(msg: &ClientMsg) -> Result<(), String> {
     let ts = match msg {
         ClientMsg::Hello { ts, .. }
@@ -354,6 +375,12 @@ pub fn validate_client_msg(msg: &ClientMsg) -> Result<(), String> {
             MAX_TS_BYTES,
             ts.len()
         ));
+    }
+    if ts.chars().any(is_forbidden_display_char) {
+        return Err(
+            "ts must not contain control, format, invisible or line/paragraph separator characters"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -796,6 +823,71 @@ mod tests {
         }
         assert!(!is_forbidden_display_char('\u{200a}'));
         assert!(!is_forbidden_display_char('\u{2030}'));
+    }
+
+    #[test]
+    fn hello_rejects_invisible_and_private_use_characters() {
+        // R2-K23：Hangul filler、CGJ、變體選擇字元、私用區
+        let id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        for bad in [
+            "web\u{3164}01",
+            "\u{115f}",
+            "web\u{1160}",
+            "web\u{ffa0}01",
+            "web\u{34f}01",
+            "web\u{fe0f}",
+            "web\u{e0100}",
+            "web\u{e000}",
+            "web\u{f8ff}",
+            "web\u{f0000}",
+            "web\u{10fffd}",
+        ] {
+            assert!(validate_hello(id, bad, "0.1.0").is_err(), "{bad:?}");
+            assert!(validate_hello(id, "web-01", bad).is_err(), "{bad:?}");
+        }
+        for &(lo, hi) in INVISIBLE_CHAR_RANGES {
+            for cp in [lo, hi] {
+                assert!(is_forbidden_display_char(char::from_u32(cp).unwrap()));
+            }
+        }
+        // 範圍外的鄰近碼位不受影響
+        for ok in [
+            '\u{034e}',
+            '\u{0350}',
+            '\u{115e}',
+            '\u{1161}',
+            '\u{3163}',
+            '\u{3165}',
+            '\u{ff9f}',
+            '\u{ffa1}',
+            '\u{fdff}',
+            '\u{fe10}',
+            '\u{f900}',
+            '\u{effff}',
+            '\u{e01f0}',
+        ] {
+            assert!(!is_forbidden_display_char(ok), "{:04X}", u32::from(ok));
+        }
+    }
+
+    #[test]
+    fn ts_rejects_forbidden_characters() {
+        // R2-K8：ts 會原樣寫入 JSONL 與 agents.json
+        let hb = |ts: &str| ClientMsg::Heartbeat {
+            seq: 1,
+            ts: ts.to_string(),
+        };
+        for bad in [
+            "2026\u{2028}",
+            "\u{202e}2026",
+            "2026\u{85}",
+            "2026\n",
+            "2026\u{3164}",
+        ] {
+            let err = validate_client_msg(&hb(bad)).unwrap_err();
+            assert!(err.starts_with("ts"), "{bad:?}: {err}");
+        }
+        assert!(validate_client_msg(&hb("2026-10-08T03:15:41.002+08:00")).is_ok());
     }
 
     #[test]

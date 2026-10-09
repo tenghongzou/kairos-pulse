@@ -1,16 +1,17 @@
 //! 單一連線的處理：TLS 握手 → 等待 hello → 已註冊狀態的訊息迴圈。
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, trace};
 use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::UnixTime;
@@ -19,10 +20,15 @@ use tokio_util::codec::Framed;
 
 use crate::auth::{BindingError, BindingPolicy, cert_matches_agent_id};
 use crate::config::TimeoutSettings;
+use crate::per_ip::source_key;
 use crate::protocol::{
     ClientMsg, ErrorCode, Frame, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, NdjsonCodec,
     PROTO_VERSION, Proto, ServerMsg, clamp_heartbeat_interval_ms, normalize_agent_id,
     offline_after_ms, parse_client_msg, validate_client_msg, validate_hello, validate_report,
+};
+use crate::rate::{
+    MAX_REPORT_PACING_DELAY, Pace, REPORT_BURST, REPORT_RATE_PER_SEC, ReportLimiter, ReportSource,
+    TokenBucket,
 };
 use crate::registry::{
     ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
@@ -41,16 +47,15 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// 失敗多半來自掃描或設定錯誤，時間取短，避免被大量觸發時長時間佔用連線名額。
 const HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// report 速率限制：每條連線的 token bucket 容量（可連續送出的筆數）
-pub const REPORT_BURST: f64 = 10.0;
+/// 每條連線的訊息速率上限（所有訊息，含無效行；R2-K12）：可連續處理的則數
+pub const MESSAGE_BURST: f64 = 50.0;
 
-/// report 速率限制：每秒補充的 token 數。Pulse 的 `report.interval` 最短 1 秒，正常不會觸及。
-/// 超過時延後處理（不回錯誤），讀取暫停後由 TCP 對送出端施加背壓。
-pub const REPORT_RATE_PER_SEC: f64 = 2.0;
+/// 每條連線每秒最多處理的訊息數。Pulse 正常每秒最多送出約 2 則，不會觸及。
+/// 超過時延後處理（期間不讀取，由 TCP 對送出端施加背壓），每則最多延後 1 / 此值 秒。
+pub const MESSAGES_PER_SEC: f64 = 20.0;
 
-/// 單則 report 因限速而延後處理的上限（= 1 / [`REPORT_RATE_PER_SEC`]）。
-/// [`TokenBucket::acquire`] 的等待時間在正常情況下本來就不會超過它，這裡再明確封頂，確保延遲預算成立。
-pub const MAX_REPORT_PACING_DELAY: Duration = Duration::from_millis(500);
+/// 單則訊息因訊息速率上限而延後的上限（= 1 / [`MESSAGES_PER_SEC`]）
+pub const MAX_MESSAGE_PACING_DELAY: Duration = Duration::from_millis(50);
 
 /// 等待寫檔逾時、但 writer 已開始寫入這筆（無法取消）時，額外等待的上限
 const CLAIMED_WRITE_GRACE: Duration = Duration::from_secs(1);
@@ -63,26 +68,27 @@ const STORE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// 從收到 report 到送出回應（`ack` / `storage_unavailable`，或結果未知時斷線）的最壞延遲：
 ///
 /// ```text
-/// 限速延後 MAX_REPORT_PACING_DELAY 0.5 s
+/// 訊息速率延後 MAX_MESSAGE_PACING_DELAY 0.05 s
+/// + report 限速延後 MAX_REPORT_PACING_DELAY 0.5 s
 /// + 等待寫檔 timeouts.write_secs     ≤ MAX_WRITE_SECS 6 s
 /// + 寫入已開始時的寬限 CLAIMED_WRITE_GRACE 1 s
-/// = 7.5 s ≤ 8 s
+/// = 7.55 s ≤ 8 s
 /// ```
 ///
 /// 等待期間同一連線的 heartbeat 排在後面拿不到 `ack`。Pulse 的讀取閒置為
-/// `max(2m, m + 10 s)`（m = min(heartbeat, report) 間隔）：Pulse 最後一次收到伺服器訊息後，
+/// `max(2m, m + 10 s)`（m 為 Pulse 的心跳間隔）：Pulse 最後一次收到伺服器訊息後，
 /// 最晚 m 秒內會送出下一則訊息，伺服器再於 8 秒內回應，`m + 8 s < m + 10 s`，
 /// 因此對任何心跳間隔都不會被誤判為斷線。
 pub const MAX_REPORT_RESPONSE_DELAY: Duration = Duration::from_secs(8);
 
 // 編譯期檢查延遲預算（以毫秒計算）
 const _: () = {
-    let total_ms = MAX_REPORT_PACING_DELAY.as_millis()
+    let total_ms = MAX_MESSAGE_PACING_DELAY.as_millis()
+        + MAX_REPORT_PACING_DELAY.as_millis()
         + (crate::config::MAX_WRITE_SECS as u128) * 1000
         + CLAIMED_WRITE_GRACE.as_millis();
     assert!(total_ms <= MAX_REPORT_RESPONSE_DELAY.as_millis());
-    // 封頂值不得小於正常的限速間隔，否則限速會失效
-    assert!(MAX_REPORT_PACING_DELAY.as_millis() * (REPORT_RATE_PER_SEC as u128) >= 1000);
+    assert!(MAX_MESSAGE_PACING_DELAY.as_millis() * (MESSAGES_PER_SEC as u128) >= 1000);
 };
 
 /// 讀取並丟棄 `stream` 的資料，直到對方關閉、發生錯誤或超過 `limit`；回傳丟棄的 bytes 數，逾時時為 `None`
@@ -114,6 +120,8 @@ pub struct ConnContext {
     pub throttle: Arc<LogThrottle>,
     /// mTLS 名稱綁定的規則
     pub binding: BindingPolicy,
+    /// 跨連線共用的 report 限速（R2-K3）
+    pub report_limiter: Arc<ReportLimiter>,
 }
 
 type Transport = Framed<TlsStream<TcpStream>, NdjsonCodec>;
@@ -171,45 +179,11 @@ fn deadline_after(duration: Duration) -> Instant {
         .unwrap_or(now)
 }
 
-/// 每條連線的 report 速率限制（token bucket）。token 不足時回傳應等待的時間，
-/// 並預先扣除（允許暫時為負），等待後即可處理，持續超量時的處理速率恰為補充速率。
-#[derive(Debug)]
-pub(crate) struct TokenBucket {
-    capacity: f64,
-    refill_per_sec: f64,
-    tokens: f64,
-    last: std::time::Instant,
-}
-
-impl TokenBucket {
-    pub(crate) fn new(capacity: f64, refill_per_sec: f64, now: std::time::Instant) -> Self {
-        Self {
-            capacity,
-            refill_per_sec,
-            tokens: capacity,
-            last: now,
-        }
-    }
-
-    /// 取一個 token，回傳處理前應等待的時間（不需等待時為 0）
-    pub(crate) fn acquire(&mut self, now: std::time::Instant) -> Duration {
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = self.last.max(now);
-        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
-        let wait = if self.tokens >= 1.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64((1.0 - self.tokens) / self.refill_per_sec)
-        };
-        self.tokens -= 1.0;
-        wait
-    }
-}
-
 /// 合法 report 的保存結果
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StoreOutcome {
-    /// 已寫入資料檔並更新 last_report；內含寫入完成後 last_seen 的更新結果
+    /// 已寫入資料檔並更新 last_report；內含等待期間各次 last_seen 更新的合併結果
+    /// （任何一次為 [`Touch::Revived`] 即為 `Revived`）
     Stored(Touch),
     /// 本連線已被取代，未寫檔也未更新任何狀態
     Stale,
@@ -226,12 +200,16 @@ pub(crate) enum StoreOutcome {
 ///    逾時時先取消這筆要求，writer 保證不會再寫入，才回 [`StoreOutcome::Unavailable`]；
 ///    writer 已開始寫入而無法取消時，再等一小段，仍無結果則回 [`StoreOutcome::Unknown`]；
 /// 3. 寫入成功後才更新 last_report，並再更新一次 last_seen（等待寫檔期間收不到 heartbeat）。
+///
+/// 各次更新 last_seen 中只要有一次讓 agent 從離線恢復，就把 `revived` 設為 `true`（不論保存結果），
+/// 呼叫端據此記錄「恢復上線」（R2-K13）。
 pub(crate) async fn store_report(
     registry: &Registry,
     sink: &ReportSink,
     conn_id: u64,
     record: ReportRecord,
     write_timeout: Duration,
+    revived: &AtomicBool,
 ) -> StoreOutcome {
     let touch = registry.touch(
         &record.agent_id,
@@ -239,8 +217,10 @@ pub(crate) async fn store_report(
         std::time::Instant::now(),
         Utc::now(),
     );
-    if touch == Touch::Stale {
-        return StoreOutcome::Stale;
+    match touch {
+        Touch::Stale => return StoreOutcome::Stale,
+        Touch::Revived => revived.store(true, Ordering::Relaxed),
+        Touch::Updated => {}
     }
     let agent_id = record.agent_id.clone();
     let last = LastReport {
@@ -253,10 +233,9 @@ pub(crate) async fn store_report(
     };
     let timed_out = || format!("寫入未在 {} 秒內完成", write_timeout.as_secs_f64());
     let deadline = deadline_after(write_timeout);
-    // 等待期間（含等待佇列空間）定期更新本連線的 last_seen（只更新 conn_id 相符的現役連線）
-
-    // 在放入佇列前逾時：這筆根本沒有進入佇列
-    let submit = keep_alive_while(registry, &agent_id, conn_id, sink.submit(record));
+    // 等待期間（含等待佇列空間）以 keep_alive_while 定期更新本連線的 last_seen
+    // （只更新 conn_id 相符的現役連線）。在放入佇列前逾時：這筆根本沒有進入佇列
+    let submit = keep_alive_while(registry, &agent_id, conn_id, revived, sink.submit(record));
     let mut pending = match timeout_at(deadline, submit).await {
         Ok(Ok(pending)) => pending,
         Ok(Err(reason)) => return StoreOutcome::Unavailable(reason),
@@ -264,7 +243,7 @@ pub(crate) async fn store_report(
     };
     let status = match timeout_at(
         deadline,
-        keep_alive_while(registry, &agent_id, conn_id, pending.wait()),
+        keep_alive_while(registry, &agent_id, conn_id, revived, pending.wait()),
     )
     .await
     {
@@ -274,7 +253,7 @@ pub(crate) async fn store_report(
         // writer 已在寫入這筆：結果很快就會出來，多等一小段
         Err(_) => match timeout(
             write_timeout.min(CLAIMED_WRITE_GRACE),
-            keep_alive_while(registry, &agent_id, conn_id, pending.wait()),
+            keep_alive_while(registry, &agent_id, conn_id, revived, pending.wait()),
         )
         .await
         {
@@ -289,18 +268,27 @@ pub(crate) async fn store_report(
             // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）
             registry.set_last_report(&agent_id, conn_id, last);
             let touch = registry.touch(&agent_id, conn_id, std::time::Instant::now(), Utc::now());
-            StoreOutcome::Stored(touch)
+            if touch == Touch::Revived {
+                revived.store(true, Ordering::Relaxed);
+            }
+            StoreOutcome::Stored(if revived.load(Ordering::Relaxed) {
+                Touch::Revived
+            } else {
+                touch
+            })
         }
         WriteStatus::Failed(reason) => StoreOutcome::Unavailable(reason),
         WriteStatus::Unknown(reason) => StoreOutcome::Unknown(reason),
     }
 }
 
-/// 執行 `fut` 直到完成；期間每 [`STORE_KEEPALIVE_INTERVAL`] 更新一次本連線的 last_seen
+/// 執行 `fut` 直到完成；期間每 [`STORE_KEEPALIVE_INTERVAL`] 更新一次本連線的 last_seen，
+/// 讓 agent 從離線恢復時設定 `revived`
 async fn keep_alive_while<F: Future>(
     registry: &Registry,
     agent_id: &str,
     conn_id: u64,
+    revived: &AtomicBool,
     fut: F,
 ) -> F::Output {
     tokio::pin!(fut);
@@ -314,8 +302,12 @@ async fn keep_alive_while<F: Future>(
             biased;
             out = &mut fut => return out,
             _ = ticker.tick() => {
-                // 已被取代（Stale）時不更新任何狀態；恢復上線（Revived）由寫入完成後的 touch 記錄
-                registry.touch(agent_id, conn_id, std::time::Instant::now(), Utc::now());
+                // 已被取代（Stale）時不更新任何狀態；恢復上線（Revived）交給呼叫端記錄
+                if registry.touch(agent_id, conn_id, std::time::Instant::now(), Utc::now())
+                    == Touch::Revived
+                {
+                    revived.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -329,6 +321,44 @@ struct Agent {
     agent_version: String,
     heartbeat_interval_ms: u64,
     hello_seq: u64,
+    /// 是否已以 mTLS 驗證 agent_id 與客戶端憑證綁定（決定 report 限速的來源）
+    authenticated: bool,
+}
+
+/// 確保連線結束時（含 panic 與被中止）以 conn_id 標記離線（R2-K20）
+struct DisconnectGuard {
+    registry: Arc<Registry>,
+    agent_id: String,
+    conn_id: u64,
+    armed: bool,
+}
+
+impl DisconnectGuard {
+    fn new(registry: Arc<Registry>, agent_id: String, conn_id: u64) -> Self {
+        Self {
+            registry,
+            agent_id,
+            conn_id,
+            armed: true,
+        }
+    }
+
+    /// 正常結束時呼叫；回傳 `true` 表示這次呼叫把 agent 從線上改為離線
+    fn disconnect(mut self) -> bool {
+        self.armed = false;
+        self.registry
+            .disconnect(&self.agent_id, self.conn_id, std::time::Instant::now())
+    }
+}
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // conn_id 不符（從未註冊或已被取代）時不做任何事
+            self.registry
+                .disconnect(&self.agent_id, self.conn_id, std::time::Instant::now());
+        }
+    }
 }
 
 struct Conn {
@@ -344,17 +374,23 @@ struct Conn {
     client_chain: Option<ClientChain>,
     /// 連續無效訊息（bad_request 與 unknown_type）的次數；收到合法訊息時歸零
     bad_requests: u32,
-    /// report 的速率限制
+    /// report 的速率限制：本連線的 bucket（未啟用 mTLS 時與來源 IP 的 bucket 一起使用）
     reports: TokenBucket,
+    /// 跨連線共用的 report 限速
+    report_limiter: Arc<ReportLimiter>,
+    /// 所有訊息的速率限制
+    messages: TokenBucket,
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
+/// `pre_auth` 為「握手中」連線的名額（R2-K2），在 hello 通過後（或連線結束時）釋放。
 pub async fn handle_connection(
     ctx: Arc<ConnContext>,
     acceptor: TlsAcceptor,
     socket: TcpStream,
     peer: SocketAddr,
     conn_id: u64,
+    pre_auth: Option<OwnedSemaphorePermit>,
 ) -> Result<(), Error> {
     let shutdown = ctx.shutdown.clone();
     // into_fallible：握手失敗時 tokio-rustls 會先送出 TLS alert，再把底層 socket 交還
@@ -410,19 +446,21 @@ pub async fn handle_connection(
         binding: ctx.binding,
         client_chain,
         bad_requests: 0,
-        reports: TokenBucket::new(REPORT_BURST, REPORT_RATE_PER_SEC, std::time::Instant::now()),
+        reports: ReportLimiter::connection_bucket(std::time::Instant::now()),
+        report_limiter: ctx.report_limiter.clone(),
+        messages: TokenBucket::new(MESSAGE_BURST, MESSAGES_PER_SEC, std::time::Instant::now()),
     };
 
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
         return Ok(());
     };
+    // hello 已通過：不再佔用「握手中」的名額
+    drop(pre_auth);
 
-    // 註冊後不論結果如何都要以 conn_id 比對並標記離線
+    // 註冊後不論結果如何（含 panic、被中止）都要以 conn_id 比對並標記離線
+    let guard = DisconnectGuard::new(ctx.registry.clone(), agent.agent_id.clone(), conn_id);
     let result = conn.run_registered(&ctx, &agent).await;
-    if ctx
-        .registry
-        .disconnect(&agent.agent_id, conn_id, std::time::Instant::now())
-    {
+    if guard.disconnect() {
         throttled!(
             ctx.throttle,
             (Category::AgentOffline, peer.ip()),
@@ -608,11 +646,11 @@ impl Conn {
     ///    不通過回 `certificate_rejected`；
     /// 2. hello 的 agent_id 必須與憑證的 SAN 相符（預設憑證只能有一個 DNS SAN）；不符回 `auth_failed`。
     ///
-    /// 兩者都是 fatal，關閉連線並回傳 `false`。
-    async fn check_identity(&mut self, seq: u64, agent_id: &str) -> Result<bool, Error> {
+    /// 兩者都是 fatal，關閉連線並回傳 `None`；通過時回傳是否已以 mTLS 驗證。
+    async fn check_identity(&mut self, seq: u64, agent_id: &str) -> Result<Option<bool>, Error> {
         let material = self.tls.current();
         let Some(verifier) = &material.verifier else {
-            return Ok(true);
+            return Ok(Some(false));
         };
         if let Err(reason) = verify_chain(
             verifier.as_ref(),
@@ -629,20 +667,21 @@ impl Conn {
                 agent_id.escape_debug(),
                 reason
             );
+            // CRL 過期或無法判定撤銷狀態時，message 為 `revocation status unavailable`（R2-K26）
             self.reply(ServerMsg::error(
                 Some(seq),
                 ErrorCode::CertificateRejected,
-                "client certificate has been revoked or is no longer trusted",
+                reason.client_message(),
             ))
             .await?;
-            return Ok(false);
+            return Ok(None);
         }
         let result = match self.client_chain.as_deref().and_then(|c| c.first()) {
             Some(cert) => cert_matches_agent_id(cert, agent_id, self.binding),
             None => Err(BindingError::Mismatch("沒有客戶端憑證".to_string())),
         };
         match result {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(Some(true)),
             Err(reason) => {
                 throttled!(
                     self.throttle,
@@ -660,9 +699,31 @@ impl Conn {
                     reason.client_message(),
                 ))
                 .await?;
-                Ok(false)
+                Ok(None)
             }
         }
+    }
+
+    /// 訊息速率上限：超過時延後處理（期間不讀取，TCP 背壓會讓送出端慢下來；R2-K12）
+    async fn pace_message(&mut self) {
+        let wait = self
+            .messages
+            .acquire(std::time::Instant::now())
+            .min(MAX_MESSAGE_PACING_DELAY);
+        if wait.is_zero() {
+            return;
+        }
+        throttled!(
+            self.throttle,
+            (Category::MessageRate, self.peer.ip()),
+            warn,
+            "[#{}] {} 送出訊息超過每秒 {} 則（可連續 {} 則），延後處理",
+            self.conn_id,
+            self.peer,
+            MESSAGES_PER_SEC,
+            MESSAGE_BURST
+        );
+        tokio::time::sleep(wait).await;
     }
 
     /// 伺服器關機：送出 close_notify 後結束
@@ -705,6 +766,7 @@ impl Conn {
                 Ok(Some(Err(e))) => return Err(e),
                 Ok(Some(Ok(frame))) => frame,
             };
+            self.pace_message().await;
 
             let flow = match classify(frame) {
                 Incoming::TooLong => self.reply_too_long().await?,
@@ -741,9 +803,10 @@ impl Conn {
                         Ok(()) => {
                             // UUID 不分大小寫：之後的驗證、註冊、日誌與寫檔一律使用小寫
                             let agent_id = normalize_agent_id(&agent_id);
-                            if !self.check_identity(seq, &agent_id).await? {
+                            let Some(authenticated) = self.check_identity(seq, &agent_id).await?
+                            else {
                                 return Ok(None);
-                            }
+                            };
                             self.bad_requests = 0;
                             return Ok(Some(Agent {
                                 agent_id,
@@ -751,6 +814,7 @@ impl Conn {
                                 agent_version,
                                 heartbeat_interval_ms,
                                 hello_seq: seq,
+                                authenticated,
                             }));
                         }
                         // 欄位不合規定：計入連續無效訊息，繼續等待 hello
@@ -826,7 +890,8 @@ impl Conn {
                     self.peer,
                     agent.agent_id
                 );
-                // 沒有專用的錯誤碼；以 fatal 的 bad_request 拒絕（Pulse 在 hello_ack 前收到錯誤會退避重連）
+                // 防禦性：設定保證走不到（見 RegistryFull）。沒有專用的錯誤碼；
+                // 以 fatal 的 bad_request 拒絕（Pulse 在 hello_ack 前收到錯誤會退避重連）
                 self.reply(ServerMsg::error_with_fatal(
                     Some(agent.hello_seq),
                     ErrorCode::BadRequest,
@@ -840,7 +905,7 @@ impl Conn {
         if let Some(evicted) = &registration.evicted {
             throttled!(
                 self.throttle,
-                Category::RegistryFull,
+                Category::RegistryEvicted,
                 info,
                 "狀態表已達上限（limits.max_agents），移除離線最久的 agent {}（{}，已離線 {:.1} 小時）",
                 evicted.agent_id,
@@ -896,13 +961,13 @@ impl Conn {
                     Ok(KickReason::CertificateRejected(reason)) => {
                         // 每條連線最多一次，數量受連線數限制；reload 也會記錄一行 warn
                         debug!(
-                            "[#{}] agent {} 的客戶端憑證已被撤銷或不再受信任（{}），關閉連線",
+                            "[#{}] agent {} 的客戶端憑證已被撤銷、不再受信任或無法判定撤銷狀態（{}），關閉連線",
                             self.conn_id, agent.agent_id, reason
                         );
                         self.reply(ServerMsg::error(
                             None,
                             ErrorCode::CertificateRejected,
-                            "client certificate has been revoked or is no longer trusted",
+                            reason.client_message(),
                         ))
                         .await?;
                         return Ok(());
@@ -929,7 +994,10 @@ impl Conn {
                         Ok(Some(Err(e))) => return Err(e),
                         Ok(Some(Ok(frame))) => frame,
                     };
-                    let handled = self.handle_registered(ctx, agent, frame).await?;
+                    // 讀到這一行的時間：之後的限速等待不影響 report 的 recv_at（R2-K16）
+                    let received_at = Utc::now();
+                    self.pace_message().await;
+                    let handled = self.handle_registered(ctx, agent, frame, received_at).await?;
                     if let Flow::Close = handled.flow {
                         return Ok(());
                     }
@@ -972,26 +1040,55 @@ impl Conn {
         self.on_touch(agent, touch)
     }
 
-    /// report 速率限制：超過時延後處理（期間不讀取，TCP 背壓會讓送出端慢下來）
-    async fn pace_report(&mut self, agent: &Agent) {
-        let wait = self
-            .reports
-            .acquire(std::time::Instant::now())
-            .min(MAX_REPORT_PACING_DELAY);
-        if wait.is_zero() {
-            return;
-        }
+    /// report 速率限制（跨連線；R2-K3）：超過時延後處理（期間不讀取，TCP 背壓會讓送出端慢下來）。
+    /// 需要延後超過 [`MAX_REPORT_PACING_DELAY`]（同一來源有多條連線同時送出）時回傳 `false`，
+    /// 這筆不處理，回 `storage_unavailable`（確定未保存）。
+    async fn pace_report(&mut self, agent: &Agent) -> bool {
+        let now = std::time::Instant::now();
+        let pace = if agent.authenticated {
+            // mTLS：agent_id 與憑證綁定，以 agent_id 為來源
+            self.report_limiter.acquire(
+                ReportSource::Agent(agent.agent_id.clone()),
+                None,
+                now,
+                MAX_REPORT_PACING_DELAY,
+            )
+        } else {
+            // agent_id 可任意宣告：以來源 IP（IPv6 /64）為來源，並限制本連線
+            self.report_limiter.acquire(
+                ReportSource::Ip(source_key(self.peer.ip())),
+                Some(&mut self.reports),
+                now,
+                MAX_REPORT_PACING_DELAY,
+            )
+        };
+        let wait = match pace {
+            Pace::Proceed(wait) if wait.is_zero() => return true,
+            Pace::Proceed(wait) => Some(wait.min(MAX_REPORT_PACING_DELAY)),
+            Pace::Reject => None,
+        };
         throttled!(
             self.throttle,
             (Category::ReportRate, self.peer.ip()),
             warn,
-            "[#{}] agent {} 的 report 超過每秒 {} 則（可連續 {} 則），延後處理",
+            "[#{}] agent {} 的 report 超過每秒 {} 則（可連續 {} 則），{}",
             self.conn_id,
             agent.agent_id,
             REPORT_RATE_PER_SEC,
-            REPORT_BURST
+            REPORT_BURST,
+            if wait.is_some() {
+                "延後處理"
+            } else {
+                "不保存並回 storage_unavailable"
+            }
         );
-        tokio::time::sleep(wait).await;
+        match wait {
+            Some(wait) => {
+                tokio::time::sleep(wait).await;
+                true
+            }
+            None => false,
+        }
     }
 
     async fn handle_registered(
@@ -999,6 +1096,7 @@ impl Conn {
         ctx: &ConnContext,
         agent: &Agent,
         frame: Frame,
+        received_at: DateTime<Utc>,
     ) -> Result<Handled, Error> {
         let msg = match classify(frame) {
             Incoming::TooLong => return Ok(Handled::not_alive(self.reply_too_long().await?)),
@@ -1049,7 +1147,19 @@ impl Conn {
                 used_memory,
             } => {
                 self.bad_requests = 0;
-                self.pace_report(agent).await;
+                if !self.pace_report(agent).await {
+                    if !self.touch(ctx, agent) {
+                        return Ok(Handled::alive(self.reply_superseded(agent).await?));
+                    }
+                    let flow = self
+                        .reply(ServerMsg::error(
+                            Some(seq),
+                            ErrorCode::StorageUnavailable,
+                            "report rate limit exceeded",
+                        ))
+                        .await?;
+                    return Ok(Handled::alive(flow));
+                }
                 if let Err(message) = validate_report(cpu_usage, total_memory, used_memory) {
                     // 不寫檔，但仍視為存活
                     if !self.touch(ctx, agent) {
@@ -1076,7 +1186,7 @@ impl Conn {
                 }
 
                 let record = ReportRecord {
-                    recv_at: Utc::now(),
+                    recv_at: received_at,
                     peer: self.peer.to_string(),
                     agent_id: agent.agent_id.clone(),
                     hostname: agent.hostname.clone(),
@@ -1087,14 +1197,20 @@ impl Conn {
                     used_memory,
                 };
                 // ack 語意 = 已寫入資料檔；等待 writer 回覆（受寫出逾時限制）
+                let revived = AtomicBool::new(false);
                 let outcome = store_report(
                     &ctx.registry,
                     &ctx.reports,
                     self.conn_id,
                     record,
                     self.write_timeout,
+                    &revived,
                 )
                 .await;
+                // 等待期間任何一次更新讓 agent 從離線恢復，都記錄「恢復上線」（R2-K13）
+                if revived.load(Ordering::Relaxed) {
+                    self.on_touch(agent, Touch::Revived);
+                }
                 match outcome {
                     StoreOutcome::Stale => {
                         debug!(
@@ -1103,8 +1219,7 @@ impl Conn {
                         );
                         Ok(Handled::alive(self.reply_superseded(agent).await?))
                     }
-                    StoreOutcome::Stored(touch) => {
-                        self.on_touch(agent, touch);
+                    StoreOutcome::Stored(_) => {
                         debug!(
                             "[#{}] agent {} report seq={} cpu={:.2}% mem={}/{} MB",
                             self.conn_id, agent.agent_id, seq, cpu_usage, used_memory, total_memory
@@ -1236,7 +1351,15 @@ mod tests {
         let (sink, rx) = report_channel(4);
         let writer = fake_writer(rx, Ok(()));
 
-        let outcome = store_report(&registry, &sink, 1, record(7), Duration::from_secs(1)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(7),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         assert_eq!(writer.await.unwrap(), Some(7));
         assert_eq!(last_report_seq(&registry), Some(7));
@@ -1251,7 +1374,15 @@ mod tests {
         let (sink, rx) = report_channel(4);
         let writer = fake_writer(rx, Err("disk full".into()));
 
-        let outcome = store_report(&registry, &sink, 1, record(8), Duration::from_secs(1)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(8),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert_eq!(outcome, StoreOutcome::Unavailable("disk full".into()));
         assert_eq!(writer.await.unwrap(), Some(8));
         // 未保存的資料不得出現在 last_report
@@ -1267,7 +1398,15 @@ mod tests {
         // writer 一直不處理（尚未認領）
         let (sink, mut rx) = report_channel(4);
         let started = std::time::Instant::now();
-        let outcome = store_report(&registry, &sink, 1, record(9), Duration::from_millis(50)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(9),
+            Duration::from_millis(50),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert!(
             matches!(outcome, StoreOutcome::Unavailable(_)),
             "{outcome:?}"
@@ -1293,14 +1432,23 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
             drop(req);
         });
-        let outcome = store_report(&registry, &sink, 1, record(9), Duration::from_millis(50)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(9),
+            Duration::from_millis(50),
+            &AtomicBool::new(false),
+        )
+        .await;
         // 不能回 storage_unavailable（資料可能已寫入），也不能回 ack
         assert!(matches!(outcome, StoreOutcome::Unknown(_)), "{outcome:?}");
         assert_eq!(last_report_seq(&registry), None);
         holder.abort();
     }
 
-    #[tokio::test]
+    // R2-T2：以暫停的 tokio 時鐘執行，邊界判定不受實際排程延遲影響
+    #[tokio::test(start_paused = true)]
     async fn store_report_claimed_write_finishing_within_grace_is_stored() {
         let registry = Registry::new();
         let _reg = registry
@@ -1310,12 +1458,19 @@ mod tests {
         let writer = tokio::spawn(async move {
             let req = rx.recv().await.unwrap();
             assert!(req.ticket.claim());
-            // 超過逾時（500 ms）才完成，但在寬限（再 500 ms）內；兩側各留 300 ms 以上的餘裕
+            // 超過逾時（500 ms）才完成，但在寬限（再 500 ms）內
             tokio::time::sleep(Duration::from_millis(800)).await;
             let _ = req.reply.send(WriteStatus::Written);
         });
-        let outcome =
-            store_report(&registry, &sink, 1, record(11), Duration::from_millis(500)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(11),
+            Duration::from_millis(500),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         assert_eq!(last_report_seq(&registry), Some(11));
         writer.await.unwrap();
@@ -1337,7 +1492,15 @@ mod tests {
             assert_eq!(swept.went_offline.len(), 1);
             let _ = req.reply.send(WriteStatus::Written);
         });
-        let outcome = store_report(&registry, &sink, 1, record(12), Duration::from_secs(1)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(12),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Revived));
         assert_eq!(registry.counts(), (1, 1));
         writer.await.unwrap();
@@ -1345,10 +1508,12 @@ mod tests {
 
     #[tokio::test]
     async fn slow_disk_longer_than_offline_threshold_does_not_mark_agent_offline() {
-        // K-C4：磁碟卡住超過離線門檻（此處 1.5 秒）時，等待期間每秒 touch 本連線，不會被 sweep 標記離線
+        // K-C4：磁碟卡住超過離線門檻（此處 3 秒）時，等待期間每秒 touch 本連線，不會被 sweep 標記離線。
+        // R2-T2：touch 間隔 1 秒與門檻 3 秒之間留 2 秒餘裕，卡住時間比門檻多 1.5 秒
+        // （registry 以 std 的時鐘判定離線，無法使用暫停的 tokio 時鐘）
         let registry = Arc::new(Registry::new());
         let mut info = hello_info();
-        info.offline_after = Duration::from_millis(1500);
+        info.offline_after = Duration::from_secs(3);
         let _reg = registry
             .register(1, info, std::time::Instant::now(), Utc::now())
             .unwrap();
@@ -1356,7 +1521,7 @@ mod tests {
         let writer = tokio::spawn(async move {
             let req = rx.recv().await.unwrap();
             assert!(req.ticket.claim());
-            tokio::time::sleep(Duration::from_millis(3500)).await;
+            tokio::time::sleep(Duration::from_millis(4500)).await;
             let _ = req.reply.send(WriteStatus::Written);
         });
         // 模擬 monitor：每 100 ms sweep 一次
@@ -1371,7 +1536,15 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
-        let outcome = store_report(&registry, &sink, 1, record(13), Duration::from_secs(6)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(13),
+            Duration::from_secs(6),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         assert!(!sweeper.is_finished(), "等待寫檔期間不應被標記離線");
         sweeper.abort();
@@ -1401,7 +1574,15 @@ mod tests {
         while sink.pending() < 1 {
             tokio::task::yield_now().await;
         }
-        let outcome = store_report(&registry, &sink, 1, record(2), Duration::from_millis(50)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(2),
+            Duration::from_millis(50),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert!(
             matches!(outcome, StoreOutcome::Unavailable(_)),
             "{outcome:?}"
@@ -1419,7 +1600,15 @@ mod tests {
             .unwrap();
         let (sink, rx) = report_channel(4);
         drop(rx);
-        let outcome = store_report(&registry, &sink, 1, record(3), Duration::from_secs(1)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(3),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert!(
             matches!(outcome, StoreOutcome::Unavailable(_)),
             "{outcome:?}"
@@ -1437,38 +1626,110 @@ mod tests {
             .unwrap();
         let (sink, mut rx) = report_channel(4);
 
-        let outcome = store_report(&registry, &sink, 1, record(9), Duration::from_secs(1)).await;
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(9),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .await;
         assert_eq!(outcome, StoreOutcome::Stale);
         assert!(rx.try_recv().is_err(), "被取代的連線不得寫檔");
         assert_eq!(last_report_seq(&registry), None);
     }
 
-    #[test]
-    fn token_bucket_allows_burst_then_paces() {
-        // K-S6：可連續 10 則，之後每則間隔 0.5 秒
-        let t0 = std::time::Instant::now();
-        let mut b = TokenBucket::new(REPORT_BURST, REPORT_RATE_PER_SEC, t0);
-        for _ in 0..10 {
-            assert_eq!(b.acquire(t0), Duration::ZERO);
-        }
-        assert_eq!(b.acquire(t0), Duration::from_millis(500));
-        // 等待後處理，持續超量時的處理速率為每秒 2 則
-        let t1 = t0 + Duration::from_millis(500);
-        assert_eq!(b.acquire(t1), Duration::from_millis(500));
-        // 正常速率（每秒 1 則）永遠不需等待
-        let mut b = TokenBucket::new(REPORT_BURST, REPORT_RATE_PER_SEC, t0);
-        for i in 0..100 {
-            assert_eq!(b.acquire(t0 + Duration::from_secs(i)), Duration::ZERO);
-        }
-        // 閒置後補滿，但不超過容量
-        let mut b = TokenBucket::new(REPORT_BURST, REPORT_RATE_PER_SEC, t0);
-        let later = t0 + Duration::from_secs(3600);
-        for _ in 0..10 {
-            assert_eq!(b.acquire(later), Duration::ZERO);
-        }
-        assert!(b.acquire(later) > Duration::ZERO);
-        // 時鐘倒退不 panic
-        assert!(b.acquire(t0) > Duration::ZERO);
+    #[tokio::test(start_paused = true)]
+    async fn revival_during_keepalive_is_reported() {
+        // R2-K13／R2-T2：等待寫檔期間被 sweep 判定離線，由「等待中的定期 touch」恢復上線
+        // （寫入完成後的 touch 只看到 Updated），仍要回報恢復上線
+        let registry = Arc::new(Registry::new());
+        let _reg = registry
+            .register(1, hello_info(), std::time::Instant::now(), Utc::now())
+            .unwrap();
+        let (sink, mut rx) = report_channel(4);
+        let r = registry.clone();
+        let writer = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert!(req.ticket.claim());
+            assert_eq!(
+                r.sweep(std::time::Instant::now() + Duration::from_secs(60))
+                    .went_offline
+                    .len(),
+                1
+            );
+            // 跨過至少一次定期 touch（每 1 秒）
+            tokio::time::sleep(STORE_KEEPALIVE_INTERVAL * 2).await;
+            assert_eq!(r.counts(), (1, 1), "定期 touch 已恢復上線");
+            let _ = req.reply.send(WriteStatus::Written);
+        });
+        let revived = AtomicBool::new(false);
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(14),
+            Duration::from_secs(5),
+            &revived,
+        )
+        .await;
+        assert_eq!(outcome, StoreOutcome::Stored(Touch::Revived));
+        assert!(revived.load(Ordering::Relaxed));
+        writer.await.unwrap();
+
+        // 寫入失敗時也回報（恢復上線與是否保存無關）
+        let (sink, mut rx) = report_channel(4);
+        let r = registry.clone();
+        let writer = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert!(req.ticket.claim());
+            r.sweep(std::time::Instant::now() + Duration::from_secs(60));
+            tokio::time::sleep(STORE_KEEPALIVE_INTERVAL * 2).await;
+            let _ = req.reply.send(WriteStatus::Failed("disk full".into()));
+        });
+        let revived = AtomicBool::new(false);
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(15),
+            Duration::from_secs(5),
+            &revived,
+        )
+        .await;
+        assert!(matches!(outcome, StoreOutcome::Unavailable(_)));
+        assert!(revived.load(Ordering::Relaxed));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_guard_marks_offline_even_if_the_task_panics() {
+        // R2-K20：連線工作 panic 時仍以 conn_id 標記離線
+        let registry = Arc::new(Registry::new());
+        let r = registry.clone();
+        let task = tokio::spawn(async move {
+            let _reg = r
+                .register(7, hello_info(), std::time::Instant::now(), Utc::now())
+                .unwrap();
+            let _guard = DisconnectGuard::new(r.clone(), AGENT.to_string(), 7);
+            panic!("連線工作異常");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(registry.counts(), (0, 1));
+
+        // 正常結束：disconnect 回報狀態變化，之後 drop 不重複處理
+        let _reg = registry
+            .register(8, hello_info(), std::time::Instant::now(), Utc::now())
+            .unwrap();
+        let guard = DisconnectGuard::new(registry.clone(), AGENT.to_string(), 8);
+        assert!(guard.disconnect());
+        // 已被新連線取代的舊連線：不影響新連線
+        let _new = registry
+            .register(9, hello_info(), std::time::Instant::now(), Utc::now())
+            .unwrap();
+        drop(DisconnectGuard::new(registry.clone(), AGENT.to_string(), 8));
+        assert_eq!(registry.counts(), (1, 1));
     }
 
     #[test]
@@ -1513,5 +1774,11 @@ mod tests {
             "x".repeat(64)
         );
         assert!(matches!(classify(Frame::Line(line)), Incoming::Msg(_)));
+        // R2-K8：ts 含行分隔字元 → bad_request
+        let line = r#"{"type":"heartbeat","seq":1,"ts":"2026 x"}"#.to_string();
+        assert!(matches!(
+            classify(Frame::Line(line)),
+            Incoming::BadRequest(m) if m.contains("ts")
+        ));
     }
 }

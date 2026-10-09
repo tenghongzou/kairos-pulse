@@ -2,7 +2,7 @@
 
 use config::{Config, Environment, File, FileFormat};
 use log::LevelFilter;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -18,10 +18,16 @@ pub const MAX_TIMEOUT_SECS: u64 = 3600;
 ///
 /// 等待寫檔期間同一連線的 heartbeat 也拿不到 `ack`。
 /// 從收到 report 到回應的最壞延遲預算（見 `connection::MAX_REPORT_RESPONSE_DELAY`）：
-/// 限速延後 0.5 秒 + `write_secs` 6 秒 + 寫入已開始時的寬限 1 秒 = 7.5 秒 ≤ 8 秒。
-/// Pulse 的讀取閒置為 `max(2m, m + 10 秒)`（m = min(heartbeat, report) 間隔），
-/// 伺服器最壞回應延遲 8 秒 < 10 秒，對任何心跳間隔都不會被誤判為斷線。
+/// 訊息速率延後 0.05 秒 + report 限速延後 0.5 秒 + `write_secs` 6 秒 + 寫入已開始時的寬限 1 秒
+/// = 7.55 秒 ≤ 8 秒。Pulse 的讀取閒置為 `max(2m, m + 10 秒)`（m 為 Pulse 的心跳間隔），
+/// 伺服器最壞回應延遲 8 秒小於其中的 10 秒餘裕，對任何心跳間隔都不會被誤判為斷線。
 pub const MAX_WRITE_SECS: u64 = 6;
+
+/// `storage.max_daily_bytes` 的預設值：0（不限制）。合適的上限取決於部署規模，由管理者自行設定
+pub const DEFAULT_MAX_DAILY_BYTES: u64 = 0;
+
+/// 估算每日 report 量時，每行 JSONL 的大小（bytes）
+pub const ESTIMATED_REPORT_LINE_BYTES: u64 = 250;
 
 /// 同時連線數上限的最大值
 pub const MAX_MAX_CONNECTIONS: usize = 65535;
@@ -127,6 +133,9 @@ pub struct StorageSettings {
     pub data_dir: String,
     /// reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天保留），0 = 永久保留
     pub retention_days: u32,
+    /// 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制。達到上限後當天的 report
+    /// 不再寫入，回 `storage_unavailable`（確定未保存）
+    pub max_daily_bytes: u64,
 }
 
 impl Default for StorageSettings {
@@ -134,6 +143,7 @@ impl Default for StorageSettings {
         Self {
             data_dir: "data".to_string(),
             retention_days: 30,
+            max_daily_bytes: DEFAULT_MAX_DAILY_BYTES,
         }
     }
 }
@@ -143,7 +153,9 @@ impl Default for StorageSettings {
 pub struct AuthSettings {
     /// 非空：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 agent_id 與憑證綁定
     pub client_ca: String,
-    /// CRL 檔路徑清單（PEM 或 DER）；只在啟用 mTLS 時使用
+    /// CRL 檔路徑清單（PEM 或 DER）；只在啟用 mTLS 時使用。
+    /// 也接受以 [`LIST_SEPARATOR`] 分隔的單一字串（環境變數 `KAIROS__AUTH__CRL=a.crl,b.crl`）
+    #[serde(deserialize_with = "string_or_list")]
     pub crl: Vec<String>,
     /// 是否接受含多個 DNS SAN 的客戶端憑證。預設 `false`：憑證必須恰好有一個 DNS SAN，
     /// 避免一張憑證同時冒用（並踢掉）多個 agent
@@ -243,15 +255,29 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, 
     Ok(CliAction::Run { config_path })
 }
 
-/// `KAIROS__<SECTION>__<KEY>` 環境變數來源
+/// 字串清單：接受陣列，或以 [`LIST_SEPARATOR`] 分隔的單一字串
+fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => s.split(LIST_SEPARATOR).map(str::to_string).collect(),
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// `KAIROS__<SECTION>__<KEY>` 環境變數來源。
+///
+/// 不使用 `try_parsing`（R2-K24）：它會把看似數字或布林的值先轉型，字串設定（路徑、位址）會被改寫
+/// （例如 `DATA_DIR=0001` 變成 `"1"`）。所有值都以字串保留，數值與布林欄位在反序列化時才由
+/// config 解析；`auth.crl` 的逗號分隔由 [`string_or_list`] 處理。
 fn environment() -> Environment {
     Environment::with_prefix("KAIROS")
         .prefix_separator("__")
         .separator("__")
-        .try_parsing(true)
-        // KAIROS__AUTH__CRL=a.crl,b.crl
-        .list_separator(LIST_SEPARATOR)
-        .with_list_parse_key("auth.crl")
 }
 
 impl AppConfig {
@@ -261,6 +287,20 @@ impl AppConfig {
         self.server
             .max_connections_per_ip
             .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP.min(self.server.max_connections))
+    }
+
+    /// 以 `max_connections` 條連線、每條每秒 1 則 report、每行約 250 bytes 估算的每日 report 量
+    pub fn estimated_daily_report_bytes(&self) -> u64 {
+        (self.server.max_connections as u64)
+            .saturating_mul(24 * 60 * 60)
+            .saturating_mul(ESTIMATED_REPORT_LINE_BYTES)
+    }
+
+    /// `storage.max_daily_bytes` 已設定且小於估算的每日量時，回傳 (上限, 估算量)，供啟動時警告
+    pub fn daily_limit_below_estimate(&self) -> Option<(u64, u64)> {
+        let max = self.storage.max_daily_bytes;
+        let estimate = self.estimated_daily_report_bytes();
+        (max > 0 && estimate > max).then_some((max, estimate))
     }
 
     /// 實際使用的狀態表上限：明確設定的值，或 `max(10000, max_connections)`
@@ -432,6 +472,8 @@ mod tests {
         assert_eq!(c.timeouts.write_secs, 5);
         assert_eq!(c.storage.data_dir, "data");
         assert_eq!(c.storage.retention_days, 30);
+        assert_eq!(c.storage.max_daily_bytes, 0);
+        assert_eq!(c.daily_limit_below_estimate(), None);
         assert_eq!(c.server.reload_interval_secs, 30);
         assert_eq!(c.log.retention_days, 14);
         assert!(c.auth.crl.is_empty());
@@ -553,7 +595,7 @@ mod tests {
         let mutations: [fn(&mut AppConfig); 9] = [
             |c| c.timeouts.handshake_secs = MAX_TIMEOUT_SECS + 1,
             |c| c.timeouts.hello_secs = u64::MAX,
-            // X2：寫出逾時必須小於 Pulse 的 10 秒讀取閒置
+            // X2：伺服器最壞回應延遲（含 write_secs）必須小於 Pulse 讀取閒置中的 10 秒餘裕
             |c| c.timeouts.write_secs = MAX_WRITE_SECS + 1,
             |c| c.timeouts.write_secs = 0,
             |c| c.server.max_connections = MAX_MAX_CONNECTIONS + 1,
@@ -617,6 +659,63 @@ mod tests {
         // 超出上限的值由 validate 擋下
         let c = from_env(&[("KAIROS__TIMEOUTS__WRITE_SECS", "7")]).unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn daily_limit_warning_uses_the_estimated_volume() {
+        // 1024 條連線 × 86400 秒 × 250 bytes ≈ 22 GB
+        let mut c = AppConfig::default();
+        assert_eq!(c.estimated_daily_report_bytes(), 1024 * 86400 * 250);
+        c.storage.max_daily_bytes = 10 * 1024 * 1024 * 1024;
+        assert_eq!(
+            c.daily_limit_below_estimate(),
+            Some((10 * 1024 * 1024 * 1024, 1024 * 86400 * 250))
+        );
+        c.storage.max_daily_bytes = 1024 * 86400 * 250;
+        assert_eq!(c.daily_limit_below_estimate(), None);
+        c.storage.max_daily_bytes = 0;
+        assert_eq!(c.daily_limit_below_estimate(), None);
+    }
+
+    #[test]
+    fn environment_strings_are_not_reinterpreted() {
+        // R2-K24：看似數字或布林的字串設定保持原樣，數值與布林欄位仍可由環境變數解析
+        let c = from_env(&[
+            ("KAIROS__STORAGE__DATA_DIR", "0001"),
+            ("KAIROS__SERVER__CERT_PATH", "true"),
+            ("KAIROS__SERVER__KEY_PATH", "1e3"),
+            ("KAIROS__SERVER__LISTEN", "[::1]:08080"),
+            ("KAIROS__AUTH__CLIENT_CA", "007"),
+            ("KAIROS__AUTH__CRL", "0001,2.50"),
+            ("KAIROS__LOG__LEVEL", "WARN"),
+            ("KAIROS__STORAGE__MAX_DAILY_BYTES", "1048576"),
+            ("KAIROS__STORAGE__RETENTION_DAYS", "07"),
+            ("KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS", "TRUE"),
+        ])
+        .unwrap();
+        assert_eq!(c.storage.data_dir, "0001");
+        assert_eq!(c.server.cert_path, "true");
+        assert_eq!(c.server.key_path, "1e3");
+        assert_eq!(c.server.listen, "[::1]:08080");
+        assert_eq!(c.auth.client_ca, "007");
+        assert_eq!(c.auth.crl, ["0001", "2.50"]);
+        assert_eq!(c.log.level, "WARN");
+        assert_eq!(c.storage.max_daily_bytes, 1048576);
+        assert_eq!(c.storage.retention_days, 7);
+        assert!(c.auth.allow_multiple_dns_sans);
+        // 數值欄位不是數字時仍是錯誤
+        assert!(from_env(&[("KAIROS__STORAGE__MAX_DAILY_BYTES", "lots")]).is_err());
+        // 設定檔中的 crl 仍可為陣列或字串
+        let c: AppConfig = Config::builder()
+            .add_source(File::from_str(
+                "[auth]\nclient_ca = \"ca\"\ncrl = \"a.crl,b.crl\"\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(c.auth.crl, ["a.crl", "b.crl"]);
     }
 
     #[test]

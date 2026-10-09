@@ -39,6 +39,8 @@ pub const MONITOR_DEADLINE: Duration = Duration::from_millis(3000);
 pub const WATCHDOG_DEADLINE: Duration = Duration::from_millis(4000);
 /// 關機期間，送出 close_notify 後讀取並丟棄對方資料的上限
 pub const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_millis(200);
+/// 強制結束前等待最後一行日誌寫出的上限（日誌所在磁碟或 stdout 卡住時不能拖住結束）
+pub const FINAL_LOG_WAIT: Duration = Duration::from_millis(100);
 
 /// 關機狀態：取消訊號與 T0
 #[derive(Debug, Default)]
@@ -165,19 +167,42 @@ impl Signals {
     }
 }
 
+/// 在另一個執行緒執行 `log`（寫日誌並 flush），最多等 `wait`；回傳是否在時限內完成。
+/// 日誌所在的磁碟或 stdout 卡住時，呼叫端不會因 fern 的鎖或 I/O 而卡住（R2-K1）。
+fn try_log_within(wait: Duration, log: impl FnOnce() + Send + 'static) -> bool {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("kairos-final-log".into())
+        .spawn(move || {
+            log();
+            let _ = done_tx.send(());
+        });
+    spawned.is_ok() && done_rx.recv_timeout(wait).is_ok()
+}
+
+/// 嘗試記錄最後一行 ERROR（最多等 [`FINAL_LOG_WAIT`]）後立即以 `code` 結束行程
+fn log_and_exit(code: i32, message: String) -> ! {
+    try_log_within(FINAL_LOG_WAIT, move || {
+        error!("{}", message);
+        log::logger().flush();
+    });
+    std::process::exit(code)
+}
+
 /// 看門狗：在獨立的 OS 執行緒等到 T0 + 4 秒，若行程仍未結束就強制結束。
-/// 用來防止 fs 卡住等無法取消的阻塞讓關機超過 Windows 給的時間。
+/// 用來防止 fs 卡住等無法取消的阻塞讓關機超過 Windows 給的時間；結束前的日誌只嘗試寫出，不等它完成。
 fn start_watchdog(t0: Instant) {
     let spawned = std::thread::Builder::new()
         .name("kairos-shutdown-watchdog".into())
         .spawn(move || {
             std::thread::sleep((t0 + WATCHDOG_DEADLINE).saturating_duration_since(Instant::now()));
-            error!(
-                "關機超過 {:.1} 秒仍未完成，強制結束",
-                WATCHDOG_DEADLINE.as_secs_f64()
+            log_and_exit(
+                WATCHDOG_EXIT_CODE,
+                format!(
+                    "關機超過 {:.1} 秒仍未完成，強制結束",
+                    WATCHDOG_DEADLINE.as_secs_f64()
+                ),
             );
-            log::logger().flush();
-            std::process::exit(WATCHDOG_EXIT_CODE);
         });
     if let Err(e) = spawned {
         warn!("無法啟動關機看門狗: {}", e);
@@ -192,9 +217,10 @@ pub async fn watch(mut signals: Signals, shutdown: std::sync::Arc<Shutdown>) {
     info!("收到 {} 訊號，開始關機（再送一次訊號可強制結束）", first);
 
     let second = signals.recv().await;
-    warn!("再次收到 {} 訊號，強制結束", second);
-    log::logger().flush();
-    std::process::exit(FORCED_EXIT_CODE);
+    log_and_exit(
+        FORCED_EXIT_CODE,
+        format!("再次收到 {} 訊號，強制結束", second),
+    );
 }
 
 #[cfg(test)]
@@ -251,6 +277,26 @@ mod tests {
         // 已過期限：0
         let late = t0 + CONNECTIONS_DEADLINE + Duration::from_millis(1);
         assert_eq!(drain_limit(Some(t0), late, normal), Duration::ZERO);
+    }
+
+    #[test]
+    fn final_log_attempt_does_not_wait_for_a_stuck_logger() {
+        // R2-K1：日誌卡住（此處以永不釋放的鎖模擬）時，最多等 FINAL_LOG_WAIT 就繼續結束流程
+        let stuck = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held = stuck.lock().unwrap();
+        let s = stuck.clone();
+        let started = Instant::now();
+        let done = try_log_within(Duration::from_millis(100), move || {
+            let _g = s.lock();
+        });
+        assert!(!done);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "不得等待卡住的日誌"
+        );
+        drop(held);
+        // 日誌正常時會等到寫完
+        assert!(try_log_within(Duration::from_secs(10), || {}));
     }
 
     #[tokio::test]

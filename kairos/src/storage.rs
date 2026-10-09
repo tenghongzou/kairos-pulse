@@ -7,9 +7,12 @@
 //! - 連線等待逾時後，逾時的要求絕不能再被寫入：每筆要求附有 [`WriteTicket`]，writer 編碼前先
 //!   「認領」，連線逾時時先「取消」，兩者以 compare-and-swap 互斥，只有一方會成功；
 //! - 寫出中途失敗時，只有確定一個 byte 都沒寫入檔案的要求才回 [`WriteStatus::Failed`]，
-//!   可能已（部分）寫入的要求回 [`WriteStatus::Unknown`]（連線不回應並斷線）。
+//!   可能已（部分）寫入的要求回 [`WriteStatus::Unknown`]（連線不回應並斷線）；
+//! - 當天的檔案達到 `storage.max_daily_bytes` 時，放不下的要求不寫入，回 [`WriteStatus::Failed`]
+//!   （R2-K3）。
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use futures_util::FutureExt;
 use log::{debug, error, info, warn};
 use serde::{Serialize, Serializer};
 use std::io::{Error, ErrorKind, SeekFrom};
@@ -24,7 +27,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::registry::RegistrySnapshot;
-use crate::retention::{DateGuard, DatedFiles, GUARD_STATE_FILE};
+use crate::retention::{
+    DateGuard, DatedFiles, GUARD_STATE_FILE, is_tmp_name_for, write_atomically,
+};
+use crate::throttle::{Category, LogThrottle};
+use crate::throttled;
 
 /// report 佇列容量
 pub const REPORT_QUEUE_CAPACITY: usize = 1024;
@@ -48,6 +55,9 @@ pub const REPORT_FILES: DatedFiles = DatedFiles {
 
 /// 取得目前時間的函式（正式程式為 `Utc::now`，測試可注入固定時間）
 pub type Clock = fn() -> DateTime<Utc>;
+
+/// 達到每日大小上限時回給連線的原因（連線回 `storage_unavailable`）
+const DAILY_LIMIT_REACHED: &str = "已達當天 report 檔的大小上限（storage.max_daily_bytes）";
 
 /// RFC 3339 UTC 毫秒格式，例如 `2026-10-08T03:15:45.210Z`
 pub fn fmt_time(t: DateTime<Utc>) -> String {
@@ -156,7 +166,6 @@ impl PendingWrite {
 pub struct DataPaths {
     pub data_dir: PathBuf,
     pub agents: PathBuf,
-    pub agents_tmp: PathBuf,
 }
 
 impl DataPaths {
@@ -164,7 +173,6 @@ impl DataPaths {
         Self {
             data_dir: data_dir.to_path_buf(),
             agents: data_dir.join(AGENTS_FILE),
-            agents_tmp: data_dir.join(format!("{}.tmp", AGENTS_FILE)),
         }
     }
 }
@@ -184,7 +192,7 @@ pub fn split_by_date(
     groups
 }
 
-/// 建立資料目錄（啟動時呼叫，失敗即中止啟動）
+/// 建立資料目錄（啟動時呼叫，失敗即中止啟動），並刪除先前異常結束時留下的暫存檔
 pub async fn prepare_data_dir(data_dir: &Path) -> Result<DataPaths, Error> {
     fs::create_dir_all(data_dir).await.map_err(|e| {
         Error::new(
@@ -192,6 +200,17 @@ pub async fn prepare_data_dir(data_dir: &Path) -> Result<DataPaths, Error> {
             format!("無法建立資料目錄 {}: {}", data_dir.display(), e),
         )
     })?;
+    if let Ok(mut entries) = fs::read_dir(data_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if (is_tmp_name_for(name, AGENTS_FILE) || is_tmp_name_for(name, GUARD_STATE_FILE))
+                && entry.file_type().await.is_ok_and(|t| t.is_file())
+            {
+                let _ = fs::remove_file(entry.path()).await;
+            }
+        }
+    }
     Ok(DataPaths::new(data_dir))
 }
 
@@ -361,10 +380,11 @@ impl ReportSink {
 /// 啟動 report 寫入工作，回傳 (handle, writer task)。
 ///
 /// 啟動時清除過期檔案、提示舊版 reports.jsonl，並開啟今天（UTC）的檔案；
-/// 開檔失敗即回錯誤，讓啟動階段就發現問題。
+/// 開檔失敗即回錯誤，讓啟動階段就發現問題。`max_daily_bytes` 為每個日期檔案的大小上限（0 = 不限制）。
 pub async fn start_report_writer(
     data_dir: PathBuf,
     retention_days: u32,
+    max_daily_bytes: u64,
     clock: Clock,
     cleanup_every: Duration,
 ) -> Result<(ReportSink, impl std::future::Future<Output = ()>), Error> {
@@ -376,46 +396,98 @@ pub async fn start_report_writer(
             legacy.display()
         );
     }
-    // 以既有最新的 report 檔日期為基準（不晚於今天），啟動時的時鐘跳躍也能偵測到
     // 時鐘跳躍保護的狀態以資料目錄中的狀態檔為準；沒有（或損毀）時以既有最新的 report 檔日期為基準
     // （不晚於今天，晚於今天的檔案不列入），啟動時的時鐘跳躍也能偵測到
     let baseline = REPORT_FILES.guard_baseline(REPORT_FILES.newest(&data_dir, today), today);
     let guard = DateGuard::load_or_new(
         REPORT_FILES.label,
         data_dir.join(GUARD_STATE_FILE),
+        None,
         baseline,
         Instant::now(),
         clock(),
     );
-    let mut state = WriterState {
-        data_dir,
-        retention_days,
-        clock,
-        current: None,
-        last_cleanup: today,
-        guard,
-    };
+    let mut state = WriterState::new(data_dir, retention_days, max_daily_bytes, clock, guard);
     state.cleanup_now().await;
 
-    let writer = open_reports_file(&state.data_dir.join(REPORT_FILES.file_name(today))).await?;
-    state.current = Some((today, writer));
+    state.current = Some(OpenFile::open(&state.data_dir, today).await?);
     let (sink, rx) = report_channel(REPORT_QUEUE_CAPACITY);
     Ok((sink, run_report_writer(state, rx, cleanup_every)))
+}
+
+/// 目前開啟的 report 檔
+struct OpenFile {
+    date: NaiveDate,
+    writer: BufWriter<File>,
+    /// 檔案目前的大小（開檔時讀取，之後加上成功寫入的 bytes 數）
+    len: u64,
+}
+
+impl OpenFile {
+    async fn open(data_dir: &Path, date: NaiveDate) -> Result<Self, Error> {
+        let path = data_dir.join(REPORT_FILES.file_name(date));
+        let writer = open_reports_file(&path).await?;
+        let len = file_len(&writer)
+            .await
+            .ok_or_else(|| Error::other(format!("無法取得 {} 的大小", path.display())))?;
+        Ok(Self { date, writer, len })
+    }
 }
 
 struct WriterState {
     data_dir: PathBuf,
     retention_days: u32,
+    /// 每個日期檔案的大小上限（0 = 不限制）
+    max_daily_bytes: u64,
     clock: Clock,
-    /// 目前開啟的檔案及其日期
-    current: Option<(NaiveDate, BufWriter<File>)>,
+    /// 目前開啟的檔案
+    current: Option<OpenFile>,
     /// 最近一次執行清除時的「今天」；寫入的紀錄切換到更新的日期時再清除一次
     last_cleanup: NaiveDate,
     /// 清除前的日期合理性檢查（時鐘往前跳時不清除）
     guard: DateGuard,
+    /// 開檔／寫入失敗與達到大小上限的日誌節流（磁碟滿時每批都會失敗；R2-K12）
+    throttle: LogThrottle,
+    /// 測試用：下一次寫出只寫入這麼多 bytes 就回報失敗（模擬寫到一半磁碟滿）
+    #[cfg(test)]
+    fail_after: Option<usize>,
 }
 
 impl WriterState {
+    fn new(
+        data_dir: PathBuf,
+        retention_days: u32,
+        max_daily_bytes: u64,
+        clock: Clock,
+        guard: DateGuard,
+    ) -> Self {
+        Self {
+            data_dir,
+            retention_days,
+            max_daily_bytes,
+            clock,
+            current: None,
+            last_cleanup: clock().date_naive(),
+            guard,
+            throttle: LogThrottle::default(),
+            #[cfg(test)]
+            fail_after: None,
+        }
+    }
+
+    /// 寫出一段資料並 flush（測試可注入寫到一半失敗）
+    async fn write_out(&mut self, data: &[u8]) -> Result<(), Error> {
+        let Some(file) = self.current.as_mut() else {
+            return Err(Error::other("report 檔未開啟"));
+        };
+        #[cfg(test)]
+        if let Some(n) = self.fail_after.take() {
+            write_all_and_flush(&mut file.writer, &data[..n.min(data.len())]).await?;
+            return Err(Error::new(ErrorKind::StorageFull, "測試注入的寫入失敗"));
+        }
+        write_all_and_flush(&mut file.writer, data).await
+    }
+
     /// 將同一天的紀錄整段寫入該日的檔案（一次 write_all + flush），再逐筆回覆結果。
     /// 編碼前先認領每一筆；連線已因逾時取消（已回 `storage_unavailable`）的要求直接略過。
     async fn write_day(&mut self, date: NaiveDate, requests: Vec<WriteRequest>, buf: &mut Vec<u8>) {
@@ -451,12 +523,12 @@ impl WriterState {
         let not_written = |reason: String| vec![WriteStatus::Failed(reason); records.len()];
         let path = self.data_dir.join(REPORT_FILES.file_name(date));
 
-        if self.current.as_ref().map(|(d, _)| *d) != Some(date) {
+        if self.current.as_ref().map(|f| f.date) != Some(date) {
             // 換日（或跨日批次中的下一段）：關閉舊檔，必要時清除過期檔案
-            if let Some((old_date, mut old)) = self.current.take()
-                && let Err(e) = old.flush().await
+            if let Some(mut old) = self.current.take()
+                && let Err(e) = old.writer.flush().await
             {
-                error!("寫入 {} 失敗: {}", REPORT_FILES.file_name(old_date), e);
+                error!("寫入 {} 失敗: {}", REPORT_FILES.file_name(old.date), e);
             }
             info!("開始寫入 {}", path.display());
             // 換日時清除一次；刪除與否以 writer 的時鐘（經合理性檢查）為準，不以單筆紀錄的日期決定
@@ -473,16 +545,23 @@ impl WriterState {
         }
 
         if self.current.is_none() {
-            match open_reports_file(&path).await {
-                Ok(w) => self.current = Some((date, w)),
+            match OpenFile::open(&self.data_dir, date).await {
+                Ok(f) => self.current = Some(f),
                 Err(e) => {
-                    // 開檔失敗：這一批一個 byte 都還沒寫
-                    error!("{}，{} 筆 report 未寫入", e, records.len());
+                    // 開檔失敗：這一批一個 byte 都還沒寫。磁碟滿或權限錯誤時每批都會失敗，節流記錄
+                    throttled!(
+                        self.throttle,
+                        Category::StorageWrite,
+                        error,
+                        "{}，{} 筆 report 未寫入",
+                        e,
+                        records.len()
+                    );
                     return not_written(e.to_string());
                 }
             }
         }
-        let Some((_, w)) = self.current.as_mut() else {
+        let Some(file) = self.current.as_ref() else {
             return not_written("report 檔未開啟".to_string());
         };
 
@@ -490,19 +569,55 @@ impl WriterState {
         // 每批結束時緩衝區都是空的（成功時已 flush，失敗時丟棄 writer），檔案長度的變化即為這批寫入的量
         buf.clear();
         let encoded = encode_batch(records.iter(), buf);
-        let len_before = file_len(w).await;
-        match write_all_and_flush(w, buf).await {
+        // 每日大小上限：只寫入放得下的前段，其餘確定未寫入
+        let cutoff = daily_limit_cutoff(&encoded, buf.len(), file.len, self.max_daily_bytes);
+        if cutoff < buf.len() {
+            throttled!(
+                self.throttle,
+                Category::StorageWrite,
+                error,
+                "{} 已達每日大小上限 {} bytes（storage.max_daily_bytes），本批 {} 筆中有 {} 筆未寫入",
+                path.display(),
+                self.max_daily_bytes,
+                records.len(),
+                encoded
+                    .iter()
+                    .flatten()
+                    .filter(|r| r.start >= cutoff)
+                    .count()
+            );
+        }
+        let len_before = file_len(&file.writer).await;
+        let result = if cutoff == 0 {
+            Ok(())
+        } else {
+            self.write_out(&buf[..cutoff]).await
+        };
+        let mut results = match result {
             Ok(()) => {
-                debug!(
-                    "已寫入 {} 筆 report 至 {}",
-                    encoded.iter().filter(|r| r.is_some()).count(),
-                    path.display()
-                );
+                if let Some(file) = self.current.as_mut() {
+                    file.len += cutoff as u64;
+                }
+                if cutoff > 0 {
+                    debug!(
+                        "已寫入 {} 筆 report 至 {}",
+                        encoded
+                            .iter()
+                            .flatten()
+                            .filter(|r| r.start < cutoff)
+                            .count(),
+                        path.display()
+                    );
+                }
                 results_after_success(&encoded)
             }
             Err(e) => {
                 // 中途失敗時可能已寫入一部分：以檔案長度的變化判斷哪些紀錄確定沒寫入
-                let written = match (len_before, file_len(w).await) {
+                let len_after = match self.current.as_ref() {
+                    Some(f) => file_len(&f.writer).await,
+                    None => None,
+                };
+                let written = match (len_before, len_after) {
                     (Some(before), Some(after)) => after.checked_sub(before),
                     _ => None,
                 };
@@ -515,18 +630,30 @@ impl WriterState {
                     .iter()
                     .filter(|r| matches!(r, WriteStatus::Unknown(_)))
                     .count();
-                error!(
+                throttled!(
+                    self.throttle,
+                    Category::StorageWrite,
+                    error,
                     "寫入 {} 失敗（本批 {} 筆，其中 {} 筆可能已部分寫入、結果未知）: {}",
                     path.display(),
                     records.len(),
                     unknown,
                     e
                 );
-                // 丟棄目前的 writer，下一批重新開檔（開檔時會補換行）
+                // 丟棄目前的 writer，下一批重新開檔（開檔時會補換行並重新讀取大小）
                 self.current = None;
                 results
             }
+        };
+        // 超過上限而沒有寫出的紀錄：確定未寫入
+        for (result, range) in results.iter_mut().zip(&encoded) {
+            if let Some(r) = range
+                && r.start >= cutoff
+            {
+                *result = WriteStatus::Failed(DAILY_LIMIT_REACHED.to_string());
+            }
         }
+        results
     }
 
     /// 以目前時鐘的日期執行保留清除；日期比先前晚超過 2 天（時鐘可能被誤校）時跳過
@@ -539,6 +666,7 @@ impl WriterState {
         let Some(date) = self
             .guard
             .check(now_wall.date_naive(), Instant::now(), now_wall)
+            .await
         else {
             return;
         };
@@ -573,15 +701,20 @@ async fn run_report_writer(
                 for (date, requests) in split_by_date(batch.drain(..)) {
                     state.write_day(date, requests, &mut buf).await;
                 }
+                // 高負載時佇列一直有資料，上面的分支永遠先被選中：每批處理完也檢查是否該清除，
+                // 避免定期清除被餓死（R2-K19）
+                if cleanup.tick().now_or_never().is_some() {
+                    state.cleanup_now().await;
+                }
             }
             _ = cleanup.tick() => state.cleanup_now().await,
         }
     }
 
-    if let Some((date, mut w)) = state.current.take()
-        && let Err(e) = w.flush().await
+    if let Some(mut file) = state.current.take()
+        && let Err(e) = file.writer.flush().await
     {
-        error!("寫入 {} 失敗: {}", REPORT_FILES.file_name(date), e);
+        error!("寫入 {} 失敗: {}", REPORT_FILES.file_name(file.date), e);
     }
     debug!("report 寫入工作結束");
 }
@@ -596,8 +729,28 @@ async fn write_all_and_flush(w: &mut BufWriter<File>, data: &[u8]) -> Result<(),
     w.flush().await
 }
 
-/// 將快照寫入 agents.json：先寫 `.tmp` 並同步到磁碟（fsync）再 rename，
-/// 避免讀取端看到寫到一半的檔案，也避免當機後 rename 已生效、內容卻是空的
+/// 每日大小上限：`buf`（長度 `buf_len`，各筆位置為 `encoded`）中可寫入的前段長度。
+/// 檔案目前為 `file_len` bytes；`max` 為 0 時不限制。只寫入完整的紀錄（第一筆放不下的紀錄起全部不寫）。
+pub fn daily_limit_cutoff(
+    encoded: &[Option<Range<usize>>],
+    buf_len: usize,
+    file_len: u64,
+    max: u64,
+) -> usize {
+    if max == 0 {
+        return buf_len;
+    }
+    let remaining = max.saturating_sub(file_len);
+    encoded
+        .iter()
+        .flatten()
+        .find(|r| r.end as u64 > remaining)
+        .map_or(buf_len, |r| r.start)
+}
+
+/// 將快照寫入 agents.json：以隨機檔名建立暫存檔（`create_new`，不跟隨預先放置的符號連結；R2-K9）、
+/// 同步到磁碟（fsync）再 rename，避免讀取端看到寫到一半的檔案，也避免當機後 rename 已生效、
+/// 內容卻是空的。寫檔在 blocking 執行緒進行。
 pub async fn write_agents_snapshot(
     paths: &DataPaths,
     snapshot: &RegistrySnapshot,
@@ -606,34 +759,11 @@ pub async fn write_agents_snapshot(
         serde_json::to_vec_pretty(snapshot).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
     json.push(b'\n');
     // 資料目錄在執行中被刪除時重建
-    ensure_parent_dir(&paths.agents_tmp).await?;
-    write_and_sync(&paths.agents_tmp, &json)
+    ensure_parent_dir(&paths.agents).await?;
+    let path = paths.agents.clone();
+    tokio::task::spawn_blocking(move || write_atomically(&path, &[&json]))
         .await
-        .map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("無法寫入 {}: {}", paths.agents_tmp.display(), e),
-            )
-        })?;
-    fs::rename(&paths.agents_tmp, &paths.agents)
-        .await
-        .map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!(
-                    "無法將 {} 更名為 {}: {}",
-                    paths.agents_tmp.display(),
-                    paths.agents.display(),
-                    e
-                ),
-            )
-        })
-}
-
-async fn write_and_sync(path: &Path, data: &[u8]) -> Result<(), Error> {
-    let mut file = File::create(path).await?;
-    file.write_all(data).await?;
-    file.sync_all().await
+        .map_err(Error::other)?
 }
 
 #[cfg(test)]
@@ -820,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn write_replies_ok_only_after_data_is_in_the_file() {
         let dir = temp_dir("ack");
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         let handle = tokio::spawn(task);
@@ -839,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn write_failure_is_reported_to_the_sender() {
         let dir = temp_dir("fail");
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         let handle = tokio::spawn(task);
@@ -894,7 +1024,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (sink, task) = start_report_writer(dir.clone(), 30, clock, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, clock, HOUR)
             .await
             .unwrap();
         // 啟動時（今天 10-09）09-09 剛好 30 天前 → 保留
@@ -947,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn writer_cleans_up_periodically_without_reports() {
         let dir = temp_dir("periodic");
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, Duration::from_millis(50))
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, Duration::from_millis(50))
             .await
             .unwrap();
         let handle = tokio::spawn(task);
@@ -989,7 +1119,7 @@ mod tests {
     async fn writer_recreates_deleted_data_dir() {
         let dir = temp_dir("rm");
         let path = dir.join(REPORT_FILES.file_name(noon().date_naive()));
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         let handle = tokio::spawn(task);
@@ -1009,7 +1139,7 @@ mod tests {
     #[tokio::test]
     async fn writer_drains_queue_and_replies_after_senders_dropped() {
         let dir = temp_dir("drain");
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         // writer 尚未啟動時先塞 500 筆，模擬關機時佇列中仍有資料
@@ -1035,7 +1165,7 @@ mod tests {
     async fn cancelled_request_is_never_written() {
         // K-C1：連線逾時取消（已回 storage_unavailable）的要求，writer 不得寫入
         let dir = temp_dir("cancel");
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         // writer 尚未啟動：三筆都在佇列中
@@ -1139,9 +1269,10 @@ mod tests {
         fs::write(&old, b"x\n").await.unwrap();
         fs::write(&recent, b"x\n").await.unwrap();
 
-        let (sink, task) = start_report_writer(dir.clone(), 30, clock, Duration::from_millis(20))
-            .await
-            .unwrap();
+        let (sink, task) =
+            start_report_writer(dir.clone(), 30, 0, clock, Duration::from_millis(20))
+                .await
+                .unwrap();
         assert!(
             fs::metadata(&old).await.is_err(),
             "正常日期下過期檔案照常刪除"
@@ -1179,9 +1310,10 @@ mod tests {
         let recent = dir.join("reports-2026-10-08.jsonl");
         fs::write(&recent, b"x\n").await.unwrap();
 
-        let (sink, task) = start_report_writer(dir.clone(), 30, clock, Duration::from_millis(20))
-            .await
-            .unwrap();
+        let (sink, task) =
+            start_report_writer(dir.clone(), 30, 0, clock, Duration::from_millis(20))
+                .await
+                .unwrap();
         let handle = tokio::spawn(task);
         // 跳到一年後：定期清除偵測到跳躍；未來日期的紀錄建立未來日期的檔案
         set_clock(&NOW, at(2027, 10, 9, 12, 0, 0));
@@ -1200,7 +1332,7 @@ mod tests {
         assert!(fs::metadata(dir.join(GUARD_STATE_FILE)).await.is_ok());
 
         // 重新啟動（時鐘仍在未來）：沒有狀態檔時基準會是 2027-10-09 而立即清除
-        let (sink, task) = start_report_writer(dir.clone(), 30, clock, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, clock, HOUR)
             .await
             .unwrap();
         assert!(fs::metadata(&recent).await.is_ok(), "重新啟動後不得清除");
@@ -1214,7 +1346,7 @@ mod tests {
 
         // 對照組：刪掉狀態檔後重新啟動，以未來日期為基準就會清除（證明上面的保護來自狀態檔）
         fs::remove_file(dir.join(GUARD_STATE_FILE)).await.unwrap();
-        let (sink, task) = start_report_writer(dir.clone(), 30, clock, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, clock, HOUR)
             .await
             .unwrap();
         assert!(fs::metadata(&recent).await.is_err());
@@ -1230,7 +1362,7 @@ mod tests {
         fs::create_dir_all(&dir).await.unwrap();
         let recent = dir.join("reports-2026-10-01.jsonl");
         fs::write(&recent, b"x\n").await.unwrap();
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         let handle = tokio::spawn(task);
@@ -1254,7 +1386,7 @@ mod tests {
         let newest = dir.join("reports-2026-09-29.jsonl");
         fs::write(&ancient, b"x\n").await.unwrap();
         fs::write(&newest, b"x\n").await.unwrap();
-        let (sink, task) = start_report_writer(dir.clone(), 30, noon, HOUR)
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
             .await
             .unwrap();
         assert!(fs::metadata(&ancient).await.is_ok());
@@ -1274,7 +1406,142 @@ mod tests {
         let v: Value =
             serde_json::from_str(&fs::read_to_string(&paths.agents).await.unwrap()).unwrap();
         assert_eq!(v["total"], json!(0));
-        assert!(fs::metadata(&paths.agents_tmp).await.is_err());
+        // 暫存檔已更名，沒有殘留
+        let mut names = Vec::new();
+        let mut entries = fs::read_dir(&dir).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, [AGENTS_FILE]);
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_temp_files_are_removed_at_startup() {
+        let dir = temp_dir("stale-tmp");
+        fs::create_dir_all(&dir).await.unwrap();
+        for n in [
+            "agents.json.tmp",
+            "agents.json.0123456789abcdef.tmp",
+            ".retention-guard.json.fedcba9876543210.tmp",
+        ] {
+            fs::write(dir.join(n), b"x").await.unwrap();
+        }
+        let keep = dir.join("agents.json.backup");
+        fs::write(&keep, b"x").await.unwrap();
+        prepare_data_dir(&dir).await.unwrap();
+        let mut names = Vec::new();
+        let mut entries = fs::read_dir(&dir).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, ["agents.json.backup"]);
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn daily_limit_cutoff_keeps_whole_records() {
+        let encoded = vec![Some(0..10), None, Some(10..20), Some(20..30)];
+        // 不限制
+        assert_eq!(daily_limit_cutoff(&encoded, 30, 1_000_000, 0), 30);
+        // 剩 25 bytes：前兩筆放得下，第三筆放不下 → 從第三筆的開頭截斷
+        assert_eq!(daily_limit_cutoff(&encoded, 30, 75, 100), 20);
+        // 剛好放得下
+        assert_eq!(daily_limit_cutoff(&encoded, 30, 70, 100), 30);
+        // 已滿或已超過
+        assert_eq!(daily_limit_cutoff(&encoded, 30, 100, 100), 0);
+        assert_eq!(daily_limit_cutoff(&encoded, 30, 200, 100), 0);
+    }
+
+    #[tokio::test]
+    async fn daily_size_limit_rejects_records_that_do_not_fit() {
+        // R2-K3：達到每日大小上限後回 Failed（storage_unavailable，確定未寫入），不寫入檔案
+        let dir = temp_dir("daily-limit");
+        let line_len = {
+            let mut buf = Vec::new();
+            encode_batch(std::iter::once(&record(1)), &mut buf);
+            buf.len() as u64
+        };
+        // 上限可放 2.5 筆
+        let (sink, task) = start_report_writer(dir.clone(), 30, line_len * 5 / 2, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        assert_eq!(sink.write(record(1)).await, Ok(()));
+        assert_eq!(sink.write(record(2)).await, Ok(()));
+        let err = sink.write(record(3)).await.unwrap_err();
+        assert!(err.contains("max_daily_bytes"), "{err}");
+        let path = dir.join(REPORT_FILES.file_name(noon().date_naive()));
+        assert_eq!(seqs_in(&path).await, [1, 2]);
+        drop(sink);
+        handle.await.unwrap();
+
+        // 重新啟動後以既有檔案大小計算，仍然拒絕
+        let (sink, task) = start_report_writer(dir.clone(), 30, line_len * 5 / 2, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        assert!(sink.write(record(4)).await.is_err());
+
+        drop(sink);
+        handle.await.unwrap();
+        assert_eq!(seqs_in(&path).await, [1, 2]);
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_write_failure_replies_by_file_length_and_repairs_the_line() {
+        // R2-T1：寫出中途失敗的整條路徑——以檔案長度的變化判定每筆的結果，下一批重新開檔並補換行
+        let dir = temp_dir("partial");
+        fs::create_dir_all(&dir).await.unwrap();
+        let guard = DateGuard::new("report 檔", noon().date_naive(), Instant::now(), noon());
+        let mut state = WriterState::new(dir.clone(), 30, 0, noon, guard);
+        let date = noon().date_naive();
+        let mut buf = Vec::new();
+        let line_len = {
+            let mut b = Vec::new();
+            encode_batch(std::iter::once(&record(1)), &mut b);
+            b.len()
+        };
+
+        // 第一批：3 筆，只寫入第一筆加上第二筆的前 5 bytes 就失敗
+        state.fail_after = Some(line_len + 5);
+        let mut replies = Vec::new();
+        let mut requests = Vec::new();
+        for seq in 1..=3 {
+            let (req, rx) = request(record(seq));
+            requests.push(req);
+            replies.push(rx);
+        }
+        state.write_day(date, requests, &mut buf).await;
+        let results: Vec<WriteStatus> = futures_util::future::join_all(replies)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        // 第一筆完整寫入、第二筆部分寫入 → 結果未知（連線不回應並斷線）；第三筆確定沒寫 → Failed
+        assert!(matches!(results[0], WriteStatus::Unknown(_)), "{results:?}");
+        assert!(matches!(results[1], WriteStatus::Unknown(_)), "{results:?}");
+        assert!(matches!(results[2], WriteStatus::Failed(_)), "{results:?}");
+        assert!(state.current.is_none(), "失敗後丟棄 writer");
+
+        // 第二批：重新開檔、先補換行再寫入
+        let (req, rx) = request(record(4));
+        state.write_day(date, vec![req], &mut buf).await;
+        assert_eq!(rx.await.unwrap(), WriteStatus::Written);
+        let path = dir.join(REPORT_FILES.file_name(date));
+        let text = fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[1].len(), 5);
+        let last: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(last["seq"], 4);
+        // 檔案大小的追蹤包含補上的換行
+        assert_eq!(
+            state.current.as_ref().unwrap().len,
+            fs::metadata(&path).await.unwrap().len()
+        );
+        drop(state);
         fs::remove_dir_all(&dir).await.unwrap();
     }
 
@@ -1347,6 +1614,5 @@ mod tests {
         let p = DataPaths::new(Path::new("data"));
         assert_eq!(p.data_dir, Path::new("data"));
         assert_eq!(p.agents, Path::new("data").join("agents.json"));
-        assert_eq!(p.agents_tmp, Path::new("data").join("agents.json.tmp"));
     }
 }

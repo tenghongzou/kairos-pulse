@@ -30,8 +30,10 @@ use tokio_rustls::rustls::{
 use crate::accept_loop;
 use crate::auth::BindingPolicy;
 use crate::config::TimeoutSettings;
-use crate::connection::{ConnContext, REPORT_BURST, REPORT_RATE_PER_SEC};
+use crate::connection::ConnContext;
+use crate::connection::{MESSAGE_BURST, MESSAGES_PER_SEC};
 use crate::per_ip::PerIpLimiter;
+use crate::rate::{REPORT_INITIAL_TOKENS, REPORT_RATE_PER_SEC, ReportLimiter};
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::Shutdown;
 use crate::storage::{
@@ -52,6 +54,7 @@ struct Options {
     /// 啟用 mTLS 時的 CRL（PEM 內容）；`None` 表示不啟用 mTLS
     mtls_crls: Option<Vec<&'static str>>,
     max_agents: usize,
+    max_connections: usize,
     max_connections_per_ip: usize,
     timeouts: TimeoutSettings,
     /// 取代真正的 report writer（例如模擬卡住的磁碟）
@@ -63,6 +66,7 @@ impl Default for Options {
         Self {
             mtls_crls: None,
             max_agents: 100,
+            max_connections: 64,
             max_connections_per_ip: 32,
             timeouts: TimeoutSettings::default(),
             reports: None,
@@ -92,10 +96,15 @@ impl Server {
         let reports = match opts.reports {
             Some(sink) => sink,
             None => {
-                let (sink, writer) =
-                    start_report_writer(dir.join("data"), 30, Utc::now, RETENTION_SWEEP_INTERVAL)
-                        .await
-                        .unwrap();
+                let (sink, writer) = start_report_writer(
+                    dir.join("data"),
+                    30,
+                    0,
+                    Utc::now,
+                    RETENTION_SWEEP_INTERVAL,
+                )
+                .await
+                .unwrap();
                 tokio::spawn(writer);
                 sink
             }
@@ -110,13 +119,17 @@ impl Server {
             tls: tls.clone(),
             throttle: Arc::new(LogThrottle::default()),
             binding: BindingPolicy::default(),
+            report_limiter: Arc::new(ReportLimiter::new(opts.max_connections_per_ip)),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // 與正式程式相同的 accept 迴圈（含全域與每 IP 的連線上限）
         let per_ip = PerIpLimiter::new(opts.max_connections_per_ip);
+        let max_connections = opts.max_connections;
         let accept = tokio::spawn(async move {
-            let mut connections = accept_loop(listener, ctx, 64, per_ip).await.unwrap();
+            let mut connections = accept_loop(listener, ctx, max_connections, per_ip)
+                .await
+                .unwrap();
             // 關機後等待連線送出 close_notify 並結束（JoinSet 被釋放時會中止仍在執行的連線）
             while connections.join_next().await.is_some() {}
         });
@@ -158,7 +171,7 @@ impl Server {
         }
     }
 
-    /// 熱重載：改用新的 CRL
+    /// 熱重載：改用新的 CRL（PEM 內容）
     fn reload_crls(&self, crls: &[&str]) {
         let paths = Self::tls_paths(&self.dir, Some(crls));
         self.tls.replace(tls::build(&paths).unwrap());
@@ -598,11 +611,12 @@ async fn full_registry_rejects_new_agent_with_fatal_error() {
 #[tokio::test]
 async fn reports_beyond_the_rate_limit_are_delayed() {
     // K-S6：超過可連續的筆數後，每秒最多處理 REPORT_RATE_PER_SEC 則
+    // （R2-K3：新連線只有 REPORT_INITIAL_TOKENS 個額度）
     let server = Server::start(Options::default()).await;
     let mut c = Client::connect(server.addr).await;
     c.register(ID).await;
     let extra = 4u64;
-    let total = REPORT_BURST as u64 + extra;
+    let total = REPORT_INITIAL_TOKENS as u64 + extra;
     let started = Instant::now();
     for seq in 0..total {
         c.send(&report(10 + seq)).await;
@@ -615,6 +629,163 @@ async fn reports_beyond_the_rate_limit_are_delayed() {
     assert!(
         elapsed >= min - Duration::from_millis(100),
         "{elapsed:?} < {min:?}"
+    );
+}
+
+#[tokio::test]
+async fn reconnecting_does_not_get_a_fresh_report_allowance() {
+    // R2-K3：未啟用 mTLS 時以來源 IP 跨連線限速；重新連線不會取得新的（滿的）額度
+    let server = Server::start(Options {
+        max_connections_per_ip: 1,
+        ..Options::default()
+    })
+    .await;
+    let mut c = Client::connect(server.addr).await;
+    c.register(ID).await;
+    // 用完來源 IP 的初始額度（2 則）
+    for seq in 0..REPORT_INITIAL_TOKENS as u64 {
+        c.send(&report(10 + seq)).await;
+        assert_eq!(c.recv().await["type"], "ack");
+    }
+    drop(c);
+    // 等伺服器端釋放名額（每 IP 上限 1）後重新連線
+    let mut c = None;
+    for _ in 0..100 {
+        let mut candidate = Client::connect(server.addr).await;
+        candidate.send(&hello(1, ID, 1000)).await;
+        if let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(2), candidate.lines.next_line()).await
+            && line.contains("hello_ack")
+        {
+            c = Some(candidate);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = c.expect("重新連線應成功");
+    // 新連線自己的 bucket 有 2 個額度，但來源 IP 的額度已用完：兩則都需等待（約 0.5 + 0.5 秒）
+    let started = Instant::now();
+    c.send(&report(20)).await;
+    c.send(&report(21)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":20}));
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":21}));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(600), "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn message_rate_is_limited_per_connection() {
+    // R2-K12：超過可連續的則數後，每秒最多處理 MESSAGES_PER_SEC 則（延後，不回錯誤）
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.register(ID).await;
+    let extra = 10u64;
+    let total = MESSAGE_BURST as u64 + extra;
+    let mut batch = String::new();
+    for seq in 0..total {
+        batch.push_str(&heartbeat(100 + seq));
+        batch.push('\n');
+    }
+    let started = Instant::now();
+    c.send_raw(batch.as_bytes()).await;
+    for seq in 0..total {
+        assert_eq!(c.recv().await, json!({"type":"ack","seq":100 + seq}));
+    }
+    // hello 也算一則：至少 (extra - 1) / 速率
+    let min = Duration::from_secs_f64((extra - 1) as f64 / MESSAGES_PER_SEC);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= min - Duration::from_millis(50),
+        "{elapsed:?} < {min:?}"
+    );
+}
+
+#[tokio::test]
+async fn handshake_slots_are_limited_and_reserved_for_registered_connections() {
+    // R2-K2：握手中（尚未通過 hello）的連線最多佔 max_connections 的一半
+    let server = Server::start(Options {
+        max_connections: 4,
+        ..Options::default()
+    })
+    .await;
+    // 已通過 hello 的連線不佔握手名額
+    let mut registered = Client::connect(server.addr).await;
+    registered.register(ID).await;
+    // 兩條只建立 TCP、不進行握手的連線佔滿握手名額（4 / 2 = 2）
+    let stalled: Vec<TcpStream> = vec![
+        TcpStream::connect(server.addr).await.unwrap(),
+        TcpStream::connect(server.addr).await.unwrap(),
+    ];
+    // 全域名額仍有剩餘，但新連線在握手前就被關閉
+    let mut rejected = false;
+    for _ in 0..50 {
+        let tcp = TcpStream::connect(server.addr).await.unwrap();
+        match tokio::time::timeout(
+            RECV_TIMEOUT,
+            connector(None).connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("伺服器應立即關閉超過握手上限的連線")
+        {
+            Err(_) => {
+                rejected = true;
+                break;
+            }
+            // 停滯的連線可能尚未被 accept：稍後再試
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert!(rejected, "握手名額用盡時新連線不應完成握手");
+    // 已註冊的連線不受影響
+    registered.send(&heartbeat(2)).await;
+    assert_eq!(registered.recv().await["type"], "ack");
+    // 停滯的連線關閉後可再建立新連線
+    drop(stalled);
+    let mut admitted = false;
+    for _ in 0..100 {
+        let tcp = TcpStream::connect(server.addr).await.unwrap();
+        if let Ok(Ok(_)) = tokio::time::timeout(
+            RECV_TIMEOUT,
+            connector(None).connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(admitted);
+}
+
+#[tokio::test]
+async fn unknown_revocation_status_is_reported_with_a_distinct_message() {
+    // R2-K26：CRL 無法判定撤銷狀態（此處換成另一個 CA 的 CRL；CRL 過期亦同）時，
+    // certificate_rejected 的 message 為 "revocation status unavailable"
+    let server = Server::start(Options {
+        mtls_crls: Some(vec![test_pki::CRL_EMPTY]),
+        ..Options::default()
+    })
+    .await;
+    let good = connector(Some((test_pki::GOOD_CERT, test_pki::GOOD_KEY)));
+    let mut c = Client::connect_with(&good, server.addr).await;
+    let other_ca_crl = std::fs::read_to_string(format!("{PKI}crl-empty.crl")).unwrap();
+    server.reload_crls(&[&other_ca_crl]);
+    c.send(&hello(1, test_pki::GOOD_ID, 1000)).await;
+    let err = c.expect_error("certificate_rejected", true).await;
+    assert_eq!(err["message"], "revocation status unavailable");
+    c.expect_clean_close().await;
+
+    // 撤銷的憑證維持原本的 message
+    server.reload_crls(&[test_pki::CRL_EMPTY]);
+    let revoked = connector(Some((test_pki::REVOKED_CERT, test_pki::REVOKED_KEY)));
+    let mut c = Client::connect_with(&revoked, server.addr).await;
+    server.reload_crls(&[test_pki::CRL_REVOKE]);
+    c.send(&hello(1, test_pki::REVOKED_ID, 1000)).await;
+    let err = c.expect_error("certificate_rejected", true).await;
+    assert_eq!(
+        err["message"],
+        "client certificate has been revoked or is no longer trusted"
     );
 }
 

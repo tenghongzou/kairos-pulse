@@ -5,6 +5,10 @@
 //! 檢查檔案與重新驗證都是同步、可能耗時的工作，一律在 blocking 執行緒執行，不佔用 async worker。
 //! 檢查檔案的工作異常結束（panic）時重建 [`Reloader`]，下個週期強制重建設定；
 //! 重新驗證的工作異常結束時無法確保已撤銷的憑證會被斷線（fail-open），因此觸發關機。
+//!
+//! 檢查檔案可能卡住（網路磁碟、FIFO 等；R2-K10）：每次最多等 [`CHECK_WAIT`]，逾時就記 ERROR、
+//! 先以目前的設定重新驗證現役連線；卡住的檢查完成前不會再啟動新的檢查（避免佔滿 blocking 執行緒），
+//! 但每個週期的重新驗證照常進行，不依賴檔案檢查完成。
 
 use log::{debug, error, info, warn};
 use std::io::Error;
@@ -15,7 +19,10 @@ use tokio_rustls::rustls::pki_types::UnixTime;
 
 use crate::registry::{KickReason, Registry};
 use crate::shutdown::{self, Shutdown};
-use crate::tls::{self, Fingerprint, TlsMaterial, TlsPaths, TlsState};
+use crate::tls::{self, ChainRejection, Fingerprint, TlsMaterial, TlsPaths, TlsState};
+
+/// 每個週期等待檔案檢查完成的上限（不超過檢查間隔）
+pub const CHECK_WAIT: Duration = Duration::from_secs(10);
 
 /// 一次檢查的結果
 #[derive(Debug)]
@@ -33,6 +40,32 @@ pub struct Reloader {
     /// 最近一次「嘗試」重建時的指紋；重建失敗後，檔案沒有再變化就不重試（避免每個週期重複記錄同一個錯誤）
     last: Fingerprint,
     state: Arc<TlsState>,
+    /// 測試用：檢查檔案前等待（模擬卡住的檔案系統）
+    #[cfg(test)]
+    stall: Option<Arc<Stall>>,
+}
+
+/// 測試用的閘門：關閉時 `wait` 會卡住，開啟後放行
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct Stall {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl Stall {
+    fn wait(&self) {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.cv.wait(open).unwrap();
+        }
+    }
+
+    pub fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
 }
 
 impl Reloader {
@@ -42,6 +75,8 @@ impl Reloader {
             paths,
             last: initial,
             state,
+            #[cfg(test)]
+            stall: None,
         }
     }
 
@@ -52,6 +87,10 @@ impl Reloader {
 
     /// 檢查檔案是否變化，有變化就重建（同步讀檔，請在 blocking 執行緒呼叫）
     pub fn check(&mut self) -> ReloadOutcome {
+        #[cfg(test)]
+        if let Some(stall) = &self.stall {
+            stall.wait();
+        }
         let current = tls::fingerprint(&self.paths);
         if current == self.last {
             return ReloadOutcome::Unchanged;
@@ -72,7 +111,7 @@ pub fn revalidate(
     registry: &Registry,
     material: &TlsMaterial,
     now: UnixTime,
-) -> Vec<(String, String)> {
+) -> Vec<(String, ChainRejection)> {
     let Some(verifier) = &material.verifier else {
         return Vec::new();
     };
@@ -94,16 +133,40 @@ pub fn revalidate(
 
 /// 重載工作：每 `period` 檢查一次，直到關機
 pub async fn run(
-    mut reloader: Reloader,
+    reloader: Reloader,
     registry: Arc<Registry>,
     state: Arc<TlsState>,
     period: Duration,
     shutdown: Arc<Shutdown>,
 ) {
+    run_with_wait(
+        reloader,
+        registry,
+        state,
+        period,
+        shutdown,
+        CHECK_WAIT.min(period),
+    )
+    .await
+}
+
+async fn run_with_wait(
+    reloader: Reloader,
+    registry: Arc<Registry>,
+    state: Arc<TlsState>,
+    period: Duration,
+    shutdown: Arc<Shutdown>,
+    check_wait: Duration,
+) {
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // 第一次 tick 立即完成；啟動時設定剛載入，跳過
     ticker.tick().await;
+    let (paths, reloader_state) = (reloader.paths.clone(), reloader.state.clone());
+    let mut idle = Some(reloader);
+    // 尚未完成的檔案檢查（卡住時跨週期保留）
+    let mut pending: Option<tokio::task::JoinHandle<(Reloader, ReloadOutcome)>> = None;
+    let mut stuck_logged = false;
 
     loop {
         tokio::select! {
@@ -112,26 +175,51 @@ pub async fn run(
             _ = ticker.tick() => {}
         }
 
-        let (paths, reloader_state) = (reloader.paths.clone(), reloader.state.clone());
-        let joined = tokio::task::spawn_blocking(move || {
-            let outcome = reloader.check();
-            (reloader, outcome)
-        })
-        .await;
-        let outcome = match joined {
-            Ok((r, outcome)) => {
-                reloader = r;
-                outcome
-            }
-            Err(e) => {
-                // 不停止整個工作：重新驗證仍要繼續；下個週期強制重建設定
-                error!(
-                    "檢查 TLS 設定檔的工作異常結束，下個週期重新載入，期間沿用目前的設定: {}",
-                    e
-                );
-                reloader = Reloader::recreate(paths, reloader_state);
-                ReloadOutcome::Unchanged
-            }
+        // 沒有進行中的檢查時才啟動新的檢查
+        if pending.is_none()
+            && let Some(mut r) = idle.take()
+        {
+            pending = Some(tokio::task::spawn_blocking(move || {
+                let outcome = r.check();
+                (r, outcome)
+            }));
+        }
+        let outcome = match pending.as_mut() {
+            None => ReloadOutcome::Unchanged,
+            Some(handle) => match tokio::time::timeout(check_wait, handle).await {
+                Err(_) => {
+                    if !stuck_logged {
+                        error!(
+                            "檢查 TLS 設定檔超過 {} 秒仍未完成（檔案系統可能卡住），先以目前的設定重新驗證現役連線",
+                            check_wait.as_secs_f64()
+                        );
+                        stuck_logged = true;
+                    }
+                    ReloadOutcome::Unchanged
+                }
+                Ok(joined) => {
+                    pending = None;
+                    if stuck_logged {
+                        info!("檢查 TLS 設定檔已恢復");
+                        stuck_logged = false;
+                    }
+                    match joined {
+                        Ok((r, outcome)) => {
+                            idle = Some(r);
+                            outcome
+                        }
+                        Err(e) => {
+                            // 不停止整個工作：重新驗證仍要繼續；下個週期強制重建設定
+                            error!(
+                                "檢查 TLS 設定檔的工作異常結束，下個週期重新載入，期間沿用目前的設定: {}",
+                                e
+                            );
+                            idle = Some(Reloader::recreate(paths.clone(), reloader_state.clone()));
+                            ReloadOutcome::Unchanged
+                        }
+                    }
+                }
+            },
         };
 
         let material = state.current();
@@ -352,6 +440,48 @@ mod tests {
         assert_eq!(stop.fatal_reason(), None);
     }
 
+    #[tokio::test]
+    async fn stuck_file_check_does_not_stop_revalidation() {
+        // R2-K10：檔案檢查卡住時，重新驗證照常進行（不 fail-open）
+        let fx = Fixture::new("stuck");
+        let (mut r, state) = fx.reloader();
+        let stall = Arc::new(Stall::default());
+        r.stall = Some(stall.clone());
+        let registry = Arc::new(Registry::new());
+        let mut a = registry
+            .register(
+                1,
+                hello(A, Some(chain("client-a.crt"))),
+                Instant::now(),
+                Utc::now(),
+            )
+            .unwrap();
+        let stop = Arc::new(Shutdown::new());
+        let task = tokio::spawn(run_with_wait(
+            r,
+            registry.clone(),
+            state.clone(),
+            Duration::from_millis(30),
+            stop.clone(),
+            Duration::from_millis(20),
+        ));
+        // 檔案檢查卡住期間，CA/CRL 以其他方式更新（此處直接替換設定）
+        let mut revoked = fx.paths.clone();
+        revoked.crls = vec![pki("crl-revoke-a.crl").to_string_lossy().to_string()];
+        state.replace(tls::build(&revoked).unwrap());
+        let kicked = tokio::time::timeout(Duration::from_secs(5), &mut a.kick)
+            .await
+            .expect("檢查卡住時仍應重新驗證並踢掉已撤銷的連線")
+            .unwrap();
+        assert!(matches!(kicked, KickReason::CertificateRejected(_)));
+        stall.release();
+        stop.trigger();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn missing_file_is_a_failed_reload() {
         let fx = Fixture::new("missing");
@@ -398,7 +528,7 @@ mod tests {
         assert_eq!(kicked.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), [A]);
         match a.kick.try_recv() {
             Ok(KickReason::CertificateRejected(reason)) => {
-                assert!(reason.to_lowercase().contains("revoked"), "{reason}")
+                assert!(reason.reason.to_lowercase().contains("revoked"), "{reason}")
             }
             other => panic!("A 應被踢: {other:?}"),
         }
@@ -427,7 +557,7 @@ mod tests {
         let kicked = revalidate(&registry, &state.current(), UnixTime::now());
         assert_eq!(kicked.len(), 1);
         assert!(
-            kicked[0].1.to_lowercase().contains("expired"),
+            kicked[0].1.reason.to_lowercase().contains("expired"),
             "{}",
             kicked[0].1
         );

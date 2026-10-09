@@ -4,12 +4,14 @@ use chrono::{NaiveDate, Utc};
 use log::{LevelFilter, info};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::retention::{DateGuard, DatedFiles, GUARD_STATE_FILE};
+use crate::retention::{
+    DateGuard, DatedFiles, GUARD_STATE_FILE, LOG_GUARD_STATE_FILE, is_tmp_name_for,
+};
 use crate::shutdown::Shutdown;
 
 pub const LOG_DIR: &str = "logs";
@@ -71,14 +73,33 @@ pub fn setup(level: LevelFilter) -> Result<Option<NaiveDate>, Error> {
     Ok(newest_before_start)
 }
 
-/// 啟動時清除一次舊日誌、提示舊版日誌檔，之後每小時清除一次，直到關機。
-/// `newest_before_start` 為啟動前既有最新日誌檔的日期（[`setup`] 的回傳值）。
+/// 啟動時清除一次 `dir`（正式程式為 [`LOG_DIR`]）中的舊日誌、提示舊版日誌檔，之後每小時清除一次，
+/// 直到關機。`newest_before_start` 為啟動前既有最新日誌檔的日期（[`setup`] 的回傳值）。
 pub async fn run_cleanup(
+    dir: PathBuf,
     retention_days: u32,
     newest_before_start: Option<NaiveDate>,
     shutdown: Arc<Shutdown>,
 ) {
-    let dir = Path::new(LOG_DIR);
+    run_cleanup_every(
+        dir,
+        retention_days,
+        newest_before_start,
+        shutdown,
+        LOG_CLEANUP_INTERVAL,
+    )
+    .await
+}
+
+async fn run_cleanup_every(
+    dir: PathBuf,
+    retention_days: u32,
+    newest_before_start: Option<NaiveDate>,
+    shutdown: Arc<Shutdown>,
+    every: Duration,
+) {
+    let dir = dir.as_path();
+    remove_stale_guard_tmp_files(dir).await;
     let legacy = dir.join(LEGACY_LOG_FILE);
     if tokio::fs::metadata(&legacy).await.is_ok() {
         info!(
@@ -87,14 +108,16 @@ pub async fn run_cleanup(
         );
     }
 
-    let mut ticker = interval(LOG_CLEANUP_INTERVAL);
+    let mut ticker = interval(every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // 時鐘被誤校到未來時不清除（見 DateGuard）。狀態以 logs/ 中的狀態檔為準；沒有（或損毀）時
+    // 時鐘被誤校到未來時不清除（見 DateGuard）。狀態以 logs/ 中的狀態檔為準（檔名與 report 的不同，
+    // 兩個目錄相同時也不會共用；舊版的檔名只在新檔不存在時讀取）；都沒有（或損毀）時
     // 比照 report，以啟動前最新的日誌檔日期為基準（不晚於今天）
     let baseline = LOG_FILES.guard_baseline(newest_before_start, Utc::now().date_naive());
     let mut guard = DateGuard::load_or_new(
         LOG_FILES.label,
-        dir.join(GUARD_STATE_FILE),
+        dir.join(LOG_GUARD_STATE_FILE),
+        Some(&dir.join(GUARD_STATE_FILE)),
         baseline,
         Instant::now(),
         Utc::now(),
@@ -110,8 +133,85 @@ pub async fn run_cleanup(
             continue;
         }
         let now_wall = Utc::now();
-        if let Some(today) = guard.check(now_wall.date_naive(), Instant::now(), now_wall) {
+        if let Some(today) = guard
+            .check(now_wall.date_naive(), Instant::now(), now_wall)
+            .await
+        {
             LOG_FILES.cleanup(dir, today, retention_days).await;
         }
+    }
+}
+
+/// 刪除先前異常結束時留下的狀態檔暫存檔（`.retention-guard-logs.json.<隨機>.tmp`，
+/// 以及舊版檔名的暫存檔）
+async fn remove_stale_guard_tmp_files(dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if (is_tmp_name_for(name, LOG_GUARD_STATE_FILE) || is_tmp_name_for(name, GUARD_STATE_FILE))
+            && entry.file_type().await.is_ok_and(|t| t.is_file())
+        {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_cleanup_deletes_old_logs_and_stops_on_shutdown() {
+        // R2-T1：logger::run_cleanup 的啟動清除、狀態檔與關機結束
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-logger-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = Utc::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let old = dir.join(LOG_FILES.file_name(today - chrono::Days::new(30)));
+        let kept = dir.join(LOG_FILES.file_name(yesterday));
+        let legacy = dir.join(LEGACY_LOG_FILE);
+        for p in [&old, &kept, &legacy] {
+            std::fs::write(p, b"x\n").unwrap();
+        }
+        // 先前異常結束留下的狀態檔暫存檔
+        let stale = dir.join(".retention-guard-logs.json.0123456789abcdef.tmp");
+        std::fs::write(&stale, b"x").unwrap();
+        let shutdown = Arc::new(Shutdown::new());
+        let task = tokio::spawn(run_cleanup_every(
+            dir.clone(),
+            14,
+            Some(yesterday),
+            shutdown.clone(),
+            Duration::from_millis(20),
+        ));
+        let mut deleted = false;
+        for _ in 0..250 {
+            if !old.exists() {
+                deleted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(deleted, "過期日誌應在啟動時刪除");
+        assert!(kept.exists());
+        assert!(legacy.exists(), "舊版日誌檔不碰");
+        // 日誌使用自己的狀態檔名
+        assert!(dir.join(LOG_GUARD_STATE_FILE).exists());
+        assert!(!stale.exists(), "啟動時應刪除殘留的暫存檔");
+        assert!(!dir.join(GUARD_STATE_FILE).exists());
+
+        shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("關機後應結束")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

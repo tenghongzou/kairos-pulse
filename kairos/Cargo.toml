@@ -20,3 +20,7 @@ tokio = { version = "1", features = ["full"] }
 # 使用 ring 作為加密後端，避免 aws-lc-rs 在 Windows 上需要額外的 C 建置工具
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+# 測試以暫停的 tokio 時鐘執行（tokio::time::pause），不依賴實際時間；只啟用既有依賴的 feature，不引入新的 crate
+tokio = { version = "1", features = ["full", "test-util"] }
