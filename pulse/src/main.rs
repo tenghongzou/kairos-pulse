@@ -6,6 +6,7 @@ mod log_files;
 mod log_throttle;
 mod network;
 mod protocol;
+mod service_status;
 mod shutdown;
 mod system_info;
 #[cfg(test)]

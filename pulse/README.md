@@ -37,14 +37,18 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 
 地端正式部署請使用預編譯的發佈包 `pulse-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件與 `PROTOCOL.md`。
 
-完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
+完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下。所有步驟請在**同一個 root shell**（`sudo -i`）中依序執行，不能只在每個指令前加 `sudo`：`/opt/pulse` 的權限是 750，一般帳號無法 `cd` 進去，而 `agent.id`、私鑰與 CSR 都寫到目前目錄，`AGENT_ID` 變數也要在步驟間延續。
 
 1. `sha256sum -c SHA256SUMS` 驗證後解壓（`tar xzf … --strip-components=1`），`./pulse --version` 確認版本與 commit。
-2. 建立系統使用者 `pulse` 與 `/opt/pulse`、`/opt/pulse/logs`。
-3. 在 `/opt/pulse` 執行 `pulse --print-agent-id` 產生 `agent.id`；在本機產生私鑰與 CSR，把 CSR 交給 Kairos 管理者以 `openssl ca` 簽發（見「啟用 mTLS」）。
+2. 建立系統使用者 `pulse` 與 `/opt/pulse`、`/opt/pulse/logs`，安裝執行檔。
+3. `cd /opt/pulse` 後執行 `./pulse --print-agent-id` 產生 `agent.id`；在同一目錄產生私鑰與 CSR，把 CSR（root 600，需以 root 複製出來）交給 Kairos 管理者以 `openssl ca` 簽發（見「啟用 mTLS」）。
 4. 建立只含覆蓋欄位的 `pulse.toml`，放好 `ca.pem`、`client.pem`、`client.key` 並設定權限。
 5. 安裝 `pulse.service`（`WorkingDirectory=/opt/pulse`、`Restart=always`、`KillSignal=SIGINT`、`StandardOutput=null`：日誌只保留 `logs/` 一份，stderr 仍進 journal），`systemctl enable --now pulse`。
 6. 確認日誌出現「已向伺服器註冊」，以及 Kairos 的 `agents.json` 中此 agent 為 `online`。
+
+- **監控**：憑證被撤銷、`auth_failed`、伺服器憑證不受信任或名稱不符等需要人工處理的錯誤，Pulse 會持續重連而不結束，服務仍為 `active (running)`。請看 `systemctl status pulse` 的 `Status:` 行（例如「已註冊：127.0.0.1:18443」「無法註冊：certificate_rejected（…）」「無法連線：伺服器憑證名稱不符（…）」「重新連線中」；需要 unit 的 `NotifyAccess=main`，舊版 unit 沒有這行時不會顯示）、`journalctl -u pulse -p err`、`logs/` 或 Kairos 的 `agents.json`，見 INSTALL.md 第 8.1 節與下方「日誌」。
+- **多實例**：同一台主機跑多個 Pulse 時，每個實例使用自己的 `/opt/pulse-N`（`agent.id`、憑證、`pulse.toml`、`logs/` 各自一份），執行檔共用 `/opt/pulse/pulse`；unit 只改 `WorkingDirectory` 與 `ReadWritePaths` 兩行。完整指令見 INSTALL.md 第 9 節。
+- **移除**：有多實例時先停用並移除所有 `pulse-N.service`，`daemon-reload`、`reset-failed` 後，最後才刪除 `/opt/pulse` 與使用者 `pulse`（見 INSTALL.md 第 12 節）。
 
 升級時先升級全部 Pulse，再升級 Kairos（見上一節）。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine` 建置 musl 靜態執行檔，輸出到 `dist/`（含 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。
 
@@ -216,6 +220,8 @@ TLS 1.3 下伺服器在握手**之後**才驗證客戶端憑證，拒絕時送�
 
 這些都是 fatal 錯誤，照一般流程退避重連，延遲逐次加長，避免設定錯誤時狂打伺服器。被撤銷的憑證之後重連會在 TLS 握手階段就被拒絕。這類錯誤每次重連都會重複發生，因此同一錯誤碼的 `ERROR` 每 10 分鐘最多記一則，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明期間改記 `WARN` 的次數（見「重連行為」）。
 
+Pulse 不會因這些錯誤結束，以 systemd 執行時服務仍為 `active (running)`，只看服務是否在執行的監控會漏掉。以 `ERROR` 記錄的這類錯誤會同時寫一行到 stderr（進 journal，可用 `journalctl -u pulse -p err` 篩選），並以 sd_notify 更新 `systemctl status` 的 `Status:` 文字，例如「無法註冊：certificate_rejected（…）」「無法註冊：TLS alert CertificateRevoked（…）」「無法註冊：auth_failed（…）」，恢復後為「已註冊：<位址>:<連接埠>」（見「日誌」與 `packaging/INSTALL.md` 第 8.1 節）。
+
 ## 建置與執行
 
 ```bash
@@ -258,7 +264,7 @@ cargo run
 1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、`use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
 2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
-4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點、網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`
+4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點，以及同一磁碟的重複掛載點（「磁碟名稱＋檔案系統＋總容量」相同者只列一次，保留路徑最短的掛載點，例如 systemd 沙箱的 `ReadWritePaths=`、`PrivateTmp=` bind mount 或 btrfs subvolume；磁碟名稱為空時不合併），網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`。磁碟容量以十進位單位顯示：1 GB 以上為 GB（小數 1 位，例如 `39.4 GB`），未滿 1 GB 為整數 MB（例如 `535 MB`）。取不到的系統名稱、核心版本、主機名稱等顯示「未知」；沒有溫度感測器（例如 VM）時印「未偵測到溫度感測器」
 5. 啟動系統資訊收集背景任務（每 `report.interval` 秒取樣一次）
 6. 連線到伺服器、送出 hello、收到 hello_ack 後開始送 heartbeat 與 report
 
@@ -461,6 +467,8 @@ rust-toolchain.toml    固定使用 Rust 1.99.0
 ## 日誌
 
 - 同時輸出到終端（stdout）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）
+- **需要人工處理的錯誤另寫一行到 stderr**：伺服器憑證驗證錯誤（不受信任、名稱不符、過期、尚未生效、被撤銷、用途不符、被標記為 CA、其他驗證失敗；第一次發生就記 `ERROR`，原因改變時立即再記）、伺服器送來的致命錯誤與註冊前的錯誤（`certificate_rejected`、`auth_failed`、狀態表已滿等）、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕（撤銷、過期等），以及本機客戶端憑證已過期。內容與日誌的 `ERROR` 行相同，節流也相同（同一原因每 10 分鐘最多一行，其餘只在日誌記 `WARN`）；一般連線錯誤（拒絕連線、逾時、連線被重設等）不寫。以 systemd 執行（有 `JOURNAL_STREAM` 環境變數）時行首加上 `<3>`，journal 以 err 等級記錄（`journalctl -u pulse -p err`），訊息中不會出現 `<3>`。stdout 與 stderr 都是終端機（互動執行）時不重複寫。`pulse.service` 設定 `StandardOutput=null`，所以 journal 中只會看到這些行與啟動失敗等 stderr 訊息
+- **systemd 狀態文字**：Linux 上有 `NOTIFY_SOCKET` 時以 sd_notify 送出 `STATUS=`，`systemctl status` 顯示為 `Status:` 行：`已註冊：<位址>:<連接埠>`、`重新連線中`（一般連線錯誤）、`無法連線：伺服器憑證<原因>（<處理提示>）`（例如 `無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）`、`無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）`；原因另有已過期、尚未生效、已被撤銷、用途不符、被標記為 CA、驗證失敗）、`無法註冊：<錯誤碼>（<處理提示>）`（錯誤碼如 `certificate_rejected`、`TLS alert CertificateRevoked`、`auth_failed`、`bad_request`、`unsupported_version`、`proto_mismatch`、`superseded`）。只送狀態文字、不送 `READY=1`，unit 維持 `Type=simple`，需設定 `NotifyAccess=main`（發佈包的 `pulse.service` 已設定）；沒有 `NOTIFY_SOCKET` 時（Windows、直接執行）不做任何事
 - **按日分檔**：檔名日期為 **UTC**（與 Kairos 相同），UTC 午夜換新檔；每行開頭的時間戳記則是本機時間
 - **保留**：保留今天與前 `log.retention_days` 天（預設 14），更早的檔案於啟動時與之後每小時刪除；`0` 表示永久保留。只會刪除檔名**完全符合** `pulse-YYYY-MM-DD.log` 的檔案，其他檔案（例如舊版的 `pulse.log`）一律不碰
 - **系統日期異常時暫停清除**（規則與 Kairos 相同；`log.retention_days = 0` 時不檢查）：系統時鐘被誤校到未來時，以「今天」計算的保留期限會把所有日誌檔判定為過期，因此清除前先檢查日期是否合理，「已接受的日期」只能隨實際經過的時間推進：

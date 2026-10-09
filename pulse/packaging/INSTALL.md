@@ -27,7 +27,20 @@
 | 可寫目錄 | `/opt/pulse/logs`（擁有者 `pulse`） |
 | Kairos | `monitor.example.com:8080`（換成 Kairos 管理者提供的位址與憑證名稱） |
 
-指令以 root 執行（或在前面加 `sudo`）。
+**從第 2 節起，請在同一個 root shell 中依序執行**：
+
+```bash
+sudo -i          # 之後的指令都在這個 shell 中執行；本文件的 ~ 指 root 的家目錄（/root）
+```
+
+不能只在每個指令前加 `sudo`：
+
+- `/opt/pulse` 的權限是 750（第 4 節），一般帳號無法 `cd` 進去，而 `sudo cd` 不存在。
+- 第 5 節的 `agent.id`、`client.key` 與 CSR 都寫到**目前目錄**，必須先 `cd /opt/pulse`；在別的目錄執行會把 `agent.id` 寫到錯的地方，服務啟動時讀不到（`/opt/pulse` 在服務中唯讀，無法自行建立）。
+- 第 5 節設定的 `AGENT_ID`、`umask` 只在同一個 shell 中有效。
+- `/opt/pulse/pulse --version`、讀取 `logs/` 等確認步驟也需要 root（一般帳號會 `Permission denied`）。
+
+中途離開了 root shell 時，重新 `sudo -i`，並從該節開頭（含 `cd`）重新執行。
 
 ## 1. 需求
 
@@ -46,7 +59,9 @@ sha256sum -c SHA256SUMS                  # 必須顯示「…: OK」，否則不
 
 `SHA256SUMS` 若同時列了 Kairos 的發佈包而你只下載了 Pulse，改用 `sha256sum -c --ignore-missing SHA256SUMS`。
 
-## 3. 解壓並安裝執行檔
+## 3. 解壓並檢查執行檔
+
+執行檔在第 4 節才安裝到 `/opt/pulse`；本節只解壓並確認版本。
 
 ```bash
 cd ~/pulse-dist
@@ -78,7 +93,9 @@ install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.
 
 ### 5.1 產生 agent_id
 
-每個 Pulse 實例有一個固定的 `agent_id`（UUID v4），存在工作目錄的 `agent.id`。服務執行時 `/opt/pulse` 是唯讀的，所以**安裝時先產生**：
+每個 Pulse 實例有一個固定的 `agent_id`（UUID v4），存在工作目錄的 `agent.id`。服務執行時 `/opt/pulse` 是唯讀的，所以**安裝時先產生**。
+
+> 5.1 與 5.2 必須在**同一個 root shell**（`sudo -i`，見開頭說明）中連續執行：`agent.id`、`client.key` 與 CSR 都寫到目前目錄 `/opt/pulse`，`AGENT_ID` 變數也要延續到 5.2。
 
 ```bash
 cd /opt/pulse                         # 必須在實際的工作目錄執行，才會寫到同一份 agent.id
@@ -99,6 +116,7 @@ echo "$AGENT_ID"
 
 ```bash
 cd /opt/pulse
+AGENT_ID=$(./pulse --print-agent-id)  # 與 5.1 相同的值；重新取得，避免沿用到其他實例的值
 umask 077
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout client.key -out "$AGENT_ID.csr" -subj "/CN=$AGENT_ID" \
@@ -106,10 +124,15 @@ openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -addext "extendedKeyUsage=clientAuth"
 chown pulse:pulse client.key
 chmod 600 client.key
+
+# 取出 CSR：/opt/pulse 內的 CSR 是 root 600，複製一份可讀的到 /tmp 再傳給管理者
+install -m 644 "$AGENT_ID.csr" /tmp/
+ls -l "/tmp/$AGENT_ID.csr"
 ```
 
 - 也可以用 RSA：把 `-newkey ec -pkeyopt ec_paramgen_curve:P-256` 換成 `-newkey rsa:2048`。私鑰不可加密（`-nodes`）。
 - `-addext` 需要 OpenSSL 1.1.1 以上；更舊的版本請改用下面的替代做法。
+- CSR 不含私鑰，可以公開傳遞；從 `/tmp/<agent_id>.csr` 以一般帳號 `scp` 取出，或在 root shell 中 `cat "$AGENT_ID.csr"` 複製貼上。**不要**把 `client.key` 複製出 `/opt/pulse`。
 - 把 `$AGENT_ID.csr` 與 agent_id 交給 Kairos 管理者。對方以代理 CA 的 `openssl ca` 資料庫簽發（見 Kairos 的 `INSTALL.md`「簽發代理的客戶端憑證」），這樣之後才能**撤銷**；簽發時 SAN 會強制設為 `DNS:<agent_id>`。
 - 取回兩個檔案：客戶端憑證（存成 `/opt/pulse/client.pem`）與伺服器 CA（存成 `/opt/pulse/ca.pem`）。
 
@@ -148,8 +171,11 @@ client_key = "client.key"
 
 ### 6.1 檔案權限
 
+在 root shell 中，先 `cd` 到取回的 `ca.pem`、`client.pem` 所在的目錄（例如以一般帳號 `scp` 到 `/home/<帳號>/pulse-files/`）：
+
 ```bash
-install -o root -g pulse -m 644 ca.pem     /opt/pulse/ca.pem       # 取回的檔案所在目錄執行
+cd /home/<帳號>/pulse-files                                # 換成實際的目錄
+install -o root -g pulse -m 644 ca.pem     /opt/pulse/ca.pem
 install -o root -g pulse -m 644 client.pem /opt/pulse/client.pem
 ```
 
@@ -162,7 +188,7 @@ install -o root -g pulse -m 644 client.pem /opt/pulse/client.pem
 | `client.key`、`agent.id` | `pulse:pulse` | 600 |
 | `logs/` | `pulse:pulse` | 750 |
 
-`$AGENT_ID.csr` 交出去後可以刪除。
+`$AGENT_ID.csr`（`/opt/pulse` 內與 `/tmp` 的副本）交出去後可以刪除。
 
 ## 7. 安裝 systemd unit
 
@@ -181,6 +207,7 @@ unit 重點（內容見 `pulse.service`）：
 | `StandardOutput` | `null` | 日誌只保留 `logs/` 一份（理由見下） |
 | `KillSignal`／`TimeoutStopSec` | `SIGINT`／`10` | Pulse 送出 `close_notify` 後約 1 秒內結束 |
 | `Restart` | `always` | Pulse 本身會無限重連；取樣任務異常或其他原因結束時一律由 systemd 重啟 |
+| `NotifyAccess` | `main` | 只用來以 sd_notify 更新 `systemctl status` 的 `Status:` 文字（見 8.1）；不送 `READY=1`，所以 `Type` 仍為 `simple` |
 | `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節） |
 
 ### 7.1 為什麼選擇 `StandardOutput=null`
@@ -200,7 +227,7 @@ systemctl enable --now pulse
 systemctl status pulse --no-pager
 ```
 
-確認清單：
+確認清單（在 root shell 中執行；`/opt/pulse` 為 750，一般帳號執行會 `Permission denied`）：
 
 ```bash
 /opt/pulse/pulse --version                      # pulse <版本> (<commit>)
@@ -219,7 +246,7 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 - 判斷連線成功以「已向伺服器註冊」這一行為準。TLS 握手完成（「已建立 TLS 加密連線」）只在 `debug` 等級記錄，因為 TLS 1.3 下伺服器在握手後才驗證客戶端憑證，握手完成不代表會被接受。
 - 這一行若是 `WARN` 且含「⚠️ 未驗證伺服器憑證」，表示設定了 `accept_invalid_certs = true`，正式環境不可如此。
-- 啟動時的系統資訊在 `info` 等級只列實體磁碟與網路介面（略過虛擬檔案系統、容量 0 的掛載點、`lo` 與 `veth*`、`docker*`、`br-*` 等虛擬介面，各以一行統計），CPU 只有一行摘要；完整清單需 `log.level = "debug"`。
+- 啟動時的系統資訊在 `info` 等級只列實體磁碟與網路介面（略過虛擬檔案系統、容量 0 的掛載點、與已列出磁碟相同的重複掛載點（例如本 unit 的 `ReadWritePaths=`、`PrivateTmp=` 在服務內建立的 `/opt/pulse/logs`、`/tmp`、`/var/tmp` bind mount）、`lo` 與 `veth*`、`docker*`、`br-*` 等虛擬介面，各以一行統計），CPU 只有一行摘要；完整清單需 `log.level = "debug"`。
 
 最後請 Kairos 管理者確認 Kairos 主機上的 `/opt/kairos/data/agents.json` 有這個 agent_id，且 `"online": true`。
 
@@ -229,37 +256,112 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 |---|---|
 | `設定檔：/opt/pulse/pulse.toml 不存在，只使用內建預設值…` | 檔名或位置錯誤。檔案存在但 pulse 使用者沒有讀取權限時，Pulse 會以「無法載入設定」結束，原因在 `journalctl -u pulse` |
 | `TCP 連線失敗` 持續出現 | 位址、連接埠或防火牆；Kairos 預設只聽 127.0.0.1 |
-| `伺服器憑證的名稱與 server.domain「…」不符` | `server.domain` 要填伺服器憑證 SAN 中的名稱 |
-| `伺服器憑證不受信任` | `ca_cert` 不是簽發 Kairos 伺服器憑證的 CA |
+| `伺服器憑證的名稱與 server.domain「…」不符` | `server.domain` 要填伺服器憑證 SAN 中的名稱。伺服器憑證的問題服務仍為 active，`Status:` 為 `無法連線：伺服器憑證…`（見 8.1） |
+| `伺服器憑證不受信任（簽發者不在信任庫中）` | `ca_cert` 不是簽發 Kairos 伺服器憑證的 CA |
+| `伺服器憑證已過期`／`尚未生效`／`已被撤銷`／`被標記為 CA`、`伺服器憑證的用途（EKU）不含 serverAuth` | 請伺服器管理者更換憑證；過期或尚未生效時也檢查本機時鐘 |
 | 啟動即結束：`SAN 不含 DNS:<agent_id>` | 憑證不是用這台的 agent_id 簽發（例如 `agent.id` 重新產生過），重做 5.2 |
-| `伺服器表示此客戶端憑證已被撤銷` | 憑證已被撤銷，請管理者重新簽發 |
+| `伺服器表示此客戶端憑證已被撤銷`、`certificate_rejected` | 憑證已被撤銷，請管理者重新簽發。Pulse 會持續重連，服務仍為 active（見 8.1） |
 | `無法初始化日誌`（journal） | `logs/` 不存在或不屬於 pulse |
 
 其他訊息見 `README.md`「啟用 mTLS」與「重連行為」。
+
+### 8.1 需要人工處理的錯誤：服務仍為 active (running)
+
+本機憑證被撤銷、身分驗證失敗、伺服器憑證不受信任或名稱不符這類**需要人工處理**的錯誤，Pulse 不會結束，而是持續退避重連，所以 systemd 看到的服務仍是 `active (running)`、`NRestarts` 不會增加。只看 `systemctl is-active` 的監控會漏掉，請用下列方式確認：
+
+1. **`systemctl status pulse` 的 `Status:` 行**：Pulse 以 sd_notify 更新狀態文字（監控腳本可用 `systemctl show -p StatusText --value pulse` 取得同一段文字）：
+
+   | `Status:` | 意義 |
+   |---|---|
+   | `已註冊：monitor.example.com:8080` | 已向伺服器註冊（IPv6 位址加方括號） |
+   | `重新連線中` | 一般連線錯誤（拒絕連線、逾時、連線被重設、伺服器關閉連線等），正在退避重連 |
+   | `無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）` | `server.ca_cert` 不是簽發 Kairos 伺服器憑證的 CA |
+   | `無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）` | `server.domain` 與伺服器憑證 SAN 不符 |
+   | `無法連線：伺服器憑證已過期（…）`、`…尚未生效（…）` | 伺服器憑證過期或尚未生效，或本機時鐘不正確 |
+   | `無法連線：伺服器憑證已被撤銷（…）`、`…用途不符（…）`、`…被標記為 CA（…）`、`…驗證失敗（詳見 logs/）` | 伺服器憑證本身的問題，請伺服器管理者更換 |
+   | `無法註冊：certificate_rejected（…）` | 伺服器拒絕本機憑證（撤銷、過期、不受信任）；括號內為 `伺服器的 CRL 已過期…` 時是伺服器端問題 |
+   | `無法註冊：TLS alert CertificateRevoked（…）` | 憑證被撤銷後的重連在 TLS 握手時就被拒；其他 alert 如 `CertificateExpired`、`CertificateRequired`、`UnknownCA` 等 |
+   | `無法註冊：auth_failed（…）` | 憑證 SAN 與 agent_id 不符 |
+   | `無法註冊：bad_request（伺服器狀態表已滿…）` | Kairos 的 `limits.max_agents` 已滿 |
+   | `無法註冊：unsupported_version（…）`、`無法註冊：proto_mismatch（…）` | 協定版本不符，請更新 Pulse 或 Kairos |
+   | `無法註冊：superseded（…）` | 連續被同一 agent_id 的其他連線取代，多台主機可能共用同一份 `agent.id` |
+
+   括號內是簡短的處理提示，完整訊息在日誌。`Status:` 行需要 unit 中的 `NotifyAccess=main`（只用來更新狀態文字，`Type` 仍為 `simple`）；**舊版 unit 沒有這一行時不會出現 `Status:` 行**，升級時請一併更新 unit（第 10 節）。
+
+2. **`journalctl -u pulse -p err`**：上述錯誤（伺服器憑證驗證失敗、伺服器送來的致命錯誤與註冊前的錯誤、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕），以及本機客戶端憑證已過期，會在寫 `ERROR` 日誌的同時寫一行到 stderr，內容與日誌的 `ERROR` 行相同，在 journal 中以 err 等級記錄，可用 `-p err` 篩選。第一次發生就記 `ERROR`，同一原因每 10 分鐘最多一行（其餘次數在 `logs/` 記 `WARN`），原因改變時立即再記。一般連線錯誤（`重新連線中`：拒絕連線、逾時、連線被重設等）不寫 stderr，只在 `logs/`。
+
+   ```
+   pulse[1234]: [ERROR] 連線中斷（連續第 1 次失敗）：伺服器回報致命錯誤 certificate_rejected：…；2.0 秒後重連
+   pulse[1234]: [ERROR] 連線中斷（連續第 1 次失敗）：TLS 握手失敗：invalid peer certificate: UnknownIssuer（伺服器憑證不受信任（簽發者不在信任庫中）：自簽憑證或私有 CA 請以 server.ca_cert 指定）；2.0 秒後重連
+   ```
+
+3. **`logs/pulse-YYYY-MM-DD.log`**：每次斷線都有一行完整紀錄。
+4. **Kairos 端**：`agents.json` 中此 agent 是否為 `"online": true`。
 
 ## 9. 多實例（同一台主機跑多個 Pulse）
 
 一般一台主機只跑一個 Pulse。測試等情況需要多個實例時，每個實例必須有**自己的工作目錄、`agent.id`、客戶端憑證與 `logs/`**（共用 `agent.id` 會互相踢下線）。
 
-做法：複製一份 unit，把所有 `/opt/pulse` 換成新目錄。執行檔可以共用 `/opt/pulse/pulse`：
+前提：第一個實例（`/opt/pulse`、`pulse.service`）已照第 4～8 節裝好。之後的實例共用使用者 `pulse` 與執行檔 `/opt/pulse/pulse`，其餘都放在 `/opt/pulse-N`（N 為 2、3…）。
+
+> 第 5、6 節的指令都寫死 `/opt/pulse`。替其他實例做時，**所有 `/opt/pulse` 路徑都要換成 `/opt/pulse-N`**（只有執行檔 `/opt/pulse/pulse` 例外），漏改會覆寫第一個實例的 `agent.id`、私鑰或設定。下面列出完整指令，請在**同一個 root shell**（`sudo -i`）中依序執行。
 
 ```bash
-N=2
+N=2                                   # 每個實例換一個編號；以下所有步驟都依賴這個變數
+
+# 1. 目錄（第 4 節）
 install -d -o root  -g pulse -m 750 /opt/pulse-$N
 install -d -o pulse -g pulse -m 750 /opt/pulse-$N/logs
 
-# unit：工作目錄、可寫目錄改成 /opt/pulse-N，ExecStart 仍指向共用的執行檔
-sed -e "s#/opt/pulse#/opt/pulse-$N#g" \
-    -e "s#^ExecStart=.*#ExecStart=/opt/pulse/pulse#" \
+# 2. unit：只改 WorkingDirectory 與 ReadWritePaths 兩行；
+#    ExecStart 仍指向共用的執行檔，註解與 Documentation= 不變
+sed -e "/^\(WorkingDirectory\|ReadWritePaths\)=/s#/opt/pulse#/opt/pulse-$N#" \
     /etc/systemd/system/pulse.service > /etc/systemd/system/pulse-$N.service
+chmod 644 /etc/systemd/system/pulse-$N.service
+grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart)=' /etc/systemd/system/pulse-$N.service
+#   WorkingDirectory=/opt/pulse-2
+#   ExecStart=/opt/pulse/pulse
+#   ReadWritePaths=/opt/pulse-2/logs
 
-# 每個實例各自產生 agent_id、私鑰與 CSR（第 5 節，在 /opt/pulse-N 執行）
-cd /opt/pulse-$N && /opt/pulse/pulse --print-agent-id && chown pulse:pulse agent.id && chmod 600 agent.id
-# …簽發憑證、建立 pulse.toml（第 5、6 節）…
+# 3. agent_id（第 5.1 節，在 /opt/pulse-N 執行）
+cd /opt/pulse-$N
+/opt/pulse/pulse --print-agent-id
+chown pulse:pulse agent.id
+chmod 600 agent.id
+AGENT_ID=$(/opt/pulse/pulse --print-agent-id)   # 這個實例自己的 agent_id
+echo "$AGENT_ID"
 
-systemctl daemon-reload
-systemctl enable --now pulse-$N
+# 4. 私鑰與 CSR（第 5.2 節，仍在 /opt/pulse-N）
+umask 077
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout client.key -out "$AGENT_ID.csr" -subj "/CN=$AGENT_ID" \
+  -addext "subjectAltName=DNS:$AGENT_ID" \
+  -addext "extendedKeyUsage=clientAuth"
+chown pulse:pulse client.key
+chmod 600 client.key
+install -m 644 "$AGENT_ID.csr" /tmp/  # 把 /tmp/<agent_id>.csr 交給 Kairos 管理者簽發
 ```
+
+取回這個實例的 `client.pem` 後（同一個 root shell，`N` 仍要是同一個值）：
+
+```bash
+# 5. 憑證與設定（第 6、6.1 節）
+cd /home/<帳號>/pulse-files                                    # 取回的 client.pem 所在目錄
+install -o root -g pulse -m 644 client.pem          /opt/pulse-$N/client.pem
+install -o root -g pulse -m 644 /opt/pulse/ca.pem   /opt/pulse-$N/ca.pem
+# pulse.toml 中的路徑都是相對於工作目錄，可直接沿用第一個實例的設定
+install -o root -g pulse -m 640 /opt/pulse/pulse.toml /opt/pulse-$N/pulse.toml
+
+# 6. 啟動與確認（第 7、8 節）
+systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/pulse-$N.service   # 沒有輸出表示格式正確
+systemctl enable --now pulse-$N
+tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄：/opt/pulse-N」與「已向伺服器註冊」
+```
+
+- 每個實例的 agent_id 不同，客戶端憑證要分別簽發；不要把第一個實例的 `client.pem`、`client.key` 複製過去（SAN 不符，啟動即結束）。
+- 以 `systemctl edit pulse` 建立的 drop-in 只套用到 `pulse.service`，`pulse-N` 需要時要各自 `systemctl edit pulse-N`。
+- 升級後 `pulse.service` 有變動時，重做步驟 2 重新產生 `pulse-N.service`，再 `systemctl daemon-reload`。
 
 多個實例都從同一個 IP 連入 Kairos，Kairos 端可能需要調高 `server.max_connections_per_ip`（見 Kairos 的 `README.md`）。
 
@@ -286,6 +388,7 @@ install -o root -g root -m 644 pkg-new/pulse.example.toml pkg-new/INSTALL.md \
   pkg-new/README.md pkg-new/PROTOCOL.md /opt/pulse/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/pulse.service /etc/systemd/system/pulse.service
+# （多實例時，再依第 9 節步驟 2 重新產生每個 pulse-N.service）
 # systemctl daemon-reload
 
 # 4. 重新啟動並確認（第 8 節）
@@ -295,6 +398,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 ```
 
 - `agent.id`、憑證與 `pulse.toml` 沿用，不需要重新簽發。
+- 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。
 - 回滾：`mv /opt/pulse/pulse.prev /opt/pulse/pulse && systemctl restart pulse`。
 
@@ -305,14 +409,37 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 ## 12. 移除
 
-```bash
-systemctl disable --now pulse
-rm /etc/systemd/system/pulse.service
-systemctl daemon-reload
-systemctl reset-failed pulse 2>/dev/null
+在 root shell 中執行。有多實例（第 9 節）時，**先移除所有 `pulse-N`，最後才移除 `/opt/pulse` 與使用者**：`pulse-N` 共用 `/opt/pulse/pulse` 與使用者 `pulse`，先刪掉它們會讓殘留的 `pulse-N.service` 以 `Restart=always` 每 10 秒啟動失敗一次。
 
-rm -rf /opt/pulse          # 含客戶端私鑰、agent.id 與日誌
-userdel pulse
+```bash
+# 1. 記下每個實例的 agent_id，交給 Kairos 管理者撤銷憑證
+grep -H . /opt/pulse/agent.id /opt/pulse-[0-9]*/agent.id 2>/dev/null
+
+# 2. 停用並移除所有多實例 pulse-N（沒有多實例時不會做任何事）
+for u in $(systemctl list-unit-files 'pulse-*.service' --no-legend | awk '{print $1}'); do
+  systemctl disable --now "$u"
+  rm -f "/etc/systemd/system/$u"
+  rm -rf "/etc/systemd/system/$u.d"      # systemctl edit 建立的 drop-in
+done
+
+# 3. 停用並移除第一個實例
+systemctl disable --now pulse
+rm -f /etc/systemd/system/pulse.service
+rm -rf /etc/systemd/system/pulse.service.d
+
+# 4. 讓 systemd 忘掉已刪除的 unit（含失敗狀態）
+systemctl daemon-reload
+systemctl reset-failed 'pulse.service' 'pulse-*.service' 2>/dev/null
+
+# 5. 最後才刪除目錄與使用者
+rm -rf /opt/pulse-[0-9]*   # 多實例的工作目錄（含私鑰、agent.id 與日誌）
+rm -rf /opt/pulse          # 含共用執行檔、客戶端私鑰、agent.id 與日誌
+userdel pulse              # 同名群組 pulse 會一併移除
+
+# 6. 確認沒有殘留
+systemctl list-units --all 'pulse*' --no-legend      # 應無輸出
+systemctl list-unit-files 'pulse*' --no-legend       # 應無輸出
+ls -d /opt/pulse* 2>/dev/null                        # 應無輸出
 ```
 
-請 Kairos 管理者撤銷這台的客戶端憑證（Kairos 的 `INSTALL.md`「撤銷與定期更新 CRL」）。Kairos 的狀態表會在離線 24 小時後自動移除這個 agent。
+請 Kairos 管理者撤銷每個實例的客戶端憑證（Kairos 的 `INSTALL.md`「撤銷與定期更新 CRL」）。Kairos 的狀態表會在離線 24 小時後自動移除這些 agent。

@@ -128,11 +128,23 @@ impl TlsSetup {
     }
 }
 
-/// 依各自的等級記錄檢查結果。
+/// 依各自的等級記錄檢查結果；需要人工處理的（本機客戶端憑證已過期，見 [`mirrors_to_stderr`]）
+/// 同時寫一行到 stderr，讓 systemd 的 journal 也看得到。
 fn log_findings(findings: &[CertFinding]) {
     for finding in findings {
         log::log!(finding.level, "{}", finding.message);
+        if mirrors_to_stderr(finding) {
+            crate::service_status::attention(&finding.message);
+        }
     }
+}
+
+/// 有效期限檢查結果是否也要寫到 stderr：只有 error（憑證已過期）。
+///
+/// 檢查只在啟動時與之後每 `CERT_RECHECK_INTERVAL`（24 小時）執行一次，
+/// 頻率本身就遠低於 10 分鐘的節流視窗，不另外節流。
+fn mirrors_to_stderr(finding: &CertFinding) -> bool {
+    finding.level == Level::Error
 }
 
 /// 依設定建立 TLS 設定；任何問題都回傳具體的錯誤訊息（啟動時即結束程式）。
@@ -1020,6 +1032,14 @@ mod tests {
     }
 
     #[test]
+    fn only_expired_findings_are_mirrored_to_stderr() {
+        assert!(mirrors_to_stderr(&CertFinding::error("expired".into())));
+        assert!(!mirrors_to_stderr(&CertFinding::warn(
+            "expires soon".into()
+        )));
+    }
+
+    #[test]
     fn client_cert_validity_can_be_rechecked_later() {
         // R2-P10：TlsSetup 保留憑證鏈，之後（每 24 小時）可用新的時間重新檢查
         let setup = build(&server("root.pem", "client-ec-chain.pem", "client-ec.key")).unwrap();
@@ -1039,12 +1059,24 @@ mod tests {
             expired.iter().any(|f| f.level == Level::Error),
             "{expired:?}"
         );
-        // 記錄時依各自的等級輸出
-        let ((), logs) = crate::test_log::capture(|| log_findings(&expired));
+        // 記錄時依各自的等級輸出；已過期（error）同時寫到 stderr（N4），即將到期（warn）不寫
+        let (((), logs), events) = crate::service_status::capture(|| {
+            crate::test_log::capture(|| {
+                log_findings(&expired);
+                log_findings(&later);
+            })
+        });
         assert!(
             logs.iter()
                 .any(|(l, m)| *l == Level::Error && m.contains("過期"))
         );
+        let errors: Vec<_> = expired
+            .iter()
+            .filter(|f| f.level == Level::Error)
+            .map(|f| crate::service_status::Event::Stderr(f.message.clone()))
+            .collect();
+        assert!(!errors.is_empty());
+        assert_eq!(events, errors);
         // 未設定客戶端憑證：沒有可檢查的項目
         let none = build(&server("root.pem", "", "")).unwrap();
         assert!(!none.has_client_cert());

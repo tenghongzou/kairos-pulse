@@ -34,6 +34,7 @@ use crate::protocol::{
     ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, ServerMsg, now_ts, report_cpu_usage,
     sanitize_cpu_usage,
 };
+use crate::service_status;
 use crate::system_info::Sample;
 use crate::tls::{self, TlsSetup};
 
@@ -141,12 +142,28 @@ impl AttentionLog {
     }
 }
 
-/// 依節流結果以 error 或 warn 記錄斷線訊息。
-fn log_attention(check: Option<u64>, msg: &str, what: &str) {
+/// 需要人工處理的斷線在節流判斷（[`AttentionLog::check`] 等）之後的處置：
+/// 記錄的等級，以及是否同時寫一行到 stderr（讓 systemd 的 journal 看得到）。
+///
+/// 只有以 ERROR 記錄的那一則（同一原因每 `ATTENTION_LOG_WINDOW` 最多一則）才寫 stderr；
+/// 視窗內改記 WARN 的不寫，避免 journal 洪水。一般連線錯誤不經過這裡，不寫 stderr。
+fn attention_outcome(check: Option<u64>) -> (log::Level, bool) {
     match check {
-        Some(0) => log::error!("{msg}"),
-        Some(n) => log::error!("{msg}（上次以 ERROR 記錄後，另有 {n} 次{what}已改記 WARN）"),
-        None => log::warn!("{msg}"),
+        Some(_) => (log::Level::Error, true),
+        None => (log::Level::Warn, false),
+    }
+}
+
+/// 依節流結果以 error 或 warn 記錄斷線訊息；以 error 記錄時同時寫一行到 stderr。
+fn log_attention(check: Option<u64>, msg: &str, what: &str) {
+    let msg = match check {
+        Some(n) if n > 0 => format!("{msg}（上次以 ERROR 記錄後，另有 {n} 次{what}已改記 WARN）"),
+        _ => msg.to_string(),
+    };
+    let (level, to_stderr) = attention_outcome(check);
+    log::log!(level, "{msg}");
+    if to_stderr {
+        service_status::attention(&msg);
     }
 }
 
@@ -445,8 +462,9 @@ async fn run_with<D: Dialer>(
     let mut superseded_streak: u32 = 0;
     // 「連續被取代」的 error 日誌節流（跨連線保留）
     let mut superseded_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
-    // 伺服器致命錯誤、協定版本不符的 error 日誌節流（跨連線保留，依錯誤碼分類）
+    // 伺服器致命錯誤、協定版本不符、客戶端憑證被拒的 error 日誌節流（跨連線保留，依錯誤碼分類）
     let mut attention_log = AttentionLog::new();
+    let has_client_cert = settings.client_cert.is_some();
 
     loop {
         let mut registered_at = None;
@@ -532,9 +550,9 @@ async fn run_with<D: Dialer>(
                 &msg,
                 "「連續被取代」的斷線",
             );
-        } else if let Some(key) = attention_key(&err) {
-            // 伺服器致命錯誤（auth_failed、certificate_rejected、狀態表滿等）每次重連都會重複：
-            // 同一錯誤碼的 error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
+        } else if let Some(key) = attention_key(&err, has_client_cert) {
+            // 伺服器致命錯誤（auth_failed、certificate_rejected、狀態表滿等）與客戶端憑證被拒的
+            // TLS alert 每次重連都會重複：同一原因的 error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
             log_attention(
                 attention_log.check(&key, Instant::now()),
                 &msg,
@@ -545,6 +563,7 @@ async fn run_with<D: Dialer>(
         } else {
             log::warn!("{msg}");
         }
+        service_status::set_status(&disconnect_status(&err, superseded_streak, has_client_cert));
 
         tokio::select! {
             _ = time::sleep(delay) => {}
@@ -556,26 +575,175 @@ async fn run_with<D: Dialer>(
     }
 }
 
-/// 斷線原因是否需要人工處理（以 error 等級記錄，不論連續失敗次數；實際記錄時另有節流）：
-/// 伺服器送來的致命錯誤或註冊前的錯誤、協定版本不符；
+/// 斷線原因是否需要人工處理（以 error 等級記錄並寫 stderr，不論連續失敗次數；實際記錄時另有節流）：
+/// 伺服器送來的致命錯誤或註冊前的錯誤、協定版本不符、伺服器以 TLS alert 拒絕客戶端憑證、
+/// 伺服器憑證驗證失敗（見 [`server_cert_problem`]）；
 /// `superseded` 只在連續發生 `SUPERSEDED_STREAK_ERROR` 次以上時才算。
 #[cfg(test)]
-fn needs_attention(err: &SessionError, superseded_streak: u32) -> bool {
+fn needs_attention(err: &SessionError, superseded_streak: u32, has_client_cert: bool) -> bool {
     match err {
         SessionError::Server { code, .. } if code == "superseded" => {
             superseded_streak >= SUPERSEDED_STREAK_ERROR
         }
-        _ => attention_key(err).is_some(),
+        _ => attention_key(err, has_client_cert).is_some(),
     }
 }
 
 /// 需要人工處理的斷線原因（`superseded` 除外，另有規則）的節流分類鍵；其他原因回傳 `None`。
-fn attention_key(err: &SessionError) -> Option<String> {
+fn attention_key(err: &SessionError, has_client_cert: bool) -> Option<String> {
     match err {
         SessionError::Server { code, .. } if code == "superseded" => None,
         SessionError::Server { code, fatal, .. } => Some(format!("server:{code}:{fatal}")),
         SessionError::ProtoMismatch(p) => Some(format!("proto:{p}")),
+        _ => client_cert_alert(err, has_client_cert)
+            .map(|a| format!("tls:{a:?}"))
+            .or_else(|| {
+                server_cert_problem(err).map(|(reason, _)| format!("server_cert:{reason}"))
+            }),
+    }
+}
+
+/// 伺服器憑證驗證失敗（本機以 rustls 驗證伺服器憑證時的錯誤）時回傳 `(原因, 提示摘要)`。
+///
+/// 不受信任、名稱不符、過期、被標記為 CA 等都需要人工處理（改設定、換憑證或校正時鐘），
+/// 每次重連都會重複，因此視為持續性錯誤。拒絕連線、逾時、連線重設等一般網路錯誤不在此列。
+fn server_cert_problem(err: &SessionError) -> Option<(&'static str, &'static str)> {
+    use tokio_rustls::rustls::{CertificateError as C, Error as TlsError};
+    let TlsError::InvalidCertificate(e) = err.rustls_error()? else {
+        return None;
+    };
+    Some(match e {
+        C::UnknownIssuer => (
+            "不受信任",
+            "簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定",
+        ),
+        C::NotValidForName | C::NotValidForNameContext { .. } => {
+            ("名稱不符", "請把 server.domain 設為伺服器憑證 SAN 中的名稱")
+        }
+        C::Expired | C::ExpiredContext { .. } => {
+            ("已過期", "請伺服器管理者更新憑證，或檢查本機時鐘")
+        }
+        C::NotValidYet | C::NotValidYetContext { .. } => {
+            ("尚未生效", "請檢查本機時鐘或伺服器憑證的有效期間")
+        }
+        C::Revoked => ("已被撤銷", "請伺服器管理者更換伺服器憑證"),
+        C::InvalidPurpose | C::InvalidPurposeContext { .. } => {
+            ("用途不符", "伺服器憑證的 EKU 必須含 serverAuth")
+        }
+        C::Other(other)
+            if other.0.downcast_ref::<webpki::Error>()
+                == Some(&webpki::Error::CaUsedAsEndEntity) =>
+        {
+            (
+                "被標記為 CA",
+                "伺服器憑證必須是 basicConstraints CA:FALSE 的終端憑證，請重新簽發",
+            )
+        }
+        _ => ("驗證失敗", "詳見 logs/"),
+    })
+}
+
+/// 伺服器以 TLS alert 拒絕本機客戶端憑證（撤銷、過期、不信任、未提供）時回傳該 alert。
+///
+/// 憑證被撤銷後，第一次斷線通常是伺服器的 `certificate_rejected`，之後每次重連都在握手時
+/// 收到 `CertificateRevoked` 等 alert；兩者都需要人工處理，因此一併視為持續性錯誤。
+/// 不信任類的 alert（`UnknownCA` 等）只在設定了客戶端憑證時才算（與 [`tls::describe_tls_error`] 一致）。
+fn client_cert_alert(
+    err: &SessionError,
+    has_client_cert: bool,
+) -> Option<tokio_rustls::rustls::AlertDescription> {
+    use tokio_rustls::rustls::{AlertDescription as A, Error as TlsError};
+    match err.rustls_error()? {
+        TlsError::AlertReceived(
+            a @ (A::CertificateRevoked | A::CertificateExpired | A::CertificateRequired),
+        ) => Some(*a),
+        TlsError::AlertReceived(
+            a @ (A::UnknownCA
+            | A::BadCertificate
+            | A::CertificateUnknown
+            | A::UnsupportedCertificate
+            | A::AccessDenied),
+        ) if has_client_cert => Some(*a),
         _ => None,
+    }
+}
+
+/// 需要人工處理的斷線原因的「錯誤碼」與簡短提示（systemd 的 STATUS 用，完整提示在日誌中）；
+/// 其他原因（一般連線錯誤、首次被取代等）回傳 `None`。
+fn attention_summary(
+    err: &SessionError,
+    superseded_streak: u32,
+    has_client_cert: bool,
+) -> Option<(String, String)> {
+    use tokio_rustls::rustls::AlertDescription as A;
+    let (code, summary) = match err {
+        SessionError::Server { code, .. } if code == "superseded" => {
+            if superseded_streak < SUPERSEDED_STREAK_ERROR {
+                return None;
+            }
+            (code.clone(), "多台主機可能共用同一份 agent.id".to_string())
+        }
+        SessionError::Server { code, message, .. } => {
+            let summary = match code.as_str() {
+                "certificate_rejected" if message.trim() == REVOCATION_UNAVAILABLE => {
+                    "伺服器的 CRL 已過期或無法判定撤銷狀態，請聯絡伺服器管理者"
+                }
+                "certificate_rejected" => {
+                    "客戶端憑證已被撤銷、過期或不受信任，請聯絡管理者重新簽發"
+                }
+                "auth_failed" => "伺服器拒絕本機身分，請確認憑證 SAN 為 DNS:<agent_id>",
+                "unsupported_version" => "協定版本不符，請更新 Pulse 或 Kairos",
+                "bad_request" if message.contains("registry is full") => {
+                    "伺服器狀態表已滿，請管理者調高 limits.max_agents"
+                }
+                _ => "伺服器拒絕註冊，詳見 logs/",
+            };
+            let code = if code.is_empty() {
+                "（未提供錯誤碼）".to_string()
+            } else {
+                code.clone()
+            };
+            (code, summary.to_string())
+        }
+        SessionError::ProtoMismatch(p) => (
+            "proto_mismatch".to_string(),
+            format!("伺服器的協定版本 {p} 與本程式（{PROTO_VERSION}）不符，請更新 Pulse 或 Kairos"),
+        ),
+        _ => {
+            let alert = client_cert_alert(err, has_client_cert)?;
+            let summary = match alert {
+                A::CertificateRevoked => "客戶端憑證已被撤銷，請聯絡管理者重新簽發",
+                A::CertificateExpired => "客戶端憑證已過期，請聯絡管理者重新簽發",
+                A::CertificateRequired => {
+                    "伺服器要求客戶端憑證，請設定 server.client_cert / server.client_key"
+                }
+                _ => "伺服器不信任此客戶端憑證，請確認由伺服器信任的 client CA 簽發",
+            };
+            (format!("TLS alert {alert:?}"), summary.to_string())
+        }
+    };
+    Some((code, summary))
+}
+
+/// 斷線後的 systemd 狀態文字：伺服器憑證驗證失敗時為「無法連線：伺服器憑證<原因>（<提示摘要>）」，
+/// 其他需要人工處理的錯誤為「無法註冊：<錯誤碼>（<提示摘要>）」，其餘為「重新連線中」。
+fn disconnect_status(err: &SessionError, superseded_streak: u32, has_client_cert: bool) -> String {
+    if let Some((reason, summary)) = server_cert_problem(err) {
+        return format!("無法連線：伺服器憑證{reason}（{summary}）");
+    }
+    match attention_summary(err, superseded_streak, has_client_cert) {
+        Some((code, summary)) => format!("無法註冊：{code}（{summary}）"),
+        None => "重新連線中".to_string(),
+    }
+}
+
+/// 註冊成功後的 systemd 狀態文字：「已註冊：<伺服器位址>:<連接埠>」（IPv6 位址加上方括號）。
+fn registered_status(settings: &Settings) -> String {
+    let address = settings.address.trim();
+    if address.contains(':') && !address.starts_with('[') {
+        format!("已註冊：[{address}]:{}", settings.port)
+    } else {
+        format!("已註冊：{address}:{}", settings.port)
     }
 }
 
@@ -636,6 +804,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     *registered_at = Some(Instant::now());
     let (level, msg) = registered_log(settings, offline_after_ms, tls_info);
     log::log!(level, "{msg}");
+    service_status::set_status(&registered_status(settings));
 
     // 斷線期間殘留在佇列中的舊取樣直接丟棄（at-most-once，不重送舊資料）
     while reports.try_recv().is_ok() {}
@@ -1649,17 +1818,17 @@ mod tests {
             hint.contains("狀態表已滿") && hint.contains("limits.max_agents"),
             "{hint}"
         );
-        assert!(needs_attention(&full, 0));
+        assert!(needs_attention(&full, 0, true));
         assert_eq!(
             server_error_hint(&s, &SessionError::ClosedByServer, 0),
             None
         );
         // 記錄等級：伺服器錯誤一律 error；superseded 只有連續發生才是 error
-        assert!(needs_attention(&err("auth_failed"), 0));
-        assert!(needs_attention(&SessionError::ProtoMismatch(2), 0));
-        assert!(!needs_attention(&err("superseded"), 1));
-        assert!(needs_attention(&err("superseded"), 2));
-        assert!(!needs_attention(&SessionError::ClosedByServer, 0));
+        assert!(needs_attention(&err("auth_failed"), 0, true));
+        assert!(needs_attention(&SessionError::ProtoMismatch(2), 0, true));
+        assert!(!needs_attention(&err("superseded"), 1, true));
+        assert!(needs_attention(&err("superseded"), 2, true));
+        assert!(!needs_attention(&SessionError::ClosedByServer, 0, true));
     }
 
     fn tls_info(verified: bool) -> TlsInfo {
@@ -2442,15 +2611,18 @@ mod tests {
         );
         // 分類鍵：superseded 與非伺服器錯誤不在此列
         assert_eq!(
-            attention_key(&SessionError::server("superseded", "", true)),
+            attention_key(&SessionError::server("superseded", "", true), true),
             None
         );
-        assert_eq!(attention_key(&SessionError::ClosedByServer), None);
+        assert_eq!(attention_key(&SessionError::ClosedByServer, true), None);
         assert_ne!(
-            attention_key(&SessionError::server("auth_failed", "", true)),
-            attention_key(&SessionError::server("certificate_rejected", "", true))
+            attention_key(&SessionError::server("auth_failed", "", true), true),
+            attention_key(
+                &SessionError::server("certificate_rejected", "", true),
+                true
+            )
         );
-        assert!(attention_key(&SessionError::ProtoMismatch(2)).is_some());
+        assert!(attention_key(&SessionError::ProtoMismatch(2), true).is_some());
     }
 
     /// 斷線日誌中，ERROR 的索引與其「另有 n 次…已改記 WARN」中的 n（沒有時為 0）。
@@ -2662,6 +2834,417 @@ mod tests {
             skipped[0].1.contains("ts=t2") && skipped[0].1.contains("已略過 1 次"),
             "{}",
             skipped[0].1
+        );
+    }
+
+    // ---- N4：需要人工處理的錯誤寫 stderr、systemd STATUS ----
+
+    use crate::service_status::Event;
+
+    /// 期間的 stderr 輸出（不含 STATUS）。
+    fn stderr_events(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Stderr(m) => Some(m.as_str()),
+                Event::Status(_) => None,
+            })
+            .collect()
+    }
+
+    /// 期間送出的 STATUS 文字。
+    fn status_events(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Status(s) => Some(s.as_str()),
+                Event::Stderr(_) => None,
+            })
+            .collect()
+    }
+
+    fn tls_alert(alert: AlertDescription) -> SessionError {
+        SessionError::Tls(io::Error::new(
+            io::ErrorKind::InvalidData,
+            TlsError::AlertReceived(alert),
+        ))
+    }
+
+    #[test]
+    fn stderr_is_written_only_when_attention_is_logged_as_error() {
+        // 節流判斷後以 ERROR 記錄（第一次、或視窗到期）才寫 stderr；視窗內改記 WARN 的不寫
+        assert_eq!(attention_outcome(Some(0)), (log::Level::Error, true));
+        assert_eq!(attention_outcome(Some(12)), (log::Level::Error, true));
+        assert_eq!(attention_outcome(None), (log::Level::Warn, false));
+
+        // 與 AttentionLog 搭配：同一原因 10 分鐘內只寫一次 stderr
+        let mut log = AttentionLog::new();
+        let t0 = Instant::now();
+        let written = |c| attention_outcome(c).1;
+        assert!(written(log.check("server:auth_failed:true", t0)));
+        assert!(!written(
+            log.check("server:auth_failed:true", t0 + Duration::from_secs(60))
+        ));
+        assert!(written(
+            log.check("server:auth_failed:true", t0 + ATTENTION_LOG_WINDOW)
+        ));
+        // 原因改變時立即再寫
+        assert!(written(log.check(
+            "tls:CertificateRevoked",
+            t0 + ATTENTION_LOG_WINDOW + Duration::from_secs(1)
+        )));
+    }
+
+    #[test]
+    fn only_manual_attention_errors_qualify_for_stderr() {
+        // 需要人工處理：伺服器致命錯誤、協定版本不符、客戶端憑證被拒的 TLS alert
+        let fatal = |code: &str, msg: &str| SessionError::server(code, msg, true);
+        for err in [
+            fatal("certificate_rejected", "revoked"),
+            fatal("auth_failed", "agent_id does not match certificate"),
+            fatal("unsupported_version", "supported proto: 2"),
+            fatal("bad_request", "agent registry is full"),
+            SessionError::ProtoMismatch(2),
+            tls_alert(AlertDescription::CertificateRevoked),
+            tls_alert(AlertDescription::CertificateExpired),
+            tls_alert(AlertDescription::CertificateRequired),
+        ] {
+            assert!(needs_attention(&err, 0, false), "{err}");
+        }
+        // 不信任類的 alert 只在設定了客戶端憑證時才算
+        assert!(needs_attention(
+            &tls_alert(AlertDescription::UnknownCA),
+            0,
+            true
+        ));
+        assert!(!needs_attention(
+            &tls_alert(AlertDescription::UnknownCA),
+            0,
+            false
+        ));
+        // 一般連線錯誤：不寫 stderr
+        for err in [
+            SessionError::ConnectTimeout,
+            SessionError::Connect(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            SessionError::TlsTimeout,
+            SessionError::Tls(io::Error::from(io::ErrorKind::ConnectionReset)),
+            tls_alert(AlertDescription::HandshakeFailure),
+            SessionError::ClosedByServer,
+            SessionError::HelloAckTimeout,
+            SessionError::IdleTimeout(Duration::from_secs(10)),
+            SessionError::WriteTimeout,
+        ] {
+            assert!(!needs_attention(&err, 0, true), "{err}");
+        }
+        // superseded 只有連續被取代才算
+        assert!(!needs_attention(&fatal("superseded", ""), 1, true));
+        assert!(needs_attention(&fatal("superseded", ""), 2, true));
+    }
+
+    #[test]
+    fn systemd_status_texts() {
+        let fatal = |code: &str, msg: &str| SessionError::server(code, msg, true);
+        assert_eq!(
+            disconnect_status(&fatal("certificate_rejected", "revoked"), 0, true),
+            "無法註冊：certificate_rejected（客戶端憑證已被撤銷、過期或不受信任，請聯絡管理者重新簽發）"
+        );
+        assert_eq!(
+            disconnect_status(
+                &fatal("certificate_rejected", "revocation status unavailable"),
+                0,
+                true
+            ),
+            "無法註冊：certificate_rejected（伺服器的 CRL 已過期或無法判定撤銷狀態，請聯絡伺服器管理者）"
+        );
+        assert_eq!(
+            disconnect_status(&fatal("auth_failed", "x"), 0, true),
+            "無法註冊：auth_failed（伺服器拒絕本機身分，請確認憑證 SAN 為 DNS:<agent_id>）"
+        );
+        assert_eq!(
+            disconnect_status(&fatal("unsupported_version", "x"), 0, true),
+            "無法註冊：unsupported_version（協定版本不符，請更新 Pulse 或 Kairos）"
+        );
+        assert_eq!(
+            disconnect_status(&fatal("bad_request", "agent registry is full"), 0, true),
+            "無法註冊：bad_request（伺服器狀態表已滿，請管理者調高 limits.max_agents）"
+        );
+        assert_eq!(
+            disconnect_status(&SessionError::server("invalid_agent", "x", false), 0, true),
+            "無法註冊：invalid_agent（伺服器拒絕註冊，詳見 logs/）"
+        );
+        assert_eq!(
+            disconnect_status(&fatal("", ""), 0, true),
+            "無法註冊：（未提供錯誤碼）（伺服器拒絕註冊，詳見 logs/）"
+        );
+        assert_eq!(
+            disconnect_status(&SessionError::ProtoMismatch(2), 0, true),
+            "無法註冊：proto_mismatch（伺服器的協定版本 2 與本程式（1）不符，請更新 Pulse 或 Kairos）"
+        );
+        assert_eq!(
+            disconnect_status(&tls_alert(AlertDescription::CertificateRevoked), 0, true),
+            "無法註冊：TLS alert CertificateRevoked（客戶端憑證已被撤銷，請聯絡管理者重新簽發）"
+        );
+        assert_eq!(
+            disconnect_status(&tls_alert(AlertDescription::CertificateExpired), 0, true),
+            "無法註冊：TLS alert CertificateExpired（客戶端憑證已過期，請聯絡管理者重新簽發）"
+        );
+        assert_eq!(
+            disconnect_status(&tls_alert(AlertDescription::UnknownCA), 0, true),
+            "無法註冊：TLS alert UnknownCA（伺服器不信任此客戶端憑證，請確認由伺服器信任的 client CA 簽發）"
+        );
+        assert_eq!(
+            disconnect_status(&fatal("superseded", ""), 2, true),
+            "無法註冊：superseded（多台主機可能共用同一份 agent.id）"
+        );
+        // 一般連線錯誤與首次被取代：重新連線中
+        for (err, streak) in [
+            (SessionError::ClosedByServer, 0),
+            (SessionError::ConnectTimeout, 0),
+            (tls_alert(AlertDescription::UnknownCA), 0),
+            (fatal("superseded", ""), 1),
+        ] {
+            let has_client_cert = !matches!(err, SessionError::Tls(_));
+            assert_eq!(
+                disconnect_status(&err, streak, has_client_cert),
+                "重新連線中",
+                "{err}"
+            );
+        }
+        // 註冊成功
+        let mut s = settings(1);
+        s.address = "kairos.example.com".into();
+        s.port = 8443;
+        assert_eq!(registered_status(&s), "已註冊：kairos.example.com:8443");
+        s.address = "::1".into();
+        assert_eq!(registered_status(&s), "已註冊：[::1]:8443");
+    }
+
+    #[test]
+    fn status_texts_from_server_are_single_line() {
+        // 伺服器送來的 code 已清理：不會夾帶換行到 STATUS（sd_notify 以換行分隔欄位）
+        let err = SessionError::server("bad\ncode\r\u{1b}[31m", "x", true);
+        let status = disconnect_status(&err, 0, true);
+        assert!(!status.contains('\n') && !status.contains('\r') && !status.contains('\u{1b}'));
+    }
+
+    /// 同 [`run_script`]，另外回傳期間的 stderr／STATUS 輸出。
+    fn run_script_with_events<F, Fut>(
+        s: Settings,
+        sessions: usize,
+        script: F,
+    ) -> (Vec<Duration>, Vec<(log::Level, String)>, Vec<Event>)
+    where
+        F: Fn(usize, ServerSide) -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let ((dials, logs), events) =
+            crate::service_status::capture(|| run_script(s, sessions, script));
+        (dials, logs, events)
+    }
+
+    #[test]
+    fn revoked_certificate_is_reported_to_stderr_and_systemd_status() {
+        // N4：註冊後被撤銷（certificate_rejected）→ 之後每次重連都被拒。
+        // stderr 只在 ERROR 時寫（10 分鐘最多一次），STATUS 顯示錯誤碼與提示摘要
+        let mut s = settings(1);
+        s.max_delay = Duration::from_secs(30);
+        s.client_cert = Some("client.pem".into());
+        let (dials, logs, events) = run_script_with_events(s, 30, |i, mut f| async move {
+            if i == 0 {
+                accept_hello(&mut f).await;
+                ack_for(&mut f, Duration::from_secs(40)).await;
+                f.send(
+                    r#"{"type":"error","seq":null,"code":"certificate_rejected","message":"client certificate has been revoked","fatal":true}"#
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+                drain(&mut f).await;
+            } else {
+                let _ = f.next().await; // hello
+                f.send(
+                    r#"{"type":"error","seq":1,"code":"certificate_rejected","message":"client certificate has been revoked","fatal":true}"#
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 30, "{d:?}");
+        let errors = error_positions(&d);
+        let stderr = stderr_events(&events);
+        // stderr 的內容與 ERROR 日誌完全相同，且只有 ERROR 那幾則
+        let error_msgs: Vec<&str> = errors.iter().map(|(i, _)| d[*i].1.as_str()).collect();
+        assert_eq!(stderr, error_msgs, "{events:?}");
+        assert!(errors.len() >= 2 && errors.len() < d.len(), "{d:?}");
+        assert!(
+            stderr[0].contains("certificate_rejected") && stderr[0].contains("重新簽發"),
+            "{}",
+            stderr[0]
+        );
+        // 第二次寫 stderr 距第一次至少 10 分鐘
+        let (second, _) = errors[1];
+        assert!(dials[second] - dials[0] >= ATTENTION_LOG_WINDOW);
+
+        let status = status_events(&events);
+        assert_eq!(status[0], "已註冊：127.0.0.1:1", "{status:?}");
+        assert_eq!(status.len(), 1 + d.len(), "{status:?}");
+        for st in &status[1..] {
+            assert_eq!(
+                *st,
+                "無法註冊：certificate_rejected（客戶端憑證已被撤銷、過期或不受信任，請聯絡管理者重新簽發）"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_disconnects_do_not_write_stderr() {
+        // 一般連線錯誤（伺服器關閉連線、註冊前被關閉），即使超過 retry.max_retries 而記 ERROR，也不寫 stderr
+        let (_, logs, events) = run_script_with_events(settings(1), 8, |i, mut f| async move {
+            if i == 0 {
+                accept_hello(&mut f).await;
+                ack_for(&mut f, Duration::from_secs(1)).await;
+            }
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 8, "{d:?}");
+        assert!(
+            d.iter().any(|(l, _)| *l == log::Level::Error),
+            "應有超過 max_retries 的 ERROR：{d:?}"
+        );
+        assert!(stderr_events(&events).is_empty(), "{events:?}");
+        let status = status_events(&events);
+        assert_eq!(status[0], "已註冊：127.0.0.1:1");
+        assert!(status[1..].iter().all(|s| *s == "重新連線中"), "{status:?}");
+        assert_eq!(status.len(), 9, "{status:?}");
+    }
+
+    #[test]
+    fn status_returns_to_registered_after_recovery() {
+        // 狀態表已滿 → 管理者調高上限後重新註冊成功
+        let (_, _, events) = run_script_with_events(settings(1), 3, |i, mut f| async move {
+            if i < 2 {
+                let _ = f.next().await; // hello
+                f.send(
+                    r#"{"type":"error","seq":1,"code":"bad_request","message":"agent registry is full","fatal":true}"#
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            } else {
+                accept_hello(&mut f).await;
+                ack_for(&mut f, Duration::from_secs(1)).await;
+            }
+        });
+        let full = "無法註冊：bad_request（伺服器狀態表已滿，請管理者調高 limits.max_agents）";
+        assert_eq!(
+            status_events(&events),
+            [full, full, "已註冊：127.0.0.1:1", "重新連線中"]
+        );
+        // 狀態表已滿只寫一次 stderr（第二次在 10 分鐘視窗內）
+        let stderr = stderr_events(&events);
+        assert_eq!(stderr.len(), 1, "{stderr:?}");
+        assert!(stderr[0].contains("limits.max_agents"), "{}", stderr[0]);
+    }
+
+    fn server_cert_error(e: tokio_rustls::rustls::CertificateError) -> SessionError {
+        SessionError::Tls(io::Error::new(
+            io::ErrorKind::InvalidData,
+            TlsError::InvalidCertificate(e),
+        ))
+    }
+
+    #[test]
+    fn server_certificate_problems_are_persistent_errors() {
+        use tokio_rustls::rustls::{CertificateError as C, OtherError};
+        let ca_as_leaf = C::Other(OtherError(std::sync::Arc::new(
+            webpki::Error::CaUsedAsEndEntity,
+        )));
+        let cases = [
+            (
+                server_cert_error(C::UnknownIssuer),
+                "無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）",
+            ),
+            (
+                server_cert_error(C::NotValidForName),
+                "無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）",
+            ),
+            (
+                server_cert_error(C::Expired),
+                "無法連線：伺服器憑證已過期（請伺服器管理者更新憑證，或檢查本機時鐘）",
+            ),
+            (
+                server_cert_error(C::NotValidYet),
+                "無法連線：伺服器憑證尚未生效（請檢查本機時鐘或伺服器憑證的有效期間）",
+            ),
+            (
+                server_cert_error(C::Revoked),
+                "無法連線：伺服器憑證已被撤銷（請伺服器管理者更換伺服器憑證）",
+            ),
+            (
+                server_cert_error(C::InvalidPurpose),
+                "無法連線：伺服器憑證用途不符（伺服器憑證的 EKU 必須含 serverAuth）",
+            ),
+            (
+                server_cert_error(ca_as_leaf),
+                "無法連線：伺服器憑證被標記為 CA（伺服器憑證必須是 basicConstraints CA:FALSE 的終端憑證，請重新簽發）",
+            ),
+            (
+                server_cert_error(C::BadSignature),
+                "無法連線：伺服器憑證驗證失敗（詳見 logs/）",
+            ),
+        ];
+        for (err, status) in &cases {
+            assert!(needs_attention(err, 0, false), "{err}");
+            assert_eq!(disconnect_status(err, 0, false), *status);
+        }
+        // 讀取時才出現的驗證錯誤（包在 Codec 的 I/O 錯誤中）也算
+        let read_err = SessionError::Codec(LinesCodecError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            TlsError::InvalidCertificate(C::Expired),
+        )));
+        assert!(needs_attention(&read_err, 0, false));
+        // 不同原因的節流鍵不同（原因改變時立即再記 ERROR）
+        assert_ne!(
+            attention_key(&cases[0].0, false),
+            attention_key(&cases[1].0, false)
+        );
+        // 一般網路錯誤仍不算
+        for err in [
+            SessionError::Connect(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            SessionError::ConnectTimeout,
+            SessionError::TlsTimeout,
+            SessionError::Tls(io::Error::from(io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(!needs_attention(&err, 0, false), "{err}");
+            assert_eq!(disconnect_status(&err, 0, false), "重新連線中");
+        }
+    }
+
+    #[test]
+    fn server_certificate_problem_is_logged_as_error_and_written_to_stderr() {
+        // 第一次就 ERROR 並寫 stderr；之後 10 分鐘內改記 WARN、不寫 stderr；視窗到期再寫
+        let err = server_cert_error(tokio_rustls::rustls::CertificateError::UnknownIssuer);
+        let key = attention_key(&err, false).unwrap();
+        let mut log = AttentionLog::new();
+        let t0 = Instant::now();
+        let ((), logs) = crate::test_log::capture(|| {
+            for (at, expect_stderr) in [
+                (t0, true),
+                (t0 + Duration::from_secs(5), false),
+                (t0 + ATTENTION_LOG_WINDOW, true),
+            ] {
+                let ((), events) = crate::service_status::capture(|| {
+                    log_attention(log.check(&key, at), "連線中斷：x", "相同原因的斷線");
+                });
+                assert_eq!(!events.is_empty(), expect_stderr, "{events:?}");
+            }
+        });
+        let levels: Vec<_> = logs.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            levels,
+            [log::Level::Error, log::Level::Warn, log::Level::Error]
         );
     }
 }
