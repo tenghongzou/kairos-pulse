@@ -5,6 +5,7 @@ use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
 use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -162,6 +163,10 @@ pub struct AuthSettings {
     /// 是否接受含多個 DNS SAN 的客戶端憑證。預設 `false`：憑證必須恰好有一個 DNS SAN，
     /// 避免一張憑證同時冒用（並踢掉）多個 agent
     pub allow_multiple_dns_sans: bool,
+    /// 未啟用 mTLS（`client_ca` 為空）時，是否仍允許監聽非 loopback 位址（審計 S1）。
+    /// 預設 `false`：監聽非 loopback 位址又沒有 mTLS 時拒絕啟動，見 [`AppConfig::check_listen_auth`]。
+    /// 啟用 mTLS 時不生效
+    pub allow_unauthenticated: bool,
 }
 
 impl AuthSettings {
@@ -221,6 +226,23 @@ impl LogSettings {
             )
         })
     }
+}
+
+/// 是否為 loopback 位址：IPv4 `127.0.0.0/8`、IPv6 `::1`，以及 IPv4-mapped 的 `::ffff:127.0.0.0/104`。
+/// `0.0.0.0`、`::`（所有介面）與其他位址都不是
+pub fn is_loopback(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
+/// 監聽位址與客戶端驗證的組合（[`AppConfig::check_listen_auth`] 的結果，決定啟動時記錄的訊息）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenAuth {
+    /// 已啟用 mTLS
+    Mutual,
+    /// 未啟用 mTLS，但只監聽 loopback 位址（本機開發）
+    LoopbackOnly,
+    /// 未啟用 mTLS 且監聽非 loopback 位址，由 `auth.allow_unauthenticated = true` 明確允許
+    UnauthenticatedAllowed { exposed: Vec<SocketAddr> },
 }
 
 /// 命令列解析結果
@@ -352,6 +374,50 @@ impl AppConfig {
         self.limits
             .max_agents
             .unwrap_or(DEFAULT_MAX_AGENTS.max(self.server.max_connections))
+    }
+
+    /// 預設拒絕未認證的對外監聽（審計 S1）：`resolved` 為 `server.listen` 解析出的位址。
+    /// 沒有設定 `auth.client_ca`（mTLS）又有任何一個位址不是 loopback 時，除非明確設定
+    /// `auth.allow_unauthenticated = true`，否則回錯誤（訊息說明原因與修正方式），拒絕啟動。
+    pub fn check_listen_auth(&self, resolved: &[SocketAddr]) -> Result<ListenAuth, Error> {
+        if self.auth.client_ca_path().is_some() {
+            return Ok(ListenAuth::Mutual);
+        }
+        let exposed: Vec<SocketAddr> = resolved
+            .iter()
+            .copied()
+            .filter(|a| !is_loopback(a.ip()))
+            .collect();
+        if exposed.is_empty() {
+            return Ok(ListenAuth::LoopbackOnly);
+        }
+        if self.auth.allow_unauthenticated {
+            return Ok(ListenAuth::UnauthenticatedAllowed { exposed });
+        }
+        let exposed_list = exposed
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join("、");
+        // server.listen 是主機名稱時，附上解析出的非 loopback 位址
+        let resolved_note = if exposed_list == self.server.listen {
+            String::new()
+        } else {
+            format!("（解析為 {}）", exposed_list)
+        };
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動\n\
+                 \x20 原因：server.listen = \"{}\"{} 不是 loopback 位址，但沒有設定 auth.client_ca。\
+                 這樣任何能連到這個位址的人都能以任意 agent_id 註冊、寫入 report，或用已知的 agent_id 把合法的 agent 踢下線。\n\
+                 \x20 處理方式：\n\
+                 \x20   1. 建議：設定 auth.client_ca（與 auth.crl）啟用 mTLS，步驟見 README「啟用 mTLS」與 INSTALL.md 第 6、7 節。\n\
+                 \x20   2. 只在本機測試：把 server.listen 改成 loopback 位址，例如 127.0.0.1:8080 或 [::1]:8080。\n\
+                 \x20   3. 只在隔離的測試環境：設定 auth.allow_unauthenticated = true（或環境變數 KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true），明確允許未認證的連線。",
+                self.server.listen, resolved_note
+            ),
+        ))
     }
 
     /// 依序疊加預設值、設定檔與環境變數
@@ -511,6 +577,7 @@ mod tests {
         assert_eq!(c.limits.max_agents, None);
         assert_eq!(c.max_agents(), 10000);
         assert!(!c.auth.allow_multiple_dns_sans);
+        assert!(!c.auth.allow_unauthenticated);
         assert_eq!(c.timeouts.handshake_secs, 5);
         assert_eq!(c.timeouts.hello_secs, 5);
         assert_eq!(c.timeouts.write_secs, 5);
@@ -679,8 +746,10 @@ mod tests {
             ("KAIROS__AUTH__CLIENT_CA", "ca.pem"),
             ("KAIROS__AUTH__CRL", "a.crl,b.crl"),
             ("KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS", "true"),
+            ("KAIROS__AUTH__ALLOW_UNAUTHENTICATED", "true"),
         ])
         .unwrap();
+        assert!(c.auth.allow_unauthenticated);
         assert_eq!(c.server.listen, "0.0.0.0:9000");
         assert_eq!(c.server.max_connections, 64);
         assert_eq!(c.server.max_connections_per_ip, Some(4));
@@ -815,6 +884,92 @@ mod tests {
         .unwrap();
         assert!(c.validate().is_ok());
         assert_eq!((c.max_connections_per_ip(), c.max_agents()), (16, 16));
+    }
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn loopback_addresses() {
+        // S1：127.0.0.0/8 與 ::1（含 IPv4-mapped）是 loopback；0.0.0.0、:: 與其他位址不是
+        for ip in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_loopback(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "0.0.0.0",
+            "::",
+            "10.0.0.5",
+            "192.168.1.1",
+            "128.0.0.1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:10.0.0.1",
+            "::ffff:0.0.0.0",
+        ] {
+            assert!(!is_loopback(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn unauthenticated_exposure_is_refused_by_default() {
+        // S1：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動
+        let mut c = AppConfig::default();
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["127.0.0.1:8080"])).unwrap(),
+            ListenAuth::LoopbackOnly
+        );
+        // localhost 解析出的 IPv4 與 IPv6 都是 loopback
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["127.0.0.1:8080", "[::1]:8080"]))
+                .unwrap(),
+            ListenAuth::LoopbackOnly
+        );
+        for exposed in [
+            &["0.0.0.0:8080"][..],
+            &["[::]:8080"],
+            &["10.0.0.5:8080"],
+            // 解析出的位址只要有一個不是 loopback 就拒絕
+            &["127.0.0.1:8080", "10.0.0.5:8080"],
+        ] {
+            c.server.listen = exposed[0].to_string();
+            let err = c.check_listen_auth(&addrs(exposed)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+            let msg = err.to_string();
+            // 訊息要說清楚怎麼修
+            for hint in [
+                "auth.client_ca",
+                "127.0.0.1:8080",
+                "auth.allow_unauthenticated = true",
+                "KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true",
+            ] {
+                assert!(msg.contains(hint), "{hint}: {msg}");
+            }
+        }
+
+        // 明確允許時照常啟動（記 WARN）
+        c.auth.allow_unauthenticated = true;
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["127.0.0.1:8080", "0.0.0.0:8080"]))
+                .unwrap(),
+            ListenAuth::UnauthenticatedAllowed {
+                exposed: addrs(&["0.0.0.0:8080"])
+            }
+        );
+
+        // 啟用 mTLS 時不論監聽位址都允許
+        let mut c = AppConfig::default();
+        c.auth.client_ca = "ca.pem".into();
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["0.0.0.0:8080"])).unwrap(),
+            ListenAuth::Mutual
+        );
     }
 
     #[test]

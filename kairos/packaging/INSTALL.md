@@ -240,9 +240,11 @@ listen = "0.0.0.0:8080"          # 預設只聽 127.0.0.1，其他主機連不�
 # max_connections = 1024         # 調高時，unit 的 LimitNOFILE 也要 > max_connections + 64
 
 [auth]
-client_ca = "client-ca.pem"      # 啟用 mTLS（正式環境必須）
+client_ca = "client-ca.pem"      # 啟用 mTLS（正式環境必須；監聽 0.0.0.0 卻沒有設定時 Kairos 拒絕啟動）
 crl = ["agents.crl"]
 ```
+
+`server.listen` 不是 loopback 位址（`127.0.0.0/8`、`::1`）又沒有設定 `auth.client_ca` 時，Kairos 會拒絕啟動並記錄 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」。`auth.allow_unauthenticated = true` 可以略過這項檢查，但任何能連線的人都能以任意 `agent_id` 註冊，**不可用於正式環境**。
 
 相對路徑以工作目錄 `/opt/kairos` 解析，`cert.pem`、`key.pem`、`data/`、`logs/` 維持預設即可。
 
@@ -317,7 +319,8 @@ cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於�
 [INFO] Kairos 已啟動，監聽 0.0.0.0:8080（連線上限 1024，…）
 ```
 
-- 出現 `未啟用客戶端憑證驗證（auth.client_ca）` 的 `WARN`：`kairos.toml` 沒有設定 `auth.client_ca`，正式環境不可如此。
+- 啟動失敗並出現 `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動`：`kairos.toml` 沒有設定 `auth.client_ca`。依第 6、7 節啟用 mTLS。
+- 出現 `未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 …（auth.allow_unauthenticated = true）` 的 `WARN`：設定了 `auth.allow_unauthenticated = true`，正式環境不可如此。
 - 出現 `可開啟的檔案數上限（RLIMIT_NOFILE soft limit）…` 的 `WARN`：unit 的 `LimitNOFILE` 沒有生效或小於 `server.max_connections` + 64；依訊息中的建議值以 drop-in 調高 `LimitNOFILE`（`systemctl show kairos -p LimitNOFILE` 可確認目前值）。
 - 從其他主機確認 TLS 與伺服器憑證：`openssl s_client -connect monitor.example.com:8080 -CAfile ca.pem -servername monitor.example.com </dev/null`（啟用 mTLS 時，沒帶客戶端憑證會在握手後被拒，這是正常的）。
 - Pulse 上線後，`agents.json` 的 `online` 會增加。多台 Pulse 經同一個 NAT 連入時，**以 `agents.json` 作為上線狀態的依據**：日誌的上線／離線事件有節流（見 `README.md`「日誌」）。
@@ -355,6 +358,8 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 - 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
 
 ## 11. 升級
+
+**未啟用 mTLS 的部署請先處理**：從舊版升級時，若 `kairos.toml` 的 `server.listen` 是非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca`，新版會拒絕啟動（舊版只記 `WARN`）。升級前先依第 6、7 節啟用 mTLS；只有隔離的測試環境才在 `[auth]` 加上 `allow_unauthenticated = true`。
 
 **升級順序：先升級全部 Pulse，再升級 Kairos**（或同時升級）。新版 Pulse 會替換新版 Kairos 禁止的主機名稱字元，連舊版 Kairos 不受影響；反過來，舊版 Pulse 連新版 Kairos 可能無法註冊（細節見 `README.md`「升級注意事項」）。
 
@@ -413,6 +418,7 @@ userdel kairos
 | `status=226/NAMESPACE` | `ReadWritePaths` 指定的 `/opt/kairos/data` 或 `/opt/kairos/logs` 不存在。依第 4 節建立 |
 | `status=200/CHDIR` | `/opt/kairos` 不存在或 kairos 使用者沒有執行權限（`ls -ld /opt/kairos` 應為 `root kairos drwxr-x---`） |
 | `找不到設定檔 /opt/kairos/kairos.toml` | 尚未依第 7 節建立 `kairos.toml` |
+| `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動` | `kairos.toml` 沒有設定 `auth.client_ca`；依第 6、7 節啟用 mTLS |
 | `無法開啟 key.pem: Permission denied` | 私鑰權限或群組不對：應為 `root:kairos` 640 |
 | `無法監聽 0.0.0.0:443: Permission denied` | 監聽 1024 以下的連接埠需要 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（第 8 節 drop-in） |
 | 日誌在 journal 與 `logs/` 各一份 | 預設行為，見第 9.2 節 |

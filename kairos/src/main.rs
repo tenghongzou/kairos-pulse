@@ -31,7 +31,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::BindingPolicy;
-use crate::config::{AppConfig, CliAction, USAGE, parse_args};
+use crate::config::{AppConfig, CliAction, ListenAuth, USAGE, parse_args};
 use crate::connection::{ConnContext, handle_connection, is_peer_disconnect};
 use crate::per_ip::{PerIpLimiter, Rejected};
 use crate::rate::ReportLimiter;
@@ -477,6 +477,18 @@ async fn run(
         None if default_file.is_file() => info!("設定檔: {}", default_file.display()),
         None => info!("未找到 {}，使用程式內預設值", default_file.display()),
     }
+    // 預設拒絕：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動（S1）。
+    // 以解析後的位址判斷（server.listen 可以是主機名稱，例如 localhost:8080）
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.server.listen)
+        .await
+        .map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("無法解析 server.listen {}: {}", config.server.listen, e),
+            )
+        })?
+        .collect();
+    let listen_auth = config.check_listen_auth(&resolved)?;
     warn_if_fd_limit_low(config.server.max_connections);
     if let Some((max, estimate)) = config.daily_limit_below_estimate() {
         warn!(
@@ -494,14 +506,27 @@ async fn run(
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
     let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths)?));
-    match &tls_paths.client_ca {
-        Some(ca) => info!(
-            "已啟用客戶端憑證驗證（mTLS），信任 {}，CRL {} 份；agent_id 必須與憑證的 SAN 相符",
-            ca,
-            tls_state.current().crl_count
+    match (&tls_paths.client_ca, &listen_auth) {
+        (Some(ca), _) => {
+            info!(
+                "已啟用客戶端憑證驗證（mTLS），信任 {}，CRL {} 份；agent_id 必須與憑證的 SAN 相符",
+                ca,
+                tls_state.current().crl_count
+            );
+            if config.auth.allow_unauthenticated {
+                info!("已啟用 mTLS，auth.allow_unauthenticated 不生效");
+            }
+        }
+        (None, ListenAuth::UnauthenticatedAllowed { exposed }) => warn!(
+            "未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 {}（auth.allow_unauthenticated = true）：任何能連線的人都能以任意 agent_id 註冊、寫入 report，或把合法的 agent 踢下線。僅限隔離的測試環境，正式環境請啟用 mTLS",
+            exposed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("、")
         ),
-        None => warn!(
-            "未啟用客戶端憑證驗證（auth.client_ca），任何人都能以任意 agent_id 註冊，僅建議用於本機開發"
+        (None, _) => warn!(
+            "未啟用客戶端憑證驗證（auth.client_ca），只監聽 loopback 位址；同一台主機上的任何程式都能以任意 agent_id 註冊，僅建議用於本機開發"
         ),
     }
 
@@ -890,6 +915,58 @@ Max open files            1024                 524288               files     \n
         let result = run(bad, None, None, opts).await;
         assert!(result.is_err());
         assert_eq!(exit_code(&result), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_refuses_unauthenticated_non_loopback_listen() {
+        // S1：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動，且在建立資料目錄與監聽之前
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-run-s1-{}-{}",
+            std::process::id(),
+            next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = run_config(&dir);
+        config.server.listen = "0.0.0.0:0".into();
+        let (opts, _) = run_options(&dir);
+        let err = run(config.clone(), None, None, opts).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("auth.allow_unauthenticated"),
+            "{err}"
+        );
+        assert!(!dir.join("data").exists(), "拒絕啟動前不應建立資料目錄");
+
+        // 明確允許時照常啟動
+        config.auth.allow_unauthenticated = true;
+        let (opts, shutdown) = run_options(&dir);
+        let task = tokio::spawn(run(config, None, None, opts));
+        for _ in 0..250 {
+            if dir.join("data").join(storage::AGENTS_FILE).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown.trigger();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run 應在關機後結束")
+            .unwrap();
+        assert!(matches!(result, Ok(None)), "{result:?}");
+
+        // 主機名稱解析成 loopback 時照常啟動（不需 allow_unauthenticated）
+        let mut config = run_config(&dir);
+        config.server.listen = "localhost:0".into();
+        let (opts, shutdown) = run_options(&dir);
+        let task = tokio::spawn(run(config, None, None, opts));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.trigger();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Ok(None)), "{result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
