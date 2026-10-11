@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::fsperm;
 use crate::registry::RegistrySnapshot;
 use crate::retention::{
     DateGuard, DatedFiles, GUARD_STATE_FILE, is_tmp_name_for, write_atomically,
@@ -192,9 +193,10 @@ pub fn split_by_date(
     groups
 }
 
-/// 建立資料目錄（啟動時呼叫，失敗即中止啟動），並刪除先前異常結束時留下的暫存檔
+/// 建立資料目錄（啟動時呼叫，失敗即中止啟動；Unix 上新建立的目錄為 0750），
+/// 並刪除先前異常結束時留下的暫存檔
 pub async fn prepare_data_dir(data_dir: &Path) -> Result<DataPaths, Error> {
-    fs::create_dir_all(data_dir).await.map_err(|e| {
+    fsperm::create_dir_all_async(data_dir).await.map_err(|e| {
         Error::new(
             e.kind(),
             format!("無法建立資料目錄 {}: {}", data_dir.display(), e),
@@ -214,15 +216,17 @@ pub async fn prepare_data_dir(data_dir: &Path) -> Result<DataPaths, Error> {
     Ok(DataPaths::new(data_dir))
 }
 
-/// 建立檔案所在的目錄（資料目錄在執行中被刪除時重建）
+/// 建立檔案所在的目錄（資料目錄在執行中被刪除時重建；Unix 上為 0750）
 async fn ensure_parent_dir(path: &Path) -> Result<(), Error> {
     match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => fs::create_dir_all(dir).await.map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("無法建立資料目錄 {}: {}", dir.display(), e),
-            )
-        }),
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            fsperm::create_dir_all_async(dir).await.map_err(|e| {
+                Error::new(
+                    e.kind(),
+                    format!("無法建立資料目錄 {}: {}", dir.display(), e),
+                )
+            })
+        }
         _ => Ok(()),
     }
 }
@@ -271,17 +275,19 @@ pub fn needs_newline_repair(file_len: u64, last_byte: Option<u8>) -> bool {
     file_len > 0 && last_byte != Some(b'\n')
 }
 
-/// 以附加模式開啟 report 檔（必要時先建立資料目錄）；若結尾是殘缺的行，先補上 `\n`
+/// 以附加模式開啟 report 檔（必要時先建立資料目錄）；若結尾是殘缺的行，先補上 `\n`。
+/// Unix 上新檔案為 0640，既有的檔案收緊到最多 0640（S3）
 async fn open_reports_file(path: &Path) -> Result<BufWriter<File>, Error> {
     ensure_parent_dir(path).await?;
     let with_path = |e: Error| Error::new(e.kind(), format!("無法開啟 {}: {}", path.display(), e));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(with_path)?;
+    let mut file =
+        fsperm::private_tokio_options(OpenOptions::new().create(true).read(true).append(true))
+            .open(path)
+            .await
+            .map_err(with_path)?;
+    if let Err(e) = fsperm::restrict_open_tokio_file(&file).await {
+        warn!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
+    }
 
     let len = file.metadata().await.map_err(with_path)?.len();
     let last_byte = if len > 0 {
@@ -794,9 +800,16 @@ pub async fn write_agents_snapshot(
     // 資料目錄在執行中被刪除時重建
     ensure_parent_dir(&paths.agents).await?;
     let path = paths.agents.clone();
-    tokio::task::spawn_blocking(move || write_atomically(&path, &[&json]))
-        .await
-        .map_err(Error::other)?
+    tokio::task::spawn_blocking(move || {
+        write_atomically(&path, &[&json])?;
+        // 暫存檔依 umask 建立；更名後收緊到最多 0640（S3）。暫存檔存在的期間由資料目錄的 0750 保護
+        if let Err(e) = fsperm::restrict_path(&path) {
+            debug!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(Error::other)?
 }
 
 #[cfg(test)]
@@ -1158,6 +1171,43 @@ mod tests {
         assert!(needs_reopen(&dir, &open));
         // 同一個檔案：不重開
         assert!(!needs_reopen(&std::fs::metadata(&exe), &open));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn data_files_are_0640_and_new_dirs_0750() {
+        // S3：不依賴 umask，report 檔、agents.json 最多 0640，自行建立的資料目錄 0750
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let root = temp_dir("perm");
+        let dir = root.join("data");
+        let paths = prepare_data_dir(&dir).await.unwrap();
+        assert_eq!(mode(&dir), 0o750);
+
+        // 既有的寬鬆 report 檔在開啟時收緊
+        let path = dir.join(REPORT_FILES.file_name(noon().date_naive()));
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        assert_eq!(sink.write(record(1)).await, Ok(()));
+        assert_eq!(mode(&path), 0o640);
+
+        // 資料目錄在執行中被刪除後重建：目錄 0750、新檔案 0640
+        fs::remove_dir_all(&dir).await.unwrap();
+        assert_eq!(sink.write(record(2)).await, Ok(()));
+        assert_eq!(mode(&dir), 0o750);
+        assert_eq!(mode(&path), 0o640);
+        drop(sink);
+        handle.await.unwrap();
+
+        // agents.json
+        let snapshot = crate::registry::Registry::with_max_agents(1).snapshot(noon());
+        write_agents_snapshot(&paths, &snapshot).await.unwrap();
+        assert_eq!(mode(&paths.agents), 0o640);
+        fs::remove_dir_all(&root).await.unwrap();
     }
 
     #[cfg(unix)]

@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod connection;
+mod fsperm;
 #[cfg(test)]
 mod integration_tests;
 mod logger;
@@ -532,6 +533,15 @@ async fn run(
 
     // 準備資料目錄與 report 寫入工作（按 UTC 日期分檔，啟動時與每小時清除過期檔案）
     let paths = storage::prepare_data_dir(Path::new(&config.storage.data_dir)).await?;
+    // 既有的資料、日誌目錄對其他使用者開放時提醒（S3；Kairos 不自行改變既有目錄的權限）
+    for (dir, what) in [
+        (paths.data_dir.as_path(), "資料目錄"),
+        (opts.log_dir.as_path(), "日誌目錄"),
+    ] {
+        if let Some(message) = fsperm::dir_permission_warning(dir, what) {
+            warn!("{}", message);
+        }
+    }
     let (reports, writer_task) = storage::start_report_writer(
         paths.data_dir.clone(),
         config.storage.retention_days,
