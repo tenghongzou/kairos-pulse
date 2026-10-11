@@ -39,6 +39,13 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 /// 過期日誌檔的清除間隔。
 const LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// 設定錯誤（`AppConfig::load` 失敗：設定檔語法、型別、範圍錯誤等）的結束代碼。
+///
+/// 依設計包 `design/pulse/cli-spec.md` §1.3（`pulse`／`pulse run` 常駐：3 啟動時設定錯誤）與
+/// `design/design-system/cli-style.md` §8，不使用 sysexits 的 `EX_CONFIG`（78）。
+/// `packaging/pulse.service` 以 `RestartPreventExitStatus=3` 讓 systemd 不再重試。
+const EXIT_CONFIG: u8 = 3;
+
 fn setup_logger(log_level: LevelFilter) -> Result<(), fern::InitError> {
     // 確保日誌目錄存在
     create_dir_all(log_files::LOG_DIR)?;
@@ -188,7 +195,8 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(e) => {
             eprintln!("錯誤：無法載入設定：{e}");
-            return ExitCode::FAILURE;
+            // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
 
@@ -419,6 +427,21 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_does_not_restart_on_config_errors() {
+        // pulse.service 的 RestartPreventExitStatus 必須與 EXIT_CONFIG 一致；
+        // 用法錯誤（2）、正常結束（0）以外的結束代碼仍由 Restart=always 重新啟動
+        let unit = include_str!("../packaging/pulse.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("RestartPreventExitStatus="))
+            .expect("pulse.service 應設定 RestartPreventExitStatus");
+        let codes: Vec<&str> = line["RestartPreventExitStatus=".len()..]
+            .split_whitespace()
+            .collect();
+        assert_eq!(codes, [EXIT_CONFIG.to_string().as_str()], "{line}");
+    }
 
     /// 文字中是否有「共 N 個」或「N 個測試」這類寫死的數量。
     fn has_hardcoded_count(line: &str) -> bool {

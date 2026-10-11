@@ -24,6 +24,7 @@
 - 使用 rustls（`ring` 加密後端），支援 TLS 1.2 與 TLS 1.3；私鑰支援 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
+- 設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）以結束代碼 **3** 結束（依設計包 `cli-style.md` §8 的結束代碼表）；`kairos.service` 以 `RestartPreventExitStatus=3` 讓 systemd 不再反覆重試
 - 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除
 - 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP；啟用 mTLS 時 agent 的上線、離線等事件改依 `agent_id`）節流，每 10 秒最多一行並附上略過的則數，未啟用 mTLS 時另列出被略過的 agent_id（見「日誌」的節流說明）
 
@@ -36,7 +37,10 @@
 
 ## 升級注意事項（破壞性變更）
 
-- **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 1 結束（systemd 會依 `Restart=on-failure` 反覆重試並失敗）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
+完整的變更與升級步驟見 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)；以下是 Kairos 需要先處理的項目。
+
+- **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 3（設定錯誤）結束；新版 `kairos.service` 的 `RestartPreventExitStatus=3` 讓 systemd 不再反覆重試（沿用舊版 unit 時仍會依 `Restart=on-failure` 每 5 秒重試並失敗，請一併換上新版 unit）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
+- **設定錯誤的結束代碼由 1 改為 3**：設定檔無法載入或驗證不通過、上述拒絕啟動，都以結束代碼 3 結束（舊版為 1），`kairos.service` 新增 `RestartPreventExitStatus=3`，systemd 不再對設定錯誤無限重試；修正設定後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、命令列參數錯誤（1）、第二次訊號強制結束（130）不變。
 
 ## 升級注意事項（與 Pulse 混用版本）
 
@@ -200,7 +204,7 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 | `server.listen` 解析出的位址 | 未設定 `auth.client_ca` 時 |
 |---|---|
 | 全部是 loopback（`127.0.0.0/8`、`::1`，例如預設的 `127.0.0.1:8080` 或 `localhost:8080`） | 照常啟動，記 `WARN`「未啟用客戶端憑證驗證（auth.client_ca），只監聽 loopback 位址…僅建議用於本機開發」 |
-| 任何一個不是 loopback（含 `0.0.0.0`、`::` 等所有介面） | **拒絕啟動**，記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並附上修正方式，以結束代碼 1 結束 |
+| 任何一個不是 loopback（含 `0.0.0.0`、`::` 等所有介面） | **拒絕啟動**，記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並附上修正方式，以結束代碼 3（設定錯誤）結束，systemd 不重試 |
 | 任何一個不是 loopback，且設定 `auth.allow_unauthenticated = true` | 照常啟動，記 `WARN`「未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 …（auth.allow_unauthenticated = true）…」。**只用於隔離的測試環境** |
 
 啟用 mTLS 時 `auth.allow_unauthenticated` 不生效。

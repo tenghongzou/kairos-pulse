@@ -46,9 +46,12 @@ StandardError=journal
 # 正常結束：送出 close_notify 後約 1 秒內結束；再送一次訊號會以 130 強制結束
 KillSignal=SIGINT
 TimeoutStopSec=10
-# Pulse 本身會無限重連；這裡處理取樣任務異常、設定錯誤等以非 0 結束的情況
+# Pulse 本身會無限重連；這裡處理取樣任務異常、憑證或 agent.id 無法載入等以非 0 結束的情況。
+# 設定錯誤（pulse.toml 語法、型別、範圍錯誤等）以結束代碼 3 結束，重試也不會成功，
+# 不重新啟動；修正設定後執行 systemctl restart pulse
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=3
 
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict

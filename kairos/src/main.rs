@@ -312,10 +312,46 @@ pub(crate) async fn accept_loop(
     Ok(connections)
 }
 
-/// `run` 的結果對應的結束代碼：正常關機 0；因內部錯誤而關機或啟動失敗 1
+/// 設定錯誤的結束代碼：設定檔無法載入或驗證不通過、`auth.allow_unauthenticated` 未設定卻
+/// 未啟用 mTLS 監聽對外位址（S1）等，重試也不會成功的錯誤。
+///
+/// 依設計包 `design/design-system/cli-style.md` §8（`kairos` 與 `pulse` 共用的結束代碼表：
+/// 常駐模式啟動時的設定錯誤為 3），不使用 sysexits 的 `EX_CONFIG`（78）。
+/// `packaging/kairos.service` 以 `RestartPreventExitStatus=3` 讓 systemd 不再重試。
+const EXIT_CONFIG: u8 = 3;
+
+/// 標記為設定錯誤的 [`Error`] 內容（結束代碼 [`EXIT_CONFIG`]）；訊息與 `kind` 不變
+#[derive(Debug)]
+struct ConfigError(Error);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// 把錯誤標記為設定錯誤（保留原本的 `kind` 與訊息）
+fn config_error(e: Error) -> Error {
+    Error::new(e.kind(), ConfigError(e))
+}
+
+/// 是否為 [`config_error`] 標記過的設定錯誤
+fn is_config_error(e: &Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ConfigError>())
+}
+
+/// `run` 的結果對應的結束代碼：正常關機 0；設定錯誤 [`EXIT_CONFIG`]；
+/// 因內部錯誤而關機或其他啟動失敗 1（交由服務管理員重新啟動）
 fn exit_code(result: &Result<Option<String>, Error>) -> u8 {
     match result {
         Ok(None) => 0,
+        Err(e) if is_config_error(e) => EXIT_CONFIG,
         Ok(Some(_)) | Err(_) => 1,
     }
 }
@@ -339,11 +375,12 @@ fn main() -> ExitCode {
         }
     };
 
+    // 設定錯誤以 EXIT_CONFIG 結束，systemd 不再重試（RestartPreventExitStatus）
     let config = match AppConfig::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
 
@@ -352,7 +389,7 @@ fn main() -> ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
     let newest_log = match logger::setup(level) {
@@ -490,7 +527,7 @@ async fn run(
             )
         })?
         .collect();
-    let listen_auth = config.check_listen_auth(&resolved)?;
+    let listen_auth = config.check_listen_auth(&resolved).map_err(config_error)?;
     warn_if_fd_limit_low(config.server.max_connections);
     if let Some((max, estimate)) = config.daily_limit_below_estimate() {
         warn!(
@@ -950,6 +987,32 @@ Max open files            1024                 524288               files     \n
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn config_errors_keep_kind_and_message() {
+        let e = config_error(Error::new(ErrorKind::InvalidInput, "設定值超出範圍"));
+        assert!(is_config_error(&e));
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert_eq!(e.to_string(), "設定值超出範圍");
+        assert_eq!(exit_code(&Err(e)), EXIT_CONFIG);
+        assert!(!is_config_error(&Error::other("x")));
+        assert!(!is_config_error(&Error::from(ErrorKind::NotFound)));
+    }
+
+    #[test]
+    fn unit_does_not_restart_on_config_errors() {
+        // kairos.service 的 RestartPreventExitStatus 必須與 EXIT_CONFIG 一致
+        let unit = include_str!("../packaging/kairos.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("RestartPreventExitStatus="))
+            .expect("kairos.service 應設定 RestartPreventExitStatus");
+        let codes: Vec<&str> = line["RestartPreventExitStatus=".len()..]
+            .split_whitespace()
+            .collect();
+        assert!(codes.contains(&EXIT_CONFIG.to_string().as_str()), "{line}");
+        assert!(unit.lines().any(|l| l.trim() == "Restart=on-failure"));
+    }
+
     #[tokio::test]
     async fn run_refuses_unauthenticated_non_loopback_listen() {
         // S1：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動，且在建立資料目錄與監聽之前
@@ -962,12 +1025,15 @@ Max open files            1024                 524288               files     \n
         let mut config = run_config(&dir);
         config.server.listen = "0.0.0.0:0".into();
         let (opts, _) = run_options(&dir);
-        let err = run(config.clone(), None, None, opts).await.unwrap_err();
+        let result = run(config.clone(), None, None, opts).await;
+        let err = result.as_ref().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         assert!(
             err.to_string().contains("auth.allow_unauthenticated"),
             "{err}"
         );
+        // 設定錯誤：結束代碼 3，systemd 不重試
+        assert_eq!(exit_code(&result), EXIT_CONFIG);
         assert!(!dir.join("data").exists(), "拒絕啟動前不應建立資料目錄");
 
         // 明確允許時照常啟動

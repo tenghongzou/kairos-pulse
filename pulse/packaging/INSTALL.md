@@ -207,7 +207,8 @@ unit 重點（內容見 `pulse.service`）：
 | `WorkingDirectory` | `/opt/pulse` | `pulse.toml`、`agent.id`、憑證與 `logs/` 都以工作目錄解析 |
 | `StandardOutput` | `null` | 日誌只保留 `logs/` 一份（理由見下） |
 | `KillSignal`／`TimeoutStopSec` | `SIGINT`／`10` | Pulse 送出 `close_notify` 後約 1 秒內結束 |
-| `Restart` | `always` | Pulse 本身會無限重連；取樣任務異常或其他原因結束時一律由 systemd 重啟 |
+| `Restart` | `always` | Pulse 本身會無限重連；取樣任務異常、憑證或 `agent.id` 無法載入等原因結束時由 systemd 重啟 |
+| `RestartPreventExitStatus` | `3` | 設定錯誤（`pulse.toml` 語法、型別、範圍錯誤等）以結束代碼 3 結束，重試也不會成功，不重啟；`systemctl status pulse` 顯示 `status=3`，修正後 `systemctl restart pulse` |
 | `NotifyAccess` | `main` | 只用來以 sd_notify 更新 `systemctl status` 的 `Status:` 文字（見 8.1）；不送 `READY=1`，所以 `Type` 仍為 `simple` |
 | `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節） |
 
@@ -408,6 +409,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
 - 升級前請看 `README.md`「升級注意事項」中「本版的行為改變」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
+- 新版 unit 新增 `RestartPreventExitStatus=3`（設定錯誤時不再每 10 秒重試）；請依步驟 2 換上新版 unit（多實例時重新產生每個 `pulse-N.service`）。
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。
 - 回滾：`mv /opt/pulse/pulse.prev /opt/pulse/pulse && systemctl restart pulse`。
