@@ -240,6 +240,7 @@ dependencies = [
  "config",
  "fern",
  "futures-util",
+ "kairos-proto",
  "log",
  "rustls-webpki",
  "serde",
@@ -247,6 +248,14 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+]
+
+[[package]]
+name = "kairos-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -388,6 +397,7 @@ dependencies = [
  "config",
  "fern",
  "futures-util",
+ "kairos-proto",
  "log",
  "rustls-native-certs",
  "rustls-webpki",

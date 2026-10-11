@@ -12,6 +12,8 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
 fern = { version = "0.7", features = ["date-based"] }
+# 與 Pulse 共用的協定型別與驗證（workspace 內部 crate）
+kairos-proto = { path = "../crates/kairos-proto" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log = "0.4"
 # 檢查 mTLS 客戶端憑證的 SAN；與 rustls 依賴的版本相同，只啟用 alloc（不引入其他加密後端）

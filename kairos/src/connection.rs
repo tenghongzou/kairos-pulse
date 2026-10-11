@@ -24,8 +24,8 @@ use crate::per_ip::source_key;
 use crate::protocol::{
     ClientMsg, ErrorCode, Frame, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, NdjsonCodec,
     PROTO_VERSION, Proto, ServerMsg, clamp_heartbeat_interval_ms, hello_seq_of_invalid,
-    normalize_agent_id, offline_after_ms, parse_client_msg, validate_client_msg, validate_hello,
-    validate_report,
+    normalize_agent_id, offline_after_ms, parse_client_msg, server_cpu_usage, validate_client_msg,
+    validate_hello, validate_report,
 };
 use crate::rate::{
     MAX_REPORT_PACING_DELAY, Pace, REPORT_BURST, REPORT_RATE_PER_SEC, ReportLimiter, ReportSource,
@@ -1197,6 +1197,8 @@ impl Conn {
                 total_memory,
                 used_memory,
             } => {
+                // 線上型別為 f64；驗證、保存與日誌沿用 f32（A14，見 server_cpu_usage）
+                let cpu_usage = server_cpu_usage(cpu_usage);
                 self.bad_requests = 0;
                 if !self.pace_report(agent).await {
                     if !self.touch(ctx, agent) {

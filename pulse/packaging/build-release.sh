@@ -18,12 +18,15 @@
 #
 # tar 內容（一層 <套件名稱>/ 目錄）：執行檔（755）、範例設定、README.md、
 # PROTOCOL.md、INSTALL.md、systemd unit（其餘皆 644），擁有者一律為 0:0。
+# PROTOCOL.md 取自兩個產品共用的唯一規格（PROTOCOL_SRC，相對於 repo 根目錄），
+# 產品目錄下的 PROTOCOL.md 只是指向它的說明。
 set -eu
 
 # ---- 專案設定 -------------------------------------------------------------
 NAME=pulse                           # 執行檔名稱（Cargo 的 bin 名稱）
 EXAMPLE_SRC=config.toml              # repo 中的預設設定（編譯時嵌入，放進 tar 作為範例）
 EXAMPLE_DST=pulse.example.toml       # 放進 tar 時的檔名
+PROTOCOL_SRC=crates/kairos-proto/PROTOCOL.md  # 協定規格（相對於 repo 根目錄）
 UNIT_SRC=packaging/pulse.service     # systemd unit 範本
 # ---------------------------------------------------------------------------
 
@@ -50,9 +53,10 @@ PKG_SUBDIR=${PKG_SUBDIR%/}
 PKG_SUBDIR=${PKG_SUBDIR:-.}
 cd "$REPO"
 [ -f Cargo.lock ] || die "缺少 Cargo.lock（workspace 根目錄）"
+[ -f "$PROTOCOL_SRC" ] || die "缺少 $PROTOCOL_SRC（協定規格）"
 cd "$PKG_SUBDIR"
 
-for f in Cargo.toml README.md PROTOCOL.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC"; do
+for f in Cargo.toml README.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC"; do
     [ -f "$f" ] || die "缺少 $f"
 done
 
@@ -101,7 +105,7 @@ chmod 755 "$STAGE/$PKG"
 install -m 755 "$BIN"                    "$STAGE/$PKG/$NAME"
 install -m 644 "$SRC/$EXAMPLE_SRC"       "$STAGE/$PKG/$EXAMPLE_DST"
 install -m 644 "$SRC/README.md"          "$STAGE/$PKG/README.md"
-install -m 644 "$SRC/PROTOCOL.md"        "$STAGE/$PKG/PROTOCOL.md"
+install -m 644 "/src/$PROTOCOL_SRC"     "$STAGE/$PKG/PROTOCOL.md"
 install -m 644 "$SRC/packaging/INSTALL.md" "$STAGE/$PKG/INSTALL.md"
 install -m 644 "$SRC/$UNIT_SRC"          "$STAGE/$PKG/$(basename "$UNIT_SRC")"
 
@@ -144,6 +148,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e EXAMPLE_SRC="$EXAMPLE_SRC" \
     -e EXAMPLE_DST="$EXAMPLE_DST" \
     -e UNIT_SRC="$UNIT_SRC" \
+    -e PROTOCOL_SRC="$PROTOCOL_SRC" \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e HOST_UID="$HOST_UID" \
     -e HOST_GID="$HOST_GID" \

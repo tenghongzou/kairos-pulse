@@ -34,7 +34,8 @@ exceptions = [
 ]
 
 [licenses.private]
-# kairos、pulse 為商業產品、不發佈到 crates.io（Cargo.toml 設定 publish = false），不檢查其授權欄位
+# kairos、pulse 為商業產品，crates/ 下為兩者共用的內部 crate，都不發佈到 crates.io
+# （Cargo.toml 設定 publish = false），不檢查其授權欄位
 ignore = true
 registries = [
 ]

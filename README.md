@@ -6,16 +6,18 @@ Kairos（TLS/mTLS 監控伺服器）與 Pulse（監控代理）的 monorepo，�
 
 ```
 kairos-pulse/
-├── Cargo.toml             workspace 設定（members = kairos、pulse）
+├── Cargo.toml             workspace 設定（members = kairos、pulse、crates/*）
 ├── Cargo.lock             整個 workspace 共用的依賴版本鎖定檔
 ├── rust-toolchain.toml    固定 Rust 1.99.0（含 rustfmt、clippy）
 ├── deny.toml              cargo-deny 設定（安全公告、授權、重複版本、來源）
 ├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test 與 cargo deny
+├── crates/
+│   └── kairos-proto/      兩個產品共用的協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
 ├── kairos/                Kairos 伺服器（說明見 kairos/README.md）
 └── pulse/                 Pulse 代理（說明見 pulse/README.md）
 ```
 
-兩個產品共用的協定規格目前各有一份（`kairos/PROTOCOL.md`、`pulse/PROTOCOL.md`，內容相同）。
+協定規格只有一份：`crates/kairos-proto/PROTOCOL.md`。`kairos-proto` 的單元測試以 `include_str!` 讀入該文件，直接從「範例」節解析測試向量、從「錯誤碼」表比對 fatal 預設值；`kairos/PROTOCOL.md`、`pulse/PROTOCOL.md` 只是指向它的說明，發佈包內附的則是完整規格。`crates/` 下的共用 crate 都是 `publish = false` 的內部 crate，只使用 workspace 既有的依賴。
 
 | 產品 | 說明 | 安裝與打包 |
 |---|---|---|
