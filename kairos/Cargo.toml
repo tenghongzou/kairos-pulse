@@ -3,6 +3,8 @@ name = "kairos"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
+# 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

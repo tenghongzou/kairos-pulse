@@ -1,0 +1,65 @@
+# cargo-deny 設定（商業審計 D5）：檢查依賴的安全公告、授權、重複版本與來源。
+# 本機執行：cargo deny check（需先 cargo install cargo-deny --locked）
+# 參考：https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# 空清單表示檢查所有平台的依賴（Windows、Linux、macOS 專屬的依賴都會被檢查）
+targets = []
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RustSec 公告：有漏洞（vulnerability）的依賴一律失敗；不再維護（unmaintained）與
+# 已撤回（yanked）的版本也視為失敗，須明確處理（升級或在 ignore 中附理由）。
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+]
+
+[licenses]
+# 允許清單依目前依賴實際使用的授權產生（cargo metadata 的 license 欄位）；
+# 只列出滿足所有依賴所需的最小集合，新依賴引入其他授權時 CI 會失敗，需人工審查後再加入。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",          # ring（Apache-2.0 AND ISC）、rustls-webpki 等
+    "BSD-3-Clause",
+    "Unicode-3.0",  # unicode-ident（(MIT OR Apache-2.0) AND Unicode-3.0）
+]
+confidence-threshold = 0.8
+exceptions = [
+]
+
+[licenses.private]
+# kairos、pulse 為商業產品、不發佈到 crates.io（Cargo.toml 設定 publish = false），不檢查其授權欄位
+ignore = true
+registries = [
+]
+
+[bans]
+# 重複版本（例如 windows-sys 的多個版本）只警告，不使 CI 失敗
+multiple-versions = "warn"
+wildcards = "deny"
+# workspace 內的 path 依賴不受 wildcards 規則限制
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = [
+]
+deny = [
+]
+skip = [
+]
+skip-tree = [
+]
+
+[sources]
+# 只允許 crates.io；不允許其他 registry 或 git 依賴
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

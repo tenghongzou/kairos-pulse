@@ -1,0 +1,70 @@
+# CI（商業審計 D3、D5）：Linux 與 Windows 上的格式、lint、測試，以及 cargo-deny 依賴檢查。
+# 工具鏈一律取自根目錄的 rust-toolchain.toml（1.99.0、rustfmt、clippy），不另外指定版本。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: fmt / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 依 rust-toolchain.toml 安裝工具鏈與元件（runner 已內建 rustup）
+      - name: Install toolchain from rust-toolchain.toml
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      # advisories、bans、licenses、sources 全部檢查（設定見 deny.toml）
+      - name: cargo deny check
+        run: cargo deny check
