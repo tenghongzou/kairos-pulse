@@ -7,10 +7,10 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 ## 功能特色
 
 - 🖥️ 收集系統資訊：CPU 使用率、記憶體（啟動時另印出一次系統資訊：磁碟、網路、元件溫度；`info` 等級略過虛擬檔案系統與虛擬網路介面）
-- 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON），預設**驗證伺服器憑證**（作業系統信任庫 + 自訂 CA；可設定為只信任自訂 CA）
+- 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON），預設**驗證伺服器憑證**（設定了自訂 CA `ca_cert` 時只信任它，否則使用作業系統信任庫；可明確設定同時信任兩者）
 - 🪪 每台主機有固定的 `agent_id`（UUID v4，存於 `agent.id`），換主機名稱也不影響識別
-- 💓 每秒送出 heartbeat，伺服器據此判斷上線 / 離線
-- 🔁 斷線自動重連：指數退避 + ±20% 抖動、有上限、不限次數
+- 💓 每 15 秒（`heartbeat.interval`）送出 heartbeat，伺服器據此判斷上線 / 離線
+- 🔁 斷線自動重連：指數退避 + ±20% 抖動、有上限、不限次數；啟動與斷線後第一次重連另加隨機延遲，避免大量 agent 同時連線
 - 🔑 可選 mTLS 客戶端憑證：以憑證 SAN 綁定 `agent_id`，防止冒用；支援中繼 CA 鏈與 RSA / ECDSA / Ed25519 私鑰
 - ⚙️ 設定三層疊加：嵌入預設值 → `pulse.toml` → `PULSE__*` 環境變數
 - 📝 日誌同時輸出到終端與 `logs/pulse-YYYY-MM-DD.log`（按日分檔、自動清除過期檔）
@@ -30,6 +30,14 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 | 舊版 Pulse（`44dcee5` 之前，即 `081f859` 及更早）連新版 Kairos | 舊版只把主機名稱中的控制字元替換成 `?`，`hostname` 含格式字元（Cf）時被以 `bad_request` 拒絕，**無法註冊**；舊版的讀取閒置固定為 `max(10 秒, 2 × min(heartbeat, report))`，心跳間隔較大時（例如 5 秒）小於「心跳間隔 + 伺服器最壞回應延遲 8 秒」，伺服器寫檔緩慢時**可能誤斷線** |
 | 第一輪修正版 Pulse（`44dcee5`）連新版 Kairos | 新版 Kairos 另外禁止 U+034F、Hangul filler、變體選擇字元與私用區（見「協定概述」），`44dcee5` 不會替換這些字元；主機名稱含這些字元時**無法註冊** |
 | 新版 Pulse 連舊版 Kairos（`572b955` 之前，`timeouts.write_secs` 沒有 6 秒上限） | Kairos 的 `timeouts.write_secs` 大於約 8 秒時，伺服器寫檔緩慢期間的回應延遲可能超過讀取閒置中的 10 秒餘裕，Pulse **誤判斷線**並重連 |
+
+### 本版的行為改變（升級前請確認）
+
+| 項目 | 舊行為 | 新行為 | 需要的處置 |
+|---|---|---|---|
+| 心跳間隔（`heartbeat.interval`） | 預設 1 秒 | 預設 **15 秒** | Kairos 的離線判定由 `max(5 × 心跳, 5 秒)` 從 5 秒變成 **75 秒**：主機斷線後要約 75 秒才會在 Kairos 顯示為離線，Pulse 的讀取閒置逾時也從 11 秒變成 30 秒。需要較快的離線判定時，在 `pulse.toml` 設定 `[heartbeat] interval = 1`（或其他 1～60 秒的值）。Kairos 不需修改（心跳間隔由 Pulse 在 hello 中告知，Kairos 接受 1～60 秒） |
+| 啟動與重連的隨機延遲 | 啟動後立即連線；斷線後第一次重連約 2 秒（±20%） | 啟動時先等 0～min(心跳, 5) 秒；斷線後第一次重連另加 0～min(心跳, 5) 秒 | 不需處置。預設下啟動後最多晚 5 秒連線、Kairos 重新啟動後的重連分散在約 1.6～7.4 秒 |
+| 信任庫（`server.use_system_roots`） | 預設 `true`：設定了 `ca_cert` 時仍同時信任作業系統信任庫 | 預設不寫，依 `ca_cert` 決定：**設定了 `ca_cert` 時只信任 `ca_cert`**，未設定時信任作業系統信任庫；明確設定時以設定為準 | 依 INSTALL 部署（私有 CA）者不受影響。若設定了 `ca_cert`、但伺服器憑證其實由公開 CA 簽發（例如 `ca_cert` 只是為了額外信任某張憑證），升級後會以「伺服器憑證不受信任」無法連線：請在 `pulse.toml` 加上 `use_system_roots = true`。啟動日誌的「伺服器憑證信任來源：…」一行會說明實際採用的信任來源 |
 
 **部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
 
@@ -91,7 +99,7 @@ PULSE__SERVER__CA_CERT=path/to/cert.pem cargo run
 成功時日誌會出現：
 
 ```
-[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 5000 ms；TLS 加密連線 127.0.0.1:8080，domain=localhost，TLSv1_3，已驗證伺服器憑證）
+[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 75000 ms；TLS 加密連線 127.0.0.1:8080，domain=localhost，TLSv1_3，已驗證伺服器憑證）
 ```
 
 判斷連線成功以這一行為準。TLS 握手完成的「已建立 TLS 加密連線（…）」只在 `debug` 等級記錄：TLS 1.3 下伺服器在握手**之後**才驗證客戶端憑證，握手完成不代表會被接受（例如憑證已撤銷時，接著就會被拒）。
@@ -120,10 +128,10 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 
 - Kairos 使用 `cert.pem` / `key.pem`。
 - 每台 Pulse 設定 `server.ca_cert = "ca.pem"`、`server.domain = "kairos.example.com"`（以 IP 連線時填 IP，憑證 SAN 也要含該 IP）。
-- 建議同時設定 `server.use_system_roots = false`：Pulse 只信任 `ca_cert`，不再信任作業系統信任庫，避免任何公開 CA 簽發的同名憑證也被接受。
+- 設定了 `ca_cert` 時，Pulse 預設**只信任 `ca_cert`**，不信任作業系統信任庫（`server.use_system_roots` 未設定時的預設），避免任何公開 CA 簽發的同名憑證也被接受；不需要另外設定 `use_system_roots = false`。
 - 伺服器憑證到期時只要用 CA 重簽，Pulse 端不必改設定。
 - `ca.key` 是整個信任鏈的根，務必離線保存。
-- 由公開 CA 簽發的伺服器憑證不需要設定 `ca_cert`：Pulse 預設（`use_system_roots = true`）會自動信任作業系統的信任庫。
+- 由公開 CA 簽發的伺服器憑證不需要設定 `ca_cert`：沒有 `ca_cert` 時 Pulse 預設信任作業系統的信任庫。同時設定了 `ca_cert` 又需要信任公開 CA 時，明確設定 `server.use_system_roots = true`。
 
 ## 啟用 mTLS（客戶端憑證）
 
@@ -187,6 +195,7 @@ client_key = "client.key"     # 對應私鑰
   - 有憑證在 30 天內到期（日誌顯示「剩餘不超過 N 天」，天數無條件進位）、或尚未生效（可能是本機時鐘不正確）時，記 `WARN`。
 - 客戶端憑證含多個 DNS SAN 時記 `WARN` 但照常啟動：Kairos 預設會以 `auth_failed` 拒絕，除非伺服器設定了 `auth.allow_multiple_dns_sans = true`。
 - 成功載入時日誌會出現 `已載入客戶端憑證：<路徑>（憑證鏈 N 張；私鑰：<路徑>）`。
+- 私鑰檔案的權限過寬（其他帳號可讀取或修改）時記 `WARN`，不阻止啟動；規則見「敏感檔案的權限檢查」。
 
 **agent.id 與憑證綁定**：重新產生 `agent.id`（刪除檔案、或複製到新主機後重產）就會得到新的 agent_id，必須重新簽發憑證；否則 Pulse 啟動時就會因 SAN 不符而報錯。
 
@@ -240,7 +249,7 @@ cargo run
 ../target/release/pulse   # workspace 的 target/ 在 monorepo 根目錄
 ```
 
-測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試，目前共 158 個。
+測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試；Unix 專屬的部分（檔案權限、sd_notify 等）以 `#[cfg(unix)]` 標示，只在 Linux／macOS 上執行，Windows 專屬的 ACL 檢查同理。實際數量以 `cargo test` 的輸出為準（各平台不同），文件不列出數字。
 
 > **`testdata/` 中的私鑰（`*.key`）只供測試使用，已公開在 repo 中，絕對不可用於任何部署環境。** 正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
 
@@ -261,11 +270,11 @@ cargo run
 
 程式啟動後會：
 
-1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、`use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
+1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、明確設定 `use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
 2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
 4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點，以及同一磁碟的重複掛載點（「磁碟名稱＋檔案系統＋總容量」相同者只列一次，保留路徑最短的掛載點，例如 systemd 沙箱的 `ReadWritePaths=`、`PrivateTmp=` bind mount 或 btrfs subvolume；磁碟名稱為空時不合併），網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`。磁碟容量以十進位單位顯示：1 GB 以上為 GB（小數 1 位，例如 `39.4 GB`），未滿 1 GB 為整數 MB（例如 `535 MB`）。取不到的系統名稱、核心版本、主機名稱等顯示「未知」；沒有溫度感測器（例如 VM）時印「未偵測到溫度感測器」
-5. 啟動系統資訊收集背景任務（每 `report.interval` 秒取樣一次）
+5. 啟動系統資訊收集背景任務（先建立 CPU 使用率的基準，第一次取樣在一個 `report.interval` 之後，之後每 `report.interval` 秒一次）
 6. 連線到伺服器、送出 hello、收到 hello_ack 後開始送 heartbeat 與 report
 
 按 Ctrl+C 結束（Windows 上 Ctrl+Break、關閉主控台視窗、系統關機也一樣；其他平台為 SIGINT、SIGTERM）：
@@ -301,8 +310,8 @@ address = "127.0.0.1"          # 伺服器位址
 port = 8080                    # 伺服器連接埠
 domain = "localhost"           # TLS SNI / 憑證名稱驗證用的名稱（DNS 名稱或 IP；須與伺服器憑證 SAN 相符）
 accept_invalid_certs = false   # 是否略過伺服器憑證驗證（預設 false）
-ca_cert = ""                   # 額外信任的 CA / 自簽憑證 PEM（可含多張）；空字串 = 只用作業系統信任庫
-use_system_roots = true        # 是否信任作業系統信任庫；false 時只信任 ca_cert（此時 ca_cert 必填，accept_invalid_certs = true 時例外）
+ca_cert = ""                   # 信任的 CA / 自簽憑證 PEM（可含多張）；空字串 = 只用作業系統信任庫
+# use_system_roots = true      # 預設不寫：有 ca_cert 時只信任 ca_cert，沒有時信任作業系統信任庫；明確設定時以設定為準
 client_cert = ""               # mTLS 客戶端憑證 PEM（可接中繼 CA）；空字串 = 不出示客戶端憑證
 client_key = ""                # 對應私鑰 PEM（PKCS#8 / PKCS#1 / SEC1，不可加密）；須與 client_cert 同時設定
 
@@ -312,7 +321,7 @@ initial_delay = 2              # 第一次重連延遲（秒），之後每次�
 max_delay = 60                 # 重連延遲上限（秒）
 
 [heartbeat]
-interval = 1                   # heartbeat 間隔（秒）
+interval = 15                  # heartbeat 間隔（秒）；伺服器的離線判定為 max(5 × interval, 5 秒)
 
 [report]
 interval = 5                   # 系統資訊回報間隔（秒）
@@ -325,7 +334,16 @@ level = "info"                 # 日誌級別：trace / debug / info / warn / er
 retention_days = 14            # 日誌檔保留天數（今天與前 N 天）；0 = 永久保留
 ```
 
-`server.use_system_roots` 也可用環境變數 `PULSE__SERVER__USE_SYSTEM_ROOTS=false` 設定。
+`server.use_system_roots` 也可用環境變數設定（例如 `PULSE__SERVER__USE_SYSTEM_ROOTS=true`）。未設定時的預設值依 `ca_cert` 決定：
+
+| `ca_cert` | `use_system_roots` | 信任的伺服器憑證 |
+|---|---|---|
+| 未設定 | 未設定 | 作業系統信任庫 |
+| 已設定 | 未設定 | 只有 `ca_cert`（不信任作業系統信任庫） |
+| 已設定 | `true` | 作業系統信任庫 + `ca_cert` |
+| 任意 | `false` | 只有 `ca_cert`（`ca_cert` 必填） |
+
+啟動時以 `INFO` 記錄實際採用的信任來源，例如「伺服器憑證信任來源：只信任 server.ca_cert（…）」。
 
 ### 設定值範圍
 
@@ -343,13 +361,13 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `log.retention_days` | 0～3650 天 | 0 = 永久保留 |
 | `agent.id_file` | 非空字串 | |
 | `server.domain` | 有效的 DNS 名稱或 IP 位址，不可空白 | |
-| `server.use_system_roots` | `true` / `false` | `false` 時 `server.ca_cert` 必填，否則啟動即報錯（`accept_invalid_certs = true` 時不使用信任庫，不檢查此項） |
+| `server.use_system_roots` | `true` / `false` / 不設定 | 不設定時依 `ca_cert` 決定（見上表）；明確設為 `false` 時 `server.ca_cert` 必填，否則啟動即報錯（`accept_invalid_certs = true` 時不使用信任庫，不檢查此項） |
 | `server.client_cert` / `server.client_key` | 同時設定或同時留空 | 只設定一個時啟動即報錯 |
 
 ### ⚠️ 安全性提醒
 
 - `accept_invalid_certs` **預設為 `false`**，Pulse 會驗證伺服器憑證是否受信任、`server.domain` 是否與憑證 SAN 相符。
-- 使用自簽憑證或私有 CA 時，請用 `ca_cert` 指定要信任的憑證，**不要**改成 `accept_invalid_certs = true`；並建議設定 `use_system_roots = false`，只信任 `ca_cert`。
+- 使用自簽憑證或私有 CA 時，請用 `ca_cert` 指定要信任的憑證，**不要**改成 `accept_invalid_certs = true`；設定了 `ca_cert` 時預設只信任它，不需要另外設定 `use_system_roots`。
 - `accept_invalid_certs = true` 會略過伺服器憑證的信任鏈與名稱驗證，任何人都能冒充伺服器（中間人攻擊），僅限臨時除錯使用。啟用時啟動階段會以 `ERROR` 記錄警告（`log.level` 最高只能設為 `error`，因此一定看得到），每次連線時，連線當下（「已建立 TLS 加密連線」）與註冊成功時（「已向伺服器註冊」）各記一行 `WARN`，並標註「⚠️ 未驗證伺服器憑證」。握手簽章仍會正確驗證（確保對方持有該憑證的私鑰），但這無法防止中間人使用自己的憑證。若同時設定了 `ca_cert`，也會以 `ERROR` 警告 `ca_cert` 此時形同無效。
 - 未啟用 mTLS 時，`agent.id` 的內容就是本機在伺服器上的身分憑據，請妥善保護（見「agent.id」）。
 
@@ -378,7 +396,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | 每則訊息寫出 | 5 秒 |
 | 讀取閒置（沒收到任何**合法**的伺服器訊息；無法解析的行不算） | `max(2 × h, h + 10 秒)`，`h = heartbeat.interval`（與 `report.interval` 無關）→ 視為斷線並重連 |
 
-以預設值（heartbeat 1 秒）而言，讀取閒置逾時為 `max(2, 1 + 10)` = 11 秒；heartbeat 30 秒時為 60 秒。只有能解析的伺服器訊息（`ack`、`hello_ack`、`error`）才會重置閒置計時，持續送垃圾行的伺服器仍會被判定為閒置。逾時在心跳間隔 `h` 上加 10 秒餘裕，是為了容忍伺服器最多 8 秒的回應延遲：Kairos 等待 report 寫入資料檔期間，同一連線的 heartbeat 也要排隊；Kairos 把寫入逾時（`timeouts.write_secs`，預設 5 秒）的上限定為 6 秒，從收到 report 到回應最壞 0.05（訊息速率）+ 0.5（report 速率限制）+ 6 + 1（寫入寬限）= 7.55 秒 ≤ 8 秒。Pulse 每 `h` 秒內一定會送出 heartbeat，因此最久 `h + 8` 秒內一定會收到伺服器訊息，對任何心跳間隔都小於逾時。逾時不看 `report.interval`：report 依賴取樣任務，取樣卡住時不會送出，不能拿來保證伺服器有回應。
+以預設值（heartbeat 15 秒）而言，讀取閒置逾時為 `max(30, 15 + 10)` = 30 秒；heartbeat 1 秒時為 11 秒，30 秒時為 60 秒。只有能解析的伺服器訊息（`ack`、`hello_ack`、`error`）才會重置閒置計時，持續送垃圾行的伺服器仍會被判定為閒置。逾時在心跳間隔 `h` 上加 10 秒餘裕，是為了容忍伺服器最多 8 秒的回應延遲：Kairos 等待 report 寫入資料檔期間，同一連線的 heartbeat 也要排隊；Kairos 把寫入逾時（`timeouts.write_secs`，預設 5 秒）的上限定為 6 秒，從收到 report 到回應最壞 0.05（訊息速率）+ 0.5（report 速率限制）+ 6 + 1（寫入寬限）= 7.55 秒 ≤ 8 秒。Pulse 每 `h` 秒內一定會送出 heartbeat，因此最久 `h + 8` 秒內一定會收到伺服器訊息，對任何心跳間隔都小於逾時。逾時不看 `report.interval`：report 依賴取樣任務，取樣卡住時不會送出，不能拿來保證伺服器有回應。
 
 ## 回報資料格式
 
@@ -397,7 +415,9 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。
 
-`cpu_usage` 是「上次取樣到這次取樣之間」（約等於 `report.interval`）所有 CPU 的平均使用率：取樣任務沿用同一個 sysinfo `System`，每次取樣只刷新一次，而不是只量約 200 ms 的瞬間值。
+`cpu_usage` 是「上次取樣到這次取樣之間」（約等於 `report.interval`）所有 CPU 的平均使用率：取樣任務沿用同一個 sysinfo `System`，每次取樣只刷新一次，而不是只量約 200 ms 的瞬間值。第一筆也一樣：取樣任務啟動時先刷新一次作為基準，第一次取樣在一個 `report.interval` 之後，因此不會只量到啟動當下的負載（代價是啟動後要等一個 `report.interval` 才有第一筆 report）。
+
+**取樣逾時**：一次取樣（sysinfo 刷新，Windows 上可能經由 WMI）超過 `clamp(report.interval, 2 秒, 10 秒)` 仍未完成時，記 `WARN` 並略過這次 report。heartbeat 由連線任務獨立送出、不受影響，因此 Kairos 仍會顯示此主機在線，只是不再收到新的 report；本機日誌的 `WARN` 是發現這種情況的依據。卡住的系統呼叫無法中斷：取樣完成前不再發起新的取樣（避免卡住的執行緒越積越多），期間持續略過 report，每 10 分鐘再提醒一次（附已略過的次數）；完成後記 `INFO`「系統資訊取樣已恢復」，以完成當下為新的 CPU 基準，下一次取樣恢復回報。Kairos 端依 `last_report` 停滯時間偵測此情況尚未實作。
 
 Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收到回應時的取樣、以及伺服器回 `storage_unavailable` 的那一筆，都會直接丟棄，不補送。
 
@@ -405,8 +425,9 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 
 - 任何錯誤（連線失敗、TLS 失敗、逾時、伺服器關閉連線、收到 fatal error、註冊前收到任何 error）都會關閉目前連線，等待後重連。
 - 等待時間從 `retry.initial_delay` 秒開始，每次加倍，最多 `retry.max_delay` 秒，並加上 ±20% 隨機抖動，避免大量 agent 同時重連。到達上限後，延遲在 `[0.8 × max_delay, max_delay]` 間均勻分佈（不會全部集中在上限值）。
+- **啟動與第一次重連的隨機延遲**：啟動時先等 0～`min(heartbeat.interval, 5)` 秒（均勻分佈，以 `INFO` 記錄「x 秒後開始連線」）才第一次連線；斷線後的第一次重連（連續失敗第 1 次）在上述退避之外另加 0～`min(heartbeat.interval, 5)` 秒。Kairos 重新啟動時所有 agent 同時斷線，只靠初始退避（2 秒 ±20%）會在約 1 秒內一起湧入；加上分散後攤在約 1.6～7.4 秒（預設值）。上限取心跳間隔，分散不超過一個心跳週期，不影響伺服器的離線判定；以 5 秒封頂，避免心跳間隔很長時拖慢啟動與恢復。之後的重試已由指數退避與抖動錯開，不再另加。
 - **不限重試次數**，程式不會因伺服器暫時不在而結束。
-- 每次斷線只記**一則**日誌，內容包含斷線原因、處置提示（若有）、本次連線維持多久與退避是否重置，以及下次重連的等待時間。連續失敗未達 `retry.max_retries` 次時以 `WARN` 記錄，達到後改用 `ERROR`；伺服器送來的 fatal error、註冊前收到的 error 與協定版本不符以 `ERROR` 記錄（`superseded` 例外，見下）。這些錯誤每次重連都會重複，因此依錯誤碼節流：同一錯誤碼每 10 分鐘最多一則 `ERROR`，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次相同原因的斷線已改記 WARN」；錯誤碼改變時立即以 `ERROR` 記錄。
+- 每次斷線只記**一則**日誌，內容包含斷線原因、處置提示（若有）、本次連線維持多久與退避是否重置，以及下次重連的等待時間。連續失敗未達 `retry.max_retries` 次時以 `WARN` 記錄，達到後改用 `ERROR`，但同樣節流：伺服器長時間停機時每次重試都會失敗，`ERROR` 每 10 分鐘最多一則，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次連線失敗已改記 WARN」（連線穩定 30 秒以上、退避重置後重新起算）；這類一般連線錯誤不寫 stderr；伺服器送來的 fatal error、註冊前收到的 error 與協定版本不符以 `ERROR` 記錄（`superseded` 例外，見下）。這些錯誤每次重連都會重複，因此依錯誤碼節流：同一錯誤碼每 10 分鐘最多一則 `ERROR`，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次相同原因的斷線已改記 WARN」；錯誤碼改變時立即以 `ERROR` 記錄。
 - **連線需在註冊（收到 `hello_ack`）後穩定維持 30 秒以上**，斷線時才會把退避與連續失敗次數歸零。註冊後不到 30 秒就斷仍算一次失敗，延遲繼續加倍。
 - **被 `superseded`（同一 `agent_id` 的新連線取代）**：
   - 第一次被取代視同一般斷線：連線已維持 30 秒以上就照常重置退避，記 `WARN`。
@@ -427,16 +448,29 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 - 檔案內容必須是 **UUID 文字格式**：`8-4-4-4-12` 個十六進位字元，共 36 字元，大小寫皆可（例如 `6f1c0e4a-1b2c-4d3e-9f00-112233445566`）。讀檔時會先去除 UTF-8 BOM（Windows 記事本存檔可能加上）與前後空白。
 - 識別**不分大小寫**：讀入後一律轉成小寫再使用（hello、日誌、`--print-agent-id`、客戶端憑證 SAN 檢查），與伺服器的正規化一致；檔案本身不會被改寫。
 - 檔案超過 **1024 bytes**（例如 `agent.id_file` 誤指到其他大檔案）時不會整個讀進記憶體，而是啟動即報錯；內容不是 UTF-8 文字時也明確報錯。
+- 檔案已存在時只讀取、不寫回（不改寫大小寫、不調整權限），因此可以設為服務帳號唯讀（發佈包的 INSTALL 使用 `root:pulse 640`）。
 - 內容不合法（含空檔）時，Pulse **不會**自動換一個新 ID（否則伺服器會把它當成另一台主機），而是啟動即以錯誤結束，並提示：要重新產生請刪除該檔案後重新啟動。
 - 寫檔不會覆蓋既有檔案，也不會留下寫到一半的檔案：先寫入暫存檔並 `sync`（避免斷電後留下空檔），再以 hard link 發佈；檔案系統不支援 hard link 時（例如 FAT32 / exFAT），改以「僅在不存在時建立」的方式直接寫入。兩個實例同時第一次啟動時，會使用同一個 ID。
 - **未啟用 mTLS 時，`agent_id` 就是本機在伺服器上的身分憑據**：知道它的人可以冒用本機註冊，並把本機踢下線。因此：
-  - Unix 上新建的 `agent.id` 權限為 `0600`（僅擁有者可讀寫）；既有檔案若可被群組或其他使用者讀取，啟動時記 `WARN` 並建議 `chmod 600`（不會自動修改權限）。
-  - Windows 上檔案權限繼承自所在目錄的 ACL，Pulse 不檢查；請把 `agent.id`（`agent.id_file`）放在只有執行帳號可讀的受保護目錄。
+  - Unix 上新建的 `agent.id` 權限為 `0600`（僅擁有者可讀寫）。既有檔案的權限過寬時，啟動時記 `WARN`（不會自動修改權限、也不阻止啟動）；規則見下方「敏感檔案的權限檢查」，與 `server.client_key` 相同。
+  - Windows 上檔案權限繼承自所在目錄的 ACL；Pulse 啟動時檢查 ACL，Users、Everyone 等一般使用者可讀取或寫入時記 `WARN`。請把 `agent.id`（`agent.id_file`）放在只有執行帳號、SYSTEM 與 Administrators 可存取的目錄。
   - 正式環境建議啟用 mTLS，讓身分改由客戶端憑證與私鑰保護。
 - Kairos 以 `agent_id` 識別主機；主機名稱只用於顯示。
 - 啟用 mTLS 時，客戶端憑證的 SAN 綁定 `agent_id`；重新產生 `agent.id` 就必須重新簽發憑證。可用 `pulse --print-agent-id` 查看目前的 ID。
 - **不要把同一份 `agent.id` 複製到多台主機**（例如複製 VM 映像檔時）：兩台會互相把對方踢下線（伺服器回 `superseded`）；連續被取代時退避不再重置、重連間隔至少 30 秒，日誌以 `ERROR` 提示。若需要重新產生，刪除 `agent.id` 後重新啟動即可；**啟用 mTLS 時**還必須請管理者以新的 agent_id 重新簽發客戶端憑證並更新 `server.client_cert`／`server.client_key`，否則 Pulse 啟動時會因憑證 SAN 不符而報錯結束。
 - `agent.id` 已列入 `.gitignore`。
+
+### 敏感檔案的權限檢查
+
+`agent.id`（未啟用 mTLS 時等同身分憑據）與 `server.client_key`（mTLS 私鑰）在啟動時檢查權限；`--print-agent-id` 也會檢查 `agent.id`，警告寫在 stderr。權限過寬時只記 `WARN`，不阻止啟動、不自動修改權限。
+
+- **Unix**（規則與 PostgreSQL 檢查 TLS 私鑰相同）：
+  - 其他使用者有任何權限，或群組有寫入、執行權限 → `WARN`。
+  - 群組可讀：擁有者是 root 時允許（`root:pulse 640`，服務帳號只能讀不能改，見 `packaging/INSTALL.md`）；擁有者不是 root 時 `WARN`（同群組的其他帳號也能讀）。
+  - 擁有者自己的權限不檢查：`pulse:pulse 600`（舊版 INSTALL 的配置）不警告。
+- **Windows**：讀取檔案的 DACL，下列群組有讀取或寫入權限的「允許」項目時 `WARN`：Everyone、Authenticated Users、BUILTIN\Users、INTERACTIVE、ANONYMOUS LOGON、本機帳戶（Local account）、Guests、Domain Users、Domain Guests；沒有 DACL（NULL DACL）也 `WARN`。
+  - `C:\`、`C:\ProgramData`、`C:\Program Files` 下新建的檔案預設讓 Users 可讀，放在這些位置會收到警告。請放在只有執行帳號、SYSTEM 與 Administrators 可存取的目錄，或以 `icacls "<檔案>" /inheritance:r /grant:r "<執行帳號>:R" "*S-1-5-18:F" "*S-1-5-32-544:F"` 移除繼承並只授權給這些帳號。
+  - 限制：只看「允許」項目，不計算「拒絕」項目與實際有效權限（同時有拒絕項目時仍會警告），也不展開群組成員（授權給自訂群組或其他個別帳號不會警告）。讀不到 ACL 時不檢查。
 
 ## 專案結構
 
@@ -447,6 +481,7 @@ src/
 ├── main.rs            進入點：載入設定、初始化日誌、建立 TLS 設定、啟動並監看背景任務
 ├── cli.rs             命令列參數解析（--print-agent-id、--version、--help）與版本字串
 ├── config_manager.rs  設定管理（嵌入預設 → pulse.toml → PULSE__ 環境變數）與範圍驗證
+├── file_perms.rs      敏感檔案（agent.id、client_key）的權限檢查（Unix 權限位元、Windows ACL）
 ├── tls.rs             rustls 設定：信任庫、客戶端憑證、SAN 與有效期限檢查、TLS 錯誤提示
 ├── protocol.rs        協定訊息定義（ClientMsg / ServerMsg）
 ├── network.rs         長 TLS 連線：hello / heartbeat / report / 逾時 / 重連 / 日誌清理
@@ -469,7 +504,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 
 - 同時輸出到終端（stdout）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）
 - **需要人工處理的錯誤另寫一行到 stderr**：伺服器憑證驗證錯誤（不受信任、名稱不符、過期、尚未生效、被撤銷、用途不符、被標記為 CA、其他驗證失敗；第一次發生就記 `ERROR`，原因改變時立即再記）、伺服器送來的致命錯誤與註冊前的錯誤（`certificate_rejected`、`auth_failed`、狀態表已滿等）、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕（撤銷、過期等），以及本機客戶端憑證已過期。內容與日誌的 `ERROR` 行相同，節流也相同（同一原因每 10 分鐘最多一行，其餘只在日誌記 `WARN`）；一般連線錯誤（拒絕連線、逾時、連線被重設等）不寫。以 systemd 執行（有 `JOURNAL_STREAM` 環境變數）時行首加上 `<3>`，journal 以 err 等級記錄（`journalctl -u pulse -p err`），訊息中不會出現 `<3>`。stdout 與 stderr 都是終端機（互動執行）時不重複寫。`pulse.service` 設定 `StandardOutput=null`，所以 journal 中只會看到這些行與啟動失敗等 stderr 訊息
-- **systemd 狀態文字**：Linux 上有 `NOTIFY_SOCKET` 時以 sd_notify 送出 `STATUS=`，`systemctl status` 顯示為 `Status:` 行：`已註冊：<位址>:<連接埠>`、`重新連線中`（一般連線錯誤）、`無法連線：伺服器憑證<原因>（<處理提示>）`（例如 `無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）`、`無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）`；原因另有已過期、尚未生效、已被撤銷、用途不符、被標記為 CA、驗證失敗）、`無法註冊：<錯誤碼>（<處理提示>）`（錯誤碼如 `certificate_rejected`、`TLS alert CertificateRevoked`、`auth_failed`、`bad_request`、`unsupported_version`、`proto_mismatch`、`superseded`）。只送狀態文字、不送 `READY=1`，unit 維持 `Type=simple`，需設定 `NotifyAccess=main`（發佈包的 `pulse.service` 已設定）；沒有 `NOTIFY_SOCKET` 時（Windows、直接執行）不做任何事
+- **systemd 狀態文字**：Linux 上有 `NOTIFY_SOCKET` 時以 sd_notify 送出 `STATUS=`，`systemctl status` 顯示為 `Status:` 行：`連線中`（啟動後、第一次註冊或斷線前，含啟動時的隨機延遲）、`已註冊：<位址>:<連接埠>`、`重新連線中`（一般連線錯誤）、`無法連線：伺服器憑證<原因>（<處理提示>）`（例如 `無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）`、`無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）`；原因另有已過期、尚未生效、已被撤銷、用途不符、被標記為 CA、驗證失敗）、`無法註冊：<錯誤碼>（<處理提示>）`（錯誤碼如 `certificate_rejected`、`TLS alert CertificateRevoked`、`auth_failed`、`bad_request`、`unsupported_version`、`proto_mismatch`、`superseded`）。只送狀態文字、不送 `READY=1`，unit 維持 `Type=simple`，需設定 `NotifyAccess=main`（發佈包的 `pulse.service` 已設定）；沒有 `NOTIFY_SOCKET` 時（Windows、直接執行）不做任何事
 - **按日分檔**：檔名日期為 **UTC**（與 Kairos 相同），UTC 午夜換新檔；每行開頭的時間戳記則是本機時間
 - **保留**：保留今天與前 `log.retention_days` 天（預設 14），更早的檔案於啟動時與之後每小時刪除；`0` 表示永久保留。只會刪除檔名**完全符合** `pulse-YYYY-MM-DD.log` 的檔案，其他檔案（例如舊版的 `pulse.log`）一律不碰
 - **系統日期異常時暫停清除**（規則與 Kairos 相同；`log.retention_days = 0` 時不檢查）：系統時鐘被誤校到未來時，以「今天」計算的保留期限會把所有日誌檔判定為過期，因此清除前先檢查日期是否合理，「已接受的日期」只能隨實際經過的時間推進：
@@ -498,9 +533,10 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 - 斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會暫存補送（at-most-once，協定設計如此）。
 - Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
+- 取樣卡住（例如 WMI 無回應）時只在本機記 `WARN` 並略過 report，heartbeat 照常送出；Kairos 目前不會因 `last_report` 停滯而告警（見「回報資料格式」）。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
 - `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
-- Windows 上不檢查 `agent.id` 的檔案權限，需自行放在受保護的目錄。
+- Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
 
 ## 授權
 

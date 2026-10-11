@@ -62,6 +62,13 @@ const SUPERSEDED_STREAK_ERROR: u32 = 2;
 const SUPERSEDED_MIN_DELAY: Duration = STABLE_CONNECTION;
 /// 「連續被取代」與「伺服器致命錯誤」的 error 日誌節流視窗；視窗內的其他次數改記 warn。
 const ATTENTION_LOG_WINDOW: Duration = Duration::from_secs(600);
+/// 啟動時與每次斷線後第一次重連前的隨機延遲上限：`min(heartbeat.interval, MAX_CONNECT_SPREAD)`。
+///
+/// Kairos 重新啟動時所有 agent 同時斷線，若都以相同的初始退避（2 秒 ±20%）重連，
+/// 會在約 1 秒內湧入；另加 0～5 秒的均勻分散，把同時重連攤到約 6 秒。
+/// 上限取心跳間隔：分散不超過一個心跳週期，對伺服器的離線判定（5 × 心跳）沒有影響；
+/// 另以 5 秒封頂，避免心跳間隔很長時啟動與恢復連線被拖慢。
+const MAX_CONNECT_SPREAD: Duration = Duration::from_secs(5);
 /// 伺服器 error 的 `code` 寫進日誌時的長度上限（字元）。
 const LOG_CODE_LIMIT: usize = 64;
 /// 伺服器送來的其他文字（error 的 `message`、無法解析的行）寫進日誌時的長度上限（字元）。
@@ -71,6 +78,9 @@ const LOG_TEXT_LIMIT: usize = 200;
 const LOG_ERROR_LIMIT: usize = 400;
 /// Kairos 因 CRL 過期或無法判定撤銷狀態而拒絕時，`certificate_rejected` 的 message（與 Kairos 約定）。
 const REVOCATION_UNAVAILABLE: &str = "revocation status unavailable";
+
+/// 啟動後、第一次註冊完成前的 systemd 狀態文字（含啟動時的隨機延遲）。
+const STARTING_STATUS: &str = "連線中";
 
 /// 依節流狀態記錄日誌：同一類別每 `DEFAULT_WINDOW` 最多一則，並附上被略過的次數。
 macro_rules! throttled {
@@ -170,6 +180,19 @@ fn log_attention(check: Option<u64>, msg: &str, what: &str) {
     }
 }
 
+/// 連續失敗達 `retry.max_retries` 後的一般連線錯誤（拒絕連線、逾時、伺服器關閉連線等）：
+/// 依節流結果以 error 或 warn 記錄（Q6）。與 [`log_attention`] 相同的 10 分鐘視窗，
+/// 但這類錯誤不需人工介入即可能自行恢復（例如 Kairos 停機維護），因此不寫 stderr。
+///
+/// 沒有節流時，Kairos 停機一天、退避上限 60 秒的 agent 約產生 1,440 行 ERROR。
+fn log_retries_exhausted(check: Option<u64>, msg: &str) {
+    match check {
+        Some(0) => log::error!("{msg}"),
+        Some(n) => log::error!("{msg}（上次以 ERROR 記錄後，另有 {n} 次連線失敗已改記 WARN）"),
+        None => log::warn!("{msg}"),
+    }
+}
+
 /// 連線 task 所需的設定（啟動時由 `AppConfig` 建立）。
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -185,6 +208,8 @@ pub struct Settings {
     pub max_delay: Duration,
     /// 已設定的客戶端憑證路徑（用於錯誤提示）
     pub client_cert: Option<String>,
+    /// 啟動時與斷線後第一次重連前的隨機延遲上限（見 [`MAX_CONNECT_SPREAD`]）
+    pub connect_spread: Duration,
 }
 
 impl Settings {
@@ -201,6 +226,7 @@ impl Settings {
             max_delay: Duration::from_secs(config.retry.max_delay),
             client_cert: Some(config.server.client_cert.trim().to_string())
                 .filter(|p| !p.is_empty()),
+            connect_spread: connect_spread(Duration::from_secs(config.heartbeat.interval)),
         }
     }
 
@@ -215,6 +241,11 @@ impl Settings {
         hb.saturating_mul(2)
             .max(hb.saturating_add(READ_IDLE_MARGIN))
     }
+}
+
+/// 啟動與第一次重連的隨機延遲上限：`min(心跳間隔, MAX_CONNECT_SPREAD)`。
+fn connect_spread(heartbeat_interval: Duration) -> Duration {
+    heartbeat_interval.min(MAX_CONNECT_SPREAD)
 }
 
 /// 單次連線結束的原因。
@@ -467,7 +498,30 @@ async fn run_with<D: Dialer>(
     let mut superseded_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
     // 伺服器致命錯誤、協定版本不符、客戶端憑證被拒的 error 日誌節流（跨連線保留，依錯誤碼分類）
     let mut attention_log = AttentionLog::new();
+    // 連續失敗達 max_retries 後一般連線錯誤的 error 日誌節流；連線穩定（退避重置）時重新起算，
+    // 下一次中斷達到 max_retries 時立即以 error 記錄
+    let mut retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
     let has_client_cert = settings.client_cert.is_some();
+
+    // systemctl status 從啟動起就有 Status: 行（否則第一次註冊或斷線前都是空的）
+    service_status::set_status(STARTING_STATUS);
+
+    // 啟動時先隨機延遲 0～connect_spread 再連線：大量主機同時開機或同時重啟 Pulse 時分散連線
+    let startup_delay = crate::backoff::random_spread(settings.connect_spread);
+    if !startup_delay.is_zero() {
+        log::info!(
+            "{:.1} 秒後開始連線（啟動時隨機延遲 0～{} 秒，避免大量 agent 同時連線）",
+            startup_delay.as_secs_f64(),
+            settings.connect_spread.as_secs()
+        );
+        tokio::select! {
+            _ = time::sleep(startup_delay) => {}
+            _ = shutdown.cancelled() => {
+                log::debug!("啟動延遲中收到結束要求，連線任務已停止");
+                return;
+            }
+        }
+    }
 
     loop {
         let mut registered_at = None;
@@ -521,6 +575,7 @@ async fn run_with<D: Dialer>(
             ),
             Some(up) if up >= STABLE_CONNECTION => {
                 backoff.reset();
+                retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
                 if superseded {
                     format!("（連線已維持 {} 秒，首次被取代，退避已重置）", up.as_secs())
                 } else {
@@ -536,6 +591,11 @@ async fn run_with<D: Dialer>(
         };
 
         let mut delay = backoff.next_delay();
+        if backoff.failures() == 1 {
+            // 斷線後第一次重連（例如 Kairos 重新啟動，所有 agent 同時斷線）：另加 0～connect_spread
+            // 的隨機延遲。之後的重試已由指數退避與 ±20% 抖動錯開
+            delay = delay.saturating_add(crate::backoff::random_spread(settings.connect_spread));
+        }
         let mut floor_note = "";
         if repeated_superseded && delay < SUPERSEDED_MIN_DELAY {
             delay = SUPERSEDED_MIN_DELAY;
@@ -562,7 +622,8 @@ async fn run_with<D: Dialer>(
                 "相同原因的斷線",
             );
         } else if failures >= settings.max_retries {
-            log::error!("{msg}");
+            // 伺服器長時間停機時每次重試都會到這裡：error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
+            log_retries_exhausted(retries_exhausted_log.check(Instant::now()), &msg);
         } else {
             log::warn!("{msg}");
         }
@@ -1394,6 +1455,8 @@ mod tests {
             initial_delay: Duration::from_secs(2),
             max_delay: Duration::from_secs(60),
             client_cert: None,
+            // 既有測試驗證精確的退避時間，不加隨機分散；分散另有測試
+            connect_spread: Duration::ZERO,
         }
     }
 
@@ -1830,7 +1893,7 @@ mod tests {
             domain: "localhost".into(),
             accept_invalid_certs: true,
             ca_cert: String::new(),
-            use_system_roots: false,
+            use_system_roots: Some(false),
             client_cert: String::new(),
             client_key: String::new(),
         })
@@ -2454,6 +2517,145 @@ mod tests {
         assert!(d[4].1.contains("連續第 3 次失敗"), "{}", d[4].1);
         assert_eq!(d[4].0, log::Level::Warn, "{}", d[4].1);
         assert_log_safe(&logs);
+    }
+
+    #[test]
+    fn startup_and_first_reconnect_are_spread() {
+        // A11：啟動時延遲 0～connect_spread 再連線；斷線後第一次重連另加 0～connect_spread，
+        // 之後的重試只有指數退避與 ±20% 抖動
+        assert_eq!(
+            connect_spread(Duration::from_secs(15)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            connect_spread(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        let cfg = AppConfig::default_for_tests();
+        let s = Settings::new(&cfg, "a".into(), "h".into());
+        assert_eq!(s.heartbeat_interval, Duration::from_secs(15));
+        assert_eq!(s.connect_spread, Duration::from_secs(5));
+
+        let spread = 5.0;
+        let mut startup = Vec::new();
+        for _ in 0..8 {
+            let mut s = settings(15);
+            s.connect_spread = Duration::from_secs(5);
+            // 第 0 次：註冊後維持 31 秒（重置退避）再斷線；第 1、2 次：hello 後立即斷線
+            let (dials, logs) = run_script(s, 3, |i, mut f| async move {
+                if i == 0 {
+                    accept_hello(&mut f).await;
+                    ack_for(&mut f, Duration::from_secs(31)).await;
+                } else {
+                    let _ = f.next().await;
+                }
+            });
+            assert_eq!(dials.len(), 4, "{dials:?}");
+            let first = dials[0].as_secs_f64();
+            assert!((0.0..=spread + 0.01).contains(&first), "{dials:?}");
+            startup.push(first);
+            if first > 0.0 {
+                assert!(
+                    logs.iter().any(|(l, m)| *l == log::Level::Info
+                        && m.contains("秒後開始連線")
+                        && m.contains("0～5 秒")),
+                    "{logs:?}"
+                );
+            }
+            let gap = |i: usize| (dials[i + 1] - dials[i]).as_secs_f64();
+            // 第一次重連：2 s ±20% + 0～5 s
+            let d1 = gap(0) - 31.0;
+            assert!(d1 >= 1.6 - 0.01 && d1 <= 2.4 + spread + 0.01, "{dials:?}");
+            // 連續第 2、3 次失敗：只有指數退避（4 s、8 s ±20%），不再加分散
+            assert!(gap(1) >= 3.2 - 0.01 && gap(1) <= 4.8 + 0.01, "{dials:?}");
+            assert!(gap(2) >= 6.4 - 0.01 && gap(2) <= 9.6 + 0.01, "{dials:?}");
+        }
+        // 啟動延遲是隨機的，不會全部相同
+        assert!(startup.iter().any(|t| *t != startup[0]), "{startup:?}");
+    }
+
+    #[test]
+    fn startup_delay_is_interrupted_by_shutdown() {
+        // A11：啟動延遲期間收到結束要求時立即結束，不連線
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut s = settings(15);
+            s.connect_spread = Duration::from_secs(3600);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let dialer = FakeDialer {
+                servers: tx,
+                dial_times: RefCell::new(Vec::new()),
+            };
+            let shutdown = CancellationToken::new();
+            shutdown.cancel();
+            let (_report_tx, mut reports) = mpsc::channel::<Sample>(1);
+            let start = Instant::now();
+            run_with(&s, &dialer, &mut reports, &shutdown).await;
+            assert!(dialer.dial_times.borrow().is_empty());
+            assert!(start.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn errors_after_max_retries_are_throttled() {
+        // Q6：連續失敗達 max_retries 後的一般連線錯誤，ERROR 每 10 分鐘最多一則，其餘記 WARN
+        let mut s = settings(1);
+        s.max_delay = Duration::from_secs(30);
+        let (dials, logs) = run_script(s, 40, |_, f| async move {
+            drop(f); // 註冊前就關閉連線
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 40, "{d:?}");
+        // 前 4 次未達 max_retries（5）：WARN
+        for (level, msg) in &d[..4] {
+            assert_eq!(*level, log::Level::Warn, "{msg}");
+        }
+        let errors = error_positions(&d);
+        assert_eq!(errors[0], (4, 0), "第 5 次失敗立即以 ERROR 記錄：{d:?}");
+        assert!(errors.len() >= 2, "{d:?}");
+        let (second, n) = errors[1];
+        assert_eq!(n, u64::try_from(second - 5).unwrap(), "{}", d[second].1);
+        assert!(
+            d[second].1.contains("次連線失敗已改記 WARN"),
+            "{}",
+            d[second].1
+        );
+        for (level, msg) in &d[5..second] {
+            assert_eq!(*level, log::Level::Warn, "{msg}");
+            assert!(msg.contains("連續第"), "{msg}");
+        }
+        // 第 i 則斷線日誌在第 i + 1 次 dial 之前
+        assert!(dials[second] - dials[4] >= ATTENTION_LOG_WINDOW);
+        assert!(dials[second - 1] - dials[4] < ATTENTION_LOG_WINDOW + Duration::from_secs(1));
+        // 一般連線錯誤不寫 stderr（不經過 attention）
+        assert!(!d.iter().any(|(_, m)| m.contains("相同原因的斷線")));
+    }
+
+    #[test]
+    fn retries_exhausted_error_restarts_after_stable_connection() {
+        // Q6：連線穩定（退避重置）後再次中斷，達到 max_retries 時立即以 ERROR 記錄，不受上一段節流影響
+        let (_, logs) = run_script(settings(1), 11, |i, mut f| async move {
+            if i == 5 {
+                accept_hello(&mut f).await;
+                ack_for(&mut f, Duration::from_secs(31)).await;
+            } else {
+                drop(f);
+            }
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 11, "{d:?}");
+        let levels: Vec<_> = d.iter().map(|(l, _)| *l).collect();
+        use log::Level::{Error as E, Warn as W};
+        // 第 6 則是穩定連線後的斷線（重新起算的連續第 1 次失敗）；第 10 則是新一段的第 5 次失敗，
+        // 距上一則 ERROR 不到 10 分鐘仍立即記 ERROR；第 11 則回到節流
+        assert_eq!(levels, [W, W, W, W, E, W, W, W, W, E, W], "{d:?}");
+        assert!(d[5].1.contains("退避已重置"), "{}", d[5].1);
+        assert!(d[9].1.contains("連續第 5 次失敗"), "{}", d[9].1);
+        assert!(!d[9].1.contains("改記 WARN"), "{}", d[9].1);
     }
 
     #[test]
@@ -3144,9 +3346,9 @@ mod tests {
         assert!(dials[second] - dials[0] >= ATTENTION_LOG_WINDOW);
 
         let status = status_events(&events);
-        assert_eq!(status[0], "已註冊：127.0.0.1:1", "{status:?}");
-        assert_eq!(status.len(), 1 + d.len(), "{status:?}");
-        for st in &status[1..] {
+        assert_eq!(status[..2], ["連線中", "已註冊：127.0.0.1:1"], "{status:?}");
+        assert_eq!(status.len(), 2 + d.len(), "{status:?}");
+        for st in &status[2..] {
             assert_eq!(
                 *st,
                 "無法註冊：certificate_rejected（客戶端憑證已被撤銷、過期或不受信任，請聯絡管理者重新簽發）"
@@ -3171,9 +3373,9 @@ mod tests {
         );
         assert!(stderr_events(&events).is_empty(), "{events:?}");
         let status = status_events(&events);
-        assert_eq!(status[0], "已註冊：127.0.0.1:1");
-        assert!(status[1..].iter().all(|s| *s == "重新連線中"), "{status:?}");
-        assert_eq!(status.len(), 9, "{status:?}");
+        assert_eq!(status[..2], ["連線中", "已註冊：127.0.0.1:1"]);
+        assert!(status[2..].iter().all(|s| *s == "重新連線中"), "{status:?}");
+        assert_eq!(status.len(), 10, "{status:?}");
     }
 
     #[test]
@@ -3196,7 +3398,7 @@ mod tests {
         let full = "無法註冊：bad_request（伺服器狀態表已滿，請管理者調高 limits.max_agents）";
         assert_eq!(
             status_events(&events),
-            [full, full, "已註冊：127.0.0.1:1", "重新連線中"]
+            ["連線中", full, full, "已註冊：127.0.0.1:1", "重新連線中"]
         );
         // 狀態表已滿只寫一次 stderr（第二次在 10 分鐘視窗內）
         let stderr = stderr_events(&events);
