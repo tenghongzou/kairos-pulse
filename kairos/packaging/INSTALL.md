@@ -260,7 +260,7 @@ crl = ["agents.crl"]
 | `data/`、`logs/` | `kairos:kairos` | 750 |
 | `data/` 中的 `reports-*.jsonl`、`agents.json`；`logs/` 中的 `kairos-*.log` | `kairos:kairos` | 640（由 Kairos 建立） |
 
-Kairos 自己建立的 report 檔、`agents.json` 與日誌檔一律最多 640，自行建立的目錄為 750，不受 umask 影響（手動執行時 umask 常為 022 也一樣）；既有檔案在開啟時收緊到最多 640（不會放寬，600 維持 600）。`data/`、`logs/` 已存在時 Kairos 不改變其權限，但其他使用者可存取（例如 755）時啟動會記 `WARN` 並建議 `chmod 750`。日期保護狀態檔（`.retention-guard*.json`，只含日期）目前仍依 umask 建立，由 750 的目錄保護。
+Kairos 自己建立的 report 檔、`agents.json` 與日誌檔一律最多 640，自行建立的目錄為 750，不受 umask 影響（手動執行時 umask 常為 022 也一樣）；既有檔案在開啟時收緊到最多 640（不會放寬，600 維持 600）。`data/`、`logs/` 已存在時 Kairos 不改變其權限，但其他使用者可存取（例如 755）時啟動會記 `WARN` 並建議 `chmod 750`。`agents.json` 與日期保護狀態檔（`.retention-guard*.json`，只含日期）的暫存檔建立時就是 640，更名後同樣最多 640。
 
 ## 8. 安裝 systemd unit
 

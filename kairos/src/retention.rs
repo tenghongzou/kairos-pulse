@@ -169,7 +169,7 @@ impl DateGuard {
             if let Some(dir) = target.parent()
                 && !dir.as_os_str().is_empty()
             {
-                std::fs::create_dir_all(dir)?;
+                crate::fsperm::create_dir_all(dir)?;
             }
             write_atomically(&target, &[&json])
         })
@@ -226,13 +226,17 @@ pub fn is_tmp_name_for(candidate: &str, file_name: &str) -> bool {
 
 /// 原子寫入：以 `create_new` 建立隨機檔名的暫存檔（不會跟隨預先放置的符號連結或覆寫既有檔案；
 /// R2-K9）、寫入並同步到磁碟後 rename 成 `path`。失敗時刪除暫存檔。同步 I/O，請在 blocking 執行緒呼叫。
+///
+/// Unix 上暫存檔以 mode 0640 建立（[`crate::fsperm::FILE_MODE`]，S3；實際權限再受 umask 限制），
+/// rename 後的目標檔（`agents.json`、`.retention-guard*.json`）從一開始就不會比 0640 寬，
+/// 不需事後收緊，也沒有暫存期間權限過寬的空窗。
 pub fn write_atomically(path: &Path, parts: &[&[u8]]) -> std::io::Result<()> {
     let tmp = unique_tmp_path(path);
     let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = crate::fsperm::private_std_options(
+            std::fs::OpenOptions::new().write(true).create_new(true),
+        )
+        .open(&tmp)?;
         for part in parts {
             file.write_all(part)?;
         }
@@ -1017,6 +1021,52 @@ mod tests {
 
         // 目標目錄不存在時回錯誤，不留下暫存檔
         assert!(write_atomically(&dir.join("missing").join("x.json"), &[b"x"]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_files_with_at_most_0640() {
+        // S3：暫存檔以 0640 建立，rename 後的檔案一開始就不比 0640 寬；
+        // 取代既有的寬鬆檔案時也不會沿用舊權限
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("atomic-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("agents.json");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        write_atomically(&target, &[b"{}"]).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & !crate::fsperm::FILE_MODE, 0, "mode {mode:o}");
+        // 擁有者仍可讀寫
+        assert_eq!(mode & 0o600, 0o600, "mode {mode:o}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guard_state_file_is_created_with_at_most_0640() {
+        // S3：.retention-guard*.json 由 write_atomically 產生，同樣不比 0640 寬；
+        // 狀態檔所在目錄不存在時以 0750 建立
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("guard-mode");
+        let state_dir = dir.join("data");
+        let path = state_dir.join(GUARD_STATE_FILE);
+        let t0 = Instant::now();
+        let now_wall = wall(2026, 10, 9, 12);
+        let mut g = DateGuard::load_or_new(
+            "report 檔",
+            path.clone(),
+            None,
+            date(2026, 10, 9),
+            t0,
+            now_wall,
+        );
+        g.check(date(2026, 10, 9), t0, now_wall).await;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & !crate::fsperm::FILE_MODE, 0, "mode {mode:o}");
+        let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode & !crate::fsperm::DIR_MODE, 0, "mode {dir_mode:o}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

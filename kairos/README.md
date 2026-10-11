@@ -569,7 +569,7 @@ heartbeat 只在 `trace` 等級記錄；agent 未送 `close_notify` 就斷線、
 
 report 檔含有 agent 的來源 IP 與主機名稱（可能含人名），日誌也是，因此不應讓服務帳號以外的使用者讀取。
 
-- **Unix**：Kairos 建立的 `reports-YYYY-MM-DD.jsonl`、`agents.json` 與 `kairos-YYYY-MM-DD.log` 一律最多 `0640`（擁有者讀寫、group 唯讀、其他人無權限），自行建立的資料目錄與日誌目錄（含執行中被刪除後重建）為 `0750`，不依賴 umask。既有的檔案在開啟時收緊到最多 `0640`（只移除權限，`0600` 維持 `0600`）；既有的目錄不會被改變，但其他使用者可存取時（例如 `0755`）啟動會記 `WARN`「資料目錄 … 的權限為 0755，其他使用者可以存取…；建議執行 chmod 750 …」。日期保護狀態檔（`.retention-guard.json`、`.retention-guard-logs.json`，只含日期）目前仍依 umask 建立，由目錄的權限保護。
+- **Unix**：Kairos 建立的 `reports-YYYY-MM-DD.jsonl`、`agents.json` 與 `kairos-YYYY-MM-DD.log` 一律最多 `0640`（擁有者讀寫、group 唯讀、其他人無權限），自行建立的資料目錄與日誌目錄（含執行中被刪除後重建）為 `0750`，不依賴 umask。既有的檔案在開啟時收緊到最多 `0640`（只移除權限，`0600` 維持 `0600`）；既有的目錄不會被改變，但其他使用者可存取時（例如 `0755`）啟動會記 `WARN`「資料目錄 … 的權限為 0755，其他使用者可以存取…；建議執行 chmod 750 …」。`agents.json` 與日期保護狀態檔（`.retention-guard.json`、`.retention-guard-logs.json`，只含日期）以「寫暫存檔再更名」產生，暫存檔建立時就是 `0640`，更名後不需再收緊。
 - **Windows**：檔案沒有 Unix 的權限位元，新檔案繼承所在目錄的 ACL；預設的 ACL 通常讓本機的 `Users` 群組可以讀取。請在第一次啟動前建立資料目錄與日誌目錄，並移除繼承、只授權給執行 Kairos 的帳號與系統管理員，例如（在 Kairos 的工作目錄、以系統管理員身分執行；`KAIROS_SVC` 換成實際的服務帳號）：
 
   ```bat

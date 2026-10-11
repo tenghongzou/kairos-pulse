@@ -801,12 +801,8 @@ pub async fn write_agents_snapshot(
     ensure_parent_dir(&paths.agents).await?;
     let path = paths.agents.clone();
     tokio::task::spawn_blocking(move || {
-        write_atomically(&path, &[&json])?;
-        // 暫存檔依 umask 建立；更名後收緊到最多 0640（S3）。暫存檔存在的期間由資料目錄的 0750 保護
-        if let Err(e) = fsperm::restrict_path(&path) {
-            debug!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
-        }
-        Ok(())
+        // Unix 上暫存檔以 0640 建立（S3），更名後的 agents.json 一開始就是正確權限
+        write_atomically(&path, &[&json])
     })
     .await
     .map_err(Error::other)?

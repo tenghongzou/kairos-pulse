@@ -3,6 +3,7 @@
 //! Unix：Kairos 寫出的 report JSONL、`agents.json` 與日誌檔最多 0640（擁有者讀寫、group 唯讀、
 //! 其他人無權限），自行建立的目錄為 0750，不依賴行程的 umask（手動執行時 umask 常為 022）。
 //! 既有的檔案在開啟時收緊到最多 0640（只移除權限，不會放寬，例如 0600 維持 0600）。
+//! `agents.json` 與日期保護狀態檔由 `retention::write_atomically` 以 0640 建立暫存檔後更名，一開始就是正確權限。
 //!
 //! Windows 沒有對應的 mode：檔案繼承所在目錄的 ACL，請依 README「檔案權限」設定目錄的 ACL。
 //! 這裡的函式在 Windows 上只建立目錄或什麼都不做。
@@ -93,21 +94,6 @@ pub async fn restrict_open_tokio_file(file: &tokio::fs::File) -> io::Result<bool
     #[cfg(not(unix))]
     let _ = file;
     Ok(false)
-}
-
-/// 把路徑上的檔案收緊到最多 0640（Unix；不跟隨符號連結以外的特殊處理，與 `chmod` 相同）
-pub fn restrict_path(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
-        if restricted(mode) != mode {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(restricted(mode)))?;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 /// 既有目錄允許其他使用者（other）存取時的警告訊息（Unix）；沒問題、讀不到或非 Unix 時為 `None`。
@@ -290,7 +276,7 @@ mod tests {
         assert!(restrict_open_file(&file).unwrap());
         assert_eq!(mode_of(&path), 0o640);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o604)).unwrap();
-        restrict_path(&path).unwrap();
+        assert!(restrict_open_file(&file).unwrap());
         assert_eq!(mode_of(&path), 0o600);
 
         // 目錄權限警告
