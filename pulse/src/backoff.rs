@@ -83,6 +83,16 @@ fn scale(d: Duration, factor: f64, overflow: Duration) -> Duration {
     Duration::try_from_secs_f64(d.as_secs_f64() * factor).unwrap_or(overflow)
 }
 
+/// `[0, max]` 間均勻分佈的隨機延遲（啟動與第一次重連的分散用，見 `network::run_with`）。
+pub fn random_spread(max: Duration) -> Duration {
+    spread_with(max, random_unit())
+}
+
+/// 以指定的 `[0, 1)` 亂數計算 `[0, max]` 間的延遲（供測試使用）。
+fn spread_with(max: Duration, u: f64) -> Duration {
+    scale(max, unit(u), max).min(max)
+}
+
 /// 產生 `[0, 1)` 的亂數（非密碼學用途，只用於抖動）。
 fn random_unit() -> f64 {
     let nanos = SystemTime::now()
@@ -198,6 +208,23 @@ mod tests {
         b.failures = u32::MAX;
         b.next_delay();
         assert_eq!(b.failures(), u32::MAX);
+    }
+
+    #[test]
+    fn spread_is_uniform_within_zero_and_max() {
+        // A11：啟動與第一次重連的隨機分散
+        assert_eq!(spread_with(S(5), 0.0), Duration::ZERO);
+        assert_eq!(spread_with(S(5), 0.5), Duration::from_millis(2500));
+        assert_eq!(spread_with(S(5), 1.0), S(5));
+        assert_eq!(spread_with(S(5), f64::NAN), Duration::ZERO);
+        assert_eq!(spread_with(S(5), 7.0), S(5));
+        assert_eq!(spread_with(Duration::ZERO, 0.7), Duration::ZERO);
+        assert_eq!(spread_with(Duration::MAX, 1.0), Duration::MAX);
+        let samples: Vec<Duration> = (0..500).map(|_| random_spread(S(5))).collect();
+        assert!(samples.iter().all(|d| *d <= S(5)));
+        // 兩半區間都有樣本（不會集中在某一端）
+        assert!(samples.iter().any(|d| *d < Duration::from_millis(2500)));
+        assert!(samples.iter().any(|d| *d > Duration::from_millis(2500)));
     }
 
     #[test]

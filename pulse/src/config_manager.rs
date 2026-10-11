@@ -279,7 +279,8 @@ mod tests {
         assert_eq!(cfg.retry.max_retries, 5);
         assert_eq!(cfg.retry.initial_delay, 2);
         assert_eq!(cfg.retry.max_delay, 60);
-        assert_eq!(cfg.heartbeat.interval, 1);
+        // A11：預設心跳 15 秒（Kairos 離線判定 5 × 15 = 75 秒，在其 1～60 秒的夾值範圍內）
+        assert_eq!(cfg.heartbeat.interval, 15);
         assert_eq!(cfg.report.interval, 5);
         assert_eq!(cfg.agent.id_file, "agent.id");
         assert_eq!(cfg.log.level, "info");

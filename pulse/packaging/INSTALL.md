@@ -242,10 +242,11 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 [INFO] Pulse 地端程式啟動（pulse <版本> (<commit>)）...
 [INFO] 工作目錄：/opt/pulse（設定中的相對路徑都以此為準）；設定檔：已讀取 /opt/pulse/pulse.toml
 [INFO] 已載入客戶端憑證：client.pem（憑證鏈 1 張；私鑰：client.key）
-[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 5000 ms；TLS 加密連線 monitor.example.com:8080，domain=monitor.example.com，TLSv1_3，已驗證伺服器憑證）
+[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 75000 ms；TLS 加密連線 monitor.example.com:8080，domain=monitor.example.com，TLSv1_3，已驗證伺服器憑證）
 ```
 
-- 判斷連線成功以「已向伺服器註冊」這一行為準。TLS 握手完成（「已建立 TLS 加密連線」）只在 `debug` 等級記錄，因為 TLS 1.3 下伺服器在握手後才驗證客戶端憑證，握手完成不代表會被接受。
+- 啟動時 Pulse 會先隨機等待 0～5 秒（「x 秒後開始連線」）才連線，避免大量主機同時連入。
+- 判斷連線成功以「已向伺服器註冊」這一行為準。伺服器離線判定為心跳間隔（預設 15 秒）的 5 倍：主機斷線約 75 秒後才會在 Kairos 顯示為離線。TLS 握手完成（「已建立 TLS 加密連線」）只在 `debug` 等級記錄，因為 TLS 1.3 下伺服器在握手後才驗證客戶端憑證，握手完成不代表會被接受。
 - 這一行若是 `WARN` 且含「⚠️ 未驗證伺服器憑證」，表示設定了 `accept_invalid_certs = true`，正式環境不可如此。
 - 啟動時的系統資訊在 `info` 等級只列實體磁碟與網路介面（略過虛擬檔案系統、容量 0 的掛載點、與已列出磁碟相同的重複掛載點（例如本 unit 的 `ReadWritePaths=`、`PrivateTmp=` 在服務內建立的 `/opt/pulse/logs`、`/tmp`、`/var/tmp` bind mount）、`lo` 與 `veth*`、`docker*`、`br-*` 等虛擬介面，各以一行統計），CPU 只有一行摘要；完整清單需 `log.level = "debug"`。
 
@@ -287,7 +288,7 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
    | `無法註冊：unsupported_version（…）`、`無法註冊：proto_mismatch（…）` | 協定版本不符，請更新 Pulse 或 Kairos |
    | `無法註冊：superseded（…）` | 連續被同一 agent_id 的其他連線取代，多台主機可能共用同一份 `agent.id` |
 
-   括號內是簡短的處理提示，完整訊息在日誌。狀態文字會隨每次重連更新：例如憑證被撤銷時，`無法註冊：certificate_rejected（…）` 只維持到下一次重連（約 1～2 秒），之後都是 `無法註冊：TLS alert CertificateRevoked（…）`；Kairos 停機時，即使本機憑證已被撤銷，也只會顯示 `重新連線中`（連不到伺服器就無法得知是否被撤銷）。監控腳本請以 `無法註冊：`、`無法連線：` 開頭判斷，不要比對完整字串。`Status:` 行需要 unit 中的 `NotifyAccess=main`（只用來更新狀態文字，`Type` 仍為 `simple`）；**舊版 unit 沒有這一行時不會出現 `Status:` 行**，升級時請一併更新 unit（第 10 節）。
+   括號內是簡短的處理提示，完整訊息在日誌。狀態文字會隨每次重連更新：例如憑證被撤銷時，`無法註冊：certificate_rejected（…）` 只維持到下一次重連（約 2～7 秒），之後都是 `無法註冊：TLS alert CertificateRevoked（…）`；Kairos 停機時，即使本機憑證已被撤銷，也只會顯示 `重新連線中`（連不到伺服器就無法得知是否被撤銷）。監控腳本請以 `無法註冊：`、`無法連線：` 開頭判斷，不要比對完整字串。`Status:` 行需要 unit 中的 `NotifyAccess=main`（只用來更新狀態文字，`Type` 仍為 `simple`）；**舊版 unit 沒有這一行時不會出現 `Status:` 行**，升級時請一併更新 unit（第 10 節）。
 
 2. **`journalctl -u pulse -p err`**：上述錯誤（伺服器憑證驗證失敗、伺服器送來的致命錯誤與註冊前的錯誤、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕），以及本機客戶端憑證已過期，會在寫 `ERROR` 日誌的同時寫一行到 stderr，內容與日誌的 `ERROR` 行相同，在 journal 中以 err 等級記錄，可用 `-p err` 篩選。第一次發生就記 `ERROR`，同一原因每 10 分鐘最多一行（其餘次數在 `logs/` 記 `WARN`），原因改變時立即再記。一般連線錯誤（`重新連線中`：拒絕連線、逾時、連線被重設等）不寫 stderr，只在 `logs/`。
 
@@ -405,7 +406,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chown root:pulse /opt/pulse/agent.id /opt/pulse/client.key
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
-- 升級前請看 `README.md`「升級注意事項」中「本版的行為改變」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`。
+- 升級前請看 `README.md`「升級注意事項」中「本版的行為改變」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。
 - 回滾：`mv /opt/pulse/pulse.prev /opt/pulse/pulse && systemctl restart pulse`。

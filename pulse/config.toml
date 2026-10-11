@@ -56,9 +56,10 @@ max_delay = 60     # 重連延遲上限（秒，1～3600）；實際延遲另加
 # 連續第 2 次起不論維持多久都不重置退避，且該次延遲至少 30 秒（不受 max_delay 上限限制）
 
 [heartbeat]
-# 心跳間隔（秒，1～60）。讀取閒置逾時 = max(2 × interval, interval + 10 秒)（預設 11 秒），
-# 只依心跳間隔計算，與 report.interval 無關
-interval = 1
+# 心跳間隔（秒，1～60）。伺服器的離線判定為 max(5 × interval, 5 秒)（預設 75 秒）。
+# 讀取閒置逾時 = max(2 × interval, interval + 10 秒)（預設 30 秒），只依心跳間隔計算，與 report.interval 無關。
+# 啟動時與斷線後第一次重連前，另加 0～min(interval, 5) 秒的隨機延遲，避免大量 agent 同時連線
+interval = 15
 
 [report]
 # 系統資訊回報間隔（秒，1～3600）。CPU 使用率為上次取樣到這次取樣之間的平均（略過回報時仍會取樣）。
