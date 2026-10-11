@@ -174,6 +174,19 @@ fn log_attention(check: Option<u64>, msg: &str, what: &str) {
     }
 }
 
+/// 連續失敗達 `retry.max_retries` 後的一般連線錯誤（拒絕連線、逾時、伺服器關閉連線等）：
+/// 依節流結果以 error 或 warn 記錄（Q6）。與 [`log_attention`] 相同的 10 分鐘視窗，
+/// 但這類錯誤不需人工介入即可能自行恢復（例如 Kairos 停機維護），因此不寫 stderr。
+///
+/// 沒有節流時，Kairos 停機一天、退避上限 60 秒的 agent 約產生 1,440 行 ERROR。
+fn log_retries_exhausted(check: Option<u64>, msg: &str) {
+    match check {
+        Some(0) => log::error!("{msg}"),
+        Some(n) => log::error!("{msg}（上次以 ERROR 記錄後，另有 {n} 次連線失敗已改記 WARN）"),
+        None => log::warn!("{msg}"),
+    }
+}
+
 /// 連線 task 所需的設定（啟動時由 `AppConfig` 建立）。
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -479,6 +492,9 @@ async fn run_with<D: Dialer>(
     let mut superseded_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
     // 伺服器致命錯誤、協定版本不符、客戶端憑證被拒的 error 日誌節流（跨連線保留，依錯誤碼分類）
     let mut attention_log = AttentionLog::new();
+    // 連續失敗達 max_retries 後一般連線錯誤的 error 日誌節流；連線穩定（退避重置）時重新起算，
+    // 下一次中斷達到 max_retries 時立即以 error 記錄
+    let mut retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
     let has_client_cert = settings.client_cert.is_some();
 
     // 啟動時先隨機延遲 0～connect_spread 再連線：大量主機同時開機或同時重啟 Pulse 時分散連線
@@ -550,6 +566,7 @@ async fn run_with<D: Dialer>(
             ),
             Some(up) if up >= STABLE_CONNECTION => {
                 backoff.reset();
+                retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
                 if superseded {
                     format!("（連線已維持 {} 秒，首次被取代，退避已重置）", up.as_secs())
                 } else {
@@ -596,7 +613,8 @@ async fn run_with<D: Dialer>(
                 "相同原因的斷線",
             );
         } else if failures >= settings.max_retries {
-            log::error!("{msg}");
+            // 伺服器長時間停機時每次重試都會到這裡：error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
+            log_retries_exhausted(retries_exhausted_log.check(Instant::now()), &msg);
         } else {
             log::warn!("{msg}");
         }
@@ -2518,6 +2536,64 @@ mod tests {
             assert!(dialer.dial_times.borrow().is_empty());
             assert!(start.elapsed() < Duration::from_secs(1));
         });
+    }
+
+    #[test]
+    fn errors_after_max_retries_are_throttled() {
+        // Q6：連續失敗達 max_retries 後的一般連線錯誤，ERROR 每 10 分鐘最多一則，其餘記 WARN
+        let mut s = settings(1);
+        s.max_delay = Duration::from_secs(30);
+        let (dials, logs) = run_script(s, 40, |_, f| async move {
+            drop(f); // 註冊前就關閉連線
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 40, "{d:?}");
+        // 前 4 次未達 max_retries（5）：WARN
+        for (level, msg) in &d[..4] {
+            assert_eq!(*level, log::Level::Warn, "{msg}");
+        }
+        let errors = error_positions(&d);
+        assert_eq!(errors[0], (4, 0), "第 5 次失敗立即以 ERROR 記錄：{d:?}");
+        assert!(errors.len() >= 2, "{d:?}");
+        let (second, n) = errors[1];
+        assert_eq!(n, u64::try_from(second - 5).unwrap(), "{}", d[second].1);
+        assert!(
+            d[second].1.contains("次連線失敗已改記 WARN"),
+            "{}",
+            d[second].1
+        );
+        for (level, msg) in &d[5..second] {
+            assert_eq!(*level, log::Level::Warn, "{msg}");
+            assert!(msg.contains("連續第"), "{msg}");
+        }
+        // 第 i 則斷線日誌在第 i + 1 次 dial 之前
+        assert!(dials[second] - dials[4] >= ATTENTION_LOG_WINDOW);
+        assert!(dials[second - 1] - dials[4] < ATTENTION_LOG_WINDOW + Duration::from_secs(1));
+        // 一般連線錯誤不寫 stderr（不經過 attention）
+        assert!(!d.iter().any(|(_, m)| m.contains("相同原因的斷線")));
+    }
+
+    #[test]
+    fn retries_exhausted_error_restarts_after_stable_connection() {
+        // Q6：連線穩定（退避重置）後再次中斷，達到 max_retries 時立即以 ERROR 記錄，不受上一段節流影響
+        let (_, logs) = run_script(settings(1), 11, |i, mut f| async move {
+            if i == 5 {
+                accept_hello(&mut f).await;
+                ack_for(&mut f, Duration::from_secs(31)).await;
+            } else {
+                drop(f);
+            }
+        });
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 11, "{d:?}");
+        let levels: Vec<_> = d.iter().map(|(l, _)| *l).collect();
+        use log::Level::{Error as E, Warn as W};
+        // 第 6 則是穩定連線後的斷線（重新起算的連續第 1 次失敗）；第 10 則是新一段的第 5 次失敗，
+        // 距上一則 ERROR 不到 10 分鐘仍立即記 ERROR；第 11 則回到節流
+        assert_eq!(levels, [W, W, W, W, E, W, W, W, W, E, W], "{d:?}");
+        assert!(d[5].1.contains("退避已重置"), "{}", d[5].1);
+        assert!(d[9].1.contains("連續第 5 次失敗"), "{}", d[9].1);
+        assert!(!d[9].1.contains("改記 WARN"), "{}", d[9].1);
     }
 
     #[test]
