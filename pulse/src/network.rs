@@ -79,6 +79,9 @@ const LOG_ERROR_LIMIT: usize = 400;
 /// Kairos 因 CRL 過期或無法判定撤銷狀態而拒絕時，`certificate_rejected` 的 message（與 Kairos 約定）。
 const REVOCATION_UNAVAILABLE: &str = "revocation status unavailable";
 
+/// 啟動後、第一次註冊完成前的 systemd 狀態文字（含啟動時的隨機延遲）。
+const STARTING_STATUS: &str = "連線中";
+
 /// 依節流狀態記錄日誌：同一類別每 `DEFAULT_WINDOW` 最多一則，並附上被略過的次數。
 macro_rules! throttled {
     ($throttle:expr, $level:ident, $($arg:tt)+) => {
@@ -496,6 +499,9 @@ async fn run_with<D: Dialer>(
     // 下一次中斷達到 max_retries 時立即以 error 記錄
     let mut retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
     let has_client_cert = settings.client_cert.is_some();
+
+    // systemctl status 從啟動起就有 Status: 行（否則第一次註冊或斷線前都是空的）
+    service_status::set_status(STARTING_STATUS);
 
     // 啟動時先隨機延遲 0～connect_spread 再連線：大量主機同時開機或同時重啟 Pulse 時分散連線
     let startup_delay = crate::backoff::random_spread(settings.connect_spread);
@@ -3284,9 +3290,9 @@ mod tests {
         assert!(dials[second] - dials[0] >= ATTENTION_LOG_WINDOW);
 
         let status = status_events(&events);
-        assert_eq!(status[0], "已註冊：127.0.0.1:1", "{status:?}");
-        assert_eq!(status.len(), 1 + d.len(), "{status:?}");
-        for st in &status[1..] {
+        assert_eq!(status[..2], ["連線中", "已註冊：127.0.0.1:1"], "{status:?}");
+        assert_eq!(status.len(), 2 + d.len(), "{status:?}");
+        for st in &status[2..] {
             assert_eq!(
                 *st,
                 "無法註冊：certificate_rejected（客戶端憑證已被撤銷、過期或不受信任，請聯絡管理者重新簽發）"
@@ -3311,9 +3317,9 @@ mod tests {
         );
         assert!(stderr_events(&events).is_empty(), "{events:?}");
         let status = status_events(&events);
-        assert_eq!(status[0], "已註冊：127.0.0.1:1");
-        assert!(status[1..].iter().all(|s| *s == "重新連線中"), "{status:?}");
-        assert_eq!(status.len(), 9, "{status:?}");
+        assert_eq!(status[..2], ["連線中", "已註冊：127.0.0.1:1"]);
+        assert!(status[2..].iter().all(|s| *s == "重新連線中"), "{status:?}");
+        assert_eq!(status.len(), 10, "{status:?}");
     }
 
     #[test]
@@ -3336,7 +3342,7 @@ mod tests {
         let full = "無法註冊：bad_request（伺服器狀態表已滿，請管理者調高 limits.max_agents）";
         assert_eq!(
             status_events(&events),
-            [full, full, "已註冊：127.0.0.1:1", "重新連線中"]
+            ["連線中", full, full, "已註冊：127.0.0.1:1", "重新連線中"]
         );
         // 狀態表已滿只寫一次 stderr（第二次在 10 分鐘視窗內）
         let stderr = stderr_events(&events);

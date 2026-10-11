@@ -25,8 +25,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 只用 sd_notify 更新狀態文字（systemctl status 的「Status:」：已註冊／無法註冊：<錯誤碼>／
-# 重新連線中），不送 READY=1，因此維持 Type=simple；只接受主程序送來的通知
+# 只用 sd_notify 更新狀態文字（systemctl status 的「Status:」：連線中／已註冊／重新連線中／
+# 無法連線：伺服器憑證<原因>／無法註冊：<錯誤碼>），不送 READY=1，因此維持 Type=simple；
+# 只接受主程序送來的通知
 NotifyAccess=main
 User=pulse
 Group=pulse
