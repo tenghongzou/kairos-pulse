@@ -1,10 +1,11 @@
 [server]
-listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080
+listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080，並同時設定 [auth] client_ca 啟用 mTLS（未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動）
 cert_path = "cert.pem"
 key_path = "key.pem"
 max_connections = 1024
 # max_connections_per_ip = 32 # 同一來源 IP 位址的同時連線數上限（含握手中的連線；IPv6 以單一位址計，新連線速率才以 /64 合併），1..=max_connections；未設定時為 min(32, max_connections)
 reload_interval_secs = 30     # 每隔幾秒檢查憑證／私鑰／客戶端 CA／CRL 是否變更並重新驗證現役連線，0 = 停用，上限 3600
+cert_expiry_warning_days = 30 # 伺服器憑證到期前幾天開始記 WARN（啟動、重載與每個重載週期檢查），0 = 不預警（已過期仍記 ERROR），上限 365
 
 [timeouts]
 handshake_secs = 5
@@ -20,6 +21,8 @@ max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限�
 client_ca = ""                # 非空：要求客戶端憑證（mTLS），以此 PEM（可含多張 CA）驗證，並強制 agent_id 綁定
 crl = []                      # CRL 檔路徑清單（PEM 或 DER），例如 ["agents.crl"]；只在設定 client_ca 時有效
 allow_multiple_dns_sans = false  # false：客戶端憑證必須恰好有一個 DNS SAN（避免一張憑證冒用多個 agent）
+crl_expiry_warning_days = 7   # CRL 的 nextUpdate 前幾天開始記 WARN（過期後所有 agent 都會被拒絕），0 = 不預警（已過期仍記 ERROR），上限 365
+allow_unauthenticated = false # false：未設定 client_ca 又監聽非 loopback 位址（例如 0.0.0.0）時拒絕啟動。true 只用於隔離的測試環境：任何人都能以任意 agent_id 註冊
 
 [limits]
 # max_agents = 10000          # 狀態表最多保留幾個 agent（達上限先淘汰離線最久者），max_connections..=100000；未設定時為 max(10000, max_connections)

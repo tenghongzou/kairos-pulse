@@ -17,7 +17,7 @@
 #   - cargo registry 快取放在 docker volume「sync-cargo」（各專案共用）
 #
 # tar 內容（一層 <套件名稱>/ 目錄）：執行檔（755）、範例設定、README.md、
-# PROTOCOL.md、INSTALL.md、systemd unit（其餘皆 644），擁有者一律為 0:0。
+# PROTOCOL.md、INSTALL.md、systemd unit 與其他範例檔（EXTRA_SRC；其餘皆 644），擁有者一律為 0:0。
 # PROTOCOL.md 取自兩個產品共用的唯一規格（PROTOCOL_SRC，相對於 repo 根目錄），
 # 產品目錄下的 PROTOCOL.md 只是指向它的說明。
 set -eu
@@ -28,6 +28,8 @@ EXAMPLE_SRC=kairos.example.toml      # repo 中的範例設定
 EXAMPLE_DST=kairos.example.toml      # 放進 tar 時的檔名
 PROTOCOL_SRC=crates/kairos-proto/PROTOCOL.md  # 協定規格（相對於 repo 根目錄）
 UNIT_SRC=packaging/kairos.service    # systemd unit 範本
+# 其他放進 tar 根目錄的範例檔（以空白分隔，路徑不可含空白）：CRL 定期更新的 unit 範例
+EXTRA_SRC="packaging/kairos-crl.service packaging/kairos-crl.timer"
 # ---------------------------------------------------------------------------
 
 IMAGE=rust:1.99-alpine
@@ -56,7 +58,8 @@ cd "$REPO"
 [ -f "$PROTOCOL_SRC" ] || die "缺少 $PROTOCOL_SRC（協定規格）"
 cd "$PKG_SUBDIR"
 
-for f in Cargo.toml README.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC"; do
+# shellcheck disable=SC2086 # EXTRA_SRC 刻意以空白分隔成多個檔案
+for f in Cargo.toml README.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC" $EXTRA_SRC; do
     [ -f "$f" ] || die "缺少 $f"
 done
 
@@ -108,6 +111,9 @@ install -m 644 "$SRC/README.md"          "$STAGE/$PKG/README.md"
 install -m 644 "/src/$PROTOCOL_SRC"     "$STAGE/$PKG/PROTOCOL.md"
 install -m 644 "$SRC/packaging/INSTALL.md" "$STAGE/$PKG/INSTALL.md"
 install -m 644 "$SRC/$UNIT_SRC"          "$STAGE/$PKG/$(basename "$UNIT_SRC")"
+for f in $EXTRA_SRC; do
+    install -m 644 "$SRC/$f" "$STAGE/$PKG/$(basename "$f")"
+done
 
 cd "$STAGE"
 tar --owner=0 --group=0 --numeric-owner --sort=name \
@@ -148,8 +154,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e EXAMPLE_SRC="$EXAMPLE_SRC" \
     -e EXAMPLE_DST="$EXAMPLE_DST" \
     -e UNIT_SRC="$UNIT_SRC" \
-    -e PROTOCOL_SRC="$PROTOCOL_SRC" \
-    -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+    -e PROTOCOL_SRC="$PROTOCOL_SRC"     -e EXTRA_SRC="$EXTRA_SRC"     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e HOST_UID="$HOST_UID" \
     -e HOST_GID="$HOST_GID" \
     "$IMAGE" sh -c "$INNER"

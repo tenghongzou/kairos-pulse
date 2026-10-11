@@ -11,7 +11,8 @@ publish = false
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
-fern = { version = "0.7", features = ["date-based"] }
+# 日誌按 UTC 日期分檔由 logger::DailyLogFile 處理（需要指定新檔案的權限），不使用 fern 的 date-based
+fern = "0.7"
 # 與 Pulse 共用的時鐘跳躍保護（workspace 內部 crate）
 date-guard = { path = "../crates/date-guard" }
 # 與 Pulse 共用的協定型別與驗證（workspace 內部 crate）

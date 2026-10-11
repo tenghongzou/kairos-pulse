@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::fsperm;
 use crate::registry::RegistrySnapshot;
 use crate::retention::{
     DateGuard, DatedFiles, GUARD_STATE_FILE, is_tmp_name_for, write_atomically,
@@ -192,9 +193,10 @@ pub fn split_by_date(
     groups
 }
 
-/// 建立資料目錄（啟動時呼叫，失敗即中止啟動），並刪除先前異常結束時留下的暫存檔
+/// 建立資料目錄（啟動時呼叫，失敗即中止啟動；Unix 上新建立的目錄為 0750），
+/// 並刪除先前異常結束時留下的暫存檔
 pub async fn prepare_data_dir(data_dir: &Path) -> Result<DataPaths, Error> {
-    fs::create_dir_all(data_dir).await.map_err(|e| {
+    fsperm::create_dir_all_async(data_dir).await.map_err(|e| {
         Error::new(
             e.kind(),
             format!("無法建立資料目錄 {}: {}", data_dir.display(), e),
@@ -214,27 +216,57 @@ pub async fn prepare_data_dir(data_dir: &Path) -> Result<DataPaths, Error> {
     Ok(DataPaths::new(data_dir))
 }
 
-/// 建立檔案所在的目錄（資料目錄在執行中被刪除時重建）
+/// 建立檔案所在的目錄（資料目錄在執行中被刪除時重建；Unix 上為 0750）
 async fn ensure_parent_dir(path: &Path) -> Result<(), Error> {
     match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => fs::create_dir_all(dir).await.map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("無法建立資料目錄 {}: {}", dir.display(), e),
-            )
-        }),
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            fsperm::create_dir_all_async(dir).await.map_err(|e| {
+                Error::new(
+                    e.kind(),
+                    format!("無法建立資料目錄 {}: {}", dir.display(), e),
+                )
+            })
+        }
         _ => Ok(()),
     }
 }
 
-/// 寫入前以 `fs::metadata` 檢查目前的 report 檔：檔案（或整個資料目錄）已被刪除時必須重新開檔，
-/// 否則資料會寫進已刪除的檔案而遺失。
+/// 寫入前檢查目前的 report 檔路徑是否仍指向開著的檔案：檔案（或整個資料目錄）已被刪除、
+/// 被換掉時必須重新開檔，否則資料會寫進已刪除的檔案而遺失，連線卻收到 `ack`。
 ///
-/// 除了 `NotFound`，`PermissionDenied` 也視為需要重開：Windows（含 FAT 與網路磁碟）上被刪除、
-/// 但仍有控制代碼開著的檔案處於 delete-pending 狀態，查詢時回 `ERROR_ACCESS_DENIED`。
+/// `path_meta` 為以路徑查詢（`fs::metadata`）的結果，`open_meta` 為開著的檔案控制代碼的查詢結果。
+/// 下列情況都要重新開檔（K-C3 與其延伸）：
+/// - 以路徑查詢失敗，不論原因：`NotFound`（已刪除）、`PermissionDenied`（Windows 上被刪除、但仍有
+///   控制代碼開著的檔案處於 delete-pending 狀態，查詢時回 `ERROR_ACCESS_DENIED`；FAT 與網路磁碟亦同）、
+///   `NotADirectory`（Linux 上資料目錄被換成同名檔案時回 `ENOTDIR`），以及其他無法確認檔案仍在的錯誤。
+///   無法確認時一律重開：重開成功就寫進正確的檔案；重開失敗則這批確定未寫入、回 `storage_unavailable`，
+///   不會在無法確認的情況下回 `ack`；
+/// - 路徑指向的不是一般檔案（例如被換成同名目錄）；
+/// - 無法查詢開著的控制代碼；
+/// - Unix 上路徑指向的檔案與開著的不是同一個（裝置與 inode 不同；例如檔案被刪除後又有同名的新檔案）。
+///
 /// 重開前會先關閉舊的控制代碼，讓刪除完成；若真的是權限問題，重開會失敗並回報錯誤。
-pub fn needs_reopen(metadata: &Result<std::fs::Metadata, Error>) -> bool {
-    matches!(metadata, Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied))
+pub fn needs_reopen(
+    path_meta: &Result<std::fs::Metadata, Error>,
+    open_meta: &Result<std::fs::Metadata, Error>,
+) -> bool {
+    match (path_meta, open_meta) {
+        (Ok(path), Ok(open)) => !path.is_file() || !same_file(path, open),
+        _ => true,
+    }
+}
+
+/// 兩份 metadata 是否屬於同一個檔案。Unix 比較裝置與 inode；其他平台無法以穩定的 API 比較，
+/// 視為相同（Windows 上被刪除的檔案在控制代碼關閉前，路徑查詢會回 `PermissionDenied`，已由上面處理）
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// 檔案非空且最後一個 byte 不是 `\n` 時（先前寫到一半失敗或程式中斷），需先補上換行，
@@ -243,17 +275,19 @@ pub fn needs_newline_repair(file_len: u64, last_byte: Option<u8>) -> bool {
     file_len > 0 && last_byte != Some(b'\n')
 }
 
-/// 以附加模式開啟 report 檔（必要時先建立資料目錄）；若結尾是殘缺的行，先補上 `\n`
+/// 以附加模式開啟 report 檔（必要時先建立資料目錄）；若結尾是殘缺的行，先補上 `\n`。
+/// Unix 上新檔案為 0640，既有的檔案收緊到最多 0640（S3）
 async fn open_reports_file(path: &Path) -> Result<BufWriter<File>, Error> {
     ensure_parent_dir(path).await?;
     let with_path = |e: Error| Error::new(e.kind(), format!("無法開啟 {}: {}", path.display(), e));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(with_path)?;
+    let mut file =
+        fsperm::private_tokio_options(OpenOptions::new().create(true).read(true).append(true))
+            .open(path)
+            .await
+            .map_err(with_path)?;
+    if let Err(e) = fsperm::restrict_open_tokio_file(&file).await {
+        warn!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
+    }
 
     let len = file.metadata().await.map_err(with_path)?.len();
     let last_byte = if len > 0 {
@@ -535,10 +569,15 @@ impl WriterState {
             if date > self.last_cleanup {
                 self.cleanup_now().await;
             }
-        } else if needs_reopen(&fs::metadata(&path).await) {
+        } else if let Some(file) = self.current.as_ref()
+            && needs_reopen(
+                &fs::metadata(&path).await,
+                &file.writer.get_ref().metadata().await,
+            )
+        {
             // 檔案或資料目錄在執行中被刪除：放棄舊的檔案控制代碼，重建後再寫
             warn!(
-                "{} 已不存在或正被刪除（檔案或資料目錄可能被刪除），重新建立",
+                "{} 已不存在、正被刪除或已被替換（檔案或資料目錄可能被刪除或換掉），重新開檔",
                 path.display()
             );
             self.current = None;
@@ -761,9 +800,16 @@ pub async fn write_agents_snapshot(
     // 資料目錄在執行中被刪除時重建
     ensure_parent_dir(&paths.agents).await?;
     let path = paths.agents.clone();
-    tokio::task::spawn_blocking(move || write_atomically(&path, &[&json]))
-        .await
-        .map_err(Error::other)?
+    tokio::task::spawn_blocking(move || {
+        write_atomically(&path, &[&json])?;
+        // 暫存檔依 umask 建立；更名後收緊到最多 0640（S3）。暫存檔存在的期間由資料目錄的 0750 保護
+        if let Err(e) = fsperm::restrict_path(&path) {
+            debug!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(Error::other)?
 }
 
 #[cfg(test)]
@@ -1102,17 +1148,106 @@ mod tests {
     }
 
     #[test]
-    fn reopen_only_when_file_is_gone() {
-        assert!(needs_reopen(&Err(Error::new(ErrorKind::NotFound, "gone"))));
-        // K-C3：Windows 上 delete-pending 的檔案回 ERROR_ACCESS_DENIED
-        assert!(needs_reopen(&Err(Error::new(
+    fn reopen_when_path_no_longer_refers_to_the_open_file() {
+        let exe = std::env::current_exe().unwrap();
+        let open = std::fs::File::open(&exe).unwrap().metadata();
+        let err = |kind| Err(Error::new(kind, "x"));
+        // 以路徑查詢失敗：不論原因都重開（Linux 的 NotADirectory、Windows delete-pending 的 PermissionDenied）
+        for kind in [
+            ErrorKind::NotFound,
             ErrorKind::PermissionDenied,
-            "denied"
-        ))));
-        assert!(!needs_reopen(&Err(Error::new(ErrorKind::TimedOut, "slow"))));
-        let meta = std::fs::metadata(std::env::current_exe().unwrap());
-        assert!(meta.is_ok());
-        assert!(!needs_reopen(&meta));
+            ErrorKind::NotADirectory,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(needs_reopen(&err(kind), &open), "{kind:?}");
+        }
+        // 無法查詢開著的控制代碼
+        assert!(needs_reopen(
+            &std::fs::metadata(&exe),
+            &err(ErrorKind::Other)
+        ));
+        // 路徑指向目錄
+        let dir = std::fs::metadata(exe.parent().unwrap());
+        assert!(needs_reopen(&dir, &open));
+        // 同一個檔案：不重開
+        assert!(!needs_reopen(&std::fs::metadata(&exe), &open));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn data_files_are_0640_and_new_dirs_0750() {
+        // S3：不依賴 umask，report 檔、agents.json 最多 0640，自行建立的資料目錄 0750
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let root = temp_dir("perm");
+        let dir = root.join("data");
+        let paths = prepare_data_dir(&dir).await.unwrap();
+        assert_eq!(mode(&dir), 0o750);
+
+        // 既有的寬鬆 report 檔在開啟時收緊
+        let path = dir.join(REPORT_FILES.file_name(noon().date_naive()));
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        assert_eq!(sink.write(record(1)).await, Ok(()));
+        assert_eq!(mode(&path), 0o640);
+
+        // 資料目錄在執行中被刪除後重建：目錄 0750、新檔案 0640
+        fs::remove_dir_all(&dir).await.unwrap();
+        assert_eq!(sink.write(record(2)).await, Ok(()));
+        assert_eq!(mode(&dir), 0o750);
+        assert_eq!(mode(&path), 0o640);
+        drop(sink);
+        handle.await.unwrap();
+
+        // agents.json
+        let snapshot = crate::registry::Registry::with_max_agents(1).snapshot(noon());
+        write_agents_snapshot(&paths, &snapshot).await.unwrap();
+        assert_eq!(mode(&paths.agents), 0o640);
+        fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopen_when_path_refers_to_a_different_file() {
+        // Unix：同名的新檔案（不同 inode）不是開著的那一個
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-storage-inode-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a");
+        std::fs::write(&path, b"old").unwrap();
+        let open = std::fs::File::open(&path).unwrap();
+        assert!(!needs_reopen(&std::fs::metadata(&path), &open.metadata()));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new").unwrap();
+        assert!(needs_reopen(&std::fs::metadata(&path), &open.metadata()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_reopens_when_report_file_is_replaced() {
+        // Unix：report 檔被刪除後立即出現同名的新檔案時，寫進新檔案而不是已刪除的那一個
+        let dir = temp_dir("replaced");
+        let path = dir.join(REPORT_FILES.file_name(noon().date_naive()));
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        assert_eq!(sink.write(record(1)).await, Ok(()));
+        fs::remove_file(&path).await.unwrap();
+        fs::write(&path, b"").await.unwrap();
+        assert_eq!(sink.write(record(2)).await, Ok(()));
+        assert_eq!(seqs_in(&path).await, [2]);
+        drop(sink);
+        handle.await.unwrap();
+        fs::remove_dir_all(&dir).await.unwrap();
     }
 
     #[tokio::test]

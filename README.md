@@ -99,7 +99,3 @@ Pulse：
 | `140db47` | `761f117` | init project Pulse |
 
 </details>
-
-## 已知問題
-
-- Linux 上 `kairos` 的 `storage::tests::write_failure_is_reported_to_the_sender` 失敗（合併前的原 repo 也一樣，只是之前沒有在 Linux 上執行過測試）：資料目錄被換成同名檔案時，Linux 的 `metadata` 回傳 `NotADirectory` 而非 `NotFound`，寫入工作沒有重新開檔，而是寫進已刪除的檔案並回報成功。將在後續批次修正，修正前 CI 的 ubuntu 測試會失敗。
