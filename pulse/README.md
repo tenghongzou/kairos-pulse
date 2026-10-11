@@ -7,7 +7,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 ## 功能特色
 
 - 🖥️ 收集系統資訊：CPU 使用率、記憶體（啟動時另印出一次系統資訊：磁碟、網路、元件溫度；`info` 等級略過虛擬檔案系統與虛擬網路介面）
-- 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON），預設**驗證伺服器憑證**（作業系統信任庫 + 自訂 CA；可設定為只信任自訂 CA）
+- 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON），預設**驗證伺服器憑證**（設定了自訂 CA `ca_cert` 時只信任它，否則使用作業系統信任庫；可明確設定同時信任兩者）
 - 🪪 每台主機有固定的 `agent_id`（UUID v4，存於 `agent.id`），換主機名稱也不影響識別
 - 💓 每秒送出 heartbeat，伺服器據此判斷上線 / 離線
 - 🔁 斷線自動重連：指數退避 + ±20% 抖動、有上限、不限次數
@@ -30,6 +30,12 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 | 舊版 Pulse（`44dcee5` 之前，即 `081f859` 及更早）連新版 Kairos | 舊版只把主機名稱中的控制字元替換成 `?`，`hostname` 含格式字元（Cf）時被以 `bad_request` 拒絕，**無法註冊**；舊版的讀取閒置固定為 `max(10 秒, 2 × min(heartbeat, report))`，心跳間隔較大時（例如 5 秒）小於「心跳間隔 + 伺服器最壞回應延遲 8 秒」，伺服器寫檔緩慢時**可能誤斷線** |
 | 第一輪修正版 Pulse（`44dcee5`）連新版 Kairos | 新版 Kairos 另外禁止 U+034F、Hangul filler、變體選擇字元與私用區（見「協定概述」），`44dcee5` 不會替換這些字元；主機名稱含這些字元時**無法註冊** |
 | 新版 Pulse 連舊版 Kairos（`572b955` 之前，`timeouts.write_secs` 沒有 6 秒上限） | Kairos 的 `timeouts.write_secs` 大於約 8 秒時，伺服器寫檔緩慢期間的回應延遲可能超過讀取閒置中的 10 秒餘裕，Pulse **誤判斷線**並重連 |
+
+### 本版的行為改變（升級前請確認）
+
+| 項目 | 舊行為 | 新行為 | 需要的處置 |
+|---|---|---|---|
+| 信任庫（`server.use_system_roots`） | 預設 `true`：設定了 `ca_cert` 時仍同時信任作業系統信任庫 | 預設不寫，依 `ca_cert` 決定：**設定了 `ca_cert` 時只信任 `ca_cert`**，未設定時信任作業系統信任庫；明確設定時以設定為準 | 依 INSTALL 部署（私有 CA）者不受影響。若設定了 `ca_cert`、但伺服器憑證其實由公開 CA 簽發（例如 `ca_cert` 只是為了額外信任某張憑證），升級後會以「伺服器憑證不受信任」無法連線：請在 `pulse.toml` 加上 `use_system_roots = true`。啟動日誌的「伺服器憑證信任來源：…」一行會說明實際採用的信任來源 |
 
 **部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
 
@@ -120,10 +126,10 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 
 - Kairos 使用 `cert.pem` / `key.pem`。
 - 每台 Pulse 設定 `server.ca_cert = "ca.pem"`、`server.domain = "kairos.example.com"`（以 IP 連線時填 IP，憑證 SAN 也要含該 IP）。
-- 建議同時設定 `server.use_system_roots = false`：Pulse 只信任 `ca_cert`，不再信任作業系統信任庫，避免任何公開 CA 簽發的同名憑證也被接受。
+- 設定了 `ca_cert` 時，Pulse 預設**只信任 `ca_cert`**，不信任作業系統信任庫（`server.use_system_roots` 未設定時的預設），避免任何公開 CA 簽發的同名憑證也被接受；不需要另外設定 `use_system_roots = false`。
 - 伺服器憑證到期時只要用 CA 重簽，Pulse 端不必改設定。
 - `ca.key` 是整個信任鏈的根，務必離線保存。
-- 由公開 CA 簽發的伺服器憑證不需要設定 `ca_cert`：Pulse 預設（`use_system_roots = true`）會自動信任作業系統的信任庫。
+- 由公開 CA 簽發的伺服器憑證不需要設定 `ca_cert`：沒有 `ca_cert` 時 Pulse 預設信任作業系統的信任庫。同時設定了 `ca_cert` 又需要信任公開 CA 時，明確設定 `server.use_system_roots = true`。
 
 ## 啟用 mTLS（客戶端憑證）
 
@@ -262,7 +268,7 @@ cargo run
 
 程式啟動後會：
 
-1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、`use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
+1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、明確設定 `use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）
 2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
 4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點，以及同一磁碟的重複掛載點（「磁碟名稱＋檔案系統＋總容量」相同者只列一次，保留路徑最短的掛載點，例如 systemd 沙箱的 `ReadWritePaths=`、`PrivateTmp=` bind mount 或 btrfs subvolume；磁碟名稱為空時不合併），網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`。磁碟容量以十進位單位顯示：1 GB 以上為 GB（小數 1 位，例如 `39.4 GB`），未滿 1 GB 為整數 MB（例如 `535 MB`）。取不到的系統名稱、核心版本、主機名稱等顯示「未知」；沒有溫度感測器（例如 VM）時印「未偵測到溫度感測器」
@@ -302,8 +308,8 @@ address = "127.0.0.1"          # 伺服器位址
 port = 8080                    # 伺服器連接埠
 domain = "localhost"           # TLS SNI / 憑證名稱驗證用的名稱（DNS 名稱或 IP；須與伺服器憑證 SAN 相符）
 accept_invalid_certs = false   # 是否略過伺服器憑證驗證（預設 false）
-ca_cert = ""                   # 額外信任的 CA / 自簽憑證 PEM（可含多張）；空字串 = 只用作業系統信任庫
-use_system_roots = true        # 是否信任作業系統信任庫；false 時只信任 ca_cert（此時 ca_cert 必填，accept_invalid_certs = true 時例外）
+ca_cert = ""                   # 信任的 CA / 自簽憑證 PEM（可含多張）；空字串 = 只用作業系統信任庫
+# use_system_roots = true      # 預設不寫：有 ca_cert 時只信任 ca_cert，沒有時信任作業系統信任庫；明確設定時以設定為準
 client_cert = ""               # mTLS 客戶端憑證 PEM（可接中繼 CA）；空字串 = 不出示客戶端憑證
 client_key = ""                # 對應私鑰 PEM（PKCS#8 / PKCS#1 / SEC1，不可加密）；須與 client_cert 同時設定
 
@@ -326,7 +332,16 @@ level = "info"                 # 日誌級別：trace / debug / info / warn / er
 retention_days = 14            # 日誌檔保留天數（今天與前 N 天）；0 = 永久保留
 ```
 
-`server.use_system_roots` 也可用環境變數 `PULSE__SERVER__USE_SYSTEM_ROOTS=false` 設定。
+`server.use_system_roots` 也可用環境變數設定（例如 `PULSE__SERVER__USE_SYSTEM_ROOTS=true`）。未設定時的預設值依 `ca_cert` 決定：
+
+| `ca_cert` | `use_system_roots` | 信任的伺服器憑證 |
+|---|---|---|
+| 未設定 | 未設定 | 作業系統信任庫 |
+| 已設定 | 未設定 | 只有 `ca_cert`（不信任作業系統信任庫） |
+| 已設定 | `true` | 作業系統信任庫 + `ca_cert` |
+| 任意 | `false` | 只有 `ca_cert`（`ca_cert` 必填） |
+
+啟動時以 `INFO` 記錄實際採用的信任來源，例如「伺服器憑證信任來源：只信任 server.ca_cert（…）」。
 
 ### 設定值範圍
 
@@ -344,13 +359,13 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `log.retention_days` | 0～3650 天 | 0 = 永久保留 |
 | `agent.id_file` | 非空字串 | |
 | `server.domain` | 有效的 DNS 名稱或 IP 位址，不可空白 | |
-| `server.use_system_roots` | `true` / `false` | `false` 時 `server.ca_cert` 必填，否則啟動即報錯（`accept_invalid_certs = true` 時不使用信任庫，不檢查此項） |
+| `server.use_system_roots` | `true` / `false` / 不設定 | 不設定時依 `ca_cert` 決定（見上表）；明確設為 `false` 時 `server.ca_cert` 必填，否則啟動即報錯（`accept_invalid_certs = true` 時不使用信任庫，不檢查此項） |
 | `server.client_cert` / `server.client_key` | 同時設定或同時留空 | 只設定一個時啟動即報錯 |
 
 ### ⚠️ 安全性提醒
 
 - `accept_invalid_certs` **預設為 `false`**，Pulse 會驗證伺服器憑證是否受信任、`server.domain` 是否與憑證 SAN 相符。
-- 使用自簽憑證或私有 CA 時，請用 `ca_cert` 指定要信任的憑證，**不要**改成 `accept_invalid_certs = true`；並建議設定 `use_system_roots = false`，只信任 `ca_cert`。
+- 使用自簽憑證或私有 CA 時，請用 `ca_cert` 指定要信任的憑證，**不要**改成 `accept_invalid_certs = true`；設定了 `ca_cert` 時預設只信任它，不需要另外設定 `use_system_roots`。
 - `accept_invalid_certs = true` 會略過伺服器憑證的信任鏈與名稱驗證，任何人都能冒充伺服器（中間人攻擊），僅限臨時除錯使用。啟用時啟動階段會以 `ERROR` 記錄警告（`log.level` 最高只能設為 `error`，因此一定看得到），每次連線時，連線當下（「已建立 TLS 加密連線」）與註冊成功時（「已向伺服器註冊」）各記一行 `WARN`，並標註「⚠️ 未驗證伺服器憑證」。握手簽章仍會正確驗證（確保對方持有該憑證的私鑰），但這無法防止中間人使用自己的憑證。若同時設定了 `ca_cert`，也會以 `ERROR` 警告 `ca_cert` 此時形同無效。
 - 未啟用 mTLS 時，`agent.id` 的內容就是本機在伺服器上的身分憑據，請妥善保護（見「agent.id」）。
 

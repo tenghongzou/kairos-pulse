@@ -27,12 +27,26 @@ pub struct ServerConfig {
     pub accept_invalid_certs: bool,
     /// 額外信任的 CA / 自簽憑證 PEM 路徑；空字串代表只用系統信任庫
     pub ca_cert: String,
-    /// 是否信任作業系統信任庫；false 時只信任 `ca_cert`（此時 `ca_cert` 必填）
-    pub use_system_roots: bool,
+    /// 是否信任作業系統信任庫；`None`（未設定）時依是否設定了 `ca_cert` 決定，
+    /// 見 [`ServerConfig::trusts_system_roots`]。明確設為 false 時 `ca_cert` 必填
+    #[serde(default)]
+    pub use_system_roots: Option<bool>,
     /// 客戶端憑證 PEM 路徑（mTLS，可含中繼 CA 鏈）；空字串代表不出示客戶端憑證
     pub client_cert: String,
     /// 客戶端憑證私鑰 PEM 路徑（PKCS#8 / PKCS#1 / SEC1，不可加密）；須與 `client_cert` 成對設定
     pub client_key: String,
+}
+
+impl ServerConfig {
+    /// 實際是否信任作業系統信任庫（S5）：
+    ///
+    /// - 明確設定 `use_system_roots` 時以設定為準；
+    /// - 未設定時：設定了 `ca_cert`（私有 CA 部署）→ `false`，只信任 `ca_cert`，
+    ///   避免任何公開 CA 簽發的同名憑證也被接受；沒有 `ca_cert` → `true`（公開 CA 簽發的伺服器憑證）。
+    pub fn trusts_system_roots(&self) -> bool {
+        self.use_system_roots
+            .unwrap_or_else(|| self.ca_cert.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,8 +204,9 @@ impl AppConfig {
                 "retry.max_delay 不可小於 retry.initial_delay".to_string(),
             ));
         }
-        // accept_invalid_certs = true 時不使用信任庫，不需要 ca_cert
-        if !self.server.use_system_roots
+        // accept_invalid_certs = true 時不使用信任庫，不需要 ca_cert。
+        // 未明確設定 use_system_roots 時，沒有 ca_cert 就一定信任系統信任庫，不會走到這裡
+        if !self.server.trusts_system_roots()
             && self.server.ca_cert.trim().is_empty()
             && !self.server.accept_invalid_certs
         {
@@ -258,7 +273,9 @@ mod tests {
         assert_eq!(cfg.server.domain, "localhost");
         assert!(!cfg.server.accept_invalid_certs);
         assert_eq!(cfg.server.ca_cert, "");
-        assert!(cfg.server.use_system_roots);
+        // S5：預設不寫死，依是否設定 ca_cert 決定
+        assert_eq!(cfg.server.use_system_roots, None);
+        assert!(cfg.server.trusts_system_roots());
         assert_eq!(cfg.retry.max_retries, 5);
         assert_eq!(cfg.retry.initial_delay, 2);
         assert_eq!(cfg.retry.max_delay, 60);
@@ -350,7 +367,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.server.port, 9000);
-        assert!(!cfg.server.use_system_roots);
+        assert_eq!(cfg.server.use_system_roots, Some(false));
         assert_eq!(cfg.report.interval, 30);
         assert_eq!(cfg.log.retention_days, 7);
         // 非數字的數值欄位仍是錯誤
@@ -471,7 +488,7 @@ mod tests {
             ])),
         )
         .unwrap();
-        assert!(!cfg.server.use_system_roots);
+        assert!(!cfg.server.trusts_system_roots());
         assert_eq!(cfg.server.ca_cert, "ca.pem");
 
         // accept_invalid_certs = true 時不檢查信任庫，可不設 ca_cert
@@ -483,6 +500,72 @@ mod tests {
             ])),
         )
         .unwrap();
-        assert!(!cfg.server.use_system_roots && cfg.server.accept_invalid_certs);
+        assert!(!cfg.server.trusts_system_roots() && cfg.server.accept_invalid_certs);
+    }
+
+    #[test]
+    fn system_roots_default_depends_on_ca_cert() {
+        // S5：未明確設定 use_system_roots 時，有 ca_cert 就只信任 ca_cert
+        let cfg =
+            AppConfig::build(None, Some(env(&[("PULSE__SERVER__CA_CERT", "ca.pem")]))).unwrap();
+        assert_eq!(cfg.server.use_system_roots, None);
+        assert!(!cfg.server.trusts_system_roots());
+        // 只有空白視同未設定 ca_cert → 信任系統信任庫
+        let cfg = AppConfig::build(None, Some(env(&[("PULSE__SERVER__CA_CERT", "  ")]))).unwrap();
+        assert!(cfg.server.trusts_system_roots());
+        // 明確設定時以設定為準（含環境變數的字串）
+        for (value, expected) in [("true", true), ("false", false)] {
+            let cfg = AppConfig::build(
+                None,
+                Some(env(&[
+                    ("PULSE__SERVER__CA_CERT", "ca.pem"),
+                    ("PULSE__SERVER__USE_SYSTEM_ROOTS", value),
+                ])),
+            )
+            .unwrap();
+            assert_eq!(cfg.server.use_system_roots, Some(expected));
+            assert_eq!(cfg.server.trusts_system_roots(), expected, "{value}");
+        }
+        // 沒有 ca_cert 時明確設定 true 也可以；不是布林值則報錯
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[("PULSE__SERVER__USE_SYSTEM_ROOTS", "true")])),
+        )
+        .unwrap();
+        assert!(cfg.server.trusts_system_roots());
+        assert!(
+            AppConfig::build(
+                None,
+                Some(env(&[("PULSE__SERVER__USE_SYSTEM_ROOTS", "maybe")]))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn system_roots_from_pulse_toml() {
+        // pulse.toml 只寫 ca_cert（INSTALL 的範例去掉 use_system_roots）→ 只信任 ca_cert；
+        // 寫明 use_system_roots = true → 同時信任系統信任庫
+        let dir = std::env::temp_dir()
+            .join("pulse-config-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pulse.toml");
+        let load = |content: &str| {
+            std::fs::write(&file, content).unwrap();
+            AppConfig::build(Some(file.to_str().unwrap()), Some(Map::new())).unwrap()
+        };
+        assert!(
+            !load("[server]\nca_cert = \"ca.pem\"\n")
+                .server
+                .trusts_system_roots()
+        );
+        assert!(
+            load("[server]\nca_cert = \"ca.pem\"\nuse_system_roots = true\n")
+                .server
+                .trusts_system_roots()
+        );
+        assert!(load("[server]\nport = 9000\n").server.trusts_system_roots());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1774,7 +1774,7 @@ mod tests {
             domain: "localhost".into(),
             accept_invalid_certs: true,
             ca_cert: String::new(),
-            use_system_roots: false,
+            use_system_roots: Some(false),
             client_cert: String::new(),
             client_key: String::new(),
         })

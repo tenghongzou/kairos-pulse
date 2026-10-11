@@ -161,13 +161,12 @@ install -o root -g pulse -m 640 /dev/null /opt/pulse/pulse.toml
 address = "monitor.example.com"   # Kairos 的位址（主機名稱或 IP）
 port = 8080
 domain = "monitor.example.com"    # 必須是 Kairos 伺服器憑證 SAN 中的名稱
-ca_cert = "ca.pem"                # 伺服器 CA
-use_system_roots = false          # 只信任 ca_cert
+ca_cert = "ca.pem"                # 伺服器 CA；設定後預設只信任它，不信任作業系統信任庫
 client_cert = "client.pem"        # mTLS（5.3 的情況下刪掉這兩行）
 client_key = "client.key"
 ```
 
-相對路徑以工作目錄 `/opt/pulse` 解析。心跳、回報間隔等其他欄位維持預設即可（見 `README.md`「設定」）。
+相對路徑以工作目錄 `/opt/pulse` 解析。設定了 `ca_cert` 時 Pulse 預設只信任它（`server.use_system_roots` 不必設定；舊版範例中的 `use_system_roots = false` 可以保留，效果相同）。心跳、回報間隔等其他欄位維持預設即可（見 `README.md`「設定」）。
 
 ### 6.1 檔案權限
 
@@ -398,6 +397,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 ```
 
 - `agent.id`、憑證與 `pulse.toml` 沿用，不需要重新簽發。
+- 升級前請看 `README.md`「升級注意事項」中「本版的行為改變」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`。
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。
 - 回滾：`mv /opt/pulse/pulse.prev /opt/pulse/pulse && systemctl restart pulse`。
