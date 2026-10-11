@@ -37,7 +37,7 @@ ExecStart=/opt/pulse/pulse
 
 # 日誌只保留 logs/pulse-YYYY-MM-DD.log 一份（Pulse 的日誌寫到 stdout 與 logs/）。
 # stderr 仍進 journal：設定錯誤、日誌初始化失敗、panic 等「日誌檔還沒開好就發生」的
-# 錯誤都寫在 stderr，`journalctl -u pulse` 仍看得到。需要人工處理的持續性錯誤（憑證被撤銷、
+# 錯誤都寫在 stderr，`journalctl -u pulse` 仍看得到；憑證錯誤等使 Pulse 結束的原因也另寫一行。需要人工處理的持續性錯誤（憑證被撤銷、
 # auth_failed、狀態表已滿、本機憑證過期等）也會以 err 等級另寫一行到 stderr（同一原因每
 # 10 分鐘最多一行），`journalctl -u pulse -p err` 可篩選。理由見 INSTALL.md。
 StandardOutput=null
@@ -46,12 +46,15 @@ StandardError=journal
 # 正常結束：送出 close_notify 後約 1 秒內結束；再送一次訊號會以 130 強制結束
 KillSignal=SIGINT
 TimeoutStopSec=10
-# Pulse 本身會無限重連；這裡處理取樣任務異常、憑證或 agent.id 無法載入等以非 0 結束的情況。
-# 設定錯誤（pulse.toml 語法、型別、範圍錯誤等）以結束代碼 3 結束，重試也不會成功，
-# 不重新啟動；修正設定後執行 systemctl restart pulse
+# Pulse 本身會無限重連；這裡處理取樣任務異常等內部錯誤（結束代碼 1）。
+# 重試也不會成功的錯誤不重新啟動，服務停在 failed，修正後執行 systemctl restart pulse：
+#   2 用法錯誤（ExecStart 的命令列參數）
+#   3 設定錯誤（pulse.toml、PULSE__* 環境變數的語法、型別、範圍錯誤等）
+#   4 憑證錯誤（ca_cert、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，SAN 與 agent_id 不符，
+#     agent.id 無法讀取或內容不合法）
 Restart=always
 RestartSec=10
-RestartPreventExitStatus=3
+RestartPreventExitStatus=2 3 4
 
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict

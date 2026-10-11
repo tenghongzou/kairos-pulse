@@ -312,47 +312,84 @@ pub(crate) async fn accept_loop(
     Ok(connections)
 }
 
-/// 設定錯誤的結束代碼：設定檔無法載入或驗證不通過、`auth.allow_unauthenticated` 未設定卻
-/// 未啟用 mTLS 監聽對外位址（S1）等，重試也不會成功的錯誤。
-///
-/// 依設計包 `design/design-system/cli-style.md` §8（`kairos` 與 `pulse` 共用的結束代碼表：
-/// 常駐模式啟動時的設定錯誤為 3），不使用 sysexits 的 `EX_CONFIG`（78）。
-/// `packaging/kairos.service` 以 `RestartPreventExitStatus=3` 讓 systemd 不再重試。
+// ---- 結束代碼 ----
+//
+// 依設計包 `design/design-system/cli-style.md` §8（`kairos` 與 `pulse` 共用的結束代碼表）。
+// 常駐模式只用到下列代碼，另有正常結束 0、第二次收到關機訊號時的 130（`shutdown::FORCED_EXIT_CODE`）。
+// 不使用 sysexits（64、78 等）。`packaging/kairos.service` 以 `RestartPreventExitStatus` 讓 systemd
+// 不重試「重試也不會成功」的代碼（2、3、4）。
+
+/// 一般錯誤：內部錯誤（背景工作異常、看門狗強制結束）與未分類的啟動失敗（例如資料目錄、
+/// 日誌目錄無法建立），交由服務管理員重新啟動
+const EXIT_GENERAL: u8 = 1;
+/// 用法錯誤：命令列參數無法辨識、`--config` 缺少路徑或重複指定
+const EXIT_USAGE: u8 = 2;
+/// 設定錯誤：設定檔無法載入或驗證不通過、`auth.allow_unauthenticated` 未設定卻未啟用 mTLS
+/// 監聽對外位址（S1）等
 const EXIT_CONFIG: u8 = 3;
+/// 憑證錯誤：伺服器憑證、私鑰、客戶端 CA 或 CRL 無法讀取、格式錯誤或不成對
+const EXIT_CERT: u8 = 4;
+/// 衝突：`server.listen` 的連接埠已被佔用（例如另一個 Kairos 仍在執行）。
+/// 舊的行程結束後重試可能成功，因此不列入 `RestartPreventExitStatus`
+const EXIT_CONFLICT: u8 = 11;
 
-/// 標記為設定錯誤的 [`Error`] 內容（結束代碼 [`EXIT_CONFIG`]）；訊息與 `kind` 不變
+/// 帶有結束代碼的 [`Error`] 內容；訊息與 `kind` 不變
 #[derive(Debug)]
-struct ConfigError(Error);
+struct Classified {
+    code: u8,
+    inner: Error,
+}
 
-impl std::fmt::Display for ConfigError {
+impl std::fmt::Display for Classified {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.inner.fmt(f)
     }
 }
 
-impl std::error::Error for ConfigError {
+impl std::error::Error for Classified {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
+        self.inner.source()
     }
 }
 
-/// 把錯誤標記為設定錯誤（保留原本的 `kind` 與訊息）
+/// 為錯誤標上結束代碼（保留原本的 `kind` 與訊息）
+fn classify(e: Error, code: u8) -> Error {
+    Error::new(e.kind(), Classified { code, inner: e })
+}
+
+/// 標記為設定錯誤（[`EXIT_CONFIG`]）
 fn config_error(e: Error) -> Error {
-    Error::new(e.kind(), ConfigError(e))
+    classify(e, EXIT_CONFIG)
 }
 
-/// 是否為 [`config_error`] 標記過的設定錯誤
-fn is_config_error(e: &Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<ConfigError>())
+/// 標記為憑證錯誤（[`EXIT_CERT`]）
+fn cert_error(e: Error) -> Error {
+    classify(e, EXIT_CERT)
 }
 
-/// `run` 的結果對應的結束代碼：正常關機 0；設定錯誤 [`EXIT_CONFIG`]；
-/// 因內部錯誤而關機或其他啟動失敗 1（交由服務管理員重新啟動）
+/// 監聽失敗：連接埠被佔用時標記為衝突（[`EXIT_CONFLICT`]），其他原因不標記（[`EXIT_GENERAL`]）
+fn listen_error(e: Error) -> Error {
+    if e.kind() == ErrorKind::AddrInUse {
+        classify(e, EXIT_CONFLICT)
+    } else {
+        e
+    }
+}
+
+/// 錯誤上標記的結束代碼（未標記時為 `None`）
+fn classified_code(e: &Error) -> Option<u8> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<Classified>())
+        .map(|c| c.code)
+}
+
+/// `run` 的結果對應的結束代碼：正常關機 0；標記過的啟動失敗為其代碼（3、4、11）；
+/// 因內部錯誤而關機或其他啟動失敗 [`EXIT_GENERAL`]（交由服務管理員重新啟動）
 fn exit_code(result: &Result<Option<String>, Error>) -> u8 {
     match result {
         Ok(None) => 0,
-        Err(e) if is_config_error(e) => EXIT_CONFIG,
-        Ok(Some(_)) | Err(_) => 1,
+        Err(e) => classified_code(e).unwrap_or(EXIT_GENERAL),
+        Ok(Some(_)) => EXIT_GENERAL,
     }
 }
 
@@ -371,7 +408,7 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("{}\n\n{}", e, USAGE);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_USAGE);
         }
     };
 
@@ -396,7 +433,7 @@ fn main() -> ExitCode {
         Ok(newest) => newest,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
 
@@ -407,7 +444,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             error!("Kairos 啟動失敗: 無法建立 tokio runtime: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
     let result = runtime.block_on(run(
@@ -544,7 +581,7 @@ async fn run(
         crls: config.auth.crl_paths(),
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
-    let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths)?));
+    let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths).map_err(cert_error)?));
     // 伺服器憑證與 CRL 的到期預警（O1）：啟動時檢查一次，之後由重載工作（或停用重載時的定期工作）檢查
     let mut expiry_warner = expiry::ExpiryWarner::new(config.expiry_policy());
     expiry_warner.check_and_log(&tls_state.current().expiries, true);
@@ -599,10 +636,10 @@ async fn run(
     let listener = TcpListener::bind(&config.server.listen)
         .await
         .map_err(|e| {
-            Error::new(
+            listen_error(Error::new(
                 e.kind(),
                 format!("無法監聽 {}: {}", config.server.listen, e),
-            )
+            ))
         })?;
     let local_addr = listener
         .local_addr()
@@ -977,30 +1014,104 @@ Max open files            1024                 524288               files     \n
         );
         assert_eq!(exit_code(&result), 1);
 
-        // 啟動失敗（憑證不存在）：結束代碼 1
+        // 其他啟動失敗（資料目錄無法建立：路徑是一個檔案）：結束代碼 1
         let (opts, _) = run_options(&dir);
         let mut bad = run_config(&dir);
-        bad.server.cert_path = dir.join("missing.crt").to_string_lossy().into_owned();
+        std::fs::write(dir.join("not-a-dir"), b"x").unwrap();
+        bad.storage.data_dir = dir.join("not-a-dir").to_string_lossy().into_owned();
         let result = run(bad, None, None, opts).await;
         assert!(result.is_err());
-        assert_eq!(exit_code(&result), 1);
+        assert_eq!(exit_code(&result), EXIT_GENERAL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_classifies_certificate_and_listen_errors() {
+        // cli-style.md §8：伺服器憑證、私鑰、客戶端 CA、CRL 的問題為 4；連接埠被佔用為 11
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-run-codes-{}-{}",
+            std::process::id(),
+            next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(dir.join("not-pem.txt"), b"not a pem file\n").unwrap();
+        std::fs::write(dir.join("ca.pem"), test_pki::CA).unwrap();
+        let other_key = concat!(env!("CARGO_MANIFEST_DIR"), "/../pulse/testdata/server.key");
+
+        // (情境, 修改設定)
+        let mut cases: Vec<(&str, AppConfig)> = Vec::new();
+        let mut c = run_config(&dir);
+        c.server.cert_path = path("missing.pem");
+        cases.push(("伺服器憑證不存在", c));
+        let mut c = run_config(&dir);
+        c.server.key_path = path("not-pem.txt");
+        cases.push(("私鑰不是 PEM", c));
+        let mut c = run_config(&dir);
+        c.server.key_path = other_key.into();
+        cases.push(("私鑰與憑證不成對", c));
+        let mut c = run_config(&dir);
+        c.auth.client_ca = path("missing.pem");
+        cases.push(("客戶端 CA 不存在", c));
+        let mut c = run_config(&dir);
+        c.auth.client_ca = path("ca.pem");
+        c.auth.crl = vec![path("missing.pem")];
+        cases.push(("CRL 不存在", c));
+        for (what, config) in cases {
+            let (opts, _) = run_options(&dir);
+            let result = run(config, None, None, opts).await;
+            assert!(result.is_err(), "{what}: {result:?}");
+            assert_eq!(exit_code(&result), EXIT_CERT, "{what}: {result:?}");
+        }
+
+        // 連接埠已被佔用
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = run_config(&dir);
+        config.server.listen = occupied.local_addr().unwrap().to_string();
+        let (opts, _) = run_options(&dir);
+        let result = run(config, None, None, opts).await;
+        let err = result.as_ref().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AddrInUse, "{err}");
+        assert!(err.to_string().contains("無法監聽"), "{err}");
+        assert_eq!(exit_code(&result), EXIT_CONFLICT);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn config_errors_keep_kind_and_message() {
+    fn classified_errors_keep_kind_and_message() {
         let e = config_error(Error::new(ErrorKind::InvalidInput, "設定值超出範圍"));
-        assert!(is_config_error(&e));
+        assert_eq!(classified_code(&e), Some(EXIT_CONFIG));
         assert_eq!(e.kind(), ErrorKind::InvalidInput);
         assert_eq!(e.to_string(), "設定值超出範圍");
         assert_eq!(exit_code(&Err(e)), EXIT_CONFIG);
-        assert!(!is_config_error(&Error::other("x")));
-        assert!(!is_config_error(&Error::from(ErrorKind::NotFound)));
+
+        let e = cert_error(Error::new(ErrorKind::NotFound, "找不到憑證"));
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        assert_eq!(e.to_string(), "找不到憑證");
+        assert_eq!(exit_code(&Err(e)), EXIT_CERT);
+
+        // 只有「連接埠被佔用」標記為衝突
+        assert_eq!(
+            exit_code(&Err(listen_error(Error::from(ErrorKind::AddrInUse)))),
+            EXIT_CONFLICT
+        );
+        assert_eq!(
+            exit_code(&Err(listen_error(Error::from(ErrorKind::AddrNotAvailable)))),
+            EXIT_GENERAL
+        );
+
+        // 未標記的錯誤：1
+        assert_eq!(classified_code(&Error::other("x")), None);
+        assert_eq!(classified_code(&Error::from(ErrorKind::NotFound)), None);
+        assert_eq!(exit_code(&Err(Error::other("x"))), EXIT_GENERAL);
+        assert_eq!(exit_code(&Ok(Some("內部錯誤".into()))), EXIT_GENERAL);
+        assert_eq!(exit_code(&Ok(None)), 0);
     }
 
     #[test]
-    fn unit_does_not_restart_on_config_errors() {
-        // kairos.service 的 RestartPreventExitStatus 必須與 EXIT_CONFIG 一致
+    fn unit_does_not_restart_when_retrying_cannot_help() {
+        // kairos.service 的 RestartPreventExitStatus 必須恰好是用法、設定、憑證錯誤（2、3、4）；
+        // 一般錯誤（1）與連接埠衝突（11）仍交由 systemd 重新啟動
         let unit = include_str!("../packaging/kairos.service");
         let line = unit
             .lines()
@@ -1009,7 +1120,8 @@ Max open files            1024                 524288               files     \n
         let codes: Vec<&str> = line["RestartPreventExitStatus=".len()..]
             .split_whitespace()
             .collect();
-        assert!(codes.contains(&EXIT_CONFIG.to_string().as_str()), "{line}");
+        let expected = [EXIT_USAGE, EXIT_CONFIG, EXIT_CERT].map(|c| c.to_string());
+        assert_eq!(codes, expected, "{line}");
         assert!(unit.lines().any(|l| l.trim() == "Restart=on-failure"));
     }
 

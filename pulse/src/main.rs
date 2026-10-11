@@ -39,12 +39,51 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 /// 過期日誌檔的清除間隔。
 const LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// 設定錯誤（`AppConfig::load` 失敗：設定檔語法、型別、範圍錯誤等）的結束代碼。
-///
-/// 依設計包 `design/pulse/cli-spec.md` §1.3（`pulse`／`pulse run` 常駐：3 啟動時設定錯誤）與
-/// `design/design-system/cli-style.md` §8，不使用 sysexits 的 `EX_CONFIG`（78）。
-/// `packaging/pulse.service` 以 `RestartPreventExitStatus=3` 讓 systemd 不再重試。
+// ---- 結束代碼 ----
+//
+// 依設計包 `design/pulse/cli-spec.md` §1.3（`pulse`／`pulse run` 常駐）與
+// `design/design-system/cli-style.md` §8（`kairos` 與 `pulse` 共用的結束代碼表）。
+// 另有正常結束 0、第二次收到結束訊號時的 130（`shutdown::FORCED_EXIT_CODE`）。不使用 sysexits。
+// `packaging/pulse.service` 以 `RestartPreventExitStatus` 讓 systemd 不重試「重試也不會成功」的
+// 代碼（2、3、4）。
+
+/// 一般錯誤：內部錯誤（收集任務異常結束等）與未分類的啟動失敗（例如日誌目錄無法建立、
+/// 無法取得主機名稱），交由服務管理員重新啟動
+const EXIT_GENERAL: u8 = 1;
+/// 用法錯誤：未知的命令列參數
+const EXIT_USAGE: u8 = 2;
+/// 設定錯誤（`AppConfig::load` 失敗：設定檔語法、型別、範圍錯誤等）
 const EXIT_CONFIG: u8 = 3;
+/// 憑證錯誤：`server.ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，
+/// 客戶端憑證的 SAN 與 agent_id 不符，或 `agent.id` 無法讀取、內容不合法
+const EXIT_CERT: u8 = 4;
+
+/// 啟動失敗或異常結束的原因與對應的結束代碼
+#[derive(Debug, PartialEq, Eq)]
+struct Failure {
+    code: u8,
+    message: String,
+}
+
+impl Failure {
+    /// 憑證錯誤（[`EXIT_CERT`]）
+    fn cert(message: String) -> Self {
+        Self {
+            code: EXIT_CERT,
+            message,
+        }
+    }
+}
+
+/// 未分類的錯誤訊息一律是一般錯誤（[`EXIT_GENERAL`]）
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            code: EXIT_GENERAL,
+            message,
+        }
+    }
+}
 
 fn setup_logger(log_level: LevelFilter) -> Result<(), fern::InitError> {
     // 確保日誌目錄存在
@@ -177,7 +216,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(e) => {
             eprintln!("錯誤：{e}\n\n{}", cli::USAGE);
-            return ExitCode::from(2);
+            return ExitCode::from(EXIT_USAGE);
         }
     };
     if command == cli::Command::Help {
@@ -212,7 +251,7 @@ fn main() -> ExitCode {
     // 初始化日誌
     if let Err(e) = setup_logger(config.log.level_filter()) {
         eprintln!("錯誤：無法初始化日誌：{e}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(EXIT_GENERAL);
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
     retention.run();
@@ -226,7 +265,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             error!("無法建立 tokio runtime：{e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
     let code = runtime.block_on(async_main(config, retention));
@@ -253,7 +292,7 @@ fn print_agent_id(config: &AppConfig) -> ExitCode {
         }
         Err(e) => {
             eprintln!("錯誤：{e}");
-            ExitCode::FAILURE
+            ExitCode::from(EXIT_GENERAL)
         }
     }
 }
@@ -267,7 +306,7 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
         Ok(s) => s,
         Err(e) => {
             error!("{e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
     let shutdown = CancellationToken::new();
@@ -303,9 +342,12 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
             info!("Pulse 已結束");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            error!("{e}");
-            ExitCode::FAILURE
+        Err(failure) => {
+            error!("{}", failure.message);
+            // 日誌只寫到 stdout 與 logs/（pulse.service 為 StandardOutput=null）；以非 0 結束的原因
+            // 另寫一行到 stderr，`journalctl -u pulse` 看得到服務為何停在 failed（例如憑證錯誤 4）
+            service_status::attention(&failure.message.replace(['\r', '\n'], " "));
+            ExitCode::from(failure.code)
         }
     }
 }
@@ -327,12 +369,13 @@ where
 /// 日誌初始化後的主流程。
 ///
 /// 正常情況下會一直執行到 `shutdown` 被觸發後返回 `Ok(())`；
-/// 啟動失敗或背景任務異常結束時回傳 `Err`，程式以非 0 結束。
+/// 啟動失敗或背景任務異常結束時回傳 `Err`，程式以其中的結束代碼結束
+/// （憑證與 `agent.id` 的問題為 [`EXIT_CERT`]，其餘為 [`EXIT_GENERAL`]）。
 async fn run(
     config: AppConfig,
     retention: log_files::LogRetention,
     shutdown: CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     // 完整版本字串（含 commit）；hello 的 agent_version 仍只送 CARGO_PKG_VERSION
     info!("Pulse 地端程式啟動（{}）...", cli::VERSION);
     let cwd = std::env::current_dir().ok();
@@ -351,7 +394,7 @@ async fn run(
     else {
         return Ok(());
     };
-    let tls = tls.map_err(|e| format!("啟動失敗：{e}"))?;
+    let tls = tls.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
 
     // agent_id：讀檔沿用，不存在則產生；格式不合法則結束（檔案 I/O 放到 blocking 執行緒）
     let id_path = PathBuf::from(&config.agent.id_file);
@@ -365,7 +408,7 @@ async fn run(
     else {
         return Ok(());
     };
-    let (agent_id, created) = loaded.map_err(|e| format!("啟動失敗：{e}"))?;
+    let (agent_id, created) = loaded.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
     if let Some(warning) = permission_warning {
         warn!("{warning}");
     }
@@ -379,7 +422,7 @@ async fn run(
     }
     // 客戶端憑證的 SAN 必須是 DNS:<agent_id>，否則伺服器會以 auth_failed 拒絕：啟動時就檢查
     tls.verify_client_cert_identity(&agent_id)
-        .map_err(|e| format!("啟動失敗：{e}"))?;
+        .map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
 
     // 印出一次完整系統資訊。內含約 200 ms 的阻塞 sleep 與大量系統呼叫（可能很慢），
     // 放到 blocking 執行緒，且收到 Ctrl+C 時不等它完成。
@@ -412,7 +455,7 @@ async fn run(
             if shutdown.is_cancelled() {
                 Ok(())
             } else {
-                Err("連線任務意外結束".to_string())
+                Err("連線任務意外結束".to_string().into())
             }
         }
         // 收集 task 正常情況下不會結束；結束或 panic 時讓整個程式以非 0 結束，交由服務管理員重啟
@@ -420,7 +463,8 @@ async fn run(
             Ok(()) => "系統資訊收集任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("系統資訊收集任務發生 panic：{e}"),
             Err(e) => format!("系統資訊收集任務異常結束：{e}"),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -429,9 +473,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unit_does_not_restart_on_config_errors() {
-        // pulse.service 的 RestartPreventExitStatus 必須與 EXIT_CONFIG 一致；
-        // 用法錯誤（2）、正常結束（0）以外的結束代碼仍由 Restart=always 重新啟動
+    fn unit_does_not_restart_when_retrying_cannot_help() {
+        // pulse.service 的 RestartPreventExitStatus 必須恰好是用法、設定、憑證錯誤（2、3、4）；
+        // 其他非 0 的結束代碼（一般錯誤 1、強制結束 130）仍由 Restart=always 重新啟動
         let unit = include_str!("../packaging/pulse.service");
         let line = unit
             .lines()
@@ -440,7 +484,25 @@ mod tests {
         let codes: Vec<&str> = line["RestartPreventExitStatus=".len()..]
             .split_whitespace()
             .collect();
-        assert_eq!(codes, [EXIT_CONFIG.to_string().as_str()], "{line}");
+        let expected = [EXIT_USAGE, EXIT_CONFIG, EXIT_CERT].map(|c| c.to_string());
+        assert_eq!(codes, expected, "{line}");
+        assert!(unit.lines().any(|l| l.trim() == "Restart=always"));
+    }
+
+    #[test]
+    fn failures_carry_exit_codes() {
+        // cli-spec.md §1.3：未分類的錯誤為 1，憑證與 agent.id 的問題為 4
+        let general: Failure = "系統資訊收集任務意外結束".to_string().into();
+        assert_eq!(general.code, EXIT_GENERAL);
+        assert_eq!(general.message, "系統資訊收集任務意外結束");
+        let cert = Failure::cert("啟動失敗：找不到憑證".to_string());
+        assert_eq!(cert.code, EXIT_CERT);
+        assert_eq!(cert.message, "啟動失敗：找不到憑證");
+        // 與設計包的代碼表一致
+        assert_eq!(
+            [EXIT_GENERAL, EXIT_USAGE, EXIT_CONFIG, EXIT_CERT],
+            [1, 2, 3, 4]
+        );
     }
 
     /// 文字中是否有「共 N 個」或「N 個測試」這類寫死的數量。
