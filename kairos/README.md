@@ -24,7 +24,7 @@
 - 使用 rustls（`ring` 加密後端），支援 TLS 1.2 與 TLS 1.3；私鑰支援 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
-- 設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）以結束代碼 **3** 結束（依設計包 `cli-style.md` §8 的結束代碼表）；`kairos.service` 以 `RestartPreventExitStatus=3` 讓 systemd 不再反覆重試
+- 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試
 - 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除
 - 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP；啟用 mTLS 時 agent 的上線、離線等事件改依 `agent_id`）節流，每 10 秒最多一行並附上略過的則數，未啟用 mTLS 時另列出被略過的 agent_id（見「日誌」的節流說明）
 
@@ -40,7 +40,7 @@
 完整的變更與升級步驟見 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）；以下是 Kairos 需要先處理的項目。
 
 - **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 3（設定錯誤）結束；新版 `kairos.service` 的 `RestartPreventExitStatus=3` 讓 systemd 不再反覆重試（沿用舊版 unit 時仍會依 `Restart=on-failure` 每 5 秒重試並失敗，請一併換上新版 unit）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
-- **設定錯誤的結束代碼由 1 改為 3**：設定檔無法載入或驗證不通過、上述拒絕啟動，都以結束代碼 3 結束（舊版為 1），`kairos.service` 新增 `RestartPreventExitStatus=3`，systemd 不再對設定錯誤無限重試；修正設定後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、命令列參數錯誤（1）、第二次訊號強制結束（130）不變。
+- **啟動失敗的結束代碼依原因區分**（舊版一律為 1）：命令列參數錯誤 2、設定錯誤 3（設定檔無法載入或驗證不通過、上述拒絕啟動）、憑證錯誤 4（伺服器憑證、私鑰、client CA、CRL）、連接埠已被佔用 11。`kairos.service` 新增 `RestartPreventExitStatus=2 3 4`，systemd 不再對這些錯誤無限重試；修正後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、其他啟動失敗（1）、第二次訊號強制結束（130）不變。
 
 ## 升級注意事項（與 Pulse 混用版本）
 
@@ -398,7 +398,7 @@ kairos --help         # 或 -h
 
 `--version` 印出 `kairos <版本> (<commit>)`（例如 `kairos 0.1.0 (4223101)`）後結束。commit 在建置時決定：環境變數 `BUILD_COMMIT`（`packaging/build-release.sh` 會傳入）→ `git rev-parse --short HEAD` → 都取不到時為 `unknown`。啟動日誌的第一行也會印出同樣的字串，可從日誌確認正在執行的版本。
 
-`--config` 的路徑可以含有非 UTF-8 的字元（Linux 的檔名不限編碼）；Windows 上非 Unicode 的路徑請用 `--config <path>`（以空白分隔）而不是 `--config=<path>`。其他參數含有無法辨識的字元時，印出錯誤與用法後以結束代碼 1 結束。
+`--config` 的路徑可以含有非 UTF-8 的字元（Linux 的檔名不限編碼）；Windows 上非 Unicode 的路徑請用 `--config <path>`（以空白分隔）而不是 `--config=<path>`。其他參數含有無法辨識的字元時，印出錯誤與用法後以結束代碼 2（用法錯誤）結束；無法辨識的參數、`--config` 缺少路徑或重複指定也一樣。
 
 ## 協定概述
 

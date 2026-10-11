@@ -266,7 +266,7 @@ cargo run
 
 程式啟動後會：
 
-1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、明確設定 `use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）。其中設定本身的錯誤（`pulse.toml`／環境變數的語法、型別、範圍錯誤，`log.level` 無效，`use_system_roots = false` 卻未設定 `ca_cert`）以結束代碼 **3** 結束（依設計包 `cli-spec.md` §1.3），`pulse.service` 以 `RestartPreventExitStatus=3` 不再重試；憑證、`agent.id` 無法載入等其餘啟動失敗為 1，仍由 systemd 重新啟動
+1. 載入並驗證設定；設定值超出範圍（含 `server.port` 為 0、`server.address` 或 `server.domain` 空白）、`log.level` 無效、明確設定 `use_system_roots = false` 卻未設定 `ca_cert`（`accept_invalid_certs = true` 時例外）、`ca_cert` 讀不到、客戶端憑證設定不完整或無法載入（含私鑰加密）、`agent.id` 內容不合法（含超過 1024 bytes、非 UTF-8）或無法建立、客戶端憑證 SAN 與 agent_id 不符時，**立即**印出錯誤並以非 0 結束（客戶端憑證已過期**不會**阻止啟動，見「啟用 mTLS」）。結束代碼依原因區分（依設計包 `cli-spec.md` §1.3）：設定本身的錯誤（`pulse.toml`／環境變數的語法、型別、範圍錯誤，`log.level` 無效，`server.domain` 不是有效的 DNS 名稱或 IP 位址，`use_system_roots = false` 卻未設定 `ca_cert`）為 **3**；憑證錯誤（`ca_cert`、客戶端憑證或私鑰讀不到、格式錯誤、不成對，SAN 與 agent_id 不符，`agent.id` 內容不合法或無法讀取、建立）為 **4**；`pulse.service` 以 `RestartPreventExitStatus=2 3 4` 不再重試。日誌目錄無法建立等其餘啟動失敗為 1，仍由 systemd 重新啟動。日誌初始化之後才發生的啟動失敗（例如憑證錯誤），除了寫日誌，也另寫一行 `[ERROR] …` 到 stderr，`pulse.service` 的 journal 看得到原因
 2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
 4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點，以及同一磁碟的重複掛載點（「磁碟名稱＋檔案系統＋總容量」相同者只列一次，保留路徑最短的掛載點，例如 systemd 沙箱的 `ReadWritePaths=`、`PrivateTmp=` bind mount 或 btrfs subvolume；磁碟名稱為空時不合併），網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`。磁碟容量以十進位單位顯示：1 GB 以上為 GB（小數 1 位，例如 `39.4 GB`），未滿 1 GB 為整數 MB（例如 `535 MB`）。取不到的系統名稱、核心版本、主機名稱等顯示「未知」；沒有溫度感測器（例如 VM）時印「未偵測到溫度感測器」
@@ -280,7 +280,7 @@ cargo run
 - 啟動階段（例如系統資訊收集因 WMI 很慢而卡住、建立 TLS 設定時讀檔很慢）也能立即中斷：Pulse 不會等待仍在背景執行緒上的系統呼叫，收到訊號後約 1 秒內結束。
 - 正常結束時 exit code 為 0；收尾期間再送一次訊號會強制結束，exit code 為 130。
 
-結束代碼總覽：0 正常結束；1 內部錯誤或設定以外的啟動失敗；2 用法錯誤（未知參數）；3 設定錯誤；130 強制結束。
+結束代碼總覽：0 正常結束；1 內部錯誤或未分類的啟動失敗；2 用法錯誤（未知參數）；3 設定錯誤；4 憑證錯誤（含 `agent.id`）；130 強制結束（與 Kairos 共用的對照表見 monorepo 根目錄 README「結束代碼」）。
 
 若系統資訊收集任務意外結束或 panic，程式會記錄 `ERROR` 並以非 0 結束，交由服務管理員（systemd、Windows 服務等）重新啟動。
 

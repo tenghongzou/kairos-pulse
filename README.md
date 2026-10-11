@@ -6,17 +6,18 @@ Kairos（TLS/mTLS 監控伺服器）與 Pulse（監控代理）的 monorepo，�
 
 ```
 kairos-pulse/
-├── Cargo.toml             workspace 設定（members = kairos、pulse、crates/*）
+├── Cargo.toml             workspace 設定（members = kairos、pulse、crates/*、tests/e2e）
 ├── Cargo.lock             整個 workspace 共用的依賴版本鎖定檔
 ├── rust-toolchain.toml    固定 Rust 1.99.0（含 rustfmt、clippy）
 ├── deny.toml              cargo-deny 設定（安全公告、授權、重複版本、來源）
 ├── CHANGELOG.md           變更紀錄（Kairos／Pulse／共用；含破壞性變更與升級步驟，也放進兩個發佈包）
-├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test 與 cargo deny
+├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test（含端對端測試）與 cargo deny
 ├── crates/                兩個產品共用的內部 crate（publish = false）
 │   ├── kairos-proto/      協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
 │   └── date-guard/        依日期命名檔案的保留清除規則與時鐘跳躍／回撥保護（DateGuard）
 ├── kairos/                Kairos 伺服器（說明見 kairos/README.md）
-└── pulse/                 Pulse 代理（說明見 pulse/README.md）
+├── pulse/                 Pulse 代理（說明見 pulse/README.md）
+└── tests/e2e/             端對端測試 kp-e2e（publish = false）：啟動實際的 kairos 與 pulse 執行檔
 ```
 
 協定規格只有一份：`crates/kairos-proto/PROTOCOL.md`。`kairos-proto` 的單元測試以 `include_str!` 讀入該文件，直接從「範例」節解析測試向量、從「錯誤碼」表比對 fatal 預設值；`kairos/PROTOCOL.md`、`pulse/PROTOCOL.md` 只是指向它的說明，發佈包內附的則是完整規格。`crates/` 下的共用 crate 都是 `publish = false` 的內部 crate，只使用 workspace 既有的依賴，不做 I/O 也不記日誌（狀態檔讀寫、NDJSON codec 與日誌措辭留在各產品）。
@@ -37,11 +38,44 @@ cargo build --workspace                 # 建置兩個產品；輸出在根目�
 cargo build -p kairos --release         # 只建置其中一個
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace                  # 含端對端測試（見下）
+cargo test -p kp-e2e                    # 只跑端對端測試
 cargo deny check                        # 需先 cargo install cargo-deny --locked
 ```
 
 在 `kairos/` 或 `pulse/` 目錄內執行 `cargo build`、`cargo test`、`cargo run` 時只會處理該產品，各自 README 中的指令都以產品目錄為工作目錄。
+
+### 端對端測試（`tests/e2e`）
+
+`kp-e2e` 以**實際編譯出的** `kairos`、`pulse` 執行檔在 `127.0.0.1` 上互連（審計 Q1），不經過任何外部網路：
+
+| 測試檔 | 情境 |
+|---|---|
+| `tests/session.rs` | mTLS 註冊 → heartbeat 收到 ack → report 寫入 `reports-*.jsonl`（逐欄檢查內容）→ 兩端優雅關機（結束代碼 0、`close_notify`、最後的 `agents.json` 標記離線）；CRL 熱重載撤銷現役連線（Kairos 踢線、之後的握手被拒；Pulse 的日誌、stderr 與 Linux 上 sd_notify 的 `Status:`）；Kairos 停止後在同一連接埠重新啟動，Pulse 自動重新註冊並繼續送 report |
+| `tests/exit_codes.rs` | 兩端常駐模式啟動時的結束代碼（0、1、2、3、4、11，見下方「結束代碼」） |
+
+- 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。
+- 每個測試使用自己的暫存目錄（`<系統暫存目錄>/kp-e2e-*`）與隨機埠，可平行執行；每個等待都有逾時（30 秒）。測試失敗時保留暫存目錄（路徑印在輸出中）並附上兩端的 stdout／stderr。
+- 測試用的設定縮短了時間：心跳與 report 每 1 秒、重連延遲 1～2 秒（A11 的啟動隨機延遲因此最多 1 秒）、Kairos 熱重載每 1 秒。
+- 憑證：Kairos 的伺服器憑證用 `pulse/testdata/server.pem`（Pulse 以 `server-ca.pem` 驗證）；客戶端憑證、私鑰、client CA 與 CRL 沿用 Kairos 整合測試的 `kairos/src/test_pki.rs`（以 `#[path]` 引用同一個檔案，`kairos/testdata/pki` 沒有客戶端私鑰）。
+- 結束訊號：Unix 送 SIGTERM；Windows 以 `CREATE_NEW_PROCESS_GROUP` 啟動子行程後送 Ctrl+Break（兩個程式都會攔截並正常關機）。
+- 整套約 10 秒以內（不含第一次建置）；沒有標記 `#[ignore]` 的慢速測試。
+
+## 結束代碼（兩個產品共用）
+
+依設計包 `design/design-system/cli-style.md` §8（Pulse 另見 `design/pulse/cli-spec.md` §1.3）。常駐模式（`kairos`、`pulse` 不帶子命令）啟動與結束時使用：
+
+| 代碼 | 意義 | Kairos | Pulse | systemd 重試 |
+|---|---|---|---|---|
+| 0 | 正常結束 | 收到關機訊號後正常關機；`--help`、`--version` | 同左 | 否 |
+| 1 | 一般錯誤 | 背景工作異常、看門狗強制結束；資料或日誌目錄無法建立等未分類的啟動失敗 | 收集任務異常；日誌目錄無法建立、無法取得主機名稱等；`--print-agent-id` 失敗 | 是 |
+| 2 | 用法錯誤 | 無法辨識的參數、`--config` 缺少路徑或重複指定 | 未知的參數 | **否** |
+| 3 | 設定錯誤 | 設定檔語法、型別、範圍錯誤；`--config` 指定的檔案不存在；未啟用 mTLS 卻監聽非 loopback 位址（S1） | `pulse.toml`／`PULSE__*` 的語法、型別、範圍錯誤；`log.level` 無效；`server.domain` 不是有效的名稱或 IP；`use_system_roots = false` 卻未設定 `ca_cert` | **否** |
+| 4 | 憑證錯誤 | 伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對 | `server.ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對；SAN 與 `agent_id` 不符；`agent.id` 無法讀取、內容不合法或無法建立 | **否** |
+| 11 | 衝突 | `server.listen` 的連接埠已被佔用 | （不使用） | 是（舊的行程結束後可能就能啟動） |
+| 130 | 強制結束 | 關機期間再收到一次訊號 | 同左 | 是 |
+
+`kairos.service`、`pulse.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再重試「重試也不會成功」的錯誤：服務停在 `failed`（`systemctl status` 顯示 `status=2`／`3`／`4`），修正後執行 `systemctl restart`。只判斷「非 0」的腳本不受影響。
 
 發佈包（Linux x86_64 musl 靜態執行檔，需要 Docker）：
 
