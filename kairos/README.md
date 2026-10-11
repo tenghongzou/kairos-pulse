@@ -27,7 +27,7 @@
 
 ## 需求
 
-- Rust 1.99（edition 2024）；專案根目錄的 `rust-toolchain.toml` 會讓 rustup 自動使用 1.99.0 與 rustfmt、clippy
+- Rust 1.99（edition 2024）；monorepo 根目錄的 `rust-toolchain.toml` 會讓 rustup 自動使用 1.99.0 與 rustfmt、clippy
 - OpenSSL 命令列工具（產生憑證與手動測試；私有 CA 流程需 OpenSSL 3.0+）
 - Linux 上可開啟的檔案數（`ulimit -n`／systemd 的 `LimitNOFILE`）需大於 `server.max_connections` + 64；啟動時讀取 `/proc/self/limits`，soft limit 不足時記 `WARN` 並附上建議值（否則連線數接近上限時可能 accept 失敗，`EMFILE`）。其他平台不檢查，請自行確認
 - 以 systemd 執行時請在 unit 的 `[Service]` 設定 `LimitNOFILE`，例如 `LimitNOFILE=8192`（發佈包的 `kairos.service` 已設定）：Ubuntu 預設的 soft limit 1024 在預設的 `server.max_connections = 1024` 下就不夠，每次啟動都會記 `WARN`。調高 `server.max_connections` 時一併調高
@@ -65,7 +65,7 @@ Kairos 與 Pulse 必須搭配升級。新舊版本混用時可能出現下列問
 
 ### 1. 產生自簽憑證（含 SAN）
 
-在專案根目錄執行：
+在專案根目錄（monorepo 的 `kairos/`）執行：
 
 ```bash
 MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:2048 -nodes \
@@ -619,13 +619,13 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 
 ## 專案結構
 
+本專案是 monorepo 中的 `kairos/`；`Cargo.lock`（鎖定的依賴版本）與 `rust-toolchain.toml` 位於 monorepo 根目錄，建置輸出在根目錄的 `target/`。
+
 ```
-Kairos/
+kairos/
 ├── Cargo.toml             套件設定與依賴
-├── Cargo.lock             鎖定的依賴版本
 ├── kairos.example.toml    設定檔範本
 ├── PROTOCOL.md            Pulse ↔ Kairos 協定規格
-├── rust-toolchain.toml    固定 Rust 1.99.0（含 rustfmt、clippy）
 ├── build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
 ├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、INSTALL.md（安裝指南）
 ├── testdata/              單元測試用的憑證樣本；pki/ 為測試用 CA、代理憑證與 CRL（見其中的 README）；含測試用私鑰，不可部署

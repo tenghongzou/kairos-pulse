@@ -17,8 +17,8 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ## 系統需求
 
-- [Rust](https://www.rust-lang.org/) 1.99（edition 2024）；repo 內的 `rust-toolchain.toml` 會自動選用 1.99.0
-- 搭配的伺服器：Kairos（同一個 repo 群組中的 `Kairos` 專案）
+- [Rust](https://www.rust-lang.org/) 1.99（edition 2024）；monorepo 根目錄的 `rust-toolchain.toml` 會自動選用 1.99.0
+- 搭配的伺服器：Kairos（同一個 monorepo 中的 `kairos/`）
 - 不需要 OpenSSL 或其他 C 函式庫：TLS 使用 rustls（ring 加密後端）
 
 ## 升級注意事項（與 Kairos 混用版本）
@@ -237,7 +237,7 @@ cargo fmt --check
 # 執行
 cargo run
 # 或直接執行編譯後的二進位檔
-./target/release/pulse
+../target/release/pulse   # workspace 的 target/ 在 monorepo 根目錄
 ```
 
 測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試，目前共 158 個。
@@ -281,7 +281,7 @@ cargo run
 
 設定依下列順序疊加，**後者覆蓋前者**：
 
-1. 專案根目錄的 `config.toml`：於**編譯時**以 `include_str!` 嵌入，作為預設值（修改它需重新編譯）；發佈包中的 `pulse.example.toml` 就是這份檔案，只供參考，程式不會讀取
+1. 專案根目錄（monorepo 的 `pulse/`）的 `config.toml`：於**編譯時**以 `include_str!` 嵌入，作為預設值（修改它需重新編譯）；發佈包中的 `pulse.example.toml` 就是這份檔案，只供參考，程式不會讀取
 2. 目前工作目錄下的 `pulse.toml`：可不存在；只需寫要覆蓋的欄位，**不需重新編譯**
 3. 環境變數 `PULSE__<SECTION>__<KEY>`（雙底線分隔，不分大小寫），例如 `PULSE__SERVER__PORT=9000`、`PULSE__LOG__LEVEL=debug`
 
@@ -440,6 +440,8 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 
 ## 專案結構
 
+以下路徑相對於 monorepo 的 `pulse/`；`Cargo.lock` 與 `rust-toolchain.toml` 位於 monorepo 根目錄，建置輸出在根目錄的 `target/`。
+
 ```
 src/
 ├── main.rs            進入點：載入設定、初始化日誌、建立 TLS 設定、啟動並監看背景任務
@@ -461,7 +463,6 @@ testdata/              測試用的憑證與私鑰（僅供測試、不可部署
 config.toml            預設設定（編譯時嵌入；發佈包中改名為 pulse.example.toml）
 build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
 packaging/             發佈包：build-release.sh（打包腳本）、pulse.service（systemd unit）、INSTALL.md（安裝指南）
-rust-toolchain.toml    固定使用 Rust 1.99.0
 ```
 
 ## 日誌

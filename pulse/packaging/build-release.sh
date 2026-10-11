@@ -2,10 +2,15 @@
 # Pulse 發佈包打包腳本
 #
 # 以 docker 的 rust:1.99-alpine 建置 musl 靜態連結的 release 執行檔，
-# 產出 dist/<名稱>-<commit>[-dirty]-linux-x86_64.tar.gz 與 dist/SHA256SUMS。
+# 產出 dist/<名稱>-<commit>[-dirty]-linux-x86_64.tar.gz 與 dist/SHA256SUMS
+# （dist/ 位於本產品目錄下，例如 monorepo 的 pulse/dist/）。
 #
 # 用法（在 repo 任一目錄執行皆可；Windows 請用 Git Bash）：
-#   sh packaging/build-release.sh
+#   sh packaging/build-release.sh          （在產品目錄下）
+#   sh pulse/packaging/build-release.sh    （在 monorepo 根目錄）
+#
+# 本產品是 Cargo workspace 的成員：Cargo.lock 與 rust-toolchain.toml 在 workspace 根目錄
+# （git repo 根目錄），整個 workspace 以唯讀方式掛進容器，在產品目錄內建置。
 #
 # 快取：
 #   - CARGO_TARGET_DIR 放在 docker volume「sync-build-<repo 目錄名稱>」
@@ -38,9 +43,16 @@ docker info >/dev/null 2>&1 || die "無法連線到 docker daemon，請確認 Do
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel) || die "$SCRIPT_DIR 不在 git repo 中"
+# 產品目錄（packaging/ 的上一層）相對於 repo 根目錄的路徑，例如 pulse；以 git 計算，避免
+# Git Bash 下 pwd（/f/...）與 git（F:/...）的路徑格式不同
+PKG_SUBDIR=$(cd "$SCRIPT_DIR/.." && git rev-parse --show-prefix) || die "無法取得產品目錄"
+PKG_SUBDIR=${PKG_SUBDIR%/}
+PKG_SUBDIR=${PKG_SUBDIR:-.}
 cd "$REPO"
+[ -f Cargo.lock ] || die "缺少 Cargo.lock（workspace 根目錄）"
+cd "$PKG_SUBDIR"
 
-for f in Cargo.toml Cargo.lock README.md PROTOCOL.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC"; do
+for f in Cargo.toml README.md PROTOCOL.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC"; do
     [ -f "$f" ] || die "缺少 $f"
 done
 
@@ -58,7 +70,8 @@ BUILD_VOLUME="sync-build-$(basename "$REPO")"
 
 mkdir -p dist
 # docker 需要主機路徑；Git Bash 下 pwd -W 會給 F:/... 形式，其他環境用一般的 pwd
-HOST_REPO=$(pwd -W 2>/dev/null || pwd)
+HOST_PKG=$(pwd -W 2>/dev/null || pwd)
+HOST_REPO=$(cd "$REPO" && { pwd -W 2>/dev/null || pwd; })
 
 echo "==> 建置 $PKG"
 echo "    image=$IMAGE target=$TARGET"
@@ -68,7 +81,9 @@ echo "    volumes: $BUILD_VOLUME（target）、$CARGO_VOLUME（registry）"
 INNER='
 set -eu
 apk add --no-cache musl-dev tar >/dev/null
-cd /src
+# 在成員目錄內執行 cargo build 只會建置該成員；Cargo.lock 取自 workspace 根目錄（/src）
+SRC="/src/$PKG_SUBDIR"
+cd "$SRC"
 cargo build --release --locked --target "$TARGET"
 BIN="$CARGO_TARGET_DIR/$TARGET/release/$NAME"
 [ -x "$BIN" ] || { echo "找不到建置產物 $BIN" >&2; exit 1; }
@@ -84,11 +99,11 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/$PKG"
 chmod 755 "$STAGE/$PKG"
 install -m 755 "$BIN"                    "$STAGE/$PKG/$NAME"
-install -m 644 "/src/$EXAMPLE_SRC"       "$STAGE/$PKG/$EXAMPLE_DST"
-install -m 644 /src/README.md            "$STAGE/$PKG/README.md"
-install -m 644 /src/PROTOCOL.md          "$STAGE/$PKG/PROTOCOL.md"
-install -m 644 /src/packaging/INSTALL.md "$STAGE/$PKG/INSTALL.md"
-install -m 644 "/src/$UNIT_SRC"          "$STAGE/$PKG/$(basename "$UNIT_SRC")"
+install -m 644 "$SRC/$EXAMPLE_SRC"       "$STAGE/$PKG/$EXAMPLE_DST"
+install -m 644 "$SRC/README.md"          "$STAGE/$PKG/README.md"
+install -m 644 "$SRC/PROTOCOL.md"        "$STAGE/$PKG/PROTOCOL.md"
+install -m 644 "$SRC/packaging/INSTALL.md" "$STAGE/$PKG/INSTALL.md"
+install -m 644 "$SRC/$UNIT_SRC"          "$STAGE/$PKG/$(basename "$UNIT_SRC")"
 
 cd "$STAGE"
 tar --owner=0 --group=0 --numeric-owner --sort=name \
@@ -116,7 +131,7 @@ esac
 # 路徑。只設在 docker 這個指令上：git 等其他 Windows 程式仍需要正常的路徑轉換。
 MSYS_NO_PATHCONV=1 docker run --rm \
     -v "$HOST_REPO:/src:ro" \
-    -v "$HOST_REPO/dist:/out" \
+    -v "$HOST_PKG/dist:/out" \
     -v "$BUILD_VOLUME:/build" \
     -v "$CARGO_VOLUME:/usr/local/cargo/registry" \
     -e CARGO_TARGET_DIR=/build/target \
@@ -125,6 +140,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e NAME="$NAME" \
     -e TARGET="$TARGET" \
     -e PKG="$PKG" \
+    -e PKG_SUBDIR="$PKG_SUBDIR" \
     -e EXAMPLE_SRC="$EXAMPLE_SRC" \
     -e EXAMPLE_DST="$EXAMPLE_DST" \
     -e UNIT_SRC="$UNIT_SRC" \
