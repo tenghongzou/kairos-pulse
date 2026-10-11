@@ -20,6 +20,8 @@
 #   DIST_DIR      輸出目錄，預設為 repo 根目錄的 dist/（兩個產品共用，SHA256SUMS 才能合併）
 #   BUILD_VOLUME  CARGO_TARGET_DIR 使用的 docker volume，預設 sync-build-<repo 目錄名稱>；
 #                 可重現性檢查以全新的 volume 指定，確保不是沿用上次的建置產物
+#   SIGNING_KEY   簽章私鑰路徑（repo 之外）。有設定時打包後以 packaging/sign-release.sh 簽署
+#                 SHA256SUMS；沒有設定時，因 SHA256SUMS 已改變，刪除舊的 SHA256SUMS.sig
 #
 # tar 內容（一層 <套件名稱>/ 目錄）：執行檔（755）、範例設定、README.md、PROTOCOL.md、
 # CHANGELOG.md、INSTALL.md、THIRD-PARTY-LICENSES、<名稱>.cdx.json、systemd unit 與
@@ -301,6 +303,14 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e HOST_UID="$HOST_UID" \
     -e HOST_GID="$HOST_GID" \
     "$IMAGE" sh -c "$INNER"
+
+# 簽章：SHA256SUMS 每次打包都會改變，舊簽章一律失效
+if [ -n "${SIGNING_KEY:-}" ]; then
+    sh "$SCRIPT_DIR/../../packaging/sign-release.sh" sign "$DIST_DIR" "$SIGNING_KEY"
+elif [ -f "$DIST_DIR/SHA256SUMS.sig" ]; then
+    rm -f "$DIST_DIR/SHA256SUMS.sig"
+    echo "注意：SHA256SUMS 已改變，刪除失效的 SHA256SUMS.sig（設定 SIGNING_KEY 可重新簽章）" >&2
+fi
 
 echo
 echo "==> 完成"

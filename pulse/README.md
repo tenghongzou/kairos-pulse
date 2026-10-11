@@ -43,7 +43,7 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下。所有步驟請在**同一個 root shell**（`sudo -i`）中依序執行，不能只在每個指令前加 `sudo`：`/opt/pulse` 的權限是 750，一般帳號無法 `cd` 進去，而 `agent.id`、私鑰與 CSR 都寫到目前目錄，`AGENT_ID` 變數也要在步驟間延續。
 
-1. `sha256sum -c SHA256SUMS` 驗證後解壓（`tar xzf … --strip-components=1`），`./pulse --version` 確認版本與 commit。
+1. 以 `ssh-keygen -Y verify` 驗證 `SHA256SUMS.sig`（發佈公鑰 `allowed_signers` 須從另一個管道取得）、`sha256sum -c --ignore-missing SHA256SUMS` 驗證雜湊後解壓（`tar xzf … --strip-components=1`），`./pulse --version` 確認版本與 commit。
 2. 建立系統使用者 `pulse` 與 `/opt/pulse`、`/opt/pulse/logs`，安裝執行檔。
 3. `cd /opt/pulse` 後執行 `./pulse --print-agent-id` 產生 `agent.id`；在同一目錄產生私鑰與 CSR，把 CSR（root 600，需以 root 複製出來）交給 Kairos 管理者以 `openssl ca` 簽發（見「啟用 mTLS」）。
 4. 建立只含覆蓋欄位的 `pulse.toml`，放好 `ca.pem`、`client.pem`、`client.key` 並設定權限。

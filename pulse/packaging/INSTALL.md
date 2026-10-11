@@ -50,17 +50,39 @@ sudo -i          # 之後的指令都在這個 shell 中執行；本文件的 ~ 
 - Linux x86_64、systemd（建議 247 以上）
 - 能以 TCP 連到 Kairos 的監聽埠
 - 產生私鑰與 CSR 用的 OpenSSL（1.1.1 以上即可；沒有的話見第 5 節的替代做法）
+- 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
 - 從 Kairos 管理者取得：Kairos 的位址與 `server.domain`（伺服器憑證 SAN 中的名稱）、伺服器 CA 憑證 `ca.pem`；啟用 mTLS 時還要由對方簽發客戶端憑證
 
 ## 2. 下載與驗證
 
+從發佈處取得下列檔案，放在同一個目錄：
+
+| 檔案 | 說明 |
+|---|---|
+| `pulse-<版本>-<commit>-linux-x86_64.tar.gz` | 發佈包 |
+| `SHA256SUMS` | Kairos 與 Pulse 共用的雜湊清單（同一次發佈的所有檔案） |
+| `SHA256SUMS.sig` | `SHA256SUMS` 的簽章（`ssh-keygen -Y sign`） |
+| `allowed_signers` | 發佈公鑰。**必須從另一個管道取得**，見下方說明 |
+
 ```bash
 mkdir -p ~/pulse-dist && cd ~/pulse-dist
-# 取得 pulse-<版本>-<commit>-linux-x86_64.tar.gz 與 SHA256SUMS（放在同一個目錄）
-sha256sum -c SHA256SUMS                  # 必須顯示「…: OK」，否則不要解壓
+# 1. 驗證 SHA256SUMS 的簽章：必須顯示
+#    Good "kairos-pulse-release" signature for release@kairos-pulse with ED25519 key SHA256:…
+ssh-keygen -Y verify -f allowed_signers -I release@kairos-pulse -n kairos-pulse-release \
+  -s SHA256SUMS.sig < SHA256SUMS
+# 2. 驗證發佈包的雜湊：必須顯示「pulse-…tar.gz: OK」
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-`SHA256SUMS` 若同時列了 Kairos 的發佈包而你只下載了 Pulse，改用 `sha256sum -c --ignore-missing SHA256SUMS`。
+任一步失敗（`Could not verify signature`、`FAILED`）都不要解壓，請向供應商確認。`--ignore-missing` 是因為 `SHA256SUMS` 也列了 Kairos 的發佈包與 SBOM；只要你下載的發佈包顯示 `OK` 即可。
+
+**公鑰必須從另一個管道取得**：簽章只能證明 `SHA256SUMS` 由持有發佈私鑰的人簽署。若 `allowed_signers` 和發佈包從同一個地方下載，能替換發佈包的人也能一起替換公鑰，驗證就沒有意義。請從供應商另外提供的管道取得 `allowed_signers`（例如合約或交付文件、客戶入口網站的 HTTPS 頁面），第一次使用時再以電話等已知可信的方式核對指紋；之後保存在管理主機上重複使用，供應商更換金鑰時會另行通知。
+
+```bash
+awk '{print $3, $4}' allowed_signers | ssh-keygen -lf -   # 印出 256 SHA256:… (ED25519)，與供應商提供的指紋比對
+```
+
+`ssh-keygen -Y verify` 需要 OpenSSH 8.1 以上（`ssh -V`）。RHEL／Rocky 8（OpenSSH 8.0）、Debian 10 等較舊的系統沒有這個功能，請在管理主機（Windows 11 內建的 OpenSSH 或 Git for Windows 的 `ssh-keygen`、macOS、Ubuntu 20.04 以上、Debian 11 以上、RHEL 9）完成驗證後，再把發佈包複製到目標主機。
 
 ## 3. 解壓並檢查執行檔
 
@@ -87,7 +109,8 @@ install -d -o pulse -g pulse -m 750 /opt/pulse/logs
 
 cd ~/pulse-dist/pkg
 install -o root -g root -m 755 pulse /opt/pulse/pulse
-install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.md /opt/pulse/
+install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.md \
+  CHANGELOG.md THIRD-PARTY-LICENSES /opt/pulse/
 ```
 
 `/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/`。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。
@@ -377,8 +400,12 @@ tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄�
 **升級順序：先升級全部 Pulse，再升級 Kairos**（或同時升級）。新版 Pulse 會替換新版 Kairos 禁止的主機名稱字元，連舊版 Kairos 不受影響；反過來，舊版 Pulse 連新版 Kairos 可能無法註冊（細節見 `README.md`「升級注意事項」）。
 
 ```bash
-# 1. 下載並驗證新版，解壓到新的目錄
-cd ~/pulse-dist && sha256sum -c SHA256SUMS
+# 1. 下載新版的發佈包、SHA256SUMS 與 SHA256SUMS.sig，依第 2 節驗證簽章與雜湊
+#    （allowed_signers 沿用第一次安裝時從另一個管道取得的那份），解壓到新的目錄
+cd ~/pulse-dist
+ssh-keygen -Y verify -f allowed_signers -I release@kairos-pulse -n kairos-pulse-release \
+  -s SHA256SUMS.sig < SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
 rm -rf pkg-new && mkdir pkg-new
 tar xzf pulse-<新版本>-<新commit>-linux-x86_64.tar.gz -C pkg-new --strip-components=1
 pkg-new/pulse --version
@@ -392,7 +419,7 @@ cp -p /opt/pulse/pulse /opt/pulse/pulse.prev
 install -o root -g root -m 755 pkg-new/pulse /opt/pulse/pulse.new
 mv /opt/pulse/pulse.new /opt/pulse/pulse
 install -o root -g root -m 644 pkg-new/pulse.example.toml pkg-new/INSTALL.md \
-  pkg-new/README.md pkg-new/PROTOCOL.md /opt/pulse/
+  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/CHANGELOG.md pkg-new/THIRD-PARTY-LICENSES /opt/pulse/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/pulse.service /etc/systemd/system/pulse.service
 # （多實例時，再依第 9 節步驟 2 重新產生每個 pulse-N.service）

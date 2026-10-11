@@ -60,7 +60,7 @@ Kairos 與 Pulse 必須搭配升級。新舊版本混用時可能出現下列問
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
 
-1. `sha256sum -c SHA256SUMS` 驗證後解壓（`tar xzf … --strip-components=1`），`./kairos --version` 確認版本與 commit（輸出 `kairos <版本> (<commit>)`，見「設定」最後的命令列參數）。
+1. 以 `ssh-keygen -Y verify` 驗證 `SHA256SUMS.sig`（發佈公鑰 `allowed_signers` 須從另一個管道取得）、`sha256sum -c --ignore-missing SHA256SUMS` 驗證雜湊後解壓（`tar xzf … --strip-components=1`），`./kairos --version` 確認版本與 commit（輸出 `kairos <版本> (<commit>)`，見「設定」最後的命令列參數）。
 2. 建立系統使用者 `kairos` 與 `/opt/kairos`、`/opt/kairos/data`、`/opt/kairos/logs`。
 3. 在管理主機建立伺服器 CA 與以 `openssl ca` 管理的代理 CA（可撤銷、產生 CRL），簽發伺服器憑證與各 Pulse 送來的 CSR。
 4. 放置 `cert.pem`、`key.pem`、`client-ca.pem`、`agents.crl`，以 `kairos.example.toml` 建立 `kairos.toml`（至少改 `server.listen` 並啟用 `auth.client_ca`、`auth.crl`）。
