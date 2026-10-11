@@ -375,6 +375,69 @@ mod tests {
     }
 
     #[test]
+    fn existing_read_only_file_is_only_read() {
+        // S8：INSTALL 讓 agent.id 為 root:pulse 640（服務帳號只能讀）。檔案存在時只讀不寫：
+        // 不改寫內容、不建立暫存檔，唯讀的檔案也能正常載入
+        let dir = temp_dir("readonly");
+        let path = dir.join("agent.id");
+        let id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        fs::write(
+            &path,
+            format!(
+                "{}
+",
+                id.to_uppercase()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let (loaded, created) = load_or_create(&path).unwrap();
+        assert_eq!((loaded.as_str(), created), (id, false));
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(only_file(&dir), vec!["agent.id"]);
+
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&path, perms).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_group_readable_file_in_read_only_dir() {
+        // S8：root:pulse 640 的 agent.id 放在服務無法寫入的目錄（ProtectSystem=strict 下的 /opt/pulse）
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = temp_dir("root-640");
+        let path = dir.join("agent.id");
+        let id = "11111111-2222-4333-8444-555555555555";
+        fs::write(
+            &path,
+            format!(
+                "{id}
+"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (loaded, created) = load_or_create(&path).unwrap();
+        assert_eq!((loaded.as_str(), created), (id, false));
+        assert_eq!(only_file(&dir), vec!["agent.id"]);
+        // 擁有者為 root（Docker 中以 root 執行測試）時 640 不警告；否則提示群組可讀
+        let owner_is_root = fs::metadata(&path).unwrap().uid() == 0;
+        assert_eq!(permission_warning(&path).is_none(), owner_is_root);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn invalid_content_is_an_error_not_regenerated() {
         let dir = temp_dir("invalid");
         let path = dir.join("agent.id");

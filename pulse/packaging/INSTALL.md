@@ -100,15 +100,15 @@ install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.
 ```bash
 cd /opt/pulse                         # 必須在實際的工作目錄執行，才會寫到同一份 agent.id
 ./pulse --print-agent-id              # stdout 印出 agent_id（小寫），「已產生新的 agent_id」提示在 stderr
-chown pulse:pulse agent.id
-chmod 600 agent.id
+chown root:pulse agent.id             # 服務帳號只能讀、不能改
+chmod 640 agent.id
 AGENT_ID=$(./pulse --print-agent-id)  # 之後的步驟會用到
 echo "$AGENT_ID"
 ```
 
 - `agent.id` 已存在時只會讀取，不會改變。
 - **不要**把 `agent.id` 複製到其他主機（例如複製 VM 映像檔後忘了刪）：兩台會互相把對方踢下線（`superseded`）。複製出來的主機請刪除 `agent.id` 後重做本節。
-- 未啟用 mTLS 時，`agent.id` 的內容就是本機在伺服器上的身分，權限必須是 600。
+- 未啟用 mTLS 時，`agent.id` 的內容就是本機在伺服器上的身分：擁有者 root、群組 pulse、權限 640，只有 root 能修改，服務帳號 pulse 只能讀取。Pulse 讀到既有的 `agent.id` 後不會寫回，因此唯讀即可正常運作；權限過寬（例如其他使用者可讀）時啟動日誌會記 `WARN`。
 
 ### 5.2 產生私鑰與 CSR，交給 Kairos 管理者簽發
 
@@ -122,8 +122,8 @@ openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout client.key -out "$AGENT_ID.csr" -subj "/CN=$AGENT_ID" \
   -addext "subjectAltName=DNS:$AGENT_ID" \
   -addext "extendedKeyUsage=clientAuth"
-chown pulse:pulse client.key
-chmod 600 client.key
+chown root:pulse client.key           # 服務帳號只能讀、不能改
+chmod 640 client.key
 
 # 取出 CSR：/opt/pulse 內的 CSR 是 root 600，複製一份可讀的到 /tmp 再傳給管理者
 install -m 644 "$AGENT_ID.csr" /tmp/
@@ -184,10 +184,12 @@ install -o root -g pulse -m 644 client.pem /opt/pulse/client.pem
 | `pulse`（執行檔） | `root:root` | 755 |
 | `pulse.toml` | `root:pulse` | 640 |
 | `ca.pem`、`client.pem` | `root:pulse` | 644 |
-| `client.key`、`agent.id` | `pulse:pulse` | 600 |
+| `client.key`、`agent.id` | `root:pulse` | 640 |
 | `logs/` | `pulse:pulse` | 750 |
 
 `$AGENT_ID.csr`（`/opt/pulse` 內與 `/tmp` 的副本）交出去後可以刪除。
+
+`client.key` 與 `agent.id` 由 root 擁有、群組 pulse 只能讀（640）：即使服務帳號被入侵，也無法竄改本機身分或替換私鑰（unit 的 `ProtectSystem=strict` 另外讓 `/opt/pulse` 對服務唯讀）。Pulse 啟動時檢查這兩個檔案的權限：其他使用者有任何權限、群組可寫入，或擁有者不是 root 而群組可讀時記 `WARN`（不阻止啟動）。舊版 INSTALL 的 `pulse:pulse 600` 仍可正常運作、不會警告，建議改成新的配置（見第 10 節）。
 
 ## 7. 安裝 systemd unit
 
@@ -325,8 +327,8 @@ grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart)=' /etc/systemd/system/puls
 # 3. agent_id（第 5.1 節，在 /opt/pulse-N 執行）
 cd /opt/pulse-$N
 /opt/pulse/pulse --print-agent-id
-chown pulse:pulse agent.id
-chmod 600 agent.id
+chown root:pulse agent.id
+chmod 640 agent.id
 AGENT_ID=$(/opt/pulse/pulse --print-agent-id)   # 這個實例自己的 agent_id
 echo "$AGENT_ID"
 
@@ -336,8 +338,8 @@ openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout client.key -out "$AGENT_ID.csr" -subj "/CN=$AGENT_ID" \
   -addext "subjectAltName=DNS:$AGENT_ID" \
   -addext "extendedKeyUsage=clientAuth"
-chown pulse:pulse client.key
-chmod 600 client.key
+chown root:pulse client.key
+chmod 640 client.key
 install -m 644 "$AGENT_ID.csr" /tmp/  # 把 /tmp/<agent_id>.csr 交給 Kairos 管理者簽發
 ```
 
@@ -397,6 +399,12 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 ```
 
 - `agent.id`、憑證與 `pulse.toml` 沿用，不需要重新簽發。
+- 依舊版 INSTALL 安裝（`client.key`、`agent.id` 為 `pulse:pulse 600`）者，建議改成服務帳號唯讀的配置（多實例時對每個 `/opt/pulse-N` 執行相同指令）：
+
+  ```bash
+  chown root:pulse /opt/pulse/agent.id /opt/pulse/client.key
+  chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
+  ```
 - 升級前請看 `README.md`「升級注意事項」中「本版的行為改變」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`。
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。
@@ -404,7 +412,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 ## 11. 憑證更新與 agent_id 重新產生
 
-- **憑證快到期**（日誌出現「剩餘不超過 N 天」的 `WARN`）：沿用同一個 agent_id，重做 5.2（新私鑰與 CSR）請管理者簽發，替換 `client.key`、`client.pem` 後 `systemctl restart pulse`。
+- **憑證快到期**（日誌出現「剩餘不超過 N 天」的 `WARN`）：沿用同一個 agent_id，重做 5.2（新私鑰與 CSR，私鑰同樣設為 `root:pulse 640`）請管理者簽發，替換 `client.key`、`client.pem` 後 `systemctl restart pulse`。
 - **重新產生 agent_id**（例如複製 VM 後）：`systemctl stop pulse`，刪除 `/opt/pulse/agent.id`，重做第 5 節全部步驟，並請管理者撤銷舊憑證。只換 `agent.id` 不換憑證時，Pulse 啟動即因 SAN 不符而結束。
 
 ## 12. 移除
