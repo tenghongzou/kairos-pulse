@@ -12,6 +12,7 @@
 # 以 docker 的 rust alpine image（以 @sha256 digest 固定）建置 musl 靜態連結的 release 執行檔，
 # 產出：
 #   <DIST_DIR>/<名稱>-<版本>-<commit>[-dirty]-linux-x86_64.tar.gz
+#   <DIST_DIR>/<名稱>-<版本>-<commit>[-dirty]-linux-x86_64.cdx.json   SBOM（與 tar 內的相同）
 #   <DIST_DIR>/SHA256SUMS   兩個產品共用的合併清單：只更新本次產出檔案的那幾列，
 #                           保留其他產品的列；最後以 sha256sum -c 確認整份清單與目錄內容一致
 #
@@ -21,9 +22,21 @@
 #                 可重現性檢查以全新的 volume 指定，確保不是沿用上次的建置產物
 #
 # tar 內容（一層 <套件名稱>/ 目錄）：執行檔（755）、範例設定、README.md、PROTOCOL.md、
-# CHANGELOG.md、INSTALL.md、systemd unit 與 EXTRA_SRC（其餘皆 644），擁有者一律為 0:0，
-# 時間戳記固定為 commit 時間（SOURCE_DATE_EPOCH），檔案依名稱排序。
-# PROTOCOL.md 取自兩個產品共用的唯一規格，CHANGELOG.md 取自 repo 根目錄。
+# CHANGELOG.md、INSTALL.md、THIRD-PARTY-LICENSES、<名稱>.cdx.json、systemd unit 與
+# EXTRA_SRC（其餘皆 644），擁有者一律為 0:0，時間戳記固定為 commit 時間（SOURCE_DATE_EPOCH），
+# 檔案依名稱排序。PROTOCOL.md 取自兩個產品共用的唯一規格，CHANGELOG.md 取自 repo 根目錄。
+#
+# THIRD-PARTY-LICENSES（商業審計 B2）與 SBOM（D4）每次建置都在容器內依 Cargo.lock 重新產生，
+# 不會過期：
+#   - cargo-about（設定 packaging/about.toml、範本 packaging/about.hbs）以 --frozen 離線執行，
+#     授權全文只取自 crate 原始碼內的檔案；依賴出現 about.toml 未允許的授權時建置失敗。
+#   - cargo-cyclonedx 產生 CycloneDX 1.5 JSON（只含目標平台、非建置期的依賴）；
+#     SOURCE_DATE_EPOCH 讓 metadata.timestamp 固定為 commit 時間。
+#   兩個工具以固定版本 cargo install --locked 安裝在 BUILD_VOLUME 的 tools/ 下，之後重複使用。
+#   已知限制：cargo metadata 會把只由弱依賴特性（dep?/feature）提到、實際未啟用的可選依賴
+#   列入 resolve，SBOM 因此可能多列少數沒有編譯進執行檔的 crate（0.2.0 為 toml 的 indexmap、
+#   toml_writer 與 indexmap 的 hashbrown、equivalent）；cargo-auditable 有同樣的限制。
+#   THIRD-PARTY-LICENSES 由 cargo-about 依實際的 feature 解析產生，不受影響。
 
 # ---- 建置環境（兩個產品共用；更新方式見 RELEASING.md「更新建置 image」）-----
 # rust:1.99-alpine（Alpine 3.24.2、rustc 1.99.0）的 multi-arch index digest，2026-10-12 查得。
@@ -36,7 +49,12 @@ APK_PACKAGES="tar=1.35-r5"
 TARGET=x86_64-unknown-linux-musl
 RUST_TOOLCHAIN=1.99.0
 CARGO_VOLUME=sync-cargo
+# 產生 THIRD-PARTY-LICENSES 與 SBOM 的工具（cargo install --locked，固定版本）
+CARGO_ABOUT_VERSION=0.9.2
+CARGO_CYCLONEDX_VERSION=0.5.9
 PROTOCOL_SRC=crates/kairos-proto/PROTOCOL.md  # 協定規格（相對於 repo 根目錄）
+ABOUT_CONFIG=packaging/about.toml              # cargo-about 設定（相對於 repo 根目錄）
+ABOUT_TEMPLATE=packaging/about.hbs             # THIRD-PARTY-LICENSES 範本（相對於 repo 根目錄）
 CHANGELOG_SRC=CHANGELOG.md                     # 變更紀錄與升級步驟（相對於 repo 根目錄）
 # ---------------------------------------------------------------------------
 
@@ -65,6 +83,8 @@ cd "$REPO"
 [ -f Cargo.lock ] || die "缺少 Cargo.lock（workspace 根目錄）"
 [ -f "$PROTOCOL_SRC" ] || die "缺少 $PROTOCOL_SRC（協定規格）"
 [ -f "$CHANGELOG_SRC" ] || die "缺少 $CHANGELOG_SRC（變更紀錄）"
+[ -f "$ABOUT_CONFIG" ] || die "缺少 $ABOUT_CONFIG（cargo-about 設定）"
+[ -f "$ABOUT_TEMPLATE" ] || die "缺少 $ABOUT_TEMPLATE（THIRD-PARTY-LICENSES 範本）"
 
 # shellcheck disable=SC2086 # EXTRA_SRC 刻意以空白分隔成多個檔案
 for f in Cargo.toml README.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC" ${EXTRA_SRC:-}; do
@@ -112,8 +132,18 @@ apk add --no-cache $APK_PACKAGES >/dev/null || {
     echo "錯誤：apk 無法安裝 $APK_PACKAGES（Alpine 套件庫可能已更新該套件），請依 RELEASING.md 更新 image digest 與 APK_PACKAGES" >&2
     exit 1
 }
+
+# 授權清單與 SBOM 的工具：已安裝同版本時 cargo install 會直接略過
+TOOLS=/build/tools
+for tool in "cargo-about@$CARGO_ABOUT_VERSION --features cli" "cargo-cyclonedx@$CARGO_CYCLONEDX_VERSION"; do
+    # shellcheck disable=SC2086
+    CARGO_TARGET_DIR=/build/tools-target cargo install --quiet --locked --root "$TOOLS" $tool
+done
+
 # 在成員目錄內執行 cargo build 只會建置該成員；Cargo.lock 取自 workspace 根目錄（/src）
 SRC="/src/$PKG_SUBDIR"
+# cargo-about／cargo-cyclonedx 會讀取所有平台的依賴資訊，先下載 Cargo.lock 中的全部 crate
+(cd /src && cargo fetch --locked --quiet)
 cd "$SRC"
 cargo build --release --locked --target "$TARGET"
 BIN="$CARGO_TARGET_DIR/$TARGET/release/$NAME"
@@ -146,14 +176,62 @@ for f in $EXTRA_SRC; do
     install -m 644 "$SRC/$f" "$STAGE/$PKG/$(basename "$f")"
 done
 
+echo "==> THIRD-PARTY-LICENSES（cargo-about $CARGO_ABOUT_VERSION）"
+(cd /src && "$TOOLS/bin/cargo-about" generate --frozen \
+    -m "$PKG_SUBDIR/Cargo.toml" -c "$ABOUT_CONFIG" \
+    -o /tmp/THIRD-PARTY-LICENSES "$ABOUT_TEMPLATE")
+grep -q "^Used by:" /tmp/THIRD-PARTY-LICENSES || {
+    echo "錯誤：產生的 THIRD-PARTY-LICENSES 沒有任何授權條目" >&2
+    exit 1
+}
+install -m 644 /tmp/THIRD-PARTY-LICENSES "$STAGE/$PKG/THIRD-PARTY-LICENSES"
+sed -n "/^Overview/,/^$/p" /tmp/THIRD-PARTY-LICENSES | sed "s/^/    /"
+
+echo "==> SBOM（cargo-cyclonedx $CARGO_CYCLONEDX_VERSION）"
+# cargo-cyclonedx 把結果寫在 Cargo.toml 旁邊，/src 是唯讀的，因此複製一份 workspace
+# （不含建置產物）到固定路徑；SBOM 的 bom-ref 含此路徑，固定才能重現。
+# cargo metadata 會合併整個 workspace 的 feature（例如 Kairos 的 tokio "full" 會讓 Pulse 的
+# SBOM 多出 parking_lot），因此複本的 workspace 只保留本產品與共用 crate，與實際建置一致。
+SBOM_SRC=/work/kairos-pulse
+rm -rf "$SBOM_SRC"
+mkdir -p "$SBOM_SRC"
+tar -C /src --exclude=./.git --exclude=target --exclude=dist -cf - . | tar -C "$SBOM_SRC" -xf -
+sed -i "s|^members = .*|members = [\"$PKG_SUBDIR\", \"crates/*\"]|" "$SBOM_SRC/Cargo.toml"
+grep -q "^members = \[\"$PKG_SUBDIR\", \"crates/\*\"\]" "$SBOM_SRC/Cargo.toml" || {
+    echo "錯誤：無法在 SBOM 用的 workspace 複本中縮減 members（Cargo.toml 格式改變？）" >&2
+    exit 1
+}
+(cd "$SBOM_SRC/$PKG_SUBDIR" && CARGO_NET_OFFLINE=true "$TOOLS/bin/cargo-cyclonedx" cyclonedx \
+    --quiet --format json --spec-version 1.5 --target "$TARGET" \
+    --describe binaries --no-build-deps)
+SBOM="$SBOM_SRC/$PKG_SUBDIR/${NAME}_bin.cdx.json"
+[ -s "$SBOM" ] || { echo "錯誤：找不到 cargo-cyclonedx 的輸出 $SBOM" >&2; exit 1; }
+grep -q "\"version\": \"$VERSION\"" "$SBOM" || {
+    echo "錯誤：SBOM 中沒有版本 $VERSION" >&2
+    exit 1
+}
+# 縮減 members 後 cargo 會從複本的 Cargo.lock 移除用不到的套件，但不得改變任何版本：
+# 複本中的每個「名稱 版本」都必須出現在原本的 Cargo.lock
+lock_pairs() { awk "/^name = /{n=\$3} /^version = /{print n, \$3}" "$1" | sort -u; }
+lock_pairs /src/Cargo.lock > /tmp/lock-src
+lock_pairs "$SBOM_SRC/Cargo.lock" > /tmp/lock-sbom
+if grep -Fxv -f /tmp/lock-src /tmp/lock-sbom; then
+    echo "錯誤：產生 SBOM 時 Cargo.lock 的版本被改變（上面列出）" >&2
+    exit 1
+fi
+install -m 644 "$SBOM" "$STAGE/$PKG/$NAME.cdx.json"
+echo "    $(grep -c "\"bom-ref\"" "$SBOM") 個 bom-ref"
+
 cd "$STAGE"
 tar --owner=0 --group=0 --numeric-owner --sort=name \
     --mtime="@$SOURCE_DATE_EPOCH" -cf - "$PKG" | gzip -n -9 > "/out/$PKG.tar.gz.tmp"
 mv "/out/$PKG.tar.gz.tmp" "/out/$PKG.tar.gz"
+# SBOM 另外放一份在 tar 外，掃描工具（Dependency-Track 等）不必先解壓
+install -m 644 "$STAGE/$PKG/$NAME.cdx.json" "/out/$PKG.cdx.json"
 
 # 合併版 SHA256SUMS：去掉本次產出檔案的舊列與已不存在的檔案，加上新列，依檔名排序
 cd /out
-NEW_FILES="$PKG.tar.gz"
+NEW_FILES="$PKG.tar.gz $PKG.cdx.json"
 : > SHA256SUMS.new
 if [ -f SHA256SUMS ]; then
     while read -r sum file; do
@@ -214,6 +292,10 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e UNIT_SRC="$UNIT_SRC" \
     -e PROTOCOL_SRC="$PROTOCOL_SRC" \
     -e CHANGELOG_SRC="$CHANGELOG_SRC" \
+    -e ABOUT_CONFIG="$ABOUT_CONFIG" \
+    -e ABOUT_TEMPLATE="$ABOUT_TEMPLATE" \
+    -e CARGO_ABOUT_VERSION="$CARGO_ABOUT_VERSION" \
+    -e CARGO_CYCLONEDX_VERSION="$CARGO_CYCLONEDX_VERSION" \
     -e EXTRA_SRC="${EXTRA_SRC:-}" \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e HOST_UID="$HOST_UID" \
@@ -223,5 +305,6 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 echo
 echo "==> 完成"
 echo "    $HOST_DIST/$PKG.tar.gz"
+echo "    $HOST_DIST/$PKG.cdx.json"
 echo "    $HOST_DIST/SHA256SUMS："
 sed 's/^/      /' "$DIST_DIR/SHA256SUMS"

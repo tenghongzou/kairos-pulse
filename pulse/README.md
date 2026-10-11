@@ -39,7 +39,7 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 
 ## 從發佈包安裝
 
-地端正式部署請使用預編譯的發佈包 `pulse-<版本>-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件、`PROTOCOL.md` 與 `CHANGELOG.md`（變更紀錄與升級步驟）。
+地端正式部署請使用預編譯的發佈包 `pulse-<版本>-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件、`PROTOCOL.md`、`CHANGELOG.md`（變更紀錄與升級步驟）、`THIRD-PARTY-LICENSES`（第三方授權聲明）與 SBOM（CycloneDX）。
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下。所有步驟請在**同一個 root shell**（`sudo -i`）中依序執行，不能只在每個指令前加 `sudo`：`/opt/pulse` 的權限是 750，一般帳號無法 `cd` 進去，而 `agent.id`、私鑰與 CSR 都寫到目前目錄，`AGENT_ID` 變數也要在步驟間延續。
 

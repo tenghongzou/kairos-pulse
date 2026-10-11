@@ -56,7 +56,7 @@ Kairos 與 Pulse 必須搭配升級。新舊版本混用時可能出現下列問
 
 ## 從發佈包安裝
 
-地端正式部署請使用預編譯的發佈包 `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`kairos-crl.service`／`kairos-crl.timer`（CRL 定期更新範例）、`INSTALL.md`、本文件、`PROTOCOL.md` 與 `CHANGELOG.md`（變更紀錄與升級步驟）。
+地端正式部署請使用預編譯的發佈包 `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`kairos-crl.service`／`kairos-crl.timer`（CRL 定期更新範例）、`INSTALL.md`、本文件、`PROTOCOL.md`、`CHANGELOG.md`（變更紀錄與升級步驟）、`THIRD-PARTY-LICENSES`（第三方授權聲明）與 SBOM（CycloneDX）。
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
 
