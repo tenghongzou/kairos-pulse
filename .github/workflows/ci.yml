@@ -1,4 +1,4 @@
-# CI（商業審計 D3、D5）：Linux 與 Windows 上的格式、lint、測試，以及 cargo-deny 依賴檢查。
+# CI（商業審計 D3、D5、Q1）：Linux 與 Windows 上的格式、lint、測試（含端對端測試），以及 cargo-deny 依賴檢查。
 # 工具鏈一律取自根目錄的 rust-toolchain.toml（1.99.0、rustfmt、clippy），不另外指定版本。
 name: CI
 
@@ -47,7 +47,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --exclude kp-e2e
+
+      # 端對端測試（審計 Q1，tests/e2e）：以實際的 kairos、pulse 執行檔在 127.0.0.1 上以 mTLS 互連，
+      # 不連外部網路。先在這一步建置執行檔（--locked），測試內的 cargo build 因此不需重新建置。
+      # 每個等待都有逾時，整套約 10 秒；這裡的 timeout 只防止 runner 異常時卡住整個 job
+      - name: Build binaries for end-to-end tests
+        run: cargo build -p kairos -p pulse --bins --locked
+
+      - name: End-to-end tests
+        run: cargo test -p kp-e2e --locked
+        timeout-minutes: 10
 
   deny:
     name: cargo deny
