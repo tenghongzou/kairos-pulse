@@ -14,6 +14,7 @@
 - 預設拒絕未認證的對外監聽：監聽非 loopback 位址（例如 `0.0.0.0`）又沒有設定 `auth.client_ca` 時拒絕啟動，除非明確設定 `auth.allow_unauthenticated = true`（見「啟用 mTLS」）
 - 雙向 TLS（mTLS）：設定 `auth.client_ca` 後要求客戶端憑證，且 `agent_id` 必須與憑證的 SAN 相符（預設憑證只能有一個 DNS SAN），無法冒用其他代理或把它踢掉；支援 CRL 撤銷；啟用時停用 TLS session resumption，收到 hello 時再驗證一次憑證鏈
 - 熱重載：定期檢查伺服器憑證、私鑰、客戶端 CA 與 CRL 檔，有變更就重建 TLS 設定（失敗時保留舊設定）；同時重新驗證所有現役連線的客戶端憑證，已撤銷、過期或不再受信任的連線收到 `certificate_rejected` 並被關閉
+- 到期預警：啟動時、熱重載時與之後定期檢查伺服器憑證的到期日與 CRL 的下次更新時間（nextUpdate），到期前 30／7 天（`server.cert_expiry_warning_days`／`auth.crl_expiry_warning_days`）記 `WARN`、已過期記 `ERROR`；附 CRL 定期更新的 systemd timer 範例（`packaging/kairos-crl.timer`）
 - report 的 `ack` 代表**已寫入資料檔**；確定未寫入時回 `storage_unavailable`（這筆未保存），寫入結果無法確定時不回應、直接關閉連線。Pulse 採 at-most-once，兩種情況都不重送
 - 回報依 UTC 日期寫入 `data/reports-YYYY-MM-DD.jsonl`，依 `storage.retention_days` 自動清除過期檔案（啟動時、換日時與每小時；系統日期前進得比實際經過的時間多時暫停清除，保護狀態存於 `data/.retention-guard.json`）；可設定每個日期檔的大小上限 `storage.max_daily_bytes`（預設 `0` = 不限制），達到後當天的 report 回 `storage_unavailable`；agent 狀態每 5 秒快照到 `data/agents.json`（寫暫存檔並 fsync 後再更名）；資料目錄在執行中被刪除時會自動重建
 - 正常關機：收到 Ctrl+C／Ctrl+Break／關閉主控台／系統關機（非 Windows 為 SIGINT／SIGTERM）時，送出 `close_notify` 關閉所有連線、寫完佇列中的 report、寫出最後的 `agents.json` 後以結束代碼 0 結束，最壞約 3 秒內完成
@@ -51,7 +52,7 @@ Kairos 與 Pulse 必須搭配升級。新舊版本混用時可能出現下列問
 
 ## 從發佈包安裝
 
-地端正式部署請使用預編譯的發佈包 `kairos-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件與 `PROTOCOL.md`。
+地端正式部署請使用預編譯的發佈包 `kairos-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`kairos-crl.service`／`kairos-crl.timer`（CRL 定期更新範例）、`INSTALL.md`、本文件與 `PROTOCOL.md`。
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
 
@@ -313,9 +314,23 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | CRL 超過 `nextUpdate` 時拒絕 | `enforce_revocation_expiration` | 過期的 CRL 可能漏掉之後的撤銷，因此視為無法判定 |
 
 > [!IMPORTANT]
-> 因為過期的 CRL 會讓**所有**代理被拒，請在 `nextUpdate` 之前重新產生 CRL（上面的設定為 30 天，`openssl crl -in agents.crl -noout -nextupdate` 可查看），例如每週以排程執行一次 `-gencrl` 並改名覆寫。Kairos 無法事先讀取 CRL 的 `nextUpdate` 發出預警；過期後的徵兆是握手失敗日誌出現 `ExpiredRevocationList`（以 `ERROR` 記錄「無法判定客戶端憑證的撤銷狀態」，與一般握手失敗分開節流），以及現役連線在下一個重載週期被斷線。這種情況下（以及缺少某一層 CA 的 CRL 時），送出 hello 或連線中被重新驗證的代理收到的 `certificate_rejected` 的 message 為 `revocation status unavailable`（一般撤銷或過期為 `client certificate has been revoked or is no longer trusted`），Pulse 據此提示這是伺服器端問題、不需重新簽發。
+> 因為過期的 CRL 會讓**所有**代理被拒，請在 `nextUpdate` 之前重新產生 CRL（上面的設定為 30 天，`openssl crl -in agents.crl -noout -nextupdate` 可查看），例如每週以排程執行一次 `-gencrl` 並改名覆寫（發佈包附有 systemd 的 `kairos-crl.service`／`kairos-crl.timer` 範例，見 INSTALL 第 10.3 節）。Kairos 會預警：啟動時、熱重載套用新設定時，以及之後每個重載週期（停用熱重載時每小時）讀取每份 CRL 的 `nextUpdate`，剩下 `auth.crl_expiry_warning_days`（預設 7）天以內時記 `WARN`「CRL agents.crl 將在 … 後過期…」，已過期時記 `ERROR`「CRL agents.crl 已過期…所有 agent 都會被拒絕連線」（見「到期預警」）。預警不改變驗證行為，過期的 CRL 仍然讓所有代理被拒。過期後的徵兆是握手失敗日誌出現 `ExpiredRevocationList`（以 `ERROR` 記錄「無法判定客戶端憑證的撤銷狀態」，與一般握手失敗分開節流），以及現役連線在下一個重載週期被斷線。這種情況下（以及缺少某一層 CA 的 CRL 時），送出 hello 或連線中被重新驗證的代理收到的 `certificate_rejected` 的 message 為 `revocation status unavailable`（一般撤銷或過期為 `client certificate has been revoked or is no longer trusted`），Pulse 據此提示這是伺服器端問題、不需重新簽發。
 
 未設定 `auth.crl` 時不做撤銷檢查。`auth.crl` 只在設定 `auth.client_ca` 時有效，否則啟動時報錯。
+
+## 到期預警
+
+伺服器憑證過期時 Pulse 會拒絕連線；CRL 超過 `nextUpdate` 時 Kairos 會拒絕所有代理（見上一節）。兩者都會讓所有代理同時斷線，因此 Kairos 會事先預警：
+
+| 項目 | 讀取的日期 | 預警門檻（預設） | 預警期間內 | 已過期 |
+|---|---|---|---|---|
+| 伺服器憑證（`server.cert_path` 的第一張） | notAfter | `server.cert_expiry_warning_days`（30 天） | `WARN`「伺服器憑證 cert.pem 將在 … 後到期…」 | `ERROR`「伺服器憑證 cert.pem 已於 … 過期，Pulse 會拒絕連線…」 |
+| 每份 CRL（`auth.crl`，一個 PEM 檔可含多份） | nextUpdate | `auth.crl_expiry_warning_days`（7 天） | `WARN`「CRL agents.crl 將在 … 後過期…」 | `ERROR`「CRL agents.crl 已過期…所有 agent 都會被拒絕連線（fail closed）…」 |
+
+- **何時檢查**：啟動時、熱重載套用新設定時，以及之後每個重載週期（`server.reload_interval_secs`；設為 `0` 停用熱重載時改為每小時）。
+- **節流**：每個檔案（每份 CRL）各自計時，與「日誌」的節流類別完全分開、不共用額度，大量的握手失敗等日誌無法掩蓋它。進入預警、過期、到期時間改變時立即記錄，啟動與熱重載時也一律記錄；其餘情況同一個項目每 24 小時最多提醒一次。換上新的檔案、不再需要預警時記 `INFO`「… 的到期時間已更新為 …，解除預警」。
+- 門檻設為 `0` 時不預警，但已過期仍記 `ERROR`。時間一律以 UTC 顯示。
+- 預警不改變任何驗證行為：CRL 過期時仍是 fail closed（所有代理被拒）。代理的客戶端憑證到期不在此預警範圍內（由 Pulse 端處理）。
 
 ## 設定
 
@@ -335,6 +350,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `server.max_connections` | `KAIROS__SERVER__MAX_CONNECTIONS` | `1024` | 同時連線數上限，1～65535。其中握手中（已 accept、尚未通過 hello）的連線最多 `max(1, server.max_connections / 2)` 條（固定比例，不可設定），超過時新連線不握手直接關閉 |
 | `server.max_connections_per_ip` | `KAIROS__SERVER__MAX_CONNECTIONS_PER_IP` | 未設定時為 `min(32, server.max_connections)` | 同一來源 IP 位址的同時連線數上限（含握手中、尚未送 hello 的連線），明確設定時必須介於 1～`server.max_connections`；超過時不握手直接關閉。IPv4-mapped IPv6 位址（`::ffff:a.b.c.d`）視為同一個 IPv4；IPv6 位址以單一位址計數（同一個 /64 中的多台主機不會互相佔用名額；以大量 IPv6 位址慢速握手的攻擊由「握手中」上限防護）。同一來源另有新連線速率上限：每秒 10 條，可連續 `max(32, 2 × 此值)` 條（固定值；此項 IPv6 以 /64 合併計算），超過時同樣不握手直接關閉。此值也決定未啟用 mTLS 時以來源 IP 計算的 report 額度倍數（見下方說明）。多台代理經同一個 NAT 連入時請調高：超過上限的代理會在握手前被斷線並不斷退避重連 |
 | `server.reload_interval_secs` | `KAIROS__SERVER__RELOAD_INTERVAL_SECS` | `30` | 每隔幾秒檢查憑證、私鑰、客戶端 CA 與 CRL 檔是否變更，並重新驗證現役連線的客戶端憑證；`0` = 停用，上限 3600 |
+| `server.cert_expiry_warning_days` | `KAIROS__SERVER__CERT_EXPIRY_WARNING_DAYS` | `30` | 伺服器憑證到期前幾天開始記 `WARN`，0～365；`0` = 不預警（已過期仍記 `ERROR`）。見「到期預警」 |
 | `timeouts.handshake_secs` | `KAIROS__TIMEOUTS__HANDSHAKE_SECS` | `5` | TLS 握手逾時（秒），1～3600 |
 | `timeouts.hello_secs` | `KAIROS__TIMEOUTS__HELLO_SECS` | `5` | 握手後等待 hello 的時間（秒），逾時直接關閉，1～3600 |
 | `timeouts.write_secs` | `KAIROS__TIMEOUTS__WRITE_SECS` | `5` | 每則訊息寫出、以及等待 report 寫入資料檔的逾時（秒），**1～6**：伺服器的回應延遲必須不超過 8 秒，Pulse 的讀取閒置只在心跳間隔上預留 10 秒餘裕（見「協定概述」） |
@@ -344,6 +360,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `auth.client_ca` | `KAIROS__AUTH__CLIENT_CA` | `""` | 非空時啟用 mTLS：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 `agent_id` 與憑證綁定（見「啟用 mTLS」） |
 | `auth.crl` | `KAIROS__AUTH__CRL`（逗號分隔） | `[]` | CRL 檔路徑清單（PEM 或 DER）；只在設定 `auth.client_ca` 時有效（見「撤銷客戶端憑證」） |
 | `auth.allow_multiple_dns_sans` | `KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS` | `false` | 是否接受含多個 DNS SAN 的客戶端憑證；`false` 時憑證必須恰好有一個 DNS SAN |
+| `auth.crl_expiry_warning_days` | `KAIROS__AUTH__CRL_EXPIRY_WARNING_DAYS` | `7` | CRL 的 `nextUpdate` 前幾天開始記 `WARN`，0～365；`0` = 不預警（已過期仍記 `ERROR`）。見「到期預警」 |
 | `auth.allow_unauthenticated` | `KAIROS__AUTH__ALLOW_UNAUTHENTICATED` | `false` | 未設定 `auth.client_ca` 時是否仍允許監聽非 loopback 位址。`false` 時拒絕啟動（loopback 位址不受影響）；`true` 只用於隔離的測試環境，任何能連線的人都能以任意 `agent_id` 註冊。啟用 mTLS 時不生效 |
 | `limits.max_agents` | `KAIROS__LIMITS__MAX_AGENTS` | 未設定時為 `max(10000, server.max_connections)` | 狀態表（記憶體與 `agents.json`）最多保留的 agent 數，明確設定時必須介於 `server.max_connections`～100000。滿時先淘汰連線已結束、離線最久的 agent（記 `INFO`）；沒有可淘汰者時，新的 `agent_id` 以 fatal 的 `bad_request`（`server agent registry is full`）拒絕並記 `WARN`（防禦性處理：因為此值不小於 `server.max_connections`，依設定範圍實際上不會發生）。已在狀態表中的 `agent_id` 重新連線不受影響 |
 | `log.level` | `KAIROS__LOG__LEVEL` | `info` | `off`、`error`、`warn`、`info`、`debug`、`trace` |
@@ -359,7 +376,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
   - 需要延後 0.5 秒以內時，伺服器暫停讀取該連線、延後處理（TCP 背壓會讓送出端慢下來），不回錯誤；需要延後更久時（例如同一來源有多條連線同時送出）不處理這筆，回非 fatal 的 `storage_unavailable`（`report rate limit exceeded`，確定未保存）。兩者都記 `WARN`（依來源 IP 節流）。Pulse 的 `report.interval` 最短 1 秒，且同一時間只有一筆 report 在途，正常不會觸及。
 - 每條連線的訊息速率上限也是固定值：所有訊息（含無效的行）可連續 50 則，之後每秒 20 則；超過時延後處理（每則最多 0.05 秒，期間不讀取該連線），不回錯誤，並記 `WARN`（依來源 IP 節流）。
 - 環境變數的值一律以字串讀入，數值與布林欄位在載入時才轉型；路徑、位址等字串欄位保持原樣（例如 `KAIROS__STORAGE__DATA_DIR=0001` 就是 `0001`，不會變成 `1`）。`KAIROS__AUTH__CRL` 仍以逗號分隔多個檔案（設定檔中的 `auth.crl` 可為陣列或逗號分隔的字串）。
-- 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days` 與 `log.retention_days` 必須介於 0～3650、`log.level` 必須是可用值。
+- 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days` 與 `log.retention_days` 必須介於 0～3650、`server.cert_expiry_warning_days` 與 `auth.crl_expiry_warning_days` 必須介於 0～365、`log.level` 必須是可用值。
 - 熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL **檔案的內容**（以內容雜湊比對，不依賴修改時間），套用時的日誌會列出變更的檔案種類，例如「已重新載入 TLS 設定（變更：cert、key；mTLS：啟用，CRL 1 份）」；`kairos.toml` 本身的設定變更（例如改監聽位址、改 `auth.client_ca` 的路徑）仍需重新啟動。
 - 熱重載讀檔卡住時（例如網路磁碟、FIFO），每個週期最多等 `min(10 秒, server.reload_interval_secs)`：逾時記 `ERROR`（「檢查 TLS 設定檔超過 … 秒仍未完成」），不再啟動新的檢查，但現役連線的客戶端憑證仍以目前的設定照常重新驗證；檢查完成後記「檢查 TLS 設定檔已恢復」。
 
@@ -644,6 +661,9 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 | `[WARN] 無法刪除過期的 ...` | 過期的 report 或日誌檔被其他程式開啟或沒有權限；下一次定期清除（每小時）會再嘗試。 |
 | `無法開啟 client-ca.pem: ...`、`client-ca.pem 中找不到CA 憑證` | `auth.client_ca` 指向的檔案不存在或沒有 `BEGIN CERTIFICATE` 區塊；修正路徑或內容，或清空 `auth.client_ca` 停用 mTLS。 |
 | 啟用 mTLS 後代理連不上，伺服器記錄 `[WARN] ... TLS 握手失敗: peer sent no certificates` | 代理沒有出示客戶端憑證，TLS 握手失敗（沒有應用層錯誤訊息）。確認 Pulse 已設定客戶端憑證與私鑰。 |
+| `[WARN] CRL agents.crl 將在 … 後過期…` | CRL 的 `nextUpdate` 剩下 `auth.crl_expiry_warning_days` 天以內。在管理主機重新產生 CRL 並部署（INSTALL 第 6.4、10.1 節）；有使用 `kairos-crl.timer` 時以 `systemctl status kairos-crl.service`、`journalctl -u kairos-crl` 確認排程是否失敗。部署後下一個重載週期會記「…解除預警」。 |
+| `[ERROR] CRL agents.crl 已過期…` | CRL 已超過 `nextUpdate`，所有代理都被拒絕（`ExpiredRevocationList`）。立即重新產生並部署，不需重新啟動。 |
+| `[WARN] 伺服器憑證 cert.pem 將在 … 後到期…`、`[ERROR] 伺服器憑證 cert.pem 已於 … 過期…` | 依「私有 CA」重新簽發伺服器憑證，以 `mv` 覆寫 `cert.pem`（換金鑰時一併換 `key.pem`），下一個重載週期自動套用。 |
 | 伺服器記錄 `invalid peer certificate: UnknownIssuer` | 客戶端憑證不是由 `auth.client_ca` 中的 CA 簽發。 |
 | 伺服器記錄 `invalid peer certificate: Expired` 或 `... InvalidPurpose` | 客戶端憑證已過期，或缺少 `extendedKeyUsage=clientAuth`；重新簽發。 |
 | 代理收到 `auth_failed`，伺服器記錄 `... 的 hello agent_id "..." 未通過客戶端憑證綁定，關閉連線: ...` | 憑證的 SAN 不是 `DNS:<該代理的 agent_id>`（代理收到的 message 為 `agent_id does not match client certificate`），或憑證含多個 DNS SAN（message 為 `client certificate must contain exactly one DNS SAN`，伺服器日誌為「客戶端憑證含 N 個 DNS SAN，必須恰好一個」）。常見原因：代理重新產生了 `agent.id`、憑證拿錯台，或簽發時漏了 `-copy_extensions copyall` 導致憑證沒有 SAN。用 `openssl x509 -in <cert> -noout -ext subjectAltName` 檢查。 |
@@ -664,7 +684,7 @@ kairos/
 ├── kairos.example.toml    設定檔範本
 ├── PROTOCOL.md            Pulse ↔ Kairos 協定規格
 ├── build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
-├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、INSTALL.md（安裝指南）
+├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、kairos-crl.service／kairos-crl.timer（CRL 定期更新範例）、INSTALL.md（安裝指南）
 ├── testdata/              單元測試用的憑證樣本；pki/ 為測試用 CA、代理憑證與 CRL（見其中的 README）；含測試用私鑰，不可部署
 └── src/
     ├── main.rs            元件組裝、accept 迴圈與連線上限、背景工作監看、關機流程
@@ -673,6 +693,7 @@ kairos/
     ├── fsperm.rs          檔案與目錄權限（Unix：資料檔與日誌檔最多 0640、目錄 0750）
     ├── tls.rs             憑證、私鑰、客戶端 CA 與 CRL 載入；可替換的目前 TLS 設定；憑證鏈重新驗證
     ├── reload.rs          TLS 熱重載與現役連線的客戶端憑證重新驗證
+    ├── expiry.rs          伺服器憑證與 CRL 的到期預警（含讀取 notAfter／nextUpdate 的最小 DER 解析）
     ├── auth.rs            mTLS：客戶端憑證 SAN 與 agent_id 的綁定檢查
     ├── per_ip.rs          每個來源 IP 位址的同時連線數上限、每個來源（IPv6 /64）的新連線速率上限
     ├── rate.rs            token bucket 與跨連線的 report 速率限制

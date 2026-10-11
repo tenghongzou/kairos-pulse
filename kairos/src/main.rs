@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod connection;
+mod expiry;
 mod fsperm;
 #[cfg(test)]
 mod integration_tests;
@@ -507,6 +508,9 @@ async fn run(
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
     let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths)?));
+    // 伺服器憑證與 CRL 的到期預警（O1）：啟動時檢查一次，之後由重載工作（或停用重載時的定期工作）檢查
+    let mut expiry_warner = expiry::ExpiryWarner::new(config.expiry_policy());
+    expiry_warner.check_and_log(&tls_state.current().expiries, true);
     // 伺服器私鑰權限過寬時提醒（S8；只在 Unix 檢查，熱重載換了私鑰時再檢查一次）
     if let Some(message) = fsperm::key_permission_warning(Path::new(&tls_paths.key)) {
         warn!("{}", message);
@@ -604,9 +608,22 @@ async fn run(
 
     // TLS 熱重載與現役連線的客戶端憑證重新驗證
     match config.server.reload_interval_secs {
-        0 => warn!(
-            "已停用 TLS 熱重載（server.reload_interval_secs = 0）：更換憑證、CA 或 CRL 需重新啟動，現役連線的客戶端憑證也不會重新驗證"
-        ),
+        0 => {
+            warn!(
+                "已停用 TLS 熱重載（server.reload_interval_secs = 0）：更換憑證、CA 或 CRL 需重新啟動，現役連線的客戶端憑證也不會重新驗證"
+            );
+            // 到期預警仍定期檢查（O1）
+            supervise(
+                "到期預警工作",
+                tokio::spawn(expiry::run(
+                    expiry_warner,
+                    tls_state.clone(),
+                    expiry::PERIODIC_CHECK_WITHOUT_RELOAD,
+                    shutdown.clone(),
+                )),
+                shutdown.clone(),
+            );
+        }
         secs => {
             info!("每 {} 秒檢查憑證、私鑰、客戶端 CA 與 CRL 是否變更", secs);
             supervise(
@@ -619,6 +636,7 @@ async fn run(
                     ),
                     registry.clone(),
                     tls_state.clone(),
+                    expiry_warner,
                     Duration::from_secs(secs),
                     shutdown.clone(),
                 )),

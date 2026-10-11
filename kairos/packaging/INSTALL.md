@@ -13,6 +13,7 @@
 | `kairos` | 755 | 執行檔（x86_64、musl 靜態連結，不依賴系統函式庫） |
 | `kairos.example.toml` | 644 | 設定範本，複製成 `kairos.toml` 後修改 |
 | `kairos.service` | 644 | systemd unit 範本 |
+| `kairos-crl.service`、`kairos-crl.timer` | 644 | CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 
@@ -216,7 +217,7 @@ openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl
 
 把新的 `agents.crl` 部署到 Kairos（第 10.1 節）。Kairos 在下一個重載週期（`server.reload_interval_secs`，預設 30 秒）載入，被撤銷的代理收到 `certificate_rejected` 並被斷線，之後重連在 TLS 握手階段就被拒；其他代理不受影響。
 
-> **CRL 過期會讓所有代理被拒。** Kairos 對 CRL 採 fail closed：超過 `nextUpdate`（上面設定為 30 天）就視為無法判定撤銷狀態。請在到期前定期重新產生並部署，例如每週一次（即使沒有新的撤銷）。`openssl crl -in agents.crl -noout -nextupdate` 可查看到期時間。
+> **CRL 過期會讓所有代理被拒。** Kairos 對 CRL 採 fail closed：超過 `nextUpdate`（上面設定為 30 天）就視為無法判定撤銷狀態。請在到期前定期重新產生並部署，例如每週一次（即使沒有新的撤銷；第 10.3 節的 `kairos-crl.timer`）。`openssl crl -in agents.crl -noout -nextupdate` 可查看到期時間。Kairos 在 `nextUpdate` 前 7 天（`auth.crl_expiry_warning_days`）起記 `WARN`，過期後記 `ERROR`。
 
 ## 7. 放置設定與憑證
 
@@ -324,6 +325,7 @@ cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於�
 
 - 啟動失敗並出現 `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動`：`kairos.toml` 沒有設定 `auth.client_ca`。依第 6、7 節啟用 mTLS。
 - 出現 `未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 …（auth.allow_unauthenticated = true）` 的 `WARN`：設定了 `auth.allow_unauthenticated = true`，正式環境不可如此。
+- 出現 `CRL … 將在 … 後過期` 或 `伺服器憑證 … 將在 … 後到期` 的 `WARN`（已過期時為 `ERROR`）：依第 10.1、10.3 節更新。
 - 出現 `伺服器私鑰 … 的權限過寬` 的 `WARN`：`key.pem` 讓其他使用者有權限、group 可寫入，或 group 可讀但群組不是 `kairos`。依訊息執行 `chown root:kairos /opt/kairos/key.pem && chmod 640 /opt/kairos/key.pem`。Kairos 在啟動時與熱重載換了私鑰時檢查，只記錄不拒絕啟動。
 - 出現 `可開啟的檔案數上限（RLIMIT_NOFILE soft limit）…` 的 `WARN`：unit 的 `LimitNOFILE` 沒有生效或小於 `server.max_connections` + 64；依訊息中的建議值以 drop-in 調高 `LimitNOFILE`（`systemctl show kairos -p LimitNOFILE` 可確認目前值）。
 - 從其他主機確認 TLS 與伺服器憑證：`openssl s_client -connect monitor.example.com:8080 -CAfile ca.pem -servername monitor.example.com </dev/null`（啟用 mTLS 時，沒帶客戶端憑證會在握手後被拒，這是正常的）。
@@ -360,6 +362,47 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 - `/opt/kairos/kairos.toml`、憑證與 CRL
 - `/opt/kairos/data/`（report 的 JSONL）。搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
 - 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
+
+### 10.3 定期更新 CRL（kairos-crl.timer）
+
+發佈包附有 `kairos-crl.service`（重新產生 CRL、檢查後部署）與 `kairos-crl.timer`（每週執行一次）範例。安裝在**保存代理 CA 的主機**（第 6.2 節的 `agent-ca/`）上；`kairos-crl.service` 依序：
+
+1. `openssl ca -gencrl` 產生到 `agents.crl.new`；
+2. 確認由 `client-ca.pem` 簽發、`nextUpdate` 在未來；
+3. 改名為 `agents.crl`，再部署到 Kairos。
+
+任一步失敗時後面的步驟不會執行，Kairos 上的 CRL 維持原樣。
+
+```bash
+# 以下以代理 CA 放在 /srv/kairos-pki/agent-ca、由 kairos-pki 帳號擁有為例
+install -m 644 ~/kairos-dist/pkg/kairos-crl.service ~/kairos-dist/pkg/kairos-crl.timer /etc/systemd/system/
+systemctl edit kairos-crl.service      # 依實際環境覆寫 User、Group、WorkingDirectory 與部署方式
+systemctl daemon-reload
+systemctl start kairos-crl.service     # 先手動執行一次
+journalctl -u kairos-crl -n 20 --no-pager
+systemctl enable --now kairos-crl.timer
+systemctl list-timers kairos-crl.timer
+```
+
+部署方式（`ExecStartPost`）二擇一：
+
+- **CA 與 Kairos 在同一台主機**（範例預設）：以 root 執行 `install -o root -g kairos -m 644 … /opt/kairos/agents.crl.new` 再 `mv` 覆寫。代理 CA 的私鑰因此放在伺服器上，伺服器被入侵時攻擊者可以簽發代理憑證，請依組織政策評估。
+- **CA 在另一台管理主機**：在 Kairos 主機建立部署帳號與只放 CRL 的目錄，讓部署帳號可寫、`kairos` 群組可讀，並把 `auth.crl` 指向該目錄：
+
+  ```bash
+  # Kairos 主機
+  useradd --system --create-home --shell /bin/sh crl-deploy
+  install -d -o crl-deploy -g kairos -m 750 /opt/kairos/crl
+  install -o crl-deploy -g kairos -m 644 /opt/kairos/agents.crl /opt/kairos/crl/agents.crl
+  # kairos.toml：[auth] crl = ["crl/agents.crl"]，之後 systemctl restart kairos
+  # 管理主機的 kairos-pki 帳號以 SSH 金鑰登入 crl-deploy（建議在 authorized_keys 加上 from= 等限制）
+  ```
+
+  再以 drop-in 改用 `scp` 與 `ssh … mv`（`kairos-crl.service` 註解中有範例）。CRL 由 CA 簽章，傳輸途中被竄改時 Kairos 會拒絕載入並保留舊的 CRL（記 `ERROR`）。
+
+更新間隔要遠小於 CRL 的有效期間（`ca.cnf` 的 `default_crl_days = 30` 時每週一次，可容許連續失敗 3 次）。排程失敗時 Kairos 會在 `nextUpdate` 前 7 天起記 `WARN`「CRL … 將在 … 後過期」，請以 `systemctl status kairos-crl.service` 檢查。
+
+伺服器憑證到期前 30 天（`server.cert_expiry_warning_days`）起 Kairos 也會記 `WARN`，請依第 6.1 節重新簽發並依第 10.1 節覆寫。
 
 ## 11. 升級
 
@@ -426,5 +469,7 @@ userdel kairos
 | `無法開啟 key.pem: Permission denied` | 私鑰權限或群組不對：應為 `root:kairos` 640 |
 | `無法監聽 0.0.0.0:443: Permission denied` | 監聽 1024 以下的連接埠需要 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（第 8 節 drop-in） |
 | 日誌在 journal 與 `logs/` 各一份 | 預設行為，見第 9.2 節 |
-| 所有代理突然被拒，日誌出現 `ExpiredRevocationList` | CRL 過期。依第 6.4 節重新產生並依第 10.1 節部署 |
+| 所有代理突然被拒，日誌出現 `ExpiredRevocationList` 或 `CRL … 已過期` | CRL 過期。依第 6.4 節重新產生並依第 10.1 節部署；之後設定第 10.3 節的 `kairos-crl.timer` |
+| `[WARN] CRL … 將在 … 後過期` | CRL 即將過期：依第 6.4、10.1 節更新；使用 `kairos-crl.timer` 時檢查 `journalctl -u kairos-crl` |
+| `[WARN] 伺服器憑證 … 將在 … 後到期` | 依第 6.1 節重新簽發，依第 10.1 節覆寫 |
 | 其他錯誤訊息 | 見 `README.md`「疑難排解」 |

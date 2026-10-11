@@ -50,6 +50,15 @@ pub const MAX_RETENTION_DAYS: u32 = 3650;
 /// TLS 熱重載檢查間隔的上限（秒；0 表示停用）
 pub const MAX_RELOAD_INTERVAL_SECS: u64 = 3600;
 
+/// `server.cert_expiry_warning_days` 的預設值：伺服器憑證到期前 30 天開始預警
+pub const DEFAULT_CERT_EXPIRY_WARNING_DAYS: u32 = 30;
+
+/// `auth.crl_expiry_warning_days` 的預設值：CRL 的 nextUpdate 前 7 天開始預警
+pub const DEFAULT_CRL_EXPIRY_WARNING_DAYS: u32 = 7;
+
+/// 到期預警天數的上限（0 表示不預警，已過期時仍記錄 ERROR）
+pub const MAX_EXPIRY_WARNING_DAYS: u32 = 365;
+
 /// `auth.crl` 以環境變數設定時的清單分隔字元
 pub const LIST_SEPARATOR: &str = ",";
 
@@ -83,6 +92,8 @@ pub struct ServerSettings {
     pub max_connections_per_ip: Option<usize>,
     /// 每隔幾秒檢查憑證、私鑰、客戶端 CA 與 CRL 檔是否變更（並重新驗證現役連線的客戶端憑證）；0 = 停用
     pub reload_interval_secs: u64,
+    /// 伺服器憑證到期前幾天開始記 WARN（O1）；0 = 不預警（已過期時仍記錄 ERROR）
+    pub cert_expiry_warning_days: u32,
 }
 
 impl Default for ServerSettings {
@@ -94,6 +105,7 @@ impl Default for ServerSettings {
             max_connections: 1024,
             max_connections_per_ip: None,
             reload_interval_secs: 30,
+            cert_expiry_warning_days: DEFAULT_CERT_EXPIRY_WARNING_DAYS,
         }
     }
 }
@@ -151,7 +163,7 @@ impl Default for StorageSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
     /// 非空：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 agent_id 與憑證綁定
@@ -167,6 +179,20 @@ pub struct AuthSettings {
     /// 預設 `false`：監聽非 loopback 位址又沒有 mTLS 時拒絕啟動，見 [`AppConfig::check_listen_auth`]。
     /// 啟用 mTLS 時不生效
     pub allow_unauthenticated: bool,
+    /// CRL 的下次更新時間（nextUpdate）前幾天開始記 WARN（O1）；0 = 不預警（已過期時仍記錄 ERROR）
+    pub crl_expiry_warning_days: u32,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            client_ca: String::new(),
+            crl: Vec::new(),
+            allow_multiple_dns_sans: false,
+            allow_unauthenticated: false,
+            crl_expiry_warning_days: DEFAULT_CRL_EXPIRY_WARNING_DAYS,
+        }
+    }
 }
 
 impl AuthSettings {
@@ -369,6 +395,14 @@ impl AppConfig {
         (max > 0 && estimate > max).then_some((max, estimate))
     }
 
+    /// 到期預警的門檻（O1）
+    pub fn expiry_policy(&self) -> crate::expiry::ExpiryPolicy {
+        crate::expiry::ExpiryPolicy {
+            cert_warning_days: self.server.cert_expiry_warning_days,
+            crl_warning_days: self.auth.crl_expiry_warning_days,
+        }
+    }
+
     /// 實際使用的狀態表上限：明確設定的值，或 `max(10000, max_connections)`
     pub fn max_agents(&self) -> usize {
         self.limits
@@ -540,6 +574,26 @@ impl AppConfig {
                 ),
             ));
         }
+        for (name, value) in [
+            (
+                "server.cert_expiry_warning_days",
+                self.server.cert_expiry_warning_days,
+            ),
+            (
+                "auth.crl_expiry_warning_days",
+                self.auth.crl_expiry_warning_days,
+            ),
+        ] {
+            if value > MAX_EXPIRY_WARNING_DAYS {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{} 必須介於 0..={}（目前為 {}）",
+                        name, MAX_EXPIRY_WARNING_DAYS, value
+                    ),
+                ));
+            }
+        }
         if !self.auth.crl_paths().is_empty() && self.auth.client_ca_path().is_none() {
             return invalid("auth.crl 只在設定 auth.client_ca（啟用 mTLS）時有效");
         }
@@ -578,6 +632,8 @@ mod tests {
         assert_eq!(c.max_agents(), 10000);
         assert!(!c.auth.allow_multiple_dns_sans);
         assert!(!c.auth.allow_unauthenticated);
+        assert_eq!(c.server.cert_expiry_warning_days, 30);
+        assert_eq!(c.auth.crl_expiry_warning_days, 7);
         assert_eq!(c.timeouts.handshake_secs, 5);
         assert_eq!(c.timeouts.hello_secs, 5);
         assert_eq!(c.timeouts.write_secs, 5);
@@ -703,7 +759,14 @@ mod tests {
         c.limits.max_agents = Some(MAX_MAX_AGENTS);
         assert!(c.validate().is_ok());
 
-        let mutations: [fn(&mut AppConfig); 9] = [
+        let mut ok = AppConfig::default();
+        ok.server.cert_expiry_warning_days = MAX_EXPIRY_WARNING_DAYS;
+        ok.auth.crl_expiry_warning_days = 0;
+        assert!(ok.validate().is_ok());
+
+        let mutations: [fn(&mut AppConfig); 11] = [
+            |c| c.server.cert_expiry_warning_days = MAX_EXPIRY_WARNING_DAYS + 1,
+            |c| c.auth.crl_expiry_warning_days = MAX_EXPIRY_WARNING_DAYS + 1,
             |c| c.timeouts.handshake_secs = MAX_TIMEOUT_SECS + 1,
             |c| c.timeouts.hello_secs = u64::MAX,
             // X2：伺服器最壞回應延遲（含 write_secs）必須小於 Pulse 讀取閒置中的 10 秒餘裕
@@ -747,9 +810,20 @@ mod tests {
             ("KAIROS__AUTH__CRL", "a.crl,b.crl"),
             ("KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS", "true"),
             ("KAIROS__AUTH__ALLOW_UNAUTHENTICATED", "true"),
+            ("KAIROS__AUTH__CRL_EXPIRY_WARNING_DAYS", "14"),
+            ("KAIROS__SERVER__CERT_EXPIRY_WARNING_DAYS", "60"),
         ])
         .unwrap();
         assert!(c.auth.allow_unauthenticated);
+        assert_eq!(c.auth.crl_expiry_warning_days, 14);
+        assert_eq!(c.server.cert_expiry_warning_days, 60);
+        assert_eq!(
+            c.expiry_policy(),
+            crate::expiry::ExpiryPolicy {
+                cert_warning_days: 60,
+                crl_warning_days: 14
+            }
+        );
         assert_eq!(c.server.listen, "0.0.0.0:9000");
         assert_eq!(c.server.max_connections, 64);
         assert_eq!(c.server.max_connections_per_ip, Some(4));

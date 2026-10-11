@@ -1,0 +1,23 @@
+# 每週重新產生並部署 Kairos 的代理 CRL（執行 kairos-crl.service）範例
+#
+# CRL 有效期間（ca.cnf 的 default_crl_days）為 30 天時，每週更新一次可容許連續失敗 3 次；
+# Kairos 在 nextUpdate 前 7 天（auth.crl_expiry_warning_days）開始記 WARN。
+# 調整 default_crl_days 時，請讓更新間隔遠小於有效期間。
+#
+# 安裝與確認見 INSTALL.md 第 10.3 節：
+#   systemctl enable --now kairos-crl.timer
+#   systemctl list-timers kairos-crl.timer
+
+[Unit]
+Description=Weekly regeneration of the Kairos agent CRL
+Documentation=file:/opt/kairos/INSTALL.md
+
+[Timer]
+OnCalendar=weekly
+# 分散執行時間，避免與其他每週工作同時啟動
+RandomizedDelaySec=1h
+# 主機在預定時間關機時，開機後補執行
+Persistent=true
+
+[Install]
+WantedBy=timers.target
