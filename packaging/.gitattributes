@@ -1,0 +1,5 @@
+# 腳本必須是 LF（core.autocrlf=true 的 Windows checkout 也一樣）
+*.sh  text eol=lf
+*.hbs text eol=lf
+*.toml text eol=lf
+*.md  text eol=lf

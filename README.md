@@ -46,9 +46,11 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 發佈包（Linux x86_64 musl 靜態執行檔，需要 Docker）：
 
 ```bash
-sh kairos/packaging/build-release.sh    # 輸出到 kairos/dist/
-sh pulse/packaging/build-release.sh     # 輸出到 pulse/dist/
+sh kairos/packaging/build-release.sh    # 輸出到 dist/kairos-<版本>-<commit>-linux-x86_64.tar.gz
+sh pulse/packaging/build-release.sh     # 輸出到 dist/pulse-<版本>-<commit>-linux-x86_64.tar.gz
 ```
+
+兩個腳本都輸出到根目錄的 `dist/`，並更新同一份合併的 `dist/SHA256SUMS`（只替換本次產出檔案的那幾列）。共用實作在 `packaging/build-release-common.sh`；建置 image 以 `@sha256:` digest 固定。
 
 `--version` 顯示的 commit 是本 monorepo 的 commit。
 

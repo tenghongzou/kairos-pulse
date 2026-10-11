@@ -6,7 +6,7 @@
 
 ## 0. 發佈包內容
 
-發佈包 `pulse-<commit>-linux-x86_64.tar.gz` 內含一層 `pulse-<commit>-linux-x86_64/` 目錄：
+發佈包 `pulse-<版本>-<commit>-linux-x86_64.tar.gz` 內含一層 `pulse-<版本>-<commit>-linux-x86_64/` 目錄：
 
 | 檔案 | 權限 | 說明 |
 |---|---|---|
@@ -17,7 +17,7 @@
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 
-檔名中的 `<commit>` 是建置時的 git commit；檔名帶 `-dirty` 表示從有未提交變更的工作目錄建置，**不應**用於正式環境。
+檔名中的 `<版本>` 是 SemVer 版本號（與 `--version` 相同，版本規則見 `CHANGELOG.md`），`<commit>` 是建置時的 git commit；檔名帶 `-dirty` 表示從有未提交變更的工作目錄建置，**不應**用於正式環境。
 
 以下範例的路徑與名稱：
 
@@ -54,7 +54,7 @@ sudo -i          # 之後的指令都在這個 shell 中執行；本文件的 ~ 
 
 ```bash
 mkdir -p ~/pulse-dist && cd ~/pulse-dist
-# 取得 pulse-<commit>-linux-x86_64.tar.gz 與 SHA256SUMS（放在同一個目錄）
+# 取得 pulse-<版本>-<commit>-linux-x86_64.tar.gz 與 SHA256SUMS（放在同一個目錄）
 sha256sum -c SHA256SUMS                  # 必須顯示「…: OK」，否則不要解壓
 ```
 
@@ -67,7 +67,7 @@ sha256sum -c SHA256SUMS                  # 必須顯示「…: OK」，否則不
 ```bash
 cd ~/pulse-dist
 mkdir -p pkg
-tar xzf pulse-<commit>-linux-x86_64.tar.gz -C pkg --strip-components=1
+tar xzf pulse-<版本>-<commit>-linux-x86_64.tar.gz -C pkg --strip-components=1
 file pkg/pulse               # 應為 ELF 64-bit x86-64 static-pie linked
 pkg/pulse --version          # 輸出 pulse <版本> (<commit>)，commit 應與檔名一致
 ```
@@ -378,7 +378,7 @@ tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄�
 # 1. 下載並驗證新版，解壓到新的目錄
 cd ~/pulse-dist && sha256sum -c SHA256SUMS
 rm -rf pkg-new && mkdir pkg-new
-tar xzf pulse-<新commit>-linux-x86_64.tar.gz -C pkg-new --strip-components=1
+tar xzf pulse-<新版本>-<新commit>-linux-x86_64.tar.gz -C pkg-new --strip-components=1
 pkg-new/pulse --version
 
 # 2. 比對預設值與 unit 是否有變動（pulse.toml 只寫覆蓋值，通常不必改）
