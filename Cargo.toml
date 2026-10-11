@@ -1,5 +1,6 @@
 [workspace]
-# crates/ 下為兩個產品共用的內部 crate（publish = false），見各自的 Cargo.toml
-members = ["kairos", "pulse", "crates/*"]
+# crates/ 下為兩個產品共用的內部 crate（publish = false），見各自的 Cargo.toml；
+# tests/e2e 為啟動實際執行檔的端對端測試（publish = false），見根目錄 README「端對端測試」
+members = ["kairos", "pulse", "crates/*", "tests/e2e"]
 # 兩個成員皆為 edition 2024，其預設 resolver 為 "3"；虛擬 manifest 必須明確指定才會一致
 resolver = "3"
