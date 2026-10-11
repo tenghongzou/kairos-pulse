@@ -417,6 +417,8 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 `cpu_usage` 是「上次取樣到這次取樣之間」（約等於 `report.interval`）所有 CPU 的平均使用率：取樣任務沿用同一個 sysinfo `System`，每次取樣只刷新一次，而不是只量約 200 ms 的瞬間值。第一筆也一樣：取樣任務啟動時先刷新一次作為基準，第一次取樣在一個 `report.interval` 之後，因此不會只量到啟動當下的負載（代價是啟動後要等一個 `report.interval` 才有第一筆 report）。
 
+**取樣逾時**：一次取樣（sysinfo 刷新，Windows 上可能經由 WMI）超過 `clamp(report.interval, 2 秒, 10 秒)` 仍未完成時，記 `WARN` 並略過這次 report。heartbeat 由連線任務獨立送出、不受影響，因此 Kairos 仍會顯示此主機在線，只是不再收到新的 report；本機日誌的 `WARN` 是發現這種情況的依據。卡住的系統呼叫無法中斷：取樣完成前不再發起新的取樣（避免卡住的執行緒越積越多），期間持續略過 report，每 10 分鐘再提醒一次（附已略過的次數）；完成後記 `INFO`「系統資訊取樣已恢復」，以完成當下為新的 CPU 基準，下一次取樣恢復回報。Kairos 端依 `last_report` 停滯時間偵測此情況尚未實作。
+
 Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收到回應時的取樣、以及伺服器回 `storage_unavailable` 的那一筆，都會直接丟棄，不補送。
 
 ## 重連行為
@@ -531,6 +533,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 - 斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會暫存補送（at-most-once，協定設計如此）。
 - Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
+- 取樣卡住（例如 WMI 無回應）時只在本機記 `WARN` 並略過 report，heartbeat 照常送出；Kairos 目前不會因 `last_report` 停滯而告警（見「回報資料格式」）。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
 - `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
 - Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
