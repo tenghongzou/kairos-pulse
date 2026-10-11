@@ -35,8 +35,8 @@ fn average_cpu_usage(sys: &System) -> f32 {
     total / cpus.len() as f32
 }
 
-/// hello 中 `hostname` 的長度上限（bytes），見 PROTOCOL.md。
-const MAX_HOSTNAME_BYTES: usize = 255;
+// hello 中 `hostname` 的長度上限（bytes），見 PROTOCOL.md；與 Kairos 的驗證共用同一個常數。
+use kairos_proto::MAX_HOSTNAME_BYTES;
 
 /// 主機名稱（僅供顯示），已符合協定限制（見 `normalize_hostname`）。
 ///

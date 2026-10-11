@@ -91,6 +91,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "date-guard"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -238,8 +247,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "config",
+ "date-guard",
  "fern",
  "futures-util",
+ "kairos-proto",
  "log",
  "rustls-webpki",
  "serde",
@@ -247,6 +258,14 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+]
+
+[[package]]
+name = "kairos-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -386,8 +405,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "config",
+ "date-guard",
  "fern",
  "futures-util",
+ "kairos-proto",
  "log",
  "rustls-native-certs",
  "rustls-webpki",

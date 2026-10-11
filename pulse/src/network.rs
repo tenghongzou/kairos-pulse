@@ -31,8 +31,8 @@ use crate::backoff::Backoff;
 use crate::config_manager::AppConfig;
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
-    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, ServerMsg, now_ts, report_cpu_usage,
-    sanitize_cpu_usage,
+    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, Proto, ServerMsg, ServerMsgError, now_ts,
+    parse_server_msg, report_cpu_usage, sanitize_cpu_usage,
 };
 use crate::service_status;
 use crate::system_info::Sample;
@@ -90,6 +90,8 @@ const STORAGE_UNAVAILABLE_LOG_WINDOW: Duration = Duration::from_secs(300);
 struct ServerLogThrottles {
     /// 無法解析的行
     unparsable: LogThrottle,
+    /// 不認得的訊息類型（DEBUG；A14）
+    unknown_type: LogThrottle,
     /// 註冊後又收到 hello_ack
     unexpected_hello_ack: LogThrottle,
     /// 註冊後的非致命 error（storage_unavailable 除外）
@@ -106,6 +108,7 @@ impl Default for ServerLogThrottles {
     fn default() -> Self {
         Self {
             unparsable: LogThrottle::default(),
+            unknown_type: LogThrottle::default(),
             unexpected_hello_ack: LogThrottle::default(),
             nonfatal_error: LogThrottle::default(),
             storage_unavailable: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
@@ -789,7 +792,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let seq = conn.next_seq();
     conn.send(&ClientMsg::Hello {
         seq,
-        proto: PROTO_VERSION,
+        proto: Proto::Version(PROTO_VERSION),
         agent_id: settings.agent_id.clone(),
         hostname: settings.hostname.clone(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1022,7 +1025,7 @@ fn handle_pre_ack_line(
     hello_seq: u64,
     throttles: &mut ServerLogThrottles,
 ) -> Result<Option<u64>> {
-    match serde_json::from_str::<ServerMsg>(line) {
+    match parse_server_msg(line) {
         Ok(ServerMsg::HelloAck {
             seq,
             proto,
@@ -1098,7 +1101,7 @@ fn handle_server_line(
     last_sent_seq: u64,
     throttles: &mut ServerLogThrottles,
 ) -> Result<LineOutcome> {
-    match serde_json::from_str::<ServerMsg>(line) {
+    match parse_server_msg(line) {
         Ok(ServerMsg::Ack { seq }) => {
             let answered = answered_seq(Some(seq), last_sent_seq);
             if answered.is_none() {
@@ -1168,7 +1171,21 @@ fn seq_text(seq: Option<u64>) -> String {
 }
 
 /// 記錄無法解析的伺服器訊息（節流）；解析錯誤本身也可能含有原始內容，一併清理。
-fn log_unparsable(throttles: &mut ServerLogThrottles, line: &str, e: &serde_json::Error) {
+///
+/// 不認得的訊息類型（A14）：協定規定雙方忽略不認得的內容以便日後擴充，較新版的 Kairos
+/// 可能送出本程式不認得的訊息，因此只記 DEBUG（仍節流），不當成伺服器異常記 WARN。
+/// 處置與其他無法解析的行相同：忽略，且不算合法訊息（不重置讀取閒置計時）。
+fn log_unparsable(throttles: &mut ServerLogThrottles, line: &str, e: &ServerMsgError) {
+    if let ServerMsgError::UnknownType(kind) = e {
+        throttled!(
+            throttles.unknown_type,
+            debug,
+            "伺服器送來本程式不認得的訊息類型 {}（可能是較新版的 Kairos），忽略：{}",
+            sanitize_for_log(kind, LOG_CODE_LIMIT),
+            sanitize_for_log(line, LOG_TEXT_LIMIT)
+        );
+        return;
+    }
     throttled!(
         throttles.unparsable,
         warn,
@@ -1488,6 +1505,45 @@ mod tests {
         // 第一則有記錄，其餘 999 則被略過並等待下次記錄時回報
         assert_eq!(t.unparsable.check(Instant::now()), None);
         assert_eq!(t.unexpected_hello_ack.check(Instant::now()), None);
+    }
+
+    #[test]
+    fn unknown_message_type_is_debug_and_throttled() {
+        // A14：較新版 Kairos 的新訊息類型只記 DEBUG（節流），壞掉的訊息仍記 WARN
+        let ((), logs) = crate::test_log::capture(|| {
+            let mut t = ServerLogThrottles::default();
+            for _ in 0..100 {
+                assert_eq!(
+                    handle_server_line(r#"{"type":"future_msg","seq":3}"#, 3, &mut t).unwrap(),
+                    LineOutcome::IGNORED
+                );
+                assert_eq!(
+                    handle_pre_ack_line(r#"{"type":"future_msg"}"#, 1, &mut t).unwrap(),
+                    None
+                );
+            }
+            // 已知類型但欄位錯誤：仍是無法解析的訊息
+            assert_eq!(
+                handle_server_line(r#"{"type":"ack"}"#, 3, &mut t).unwrap(),
+                LineOutcome::IGNORED
+            );
+            // 未知類型走自己的節流類別，沒有用掉「無法解析」的額度
+            assert_eq!(t.unknown_type.check(Instant::now()), None);
+            assert_eq!(t.unparsable.check(Instant::now()), None);
+        });
+        let unknown: Vec<_> = logs
+            .iter()
+            .filter(|(_, m)| m.contains("不認得的訊息類型"))
+            .collect();
+        assert_eq!(unknown.len(), 1, "{logs:?}");
+        assert_eq!(unknown[0].0, log::Level::Debug);
+        assert!(unknown[0].1.contains("future_msg"), "{unknown:?}");
+        let warns: Vec<_> = logs
+            .iter()
+            .filter(|(l, _)| *l == log::Level::Warn)
+            .collect();
+        assert_eq!(warns.len(), 1, "{logs:?}");
+        assert!(warns[0].1.contains("無法解析伺服器訊息"), "{warns:?}");
     }
 
     #[test]

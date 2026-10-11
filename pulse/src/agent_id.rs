@@ -14,6 +14,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+// agent_id 的格式與正規化規則與 Kairos 共用（PROTOCOL.md「hello 欄位限制」）
+use kairos_proto::{is_uuid_text, normalize_agent_id};
+
 /// UTF-8 BOM（Windows 記事本存檔時可能加上）。
 const UTF8_BOM: char = '\u{feff}';
 
@@ -125,7 +128,7 @@ fn validate(path: &Path, content: Option<String>) -> io::Result<Option<String>> 
             ),
         ));
     }
-    Ok(Some(id.to_ascii_lowercase()))
+    Ok(Some(normalize_agent_id(&id)))
 }
 
 /// Unix：agent_id 檔案對群組或其他使用者開放任何權限（讀取、寫入或執行）時，
@@ -279,16 +282,6 @@ fn temp_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "agent.id".into());
     name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
     path.with_file_name(name)
-}
-
-/// 是否為 UUID 文字格式：8-4-4-4-12 個十六進位字元（大小寫皆可），共 36 字元。
-fn is_uuid_text(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => *b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
 }
 
 /// 錯誤訊息用：過長內容只顯示開頭。
