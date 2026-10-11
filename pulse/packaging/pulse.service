@@ -1,0 +1,79 @@
+# Pulse 系統層級 systemd unit 範本（單一實例，/opt/pulse）
+#
+# 安裝（完整步驟見 INSTALL.md）：
+#   install -m 644 pulse.service /etc/systemd/system/pulse.service
+#   systemctl daemon-reload && systemctl enable --now pulse
+#
+# 前提：
+#   - 專用使用者 pulse（無登入 shell），程式與設定在 /opt/pulse
+#   - /opt/pulse/agent.id 已事先以 `pulse --print-agent-id` 產生（ProtectSystem=strict
+#     下 /opt/pulse 本身唯讀，服務無法自行建立 agent.id）
+#   - /opt/pulse/logs 已建立且屬於 pulse（唯一可寫的目錄；不存在時 unit 會以
+#     226/NAMESPACE 啟動失敗）
+#
+# 同一台主機要跑多個實例時，每個實例複製一份 unit（例如 pulse-2.service 對應 /opt/pulse-2），
+# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行；執行檔仍用 /opt/pulse/pulse。
+# 詳見 INSTALL.md 第 9 節。
+#
+# 修改請用 `systemctl edit pulse` 建立 drop-in，不要直接改這個檔案。
+
+[Unit]
+Description=Pulse monitoring agent
+Documentation=file:/opt/pulse/INSTALL.md file:/opt/pulse/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 只用 sd_notify 更新狀態文字（systemctl status 的「Status:」：已註冊／無法註冊：<錯誤碼>／
+# 重新連線中），不送 READY=1，因此維持 Type=simple；只接受主程序送來的通知
+NotifyAccess=main
+User=pulse
+Group=pulse
+# pulse.toml、agent.id、憑證與 logs/ 都以工作目錄解析
+WorkingDirectory=/opt/pulse
+ExecStart=/opt/pulse/pulse
+
+# 日誌只保留 logs/pulse-YYYY-MM-DD.log 一份（Pulse 的日誌寫到 stdout 與 logs/）。
+# stderr 仍進 journal：設定錯誤、日誌初始化失敗、panic 等「日誌檔還沒開好就發生」的
+# 錯誤都寫在 stderr，`journalctl -u pulse` 仍看得到。需要人工處理的持續性錯誤（憑證被撤銷、
+# auth_failed、狀態表已滿、本機憑證過期等）也會以 err 等級另寫一行到 stderr（同一原因每
+# 10 分鐘最多一行），`journalctl -u pulse -p err` 可篩選。理由見 INSTALL.md。
+StandardOutput=null
+StandardError=journal
+
+# 正常結束：送出 close_notify 後約 1 秒內結束；再送一次訊號會以 130 強制結束
+KillSignal=SIGINT
+TimeoutStopSec=10
+# Pulse 本身會無限重連；這裡處理取樣任務異常、設定錯誤等以非 0 結束的情況
+Restart=always
+RestartSec=10
+
+# ---- 硬化 -------------------------------------------------------------------
+ProtectSystem=strict
+ReadWritePaths=/opt/pulse/logs
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+# hostname 只在啟動時讀取一次（唯讀），主機改名後 systemctl restart pulse 即可反映
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

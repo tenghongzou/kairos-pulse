@@ -1,0 +1,77 @@
+# Pulse 設定範例與預設值
+#
+# 這份檔案有兩種用途，內容相同：
+#   - 原始碼中的 config.toml：編譯時嵌入執行檔，作為所有欄位的預設值。
+#   - 發佈包中的 pulse.example.toml：供參考的範例，程式「不會」讀取這個檔名。
+#
+# 如何修改設定（不要直接修改本檔，修改它不會生效）：
+#   1. 在 Pulse 的工作目錄下另外建立 pulse.toml。
+#   2. 只寫要覆蓋的欄位，其餘沿用內建預設值；不需要把整份檔案複製過去。例如：
+#        [server]
+#        address = "kairos.example.com"
+#        domain = "kairos.example.com"
+#   3. 也可以改用環境變數 PULSE__<SECTION>__<KEY>，例如 PULSE__SERVER__PORT=9000
+#      （環境變數的值一律當字串讀入：數值與布林欄位再轉成對應型別，
+#       路徑、domain、address 等字串欄位保持原樣，例如 0001 不會變成 1）
+#
+# 載入順序（後者覆蓋前者）：內建預設值（本檔內容）→ 工作目錄下的 pulse.toml（可省略）→ PULSE__* 環境變數
+#
+# 設定中的相對路徑一律以「目前工作目錄」解析；啟動時會在日誌記錄工作目錄與是否讀到 pulse.toml。
+# 以 systemd 執行時請設定 WorkingDirectory；以 Windows 服務執行時預設工作目錄是 C:\Windows\System32，
+# 請在服務設定中指定工作目錄。
+
+[server]
+address = "127.0.0.1"  # 不可為空字串
+port = 8080            # 1～65535
+# TLS 用的主機名稱（SNI / 憑證 SAN 驗證）；正式環境請填實際伺服器域名
+domain = "localhost"
+# 是否略過 TLS 憑證驗證。⚠️ 僅供開發測試，正式環境務必維持 false，
+# 否則容易遭中間人攻擊。使用自簽憑證時請改用下方的 ca_cert。
+accept_invalid_certs = false
+# 額外信任的 CA 或自簽憑證（PEM，可含多張）路徑；空字串 = 只使用作業系統信任庫。
+# 非空時於啟動時讀取，讀不到檔案或格式錯誤會直接結束程式。
+ca_cert = ""
+# 是否同時信任作業系統信任庫。使用私有 CA 時建議設為 false，只信任 ca_cert，
+# 避免任何公開 CA 簽發的同名憑證也被接受。設為 false 時 ca_cert 必填，否則啟動即報錯。
+use_system_roots = true
+# mTLS 客戶端憑證（伺服器要求客戶端憑證時才需要）。兩者須同時設定或同時留空。
+# 憑證的 SAN 必須是 DNS:<本機 agent_id>（可用 `pulse --print-agent-id` 取得），EKU 需含 clientAuth。
+client_cert = ""   # 客戶端憑證 PEM：第一張為客戶端憑證本身，之後可接中繼 CA（整條鏈都會送出）
+client_key = ""    # 對應私鑰 PEM：PKCS#8 / PKCS#1 / SEC1 皆可，支援 RSA、ECDSA P-256 / P-384、Ed25519；
+                   # 不可加密。與憑證不成對時啟動即報錯
+# 啟動時與之後每 24 小時檢查客戶端憑證鏈的有效期限：已過期 → 記 ERROR（仍會繼續嘗試連線，
+# 以伺服器的判定為準；也請確認本機時鐘是否正確）；尚未生效或 30 天內到期 → 記 WARN
+
+[retry]
+# 連續連線失敗達此次數後，重連日誌由 warn 升級為 error（重試本身不設上限）
+max_retries = 5
+initial_delay = 2  # 第一次重連前的延遲（秒，1～3600），之後每次加倍
+max_delay = 60     # 重連延遲上限（秒，1～3600）；實際延遲另加 ±20% 抖動（不超過此上限）
+# 註冊後連線穩定維持 30 秒以上才會重置退避；更早斷線仍視為連續失敗。
+# 因 superseded（被同一 agent_id 的其他連線取代）而斷線：第一次照上述規則處理；
+# 連續第 2 次起不論維持多久都不重置退避，且該次延遲至少 30 秒（不受 max_delay 上限限制）
+
+[heartbeat]
+# 心跳間隔（秒，1～60）。讀取閒置逾時 = max(2 × interval, interval + 10 秒)（預設 11 秒），
+# 只依心跳間隔計算，與 report.interval 無關
+interval = 1
+
+[report]
+# 系統資訊回報間隔（秒，1～3600）。CPU 使用率為上次取樣到這次取樣之間的平均（略過回報時仍會取樣）。
+# 上一筆 report 尚未收到伺服器回應（ack 或 error）時，略過這次取樣（記 WARN，有節流）
+interval = 5
+
+[agent]
+# 存放 agent_id（UUID v4）的檔案；第一次啟動時自動產生，之後沿用。
+# 內容須為 8-4-4-4-12 格式的 UUID（大小寫皆可，讀入後一律轉小寫），不合法或超過 1024 bytes
+# 時啟動即報錯（刪除檔案可重新產生）。未啟用 mTLS 時 agent_id 等同身分憑據，請妥善保護：
+# Unix 上新建的檔案權限為 0600；Windows 請放在只有執行帳號可讀的目錄
+id_file = "agent.id"
+
+[log]
+level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）
+# 日誌檔按日分檔：logs/pulse-YYYY-MM-DD.log（檔名日期為 UTC）。
+# 保留今天與前 N 天，更早的於啟動時與每小時清除；0 = 永久保留，上限 3650。
+# 清除前會檢查系統日期是否合理：日期前進得比實際經過的時間多（例如時鐘被誤校到未來）時暫停清除，
+# 同一日期持續 24 小時後才接受。狀態存在 logs/.retention-guard.json，請勿刪除
+retention_days = 14

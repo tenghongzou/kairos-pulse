@@ -1,0 +1,13 @@
+# IDE
+/.idea
+
+/target
+/logs
+
+# 執行期產生 / 本機專用檔案
+agent.id
+pulse.toml
+logs/
+
+# 發佈包輸出（packaging/build-release.sh）
+/dist/
