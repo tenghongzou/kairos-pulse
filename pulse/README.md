@@ -274,7 +274,7 @@ cargo run
 2. 清除過期日誌檔（清除前檢查系統日期是否合理，見「日誌」；之後每小時一次），並以 `INFO` 記錄工作目錄、`pulse.toml` 的完整路徑與是否讀到（工作目錄是 `System32`／`SysWOW64` 時另記 `WARN`，見「設定」）
 3. 讀取（或第一次產生）`agent_id`
 4. 印出一次系統資訊（在背景執行緒進行；收到 Ctrl+C 時不會等它完成）。`info` 等級下 CPU 只有一行摘要（例如 `CPU: 24 個核心，平均使用率 37.38%（各核心使用率見 debug 等級）`），磁碟略過虛擬檔案系統與容量為 0 的掛載點，以及同一磁碟的重複掛載點（「磁碟名稱＋檔案系統＋總容量」相同者只列一次，保留路徑最短的掛載點，例如 systemd 沙箱的 `ReadWritePaths=`、`PrivateTmp=` bind mount 或 btrfs subvolume；磁碟名稱為空時不合併），網路略過 `lo` 與虛擬介面（`veth*`、`docker*`、`br-*` 等），略過的數量各以一行統計；完整清單需 `log.level = "debug"`。磁碟容量以十進位單位顯示：1 GB 以上為 GB（小數 1 位，例如 `39.4 GB`），未滿 1 GB 為整數 MB（例如 `535 MB`）。取不到的系統名稱、核心版本、主機名稱等顯示「未知」；沒有溫度感測器（例如 VM）時印「未偵測到溫度感測器」
-5. 啟動系統資訊收集背景任務（每 `report.interval` 秒取樣一次）
+5. 啟動系統資訊收集背景任務（先建立 CPU 使用率的基準，第一次取樣在一個 `report.interval` 之後，之後每 `report.interval` 秒一次）
 6. 連線到伺服器、送出 hello、收到 hello_ack 後開始送 heartbeat 與 report
 
 按 Ctrl+C 結束（Windows 上 Ctrl+Break、關閉主控台視窗、系統關機也一樣；其他平台為 SIGINT、SIGTERM）：
@@ -415,7 +415,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。
 
-`cpu_usage` 是「上次取樣到這次取樣之間」（約等於 `report.interval`）所有 CPU 的平均使用率：取樣任務沿用同一個 sysinfo `System`，每次取樣只刷新一次，而不是只量約 200 ms 的瞬間值。
+`cpu_usage` 是「上次取樣到這次取樣之間」（約等於 `report.interval`）所有 CPU 的平均使用率：取樣任務沿用同一個 sysinfo `System`，每次取樣只刷新一次，而不是只量約 200 ms 的瞬間值。第一筆也一樣：取樣任務啟動時先刷新一次作為基準，第一次取樣在一個 `report.interval` 之後，因此不會只量到啟動當下的負載（代價是啟動後要等一個 `report.interval` 才有第一筆 report）。
 
 Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收到回應時的取樣、以及伺服器回 `storage_unavailable` 的那一筆，都會直接丟棄，不補送。
 

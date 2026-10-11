@@ -431,8 +431,9 @@ fn refresh_cpu_and_memory(sys: &mut System) {
 ///
 /// sysinfo 的 CPU 使用率是「兩次刷新之間」的平均，因此每次取樣得到的是
 /// 「上次取樣到這次取樣之間」（約等於 `report.interval`）的平均，而不是只量約 200 ms 的瞬間值。
-/// 第一次取樣前先刷新一次建立基準，並補足 sysinfo 要求的最短間隔
-/// （`MINIMUM_CPU_UPDATE_INTERVAL`，用 tokio 的 sleep，不佔用任何執行緒）。
+/// 收集 task 啟動時先以 [`Sampler::baseline`] 建立基準，第一次取樣在一個 `report.interval` 之後，
+/// 因此第一筆也涵蓋約一個 `report.interval`。沒有基準就取樣時（測試），先刷新一次建立基準，
+/// 並補足 sysinfo 要求的最短間隔（`MINIMUM_CPU_UPDATE_INTERVAL`，用 tokio 的 sleep，不佔用任何執行緒）。
 ///
 /// sysinfo 的 refresh 是阻塞的系統呼叫（首次可達數百 ms），一律放到 blocking 執行緒；
 /// `System` 移入 / 移出 blocking 閉包，避免每次重新掃描。
@@ -456,6 +457,11 @@ impl Sampler {
             last_refresh: None,
             refresh,
         }
+    }
+
+    /// 建立 CPU 使用率的基準（刷新一次、讀數不用）。runtime 關閉中時回傳 `None`。
+    async fn baseline(&mut self) -> Option<()> {
+        self.refresh_and_read().await.map(|_| ())
     }
 
     /// 取樣一次 CPU 與記憶體。runtime 關閉中時回傳 `None`。
@@ -494,15 +500,27 @@ impl Sampler {
     }
 }
 
-/// 收集 task：每 `interval` 取樣一次，以 `try_send` 交給連線 task。
+/// 收集 task：啟動時先建立 CPU 基準，之後每 `interval` 取樣一次（第一次在一個 `interval` 之後），
+/// 以 `try_send` 交給連線 task。
+///
+/// 第一筆 CPU 使用率因此涵蓋約一個 `interval`，而不是啟動當下約 200 ms 的瞬間值
+/// （剛好落在啟動負載上，與「約等於 `report.interval` 的平均」不符）。
 ///
 /// 通道已滿（連線中斷或寫出卡住，上一筆還沒被取走）時**丟棄這次的新取樣**，
 /// 因此不會堆積；連線 task 在每次註冊成功後會清掉通道內殘留的舊取樣，
 /// 上一筆 report 尚未收到伺服器回應時也會略過新取樣。
 /// 接收端關閉或 runtime 關閉時結束。
 pub async fn collect_periodically(interval: Duration, tx: mpsc::Sender<Sample>) {
-    let mut sampler = Sampler::new();
-    let mut ticker = time::interval(interval);
+    collect_with(Sampler::new(), interval, tx).await;
+}
+
+/// [`collect_periodically`] 的實作，取樣器由呼叫端提供（測試時可替換刷新函式）。
+async fn collect_with(mut sampler: Sampler, interval: Duration, tx: mpsc::Sender<Sample>) {
+    // 先建立基準，並跳過 interval 立即觸發的第一次 tick：第一次取樣在一個 interval 之後
+    if sampler.baseline().await.is_none() {
+        return;
+    }
+    let mut ticker = time::interval_at(Instant::now() + interval, interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -985,6 +1003,48 @@ mod tests {
 
     fn count_refresh(_: &mut System) {
         REFRESH_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    static FIRST_SAMPLE_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_first_sample_refresh(_: &mut System) {
+        FIRST_SAMPLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_sample_covers_a_full_interval() {
+        // Q3：啟動時先建立基準並跳過第一次 tick，第一筆取樣在一個 interval 之後，
+        // 只刷新一次（不再是「基準 + 200 ms 後的讀數」）
+        use std::sync::atomic::Ordering::SeqCst;
+        const INTERVAL: Duration = Duration::from_secs(5);
+        let (tx, mut rx) = mpsc::channel(4);
+        let start = Instant::now();
+        let task = tokio::spawn(collect_with(
+            Sampler::with_refresh(count_first_sample_refresh),
+            INTERVAL,
+            tx,
+        ));
+        // 第一個 interval 內沒有任何取樣，只建立了基準
+        time::sleep(INTERVAL - Duration::from_millis(10)).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(FIRST_SAMPLE_CALLS.load(SeqCst), 1, "只有基準");
+
+        rx.recv().await.unwrap();
+        let first_at = start.elapsed();
+        assert!(
+            first_at >= INTERVAL && first_at < INTERVAL + MINIMUM_CPU_UPDATE_INTERVAL,
+            "{first_at:?}"
+        );
+        assert_eq!(FIRST_SAMPLE_CALLS.load(SeqCst), 2, "基準 + 第一筆");
+
+        rx.recv().await.unwrap();
+        let second_at = start.elapsed();
+        assert!(
+            second_at >= INTERVAL * 2 && second_at < INTERVAL * 2 + MINIMUM_CPU_UPDATE_INTERVAL
+        );
+        assert_eq!(FIRST_SAMPLE_CALLS.load(SeqCst), 3);
+        task.abort();
     }
 
     #[tokio::test(start_paused = true)]
