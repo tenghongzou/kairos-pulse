@@ -33,17 +33,13 @@ Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問
 
 ### 本版的行為改變（升級前請確認）
 
-| 項目 | 舊行為 | 新行為 | 需要的處置 |
-|---|---|---|---|
-| 心跳間隔（`heartbeat.interval`） | 預設 1 秒 | 預設 **15 秒** | Kairos 的離線判定由 `max(5 × 心跳, 5 秒)` 從 5 秒變成 **75 秒**：主機斷線後要約 75 秒才會在 Kairos 顯示為離線，Pulse 的讀取閒置逾時也從 11 秒變成 30 秒。需要較快的離線判定時，在 `pulse.toml` 設定 `[heartbeat] interval = 1`（或其他 1～60 秒的值）。Kairos 不需修改（心跳間隔由 Pulse 在 hello 中告知，Kairos 接受 1～60 秒） |
-| 啟動與重連的隨機延遲 | 啟動後立即連線；斷線後第一次重連約 2 秒（±20%） | 啟動時先等 0～min(心跳, 5) 秒；斷線後第一次重連另加 0～min(心跳, 5) 秒 | 不需處置。預設下啟動後最多晚 5 秒連線、Kairos 重新啟動後的重連分散在約 1.6～7.4 秒 |
-| 信任庫（`server.use_system_roots`） | 預設 `true`：設定了 `ca_cert` 時仍同時信任作業系統信任庫 | 預設不寫，依 `ca_cert` 決定：**設定了 `ca_cert` 時只信任 `ca_cert`**，未設定時信任作業系統信任庫；明確設定時以設定為準 | 依 INSTALL 部署（私有 CA）者不受影響。若設定了 `ca_cert`、但伺服器憑證其實由公開 CA 簽發（例如 `ca_cert` 只是為了額外信任某張憑證），升級後會以「伺服器憑證不受信任」無法連線：請在 `pulse.toml` 加上 `use_system_roots = true`。啟動日誌的「伺服器憑證信任來源：…」一行會說明實際採用的信任來源 |
+本版有數項會影響既有部署的行為改變（設定 `ca_cert` 時預設不再信任作業系統信任庫、預設心跳由 1 秒改為 15 秒使 Kairos 的離線判定由 5 秒變成 75 秒、設定錯誤的結束代碼改為 3 等），完整說明與升級步驟統一記錄在 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）「破壞性變更與升級步驟」，這裡不再重複。
 
 **部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
 
 ## 從發佈包安裝
 
-地端正式部署請使用預編譯的發佈包 `pulse-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件與 `PROTOCOL.md`。
+地端正式部署請使用預編譯的發佈包 `pulse-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件、`PROTOCOL.md` 與 `CHANGELOG.md`（變更紀錄與升級步驟）。
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下。所有步驟請在**同一個 root shell**（`sudo -i`）中依序執行，不能只在每個指令前加 `sudo`：`/opt/pulse` 的權限是 750，一般帳號無法 `cd` 進去，而 `agent.id`、私鑰與 CSR 都寫到目前目錄，`AGENT_ID` 變數也要在步驟間延續。
 

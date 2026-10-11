@@ -19,7 +19,8 @@
 # tar 內容（一層 <套件名稱>/ 目錄）：執行檔（755）、範例設定、README.md、
 # PROTOCOL.md、INSTALL.md、systemd unit 與其他範例檔（EXTRA_SRC；其餘皆 644），擁有者一律為 0:0。
 # PROTOCOL.md 取自兩個產品共用的唯一規格（PROTOCOL_SRC，相對於 repo 根目錄），
-# 產品目錄下的 PROTOCOL.md 只是指向它的說明。
+# 產品目錄下的 PROTOCOL.md 只是指向它的說明。CHANGELOG.md 取自 repo 根目錄的變更紀錄
+# （CHANGELOG_SRC，兩個產品共用一份）。
 set -eu
 
 # ---- 專案設定 -------------------------------------------------------------
@@ -27,6 +28,7 @@ NAME=kairos                          # 執行檔名稱（Cargo 的 bin 名稱）
 EXAMPLE_SRC=kairos.example.toml      # repo 中的範例設定
 EXAMPLE_DST=kairos.example.toml      # 放進 tar 時的檔名
 PROTOCOL_SRC=crates/kairos-proto/PROTOCOL.md  # 協定規格（相對於 repo 根目錄）
+CHANGELOG_SRC=CHANGELOG.md                     # 變更紀錄與升級步驟（相對於 repo 根目錄）
 UNIT_SRC=packaging/kairos.service    # systemd unit 範本
 # 其他放進 tar 根目錄的範例檔（以空白分隔，路徑不可含空白）：CRL 定期更新的 unit 範例
 EXTRA_SRC="packaging/kairos-crl.service packaging/kairos-crl.timer"
@@ -56,6 +58,7 @@ PKG_SUBDIR=${PKG_SUBDIR:-.}
 cd "$REPO"
 [ -f Cargo.lock ] || die "缺少 Cargo.lock（workspace 根目錄）"
 [ -f "$PROTOCOL_SRC" ] || die "缺少 $PROTOCOL_SRC（協定規格）"
+[ -f "$CHANGELOG_SRC" ] || die "缺少 $CHANGELOG_SRC（變更紀錄）"
 cd "$PKG_SUBDIR"
 
 # shellcheck disable=SC2086 # EXTRA_SRC 刻意以空白分隔成多個檔案
@@ -109,6 +112,7 @@ install -m 755 "$BIN"                    "$STAGE/$PKG/$NAME"
 install -m 644 "$SRC/$EXAMPLE_SRC"       "$STAGE/$PKG/$EXAMPLE_DST"
 install -m 644 "$SRC/README.md"          "$STAGE/$PKG/README.md"
 install -m 644 "/src/$PROTOCOL_SRC"     "$STAGE/$PKG/PROTOCOL.md"
+install -m 644 "/src/$CHANGELOG_SRC"    "$STAGE/$PKG/CHANGELOG.md"
 install -m 644 "$SRC/packaging/INSTALL.md" "$STAGE/$PKG/INSTALL.md"
 install -m 644 "$SRC/$UNIT_SRC"          "$STAGE/$PKG/$(basename "$UNIT_SRC")"
 for f in $EXTRA_SRC; do
@@ -155,6 +159,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     -e EXAMPLE_DST="$EXAMPLE_DST" \
     -e UNIT_SRC="$UNIT_SRC" \
     -e PROTOCOL_SRC="$PROTOCOL_SRC" \
+    -e CHANGELOG_SRC="$CHANGELOG_SRC" \
     -e EXTRA_SRC="$EXTRA_SRC" \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e HOST_UID="$HOST_UID" \

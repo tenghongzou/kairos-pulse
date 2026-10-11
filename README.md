@@ -10,6 +10,7 @@ kairos-pulse/
 ├── Cargo.lock             整個 workspace 共用的依賴版本鎖定檔
 ├── rust-toolchain.toml    固定 Rust 1.99.0（含 rustfmt、clippy）
 ├── deny.toml              cargo-deny 設定（安全公告、授權、重複版本、來源）
+├── CHANGELOG.md           變更紀錄（Kairos／Pulse／共用；含破壞性變更與升級步驟，也放進兩個發佈包）
 ├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test 與 cargo deny
 ├── crates/                兩個產品共用的內部 crate（publish = false）
 │   ├── kairos-proto/      協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
