@@ -133,7 +133,7 @@ Kairos 的 TLS 握手、等待 `hello`、寫出逾時可在設定檔 `[timeouts]
 | Pulse | TCP 連線 | 5 秒 |
 | Pulse | TLS 握手 | 10 秒 |
 | Pulse | 等待 `hello_ack` | 5 秒 |
-| Pulse | 讀取閒置（沒收到任何**合法**伺服器訊息；無法解析的行不算） | `max(2 × h, h + 10 秒)`，`h = heartbeat.interval`（只看心跳間隔，與 `report.interval` 無關；預設心跳 1 秒時為 11 秒），視為連線中斷並重連 |
+| Pulse | 讀取閒置（沒收到任何**合法**伺服器訊息；無法解析的行不算） | `max(2 × h, h + 10 秒)`，`h = heartbeat.interval`（只看心跳間隔，與 `report.interval` 無關；預設心跳 15 秒時為 30 秒，心跳 1 秒時為 11 秒），視為連線中斷並重連 |
 | 雙方 | 每則訊息寫出 | 5 秒（Kairos 的 `timeouts.write_secs` 可調，上限 6 秒） |
 
 - `offline_after_ms = max(5 × clamp(heartbeat_interval_ms, 1000, 60000), 5000)`，因此介於 5000～300000，由伺服器在 `hello_ack` 中告知。
