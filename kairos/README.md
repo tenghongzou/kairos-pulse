@@ -105,8 +105,12 @@ cargo run
 ```
 2026-10-08 11:15:40 [INFO] kairos 0.1.0 (4223101)
 2026-10-08 11:15:40 [INFO] 未找到 kairos.toml，使用程式內預設值
+2026-10-08 11:15:40 [WARN] 未啟用客戶端憑證驗證（auth.client_ca），只監聽 loopback 位址；同一台主機上的任何程式都能以任意 agent_id 註冊，僅建議用於本機開發
+2026-10-08 11:15:40 [INFO] 每 30 秒檢查憑證、私鑰、客戶端 CA 與 CRL 是否變更
 2026-10-08 11:15:40 [INFO] Kairos 已啟動，監聽 127.0.0.1:8080（連線上限 1024，其中握手中 512，每個來源 IP 32，狀態表上限 10000，資料目錄 data）
 ```
+
+本機開發不啟用 mTLS 時，`WARN` 是預期的；監聽 `0.0.0.0` 等非 loopback 位址時必須啟用 mTLS，否則拒絕啟動（見「啟用 mTLS」）。Linux 上以 `umask 022` 手動執行、`key.pem` 為 `0644` 時，另有一行私鑰權限過寬的 `WARN`（`chmod 600 key.pem` 即可）。
 
 ### 3. 測試連線
 
@@ -509,7 +513,7 @@ sequenceDiagram
 
 ### `data/agents.json`
 
-每 5 秒覆寫一次的狀態快照（先寫 `agents.json.tmp` 並 fsync 到磁碟，再更名，讀取端不會讀到寫一半的檔案，當機後也不會留下空檔）。寫入或更名失敗時第一次立即記錄 `ERROR`，持續失敗時每 60 秒再記一次（附連續失敗次數）：
+每 5 秒覆寫一次的狀態快照（先以隨機檔名建立暫存檔 `agents.json.<16 位十六進位>.tmp`（不跟隨預先放置的符號連結、不覆寫既有檔案）並 fsync 到磁碟，再更名為 `agents.json`，讀取端不會讀到寫一半的檔案，當機後也不會留下空檔；啟動時刪除先前異常結束時殘留的暫存檔）。寫入或更名失敗時第一次立即記錄 `ERROR`，持續失敗時每 60 秒再記一次（附連續失敗次數）：
 
 ```json
 {
@@ -733,12 +737,18 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-單元測試涵蓋協定測試向量（PROTOCOL.md「範例」節，與 Pulse 共用）、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），以及設定載入、環境變數（字串不轉型）與上限檢查。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`。目前共 206 個測試。
+以上在 `kairos/` 目錄執行，只處理本產品；在 monorepo 根目錄執行 `cargo test --workspace` 等指令則包含 Pulse（見根目錄 README）。CI 在 Linux 與 Windows 上都會執行，Unix 專屬的測試（`#[cfg(unix)]`，例如檔案權限與 inode 比對）只在 Linux 上跑；Windows 開發機可以用 Docker 在 Linux 上測試，例如在 monorepo 根目錄（Git Bash）：
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.99 cargo test -p kairos --locked
+```
+
+單元測試涵蓋協定測試向量（PROTOCOL.md「範例」節，與 Pulse 共用）、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`。測試數量以 `cargo test` 的輸出為準。
 
 > [!WARNING]
 > `src/test_pki.rs` 與 `testdata/`（例如 `testdata/pki/server.key`）中的私鑰**只供測試使用**，已公開在 repo 中，絕對不可用於任何部署環境。正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
 
-建議在 CI 加上 `cargo audit`（需先 `cargo install cargo-audit`），檢查依賴套件是否有已公告的安全漏洞。
+依賴套件的安全公告（RustSec）、授權與來源由 CI 的 `cargo deny check` 檢查（設定見 monorepo 根目錄的 `deny.toml`）；本機可先 `cargo install cargo-deny --locked` 後在根目錄執行。
 
 ## 目前限制
 
