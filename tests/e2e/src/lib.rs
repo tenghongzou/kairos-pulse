@@ -79,22 +79,29 @@ fn build_binaries() -> PathBuf {
     };
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| env!("CARGO").into());
     let started = Instant::now();
-    let output = Command::new(cargo)
-        .args([
-            "build",
-            "--bins",
-            "-p",
-            "kairos",
-            "-p",
-            "pulse",
-            "--profile",
-        ])
-        .arg(&profile)
-        .env("CARGO_TARGET_DIR", target_dir)
-        .current_dir(workspace_root())
-        .stdin(Stdio::null())
-        .output()
-        .expect("無法執行 cargo build");
+    let mut cmd = Command::new(cargo);
+    cmd.args([
+        "build",
+        "--bins",
+        "-p",
+        "kairos",
+        "-p",
+        "pulse",
+        "--profile",
+    ])
+    .arg(&profile)
+    .env("CARGO_TARGET_DIR", target_dir)
+    .current_dir(workspace_root())
+    .stdin(Stdio::null());
+    // cargo 執行測試時設定的「本套件」變數（CARGO_MANIFEST_DIR 等）不能傳下去：依賴的建置腳本
+    // （例如 ring 的 rerun-if-env-changed）會把它們當成環境變更，每次都重新編譯，
+    // 也讓之後一般的 cargo build 再重新編譯一次
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(is_per_package_cargo_var) {
+            cmd.env_remove(&key);
+        }
+    }
+    let output = cmd.output().expect("無法執行 cargo build");
     assert!(
         output.status.success(),
         "cargo build -p kairos -p pulse 失敗（{}）：\n{}",
@@ -107,6 +114,22 @@ fn build_binaries() -> PathBuf {
         profile_dir.display()
     );
     profile_dir
+}
+
+/// cargo 為「目前執行的套件」設定的環境變數（見 cargo 文件 Environment variables Cargo sets for crates）
+fn is_per_package_cargo_var(key: &str) -> bool {
+    key.starts_with("CARGO_PKG_")
+        || matches!(
+            key,
+            "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_BIN_NAME"
+                | "CARGO_PRIMARY_PACKAGE"
+                | "CARGO_TARGET_TMPDIR"
+                | "CARGO_RUSTC_CURRENT_DIR"
+                | "OUT_DIR"
+        )
 }
 
 /// 127.0.0.1 上目前沒有被使用的 TCP 連接埠（綁定 0 由作業系統分配後立即釋放）
