@@ -1,4 +1,4 @@
-//! 檔案與目錄權限（審計 S3）。
+//! 檔案與目錄權限（審計 S3），以及伺服器私鑰的權限檢查（審計 S8）。
 //!
 //! Unix：Kairos 寫出的 report JSONL、`agents.json` 與日誌檔最多 0640（擁有者讀寫、group 唯讀、
 //! 其他人無權限），自行建立的目錄為 0750，不依賴行程的 umask（手動執行時 umask 常為 022）。
@@ -134,9 +134,110 @@ pub fn dir_permission_warning(path: &Path, what: &str) -> Option<String> {
     }
 }
 
+/// 從 `/proc/self/status` 的 `Gid:` 行取得 effective GID（第二個欄位）
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_effective_gid(status: &str) -> Option<u32> {
+    let line = status.lines().find(|l| l.starts_with("Gid:"))?;
+    line.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// 行程的 effective GID：只在 Linux 讀取 `/proc/self/status`（不需 unsafe 或額外依賴）；其他平台為 `None`
+#[cfg(unix)]
+fn effective_gid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_effective_gid(&std::fs::read_to_string("/proc/self/status").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// 私鑰權限中過寬的部分（Unix 權限位元與檔案 GID）。`own_gid` 為行程的 effective GID（無法得知時為 `None`）。
+///
+/// - other 有任何權限、group 可寫入或執行：過寬；
+/// - group 可讀：只在檔案的群組就是 Kairos 執行時的群組（INSTALL 建議的 `root:kairos 640`）時允許；
+///   無法得知行程的群組時（非 Linux）不視為過寬。
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn key_mode_problems(mode: u32, file_gid: u32, own_gid: Option<u32>) -> Vec<String> {
+    let mut problems = Vec::new();
+    if mode & 0o007 != 0 {
+        problems.push("其他使用者（other）有權限".to_string());
+    }
+    if mode & 0o030 != 0 {
+        problems.push("group 可寫入或執行".to_string());
+    }
+    if mode & 0o040 != 0
+        && let Some(own) = own_gid
+        && own != file_gid
+    {
+        problems.push(format!(
+            "group 可讀取，但檔案的群組（GID {}）不是 Kairos 執行時的群組（GID {}）",
+            file_gid, own
+        ));
+    }
+    problems
+}
+
+/// 伺服器私鑰權限過寬時的警告訊息（Unix，S8）；沒問題、讀不到（建立 TLS 設定時會另外報錯）或非 Unix 時為 `None`
+pub fn key_permission_warning(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(path).ok()?;
+        let mode = meta.permissions().mode() & 0o7777;
+        let problems = key_mode_problems(mode, meta.gid(), effective_gid());
+        (!problems.is_empty()).then(|| {
+            format!(
+                "伺服器私鑰 {} 的權限過寬（{:04o}：{}），服務帳號以外的帳號可能讀取或修改私鑰；建議執行 chown root:kairos {} && chmod 640 {}（群組換成執行 Kairos 的群組）",
+                path.display(),
+                mode,
+                problems.join("；"),
+                path.display(),
+                path.display()
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_gid_is_parsed_from_proc_status() {
+        let status =
+            "Name:\tkairos\nUid:\t998\t998\t998\t998\nGid:\t997\t996\t997\t997\nGroups:\t997\n";
+        assert_eq!(parse_effective_gid(status), Some(996));
+        assert_eq!(parse_effective_gid("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn key_mode_problems_allow_only_owner_and_own_group_read() {
+        // S8：600、400、以及群組是自己的 640／440 都不警告
+        for mode in [0o600, 0o400, 0o640, 0o440] {
+            assert!(
+                key_mode_problems(mode, 100, Some(100)).is_empty(),
+                "{mode:o}"
+            );
+        }
+        // 無法得知行程的群組時，group 可讀不視為過寬
+        assert!(key_mode_problems(0o640, 100, None).is_empty());
+        // group 可讀但不是自己的群組
+        let p = key_mode_problems(0o640, 0, Some(100));
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("GID 0"), "{p:?}");
+        // other 有權限、group 可寫
+        assert_eq!(key_mode_problems(0o644, 100, Some(100)).len(), 1);
+        assert_eq!(key_mode_problems(0o660, 100, Some(100)).len(), 1);
+        assert_eq!(key_mode_problems(0o666, 0, Some(100)).len(), 3);
+    }
 
     #[test]
     fn restricted_only_removes_bits() {
@@ -219,6 +320,40 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn key_permission_warning_checks_mode_and_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("key");
+        create_dir_all(&root).unwrap();
+        let key = root.join("key.pem");
+        std::fs::write(&key, b"x").unwrap();
+        let set =
+            |mode| std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        set(0o600);
+        assert_eq!(key_permission_warning(&key), None);
+        // 測試建立的檔案屬於行程自己的群組：640 不警告
+        set(0o640);
+        assert_eq!(key_permission_warning(&key), None);
+        set(0o644);
+        let w = key_permission_warning(&key).unwrap();
+        assert!(w.contains("0644") && w.contains("chmod 640"), "{w}");
+        set(0o660);
+        assert!(key_permission_warning(&key).is_some());
+
+        // Linux 上以 root 執行時（例如 Docker 中的測試）：群組換成別的 GID，640 也要警告
+        #[cfg(target_os = "linux")]
+        if std::os::unix::fs::chown(&key, None, Some(54321)).is_ok() {
+            set(0o640);
+            let w = key_permission_warning(&key).unwrap();
+            assert!(w.contains("GID 54321"), "{w}");
+        }
+        // 讀不到時不警告（建立 TLS 設定時另外報錯）
+        assert_eq!(key_permission_warning(&root.join("missing.pem")), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn non_unix_only_creates_dirs() {
@@ -230,6 +365,7 @@ mod tests {
         create_dir_all(&root.join("a")).unwrap();
         assert!(root.join("a").is_dir());
         assert_eq!(dir_permission_warning(&root, "資料目錄"), None);
+        assert_eq!(key_permission_warning(&root.join("a")), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

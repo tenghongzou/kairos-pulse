@@ -254,7 +254,7 @@ crl = ["agents.crl"]
 |---|---|---|
 | `/opt/kairos` | `root:kairos` | 750 |
 | `kairos`（執行檔） | `root:root` | 755 |
-| `kairos.toml`、`key.pem` | `root:kairos` | 640 |
+| `kairos.toml`、`key.pem` | `root:kairos` | 640（`key.pem` 由 root 擁有、只讓 `kairos` 群組讀取：服務帳號讀得到但不能改寫或替換） |
 | `cert.pem`、`client-ca.pem`、`agents.crl` | `root:kairos` | 644 |
 | `data/`、`logs/` | `kairos:kairos` | 750 |
 | `data/` 中的 `reports-*.jsonl`、`agents.json`；`logs/` 中的 `kairos-*.log` | `kairos:kairos` | 640（由 Kairos 建立） |
@@ -324,6 +324,7 @@ cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於�
 
 - 啟動失敗並出現 `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動`：`kairos.toml` 沒有設定 `auth.client_ca`。依第 6、7 節啟用 mTLS。
 - 出現 `未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 …（auth.allow_unauthenticated = true）` 的 `WARN`：設定了 `auth.allow_unauthenticated = true`，正式環境不可如此。
+- 出現 `伺服器私鑰 … 的權限過寬` 的 `WARN`：`key.pem` 讓其他使用者有權限、group 可寫入，或 group 可讀但群組不是 `kairos`。依訊息執行 `chown root:kairos /opt/kairos/key.pem && chmod 640 /opt/kairos/key.pem`。Kairos 在啟動時與熱重載換了私鑰時檢查，只記錄不拒絕啟動。
 - 出現 `可開啟的檔案數上限（RLIMIT_NOFILE soft limit）…` 的 `WARN`：unit 的 `LimitNOFILE` 沒有生效或小於 `server.max_connections` + 64；依訊息中的建議值以 drop-in 調高 `LimitNOFILE`（`systemctl show kairos -p LimitNOFILE` 可確認目前值）。
 - 從其他主機確認 TLS 與伺服器憑證：`openssl s_client -connect monitor.example.com:8080 -CAfile ca.pem -servername monitor.example.com </dev/null`（啟用 mTLS 時，沒帶客戶端憑證會在握手後被拒，這是正常的）。
 - Pulse 上線後，`agents.json` 的 `online` 會增加。多台 Pulse 經同一個 NAT 連入時，**以 `agents.json` 作為上線狀態的依據**：日誌的上線／離線事件有節流（見 `README.md`「日誌」）。

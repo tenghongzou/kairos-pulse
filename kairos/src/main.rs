@@ -507,6 +507,10 @@ async fn run(
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
     let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths)?));
+    // 伺服器私鑰權限過寬時提醒（S8；只在 Unix 檢查，熱重載換了私鑰時再檢查一次）
+    if let Some(message) = fsperm::key_permission_warning(Path::new(&tls_paths.key)) {
+        warn!("{}", message);
+    }
     match (&tls_paths.client_ca, &listen_auth) {
         (Some(ca), _) => {
             info!(

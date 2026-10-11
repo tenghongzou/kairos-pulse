@@ -603,6 +603,7 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 | `無法開啟 cert.pem: 系統找不到指定的檔案` | 目前工作目錄沒有憑證檔。請在放置 `cert.pem`、`key.pem` 的目錄執行程式，或在設定中指定 `server.cert_path`、`server.key_path`。 |
 | `cert.pem 中找不到證書` | 檔案內沒有 `BEGIN CERTIFICATE` 區塊。 |
 | `key.pem 中找不到私鑰` | 檔案內沒有支援格式的私鑰（`BEGIN PRIVATE KEY`、`BEGIN RSA PRIVATE KEY` 或 `BEGIN EC PRIVATE KEY`）。 |
+| `[WARN] 伺服器私鑰 key.pem 的權限過寬（0644：…）…` | 僅 Unix：私鑰讓其他使用者（other）有權限、group 可寫入或執行，或 group 可讀但檔案的群組不是 Kairos 執行時的群組（只在 Linux 判斷群組）。建議由 root 擁有、只讓服務的群組讀取：`chown root:kairos key.pem && chmod 640 key.pem`；手動執行時 `chmod 600 key.pem`。啟動時與熱重載換了私鑰時檢查，只記錄、不拒絕啟動。Windows 請以 ACL 限制（見「檔案權限」）。 |
 | `無法監聽 127.0.0.1:8080: ...一次只能用一個通訊端位址...`（`AddrInUse`） | 埠已被佔用，可能有另一個 Kairos 仍在執行；結束它或修改 `server.listen`。 |
 | `找不到設定檔 <path>` | `--config` 指定的檔案不存在。 |
 | `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動` | `server.listen` 不是 loopback 位址（例如 `0.0.0.0:8080`），但沒有設定 `auth.client_ca`。依訊息的處理方式擇一：啟用 mTLS（建議，見「啟用 mTLS」）；本機測試時改聽 `127.0.0.1`；只在隔離的測試環境設定 `auth.allow_unauthenticated = true`。 |

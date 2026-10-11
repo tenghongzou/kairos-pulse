@@ -257,16 +257,25 @@ async fn run_with_wait(
         let material = state.current();
         match outcome {
             ReloadOutcome::Unchanged => {}
-            ReloadOutcome::Reloaded(changed) => info!(
-                "已重新載入 TLS 設定（變更：{}；mTLS：{}，CRL {} 份）",
-                describe_kinds(&changed),
-                if material.auth_enabled() {
-                    "啟用"
-                } else {
-                    "未啟用"
-                },
-                material.crl_count
-            ),
+            ReloadOutcome::Reloaded(changed) => {
+                info!(
+                    "已重新載入 TLS 設定（變更：{}；mTLS：{}，CRL {} 份）",
+                    describe_kinds(&changed),
+                    if material.auth_enabled() {
+                        "啟用"
+                    } else {
+                        "未啟用"
+                    },
+                    material.crl_count
+                );
+                // 換了私鑰時再檢查一次權限（S8）
+                if changed.contains(&TlsFileKind::Key)
+                    && let Some(message) =
+                        crate::fsperm::key_permission_warning(std::path::Path::new(&paths.key))
+                {
+                    warn!("{}", message);
+                }
+            }
             ReloadOutcome::Failed(e) => {
                 error!("重新載入 TLS 設定失敗，繼續使用目前的設定: {}", e)
             }
