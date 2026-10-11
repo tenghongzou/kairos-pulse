@@ -420,6 +420,35 @@ async fn run(
 mod tests {
     use super::*;
 
+    /// 文字中是否有「共 N 個」或「N 個測試」這類寫死的數量。
+    fn has_hardcoded_count(line: &str) -> bool {
+        let chars: Vec<char> = line.chars().collect();
+        (0..chars.len()).any(|i| {
+            let digits = chars[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits == 0 || (i > 0 && chars[i - 1].is_ascii_digit()) {
+                return false;
+            }
+            let after: String = chars[i + digits..].iter().take(4).collect();
+            let before: String = chars[i.saturating_sub(2)..i].iter().collect();
+            after.starts_with(" 個") && (before == "共 " || after.starts_with(" 個測試"))
+        })
+    }
+
+    #[test]
+    fn readme_does_not_hardcode_test_count() {
+        // Q8：測試數量隨時變動（且各平台不同），README 不寫死數字
+        assert!(has_hardcoded_count("目前共 158 個。"));
+        assert!(has_hardcoded_count("共有 12 個測試"));
+        assert!(!has_hardcoded_count("目前共 2 次重試"));
+        assert!(!has_hardcoded_count("憑證鏈 2 張"));
+        let readme = include_str!("../README.md");
+        let offending: Vec<&str> = readme
+            .lines()
+            .filter(|l| l.contains("測試") && has_hardcoded_count(l))
+            .collect();
+        assert!(offending.is_empty(), "{offending:?}");
+    }
+
     #[test]
     fn startup_logs_working_directory_and_config_source() {
         // R2-P6

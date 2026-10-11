@@ -249,7 +249,7 @@ cargo run
 ../target/release/pulse   # workspace 的 target/ 在 monorepo 根目錄
 ```
 
-測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試，目前共 158 個。
+測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試；Unix 專屬的部分（檔案權限、sd_notify 等）以 `#[cfg(unix)]` 標示，只在 Linux／macOS 上執行，Windows 專屬的 ACL 檢查同理。實際數量以 `cargo test` 的輸出為準（各平台不同），文件不列出數字。
 
 > **`testdata/` 中的私鑰（`*.key`）只供測試使用，已公開在 repo 中，絕對不可用於任何部署環境。** 正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
 
