@@ -4,8 +4,9 @@
 //!   格式不合法時回傳錯誤讓程式結束，**不會**默默換新 ID（避免伺服器端身分改變）。
 //!   檔案超過 `MAX_ID_FILE_SIZE` 時不讀完整個檔案，直接報錯。
 //! - 識別不分大小寫：讀入後一律轉為小寫（與伺服器的正規化一致），檔案本身不改寫。
-//! - 未啟用 mTLS 時 agent_id 就是身分憑據：Unix 上新建的檔案權限為 0600（僅擁有者可讀寫），
-//!   既有檔案若可被其他使用者讀取會記 warn。Windows 上權限繼承自所在目錄。
+//! - 未啟用 mTLS 時 agent_id 就是身分憑據：Unix 上新建的檔案權限為 0600（僅擁有者可讀寫）；
+//!   既有檔案權限過寬時記 warn（規則見 [`crate::file_perms`]，Windows 檢查 ACL）。
+//!   檔案存在時只讀不寫，因此可設為服務帳號唯讀（INSTALL 的 `root:pulse 640`）。
 //! - 寫檔不會覆蓋既有檔案：先寫入暫存檔並 sync，再以 hard link 發佈（目的檔已存在則失敗）；
 //!   檔案系統不支援 hard link 時退回以 create_new 直接建立。
 //!   兩個實例同時首次啟動時，後到者會改讀先到者的檔案，兩者使用同一個 ID。
@@ -128,48 +129,14 @@ fn validate(path: &Path, content: Option<String>) -> io::Result<Option<String>> 
     Ok(Some(id.to_ascii_lowercase()))
 }
 
-/// Unix：agent_id 檔案對群組或其他使用者開放任何權限（讀取、寫入或執行）時，
-/// 回傳警告訊息（不自動修改權限）。
+/// agent_id 檔案的權限過寬時回傳警告訊息（不自動修改權限），規則見 [`crate::file_perms`]：
+/// Unix 上群組或其他使用者有權限時警告（擁有者為 root 時允許群組可讀，即 `root:pulse 640`）；
+/// Windows 上 ACL 允許 Users、Everyone 等一般使用者讀取或寫入時警告。
 ///
 /// 由呼叫端決定輸出方式（一般模式寫日誌；`--print-agent-id` 尚未初始化日誌，改寫 stderr）。
 /// 讀不到檔案資訊時回傳 `None`。
-#[cfg(unix)]
 pub fn permission_warning(path: &Path) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path).ok()?.permissions().mode();
-    mode_warning(path, mode)
-}
-
-/// 依權限位元產生警告（與平台無關，方便在任何平台測試用語）。
-#[cfg_attr(not(unix), allow(dead_code))]
-fn mode_warning(path: &Path, mode: u32) -> Option<String> {
-    let mode = mode & 0o777;
-    if mode & 0o077 == 0 {
-        return None;
-    }
-    let mut granted = Vec::new();
-    if mode & 0o044 != 0 {
-        granted.push("讀取");
-    }
-    if mode & 0o022 != 0 {
-        granted.push("寫入");
-    }
-    if mode & 0o011 != 0 {
-        granted.push("執行");
-    }
-    Some(format!(
-        "agent_id 檔案 {} 的權限為 {mode:o}，群組或其他使用者可{}；未啟用 mTLS 時 agent_id 等同身分憑據\
-         （可寫入者還能竄改本機身分），建議執行 chmod 600 {}",
-        path.display(),
-        granted.join("、"),
-        path.display()
-    ))
-}
-
-/// 非 Unix：權限由所在目錄的 ACL 決定，不檢查。
-#[cfg(not(unix))]
-pub fn permission_warning(_path: &Path) -> Option<String> {
-    None
+    crate::file_perms::permission_warning(path, crate::file_perms::AGENT_ID_FILE)
 }
 
 /// 以原子方式寫入新檔，不覆蓋既有檔案。
@@ -570,28 +537,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
-    fn mode_warning_names_the_granted_access() {
-        // R2-P11：寫入／執行位元不可說成「可讀取」
-        let p = Path::new("agent.id");
-        assert_eq!(mode_warning(p, 0o600), None);
-        assert_eq!(mode_warning(p, 0o100_700), None);
-        let w = mode_warning(p, 0o644).unwrap();
-        assert!(w.contains("644") && w.contains("可讀取；"), "{w}");
-        let w = mode_warning(p, 0o620).unwrap();
-        assert!(w.contains("可寫入；") && !w.contains("讀取"), "{w}");
-        let w = mode_warning(p, 0o601).unwrap();
-        assert!(w.contains("可執行；") && !w.contains("讀取"), "{w}");
-        let w = mode_warning(p, 0o666).unwrap();
-        assert!(
-            w.contains("可讀取、寫入；") && w.contains("chmod 600"),
-            "{w}"
-        );
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn permission_warning_is_unix_only() {
+    fn new_file_in_private_temp_dir_has_no_acl_warning() {
+        // S4：Windows 也檢查 ACL；使用者的 TEMP 只有本人、SYSTEM 與 Administrators 可存取
         let dir = temp_dir("perm");
         let path = dir.join("agent.id");
         load_or_create(&path).unwrap();

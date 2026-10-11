@@ -2,6 +2,7 @@ mod agent_id;
 mod backoff;
 mod cli;
 mod config_manager;
+mod file_perms;
 mod log_files;
 mod log_throttle;
 mod network;

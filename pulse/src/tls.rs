@@ -4,6 +4,8 @@
 //!   + `server.ca_cert`（可含多張）。
 //! - 客戶端憑證（mTLS）：`server.client_cert`（可含中繼 CA 鏈）+ `server.client_key`
 //!   （PKCS#8 / PKCS#1 / SEC1，RSA / ECDSA / Ed25519，不可加密）。金鑰與憑證不成對時在啟動時即報錯。
+//!   私鑰檔案權限過寬（Unix 的群組／其他使用者權限、Windows 的 ACL）時記 warn，規則見
+//!   [`crate::file_perms`]。
 //!   憑證有效期限在啟動時與之後每 24 小時檢查一次（[`TlsSetup::log_client_cert_validity`]）：
 //!   已過期記 error（仍會嘗試連線，以伺服器判定為準：可能只是本機時鐘不正確）、
 //!   尚未生效或 30 天內到期記 warn。
@@ -190,6 +192,13 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
         (None, None)
     } else {
         let (chain, key) = load_client_cert(cert_path, key_path)?;
+        // 私鑰權限過寬只記 warn、不阻止啟動（與 agent.id 的策略一致）
+        if let Some(warning) = crate::file_perms::permission_warning(
+            std::path::Path::new(key_path),
+            crate::file_perms::CLIENT_KEY_FILE,
+        ) {
+            log::warn!("{warning}");
+        }
         // 已過期也不阻止啟動（記 error）：本機時鐘可能不正確，以伺服器的判定為準
         log_findings(&check_chain_validity(cert_path, &chain, Utc::now()));
         if let Some(warning) = multiple_dns_san_warning(cert_path, &chain[0]) {
@@ -750,6 +759,77 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_key_permissions_are_checked() {
+        // S4：私鑰權限過寬時記 warn，但不阻止啟動
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join("pulse-tls-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("client.key");
+        std::fs::copy(data("client-rsa.key"), &key).unwrap();
+        let mut cfg = server("root.pem", "client-rsa.pem", "");
+        cfg.client_key = key.display().to_string();
+        let key_warnings = |logs: &[(Level, String)]| {
+            logs.iter()
+                .filter(|(l, m)| *l == Level::Warn && m.contains("server.client_key"))
+                .count()
+        };
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok());
+        assert_eq!(key_warnings(&logs), 0, "{logs:?}");
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok(), "權限過寬不阻止啟動");
+        assert_eq!(key_warnings(&logs), 1, "{logs:?}");
+        assert!(
+            logs.iter()
+                .any(|(_, m)| m.contains("644") && m.contains("chmod 600")),
+            "{logs:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_key_acl_is_checked() {
+        // S4：Windows 檢查 ACL；Users 可讀時記 warn，但不阻止啟動
+        let dir = std::env::temp_dir()
+            .join("pulse-tls-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("client.key");
+        std::fs::copy(data("client-rsa.key"), &key).unwrap();
+        let mut cfg = server("root.pem", "client-rsa.pem", "");
+        cfg.client_key = key.display().to_string();
+        let key_warnings = |logs: &[(Level, String)]| {
+            logs.iter()
+                .filter(|(l, m)| *l == Level::Warn && m.contains("server.client_key"))
+                .count()
+        };
+        // 使用者的 TEMP 只有本人、SYSTEM 與 Administrators 可存取
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok());
+        assert_eq!(key_warnings(&logs), 0, "{logs:?}");
+
+        let status = std::process::Command::new("icacls")
+            .arg(&key)
+            .args(["/grant", "*S-1-5-32-545:R"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok(), "權限過寬不阻止啟動");
+        assert_eq!(key_warnings(&logs), 1, "{logs:?}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

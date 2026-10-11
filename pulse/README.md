@@ -187,6 +187,7 @@ client_key = "client.key"     # 對應私鑰
   - 有憑證在 30 天內到期（日誌顯示「剩餘不超過 N 天」，天數無條件進位）、或尚未生效（可能是本機時鐘不正確）時，記 `WARN`。
 - 客戶端憑證含多個 DNS SAN 時記 `WARN` 但照常啟動：Kairos 預設會以 `auth_failed` 拒絕，除非伺服器設定了 `auth.allow_multiple_dns_sans = true`。
 - 成功載入時日誌會出現 `已載入客戶端憑證：<路徑>（憑證鏈 N 張；私鑰：<路徑>）`。
+- 私鑰檔案的權限過寬（其他帳號可讀取或修改）時記 `WARN`，不阻止啟動；規則見「敏感檔案的權限檢查」。
 
 **agent.id 與憑證綁定**：重新產生 `agent.id`（刪除檔案、或複製到新主機後重產）就會得到新的 agent_id，必須重新簽發憑證；否則 Pulse 啟動時就會因 SAN 不符而報錯。
 
@@ -430,13 +431,25 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 - 內容不合法（含空檔）時，Pulse **不會**自動換一個新 ID（否則伺服器會把它當成另一台主機），而是啟動即以錯誤結束，並提示：要重新產生請刪除該檔案後重新啟動。
 - 寫檔不會覆蓋既有檔案，也不會留下寫到一半的檔案：先寫入暫存檔並 `sync`（避免斷電後留下空檔），再以 hard link 發佈；檔案系統不支援 hard link 時（例如 FAT32 / exFAT），改以「僅在不存在時建立」的方式直接寫入。兩個實例同時第一次啟動時，會使用同一個 ID。
 - **未啟用 mTLS 時，`agent_id` 就是本機在伺服器上的身分憑據**：知道它的人可以冒用本機註冊，並把本機踢下線。因此：
-  - Unix 上新建的 `agent.id` 權限為 `0600`（僅擁有者可讀寫）；既有檔案若可被群組或其他使用者讀取，啟動時記 `WARN` 並建議 `chmod 600`（不會自動修改權限）。
-  - Windows 上檔案權限繼承自所在目錄的 ACL，Pulse 不檢查；請把 `agent.id`（`agent.id_file`）放在只有執行帳號可讀的受保護目錄。
+  - Unix 上新建的 `agent.id` 權限為 `0600`（僅擁有者可讀寫）。既有檔案的權限過寬時，啟動時記 `WARN`（不會自動修改權限、也不阻止啟動）；規則見下方「敏感檔案的權限檢查」，與 `server.client_key` 相同。
+  - Windows 上檔案權限繼承自所在目錄的 ACL；Pulse 啟動時檢查 ACL，Users、Everyone 等一般使用者可讀取或寫入時記 `WARN`。請把 `agent.id`（`agent.id_file`）放在只有執行帳號、SYSTEM 與 Administrators 可存取的目錄。
   - 正式環境建議啟用 mTLS，讓身分改由客戶端憑證與私鑰保護。
 - Kairos 以 `agent_id` 識別主機；主機名稱只用於顯示。
 - 啟用 mTLS 時，客戶端憑證的 SAN 綁定 `agent_id`；重新產生 `agent.id` 就必須重新簽發憑證。可用 `pulse --print-agent-id` 查看目前的 ID。
 - **不要把同一份 `agent.id` 複製到多台主機**（例如複製 VM 映像檔時）：兩台會互相把對方踢下線（伺服器回 `superseded`）；連續被取代時退避不再重置、重連間隔至少 30 秒，日誌以 `ERROR` 提示。若需要重新產生，刪除 `agent.id` 後重新啟動即可；**啟用 mTLS 時**還必須請管理者以新的 agent_id 重新簽發客戶端憑證並更新 `server.client_cert`／`server.client_key`，否則 Pulse 啟動時會因憑證 SAN 不符而報錯結束。
 - `agent.id` 已列入 `.gitignore`。
+
+### 敏感檔案的權限檢查
+
+`agent.id`（未啟用 mTLS 時等同身分憑據）與 `server.client_key`（mTLS 私鑰）在啟動時檢查權限；`--print-agent-id` 也會檢查 `agent.id`，警告寫在 stderr。權限過寬時只記 `WARN`，不阻止啟動、不自動修改權限。
+
+- **Unix**（規則與 PostgreSQL 檢查 TLS 私鑰相同）：
+  - 其他使用者有任何權限，或群組有寫入、執行權限 → `WARN`。
+  - 群組可讀：擁有者是 root 時允許（`root:pulse 640`，服務帳號只能讀不能改，見 `packaging/INSTALL.md`）；擁有者不是 root 時 `WARN`（同群組的其他帳號也能讀）。
+  - 擁有者自己的權限不檢查：`pulse:pulse 600`（舊版 INSTALL 的配置）不警告。
+- **Windows**：讀取檔案的 DACL，下列群組有讀取或寫入權限的「允許」項目時 `WARN`：Everyone、Authenticated Users、BUILTIN\Users、INTERACTIVE、ANONYMOUS LOGON、本機帳戶（Local account）、Guests、Domain Users、Domain Guests；沒有 DACL（NULL DACL）也 `WARN`。
+  - `C:\`、`C:\ProgramData`、`C:\Program Files` 下新建的檔案預設讓 Users 可讀，放在這些位置會收到警告。請放在只有執行帳號、SYSTEM 與 Administrators 可存取的目錄，或以 `icacls "<檔案>" /inheritance:r /grant:r "<執行帳號>:R" "*S-1-5-18:F" "*S-1-5-32-544:F"` 移除繼承並只授權給這些帳號。
+  - 限制：只看「允許」項目，不計算「拒絕」項目與實際有效權限（同時有拒絕項目時仍會警告），也不展開群組成員（授權給自訂群組或其他個別帳號不會警告）。讀不到 ACL 時不檢查。
 
 ## 專案結構
 
@@ -447,6 +460,7 @@ src/
 ├── main.rs            進入點：載入設定、初始化日誌、建立 TLS 設定、啟動並監看背景任務
 ├── cli.rs             命令列參數解析（--print-agent-id、--version、--help）與版本字串
 ├── config_manager.rs  設定管理（嵌入預設 → pulse.toml → PULSE__ 環境變數）與範圍驗證
+├── file_perms.rs      敏感檔案（agent.id、client_key）的權限檢查（Unix 權限位元、Windows ACL）
 ├── tls.rs             rustls 設定：信任庫、客戶端憑證、SAN 與有效期限檢查、TLS 錯誤提示
 ├── protocol.rs        協定訊息定義（ClientMsg / ServerMsg）
 ├── network.rs         長 TLS 連線：hello / heartbeat / report / 逾時 / 重連 / 日誌清理
@@ -500,7 +514,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
 - `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
-- Windows 上不檢查 `agent.id` 的檔案權限，需自行放在受保護的目錄。
+- Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
 
 ## 授權
 

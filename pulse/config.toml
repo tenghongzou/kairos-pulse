@@ -38,7 +38,7 @@ use_system_roots = true
 # 憑證的 SAN 必須是 DNS:<本機 agent_id>（可用 `pulse --print-agent-id` 取得），EKU 需含 clientAuth。
 client_cert = ""   # 客戶端憑證 PEM：第一張為客戶端憑證本身，之後可接中繼 CA（整條鏈都會送出）
 client_key = ""    # 對應私鑰 PEM：PKCS#8 / PKCS#1 / SEC1 皆可，支援 RSA、ECDSA P-256 / P-384、Ed25519；
-                   # 不可加密。與憑證不成對時啟動即報錯
+                   # 不可加密。與憑證不成對時啟動即報錯；權限過寬時記 WARN（規則同 agent.id）
 # 啟動時與之後每 24 小時檢查客戶端憑證鏈的有效期限：已過期 → 記 ERROR（仍會繼續嘗試連線，
 # 以伺服器的判定為準；也請確認本機時鐘是否正確）；尚未生效或 30 天內到期 → 記 WARN
 
@@ -65,7 +65,8 @@ interval = 5
 # 存放 agent_id（UUID v4）的檔案；第一次啟動時自動產生，之後沿用。
 # 內容須為 8-4-4-4-12 格式的 UUID（大小寫皆可，讀入後一律轉小寫），不合法或超過 1024 bytes
 # 時啟動即報錯（刪除檔案可重新產生）。未啟用 mTLS 時 agent_id 等同身分憑據，請妥善保護：
-# Unix 上新建的檔案權限為 0600；Windows 請放在只有執行帳號可讀的目錄
+# Unix 上新建的檔案權限為 0600。啟動時檢查權限，過寬時記 WARN（Unix：群組或其他使用者有權限，
+# 擁有者為 root 時允許群組可讀；Windows：ACL 允許 Users、Everyone 等一般使用者存取）
 id_file = "agent.id"
 
 [log]
