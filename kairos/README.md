@@ -107,7 +107,7 @@ cargo run
 伺服器會從**目前工作目錄**讀取 `cert.pem`、`key.pem` 與（若存在）`kairos.toml`，並監聽 `127.0.0.1:8080`。啟動成功時會顯示：
 
 ```
-2026-10-08 11:15:40 [INFO] kairos 0.1.0 (4223101)
+2026-10-08 11:15:40 [INFO] kairos 0.2.0 (7247f20)
 2026-10-08 11:15:40 [INFO] 未找到 kairos.toml，使用程式內預設值
 2026-10-08 11:15:40 [WARN] 未啟用客戶端憑證驗證（auth.client_ca），只監聽 loopback 位址；同一台主機上的任何程式都能以任意 agent_id 註冊，僅建議用於本機開發
 2026-10-08 11:15:40 [INFO] 每 30 秒檢查憑證、私鑰、客戶端 CA 與 CRL 是否變更
@@ -396,7 +396,7 @@ kairos --version      # 或 -V
 kairos --help         # 或 -h
 ```
 
-`--version` 印出 `kairos <版本> (<commit>)`（例如 `kairos 0.1.0 (4223101)`）後結束。commit 在建置時決定：環境變數 `BUILD_COMMIT`（`packaging/build-release.sh` 會傳入）→ `git rev-parse --short HEAD` → 都取不到時為 `unknown`。啟動日誌的第一行也會印出同樣的字串，可從日誌確認正在執行的版本。
+`--version` 印出 `kairos <版本> (<commit>)`（例如 `kairos 0.2.0 (7247f20)`）後結束。commit 在建置時決定：環境變數 `BUILD_COMMIT`（`packaging/build-release.sh` 會傳入）→ `git rev-parse --short HEAD` → 都取不到時為 `unknown`。啟動日誌的第一行也會印出同樣的字串，可從日誌確認正在執行的版本。
 
 `--config` 的路徑可以含有非 UTF-8 的字元（Linux 的檔名不限編碼）；Windows 上非 Unicode 的路徑請用 `--config <path>`（以空白分隔）而不是 `--config=<path>`。其他參數含有無法辨識的字元時，印出錯誤與用法後以結束代碼 1 結束。
 
