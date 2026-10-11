@@ -3,6 +3,7 @@
 use config::{Config, Environment, File, FileFormat};
 use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
+use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -230,9 +231,41 @@ pub enum CliAction {
     Version,
 }
 
+/// `--config=<path>` 的前綴
+const CONFIG_EQ: &str = "--config=";
+
+/// 取出 `--config=<path>` 中的路徑；不是這個形式時回傳 `None`。
+/// 路徑可以不是 UTF-8：Unix 上以位元組切開；其他平台無法安全地切開非 UTF-8 的參數，回錯誤請改用
+/// `--config <path>`
+fn strip_config_eq(arg: &OsStr) -> Option<Result<OsString, String>> {
+    if let Some(s) = arg.to_str() {
+        return s.strip_prefix(CONFIG_EQ).map(|p| Ok(OsString::from(p)));
+    }
+    if !arg.as_encoded_bytes().starts_with(CONFIG_EQ.as_bytes()) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(Ok(
+            OsStr::from_bytes(&arg.as_bytes()[CONFIG_EQ.len()..]).to_os_string()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(Err(format!(
+            "--config= 後的路徑含有無法辨識的字元（不是有效的 Unicode）: {}；請改用 --config <path>",
+            arg.to_string_lossy()
+        )))
+    }
+}
+
 /// 解析命令列參數（不含程式名稱）。只支援 `--config <path>`、`--config=<path>`、`-V/--version`
 /// 與 `-h/--help`。
-pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, String> {
+///
+/// 參數以 `OsString` 接收（`std::env::args_os()`；審計 Q5）：`std::env::args()` 遇到非 UTF-8 的參數
+/// 會 panic。設定檔路徑可以不是 UTF-8；其他非 UTF-8 的參數回錯誤（訊息中以 U+FFFD 取代無法辨識的部分）。
+pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction, String> {
     let mut config_path = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -241,17 +274,23 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, 
                 Some(p) if !p.is_empty() => p,
                 _ => return Err("--config 需要指定設定檔路徑".to_string()),
             }
-        } else if let Some(p) = arg.strip_prefix("--config=") {
+        } else if let Some(p) = strip_config_eq(&arg) {
+            let p = p?;
             if p.is_empty() {
                 return Err("--config 需要指定設定檔路徑".to_string());
             }
-            p.to_string()
+            p
         } else if arg == "-h" || arg == "--help" {
             return Ok(CliAction::Help);
         } else if arg == "-V" || arg == "--version" {
             return Ok(CliAction::Version);
+        } else if arg.to_str().is_none() {
+            return Err(format!(
+                "無法辨識的參數（含有不是有效 Unicode 的字元）: {}",
+                arg.to_string_lossy()
+            ));
         } else {
-            return Err(format!("無法辨識的參數: {}", arg));
+            return Err(format!("無法辨識的參數: {}", arg.to_string_lossy()));
         };
         if config_path.replace(PathBuf::from(path)).is_some() {
             return Err("--config 只能指定一次".to_string());
@@ -456,8 +495,8 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
     }
 
     #[test]
@@ -809,5 +848,53 @@ mod tests {
         assert!(parse_args(args(&["--config="])).is_err());
         assert!(parse_args(args(&["--config", "a", "--config", "b"])).is_err());
         assert!(parse_args(args(&["--port", "1"])).is_err());
+    }
+
+    /// 平台上「不是有效 Unicode」的參數：Unix 為非 UTF-8 的位元組，Windows 為未配對的 surrogate
+    fn non_unicode(prefix: &str) -> OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = prefix.as_bytes().to_vec();
+            bytes.extend_from_slice(b"caf\xe9.toml");
+            OsString::from_vec(bytes)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = prefix.encode_utf16().collect();
+            wide.extend([0x63, 0xD800, 0x2E, 0x74]);
+            OsString::from_wide(&wide)
+        }
+    }
+
+    #[test]
+    fn parse_args_handles_non_unicode_without_panic() {
+        // Q5：非 UTF-8 的參數不 panic，給出錯誤訊息
+        let err = parse_args([non_unicode("--bogus")]).unwrap_err();
+        assert!(err.contains("無法辨識的參數"), "{err}");
+        assert!(err.contains('\u{FFFD}'), "{err}");
+        let err = parse_args([non_unicode("")]).unwrap_err();
+        assert!(err.contains("不是有效 Unicode"), "{err}");
+
+        // 設定檔路徑本身可以不是 UTF-8
+        let path = non_unicode("");
+        assert_eq!(
+            parse_args([OsString::from("--config"), path.clone()]),
+            Ok(CliAction::Run {
+                config_path: Some(PathBuf::from(path.clone()))
+            })
+        );
+        // --config=<非 UTF-8>：Unix 可解析；其他平台回錯誤並提示改用 --config <path>
+        let result = parse_args([non_unicode("--config=")]);
+        #[cfg(unix)]
+        assert_eq!(
+            result,
+            Ok(CliAction::Run {
+                config_path: Some(PathBuf::from(path))
+            })
+        );
+        #[cfg(not(unix))]
+        assert!(result.unwrap_err().contains("--config <path>"));
     }
 }

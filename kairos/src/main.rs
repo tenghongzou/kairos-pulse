@@ -320,7 +320,8 @@ fn exit_code(result: &Result<Option<String>, Error>) -> u8 {
 
 fn main() -> ExitCode {
     // 日誌尚未初始化前的錯誤只能輸出到 stderr
-    let config_path = match parse_args(std::env::args().skip(1)) {
+    // args_os：非 UTF-8 的參數不會 panic，由 parse_args 回錯誤（審計 Q5）
+    let config_path = match parse_args(std::env::args_os().skip(1)) {
         Ok(CliAction::Run { config_path }) => config_path,
         Ok(CliAction::Help) => {
             println!("{}", USAGE);
