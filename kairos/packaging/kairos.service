@@ -1,0 +1,72 @@
+# Kairos 系統層級 systemd unit 範本
+#
+# 安裝（完整步驟見 INSTALL.md）：
+#   install -m 644 kairos.service /etc/systemd/system/kairos.service
+#   systemctl daemon-reload && systemctl enable --now kairos
+#
+# 前提：
+#   - 專用使用者 kairos（無登入 shell），程式與設定在 /opt/kairos
+#   - /opt/kairos/data 與 /opt/kairos/logs 已建立且屬於 kairos（ProtectSystem=strict
+#     下只有這兩個目錄可寫；目錄不存在時 unit 會以 226/NAMESPACE 啟動失敗）
+#   - 憑證、私鑰、client CA、CRL 放在 /opt/kairos（kairos 可讀即可，不需可寫）
+#
+# 修改請用 `systemctl edit kairos` 建立 drop-in，不要直接改這個檔案。
+
+[Unit]
+Description=Kairos monitoring server (Pulse agent receiver)
+Documentation=file:/opt/kairos/INSTALL.md file:/opt/kairos/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kairos
+Group=kairos
+WorkingDirectory=/opt/kairos
+ExecStart=/opt/kairos/kairos --config /opt/kairos/kairos.toml
+
+# 預設 max_connections = 1024 時需要 > 1024 + 64 個 FD；Ubuntu 預設 soft limit 1024
+# 會在啟動時記 WARN。調高 server.max_connections 時請一併調高（> max_connections + 64）。
+LimitNOFILE=8192
+
+# 正常關機：Kairos 收到 SIGINT/SIGTERM 後最壞約 3 秒結束（看門狗 4 秒），10 秒足夠
+KillSignal=SIGINT
+TimeoutStopSec=10
+# 背景工作異常時 Kairos 以結束代碼 1 結束，交由 systemd 重新啟動
+Restart=on-failure
+RestartSec=5
+
+# 監聽 1024 以下的連接埠（例如 443）時取消下一行的註解
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# ---- 硬化 -------------------------------------------------------------------
+# 整個檔案系統唯讀，只有資料與日誌目錄可寫。熱重載只「讀取」憑證、私鑰、client CA
+# 與 CRL；管理者在主機上以 mv 覆寫 /opt/kairos/*.pem、agents.crl 後，服務內看到的是
+# 同一個檔案系統的唯讀掛載，變更會立即可見，不影響熱重載。
+ProtectSystem=strict
+ReadWritePaths=/opt/kairos/data /opt/kairos/logs
+# 憑證與設定不可放在 /home、/root、/run/user 之下（服務內看不到）
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
