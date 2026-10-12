@@ -388,6 +388,10 @@ fn pulse_like(agent: &str, seq: u64, at: DateTime<Utc>, cpu: f64) -> ReportRecor
 ///   `KP_BENCH_DUP_PERCENT`（預設 0）% 的筆數另外重送一次（模擬結果不明後的重送，應為 `Duplicate`）
 /// - `KP_BENCH_INVENTORY=1`：一開始就送出 `KP_BENCH_HOSTS` 台線上主機的狀態表快照，量測期間
 ///   （第 30 秒）的第一次清冊同步會寫入這麼多列（重新啟動後的情況）
+/// - `KP_BENCH_TIMEOUT=1`：與連線（`connection::store_report`）相同地等待：最多 5 秒
+///   （`timeouts.write_secs` 預設值），逾時時 writer 尚未認領的取消（連線回 `storage_unavailable`），
+///   已認領的再等 1 秒，仍沒有結果算「結果不明」（連線不回應並關閉）。負載是固定速率（不像 Pulse
+///   收到 `storage_unavailable` 會退避），用來確認寫入跟不上時的回應時間上限
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "吞吐量量測，手動執行"]
 async fn sqlite_throughput() {
@@ -413,6 +417,7 @@ async fn sqlite_throughput() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let inventory = std::env::var("KP_BENCH_INVENTORY").is_ok_and(|v| v == "1");
+    let emulate_timeout = std::env::var("KP_BENCH_TIMEOUT").is_ok_and(|v| v == "1");
     let dir = std::env::var("KP_BENCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| temp_dir("bench"));
@@ -489,9 +494,13 @@ async fn sqlite_throughput() {
                 let tx = lat_tx.clone();
                 tokio::spawn(async move {
                     let t0 = Instant::now();
-                    let status = match sink.submit(rec).await {
-                        Ok(mut p) => p.wait().await,
-                        Err(e) => WriteStatus::Failed(e),
+                    let status = if emulate_timeout {
+                        submit_like_a_connection(&sink, rec).await
+                    } else {
+                        match sink.submit(rec).await {
+                            Ok(mut p) => p.wait().await,
+                            Err(e) => WriteStatus::Failed(e),
+                        }
                     };
                     let _ = tx.send((t0.elapsed(), status));
                 });
@@ -501,13 +510,15 @@ async fn sqlite_throughput() {
     }
     drop(lat_tx);
     let mut lat = Vec::with_capacity(total as usize);
-    let (mut failed, mut duplicates) = (0, 0);
+    let (mut failed, mut duplicates, mut unavailable, mut unknown) = (0, 0, 0, 0);
     while let Some((d, status)) = lat_rx.recv().await {
         lat.push(d);
         match status {
             WriteStatus::Written => {}
             WriteStatus::Duplicate => duplicates += 1,
-            _ => failed += 1,
+            WriteStatus::Failed(r) if r == BENCH_TIMED_OUT => unavailable += 1,
+            WriteStatus::Unknown(_) => unknown += 1,
+            WriteStatus::Failed(_) => failed += 1,
         }
     }
     // 連線等待寫入的上限（timeouts.write_secs 預設 5 秒）：超過時回 storage_unavailable 或不回應
@@ -536,7 +547,7 @@ async fn sqlite_throughput() {
         .unwrap_or(0);
     println!(
         "BENCH rate={rate}/s secs={secs} hosts={hosts} durable={durable} backfill_hours={backfill_hours} dup_percent={dup_percent} inventory={inventory}\n\
-         BENCH sent={total} elapsed={:.1}s failed={failed} duplicates={duplicates} over_write_timeout_5s={over_timeout}\n\
+         BENCH sent={total} elapsed={:.1}s failed={failed} duplicates={duplicates} over_write_timeout_5s={over_timeout} timeout_emulated={emulate_timeout} storage_unavailable={unavailable} unknown={unknown}\n\
          BENCH latency p50={:?} p99={:?} p999={:?} max={:?}\n\
          BENCH db_bytes={bytes} wal_bytes_at_end={wal_bytes} reports={rows} rollup_rows={rollups} bytes_per_report_total={:.0} bytes_per_report_raw_table_and_index={}",
         elapsed.as_secs_f64(),
@@ -552,13 +563,131 @@ async fn sqlite_throughput() {
         },
     );
     assert_eq!(failed, 0);
-    assert_eq!(rows as u64, total);
-    if durable {
-        assert_eq!(duplicates as u64, total * dup_percent.min(100) / 100);
+    if emulate_timeout {
+        // 連線等待寫入的上限：5 秒 + 已開始寫入時的寬限 1 秒（PROTOCOL.md 的 8 秒預算中的這一段）
+        assert!(
+            *lat.last().unwrap() < Duration::from_millis(6_100),
+            "max = {:?}",
+            lat.last()
+        );
+    } else {
+        assert_eq!(rows as u64, total);
+        if durable {
+            assert_eq!(duplicates as u64, total * dup_percent.min(100) / 100);
+        } else {
+            // 平常的負載（每秒 2000 筆）：遠低於 timeouts.write_secs
+            assert!(pct(0.99) < Duration::from_secs(1), "p99 = {:?}", pct(0.99));
+        }
     }
-    // PROTOCOL.md 的回應延遲預算：等待寫入最多 timeouts.write_secs（預設 5 秒）
-    assert!(pct(0.99) < Duration::from_secs(1), "p99 = {:?}", pct(0.99));
     if std::env::var("KP_BENCH_DIR").is_err() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// [`sqlite_throughput`] 的 `KP_BENCH_TIMEOUT=1`：逾時取消的回 `Failed(BENCH_TIMED_OUT)`
+const BENCH_TIMED_OUT: &str = "bench: timed out";
+
+/// 與 `connection::store_report` 相同的等待方式（逾時 5 秒、已認領時再等 1 秒）
+async fn submit_like_a_connection(sink: &ReportSink, rec: ReportRecord) -> WriteStatus {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut pending = match tokio::time::timeout_at(deadline, sink.submit(rec)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return WriteStatus::Failed(e),
+        Err(_) => return WriteStatus::Failed(BENCH_TIMED_OUT.into()),
+    };
+    match tokio::time::timeout_at(deadline, pending.wait()).await {
+        Ok(status) => status,
+        Err(_) if pending.cancel() => WriteStatus::Failed(BENCH_TIMED_OUT.into()),
+        Err(_) => match tokio::time::timeout(Duration::from_secs(1), pending.wait()).await {
+            Ok(status) => status,
+            Err(_) => WriteStatus::Unknown("bench: claimed but no result".into()),
+        },
+    }
+}
+
+/// 補送尖峰的剖析（`kairos/STORAGE.md`「量測」）：直接驅動 [`sqlite::SqliteStore`]（不經佇列），
+/// 每批 `KP_BENCH_BATCH`（預設 1000）筆 durable report（1 萬台輪流、取樣時間從 72 小時前起），
+/// 每批之後做一步維護，每 `KP_BENCH_REPORT_EVERY` 批印出寫入與維護的平均耗時，找出持續寫入時
+/// 變慢的部分。`cargo test -p kairos --release -- --ignored --nocapture sqlite_backfill_profile`
+#[test]
+#[ignore = "剖析，手動執行"]
+fn sqlite_backfill_profile() {
+    let env = |k: &str, d: u64| -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let total = env("KP_BENCH_TOTAL", 4_800_000);
+    let batch = env("KP_BENCH_BATCH", 1000);
+    let hosts = env("KP_BENCH_HOSTS", 10_000);
+    let every = env("KP_BENCH_REPORT_EVERY", 500);
+    let durable = env("KP_BENCH_DURABLE", 1) == 1;
+    let dir = temp_dir("profile");
+    let config = sqlite_config(&dir);
+    let mut opts = sqlite::SqliteOptions::from_config(&config, &dir);
+    opts.max_total_bytes = 0;
+    let (mut store, _) = sqlite::SqliteStore::open(opts, Utc::now).unwrap();
+    let agents: Vec<String> = (0..hosts)
+        .map(|i| format!("00000000-0000-4000-8000-{i:012x}"))
+        .collect();
+    let from = Utc::now() - chrono::Duration::hours(72);
+    let (mut w, mut m, mut wmax, mut mmax) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let started = Instant::now();
+    let mut sent = 0u64;
+    let mut n_batches = 0u64;
+    while sent < total {
+        let records: Vec<ReportRecord> = (0..batch.min(total - sent))
+            .map(|i| {
+                let k = sent + i;
+                let host = k % hosts;
+                let n = k / hosts;
+                let mut rec = pulse_like(&agents[host as usize], n, Utc::now(), (k % 100) as f64);
+                if durable {
+                    rec.ts = fmt_time(from + chrono::Duration::seconds(n as i64 * 5));
+                    rec = rec.with_dedup(Some(DedupKey {
+                        boot_id: format!("{host:08x}-0000-4000-8000-000000000000"),
+                        report_seq: n + 1,
+                    }));
+                }
+                rec
+            })
+            .collect();
+        sent += records.len() as u64;
+        let t = Instant::now();
+        let results = store.write_batch(&records);
+        let d = t.elapsed();
+        assert!(results.iter().all(|r| *r == WriteStatus::Written));
+        w += d;
+        wmax = wmax.max(d);
+        let t = Instant::now();
+        store.maintain();
+        let d = t.elapsed();
+        m += d;
+        mmax = mmax.max(d);
+        n_batches += 1;
+        if n_batches.is_multiple_of(every) {
+            let db = std::fs::metadata(dir.join(sqlite::DB_FILE)).map_or(0, |m| m.len());
+            println!(
+                "PROFILE rows={sent} elapsed={:.0}s rate={:.0}/s write_avg={:?} write_max={wmax:?} maintain_avg={m_avg:?} maintain_max={mmax:?} db_bytes={db} {store:?}",
+                started.elapsed().as_secs_f64(),
+                (every * batch) as f64 / (w + m).as_secs_f64(),
+                w / every as u32,
+                m_avg = m / every as u32,
+            );
+            (w, m, wmax, mmax) = (
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+        }
+    }
+    store.close();
+    std::fs::remove_dir_all(&dir).unwrap();
 }
