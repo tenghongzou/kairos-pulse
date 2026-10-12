@@ -8,15 +8,26 @@ Kairos 與 Pulse 自 0.2.0 起各自採用 [SemVer](https://semver.org/lang/zh-T
 
 ## 版本相容矩陣〔草稿〕
 
-Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以 commit 識別的所有建置，各 commit 之間的細節見 Kairos README 的「升級注意事項（與 Pulse 混用版本）」。
+Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以 commit 識別的所有建置，各 commit 之間的細節見各產品 README 的「升級注意事項（與 … 混用版本）」。
 
-| Kairos ＼ Pulse | Pulse 0.1.0 | Pulse 0.2.0 |
+**協定版本**由每條連線的 hello 協商（`crates/kairos-proto/PROTOCOL.md`「版本協商」），與產品版本號無關：
+
+| 產品版本 | 支援的協定 | hello／hello_ack |
 |---|---|---|
-| **Kairos 0.1.0** | 依舊版說明 | 相容（協定 v1）。Kairos `timeouts.write_secs` 大於約 8 秒的舊版（`572b955` 之前）在寫檔緩慢時 Pulse 可能誤判斷線；Pulse 的預設心跳改為 15 秒，離線判定變為約 75 秒 |
-| **Kairos 0.2.0** | **有條件**：`44dcee5` 之前的 Pulse 在主機名稱含格式字元（Cf）時、`44dcee5` 在主機名稱含 U+034F、Hangul filler、變體選擇字元或私用區字元時**無法註冊**；舊版 Pulse 的讀取閒置計算方式在心跳較大時可能誤斷線。請先升級 Pulse | **相容（建議組合）** |
+| Kairos 0.1.0 | v1 | 只檢查 hello 的 `proto == 1`，忽略不認得的欄位 |
+| Kairos 0.2.0 | v1～v2 | 取 client 宣告的範圍與 1～2 中最高的共同版本；v1 時的 `hello_ack`、report 與錯誤處理與 0.1.0 相同 |
+| Pulse 0.1.0 | v1 | `proto: 1` |
+| Pulse 0.2.0 | v1～v2 | `proto: 1`（讓 0.1.0 的 Kairos 接受）加上 `proto_min: 1`、`proto_max: 2`、`features: ["metrics"]` 與主機資訊；依 `hello_ack` 的 `proto` 與 `features` 決定 report 格式 |
 
-- 兩個產品之間的協定目前都是 v1。協定 v2（版本協商，審計 A3）合併後，本表要補上 v1／v2 混用的行為與最低版本。
-- 升級順序一律為：先升級全部 Pulse，再升級 Kairos（或同時升級）。
+| Kairos ＼ Pulse | Pulse 0.1.0（協定 v1） | Pulse 0.2.0（協定 v1～v2） |
+|---|---|---|
+| **Kairos 0.1.0**（協定 v1） | 協定 v1，依舊版說明 | **相容，協定 v1**：Kairos 忽略 v2 欄位、回 `"proto":1`，Pulse 改送三欄位的 report；JSONL 維持舊格式（沒有 `schema`），沒有主機資訊。注意：`572b955` 之前的 Kairos 把 `timeouts.write_secs` 設得大於約 8 秒時，寫檔緩慢期間 Pulse 可能誤判斷線；Pulse 的預設心跳改為 15 秒，離線判定變為約 75 秒（破壞性變更第 3 項） |
+| **Kairos 0.2.0**（協定 v1～v2） | **有條件相容，協定 v1**：`hello_ack`、report、錯誤處理與 0.1.0 的 Kairos 相同；JSONL 為 `schema` 1（欄位與舊版相同，只多 `schema`），`agents.json` 的 `proto` 為 1、沒有主機資訊。限制：`44dcee5` 之前的 Pulse 在主機名稱含格式字元（Cf）時、`44dcee5` 在主機名稱含 U+034F、Hangul filler、變體選擇字元或私用區字元時**無法註冊**；舊版 Pulse 的讀取閒置計算方式在心跳較大時可能誤斷線 | **相容（建議組合），協定 v2**：report 為通用指標（JSONL `schema` 2），hello 帶主機資訊（寫入 `agents.json`），`hello_ack` 帶 `server_time`（Pulse 檢查時鐘偏差） |
+
+- 同一個 Kairos 0.2.0 可以同時服務 v1 與 v2 的 Pulse：每個 agent 依自己的連線協商，同一個 `reports-*.jsonl` 中 `schema` 1 與 2 的行並存（讀取工具須依 `schema` 分流，見破壞性變更第 6 項）。
+- 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
+- **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。
+- 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
 
 ## 支援期限〔草稿〕
 
@@ -34,7 +45,11 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-預定發佈為 **Kairos 0.2.0**、**Pulse 0.2.0**（`Cargo.toml` 已是 0.2.0，尚未打 tag；發佈時本標題改為版本與日期，見 RELEASING.md）。
+（0.2.0 之後的變更記在這裡。）
+
+## [0.2.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.2.0**、**Pulse 0.2.0**（兩者同時發佈）。`Cargo.toml` 已是 0.2.0，尚未打 tag；發佈時依 RELEASING.md 填入日期並移除〔草稿〕標記。共用 crate（`kairos-proto`、`date-guard`）是內部 crate，維持 0.1.0、不單獨發佈。協定新增 v2，與 v1 自動協商（見上方「版本相容矩陣」）。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -46,18 +61,20 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | 4 | Kairos | **既有資料檔與日誌檔的權限被收緊到最多 0640**（S3，Unix） | 以 Kairos 服務帳號以外、又不在其群組中的帳號讀取 `data/reports-*.jsonl`、`agents.json`、`logs/kairos-*.log` 的工具（例如日誌收集代理、備份腳本） | Kairos 開啟既有的 report 檔與日誌檔時會移除 group 寫入與 other 的所有權限（`0644` → `0640`，`0600` 維持不變），`agents.json` 與 `.retention-guard*.json` 每次重寫都是 `0640`。需要讀取的帳號請加入 Kairos 的群組（例如 `usermod -aG kairos <帳號>`）或以 ACL（`setfacl`）授權。既有目錄的權限不會被改變，但其他使用者可存取時（例如 `0755`）啟動會記 `WARN` 並建議 `chmod 750` |
 | 5 | Kairos、Pulse | **啟動失敗的結束代碼依原因區分**（用法錯誤 2、設定錯誤 3、憑證錯誤 4，Kairos 另有連接埠衝突 11），systemd 不再重試 2、3、4 | 以結束代碼判斷啟動失敗的腳本或監控；沿用舊版 unit 檔的部署 | 依設計包 `design/design-system/cli-style.md` §8 的結束代碼表（不使用 sysexits）：用法錯誤 **2**（Kairos 原為 1，Pulse 不變）；設定錯誤 **3**（原為 1：設定檔無法載入或驗證不通過；Kairos 另含第 1 項的拒絕啟動，Pulse 另含無效的 `server.domain`）；憑證錯誤 **4**（原為 1：Kairos 的伺服器憑證、私鑰、client CA、CRL，Pulse 的 `ca_cert`、客戶端憑證、私鑰、SAN 不符與 `agent.id`）；Kairos 連接埠已被佔用 **11**（原為 1，仍會重試）。對照表見根目錄 README「結束代碼」。新版 `kairos.service`、`pulse.service` 加上 `RestartPreventExitStatus=2 3 4`：服務停在 `failed`（`status=2`／`3`／`4`），修正後執行 `systemctl restart`。升級時請以發佈包的 unit 覆寫 `/etc/systemd/system/` 下的檔案（自訂內容放在 `systemctl edit` 的 drop-in）並 `systemctl daemon-reload`；Pulse 多實例時依 `pulse/packaging/INSTALL.md` 第 9 節重新產生每個 `pulse-N.service`。只判斷「非 0」的腳本不受影響 |
 | 6 | Kairos（影響讀取資料檔的工具） | **JSONL 每行新增 `schema`；新版 Pulse 連新版 Kairos 時 report 改為通用指標（`schema` 2）**（A3、A4、O6） | 直接讀取 `data/reports-*.jsonl` 或 `agents.json` 的工具（匯入、報表、監控腳本） | 每一行最前面多了 `schema`（`1` 為原本的 `cpu_usage`／`total_memory`／`used_memory`，`2` 為 `metrics` 陣列，記憶體等改以 bytes 表示）。兩端都升級後新資料為 `schema` 2，混用期間同一個檔案中兩種格式並存：升級 Kairos **前**請讓讀取工具依 `schema` 分流（沒有 `schema` 的舊資料視同 1，不認得的 `schema` 略過）。`agents.json` 每個 agent 多了 `proto` 與 v2 的主機資訊，`last_report` 的三個值在 v2 由標準指標換算（缺少時省略），另有 `metrics` 指標數。格式說明見 `kairos/README.md`「資料輸出」 |
+| 7 | Kairos | **連線被拒與全域上限的日誌文字改寫**（A7） | 以日誌全文或固定字串比對來告警的監控（例如 grep「已達連線上限」） | 每 IP 上限：「來自 <位址> 的同時連線數已達上限 N（server.max_connections_per_ip），拒絕新連線」→「來自 <位址> 的同時連線數／握手中（尚未通過 hello）的連線數已達上限 N（<適用的設定>），在 TLS 握手前拒絕新連線」，並附允許清單的提示；全域上限：「已達連線上限 N，暫停接受新連線」→「已達同時連線上限 N（server.max_connections），暫停接受新連線；…」，恢復時另附累計暫停次數與時間；握手中上限的訊息加上「（server.max_connections 的一半）」與「在 TLS 握手前」。請改以「已達同時連線上限」「已達上限」等新字串或日誌等級比對。另外 agent 上線的 `INFO` 日誌結尾多了「，協定 vN」（比對前綴者不受影響） |
+| 8 | Kairos、Pulse | **發佈包檔名加入版本，輸出位置與 `SHA256SUMS` 改變**（B3、D2） | 依檔名下載、解壓或比對雜湊的自動化腳本 | 檔名 `kairos-<commit>-linux-x86_64.tar.gz` → `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（Pulse 相同），解壓後的目錄名稱也隨之改變；`--version` 由 `0.1.0 (<commit>)` 變為 `0.2.0 (<commit>)`。發佈處的 `SHA256SUMS` 改為兩個產品共用的一份並附 `SHA256SUMS.sig`，驗證步驟改為先以 `ssh-keygen -Y verify` 驗簽章，再 `sha256sum -c --ignore-missing`（INSTALL 第 2 節） |
 
-**建議的升級順序**：
+**建議的升級順序**（協定 v2 以版本協商相容 v1，Kairos 與 Pulse 不必同時升級，以下順序是建議而非必要，理由見上方「版本相容矩陣」）：
 
 1. 檢查 Kairos 是否符合第 1 項（`server.listen` 非 loopback 卻沒有 `auth.client_ca`），先啟用 mTLS。
-2. 檢查第 4 項：有其他帳號讀取 Kairos 資料檔或日誌時，先把它加入 Kairos 的群組；第 6 項：讀取 JSONL 的工具先改為依 `schema` 分流。
-3. 升級全部 Pulse（第 2、3 項；換上新版 `pulse.service`），確認 `systemctl status pulse` 的 `Status:` 為「已註冊：…」、日誌的信任來源正確。
-4. 升級 Kairos（換上新版 `kairos.service`）。
+2. 檢查第 4 項：有其他帳號讀取 Kairos 資料檔或日誌時，先把它加入 Kairos 的群組；第 6 項：讀取 JSONL 的工具先改為依 `schema` 分流；第 7 項：更新比對日誌文字的監控；第 8 項：更新下載與驗證發佈包的腳本。
+3. 升級 Pulse（第 2、3 項；換上新版 `pulse.service`），確認 `systemctl status pulse` 的 `Status:` 為「已註冊：…」、日誌的信任來源正確。連舊版 Kairos 時註冊日誌為「協定 v1」。
+4. 升級 Kairos（換上新版 `kairos.service`）。之後 Pulse 重連時註冊日誌變為「協定 v2」，JSONL 開始出現 `schema` 2 的行；尚未升級的 Pulse 繼續以 v1 運作。
 5. 調整依賴離線判定時間（第 3 項）與結束代碼（第 5 項）的監控與腳本。
 
 另有一項不需修改設定的行為改變：**啟用 mTLS 時 `server.max_connections_per_ip` 只計算尚未通過 hello 的連線**，通過後改依憑證身分計數（A7，見 Kairos「變更」）；同一個 NAT 後的 agent 不再從第 33 台起被斷線。
 
-兩個產品之間的協定新增 **v2**，並以版本協商相容 v1（見「共用」）：新版與舊版混用時自動以 v1 通訊、線上格式與舊版相同，因此 Kairos 與 Pulse 不必同時升級，上面的升級順序（先 Pulse 後 Kairos）只是建議。兩端都是新版時才使用 v2（通用指標、主機資訊、`server_time`）。新舊版本混用的其他限制見各產品 README 的「升級注意事項（與 … 混用版本）」。
+兩個產品之間的協定新增 **v2**，並以版本協商相容 v1（見「共用」與上方「版本相容矩陣」）：新版與舊版混用時自動以 v1 通訊、線上格式與舊版相同；兩端都是新版時才使用 v2（通用指標、主機資訊、`server_time`）。新舊版本混用的其他限制見各產品 README 的「升級注意事項（與 … 混用版本）」。
 
 ### Kairos
 
@@ -73,7 +90,6 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 啟動時以 `INFO` 記錄每 IP 上限的計數方式（是否只計算握手中的連線）、實際上限與允許清單。
 - 協定 v2 與版本協商（A3）：依 hello 的 `proto`／`proto_min`／`proto_max` 協商（支援 1～2），`hello_ack` 回協商結果；v2 另回 `features`（`["metrics"]`）與 `server_time`（RFC 3339 UTC 毫秒，設計包 §12 #4）。舊版 Pulse 協商為 v1，`hello_ack`、report 格式與錯誤處理與舊版完全相同；協商為 v1 時 hello 中的 v2 主機資訊一律忽略（不檢查型別），與舊版 Kairos 相同。
 - 通用指標（A4）：v2 且雙方都宣告 `metrics` 時，report 為 `metrics: [{name, value, unit, labels}]`，驗證名稱、單位、label、數量（1～256）、重複與標準指標的單位與範圍（違反時 `invalid_report`），原樣保存到 JSONL（`schema` 2，數字保留原本的表示）。
-- JSONL 每行新增 `schema`（O6）：`1` 為三欄位的 report，`2` 為通用指標（見上表第 6 項）。
 - v2 hello 的主機資訊（設計包 `enrollment-ux.md` §12 #5、`screens.md` §24 #15）：`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os` 依 PROTOCOL.md 的限制驗證（違反時 `bad_request`），寫入 `agents.json`；每個 agent 另記錄協商出的 `proto`。
 - 同一個 `agent_id` 的主機指紋與狀態表中記錄的不同時記 `WARN`「主機指紋與上次不同」（每個 agent 節流），用於發現由映像檔複製、共用 `agent.id` 的主機。
 
@@ -85,7 +101,8 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 日誌依 UTC 日期分檔改由 Kairos 自行實作（`DailyLogFile`，取代 fern 的 `date-based`，以便指定新檔案的權限），檔名與保留規則不變；只在一筆日誌的開頭檢查日期，同一行不會被拆到兩個檔案。
 - 協定型別、驗證與日期保護改用共用 crate（見「共用」），線上行為與日誌內容不變；`cpu_usage` 在線上統一為 f64、保存仍為 f32，接受範圍與 JSONL 輸出不變（A14）。
 - **（行為改變）** 啟用 mTLS 時改依憑證身分計數（A7 根本解，設計包 D13）：`server.max_connections_per_ip` 只計算握手前、握手中與等待 hello 的連線（慢速握手防護，K-S2 仍有效）；hello 通過、`agent_id` 與憑證綁定後歸還來源位址的名額，改依 `agent_id` 計數，同一身分的多條連線依既有的 `superseded` 行為處理。同一個 NAT 後的 agent 數只受 `server.max_connections` 限制。設定鍵與預設值不變；為了 NAT 而調高 `server.max_connections_per_ip` 的 mTLS 部署可改回預設。未啟用 mTLS 時行為不變（每 IP 上限涵蓋整個連線）。
-- 連線被拒的日誌改寫：每 IP 上限寫出計算的是「同時連線數」還是「握手中的連線數」、適用的設定（`server.max_connections_per_ip` 或允許清單），並提示可加入 `server.per_ip_allowlist`；全域上限與握手中上限的日誌寫出對應的設定（`server.max_connections`）。依賴舊日誌全文比對的監控請更新。
+- **（破壞性）** JSONL 每行新增 `schema`（O6）：`1` 為三欄位的 report，`2` 為通用指標；新版 Pulse 連線時寫成 `schema` 2（見上表第 6 項）。
+- **（破壞性）** 連線被拒的日誌改寫（見上表第 7 項）：每 IP 上限寫出計算的是「同時連線數」還是「握手中的連線數」、適用的設定（`server.max_connections_per_ip` 或允許清單），並提示可加入 `server.per_ip_allowlist`；全域上限與握手中上限的日誌寫出對應的設定（`server.max_connections`）。依賴舊日誌全文比對的監控請更新。
 - `unsupported_version` 的 `message` 改為伺服器支援的範圍 `supported proto: 1-2`，並另帶 `proto_min`、`proto_max`（舊版 Pulse 忽略多出的欄位）；只送 `proto: 2`（沒有範圍）的 client 改以 v2 接受（舊版回 `unsupported_version`）。
 - agent 上線的 `INFO` 日誌結尾加上「，協定 vN」；版本不受支援的 `WARN` 附上 client 宣告的範圍與本伺服器支援的範圍。
 
@@ -155,12 +172,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **簽章**：發佈處提供 `SHA256SUMS.sig`（`ssh-keygen -Y sign`，namespace `kairos-pulse-release`）。INSTALL 第 2 節的驗證改為先以 `ssh-keygen -Y verify` 驗簽章、再 `sha256sum -c --ignore-missing`；發佈公鑰 `allowed_signers` 須從另一個管道取得並核對指紋（D2）。
 - **第三方授權聲明**：發佈包新增 `THIRD-PARTY-LICENSES`（cargo-about 依 `Cargo.lock` 產生，含各依賴的授權全文），INSTALL 的安裝與升級步驟一併把它與 `CHANGELOG.md` 複製到 `/opt/<產品>/`（B2）。
 - **SBOM**：發佈包新增 `<名稱>.cdx.json`（CycloneDX 1.5，cargo-cyclonedx 產生），發佈處另附一份 `<名稱>-<版本>-<commit>-linux-x86_64.cdx.json`（D4）。
-- `packaging/release.sh`：檢查工作目錄乾淨、執行 fmt／clippy／test／deny 後打包兩個產品，提供私鑰時簽章；`packaging/sign-release.sh`：簽章與驗證；`packaging/check-reproducible.sh`：以兩個全新的建置環境各建置一次並比對雜湊（D3、D4）。
+- `packaging/release.sh`：檢查工作目錄乾淨、執行 fmt／clippy／test（與 CI 相同，端對端測試分開執行）／deny 後打包兩個產品，提供私鑰時簽章；`packaging/sign-release.sh`：簽章與驗證；`packaging/check-reproducible.sh`：以兩個全新的建置環境各建置一次並比對雜湊（D3、D4）。
 - CI 新增 `package` job：Linux 與 Windows 的 fmt、clippy、test 與 cargo deny 都通過後才打包，產出兩個發佈包、SBOM 與合併版 `SHA256SUMS`（artifact，不簽章）；push 到 `main` 與手動觸發時另跑可重現性檢查（D3、D4）。
 
 #### 變更
 
-- **發佈包檔名加入版本**：`kairos-<commit>-linux-x86_64.tar.gz` → `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（Pulse 相同），依檔名下載或解壓的自動化腳本需要調整。
+- **（破壞性）** **發佈包檔名加入版本**：`kairos-<commit>-linux-x86_64.tar.gz` → `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（Pulse 相同），依檔名下載或解壓的自動化腳本需要調整（見上表第 8 項）。
 - 兩個產品的打包腳本都輸出到 repo 根目錄的 `dist/`，`SHA256SUMS` 改為兩個產品共用的合併清單（修正每次打包都覆寫成只剩單一套件的問題，D2）。
 - 建置 image 以 `@sha256:` digest 固定，唯一需要 `apk add` 的 GNU tar 鎖定版本（D4）。
 - 建置來源改用 `git archive` 匯出的 commit 內容，不再掛載工作目錄：Windows（`core.autocrlf=true`）上打出的發佈包中文件與範例設定原本是 CRLF，Pulse 嵌入的預設設定也因此與 Linux 上建置的不同；現在與主機的行尾設定無關。

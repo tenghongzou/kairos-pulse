@@ -22,7 +22,7 @@
 1. 從整合分支（目前為 `sprint1/integration`，之後為 `main`）開分支，例如 `release/0.2.0`。
 2. 確認兩個產品 `Cargo.toml` 的 `version`，執行 `cargo metadata --format-version 1 >/dev/null` 更新 `Cargo.lock`；`git diff Cargo.lock` 只能有 `kairos`、`pulse` 等 workspace 成員的版本變動。
 3. 更新 `CHANGELOG.md`：
-   - `## [Unreleased]` 改為 `## [Kairos 0.2.0、Pulse 0.2.0] - YYYY-MM-DD`，上方留一個新的空 `## [Unreleased]`。
+   - 草稿段落 `## [0.2.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.2.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.2.1），標題寫成 `## [Pulse 0.2.1] - YYYY-MM-DD`。
    - 更新「版本相容矩陣」，移除已確定項目的〔草稿〕標記。
 4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。
 5. 合併到整合分支後，記下合併後的 commit（以下稱 `<release-commit>`）；之後的步驟都在這個 commit 上進行。
