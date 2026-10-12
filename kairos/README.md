@@ -64,7 +64,7 @@
 | 第一輪修正版 Pulse（`44dcee5`）連新版 Kairos | 新版 Kairos 另外禁止 U+034F、Hangul filler、變體選擇字元與私用區（見「協定概述」的 hello 欄位限制），`44dcee5` 不會替換這些字元；主機名稱含這些字元時**無法註冊** |
 | 新版 Pulse 連舊版 Kairos（`572b955` 之前，`timeouts.write_secs` 沒有 6 秒上限） | Kairos 的 `timeouts.write_secs` 大於約 8 秒時，伺服器寫檔緩慢期間的回應延遲可能超過 Pulse 讀取閒置中的 10 秒餘裕，Pulse **誤判斷線**並重連 |
 
-**部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
+**部署順序**：協定 v2 起不必同時升級，任何順序都能以協定 v1 混用；仍建議先升級全部 Pulse，再升級 Kairos，以避開上表「舊版 Pulse 連新版 Kairos」的風險。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。各版本組合見 CHANGELOG「版本相容矩陣」。
 
 ## 從發佈包安裝
 
@@ -79,7 +79,7 @@
 5. 安裝 `kairos.service`（`User=kairos`、`WorkingDirectory=/opt/kairos`、`ExecStart=/opt/kairos/kairos --config /opt/kairos/kairos.toml`、`LimitNOFILE=8192`、`Restart=on-failure`、`KillSignal=SIGINT`、`ProtectSystem=strict` 且只開放 `data/`、`logs/` 可寫），`systemctl enable --now kairos`。
 6. 確認 `--version`、`journalctl -u kairos` 與 `data/agents.json`。
 
-不要以 `systemd-run --user` 執行正式服務：沒有開啟 linger 時，最後一個登入 session 結束就會一起被停掉。升級時先升級全部 Pulse，再升級 Kairos（見上一節）。
+不要以 `systemd-run --user` 執行正式服務：沒有開啟 linger 時，最後一個登入 session 結束就會一起被停掉。升級時建議先升級全部 Pulse，再升級 Kairos（不必同時升級，見上一節）。
 
 發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/kairos-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Pulse 共用的 `dist/SHA256SUMS`（工作目錄有未提交的變更時檔名加上 `-dirty`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
 

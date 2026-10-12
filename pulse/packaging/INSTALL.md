@@ -397,7 +397,12 @@ tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄�
 
 ## 10. 升級
 
-**升級順序：先升級全部 Pulse，再升級 Kairos**（或同時升級）。新版 Pulse 會替換新版 Kairos 禁止的主機名稱字元，連舊版 Kairos 不受影響；反過來，舊版 Pulse 連新版 Kairos 可能無法註冊（細節見 `README.md`「升級注意事項」）。
+**升級順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。** 協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
+
+- 舊版 Pulse（`44dcee5` 及更早）連新版 Kairos 時，主機名稱含新版 Kairos 禁止的字元會**無法註冊**，心跳間隔較大時也可能誤斷線；新版 Pulse 連舊版 Kairos 沒有這類問題（舊版 Kairos 的 `timeouts.write_secs` 維持預設時）。先升級 Pulse 就不會經過有風險的組合。
+- 資料格式的改變與順序無關：Kairos 升級後 JSONL 每行多了 `schema`，新版 Pulse 連上後寫成 `schema` 2，讀取 JSONL 的工具要在升級 Kairos **前**改為依 `schema` 分流（`CHANGELOG.md` 破壞性變更第 6 項）。
+
+確認協商結果：Pulse 日誌的「已向伺服器註冊（…，協定 vN）」，連舊版 Kairos 時為 v1、連新版 Kairos 時為 v2。各版本組合的細節見 `CHANGELOG.md`「版本相容矩陣」與 `README.md`「升級注意事項」。
 
 ```bash
 # 1. 下載新版的發佈包、SHA256SUMS 與 SHA256SUMS.sig，依第 2 節驗證簽章與雜湊

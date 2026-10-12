@@ -41,9 +41,9 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ### 本版的行為改變（升級前請確認）
 
-本版有數項會影響既有部署的行為改變（設定 `ca_cert` 時預設不再信任作業系統信任庫、預設心跳由 1 秒改為 15 秒使 Kairos 的離線判定由 5 秒變成 75 秒、設定錯誤的結束代碼改為 3 等），完整說明與升級步驟統一記錄在 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）「破壞性變更與升級步驟」，這裡不再重複。
+本版有數項會影響既有部署的行為改變（設定 `ca_cert` 時預設不再信任作業系統信任庫、預設心跳由 1 秒改為 15 秒使 Kairos 的離線判定由 5 秒變成 75 秒、啟動失敗的結束代碼依原因區分為 2／3／4 等），完整說明與升級步驟統一記錄在 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）「破壞性變更與升級步驟」，這裡不再重複。
 
-**部署順序**：先升級全部 Pulse，再升級 Kairos；或兩邊同時升級。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。
+**部署順序**：協定 v2 起不必同時升級，任何順序都能以協定 v1 混用；仍建議先升級全部 Pulse，再升級 Kairos，以避開上表「舊版 Pulse 連新版 Kairos」的風險。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。各版本組合見 CHANGELOG「版本相容矩陣」。
 
 ## 從發佈包安裝
 
@@ -62,7 +62,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 - **多實例**：同一台主機跑多個 Pulse 時，每個實例使用自己的 `/opt/pulse-N`（`agent.id`、憑證、`pulse.toml`、`logs/` 各自一份），執行檔共用 `/opt/pulse/pulse`；unit 只改 `WorkingDirectory` 與 `ReadWritePaths` 兩行。完整指令見 INSTALL.md 第 9 節。
 - **移除**：有多實例時先停用並移除所有 `pulse-N.service`，`daemon-reload`、`reset-failed` 後，最後才刪除 `/opt/pulse` 與使用者 `pulse`（見 INSTALL.md 第 12 節）。
 
-升級時先升級全部 Pulse，再升級 Kairos（見上一節）。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/`（`pulse-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Kairos 共用的 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
+升級時建議先升級全部 Pulse，再升級 Kairos（不必同時升級，見上一節）。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/`（`pulse-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Kairos 共用的 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
 
 ## 快速開始（搭配 Kairos，本機測試）
 
