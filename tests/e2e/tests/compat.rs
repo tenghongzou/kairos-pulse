@@ -86,7 +86,8 @@ fn v1_client_and_new_pulse_share_one_new_kairos() {
     let online = k.lines_with(&format!("agent {old_id}（old-pulse，v0.1.0"));
     assert!(online[0].contains("協定 v1"), "{online:?}");
 
-    // JSONL：舊版 Pulse 的行是 schema 1，欄位與舊版相同（只多了 schema）；新版 Pulse 的行是 schema 2
+    // SQLite（以 kairos reports export 匯出，格式與 JSONL 相同）：舊版 Pulse 的行是 schema 1，
+    // 欄位與舊版相同（只多了 schema）；新版 Pulse 的行是 schema 2
     assert!(
         poll_until(WAIT, || {
             let reports = kairos.reports();
@@ -137,7 +138,7 @@ fn v1_client_and_new_pulse_share_one_new_kairos() {
             "{r}"
         );
     }
-    // 兩種格式在同一個檔案中（同一天）
+    // JSONL 鏡像：兩種格式在同一個檔案中（同一天）
     let files: Vec<_> = std::fs::read_dir(kairos.dir.join("data"))
         .unwrap()
         .filter_map(Result::ok)

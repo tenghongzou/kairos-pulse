@@ -626,6 +626,8 @@ reload_interval_secs = 1
 
 [storage]
 data_dir = "data"
+# 預設的 SQLite 之外另輸出 JSONL 鏡像：相容測試檢查兩種 schema 寫在同一個 JSONL 檔
+jsonl_mirror = true
 
 [auth]
 client_ca = "client-ca.pem"
@@ -652,8 +654,55 @@ level = "debug"
         write_atomically(&self.dir.join("agents.crl"), crl.as_bytes());
     }
 
-    /// `data/reports-*.jsonl` 中所有的 report（依檔名與行序）
+    /// SQLite（`data/kairos.db`）中所有的 report：以實際的 `kairos reports export` 匯出（Kairos 執行中
+    /// 也可以），每行的格式與 JSONL 相同，依寫入順序。資料庫尚未建立時為空
     pub fn reports(&self) -> Vec<serde_json::Value> {
+        if !self.dir.join("data").join("kairos.db").exists() {
+            return Vec::new();
+        }
+        let (code, p) = run_to_exit(
+            "kairos",
+            &self.dir,
+            &[
+                "reports",
+                "export",
+                "--config",
+                "kairos.toml",
+                "--since",
+                "7d",
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "kairos reports export 失敗\n{}", p.dump());
+        p.stdout()
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("匯出的一行不是 JSON（{e}）：{line}"))
+            })
+            .collect()
+    }
+
+    /// `kairos hosts list --json` 的 `data.hosts`（SQLite 主機清冊）
+    pub fn hosts(&self) -> Vec<serde_json::Value> {
+        let (code, p) = run_to_exit(
+            "kairos",
+            &self.dir,
+            &["hosts", "list", "--config", "kairos.toml", "--json"],
+            &[],
+        );
+        assert_eq!(code, 0, "kairos hosts list 失敗\n{}", p.dump());
+        let doc: serde_json::Value = serde_json::from_str(p.stdout().trim()).unwrap_or_else(|e| {
+            panic!("kairos hosts list --json 不是 JSON（{e}）：{}", p.stdout())
+        });
+        assert_eq!(doc["schema"], "kairos.hosts.list/v1", "{doc}");
+        assert_eq!(doc["ok"], true, "{doc}");
+        assert!(p.stdout().is_ascii(), "{}", p.stdout());
+        doc["data"]["hosts"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// `data/reports-*.jsonl`（JSONL 鏡像）中所有的 report（依檔名與行序）
+    pub fn jsonl_reports(&self) -> Vec<serde_json::Value> {
         let Ok(entries) = std::fs::read_dir(self.dir.join("data")) else {
             return Vec::new();
         };

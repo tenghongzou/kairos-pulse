@@ -72,11 +72,11 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
         "{online:?}"
     );
 
-    // report：等到至少 3 筆寫入 JSONL，檢查每一筆的內容。協定 v2 且雙方都宣告 metrics：
-    // 每行為 schema 2 的通用指標，不再有 cpu_usage／total_memory／used_memory 三欄位
+    // report：等到至少 3 筆寫入 SQLite（以 kairos reports export 匯出），檢查每一筆的內容。
+    // 協定 v2 且雙方都宣告 metrics：每行為 schema 2 的通用指標，不再有 cpu_usage／total_memory／used_memory
     assert!(
         poll_until(WAIT, || kairos.reports().len() >= 3),
-        "JSONL 沒有寫入 3 筆 report：{:?}\n{}\n{}",
+        "SQLite 沒有寫入 3 筆 report：{:?}\n{}\n{}",
         kairos.reports(),
         p.dump(),
         k.dump()
@@ -112,6 +112,18 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
         let seq = r["seq"].as_u64().unwrap();
         assert!(seq > last_seq, "seq 應遞增：{reports:?}");
         last_seq = seq;
+    }
+    // JSONL 鏡像（storage.jsonl_mirror）：寫入 SQLite 的 report 也出現在 JSONL，內容相同
+    assert!(
+        poll_until(WAIT, || kairos.jsonl_reports().len() >= 3),
+        "{:?}",
+        kairos.jsonl_reports()
+    );
+    let mirrored = kairos.jsonl_reports();
+    for (db, jsonl) in reports.iter().zip(&mirrored) {
+        assert_eq!(db["seq"], jsonl["seq"]);
+        assert_eq!(db["metrics"], jsonl["metrics"]);
+        assert_eq!(db["recv_at"], jsonl["recv_at"]);
     }
 
     // heartbeat：Pulse 送出的 heartbeat 收到 Kairos 的 ack（trace 日誌中的 seq 相同）
@@ -158,6 +170,19 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
         let fp = agent["host_fingerprint"].as_str().unwrap_or_default();
         assert!(fp.starts_with("sha256:") && fp.len() == 7 + 64, "{agents}");
     }
+    // 主機清冊（SQLite，A6）：關機時寫入最後的狀態（離線），以 kairos hosts list 查詢
+    let hosts = kairos.hosts();
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let host = &hosts[0];
+    assert_eq!(host["agent_id"], test_pki::GOOD_ID, "{host}");
+    assert_eq!(host["status"], "offline", "{host}");
+    assert_eq!(host["proto"], 2, "{host}");
+    assert_eq!(host["identity_verified"], true, "{host}");
+    assert_eq!(host["ip"], "127.0.0.1", "{host}");
+    assert_eq!(
+        host["host_fingerprint"], agent["host_fingerprint"],
+        "{host}"
+    );
     // display_name、tags 預設不送
     assert!(agent.get("display_name").is_none(), "{agents}");
     assert!(agent.get("tags").is_none(), "{agents}");
@@ -283,8 +308,9 @@ fn pulse_reconnects_after_kairos_restart() {
     std::thread::sleep(Duration::from_millis(1500));
     assert!(p.is_running(), "{}", p.dump());
 
-    // 同一個連接埠重新啟動 Kairos：Pulse 自動重新註冊並繼續送 report
+    // 同一個連接埠重新啟動 Kairos：主機清冊中的主機載回狀態表（A6），Pulse 自動重新註冊並繼續送 report
     let mut k = kairos.start();
+    assert_eq!(k.count("已從主機清冊載回 1 台"), 1, "{}", k.dump());
     p.wait_for_count(PULSE_REGISTERED, 2, WAIT);
     k.wait_for(&format!("agent {}", test_pki::GOOD_ID), WAIT);
     assert!(
