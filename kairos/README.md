@@ -6,7 +6,8 @@
 
 ## 功能
 
-- 長連線 + NDJSON 協定（v1），單行上限 65536 bytes，詳見 [PROTOCOL.md](PROTOCOL.md)
+- 長連線 + NDJSON 協定（v1、v2），單行上限 65536 bytes，詳見 [PROTOCOL.md](PROTOCOL.md)；hello 以 `proto_min`／`proto_max`／`features` 協商版本，與舊版 Pulse 自動以 v1 通訊（見「升級注意事項（與 Pulse 混用版本）」）
+- 協定 v2：保存 Pulse 宣告的主機資訊（主機指紋、顯示名稱、標籤、report 間隔、作業系統）到 `agents.json`，同一個 `agent_id` 的主機指紋改變時記 `WARN`；report 為通用指標 `metrics`（CPU、記憶體、磁碟、網路、溫度等），原樣保存到 JSONL；`hello_ack` 帶 `server_time`
 - 以 `agent_id` 識別 agent（不分大小寫，一律以小寫識別、記錄與寫檔）；同一 agent 重新連線時自動踢掉舊連線（`superseded`）
 - 依 agent 宣告的心跳間隔計算離線門檻：`max(5 × clamp(heartbeat_interval_ms, 1000, 60000), 5000)` ms（5～300 秒），只有合法訊息才算存活
 - 每秒檢查存活狀態，上線／離線／恢復都會記錄日誌（「標記為離線」與「從狀態表移除」每 10 秒最多各逐一記錄 20／5 個，其餘在時間窗結束後合併成一行摘要）；離線超過 24 小時的 agent 自動從狀態表移除（狀態表只在記憶體中，重新啟動後離線的 agent 會立即從 `agents.json` 消失）；每 60 秒輸出一行摘要
@@ -44,7 +45,17 @@
 
 ## 升級注意事項（與 Pulse 混用版本）
 
-Kairos 與 Pulse 必須搭配升級。新舊版本混用時可能出現下列問題：
+**協定 v2 起不必同時升級**：新版 Kairos 支援協定 1～2，依 Pulse 的 hello 自動協商（PROTOCOL.md「版本協商」）：
+
+| 組合 | 協商結果 |
+|---|---|
+| 舊版 Pulse（只送 `proto: 1`）連新版 Kairos | v1：`hello_ack` 與舊版相同，report 為三個欄位，JSONL 為 `schema` 1、`agents.json` 的 `proto` 為 1 |
+| 新版 Pulse 連舊版 Kairos | v1：舊版 Kairos 只檢查 `proto == 1` 並忽略 v2 欄位，Pulse 依 `hello_ack` 改送三個欄位 |
+| 新版 Pulse 連新版 Kairos | v2：report 為通用指標，JSONL 為 `schema` 2 |
+
+讀取 JSONL 的工具請依每行的 `schema` 判斷格式（見「資料輸出」）；同一個檔案中可能同時有兩種格式的行。
+
+更早的版本之間混用時可能出現下列問題：
 
 | 組合 | 風險 |
 |---|---|
@@ -425,23 +436,23 @@ sequenceDiagram
 
 | 方向 | `type` | 說明 |
 |---|---|---|
-| Pulse → Kairos | `hello` | 連線後第一則訊息，帶 `proto`、`agent_id`、`hostname`、`agent_version`、`heartbeat_interval_ms` |
+| Pulse → Kairos | `hello` | 連線後第一則訊息，帶 `proto`、`agent_id`、`hostname`、`agent_version`、`heartbeat_interval_ms`；v2 另帶 `proto_min`、`proto_max`、`features` 與主機資訊（`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`） |
 | Pulse → Kairos | `heartbeat` | 存活訊號 |
-| Pulse → Kairos | `report` | `cpu_usage`（%）、`total_memory`、`used_memory`（MB） |
-| Kairos → Pulse | `hello_ack` | 回應 hello，帶 `offline_after_ms` |
+| Pulse → Kairos | `report` | v1：`cpu_usage`（%）、`total_memory`、`used_memory`（MB）；v2 且雙方都宣告 `metrics`：`metrics`（`[{name, value, unit, labels}]`） |
+| Kairos → Pulse | `hello_ack` | 回應 hello，帶協商出的 `proto` 與 `offline_after_ms`；v2 另帶 `features`（`["metrics"]`）與 `server_time`（RFC 3339 UTC 毫秒） |
 | Kairos → Pulse | `ack` | 回應 heartbeat / report（report 的 ack 代表該筆已寫入資料檔並 flush，交給作業系統，但不保證已同步到磁碟） |
 | Kairos → Pulse | `error` | 帶 `code`、`message`、`fatal`；`fatal: true` 時伺服器隨即關閉連線 |
 
 | 錯誤碼 | 情境 | fatal |
 |---|---|---|
-| `unsupported_version` | hello 的 `proto` 不是 1（含不是合法 u32 的值，例如字串、負數、小數） | 是 |
+| `unsupported_version` | hello 宣告的版本範圍與本伺服器（1～2）沒有交集，或 `proto` 不是合法 u32（例如字串、負數、小數）；`message` 為 `supported proto: 1-2`，另帶 `proto_min`、`proto_max` | 是 |
 | `hello_required` | 第一則訊息不是 hello | 是 |
 | `too_long` | 單行超過 65536 bytes | 是 |
 | `superseded` | 同 `agent_id` 有新連線，舊連線被踢 | 是 |
-| `bad_request` | 非 UTF-8、JSON 錯誤（含超出 f64 範圍的數字，例如 `1e400`）、欄位缺漏或型別錯誤、hello 欄位不符限制、`ts` 超過 64 bytes 或含禁止的字元；狀態表已滿時拒絕新 agent（`server agent registry is full`） | 否（`bad_request` 與 `unknown_type` 合計連續 5 次時第 5 次改為 fatal；狀態表已滿時是） |
+| `bad_request` | 非 UTF-8、JSON 錯誤（含超出 f64 範圍的數字，例如 `1e400`）、欄位缺漏或型別錯誤（含 report 的格式與協商結果不符，例如 v1 連線送 `metrics`）、hello 欄位不符限制（含 v2 的版本範圍、features 與主機資訊）、`ts` 超過 64 bytes 或含禁止的字元；狀態表已滿時拒絕新 agent（`server agent registry is full`） | 否（`bad_request` 與 `unknown_type` 合計連續 5 次時第 5 次改為 fatal；狀態表已滿時是） |
 | `unknown_type` | 不認得的 `type` | 否（連續達上限時是，計數同上） |
 | `already_registered` | 同一連線第二次 hello | 否 |
-| `invalid_report` | `cpu_usage` 不在 0..=100 或 `used_memory > total_memory`（不寫檔，但仍視為存活） | 否 |
+| `invalid_report` | v1：`cpu_usage` 不在 0..=100 或 `used_memory > total_memory`；v2：`metrics` 不符名稱、單位、label、數量（1～256）、重複或標準指標範圍的限制（見 PROTOCOL.md「report（通用指標）」）。不寫檔，但仍視為存活 | 否 |
 | `auth_failed` | 啟用 mTLS 時，hello 的 `agent_id` 與客戶端憑證的 SAN 不符（`agent_id does not match client certificate`），或憑證含多個 DNS SAN（`client certificate must contain exactly one DNS SAN`，`auth.allow_multiple_dns_sans = false` 時） | 是 |
 | `certificate_rejected` | 啟用 mTLS 時，收到 hello 時重新驗證、或連線期間重新驗證時，客戶端憑證已被撤銷、過期或不再受信任（`client certificate has been revoked or is no longer trusted`）；無法判定撤銷狀態（CRL 已過期或缺少某一層 CA 的 CRL）時 message 為 `revocation status unavailable`，屬伺服器端問題 | 是 |
 | `storage_unavailable` | 伺服器確定沒有寫入這筆 report，這筆資料未保存：寫入失敗（磁碟已滿、資料目錄無法寫入、等待寫入逾時且已取消、當天的檔案已達 `storage.max_daily_bytes`）時 message 為 `report could not be stored`；report 送得太快、需延後超過 0.5 秒時為 `report rate limit exceeded` | 否 |
@@ -454,6 +465,8 @@ sequenceDiagram
 | `hostname` | 1～255 bytes，不得含控制字元（換行、ESC 等）、格式字元（Cf，例如 U+200B 零寬空格、U+202E 由右至左覆寫、U+FEFF）、行分隔 U+2028、段落分隔 U+2029，以及顯示為空白或不可見的碼位：U+034F、Hangul filler（U+115F、U+1160、U+3164、U+FFA0）、變體選擇字元（U+FE00–U+FE0F、U+E0100–U+E01EF）、私用區（U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD） |
 | `agent_version` | 1～64 bytes，字元限制同 `hostname` |
 | `heartbeat_interval_ms` | 不視為錯誤：任何 JSON 數字都接受（負數視為 0、小數捨去），伺服器先夾在 1000～60000 之間再計算離線門檻，被夾值時記錄 `WARN`；不是數字或缺漏時才回 `bad_request`。例外：超出 f64 範圍的數字（例如 `1e400`）無法解析，整行視為不合法 JSON，回 `bad_request` |
+| `proto_min`、`proto_max`、`features`（v2） | 版本範圍須同時出現且 `proto_min ≤ proto ≤ proto_max`；`features` 最多 32 項 |
+| `host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`（v2） | 只在協商結果為 v2 時檢查（v1 時與舊版 Kairos 一樣忽略）：指紋為 `<演算法>:<小寫十六進位>`；`display_name` 1～255 bytes、`tags` 最多 32 個各 1～64 bytes 且不重複、`os` 各欄位 1～128 bytes，字元限制同 `hostname`；`report_interval_ms` 為 1000～86400000 |
 
 另外，所有訊息的 `ts` 最長 64 bytes，且字元限制同 `hostname`（`ts` 會原樣寫入 JSONL 與 `agents.json`），違反時回 `bad_request`；伺服器不檢查 `ts` 是否為 RFC 3339。對方提供的字串（`hostname`、`agent_version`）寫入日誌時會再做一次跳脫，作為防止日誌注入的第二道防線。
 
@@ -476,18 +489,23 @@ sequenceDiagram
 
 每筆合法 report 一行（JSON Lines），只會附加寫入。檔名的日期是該筆 `recv_at` 的 **UTC** 日期（台灣時間早上 8 點前收到的資料會在前一天的檔案裡）；writer 遇到日期變化時切換檔案，同一批跨過午夜的資料也會正確拆到兩個檔案。
 
+每一行的第一個欄位 `schema` 標示格式（審計 O6）：`1` 為三個欄位的 report（協定 v1，或 v2 但未協商 `metrics`），`2` 為協定 v2 的通用指標。同一個檔案中可能同時有兩種格式（例如部分 Pulse 尚未升級），讀取端請依 `schema` 判斷，遇到不認得的 `schema` 應略過該行。加入 `schema` 之前的版本寫出的行沒有這個欄位，視同 `schema` 1。
+
 ```json
-{"recv_at":"2026-10-08T03:15:45.300Z","peer":"127.0.0.1:50123","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","seq":6,"ts":"2026-10-08T03:15:45.210Z","cpu_usage":17.84,"total_memory":49152,"used_memory":37034}
+{"schema":1,"recv_at":"2026-10-08T03:15:45.300Z","peer":"127.0.0.1:50123","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","seq":6,"ts":"2026-10-08T03:15:45.210Z","cpu_usage":17.84,"total_memory":49152,"used_memory":37034}
+{"schema":2,"recv_at":"2026-10-08T03:15:45.300Z","peer":"127.0.0.1:50124","agent_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","hostname":"web-02","seq":3,"ts":"2026-10-08T03:15:45.210Z","metrics":[{"name":"system.cpu.usage","value":17.84,"unit":"%"},{"name":"system.memory.total","value":51539607552,"unit":"By"},{"name":"system.filesystem.available","value":211312345088,"unit":"By","labels":{"fstype":"ext4","mountpoint":"/"}}]}
 ```
 
 | 欄位 | 說明 |
 |---|---|
+| `schema` | 這一行的格式：`1` 或 `2` |
 | `recv_at` | 伺服器收到的時間（RFC 3339 UTC，毫秒） |
 | `peer` | agent 的來源 `ip:port` |
 | `agent_id`、`hostname` | 來自該連線的 hello（`agent_id` 一律為小寫） |
 | `seq`、`ts` | agent 端的序號與時間（`ts` 只記錄，不用於存活判定） |
-| `cpu_usage` | CPU 使用率（%） |
-| `total_memory`、`used_memory` | 記憶體總量與使用量（MB） |
+| `cpu_usage` | （`schema` 1）CPU 使用率（%） |
+| `total_memory`、`used_memory` | （`schema` 1）記憶體總量與使用量（MB） |
+| `metrics` | （`schema` 2）Pulse 送來的指標，依原順序保存：`name`、`value`（保留原本的數字表示，bytes 等整數不會變成小數）、`unit`，有 label 時另有 `labels`（依名稱排序）；指標物件中規格未定義的欄位不保存。標準指標的名稱與單位見 PROTOCOL.md「report（通用指標）」 |
 
 寫入由單一背景工作負責：連線讀到該行時就記錄 `recv_at`（之後的限速等待不影響），把紀錄放入容量 1024 的佇列，背景工作取出一批、依日期分段，每段一次寫入並 flush 後，才逐筆回覆給各連線；連線收到成功才回 `ack`。寫檔失敗時（非 fatal，連線繼續），背景工作記錄 `ERROR`、下一批重新開檔：開檔失敗等一個 byte 都還沒寫入的情況，這一段的每一筆都回 `storage_unavailable`；寫出中途失敗時，依檔案長度的變化判斷，確定沒寫入的紀錄回 `storage_unavailable`，可能已完整或部分寫入的紀錄（無法得知寫入多少時則是整段）視為結果未知，處理方式同下述「不回應、直接關閉連線」。多條連線同時送 report 時仍是一批一次寫入；單一連線的 report 則是一筆寫完才處理下一筆。當天的檔案達到 `storage.max_daily_bytes` 時，只寫入放得下的完整紀錄，其餘回 `storage_unavailable`（確定未寫入）。開檔失敗、寫入失敗與達到大小上限的 `ERROR` 依類別節流（磁碟已滿時不會每批都記一行）。
 
@@ -529,6 +547,7 @@ sequenceDiagram
       "agent_id": "6f1c0e4a-1b2c-4d3e-9f00-112233445566",
       "hostname": "web-01",
       "agent_version": "0.1.0",
+      "proto": 1,
       "peer": "127.0.0.1:50123",
       "online": true,
       "conn_id": 12,
@@ -549,6 +568,21 @@ sequenceDiagram
 ```
 
 `agents` 依 `agent_id`（小寫）排序；離線的 agent 會保留 24 小時（`online: false`）後移除（狀態表達到 `limits.max_agents` 時可能提早移除），`last_report` 尚未收到時為 `null`。
+
+`proto` 是該連線協商出的協定版本。協商為 v2 的 agent 另有它在 hello 中宣告的主機資訊（只輸出有值的欄位）：`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`（`name`、`version`、`kernel`、`arch`）。v2 指標 report 的 `last_report` 取自沒有 label 的 `system.cpu.usage`、`system.memory.total`／`used`（bytes 換算成 MB，與 v1 相同單位；沒有時省略該欄位），並另有 `metrics`（該筆的指標數），例如：
+
+```json
+      "proto": 2,
+      "host_fingerprint": "sha256:355cf5ed40956a057645145cccf74f594102726167e94e3511aae182acc4ec43",
+      "display_name": "Web 01（正式環境）",
+      "tags": ["env:prod"],
+      "report_interval_ms": 5000,
+      "os": {"name": "Ubuntu", "version": "24.04", "kernel": "6.8.0-45-generic", "arch": "x86_64"},
+      ...
+      "last_report": {"recv_at": "…", "seq": 3, "ts": "…", "cpu_usage": 17.84, "total_memory": 49152, "used_memory": 37034, "metrics": 8}
+```
+
+同一個 `agent_id` 這次 hello 的 `host_fingerprint` 與狀態表中記錄的不同時（例如由映像檔複製的 VM 沿用了 `agent.id`，或主機已重灌），記 `WARN`「主機指紋與上次不同」（每個 agent 節流）。狀態表在重新啟動後從空開始，因此只能偵測同一次執行期間的改變。
 
 `agents.json` 只寫不讀：Kairos 重新啟動時不會讀回，狀態表從空開始，因此離線中的 agent 在重新啟動後就從 `agents.json` 消失（「離線 24 小時才移除」只適用於同一次執行期間），線上的 agent 重新連線後才會再出現。關機時最後的 `agents.json` 由主流程寫出，監控工作異常結束時也會寫出。
 
@@ -636,8 +670,9 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 | `載入設定失敗（kairos.toml / KAIROS__ 環境變數）: ...` | 設定檔 TOML 語法錯誤或欄位型別不符（例如數字欄位填了文字）。 |
 | `log.level 的值 "..." 無效` | 只接受 `off`、`error`、`warn`、`info`、`debug`、`trace`。 |
 | Pulse 端出現憑證驗證失敗（例如 hostname mismatch） | 憑證缺少 SAN 或 SAN 與 Pulse 的 `server.domain` 不符；依「快速開始」或「私有 CA」重新產生含正確 SAN 的憑證。 |
-| `[WARN] ... 未先送出 hello，關閉連線` | 客戶端在 hello 之前送了其他訊息；確認客戶端實作了協定 v1。 |
-| `[WARN] ... 的協定版本 N 不受支援` | Pulse 與 Kairos 版本不相容，請更新其中一方。 |
+| `[WARN] ... 未先送出 hello，關閉連線` | 客戶端在 hello 之前送了其他訊息；確認客戶端實作了本協定。 |
+| `[WARN] ... 的協定版本 N 不受支援（…，本伺服器支援 1～2）` | 客戶端宣告的版本範圍與本伺服器沒有交集（例如只支援更新版本的 Pulse），請更新 Kairos。 |
+| `[WARN] ... 的主機指紋與上次不同（… → …）` | 同一個 `agent_id` 從不同的主機連入：多半是由映像檔複製的 VM 沿用了 `agent.id`（會與「取代舊連線」交替出現），在多出來的主機上刪除 `agent.id` 後重新啟動；主機重灌後的第一次連線也會出現，可忽略。 |
 | `[INFO] ... 在 5 秒內未送出 hello，關閉連線` | 客戶端完成 TLS 握手後沒有送 hello，常見於用瀏覽器或 port 掃描連入。 |
 | agent 反覆出現「取代舊連線」 | 兩台機器使用了相同的 `agent_id`（例如複製了 Pulse 的 `agent.id` 檔案）；刪除其中一台的 `agent.id` 讓它重新產生。 |
 | `[WARN] 已達連線上限 N，暫停接受新連線` | 同時連線數達到 `server.max_connections`；調高上限或檢查是否有異常連線。只在進入飽和時記錄一次；等待新連線期間每秒檢查一次，可用名額回到上限的 10%（至少 1）時記錄「恢復接受新連線」，不必等到下一條連線。 |
@@ -747,7 +782,7 @@ cargo fmt --check
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.99 cargo test -p kairos --locked
 ```
 
-協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析）、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`。測試數量以 `cargo test` 的輸出為準。
+協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`。測試數量以 `cargo test` 的輸出為準。
 
 > [!WARNING]
 > `src/test_pki.rs` 與 `testdata/`（例如 `testdata/pki/server.key`）中的私鑰**只供測試使用**，已公開在 repo 中，絕對不可用於任何部署環境。正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
