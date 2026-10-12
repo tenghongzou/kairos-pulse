@@ -53,13 +53,13 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 
 | 測試檔 | 情境 |
 |---|---|
-| `tests/session.rs` | mTLS 註冊（兩端日誌都寫出協商為協定 v2）→ heartbeat 收到 ack → report 寫入 `reports-*.jsonl`（`schema` 2 的通用指標，逐項檢查標準指標的名稱、單位與值）→ 兩端優雅關機（結束代碼 0、`close_notify`、最後的 `agents.json` 標記離線，並有 `proto` 2 與 hello 的主機資訊）；CRL 熱重載撤銷現役連線（Kairos 踢線、之後的握手被拒；Pulse 的日誌、stderr 與 Linux 上 sd_notify 的 `Status:`）；Kairos 停止後在同一連接埠重新啟動，Pulse 自動重新註冊並繼續送 report |
-| `tests/compat.rs` | 協定 v1 相容：以假 client（`RawClient`，送出與舊版 0.1.0 Pulse 相同的 hello、heartbeat、report）與新版 Pulse 同時連同一個新版 Kairos。舊版得到與 v1 Kairos 相同的 `hello_ack`（`proto` 1，沒有 v2 欄位）與錯誤處理，JSONL 為 `schema` 1 且欄位與舊版相同，新版為 `schema` 2，兩種格式寫在同一個檔案；`agents.json` 中 v1 的 agent 沒有主機資訊。新版 Pulse 沒有只用 v1 的設定，新版 Pulse 連舊版 Kairos 的方向由 Pulse 的單元測試涵蓋 |
+| `tests/session.rs` | mTLS 註冊（兩端日誌都寫出協商為協定 v2）→ heartbeat 收到 ack → report 寫入 SQLite（以實際的 `kairos reports export` 取出；`schema` 2 的通用指標，逐項檢查標準指標的名稱、單位與值），JSONL 鏡像與資料庫一致 → 兩端優雅關機（結束代碼 0、`close_notify`、最後的 `agents.json` 標記離線，並有 `proto` 2 與 hello 的主機資訊；`kairos hosts list --json` 的主機清冊中為離線、帶相同的主機資訊）；CRL 熱重載撤銷現役連線（Kairos 踢線、之後的握手被拒；Pulse 的日誌、stderr 與 Linux 上 sd_notify 的 `Status:`）；Kairos 停止後在同一連接埠重新啟動，從主機清冊載回主機，Pulse 自動重新註冊並繼續送 report |
+| `tests/compat.rs` | 協定 v1 相容：以假 client（`RawClient`，送出與舊版 0.1.0 Pulse 相同的 hello、heartbeat、report）與新版 Pulse 同時連同一個新版 Kairos。舊版得到與 v1 Kairos 相同的 `hello_ack`（`proto` 1，沒有 v2 欄位）與錯誤處理，匯出的 report 為 `schema` 1 且欄位與舊版的 JSONL 相同，新版為 `schema` 2，兩種格式也寫在同一個 JSONL 鏡像檔；`agents.json` 中 v1 的 agent 沒有主機資訊。新版 Pulse 沒有只用 v1 的設定，新版 Pulse 連舊版 Kairos 的方向由 Pulse 的單元測試涵蓋 |
 | `tests/exit_codes.rs` | 兩端常駐模式啟動時的結束代碼（0、1、2、3、4、11，見下方「結束代碼」） |
 
 - 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。
 - 每個測試使用自己的暫存目錄（`<系統暫存目錄>/kp-e2e-*`）與隨機埠，可平行執行；每個等待都有逾時（30 秒）。測試失敗時保留暫存目錄（路徑印在輸出中）並附上兩端的 stdout／stderr。
-- 測試用的設定縮短了時間：心跳與 report 每 1 秒、重連延遲 1～2 秒（A11 的啟動隨機延遲因此最多 1 秒）、Kairos 熱重載每 1 秒。
+- 測試用的設定縮短了時間：心跳與 report 每 1 秒、重連延遲 1～2 秒（A11 的啟動隨機延遲因此最多 1 秒）、Kairos 熱重載每 1 秒。Kairos 使用預設的 SQLite 並開啟 JSONL 鏡像（`storage.jsonl_mirror = true`）。
 - 憑證：Kairos 的伺服器憑證用 `pulse/testdata/server.pem`（Pulse 以 `server-ca.pem` 驗證）；客戶端憑證、私鑰、client CA 與 CRL 沿用 Kairos 整合測試的 `kairos/src/test_pki.rs`（以 `#[path]` 引用同一個檔案，`kairos/testdata/pki` 沒有客戶端私鑰）。`RawClient` 以 workspace 已使用的 `rustls`（ring）建立與 Pulse 相同的 mTLS 連線，不新增外部套件。
 - 結束訊號：Unix 送 SIGTERM；Windows 以 `CREATE_NEW_PROCESS_GROUP` 啟動子行程後送 Ctrl+Break（兩個程式都會攔截並正常關機）。
 - 整套約 10 秒以內（不含第一次建置）；沒有標記 `#[ignore]` 的慢速測試。
