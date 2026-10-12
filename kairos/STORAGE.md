@@ -1,6 +1,6 @@
 # Kairos 資料儲存（SQLite）
 
-本文件說明 Kairos 0.3 起的 report 儲存、主機清冊、彙總、保留期限與容量上限（商業審計 A1、A6、A9），以及與 at-least-once（A5，`sprint2/durable`）的去重契約。設定的完整清單見 [README.md](README.md)「設定」。
+本文件說明 Kairos 0.3 起的 report 儲存、主機清冊、彙總、保留期限與容量上限（商業審計 A1、A6、A9），以及 at-least-once（A5，協定 feature `durable`）的去重與補送資料的處理。設定的完整清單見 [README.md](README.md)「設定」。
 
 ## 1. 架構
 
@@ -21,7 +21,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 ```
 
 - **抽象介面**：連線只認得 `ReportSink`（送出、等待結果、逾時取消），不知道後端。後端實作 `trait ReportStore`（`write_batch`、`sync_inventory`、`maintain`、`close`，同步 API、一批一個交易）。日後換成時序資料庫時實作這個 trait 即可，連線與協定不需修改。
-- **後端選擇**（`storage.backend`）：`sqlite`（預設）或 `jsonl`。`jsonl` 是舊版的按日 JSONL writer（`storage.rs`），保留給相容與回復使用，沒有主機清冊、彙總與去重。
+- **後端選擇**（`storage.backend`）：`sqlite`（預設）或 `jsonl`。`jsonl` 是舊版的按日 JSONL writer（`storage.rs`），保留給相容與回復使用，沒有主機清冊與彙總；durable 的去重只在記憶體中、範圍有限（第 5.1 節）。
 - **JSONL 鏡像**（`storage.jsonl_mirror = true`，只在 `sqlite` 時有效）：寫入 SQLite 成功（`Written`）的 report 另外交給 JSONL writer，格式、檔名、`storage.retention_days` 與 `storage.max_daily_bytes` 的規則與 `backend = "jsonl"` 完全相同（`retention.rs` 的保留清除與時鐘跳躍保護照常運作）。鏡像是盡力而為：鏡像的佇列已滿或寫入失敗時只記 `WARN`／`ERROR`，**不影響 `ack`**；重複的 report（`Duplicate`）不寫入鏡像。
 
 ### 1.1 `ack` 的語意（PROTOCOL.md「流程」第 2 點）
@@ -97,13 +97,14 @@ CREATE TABLE boots (                       -- 去重鍵的 boot_id（每台主�
 CREATE TABLE reports (                     -- 原始 report，每筆一列（A1）
     id         INTEGER PRIMARY KEY,
     host_id    INTEGER NOT NULL,
-    ts         INTEGER NOT NULL,           -- 伺服器收到的時間（JSONL 的 recv_at）
+    ts         INTEGER NOT NULL,           -- 取樣時間（第 5.2 節）：durable report 為 client 的 ts，其他為伺服器收到的時間
     seq        INTEGER NOT NULL,           -- 協定的 seq（每條連線從 1 起）
     agent_ts,                              -- client 的 ts：RFC 3339 毫秒 UTC 時存成 INTEGER，否則原樣存 TEXT
     format     INTEGER NOT NULL,           -- 1：協定 v1 的三欄位；2：通用指標
     body       BLOB NOT NULL,              -- 緊湊編碼，見 3.1
     boot_ref   INTEGER,                    -- 去重鍵（durable），沒有時為 NULL
-    report_seq INTEGER
+    report_seq INTEGER,
+    recv_lag   INTEGER                     -- 收到的時間 − ts（毫秒）；相同時（即時資料）為 NULL。JSONL 的 recv_at = ts + recv_lag
 );
 CREATE INDEX reports_host_ts ON reports (host_id, ts);
 CREATE UNIQUE INDEX reports_dedup ON reports (boot_ref, report_seq) WHERE boot_ref IS NOT NULL;
@@ -145,28 +146,84 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - **checkpoint**：寫入的連線關閉自動 checkpoint（`wal_autocheckpoint = 0`），改由背景執行緒以另一條連線每 0.5 秒執行 `wal_checkpoint(PASSIVE)`（把 WAL 寫回資料庫並 fsync，不擋住寫入）。持續寫入時背景 checkpoint 追不上最新的頁，WAL 不會從頭重寫，因此 WAL 超過約 4096 頁（16 MiB）時，由寫入的連線在兩批之間補做一次 PASSIVE checkpoint（大部分的頁已寫回並同步，停頓很短），之後的交易從 WAL 開頭重寫；WAL 檔由 `journal_size_limit` 截到 64 MiB 以內。量測：改用背景 checkpoint 前 p99 約 334 ms，之後約 1.5 ms（第 11 節）。
 - **快取**：主機（`agent_id` → `host_id`）、序列與每台主機最近的 boot 存在記憶體；交易失敗時整個清空、下一批前重新載入（失敗交易中建立的編號已不存在）。
 
-## 5. 去重（與 `sprint2/durable` 的契約）
+## 5. 去重與補送的歷史資料（A5）
 
-at-least-once（A5）時 Pulse 會重送 report。Pulse 與 Kairos 協商到 feature `durable` 時，report 另帶 `boot_id`（字串，UUID，Pulse 每次啟動產生）與 `report_seq`（u64，同一個 `boot_id` 內單調遞增），重送時兩者不變。
+at-least-once（A5）時 Pulse 會重送 report。Pulse 與 Kairos 協商到 feature `durable` 時，report 另帶 `boot_id`（字串，UUID，Pulse 每次啟動產生）與 `report_seq`（u64，同一個 `boot_id` 內單調遞增），重送時兩者與 `ts`、內容都不變（PROTOCOL.md「durable：at-least-once 投遞」）。Pulse 斷線期間的取樣存在本機緩衝，重新連上後依序補送，因此 `ts` 可能比收到的時間早數小時到數天（Pulse 的 `buffer.max_age_hours`，預設 168 小時）。
 
-**本分支提供的 API**（`kairos/src/storage.rs`）：
+### 5.1 去重
+
+連線端與後端之間只有一套介面（`kairos/src/storage.rs`）：
 
 ```rust
 pub struct DedupKey { pub boot_id: String, pub report_seq: u64 }
 impl ReportRecord { pub fn with_dedup(self, dedup: Option<DedupKey>) -> Self }
+impl ReportSink { pub async fn submit(&self, record: ReportRecord) -> Result<PendingWrite, String> }
 pub enum WriteStatus { Written, Duplicate, Failed(String), Unknown(String) }
 ```
 
-- 連線端（`connection.rs` 的 `handle_registered`）在建立 `ReportRecord` 後，若連線協商到 `durable` 且 report 帶有兩個欄位，以 `.with_dedup(Some(DedupKey { boot_id, report_seq }))` 附上；沒有時維持 `None`（行為與目前相同）。這段接線由 durable 分支處理，本分支沒有修改協定解析。`store_report` 與 writer 不需再改。
-- SQLite 以唯一索引保證同一主機、同一個 `(boot_id, report_seq)` 只保存一次（`boots` 把 `(host_id, boot_id)` 對應到 `boot_ref`，`reports_dedup` 為 `(boot_ref, report_seq)` 的部分唯一索引）。重複的那筆（含同一批中重複）回 `WriteStatus::Duplicate`：連線照常回 `ack`，**不重寫**、不更新 `agents.json` 的 `last_report`（那是較舊的資料）、不加入彙總、不寫入 JSONL 鏡像。
+- 連線（`connection.rs`）協商到 `durable` 時，以 `.with_dedup(Some(DedupKey { boot_id, report_seq }))` 附上（`boot_id` 已轉小寫；欄位缺漏或不合法時回 `bad_request`，不會走到 writer）；沒有協商時為 `None`，行為與 0.2 相同。
+- 後端回 `Duplicate` 時連線照常回 `ack`，**不重寫**、不更新 `agents.json` 的 `last_report`（那是較舊的資料）；`Written` 的 durable report 也只在 `ts` 不早於目前的 `last_report` 時更新它（補送的舊資料不蓋過較新的狀態）。
+
+**SQLite（預設）**：唯一索引保證同一主機、同一個 `(boot_id, report_seq)` 只保存一次（`boots` 把 `(host_id, boot_id)` 對應到 `boot_ref`，`reports_dedup` 為 `(boot_ref, report_seq)` 的部分唯一索引）。
+
+- 重複的那筆（含同一批中重複）回 `Duplicate`：不寫入、**不加入彙總**、不寫入 JSONL 鏡像。
 - 不同主機使用相同的 `boot_id` 與 `report_seq` 不衝突；同一主機換了 `boot_id` 後從頭編號也不衝突；舊 boot 的重送在換 boot 後仍能辨識。
-- 去重的範圍是**原始資料仍保存的期間**（`storage.raw_retention_days`、容量上限）：原始 report 被刪除後，同一個去重鍵再送來會被當成新的一筆。保留清除會順便刪除已沒有任何 report 引用的 `boots` 列。
-- `backend = "jsonl"` 不去重（JSONL 只把 `boot_id`、`report_seq` 寫在 `ts` 之後，讀取端可自行去重）。
-- 測試：`store::sqlite::tests::duplicate_dedup_keys_are_acknowledged_but_not_stored_twice`、`store::tests::sqlite_storage_acks_after_commit_mirrors_to_jsonl_and_persists_the_inventory`、`connection::tests::duplicate_report_is_acked_without_updating_last_report`。
+- **commit 結果不明 → 斷線 → Pulse 重送**：連線不回應並關閉（`Unknown`），Pulse 重連後重送。若那個交易其實已生效，重送的那筆被唯一索引判定為 `Duplicate`，不會重複；若沒有生效，重送時正常寫入。結果不明時記憶體中的彙總沒有加入那一批的值（不知道是否已寫入），writer 在下一次寫入前從原始資料重建記憶體中的彙總（與啟動時相同，第 7 節），因此那一筆的值不論哪種情況都只算一次。「寫入逾時、但 writer 其實已寫完」的情況相同。
+- 去重的範圍是**原始資料仍保存的期間**：原始 report 被保留期限或容量上限刪除後，同一個去重鍵再送來會被當成新的一筆（與 Pulse 設定的關係見第 5.4 節）。保留清除會順便刪除已沒有任何 report 引用的 `boots` 列。
+- 測試：`store::sqlite::tests::duplicate_dedup_keys_are_acknowledged_but_not_stored_twice`、`after_an_unknown_commit_the_resent_report_is_rolled_up_exactly_once`、`store::tests::sqlite_storage_acks_after_commit_mirrors_to_jsonl_and_persists_the_inventory`、`connection::tests::duplicate_report_is_acked_without_updating_last_report`、端對端 `tests/e2e/tests/durable.rs`（Kairos 停機補送不缺號不重複、結果不明的重送與重新啟動後的重送都不重複）。
+
+**`backend = "jsonl"`**：JSONL writer 以記憶體中的 `DedupIndex`（`kairos/src/dedup.rs`）去重，範圍有限：
+
+- 每個 (agent_id, `boot_id`) 一個 256 筆的滑動視窗；比「已寫入的最大 `report_seq` − 255」更舊的重送視為已寫入（協定的明文規則；Pulse 依序送出、在途不超過 4 筆，需要重送的一定在視窗內）。
+- 只在記憶體中：啟動時從最新兩個 `reports-*.jsonl` 的尾端（合計最多 64 MiB）重建；48 小時沒有新資料的 (agent_id, `boot_id`) 清除，總數超過 20 萬時清掉最久沒更新的八分之一。超出範圍的重送會重複寫入。
+- 寫出中途失敗、結果不明（`Unknown`）的那筆不列入，重送時再寫一次（可能多一行不完整或重複的紀錄）：寧可重複，不可遺失。
+- JSONL 鏡像（`backend = "sqlite"` 且 `jsonl_mirror = true`）不建立 `DedupIndex`：送進鏡像的都是 SQLite 已寫入（已去重）的 report。
+- 兩種後端都把 `boot_id`、`report_seq` 寫在 JSONL 該行的 `ts` 之後（`kairos reports export` 亦同）。
+
+### 5.2 時間：取樣時間與收到時間
+
+SQLite 的 `reports.ts` 是**取樣時間**，彙總的桶、依時間的保留期限與 `kairos reports export --since` 都以它為準：
+
+| report | `reports.ts` |
+|---|---|
+| 協商了 `durable`，`ts` 為 RFC 3339 且在收到時間的 −367 天～＋5 分鐘之內 | client 的 `ts`（Pulse 的取樣時間） |
+| 協商了 `durable`，但 `ts` 無法解析或超出範圍（client 時鐘錯誤） | 收到的時間 |
+| 沒有協商 `durable`（0.2 的 Pulse、協定 v1、停用緩衝） | 收到的時間（與 0.2 的 JSONL 相同，不受 client 時鐘影響） |
+
+- −367 天 = Pulse `buffer.max_age_hours` 的上限（1 年）加 2 天餘裕；＋5 分鐘容忍 client 時鐘稍快（Pulse 以 `hello_ack` 的 `server_time` 檢查偏差並記 `WARN`）。
+- client 原本的 `ts` 字串另外原樣保存在 `agent_ts`，收到的時間為 `ts + recv_lag`；`kairos reports export` 輸出的 `ts`、`recv_at` 與 JSONL 相同。
+- 協商了 `durable` 的連線上，即時的取樣也用 Pulse 的時間：Pulse 時鐘偏差 ±5 分鐘以內時，趨勢會跟著偏移同樣的量（與補送的資料一致，不會在補送與即時的交界處錯位）。
+- `hosts.last_seen`、`first_seen` 仍是伺服器的時間；JSONL（後端或鏡像）仍以 `recv_at` 的日期決定寫入哪個檔案與保留期限。
+
+### 5.3 遲到的資料與已寫出的彙總
+
+補送的資料、client 時鐘偏差、或結果不明後的重送，都可能讓一筆 report 的取樣時間落在**已經寫出的 5 分鐘／1 小時桶**中。處理方式（`store/rollup.rs`、`store/sqlite.rs`）：
+
+- 每台主機的 `hosts.rollup_until` 是「已寫出的桶」的結束時間；記憶體中尚未寫出的桶一定都在它之後（每台主機的桶依時間順序寫出）。
+- 取樣時間 **≥ `rollup_until`**：commit 後加進記憶體中的桶，照常寫出。
+- 取樣時間 **< `rollup_until`**（遲到）：在寫入原始資料的**同一個交易**中，依桶先合併，再以 `INSERT … ON CONFLICT DO UPDATE` 累加進 `rollup_5m` 與 `rollup_1h`（`vmin = min(…)`、`vmax = max(…)`、`vsum = vsum + …`、`cnt = cnt + …`），**不覆蓋、不遺漏**；桶不存在時新增。交易回復時這些合併一併回復；重複的那筆不合併。
+- 重新啟動時只從 `rollup_until` 起重新讀取原始資料補回記憶體中的桶，已直接合併的遲到資料不會再算一次。
+- **補送中的桶延後寫出**：記憶體中的桶要「已結束 15 秒」且「該主機在這個桶已 15 秒沒有新值」才寫出。補送 3 天前的資料時桶早已結束，但補送進行中一直有新值，等補到下一個桶後才一次寫出整個桶；某台主機有一個桶還不能寫出時，它之後的桶也先不寫（才能推進 `rollup_until`），其他主機不受影響。這避免同一個桶被拆成很多次寫出、之後每筆都變成遲到資料逐筆 upsert。
+- 測試：`late_samples_are_merged_into_flushed_rollups_by_sample_time`、`a_backfilled_bucket_is_flushed_once_after_it_is_complete`、`rollup::tests::a_bucket_being_backfilled_waits_and_blocks_only_its_own_host`。
+
+### 5.4 保留期限、Pulse 的 `buffer.max_age_hours` 與去重範圍
+
+三者都以取樣時間計算，關係如下（預設值：原始資料 `storage.raw_retention_days = 7`、Pulse `buffer.max_age_hours = 168`）：
+
+- **原始資料**保留「今天與前 N 天」（UTC，`N = raw_retention_days`）：一筆取樣在它的 UTC 日期早於「今天 − N」時才被刪除，此時它的年齡一定**超過 24 × N 小時**。
+- **Pulse** 在送出（含重送）前丟棄取樣時間超過 `buffer.max_age_hours` 的資料。
+- 因此只要 **`buffer.max_age_hours ≤ 24 × raw_retention_days`**（預設 168 ≤ 168），Pulse 還可能送出的資料在 Kairos 都還保存著，去重一定有效，補送與重送都不會重複。
+- 不滿足時（例如 1 萬台主機依第 10 節把原始資料縮短為 2 天，Pulse 仍保留 7 天）：比原始保留期限更舊的補送資料照常接受、寫入原始資料並併入彙總（5 分鐘／1 小時彙總依各自的保留期限保存，這些補送仍有價值），原始資料在下一輪保留清除（每小時）被刪除。唯一的影響是：若同一筆在原始資料被刪除**之後**又被重送（只會發生在它的 `ack` 遺失時；Pulse 收到 `ack` 就刪除），它會被當成新的一筆再寫入一次，彙總中多算一次。不會遺失資料，也沒有其他副作用。要完全避免，請把各台 Pulse 的 `buffer.max_age_hours` 設為 `24 × raw_retention_days` 以下。
+- `raw_retention_days = 0`（不依時間刪除）時沒有這個限制。
+- **總容量上限**（第 8.2 節）依寫入順序刪除最舊的原始 report，不看取樣時間；剛補送進來的舊資料會比較晚被刪。被容量上限刪除後的重送同上（當成新的一筆）。
+- 彙總的保留期限依桶的時間：比 `rollup_5m_retention_days` 更舊的補送資料會先合併進 5 分鐘桶，在下一輪保留清除時刪除（1 小時桶保留較久）。
+- 保留清除的「今天」是伺服器的時鐘（經 DateGuard 檢查），不受 client 的 `ts` 影響；client 時鐘錯誤的 `ts` 已在第 5.2 節改用收到的時間，不會讓資料一寫入就被刪除或永遠不刪。
+- `backend = "jsonl"`：檔案與保留期限依 `recv_at`（收到的日期）；去重範圍為記憶體中的視窗（第 5.1 節），與保留期限無關。
 
 ## 6. 主機清冊（A6）
 
-- 第一次收到某台主機的 report 時在 `hosts` 新增一列（`agent_id`、`hostname`、`peer`）。之後每 30 秒，writer 把 monitor 最新的狀態表快照（與 `agents.json` 同一份）同步到 `hosts`：上線、離線、hello 的資訊改變時立即寫入；`last_seen` 與 `last_report` 只在 `last_seen` 前進 60 秒以上時寫入（線上的主機每分鐘最多寫一次）。關機時最後一份快照（所有主機已離線）在 writer 結束前寫入。
+- 第一次收到某台主機的 report 時在 `hosts` 新增一列（`agent_id`、`hostname`、`peer`）。之後每 30 秒，writer 把 monitor 最新的狀態表快照（與 `agents.json` 同一份）同步到 `hosts`：上線、離線、hello 的資訊改變時立即寫入；`last_seen` 與 `last_report` 只在 `last_seen` 前進 60 秒以上時寫入（線上的主機每分鐘最多寫一次）。關機時最後一份快照（所有主機已離線）在 writer 結束前全部寫入。
+- **分批寫入**：有變化的主機每個交易最多寫 500 列，其餘在之後的維護步驟（每 100 ms 一步，與 report 的批次交錯）逐批寫入；下一份快照到來時取代尚未寫完的部分（新的快照包含最新的狀態）。重新啟動後的第一次同步約有主機數那麼多列（1 萬台時 1 萬列），在 kp-build 上單一交易約 69 ms，分批後每個交易最多約 17 ms（第 11 節）。
 - v1 的 hello 沒有主機資訊：`host_fingerprint`、`display_name`、`tags`、`os`、`report_interval_ms` 保留最後已知的值，不會被清空。
 - `identity_verified`：伺服器啟用 mTLS（`auth.client_ca`）時為 1，表示 `agent_id` 與客戶端憑證的 SAN 綁定；未啟用時 `agent_id` 是自行宣告的。
 - **啟動時載回**：上次異常結束時仍標為線上的主機改為離線（保留 `last_seen`）；`last_seen` 在 24 小時內的主機以「離線」狀態放回狀態表（`Registry::restore`，最多 `limits.max_agents` 台，最近出現的優先）。因此重新啟動後 `agents.json` 不再是空的，之後的 hello 記為「重新上線」，「主機指紋與上次不同」的偵測也延續到重新啟動之後。更早的主機只在清冊中。
@@ -189,9 +246,10 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 
 - **兩層**：5 分鐘（`rollup_5m`）與 1 小時（`rollup_1h`），每列為一台主機、一個序列、一個時間桶的 `vmin`、`vmax`、`vsum`、`cnt`（平均 = `vsum / cnt`）。
 - **哪些值**：每筆 report 的每個指標（數值以 f64 計）。v1 的三個欄位對應到標準序列：`cpu_usage` → `system.cpu.usage`（`%`），`total_memory`／`used_memory`（MB）× 1048576 → `system.memory.total`／`used`（`By`），與 v2 的指標合併成同一條趨勢。網路流量是累計計數器，彙總的是計數器本身的值（速率由使用端以前後相減計算）。
-- **怎麼算**：commit 成功後才把值加進記憶體中尚未寫出的 5 分鐘桶。桶結束 15 秒後（等待排隊中的 report）分批寫出（每步最多約 5000 列，只在主機的邊界切開），同一個交易中合併進 1 小時彙總（`ON CONFLICT DO UPDATE` 合併 min／max／sum／count），並把這些主機的 `hosts.rollup_until` 推進到桶的結束時間。
-- **重新啟動不漏算、不重複算**：啟動時，各主機從 `rollup_until` 起重新讀取原始資料補回記憶體中的桶；已寫出的桶不會再算一次（`rollup_until` 與寫出在同一個交易）。
-- **已知的近似**：時鐘回撥等原因造成 report 的時間落在已寫出的桶時，仍會合併進該桶；若在寫出前 Kairos 當掉，這類遲到的值不會補回（原始資料仍在）。1 小時桶只在其中的 5 分鐘桶寫出時更新。
+- **怎麼算**：依取樣時間（第 5.2 節）分桶。commit 成功後才把值加進記憶體中尚未寫出的 5 分鐘桶；桶結束 15 秒、且該主機在這個桶 15 秒沒有新值之後（等待排隊中的 report、補送中的桶補完）分批寫出（每步最多約 5000 列，只在主機的邊界切開，每台主機依時間順序），同一個交易中合併進 1 小時彙總（`ON CONFLICT DO UPDATE` 合併 min／max／sum／count），並把這些主機的 `hosts.rollup_until` 推進到桶的結束時間。
+- **遲到的資料**（取樣時間早於 `rollup_until`）在寫入原始資料的同一個交易中直接累加進已寫出的桶（第 5.3 節）。
+- **重新啟動不漏算、不重複算**：啟動時，各主機從 `rollup_until` 起重新讀取原始資料補回記憶體中的桶；已寫出的桶與直接合併的遲到資料不會再算一次（`rollup_until` 與寫出在同一個交易）。commit 結果不明之後也以同樣的方式重建（第 5.1 節）。
+- **已知的近似**：1 小時桶只在其中的 5 分鐘桶寫出（或遲到資料合併）時更新。取樣時間早於原始資料保留期限的補送資料，若在它的桶寫出前（最多約 15 秒）原始資料已被保留清除刪除、Kairos 又剛好當掉，這些值不會補回彙總。
 
 **記憶體**：每台主機每個序列每個尚未寫出的桶約 80 bytes；1 萬台 × 20 個序列 × 2 個桶約 32 MB。
 
@@ -205,7 +263,7 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 | 5 分鐘彙總 | `storage.rollup_5m_retention_days` | 31 |
 | 1 小時彙總 | `storage.rollup_1h_retention_days` | 400 |
 
-0 表示不依時間刪除。啟動後立即執行一次，之後每小時一輪；每一步刪除最多 5000 列（一個交易，每台主機以 `(host_id, ts)` 索引或主鍵範圍刪除），步與步之間讓 report 先寫，不會長時間鎖住資料庫。一輪結束時刪除已沒有任何 report 引用的 `boots` 列，並記一行 `INFO`（刪除的筆數）。
+依取樣時間（`reports.ts`、彙總的桶）；與 Pulse 補送的關係見第 5.4 節。0 表示不依時間刪除。啟動後立即執行一次，之後每小時一輪；每一步刪除最多 5000 列（一個交易，每台主機以 `(host_id, ts)` 索引或主鍵範圍刪除），步與步之間讓 report 先寫，不會長時間鎖住資料庫。一輪結束時刪除已沒有任何 report 引用的 `boots` 列，並記一行 `INFO`（刪除的筆數）。
 
 刪除前同樣檢查系統日期是否合理（與 JSONL、日誌共用 `crates/date-guard` 的 DateGuard 規則：時鐘被誤校到未來時暫停刪除 24 小時）；狀態存在資料庫的 `meta.retention_guard`，跨重新啟動延續。
 
@@ -273,6 +331,7 @@ systemctl start kairos
 - 240 bytes／筆來自第 11 節的量測（含 `reports_host_ts` 索引與主機、序列等；資料表與索引本身約 203 bytes）；指標數不同時大致等比例調整（每個指標約 7～10 bytes）。0.2 的 JSONL 同一筆約 1.5 KB（`schema` 2，17 個指標），約為 SQLite 的 6 倍。
 - 預設上限 64 GiB 約可容納 1,300 台主機的預設保留期間。1 萬台時請依磁碟調高 `storage.max_total_bytes`，或縮短保留天數，例如原始 2 天、5 分鐘 14 天、1 小時 180 天：約 124 + 43 + 43 ≈ 210 GB。超過上限時依第 8.2 節提早刪除最舊的資料（原始資料先刪）。
 - 主機清冊每台約 1 KB，1 萬台約 10 MB，可忽略。
+- **補送**（A5）不增加長期的容量（補的是斷線期間本來就該有的資料），但恢復連線時寫入速率暫時升高：每台 Pulse 補送時約每秒 1.67 筆，1 萬台同時恢復約每秒 16,700 筆（平常約 2,000 筆）。第 11 節量測了每秒 8,000～16,000 筆。原始資料保留天數縮短時，請一併檢查第 5.4 節的 `buffer.max_age_hours`。
 
 ## 11. 量測
 
@@ -282,6 +341,11 @@ systemctl start kairos
 cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput
 # 可調：KP_BENCH_RATE（筆／秒，預設 2000）、KP_BENCH_SECS（預設 30）、KP_BENCH_HOSTS（預設 10000）、
 #       KP_BENCH_SYNC=full、KP_BENCH_DIR（保留資料庫供檢查）
+# 補送尖峰：KP_BENCH_DURABLE=1（帶去重鍵、取樣時間從 KP_BENCH_BACKFILL_HOURS=72 小時前起）、
+#       KP_BENCH_DUP_PERCENT=2（2% 另外重送一次）、KP_BENCH_INVENTORY=1（量測期間第一次清冊同步 1 萬台）、
+#       KP_BENCH_TIMEOUT=1（與連線相同：等 5 秒，未認領的取消 = storage_unavailable，已認領再等 1 秒）
+cargo test -p kairos --release -- --ignored --nocapture inventory_sync_timing     # 清冊第一次同步
+cargo test -p kairos --release -- --ignored --nocapture sqlite_backfill_profile   # 寫入／維護耗時隨資料量的變化
 ```
 
 kp-build（PVE VM，4 vCPU、3 GB RAM、本機虛擬磁碟，Ubuntu）2026-10-12 的結果，1 萬台主機輪流、每秒 2000 筆（相當於 1 萬台 × 每 5 秒一筆）、每筆 17 個指標：
@@ -294,7 +358,35 @@ kp-build（PVE VM，4 vCPU、3 GB RAM、本機虛擬磁碟，Ubuntu）2026-10-12
 
 - 每筆大小：`reports` 資料表與 `reports_host_ts` 索引約 203～206 bytes，其餘為主機、序列與彙總（7 分鐘的量測中 34 萬列彙總約 16.6 MB，每列約 49 bytes，與第 10 節的估算相符）。
 - 所有 report 都在 50 ms 內收到結果，遠低於 `timeouts.write_secs`（預設 5 秒），PROTOCOL.md 的 8 秒回應預算不受影響。
-- 主機清冊的同步沒有包含在量測中（量測直接驅動 writer）：1 萬台主機時，重新啟動後第一次同步約寫入 1 萬列（一個交易），之後只寫有變化的主機（每台每分鐘最多一次）。
+- 上表的量測沒有包含主機清冊的同步；清冊與補送尖峰見下面兩小節。
+
+### 11.1 1 萬台同時恢復連線的補送尖峰（A5）
+
+情境：Kairos 停機（或網路中斷）後 1 萬台 Pulse 同時恢復，各自以每 0.6 秒一筆補送積壓（PROTOCOL.md 的估算約每秒 16,700 筆）。量測以 `KP_BENCH_DURABLE=1 KP_BENCH_DUP_PERCENT=2 KP_BENCH_INVENTORY=1`：每筆帶去重鍵、取樣時間為 72 小時前起的歷史資料（彙總的桶都是已結束的舊桶，走第 5.3 節的補送路徑），2% 的筆數重送一次（應為 `Duplicate`），並在第 30 秒做一次 1 萬台的清冊同步。kp-build 同上，2026-10-12：
+
+| 速率 × 時間 | 等待方式 | 結果 | p50 | p99 | 最大 | `storage_unavailable` | 結果不明 |
+|---|---|---|---|---|---|---|---|
+| 8,000／秒 × 60 秒 | 不逾時 | 48 萬筆全部寫入，重送 9,600 筆皆為 `Duplicate` | 1.4 ms | 43 ms | 94 ms | 0 | 0 |
+| 16,000／秒 × 60 秒 | 不逾時 | 96 萬筆全部寫入，重送 19,200 筆皆為 `Duplicate` | 2.8 ms | 103 ms | 143 ms | 0 | 0 |
+| 8,000／秒 × 5 分鐘 | 與連線相同 | 240 萬筆全部寫入，重送 48,000 筆皆為 `Duplicate` | 2.1 ms | 124 ms | 226 ms | 0 | 0 |
+| 16,000／秒 × 5 分鐘 | 與連線相同 | 480 萬筆中 465 萬筆寫入 | 188 ms | 5.0 s | 5.05 s | 149,923（3.1%） | 0 |
+| 16,000／秒 × 5 分鐘（參考） | 不逾時（不取消） | 寫入跟不上後佇列外的等待無限累積 | 167 ms | 12.5 s | 14.1 s | （連線會在 5 秒時回） | — |
+
+- **8 秒回應預算不受影響**：寫入跟不上時，連線等待 `timeouts.write_secs`（5 秒）後取消尚未被認領的要求並回 `storage_unavailable`（確定未保存），所以最長回應約 5.05 秒；已被認領的都在 1 秒寬限內有結果，沒有任何一筆變成「結果不明」。被取消的要求 writer 不會再處理，佇列不會無限累積（上表最後一列是不取消時的對照）。
+- **每秒 16,000 筆在 60 秒內跟得上，持續 5 分鐘時跟不上**：kp-build 上持續寫入的能力隨資料庫變大而下降（`sqlite_backfill_profile`：每批 1000 筆的寫入從 9.7 ms 增加到 17 ms、每步維護從 12 ms 增加到 27 ms，資料庫從 0.1 GB 增加到 0.5 GB）。原因是 `reports_host_ts` 與 `reports_dedup` 兩個索引、以及彙總表的主鍵都依主機分散，1 萬台主機輪流寫入時每個交易會碰到上千個分散的頁；補送時彙總的桶寫出量也是即時資料的約 8 倍。加大 SQLite 的 cache（256 MB）沒有改善；提高 writer 補做 checkpoint 的門檻（4096 → 16384 頁）約改善 20%，但最大延遲變大，未採用。
+- **實際的行為**：Pulse 收到 `storage_unavailable` 後退避（2 秒加倍到 60 秒）再從最舊的未確認資料重送，整體速率自動降到 Kairos 寫得進去的程度，資料留在 Pulse 的緩衝中、不會遺失，重送由唯一索引去重。上表是固定速率的負載（不退避），比實際更嚴苛。
+- **建議**：主機數接近 1 萬台、且預期會同時恢復連線（例如 Kairos 維護）時，把 Pulse 的 `buffer.replay_interval_ms` 調到 1200 左右（1 萬台約每秒 8,300 筆，上表中沒有 `storage_unavailable` 的範圍；斷線 24 小時的積壓約 7.6 小時補完，預設 600 ms 時約 3.3 小時），或使用更快的磁碟與更多 CPU。預設值是否調整需依部署規模決定。
+
+### 11.2 主機清冊的第一次同步
+
+重新啟動後的第一次同步約寫入主機數那麼多列。`inventory_sync_timing`（1 萬台，kp-build，3 次）：
+
+| 方式 | 交易數 | 最長的一個交易 | 合計 |
+|---|---|---|---|
+| 一個交易（改成分批之前） | 1 | 68～69 ms | 68～69 ms |
+| 每個交易最多 500 列（目前） | 20 | 17 ms | 83～84 ms |
+
+分批之後，同步在 report 的批次之間逐步進行（每 100 ms 一步），report 的寫入最多被擋住約 17 ms；上一小節的補送量測都包含第 30 秒的這次同步（例如每秒 8,000 筆 60 秒的最大延遲 94 ms）。
 
 ## 12. 查詢範例
 
@@ -329,6 +421,7 @@ WHERE host_id = (SELECT host_id FROM hosts WHERE agent_id = '6f1c0e4a-1b2c-4d3e-
 - 主機清冊從空開始，主機在第一次送 report、或下一次清冊同步（30 秒內）時出現。
 - 回到 0.2：0.2 不認得 `kairos.db`（忽略），照常寫 JSONL；之後再升級時資料庫中的資料仍在（期間的 report 只在 JSONL 中）。降版到 schema 較舊的 0.3.x 時會被拒絕（第 3.2 節）。
 - systemd 的 unit 不需修改：資料庫在原本的資料目錄 `/opt/kairos/data`（`ReadWritePaths` 已包含）。
+- **與 Pulse 0.3（durable）**：at-least-once 需要 Kairos 與 Pulse 都是 0.3（任一端是 0.2 時維持 at-most-once，見 CHANGELOG 的相容矩陣）。建議先升級 Kairos（CHANGELOG [0.3.0] 的升級步驟）。補送的資料以 Pulse 的取樣時間保存與彙總（第 5.2 節），從匯出或 JSONL 鏡像讀資料的工具請以 `ts` 作為取樣時間，`recv_at` 只是收到的時間。
 
 ## 14. 限制與後續
 
@@ -337,3 +430,5 @@ WHERE host_id = (SELECT host_id FROM hosts WHERE agent_id = '6f1c0e4a-1b2c-4d3e-
 - `kairos reports export` 不做全域時間範圍的索引（未指定 `--agent` 時掃描整個 `reports` 表）。
 - 彙總的值以 f64 計算，超過 2^53 的整數會失去精度（原始資料保留原值）。
 - 清冊不會自動刪除主機（除役流程屬 F 系列）。
+- durable 連線的取樣時間以 Pulse 的時鐘為準（第 5.2 節）；Pulse 時鐘偏差超過 5 分鐘（偏快）或 367 天（偏慢）時改用收到的時間。
+- 原始資料保留天數小於 Pulse 的 `buffer.max_age_hours` 時，原始資料被刪除之後的重送會再寫入一次（第 5.4 節）。

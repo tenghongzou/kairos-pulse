@@ -114,10 +114,11 @@ pub const MAX_LABEL_KEY_BYTES: usize = 64;
 /// label 值長度上限（bytes）
 pub const MAX_LABEL_VALUE_BYTES: usize = 256;
 
-/// durable：伺服器保證去重的重送範圍。同一個 (agent_id, `boot_id`) 中，`report_seq` 不小於
-/// 「已保存的最大 `report_seq` − 此值 + 1」的重送都能正確判斷是否已保存；更舊的重送一律視為已保存
-/// （回 `ack`、不寫入）。client 依序送出、在途筆數不超過 [`MAX_DURABLE_IN_FLIGHT`] 時，
-/// 需要重送的資料一定落在這個範圍內
+/// durable：伺服器至少保證去重的重送範圍。同一個 (agent_id, `boot_id`) 中，`report_seq` 不小於
+/// 「已保存的最大 `report_seq` − 此值 + 1」的重送都能正確判斷是否已保存；伺服器可以把更舊的重送
+/// 一律視為已保存（回 `ack`、不寫入；Kairos 的 JSONL 後端如此，SQLite 後端以唯一索引判斷整段保存
+/// 期間）。client 依序送出、在途筆數不超過 [`MAX_DURABLE_IN_FLIGHT`] 時，需要重送的資料一定落在
+/// 這個範圍內
 pub const DURABLE_DEDUP_WINDOW: u64 = 256;
 
 /// durable：client 同一時間最多在途（已送出、尚未收到回應）的 report 筆數

@@ -415,7 +415,9 @@ tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄�
 
 ## 10. 升級
 
-**升級順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。** 協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
+**從 0.2 升級到 0.3：建議先升級 Kairos，再升級 Pulse**（Kairos 0.3 才支援 `durable`；Pulse 升級後的第一次斷線就能補送）。先升級 Pulse 也可以：連 Kairos 0.2 時連線期間維持 at-most-once，斷線期間的積壓保留在緩衝中，Kairos 升級後才補送。完整步驟見 `CHANGELOG.md` [0.3.0]「升級步驟」。
+
+**從 0.1.x 升級時的順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。** 協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
 
 - 舊版 Pulse（`44dcee5` 及更早）連新版 Kairos 時，主機名稱含新版 Kairos 禁止的字元會**無法註冊**，心跳間隔較大時也可能誤斷線；新版 Pulse 連舊版 Kairos 沒有這類問題（舊版 Kairos 的 `timeouts.write_secs` 維持預設時）。先升級 Pulse 就不會經過有風險的組合。
 - 資料格式的改變與順序無關：Kairos 升級後 JSONL 每行多了 `schema`，新版 Pulse 連上後寫成 `schema` 2，讀取 JSONL 的工具要在升級 Kairos **前**改為依 `schema` 分流（`CHANGELOG.md` 破壞性變更第 6 項）。
@@ -471,7 +473,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   沒有建立目錄或沿用舊 unit 時，Pulse 照常運作，但會記 `ERROR`「無法開啟本機緩衝」並改為 at-most-once。升級後啟動日誌會有「本機緩衝：buffer（待送 0 筆…）」；連上 Kairos 0.3.0 以上時 Kairos 的上線日誌註明「durable」。回滾到 0.2.x 時 `buffer/` 中尚未送出的資料不會被送出，可以刪除。
 - 新版 unit 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再每 10 秒重試）；請依步驟 2 換上新版 unit（多實例時重新產生每個 `pulse-N.service`）。
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
-- 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。
+- 從 0.1.x 升級時：全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。從 0.2 升級到 0.3 時則先確認 Kairos 已是 0.3。
 - 回滾：`mv /opt/pulse/pulse.prev /opt/pulse/pulse && systemctl restart pulse`。
 
 ## 11. 憑證更新與 agent_id 重新產生

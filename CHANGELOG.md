@@ -25,9 +25,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | **Kairos 0.2.0**（協定 v1～v2） | **有條件相容，協定 v1**：`hello_ack`、report、錯誤處理與 0.1.0 的 Kairos 相同；JSONL 為 `schema` 1（欄位與舊版相同，只多 `schema`），`agents.json` 的 `proto` 為 1、沒有主機資訊。限制：`44dcee5` 之前的 Pulse 在主機名稱含格式字元（Cf）時、`44dcee5` 在主機名稱含 U+034F、Hangul filler、變體選擇字元或私用區字元時**無法註冊**；舊版 Pulse 的讀取閒置計算方式在心跳較大時可能誤斷線 | **相容（建議組合），協定 v2**：report 為通用指標（JSONL `schema` 2），hello 帶主機資訊（寫入 `agents.json`），`hello_ack` 帶 `server_time`（Pulse 檢查時鐘偏差） |
 
 - 同一個 Kairos 0.2.0 可以同時服務 v1 與 v2 的 Pulse：每個 agent 依自己的連線協商，同一個 `reports-*.jsonl` 中 `schema` 1 與 2 的行並存（讀取工具須依 `schema` 分流，見破壞性變更第 6 項）。
-- Kairos 0.3.0〔草稿〕的協定與 0.2.0 相同（v1～v2），與各版 Pulse 的相容性同上表的 Kairos 0.2.0；差別只在資料儲存（SQLite，見 [0.3.0]），讀取資料的工具受影響，Pulse 不受影響。
+- 0.3.0〔草稿〕的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
-- **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。
+- **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
 
 ## 支援期限〔草稿〕
@@ -50,7 +50,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [0.3.0] - 〔草稿：發佈日期待定〕
 
-〔草稿〕**Kairos 0.3.0**：商業審計路線圖「階段 2 資料層」中的 A1（資料庫）、A6（持久化主機清冊）、A9（容量）。report 預設改寫 SQLite，另有主機清冊、5 分鐘／1 小時彙總、分層保留與總容量上限；並備妥 A5（at-least-once）需要的去重 API。協定與 Pulse 不變。`kairos/Cargo.toml` 的版本號尚未改為 0.3.0，發佈時依 RELEASING.md 決定（也可能併入尚未發佈的 0.2.0），並移除〔草稿〕標記。架構、schema、設定、容量估算、量測與備份見 `kairos/STORAGE.md`（發佈包內的 `STORAGE.md`）。
+〔草稿〕**Kairos 0.3.0、Pulse 0.3.0**：商業審計路線圖「階段 2 資料層」中的 A1（資料庫）、A5（at-least-once 投遞）、A6（持久化主機清冊）、A9（容量）。Kairos 的 report 預設改寫 SQLite，另有主機清冊、5 分鐘／1 小時彙總、分層保留與總容量上限；Pulse 新增本機環狀緩衝，Kairos 停機或網路中斷期間的取樣在恢復後補送，雙方以協定 feature `durable` 協商，Kairos 以唯一索引去重。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.3.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。架構、schema、設定、容量估算、量測與備份見 `kairos/STORAGE.md`（發佈包內的 `STORAGE.md`）；協定見 `crates/kairos-proto/PROTOCOL.md`「durable：at-least-once 投遞」。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -58,24 +58,45 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 |---|---|---|---|---|
 | 1 | Kairos | **report 預設寫入 SQLite（`data/kairos.db`），不再寫 `reports-YYYY-MM-DD.jsonl`**（A1） | 直接讀取 `data/reports-*.jsonl` 的工具（匯入、報表、監控腳本），以及複製資料目錄的備份腳本 | 升級前擇一：讀取工具改用 `kairos reports export --since <時間> [--agent <agent_id>]`（每行格式與 JSONL 相同，`peer`、`hostname` 為清冊中最後的值）；或在 `[storage]` 加上 `jsonl_mirror = true` 同時輸出 JSONL（盡力而為、不影響 `ack`，磁碟用量約多 6 倍）；或暫時設定 `backend = "jsonl"`（與 0.2 相同，沒有主機清冊與彙總）。備份改用 `kairos db backup <檔案>`（**執行中不可直接複製 `kairos.db`**，INSTALL 第 10.2 節）。既有的 JSONL 檔不會匯入資料庫、不會被修改；不開鏡像時 JSONL 的保留清除不再執行，舊檔請自行搬移或刪除 |
 | 2 | Kairos | **資料目錄必須在本機磁碟** | `storage.data_dir` 放在 NFS、SMB 等網路磁碟的部署 | SQLite 的 WAL 需要共享記憶體與檔案鎖；無法啟用 WAL 時拒絕啟動（`無法啟用 WAL`）。改到本機磁碟 |
-| 3 | Kairos | **總容量上限預設 64 GiB，超過時刪除最舊的資料**（A9） | 主機多（約 1,300 台以上）或保留天數調長的部署 | 依 STORAGE.md「容量估算」設定 `storage.max_total_bytes`（0 = 不限制）與 `raw_retention_days`／`rollup_5m_retention_days`／`rollup_1h_retention_days`（預設 7／31／400 天）。上限小於以 `server.max_connections` 台估算的容量時啟動記 `WARN` |
+| 3 | Kairos | **總容量上限預設 64 GiB，超過時刪除最舊的資料**（A9） | 主機多（約 1,300 台以上）或保留天數調長的部署 | 依 STORAGE.md「容量估算」設定 `storage.max_total_bytes`（0 = 不限制）與 `raw_retention_days`／`rollup_5m_retention_days`／`rollup_1h_retention_days`（預設 7／31／400 天）。上限小於以 `server.max_connections` 台估算的容量時啟動記 `WARN`。縮短 `raw_retention_days` 時一併檢查第 6 項的 `buffer.max_age_hours` |
 | 4 | Kairos | **`agents.json` 在重新啟動後保留最近 24 小時內出現過的主機**（A6，行為改變） | 依「重新啟動後 `agents.json` 為空」或 `total` 計數的工具 | 重新啟動後這些主機以 `online: false`、`conn_id: 0` 出現，24 小時後照常移除；需要所有主機（含更早的）時用 `kairos hosts list --json` |
+| 5 | Kairos | **補送的資料：`ts` 可能比 `recv_at` 早數小時到數天**（A5）。SQLite 中依 `ts`（Pulse 的取樣時間）保存、彙總與套用保留期限；匯出與 JSONL 另有選用欄位 `boot_id`、`report_seq`（`schema` 不變），JSONL 仍寫入收到當天的檔案 | 依 `recv_at`、檔案日期或匯出順序當作取樣時間的讀取工具 | 時序分析改用 `ts`；忽略未知欄位的工具不受其他影響。`kairos reports export --since` 依取樣時間篩選（STORAGE.md 第 5.2 節） |
+| 6 | Pulse | **預設啟用本機緩衝，需要可寫的 `buffer/` 目錄**（A5） | 以發佈包的 systemd unit（`ProtectSystem=strict`，只有 `logs/` 可寫）執行的部署 | 升級前 `install -d -o pulse -g pulse -m 750 /opt/pulse/buffer`，並換上新版 `pulse.service`（`ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer`；多實例時對每個實例重做，Pulse INSTALL.md 第 9、10 節）。沒有做時 Pulse 照常監控，但記 `ERROR`「無法開啟本機緩衝」並改為 at-most-once。緩衝保留 `buffer.max_age_hours`（預設 168 小時）內的資料，建議不超過 Kairos `raw_retention_days` × 24（STORAGE.md 第 5.4 節） |
+| 7 | Pulse | **磁碟用量增加**：緩衝預設最多約 72 MiB（`buffer.max_mb` 64 MiB 加兩個區段）（A5） | 磁碟空間很小的主機 | 在 `pulse.toml` 調小 `[buffer] max_mb`／`max_records`，或 `enabled = false`（與 0.2.0 相同） |
+| 8 | 兩者 | **恢復連線後的寫入量暫時增加**：每台 Pulse 補送時約每秒 1.67 筆（平常每 5 秒 1 筆），1 萬台同時恢復約每秒 16,700 筆（A5） | 大量主機同時恢復連線的部署（例如 Kairos 維護後） kp-build（4 vCPU）上量測：每秒 8,000 筆持續 5 分鐘 p99 0.12 秒、沒有 `storage_unavailable`；每秒 16,000 筆持續 5 分鐘時約 3% 回 `storage_unavailable`（Pulse 退避後重送，不遺失、不重複），最長回應 5.05 秒（8 秒預算內）（STORAGE.md「量測」）。主機接近 1 萬台時建議把 Pulse 的 `buffer.replay_interval_ms` 調到約 1200（約每秒 8,300 筆）。以 `backend = "jsonl"` 或鏡像寫 JSONL 時，補送寫入收到當天的檔案，`storage.max_daily_bytes` 可能較快達到（之後回 `storage_unavailable`，資料留在 Pulse，換日後繼續補送） |
 
-**升級步驟**：（1）依第 1 項處理讀取 JSONL 的工具與備份腳本；（2）確認資料目錄在本機磁碟並有足夠空間（第 2、3 項）；（3）換上新版執行檔並重新啟動（INSTALL 第 11 節，unit 不需修改）；（4）以 `sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml` 確認 Pulse 上線後出現在清冊中。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用。
+**升級步驟**（依序；Kairos 先升級，Pulse 升級後的第一次斷線就能補送）：
+
+1. **Kairos 升級前**：依第 1 項處理讀取 JSONL 的工具與備份腳本，依第 5 項檢查以 `recv_at` 當取樣時間的工具；確認資料目錄在本機磁碟並有足夠空間（第 2、3 項）。
+2. **升級 Kairos**：換上新版執行檔並重新啟動（Kairos INSTALL 第 11 節，unit 不需修改）。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用。
+3. **確認 Kairos**：以 `sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml` 確認既有的 Pulse（0.2.0，at-most-once）重新連上後出現在清冊中。
+4. **每台 Pulse 主機：建立緩衝目錄**：`install -d -o pulse -g pulse -m 750 /opt/pulse/buffer`（第 6 項；多實例時每個實例各一個）。
+5. **換上新版 `pulse.service`** 並 `systemctl daemon-reload`（`ReadWritePaths` 加上 `-/opt/pulse/buffer`）。
+6. **升級 Pulse**：換上新版執行檔並重新啟動（Pulse INSTALL 第 10 節）。啟動日誌應有「本機緩衝：buffer（待送 0 筆…）」，Kairos 的上線日誌註明「durable：report 可補送、去重」。
+7. 需要時調整 Pulse 的 `[buffer]`（第 7、8 項）與 Kairos 的保留天數，讓 `buffer.max_age_hours ≤ 24 × raw_retention_days`（第 6 項）。
+
+先升級 Pulse 也可以：連上 0.2.0 的 Kairos 時不啟用 durable（連線期間 at-most-once），斷線期間的積壓保留在 Pulse 的緩衝中，Kairos 升級後才補送（只是會先佔用緩衝）。
+
+### 協定（kairos-proto）
+
+- 新增 feature `durable`（v2 的 `features` 協商，不提升協定版本）：雙方都宣告時 report 為 at-least-once，report 帶 `boot_id`（UUID，Pulse 每次程序啟動時產生）與 `report_seq`（同一 `boot_id` 內從 1 遞增）；缺漏或型別錯誤回 `bad_request`。任一端沒有宣告時維持 at-most-once。PROTOCOL.md 新增「durable：at-least-once 投遞」與測試向量，並更新相容矩陣、寫入結果不明時的重送語意與 8 秒回應預算的說明（A5）。
+- `DurableSeq`、`FEATURE_DURABLE`、`Session.durable`、`validate_durable_seq`、`DURABLE_DEDUP_WINDOW`（256）、`MAX_DURABLE_IN_FLIGHT`（8）。
+- `PROTOCOL.md`：`ack` 的「已寫入」涵蓋資料庫的 commit；狀態表與 `agents.json` 在重新啟動後的行為依主機清冊更新；伺服器的去重範圍分別說明 SQLite（原始資料保存期間）與 JSONL（記憶體視窗）。
 
 ### Kairos
 
 #### 新增
 
 - **SQLite 儲存**（A1，`storage.backend = "sqlite"`，預設）：`data/kairos.db`（WAL）。原始 report 每筆一列，指標以緊湊的二進位格式保存，名稱、單位與 label 的組合（序列）各存一次，不再每筆重複 `peer`、`hostname`、`agent_id`；以 `(host_id, ts)` 索引查詢某台主機的時間範圍。Pulse 0.2.0 的典型 report（17 個指標）每筆約 240 bytes（含索引），JSONL 約 1.5 KB。schema 以 `PRAGMA user_version` 管理版本，啟動時依序遷移（每版一個交易）；資料庫比程式新時、或不是 Kairos 的資料庫時拒絕啟動。
-- **寫入介面抽象化**：連線只認得 `ReportSink`；後端實作 `trait ReportStore`（`store/mod.rs`），日後可換成時序資料庫。單一 writer 把佇列中目前所有的要求（最多 1024 筆）寫成一個交易（group commit），在 blocking 執行緒上執行，commit 成功後才回 `ack`；commit 前失敗、磁碟已滿等確定未寫入時回 `storage_unavailable`，commit 結果不明時維持「不回應、關閉連線」。checkpoint 由背景執行緒進行（必要時由 writer 在兩批之間補做），不在 commit 時擋住寫入。資料庫在執行中被刪除或替換時重新建立，不會寫進已刪除的檔案後回 `ack`。量測（kp-build，每秒 2000 筆、1 萬台主機）：p50 0.55 ms、p99 1.5 ms（STORAGE.md「量測」）。
-- **去重 API**（A5 的前置，與 `sprint2/durable` 的契約）：`ReportRecord::with_dedup(Some(DedupKey { boot_id, report_seq }))`；SQLite 以唯一索引保證同一主機、同一個 `(boot_id, report_seq)` 只保存一次，重複的回 `WriteStatus::Duplicate`，連線照常回 `ack`、不重寫、不更新 `last_report`。連線端的接線（協商 `durable` 時附上去重鍵）由 durable 分支處理。JSONL 不去重，只在 `ts` 之後寫出 `boot_id`、`report_seq`。
-- **主機清冊**（A6）：所有出現過的主機保存在 `hosts` 表（`agent_id`、hello 的主機資訊含 `host_fingerprint`、最後的來源位址、是否以 mTLS 驗證身分、首次出現、最後訊息、最後一筆 report），每 30 秒從狀態表同步、關機時寫入最後狀態。啟動時把上次異常結束時仍標為線上的主機改為離線，並把最近 24 小時內出現過的主機以離線狀態放回狀態表（「重新上線」與主機指紋的比對延續到重新啟動之後）。新設定 `storage.max_hosts`（預設 `max(100000, limits.max_agents)`）。
+- **寫入介面抽象化**：連線只認得 `ReportSink`；後端實作 `trait ReportStore`（`store/mod.rs`），日後可換成時序資料庫。單一 writer 把佇列中目前所有的要求（最多 1024 筆）寫成一個交易（group commit），在 blocking 執行緒上執行，commit 成功後才回 `ack`；commit 前失敗、磁碟已滿等確定未寫入時回 `storage_unavailable`，commit 結果不明時維持「不回應、關閉連線」。checkpoint 由背景執行緒進行（必要時由 writer 在兩批之間補做），不在 commit 時擋住寫入。資料庫在執行中被刪除或替換時重新建立，不會寫進已刪除的檔案後回 `ack`。量測（kp-build，每秒 2000 筆、1 萬台主機）：p50 0.55 ms、p99 1.4 ms（STORAGE.md「量測」）。
+- **durable（at-least-once）與去重**（A5）：協商 `durable` 時，連線以 `ReportRecord::with_dedup(Some(DedupKey { boot_id, report_seq }))` 把去重鍵交給 writer（`ReportSink::submit(record)` 不變）。SQLite 以唯一索引保證同一主機、同一個 `(boot_id, report_seq)` 只保存一次，範圍為原始資料保存的整段期間；重複的回 `WriteStatus::Duplicate`，連線照常回 `ack`、不重寫、不加入彙總、不寫入鏡像、不更新 `last_report`。commit 結果不明而斷線後的重送也由唯一索引去重，記憶體中的彙總由原始資料重建，那一筆只算一次。`backend = "jsonl"` 時以記憶體中的視窗去重（每個 boot 256 筆，啟動時由最新兩個 report 檔尾端重建，48 小時閒置清除）；JSONL 鏡像不另外去重。上線日誌註明「durable：report 可補送、去重」。
+- **補送的歷史資料**（A5）：一律接受，`ts` 原樣保存。SQLite 的 `reports.ts` 為取樣時間（durable 時為 Pulse 的 `ts`，須在收到時間的 −367 天～＋5 分鐘內，否則用收到的時間；非 durable 為收到的時間），另存 `recv_lag` 還原收到的時間。彙總依取樣時間分桶；取樣時間落在已寫出的桶時，在同一個交易中累加進 `rollup_5m`／`rollup_1h`（不覆蓋、不遺漏、重新啟動後不重複）；補送中的桶等補完（15 秒沒有新值）才寫出。`agents.json` 的 `last_report` 不會被較舊的補送資料蓋過。
+- **主機清冊**（A6）：所有出現過的主機保存在 `hosts` 表（`agent_id`、hello 的主機資訊含 `host_fingerprint`、最後的來源位址、是否以 mTLS 驗證身分、首次出現、最後訊息、最後一筆 report），每 30 秒從狀態表同步（每個交易最多 500 列，其餘在之後的維護步驟寫入；1 萬台時每個交易約 17 ms）、關機時寫入最後狀態。啟動時把上次異常結束時仍標為線上的主機改為離線，並把最近 24 小時內出現過的主機以離線狀態放回狀態表（「重新上線」與主機指紋的比對延續到重新啟動之後）。新設定 `storage.max_hosts`（預設 `max(100000, limits.max_agents)`）。
 - **`kairos hosts list [--offline-for <時間>] [--wide] [--no-header] [--json] [--ascii]`**：查詢主機清冊（線上／離線／未知、主機名稱、`agent_id`、IP、最後訊息），回答「哪些主機已失聯 N 天」；`--json` 為純 ASCII（`schema` `kairos.hosts.list/v1`），錯誤為 `KRS-E4003`。輸出依設計包 `cli-style.md`。
-- **`kairos reports export [--since <時間>] [--agent <agent_id>]`**：以 JSON Lines 匯出 SQLite 中的原始 report，格式與 JSONL 檔相同（`schema` 1／2）。
+- **`kairos reports export [--since <時間>] [--agent <agent_id>]`**：以 JSON Lines 匯出 SQLite 中的原始 report，格式與 JSONL 檔相同（`schema` 1／2，durable 的另有 `boot_id`、`report_seq`；`--since` 依取樣時間）。
 - **`kairos db backup <檔案>`**：線上備份（`VACUUM INTO`），Kairos 執行中也可以執行，不覆寫既有檔案，備份檔 `0640`。
 - **彙總**（A9）：每個指標的 5 分鐘與 1 小時 min／max／sum／count（`rollup_5m`、`rollup_1h`）；v1 的三個欄位對應到標準指標（記憶體換算成 bytes），與 v2 合併成同一條趨勢。重新啟動時從原始資料補回尚未寫出的部分，不漏算、不重複算。
-- **分層保留與總容量上限**（A9）：`storage.raw_retention_days`（預設 7）、`storage.rollup_5m_retention_days`（31）、`storage.rollup_1h_retention_days`（400）；`storage.max_total_bytes`（預設 64 GiB）超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，直到低於上限的 95%。刪除都分批進行（每步最多 5000 列、一個短交易），不會長時間鎖住資料庫；依時間的刪除沿用 DateGuard 的時鐘跳躍保護（狀態存在資料庫中）。
+- **分層保留與總容量上限**（A9）：`storage.raw_retention_days`（預設 7）、`storage.rollup_5m_retention_days`（31）、`storage.rollup_1h_retention_days`（400），依取樣時間；`storage.max_total_bytes`（預設 64 GiB）超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，直到低於上限的 95%。刪除都分批進行（每步最多 5000 列、一個短交易），不會長時間鎖住資料庫；依時間的刪除沿用 DateGuard 的時鐘跳躍保護（狀態存在資料庫中）。
 - 新設定 `storage.backend`（`sqlite`／`jsonl`）、`storage.jsonl_mirror`（`sqlite` 時另輸出 JSONL 鏡像，沿用 `retention_days`、`max_daily_bytes` 與保留清除）、`storage.sqlite_synchronous`（`normal`／`full`）。範例設定與 README 的設定表已更新。
 - 啟動時：`storage.max_total_bytes` 小於以 `server.max_connections` 台主機估算的容量時記 `WARN`；記錄資料庫的 schema 版本、主機與序列數與載回的主機數。
 
@@ -88,64 +109,40 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 #### 文件
 
-- 新增 `kairos/STORAGE.md`（發佈包內附）：架構、`ack` 語意、schema 與遷移、批次策略、去重契約、主機清冊、彙總、保留與容量上限、設定、容量估算公式與表、吞吐量量測、查詢範例、備份與還原、從 JSONL 升級。
-- README：設定表、資料輸出、檔案權限、專案結構、依賴與目前限制依 SQLite 更新；INSTALL：資料目錄須為本機磁碟、確認清單加上 `kairos hosts list`、備份改用 `kairos db backup`、升級前備份與回滾、疑難排解。
-
-### 共用
-
-- `PROTOCOL.md`：`ack` 的「已寫入」涵蓋資料庫的 commit；狀態表與 `agents.json` 在重新啟動後的行為依主機清冊更新。協定本身不變。
-- 端對端測試（`tests/e2e`）改以預設的 SQLite 執行：report 以實際的 `kairos reports export` 從資料庫取出檢查，另檢查 JSONL 鏡像與資料庫一致、關機後 `kairos hosts list --json` 中主機為離線且帶主機資訊、重新啟動時從清冊載回主機。
-
-### 發佈與建置
-
-- 新增依賴 `rusqlite`（MIT，只啟用 `bundled`：編譯內附的 SQLite 原始碼，不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝）及其依賴 `libsqlite3-sys`（MIT）、`fallible-iterator`、`fallible-streaming-iterator`（MIT／Apache-2.0）、`pkg-config`、`vcpkg`（建置用，MIT／Apache-2.0）。SQLite 本身是 public domain（不需授權條款），`THIRD-PARTY-LICENSES` 另加註說明。`deny.toml`、`packaging/about.toml` 的授權允許清單不需變更（沒有新的授權種類；未啟用 rusqlite 的 `cache` feature，避免引入 Zlib 授權的 `foldhash`）。
-- 發佈包新增 `STORAGE.md`。
-
-## [0.3.0] - 〔草稿：發佈日期待定〕
-
-〔草稿〕本區段目前只列 A5（report 改為 at-least-once）的條目；其他分支的 0.3.0 條目合併時再整併成一份。
-
-### 破壞性變更與升級步驟（A5）
-
-| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
-|---|---|---|---|---|
-| A5-1 | Pulse | **預設啟用本機緩衝，需要可寫的 `buffer/` 目錄** | 以發佈包的 systemd unit（`ProtectSystem=strict`，只有 `logs/` 可寫）執行的部署 | 升級前 `install -d -o pulse -g pulse -m 750 /opt/pulse/buffer`，並換上新版 `pulse.service`（`ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer`；多實例時對每個實例重做，INSTALL.md 第 9、10 節）。沒有做時 Pulse 照常監控，但記 `ERROR`「無法開啟本機緩衝」並改為 at-most-once |
-| A5-2 | Pulse | **磁碟用量增加**：緩衝預設最多約 72 MiB（`buffer.max_mb` 64 MiB 加兩個區段） | 磁碟空間很小的主機 | 在 `pulse.toml` 調小 `[buffer] max_mb`／`max_records`，或 `enabled = false`（與 0.2.0 相同） |
-| A5-3 | Kairos | **JSONL 新增選用欄位 `boot_id`、`report_seq`；補送的資料 `ts` 可能比 `recv_at` 早數小時到數天**，並寫入收到當天的檔案 | 依 `recv_at` 或檔案日期當作取樣時間的讀取工具 | 時序分析請改用 `ts`（Pulse 的取樣時間）；`schema` 不變，忽略未知欄位的工具不受影響 |
-| A5-4 | Kairos | **恢復連線後的寫入量增加**：每台 Pulse 補送時約每秒 1.67 筆（平常每 5 秒 1 筆） | 大量主機同時恢復連線的部署（例如 Kairos 維護後） | 見下方「容量估算」；需要時調大 Pulse 的 `buffer.replay_interval_ms`，或調大 Kairos 的 `storage.max_daily_bytes` |
-
-### 協定（kairos-proto）
-
-- 新增 feature `durable`（v2 的 `features` 協商，不提升協定版本）：雙方都宣告時 report 為 at-least-once，report 帶 `boot_id`（UUID，Pulse 每次程序啟動時產生）與 `report_seq`（同一 `boot_id` 內從 1 遞增）；缺漏或型別錯誤回 `bad_request`。任一端沒有宣告時維持 at-most-once。PROTOCOL.md 新增「durable：at-least-once 投遞」與測試向量，並更新相容矩陣、寫入結果不明時的重送語意與 8 秒回應預算的說明（A5）。
-- `DurableSeq`、`FEATURE_DURABLE`、`Session.durable`、`validate_durable_seq`、`DURABLE_DEDUP_WINDOW`（256）、`MAX_DURABLE_IN_FLIGHT`（8）。
-
-### Kairos
-
-- 協商 `durable`，以 (agent_id, `boot_id`, `report_seq`) 去重：重送的資料回 `ack`、不重寫；JSONL 另寫 `boot_id`、`report_seq`（A5）。
-- 去重在 report 寫入工作中進行，寫入成功才記錄（連線逾時放棄等待、但寫入已完成的那筆也算）；啟動時由最新兩個 report 檔尾端（最多 64 MiB）重建，48 小時閒置清除。這是 JSONL 儲存的暫行實作，寫入介面為 `ReportSink::submit(record, Option<DedupKey>)`，改用資料庫（A1）時以唯一索引取代（A5）。
-- 補送的歷史資料一律接受，`ts` 原樣保存；`agents.json` 的 `last_report` 不會被較舊的補送資料蓋過（A5）。
-- 上線日誌註明「durable：report 可補送、去重」（A5）。
+- 新增 `kairos/STORAGE.md`（發佈包內附）：架構、`ack` 語意、schema 與遷移、批次策略、去重、取樣時間與遲到資料、保留期限與 Pulse 緩衝的關係、主機清冊、彙總、保留與容量上限、設定、容量估算公式與表、吞吐量量測（含補送尖峰）、查詢範例、備份與還原、從 JSONL 升級。
+- README：設定表、資料輸出、檔案權限、專案結構、依賴與目前限制依 SQLite 與 durable 更新；INSTALL：資料目錄須為本機磁碟、確認清單加上 `kairos hosts list`、備份改用 `kairos db backup`、升級前備份與回滾、疑難排解。
 
 ### Pulse
 
 - 新增本機環狀緩衝 `[buffer]`（預設啟用）：取樣先寫進 `buffer/`，Kairos 確認後才刪除；重新連上後先依序補送積壓再送新的取樣，最多 4 筆在途、兩筆間隔至少 `replay_interval_ms`（預設 600 ms）；`storage_unavailable` 與結果不明時退避後重送，`invalid_report`／`bad_request` 丟棄（A5）。
 - 緩衝滿時丟最舊並計數記 `WARN`；超過 `max_age_hours`（預設 7 天）的不送出；每筆記錄有 CRC，啟動時截掉斷電造成的不完整尾端；不逐筆 fsync（最多每 10 秒）。Unix 上目錄 0750、檔案 0640，目錄權限過寬時記 `WARN`（Windows 檢查 ACL）（A5）。
 - 連上不支援 `durable` 的 Kairos 時，連線期間維持 at-most-once，緩衝中的積壓保留不送（A5）。
+- `pulse.service` 允許寫入 `buffer/`（`ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer`）；INSTALL 補上緩衝目錄的建立與升級步驟。
 
 ### 相容性（A5）
 
 | Kairos ＼ Pulse | Pulse 0.2.0 | Pulse 0.3.0（`buffer.enabled = true`） | Pulse 0.3.0（`buffer.enabled = false`） |
 |---|---|---|---|
 | Kairos 0.2.0 | 與 0.2.0 相同 | v2，不啟用 durable：連線期間 at-most-once；斷線期間的積壓保留在 Pulse，連上 0.3.0 的 Kairos 後才補送 | 與 0.2.0 相同 |
-| Kairos 0.3.0 | v2，不啟用 durable（與 0.2.0 相同；Pulse 不宣告 durable） | **v2＋durable：at-least-once** | 與 0.2.0 相同 |
+| Kairos 0.3.0 | v2，不啟用 durable（與 0.2.0 相同；Pulse 不宣告 durable）；資料寫入 SQLite | **v2＋durable：at-least-once** | 與 0.2.0 相同；資料寫入 SQLite |
 
-協定 v1（0.1.0 的任一端）時不使用 features，維持 at-most-once。升級順序不限；建議先升級 Kairos 再升級 Pulse，Pulse 升級後的第一次斷線就能補送（反過來時，Pulse 在 Kairos 升級前累積的積壓也會在 Kairos 升級後補送，只是會先佔用緩衝）。
+協定 v1（0.1.0 的任一端）時不使用 features，維持 at-most-once。
 
 ### 容量估算（A5，預設值）
 
 - 每台 Pulse 補送速率 1 ÷ 0.6 秒 ≈ 1.67 筆／秒（Kairos 的 report 速率限制為每秒 2 則、可連續 10 則，新連線先給 2 則，因此不會觸發限流或 `storage_unavailable`），扣掉同時產生的新取樣（每 5 秒 1 筆）後積壓以約 1.47 筆／秒減少：斷線 1 小時（720 筆）約 8 分鐘補完，24 小時（17,280 筆）約 3.3 小時補完。
-- 1 萬台同時恢復連線：Pulse 的重連隨機延遲（0～5 秒）與補送前的隨機延遲（0～5 秒）把開始時間攤開後，Kairos 的 report 寫入約 16,700 筆／秒（平常約 2,000 筆／秒，約 8.3 倍），以一筆約 1.5 KB 計約 25 MB／秒 的 JSONL 寫入，持續到各台補完。伺服器端不會無限積壓：每條連線最多 4 筆在途、Kairos 逐則處理；寫入跟不上時寫入佇列（1024 筆）滿、連線等待逾時回 `storage_unavailable`，Pulse 退避（2 秒加倍到 60 秒）後重送，整體自動放慢。需要壓低尖峰時調大 `buffer.replay_interval_ms`（例如 2000 ms → 約 5,000 筆／秒，24 小時的積壓約 13 小時補完）。
-- 補送的資料寫入收到當天的檔案，`storage.max_daily_bytes` 可能比平常更快達到；達到上限時回 `storage_unavailable`，資料留在 Pulse 的緩衝中，換日後繼續補送。
+- 1 萬台同時恢復連線：Pulse 的重連隨機延遲（0～5 秒）與補送前的隨機延遲（0～5 秒）把開始時間攤開後，Kairos 的 report 寫入約 16,700 筆／秒（平常約 2,000 筆／秒，約 8.3 倍），持續到各台補完。SQLite 在 kp-build（4 vCPU）上：每秒 8,000 筆持續 5 分鐘 p99 0.12 秒、沒有 `storage_unavailable`；每秒 16,000 筆在 60 秒內 p99 0.1 秒，持續 5 分鐘時資料庫變大、寫入跟不上，約 3% 的 report 在 5 秒後回 `storage_unavailable`，最長回應 5.05 秒，沒有結果不明，8 秒回應預算不受影響（STORAGE.md「量測」）。伺服器端不會無限積壓：每條連線最多 4 筆在途、Kairos 逐則處理；寫入跟不上時寫入佇列（1024 筆）滿、連線等待逾時回 `storage_unavailable`，Pulse 退避（2 秒加倍到 60 秒）後重送，整體自動放慢。需要壓低尖峰時調大 `buffer.replay_interval_ms`（例如 2000 ms → 約 5,000 筆／秒，24 小時的積壓約 13 小時補完）。
+- 補送的資料不增加長期的容量（補的是斷線期間本來就該有的資料）；寫 JSONL 時寫入收到當天的檔案，`storage.max_daily_bytes` 可能比平常更快達到（見上表第 8 項）。
+
+### 共用
+
+- 端對端測試（`tests/e2e`）改以預設的 SQLite 執行：report 以實際的 `kairos reports export` 從資料庫取出檢查，另檢查 JSONL 鏡像與資料庫一致、關機後 `kairos hosts list --json` 中主機為離線且帶主機資訊、重新啟動時從清冊載回主機。新增 durable 的端對端測試：Kairos 停機期間的取樣補送後不缺號、不重複；結果不明的重送與 Kairos 重新啟動後的重送都不重複。
+
+### 發佈與建置
+
+- 版本：`kairos`、`pulse` 改為 0.3.0；發佈包為 `kairos-0.3.0-<commit>-linux-x86_64.tar.gz`、`pulse-0.3.0-<commit>-linux-x86_64.tar.gz`。
+- 新增依賴 `rusqlite`（MIT，只啟用 `bundled`：編譯內附的 SQLite 原始碼，不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝）及其依賴 `libsqlite3-sys`（MIT）、`fallible-iterator`、`fallible-streaming-iterator`（MIT／Apache-2.0）、`pkg-config`、`vcpkg`（建置用，MIT／Apache-2.0）。SQLite 本身是 public domain（不需授權條款），`THIRD-PARTY-LICENSES` 另加註說明。`deny.toml`、`packaging/about.toml` 的授權允許清單不需變更（沒有新的授權種類；未啟用 rusqlite 的 `cache` feature，避免引入 Zlib 授權的 `foldhash`）。
+- Kairos 發佈包新增 `STORAGE.md`；Pulse 發佈包的 `pulse.service` 允許寫入 `buffer/`。
 
 ## [0.2.0] - 〔草稿：發佈日期待定〕
 

@@ -456,9 +456,11 @@ systemctl list-timers kairos-crl.timer
 
 **從 0.2 升級到 0.3：report 改寫 SQLite**。升級後 report 寫入 `data/kairos.db`，不再寫 `reports-*.jsonl`；直接讀 JSONL 的工具請先改用 `kairos reports export`，或在 `kairos.toml` 的 `[storage]` 加上 `jsonl_mirror = true`（同時寫兩份），或暫時設定 `backend = "jsonl"` 維持舊行為。既有的 JSONL 檔不會匯入資料庫，不開鏡像時也不會再被自動清除。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用（舊版會拒絕啟動）。詳見 `STORAGE.md`「從 JSONL（0.2）升級」。
 
+**從 0.2 升級到 0.3：先升級 Kairos，再升級 Pulse**。Pulse 0.3 預設啟用本機緩衝，與 Kairos 0.3 協商 `durable` 後，Kairos 停機或網路中斷期間的取樣會在恢復後補送（at-least-once），Kairos 以唯一索引去重。Kairos 先升級後，Pulse 升級後的第一次斷線就能補送；Pulse 0.2 連 Kairos 0.3 時與 0.2 相同（at-most-once）。Pulse 端要先建立 `buffer/` 目錄並換上新版 unit（Pulse 的 INSTALL 第 10 節）。補送的資料以 Pulse 的取樣時間保存與彙總，`kairos reports export` 的 `ts` 可能比 `recv_at` 早數小時到數天；縮短 `storage.raw_retention_days` 時請一併檢查 Pulse 的 `buffer.max_age_hours`（`STORAGE.md`「保留期限、Pulse 的 buffer.max_age_hours 與去重範圍」）。大量 Pulse 同時恢復連線時的寫入尖峰見 `STORAGE.md`「量測」。
+
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
-**升級順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。** 協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
+**從 0.1.x 升級時的順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。**（0.2 → 0.3 見上方，先升級 Kairos。）協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
 
 - 舊版 Pulse（`44dcee5` 及更早）連新版 Kairos 時，主機名稱含新版 Kairos 禁止的字元會**無法註冊**，心跳間隔較大時也可能誤斷線；新版 Pulse 連舊版 Kairos 沒有這類問題（舊版 Kairos 的 `timeouts.write_secs` 維持預設時）。先升級 Pulse 就不會經過有風險的組合。
 - 資料格式的改變與順序無關：Kairos 升級後 JSONL 每行多了 `schema`，新版 Pulse 連上後寫成 `schema` 2，讀取 JSONL 的工具要在升級 Kairos **前**改為依 `schema` 分流（`CHANGELOG.md` 破壞性變更第 6 項）。

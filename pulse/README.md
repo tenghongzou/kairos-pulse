@@ -407,7 +407,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 - **版本協商**：hello 送 `"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable"]`（舊版 Kairos 只看 `proto`；`buffer.enabled = false` 時不宣告 `durable`）。`hello_ack` 的 `proto` 是協商結果：1 → report 為三個欄位；2 且 Kairos 也宣告 `metrics` → report 為通用指標。`proto` 不在 1～2 時斷線並記 `ERROR`（`proto_mismatch`），Kairos 回 `unsupported_version` 時同樣以 `ERROR` 記錄（`message` 含 Kairos 支援的範圍）
 - **hello 的主機資訊**（v2，舊版 Kairos 忽略）：`host_fingerprint`（機器 ID 的 SHA-256，不送原始值，計算方式見 PROTOCOL.md「主機指紋」；Linux 讀 `/etc/machine-id`、Windows 讀 `MachineGuid`，讀不到時不送）、`display_name` 與 `tags`（設定 `agent.display_name`、`agent.tags`，未設定時不送）、`report_interval_ms`（`report.interval`）、`os`（sysinfo 取得的作業系統名稱、版本、核心版本與 CPU 架構）
 - **時鐘檢查**：v2 的 `hello_ack` 帶 Kairos 的 `server_time`，與本機時鐘相差超過 5 分鐘時記 `WARN`「本機時鐘比伺服器快／慢約 N 秒」（每次註冊最多一則），請檢查 NTP
-- `report` 的 `ack` 代表該筆資料已寫入伺服器的資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`（message 為 `report could not be stored`：寫入失敗或達到伺服器的每日檔案大小上限；或 `report rate limit exceeded`：同一來源送得太快）。Pulse 收到時記 `WARN`（節流，見「日誌」），連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連。協商了 `durable` 時這兩種情況的資料都留在本機緩衝、稍後重送（Kairos 去重，不會重複）；沒有協商時（舊版 Kairos 或停用本機緩衝），**該筆 report 視為未送達、不重送**
+- `report` 的 `ack` 代表該筆資料已寫入伺服器的資料庫或資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`（message 為 `report could not be stored`：寫入失敗或達到伺服器的每日檔案大小上限；或 `report rate limit exceeded`：同一來源送得太快）。Pulse 收到時記 `WARN`（節流，見「日誌」），連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連。協商了 `durable` 時這兩種情況的資料都留在本機緩衝、稍後重送（Kairos 去重，不會重複）；沒有協商時（舊版 Kairos 或停用本機緩衝），**該筆 report 視為未送達、不重送**
 - **沒有協商 `durable` 時同一時間只有一筆 report 在途**：送出 report 後，到收到伺服器對它（或之後的訊息）的回應（`ack` 或帶 `seq` 的 `error`，含 `storage_unavailable`）之前，新的取樣直接略過（記 `WARN`，節流，附這條連線已略過的次數）；斷線時清除。協商了 `durable` 時最多 4 筆在途（見「本機緩衝」）。兩種情況下伺服器寫檔緩慢時都不會在伺服器端無限積壓
 - Kairos 也可能回其他 `error`：
   - 收到 `hello_ack` **之前**收到任何 `error`（不論是否 fatal，例如 `bad_request`），Pulse 立即結束該連線並退避重連，不會等到 5 秒逾時；這次斷線以 `ERROR` 記錄錯誤碼與訊息
@@ -601,7 +601,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 ## 目前限制
 
 - 只回報 CPU 使用率與記憶體；磁碟、網路、溫度僅在啟動時印出到日誌，不會送給伺服器。
-- 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 重新啟動後的去重有範圍限制（見 PROTOCOL.md），極少數情況下可能重複寫入。
+- 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 的去重有範圍限制（SQLite 為原始資料保存的期間；`backend = "jsonl"` 為記憶體中的視窗，見 PROTOCOL.md 與 Kairos 的 STORAGE.md），極少數情況下可能重複寫入。`buffer.max_age_hours` 建議不超過 Kairos `storage.raw_retention_days` × 24。
 - 本機緩衝不加鎖：同一個 `buffer.dir` 只能由一個 Pulse 使用。
 - Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。

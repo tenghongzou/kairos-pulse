@@ -377,7 +377,7 @@ fn a_batch_is_one_transaction() {
 
 #[test]
 fn duplicate_dedup_keys_are_acknowledged_but_not_stored_twice() {
-    // 與 sprint2/durable 的契約：同一主機、同一 (boot_id, report_seq) 只保存一次，重複的回 Duplicate
+    // durable（A5）：同一主機、同一 (boot_id, report_seq) 只保存一次，重複的回 Duplicate
     let dir = temp_dir("dedup");
     let (mut store, _) = open(&dir, noon);
     let boot = "0b1c2d3e-0000-4000-8000-000000000001";

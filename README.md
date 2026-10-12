@@ -55,6 +55,7 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 |---|---|
 | `tests/session.rs` | mTLS 註冊（兩端日誌都寫出協商為協定 v2）→ heartbeat 收到 ack → report 寫入 SQLite（以實際的 `kairos reports export` 取出；`schema` 2 的通用指標，逐項檢查標準指標的名稱、單位與值），JSONL 鏡像與資料庫一致 → 兩端優雅關機（結束代碼 0、`close_notify`、最後的 `agents.json` 標記離線，並有 `proto` 2 與 hello 的主機資訊；`kairos hosts list --json` 的主機清冊中為離線、帶相同的主機資訊）；CRL 熱重載撤銷現役連線（Kairos 踢線、之後的握手被拒；Pulse 的日誌、stderr 與 Linux 上 sd_notify 的 `Status:`）；Kairos 停止後在同一連接埠重新啟動，從主機清冊載回主機，Pulse 自動重新註冊並繼續送 report |
 | `tests/compat.rs` | 協定 v1 相容：以假 client（`RawClient`，送出與舊版 0.1.0 Pulse 相同的 hello、heartbeat、report）與新版 Pulse 同時連同一個新版 Kairos。舊版得到與 v1 Kairos 相同的 `hello_ack`（`proto` 1，沒有 v2 欄位）與錯誤處理，匯出的 report 為 `schema` 1 且欄位與舊版的 JSONL 相同，新版為 `schema` 2，兩種格式也寫在同一個 JSONL 鏡像檔；`agents.json` 中 v1 的 agent 沒有主機資訊。新版 Pulse 沒有只用 v1 的設定，新版 Pulse 連舊版 Kairos 的方向由 Pulse 的單元測試涵蓋 |
+| `tests/durable.rs` | durable（at-least-once，A5）：Pulse 持續送資料時讓 Kairos 停機再啟動，停機期間的取樣補送後在 SQLite 中不缺號、不重複，收到時間（`recv_at`）比取樣時間（`ts`）晚；Kairos 已寫入、client 沒收到 `ack` 就斷線（結果不明）時重送只保存一次，Kairos 重新啟動後的重送也一樣（唯一索引） |
 | `tests/exit_codes.rs` | 兩端常駐模式啟動時的結束代碼（0、1、2、3、4、11，見下方「結束代碼」） |
 
 - 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。
