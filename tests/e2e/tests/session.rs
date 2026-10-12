@@ -26,6 +26,32 @@ fn seqs(lines: &[String], prefix: &str) -> BTreeSet<u64> {
         .collect()
 }
 
+/// report 的 CPU 使用率與記憶體總量／用量：`schema` 1 為三欄位，`schema` 2 取自標準指標
+fn cpu_and_memory(r: &serde_json::Value) -> (f64, u64, u64) {
+    if r["schema"] == 2 {
+        let metric = |name: &str| {
+            r["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["name"] == name)
+                .unwrap_or_else(|| panic!("缺少 {name}：{r}"))["value"]
+                .clone()
+        };
+        (
+            metric("system.cpu.usage").as_f64().unwrap(),
+            metric("system.memory.total").as_u64().unwrap(),
+            metric("system.memory.used").as_u64().unwrap(),
+        )
+    } else {
+        (
+            r["cpu_usage"].as_f64().unwrap(),
+            r["total_memory"].as_u64().unwrap(),
+            r["used_memory"].as_u64().unwrap(),
+        )
+    }
+}
+
 #[test]
 fn registers_heartbeats_reports_and_shuts_down_gracefully() {
     let root = TestDir::new("session");
@@ -58,10 +84,8 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
         assert!(!r["hostname"].as_str().unwrap().is_empty(), "{r}");
         assert!(!r["recv_at"].as_str().unwrap().is_empty(), "{r}");
         assert!(!r["ts"].as_str().unwrap().is_empty(), "{r}");
-        let cpu = r["cpu_usage"].as_f64().unwrap();
+        let (cpu, total, used) = cpu_and_memory(r);
         assert!((0.0..=100.0).contains(&cpu), "{r}");
-        let total = r["total_memory"].as_u64().unwrap();
-        let used = r["used_memory"].as_u64().unwrap();
         assert!(total > 0 && used <= total, "{r}");
         let seq = r["seq"].as_u64().unwrap();
         assert!(seq > last_seq, "seq 應遞增：{reports:?}");

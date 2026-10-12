@@ -2,11 +2,18 @@
 //!
 //! 兩個方向的訊息都同時實作序列化與反序列化：Kairos 解析 [`ClientMsg`]、送出 [`ServerMsg`]，
 //! Pulse 相反。解析時忽略未知欄位（不使用 `deny_unknown_fields`），以便日後擴充。
+//!
+//! v2 新增的欄位（hello 的版本範圍、features 與主機資訊；report 的 `metrics`）以
+//! [`HelloExt`]、[`ReportBody`] 收集，**解析時不會讓整則訊息失敗**：這些欄位型別錯誤時只記下
+//! 錯誤原因，由伺服器依協商結果決定是否使用。協商結果為 v1 時，v2 欄位與 v1 Kairos 一樣被忽略，
+//! v1 的行為（哪些訊息被接受、錯誤碼與 seq）因此不變。
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::fmt;
 use std::io::{Error, ErrorKind};
+
+use crate::metrics::Metric;
 
 /// 日誌中顯示無效 `proto` 原始值的長度上限（字元）
 pub(crate) const MAX_PROTO_DISPLAY_CHARS: usize = 32;
@@ -73,12 +80,253 @@ fn de_heartbeat_interval<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Erro
     }
 }
 
+/// hello 的版本協商欄位（v2，A3）。三者都可省略：省略 `proto_min`／`proto_max` 時，
+/// client 支援的範圍就是 `proto` 單一版本（v1 client 的行為）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtoOffer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_max: Option<u32>,
+    /// client 支援的選用功能（例如 [`FEATURE_METRICS`](crate::FEATURE_METRICS)）；不認得的名稱忽略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
+}
+
+/// hello 的作業系統資訊（v2）。各欄位都可省略，物件中的其他欄位忽略。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsInfo {
+    /// 作業系統名稱，例如 `Ubuntu`、`Windows`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 作業系統版本，例如 `24.04`、`11 (26200)`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// 核心版本，例如 `6.8.0-45-generic`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    /// CPU 架構，例如 `x86_64`、`aarch64`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+}
+
+impl OsInfo {
+    /// 所有欄位都沒有值
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.version.is_none()
+            && self.kernel.is_none()
+            && self.arch.is_none()
+    }
+}
+
+/// hello 的主機資訊（v2；設計包 `enrollment-ux.md` §12 #5、`screens.md` §24 #15）。
+/// 全部可省略；協商結果為 v1 時伺服器不讀取。限制見 [`validate_host_info`](crate::validate_host_info)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInfo {
+    /// 主機指紋（`<演算法>:<小寫十六進位>`，Pulse 為 `sha256:` 加 64 個字元），不含原始的機器 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fingerprint: Option<String>,
+    /// 主控台顯示名稱（未設定時以 `hostname` 顯示）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 標籤，例如 `env:prod`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// client 宣告的 report 間隔（毫秒），供伺服器判定回報延遲
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<OsInfo>,
+}
+
+/// 把 v2 欄位的各部分合併序列化到外層物件（搭配 `#[serde(flatten)]`）
+fn serialize_merged<S: Serializer>(
+    parts: &[Result<Value, String>],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::{Error as _, SerializeMap};
+    let mut map = s.serialize_map(None)?;
+    for part in parts {
+        match part {
+            Ok(Value::Object(fields)) => {
+                for (k, v) in fields {
+                    map.serialize_entry(k, v)?;
+                }
+            }
+            Ok(_) => return Err(S::Error::custom("v2 fields must serialize to an object")),
+            Err(e) => return Err(S::Error::custom(e)),
+        }
+    }
+    map.end()
+}
+
+/// 以 `T` 解析外層物件中其餘的欄位；失敗時保留錯誤說明，不讓整則訊息失敗
+fn parse_part<T: for<'a> Deserialize<'a>>(fields: &Value) -> Result<T, String> {
+    T::deserialize(fields).map_err(|e| e.to_string())
+}
+
+/// 序列化 v2 欄位的一部分；`Err`（解析失敗的內容）不能序列化
+fn to_part<T: Serialize>(part: &Result<T, String>) -> Result<Value, String> {
+    match part {
+        Ok(v) => serde_json::to_value(v).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("an invalid field cannot be serialized: {e}")),
+    }
+}
+
+/// hello 中 v1 以外的欄位（v2 的版本協商與主機資訊）。
+///
+/// 兩部分各自解析：型別錯誤只讓該部分變成 `Err`（內含錯誤說明），hello 本身仍可解析，
+/// 由伺服器依協商結果決定是否回 `bad_request`。`Err` 的部分不能序列化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloExt {
+    /// `proto_min`、`proto_max`、`features`
+    pub offer: Result<ProtoOffer, String>,
+    /// `host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`
+    pub host: Result<HostInfo, String>,
+}
+
+impl HelloExt {
+    /// v2 client 的 hello 欄位
+    pub fn new(offer: ProtoOffer, host: HostInfo) -> Self {
+        Self {
+            offer: Ok(offer),
+            host: Ok(host),
+        }
+    }
+}
+
+impl Default for HelloExt {
+    /// v1 hello：沒有任何 v2 欄位
+    fn default() -> Self {
+        Self::new(ProtoOffer::default(), HostInfo::default())
+    }
+}
+
+impl Serialize for HelloExt {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serialize_merged(&[to_part(&self.offer), to_part(&self.host)], s)
+    }
+}
+
+impl<'de> Deserialize<'de> for HelloExt {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let fields = Value::Object(Map::deserialize(d)?);
+        Ok(Self {
+            offer: parse_part(&fields),
+            host: parse_part(&fields),
+        })
+    }
+}
+
+/// v1 report 的三個欄位（v2 未協商 [`FEATURE_METRICS`](crate::FEATURE_METRICS) 時也使用）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyReport {
+    /// 全機 CPU 平均使用率（%，有限值、0～100）。
+    ///
+    /// 線上格式為 JSON 數字，型別統一為 f64（A14）：Pulse 以 f64 送出已四捨五入到小數 2 位的值
+    /// （f32 直接序列化會出現 `7.5000005` 這類精度雜訊）；Kairos 以
+    /// [`server_cpu_usage`](crate::server_cpu_usage) 轉成 f32 後驗證與保存，
+    /// 接受範圍與 JSONL 的輸出都與先前以 f32 反序列化時相同。
+    pub cpu_usage: f64,
+    /// 總記憶體（MB）
+    pub total_memory: u64,
+    /// 已使用記憶體（MB）
+    pub used_memory: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MetricsPart {
+    metrics: Vec<Metric>,
+}
+
+/// report 的內容：v1 的三個欄位與 v2 的 `metrics`，兩者各自解析。
+///
+/// 伺服器依連線協商的格式取用（[`ReportBody::legacy_fields`] 或 [`ReportBody::metric_list`]），
+/// 另一種格式的欄位一律忽略（與 v1 Kairos 忽略未知欄位相同）。序列化時只輸出 `Ok` 的部分。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportBody {
+    pub legacy: Result<LegacyReport, String>,
+    pub metrics: Result<Vec<Metric>, String>,
+}
+
+impl ReportBody {
+    /// v1 格式的 report 內容
+    pub fn legacy(cpu_usage: f64, total_memory: u64, used_memory: u64) -> Self {
+        Self {
+            legacy: Ok(LegacyReport {
+                cpu_usage,
+                total_memory,
+                used_memory,
+            }),
+            metrics: Err("missing field `metrics`".to_string()),
+        }
+    }
+
+    /// v2 通用指標格式的 report 內容
+    pub fn metrics(metrics: Vec<Metric>) -> Self {
+        Self {
+            legacy: Err("missing field `cpu_usage`".to_string()),
+            metrics: Ok(metrics),
+        }
+    }
+
+    /// v1 格式的欄位；缺漏或型別錯誤時回傳 `bad_request` 的說明
+    pub fn legacy_fields(&self) -> Result<&LegacyReport, String> {
+        self.legacy
+            .as_ref()
+            .map_err(|e| format!("invalid message: {e}"))
+    }
+
+    /// v2 的 `metrics`；缺漏或型別錯誤時回傳 `bad_request` 的說明
+    pub fn metric_list(&self) -> Result<&[Metric], String> {
+        self.metrics
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(|e| format!("invalid message: {e}"))
+    }
+}
+
+impl Serialize for ReportBody {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut parts = Vec::new();
+        if let Ok(legacy) = &self.legacy {
+            parts.push(serde_json::to_value(legacy).map_err(|e| e.to_string()));
+        }
+        if let Ok(metrics) = &self.metrics {
+            parts.push(
+                serde_json::to_value(MetricsPart {
+                    metrics: metrics.clone(),
+                })
+                .map_err(|e| e.to_string()),
+            );
+        }
+        if parts.is_empty() {
+            parts.push(Err(
+                "a report needs either the v1 fields or metrics".to_string()
+            ));
+        }
+        serialize_merged(&parts, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReportBody {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let fields = Value::Object(Map::deserialize(d)?);
+        Ok(Self {
+            legacy: parse_part(&fields),
+            metrics: parse_part::<MetricsPart>(&fields).map(|p| p.metrics),
+        })
+    }
+}
+
 /// Client（Pulse）→ Server（Kairos）訊息
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Hello {
         seq: u64,
+        /// v1 的版本欄位；v2 client 仍必須送出（v1 Kairos 只看這個欄位，見 PROTOCOL.md「版本協商」）
         #[serde(deserialize_with = "de_proto")]
         proto: Proto,
         agent_id: String,
@@ -87,6 +335,10 @@ pub enum ClientMsg {
         #[serde(deserialize_with = "de_heartbeat_interval")]
         heartbeat_interval_ms: u64,
         ts: String,
+        /// v2 欄位（v1 hello 為 [`HelloExt::default`]）。hello 每條連線只有一則，裝箱避免
+        /// 所有 [`ClientMsg`] 都佔用這部分的空間
+        #[serde(flatten)]
+        ext: Box<HelloExt>,
     },
     Heartbeat {
         seq: u64,
@@ -95,17 +347,8 @@ pub enum ClientMsg {
     Report {
         seq: u64,
         ts: String,
-        /// 全機 CPU 平均使用率（%，有限值、0～100）。
-        ///
-        /// 線上格式為 JSON 數字，型別統一為 f64（A14）：Pulse 以 f64 送出已四捨五入到小數 2 位的值
-        /// （f32 直接序列化會出現 `7.5000005` 這類精度雜訊）；Kairos 以
-        /// [`server_cpu_usage`](crate::server_cpu_usage) 轉成 f32 後驗證與保存，
-        /// 接受範圍與 JSONL 的輸出都與先前以 f32 反序列化時相同。
-        cpu_usage: f64,
-        /// 總記憶體（MB）
-        total_memory: u64,
-        /// 已使用記憶體（MB）
-        used_memory: u64,
+        #[serde(flatten)]
+        body: ReportBody,
     },
     /// 不認得的 `type`；`serde(other)` 只能用於 unit 變體，因此拿不到 seq。
     /// 只出現在解析結果中，不能序列化。
@@ -119,8 +362,15 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     HelloAck {
         seq: u64,
+        /// 協商出的版本（v1 Kairos 一律為 1）
         proto: u32,
         offline_after_ms: u64,
+        /// 伺服器支援的選用功能（v2；協商結果為 v1 時不送）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        features: Option<Vec<String>>,
+        /// 伺服器送出 hello_ack 時的時間，RFC 3339 UTC 毫秒（v2；協商結果為 v1 時不送）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_time: Option<String>,
     },
     Ack {
         seq: u64,
@@ -136,7 +386,28 @@ pub enum ServerMsg {
         message: String,
         #[serde(default = "fatal_by_default")]
         fatal: bool,
+        /// `unsupported_version` 時伺服器支援的版本範圍（v2 起的 Kairos；其他錯誤不送）。
+        /// 不是合法 u32 時視為沒有（不讓整則 error 無法解析）
+        #[serde(
+            default,
+            deserialize_with = "de_lenient_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
+        proto_min: Option<u32>,
+        #[serde(
+            default,
+            deserialize_with = "de_lenient_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
+        proto_max: Option<u32>,
     },
+}
+
+/// 寬鬆的 u32：不是合法 u32 的值（字串、負數、小數、null 等）視為 `None`
+fn de_lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(Value::deserialize(d)?
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok()))
 }
 
 /// error 訊息缺少 `fatal` 欄位時的預設值
@@ -234,6 +505,8 @@ impl ServerMsg {
             code: code.as_str().to_string(),
             message: message.into(),
             fatal,
+            proto_min: None,
+            proto_max: None,
         }
     }
 
@@ -315,8 +588,14 @@ pub fn parse_server_msg(line: &str) -> Result<ServerMsg, ServerMsgError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{ack_vector, client_vector, server_error_vector, server_vector};
-    use crate::{PROTO_VERSION, offline_after_ms, server_cpu_usage, validate_report};
+    use crate::tests::{
+        Ver, ack_vector, client_vector, client_vector_in, server_error_vector, server_vector,
+        server_vector_in,
+    };
+    use crate::{
+        PROTO_V1, SUPPORTED_PROTO, offline_after_ms, server_cpu_usage, unsupported_version_error,
+        validate_report,
+    };
     use serde_json::json;
 
     fn assert_server_msg(msg: &ServerMsg, vector: &str) {
@@ -342,6 +621,7 @@ mod tests {
             agent_version: "0.1.0".into(),
             heartbeat_interval_ms: 1000,
             ts: "2026-10-08T03:15:40.001Z".into(),
+            ext: Box::default(),
         }
     }
 
@@ -356,9 +636,7 @@ mod tests {
         ClientMsg::Report {
             seq: 6,
             ts: "2026-10-08T03:15:45.210Z".into(),
-            cpu_usage: 17.84,
-            total_memory: 49152,
-            used_memory: 37034,
+            body: ReportBody::legacy(17.84, 49152, 37034),
         }
     }
 
@@ -393,15 +671,17 @@ mod tests {
         assert_server_msg(
             &ServerMsg::HelloAck {
                 seq: 1,
-                proto: PROTO_VERSION,
+                proto: PROTO_V1,
                 offline_after_ms: offline_after_ms(1000),
+                features: None,
+                server_time: None,
             },
             server_vector("hello_ack"),
         );
         assert_server_msg(&ServerMsg::Ack { seq: 2 }, ack_vector(2));
         assert_server_msg(&ServerMsg::Ack { seq: 6 }, ack_vector(6));
         assert_server_msg(
-            &ServerMsg::error(Some(1), ErrorCode::UnsupportedVersion, "supported proto: 1"),
+            &unsupported_version_error(Some(1), SUPPORTED_PROTO),
             server_error_vector("unsupported_version"),
         );
         assert_server_msg(
@@ -442,10 +722,19 @@ mod tests {
             r#"{"seq":1}"#,                              // 缺 type
             r#"{"type":"heartbeat","seq":1}"#,           // 缺 ts
             r#"{"type":"heartbeat","seq":-1,"ts":"x"}"#, // seq 為負
-            r#"{"type":"report","seq":1,"ts":"x","cpu_usage":"high","total_memory":1,"used_memory":1}"#,
-            r#"{"type":"hello","seq":1,"proto":1}"#, // 欄位缺漏
+            r#"{"type":"report","seq":1,"cpu_usage":1,"total_memory":1,"used_memory":1}"#, // 缺 ts
+            r#"{"type":"hello","seq":1,"proto":1}"#,     // 欄位缺漏
         ] {
             assert!(parse_client_msg(line).is_err(), "應解析失敗: {line}");
+        }
+        // report 的內容欄位錯誤：可以解析（v2 欄位與 v1 欄位各自解析），由 validate_client_msg 與
+        // 協商後的格式檢查回 bad_request（見 report_body_is_parsed_per_format）
+        for line in [
+            r#"{"type":"report","seq":1,"ts":"x","cpu_usage":"high","total_memory":1,"used_memory":1}"#,
+            r#"{"type":"report","seq":1,"ts":"x"}"#,
+        ] {
+            let msg = parse_client_msg(line).unwrap();
+            assert!(crate::validate_client_msg(&msg).is_err(), "{line}");
         }
     }
 
@@ -527,15 +816,14 @@ mod tests {
     fn huge_cpu_value_becomes_infinite_and_is_rejected() {
         // 超出 f32 範圍的數字轉成伺服器端的 f32 後是 inf，必須被驗證擋下
         let line = r#"{"type":"report","seq":1,"ts":"x","cpu_usage":1e39,"total_memory":1,"used_memory":1}"#;
-        let Ok(ClientMsg::Report {
+        let Ok(ClientMsg::Report { body, .. }) = parse_client_msg(line) else {
+            panic!("應解析為 report");
+        };
+        let LegacyReport {
             cpu_usage,
             total_memory,
             used_memory,
-            ..
-        }) = parse_client_msg(line)
-        else {
-            panic!("應解析為 report");
-        };
+        } = body.legacy_fields().unwrap().clone();
         let cpu_usage = server_cpu_usage(cpu_usage);
         assert!(cpu_usage.is_infinite());
         assert!(validate_report(cpu_usage, total_memory, used_memory).is_err());
@@ -640,7 +928,9 @@ mod tests {
             ServerMsg::HelloAck {
                 seq: 1,
                 proto: 1,
-                offline_after_ms: 5000
+                offline_after_ms: 5000,
+                features: None,
+                server_time: None,
             }
         );
     }
@@ -662,8 +952,10 @@ mod tests {
             ServerMsg::Error {
                 seq: Some(1),
                 code: "unsupported_version".into(),
-                message: "supported proto: 1".into(),
-                fatal: true
+                message: "supported proto: 1-2".into(),
+                fatal: true,
+                proto_min: Some(1),
+                proto_max: Some(2),
             }
         );
 
@@ -674,7 +966,9 @@ mod tests {
                 seq: None,
                 code: "unknown_type".into(),
                 message: "unknown message type".into(),
-                fatal: false
+                fatal: false,
+                proto_min: None,
+                proto_max: None,
             }
         );
     }
@@ -690,7 +984,9 @@ mod tests {
                 seq: Some(3),
                 code: "auth_failed".into(),
                 message: String::new(),
-                fatal: true
+                fatal: true,
+                proto_min: None,
+                proto_max: None,
             }
         );
         let msg: ServerMsg = serde_json::from_str(r#"{"type":"error"}"#).unwrap();
@@ -700,7 +996,9 @@ mod tests {
                 seq: None,
                 code: String::new(),
                 message: String::new(),
-                fatal: true
+                fatal: true,
+                proto_min: None,
+                proto_max: None,
             }
         );
         // 明確給 fatal:false 時照給的值
@@ -775,6 +1073,8 @@ mod tests {
                 seq: 1,
                 proto: 1,
                 offline_after_ms: 5000,
+                features: None,
+                server_time: None,
             },
             ServerMsg::Ack { seq: 1 },
             ServerMsg::error(None, ErrorCode::BadRequest, "x"),
@@ -808,5 +1108,368 @@ mod tests {
         }
         assert_eq!(ErrorCode::from_code("Bad_Request"), None);
         assert_eq!(ErrorCode::from_code(""), None);
+    }
+
+    // ---- 協定 v2（A3、A4） ----
+
+    use crate::metrics::Metric;
+
+    /// 在 v1 hello 測試向量的結尾加上欄位
+    fn v1_hello_with(extra: &str) -> String {
+        let v1 = client_vector("hello");
+        format!("{},{extra}}}", &v1[..v1.len() - 1])
+    }
+
+    fn hello_ext(line: &str) -> HelloExt {
+        match parse_client_msg(line) {
+            Ok(ClientMsg::Hello { ext, .. }) => *ext,
+            other => panic!("應解析為 hello: {other:?}"),
+        }
+    }
+
+    fn report_body(line: &str) -> ReportBody {
+        match parse_client_msg(line) {
+            Ok(ClientMsg::Report { body, .. }) => body,
+            other => panic!("應解析為 report: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_hello_vector_parses_into_extension_fields() {
+        let ClientMsg::Hello {
+            proto, ext, seq, ..
+        } = parse_client_msg(client_vector_in(Ver::V2, "hello")).unwrap()
+        else {
+            panic!("應解析為 hello");
+        };
+        assert_eq!((seq, proto), (1, Proto::Version(1)));
+        assert_eq!(
+            ext.offer.unwrap(),
+            ProtoOffer {
+                proto_min: Some(1),
+                proto_max: Some(2),
+                features: Some(vec!["metrics".into()]),
+            }
+        );
+        let host = ext.host.unwrap();
+        assert_eq!(
+            host.host_fingerprint.as_deref(),
+            Some("sha256:355cf5ed40956a057645145cccf74f594102726167e94e3511aae182acc4ec43")
+        );
+        assert_eq!(host.display_name.as_deref(), Some("Web 01（正式環境）"));
+        assert_eq!(host.tags, Some(vec!["env:prod".into(), "team:web".into()]));
+        assert_eq!(host.report_interval_ms, Some(5000));
+        assert_eq!(
+            host.os,
+            Some(OsInfo {
+                name: Some("Ubuntu".into()),
+                version: Some("24.04".into()),
+                kernel: Some("6.8.0-45-generic".into()),
+                arch: Some("x86_64".into()),
+            })
+        );
+        assert!(crate::validate_host_info(&host).is_ok());
+    }
+
+    #[test]
+    fn v1_hello_has_empty_extension() {
+        assert_eq!(hello_ext(client_vector("hello")), HelloExt::default());
+        // v1 hello 序列化後不會多出任何欄位
+        let v: Value = serde_json::to_value(vector_hello()).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 8, "{v}");
+    }
+
+    #[test]
+    fn v2_hello_ack_and_report_vectors() {
+        assert_eq!(
+            parse_server_msg(server_vector_in(Ver::V2, "hello_ack")).unwrap(),
+            ServerMsg::HelloAck {
+                seq: 1,
+                proto: 2,
+                offline_after_ms: 75000,
+                features: Some(vec!["metrics".into()]),
+                server_time: Some("2026-10-08T03:15:40.012Z".into()),
+            }
+        );
+        let body = report_body(client_vector_in(Ver::V2, "report"));
+        // v2 report 沒有三欄位：v1 格式取不到，指標格式可以
+        assert!(body.legacy_fields().unwrap_err().contains("cpu_usage"));
+        let metrics = body.metric_list().unwrap();
+        assert_eq!(metrics.len(), 8);
+        assert_eq!(
+            metrics[0],
+            Metric::new(
+                "system.cpu.usage",
+                serde_json::Number::from_f64(17.84).unwrap(),
+                "%"
+            )
+        );
+        assert_eq!(metrics[1].value.as_u64(), Some(51_539_607_552));
+        assert_eq!(metrics[3].labels["mountpoint"], "/");
+        assert!(crate::validate_metrics(metrics).is_ok());
+        // v1 report：指標格式取不到
+        let body = report_body(client_vector("report"));
+        assert!(body.metric_list().unwrap_err().contains("metrics"));
+        assert_eq!(body.legacy_fields().unwrap().total_memory, 49152);
+    }
+
+    #[test]
+    fn v2_fields_with_wrong_types_do_not_break_the_hello() {
+        // 型別錯誤只讓該部分變成 Err，hello 本身仍可解析（由伺服器依協商結果決定是否拒絕）
+        let ext = hello_ext(&v1_hello_with(r#""display_name":42"#));
+        assert_eq!(ext.offer, Ok(ProtoOffer::default()));
+        assert!(ext.host.unwrap_err().contains("invalid type"));
+
+        let ext = hello_ext(&v1_hello_with(r#""proto_max":"2","tags":["a"]"#));
+        assert!(ext.offer.is_err());
+        assert_eq!(ext.host.unwrap().tags, Some(vec!["a".into()]));
+
+        for extra in [
+            r#""proto_min":-1,"proto_max":2"#,
+            r#""proto_min":1.5,"proto_max":2"#,
+            r#""features":"metrics""#,
+            r#""features":[1]"#,
+        ] {
+            assert!(hello_ext(&v1_hello_with(extra)).offer.is_err(), "{extra}");
+        }
+        for extra in [
+            r#""report_interval_ms":-1"#,
+            r#""report_interval_ms":"5000""#,
+            r#""tags":"prod""#,
+            r#""os":"linux""#,
+            r#""os":{"name":1}"#,
+            r#""host_fingerprint":true"#,
+        ] {
+            assert!(hello_ext(&v1_hello_with(extra)).host.is_err(), "{extra}");
+        }
+        // null 視同省略；os 中的其他欄位忽略
+        let ext = hello_ext(&v1_hello_with(
+            r#""proto_min":null,"display_name":null,"os":{"name":"Debian","extra":[1]}"#,
+        ));
+        assert_eq!(ext.offer, Ok(ProtoOffer::default()));
+        assert_eq!(
+            ext.host.unwrap().os.unwrap().name.as_deref(),
+            Some("Debian")
+        );
+        // 解析失敗的部分不能序列化
+        let mut hello = vector_hello();
+        if let ClientMsg::Hello { ext, .. } = &mut hello {
+            ext.host = Err("x".into());
+        }
+        assert!(serde_json::to_string(&hello).is_err());
+    }
+
+    #[test]
+    fn report_formats_are_parsed_independently() {
+        // 三欄位正確、metrics 型別錯誤：v1 格式可用（v1 Kairos 也會忽略 metrics）
+        let v1 = client_vector("report");
+        let line = format!(r#"{},"metrics":5}}"#, &v1[..v1.len() - 1]);
+        let body = report_body(&line);
+        assert!(body.legacy_fields().is_ok());
+        assert!(body.metric_list().is_err());
+        assert!(crate::validate_client_msg(&parse_client_msg(&line).unwrap()).is_ok());
+        // metrics 正確、三欄位型別錯誤：指標格式可用
+        let line = r#"{"type":"report","seq":1,"ts":"x","cpu_usage":"high","metrics":[{"name":"a.b","value":1,"unit":"1"}]}"#;
+        let body = report_body(line);
+        assert!(body.legacy_fields().is_err());
+        assert_eq!(body.metric_list().unwrap().len(), 1);
+        assert!(crate::validate_client_msg(&parse_client_msg(line).unwrap()).is_ok());
+        // 兩者都不行：validate_client_msg 回 v1 格式的錯誤說明（與 v1 Kairos 相同）
+        let line = r#"{"type":"report","seq":1,"ts":"x","total_memory":1,"used_memory":1}"#;
+        let err = crate::validate_client_msg(&parse_client_msg(line).unwrap()).unwrap_err();
+        assert!(err.contains("missing field `cpu_usage`"), "{err}");
+        // 只輸出 Ok 的部分；兩者都不是 Ok 時不能序列化
+        let v = serde_json::to_value(ClientMsg::Report {
+            seq: 1,
+            ts: "t".into(),
+            body: ReportBody::metrics(vec![Metric::new("a.b", 1, "1")]),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"type":"report","seq":1,"ts":"t","metrics":[{"name":"a.b","value":1,"unit":"1"}]})
+        );
+        let empty = ClientMsg::Report {
+            seq: 1,
+            ts: "t".into(),
+            body: ReportBody {
+                legacy: Err("x".into()),
+                metrics: Err("y".into()),
+            },
+        };
+        assert!(serde_json::to_string(&empty).is_err());
+    }
+
+    #[test]
+    fn error_proto_range_is_lenient() {
+        // Pulse 解析 error 時容忍欄位問題：proto_min／proto_max 不是 u32 時視為沒有
+        let msg = parse_server_msg(
+            r#"{"type":"error","seq":1,"code":"unsupported_version","message":"m","fatal":true,"proto_min":"1","proto_max":-2}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            msg,
+            ServerMsg::Error {
+                proto_min: None,
+                proto_max: None,
+                ..
+            }
+        ));
+        // 其他錯誤不輸出這兩個欄位
+        let v = serde_json::to_value(ServerMsg::error(None, ErrorCode::BadRequest, "m")).unwrap();
+        assert!(
+            v.get("proto_min").is_none() && v.get("proto_max").is_none(),
+            "{v}"
+        );
+    }
+
+    /// 凍結的 v1 型別定義（v1 Kairos 與 v1 Pulse 實際使用的 serde 定義，沒有 `deny_unknown_fields`），
+    /// 用來確認舊版看到 v2 欄位時的行為。不要隨協定修改。
+    mod frozen_v1 {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        pub enum ClientMsg {
+            Hello {
+                seq: u64,
+                proto: serde_json::Value,
+                agent_id: String,
+                hostname: String,
+                agent_version: String,
+                heartbeat_interval_ms: serde_json::Value,
+                ts: String,
+            },
+            Heartbeat {
+                seq: u64,
+                ts: String,
+            },
+            Report {
+                seq: u64,
+                ts: String,
+                cpu_usage: f32,
+                total_memory: u64,
+                used_memory: u64,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        pub enum ServerMsg {
+            HelloAck {
+                seq: u64,
+                proto: u32,
+                offline_after_ms: u64,
+            },
+            Ack {
+                seq: u64,
+            },
+            Error {
+                #[serde(default)]
+                seq: Option<u64>,
+                #[serde(default)]
+                code: String,
+                #[serde(default)]
+                message: String,
+                #[serde(default = "yes")]
+                fatal: bool,
+            },
+        }
+
+        fn yes() -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn v1_kairos_accepts_the_v2_hello_as_v1() {
+        // 新 Pulse ↔ 舊 Kairos：v1 Kairos 只檢查 proto == 1，v2 欄位被忽略
+        let v2_hello = client_vector_in(Ver::V2, "hello");
+        match serde_json::from_str::<frozen_v1::ClientMsg>(v2_hello).unwrap() {
+            frozen_v1::ClientMsg::Hello {
+                proto, hostname, ..
+            } => {
+                assert_eq!(proto, json!(1));
+                assert_eq!(hostname, "web-01");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 舊 Kairos 回的 hello_ack 就是 v1 向量；新 Pulse 解析為 proto 1、沒有 v2 欄位
+        assert_eq!(
+            parse_server_msg(server_vector("hello_ack")).unwrap(),
+            ServerMsg::HelloAck {
+                seq: 1,
+                proto: 1,
+                offline_after_ms: 5000,
+                features: None,
+                server_time: None,
+            }
+        );
+        // 新 Pulse 在 v1 連線送出的 report 就是 v1 向量，舊 Kairos 可解析
+        assert!(matches!(
+            serde_json::from_str::<frozen_v1::ClientMsg>(client_vector("report")).unwrap(),
+            frozen_v1::ClientMsg::Report { seq: 6, .. }
+        ));
+        // 反過來，v2 的 metrics report 在舊 Kairos 是欄位缺漏（新 Pulse 不會在 v1 連線送出）
+        assert!(
+            serde_json::from_str::<frozen_v1::ClientMsg>(client_vector_in(Ver::V2, "report"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v1_pulse_ignores_v2_fields_in_server_messages() {
+        // 新 Kairos 只在協商為 v2 時送出這些欄位；即使送到 v1 Pulse，多出的欄位也會被忽略
+        assert_eq!(
+            serde_json::from_str::<frozen_v1::ServerMsg>(server_vector_in(Ver::V2, "hello_ack"))
+                .unwrap(),
+            frozen_v1::ServerMsg::HelloAck {
+                seq: 1,
+                proto: 2,
+                offline_after_ms: 75000
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<frozen_v1::ServerMsg>(server_error_vector(
+                "unsupported_version"
+            ))
+            .unwrap(),
+            frozen_v1::ServerMsg::Error {
+                seq: Some(1),
+                code: "unsupported_version".into(),
+                message: "supported proto: 1-2".into(),
+                fatal: true
+            }
+        );
+    }
+
+    #[test]
+    fn v1_pulse_hello_is_a_v1_hello_for_the_new_server() {
+        // 舊 Pulse ↔ 新 Kairos：舊版 hello（v1 向量）沒有任何 v2 欄位，協商範圍為 [1, 1]
+        let ClientMsg::Hello { proto, ext, .. } = parse_client_msg(client_vector("hello")).unwrap()
+        else {
+            panic!("應解析為 hello");
+        };
+        let range = crate::client_proto_range(&proto, &ext.offer).unwrap();
+        assert_eq!(crate::negotiate(range, SUPPORTED_PROTO), Some(PROTO_V1));
+        // 新 Pulse 的 hello：協商為 v2
+        let ClientMsg::Hello { proto, ext, .. } =
+            parse_client_msg(client_vector_in(Ver::V2, "hello")).unwrap()
+        else {
+            panic!("應解析為 hello");
+        };
+        let range = crate::client_proto_range(&proto, &ext.offer).unwrap();
+        assert_eq!(
+            crate::negotiate(range, SUPPORTED_PROTO),
+            Some(crate::PROTO_V2)
+        );
+        // 新 Pulse 的 hello 遇到只支援 v1 的伺服器：協商為 v1
+        assert_eq!(
+            crate::negotiate(range, crate::ProtoRange { min: 1, max: 1 }),
+            Some(PROTO_V1)
+        );
     }
 }

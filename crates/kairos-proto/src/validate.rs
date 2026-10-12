@@ -1,11 +1,15 @@
-//! 欄位限制與驗證：agent_id、顯示用字串的禁止字元、hello／`ts`／report、心跳與離線門檻。
+//! 欄位限制與驗證：agent_id、顯示用字串的禁止字元、hello（含 v2 的 features 與主機資訊）、
+//! `ts`、report（v1 三欄位；v2 的指標見 `metrics` 模組）、心跳與離線門檻。
 //!
 //! Kairos 用這些函式判定是否回 `bad_request` / `invalid_report`；Pulse 用同一份規則在送出前
 //! 整理 hostname、檢查 agent_id，兩邊不會再因各自維護一份表而不一致（R2-K23）。
 
 use crate::{
-    ClientMsg, MAX_AGENT_VERSION_BYTES, MAX_HEARTBEAT_INTERVAL_MS, MAX_HOSTNAME_BYTES,
-    MAX_TS_BYTES, MIN_HEARTBEAT_INTERVAL_MS, MIN_OFFLINE_AFTER_MS, OFFLINE_HEARTBEAT_MULTIPLIER,
+    ClientMsg, HostInfo, MAX_AGENT_VERSION_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_FEATURE_BYTES,
+    MAX_FEATURES, MAX_HEARTBEAT_INTERVAL_MS, MAX_HOST_FINGERPRINT_BYTES, MAX_HOSTNAME_BYTES,
+    MAX_OS_FIELD_BYTES, MAX_REPORT_INTERVAL_MS, MAX_TAG_BYTES, MAX_TAGS, MAX_TS_BYTES,
+    MIN_HEARTBEAT_INTERVAL_MS, MIN_OFFLINE_AFTER_MS, MIN_REPORT_INTERVAL_MS,
+    OFFLINE_HEARTBEAT_MULTIPLIER,
 };
 
 /// 將 client 宣告的心跳間隔夾在 [`MIN_HEARTBEAT_INTERVAL_MS`]..=[`MAX_HEARTBEAT_INTERVAL_MS`]
@@ -129,7 +133,11 @@ pub fn is_forbidden_display_char(c: char) -> bool {
 }
 
 /// 檢查顯示用字串：長度 1..=max bytes，且不得含控制、格式、行／段落分隔字元（避免日誌注入）
-fn validate_display_text(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+pub(crate) fn validate_display_text(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
     if value.is_empty() || value.len() > max_bytes {
         return Err(format!(
             "{} must be 1..={} bytes (got {})",
@@ -157,14 +165,129 @@ pub fn validate_hello(agent_id: &str, hostname: &str, agent_version: &str) -> Re
     Ok(())
 }
 
-/// 解析後、依狀態處理前的共通驗證（違反時回 `bad_request`）：`ts` 最長 64 bytes，
-/// 且不得含 [`is_forbidden_display_char`] 的字元（`ts` 會原樣寫入 JSONL 與 agents.json；R2-K8）。
-/// 不要求 RFC 3339：規格只把 `ts` 定義為參考用字串，伺服器不解析它。
+/// 把字串整理成符合顯示用字串限制的形式（Pulse 送出前使用，規則與伺服器的驗證相同）：
+/// 去除前後空白，[`is_forbidden_display_char`] 的字元替換成 `?`，超過 `max_bytes` 時在字元邊界截斷。
+/// 結果為空時回傳 `None`（呼叫端省略該欄位）。
+pub fn sanitize_display_text(text: &str, max_bytes: usize) -> Option<String> {
+    let mut out = String::with_capacity(text.len().min(max_bytes));
+    for c in text.trim().chars() {
+        let c = if is_forbidden_display_char(c) { '?' } else { c };
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    let out = out.trim_end().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// `host_fingerprint` 的格式：`<演算法>:<十六進位>`，演算法為 1～16 個小寫英文字母或數字，
+/// 十六進位為 32～128 個小寫字元（偶數個），總長最多 [`MAX_HOST_FINGERPRINT_BYTES`] bytes。
+/// Pulse 送出 `sha256:` 加 64 個字元（計算方式見 PROTOCOL.md「主機指紋」）。
+pub fn is_host_fingerprint(s: &str) -> bool {
+    let Some((alg, hex)) = s.split_once(':') else {
+        return false;
+    };
+    s.len() <= MAX_HOST_FINGERPRINT_BYTES
+        && (1..=16).contains(&alg.len())
+        && alg.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'))
+        && (32..=128).contains(&hex.len())
+        && hex.len() % 2 == 0
+        && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// v2 hello 的 `features`（違反時回 `bad_request`）：最多 [`MAX_FEATURES`] 項，每項 1～64 bytes，
+/// 小寫英文字母或數字開頭，其後為小寫英文字母、數字或 `_ . -`。不認得的名稱不是錯誤（忽略）。
+pub fn validate_features(features: &[String]) -> Result<(), String> {
+    if features.len() > MAX_FEATURES {
+        return Err(format!(
+            "features must have at most {MAX_FEATURES} entries (got {})",
+            features.len()
+        ));
+    }
+    let valid = |f: &str| {
+        let mut bytes = f.bytes();
+        f.len() <= MAX_FEATURE_BYTES
+            && matches!(bytes.next(), Some(b'a'..=b'z' | b'0'..=b'9'))
+            && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-'))
+    };
+    match features.iter().find(|f| !valid(f)) {
+        Some(_) => Err(format!(
+            "each feature must be 1..={MAX_FEATURE_BYTES} bytes of lowercase letters, digits, _ . or -"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// v2 hello 的主機資訊（違反時回 `bad_request`；只在協商結果為 v2 時檢查）。
+/// 顯示用字串的字元限制同 `hostname`（[`is_forbidden_display_char`]）：
+/// - `host_fingerprint`：[`is_host_fingerprint`]
+/// - `display_name`：1～[`MAX_DISPLAY_NAME_BYTES`] bytes
+/// - `tags`：最多 [`MAX_TAGS`] 個，每個 1～[`MAX_TAG_BYTES`] bytes，不得重複
+/// - `report_interval_ms`：[`MIN_REPORT_INTERVAL_MS`]～[`MAX_REPORT_INTERVAL_MS`]
+/// - `os` 的 `name`／`version`／`kernel`／`arch`：各 1～[`MAX_OS_FIELD_BYTES`] bytes
+pub fn validate_host_info(host: &HostInfo) -> Result<(), String> {
+    if let Some(fp) = &host.host_fingerprint
+        && !is_host_fingerprint(fp)
+    {
+        return Err(
+            "host_fingerprint must be <algorithm>:<lowercase hex>, e.g. sha256:<64 hex digits>"
+                .to_string(),
+        );
+    }
+    if let Some(name) = &host.display_name {
+        validate_display_text("display_name", name, MAX_DISPLAY_NAME_BYTES)?;
+    }
+    if let Some(tags) = &host.tags {
+        if tags.len() > MAX_TAGS {
+            return Err(format!(
+                "tags must have at most {MAX_TAGS} entries (got {})",
+                tags.len()
+            ));
+        }
+        for (i, tag) in tags.iter().enumerate() {
+            validate_display_text("each tag", tag, MAX_TAG_BYTES)?;
+            if tags[..i].contains(tag) {
+                return Err("tags must not contain duplicates".to_string());
+            }
+        }
+    }
+    if let Some(ms) = host.report_interval_ms
+        && !(MIN_REPORT_INTERVAL_MS..=MAX_REPORT_INTERVAL_MS).contains(&ms)
+    {
+        return Err(format!(
+            "report_interval_ms must be {MIN_REPORT_INTERVAL_MS}..={MAX_REPORT_INTERVAL_MS} (got {ms})"
+        ));
+    }
+    if let Some(os) = &host.os {
+        for (field, value) in [
+            ("os.name", &os.name),
+            ("os.version", &os.version),
+            ("os.kernel", &os.kernel),
+            ("os.arch", &os.arch),
+        ] {
+            if let Some(value) = value {
+                validate_display_text(field, value, MAX_OS_FIELD_BYTES)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 解析後、依狀態處理前的共通驗證（違反時回 `bad_request`）：
+/// - `ts` 最長 64 bytes，且不得含 [`is_forbidden_display_char`] 的字元（`ts` 會原樣寫入 JSONL 與
+///   agents.json；R2-K8）。不要求 RFC 3339：規格只把 `ts` 定義為參考用字串，伺服器不解析它。
+/// - report 至少要符合一種格式（v1 三欄位或 v2 的 `metrics`）的型別；兩者都不符時回傳 v1 格式的
+///   錯誤說明（與 v1 Kairos 相同）。連線實際使用哪一種格式由協商結果決定，在註冊後檢查。
 pub fn validate_client_msg(msg: &ClientMsg) -> Result<(), String> {
     let ts = match msg {
-        ClientMsg::Hello { ts, .. }
-        | ClientMsg::Heartbeat { ts, .. }
-        | ClientMsg::Report { ts, .. } => ts,
+        ClientMsg::Hello { ts, .. } | ClientMsg::Heartbeat { ts, .. } => ts,
+        ClientMsg::Report { ts, body, .. } => {
+            if body.legacy.is_err() && body.metrics.is_err() {
+                body.legacy_fields()?;
+            }
+            ts
+        }
         ClientMsg::Unknown => return Ok(()),
     };
     if ts.len() > MAX_TS_BYTES {
@@ -420,9 +543,7 @@ mod tests {
         let report = ClientMsg::Report {
             seq: 1,
             ts: ts_bad.clone(),
-            cpu_usage: 1.0,
-            total_memory: 1,
-            used_memory: 1,
+            body: crate::ReportBody::legacy(1.0, 1, 1),
         };
         assert!(validate_client_msg(&report).is_err());
         let hello = parse_client_msg(&format!(
@@ -569,5 +690,161 @@ mod tests {
         }
         // f32 精度下 100.000001 等於 100.0，仍被接受（與合併前的 Kairos 相同）
         assert!(validate_report(server_cpu_usage(100.000001), 1, 1).is_ok());
+    }
+
+    // ---- 協定 v2 的 hello 欄位 ----
+
+    use crate::{HostInfo, OsInfo};
+
+    #[test]
+    fn host_fingerprint_format() {
+        let hex64 = "0123456789abcdef".repeat(4);
+        assert!(is_host_fingerprint(&format!("sha256:{hex64}")));
+        assert!(is_host_fingerprint(&format!("x:{}", "ab".repeat(16))));
+        assert!(is_host_fingerprint(&format!(
+            "{}:{}",
+            "a".repeat(16),
+            "ab".repeat(64)
+        )));
+        for bad in [
+            String::new(),
+            hex64.clone(),                              // 沒有演算法
+            format!(":{hex64}"),                        // 演算法為空
+            format!("SHA256:{hex64}"),                  // 大寫
+            format!("sha-256:{hex64}"),                 // 演算法含 -
+            format!("sha256:{}", hex64.to_uppercase()), // 大寫十六進位
+            format!("sha256:{}", &hex64[..63]),         // 奇數個
+            format!("sha256:{}", "ab".repeat(15)),      // 太短
+            format!("sha256:{}", "ab".repeat(65)),      // 太長
+            format!("{}:{}", "a".repeat(17), "ab".repeat(16)),
+            format!("sha256:{}g", &hex64[..63]),
+            format!("sha256:{hex64}:00"),
+            format!("sha256: {hex64}"),
+        ] {
+            assert!(!is_host_fingerprint(&bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn features_limits() {
+        let f =
+            |v: &[&str]| validate_features(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(f(&[]).is_ok());
+        assert!(f(&["metrics", "future.thing-2", "x_y", "9lives"]).is_ok());
+        assert!(f(&[&"a".repeat(MAX_FEATURE_BYTES)]).is_ok());
+        for bad in [
+            "",
+            "Metrics",
+            "-x",
+            "_x",
+            "a b",
+            "名",
+            &"a".repeat(MAX_FEATURE_BYTES + 1),
+        ] {
+            assert!(f(&[bad]).is_err(), "{bad:?}");
+        }
+        let many: Vec<String> = (0..MAX_FEATURES).map(|i| format!("f{i}")).collect();
+        assert!(validate_features(&many).is_ok());
+        let mut too_many = many;
+        too_many.push("x".into());
+        assert!(validate_features(&too_many).is_err());
+    }
+
+    #[test]
+    fn host_info_limits() {
+        assert!(validate_host_info(&HostInfo::default()).is_ok());
+        let ok = |h: HostInfo| assert!(validate_host_info(&h).is_ok(), "{h:?}");
+        let bad = |h: HostInfo| assert!(validate_host_info(&h).is_err(), "{h:?}");
+        let name = |s: &str| HostInfo {
+            display_name: Some(s.into()),
+            ..Default::default()
+        };
+        ok(name("Web 01（正式環境）"));
+        ok(name(&"主".repeat(85)));
+        bad(name(""));
+        bad(name(&"n".repeat(MAX_DISPLAY_NAME_BYTES + 1)));
+        bad(name("a\u{202e}b"));
+        bad(name("a\nb"));
+
+        let tags = |v: Vec<String>| HostInfo {
+            tags: Some(v),
+            ..Default::default()
+        };
+        ok(tags(vec![]));
+        ok(tags(vec!["env:prod".into(), "Env:prod".into()]));
+        ok(tags((0..MAX_TAGS).map(|i| format!("t{i}")).collect()));
+        bad(tags((0..=MAX_TAGS).map(|i| format!("t{i}")).collect()));
+        bad(tags(vec!["a".into(), "a".into()]));
+        bad(tags(vec![String::new()]));
+        bad(tags(vec!["t".repeat(MAX_TAG_BYTES + 1)]));
+        ok(tags(vec!["t".repeat(MAX_TAG_BYTES)]));
+        bad(tags(vec!["a\u{200b}".into()]));
+
+        let interval = |ms| HostInfo {
+            report_interval_ms: Some(ms),
+            ..Default::default()
+        };
+        ok(interval(MIN_REPORT_INTERVAL_MS));
+        ok(interval(MAX_REPORT_INTERVAL_MS));
+        bad(interval(MIN_REPORT_INTERVAL_MS - 1));
+        bad(interval(MAX_REPORT_INTERVAL_MS + 1));
+        bad(interval(0));
+
+        let os = |o: OsInfo| HostInfo {
+            os: Some(o),
+            ..Default::default()
+        };
+        ok(os(OsInfo::default()));
+        ok(os(OsInfo {
+            name: Some("Windows".into()),
+            version: Some("11 (26200)".into()),
+            kernel: Some("26200".into()),
+            arch: Some("x86_64".into()),
+        }));
+        bad(os(OsInfo {
+            arch: Some(String::new()),
+            ..Default::default()
+        }));
+        bad(os(OsInfo {
+            version: Some("v".repeat(MAX_OS_FIELD_BYTES + 1)),
+            ..Default::default()
+        }));
+        bad(os(OsInfo {
+            kernel: Some("k\u{0}".into()),
+            ..Default::default()
+        }));
+
+        bad(HostInfo {
+            host_fingerprint: Some("md5".into()),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn sanitized_display_text_passes_validation() {
+        assert_eq!(
+            sanitize_display_text("  Ubuntu \n", 128).as_deref(),
+            Some("Ubuntu")
+        );
+        assert_eq!(
+            sanitize_display_text("a\u{202e}b\nc", 128).as_deref(),
+            Some("a?b?c")
+        );
+        assert_eq!(sanitize_display_text("", 10), None);
+        assert_eq!(sanitize_display_text(" \t\r\n", 10), None);
+        // 截斷在字元邊界，且結果不超過上限
+        assert_eq!(
+            sanitize_display_text("主機名稱", 7).as_deref(),
+            Some("主機")
+        );
+        assert_eq!(sanitize_display_text("ab cd", 3).as_deref(), Some("ab"));
+        for raw in ["web\u{3164}01", "x\u{fe0f}", "\u{e000}", &"長".repeat(200)] {
+            if let Some(s) = sanitize_display_text(raw, MAX_OS_FIELD_BYTES) {
+                assert!(
+                    validate_display_text("f", &s, MAX_OS_FIELD_BYTES).is_ok(),
+                    "{raw:?} → {s:?}"
+                );
+            }
+        }
     }
 }

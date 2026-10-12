@@ -1,11 +1,20 @@
 use log::{debug, info};
+use std::collections::HashSet;
 use std::time::Duration;
 use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant, MissedTickBehavior};
 
+use kairos_proto::{
+    MAX_LABEL_VALUE_BYTES, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL,
+    METRIC_NETWORK_RECEIVED, METRIC_NETWORK_TRANSMITTED, METRIC_TEMPERATURE, Metric,
+    sanitize_display_text,
+};
+
 use crate::log_throttle::LogThrottle;
 use crate::protocol::{is_forbidden_display_char, now_ts};
+
+pub mod host;
 
 /// 一個 MB 的位元組數，用來把 sysinfo 回傳的 bytes 換算成 MB。
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -21,6 +30,156 @@ pub struct Sample {
     pub total_memory: u64,
     /// 已使用記憶體（MB）
     pub used_memory: u64,
+    /// 總記憶體（bytes；協定 v2 的 `system.memory.total`）
+    pub total_memory_bytes: u64,
+    /// 已使用記憶體（bytes；協定 v2 的 `system.memory.used`）
+    pub used_memory_bytes: u64,
+    /// 磁碟、網路與溫度的指標（A4；只在協定 v2 協商了 `metrics` 時送出，v1 不送）
+    pub extra: Vec<Metric>,
+}
+
+/// 每次 report 最多送出的磁碟、網路介面與溫度感測器數（各自計算）。
+/// 合計最多 2 × 32 + 2 × 32 + 32 = 160 個，加上 CPU 與記憶體共 163 個，低於協定上限 256
+const MAX_REPORTED_DISKS: usize = 32;
+const MAX_REPORTED_INTERFACES: usize = 32;
+const MAX_REPORTED_SENSORS: usize = 32;
+
+/// label 值：整理成符合協定限制的字串（禁止字元換成 `?`、截到 256 bytes），空的回傳 `None`
+fn label_value(raw: &str) -> Option<String> {
+    sanitize_display_text(raw, MAX_LABEL_VALUE_BYTES)
+}
+
+/// 數值四捨五入到小數 2 位（避免 f32 轉 f64 的精度雜訊，例如 `47.83000183105469`）
+fn round2(v: f32) -> Option<serde_json::Number> {
+    serde_json::Number::from_f64((f64::from(v) * 100.0).round() / 100.0)
+}
+
+/// 磁碟、網路與溫度的指標（A4）。篩選規則與啟動時的 INFO 清單相同：略過虛擬檔案系統、容量為 0
+/// 與同一磁碟的重複掛載點，略過迴路與虛擬網路介面，略過讀不到溫度的感測器；
+/// 各類最多 [`MAX_REPORTED_DISKS`] 等個數，同一個 label 只送第一個。
+fn extra_metrics(
+    disks: Vec<DiskEntry>,
+    interfaces: &[(String, u64, u64)],
+    temperatures: &[(String, Option<f32>)],
+) -> Vec<Metric> {
+    let mut out = Vec::new();
+
+    let meaningful = disks
+        .into_iter()
+        .filter(|d| is_meaningful_disk(&d.file_system, d.total_space))
+        .collect();
+    let (kept, _) = dedupe_disks(meaningful);
+    let mut seen = HashSet::new();
+    for disk in kept {
+        let Some(mount) = label_value(&disk.mount_point) else {
+            continue;
+        };
+        if !seen.insert(mount.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_REPORTED_DISKS {
+            break;
+        }
+        let with_labels = |m: Metric| {
+            let m = m.with_label("mountpoint", mount.clone());
+            match label_value(&disk.file_system) {
+                Some(fs) => m.with_label("fstype", fs),
+                None => m,
+            }
+        };
+        out.push(with_labels(Metric::new(
+            METRIC_FILESYSTEM_TOTAL,
+            disk.total_space,
+            "By",
+        )));
+        out.push(with_labels(Metric::new(
+            METRIC_FILESYSTEM_AVAILABLE,
+            disk.available_space,
+            "By",
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    for (name, received, transmitted) in interfaces {
+        if !is_meaningful_interface(name) {
+            continue;
+        }
+        let Some(device) = label_value(name) else {
+            continue;
+        };
+        if !seen.insert(device.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_REPORTED_INTERFACES {
+            break;
+        }
+        out.push(
+            Metric::new(METRIC_NETWORK_RECEIVED, *received, "By")
+                .with_label("device", device.clone()),
+        );
+        out.push(
+            Metric::new(METRIC_NETWORK_TRANSMITTED, *transmitted, "By")
+                .with_label("device", device),
+        );
+    }
+
+    let mut seen = HashSet::new();
+    for (label, temperature) in temperatures {
+        let (Some(sensor), Some(value)) = (label_value(label), temperature.and_then(round2)) else {
+            continue;
+        };
+        if !seen.insert(sensor.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_REPORTED_SENSORS {
+            break;
+        }
+        out.push(Metric::new(METRIC_TEMPERATURE, value, "Cel").with_label("sensor", sensor));
+    }
+    out
+}
+
+/// 取樣磁碟、網路與溫度用的 sysinfo 物件（第一次在 blocking 執行緒建立，之後沿用）
+struct Extras {
+    disks: Disks,
+    networks: Networks,
+    components: Components,
+}
+
+impl Extras {
+    fn new() -> Self {
+        Self {
+            disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
+            components: Components::new_with_refreshed_list(),
+        }
+    }
+
+    /// 刷新（含新增與移除的磁碟、介面、感測器）並轉成指標
+    fn refresh_and_read(&mut self) -> Vec<Metric> {
+        self.disks.refresh(true);
+        self.networks.refresh(true);
+        self.components.refresh(true);
+        let disks = self.disks.iter().map(DiskEntry::from_disk).collect();
+        let mut interfaces: Vec<(String, u64, u64)> = self
+            .networks
+            .iter()
+            .map(|(name, data)| {
+                (
+                    name.clone(),
+                    data.total_received(),
+                    data.total_transmitted(),
+                )
+            })
+            .collect();
+        interfaces.sort();
+        let temperatures: Vec<(String, Option<f32>)> = self
+            .components
+            .iter()
+            .map(|c| (c.label().to_string(), c.temperature()))
+            .collect();
+        extra_metrics(disks, &interfaces, &temperatures)
+    }
 }
 
 /// 計算全機 CPU 平均使用率。
@@ -439,8 +598,8 @@ enum SampleOutcome {
     Stopped,
 }
 
-/// blocking 執行緒上的一次刷新：回傳 `System` 與讀出的取樣。
-type RefreshTask = tokio::task::JoinHandle<(System, Sample)>;
+/// blocking 執行緒上的一次刷新：回傳 `System`、磁碟等的 sysinfo 物件與讀出的取樣。
+type RefreshTask = tokio::task::JoinHandle<(System, Option<Extras>, Sample)>;
 
 /// 定期取樣器：沿用同一個 `System`，每次取樣只刷新一次 CPU。
 ///
@@ -461,6 +620,10 @@ type RefreshTask = tokio::task::JoinHandle<(System, Sample)>;
 struct Sampler {
     /// 取樣用的 `System`；blocking 閉包執行期間（含卡住時）為 `None`
     sys: Option<System>,
+    /// 是否另外取樣磁碟、網路與溫度（A4；測試替換刷新函式時不取樣）
+    collect_extras: bool,
+    /// 磁碟、網路與溫度的 sysinfo 物件；第一次刷新時在 blocking 執行緒建立，與 `sys` 一起移動
+    extras: Option<Extras>,
     /// 上次刷新 CPU 的時間；`None` 表示尚未建立基準
     last_refresh: Option<Instant>,
     /// 實際的刷新函式（測試時可替換，以驗證在哪個執行緒、呼叫幾次）
@@ -477,12 +640,17 @@ struct Sampler {
 
 impl Sampler {
     fn new(timeout: Duration) -> Self {
-        Self::with_refresh(refresh_cpu_and_memory, timeout)
+        Self {
+            collect_extras: true,
+            ..Self::with_refresh(refresh_cpu_and_memory, timeout)
+        }
     }
 
     fn with_refresh(refresh: fn(&mut System), timeout: Duration) -> Self {
         Self {
             sys: Some(System::new()),
+            collect_extras: false,
+            extras: None,
             last_refresh: None,
             refresh,
             timeout,
@@ -529,21 +697,34 @@ impl Sampler {
             return SampleOutcome::Skipped;
         };
         let refresh = self.refresh;
+        let mut extras = self.extras.take();
+        let collect_extras = self.collect_extras;
         let started = Instant::now();
         let mut task = tokio::task::spawn_blocking(move || {
             refresh(&mut sys);
+            if collect_extras && extras.is_none() {
+                extras = Some(Extras::new());
+            }
+            let extra = extras
+                .as_mut()
+                .map(Extras::refresh_and_read)
+                .unwrap_or_default();
             let s = Sample {
                 ts: now_ts(),
                 cpu_usage: average_cpu_usage(&sys),
                 total_memory: sys.total_memory() / BYTES_PER_MB,
                 used_memory: sys.used_memory() / BYTES_PER_MB,
+                total_memory_bytes: sys.total_memory(),
+                used_memory_bytes: sys.used_memory(),
+                extra,
             };
-            (sys, s)
+            (sys, extras, s)
         });
         match time::timeout(self.timeout, &mut task).await {
             Ok(joined) => match finished(joined) {
-                Some((sys, s)) => {
+                Some((sys, extras, s)) => {
                     self.sys = Some(sys);
+                    self.extras = extras;
                     self.last_refresh = Some(Instant::now());
                     SampleOutcome::Ready(s)
                 }
@@ -585,8 +766,9 @@ impl Sampler {
             return SampleOutcome::Skipped;
         }
         match finished(task.await) {
-            Some((sys, _stale)) => {
+            Some((sys, extras, _stale)) => {
                 self.sys = Some(sys);
+                self.extras = extras;
                 self.last_refresh = Some(Instant::now());
                 log::info!(
                     "系統資訊取樣已恢復（卡住約 {} 秒，期間略過 {} 次 report）；以現在為新的 CPU 基準，\
@@ -663,6 +845,94 @@ async fn collect_with(mut sampler: Sampler, interval: Duration, tx: mpsc::Sender
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interface(name: &str, rx: u64, tx: u64) -> (String, u64, u64) {
+        (name.to_string(), rx, tx)
+    }
+
+    #[test]
+    fn extra_metrics_follow_the_startup_filters() {
+        let disks = vec![
+            disk("/", "ext4", "/dev/sda1", 1000),
+            disk("/opt/pulse/logs", "ext4", "/dev/sda1", 1000), // 重複掛載點
+            disk("/proc", "proc", "proc", 0),                   // 虛擬
+            disk("/data", "xfs", "/dev/sdb1", 2000),
+        ];
+        let interfaces = [
+            interface("eth0", 10, 20),
+            interface("lo", 1, 1),
+            interface("veth123", 1, 1),
+            interface("docker0", 1, 1),
+        ];
+        let temps = [
+            ("coretemp Package id 0".to_string(), Some(47.83_f32)),
+            ("acpitz".to_string(), None),
+            ("nvme".to_string(), Some(f32::NAN)),
+        ];
+        let metrics = extra_metrics(disks, &interfaces, &temps);
+        let names: Vec<(&str, Vec<&str>)> = metrics
+            .iter()
+            .map(|m| {
+                (
+                    m.name.as_str(),
+                    m.labels.values().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("system.filesystem.total", vec!["ext4", "/"]),
+                ("system.filesystem.available", vec!["ext4", "/"]),
+                ("system.filesystem.total", vec!["xfs", "/data"]),
+                ("system.filesystem.available", vec!["xfs", "/data"]),
+                ("system.network.received", vec!["eth0"]),
+                ("system.network.transmitted", vec!["eth0"]),
+                ("system.temperature", vec!["coretemp Package id 0"]),
+            ]
+        );
+        assert_eq!(metrics[2].value.as_u64(), Some(2000));
+        assert_eq!(metrics[5].value.as_u64(), Some(20));
+        // f32 的精度雜訊被去掉
+        assert_eq!(metrics[6].value.to_string(), "47.83");
+        // 都符合協定（加上 CPU 與記憶體後仍是合法的 report）
+        kairos_proto::validate_metrics(&metrics).unwrap();
+    }
+
+    #[test]
+    fn extra_metrics_are_capped_and_labels_sanitized() {
+        let disks = (0..100)
+            .map(|i| disk(&format!("/m{i}"), "ext4", &format!("/dev/x{i}"), 1))
+            .collect();
+        let interfaces: Vec<_> = (0..100)
+            .map(|i| interface(&format!("en{i:03}"), 1, 1))
+            .collect();
+        let temps: Vec<_> = (0..100)
+            .map(|i| (format!("s{i}"), Some(40.0_f32)))
+            .chain([("s0".to_string(), Some(1.0))]) // 重複的 label 只取第一個
+            .collect();
+        let metrics = extra_metrics(disks, &interfaces, &temps);
+        let count = |name: &str| metrics.iter().filter(|m| m.name == name).count();
+        assert_eq!(count("system.filesystem.total"), MAX_REPORTED_DISKS);
+        assert_eq!(count("system.network.received"), MAX_REPORTED_INTERFACES);
+        assert_eq!(count("system.temperature"), MAX_REPORTED_SENSORS);
+        assert!(metrics.len() + 3 <= kairos_proto::MAX_METRICS);
+        kairos_proto::validate_metrics(&metrics).unwrap();
+
+        // 掛載路徑含換行等禁止字元：替換成 ?；空白的 label 略過
+        let disks = vec![
+            disk(
+                "/mnt/a
+b", "ext4", "/dev/a", 1,
+            ),
+            disk(" ", "ext4", "/dev/b", 1),
+        ];
+        let temps = [(" ".to_string(), Some(1.0_f32))];
+        let metrics = extra_metrics(disks, &[], &temps);
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].labels["mountpoint"], "/mnt/a?b");
+        kairos_proto::validate_metrics(&metrics).unwrap();
+    }
 
     #[test]
     fn hostname_normalization() {
@@ -1188,6 +1458,17 @@ mod tests {
     }
 
     /// 測試用：取出完成的取樣。
+    #[tokio::test]
+    async fn real_extra_metrics_are_valid() {
+        // 實際的磁碟、網路與溫度讀數也符合協定（各平台可能為空）
+        let metrics = tokio::task::spawn_blocking(|| Extras::new().refresh_and_read())
+            .await
+            .unwrap();
+        if !metrics.is_empty() {
+            kairos_proto::validate_metrics(&metrics).unwrap();
+        }
+    }
+
     fn ready(outcome: SampleOutcome) -> Sample {
         match outcome {
             SampleOutcome::Ready(s) => s,

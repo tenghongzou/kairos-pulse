@@ -1,4 +1,4 @@
-//! Pulse ↔ Kairos 協定 v1：Kairos 端的 NDJSON 框架。
+//! Pulse ↔ Kairos 協定（v1、v2）：Kairos 端的 NDJSON 框架。
 //!
 //! 訊息型別、序列化與欄位驗證在兩個產品共用的 `kairos-proto` crate（規格見
 //! `crates/kairos-proto/PROTOCOL.md`），這裡重新匯出 Kairos 用到的部分，呼叫端仍以
@@ -9,10 +9,12 @@ use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder, LinesCodec, LinesCodecError};
 
 pub use kairos_proto::{
-    ClientMsg, ErrorCode, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, PROTO_VERSION, Proto,
-    ServerMsg, clamp_heartbeat_interval_ms, hello_seq_of_invalid, normalize_agent_id,
-    offline_after_ms, parse_client_msg, server_cpu_usage, validate_client_msg, validate_hello,
-    validate_report,
+    ClientMsg, ErrorCode, HelloExt, HostInfo, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH,
+    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, Proto, ProtoRangeError,
+    SERVER_FEATURES, SUPPORTED_PROTO, ServerMsg, Session, clamp_heartbeat_interval_ms,
+    client_proto_range, hello_seq_of_invalid, negotiate, normalize_agent_id, offline_after_ms,
+    parse_client_msg, server_cpu_usage, unsupported_version_error, validate_client_msg,
+    validate_features, validate_hello, validate_host_info, validate_metrics, validate_report,
 };
 
 /// 從連線讀到的一個框架

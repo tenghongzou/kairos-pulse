@@ -401,6 +401,8 @@ mod tests {
             agent_id: agent_id.into(),
             hostname: "h".into(),
             agent_version: "1".into(),
+            proto: 1,
+            host: None,
             peer: "p".into(),
             offline_after: Duration::from_secs(5),
             client_chain: chain,

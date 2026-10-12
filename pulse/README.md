@@ -6,8 +6,8 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ## 功能特色
 
-- 🖥️ 收集系統資訊：CPU 使用率、記憶體（啟動時另印出一次系統資訊：磁碟、網路、元件溫度；`info` 等級略過虛擬檔案系統與虛擬網路介面）
-- 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON），預設**驗證伺服器憑證**（設定了自訂 CA `ca_cert` 時只信任它，否則使用作業系統信任庫；可明確設定同時信任兩者）
+- 🖥️ 收集系統資訊：CPU 使用率、記憶體；Kairos 支援協定 v2 時另外回報磁碟容量、網路累計流量與元件溫度（啟動時也印出一次；`info` 等級略過虛擬檔案系統與虛擬網路介面）
+- 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON，v1、v2 自動協商），預設**驗證伺服器憑證**（設定了自訂 CA `ca_cert` 時只信任它，否則使用作業系統信任庫；可明確設定同時信任兩者）
 - 🪪 每台主機有固定的 `agent_id`（UUID v4，存於 `agent.id`），換主機名稱也不影響識別
 - 💓 每 15 秒（`heartbeat.interval`）送出 heartbeat，伺服器據此判斷上線 / 離線
 - 🔁 斷線自動重連：指數退避 + ±20% 抖動、有上限、不限次數；啟動與斷線後第一次重連另加隨機延遲，避免大量 agent 同時連線
@@ -23,7 +23,15 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ## 升級注意事項（與 Kairos 混用版本）
 
-Pulse 與 Kairos 必須搭配升級。新舊版本混用時可能出現下列問題：
+**協定 v2 起不必同時升級**：新版 Pulse 在 hello 宣告支援協定 1～2，依 Kairos 的 `hello_ack` 決定格式（PROTOCOL.md「版本協商」）：
+
+| 組合 | 協商結果 |
+|---|---|
+| 新版 Pulse 連舊版 Kairos | v1：舊版 Kairos 只檢查 `proto == 1` 並忽略 v2 欄位；Pulse 送 v1 的三欄位 report，註冊日誌為「協定 v1」 |
+| 新版 Pulse 連新版 Kairos | v2：report 改為通用指標（CPU、記憶體、磁碟、網路、溫度），另送主機指紋等主機資訊；註冊日誌為「協定 v2」 |
+| 舊版 Pulse 連新版 Kairos | v1：與舊版相同 |
+
+更早的版本之間混用時可能出現下列問題：
 
 | 組合 | 風險 |
 |---|---|
@@ -245,7 +253,7 @@ cargo run
 ../target/release/pulse   # workspace 的 target/ 在 monorepo 根目錄
 ```
 
-測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試。協定訊息的序列化、解析與欄位驗證（含直接從 `crates/kairos-proto/PROTOCOL.md`「範例」節解析的測試向量）在與 Kairos 共用的 `crates/kairos-proto` 中測試，日期保護的核心規則在 `crates/date-guard`，在 monorepo 根目錄執行 `cargo test -p kairos-proto -p date-guard`，或以 `cargo test --workspace` 一併執行；`cargo test`（在 `pulse/` 目錄）只執行本產品的測試。Unix 專屬的部分（檔案權限、sd_notify 等）以 `#[cfg(unix)]` 標示，只在 Linux／macOS 上執行，Windows 專屬的 ACL 檢查同理。實際數量以 `cargo test` 的輸出為準（各平台不同），文件不列出數字。
+測試都寫在各模組內（`#[cfg(test)]`），包含以 `testdata/` 的測試憑證進行的實際 TLS 握手測試。協定訊息的序列化、解析與欄位驗證（含直接從 `crates/kairos-proto/PROTOCOL.md`「範例」節解析的 v1、v2 測試向量與版本協商）在與 Kairos 共用的 `crates/kairos-proto` 中測試；本產品另測試 hello 的版本範圍與主機資訊、依 `hello_ack` 選擇 report 格式（舊版 Kairos → 三欄位、新版 → 通用指標、版本不符 → 斷線）、指標的篩選與上限、超過單行上限時的捨去、主機指紋與規格的計算範例一致、時鐘偏差警告。日期保護的核心規則在 `crates/date-guard`；在 monorepo 根目錄執行 `cargo test -p kairos-proto -p date-guard`，或以 `cargo test --workspace` 一併執行；`cargo test`（在 `pulse/` 目錄）只執行本產品的測試。Unix 專屬的部分（檔案權限、sd_notify 等）以 `#[cfg(unix)]` 標示，只在 Linux／macOS 上執行，Windows 專屬的 ACL 檢查同理。實際數量以 `cargo test` 的輸出為準（各平台不同），文件不列出數字。
 
 > **`testdata/` 中的私鑰（`*.key`）只供測試使用，已公開在 repo 中，絕對不可用於任何部署環境。** 正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
 
@@ -326,6 +334,8 @@ interval = 5                   # 系統資訊回報間隔（秒）
 
 [agent]
 id_file = "agent.id"           # 存放 agent_id 的檔案
+display_name = ""              # 主控台顯示名稱（協定 v2 的 hello；空字串 = 不送）
+tags = []                      # 標籤，例如 ["env:prod", "team:web"]（協定 v2 的 hello；只能在 pulse.toml 設定）
 
 [log]
 level = "info"                 # 日誌級別：trace / debug / info / warn / error（不分大小寫）
@@ -358,6 +368,8 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `log.level` | `trace` / `debug` / `info` / `warn` / `error` | 不分大小寫（`DEBUG`、`Warn` 皆可）；其他值啟動即報錯，不會默默改用 `info` |
 | `log.retention_days` | 0～3650 天 | 0 = 永久保留 |
 | `agent.id_file` | 非空字串 | |
+| `agent.display_name` | 空字串，或 1～255 bytes | 不得含控制字元、格式字元等不可見字元（規則同 Kairos 對 `hostname` 的限制）；只在 Kairos 支援協定 v2 時送出 |
+| `agent.tags` | 最多 32 個，每個 1～64 bytes，不得重複 | 字元限制同上；只能在 `pulse.toml` 設定（環境變數不支援陣列） |
 | `server.domain` | 有效的 DNS 名稱或 IP 位址，不可空白 | |
 | `server.use_system_roots` | `true` / `false` / 不設定 | 不設定時依 `ca_cert` 決定（見上表）；明確設為 `false` 時 `server.ca_cert` 必填，否則啟動即報錯（`accept_invalid_certs = true` 時不使用信任庫，不檢查此項） |
 | `server.client_cert` / `server.client_key` | 同時設定或同時留空 | 只設定一個時啟動即報錯 |
@@ -376,6 +388,9 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 - 一條長 TLS 連線，**NDJSON**（UTF-8，一行一則 JSON，以 `\n` 結尾），單行上限 65536 bytes
 - 每則訊息有 `type` 與 `seq`；`seq` 每條連線從 1 開始遞增，重連後重新計算
 - 流程：Pulse 送 `hello` → Kairos 回 `hello_ack` → 之後 Pulse 每 `heartbeat.interval` 秒送 `heartbeat`、每 `report.interval` 秒送 `report`，Kairos 對每則訊息回 `ack`
+- **版本協商**：hello 送 `"proto":1,"proto_min":1,"proto_max":2,"features":["metrics"]`（舊版 Kairos 只看 `proto`）。`hello_ack` 的 `proto` 是協商結果：1 → report 為三個欄位；2 且 Kairos 也宣告 `metrics` → report 為通用指標。`proto` 不在 1～2 時斷線並記 `ERROR`（`proto_mismatch`），Kairos 回 `unsupported_version` 時同樣以 `ERROR` 記錄（`message` 含 Kairos 支援的範圍）
+- **hello 的主機資訊**（v2，舊版 Kairos 忽略）：`host_fingerprint`（機器 ID 的 SHA-256，不送原始值，計算方式見 PROTOCOL.md「主機指紋」；Linux 讀 `/etc/machine-id`、Windows 讀 `MachineGuid`，讀不到時不送）、`display_name` 與 `tags`（設定 `agent.display_name`、`agent.tags`，未設定時不送）、`report_interval_ms`（`report.interval`）、`os`（sysinfo 取得的作業系統名稱、版本、核心版本與 CPU 架構）
+- **時鐘檢查**：v2 的 `hello_ack` 帶 Kairos 的 `server_time`，與本機時鐘相差超過 5 分鐘時記 `WARN`「本機時鐘比伺服器快／慢約 N 秒」（每次註冊最多一則），請檢查 NTP
 - `report` 的 `ack` 代表該筆資料已寫入伺服器的資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`（message 為 `report could not be stored`：寫入失敗或達到伺服器的每日檔案大小上限；或 `report rate limit exceeded`：同一來源送得太快）。Pulse 收到時記 `WARN`（節流，見「日誌」），**該筆 report 視為未送達、不重送**，連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連，該筆同樣不重送
 - **同一時間只有一筆 report 在途**：送出 report 後，到收到伺服器對它（或之後的訊息）的回應（`ack` 或帶 `seq` 的 `error`，含 `storage_unavailable`）之前，新的取樣直接略過（記 `WARN`，節流，附這條連線已略過的次數）；斷線時清除。伺服器寫檔緩慢時不會在伺服器端無限積壓
 - Kairos 也可能回其他 `error`：
@@ -398,7 +413,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 
 ## 回報資料格式
 
-系統資訊以 `report` 訊息送出（一行 JSON，此處為方便閱讀而換行）：
+系統資訊以 `report` 訊息送出（一行 JSON，此處為方便閱讀而換行）。協商結果為 v1（舊版 Kairos）時：
 
 ```json
 {
@@ -410,6 +425,31 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
   "used_memory": 37034                // 已使用記憶體（MB）
 }
 ```
+
+協商結果為 v2 且雙方都宣告 `metrics` 時（新版 Kairos），改送通用指標（名稱、單位與限制見 PROTOCOL.md「report（通用指標）」）：
+
+```json
+{
+  "type": "report",
+  "seq": 3,
+  "ts": "2026-10-08T03:15:45.210Z",
+  "metrics": [
+    {"name": "system.cpu.usage", "value": 17.84, "unit": "%"},
+    {"name": "system.memory.total", "value": 51539607552, "unit": "By"},
+    {"name": "system.memory.used", "value": 38833356800, "unit": "By"},
+    {"name": "system.filesystem.total", "value": 502468108288, "unit": "By", "labels": {"fstype": "ext4", "mountpoint": "/"}},
+    {"name": "system.filesystem.available", "value": 211312345088, "unit": "By", "labels": {"fstype": "ext4", "mountpoint": "/"}},
+    {"name": "system.network.received", "value": 98765432101, "unit": "By", "labels": {"device": "eth0"}},
+    {"name": "system.network.transmitted", "value": 1234567890, "unit": "By", "labels": {"device": "eth0"}},
+    {"name": "system.temperature", "value": 48.5, "unit": "Cel", "labels": {"sensor": "coretemp Package id 0"}}
+  ]
+}
+```
+
+- 記憶體、磁碟與網路以 bytes 為單位（v1 的記憶體為 MB）；網路是開機以來的累計量，速率請由相鄰兩筆相減。
+- 磁碟與網路介面的篩選與啟動時的 INFO 清單相同：略過虛擬檔案系統、容量為 0 與同一磁碟的重複掛載點（例如 systemd 沙箱的 bind mount），略過迴路與虛擬網路介面（`lo`、`veth*`、`docker*`、`br-*` 等）；讀不到溫度的感測器略過。磁碟、網路介面、溫度感測器各最多 32 個，同一個掛載點／介面／感測器名稱只送第一個；label 中的控制字元等禁止字元替換成 `?`，長度截到 256 bytes。
+- 整行超過單行上限 65536 bytes 時，捨去後面的磁碟、網路、溫度指標（CPU 與記憶體一定保留），並在 debug 日誌註明。
+- 磁碟、網路與溫度在每次取樣時一起刷新（第一次取樣時建立清單，之後會反映新增或移除的掛載點、介面與感測器）；與 CPU、記憶體一樣受取樣逾時保護。
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。
 

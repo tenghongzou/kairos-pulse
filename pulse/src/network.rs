@@ -31,11 +31,12 @@ use crate::backoff::Backoff;
 use crate::config_manager::AppConfig;
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
-    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, Proto, ServerMsg, ServerMsgError, now_ts,
-    parse_server_msg, report_cpu_usage, sanitize_cpu_usage,
+    CLIENT_FEATURES, ClientMsg, HelloExt, HostInfo, MAX_LINE_LENGTH, Proto, ProtoOffer,
+    SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, clock_skew_warning, now_ts,
+    parse_server_msg, report_message, sanitize_cpu_usage,
 };
 use crate::service_status;
-use crate::system_info::Sample;
+use crate::system_info::{self, Sample};
 use crate::tls::{self, TlsSetup};
 
 /// TCP 連線逾時。
@@ -210,6 +211,9 @@ pub struct Settings {
     pub client_cert: Option<String>,
     /// 啟動時與斷線後第一次重連前的隨機延遲上限（見 [`MAX_CONNECT_SPREAD`]）
     pub connect_spread: Duration,
+    /// 協定 v2 hello 的主機資訊（主機指紋、OS、顯示名稱、標籤、report 間隔）；
+    /// 只在 hello 中附上，舊版 Kairos 會忽略
+    pub host: HostInfo,
 }
 
 impl Settings {
@@ -227,6 +231,12 @@ impl Settings {
             client_cert: Some(config.server.client_cert.trim().to_string())
                 .filter(|p| !p.is_empty()),
             connect_spread: connect_spread(Duration::from_secs(config.heartbeat.interval)),
+            // 讀取機器 ID 與作業系統資訊（都很快），只在啟動時做一次
+            host: system_info::host::collect(
+                &config.agent.display_name,
+                &config.agent.tags,
+                Duration::from_secs(config.report.interval),
+            ),
         }
     }
 
@@ -327,7 +337,8 @@ impl fmt::Display for SessionError {
             Self::ProtoMismatch(p) => {
                 write!(
                     f,
-                    "伺服器回覆的協定版本 {p} 與本程式（{PROTO_VERSION}）不符"
+                    "伺服器回覆的協定版本 {p} 不在本程式支援的範圍（{}～{}）內",
+                    SUPPORTED_PROTO.min, SUPPORTED_PROTO.max
                 )
             }
             Self::ClosedByServer => write!(f, "伺服器關閉了連線"),
@@ -771,7 +782,10 @@ fn attention_summary(
         }
         SessionError::ProtoMismatch(p) => (
             "proto_mismatch".to_string(),
-            format!("伺服器的協定版本 {p} 與本程式（{PROTO_VERSION}）不符，請更新 Pulse 或 Kairos"),
+            format!(
+                "伺服器的協定版本 {p} 不在本程式支援的範圍（{}～{}）內，請更新 Pulse 或 Kairos",
+                SUPPORTED_PROTO.min, SUPPORTED_PROTO.max
+            ),
         ),
         _ => {
             let alert = client_cert_alert(err, has_client_cert)?;
@@ -850,24 +864,43 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     throttles: &mut ServerLogThrottles,
 ) -> Result<Infallible> {
     // ---- hello / hello_ack ----
+    // 版本協商（A3）：proto 送 1（v1 Kairos 只接受 1），另以 proto_min／proto_max 宣告支援 1～2；
+    // v2 的欄位（features、主機資訊）舊版 Kairos 會忽略
     let seq = conn.next_seq();
     conn.send(&ClientMsg::Hello {
         seq,
-        proto: Proto::Version(PROTO_VERSION),
+        proto: Proto::Version(SUPPORTED_PROTO.min),
         agent_id: settings.agent_id.clone(),
         hostname: settings.hostname.clone(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         heartbeat_interval_ms: u64::try_from(settings.heartbeat_interval.as_millis())
             .unwrap_or(u64::MAX),
         ts: now_ts(),
+        ext: Box::new(HelloExt::new(
+            ProtoOffer {
+                proto_min: Some(SUPPORTED_PROTO.min),
+                proto_max: Some(SUPPORTED_PROTO.max),
+                features: Some(CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()),
+            },
+            settings.host.clone(),
+        )),
     })
     .await?;
     log::debug!("已送出 hello（seq={seq}），等待 hello_ack");
 
-    let offline_after_ms = wait_hello_ack(conn, seq, throttles).await?;
+    let ack = wait_hello_ack(conn, seq, throttles).await?;
+    let session = ack.session;
     *registered_at = Some(Instant::now());
-    let (level, msg) = registered_log(settings, offline_after_ms, tls_info);
+    let (level, msg) = registered_log(settings, &ack, tls_info);
     log::log!(level, "{msg}");
+    if let Some(warning) = ack
+        .server_time
+        .as_deref()
+        .and_then(|t| clock_skew_warning(t, chrono::Utc::now()))
+    {
+        // 每次註冊最多一則（重連受退避限制），不需節流
+        log::warn!("{warning}");
+    }
     service_status::set_status(&registered_status(settings));
 
     // 斷線期間殘留在佇列中的舊取樣直接丟棄（at-most-once，不重送舊資料）
@@ -913,22 +946,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 if sanitized != sample.cpu_usage {
                     log::debug!("CPU 使用率 {} 不合理，送出前調整為 {sanitized}", sample.cpu_usage);
                 }
-                // 四捨五入到小數 2 位（f64），JSON 中不會出現 f32 的精度雜訊
-                let cpu_usage = report_cpu_usage(sample.cpu_usage);
-                conn.send(&ClientMsg::Report {
-                    seq,
-                    ts: sample.ts,
-                    cpu_usage,
-                    total_memory: sample.total_memory,
-                    used_memory: sample.used_memory,
-                })
-                .await?;
+                // v1（或沒有協商 metrics）送三個欄位；v2 送通用指標（A4）
+                let (msg, summary) = report_message(seq, sample, session);
+                conn.send(&msg).await?;
                 pending_report = Some(seq);
-                log::debug!(
-                    "已送出 report（seq={seq}，CPU {cpu_usage:.2}%，記憶體 {}/{} MB）",
-                    sample.used_memory,
-                    sample.total_memory
-                );
+                log::debug!("已送出 report（seq={seq}，{summary}）");
             }
             line = conn.framed.next() => {
                 let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
@@ -1037,12 +1059,12 @@ fn established_log(settings: &Settings, info: &TlsInfo) -> (log::Level, String) 
 /// 未驗證伺服器憑證時記 warn，讓只看 INFO 以上的人每次連上都看得到警告。
 fn registered_log(
     settings: &Settings,
-    offline_after_ms: u64,
+    ack: &HelloAckInfo,
     tls_info: Option<&TlsInfo>,
 ) -> (log::Level, String) {
     let base = format!(
-        "已向伺服器註冊（agent_id={}，伺服器離線判定 {offline_after_ms} ms",
-        settings.agent_id
+        "已向伺服器註冊（agent_id={}，伺服器離線判定 {} ms，協定 v{}",
+        settings.agent_id, ack.offline_after_ms, ack.session.proto
     );
     match tls_info {
         Some(info) => (
@@ -1057,12 +1079,22 @@ fn registered_log(
     }
 }
 
-/// 等待 hello_ack（整體 5 s）。回傳伺服器給的 `offline_after_ms`。
+/// hello_ack 帶來的資訊
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HelloAckInfo {
+    offline_after_ms: u64,
+    /// 協商結果（版本與 report 格式）
+    session: Session,
+    /// 伺服器時間（v2）
+    server_time: Option<String>,
+}
+
+/// 等待 hello_ack（整體 5 s）。
 async fn wait_hello_ack<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Connection<S>,
     hello_seq: u64,
     throttles: &mut ServerLogThrottles,
-) -> Result<u64> {
+) -> Result<HelloAckInfo> {
     let deadline = after(HELLO_ACK_TIMEOUT);
     loop {
         let line = time::timeout_at(deadline, conn.framed.next())
@@ -1070,38 +1102,46 @@ async fn wait_hello_ack<S: AsyncRead + AsyncWrite + Unpin>(
             .map_err(|_| SessionError::HelloAckTimeout)?
             .ok_or(SessionError::ClosedByServer)?
             .map_err(SessionError::Codec)?;
-        if let Some(offline_after_ms) = handle_pre_ack_line(&line, hello_seq, throttles)? {
-            return Ok(offline_after_ms);
+        if let Some(ack) = handle_pre_ack_line(&line, hello_seq, throttles)? {
+            return Ok(ack);
         }
     }
 }
 
 /// 處理註冊前收到的一行伺服器訊息。
 ///
-/// - `hello_ack` → `Ok(Some(offline_after_ms))`（seq 不符只記 warn）
+/// - `hello_ack` → `Ok(Some(…))`（seq 不符只記 warn；`proto` 不在本程式支援的範圍內 → 斷線）
 /// - 任何 `error`（不論是否 fatal）→ 結束這條連線（由重連迴圈記錄 error）
 /// - 其他 → 忽略（節流記錄），繼續等待
 fn handle_pre_ack_line(
     line: &str,
     hello_seq: u64,
     throttles: &mut ServerLogThrottles,
-) -> Result<Option<u64>> {
+) -> Result<Option<HelloAckInfo>> {
     match parse_server_msg(line) {
         Ok(ServerMsg::HelloAck {
             seq,
             proto,
             offline_after_ms,
+            features,
+            server_time,
         }) => {
-            if proto != PROTO_VERSION {
+            if !(SUPPORTED_PROTO.min..=SUPPORTED_PROTO.max).contains(&proto) {
                 return Err(SessionError::ProtoMismatch(proto));
             }
+            // v1 Kairos 不送 features；v2 時取雙方都宣告的功能
+            let session = Session::new(proto, CLIENT_FEATURES, &features.unwrap_or_default());
             if seq != hello_seq {
                 // 每條連線最多一次（收到後即離開等待），不需節流
                 log::warn!(
                     "hello_ack 的 seq={seq} 與 hello 的 seq={hello_seq} 不符，仍視為註冊成功"
                 );
             }
-            Ok(Some(offline_after_ms))
+            Ok(Some(HelloAckInfo {
+                offline_after_ms,
+                session,
+                server_time: server_time.filter(|_| session.is_v2()),
+            }))
         }
         // 會結束連線，頻率受退避限制，不需節流；日誌由重連迴圈統一記錄一次
         Ok(ServerMsg::Error {
@@ -1283,7 +1323,8 @@ fn server_error_hint(
                 .to_string(),
         ),
         "unsupported_version" => Some(format!(
-            "伺服器不支援本程式的協定版本 proto {PROTO_VERSION}，請更新 Pulse 或 Kairos"
+            "伺服器不支援本程式的協定版本（{}～{}），請更新 Pulse 或 Kairos",
+            SUPPORTED_PROTO.min, SUPPORTED_PROTO.max
         )),
         // Kairos 的狀態表達到 limits.max_agents 時，以 fatal bad_request 拒絕新的 agent_id
         "bad_request" if err_message(err).contains("registry is full") => Some(
@@ -1457,6 +1498,7 @@ mod tests {
             client_cert: None,
             // 既有測試驗證精確的退避時間，不加隨機分散；分散另有測試
             connect_spread: Duration::ZERO,
+            host: HostInfo::default(),
         }
     }
 
@@ -1641,7 +1683,7 @@ mod tests {
             &mut t,
         )
         .unwrap();
-        assert_eq!(ok, Some(5000));
+        assert_eq!(ok.map(|a| a.offline_after_ms), Some(5000));
         // seq 不符只記 warn，不斷線
         let ok = handle_pre_ack_line(
             r#"{"type":"hello_ack","seq":7,"proto":1,"offline_after_ms":6000}"#,
@@ -1649,16 +1691,64 @@ mod tests {
             &mut t,
         )
         .unwrap();
-        assert_eq!(ok, Some(6000));
-        // proto 不符則斷線
-        assert!(matches!(
-            handle_pre_ack_line(
-                r#"{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":5000}"#,
-                1,
-                &mut t
-            ),
-            Err(SessionError::ProtoMismatch(2))
-        ));
+        assert_eq!(ok.map(|a| a.offline_after_ms), Some(6000));
+        // proto 不在支援範圍（1～2）內則斷線
+        for proto in [0, 3, 99] {
+            let line = format!(
+                r#"{{"type":"hello_ack","seq":1,"proto":{proto},"offline_after_ms":5000}}"#
+            );
+            assert!(
+                matches!(
+                    handle_pre_ack_line(&line, 1, &mut t),
+                    Err(SessionError::ProtoMismatch(p)) if p == proto
+                ),
+                "{proto}"
+            );
+        }
+    }
+
+    #[test]
+    fn hello_ack_negotiates_the_session() {
+        // A3：v1 Kairos（沒有 features）→ v1；v2 且雙方都有 metrics → 指標格式
+        let mut t = ServerLogThrottles::default();
+        let ack = |line: &str, t: &mut ServerLogThrottles| {
+            handle_pre_ack_line(line, 1, t).unwrap().unwrap()
+        };
+        let v1 = ack(
+            r#"{"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000}"#,
+            &mut t,
+        );
+        assert_eq!(v1.session, Session::V1);
+        assert_eq!(v1.server_time, None);
+        let v2 = ack(
+            r#"{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":5000,"features":["metrics","x"],"server_time":"2026-10-08T03:15:40.012Z"}"#,
+            &mut t,
+        );
+        assert_eq!(
+            v2.session,
+            Session {
+                proto: 2,
+                metrics: true
+            }
+        );
+        assert_eq!(v2.server_time.as_deref(), Some("2026-10-08T03:15:40.012Z"));
+        let v2_plain = ack(
+            r#"{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":5000,"features":[]}"#,
+            &mut t,
+        );
+        assert_eq!(
+            v2_plain.session,
+            Session {
+                proto: 2,
+                metrics: false
+            }
+        );
+        // v1 的 hello_ack 夾帶 v2 欄位：不使用
+        let odd = ack(
+            r#"{"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000,"features":["metrics"],"server_time":"x"}"#,
+            &mut t,
+        );
+        assert_eq!((odd.session, odd.server_time), (Session::V1, None));
     }
 
     #[test]
@@ -1944,7 +2034,7 @@ mod tests {
         );
         // 記錄等級：伺服器錯誤一律 error；superseded 只有連續發生才是 error
         assert!(needs_attention(&err("auth_failed"), 0, true));
-        assert!(needs_attention(&SessionError::ProtoMismatch(2), 0, true));
+        assert!(needs_attention(&SessionError::ProtoMismatch(3), 0, true));
         assert!(!needs_attention(&err("superseded"), 1, true));
         assert!(needs_attention(&err("superseded"), 2, true));
         assert!(!needs_attention(&SessionError::ClosedByServer, 0, true));
@@ -1981,15 +2071,20 @@ mod tests {
     fn registered_log_carries_tls_details() {
         // F4：原本「已建立 TLS 加密連線」INFO 的資訊改附在註冊成功的 INFO
         let s = settings(1);
-        let (level, msg) = registered_log(&s, 5000, Some(&tls_info(true)));
+        let ack = |offline_after_ms, proto| HelloAckInfo {
+            offline_after_ms,
+            session: Session::new(proto, CLIENT_FEATURES, CLIENT_FEATURES),
+            server_time: None,
+        };
+        let (level, msg) = registered_log(&s, &ack(5000, 2), Some(&tls_info(true)));
         assert_eq!(level, log::Level::Info);
         assert_eq!(
             msg,
-            "已向伺服器註冊（agent_id=a，伺服器離線判定 5000 ms；\
+            "已向伺服器註冊（agent_id=a，伺服器離線判定 5000 ms，協定 v2；\
              TLS 加密連線 127.0.0.1:1，domain=localhost，TLSv1_3，已驗證伺服器憑證）"
         );
         // 未驗證伺服器憑證：註冊成功的那一行升為 warn 並帶警告
-        let (level, msg) = registered_log(&s, 5000, Some(&tls_info(false)));
+        let (level, msg) = registered_log(&s, &ack(5000, 2), Some(&tls_info(false)));
         assert_eq!(level, log::Level::Warn);
         assert!(
             msg.starts_with("已向伺服器註冊")
@@ -1999,9 +2094,12 @@ mod tests {
             "{msg}"
         );
         // 沒有 TLS 資訊（測試用的記憶體內串流）
-        let (level, msg) = registered_log(&s, 6000, None);
+        let (level, msg) = registered_log(&s, &ack(6000, 1), None);
         assert_eq!(level, log::Level::Info);
-        assert_eq!(msg, "已向伺服器註冊（agent_id=a，伺服器離線判定 6000 ms）");
+        assert_eq!(
+            msg,
+            "已向伺服器註冊（agent_id=a，伺服器離線判定 6000 ms，協定 v1）"
+        );
     }
 
     // ---- P1：伺服器送來的文字寫進日誌前必須清理 ----
@@ -2880,7 +2978,7 @@ mod tests {
                 true
             )
         );
-        assert!(attention_key(&SessionError::ProtoMismatch(2), true).is_some());
+        assert!(attention_key(&SessionError::ProtoMismatch(3), true).is_some());
     }
 
     /// 斷線日誌中，ERROR 的索引與其「另有 n 次…已改記 WARN」中的 n（沒有時為 0）。
@@ -2977,6 +3075,9 @@ mod tests {
             cpu_usage: 1.0,
             total_memory: 2,
             used_memory: 1,
+            total_memory_bytes: 2 * 1024 * 1024,
+            used_memory_bytes: 1024 * 1024,
+            extra: Vec::new(),
         }
     }
 
@@ -3160,9 +3261,9 @@ mod tests {
         for err in [
             fatal("certificate_rejected", "revoked"),
             fatal("auth_failed", "agent_id does not match certificate"),
-            fatal("unsupported_version", "supported proto: 2"),
+            fatal("unsupported_version", "supported proto: 3"),
             fatal("bad_request", "agent registry is full"),
-            SessionError::ProtoMismatch(2),
+            SessionError::ProtoMismatch(3),
             tls_alert(AlertDescription::CertificateRevoked),
             tls_alert(AlertDescription::CertificateExpired),
             tls_alert(AlertDescription::CertificateRequired),
@@ -3235,8 +3336,8 @@ mod tests {
             "無法註冊：（未提供錯誤碼）（伺服器拒絕註冊，詳見 logs/）"
         );
         assert_eq!(
-            disconnect_status(&SessionError::ProtoMismatch(2), 0, true),
-            "無法註冊：proto_mismatch（伺服器的協定版本 2 與本程式（1）不符，請更新 Pulse 或 Kairos）"
+            disconnect_status(&SessionError::ProtoMismatch(3), 0, true),
+            "無法註冊：proto_mismatch（伺服器的協定版本 3 不在本程式支援的範圍（1～2）內，請更新 Pulse 或 Kairos）"
         );
         assert_eq!(
             disconnect_status(&tls_alert(AlertDescription::CertificateRevoked), 0, true),
@@ -3504,5 +3605,133 @@ mod tests {
             levels,
             [log::Level::Error, log::Level::Warn, log::Level::Error]
         );
+    }
+
+    // ---- 協定 v2：版本協商與 report 格式（A3、A4 的相容矩陣，Pulse 端） ----
+
+    /// 測試用伺服器：讀取 hello、回覆 `hello_ack`（`seq` 由收到的 hello 帶入），之後把第一則
+    /// report 連同 hello 回傳，並關閉連線
+    fn spawn_versioned_server(
+        server: DuplexStream,
+        hello_ack: &'static str,
+    ) -> tokio::task::JoinHandle<(serde_json::Value, Option<serde_json::Value>)> {
+        tokio::spawn(async move {
+            let mut f = server_side(server);
+            let line = f.next().await.unwrap().unwrap();
+            let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
+            f.send(hello_ack.replace("SEQ", &hello["seq"].to_string()))
+                .await
+                .unwrap();
+            while let Some(Ok(line)) = f.next().await {
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v["type"] == "report" {
+                    return (hello, Some(v));
+                }
+            }
+            (hello, None)
+        })
+    }
+
+    async fn report_against(
+        hello_ack: &'static str,
+    ) -> (serde_json::Value, Option<serde_json::Value>, SessionError) {
+        let (client, server) = duplex(64 * 1024);
+        let srv = spawn_versioned_server(server, hello_ack);
+        let mut s = settings(60);
+        s.host = HostInfo {
+            display_name: Some("Web 01".into()),
+            report_interval_ms: Some(5000),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel::<Sample>(1);
+        let mut sample = test_sample(1);
+        sample.extra = vec![
+            crate::protocol::Metric::new("system.filesystem.total", 10, "By")
+                .with_label("mountpoint", "/"),
+        ];
+        let feeder = async {
+            time::sleep(Duration::from_secs(1)).await;
+            let _ = tx.send(sample).await;
+        };
+        let ((err, _), ()) = tokio::join!(serve_with_reports(client, &s, &mut rx), feeder);
+        let (hello, report) = srv.await.unwrap();
+        (hello, report, err)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hello_offers_versions_1_to_2_with_v2_fields() {
+        let (hello, _, _) =
+            report_against(r#"{"type":"hello_ack","seq":SEQ,"proto":1,"offline_after_ms":5000}"#)
+                .await;
+        // proto 送 1（v1 Kairos 只接受 1），另以範圍與 features 宣告 v2
+        assert_eq!(hello["proto"], 1);
+        assert_eq!(hello["proto_min"], 1);
+        assert_eq!(hello["proto_max"], 2);
+        assert_eq!(hello["features"], serde_json::json!(["metrics"]));
+        assert_eq!(hello["display_name"], "Web 01");
+        assert_eq!(hello["report_interval_ms"], 5000);
+        // 沒有值的主機資訊欄位不送
+        assert!(hello.get("tags").is_none(), "{hello}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_kairos_gets_v1_reports() {
+        // 新 Pulse ↔ 舊 Kairos：hello_ack 沒有 v2 欄位 → report 為三欄位
+        let (_, report, err) =
+            report_against(r#"{"type":"hello_ack","seq":SEQ,"proto":1,"offline_after_ms":5000}"#)
+                .await;
+        let report = report.expect("應送出 report");
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        assert_eq!(report["cpu_usage"], 1.0);
+        assert_eq!(report["total_memory"], 2);
+        assert_eq!(report["used_memory"], 1);
+        assert!(report.get("metrics").is_none(), "{report}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_kairos_gets_metric_reports() {
+        // 新 ↔ 新：v2 且雙方都宣告 metrics → 通用指標
+        let (_, report, _) = report_against(
+            r#"{"type":"hello_ack","seq":SEQ,"proto":2,"offline_after_ms":5000,"features":["metrics"],"server_time":"2026-10-08T03:15:40.012Z"}"#,
+        )
+        .await;
+        let report = report.expect("應送出 report");
+        assert!(report.get("cpu_usage").is_none(), "{report}");
+        let names: Vec<&str> = report["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "system.cpu.usage",
+                "system.memory.total",
+                "system.memory.used",
+                "system.filesystem.total"
+            ]
+        );
+        assert_eq!(report["metrics"][1]["value"], 2 * 1024 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn v2_kairos_without_metrics_gets_v1_reports() {
+        let (_, report, _) = report_against(
+            r#"{"type":"hello_ack","seq":SEQ,"proto":2,"offline_after_ms":5000,"features":[]}"#,
+        )
+        .await;
+        let report = report.expect("應送出 report");
+        assert_eq!(report["cpu_usage"], 1.0);
+        assert!(report.get("metrics").is_none(), "{report}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_negotiated_version_disconnects() {
+        let (_, report, err) =
+            report_against(r#"{"type":"hello_ack","seq":SEQ,"proto":3,"offline_after_ms":5000}"#)
+                .await;
+        assert!(matches!(err, SessionError::ProtoMismatch(3)), "{err:?}");
+        assert!(report.is_none());
     }
 }
