@@ -22,13 +22,15 @@ pub const REPORTS_USAGE: &str = "kairos reports export — 以 JSON Lines 匯出
   kairos reports export [選項] > reports.jsonl
 
 選項：
-  --since <時間>     匯出最近這段時間內收到的 report，例如 30m、12h、7d（預設 1d）
+  --since <時間>     匯出取樣時間在最近這段時間內的 report，例如 30m、12h、7d（預設 1d）；
+                     補送的歷史資料（durable）依 Pulse 的取樣時間 ts，其他依收到的時間
   --agent <agent_id> 只匯出這台主機（未指定時掃描整個 reports 表）
   --config <path>    Kairos 的設定檔（用來找到 storage.data_dir；預設為目前目錄的 kairos.toml）
   -h, --help         顯示本說明
 
 每一行的格式與 reports-YYYY-MM-DD.jsonl 相同（schema 1 為協定 v1 的三欄位，schema 2 為通用指標），
 依寫入順序排列；peer 與 hostname 為主機清冊中最後的值（SQLite 不逐筆保存）。
+輸出只有監控資料（主機識別、時間與指標），不含憑證、私鑰或設定；檔案權限依目前的 umask。
 
 範例：
   kairos reports export --config /opt/kairos/kairos.toml --since 1d > today.jsonl

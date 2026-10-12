@@ -2159,27 +2159,35 @@ pub fn export_reports(
 }
 
 /// 線上備份（`kairos db backup`）：以 `VACUUM INTO` 把資料庫一致的快照寫到 `dest`（不含空閒頁，
-/// 比原檔小）。Kairos 執行中也可以備份，不會擋住寫入（WAL）。`dest` 已存在時拒絕（不覆寫）；
-/// 備份檔在 Unix 上收緊為 0640
+/// 比原檔小）。Kairos 執行中也可以備份，不會擋住寫入（WAL）。
+///
+/// 先以 `create_new` 建立權限 0640（Unix）的空檔再寫入：`dest` 已存在時拒絕（不覆寫，也不跟隨預先
+/// 放置的符號連結），備份內容在寫入期間不會因 umask 而讓其他使用者可讀。失敗時刪除這個檔案
 pub fn backup_to(conn: &Connection, dest: &Path) -> Result<(), Error> {
-    if dest.exists() {
-        return Err(Error::new(
-            ErrorKind::AlreadyExists,
-            format!("{} 已存在，不覆寫", dest.display()),
-        ));
-    }
     let target = dest.to_str().ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidInput,
             format!("備份路徑含有無法辨識的字元: {}", dest.display()),
         )
     })?;
-    conn.execute("VACUUM INTO ?1", [target])
-        .map_err(|e| db_error(&format!("無法備份到 {}", dest.display()), e))?;
-    if let Ok(f) = std::fs::File::open(dest)
-        && let Err(e) = fsperm::restrict_open_file(&f)
-    {
+    let file =
+        fsperm::private_std_options(std::fs::OpenOptions::new().write(true).create_new(true))
+            .open(dest)
+            .map_err(|e| match e.kind() {
+                ErrorKind::AlreadyExists => Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!("{} 已存在，不覆寫", dest.display()),
+                ),
+                kind => Error::new(kind, format!("無法建立 {}: {}", dest.display(), e)),
+            })?;
+    if let Err(e) = fsperm::restrict_open_file(&file) {
         warn!("無法將 {} 的權限收緊為 0640: {}", dest.display(), e);
+    }
+    drop(file);
+    // VACUUM INTO 可以寫入既有的空檔（沿用它的權限）
+    if let Err(e) = conn.execute("VACUUM INTO ?1", [target]) {
+        let _ = std::fs::remove_file(dest);
+        return Err(db_error(&format!("無法備份到 {}", dest.display()), e));
     }
     Ok(())
 }
