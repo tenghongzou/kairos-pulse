@@ -74,6 +74,12 @@ interval = 5
 # Unix 上新建的檔案權限為 0600。啟動時檢查權限，過寬時記 WARN（Unix：群組或其他使用者有權限，
 # 擁有者為 root 時允許群組可讀；Windows：ACL 允許 Users、Everyone 等一般使用者存取）
 id_file = "agent.id"
+# 主控台的顯示名稱（1～255 bytes；空字串 = 不送，主控台以主機名稱顯示）與標籤
+# （最多 32 個、每個 1～64 bytes、不得重複，例如 ["env:prod", "team:web"]）。
+# 只在 Kairos 支援協定 v2 時送出；不得含控制字元、零寬空格等不可見字元，不符時啟動即報錯。
+# tags 只能在 pulse.toml 設定（環境變數不支援陣列）
+display_name = ""
+tags = []
 
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）

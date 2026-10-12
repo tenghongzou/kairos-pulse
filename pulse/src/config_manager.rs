@@ -73,6 +73,10 @@ pub struct ReportConfig {
 pub struct AgentConfig {
     /// 存放 agent_id 的檔案路徑
     pub id_file: String,
+    /// 主控台顯示名稱（協定 v2 的 hello `display_name`）；空字串為不送
+    pub display_name: String,
+    /// 標籤（協定 v2 的 hello `tags`）
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,6 +235,33 @@ impl AppConfig {
             return Err(ConfigError::Message(
                 "agent.id_file 不可為空字串".to_string(),
             ));
+        }
+        // 與 Kairos 的 hello 驗證相同的規則（協定 v2 的 display_name、tags），避免連線後才被拒絕
+        let host = kairos_proto::HostInfo {
+            display_name: Some(self.agent.display_name.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            tags: Some(self.agent.tags.clone()),
+            ..Default::default()
+        };
+        if let Err(e) = kairos_proto::validate_host_info(&host) {
+            let (field, detail) = if e.starts_with("display_name") {
+                (
+                    "agent.display_name",
+                    format!("1～{} bytes", kairos_proto::MAX_DISPLAY_NAME_BYTES),
+                )
+            } else {
+                (
+                    "agent.tags",
+                    format!(
+                        "最多 {} 個、每個 1～{} bytes、不得重複",
+                        kairos_proto::MAX_TAGS,
+                        kairos_proto::MAX_TAG_BYTES
+                    ),
+                )
+            };
+            return Err(ConfigError::Message(format!(
+                "{field} 不符合限制（{detail}，不得含控制字元、格式字元等不可見字元）：{e}"
+            )));
         }
         range(
             "log.retention_days",
@@ -567,6 +598,55 @@ mod tests {
                 .trusts_system_roots()
         );
         assert!(load("[server]\nport = 9000\n").server.trusts_system_roots());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn display_name_and_tags_from_pulse_toml() {
+        // 協定 v2 的 display_name／tags：預設不送；不符合 Kairos 的 hello 限制時啟動即報錯
+        let cfg = AppConfig::build(None, Some(Map::new())).unwrap();
+        assert_eq!(cfg.agent.display_name, "");
+        assert!(cfg.agent.tags.is_empty());
+        let cfg =
+            AppConfig::build(None, Some(env(&[("PULSE__AGENT__DISPLAY_NAME", "Web 01")]))).unwrap();
+        assert_eq!(cfg.agent.display_name, "Web 01");
+        assert!(
+            build_err(&[("PULSE__AGENT__DISPLAY_NAME", "a\u{202e}b")])
+                .contains("agent.display_name")
+        );
+        assert!(
+            build_err(&[("PULSE__AGENT__DISPLAY_NAME", &"n".repeat(256))])
+                .contains("agent.display_name")
+        );
+
+        let dir = std::env::temp_dir()
+            .join("pulse-config-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pulse.toml");
+        let load = |content: &str| {
+            std::fs::write(&file, content).unwrap();
+            AppConfig::build(Some(file.to_str().unwrap()), Some(Map::new()))
+        };
+        let cfg = load("[agent]\ndisplay_name = \"主機 A\"\ntags = [\"env:prod\", \"team:web\"]\n")
+            .unwrap();
+        assert_eq!(cfg.agent.display_name, "主機 A");
+        assert_eq!(cfg.agent.tags, ["env:prod", "team:web"]);
+        for bad in [
+            "[agent]\ntags = [\"a\", \"a\"]\n",
+            "[agent]\ntags = [\"\"]\n",
+            "[agent]\ntags = [\"a\\nb\"]\n",
+        ] {
+            let err = load(bad).unwrap_err().to_string();
+            assert!(err.contains("agent.tags"), "{bad}: {err}");
+        }
+        let many: Vec<String> = (0..=kairos_proto::MAX_TAGS)
+            .map(|i| format!("\"t{i}\""))
+            .collect();
+        let err = load(&format!("[agent]\ntags = [{}]\n", many.join(",")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent.tags"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
