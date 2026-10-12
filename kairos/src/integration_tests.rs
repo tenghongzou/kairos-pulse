@@ -6,7 +6,7 @@
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +32,8 @@ use crate::auth::BindingPolicy;
 use crate::config::TimeoutSettings;
 use crate::connection::ConnContext;
 use crate::connection::{MESSAGE_BURST, MESSAGES_PER_SEC};
-use crate::per_ip::PerIpLimiter;
+use crate::per_ip::cidr::Allowlist;
+use crate::per_ip::{LimiterSnapshot, PerIpLimiter, PerIpPolicy};
 use crate::rate::{REPORT_INITIAL_TOKENS, REPORT_RATE_PER_SEC, ReportLimiter};
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::Shutdown;
@@ -56,6 +57,10 @@ struct Options {
     max_agents: usize,
     max_connections: usize,
     max_connections_per_ip: usize,
+    /// `server.per_ip_allowlist`
+    per_ip_allowlist: Vec<&'static str>,
+    /// 允許清單內每個位址的實際上限
+    max_connections_per_allowlisted_ip: usize,
     timeouts: TimeoutSettings,
     /// 取代真正的 report writer（例如模擬卡住的磁碟）
     reports: Option<ReportSink>,
@@ -70,6 +75,8 @@ impl Default for Options {
             max_agents: 100,
             max_connections: 64,
             max_connections_per_ip: 32,
+            per_ip_allowlist: Vec::new(),
+            max_connections_per_allowlisted_ip: 64,
             timeouts: TimeoutSettings::default(),
             reports: None,
             throttle_interval: crate::throttle::DEFAULT_INTERVAL,
@@ -84,6 +91,7 @@ struct Server {
     tls: Arc<TlsState>,
     shutdown: Arc<Shutdown>,
     throttle: Arc<LogThrottle>,
+    per_ip: Arc<PerIpLimiter>,
     accept: JoinHandle<()>,
 }
 
@@ -116,6 +124,12 @@ impl Server {
         let registry = Arc::new(Registry::with_max_agents(opts.max_agents));
         let shutdown = Arc::new(Shutdown::new());
         let throttle = Arc::new(LogThrottle::new(opts.throttle_interval));
+        let policy = PerIpPolicy {
+            max_per_ip: opts.max_connections_per_ip,
+            allowlist: Arc::new(Allowlist::parse(&opts.per_ip_allowlist).unwrap()),
+            max_per_allowlisted_ip: opts.max_connections_per_allowlisted_ip,
+            mtls: opts.mtls_crls.is_some(),
+        };
         let ctx = Arc::new(ConnContext {
             registry: registry.clone(),
             reports,
@@ -124,14 +138,16 @@ impl Server {
             tls: tls.clone(),
             throttle: throttle.clone(),
             binding: BindingPolicy::default(),
-            report_limiter: Arc::new(ReportLimiter::new(opts.max_connections_per_ip)),
+            report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // 與正式程式相同的 accept 迴圈（含全域與每 IP 的連線上限）
-        let per_ip = PerIpLimiter::new(opts.max_connections_per_ip);
+        let per_ip = PerIpLimiter::with_policy(policy);
         let max_connections = opts.max_connections;
+        let accept_per_ip = per_ip.clone();
         let accept = tokio::spawn(async move {
+            let per_ip = accept_per_ip;
             let mut connections = accept_loop(listener, ctx, max_connections, per_ip)
                 .await
                 .unwrap();
@@ -145,6 +161,7 @@ impl Server {
             tls,
             shutdown,
             throttle,
+            per_ip,
             accept,
         }
     }
@@ -170,7 +187,9 @@ impl Server {
             None => (None, Vec::new()),
             Some(crls) => {
                 let ca = dir.join("client-ca.crt");
-                std::fs::write(&ca, test_pki::CA).unwrap();
+                // 另含 NAT 情境用的測試 CA（testdata/pki/nat-ca.crt，簽發 nat-clients.bundle 的 40 個身分）
+                let nat_ca = std::fs::read_to_string(format!("{PKI}nat-ca.crt")).unwrap();
+                std::fs::write(&ca, format!("{}{}", test_pki::CA, nat_ca)).unwrap();
                 let paths = crls
                     .iter()
                     .enumerate()
@@ -787,6 +806,13 @@ async fn handshake_slots_are_limited_and_reserved_for_registered_connections() {
         }
     }
     assert!(rejected, "握手名額用盡時新連線不應完成握手");
+    // 因全域上限被拒（握手中上限）的次數；不計入每 IP 上限
+    let snap = server.per_ip.snapshot(Instant::now());
+    assert!(
+        snap.rejections.global.handshake_limit_rejected >= 1,
+        "{snap:?}"
+    );
+    assert_eq!(snap.rejections.per_ip.total, 0);
     // 已註冊的連線不受影響
     registered.send(&heartbeat(2)).await;
     assert_eq!(registered.recv().await["type"], "ack");
@@ -1138,4 +1164,233 @@ async fn unauthenticated_agent_events_are_throttled_by_ip_and_list_skipped_agent
         )),
         "{line}"
     );
+}
+
+/// `testdata/pki/nat-clients.bundle` 的 (agent_id, 憑證 PEM, 私鑰 PEM)：40 個由 NAT 測試 CA 簽發的身分
+fn nat_identities() -> Vec<(String, String, String)> {
+    let bundle = std::fs::read_to_string(format!("{PKI}nat-clients.bundle")).unwrap();
+    let end = "-----END PRIVATE KEY-----";
+    let ids: Vec<_> = bundle
+        .split_inclusive(end)
+        .filter(|chunk| chunk.contains(end))
+        .enumerate()
+        .map(|(i, chunk)| {
+            let at = chunk.find("-----BEGIN PRIVATE KEY-----").unwrap();
+            (
+                format!("4e470000-0000-4000-8000-{:012x}", i + 1),
+                chunk[..at].trim().to_string(),
+                chunk[at..].trim().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(ids.len(), 40);
+    ids
+}
+
+/// 嘗試建立 TLS 連線直到被伺服器在握手前關閉（停滯的連線可能尚未被 accept，稍後再試）；回傳是否被拒
+async fn rejected_before_handshake(addr: SocketAddr, connector: &TlsConnector) -> bool {
+    for _ in 0..50 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        match tokio::time::timeout(
+            RECV_TIMEOUT,
+            connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("伺服器應立即關閉超過上限的連線")
+        {
+            Err(_) => return true,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    false
+}
+
+/// 重試建立 TLS 連線直到成功（伺服器端歸還名額在背景進行）
+async fn connect_when_admitted(addr: SocketAddr, connector: &TlsConnector) -> Client {
+    for _ in 0..100 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        if let Ok(Ok(tls)) = tokio::time::timeout(
+            RECV_TIMEOUT,
+            connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        {
+            let handshake = tls.get_ref().1.handshake_kind();
+            let (r, w) = tokio::io::split(tls);
+            return Client {
+                lines: BufReader::new(r).lines(),
+                writer: w,
+                handshake,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("名額歸還後應可再建立連線");
+}
+
+/// 等待 `pred` 對伺服器的計數快照成立，回傳最後一次的快照
+async fn wait_for_snapshot(
+    server: &Server,
+    pred: impl Fn(&LimiterSnapshot) -> bool,
+) -> LimiterSnapshot {
+    let deadline = Instant::now() + RECV_TIMEOUT;
+    loop {
+        let snap = server.per_ip.snapshot(Instant::now());
+        if pred(&snap) || Instant::now() >= deadline {
+            return snap;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+const LOCALHOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+#[tokio::test]
+async fn mtls_counts_by_identity_so_more_than_32_agents_behind_one_nat_can_connect() {
+    // A7 根本解：同一個 NAT（此處為 127.0.0.1）後 40 台各自持有憑證的 agent，每 IP 上限維持預設 32，
+    // 全部都能連上；通過 hello 後依憑證身分計數，不佔來源位址的名額
+    let server = Server::start(Options {
+        mtls_crls: Some(Vec::new()),
+        max_connections: 128,
+        max_agents: 128,
+        ..Options::default()
+    })
+    .await;
+    let identities = nat_identities();
+    let mut clients = Vec::new();
+    for (id, cert, key) in &identities {
+        let mut c = Client::connect_with(&connector(Some((cert, key))), server.addr).await;
+        c.register(id).await;
+        clients.push(c);
+    }
+    assert_eq!(server.agent_ids().len(), 40);
+    let snap = wait_for_snapshot(&server, |s| s.counted_connections == 0).await;
+    assert_eq!(snap.counted_connections, 0, "{snap:?}");
+    assert_eq!((snap.identities, snap.identity_connections), (40, 40));
+    assert_eq!(snap.rejections.per_ip.total, 0);
+
+    // 同一身分再連線：與既有的 superseded 行為一致，新連線取代舊連線，身分數不變
+    let (id, cert, key) = &identities[0];
+    let mut again = Client::connect_with(&connector(Some((cert, key))), server.addr).await;
+    again.register(id).await;
+    clients[0].expect_error("superseded", true).await;
+    clients[0].expect_clean_close().await;
+    let snap = wait_for_snapshot(&server, |s| s.identity_connections == 40).await;
+    assert_eq!((snap.identities, snap.identity_connections), (40, 40));
+    assert_eq!(server.agent_ids().len(), 40);
+    for c in clients.iter_mut().skip(1) {
+        c.send(&heartbeat(2)).await;
+        assert_eq!(c.recv().await["type"], "ack");
+    }
+}
+
+#[tokio::test]
+async fn mtls_still_limits_connections_per_ip_before_hello() {
+    // K-S2：mTLS 時每 IP 上限仍保護握手前與握手中的階段（慢速握手）；已通過 hello 的連線不受影響
+    let server = Server::start(Options {
+        mtls_crls: Some(Vec::new()),
+        max_connections: 64,
+        max_connections_per_ip: 4,
+        ..Options::default()
+    })
+    .await;
+    let identities = nat_identities();
+    let mut registered = Vec::new();
+    for (id, cert, key) in identities.iter().take(6) {
+        let mut c = Client::connect_with(&connector(Some((cert, key))), server.addr).await;
+        c.register(id).await;
+        registered.push(c);
+    }
+    // 4 條只建立 TCP、不握手的連線佔滿該位址握手中的名額（全域握手中上限 32 仍有剩餘）
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        stalled.push(TcpStream::connect(server.addr).await.unwrap());
+    }
+    let (_, cert, key) = &identities[10];
+    assert!(rejected_before_handshake(server.addr, &connector(Some((cert, key)))).await);
+    let snap = server.per_ip.snapshot(Instant::now());
+    let rejected = &snap.rejections.per_ip;
+    assert!(rejected.total >= 1, "{snap:?}");
+    assert_eq!(rejected.sources[0].source, LOCALHOST);
+    assert_eq!(
+        (rejected.sources[0].limit, rejected.sources[0].allowlisted),
+        (4, false)
+    );
+    assert_eq!(snap.rejections.global.handshake_limit_rejected, 0);
+    let needle = "來自 127.0.0.1 的握手中（尚未通過 hello）的連線數已達上限 4（server.max_connections_per_ip";
+    let logs = server.wait_for_logs(1, |l| l.contains(needle)).await;
+    assert!(logs.iter().any(|l| l.contains(needle)), "{logs:#?}");
+    // 已通過 hello 的 6 條連線（超過每 IP 上限 4）不受影響
+    for c in &mut registered {
+        c.send(&heartbeat(2)).await;
+        assert_eq!(c.recv().await["type"], "ack");
+    }
+    // 停滯的連線關閉後，新的 agent 可以連上
+    drop(stalled);
+    let (id, cert, key) = &identities[11];
+    let mut c = connect_when_admitted(server.addr, &connector(Some((cert, key)))).await;
+    c.register(id).await;
+}
+
+#[tokio::test]
+async fn allowlisted_address_uses_the_allowlisted_limit_without_mtls() {
+    // A7 過渡方案：允許清單內的位址改用允許清單的上限；被拒時依來源計數並記錄對應的設定
+    let server = Server::start(Options {
+        max_connections_per_ip: 2,
+        per_ip_allowlist: vec!["127.0.0.0/8"],
+        max_connections_per_allowlisted_ip: 5,
+        ..Options::default()
+    })
+    .await;
+    let mut clients = Vec::new();
+    for i in 0..5 {
+        let mut c = Client::connect(server.addr).await;
+        c.register(&format!("4e470000-0000-4000-8000-{:012x}", 100 + i))
+            .await;
+        clients.push(c);
+    }
+    // 未啟用 mTLS：已註冊的連線仍依來源位址計數
+    let snap = server.per_ip.snapshot(Instant::now());
+    assert_eq!((snap.counted_connections, snap.identities), (5, 0));
+    assert!(rejected_before_handshake(server.addr, &connector(None)).await);
+    let snap = server.per_ip.snapshot(Instant::now());
+    let source = snap.rejections.per_ip.sources[0];
+    assert_eq!(source.source, LOCALHOST);
+    assert_eq!((source.limit, source.allowlisted), (5, true));
+    let needle = "來自 127.0.0.1 的同時連線數已達上限 5（此位址在 server.per_ip_allowlist 中";
+    let logs = server.wait_for_logs(1, |l| l.contains(needle)).await;
+    assert!(logs.iter().any(|l| l.contains(needle)), "{logs:#?}");
+    // 名額歸還後可再連線
+    drop(clients.pop());
+    let mut c = connect_when_admitted(server.addr, &connector(None)).await;
+    c.register(OTHER_ID).await;
+}
+
+#[tokio::test]
+async fn global_limit_pause_time_is_counted() {
+    // D15：因全域上限被拒（KRS-W2204）：暫停接受新連線的次數與累計時間
+    let server = Server::start(Options {
+        max_connections: 2,
+        ..Options::default()
+    })
+    .await;
+    let mut a = Client::connect(server.addr).await;
+    a.register(ID).await;
+    // 第 2 條停在握手前：用完全域名額，accept 迴圈暫停
+    let stalled = TcpStream::connect(server.addr).await.unwrap();
+    let snap = wait_for_snapshot(&server, |s| s.rejections.global.paused_now).await;
+    assert!(snap.rejections.global.paused_now, "{snap:?}");
+    assert_eq!(snap.rejections.global.pauses, 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // 釋放後恢復，累計時間包含整段暫停
+    drop(stalled);
+    let snap = wait_for_snapshot(&server, |s| !s.rejections.global.paused_now).await;
+    assert!(!snap.rejections.global.paused_now, "{snap:?}");
+    assert!(
+        snap.rejections.global.paused >= Duration::from_millis(50),
+        "{snap:?}"
+    );
+    assert_eq!(snap.rejections.per_ip.total, 0);
+    a.send(&heartbeat(2)).await;
+    assert_eq!(a.recv().await["type"], "ack");
 }
