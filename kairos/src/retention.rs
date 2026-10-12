@@ -110,51 +110,7 @@ impl DateGuard {
 
     /// 記錄狀態變化（措辭與 A8 抽出共用 crate 之前相同）
     fn log_event(&self, event: &GuardEvent) {
-        let hours = |d: Duration| d.as_secs() / 3600;
-        match *event {
-            GuardEvent::JumpCleared { today, .. } => {
-                info!("系統日期已回到 {}，恢復清除過期的{}", today, self.label)
-            }
-            GuardEvent::RollbackStarted { today, accepted } => info!(
-                "系統日期 {} 早於先前的 {}（時鐘回撥）；以較早的日期清除過期的{}，持續 {} 小時後改以此日期為基準",
-                today,
-                accepted,
-                self.label,
-                hours(ROLLBACK_ACCEPT_AFTER)
-            ),
-            GuardEvent::RollbackAccepted { today, .. } => info!(
-                "系統日期回撥至 {} 已持續 {} 小時，改以此日期作為清除過期的{}的基準",
-                today,
-                hours(ROLLBACK_ACCEPT_AFTER),
-                self.label
-            ),
-            // Kairos 不記錄回撥計時的取消（Pulse 記 debug）
-            GuardEvent::RollbackCleared { .. } => {}
-            GuardEvent::JumpStarted {
-                today,
-                allowed_max,
-                accepted,
-            } => warn!(
-                "系統日期 {} 晚於依經過時間推算的最晚日期 {}（先前為 {}），可能是時鐘被誤校；暫停清除過期的{}以免誤刪。若日期正確，{} 小時後會恢復清除",
-                today,
-                allowed_max,
-                accepted,
-                self.label,
-                hours(JUMP_ACCEPT_AFTER)
-            ),
-            GuardEvent::JumpRestarted { today, previous } => warn!(
-                "暫停清除期間系統日期再往前跳到 {}（偵測到跳躍時為 {}），重新起算 {} 小時",
-                today,
-                previous,
-                hours(JUMP_ACCEPT_AFTER)
-            ),
-            GuardEvent::JumpAccepted { today } => warn!(
-                "系統日期 {} 已持續 {} 小時，接受為正確日期並恢復清除過期的{}",
-                today,
-                hours(JUMP_ACCEPT_AFTER),
-                self.label
-            ),
-        }
+        log_guard_event(self.label, event);
     }
 
     /// 原子寫入狀態檔（暫存檔同步到磁碟後 rename）
@@ -193,6 +149,56 @@ impl DateGuard {
                 self.save_failed = true;
             }
         }
+    }
+}
+
+/// 記錄 [`date_guard::DateGuard`] 的狀態變化；`label` 為被清除的資料的名稱（例如「 report 檔」）。
+/// JSONL 檔、日誌與 SQLite 的保留清除共用同一套措辭
+pub fn log_guard_event(label: &str, event: &GuardEvent) {
+    let hours = |d: Duration| d.as_secs() / 3600;
+    match *event {
+        GuardEvent::JumpCleared { today, .. } => {
+            info!("系統日期已回到 {}，恢復清除過期的{}", today, label)
+        }
+        GuardEvent::RollbackStarted { today, accepted } => info!(
+            "系統日期 {} 早於先前的 {}（時鐘回撥）；以較早的日期清除過期的{}，持續 {} 小時後改以此日期為基準",
+            today,
+            accepted,
+            label,
+            hours(ROLLBACK_ACCEPT_AFTER)
+        ),
+        GuardEvent::RollbackAccepted { today, .. } => info!(
+            "系統日期回撥至 {} 已持續 {} 小時，改以此日期作為清除過期的{}的基準",
+            today,
+            hours(ROLLBACK_ACCEPT_AFTER),
+            label
+        ),
+        // Kairos 不記錄回撥計時的取消（Pulse 記 debug）
+        GuardEvent::RollbackCleared { .. } => {}
+        GuardEvent::JumpStarted {
+            today,
+            allowed_max,
+            accepted,
+        } => warn!(
+            "系統日期 {} 晚於依經過時間推算的最晚日期 {}（先前為 {}），可能是時鐘被誤校；暫停清除過期的{}以免誤刪。若日期正確，{} 小時後會恢復清除",
+            today,
+            allowed_max,
+            accepted,
+            label,
+            hours(JUMP_ACCEPT_AFTER)
+        ),
+        GuardEvent::JumpRestarted { today, previous } => warn!(
+            "暫停清除期間系統日期再往前跳到 {}（偵測到跳躍時為 {}），重新起算 {} 小時",
+            today,
+            previous,
+            hours(JUMP_ACCEPT_AFTER)
+        ),
+        GuardEvent::JumpAccepted { today } => warn!(
+            "系統日期 {} 已持續 {} 小時，接受為正確日期並恢復清除過期的{}",
+            today,
+            hours(JUMP_ACCEPT_AFTER),
+            label
+        ),
     }
 }
 
