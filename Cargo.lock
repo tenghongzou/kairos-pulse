@@ -272,6 +272,7 @@ dependencies = [
 name = "kp-e2e"
 version = "0.0.0"
 dependencies = [
+ "rustls",
  "serde_json",
 ]
 

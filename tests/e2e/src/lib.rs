@@ -8,8 +8,9 @@
 //! - [`TestDir`]：每個測試獨立的暫存目錄（測試失敗時保留，方便查看日誌）。
 //! - [`Kairos`]、[`Pulse`]：在暫存目錄中寫好設定、憑證與 `agent.id`，以隨機埠在 127.0.0.1 上啟動。
 //! - [`test_pki`]：與 Kairos 整合測試共用的 mTLS 測試 PKI（客戶端憑證、私鑰、CA 與 CRL）。
+//! - [`RawClient`]：以 mTLS 連上 Kairos、逐行收送 JSON 的假 client（模擬只支援協定 v1 的舊版 Pulse）。
 //!
-//! 不連外部網路、不依賴 crates.io 以外的新套件（只用標準函式庫與既有的 `serde_json`）。
+//! 不連外部網路、不新增外部套件（只用標準函式庫與 workspace 已使用的 `serde_json`、`rustls`）。
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -763,5 +764,90 @@ level = "trace"
     /// 啟動（不等待註冊）
     pub fn start(&self, envs: &[(&str, &str)]) -> Proc {
         Proc::spawn("pulse", &self.dir, &[], envs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 假 client（協定 v1）
+// ---------------------------------------------------------------------------
+
+/// 以 mTLS 連上 Kairos、逐行收送 JSON 的假 client。
+///
+/// 新版 Pulse 一律宣告 `proto_min` 1～`proto_max` 2，沒有只用 v1 的設定；舊版（0.1.0）Pulse 的
+/// 執行檔也不在 repo 中，因此以這個 client 送出與舊版 Pulse 相同的訊息，驗證新版 Kairos 對 v1 的相容。
+/// TLS 設定與 Pulse 相同：以 `pulse/testdata/server-ca.pem` 驗證伺服器（`localhost`），出示客戶端憑證。
+pub struct RawClient {
+    reader: std::io::BufReader<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>,
+}
+
+impl RawClient {
+    /// 連上 `127.0.0.1:port` 並完成 TLS 握手（讀取逾時為 [`WAIT`]）
+    pub fn connect(port: u16, identity: Identity) -> Self {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(pulse_testdata("server-ca.pem")).unwrap() {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(identity.cert.as_bytes())
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(identity.key.as_bytes()).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(chain, key)
+        .unwrap();
+        let conn = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let tcp = std::net::TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|e| panic!("無法連上 127.0.0.1:{port}：{e}"));
+        tcp.set_read_timeout(Some(WAIT)).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, tcp);
+        while stream.conn.is_handshaking() {
+            stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .unwrap_or_else(|e| panic!("TLS 握手失敗：{e}"));
+        }
+        Self {
+            reader: std::io::BufReader::new(stream),
+        }
+    }
+
+    /// 送出一行 JSON
+    pub fn send(&mut self, msg: &serde_json::Value) {
+        use std::io::Write as _;
+        let stream = self.reader.get_mut();
+        writeln!(stream, "{msg}").unwrap();
+        stream.flush().unwrap();
+    }
+
+    /// 讀取一行 JSON（逾時或連線關閉時 panic）
+    pub fn recv(&mut self) -> serde_json::Value {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        let n = self
+            .reader
+            .read_line(&mut line)
+            .unwrap_or_else(|e| panic!("讀取 Kairos 的回應失敗：{e}"));
+        assert!(n > 0, "Kairos 關閉了連線");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("回應不是 JSON（{e}）：{line}"))
+    }
+
+    /// 送出 close_notify 後關閉（與 Pulse 的優雅斷線相同）
+    pub fn close(mut self) {
+        use std::io::Write as _;
+        let stream = self.reader.get_mut();
+        stream.conn.send_close_notify();
+        let _ = stream.flush();
     }
 }

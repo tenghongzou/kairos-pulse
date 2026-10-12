@@ -5,6 +5,8 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use serde_json::Value;
+
 use kp_e2e::{
     GOOD, KAIROS_STARTED, KAIROS_STOPPED, Kairos, PULSE_REGISTERED, PULSE_STOPPED, Pulse, REVOKED,
     TestDir, WAIT, poll_until, test_pki,
@@ -26,30 +28,22 @@ fn seqs(lines: &[String], prefix: &str) -> BTreeSet<u64> {
         .collect()
 }
 
-/// report 的 CPU 使用率與記憶體總量／用量：`schema` 1 為三欄位，`schema` 2 取自標準指標
-fn cpu_and_memory(r: &serde_json::Value) -> (f64, u64, u64) {
-    if r["schema"] == 2 {
-        let metric = |name: &str| {
-            r["metrics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|m| m["name"] == name)
-                .unwrap_or_else(|| panic!("缺少 {name}：{r}"))["value"]
-                .clone()
-        };
-        (
-            metric("system.cpu.usage").as_f64().unwrap(),
-            metric("system.memory.total").as_u64().unwrap(),
-            metric("system.memory.used").as_u64().unwrap(),
-        )
-    } else {
-        (
-            r["cpu_usage"].as_f64().unwrap(),
-            r["total_memory"].as_u64().unwrap(),
-            r["used_memory"].as_u64().unwrap(),
-        )
+/// 協定 v2 的指標 report（`schema` 2）中沒有 label 的標準指標值
+fn metric<'a>(r: &'a Value, name: &str) -> &'a Value {
+    r["metrics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("schema 2 的 report 應有 metrics：{r}"))
+        .iter()
+        .find(|m| m["name"] == name && m.get("labels").is_none())
+        .unwrap_or_else(|| panic!("缺少 {name}：{r}"))
+}
+
+/// 這台機器的 Pulse 是否有可用的機器 ID（有才會在 hello 中送出 `host_fingerprint`）
+fn has_machine_id() -> bool {
+    if cfg!(windows) {
+        return true; // 登錄機碼 MachineGuid 一定存在
     }
+    std::fs::read_to_string("/etc/machine-id").is_ok_and(|s| !s.trim().is_empty())
 }
 
 #[test]
@@ -64,11 +58,22 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
     let registered = p.lines_with(PULSE_REGISTERED);
     assert!(
         registered[0].contains(&format!("agent_id={}", test_pki::GOOD_ID))
-            && registered[0].contains("伺服器離線判定 5000 ms"),
-        "{registered:?}"
+            && registered[0].contains("伺服器離線判定 5000 ms")
+            && registered[0].contains("協定 v2"),
+        "新版 Pulse 與新版 Kairos 應協商為協定 v2：{registered:?}"
+    );
+    // Kairos 的上線日誌也寫出協商結果
+    k.wait_for("，協定 v", WAIT);
+    let online = k.lines_with("，協定 v");
+    assert!(
+        online[0].contains(&format!("agent {}", test_pki::GOOD_ID))
+            && online[0].contains("上線")
+            && online[0].contains("協定 v2"),
+        "{online:?}"
     );
 
-    // report：等到至少 3 筆寫入 JSONL，檢查每一筆的內容
+    // report：等到至少 3 筆寫入 JSONL，檢查每一筆的內容。協定 v2 且雙方都宣告 metrics：
+    // 每行為 schema 2 的通用指標，不再有 cpu_usage／total_memory／used_memory 三欄位
     assert!(
         poll_until(WAIT, || kairos.reports().len() >= 3),
         "JSONL 沒有寫入 3 筆 report：{:?}\n{}\n{}",
@@ -84,8 +89,25 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
         assert!(!r["hostname"].as_str().unwrap().is_empty(), "{r}");
         assert!(!r["recv_at"].as_str().unwrap().is_empty(), "{r}");
         assert!(!r["ts"].as_str().unwrap().is_empty(), "{r}");
-        let (cpu, total, used) = cpu_and_memory(r);
+        assert_eq!(r["schema"], 2, "{r}");
+        for old in ["cpu_usage", "total_memory", "used_memory"] {
+            assert!(r.get(old).is_none(), "schema 2 不應有 {old}：{r}");
+        }
+        let metrics = r["metrics"].as_array().unwrap();
+        assert!(!metrics.is_empty() && metrics.len() <= 256, "{r}");
+        for m in metrics {
+            assert!(m["name"].as_str().unwrap().starts_with("system."), "{m}");
+            assert!(m["value"].is_number(), "{m}");
+            assert!(!m["unit"].as_str().unwrap().is_empty(), "{m}");
+        }
+        assert_eq!(metric(r, "system.cpu.usage")["unit"], "%", "{r}");
+        assert_eq!(metric(r, "system.memory.total")["unit"], "By", "{r}");
+        assert_eq!(metric(r, "system.memory.used")["unit"], "By", "{r}");
+        let cpu = metric(r, "system.cpu.usage")["value"].as_f64().unwrap();
         assert!((0.0..=100.0).contains(&cpu), "{r}");
+        // bytes 以整數保存（不會變成小數）
+        let total = metric(r, "system.memory.total")["value"].as_u64().unwrap();
+        let used = metric(r, "system.memory.used")["value"].as_u64().unwrap();
         assert!(total > 0 && used <= total, "{r}");
         let seq = r["seq"].as_u64().unwrap();
         assert!(seq > last_seq, "seq 應遞增：{reports:?}");
@@ -123,6 +145,31 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
     assert_eq!(agent["agent_id"], test_pki::GOOD_ID, "{agents}");
     assert_eq!(agent["online"], false, "{agents}");
     assert_eq!(agent["offline_after_ms"], 5000, "{agents}");
+    // 協定 v2：協商出的版本與 hello 中的主機資訊
+    assert_eq!(agent["proto"], 2, "{agents}");
+    assert_eq!(agent["report_interval_ms"], 1000, "{agents}");
+    for key in ["name", "arch"] {
+        assert!(
+            !agent["os"][key].as_str().unwrap_or_default().is_empty(),
+            "{agents}"
+        );
+    }
+    if has_machine_id() {
+        let fp = agent["host_fingerprint"].as_str().unwrap_or_default();
+        assert!(fp.starts_with("sha256:") && fp.len() == 7 + 64, "{agents}");
+    }
+    // display_name、tags 預設不送
+    assert!(agent.get("display_name").is_none(), "{agents}");
+    assert!(agent.get("tags").is_none(), "{agents}");
+    // last_report 由標準指標換算（bytes → MB），另有指標數
+    assert!(
+        agent["last_report"]["total_memory"].as_u64().unwrap() > 0,
+        "{agents}"
+    );
+    assert!(
+        agent["last_report"]["metrics"].as_u64().unwrap() >= 3,
+        "{agents}"
+    );
     assert!(
         agent["last_report"]["seq"].as_u64().unwrap() >= last_seq,
         "{agents}"

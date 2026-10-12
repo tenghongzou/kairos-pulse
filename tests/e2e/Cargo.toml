@@ -15,3 +15,6 @@ doctest = false
 [dependencies]
 # 解析 Kairos 寫出的 reports-*.jsonl 與 agents.json；與 kairos、pulse 使用的版本相同（不新增依賴）
 serde_json = "1"
+# 協定 v1 的假 client（模擬舊版 Pulse）以 mTLS 連上實際的 Kairos；與 kairos、pulse 經 tokio-rustls
+# 使用的版本與加密後端（ring）相同，Cargo.lock 不新增外部套件
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
