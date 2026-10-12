@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::fsperm;
+use crate::protocol::Metric;
 use crate::registry::RegistrySnapshot;
 use crate::retention::{
     DateGuard, DatedFiles, GUARD_STATE_FILE, is_tmp_name_for, write_atomically,
@@ -69,9 +70,41 @@ fn serialize_time<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Er
     s.serialize_str(&fmt_time(*t))
 }
 
-/// reports-YYYY-MM-DD.jsonl 的一行（欄位順序即輸出順序）
+/// JSONL 的 `schema` 1：report 為 v1 的三個欄位（`cpu_usage`、`total_memory`、`used_memory`）
+pub const REPORT_SCHEMA_LEGACY: u32 = 1;
+/// JSONL 的 `schema` 2：report 為協定 v2 的通用指標 `metrics`
+pub const REPORT_SCHEMA_METRICS: u32 = 2;
+
+/// 一筆 report 的內容，依 JSONL 的 `schema` 區分（審計 O6）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum RecordBody {
+    /// `schema` 1：協定 v1（或 v2 但未協商 `metrics`）
+    Legacy {
+        cpu_usage: f32,
+        total_memory: u64,
+        used_memory: u64,
+    },
+    /// `schema` 2：協定 v2 的通用指標，原樣保存（指標物件中未定義的欄位不保存）
+    Metrics { metrics: Vec<Metric> },
+}
+
+impl RecordBody {
+    /// 對應的 JSONL `schema`
+    pub fn schema(&self) -> u32 {
+        match self {
+            RecordBody::Legacy { .. } => REPORT_SCHEMA_LEGACY,
+            RecordBody::Metrics { .. } => REPORT_SCHEMA_METRICS,
+        }
+    }
+}
+
+/// reports-YYYY-MM-DD.jsonl 的一行（欄位順序即輸出順序）。以 [`ReportRecord::new`] 建立，
+/// `schema` 由內容決定。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReportRecord {
+    /// 這一行的格式版本（[`REPORT_SCHEMA_LEGACY`] 或 [`REPORT_SCHEMA_METRICS`]）
+    pub schema: u32,
     /// 伺服器收到的時間；其 UTC 日期決定寫入哪個檔案
     #[serde(serialize_with = "serialize_time")]
     pub recv_at: DateTime<Utc>,
@@ -80,9 +113,31 @@ pub struct ReportRecord {
     pub hostname: String,
     pub seq: u64,
     pub ts: String,
-    pub cpu_usage: f32,
-    pub total_memory: u64,
-    pub used_memory: u64,
+    #[serde(flatten)]
+    pub body: RecordBody,
+}
+
+impl ReportRecord {
+    pub fn new(
+        recv_at: DateTime<Utc>,
+        peer: String,
+        agent_id: String,
+        hostname: String,
+        seq: u64,
+        ts: String,
+        body: RecordBody,
+    ) -> Self {
+        Self {
+            schema: body.schema(),
+            recv_at,
+            peer,
+            agent_id,
+            hostname,
+            seq,
+            ts,
+            body,
+        }
+    }
 }
 
 const TICKET_PENDING: u8 = 0;
@@ -836,17 +891,19 @@ mod tests {
     const HOUR: Duration = RETENTION_SWEEP_INTERVAL;
 
     fn record_at(seq: u64, recv_at: DateTime<Utc>) -> ReportRecord {
-        ReportRecord {
+        ReportRecord::new(
             recv_at,
-            peer: "p".into(),
-            agent_id: "a".into(),
-            hostname: "h".into(),
+            "p".into(),
+            "a".into(),
+            "h".into(),
             seq,
-            ts: "t".into(),
-            cpu_usage: 1.0,
-            total_memory: 2,
-            used_memory: 1,
-        }
+            "t".into(),
+            RecordBody::Legacy {
+                cpu_usage: 1.0,
+                total_memory: 2,
+                used_memory: 1,
+            },
+        )
     }
 
     fn record(seq: u64) -> ReportRecord {
@@ -909,26 +966,58 @@ mod tests {
 
     #[test]
     fn report_record_field_order_and_values() {
-        let r = ReportRecord {
-            recv_at: at(2026, 10, 8, 3, 15, 45) + chrono::Duration::milliseconds(300),
-            peer: "127.0.0.1:50000".into(),
-            agent_id: "id".into(),
-            hostname: "web-01".into(),
-            seq: 6,
-            ts: "2026-10-08T03:15:45.210Z".into(),
-            cpu_usage: 17.84,
-            total_memory: 49152,
-            used_memory: 37034,
-        };
+        let r = ReportRecord::new(
+            at(2026, 10, 8, 3, 15, 45) + chrono::Duration::milliseconds(300),
+            "127.0.0.1:50000".into(),
+            "id".into(),
+            "web-01".into(),
+            6,
+            "2026-10-08T03:15:45.210Z".into(),
+            RecordBody::Legacy {
+                cpu_usage: 17.84,
+                total_memory: 49152,
+                used_memory: 37034,
+            },
+        );
         let line = serde_json::to_string(&r).unwrap();
-        assert!(line.starts_with(r#"{"recv_at":"2026-10-08T03:15:45.300Z""#));
+        // O6：schema 在最前面，其餘欄位與順序與加入 schema 前相同
+        assert_eq!(
+            line,
+            r#"{"schema":1,"recv_at":"2026-10-08T03:15:45.300Z","peer":"127.0.0.1:50000","agent_id":"id","hostname":"web-01","seq":6,"ts":"2026-10-08T03:15:45.210Z","cpu_usage":17.84,"total_memory":49152,"used_memory":37034}"#
+        );
+    }
+
+    #[test]
+    fn metrics_record_keeps_the_metrics_as_received() {
+        let metrics: Vec<Metric> = serde_json::from_str(
+            r#"[{"name":"system.cpu.usage","value":17.84,"unit":"%"},
+                {"name":"system.memory.total","value":51539607552,"unit":"By"},
+                {"name":"system.filesystem.total","value":5,"unit":"By","labels":{"mountpoint":"/","fstype":"ext4"},"ignored":1}]"#,
+        )
+        .unwrap();
+        let r = ReportRecord::new(
+            at(2026, 10, 8, 3, 15, 45),
+            "p".into(),
+            "id".into(),
+            "h".into(),
+            3,
+            "t".into(),
+            RecordBody::Metrics { metrics },
+        );
+        assert_eq!(r.schema, REPORT_SCHEMA_METRICS);
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(line.starts_with(r#"{"schema":2,"recv_at":"#), "{line}");
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v,
-            json!({"recv_at":"2026-10-08T03:15:45.300Z","peer":"127.0.0.1:50000","agent_id":"id",
-                   "hostname":"web-01","seq":6,"ts":"2026-10-08T03:15:45.210Z","cpu_usage":17.84,
-                   "total_memory":49152,"used_memory":37034})
+            json!({"schema":2,"recv_at":"2026-10-08T03:15:45.000Z","peer":"p","agent_id":"id","hostname":"h",
+                   "seq":3,"ts":"t","metrics":[
+                       {"name":"system.cpu.usage","value":17.84,"unit":"%"},
+                       {"name":"system.memory.total","value":51539607552_u64,"unit":"By"},
+                       {"name":"system.filesystem.total","value":5,"unit":"By","labels":{"fstype":"ext4","mountpoint":"/"}}]})
         );
+        // 整數保持整數表示（不會變成 51539607552.0）
+        assert!(line.contains(r#""value":51539607552,"#), "{line}");
     }
 
     #[test]

@@ -8,9 +8,12 @@
 use chrono::{SecondsFormat, Utc};
 
 pub use kairos_proto::{
-    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, Proto, ServerMsg, ServerMsgError,
+    ClientMsg, MAX_LINE_LENGTH, Proto, ReportBody, ServerMsg, ServerMsgError,
     is_forbidden_display_char, parse_server_msg,
 };
+
+/// 本程式送出與接受的協定版本（只支援 v1；版本協商見 kairos-proto）
+pub const PROTO_VERSION: u32 = kairos_proto::PROTO_V1;
 
 // `heartbeat.interval` 的設定上限（秒）必須與伺服器的夾值上限一致（PROTOCOL.md「hello 欄位限制」）
 const _: () = assert!(
@@ -54,9 +57,7 @@ mod tests {
         let line = serde_json::to_string(&ClientMsg::Report {
             seq: 1,
             ts: "2026-10-09T00:00:00.000Z".into(),
-            cpu_usage: report_cpu_usage(cpu),
-            total_memory: 2,
-            used_memory: 1,
+            body: ReportBody::legacy(report_cpu_usage(cpu), 2, 1),
         })
         .unwrap();
         let start = line.find("\"cpu_usage\":").unwrap() + "\"cpu_usage\":".len();

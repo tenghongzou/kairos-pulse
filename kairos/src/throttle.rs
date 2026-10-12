@@ -78,6 +78,8 @@ pub enum Category {
     AgentOnline,
     /// agent 離線（連線關閉、被取代）
     AgentOffline,
+    /// 同一個 agent_id 的主機指紋與上次登記時不同（可能是複製的主機共用 agent.id）
+    HostFingerprintChanged,
     /// 宣告的 heartbeat_interval_ms 超出範圍
     HeartbeatClamped,
     /// 內容無效的 report（invalid_report）

@@ -1139,3 +1139,292 @@ async fn unauthenticated_agent_events_are_throttled_by_ip_and_list_skipped_agent
         "{line}"
     );
 }
+
+// ---- 協定 v2 與相容矩陣（A3、A4、O6） ----
+
+/// 新版 Pulse 的 hello：proto 1 + 範圍 1～2 + features 與主機資訊
+fn hello_v2(seq: u64, agent_id: &str, features: &[&str]) -> Value {
+    json!({
+        "type": "hello", "seq": seq, "proto": 1, "proto_min": 1, "proto_max": 2,
+        "features": features, "agent_id": agent_id, "hostname": "web-01",
+        "agent_version": "0.2.0", "heartbeat_interval_ms": 1000,
+        "ts": "2026-10-09T00:00:00.000Z",
+        "host_fingerprint": format!("sha256:{}", "a".repeat(64)),
+        "display_name": "Web 01", "tags": ["env:prod"], "report_interval_ms": 5000,
+        "os": {"name": "Ubuntu", "version": "24.04", "kernel": "6.8.0", "arch": "x86_64"}
+    })
+}
+
+fn metrics_report(seq: u64, cpu: f64) -> String {
+    json!({
+        "type": "report", "seq": seq, "ts": "2026-10-09T00:00:00.000Z",
+        "metrics": [
+            {"name": "system.cpu.usage", "value": cpu, "unit": "%"},
+            {"name": "system.memory.total", "value": 51_539_607_552_u64, "unit": "By"},
+            {"name": "system.memory.used", "value": 38_833_356_800_u64, "unit": "By"},
+            {"name": "system.filesystem.total", "value": 1000, "unit": "By",
+             "labels": {"mountpoint": "/", "fstype": "ext4"}, "extra": "dropped"},
+            {"name": "system.temperature", "value": -3.5, "unit": "Cel",
+             "labels": {"sensor": "acpitz"}}
+        ]
+    })
+    .to_string()
+}
+
+impl Server {
+    /// report 檔的最後一行
+    fn last_report_line(&self) -> Value {
+        let text = std::fs::read_to_string(self.reports_file()).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn v1_pulse_gets_a_v1_session_on_the_new_server() {
+    // 舊 Pulse ↔ 新 Kairos：hello_ack、report 格式、JSONL（除了新增的 schema）都與 v1 相同
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let ack = c.register(ID).await;
+    assert_eq!(
+        ack,
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+    c.send(&report(2)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    let line = server.last_report_line();
+    assert_eq!(line["schema"], 1);
+    assert_eq!(line["cpu_usage"], 12.5);
+    assert_eq!(line["total_memory"], 1000);
+    assert!(line.get("metrics").is_none(), "{line}");
+    // v1 連線送 metrics 格式：與 v1 Kairos 相同，是缺欄位的 bad_request（seq 為 null）
+    c.send(&metrics_report(3, 1.0)).await;
+    let err = c.expect_error("bad_request", false).await;
+    assert_eq!(err["seq"], Value::Null);
+    assert!(
+        err["message"].as_str().unwrap().contains("cpu_usage"),
+        "{err}"
+    );
+    // v1 report 夾帶型別錯誤的 metrics：v1 Kairos 會忽略，這裡也忽略
+    let mut with_garbage: Value = serde_json::from_str(&report(4)).unwrap();
+    with_garbage["metrics"] = json!(5);
+    c.send(&with_garbage.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    let snap = server.registry.snapshot(Utc::now());
+    assert_eq!(snap.agents[0].proto, 1);
+    assert_eq!(snap.agents[0].host, None);
+}
+
+#[tokio::test]
+async fn v1_hello_ignores_v2_host_fields_with_bad_types() {
+    // 協商為 v1 時，主機資訊欄位與 v1 Kairos 一樣被忽略（不檢查型別與限制）
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let mut h: Value = serde_json::from_str(&hello(1, ID, 1000)).unwrap();
+    h["display_name"] = json!(42);
+    h["tags"] = json!("x");
+    h["os"] = json!({"name": "a\nb"});
+    c.send(&h.to_string()).await;
+    assert_eq!(
+        c.recv().await,
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+}
+
+#[tokio::test]
+async fn new_pulse_negotiates_v2_with_metrics() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "future-thing"]).to_string())
+        .await;
+    let ack = c.recv().await;
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    assert_eq!(ack["proto"], 2);
+    assert_eq!(ack["features"], json!(["metrics"]));
+    assert_eq!(ack["offline_after_ms"], 5000);
+    // server_time：RFC 3339 UTC 毫秒，接近現在
+    let server_time = ack["server_time"].as_str().unwrap();
+    assert_eq!(server_time.len(), 24, "{server_time}");
+    assert!(server_time.ends_with('Z'));
+    let t = chrono::DateTime::parse_from_rfc3339(server_time).unwrap();
+    assert!((Utc::now() - t.with_timezone(&Utc)).num_seconds().abs() < 60);
+
+    // 指標 report：原樣保存為 schema 2（指標物件中未定義的欄位不保存）
+    c.send(&metrics_report(2, 17.84)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    let line = server.last_report_line();
+    assert_eq!(line["schema"], 2);
+    assert_eq!(line["agent_id"], ID);
+    assert!(line.get("cpu_usage").is_none(), "{line}");
+    let mut expected: Value = serde_json::from_str(&metrics_report(2, 17.84)).unwrap();
+    expected["metrics"][3]
+        .as_object_mut()
+        .unwrap()
+        .remove("extra");
+    assert_eq!(line["metrics"], expected["metrics"]);
+    let text = std::fs::read_to_string(server.reports_file()).unwrap();
+    assert!(text.contains(r#""value":51539607552,"#), "{text}");
+
+    // agents.json：協定版本、主機資訊與由指標換算的 last_report
+    let snap = serde_json::to_value(server.registry.snapshot(Utc::now())).unwrap();
+    let a = &snap["agents"][0];
+    assert_eq!(a["proto"], 2);
+    assert_eq!(a["display_name"], "Web 01");
+    assert_eq!(a["report_interval_ms"], 5000);
+    assert_eq!(a["os"]["arch"], "x86_64");
+    assert_eq!(a["last_report"]["total_memory"], 49152);
+    assert_eq!(a["last_report"]["metrics"], 5);
+
+    // v2 metrics 連線送 v1 三欄位：缺 metrics 的 bad_request
+    c.send(&report(3)).await;
+    let err = c.expect_error("bad_request", false).await;
+    assert_eq!(err["seq"], Value::Null);
+    assert!(
+        err["message"].as_str().unwrap().contains("metrics"),
+        "{err}"
+    );
+    // 內容不合限制：invalid_report（帶 seq，不保存，連線保持）
+    c.send(&metrics_report(4, 101.0)).await;
+    let err = c.expect_error("invalid_report", false).await;
+    assert_eq!(err["seq"], 4);
+    let mut bad_name: Value = serde_json::from_str(&metrics_report(5, 1.0)).unwrap();
+    bad_name["metrics"][0]["name"] = json!("CPU");
+    c.send(&bad_name.to_string()).await;
+    assert_eq!(c.expect_error("invalid_report", false).await["seq"], 5);
+    // metrics 型別錯誤：bad_request
+    let mut bad_type: Value = serde_json::from_str(&metrics_report(6, 1.0)).unwrap();
+    bad_type["metrics"][0]["value"] = json!("1");
+    c.send(&bad_type.to_string()).await;
+    assert_eq!(
+        c.expect_error("bad_request", false).await["seq"],
+        Value::Null
+    );
+    c.send(&heartbeat(7)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":7}));
+    assert_eq!(server.last_report_line()["seq"], 2);
+}
+
+#[tokio::test]
+async fn v2_without_the_metrics_feature_keeps_the_v1_report_format() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &[]).to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(ack["proto"], 2, "{ack}");
+    assert_eq!(ack["features"], json!(["metrics"]));
+    c.send(&report(2)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    assert_eq!(server.last_report_line()["schema"], 1);
+    c.send(&metrics_report(3, 1.0)).await;
+    c.expect_error("bad_request", false).await;
+}
+
+#[tokio::test]
+async fn version_ranges_without_overlap_are_rejected_with_the_server_range() {
+    let server = Server::start(Options::default()).await;
+    for (proto, min, max) in [(3, Some(3), Some(4)), (0, None, None), (9, None, None)] {
+        let mut c = Client::connect(server.addr).await;
+        let mut h: Value = serde_json::from_str(&hello(5, ID, 1000)).unwrap();
+        h["proto"] = json!(proto);
+        if let (Some(min), Some(max)) = (min, max) {
+            h["proto_min"] = json!(min);
+            h["proto_max"] = json!(max);
+        }
+        c.send(&h.to_string()).await;
+        let err = c.expect_error("unsupported_version", true).await;
+        assert_eq!(err["seq"], 5);
+        assert_eq!(err["message"], "supported proto: 1-2");
+        assert_eq!(
+            (err["proto_min"].clone(), err["proto_max"].clone()),
+            (json!(1), json!(2))
+        );
+        c.expect_clean_close().await;
+    }
+    // proto 2（沒有範圍）：只支援 v2 的 client，新伺服器以 v2 接受
+    let mut c = Client::connect(server.addr).await;
+    let mut h: Value = serde_json::from_str(&hello(1, ID, 1000)).unwrap();
+    h["proto"] = json!(2);
+    c.send(&h.to_string()).await;
+    assert_eq!(c.recv().await["proto"], 2);
+    // 未來的 client（1～9）：取共同的最高版本 2
+    let mut c = Client::connect(server.addr).await;
+    let mut h = hello_v2(1, OTHER_ID, &["metrics"]);
+    h["proto_max"] = json!(9);
+    c.send(&h.to_string()).await;
+    assert_eq!(c.recv().await["proto"], 2);
+}
+
+#[tokio::test]
+async fn invalid_v2_hello_fields_are_bad_requests_with_the_seq() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let cases: Vec<(&str, Value)> = vec![
+        ("proto_min", json!(null)),       // 只有 proto_max
+        ("proto_min", json!(3)),          // min > max
+        ("proto_min", json!("1")),        // 型別錯誤
+        ("features", json!(["Metrics"])), // 格式
+    ];
+    for (i, (field, value)) in cases.into_iter().enumerate() {
+        let seq = 10 + i as u64;
+        let mut h = hello_v2(seq, ID, &["metrics"]);
+        h[field] = value;
+        c.send(&h.to_string()).await;
+        assert_eq!(
+            c.expect_error("bad_request", false).await["seq"],
+            seq,
+            "{field}"
+        );
+        // 不讓連續無效訊息達到上限
+        if i == 2 {
+            c = Client::connect(server.addr).await;
+        }
+    }
+    let mut c = Client::connect(server.addr).await;
+    for (i, (field, value)) in [
+        ("display_name", json!("a\u{202e}b")),
+        ("tags", json!(["a", "a"])),
+        ("report_interval_ms", json!(10)),
+        ("host_fingerprint", json!("md5:abc")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = 20 + i as u64;
+        let mut h = hello_v2(seq, ID, &["metrics"]);
+        h[field] = value;
+        c.send(&h.to_string()).await;
+        assert_eq!(
+            c.expect_error("bad_request", false).await["seq"],
+            seq,
+            "{field}"
+        );
+    }
+    // 修正後的 hello 仍可在同一條連線註冊
+    c.send(&hello_v2(30, ID, &["metrics"]).to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(
+        (ack["type"].clone(), ack["seq"].clone()),
+        (json!("hello_ack"), json!(30))
+    );
+}
+
+#[tokio::test]
+async fn changed_host_fingerprint_is_logged() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics"]).to_string()).await;
+    assert_eq!(c.recv().await["proto"], 2);
+    let mut h = hello_v2(1, ID, &["metrics"]);
+    h["host_fingerprint"] = json!(format!("sha256:{}", "b".repeat(64)));
+    let mut other = Client::connect(server.addr).await;
+    other.send(&h.to_string()).await;
+    assert_eq!(other.recv().await["proto"], 2);
+    let logs = server
+        .wait_for_logs(1, |l| l.contains("主機指紋與上次不同"))
+        .await;
+    let line = logs
+        .iter()
+        .find(|l| l.contains("主機指紋與上次不同"))
+        .expect("應記錄主機指紋改變");
+    assert!(line.contains("sha256:aaaaaaaaaaaa…"), "{line}");
+    assert!(line.contains("sha256:bbbbbbbbbbbb…"), "{line}");
+}

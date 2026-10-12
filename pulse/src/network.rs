@@ -31,8 +31,8 @@ use crate::backoff::Backoff;
 use crate::config_manager::AppConfig;
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
-    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, Proto, ServerMsg, ServerMsgError, now_ts,
-    parse_server_msg, report_cpu_usage, sanitize_cpu_usage,
+    ClientMsg, MAX_LINE_LENGTH, PROTO_VERSION, Proto, ReportBody, ServerMsg, ServerMsgError,
+    now_ts, parse_server_msg, report_cpu_usage, sanitize_cpu_usage,
 };
 use crate::service_status;
 use crate::system_info::Sample;
@@ -860,6 +860,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         heartbeat_interval_ms: u64::try_from(settings.heartbeat_interval.as_millis())
             .unwrap_or(u64::MAX),
         ts: now_ts(),
+        ext: Box::default(),
     })
     .await?;
     log::debug!("已送出 hello（seq={seq}），等待 hello_ack");
@@ -918,9 +919,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 conn.send(&ClientMsg::Report {
                     seq,
                     ts: sample.ts,
-                    cpu_usage,
-                    total_memory: sample.total_memory,
-                    used_memory: sample.used_memory,
+                    body: ReportBody::legacy(cpu_usage, sample.total_memory, sample.used_memory),
                 })
                 .await?;
                 pending_report = Some(seq);
@@ -1091,6 +1090,7 @@ fn handle_pre_ack_line(
             seq,
             proto,
             offline_after_ms,
+            ..
         }) => {
             if proto != PROTO_VERSION {
                 return Err(SessionError::ProtoMismatch(proto));

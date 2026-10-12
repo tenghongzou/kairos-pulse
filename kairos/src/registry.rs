@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
+use crate::protocol::HostInfo;
 use crate::storage::fmt_time;
 use crate::tls::ChainRejection;
 
@@ -43,6 +44,10 @@ pub struct HelloInfo {
     pub agent_id: String,
     pub hostname: String,
     pub agent_version: String,
+    /// 協商出的協定版本
+    pub proto: u32,
+    /// v2 hello 的主機資訊（協商為 v1、或 client 沒有送任何主機資訊時為 `None`）
+    pub host: Option<Arc<HostInfo>>,
     pub peer: String,
     pub offline_after: Duration,
     /// 握手時取得的客戶端憑證鏈（[0] 為 end-entity）；未使用 mTLS 時為 None
@@ -75,9 +80,18 @@ pub struct LastReport {
     pub recv_at: String,
     pub seq: u64,
     pub ts: String,
-    pub cpu_usage: f32,
-    pub total_memory: u64,
-    pub used_memory: u64,
+    /// v1 report 一定有值；v2 的指標 report 取自 `system.cpu.usage`，沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_usage: Option<f32>,
+    /// MB；v2 的指標 report 由 `system.memory.total`（bytes）換算，沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_memory: Option<u64>,
+    /// MB；v2 的指標 report 由 `system.memory.used`（bytes）換算，沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory: Option<u64>,
+    /// v2 的指標 report 中的指標數（v1 不輸出）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -86,6 +100,8 @@ pub struct AgentState {
     pub peer: Arc<str>,
     pub hostname: Arc<str>,
     pub agent_version: Arc<str>,
+    pub proto: u32,
+    pub host: Option<Arc<HostInfo>>,
     pub online: bool,
     pub offline_after: Duration,
     pub last_seen: Instant,
@@ -134,6 +150,9 @@ pub struct Registration {
     pub kick: oneshot::Receiver<KickReason>,
     /// 狀態表已滿時，為了這次註冊而淘汰的離線 agent
     pub evicted: Option<Evicted>,
+    /// 同一個 agent_id 上次登記的主機指紋與這次不同時，為上次的指紋（設計包的身分衝突偵測：
+    /// 例如複製的 VM 沿用了 `agent.id`）。任一次沒有指紋時不比較
+    pub previous_fingerprint: Option<String>,
 }
 
 /// 狀態表已達上限，且沒有可淘汰的離線 agent。
@@ -185,6 +204,12 @@ pub struct AgentSnapshot {
     pub agent_id: String,
     pub hostname: String,
     pub agent_version: String,
+    /// 協商出的協定版本
+    pub proto: u32,
+    /// v2 hello 的主機資訊（`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`），
+    /// 只輸出有值的欄位
+    #[serde(flatten)]
+    pub host: Option<HostInfo>,
     pub peer: String,
     pub online: bool,
     pub conn_id: u64,
@@ -208,6 +233,8 @@ struct RawAgent {
     agent_id: Arc<str>,
     hostname: Arc<str>,
     agent_version: Arc<str>,
+    proto: u32,
+    host: Option<Arc<HostInfo>>,
     peer: Arc<str>,
     online: bool,
     conn_id: u64,
@@ -326,9 +353,17 @@ impl Registry {
             })?);
         }
         let (tx, rx) = oneshot::channel();
+        let fingerprint =
+            |host: &Option<Arc<HostInfo>>| host.as_ref().and_then(|h| h.host_fingerprint.clone());
+        let mut previous_fingerprint = None;
         let (kind, last_report, key) = match inner.remove(&info.agent_id) {
             None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
             Some(mut prev) => {
+                if let (Some(old), Some(new)) = (fingerprint(&prev.host), fingerprint(&info.host))
+                    && old != new
+                {
+                    previous_fingerprint = Some(old);
+                }
                 let previous_conn_id = prev.conn_id;
                 let kind = match prev.kick.take() {
                     // 舊連線仍在：通知它被取代。接收端已結束時 send 會失敗，可忽略。
@@ -355,6 +390,8 @@ impl Registry {
                 peer: info.peer.into(),
                 hostname: info.hostname.into(),
                 agent_version: info.agent_version.into(),
+                proto: info.proto,
+                host: info.host,
                 online: true,
                 offline_after: info.offline_after,
                 last_seen: now,
@@ -372,6 +409,7 @@ impl Registry {
             kind,
             kick: rx,
             evicted,
+            previous_fingerprint,
         })
     }
 
@@ -547,6 +585,8 @@ impl Registry {
                     agent_id: agent_id.clone(),
                     hostname: s.hostname.clone(),
                     agent_version: s.agent_version.clone(),
+                    proto: s.proto,
+                    host: s.host.clone(),
                     peer: s.peer.clone(),
                     online: s.online,
                     conn_id: s.conn_id,
@@ -564,6 +604,8 @@ impl Registry {
                 agent_id: r.agent_id.to_string(),
                 hostname: r.hostname.to_string(),
                 agent_version: r.agent_version.to_string(),
+                proto: r.proto,
+                host: r.host.map(|h| (*h).clone()),
                 peer: r.peer.to_string(),
                 online: r.online,
                 conn_id: r.conn_id,
@@ -625,6 +667,8 @@ mod tests {
             agent_id: agent_id.into(),
             hostname: format!("host-{agent_id}"),
             agent_version: "0.1.0".into(),
+            proto: 1,
+            host: None,
             peer: peer.into(),
             offline_after: Duration::from_millis(5000),
             client_chain: None,
@@ -636,9 +680,10 @@ mod tests {
             recv_at: "2026-10-08T00:00:00.000Z".into(),
             seq,
             ts: "2026-10-08T00:00:00.000Z".into(),
-            cpu_usage: 1.5,
-            total_memory: 100,
-            used_memory: 50,
+            cpu_usage: Some(1.5),
+            total_memory: Some(100),
+            used_memory: Some(50),
+            metrics: None,
         }
     }
 
@@ -1064,6 +1109,76 @@ mod tests {
         r.mark_all_offline(t0);
         assert!(r.lock().agents.get("b").unwrap().client_chain.is_none());
         assert_eq!(Arc::strong_count(&chain), 1);
+    }
+
+    fn hello_v2(agent_id: &str, fingerprint: Option<&str>) -> HelloInfo {
+        HelloInfo {
+            proto: 2,
+            host: Some(Arc::new(HostInfo {
+                host_fingerprint: fingerprint.map(str::to_string),
+                display_name: Some("Web 01".into()),
+                tags: Some(vec!["env:prod".into()]),
+                ..Default::default()
+            })),
+            ..hello(agent_id, "p")
+        }
+    }
+
+    #[test]
+    fn changed_host_fingerprint_is_reported() {
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let fp_a = format!("sha256:{}", "a".repeat(64));
+        let fp_b = format!("sha256:{}", "b".repeat(64));
+        let first = r
+            .register(1, hello_v2("x", Some(&fp_a)), t0, Utc::now())
+            .unwrap();
+        assert_eq!(first.previous_fingerprint, None);
+        // 相同指紋、沒有指紋（v1 或未送）都不算改變
+        let same = r
+            .register(2, hello_v2("x", Some(&fp_a)), t0, Utc::now())
+            .unwrap();
+        assert_eq!(same.previous_fingerprint, None);
+        let v1 = r.register(3, hello("x", "p"), t0, Utc::now()).unwrap();
+        assert_eq!(v1.previous_fingerprint, None);
+        let _ = r
+            .register(4, hello_v2("x", Some(&fp_a)), t0, Utc::now())
+            .unwrap();
+        let changed = r
+            .register(5, hello_v2("x", Some(&fp_b)), t0, Utc::now())
+            .unwrap();
+        assert_eq!(changed.previous_fingerprint, Some(fp_a));
+        assert!(matches!(changed.kind, RegisterKind::Superseded { .. }));
+    }
+
+    #[test]
+    fn snapshot_includes_proto_and_host_info() {
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let fp = format!("sha256:{}", "a".repeat(64));
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        let _b = r
+            .register(2, hello_v2("b", Some(&fp)), t0, Utc::now())
+            .unwrap();
+        let snap = serde_json::to_value(r.snapshot(Utc::now())).unwrap();
+        let a = &snap["agents"][0];
+        let b = &snap["agents"][1];
+        // v1 agent：只多了 proto，沒有任何主機資訊欄位
+        assert_eq!(a["proto"], 1);
+        for field in [
+            "host_fingerprint",
+            "display_name",
+            "tags",
+            "report_interval_ms",
+            "os",
+        ] {
+            assert!(a.get(field).is_none(), "{field}: {a}");
+        }
+        assert_eq!(b["proto"], 2);
+        assert_eq!(b["host_fingerprint"], fp.as_str());
+        assert_eq!(b["display_name"], "Web 01");
+        assert_eq!(b["tags"], serde_json::json!(["env:prod"]));
+        assert!(b.get("os").is_none(), "{b}");
     }
 
     #[test]
