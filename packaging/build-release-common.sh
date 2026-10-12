@@ -81,7 +81,7 @@ REPO=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel) || die "$SCRIPT_DIR 不�
 PKG_SUBDIR=$(cd "$SCRIPT_DIR/.." && git rev-parse --show-prefix) || die "無法取得產品目錄"
 PKG_SUBDIR=${PKG_SUBDIR%/}
 [ -n "$PKG_SUBDIR" ] || die "產品目錄不能是 repo 根目錄"
-cd "$REPO"
+cd "$REPO" || exit 1
 [ -f Cargo.lock ] || die "缺少 Cargo.lock（workspace 根目錄）"
 [ -f "$PROTOCOL_SRC" ] || die "缺少 $PROTOCOL_SRC（協定規格）"
 [ -f "$CHANGELOG_SRC" ] || die "缺少 $CHANGELOG_SRC（變更紀錄）"

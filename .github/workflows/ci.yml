@@ -1,5 +1,7 @@
-# CI（商業審計 D3、D5）：Linux 與 Windows 上的格式、lint、測試，以及 cargo-deny 依賴檢查。
-# 工具鏈一律取自根目錄的 rust-toolchain.toml（1.99.0、rustfmt、clippy），不另外指定版本。
+# CI（商業審計 D3、D4、D5）：Linux 與 Windows 上的格式、lint、測試，cargo-deny 依賴檢查，
+# 通過後才打包兩個產品的 Linux 發佈包（不簽章；簽章只在發佈者的機器上進行，見 RELEASING.md）。
+# 工具鏈一律取自根目錄的 rust-toolchain.toml（1.99.0、rustfmt、clippy），不另外指定版本；
+# 打包則在 packaging/build-release-common.sh 以 digest 固定的 docker image 中進行。
 name: CI
 
 on:
@@ -68,3 +70,65 @@ jobs:
       # advisories、bans、licenses、sources 全部檢查（設定見 deny.toml）
       - name: cargo deny check
         run: cargo deny check
+
+  # 審計 D3 後半：打包前必須通過上面兩個 job（Linux／Windows 的 fmt、clippy、test 與 cargo deny）
+  package:
+    name: package (linux-x86_64)
+    needs: [check, deny]
+    runs-on: ubuntu-latest
+    steps:
+      # 完整歷史與 tag：短 commit 的長度與 HEAD 上的 <名稱>-v* tag 檢查都和本機一致
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # runner 內建 shellcheck；-P SCRIPTDIR 讓產品腳本能追蹤到共用的 build-release-common.sh
+      - name: shellcheck
+        run: >-
+          shellcheck -x -P SCRIPTDIR
+          packaging/build-release-common.sh packaging/release.sh packaging/sign-release.sh
+          packaging/check-reproducible.sh kairos/packaging/build-release.sh pulse/packaging/build-release.sh
+
+      # 檢查已由 check、deny job 完成；release.sh 會確認工作目錄乾淨、清除 dist/ 後打包兩個產品，
+      # 產出合併版 SHA256SUMS。CI 沒有私鑰，不簽章。
+      - name: Build release packages
+        env:
+          SKIP_CHECKS: "1"
+        run: sh packaging/release.sh
+
+      - name: Verify SHA256SUMS
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  # 審計 D4：以兩個全新的 docker volume 各建置一次並比對雜湊。從頭編譯兩次約需 15 分鐘，
+  # 只在 main 與手動觸發時執行，不擋 PR。
+  reproducible:
+    name: reproducible build check
+    needs: [check, deny]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build twice and compare
+        run: sh packaging/check-reproducible.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproducible-logs-${{ github.sha }}
+          path: dist/repro/
+          retention-days: 14
