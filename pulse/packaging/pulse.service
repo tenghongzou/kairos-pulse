@@ -8,11 +8,13 @@
 #   - 專用使用者 pulse（無登入 shell），程式與設定在 /opt/pulse
 #   - /opt/pulse/agent.id 已事先以 `pulse --print-agent-id` 產生（ProtectSystem=strict
 #     下 /opt/pulse 本身唯讀，服務無法自行建立 agent.id）
-#   - /opt/pulse/logs 已建立且屬於 pulse（唯一可寫的目錄；不存在時 unit 會以
-#     226/NAMESPACE 啟動失敗）
+#   - /opt/pulse/logs 已建立且屬於 pulse（可寫；不存在時 unit 會以 226/NAMESPACE 啟動失敗）
+#   - /opt/pulse/buffer 已建立且屬於 pulse（本機緩衝，可寫；路徑前的 - 表示不存在時不影響啟動，
+#     但 Pulse 無法建立緩衝，會記 ERROR 並改為 at-most-once）
 #
 # 同一台主機要跑多個實例時，每個實例複製一份 unit（例如 pulse-2.service 對應 /opt/pulse-2），
-# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行；執行檔仍用 /opt/pulse/pulse。
+# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行（ReadWritePaths= 的兩個路徑都要改）；
+# 執行檔仍用 /opt/pulse/pulse。
 # 詳見 INSTALL.md 第 9 節。
 #
 # 修改請用 `systemctl edit pulse` 建立 drop-in，不要直接改這個檔案。
@@ -58,7 +60,7 @@ RestartPreventExitStatus=2 3 4
 
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict
-ReadWritePaths=/opt/pulse/logs
+ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

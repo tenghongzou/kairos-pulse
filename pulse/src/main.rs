@@ -582,6 +582,31 @@ mod tests {
     }
 
     #[test]
+    fn unit_lets_the_service_write_the_default_buffer_directory() {
+        // A5：ProtectSystem=strict 下只有 ReadWritePaths= 可寫；預設的本機緩衝目錄必須在其中
+        // （前綴 - 表示目錄不存在時不影響啟動，Pulse 改為 at-most-once 並記 ERROR）
+        let unit = include_str!("../packaging/pulse.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("ReadWritePaths="))
+            .expect("pulse.service 應設定 ReadWritePaths");
+        let paths: Vec<&str> = line["ReadWritePaths=".len()..].split_whitespace().collect();
+        let config = AppConfig::default_for_tests();
+        let workdir = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("WorkingDirectory="))
+            .unwrap();
+        assert_eq!(
+            paths,
+            [
+                format!("{workdir}/logs"),
+                format!("-{workdir}/{}", config.buffer.dir)
+            ],
+            "{line}"
+        );
+    }
+
+    #[test]
     fn failures_carry_exit_codes() {
         // cli-spec.md §1.3：未分類的錯誤為 1，憑證與 agent.id 的問題為 4
         let general: Failure = "系統資訊收集任務意外結束".to_string().into();
