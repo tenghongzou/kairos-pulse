@@ -9,6 +9,7 @@
 //! - 訊息型別 [`ClientMsg`]、[`ServerMsg`] 與錯誤碼 [`ErrorCode`]，兩個方向都能序列化與反序列化
 //!   （Kairos 解析 client 訊息、送出 server 訊息；Pulse 相反）
 //! - 版本協商（A3）：[`client_proto_range`]、[`negotiate`]、[`Session`]
+//! - at-least-once（A5）：durable 的 [`DurableSeq`]（`boot_id`／`report_seq`）與其限制
 //! - 欄位驗證：UUID 格式的 `agent_id`、顯示用字串的禁止字元表、hello（含 v2 的主機資訊）、
 //!   `ts`、report（v1 三欄位與 v2 的通用指標，A4）的限制
 //!
@@ -26,9 +27,9 @@ mod validate;
 mod tests;
 
 pub use messages::{
-    ClientMsg, ErrorCode, HelloExt, HostInfo, LegacyReport, OsInfo, Proto, ProtoOffer, ReportBody,
-    SERVER_MSG_TYPES, ServerMsg, ServerMsgError, hello_seq_of_invalid, parse_client_msg,
-    parse_server_msg,
+    ClientMsg, DurableSeq, ErrorCode, HelloExt, HostInfo, LegacyReport, OsInfo, Proto, ProtoOffer,
+    ReportBody, SERVER_MSG_TYPES, ServerMsg, ServerMsgError, hello_seq_of_invalid,
+    parse_client_msg, parse_server_msg,
 };
 pub use metrics::{
     METRIC_CPU_USAGE, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL, METRIC_MEMORY_TOTAL,
@@ -37,13 +38,14 @@ pub use metrics::{
     is_valid_unit, validate_metric, validate_metrics,
 };
 pub use negotiate::{
-    FEATURE_METRICS, ProtoRange, ProtoRangeError, SERVER_FEATURES, SUPPORTED_PROTO, Session,
-    client_proto_range, negotiate, unsupported_version_error,
+    FEATURE_DURABLE, FEATURE_METRICS, ProtoRange, ProtoRangeError, SERVER_FEATURES,
+    SUPPORTED_PROTO, Session, client_proto_range, negotiate, unsupported_version_error,
 };
 pub use validate::{
     clamp_heartbeat_interval_ms, is_forbidden_display_char, is_host_fingerprint, is_uuid_text,
     normalize_agent_id, offline_after_ms, sanitize_display_text, server_cpu_usage,
-    validate_client_msg, validate_features, validate_hello, validate_host_info, validate_report,
+    validate_client_msg, validate_durable_seq, validate_features, validate_hello,
+    validate_host_info, validate_report,
 };
 
 /// 協定 v1：hello 只有 `proto`，report 為 `cpu_usage`／`total_memory`／`used_memory` 三欄位
@@ -111,3 +113,14 @@ pub const MAX_METRIC_LABELS: usize = 16;
 pub const MAX_LABEL_KEY_BYTES: usize = 64;
 /// label 值長度上限（bytes）
 pub const MAX_LABEL_VALUE_BYTES: usize = 256;
+
+/// durable：伺服器保證去重的重送範圍。同一個 (agent_id, `boot_id`) 中，`report_seq` 不小於
+/// 「已保存的最大 `report_seq` − 此值 + 1」的重送都能正確判斷是否已保存；更舊的重送一律視為已保存
+/// （回 `ack`、不寫入）。client 依序送出、在途筆數不超過 [`MAX_DURABLE_IN_FLIGHT`] 時，
+/// 需要重送的資料一定落在這個範圍內
+pub const DURABLE_DEDUP_WINDOW: u64 = 256;
+
+/// durable：client 同一時間最多在途（已送出、尚未收到回應）的 report 筆數
+pub const MAX_DURABLE_IN_FLIGHT: usize = 8;
+
+const _: () = assert!(MAX_DURABLE_IN_FLIGHT as u64 <= DURABLE_DEDUP_WINDOW);

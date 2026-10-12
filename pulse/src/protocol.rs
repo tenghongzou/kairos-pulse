@@ -263,6 +263,7 @@ mod tests {
             Session {
                 proto: 2,
                 metrics: false,
+                durable: false,
             },
         );
         assert!(to_value(&msg).get("metrics").is_none());
@@ -274,6 +275,7 @@ mod tests {
         let session = Session {
             proto: 2,
             metrics: true,
+            durable: false,
         };
         let (msg, summary) = report_message(4, sample(vec![fs]), session);
         let v = to_value(&msg);
@@ -306,6 +308,7 @@ mod tests {
         let session = Session {
             proto: 2,
             metrics: true,
+            durable: false,
         };
         let (msg, summary) = report_message(5, sample(extra), session);
         let line = serde_json::to_string(&msg).unwrap();
@@ -328,6 +331,7 @@ mod tests {
         let session = Session {
             proto: 2,
             metrics: true,
+            durable: false,
         };
         let (msg, _) = report_message(1, s, session);
         let ClientMsg::Report { body, .. } = &msg else {

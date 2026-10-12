@@ -1728,7 +1728,8 @@ mod tests {
             v2.session,
             Session {
                 proto: 2,
-                metrics: true
+                metrics: true,
+                durable: false,
             }
         );
         assert_eq!(v2.server_time.as_deref(), Some("2026-10-08T03:15:40.012Z"));
@@ -1740,7 +1741,8 @@ mod tests {
             v2_plain.session,
             Session {
                 proto: 2,
-                metrics: false
+                metrics: false,
+                durable: false,
             }
         );
         // v1 的 hello_ack 夾帶 v2 欄位：不使用

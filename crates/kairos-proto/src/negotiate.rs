@@ -19,6 +19,11 @@ pub const SUPPORTED_PROTO: ProtoRange = ProtoRange {
 /// report 改用通用指標 `metrics`（A4）。雙方都宣告時才使用，否則 report 沿用 v1 的三個欄位
 pub const FEATURE_METRICS: &str = "metrics";
 
+/// report 改為 at-least-once（A5）：report 帶 `boot_id`／`report_seq`，伺服器據此去重，
+/// client 在收到 `ack` 前保留資料、斷線或結果不明時重送。雙方都宣告時才啟用，
+/// 否則維持 at-most-once（見 PROTOCOL.md「durable」）
+pub const FEATURE_DURABLE: &str = "durable";
+
 /// Kairos 在 v2 hello_ack 宣告的功能（Pulse 也宣告同一組）
 pub const SERVER_FEATURES: &[&str] = &[FEATURE_METRICS];
 
@@ -109,6 +114,9 @@ pub struct Session {
     pub proto: u32,
     /// report 是否使用通用指標 `metrics`（v2 且雙方都宣告 [`FEATURE_METRICS`]）
     pub metrics: bool,
+    /// report 是否為 at-least-once（v2 且雙方都宣告 [`FEATURE_DURABLE`]）：report 必須帶
+    /// `boot_id`／`report_seq`，伺服器去重
+    pub durable: bool,
 }
 
 impl Session {
@@ -116,6 +124,7 @@ impl Session {
     pub const V1: Session = Session {
         proto: PROTO_V1,
         metrics: false,
+        durable: false,
     };
 
     /// 依協商出的版本與雙方宣告的功能建立。v1 時忽略 features。
@@ -127,6 +136,7 @@ impl Session {
         Session {
             proto,
             metrics: proto >= PROTO_V2 && both(FEATURE_METRICS),
+            durable: proto >= PROTO_V2 && both(FEATURE_DURABLE),
         }
     }
 
@@ -232,7 +242,8 @@ mod tests {
             Session::new(2, &both, &["x", FEATURE_METRICS]),
             Session {
                 proto: 2,
-                metrics: true
+                metrics: true,
+                durable: false,
             }
         );
         assert!(!Session::new(2, &both, &none).metrics);
@@ -241,5 +252,23 @@ mod tests {
         assert_eq!(Session::new(1, &both, &both), Session::V1);
         assert!(Session::new(2, &none, &none).is_v2());
         assert!(!Session::V1.is_v2());
+    }
+
+    #[test]
+    fn durable_needs_v2_and_both_sides() {
+        // 相容矩陣：任一端是舊版（不宣告 durable）或協商為 v1 → 維持 at-most-once
+        let new = [FEATURE_METRICS, FEATURE_DURABLE];
+        let old = [FEATURE_METRICS];
+        let none: [&str; 0] = [];
+        let both = Session::new(2, &new, &new);
+        assert!(both.durable && both.metrics);
+        assert!(!Session::new(2, &new, &old).durable); // 0.2.0 Pulse
+        assert!(!Session::new(2, &old, &new).durable); // 0.2.0 Kairos
+        assert!(!Session::new(2, &new, &none).durable);
+        assert!(!Session::new(1, &new, &new).durable); // 協商為 v1
+        // durable 與 metrics 各自協商
+        let only_durable = Session::new(2, &new, &[FEATURE_DURABLE]);
+        assert!(only_durable.durable && !only_durable.metrics);
+        assert_eq!(Session::new(1, &new, &new), Session::V1);
     }
 }

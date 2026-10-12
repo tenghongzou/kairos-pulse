@@ -1,7 +1,7 @@
 //! 從 PROTOCOL.md 解析測試向量與錯誤碼表（審計 Q1）。
 //!
 //! 「範例」節的程式碼區塊中，`P ` 開頭的行是 Pulse → Kairos 的訊息，`K ` 開頭的是 Kairos → Pulse；
-//! v1、v2 與錯誤範例分別在 `### v1`、`### v2`、`### 錯誤` 小節。
+//! v1、v2、durable 與錯誤範例分別在 `### v1`、`### v2`、`### durable`、`### 錯誤` 小節。
 //! 其他模組的測試以 [`client_vector`] 等函式取用，規格與測試只有一份來源。
 
 use crate::{ClientMsg, ErrorCode, ServerMsg, parse_client_msg, parse_server_msg};
@@ -42,6 +42,7 @@ fn example_subsection(sub: &str) -> Vec<&'static str> {
 pub(crate) enum Ver {
     V1,
     V2,
+    Durable,
     Errors,
 }
 
@@ -50,6 +51,7 @@ impl Ver {
         match self {
             Ver::V1 => "v1",
             Ver::V2 => "v2",
+            Ver::Durable => "durable",
             Ver::Errors => "錯誤",
         }
     }
@@ -120,13 +122,15 @@ fn spec_vectors_are_found() {
     assert_eq!(vectors(Ver::V1, 'K').len(), 3);
     assert_eq!(vectors(Ver::V2, 'P').len(), 3);
     assert_eq!(vectors(Ver::V2, 'K').len(), 3);
+    assert_eq!(vectors(Ver::Durable, 'P').len(), 2);
+    assert_eq!(vectors(Ver::Durable, 'K').len(), 2);
     assert_eq!(vectors(Ver::Errors, 'P').len(), 0);
     assert_eq!(vectors(Ver::Errors, 'K').len(), 2);
 }
 
 #[test]
 fn every_client_vector_round_trips() {
-    for ver in [Ver::V1, Ver::V2] {
+    for ver in [Ver::V1, Ver::V2, Ver::Durable] {
         for line in vectors(ver, 'P') {
             let msg = parse_client_msg(line).unwrap();
             assert_ne!(msg, ClientMsg::Unknown, "{line}");
@@ -138,7 +142,7 @@ fn every_client_vector_round_trips() {
 
 #[test]
 fn every_server_vector_round_trips() {
-    for ver in [Ver::V1, Ver::V2, Ver::Errors] {
+    for ver in [Ver::V1, Ver::V2, Ver::Durable, Ver::Errors] {
         for line in vectors(ver, 'K') {
             let msg = parse_server_msg(line).unwrap();
             let back: Value = serde_json::from_str(&msg.to_line().unwrap()).unwrap();
@@ -230,6 +234,15 @@ fn spec_limits_match_constants() {
     ));
     has(format!("值 1～{MAX_LABEL_VALUE_BYTES} bytes"));
     has(format!("整個陣列 1～{MAX_METRICS} 個元素"));
+    // durable
+    has(format!(
+        "已保存的最大 `report_seq` − {}」",
+        DURABLE_DEDUP_WINDOW - 1
+    ));
+    has(format!("同一時間最多 **{MAX_DURABLE_IN_FLIGHT} 筆**在途"));
+    has(format!(
+        "每條連線最多 {MAX_DURABLE_IN_FLIGHT} 筆 report 在途"
+    ));
     // features 表與 SERVER_FEATURES 一致
     for feature in SERVER_FEATURES {
         has(format!("| `{feature}` |"));

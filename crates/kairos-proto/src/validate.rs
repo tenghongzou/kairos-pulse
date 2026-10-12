@@ -5,10 +5,10 @@
 //! 整理 hostname、檢查 agent_id，兩邊不會再因各自維護一份表而不一致（R2-K23）。
 
 use crate::{
-    ClientMsg, HostInfo, MAX_AGENT_VERSION_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_FEATURE_BYTES,
-    MAX_FEATURES, MAX_HEARTBEAT_INTERVAL_MS, MAX_HOST_FINGERPRINT_BYTES, MAX_HOSTNAME_BYTES,
-    MAX_OS_FIELD_BYTES, MAX_REPORT_INTERVAL_MS, MAX_TAG_BYTES, MAX_TAGS, MAX_TS_BYTES,
-    MIN_HEARTBEAT_INTERVAL_MS, MIN_OFFLINE_AFTER_MS, MIN_REPORT_INTERVAL_MS,
+    ClientMsg, DurableSeq, HostInfo, MAX_AGENT_VERSION_BYTES, MAX_DISPLAY_NAME_BYTES,
+    MAX_FEATURE_BYTES, MAX_FEATURES, MAX_HEARTBEAT_INTERVAL_MS, MAX_HOST_FINGERPRINT_BYTES,
+    MAX_HOSTNAME_BYTES, MAX_OS_FIELD_BYTES, MAX_REPORT_INTERVAL_MS, MAX_TAG_BYTES, MAX_TAGS,
+    MAX_TS_BYTES, MIN_HEARTBEAT_INTERVAL_MS, MIN_OFFLINE_AFTER_MS, MIN_REPORT_INTERVAL_MS,
     OFFLINE_HEARTBEAT_MULTIPLIER,
 };
 
@@ -270,6 +270,18 @@ pub fn validate_host_info(host: &HostInfo) -> Result<(), String> {
                 validate_display_text(field, value, MAX_OS_FIELD_BYTES)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// durable 的 `boot_id`／`report_seq`（違反時回 `bad_request`）：`boot_id` 為 UUID 文字格式
+/// （[`is_uuid_text`]，大小寫皆可，伺服器轉小寫後比對），`report_seq` 至少為 1
+pub fn validate_durable_seq(seq: &DurableSeq) -> Result<(), String> {
+    if !is_uuid_text(&seq.boot_id) {
+        return Err("boot_id must be a UUID (8-4-4-4-12 hex digits)".to_string());
+    }
+    if seq.report_seq == 0 {
+        return Err("report_seq must be at least 1".to_string());
     }
     Ok(())
 }
