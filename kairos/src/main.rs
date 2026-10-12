@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::BindingPolicy;
 use crate::config::{AppConfig, CliAction, ListenAuth, USAGE, parse_args};
 use crate::connection::{ConnContext, handle_connection, is_peer_disconnect};
-use crate::per_ip::{PerIpLimiter, Rejected};
+use crate::per_ip::{ConnectionSlot, PerIpLimiter, PerIpPolicy, Rejected};
 use crate::rate::ReportLimiter;
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::{CONNECTIONS_DEADLINE, MONITOR_DEADLINE, Shutdown, WRITER_DEADLINE};
@@ -153,6 +153,7 @@ impl Saturation {
 
 /// accept 迴圈：先取得全域連線名額再 accept，再取得來源的名額（同時連線數與新連線速率）與
 /// 「握手中」的名額，為每條連線啟動 [`handle_connection`]，直到關機。
+/// 被拒的連線與全域上限的暫停時間記錄在 `per_ip` 的計數器（[`PerIpLimiter::stats`]）。
 /// 回傳仍在執行的連線（listener 隨之釋放，不再接受新連線）。
 pub(crate) async fn accept_loop(
     listener: TcpListener,
@@ -182,16 +183,22 @@ pub(crate) async fn accept_loop(
         let permit: OwnedSemaphorePermit = match limit.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
+                per_ip.stats().pause_begin(Instant::now());
                 if saturation.enter() {
-                    warn!("已達連線上限 {}，暫停接受新連線", max_connections);
+                    warn!(
+                        "已達同時連線上限 {}（server.max_connections），暫停接受新連線；之後的新連線在 TCP 層排隊或逾時",
+                        max_connections
+                    );
                 }
-                tokio::select! {
+                let permit = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break 'accept,
                     res = limit.clone().acquire_owned() => {
                         res.map_err(|_| Error::other("連線上限的 Semaphore 已關閉"))?
                     }
-                }
+                };
+                per_ip.stats().pause_end(Instant::now());
+                permit
             }
             Err(TryAcquireError::Closed) => {
                 return Err(Error::other("連線上限的 Semaphore 已關閉"));
@@ -207,9 +214,12 @@ pub(crate) async fn accept_loop(
                 _ = saturation_check.tick() => {
                     // 手上這個名額尚未使用，也算可用
                     if saturation.check_resume(limit.available_permits() + 1) {
+                        let global = per_ip.stats().snapshot(Instant::now()).global;
                         info!(
-                            "連線數已降至上限 {} 以下，恢復接受新連線",
-                            max_connections
+                            "連線數已降至上限 {} 以下，恢復接受新連線（啟動以來因全域上限暫停 {} 次、累計 {:.1} 秒）",
+                            max_connections,
+                            global.pauses,
+                            global.paused.as_secs_f64()
                         );
                     }
                 }
@@ -236,23 +246,49 @@ pub(crate) async fn accept_loop(
                 continue;
             }
         };
-        // 每個來源的同時連線數與新連線速率上限：超過時立即關閉，不進行 TLS 握手
-        // 依序檢查：該位址的同時連線數 → 握手中的連線數上限（保留名額給已通過 hello 的連線）→
-        // 該來源（IPv6 /64）的新連線速率。被前兩者拒絕的連線不扣速率額度。超過時立即關閉，不進行 TLS 握手
+        // 依序檢查：該位址的連線數（mTLS 時只計算握手中的連線）→ 握手中的連線數上限（保留名額給已通過
+        // hello 的連線）→ 該來源（IPv6 /64）的新連線速率。被前兩者拒絕的連線不扣速率額度。
+        // 超過任一上限時立即關閉，不進行 TLS 握手；被拒的連線依原因計數（per_ip::stats）
         let mut pre_auth = None;
         let ip_permit = match per_ip.try_acquire(peer.ip(), || {
             pre_auth = handshakes.clone().try_acquire_owned().ok();
             pre_auth.is_some()
         }) {
             Ok(p) => p,
-            Err(Rejected::Concurrency) => {
+            Err(Rejected::Concurrency(limit)) => {
+                // 設計包 KRS-W2201 的情境：寫出計算方式與要調的設定
+                let (counted, setting, hint) = match (per_ip.policy().mtls, limit.allowlisted) {
+                    (false, false) => (
+                        "同時連線數",
+                        "server.max_connections_per_ip",
+                        "；若這是多台主機共用的 NAT 出口，可將它加入 server.per_ip_allowlist",
+                    ),
+                    (true, false) => (
+                        "握手中（尚未通過 hello）的連線數",
+                        "server.max_connections_per_ip；啟用 mTLS 時通過 hello 的連線改依憑證身分計數",
+                        "；若這是多台主機共用的 NAT 出口，可將它加入 server.per_ip_allowlist",
+                    ),
+                    (false, true) => (
+                        "同時連線數",
+                        "此位址在 server.per_ip_allowlist 中，上限為 server.max_connections_per_allowlisted_ip 與 server.max_connections 的較小者",
+                        "",
+                    ),
+                    (true, true) => (
+                        "握手中（尚未通過 hello）的連線數",
+                        "此位址在 server.per_ip_allowlist 中，上限為 server.max_connections_per_allowlisted_ip 與 server.max_connections 的較小者",
+                        "",
+                    ),
+                };
                 throttled!(
                     throttle,
                     (Category::PerIpLimit, peer.ip()),
                     warn,
-                    "來自 {} 的同時連線數已達上限 {}（server.max_connections_per_ip），拒絕新連線",
+                    "來自 {} 的{}已達上限 {}（{}），在 TLS 握手前拒絕新連線{}",
                     peer.ip(),
-                    per_ip.max_per_ip()
+                    counted,
+                    limit.max,
+                    setting,
+                    hint
                 );
                 continue;
             }
@@ -261,7 +297,7 @@ pub(crate) async fn accept_loop(
                     throttle,
                     Category::HandshakeLimit,
                     warn,
-                    "握手中（尚未通過 hello）的連線數已達上限 {}，拒絕來自 {} 的新連線",
+                    "握手中（尚未通過 hello）的連線數已達上限 {}（server.max_connections 的一半），在 TLS 握手前拒絕來自 {} 的新連線",
                     max_handshakes,
                     peer.ip()
                 );
@@ -286,11 +322,12 @@ pub(crate) async fn accept_loop(
         let acceptor = ctx.tls.current().acceptor.clone();
         let ctx = ctx.clone();
         let throttle = throttle.clone();
+        // 來源位址與握手中的名額：hello 通過後依兩階段釋放（per_ip::ConnectionSlot）
+        let slot = ConnectionSlot::new(ip_permit, pre_auth);
         connections.spawn(async move {
-            // permit 在連線結束時釋放
+            // 全域名額在連線結束時釋放
             let _permit = permit;
-            let _ip_permit = ip_permit;
-            match handle_connection(ctx, acceptor, socket, peer, conn_id, pre_auth).await {
+            match handle_connection(ctx, acceptor, socket, peer, conn_id, slot).await {
                 Ok(()) => {}
                 // 對方未送 close_notify 就斷線、連線被重設或中止：屬正常的斷線情境
                 Err(e) if is_peer_disconnect(&e) => {
@@ -309,6 +346,9 @@ pub(crate) async fn accept_loop(
         });
     }
 
+    // 兩類被拒連線的累計值（S20／`/metrics` 尚未實作前，至少在關機時留下紀錄）
+    let summary = per_ip.snapshot(Instant::now()).summary();
+    info!("{}", summary);
     Ok(connections)
 }
 
@@ -719,6 +759,12 @@ async fn run(
         }
     }
 
+    // 每 IP 上限、網段允許清單與 mTLS 時的兩階段計數（審計 A7）
+    let per_ip_policy = PerIpPolicy::from_config(&config).map_err(config_error)?;
+    if let Some(warning) = config.allowlisted_limit_warning() {
+        warn!("{}", warning);
+    }
+    info!("{}", per_ip_policy.describe());
     let throttle = Arc::new(LogThrottle::default());
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),
@@ -730,9 +776,9 @@ async fn run(
         binding: BindingPolicy {
             allow_multiple_dns_sans: config.auth.allow_multiple_dns_sans,
         },
-        report_limiter: Arc::new(ReportLimiter::new(config.max_connections_per_ip())),
+        report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
     });
-    let per_ip = PerIpLimiter::new(config.max_connections_per_ip());
+    let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
     info!(
         "Kairos 已啟動，監聽 {}（連線上限 {}，其中握手中 {}，每個來源 IP {}，狀態表上限 {}，資料目錄 {}）",

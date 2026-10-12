@@ -3,7 +3,9 @@ listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080�
 cert_path = "cert.pem"
 key_path = "key.pem"
 max_connections = 1024
-# max_connections_per_ip = 32 # 同一來源 IP 位址的同時連線數上限（含握手中的連線；IPv6 以單一位址計，新連線速率才以 /64 合併），1..=max_connections；未設定時為 min(32, max_connections)
+# max_connections_per_ip = 32 # 每個來源 IP 位址的連線數上限，1..=max_connections；未設定時為 min(32, max_connections)。未啟用 mTLS：計算全部連線（含握手中）；啟用 mTLS：只計算尚未通過 hello 的連線（握手前保護），通過後改依憑證身分計數，同一 NAT 後的 agent 數不受此限（IPv6 以單一位址計，新連線速率才以 /64 合併）
+per_ip_allowlist = []         # 每 IP 上限的網段允許清單（CIDR，IPv4／IPv6，只寫位址表示單一位址），例如 ["203.0.113.10", "10.20.0.0/16"]；清單內的位址改用下一項的上限
+# max_connections_per_allowlisted_ip = 4096 # 允許清單內每個位址的上限，1..=65535；實際上限為 min(此值, max_connections)。清單非空且此值大於 max_connections 時啟動記 WARN；清單為空時不生效
 reload_interval_secs = 30     # 每隔幾秒檢查憑證／私鑰／客戶端 CA／CRL 是否變更並重新驗證現役連線，0 = 停用，上限 3600
 cert_expiry_warning_days = 30 # 伺服器憑證到期前幾天開始記 WARN（啟動、重載與每個重載週期檢查），0 = 不預警（已過期仍記 ERROR），上限 365
 

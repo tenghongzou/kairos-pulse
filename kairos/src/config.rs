@@ -41,6 +41,13 @@ pub const MAX_MAX_AGENTS: usize = 100_000;
 /// 未設定 `server.max_connections_per_ip` 時的預設值（不超過 `server.max_connections`）
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 
+/// 未設定 `server.max_connections_per_allowlisted_ip` 時的預設值（設計包 D14）。
+/// 實際生效值不超過 `server.max_connections`（D15）
+pub const DEFAULT_MAX_CONNECTIONS_PER_ALLOWLISTED_IP: usize = 4096;
+
+/// `server.max_connections_per_allowlisted_ip` 的最大值（D15）
+pub const MAX_MAX_CONNECTIONS_PER_ALLOWLISTED_IP: usize = 65535;
+
 /// 未設定 `limits.max_agents` 時的預設值（不小於 `server.max_connections`）
 pub const DEFAULT_MAX_AGENTS: usize = 10000;
 
@@ -87,9 +94,18 @@ pub struct ServerSettings {
     pub cert_path: String,
     pub key_path: String,
     pub max_connections: usize,
-    /// 同一個來源 IP 的同時連線數上限（含握手中、尚未送出 hello 的連線）。
+    /// 同一個來源 IP 位址的連線數上限。未啟用 mTLS 時計算全部連線（含握手中、尚未送出 hello 的連線）；
+    /// 啟用 mTLS 時只計算尚未通過 hello 的連線，通過後改依憑證身分計數（審計 A7，見 `per_ip` 模組）。
     /// 未設定時為 `min(32, max_connections)`，見 [`AppConfig::max_connections_per_ip`]
     pub max_connections_per_ip: Option<usize>,
+    /// 每 IP 上限的網段允許清單（CIDR，IPv4／IPv6；只寫位址表示單一位址）。清單內的位址改用
+    /// `max_connections_per_allowlisted_ip`（審計 A7 過渡方案，設計包 D14、D15）。
+    /// 也接受以 [`LIST_SEPARATOR`] 分隔的單一字串（環境變數 `KAIROS__SERVER__PER_IP_ALLOWLIST`）
+    #[serde(deserialize_with = "string_or_list")]
+    pub per_ip_allowlist: Vec<String>,
+    /// `per_ip_allowlist` 內每個位址的上限，1..=65535；未設定時為 4096。實際生效值為
+    /// `min(此值, max_connections)`，見 [`AppConfig::max_connections_per_allowlisted_ip`]
+    pub max_connections_per_allowlisted_ip: Option<usize>,
     /// 每隔幾秒檢查憑證、私鑰、客戶端 CA 與 CRL 檔是否變更（並重新驗證現役連線的客戶端憑證）；0 = 停用
     pub reload_interval_secs: u64,
     /// 伺服器憑證到期前幾天開始記 WARN（O1）；0 = 不預警（已過期時仍記錄 ERROR）
@@ -104,6 +120,8 @@ impl Default for ServerSettings {
             key_path: "key.pem".to_string(),
             max_connections: 1024,
             max_connections_per_ip: None,
+            per_ip_allowlist: Vec::new(),
+            max_connections_per_allowlisted_ip: None,
             reload_interval_secs: 30,
             cert_expiry_warning_days: DEFAULT_CERT_EXPIRY_WARNING_DAYS,
         }
@@ -381,6 +399,50 @@ impl AppConfig {
             .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP.min(self.server.max_connections))
     }
 
+    /// 解析後的 `server.per_ip_allowlist`
+    pub fn per_ip_allowlist(&self) -> Result<crate::per_ip::Allowlist, Error> {
+        crate::per_ip::Allowlist::parse(&self.server.per_ip_allowlist)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e))
+    }
+
+    /// `server.max_connections_per_allowlisted_ip` 的設定值（未設定時為內建預設 4096）
+    pub fn configured_max_connections_per_allowlisted_ip(&self) -> usize {
+        self.server
+            .max_connections_per_allowlisted_ip
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_ALLOWLISTED_IP)
+    }
+
+    /// 允許清單內每個位址的實際上限：`min(server.max_connections_per_allowlisted_ip, server.max_connections)`
+    /// （同一個位址的連線也算在全部連線之內；D15）
+    pub fn max_connections_per_allowlisted_ip(&self) -> usize {
+        self.configured_max_connections_per_allowlisted_ip()
+            .min(self.server.max_connections)
+    }
+
+    /// 設計包 `KRS-W0203` 的情境：`server.per_ip_allowlist` 非空，且
+    /// `server.max_connections_per_allowlisted_ip`（含內建預設）大於 `server.max_connections` 時，
+    /// 回傳啟動時要記錄一次的警告訊息。清單為空時這個鍵不生效，不檢查也不警告（D22）
+    pub fn allowlisted_limit_warning(&self) -> Option<String> {
+        let configured = self.configured_max_connections_per_allowlisted_ip();
+        let max = self.server.max_connections;
+        let has_entries = self
+            .server
+            .per_ip_allowlist
+            .iter()
+            .any(|e| !e.trim().is_empty());
+        if !has_entries || configured <= max {
+            return None;
+        }
+        let source = if self.server.max_connections_per_allowlisted_ip.is_some() {
+            ""
+        } else {
+            "（內建預設）"
+        };
+        Some(format!(
+            "允許清單內每位址上限（{configured}）大於同時連線上限（{max}），實際只會生效 {max}：server.max_connections_per_allowlisted_ip = {configured}{source} 大於 server.max_connections = {max}，同一個位址的連線也算在全部連線之內，server.per_ip_allowlist 內每個位址最多 {max} 條連線。單一 NAT 出口後的主機不超過 {max} 台時不需處理（也可把 server.max_connections_per_allowlisted_ip 改為 {max} 以下）；需要更多連線時調高 server.max_connections（需重新啟動），並把檔案描述元上限調到大於 server.max_connections + 64（Linux：systemd unit 的 LimitNOFILE，手動執行時 ulimit -n）"
+        ))
+    }
+
     /// 以 `max_connections` 條連線、每條每秒 1 則 report、每行約 250 bytes 估算的每日 report 量
     pub fn estimated_daily_report_bytes(&self) -> u64 {
         (self.server.max_connections as u64)
@@ -518,6 +580,18 @@ impl AppConfig {
                 ),
             ));
         }
+        if let Some(per_allowlisted) = self.server.max_connections_per_allowlisted_ip
+            && !(1..=MAX_MAX_CONNECTIONS_PER_ALLOWLISTED_IP).contains(&per_allowlisted)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "server.max_connections_per_allowlisted_ip 必須介於 1..={}（目前為 {}）",
+                    MAX_MAX_CONNECTIONS_PER_ALLOWLISTED_IP, per_allowlisted
+                ),
+            ));
+        }
+        self.per_ip_allowlist()?;
         if let Some(max_agents) = self.limits.max_agents
             && !(self.server.max_connections..=MAX_MAX_AGENTS).contains(&max_agents)
         {
@@ -1125,5 +1199,118 @@ mod tests {
         );
         #[cfg(not(unix))]
         assert!(result.unwrap_err().contains("--config <path>"));
+    }
+
+    #[test]
+    fn per_ip_allowlist_settings() {
+        // 預設：清單空、允許清單上限 4096（D14），實際上限 min(4096, max_connections)（D15）
+        let c = AppConfig::default();
+        assert!(c.server.per_ip_allowlist.is_empty());
+        assert_eq!(c.server.max_connections_per_allowlisted_ip, None);
+        assert_eq!(c.configured_max_connections_per_allowlisted_ip(), 4096);
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 1024);
+        assert!(c.per_ip_allowlist().unwrap().is_empty());
+
+        // 設定檔：陣列；環境變數：逗號分隔
+        let c: AppConfig = Config::builder()
+            .add_source(File::from_str(
+                "[server]\nmax_connections = 8000\nper_ip_allowlist = [\"203.0.113.10\", \"10.20.0.0/16\", \"2001:db8:100::/48\"]\nmax_connections_per_allowlisted_ip = 5000\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 5000);
+        let list = c.per_ip_allowlist().unwrap();
+        assert_eq!(
+            list.to_string(),
+            "203.0.113.10/32、10.20.0.0/16、2001:db8:100::/48"
+        );
+        assert!(list.contains("::ffff:10.20.3.4".parse().unwrap()));
+
+        let c = from_env(&[
+            (
+                "KAIROS__SERVER__PER_IP_ALLOWLIST",
+                "198.51.100.0/24,2001:db8::/32",
+            ),
+            ("KAIROS__SERVER__MAX_CONNECTIONS_PER_ALLOWLISTED_IP", "600"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.server.per_ip_allowlist,
+            ["198.51.100.0/24", "2001:db8::/32"]
+        );
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 600);
+        assert!(c.validate().is_ok());
+        // 空字串表示空清單
+        let c = from_env(&[("KAIROS__SERVER__PER_IP_ALLOWLIST", "")]).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(c.per_ip_allowlist().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_ip_allowlist_validation() {
+        let mut c = AppConfig::default();
+        // 範圍 1..=65535，與 server.max_connections 無關（較大時只警告）
+        for (value, ok) in [(0, false), (1, true), (65535, true), (65536, false)] {
+            c.server.max_connections_per_allowlisted_ip = Some(value);
+            assert_eq!(c.validate().is_ok(), ok, "{value}");
+        }
+        c.server.max_connections_per_allowlisted_ip = None;
+        // 錯誤的網段拒絕啟動，訊息指出第幾項與原因
+        c.server.per_ip_allowlist = vec!["10.0.0.0/8".into(), "10.0.0.1/8".into()];
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("第 2 項 \"10.0.0.1/8\""), "{err}");
+        assert!(err.to_string().contains("10.0.0.0/8"), "{err}");
+        for bad in [
+            "10.0.0.0/33",
+            "nat-gw",
+            "fe80::1%eth0",
+            "::/129",
+            "10.0.0.0/+8",
+        ] {
+            c.server.per_ip_allowlist = vec![bad.into()];
+            assert!(c.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allowlisted_limit_warning_only_when_the_list_has_entries() {
+        // D22：清單為空時不檢查、不警告（即使內建預設 4096 > 1024）
+        let mut c = AppConfig::default();
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        c.server.per_ip_allowlist = vec!["  ".into()];
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        c.server.max_connections_per_allowlisted_ip = Some(60000);
+        assert_eq!(c.allowlisted_limit_warning(), None);
+
+        // D15：清單非空且設定值（含內建預設）大於 server.max_connections 時警告（KRS-W0203）
+        c.server.max_connections_per_allowlisted_ip = None;
+        c.server.per_ip_allowlist = vec!["203.0.113.10".into()];
+        let w = c.allowlisted_limit_warning().unwrap();
+        assert!(
+            w.starts_with(
+                "允許清單內每位址上限（4096）大於同時連線上限（1024），實際只會生效 1024"
+            ),
+            "{w}"
+        );
+        assert!(w.contains("4096（內建預設）"), "{w}");
+        assert!(w.contains("LimitNOFILE"), "{w}");
+        c.server.max_connections_per_allowlisted_ip = Some(2000);
+        let w = c.allowlisted_limit_warning().unwrap();
+        assert!(w.contains("= 2000 大於"), "{w}");
+        // 等於或小於時不警告（比較為 >，D18）
+        c.server.max_connections_per_allowlisted_ip = Some(1024);
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        c.server.max_connections_per_allowlisted_ip = None;
+        c.server.max_connections = 4096;
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 4096);
+        c.server.max_connections = 2400;
+        assert!(c.allowlisted_limit_warning().is_some());
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 2400);
     }
 }

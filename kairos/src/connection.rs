@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::UnixTime;
@@ -20,7 +20,7 @@ use tokio_util::codec::Framed;
 
 use crate::auth::{BindingError, BindingPolicy, cert_matches_agent_id};
 use crate::config::TimeoutSettings;
-use crate::per_ip::source_key;
+use crate::per_ip::{ConnectionSlot, source_key};
 use crate::protocol::{
     ClientMsg, ErrorCode, Frame, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, NdjsonCodec,
     PROTO_VERSION, Proto, ServerMsg, clamp_heartbeat_interval_ms, hello_seq_of_invalid,
@@ -400,14 +400,15 @@ struct Conn {
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
-/// `pre_auth` 為「握手中」連線的名額（R2-K2），在 hello 通過後（或連線結束時）釋放。
+/// `slot` 為 accept 時取得的來源位址與「握手中」的名額（R2-K2、A7）：hello 通過後歸還握手中的名額，
+/// 以 mTLS 驗證身分時另改依憑證身分計數（見 [`ConnectionSlot`]）；其餘在連線結束時釋放。
 pub async fn handle_connection(
     ctx: Arc<ConnContext>,
     acceptor: TlsAcceptor,
     socket: TcpStream,
     peer: SocketAddr,
     conn_id: u64,
-    pre_auth: Option<OwnedSemaphorePermit>,
+    mut slot: ConnectionSlot,
 ) -> Result<(), Error> {
     let shutdown = ctx.shutdown.clone();
     // into_fallible：握手失敗時 tokio-rustls 會先送出 TLS alert，再把底層 socket 交還
@@ -471,8 +472,8 @@ pub async fn handle_connection(
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
         return Ok(());
     };
-    // hello 已通過：不再佔用「握手中」的名額
-    drop(pre_auth);
+    // hello 已通過：不再佔用「握手中」的名額；mTLS 時改依憑證身分計數（A7）
+    slot.hello_passed(agent.authenticated.then_some(agent.agent_id.as_str()));
 
     // 註冊後不論結果如何（含 panic、被中止）都要以 conn_id 比對並標記離線
     let guard = DisconnectGuard::new(ctx.registry.clone(), agent.agent_id.clone(), conn_id);
