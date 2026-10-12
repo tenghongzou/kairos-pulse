@@ -47,6 +47,52 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.2.0 之後的變更記在這裡。）
 
+## [0.3.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕本區段目前只列 A5（report 改為 at-least-once）的條目；其他分支的 0.3.0 條目合併時再整併成一份。
+
+### 破壞性變更與升級步驟（A5）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| A5-1 | Pulse | **預設啟用本機緩衝，需要可寫的 `buffer/` 目錄** | 以發佈包的 systemd unit（`ProtectSystem=strict`，只有 `logs/` 可寫）執行的部署 | 升級前 `install -d -o pulse -g pulse -m 750 /opt/pulse/buffer`，並換上新版 `pulse.service`（`ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer`；多實例時對每個實例重做，INSTALL.md 第 9、10 節）。沒有做時 Pulse 照常監控，但記 `ERROR`「無法開啟本機緩衝」並改為 at-most-once |
+| A5-2 | Pulse | **磁碟用量增加**：緩衝預設最多約 72 MiB（`buffer.max_mb` 64 MiB 加兩個區段） | 磁碟空間很小的主機 | 在 `pulse.toml` 調小 `[buffer] max_mb`／`max_records`，或 `enabled = false`（與 0.2.0 相同） |
+| A5-3 | Kairos | **JSONL 新增選用欄位 `boot_id`、`report_seq`；補送的資料 `ts` 可能比 `recv_at` 早數小時到數天**，並寫入收到當天的檔案 | 依 `recv_at` 或檔案日期當作取樣時間的讀取工具 | 時序分析請改用 `ts`（Pulse 的取樣時間）；`schema` 不變，忽略未知欄位的工具不受影響 |
+| A5-4 | Kairos | **恢復連線後的寫入量增加**：每台 Pulse 補送時約每秒 1.67 筆（平常每 5 秒 1 筆） | 大量主機同時恢復連線的部署（例如 Kairos 維護後） | 見下方「容量估算」；需要時調大 Pulse 的 `buffer.replay_interval_ms`，或調大 Kairos 的 `storage.max_daily_bytes` |
+
+### 協定（kairos-proto）
+
+- 新增 feature `durable`（v2 的 `features` 協商，不提升協定版本）：雙方都宣告時 report 為 at-least-once，report 帶 `boot_id`（UUID，Pulse 每次程序啟動時產生）與 `report_seq`（同一 `boot_id` 內從 1 遞增）；缺漏或型別錯誤回 `bad_request`。任一端沒有宣告時維持 at-most-once。PROTOCOL.md 新增「durable：at-least-once 投遞」與測試向量，並更新相容矩陣、寫入結果不明時的重送語意與 8 秒回應預算的說明（A5）。
+- `DurableSeq`、`FEATURE_DURABLE`、`Session.durable`、`validate_durable_seq`、`DURABLE_DEDUP_WINDOW`（256）、`MAX_DURABLE_IN_FLIGHT`（8）。
+
+### Kairos
+
+- 協商 `durable`，以 (agent_id, `boot_id`, `report_seq`) 去重：重送的資料回 `ack`、不重寫；JSONL 另寫 `boot_id`、`report_seq`（A5）。
+- 去重在 report 寫入工作中進行，寫入成功才記錄（連線逾時放棄等待、但寫入已完成的那筆也算）；啟動時由最新兩個 report 檔尾端（最多 64 MiB）重建，48 小時閒置清除。這是 JSONL 儲存的暫行實作，寫入介面為 `ReportSink::submit(record, Option<DedupKey>)`，改用資料庫（A1）時以唯一索引取代（A5）。
+- 補送的歷史資料一律接受，`ts` 原樣保存；`agents.json` 的 `last_report` 不會被較舊的補送資料蓋過（A5）。
+- 上線日誌註明「durable：report 可補送、去重」（A5）。
+
+### Pulse
+
+- 新增本機環狀緩衝 `[buffer]`（預設啟用）：取樣先寫進 `buffer/`，Kairos 確認後才刪除；重新連上後先依序補送積壓再送新的取樣，最多 4 筆在途、兩筆間隔至少 `replay_interval_ms`（預設 600 ms）；`storage_unavailable` 與結果不明時退避後重送，`invalid_report`／`bad_request` 丟棄（A5）。
+- 緩衝滿時丟最舊並計數記 `WARN`；超過 `max_age_hours`（預設 7 天）的不送出；每筆記錄有 CRC，啟動時截掉斷電造成的不完整尾端；不逐筆 fsync（最多每 10 秒）。Unix 上目錄 0750、檔案 0640，目錄權限過寬時記 `WARN`（Windows 檢查 ACL）（A5）。
+- 連上不支援 `durable` 的 Kairos 時，連線期間維持 at-most-once，緩衝中的積壓保留不送（A5）。
+
+### 相容性（A5）
+
+| Kairos ＼ Pulse | Pulse 0.2.0 | Pulse 0.3.0（`buffer.enabled = true`） | Pulse 0.3.0（`buffer.enabled = false`） |
+|---|---|---|---|
+| Kairos 0.2.0 | 與 0.2.0 相同 | v2，不啟用 durable：連線期間 at-most-once；斷線期間的積壓保留在 Pulse，連上 0.3.0 的 Kairos 後才補送 | 與 0.2.0 相同 |
+| Kairos 0.3.0 | v2，不啟用 durable（與 0.2.0 相同；Pulse 不宣告 durable） | **v2＋durable：at-least-once** | 與 0.2.0 相同 |
+
+協定 v1（0.1.0 的任一端）時不使用 features，維持 at-most-once。升級順序不限；建議先升級 Kairos 再升級 Pulse，Pulse 升級後的第一次斷線就能補送（反過來時，Pulse 在 Kairos 升級前累積的積壓也會在 Kairos 升級後補送，只是會先佔用緩衝）。
+
+### 容量估算（A5，預設值）
+
+- 每台 Pulse 補送速率 1 ÷ 0.6 秒 ≈ 1.67 筆／秒（Kairos 的 report 速率限制為每秒 2 則、可連續 10 則，新連線先給 2 則，因此不會觸發限流或 `storage_unavailable`），扣掉同時產生的新取樣（每 5 秒 1 筆）後積壓以約 1.47 筆／秒減少：斷線 1 小時（720 筆）約 8 分鐘補完，24 小時（17,280 筆）約 3.3 小時補完。
+- 1 萬台同時恢復連線：Pulse 的重連隨機延遲（0～5 秒）與補送前的隨機延遲（0～5 秒）把開始時間攤開後，Kairos 的 report 寫入約 16,700 筆／秒（平常約 2,000 筆／秒，約 8.3 倍），以一筆約 1.5 KB 計約 25 MB／秒 的 JSONL 寫入，持續到各台補完。伺服器端不會無限積壓：每條連線最多 4 筆在途、Kairos 逐則處理；寫入跟不上時寫入佇列（1024 筆）滿、連線等待逾時回 `storage_unavailable`，Pulse 退避（2 秒加倍到 60 秒）後重送，整體自動放慢。需要壓低尖峰時調大 `buffer.replay_interval_ms`（例如 2000 ms → 約 5,000 筆／秒，24 小時的積壓約 13 小時補完）。
+- 補送的資料寫入收到當天的檔案，`storage.max_daily_bytes` 可能比平常更快達到；達到上限時回 `storage_unavailable`，資料留在 Pulse 的緩衝中，換日後繼續補送。
+
 ## [0.2.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.2.0**、**Pulse 0.2.0**（兩者同時發佈）。`Cargo.toml` 已是 0.2.0，尚未打 tag；發佈時依 RELEASING.md 填入日期並移除〔草稿〕標記。共用 crate（`kairos-proto`、`date-guard`）是內部 crate，維持 0.1.0、不單獨發佈。協定新增 v2，與 v1 自動協商（見上方「版本相容矩陣」）。

@@ -529,7 +529,8 @@ sequenceDiagram
 | `recv_at` | 伺服器收到的時間（RFC 3339 UTC，毫秒） |
 | `peer` | agent 的來源 `ip:port` |
 | `agent_id`、`hostname` | 來自該連線的 hello（`agent_id` 一律為小寫） |
-| `seq`、`ts` | agent 端的序號與時間（`ts` 只記錄，不用於存活判定） |
+| `seq`、`ts` | agent 端的序號與時間（`ts` 只記錄，不用於存活判定）。協商了 `durable` 時 `ts` 是 Pulse 的取樣時間，補送的資料可能比 `recv_at` 早數小時到數天 |
+| `boot_id`、`report_seq` | （選用，協商了 `durable` 的 report）Pulse 的投遞識別，(agent_id, `boot_id`, `report_seq`) 相同的資料只寫一行（見下方「durable 去重」）；沒有協商時不輸出。`schema` 不變 |
 | `cpu_usage` | （`schema` 1）CPU 使用率（%） |
 | `total_memory`、`used_memory` | （`schema` 1）記憶體總量與使用量（MB） |
 | `metrics` | （`schema` 2）Pulse 送來的指標，依原順序保存：`name`、`value`（保留原本的數字表示，bytes 等整數不會變成小數）、`unit`，有 label 時另有 `labels`（依名稱排序）；指標物件中規格未定義的欄位不保存。標準指標的名稱與單位見 PROTOCOL.md「report（通用指標）」 |
@@ -540,6 +541,8 @@ sequenceDiagram
 
 - writer 還沒開始處理這筆：連線取消這筆要求（writer 之後會略過它，保證不會寫入），回 `storage_unavailable`。
 - writer 已開始寫入這筆（無法取消）：再等最多 1 秒；仍沒有結果時，伺服器既不能回 `ack` 也不能回 `storage_unavailable`，因此**不回應、直接關閉連線**，並記錄 `WARN`（「寫入結果未知，不回應並關閉連線」）。這筆資料可能已寫入，也可能沒有。
+
+**durable 去重**（A5）：協商了 `durable` 的 report 帶 `boot_id`／`report_seq`，Pulse 在收到 `ack` 前會重送（斷線、`storage_unavailable`、寫入結果不明而斷線）。寫入工作在寫入前以 (agent_id, `boot_id`, `report_seq`) 檢查是否已寫入過：已寫入的不再寫、照常回 `ack`。去重紀錄在記憶體中（每個 agent／boot_id 一個 256 筆的滑動視窗），寫入成功才記錄，因此「連線逾時放棄等待、但寫入其實已完成」的那筆重送時也不會重複；寫出中途失敗、結果不明的那筆不記錄（重送時再寫一次，寧可重複、不可遺失）。啟動時從最新的兩個 report 檔尾端（合計最多 64 MiB）重建，記 `INFO`「已由資料檔重建 durable report 的去重紀錄…」；48 小時沒有新資料的紀錄會清除，總數上限 20 萬個 agent／boot_id。補送的資料寫入**收到當天**的檔案（`recv_at` 的日期），保留期限也依收到的日期計算；伺服器不限制 `ts` 與收到時間的差距。`agents.json` 的 `last_report` 只在 durable report 的 `ts` 不早於目前的值時更新，補送的舊資料不會蓋過最新狀態。
 
 **保留與清除**：啟動時、每次切換到新的一天時，以及之後每小時一次（不論有沒有 report 進來），刪除資料目錄中檔名**完全符合** `reports-YYYY-MM-DD.jsonl` 且日期早於「今天（UTC）− `retention_days`」的檔案（今天與前 `retention_days` 天保留）。每刪一個記錄 `INFO`，刪除失敗記錄 `WARN` 後繼續。其他檔案一律不碰。`retention_days = 0` 時永久保留。「今天」一律取自 writer 的系統時鐘，不會因單筆紀錄的日期觸發刪除。
 
@@ -829,7 +832,8 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_D
 - report 檔寫入中途失敗時，殘缺的那一行會留在檔案中（之後補上換行隔開），讀取端需能略過無法解析的行
 - `ack` 代表資料已交給作業系統（write + flush），不保證已同步到磁碟；作業系統當機或斷電時，最近寫入的資料可能遺失（為了寫入效能，沒有每批呼叫 fsync）
 - writer 在寫入前檢查 report 檔是否還存在，但「檢查」與「寫入」之間仍有時間差：若檔案剛好在這段期間被刪除，該批資料會寫進已刪除的檔案而遺失，連線卻已收到 `ack`。下一批寫入前會偵測到並重建檔案
-- 等待寫入逾時且 writer 已開始寫入、或寫出中途失敗而無法確定這筆是否已寫入時，伺服器不回應並關閉連線，該筆資料是否已保存無法得知（Pulse 不重送，不會重複；但可能已寫入或遺失）
+- 等待寫入逾時且 writer 已開始寫入、或寫出中途失敗而無法確定這筆是否已寫入時，伺服器不回應並關閉連線，該筆資料是否已保存無法得知。協商了 `durable` 時 Pulse 會重送，寫入其實已完成的由去重略過；寫出中途失敗的那筆可能重複一行。沒有協商時 Pulse 不重送（不會重複，但可能已寫入或遺失）
+- durable 的去重紀錄只在記憶體中（啟動時由資料檔尾端重建，最多 64 MiB）：重新啟動前已寫入、`ack` 沒送到，且不在重建範圍內的資料，重送時會重複寫入；改用資料庫儲存（審計 A1）後以唯一索引取代
 - 系統日期前進得比實際經過的時間多時，保留清除會暫停 24 小時（跨重啟延續）；伺服器停機超過約 2 天後重新啟動也會觸發，期間過期的 report 檔與日誌檔不會被刪除。保護狀態存於 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，刪除後若系統時鐘仍在未來，可能以未來日期清除
 - 未設定 `auth.client_ca` 時沒有客戶端身分驗證：任何能完成 TLS 握手的客戶端都能以任意 `agent_id` 登記，也能藉此踢掉同 `agent_id` 的既有連線；狀態表筆數雖有上限，仍可能被大量隨機 `agent_id` 佔滿而擠掉離線 agent。因此預設只允許在 loopback 位址上不啟用 mTLS（見「啟用 mTLS」），`auth.allow_unauthenticated = true` 時對外位址也一樣
 - 現役連線的客戶端憑證在每個重載週期重新檢查，因此撤銷或過期最多延遲 `server.reload_interval_secs` 才生效；握手後、送出 hello 前的連線（最多 `timeouts.hello_secs`）不在週期檢查範圍內，但送出 hello 時會再驗證一次憑證鏈，註冊後也會在下一個週期被檢查
