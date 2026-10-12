@@ -8,16 +8,26 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 
 pub use kairos_proto::{
-    ClientMsg, FEATURE_METRICS, HelloExt, HostInfo, MAX_LINE_LENGTH, METRIC_CPU_USAGE,
-    METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, Proto, ProtoOffer, ReportBody,
-    SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, is_forbidden_display_char,
+    ClientMsg, DurableSeq, FEATURE_DURABLE, FEATURE_METRICS, HelloExt, HostInfo, MAX_LINE_LENGTH,
+    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, Proto, ProtoOffer,
+    ReportBody, SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, is_forbidden_display_char,
     parse_server_msg,
 };
 
 use crate::system_info::Sample;
 
-/// Pulse 在 v2 hello 宣告的功能（與 Kairos 相同的一組）
-pub const CLIENT_FEATURES: &[&str] = &[FEATURE_METRICS];
+/// Pulse 支援的功能（與 Kairos 相同的一組）。`durable` 只在啟用本機緩衝時於 hello 宣告
+/// （見 [`hello_features`]）
+pub const CLIENT_FEATURES: &[&str] = &[FEATURE_METRICS, FEATURE_DURABLE];
+
+/// hello 宣告的功能：停用本機緩衝（`buffer.enabled = false`）時不宣告 `durable`
+pub fn hello_features(durable: bool) -> Vec<String> {
+    CLIENT_FEATURES
+        .iter()
+        .filter(|f| durable || **f != FEATURE_DURABLE)
+        .map(|f| f.to_string())
+        .collect()
+}
 
 /// 本機時鐘與伺服器相差超過此值時記 WARN（設計包 PF03 的時鐘檢查門檻）
 pub const MAX_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
@@ -79,7 +89,18 @@ pub fn clock_skew_warning(server_time: &str, now: DateTime<Utc>) -> Option<Strin
 /// - 沒有協商 `metrics`（v1 Kairos、或 v2 但未宣告）：`cpu_usage`／`total_memory`／`used_memory`
 /// - 協商了 `metrics`：CPU、記憶體三個標準指標加上磁碟、網路、溫度（A4）。整行超過單行上限時，
 ///   捨去後面的磁碟、網路、溫度指標（CPU 與記憶體一定保留）
-pub fn report_message(seq: u64, sample: Sample, session: Session) -> (ClientMsg, String) {
+/// - `durable`：協商了 durable 時附上緩衝記錄的 `boot_id`／`report_seq`（A5）。同一筆取樣在同一種
+///   格式下組出的內容固定，重送時與第一次送出的相同
+pub fn report_message(
+    seq: u64,
+    sample: Sample,
+    session: Session,
+    durable: Option<DurableSeq>,
+) -> (ClientMsg, String) {
+    let with_durable = |body: ReportBody| match &durable {
+        Some(d) => body.with_durable(d.clone()),
+        None => body,
+    };
     // 四捨五入到小數 2 位（f64），JSON 中不會出現 f32 的精度雜訊
     let cpu_usage = report_cpu_usage(sample.cpu_usage);
     if !session.metrics {
@@ -90,7 +111,11 @@ pub fn report_message(seq: u64, sample: Sample, session: Session) -> (ClientMsg,
         let msg = ClientMsg::Report {
             seq,
             ts: sample.ts,
-            body: ReportBody::legacy(cpu_usage, sample.total_memory, sample.used_memory),
+            body: with_durable(ReportBody::legacy(
+                cpu_usage,
+                sample.total_memory,
+                sample.used_memory,
+            )),
         };
         return (msg, summary);
     }
@@ -113,7 +138,9 @@ pub fn report_message(seq: u64, sample: Sample, session: Session) -> (ClientMsg,
     let build = |extra: &[Metric]| ClientMsg::Report {
         seq,
         ts: sample.ts.clone(),
-        body: ReportBody::metrics(core.iter().chain(extra).cloned().collect()),
+        body: with_durable(ReportBody::metrics(
+            core.iter().chain(extra).cloned().collect(),
+        )),
     };
     let mut msg = build(&extra);
     while !extra.is_empty() && serialized_len(&msg) > MAX_LINE_LENGTH {
@@ -249,7 +276,7 @@ mod tests {
     #[test]
     fn v1_session_sends_the_three_fields() {
         let fs = Metric::new("system.filesystem.total", 1, "By").with_label("mountpoint", "/");
-        let (msg, summary) = report_message(3, sample(vec![fs]), Session::V1);
+        let (msg, summary) = report_message(3, sample(vec![fs]), Session::V1, None);
         assert_eq!(
             to_value(&msg),
             serde_json::json!({"type":"report","seq":3,"ts":"2026-10-09T00:00:00.000Z",
@@ -265,8 +292,43 @@ mod tests {
                 metrics: false,
                 durable: false,
             },
+            None,
         );
         assert!(to_value(&msg).get("metrics").is_none());
+    }
+
+    #[test]
+    fn durable_report_carries_boot_id_and_report_seq_and_is_reproducible() {
+        // A5：重送時 boot_id、report_seq、ts 與內容都不變（只有 seq 不同）
+        let durable = DurableSeq {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq: 42,
+        };
+        let session = Session {
+            proto: 2,
+            metrics: true,
+            durable: true,
+        };
+        let fs = Metric::new("system.temperature", 40, "Cel");
+        let (first, _) =
+            report_message(3, sample(vec![fs.clone()]), session, Some(durable.clone()));
+        let (again, _) = report_message(9, sample(vec![fs]), session, Some(durable.clone()));
+        let mut a = to_value(&first);
+        let mut b = to_value(&again);
+        assert_eq!(
+            (&a["boot_id"], &a["report_seq"]),
+            (&serde_json::json!(durable.boot_id), &serde_json::json!(42))
+        );
+        a.as_object_mut().unwrap().remove("seq");
+        b.as_object_mut().unwrap().remove("seq");
+        assert_eq!(a, b);
+        // v1 格式也可以帶（durable 與 metrics 各自協商）
+        let (msg, _) = report_message(1, sample(vec![]), Session::V1, Some(durable));
+        let v = to_value(&msg);
+        assert!(v.get("cpu_usage").is_some() && v["report_seq"] == 42, "{v}");
+        // 停用本機緩衝時不宣告 durable
+        assert_eq!(hello_features(true), vec!["metrics", "durable"]);
+        assert_eq!(hello_features(false), vec!["metrics"]);
     }
 
     #[test]
@@ -277,7 +339,7 @@ mod tests {
             metrics: true,
             durable: false,
         };
-        let (msg, summary) = report_message(4, sample(vec![fs]), session);
+        let (msg, summary) = report_message(4, sample(vec![fs]), session, None);
         let v = to_value(&msg);
         assert!(v.get("cpu_usage").is_none(), "{v}");
         assert_eq!(
@@ -310,7 +372,7 @@ mod tests {
             metrics: true,
             durable: false,
         };
-        let (msg, summary) = report_message(5, sample(extra), session);
+        let (msg, summary) = report_message(5, sample(extra), session, None);
         let line = serde_json::to_string(&msg).unwrap();
         assert!(line.len() <= MAX_LINE_LENGTH, "{}", line.len());
         let v = to_value(&msg);
@@ -333,7 +395,7 @@ mod tests {
             metrics: true,
             durable: false,
         };
-        let (msg, _) = report_message(1, s, session);
+        let (msg, _) = report_message(1, s, session, None);
         let ClientMsg::Report { body, .. } = &msg else {
             unreachable!()
         };

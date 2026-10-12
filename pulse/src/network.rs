@@ -10,12 +10,19 @@
 //! TLS／I/O 錯誤文字（例如憑證名稱不符時列出的伺服器憑證 SAN），一律經
 //! [`sanitize_for_log`] 轉義控制字元並截斷後才寫進日誌，避免偽造日誌行或夾帶終端跳脫序列。
 //!
-//! report 一次只有一筆在途：上一筆 report 尚未收到伺服器回應（ack 或 error）時，
-//! 新的取樣直接略過（節流 WARN 記錄略過次數），避免伺服器寫檔緩慢時在伺服器端無限積壓。
+//! 沒有協商 `durable` 時（舊版 Kairos，或停用本機緩衝）report 為 at-most-once，一次只有一筆在途：
+//! 上一筆 report 尚未收到伺服器回應（ack 或 error）時，新的取樣直接略過（節流 WARN 記錄略過次數），
+//! 避免伺服器寫檔緩慢時在伺服器端無限積壓。
+//!
+//! 協商了 `durable` 時為 at-least-once（A5，[`serve_durable`]）：取樣先寫進本機緩衝（`spool`），
+//! 連線 task 依序送出、收到 ack 才刪除；同一時間最多 [`DURABLE_IN_FLIGHT`] 筆在途，
+//! 兩筆之間至少間隔 `buffer.replay_interval_ms`（低於 Kairos 的 report 速率限制）。
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -31,11 +38,12 @@ use crate::backoff::Backoff;
 use crate::config_manager::AppConfig;
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
-    CLIENT_FEATURES, ClientMsg, HelloExt, HostInfo, MAX_LINE_LENGTH, Proto, ProtoOffer,
-    SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, clock_skew_warning, now_ts,
-    parse_server_msg, report_message, sanitize_cpu_usage,
+    CLIENT_FEATURES, ClientMsg, DurableSeq, HelloExt, HostInfo, MAX_LINE_LENGTH, Proto, ProtoOffer,
+    SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, clock_skew_warning, hello_features,
+    now_ts, parse_server_msg, report_message, sanitize_cpu_usage,
 };
 use crate::service_status;
+use crate::spool::{EntryInfo, SharedSpool, Spool, SpoolRecord};
 use crate::system_info::{self, Sample};
 use crate::tls::{self, TlsSetup};
 
@@ -113,6 +121,12 @@ struct ServerLogThrottles {
     unexpected_ack: LogThrottle,
     /// 上一筆 report 尚未收到回應而略過的取樣
     report_skipped: LogThrottle,
+    /// durable：伺服器拒收（invalid_report、bad_request）而丟棄的緩衝記錄
+    report_rejected: LogThrottle,
+    /// durable：讀取本機緩衝失敗或記錄損毀
+    spool_error: LogThrottle,
+    /// durable：超過 buffer.max_age_hours 而丟棄的記錄
+    spool_expired: LogThrottle,
 }
 
 impl Default for ServerLogThrottles {
@@ -125,6 +139,9 @@ impl Default for ServerLogThrottles {
             storage_unavailable: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
             unexpected_ack: LogThrottle::default(),
             report_skipped: LogThrottle::default(),
+            report_rejected: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
+            spool_error: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
+            spool_expired: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
         }
     }
 }
@@ -214,6 +231,8 @@ pub struct Settings {
     /// 協定 v2 hello 的主機資訊（主機指紋、OS、顯示名稱、標籤、report 間隔）；
     /// 只在 hello 中附上，舊版 Kairos 會忽略
     pub host: HostInfo,
+    /// durable：兩筆 report 之間的最短間隔（`buffer.replay_interval_ms`）
+    pub replay_interval: Duration,
 }
 
 impl Settings {
@@ -237,6 +256,7 @@ impl Settings {
                 &config.agent.tags,
                 Duration::from_secs(config.report.interval),
             ),
+            replay_interval: Duration::from_millis(config.buffer.replay_interval_ms),
         }
     }
 
@@ -481,17 +501,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 }
 
 /// 連線主迴圈：無限重連，直到 `shutdown` 被觸發才返回。
+///
+/// `reports` 為 at-most-once 時的即時取樣；`spool` 為本機緩衝（停用時 `None`，不宣告 `durable`）。
 pub async fn run(
     settings: Settings,
     tls: TlsSetup,
     mut reports: mpsc::Receiver<Sample>,
+    spool: Option<Arc<SharedSpool>>,
     shutdown: CancellationToken,
 ) {
     let dialer = TlsDialer {
         settings: &settings,
         tls: &tls,
     };
-    run_with(&settings, &dialer, &mut reports, &shutdown).await;
+    run_with(&settings, &dialer, &mut reports, spool.as_ref(), &shutdown).await;
 }
 
 /// [`run`] 的實作，連線方式由 `dialer` 提供。
@@ -499,6 +522,7 @@ async fn run_with<D: Dialer>(
     settings: &Settings,
     dialer: &D,
     reports: &mut mpsc::Receiver<Sample>,
+    spool: Option<&Arc<SharedSpool>>,
     shutdown: &CancellationToken,
 ) {
     let mut backoff = Backoff::new(settings.initial_delay, settings.max_delay);
@@ -540,6 +564,7 @@ async fn run_with<D: Dialer>(
             settings,
             dialer,
             reports,
+            spool,
             &mut registered_at,
             &mut throttles,
             shutdown,
@@ -832,6 +857,7 @@ async fn session<D: Dialer>(
     settings: &Settings,
     dialer: &D,
     reports: &mut mpsc::Receiver<Sample>,
+    spool: Option<&Arc<SharedSpool>>,
     registered_at: &mut Option<Instant>,
     throttles: &mut ServerLogThrottles,
     shutdown: &CancellationToken,
@@ -843,7 +869,7 @@ async fn session<D: Dialer>(
     let mut conn = Connection::new(stream);
 
     let result = tokio::select! {
-        res = serve(&mut conn, settings, Some(&tls_info), reports, registered_at, throttles) => res,
+        res = serve(&mut conn, settings, Some(&tls_info), reports, spool, registered_at, throttles) => res,
         _ = shutdown.cancelled() => Err(SessionError::Shutdown),
     };
     if matches!(result, Err(SessionError::Shutdown)) {
@@ -860,6 +886,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     settings: &Settings,
     tls_info: Option<&TlsInfo>,
     reports: &mut mpsc::Receiver<Sample>,
+    spool: Option<&Arc<SharedSpool>>,
     registered_at: &mut Option<Instant>,
     throttles: &mut ServerLogThrottles,
 ) -> Result<Infallible> {
@@ -880,7 +907,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             ProtoOffer {
                 proto_min: Some(SUPPORTED_PROTO.min),
                 proto_max: Some(SUPPORTED_PROTO.max),
-                features: Some(CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()),
+                // 停用本機緩衝時不宣告 durable（A5）
+                features: Some(hello_features(spool.is_some())),
             },
             settings.host.clone(),
         )),
@@ -889,7 +917,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     log::debug!("已送出 hello（seq={seq}），等待 hello_ack");
 
     let ack = wait_hello_ack(conn, seq, throttles).await?;
-    let session = ack.session;
+    let mut session = ack.session;
+    if spool.is_none() {
+        // 沒有宣告 durable：即使伺服器宣告了也不啟用
+        session.durable = false;
+    }
     *registered_at = Some(Instant::now());
     let (level, msg) = registered_log(settings, &ack, tls_info);
     log::log!(level, "{msg}");
@@ -905,6 +937,23 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
 
     // 斷線期間殘留在佇列中的舊取樣直接丟棄（at-most-once，不重送舊資料）
     while reports.try_recv().is_ok() {}
+
+    // 本機緩衝（A5）：協商了 durable 時改走 at-least-once 的迴圈；沒有協商（舊版 Kairos）時，
+    // 這條連線期間的新取樣照舊即時送出（at-most-once），緩衝中的積壓保留到連上支援 durable 的 Kairos
+    if let Some(shared) = spool {
+        if session.durable {
+            return serve_durable(conn, settings, session, shared, throttles).await;
+        }
+        let backlog = shared.lock().len();
+        if backlog > 0 {
+            log::info!(
+                "伺服器不支援 durable（Kairos 0.2.0 以前的版本）：本機緩衝中的 {backlog} 筆積壓暫不補送，\
+                 保留到連上支援的 Kairos；這條連線期間的取樣即時送出，送不出去就丟棄"
+            );
+        }
+    }
+    // 連線期間的取樣由收集 task 直接送到 `reports`（不寫入緩衝）；離開時（斷線）恢復寫入緩衝
+    let _live = spool.map(|shared| shared.set_live(true));
 
     // ---- 主迴圈 ----
     let read_idle = settings.read_idle_timeout();
@@ -947,7 +996,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     log::debug!("CPU 使用率 {} 不合理，送出前調整為 {sanitized}", sample.cpu_usage);
                 }
                 // v1（或沒有協商 metrics）送三個欄位；v2 送通用指標（A4）
-                let (msg, summary) = report_message(seq, sample, session);
+                let (msg, summary) = report_message(seq, sample, session, None);
                 conn.send(&msg).await?;
                 pending_report = Some(seq);
                 log::debug!("已送出 report（seq={seq}，{summary}）");
@@ -965,6 +1014,316 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     && answered >= pending
                 {
                     pending_report = None;
+                }
+            }
+            _ = &mut idle => {
+                return Err(SessionError::IdleTimeout(read_idle));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// durable：at-least-once 投遞（A5）
+// ---------------------------------------------------------------------------
+
+/// durable：同一時間最多在途的 report 筆數（協定上限為 [`kairos_proto::MAX_DURABLE_IN_FLIGHT`]）。
+///
+/// 每 0.6 秒送一筆時，往返延遲（含 Kairos 寫檔）在 2.4 秒以內都不會被視窗卡住；
+/// Kairos 逐則處理，每條連線最多排 4 筆 report，伺服器端不會無限積壓。
+const DURABLE_IN_FLIGHT: usize = 4;
+const _: () = assert!(DURABLE_IN_FLIGHT <= kairos_proto::MAX_DURABLE_IN_FLIGHT);
+
+/// `storage_unavailable` 或讀取緩衝失敗後，重送前的退避：從 2 秒加倍到 60 秒（另加 ±20% 抖動），
+/// 收到 ack 後重置。Kairos 過載（寫檔逾時回 storage_unavailable）時，大量主機會自動放慢補送
+const DURABLE_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const DURABLE_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// durable 連線上一則伺服器回應對 report 的意義
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reply {
+    /// 已保存（或先前已保存過）：從緩衝移除
+    Ack,
+    /// 沒有保存（`storage_unavailable` 與其他非 fatal 的錯誤）：保留，退避後重送
+    Retry,
+    /// 永遠不會被接受（`invalid_report`、`bad_request`）：丟棄，不重送
+    Rejected(String),
+}
+
+/// 一行伺服器訊息中的回應：`ack` 與非 fatal 的 `error`，回傳 (回應的 seq, 意義)；其他訊息為 `None`
+fn durable_reply(line: &str) -> Option<(Option<u64>, Reply)> {
+    match parse_server_msg(line).ok()? {
+        ServerMsg::Ack { seq } => Some((Some(seq), Reply::Ack)),
+        ServerMsg::Error {
+            seq,
+            code,
+            fatal: false,
+            ..
+        } => Some((
+            seq,
+            match code.as_str() {
+                "invalid_report" | "bad_request" => Reply::Rejected(code),
+                _ => Reply::Retry,
+            },
+        )),
+        _ => None,
+    }
+}
+
+/// 等到 `t`；`None` 時永遠等待（`select!` 中的停用分支）
+async fn sleep_until_opt(t: Option<Instant>) {
+    match t {
+        Some(t) => time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 一條 durable 連線的送出狀態。斷線即丟棄：緩衝中未確認的記錄（含已送出、還沒收到 ack 的）
+/// 下一條連線從最舊的開始重送
+#[derive(Debug)]
+struct Delivery {
+    /// 兩筆 report 之間的最短間隔（`buffer.replay_interval_ms`）
+    interval: Duration,
+    /// 已送出、尚未收到回應的訊息（含 heartbeat），依送出順序：(seq, 緩衝記錄編號)
+    outstanding: VecDeque<(u64, Option<u64>)>,
+    /// 其中的 report 筆數
+    in_flight: usize,
+    /// 下一筆要送的緩衝記錄編號（≥）
+    cursor: u64,
+    /// 下一筆 report 最早的送出時間（速率、退避與開始補送前的隨機延遲）
+    next_allowed: Instant,
+    /// 有記錄沒有保存或結果不明：等在途的都有回應後，從最舊的未確認記錄重送
+    rewind: bool,
+    retry: Backoff,
+    /// 本連線確認送達的筆數
+    acked: u64,
+    /// 連線開始時的積壓筆數（0 表示沒有積壓、不記「補送完成」）
+    backlog: usize,
+}
+
+impl Delivery {
+    fn new(interval: Duration, start: Instant, backlog: usize) -> Self {
+        Self {
+            interval,
+            outstanding: VecDeque::new(),
+            in_flight: 0,
+            cursor: 0,
+            next_allowed: start,
+            rewind: false,
+            retry: Backoff::new(DURABLE_RETRY_INITIAL, DURABLE_RETRY_MAX),
+            acked: 0,
+            backlog,
+        }
+    }
+
+    /// 下一筆 report 可以送出的時間；視窗已滿、等待重送前的回應或沒有待送記錄時為 `None`
+    fn next_send_at(&self, spool: &Spool) -> Option<Instant> {
+        if self.in_flight >= DURABLE_IN_FLIGHT || (self.rewind && self.in_flight > 0) {
+            return None;
+        }
+        let cursor = if self.rewind { 0 } else { self.cursor };
+        spool.first_at_or_after(cursor).map(|_| self.next_allowed)
+    }
+
+    /// 取出下一筆要送的記錄（先丟掉過期的；損毀的略過）。讀取失敗時退避並回傳 `None`
+    fn prepare_next(
+        &mut self,
+        spool: &mut Spool,
+        throttles: &mut ServerLogThrottles,
+    ) -> Option<(EntryInfo, SpoolRecord)> {
+        if self.rewind {
+            if self.in_flight > 0 {
+                return None;
+            }
+            self.cursor = 0;
+            self.rewind = false;
+        }
+        let expired = spool.drop_expired(chrono::Utc::now());
+        if expired > 0 {
+            throttled!(
+                throttles.spool_expired,
+                warn,
+                "本機緩衝中有 {expired} 筆取樣超過 buffer.max_age_hours 設定的時間，已丟棄、不送出（累計 {} 筆）",
+                spool.stats().dropped_expired
+            );
+        }
+        loop {
+            let entry = spool.first_at_or_after(self.cursor)?;
+            match spool.read(entry.id) {
+                Ok(Some(record)) => return Some((entry, record)),
+                Ok(None) => self.cursor = entry.id + 1,
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    spool.discard_corrupted(entry.id);
+                    throttled!(throttles.spool_error, warn, "略過本機緩衝中損毀的記錄：{e}");
+                }
+                Err(e) => {
+                    let delay = self.retry.next_delay();
+                    self.next_allowed = Instant::now() + delay;
+                    throttled!(
+                        throttles.spool_error,
+                        warn,
+                        "無法讀取本機緩衝，{:.1} 秒後重試：{e}",
+                        delay.as_secs_f64()
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// 送出了一則訊息（report 時 `entry` 為緩衝記錄編號）
+    fn sent(&mut self, seq: u64, entry: Option<u64>) {
+        self.outstanding.push_back((seq, entry));
+        if let Some(id) = entry {
+            self.in_flight += 1;
+            self.cursor = id + 1;
+            self.next_allowed = Instant::now() + self.interval;
+        }
+    }
+
+    /// 處理一則回應。伺服器依序回應每一則訊息：`seq` 為 `null` 的 error 回應的是最早的未回應訊息；
+    /// 在回應的 seq 之前、卻沒有收到回應的訊息（不應發生）視為結果不明，之後重送
+    fn on_reply(
+        &mut self,
+        seq: Option<u64>,
+        last_sent: u64,
+        reply: Reply,
+        spool: &mut Spool,
+        throttles: &mut ServerLogThrottles,
+    ) {
+        let answered = match seq {
+            Some(s) if s != 0 && s <= last_sent => {
+                while let Some(&(q, entry)) = self.outstanding.front() {
+                    if q >= s {
+                        break;
+                    }
+                    self.outstanding.pop_front();
+                    if entry.is_some() {
+                        self.in_flight -= 1;
+                        self.rewind = true;
+                    }
+                }
+                match self.outstanding.front() {
+                    Some(&(q, _)) if q == s => self.outstanding.pop_front(),
+                    _ => None,
+                }
+            }
+            Some(_) => None,
+            None => self.outstanding.pop_front(),
+        };
+        let Some((_, Some(id))) = answered else {
+            return;
+        };
+        self.in_flight -= 1;
+        match reply {
+            Reply::Ack => {
+                if spool.remove(id) {
+                    self.acked += 1;
+                }
+                self.retry.reset();
+            }
+            Reply::Retry => {
+                // 這筆沒有保存：在途的其他筆有回應後，退避一段時間再從最舊的未確認記錄重送
+                self.rewind = true;
+                let delay = self.retry.next_delay();
+                self.next_allowed = self.next_allowed.max(Instant::now() + delay);
+            }
+            Reply::Rejected(code) => {
+                if spool.discard_rejected(id) {
+                    throttled!(
+                        throttles.report_rejected,
+                        warn,
+                        "伺服器拒收本機緩衝中的 report（{}），已丟棄、不重送（累計 {} 筆）",
+                        sanitize_for_log(&code, LOG_CODE_LIMIT),
+                        spool.stats().dropped_rejected
+                    );
+                }
+            }
+        }
+        if self.backlog > 0 && self.in_flight == 0 && spool.is_empty() {
+            log::info!(
+                "已補送完本機緩衝中的積壓（這條連線共確認 {} 筆），之後的取樣即時送出",
+                self.acked
+            );
+            self.backlog = 0;
+        }
+    }
+}
+
+/// 協商了 durable 的連線主迴圈：依序送出緩衝中的記錄（先補送積壓、再送新的取樣），
+/// 同一時間最多 [`DURABLE_IN_FLIGHT`] 筆在途，兩筆之間至少間隔 `buffer.replay_interval_ms`；
+/// 收到 ack 才從緩衝移除。heartbeat、讀取閒置與伺服器訊息的處理與 at-most-once 的迴圈相同
+async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    settings: &Settings,
+    session: Session,
+    shared: &Arc<SharedSpool>,
+    throttles: &mut ServerLogThrottles,
+) -> Result<Infallible> {
+    let read_idle = settings.read_idle_timeout();
+    let idle = time::sleep(read_idle);
+    tokio::pin!(idle);
+    let hb_period = settings.heartbeat_interval;
+    let mut heartbeat = time::interval_at(after(hb_period), hb_period);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let (backlog, oldest) = {
+        let spool = shared.lock();
+        (spool.len(), spool.oldest_sampled_at())
+    };
+    // 有積壓時（例如 Kairos 重新啟動，大量主機同時恢復連線）先隨機延遲 0～connect_spread 再開始補送
+    let spread = if backlog > 0 {
+        crate::backoff::random_spread(settings.connect_spread)
+    } else {
+        Duration::ZERO
+    };
+    if backlog > 0 {
+        let interval_ms = settings.replay_interval.as_millis();
+        let minutes = (backlog as u128 * interval_ms).div_ceil(60_000);
+        log::info!(
+            "本機緩衝有 {backlog} 筆待補送的 report（最早的取樣時間 {}），{:.1} 秒後依序補送，之後再送新的取樣\
+             （每 {interval_ms} 毫秒最多一筆，至少約需 {minutes} 分鐘）",
+            oldest.map_or_else(
+                || "未知".to_string(),
+                |t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ),
+            spread.as_secs_f64()
+        );
+    }
+    let mut delivery = Delivery::new(settings.replay_interval, Instant::now() + spread, backlog);
+
+    loop {
+        let next_send = delivery.next_send_at(&shared.lock());
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let seq = conn.next_seq();
+                conn.send(&ClientMsg::Heartbeat { seq, ts: now_ts() }).await?;
+                delivery.sent(seq, None);
+                log::trace!("已送出 heartbeat（seq={seq}）");
+            }
+            // 收集 task 寫入了新的取樣：重新計算下一筆的送出時間
+            _ = shared.notify.notified() => {}
+            _ = sleep_until_opt(next_send) => {
+                let next = delivery.prepare_next(&mut shared.lock(), throttles);
+                let Some((entry, record)) = next else { continue };
+                let seq = conn.next_seq();
+                let durable = DurableSeq {
+                    boot_id: record.boot_id,
+                    report_seq: record.report_seq,
+                };
+                let (msg, summary) = report_message(seq, record.sample, session, Some(durable));
+                conn.send(&msg).await?;
+                delivery.sent(seq, Some(entry.id));
+                log::debug!("已送出 report（seq={seq}，report_seq={}，{summary}）", entry.report_seq);
+            }
+            line = conn.framed.next() => {
+                let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
+                let outcome = handle_server_line_in(&line, conn.seq, throttles, true)?;
+                if outcome.valid {
+                    idle.as_mut().reset(after(read_idle));
+                }
+                if let Some((seq, reply)) = durable_reply(&line) {
+                    delivery.on_reply(seq, conn.seq, reply, &mut shared.lock(), throttles);
                 }
             }
             _ = &mut idle => {
@@ -1202,6 +1561,17 @@ fn handle_server_line(
     last_sent_seq: u64,
     throttles: &mut ServerLogThrottles,
 ) -> Result<LineOutcome> {
+    handle_server_line_in(line, last_sent_seq, throttles, false)
+}
+
+/// 同 [`handle_server_line`]；`durable` 為 `true` 時（at-least-once 的連線）
+/// `storage_unavailable` 的日誌改為「稍後重送」
+fn handle_server_line_in(
+    line: &str,
+    last_sent_seq: u64,
+    throttles: &mut ServerLogThrottles,
+    durable: bool,
+) -> Result<LineOutcome> {
     match parse_server_msg(line) {
         Ok(ServerMsg::Ack { seq }) => {
             let answered = answered_seq(Some(seq), last_sent_seq);
@@ -1238,9 +1608,14 @@ fn handle_server_line(
             // 節流視窗較長（STORAGE_UNAVAILABLE_LOG_WINDOW），不用 throttled!（固定 10 秒）
             if let Some(n) = throttles.storage_unavailable.check(Instant::now()) {
                 log::warn!(
-                    "伺服器無法保存 report（seq={}，storage_unavailable）：{}；此筆資料未送達，不會重送{}",
+                    "伺服器無法保存 report（seq={}，storage_unavailable）：{}；{}{}",
                     seq_text(seq),
                     sanitize_for_log(&message, LOG_TEXT_LIMIT),
+                    if durable {
+                        "資料保留在本機緩衝，稍後重送"
+                    } else {
+                        "此筆資料未送達，不會重送"
+                    },
                     suppressed_note(n, STORAGE_UNAVAILABLE_LOG_WINDOW)
                 );
             }
@@ -1499,6 +1874,7 @@ mod tests {
             // 既有測試驗證精確的退避時間，不加隨機分散；分散另有測試
             connect_spread: Duration::ZERO,
             host: HostInfo::default(),
+            replay_interval: Duration::from_millis(600),
         }
     }
 
@@ -2253,7 +2629,17 @@ mod tests {
         let mut conn = Connection::new(stream);
         let mut registered_at = None;
         let mut throttles = ServerLogThrottles::default();
-        let err = match serve(&mut conn, s, None, rx, &mut registered_at, &mut throttles).await {
+        let err = match serve(
+            &mut conn,
+            s,
+            None,
+            rx,
+            None,
+            &mut registered_at,
+            &mut throttles,
+        )
+        .await
+        {
             Ok(never) => match never {},
             Err(e) => e,
         };
@@ -2449,6 +2835,359 @@ mod tests {
         assert!(conn.close_gracefully().await);
     }
 
+    // ---- durable：at-least-once（A5） ----
+
+    /// 測試用的本機緩衝目錄（結束時刪除）
+    struct SpoolDir(std::path::PathBuf);
+
+    impl Drop for SpoolDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_spool(tag: &str, samples: usize) -> (SpoolDir, Arc<SharedSpool>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pulse-net-spool-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spool = Spool::open(crate::spool::SpoolSettings {
+            dir: dir.clone(),
+            max_bytes: 1024 * 1024,
+            max_records: 1000,
+            max_age: Duration::from_secs(7 * 24 * 3600),
+        })
+        .unwrap();
+        let shared = SharedSpool::new(spool);
+        for i in 0..samples {
+            shared.lock().append(&durable_sample(i as f32)).unwrap();
+        }
+        (SpoolDir(dir), shared)
+    }
+
+    fn durable_sample(cpu: f32) -> Sample {
+        Sample {
+            ts: now_ts(),
+            cpu_usage: cpu,
+            total_memory: 2,
+            used_memory: 1,
+            total_memory_bytes: 2048,
+            used_memory_bytes: 1024,
+            extra: Vec::new(),
+        }
+    }
+
+    /// 讀取 hello，以協定 v2 與 `features` 回覆 hello_ack；回傳 hello
+    async fn accept_hello_v2(f: &mut ServerSide, features: &[&str]) -> serde_json::Value {
+        let line = f.next().await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "hello", "{line}");
+        f.send(
+            serde_json::json!({"type":"hello_ack","seq":v["seq"],"proto":2,
+                "offline_after_ms":5000,"features":features})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        v
+    }
+
+    /// 讀取下一則 report（heartbeat 立即回 ack）；連線關閉時為 `None`
+    async fn next_report(f: &mut ServerSide) -> Option<serde_json::Value> {
+        loop {
+            let line = f.next().await?.ok()?;
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["type"] == "report" {
+                return Some(v);
+            }
+            f.send(format!(r#"{{"type":"ack","seq":{}}}"#, v["seq"]))
+                .await
+                .ok()?;
+        }
+    }
+
+    async fn reply(f: &mut ServerSide, json: serde_json::Value) {
+        f.send(json.to_string()).await.unwrap();
+    }
+
+    fn ack_of(report: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type":"ack","seq":report["seq"]})
+    }
+
+    /// 在 `stream` 上以本機緩衝執行 serve()
+    async fn serve_spool(
+        stream: DuplexStream,
+        s: &Settings,
+        shared: &Arc<SharedSpool>,
+    ) -> SessionError {
+        let (_tx, mut rx) = mpsc::channel::<Sample>(1);
+        let mut conn = Connection::new(stream);
+        let mut registered_at = None;
+        let mut throttles = ServerLogThrottles::default();
+        match serve(
+            &mut conn,
+            s,
+            None,
+            &mut rx,
+            Some(shared),
+            &mut registered_at,
+            &mut throttles,
+        )
+        .await
+        {
+            Ok(never) => match never {},
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_session_replays_backlog_in_order_at_the_replay_rate() {
+        let (_dir, shared) = test_spool("order", 6);
+        let boot = shared.lock().boot_id().to_string();
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            let hello = accept_hello_v2(&mut f, &["metrics", "durable"]).await;
+            let mut got = Vec::new();
+            while got.len() < 6 {
+                let r = next_report(&mut f).await.unwrap();
+                reply(&mut f, ack_of(&r)).await;
+                got.push((r, Instant::now()));
+            }
+            (hello, got)
+        });
+        let err = serve_spool(client, &settings(60), &shared).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        let (hello, got) = srv.await.unwrap();
+        // 啟用本機緩衝時宣告 durable
+        assert_eq!(hello["features"], serde_json::json!(["metrics", "durable"]));
+        let seqs: Vec<u64> = got
+            .iter()
+            .map(|(r, _)| r["report_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
+        assert!(
+            got.iter()
+                .all(|(r, _)| r["boot_id"] == boot.as_str() && r["metrics"].is_array())
+        );
+        // 補送速率：兩筆之間至少 buffer.replay_interval_ms（600 ms）
+        for pair in got.windows(2) {
+            let gap = pair[1].1 - pair[0].1;
+            assert!(gap >= Duration::from_millis(600), "{gap:?}");
+        }
+        assert!(shared.lock().is_empty(), "收到 ack 的都已從緩衝移除");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_window_limits_in_flight_and_storage_unavailable_is_resent() {
+        let (_dir, shared) = test_spool("window", 6);
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello_v2(&mut f, &["metrics", "durable"]).await;
+            // 不回應：最多 4 筆在途，之後不再送
+            let mut held = Vec::new();
+            for _ in 0..DURABLE_IN_FLIGHT {
+                held.push(next_report(&mut f).await.unwrap());
+            }
+            let more = time::timeout(Duration::from_secs(20), next_report(&mut f)).await;
+            assert!(more.is_err(), "視窗已滿仍送出：{more:?}");
+            // 依序回應：第 1 筆沒有保存，其餘已保存
+            reply(
+                &mut f,
+                serde_json::json!({"type":"error","seq":held[0]["seq"],"code":"storage_unavailable",
+                    "message":"report could not be stored","fatal":false}),
+            )
+            .await;
+            for r in &held[1..] {
+                reply(&mut f, ack_of(r)).await;
+            }
+            let start = Instant::now();
+            let mut rest = Vec::new();
+            while rest.len() < 3 {
+                let r = next_report(&mut f).await.unwrap();
+                reply(&mut f, ack_of(&r)).await;
+                rest.push(r);
+            }
+            let held_seq: Vec<u64> = held
+                .iter()
+                .map(|r| r["report_seq"].as_u64().unwrap())
+                .collect();
+            (held_seq, rest, start)
+        });
+        let s = settings(60);
+        let session = serve_spool(client, &s, &shared);
+        let (err, server) = tokio::join!(session, srv);
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        let (held, rest, _) = server.unwrap();
+        assert_eq!(held, vec![1, 2, 3, 4]);
+        // storage_unavailable 的那筆退避後重送（內容不變），之後接著送 5、6；已 ack 的不重送
+        let rest_seq: Vec<u64> = rest
+            .iter()
+            .map(|r| r["report_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(rest_seq, vec![1, 5, 6]);
+        assert!(shared.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unacked_reports_are_resent_unchanged_on_the_next_connection() {
+        let (_dir, shared) = test_spool("resend", 2);
+        // 第一條連線：收到兩筆，只 ack 第一筆就斷線（第二筆的結果對 Pulse 來說不明）
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello_v2(&mut f, &["metrics", "durable"]).await;
+            let first = next_report(&mut f).await.unwrap();
+            reply(&mut f, ack_of(&first)).await;
+            next_report(&mut f).await.unwrap()
+        });
+        let err = serve_spool(client, &settings(60), &shared).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        let lost = srv.await.unwrap();
+        assert_eq!(shared.lock().len(), 1);
+
+        // 第二條連線：同一筆以新的 seq 重送，boot_id、report_seq、ts 與內容都不變
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello_v2(&mut f, &["metrics", "durable"]).await;
+            let again = next_report(&mut f).await.unwrap();
+            reply(&mut f, ack_of(&again)).await;
+            again
+        });
+        let err = serve_spool(client, &settings(60), &shared).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        let mut again = srv.await.unwrap();
+        let mut lost = lost;
+        assert_eq!(again["report_seq"], 2);
+        lost.as_object_mut().unwrap().remove("seq");
+        again.as_object_mut().unwrap().remove("seq");
+        assert_eq!(lost, again);
+        assert!(shared.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_reports_are_dropped_not_resent() {
+        let (_dir, shared) = test_spool("reject", 3);
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello_v2(&mut f, &["metrics", "durable"]).await;
+            let r1 = next_report(&mut f).await.unwrap();
+            reply(
+                &mut f,
+                serde_json::json!({"type":"error","seq":r1["seq"],"code":"invalid_report",
+                    "message":"x","fatal":false}),
+            )
+            .await;
+            let _r2 = next_report(&mut f).await.unwrap();
+            // 欄位錯誤的 bad_request 沒有 seq：對應最早的未回應訊息
+            reply(
+                &mut f,
+                serde_json::json!({"type":"error","seq":null,"code":"bad_request",
+                    "message":"invalid message","fatal":false}),
+            )
+            .await;
+            let r3 = next_report(&mut f).await.unwrap();
+            reply(&mut f, ack_of(&r3)).await;
+            let more = time::timeout(Duration::from_secs(20), next_report(&mut f)).await;
+            assert!(more.is_err(), "拒收的不應重送：{more:?}");
+        });
+        let err = serve_spool(client, &settings(60), &shared).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        srv.await.unwrap();
+        let stats = shared.lock().stats();
+        assert_eq!((stats.pending, stats.dropped_rejected), (0, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_kairos_without_durable_keeps_the_backlog_and_sends_live_samples() {
+        let (_dir, shared) = test_spool("old", 3);
+        let (client, server) = duplex(256 * 1024);
+        let probe = shared.clone();
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello_v2(&mut f, &["metrics"]).await;
+            let more = time::timeout(Duration::from_secs(10), next_report(&mut f)).await;
+            assert!(
+                more.is_err(),
+                "積壓不應送給不支援 durable 的伺服器：{more:?}"
+            );
+            // 連線期間收集 task 改為即時送出（不寫入緩衝）
+            assert!(probe.is_live());
+        });
+        let err = serve_spool(client, &settings(60), &shared).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        srv.await.unwrap();
+        assert!(!shared.is_live(), "斷線後恢復寫入緩衝");
+        assert_eq!(shared.lock().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_spool_durable_is_not_declared_or_used() {
+        let (client, server) = duplex(256 * 1024);
+        let (tx, mut rx) = mpsc::channel::<Sample>(1);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            // 伺服器宣告 durable，但 Pulse 沒有宣告：不啟用
+            let hello = accept_hello_v2(&mut f, &["metrics", "durable"]).await;
+            // 註冊後才送入取樣（註冊時會清掉佇列中殘留的舊取樣）
+            time::sleep(Duration::from_secs(1)).await;
+            tx.send(durable_sample(1.0)).await.unwrap();
+            let r = next_report(&mut f).await.unwrap();
+            reply(&mut f, ack_of(&r)).await;
+            (hello, r)
+        });
+        let (err, _) = serve_with_reports(client, &settings(60), &mut rx).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        let (hello, report) = srv.await.unwrap();
+        assert_eq!(hello["features"], serde_json::json!(["metrics"]));
+        assert!(
+            report.get("boot_id").is_none() && report.get("report_seq").is_none(),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn durable_replies_are_classified() {
+        assert_eq!(
+            durable_reply(r#"{"type":"ack","seq":3}"#),
+            Some((Some(3), Reply::Ack))
+        );
+        for code in ["storage_unavailable", "something_new"] {
+            let line = format!(
+                r#"{{"type":"error","seq":4,"code":"{code}","message":"m","fatal":false}}"#
+            );
+            assert_eq!(
+                durable_reply(&line),
+                Some((Some(4), Reply::Retry)),
+                "{code}"
+            );
+        }
+        for code in ["invalid_report", "bad_request"] {
+            let line = format!(
+                r#"{{"type":"error","seq":null,"code":"{code}","message":"m","fatal":false}}"#
+            );
+            assert_eq!(
+                durable_reply(&line),
+                Some((None, Reply::Rejected(code.into())))
+            );
+        }
+        // fatal 由 handle_server_line 結束連線；其他訊息不是回應
+        assert_eq!(
+            durable_reply(
+                r#"{"type":"error","seq":4,"code":"superseded","message":"m","fatal":true}"#
+            ),
+            None
+        );
+        assert_eq!(durable_reply("garbage"), None);
+    }
+
     // ---- run_with()：退避重置與 superseded（X1、P6） ----
 
     /// 測試用連線方式：每次 dial 建立一對記憶體內串流，伺服器端交給測試劇本。
@@ -2515,7 +3254,7 @@ mod tests {
                 let (_report_tx, mut reports) = mpsc::channel::<Sample>(1);
                 let start = Instant::now();
                 local
-                    .run_until(run_with(&s, &dialer, &mut reports, &shutdown))
+                    .run_until(run_with(&s, &dialer, &mut reports, None, &shutdown))
                     .await;
                 let times = dialer.dial_times.borrow();
                 times.iter().map(|t| *t - start).collect()
@@ -2694,7 +3433,7 @@ mod tests {
             shutdown.cancel();
             let (_report_tx, mut reports) = mpsc::channel::<Sample>(1);
             let start = Instant::now();
-            run_with(&s, &dialer, &mut reports, &shutdown).await;
+            run_with(&s, &dialer, &mut reports, None, &shutdown).await;
             assert!(dialer.dial_times.borrow().is_empty());
             assert!(start.elapsed() < Duration::from_secs(1));
         });

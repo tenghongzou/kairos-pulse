@@ -9,6 +9,7 @@ mod network;
 mod protocol;
 mod service_status;
 mod shutdown;
+mod spool;
 mod system_info;
 #[cfg(test)]
 mod test_log;
@@ -24,10 +25,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// 收集 task → 連線 task 的回報佇列容量。
+/// 收集 task → 連線 task 的回報佇列容量（at-most-once 的即時取樣）。
 ///
 /// 刻意設為 1：連線中斷時最多只保留一筆取樣，其餘新取樣直接丟棄，不會堆積。
+/// 啟用本機緩衝時，斷線期間的取樣寫進緩衝（`spool`），不經過這個佇列。
 const REPORT_QUEUE_CAPACITY: usize = 1;
+
+/// 啟用本機緩衝時，收集 task → 緩衝寫入 task 的佇列容量（寫入 task 一直在讀，
+/// 只需容納 fsync 等短暫的延遲）
+const SPOOL_QUEUE_CAPACITY: usize = 8;
 
 /// 收到 Ctrl+C 後，等待連線任務收尾（含送 TLS close_notify，上限 1 秒）的時間上限。
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -442,22 +448,90 @@ async fn run(
     spawn_log_cleanup(retention, config.log.retention_days);
     spawn_client_cert_recheck(tls.clone());
 
-    // 系統資訊收集 task → 連線 task
+    // 本機緩衝（A5）：開啟失敗時不中止監控，改為 at-most-once（不宣告 durable）並記 ERROR
+    let shared_spool = if config.buffer.enabled {
+        let settings = spool_settings(&config.buffer);
+        let dir = settings.dir.clone();
+        match blocking_or_shutdown(&shutdown, move || spool::Spool::open(settings))
+            .await
+            .map_err(|e| format!("啟動失敗：{e}"))?
+        {
+            None => return Ok(()),
+            Some(Ok(opened)) => {
+                let stats = opened.stats();
+                info!(
+                    "本機緩衝：{}（待送 {} 筆、{} bytes；上限 {} MiB／{} 筆，保留 {} 小時；本次 boot_id {}），\
+                     Kairos 支援時 report 斷線期間的資料會補送（durable）",
+                    dir.display(),
+                    stats.pending,
+                    stats.pending_bytes,
+                    config.buffer.max_mb,
+                    config.buffer.max_records,
+                    config.buffer.max_age_hours,
+                    opened.boot_id()
+                );
+                Some(spool::SharedSpool::new(opened))
+            }
+            Some(Err(e)) => {
+                let msg = format!(
+                    "無法開啟本機緩衝 {}：{e}；本次執行不寫入本機緩衝，report 為 at-most-once（斷線期間的資料不補送）。\
+                     請確認目錄可由服務帳號寫入（或以 buffer.dir 指定其他目錄），修正後重新啟動 Pulse",
+                    dir.display()
+                );
+                error!("{msg}");
+                service_status::attention(&msg);
+                None
+            }
+        }
+    } else {
+        info!(
+            "本機緩衝已停用（buffer.enabled = false）：report 為 at-most-once，斷線期間的資料不補送"
+        );
+        None
+    };
+
+    // 系統資訊收集 task →（啟用本機緩衝時經緩衝寫入 task）→ 連線 task
     let (report_tx, report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
-    let mut collector = tokio::spawn(system_info::collect_periodically(
-        Duration::from_secs(config.report.interval),
-        report_tx,
-    ));
+    let (mut collector, mut ingest) = match &shared_spool {
+        Some(shared) => {
+            let (sample_tx, sample_rx) = mpsc::channel(SPOOL_QUEUE_CAPACITY);
+            let collector = tokio::spawn(system_info::collect_periodically(
+                Duration::from_secs(config.report.interval),
+                sample_tx,
+            ));
+            let ingest = tokio::spawn(spool::ingest(sample_rx, shared.clone(), report_tx));
+            (collector, Some(ingest))
+        }
+        None => (
+            tokio::spawn(system_info::collect_periodically(
+                Duration::from_secs(config.report.interval),
+                report_tx,
+            )),
+            None,
+        ),
+    };
+    let ingest_done = async {
+        match ingest.as_mut() {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    };
 
     let settings = network::Settings::new(&config, agent_id, hostname);
-    tokio::select! {
-        _ = network::run(settings, tls, report_rx, shutdown.clone()) => {
+    let result = tokio::select! {
+        _ = network::run(settings, tls, report_rx, shared_spool.clone(), shutdown.clone()) => {
             if shutdown.is_cancelled() {
                 Ok(())
             } else {
                 Err("連線任務意外結束".to_string().into())
             }
         }
+        res = ingest_done => Err(match res {
+            Ok(()) => "本機緩衝寫入任務意外結束".to_string(),
+            Err(e) if e.is_panic() => format!("本機緩衝寫入任務發生 panic：{e}"),
+            Err(e) => format!("本機緩衝寫入任務異常結束：{e}"),
+        }
+        .into()),
         // 收集 task 正常情況下不會結束；結束或 panic 時讓整個程式以非 0 結束，交由服務管理員重啟
         res = &mut collector => Err(match res {
             Ok(()) => "系統資訊收集任務意外結束".to_string(),
@@ -465,6 +539,24 @@ async fn run(
             Err(e) => format!("系統資訊收集任務異常結束：{e}"),
         }
         .into()),
+    };
+    // 結束（或異常結束）前 fsync 本機緩衝並記下送達位置，下次啟動從這裡接著送
+    if let Some(shared) = &shared_spool {
+        let closed = shared.lock().close();
+        if let Err(e) = closed {
+            warn!("結束時無法同步本機緩衝：{e}");
+        }
+    }
+    result
+}
+
+/// `[buffer]` 設定對應的緩衝設定（已在載入時驗證範圍）
+fn spool_settings(buffer: &config_manager::BufferConfig) -> spool::SpoolSettings {
+    spool::SpoolSettings {
+        dir: PathBuf::from(buffer.dir.trim()),
+        max_bytes: buffer.max_mb.saturating_mul(1024 * 1024),
+        max_records: usize::try_from(buffer.max_records).unwrap_or(usize::MAX),
+        max_age: Duration::from_secs(buffer.max_age_hours.saturating_mul(3600)),
     }
 }
 
