@@ -24,8 +24,8 @@ pub const FEATURE_METRICS: &str = "metrics";
 /// 否則維持 at-most-once（見 PROTOCOL.md「durable」）
 pub const FEATURE_DURABLE: &str = "durable";
 
-/// Kairos 在 v2 hello_ack 宣告的功能（Pulse 也宣告同一組）
-pub const SERVER_FEATURES: &[&str] = &[FEATURE_METRICS];
+/// Kairos 在 v2 hello_ack 宣告的功能（Pulse 啟用本機緩衝時也宣告同一組，停用時不宣告 durable）
+pub const SERVER_FEATURES: &[&str] = &[FEATURE_METRICS, FEATURE_DURABLE];
 
 /// [`client_proto_range`] 的失敗原因
 #[derive(Debug, Clone, PartialEq, Eq)]

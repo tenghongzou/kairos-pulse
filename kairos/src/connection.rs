@@ -1199,7 +1199,7 @@ impl Conn {
             self.throttle,
             self.agent_key(Category::AgentOnline, agent),
             info,
-            "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms，協定 v{}",
+            "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms，協定 v{}{}",
             self.conn_id,
             agent.agent_id,
             agent.hostname.escape_debug(),
@@ -1207,7 +1207,12 @@ impl Conn {
             self.peer,
             state,
             offline_ms,
-            agent.session.proto
+            agent.session.proto,
+            if agent.session.durable {
+                "（durable：report 可補送、去重）"
+            } else {
+                ""
+            }
         );
         if let Some(previous) = &registration.previous_fingerprint {
             throttled!(
@@ -1465,6 +1470,23 @@ impl Conn {
                         ));
                     }
                 };
+                // durable（A5）：必須帶 boot_id／report_seq；缺漏、型別錯誤或不符限制與其他欄位
+                // 相同，回 bad_request（seq 為 null）、不算合法訊息。未協商 durable 時一律忽略
+                let dedup = if agent.session.durable {
+                    match body.durable_seq() {
+                        Ok(durable) => Some(DedupKey {
+                            boot_id: durable.boot_id.to_ascii_lowercase(),
+                            report_seq: durable.report_seq,
+                        }),
+                        Err(message) => {
+                            return Ok(Handled::not_alive(
+                                self.reply_bad_request(None, message).await?,
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.bad_requests = 0;
                 if !self.pace_report(agent).await {
                     if !self.touch(ctx, agent) {
@@ -1504,7 +1526,15 @@ impl Conn {
                     return Ok(Handled::alive(flow));
                 }
 
-                let summary = content.summary();
+                let mut summary = content.summary();
+                if let Some(key) = &dedup {
+                    summary.push_str(&format!(
+                        " boot_id={} report_seq={} ts={}",
+                        key.boot_id,
+                        key.report_seq,
+                        ts.escape_debug()
+                    ));
+                }
                 let record = ReportRecord::new(
                     received_at,
                     self.peer.to_string(),
@@ -1521,7 +1551,7 @@ impl Conn {
                     &ctx.reports,
                     self.conn_id,
                     record,
-                    None,
+                    dedup,
                     self.write_timeout,
                     &revived,
                 )
