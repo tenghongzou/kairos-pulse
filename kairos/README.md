@@ -19,7 +19,7 @@
 - 回報依 UTC 日期寫入 `data/reports-YYYY-MM-DD.jsonl`，依 `storage.retention_days` 自動清除過期檔案（啟動時、換日時與每小時；系統日期前進得比實際經過的時間多時暫停清除，保護狀態存於 `data/.retention-guard.json`）；可設定每個日期檔的大小上限 `storage.max_daily_bytes`（預設 `0` = 不限制），達到後當天的 report 回 `storage_unavailable`；agent 狀態每 5 秒快照到 `data/agents.json`（寫暫存檔並 fsync 後再更名）；資料目錄在執行中被刪除時會自動重建
 - 正常關機：收到 Ctrl+C／Ctrl+Break／關閉主控台／系統關機（非 Windows 為 SIGINT／SIGTERM）時，送出 `close_notify` 關閉所有連線、寫完佇列中的 report、寫出最後的 `agents.json` 後以結束代碼 0 結束，最壞約 3 秒內完成
 - 設定可由 `kairos.toml`、`--config <path>` 與 `KAIROS__` 環境變數調整
-- 同時連線數上限（預設 1024），達上限時暫停接受新連線；其中握手中（已 accept、尚未通過 hello）的連線最多佔一半（`max(1, server.max_connections / 2)`），其餘保留給已通過 hello 的連線。另有每個來源 IP 位址的同時連線數上限（預設 `min(32, server.max_connections)`，以單一位址計算）與每個來源的新連線速率上限（每秒 10 條，可連續 `max(32, 2 × server.max_connections_per_ip)` 條；IPv6 以 /64 合併計算）。超過任一上限的連線不握手直接關閉，避免單一來源以慢速握手或大量連線佔滿名額
+- 同時連線數上限（預設 1024），達上限時暫停接受新連線；其中握手中（已 accept、尚未通過 hello）的連線最多佔一半（`max(1, server.max_connections / 2)`），其餘保留給已通過 hello 的連線。另有每個來源 IP 位址的連線數上限（預設 `min(32, server.max_connections)`，以單一位址計算；未啟用 mTLS 時計算全部連線，啟用 mTLS 時只計算尚未通過 hello 的連線，通過後改依憑證身分計數，同一個 NAT 後的 agent 數不受此限）與每個來源的新連線速率上限（每秒 10 條，可連續 `max(32, 2 × 每 IP 上限)` 條；IPv6 以 /64 合併計算）。超過任一上限的連線不握手直接關閉，避免單一來源以慢速握手或大量連線佔滿名額。網段允許清單 `server.per_ip_allowlist` 內的位址改用較高的上限（見「每 IP 上限、NAT 與網段允許清單」）；被拒的連線依原因（每 IP 上限依來源、全域上限的暫停時間與握手中上限）計數
 - report 速率限制：跨連線依來源計算（啟用 mTLS 時依 `agent_id`，否則依來源 IP／IPv6 /64），可連續送 10 則、之後每秒 2 則，新來源與新連線一開始只有 2 則；需延後 0.5 秒以內時延後處理，更久時回 `storage_unavailable`（`report rate limit exceeded`）。另有每條連線的訊息速率上限（可連續 50 則、之後每秒 20 則，超過時延後處理）
 - 使用 rustls（`ring` 加密後端），支援 TLS 1.2 與 TLS 1.3；私鑰支援 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
@@ -40,6 +40,7 @@
 完整的變更與升級步驟見 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）；以下是 Kairos 需要先處理的項目。
 
 - **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 3（設定錯誤）結束；新版 `kairos.service` 的 `RestartPreventExitStatus=3` 讓 systemd 不再反覆重試（沿用舊版 unit 時仍會依 `Restart=on-failure` 每 5 秒重試並失敗，請一併換上新版 unit）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
+- **啟用 mTLS 時 `server.max_connections_per_ip` 只計算尚未通過 hello 的連線**（行為改變，不需修改設定）：舊版不論是否啟用 mTLS，都計算同一位址的全部連線，同一個 NAT 後第 33 台 agent 起在握手前被斷線（審計 A7）；新版啟用 mTLS 時，連線通過 hello（憑證與 `agent_id` 綁定）後改依憑證身分計數，同一個 NAT 後的 agent 數只受 `server.max_connections` 限制。握手前與握手中的連線仍依位址限制（慢速握手防護）。為了 NAT 而調高 `server.max_connections_per_ip` 的 mTLS 部署可以改回預設；未啟用 mTLS 時行為不變。見「每 IP 上限、NAT 與網段允許清單」。
 - **設定錯誤的結束代碼由 1 改為 3**：設定檔無法載入或驗證不通過、上述拒絕啟動，都以結束代碼 3 結束（舊版為 1），`kairos.service` 新增 `RestartPreventExitStatus=3`，systemd 不再對設定錯誤無限重試；修正設定後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、命令列參數錯誤（1）、第二次訊號強制結束（130）不變。
 
 ## 升級注意事項（與 Pulse 混用版本）
@@ -111,6 +112,7 @@ cargo run
 2026-10-08 11:15:40 [INFO] 未找到 kairos.toml，使用程式內預設值
 2026-10-08 11:15:40 [WARN] 未啟用客戶端憑證驗證（auth.client_ca），只監聽 loopback 位址；同一台主機上的任何程式都能以任意 agent_id 註冊，僅建議用於本機開發
 2026-10-08 11:15:40 [INFO] 每 30 秒檢查憑證、私鑰、客戶端 CA 與 CRL 是否變更
+2026-10-08 11:15:40 [INFO] 每 IP 上限：未啟用 mTLS，計算全部連線（含握手中），每個位址 32 條（server.max_connections_per_ip）；網段允許清單（server.per_ip_allowlist）是空的
 2026-10-08 11:15:40 [INFO] Kairos 已啟動，監聽 127.0.0.1:8080（連線上限 1024，其中握手中 512，每個來源 IP 32，狀態表上限 10000，資料目錄 data）
 ```
 
@@ -356,7 +358,9 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `server.cert_path` | `KAIROS__SERVER__CERT_PATH` | `cert.pem` | 憑證檔（PEM，可含中繼憑證） |
 | `server.key_path` | `KAIROS__SERVER__KEY_PATH` | `key.pem` | 私鑰檔（PEM） |
 | `server.max_connections` | `KAIROS__SERVER__MAX_CONNECTIONS` | `1024` | 同時連線數上限，1～65535。其中握手中（已 accept、尚未通過 hello）的連線最多 `max(1, server.max_connections / 2)` 條（固定比例，不可設定），超過時新連線不握手直接關閉 |
-| `server.max_connections_per_ip` | `KAIROS__SERVER__MAX_CONNECTIONS_PER_IP` | 未設定時為 `min(32, server.max_connections)` | 同一來源 IP 位址的同時連線數上限（含握手中、尚未送 hello 的連線），明確設定時必須介於 1～`server.max_connections`；超過時不握手直接關閉。IPv4-mapped IPv6 位址（`::ffff:a.b.c.d`）視為同一個 IPv4；IPv6 位址以單一位址計數（同一個 /64 中的多台主機不會互相佔用名額；以大量 IPv6 位址慢速握手的攻擊由「握手中」上限防護）。同一來源另有新連線速率上限：每秒 10 條，可連續 `max(32, 2 × 此值)` 條（固定值；此項 IPv6 以 /64 合併計算），超過時同樣不握手直接關閉。此值也決定未啟用 mTLS 時以來源 IP 計算的 report 額度倍數（見下方說明）。多台代理經同一個 NAT 連入時請調高：超過上限的代理會在握手前被斷線並不斷退避重連 |
+| `server.max_connections_per_ip` | `KAIROS__SERVER__MAX_CONNECTIONS_PER_IP` | 未設定時為 `min(32, server.max_connections)` | 同一來源 IP 位址的連線數上限，明確設定時必須介於 1～`server.max_connections`；超過時不握手直接關閉。**未啟用 mTLS** 時計算全部連線（含握手中、尚未送 hello 的連線）；**啟用 mTLS** 時只計算尚未通過 hello 的連線，通過後改依憑證身分計數（見「每 IP 上限、NAT 與網段允許清單」）。`server.per_ip_allowlist` 內的位址改用 `server.max_connections_per_allowlisted_ip`。IPv4-mapped IPv6 位址（`::ffff:a.b.c.d`）視為同一個 IPv4；IPv6 位址以單一位址計數（同一個 /64 中的多台主機不會互相佔用名額；以大量 IPv6 位址慢速握手的攻擊由「握手中」上限防護）。同一來源另有新連線速率上限：每秒 10 條，可連續 `max(32, 2 × 此值)` 條（固定值；此項 IPv6 以 /64 合併計算），超過時同樣不握手直接關閉。此值也決定未啟用 mTLS 時以來源 IP 計算的 report 額度倍數（見下方說明）。未啟用 mTLS 而多台代理經同一個 NAT 連入時，請把 NAT 出口加入 `server.per_ip_allowlist` 或調高此值：超過上限的代理會在握手前被斷線並不斷退避重連 |
+| `server.per_ip_allowlist` | `KAIROS__SERVER__PER_IP_ALLOWLIST`（逗號分隔） | `[]` | 每 IP 上限的網段允許清單（CIDR，IPv4／IPv6；只寫位址表示單一位址，例如 `["203.0.113.10", "10.20.0.0/16", "2001:db8:100::/48"]`）。清單內的位址改用 `server.max_connections_per_allowlisted_ip`，新連線可連續的條數隨之為 `max(32, 2 × 該上限)`。主機位元不為 0（例如 `10.0.0.1/8`）、前綴長度超出範圍、不是 IP 位址（主機名稱、zone ID）時拒絕啟動。`::ffff:a.b.c.d/96..128` 視為對應的 IPv4 網段 |
+| `server.max_connections_per_allowlisted_ip` | `KAIROS__SERVER__MAX_CONNECTIONS_PER_ALLOWLISTED_IP` | 未設定時為 `4096` | 允許清單內每個位址的上限，1～65535。**實際上限 ＝ min(此值, `server.max_connections`)**（同一個位址的連線也算在全部連線之內）。允許清單非空且此值（含預設 4096）大於 `server.max_connections` 時，啟動記一次 `WARN`（不拒絕啟動）；清單為空時這個值不生效，不檢查也不警告 |
 | `server.reload_interval_secs` | `KAIROS__SERVER__RELOAD_INTERVAL_SECS` | `30` | 每隔幾秒檢查憑證、私鑰、客戶端 CA 與 CRL 檔是否變更，並重新驗證現役連線的客戶端憑證；`0` = 停用，上限 3600 |
 | `server.cert_expiry_warning_days` | `KAIROS__SERVER__CERT_EXPIRY_WARNING_DAYS` | `30` | 伺服器憑證到期前幾天開始記 `WARN`，0～365；`0` = 不預警（已過期仍記 `ERROR`）。見「到期預警」 |
 | `timeouts.handshake_secs` | `KAIROS__TIMEOUTS__HANDSHAKE_SECS` | `5` | TLS 握手逾時（秒），1～3600 |
@@ -376,17 +380,40 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
-- `server.max_connections_per_ip` 與 `limits.max_agents` 未設定時依 `server.max_connections` 推導，因此只調整 `server.max_connections` 的設定檔仍能啟動；明確設定時才做範圍檢查。
+- `server.max_connections_per_ip`、`server.max_connections_per_allowlisted_ip` 與 `limits.max_agents` 未設定時依 `server.max_connections` 推導，因此只調整 `server.max_connections` 的設定檔仍能啟動；明確設定時才做範圍檢查。
 - report 速率限制不在設定檔中（固定值），以「來源」計算、跨連線保留，斷線重連無法取得新的額度：
   - 啟用 mTLS 時來源為 `agent_id`（與憑證綁定，無法偽造）：可連續送 10 則，之後每秒補充 2 則。
-  - 未啟用 mTLS 時 `agent_id` 可任意宣告，改以來源 IP（IPv6 以 /64 合併）為來源，容量與速率乘上 `server.max_connections_per_ip`（讓同一個 NAT 後的多個 agent 不互相拖累）；另外每條連線各有一份「可連續 10 則、每秒 2 則」的額度，單一連線無法獨佔來源 IP 的額度。
+  - 未啟用 mTLS 時 `agent_id` 可任意宣告，改以來源 IP（IPv6 以 /64 合併）為來源，容量與速率乘上 `server.max_connections_per_ip`（來源與 `server.per_ip_allowlist` 有交集時改乘允許清單的實際上限；讓同一個 NAT 後的多個 agent 不互相拖累）；另外每條連線各有一份「可連續 10 則、每秒 2 則」的額度，單一連線無法獨佔來源 IP 的額度。
   - 新出現的來源與新連線一開始只有 2 則（不是滿額）。
   - 需要延後 0.5 秒以內時，伺服器暫停讀取該連線、延後處理（TCP 背壓會讓送出端慢下來），不回錯誤；需要延後更久時（例如同一來源有多條連線同時送出）不處理這筆，回非 fatal 的 `storage_unavailable`（`report rate limit exceeded`，確定未保存）。兩者都記 `WARN`（依來源 IP 節流）。Pulse 的 `report.interval` 最短 1 秒，且同一時間只有一筆 report 在途，正常不會觸及。
 - 每條連線的訊息速率上限也是固定值：所有訊息（含無效的行）可連續 50 則，之後每秒 20 則；超過時延後處理（每則最多 0.05 秒，期間不讀取該連線），不回錯誤，並記 `WARN`（依來源 IP 節流）。
 - 環境變數的值一律以字串讀入，數值與布林欄位在載入時才轉型；路徑、位址等字串欄位保持原樣（例如 `KAIROS__STORAGE__DATA_DIR=0001` 就是 `0001`，不會變成 `1`）。`KAIROS__AUTH__CRL` 仍以逗號分隔多個檔案（設定檔中的 `auth.crl` 可為陣列或逗號分隔的字串）。
-- 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days` 與 `log.retention_days` 必須介於 0～3650、`server.cert_expiry_warning_days` 與 `auth.crl_expiry_warning_days` 必須介於 0～365、`log.level` 必須是可用值。
+- 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`server.max_connections_per_allowlisted_ip`（有設定時）必須介於 1～65535，`server.per_ip_allowlist` 的每一項必須是合法的 CIDR，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days` 與 `log.retention_days` 必須介於 0～3650、`server.cert_expiry_warning_days` 與 `auth.crl_expiry_warning_days` 必須介於 0～365、`log.level` 必須是可用值。
 - 熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL **檔案的內容**（以內容雜湊比對，不依賴修改時間），套用時的日誌會列出變更的檔案種類，例如「已重新載入 TLS 設定（變更：cert、key；mTLS：啟用，CRL 1 份）」；`kairos.toml` 本身的設定變更（例如改監聽位址、改 `auth.client_ca` 的路徑）仍需重新啟動。
 - 熱重載讀檔卡住時（例如網路磁碟、FIFO），每個週期最多等 `min(10 秒, server.reload_interval_secs)`：逾時記 `ERROR`（「檢查 TLS 設定檔超過 … 秒仍未完成」），不再啟動新的檢查，但現役連線的客戶端憑證仍以目前的設定照常重新驗證；檢查完成後記「檢查 TLS 設定檔已恢復」。
+
+### 每 IP 上限、NAT 與網段允許清單
+
+同一個 NAT（或防火牆）後的主機在 Kairos 看來是同一個來源位址。連線上限分兩個階段計算（審計 A7、K-S2）：
+
+| 階段 | 未啟用 mTLS | 啟用 mTLS（`auth.client_ca`） |
+|---|---|---|
+| 握手前、握手中、等待 hello（accept 到 hello 通過） | 依來源位址計數，上限 `server.max_connections_per_ip`（允許清單內：實際上限 ＝ min(`server.max_connections_per_allowlisted_ip`, `server.max_connections`)）；另受全域「握手中」上限（`server.max_connections` 的一半）限制 | 同左 |
+| hello 通過後 | 繼續依來源位址計數（`agent_id` 可任意宣告，無法以身分區分） | **改依憑證身分（`agent_id`，與憑證 SAN 綁定）計數**，歸還來源位址的名額。同一身分的新連線依既有的 `superseded` 行為取代舊連線，每個身分穩定時只有一條連線；同一位址後的 agent 數只受 `server.max_connections` 限制 |
+
+- 啟用 mTLS 時，預設的 `server.max_connections_per_ip = 32` 只限制同一位址「同時在握手中」的連線數（慢速握手防護），NAT 後的 agent 數量不受限。Kairos 重新啟動後大量 agent 同時重連時，超過的連線在握手前被關閉、Pulse 退避後重試；加上新連線速率（可連續 `max(32, 2 × 每 IP 上限)` 條、之後每秒 10 條），數百台約在數十秒內全部連上。需要更快時把 NAT 出口加入允許清單。
+- 未啟用 mTLS 時（只建議用於 loopback 或隔離的測試環境），每 IP 上限涵蓋整個連線；NAT 後超過上限的主機會連不上，請把 NAT 出口加入 `server.per_ip_allowlist`，或調高 `server.max_connections_per_ip`。
+- `server.per_ip_allowlist` 在兩種模式下都只放寬「依來源位址計數」的部分（握手前與握手中、未啟用 mTLS 時的全部連線、新連線速率、未啟用 mTLS 時的 report 額度），不影響全域上限。例如：
+
+```toml
+[server]
+max_connections = 2400
+per_ip_allowlist = ["203.0.113.10", "10.20.0.0/16"]   # B 廠 NAT 出口、內網
+max_connections_per_allowlisted_ip = 2400              # 未設定時為 4096；實際上限 = min(此值, max_connections)
+```
+
+- 允許清單非空且 `server.max_connections_per_allowlisted_ip`（含預設 4096）大於 `server.max_connections` 時，啟動記一次 `WARN`「允許清單內每位址上限（4096）大於同時連線上限（1024），實際只會生效 1024：…」（設計包 `KRS-W0203`），內容附調整建議；不拒絕啟動。清單為空時不檢查也不警告。
+- 被拒的連線在記憶體中分兩類累計（重新啟動後歸零；供日後的狀態頁與 `/metrics` 使用）：**因每 IP 上限**（依來源位址，附當時的上限與是否在允許清單內；新連線速率另依來源計數，設計包 `KRS-W2201`）與**因全域上限**（`server.max_connections` 用盡而暫停接受新連線的次數與累計時間、握手中上限拒絕的次數，設計包 `KRS-W2204`）。關機時記一行 `INFO` 摘要「啟動以來被拒的連線：…」。
 
 命令列參數：
 
@@ -640,10 +667,14 @@ report 寫入、監控或 TLS 重載等背景工作在關機前異常結束（pa
 | `[WARN] ... 的協定版本 N 不受支援` | Pulse 與 Kairos 版本不相容，請更新其中一方。 |
 | `[INFO] ... 在 5 秒內未送出 hello，關閉連線` | 客戶端完成 TLS 握手後沒有送 hello，常見於用瀏覽器或 port 掃描連入。 |
 | agent 反覆出現「取代舊連線」 | 兩台機器使用了相同的 `agent_id`（例如複製了 Pulse 的 `agent.id` 檔案）；刪除其中一台的 `agent.id` 讓它重新產生。 |
-| `[WARN] 已達連線上限 N，暫停接受新連線` | 同時連線數達到 `server.max_connections`；調高上限或檢查是否有異常連線。只在進入飽和時記錄一次；等待新連線期間每秒檢查一次，可用名額回到上限的 10%（至少 1）時記錄「恢復接受新連線」，不必等到下一條連線。 |
-| `[WARN] 來自 <IP> 的同時連線數已達上限 N（server.max_connections_per_ip），拒絕新連線` | 同一來源 IP 位址的連線過多，超過的連線未握手即被關閉（客戶端看到 TLS 握手失敗）。可能是掃描或攻擊；若多台代理經同一個 NAT 連入，請調高 `server.max_connections_per_ip`。 |
-| `[WARN] 來自 <IP> 的新連線超過每秒 10 條（IPv6 以 /64 合併計算），拒絕新連線` | 同一來源建立新連線太快（可連續 `max(32, 2 × server.max_connections_per_ip)` 條，之後每秒 10 條），超過的連線未握手即被關閉。正常的 Pulse 以退避重連，不會觸發；大量代理經同一個 NAT 在伺服器重新啟動後同時重連時，可調高 `server.max_connections_per_ip` 以提高可連續的條數。 |
-| `[WARN] 握手中（尚未通過 hello）的連線數已達上限 N，拒絕來自 <IP> 的新連線` | 已 accept、尚未通過 hello 的連線達到 `server.max_connections` 的一半，新連線未握手即被關閉；其餘名額保留給已通過 hello 的連線。通常代表有大量慢速握手或只連不送 hello 的連線（掃描或攻擊）。 |
+| `[WARN] 已達同時連線上限 N（server.max_connections），暫停接受新連線；…` | 同時連線數達到 `server.max_connections`；調高上限（並一併調高檔案描述元上限）或檢查是否有異常連線。只在進入飽和時記錄一次；等待新連線期間每秒檢查一次，可用名額回到上限的 10%（至少 1）時記錄「恢復接受新連線（啟動以來因全域上限暫停 N 次、累計 N 秒）」，不必等到下一條連線。 |
+| `[WARN] 來自 <IP> 的同時連線數已達上限 N（server.max_connections_per_ip），在 TLS 握手前拒絕新連線；若這是多台主機共用的 NAT 出口，…` | 未啟用 mTLS：同一來源 IP 位址的連線過多，超過的連線未握手即被關閉（客戶端看到 TLS 握手失敗）。可能是掃描或攻擊；若多台代理經同一個 NAT 連入，請把該位址加入 `server.per_ip_allowlist`（或調高 `server.max_connections_per_ip`）。 |
+| `[WARN] 來自 <IP> 的握手中（尚未通過 hello）的連線數已達上限 N（server.max_connections_per_ip；啟用 mTLS 時通過 hello 的連線改依憑證身分計數），…` | 啟用 mTLS：同一位址同時在握手中（含等待 hello）的連線過多。已連上的 agent 不受影響；大量 agent 經同一個 NAT 同時重連時會短暫出現，Pulse 退避後重試即可連上。持續出現且不是 NAT 時，可能是慢速握手攻擊。 |
+| `[WARN] 來自 <IP> 的…連線數已達上限 N（此位址在 server.per_ip_allowlist 中，上限為 …較小者），…` | 允許清單內的位址也達到上限（實際上限 ＝ min(`server.max_connections_per_allowlisted_ip`, `server.max_connections`)）；需要更多連線時兩者一併調高。 |
+| `[WARN] 允許清單內每位址上限（N）大於同時連線上限（M），實際只會生效 M：…` | 啟動時：`server.per_ip_allowlist` 非空，且 `server.max_connections_per_allowlisted_ip`（含預設 4096）大於 `server.max_connections`。單一 NAT 後的主機不超過 M 台時不需處理（或把前者改為 M 以下讓設定一致）；需要更多時調高 `server.max_connections` 與檔案描述元上限。 |
+| `server.per_ip_allowlist 第 N 項 "..." 無效：…` | 允許清單的網段格式錯誤，拒絕啟動（結束代碼 3）。訊息寫出原因，例如主機位元不為 0 時建議正確的網段（`10.0.0.1/8` → `10.0.0.0/8`）。 |
+| `[WARN] 來自 <IP> 的新連線超過每秒 10 條（IPv6 以 /64 合併計算），拒絕新連線` | 同一來源建立新連線太快（可連續 `max(32, 2 × 每 IP 上限)` 條，之後每秒 10 條；允許清單內的來源以允許清單的實際上限計算），超過的連線未握手即被關閉。正常的 Pulse 以退避重連，不會觸發；大量代理經同一個 NAT 在伺服器重新啟動後同時重連時，可把 NAT 出口加入 `server.per_ip_allowlist`（或調高 `server.max_connections_per_ip`）以提高可連續的條數。 |
+| `[WARN] 握手中（尚未通過 hello）的連線數已達上限 N（server.max_connections 的一半），在 TLS 握手前拒絕來自 <IP> 的新連線` | 已 accept、尚未通過 hello 的連線達到 `server.max_connections` 的一半，新連線未握手即被關閉；其餘名額保留給已通過 hello 的連線。通常代表有大量慢速握手或只連不送 hello 的連線（掃描或攻擊）。 |
 | `[WARN] [#N] <IP:port> 送出訊息超過每秒 20 則（可連續 50 則），延後處理` | 該連線送訊息的速度超過每條連線的訊息速率上限；伺服器已延後處理（期間不讀取該連線）。正常的 Pulse 不會觸發。 |
 | `[WARN] 可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 N，低於 server.max_connections（N）加上預留的 64（共 N）…建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE=N…` | 僅 Linux：`ulimit -n`（或 systemd 的 `LimitNOFILE`）太小，連線數接近上限時可能 accept 失敗（`EMFILE`）。依訊息中的建議值在 systemd unit 設定 `LimitNOFILE`（發佈包的 `kairos.service` 預設 8192）、手動執行前先 `ulimit -n`，或調低 `server.max_connections`。 |
 | `[WARN] [#N] 狀態表已達上限 N（limits.max_agents）且沒有可淘汰的離線 agent，拒絕 ... 的新 agent ...` | 狀態表已滿且都是線上 agent，新的 `agent_id` 收到 fatal 的 `bad_request`（`server agent registry is full`）。未啟用 mTLS 時可能是有人以大量隨機 `agent_id` 灌入；正式環境請啟用 mTLS，或調高 `limits.max_agents`。 |
@@ -703,7 +734,9 @@ kairos/
     ├── reload.rs          TLS 熱重載與現役連線的客戶端憑證重新驗證
     ├── expiry.rs          伺服器憑證與 CRL 的到期預警（含讀取 notAfter／nextUpdate 的最小 DER 解析）
     ├── auth.rs            mTLS：客戶端憑證 SAN 與 agent_id 的綁定檢查
-    ├── per_ip.rs          每個來源 IP 位址的同時連線數上限、每個來源（IPv6 /64）的新連線速率上限
+    ├── per_ip.rs          每個來源 IP 位址的連線數上限（mTLS 時 hello 後改依憑證身分計數）、每個來源（IPv6 /64）的新連線速率上限
+    ├── per_ip/cidr.rs     CIDR 解析與 server.per_ip_allowlist
+    ├── per_ip/stats.rs    被拒連線的計數（每 IP 上限依來源、全域上限的暫停時間與握手中上限）
     ├── rate.rs            token bucket 與跨連線的 report 速率限制
     ├── throttle.rs        日誌節流（類別或類別 + 來源）
     ├── retention.rs       依日期命名的檔案：檔名規則、保留清除與日期合理性檢查
@@ -747,7 +780,7 @@ cargo fmt --check
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.99 cargo test -p kairos --locked
 ```
 
-協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析）、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`。測試數量以 `cargo test` 的輸出為準。
+協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析）、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。測試數量以 `cargo test` 的輸出為準。
 
 > [!WARNING]
 > `src/test_pki.rs` 與 `testdata/`（例如 `testdata/pki/server.key`）中的私鑰**只供測試使用**，已公開在 repo 中，絕對不可用於任何部署環境。正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
