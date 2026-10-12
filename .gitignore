@@ -4,5 +4,5 @@
 # workspace 建置輸出（所有成員共用根目錄的 target/）
 /target
 
-# 發佈包輸出；各產品的 packaging/build-release.sh 輸出到 <成員>/dist/，由成員的 .gitignore 忽略
+# 發佈包輸出：kairos/、pulse/ 的 packaging/build-release.sh 都輸出到根目錄的 dist/（合併的 SHA256SUMS）
 /dist/

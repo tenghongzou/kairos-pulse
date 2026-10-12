@@ -6,7 +6,7 @@
 
 ## 0. 發佈包內容
 
-發佈包 `kairos-<commit>-linux-x86_64.tar.gz` 內含一層 `kairos-<commit>-linux-x86_64/` 目錄：
+發佈包 `kairos-<版本>-<commit>-linux-x86_64.tar.gz` 內含一層 `kairos-<版本>-<commit>-linux-x86_64/` 目錄：
 
 | 檔案 | 權限 | 說明 |
 |---|---|---|
@@ -17,8 +17,10 @@
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
+| `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
+| `kairos.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `kairos-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
 
-檔名中的 `<commit>` 是建置時的 git commit；檔名帶 `-dirty` 表示從有未提交變更的工作目錄建置，**不應**用於正式環境。
+檔名中的 `<版本>` 是 SemVer 版本號（與 `--version` 相同，版本規則見 `CHANGELOG.md`），`<commit>` 是建置時的 git commit；檔名帶 `-dirty` 表示從有未提交變更的工作目錄建置，**不應**用於正式環境。
 
 以下範例的路徑與名稱：
 
@@ -37,24 +39,46 @@
 
 - Linux x86_64、systemd（建議 247 以上；Ubuntu 22.04／24.04、Debian 12、RHEL 9 皆可）
 - 管理主機上的 OpenSSL 3.0 以上（建立 PKI；`openssl version` 確認）
+- 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
 - 防火牆允許 Pulse 連到監聽埠（本例 TCP 8080）
 
 ## 2. 下載與驗證
 
+從發佈處取得下列檔案，放在同一個目錄：
+
+| 檔案 | 說明 |
+|---|---|
+| `kairos-<版本>-<commit>-linux-x86_64.tar.gz` | 發佈包 |
+| `SHA256SUMS` | Kairos 與 Pulse 共用的雜湊清單（同一次發佈的所有檔案） |
+| `SHA256SUMS.sig` | `SHA256SUMS` 的簽章（`ssh-keygen -Y sign`） |
+| `allowed_signers` | 發佈公鑰。**必須從另一個管道取得**，見下方說明 |
+
 ```bash
 mkdir -p ~/kairos-dist && cd ~/kairos-dist
-# 取得 kairos-<commit>-linux-x86_64.tar.gz 與 SHA256SUMS（放在同一個目錄）
-sha256sum -c SHA256SUMS                  # 必須顯示「…: OK」，否則不要解壓
+# 1. 驗證 SHA256SUMS 的簽章：必須顯示
+#    Good "kairos-pulse-release" signature for release@kairos-pulse with ED25519 key SHA256:…
+ssh-keygen -Y verify -f allowed_signers -I release@kairos-pulse -n kairos-pulse-release \
+  -s SHA256SUMS.sig < SHA256SUMS
+# 2. 驗證發佈包的雜湊：必須顯示「kairos-…tar.gz: OK」
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-`SHA256SUMS` 若同時列了 Pulse 的發佈包而你只下載了 Kairos，改用 `sha256sum -c --ignore-missing SHA256SUMS`。
+任一步失敗（`Could not verify signature`、`FAILED`）都不要解壓，請向供應商確認。`--ignore-missing` 是因為 `SHA256SUMS` 也列了 Pulse 的發佈包與 SBOM；只要你下載的發佈包顯示 `OK` 即可。
+
+**公鑰必須從另一個管道取得**：簽章只能證明 `SHA256SUMS` 由持有發佈私鑰的人簽署。若 `allowed_signers` 和發佈包從同一個地方下載，能替換發佈包的人也能一起替換公鑰，驗證就沒有意義。請從供應商另外提供的管道取得 `allowed_signers`（例如合約或交付文件、客戶入口網站的 HTTPS 頁面），第一次使用時再以電話等已知可信的方式核對指紋；之後保存在管理主機上重複使用，供應商更換金鑰時會另行通知。
+
+```bash
+awk '{print $3, $4}' allowed_signers | ssh-keygen -lf -   # 印出 256 SHA256:… (ED25519)，與供應商提供的指紋比對
+```
+
+`ssh-keygen -Y verify` 需要 OpenSSH 8.1 以上（`ssh -V`）。RHEL／Rocky 8（OpenSSH 8.0）、Debian 10 等較舊的系統沒有這個功能，請在管理主機（Windows 11 內建的 OpenSSH 或 Git for Windows 的 `ssh-keygen`、macOS、Ubuntu 20.04 以上、Debian 11 以上、RHEL 9）完成驗證後，再把發佈包複製到目標主機。
 
 ## 3. 解壓
 
 ```bash
 cd ~/kairos-dist
 mkdir -p pkg
-tar xzf kairos-<commit>-linux-x86_64.tar.gz -C pkg --strip-components=1
+tar xzf kairos-<版本>-<commit>-linux-x86_64.tar.gz -C pkg --strip-components=1
 file pkg/kairos              # 應為 ELF 64-bit x86-64 static-pie linked
 pkg/kairos --version         # 輸出 kairos <版本> (<commit>)，commit 應與檔名一致
 ```
@@ -78,7 +102,8 @@ install -d -o kairos -g kairos -m 750 /opt/kairos/data /opt/kairos/logs
 ```bash
 cd ~/kairos-dist/pkg
 install -o root -g root -m 755 kairos /opt/kairos/kairos
-install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL.md /opt/kairos/
+install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL.md \
+  CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
 ## 6. 建立 PKI
@@ -418,10 +443,14 @@ systemctl list-timers kairos-crl.timer
 **升級順序：先升級全部 Pulse，再升級 Kairos**（或同時升級）。新版 Pulse 會替換新版 Kairos 禁止的主機名稱字元，連舊版 Kairos 不受影響；反過來，舊版 Pulse 連新版 Kairos 可能無法註冊（細節見 `README.md`「升級注意事項」）。
 
 ```bash
-# 1. 下載並驗證新版（第 2、3 節），解壓到新的目錄
-cd ~/kairos-dist && sha256sum -c SHA256SUMS
+# 1. 下載新版的發佈包、SHA256SUMS 與 SHA256SUMS.sig，依第 2 節驗證簽章與雜湊
+#    （allowed_signers 沿用第一次安裝時從另一個管道取得的那份），解壓到新的目錄
+cd ~/kairos-dist
+ssh-keygen -Y verify -f allowed_signers -I release@kairos-pulse -n kairos-pulse-release \
+  -s SHA256SUMS.sig < SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
 rm -rf pkg-new && mkdir pkg-new
-tar xzf kairos-<新commit>-linux-x86_64.tar.gz -C pkg-new --strip-components=1
+tar xzf kairos-<新版本>-<新commit>-linux-x86_64.tar.gz -C pkg-new --strip-components=1
 pkg-new/kairos --version
 
 # 2. 比對設定範本與 unit 是否有變動，必要時更新 kairos.toml
@@ -433,7 +462,7 @@ cp -p /opt/kairos/kairos /opt/kairos/kairos.prev
 install -o root -g root -m 755 pkg-new/kairos /opt/kairos/kairos.new
 mv /opt/kairos/kairos.new /opt/kairos/kairos
 install -o root -g root -m 644 pkg-new/kairos.example.toml pkg-new/INSTALL.md \
-  pkg-new/README.md pkg-new/PROTOCOL.md /opt/kairos/
+  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/CHANGELOG.md pkg-new/THIRD-PARTY-LICENSES /opt/kairos/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/kairos.service /etc/systemd/system/kairos.service
 # systemctl daemon-reload

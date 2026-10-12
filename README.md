@@ -11,7 +11,9 @@ kairos-pulse/
 ├── rust-toolchain.toml    固定 Rust 1.99.0（含 rustfmt、clippy）
 ├── deny.toml              cargo-deny 設定（安全公告、授權、重複版本、來源）
 ├── CHANGELOG.md           變更紀錄（Kairos／Pulse／共用；含破壞性變更與升級步驟，也放進兩個發佈包）
-├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test（含端對端測試）與 cargo deny
+├── RELEASING.md           發佈流程：版本規則、打 tag、建置、簽章與發佈金鑰管理
+├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test（含端對端測試）與 cargo deny，全部通過後打包發佈包
+├── packaging/             兩個產品共用的打包實作、release.sh、簽章、可重現性檢查與 cargo-about 設定
 ├── crates/                兩個產品共用的內部 crate（publish = false）
 │   ├── kairos-proto/      協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
 │   └── date-guard/        依日期命名檔案的保留清除規則與時鐘跳躍／回撥保護（DateGuard）
@@ -80,9 +82,11 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 發佈包（Linux x86_64 musl 靜態執行檔，需要 Docker）：
 
 ```bash
-sh kairos/packaging/build-release.sh    # 輸出到 kairos/dist/
-sh pulse/packaging/build-release.sh     # 輸出到 pulse/dist/
+sh kairos/packaging/build-release.sh    # 輸出到 dist/kairos-<版本>-<commit>-linux-x86_64.tar.gz
+sh pulse/packaging/build-release.sh     # 輸出到 dist/pulse-<版本>-<commit>-linux-x86_64.tar.gz
 ```
+
+兩個腳本都輸出到根目錄的 `dist/`，並更新同一份合併的 `dist/SHA256SUMS`（只替換本次產出檔案的那幾列）。共用實作在 `packaging/build-release-common.sh`：建置 image 以 `@sha256:` digest 固定，來源取自 `git archive`（與工作目錄的行尾設定無關），發佈包內附 `THIRD-PARTY-LICENSES` 與 SBOM。正式發佈（檢查、打包、簽章）請用 `sh packaging/release.sh`，流程見 [RELEASING.md](RELEASING.md)；`sh packaging/check-reproducible.sh` 檢查建置是否可重現。
 
 `--version` 顯示的 commit 是本 monorepo 的 commit。
 
