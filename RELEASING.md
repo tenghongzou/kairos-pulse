@@ -52,7 +52,7 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 `packaging/release.sh` 依序：
 
 1. 確認工作目錄乾淨（有未提交的變更時拒絕；發佈包帶 `-dirty` 時也拒絕簽章）。
-2. 執行 `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test`、`cargo deny check`，任一失敗即停止。
+2. 執行 `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test`、`cargo deny check`，任一失敗即停止。`cargo test` 的步驟與 CI 相同：先 `cargo test --workspace --exclude kp-e2e`，再 `cargo build -p kairos -p pulse --bins` 建置執行檔，最後單獨執行端對端測試 `cargo test -p kp-e2e`（失敗時可從輸出分辨是單元／整合測試還是端對端測試）。
 3. 刪除 `dist/` 中舊的 `kairos-*`、`pulse-*`、`SHA256SUMS*`，打包兩個產品（`kairos/packaging/build-release.sh`、`pulse/packaging/build-release.sh`，共用實作 `packaging/build-release-common.sh`）。
 4. 以 `packaging/sign-release.sh` 簽署合併版 `SHA256SUMS`，並以 `<私鑰>.pub` 驗證剛產生的簽章。
 

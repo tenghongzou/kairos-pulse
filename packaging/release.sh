@@ -8,7 +8,7 @@
 #
 # 環境變數：
 #   SIGNING_KEY   簽章私鑰路徑（必須在 repo 之外）；沒有設定時只打包不簽章（例如 CI）
-#   SKIP_CHECKS=1 略過 fmt／clippy／test／deny（只用於已在同一個 commit 通過這些檢查的 CI job）
+#   SKIP_CHECKS=1 略過 fmt／clippy／test（含端對端測試）／deny（只用於已在同一個 commit 通過這些檢查的 CI job）
 #   ALLOW_DIRTY=1 允許工作目錄有未提交的變更（產物帶 -dirty，不能簽章；只用於測試打包腳本）
 #   DIST_DIR、BUILD_VOLUME 見 packaging/build-release-common.sh
 #
@@ -48,8 +48,13 @@ else
     cargo fmt --all --check
     echo "==> cargo clippy"
     cargo clippy --workspace --all-targets --locked -- -D warnings
-    echo "==> cargo test"
-    cargo test --workspace --locked
+    # 與 CI 的 check job 相同：先跑端對端測試以外的測試，再建置兩個執行檔、單獨跑端對端測試（tests/e2e）
+    echo "==> cargo test（端對端測試以外）"
+    cargo test --workspace --locked --exclude kp-e2e
+    echo "==> cargo build -p kairos -p pulse（端對端測試用）"
+    cargo build -p kairos -p pulse --bins --locked
+    echo "==> cargo test -p kp-e2e（端對端測試）"
+    cargo test -p kp-e2e --locked
     echo "==> cargo deny check"
     cargo deny check
 fi
