@@ -27,7 +27,7 @@
 |---|---|
 | 安裝目錄 | `/opt/pulse`（擁有者 `root:pulse`，750） |
 | 服務使用者 | `pulse`（系統帳號，不能登入） |
-| 可寫目錄 | `/opt/pulse/logs`（擁有者 `pulse`） |
+| 可寫目錄 | `/opt/pulse/logs`、`/opt/pulse/buffer`（本機緩衝；擁有者 `pulse`） |
 | Kairos | `monitor.example.com:8080`（換成 Kairos 管理者提供的位址與憑證名稱） |
 
 **從第 2 節起，請在同一個 root shell 中依序執行**：
@@ -106,6 +106,7 @@ useradd --system --user-group --home-dir /opt/pulse --no-create-home \
 
 install -d -o root  -g pulse -m 750 /opt/pulse
 install -d -o pulse -g pulse -m 750 /opt/pulse/logs
+install -d -o pulse -g pulse -m 750 /opt/pulse/buffer
 
 cd ~/pulse-dist/pkg
 install -o root -g root -m 755 pulse /opt/pulse/pulse
@@ -113,7 +114,7 @@ install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.
   CHANGELOG.md THIRD-PARTY-LICENSES /opt/pulse/
 ```
 
-`/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/`。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。
+`/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/` 與 `buffer/`。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。`buffer/` 是本機緩衝（斷線或 Kairos 維護期間的資料暫存在這裡，Kairos 確認後才刪除，見第 6.2 節）；沒有建立時服務仍會啟動，但 Pulse 無法寫入緩衝，記 `ERROR` 後改為 at-most-once（斷線期間的資料不補送）。
 
 ## 5. 產生 agent_id 並申請客戶端憑證
 
@@ -212,10 +213,26 @@ install -o root -g pulse -m 644 client.pem /opt/pulse/client.pem
 | `ca.pem`、`client.pem` | `root:pulse` | 644 |
 | `client.key`、`agent.id` | `root:pulse` | 640 |
 | `logs/` | `pulse:pulse` | 750 |
+| `buffer/`（Pulse 建立的檔案為 640） | `pulse:pulse` | 750 |
 
 `$AGENT_ID.csr`（`/opt/pulse` 內與 `/tmp` 的副本）交出去後可以刪除。
 
 `client.key` 與 `agent.id` 由 root 擁有、群組 pulse 只能讀（640）：即使服務帳號被入侵，也無法竄改本機身分或替換私鑰（unit 的 `ProtectSystem=strict` 另外讓 `/opt/pulse` 對服務唯讀）。Pulse 啟動時檢查這兩個檔案的權限：其他使用者有任何權限、群組可寫入，或擁有者不是 root 而群組可讀時記 `WARN`（不阻止啟動）。舊版 INSTALL 的 `pulse:pulse 600` 仍可正常運作、不會警告，建議改成新的配置（見第 10 節）。
+
+### 6.2 本機緩衝（磁碟用量）
+
+Pulse 0.3.0 起，取樣先寫進 `buffer/`，收到 Kairos 的確認（`ack`）才刪除；斷線、Kairos 停機維護或寫入結果不明時資料留在緩衝中，重新連上後依序補送（需要 Kairos 0.3.0 以上，見 `README.md`「本機緩衝（at-least-once）」）。相關設定（`pulse.toml` 的 `[buffer]`）：
+
+| 設定 | 預設 | 說明 |
+|---|---|---|
+| `enabled` | `true` | `false` 時不寫磁碟、不補送（與 0.2.0 相同） |
+| `dir` | `"buffer"` | 相對於工作目錄（`/opt/pulse/buffer`）；改到其他位置時，unit 的 `ReadWritePaths=` 也要一起改 |
+| `max_mb` | `64` | 待送資料的總大小上限（MiB） |
+| `max_records` | `50000` | 待送資料的筆數上限；與 `max_mb` 先到者為準，滿時丟掉最舊的資料並記 `WARN` |
+| `max_age_hours` | `168` | 取樣超過 7 天的資料不再送出 |
+| `replay_interval_ms` | `600` | 補送時兩筆之間的最短間隔（每秒約 1.67 筆，低於 Kairos 的 report 速率限制） |
+
+磁碟用量最多約 `max_mb` 再加 8 MiB（預設約 72 MiB）。一筆約 0.5～3 KB，預設每 5 秒一筆時，`max_records` 約可保存 69 小時、`max_mb` 約 1.5～4 天，先到者為準。斷線 24 小時（約 17,000 筆）恢復後，以預設速率約 3.3 小時補完（期間新的取樣排在積壓之後）。
 
 ## 7. 安裝 systemd unit
 
@@ -236,7 +253,7 @@ unit 重點（內容見 `pulse.service`）：
 | `Restart` | `always` | Pulse 本身會無限重連；取樣任務異常等內部錯誤（結束代碼 1）時由 systemd 重啟 |
 | `RestartPreventExitStatus` | `2 3 4` | 重試也不會成功的錯誤不重啟：2 命令列參數錯誤、3 設定錯誤（`pulse.toml` 語法、型別、範圍錯誤等）、4 憑證錯誤（`ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，SAN 與 agent_id 不符，`agent.id` 無法讀取或內容不合法）。`systemctl status pulse` 顯示 `status=2`／`3`／`4`，原因在 `journalctl -u pulse`，修正後 `systemctl restart pulse` |
 | `NotifyAccess` | `main` | 只用來以 sd_notify 更新 `systemctl status` 的 `Status:` 文字（見 8.1）；不送 `READY=1`，所以 `Type` 仍為 `simple` |
-| `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節） |
+| `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節）。`-` 表示 `buffer/` 不存在時不影響啟動（Pulse 改為 at-most-once 並記 `ERROR`） |
 
 ### 7.1 為什麼選擇 `StandardOutput=null`
 
@@ -330,7 +347,7 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 ## 9. 多實例（同一台主機跑多個 Pulse）
 
-一般一台主機只跑一個 Pulse。測試等情況需要多個實例時，每個實例必須有**自己的工作目錄、`agent.id`、客戶端憑證與 `logs/`**（共用 `agent.id` 會互相踢下線）。
+一般一台主機只跑一個 Pulse。測試等情況需要多個實例時，每個實例必須有**自己的工作目錄、`agent.id`、客戶端憑證、`logs/` 與 `buffer/`**（共用 `agent.id` 會互相踢下線；共用 `buffer/` 會讓兩個實例互相覆寫緩衝）。
 
 前提：第一個實例（`/opt/pulse`、`pulse.service`）已照第 4～8 節裝好。之後的實例共用使用者 `pulse` 與執行檔 `/opt/pulse/pulse`，其餘都放在 `/opt/pulse-N`（N 為 2、3…）。
 
@@ -342,16 +359,17 @@ N=2                                   # 每個實例換一個編號；以下所�
 # 1. 目錄（第 4 節）
 install -d -o root  -g pulse -m 750 /opt/pulse-$N
 install -d -o pulse -g pulse -m 750 /opt/pulse-$N/logs
+install -d -o pulse -g pulse -m 750 /opt/pulse-$N/buffer
 
-# 2. unit：只改 WorkingDirectory 與 ReadWritePaths 兩行；
+# 2. unit：只改 WorkingDirectory 與 ReadWritePaths 兩行（ReadWritePaths 的兩個路徑都改，所以用 g）；
 #    ExecStart 仍指向共用的執行檔，註解與 Documentation= 不變
-sed -e "/^\(WorkingDirectory\|ReadWritePaths\)=/s#/opt/pulse#/opt/pulse-$N#" \
+sed -e "/^\(WorkingDirectory\|ReadWritePaths\)=/s#/opt/pulse#/opt/pulse-$N#g" \
     /etc/systemd/system/pulse.service > /etc/systemd/system/pulse-$N.service
 chmod 644 /etc/systemd/system/pulse-$N.service
 grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart)=' /etc/systemd/system/pulse-$N.service
 #   WorkingDirectory=/opt/pulse-2
 #   ExecStart=/opt/pulse/pulse
-#   ReadWritePaths=/opt/pulse-2/logs
+#   ReadWritePaths=/opt/pulse-2/logs -/opt/pulse-2/buffer
 
 # 3. agent_id（第 5.1 節，在 /opt/pulse-N 執行）
 cd /opt/pulse-$N
@@ -444,6 +462,13 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
 - 升級前請看新版發佈包中的 `CHANGELOG.md`「破壞性變更與升級步驟」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
+- **升級到 0.3.0**：新版預設啟用本機緩衝（第 6.2 節），升級前先建立緩衝目錄並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/buffer`；多實例時對每個 `/opt/pulse-N` 建立目錄並重新產生 `pulse-N.service`）：
+
+  ```bash
+  install -d -o pulse -g pulse -m 750 /opt/pulse/buffer
+  ```
+
+  沒有建立目錄或沿用舊 unit 時，Pulse 照常運作，但會記 `ERROR`「無法開啟本機緩衝」並改為 at-most-once。升級後啟動日誌會有「本機緩衝：buffer（待送 0 筆…）」；連上 Kairos 0.3.0 以上時 Kairos 的上線日誌註明「durable」。回滾到 0.2.x 時 `buffer/` 中尚未送出的資料不會被送出，可以刪除。
 - 新版 unit 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再每 10 秒重試）；請依步驟 2 換上新版 unit（多實例時重新產生每個 `pulse-N.service`）。
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。

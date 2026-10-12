@@ -1,4 +1,5 @@
 use log::{debug, info};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
 use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
@@ -20,7 +21,9 @@ pub mod host;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
 /// 一次系統資訊取樣，由收集 task 產生、經 mpsc 交給連線 task 組成 report 訊息。
-#[derive(Debug, Clone)]
+///
+/// 啟用本機緩衝（A5）時以 JSON 原樣存進緩衝（`spool`），送出時才依協商的格式組成 report。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     /// 取樣時間（RFC 3339 UTC 毫秒），作為 report 的 `ts`
     pub ts: String,

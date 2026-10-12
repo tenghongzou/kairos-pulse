@@ -74,6 +74,45 @@ pub fn permission_warning(_path: &Path, _file: SensitiveFile) -> Option<String> 
     None
 }
 
+/// 目錄允許其他使用者存取時的警告訊息（本機緩衝目錄，A5）；沒問題或讀不到時為 `None`。
+///
+/// 目錄中是本機的監控資料（主機名稱、掛載點、網路介面名稱等），服務帳號必須能寫入，因此規則與
+/// 敏感檔案不同：Unix 只看其他使用者（other）的權限（Pulse 自己建立的目錄為 0750）；
+/// Windows 看 ACL 是否允許一般使用者存取（同 [`permission_warning`] 的廣泛群組清單）。
+#[cfg(unix)]
+pub fn dir_permission_warning(path: &Path, what: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    dir_mode_warning(path, mode, what)
+}
+
+/// 目錄允許一般使用者存取時的警告訊息（Windows：讀取 DACL）
+#[cfg(windows)]
+pub fn dir_permission_warning(path: &Path, what: &str) -> Option<String> {
+    let finding = windows::read_dacl(path)?;
+    acl::dir_acl_warning(path, &finding, what)
+}
+
+/// 其他平台：不檢查。
+#[cfg(not(any(unix, windows)))]
+pub fn dir_permission_warning(_path: &Path, _what: &str) -> Option<String> {
+    None
+}
+
+/// 目錄的 Unix 權限位元：其他使用者有任何權限時警告（與平台無關，方便測試用語）
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dir_mode_warning(path: &Path, mode: u32, what: &str) -> Option<String> {
+    let mode = mode & 0o7777;
+    (mode & 0o007 != 0).then(|| {
+        format!(
+            "{what} {} 的權限為 {mode:04o}，其他使用者可以存取（其中是本機的監控資料，含主機名稱、掛載點與網路介面名稱）；\
+             建議執行 chmod 750 {}",
+            path.display(),
+            path.display()
+        )
+    })
+}
+
 /// 依 Unix 權限位元與擁有者產生警告（與平台無關，方便在任何平台測試用語）。
 ///
 /// `owner_is_root` 為 true 時允許群組可讀（`root:<服務群組> 640`）。
@@ -166,7 +205,37 @@ mod acl {
         finding: &DaclFinding,
         file: SensitiveFile,
     ) -> Option<String> {
-        let detail = match finding {
+        let detail = finding_detail(path, finding)?;
+        Some(format!(
+            "{} {} 的{detail}；{}。建議放在只有執行帳號、SYSTEM 與 Administrators 可存取的目錄，\
+             或以 icacls \"{}\" /inheritance:r /grant:r \"<執行帳號>:R\" \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" \
+             移除繼承並只授權給這些帳號",
+            file.name,
+            path.display(),
+            file.risk,
+            path.display()
+        ))
+    }
+
+    /// 目錄（本機緩衝）的 DACL 檢查結果產生警告；執行帳號需要修改權限，子項目繼承
+    pub(super) fn dir_acl_warning(
+        path: &Path,
+        finding: &DaclFinding,
+        what: &str,
+    ) -> Option<String> {
+        let detail = finding_detail(path, finding)?;
+        Some(format!(
+            "{what} {} 的{detail}（其中是本機的監控資料，含主機名稱、掛載點與網路介面名稱）。\
+             建議以 icacls \"{}\" /inheritance:r /grant:r \"<執行帳號>:(OI)(CI)M\" \
+             \"*S-1-5-18:(OI)(CI)F\" \"*S-1-5-32-544:(OI)(CI)F\" 移除繼承並只授權給執行帳號、SYSTEM 與 Administrators",
+            path.display(),
+            path.display()
+        ))
+    }
+
+    /// DACL 檢查結果的說明文字；沒有問題時為 `None`
+    fn finding_detail(path: &Path, finding: &DaclFinding) -> Option<String> {
+        Some(match finding {
             DaclFinding::Null => "沒有 DACL（NULL DACL），任何人都有完全控制".to_string(),
             DaclFinding::Grants(grants) if !grants.is_empty() => {
                 let items: Vec<String> = grants
@@ -187,16 +256,7 @@ mod acl {
                 log::debug!("無法解析 {} 的 ACL，略過權限檢查", path.display());
                 return None;
             }
-        };
-        Some(format!(
-            "{} {} 的{detail}；{}。建議放在只有執行帳號、SYSTEM 與 Administrators 可存取的目錄，\
-             或以 icacls \"{}\" /inheritance:r /grant:r \"<執行帳號>:R\" \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" \
-             移除繼承並只授權給這些帳號",
-            file.name,
-            path.display(),
-            file.risk,
-            path.display()
-        ))
+        })
     }
 
     /// 解析 ACL 的二進位結構（winnt.h 的 `ACL` 標頭與其後的 ACE），找出授權給廣泛群組的允許項目。
@@ -387,6 +447,35 @@ mod tests {
     use super::*;
 
     const KEY: SensitiveFile = CLIENT_KEY_FILE;
+
+    #[test]
+    fn buffer_directory_warnings() {
+        let p = Path::new("/opt/pulse/buffer");
+        for mode in [0o750, 0o700, 0o40750, 0o770] {
+            assert_eq!(dir_mode_warning(p, mode, "本機緩衝目錄"), None, "{mode:o}");
+        }
+        let w = dir_mode_warning(p, 0o40755, "本機緩衝目錄").unwrap();
+        assert!(
+            w.starts_with("本機緩衝目錄 /opt/pulse/buffer 的權限為 0755")
+                && w.contains("chmod 750 /opt/pulse/buffer"),
+            "{w}"
+        );
+        // Windows：Users 可讀時警告，建議授權執行帳號修改（子項目繼承）
+        let finding = DaclFinding::Grants(vec![BroadGrant {
+            principal: r"BUILTIN\Users",
+            read: true,
+            write: false,
+        }]);
+        let w = dir_acl_warning(Path::new(r"C:\pulse\buffer"), &finding, "本機緩衝目錄").unwrap();
+        assert!(
+            w.contains(r"BUILTIN\Users 可讀取") && w.contains("(OI)(CI)M"),
+            "{w}"
+        );
+        assert_eq!(
+            dir_acl_warning(Path::new("x"), &DaclFinding::Grants(vec![]), "d"),
+            None
+        );
+    }
 
     #[test]
     fn mode_owner_only_is_fine() {

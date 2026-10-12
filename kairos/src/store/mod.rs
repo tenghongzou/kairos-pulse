@@ -28,7 +28,7 @@ use crate::config::{AppConfig, StorageBackend};
 use crate::registry::{RegistrySnapshot, RestoredAgent};
 use crate::storage::{
     Clock, REPORT_QUEUE_CAPACITY, RETENTION_SWEEP_INTERVAL, ReportRecord, ReportSink, WriteRequest,
-    WriteStatus, report_channel, start_report_writer,
+    WriteStatus, report_channel, start_mirror_writer, start_report_writer,
 };
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
@@ -192,19 +192,19 @@ pub struct Storage {
 /// 依 `storage.backend` 啟動 report 的儲存。開啟失敗（資料目錄無法寫入、資料庫損毀或版本較新）
 /// 時回錯誤，Kairos 不啟動
 pub async fn start(config: &AppConfig, data_dir: &Path, clock: Clock) -> Result<Storage, Error> {
-    let jsonl = |dir: &Path| {
-        start_report_writer(
-            dir.to_path_buf(),
-            config.storage.retention_days,
-            config.storage.max_daily_bytes,
-            clock,
-            RETENTION_SWEEP_INTERVAL,
-        )
-    };
+    let retention_days = config.storage.retention_days;
+    let max_daily_bytes = config.storage.max_daily_bytes;
     match config.storage.backend {
         StorageBackend::Jsonl => {
             info!("report 寫入 JSONL（storage.backend = \"jsonl\"）；沒有主機清冊與彙總");
-            let (reports, task) = jsonl(data_dir).await?;
+            let (reports, task) = start_report_writer(
+                data_dir.to_path_buf(),
+                retention_days,
+                max_daily_bytes,
+                clock,
+                RETENTION_SWEEP_INTERVAL,
+            )
+            .await?;
             Ok(Storage {
                 reports,
                 writer: Box::pin(task),
@@ -214,7 +214,14 @@ pub async fn start(config: &AppConfig, data_dir: &Path, clock: Clock) -> Result<
         }
         StorageBackend::Sqlite => {
             let mirror = if config.storage.jsonl_mirror {
-                let (sink, task) = jsonl(data_dir).await?;
+                let (sink, task) = start_mirror_writer(
+                    data_dir.to_path_buf(),
+                    retention_days,
+                    max_daily_bytes,
+                    clock,
+                    RETENTION_SWEEP_INTERVAL,
+                )
+                .await?;
                 info!("另外輸出 JSONL 鏡像（storage.jsonl_mirror = true）");
                 Some((sink, tokio::spawn(task)))
             } else {

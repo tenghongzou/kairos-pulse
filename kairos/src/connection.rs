@@ -38,7 +38,7 @@ use crate::registry::{
     ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
 };
 use crate::shutdown::{CONNECTIONS_DEADLINE, Shutdown, drain_limit};
-use crate::storage::{RecordBody, ReportRecord, ReportSink, WriteStatus, fmt_time};
+use crate::storage::{DedupKey, RecordBody, ReportRecord, ReportSink, WriteStatus, fmt_time};
 use crate::throttle::{Category, Key, LogThrottle};
 use crate::throttled;
 use crate::tls::{RevocationFailure, TlsState, revocation_failure, verify_chain};
@@ -271,6 +271,10 @@ pub(crate) enum StoreOutcome {
 ///    writer 已開始寫入而無法取消時，再等一小段，仍無結果則回 [`StoreOutcome::Unknown`]；
 /// 3. 寫入成功後才更新 last_report，並再更新一次 last_seen（等待寫檔期間收不到 heartbeat）。
 ///
+/// `record.dedup` 為 durable report 的去重鍵（A5，[`ReportRecord::with_dedup`]）：已保存過的那筆不再
+/// 寫入（[`WriteStatus::Duplicate`]），同樣回 [`StoreOutcome::Stored`]（連線回 `ack`），但不更新
+/// last_report。durable report 可能是補送的舊資料，只在 `ts` 不早於目前的 last_report 時更新。
+///
 /// 各次更新 last_seen 中只要有一次讓 agent 從離線恢復，就把 `revived` 設為 `true`（不論保存結果），
 /// 呼叫端據此記錄「恢復上線」（R2-K13）。
 pub(crate) async fn store_report(
@@ -298,6 +302,7 @@ pub(crate) async fn store_report(
     let deadline = deadline_after(write_timeout);
     // 等待期間（含等待佇列空間）以 keep_alive_while 定期更新本連線的 last_seen
     // （只更新 conn_id 相符的現役連線）。在放入佇列前逾時：這筆根本沒有進入佇列
+    let durable = record.dedup.is_some();
     let submit = keep_alive_while(registry, &agent_id, conn_id, revived, sink.submit(record));
     let mut pending = match timeout_at(deadline, submit).await {
         Ok(Ok(pending)) => pending,
@@ -329,9 +334,14 @@ pub(crate) async fn store_report(
     match status {
         WriteStatus::Written | WriteStatus::Duplicate => {
             // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）。
-            // 重複的 report（at-least-once 的重送，先前已保存）不更新 last_report：它是較舊的資料
+            // 重複的 report（at-least-once 的重送，先前已保存）不更新 last_report：它是較舊的資料。
+            // durable report 可能是補送的舊資料，只在 ts 不早於目前的 last_report 時更新
             if status == WriteStatus::Written {
-                registry.set_last_report(&agent_id, conn_id, last);
+                if durable {
+                    registry.set_last_report_unless_older(&agent_id, conn_id, last);
+                } else {
+                    registry.set_last_report(&agent_id, conn_id, last);
+                }
             }
             let touch = registry.touch(&agent_id, conn_id, std::time::Instant::now(), Utc::now());
             if touch == Touch::Revived {
@@ -1183,7 +1193,7 @@ impl Conn {
             self.throttle,
             self.agent_key(Category::AgentOnline, agent),
             info,
-            "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms，協定 v{}",
+            "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms，協定 v{}{}",
             self.conn_id,
             agent.agent_id,
             agent.hostname.escape_debug(),
@@ -1191,7 +1201,12 @@ impl Conn {
             self.peer,
             state,
             offline_ms,
-            agent.session.proto
+            agent.session.proto,
+            if agent.session.durable {
+                "（durable：report 可補送、去重）"
+            } else {
+                ""
+            }
         );
         if let Some(previous) = &registration.previous_fingerprint {
             throttled!(
@@ -1449,6 +1464,23 @@ impl Conn {
                         ));
                     }
                 };
+                // durable（A5）：必須帶 boot_id／report_seq；缺漏、型別錯誤或不符限制與其他欄位
+                // 相同，回 bad_request（seq 為 null）、不算合法訊息。未協商 durable 時一律忽略
+                let dedup = if agent.session.durable {
+                    match body.durable_seq() {
+                        Ok(durable) => Some(DedupKey {
+                            boot_id: durable.boot_id.to_ascii_lowercase(),
+                            report_seq: durable.report_seq,
+                        }),
+                        Err(message) => {
+                            return Ok(Handled::not_alive(
+                                self.reply_bad_request(None, message).await?,
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.bad_requests = 0;
                 if !self.pace_report(agent).await {
                     if !self.touch(ctx, agent) {
@@ -1488,7 +1520,15 @@ impl Conn {
                     return Ok(Handled::alive(flow));
                 }
 
-                let summary = content.summary();
+                let mut summary = content.summary();
+                if let Some(key) = &dedup {
+                    summary.push_str(&format!(
+                        " boot_id={} report_seq={} ts={}",
+                        key.boot_id,
+                        key.report_seq,
+                        ts.escape_debug()
+                    ));
+                }
                 let record = ReportRecord::new(
                     received_at,
                     self.peer.to_string(),
@@ -1497,8 +1537,9 @@ impl Conn {
                     seq,
                     ts,
                     content.into_body(),
-                );
-                // ack 語意 = 已寫入資料檔；等待 writer 回覆（受寫出逾時限制）
+                )
+                .with_dedup(dedup);
+                // ack 語意 = 已寫入資料庫或資料檔；等待 writer 回覆（受寫出逾時限制）
                 let revived = AtomicBool::new(false);
                 let outcome = store_report(
                     &ctx.registry,
@@ -1722,32 +1763,40 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_report_is_acked_without_updating_last_report() {
-        // 去重（durable）：writer 回 Duplicate（已保存過）時照常 ack，但 last_report 不改成重送的舊資料
+        // 去重（durable，A5）：去重鍵隨紀錄交給 writer；writer 回 Duplicate（已保存過）時照常 ack，
+        // 但 last_report 不改成重送的舊資料
         let registry = Registry::new();
         let _reg = registry
             .register(1, hello_info(), std::time::Instant::now(), Utc::now())
             .unwrap();
         let (sink, mut rx) = report_channel(4);
         let writer = tokio::spawn(async move {
+            let mut keys = Vec::new();
             for status in [WriteStatus::Written, WriteStatus::Duplicate] {
                 let req = rx.recv().await.unwrap();
                 assert!(req.ticket.claim());
+                keys.push(req.record.dedup.clone());
                 let _ = req.reply.send(status);
             }
+            keys
         });
-        for seq in [9, 8] {
+        let key = |report_seq| DedupKey {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq,
+        };
+        for (seq, report_seq) in [(9, 4), (8, 3)] {
             let outcome = store_report(
                 &registry,
                 &sink,
                 1,
-                record(seq),
+                record(seq).with_dedup(Some(key(report_seq))),
                 Duration::from_secs(1),
                 &AtomicBool::new(false),
             )
             .await;
             assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         }
-        writer.await.unwrap();
+        assert_eq!(writer.await.unwrap(), vec![Some(key(4)), Some(key(3))]);
         assert_eq!(last_report_seq(&registry), Some(9));
     }
 

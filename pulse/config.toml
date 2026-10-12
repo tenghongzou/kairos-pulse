@@ -64,7 +64,8 @@ interval = 15
 
 [report]
 # 系統資訊回報間隔（秒，1～3600）。CPU 使用率為上次取樣到這次取樣之間的平均（略過回報時仍會取樣）。
-# 上一筆 report 尚未收到伺服器回應（ack 或 error）時，略過這次取樣（記 WARN，有節流）
+# 啟用本機緩衝且 Kairos 支援 durable 時，取樣先寫進緩衝、依序送出（見 [buffer]）；
+# 否則（at-most-once）上一筆 report 尚未收到伺服器回應（ack 或 error）時，略過這次取樣（記 WARN，有節流）
 interval = 5
 
 [agent]
@@ -80,6 +81,26 @@ id_file = "agent.id"
 # tags 只能在 pulse.toml 設定（環境變數不支援陣列）
 display_name = ""
 tags = []
+
+[buffer]
+# 本機緩衝（at-least-once）：取樣先寫進本機磁碟，收到 Kairos 的確認（ack）才刪除；
+# 斷線、Kairos 停機維護或寫入結果不明時資料留在緩衝中，重新連上後依序補送，再送新的取樣。
+# 需要 Kairos 0.3.0 以上（協定 feature「durable」）；連上舊版 Kairos 時照舊即時送出、送不出去就丟棄，
+# 緩衝中的積壓保留到連上新版 Kairos 為止。設為 false 時與 0.2.0 相同（不寫磁碟、不補送）。
+enabled = true
+# 緩衝目錄（相對路徑以工作目錄解析）。Unix 上以 0750 建立、檔案為 0640；
+# 目錄允許其他使用者（Windows：一般使用者）存取時記 WARN。同一個目錄只能給一個 Pulse 使用
+dir = "buffer"
+# 待送資料的上限，先到者為準；超過時丟掉最舊的資料並記 WARN（計入丟棄筆數）。
+# 一筆約 0.5～3 KB（視磁碟、網路介面與溫度感測器的數量而定），預設每 5 秒一筆時，
+# 50000 筆約 69 小時、64 MiB 約 1.5～4 天。磁碟用量最多約 max_mb 再加 8 MiB
+max_mb = 64              # MiB，1～102400
+max_records = 50000      # 筆，100～10000000
+# 取樣時間超過這麼久的資料不再送出、直接丟棄（小時，1～8760；預設 7 天）
+max_age_hours = 168
+# 兩筆 report 之間的最短間隔（毫秒，500～60000）。補送積壓時以這個速率送出（預設每秒約 1.67 筆，
+# 低於 Kairos 的 report 速率限制每秒 2 則）；大量主機同時恢復連線時可調大以減輕 Kairos 的負載
+replay_interval_ms = 600
 
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）

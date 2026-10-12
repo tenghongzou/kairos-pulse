@@ -15,6 +15,13 @@
 //!   可能已（部分）寫入的要求回 [`WriteStatus::Unknown`]（連線不回應並斷線）；
 //! - 當天的檔案達到 `storage.max_daily_bytes` 時，放不下的要求不寫入，回 [`WriteStatus::Failed`]
 //!   （R2-K3）。
+//!
+//! durable report（A5）的去重鍵放在 [`ReportRecord::dedup`]（[`ReportRecord::with_dedup`]），
+//! 由後端各自去重，連線端只看 [`WriteStatus::Duplicate`]：SQLite 以唯一索引（[`crate::store`]）；
+//! `storage.backend = "jsonl"` 時由本模組的 writer 以記憶體中的 [`DedupIndex`] 去重（寫入前先查，
+//! 寫入成功後才記錄；啟動時從資料檔尾端重建）。writer 是唯一的寫入者、依序處理，因此「連線逾時
+//! 放棄等待、但 writer 其實寫完了」的那筆也會被記錄，重送時不會重複。JSONL 鏡像（SQLite 已去重）
+//! 不建立 [`DedupIndex`]。
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use futures_util::FutureExt;
@@ -31,6 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::dedup::{DedupIndex, IDLE_EVICTION, REBUILD_MAX_BYTES};
 use crate::fsperm;
 use crate::protocol::Metric;
 use crate::registry::RegistrySnapshot;
@@ -107,10 +115,11 @@ impl RecordBody {
 /// at-least-once（協定 feature `durable`）的去重鍵：Pulse 每次啟動產生的 `boot_id` 與該 boot 內
 /// 單調遞增的 `report_seq`。重送同一筆 report 時兩者不變。
 ///
-/// 與 `sprint2/durable` 分支的契約（見 `kairos/STORAGE.md`「去重」）：連線協商到 `durable` 且 report
-/// 帶有這兩個欄位時，以 [`ReportRecord::with_dedup`] 附上；SQLite 後端以唯一索引
-/// （主機＋`boot_id`＋`report_seq`）保證不重複，重複的那筆回 [`WriteStatus::Duplicate`]（連線照常回
-/// `ack`，不重寫）。JSONL 後端不去重，只把兩個欄位寫進該行。
+/// 連線協商到 `durable` 時（report 必定帶這兩個欄位，`boot_id` 已轉小寫），以
+/// [`ReportRecord::with_dedup`] 附上（見 `kairos/STORAGE.md`「去重」）。主機身分為 `agent_id`：
+/// SQLite 後端以唯一索引（主機＋`boot_id`＋`report_seq`）保證不重複；JSONL 後端以記憶體中的
+/// [`DedupIndex`] 去重（範圍有限，見 [`crate::dedup`]）。重複的那筆回 [`WriteStatus::Duplicate`]
+/// （連線照常回 `ack`，不重寫）。兩者也寫進 JSONL 的該行（`ts` 之後）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct DedupKey {
     pub boot_id: String,
@@ -131,7 +140,7 @@ pub struct ReportRecord {
     pub hostname: String,
     pub seq: u64,
     pub ts: String,
-    /// 去重鍵（`durable`）；有值時 JSONL 在 `ts` 之後多 `boot_id`、`report_seq` 兩個欄位
+    /// 去重鍵（`durable`，A5）；有值時 JSONL 在 `ts` 之後多 `boot_id`、`report_seq` 兩個欄位
     #[serde(flatten)]
     pub dedup: Option<DedupKey>,
     #[serde(flatten)]
@@ -161,7 +170,7 @@ impl ReportRecord {
         }
     }
 
-    /// 附上去重鍵（`durable`；連線端的接線由 sprint2/durable 處理，目前由 `kairos reports export` 使用）
+    /// 附上去重鍵（`durable`：連線協商到 `durable` 時；`kairos reports export` 讀回時）
     pub fn with_dedup(mut self, dedup: Option<DedupKey>) -> Self {
         self.dedup = dedup;
         self
@@ -472,6 +481,9 @@ impl ReportSink {
 
     /// 放入佇列（佇列滿時等待），回傳可等待結果的 [`PendingWrite`]。
     /// 佇列已關閉（writer 已停止）時回傳 `Err`。在放入前被逾時中斷時，這筆不會進入佇列。
+    ///
+    /// `record.dedup`（durable report 的去重鍵）有值時，同一主機、同一個去重鍵已保存過就不再寫入，
+    /// 結果為 [`WriteStatus::Duplicate`]。
     pub async fn submit(&self, record: ReportRecord) -> Result<PendingWrite, String> {
         let (reply, result) = oneshot::channel();
         let ticket = WriteTicket::default();
@@ -508,7 +520,8 @@ impl ReportSink {
     }
 }
 
-/// 啟動 report 寫入工作，回傳 (handle, writer task)。
+/// 啟動 JSONL 後端（`storage.backend = "jsonl"`）的 report 寫入工作，回傳 (handle, writer task)；
+/// durable report 以記憶體中的 [`DedupIndex`] 去重（啟動時從資料檔尾端重建）。
 ///
 /// 啟動時清除過期檔案、提示舊版 reports.jsonl，並開啟今天（UTC）的檔案；
 /// 開檔失敗即回錯誤，讓啟動階段就發現問題。`max_daily_bytes` 為每個日期檔案的大小上限（0 = 不限制）。
@@ -518,6 +531,45 @@ pub async fn start_report_writer(
     max_daily_bytes: u64,
     clock: Clock,
     cleanup_every: Duration,
+) -> Result<(ReportSink, impl std::future::Future<Output = ()>), Error> {
+    start_jsonl_writer(
+        data_dir,
+        retention_days,
+        max_daily_bytes,
+        clock,
+        cleanup_every,
+        true,
+    )
+    .await
+}
+
+/// 啟動 JSONL 鏡像（`storage.jsonl_mirror`）的寫入工作：與 [`start_report_writer`] 相同，但不去重
+/// （送進鏡像的都是 SQLite 已寫入、已去重的 report），也不讀資料檔重建去重紀錄
+pub async fn start_mirror_writer(
+    data_dir: PathBuf,
+    retention_days: u32,
+    max_daily_bytes: u64,
+    clock: Clock,
+    cleanup_every: Duration,
+) -> Result<(ReportSink, impl std::future::Future<Output = ()>), Error> {
+    start_jsonl_writer(
+        data_dir,
+        retention_days,
+        max_daily_bytes,
+        clock,
+        cleanup_every,
+        false,
+    )
+    .await
+}
+
+async fn start_jsonl_writer(
+    data_dir: PathBuf,
+    retention_days: u32,
+    max_daily_bytes: u64,
+    clock: Clock,
+    cleanup_every: Duration,
+    dedup: bool,
 ) -> Result<(ReportSink, impl std::future::Future<Output = ()>), Error> {
     let today = clock().date_naive();
     let legacy = data_dir.join(LEGACY_REPORTS_FILE);
@@ -539,6 +591,11 @@ pub async fn start_report_writer(
         clock(),
     );
     let mut state = WriterState::new(data_dir, retention_days, max_daily_bytes, clock, guard);
+    state.dedup = if dedup {
+        Some(rebuild_dedup_index(&state.data_dir).await)
+    } else {
+        None
+    };
     state.cleanup_now().await;
 
     state.current = Some(OpenFile::open(&state.data_dir, today).await?);
@@ -579,6 +636,8 @@ struct WriterState {
     guard: DateGuard,
     /// 開檔／寫入失敗與達到大小上限的日誌節流（磁碟滿時每批都會失敗；R2-K12）
     throttle: LogThrottle,
+    /// durable report 的去重紀錄（A5）；JSONL 鏡像（SQLite 已去重）時為 `None`
+    dedup: Option<DedupIndex>,
     /// 測試用：下一次寫出只寫入這麼多 bytes 就回報失敗（模擬寫到一半磁碟滿）
     #[cfg(test)]
     fail_after: Option<usize>,
@@ -601,6 +660,7 @@ impl WriterState {
             last_cleanup: clock().date_naive(),
             guard,
             throttle: LogThrottle::default(),
+            dedup: Some(DedupIndex::new()),
             #[cfg(test)]
             fail_after: None,
         }
@@ -621,26 +681,60 @@ impl WriterState {
 
     /// 將同一天的紀錄整段寫入該日的檔案（一次 write_all + flush），再逐筆回覆結果。
     /// 編碼前先認領每一筆；連線已因逾時取消（已回 `storage_unavailable`）的要求直接略過。
+    ///
+    /// 帶去重鍵的要求（durable report）：已寫入過的不寫，回 [`WriteStatus::Duplicate`]；
+    /// 寫入成功才記錄。同一批中出現兩次的同一筆，第二次留到第一次寫完後再判斷。
     async fn write_day(&mut self, date: NaiveDate, requests: Vec<WriteRequest>, buf: &mut Vec<u8>) {
         let total = requests.len();
-        let (records, replies): (Vec<_>, Vec<_>) = requests
+        let mut pending: Vec<(ReportRecord, oneshot::Sender<WriteStatus>)> = requests
             .into_iter()
             .filter(|r| r.ticket.claim())
             .map(|r| (r.record, r.reply))
-            .unzip();
-        if records.len() < total {
+            .collect();
+        if pending.len() < total {
             debug!(
                 "略過 {} 筆連線已逾時放棄的 report（已回覆 storage_unavailable）",
-                total - records.len()
+                total - pending.len()
             );
         }
-        if records.is_empty() {
-            return;
-        }
-        let results = self.write_records(date, &records, buf).await;
-        for (reply, result) in replies.into_iter().zip(results) {
-            // 連線已關閉（例如關機時）就收不到，忽略
-            let _ = reply.send(result);
+        while !pending.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let mut later = Vec::new();
+            let mut records = Vec::with_capacity(pending.len());
+            let mut replies = Vec::with_capacity(pending.len());
+            for (record, reply) in pending {
+                if let (Some(key), Some(index)) = (&record.dedup, &self.dedup) {
+                    if index.contains(&record.agent_id, key) {
+                        debug!(
+                            "agent {} 的 report（boot_id={} report_seq={}）已寫入過，不再寫入",
+                            record.agent_id, key.boot_id, key.report_seq
+                        );
+                        // 連線已關閉（例如關機時）就收不到，忽略
+                        let _ = reply.send(WriteStatus::Duplicate);
+                        continue;
+                    }
+                    if !seen.insert((record.agent_id.clone(), key.clone())) {
+                        later.push((record, reply));
+                        continue;
+                    }
+                }
+                records.push(record);
+                replies.push(reply);
+            }
+            if !records.is_empty() {
+                let results = self.write_records(date, &records, buf).await;
+                let now = Instant::now();
+                for ((record, reply), result) in records.iter().zip(replies).zip(results) {
+                    // 結果不明（Unknown）的不記錄：重送時再寫一次，寧可重複、不可遺失
+                    if result == WriteStatus::Written
+                        && let (Some(key), Some(index)) = (&record.dedup, self.dedup.as_mut())
+                    {
+                        index.insert(&record.agent_id, key, now);
+                    }
+                    let _ = reply.send(result);
+                }
+            }
+            pending = later;
         }
     }
 
@@ -792,8 +886,19 @@ impl WriterState {
         results
     }
 
-    /// 以目前時鐘的日期執行保留清除；日期比先前晚超過 2 天（時鐘可能被誤校）時跳過
+    /// 以目前時鐘的日期執行保留清除；日期比先前晚超過 2 天（時鐘可能被誤校）時跳過。
+    /// 同時清除閒置的去重紀錄
     async fn cleanup_now(&mut self) {
+        let evicted = self
+            .dedup
+            .as_mut()
+            .map_or(0, |index| index.evict_idle(Instant::now(), IDLE_EVICTION));
+        if evicted > 0 {
+            debug!(
+                "清除 {evicted} 筆超過 {} 小時沒有新資料的 durable 去重紀錄",
+                IDLE_EVICTION.as_secs() / 3600
+            );
+        }
         // 永久保留時不清除，也不需要檢查日期
         if self.retention_days == 0 {
             return;
@@ -853,6 +958,75 @@ async fn run_report_writer(
         error!("寫入 {} 失敗: {}", REPORT_FILES.file_name(file.date), e);
     }
     debug!("report 寫入工作結束");
+}
+
+/// 啟動時重建 durable report 的去重紀錄：讀取最新的兩個 report 檔尾端（合計最多
+/// [`REBUILD_MAX_BYTES`]）中帶 `boot_id`／`report_seq` 的行。讀取失敗只記 WARN（從空的紀錄開始，
+/// 之後的重送可能重複寫入，不影響啟動）
+async fn rebuild_dedup_index(data_dir: &Path) -> DedupIndex {
+    let dir = data_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || read_dedup_tails(&dir, REBUILD_MAX_BYTES)).await {
+        Ok(Ok((index, lines))) => {
+            if lines > 0 {
+                info!(
+                    "已由資料檔重建 durable report 的去重紀錄（{} 筆，{} 個 agent／boot_id）",
+                    lines,
+                    index.len()
+                );
+            }
+            index
+        }
+        Ok(Err(e)) => {
+            warn!("無法由資料檔重建 durable report 的去重紀錄（之後的重送可能重複寫入）: {e}");
+            DedupIndex::new()
+        }
+        Err(e) => {
+            warn!("重建 durable report 的去重紀錄時發生錯誤: {e}");
+            DedupIndex::new()
+        }
+    }
+}
+
+/// [`rebuild_dedup_index`] 的同步部分：回傳重建的紀錄與讀到的 durable 行數
+pub fn read_dedup_tails(dir: &Path, max_bytes: u64) -> Result<(DedupIndex, usize), Error> {
+    use std::io::{Read, Seek};
+    let mut dates: Vec<NaiveDate> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter_map(|e| REPORT_FILES.parse(e.file_name().to_str()?))
+        .collect();
+    dates.sort_unstable_by(|a, b| b.cmp(a));
+    let mut remaining = max_bytes;
+    let mut tails = Vec::new();
+    for date in dates.into_iter().take(2) {
+        if remaining == 0 {
+            break;
+        }
+        let path = dir.join(REPORT_FILES.file_name(date));
+        let mut file = std::fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(remaining);
+        file.seek(SeekFrom::Start(start))?;
+        let mut data = Vec::new();
+        file.take(len - start).read_to_end(&mut data)?;
+        remaining -= len - start;
+        // 從檔案中間開始讀時，第一行不完整
+        if start > 0 {
+            let first = data
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(data.len(), |i| i + 1);
+            data.drain(..first);
+        }
+        tails.push(data);
+    }
+    let mut index = DedupIndex::new();
+    let now = Instant::now();
+    let mut lines = 0;
+    // 舊的檔案先處理（順序不影響結果，只是與寫入順序一致）
+    for data in tails.iter().rev() {
+        lines += index.rebuild_from_lines(data.split(|&b| b == b'\n'), now);
+    }
+    Ok((index, lines))
 }
 
 /// 目前檔案的長度；查詢失敗時為 `None`
@@ -1768,6 +1942,166 @@ mod tests {
         handle.await.unwrap();
         assert_eq!(seqs_in(&path).await, [1, 2]);
         fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    // ---- durable report 的去重（A5） ----
+
+    const BOOT: &str = "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e";
+
+    fn dkey(report_seq: u64) -> DedupKey {
+        DedupKey {
+            boot_id: BOOT.into(),
+            report_seq,
+        }
+    }
+
+    fn durable_request(
+        seq: u64,
+        report_seq: u64,
+    ) -> (WriteRequest, oneshot::Receiver<WriteStatus>) {
+        let mut r = record(seq);
+        r.dedup = Some(dkey(report_seq));
+        request(r)
+    }
+
+    async fn submit_durable(sink: &ReportSink, seq: u64, report_seq: u64) -> WriteStatus {
+        sink.submit(record(seq).with_dedup(Some(dkey(report_seq))))
+            .await
+            .unwrap()
+            .wait()
+            .await
+    }
+
+    #[tokio::test]
+    async fn resent_durable_report_is_acked_without_writing_again() {
+        let dir = temp_dir("dedup");
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        let path = dir.join(REPORT_FILES.file_name(noon().date_naive()));
+
+        assert_eq!(submit_durable(&sink, 2, 1).await, WriteStatus::Written);
+        // 重送（新連線的 seq 不同）：回 Duplicate，資料檔只有一行
+        assert_eq!(submit_durable(&sink, 7, 1).await, WriteStatus::Duplicate);
+        assert_eq!(submit_durable(&sink, 3, 2).await, WriteStatus::Written);
+        // 沒有去重鍵的 report 不受影響
+        assert_eq!(sink.write(record(4)).await, Ok(()));
+        assert_eq!(seqs_in(&path).await, vec![2, 3, 4]);
+        let text = fs::read_to_string(&path).await.unwrap();
+        let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            (&first["boot_id"], &first["report_seq"]),
+            (&json!(BOOT), &json!(1))
+        );
+        let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert!(last.get("boot_id").is_none() && last.get("report_seq").is_none());
+
+        // 重新啟動：由資料檔重建去重紀錄，重新啟動前已寫入的那筆重送時不會重複
+        drop(sink);
+        handle.await.unwrap();
+        let (sink, task) = start_report_writer(dir.clone(), 30, 0, noon, HOUR)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(task);
+        assert_eq!(submit_durable(&sink, 1, 2).await, WriteStatus::Duplicate);
+        assert_eq!(submit_durable(&sink, 2, 3).await, WriteStatus::Written);
+        assert_eq!(seqs_in(&path).await, vec![2, 3, 4, 2]);
+        drop(sink);
+        handle.await.unwrap();
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_durable_report_twice_in_one_batch_is_written_once() {
+        let dir = temp_dir("dedup-batch");
+        fs::create_dir_all(&dir).await.unwrap();
+        let guard = DateGuard::new("report 檔", noon().date_naive(), Instant::now(), noon());
+        let mut state = WriterState::new(dir.clone(), 30, 0, noon, guard);
+        let date = noon().date_naive();
+        let mut buf = Vec::new();
+        let (a, ra) = durable_request(1, 5);
+        let (b, rb) = durable_request(2, 6);
+        let (c, rc) = durable_request(3, 5);
+        state.write_day(date, vec![a, b, c], &mut buf).await;
+        assert_eq!(ra.await.unwrap(), WriteStatus::Written);
+        assert_eq!(rb.await.unwrap(), WriteStatus::Written);
+        assert_eq!(rc.await.unwrap(), WriteStatus::Duplicate);
+        assert_eq!(
+            seqs_in(&dir.join(REPORT_FILES.file_name(date))).await,
+            vec![1, 2]
+        );
+        drop(state);
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_report_with_unknown_or_failed_result_is_written_when_resent() {
+        // 寫出中途失敗：結果不明（Unknown）與確定未寫入（Failed）的都不列入去重紀錄，
+        // 重送時再寫一次（寧可重複、不可遺失）
+        let dir = temp_dir("dedup-fail");
+        fs::create_dir_all(&dir).await.unwrap();
+        let guard = DateGuard::new("report 檔", noon().date_naive(), Instant::now(), noon());
+        let mut state = WriterState::new(dir.clone(), 30, 0, noon, guard);
+        let date = noon().date_naive();
+        let mut buf = Vec::new();
+        let line_len = {
+            let mut b = Vec::new();
+            let (req, _) = durable_request(1, 1);
+            encode_batch(std::iter::once(&req.record), &mut b);
+            b.len()
+        };
+        state.fail_after = Some(line_len + 5);
+        let (a, ra) = durable_request(1, 1);
+        let (b, rb) = durable_request(2, 2);
+        let (c, rc) = durable_request(3, 3);
+        state.write_day(date, vec![a, b, c], &mut buf).await;
+        assert!(matches!(ra.await.unwrap(), WriteStatus::Unknown(_)));
+        assert!(matches!(rb.await.unwrap(), WriteStatus::Unknown(_)));
+        assert!(matches!(rc.await.unwrap(), WriteStatus::Failed(_)));
+        for report_seq in 1..=3 {
+            let (req, rx) = durable_request(10 + report_seq, report_seq);
+            state.write_day(date, vec![req], &mut buf).await;
+            assert_eq!(rx.await.unwrap(), WriteStatus::Written, "{report_seq}");
+        }
+        // 再送一次就是重複了
+        let (req, rx) = durable_request(20, 2);
+        state.write_day(date, vec![req], &mut buf).await;
+        assert_eq!(rx.await.unwrap(), WriteStatus::Duplicate);
+        drop(state);
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn dedup_rebuild_reads_only_the_tail_of_the_newest_two_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-dedup-tail-{}-{}",
+            std::process::id(),
+            noon().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |seq: u64| {
+            let mut r = record(seq);
+            r.dedup = Some(dkey(seq));
+            format!("{}\n", serde_json::to_string(&r).unwrap())
+        };
+        let write = |date: NaiveDate, seqs: std::ops::RangeInclusive<u64>| {
+            let text: String = seqs.map(line).collect();
+            std::fs::write(dir.join(REPORT_FILES.file_name(date)), text).unwrap();
+        };
+        write(date(2026, 10, 1), 1..=10); // 第三新：不讀
+        write(date(2026, 10, 2), 11..=20);
+        write(date(2026, 10, 3), 21..=30);
+        std::fs::write(dir.join("agents.json"), "{}").unwrap();
+        let (idx, n) = read_dedup_tails(&dir, u64::MAX).unwrap();
+        assert_eq!(n, 20);
+        assert!(idx.contains("a", &dkey(11)) && idx.contains("a", &dkey(30)));
+        // 上限只夠讀最新檔的最後 3 行多一點：不完整的第一行略過
+        let budget = (line(30).len() * 3 + 7) as u64;
+        let (idx, n) = read_dedup_tails(&dir, budget).unwrap();
+        assert_eq!(n, 3);
+        assert!(idx.contains("a", &dkey(28)) && !idx.contains("a", &dkey(27)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

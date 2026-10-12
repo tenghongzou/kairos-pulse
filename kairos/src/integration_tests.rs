@@ -1494,7 +1494,7 @@ async fn new_pulse_negotiates_v2_with_metrics() {
     let ack = c.recv().await;
     assert_eq!(ack["type"], "hello_ack", "{ack}");
     assert_eq!(ack["proto"], 2);
-    assert_eq!(ack["features"], json!(["metrics"]));
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
     assert_eq!(ack["offline_after_ms"], 5000);
     // server_time：RFC 3339 UTC 毫秒，接近現在
     let server_time = ack["server_time"].as_str().unwrap();
@@ -1565,7 +1565,7 @@ async fn v2_without_the_metrics_feature_keeps_the_v1_report_format() {
     c.send(&hello_v2(1, ID, &[]).to_string()).await;
     let ack = c.recv().await;
     assert_eq!(ack["proto"], 2, "{ack}");
-    assert_eq!(ack["features"], json!(["metrics"]));
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
     c.send(&report(2)).await;
     assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
     assert_eq!(server.last_report_line()["schema"], 1);
@@ -1682,4 +1682,136 @@ async fn changed_host_fingerprint_is_logged() {
         .expect("應記錄主機指紋改變");
     assert!(line.contains("sha256:aaaaaaaaaaaa…"), "{line}");
     assert!(line.contains("sha256:bbbbbbbbbbbb…"), "{line}");
+}
+
+// ---- durable：at-least-once（A5） ----
+
+const BOOT: &str = "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e";
+
+fn durable_report(seq: u64, boot_id: &str, report_seq: u64, ts: &str) -> String {
+    let mut r: Value = serde_json::from_str(&metrics_report(seq, 1.5)).unwrap();
+    r["boot_id"] = json!(boot_id);
+    r["report_seq"] = json!(report_seq);
+    r["ts"] = json!(ts);
+    r.to_string()
+}
+
+async fn durable_client(server: &Server, seq: u64) -> Client {
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(seq, ID, &["metrics", "durable"]).to_string())
+        .await;
+    let ack = c.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    c
+}
+
+fn durable_lines(server: &Server) -> Vec<Value> {
+    std::fs::read_to_string(server.reports_file())
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn durable_resend_is_acked_but_written_once() {
+    let server = Server::start(Options::default()).await;
+    let mut c = durable_client(&server, 1).await;
+    // 補送的歷史資料（3 天前）照收，ts 原樣保存
+    let old = "2026-10-06T03:15:45.210Z";
+    c.send(&durable_report(2, BOOT, 41, old)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    // boot_id 大小寫不同仍是同一筆（伺服器轉小寫）
+    c.send(&durable_report(3, &BOOT.to_ascii_uppercase(), 41, old))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+    c.send(&durable_report(4, BOOT, 42, "2026-10-06T03:15:50.210Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    drop(c);
+
+    // 結果不明時斷線、重連後重送：回 ack，不重寫
+    let mut c = durable_client(&server, 1).await;
+    c.send(&durable_report(2, BOOT, 42, "2026-10-06T03:15:50.210Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    c.send(&durable_report(3, BOOT, 43, "2026-10-06T03:15:55.210Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+
+    let lines = durable_lines(&server);
+    let keys: Vec<(String, u64, String)> = lines
+        .iter()
+        .map(|l| {
+            (
+                l["boot_id"].as_str().unwrap().to_string(),
+                l["report_seq"].as_u64().unwrap(),
+                l["ts"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (BOOT.to_string(), 41, old.to_string()),
+            (BOOT.to_string(), 42, "2026-10-06T03:15:50.210Z".to_string()),
+            (BOOT.to_string(), 43, "2026-10-06T03:15:55.210Z".to_string()),
+        ]
+    );
+    assert!(lines.iter().all(|l| l["schema"] == 2));
+}
+
+#[tokio::test]
+async fn durable_report_without_valid_seq_fields_is_bad_request() {
+    let server = Server::start(Options::default()).await;
+    let mut c = durable_client(&server, 1).await;
+    let base: Value = serde_json::from_str(&metrics_report(2, 1.5)).unwrap();
+    let cases = [
+        json!({}),                                   // 缺漏
+        json!({"boot_id": BOOT}),                    // 只有一個
+        json!({"boot_id": BOOT, "report_seq": "1"}), // 型別錯誤
+        json!({"boot_id": BOOT, "report_seq": -1}),
+        json!({"boot_id": "not-a-uuid", "report_seq": 1}), // 不是 UUID
+        json!({"boot_id": BOOT, "report_seq": 0}),         // 至少為 1
+    ];
+    for (i, extra) in cases.iter().enumerate() {
+        let mut r = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        c.send(&r.to_string()).await;
+        let err = c.recv().await;
+        assert_eq!(err["code"], "bad_request", "{extra}: {err}");
+        assert_eq!(err["seq"], Value::Null, "{err}");
+        // 連續 5 則無效訊息會斷線：中間穿插一則 heartbeat
+        if i % 2 == 1 {
+            c.send(r#"{"type":"heartbeat","seq":9,"ts":"t"}"#).await;
+            assert_eq!(c.recv().await, json!({"type":"ack","seq":9}));
+        }
+    }
+    assert!(durable_lines(&server).is_empty());
+}
+
+#[tokio::test]
+async fn durable_fields_are_ignored_when_not_negotiated() {
+    // 0.2.0 Pulse（不宣告 durable）：report 帶了也忽略，型別錯誤也不檢查，與 0.2.0 Kairos 相同
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics"]).to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
+    let mut r: Value = serde_json::from_str(&metrics_report(2, 1.5)).unwrap();
+    r["boot_id"] = json!(5);
+    r["report_seq"] = json!("x");
+    c.send(&r.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    c.send(&durable_report(3, BOOT, 1, "2026-10-09T00:00:00.000Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+    c.send(&durable_report(4, BOOT, 1, "2026-10-09T00:00:00.000Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    let lines = durable_lines(&server);
+    assert_eq!(lines.len(), 3, "未協商 durable 時不去重");
+    assert!(lines.iter().all(|l| l.get("boot_id").is_none()));
 }

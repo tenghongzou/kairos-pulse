@@ -240,14 +240,54 @@ struct MetricsPart {
     metrics: Vec<Metric>,
 }
 
+/// durable report 的投遞識別（`boot_id`、`report_seq`；雙方都宣告
+/// [`FEATURE_DURABLE`](crate::FEATURE_DURABLE) 時才送，見 PROTOCOL.md「durable」）。
+///
+/// 伺服器以 (agent_id, `boot_id`, `report_seq`) 去重：同一筆重送時兩個值與 `ts`、內容都不變，
+/// 已保存過的那筆回 `ack` 但不再寫入。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DurableSeq {
+    /// client 產生的 UUID（Pulse：每次程序啟動時產生，見 PROTOCOL.md）
+    pub boot_id: String,
+    /// 同一個 `boot_id` 內單調遞增，從 1 開始
+    pub report_seq: u64,
+}
+
+/// report 中 durable 的兩個欄位；`null` 視同省略
+#[derive(Deserialize)]
+struct DurablePart {
+    #[serde(default)]
+    boot_id: Option<String>,
+    #[serde(default)]
+    report_seq: Option<u64>,
+}
+
+impl DurablePart {
+    fn into_seq(self) -> Result<Option<DurableSeq>, String> {
+        match (self.boot_id, self.report_seq) {
+            (None, None) => Ok(None),
+            (Some(boot_id), Some(report_seq)) => Ok(Some(DurableSeq {
+                boot_id,
+                report_seq,
+            })),
+            _ => Err("boot_id and report_seq must be given together".to_string()),
+        }
+    }
+}
+
 /// report 的內容：v1 的三個欄位與 v2 的 `metrics`，兩者各自解析。
 ///
 /// 伺服器依連線協商的格式取用（[`ReportBody::legacy_fields`] 或 [`ReportBody::metric_list`]），
 /// 另一種格式的欄位一律忽略（與 v1 Kairos 忽略未知欄位相同）。序列化時只輸出 `Ok` 的部分。
+///
+/// durable 的 `boot_id`／`report_seq` 也在這裡另外解析（[`ReportBody::durable_seq`]），
+/// 只在協商了 durable 的連線上使用，其他連線忽略（型別錯誤也不檢查）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportBody {
     pub legacy: Result<LegacyReport, String>,
     pub metrics: Result<Vec<Metric>, String>,
+    /// durable 的投遞識別；兩個欄位都省略時為 `Ok(None)`
+    pub durable: Result<Option<DurableSeq>, String>,
 }
 
 impl ReportBody {
@@ -260,6 +300,7 @@ impl ReportBody {
                 used_memory,
             }),
             metrics: Err("missing field `metrics`".to_string()),
+            durable: Ok(None),
         }
     }
 
@@ -268,7 +309,14 @@ impl ReportBody {
         Self {
             legacy: Err("missing field `cpu_usage`".to_string()),
             metrics: Ok(metrics),
+            durable: Ok(None),
         }
+    }
+
+    /// 附上 durable 的投遞識別（durable 連線上的 report）
+    pub fn with_durable(mut self, durable: DurableSeq) -> Self {
+        self.durable = Ok(Some(durable));
+        self
     }
 
     /// v1 格式的欄位；缺漏或型別錯誤時回傳 `bad_request` 的說明
@@ -284,6 +332,22 @@ impl ReportBody {
             .as_ref()
             .map(Vec::as_slice)
             .map_err(|e| format!("invalid message: {e}"))
+    }
+
+    /// durable 連線上的 `boot_id`／`report_seq`：缺漏、只有其中一個、型別錯誤或不符限制
+    /// （[`validate_durable_seq`](crate::validate_durable_seq)）時回傳 `bad_request` 的說明
+    pub fn durable_seq(&self) -> Result<&DurableSeq, String> {
+        match &self.durable {
+            Ok(Some(seq)) => {
+                crate::validate_durable_seq(seq).map_err(|e| format!("invalid message: {e}"))?;
+                Ok(seq)
+            }
+            Ok(None) => Err(
+                "invalid message: missing fields `boot_id` and `report_seq` (required when durable is negotiated)"
+                    .to_string(),
+            ),
+            Err(e) => Err(format!("invalid message: {e}")),
+        }
     }
 }
 
@@ -306,6 +370,13 @@ impl Serialize for ReportBody {
                 "a report needs either the v1 fields or metrics".to_string()
             ));
         }
+        match &self.durable {
+            Ok(Some(durable)) => {
+                parts.push(serde_json::to_value(durable).map_err(|e| e.to_string()))
+            }
+            Ok(None) => {}
+            Err(e) => parts.push(Err(format!("an invalid field cannot be serialized: {e}"))),
+        }
         serialize_merged(&parts, s)
     }
 }
@@ -316,6 +387,7 @@ impl<'de> Deserialize<'de> for ReportBody {
         Ok(Self {
             legacy: parse_part(&fields),
             metrics: parse_part::<MetricsPart>(&fields).map(|p| p.metrics),
+            durable: parse_part::<DurablePart>(&fields).and_then(DurablePart::into_seq),
         })
     }
 }
@@ -1295,9 +1367,101 @@ mod tests {
             body: ReportBody {
                 legacy: Err("x".into()),
                 metrics: Err("y".into()),
+                durable: Ok(None),
             },
         };
         assert!(serde_json::to_string(&empty).is_err());
+    }
+
+    #[test]
+    fn durable_vector_carries_boot_id_and_report_seq() {
+        let ClientMsg::Hello { ext, .. } =
+            parse_client_msg(client_vector_in(Ver::Durable, "hello")).unwrap()
+        else {
+            panic!("應解析為 hello");
+        };
+        assert_eq!(
+            ext.offer.unwrap().features,
+            Some(vec!["metrics".into(), "durable".into()])
+        );
+        let ServerMsg::HelloAck { features, .. } =
+            parse_server_msg(server_vector_in(Ver::Durable, "hello_ack")).unwrap()
+        else {
+            panic!("應解析為 hello_ack");
+        };
+        assert_eq!(features, Some(vec!["metrics".into(), "durable".into()]));
+        let body = report_body(client_vector_in(Ver::Durable, "report"));
+        let durable = body.durable_seq().unwrap();
+        assert_eq!(
+            durable,
+            &DurableSeq {
+                boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+                report_seq: 42,
+            }
+        );
+        assert_eq!(body.metric_list().unwrap().len(), 3);
+        // 重送：同一筆內容以 with_durable 組回，序列化結果與向量相同（seq 以外）
+        let rebuilt = ClientMsg::Report {
+            seq: 2,
+            ts: "2026-10-08T03:15:45.210Z".into(),
+            body: ReportBody::metrics(body.metric_list().unwrap().to_vec())
+                .with_durable(durable.clone()),
+        };
+        assert_client_serializes_to(&rebuilt, client_vector_in(Ver::Durable, "report"));
+    }
+
+    #[test]
+    fn durable_fields_are_parsed_independently() {
+        let v1 = client_vector("report");
+        let with = |extra: &str| report_body(&format!("{},{extra}}}", &v1[..v1.len() - 1]));
+        const BOOT: &str = "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e";
+        // 省略（或 null）：Ok(None)，非 durable 連線不受影響；durable 連線為 bad_request
+        let body = report_body(v1);
+        assert_eq!(body.durable, Ok(None));
+        assert!(body.durable_seq().unwrap_err().contains("boot_id"));
+        assert_eq!(
+            with(r#""boot_id":null,"report_seq":null"#).durable,
+            Ok(None)
+        );
+        // 型別錯誤或只有一個：只讓 durable 部分失敗，v1 欄位照常可用
+        for extra in [
+            format!(r#""boot_id":"{BOOT}""#),
+            r#""report_seq":1"#.to_string(),
+            format!(r#""boot_id":"{BOOT}","report_seq":"1""#),
+            format!(r#""boot_id":"{BOOT}","report_seq":-1"#),
+            format!(r#""boot_id":"{BOOT}","report_seq":1.5"#),
+            r#""boot_id":7,"report_seq":1"#.to_string(),
+        ] {
+            let body = with(&extra);
+            assert!(body.durable.is_err(), "{extra}");
+            assert!(body.legacy_fields().is_ok(), "{extra}");
+            let err = body.durable_seq().unwrap_err();
+            assert!(err.starts_with("invalid message: "), "{err}");
+            // validate_client_msg 不看 durable 欄位（只有 durable 連線才檢查）
+            let line = format!("{},{extra}}}", &v1[..v1.len() - 1]);
+            assert!(crate::validate_client_msg(&parse_client_msg(&line).unwrap()).is_ok());
+        }
+        // 格式正確但不符限制
+        let body = with(r#""boot_id":"not-a-uuid","report_seq":1"#);
+        assert!(body.durable_seq().unwrap_err().contains("UUID"));
+        let body = with(&format!(r#""boot_id":"{BOOT}","report_seq":0"#));
+        assert!(body.durable_seq().unwrap_err().contains("at least 1"));
+        // 大寫的 UUID 可接受（伺服器轉小寫）
+        let upper = BOOT.to_ascii_uppercase();
+        let body = with(&format!(
+            r#""boot_id":"{upper}","report_seq":18446744073709551615"#
+        ));
+        assert_eq!(body.durable_seq().unwrap().report_seq, u64::MAX);
+        // 解析失敗的 durable 部分不能序列化
+        let msg = ClientMsg::Report {
+            seq: 1,
+            ts: "t".into(),
+            body: ReportBody {
+                durable: Err("x".into()),
+                ..ReportBody::legacy(1.0, 2, 1)
+            },
+        };
+        assert!(serde_json::to_string(&msg).is_err());
     }
 
     #[test]

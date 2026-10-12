@@ -17,6 +17,17 @@ pub const MAX_REPORT_INTERVAL: u64 = 3600;
 pub const MAX_RETRY_DELAY: u64 = 3600;
 /// `log.retention_days` 上限（天，約 10 年）。
 pub const MAX_LOG_RETENTION_DAYS: u32 = 3650;
+/// `buffer.max_mb` 的範圍（MiB）
+pub const MIN_BUFFER_MB: u64 = 1;
+pub const MAX_BUFFER_MB: u64 = 102_400;
+/// `buffer.max_records` 的範圍
+pub const MIN_BUFFER_RECORDS: u64 = 100;
+pub const MAX_BUFFER_RECORDS: u64 = 10_000_000;
+/// `buffer.max_age_hours` 的範圍（1 小時～1 年）
+pub const MAX_BUFFER_AGE_HOURS: u64 = 8760;
+/// `buffer.replay_interval_ms` 的範圍：下限 500 ms（= Kairos 的 report 速率限制每秒 2 則），上限 60 秒
+pub const MIN_REPLAY_INTERVAL_MS: u64 = 500;
+pub const MAX_REPLAY_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -80,6 +91,23 @@ pub struct AgentConfig {
     pub tags: Vec<String>,
 }
 
+/// 本機緩衝（A5，見 `spool` 模組）
+#[derive(Debug, Clone, Deserialize)]
+pub struct BufferConfig {
+    /// 是否啟用：啟用時向 Kairos 宣告 `durable`（at-least-once）；停用時與 0.2.0 相同（at-most-once）
+    pub enabled: bool,
+    /// 緩衝目錄（相對路徑以工作目錄解析）
+    pub dir: String,
+    /// 待送資料的總大小上限（MiB）
+    pub max_mb: u64,
+    /// 待送資料的筆數上限
+    pub max_records: u64,
+    /// 取樣時間超過這麼久（小時）的資料不送出、直接丟棄
+    pub max_age_hours: u64,
+    /// 兩筆 report 之間的最短間隔（毫秒；補送積壓時的速率）
+    pub replay_interval_ms: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
     /// 日誌級別；載入後已正規化為小寫並驗證過
@@ -114,6 +142,7 @@ pub struct AppConfig {
     pub heartbeat: HeartbeatConfig,
     pub report: ReportConfig,
     pub agent: AgentConfig,
+    pub buffer: BufferConfig,
     pub log: LogConfig,
     /// 載入時目前工作目錄下是否有 `pulse.toml`（啟動時記錄，方便確認設定來源）
     #[serde(skip)]
@@ -271,6 +300,35 @@ impl AppConfig {
                 "{field} 不符合限制（{detail}，不得含控制字元、格式字元等不可見字元）：{e}"
             )));
         }
+        if self.buffer.enabled && self.buffer.dir.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "buffer.dir 不可為空字串（啟用本機緩衝時必須指定目錄）".to_string(),
+            ));
+        }
+        range(
+            "buffer.max_mb",
+            self.buffer.max_mb,
+            MIN_BUFFER_MB,
+            MAX_BUFFER_MB,
+        )?;
+        range(
+            "buffer.max_records",
+            self.buffer.max_records,
+            MIN_BUFFER_RECORDS,
+            MAX_BUFFER_RECORDS,
+        )?;
+        range(
+            "buffer.max_age_hours",
+            self.buffer.max_age_hours,
+            1,
+            MAX_BUFFER_AGE_HOURS,
+        )?;
+        range(
+            "buffer.replay_interval_ms",
+            self.buffer.replay_interval_ms,
+            MIN_REPLAY_INTERVAL_MS,
+            MAX_REPLAY_INTERVAL_MS,
+        )?;
         range(
             "log.retention_days",
             u64::from(self.log.retention_days),
@@ -322,6 +380,13 @@ mod tests {
         assert_eq!(cfg.heartbeat.interval, 15);
         assert_eq!(cfg.report.interval, 5);
         assert_eq!(cfg.agent.id_file, "agent.id");
+        // A5：本機緩衝預設啟用
+        assert!(cfg.buffer.enabled);
+        assert_eq!(cfg.buffer.dir, "buffer");
+        assert_eq!(cfg.buffer.max_mb, 64);
+        assert_eq!(cfg.buffer.max_records, 50_000);
+        assert_eq!(cfg.buffer.max_age_hours, 168);
+        assert_eq!(cfg.buffer.replay_interval_ms, 600);
         assert_eq!(cfg.log.level, "info");
         assert_eq!(cfg.log.level_filter(), LevelFilter::Info);
     }
@@ -348,6 +413,42 @@ mod tests {
         assert_eq!(cfg.agent.id_file, "data/agent.id");
         // 未覆蓋的欄位維持嵌入值
         assert_eq!(cfg.server.address, "127.0.0.1");
+    }
+
+    #[test]
+    fn buffer_settings_are_validated() {
+        for (key, value) in [
+            ("PULSE__BUFFER__MAX_MB", "0"),
+            ("PULSE__BUFFER__MAX_MB", "102401"),
+            ("PULSE__BUFFER__MAX_RECORDS", "99"),
+            ("PULSE__BUFFER__MAX_AGE_HOURS", "0"),
+            ("PULSE__BUFFER__MAX_AGE_HOURS", "8761"),
+            // 低於 500 ms 會超過 Kairos 的 report 速率限制（每秒 2 則）
+            ("PULSE__BUFFER__REPLAY_INTERVAL_MS", "499"),
+            ("PULSE__BUFFER__REPLAY_INTERVAL_MS", "60001"),
+        ] {
+            let err = build_err(&[(key, value)]);
+            let name = key
+                .trim_start_matches("PULSE__BUFFER__")
+                .to_ascii_lowercase();
+            assert!(
+                err.contains(&format!("buffer.{name}")),
+                "{key}={value}: {err}"
+            );
+        }
+        assert!(build_err(&[("PULSE__BUFFER__DIR", " ")]).contains("buffer.dir"));
+        // 停用時目錄可以留空
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__BUFFER__ENABLED", "false"),
+                ("PULSE__BUFFER__DIR", ""),
+                ("PULSE__BUFFER__REPLAY_INTERVAL_MS", "500"),
+            ])),
+        )
+        .unwrap();
+        assert!(!cfg.buffer.enabled);
+        assert_eq!(cfg.buffer.replay_interval_ms, 500);
     }
 
     #[test]

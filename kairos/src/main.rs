@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod connection;
+mod dedup;
 mod expiry;
 mod export_cli;
 mod fsperm;
