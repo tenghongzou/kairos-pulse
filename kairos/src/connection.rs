@@ -327,9 +327,12 @@ pub(crate) async fn store_report(
         },
     };
     match status {
-        WriteStatus::Written => {
-            // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）
-            registry.set_last_report(&agent_id, conn_id, last);
+        WriteStatus::Written | WriteStatus::Duplicate => {
+            // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）。
+            // 重複的 report（at-least-once 的重送，先前已保存）不更新 last_report：它是較舊的資料
+            if status == WriteStatus::Written {
+                registry.set_last_report(&agent_id, conn_id, last);
+            }
             let touch = registry.touch(&agent_id, conn_id, std::time::Instant::now(), Utc::now());
             if touch == Touch::Revived {
                 revived.store(true, Ordering::Relaxed);
@@ -1715,6 +1718,37 @@ mod tests {
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         assert_eq!(writer.await.unwrap(), Some(7));
         assert_eq!(last_report_seq(&registry), Some(7));
+    }
+
+    #[tokio::test]
+    async fn duplicate_report_is_acked_without_updating_last_report() {
+        // 去重（durable）：writer 回 Duplicate（已保存過）時照常 ack，但 last_report 不改成重送的舊資料
+        let registry = Registry::new();
+        let _reg = registry
+            .register(1, hello_info(), std::time::Instant::now(), Utc::now())
+            .unwrap();
+        let (sink, mut rx) = report_channel(4);
+        let writer = tokio::spawn(async move {
+            for status in [WriteStatus::Written, WriteStatus::Duplicate] {
+                let req = rx.recv().await.unwrap();
+                assert!(req.ticket.claim());
+                let _ = req.reply.send(status);
+            }
+        });
+        for seq in [9, 8] {
+            let outcome = store_report(
+                &registry,
+                &sink,
+                1,
+                record(seq),
+                Duration::from_secs(1),
+                &AtomicBool::new(false),
+            )
+            .await;
+            assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
+        }
+        writer.await.unwrap();
+        assert_eq!(last_report_seq(&registry), Some(9));
     }
 
     #[tokio::test]

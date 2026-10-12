@@ -16,6 +16,7 @@
 | `kairos-crl.service`、`kairos-crl.timer` | 644 | CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
+| `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `kairos.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `kairos-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -97,13 +98,15 @@ install -d -o kairos -g kairos -m 750 /opt/kairos/data /opt/kairos/logs
 
 `/opt/kairos` 本身屬於 root，kairos 使用者只能讀取執行檔、設定與憑證，不能修改；只有 `data/`、`logs/` 可寫。unit 也以 `ProtectSystem=strict` 讓服務只能寫這兩個目錄，**兩個目錄必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。
 
+`data/` 會放 SQLite 資料庫 `kairos.db`（report、彙總與主機清冊），**必須在本機磁碟**（SQLite 的 WAL 不支援 NFS、SMB 等網路磁碟），並預留 `storage.max_total_bytes`（預設 64 GiB）加上至少 128 MiB 的空間；主機數與保留天數對應的容量見 `STORAGE.md`「容量估算」。
+
 ## 5. 安裝執行檔與文件
 
 ```bash
 cd ~/kairos-dist/pkg
 install -o root -g root -m 755 kairos /opt/kairos/kairos
 install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL.md \
-  CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
+  STORAGE.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
 ## 6. 建立 PKI
@@ -339,6 +342,8 @@ journalctl -u kairos -n 50 --no-pager        # 啟動日誌
 ss -ltnp | grep kairos                       # 監聽 0.0.0.0:8080
 tail -n 20 /opt/kairos/logs/kairos-$(date -u +%F).log
 cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於已連線的 Pulse 數
+# 主機清冊（SQLite）：Pulse 上線後 30 秒內出現；--offline-for 3d 列出失聯 3 天以上的主機
+sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 ```
 
 啟動成功時日誌會有：
@@ -347,6 +352,8 @@ cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於�
 [INFO] kairos <版本> (<commit>)
 [INFO] 設定檔: /opt/kairos/kairos.toml
 [INFO] 已啟用客戶端憑證驗證（mTLS），信任 client-ca.pem，CRL 1 份；agent_id 必須與憑證的 SAN 相符
+[INFO] 已建立資料庫 schema v1                  （第一次啟動時）
+[INFO] SQLite 資料庫 data/kairos.db（schema v1）：主機清冊 0 台、指標序列 0 個
 [INFO] Kairos 已啟動，監聽 0.0.0.0:8080（連線上限 1024，…）
 ```
 
@@ -390,7 +397,16 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 ### 10.2 備份
 
 - `/opt/kairos/kairos.toml`、憑證與 CRL
-- `/opt/kairos/data/`（report 的 JSONL）。搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
+- SQLite 資料庫：以線上備份產生一致的快照，**不要在執行中直接複製 `data/kairos.db`**（最新的交易可能還在 `kairos.db-wal` 中）。例如每天一次：
+
+  ```bash
+  install -d -o kairos -g kairos -m 750 /var/backups/kairos
+  sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/kairos-$(date -u +%F).db \
+    --config /opt/kairos/kairos.toml
+  ```
+
+  備份檔不會覆寫既有的檔案；舊備份請自行輪替（例如 `find /var/backups/kairos -name 'kairos-*.db' -mtime +14 -delete`）。還原步驟見 `STORAGE.md`「備份與還原」。停機備份時直接複製整個 `data/` 即可。
+- 使用 JSONL（`storage.backend = "jsonl"` 或鏡像）時另備份 `/opt/kairos/data/reports-*.jsonl`；搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
 - 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
 
 ### 10.3 定期更新 CRL（kairos-crl.timer）
@@ -438,6 +454,8 @@ systemctl list-timers kairos-crl.timer
 
 **未啟用 mTLS 的部署請先處理**：從舊版升級時，若 `kairos.toml` 的 `server.listen` 是非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca`，新版會拒絕啟動（舊版只記 `WARN`）。升級前先依第 6、7 節啟用 mTLS；只有隔離的測試環境才在 `[auth]` 加上 `allow_unauthenticated = true`。
 
+**從 0.2 升級到 0.3：report 改寫 SQLite**。升級後 report 寫入 `data/kairos.db`，不再寫 `reports-*.jsonl`；直接讀 JSONL 的工具請先改用 `kairos reports export`，或在 `kairos.toml` 的 `[storage]` 加上 `jsonl_mirror = true`（同時寫兩份），或暫時設定 `backend = "jsonl"` 維持舊行為。既有的 JSONL 檔不會匯入資料庫，不開鏡像時也不會再被自動清除。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用（舊版會拒絕啟動）。詳見 `STORAGE.md`「從 JSONL（0.2）升級」。
+
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
 **升級順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。** 協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
@@ -462,12 +480,15 @@ pkg-new/kairos --version
 diff /opt/kairos/kairos.example.toml pkg-new/kairos.example.toml
 diff /etc/systemd/system/kairos.service pkg-new/kairos.service
 
-# 3. 保留舊版以便回滾，換上新版
+# 3. 保留舊版以便回滾，換上新版（先備份資料庫：新版可能升級 schema）
+sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/kairos-before-upgrade-$(date -u +%F).db \
+  --config /opt/kairos/kairos.toml
 cp -p /opt/kairos/kairos /opt/kairos/kairos.prev
 install -o root -g root -m 755 pkg-new/kairos /opt/kairos/kairos.new
 mv /opt/kairos/kairos.new /opt/kairos/kairos
 install -o root -g root -m 644 pkg-new/kairos.example.toml pkg-new/INSTALL.md \
-  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/CHANGELOG.md pkg-new/THIRD-PARTY-LICENSES /opt/kairos/
+  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/STORAGE.md pkg-new/CHANGELOG.md \
+  pkg-new/THIRD-PARTY-LICENSES /opt/kairos/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/kairos.service /etc/systemd/system/kairos.service
 # systemctl daemon-reload
@@ -479,8 +500,8 @@ journalctl -u kairos -n 30 --no-pager
 ```
 
 - 重新啟動時連線中的 Pulse 收到 `close_notify`，依退避在數秒內自動重連；不需要動 Pulse。
-- 狀態表只在記憶體中：重啟後 `agents.json` 從空開始，離線中的 agent 會消失，線上的 agent 重連後再出現。
-- 回滾：`mv /opt/kairos/kairos.prev /opt/kairos/kairos && systemctl restart kairos`。
+- 重啟後，主機清冊中最近 24 小時內出現過的主機以離線狀態出現在 `agents.json`，線上的 agent 重連後恢復上線（`storage.backend = "jsonl"` 時沒有清冊，`agents.json` 從空開始）。
+- 回滾：`mv /opt/kairos/kairos.prev /opt/kairos/kairos && systemctl restart kairos`。新版升級過 schema 時，舊版會以「資料庫的 schema 版本 … 比本版 Kairos 支援的 … 新」拒絕啟動：停止服務後把升級前的備份還原成 `data/kairos.db`（`STORAGE.md`「備份與還原」）再啟動舊版；備份之後收到的 report 不在其中。
 
 ## 12. 移除
 
@@ -513,4 +534,9 @@ userdel kairos
 | 所有代理突然被拒，日誌出現 `ExpiredRevocationList` 或 `CRL … 已過期` | CRL 過期。依第 6.4 節重新產生並依第 10.1 節部署；之後設定第 10.3 節的 `kairos-crl.timer` |
 | `[WARN] CRL … 將在 … 後過期` | CRL 即將過期：依第 6.4、10.1 節更新；使用 `kairos-crl.timer` 時檢查 `journalctl -u kairos-crl` |
 | `[WARN] 伺服器憑證 … 將在 … 後到期` | 依第 6.1 節重新簽發，依第 10.1 節覆寫 |
+| `無法啟用 WAL（journal_mode 為 …）` | `data/` 所在的檔案系統不支援 SQLite 的 WAL（例如 NFS、SMB）。改用本機磁碟 |
+| `資料庫的 schema 版本 N 比本版 Kairos 支援的 M 新` | 降版執行。改用較新的版本，或停止服務後還原升級前的備份（第 11 節） |
+| `不是 Kairos 的資料庫（application_id = …）` | `storage.data_dir` 指到其他程式的 SQLite 檔。確認設定 |
+| `SQLite 資料庫已使用 … bytes，超過 storage.max_total_bytes` | 已達總容量上限，Kairos 正在刪除最舊的原始 report（之後是彙總）。依 `STORAGE.md`「容量估算」調高上限或縮短保留天數 |
+| `kairos hosts list` 回 `KRS-E4003`，原因為權限不足 | 以 root 或服務帳號執行：`sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml` |
 | 其他錯誤訊息 | 見 `README.md`「疑難排解」 |

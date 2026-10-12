@@ -31,6 +31,31 @@ pub const DEFAULT_MAX_DAILY_BYTES: u64 = 0;
 /// 估算每日 report 量時，每行 JSONL 的大小（bytes）
 pub const ESTIMATED_REPORT_LINE_BYTES: u64 = 250;
 
+/// `storage.raw_retention_days` 的預設值：原始 report 保留 7 天（今天與前 7 天）
+pub const DEFAULT_RAW_RETENTION_DAYS: u32 = 7;
+/// `storage.rollup_5m_retention_days` 的預設值
+pub const DEFAULT_ROLLUP_5M_RETENTION_DAYS: u32 = 31;
+/// `storage.rollup_1h_retention_days` 的預設值（13 個月，可做跨年同期比較）
+pub const DEFAULT_ROLLUP_1H_RETENTION_DAYS: u32 = 400;
+/// `storage.max_total_bytes` 的預設值：64 GiB（SQLite 資料庫與 WAL 合計；0 = 不限制）
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// `storage.max_total_bytes` 不為 0 時的下限（64 MiB）
+pub const MIN_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// 主機清冊筆數上限的預設值（實際為 `max(此值, limits.max_agents)`）
+pub const DEFAULT_MAX_HOSTS: usize = 100_000;
+/// `storage.max_hosts` 的最大值
+pub const MAX_MAX_HOSTS: usize = 1_000_000;
+
+/// 容量估算（`kairos/STORAGE.md`「容量估算」）：每台主機每 5 秒一筆 report
+pub const ESTIMATE_REPORT_INTERVAL_SECS: u64 = 5;
+/// 容量估算：每筆原始 report 在 SQLite 中的大小（含索引與主機、序列等；Pulse 0.2.0 的 17 個指標
+/// 實測約 235 bytes，見 STORAGE.md「量測」）
+pub const ESTIMATED_RAW_ROW_BYTES: u64 = 240;
+/// 容量估算：每台主機的序列（指標名稱＋label 組合）數
+pub const ESTIMATED_SERIES_PER_HOST: u64 = 20;
+/// 容量估算：每列彙總的大小
+pub const ESTIMATED_ROLLUP_ROW_BYTES: u64 = 50;
+
 /// 同時連線數上限的最大值
 pub const MAX_MAX_CONNECTIONS: usize = 65535;
 
@@ -69,7 +94,10 @@ pub const MAX_EXPIRY_WARNING_DAYS: u32 = 365;
 /// `auth.crl` 以環境變數設定時的清單分隔字元
 pub const LIST_SEPARATOR: &str = ",";
 
-pub const USAGE: &str = "用法: kairos [--config <path>]\n\n\
+pub const USAGE: &str = "用法: kairos [--config <path>]\n       \
+kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\n       \
+kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
+kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
@@ -160,24 +188,82 @@ impl TimeoutSettings {
     }
 }
 
+/// report 的儲存後端（`storage.backend`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// SQLite（`<data_dir>/kairos.db`）：原始資料、彙總與主機清冊（A1、A6、A9）
+    #[default]
+    Sqlite,
+    /// 舊版的按日 JSONL（`reports-YYYY-MM-DD.jsonl`）；沒有主機清冊與彙總，只供相容與回復
+    Jsonl,
+}
+
+/// SQLite 的 `PRAGMA synchronous`（`storage.sqlite_synchronous`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SqliteSynchronous {
+    /// WAL 模式下 commit 只寫入作業系統（不 fsync）：行程當掉不會遺失已 `ack` 的資料，
+    /// 斷電可能遺失最後幾個交易（與 JSONL 的 flush 相同，符合 PROTOCOL.md 的 ack 語意）
+    #[default]
+    Normal,
+    /// 每次 commit 都 fsync WAL：斷電也不遺失已 `ack` 的資料，寫入延遲較高
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct StorageSettings {
     pub data_dir: String,
-    /// reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天保留），0 = 永久保留
+    /// report 的儲存後端，預設 `sqlite`
+    pub backend: StorageBackend,
+    /// `backend = "sqlite"` 時是否另外輸出 JSONL 鏡像（`reports-YYYY-MM-DD.jsonl`，盡力而為，
+    /// 不影響 `ack`）
+    pub jsonl_mirror: bool,
+    /// reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天保留），0 = 永久保留。
+    /// 只用於 JSONL（`backend = "jsonl"` 或 `jsonl_mirror = true`）
     pub retention_days: u32,
     /// 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制。達到上限後當天的 report
-    /// 不再寫入，回 `storage_unavailable`（確定未保存）
+    /// 不再寫入（`backend = "jsonl"` 時回 `storage_unavailable`；鏡像時只是不寫入鏡像）
     pub max_daily_bytes: u64,
+    /// SQLite 原始 report 的保留天數（今天與前 N 天，UTC），0 = 不依時間刪除
+    pub raw_retention_days: u32,
+    /// 5 分鐘彙總的保留天數，0 = 不依時間刪除
+    pub rollup_5m_retention_days: u32,
+    /// 1 小時彙總的保留天數，0 = 不依時間刪除
+    pub rollup_1h_retention_days: u32,
+    /// SQLite 資料庫（含 WAL）的總容量上限（bytes），0 = 不限制。超過時依序刪除最舊的原始 report、
+    /// 5 分鐘彙總、1 小時彙總，直到低於上限的 95%
+    pub max_total_bytes: u64,
+    /// SQLite 的 `PRAGMA synchronous`：`normal`（預設）或 `full`
+    pub sqlite_synchronous: SqliteSynchronous,
+    /// 主機清冊最多幾台主機（新主機超過時其 report 回 `storage_unavailable`）。未設定時為
+    /// `max(100000, limits.max_agents)`，見 [`AppConfig::max_hosts`]
+    pub max_hosts: Option<usize>,
 }
 
 impl Default for StorageSettings {
     fn default() -> Self {
         Self {
             data_dir: "data".to_string(),
+            backend: StorageBackend::Sqlite,
+            jsonl_mirror: false,
             retention_days: 30,
             max_daily_bytes: DEFAULT_MAX_DAILY_BYTES,
+            raw_retention_days: DEFAULT_RAW_RETENTION_DAYS,
+            rollup_5m_retention_days: DEFAULT_ROLLUP_5M_RETENTION_DAYS,
+            rollup_1h_retention_days: DEFAULT_ROLLUP_1H_RETENTION_DAYS,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            sqlite_synchronous: SqliteSynchronous::Normal,
+            max_hosts: None,
         }
+    }
+}
+
+impl StorageSettings {
+    /// 是否寫入 JSONL（主要輸出或鏡像）
+    pub fn writes_jsonl(&self) -> bool {
+        self.backend == StorageBackend::Jsonl || self.jsonl_mirror
     }
 }
 
@@ -292,9 +378,17 @@ pub enum ListenAuth {
 /// 命令列解析結果
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliAction {
-    Run { config_path: Option<PathBuf> },
+    Run {
+        config_path: Option<PathBuf>,
+    },
     Help,
     Version,
+    /// `kairos hosts ...`（主機清冊查詢，見 [`crate::hosts_cli`]）
+    Hosts(crate::hosts_cli::HostsCommand),
+    /// `kairos reports ...`（匯出 SQLite 中的 report，見 [`crate::export_cli`]）
+    Reports(crate::export_cli::ReportsCommand),
+    /// `kairos db ...`（資料庫的線上備份，見 [`crate::export_cli`]）
+    Db(crate::export_cli::DbCommand),
 }
 
 /// `--config=<path>` 的前綴
@@ -333,7 +427,19 @@ fn strip_config_eq(arg: &OsStr) -> Option<Result<OsString, String>> {
 /// 會 panic。設定檔路徑可以不是 UTF-8；其他非 UTF-8 的參數回錯誤（訊息中以 U+FFFD 取代無法辨識的部分）。
 pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction, String> {
     let mut config_path = None;
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
+    if iter.peek().is_some_and(|a| a == "hosts") {
+        iter.next();
+        return crate::hosts_cli::parse_args(iter).map(CliAction::Hosts);
+    }
+    if iter.peek().is_some_and(|a| a == "reports") {
+        iter.next();
+        return crate::export_cli::parse_args(iter).map(CliAction::Reports);
+    }
+    if iter.peek().is_some_and(|a| a == "db") {
+        iter.next();
+        return crate::export_cli::parse_db_args(iter).map(CliAction::Db);
+    }
     while let Some(arg) = iter.next() {
         let path = if arg == "--config" {
             match iter.next() {
@@ -363,6 +469,29 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
         }
     }
     Ok(CliAction::Run { config_path })
+}
+
+/// 解析 `--config <path>`／`--config=<path>`（子命令共用）：`arg` 是這個選項時回傳路徑，
+/// 不是時回傳 `Ok(None)`
+pub fn take_config_arg(
+    arg: &OsStr,
+    rest: &mut impl Iterator<Item = OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let path = if arg == "--config" {
+        match rest.next() {
+            Some(p) if !p.is_empty() => p,
+            _ => return Err("--config 需要指定設定檔路徑".to_string()),
+        }
+    } else if let Some(p) = strip_config_eq(arg) {
+        let p = p?;
+        if p.is_empty() {
+            return Err("--config 需要指定設定檔路徑".to_string());
+        }
+        p
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(PathBuf::from(path)))
 }
 
 /// 字串清單：接受陣列，或以 [`LIST_SEPARATOR`] 分隔的單一字串
@@ -455,6 +584,40 @@ impl AppConfig {
         let max = self.storage.max_daily_bytes;
         let estimate = self.estimated_daily_report_bytes();
         (max > 0 && estimate > max).then_some((max, estimate))
+    }
+
+    /// 主機清冊的筆數上限：明確設定的值，或 `max(100000, limits.max_agents)`
+    pub fn max_hosts(&self) -> usize {
+        self.storage
+            .max_hosts
+            .unwrap_or(DEFAULT_MAX_HOSTS.max(self.max_agents()))
+    }
+
+    /// 以 `hosts` 台主機、每 5 秒一筆 report 估算 SQLite 在保留期限內需要的容量（bytes；
+    /// 公式見 `kairos/STORAGE.md`「容量估算」）。保留天數為 0（不依時間刪除）時以 365 天估算
+    pub fn estimated_sqlite_bytes(&self, hosts: u64) -> u64 {
+        let days = |d: u32| u64::from(if d == 0 { 365 } else { d + 1 });
+        let reports_per_day = 86_400 / ESTIMATE_REPORT_INTERVAL_SECS;
+        let raw = reports_per_day * ESTIMATED_RAW_ROW_BYTES * days(self.storage.raw_retention_days);
+        let rollup = |bucket_secs: u64, d: u32| {
+            (86_400 / bucket_secs)
+                * ESTIMATED_SERIES_PER_HOST
+                * ESTIMATED_ROLLUP_ROW_BYTES
+                * days(d)
+        };
+        let per_host = raw
+            + rollup(300, self.storage.rollup_5m_retention_days)
+            + rollup(3600, self.storage.rollup_1h_retention_days);
+        hosts.saturating_mul(per_host)
+    }
+
+    /// SQLite 時 `storage.max_total_bytes` 小於以 `max_connections` 台主機估算的容量時回傳
+    /// (上限, 估算量)，供啟動時警告（達到上限後會提早刪除最舊的資料）
+    pub fn total_limit_below_estimate(&self) -> Option<(u64, u64)> {
+        let max = self.storage.max_total_bytes;
+        let estimate = self.estimated_sqlite_bytes(self.server.max_connections as u64);
+        (self.storage.backend == StorageBackend::Sqlite && max > 0 && estimate > max)
+            .then_some((max, estimate))
     }
 
     /// 到期預警的門檻（O1）
@@ -671,14 +834,58 @@ impl AppConfig {
         if !self.auth.crl_paths().is_empty() && self.auth.client_ca_path().is_none() {
             return invalid("auth.crl 只在設定 auth.client_ca（啟用 mTLS）時有效");
         }
-        if self.storage.retention_days > MAX_RETENTION_DAYS {
+        for (name, value) in [
+            ("storage.retention_days", self.storage.retention_days),
+            (
+                "storage.raw_retention_days",
+                self.storage.raw_retention_days,
+            ),
+            (
+                "storage.rollup_5m_retention_days",
+                self.storage.rollup_5m_retention_days,
+            ),
+            (
+                "storage.rollup_1h_retention_days",
+                self.storage.rollup_1h_retention_days,
+            ),
+        ] {
+            if value > MAX_RETENTION_DAYS {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{} 必須介於 0..={}（目前為 {}）",
+                        name, MAX_RETENTION_DAYS, value
+                    ),
+                ));
+            }
+        }
+        let total = self.storage.max_total_bytes;
+        if total != 0 && total < MIN_MAX_TOTAL_BYTES {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!(
-                    "storage.retention_days 必須介於 0..={}（目前為 {}）",
-                    MAX_RETENTION_DAYS, self.storage.retention_days
+                    "storage.max_total_bytes 必須為 0（不限制）或至少 {}（64 MiB）（目前為 {}）",
+                    MIN_MAX_TOTAL_BYTES, total
                 ),
             ));
+        }
+        if let Some(max_hosts) = self.storage.max_hosts
+            && !(self.max_agents()..=MAX_MAX_HOSTS).contains(&max_hosts)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "storage.max_hosts 必須介於 limits.max_agents（{}）..={}（目前為 {}）",
+                    self.max_agents(),
+                    MAX_MAX_HOSTS,
+                    max_hosts
+                ),
+            ));
+        }
+        if self.storage.jsonl_mirror && self.storage.backend == StorageBackend::Jsonl {
+            return invalid(
+                "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
+            );
         }
         self.log.level_filter()?;
         Ok(())
@@ -715,6 +922,15 @@ mod tests {
         assert_eq!(c.storage.retention_days, 30);
         assert_eq!(c.storage.max_daily_bytes, 0);
         assert_eq!(c.daily_limit_below_estimate(), None);
+        assert_eq!(c.storage.backend, StorageBackend::Sqlite);
+        assert!(!c.storage.jsonl_mirror);
+        assert!(!c.storage.writes_jsonl());
+        assert_eq!(c.storage.raw_retention_days, 7);
+        assert_eq!(c.storage.rollup_5m_retention_days, 31);
+        assert_eq!(c.storage.rollup_1h_retention_days, 400);
+        assert_eq!(c.storage.max_total_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(c.storage.sqlite_synchronous, SqliteSynchronous::Normal);
+        assert_eq!(c.max_hosts(), 100_000);
         assert_eq!(c.server.reload_interval_secs, 30);
         assert_eq!(c.log.retention_days, 14);
         assert!(c.auth.crl.is_empty());
@@ -920,6 +1136,89 @@ mod tests {
         // 超出上限的值由 validate 擋下
         let c = from_env(&[("KAIROS__TIMEOUTS__WRITE_SECS", "7")]).unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn storage_backend_settings() {
+        let c = from_env(&[
+            ("KAIROS__STORAGE__BACKEND", "jsonl"),
+            ("KAIROS__STORAGE__RAW_RETENTION_DAYS", "3"),
+            ("KAIROS__STORAGE__MAX_TOTAL_BYTES", "0"),
+            ("KAIROS__STORAGE__SQLITE_SYNCHRONOUS", "full"),
+            ("KAIROS__STORAGE__MAX_HOSTS", "20000"),
+        ])
+        .unwrap();
+        assert_eq!(c.storage.backend, StorageBackend::Jsonl);
+        assert!(c.storage.writes_jsonl());
+        assert_eq!(c.storage.raw_retention_days, 3);
+        assert_eq!(c.storage.max_total_bytes, 0);
+        assert_eq!(c.storage.sqlite_synchronous, SqliteSynchronous::Full);
+        assert_eq!(c.max_hosts(), 20000);
+        assert!(c.validate().is_ok());
+        // 不認得的值是錯誤
+        assert!(from_env(&[("KAIROS__STORAGE__BACKEND", "postgres")]).is_err());
+        assert!(from_env(&[("KAIROS__STORAGE__SQLITE_SYNCHRONOUS", "off")]).is_err());
+
+        let c: AppConfig = Config::builder()
+            .add_source(File::from_str(
+                "[storage]\njsonl_mirror = true\nrollup_1h_retention_days = 0\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(c.storage.jsonl_mirror && c.storage.writes_jsonl());
+        assert!(c.validate().is_ok());
+
+        let mutations: [fn(&mut AppConfig); 6] = [
+            |c| c.storage.raw_retention_days = MAX_RETENTION_DAYS + 1,
+            |c| c.storage.rollup_5m_retention_days = MAX_RETENTION_DAYS + 1,
+            |c| c.storage.rollup_1h_retention_days = MAX_RETENTION_DAYS + 1,
+            |c| c.storage.max_total_bytes = MIN_MAX_TOTAL_BYTES - 1,
+            |c| c.storage.max_hosts = Some(c.max_agents() - 1),
+            |c| {
+                c.storage.backend = StorageBackend::Jsonl;
+                c.storage.jsonl_mirror = true;
+            },
+        ];
+        for mutate in mutations {
+            let mut c = AppConfig::default();
+            mutate(&mut c);
+            assert!(c.validate().is_err(), "{:?}", c.storage);
+        }
+        // 上限與下限本身合法
+        let mut c = AppConfig::default();
+        c.storage.max_total_bytes = MIN_MAX_TOTAL_BYTES;
+        c.storage.max_hosts = Some(MAX_MAX_HOSTS);
+        assert!(c.validate().is_ok());
+        // 未設定 max_hosts 時至少為 limits.max_agents
+        c.storage.max_hosts = None;
+        c.server.max_connections = 65535;
+        c.limits.max_agents = Some(MAX_MAX_AGENTS);
+        assert_eq!(c.max_hosts(), 100_000);
+    }
+
+    #[test]
+    fn sqlite_estimate_follows_the_documented_formula() {
+        // STORAGE.md「容量估算」：每台每天 原始 17280 × 240 × (7+1) 天
+        // + 5 分鐘 288 × 20 × 50 × (31+1) 天 + 1 小時 24 × 20 × 50 × (400+1) 天
+        let c = AppConfig::default();
+        let per_host = 17280 * 240 * 8 + 288 * 20 * 50 * 32 + 24 * 20 * 50 * 401;
+        assert_eq!(c.estimated_sqlite_bytes(1), per_host);
+        assert_eq!(c.estimated_sqlite_bytes(1024), 1024 * per_host);
+        // 預設 1024 台約 53 GB，低於預設上限 64 GiB：不警告
+        assert_eq!(c.total_limit_below_estimate(), None);
+        let mut big = AppConfig::default();
+        big.server.max_connections = 10000;
+        let (max, estimate) = big.total_limit_below_estimate().unwrap();
+        assert_eq!(max, DEFAULT_MAX_TOTAL_BYTES);
+        assert_eq!(estimate, 10000 * per_host);
+        big.storage.max_total_bytes = 0;
+        assert_eq!(big.total_limit_below_estimate(), None);
+        big.storage.max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
+        big.storage.backend = StorageBackend::Jsonl;
+        assert_eq!(big.total_limit_below_estimate(), None);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 以 Rust 撰寫的非同步 TLS 監控伺服器，建構於 [tokio](https://tokio.rs/) 與 [rustls](https://github.com/rustls/rustls)，負責接收 Pulse agent 送來的心跳與系統資源回報。
 
-每個 agent 與 Kairos 維持一條長 TLS 連線，以 NDJSON（一行一則 JSON）交換訊息。Kairos 追蹤每個 agent 的上線／離線狀態，並把回報寫入 JSONL 檔。
+每個 agent 與 Kairos 維持一條長 TLS 連線，以 NDJSON（一行一則 JSON）交換訊息。Kairos 追蹤每個 agent 的上線／離線狀態，把回報寫入 SQLite 資料庫（原始資料、5 分鐘與 1 小時彙總、主機清冊；可另輸出 JSONL），儲存的架構、schema 與容量見 [STORAGE.md](STORAGE.md)。
 
 ## 功能
 
@@ -10,14 +10,15 @@
 - 協定 v2：保存 Pulse 宣告的主機資訊（主機指紋、顯示名稱、標籤、report 間隔、作業系統）到 `agents.json`，同一個 `agent_id` 的主機指紋改變時記 `WARN`；report 為通用指標 `metrics`（CPU、記憶體、磁碟、網路、溫度等），原樣保存到 JSONL；`hello_ack` 帶 `server_time`
 - 以 `agent_id` 識別 agent（不分大小寫，一律以小寫識別、記錄與寫檔）；同一 agent 重新連線時自動踢掉舊連線（`superseded`）
 - 依 agent 宣告的心跳間隔計算離線門檻：`max(5 × clamp(heartbeat_interval_ms, 1000, 60000), 5000)` ms（5～300 秒），只有合法訊息才算存活
-- 每秒檢查存活狀態，上線／離線／恢復都會記錄日誌（「標記為離線」與「從狀態表移除」每 10 秒最多各逐一記錄 20／5 個，其餘在時間窗結束後合併成一行摘要）；離線超過 24 小時的 agent 自動從狀態表移除（狀態表只在記憶體中，重新啟動後離線的 agent 會立即從 `agents.json` 消失）；每 60 秒輸出一行摘要
+- 每秒檢查存活狀態，上線／離線／恢復都會記錄日誌（「標記為離線」與「從狀態表移除」每 10 秒最多各逐一記錄 20／5 個，其餘在時間窗結束後合併成一行摘要）；離線超過 24 小時的 agent 自動從狀態表移除；每 60 秒輸出一行摘要
+- 主機清冊（審計 A6）：所有出現過的主機保存在 SQLite（`hosts`），每 30 秒從狀態表同步、關機時寫入最後狀態；重新啟動時最近 24 小時內出現過的主機以離線狀態放回狀態表（`agents.json` 不再重新啟動就清空）。`kairos hosts list [--offline-for 3d]` 查詢哪些主機已失聯多久
 - 驗證 hello 欄位（`agent_id` 必須是 UUID 文字格式，`hostname`、`agent_version` 有長度與字元限制），並以 `limits.max_agents` 限制狀態表筆數（預設 `max(10000, server.max_connections)`；滿時先淘汰離線最久的 agent，沒有可淘汰者才拒絕新的 `agent_id`），避免狀態表與 `agents.json` 被任意資料灌爆
 - 預設拒絕未認證的對外監聽：監聽非 loopback 位址（例如 `0.0.0.0`）又沒有設定 `auth.client_ca` 時拒絕啟動，除非明確設定 `auth.allow_unauthenticated = true`（見「啟用 mTLS」）
 - 雙向 TLS（mTLS）：設定 `auth.client_ca` 後要求客戶端憑證，且 `agent_id` 必須與憑證的 SAN 相符（預設憑證只能有一個 DNS SAN），無法冒用其他代理或把它踢掉；支援 CRL 撤銷；啟用時停用 TLS session resumption，收到 hello 時再驗證一次憑證鏈
 - 熱重載：定期檢查伺服器憑證、私鑰、客戶端 CA 與 CRL 檔，有變更就重建 TLS 設定（失敗時保留舊設定）；同時重新驗證所有現役連線的客戶端憑證，已撤銷、過期或不再受信任的連線收到 `certificate_rejected` 並被關閉
 - 到期預警：啟動時、熱重載時與之後定期檢查伺服器憑證的到期日與 CRL 的下次更新時間（nextUpdate），到期前 30／7 天（`server.cert_expiry_warning_days`／`auth.crl_expiry_warning_days`）記 `WARN`、已過期記 `ERROR`；附 CRL 定期更新的 systemd timer 範例（`packaging/kairos-crl.timer`）
-- report 的 `ack` 代表**已寫入資料檔**；確定未寫入時回 `storage_unavailable`（這筆未保存），寫入結果無法確定時不回應、直接關閉連線。Pulse 採 at-most-once，兩種情況都不重送
-- 回報依 UTC 日期寫入 `data/reports-YYYY-MM-DD.jsonl`，依 `storage.retention_days` 自動清除過期檔案（啟動時、換日時與每小時；系統日期前進得比實際經過的時間多時暫停清除，保護狀態存於 `data/.retention-guard.json`）；可設定每個日期檔的大小上限 `storage.max_daily_bytes`（預設 `0` = 不限制），達到後當天的 report 回 `storage_unavailable`；agent 狀態每 5 秒快照到 `data/agents.json`（寫暫存檔並 fsync 後再更名）；資料目錄在執行中被刪除時會自動重建
+- report 的 `ack` 代表**已寫入資料庫（commit）或資料檔**；確定未寫入時回 `storage_unavailable`（這筆未保存），寫入結果無法確定時不回應、直接關閉連線。Pulse 採 at-most-once，兩種情況都不重送；at-least-once（`durable`）的重送以 `(主機, boot_id, report_seq)` 去重，重複的照常回 `ack`、不重寫（見 STORAGE.md「去重」）
+- 回報預設寫入 SQLite `data/kairos.db`（`storage.backend = "sqlite"`）：單一 writer 把佇列中的 report 批次寫成一個交易（group commit），commit 後才回 `ack`；原始資料、5 分鐘與 1 小時彙總各有保留天數（預設 7／31／400 天），另有總容量上限 `storage.max_total_bytes`（預設 64 GiB，超過時依序刪除最舊的原始資料、彙總），刪除都分批進行；`kairos db backup` 線上備份、`kairos reports export` 匯出成 JSONL 格式。可另輸出 JSONL 鏡像（`storage.jsonl_mirror`），或以 `storage.backend = "jsonl"` 使用舊版的按日 JSONL：依 UTC 日期寫入 `data/reports-YYYY-MM-DD.jsonl`，依 `storage.retention_days` 自動清除過期檔案（啟動時、換日時與每小時；系統日期前進得比實際經過的時間多時暫停清除，保護狀態存於 `data/.retention-guard.json`），可設定每個日期檔的大小上限 `storage.max_daily_bytes`；agent 狀態每 5 秒快照到 `data/agents.json`（寫暫存檔並 fsync 後再更名）；資料目錄或資料庫在執行中被刪除時會自動重建
 - 正常關機：收到 Ctrl+C／Ctrl+Break／關閉主控台／系統關機（非 Windows 為 SIGINT／SIGTERM）時，送出 `close_notify` 關閉所有連線、寫完佇列中的 report、寫出最後的 `agents.json` 後以結束代碼 0 結束，最壞約 3 秒內完成
 - 設定可由 `kairos.toml`、`--config <path>` 與 `KAIROS__` 環境變數調整
 - 同時連線數上限（預設 1024），達上限時暫停接受新連線；其中握手中（已 accept、尚未通過 hello）的連線最多佔一半（`max(1, server.max_connections / 2)`），其餘保留給已通過 hello 的連線。另有每個來源 IP 位址的連線數上限（預設 `min(32, server.max_connections)`，以單一位址計算；未啟用 mTLS 時計算全部連線，啟用 mTLS 時只計算尚未通過 hello 的連線，通過後改依憑證身分計數，同一個 NAT 後的 agent 數不受此限）與每個來源的新連線速率上限（每秒 10 條，可連續 `max(32, 2 × 每 IP 上限)` 條；IPv6 以 /64 合併計算）。超過任一上限的連線不握手直接關閉，避免單一來源以慢速握手或大量連線佔滿名額。網段允許清單 `server.per_ip_allowlist` 內的位址改用較高的上限（見「每 IP 上限、NAT 與網段允許清單」）；被拒的連線依原因（每 IP 上限依來源、全域上限的暫停時間與握手中上限）計數
@@ -39,6 +40,8 @@
 ## 升級注意事項（破壞性變更）
 
 完整的變更與升級步驟見 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）；以下是 Kairos 需要先處理的項目。
+
+- **report 預設改寫 SQLite，不再寫 `reports-YYYY-MM-DD.jsonl`**（0.3〔草稿〕）：資料寫入 `data/kairos.db`。直接讀 JSONL 的工具請改用 `kairos reports export`（格式相同），或設定 `storage.jsonl_mirror = true` 同時輸出 JSONL，或暫時設定 `storage.backend = "jsonl"` 維持舊行為（沒有主機清冊與彙總）。既有的 JSONL 檔不會匯入、不會被修改，不開鏡像時也不會再被自動清除。備份改用 `kairos db backup`（執行中不可直接複製 `kairos.db`）。見 STORAGE.md「從 JSONL（0.2）升級」。
 
 - **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 3（設定錯誤）結束；新版 `kairos.service` 的 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再反覆重試（沿用舊版 unit 時仍會依 `Restart=on-failure` 每 5 秒重試並失敗，請一併換上新版 unit）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
 - **啟動失敗的結束代碼依原因區分**（舊版一律為 1）：命令列參數錯誤 2、設定錯誤 3（設定檔無法載入或驗證不通過、上述拒絕啟動）、憑證錯誤 4（伺服器憑證、私鑰、client CA、CRL）、連接埠已被佔用 11。`kairos.service` 新增 `RestartPreventExitStatus=2 3 4`，systemd 不再對這些錯誤無限重試；修正後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、其他啟動失敗（1）、第二次訊號強制結束（130）不變。
@@ -377,9 +380,17 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `timeouts.handshake_secs` | `KAIROS__TIMEOUTS__HANDSHAKE_SECS` | `5` | TLS 握手逾時（秒），1～3600 |
 | `timeouts.hello_secs` | `KAIROS__TIMEOUTS__HELLO_SECS` | `5` | 握手後等待 hello 的時間（秒），逾時直接關閉，1～3600 |
 | `timeouts.write_secs` | `KAIROS__TIMEOUTS__WRITE_SECS` | `5` | 每則訊息寫出、以及等待 report 寫入資料檔的逾時（秒），**1～6**：伺服器的回應延遲必須不超過 8 秒，Pulse 的讀取閒置只在心跳間隔上預留 10 秒餘裕（見「協定概述」） |
-| `storage.data_dir` | `KAIROS__STORAGE__DATA_DIR` | `data` | 資料輸出目錄 |
-| `storage.retention_days` | `KAIROS__STORAGE__RETENTION_DAYS` | `30` | `reports-YYYY-MM-DD.jsonl` 保留天數（今天與前 N 天保留），`0` = 永久保留，上限 3650 |
-| `storage.max_daily_bytes` | `KAIROS__STORAGE__MAX_DAILY_BYTES` | `0` | 每個 `reports-YYYY-MM-DD.jsonl` 的大小上限（bytes），`0` = 不限制。合適的上限取決於部署規模，請自行設定。只寫入放得下的完整紀錄；放不下的 report 不寫入，回 `storage_unavailable`（`report could not be stored`，確定未保存），並記 `ERROR`（節流）。換日後寫入新檔即恢復。設定值小於「`server.max_connections` 條連線 × 每秒 1 則 × 約 250 bytes × 86400 秒」的估算量時，啟動時記 `WARN` |
+| `storage.data_dir` | `KAIROS__STORAGE__DATA_DIR` | `data` | 資料輸出目錄（SQLite 的 `kairos.db` 與 `agents.json`；寫 JSONL 時另有 `reports-*.jsonl`）。須為本機磁碟（不要用 NFS／SMB） |
+| `storage.backend` | `KAIROS__STORAGE__BACKEND` | `sqlite` | report 的儲存：`sqlite`（原始資料、彙總、主機清冊，見 STORAGE.md）或 `jsonl`（舊版的按日 JSONL，沒有主機清冊、彙總與去重） |
+| `storage.jsonl_mirror` | `KAIROS__STORAGE__JSONL_MIRROR` | `false` | `backend = "sqlite"` 時另外輸出 JSONL 鏡像（格式與 `backend = "jsonl"` 相同，盡力而為，不影響 `ack`）；`backend = "jsonl"` 時設為 `true` 是設定錯誤 |
+| `storage.raw_retention_days` | `KAIROS__STORAGE__RAW_RETENTION_DAYS` | `7` | SQLite 原始 report 保留天數（今天與前 N 天，UTC），`0` = 不依時間刪除，上限 3650 |
+| `storage.rollup_5m_retention_days` | `KAIROS__STORAGE__ROLLUP_5M_RETENTION_DAYS` | `31` | 5 分鐘彙總（min／max／sum／count）保留天數，`0` = 不依時間刪除 |
+| `storage.rollup_1h_retention_days` | `KAIROS__STORAGE__ROLLUP_1H_RETENTION_DAYS` | `400` | 1 小時彙總保留天數，`0` = 不依時間刪除 |
+| `storage.max_total_bytes` | `KAIROS__STORAGE__MAX_TOTAL_BYTES` | `68719476736`（64 GiB） | SQLite 資料庫的總容量上限（bytes），`0` = 不限制，否則至少 64 MiB。超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，直到低於上限的 95%（分批，每步一個短交易）。小於以 `server.max_connections` 台主機估算的容量時，啟動時記 `WARN`（估算方式見 STORAGE.md「容量估算」） |
+| `storage.sqlite_synchronous` | `KAIROS__STORAGE__SQLITE_SYNCHRONOUS` | `normal` | `normal`：commit 寫入作業系統即 `ack`（與 JSONL 的 flush 相同，斷電可能遺失最後幾個交易）；`full`：每次 commit 都 fsync |
+| `storage.max_hosts` | `KAIROS__STORAGE__MAX_HOSTS` | 未設定時為 `max(100000, limits.max_agents)` | 主機清冊最多幾台，明確設定時必須介於 `limits.max_agents`～1000000；已滿時新主機的 report 回 `storage_unavailable` |
+| `storage.retention_days` | `KAIROS__STORAGE__RETENTION_DAYS` | `30` | JSONL（`backend = "jsonl"` 或鏡像）的 `reports-YYYY-MM-DD.jsonl` 保留天數（今天與前 N 天保留），`0` = 永久保留，上限 3650 |
+| `storage.max_daily_bytes` | `KAIROS__STORAGE__MAX_DAILY_BYTES` | `0` | 每個 `reports-YYYY-MM-DD.jsonl` 的大小上限（bytes），`0` = 不限制。合適的上限取決於部署規模，請自行設定。只寫入放得下的完整紀錄；放不下的 report 不寫入：`backend = "jsonl"` 時回 `storage_unavailable`（`report could not be stored`，確定未保存），鏡像時只是不寫入鏡像（SQLite 照常寫入、照常 `ack`），並記 `ERROR`（節流）。換日後寫入新檔即恢復。寫 JSONL 且設定值小於「`server.max_connections` 條連線 × 每秒 1 則 × 約 250 bytes × 86400 秒」的估算量時，啟動時記 `WARN` |
 | `auth.client_ca` | `KAIROS__AUTH__CLIENT_CA` | `""` | 非空時啟用 mTLS：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 `agent_id` 與憑證綁定（見「啟用 mTLS」） |
 | `auth.crl` | `KAIROS__AUTH__CRL`（逗號分隔） | `[]` | CRL 檔路徑清單（PEM 或 DER）；只在設定 `auth.client_ca` 時有效（見「撤銷客戶端憑證」） |
 | `auth.allow_multiple_dns_sans` | `KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS` | `false` | 是否接受含多個 DNS SAN 的客戶端憑證；`false` 時憑證必須恰好有一個 DNS SAN |
@@ -399,7 +410,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
   - 需要延後 0.5 秒以內時，伺服器暫停讀取該連線、延後處理（TCP 背壓會讓送出端慢下來），不回錯誤；需要延後更久時（例如同一來源有多條連線同時送出）不處理這筆，回非 fatal 的 `storage_unavailable`（`report rate limit exceeded`，確定未保存）。兩者都記 `WARN`（依來源 IP 節流）。Pulse 的 `report.interval` 最短 1 秒，且同一時間只有一筆 report 在途，正常不會觸及。
 - 每條連線的訊息速率上限也是固定值：所有訊息（含無效的行）可連續 50 則，之後每秒 20 則；超過時延後處理（每則最多 0.05 秒，期間不讀取該連線），不回錯誤，並記 `WARN`（依來源 IP 節流）。
 - 環境變數的值一律以字串讀入，數值與布林欄位在載入時才轉型；路徑、位址等字串欄位保持原樣（例如 `KAIROS__STORAGE__DATA_DIR=0001` 就是 `0001`，不會變成 `1`）。`KAIROS__AUTH__CRL` 仍以逗號分隔多個檔案（設定檔中的 `auth.crl` 可為陣列或逗號分隔的字串）。
-- 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`server.max_connections_per_allowlisted_ip`（有設定時）必須介於 1～65535，`server.per_ip_allowlist` 的每一項必須是合法的 CIDR，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days` 與 `log.retention_days` 必須介於 0～3650、`server.cert_expiry_warning_days` 與 `auth.crl_expiry_warning_days` 必須介於 0～365、`log.level` 必須是可用值。
+- 不合理的設定會在啟動時報錯：`timeouts.handshake_secs`、`timeouts.hello_secs` 必須介於 1～3600 秒，`timeouts.write_secs` 必須介於 1～6 秒，`server.max_connections` 必須介於 1～65535，`server.max_connections_per_ip`（有設定時）必須介於 1～`server.max_connections`，`server.max_connections_per_allowlisted_ip`（有設定時）必須介於 1～65535，`server.per_ip_allowlist` 的每一項必須是合法的 CIDR，`limits.max_agents`（有設定時）必須介於 `server.max_connections`～100000，`server.reload_interval_secs` 必須介於 0～3600、`storage.retention_days`、`storage.raw_retention_days`、`storage.rollup_5m_retention_days`、`storage.rollup_1h_retention_days` 與 `log.retention_days` 必須介於 0～3650、`storage.max_total_bytes` 必須為 0 或至少 64 MiB、`storage.max_hosts`（有設定時）必須介於 `limits.max_agents`～1000000、`server.cert_expiry_warning_days` 與 `auth.crl_expiry_warning_days` 必須介於 0～365、`log.level` 必須是可用值。
 - 熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL **檔案的內容**（以內容雜湊比對，不依賴修改時間），套用時的日誌會列出變更的檔案種類，例如「已重新載入 TLS 設定（變更：cert、key；mTLS：啟用，CRL 1 份）」；`kairos.toml` 本身的設定變更（例如改監聽位址、改 `auth.client_ca` 的路徑）仍需重新啟動。
 - 熱重載讀檔卡住時（例如網路磁碟、FIFO），每個週期最多等 `min(10 秒, server.reload_interval_secs)`：逾時記 `ERROR`（「檢查 TLS 設定檔超過 … 秒仍未完成」），不再啟動新的檢查，但現役連線的客戶端憑證仍以目前的設定照常重新驗證；檢查完成後記「檢查 TLS 設定檔已恢復」。
 
@@ -512,7 +523,19 @@ sequenceDiagram
 
 ## 資料輸出
 
-### `data/reports-YYYY-MM-DD.jsonl`
+### `data/kairos.db`（SQLite，預設）
+
+`storage.backend = "sqlite"`（預設）時，report、5 分鐘與 1 小時彙總、主機清冊都在這個資料庫中（WAL 模式，另有 `kairos.db-wal`、`kairos.db-shm`）。schema、寫入與 `ack` 的語意、去重、彙總、保留期限與總容量上限、容量估算、量測、備份與還原見 [STORAGE.md](STORAGE.md)。維運用的子命令（都以唯讀方式開啟資料庫，Kairos 執行中也可以執行；用 `--config` 指向 Kairos 的設定檔以找到 `storage.data_dir`）：
+
+| 指令 | 用途 |
+|---|---|
+| `kairos hosts list [--offline-for 3d] [--json]` | 主機清冊：狀態（線上／離線／未知）、主機名稱、`agent_id`、IP、最後訊息；`--offline-for` 只列出失聯至少這麼久的主機 |
+| `kairos reports export [--since 1d] [--agent <agent_id>]` | 以 JSON Lines 匯出原始 report，每行的格式與下一節的 JSONL 相同（`peer`、`hostname` 為清冊中最後的值） |
+| `kairos db backup <備份檔>` | 線上備份（`VACUUM INTO`）；**執行中不可直接複製 `kairos.db`** |
+
+以 systemd 執行時請以服務帳號執行，例如 `sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml`。
+
+### `data/reports-YYYY-MM-DD.jsonl`（`storage.backend = "jsonl"` 或 `storage.jsonl_mirror = true`）
 
 每筆合法 report 一行（JSON Lines），只會附加寫入。檔名的日期是該筆 `recv_at` 的 **UTC** 日期（台灣時間早上 8 點前收到的資料會在前一天的檔案裡）；writer 遇到日期變化時切換檔案，同一批跨過午夜的資料也會正確拆到兩個檔案。
 
@@ -609,9 +632,9 @@ sequenceDiagram
       "last_report": {"recv_at": "…", "seq": 3, "ts": "…", "cpu_usage": 17.84, "total_memory": 49152, "used_memory": 37034, "metrics": 8}
 ```
 
-同一個 `agent_id` 這次 hello 的 `host_fingerprint` 與狀態表中記錄的不同時（例如由映像檔複製的 VM 沿用了 `agent.id`，或主機已重灌），記 `WARN`「主機指紋與上次不同」（每個 agent 節流）。狀態表在重新啟動後從空開始，因此只能偵測同一次執行期間的改變。
+同一個 `agent_id` 這次 hello 的 `host_fingerprint` 與狀態表中記錄的不同時（例如由映像檔複製的 VM 沿用了 `agent.id`，或主機已重灌），記 `WARN`「主機指紋與上次不同」（每個 agent 節流）。SQLite 時狀態表在重新啟動後會載回最近 24 小時內的主機，偵測也延續到重新啟動之後；`backend = "jsonl"` 時狀態表從空開始，只能偵測同一次執行期間的改變。
 
-`agents.json` 只寫不讀：Kairos 重新啟動時不會讀回，狀態表從空開始，因此離線中的 agent 在重新啟動後就從 `agents.json` 消失（「離線 24 小時才移除」只適用於同一次執行期間），線上的 agent 重新連線後才會再出現。關機時最後的 `agents.json` 由主流程寫出，監控工作異常結束時也會寫出。
+`agents.json` 是狀態表的即時快照，Kairos 不會讀回這個檔案。SQLite 時（預設）主機清冊保存在資料庫中：重新啟動時最近 24 小時內出現過的主機以離線狀態放回狀態表，因此重新啟動後 `agents.json` 仍列出它們（`conn_id` 為 0），24 小時後照常移除；更早的主機只在清冊中（`kairos hosts list`）。`backend = "jsonl"` 時沒有清冊，與 0.2 相同：重新啟動後狀態表從空開始，離線中的 agent 立即從 `agents.json` 消失，線上的 agent 重新連線後才會再出現。關機時最後的 `agents.json` 由主流程寫出，監控工作異常結束時也會寫出。
 
 ### `logs/kairos-YYYY-MM-DD.log`
 
@@ -632,9 +655,9 @@ heartbeat 只在 `trace` 等級記錄；agent 未送 `close_notify` 就斷線、
 
 ### 檔案權限
 
-report 檔含有 agent 的來源 IP 與主機名稱（可能含人名），日誌也是，因此不應讓服務帳號以外的使用者讀取。
+資料庫、report 檔含有 agent 的來源 IP 與主機名稱（可能含人名），日誌也是，因此不應讓服務帳號以外的使用者讀取。
 
-- **Unix**：Kairos 建立的 `reports-YYYY-MM-DD.jsonl`、`agents.json` 與 `kairos-YYYY-MM-DD.log` 一律最多 `0640`（擁有者讀寫、group 唯讀、其他人無權限），自行建立的資料目錄與日誌目錄（含執行中被刪除後重建）為 `0750`，不依賴 umask。既有的檔案在開啟時收緊到最多 `0640`（只移除權限，`0600` 維持 `0600`）；既有的目錄不會被改變，但其他使用者可存取時（例如 `0755`）啟動會記 `WARN`「資料目錄 … 的權限為 0755，其他使用者可以存取…；建議執行 chmod 750 …」。`agents.json` 與日期保護狀態檔（`.retention-guard.json`、`.retention-guard-logs.json`，只含日期）以「寫暫存檔再更名」產生，暫存檔建立時就是 `0640`，更名後不需再收緊。
+- **Unix**：Kairos 建立的 `kairos.db`（SQLite 建立的 `kairos.db-wal`、`kairos.db-shm` 沿用同樣的權限；`kairos db backup` 的備份檔也是）、`reports-YYYY-MM-DD.jsonl`、`agents.json` 與 `kairos-YYYY-MM-DD.log` 一律最多 `0640`（擁有者讀寫、group 唯讀、其他人無權限），自行建立的資料目錄與日誌目錄（含執行中被刪除後重建）為 `0750`，不依賴 umask。既有的檔案在開啟時收緊到最多 `0640`（只移除權限，`0600` 維持 `0600`）；既有的目錄不會被改變，但其他使用者可存取時（例如 `0755`）啟動會記 `WARN`「資料目錄 … 的權限為 0755，其他使用者可以存取…；建議執行 chmod 750 …」。`agents.json` 與日期保護狀態檔（`.retention-guard.json`、`.retention-guard-logs.json`，只含日期）以「寫暫存檔再更名」產生，暫存檔建立時就是 `0640`，更名後不需再收緊。
 - **Windows**：檔案沒有 Unix 的權限位元，新檔案繼承所在目錄的 ACL；預設的 ACL 通常讓本機的 `Users` 群組可以讀取。請在第一次啟動前建立資料目錄與日誌目錄，並移除繼承、只授權給執行 Kairos 的帳號與系統管理員，例如（在 Kairos 的工作目錄、以系統管理員身分執行；`KAIROS_SVC` 換成實際的服務帳號）：
 
   ```bat
@@ -778,7 +801,12 @@ kairos/
     ├── protocol.rs        訊息型別、NDJSON codec、驗證（純函式）
     ├── connection.rs      單一連線：握手、hello 狀態機、訊息處理與訊息速率限制、report 限速、踢除
     ├── registry.rs        agent 註冊表、存活狀態與筆數上限
-    ├── storage.rs         按日分檔的 report 寫入工作（寫入後回覆結果）、agents.json 快照
+    ├── storage.rs         report 的寫入介面（ReportSink、WriteTicket、去重鍵）、JSONL 後端與鏡像、agents.json 快照
+    ├── store/             report 的儲存後端（STORAGE.md）：mod.rs（ReportStore trait 與 writer task）、
+    │                      sqlite.rs（SQLite 後端、主機清冊、保留與容量上限、checkpoint）、codec.rs（緊湊編碼）、
+    │                      rollup.rs（5 分鐘／1 小時彙總）、*tests.rs（單元測試與吞吐量量測）
+    ├── hosts_cli.rs       kairos hosts list（主機清冊查詢）
+    ├── export_cli.rs      kairos reports export（JSON Lines 匯出）、kairos db backup（線上備份）
     ├── monitor.rs         每秒存活檢查、每 5 秒快照、每 60 秒摘要、關機時最後快照
     ├── shutdown.rs        關機訊號、關機期限與看門狗
     ├── integration_tests.rs  透過真實 TLS 連線的整合測試（僅測試建置）
@@ -798,6 +826,7 @@ kairos/
 | `chrono` | RFC 3339 時間戳記與日誌時間 |
 | `config` | 設定檔與環境變數疊加（0.15，只啟用 `toml`） |
 | `log`、`fern` | 日誌輸出到終端與按日分檔的檔案（分檔由 `logger.rs` 自行處理，以便指定檔案權限） |
+| `rusqlite` | SQLite 儲存（`bundled`：編譯內附的 SQLite 原始碼，SQLite 為 public domain，不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝；不啟用其他 feature） |
 
 加密後端選用 `ring` 而非 rustls 預設的 `aws-lc-rs`，以避免在 Windows 上需要額外的 C 建置工具。
 
@@ -815,7 +844,7 @@ cargo fmt --check
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.99 cargo test -p kairos --locked
 ```
 
-協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。測試數量以 `cargo test` 的輸出為準。
+協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。SQLite 儲存的測試在 `src/store/`：schema 建立與遷移（依序套用、失敗時整版不生效、拒絕較新或不是 Kairos 的資料庫）、緊湊編碼的往返、一批一個交易、commit 前失敗／磁碟已滿／結果未知的回報、去重（重複的回 `Duplicate`、同一批與跨重新開啟）、資料庫或資料目錄被刪除時重建、主機清冊的同步（只寫有變化的）與重新啟動後載回、彙總的寫出與當掉後補回（不重複計算）、保留期限（含時鐘跳躍保護）、總容量上限的刪除順序、趨勢查詢走索引（`EXPLAIN QUERY PLAN`）、匯出與線上備份；writer 的 commit 後才回覆、group commit、取消的要求不寫入、JSONL 鏡像與關機前的清冊同步。吞吐量量測為 ignored 測試（`cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput`，見 STORAGE.md「量測」）。測試數量以 `cargo test` 的輸出為準。
 
 > [!WARNING]
 > `src/test_pki.rs` 與 `testdata/`（例如 `testdata/pki/server.key`）中的私鑰**只供測試使用**，已公開在 repo 中，絕對不可用於任何部署環境。正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。
@@ -824,15 +853,16 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_D
 
 ## 目前限制
 
-- 狀態只存在記憶體（`agents.json` 只寫不讀）：重新啟動後 `agents.json` 會從空清單開始，離線中的 agent 立即消失（不會保留 24 小時），線上的 agent 要等重新連線才會出現
+- 單一寫入者：同一個資料目錄只能由一個 Kairos 使用（HA 見審計 A2）；資料目錄須為本機磁碟（SQLite 的 WAL 不支援網路磁碟）
+- `backend = "jsonl"` 時狀態只存在記憶體：重新啟動後 `agents.json` 會從空清單開始，離線中的 agent 立即消失（不會保留 24 小時），線上的 agent 要等重新連線才會出現
 - 狀態表達到 `limits.max_agents` 時，離線最久的 agent 會在 24 小時到期前被提早移除；全部都在線上時，新的 `agent_id` 無法登記
-- report 檔寫入中途失敗時，殘缺的那一行會留在檔案中（之後補上換行隔開），讀取端需能略過無法解析的行
-- `ack` 代表資料已交給作業系統（write + flush），不保證已同步到磁碟；作業系統當機或斷電時，最近寫入的資料可能遺失（為了寫入效能，沒有每批呼叫 fsync）
-- writer 在寫入前檢查 report 檔是否還存在，但「檢查」與「寫入」之間仍有時間差：若檔案剛好在這段期間被刪除，該批資料會寫進已刪除的檔案而遺失，連線卻已收到 `ack`。下一批寫入前會偵測到並重建檔案
+- JSONL：report 檔寫入中途失敗時，殘缺的那一行會留在檔案中（之後補上換行隔開），讀取端需能略過無法解析的行
+- `ack` 代表資料已交給作業系統（SQLite 的 commit 或 JSONL 的 write + flush），不保證已同步到磁碟；作業系統當機或斷電時，最近寫入的資料可能遺失（為了寫入效能，預設不每批 fsync；SQLite 可設定 `storage.sqlite_synchronous = "full"`）
+- writer 在寫入前檢查資料庫（或 report 檔）是否還存在，但「檢查」與「寫入」之間仍有時間差：若檔案剛好在這段期間被刪除，該批資料會寫進已刪除的檔案而遺失，連線卻已收到 `ack`。下一批寫入前會偵測到並重建
 - 等待寫入逾時且 writer 已開始寫入、或寫出中途失敗而無法確定這筆是否已寫入時，伺服器不回應並關閉連線，該筆資料是否已保存無法得知（Pulse 不重送，不會重複；但可能已寫入或遺失）
 - 系統日期前進得比實際經過的時間多時，保留清除會暫停 24 小時（跨重啟延續）；伺服器停機超過約 2 天後重新啟動也會觸發，期間過期的 report 檔與日誌檔不會被刪除。保護狀態存於 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，刪除後若系統時鐘仍在未來，可能以未來日期清除
 - 未設定 `auth.client_ca` 時沒有客戶端身分驗證：任何能完成 TLS 握手的客戶端都能以任意 `agent_id` 登記，也能藉此踢掉同 `agent_id` 的既有連線；狀態表筆數雖有上限，仍可能被大量隨機 `agent_id` 佔滿而擠掉離線 agent。因此預設只允許在 loopback 位址上不啟用 mTLS（見「啟用 mTLS」），`auth.allow_unauthenticated = true` 時對外位址也一樣
 - 現役連線的客戶端憑證在每個重載週期重新檢查，因此撤銷或過期最多延遲 `server.reload_interval_secs` 才生效；握手後、送出 hello 前的連線（最多 `timeouts.hello_secs`）不在週期檢查範圍內，但送出 hello 時會再驗證一次憑證鏈，註冊後也會在下一個週期被檢查
 - 關機時連線最晚到訊號後 2 秒就會被中止；網路極慢的連線可能收不到 `close_notify`（agent 端會視為斷線並重連）。被中止的連線若正在等待 report 寫入，該筆仍會寫入資料檔，但 `agents.json` 中該 agent 的 `last_report` 可能不會更新
 - `kairos.toml` 本身的設定只在啟動時讀取；熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL 檔的內容
-- 只提供檔案輸出，沒有查詢 API 或網頁介面
+- 沒有查詢 API 或網頁介面；趨勢以 SQL 查詢資料庫或 `kairos reports export` 取得（STORAGE.md「查詢範例」）

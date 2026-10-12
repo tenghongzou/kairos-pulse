@@ -19,6 +19,9 @@ date-guard = { path = "../crates/date-guard" }
 kairos-proto = { path = "../crates/kairos-proto" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log = "0.4"
+# report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
+# 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 # 檢查 mTLS 客戶端憑證的 SAN；與 rustls 依賴的版本相同，只啟用 alloc（不引入其他加密後端）
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
