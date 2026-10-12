@@ -16,6 +16,12 @@
 #   <DIST_DIR>/SHA256SUMS   兩個產品共用的合併清單：只更新本次產出檔案的那幾列，
 #                           保留其他產品的列；最後以 sha256sum -c 確認整份清單與目錄內容一致
 #
+# 建置來源不是工作目錄，而是以 git -c core.autocrlf=false archive 匯出的 commit 內容（repo 中
+# 儲存的 LF 版本），經 stdin 傳進容器。Windows 上 core.autocrlf=true 的工作目錄是 CRLF，直接掛載
+# 會讓 tar 內的文件與 Pulse 以 include_str! 嵌入的 config.toml 和 Linux 上建置的不同。
+# 工作目錄有未提交的變更時改用 git stash create 的結果（含已追蹤檔案的修改，不改變工作目錄與
+# stash 清單；未追蹤的檔案不會進入建置），產物標為 -dirty。
+#
 # 可用的環境變數：
 #   DIST_DIR      輸出目錄，預設為 repo 根目錄的 dist/（兩個產品共用，SHA256SUMS 才能合併）
 #   BUILD_VOLUME  CARGO_TARGET_DIR 使用的 docker volume，預設 sync-build-<repo 目錄名稱>；
@@ -109,6 +115,15 @@ fi
 for t in $(git tag --points-at HEAD "$NAME-v*"); do
     [ "$t" = "$NAME-v$VERSION" ] || die "HEAD 上的 tag $t 與 $PKG_SUBDIR/Cargo.toml 的版本 $VERSION 不一致"
 done
+# 建置來源（見檔案開頭）
+TREEISH=HEAD
+if [ -n "$DIRTY" ]; then
+    TREEISH=$(git stash create)
+    TREEISH=${TREEISH:-HEAD}
+    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        echo "警告：未追蹤的檔案不會進入建置（請先 git add 或提交）" >&2
+    fi
+fi
 # tar 內檔案的時間戳記固定為該 commit 的時間，同一份原始碼重複打包時內容一致
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD)
 BUILD_COMMIT="$COMMIT$DIRTY"
@@ -118,7 +133,6 @@ PKG="$NAME-$VERSION-$BUILD_COMMIT-linux-x86_64"
 DIST_DIR=${DIST_DIR:-$REPO/dist}
 mkdir -p "$DIST_DIR"
 HOST_DIST=$(host_path "$DIST_DIR")
-HOST_REPO=$(host_path "$REPO")
 BUILD_VOLUME=${BUILD_VOLUME:-sync-build-$(basename "$REPO")}
 
 echo "==> 建置 $PKG"
@@ -130,6 +144,10 @@ echo "    volumes: $BUILD_VOLUME（target）、$CARGO_VOLUME（registry）"
 # shellcheck disable=SC2016
 INNER='
 set -eu
+# 建置來源由 stdin 傳入（git archive 的 tar）。-m：檔案時間設為解壓當下，cargo 以 mtime 判斷
+# 是否需要重新編譯，沿用 commit 時間可能讓切換到較舊的 commit 時誤用上次的建置產物
+mkdir -p /src
+tar -x -m -f - -C /src
 apk add --no-cache $APK_PACKAGES >/dev/null || {
     echo "錯誤：apk 無法安裝 $APK_PACKAGES（Alpine 套件庫可能已更新該套件），請依 RELEASING.md 更新 image digest 與 APK_PACKAGES" >&2
     exit 1
@@ -190,14 +208,14 @@ install -m 644 /tmp/THIRD-PARTY-LICENSES "$STAGE/$PKG/THIRD-PARTY-LICENSES"
 sed -n "/^Overview/,/^$/p" /tmp/THIRD-PARTY-LICENSES | sed "s/^/    /"
 
 echo "==> SBOM（cargo-cyclonedx $CARGO_CYCLONEDX_VERSION）"
-# cargo-cyclonedx 把結果寫在 Cargo.toml 旁邊，/src 是唯讀的，因此複製一份 workspace
-# （不含建置產物）到固定路徑；SBOM 的 bom-ref 含此路徑，固定才能重現。
+# cargo-cyclonedx 把結果寫在 Cargo.toml 旁邊，因此在另一個固定路徑複製一份 workspace
+# （SBOM 的 bom-ref 含此路徑，固定才能重現），不影響 /src 的建置。
 # cargo metadata 會合併整個 workspace 的 feature（例如 Kairos 的 tokio "full" 會讓 Pulse 的
 # SBOM 多出 parking_lot），因此複本的 workspace 只保留本產品與共用 crate，與實際建置一致。
 SBOM_SRC=/work/kairos-pulse
 rm -rf "$SBOM_SRC"
 mkdir -p "$SBOM_SRC"
-tar -C /src --exclude=./.git --exclude=target --exclude=dist -cf - . | tar -C "$SBOM_SRC" -xf -
+tar -C /src -cf - . | tar -C "$SBOM_SRC" -xf -
 sed -i "s|^members = .*|members = [\"$PKG_SUBDIR\", \"crates/*\"]|" "$SBOM_SRC/Cargo.toml"
 grep -q "^members = \[\"$PKG_SUBDIR\", \"crates/\*\"\]" "$SBOM_SRC/Cargo.toml" || {
     echo "錯誤：無法在 SBOM 用的 workspace 複本中縮減 members（Cargo.toml 格式改變？）" >&2
@@ -275,8 +293,8 @@ esac
 # rustfmt、clippy；不覆寫的話 rustup 每次都會在一次性容器裡重新下載這兩個元件。
 # Windows Git Bash：MSYS_NO_PATHCONV=1 避免 /src、/out 等容器內路徑被自動轉換成 Windows
 # 路徑。只設在 docker 這個指令上：git 等其他 Windows 程式仍需要正常的路徑轉換。
-MSYS_NO_PATHCONV=1 docker run --rm \
-    -v "$HOST_REPO:/src:ro" \
+git -c core.autocrlf=false archive --format=tar "$TREEISH" |
+    MSYS_NO_PATHCONV=1 docker run --rm -i \
     -v "$HOST_DIST:/out" \
     -v "$BUILD_VOLUME:/build" \
     -v "$CARGO_VOLUME:/usr/local/cargo/registry" \
