@@ -38,7 +38,7 @@ use crate::registry::{
     ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
 };
 use crate::shutdown::{CONNECTIONS_DEADLINE, Shutdown, drain_limit};
-use crate::storage::{RecordBody, ReportRecord, ReportSink, WriteStatus, fmt_time};
+use crate::storage::{DedupKey, RecordBody, ReportRecord, ReportSink, WriteStatus, fmt_time};
 use crate::throttle::{Category, Key, LogThrottle};
 use crate::throttled;
 use crate::tls::{RevocationFailure, TlsState, revocation_failure, verify_chain};
@@ -271,6 +271,10 @@ pub(crate) enum StoreOutcome {
 ///    writer 已開始寫入而無法取消時，再等一小段，仍無結果則回 [`StoreOutcome::Unknown`]；
 /// 3. 寫入成功後才更新 last_report，並再更新一次 last_seen（等待寫檔期間收不到 heartbeat）。
 ///
+/// `dedup` 為 durable report 的去重鍵（A5）：已寫入過的那筆不再寫入（[`WriteStatus::Duplicate`]），
+/// 同樣回 [`StoreOutcome::Stored`]（連線回 `ack`），但不更新 last_report。durable report 可能是
+/// 補送的舊資料，只在 `ts` 不早於目前的 last_report 時更新。
+///
 /// 各次更新 last_seen 中只要有一次讓 agent 從離線恢復，就把 `revived` 設為 `true`（不論保存結果），
 /// 呼叫端據此記錄「恢復上線」（R2-K13）。
 pub(crate) async fn store_report(
@@ -278,6 +282,7 @@ pub(crate) async fn store_report(
     sink: &ReportSink,
     conn_id: u64,
     record: ReportRecord,
+    dedup: Option<DedupKey>,
     write_timeout: Duration,
     revived: &AtomicBool,
 ) -> StoreOutcome {
@@ -298,7 +303,14 @@ pub(crate) async fn store_report(
     let deadline = deadline_after(write_timeout);
     // 等待期間（含等待佇列空間）以 keep_alive_while 定期更新本連線的 last_seen
     // （只更新 conn_id 相符的現役連線）。在放入佇列前逾時：這筆根本沒有進入佇列
-    let submit = keep_alive_while(registry, &agent_id, conn_id, revived, sink.submit(record));
+    let durable = dedup.is_some();
+    let submit = keep_alive_while(
+        registry,
+        &agent_id,
+        conn_id,
+        revived,
+        sink.submit(record, dedup),
+    );
     let mut pending = match timeout_at(deadline, submit).await {
         Ok(Ok(pending)) => pending,
         Ok(Err(reason)) => return StoreOutcome::Unavailable(reason),
@@ -327,9 +339,16 @@ pub(crate) async fn store_report(
         },
     };
     match status {
-        WriteStatus::Written => {
-            // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）
-            registry.set_last_report(&agent_id, conn_id, last);
+        WriteStatus::Written | WriteStatus::Duplicate => {
+            // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）。
+            // 重送（Duplicate）的資料先前已更新過；durable report 可能是補送的舊資料
+            if status == WriteStatus::Written {
+                if durable {
+                    registry.set_last_report_unless_older(&agent_id, conn_id, last);
+                } else {
+                    registry.set_last_report(&agent_id, conn_id, last);
+                }
+            }
             let touch = registry.touch(&agent_id, conn_id, std::time::Instant::now(), Utc::now());
             if touch == Touch::Revived {
                 revived.store(true, Ordering::Relaxed);
@@ -1502,6 +1521,7 @@ impl Conn {
                     &ctx.reports,
                     self.conn_id,
                     record,
+                    None,
                     self.write_timeout,
                     &revived,
                 )
@@ -1708,6 +1728,7 @@ mod tests {
             &sink,
             1,
             record(7),
+            None,
             Duration::from_secs(1),
             &AtomicBool::new(false),
         )
@@ -1715,6 +1736,41 @@ mod tests {
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         assert_eq!(writer.await.unwrap(), Some(7));
         assert_eq!(last_report_seq(&registry), Some(7));
+    }
+
+    #[tokio::test]
+    async fn store_report_duplicate_is_stored_without_touching_last_report() {
+        // A5：durable report 的重送（writer 判定已寫入過）→ Stored（連線回 ack），last_report 不變
+        let registry = Registry::new();
+        let _reg = registry
+            .register(1, hello_info(), std::time::Instant::now(), Utc::now())
+            .unwrap();
+        let (sink, mut rx) = report_channel(4);
+        let writer = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert!(req.ticket.claim());
+            // 去重鍵隨紀錄交給 writer（也會寫進 JSONL）
+            let key = req.record.dedup.clone().unwrap();
+            let _ = req.reply.send(WriteStatus::Duplicate);
+            key
+        });
+        let key = DedupKey {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq: 3,
+        };
+        let outcome = store_report(
+            &registry,
+            &sink,
+            1,
+            record(9),
+            Some(key.clone()),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
+        assert_eq!(writer.await.unwrap(), key);
+        assert_eq!(last_report_seq(&registry), None);
     }
 
     #[tokio::test]
@@ -1731,6 +1787,7 @@ mod tests {
             &sink,
             1,
             record(8),
+            None,
             Duration::from_secs(1),
             &AtomicBool::new(false),
         )
@@ -1755,6 +1812,7 @@ mod tests {
             &sink,
             1,
             record(9),
+            None,
             Duration::from_millis(50),
             &AtomicBool::new(false),
         )
@@ -1789,6 +1847,7 @@ mod tests {
             &sink,
             1,
             record(9),
+            None,
             Duration::from_millis(50),
             &AtomicBool::new(false),
         )
@@ -1819,6 +1878,7 @@ mod tests {
             &sink,
             1,
             record(11),
+            None,
             Duration::from_millis(500),
             &AtomicBool::new(false),
         )
@@ -1849,6 +1909,7 @@ mod tests {
             &sink,
             1,
             record(12),
+            None,
             Duration::from_secs(1),
             &AtomicBool::new(false),
         )
@@ -1893,6 +1954,7 @@ mod tests {
             &sink,
             1,
             record(13),
+            None,
             Duration::from_secs(6),
             &AtomicBool::new(false),
         )
@@ -1931,6 +1993,7 @@ mod tests {
             &sink,
             1,
             record(2),
+            None,
             Duration::from_millis(50),
             &AtomicBool::new(false),
         )
@@ -1957,6 +2020,7 @@ mod tests {
             &sink,
             1,
             record(3),
+            None,
             Duration::from_secs(1),
             &AtomicBool::new(false),
         )
@@ -1983,6 +2047,7 @@ mod tests {
             &sink,
             1,
             record(9),
+            None,
             Duration::from_secs(1),
             &AtomicBool::new(false),
         )
@@ -2022,6 +2087,7 @@ mod tests {
             &sink,
             1,
             record(14),
+            None,
             Duration::from_secs(5),
             &revived,
         )
@@ -2046,6 +2112,7 @@ mod tests {
             &sink,
             1,
             record(15),
+            None,
             Duration::from_secs(5),
             &revived,
         )

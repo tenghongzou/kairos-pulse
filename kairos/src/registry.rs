@@ -481,6 +481,34 @@ impl Registry {
         }
     }
 
+    /// 同 [`Registry::set_last_report`]，但 `report.ts` 早於目前 last_report 的 `ts` 時不更新
+    /// （durable 補送的舊資料不蓋過較新的狀態；A5）。任一方的 `ts` 不是 RFC 3339 時照常更新。
+    /// 回傳是否更新
+    pub fn set_last_report_unless_older(
+        &self,
+        agent_id: &str,
+        conn_id: u64,
+        report: LastReport,
+    ) -> bool {
+        let mut inner = self.lock();
+        match inner.agents.get_mut(agent_id) {
+            Some(state) if state.conn_id == conn_id => {
+                let parse = |ts: &str| DateTime::parse_from_rfc3339(ts).ok();
+                let older = state.last_report.as_ref().is_some_and(|current| {
+                    matches!(
+                        (parse(&report.ts), parse(&current.ts)),
+                        (Some(new), Some(cur)) if new < cur
+                    )
+                });
+                if !older {
+                    state.last_report = Some(Arc::new(report));
+                }
+                !older
+            }
+            _ => false,
+        }
+    }
+
     /// 關機時呼叫：把仍有連線的 agent 全部標為離線（例如連線工作逾時被中止，
     /// 來不及自行 disconnect）。回傳其中仍標記為線上的數量。
     pub fn mark_all_offline(&self, now: Instant) -> usize {
@@ -774,6 +802,35 @@ mod tests {
         assert_eq!(snap.agents[0].conn_id, 2);
         assert!(snap.agents[0].online);
         r.assert_consistent();
+    }
+
+    #[test]
+    fn durable_last_report_is_not_replaced_by_older_samples() {
+        // A5：補送的舊資料不蓋過較新的 last_report
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        let at = |seq, ts: &str| LastReport {
+            ts: ts.into(),
+            ..report(seq)
+        };
+        let last_seq = || {
+            r.snapshot(Utc::now()).agents[0]
+                .last_report
+                .as_ref()
+                .map(|r| r.seq)
+        };
+        assert!(r.set_last_report_unless_older("a", 1, at(1, "2026-10-08T03:00:00.000Z")));
+        assert!(!r.set_last_report_unless_older("a", 1, at(2, "2026-10-08T02:59:59.999Z")));
+        assert_eq!(last_seq(), Some(1));
+        // 同一時間或較新的照常更新；任一方無法解析時也更新
+        assert!(r.set_last_report_unless_older("a", 1, at(3, "2026-10-08T03:00:00.000Z")));
+        assert!(r.set_last_report_unless_older("a", 1, at(4, "2026-10-08T11:00:00+08:00")));
+        assert!(r.set_last_report_unless_older("a", 1, at(5, "not a time")));
+        assert!(r.set_last_report_unless_older("a", 1, at(6, "2001-01-01T00:00:00Z")));
+        assert_eq!(last_seq(), Some(6));
+        // 連線不符時不更新
+        assert!(!r.set_last_report_unless_older("a", 9, at(7, "2030-01-01T00:00:00Z")));
     }
 
     #[test]

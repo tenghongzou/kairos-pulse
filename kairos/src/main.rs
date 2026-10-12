@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod connection;
+mod dedup;
 mod expiry;
 mod fsperm;
 #[cfg(test)]
