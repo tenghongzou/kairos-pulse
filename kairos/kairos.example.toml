@@ -16,8 +16,16 @@ write_secs = 5                # 寫出訊息與等待 report 寫檔的上限，1
 
 [storage]
 data_dir = "data"
-retention_days = 30           # reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
-max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制；達到後當天的 report 回 storage_unavailable。設定值小於 max_connections × 每秒 1 則 × 約 250 bytes × 86400 時，啟動會記 WARN
+backend = "sqlite"            # report 的儲存：sqlite（<data_dir>/kairos.db：原始資料、彙總與主機清冊）或 jsonl（舊版的按日 JSONL，沒有主機清冊與彙總）；說明見 STORAGE.md
+jsonl_mirror = false          # backend = "sqlite" 時另外輸出 JSONL 鏡像 reports-YYYY-MM-DD.jsonl（盡力而為，不影響 ack）
+raw_retention_days = 7        # SQLite 原始 report 保留天數（今天與前 N 天，UTC），0 = 不依時間刪除，上限 3650
+rollup_5m_retention_days = 31 # 5 分鐘彙總（min/max/sum/count）保留天數，0 = 不依時間刪除
+rollup_1h_retention_days = 400 # 1 小時彙總保留天數，0 = 不依時間刪除
+max_total_bytes = 68719476736 # SQLite 資料庫的總容量上限（bytes，預設 64 GiB；0 = 不限制，否則至少 64 MiB）；超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總。小於估算量時啟動會記 WARN
+sqlite_synchronous = "normal" # normal：commit 寫入作業系統即 ack（與 JSONL 相同，斷電可能遺失最後幾個交易）；full：每次 commit 都 fsync
+# max_hosts = 100000          # 主機清冊最多幾台（limits.max_agents..=1000000）；未設定時為 max(100000, limits.max_agents)
+retention_days = 30           # JSONL（backend = "jsonl" 或鏡像）reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
+max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制；backend = "jsonl" 時達到後當天的 report 回 storage_unavailable（鏡像只是不再寫入鏡像）。寫 JSONL 且設定值小於 max_connections × 每秒 1 則 × 約 250 bytes × 86400 時，啟動會記 WARN
 
 [auth]
 client_ca = ""                # 非空：要求客戶端憑證（mTLS），以此 PEM（可含多張 CA）驗證，並強制 agent_id 綁定

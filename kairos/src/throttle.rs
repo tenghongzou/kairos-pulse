@@ -96,6 +96,8 @@ pub enum Category {
     WriteUnknown,
     /// report 檔開檔或寫入失敗、達到每日大小上限
     StorageWrite,
+    /// SQLite 的維護工作（彙總寫出、保留期限與容量上限的刪除、主機清冊同步）失敗或無法完成
+    StorageMaintenance,
 }
 
 /// 節流的來源

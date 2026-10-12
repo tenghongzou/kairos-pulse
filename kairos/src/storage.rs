@@ -1,7 +1,12 @@
-//! 資料輸出：按 UTC 日期分檔的 `reports-YYYY-MM-DD.jsonl`（單一 writer task）與 `agents.json` 快照。
+//! report 的寫入介面（[`ReportSink`]：佇列、[`WriteTicket`]、[`WriteStatus`]），以及 JSONL 後端：
+//! 按 UTC 日期分檔的 `reports-YYYY-MM-DD.jsonl`（單一 writer task）與 `agents.json` 快照。
 //!
-//! report 的寫入結果會回覆給送出它的連線：writer 把同一天的一段紀錄一次寫入並 flush 後，
-//! 才逐筆透過 oneshot 回報成功或失敗，連線收到成功才回 `ack`。
+//! 連線只透過 [`ReportSink`] 送出 report，不知道後端是什麼：`storage.backend = "sqlite"`（預設）時
+//! 由 [`crate::store`] 的 writer 寫入 SQLite，`"jsonl"` 時由本模組的 writer 寫入 JSONL；
+//! SQLite 時可另以本模組的 writer 輸出 JSONL 鏡像（`storage.jsonl_mirror`）。
+//!
+//! report 的寫入結果會回覆給送出它的連線：writer 把一段紀錄寫入（JSONL：一次寫入並 flush；
+//! SQLite：commit）後，才逐筆透過 oneshot 回報成功或失敗，連線收到成功才回 `ack`。
 //!
 //! `storage_unavailable` 的語意是「確定未保存」，因此：
 //! - 連線等待逾時後，逾時的要求絕不能再被寫入：每筆要求附有 [`WriteTicket`]，writer 編碼前先
@@ -99,6 +104,19 @@ impl RecordBody {
     }
 }
 
+/// at-least-once（協定 feature `durable`）的去重鍵：Pulse 每次啟動產生的 `boot_id` 與該 boot 內
+/// 單調遞增的 `report_seq`。重送同一筆 report 時兩者不變。
+///
+/// 與 `sprint2/durable` 分支的契約（見 `kairos/STORAGE.md`「去重」）：連線協商到 `durable` 且 report
+/// 帶有這兩個欄位時，以 [`ReportRecord::with_dedup`] 附上；SQLite 後端以唯一索引
+/// （主機＋`boot_id`＋`report_seq`）保證不重複，重複的那筆回 [`WriteStatus::Duplicate`]（連線照常回
+/// `ack`，不重寫）。JSONL 後端不去重，只把兩個欄位寫進該行。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct DedupKey {
+    pub boot_id: String,
+    pub report_seq: u64,
+}
+
 /// reports-YYYY-MM-DD.jsonl 的一行（欄位順序即輸出順序）。以 [`ReportRecord::new`] 建立，
 /// `schema` 由內容決定。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -113,6 +131,9 @@ pub struct ReportRecord {
     pub hostname: String,
     pub seq: u64,
     pub ts: String,
+    /// 去重鍵（`durable`）；有值時 JSONL 在 `ts` 之後多 `boot_id`、`report_seq` 兩個欄位
+    #[serde(flatten)]
+    pub dedup: Option<DedupKey>,
     #[serde(flatten)]
     pub body: RecordBody,
 }
@@ -135,8 +156,15 @@ impl ReportRecord {
             hostname,
             seq,
             ts,
+            dedup: None,
             body,
         }
+    }
+
+    /// 附上去重鍵（`durable`；連線端的接線由 sprint2/durable 處理，目前由 `kairos reports export` 使用）
+    pub fn with_dedup(mut self, dedup: Option<DedupKey>) -> Self {
+        self.dedup = dedup;
+        self
     }
 }
 
@@ -191,8 +219,10 @@ pub struct PendingWrite {
 /// 等待寫入的結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteStatus {
-    /// 已寫入並 flush
+    /// 已寫入（JSONL：已 flush；SQLite：已 commit）
     Written,
+    /// 與已保存的一筆重複（同一主機、同一個 [`DedupKey`]），沒有再寫入。資料已保存，連線照常回 `ack`
+    Duplicate,
     /// 確定沒有寫入任何一個 byte（內含原因）
     Failed(String),
     /// 可能已（部分）寫入：寫出中途失敗，或 writer 已認領卻未回覆就結束
@@ -456,11 +486,23 @@ impl ReportSink {
         Ok(PendingWrite { result, ticket })
     }
 
+    /// 不等待結果、佇列滿時不等待地放入一筆（JSONL 鏡像用）；放不進去時回傳 `false`
+    pub fn try_forward(&self, record: ReportRecord) -> bool {
+        let (reply, _) = oneshot::channel();
+        self.tx
+            .try_send(WriteRequest {
+                record,
+                reply,
+                ticket: WriteTicket::default(),
+            })
+            .is_ok()
+    }
+
     /// 送出一筆並等待寫入結果（寫入並 flush 後才回傳 `Ok`）
     #[cfg(test)]
     pub async fn write(&self, record: ReportRecord) -> Result<(), String> {
         match self.submit(record).await?.wait().await {
-            WriteStatus::Written => Ok(()),
+            WriteStatus::Written | WriteStatus::Duplicate => Ok(()),
             WriteStatus::Failed(e) | WriteStatus::Unknown(e) => Err(e),
         }
     }
@@ -984,6 +1026,25 @@ mod tests {
         assert_eq!(
             line,
             r#"{"schema":1,"recv_at":"2026-10-08T03:15:45.300Z","peer":"127.0.0.1:50000","agent_id":"id","hostname":"web-01","seq":6,"ts":"2026-10-08T03:15:45.210Z","cpu_usage":17.84,"total_memory":49152,"used_memory":37034}"#
+        );
+    }
+
+    #[test]
+    fn dedup_key_is_written_after_ts() {
+        let r = record(7).with_dedup(Some(DedupKey {
+            boot_id: "0b1c2d3e-0000-4000-8000-000000000001".into(),
+            report_seq: 42,
+        }));
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(
+            line.contains(r#""ts":"t","boot_id":"0b1c2d3e-0000-4000-8000-000000000001","report_seq":42,"cpu_usage""#),
+            "{line}"
+        );
+        // 沒有去重鍵時不輸出
+        assert!(
+            !serde_json::to_string(&record(7))
+                .unwrap()
+                .contains("boot_id")
         );
     }
 

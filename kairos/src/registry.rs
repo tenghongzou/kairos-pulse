@@ -12,7 +12,7 @@
 //! 字串欄位以 `Arc<str>` 保存，snapshot 在鎖內只複製參考計數，格式化與排序都在鎖外進行。
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -74,8 +74,8 @@ pub struct LiveConnection {
     pub client_chain: Option<ClientChain>,
 }
 
-/// 最近一次合法的 report
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// 最近一次合法的 report（也存在 SQLite 主機清冊的 `hosts.last_report`，重新啟動時讀回）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastReport {
     pub recv_at: String,
     pub seq: u64,
@@ -123,6 +123,21 @@ pub struct AgentState {
 
 /// 離線索引的 key：(離線時間, 序號)；序號讓同一時間離線的多個 agent 不會衝突
 type OfflineKey = (Instant, u64);
+
+/// 從 SQLite 主機清冊載回的 agent（啟動時；審計 A6），見 [`Registry::restore`]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredAgent {
+    pub agent_id: String,
+    pub hostname: String,
+    pub agent_version: String,
+    pub proto: u32,
+    pub host: Option<HostInfo>,
+    pub peer: String,
+    pub connected_at: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub offline_after: Duration,
+    pub last_report: Option<LastReport>,
+}
 
 /// 註冊結果的種類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +426,62 @@ impl Registry {
             evicted,
             previous_fingerprint,
         })
+    }
+
+    /// 啟動時把主機清冊中離線未超過 [`OFFLINE_RETENTION`] 的 agent 以「離線」狀態放回狀態表
+    /// （審計 A6）：重新啟動後 `agents.json` 不再是空的，之後的 hello 記為「重新上線」，
+    /// 主機指紋的比對也延續到重新啟動之後。離線時間以清冊的 `last_seen` 起算（24 小時後照常由
+    /// sweep 移除）；最多放回狀態表上限的筆數（最近出現的優先），已在表中的 agent 不覆寫。
+    /// 回傳放回的筆數。
+    pub fn restore(
+        &self,
+        mut agents: Vec<RestoredAgent>,
+        now: Instant,
+        now_wall: DateTime<Utc>,
+    ) -> usize {
+        agents.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
+        let mut inner = self.lock();
+        let mut restored = 0;
+        for a in agents {
+            if inner.agents.len() >= self.max_agents {
+                break;
+            }
+            let offline_for = (now_wall - a.last_seen).to_std().unwrap_or_default();
+            if offline_for > OFFLINE_RETENTION || inner.agents.contains_key(a.agent_id.as_str()) {
+                continue;
+            }
+            // 開機不久時單調時鐘可能無法往回推，改以現在起算（最多讓移除晚一點）
+            let since = now.checked_sub(offline_for).unwrap_or(now);
+            let key = (since, inner.next_offline_seq);
+            inner.next_offline_seq += 1;
+            let agent_id: Arc<str> = Arc::from(a.agent_id);
+            inner.offline.insert(key, agent_id.clone());
+            inner.agents.insert(
+                agent_id,
+                AgentState {
+                    // 連線編號從 1 開始，0 不會與任何連線相符
+                    conn_id: 0,
+                    peer: a.peer.into(),
+                    hostname: a.hostname.into(),
+                    agent_version: a.agent_version.into(),
+                    proto: a.proto,
+                    host: a.host.map(Arc::new),
+                    online: false,
+                    offline_after: a.offline_after,
+                    last_seen: since,
+                    last_seen_wall: a.last_seen,
+                    connected_at: a.connected_at,
+                    offline_since: Some(since),
+                    last_report: a.last_report.map(Arc::new),
+                    client_chain: None,
+                    kick: None,
+                    connected: false,
+                    offline_key: Some(key),
+                },
+            );
+            restored += 1;
+        }
+        restored
     }
 
     /// 列出仍有連線（且尚未被通知結束）的 agent 與其客戶端憑證鏈
@@ -1179,6 +1250,93 @@ mod tests {
         assert_eq!(b["display_name"], "Web 01");
         assert_eq!(b["tags"], serde_json::json!(["env:prod"]));
         assert!(b.get("os").is_none(), "{b}");
+    }
+
+    fn restored(
+        agent_id: &str,
+        offline_for: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> RestoredAgent {
+        RestoredAgent {
+            agent_id: agent_id.into(),
+            hostname: format!("host-{agent_id}"),
+            agent_version: "0.2.0".into(),
+            proto: 2,
+            host: Some(HostInfo {
+                host_fingerprint: Some(format!("sha256:{}", "a".repeat(64))),
+                ..Default::default()
+            }),
+            peer: "10.0.0.1:5000".into(),
+            connected_at: now - offline_for - chrono::Duration::hours(1),
+            last_seen: now - offline_for,
+            offline_after: Duration::from_secs(75),
+            last_report: Some(report(3)),
+        }
+    }
+
+    #[test]
+    fn restore_puts_recent_hosts_back_as_offline() {
+        // A6：重新啟動後，清冊中 24 小時內出現過的 agent 以離線狀態回到狀態表
+        let r = Registry::with_max_agents(3);
+        let t0 = Instant::now();
+        let now = Utc::now();
+        let n = r.restore(
+            vec![
+                restored("old", chrono::Duration::hours(25), now),
+                restored("a", chrono::Duration::hours(2), now),
+                restored("b", chrono::Duration::minutes(1), now),
+            ],
+            t0,
+            now,
+        );
+        assert_eq!(n, 2);
+        assert_eq!(r.counts(), (0, 2));
+        r.assert_consistent();
+        let snap = r.snapshot(now);
+        let a = &snap.agents[0];
+        assert_eq!(a.agent_id, "a");
+        assert!(!a.online);
+        assert_eq!(a.proto, 2);
+        assert_eq!(a.last_report.as_ref().map(|l| l.seq), Some(3));
+        assert_eq!(a.last_seen, fmt_time(now - chrono::Duration::hours(2)));
+        assert_eq!(a.offline_after_ms, 75_000);
+
+        // 重新連線：記為「重新上線」，並延續主機指紋的比對
+        let mut info = hello("a", "p");
+        info.host = Some(Arc::new(HostInfo {
+            host_fingerprint: Some(format!("sha256:{}", "b".repeat(64))),
+            ..Default::default()
+        }));
+        let reg = r.register(1, info, t0, now).unwrap();
+        assert_eq!(reg.kind, RegisterKind::Reconnected);
+        assert_eq!(
+            reg.previous_fingerprint,
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        r.assert_consistent();
+        // 舊的離線時間照常計算：b 離線 1 分鐘，24 小時後被移除
+        let res = r.sweep(t0 + OFFLINE_RETENTION);
+        assert_eq!(ids_removed(&res), ["b"]);
+        r.assert_consistent();
+
+        // 已在表中的 agent 不覆寫；超過上限的不放回
+        let r = Registry::with_max_agents(1);
+        assert_eq!(
+            r.restore(
+                vec![
+                    restored("x", chrono::Duration::hours(1), now),
+                    restored("y", chrono::Duration::hours(2), now)
+                ],
+                t0,
+                now
+            ),
+            1
+        );
+        assert_eq!(r.snapshot(now).agents[0].agent_id, "x");
+        assert_eq!(
+            r.restore(vec![restored("x", chrono::Duration::zero(), now)], t0, now),
+            0
+        );
     }
 
     #[test]

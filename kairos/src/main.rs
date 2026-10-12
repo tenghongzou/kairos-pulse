@@ -2,7 +2,9 @@ mod auth;
 mod config;
 mod connection;
 mod expiry;
+mod export_cli;
 mod fsperm;
+mod hosts_cli;
 #[cfg(test)]
 mod integration_tests;
 mod logger;
@@ -15,6 +17,7 @@ mod reload;
 mod retention;
 mod shutdown;
 mod storage;
+mod store;
 #[cfg(test)]
 mod test_pki;
 mod throttle;
@@ -446,8 +449,18 @@ fn main() -> ExitCode {
             println!("{}", VERSION);
             return ExitCode::SUCCESS;
         }
+        // 子命令：查詢後結束，不啟動伺服器、不寫日誌檔
+        Ok(CliAction::Hosts(cmd)) => return ExitCode::from(hosts_cli::run(cmd)),
+        Ok(CliAction::Reports(cmd)) => return ExitCode::from(export_cli::run(cmd)),
+        Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
         Err(e) => {
-            eprintln!("{}\n\n{}", e, USAGE);
+            let usage = match std::env::args_os().nth(1) {
+                Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
+                Some(a) if a == "reports" => export_cli::REPORTS_USAGE,
+                Some(a) if a == "db" => export_cli::DB_USAGE,
+                _ => USAGE,
+            };
+            eprintln!("{}\n\n{}", e, usage);
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -606,7 +619,15 @@ async fn run(
         .collect();
     let listen_auth = config.check_listen_auth(&resolved).map_err(config_error)?;
     warn_if_fd_limit_low(config.server.max_connections);
-    if let Some((max, estimate)) = config.daily_limit_below_estimate() {
+    if let Some((max, estimate)) = config.total_limit_below_estimate() {
+        warn!(
+            "storage.max_total_bytes（{} bytes）小於以 {} 台主機、每 5 秒一筆 report 與目前保留天數估算的容量（約 {} bytes，見 STORAGE.md「容量估算」）；達到上限後會提早刪除最舊的原始 report 與彙總",
+            max, config.server.max_connections, estimate
+        );
+    }
+    if config.storage.writes_jsonl()
+        && let Some((max, estimate)) = config.daily_limit_below_estimate()
+    {
         warn!(
             "storage.max_daily_bytes（{} bytes）小於以 {} 條連線、每條每秒 1 則 report 估算的每日量（約 {} bytes）；達到上限後當天的 report 會回 storage_unavailable 而不寫入",
             max, config.server.max_connections, estimate
@@ -653,7 +674,7 @@ async fn run(
         ),
     }
 
-    // 準備資料目錄與 report 寫入工作（按 UTC 日期分檔，啟動時與每小時清除過期檔案）
+    // 準備資料目錄與 report 的儲存（SQLite 或 JSONL，見 store 模組）
     let paths = storage::prepare_data_dir(Path::new(&config.storage.data_dir)).await?;
     // 既有的資料、日誌目錄對其他使用者開放時提醒（S3；Kairos 不自行改變既有目錄的權限）
     for (dir, what) in [
@@ -664,14 +685,12 @@ async fn run(
             warn!("{}", message);
         }
     }
-    let (reports, writer_task) = storage::start_report_writer(
-        paths.data_dir.clone(),
-        config.storage.retention_days,
-        config.storage.max_daily_bytes,
-        chrono::Utc::now,
-        storage::RETENTION_SWEEP_INTERVAL,
-    )
-    .await?;
+    let store::Storage {
+        reports,
+        writer: writer_task,
+        inventory,
+        restored,
+    } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
 
     let listener = TcpListener::bind(&config.server.listen)
         .await
@@ -693,6 +712,14 @@ async fn run(
     }
 
     let registry = Arc::new(Registry::with_max_agents(config.max_agents()));
+    // 主機清冊中最近 24 小時出現過的主機以離線狀態放回狀態表（A6）
+    if !restored.is_empty() {
+        let n = registry.restore(restored, Instant::now(), chrono::Utc::now());
+        info!(
+            "已從主機清冊載回 {} 台最近 24 小時內出現過的主機（離線）",
+            n
+        );
+    }
     let writer = supervise(
         "report 寫入工作",
         tokio::spawn(writer_task),
@@ -705,6 +732,7 @@ async fn run(
         tokio::spawn(monitor::run(
             registry.clone(),
             paths.clone(),
+            inventory.clone(),
             monitor_stop.clone(),
         )),
         shutdown.clone(),
@@ -819,6 +847,10 @@ async fn run(
         info!("將 {} 個仍在線上的 agent 標記為離線", forced);
     }
 
+    // 最後一份狀態（所有 agent 已標為離線）交給 writer，結束前寫入主機清冊
+    if let Some(feed) = &inventory {
+        feed.send_replace(Some(Arc::new(registry.snapshot(chrono::Utc::now()))));
+    }
     // 釋放最後一個 report sender，writer 取完佇列、寫入並逐筆回覆後結束
     let pending = ctx.reports.pending();
     drop(ctx);
