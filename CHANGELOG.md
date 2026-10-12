@@ -1,10 +1,40 @@
 # 變更紀錄
 
-本檔案記錄 Kairos、Pulse 與共用 crate 值得注意的變更，格式依 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)。兩個產品尚未有正式版號，發佈包以 commit 識別（`kairos-<commit>-linux-x86_64.tar.gz`、`pulse-<commit>-linux-x86_64.tar.gz`），因此目前只有 `[Unreleased]` 區段。
+本檔案記錄 Kairos、Pulse 與共用 crate 值得注意的變更，格式依 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)。
+
+Kairos 與 Pulse 自 0.2.0 起各自採用 [SemVer](https://semver.org/lang/zh-TW/)：`--version` 印出 `<名稱> <版本> (<commit>)`，發佈包為 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz`。1.0 之前，破壞性變更升 MINOR（0.2 → 0.3），其餘升 PATCH。0.2.0 之前的建置一律顯示 `0.1.0 (<commit>)`，只能以 commit 區分。版本規則、打 tag 與發佈流程見 [RELEASING.md](RELEASING.md)（只在原始碼 repo 中）。
 
 各項後的代號（例如 S1、A11）對應商業審計的項目編號。
 
+## 版本相容矩陣〔草稿〕
+
+Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以 commit 識別的所有建置，各 commit 之間的細節見 Kairos README 的「升級注意事項（與 Pulse 混用版本）」。
+
+| Kairos ＼ Pulse | Pulse 0.1.0 | Pulse 0.2.0 |
+|---|---|---|
+| **Kairos 0.1.0** | 依舊版說明 | 相容（協定 v1）。Kairos `timeouts.write_secs` 大於約 8 秒的舊版（`572b955` 之前）在寫檔緩慢時 Pulse 可能誤判斷線；Pulse 的預設心跳改為 15 秒，離線判定變為約 75 秒 |
+| **Kairos 0.2.0** | **有條件**：`44dcee5` 之前的 Pulse 在主機名稱含格式字元（Cf）時、`44dcee5` 在主機名稱含 U+034F、Hangul filler、變體選擇字元或私用區字元時**無法註冊**；舊版 Pulse 的讀取閒置計算方式在心跳較大時可能誤斷線。請先升級 Pulse | **相容（建議組合）** |
+
+- 兩個產品之間的協定目前都是 v1。協定 v2（版本協商，審計 A3）合併後，本表要補上 v1／v2 混用的行為與最低版本。
+- 升級順序一律為：先升級全部 Pulse，再升級 Kairos（或同時升級）。
+
+## 支援期限〔草稿〕
+
+> 以下為待使用者決定的草稿，數字皆為建議值，尚未對外承諾。
+
+| 項目 | 建議 |
+|---|---|
+| 支援的版本線 | 最新的 MINOR 版本線（目前 0.2.x）提供錯誤與安全性修正（PATCH） |
+| 前一個版本線 | 新的 MINOR 版本發佈後〔待定：建議 6 個月〕內只提供安全性修正，之後終止支援 |
+| PATCH 版本 | 同一 MINOR 版本線內不含破壞性變更，可直接升級 |
+| Kairos／Pulse 混用 | 保證相鄰兩個 MINOR 版本線可以混用（例如 Kairos 0.3 搭配 Pulse 0.2），以便分批升級〔待定〕 |
+| 終止支援通知 | 至少提前〔待定：建議 3 個月〕在本檔案與發佈公告中通知 |
+| 平台 | Linux x86_64（musl 靜態連結）、systemd 247 以上；其他平台目前不提供發佈包 |
+| 1.0 之後 | 另訂長期支援（LTS）政策〔待定〕 |
+
 ## [Unreleased]
+
+預定發佈為 **Kairos 0.2.0**、**Pulse 0.2.0**（`Cargo.toml` 已是 0.2.0，尚未打 tag；發佈時本標題改為版本與日期，見 RELEASING.md）。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -92,3 +122,21 @@
 
 - 協定規格只留一份：`crates/kairos-proto/PROTOCOL.md`。`kairos/PROTOCOL.md`、`pulse/PROTOCOL.md` 改為指向它的說明，發佈包內附的仍是完整規格。協定測試以 `include_str!` 直接從規格的「範例」節解析測試向量、比對「錯誤碼」表，取代兩個產品各自寫死的複本。
 - 規格中 Pulse 讀取閒置的範例數值依新的預設心跳更新（15 秒時為 30 秒）。
+
+### 發佈與建置
+
+#### 新增
+
+- **版本號**：Kairos、Pulse 改為 0.2.0 並採用 SemVer，`--version` 為 `<名稱> 0.2.0 (<commit>)`；共用 crate 維持 0.1.0（內部 crate，不單獨發佈）。版本規則、打 tag 與發佈流程見 `RELEASING.md`（B3）。
+- **簽章**：發佈處提供 `SHA256SUMS.sig`（`ssh-keygen -Y sign`，namespace `kairos-pulse-release`）。INSTALL 第 2 節的驗證改為先以 `ssh-keygen -Y verify` 驗簽章、再 `sha256sum -c --ignore-missing`；發佈公鑰 `allowed_signers` 須從另一個管道取得並核對指紋（D2）。
+- **第三方授權聲明**：發佈包新增 `THIRD-PARTY-LICENSES`（cargo-about 依 `Cargo.lock` 產生，含各依賴的授權全文），INSTALL 的安裝與升級步驟一併把它與 `CHANGELOG.md` 複製到 `/opt/<產品>/`（B2）。
+- **SBOM**：發佈包新增 `<名稱>.cdx.json`（CycloneDX 1.5，cargo-cyclonedx 產生），發佈處另附一份 `<名稱>-<版本>-<commit>-linux-x86_64.cdx.json`（D4）。
+- `packaging/release.sh`：檢查工作目錄乾淨、執行 fmt／clippy／test／deny 後打包兩個產品，提供私鑰時簽章；`packaging/sign-release.sh`：簽章與驗證；`packaging/check-reproducible.sh`：以兩個全新的建置環境各建置一次並比對雜湊（D3、D4）。
+- CI 新增 `package` job：Linux 與 Windows 的 fmt、clippy、test 與 cargo deny 都通過後才打包，產出兩個發佈包、SBOM 與合併版 `SHA256SUMS`（artifact，不簽章）；push 到 `main` 與手動觸發時另跑可重現性檢查（D3、D4）。
+
+#### 變更
+
+- **發佈包檔名加入版本**：`kairos-<commit>-linux-x86_64.tar.gz` → `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（Pulse 相同），依檔名下載或解壓的自動化腳本需要調整。
+- 兩個產品的打包腳本都輸出到 repo 根目錄的 `dist/`，`SHA256SUMS` 改為兩個產品共用的合併清單（修正每次打包都覆寫成只剩單一套件的問題，D2）。
+- 建置 image 以 `@sha256:` digest 固定，唯一需要 `apk add` 的 GNU tar 鎖定版本（D4）。
+- 建置來源改用 `git archive` 匯出的 commit 內容，不再掛載工作目錄：Windows（`core.autocrlf=true`）上打出的發佈包中文件與範例設定原本是 CRLF，Pulse 嵌入的預設設定也因此與 Linux 上建置的不同；現在與主機的行尾設定無關。
