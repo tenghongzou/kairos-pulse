@@ -280,8 +280,8 @@ unit 重點（內容見 `kairos.service`）：
 | `ExecStart` | `/opt/kairos/kairos --config /opt/kairos/kairos.toml` | 明確指定設定檔，檔案不存在時啟動即報錯（不會默默使用預設值） |
 | `LimitNOFILE` | `8192` | 需大於 `server.max_connections` + 64；Ubuntu 預設 soft limit 1024 在預設的 1024 條連線下會記 `WARN`。不足時 `WARN` 會附上建議值（預設設定下為 4096），8192 已足夠，並保留調高 `max_connections` 的餘裕 |
 | `KillSignal`／`TimeoutStopSec` | `SIGINT`／`10` | Kairos 收到訊號後最壞約 3 秒正常關機（看門狗 4 秒） |
-| `Restart` | `on-failure` | 背景工作異常時 Kairos 以結束代碼 1 結束，交由 systemd 重啟；正常停止（結束代碼 0）不重啟 |
-| `RestartPreventExitStatus` | `3` | 設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）以結束代碼 3 結束，重試也不會成功，不重啟；修正後 `systemctl restart kairos`。`systemctl status kairos` 會顯示 `status=3` |
+| `Restart` | `on-failure` | 背景工作異常時 Kairos 以結束代碼 1 結束，交由 systemd 重啟；連接埠被佔用（11，例如舊的行程還沒結束）也會重試；正常停止（結束代碼 0）不重啟 |
+| `RestartPreventExitStatus` | `2 3 4` | 重試也不會成功的錯誤不重啟：2 命令列參數錯誤、3 設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）、4 憑證錯誤（伺服器憑證、私鑰、client CA、CRL 無法讀取、格式錯誤或不成對）。`systemctl status kairos` 會顯示 `status=2`／`3`／`4`，修正後 `systemctl restart kairos` |
 | `ProtectSystem=strict` + `ReadWritePaths` | `data`、`logs` | 其餘檔案系統唯讀。熱重載只**讀取**憑證、私鑰、CA 與 CRL，管理者在主機上覆寫檔案後服務內立即可見，不受影響 |
 | `ProtectHome`、`PrivateTmp`、`NoNewPrivileges` 等 | | 一般硬化；憑證與設定不可放在 `/home`、`/root` 之下 |
 
@@ -326,6 +326,8 @@ cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於�
 ```
 
 - `systemctl status kairos` 顯示 `(code=exited, status=3)` 且服務停在 `failed`、沒有重試：設定錯誤，用 `journalctl -u kairos -n 30` 看錯誤訊息，修正 `kairos.toml` 後 `systemctl restart kairos`。
+- 顯示 `status=4` 且停在 `failed`：憑證錯誤（伺服器憑證、私鑰、`client-ca.pem`、CRL 讀不到、格式錯誤或憑證與私鑰不成對；常見原因是檔案權限或路徑），錯誤訊息在 `journalctl -u kairos -n 30` 與 `logs/`。修正後 `systemctl restart kairos`。`status=2` 為 `ExecStart` 的命令列參數錯誤。
+- 顯示 `status=11` 並每 5 秒重試：`server.listen` 的連接埠被其他程式佔用（`ss -ltnp | grep :8080` 查看是誰）。
 - 啟動失敗並出現 `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動`：`kairos.toml` 沒有設定 `auth.client_ca`。依第 6、7 節啟用 mTLS。
 - 出現 `未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 …（auth.allow_unauthenticated = true）` 的 `WARN`：設定了 `auth.allow_unauthenticated = true`，正式環境不可如此。
 - 出現 `CRL … 將在 … 後過期` 或 `伺服器憑證 … 將在 … 後到期` 的 `WARN`（已過期時為 `ERROR`）：依第 10.1、10.3 節更新。
@@ -411,7 +413,7 @@ systemctl list-timers kairos-crl.timer
 
 **未啟用 mTLS 的部署請先處理**：從舊版升級時，若 `kairos.toml` 的 `server.listen` 是非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca`，新版會拒絕啟動（舊版只記 `WARN`）。升級前先依第 6、7 節啟用 mTLS；只有隔離的測試環境才在 `[auth]` 加上 `allow_unauthenticated = true`。
 
-**換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=3`（設定錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
+**換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
 **升級順序：先升級全部 Pulse，再升級 Kairos**（或同時升級）。新版 Pulse 會替換新版 Kairos 禁止的主機名稱字元，連舊版 Kairos 不受影響；反過來，舊版 Pulse 連新版 Kairos 可能無法註冊（細節見 `README.md`「升級注意事項」）。
 

@@ -1,6 +1,7 @@
 use config::{Config, ConfigError, Environment, File, FileFormat, Map};
 use log::LevelFilter;
 use serde::Deserialize;
+use tokio_rustls::rustls::pki_types::ServerName;
 
 /// 編譯時嵌入的預設設定。
 const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
@@ -180,6 +181,13 @@ impl AppConfig {
                 "server.domain 不可為空字串（TLS 以此驗證伺服器憑證的名稱）".to_string(),
             ));
         }
+        // 與 tls::build 相同的檢查；在這裡先檢查，讓它歸類為設定錯誤（結束代碼 3）而不是憑證錯誤
+        let domain = self.server.domain.trim();
+        if let Err(e) = ServerName::try_from(domain.to_string()) {
+            return Err(ConfigError::Message(format!(
+                "server.domain「{domain}」不是有效的 DNS 名稱或 IP 位址：{e}"
+            )));
+        }
         range(
             "heartbeat.interval",
             self.heartbeat.interval,
@@ -332,6 +340,23 @@ mod tests {
         assert!(AppConfig::build(None, Some(env(&[("PULSE__SERVER__PORT", "65536")]))).is_err());
         let cfg = AppConfig::build(None, Some(env(&[("PULSE__SERVER__PORT", "65535")]))).unwrap();
         assert_eq!(cfg.server.port, 65535);
+    }
+
+    #[test]
+    fn invalid_domain_is_a_config_error() {
+        // 不是有效的 DNS 名稱或 IP 位址：設定錯誤（結束代碼 3），而不是等到建立 TLS 設定時才失敗
+        for bad in ["bad domain", "kairos..example.com", "-"] {
+            let err = build_err(&[("PULSE__SERVER__DOMAIN", bad)]);
+            assert!(
+                err.contains("server.domain") && err.contains(bad),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["kairos.example.com", "localhost", "127.0.0.1", "::1"] {
+            let cfg =
+                AppConfig::build(None, Some(env(&[("PULSE__SERVER__DOMAIN", good)]))).unwrap();
+            assert_eq!(cfg.server.domain, good);
+        }
     }
 
     #[test]
