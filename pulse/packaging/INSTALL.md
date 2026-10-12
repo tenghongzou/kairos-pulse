@@ -393,7 +393,7 @@ tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄�
 - 以 `systemctl edit pulse` 建立的 drop-in 只套用到 `pulse.service`，`pulse-N` 需要時要各自 `systemctl edit pulse-N`。
 - 升級後 `pulse.service` 有變動時，重做步驟 2 重新產生 `pulse-N.service`，再 `systemctl daemon-reload`。
 
-多個實例都從同一個 IP 連入 Kairos，Kairos 端可能需要調高 `server.max_connections_per_ip`（見 Kairos 的 `README.md`）。
+多個實例都從同一個 IP 連入 Kairos。Kairos 0.2.0 起啟用 mTLS 時，連線通過 hello 後改依憑證身分（agent_id）計數，同一個 IP 的實例數不受 `server.max_connections_per_ip` 限制（它只限制握手前與握手中的連線）；連舊版 Kairos 或未啟用 mTLS 時，才可能需要調高 `server.max_connections_per_ip` 或把該位址加入 `server.per_ip_allowlist`（見 Kairos 的 `README.md`「每 IP 上限、NAT 與網段允許清單」）。
 
 ## 10. 升級
 

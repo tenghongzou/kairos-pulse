@@ -216,7 +216,7 @@ TLS 失敗時，Pulse 會在重連日誌中附上具體原因，例如：
 | 伺服器憑證的簽發者不受信任 | 伺服器憑證不受信任…請以 server.ca_cert 指定 |
 | 伺服器憑證名稱與 `server.domain` 不符 | 伺服器憑證的名稱與 server.domain「…」不符 |
 | 伺服器憑證被標記為 CA | 伺服器憑證被標記為 CA（basicConstraints CA:TRUE）…加上 basicConstraints=critical,CA:FALSE |
-| TLS 握手完成前連線就被關閉（例如超過 Kairos 的每 IP 連線上限 `server.max_connections_per_ip`，多台代理經同一個 NAT 連入時常見；或超過新連線速率、伺服器握手中的連線數上限） | 伺服器在 TLS 握手完成前就關閉了連線：可能超過伺服器的每 IP 連線上限（同一 IP 位址的連線過多）、新連線速率過快（同一 IP，IPv6 為同一 /64）或伺服器握手中的連線過多，或伺服器正在重新啟動、連到的連接埠不是 TLS 服務 |
+| TLS 握手完成前連線就被關閉（例如超過 Kairos 的每 IP 連線上限 `server.max_connections_per_ip`：舊版 Kairos 或未啟用 mTLS 時多台代理經同一個 NAT 連入常見，新版 Kairos 啟用 mTLS 時只計算握手前與握手中的連線，大量代理同時重連時仍可能發生；或超過新連線速率、伺服器握手中的連線數上限） | 伺服器在 TLS 握手完成前就關閉了連線：可能超過伺服器的每 IP 連線上限（同一 IP 位址的連線過多）、新連線速率過快（同一 IP，IPv6 為同一 /64）或伺服器握手中的連線過多，或伺服器正在重新啟動、連到的連接埠不是 TLS 服務 |
 
 TLS 1.3 下伺服器在握手**之後**才驗證客戶端憑證，拒絕時送出的 alert 可能因連線被立即重設而收不到。Pulse 會記錄伺服器在握手時是否送出了客戶端憑證要求（CertificateRequest），因此即使沒收到 alert 也能指出是客戶端憑證的問題。
 
