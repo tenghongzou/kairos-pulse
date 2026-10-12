@@ -42,6 +42,38 @@ pub const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 /// 主機清冊與狀態表同步的間隔
 pub const INVENTORY_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
+/// durable report 的取樣時間（`ts`）最多可以早於收到的時間多久：Pulse `buffer.max_age_hours` 的上限
+/// （1 年）再加 2 天餘裕。更早的視為 client 時鐘錯誤，改以收到的時間保存與彙總
+pub const MAX_SAMPLE_AGE: Duration = Duration::from_secs(367 * 86_400);
+
+/// durable report 的取樣時間最多可以晚於收到的時間多久（client 時鐘偏快）；更晚的改用收到的時間
+pub const MAX_SAMPLE_AHEAD: Duration = Duration::from_secs(5 * 60);
+
+/// report 的取樣時間（Unix 毫秒）：SQLite 的 `reports.ts`，決定彙總的桶、保留期限與匯出的範圍。
+///
+/// - durable report（帶去重鍵，可能是補送的歷史資料）：client 的 `ts`，須為 RFC 3339 且落在收到時間的
+///   [−[`MAX_SAMPLE_AGE`], +[`MAX_SAMPLE_AHEAD`]] 之內；
+/// - 其他 report、或 `ts` 無法解析、超出範圍：收到的時間（與 0.2 的 JSONL 相同，不受 client 時鐘影響）。
+///
+/// client 原本的 `ts` 字串另外原樣保存（`reports.agent_ts`），收到的時間由 `recv_lag` 還原
+pub fn sample_time_ms(record: &ReportRecord) -> i64 {
+    let recv = record.recv_at.timestamp_millis();
+    if record.dedup.is_none() {
+        return recv;
+    }
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&record.ts) else {
+        return recv;
+    };
+    let ts = ts.timestamp_millis();
+    let age = i64::try_from(MAX_SAMPLE_AGE.as_millis()).unwrap_or(i64::MAX);
+    let ahead = i64::try_from(MAX_SAMPLE_AHEAD.as_millis()).unwrap_or(i64::MAX);
+    if ts >= recv.saturating_sub(age) && ts <= recv.saturating_add(ahead) {
+        ts
+    } else {
+        recv
+    }
+}
+
 /// report 儲存後端：同步 API，只在 writer 的 blocking 執行緒上呼叫
 pub trait ReportStore: Send + 'static {
     /// 在一個交易中寫入一批 report（呼叫端已認領每一筆），回傳每筆的結果（順序與輸入相同）：

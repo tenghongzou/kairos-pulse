@@ -1079,3 +1079,372 @@ fn read_only_queries_work_while_the_writer_is_open() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- durable 補送的歷史資料：取樣時間、遲到資料併入已寫出的彙總、結果不明後的重送 ----
+
+/// durable report：`recv_at` 收到、取樣時間為 `ts`
+fn durable(
+    agent: &str,
+    seq: u64,
+    recv_at: DateTime<Utc>,
+    ts: DateTime<Utc>,
+    cpu: f32,
+    report_seq: u64,
+) -> ReportRecord {
+    let mut r = legacy(agent, seq, recv_at, cpu);
+    r.ts = crate::storage::fmt_time(ts);
+    r.with_dedup(dedup("0b1c2d3e-0000-4000-8000-0000000000aa", report_seq))
+}
+
+/// CPU 序列在某個彙總表、某個桶的 (vmin, vmax, vsum, cnt)
+fn cpu_rollup(
+    store: &mut SqliteStore,
+    table: &str,
+    bucket: DateTime<Utc>,
+) -> Option<(f64, f64, f64, i64)> {
+    store.ensure_ready().unwrap();
+    store
+        .conn
+        .as_ref()
+        .unwrap()
+        .query_row(
+            &format!(
+                "SELECT vmin, vmax, vsum, cnt FROM {table} JOIN series USING (series_id)
+                 WHERE name = 'system.cpu.usage' AND bucket = ?1"
+            ),
+            [bucket.timestamp()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .unwrap()
+}
+
+#[test]
+fn sample_time_is_the_client_ts_only_for_durable_reports_within_range() {
+    let recv = noon();
+    let at = |ts: &str| {
+        let mut r = legacy(A, 1, recv, 1.0);
+        r.ts = ts.into();
+        r
+    };
+    let with_key = |r: ReportRecord| r.with_dedup(dedup("b", 1));
+    let ms = |t: DateTime<Utc>| t.timestamp_millis();
+    // 非 durable：一律為收到的時間（與 0.2 相同，不受 client 時鐘影響）
+    assert_eq!(sample_time_ms(&at("2026-10-01T00:00:00.000Z")), ms(recv));
+    // durable：client 的 ts（任何 RFC 3339 寫法），補送 7 天、甚至 1 年前的資料都照收
+    let week_ago = recv - chrono::Duration::days(7);
+    assert_eq!(
+        sample_time_ms(&with_key(at(&crate::storage::fmt_time(week_ago)))),
+        ms(week_ago)
+    );
+    assert_eq!(
+        sample_time_ms(&with_key(at("2026-10-09T20:00:00+08:00"))),
+        ms(recv)
+    );
+    let year_ago = recv - chrono::Duration::days(366);
+    assert_eq!(
+        sample_time_ms(&with_key(at(&crate::storage::fmt_time(year_ago)))),
+        ms(year_ago)
+    );
+    // 超出範圍（client 時鐘錯誤）或無法解析：收到的時間
+    for ts in [
+        crate::storage::fmt_time(recv - chrono::Duration::days(368)),
+        crate::storage::fmt_time(recv + chrono::Duration::minutes(6)),
+        "not a time".to_string(),
+    ] {
+        assert_eq!(sample_time_ms(&with_key(at(&ts))), ms(recv), "{ts}");
+    }
+    // 稍微偏快（5 分鐘內）：照用
+    let ahead = recv + chrono::Duration::minutes(4);
+    assert_eq!(
+        sample_time_ms(&with_key(at(&crate::storage::fmt_time(ahead)))),
+        ms(ahead)
+    );
+}
+
+#[test]
+fn late_samples_are_merged_into_flushed_rollups_by_sample_time() {
+    settable_clock!(clock, NOW);
+    set_clock(&NOW, noon());
+    let dir = temp_dir("late");
+    let (mut store, _) = open(&dir, clock);
+    // 即時資料：12:00 的桶，12:05:20 寫出
+    store.write(&[legacy(A, 1, noon(), 10.0)]);
+    store.write(&[legacy(A, 2, noon() + chrono::Duration::seconds(60), 30.0)]);
+    let now = noon() + chrono::Duration::seconds(320);
+    set_clock(&NOW, now);
+    while store.maintain() {}
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", noon()),
+        Some((10.0, 30.0, 40.0, 2))
+    );
+
+    // 補送：取樣時間 12:01（桶已寫出）與 11:00（更早，還沒有這個桶），12:05:20 收到
+    let t1 = noon() + chrono::Duration::seconds(60);
+    let t0 = noon() - chrono::Duration::hours(1);
+    assert_eq!(
+        store.write(&[
+            durable(A, 3, now, t1, 50.0, 1),
+            durable(A, 4, now, t0, 5.0, 2)
+        ]),
+        [WriteStatus::Written, WriteStatus::Written]
+    );
+    // 在同一個交易中合併進已寫出的桶（累加，不覆蓋）；更早的桶新增一列；不進記憶體
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", noon()),
+        Some((10.0, 50.0, 90.0, 3))
+    );
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_1h", noon()),
+        Some((10.0, 50.0, 90.0, 3))
+    );
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", t0),
+        Some((5.0, 5.0, 5.0, 1))
+    );
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_1h", t0),
+        Some((5.0, 5.0, 5.0, 1))
+    );
+    assert_eq!(store.rollup.len(), 0);
+    // 原始資料以取樣時間保存，收到的時間由 recv_lag 還原
+    assert_eq!(
+        count(&mut store, "SELECT ts FROM reports WHERE report_seq = 1"),
+        t1.timestamp_millis()
+    );
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT recv_lag FROM reports WHERE report_seq = 1"
+        ),
+        (now - t1).num_milliseconds()
+    );
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT count(*) FROM reports WHERE recv_lag IS NULL"
+        ),
+        2,
+        "即時資料不存 recv_lag"
+    );
+    // 重送（結果不明後）：Duplicate，彙總不變
+    assert_eq!(
+        store.write(&[durable(A, 9, now, t1, 50.0, 1)]),
+        [WriteStatus::Duplicate]
+    );
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", noon()),
+        Some((10.0, 50.0, 90.0, 3))
+    );
+    // 匯出：recv_at 為收到的時間、ts 為原本的取樣時間
+    let conn = open_read_only(&dir.join(DB_FILE)).unwrap();
+    let mut lines = Vec::new();
+    export_reports(&conn, t1.timestamp_millis(), Some(A), |r| {
+        lines.push(r.clone());
+        Ok(())
+    })
+    .unwrap();
+    let backfilled = lines.iter().find(|r| r.seq == 3).unwrap();
+    assert_eq!(backfilled.recv_at, now);
+    assert_eq!(backfilled.ts, crate::storage::fmt_time(t1));
+    assert!(lines.iter().all(|r| r.seq != 4), "11:00 的取樣早於 --since");
+    drop(conn);
+
+    // 當掉後重新開啟：直接合併的值不會再被補回一次
+    drop(store);
+    let (mut store, _) = open(&dir, clock);
+    assert_eq!(store.rollup.len(), 0);
+    set_clock(&NOW, noon() + chrono::Duration::hours(2));
+    while store.maintain() {}
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_1h", noon()),
+        Some((10.0, 50.0, 90.0, 3))
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_backfilled_bucket_is_flushed_once_after_it_is_complete() {
+    settable_clock!(clock, NOW);
+    set_clock(&NOW, noon());
+    let dir = temp_dir("backfill");
+    let (mut store, _) = open(&dir, clock);
+    // 新主機補送 3 天前的資料：桶早已結束，但補送進行中（每 0.6 秒一筆）不寫出
+    let base = at(2026, 10, 6, 0, 0, 0);
+    for i in 0..10u64 {
+        let ts = base + chrono::Duration::seconds(i as i64 * 5);
+        assert_eq!(
+            store.write(&[durable(B, i + 1, clock(), ts, i as f32, i + 1)]),
+            [WriteStatus::Written]
+        );
+        set_clock(&NOW, clock() + chrono::Duration::milliseconds(600));
+    }
+    assert!(store.rollup.has_ready(clock().timestamp_millis()));
+    while store.maintain() {}
+    assert_eq!(cpu_rollup(&mut store, "rollup_5m", base), None);
+    assert_eq!(store.rollup.len(), 3);
+    // 15 秒沒有新值：一次寫出整個桶，rollup_until 推進到桶的結束
+    set_clock(&NOW, clock() + chrono::Duration::seconds(15));
+    while store.maintain() {}
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", base),
+        Some((0.0, 9.0, 45.0, 10))
+    );
+    assert_eq!(
+        count(&mut store, "SELECT rollup_until FROM hosts"),
+        (base + chrono::Duration::minutes(5)).timestamp_millis()
+    );
+    // 之後才到的同一個桶的值（例如在途的那幾筆）直接合併
+    store.write(&[durable(
+        B,
+        11,
+        clock(),
+        base + chrono::Duration::seconds(50),
+        100.0,
+        11,
+    )]);
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", base),
+        Some((0.0, 100.0, 145.0, 11))
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn after_an_unknown_commit_the_resent_report_is_rolled_up_exactly_once() {
+    // 提交結果不明 → 連線不回應並關閉 → Pulse 重送：唯一索引判定重複（不重寫），
+    // 記憶體中的彙總由原始資料重建，那一筆的值仍只算一次
+    settable_clock!(clock, NOW);
+    set_clock(&NOW, noon());
+    let dir = temp_dir("unknown-resend");
+    let (mut store, _) = open(&dir, clock);
+    store.write(&[legacy(A, 1, noon(), 10.0)]);
+    let t = noon() + chrono::Duration::seconds(1);
+    store.fail_next = Some(FailPoint::CommitUnknown);
+    let results = store.write(&[durable(A, 2, t, t, 20.0, 1)]);
+    assert!(
+        matches!(&results[0], WriteStatus::Unknown(_)),
+        "{results:?}"
+    );
+    // 重連後重送（新的 seq，相同的去重鍵）
+    assert_eq!(
+        store.write(&[durable(A, 1, t, t, 20.0, 1)]),
+        [WriteStatus::Duplicate]
+    );
+    assert_eq!(count(&mut store, "SELECT count(*) FROM reports"), 2);
+    set_clock(&NOW, noon() + chrono::Duration::seconds(320));
+    while store.maintain() {}
+    assert_eq!(
+        cpu_rollup(&mut store, "rollup_5m", noon()),
+        Some((10.0, 20.0, 30.0, 2))
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn inventory_sync_is_written_in_short_transactions() {
+    let dir = temp_dir("sync-chunks");
+    let (mut store, _) = open(&dir, noon);
+    store.opts.max_hosts = 10_000;
+    let n = INVENTORY_CHUNK_ROWS * 2 + 100;
+    let agents: Vec<String> = (0..n)
+        .map(|i| format!("00000000-0000-4000-8000-{i:012x}"))
+        .collect();
+    let snap = |online| {
+        snapshot(
+            agents
+                .iter()
+                .map(|a| agent_snapshot(a, online, noon()))
+                .collect(),
+        )
+    };
+    // 第一次同步：只寫入一批，其餘留給之後的維護步驟；中間照常寫入 report
+    assert_eq!(store.sync(&snap(true)).unwrap(), INVENTORY_CHUNK_ROWS);
+    assert_eq!(store.pending_inventory.len(), n - INVENTORY_CHUNK_ROWS);
+    assert_eq!(
+        store.write(&[legacy(A, 1, noon(), 1.0)]),
+        [WriteStatus::Written]
+    );
+    assert!(store.maintain());
+    assert_eq!(store.pending_inventory.len(), 100);
+    assert!(store.maintain());
+    assert!(store.pending_inventory.is_empty());
+    assert_eq!(
+        count(&mut store, "SELECT count(*) FROM hosts WHERE online = 1"),
+        n as i64 + 1
+    );
+    // 已寫入的不再寫
+    assert_eq!(store.sync(&snap(true)).unwrap(), 0);
+    // 關機：最後一份快照（全部離線）在關閉前寫完
+    assert_eq!(store.sync(&snap(false)).unwrap(), INVENTORY_CHUNK_ROWS);
+    store.close();
+    drop(store);
+    let conn = open_read_only(&dir.join(DB_FILE)).unwrap();
+    let offline: i64 = conn
+        .query_row("SELECT count(*) FROM hosts WHERE online = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(offline, n as i64);
+    drop(conn);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 主機清冊第一次同步 1 萬台的耗時（`kairos/STORAGE.md`「量測」）：分批（每批
+/// [`INVENTORY_CHUNK_ROWS`] 列）時每個交易的最長耗時，與一次寫入 1 萬列的單一交易比較。
+/// `cargo test -p kairos --release -- --ignored --nocapture inventory_sync_timing`
+#[test]
+#[ignore = "量測，手動執行"]
+fn inventory_sync_timing() {
+    let hosts: usize = std::env::var("KP_BENCH_HOSTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let agents: Vec<String> = (0..hosts)
+        .map(|i| format!("00000000-0000-4000-8000-{i:012x}"))
+        .collect();
+    let snap = snapshot(
+        agents
+            .iter()
+            .map(|a| agent_snapshot(a, true, noon()))
+            .collect(),
+    );
+    // 分批
+    let dir = temp_dir("sync-timing");
+    let (mut store, _) = open(&dir, noon);
+    store.opts.max_hosts = hosts * 2;
+    let started = Instant::now();
+    let t = Instant::now();
+    store.sync(&snap).unwrap();
+    let mut chunks = vec![t.elapsed()];
+    while !store.pending_inventory.is_empty() {
+        let t = Instant::now();
+        store.sync_chunk().unwrap();
+        chunks.push(t.elapsed());
+    }
+    let total = started.elapsed();
+    let max = chunks.iter().max().copied().unwrap_or_default();
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+    // 單一交易（改成分批前的行為）
+    let dir = temp_dir("sync-timing-single");
+    let (mut store, _) = open(&dir, noon);
+    store.opts.max_hosts = hosts * 2;
+    let rows: Vec<InventoryRow> = snap
+        .agents
+        .iter()
+        .map(|a| InventoryRow::of(a, true))
+        .collect();
+    let t = Instant::now();
+    store.write_inventory(&rows).unwrap();
+    let single = t.elapsed();
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!(
+        "BENCH inventory hosts={hosts} chunk_rows={INVENTORY_CHUNK_ROWS} chunks={} chunked_total={total:?} chunk_max={max:?} single_transaction={single:?}",
+        chunks.len()
+    );
+}

@@ -31,10 +31,52 @@ fn unix_ms(ts: &str) -> i64 {
     ((days * 24 + n(11..13)) * 60 + n(14..16)) * 60_000 + n(17..19) * 1000 + n(20..23)
 }
 
+/// Unix 毫秒 → `YYYY-MM-DDTHH:MM:SS.mmmZ`（[`unix_ms`] 的反函數）
+fn iso_ms(ms: i64) -> String {
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // civil from days（Howard Hinnant 的演算法）
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000
+    )
+}
+
+/// 補送的取樣時間：約 3 小時前（Kairos 以取樣時間保存與套用保留期限，不能寫死日期）
+fn sample_ts(report_seq: u64) -> String {
+    static BASE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        (now - 3 * 3_600_000) / 1000 * 1000
+    });
+    iso_ms(base + report_seq as i64 * 1000)
+}
+
 #[test]
 fn unix_ms_matches_known_values() {
     assert_eq!(unix_ms("1970-01-01T00:00:00.000Z"), 0);
     assert_eq!(unix_ms("2026-10-08T03:15:45.210Z"), 1_791_429_345_210);
+    for t in [
+        "1970-01-01T00:00:00.000Z",
+        "2026-10-08T03:15:45.210Z",
+        "2028-02-29T23:59:59.999Z",
+    ] {
+        assert_eq!(iso_ms(unix_ms(t)), t);
+    }
 }
 
 /// 資料檔中某 agent 的 durable 行：boot_id → [(report_seq, ts, recv_at)]
@@ -138,7 +180,7 @@ fn durable_hello(agent_id: &str) -> Value {
 
 fn durable_report(seq: u64, boot_id: &str, report_seq: u64) -> Value {
     json!({
-        "type": "report", "seq": seq, "ts": format!("2026-10-08T03:15:{:02}.000Z", report_seq),
+        "type": "report", "seq": seq, "ts": sample_ts(report_seq),
         "metrics": [
             {"name": "system.cpu.usage", "value": 12.5, "unit": "%"},
             {"name": "system.memory.total", "value": 2048, "unit": "By"},
@@ -205,7 +247,10 @@ fn resend_after_unknown_result_is_acked_but_not_written_twice() {
         .into_iter()
         .find(|r| r["report_seq"] == 3)
         .unwrap();
-    assert_eq!(line["ts"], "2026-10-08T03:15:03.000Z", "{line}");
+    assert_eq!(line["ts"], sample_ts(3), "{line}");
+    // 收到的時間（匯出的 recv_at）比取樣時間晚約 3 小時
+    let lag = unix_ms(line["recv_at"].as_str().unwrap()) - unix_ms(&sample_ts(3));
+    assert!(lag > 2 * 3_600_000, "{line}");
     assert_eq!(line["schema"], 2, "{line}");
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());

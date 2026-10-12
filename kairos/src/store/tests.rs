@@ -379,8 +379,15 @@ fn pulse_like(agent: &str, seq: u64, at: DateTime<Utc>, cpu: f64) -> ReportRecor
 
 /// 吞吐量量測（`kairos/STORAGE.md`「量測」）：以 `KP_BENCH_RATE` 筆／秒（預設 2000，相當於 1 萬台 ×
 /// 每 5 秒一筆）持續 `KP_BENCH_SECS` 秒（預設 30），每筆從放入佇列到收到結果的延遲；結束時印出
-/// p50／p99／最大延遲、資料庫大小與每筆平均大小。在 kp-build 上執行：
+/// p50／p99／最大延遲、超過 `timeouts.write_secs`（5 秒，連線會回 `storage_unavailable`）的筆數、
+/// 資料庫大小與每筆平均大小。在 kp-build 上執行：
 /// `cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput`
+///
+/// - `KP_BENCH_DURABLE=1`：模擬 1 萬台同時恢復連線的補送尖峰：每筆帶去重鍵，取樣時間從
+///   `KP_BENCH_BACKFILL_HOURS`（預設 72）小時前起、每台每筆前進 5 秒（彙總的桶都是已結束的舊桶）；
+///   `KP_BENCH_DUP_PERCENT`（預設 0）% 的筆數另外重送一次（模擬結果不明後的重送，應為 `Duplicate`）
+/// - `KP_BENCH_INVENTORY=1`：一開始就送出 `KP_BENCH_HOSTS` 台線上主機的狀態表快照，量測期間
+///   （第 30 秒）的第一次清冊同步會寫入這麼多列（重新啟動後的情況）
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "吞吐量量測，手動執行"]
 async fn sqlite_throughput() {
@@ -396,6 +403,16 @@ async fn sqlite_throughput() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
+    let durable = std::env::var("KP_BENCH_DURABLE").is_ok_and(|v| v == "1");
+    let backfill_hours: i64 = std::env::var("KP_BENCH_BACKFILL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(72);
+    let dup_percent: u64 = std::env::var("KP_BENCH_DUP_PERCENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let inventory = std::env::var("KP_BENCH_INVENTORY").is_ok_and(|v| v == "1");
     let dir = std::env::var("KP_BENCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| temp_dir("bench"));
@@ -406,14 +423,41 @@ async fn sqlite_throughput() {
         config.storage.sqlite_synchronous = crate::config::SqliteSynchronous::Full;
     }
     let storage = start(&config, &dir, Utc::now).await.unwrap();
+    let feed = storage.inventory.clone().unwrap();
     let writer = tokio::spawn(storage.writer);
     let sink = storage.reports;
     let agents: Vec<String> = (0..hosts)
         .map(|i| format!("00000000-0000-4000-8000-{i:012x}"))
         .collect();
+    if inventory {
+        let now = fmt_time(Utc::now());
+        feed.send_replace(Some(Arc::new(RegistrySnapshot {
+            generated_at: now.clone(),
+            online: agents.len(),
+            total: agents.len(),
+            agents: agents
+                .iter()
+                .map(|a| AgentSnapshot {
+                    agent_id: a.clone(),
+                    hostname: format!("host-{a}"),
+                    agent_version: "0.3.0".into(),
+                    proto: 2,
+                    host: None,
+                    peer: "10.0.0.1:50000".into(),
+                    online: true,
+                    conn_id: 1,
+                    connected_at: now.clone(),
+                    last_seen: now.clone(),
+                    offline_after_ms: 75_000,
+                    last_report: None,
+                })
+                .collect(),
+        })));
+    }
+    let backfill_from = Utc::now() - chrono::Duration::hours(backfill_hours);
 
     // 每 10 ms 送出 rate/100 筆；每筆在自己的 task 等待結果（與連線相同）
-    let (lat_tx, mut lat_rx) = mpsc::unbounded_channel::<(Duration, bool)>();
+    let (lat_tx, mut lat_rx) = mpsc::unbounded_channel::<(Duration, WriteStatus)>();
     let total = rate * secs;
     let per_tick = (rate / 100).max(1);
     let started = Instant::now();
@@ -423,30 +467,51 @@ async fn sqlite_throughput() {
     while sent < total {
         tick.tick().await;
         for _ in 0..per_tick.min(total - sent) {
-            let agent = &agents[(sent % hosts) as usize];
-            let rec = pulse_like(agent, sent / hosts, Utc::now(), (sent % 100) as f64);
-            let sink = sink.clone();
-            let tx = lat_tx.clone();
-            tokio::spawn(async move {
-                let t0 = Instant::now();
-                let ok = match sink.submit(rec).await {
-                    Ok(mut p) => p.wait().await == WriteStatus::Written,
-                    Err(_) => false,
-                };
-                let _ = tx.send((t0.elapsed(), ok));
-            });
+            let host = sent % hosts;
+            let agent = &agents[host as usize];
+            let n = sent / hosts;
+            let mut rec = pulse_like(agent, n, Utc::now(), (sent % 100) as f64);
+            if durable {
+                rec.ts = fmt_time(backfill_from + chrono::Duration::seconds(n as i64 * 5));
+                rec = rec.with_dedup(Some(DedupKey {
+                    boot_id: format!("{host:08x}-0000-4000-8000-000000000000"),
+                    report_seq: n + 1,
+                }));
+            }
+            let resend = durable && dup_percent > 0 && sent % 100 < dup_percent;
+            let copies = if resend {
+                vec![rec.clone(), rec]
+            } else {
+                vec![rec]
+            };
+            for rec in copies {
+                let sink = sink.clone();
+                let tx = lat_tx.clone();
+                tokio::spawn(async move {
+                    let t0 = Instant::now();
+                    let status = match sink.submit(rec).await {
+                        Ok(mut p) => p.wait().await,
+                        Err(e) => WriteStatus::Failed(e),
+                    };
+                    let _ = tx.send((t0.elapsed(), status));
+                });
+            }
             sent += 1;
         }
     }
     drop(lat_tx);
     let mut lat = Vec::with_capacity(total as usize);
-    let mut failed = 0;
-    while let Some((d, ok)) = lat_rx.recv().await {
+    let (mut failed, mut duplicates) = (0, 0);
+    while let Some((d, status)) = lat_rx.recv().await {
         lat.push(d);
-        if !ok {
-            failed += 1;
+        match status {
+            WriteStatus::Written => {}
+            WriteStatus::Duplicate => duplicates += 1,
+            _ => failed += 1,
         }
     }
+    // 連線等待寫入的上限（timeouts.write_secs 預設 5 秒）：超過時回 storage_unavailable 或不回應
+    let over_timeout = lat.iter().filter(|d| **d >= Duration::from_secs(5)).count();
     let elapsed = started.elapsed();
     // 執行中的 WAL 大小（關閉時會 checkpoint 並刪除）
     let wal_bytes =
@@ -470,7 +535,8 @@ async fn sqlite_throughput() {
         )
         .unwrap_or(0);
     println!(
-        "BENCH rate={rate}/s secs={secs} hosts={hosts} sent={total} elapsed={:.1}s failed={failed}\n\
+        "BENCH rate={rate}/s secs={secs} hosts={hosts} durable={durable} backfill_hours={backfill_hours} dup_percent={dup_percent} inventory={inventory}\n\
+         BENCH sent={total} elapsed={:.1}s failed={failed} duplicates={duplicates} over_write_timeout_5s={over_timeout}\n\
          BENCH latency p50={:?} p99={:?} p999={:?} max={:?}\n\
          BENCH db_bytes={bytes} wal_bytes_at_end={wal_bytes} reports={rows} rollup_rows={rollups} bytes_per_report_total={:.0} bytes_per_report_raw_table_and_index={}",
         elapsed.as_secs_f64(),
@@ -487,6 +553,9 @@ async fn sqlite_throughput() {
     );
     assert_eq!(failed, 0);
     assert_eq!(rows as u64, total);
+    if durable {
+        assert_eq!(duplicates as u64, total * dup_percent.min(100) / 100);
+    }
     // PROTOCOL.md 的回應延遲預算：等待寫入最多 timeouts.write_secs（預設 5 秒）
     assert!(pct(0.99) < Duration::from_secs(1), "p99 = {:?}", pct(0.99));
     if std::env::var("KP_BENCH_DIR").is_err() {

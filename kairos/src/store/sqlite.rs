@@ -16,7 +16,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -24,9 +24,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::ReportStore;
 use super::codec::{self, AgentTs, BYTES_PER_MB, FORMAT_LEGACY, FORMAT_METRICS, canonical_labels};
-use super::rollup::{BUCKET_1H_SECS, Rollup, bucket_start};
+use super::rollup::{BUCKET_1H_SECS, Rollup, RollupRow, aggregate, bucket_start};
+use super::{ReportStore, sample_time_ms};
 use crate::config::{AppConfig, SqliteSynchronous};
 use crate::fsperm;
 use crate::protocol::{HostInfo, METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED};
@@ -105,7 +105,8 @@ CREATE TABLE reports (
     format     INTEGER NOT NULL,
     body       BLOB NOT NULL,
     boot_ref   INTEGER,
-    report_seq INTEGER
+    report_seq INTEGER,
+    recv_lag   INTEGER
 );
 CREATE INDEX reports_host_ts ON reports (host_id, ts);
 CREATE UNIQUE INDEX reports_dedup ON reports (boot_ref, report_seq) WHERE boot_ref IS NOT NULL;
@@ -165,6 +166,9 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CAPACITY_LOW_WATERMARK_PERCENT: u64 = 95;
 /// 主機清冊的 `last_seen` 最多這麼久寫入一次（其他欄位改變時立即寫入）
 const LAST_SEEN_WRITE_INTERVAL_MS: i64 = 60_000;
+/// 主機清冊同步每個交易最多寫入的列數：重新啟動後第一次同步約有主機數那麼多列（1 萬台時 1 萬列），
+/// 分成多個短交易，在 report 的批次之間逐步寫入，不會一次擋住寫入（量測見 STORAGE.md「量測」）
+pub(crate) const INVENTORY_CHUNK_ROWS: usize = 500;
 /// 日期保護（DateGuard）狀態在 `meta` 表中的鍵
 const META_RETENTION_GUARD: &str = "retention_guard";
 /// 日誌中稱呼 SQLite 中的資料的名稱（DateGuard 的事件訊息）
@@ -697,6 +701,10 @@ pub struct SqliteStore {
     next_wal_check: Option<Instant>,
     throttle: LogThrottle,
     buf: Vec<u8>,
+    /// 提交結果不明之後：記憶體中的彙總可能少了已提交的那一批，下一次使用前改由原始資料重建
+    rollup_stale: bool,
+    /// 主機清冊中尚未寫入的列（最新一份快照中有變化的主機），每次維護步驟寫入一批
+    pending_inventory: VecDeque<InventoryRow>,
     /// 測試用的失敗注入
     pub(crate) fail_next: Option<FailPoint>,
 }
@@ -735,6 +743,8 @@ impl SqliteStore {
             next_wal_check: None,
             throttle: LogThrottle::default(),
             buf: Vec::with_capacity(4096),
+            rollup_stale: false,
+            pending_inventory: VecDeque::new(),
             fail_next: None,
         };
         store.ensure_ready().map_err(Error::other)?;
@@ -816,6 +826,25 @@ impl SqliteStore {
                 }
             }
         }
+        if self.rollup_stale {
+            // 提交結果不明：那一批可能已寫入，記憶體中的彙總卻沒有它的值（重送時是 Duplicate，
+            // 不會再加入）。以原始資料重建記憶體中的桶（與啟動時相同），之後才繼續寫入
+            self.rollup.clear();
+            match self.recover_rollup() {
+                Ok(n) => {
+                    self.rollup_stale = false;
+                    info!("提交結果不明之後，已從原始資料重建尚未寫出的彙總（{n} 筆 report）");
+                }
+                Err(e) => {
+                    self.invalidate(is_connection_fatal(&e));
+                    return Err(format!(
+                        "無法從 {} 的原始資料重建彙總: {}",
+                        self.opts.path.display(),
+                        e
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -828,6 +857,8 @@ impl SqliteStore {
         }
     }
 
+    /// 在一個交易中寫入一批。取樣時間不早於主機 `rollup_until` 的數值放進 `samples`（提交後才加入
+    /// 記憶體中的桶）；早於的（遲到資料：對應的桶已寫出）在同一個交易中直接合併進彙總表
     fn insert_batch(
         &mut self,
         records: &[ReportRecord],
@@ -849,17 +880,20 @@ impl SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(before)?;
+        let mut late: Vec<Sample> = Vec::new();
         {
             let mut insert = tx
                 .prepare(
-                    "INSERT INTO reports (host_id, ts, seq, agent_ts, format, body, boot_ref, report_seq)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT DO NOTHING",
+                    "INSERT INTO reports (host_id, ts, seq, agent_ts, format, body, boot_ref, report_seq, recv_lag)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT DO NOTHING",
                 )
                 .map_err(before)?;
             let mut record_samples: Vec<Sample> = Vec::new();
             'records: for (i, r) in records.iter().enumerate() {
-                let ts = r.recv_at.timestamp_millis();
-                let Some(host_id) = caches.host_id(&tx, r, ts, opts).map_err(before)? else {
+                let recv_ms = r.recv_at.timestamp_millis();
+                // 取樣時間：durable report 為 client 的 ts（補送的歷史資料），否則為收到的時間
+                let ts = sample_time_ms(r);
+                let Some(host_id) = caches.host_id(&tx, r, recv_ms, opts).map_err(before)? else {
                     statuses[i] = WriteStatus::Failed(HOSTS_FULL.to_string());
                     continue;
                 };
@@ -929,14 +963,27 @@ impl SqliteStore {
                         &buf[..],
                         boot_ref,
                         r.dedup.as_ref().map(|d| d.report_seq as i64),
+                        (recv_ms != ts).then_some(recv_ms - ts),
                     ])
                     .map_err(before)?;
                 if changed == 0 {
+                    // 重複（已保存過）：不寫入、不加入彙總
                     statuses[i] = WriteStatus::Duplicate;
+                    continue;
+                }
+                let rollup_until = caches
+                    .hosts
+                    .get(r.agent_id.as_str())
+                    .map_or(0, |e| e.rollup_until);
+                if ts < rollup_until {
+                    late.extend_from_slice(&record_samples);
                 } else {
                     samples.extend_from_slice(&record_samples);
                 }
             }
+        }
+        if !late.is_empty() {
+            merge_rollup_rows(&tx, &aggregate(late.drain(..))).map_err(before)?;
         }
         // 失敗注入（測試）：回傳錯誤時 tx 被釋放，交易回復
         let injected = |code| {
@@ -984,8 +1031,9 @@ impl SqliteStore {
         let result = self.insert_batch(records, &mut statuses, &mut samples);
         match result {
             Ok(()) => {
+                let now_ms = (self.clock)().timestamp_millis();
                 for (host_id, series_id, ts, value) in samples {
-                    self.rollup.add(host_id, series_id, ts, value);
+                    self.rollup.add(host_id, series_id, ts, value, now_ms);
                 }
                 debug!(
                     "已寫入 {} 筆 report 至 {}",
@@ -1042,8 +1090,9 @@ impl SqliteStore {
                         reason,
                         records.len()
                     );
-                    // 無法確定交易是否生效：重新開啟連線並重新載入快取
+                    // 無法確定交易是否生效：重新開啟連線並重新載入快取，記憶體中的彙總改由原始資料重建
                     self.invalidate(true);
+                    self.rollup_stale = true;
                     vec![WriteStatus::Unknown(reason); records.len()]
                 }
             }
@@ -1077,9 +1126,11 @@ impl SqliteStore {
             }
         }
         let newest: Option<i64> = conn
-            .query_row("SELECT ts FROM reports ORDER BY id DESC LIMIT 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT ts + coalesce(recv_lag, 0) FROM reports ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .optional()
             .ok()
             .flatten();
@@ -1093,8 +1144,10 @@ impl SqliteStore {
         )
     }
 
-    /// 從各主機的 `rollup_until` 起重新讀取原始資料，補回記憶體中尚未寫出的彙總。回傳讀取的筆數
+    /// 從各主機的 `rollup_until` 起（取樣時間）重新讀取原始資料，補回記憶體中尚未寫出的彙總。
+    /// 早於 `rollup_until` 的資料已在寫出的桶中（含遲到資料的直接合併），不再讀取。回傳讀取的筆數
     fn recover_rollup(&mut self) -> rusqlite::Result<u64> {
+        let now_ms = (self.clock)().timestamp_millis();
         let Self {
             conn,
             caches,
@@ -1130,9 +1183,9 @@ impl SqliteStore {
                             if let (Some((cpu, total, used)), Some([c, t, u])) =
                                 (codec::decode_legacy(&body), caches.legacy_series(&tx)?)
                             {
-                                rollup.add(host_id, c, ts, f64::from(cpu));
-                                rollup.add(host_id, t, ts, (total * BYTES_PER_MB) as f64);
-                                rollup.add(host_id, u, ts, (used * BYTES_PER_MB) as f64);
+                                rollup.add(host_id, c, ts, f64::from(cpu), now_ms);
+                                rollup.add(host_id, t, ts, (total * BYTES_PER_MB) as f64, now_ms);
+                                rollup.add(host_id, u, ts, (used * BYTES_PER_MB) as f64, now_ms);
                             }
                         }
                         FORMAT_METRICS => {
@@ -1144,6 +1197,7 @@ impl SqliteStore {
                                     series_id,
                                     ts,
                                     value.as_f64().unwrap_or(f64::NAN),
+                                    now_ms,
                                 );
                             }
                         }
@@ -1168,46 +1222,15 @@ impl SqliteStore {
             return Ok(0);
         };
         let mut until: HashMap<i64, i64> = HashMap::new();
+        for row in &rows {
+            let end = (row.bucket + super::rollup::BUCKET_5M_SECS) * 1000;
+            let e = until.entry(row.host_id).or_insert(end);
+            *e = (*e).max(end);
+        }
         let result = (|| -> rusqlite::Result<()> {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            merge_rollup_rows(&tx, &rows)?;
             {
-                let merge = |table: &str| {
-                    format!(
-                        "INSERT INTO {table} (host_id, bucket, series_id, vmin, vmax, vsum, cnt)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                         ON CONFLICT (host_id, bucket, series_id) DO UPDATE SET
-                           vmin = min(vmin, excluded.vmin), vmax = max(vmax, excluded.vmax),
-                           vsum = vsum + excluded.vsum, cnt = cnt + excluded.cnt"
-                    )
-                };
-                let mut m5 = tx.prepare(&merge("rollup_5m"))?;
-                let mut h1 = tx.prepare(&merge("rollup_1h"))?;
-                for row in &rows {
-                    let a = &row.agg;
-                    let count = i64::try_from(a.count).unwrap_or(i64::MAX);
-                    m5.execute(params![
-                        row.host_id,
-                        row.bucket,
-                        row.series_id,
-                        a.min,
-                        a.max,
-                        a.sum,
-                        count
-                    ])?;
-                    let hour = bucket_start(row.bucket * 1000, BUCKET_1H_SECS);
-                    h1.execute(params![
-                        row.host_id,
-                        hour,
-                        row.series_id,
-                        a.min,
-                        a.max,
-                        a.sum,
-                        count
-                    ])?;
-                    let end = (row.bucket + super::rollup::BUCKET_5M_SECS) * 1000;
-                    let e = until.entry(row.host_id).or_insert(end);
-                    *e = (*e).max(end);
-                }
                 let mut upd = tx.prepare(
                     "UPDATE hosts SET rollup_until = max(rollup_until, ?2) WHERE host_id = ?1",
                 )?;
@@ -1475,12 +1498,20 @@ impl SqliteStore {
         }
     }
 
-    /// 一步維護工作：寫出彙總 → 容量上限 → 保留期限。回傳是否還有工作（呼叫端稍後再呼叫）
+    /// 一步維護工作：主機清冊的下一批 → 寫出彙總 → 容量上限 → 保留期限。回傳是否還有工作
+    /// （呼叫端稍後再呼叫）
     fn maintain_step(&mut self) -> rusqlite::Result<bool> {
         self.writer_checkpoint();
+        if !self.pending_inventory.is_empty() {
+            self.sync_chunk()?;
+            return Ok(true);
+        }
         let now = (self.clock)();
-        if self.rollup.has_ready(now.timestamp_millis()) {
-            self.flush_rollup(now.timestamp_millis())?;
+        // 最舊的桶已結束但仍在補送（或所屬主機較早的桶還在補）時，這一步可能沒有可寫出的列，
+        // 照常繼續做容量上限與保留期限
+        if self.rollup.has_ready(now.timestamp_millis())
+            && self.flush_rollup(now.timestamp_millis())? > 0
+        {
             return Ok(true);
         }
         if self.capacity_step()? {
@@ -1491,9 +1522,14 @@ impl SqliteStore {
 
     /// 主機清冊同步：狀態表中有變化的主機寫入 `hosts`。`last_seen` 與 `last_report` 只在 `last_seen`
     /// 相差 60 秒以上時才寫（線上的主機每分鐘最多寫一次），其他欄位（上線、離線、hello 的資訊）
-    /// 改變時立即寫入
+    /// 改變時立即寫入。
+    ///
+    /// 有變化的主機放進待寫入的佇列（取代上一份快照尚未寫完的部分：新的快照包含最新的狀態），
+    /// 這裡先寫入一批（[`INVENTORY_CHUNK_ROWS`] 列、一個交易），其餘由之後的維護步驟逐批寫入。
+    /// 回傳這次寫入的列數
     fn sync(&mut self, snapshot: &RegistrySnapshot) -> rusqlite::Result<usize> {
-        let mut rows = Vec::new();
+        let mut rows = VecDeque::new();
+        let mut new_hosts = 0;
         for agent in &snapshot.agents {
             let row = InventoryRow::of(agent, self.opts.mtls);
             let entry = self.caches.hosts.get(agent.agent_id.as_str());
@@ -1503,7 +1539,7 @@ impl SqliteStore {
             if unchanged {
                 continue;
             }
-            if entry.is_none() && self.caches.hosts.len() + rows.len() >= self.opts.max_hosts {
+            if entry.is_none() && self.caches.hosts.len() + new_hosts >= self.opts.max_hosts {
                 throttled!(
                     self.throttle,
                     Category::StorageMaintenance,
@@ -1514,13 +1550,37 @@ impl SqliteStore {
                 );
                 continue;
             }
-            rows.push(row);
+            if entry.is_none() {
+                new_hosts += 1;
+            }
+            rows.push_back(row);
         }
-        if rows.is_empty() {
+        self.pending_inventory = rows;
+        self.sync_chunk()
+    }
+
+    /// 寫入待寫入清冊的下一批（一個交易）；失敗時放回，下一次再試。回傳寫入的列數
+    fn sync_chunk(&mut self) -> rusqlite::Result<usize> {
+        if self.pending_inventory.is_empty() {
             return Ok(0);
         }
+        let n = self.pending_inventory.len().min(INVENTORY_CHUNK_ROWS);
+        let rows: Vec<InventoryRow> = self.pending_inventory.drain(..n).collect();
+        match self.write_inventory(&rows) {
+            Ok(()) => Ok(rows.len()),
+            Err(e) => {
+                for row in rows.into_iter().rev() {
+                    self.pending_inventory.push_front(row);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 在一個交易中把 `rows` 寫入清冊，成功後更新快取
+    fn write_inventory(&mut self, rows: &[InventoryRow]) -> rusqlite::Result<()> {
         let Some(conn) = self.conn.as_mut() else {
-            return Ok(0);
+            return Ok(());
         };
         let mut written = Vec::with_capacity(rows.len());
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1548,7 +1608,7 @@ impl SqliteStore {
                     last_report = coalesce(excluded.last_report, hosts.last_report)
                  RETURNING host_id, rollup_until",
             )?;
-            for row in &rows {
+            for row in rows {
                 let (host_id, rollup_until): (i64, i64) = stmt.query_row(
                     params![
                         row.agent_id,
@@ -1587,8 +1647,48 @@ impl SqliteStore {
                 });
             entry.synced = Some((row.hash, row.last_seen));
         }
-        Ok(rows.len())
+        Ok(())
     }
+}
+
+/// 把 5 分鐘桶的列合併進 `rollup_5m` 與 `rollup_1h`（已存在的列累加 min／max／sum／count，
+/// 不覆蓋）。寫出記憶體中的桶、以及遲到資料直接合併進已寫出的桶時共用
+fn merge_rollup_rows(tx: &Transaction, rows: &[RollupRow]) -> rusqlite::Result<()> {
+    let merge = |table: &str| {
+        format!(
+            "INSERT INTO {table} (host_id, bucket, series_id, vmin, vmax, vsum, cnt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (host_id, bucket, series_id) DO UPDATE SET
+               vmin = min(vmin, excluded.vmin), vmax = max(vmax, excluded.vmax),
+               vsum = vsum + excluded.vsum, cnt = cnt + excluded.cnt"
+        )
+    };
+    let mut m5 = tx.prepare(&merge("rollup_5m"))?;
+    let mut h1 = tx.prepare(&merge("rollup_1h"))?;
+    for row in rows {
+        let a = &row.agg;
+        let count = i64::try_from(a.count).unwrap_or(i64::MAX);
+        m5.execute(params![
+            row.host_id,
+            row.bucket,
+            row.series_id,
+            a.min,
+            a.max,
+            a.sum,
+            count
+        ])?;
+        let hour = bucket_start(row.bucket * 1000, BUCKET_1H_SECS);
+        h1.execute(params![
+            row.host_id,
+            hour,
+            row.series_id,
+            a.min,
+            a.max,
+            a.sum,
+            count
+        ])?;
+    }
+    Ok(())
 }
 
 /// 交易中的錯誤是否表示連線本身已不可用（需要重新開啟）
@@ -1791,7 +1891,11 @@ impl ReportStore for SqliteStore {
             return;
         }
         match self.sync(snapshot) {
-            Ok(n) => debug!("主機清冊已同步 {n} 台主機"),
+            Ok(n) => debug!(
+                "主機清冊已同步 {} 台主機（尚有 {} 台在之後的維護步驟寫入）",
+                n,
+                self.pending_inventory.len()
+            ),
             Err(e) => {
                 throttled!(
                     self.throttle,
@@ -1826,6 +1930,17 @@ impl ReportStore for SqliteStore {
     }
 
     fn close(&mut self) {
+        // 清冊中尚未寫入的列全部寫完（關機時的快照：所有主機已離線）
+        while !self.pending_inventory.is_empty() {
+            if let Err(e) = self.sync_chunk() {
+                warn!(
+                    "關機前寫入主機清冊失敗，{} 台主機的最新狀態未寫入: {}",
+                    self.pending_inventory.len(),
+                    e
+                );
+                break;
+            }
+        }
         // 剩下的彙總留在原始資料中，下次啟動時補回；關閉連線讓 SQLite 完成 checkpoint 並刪除 -wal、-shm
         self.checkpointer = None;
         if let Some(conn) = self.conn.take()
@@ -1927,9 +2042,9 @@ pub fn list_hosts(conn: &Connection) -> Result<Vec<HostRow>, Error> {
     query().map_err(|e| db_error("無法讀取主機清冊", e))
 }
 
-/// 匯出原始 report（`kairos reports export`）：`ts`（收到的時間）不早於 `since_ms` 的 report，
-/// 依寫入順序轉回 JSONL 的格式（[`ReportRecord`]）逐筆交給 `out`。SQLite 不逐筆保存
-/// `peer` 與 `hostname`，以主機清冊中最後的值代替。回傳匯出的筆數
+/// 匯出原始 report（`kairos reports export`）：取樣時間（`reports.ts`）不早於 `since_ms` 的 report，
+/// 依寫入順序轉回 JSONL 的格式（[`ReportRecord`]，`recv_at` 為收到的時間 = `ts + recv_lag`）逐筆
+/// 交給 `out`。SQLite 不逐筆保存 `peer` 與 `hostname`，以主機清冊中最後的值代替。回傳匯出的筆數
 pub fn export_reports(
     conn: &Connection,
     since_ms: i64,
@@ -1966,7 +2081,7 @@ pub fn export_reports(
     let mut stmt = conn
         .prepare(
             "SELECT r.ts, r.seq, r.agent_ts, r.format, r.body, b.boot_id, r.report_seq,
-                    h.agent_id, h.hostname, h.peer
+                    h.agent_id, h.hostname, h.peer, r.recv_lag
              FROM reports r JOIN hosts h USING (host_id) LEFT JOIN boots b ON b.boot_ref = r.boot_ref
              WHERE r.ts >= ?1 AND (?2 IS NULL OR h.agent_id = ?2)
              ORDER BY r.id",
@@ -2023,8 +2138,10 @@ pub fn export_reports(
             }),
             _ => None,
         };
+        let recv_lag: Option<i64> = r.get(10).map_err(get)?;
+        let recv_at = ts.saturating_add(recv_lag.unwrap_or(0));
         let record = ReportRecord::new(
-            DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+            DateTime::from_timestamp_millis(recv_at).unwrap_or_default(),
             r.get::<_, Option<String>>(9)
                 .map_err(get)?
                 .unwrap_or_default(),
