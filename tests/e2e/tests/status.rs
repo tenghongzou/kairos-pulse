@@ -157,8 +157,11 @@ fn status_follows_kairos_outage_and_pulse_exit() {
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());
     drop(k);
+    // 第一次斷線是 Kairos 正常關閉連線（沒有代碼）；之後的重連被拒絕（PLS-E2003）。
+    // 斷線當下尚未收到 ack 的記錄也算待補送，因此一併等到重連被拒
     let (code, doc) = wait_status(&pulse.dir, "離線且有待補送", |_, d| {
         d["data"]["status"] == "offline"
+            && d["data"]["connection"]["last_error_code"] == "PLS-E2003"
             && d["data"]["reporting"]["buffer"]["pending"]
                 .as_u64()
                 .is_some_and(|n| n >= 2)
