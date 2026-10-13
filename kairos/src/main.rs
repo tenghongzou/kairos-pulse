@@ -18,6 +18,7 @@ mod registry;
 mod reload;
 mod retention;
 mod shutdown;
+mod stats;
 mod storage;
 mod store;
 #[cfg(test)]

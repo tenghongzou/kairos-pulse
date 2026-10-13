@@ -10,6 +10,9 @@
 //!   24 小時者都是 O(log n)。
 //!
 //! 字串欄位以 `Arc<str>` 保存，snapshot 在鎖內只複製參考計數，格式化與排序都在鎖外進行。
+//!
+//! 狀態變化（上線、離線）另以 [`HostChange`] 廣播（[`Registry::subscribe`]），主控台 API 的 SSE
+//! 由此推送（`kairos/API.md` 第 6 節）。在鎖內送出：broadcast 不會阻塞，沒有接收端時直接丟棄。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use crate::protocol::HostInfo;
@@ -29,6 +32,101 @@ pub const OFFLINE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 狀態表筆數上限的預設值（與 `limits.max_agents` 的預設相同）
 pub const DEFAULT_MAX_AGENTS: usize = 10000;
+
+/// 狀態變化廣播的緩衝（接收端落後超過這麼多則時收到 `Lagged`，SSE 改送 `resync`）
+pub const HOST_CHANGE_CAPACITY: usize = 4096;
+
+/// 收到的 durable report 的取樣時間比收到的時間早這麼多以上，視為補送的資料
+pub const BACKFILL_LAG_MS: i64 = 60_000;
+
+/// 最近一次補送在這麼久之內，視為「補送中」
+pub const BACKFILL_ACTIVE: Duration = Duration::from_secs(60);
+
+/// 最近一次離線的原因（只有 Kairos 這次啟動後發生的才知道；`kairos/API.md` 第 5.2 節）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineReason {
+    /// 超過離線門檻沒有合法訊息（sweep）
+    Timeout,
+    /// 連線關閉（agent 關閉、網路中斷、伺服器關閉連線）
+    ConnectionClosed,
+    /// Kairos 關機
+    ServerShutdown,
+    /// 連線中重新驗證客戶端憑證時被拒（撤銷、過期、不再受信任）；握手時被拒的另由
+    /// `tls::rejections` 記錄
+    CertificateRejected,
+}
+
+impl OfflineReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OfflineReason::Timeout => "timeout",
+            OfflineReason::ConnectionClosed => "connection_closed",
+            OfflineReason::ServerShutdown => "server_shutdown",
+            OfflineReason::CertificateRejected => "certificate_rejected",
+        }
+    }
+}
+
+/// 狀態變化的種類
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostChangeKind {
+    /// 上線、重新上線、離線後恢復
+    Online,
+    Offline(OfflineReason),
+}
+
+/// 一次狀態變化（[`Registry::subscribe`]）
+#[derive(Debug, Clone)]
+pub struct HostChange {
+    pub agent_id: Arc<str>,
+    pub hostname: Arc<str>,
+    pub display_name: Option<String>,
+    pub peer: Arc<str>,
+    pub kind: HostChangeKind,
+    pub at: DateTime<Utc>,
+}
+
+/// 最近一次收到補送資料
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backfill {
+    pub at: Instant,
+    pub at_wall: DateTime<Utc>,
+    /// 收到的時間 − 取樣時間（毫秒）
+    pub lag_ms: i64,
+}
+
+/// 主控台 API 用的即時狀態（[`Registry::live_view`]）：字串只複製參考計數
+#[derive(Debug, Clone)]
+pub struct LiveAgent {
+    pub agent_id: Arc<str>,
+    pub hostname: Arc<str>,
+    pub agent_version: Arc<str>,
+    pub proto: u32,
+    pub host: Option<Arc<HostInfo>>,
+    pub peer: Arc<str>,
+    pub online: bool,
+    /// Kairos 這次啟動後是否連線過（`false`：由主機清冊載回、尚未連線）
+    pub seen_since_start: bool,
+    pub connected_at: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub offline_after: Duration,
+    pub last_report: Option<Arc<LastReport>>,
+    /// 最近一次連線是否協商了 durable（尚未連線時為 `None`）
+    pub durable: Option<bool>,
+    pub backfill: Option<Backfill>,
+    pub offline_reason: Option<OfflineReason>,
+}
+
+impl LiveAgent {
+    /// 目前是否正在補送（線上，且最近 [`BACKFILL_ACTIVE`] 內收到補送的資料）
+    pub fn replaying(&self, now: Instant) -> bool {
+        self.online
+            && self
+                .backfill
+                .is_some_and(|b| now.saturating_duration_since(b.at) <= BACKFILL_ACTIVE)
+    }
+}
 
 /// 全域連線編號
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -119,6 +217,14 @@ pub struct AgentState {
     pub connected: bool,
     /// 在離線索引中的 key（連線已結束時為 `Some`）
     offline_key: Option<OfflineKey>,
+    /// 連線是否協商了 durable（[`Registry::set_durable`]；由清冊載回、尚未連線時為 `None`）
+    pub durable: Option<bool>,
+    /// 最近一次收到補送的資料（[`Registry::note_backfill`]）
+    pub backfill: Option<Backfill>,
+    /// 最近一次離線的原因（線上時保留上一次的值，供詳情顯示）
+    pub offline_reason: Option<OfflineReason>,
+    /// 連線因憑證被拒而被要求結束時記下，連線結束時作為離線原因
+    kick_reason: Option<OfflineReason>,
 }
 
 /// 離線索引的 key：(離線時間, 序號)；序號讓同一時間離線的多個 agent 不會衝突
@@ -270,8 +376,9 @@ struct Inner {
 }
 
 impl Inner {
-    /// 連線結束：標記離線、釋放只在連線期間需要的資源，並移入離線索引
-    fn mark_disconnected(&mut self, agent_id: &Arc<str>, now: Instant) {
+    /// 連線結束：標記離線、釋放只在連線期間需要的資源，並移入離線索引。
+    /// `reason` 為仍在線上時的離線原因（連線因憑證被拒而被要求結束時改用 `CertificateRejected`）
+    fn mark_disconnected(&mut self, agent_id: &Arc<str>, now: Instant, reason: OfflineReason) {
         let seq = self.next_offline_seq;
         let Some(state) = self.agents.get_mut(agent_id) else {
             return;
@@ -279,6 +386,10 @@ impl Inner {
         state.kick = None;
         state.connected = false;
         state.client_chain = None;
+        if state.online {
+            state.offline_reason = Some(state.kick_reason.take().unwrap_or(reason));
+        }
+        state.kick_reason = None;
         state.online = false;
         let since = *state.offline_since.get_or_insert(now);
         if state.offline_key.is_none() {
@@ -321,6 +432,8 @@ pub struct Registry {
     inner: Mutex<Inner>,
     /// 狀態表最多保留的 agent 數（`limits.max_agents`）
     max_agents: usize,
+    /// 狀態變化的廣播（[`Registry::subscribe`]）
+    events: broadcast::Sender<HostChange>,
 }
 
 impl Default for Registry {
@@ -339,7 +452,34 @@ impl Registry {
         Self {
             inner: Mutex::new(Inner::default()),
             max_agents: max_agents.max(1),
+            events: broadcast::channel(HOST_CHANGE_CAPACITY).0,
         }
+    }
+
+    /// 訂閱之後的狀態變化（上線、離線）
+    pub fn subscribe(&self) -> broadcast::Receiver<HostChange> {
+        self.events.subscribe()
+    }
+
+    /// 送出一則狀態變化（持鎖中呼叫；沒有接收端時丟棄）
+    fn emit(
+        &self,
+        agent_id: &Arc<str>,
+        state: &AgentState,
+        kind: HostChangeKind,
+        at: DateTime<Utc>,
+    ) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        let _ = self.events.send(HostChange {
+            agent_id: agent_id.clone(),
+            hostname: state.hostname.clone(),
+            display_name: state.host.as_ref().and_then(|h| h.display_name.clone()),
+            peer: state.peer.clone(),
+            kind,
+            at,
+        });
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -371,9 +511,13 @@ impl Registry {
         let fingerprint =
             |host: &Option<Arc<HostInfo>>| host.as_ref().and_then(|h| h.host_fingerprint.clone());
         let mut previous_fingerprint = None;
+        let mut was_online = false;
+        let mut previous_reason = None;
         let (kind, last_report, key) = match inner.remove(&info.agent_id) {
             None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
             Some(mut prev) => {
+                was_online = prev.online;
+                previous_reason = prev.offline_reason;
                 if let (Some(old), Some(new)) = (fingerprint(&prev.host), fingerprint(&info.host))
                     && old != new
                 {
@@ -398,6 +542,7 @@ impl Registry {
             }
         };
         inner.connected.insert(key.clone());
+        let event_key = key.clone();
         inner.agents.insert(
             key,
             AgentState {
@@ -418,8 +563,15 @@ impl Registry {
                 kick: Some(tx),
                 connected: true,
                 offline_key: None,
+                durable: None,
+                backfill: None,
+                offline_reason: previous_reason,
+                kick_reason: None,
             },
         );
+        if !was_online && let Some(state) = inner.agents.get(&event_key) {
+            self.emit(&event_key, state, HostChangeKind::Online, now_wall);
+        }
         Ok(Registration {
             kind,
             kick: rx,
@@ -477,6 +629,10 @@ impl Registry {
                     kick: None,
                     connected: false,
                     offline_key: Some(key),
+                    durable: None,
+                    backfill: None,
+                    offline_reason: None,
+                    kick_reason: None,
                 },
             );
             restored += 1;
@@ -506,10 +662,96 @@ impl Registry {
         let mut inner = self.lock();
         match inner.agents.get_mut(agent_id) {
             Some(state) if state.conn_id == conn_id => match state.kick.take() {
-                Some(kick) => kick.send(reason).is_ok(),
+                Some(kick) => {
+                    if matches!(reason, KickReason::CertificateRejected(_)) {
+                        state.kick_reason = Some(OfflineReason::CertificateRejected);
+                    }
+                    kick.send(reason).is_ok()
+                }
                 None => false,
             },
             _ => false,
+        }
+    }
+
+    /// hello 通過後記錄這條連線是否協商了 durable（A5）；conn_id 不符時不更新
+    pub fn set_durable(&self, agent_id: &str, conn_id: u64, durable: bool) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+        {
+            state.durable = Some(durable);
+        }
+    }
+
+    /// 收到補送的資料（durable report 的取樣時間比收到的時間早 [`BACKFILL_LAG_MS`] 以上）
+    pub fn note_backfill(
+        &self,
+        agent_id: &str,
+        conn_id: u64,
+        lag_ms: i64,
+        now: Instant,
+        now_wall: DateTime<Utc>,
+    ) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+        {
+            state.backfill = Some(Backfill {
+                at: now,
+                at_wall: now_wall,
+                lag_ms,
+            });
+        }
+    }
+
+    /// 主控台 API 用：所有 agent 的即時狀態（持鎖期間只複製參考計數）
+    pub fn live_view(&self) -> Vec<LiveAgent> {
+        let inner = self.lock();
+        inner
+            .agents
+            .iter()
+            .map(|(id, s)| Self::live_of(id, s))
+            .collect()
+    }
+
+    /// 主控台 API 用：一台 agent 的即時狀態
+    pub fn live_get(&self, agent_id: &str) -> Option<LiveAgent> {
+        let inner = self.lock();
+        inner
+            .agents
+            .get_key_value(agent_id)
+            .map(|(id, s)| Self::live_of(id, s))
+    }
+
+    /// 狀態表中的筆數與連線工作仍在的 agent 數
+    pub fn sizes(&self) -> (usize, usize) {
+        let inner = self.lock();
+        (inner.agents.len(), inner.connected.len())
+    }
+
+    /// 狀態表的上限（`limits.max_agents`）
+    pub fn max_agents(&self) -> usize {
+        self.max_agents
+    }
+
+    fn live_of(id: &Arc<str>, s: &AgentState) -> LiveAgent {
+        LiveAgent {
+            agent_id: id.clone(),
+            hostname: s.hostname.clone(),
+            agent_version: s.agent_version.clone(),
+            proto: s.proto,
+            host: s.host.clone(),
+            peer: s.peer.clone(),
+            online: s.online,
+            seen_since_start: s.conn_id != 0,
+            connected_at: s.connected_at,
+            last_seen: s.last_seen_wall,
+            offline_after: s.offline_after,
+            last_report: s.last_report.clone(),
+            durable: s.durable,
+            backfill: s.backfill,
+            offline_reason: s.offline_reason,
         }
     }
 
@@ -522,7 +764,7 @@ impl Registry {
         now_wall: DateTime<Utc>,
     ) -> Touch {
         let mut inner = self.lock();
-        match inner.agents.get_mut(agent_id) {
+        let touch = match inner.agents.get_mut(agent_id) {
             Some(state) if state.conn_id == conn_id && state.connected => {
                 state.last_seen = now;
                 state.last_seen_wall = now_wall;
@@ -536,7 +778,13 @@ impl Registry {
                 }
             }
             _ => Touch::Stale,
+        };
+        if touch == Touch::Revived
+            && let Some((id, state)) = inner.agents.get_key_value(agent_id)
+        {
+            self.emit(id, state, HostChangeKind::Online, now_wall);
         }
+        touch
     }
 
     /// report 已寫入資料檔並 flush 後才呼叫，記錄為最近一次 report，確保 agents.json 與
@@ -586,11 +834,21 @@ impl Registry {
         let mut inner = self.lock();
         let ids: Vec<Arc<str>> = inner.connected.iter().cloned().collect();
         let mut count = 0;
+        let now_wall = Utc::now();
         for agent_id in &ids {
-            if inner.agents.get(agent_id).is_some_and(|s| s.online) {
+            let was_online = inner.agents.get(agent_id).is_some_and(|s| s.online);
+            inner.mark_disconnected(agent_id, now, OfflineReason::ServerShutdown);
+            if was_online {
                 count += 1;
+                if let Some(state) = inner.agents.get(agent_id) {
+                    self.emit(
+                        agent_id,
+                        state,
+                        HostChangeKind::Offline(OfflineReason::ServerShutdown),
+                        now_wall,
+                    );
+                }
             }
-            inner.mark_disconnected(agent_id, now);
         }
         count
     }
@@ -607,7 +865,13 @@ impl Registry {
         }
         let was_online = state.online;
         let key = key.clone();
-        inner.mark_disconnected(&key, now);
+        inner.mark_disconnected(&key, now, OfflineReason::ConnectionClosed);
+        if was_online && let Some(state) = inner.agents.get(&key) {
+            let reason = state
+                .offline_reason
+                .unwrap_or(OfflineReason::ConnectionClosed);
+            self.emit(&key, state, HostChangeKind::Offline(reason), Utc::now());
+        }
         was_online
     }
 
@@ -617,6 +881,7 @@ impl Registry {
         let mut result = SweepResult::default();
         let mut guard = self.lock();
         let inner = &mut *guard;
+        let now_wall = Utc::now();
         // 只走訪仍有連線的 agent（線上的 agent 一定仍有連線）
         for agent_id in &inner.connected {
             let Some(state) = inner.agents.get_mut(agent_id) else {
@@ -629,6 +894,13 @@ impl Registry {
             if silent_for > state.offline_after {
                 state.online = false;
                 state.offline_since.get_or_insert(now);
+                state.offline_reason = Some(OfflineReason::Timeout);
+                self.emit(
+                    agent_id,
+                    state,
+                    HostChangeKind::Offline(OfflineReason::Timeout),
+                    now_wall,
+                );
                 result.went_offline.push(WentOffline {
                     agent_id: agent_id.to_string(),
                     hostname: state.hostname.to_string(),
@@ -803,6 +1075,106 @@ mod tests {
         let a = next_conn_id();
         let b = next_conn_id();
         assert!(b > a);
+    }
+
+    /// 收到的所有狀態變化：(agent_id, 種類)
+    fn drain(rx: &mut broadcast::Receiver<HostChange>) -> Vec<(String, HostChangeKind)> {
+        let mut out = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            out.push((c.agent_id.to_string(), c.kind));
+        }
+        out
+    }
+
+    #[test]
+    fn state_changes_are_broadcast() {
+        // kairos/API.md 第 6 節：上線、恢復、離線（含原因）各一則；沒有狀態變化時不送出
+        let r = Registry::new();
+        let mut rx = r.subscribe();
+        let t0 = Instant::now();
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        assert_eq!(drain(&mut rx), [("a".into(), HostChangeKind::Online)]);
+        // 取代仍在線上的連線：沒有狀態變化
+        let _a2 = r.register(2, hello("a", "p"), t0, Utc::now()).unwrap();
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(r.touch("a", 2, t0, Utc::now()), Touch::Updated);
+        assert!(drain(&mut rx).is_empty());
+        // sweep 判定離線 → 再收到訊息時恢復
+        let later = t0 + Duration::from_secs(6);
+        assert_eq!(ids_offline(&r.sweep(later)), ["a"]);
+        assert_eq!(
+            drain(&mut rx),
+            [("a".into(), HostChangeKind::Offline(OfflineReason::Timeout))]
+        );
+        assert_eq!(
+            r.live_get("a").unwrap().offline_reason,
+            Some(OfflineReason::Timeout)
+        );
+        assert_eq!(r.touch("a", 2, later, Utc::now()), Touch::Revived);
+        assert_eq!(drain(&mut rx), [("a".into(), HostChangeKind::Online)]);
+        // 連線關閉
+        assert!(r.disconnect("a", 2, later));
+        assert_eq!(
+            drain(&mut rx),
+            [(
+                "a".into(),
+                HostChangeKind::Offline(OfflineReason::ConnectionClosed)
+            )]
+        );
+        // 已離線的連線再結束：沒有事件
+        assert!(!r.disconnect("a", 2, later));
+        assert!(drain(&mut rx).is_empty());
+
+        // 憑證被拒而被要求結束的連線：離線原因為 certificate_rejected
+        let _b = r.register(3, hello("b", "p"), later, Utc::now()).unwrap();
+        assert!(r.kick("b", 3, rejected("revoked")));
+        assert!(r.disconnect("b", 3, later));
+        let changes = drain(&mut rx);
+        assert_eq!(
+            changes,
+            [
+                ("b".into(), HostChangeKind::Online),
+                (
+                    "b".into(),
+                    HostChangeKind::Offline(OfflineReason::CertificateRejected)
+                )
+            ]
+        );
+        // 關機
+        let _c = r.register(4, hello("c", "p"), later, Utc::now()).unwrap();
+        drain(&mut rx);
+        assert_eq!(r.mark_all_offline(later), 1);
+        assert_eq!(
+            drain(&mut rx),
+            [(
+                "c".into(),
+                HostChangeKind::Offline(OfflineReason::ServerShutdown)
+            )]
+        );
+        r.assert_consistent();
+    }
+
+    #[test]
+    fn live_view_reports_delivery_state() {
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        let live = r.live_get("a").unwrap();
+        assert!(live.online && live.seen_since_start);
+        assert_eq!(live.durable, None);
+        assert!(!live.replaying(t0));
+        r.set_durable("a", 1, true);
+        // conn_id 不符時不更新
+        r.set_durable("a", 99, false);
+        r.note_backfill("a", 1, 3_600_000, t0, Utc::now());
+        let live = r.live_get("a").unwrap();
+        assert_eq!(live.durable, Some(true));
+        assert_eq!(live.backfill.map(|b| b.lag_ms), Some(3_600_000));
+        assert!(live.replaying(t0 + Duration::from_secs(30)));
+        assert!(!live.replaying(t0 + BACKFILL_ACTIVE + Duration::from_secs(1)));
+        assert_eq!(r.live_view().len(), 1);
+        assert_eq!(r.sizes(), (1, 1));
+        assert!(r.live_get("missing").is_none());
     }
 
     #[test]
