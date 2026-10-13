@@ -26,6 +26,8 @@ pub mod overview;
 pub mod tokens;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 use chrono::{DateTime, Utc};
@@ -139,14 +141,34 @@ pub struct Console {
     #[cfg_attr(not(test), allow(dead_code))]
     pub ctx: Arc<ApiContext>,
     task: tokio::task::JoinHandle<()>,
+    /// 主控台專用的 tokio runtime（與 agent 連線、report 的寫入分開排程）
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Console {
-    /// 等待主控台結束（關機時：停止接受連線並中斷所有連線）
-    pub async fn join(self) {
-        let _ = self.task.await;
+    /// 等待主控台結束（關機時：停止接受連線並中斷所有連線），再關閉它的 runtime
+    pub async fn join(mut self) {
+        let _ = (&mut self.task).await;
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_background();
+        }
     }
 }
+
+impl Drop for Console {
+    fn drop(&mut self) {
+        // 在 async 的環境中不能以阻塞的方式關閉 runtime
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// 主控台 runtime 的工作執行緒數：API 的處理（TLS、JSON、篩選排序）不與 agent 連線、report 的
+/// writer 共用 tokio 的工作執行緒，大量查詢時 report 的 `ack` 不需排在查詢之後（`kairos/API.md` 第 9 節）
+pub const CONSOLE_WORKER_THREADS: usize = 2;
+/// 主控台 runtime 的 blocking 執行緒上限（唯讀查詢 4 條、寫入 1 條，另有餘裕）
+pub const CONSOLE_BLOCKING_THREADS: usize = 8;
 
 /// 主控台的 TLS 設定：只做伺服器端 TLS（不要求用戶端憑證），ALPN 只有 http/1.1
 pub fn build_acceptor(cert: &str, key: &str) -> Result<TlsAcceptor, Error> {
@@ -206,13 +228,23 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
             &console.listen,
         )));
     }
-    let listener = TcpListener::bind(&console.listen).await.map_err(|e| {
-        StartError::Listen(Error::new(
-            e.kind(),
-            format!("無法監聽主控台 console.listen {}: {}", console.listen, e),
-        ))
-    })?;
+    // 以標準函式庫監聽，再交給主控台的 runtime（socket 註冊在使用它的 runtime 上）
+    let listener = std::net::TcpListener::bind(console.listen.trim())
+        .and_then(|l| l.set_nonblocking(true).map(|_| l))
+        .map_err(|e| {
+            StartError::Listen(Error::new(
+                e.kind(),
+                format!("無法監聽主控台 console.listen {}: {}", console.listen, e),
+            ))
+        })?;
     let local_addr = listener.local_addr().map_err(StartError::Listen)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CONSOLE_WORKER_THREADS)
+        .max_blocking_threads(CONSOLE_BLOCKING_THREADS)
+        .thread_name("kairos-console")
+        .enable_all()
+        .build()
+        .map_err(|e| StartError::Other(Error::other(format!("無法建立主控台的 runtime: {e}"))))?;
 
     let db_opts = SqliteOptions::from_config(&p.config, &p.data_dir);
     let db_path = db_opts.path.clone();
@@ -256,18 +288,18 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
     });
     ctx.hosts.load_known(known);
 
-    // 狀態表的變化 → SSE 事件
+    // 狀態表的變化 → SSE 事件；以下的工作都在主控台的 runtime 上執行
     let index_ctx = ctx.clone();
-    tokio::spawn(events::pump(
+    runtime.spawn(events::pump(
         p.registry.subscribe(),
         ctx.events.clone(),
         move |id| index_ctx.hosts.mark_known(id),
         p.shutdown.clone(),
     ));
-    tokio::spawn(maint::run(ctx.clone()));
+    runtime.spawn(maint::run(ctx.clone()));
     let acceptor = Arc::new(RwLock::new(acceptor));
     if p.config.server.reload_interval_secs > 0 {
-        tokio::spawn(reload_certificate(
+        runtime.spawn(reload_certificate(
             TlsPaths {
                 cert: cert.clone(),
                 key: key.clone(),
@@ -283,16 +315,19 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         "主控台 API 已啟動，監聽 https://{}/api/v1/（連線上限 {}，SSE 上限 {}，憑證 {}）",
         local_addr, console.max_connections, console.max_streams, cert
     );
-    let task = tokio::spawn(accept_loop(
-        listener,
-        ctx.clone(),
-        acceptor,
-        console.max_connections,
-    ));
+    let loop_ctx = ctx.clone();
+    let max_connections = console.max_connections;
+    let task = runtime.spawn(async move {
+        match TcpListener::from_std(listener) {
+            Ok(listener) => accept_loop(listener, loop_ctx, acceptor, max_connections).await,
+            Err(e) => log::error!("主控台無法使用監聽的 socket: {e}"),
+        }
+    });
     Ok(Console {
         local_addr,
         ctx,
         task,
+        runtime: Some(runtime),
     })
 }
 

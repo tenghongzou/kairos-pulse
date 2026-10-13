@@ -50,10 +50,11 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 
-    /// 管理用的連線（直接檢查資料庫）
+    /// 管理用的連線（直接檢查資料庫；只經由 SQLite 開啟，不影響 writer 的檔案鎖）
     pub fn admin(&self) -> rusqlite::Connection {
-        crate::store::sqlite::open_admin(
-            &SqliteOptions::from_config(&self.config, Path::new(&self.config.storage.data_dir)),
+        crate::store::sqlite::open_existing_read_write(
+            &SqliteOptions::from_config(&self.config, Path::new(&self.config.storage.data_dir))
+                .path,
             Duration::from_secs(5),
         )
         .unwrap()
@@ -93,8 +94,8 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         .unwrap();
     let writer = tokio::spawn(storage.writer);
     let registry = Arc::new(Registry::new());
-    let conn = crate::store::sqlite::open_admin(
-        &SqliteOptions::from_config(&config, &paths.data_dir),
+    let conn = crate::store::sqlite::open_existing_read_write(
+        &SqliteOptions::from_config(&config, &paths.data_dir).path,
         Duration::from_secs(5),
     )
     .unwrap();
