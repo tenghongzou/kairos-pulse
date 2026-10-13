@@ -1,3 +1,4 @@
+mod api;
 mod auth;
 mod config;
 mod connection;
@@ -25,6 +26,7 @@ mod store;
 mod test_pki;
 mod throttle;
 mod tls;
+mod token_cli;
 
 use log::{debug, error, info, warn};
 use std::io::{Error, ErrorKind};
@@ -39,7 +41,10 @@ use tokio::time::{MissedTickBehavior, interval, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::BindingPolicy;
-use crate::config::{AppConfig, CliAction, ListenAuth, USAGE, parse_args};
+use crate::config::{
+    AppConfig, CliAction, FD_RESERVE, ListenAuth, StorageBackend, USAGE, parse_args,
+    suggested_nofile,
+};
 use crate::connection::{ConnContext, handle_connection, is_peer_disconnect};
 use crate::per_ip::{ConnectionSlot, PerIpLimiter, PerIpPolicy, Rejected};
 use crate::rate::ReportLimiter;
@@ -67,9 +72,6 @@ const SATURATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// `block_on` 返回後，等待 blocking 執行緒（例如卡住的 fsync）結束的上限；
 /// 超過就不再等待，讓行程以 `run` 的結果結束（R2-K17）
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// 除了連線之外，行程需要的檔案描述符（日誌、資料檔、TLS 設定檔、listener 等）的估計量
-const FD_RESERVE: u64 = 64;
 
 /// 「握手中」（已 accept、尚未通過 hello）連線數的上限：`max_connections` 的一半（至少 1）。
 /// 其餘名額保留給已通過 hello 的連線，慢速握手無法佔滿全域名額（R2-K2）
@@ -456,9 +458,11 @@ fn main() -> ExitCode {
         Ok(CliAction::Hosts(cmd)) => return ExitCode::from(hosts_cli::run(cmd)),
         Ok(CliAction::Reports(cmd)) => return ExitCode::from(export_cli::run(cmd)),
         Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
+        Ok(CliAction::ApiToken(cmd)) => return ExitCode::from(token_cli::run(cmd)),
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
+                Some(a) if a == "api-token" => token_cli::TOKEN_USAGE,
                 Some(a) if a == "reports" => {
                     if std::env::args_os().nth(2).is_some_and(|a| a == "import") {
                         import_cli::IMPORT_USAGE
@@ -556,48 +560,62 @@ fn parse_nofile_soft_limit(limits: &str) -> Option<u64> {
     }
 }
 
-/// 建議的 `LimitNOFILE`：不小於所需數量的 2 的冪次，且至少 4096
-const MIN_SUGGESTED_NOFILE: u64 = 4096;
-
-/// soft limit 低於 `max_connections` 加上預留量時的警告訊息（D4：具體指出建議做法）；足夠時回傳 `None`
+/// soft limit 低於需要量（`server.max_connections` ＋ 主控台的連線上限 ＋ 預留，設計包 §24 #18、D21）
+/// 時的警告訊息（D4：具體指出建議做法）；足夠時回傳 `None`
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn fd_limit_warning(soft: u64, max_connections: usize) -> Option<String> {
-    let needed = max_connections as u64 + FD_RESERVE;
+fn fd_limit_warning(soft: u64, max_connections: usize, console_connections: u64) -> Option<String> {
+    let needed = max_connections as u64 + console_connections + FD_RESERVE;
     if soft >= needed {
         return None;
     }
-    let suggested = needed
-        .checked_next_power_of_two()
-        .unwrap_or(needed)
-        .max(MIN_SUGGESTED_NOFILE);
-    let lower = if soft > FD_RESERVE {
+    let suggested = suggested_nofile(needed);
+    let reserve = console_connections + FD_RESERVE;
+    let lower = if soft > reserve {
         format!(
             "；或將 server.max_connections 調低至 {} 以下（= 目前上限 {} − 預留 {}）",
-            soft - FD_RESERVE,
+            soft - reserve,
             soft,
-            FD_RESERVE
+            reserve
         )
     } else {
         String::new()
     };
+    let console = if console_connections > 0 {
+        format!("、主控台的連線上限（console.max_connections {console_connections}）")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）加上預留的 {}（共 {}）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE={}，手動執行時先執行 ulimit -n {}{}",
-        soft, max_connections, FD_RESERVE, needed, suggested, suggested, lower
+        "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）{}加上預留的 {}（共 {}）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE={}，手動執行時先執行 ulimit -n {}{}",
+        soft, max_connections, console, FD_RESERVE, needed, suggested, suggested, lower
     ))
 }
 
-/// 可開啟檔案數的 soft limit 低於 `max_connections` 加上預留量時警告（R2-K25）。
-/// 只在 Linux 讀取 `/proc/self/limits`（不需額外依賴）；其他平台不檢查。
-fn warn_if_fd_limit_low(max_connections: usize) {
+/// 可開啟檔案數的 soft limit（`unlimited` 為 `u64::MAX`）；只在 Linux 讀取 `/proc/self/limits`，
+/// 其他平台為 `None`（系統健康與啟動檢查共用）
+pub(crate) fn nofile_soft_limit() -> Option<u64> {
     #[cfg(target_os = "linux")]
-    if let Ok(text) = std::fs::read_to_string("/proc/self/limits")
-        && let Some(soft) = parse_nofile_soft_limit(&text)
-        && let Some(message) = fd_limit_warning(soft, max_connections)
+    {
+        parse_nofile_soft_limit(&std::fs::read_to_string("/proc/self/limits").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// 可開啟檔案數的 soft limit 低於需要量時警告（R2-K25；需要量含主控台，D21）
+fn warn_if_fd_limit_low(config: &AppConfig) {
+    let console = if config.console.enabled {
+        config.console.max_connections as u64
+    } else {
+        0
+    };
+    if let Some(soft) = nofile_soft_limit()
+        && let Some(message) = fd_limit_warning(soft, config.server.max_connections, console)
     {
         warn!("{}", message);
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = max_connections;
 }
 
 /// 執行伺服器直到關機。正常關機回傳 `Ok(None)`；因背景工作異常而關機時回傳 `Ok(Some(原因))`
@@ -627,7 +645,7 @@ async fn run(
         })?
         .collect();
     let listen_auth = config.check_listen_auth(&resolved).map_err(config_error)?;
-    warn_if_fd_limit_low(config.server.max_connections);
+    warn_if_fd_limit_low(&config);
     if let Some((max, estimate)) = config.total_limit_below_estimate() {
         warn!(
             "storage.max_total_bytes（{} bytes）小於以 {} 台主機、每 5 秒一筆 report 與目前保留天數估算的容量（約 {} bytes，見 STORAGE.md「容量估算」）；達到上限後會提早刪除最舊的原始 report 與彙總",
@@ -817,6 +835,48 @@ async fn run(
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
+    // 主控台 API（kairos/API.md）：需要 SQLite（API token 存在資料庫中）
+    let console = match (config.console.enabled, config.storage.backend) {
+        (false, _) => {
+            info!("主控台 API 已停用（console.enabled = false）");
+            None
+        }
+        (true, StorageBackend::Jsonl) => {
+            warn!(
+                "主控台 API 需要 SQLite（API token 與主機清冊存在資料庫中），storage.backend = \"jsonl\" 時不啟動；不需要主控台時可設定 console.enabled = false"
+            );
+            None
+        }
+        (true, StorageBackend::Sqlite) => {
+            let agent_addr = listener
+                .local_addr()
+                .map_err(|e| Error::new(e.kind(), format!("無法取得監聽位址: {e}")))?;
+            let started = api::start(api::StartParams {
+                config: Arc::new(config.clone()),
+                config_file: config_path
+                    .map(Path::to_path_buf)
+                    .or_else(|| default_file.is_file().then(|| default_file.to_path_buf())),
+                registry: registry.clone(),
+                write_stats: ctx.reports.stats().clone(),
+                agent_tls: tls_state.clone(),
+                per_ip: Some(per_ip.clone()),
+                data_dir: paths.data_dir.clone(),
+                shutdown: shutdown.clone(),
+                agent_listen: agent_addr,
+            })
+            .await;
+            match started {
+                Ok(c) => Some(c),
+                Err(api::StartError::Certificate(e)) => return Err(cert_error(e)),
+                Err(api::StartError::Listen(e)) => return Err(listen_error(e)),
+                Err(api::StartError::Other(e)) if e.kind() == ErrorKind::InvalidInput => {
+                    return Err(config_error(e));
+                }
+                Err(api::StartError::Other(e)) => return Err(e),
+            }
+        }
+    };
+
     info!(
         "Kairos 已啟動，監聽 {}（連線上限 {}，其中握手中 {}，每個來源 IP {}，狀態表上限 {}，資料目錄 {}）",
         local_addr,
@@ -834,6 +894,10 @@ async fn run(
     // 所有階段共用以 T0（收到訊號的時間）起算的期限
     let t0 = shutdown.started_at().unwrap_or_else(Instant::now);
     info!("已停止接受新連線");
+    // 主控台：停止接受並中斷所有連線（含 SSE）
+    if let Some(console) = console {
+        let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), console.join()).await;
+    }
 
     while connections.try_join_next().is_some() {}
     info!(
@@ -999,17 +1063,23 @@ Max open files            1024                 524288               files     \n
 
     #[test]
     fn fd_limit_warning_suggests_concrete_fixes() {
-        // D4：Ubuntu 預設 soft 1024、範例設定 max_connections = 1024
-        let message = fd_limit_warning(1024, 1024).unwrap();
+        // D4：Ubuntu 預設 soft 1024、範例設定 max_connections = 1024（停用主控台時與 0.3 相同）
+        let message = fd_limit_warning(1024, 1024, 0).unwrap();
         assert_eq!(
             message,
             "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 1024，低於 server.max_connections（1024）加上預留的 64（共 1088）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE=4096，手動執行時先執行 ulimit -n 4096；或將 server.max_connections 調低至 960 以下（= 目前上限 1024 − 預留 64）"
         );
+        // D21：主控台的連線上限計入需要量
+        let message = fd_limit_warning(1100, 1024, 64).unwrap();
+        assert!(message.contains("console.max_connections 64"), "{message}");
+        assert!(message.contains("（共 1152）"), "{message}");
+        assert!(message.contains("調低至 972 以下"), "{message}");
+        assert_eq!(fd_limit_warning(1152, 1024, 64), None);
         // 足夠時不警告
-        assert_eq!(fd_limit_warning(1088, 1024), None);
-        assert_eq!(fd_limit_warning(u64::MAX, 65535), None);
+        assert_eq!(fd_limit_warning(1088, 1024, 0), None);
+        assert_eq!(fd_limit_warning(u64::MAX, 65535, 4096), None);
         // 需要量較大時建議值隨之提高；soft 小於預留量時不建議調低 max_connections
-        let message = fd_limit_warning(32, 10_000).unwrap();
+        let message = fd_limit_warning(32, 10_000, 64).unwrap();
         assert!(message.contains("LimitNOFILE=16384"), "{message}");
         assert!(!message.contains("調低"), "{message}");
     }
@@ -1035,6 +1105,8 @@ Max open files            1024                 524288               files     \n
         c.server.key_path = format!("{pki}server.key");
         c.server.reload_interval_secs = 1;
         c.storage.data_dir = dir.join("data").to_string_lossy().into_owned();
+        // 多個測試同時執行：主控台使用作業系統分配的連接埠
+        c.console.listen = "127.0.0.1:0".into();
         c
     }
 

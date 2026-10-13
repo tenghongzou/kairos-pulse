@@ -17,8 +17,8 @@ EXAMPLE_SRC=kairos.example.toml      # 產品目錄中的範例設定
 EXAMPLE_DST=kairos.example.toml      # 放進 tar 時的檔名
 UNIT_SRC=packaging/kairos.service    # systemd unit 範本
 # 其他放進 tar 根目錄的檔案（以空白分隔，路徑不可含空白）：CRL 定期更新的 unit 範例、
-# 資料儲存的說明
-EXTRA_SRC="packaging/kairos-crl.service packaging/kairos-crl.timer STORAGE.md"
+# 資料儲存與主控台 API 的說明
+EXTRA_SRC="packaging/kairos-crl.service packaging/kairos-crl.timer STORAGE.md API.md"
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
