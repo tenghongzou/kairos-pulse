@@ -11,6 +11,7 @@
 //! 實作 [`ReportStore`] 即可，連線端不需修改。架構、schema 與設定見 `kairos/STORAGE.md`。
 
 pub mod codec;
+pub mod import;
 pub mod rollup;
 pub mod sqlite;
 

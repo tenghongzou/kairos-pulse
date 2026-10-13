@@ -120,6 +120,27 @@ pub fn dir_permission_warning(path: &Path, what: &str) -> Option<String> {
     }
 }
 
+/// 從 `/proc/self/status` 的 `Uid:` 行取得 effective UID（第二個欄位）
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_effective_uid(status: &str) -> Option<u32> {
+    let line = status.lines().find(|l| l.starts_with("Uid:"))?;
+    line.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// 行程的 effective UID：只在 Linux 讀取 `/proc/self/status`；其他平台為 `None`
+/// （`kairos reports import` 以 root 執行時提醒改用服務帳號）
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn effective_uid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_effective_uid(&std::fs::read_to_string("/proc/self/status").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// 從 `/proc/self/status` 的 `Gid:` 行取得 effective GID（第二個欄位）
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_effective_gid(status: &str) -> Option<u32> {
@@ -202,6 +223,9 @@ mod tests {
             "Name:\tkairos\nUid:\t998\t998\t998\t998\nGid:\t997\t996\t997\t997\nGroups:\t997\n";
         assert_eq!(parse_effective_gid(status), Some(996));
         assert_eq!(parse_effective_gid("Name:\tx\n"), None);
+        let status = "Name:\tkairos\nUid:\t0\t998\t0\t0\nGid:\t0\t0\t0\t0\n";
+        assert_eq!(parse_effective_uid(status), Some(998));
+        assert_eq!(parse_effective_uid("Name:\tx\n"), None);
     }
 
     #[test]

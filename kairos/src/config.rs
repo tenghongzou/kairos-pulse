@@ -97,6 +97,7 @@ pub const LIST_SEPARATOR: &str = ",";
 pub const USAGE: &str = "用法: kairos [--config <path>]\n       \
 kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\n       \
 kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
+kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）\n       \
 kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \

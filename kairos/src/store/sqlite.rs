@@ -134,14 +134,36 @@ CREATE TABLE rollup_1h (
 ) WITHOUT ROWID;
 ";
 
+/// schema v2：`kairos reports import`（匯入 0.2.x 以前的 JSONL）的去重鍵，以及主機的來源
+/// （`kairos/STORAGE.md`「從 JSONL 升級」）
+const SCHEMA_V2: &str = "
+ALTER TABLE hosts ADD COLUMN source TEXT;
+
+CREATE TABLE import_keys (
+    host_id INTEGER NOT NULL,
+    ts      INTEGER NOT NULL,
+    hash    INTEGER NOT NULL,
+    PRIMARY KEY (host_id, ts, hash)
+) WITHOUT ROWID;
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: SCHEMA_V1,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        sql: SCHEMA_V2,
+    },
+];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// `hosts.source`：由 `kairos reports import` 建立的主機（由連線建立的為 NULL）
+pub const HOST_SOURCE_IMPORT: &str = "import";
 
 /// 序列（指標名稱＋單位＋label 組合）的數量上限。未啟用 mTLS 時任何人都能送出任意 label，
 /// 以此限制 `series` 表與記憶體快取；超過時含新序列的 report 回 `storage_unavailable`
@@ -206,7 +228,7 @@ impl SqliteOptions {
     }
 }
 
-fn db_error(context: &str, e: rusqlite::Error) -> Error {
+pub(super) fn db_error(context: &str, e: rusqlite::Error) -> Error {
     let kind = match e.sqlite_error_code() {
         Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly) => ErrorKind::PermissionDenied,
         Some(ErrorCode::CannotOpen) => ErrorKind::NotFound,
@@ -269,11 +291,18 @@ fn prepare_files(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// 開啟（必要時建立）資料庫、設定 PRAGMA 並升級 schema
-fn open_connection(opts: &SqliteOptions) -> Result<Connection, Error> {
+/// `kairos reports import` 開啟資料庫：與 [`open_connection`] 相同（必要時建立、升級 schema），但以
+/// `locking_mode = EXCLUSIVE` 取得資料庫檔的獨占鎖並保留到關閉。
+///
+/// WAL 模式下每條開啟中的連線都持有資料庫檔的 SHARED 鎖（SQLite 關閉 WAL 時就是以能否取得
+/// EXCLUSIVE 鎖判斷自己是不是最後一條連線），因此 Kairos 執行中（writer 與背景 checkpoint 的連線）
+/// 這裡會在 `busy` 之後回 [`ErrorKind::ResourceBusy`]；取得之後，匯入期間 Kairos 也無法啟動、
+/// `hosts list` 等唯讀查詢會等待後失敗，不會有第二個寫入者。exclusive 模式下 WAL 不使用共享記憶體
+/// （`-shm`），關閉時 checkpoint 並刪除 `-wal`。
+pub(super) fn open_exclusive(opts: &SqliteOptions, busy: Duration) -> Result<Connection, Error> {
     prepare_files(&opts.path)?;
     let path = opts.path.display().to_string();
-    let mut conn = Connection::open_with_flags(
+    let conn = Connection::open_with_flags(
         &opts.path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
@@ -281,8 +310,43 @@ fn open_connection(opts: &SqliteOptions) -> Result<Connection, Error> {
     )
     .map_err(|e| db_error(&format!("無法開啟 {path}"), e))?;
     let ctx = |what: &str| format!("{path}：{what}");
-    conn.busy_timeout(Duration::from_secs(5))
+    conn.busy_timeout(busy)
         .map_err(|e| db_error(&ctx("無法設定 busy_timeout"), e))?;
+    // 必須在第一次讀取之前設定，WAL 才不使用共享記憶體、改以資料庫檔的 EXCLUSIVE 鎖
+    conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")
+        .map_err(|e| match e.sqlite_error_code() {
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Error::new(
+                ErrorKind::ResourceBusy,
+                ctx("資料庫正在使用中（Kairos 執行中，或另一個 kairos 子命令正在使用）"),
+            ),
+            _ => db_error(&ctx("無法取得資料庫的獨占鎖"), e),
+        })?;
+    finish_open(conn, opts, &path)
+}
+
+/// 開啟（必要時建立）資料庫、設定 PRAGMA 並升級 schema
+fn open_connection(opts: &SqliteOptions) -> Result<Connection, Error> {
+    prepare_files(&opts.path)?;
+    let path = opts.path.display().to_string();
+    let conn = Connection::open_with_flags(
+        &opts.path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| db_error(&format!("無法開啟 {path}"), e))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| db_error(&format!("{path}：無法設定 busy_timeout"), e))?;
+    finish_open(conn, opts, &path)
+}
+
+/// [`open_connection`]、[`open_exclusive`] 共用：檢查 application_id、啟用 WAL、PRAGMA、升級 schema
+fn finish_open(
+    mut conn: Connection,
+    opts: &SqliteOptions,
+    path: &str,
+) -> Result<Connection, Error> {
+    let ctx = |what: &str| format!("{path}：{what}");
     check_application_id(&conn).map_err(|e| Error::new(e.kind(), format!("{path}：{e}")))?;
     let mode: String = conn
         .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
@@ -460,7 +524,7 @@ struct HostEntry {
 /// 主機、序列與 boot 的快取。交易失敗時整個清空、下一次寫入前從資料庫重新載入
 /// （失敗的交易中新建立的編號已不存在）
 #[derive(Debug, Default)]
-struct Caches {
+pub(super) struct Caches {
     loaded: bool,
     hosts: HashMap<String, HostEntry>,
     /// `name \x1f unit \x1f labels` → series_id
@@ -473,7 +537,7 @@ struct Caches {
 }
 
 impl Caches {
-    fn load(conn: &Connection) -> rusqlite::Result<Self> {
+    pub(super) fn load(conn: &Connection) -> rusqlite::Result<Self> {
         let mut caches = Caches::default();
         let mut stmt = conn.prepare("SELECT agent_id, host_id, rollup_until FROM hosts")?;
         let rows = stmt.query_map([], |r| {
@@ -545,7 +609,7 @@ impl Caches {
     }
 
     /// 序列編號；第一次出現時新增。數量已達 [`MAX_SERIES`] 時為 `None`
-    fn series_id(
+    pub(super) fn series_id(
         &mut self,
         tx: &Transaction,
         name: &str,
@@ -575,7 +639,7 @@ impl Caches {
     }
 
     /// v1 的三個欄位在彙總中對應的標準序列（記憶體換算成 bytes，與 v2 的指標合併）
-    fn legacy_series(&mut self, tx: &Transaction) -> rusqlite::Result<Option<[i64; 3]>> {
+    pub(super) fn legacy_series(&mut self, tx: &Transaction) -> rusqlite::Result<Option<[i64; 3]>> {
         if let Some(ids) = self.legacy {
             return Ok(Some(ids));
         }
@@ -595,7 +659,12 @@ impl Caches {
     }
 
     /// 去重鍵的 boot 編號（每台主機每個 boot_id 一列）
-    fn boot_ref(&mut self, tx: &Transaction, host_id: i64, boot_id: &str) -> rusqlite::Result<i64> {
+    pub(super) fn boot_ref(
+        &mut self,
+        tx: &Transaction,
+        host_id: i64,
+        boot_id: &str,
+    ) -> rusqlite::Result<i64> {
         if let Some((cached, boot_ref)) = self.boots.get(&host_id)
             && cached == boot_id
         {
@@ -1653,7 +1722,17 @@ impl SqliteStore {
 
 /// 把 5 分鐘桶的列合併進 `rollup_5m` 與 `rollup_1h`（已存在的列累加 min／max／sum／count，
 /// 不覆蓋）。寫出記憶體中的桶、以及遲到資料直接合併進已寫出的桶時共用
-fn merge_rollup_rows(tx: &Transaction, rows: &[RollupRow]) -> rusqlite::Result<()> {
+pub(super) fn merge_rollup_rows(tx: &Transaction, rows: &[RollupRow]) -> rusqlite::Result<()> {
+    merge_rollup_rows_from(tx, rows, None)
+}
+
+/// [`merge_rollup_rows`]，但 `bucket`（秒）早於 `rollup_5m_from` 的列只合併進 `rollup_1h`
+/// （`kairos reports import` 匯入超過 5 分鐘彙總保留期限的資料時，不寫入馬上就會被刪除的 5 分鐘桶）
+pub(super) fn merge_rollup_rows_from(
+    tx: &Transaction,
+    rows: &[RollupRow],
+    rollup_5m_from: Option<i64>,
+) -> rusqlite::Result<()> {
     let merge = |table: &str| {
         format!(
             "INSERT INTO {table} (host_id, bucket, series_id, vmin, vmax, vsum, cnt)
@@ -1668,15 +1747,17 @@ fn merge_rollup_rows(tx: &Transaction, rows: &[RollupRow]) -> rusqlite::Result<(
     for row in rows {
         let a = &row.agg;
         let count = i64::try_from(a.count).unwrap_or(i64::MAX);
-        m5.execute(params![
-            row.host_id,
-            row.bucket,
-            row.series_id,
-            a.min,
-            a.max,
-            a.sum,
-            count
-        ])?;
+        if rollup_5m_from.is_none_or(|from| row.bucket >= from) {
+            m5.execute(params![
+                row.host_id,
+                row.bucket,
+                row.series_id,
+                a.min,
+                a.max,
+                a.sum,
+                count
+            ])?;
+        }
         let hour = bucket_start(row.bucket * 1000, BUCKET_1H_SECS);
         h1.execute(params![
             row.host_id,

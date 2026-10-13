@@ -6,6 +6,7 @@ mod expiry;
 mod export_cli;
 mod fsperm;
 mod hosts_cli;
+mod import_cli;
 #[cfg(test)]
 mod integration_tests;
 mod logger;
@@ -457,7 +458,13 @@ fn main() -> ExitCode {
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
-                Some(a) if a == "reports" => export_cli::REPORTS_USAGE,
+                Some(a) if a == "reports" => {
+                    if std::env::args_os().nth(2).is_some_and(|a| a == "import") {
+                        import_cli::IMPORT_USAGE
+                    } else {
+                        export_cli::REPORTS_USAGE
+                    }
+                }
                 Some(a) if a == "db" => export_cli::DB_USAGE,
                 _ => USAGE,
             };

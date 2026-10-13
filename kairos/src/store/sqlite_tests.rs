@@ -148,6 +148,7 @@ fn fresh_database_has_the_current_schema() {
         "reports",
         "rollup_5m",
         "rollup_1h",
+        "import_keys",
     ] {
         assert_eq!(
             count(
@@ -163,7 +164,10 @@ fn fresh_database_has_the_current_schema() {
     drop(store);
     // 再開一次：不重複建立
     let (mut store, _) = open(&dir, noon);
-    assert_eq!(count(&mut store, "PRAGMA user_version"), 1);
+    assert_eq!(
+        count(&mut store, "PRAGMA user_version"),
+        i64::from(SCHEMA_VERSION)
+    );
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }

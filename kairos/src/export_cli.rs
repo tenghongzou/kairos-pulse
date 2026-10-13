@@ -20,6 +20,7 @@ pub const REPORTS_USAGE: &str = "kairos reports export — 以 JSON Lines 匯出
 
 用法：
   kairos reports export [選項] > reports.jsonl
+  kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）
 
 選項：
   --since <時間>     匯出取樣時間在最近這段時間內的 report，例如 30m、12h、7d（預設 1d）；
@@ -144,6 +145,10 @@ const DEFAULT_SINCE: Duration = Duration::from_secs(86_400);
 pub enum ReportsCommand {
     Help,
     Export(ExportOptions),
+    /// `kairos reports import --help`
+    ImportHelp,
+    /// `kairos reports import`（見 [`crate::import_cli`]）
+    Import(crate::import_cli::ImportOptions),
 }
 
 /// `kairos reports export` 的選項
@@ -168,12 +173,16 @@ impl Default for ExportOptions {
 pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<ReportsCommand, String> {
     let mut args = args.peekable();
     match args.next() {
-        None => return Err("kairos reports 需要子命令（目前只有 export）".to_string()),
+        None => return Err("kairos reports 需要子命令（export 或 import）".to_string()),
         Some(a) if a == "-h" || a == "--help" => return Ok(ReportsCommand::Help),
         Some(a) if a == "export" => {}
+        Some(a) if a == "import" => {
+            return Ok(crate::import_cli::parse_args(&mut args)?
+                .map_or(ReportsCommand::ImportHelp, ReportsCommand::Import));
+        }
         Some(a) => {
             return Err(format!(
-                "無法辨識的子命令: {}（目前只有 export）",
+                "無法辨識的子命令: {}（export 或 import）",
                 a.to_string_lossy()
             ));
         }
@@ -230,6 +239,11 @@ pub fn run(cmd: ReportsCommand) -> u8 {
             println!("{REPORTS_USAGE}");
             return 0;
         }
+        ReportsCommand::ImportHelp => {
+            println!("{}", crate::import_cli::IMPORT_USAGE);
+            return 0;
+        }
+        ReportsCommand::Import(opts) => return crate::import_cli::run(opts),
         ReportsCommand::Export(opts) => opts,
     };
     let title = "無法產生匯出檔案";
@@ -306,6 +320,7 @@ mod tests {
         for bad in [
             &[][..],
             &["import"],
+            &["delete"],
             &["export", "--since"],
             &["export", "--since", "yesterday"],
             &["export", "--agent", "web-01"],
