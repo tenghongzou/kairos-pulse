@@ -26,9 +26,9 @@
 
 | 項目 | 值 |
 |---|---|
-| 安裝目錄 | `/opt/pulse`（擁有者 `root:pulse`，750） |
+| 安裝目錄 | `/opt/pulse`（擁有者 `root:pulse`，751：其他使用者只能執行已知名稱的檔案，例如 `pulse status`，不能列出或讀取設定與私鑰） |
 | 服務使用者 | `pulse`（系統帳號，不能登入） |
-| 可寫目錄 | `/opt/pulse/logs`、`/opt/pulse/buffer`（本機緩衝；擁有者 `pulse`） |
+| 可寫目錄 | `/opt/pulse/logs`、`/opt/pulse/buffer`（本機緩衝；擁有者 `pulse`）；`/var/lib/pulse`（本機狀態檔，由 unit 的 `StateDirectory=pulse` 建立，0755） |
 | Kairos | `monitor.example.com:8080`（換成 Kairos 管理者提供的位址與憑證名稱） |
 
 **從第 2 節起，請在同一個 root shell 中依序執行**：
@@ -39,10 +39,10 @@ sudo -i          # 之後的指令都在這個 shell 中執行；本文件的 ~ 
 
 不能只在每個指令前加 `sudo`：
 
-- `/opt/pulse` 的權限是 750（第 4 節），一般帳號無法 `cd` 進去，而 `sudo cd` 不存在。
+- `/opt/pulse` 的權限是 751（第 4 節），一般帳號無法列出或 `cd` 進去後建立檔案，而 `sudo cd` 不存在。
 - 第 5 節的 `agent.id`、`client.key` 與 CSR 都寫到**目前目錄**，必須先 `cd /opt/pulse`；在別的目錄執行會把 `agent.id` 寫到錯的地方，服務啟動時讀不到（`/opt/pulse` 在服務中唯讀，無法自行建立）。
 - 第 5 節設定的 `AGENT_ID`、`umask` 只在同一個 shell 中有效。
-- `/opt/pulse/pulse --version`、讀取 `logs/` 等確認步驟也需要 root（一般帳號會 `Permission denied`）。
+- 讀取 `logs/` 等確認步驟也需要 root（一般帳號會 `Permission denied`）；`/opt/pulse/pulse --version` 與 `pulse status` 一般帳號即可執行。
 
 中途離開了 root shell 時，重新 `sudo -i`，並從該節開頭（含 `cd`）重新執行。
 
@@ -105,7 +105,7 @@ tar 內有一層目錄，所以要加 `--strip-components=1`。
 useradd --system --user-group --home-dir /opt/pulse --no-create-home \
   --shell /usr/sbin/nologin pulse
 
-install -d -o root  -g pulse -m 750 /opt/pulse
+install -d -o root  -g pulse -m 751 /opt/pulse
 install -d -o pulse -g pulse -m 750 /opt/pulse/logs
 install -d -o pulse -g pulse -m 750 /opt/pulse/buffer
 
@@ -115,7 +115,7 @@ install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.
   CHANGELOG.md ERROR-CODES.md THIRD-PARTY-LICENSES /opt/pulse/
 ```
 
-`/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/` 與 `buffer/`。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。`buffer/` 是本機緩衝（斷線或 Kairos 維護期間的資料暫存在這裡，Kairos 確認後才刪除，見第 6.2 節）；沒有建立時服務仍會啟動，但 Pulse 無法寫入緩衝，記 `ERROR` 後改為 at-most-once（斷線期間的資料不補送）。
+`/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；其他使用者（751）只能執行 `/opt/pulse/pulse`（例如 `pulse status`），不能列出目錄，也讀不到 640 的 `pulse.toml`、`agent.id`、`client.key` 與 750 的 `logs/`、`buffer/`。unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/`、`buffer/` 與 systemd 建立的 `/var/lib/pulse`（本機狀態檔，第 8.2 節；不需要手動建立）。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。`buffer/` 是本機緩衝（斷線或 Kairos 維護期間的資料暫存在這裡，Kairos 確認後才刪除，見第 6.2 節）；沒有建立時服務仍會啟動，但 Pulse 無法寫入緩衝，記 `ERROR` 後改為 at-most-once（斷線期間的資料不補送）。
 
 ## 5. 產生 agent_id 並申請客戶端憑證
 
@@ -208,13 +208,14 @@ install -o root -g pulse -m 644 client.pem /opt/pulse/client.pem
 
 | 路徑 | 擁有者 | 權限 |
 |---|---|---|
-| `/opt/pulse` | `root:pulse` | 750 |
+| `/opt/pulse` | `root:pulse` | 751（其他使用者只能執行已知名稱的檔案） |
 | `pulse`（執行檔） | `root:root` | 755 |
 | `pulse.toml` | `root:pulse` | 640 |
 | `ca.pem`、`client.pem` | `root:pulse` | 644 |
 | `client.key`、`agent.id` | `root:pulse` | 640 |
 | `logs/` | `pulse:pulse` | 750 |
 | `buffer/`（Pulse 建立的檔案為 640） | `pulse:pulse` | 750 |
+| `/var/lib/pulse`（unit 的 `StateDirectory=pulse` 建立；`status.json` 為 644，不含秘密） | `pulse:pulse` | 755 |
 
 `$AGENT_ID.csr`（`/opt/pulse` 內與 `/tmp` 的副本）交出去後可以刪除。
 
@@ -273,7 +274,7 @@ systemctl enable --now pulse
 systemctl status pulse --no-pager
 ```
 
-確認清單（在 root shell 中執行；`/opt/pulse` 為 750，一般帳號執行會 `Permission denied`）：
+確認清單（在 root shell 中執行；`logs/` 為 750，一般帳號讀取會 `Permission denied`；`pulse status` 一般帳號也可以執行）：
 
 ```bash
 /opt/pulse/pulse --version                      # pulse <版本> (<commit>)
@@ -287,7 +288,7 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 ```
 [INFO] agent.start - Pulse 地端程式啟動（pulse <版本> (<commit>)，PID <PID>）...
 [INFO] 工作目錄：/opt/pulse（設定中的相對路徑都以此為準）；設定檔：已讀取 /opt/pulse/pulse.toml
-[INFO] 本機狀態檔：/opt/pulse/logs/status.json（pulse status 讀取）
+[INFO] 本機狀態檔：/var/lib/pulse/status.json（pulse status 讀取）
 [INFO] 已載入客戶端憑證：client.pem（憑證鏈 1 張；私鑰：client.key）
 [INFO] buffer.opened - 本機緩衝：/opt/pulse/buffer（待送 0 筆、0 bytes；…）
 [INFO] conn.registered - 已向伺服器註冊（agent_id=…，伺服器離線判定 75000 ms，協定 v2；TLS 加密連線 monitor.example.com:8080，domain=monitor.example.com，TLSv1_3，已驗證伺服器憑證）
@@ -354,7 +355,7 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 ### 8.2 `pulse status` 與本機狀態檔
 
-Pulse 每 10 秒（狀態改變時另外）把目前的狀態寫到 `/opt/pulse/logs/status.json`（`pulse.toml` 的 `[status] file` 可改），`pulse status` 讀取它並向 systemd 查詢 `pulse.service`，不連線、不影響服務。完整說明與 `--json` 欄位見 `README.md`「本機狀態（pulse status）」。
+Pulse 每 10 秒（狀態改變時另外）把目前的狀態寫到 `/var/lib/pulse/status.json`（unit 的 `StateDirectory=pulse` 建立，`pulse.toml` 的 `[status] file` 可改），`pulse status` 讀取它並向 systemd 查詢 `pulse.service`，不連線、不影響服務，**一般帳號即可執行**。完整說明與 `--json` 欄位見 `README.md`「本機狀態（pulse status）」。
 
 ```bash
 /opt/pulse/pulse status            # 人看的檢查列；有問題時另印原因與處理方式
@@ -369,8 +370,9 @@ Pulse 每 10 秒（狀態改變時另外）把目前的狀態寫到 `/opt/pulse/
 | 9 | 離線（重新連線中，未滿 30 分鐘）、嚴重（需要人工處理、中斷滿 30 分鐘、服務未執行）、未知（狀態檔超過 60 秒沒有更新） |
 | 10 | 沒有權限讀取狀態檔 |
 
-- **權限**：狀態檔為 `pulse:pulse 640`，所在的 `/opt/pulse`（`root:pulse 750`）與 `logs/`（`pulse:pulse 750`）只有 root 與 `pulse` 群組可以進入。一般帳號要執行時，把它加入 `pulse` 群組（`usermod -aG pulse <帳號>`，重新登入後生效）；否則以 `sudo` 執行。狀態檔不含私鑰或 token。
-- **設定檔的位置**：在任何目錄執行 `/opt/pulse/pulse status` 都會讀 `/opt/pulse/pulse.toml`（執行檔所在的目錄）；多實例時在 `/opt/pulse-N` 目錄執行，或加上 `--config /opt/pulse-N/pulse.toml`。
+- **權限**：狀態檔 `/var/lib/pulse/status.json` 為 `pulse:pulse 644`、目錄 0755，所有人可讀；執行檔 `/opt/pulse/pulse` 在 751 的 `/opt/pulse` 中，所有人可執行。狀態檔不含私鑰、token；**未啟用 mTLS 時也不含 agent_id**（此時 agent_id 等同身分憑據），一般帳號的 `pulse status` 標頭顯示「未啟用 mTLS，不顯示」，root 執行時從 `agent.id` 讀取。
+- **設定檔的位置**：在任何目錄執行 `/opt/pulse/pulse status` 都會讀 `/opt/pulse/pulse.toml`（執行檔所在的目錄；一般帳號讀不到時使用預設值，狀態檔仍在預設位置）。多實例 N 請加 `--instance N`（讀 `/var/lib/pulse/N/status.json`）。
+- **沿用舊 unit（沒有 `StateDirectory=`）時**：`/var/lib/pulse` 在 `ProtectSystem=strict` 下不可寫，Pulse **照常啟動與監控**，把狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`status.write_failed PLS-E8204`）；`sudo pulse status` 仍可使用，「設定」列為警告（結束代碼 8）並提示更新 unit，一般帳號則讀不到（結束代碼 10）。換上新版 unit 後，Pulse 改寫 `/var/lib/pulse` 並刪除 `logs/` 中的舊檔。
 - **登入提示**（選用，預設不安裝）：在 `/etc/update-motd.d/` 加一個腳本，例如 `/etc/update-motd.d/90-pulse`（755）：
 
   ```sh
@@ -393,18 +395,20 @@ Pulse 每 10 秒（狀態改變時另外）把目前的狀態寫到 `/opt/pulse/
 N=2                                   # 每個實例換一個編號；以下所有步驟都依賴這個變數
 
 # 1. 目錄（第 4 節）
-install -d -o root  -g pulse -m 750 /opt/pulse-$N
+install -d -o root  -g pulse -m 751 /opt/pulse-$N
 install -d -o pulse -g pulse -m 750 /opt/pulse-$N/logs
 install -d -o pulse -g pulse -m 750 /opt/pulse-$N/buffer
 
-# 2. unit：只改 WorkingDirectory 與 ReadWritePaths 兩行（ReadWritePaths 的兩個路徑都改，所以用 g）；
+# 2. unit：只改 WorkingDirectory、ReadWritePaths（兩個路徑都改，所以用 g）與 StateDirectory 三行；
 #    ExecStart 仍指向共用的執行檔，註解與 Documentation= 不變
 sed -e "/^\(WorkingDirectory\|ReadWritePaths\)=/s#/opt/pulse#/opt/pulse-$N#g" \
+    -e "s#^StateDirectory=pulse\$#StateDirectory=pulse/$N#" \
     /etc/systemd/system/pulse.service > /etc/systemd/system/pulse-$N.service
 chmod 644 /etc/systemd/system/pulse-$N.service
-grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart)=' /etc/systemd/system/pulse-$N.service
+grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart|StateDirectory)=' /etc/systemd/system/pulse-$N.service
 #   WorkingDirectory=/opt/pulse-2
 #   ExecStart=/opt/pulse/pulse
+#   StateDirectory=pulse/2          ← 狀態檔 /var/lib/pulse/2/status.json（Pulse 依 STATE_DIRECTORY 自動使用）
 #   ReadWritePaths=/opt/pulse-2/logs -/opt/pulse-2/buffer
 
 # 3. agent_id（第 5.1 節，在 /opt/pulse-N 執行）
@@ -441,7 +445,7 @@ systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/pulse-$N.service   # 沒有輸出表示格式正確
 systemctl enable --now pulse-$N
 tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄：/opt/pulse-N」與「已向伺服器註冊」
-/opt/pulse/pulse status --config /opt/pulse-$N/pulse.toml    # 查詢 pulse-N.service 與 /opt/pulse-N/logs/status.json
+/opt/pulse/pulse status --instance $N                        # 查詢 pulse-N.service 與 /var/lib/pulse/N/status.json
 ```
 
 - 每個實例的 agent_id 不同，客戶端憑證要分別簽發；不要把第一個實例的 `client.pem`、`client.key` 複製過去（SAN 不符，啟動即結束）。
@@ -502,6 +506,13 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chown root:pulse /opt/pulse/agent.id /opt/pulse/client.key
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
+- **升級到 0.4（本機狀態檔與 `pulse status`）**：新版 unit 多了 `StateDirectory=pulse`、`StateDirectoryMode=0755`，請依步驟 2 換上（多實例時依第 9 節步驟 2 重新產生，`StateDirectory=pulse/N`），並讓一般帳號可以執行 `pulse status`：
+
+  ```bash
+  chmod 751 /opt/pulse /opt/pulse-[0-9]* 2>/dev/null
+  ```
+
+  沒有換 unit 時服務照常啟動與監控（不會因狀態檔而失敗）：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`PLS-E8204`），只有 root 能執行 `pulse status`，「設定」列提示更新 unit（第 8.2 節）。換上後重新啟動，`pulse status` 的「設定」列不再有 `PLS-E8204`。
 - 升級前請看新版發佈包中的 `CHANGELOG.md`「破壞性變更與升級步驟」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
 - **升級到 0.3.0**：新版預設啟用本機緩衝（第 6.2 節），升級前先建立緩衝目錄並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/buffer`；多實例時對每個 `/opt/pulse-N` 建立目錄並重新產生 `pulse-N.service`）：
 
@@ -550,12 +561,13 @@ for id in $(cat /opt/pulse/agent.id /opt/pulse-[0-9]*/agent.id 2>/dev/null); do
 done
 rm -rf /opt/pulse-[0-9]*   # 多實例的工作目錄（含私鑰、agent.id 與日誌）
 rm -rf /opt/pulse          # 含共用執行檔、客戶端私鑰、agent.id 與日誌
+rm -rf /var/lib/pulse      # 本機狀態檔（StateDirectory=，停止服務後不會自動刪除）
 userdel pulse              # 同名群組 pulse 會一併移除
 
 # 6. 確認沒有殘留
 systemctl list-units --all 'pulse*' --no-legend      # 應無輸出
 systemctl list-unit-files 'pulse*' --no-legend       # 應無輸出
-ls -d /opt/pulse* 2>/dev/null                        # 應無輸出
+ls -d /opt/pulse* /var/lib/pulse 2>/dev/null         # 應無輸出
 ```
 
 請 Kairos 管理者撤銷每個實例的客戶端憑證（Kairos 的 `INSTALL.md`「撤銷與定期更新 CRL」）。Kairos 的狀態表會在離線 24 小時後自動移除這些 agent。

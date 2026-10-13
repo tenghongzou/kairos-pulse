@@ -55,9 +55,17 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 ### Pulse：新增
 
 - **`pulse status`**（設計包 `pulse/cli-spec.md` §4）：讀取本機狀態檔與服務管理員（systemd、Windows 服務控制管理員），顯示服務、連線、回報、身分、設定、時鐘六列與本機狀態（線上／警告／離線／嚴重／未知），問題另以三段式說明（標題、原因、處理方式與代碼）寫到 stderr。`--brief`（單行）、`--json`（`pulse.status/v1`，純 ASCII）、`--watch [秒]`、`--exit-codes=nagios`、`--config`、`--ascii`、`--color`。不需要連線；結束代碼 0 線上、8 警告、9 離線／嚴重／未知、2 用法錯誤、10 無法讀取狀態檔。「回報」列寫出補送資訊：待補送筆數、最舊一筆的取樣時間、預計補完時間、最近 24 小時內因緩衝已滿或超過保存時間而丟棄的筆數與取樣時間範圍（`PLS-W4202`／`PLS-W4203`）、無法寫入緩衝（`PLS-W4103`）、緩衝無法使用（`PLS-E4004`）、Kairos 暫時無法保存（`PLS-W4101`）。README「本機狀態（pulse status）」、INSTALL 第 8.2 節
-- **本機狀態檔**（`[status] file`，預設 `logs/status.json`）：執行中每 10 秒、狀態變化時另外以原子方式改寫（暫存檔＋rename，不 fsync，Unix 0640），內容不含秘密；以單調時鐘判斷是否過時（超過 60 秒為「未知」，`PLS-W8004`），正常結束前寫入結束代碼
+- **本機狀態檔**（`cli-spec.md` §4.1）：Linux `/var/lib/pulse/status.json`（`pulse.service` 新增 `StateDirectory=pulse`；多實例 `StateDirectory=pulse/N` 時依 `STATE_DIRECTORY` 寫 `/var/lib/pulse/N/`），Windows `%ProgramData%\Pulse\status.json`；`[status] file` 可改。**所有人可讀**（Unix 0644、目錄 0755，不受 unit 的 `UMask=0077` 影響；Windows 授予 Users 讀取），`pulse status` 不需要 root。執行中每 10 秒、狀態變化時另外以原子方式改寫（暫存檔＋rename，不 fsync）。內容不含秘密：沒有私鑰、token；未啟用 mTLS 時不含 agent_id（等同身分憑據）。以單調時鐘判斷是否過時（超過 60 秒為「未知」，`PLS-W8004`），正常結束前寫入結束代碼
 - **`pulse explain <代碼>`**：印出錯誤代碼的標題；發佈包新增 `ERROR-CODES.md`（代碼 → 程式位置 → 觸發條件的對照表，與尚未實作的代碼）
-- 子命令 `pulse run`（等同不帶參數）
+- 子命令 `pulse run`（等同不帶參數）；`pulse status --instance <N>`（多實例）
+
+### Pulse：升級步驟
+
+1. 換上新版 `pulse.service`（新增 `StateDirectory=pulse`、`StateDirectoryMode=0755`；多實例依 Pulse INSTALL.md 第 9 節重新產生，`StateDirectory=pulse/N`），`systemctl daemon-reload`。
+2. `chmod 751 /opt/pulse`（多實例的 `/opt/pulse-N` 也是）：一般帳號才能執行 `/opt/pulse/pulse status`；仍無法列出目錄或讀取 640 的設定、私鑰與 `agent.id`。
+3. 重新啟動 Pulse，`pulse status` 確認（結束代碼 0）。
+
+沒有換 unit 時**服務照常啟動與監控**：`/var/lib/pulse` 不可寫，狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 只有 root 能用，「設定」列為警告（結束代碼 8）。
 
 ### Pulse：變更
 
@@ -69,7 +77,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### Pulse：與設計包的差異與待辦
 
-見 `pulse/ERROR-CODES.md` §4、§5：狀態檔在工作目錄的 `logs/`（設計包為 `/var/lib/pulse`），`pulse status` 需要 root 或 `pulse` 群組；尚未實作 Windows 事件記錄、服務描述、`log-ux.md` 的完整格式（RFC 3339 時間、JSON）與重試摘要、`--all`、`--json-lines`，以及 53 個與註冊、安裝、自動更新憑證相關的代碼。
+見 `pulse/ERROR-CODES.md` §4、§5：尚未實作 Windows 事件記錄、服務描述、`log-ux.md` 的完整格式（RFC 3339 時間、JSON）與重試摘要、`--all`、`--json-lines`，以及 53 個與註冊、安裝、自動更新憑證相關的代碼。
 
 ## [0.3.0] - 〔草稿：發佈日期待定〕
 

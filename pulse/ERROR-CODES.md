@@ -80,7 +80,7 @@
 | `PLS-W4203` | `network.rs` `Delivery::prepare_next` | 待補送資料超過 `buffer.max_age_hours`，送出前丟掉 | `buffer.expired`（節流 5 分鐘）；最近 24 小時內回報列 ⚠ |
 | `PLS-W4201` | `log_files.rs` `log_event` | 系統日期異常，暫停清除日誌 | `log.retention_paused` |
 | `PLS-E4002` | `main.rs` `main` | 無法初始化日誌（結束代碼 1） | stderr |
-| `PLS-E8204` | `local_status.rs` `run_writer` | 無法寫入狀態檔（節流 10 分鐘，恢復時記 INFO） | `status.write_failed`；`pulse status` 隨後顯示「未知」 |
+| `PLS-E8204` | `local_status.rs` `Tracker::write_locked`、`run_writer` | 預設位置（`/var/lib/pulse`、`%ProgramData%\Pulse`）無法寫入而改寫 `logs/status.json`（記一次）；指定的 `status.file` 無法寫入（節流 10 分鐘，恢復時記 INFO） | `status.write_failed`；前者為「設定」列 ⚠（提示更新 unit），後者 `pulse status` 隨後顯示「未知」 |
 | `PLS-W8005` | `system_info.rs` `Sampler::refresh_and_read`、`check_stuck` | 系統資訊取樣逾時 | `sample.timeout` |
 
 ### 2.5 `pulse status` 專用
@@ -141,7 +141,7 @@
 
 | 項目 | 設計包 | 實作 | 理由 |
 |---|---|---|---|
-| 狀態檔位置與權限 | `/var/lib/pulse/status.json`、`C:\ProgramData\Pulse\status.json`，所有人可讀（`cli-spec.md` §4.1） | 工作目錄下的 `logs/status.json`（`status.file` 可改），Unix 0640 | 這個版本的安裝佈局是 `/opt/pulse`（0750）且 unit 只允許寫 `logs/`、`buffer/`；放在 `logs/` 不必改 unit，升級沿用舊 unit 也能寫。`/opt/pulse` 本身就只有 root 與 pulse 群組可進入，因此一般帳號執行 `pulse status` 會得到結束代碼 10 |
+| 狀態檔的備用位置 | `/var/lib/pulse/status.json`、`%ProgramData%\Pulse\status.json`，所有人可讀（`cli-spec.md` §4.1） | 依設計（2026-10-13 使用者決定）；另外在預設位置無法寫入時（沿用沒有 `StateDirectory=` 的舊 unit）改寫工作目錄的 `logs/status.json` 並以 `PLS-E8204` 警告 | 舊 unit 在 `ProtectSystem=strict` 下不能寫 `/var/lib/pulse`；不讓服務因狀態檔而啟動失敗。此時只有 root／`pulse` 群組讀得到 |
 | `pulse status` 的結束代碼 10 | §1.3 只列 0／7／8／9／2 | 無法讀取狀態檔時為 10（`cli-style.md` §8「權限不足」，`--json` 的 `ok: false`、`error`） | 權限不足時無法判斷主機狀態，不應回 9 讓監控誤判為「嚴重」；SCCM 以 SYSTEM 執行，不會遇到 |
 | 「身分」列 | 「…，2027-06-09 起自動更新」 | 沒有這一段；14 天內到期為 `PLS-W1110`（不會自動更新） | 這個版本沒有自動更新憑證 |
 | `PLS-E2003` 的說明 | 原因寫出解析出的 IP；處理方式 `sudo pulse check-config --connect` | 不寫 IP；以 `nc -vz <主機> <埠>`（Windows `Test-NetConnection`）檢查 | 連線失敗時拿不到實際連線的位址；`pulse check-config` 尚未實作 |
@@ -155,7 +155,7 @@
 
 ## 6. SCCM 指令碼核對（`design/pulse/sccm/*.ps1`）
 
-- `Get-PulseHealth.ps1` 執行 `pulse.exe status --json`（不帶 `--config`）：`pulse status` 依序找目前目錄、**`pulse.exe` 所在目錄**的 `pulse.toml`，以及執行檔所在目錄的 `logs/status.json`。Pulse 以服務執行時工作目錄須設為 Pulse 所在的目錄（README「設定」），因此與執行檔放在同一目錄時 SCCM 不需要額外參數。
+- `Get-PulseHealth.ps1` 執行 `pulse.exe status --json`（不帶參數）：狀態檔在固定位置 `%ProgramData%\Pulse\status.json`（與設計包相同），SCCM 不需要額外參數；`pulse.toml` 依序找目前目錄與 `pulse.exe` 所在目錄。服務的寫入位置不可寫時，也會讀 `pulse.exe` 所在目錄的 `logs\status.json`。
 - 讀取的欄位 `schema`（`pulse.status/*`）與 `data.status`（6 個值）一致；結束代碼 0／7／8／9 一致。不一致：無法讀取狀態檔時 `pulse status` 回 10、`data` 為 `null`，指令碼會落到「結束代碼不在預期範圍」而回報 `error`（SCCM 以 SYSTEM 執行，實務上不會發生）。
 - `--json` 為純 ASCII、stderr 為空，30 秒逾時足夠（`pulse status` 不連線；`systemctl` 查詢上限 5 秒，Windows 為直接呼叫服務控制管理員）。
 - `Detect-PulseInstalled.ps1` 讀服務 `Pulse` 的 ImagePath、`pulse.exe` 的檔案版本與 `install-result.json`：Pulse 目前沒有 MSI，也不產生 `install-result.json`，執行檔沒有設定 Windows 檔案版本資源（`FileMajorPart` 等為 0）；以 `$MinimumVersion = 0.2.0` 判斷時會判為未安裝。這是 MSI 與建置時版本資源的待辦，不影響 `pulse status`。

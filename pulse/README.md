@@ -352,7 +352,7 @@ max_age_hours = 168            # 取樣超過這麼久（小時）的資料不�
 replay_interval_ms = 1200      # 兩筆 report 之間的最短間隔（毫秒；補送積壓的速率，不超過 report.interval 的 60%）
 
 [status]
-file = "logs/status.json"      # 本機狀態檔（pulse status 讀取；相對於工作目錄）
+file = ""                      # 本機狀態檔；空字串 = /var/lib/pulse/status.json（Windows %ProgramData%\Pulse\status.json）
 
 [log]
 level = "info"                 # 日誌級別：trace / debug / info / warn / error（不分大小寫）
@@ -395,7 +395,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `buffer.max_records` | 100～10000000 | |
 | `buffer.max_age_hours` | 1～8760 小時 | |
 | `buffer.replay_interval_ms` | 500～60000 毫秒 | 下限 500 毫秒對應 Kairos 的 report 速率限制（每秒 2 則）。實際使用的值不超過 `report.interval` 的 60%（否則積壓補不完；被調整時啟動記 `INFO`） |
-| `status.file` | 非空白字串 | |
+| `status.file` | 空字串或路徑 | 空字串為預設位置（見「本機狀態（pulse status）」） |
 
 ### ⚠️ 安全性提醒
 
@@ -523,7 +523,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 依設計包 `pulse/cli-spec.md` §4。`pulse status` **不連線、不影響服務**：只讀取執行中的 Pulse 寫出的本機狀態檔，並向 systemd／Windows 服務控制管理員查詢服務狀態。
 
 ```
-$ sudo /opt/pulse/pulse status
+$ /opt/pulse/pulse status
 Pulse 0.3.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-112233445566
 
 ✓ 通過 服務   pulse.service 執行中（PID 4151145，已執行 12 天 4 小時）
@@ -549,6 +549,7 @@ Pulse 0.3.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 | `--watch [秒]` | 每 N 秒（預設 2）重新顯示，按 Ctrl+C 結束 |
 | `--exit-codes=nagios` | 單行輸出，結束代碼為 Nagios 慣例（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN） |
 | `-c, --config <路徑>` | 指定 `pulse.toml`；狀態檔等相對路徑以它所在的目錄解析 |
+| `--instance <N>` | 多實例 N：讀 `/var/lib/pulse/N/status.json`，查詢 `pulse-N.service` |
 | `-q`／`-v` | 不顯示警告等級的說明／說明中加上技術細節 |
 
 **本機狀態與結束代碼**（`cli-spec.md` §1.2、§1.3）：
@@ -566,18 +567,18 @@ Pulse 0.3.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 
 **「回報」列的補送資訊**：連線中有積壓時寫「補送中：待補送 N 筆（最舊…），預計約…補完」（預計時間＝待補送筆數 ÷（1000 ÷ 實際補送間隔 − 1 ÷ `report.interval`））；中斷中寫待補送筆數與緩衝用量（達 80% 時提醒）；不補送時（停用緩衝、緩衝無法使用、連上 0.2 以前的 Kairos）寫原因。
 
-**設定檔與狀態檔的位置**：`pulse status` 依序找 `--config`、目前目錄的 `pulse.toml`、`pulse` 執行檔所在目錄的 `pulse.toml`（發佈包的佈局是兩者都在 `/opt/pulse`，因此在任何目錄執行 `/opt/pulse/pulse status` 都可以）。都沒有時以目前目錄為準。狀態檔為 `status.file`（預設工作目錄下的 `logs/status.json`）。設定檔有誤時仍以預設位置讀取狀態檔，並在「設定」列顯示錯誤（`PLS-E0101`／`PLS-E0201`）。多實例時在該實例的目錄執行，或以 `--config /opt/pulse-N/pulse.toml` 指定。
+**設定檔與狀態檔的位置**：`pulse status` 依序找 `--config`、目前目錄的 `pulse.toml`、`pulse` 執行檔所在目錄的 `pulse.toml`（發佈包的佈局是兩者都在 `/opt/pulse`，因此在任何目錄執行 `/opt/pulse/pulse status` 都可以；一般帳號讀不到 640 的 `pulse.toml` 時使用預設值）。狀態檔為 `status.file`，未設定時為設計包的位置：Linux `/var/lib/pulse/status.json`（多實例 N 為 `/var/lib/pulse/N/status.json`，加 `--instance N`），Windows `%ProgramData%\Pulse\status.json`；另外也讀工作目錄的 `logs/status.json`（沿用舊 unit 時的備用位置），兩者都有時取較新的。設定檔有誤時仍以預設位置讀取狀態檔，並在「設定」列顯示錯誤（`PLS-E0101`／`PLS-E0201`）。
 
 **服務狀態**：Linux 以 `systemctl show`（一般帳號可執行，最多等 5 秒）查詢 Pulse 寫在狀態檔中的 unit（以 systemd 啟動時自動偵測，例如 `pulse-2.service`，沒有時為 `pulse.service`）；Windows 查詢服務 `Pulse`。找不到服務時（前景執行、容器、服務包裝工具使用其他名稱），以狀態檔記錄的 PID 是否還在判斷（「未由服務管理員管理」）。「最近 1 小時重新啟動 ≥ 3 次」依狀態檔記錄的啟動時間計算。
 
 **本機狀態檔**（`status_file.rs`、`local_status.rs`）：
 
-- 內容：版本、PID、啟動時間、設定檔、連線（協商的協定版本與 features、最近的錯誤代碼、上次被拒的原因、上一次中斷的期間）、回報（最後回報與確認時間、最近 1 小時的取樣／確認／拒收筆數、投遞方式）、本機緩衝（待補送筆數與 bytes、最舊一筆的取樣時間、上限與用量、累計丟棄筆數與被丟掉的取樣時間範圍、`last_dropped_at`、寫入失敗）、用戶端憑證（序號、有效期間）、時鐘偏差、設定與權限警告。不含私鑰、token 或未清理的伺服器文字。schema `pulse.status-file/v1`，只新增欄位。
+- 內容：版本、PID、啟動時間、設定檔、連線（協商的協定版本與 features、最近的錯誤代碼、上次被拒的原因、上一次中斷的期間）、回報（最後回報與確認時間、最近 1 小時的取樣／確認／拒收筆數、投遞方式）、本機緩衝（待補送筆數與 bytes、最舊一筆的取樣時間、上限與用量、累計丟棄筆數與被丟掉的取樣時間範圍、`last_dropped_at`、寫入失敗）、用戶端憑證（路徑、序號、有效期間）、時鐘偏差、設定與權限警告。**不含秘密**：沒有私鑰（也不寫私鑰路徑）、token 或未清理的伺服器文字；未啟用 mTLS 時 `agent_id` 等同身分憑據，不寫入，其他欄位中出現的 agent_id 換成 `<agent_id>`（`agent_id_hidden: true`；`pulse status` 由 root 執行時從 `agent.id` 讀取）。schema `pulse.status-file/v1`，只新增欄位。
 - 寫入：每 10 秒一次，連線狀態、錯誤代碼、緩衝狀態改變或丟棄資料時另外寫（兩次至少間隔 1 秒；補送中待補送筆數每秒都在變，不另外寫）。以同目錄的暫存檔（`create_new`、隨機檔名）寫入後 rename 取代，讀取端只會看到完整的舊檔或新檔。正常結束前寫最後一份（`running: false` 與結束代碼）。
 - 磁碟負擔的取捨：一份約 3～5 KB，每 10 秒一次約 0.4 KB/s（一天約 40 MB 的寫入量）；**不 fsync**，大部分寫入在作業系統的快取中合併。狀態檔只描述「現在」，斷電後下一次寫入（10 秒內）就會更新；少數檔案系統斷電後可能留下空檔，`pulse status` 視為無法解析（未知），服務啟動 10 秒內恢復。
 - 過時判斷：寫入時記錄單調時鐘（Linux `/proc/uptime`、Windows `GetTickCount64`），`pulse status` 以同一個時鐘相減，不受系統時間調整或與 Kairos 的時鐘偏差影響；重新開機後一律視為過時。
-- 權限：Unix 上以 0640 建立（S3 的規則，不依賴 umask）。發佈包的佈局中 `/opt/pulse` 為 `root:pulse 750`、`logs/` 為 `pulse:pulse 750`，因此 **`pulse status` 需要 root 或 `pulse` 群組的成員**（把維運帳號加入 `pulse` 群組即可不用 sudo）；沒有權限時結束代碼 10。Windows 上檔案繼承 `logs\` 的 ACL。
-- 無法寫入時（`logs/` 不可寫等）記 `WARN`（`status.write_failed PLS-E8204`，每 10 分鐘最多一則），不影響監控；`pulse status` 會顯示「未知」。
+- 位置與權限（`cli-spec.md` §4.1）：**所有人可讀，`pulse status` 不需要 root**。Linux 為 `/var/lib/pulse/status.json`，由 `pulse.service` 的 `StateDirectory=pulse`（`StateDirectoryMode=0755`）在 `ProtectSystem=strict` 下建立並開放寫入；以 systemd 執行時優先使用 `STATE_DIRECTORY`（多實例 `StateDirectory=pulse/N`）。檔案 0644、Pulse 自行建立的目錄 0755，以 `set_permissions` 明確設定（unit 的 `UMask=0077` 不影響）。發佈包的 `/opt/pulse` 為 751，一般帳號可以執行 `/opt/pulse/pulse`。Windows 為 `%ProgramData%\Pulse\status.json`，Pulse 在檔案上另外授予 BUILTIN\Users 讀取（目錄被收緊時仍可讀）。沒有權限讀取時結束代碼 10。
+- 預設位置無法寫入時（例如沿用沒有 `StateDirectory=` 的舊 unit）：**服務照常啟動與監控**，狀態檔改寫在工作目錄的 `logs/status.json`，記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 的「設定」列為警告（只有 root／`pulse` 群組讀得到 `logs/`）。預設位置恢復可寫後刪除 `logs/` 中的舊檔。指定了 `status.file` 而無法寫入時記 `WARN`（每 10 分鐘最多一則），`pulse status` 顯示「未知」。
 
 ## agent.id
 
