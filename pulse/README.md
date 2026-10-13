@@ -413,7 +413,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 - 流程：Pulse 送 `hello` → Kairos 回 `hello_ack` → 之後 Pulse 每 `heartbeat.interval` 秒送 `heartbeat`、每 `report.interval` 秒送 `report`，Kairos 對每則訊息回 `ack`
 - **版本協商**：hello 送 `"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable"]`（舊版 Kairos 只看 `proto`；`buffer.enabled = false` 時不宣告 `durable`）。`hello_ack` 的 `proto` 是協商結果：1 → report 為三個欄位；2 且 Kairos 也宣告 `metrics` → report 為通用指標。`proto` 不在 1～2 時斷線並記 `ERROR`（`proto_mismatch`），Kairos 回 `unsupported_version` 時同樣以 `ERROR` 記錄（`message` 含 Kairos 支援的範圍）
 - **hello 的主機資訊**（v2，舊版 Kairos 忽略）：`host_fingerprint`（機器 ID 的 SHA-256，不送原始值，計算方式見 PROTOCOL.md「主機指紋」；Linux 讀 `/etc/machine-id`、Windows 讀 `MachineGuid`，讀不到時不送）、`display_name` 與 `tags`（設定 `agent.display_name`、`agent.tags`，未設定時不送）、`report_interval_ms`（`report.interval`）、`os`（sysinfo 取得的作業系統名稱、版本、核心版本與 CPU 架構）
-- **時鐘檢查**：v2 的 `hello_ack` 帶 Kairos 的 `server_time`，與本機時鐘相差超過 5 分鐘時記 `WARN`「本機時鐘比伺服器快／慢約 N 秒」（每次註冊最多一則），請檢查 NTP
+- **時鐘檢查**：v2 的 `hello_ack` 帶 Kairos 的 `server_time`。與本機時鐘相差 30 秒～5 分鐘記 `WARN`（`clock.skew PLS-W8301`），超過 5 分鐘記 `ERROR`（`clock.skew PLS-E8302`，同時寫 stderr），請檢查 NTP。只在等級改變或偏差再變化超過 1 分鐘時記錄（重連時不重複），回到 30 秒以內記一則 `INFO`（`clock.skew -`）
 - `report` 的 `ack` 代表該筆資料已寫入伺服器的資料庫或資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`（message 為 `report could not be stored`：寫入失敗或達到伺服器的每日檔案大小上限；或 `report rate limit exceeded`：同一來源送得太快）。Pulse 收到時記 `WARN`（節流，見「日誌」），連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連。協商了 `durable` 時這兩種情況的資料都留在本機緩衝、稍後重送（Kairos 去重，不會重複）；沒有協商時（舊版 Kairos 或停用本機緩衝），**該筆 report 視為未送達、不重送**
 - **沒有協商 `durable` 時同一時間只有一筆 report 在途**：送出 report 後，到收到伺服器對它（或之後的訊息）的回應（`ack` 或帶 `seq` 的 `error`，含 `storage_unavailable`）之前，新的取樣直接略過（記 `WARN`，節流，附這條連線已略過的次數）；斷線時清除。協商了 `durable` 時最多 4 筆在途（見「本機緩衝」）。兩種情況下伺服器寫檔緩慢時都不會在伺服器端無限積壓
 - Kairos 也可能回其他 `error`：
@@ -578,7 +578,7 @@ Pulse 0.4.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 - 磁碟負擔的取捨：一份約 3～5 KB，每 10 秒一次約 0.4 KB/s（一天約 40 MB 的寫入量）；**不 fsync**，大部分寫入在作業系統的快取中合併。狀態檔只描述「現在」，斷電後下一次寫入（10 秒內）就會更新；少數檔案系統斷電後可能留下空檔，`pulse status` 視為無法解析（未知），服務啟動 10 秒內恢復。
 - 過時判斷：寫入時記錄單調時鐘（Linux `/proc/uptime`、Windows `GetTickCount64`），`pulse status` 以同一個時鐘相減，不受系統時間調整或與 Kairos 的時鐘偏差影響；重新開機後一律視為過時。
 - 位置與權限（`cli-spec.md` §4.1）：**所有人可讀，`pulse status` 不需要 root**。Linux 為 `/var/lib/pulse/status.json`，由 `pulse.service` 的 `StateDirectory=pulse`（`StateDirectoryMode=0755`）在 `ProtectSystem=strict` 下建立並開放寫入；以 systemd 執行時優先使用 `STATE_DIRECTORY`（多實例 `StateDirectory=pulse/N`）。檔案 0644、Pulse 自行建立的目錄 0755，以 `set_permissions` 明確設定（unit 的 `UMask=0077` 不影響）。發佈包的 `/opt/pulse` 為 751，一般帳號可以執行 `/opt/pulse/pulse`。Windows 為 `%ProgramData%\Pulse\status.json`，Pulse 在檔案上另外授予 BUILTIN\Users 讀取（目錄被收緊時仍可讀）。沒有權限讀取時結束代碼 10。
-- 預設位置無法寫入時（例如沿用沒有 `StateDirectory=` 的舊 unit）：**服務照常啟動與監控**，狀態檔改寫在工作目錄的 `logs/status.json`，記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 的「設定」列為警告（只有 root／`pulse` 群組讀得到 `logs/`）。預設位置恢復可寫後刪除 `logs/` 中的舊檔。指定了 `status.file` 而無法寫入時記 `WARN`（每 10 分鐘最多一則），`pulse status` 顯示「未知」。
+- 預設位置無法寫入時（例如沿用沒有 `StateDirectory=` 的舊 unit）：**服務照常啟動與監控**，狀態檔改寫在工作目錄的 `logs/status.json`，記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 的「設定」列為警告（只有 root／`pulse` 群組讀得到 `logs/`）。預設位置恢復可寫後刪除 `logs/` 中的舊檔。執行中無法寫入狀態檔時，第一次記 `WARN`（`status.write_failed PLS-E8204`），連續失敗滿 60 秒（`pulse status` 開始顯示「未知」）記 `ERROR` 並寫 stderr，之後每 10 分鐘一則 `ERROR` 摘要；恢復時記 `INFO`（`status.write_restored`）。
 
 ## agent.id
 

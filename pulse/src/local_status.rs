@@ -19,12 +19,68 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::codes;
-use crate::log_throttle::LogThrottle;
 use crate::spool::SharedSpool;
 use crate::status_file::{self as sf, CodeNote, StatusFile, ts};
 
-/// 寫入失敗的 WARN 節流
-const WRITE_FAILURE_LOG_WINDOW: Duration = Duration::from_secs(600);
+/// 連續寫入失敗這麼久（狀態檔開始被判為過時，[`sf::STALE_AFTER`]）時記 `ERROR`（`log-ux.md` §4.5）
+const WRITE_FAILURE_ERROR_AFTER: Duration = sf::STALE_AFTER;
+/// 之後的 `ERROR` 摘要間隔（`log-ux.md` §5.1「需人工處理」）
+const WRITE_FAILURE_SUMMARY_EVERY: Duration = Duration::from_secs(600);
+
+/// `status.write_failed`（5020）的一次處置
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFailureLog {
+    /// 第一次失敗
+    Warn,
+    /// 連續失敗滿 [`WRITE_FAILURE_ERROR_AFTER`]，或距上一則 `ERROR` 滿 [`WRITE_FAILURE_SUMMARY_EVERY`]：
+    /// 寫 stderr；`suppressed` 為上一則之後只記 `DEBUG` 的次數，`failing` 為已連續失敗多久
+    Error { suppressed: u64, failing: Duration },
+    /// 其間的失敗
+    Debug,
+}
+
+/// 狀態檔寫入失敗與恢復的記錄規則（`log-ux.md` §4.5：`status.write_failed` 5020、
+/// `status.write_restored` 5021）
+#[derive(Debug, Default)]
+struct WriteFailures {
+    /// 這一段連續失敗的開始
+    since: Option<tokio::time::Instant>,
+    /// 最近一則 `ERROR`
+    last_error: Option<tokio::time::Instant>,
+    suppressed: u64,
+}
+
+impl WriteFailures {
+    fn failed(&mut self, now: tokio::time::Instant) -> WriteFailureLog {
+        let Some(since) = self.since else {
+            self.since = Some(now);
+            return WriteFailureLog::Warn;
+        };
+        let failing = now.duration_since(since);
+        let due = match self.last_error {
+            None => failing >= WRITE_FAILURE_ERROR_AFTER,
+            Some(last) => now.duration_since(last) >= WRITE_FAILURE_SUMMARY_EVERY,
+        };
+        if due {
+            self.last_error = Some(now);
+            WriteFailureLog::Error {
+                suppressed: std::mem::take(&mut self.suppressed),
+                failing,
+            }
+        } else {
+            self.suppressed += 1;
+            WriteFailureLog::Debug
+        }
+    }
+
+    /// 寫入成功：之前在失敗中時回傳連續失敗了多久（記 `status.write_restored`）
+    fn succeeded(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+        let since = self.since.take()?;
+        self.last_error = None;
+        self.suppressed = 0;
+        Some(now.duration_since(since))
+    }
+}
 
 /// 最近 1 小時計數的時間格（每分鐘一格）
 const WINDOW_SLOTS: u64 = 60;
@@ -718,13 +774,13 @@ fn unit_from_cgroup(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 定期與狀態變化時寫出狀態檔，直到 `shutdown`。寫入失敗時節流記 WARN（`PLS-E8204`），恢復時記 INFO。
+/// 定期與狀態變化時寫出狀態檔，直到 `shutdown`。寫入失敗依 [`WriteFailures`] 記錄（`PLS-E8204`），
+/// 恢復時記 `status.write_restored`。
 pub async fn run_writer(tracker: Arc<Tracker>, shutdown: CancellationToken) {
     let mut ticker = tokio::time::interval(sf::WRITE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_write: Option<tokio::time::Instant> = None;
-    let mut failures = LogThrottle::new(WRITE_FAILURE_LOG_WINDOW);
-    let mut failing = false;
+    let mut failures = WriteFailures::default();
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -738,28 +794,49 @@ pub async fn run_writer(tracker: Arc<Tracker>, shutdown: CancellationToken) {
             }
             _ = shutdown.cancelled() => return,
         }
-        last_write = Some(tokio::time::Instant::now());
+        let now = tokio::time::Instant::now();
+        last_write = Some(now);
         match tracker.write() {
             Ok(()) => {
-                if failing {
+                if let Some(failing) = failures.succeeded(now) {
                     log::info!(
-                        "{}已恢復寫入狀態檔 {}",
-                        codes::tag(codes::STATUS_WRITE_FAILED, None),
-                        tracker.path().display()
+                        "{}已恢復寫入狀態檔 {}（連續失敗約 {} 秒）",
+                        codes::tag(codes::STATUS_WRITE_RESTORED, None),
+                        tracker.path().display(),
+                        failing.as_secs()
                     );
-                    failing = false;
                 }
             }
             Err(e) => {
-                failing = true;
-                if let Some(n) = failures.check(tokio::time::Instant::now()) {
-                    log::warn!(
-                        "{}無法寫入狀態檔 {}：{e}；pulse status 會顯示「未知」。請確認目錄可由服務帳號寫入\
-                         （或以 status.file 指定其他位置）{}",
-                        codes::tag(codes::STATUS_WRITE_FAILED, Some(codes::E_STATUS_UNWRITABLE)),
-                        tracker.path().display(),
-                        crate::log_throttle::suppressed_note(n, WRITE_FAILURE_LOG_WINDOW)
-                    );
+                let tag = codes::tag(codes::STATUS_WRITE_FAILED, Some(codes::E_STATUS_UNWRITABLE));
+                let path = tracker.path();
+                let path = path.display();
+                match failures.failed(now) {
+                    WriteFailureLog::Warn => log::warn!(
+                        "{tag}無法寫入狀態檔 {path}：{e}；監控與回報照常，連續失敗 60 秒後 pulse status 會顯示\
+                         「未知」。請確認目錄可由服務帳號寫入（或以 status.file 指定其他位置）"
+                    ),
+                    WriteFailureLog::Error {
+                        suppressed,
+                        failing,
+                    } => {
+                        let more = if suppressed > 0 {
+                            format!("（上一則之後另有 {suppressed} 次失敗只記 DEBUG）")
+                        } else {
+                            String::new()
+                        };
+                        let msg = format!(
+                            "{tag}已連續約 {} 秒無法寫入狀態檔 {path}：{e}；pulse status 與「Pulse 狀態」\
+                             視窗顯示「未知」。請確認目錄可由服務帳號寫入、磁碟有空間\
+                             （或以 status.file 指定其他位置）{more}",
+                            failing.as_secs()
+                        );
+                        log::error!("{msg}");
+                        crate::service_status::attention(&msg);
+                    }
+                    WriteFailureLog::Debug => {
+                        log::debug!("{tag}無法寫入狀態檔 {path}：{e}")
+                    }
                 }
             }
         }
@@ -770,6 +847,41 @@ pub async fn run_writer(tracker: Arc<Tracker>, shutdown: CancellationToken) {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn status_write_failures_warn_then_escalate_and_restore() {
+        // log-ux.md §4.5：第一次 WARN、連續失敗滿 60 秒 ERROR、之後每 10 分鐘一則 ERROR 摘要、
+        // 其間 DEBUG；恢復時回報失敗了多久（status.write_restored）
+        let t0 = tokio::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut f = WriteFailures::default();
+        assert_eq!(f.succeeded(at(0)), None, "沒有失敗過時不記恢復");
+        assert_eq!(f.failed(at(0)), WriteFailureLog::Warn);
+        for s in (10..60).step_by(10) {
+            assert_eq!(f.failed(at(s)), WriteFailureLog::Debug, "{s} 秒");
+        }
+        assert_eq!(
+            f.failed(at(60)),
+            WriteFailureLog::Error {
+                suppressed: 5,
+                failing: Duration::from_secs(60)
+            }
+        );
+        assert_eq!(f.failed(at(70)), WriteFailureLog::Debug);
+        assert_eq!(f.failed(at(659)), WriteFailureLog::Debug);
+        assert_eq!(
+            f.failed(at(660)),
+            WriteFailureLog::Error {
+                suppressed: 2,
+                failing: Duration::from_secs(660)
+            }
+        );
+        assert_eq!(f.succeeded(at(665)), Some(Duration::from_secs(665)));
+        // 下一段失敗重新從 WARN 開始
+        assert_eq!(f.failed(at(700)), WriteFailureLog::Warn);
+        assert_eq!(f.failed(at(759)), WriteFailureLog::Debug);
+        assert!(matches!(f.failed(at(760)), WriteFailureLog::Error { .. }));
+    }
 
     fn tracker(dir: &Path) -> Tracker {
         Tracker::new(

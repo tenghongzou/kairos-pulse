@@ -104,9 +104,10 @@ events! {
     BUFFER_EXPIRED = "buffer.expired", Some(5014);
     /// 中斷後的積壓已補送完成
     BUFFER_REPLAY_DONE = "buffer.replay_done", Some(5015);
-    /// 無法寫入本機狀態檔（`PLS-E8204`）。`log-ux.md` §4 沒有這個事件，工程先選用（待設計補登），
-    /// 只寫檔案
-    STATUS_WRITE_FAILED = "status.write_failed", None;
+    /// 無法寫入本機狀態檔（`PLS-E8204`；`log-ux.md` §4.5）：第一次 WARN、連續失敗 60 秒 ERROR
+    STATUS_WRITE_FAILED = "status.write_failed", Some(5020);
+    /// 恢復寫入本機狀態檔（只在之前記過 `status.write_failed` 時）
+    STATUS_WRITE_RESTORED = "status.write_restored", Some(5021);
 }
 
 /// 日誌訊息的開頭：「`<event> <code> `」，沒有代碼時為「`<event> - `」
@@ -284,6 +285,10 @@ mod tests {
                 ("buffer.replay_done", 5015),
             ]
         );
+        // INTEGRATION §26：本機狀態檔的事件 5020、5021
+        assert_eq!(STATUS_WRITE_FAILED.win_event_id, Some(5020));
+        assert_eq!(STATUS_WRITE_RESTORED.win_event_id, Some(5021));
+        assert_eq!(CLOCK_SKEW.win_event_id, Some(5000));
     }
 
     #[test]

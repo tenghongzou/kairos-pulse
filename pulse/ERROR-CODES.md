@@ -80,7 +80,7 @@
 | `PLS-W4203` | `network.rs` `Delivery::prepare_next` | 待補送資料超過 `buffer.max_age_hours`，送出前丟掉 | `buffer.expired`（節流 5 分鐘）；最近 24 小時內回報列 ⚠ |
 | `PLS-W4201` | `log_files.rs` `log_event` | 系統日期異常，暫停清除日誌 | `log.retention_paused` |
 | `PLS-E4002` | `main.rs` `main` | 無法初始化日誌（結束代碼 1） | stderr |
-| `PLS-E8204` | `local_status.rs` `Tracker::write_locked`、`run_writer` | 預設位置（`/var/lib/pulse`、`%ProgramData%\Pulse`）無法寫入而改寫 `logs/status.json`（記一次）；指定的 `status.file` 無法寫入（節流 10 分鐘，恢復時記 INFO） | `status.write_failed`；前者為「設定」列 ⚠（提示更新 unit），後者 `pulse status` 隨後顯示「未知」 |
+| `PLS-E8204` | `local_status.rs` `Tracker::write_locked`、`run_writer` | 預設位置（`/var/lib/pulse`、`%ProgramData%\Pulse`）無法寫入而改寫 `logs/status.json`（記一次）；執行中無法寫入（第一次 `WARN`、連續失敗滿 60 秒 `ERROR` 並寫 stderr、之後每 10 分鐘一則 `ERROR` 摘要、其間 `DEBUG`；恢復時記 `status.write_restored`） | `status.write_failed`；前者為「設定」列 ⚠（提示更新 unit），後者 `pulse status` 隨後顯示「未知」 |
 | `PLS-W8005` | `system_info.rs` `Sampler::refresh_and_read`、`check_stuck` | 系統資訊取樣逾時 | `sample.timeout` |
 
 ### 2.5 `pulse status` 專用
@@ -91,8 +91,8 @@
 | `PLS-E8003` | 同上 | 服務管理員回報未執行（failed、inactive、正在重新啟動、已停止），或沒有服務管理員時狀態檔記錄的 PID 已不在 | 服務列 ✗（上次結束時間與結束代碼），其餘列為「最後已知狀態」 |
 | `PLS-W8004` | 同上 | 服務在執行，但狀態檔超過 60 秒未更新（單調時鐘）、不存在或無法解析 | 服務列 ⚠，本機狀態「未知」，結束代碼 9 |
 | `PLS-E8203` | `status_cmd::permission_denied` | 沒有權限讀取狀態檔 | stderr（`--json` 為 `error`），結束代碼 10 |
-| `PLS-W8301` | `network.rs` `clock_skew_log`；`eval.rs` `clock_row` | 與 Kairos 相差 30 秒～5 分鐘（以 `hello_ack` 的 `server_time` 量測） | `clock.skew`；時鐘列 ⚠ |
-| `PLS-E8302` | 同上 | 相差超過 5 分鐘 | `clock.skew`（WARN，見 §5）；時鐘列 ✗ |
+| `PLS-W8301` | `network.rs` `ClockSkewLog`；`eval.rs` `clock_row` | 與 Kairos 相差 30 秒～5 分鐘（以 `hello_ack` 的 `server_time` 量測；只在等級改變或偏差再變化超過 1 分鐘時記錄） | `clock.skew`（WARN）；時鐘列 ⚠ |
+| `PLS-E8302` | 同上 | 相差超過 5 分鐘 | `clock.skew`（ERROR，同時寫 stderr）；時鐘列 ✗。回到 30 秒以內時 `clock.skew -`（INFO） |
 
 ## 3. 日誌事件（`log-ux.md` §4）
 
@@ -109,7 +109,7 @@
 | `clock.skew` | 5000 | `network.rs` | ✓ |
 | `log.retention_paused` | 5001 | `log_files.rs` | ✓ |
 | `buffer.opened`、`buffer.unavailable`、`buffer.write_failed`、`buffer.full`、`buffer.expired`、`buffer.replay_done` | 5010～5015 | `main.rs`、`spool.rs`、`network.rs` | ✓ |
-| `status.write_failed` | （無） | `local_status.rs` | ✓（工程先選用，待設計補登） |
+| `status.write_failed`、`status.write_restored` | 5020、5021 | `local_status.rs` | ✓（設計包 §26 補登） |
 | `conn.retry`、`conn.retry_summary` | —、2002 | — | 待辦（§4） |
 | `config.loaded`、`identity.clone_suspected`、`sysinfo.snapshot` | 1002、1006、1010 | — | 待辦 |
 | `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | — | 待辦（沒有自動更新憑證） |
@@ -133,7 +133,7 @@
 
 - `log-ux.md` §6 的完整格式（RFC 3339 帶時區的時間、5 欄寬等級、`event` 補到 18 欄、`key=value` 欄位、`log.format = "json"`、`run_id`／`seq`）與 §5 的重試摘要（`conn.retry_summary`：1／5／15／30 分、之後每小時）尚未實作；目前仍是每次斷線一行（WARN／節流的 ERROR）。
 - systemd `Status:` 的文字仍是 0.2 的寫法（`無法註冊：certificate_rejected（…）`），尚未改為 `cli-spec.md` §2.2 的「標題（代碼，處理提示）」；`PLS-E4004` 已附在 `已註冊：…` 之後。
-- `clock.skew` 超過 5 分鐘（`PLS-E8302`）仍記 `WARN`（`log-ux.md` 為 ERROR，ERROR 依 §3 須同時寫 stderr），待決定。
+- `clock.skew` 的 `ERROR` 與 `status.write_failed` 的 `ERROR` 目前寫日誌與 stderr；Windows 事件記錄與服務狀態（`log-ux.md` §3）待 Windows 事件記錄實作時一併處理。
 - Windows 事件記錄、服務描述欄位（`local-status.md` §5、§6）。
 - `pulse status --all`、`--json-lines`、`--pause-on-exit`（「Pulse 狀態」捷徑）、`status.offline_error_after`（30 分鐘門檻固定）、`PULSE_LANG`。
 

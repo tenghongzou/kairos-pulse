@@ -136,6 +136,8 @@ struct ServerLogThrottles {
     spool_error: LogThrottle,
     /// durable：超過 buffer.max_age_hours 而丟棄的記錄
     spool_expired: LogThrottle,
+    /// 與 Kairos 的時鐘偏差（`clock.skew`，跨連線保留：只在等級改變時記錄）
+    clock_skew: ClockSkewLog,
 }
 
 impl Default for ServerLogThrottles {
@@ -151,6 +153,7 @@ impl Default for ServerLogThrottles {
             report_rejected: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
             spool_error: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
             spool_expired: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
+            clock_skew: ClockSkewLog::default(),
         }
     }
 }
@@ -836,30 +839,71 @@ fn disconnect_event(code: Option<&str>) -> Event {
     }
 }
 
-/// hello_ack 的 `server_time` 與本機時間的差距超過 30 秒時的日誌（`clock.skew`）：
-/// 超過 5 分鐘為 `PLS-E8302`（沿用 [`clock_skew_warning`] 的文字），30 秒～5 分鐘為 `PLS-W8301`
-fn clock_skew_log(server_time: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    if let Some(warning) = clock_skew_warning(server_time, now) {
-        return Some(format!(
-            "{}{warning}",
-            codes::tag(codes::CLOCK_SKEW, Some(codes::E_CLOCK_SKEW))
-        ));
+/// 同一等級下，偏差再變化超過這麼多才再記一則 `clock.skew`（`log-ux.md` §4.5）
+const CLOCK_SKEW_RELOG_CHANGE: i64 = 60;
+
+/// `clock.skew`（事件 5000）的記錄規則（`log-ux.md` §4.5、`decisions/INTEGRATION.md` §26）：
+/// 依每次註冊時 hello_ack 的 `server_time` 量測，只在等級改變（30 秒～5 分鐘 `WARN` `PLS-W8301`、
+/// 超過 5 分鐘 `ERROR` `PLS-E8302`）或同一等級下偏差再變化超過 1 分鐘時記錄；回到 30 秒以內時記一則
+/// `INFO`（代碼為 `-`）。跨連線保留，重連時不重複記錄同樣的偏差。
+#[derive(Debug, Default)]
+struct ClockSkewLog {
+    /// 最近一則記錄的等級與偏差（秒，正值為本機較快）；在 30 秒以內時為 `None`
+    last: Option<(log::Level, i64)>,
+}
+
+impl ClockSkewLog {
+    /// 量測一次；需要記錄時回傳等級與訊息。`server_time` 無法解析時不記錄、不改變狀態
+    fn observe(
+        &mut self,
+        server_time: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<(log::Level, String)> {
+        let server = chrono::DateTime::parse_from_rfc3339(server_time).ok()?;
+        let skew = now - server.with_timezone(&chrono::Utc);
+        let secs = skew.num_seconds();
+        let level = if skew.abs() > crate::protocol::MAX_CLOCK_SKEW {
+            log::Level::Error
+        } else if skew.abs() > CLOCK_SKEW_NOTICE {
+            log::Level::Warn
+        } else {
+            return self.last.take().map(|_| {
+                (
+                    log::Level::Info,
+                    format!(
+                        "{}本機時鐘與伺服器的差距已回到 30 秒以內（約 {secs} 秒）",
+                        codes::tag(codes::CLOCK_SKEW, None)
+                    ),
+                )
+            });
+        };
+        if let Some((last_level, last_secs)) = self.last
+            && last_level == level
+            && (secs - last_secs).abs() <= CLOCK_SKEW_RELOG_CHANGE
+        {
+            return None;
+        }
+        self.last = Some((level, secs));
+        let msg = if level == log::Level::Error {
+            format!(
+                "{}{}",
+                codes::tag(codes::CLOCK_SKEW, Some(codes::E_CLOCK_SKEW)),
+                clock_skew_warning(server_time, now).unwrap_or_default()
+            )
+        } else {
+            let (direction, abs) = if secs > 0 {
+                ("快", secs)
+            } else {
+                ("慢", -secs)
+            };
+            format!(
+                "{}本機時鐘比伺服器{direction}約 {abs} 秒（超過 30 秒）：report 的 ts 與日誌時間會不準確，\
+                 請檢查本機的時間同步（NTP）",
+                codes::tag(codes::CLOCK_SKEW, Some(codes::W_CLOCK_SKEW))
+            )
+        };
+        Some((level, msg))
     }
-    let server = chrono::DateTime::parse_from_rfc3339(server_time).ok()?;
-    let skew = now - server.with_timezone(&chrono::Utc);
-    if skew.abs() <= CLOCK_SKEW_NOTICE {
-        return None;
-    }
-    let (direction, secs) = if skew > chrono::TimeDelta::zero() {
-        ("快", skew.num_seconds())
-    } else {
-        ("慢", -skew.num_seconds())
-    };
-    Some(format!(
-        "{}本機時鐘比伺服器{direction}約 {secs} 秒（超過 30 秒）：report 的 ts 與日誌時間會不準確，\
-         請檢查本機的時間同步（NTP）",
-        codes::tag(codes::CLOCK_SKEW, Some(codes::W_CLOCK_SKEW))
-    ))
 }
 
 /// rustls 的 TLS 版本名稱（`TLSv1_3`）改為一般寫法（`TLSv1.3`）
@@ -1108,13 +1152,16 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     *registered_at = Some(Instant::now());
     let (level, msg) = registered_log(settings, &ack, tls_info);
     log::log!(level, "{}{msg}", codes::tag(codes::CONN_REGISTERED, None));
-    if let Some(warning) = ack
+    if let Some((level, msg)) = ack
         .server_time
         .as_deref()
-        .and_then(|t| clock_skew_log(t, chrono::Utc::now()))
+        .and_then(|t| throttles.clock_skew.observe(t, chrono::Utc::now()))
     {
-        // 每次註冊最多一則（重連受退避限制），不需節流
-        log::warn!("{warning}");
+        log::log!(level, "{msg}");
+        if level == log::Level::Error {
+            // 超過 5 分鐘：需要人工以 NTP 修正（log-ux.md §4.5、§3）
+            service_status::attention(&msg);
+        }
     }
     service_status::set_status(&registered_status(settings));
     let durable_session = session.durable && spool.is_some();
@@ -3694,22 +3741,42 @@ mod tests {
     }
 
     #[test]
-    fn clock_skew_logs_carry_w8301_or_e8302() {
+    fn clock_skew_is_logged_on_level_changes_and_escalates_to_error() {
+        // log-ux.md §4.5：30 秒～5 分鐘 WARN（PLS-W8301）、超過 5 分鐘 ERROR（PLS-E8302）；
+        // 只在等級改變或偏差再變化超過 1 分鐘時記錄；回到 30 秒以內記一則 INFO
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-08T03:15:40Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        assert_eq!(clock_skew_log("2026-10-08T03:15:20Z", now), None, "20 秒");
-        let w = clock_skew_log("2026-10-08T03:14:40Z", now).unwrap();
+        // 本機比伺服器快 secs 秒時，伺服器的時間
+        let server = |secs: i64| {
+            (now - chrono::TimeDelta::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let mut c = ClockSkewLog::default();
+        assert_eq!(c.observe(&server(20), now), None, "20 秒：不記錄");
+        let (level, w) = c.observe(&server(60), now).unwrap();
+        assert_eq!(level, log::Level::Warn);
         assert!(
             w.starts_with("clock.skew PLS-W8301 本機時鐘比伺服器快約 60 秒"),
             "{w}"
         );
-        let e = clock_skew_log("2026-10-08T03:25:40Z", now).unwrap();
+        assert_eq!(c.observe(&server(100), now), None, "同一等級、變化 40 秒");
+        assert_eq!(c.observe(&server(60), now), None, "重連後同樣的偏差");
+        let (level, _) = c.observe(&server(130), now).unwrap();
+        assert_eq!(level, log::Level::Warn, "變化超過 1 分鐘再記一則");
+        let (level, e) = c.observe(&server(-600), now).unwrap();
+        assert_eq!(level, log::Level::Error);
         assert!(
             e.starts_with("clock.skew PLS-E8302 本機時鐘比伺服器慢約 600 秒"),
             "{e}"
         );
-        assert_eq!(clock_skew_log("x", now), None);
+        assert_eq!(c.observe(&server(-640), now), None);
+        assert!(c.observe(&server(-720), now).is_some(), "變化 120 秒");
+        assert_eq!(c.observe("x", now), None, "無法解析：不改變狀態");
+        let (level, i) = c.observe(&server(5), now).unwrap();
+        assert_eq!(level, log::Level::Info);
+        assert!(i.starts_with("clock.skew - "), "{i}");
+        assert_eq!(c.observe(&server(5), now), None, "INFO 只記一則");
         assert_eq!(tls_version_name("TLSv1_3"), "TLSv1.3");
     }
 
