@@ -126,32 +126,40 @@ Authorization: Bearer kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuL
 - 伺服器只保存秘密的 **SHA-256 雜湊**（`api_tokens.secret_hash`）。秘密有 256 位元的亂度，不需要慢速雜湊（bcrypt／Argon2 是為了低亂度的密碼）。比對時先以 token_id 查詢，再以**常數時間**比較雜湊；token_id 不存在時仍做一次同樣的比較，回應時間不洩漏 token_id 是否存在。
 - token 只在建立時顯示一次，之後無法取回；遺失時撤銷後重新建立。
 - **範圍**（`scope`）：本版只有 `read`（唯讀：所有 `GET` 端點）。之後的寫入端點會要求 `write` 等範圍，`read` 的 token 回 403。
-- **到期**：建立時指定，預設 90 天；`--no-expiry` 建立不過期的 token（不建議）。到期後回 401。
+- **到期**：建立時指定，預設 90 天、上限 3,650 天；不提供不過期的 token（設計包 `cli-style.md` §11.6：外洩後只能靠人工撤銷）。需要長期使用的整合以 `--expires-in 3650d` 建立，`kairos api-token list` 出現 14 天內到期的提示時輪替。到期後回 401（`KRS-E6010`）。
 - **最後使用**：成功驗證時在記憶體中記下時間與來源 IP，每 60 秒以一個短交易寫回資料庫（`last_used_at`、`last_used_ip`；`kairos api-token list` 顯示）。
 - 回應、日誌與 `kairos api-token list` 都不會出現秘密或雜湊；日誌只記 token_id 與名稱。
 
 ### 4.2 `kairos api-token`
 
 ```
-kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期或時間> | --no-expiry] [--scope read] [--json] [--config <檔案>]
+kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期或時間>] [--scope read] [--json] [--config <檔案>]
 kairos api-token list [--all] [--json] [--config <檔案>]
 kairos api-token revoke <token_id> [--reason <原因>] [--yes] [--json] [--config <檔案>]
 ```
 
-輸出依設計包 `design-system/cli-style.md`（結果在 stdout、過程與錯誤在 stderr、`--json` 為純 ASCII 的單一文件）：
+輸出依設計包 `design-system/cli-style.md` §11.6（結果在 stdout、過程與錯誤在 stderr、`--json` 為純 ASCII 的單一文件）。給人看的時間用**本機時區**並標示時區（`copywriting.md` §5.1），`--json` 一律 UTC：
 
 ```console
 $ sudo -u kairos /opt/kairos/kairos api-token create --name grafana --expires-in 180d --config /opt/kairos/kairos.toml
 kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuLWV4YW1wbGU
-✓ 已建立 API token「grafana」（token_id 3f9c2a71b4e05d18，範圍 read，到期 2027-04-11 06:03 UTC）
+✓ 已建立 API token「grafana」（token_id 3f9c2a71b4e05d18，範圍 read，到期 2027-04-11 14:03 UTC+8）
   這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。
-  使用方式：Authorization: Bearer <token>（主控台 https://<主機>:9443/api/v1/）
+  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）
+
+$ sudo -u kairos /opt/kairos/kairos api-token list --config /opt/kairos/kairos.toml
+TOKEN_ID          名稱     範圍  狀態  建立（UTC+8）           到期（UTC+8）       最後使用
+3f9c2a71b4e05d18  grafana  read  有效  2026-10-13 14:03 ops    2027-04-11 14:03    3 分鐘前（10.20.5.31）
+a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:12 ⚠  2 天前（10.20.5.40）
+
+共 2 個（有效 2）
+⚠ 1 個 API token 在 14 天內到期：到期前以 kairos api-token create 建立新的 token、更新整合端，再撤銷舊的。
 ```
 
 - stdout 只有 token 一行（`TOKEN=$(kairos api-token create …)`），其他說明寫 stderr。
-- `--expires-in`：`90m`、`12h`、`30d`、`2w`（與 `kairos hosts list --offline-for` 相同的寫法），上限 3650 天；`--expires-at`：`2027-01-01`（UTC 當天 00:00）或 RFC 3339。
+- `--expires-in`：`90m`、`12h`、`30d`、`2w`（與 `kairos hosts list --offline-for` 相同的寫法），上限 3650 天；`--expires-at`：`2027-01-01`（UTC 當天 00:00）或 RFC 3339。`--no-expiry`（0.4 草稿）已移除：指定時以結束代碼 2 拒絕並提示 `--expires-in 3650d`。
 - `--name`：1～64 個字元，不可含控制字元；不必唯一（以 token_id 區分）。
-- `list`：預設只列出有效的 token；`--all` 另列已撤銷與已過期的。欄位：token_id、名稱、範圍、狀態（有效／已撤銷／已過期）、建立時間與建立者、到期、最後使用（時間與 IP）。
+- `list`：預設只列出有效的 token；`--all` 另列已撤銷與已過期的。欄位：token_id、名稱、範圍、狀態（有效／已撤銷／已過期）、建立時間與建立者、到期、最後使用（相對時間與 IP）。時間為本機時區，只在欄位標題標示；剩餘 14 天以內的有效 token 在到期時間後加 `⚠`（`--ascii` 或非 UTF-8 終端機為 `[WARN]`），並在 stderr 提示輪替。
 - `revoke`：危險操作 L1（`cli-style.md` §5.4）：互動模式詢問 `是否繼續？[y/N]`，非互動需 `--yes`（否則結束代碼 2）。撤銷立即生效（每個請求都查詢資料庫）。重複撤銷已撤銷的 token 不算錯誤。
 - 結束代碼：0 完成、1 資料庫錯誤、2 用法錯誤、3 設定錯誤、10 權限不足（以 root 執行而資料目錄屬於服務帳號時拒絕，與 `kairos reports import` 相同）、11 資料庫被 `kairos reports import` 獨占中。
 - 以服務帳號執行（`sudo -u kairos`），Kairos 執行中也可以（只寫一個短交易）；資料庫不存在時建立（並升級 schema）。

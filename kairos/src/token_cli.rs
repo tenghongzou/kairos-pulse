@@ -5,7 +5,7 @@
 //! （`schema` 為 `kairos.api-token.<子命令>/v1`），錯誤也以 JSON 寫到 stdout。`revoke` 是 L1 的危險操作
 //! （§5.4）：互動時詢問，非互動需要 `--yes`。
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, Offset, Utc};
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::io::{BufRead, ErrorKind, IsTerminal, Write};
@@ -21,7 +21,7 @@ use crate::store::sqlite::{DB_FILE, SqliteOptions, open_admin};
 pub const TOKEN_USAGE: &str = "kairos api-token — 主控台 API（kairos/API.md）的 token
 
 用法：
-  kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期> | --no-expiry] [選項]
+  kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期>] [選項]
   kairos api-token list [--all] [選項]
   kairos api-token revoke <token_id> [--reason <原因>] [--yes] [選項]
 
@@ -29,7 +29,6 @@ create 的選項：
   --name <名稱>          用途說明（1～64 個字元），例如 grafana、console-dev
   --expires-in <時間>    多久後到期，例如 90d、12h、2w（預設 90d，上限 3650d）
   --expires-at <日期>    到期日：2027-01-01（UTC 當天 00:00）或 RFC 3339 時間
-  --no-expiry            不過期（不建議）
   --scope read           範圍；本版只有 read（唯讀）
 
 list 的選項：
@@ -45,7 +44,9 @@ revoke 的選項：
   --ascii                不使用 Unicode 符號
   -h, --help             顯示本說明
 
-token 只在建立時顯示一次（寫到 stdout），資料庫只保存它的 SHA-256。請以 Kairos 的服務帳號執行，
+token 只在建立時顯示一次（寫到 stdout），資料庫只保存它的 SHA-256；不提供不過期的 token，
+需要長期使用時以 --expires-in 3650d 建立，list 出現 14 天內到期的提示時輪替。時間以本機時區顯示
+（--json 為 UTC）。請以 Kairos 的服務帳號執行，
 Kairos 執行中也可以；建立與撤銷由執行中的 Kairos 在 10 秒內寫入日誌。
 
 範例：
@@ -59,6 +60,8 @@ Kairos 執行中也可以；建立與撤銷由執行中的 Kairos 在 10 秒內�
 pub const DEFAULT_EXPIRY_DAYS: u64 = 90;
 /// 有效期限的上限（天）
 pub const MAX_EXPIRY_DAYS: u64 = 3650;
+/// `list` 對剩餘天數在這以內的有效 token 加 `⚠`（cli-style.md §11.6）
+pub const EXPIRY_WARN_DAYS: i64 = 14;
 
 const EXIT_GENERAL: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -73,7 +76,6 @@ pub enum Expiry {
     Default,
     In(std::time::Duration),
     At(DateTime<Utc>),
-    Never,
 }
 
 /// 子命令
@@ -131,8 +133,7 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
         return Err(format!("無法辨識的子命令: {sub}（create、list、revoke）"));
     }
     let mut config_path = None;
-    let (mut json, mut ascii, mut all, mut yes, mut no_expiry) =
-        (false, false, false, false, false);
+    let (mut json, mut ascii, mut all, mut yes) = (false, false, false, false);
     let mut name = None;
     let mut reason = None;
     let mut expires_in = None;
@@ -175,7 +176,12 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
             "--ascii" => ascii = true,
             "--all" if sub == "list" => all = true,
             "--yes" if sub == "revoke" => yes = true,
-            "--no-expiry" if sub == "create" => no_expiry = true,
+            // 設計包不提供不過期的 token（cli-style.md §11.6、decisions/INTEGRATION.md §26）
+            "--no-expiry" if sub == "create" => {
+                return Err(format!(
+                    "不提供不過期的 API token（--no-expiry 已移除）；需要長期使用時以 --expires-in {MAX_EXPIRY_DAYS}d 建立，並在到期前輪替"
+                ));
+            }
             "--name" if sub == "create" => name = Some(value("--name")?),
             "--reason" if sub == "revoke" => reason = Some(value("--reason")?),
             "--scope" if sub == "create" => {
@@ -212,13 +218,12 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
             }
             let name = name.ok_or("kairos api-token create 需要 --name <名稱>")?;
             tokens::validate_name(&name).map_err(|e| format!("--name 無效：{e}"))?;
-            let expiry = match (expires_in, expires_at, no_expiry) {
-                (None, None, false) => Expiry::Default,
-                (Some(d), None, false) => Expiry::In(d),
-                (None, Some(t), false) => Expiry::At(t),
-                (None, None, true) => Expiry::Never,
-                _ => {
-                    return Err("--expires-in、--expires-at、--no-expiry 只能擇一".to_string());
+            let expiry = match (expires_in, expires_at) {
+                (None, None) => Expiry::Default,
+                (Some(d), None) => Expiry::In(d),
+                (None, Some(t)) => Expiry::At(t),
+                (Some(_), Some(_)) => {
+                    return Err("--expires-in、--expires-at 只能擇一".to_string());
                 }
             };
             TokenAction::Create { name, expiry }
@@ -425,10 +430,49 @@ fn db_failure(e: impl std::fmt::Display) -> Failure {
     )
 }
 
-fn human_time(ms: i64) -> String {
+/// 時區標示：`UTC+8`、`UTC-3:30`、`UTC`（copywriting.md §5.1）
+fn zone_label(tz: FixedOffset) -> String {
+    let secs = tz.local_minus_utc();
+    if secs == 0 {
+        return "UTC".to_string();
+    }
+    let sign = if secs < 0 { '-' } else { '+' };
+    let (h, m) = (secs.abs() / 3600, secs.abs() % 3600 / 60);
+    if m == 0 {
+        format!("UTC{sign}{h}")
+    } else {
+        format!("UTC{sign}{h}:{m:02}")
+    }
+}
+
+/// 人看的時間（本機時區，不含時區標示；表格只在欄位標題標示）
+fn human_time(ms: i64, tz: FixedOffset) -> String {
     DateTime::from_timestamp_millis(ms)
-        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .map(|t| t.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+/// 人看的時間＋時區標示：`2027-04-11 14:03 UTC+8`
+fn human_time_zoned(ms: i64, tz: FixedOffset) -> String {
+    format!("{} {}", human_time(ms, tz), zone_label(tz))
+}
+
+/// 相對時間：`12 秒前`、`3 分鐘前`、`2 小時 15 分前`、`14 天前`（cli-style.md §11.6 的範例）
+fn relative(now_ms: i64, ms: i64) -> String {
+    let secs = (now_ms - ms).max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs} 秒前"),
+        60..3600 => format!("{} 分鐘前", secs / 60),
+        3600..86_400 => format!("{} 小時 {} 分前", secs / 3600, secs % 3600 / 60),
+        _ => format!("{} 天前", secs / 86_400),
+    }
+}
+
+/// 有效且剩餘 [`EXPIRY_WARN_DAYS`] 天以內
+fn expires_soon(r: &TokenRow, now_ms: i64) -> bool {
+    r.state(now_ms) == TokenState::Active
+        && r.expires_at
+            .is_some_and(|e| e - now_ms <= EXPIRY_WARN_DAYS * 86_400_000)
 }
 
 fn row_json(r: &TokenRow, now_ms: i64) -> Value {
@@ -449,14 +493,11 @@ fn row_json(r: &TokenRow, now_ms: i64) -> Value {
     })
 }
 
-fn state_label(s: TokenState, unicode: bool) -> &'static str {
-    match (s, unicode) {
-        (TokenState::Active, true) => "✓ 有效",
-        (TokenState::Revoked, true) => "- 已撤銷",
-        (TokenState::Expired, true) => "- 已過期",
-        (TokenState::Active, false) => "[ OK ] 有效",
-        (TokenState::Revoked, false) => "[SKIP] 已撤銷",
-        (TokenState::Expired, false) => "[SKIP] 已過期",
+fn state_label(s: TokenState) -> &'static str {
+    match s {
+        TokenState::Active => "有效",
+        TokenState::Revoked => "已撤銷",
+        TokenState::Expired => "已過期",
     }
 }
 
@@ -489,10 +530,12 @@ pub struct Output {
     pub exit: u8,
 }
 
-/// 執行命令（不直接寫 stdout／stderr，方便測試）。`confirm` 在互動式 `revoke` 時詢問使用者
+/// 執行命令（不直接寫 stdout／stderr，方便測試）。人看的時間以 `tz` 顯示（`run` 傳入本機時區），
+/// `--json` 一律 UTC。`confirm` 在互動式 `revoke` 時詢問使用者
 pub fn execute(
     cmd: &TokenCommand,
     now: DateTime<Utc>,
+    tz: FixedOffset,
     unicode: bool,
     confirm: &mut dyn FnMut(&str) -> bool,
 ) -> Output {
@@ -531,8 +574,8 @@ pub fn execute(
                             "到期時間已經過去",
                             format!(
                                 "--expires-at {} 早於現在（{}）",
-                                fmt_time(*t),
-                                fmt_time(now)
+                                human_time_zoned(t.timestamp_millis(), tz),
+                                human_time_zoned(now_ms, tz)
                             ),
                             vec!["指定未來的日期，或改用 --expires-in。".to_string()],
                             EXIT_USAGE,
@@ -540,7 +583,6 @@ pub fn execute(
                     }
                     Some(t.timestamp_millis())
                 }
-                Expiry::Never => None,
             };
             let conn = match open(cmd.config_path.as_deref(), true) {
                 Ok(Some(c)) => c,
@@ -566,12 +608,12 @@ pub fn execute(
             }
             let expiry_text = row.expires_at.map_or_else(
                 || "不過期".to_string(),
-                |e| format!("到期 {}", human_time(e)),
+                |e| format!("到期 {}", human_time_zoned(e, tz)),
             );
             Output {
                 stdout: format!("{token}\n"),
                 stderr: format!(
-                    "{ok_mark} 已建立 API token「{}」（token_id {}，範圍 read，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>\n",
+                    "{ok_mark} 已建立 API token「{}」（token_id {}，範圍 read，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n",
                     row.name, row.token_id
                 ),
                 exit: 0,
@@ -610,40 +652,45 @@ pub fn execute(
                     ..Default::default()
                 };
             }
-            let mut t = vec![
-                [
-                    "狀態",
-                    "TOKEN_ID",
-                    "名稱",
-                    "範圍",
-                    "建立",
-                    "到期",
-                    "最後使用",
-                ]
-                .map(str::to_string)
-                .to_vec(),
-            ];
+            // cli-style.md §11.6：時間為本機時區，只在欄位標題標示；14 天內到期的有效 token 加 ⚠
+            let zone = zone_label(tz);
+            let warn_mark = if unicode { "⚠" } else { "[WARN]" };
+            let mut t = vec![vec![
+                "TOKEN_ID".to_string(),
+                "名稱".to_string(),
+                "範圍".to_string(),
+                "狀態".to_string(),
+                format!("建立（{zone}）"),
+                format!("到期（{zone}）"),
+                "最後使用".to_string(),
+            ]];
             for r in &shown {
                 t.push(vec![
-                    state_label(r.state(now_ms), unicode).to_string(),
                     r.token_id.clone(),
                     r.name
                         .chars()
                         .map(|c| if c.is_control() { '?' } else { c })
                         .collect(),
                     r.scope.clone(),
+                    state_label(r.state(now_ms)).to_string(),
                     format!(
                         "{} {}",
-                        human_time(r.created_at),
+                        human_time(r.created_at, tz),
                         r.created_by.as_deref().unwrap_or("")
                     )
                     .trim_end()
                     .to_string(),
-                    r.expires_at
-                        .map_or_else(|| "不過期".to_string(), human_time),
+                    match r.expires_at {
+                        // 0.4 草稿建立的不過期 token
+                        None => "不過期".to_string(),
+                        Some(e) if expires_soon(r, now_ms) => {
+                            format!("{} {warn_mark}", human_time(e, tz))
+                        }
+                        Some(e) => human_time(e, tz),
+                    },
                     match (r.last_used_at, &r.last_used_ip) {
-                        (Some(t), Some(ip)) => format!("{} {ip}", human_time(t)),
-                        (Some(t), None) => human_time(t),
+                        (Some(t), Some(ip)) => format!("{}（{ip}）", relative(now_ms, t)),
+                        (Some(t), None) => relative(now_ms, t),
                         _ => "-".to_string(),
                     },
                 ]);
@@ -654,6 +701,7 @@ pub fn execute(
                 parts.push(format!("已撤銷 {}", count(TokenState::Revoked)));
                 parts.push(format!("已過期 {}", count(TokenState::Expired)));
             }
+            let soon = shown.iter().filter(|r| expires_soon(r, now_ms)).count();
             Output {
                 stdout: format!(
                     "{}\n共 {} 個（{}）\n",
@@ -661,7 +709,14 @@ pub fn execute(
                     shown.len(),
                     parts.join("、")
                 ),
-                ..Default::default()
+                stderr: if soon > 0 {
+                    format!(
+                        "{warn_mark} {soon} 個 API token 在 {EXPIRY_WARN_DAYS} 天內到期：到期前以 kairos api-token create 建立新的 token、更新整合端，再撤銷舊的。\n"
+                    )
+                } else {
+                    String::new()
+                },
+                exit: 0,
             }
         }
         TokenAction::Revoke {
@@ -739,11 +794,13 @@ pub fn execute(
                     "{ok_mark} API token「{}」（token_id {}）先前已於 {} 撤銷\n",
                     row.name,
                     row.token_id,
-                    row.revoked_at.map(human_time).unwrap_or_default()
+                    row.revoked_at
+                        .map(|t| human_time_zoned(t, tz))
+                        .unwrap_or_default()
                 )
             } else {
                 format!(
-                    "{ok_mark} 已撤銷 API token「{}」（token_id {}），立即生效\n",
+                    "{ok_mark} 已撤銷 API token「{}」（token_id {}）。使用它的請求會立即收到 401（KRS-E6010）。\n",
                     row.name, row.token_id
                 )
             };
@@ -771,7 +828,13 @@ pub fn run(cmd: TokenCommand) -> u8 {
         }
         matches!(line.trim(), "y" | "Y" | "yes" | "YES")
     };
-    let out = execute(&cmd, Utc::now(), unicode, &mut confirm);
+    let out = execute(
+        &cmd,
+        Utc::now(),
+        Local::now().offset().fix(),
+        unicode,
+        &mut confirm,
+    );
     let mut stdout = std::io::stdout().lock();
     let wrote = stdout
         .write_all(out.stdout.as_bytes())
@@ -794,6 +857,11 @@ mod tests {
             .into_iter()
     }
 
+    /// 測試用的固定時區 UTC+8
+    fn tz8() -> FixedOffset {
+        FixedOffset::east_opt(8 * 3600).unwrap()
+    }
+
     #[test]
     fn argument_parsing() {
         let c = parse_args(os(&[
@@ -812,22 +880,19 @@ mod tests {
             }
         );
         assert!(c.json);
-        let c = parse_args(os(&[
-            "create",
-            "--name=x",
-            "--no-expiry",
-            "--config",
-            "k.toml",
-        ]))
-        .unwrap();
+        let c = parse_args(os(&["create", "--name=x", "--config", "k.toml"])).unwrap();
         assert_eq!(c.config_path, Some(PathBuf::from("k.toml")));
         assert!(matches!(
             c.action,
             TokenAction::Create {
-                expiry: Expiry::Never,
+                expiry: Expiry::Default,
                 ..
             }
         ));
+        // 不提供不過期的 token：以用法錯誤拒絕並提示 --expires-in 3650d
+        let e = parse_args(os(&["create", "--name", "x", "--no-expiry"])).unwrap_err();
+        assert!(e.contains("--expires-in 3650d"), "{e}");
+        assert!(!TOKEN_USAGE.contains("--no-expiry"));
         let c = parse_args(os(&["create", "--name", "x", "--expires-at", "2027-01-01"])).unwrap();
         assert!(matches!(
             c.action,
@@ -866,7 +931,15 @@ mod tests {
             &["create", "--name", "x", "--scope", "write"],
             &["create", "--name", "x", "--expires-in", "0d"],
             &["create", "--name", "x", "--expires-in", "4000d"],
-            &["create", "--name", "x", "--expires-in", "1d", "--no-expiry"],
+            &[
+                "create",
+                "--name",
+                "x",
+                "--expires-in",
+                "1d",
+                "--expires-at",
+                "2099-01-01",
+            ],
             &["create", "--name", "x", "--all"],
             &["list", "extra"],
             &["revoke"],
@@ -879,6 +952,23 @@ mod tests {
             crate::config::parse_args(os(&["api-token", "list"])),
             Ok(crate::config::CliAction::ApiToken(_))
         ));
+    }
+
+    #[test]
+    fn local_time_and_relative_time() {
+        assert_eq!(zone_label(tz8()), "UTC+8");
+        assert_eq!(zone_label(FixedOffset::east_opt(0).unwrap()), "UTC");
+        assert_eq!(
+            zone_label(FixedOffset::west_opt(3 * 3600 + 1800).unwrap()),
+            "UTC-3:30"
+        );
+        // 2026-10-13T06:03:00Z → 台北 14:03
+        let ms = 1_760_335_380_000;
+        assert_eq!(human_time_zoned(ms, tz8()), "2025-10-13 14:03 UTC+8");
+        assert_eq!(relative(ms + 12_000, ms), "12 秒前");
+        assert_eq!(relative(ms + 180_000, ms), "3 分鐘前");
+        assert_eq!(relative(ms + 8_100_000, ms), "2 小時 15 分前");
+        assert_eq!(relative(ms + 14 * 86_400_000, ms), "14 天前");
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -922,6 +1012,7 @@ mod tests {
         let out = execute(
             &cmd(TokenAction::List { all: false }, false),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -938,6 +1029,7 @@ mod tests {
                 false,
             ),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -957,11 +1049,12 @@ mod tests {
             &cmd(
                 TokenAction::Create {
                     name: "主控台".into(),
-                    expiry: Expiry::Never,
+                    expiry: Expiry::In(std::time::Duration::from_secs(10 * 86_400)),
                 },
                 true,
             ),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -969,7 +1062,11 @@ mod tests {
         let v: Value = serde_json::from_str(&out.stdout).unwrap();
         assert_eq!(v["schema"], "kairos.api-token.create/v1");
         assert_eq!(v["data"]["name"], "主控台");
-        assert_eq!(v["data"]["expires_at"], Value::Null);
+        // --json 為 UTC
+        assert!(
+            v["data"]["expires_at"].as_str().unwrap().ends_with('Z'),
+            "{v}"
+        );
         assert!(v["data"]["token"].as_str().unwrap().starts_with("kat_"));
         assert!(out.stderr.is_empty());
 
@@ -977,6 +1074,7 @@ mod tests {
         let out = execute(
             &cmd(TokenAction::List { all: false }, false),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -987,9 +1085,32 @@ mod tests {
             "{}",
             out.stdout
         );
+        // 本機時區只標在欄位標題；10 天後到期的「主控台」加上到期提示（ASCII 為 [WARN]）
+        assert!(out.stdout.starts_with("TOKEN_ID"), "{}", out.stdout);
+        assert!(out.stdout.contains("到期（UTC+8）"), "{}", out.stdout);
+        let line = |name: &str| {
+            out.stdout
+                .lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line("主控台").ends_with("[WARN]  -"), "{}", out.stdout);
+        assert!(!line("grafana").contains("[WARN]"), "{}", out.stdout);
+        assert!(
+            !out.stdout.contains(" UTC"),
+            "儲存格不重複時區：{}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("1 個 API token 在 14 天內到期"),
+            "{}",
+            out.stderr
+        );
         let out = execute(
             &cmd(TokenAction::List { all: false }, true),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -1008,20 +1129,21 @@ mod tests {
                 false,
             )
         };
-        let out = execute(&revoke(false), now, false, &mut no);
+        let out = execute(&revoke(false), now, tz8(), false, &mut no);
         assert_eq!(out.exit, EXIT_USAGE, "{out:?}");
         assert!(out.stderr.contains("--yes"), "{}", out.stderr);
-        let out = execute(&revoke(false), now, false, &mut yes);
+        let out = execute(&revoke(false), now, tz8(), false, &mut yes);
         assert_eq!(out.exit, 0, "{out:?}");
         assert!(out.stdout.contains("已撤銷"), "{}", out.stdout);
         // 再撤銷一次：不算錯誤
-        let out = execute(&revoke(true), now, false, &mut no);
+        let out = execute(&revoke(true), now, tz8(), false, &mut no);
         assert_eq!(out.exit, 0);
         assert!(out.stdout.contains("先前已於"), "{}", out.stdout);
         // 預設只列出有效的
         let out = execute(
             &cmd(TokenAction::List { all: false }, false),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -1029,6 +1151,7 @@ mod tests {
         let out = execute(
             &cmd(TokenAction::List { all: true }, false),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -1044,6 +1167,7 @@ mod tests {
                 true,
             ),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -1060,6 +1184,7 @@ mod tests {
                 false,
             ),
             now,
+            tz8(),
             false,
             &mut no,
         );
@@ -1067,7 +1192,7 @@ mod tests {
         // 設定錯誤
         let mut bad = cmd(TokenAction::List { all: false }, false);
         bad.config_path = Some(dir.join("missing.toml"));
-        assert_eq!(execute(&bad, now, false, &mut no).exit, EXIT_CONFIG);
+        assert_eq!(execute(&bad, now, tz8(), false, &mut no).exit, EXIT_CONFIG);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
