@@ -58,6 +58,13 @@ Restart=always
 RestartSec=10
 RestartPreventExitStatus=2 3 4
 
+# 本機狀態檔 /var/lib/pulse/status.json（pulse status 讀取，所有人可讀）：systemd 在啟動前建立
+# /var/lib/pulse（擁有者 pulse、0755），並讓它在 ProtectSystem=strict 下可寫。
+# 多實例的 unit 改為 StateDirectory=pulse/N，並在 pulse.toml 設定 [status] file（INSTALL.md 第 9 節）。
+# 沒有這兩行的舊 unit：Pulse 改寫 logs/status.json 並記 WARN（PLS-E8204），服務照常執行
+StateDirectory=pulse
+StateDirectoryMode=0755
+
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict
 ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer

@@ -1,8 +1,10 @@
 mod agent_id;
 mod backoff;
 mod cli;
+mod codes;
 mod config_manager;
 mod file_perms;
+mod local_status;
 mod log_files;
 mod log_throttle;
 mod network;
@@ -10,6 +12,8 @@ mod protocol;
 mod service_status;
 mod shutdown;
 mod spool;
+mod status_cmd;
+mod status_file;
 mod system_info;
 #[cfg(test)]
 mod test_log;
@@ -69,6 +73,8 @@ const EXIT_CERT: u8 = 4;
 struct Failure {
     code: u8,
     message: String,
+    /// 對應的錯誤代碼（`agent.fatal` 日誌的 code 欄；無法歸類時為 `None`）
+    pls: Option<&'static str>,
 }
 
 impl Failure {
@@ -77,7 +83,14 @@ impl Failure {
         Self {
             code: EXIT_CERT,
             message,
+            pls: None,
         }
+    }
+
+    /// 附上錯誤代碼
+    fn pls(mut self, code: &'static str) -> Self {
+        self.pls = Some(code);
+        self
     }
 }
 
@@ -87,6 +100,7 @@ impl From<String> for Failure {
         Self {
             code: EXIT_GENERAL,
             message,
+            pls: None,
         }
     }
 }
@@ -203,13 +217,83 @@ fn startup_location_messages(cwd: Option<&Path>, local_file_found: bool) -> Vec<
         messages.push((
             Level::Warn,
             format!(
-                "工作目錄是系統目錄 {}（以 Windows 服務執行時的預設值）：pulse.toml 需放在這裡才會被讀取，\
+                "{}工作目錄是系統目錄 {}（以 Windows 服務執行時的預設值）：pulse.toml 需放在這裡才會被讀取，\
                  agent.id 與 logs/ 也會建立在這裡。建議在服務設定中把工作目錄設為 Pulse 所在的目錄",
+                codes::tag(codes::CONFIG_WARNING, Some(codes::W_SYSTEM32_WORKDIR)),
                 cwd.display()
             ),
         ));
     }
     messages
+}
+
+/// 設定類警告（寫進狀態檔，`pulse status` 的「設定」列）：停用伺服器憑證驗證（`PLS-W0302`）、
+/// 同時信任系統信任庫與私有 CA（`PLS-W0303`）
+fn config_warnings(config: &AppConfig) -> Vec<status_file::CodeNote> {
+    let mut out = Vec::new();
+    if config.server.accept_invalid_certs {
+        out.push(status_file::CodeNote::new(
+            codes::W_TLS_VERIFY_DISABLED,
+            "已停用伺服器憑證驗證（accept_invalid_certs = true）",
+        ));
+    } else if !config.server.ca_cert.trim().is_empty() && config.server.trusts_system_roots() {
+        out.push(status_file::CodeNote::new(
+            codes::W_BOTH_TRUST_STORES,
+            "同時信任系統信任庫與 server.ca_cert（use_system_roots = true）",
+        ));
+    }
+    out
+}
+
+/// 建立狀態追蹤器（`status.file` 以工作目錄解析；沿用上一個行程留下的狀態檔計算最近 1 小時的重啟次數）
+fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Tracker {
+    let base = cwd.map(Path::to_path_buf).unwrap_or_default();
+    // status.file 未設定：設計包的位置（/var/lib/pulse、%ProgramData%\Pulse），無法寫入時改寫 logs/
+    // systemd 的 StateDirectory=（多實例為 pulse/N）會設定 STATE_DIRECTORY，優先使用
+    let (path, fallback) = match config.status.file.trim() {
+        "" => (
+            status_file::state_directory(std::env::var_os("STATE_DIRECTORY").as_deref())
+                .map_or_else(status_file::default_path, |d| d.join("status.json")),
+            Some(base.join(status_file::LEGACY_RELATIVE)),
+        ),
+        file => (base.join(file), None),
+    };
+    let previous = status_file::read(&path)
+        .ok()
+        .or_else(|| fallback.as_ref().and_then(|f| status_file::read(f).ok()));
+    let config_file = config.local_file_found.then(|| {
+        base.join(config_manager::LOCAL_CONFIG_FILE)
+            .display()
+            .to_string()
+    });
+    let address = config.server.address.trim();
+    let server = if address.contains(':') && !address.starts_with('[') {
+        format!("[{address}]:{}", config.server.port)
+    } else {
+        format!("{address}:{}", config.server.port)
+    };
+    let mut file = local_status::initial_file(
+        previous.as_ref(),
+        config_file,
+        cwd.map(|c| c.display().to_string()),
+        Duration::from_secs(config.report.interval),
+        server,
+        Some(config.agent.display_name.trim().to_string()).filter(|n| !n.is_empty()),
+    );
+    file.config.warnings = config_warnings(config);
+    file.identity.agent_id_file =
+        Some(base.join(config.agent.id_file.trim()).display().to_string());
+    let buffer = local_status::BufferSettings {
+        dir: config
+            .buffer
+            .enabled
+            .then(|| base.join(config.buffer.dir.trim())),
+        max_bytes: config.buffer.max_mb.saturating_mul(1024 * 1024),
+        max_records: config.buffer.max_records,
+        max_age_hours: config.buffer.max_age_hours,
+        replay_interval_ms: config.effective_replay_interval_ms(),
+    };
+    local_status::Tracker::new(path, fallback, file, buffer)
 }
 
 fn main() -> ExitCode {
@@ -221,13 +305,23 @@ fn main() -> ExitCode {
     ) {
         Ok(command) => command,
         Err(e) => {
-            eprintln!("錯誤：{e}\n\n{}", cli::USAGE);
+            eprintln!("錯誤：{}\n\n{}", e.message, e.usage);
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    if command == cli::Command::Help {
-        println!("{}", cli::USAGE);
-        return ExitCode::SUCCESS;
+    match &command {
+        cli::Command::Help => {
+            println!("{}", cli::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        cli::Command::StatusHelp => {
+            println!("{}", cli::STATUS_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        // pulse status：只讀狀態檔與服務管理員，不初始化日誌、不連線（cli-spec §4）
+        cli::Command::Status(args) => return ExitCode::from(status_cmd::run(args)),
+        cli::Command::Explain(code) => return ExitCode::from(status_cmd::explain(code)),
+        _ => {}
     }
     // 不讀取設定：設定有誤時也能確認版本
     if command == cli::Command::Version {
@@ -239,7 +333,11 @@ fn main() -> ExitCode {
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("錯誤：無法載入設定：{e}");
+            let code = match e {
+                config::ConfigError::Message(_) => codes::E_CONFIG_RANGE,
+                _ => codes::E_CONFIG_SYNTAX,
+            };
+            eprintln!("錯誤 {code}：無法載入設定：{e}");
             // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
             return ExitCode::from(EXIT_CONFIG);
         }
@@ -256,7 +354,7 @@ fn main() -> ExitCode {
 
     // 初始化日誌
     if let Err(e) = setup_logger(config.log.level_filter()) {
-        eprintln!("錯誤：無法初始化日誌：{e}");
+        eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
         return ExitCode::from(EXIT_GENERAL);
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
@@ -345,11 +443,21 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
 
     match result {
         Ok(()) => {
-            info!("Pulse 已結束");
+            if let Some(t) = local_status::tracker() {
+                t.write_final(0, None);
+            }
+            info!("{}Pulse 已結束", codes::tag(codes::AGENT_STOP, None));
             ExitCode::SUCCESS
         }
         Err(failure) => {
-            error!("{}", failure.message);
+            if let Some(t) = local_status::tracker() {
+                t.write_final(i32::from(failure.code), Some(&failure.message));
+            }
+            error!(
+                "{}{}",
+                codes::tag(codes::AGENT_FATAL, failure.pls),
+                failure.message
+            );
             // 日誌只寫到 stdout 與 logs/（pulse.service 為 StandardOutput=null）；以非 0 結束的原因
             // 另寫一行到 stderr，`journalctl -u pulse` 看得到服務為何停在 failed（例如憑證錯誤 4）
             service_status::attention(&failure.message.replace(['\r', '\n'], " "));
@@ -383,11 +491,34 @@ async fn run(
     shutdown: CancellationToken,
 ) -> Result<(), Failure> {
     // 完整版本字串（含 commit）；hello 的 agent_version 仍只送 CARGO_PKG_VERSION
-    info!("Pulse 地端程式啟動（{}）...", cli::VERSION);
+    info!(
+        "{}Pulse 地端程式啟動（{}，PID {}）...",
+        codes::tag(codes::AGENT_START, None),
+        cli::VERSION,
+        std::process::id()
+    );
     let cwd = std::env::current_dir().ok();
+    // 本機狀態檔（pulse status）：之後各任務的狀態都記在這裡，每 10 秒與狀態變化時寫出
+    let tracker = local_status::init(status_tracker(&config, cwd.as_deref()));
     for (level, msg) in startup_location_messages(cwd.as_deref(), config.local_file_found) {
         log::log!(level, "{msg}");
+        if let Some(rest) = msg.strip_prefix(&codes::tag(
+            codes::CONFIG_WARNING,
+            Some(codes::W_SYSTEM32_WORKDIR),
+        )) {
+            tracker.update(|s| {
+                s.add_config_warning(status_file::CodeNote::new(
+                    codes::W_SYSTEM32_WORKDIR,
+                    rest.to_string(),
+                ));
+            });
+        }
     }
+    info!(
+        "本機狀態檔：{}（pulse status 讀取）",
+        tracker.path().display()
+    );
+    tokio::spawn(local_status::run_writer(tracker.clone(), shutdown.clone()));
     debug!("使用的配置: {:?}", config);
 
     // TLS 設定只在啟動時建立一次；憑證 / 私鑰讀不到、格式錯誤、不成對、過期都會在這裡直接失敗。
@@ -401,6 +532,9 @@ async fn run(
         return Ok(());
     };
     let tls = tls.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
+    if let Some(info) = tls.client_cert_info() {
+        tracker.update(|s| s.set_client_cert(info));
+    }
 
     // agent_id：讀檔沿用，不存在則產生；格式不合法則結束（檔案 I/O 放到 blocking 執行緒）
     let id_path = PathBuf::from(&config.agent.id_file);
@@ -414,21 +548,39 @@ async fn run(
     else {
         return Ok(());
     };
-    let (agent_id, created) = loaded.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
+    let (agent_id, created) = loaded.map_err(|e| {
+        let code = if e.kind() == std::io::ErrorKind::InvalidData {
+            codes::E_AGENT_ID_INVALID
+        } else {
+            codes::E_AGENT_ID_IO
+        };
+        Failure::cert(format!("啟動失敗：{e}")).pls(code)
+    })?;
     if let Some(warning) = permission_warning {
-        warn!("{warning}");
+        warn!(
+            "{}{warning}",
+            codes::tag(codes::CONFIG_WARNING, Some(codes::W_AGENT_ID_PERMS))
+        );
+        tracker.update(|s| {
+            s.add_identity_warning(status_file::CodeNote::new(codes::W_AGENT_ID_PERMS, warning));
+        });
     }
     if created {
         info!(
-            "已產生新的 agent_id {agent_id}，存放於 {}",
+            "{}已產生新的 agent_id {agent_id}，存放於 {}",
+            codes::tag(codes::IDENTITY_CREATED, None),
             id_path.display()
         );
     } else {
-        info!("agent_id：{agent_id}（{}）", id_path.display());
+        info!(
+            "{}agent_id：{agent_id}（{}）",
+            codes::tag(codes::IDENTITY_LOADED, None),
+            id_path.display()
+        );
     }
     // 客戶端憑證的 SAN 必須是 DNS:<agent_id>，否則伺服器會以 auth_failed 拒絕：啟動時就檢查
     tls.verify_client_cert_identity(&agent_id)
-        .map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
+        .map_err(|e| Failure::cert(format!("啟動失敗：{e}")).pls(codes::E_CLIENT_CERT_MISMATCH))?;
 
     // 印出一次完整系統資訊。內含約 200 ms 的阻塞 sleep 與大量系統呼叫（可能很慢），
     // 放到 blocking 執行緒，且收到 Ctrl+C 時不等它完成。
@@ -444,6 +596,7 @@ async fn run(
     else {
         return Ok(());
     };
+    tracker.update(|s| s.set_identity(&agent_id, &hostname));
 
     spawn_log_cleanup(retention, config.log.retention_days);
     spawn_client_cert_recheck(tls.clone());
@@ -460,8 +613,9 @@ async fn run(
             Some(Ok(opened)) => {
                 let stats = opened.stats();
                 info!(
-                    "本機緩衝：{}（待送 {} 筆、{} bytes；上限 {} MiB／{} 筆，保留 {} 小時；補送間隔 {} 毫秒；\
+                    "{}本機緩衝：{}（待送 {} 筆、{} bytes；上限 {} MiB／{} 筆，保留 {} 小時；補送間隔 {} 毫秒；\
                      本次 boot_id {}），Kairos 支援時 report 斷線期間的資料會補送（durable）",
+                    codes::tag(codes::BUFFER_OPENED, None),
                     dir.display(),
                     stats.pending,
                     stats.pending_bytes,
@@ -480,16 +634,20 @@ async fn run(
                         config.effective_replay_interval_ms()
                     );
                 }
-                Some(spool::SharedSpool::new(opened))
+                let shared = spool::SharedSpool::new(opened);
+                tracker.set_spool(shared.clone());
+                Some(shared)
             }
             Some(Err(e)) => {
                 let msg = format!(
-                    "無法開啟本機緩衝 {}：{e}；本次執行不寫入本機緩衝，report 為 at-most-once（斷線期間的資料不補送）。\
+                    "{}無法開啟本機緩衝 {}：{e}；本次執行不寫入本機緩衝，report 為 at-most-once（斷線期間的資料不補送）。\
                      請確認目錄可由服務帳號寫入（或以 buffer.dir 指定其他目錄），修正後重新啟動 Pulse",
+                    codes::tag(codes::BUFFER_UNAVAILABLE, Some(codes::E_BUFFER_UNAVAILABLE)),
                     dir.display()
                 );
                 error!("{msg}");
                 service_status::attention(&msg);
+                tracker.update(|s| s.buffer_unavailable(e.to_string()));
                 None
             }
         }
@@ -497,6 +655,7 @@ async fn run(
         info!(
             "本機緩衝已停用（buffer.enabled = false）：report 為 at-most-once，斷線期間的資料不補送"
         );
+        tracker.update(local_status::State::buffer_disabled);
         None
     };
 
@@ -527,7 +686,11 @@ async fn run(
         }
     };
 
-    let settings = network::Settings::new(&config, agent_id, hostname);
+    let mut settings = network::Settings::new(&config, agent_id, hostname);
+    if config.buffer.enabled && shared_spool.is_none() {
+        // copywriting §4.2 範例 71：systemd Status 與服務描述也要看得到 PLS-E4004
+        settings.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
+    }
     let result = tokio::select! {
         _ = network::run(settings, tls, report_rx, shared_spool.clone(), shutdown.clone()) => {
             if shutdown.is_cancelled() {
@@ -614,6 +777,25 @@ mod tests {
             ],
             "{line}"
         );
+    }
+
+    #[test]
+    fn unit_lets_the_service_write_the_default_status_file() {
+        // cli-spec §4.1：/var/lib/pulse/status.json 由 StateDirectory=pulse 建立，ProtectSystem=strict 下可寫
+        let unit = include_str!("../packaging/pulse.service");
+        let state_dir = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("StateDirectory="))
+            .expect("pulse.service 應設定 StateDirectory");
+        assert_eq!(state_dir, "pulse");
+        assert!(unit.lines().any(|l| l == "StateDirectoryMode=0755"));
+        if cfg!(unix) {
+            assert_eq!(
+                status_file::default_path(),
+                Path::new("/var/lib").join(state_dir).join("status.json")
+            );
+        }
+        assert_eq!(AppConfig::default_for_tests().status.file, "");
     }
 
     #[test]

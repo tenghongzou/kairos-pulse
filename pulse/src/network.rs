@@ -35,7 +35,9 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 
 use crate::backoff::Backoff;
+use crate::codes::{self, Event};
 use crate::config_manager::AppConfig;
+use crate::local_status::{self, Disconnected, Registered};
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
     CLIENT_FEATURES, ClientMsg, DurableSeq, HelloExt, HostInfo, MAX_LINE_LENGTH, Proto, ProtoOffer,
@@ -90,6 +92,13 @@ const REVOCATION_UNAVAILABLE: &str = "revocation status unavailable";
 
 /// 啟動後、第一次註冊完成前的 systemd 狀態文字（含啟動時的隨機延遲）。
 const STARTING_STATUS: &str = "連線中";
+
+/// 連線中斷超過這麼久時記一次 `conn.outage`（ERROR），`pulse status` 的本機狀態也改為「嚴重」
+/// （`cli-spec.md` §4.2「連線中斷 30 分鐘」、`log-ux.md` §5.1）
+pub const OUTAGE_ERROR_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// 本機時鐘與 Kairos 相差超過這麼久時記 `PLS-W8301`（`cli-spec.md` §4.2「時鐘」列的通過門檻）
+const CLOCK_SKEW_NOTICE: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
 
 /// 依節流狀態記錄日誌：同一類別每 `DEFAULT_WINDOW` 最多一則，並附上被略過的次數。
 macro_rules! throttled {
@@ -234,6 +243,8 @@ pub struct Settings {
     /// durable：兩筆 report 之間的最短間隔（`buffer.replay_interval_ms`，不超過取樣間隔的 60%，
     /// 見 [`AppConfig::effective_replay_interval_ms`]）
     pub replay_interval: Duration,
+    /// 已註冊時附加在 systemd 狀態文字後的提醒（例如無法開啟本機緩衝 `PLS-E4004`）
+    pub status_note: Option<String>,
 }
 
 impl Settings {
@@ -258,6 +269,7 @@ impl Settings {
                 Duration::from_secs(config.report.interval),
             ),
             replay_interval: Duration::from_millis(config.effective_replay_interval_ms()),
+            status_note: None,
         }
     }
 
@@ -541,6 +553,7 @@ async fn run_with<D: Dialer>(
 
     // systemctl status 從啟動起就有 Status: 行（否則第一次註冊或斷線前都是空的）
     service_status::set_status(STARTING_STATUS);
+    local_status::record(local_status::State::connecting);
 
     // 啟動時先隨機延遲 0～connect_spread 再連線：大量主機同時開機或同時重啟 Pulse 時分散連線
     let startup_delay = crate::backoff::random_spread(settings.connect_spread);
@@ -639,10 +652,26 @@ async fn run_with<D: Dialer>(
             floor_note = "（連續被取代時延遲至少 30 秒，不受 retry.max_delay 限制）";
         }
         let failures = backoff.failures();
+        let code = error_code(&err, superseded_streak, has_client_cert).or_else(|| {
+            // 握手完成前、伺服器也還沒要求客戶端憑證就被關閉：多半是每 IP 連線上限（審計 A7）
+            matches!(&err, SessionError::Tls(e) if closed_before_handshake(e))
+                .then_some(codes::E_PER_IP_LIMIT)
+                .filter(|_| !dialer.client_cert_was_requested())
+        });
         let msg = format!(
-            "連線中斷（連續第 {failures} 次失敗）：{err}{hint}{uptime_note}；{:.1} 秒後重連{floor_note}",
+            "{}連線中斷（連續第 {failures} 次失敗）：{err}{hint}{uptime_note}；{:.1} 秒後重連{floor_note}",
+            codes::tag(disconnect_event(code), code),
             delay.as_secs_f64()
         );
+        local_status::record(|s| {
+            s.disconnected(Disconnected {
+                code,
+                message: err.to_string(),
+                attention: repeated_superseded || attention_key(&err, has_client_cert).is_some(),
+                consecutive_failures: u64::from(failures),
+                retry_in: delay,
+            });
+        });
         if repeated_superseded {
             // 互踢會持續發生：error 每 ATTENTION_LOG_WINDOW 最多一則，其餘記 warn
             log_attention(
@@ -665,6 +694,19 @@ async fn run_with<D: Dialer>(
             log::warn!("{msg}");
         }
         service_status::set_status(&disconnect_status(&err, superseded_streak, has_client_cert));
+        if local_status::tracker()
+            .is_some_and(|t| t.update(|s| s.outage_reached(OUTAGE_ERROR_AFTER)))
+        {
+            let msg = format!(
+                "{}已中斷 {} 分鐘，超過告警門檻：請確認 Kairos 狀態，或檢查本機到 {}:{} 的網路（服務會持續重連）",
+                codes::tag(codes::CONN_OUTAGE, code),
+                OUTAGE_ERROR_AFTER.as_secs() / 60,
+                settings.address,
+                settings.port
+            );
+            log::error!("{msg}");
+            service_status::attention(&msg);
+        }
 
         tokio::select! {
             _ = time::sleep(delay) => {}
@@ -688,6 +730,141 @@ fn needs_attention(err: &SessionError, superseded_streak: u32, has_client_cert: 
         }
         _ => attention_key(err, has_client_cert).is_some(),
     }
+}
+
+/// 斷線原因對應的錯誤代碼（`copywriting.md` §3.3、§3.4）；無法歸類時為 `None`。
+fn error_code(
+    err: &SessionError,
+    superseded_streak: u32,
+    has_client_cert: bool,
+) -> Option<&'static str> {
+    use tokio_rustls::rustls::AlertDescription as A;
+    match err {
+        SessionError::ConnectTimeout => Some(codes::E_CONN_TIMEOUT),
+        SessionError::Connect(e) => connect_error_code(e, &e.to_string()),
+        SessionError::TlsTimeout | SessionError::HelloAckTimeout | SessionError::IdleTimeout(_) => {
+            Some(codes::E_SERVER_SILENT)
+        }
+        SessionError::ProtoMismatch(_) => Some(codes::E_PROTO_VERSION),
+        SessionError::Codec(LinesCodecError::MaxLineLengthExceeded) => Some(codes::E_LINE_TOO_LONG),
+        SessionError::Server { code, message, .. } => match code.as_str() {
+            "superseded" if superseded_streak >= SUPERSEDED_STREAK_ERROR => {
+                Some(codes::E_AGENT_ID_CONFLICT)
+            }
+            "superseded" => Some(codes::W_SUPERSEDED),
+            "certificate_rejected" if message.trim() == REVOCATION_UNAVAILABLE => {
+                Some(codes::E_SERVER_CRL)
+            }
+            "certificate_rejected" => Some(codes::E_CLIENT_CERT_REJECTED),
+            "auth_failed" if message.contains("exactly one DNS SAN") => {
+                Some(codes::E_CLIENT_CERT_MULTI_SAN)
+            }
+            "auth_failed" => Some(codes::E_CLIENT_CERT_MISMATCH),
+            "unsupported_version" => Some(codes::E_PROTO_VERSION),
+            "hello_required" => Some(codes::E_HELLO_REQUIRED),
+            "too_long" => Some(codes::E_LINE_TOO_LONG),
+            "bad_request" if message.contains("registry is full") => Some(codes::E_REGISTRY_FULL),
+            "bad_request" => Some(codes::E_HELLO_BAD_REQUEST),
+            _ => None,
+        },
+        _ => {
+            if let Some(alert) = client_cert_alert(err, has_client_cert) {
+                return Some(match alert {
+                    A::CertificateExpired => codes::E_CLIENT_CERT_EXPIRED,
+                    A::CertificateRequired => codes::E_CLIENT_CERT_REQUIRED,
+                    A::UnknownCA => codes::E_CLIENT_CERT_UNTRUSTED,
+                    // 撤銷，以及伺服器沒有細分原因的拒絕（copywriting §3.3 PLS-E1105）
+                    _ => codes::E_CLIENT_CERT_REJECTED,
+                });
+            }
+            if let Some((reason, _)) = server_cert_problem(err) {
+                return match reason {
+                    "不受信任" => Some(codes::E_SERVER_CERT_UNTRUSTED),
+                    "名稱不符" => Some(codes::E_SERVER_CERT_NAME),
+                    "已過期" | "尚未生效" => Some(codes::E_SERVER_CERT_VALIDITY),
+                    "已被撤銷" => Some(codes::E_SERVER_CERT_REVOKED),
+                    "用途不符" | "被標記為 CA" => Some(codes::E_SERVER_CERT_PURPOSE),
+                    _ => None,
+                };
+            }
+            None
+        }
+    }
+}
+
+/// TCP 連線失敗的錯誤代碼：拒絕連線 `PLS-E2003`、逾時或無法到達 `PLS-E2004`、名稱解析失敗 `PLS-E2002`
+fn connect_error_code(e: &io::Error, text: &str) -> Option<&'static str> {
+    match e.kind() {
+        io::ErrorKind::ConnectionRefused => Some(codes::E_CONN_REFUSED),
+        io::ErrorKind::TimedOut
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable => Some(codes::E_CONN_TIMEOUT),
+        // std 的名稱解析錯誤沒有專屬的 ErrorKind，依訊息判斷（Linux：「failed to lookup address
+        // information」；Windows：「No such host is known」）
+        _ if text.contains("lookup address")
+            || text.contains("No such host")
+            || text.contains("nodename nor servname") =>
+        {
+            Some(codes::E_DNS)
+        }
+        _ => None,
+    }
+}
+
+/// 斷線日誌的事件（`log-ux.md` §4.2）：需要人工處理的錯誤有專屬事件，其餘為 `conn.lost`
+fn disconnect_event(code: Option<&str>) -> Event {
+    match code {
+        Some(
+            codes::E_SERVER_CERT_UNTRUSTED
+            | codes::E_SERVER_CERT_NAME
+            | codes::E_SERVER_CERT_VALIDITY
+            | codes::E_SERVER_CERT_REVOKED
+            | codes::E_SERVER_CERT_PURPOSE,
+        ) => codes::TLS_SERVER_CERT_REJECTED,
+        Some(codes::E_CLIENT_CERT_REQUIRED) => codes::AUTH_CLIENT_CERT_REQUIRED,
+        Some(codes::E_CLIENT_CERT_UNTRUSTED) => codes::AUTH_UNTRUSTED,
+        Some(codes::E_CLIENT_CERT_REJECTED) => codes::AUTH_REJECTED,
+        Some(codes::E_CLIENT_CERT_EXPIRED) => codes::AUTH_EXPIRED,
+        Some(codes::E_CLIENT_CERT_MISMATCH | codes::E_CLIENT_CERT_MULTI_SAN) => {
+            codes::AUTH_MISMATCH
+        }
+        Some(codes::E_SERVER_CRL) => codes::AUTH_SERVER_CRL,
+        Some(codes::W_SUPERSEDED | codes::E_AGENT_ID_CONFLICT) => codes::CONN_SUPERSEDED,
+        Some(codes::E_PROTO_VERSION) => codes::PROTO_INCOMPATIBLE,
+        Some(codes::E_REGISTRY_FULL) => codes::SERVER_FULL,
+        _ => codes::CONN_LOST,
+    }
+}
+
+/// hello_ack 的 `server_time` 與本機時間的差距超過 30 秒時的日誌（`clock.skew`）：
+/// 超過 5 分鐘為 `PLS-E8302`（沿用 [`clock_skew_warning`] 的文字），30 秒～5 分鐘為 `PLS-W8301`
+fn clock_skew_log(server_time: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    if let Some(warning) = clock_skew_warning(server_time, now) {
+        return Some(format!(
+            "{}{warning}",
+            codes::tag(codes::CLOCK_SKEW, Some(codes::E_CLOCK_SKEW))
+        ));
+    }
+    let server = chrono::DateTime::parse_from_rfc3339(server_time).ok()?;
+    let skew = now - server.with_timezone(&chrono::Utc);
+    if skew.abs() <= CLOCK_SKEW_NOTICE {
+        return None;
+    }
+    let (direction, secs) = if skew > chrono::TimeDelta::zero() {
+        ("快", skew.num_seconds())
+    } else {
+        ("慢", -skew.num_seconds())
+    };
+    Some(format!(
+        "{}本機時鐘比伺服器{direction}約 {secs} 秒（超過 30 秒）：report 的 ts 與日誌時間會不準確，\
+         請檢查本機的時間同步（NTP）",
+        codes::tag(codes::CLOCK_SKEW, Some(codes::W_CLOCK_SKEW))
+    ))
+}
+
+/// rustls 的 TLS 版本名稱（`TLSv1_3`）改為一般寫法（`TLSv1.3`）
+fn tls_version_name(version: &str) -> String {
+    version.replace('_', ".")
 }
 
 /// 需要人工處理的斷線原因（`superseded` 除外，另有規則）的節流分類鍵；其他原因回傳 `None`。
@@ -841,13 +1018,18 @@ fn disconnect_status(err: &SessionError, superseded_streak: u32, has_client_cert
     }
 }
 
-/// 註冊成功後的 systemd 狀態文字：「已註冊：<伺服器位址>:<連接埠>」（IPv6 位址加上方括號）。
+/// 註冊成功後的 systemd 狀態文字：「已註冊：<伺服器位址>:<連接埠>」（IPv6 位址加上方括號），
+/// 有提醒時接在「；」之後（例如「；無法開啟本機緩衝（PLS-E4004，…）」）。
 fn registered_status(settings: &Settings) -> String {
     let address = settings.address.trim();
-    if address.contains(':') && !address.starts_with('[') {
+    let base = if address.contains(':') && !address.starts_with('[') {
         format!("已註冊：[{address}]:{}", settings.port)
     } else {
         format!("已註冊：{address}:{}", settings.port)
+    };
+    match &settings.status_note {
+        Some(note) => format!("{base}；{note}"),
+        None => base,
     }
 }
 
@@ -925,16 +1107,66 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
     *registered_at = Some(Instant::now());
     let (level, msg) = registered_log(settings, &ack, tls_info);
-    log::log!(level, "{msg}");
+    log::log!(level, "{}{msg}", codes::tag(codes::CONN_REGISTERED, None));
     if let Some(warning) = ack
         .server_time
         .as_deref()
-        .and_then(|t| clock_skew_warning(t, chrono::Utc::now()))
+        .and_then(|t| clock_skew_log(t, chrono::Utc::now()))
     {
         // 每次註冊最多一則（重連受退避限制），不需節流
         log::warn!("{warning}");
     }
     service_status::set_status(&registered_status(settings));
+    let durable_session = session.durable && spool.is_some();
+    let restored = local_status::tracker().and_then(|t| {
+        t.update(|s| {
+            s.registered(Registered {
+                tls_version: tls_info.map(|i| tls_version_name(&i.version)),
+                server_verified: tls_info.is_none_or(|i| i.verified),
+                proto: session.proto,
+                features: [
+                    (session.metrics, kairos_proto::FEATURE_METRICS),
+                    (session.durable, kairos_proto::FEATURE_DURABLE),
+                ]
+                .into_iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, f)| f.to_string())
+                .collect(),
+                durable: durable_session,
+                server_time: ack
+                    .server_time
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc)),
+            })
+        })
+    });
+    if let Some(restored) = restored {
+        let backlog = match spool {
+            Some(shared) if durable_session => {
+                let spool = shared.lock();
+                let stats = spool.stats();
+                format!(
+                    "；待補送 {} 筆（最舊 {}），開始補送  delivery=durable backlog={} dropped_full={} dropped_expired={}",
+                    stats.pending,
+                    spool.oldest_sampled_at().map_or_else(
+                        || "—".to_string(),
+                        |t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    ),
+                    stats.pending,
+                    stats.dropped_full,
+                    stats.dropped_expired
+                )
+            }
+            _ => "  delivery=at_most_once".to_string(),
+        };
+        log::info!(
+            "{}連線已恢復：中斷 {:.1} 秒，重試 {} 次{backlog}",
+            codes::tag(codes::CONN_RESTORED, None),
+            restored.outage.as_secs_f64(),
+            restored.attempts
+        );
+    }
 
     // 斷線期間殘留在佇列中的舊取樣直接丟棄（at-most-once，不重送舊資料）
     while reports.try_recv().is_ok() {}
@@ -982,11 +1214,13 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 if let Some(pending) = pending_report {
                     // 伺服器寫檔緩慢時不再堆送：report 為 at-most-once，這次取樣直接丟棄
                     skipped_reports = skipped_reports.saturating_add(1);
+                    local_status::record(local_status::State::dropped_disconnected);
                     throttled!(
                         throttles.report_skipped,
                         warn,
-                        "上一筆 report（seq={pending}）尚未收到伺服器回應，略過此次取樣（ts={}，這條連線已略過 {skipped_reports} 次）；\
+                        "{}上一筆 report（seq={pending}）尚未收到伺服器回應，略過此次取樣（ts={}，這條連線已略過 {skipped_reports} 次）；\
                          伺服器寫入可能較慢",
+                        codes::tag(codes::REPORT_SKIPPED, None),
                         sample.ts
                     );
                     continue;
@@ -1000,6 +1234,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 let (msg, summary) = report_message(seq, sample, session, None);
                 conn.send(&msg).await?;
                 pending_report = Some(seq);
+                local_status::record(local_status::State::report_sent);
                 log::debug!("已送出 report（seq={seq}，{summary}）");
             }
             line = conn.framed.next() => {
@@ -1015,6 +1250,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     && answered >= pending
                 {
                     pending_report = None;
+                    if answered == pending && matches!(parse_server_msg(&line), Ok(ServerMsg::Ack { .. })) {
+                        local_status::record(local_status::State::report_acked);
+                    } else if answered == pending {
+                        local_status::record(local_status::State::report_rejected);
+                    }
                 }
             }
             _ = &mut idle => {
@@ -1046,8 +1286,9 @@ const DURABLE_RETRY_MAX: Duration = Duration::from_secs(60);
 enum Reply {
     /// 已保存（或先前已保存過）：從緩衝移除
     Ack,
-    /// 沒有保存（`storage_unavailable` 與其他非 fatal 的錯誤）：保留，退避後重送
-    Retry,
+    /// 沒有保存（`storage_unavailable` 與其他非 fatal 的錯誤）：保留，退避後重送。
+    /// 內容為代碼（`PLS-W4101` 無法保存、`PLS-W2203` 速率限制、`PLS-W2107` 其他）
+    Retry(&'static str),
     /// 永遠不會被接受（`invalid_report`、`bad_request`）：丟棄，不重送
     Rejected(String),
 }
@@ -1059,16 +1300,28 @@ fn durable_reply(line: &str) -> Option<(Option<u64>, Reply)> {
         ServerMsg::Error {
             seq,
             code,
+            message,
             fatal: false,
             ..
         } => Some((
             seq,
             match code.as_str() {
                 "invalid_report" | "bad_request" => Reply::Rejected(code),
-                _ => Reply::Retry,
+                "storage_unavailable" => Reply::Retry(storage_code(&message)),
+                _ => Reply::Retry(codes::W_SERVER_UNEXPECTED),
             },
         )),
         _ => None,
+    }
+}
+
+/// `storage_unavailable` 的代碼：速率限制（`report rate limit exceeded`）為 `PLS-W2203`，
+/// 其餘（無法保存）為 `PLS-W4101`（`copywriting.md` §3.4）
+fn storage_code(message: &str) -> &'static str {
+    if message.contains("rate limit") {
+        codes::W_REPORT_RATE
+    } else {
+        codes::W_SERVER_STORAGE
     }
 }
 
@@ -1101,6 +1354,8 @@ struct Delivery {
     acked: u64,
     /// 連線開始時的積壓筆數（0 表示沒有積壓、不記「補送完成」）
     backlog: usize,
+    /// 開始補送的時間（`buffer.replay_done` 的 `duration_ms`）
+    started: Instant,
 }
 
 impl Delivery {
@@ -1115,6 +1370,7 @@ impl Delivery {
             retry: Backoff::new(DURABLE_RETRY_INITIAL, DURABLE_RETRY_MAX),
             acked: 0,
             backlog,
+            started: start,
         }
     }
 
@@ -1142,10 +1398,12 @@ impl Delivery {
         }
         let expired = spool.drop_expired(chrono::Utc::now());
         if expired > 0 {
+            local_status::record(local_status::State::buffer_changed);
             throttled!(
                 throttles.spool_expired,
                 warn,
-                "本機緩衝中有 {expired} 筆取樣超過 buffer.max_age_hours 設定的時間，已丟棄、不送出（累計 {} 筆）",
+                "{}本機緩衝中有 {expired} 筆取樣超過 buffer.max_age_hours 設定的時間，已丟棄、不送出（累計 {} 筆）",
+                codes::tag(codes::BUFFER_EXPIRED, Some(codes::W_BUFFER_EXPIRED)),
                 spool.stats().dropped_expired
             );
         }
@@ -1223,19 +1481,26 @@ impl Delivery {
                     self.acked += 1;
                 }
                 self.retry.reset();
+                local_status::record(local_status::State::report_acked);
             }
-            Reply::Retry => {
+            Reply::Retry(code) => {
                 // 這筆沒有保存：在途的其他筆有回應後，退避一段時間再從最舊的未確認記錄重送
                 self.rewind = true;
                 let delay = self.retry.next_delay();
                 self.next_allowed = self.next_allowed.max(Instant::now() + delay);
+                let at = chrono::Utc::now()
+                    + chrono::Duration::from_std(self.next_allowed - Instant::now())
+                        .unwrap_or_default();
+                local_status::record(|s| s.server_backoff(at, code));
             }
             Reply::Rejected(code) => {
+                local_status::record(local_status::State::report_rejected);
                 if spool.discard_rejected(id) {
                     throttled!(
                         throttles.report_rejected,
                         warn,
-                        "伺服器拒收本機緩衝中的 report（{}），已丟棄、不重送（累計 {} 筆）",
+                        "{}伺服器拒收本機緩衝中的 report（{}），已丟棄、不重送（累計 {} 筆）",
+                        codes::tag(codes::REPORT_REJECTED, Some(codes::W_INVALID_REPORT)),
                         sanitize_for_log(&code, LOG_CODE_LIMIT),
                         spool.stats().dropped_rejected
                     );
@@ -1244,10 +1509,15 @@ impl Delivery {
         }
         if self.backlog > 0 && self.in_flight == 0 && spool.is_empty() {
             log::info!(
-                "已補送完本機緩衝中的積壓（這條連線共確認 {} 筆），之後的取樣即時送出",
-                self.acked
+                "{}已補送完本機緩衝中的積壓（這條連線共確認 {} 筆，約 {:.1} 秒），之後的取樣即時送出  replayed={} duration_ms={}",
+                codes::tag(codes::BUFFER_REPLAY_DONE, None),
+                self.acked,
+                self.started.elapsed().as_secs_f64(),
+                self.acked,
+                self.started.elapsed().as_millis()
             );
             self.backlog = 0;
+            local_status::record(local_status::State::buffer_changed);
         }
     }
 }
@@ -1316,6 +1586,7 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                 let (msg, summary) = report_message(seq, record.sample, session, Some(durable));
                 conn.send(&msg).await?;
                 delivery.sent(seq, Some(entry.id));
+                local_status::record(local_status::State::report_sent);
                 log::debug!("已送出 report（seq={seq}，report_seq={}，{summary}）", entry.report_seq);
             }
             line = conn.framed.next() => {
@@ -1592,7 +1863,8 @@ fn handle_server_line_in(
             throttled!(
                 throttles.unexpected_hello_ack,
                 warn,
-                "已註冊後又收到 hello_ack（seq={seq}），忽略"
+                "{}已註冊後又收到 hello_ack（seq={seq}），忽略",
+                codes::tag(codes::SERVER_UNEXPECTED, Some(codes::W_SERVER_UNEXPECTED))
             );
             Ok(LineOutcome::valid(None))
         }
@@ -1610,7 +1882,8 @@ fn handle_server_line_in(
             // 節流視窗較長（STORAGE_UNAVAILABLE_LOG_WINDOW），不用 throttled!（固定 10 秒）
             if let Some(n) = throttles.storage_unavailable.check(Instant::now()) {
                 log::warn!(
-                    "伺服器無法保存 report（seq={}，storage_unavailable）：{}；{}{}",
+                    "{}伺服器無法保存 report（seq={}，storage_unavailable）：{}；{}{}",
+                    codes::tag(codes::REPORT_REJECTED, Some(storage_code(&message))),
                     seq_text(seq),
                     sanitize_for_log(&message, LOG_TEXT_LIMIT),
                     if durable {
@@ -1626,10 +1899,16 @@ fn handle_server_line_in(
         Ok(ServerMsg::Error {
             seq, code, message, ..
         }) => {
+            let (event, pls) = if code == "invalid_report" {
+                (codes::REPORT_REJECTED, codes::W_INVALID_REPORT)
+            } else {
+                (codes::SERVER_UNEXPECTED, codes::W_SERVER_UNEXPECTED)
+            };
             throttled!(
                 throttles.nonfatal_error,
                 warn,
-                "伺服器回報錯誤（seq={}）{}：{}",
+                "{}伺服器回報錯誤（seq={}）{}：{}",
+                codes::tag(event, Some(pls)),
                 seq_text(seq),
                 sanitize_for_log(&code, LOG_CODE_LIMIT),
                 sanitize_for_log(&message, LOG_TEXT_LIMIT)
@@ -1667,7 +1946,8 @@ fn log_unparsable(throttles: &mut ServerLogThrottles, line: &str, e: &ServerMsgE
     throttled!(
         throttles.unparsable,
         warn,
-        "無法解析伺服器訊息（{}），忽略：{}",
+        "{}無法解析伺服器訊息（{}），忽略：{}",
+        codes::tag(codes::SERVER_UNEXPECTED, Some(codes::W_SERVER_UNEXPECTED)),
         sanitize_for_log(&e.to_string(), LOG_TEXT_LIMIT),
         sanitize_for_log(line, LOG_TEXT_LIMIT)
     );
@@ -1877,7 +2157,19 @@ mod tests {
             connect_spread: Duration::ZERO,
             host: HostInfo::default(),
             replay_interval: Duration::from_millis(600),
+            status_note: None,
         }
+    }
+
+    #[test]
+    fn registered_status_appends_the_buffer_note() {
+        let mut s = settings(1);
+        assert_eq!(registered_status(&s), "已註冊：127.0.0.1:1");
+        s.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
+        assert_eq!(
+            registered_status(&s),
+            "已註冊：127.0.0.1:1；無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）"
+        );
     }
 
     #[test]
@@ -3161,13 +3453,25 @@ mod tests {
             durable_reply(r#"{"type":"ack","seq":3}"#),
             Some((Some(3), Reply::Ack))
         );
-        for code in ["storage_unavailable", "something_new"] {
+        for (code, message, expected) in [
+            (
+                "storage_unavailable",
+                "report could not be stored",
+                "PLS-W4101",
+            ),
+            (
+                "storage_unavailable",
+                "report rate limit exceeded",
+                "PLS-W2203",
+            ),
+            ("something_new", "m", "PLS-W2107"),
+        ] {
             let line = format!(
-                r#"{{"type":"error","seq":4,"code":"{code}","message":"m","fatal":false}}"#
+                r#"{{"type":"error","seq":4,"code":"{code}","message":"{message}","fatal":false}}"#
             );
             assert_eq!(
                 durable_reply(&line),
-                Some((Some(4), Reply::Retry)),
+                Some((Some(4), Reply::Retry(expected))),
                 "{code}"
             );
         }
@@ -3272,7 +3576,7 @@ mod tests {
         });
         let registered: Vec<_> = logs
             .iter()
-            .filter(|(_, m)| m.starts_with("已向伺服器註冊"))
+            .filter(|(_, m)| m.starts_with("conn.registered - 已向伺服器註冊"))
             .collect();
         assert_eq!(registered.len(), 1, "{logs:?}");
         let (level, msg) = registered[0];
@@ -3292,12 +3596,121 @@ mod tests {
         );
     }
 
-    /// 斷線日誌（「連線中斷」開頭）的等級與內容。
+    /// 日誌訊息去掉開頭的「`<event> <code> `」（見 `codes::tag`）
+    fn untagged(m: &str) -> &str {
+        match m.split_once(' ') {
+            Some((event, rest)) if event.contains('.') && event.is_ascii() => {
+                rest.split_once(' ').map_or(rest, |(_, msg)| msg)
+            }
+            _ => m,
+        }
+    }
+
+    /// 斷線日誌（「連線中斷」開頭）的等級與內容（去掉事件與代碼）。
     fn disconnect_logs(logs: &[(log::Level, String)]) -> Vec<(log::Level, String)> {
         logs.iter()
-            .filter(|(_, m)| m.starts_with("連線中斷"))
-            .cloned()
+            .filter(|(_, m)| untagged(m).starts_with("連線中斷"))
+            .map(|(l, m)| (*l, untagged(m).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn disconnect_logs_carry_event_and_code() {
+        // log-ux §4.2、§6.1：事件與代碼在訊息開頭
+        let refused = SessionError::Connect(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(error_code(&refused, 0, false), Some("PLS-E2003"));
+        assert_eq!(disconnect_event(Some("PLS-E2003")).name, "conn.lost");
+        assert_eq!(
+            error_code(&SessionError::ConnectTimeout, 0, false),
+            Some("PLS-E2004")
+        );
+        let dns =
+            io::Error::other("failed to lookup address information: Name or service not known");
+        assert_eq!(
+            connect_error_code(&dns, &dns.to_string()),
+            Some("PLS-E2002")
+        );
+        assert_eq!(
+            error_code(
+                &SessionError::IdleTimeout(Duration::from_secs(30)),
+                0,
+                false
+            ),
+            Some("PLS-E2005")
+        );
+        let fatal = |code: &str, message: &str| SessionError::server(code, message, true);
+        for (err, streak, code, event) in [
+            (
+                fatal("certificate_rejected", "x"),
+                0,
+                "PLS-E1105",
+                "auth.rejected",
+            ),
+            (
+                fatal("certificate_rejected", REVOCATION_UNAVAILABLE),
+                0,
+                "PLS-E1203",
+                "auth.server_crl",
+            ),
+            (fatal("auth_failed", "x"), 0, "PLS-E1102", "auth.mismatch"),
+            (
+                fatal(
+                    "auth_failed",
+                    "client certificate must contain exactly one DNS SAN",
+                ),
+                0,
+                "PLS-E1103",
+                "auth.mismatch",
+            ),
+            (fatal("superseded", ""), 1, "PLS-W3101", "conn.superseded"),
+            (fatal("superseded", ""), 2, "PLS-E3102", "conn.superseded"),
+            (
+                fatal("bad_request", "server agent registry is full"),
+                0,
+                "PLS-E3201",
+                "server.full",
+            ),
+            (
+                fatal("unsupported_version", ""),
+                0,
+                "PLS-E2101",
+                "proto.incompatible",
+            ),
+            (
+                SessionError::ProtoMismatch(3),
+                0,
+                "PLS-E2101",
+                "proto.incompatible",
+            ),
+        ] {
+            let c = error_code(&err, streak, true);
+            assert_eq!(c, Some(code), "{err}");
+            assert_eq!(disconnect_event(c).name, event, "{err}");
+        }
+        assert_eq!(error_code(&SessionError::ClosedByServer, 0, true), None);
+        assert_eq!(disconnect_event(None).name, "conn.lost");
+        assert_eq!(untagged("conn.lost PLS-E2003 連線中斷"), "連線中斷");
+        assert_eq!(untagged("連線中斷：x y"), "連線中斷：x y");
+    }
+
+    #[test]
+    fn clock_skew_logs_carry_w8301_or_e8302() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-08T03:15:40Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(clock_skew_log("2026-10-08T03:15:20Z", now), None, "20 秒");
+        let w = clock_skew_log("2026-10-08T03:14:40Z", now).unwrap();
+        assert!(
+            w.starts_with("clock.skew PLS-W8301 本機時鐘比伺服器快約 60 秒"),
+            "{w}"
+        );
+        let e = clock_skew_log("2026-10-08T03:25:40Z", now).unwrap();
+        assert!(
+            e.starts_with("clock.skew PLS-E8302 本機時鐘比伺服器慢約 600 秒"),
+            "{e}"
+        );
+        assert_eq!(clock_skew_log("x", now), None);
+        assert_eq!(tls_version_name("TLSv1_3"), "TLSv1.3");
     }
 
     #[test]
@@ -4176,6 +4589,14 @@ mod tests {
         assert_eq!(d.len(), 30, "{d:?}");
         let errors = error_positions(&d);
         let stderr = stderr_events(&events);
+        // journal 中也有事件與代碼（log-ux §4.2：certificate_rejected → auth.rejected PLS-E1105）
+        assert!(
+            stderr
+                .iter()
+                .all(|s| s.starts_with("auth.rejected PLS-E1105 連線中斷")),
+            "{stderr:?}"
+        );
+        let stderr: Vec<&str> = stderr.iter().map(|s| untagged(s)).collect();
         // stderr 的內容與 ERROR 日誌完全相同，且只有 ERROR 那幾則
         let error_msgs: Vec<&str> = errors.iter().map(|(i, _)| d[*i].1.as_str()).collect();
         assert_eq!(stderr, error_msgs, "{events:?}");

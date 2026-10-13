@@ -218,7 +218,16 @@ impl Drop for TestDir {
 fn is_ambient_setting(key: &str) -> bool {
     key.starts_with("KAIROS__")
         || key.starts_with("PULSE__")
-        || matches!(key, "NOTIFY_SOCKET" | "JOURNAL_STREAM" | "BUILD_COMMIT")
+        || matches!(
+            key,
+            "NOTIFY_SOCKET"
+                | "JOURNAL_STREAM"
+                | "BUILD_COMMIT"
+                // pulse status 的符號與色彩（cli-style §3、§4）
+                | "PULSE_SYMBOLS"
+                | "NO_COLOR"
+                | "CLICOLOR_FORCE"
+        )
 }
 
 /// 一個啟動中的 `kairos` 或 `pulse` 行程。結束時（含測試 panic）若仍在執行則強制終止。
@@ -339,6 +348,11 @@ impl Proc {
             self.name,
             tail(&self.stderr())
         )
+    }
+
+    /// 行程 ID
+    pub fn id(&self) -> u32 {
+        self.child.id()
     }
 
     /// 行程是否仍在執行（已結束時記下結束狀態）
@@ -847,6 +861,9 @@ interval = 1
 
 [report]
 interval = 1
+
+[status]
+file = "state/status.json"
 
 [log]
 level = "trace"

@@ -349,11 +349,19 @@ fn log_event(event: &GuardEvent) {
         GuardEvent::JumpStarted {
             today, accepted, ..
         } => log::warn!(
-            "系統日期 {today} 比先前的 {accepted} 前進得比實際經過的時間多，可能是時鐘被誤校；暫停清除過期的日誌檔以免誤刪。\
-             若日期正確，{hours} 小時後會恢復清除"
+            "{}系統日期 {today} 比先前的 {accepted} 前進得比實際經過的時間多，可能是時鐘被誤校；暫停清除過期的日誌檔以免誤刪。\
+             若日期正確，{hours} 小時後會恢復清除",
+            crate::codes::tag(
+                crate::codes::LOG_RETENTION_PAUSED,
+                Some(crate::codes::W_LOG_RETENTION_PAUSED)
+            )
         ),
         GuardEvent::JumpRestarted { today, previous } => log::warn!(
-            "暫停清除日誌檔期間，系統日期又從 {previous} 往前跳到 {today}，重新起算 {hours} 小時"
+            "{}暫停清除日誌檔期間，系統日期又從 {previous} 往前跳到 {today}，重新起算 {hours} 小時",
+            crate::codes::tag(
+                crate::codes::LOG_RETENTION_PAUSED,
+                Some(crate::codes::W_LOG_RETENTION_PAUSED)
+            )
         ),
         GuardEvent::JumpAccepted { today } => {
             log::warn!("系統日期 {today} 已持續 {hours} 小時，接受為正確日期並恢復清除過期的日誌檔")
