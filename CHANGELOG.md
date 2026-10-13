@@ -48,6 +48,29 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.3.0 之後的變更記在這裡。）
 
+## [0.4.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕以下只列 Pulse 的條目（衝刺 3 `sprint3/pulse-status`）；Kairos 的條目在另一個分支，合併時整併。版本號尚未改（`pulse/Cargo.toml` 仍為 0.3.0）。
+
+### Pulse：新增
+
+- **`pulse status`**（設計包 `pulse/cli-spec.md` §4）：讀取本機狀態檔與服務管理員（systemd、Windows 服務控制管理員），顯示服務、連線、回報、身分、設定、時鐘六列與本機狀態（線上／警告／離線／嚴重／未知），問題另以三段式說明（標題、原因、處理方式與代碼）寫到 stderr。`--brief`（單行）、`--json`（`pulse.status/v1`，純 ASCII）、`--watch [秒]`、`--exit-codes=nagios`、`--config`、`--ascii`、`--color`。不需要連線；結束代碼 0 線上、8 警告、9 離線／嚴重／未知、2 用法錯誤、10 無法讀取狀態檔。「回報」列寫出補送資訊：待補送筆數、最舊一筆的取樣時間、預計補完時間、最近 24 小時內因緩衝已滿或超過保存時間而丟棄的筆數與取樣時間範圍（`PLS-W4202`／`PLS-W4203`）、無法寫入緩衝（`PLS-W4103`）、緩衝無法使用（`PLS-E4004`）、Kairos 暫時無法保存（`PLS-W4101`）。README「本機狀態（pulse status）」、INSTALL 第 8.2 節
+- **本機狀態檔**（`[status] file`，預設 `logs/status.json`）：執行中每 10 秒、狀態變化時另外以原子方式改寫（暫存檔＋rename，不 fsync，Unix 0640），內容不含秘密；以單調時鐘判斷是否過時（超過 60 秒為「未知」，`PLS-W8004`），正常結束前寫入結束代碼
+- **`pulse explain <代碼>`**：印出錯誤代碼的標題；發佈包新增 `ERROR-CODES.md`（代碼 → 程式位置 → 觸發條件的對照表，與尚未實作的代碼）
+- 子命令 `pulse run`（等同不帶參數）
+
+### Pulse：變更
+
+- **日誌加上固定事件與錯誤代碼**（設計包 `pulse/log-ux.md` §4、`decisions/INTEGRATION.md` §25.5）：有對應事件的行，訊息開頭為「`<event> <code> `」，例如 `buffer.full PLS-W4202`、`auth.rejected PLS-E1105`、`conn.registered -`。本機緩衝的 5010～5015（`buffer.opened`、`buffer.unavailable` `PLS-E4004`、`buffer.write_failed` `PLS-W4103`、`buffer.full` `PLS-W4202`、`buffer.expired` `PLS-W4203`、`buffer.replay_done`），連線中斷依原因分為 `conn.lost`（`PLS-E2002`～`E2005`、`E2201`）、`tls.server_cert_rejected`（`PLS-E1401`～`E1405`）、`auth.*`、`conn.superseded`、`proto.incompatible`、`server.full`；新增 `conn.restored`（恢復時記中斷時間、重試次數、待補送與丟棄筆數）與 `conn.outage`（中斷滿 30 分鐘時一次 `ERROR`，同時寫 stderr）。比對日誌文字的告警規則若以行首比對（例如 `[ERROR] 連線中斷`），請改為比對事件或代碼，或改用包含比對
+- 時鐘偏差 30 秒～5 分鐘時也記 `WARN`（`clock.skew PLS-W8301`；超過 5 分鐘為 `PLS-E8302`，維持 `WARN`）
+- 啟動失敗的 stderr 訊息帶代碼：`錯誤 PLS-E0101：無法載入設定：…`（範圍錯誤為 `PLS-E0201`）、`錯誤 PLS-E4002：無法初始化日誌：…`；`agent.fatal` 帶 `PLS-E3103`／`PLS-E3104`（`agent.id`）、`PLS-E1102`（SAN 與 agent_id 不符）。命令列錯誤帶 `PLS-E0001`～`E0003`
+- 無法開啟本機緩衝時，systemd 的 `Status:` 在「已註冊：…」後加上「；無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）」
+- `--help` 列出 `status`、`explain`
+
+### Pulse：與設計包的差異與待辦
+
+見 `pulse/ERROR-CODES.md` §4、§5：狀態檔在工作目錄的 `logs/`（設計包為 `/var/lib/pulse`），`pulse status` 需要 root 或 `pulse` 群組；尚未實作 Windows 事件記錄、服務描述、`log-ux.md` 的完整格式（RFC 3339 時間、JSON）與重試摘要、`--all`、`--json-lines`，以及 53 個與註冊、安裝、自動更新憑證相關的代碼。
+
 ## [0.3.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.3.0、Pulse 0.3.0**：商業審計路線圖「階段 2 資料層」中的 A1（資料庫）、A5（at-least-once 投遞）、A6（持久化主機清冊）、A9（容量）。Kairos 的 report 預設改寫 SQLite，另有主機清冊、5 分鐘／1 小時彙總、分層保留與總容量上限；Pulse 新增本機環狀緩衝，Kairos 停機或網路中斷期間的取樣在恢復後補送，雙方以協定 feature `durable` 協商，Kairos 以唯一索引去重。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.3.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。架構、schema、設定、容量估算、量測與備份見 `kairos/STORAGE.md`（發佈包內的 `STORAGE.md`）；協定見 `crates/kairos-proto/PROTOCOL.md`「durable：at-least-once 投遞」。

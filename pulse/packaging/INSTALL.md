@@ -15,6 +15,7 @@
 | `pulse.service` | 644 | systemd unit 範本（單一實例） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
+| `ERROR-CODES.md` | 644 | 錯誤代碼與日誌事件的對照（`pulse explain <代碼>` 指向這裡） |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `pulse.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `pulse-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -111,7 +112,7 @@ install -d -o pulse -g pulse -m 750 /opt/pulse/buffer
 cd ~/pulse-dist/pkg
 install -o root -g root -m 755 pulse /opt/pulse/pulse
 install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.md \
-  CHANGELOG.md THIRD-PARTY-LICENSES /opt/pulse/
+  CHANGELOG.md ERROR-CODES.md THIRD-PARTY-LICENSES /opt/pulse/
 ```
 
 `/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/` 與 `buffer/`。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。`buffer/` 是本機緩衝（斷線或 Kairos 維護期間的資料暫存在這裡，Kairos 確認後才刪除，見第 6.2 節）；沒有建立時服務仍會啟動，但 Pulse 無法寫入緩衝，記 `ERROR` 後改為 at-most-once（斷線期間的資料不補送）。
@@ -276,17 +277,20 @@ systemctl status pulse --no-pager
 
 ```bash
 /opt/pulse/pulse --version                      # pulse <版本> (<commit>)
+/opt/pulse/pulse status                         # 本機狀態：線上、結果：6 項通過（第 8.2 節）；結束代碼 0
 journalctl -u pulse -n 20 --no-pager            # 只有 systemd 啟停紀錄與 stderr；沒有錯誤即正常
 tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 ```
 
-日誌中應依序出現：
+日誌中應依序出現（有固定事件的行以「事件 代碼」開頭，沒有代碼時為 `-`，見 `ERROR-CODES.md`）：
 
 ```
-[INFO] Pulse 地端程式啟動（pulse <版本> (<commit>)）...
+[INFO] agent.start - Pulse 地端程式啟動（pulse <版本> (<commit>)，PID <PID>）...
 [INFO] 工作目錄：/opt/pulse（設定中的相對路徑都以此為準）；設定檔：已讀取 /opt/pulse/pulse.toml
+[INFO] 本機狀態檔：/opt/pulse/logs/status.json（pulse status 讀取）
 [INFO] 已載入客戶端憑證：client.pem（憑證鏈 1 張；私鑰：client.key）
-[INFO] 已向伺服器註冊（agent_id=…，伺服器離線判定 75000 ms；TLS 加密連線 monitor.example.com:8080，domain=monitor.example.com，TLSv1_3，已驗證伺服器憑證）
+[INFO] buffer.opened - 本機緩衝：/opt/pulse/buffer（待送 0 筆、0 bytes；…）
+[INFO] conn.registered - 已向伺服器註冊（agent_id=…，伺服器離線判定 75000 ms，協定 v2；TLS 加密連線 monitor.example.com:8080，domain=monitor.example.com，TLSv1_3，已驗證伺服器憑證）
 ```
 
 - 啟動時 Pulse 會先隨機等待 0～5 秒（「x 秒後開始連線」）才連線，避免大量主機同時連入。
@@ -338,12 +342,44 @@ tail -n 30 /opt/pulse/logs/pulse-$(date -u +%F).log
 2. **`journalctl -u pulse -p err`**：上述錯誤（伺服器憑證驗證失敗、伺服器送來的致命錯誤與註冊前的錯誤、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕），以及本機客戶端憑證已過期，會在寫 `ERROR` 日誌的同時寫一行到 stderr，內容與日誌的 `ERROR` 行相同，在 journal 中以 err 等級記錄，可用 `-p err` 篩選。第一次發生就記 `ERROR`，同一原因每 10 分鐘最多一行（其餘次數在 `logs/` 記 `WARN`），原因改變時立即再記。一般連線錯誤（`重新連線中`：拒絕連線、逾時、連線被重設等）不寫 stderr，只在 `logs/`。
 
    ```
-   pulse[1234]: [ERROR] 連線中斷（連續第 1 次失敗）：伺服器回報致命錯誤 certificate_rejected：…；2.0 秒後重連
-   pulse[1234]: [ERROR] 連線中斷（連續第 1 次失敗）：TLS 握手失敗：invalid peer certificate: UnknownIssuer（伺服器憑證不受信任（簽發者不在信任庫中）：自簽憑證或私有 CA 請以 server.ca_cert 指定）；2.0 秒後重連
+   pulse[1234]: [ERROR] auth.rejected PLS-E1105 連線中斷（連續第 1 次失敗）：伺服器回報致命錯誤 certificate_rejected：…；2.0 秒後重連
+   pulse[1234]: [ERROR] tls.server_cert_rejected PLS-E1401 連線中斷（連續第 1 次失敗）：TLS 握手失敗：invalid peer certificate: UnknownIssuer（伺服器憑證不受信任（簽發者不在信任庫中）：自簽憑證或私有 CA 請以 server.ca_cert 指定）；2.0 秒後重連
    ```
 
+   一般連線錯誤中斷滿 30 分鐘時另寫一行（`conn.outage`），例如 `[ERROR] conn.outage PLS-E2003 已中斷 30 分鐘，超過告警門檻：…`。
+
 3. **`logs/pulse-YYYY-MM-DD.log`**：每次斷線都有一行完整紀錄。
-4. **Kairos 端**：`agents.json` 中此 agent 是否為 `"online": true`。
+4. **`pulse status`**（第 8.2 節）：需要人工處理的錯誤時本機狀態為「嚴重」、結束代碼 9，「連線」列寫出原因與代碼，即使之後 Kairos 剛好停機也不會被「重新連線中」蓋掉。
+5. **Kairos 端**：`agents.json` 中此 agent 是否為 `"online": true`。
+
+### 8.2 `pulse status` 與本機狀態檔
+
+Pulse 每 10 秒（狀態改變時另外）把目前的狀態寫到 `/opt/pulse/logs/status.json`（`pulse.toml` 的 `[status] file` 可改），`pulse status` 讀取它並向 systemd 查詢 `pulse.service`，不連線、不影響服務。完整說明與 `--json` 欄位見 `README.md`「本機狀態（pulse status）」。
+
+```bash
+/opt/pulse/pulse status            # 人看的檢查列；有問題時另印原因與處理方式
+/opt/pulse/pulse status --brief    # 單行，例如：online    plc-hmi-07 registered kairos.example.gov.tw:8443 cert=365d
+/opt/pulse/pulse status --json     # 給監控系統（schema pulse.status/v1）
+```
+
+| 結束代碼 | 本機狀態 |
+|---|---|
+| 0 | 線上 |
+| 8 | 警告（憑證即將到期、時鐘偏差、本機緩衝最近丟過資料等） |
+| 9 | 離線（重新連線中，未滿 30 分鐘）、嚴重（需要人工處理、中斷滿 30 分鐘、服務未執行）、未知（狀態檔超過 60 秒沒有更新） |
+| 10 | 沒有權限讀取狀態檔 |
+
+- **權限**：狀態檔為 `pulse:pulse 640`，所在的 `/opt/pulse`（`root:pulse 750`）與 `logs/`（`pulse:pulse 750`）只有 root 與 `pulse` 群組可以進入。一般帳號要執行時，把它加入 `pulse` 群組（`usermod -aG pulse <帳號>`，重新登入後生效）；否則以 `sudo` 執行。狀態檔不含私鑰或 token。
+- **設定檔的位置**：在任何目錄執行 `/opt/pulse/pulse status` 都會讀 `/opt/pulse/pulse.toml`（執行檔所在的目錄）；多實例時在 `/opt/pulse-N` 目錄執行，或加上 `--config /opt/pulse-N/pulse.toml`。
+- **登入提示**（選用，預設不安裝）：在 `/etc/update-motd.d/` 加一個腳本，例如 `/etc/update-motd.d/90-pulse`（755）：
+
+  ```sh
+  #!/bin/sh
+  /opt/pulse/pulse status --brief 2>/dev/null || true
+  ```
+
+  motd 由 root 執行，不需要額外權限。
+- 監控系統（Nagios、Zabbix）可用 `--exit-codes=nagios`（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN，單行輸出）。
 
 ## 9. 多實例（同一台主機跑多個 Pulse）
 
@@ -405,6 +441,7 @@ systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/pulse-$N.service   # 沒有輸出表示格式正確
 systemctl enable --now pulse-$N
 tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄：/opt/pulse-N」與「已向伺服器註冊」
+/opt/pulse/pulse status --config /opt/pulse-$N/pulse.toml    # 查詢 pulse-N.service 與 /opt/pulse-N/logs/status.json
 ```
 
 - 每個實例的 agent_id 不同，客戶端憑證要分別簽發；不要把第一個實例的 `client.pem`、`client.key` 複製過去（SAN 不符，啟動即結束）。
@@ -444,7 +481,8 @@ cp -p /opt/pulse/pulse /opt/pulse/pulse.prev
 install -o root -g root -m 755 pkg-new/pulse /opt/pulse/pulse.new
 mv /opt/pulse/pulse.new /opt/pulse/pulse
 install -o root -g root -m 644 pkg-new/pulse.example.toml pkg-new/INSTALL.md \
-  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/CHANGELOG.md pkg-new/THIRD-PARTY-LICENSES /opt/pulse/
+  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/CHANGELOG.md pkg-new/ERROR-CODES.md \
+  pkg-new/THIRD-PARTY-LICENSES /opt/pulse/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/pulse.service /etc/systemd/system/pulse.service
 # （多實例時，再依第 9 節步驟 2 重新產生每個 pulse-N.service）
@@ -453,6 +491,7 @@ install -o root -g root -m 644 pkg-new/pulse.example.toml pkg-new/INSTALL.md \
 # 4. 重新啟動並確認（第 8 節）
 systemctl restart pulse          # 多實例時：systemctl restart 'pulse*.service'
 /opt/pulse/pulse --version
+/opt/pulse/pulse status          # 0.4 起；結束代碼 0 表示線上
 tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 ```
 

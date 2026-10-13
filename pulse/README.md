@@ -14,7 +14,8 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 - 🔁 斷線自動重連：指數退避 + ±20% 抖動、有上限、不限次數；啟動與斷線後第一次重連另加隨機延遲，避免大量 agent 同時連線
 - 🔑 可選 mTLS 客戶端憑證：以憑證 SAN 綁定 `agent_id`，防止冒用；支援中繼 CA 鏈與 RSA / ECDSA / Ed25519 私鑰
 - ⚙️ 設定三層疊加：嵌入預設值 → `pulse.toml` → `PULSE__*` 環境變數
-- 📝 日誌同時輸出到終端與 `logs/pulse-YYYY-MM-DD.log`（按日分檔、自動清除過期檔）
+- 📝 日誌同時輸出到終端與 `logs/pulse-YYYY-MM-DD.log`（按日分檔、自動清除過期檔）；有固定事件的行以「`<event> <代碼>`」開頭（見「日誌」與 `ERROR-CODES.md`）
+- 🩺 `pulse status`：讀取執行中的 Pulse 每 10 秒寫出的本機狀態檔，顯示服務、連線、回報（含待補送筆數）、身分、設定與時鐘；`--brief`、`--json` 與結束代碼給監控系統、SCCM 使用（見「本機狀態（pulse status）」）
 
 ## 系統需求
 
@@ -266,12 +267,14 @@ cargo run
 
 | 參數 | 說明 |
 |---|---|
-| （無） | 啟動監控代理 |
+| （無）、`run` | 啟動監控代理 |
+| `status [選項]` | 顯示本機狀態（見「本機狀態（pulse status）」；`pulse status --help`） |
+| `explain <代碼>` | 印出錯誤代碼的標題（例如 `pulse explain PLS-W4202`），完整對照見 `ERROR-CODES.md` |
 | `--print-agent-id` | 印出本機 agent_id 後結束（見「啟用 mTLS」） |
 | `-V`, `--version` | 印出 `pulse <版本> (<commit>)` 後結束（不讀取設定，設定有誤時也能確認版本） |
 | `-h`, `--help` | 顯示使用說明 |
 
-未知參數會印出錯誤與用法，並以 exit code 2 結束。
+未知參數會印出錯誤（`PLS-E0001`）與用法，並以 exit code 2 結束。
 
 `--version` 的 commit 在建置時決定：環境變數 `BUILD_COMMIT`（`packaging/build-release.sh` 會傳入）→ `git rev-parse --short HEAD` → 都取不到時為 `unknown`。啟動日誌的第一行也會印出同樣的版本字串；送給伺服器的 hello 中的 `agent_version` 仍只有版本號（例如 `0.1.0`）。
 
@@ -348,6 +351,9 @@ max_records = 50000            # 待送資料的筆數上限（與 max_mb 先到
 max_age_hours = 168            # 取樣超過這麼久（小時）的資料不再送出
 replay_interval_ms = 1200      # 兩筆 report 之間的最短間隔（毫秒；補送積壓的速率，不超過 report.interval 的 60%）
 
+[status]
+file = "logs/status.json"      # 本機狀態檔（pulse status 讀取；相對於工作目錄）
+
 [log]
 level = "info"                 # 日誌級別：trace / debug / info / warn / error（不分大小寫）
 retention_days = 14            # 日誌檔保留天數（今天與前 N 天）；0 = 永久保留
@@ -389,6 +395,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `buffer.max_records` | 100～10000000 | |
 | `buffer.max_age_hours` | 1～8760 小時 | |
 | `buffer.replay_interval_ms` | 500～60000 毫秒 | 下限 500 毫秒對應 Kairos 的 report 速率限制（每秒 2 則）。實際使用的值不超過 `report.interval` 的 60%（否則積壓補不完；被調整時啟動記 `INFO`） |
+| `status.file` | 非空白字串 | |
 
 ### ⚠️ 安全性提醒
 
@@ -511,6 +518,67 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 - **無法開啟緩衝**（目錄無法建立或寫入，例如沿用舊版 systemd unit 而 `buffer/` 不可寫）：記 `ERROR`（同時寫 stderr），本次執行改為 at-most-once，不影響監控本身。
 - `buffer.enabled = false`：不寫磁碟、不宣告 `durable`，行為與 0.2.0 相同。
 
+## 本機狀態（pulse status）
+
+依設計包 `pulse/cli-spec.md` §4。`pulse status` **不連線、不影響服務**：只讀取執行中的 Pulse 寫出的本機狀態檔，並向 systemd／Windows 服務控制管理員查詢服務狀態。
+
+```
+$ sudo /opt/pulse/pulse status
+Pulse 0.3.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-112233445566
+
+✓ 通過 服務   pulse.service 執行中（PID 4151145，已執行 12 天 4 小時）
+✓ 通過 連線   已註冊到 kairos.example.gov.tw:8443（TLS 1.3，mTLS），已連線 2 分 2 秒
+⚠ 警告 回報   最後回報 2 秒前
+              補送中：待補送 49,924 筆（最舊 2026-10-06 17:14:40 UTC+8，2 天 21 小時前），
+              預計約 21 小時 54 分補完
+              本機緩衝曾滿：已丟掉最舊的 3,676 筆（2026-10-06 12:00～17:06 的取樣，PLS-W4202）
+✓ 通過 身分   憑證有效至 2027-10-09（剩餘 365 天）
+✓ 通過 設定   /opt/pulse/pulse.toml，無警告
+✓ 通過 時鐘   與 Kairos 相差 0.2 秒
+
+本機狀態：警告
+結果：1 個警告、5 項通過。
+```
+
+檢查列寫 stdout，有問題時另在 stderr 印出三段式說明（標題、原因、處理方式與代碼）；`pulse status > status.txt` 只會得到檢查列。非 TTY（導向檔案、管線、部署工具）時改用 ASCII 標籤（`[ OK ]`、`[WARN]`、`[FAIL]`、`[DOWN]`、`[SKIP]`）且不上色；`--ascii`、`PULSE_SYMBOLS=ascii`、`--color never`、`NO_COLOR` 也可指定。
+
+| 選項 | 說明 |
+|---|---|
+| `--brief` | 單行，第一欄為本機狀態：`offline   plc-hmi-07 reconnecting 12m30s PLS-E2003 backlog=149` |
+| `--json` | 機器可讀（schema `pulse.status/v1`，純 ASCII，非 ASCII 字元以 `\uXXXX` 跳脫）；欄位見設計包 `cli-spec.md` §4.8，腳本請讀 `data.status`、`data.checks[]`、`data.issues[]` |
+| `--watch [秒]` | 每 N 秒（預設 2）重新顯示，按 Ctrl+C 結束 |
+| `--exit-codes=nagios` | 單行輸出，結束代碼為 Nagios 慣例（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN） |
+| `-c, --config <路徑>` | 指定 `pulse.toml`；狀態檔等相對路徑以它所在的目錄解析 |
+| `-q`／`-v` | 不顯示警告等級的說明／說明中加上技術細節 |
+
+**本機狀態與結束代碼**（`cli-spec.md` §1.2、§1.3）：
+
+| 本機狀態 | 判定 | 結束代碼 |
+|---|---|---|
+| `online` 線上 | 已註冊、連線中、沒有警告 | 0 |
+| `warning` 警告 | 連線中但有警告：憑證 14 天內到期、時鐘相差 30 秒以上、設定或權限警告、最近 24 小時內本機緩衝丟過資料（`PLS-W4202`／`PLS-W4203`）、最近 1 小時內無法寫入緩衝（`PLS-W4103`）、緩衝無法使用（`PLS-E4004`）、Kairos 暫時無法保存（`PLS-W4101`） | 8 |
+| `offline` 離線 | 一般網路錯誤、中斷未滿 30 分鐘（Pulse 會自行重連） | 9 |
+| `critical` 嚴重 | 需要人工處理（憑證被撤銷、驗證失敗等）、中斷滿 30 分鐘、服務未執行或未安裝、時鐘相差超過 5 分鐘、設定檔有誤 | 9 |
+| `unknown` 未知 | 服務在執行，但狀態檔超過 60 秒沒有更新、不存在或無法解析（`PLS-W8004`，Pulse 可能卡住） | 9 |
+| — | 用法錯誤／沒有權限讀取狀態檔（`PLS-E8203`） | 2／10 |
+
+結束代碼 9 涵蓋三種狀態，要區分短暫重連與需要人工處理時請讀 `--json` 的 `data.status`（SCCM 的判讀方式見設計包 `pulse/sccm-deployment.md`）。
+
+**「回報」列的補送資訊**：連線中有積壓時寫「補送中：待補送 N 筆（最舊…），預計約…補完」（預計時間＝待補送筆數 ÷（1000 ÷ 實際補送間隔 − 1 ÷ `report.interval`））；中斷中寫待補送筆數與緩衝用量（達 80% 時提醒）；不補送時（停用緩衝、緩衝無法使用、連上 0.2 以前的 Kairos）寫原因。
+
+**設定檔與狀態檔的位置**：`pulse status` 依序找 `--config`、目前目錄的 `pulse.toml`、`pulse` 執行檔所在目錄的 `pulse.toml`（發佈包的佈局是兩者都在 `/opt/pulse`，因此在任何目錄執行 `/opt/pulse/pulse status` 都可以）。都沒有時以目前目錄為準。狀態檔為 `status.file`（預設工作目錄下的 `logs/status.json`）。設定檔有誤時仍以預設位置讀取狀態檔，並在「設定」列顯示錯誤（`PLS-E0101`／`PLS-E0201`）。多實例時在該實例的目錄執行，或以 `--config /opt/pulse-N/pulse.toml` 指定。
+
+**服務狀態**：Linux 以 `systemctl show`（一般帳號可執行，最多等 5 秒）查詢 Pulse 寫在狀態檔中的 unit（以 systemd 啟動時自動偵測，例如 `pulse-2.service`，沒有時為 `pulse.service`）；Windows 查詢服務 `Pulse`。找不到服務時（前景執行、容器、服務包裝工具使用其他名稱），以狀態檔記錄的 PID 是否還在判斷（「未由服務管理員管理」）。「最近 1 小時重新啟動 ≥ 3 次」依狀態檔記錄的啟動時間計算。
+
+**本機狀態檔**（`status_file.rs`、`local_status.rs`）：
+
+- 內容：版本、PID、啟動時間、設定檔、連線（協商的協定版本與 features、最近的錯誤代碼、上次被拒的原因、上一次中斷的期間）、回報（最後回報與確認時間、最近 1 小時的取樣／確認／拒收筆數、投遞方式）、本機緩衝（待補送筆數與 bytes、最舊一筆的取樣時間、上限與用量、累計丟棄筆數與被丟掉的取樣時間範圍、`last_dropped_at`、寫入失敗）、用戶端憑證（序號、有效期間）、時鐘偏差、設定與權限警告。不含私鑰、token 或未清理的伺服器文字。schema `pulse.status-file/v1`，只新增欄位。
+- 寫入：每 10 秒一次，連線狀態、錯誤代碼、緩衝狀態改變或丟棄資料時另外寫（兩次至少間隔 1 秒；補送中待補送筆數每秒都在變，不另外寫）。以同目錄的暫存檔（`create_new`、隨機檔名）寫入後 rename 取代，讀取端只會看到完整的舊檔或新檔。正常結束前寫最後一份（`running: false` 與結束代碼）。
+- 磁碟負擔的取捨：一份約 3～5 KB，每 10 秒一次約 0.4 KB/s（一天約 40 MB 的寫入量）；**不 fsync**，大部分寫入在作業系統的快取中合併。狀態檔只描述「現在」，斷電後下一次寫入（10 秒內）就會更新；少數檔案系統斷電後可能留下空檔，`pulse status` 視為無法解析（未知），服務啟動 10 秒內恢復。
+- 過時判斷：寫入時記錄單調時鐘（Linux `/proc/uptime`、Windows `GetTickCount64`），`pulse status` 以同一個時鐘相減，不受系統時間調整或與 Kairos 的時鐘偏差影響；重新開機後一律視為過時。
+- 權限：Unix 上以 0640 建立（S3 的規則，不依賴 umask）。發佈包的佈局中 `/opt/pulse` 為 `root:pulse 750`、`logs/` 為 `pulse:pulse 750`，因此 **`pulse status` 需要 root 或 `pulse` 群組的成員**（把維運帳號加入 `pulse` 群組即可不用 sudo）；沒有權限時結束代碼 10。Windows 上檔案繼承 `logs\` 的 ACL。
+- 無法寫入時（`logs/` 不可寫等）記 `WARN`（`status.write_failed PLS-E8204`，每 10 分鐘最多一則），不影響監控；`pulse status` 會顯示「未知」。
+
 ## agent.id
 
 - 第一次啟動時產生一個 UUID v4 並寫入 `agent.id`（路徑由 `agent.id_file` 設定），之後每次啟動讀檔沿用。
@@ -548,7 +616,12 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 ```
 src/
 ├── main.rs            進入點：載入設定、初始化日誌、建立 TLS 設定、啟動並監看背景任務
-├── cli.rs             命令列參數解析（--print-agent-id、--version、--help）與版本字串
+├── cli.rs             命令列參數解析（status、explain、--print-agent-id、--version、--help）與版本字串
+├── codes.rs           日誌事件（log-ux §4，含 Windows 事件識別碼）與錯誤代碼
+├── status_file.rs     本機狀態檔的格式、原子寫入、讀取與單調時鐘
+├── local_status.rs    執行中記錄狀態並定期寫出狀態檔
+├── status_cmd/        pulse status：判定（eval）、三段式說明（issues）、輸出（render、json）、
+│                      服務管理員查詢（service）、色彩與符號（term）、時間與數字格式（fmt）、golden 測試
 ├── config_manager.rs  設定管理（嵌入預設 → pulse.toml → PULSE__ 環境變數）與範圍驗證
 ├── file_perms.rs      敏感檔案（agent.id、client_key）與本機緩衝目錄的權限檢查（Unix 權限位元、Windows ACL）
 ├── tls.rs             rustls 設定：信任庫、客戶端憑證、SAN 與有效期限檢查、TLS 錯誤提示
@@ -573,6 +646,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 ## 日誌
 
 - 同時輸出到終端（stdout）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）
+- **事件與錯誤代碼**：有固定事件的日誌行，訊息開頭為「`<event> <code> `」（沒有代碼時為 `-`），例如 `[WARN] buffer.full PLS-W4202 本機緩衝已滿…`、`[ERROR] auth.rejected PLS-E1105 連線中斷…`、`[INFO] conn.registered - 已向伺服器註冊…`。事件名稱與代碼固定、不翻譯（設計包 `pulse/log-ux.md` §4、`copywriting.md` §3.3），告警規則與搜尋請比對這兩欄。哪些代碼已對應、在程式的哪裡、何時觸發，見 `ERROR-CODES.md`；行首時間與 JSON 格式等其餘 `log-ux.md` 的改版尚未實作。本機緩衝的事件：`buffer.opened`（啟動時）、`buffer.unavailable`（`PLS-E4004`）、`buffer.write_failed`（`PLS-W4103`）、`buffer.full`（`PLS-W4202`）、`buffer.expired`（`PLS-W4203`）、`buffer.replay_done`（補送完成，附筆數與耗時）；連線恢復時另記 `conn.restored`（中斷時間、重試次數、待補送與丟棄筆數），中斷滿 30 分鐘記一次 `conn.outage`（`ERROR`，同時寫 stderr）
 - **需要人工處理的錯誤另寫一行到 stderr**：伺服器憑證驗證錯誤（不受信任、名稱不符、過期、尚未生效、被撤銷、用途不符、被標記為 CA、其他驗證失敗；第一次發生就記 `ERROR`，原因改變時立即再記）、伺服器送來的致命錯誤與註冊前的錯誤（`certificate_rejected`、`auth_failed`、狀態表已滿等）、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕（撤銷、過期等），以及本機客戶端憑證已過期。內容與日誌的 `ERROR` 行相同，節流也相同（同一原因每 10 分鐘最多一行，其餘只在日誌記 `WARN`）；一般連線錯誤（拒絕連線、逾時、連線被重設等）不寫。以 systemd 執行（有 `JOURNAL_STREAM` 環境變數）時行首加上 `<3>`，journal 以 err 等級記錄（`journalctl -u pulse -p err`），訊息中不會出現 `<3>`。stdout 與 stderr 都是終端機（互動執行）時不重複寫。`pulse.service` 設定 `StandardOutput=null`，所以 journal 中只會看到這些行與啟動失敗等 stderr 訊息
 - **systemd 狀態文字**：Linux 上有 `NOTIFY_SOCKET` 時以 sd_notify 送出 `STATUS=`，`systemctl status` 顯示為 `Status:` 行：`連線中`（啟動後、第一次註冊或斷線前，含啟動時的隨機延遲）、`已註冊：<位址>:<連接埠>`、`重新連線中`（一般連線錯誤）、`無法連線：伺服器憑證<原因>（<處理提示>）`（例如 `無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）`、`無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）`；原因另有已過期、尚未生效、已被撤銷、用途不符、被標記為 CA、驗證失敗）、`無法註冊：<錯誤碼>（<處理提示>）`（錯誤碼如 `certificate_rejected`、`TLS alert CertificateRevoked`、`auth_failed`、`bad_request`、`unsupported_version`、`proto_mismatch`、`superseded`）。只送狀態文字、不送 `READY=1`，unit 維持 `Type=simple`，需設定 `NotifyAccess=main`（發佈包的 `pulse.service` 已設定）；沒有 `NOTIFY_SOCKET` 時（Windows、直接執行）不做任何事
 - **按日分檔**：檔名日期為 **UTC**（與 Kairos 相同），UTC 午夜換新檔；每行開頭的時間戳記則是本機時間
@@ -604,6 +678,8 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 - 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 的去重有範圍限制（SQLite 為原始資料保存的期間；`backend = "jsonl"` 為記憶體中的視窗，見 PROTOCOL.md 與 Kairos 的 STORAGE.md），極少數情況下可能重複寫入。`buffer.max_age_hours` 建議不超過 Kairos `storage.raw_retention_days` × 24。
 - 本機緩衝不加鎖：同一個 `buffer.dir` 只能由一個 Pulse 使用。
 - Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
+- 不寫 Windows 事件記錄、不更新 Windows 服務描述（需要安裝程式註冊事件來源；事件識別碼已在 `codes.rs` 定案）。`pulse status` 在 Windows 上查詢的服務名稱固定為 `Pulse`，以服務包裝工具註冊成其他名稱時改以狀態檔的 PID 判斷。
+- `pulse status` 尚不支援 `--all`（列出所有實例）與 `--json-lines`；「連線中斷 30 分鐘」的門檻固定。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
 - 取樣卡住（例如 WMI 無回應）時只在本機記 `WARN` 並略過 report，heartbeat 照常送出；Kairos 目前不會因 `last_report` 停滯而告警（見「回報資料格式」）。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
