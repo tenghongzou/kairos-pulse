@@ -652,7 +652,12 @@ async fn run_with<D: Dialer>(
             floor_note = "（連續被取代時延遲至少 30 秒，不受 retry.max_delay 限制）";
         }
         let failures = backoff.failures();
-        let code = error_code(&err, superseded_streak, has_client_cert);
+        let code = error_code(&err, superseded_streak, has_client_cert).or_else(|| {
+            // 握手完成前、伺服器也還沒要求客戶端憑證就被關閉：多半是每 IP 連線上限（審計 A7）
+            matches!(&err, SessionError::Tls(e) if closed_before_handshake(e))
+                .then_some(codes::E_PER_IP_LIMIT)
+                .filter(|_| !dialer.client_cert_was_requested())
+        });
         let msg = format!(
             "{}連線中斷（連續第 {failures} 次失敗）：{err}{hint}{uptime_note}；{:.1} 秒後重連{floor_note}",
             codes::tag(disconnect_event(code), code),

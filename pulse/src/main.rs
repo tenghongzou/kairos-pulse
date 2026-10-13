@@ -73,6 +73,8 @@ const EXIT_CERT: u8 = 4;
 struct Failure {
     code: u8,
     message: String,
+    /// 對應的錯誤代碼（`agent.fatal` 日誌的 code 欄；無法歸類時為 `None`）
+    pls: Option<&'static str>,
 }
 
 impl Failure {
@@ -81,7 +83,14 @@ impl Failure {
         Self {
             code: EXIT_CERT,
             message,
+            pls: None,
         }
+    }
+
+    /// 附上錯誤代碼
+    fn pls(mut self, code: &'static str) -> Self {
+        self.pls = Some(code);
+        self
     }
 }
 
@@ -91,6 +100,7 @@ impl From<String> for Failure {
         Self {
             code: EXIT_GENERAL,
             message,
+            pls: None,
         }
     }
 }
@@ -312,7 +322,11 @@ fn main() -> ExitCode {
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("錯誤：無法載入設定：{e}");
+            let code = match e {
+                config::ConfigError::Message(_) => codes::E_CONFIG_RANGE,
+                _ => codes::E_CONFIG_SYNTAX,
+            };
+            eprintln!("錯誤 {code}：無法載入設定：{e}");
             // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
             return ExitCode::from(EXIT_CONFIG);
         }
@@ -329,7 +343,7 @@ fn main() -> ExitCode {
 
     // 初始化日誌
     if let Err(e) = setup_logger(config.log.level_filter()) {
-        eprintln!("錯誤：無法初始化日誌：{e}");
+        eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
         return ExitCode::from(EXIT_GENERAL);
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
@@ -430,7 +444,7 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
             }
             error!(
                 "{}{}",
-                codes::tag(codes::AGENT_FATAL, None),
+                codes::tag(codes::AGENT_FATAL, failure.pls),
                 failure.message
             );
             // 日誌只寫到 stdout 與 logs/（pulse.service 為 StandardOutput=null）；以非 0 結束的原因
@@ -523,7 +537,14 @@ async fn run(
     else {
         return Ok(());
     };
-    let (agent_id, created) = loaded.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
+    let (agent_id, created) = loaded.map_err(|e| {
+        let code = if e.kind() == std::io::ErrorKind::InvalidData {
+            codes::E_AGENT_ID_INVALID
+        } else {
+            codes::E_AGENT_ID_IO
+        };
+        Failure::cert(format!("啟動失敗：{e}")).pls(code)
+    })?;
     if let Some(warning) = permission_warning {
         warn!(
             "{}{warning}",
@@ -548,7 +569,7 @@ async fn run(
     }
     // 客戶端憑證的 SAN 必須是 DNS:<agent_id>，否則伺服器會以 auth_failed 拒絕：啟動時就檢查
     tls.verify_client_cert_identity(&agent_id)
-        .map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
+        .map_err(|e| Failure::cert(format!("啟動失敗：{e}")).pls(codes::E_CLIENT_CERT_MISMATCH))?;
 
     // 印出一次完整系統資訊。內含約 200 ms 的阻塞 sleep 與大量系統呼叫（可能很慢），
     // 放到 blocking 執行緒，且收到 Ctrl+C 時不等它完成。
