@@ -312,7 +312,7 @@ async fn startup_fails_when_the_database_cannot_be_used() {
 }
 
 /// Pulse 0.2.0 的典型 report：17 個指標（cpu、記憶體 2、檔案系統 3 個掛載點 × 2、網路 2 張網卡 × 2、溫度 4）
-fn pulse_like(agent: &str, seq: u64, at: DateTime<Utc>, cpu: f64) -> ReportRecord {
+pub(crate) fn pulse_like(agent: &str, seq: u64, at: DateTime<Utc>, cpu: f64) -> ReportRecord {
     let mut metrics = vec![
         Metric::new(
             "system.cpu.usage",
