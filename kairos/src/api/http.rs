@@ -111,6 +111,13 @@ pub fn event_stream(body: ApiBody) -> Response<ApiBody> {
     resp
 }
 
+/// 401 `unauthorized` 的產品代碼（設計包 `copywriting.md` §3.4、`decisions/INTEGRATION.md` §26）
+pub const CODE_UNAUTHORIZED: &str = "KRS-E6010";
+/// 429 `rate_limited`（同一來源驗證失敗太多次）的產品代碼；第一次限制該來源時的 `WARN` 日誌也帶它
+pub const CODE_RATE_LIMITED: &str = "KRS-W6011";
+/// 403 `forbidden` 的產品代碼（0.4 只有 `read` 範圍，不會出現）
+pub const CODE_FORBIDDEN: &str = "KRS-E6104";
+
 /// API 的錯誤（`kairos/API.md` 第 1.2 節）
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiError {
@@ -155,12 +162,35 @@ impl ApiError {
             .with_details(json!({ "parameter": name }))
     }
 
+    /// 401 `unauthorized`（`KRS-E6010`）：沒有或無效的 API token（不存在、已撤銷、已過期，對外不區分）
     pub fn unauthorized() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "需要有效的 API token（Authorization: Bearer <token>）",
         )
+        .with_product_code(CODE_UNAUTHORIZED)
+    }
+
+    /// 429 `rate_limited`（`KRS-W6011`）：同一來源驗證失敗太多次
+    pub fn rate_limited(retry_after: u64) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "這個來源驗證失敗太多次，請稍後再試",
+        )
+        .with_product_code(CODE_RATE_LIMITED)
+        .with_retry_after(retry_after)
+    }
+
+    /// 403 `forbidden`（`KRS-E6104`）：token 的範圍不包含這個操作
+    pub fn forbidden() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "這個 token 的範圍不包含這個操作",
+        )
+        .with_product_code(CODE_FORBIDDEN)
     }
 
     pub fn not_found() -> Self {
@@ -460,12 +490,24 @@ mod tests {
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["server_time"], "2025-10-13T06:03:27.123Z");
         assert_eq!(v["error"]["code"], "unauthorized");
-        assert_eq!(v["error"]["product_code"], Value::Null);
+        assert_eq!(v["error"]["product_code"], "KRS-E6010");
 
-        let resp = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "x")
-            .with_retry_after(6)
-            .into_response(now);
+        let resp = ApiError::rate_limited(6).into_response(now);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers()[header::RETRY_AFTER], "6");
+        let ApiBody::Full(Some(body)) = resp.into_body() else {
+            panic!("應有本文");
+        };
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "rate_limited");
+        assert_eq!(v["error"]["product_code"], "KRS-W6011");
+        // 用法錯誤沒有產品代碼（copywriting.md §3.4）
+        let v = ApiError::param("limit", "x").into_response(now);
+        let ApiBody::Full(Some(body)) = v.into_body() else {
+            panic!("應有本文");
+        };
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["product_code"], Value::Null);
         let resp = ApiError::storage("主機清單").into_response(now);
         let ApiBody::Full(Some(body)) = resp.into_body() else {
             panic!("應有本文");

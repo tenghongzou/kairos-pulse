@@ -27,6 +27,7 @@ fn api_lists_hosts_and_metrics_and_streams_online_offline_events() {
     let (status, v) = anonymous.get("/api/v1/hosts");
     assert_eq!(status, 401, "{v}");
     assert_eq!(v["error"]["code"], "unauthorized");
+    assert_eq!(v["error"]["product_code"], "KRS-E6010");
 
     // 先開 SSE，再啟動 Pulse：新主機上線 → host.added
     let mut events = ApiStream::open(&api, None);
@@ -178,6 +179,38 @@ fn revoked_certificate_is_attributed_to_the_host() {
 
     let (code, _) = p.stop();
     assert_eq!(code, 0, "{}", p.dump());
+    let (code, _) = k.stop();
+    assert_eq!(code, 0, "{}", k.dump());
+}
+
+#[test]
+fn repeated_authentication_failures_are_rate_limited_with_product_codes() {
+    // 設計包 §26：401 為 KRS-E6010、429 為 KRS-W6011；第一次限制這個來源時的 WARN 日誌帶 KRS-W6011
+    let root = TestDir::new("api-limit");
+    let kairos = Kairos::new(&root, test_pki::CRL_EMPTY);
+    let mut k = kairos.start();
+    k.wait_for("主控台 API 已啟動", WAIT);
+    let anonymous = kp_e2e::Api {
+        port: kairos.console_port,
+        token: "kat_wrong".into(),
+    };
+    let mut limited = None;
+    for _ in 0..12 {
+        let (status, v) = anonymous.get("/api/v1/me");
+        if status == 429 {
+            limited = Some(v);
+            break;
+        }
+        assert_eq!(status, 401, "{v}");
+        assert_eq!(v["error"]["product_code"], "KRS-E6010", "{v}");
+    }
+    let v = limited.unwrap_or_else(|| panic!("驗證失敗 10 次後應回 429\n{}", k.dump()));
+    assert_eq!(v["error"]["code"], "rate_limited", "{v}");
+    assert_eq!(v["error"]["product_code"], "KRS-W6011", "{v}");
+    k.wait_for("警告 KRS-W6011：主控台 API", WAIT);
+    // 限制期間的請求不再記 WARN
+    assert_eq!(anonymous.get("/api/v1/me").0, 429);
+    assert_eq!(k.count("KRS-W6011"), 1, "{}", k.dump());
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());
 }

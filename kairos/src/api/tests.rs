@@ -702,6 +702,7 @@ async fn requests_are_authenticated_and_validated() {
         Some("Bearer realm=\"kairos\"")
     );
     assert_eq!(r.json()["error"]["code"], "unauthorized");
+    assert_eq!(r.json()["error"]["product_code"], "KRS-E6010");
     let r = request(addr, "GET", "/api/v1/hosts", Some("nope"), &[]).await;
     assert_eq!(r.status, 401);
     let (id, secret) = tokens::generate().unwrap();
@@ -783,6 +784,7 @@ async fn requests_are_authenticated_and_validated() {
     let r = request(addr, "GET", "/api/v1/me", Some(&valid), &[]).await;
     assert_eq!(r.status, 429, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["error"]["code"], "rate_limited");
+    assert_eq!(r.json()["error"]["product_code"], "KRS-W6011");
     assert!(r.header("retry-after").unwrap().parse::<u64>().unwrap() >= 1);
     f.stop().await;
 }

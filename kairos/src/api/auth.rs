@@ -7,7 +7,6 @@
 //!   [`Principal::require`] 檢查權限，不需修改。
 
 use chrono::{DateTime, Utc};
-use hyper::StatusCode;
 use hyper::header::{AUTHORIZATION, HeaderMap};
 use log::warn;
 use serde::Serialize;
@@ -18,7 +17,7 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 use super::db::{ReadPool, query_failed};
-use super::http::{ApiError, ts_ms};
+use super::http::{ApiError, CODE_RATE_LIMITED, ts_ms};
 use super::tokens::{self, SCOPE_READ, StoredToken, hash_secret, parse_token};
 use crate::per_ip::source_key;
 
@@ -59,11 +58,7 @@ impl Principal {
         if allowed {
             Ok(())
         } else {
-            Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "這個 token 的範圍不包含這個操作",
-            ))
+            Err(ApiError::forbidden())
         }
     }
 
@@ -214,12 +209,7 @@ impl Authenticator {
         now: DateTime<Utc>,
     ) -> Result<Principal, ApiError> {
         if let Err(retry) = self.failures.check(peer, Instant::now()) {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "這個來源驗證失敗太多次，請稍後再試",
-            )
-            .with_retry_after(retry));
+            return Err(ApiError::rate_limited(retry));
         }
         let token = headers
             .get(AUTHORIZATION)
@@ -284,7 +274,8 @@ impl Authenticator {
     fn failed(&self, peer: IpAddr, why: &str) -> ApiError {
         if self.failures.fail(peer, Instant::now()) {
             warn!(
-                "主控台 API：來自 {} 的請求驗證失敗太多次（{}），之後每 {} 秒只接受 1 次嘗試",
+                "警告 {}：主控台 API：來自 {} 的請求驗證失敗太多次（{}），之後每 {} 秒只接受 1 次嘗試",
+                CODE_RATE_LIMITED,
                 source_key(peer),
                 why,
                 Duration::from_secs_f64(1.0 / FAILURE_REFILL_PER_SEC).as_secs()
@@ -385,10 +376,10 @@ mod tests {
             scopes: vec![],
             expires_at: None,
         };
-        assert_eq!(
-            none.require(Permission::Read).unwrap_err().status,
-            StatusCode::FORBIDDEN
-        );
+        let denied = none.require(Permission::Read).unwrap_err();
+        assert_eq!(denied.status, hyper::StatusCode::FORBIDDEN);
+        assert_eq!(denied.code, "forbidden");
+        assert_eq!(denied.product_code, Some("KRS-E6104"));
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["type"], "api_token");
         assert_eq!(v["scopes"][0], "read");

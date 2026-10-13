@@ -55,20 +55,20 @@
 |---|---|---|---|
 | 400 | `invalid_parameter` | — | 查詢參數不合法（`details.parameter` 寫出是哪一個） |
 | 400 | `invalid_cursor` | — | `cursor` 無法解析、或與目前的排序不符（改變排序後要從第一頁開始） |
-| 401 | `unauthorized` | 〔待分配〕 | 沒有 `Authorization`、格式錯誤、token 不存在、已撤銷或已過期（對外不區分），附 `WWW-Authenticate: Bearer realm="kairos"` |
-| 403 | `forbidden` | 〔待分配〕 | token 的範圍不包含這個操作（本版的端點都只需要 `read`，保留給之後的寫入操作） |
+| 401 | `unauthorized` | `KRS-E6010` | 沒有 `Authorization`、格式錯誤、token 不存在、已撤銷或已過期（對外不區分），附 `WWW-Authenticate: Bearer realm="kairos"` |
+| 403 | `forbidden` | `KRS-E6104` | token 的範圍不包含這個操作（本版的端點都只需要 `read`，保留給之後的寫入操作） |
 | 404 | `not_found` | — | 沒有這個路徑 |
 | 404 | `host_not_found` | — | 清冊中沒有這個 `agent_id`（設計包 S05「主機不存在 → 404 頁」） |
 | 404 | `metric_not_found` | — | 這台主機在查詢範圍內沒有這個指標 |
 | 405 | `method_not_allowed` | — | 不是 `GET`／`HEAD` |
 | 413 | `payload_too_large` | — | 請求帶有本文（本版的端點都不接受本文） |
-| 429 | `rate_limited` | — | 同一來源驗證失敗太多次（第 4.3 節），附 `Retry-After`（秒） |
+| 429 | `rate_limited` | `KRS-W6011` | 同一來源驗證失敗太多次（第 4.3 節），附 `Retry-After`（秒）。第一次限制這個來源時 Kairos 記一則 `WARN`（`警告 KRS-W6011：…`） |
 | 503 | `too_many_streams` | — | SSE 的同時連線數已達 `console.max_streams`，附 `Retry-After` |
 | 503 | `storage_unavailable` | `KRS-E4003` | 資料庫查詢失敗（例如磁碟 I/O 錯誤、資料庫被刪除）；主控台顯示「無法載入○○」 |
 | 503 | `shutting_down` | — | Kairos 正在關機 |
 | 500 | `internal` | `KRS-E4003` | 未預期的錯誤（日誌中有細節；回應不含內部資訊） |
 
-`unauthorized`／`forbidden` 尚沒有產品代碼：`copywriting.md` §3.3 的 6001（帳號或密碼不正確）是給登入畫面的，不適用於 API token；需要設計分配（第 10 節）。
+產品代碼依設計包 `copywriting.md` §3.4「主控台 API」（`decisions/INTEGRATION.md` §26）：驗證失敗與限速屬於子類別 60（登入與驗證，`KRS-E6010`、`KRS-W6011`），權限不足屬於 61（`KRS-E6104`）；登入畫面的帳號密碼錯誤是另一個代碼 `KRS-E6001`。表中「—」的代碼為用法錯誤或暫時狀態，主控台就地處理，`product_code` 為 `null`。
 
 ## 2. 設定（`[console]`）
 
@@ -161,7 +161,7 @@ kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuLWV4YW1wbGU
 ### 4.3 失敗的速率限制
 
 - 同一來源（IPv4 位址；IPv6 以 /64 合併，與 agent 連線埠的新連線速率相同）**驗證失敗**時扣額度：可連續 10 次，之後每 6 秒恢復 1 次（每分鐘 10 次）。額度用完時該來源的**所有請求**回 429 `rate_limited`（`Retry-After` 為恢復 1 次所需的秒數），不再檢查 token，直到額度恢復。成功的請求不扣額度。
-- 每個來源第一次被限制時記一行 `WARN`（節流），不記錄 token 內容。
+- 每個來源第一次被限制時記一行 `WARN`（`警告 KRS-W6011：主控台 API：來自 … 的請求驗證失敗太多次…`；同一來源恢復額度前不再記），不記錄 token 內容。
 - 記憶體中最多追蹤 10,000 個來源，超過時清掉最久沒有失敗的來源。
 
 ### 4.4 之後接入工作階段與 RBAC 的位置
