@@ -28,6 +28,10 @@ pub const MAX_BUFFER_AGE_HOURS: u64 = 8760;
 /// `buffer.replay_interval_ms` 的範圍：下限 500 ms（= Kairos 的 report 速率限制每秒 2 則），上限 60 秒
 pub const MIN_REPLAY_INTERVAL_MS: u64 = 500;
 pub const MAX_REPLAY_INTERVAL_MS: u64 = 60_000;
+/// 實際的補送間隔不超過 `report.interval` 的這個比例（千分比）：補送與新的取樣共用同一個速率，
+/// 間隔不小於取樣間隔時，送出的速度追不上新的取樣、積壓永遠補不完。60% 時送出速率至少是取樣速率的
+/// 1.67 倍（`report.interval = 1` 時為 600 ms）
+pub const MAX_REPLAY_SHARE_PERMILLE: u64 = 600;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -104,7 +108,8 @@ pub struct BufferConfig {
     pub max_records: u64,
     /// 取樣時間超過這麼久（小時）的資料不送出、直接丟棄
     pub max_age_hours: u64,
-    /// 兩筆 report 之間的最短間隔（毫秒；補送積壓時的速率）
+    /// 兩筆 report 之間的最短間隔（毫秒；補送積壓時的速率）。實際使用的值見
+    /// [`AppConfig::effective_replay_interval_ms`]
     pub replay_interval_ms: u64,
 }
 
@@ -162,6 +167,18 @@ impl AppConfig {
     #[cfg(test)]
     pub fn default_for_tests() -> Self {
         Self::build(None, Some(Map::new())).expect("嵌入的預設設定必須合法")
+    }
+
+    /// 實際使用的補送間隔（毫秒）：`buffer.replay_interval_ms`，但不超過 `report.interval` 的
+    /// [`MAX_REPLAY_SHARE_PERMILLE`]（且不低於 [`MIN_REPLAY_INTERVAL_MS`]），讓積壓一定補得完。
+    /// 預設 1200 ms、`report.interval = 1` 時為 600 ms
+    pub fn effective_replay_interval_ms(&self) -> u64 {
+        let cap = self
+            .report
+            .interval
+            .saturating_mul(MAX_REPLAY_SHARE_PERMILLE)
+            .max(MIN_REPLAY_INTERVAL_MS);
+        self.buffer.replay_interval_ms.min(cap)
     }
 
     /// 實際的載入邏輯。
@@ -386,7 +403,9 @@ mod tests {
         assert_eq!(cfg.buffer.max_mb, 64);
         assert_eq!(cfg.buffer.max_records, 50_000);
         assert_eq!(cfg.buffer.max_age_hours, 168);
-        assert_eq!(cfg.buffer.replay_interval_ms, 600);
+        // 1 萬台同時恢復連線時約每秒 8,300 筆（STORAGE.md 第 11.1 節）
+        assert_eq!(cfg.buffer.replay_interval_ms, 1200);
+        assert_eq!(cfg.effective_replay_interval_ms(), 1200);
         assert_eq!(cfg.log.level, "info");
         assert_eq!(cfg.log.level_filter(), LevelFilter::Info);
     }
@@ -449,6 +468,39 @@ mod tests {
         .unwrap();
         assert!(!cfg.buffer.enabled);
         assert_eq!(cfg.buffer.replay_interval_ms, 500);
+    }
+
+    #[test]
+    fn replay_interval_is_capped_below_the_report_interval() {
+        let with = |report: &str, replay: &str| {
+            AppConfig::build(
+                None,
+                Some(env(&[
+                    ("PULSE__REPORT__INTERVAL", report),
+                    ("PULSE__BUFFER__REPLAY_INTERVAL_MS", replay),
+                ])),
+            )
+            .unwrap()
+            .effective_replay_interval_ms()
+        };
+        // 取樣每秒一筆時，預設的 1200 ms 會比取樣慢：改用 600 ms（與 0.2.x 相同）
+        assert_eq!(with("1", "1200"), 600);
+        assert_eq!(with("1", "500"), 500);
+        assert_eq!(with("2", "1200"), 1200);
+        assert_eq!(with("2", "5000"), 1200);
+        assert_eq!(with("5", "2000"), 2000);
+        assert_eq!(with("5", "60000"), 3000);
+        assert_eq!(with("3600", "60000"), 60000);
+        // 送出速率一定高於取樣速率
+        for report in [1u64, 2, 3, 5, 60] {
+            for replay in [500u64, 600, 1200, 5000, 60000] {
+                let ms = with(&report.to_string(), &replay.to_string());
+                assert!(
+                    ms < report * 1000,
+                    "report {report} s、replay {replay} ms → {ms}"
+                );
+            }
+        }
     }
 
     #[test]

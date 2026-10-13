@@ -460,16 +460,26 @@ async fn run(
             Some(Ok(opened)) => {
                 let stats = opened.stats();
                 info!(
-                    "本機緩衝：{}（待送 {} 筆、{} bytes；上限 {} MiB／{} 筆，保留 {} 小時；本次 boot_id {}），\
-                     Kairos 支援時 report 斷線期間的資料會補送（durable）",
+                    "本機緩衝：{}（待送 {} 筆、{} bytes；上限 {} MiB／{} 筆，保留 {} 小時；補送間隔 {} 毫秒；\
+                     本次 boot_id {}），Kairos 支援時 report 斷線期間的資料會補送（durable）",
                     dir.display(),
                     stats.pending,
                     stats.pending_bytes,
                     config.buffer.max_mb,
                     config.buffer.max_records,
                     config.buffer.max_age_hours,
+                    config.effective_replay_interval_ms(),
                     opened.boot_id()
                 );
+                if config.effective_replay_interval_ms() < config.buffer.replay_interval_ms {
+                    info!(
+                        "buffer.replay_interval_ms = {} 大於取樣間隔（report.interval = {} 秒）的 60%，\
+                         改以 {} 毫秒送出（否則新的取樣比送出的快，積壓補不完）",
+                        config.buffer.replay_interval_ms,
+                        config.report.interval,
+                        config.effective_replay_interval_ms()
+                    );
+                }
                 Some(spool::SharedSpool::new(opened))
             }
             Some(Err(e)) => {

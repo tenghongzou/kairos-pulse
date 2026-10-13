@@ -63,7 +63,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | 5 | Kairos | **補送的資料：`ts` 可能比 `recv_at` 早數小時到數天**（A5）。SQLite 中依 `ts`（Pulse 的取樣時間）保存、彙總與套用保留期限；匯出與 JSONL 另有選用欄位 `boot_id`、`report_seq`（`schema` 不變），JSONL 仍寫入收到當天的檔案 | 依 `recv_at`、檔案日期或匯出順序當作取樣時間的讀取工具 | 時序分析改用 `ts`；忽略未知欄位的工具不受其他影響。`kairos reports export --since` 依取樣時間篩選（STORAGE.md 第 5.2 節） |
 | 6 | Pulse | **預設啟用本機緩衝，需要可寫的 `buffer/` 目錄**（A5） | 以發佈包的 systemd unit（`ProtectSystem=strict`，只有 `logs/` 可寫）執行的部署 | 升級前 `install -d -o pulse -g pulse -m 750 /opt/pulse/buffer`，並換上新版 `pulse.service`（`ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer`；多實例時對每個實例重做，Pulse INSTALL.md 第 9、10 節）。沒有做時 Pulse 照常監控，但記 `ERROR`「無法開啟本機緩衝」並改為 at-most-once。緩衝保留 `buffer.max_age_hours`（預設 168 小時）內的資料，建議不超過 Kairos `raw_retention_days` × 24（STORAGE.md 第 5.4 節） |
 | 7 | Pulse | **磁碟用量增加**：緩衝預設最多約 72 MiB（`buffer.max_mb` 64 MiB 加兩個區段）（A5） | 磁碟空間很小的主機 | 在 `pulse.toml` 調小 `[buffer] max_mb`／`max_records`，或 `enabled = false`（與 0.2.0 相同） |
-| 8 | 兩者 | **恢復連線後的寫入量暫時增加**：每台 Pulse 補送時約每秒 1.67 筆（平常每 5 秒 1 筆），1 萬台同時恢復約每秒 16,700 筆（A5） | 大量主機同時恢復連線的部署（例如 Kairos 維護後） kp-build（4 vCPU）上量測：每秒 8,000 筆持續 5 分鐘 p99 0.12 秒、沒有 `storage_unavailable`；每秒 16,000 筆持續 5 分鐘時約 3% 回 `storage_unavailable`（Pulse 退避後重送，不遺失、不重複），最長回應 5.05 秒（8 秒預算內）（STORAGE.md「量測」）。主機接近 1 萬台時建議把 Pulse 的 `buffer.replay_interval_ms` 調到約 1200（約每秒 8,300 筆）。以 `backend = "jsonl"` 或鏡像寫 JSONL 時，補送寫入收到當天的檔案，`storage.max_daily_bytes` 可能較快達到（之後回 `storage_unavailable`，資料留在 Pulse，換日後繼續補送） |
+| 8 | 兩者 | **恢復連線後的寫入量暫時增加**：每台 Pulse 補送時約每秒 0.83 筆（`buffer.replay_interval_ms` 預設 1200；平常每 5 秒 1 筆），1 萬台同時恢復約每秒 8,300 筆（平常約 2,000 筆）（A5） | 大量主機同時恢復連線的部署（例如 Kairos 維護後） | kp-build（4 vCPU）上量測：每秒 8,000 筆持續 5 分鐘 p99 0.12 秒、沒有 `storage_unavailable`；每秒 16,000 筆持續 5 分鐘時約 3% 回 `storage_unavailable`（Pulse 退避後重送，不遺失、不重複），最長回應 5.05 秒（8 秒預算內）（STORAGE.md「量測」）。預設值即依此訂在約每秒 8,300 筆；主機超過 1 萬台時再調大 `buffer.replay_interval_ms`（例如 2000）。以 `backend = "jsonl"` 或鏡像寫 JSONL 時，補送寫入收到當天的檔案，`storage.max_daily_bytes` 可能較快達到（之後回 `storage_unavailable`，資料留在 Pulse，換日後繼續補送） |
 
 **升級步驟**（依序；Kairos 先升級，Pulse 升級後的第一次斷線就能補送）：
 
@@ -114,7 +114,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### Pulse
 
-- 新增本機環狀緩衝 `[buffer]`（預設啟用）：取樣先寫進 `buffer/`，Kairos 確認後才刪除；重新連上後先依序補送積壓再送新的取樣，最多 4 筆在途、兩筆間隔至少 `replay_interval_ms`（預設 600 ms）；`storage_unavailable` 與結果不明時退避後重送，`invalid_report`／`bad_request` 丟棄（A5）。
+- 新增本機環狀緩衝 `[buffer]`（預設啟用）：取樣先寫進 `buffer/`，Kairos 確認後才刪除；重新連上後先依序補送積壓再送新的取樣，最多 4 筆在途、兩筆間隔至少 `replay_interval_ms`（預設 1200 ms，實際不超過 `report.interval` 的 60%，讓積壓一定補得完）；`storage_unavailable` 與結果不明時退避後重送，`invalid_report`／`bad_request` 丟棄（A5）。
 - 緩衝滿時丟最舊並計數記 `WARN`；超過 `max_age_hours`（預設 7 天）的不送出；每筆記錄有 CRC，啟動時截掉斷電造成的不完整尾端；不逐筆 fsync（最多每 10 秒）。Unix 上目錄 0750、檔案 0640，目錄權限過寬時記 `WARN`（Windows 檢查 ACL）（A5）。
 - 連上不支援 `durable` 的 Kairos 時，連線期間維持 at-most-once，緩衝中的積壓保留不送（A5）。
 - `pulse.service` 允許寫入 `buffer/`（`ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer`）；INSTALL 補上緩衝目錄的建立與升級步驟。
@@ -130,8 +130,8 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 容量估算（A5，預設值）
 
-- 每台 Pulse 補送速率 1 ÷ 0.6 秒 ≈ 1.67 筆／秒（Kairos 的 report 速率限制為每秒 2 則、可連續 10 則，新連線先給 2 則，因此不會觸發限流或 `storage_unavailable`），扣掉同時產生的新取樣（每 5 秒 1 筆）後積壓以約 1.47 筆／秒減少：斷線 1 小時（720 筆）約 8 分鐘補完，24 小時（17,280 筆）約 3.3 小時補完。
-- 1 萬台同時恢復連線：Pulse 的重連隨機延遲（0～5 秒）與補送前的隨機延遲（0～5 秒）把開始時間攤開後，Kairos 的 report 寫入約 16,700 筆／秒（平常約 2,000 筆／秒，約 8.3 倍），持續到各台補完。SQLite 在 kp-build（4 vCPU）上：每秒 8,000 筆持續 5 分鐘 p99 0.12 秒、沒有 `storage_unavailable`；每秒 16,000 筆在 60 秒內 p99 0.1 秒，持續 5 分鐘時資料庫變大、寫入跟不上，約 3% 的 report 在 5 秒後回 `storage_unavailable`，最長回應 5.05 秒，沒有結果不明，8 秒回應預算不受影響（STORAGE.md「量測」）。伺服器端不會無限積壓：每條連線最多 4 筆在途、Kairos 逐則處理；寫入跟不上時寫入佇列（1024 筆）滿、連線等待逾時回 `storage_unavailable`，Pulse 退避（2 秒加倍到 60 秒）後重送，整體自動放慢。需要壓低尖峰時調大 `buffer.replay_interval_ms`（例如 2000 ms → 約 5,000 筆／秒，24 小時的積壓約 13 小時補完）。
+- 每台 Pulse 補送速率 1 ÷ 1.2 秒 ≈ 0.83 筆／秒（Kairos 的 report 速率限制為每秒 2 則、可連續 10 則，新連線先給 2 則；兩筆至少間隔 1.2 秒時 token 在下一筆之前已補回 2.4 則，連新連線的 2 則也不會用完，因此不會觸發限流或 `storage_unavailable`；設定的下限 500 ms 時恰為每秒 2 則，同樣不觸發），扣掉同時產生的新取樣（每 5 秒 1 筆）後積壓以約 0.63 筆／秒減少：斷線 1 小時（720 筆）約 19 分鐘補完，24 小時（17,280 筆）約 7.6 小時補完。
+- 1 萬台同時恢復連線：Pulse 的重連隨機延遲（0～5 秒）與補送前的隨機延遲（0～5 秒）把開始時間攤開後，Kairos 的 report 寫入約 8,300 筆／秒（平常約 2,000 筆／秒，約 4.2 倍），持續到各台補完。SQLite 在 kp-build（4 vCPU）上：每秒 8,000 筆持續 5 分鐘 p99 0.12 秒、沒有 `storage_unavailable`；每秒 16,000 筆在 60 秒內 p99 0.1 秒，持續 5 分鐘時資料庫變大、寫入跟不上，約 3% 的 report 在 5 秒後回 `storage_unavailable`，最長回應 5.05 秒，沒有結果不明，8 秒回應預算不受影響（STORAGE.md「量測」）。伺服器端不會無限積壓：每條連線最多 4 筆在途、Kairos 逐則處理；寫入跟不上時寫入佇列（1024 筆）滿、連線等待逾時回 `storage_unavailable`，Pulse 退避（2 秒加倍到 60 秒）後重送，整體自動放慢。預設值 1200 ms 的尖峰（約 8,300 筆／秒）接近每秒 8,000 筆、沒有 `storage_unavailable` 的量測範圍。需要再壓低尖峰時調大 `buffer.replay_interval_ms`（例如 2000 ms → 約 5,000 筆／秒，24 小時的積壓約 16 小時補完）；主機少、希望補得快時可調小（500 ms → 每台約 2 筆／秒，24 小時的積壓約 2.7 小時補完）。
 - 補送的資料不增加長期的容量（補的是斷線期間本來就該有的資料）；寫 JSONL 時寫入收到當天的檔案，`storage.max_daily_bytes` 可能比平常更快達到（見上表第 8 項）。
 
 ### 共用

@@ -1270,7 +1270,7 @@ fn a_backfilled_bucket_is_flushed_once_after_it_is_complete() {
     set_clock(&NOW, noon());
     let dir = temp_dir("backfill");
     let (mut store, _) = open(&dir, clock);
-    // 新主機補送 3 天前的資料：桶早已結束，但補送進行中（每 0.6 秒一筆）不寫出
+    // 新主機補送 3 天前的資料：桶早已結束，但補送進行中（Pulse 預設每 1.2 秒一筆）不寫出
     let base = at(2026, 10, 6, 0, 0, 0);
     for i in 0..10u64 {
         let ts = base + chrono::Duration::seconds(i as i64 * 5);
@@ -1278,7 +1278,7 @@ fn a_backfilled_bucket_is_flushed_once_after_it_is_complete() {
             store.write(&[durable(B, i + 1, clock(), ts, i as f32, i + 1)]),
             [WriteStatus::Written]
         );
-        set_clock(&NOW, clock() + chrono::Duration::milliseconds(600));
+        set_clock(&NOW, clock() + chrono::Duration::milliseconds(1200));
     }
     assert!(store.rollup.has_ready(clock().timestamp_millis()));
     while store.maintain() {}

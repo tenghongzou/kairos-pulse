@@ -346,7 +346,7 @@ dir = "buffer"                 # 緩衝目錄（相對於工作目錄）
 max_mb = 64                    # 待送資料的總大小上限（MiB）
 max_records = 50000            # 待送資料的筆數上限（與 max_mb 先到者為準，滿時丟掉最舊的）
 max_age_hours = 168            # 取樣超過這麼久（小時）的資料不再送出
-replay_interval_ms = 600       # 兩筆 report 之間的最短間隔（毫秒；補送積壓的速率）
+replay_interval_ms = 1200      # 兩筆 report 之間的最短間隔（毫秒；補送積壓的速率，不超過 report.interval 的 60%）
 
 [log]
 level = "info"                 # 日誌級別：trace / debug / info / warn / error（不分大小寫）
@@ -388,7 +388,7 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `buffer.max_mb` | 1～102400 MiB | |
 | `buffer.max_records` | 100～10000000 | |
 | `buffer.max_age_hours` | 1～8760 小時 | |
-| `buffer.replay_interval_ms` | 500～60000 毫秒 | 下限 500 毫秒對應 Kairos 的 report 速率限制（每秒 2 則） |
+| `buffer.replay_interval_ms` | 500～60000 毫秒 | 下限 500 毫秒對應 Kairos 的 report 速率限制（每秒 2 則）。實際使用的值不超過 `report.interval` 的 60%（否則積壓補不完；被調整時啟動記 `INFO`） |
 
 ### ⚠️ 安全性提醒
 
@@ -502,7 +502,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 
 - **流程**：每次取樣先寫進 `buffer.dir`（預設 `buffer/`），連線 task 依序送出，收到 Kairos 的 `ack` 才從緩衝刪除。斷線（含 Kairos 停機、重新啟動、寫入結果不明而斷線）期間的取樣留在緩衝中；重新連上後先依序補送積壓（含斷線前已送出、還沒收到 `ack` 的），再送新的取樣。重送的資料與第一次送出的相同（`boot_id`、`report_seq`、`ts` 與內容都不變），Kairos 以 (agent_id, `boot_id`, `report_seq`) 去重，已保存過的回 `ack` 但不再寫入。
 - **`boot_id` 與 `report_seq`**：`boot_id` 是 Pulse **每次程序啟動**時產生的 UUID v4（啟動日誌「本機緩衝：…本次 boot_id …」），`report_seq` 從 1 開始、每筆取樣加 1。重新啟動前留在緩衝中的資料沿用原本的 `boot_id` 與 `report_seq`。
-- **補送速率**：兩筆 report 之間至少間隔 `buffer.replay_interval_ms`（預設 600 毫秒，每秒約 1.67 筆，低於 Kairos 的 report 速率限制每秒 2 則），同一時間最多 4 筆在途。有積壓時，開始補送前另加 0～`min(heartbeat.interval, 5)` 秒的隨機延遲（與重連的分散相同）。以預設值，斷線 1 小時（720 筆）約 8 分鐘補完、24 小時（約 17,000 筆）約 3.3 小時補完（新的取樣同時以每 5 秒一筆加入）。
+- **補送速率**：兩筆 report 之間至少間隔 `buffer.replay_interval_ms`（預設 1200 毫秒，每秒約 0.83 筆，低於 Kairos 的 report 速率限制每秒 2 則），同一時間最多 4 筆在途。實際使用的間隔不超過 `report.interval` 的 60%（`report.interval = 1` 時為 600 毫秒），否則新的取樣比送出的快、積壓補不完；啟動日誌「本機緩衝：…補送間隔 N 毫秒…」為實際的值。有積壓時，開始補送前另加 0～`min(heartbeat.interval, 5)` 秒的隨機延遲（與重連的分散相同）。以預設值，積壓每秒約減少 0.63 筆（新的取樣同時以每 5 秒一筆加入）：斷線 1 小時（720 筆）約 19 分鐘補完、24 小時（約 17,000 筆）約 7.6 小時補完。預設值依 1 萬台同時恢復連線時 Kairos 的寫入量（約每秒 8,300 筆）決定，見 Kairos 的 STORAGE.md 第 11.1 節；主機少、希望補得快時可調小（500 時 24 小時的積壓約 2.7 小時補完）。
 - **Kairos 回應**：`ack` → 刪除；`storage_unavailable`（Kairos 磁碟已滿、每日大小上限、寫入逾時、速率限制）→ 保留，退避 2 秒起、加倍到 60 秒後從最舊的未確認資料重送；`invalid_report`、`bad_request`（這筆永遠不會被接受）→ 丟棄並記 `WARN`。
 - **容量**：待送資料超過 `buffer.max_mb`（預設 64 MiB）或 `buffer.max_records`（預設 50,000 筆）時丟掉最舊的資料並記 `WARN`（節流，附累計丟棄筆數）；取樣時間超過 `buffer.max_age_hours`（預設 7 天）的資料不再送出。一筆約 0.5～3 KB，預設每 5 秒一筆時約可保存 1.5～3 天。磁碟用量最多約 `max_mb` 再加 8 MiB。
 - **斷電與效能的取捨**：寫入不逐筆 fsync，最多每 10 秒（以及換區段檔與正常結束時）fsync 一次，因此斷電時最多遺失最近約 10 秒的取樣（預設約 2 筆）；每筆記錄有長度與 CRC-32，啟動時偵測並截掉寫到一半的尾端（記 `WARN`）。已送達的位置（`spool.ack`）最多每 5 秒更新一次，斷電後可能有幾筆已送達的資料再送一次，由 Kairos 去重。

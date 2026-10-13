@@ -231,7 +231,8 @@ pub struct Settings {
     /// 協定 v2 hello 的主機資訊（主機指紋、OS、顯示名稱、標籤、report 間隔）；
     /// 只在 hello 中附上，舊版 Kairos 會忽略
     pub host: HostInfo,
-    /// durable：兩筆 report 之間的最短間隔（`buffer.replay_interval_ms`）
+    /// durable：兩筆 report 之間的最短間隔（`buffer.replay_interval_ms`，不超過取樣間隔的 60%，
+    /// 見 [`AppConfig::effective_replay_interval_ms`]）
     pub replay_interval: Duration,
 }
 
@@ -256,7 +257,7 @@ impl Settings {
                 &config.agent.tags,
                 Duration::from_secs(config.report.interval),
             ),
-            replay_interval: Duration::from_millis(config.buffer.replay_interval_ms),
+            replay_interval: Duration::from_millis(config.effective_replay_interval_ms()),
         }
     }
 
@@ -1029,7 +1030,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// durable：同一時間最多在途的 report 筆數（協定上限為 [`kairos_proto::MAX_DURABLE_IN_FLIGHT`]）。
 ///
-/// 每 0.6 秒送一筆時，往返延遲（含 Kairos 寫檔）在 2.4 秒以內都不會被視窗卡住；
+/// 預設每 1.2 秒送一筆時，往返延遲（含 Kairos 寫檔）在 4.8 秒以內都不會被視窗卡住（最小間隔
+/// 0.5 秒時為 2 秒）；
 /// Kairos 逐則處理，每條連線最多排 4 筆 report，伺服器端不會無限積壓。
 const DURABLE_IN_FLIGHT: usize = 4;
 const _: () = assert!(DURABLE_IN_FLIGHT <= kairos_proto::MAX_DURABLE_IN_FLIGHT);

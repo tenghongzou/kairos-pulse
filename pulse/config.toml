@@ -98,9 +98,10 @@ max_mb = 64              # MiB，1～102400
 max_records = 50000      # 筆，100～10000000
 # 取樣時間超過這麼久的資料不再送出、直接丟棄（小時，1～8760；預設 7 天）
 max_age_hours = 168
-# 兩筆 report 之間的最短間隔（毫秒，500～60000）。補送積壓時以這個速率送出（預設每秒約 1.67 筆，
-# 低於 Kairos 的 report 速率限制每秒 2 則）；大量主機同時恢復連線時可調大以減輕 Kairos 的負載
-replay_interval_ms = 600
+# 兩筆 report 之間的最短間隔（毫秒，500～60000）。補送積壓時以這個速率送出（預設每秒約 0.83 筆，
+# 低於 Kairos 的 report 速率限制每秒 2 則；1 萬台同時恢復連線時約每秒 8,300 筆）。實際使用的值不超過
+# report.interval 的 60%（report.interval = 1 時為 600），否則新的取樣比送出的快、積壓補不完
+replay_interval_ms = 1200
 
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）
