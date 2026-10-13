@@ -129,13 +129,51 @@ impl TlsSetup {
     pub fn log_client_cert_validity(&self) {
         log_findings(&self.client_cert_validity(Utc::now()));
     }
+
+    /// 用戶端憑證（葉憑證）的摘要；未設定客戶端憑證時為 `None`
+    pub fn client_cert_info(&self) -> Option<ClientCertInfo> {
+        let (path, chain) = self.client_chain.as_ref()?;
+        let leaf = chain.first()?;
+        let validity = cert_validity(leaf);
+        Some(ClientCertInfo {
+            path: path.clone(),
+            serial: cert_serial(leaf),
+            not_before: validity.map(|v| v.0),
+            not_after: validity.map(|v| v.1),
+        })
+    }
+}
+
+/// 用戶端憑證的摘要（寫進本機狀態檔，`pulse status` 的「身分」列）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCertInfo {
+    pub path: String,
+    /// 序號：十六進位大寫、每個位元組以 `:` 分隔（例如 `10:02`）
+    pub serial: Option<String>,
+    pub not_before: Option<DateTime<Utc>>,
+    pub not_after: Option<DateTime<Utc>>,
 }
 
 /// 依各自的等級記錄檢查結果；需要人工處理的（本機客戶端憑證已過期，見 [`mirrors_to_stderr`]）
 /// 同時寫一行到 stderr，讓 systemd 的 journal 也看得到。
 fn log_findings(findings: &[CertFinding]) {
     for finding in findings {
-        log::log!(finding.level, "{}", finding.message);
+        let tag = match finding.level {
+            Level::Error => crate::codes::tag(
+                crate::codes::CERT_EXPIRED,
+                Some(crate::codes::E_CLIENT_CERT_EXPIRED),
+            ),
+            _ if finding.message.contains("才生效") => crate::codes::tag(
+                crate::codes::CERT_EXPIRING,
+                Some(crate::codes::E_CERT_NOT_YET_VALID),
+            ),
+            _ if finding.message.contains("到期") => crate::codes::tag(
+                crate::codes::CERT_EXPIRING,
+                Some(crate::codes::W_CLIENT_CERT_EXPIRING),
+            ),
+            _ => String::new(),
+        };
+        log::log!(finding.level, "{tag}{}", finding.message);
         if mirrors_to_stderr(finding) {
             crate::service_status::attention(&finding.message);
         }
@@ -170,8 +208,12 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
             );
         }
         log::error!(
-            "已停用 TLS 伺服器憑證驗證（accept_invalid_certs = true）：無法確認連到的是真正的伺服器，\
-             連線可能遭中間人竊聽或竄改，請勿用於正式環境"
+            "{}已停用 TLS 伺服器憑證驗證（accept_invalid_certs = true）：無法確認連到的是真正的伺服器，\
+             連線可能遭中間人竊聽或竄改，請勿用於正式環境",
+            crate::codes::tag(
+                crate::codes::CONFIG_WARNING,
+                Some(crate::codes::W_TLS_VERIFY_DISABLED)
+            )
         );
         builder
             .dangerous()
@@ -199,7 +241,19 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
             std::path::Path::new(key_path),
             crate::file_perms::CLIENT_KEY_FILE,
         ) {
-            log::warn!("{warning}");
+            log::warn!(
+                "{}{warning}",
+                crate::codes::tag(
+                    crate::codes::CONFIG_WARNING,
+                    Some(crate::codes::W_KEY_PERMS)
+                )
+            );
+            crate::local_status::record(|s| {
+                s.add_identity_warning(crate::status_file::CodeNote::new(
+                    crate::codes::W_KEY_PERMS,
+                    warning.clone(),
+                ));
+            });
         }
         // 已過期也不阻止啟動（記 error）：本機時鐘可能不正確，以伺服器的判定為準
         log_findings(&check_chain_validity(cert_path, &chain, Utc::now()));
@@ -420,6 +474,36 @@ fn check_chain_validity(
 /// 剩餘時間換算成天數（無條件進位，至少 1）：剩 9.5 天 → 10，剛好 10 天 → 10。
 fn remaining_days(remaining: Duration) -> u64 {
     remaining.as_secs().div_ceil(SECS_PER_DAY).max(1)
+}
+
+/// 從 X.509 憑證 DER 取出序號（`10:02` 形式）；格式不符時回傳 `None`（不 panic）。
+fn cert_serial(cert: &CertificateDer<'_>) -> Option<String> {
+    const SEQUENCE: u8 = 0x30;
+    const INTEGER: u8 = 0x02;
+    const VERSION: u8 = 0xa0;
+    let (cert, _) = der_expect(cert.as_ref(), SEQUENCE)?;
+    let (tbs, _) = der_expect(cert, SEQUENCE)?;
+    let (tag, content, rest) = der_next(tbs)?;
+    let serial = match tag {
+        VERSION => der_expect(rest, INTEGER)?.0,
+        INTEGER => content,
+        _ => return None,
+    };
+    // 去掉 DER 為了表示正數而補的 0x00
+    let serial = match serial {
+        [0, rest @ ..] if !rest.is_empty() => rest,
+        s => s,
+    };
+    if serial.is_empty() {
+        return None;
+    }
+    Some(
+        serial
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
 }
 
 /// 從 X.509 憑證 DER 取出 `(notBefore, notAfter)`；格式不符時回傳 `None`（不 panic）。
@@ -1014,6 +1098,30 @@ mod tests {
 
     fn first_cert(name: &str) -> CertificateDer<'static> {
         load_certs(&data(name), "test", "憑證").unwrap().remove(0)
+    }
+
+    #[test]
+    fn cert_serial_is_parsed_from_der() {
+        // 與 `openssl x509 -noout -serial` 相同（以 : 分隔每個位元組）
+        assert_eq!(
+            cert_serial(&first_cert("client-rsa.pem")).as_deref(),
+            Some("43:15:54:47:74:5B:C5:6B:AB:29:D0:DF:F5:69:C6:BD:F0:9D:E4:02")
+        );
+        assert_eq!(
+            cert_serial(&first_cert("client-ec-chain.pem")).as_deref(),
+            Some("52:1F:B8:66:C2:18:11:8D:9F:03:5F:3A:41:34:30:97:30:14:63:01")
+        );
+        assert_eq!(cert_serial(&CertificateDer::from(vec![0x30, 0x00])), None);
+        let setup = build(&server("root.pem", "client-rsa.pem", "client-rsa.key")).unwrap();
+        let info = setup.client_cert_info().unwrap();
+        assert_eq!(info.path, data("client-rsa.pem"));
+        assert_eq!(info.not_after.unwrap().format("%Y").to_string(), "2126");
+        assert!(
+            build(&server("root.pem", "", ""))
+                .unwrap()
+                .client_cert_info()
+                .is_none()
+        );
     }
 
     #[test]

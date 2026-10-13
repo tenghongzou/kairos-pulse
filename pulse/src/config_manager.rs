@@ -113,6 +113,13 @@ pub struct BufferConfig {
     pub replay_interval_ms: u64,
 }
 
+/// 本機狀態檔（`pulse status` 讀取，見 `status_file` 模組）
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusConfig {
+    /// 狀態檔路徑（相對路徑以工作目錄解析）
+    pub file: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
     /// 日誌級別；載入後已正規化為小寫並驗證過
@@ -148,6 +155,7 @@ pub struct AppConfig {
     pub report: ReportConfig,
     pub agent: AgentConfig,
     pub buffer: BufferConfig,
+    pub status: StatusConfig,
     pub log: LogConfig,
     /// 載入時目前工作目錄下是否有 `pulse.toml`（啟動時記錄，方便確認設定來源）
     #[serde(skip)]
@@ -157,10 +165,24 @@ pub struct AppConfig {
 impl AppConfig {
     /// 依序疊加：嵌入的 config.toml → `pulse.toml`（可不存在）→ `PULSE__*` 環境變數。
     pub fn load() -> Result<Self, ConfigError> {
-        let found = std::path::Path::new(LOCAL_CONFIG_FILE).is_file();
-        let mut config = Self::build(Some(LOCAL_CONFIG_FILE), None)?;
+        Self::load_file(std::path::Path::new(LOCAL_CONFIG_FILE))
+    }
+
+    /// 同 [`AppConfig::load`]，但讀取指定的設定檔（`pulse status --config`、從執行檔所在目錄找到的
+    /// `pulse.toml`）。設定中的相對路徑由呼叫端以設定檔所在的目錄解析。
+    pub fn load_file(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let found = path.is_file();
+        let mut config = Self::build(Some(path), None)?;
         config.local_file_found = found;
         Ok(config)
+    }
+
+    /// 不讀設定檔：嵌入的預設值加上環境變數；環境變數也有誤時只用嵌入的預設值
+    /// （設定有誤時，`pulse status` 仍需要預設的狀態檔位置）。
+    pub fn defaults() -> Self {
+        Self::build(None, None)
+            .or_else(|_| Self::build(None, Some(Map::new())))
+            .expect("嵌入的預設設定必須合法")
     }
 
     /// 測試用：只用嵌入的預設值（不讀 pulse.toml 與行程環境變數）。
@@ -189,13 +211,13 @@ impl AppConfig {
     /// 把字串轉成對應型別；字串欄位（路徑、domain、address）則保持原樣，
     /// 例如 `PULSE__AGENT__ID_FILE=0001` 不會被改寫成 `"1"`。
     fn build(
-        local_file: Option<&str>,
+        local_file: Option<&std::path::Path>,
         env_override: Option<Map<String, String>>,
     ) -> Result<Self, ConfigError> {
         let mut builder =
             Config::builder().add_source(File::from_str(EMBEDDED_CONFIG, FileFormat::Toml));
         if let Some(path) = local_file {
-            builder = builder.add_source(File::new(path, FileFormat::Toml).required(false));
+            builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(false));
         }
         let env = Environment::with_prefix("PULSE")
             .prefix_separator("__")
@@ -346,6 +368,11 @@ impl AppConfig {
             MIN_REPLAY_INTERVAL_MS,
             MAX_REPLAY_INTERVAL_MS,
         )?;
+        if self.status.file.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "status.file 不可為空字串（pulse status 讀取的本機狀態檔）".to_string(),
+            ));
+        }
         range(
             "log.retention_days",
             u64::from(self.log.retention_days),
@@ -763,7 +790,7 @@ mod tests {
         let file = dir.join("pulse.toml");
         let load = |content: &str| {
             std::fs::write(&file, content).unwrap();
-            AppConfig::build(Some(file.to_str().unwrap()), Some(Map::new())).unwrap()
+            AppConfig::build(Some(file.as_path()), Some(Map::new())).unwrap()
         };
         assert!(
             !load("[server]\nca_cert = \"ca.pem\"\n")
@@ -804,7 +831,7 @@ mod tests {
         let file = dir.join("pulse.toml");
         let load = |content: &str| {
             std::fs::write(&file, content).unwrap();
-            AppConfig::build(Some(file.to_str().unwrap()), Some(Map::new()))
+            AppConfig::build(Some(file.as_path()), Some(Map::new()))
         };
         let cfg = load("[agent]\ndisplay_name = \"主機 A\"\ntags = [\"env:prod\", \"team:web\"]\n")
             .unwrap();

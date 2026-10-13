@@ -103,6 +103,12 @@ max_age_hours = 168
 # report.interval 的 60%（report.interval = 1 時為 600），否則新的取樣比送出的快、積壓補不完
 replay_interval_ms = 1200
 
+[status]
+# 本機狀態檔（pulse status 讀取；相對路徑以工作目錄解析）。執行中每 10 秒、狀態變化時另外以原子方式改寫
+# （寫暫存檔再改名，不 fsync）；內容不含秘密。Unix 上以 0640 建立，與 logs/ 相同只有服務帳號與其群組可讀。
+# 預設放在 logs/：systemd unit（ProtectSystem=strict）中服務只能寫 logs/ 與 buffer/
+file = "logs/status.json"
+
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）
 # 日誌檔按日分檔：logs/pulse-YYYY-MM-DD.log（檔名日期為 UTC）。

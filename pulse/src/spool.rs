@@ -56,6 +56,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 
+use crate::codes;
+use crate::local_status;
 use crate::log_throttle::{LogThrottle, suppressed_note};
 use crate::system_info::Sample;
 
@@ -141,7 +143,7 @@ pub struct Appended {
 }
 
 /// 統計（自程序啟動起）
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpoolStats {
     /// 待送筆數
     pub pending: usize,
@@ -157,6 +159,28 @@ pub struct SpoolStats {
     pub dropped_rejected: u64,
     /// 損毀而略過的記錄數（啟動時的尾端截斷不計筆數，只記日誌）
     pub corrupted: u64,
+    /// 因容量已滿而丟掉的記錄，取樣時間的範圍（Unix 毫秒，最舊～最新）
+    pub dropped_full_from_ms: Option<i64>,
+    pub dropped_full_until_ms: Option<i64>,
+    /// 最近一次因容量已滿而丟棄的時間（Unix 毫秒）
+    pub last_dropped_full_at_ms: Option<i64>,
+    /// 因超過 max_age 而丟掉的記錄，取樣時間的範圍
+    pub dropped_expired_from_ms: Option<i64>,
+    pub dropped_expired_until_ms: Option<i64>,
+    pub last_dropped_expired_at_ms: Option<i64>,
+    /// 無法寫入緩衝而遺失的取樣數（`PLS-W4103`）
+    pub write_failures: u64,
+    pub last_write_failure_at_ms: Option<i64>,
+    /// 最近一次寫入失敗的原因
+    pub last_write_error: Option<String>,
+}
+
+impl SpoolStats {
+    /// 把一批丟掉的記錄的取樣時間範圍併入目前累計的範圍
+    fn widen(from: &mut Option<i64>, until: &mut Option<i64>, oldest: i64, newest: i64) {
+        *from = Some(from.map_or(oldest, |f| f.min(oldest)));
+        *until = Some(until.map_or(newest, |u| u.max(newest)));
+    }
 }
 
 /// 送達位置
@@ -439,7 +463,8 @@ impl Spool {
         let dropped = spool.enforce_capacity(0);
         if dropped > 0 {
             log::warn!(
-                "本機緩衝的待送資料超過容量上限（buffer.max_mb／buffer.max_records），已丟掉最舊的 {dropped} 筆"
+                "{}本機緩衝的待送資料超過容量上限（buffer.max_mb／buffer.max_records），已丟掉最舊的 {dropped} 筆",
+                codes::tag(codes::BUFFER_FULL, Some(codes::W_BUFFER_FULL))
             );
         }
         spool.collect_segments();
@@ -466,8 +491,25 @@ impl Spool {
             pending: self.entries.len(),
             pending_bytes: self.pending_bytes,
             disk_bytes: self.segments.values().sum(),
-            ..self.stats
+            ..self.stats.clone()
         }
+    }
+
+    /// 取樣時間不早於 `since_ms`（Unix 毫秒）的待送筆數（`window_1h.buffered`）
+    pub fn pending_sampled_since(&self, since_ms: i64) -> usize {
+        // 記錄依取樣順序排列：從最新的往回數
+        self.entries
+            .iter()
+            .rev()
+            .take_while(|e| e.sampled_at_ms >= since_ms)
+            .count()
+    }
+
+    /// 無法寫入一筆取樣（`PLS-W4103`）：計數並記下原因
+    pub fn record_write_failure(&mut self, error: &str) {
+        self.stats.write_failures = self.stats.write_failures.saturating_add(1);
+        self.stats.last_write_failure_at_ms = Some(Utc::now().timestamp_millis());
+        self.stats.last_write_error = Some(error.chars().take(400).collect());
     }
 
     /// 寫入一筆新的取樣（指派本程序的 `boot_id` 與下一個 `report_seq`）。超過容量時先丟掉最舊的記錄。
@@ -531,6 +573,7 @@ impl Spool {
     fn enforce_capacity(&mut self, incoming: u64) -> u64 {
         let extra = u64::from(incoming > 0);
         let mut dropped = 0;
+        let mut range: Option<(i64, i64)> = None;
         while let Some(front) = self.entries.front().copied() {
             let over_records = self.entries.len() as u64 + extra > self.settings.max_records as u64;
             let over_bytes = self.pending_bytes + incoming > self.settings.max_bytes;
@@ -541,8 +584,20 @@ impl Spool {
             self.pending_bytes -= front.len;
             self.ack_dirty = true;
             dropped += 1;
+            let t = front.sampled_at_ms;
+            range = Some(range.map_or((t, t), |(a, b)| (a.min(t), b.max(t))));
         }
         self.stats.dropped_full = self.stats.dropped_full.saturating_add(dropped);
+        if let Some((oldest, newest)) = range {
+            let s = &mut self.stats;
+            SpoolStats::widen(
+                &mut s.dropped_full_from_ms,
+                &mut s.dropped_full_until_ms,
+                oldest,
+                newest,
+            );
+            s.last_dropped_full_at_ms = Some(Utc::now().timestamp_millis());
+        }
         dropped
     }
 
@@ -661,6 +716,7 @@ impl Spool {
         let max_age_ms = i64::try_from(self.settings.max_age.as_millis()).unwrap_or(i64::MAX);
         let cutoff = now.timestamp_millis().saturating_sub(max_age_ms);
         let mut dropped = 0;
+        let mut range: Option<(i64, i64)> = None;
         while let Some(front) = self.entries.front().copied() {
             if front.sampled_at_ms >= cutoff {
                 break;
@@ -668,6 +724,18 @@ impl Spool {
             self.entries.pop_front();
             self.pending_bytes -= front.len;
             dropped += 1;
+            let t = front.sampled_at_ms;
+            range = Some(range.map_or((t, t), |(a, b)| (a.min(t), b.max(t))));
+        }
+        if let Some((oldest, newest)) = range {
+            let s = &mut self.stats;
+            SpoolStats::widen(
+                &mut s.dropped_expired_from_ms,
+                &mut s.dropped_expired_until_ms,
+                oldest,
+                newest,
+            );
+            s.last_dropped_expired_at_ms = Some(now.timestamp_millis());
         }
         if dropped > 0 {
             self.stats.dropped_expired = self.stats.dropped_expired.saturating_add(dropped);
@@ -875,6 +943,7 @@ pub async fn ingest(
                 let Some(sample) = sample else { break };
                 if shared.is_live() {
                     if let Err(mpsc::error::TrySendError::Full(s)) = live.try_send(sample) {
+                        local_status::record(local_status::State::dropped_disconnected);
                         log::debug!("回報佇列已滿（寫出中），丟棄此次取樣（ts={}）", s.ts);
                     }
                     continue;
@@ -889,10 +958,12 @@ pub async fn ingest(
                         );
                         if appended.dropped > 0 {
                             let stats = shared.lock().stats();
+                            local_status::record(local_status::State::buffer_changed);
                             if let Some(n) = full.check(tokio::time::Instant::now()) {
                                 log::warn!(
-                                    "本機緩衝已滿（待送 {} 筆、{} bytes），丟掉最舊的資料；累計已丟掉 {} 筆\
+                                    "{}本機緩衝已滿（待送 {} 筆、{} bytes），丟掉最舊的資料；累計已丟掉 {} 筆\
                                      （可調大 buffer.max_mb／buffer.max_records）{}",
+                                    codes::tag(codes::BUFFER_FULL, Some(codes::W_BUFFER_FULL)),
                                     stats.pending,
                                     stats.pending_bytes,
                                     stats.dropped_full,
@@ -903,9 +974,16 @@ pub async fn ingest(
                         shared.notify.notify_one();
                     }
                     Err(e) => {
+                        let total = {
+                            let mut spool = shared.lock();
+                            spool.record_write_failure(&e.to_string());
+                            spool.stats().write_failures
+                        };
+                        local_status::record(local_status::State::buffer_changed);
                         if let Some(n) = write_errors.check(tokio::time::Instant::now()) {
                             log::warn!(
-                                "無法寫入本機緩衝，此次取樣（ts={}）遺失：{e}{}",
+                                "{}無法寫入本機緩衝，此次取樣（ts={}）遺失（累計 {total} 筆）：{e}{}",
+                                codes::tag(codes::BUFFER_WRITE_FAILED, Some(codes::W_BUFFER_WRITE)),
                                 sample.ts,
                                 suppressed_note(n, SPOOL_LOG_WINDOW)
                             );
@@ -917,7 +995,11 @@ pub async fn ingest(
                 if let Err(e) = shared.lock().maintain(Instant::now())
                     && let Some(n) = write_errors.check(tokio::time::Instant::now())
                 {
-                    log::warn!("無法同步本機緩衝：{e}{}", suppressed_note(n, SPOOL_LOG_WINDOW));
+                    log::warn!(
+                        "{}無法同步本機緩衝（斷電時最近的取樣可能遺失）：{e}{}",
+                        codes::tag(codes::BUFFER_WRITE_FAILED, Some(codes::W_BUFFER_WRITE)),
+                        suppressed_note(n, SPOOL_LOG_WINDOW)
+                    );
                 }
             }
         }
