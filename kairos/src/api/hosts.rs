@@ -1215,6 +1215,30 @@ pub(crate) mod tests {
         format!("{n:08x}-0000-4000-8000-000000000000")
     }
 
+    /// API.md §5.1、設計包 `ia.md` §5.1 的狀態暖機期：只有「最後一次訊息在這次啟動之前、這次啟動後
+    /// 還沒連上」的主機在啟動後 2 分鐘內為 unknown
+    #[test]
+    fn unknown_only_within_the_status_warmup_for_hosts_last_seen_before_start() {
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+        let before_start = db_host(&id(1), "db-01", "10.0.0.1:1", now_ms - 3_600_000);
+        let within = env(now, STARTUP_GRACE - Duration::from_secs(1));
+        let v = view_of(Some(&before_start), None, None, &within).unwrap();
+        assert_eq!((v.status, v.starting), (Status::Unknown, true));
+        // 2 分鐘後仍未連上：離線
+        let after = env(now, STARTUP_GRACE);
+        let v = view_of(Some(&before_start), None, None, &after).unwrap();
+        assert_eq!((v.status, v.starting), (Status::Offline, false));
+        // 最後一次訊息在這次啟動之後（清冊已更新、即時狀態已移除）：暖機期內也是離線
+        let since_start = db_host(&id(2), "db-02", "10.0.0.2:1", now_ms - 1_000);
+        let v = view_of(Some(&since_start), None, None, &within).unwrap();
+        assert_eq!((v.status, v.starting), (Status::Offline, false));
+        // 這次啟動後連上又中斷：暖機期內照常離線
+        let l = live(&id(1), false, now - chrono::Duration::seconds(30));
+        let v = view_of(Some(&before_start), Some(&l), None, &within).unwrap();
+        assert_eq!((v.status, v.starting), (Status::Offline, false));
+    }
+
     #[test]
     fn statuses_are_merged_from_inventory_and_live_state() {
         let now = Utc::now();

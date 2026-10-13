@@ -209,7 +209,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 |---|---|
 | `online` | 目前有連線、通過 hello，且 `last_seen` 在離線門檻（`offline_after_ms`）內 |
 | `offline` | 曾經上線，現在沒有連線或超過離線門檻 |
-| `unknown` | 清冊中有、但從未連線到這個 Kairos（由 `kairos reports import` 匯入的主機，`status_detail.never_connected: true`）；或 Kairos 啟動後 2 分鐘內、這台主機在啟動前已離線且尚未連上（`status_detail.starting: true`，設計包「Kairos 剛重新啟動且暖機期內」） |
+| `unknown` | 清冊中有、但從未連線到這個 Kairos（由 `kairos reports import` 匯入的主機，`status_detail.never_connected: true`）；或在**狀態暖機期**（Kairos 啟動後 2 分鐘）內，最後一次訊息在這次啟動之前、這次啟動後還沒連上的主機（`status_detail.starting: true`；設計包 `ia.md` §5.1）。2 分鐘後仍未連上改為 `offline`；這次啟動後已連上又中斷的主機照常為 `offline`。狀態暖機期只影響狀態顯示，與告警的暖機期無關 |
 
 **查詢參數**（同一參數多個值以逗號分隔，取「或」；不同參數取「且」，與設計包 D23 的篩選規則相同）：
 
@@ -569,11 +569,12 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 **已決定（使用者已核准，衝刺 3 整合）**
 
 - **預設啟用主控台，只綁 `127.0.0.1:9443`**：0.4 升級後預設監聽 loopback；9443 被其他程式佔用時 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試），以 `[console]` 的 `listen` 換連接埠或 `enabled = false` 停用（CHANGELOG 破壞性變更第 1 項、INSTALL 第 9.3 節）。開放給管理網段由管理者手動修改，並以防火牆只允許管理網段。
-- **token 的有效期限預設 90 天、上限 3,650 天**（第 4.1、4.2 節）；`--no-expiry` 仍可建立不過期的 token（不建議）。
+- **token 的有效期限預設 90 天、上限 3,650 天**（第 4.1、4.2 節），不提供不過期的 token（`--no-expiry` 已移除，設計包 §26.4 #3）。
 - **驗證失敗依來源 IP 速率限制**（第 4.3 節；IPv6 以 /64 合併）：同一個 NAT 後的合法用戶端可能被同一來源的錯誤 token 連帶限制（最多約 1 分鐘），接受這個取捨。
+- **錯誤代碼**（設計包 `copywriting.md` §3.4、`decisions/INTEGRATION.md` §26）：401 `KRS-E6010`、429 `KRS-W6011`、403 `KRS-E6104`（第 1.2 節）。
+- **狀態暖機期 2 分鐘**（設計包 `ia.md` §5.1，第 5.1 節）。
 
 **需要使用者或設計決定**
 
-1. **錯誤代碼**：API 的 `unauthorized`（401）、`forbidden`（403）、`rate_limited`（429）沒有對應的產品代碼。`copywriting.md` §3.3 的 6001 是登入畫面的帳號密碼錯誤；建議設計分配子類別 61（權限）的新號碼，例如 `KRS-E6101`（API token 無效或已過期）、`KRS-E6102`（權限不足）、`KRS-W6103`（驗證失敗太多次），以及主控台連接埠的啟動錯誤是否沿用 `KRS-E2001`。
-2. **`unknown` 狀態的暖機期**定為 Kairos 啟動後 2 分鐘（設計包只寫「暖機期內」）。
-3. **主機詳情是否顯示「支援補送」**（`decisions/INTEGRATION.md` §25.8 #6）：API 已提供 `durable`、`replaying`、`connection.last_backfill_*`，畫面是否呈現由設計決定。
+1. **連接埠被佔用的代碼**：設計包 §26.1 #2 核准主控台埠被佔用時為 `KRS-E2001`（結束代碼 11），但目前 agent 連接埠與主控台連接埠的「無法監聽…」訊息都還沒有帶代碼，待補。
+2. **主機詳情是否顯示「支援補送」**（`decisions/INTEGRATION.md` §25.8 #6）：API 已提供 `durable`、`replaying`、`connection.last_backfill_*`，畫面是否呈現由設計決定。
