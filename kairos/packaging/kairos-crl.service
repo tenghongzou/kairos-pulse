@@ -1,0 +1,55 @@
+# Kairos 代理 CRL 定期重新產生（由 kairos-crl.timer 觸發）範例
+#
+# 為什麼需要：Kairos 對 CRL 採 fail closed，CRL 超過 nextUpdate（INSTALL 的 ca.cnf 為
+# default_crl_days = 30）時「所有」agent 都會被拒絕連線。即使沒有新的撤銷，也要在到期前
+# 重新產生並部署。Kairos 在 nextUpdate 前 7 天（auth.crl_expiry_warning_days）開始記 WARN。
+#
+# 安裝在保存代理 CA（agent-ca/ 與 client-ca.key）的主機上，完整說明見 INSTALL.md 第 10.3 節：
+#   install -m 644 kairos-crl.service kairos-crl.timer /etc/systemd/system/
+#   systemctl edit kairos-crl.service     # 以 drop-in 調整下方標示「需調整」的項目
+#   systemctl daemon-reload && systemctl enable --now kairos-crl.timer
+#   systemctl start kairos-crl.service    # 立即執行一次並確認：journalctl -u kairos-crl
+#
+# 流程：產生到暫存檔 → 確認 nextUpdate 在未來 → 原子改名 → 部署到 Kairos。
+# 任何一步失敗，後面的步驟都不會執行，Kairos 上的 CRL 維持原樣（不會部署壞檔）；
+# 失敗會留在 journal，systemctl status 顯示 failed。
+
+[Unit]
+Description=Regenerate and deploy the Kairos agent CRL
+Documentation=file:/opt/kairos/INSTALL.md
+
+[Service]
+Type=oneshot
+# 需調整：擁有 agent-ca/ 的帳號（能讀 client-ca.key 與寫入 index.txt、crlnumber）
+User=kairos-pki
+Group=kairos-pki
+# 需調整：代理 CA 的目錄（INSTALL 第 6.2 節的 agent-ca/；ca.cnf 中的路徑相對於此目錄）
+WorkingDirectory=/srv/kairos-pki/agent-ca
+UMask=0077
+
+# 1. 產生新的 CRL 到暫存檔（ca.cnf 見 INSTALL 第 6.2 節）
+ExecStart=/usr/bin/openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl.new
+# 2. 確認是由 client-ca.pem 簽發的合法 CRL，且 nextUpdate 在未來（任一項不通過時結束代碼非 0）
+ExecStart=/usr/bin/openssl crl -in agents.crl.new -noout -CAfile client-ca.pem
+# （unit 檔中 $$ 代表字面的 $、%% 代表字面的 %）
+ExecStart=/bin/sh -c 'next=$$(openssl crl -in agents.crl.new -noout -nextupdate | cut -d= -f2-) && [ "$$(date -u -d "$$next" +%%s)" -gt "$$(date -u +%%s)" ] && echo "nextUpdate: $$next"'
+ExecStart=/bin/mv -f agents.crl.new agents.crl
+
+# 3. 部署到 Kairos（擇一，以 drop-in 覆寫 ExecStartPost）。
+#    Kairos 在下一個重載週期（server.reload_interval_secs，預設 30 秒）自動載入，不需重新啟動。
+#
+# (a) CA 與 Kairos 在同一台主機（CA 私鑰放在伺服器上，風險較高，見 INSTALL 第 6 節）：
+#     以 root 執行部署步驟（「+」前綴）；先寫暫存檔再 mv，Kairos 不會讀到寫一半的檔案
+ExecStartPost=+/usr/bin/install -o root -g kairos -m 644 agents.crl /opt/kairos/agents.crl.new
+ExecStartPost=+/bin/mv -f /opt/kairos/agents.crl.new /opt/kairos/agents.crl
+#
+# (b) CA 在另一台管理主機：以 scp 傳到 Kairos 主機上「部署帳號可寫、kairos 群組可讀」的目錄，
+#     再以 ssh 原子改名（Kairos 的 auth.crl 指向該目錄，見 INSTALL 第 10.3 節）。drop-in 範例：
+#   [Service]
+#   ExecStartPost=
+#   ExecStartPost=/usr/bin/scp -q agents.crl crl-deploy@monitor.example.com:/opt/kairos/crl/agents.crl.new
+#   ExecStartPost=/usr/bin/ssh crl-deploy@monitor.example.com mv -f /opt/kairos/crl/agents.crl.new /opt/kairos/crl/agents.crl
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only

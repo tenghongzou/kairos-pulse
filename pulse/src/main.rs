@@ -2,12 +2,14 @@ mod agent_id;
 mod backoff;
 mod cli;
 mod config_manager;
+mod file_perms;
 mod log_files;
 mod log_throttle;
 mod network;
 mod protocol;
 mod service_status;
 mod shutdown;
+mod spool;
 mod system_info;
 #[cfg(test)]
 mod test_log;
@@ -23,10 +25,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// 收集 task → 連線 task 的回報佇列容量。
+/// 收集 task → 連線 task 的回報佇列容量（at-most-once 的即時取樣）。
 ///
 /// 刻意設為 1：連線中斷時最多只保留一筆取樣，其餘新取樣直接丟棄，不會堆積。
+/// 啟用本機緩衝時，斷線期間的取樣寫進緩衝（`spool`），不經過這個佇列。
 const REPORT_QUEUE_CAPACITY: usize = 1;
+
+/// 啟用本機緩衝時，收集 task → 緩衝寫入 task 的佇列容量（寫入 task 一直在讀，
+/// 只需容納 fsync 等短暫的延遲）
+const SPOOL_QUEUE_CAPACITY: usize = 8;
 
 /// 收到 Ctrl+C 後，等待連線任務收尾（含送 TLS close_notify，上限 1 秒）的時間上限。
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -37,6 +44,52 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 過期日誌檔的清除間隔。
 const LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
+
+// ---- 結束代碼 ----
+//
+// 依設計包 `design/pulse/cli-spec.md` §1.3（`pulse`／`pulse run` 常駐）與
+// `design/design-system/cli-style.md` §8（`kairos` 與 `pulse` 共用的結束代碼表）。
+// 另有正常結束 0、第二次收到結束訊號時的 130（`shutdown::FORCED_EXIT_CODE`）。不使用 sysexits。
+// `packaging/pulse.service` 以 `RestartPreventExitStatus` 讓 systemd 不重試「重試也不會成功」的
+// 代碼（2、3、4）。
+
+/// 一般錯誤：內部錯誤（收集任務異常結束等）與未分類的啟動失敗（例如日誌目錄無法建立、
+/// 無法取得主機名稱），交由服務管理員重新啟動
+const EXIT_GENERAL: u8 = 1;
+/// 用法錯誤：未知的命令列參數
+const EXIT_USAGE: u8 = 2;
+/// 設定錯誤（`AppConfig::load` 失敗：設定檔語法、型別、範圍錯誤等）
+const EXIT_CONFIG: u8 = 3;
+/// 憑證錯誤：`server.ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，
+/// 客戶端憑證的 SAN 與 agent_id 不符，或 `agent.id` 無法讀取、內容不合法
+const EXIT_CERT: u8 = 4;
+
+/// 啟動失敗或異常結束的原因與對應的結束代碼
+#[derive(Debug, PartialEq, Eq)]
+struct Failure {
+    code: u8,
+    message: String,
+}
+
+impl Failure {
+    /// 憑證錯誤（[`EXIT_CERT`]）
+    fn cert(message: String) -> Self {
+        Self {
+            code: EXIT_CERT,
+            message,
+        }
+    }
+}
+
+/// 未分類的錯誤訊息一律是一般錯誤（[`EXIT_GENERAL`]）
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            code: EXIT_GENERAL,
+            message,
+        }
+    }
+}
 
 fn setup_logger(log_level: LevelFilter) -> Result<(), fern::InitError> {
     // 確保日誌目錄存在
@@ -169,7 +222,7 @@ fn main() -> ExitCode {
         Ok(command) => command,
         Err(e) => {
             eprintln!("錯誤：{e}\n\n{}", cli::USAGE);
-            return ExitCode::from(2);
+            return ExitCode::from(EXIT_USAGE);
         }
     };
     if command == cli::Command::Help {
@@ -187,7 +240,8 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(e) => {
             eprintln!("錯誤：無法載入設定：{e}");
-            return ExitCode::FAILURE;
+            // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
 
@@ -203,7 +257,7 @@ fn main() -> ExitCode {
     // 初始化日誌
     if let Err(e) = setup_logger(config.log.level_filter()) {
         eprintln!("錯誤：無法初始化日誌：{e}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(EXIT_GENERAL);
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
     retention.run();
@@ -217,7 +271,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             error!("無法建立 tokio runtime：{e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
     let code = runtime.block_on(async_main(config, retention));
@@ -244,7 +298,7 @@ fn print_agent_id(config: &AppConfig) -> ExitCode {
         }
         Err(e) => {
             eprintln!("錯誤：{e}");
-            ExitCode::FAILURE
+            ExitCode::from(EXIT_GENERAL)
         }
     }
 }
@@ -258,7 +312,7 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
         Ok(s) => s,
         Err(e) => {
             error!("{e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
     let shutdown = CancellationToken::new();
@@ -294,9 +348,12 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
             info!("Pulse 已結束");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            error!("{e}");
-            ExitCode::FAILURE
+        Err(failure) => {
+            error!("{}", failure.message);
+            // 日誌只寫到 stdout 與 logs/（pulse.service 為 StandardOutput=null）；以非 0 結束的原因
+            // 另寫一行到 stderr，`journalctl -u pulse` 看得到服務為何停在 failed（例如憑證錯誤 4）
+            service_status::attention(&failure.message.replace(['\r', '\n'], " "));
+            ExitCode::from(failure.code)
         }
     }
 }
@@ -318,12 +375,13 @@ where
 /// 日誌初始化後的主流程。
 ///
 /// 正常情況下會一直執行到 `shutdown` 被觸發後返回 `Ok(())`；
-/// 啟動失敗或背景任務異常結束時回傳 `Err`，程式以非 0 結束。
+/// 啟動失敗或背景任務異常結束時回傳 `Err`，程式以其中的結束代碼結束
+/// （憑證與 `agent.id` 的問題為 [`EXIT_CERT`]，其餘為 [`EXIT_GENERAL`]）。
 async fn run(
     config: AppConfig,
     retention: log_files::LogRetention,
     shutdown: CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     // 完整版本字串（含 commit）；hello 的 agent_version 仍只送 CARGO_PKG_VERSION
     info!("Pulse 地端程式啟動（{}）...", cli::VERSION);
     let cwd = std::env::current_dir().ok();
@@ -342,7 +400,7 @@ async fn run(
     else {
         return Ok(());
     };
-    let tls = tls.map_err(|e| format!("啟動失敗：{e}"))?;
+    let tls = tls.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
 
     // agent_id：讀檔沿用，不存在則產生；格式不合法則結束（檔案 I/O 放到 blocking 執行緒）
     let id_path = PathBuf::from(&config.agent.id_file);
@@ -356,7 +414,7 @@ async fn run(
     else {
         return Ok(());
     };
-    let (agent_id, created) = loaded.map_err(|e| format!("啟動失敗：{e}"))?;
+    let (agent_id, created) = loaded.map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
     if let Some(warning) = permission_warning {
         warn!("{warning}");
     }
@@ -370,7 +428,7 @@ async fn run(
     }
     // 客戶端憑證的 SAN 必須是 DNS:<agent_id>，否則伺服器會以 auth_failed 拒絕：啟動時就檢查
     tls.verify_client_cert_identity(&agent_id)
-        .map_err(|e| format!("啟動失敗：{e}"))?;
+        .map_err(|e| Failure::cert(format!("啟動失敗：{e}")))?;
 
     // 印出一次完整系統資訊。內含約 200 ms 的阻塞 sleep 與大量系統呼叫（可能很慢），
     // 放到 blocking 執行緒，且收到 Ctrl+C 時不等它完成。
@@ -390,34 +448,218 @@ async fn run(
     spawn_log_cleanup(retention, config.log.retention_days);
     spawn_client_cert_recheck(tls.clone());
 
-    // 系統資訊收集 task → 連線 task
+    // 本機緩衝（A5）：開啟失敗時不中止監控，改為 at-most-once（不宣告 durable）並記 ERROR
+    let shared_spool = if config.buffer.enabled {
+        let settings = spool_settings(&config.buffer);
+        let dir = settings.dir.clone();
+        match blocking_or_shutdown(&shutdown, move || spool::Spool::open(settings))
+            .await
+            .map_err(|e| format!("啟動失敗：{e}"))?
+        {
+            None => return Ok(()),
+            Some(Ok(opened)) => {
+                let stats = opened.stats();
+                info!(
+                    "本機緩衝：{}（待送 {} 筆、{} bytes；上限 {} MiB／{} 筆，保留 {} 小時；補送間隔 {} 毫秒；\
+                     本次 boot_id {}），Kairos 支援時 report 斷線期間的資料會補送（durable）",
+                    dir.display(),
+                    stats.pending,
+                    stats.pending_bytes,
+                    config.buffer.max_mb,
+                    config.buffer.max_records,
+                    config.buffer.max_age_hours,
+                    config.effective_replay_interval_ms(),
+                    opened.boot_id()
+                );
+                if config.effective_replay_interval_ms() < config.buffer.replay_interval_ms {
+                    info!(
+                        "buffer.replay_interval_ms = {} 大於取樣間隔（report.interval = {} 秒）的 60%，\
+                         改以 {} 毫秒送出（否則新的取樣比送出的快，積壓補不完）",
+                        config.buffer.replay_interval_ms,
+                        config.report.interval,
+                        config.effective_replay_interval_ms()
+                    );
+                }
+                Some(spool::SharedSpool::new(opened))
+            }
+            Some(Err(e)) => {
+                let msg = format!(
+                    "無法開啟本機緩衝 {}：{e}；本次執行不寫入本機緩衝，report 為 at-most-once（斷線期間的資料不補送）。\
+                     請確認目錄可由服務帳號寫入（或以 buffer.dir 指定其他目錄），修正後重新啟動 Pulse",
+                    dir.display()
+                );
+                error!("{msg}");
+                service_status::attention(&msg);
+                None
+            }
+        }
+    } else {
+        info!(
+            "本機緩衝已停用（buffer.enabled = false）：report 為 at-most-once，斷線期間的資料不補送"
+        );
+        None
+    };
+
+    // 系統資訊收集 task →（啟用本機緩衝時經緩衝寫入 task）→ 連線 task
     let (report_tx, report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
-    let mut collector = tokio::spawn(system_info::collect_periodically(
-        Duration::from_secs(config.report.interval),
-        report_tx,
-    ));
+    let (mut collector, mut ingest) = match &shared_spool {
+        Some(shared) => {
+            let (sample_tx, sample_rx) = mpsc::channel(SPOOL_QUEUE_CAPACITY);
+            let collector = tokio::spawn(system_info::collect_periodically(
+                Duration::from_secs(config.report.interval),
+                sample_tx,
+            ));
+            let ingest = tokio::spawn(spool::ingest(sample_rx, shared.clone(), report_tx));
+            (collector, Some(ingest))
+        }
+        None => (
+            tokio::spawn(system_info::collect_periodically(
+                Duration::from_secs(config.report.interval),
+                report_tx,
+            )),
+            None,
+        ),
+    };
+    let ingest_done = async {
+        match ingest.as_mut() {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    };
 
     let settings = network::Settings::new(&config, agent_id, hostname);
-    tokio::select! {
-        _ = network::run(settings, tls, report_rx, shutdown.clone()) => {
+    let result = tokio::select! {
+        _ = network::run(settings, tls, report_rx, shared_spool.clone(), shutdown.clone()) => {
             if shutdown.is_cancelled() {
                 Ok(())
             } else {
-                Err("連線任務意外結束".to_string())
+                Err("連線任務意外結束".to_string().into())
             }
         }
+        res = ingest_done => Err(match res {
+            Ok(()) => "本機緩衝寫入任務意外結束".to_string(),
+            Err(e) if e.is_panic() => format!("本機緩衝寫入任務發生 panic：{e}"),
+            Err(e) => format!("本機緩衝寫入任務異常結束：{e}"),
+        }
+        .into()),
         // 收集 task 正常情況下不會結束；結束或 panic 時讓整個程式以非 0 結束，交由服務管理員重啟
         res = &mut collector => Err(match res {
             Ok(()) => "系統資訊收集任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("系統資訊收集任務發生 panic：{e}"),
             Err(e) => format!("系統資訊收集任務異常結束：{e}"),
-        }),
+        }
+        .into()),
+    };
+    // 結束（或異常結束）前 fsync 本機緩衝並記下送達位置，下次啟動從這裡接著送
+    if let Some(shared) = &shared_spool {
+        let closed = shared.lock().close();
+        if let Err(e) = closed {
+            warn!("結束時無法同步本機緩衝：{e}");
+        }
+    }
+    result
+}
+
+/// `[buffer]` 設定對應的緩衝設定（已在載入時驗證範圍）
+fn spool_settings(buffer: &config_manager::BufferConfig) -> spool::SpoolSettings {
+    spool::SpoolSettings {
+        dir: PathBuf::from(buffer.dir.trim()),
+        max_bytes: buffer.max_mb.saturating_mul(1024 * 1024),
+        max_records: usize::try_from(buffer.max_records).unwrap_or(usize::MAX),
+        max_age: Duration::from_secs(buffer.max_age_hours.saturating_mul(3600)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_does_not_restart_when_retrying_cannot_help() {
+        // pulse.service 的 RestartPreventExitStatus 必須恰好是用法、設定、憑證錯誤（2、3、4）；
+        // 其他非 0 的結束代碼（一般錯誤 1、強制結束 130）仍由 Restart=always 重新啟動
+        let unit = include_str!("../packaging/pulse.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("RestartPreventExitStatus="))
+            .expect("pulse.service 應設定 RestartPreventExitStatus");
+        let codes: Vec<&str> = line["RestartPreventExitStatus=".len()..]
+            .split_whitespace()
+            .collect();
+        let expected = [EXIT_USAGE, EXIT_CONFIG, EXIT_CERT].map(|c| c.to_string());
+        assert_eq!(codes, expected, "{line}");
+        assert!(unit.lines().any(|l| l.trim() == "Restart=always"));
+    }
+
+    #[test]
+    fn unit_lets_the_service_write_the_default_buffer_directory() {
+        // A5：ProtectSystem=strict 下只有 ReadWritePaths= 可寫；預設的本機緩衝目錄必須在其中
+        // （前綴 - 表示目錄不存在時不影響啟動，Pulse 改為 at-most-once 並記 ERROR）
+        let unit = include_str!("../packaging/pulse.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("ReadWritePaths="))
+            .expect("pulse.service 應設定 ReadWritePaths");
+        let paths: Vec<&str> = line["ReadWritePaths=".len()..].split_whitespace().collect();
+        let config = AppConfig::default_for_tests();
+        let workdir = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("WorkingDirectory="))
+            .unwrap();
+        assert_eq!(
+            paths,
+            [
+                format!("{workdir}/logs"),
+                format!("-{workdir}/{}", config.buffer.dir)
+            ],
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn failures_carry_exit_codes() {
+        // cli-spec.md §1.3：未分類的錯誤為 1，憑證與 agent.id 的問題為 4
+        let general: Failure = "系統資訊收集任務意外結束".to_string().into();
+        assert_eq!(general.code, EXIT_GENERAL);
+        assert_eq!(general.message, "系統資訊收集任務意外結束");
+        let cert = Failure::cert("啟動失敗：找不到憑證".to_string());
+        assert_eq!(cert.code, EXIT_CERT);
+        assert_eq!(cert.message, "啟動失敗：找不到憑證");
+        // 與設計包的代碼表一致
+        assert_eq!(
+            [EXIT_GENERAL, EXIT_USAGE, EXIT_CONFIG, EXIT_CERT],
+            [1, 2, 3, 4]
+        );
+    }
+
+    /// 文字中是否有「共 N 個」或「N 個測試」這類寫死的數量。
+    fn has_hardcoded_count(line: &str) -> bool {
+        let chars: Vec<char> = line.chars().collect();
+        (0..chars.len()).any(|i| {
+            let digits = chars[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits == 0 || (i > 0 && chars[i - 1].is_ascii_digit()) {
+                return false;
+            }
+            let after: String = chars[i + digits..].iter().take(4).collect();
+            let before: String = chars[i.saturating_sub(2)..i].iter().collect();
+            after.starts_with(" 個") && (before == "共 " || after.starts_with(" 個測試"))
+        })
+    }
+
+    #[test]
+    fn readme_does_not_hardcode_test_count() {
+        // Q8：測試數量隨時變動（且各平台不同），README 不寫死數字
+        assert!(has_hardcoded_count("目前共 158 個。"));
+        assert!(has_hardcoded_count("共有 12 個測試"));
+        assert!(!has_hardcoded_count("目前共 2 次重試"));
+        assert!(!has_hardcoded_count("憑證鏈 2 張"));
+        let readme = include_str!("../README.md");
+        let offending: Vec<&str> = readme
+            .lines()
+            .filter(|l| l.contains("測試") && has_hardcoded_count(l))
+            .collect();
+        assert!(offending.is_empty(), "{offending:?}");
+    }
 
     #[test]
     fn startup_logs_working_directory_and_config_source() {

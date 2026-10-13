@@ -1,17 +1,27 @@
 [package]
 name = "kairos"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
+# 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
-fern = { version = "0.7", features = ["date-based"] }
+# 日誌按 UTC 日期分檔由 logger::DailyLogFile 處理（需要指定新檔案的權限），不使用 fern 的 date-based
+fern = "0.7"
+# 與 Pulse 共用的時鐘跳躍保護（workspace 內部 crate）
+date-guard = { path = "../crates/date-guard" }
+# 與 Pulse 共用的協定型別與驗證（workspace 內部 crate）
+kairos-proto = { path = "../crates/kairos-proto" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log = "0.4"
+# report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
+# 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 # 檢查 mTLS 客戶端憑證的 SAN；與 rustls 依賴的版本相同，只啟用 alloc（不引入其他加密後端）
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }

@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_rustls::rustls::pki_types::UnixTime;
 
+use crate::expiry::ExpiryWarner;
 use crate::registry::{KickReason, Registry};
 use crate::shutdown::{self, Shutdown};
 use crate::tls::{self, ChainRejection, Fingerprint, TlsFileKind, TlsMaterial, TlsPaths, TlsState};
@@ -163,11 +164,13 @@ pub fn revalidate(
     kicked
 }
 
-/// 重載工作：每 `period` 檢查一次，直到關機
+/// 重載工作：每 `period` 檢查一次，直到關機。每個週期也檢查伺服器憑證與 CRL 的到期預警（O1），
+/// 套用新設定時一律記錄仍在預警期間內的項目
 pub async fn run(
     reloader: Reloader,
     registry: Arc<Registry>,
     state: Arc<TlsState>,
+    expiry: ExpiryWarner,
     period: Duration,
     shutdown: Arc<Shutdown>,
 ) {
@@ -175,6 +178,7 @@ pub async fn run(
         reloader,
         registry,
         state,
+        expiry,
         period,
         shutdown,
         CHECK_WAIT.min(period),
@@ -186,6 +190,7 @@ async fn run_with_wait(
     reloader: Reloader,
     registry: Arc<Registry>,
     state: Arc<TlsState>,
+    mut expiry: ExpiryWarner,
     period: Duration,
     shutdown: Arc<Shutdown>,
     check_wait: Duration,
@@ -255,22 +260,35 @@ async fn run_with_wait(
         };
 
         let material = state.current();
+        let reloaded = matches!(outcome, ReloadOutcome::Reloaded(_));
         match outcome {
             ReloadOutcome::Unchanged => {}
-            ReloadOutcome::Reloaded(changed) => info!(
-                "已重新載入 TLS 設定（變更：{}；mTLS：{}，CRL {} 份）",
-                describe_kinds(&changed),
-                if material.auth_enabled() {
-                    "啟用"
-                } else {
-                    "未啟用"
-                },
-                material.crl_count
-            ),
+            ReloadOutcome::Reloaded(changed) => {
+                info!(
+                    "已重新載入 TLS 設定（變更：{}；mTLS：{}，CRL {} 份）",
+                    describe_kinds(&changed),
+                    if material.auth_enabled() {
+                        "啟用"
+                    } else {
+                        "未啟用"
+                    },
+                    material.crl_count
+                );
+                // 換了私鑰時再檢查一次權限（S8）
+                if changed.contains(&TlsFileKind::Key)
+                    && let Some(message) =
+                        crate::fsperm::key_permission_warning(std::path::Path::new(&paths.key))
+                {
+                    warn!("{}", message);
+                }
+            }
             ReloadOutcome::Failed(e) => {
                 error!("重新載入 TLS 設定失敗，繼續使用目前的設定: {}", e)
             }
         }
+
+        // 到期預警（O1）：套用新設定時一律記錄仍在預警期間內的項目，其餘依各項目的提醒間隔
+        expiry.check_and_log(&material.expiries, reloaded);
 
         let registry_for_check = registry.clone();
         let joined = tokio::task::spawn_blocking(move || {
@@ -367,6 +385,13 @@ mod tests {
         }
     }
 
+    fn test_warner() -> ExpiryWarner {
+        ExpiryWarner::new(crate::expiry::ExpiryPolicy {
+            cert_warning_days: 30,
+            crl_warning_days: 7,
+        })
+    }
+
     fn chain(name: &str) -> ClientChain {
         Arc::from(vec![CertificateDer::from_pem_file(pki(name)).unwrap()])
     }
@@ -376,6 +401,8 @@ mod tests {
             agent_id: agent_id.into(),
             hostname: "h".into(),
             agent_version: "1".into(),
+            proto: 1,
+            host: None,
             peer: "p".into(),
             offline_after: Duration::from_secs(5),
             client_chain: chain,
@@ -401,6 +428,35 @@ mod tests {
         assert_ne!(Arc::as_ptr(&state.current()), before);
         // 再檢查一次：沒有新變化
         assert!(matches!(r.check(), ReloadOutcome::Unchanged));
+    }
+
+    #[test]
+    fn reload_refreshes_expiry_dates() {
+        // O1：重載後到期預警使用新的 CRL；CRL 從清單消失時不再列入
+        let fx = Fixture::new("expiry");
+        let (mut r, state) = fx.reloader();
+        let crl_path = fx.paths.crls[0].clone();
+        let has_crl = |state: &TlsState| {
+            state
+                .current()
+                .expiries
+                .iter()
+                .any(|e| e.kind == crate::expiry::ExpiryKind::Crl && e.path == crl_path)
+        };
+        assert!(has_crl(&state));
+        // 檔案內含兩份 CRL：各自列入（第 2 份的 index 為 1）
+        let a = std::fs::read(pki("crl-revoke-a.crl")).unwrap();
+        let b = std::fs::read(pki("crl-empty.crl")).unwrap();
+        std::fs::write(fx.dir.join("crl.crl"), [a, b].concat()).unwrap();
+        assert!(matches!(r.check(), ReloadOutcome::Reloaded(_)));
+        let indexes: Vec<usize> = state
+            .current()
+            .expiries
+            .iter()
+            .filter(|e| e.kind == crate::expiry::ExpiryKind::Crl)
+            .map(|e| e.index)
+            .collect();
+        assert_eq!(indexes, [0, 1]);
     }
 
     #[test]
@@ -524,6 +580,7 @@ mod tests {
             r,
             registry.clone(),
             state.clone(),
+            test_warner(),
             Duration::from_millis(30),
             stop.clone(),
         ));
@@ -562,6 +619,7 @@ mod tests {
             r,
             registry.clone(),
             state.clone(),
+            test_warner(),
             Duration::from_millis(30),
             stop.clone(),
             Duration::from_millis(20),

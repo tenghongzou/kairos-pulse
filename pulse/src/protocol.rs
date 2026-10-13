@@ -1,137 +1,41 @@
-//! Pulse ↔ Kairos 協定訊息定義（共同規格 v1）。
+//! Pulse ↔ Kairos 協定訊息（共同規格 v1、v2）：Pulse 端的輔助函式。
 //!
-//! 傳輸為 NDJSON：一行一則 JSON 物件。欄位名稱與 `type` 值為定案，請勿更改。
-//! 解析時忽略未知欄位（不使用 `deny_unknown_fields`）。
+//! 訊息型別、序列化與欄位驗證在兩個產品共用的 `kairos-proto` crate（規格見
+//! `crates/kairos-proto/PROTOCOL.md`），這裡重新匯出 Pulse 用到的部分，呼叫端仍以
+//! `crate::protocol::…` 取用。傳輸為 NDJSON：一行一則 JSON 物件，欄位名稱與 `type` 值為定案；
+//! 解析時忽略未知欄位。
 
-use chrono::{SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, SecondsFormat, Utc};
 
-/// 目前的協定版本。
-pub const PROTO_VERSION: u32 = 1;
+pub use kairos_proto::{
+    ClientMsg, DurableSeq, FEATURE_DURABLE, FEATURE_METRICS, HelloExt, HostInfo, MAX_LINE_LENGTH,
+    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, Proto, ProtoOffer,
+    ReportBody, SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, is_forbidden_display_char,
+    parse_server_msg,
+};
 
-/// 單行 NDJSON 的最大長度（bytes）。
-pub const MAX_LINE_LENGTH: usize = 65536;
+use crate::system_info::Sample;
 
-/// Client（Pulse）→ Server（Kairos）的訊息。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMsg {
-    Hello {
-        seq: u64,
-        proto: u32,
-        agent_id: String,
-        hostname: String,
-        agent_version: String,
-        heartbeat_interval_ms: u64,
-        ts: String,
-    },
-    Heartbeat {
-        seq: u64,
-        ts: String,
-    },
-    Report {
-        seq: u64,
-        ts: String,
-        /// 全機 CPU 平均使用率（%，0～100）；以 [`report_cpu_usage`] 產生（已四捨五入到小數 2 位）。
-        /// 型別用 f64：f32 直接序列化會出現 `7.5000005` 這類精度雜訊
-        cpu_usage: f64,
-        /// 總記憶體（MB）
-        total_memory: u64,
-        /// 已使用記憶體（MB）
-        used_memory: u64,
-    },
-}
+/// Pulse 支援的功能（與 Kairos 相同的一組）。`durable` 只在啟用本機緩衝時於 hello 宣告
+/// （見 [`hello_features`]）
+pub const CLIENT_FEATURES: &[&str] = &[FEATURE_METRICS, FEATURE_DURABLE];
 
-/// Server（Kairos）→ Client（Pulse）的訊息。
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMsg {
-    HelloAck {
-        seq: u64,
-        proto: u32,
-        offline_after_ms: u64,
-    },
-    Ack {
-        seq: u64,
-    },
-    /// 欄位缺漏時仍視為 error，不整則忽略：缺 `seq` → null、缺 `code` / `message` → 空字串、
-    /// 缺 `fatal` → 視為 fatal（保守處理：結束連線並退避重連）。
-    Error {
-        #[serde(default)]
-        seq: Option<u64>,
-        #[serde(default)]
-        code: String,
-        #[serde(default)]
-        message: String,
-        #[serde(default = "fatal_by_default")]
-        fatal: bool,
-    },
-}
-
-/// error 訊息缺少 `fatal` 欄位時的預設值。
-fn fatal_by_default() -> bool {
-    true
-}
-
-/// Unicode 一般類別 Cf（格式字元，例如 U+200B 零寬空格、U+202E 由右至左覆寫、U+FEFF BOM）
-/// 的所有碼位範圍（Unicode 15.1）。std 沒有提供一般類別查詢，這裡直接列表。
-///
-/// 與 Kairos `protocol.rs` 的同名表完全相同：Kairos 拒絕 hostname / agent_version 含這些字元，
-/// 兩邊必須一致，否則 Pulse 會因 `bad_request` 無法註冊。
-const FORMAT_CHAR_RANGES: &[(u32, u32)] = &[
-    (0x00AD, 0x00AD),
-    (0x0600, 0x0605),
-    (0x061C, 0x061C),
-    (0x06DD, 0x06DD),
-    (0x070F, 0x070F),
-    (0x0890, 0x0891),
-    (0x08E2, 0x08E2),
-    (0x180E, 0x180E),
-    (0x200B, 0x200F),
-    (0x202A, 0x202E),
-    (0x2060, 0x2064),
-    (0x2066, 0x206F),
-    (0xFEFF, 0xFEFF),
-    (0xFFF9, 0xFFFB),
-    (0x110BD, 0x110BD),
-    (0x110CD, 0x110CD),
-    (0x13430, 0x1343F),
-    (0x1BCA0, 0x1BCA3),
-    (0x1D173, 0x1D17A),
-    (0xE0001, 0xE0001),
-    (0xE0020, 0xE007F),
-];
-
-/// Cf 以外、但同樣不可見或可用來偽裝外觀的碼位（R2-K23，與 Kairos 同步）：
-/// U+034F 組合字形連接符、Hangul filler（U+115F、U+1160、U+3164、U+FFA0）、
-/// 變體選擇字元（U+FE00–U+FE0F、U+E0100–U+E01EF）與私用區
-/// （U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD）。
-const INVISIBLE_OR_PRIVATE_RANGES: &[(u32, u32)] = &[
-    (0x034F, 0x034F),
-    (0x115F, 0x1160),
-    (0x3164, 0x3164),
-    (0xE000, 0xF8FF),
-    (0xFE00, 0xFE0F),
-    (0xFFA0, 0xFFA0),
-    (0xE0100, 0xE01EF),
-    (0xF0000, 0xFFFFD),
-    (0x100000, 0x10FFFD),
-];
-
-/// 不得出現在顯示用字串（hello 的 hostname / agent_version、日誌）中的字元：
-/// 控制字元（Cc）、格式字元（Cf）、行分隔（Zl, U+2028）、段落分隔（Zp, U+2029），
-/// 以及 [`INVISIBLE_OR_PRIVATE_RANGES`]（Hangul filler、變體選擇字元、私用區等）。
-/// 規則與 Kairos 的 `is_forbidden_display_char` 相同。
-pub fn is_forbidden_display_char(c: char) -> bool {
-    if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
-        return true;
-    }
-    let cp = u32::from(c);
-    FORMAT_CHAR_RANGES
+/// hello 宣告的功能：停用本機緩衝（`buffer.enabled = false`）時不宣告 `durable`
+pub fn hello_features(durable: bool) -> Vec<String> {
+    CLIENT_FEATURES
         .iter()
-        .chain(INVISIBLE_OR_PRIVATE_RANGES)
-        .any(|&(lo, hi)| (lo..=hi).contains(&cp))
+        .filter(|f| durable || **f != FEATURE_DURABLE)
+        .map(|f| f.to_string())
+        .collect()
 }
+
+/// 本機時鐘與伺服器相差超過此值時記 WARN（設計包 PF03 的時鐘檢查門檻）
+pub const MAX_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+// `heartbeat.interval` 的設定上限（秒）必須與伺服器的夾值上限一致（PROTOCOL.md「hello 欄位限制」）
+const _: () = assert!(
+    crate::config_manager::MAX_HEARTBEAT_INTERVAL * 1000 == kairos_proto::MAX_HEARTBEAT_INTERVAL_MS
+);
 
 /// 目前時間，RFC 3339 UTC 毫秒格式（例如 `2026-10-08T03:15:40.001Z`）。
 pub fn now_ts() -> String {
@@ -152,74 +56,135 @@ pub fn sanitize_cpu_usage(cpu: f32) -> f32 {
 ///
 /// 在 f64 上以「乘 100 → round → 除以 100」計算，結果是最接近 `n / 100` 的 f64，
 /// serde_json 以最短表示法輸出，因此 JSON 中最多只有 2 位小數（例如 f32 的 `7.5000005` → `7.5`）。
-/// 結果仍是 0～100 的有限值，符合 PROTOCOL.md 的範圍。
+/// 結果仍是 0～100 的有限值，符合 PROTOCOL.md 的範圍（Kairos 端的驗證見 `kairos_proto::validate_report`）。
 pub fn report_cpu_usage(cpu: f32) -> f64 {
     let cpu = f64::from(sanitize_cpu_usage(cpu));
     ((cpu * 100.0).round() / 100.0).clamp(0.0, 100.0)
 }
 
+/// hello_ack 的 `server_time` 與本機時間相差超過 [`MAX_CLOCK_SKEW`] 時的警告文字。
+/// 無法解析時不警告（`server_time` 只供參考，不影響連線）。
+pub fn clock_skew_warning(server_time: &str, now: DateTime<Utc>) -> Option<String> {
+    let server = DateTime::parse_from_rfc3339(server_time)
+        .ok()?
+        .with_timezone(&Utc);
+    let skew = now - server;
+    if skew.abs() <= MAX_CLOCK_SKEW {
+        return None;
+    }
+    let (direction, secs) = if skew > chrono::TimeDelta::zero() {
+        ("快", skew.num_seconds())
+    } else {
+        ("慢", -skew.num_seconds())
+    };
+    Some(format!(
+        "本機時鐘比伺服器{direction}約 {secs} 秒（伺服器時間 {}）：report 的 ts 與日誌時間會不準確，\
+         日後的憑證自動註冊也會因時鐘偏差被拒，請檢查本機的時間同步（NTP）",
+        server.to_rfc3339_opts(SecondsFormat::Millis, true)
+    ))
+}
+
+/// 依協商結果組出 report 訊息，並回傳 debug 日誌用的摘要。
+///
+/// - 沒有協商 `metrics`（v1 Kairos、或 v2 但未宣告）：`cpu_usage`／`total_memory`／`used_memory`
+/// - 協商了 `metrics`：CPU、記憶體三個標準指標加上磁碟、網路、溫度（A4）。整行超過單行上限時，
+///   捨去後面的磁碟、網路、溫度指標（CPU 與記憶體一定保留）
+/// - `durable`：協商了 durable 時附上緩衝記錄的 `boot_id`／`report_seq`（A5）。同一筆取樣在同一種
+///   格式下組出的內容固定，重送時與第一次送出的相同
+pub fn report_message(
+    seq: u64,
+    sample: Sample,
+    session: Session,
+    durable: Option<DurableSeq>,
+) -> (ClientMsg, String) {
+    let with_durable = |body: ReportBody| match &durable {
+        Some(d) => body.with_durable(d.clone()),
+        None => body,
+    };
+    // 四捨五入到小數 2 位（f64），JSON 中不會出現 f32 的精度雜訊
+    let cpu_usage = report_cpu_usage(sample.cpu_usage);
+    if !session.metrics {
+        let summary = format!(
+            "CPU {cpu_usage:.2}%，記憶體 {}/{} MB",
+            sample.used_memory, sample.total_memory
+        );
+        let msg = ClientMsg::Report {
+            seq,
+            ts: sample.ts,
+            body: with_durable(ReportBody::legacy(
+                cpu_usage,
+                sample.total_memory,
+                sample.used_memory,
+            )),
+        };
+        return (msg, summary);
+    }
+    let core = [
+        Metric::new(
+            METRIC_CPU_USAGE,
+            serde_json::Number::from_f64(cpu_usage).unwrap_or_else(|| 0.into()),
+            "%",
+        ),
+        Metric::new(METRIC_MEMORY_TOTAL, sample.total_memory_bytes, "By"),
+        // used 不得大於 total（Kairos 會回 invalid_report）
+        Metric::new(
+            METRIC_MEMORY_USED,
+            sample.used_memory_bytes.min(sample.total_memory_bytes),
+            "By",
+        ),
+    ];
+    let mut extra = sample.extra;
+    let total_extra = extra.len();
+    let build = |extra: &[Metric]| ClientMsg::Report {
+        seq,
+        ts: sample.ts.clone(),
+        body: with_durable(ReportBody::metrics(
+            core.iter().chain(extra).cloned().collect(),
+        )),
+    };
+    let mut msg = build(&extra);
+    while !extra.is_empty() && serialized_len(&msg) > MAX_LINE_LENGTH {
+        extra.truncate(extra.len() / 2);
+        msg = build(&extra);
+    }
+    let mut summary = format!(
+        "CPU {cpu_usage:.2}%，記憶體 {}/{} MB，共 {} 個指標",
+        sample.used_memory,
+        sample.total_memory,
+        core.len() + extra.len()
+    );
+    if extra.len() < total_extra {
+        summary.push_str(&format!(
+            "；超過單行上限，捨去 {} 個磁碟／網路／溫度指標",
+            total_extra - extra.len()
+        ));
+    }
+    (msg, summary)
+}
+
+/// 序列化後的長度（無法序列化時視為超長）
+fn serialized_len(msg: &ClientMsg) -> usize {
+    serde_json::to_string(msg).map_or(usize::MAX, |l| l.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
-    // 下列 serialize_* / deserialize_hello_ack / deserialize_acks / deserialize_errors 使用的
-    // JSON 字串是 PROTOCOL.md「範例」節的測試向量（與 Kairos 的 src/protocol.rs 相同），
-    // 修改協定時兩邊一起更新。
+    // 協定測試向量（PROTOCOL.md「範例」節）的序列化與解析測試在 kairos-proto，
+    // 這裡只測 Pulse 端的輔助函式。
 
-    /// 序列化後轉成 `Value` 與測試向量比對（不比字串，避免欄位順序差異）。
-    /// cpu_usage 為 f64，與測試向量逐位元比對，不需容差。
-    fn assert_serializes_to(msg: &ClientMsg, expected: &str) {
-        let actual: Value = serde_json::from_str(&serde_json::to_string(msg).unwrap()).unwrap();
-        let expected: Value = serde_json::from_str(expected).unwrap();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn serialize_hello() {
-        // PROTOCOL.md「範例」節的測試向量（P hello）
-        let msg = ClientMsg::Hello {
+    /// report 序列化後的 `"cpu_usage":...` 數值字串。
+    fn serialized_cpu(cpu: f32) -> String {
+        let line = serde_json::to_string(&ClientMsg::Report {
             seq: 1,
-            proto: 1,
-            agent_id: "6f1c0e4a-1b2c-4d3e-9f00-112233445566".into(),
-            hostname: "web-01".into(),
-            agent_version: "0.1.0".into(),
-            heartbeat_interval_ms: 1000,
-            ts: "2026-10-08T03:15:40.001Z".into(),
-        };
-        assert_serializes_to(
-            &msg,
-            r#"{"type":"hello","seq":1,"proto":1,"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.1.0","heartbeat_interval_ms":1000,"ts":"2026-10-08T03:15:40.001Z"}"#,
-        );
-    }
-
-    #[test]
-    fn serialize_heartbeat() {
-        // PROTOCOL.md「範例」節的測試向量（P heartbeat）
-        let msg = ClientMsg::Heartbeat {
-            seq: 2,
-            ts: "2026-10-08T03:15:41.002Z".into(),
-        };
-        assert_serializes_to(
-            &msg,
-            r#"{"type":"heartbeat","seq":2,"ts":"2026-10-08T03:15:41.002Z"}"#,
-        );
-    }
-
-    #[test]
-    fn serialize_report() {
-        // PROTOCOL.md「範例」節的測試向量（P report）
-        let msg = ClientMsg::Report {
-            seq: 6,
-            ts: "2026-10-08T03:15:45.210Z".into(),
-            cpu_usage: 17.84,
-            total_memory: 49152,
-            used_memory: 37034,
-        };
-        assert_serializes_to(
-            &msg,
-            r#"{"type":"report","seq":6,"ts":"2026-10-08T03:15:45.210Z","cpu_usage":17.84,"total_memory":49152,"used_memory":37034}"#,
-        );
+            ts: "2026-10-09T00:00:00.000Z".into(),
+            body: ReportBody::legacy(report_cpu_usage(cpu), 2, 1),
+        })
+        .unwrap();
+        let start = line.find("\"cpu_usage\":").unwrap() + "\"cpu_usage\":".len();
+        let rest = &line[start..];
+        rest[..rest.find(',').unwrap()].to_string()
     }
 
     #[test]
@@ -234,106 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_hello_ack() {
-        // PROTOCOL.md「範例」節的測試向量（K hello_ack）
-        let msg: ServerMsg = serde_json::from_str(
-            r#"{"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            msg,
-            ServerMsg::HelloAck {
-                seq: 1,
-                proto: 1,
-                offline_after_ms: 5000
-            }
-        );
-    }
-
-    #[test]
-    fn deserialize_acks() {
-        // PROTOCOL.md「範例」節的測試向量（K ack seq=2 / seq=6）
-        let msg: ServerMsg = serde_json::from_str(r#"{"type":"ack","seq":2}"#).unwrap();
-        assert_eq!(msg, ServerMsg::Ack { seq: 2 });
-        let msg: ServerMsg = serde_json::from_str(r#"{"type":"ack","seq":6}"#).unwrap();
-        assert_eq!(msg, ServerMsg::Ack { seq: 6 });
-    }
-
-    #[test]
-    fn deserialize_errors() {
-        // PROTOCOL.md「範例」節「錯誤範例」的測試向量
-        let msg: ServerMsg = serde_json::from_str(
-            r#"{"type":"error","seq":1,"code":"unsupported_version","message":"supported proto: 1","fatal":true}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            msg,
-            ServerMsg::Error {
-                seq: Some(1),
-                code: "unsupported_version".into(),
-                message: "supported proto: 1".into(),
-                fatal: true
-            }
-        );
-
-        let msg: ServerMsg = serde_json::from_str(
-            r#"{"type":"error","seq":null,"code":"unknown_type","message":"unknown message type","fatal":false}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            msg,
-            ServerMsg::Error {
-                seq: None,
-                code: "unknown_type".into(),
-                message: "unknown message type".into(),
-                fatal: false
-            }
-        );
-    }
-
-    #[test]
-    fn error_with_missing_fields_is_not_ignored() {
-        // P4：缺 message / fatal 也要能解析；缺 fatal 視為 fatal
-        let msg: ServerMsg =
-            serde_json::from_str(r#"{"type":"error","seq":3,"code":"auth_failed"}"#).unwrap();
-        assert_eq!(
-            msg,
-            ServerMsg::Error {
-                seq: Some(3),
-                code: "auth_failed".into(),
-                message: String::new(),
-                fatal: true
-            }
-        );
-        let msg: ServerMsg = serde_json::from_str(r#"{"type":"error"}"#).unwrap();
-        assert_eq!(
-            msg,
-            ServerMsg::Error {
-                seq: None,
-                code: String::new(),
-                message: String::new(),
-                fatal: true
-            }
-        );
-        // 明確給 fatal:false 時照給的值
-        let msg: ServerMsg =
-            serde_json::from_str(r#"{"type":"error","code":"unknown_type","fatal":false}"#)
-                .unwrap();
-        assert!(matches!(msg, ServerMsg::Error { fatal: false, .. }));
-        // 型別錯誤仍是解析失敗
-        assert!(
-            serde_json::from_str::<ServerMsg>(r#"{"type":"error","code":1,"fatal":true}"#).is_err()
-        );
-    }
-
-    #[test]
-    fn unknown_fields_are_ignored() {
-        let msg: ServerMsg =
-            serde_json::from_str(r#"{"type":"ack","seq":3,"future_field":"x"}"#).unwrap();
-        assert_eq!(msg, ServerMsg::Ack { seq: 3 });
-    }
-
-    #[test]
     fn cpu_usage_is_sanitized() {
         assert_eq!(sanitize_cpu_usage(17.84), 17.84);
         assert_eq!(sanitize_cpu_usage(0.0), 0.0);
@@ -343,21 +208,6 @@ mod tests {
         assert_eq!(sanitize_cpu_usage(f32::NAN), 0.0);
         assert_eq!(sanitize_cpu_usage(f32::INFINITY), 0.0);
         assert_eq!(sanitize_cpu_usage(f32::NEG_INFINITY), 0.0);
-    }
-
-    /// report 序列化後的 `"cpu_usage":...` 數值字串。
-    fn serialized_cpu(cpu: f32) -> String {
-        let line = serde_json::to_string(&ClientMsg::Report {
-            seq: 1,
-            ts: "2026-10-09T00:00:00.000Z".into(),
-            cpu_usage: report_cpu_usage(cpu),
-            total_memory: 2,
-            used_memory: 1,
-        })
-        .unwrap();
-        let start = line.find("\"cpu_usage\":").unwrap() + "\"cpu_usage\":".len();
-        let rest = &line[start..];
-        rest[..rest.find(',').unwrap()].to_string()
     }
 
     #[test]
@@ -391,81 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_display_chars_match_kairos_rules() {
-        // Cc
-        for c in ['\u{0}', '\n', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}'] {
-            assert!(is_forbidden_display_char(c), "{c:?}");
-        }
-        // Cf（表的頭尾與中間各取樣）與 Zl / Zp
-        for c in [
-            '\u{ad}',
-            '\u{600}',
-            '\u{605}',
-            '\u{61c}',
-            '\u{200b}',
-            '\u{200f}',
-            '\u{202a}',
-            '\u{202e}',
-            '\u{2066}',
-            '\u{206f}',
-            '\u{feff}',
-            '\u{fffb}',
-            '\u{110bd}',
-            '\u{1343f}',
-            '\u{e0001}',
-            '\u{e007f}',
-            '\u{2028}',
-            '\u{2029}',
-        ] {
-            assert!(is_forbidden_display_char(c), "{c:?}");
-        }
-        // 範圍邊界外與一般字元
-        for c in [
-            'a',
-            ' ',
-            '-',
-            '主',
-            'é',
-            '\u{ac}',
-            '\u{ae}',
-            '\u{606}',
-            '\u{2010}',
-            '\u{2065}',
-            '\u{2070}',
-            '\u{fffc}',
-            '\u{e0002}',
-            '\u{e0080}',
-        ] {
-            assert!(!is_forbidden_display_char(c), "{c:?}");
-        }
-        // 表需由小到大排列且不重疊（與 Kairos 相同的整理方式，方便逐行比對）
-        for table in [FORMAT_CHAR_RANGES, INVISIBLE_OR_PRIVATE_RANGES] {
-            assert!(table.windows(2).all(|w| w[0].1 < w[1].0));
-            assert!(table.iter().all(|&(lo, hi)| lo <= hi));
-        }
-    }
-
-    #[test]
-    fn invisible_fillers_selectors_and_private_use_are_forbidden() {
-        // R2-K23：每個範圍的頭尾都禁止
-        for cp in [
-            0x034F, 0x115F, 0x1160, 0x3164, 0xE000, 0xF8FF, 0xFE00, 0xFE0F, 0xFFA0, 0xE0100,
-            0xE01EF, 0xF0000, 0xFFFFD, 0x100000, 0x10FFFD,
-        ] {
-            let c = char::from_u32(cp).unwrap();
-            assert!(is_forbidden_display_char(c), "U+{cp:04X}");
-        }
-        // 範圍外緊鄰的碼位不受影響
-        for cp in [
-            0x034E, 0x0350, 0x115E, 0x1161, 0x3163, 0x3165, 0xF900, 0xFDFF, 0xFE10, 0xFF9F, 0xFFA1,
-            0xE00FF, 0xE01F0, 0xEFFFF, 0xFFFFE, 0x10FFFE,
-        ] {
-            let c = char::from_u32(cp).unwrap();
-            assert!(!is_forbidden_display_char(c), "U+{cp:04X}");
-        }
-    }
-
-    #[test]
     fn agent_version_has_no_forbidden_chars() {
         // agent_version 取自編譯時的 CARGO_PKG_VERSION（semver），不會含禁止字元
         let v = env!("CARGO_PKG_VERSION");
@@ -480,5 +255,170 @@ mod tests {
         assert_eq!(ts.len(), 24, "{ts}");
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[19..20], ".");
+    }
+
+    fn sample(extra: Vec<Metric>) -> Sample {
+        Sample {
+            ts: "2026-10-09T00:00:00.000Z".into(),
+            cpu_usage: 7.500_000_5,
+            total_memory: 49152,
+            used_memory: 37034,
+            total_memory_bytes: 51_539_607_552,
+            used_memory_bytes: 38_833_356_800,
+            extra,
+        }
+    }
+
+    fn to_value(msg: &ClientMsg) -> serde_json::Value {
+        serde_json::to_value(msg).unwrap()
+    }
+
+    #[test]
+    fn v1_session_sends_the_three_fields() {
+        let fs = Metric::new("system.filesystem.total", 1, "By").with_label("mountpoint", "/");
+        let (msg, summary) = report_message(3, sample(vec![fs]), Session::V1, None);
+        assert_eq!(
+            to_value(&msg),
+            serde_json::json!({"type":"report","seq":3,"ts":"2026-10-09T00:00:00.000Z",
+                "cpu_usage":7.5,"total_memory":49152,"used_memory":37034})
+        );
+        assert_eq!(summary, "CPU 7.50%，記憶體 37034/49152 MB");
+        // v2 但沒有協商 metrics：同 v1
+        let (msg, _) = report_message(
+            3,
+            sample(vec![]),
+            Session {
+                proto: 2,
+                metrics: false,
+                durable: false,
+            },
+            None,
+        );
+        assert!(to_value(&msg).get("metrics").is_none());
+    }
+
+    #[test]
+    fn durable_report_carries_boot_id_and_report_seq_and_is_reproducible() {
+        // A5：重送時 boot_id、report_seq、ts 與內容都不變（只有 seq 不同）
+        let durable = DurableSeq {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq: 42,
+        };
+        let session = Session {
+            proto: 2,
+            metrics: true,
+            durable: true,
+        };
+        let fs = Metric::new("system.temperature", 40, "Cel");
+        let (first, _) =
+            report_message(3, sample(vec![fs.clone()]), session, Some(durable.clone()));
+        let (again, _) = report_message(9, sample(vec![fs]), session, Some(durable.clone()));
+        let mut a = to_value(&first);
+        let mut b = to_value(&again);
+        assert_eq!(
+            (&a["boot_id"], &a["report_seq"]),
+            (&serde_json::json!(durable.boot_id), &serde_json::json!(42))
+        );
+        a.as_object_mut().unwrap().remove("seq");
+        b.as_object_mut().unwrap().remove("seq");
+        assert_eq!(a, b);
+        // v1 格式也可以帶（durable 與 metrics 各自協商）
+        let (msg, _) = report_message(1, sample(vec![]), Session::V1, Some(durable));
+        let v = to_value(&msg);
+        assert!(v.get("cpu_usage").is_some() && v["report_seq"] == 42, "{v}");
+        // 停用本機緩衝時不宣告 durable
+        assert_eq!(hello_features(true), vec!["metrics", "durable"]);
+        assert_eq!(hello_features(false), vec!["metrics"]);
+    }
+
+    #[test]
+    fn metrics_session_sends_standard_and_extra_metrics() {
+        let fs = Metric::new("system.filesystem.total", 1000, "By").with_label("mountpoint", "/");
+        let session = Session {
+            proto: 2,
+            metrics: true,
+            durable: false,
+        };
+        let (msg, summary) = report_message(4, sample(vec![fs]), session, None);
+        let v = to_value(&msg);
+        assert!(v.get("cpu_usage").is_none(), "{v}");
+        assert_eq!(
+            v["metrics"],
+            serde_json::json!([
+                {"name":"system.cpu.usage","value":7.5,"unit":"%"},
+                {"name":"system.memory.total","value":51_539_607_552_u64,"unit":"By"},
+                {"name":"system.memory.used","value":38_833_356_800_u64,"unit":"By"},
+                {"name":"system.filesystem.total","value":1000,"unit":"By","labels":{"mountpoint":"/"}}
+            ])
+        );
+        assert!(summary.ends_with("共 4 個指標"), "{summary}");
+        let ClientMsg::Report { body, .. } = &msg else {
+            unreachable!()
+        };
+        kairos_proto::validate_metrics(body.metric_list().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oversized_metrics_are_trimmed_to_the_line_limit() {
+        // 256 bytes 的 label × 250 個 ≈ 80 KB > 65536：捨去後面的指標，CPU 與記憶體一定保留
+        let extra: Vec<Metric> = (0..250)
+            .map(|i| {
+                Metric::new("system.temperature", i, "Cel")
+                    .with_label("sensor", format!("{i:03}{}", "x".repeat(250)))
+            })
+            .collect();
+        let session = Session {
+            proto: 2,
+            metrics: true,
+            durable: false,
+        };
+        let (msg, summary) = report_message(5, sample(extra), session, None);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(line.len() <= MAX_LINE_LENGTH, "{}", line.len());
+        let v = to_value(&msg);
+        let metrics = v["metrics"].as_array().unwrap();
+        assert!(
+            metrics.len() > 3 && metrics.len() < 253,
+            "{}",
+            metrics.len()
+        );
+        assert_eq!(metrics[0]["name"], "system.cpu.usage");
+        assert!(summary.contains("超過單行上限"), "{summary}");
+    }
+
+    #[test]
+    fn used_memory_metric_never_exceeds_total() {
+        let mut s = sample(vec![]);
+        s.used_memory_bytes = s.total_memory_bytes + 1;
+        let session = Session {
+            proto: 2,
+            metrics: true,
+            durable: false,
+        };
+        let (msg, _) = report_message(1, s, session, None);
+        let ClientMsg::Report { body, .. } = &msg else {
+            unreachable!()
+        };
+        kairos_proto::validate_metrics(body.metric_list().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clock_skew_is_reported_beyond_five_minutes() {
+        let now = DateTime::parse_from_rfc3339("2026-10-08T03:15:40.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(clock_skew_warning("2026-10-08T03:15:40.012Z", now), None);
+        assert_eq!(clock_skew_warning("2026-10-08T03:20:40.000Z", now), None);
+        assert_eq!(clock_skew_warning("2026-10-08T03:10:40.000Z", now), None);
+        let slow = clock_skew_warning("2026-10-08T03:25:40.000Z", now).unwrap();
+        assert!(slow.starts_with("本機時鐘比伺服器慢約 600 秒"), "{slow}");
+        let fast = clock_skew_warning("2026-10-08T03:05:39.000Z", now).unwrap();
+        assert!(fast.starts_with("本機時鐘比伺服器快約 601 秒"), "{fast}");
+        // 其他時區的表示也接受；無法解析時不警告
+        assert_eq!(
+            clock_skew_warning("2026-10-08T11:15:40.000+08:00", now),
+            None
+        );
+        assert_eq!(clock_skew_warning("not a time", now), None);
     }
 }

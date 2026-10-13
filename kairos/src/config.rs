@@ -3,7 +3,9 @@
 use config::{Config, Environment, File, FileFormat};
 use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
+use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -29,6 +31,31 @@ pub const DEFAULT_MAX_DAILY_BYTES: u64 = 0;
 /// 估算每日 report 量時，每行 JSONL 的大小（bytes）
 pub const ESTIMATED_REPORT_LINE_BYTES: u64 = 250;
 
+/// `storage.raw_retention_days` 的預設值：原始 report 保留 7 天（今天與前 7 天）
+pub const DEFAULT_RAW_RETENTION_DAYS: u32 = 7;
+/// `storage.rollup_5m_retention_days` 的預設值
+pub const DEFAULT_ROLLUP_5M_RETENTION_DAYS: u32 = 31;
+/// `storage.rollup_1h_retention_days` 的預設值（13 個月，可做跨年同期比較）
+pub const DEFAULT_ROLLUP_1H_RETENTION_DAYS: u32 = 400;
+/// `storage.max_total_bytes` 的預設值：64 GiB（SQLite 資料庫與 WAL 合計；0 = 不限制）
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// `storage.max_total_bytes` 不為 0 時的下限（64 MiB）
+pub const MIN_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// 主機清冊筆數上限的預設值（實際為 `max(此值, limits.max_agents)`）
+pub const DEFAULT_MAX_HOSTS: usize = 100_000;
+/// `storage.max_hosts` 的最大值
+pub const MAX_MAX_HOSTS: usize = 1_000_000;
+
+/// 容量估算（`kairos/STORAGE.md`「容量估算」）：每台主機每 5 秒一筆 report
+pub const ESTIMATE_REPORT_INTERVAL_SECS: u64 = 5;
+/// 容量估算：每筆原始 report 在 SQLite 中的大小（含索引與主機、序列等；Pulse 0.2.0 的 17 個指標
+/// 實測約 235 bytes，見 STORAGE.md「量測」）
+pub const ESTIMATED_RAW_ROW_BYTES: u64 = 240;
+/// 容量估算：每台主機的序列（指標名稱＋label 組合）數
+pub const ESTIMATED_SERIES_PER_HOST: u64 = 20;
+/// 容量估算：每列彙總的大小
+pub const ESTIMATED_ROLLUP_ROW_BYTES: u64 = 50;
+
 /// 同時連線數上限的最大值
 pub const MAX_MAX_CONNECTIONS: usize = 65535;
 
@@ -39,6 +66,13 @@ pub const MAX_MAX_AGENTS: usize = 100_000;
 /// 未設定 `server.max_connections_per_ip` 時的預設值（不超過 `server.max_connections`）
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 
+/// 未設定 `server.max_connections_per_allowlisted_ip` 時的預設值（設計包 D14）。
+/// 實際生效值不超過 `server.max_connections`（D15）
+pub const DEFAULT_MAX_CONNECTIONS_PER_ALLOWLISTED_IP: usize = 4096;
+
+/// `server.max_connections_per_allowlisted_ip` 的最大值（D15）
+pub const MAX_MAX_CONNECTIONS_PER_ALLOWLISTED_IP: usize = 65535;
+
 /// 未設定 `limits.max_agents` 時的預設值（不小於 `server.max_connections`）
 pub const DEFAULT_MAX_AGENTS: usize = 10000;
 
@@ -48,10 +82,23 @@ pub const MAX_RETENTION_DAYS: u32 = 3650;
 /// TLS 熱重載檢查間隔的上限（秒；0 表示停用）
 pub const MAX_RELOAD_INTERVAL_SECS: u64 = 3600;
 
+/// `server.cert_expiry_warning_days` 的預設值：伺服器憑證到期前 30 天開始預警
+pub const DEFAULT_CERT_EXPIRY_WARNING_DAYS: u32 = 30;
+
+/// `auth.crl_expiry_warning_days` 的預設值：CRL 的 nextUpdate 前 7 天開始預警
+pub const DEFAULT_CRL_EXPIRY_WARNING_DAYS: u32 = 7;
+
+/// 到期預警天數的上限（0 表示不預警，已過期時仍記錄 ERROR）
+pub const MAX_EXPIRY_WARNING_DAYS: u32 = 365;
+
 /// `auth.crl` 以環境變數設定時的清單分隔字元
 pub const LIST_SEPARATOR: &str = ",";
 
-pub const USAGE: &str = "用法: kairos [--config <path>]\n\n\
+pub const USAGE: &str = "用法: kairos [--config <path>]\n       \
+kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\n       \
+kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
+kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）\n       \
+kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
@@ -76,11 +123,22 @@ pub struct ServerSettings {
     pub cert_path: String,
     pub key_path: String,
     pub max_connections: usize,
-    /// 同一個來源 IP 的同時連線數上限（含握手中、尚未送出 hello 的連線）。
+    /// 同一個來源 IP 位址的連線數上限。未啟用 mTLS 時計算全部連線（含握手中、尚未送出 hello 的連線）；
+    /// 啟用 mTLS 時只計算尚未通過 hello 的連線，通過後改依憑證身分計數（審計 A7，見 `per_ip` 模組）。
     /// 未設定時為 `min(32, max_connections)`，見 [`AppConfig::max_connections_per_ip`]
     pub max_connections_per_ip: Option<usize>,
+    /// 每 IP 上限的網段允許清單（CIDR，IPv4／IPv6；只寫位址表示單一位址）。清單內的位址改用
+    /// `max_connections_per_allowlisted_ip`（審計 A7 過渡方案，設計包 D14、D15）。
+    /// 也接受以 [`LIST_SEPARATOR`] 分隔的單一字串（環境變數 `KAIROS__SERVER__PER_IP_ALLOWLIST`）
+    #[serde(deserialize_with = "string_or_list")]
+    pub per_ip_allowlist: Vec<String>,
+    /// `per_ip_allowlist` 內每個位址的上限，1..=65535；未設定時為 4096。實際生效值為
+    /// `min(此值, max_connections)`，見 [`AppConfig::max_connections_per_allowlisted_ip`]
+    pub max_connections_per_allowlisted_ip: Option<usize>,
     /// 每隔幾秒檢查憑證、私鑰、客戶端 CA 與 CRL 檔是否變更（並重新驗證現役連線的客戶端憑證）；0 = 停用
     pub reload_interval_secs: u64,
+    /// 伺服器憑證到期前幾天開始記 WARN（O1）；0 = 不預警（已過期時仍記錄 ERROR）
+    pub cert_expiry_warning_days: u32,
 }
 
 impl Default for ServerSettings {
@@ -91,7 +149,10 @@ impl Default for ServerSettings {
             key_path: "key.pem".to_string(),
             max_connections: 1024,
             max_connections_per_ip: None,
+            per_ip_allowlist: Vec::new(),
+            max_connections_per_allowlisted_ip: None,
             reload_interval_secs: 30,
+            cert_expiry_warning_days: DEFAULT_CERT_EXPIRY_WARNING_DAYS,
         }
     }
 }
@@ -128,28 +189,86 @@ impl TimeoutSettings {
     }
 }
 
+/// report 的儲存後端（`storage.backend`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// SQLite（`<data_dir>/kairos.db`）：原始資料、彙總與主機清冊（A1、A6、A9）
+    #[default]
+    Sqlite,
+    /// 舊版的按日 JSONL（`reports-YYYY-MM-DD.jsonl`）；沒有主機清冊與彙總，只供相容與回復
+    Jsonl,
+}
+
+/// SQLite 的 `PRAGMA synchronous`（`storage.sqlite_synchronous`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SqliteSynchronous {
+    /// WAL 模式下 commit 只寫入作業系統（不 fsync）：行程當掉不會遺失已 `ack` 的資料，
+    /// 斷電可能遺失最後幾個交易（與 JSONL 的 flush 相同，符合 PROTOCOL.md 的 ack 語意）
+    #[default]
+    Normal,
+    /// 每次 commit 都 fsync WAL：斷電也不遺失已 `ack` 的資料，寫入延遲較高
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct StorageSettings {
     pub data_dir: String,
-    /// reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天保留），0 = 永久保留
+    /// report 的儲存後端，預設 `sqlite`
+    pub backend: StorageBackend,
+    /// `backend = "sqlite"` 時是否另外輸出 JSONL 鏡像（`reports-YYYY-MM-DD.jsonl`，盡力而為，
+    /// 不影響 `ack`）
+    pub jsonl_mirror: bool,
+    /// reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天保留），0 = 永久保留。
+    /// 只用於 JSONL（`backend = "jsonl"` 或 `jsonl_mirror = true`）
     pub retention_days: u32,
     /// 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制。達到上限後當天的 report
-    /// 不再寫入，回 `storage_unavailable`（確定未保存）
+    /// 不再寫入（`backend = "jsonl"` 時回 `storage_unavailable`；鏡像時只是不寫入鏡像）
     pub max_daily_bytes: u64,
+    /// SQLite 原始 report 的保留天數（今天與前 N 天，UTC），0 = 不依時間刪除
+    pub raw_retention_days: u32,
+    /// 5 分鐘彙總的保留天數，0 = 不依時間刪除
+    pub rollup_5m_retention_days: u32,
+    /// 1 小時彙總的保留天數，0 = 不依時間刪除
+    pub rollup_1h_retention_days: u32,
+    /// SQLite 資料庫（含 WAL）的總容量上限（bytes），0 = 不限制。超過時依序刪除最舊的原始 report、
+    /// 5 分鐘彙總、1 小時彙總，直到低於上限的 95%
+    pub max_total_bytes: u64,
+    /// SQLite 的 `PRAGMA synchronous`：`normal`（預設）或 `full`
+    pub sqlite_synchronous: SqliteSynchronous,
+    /// 主機清冊最多幾台主機（新主機超過時其 report 回 `storage_unavailable`）。未設定時為
+    /// `max(100000, limits.max_agents)`，見 [`AppConfig::max_hosts`]
+    pub max_hosts: Option<usize>,
 }
 
 impl Default for StorageSettings {
     fn default() -> Self {
         Self {
             data_dir: "data".to_string(),
+            backend: StorageBackend::Sqlite,
+            jsonl_mirror: false,
             retention_days: 30,
             max_daily_bytes: DEFAULT_MAX_DAILY_BYTES,
+            raw_retention_days: DEFAULT_RAW_RETENTION_DAYS,
+            rollup_5m_retention_days: DEFAULT_ROLLUP_5M_RETENTION_DAYS,
+            rollup_1h_retention_days: DEFAULT_ROLLUP_1H_RETENTION_DAYS,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            sqlite_synchronous: SqliteSynchronous::Normal,
+            max_hosts: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+impl StorageSettings {
+    /// 是否寫入 JSONL（主要輸出或鏡像）
+    pub fn writes_jsonl(&self) -> bool {
+        self.backend == StorageBackend::Jsonl || self.jsonl_mirror
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
     /// 非空：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 agent_id 與憑證綁定
@@ -161,6 +280,24 @@ pub struct AuthSettings {
     /// 是否接受含多個 DNS SAN 的客戶端憑證。預設 `false`：憑證必須恰好有一個 DNS SAN，
     /// 避免一張憑證同時冒用（並踢掉）多個 agent
     pub allow_multiple_dns_sans: bool,
+    /// 未啟用 mTLS（`client_ca` 為空）時，是否仍允許監聽非 loopback 位址（審計 S1）。
+    /// 預設 `false`：監聽非 loopback 位址又沒有 mTLS 時拒絕啟動，見 [`AppConfig::check_listen_auth`]。
+    /// 啟用 mTLS 時不生效
+    pub allow_unauthenticated: bool,
+    /// CRL 的下次更新時間（nextUpdate）前幾天開始記 WARN（O1）；0 = 不預警（已過期時仍記錄 ERROR）
+    pub crl_expiry_warning_days: u32,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            client_ca: String::new(),
+            crl: Vec::new(),
+            allow_multiple_dns_sans: false,
+            allow_unauthenticated: false,
+            crl_expiry_warning_days: DEFAULT_CRL_EXPIRY_WARNING_DAYS,
+        }
+    }
 }
 
 impl AuthSettings {
@@ -222,42 +359,140 @@ impl LogSettings {
     }
 }
 
+/// 是否為 loopback 位址：IPv4 `127.0.0.0/8`、IPv6 `::1`，以及 IPv4-mapped 的 `::ffff:127.0.0.0/104`。
+/// `0.0.0.0`、`::`（所有介面）與其他位址都不是
+pub fn is_loopback(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
+/// 監聽位址與客戶端驗證的組合（[`AppConfig::check_listen_auth`] 的結果，決定啟動時記錄的訊息）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenAuth {
+    /// 已啟用 mTLS
+    Mutual,
+    /// 未啟用 mTLS，但只監聽 loopback 位址（本機開發）
+    LoopbackOnly,
+    /// 未啟用 mTLS 且監聽非 loopback 位址，由 `auth.allow_unauthenticated = true` 明確允許
+    UnauthenticatedAllowed { exposed: Vec<SocketAddr> },
+}
+
 /// 命令列解析結果
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliAction {
-    Run { config_path: Option<PathBuf> },
+    Run {
+        config_path: Option<PathBuf>,
+    },
     Help,
     Version,
+    /// `kairos hosts ...`（主機清冊查詢，見 [`crate::hosts_cli`]）
+    Hosts(crate::hosts_cli::HostsCommand),
+    /// `kairos reports ...`（匯出 SQLite 中的 report，見 [`crate::export_cli`]）
+    Reports(crate::export_cli::ReportsCommand),
+    /// `kairos db ...`（資料庫的線上備份，見 [`crate::export_cli`]）
+    Db(crate::export_cli::DbCommand),
+}
+
+/// `--config=<path>` 的前綴
+const CONFIG_EQ: &str = "--config=";
+
+/// 取出 `--config=<path>` 中的路徑；不是這個形式時回傳 `None`。
+/// 路徑可以不是 UTF-8：Unix 上以位元組切開；其他平台無法安全地切開非 UTF-8 的參數，回錯誤請改用
+/// `--config <path>`
+fn strip_config_eq(arg: &OsStr) -> Option<Result<OsString, String>> {
+    if let Some(s) = arg.to_str() {
+        return s.strip_prefix(CONFIG_EQ).map(|p| Ok(OsString::from(p)));
+    }
+    if !arg.as_encoded_bytes().starts_with(CONFIG_EQ.as_bytes()) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(Ok(
+            OsStr::from_bytes(&arg.as_bytes()[CONFIG_EQ.len()..]).to_os_string()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(Err(format!(
+            "--config= 後的路徑含有無法辨識的字元（不是有效的 Unicode）: {}；請改用 --config <path>",
+            arg.to_string_lossy()
+        )))
+    }
 }
 
 /// 解析命令列參數（不含程式名稱）。只支援 `--config <path>`、`--config=<path>`、`-V/--version`
 /// 與 `-h/--help`。
-pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, String> {
+///
+/// 參數以 `OsString` 接收（`std::env::args_os()`；審計 Q5）：`std::env::args()` 遇到非 UTF-8 的參數
+/// 會 panic。設定檔路徑可以不是 UTF-8；其他非 UTF-8 的參數回錯誤（訊息中以 U+FFFD 取代無法辨識的部分）。
+pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction, String> {
     let mut config_path = None;
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
+    if iter.peek().is_some_and(|a| a == "hosts") {
+        iter.next();
+        return crate::hosts_cli::parse_args(iter).map(CliAction::Hosts);
+    }
+    if iter.peek().is_some_and(|a| a == "reports") {
+        iter.next();
+        return crate::export_cli::parse_args(iter).map(CliAction::Reports);
+    }
+    if iter.peek().is_some_and(|a| a == "db") {
+        iter.next();
+        return crate::export_cli::parse_db_args(iter).map(CliAction::Db);
+    }
     while let Some(arg) = iter.next() {
         let path = if arg == "--config" {
             match iter.next() {
                 Some(p) if !p.is_empty() => p,
                 _ => return Err("--config 需要指定設定檔路徑".to_string()),
             }
-        } else if let Some(p) = arg.strip_prefix("--config=") {
+        } else if let Some(p) = strip_config_eq(&arg) {
+            let p = p?;
             if p.is_empty() {
                 return Err("--config 需要指定設定檔路徑".to_string());
             }
-            p.to_string()
+            p
         } else if arg == "-h" || arg == "--help" {
             return Ok(CliAction::Help);
         } else if arg == "-V" || arg == "--version" {
             return Ok(CliAction::Version);
+        } else if arg.to_str().is_none() {
+            return Err(format!(
+                "無法辨識的參數（含有不是有效 Unicode 的字元）: {}",
+                arg.to_string_lossy()
+            ));
         } else {
-            return Err(format!("無法辨識的參數: {}", arg));
+            return Err(format!("無法辨識的參數: {}", arg.to_string_lossy()));
         };
         if config_path.replace(PathBuf::from(path)).is_some() {
             return Err("--config 只能指定一次".to_string());
         }
     }
     Ok(CliAction::Run { config_path })
+}
+
+/// 解析 `--config <path>`／`--config=<path>`（子命令共用）：`arg` 是這個選項時回傳路徑，
+/// 不是時回傳 `Ok(None)`
+pub fn take_config_arg(
+    arg: &OsStr,
+    rest: &mut impl Iterator<Item = OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let path = if arg == "--config" {
+        match rest.next() {
+            Some(p) if !p.is_empty() => p,
+            _ => return Err("--config 需要指定設定檔路徑".to_string()),
+        }
+    } else if let Some(p) = strip_config_eq(arg) {
+        let p = p?;
+        if p.is_empty() {
+            return Err("--config 需要指定設定檔路徑".to_string());
+        }
+        p
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(PathBuf::from(path)))
 }
 
 /// 字串清單：接受陣列，或以 [`LIST_SEPARATOR`] 分隔的單一字串
@@ -294,6 +529,50 @@ impl AppConfig {
             .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP.min(self.server.max_connections))
     }
 
+    /// 解析後的 `server.per_ip_allowlist`
+    pub fn per_ip_allowlist(&self) -> Result<crate::per_ip::Allowlist, Error> {
+        crate::per_ip::Allowlist::parse(&self.server.per_ip_allowlist)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e))
+    }
+
+    /// `server.max_connections_per_allowlisted_ip` 的設定值（未設定時為內建預設 4096）
+    pub fn configured_max_connections_per_allowlisted_ip(&self) -> usize {
+        self.server
+            .max_connections_per_allowlisted_ip
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_ALLOWLISTED_IP)
+    }
+
+    /// 允許清單內每個位址的實際上限：`min(server.max_connections_per_allowlisted_ip, server.max_connections)`
+    /// （同一個位址的連線也算在全部連線之內；D15）
+    pub fn max_connections_per_allowlisted_ip(&self) -> usize {
+        self.configured_max_connections_per_allowlisted_ip()
+            .min(self.server.max_connections)
+    }
+
+    /// 設計包 `KRS-W0203` 的情境：`server.per_ip_allowlist` 非空，且
+    /// `server.max_connections_per_allowlisted_ip`（含內建預設）大於 `server.max_connections` 時，
+    /// 回傳啟動時要記錄一次的警告訊息。清單為空時這個鍵不生效，不檢查也不警告（D22）
+    pub fn allowlisted_limit_warning(&self) -> Option<String> {
+        let configured = self.configured_max_connections_per_allowlisted_ip();
+        let max = self.server.max_connections;
+        let has_entries = self
+            .server
+            .per_ip_allowlist
+            .iter()
+            .any(|e| !e.trim().is_empty());
+        if !has_entries || configured <= max {
+            return None;
+        }
+        let source = if self.server.max_connections_per_allowlisted_ip.is_some() {
+            ""
+        } else {
+            "（內建預設）"
+        };
+        Some(format!(
+            "允許清單內每位址上限（{configured}）大於同時連線上限（{max}），實際只會生效 {max}：server.max_connections_per_allowlisted_ip = {configured}{source} 大於 server.max_connections = {max}，同一個位址的連線也算在全部連線之內，server.per_ip_allowlist 內每個位址最多 {max} 條連線。單一 NAT 出口後的主機不超過 {max} 台時不需處理（也可把 server.max_connections_per_allowlisted_ip 改為 {max} 以下）；需要更多連線時調高 server.max_connections（需重新啟動），並把檔案描述元上限調到大於 server.max_connections + 64（Linux：systemd unit 的 LimitNOFILE，手動執行時 ulimit -n）"
+        ))
+    }
+
     /// 以 `max_connections` 條連線、每條每秒 1 則 report、每行約 250 bytes 估算的每日 report 量
     pub fn estimated_daily_report_bytes(&self) -> u64 {
         (self.server.max_connections as u64)
@@ -308,11 +587,97 @@ impl AppConfig {
         (max > 0 && estimate > max).then_some((max, estimate))
     }
 
+    /// 主機清冊的筆數上限：明確設定的值，或 `max(100000, limits.max_agents)`
+    pub fn max_hosts(&self) -> usize {
+        self.storage
+            .max_hosts
+            .unwrap_or(DEFAULT_MAX_HOSTS.max(self.max_agents()))
+    }
+
+    /// 以 `hosts` 台主機、每 5 秒一筆 report 估算 SQLite 在保留期限內需要的容量（bytes；
+    /// 公式見 `kairos/STORAGE.md`「容量估算」）。保留天數為 0（不依時間刪除）時以 365 天估算
+    pub fn estimated_sqlite_bytes(&self, hosts: u64) -> u64 {
+        let days = |d: u32| u64::from(if d == 0 { 365 } else { d + 1 });
+        let reports_per_day = 86_400 / ESTIMATE_REPORT_INTERVAL_SECS;
+        let raw = reports_per_day * ESTIMATED_RAW_ROW_BYTES * days(self.storage.raw_retention_days);
+        let rollup = |bucket_secs: u64, d: u32| {
+            (86_400 / bucket_secs)
+                * ESTIMATED_SERIES_PER_HOST
+                * ESTIMATED_ROLLUP_ROW_BYTES
+                * days(d)
+        };
+        let per_host = raw
+            + rollup(300, self.storage.rollup_5m_retention_days)
+            + rollup(3600, self.storage.rollup_1h_retention_days);
+        hosts.saturating_mul(per_host)
+    }
+
+    /// SQLite 時 `storage.max_total_bytes` 小於以 `max_connections` 台主機估算的容量時回傳
+    /// (上限, 估算量)，供啟動時警告（達到上限後會提早刪除最舊的資料）
+    pub fn total_limit_below_estimate(&self) -> Option<(u64, u64)> {
+        let max = self.storage.max_total_bytes;
+        let estimate = self.estimated_sqlite_bytes(self.server.max_connections as u64);
+        (self.storage.backend == StorageBackend::Sqlite && max > 0 && estimate > max)
+            .then_some((max, estimate))
+    }
+
+    /// 到期預警的門檻（O1）
+    pub fn expiry_policy(&self) -> crate::expiry::ExpiryPolicy {
+        crate::expiry::ExpiryPolicy {
+            cert_warning_days: self.server.cert_expiry_warning_days,
+            crl_warning_days: self.auth.crl_expiry_warning_days,
+        }
+    }
+
     /// 實際使用的狀態表上限：明確設定的值，或 `max(10000, max_connections)`
     pub fn max_agents(&self) -> usize {
         self.limits
             .max_agents
             .unwrap_or(DEFAULT_MAX_AGENTS.max(self.server.max_connections))
+    }
+
+    /// 預設拒絕未認證的對外監聽（審計 S1）：`resolved` 為 `server.listen` 解析出的位址。
+    /// 沒有設定 `auth.client_ca`（mTLS）又有任何一個位址不是 loopback 時，除非明確設定
+    /// `auth.allow_unauthenticated = true`，否則回錯誤（訊息說明原因與修正方式），拒絕啟動。
+    pub fn check_listen_auth(&self, resolved: &[SocketAddr]) -> Result<ListenAuth, Error> {
+        if self.auth.client_ca_path().is_some() {
+            return Ok(ListenAuth::Mutual);
+        }
+        let exposed: Vec<SocketAddr> = resolved
+            .iter()
+            .copied()
+            .filter(|a| !is_loopback(a.ip()))
+            .collect();
+        if exposed.is_empty() {
+            return Ok(ListenAuth::LoopbackOnly);
+        }
+        if self.auth.allow_unauthenticated {
+            return Ok(ListenAuth::UnauthenticatedAllowed { exposed });
+        }
+        let exposed_list = exposed
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join("、");
+        // server.listen 是主機名稱時，附上解析出的非 loopback 位址
+        let resolved_note = if exposed_list == self.server.listen {
+            String::new()
+        } else {
+            format!("（解析為 {}）", exposed_list)
+        };
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動\n\
+                 \x20 原因：server.listen = \"{}\"{} 不是 loopback 位址，但沒有設定 auth.client_ca。\
+                 這樣任何能連到這個位址的人都能以任意 agent_id 註冊、寫入 report，或用已知的 agent_id 把合法的 agent 踢下線。\n\
+                 \x20 處理方式：\n\
+                 \x20   1. 建議：設定 auth.client_ca（與 auth.crl）啟用 mTLS，步驟見 README「啟用 mTLS」與 INSTALL.md 第 6、7 節。\n\
+                 \x20   2. 只在本機測試：把 server.listen 改成 loopback 位址，例如 127.0.0.1:8080 或 [::1]:8080。\n\
+                 \x20   3. 只在隔離的測試環境：設定 auth.allow_unauthenticated = true（或環境變數 KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true），明確允許未認證的連線。",
+                self.server.listen, resolved_note
+            ),
+        ))
     }
 
     /// 依序疊加預設值、設定檔與環境變數
@@ -379,6 +744,18 @@ impl AppConfig {
                 ),
             ));
         }
+        if let Some(per_allowlisted) = self.server.max_connections_per_allowlisted_ip
+            && !(1..=MAX_MAX_CONNECTIONS_PER_ALLOWLISTED_IP).contains(&per_allowlisted)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "server.max_connections_per_allowlisted_ip 必須介於 1..={}（目前為 {}）",
+                    MAX_MAX_CONNECTIONS_PER_ALLOWLISTED_IP, per_allowlisted
+                ),
+            ));
+        }
+        self.per_ip_allowlist()?;
         if let Some(max_agents) = self.limits.max_agents
             && !(self.server.max_connections..=MAX_MAX_AGENTS).contains(&max_agents)
         {
@@ -435,17 +812,81 @@ impl AppConfig {
                 ),
             ));
         }
+        for (name, value) in [
+            (
+                "server.cert_expiry_warning_days",
+                self.server.cert_expiry_warning_days,
+            ),
+            (
+                "auth.crl_expiry_warning_days",
+                self.auth.crl_expiry_warning_days,
+            ),
+        ] {
+            if value > MAX_EXPIRY_WARNING_DAYS {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{} 必須介於 0..={}（目前為 {}）",
+                        name, MAX_EXPIRY_WARNING_DAYS, value
+                    ),
+                ));
+            }
+        }
         if !self.auth.crl_paths().is_empty() && self.auth.client_ca_path().is_none() {
             return invalid("auth.crl 只在設定 auth.client_ca（啟用 mTLS）時有效");
         }
-        if self.storage.retention_days > MAX_RETENTION_DAYS {
+        for (name, value) in [
+            ("storage.retention_days", self.storage.retention_days),
+            (
+                "storage.raw_retention_days",
+                self.storage.raw_retention_days,
+            ),
+            (
+                "storage.rollup_5m_retention_days",
+                self.storage.rollup_5m_retention_days,
+            ),
+            (
+                "storage.rollup_1h_retention_days",
+                self.storage.rollup_1h_retention_days,
+            ),
+        ] {
+            if value > MAX_RETENTION_DAYS {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{} 必須介於 0..={}（目前為 {}）",
+                        name, MAX_RETENTION_DAYS, value
+                    ),
+                ));
+            }
+        }
+        let total = self.storage.max_total_bytes;
+        if total != 0 && total < MIN_MAX_TOTAL_BYTES {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!(
-                    "storage.retention_days 必須介於 0..={}（目前為 {}）",
-                    MAX_RETENTION_DAYS, self.storage.retention_days
+                    "storage.max_total_bytes 必須為 0（不限制）或至少 {}（64 MiB）（目前為 {}）",
+                    MIN_MAX_TOTAL_BYTES, total
                 ),
             ));
+        }
+        if let Some(max_hosts) = self.storage.max_hosts
+            && !(self.max_agents()..=MAX_MAX_HOSTS).contains(&max_hosts)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "storage.max_hosts 必須介於 limits.max_agents（{}）..={}（目前為 {}）",
+                    self.max_agents(),
+                    MAX_MAX_HOSTS,
+                    max_hosts
+                ),
+            ));
+        }
+        if self.storage.jsonl_mirror && self.storage.backend == StorageBackend::Jsonl {
+            return invalid(
+                "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
+            );
         }
         self.log.level_filter()?;
         Ok(())
@@ -456,8 +897,8 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
     }
 
     #[test]
@@ -472,6 +913,9 @@ mod tests {
         assert_eq!(c.limits.max_agents, None);
         assert_eq!(c.max_agents(), 10000);
         assert!(!c.auth.allow_multiple_dns_sans);
+        assert!(!c.auth.allow_unauthenticated);
+        assert_eq!(c.server.cert_expiry_warning_days, 30);
+        assert_eq!(c.auth.crl_expiry_warning_days, 7);
         assert_eq!(c.timeouts.handshake_secs, 5);
         assert_eq!(c.timeouts.hello_secs, 5);
         assert_eq!(c.timeouts.write_secs, 5);
@@ -479,6 +923,15 @@ mod tests {
         assert_eq!(c.storage.retention_days, 30);
         assert_eq!(c.storage.max_daily_bytes, 0);
         assert_eq!(c.daily_limit_below_estimate(), None);
+        assert_eq!(c.storage.backend, StorageBackend::Sqlite);
+        assert!(!c.storage.jsonl_mirror);
+        assert!(!c.storage.writes_jsonl());
+        assert_eq!(c.storage.raw_retention_days, 7);
+        assert_eq!(c.storage.rollup_5m_retention_days, 31);
+        assert_eq!(c.storage.rollup_1h_retention_days, 400);
+        assert_eq!(c.storage.max_total_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(c.storage.sqlite_synchronous, SqliteSynchronous::Normal);
+        assert_eq!(c.max_hosts(), 100_000);
         assert_eq!(c.server.reload_interval_secs, 30);
         assert_eq!(c.log.retention_days, 14);
         assert!(c.auth.crl.is_empty());
@@ -597,7 +1050,14 @@ mod tests {
         c.limits.max_agents = Some(MAX_MAX_AGENTS);
         assert!(c.validate().is_ok());
 
-        let mutations: [fn(&mut AppConfig); 9] = [
+        let mut ok = AppConfig::default();
+        ok.server.cert_expiry_warning_days = MAX_EXPIRY_WARNING_DAYS;
+        ok.auth.crl_expiry_warning_days = 0;
+        assert!(ok.validate().is_ok());
+
+        let mutations: [fn(&mut AppConfig); 11] = [
+            |c| c.server.cert_expiry_warning_days = MAX_EXPIRY_WARNING_DAYS + 1,
+            |c| c.auth.crl_expiry_warning_days = MAX_EXPIRY_WARNING_DAYS + 1,
             |c| c.timeouts.handshake_secs = MAX_TIMEOUT_SECS + 1,
             |c| c.timeouts.hello_secs = u64::MAX,
             // X2：伺服器最壞回應延遲（含 write_secs）必須小於 Pulse 讀取閒置中的 10 秒餘裕
@@ -640,8 +1100,21 @@ mod tests {
             ("KAIROS__AUTH__CLIENT_CA", "ca.pem"),
             ("KAIROS__AUTH__CRL", "a.crl,b.crl"),
             ("KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS", "true"),
+            ("KAIROS__AUTH__ALLOW_UNAUTHENTICATED", "true"),
+            ("KAIROS__AUTH__CRL_EXPIRY_WARNING_DAYS", "14"),
+            ("KAIROS__SERVER__CERT_EXPIRY_WARNING_DAYS", "60"),
         ])
         .unwrap();
+        assert!(c.auth.allow_unauthenticated);
+        assert_eq!(c.auth.crl_expiry_warning_days, 14);
+        assert_eq!(c.server.cert_expiry_warning_days, 60);
+        assert_eq!(
+            c.expiry_policy(),
+            crate::expiry::ExpiryPolicy {
+                cert_warning_days: 60,
+                crl_warning_days: 14
+            }
+        );
         assert_eq!(c.server.listen, "0.0.0.0:9000");
         assert_eq!(c.server.max_connections, 64);
         assert_eq!(c.server.max_connections_per_ip, Some(4));
@@ -664,6 +1137,89 @@ mod tests {
         // 超出上限的值由 validate 擋下
         let c = from_env(&[("KAIROS__TIMEOUTS__WRITE_SECS", "7")]).unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn storage_backend_settings() {
+        let c = from_env(&[
+            ("KAIROS__STORAGE__BACKEND", "jsonl"),
+            ("KAIROS__STORAGE__RAW_RETENTION_DAYS", "3"),
+            ("KAIROS__STORAGE__MAX_TOTAL_BYTES", "0"),
+            ("KAIROS__STORAGE__SQLITE_SYNCHRONOUS", "full"),
+            ("KAIROS__STORAGE__MAX_HOSTS", "20000"),
+        ])
+        .unwrap();
+        assert_eq!(c.storage.backend, StorageBackend::Jsonl);
+        assert!(c.storage.writes_jsonl());
+        assert_eq!(c.storage.raw_retention_days, 3);
+        assert_eq!(c.storage.max_total_bytes, 0);
+        assert_eq!(c.storage.sqlite_synchronous, SqliteSynchronous::Full);
+        assert_eq!(c.max_hosts(), 20000);
+        assert!(c.validate().is_ok());
+        // 不認得的值是錯誤
+        assert!(from_env(&[("KAIROS__STORAGE__BACKEND", "postgres")]).is_err());
+        assert!(from_env(&[("KAIROS__STORAGE__SQLITE_SYNCHRONOUS", "off")]).is_err());
+
+        let c: AppConfig = Config::builder()
+            .add_source(File::from_str(
+                "[storage]\njsonl_mirror = true\nrollup_1h_retention_days = 0\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(c.storage.jsonl_mirror && c.storage.writes_jsonl());
+        assert!(c.validate().is_ok());
+
+        let mutations: [fn(&mut AppConfig); 6] = [
+            |c| c.storage.raw_retention_days = MAX_RETENTION_DAYS + 1,
+            |c| c.storage.rollup_5m_retention_days = MAX_RETENTION_DAYS + 1,
+            |c| c.storage.rollup_1h_retention_days = MAX_RETENTION_DAYS + 1,
+            |c| c.storage.max_total_bytes = MIN_MAX_TOTAL_BYTES - 1,
+            |c| c.storage.max_hosts = Some(c.max_agents() - 1),
+            |c| {
+                c.storage.backend = StorageBackend::Jsonl;
+                c.storage.jsonl_mirror = true;
+            },
+        ];
+        for mutate in mutations {
+            let mut c = AppConfig::default();
+            mutate(&mut c);
+            assert!(c.validate().is_err(), "{:?}", c.storage);
+        }
+        // 上限與下限本身合法
+        let mut c = AppConfig::default();
+        c.storage.max_total_bytes = MIN_MAX_TOTAL_BYTES;
+        c.storage.max_hosts = Some(MAX_MAX_HOSTS);
+        assert!(c.validate().is_ok());
+        // 未設定 max_hosts 時至少為 limits.max_agents
+        c.storage.max_hosts = None;
+        c.server.max_connections = 65535;
+        c.limits.max_agents = Some(MAX_MAX_AGENTS);
+        assert_eq!(c.max_hosts(), 100_000);
+    }
+
+    #[test]
+    fn sqlite_estimate_follows_the_documented_formula() {
+        // STORAGE.md「容量估算」：每台每天 原始 17280 × 240 × (7+1) 天
+        // + 5 分鐘 288 × 20 × 50 × (31+1) 天 + 1 小時 24 × 20 × 50 × (400+1) 天
+        let c = AppConfig::default();
+        let per_host = 17280 * 240 * 8 + 288 * 20 * 50 * 32 + 24 * 20 * 50 * 401;
+        assert_eq!(c.estimated_sqlite_bytes(1), per_host);
+        assert_eq!(c.estimated_sqlite_bytes(1024), 1024 * per_host);
+        // 預設 1024 台約 53 GB，低於預設上限 64 GiB：不警告
+        assert_eq!(c.total_limit_below_estimate(), None);
+        let mut big = AppConfig::default();
+        big.server.max_connections = 10000;
+        let (max, estimate) = big.total_limit_below_estimate().unwrap();
+        assert_eq!(max, DEFAULT_MAX_TOTAL_BYTES);
+        assert_eq!(estimate, 10000 * per_host);
+        big.storage.max_total_bytes = 0;
+        assert_eq!(big.total_limit_below_estimate(), None);
+        big.storage.max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
+        big.storage.backend = StorageBackend::Jsonl;
+        assert_eq!(big.total_limit_below_estimate(), None);
     }
 
     #[test]
@@ -778,6 +1334,92 @@ mod tests {
         assert_eq!((c.max_connections_per_ip(), c.max_agents()), (16, 16));
     }
 
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn loopback_addresses() {
+        // S1：127.0.0.0/8 與 ::1（含 IPv4-mapped）是 loopback；0.0.0.0、:: 與其他位址不是
+        for ip in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_loopback(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "0.0.0.0",
+            "::",
+            "10.0.0.5",
+            "192.168.1.1",
+            "128.0.0.1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:10.0.0.1",
+            "::ffff:0.0.0.0",
+        ] {
+            assert!(!is_loopback(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn unauthenticated_exposure_is_refused_by_default() {
+        // S1：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動
+        let mut c = AppConfig::default();
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["127.0.0.1:8080"])).unwrap(),
+            ListenAuth::LoopbackOnly
+        );
+        // localhost 解析出的 IPv4 與 IPv6 都是 loopback
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["127.0.0.1:8080", "[::1]:8080"]))
+                .unwrap(),
+            ListenAuth::LoopbackOnly
+        );
+        for exposed in [
+            &["0.0.0.0:8080"][..],
+            &["[::]:8080"],
+            &["10.0.0.5:8080"],
+            // 解析出的位址只要有一個不是 loopback 就拒絕
+            &["127.0.0.1:8080", "10.0.0.5:8080"],
+        ] {
+            c.server.listen = exposed[0].to_string();
+            let err = c.check_listen_auth(&addrs(exposed)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+            let msg = err.to_string();
+            // 訊息要說清楚怎麼修
+            for hint in [
+                "auth.client_ca",
+                "127.0.0.1:8080",
+                "auth.allow_unauthenticated = true",
+                "KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true",
+            ] {
+                assert!(msg.contains(hint), "{hint}: {msg}");
+            }
+        }
+
+        // 明確允許時照常啟動（記 WARN）
+        c.auth.allow_unauthenticated = true;
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["127.0.0.1:8080", "0.0.0.0:8080"]))
+                .unwrap(),
+            ListenAuth::UnauthenticatedAllowed {
+                exposed: addrs(&["0.0.0.0:8080"])
+            }
+        );
+
+        // 啟用 mTLS 時不論監聽位址都允許
+        let mut c = AppConfig::default();
+        c.auth.client_ca = "ca.pem".into();
+        assert_eq!(
+            c.check_listen_auth(&addrs(&["0.0.0.0:8080"])).unwrap(),
+            ListenAuth::Mutual
+        );
+    }
+
     #[test]
     fn parse_args_variants() {
         assert_eq!(
@@ -809,5 +1451,166 @@ mod tests {
         assert!(parse_args(args(&["--config="])).is_err());
         assert!(parse_args(args(&["--config", "a", "--config", "b"])).is_err());
         assert!(parse_args(args(&["--port", "1"])).is_err());
+    }
+
+    /// 平台上「不是有效 Unicode」的參數：Unix 為非 UTF-8 的位元組，Windows 為未配對的 surrogate
+    fn non_unicode(prefix: &str) -> OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = prefix.as_bytes().to_vec();
+            bytes.extend_from_slice(b"caf\xe9.toml");
+            OsString::from_vec(bytes)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = prefix.encode_utf16().collect();
+            wide.extend([0x63, 0xD800, 0x2E, 0x74]);
+            OsString::from_wide(&wide)
+        }
+    }
+
+    #[test]
+    fn parse_args_handles_non_unicode_without_panic() {
+        // Q5：非 UTF-8 的參數不 panic，給出錯誤訊息
+        let err = parse_args([non_unicode("--bogus")]).unwrap_err();
+        assert!(err.contains("無法辨識的參數"), "{err}");
+        assert!(err.contains('\u{FFFD}'), "{err}");
+        let err = parse_args([non_unicode("")]).unwrap_err();
+        assert!(err.contains("不是有效 Unicode"), "{err}");
+
+        // 設定檔路徑本身可以不是 UTF-8
+        let path = non_unicode("");
+        assert_eq!(
+            parse_args([OsString::from("--config"), path.clone()]),
+            Ok(CliAction::Run {
+                config_path: Some(PathBuf::from(path.clone()))
+            })
+        );
+        // --config=<非 UTF-8>：Unix 可解析；其他平台回錯誤並提示改用 --config <path>
+        let result = parse_args([non_unicode("--config=")]);
+        #[cfg(unix)]
+        assert_eq!(
+            result,
+            Ok(CliAction::Run {
+                config_path: Some(PathBuf::from(path))
+            })
+        );
+        #[cfg(not(unix))]
+        assert!(result.unwrap_err().contains("--config <path>"));
+    }
+
+    #[test]
+    fn per_ip_allowlist_settings() {
+        // 預設：清單空、允許清單上限 4096（D14），實際上限 min(4096, max_connections)（D15）
+        let c = AppConfig::default();
+        assert!(c.server.per_ip_allowlist.is_empty());
+        assert_eq!(c.server.max_connections_per_allowlisted_ip, None);
+        assert_eq!(c.configured_max_connections_per_allowlisted_ip(), 4096);
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 1024);
+        assert!(c.per_ip_allowlist().unwrap().is_empty());
+
+        // 設定檔：陣列；環境變數：逗號分隔
+        let c: AppConfig = Config::builder()
+            .add_source(File::from_str(
+                "[server]\nmax_connections = 8000\nper_ip_allowlist = [\"203.0.113.10\", \"10.20.0.0/16\", \"2001:db8:100::/48\"]\nmax_connections_per_allowlisted_ip = 5000\n",
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 5000);
+        let list = c.per_ip_allowlist().unwrap();
+        assert_eq!(
+            list.to_string(),
+            "203.0.113.10/32、10.20.0.0/16、2001:db8:100::/48"
+        );
+        assert!(list.contains("::ffff:10.20.3.4".parse().unwrap()));
+
+        let c = from_env(&[
+            (
+                "KAIROS__SERVER__PER_IP_ALLOWLIST",
+                "198.51.100.0/24,2001:db8::/32",
+            ),
+            ("KAIROS__SERVER__MAX_CONNECTIONS_PER_ALLOWLISTED_IP", "600"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.server.per_ip_allowlist,
+            ["198.51.100.0/24", "2001:db8::/32"]
+        );
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 600);
+        assert!(c.validate().is_ok());
+        // 空字串表示空清單
+        let c = from_env(&[("KAIROS__SERVER__PER_IP_ALLOWLIST", "")]).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(c.per_ip_allowlist().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_ip_allowlist_validation() {
+        let mut c = AppConfig::default();
+        // 範圍 1..=65535，與 server.max_connections 無關（較大時只警告）
+        for (value, ok) in [(0, false), (1, true), (65535, true), (65536, false)] {
+            c.server.max_connections_per_allowlisted_ip = Some(value);
+            assert_eq!(c.validate().is_ok(), ok, "{value}");
+        }
+        c.server.max_connections_per_allowlisted_ip = None;
+        // 錯誤的網段拒絕啟動，訊息指出第幾項與原因
+        c.server.per_ip_allowlist = vec!["10.0.0.0/8".into(), "10.0.0.1/8".into()];
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("第 2 項 \"10.0.0.1/8\""), "{err}");
+        assert!(err.to_string().contains("10.0.0.0/8"), "{err}");
+        for bad in [
+            "10.0.0.0/33",
+            "nat-gw",
+            "fe80::1%eth0",
+            "::/129",
+            "10.0.0.0/+8",
+        ] {
+            c.server.per_ip_allowlist = vec![bad.into()];
+            assert!(c.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allowlisted_limit_warning_only_when_the_list_has_entries() {
+        // D22：清單為空時不檢查、不警告（即使內建預設 4096 > 1024）
+        let mut c = AppConfig::default();
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        c.server.per_ip_allowlist = vec!["  ".into()];
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        c.server.max_connections_per_allowlisted_ip = Some(60000);
+        assert_eq!(c.allowlisted_limit_warning(), None);
+
+        // D15：清單非空且設定值（含內建預設）大於 server.max_connections 時警告（KRS-W0203）
+        c.server.max_connections_per_allowlisted_ip = None;
+        c.server.per_ip_allowlist = vec!["203.0.113.10".into()];
+        let w = c.allowlisted_limit_warning().unwrap();
+        assert!(
+            w.starts_with(
+                "允許清單內每位址上限（4096）大於同時連線上限（1024），實際只會生效 1024"
+            ),
+            "{w}"
+        );
+        assert!(w.contains("4096（內建預設）"), "{w}");
+        assert!(w.contains("LimitNOFILE"), "{w}");
+        c.server.max_connections_per_allowlisted_ip = Some(2000);
+        let w = c.allowlisted_limit_warning().unwrap();
+        assert!(w.contains("= 2000 大於"), "{w}");
+        // 等於或小於時不警告（比較為 >，D18）
+        c.server.max_connections_per_allowlisted_ip = Some(1024);
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        c.server.max_connections_per_allowlisted_ip = None;
+        c.server.max_connections = 4096;
+        assert_eq!(c.allowlisted_limit_warning(), None);
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 4096);
+        c.server.max_connections = 2400;
+        assert!(c.allowlisted_limit_warning().is_some());
+        assert_eq!(c.max_connections_per_allowlisted_ip(), 2400);
     }
 }

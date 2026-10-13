@@ -1,16 +1,29 @@
 use log::{debug, info};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant, MissedTickBehavior};
 
+use kairos_proto::{
+    MAX_LABEL_VALUE_BYTES, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL,
+    METRIC_NETWORK_RECEIVED, METRIC_NETWORK_TRANSMITTED, METRIC_TEMPERATURE, Metric,
+    sanitize_display_text,
+};
+
+use crate::log_throttle::LogThrottle;
 use crate::protocol::{is_forbidden_display_char, now_ts};
+
+pub mod host;
 
 /// 一個 MB 的位元組數，用來把 sysinfo 回傳的 bytes 換算成 MB。
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
 /// 一次系統資訊取樣，由收集 task 產生、經 mpsc 交給連線 task 組成 report 訊息。
-#[derive(Debug, Clone)]
+///
+/// 啟用本機緩衝（A5）時以 JSON 原樣存進緩衝（`spool`），送出時才依協商的格式組成 report。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     /// 取樣時間（RFC 3339 UTC 毫秒），作為 report 的 `ts`
     pub ts: String,
@@ -20,6 +33,156 @@ pub struct Sample {
     pub total_memory: u64,
     /// 已使用記憶體（MB）
     pub used_memory: u64,
+    /// 總記憶體（bytes；協定 v2 的 `system.memory.total`）
+    pub total_memory_bytes: u64,
+    /// 已使用記憶體（bytes；協定 v2 的 `system.memory.used`）
+    pub used_memory_bytes: u64,
+    /// 磁碟、網路與溫度的指標（A4；只在協定 v2 協商了 `metrics` 時送出，v1 不送）
+    pub extra: Vec<Metric>,
+}
+
+/// 每次 report 最多送出的磁碟、網路介面與溫度感測器數（各自計算）。
+/// 合計最多 2 × 32 + 2 × 32 + 32 = 160 個，加上 CPU 與記憶體共 163 個，低於協定上限 256
+const MAX_REPORTED_DISKS: usize = 32;
+const MAX_REPORTED_INTERFACES: usize = 32;
+const MAX_REPORTED_SENSORS: usize = 32;
+
+/// label 值：整理成符合協定限制的字串（禁止字元換成 `?`、截到 256 bytes），空的回傳 `None`
+fn label_value(raw: &str) -> Option<String> {
+    sanitize_display_text(raw, MAX_LABEL_VALUE_BYTES)
+}
+
+/// 數值四捨五入到小數 2 位（避免 f32 轉 f64 的精度雜訊，例如 `47.83000183105469`）
+fn round2(v: f32) -> Option<serde_json::Number> {
+    serde_json::Number::from_f64((f64::from(v) * 100.0).round() / 100.0)
+}
+
+/// 磁碟、網路與溫度的指標（A4）。篩選規則與啟動時的 INFO 清單相同：略過虛擬檔案系統、容量為 0
+/// 與同一磁碟的重複掛載點，略過迴路與虛擬網路介面，略過讀不到溫度的感測器；
+/// 各類最多 [`MAX_REPORTED_DISKS`] 等個數，同一個 label 只送第一個。
+fn extra_metrics(
+    disks: Vec<DiskEntry>,
+    interfaces: &[(String, u64, u64)],
+    temperatures: &[(String, Option<f32>)],
+) -> Vec<Metric> {
+    let mut out = Vec::new();
+
+    let meaningful = disks
+        .into_iter()
+        .filter(|d| is_meaningful_disk(&d.file_system, d.total_space))
+        .collect();
+    let (kept, _) = dedupe_disks(meaningful);
+    let mut seen = HashSet::new();
+    for disk in kept {
+        let Some(mount) = label_value(&disk.mount_point) else {
+            continue;
+        };
+        if !seen.insert(mount.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_REPORTED_DISKS {
+            break;
+        }
+        let with_labels = |m: Metric| {
+            let m = m.with_label("mountpoint", mount.clone());
+            match label_value(&disk.file_system) {
+                Some(fs) => m.with_label("fstype", fs),
+                None => m,
+            }
+        };
+        out.push(with_labels(Metric::new(
+            METRIC_FILESYSTEM_TOTAL,
+            disk.total_space,
+            "By",
+        )));
+        out.push(with_labels(Metric::new(
+            METRIC_FILESYSTEM_AVAILABLE,
+            disk.available_space,
+            "By",
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    for (name, received, transmitted) in interfaces {
+        if !is_meaningful_interface(name) {
+            continue;
+        }
+        let Some(device) = label_value(name) else {
+            continue;
+        };
+        if !seen.insert(device.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_REPORTED_INTERFACES {
+            break;
+        }
+        out.push(
+            Metric::new(METRIC_NETWORK_RECEIVED, *received, "By")
+                .with_label("device", device.clone()),
+        );
+        out.push(
+            Metric::new(METRIC_NETWORK_TRANSMITTED, *transmitted, "By")
+                .with_label("device", device),
+        );
+    }
+
+    let mut seen = HashSet::new();
+    for (label, temperature) in temperatures {
+        let (Some(sensor), Some(value)) = (label_value(label), temperature.and_then(round2)) else {
+            continue;
+        };
+        if !seen.insert(sensor.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_REPORTED_SENSORS {
+            break;
+        }
+        out.push(Metric::new(METRIC_TEMPERATURE, value, "Cel").with_label("sensor", sensor));
+    }
+    out
+}
+
+/// 取樣磁碟、網路與溫度用的 sysinfo 物件（第一次在 blocking 執行緒建立，之後沿用）
+struct Extras {
+    disks: Disks,
+    networks: Networks,
+    components: Components,
+}
+
+impl Extras {
+    fn new() -> Self {
+        Self {
+            disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
+            components: Components::new_with_refreshed_list(),
+        }
+    }
+
+    /// 刷新（含新增與移除的磁碟、介面、感測器）並轉成指標
+    fn refresh_and_read(&mut self) -> Vec<Metric> {
+        self.disks.refresh(true);
+        self.networks.refresh(true);
+        self.components.refresh(true);
+        let disks = self.disks.iter().map(DiskEntry::from_disk).collect();
+        let mut interfaces: Vec<(String, u64, u64)> = self
+            .networks
+            .iter()
+            .map(|(name, data)| {
+                (
+                    name.clone(),
+                    data.total_received(),
+                    data.total_transmitted(),
+                )
+            })
+            .collect();
+        interfaces.sort();
+        let temperatures: Vec<(String, Option<f32>)> = self
+            .components
+            .iter()
+            .map(|c| (c.label().to_string(), c.temperature()))
+            .collect();
+        extra_metrics(disks, &interfaces, &temperatures)
+    }
 }
 
 /// 計算全機 CPU 平均使用率。
@@ -35,8 +198,8 @@ fn average_cpu_usage(sys: &System) -> f32 {
     total / cpus.len() as f32
 }
 
-/// hello 中 `hostname` 的長度上限（bytes），見 PROTOCOL.md。
-const MAX_HOSTNAME_BYTES: usize = 255;
+// hello 中 `hostname` 的長度上限（bytes），見 PROTOCOL.md；與 Kairos 的驗證共用同一個常數。
+use kairos_proto::MAX_HOSTNAME_BYTES;
 
 /// 主機名稱（僅供顯示），已符合協定限制（見 `normalize_hostname`）。
 ///
@@ -405,64 +568,121 @@ fn cpu_core_line(name: &str, usage: f32) -> String {
     format!("各核心 CPU 使用率：{name}：{usage:.2}%")
 }
 
-/// 在 blocking 執行緒執行 `f`。
-///
-/// `f` panic 時在呼叫端重新拋出（讓收集 task 以 panic 結束，由 main 監看並記錄）；
-/// runtime 正在關閉而被取消時回傳 `None`。
-async fn blocking<T, F>(f: F) -> Option<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(v) => Some(v),
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(_) => None,
-    }
-}
-
 /// 刷新 CPU 與記憶體讀數（阻塞的系統呼叫）。
 fn refresh_cpu_and_memory(sys: &mut System) {
     sys.refresh_cpu_usage();
     sys.refresh_memory();
 }
 
+/// 單次取樣（sysinfo 刷新）逾時的下限與上限；實際值見 [`sample_timeout`]。
+const MIN_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SAMPLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 取樣持續卡住時，提醒用 WARN 的節流視窗（第一次逾時一定記錄）。
+const STUCK_LOG_WINDOW: Duration = Duration::from_secs(600);
+
+/// 單次取樣的逾時：`clamp(report.interval, 2 秒, 10 秒)`。
+///
+/// 正常的刷新只要數毫秒（第一次掃描可達數百毫秒）。超過一個回報間隔仍未完成，這次 report
+/// 已經趕不上；下限 2 秒避免很短的間隔下把偶發的慢刷新當成卡住，上限 10 秒讓長間隔時
+/// 也能及早發現（例如 Windows 的 WMI 查詢卡住）。
+fn sample_timeout(interval: Duration) -> Duration {
+    interval.clamp(MIN_SAMPLE_TIMEOUT, MAX_SAMPLE_TIMEOUT)
+}
+
+/// 一次取樣的結果。
+#[derive(Debug)]
+enum SampleOutcome {
+    /// 取樣完成
+    Ready(Sample),
+    /// 取樣逾時、仍卡住，或剛從卡住恢復（重新建立基準）：略過這次 report
+    Skipped,
+    /// runtime 正在關閉
+    Stopped,
+}
+
+/// blocking 執行緒上的一次刷新：回傳 `System`、磁碟等的 sysinfo 物件與讀出的取樣。
+type RefreshTask = tokio::task::JoinHandle<(System, Option<Extras>, Sample)>;
+
 /// 定期取樣器：沿用同一個 `System`，每次取樣只刷新一次 CPU。
 ///
 /// sysinfo 的 CPU 使用率是「兩次刷新之間」的平均，因此每次取樣得到的是
 /// 「上次取樣到這次取樣之間」（約等於 `report.interval`）的平均，而不是只量約 200 ms 的瞬間值。
-/// 第一次取樣前先刷新一次建立基準，並補足 sysinfo 要求的最短間隔
-/// （`MINIMUM_CPU_UPDATE_INTERVAL`，用 tokio 的 sleep，不佔用任何執行緒）。
+/// 收集 task 啟動時先以 [`Sampler::baseline`] 建立基準，第一次取樣在一個 `report.interval` 之後，
+/// 因此第一筆也涵蓋約一個 `report.interval`。沒有基準就取樣時（測試），先刷新一次建立基準，
+/// 並補足 sysinfo 要求的最短間隔（`MINIMUM_CPU_UPDATE_INTERVAL`，用 tokio 的 sleep，不佔用任何執行緒）。
 ///
 /// sysinfo 的 refresh 是阻塞的系統呼叫（首次可達數百 ms），一律放到 blocking 執行緒；
 /// `System` 移入 / 移出 blocking 閉包，避免每次重新掃描。
+///
+/// **逾時**（Q4）：刷新超過 `timeout` 仍未完成時記 WARN 並略過這次 report（heartbeat 照常送出，
+/// 伺服器端看起來仍在線，因此必須在本機日誌留下紀錄）。卡住的刷新無法中斷，`System` 仍在
+/// 該執行緒上：之後每次 tick 只檢查它是否完成，**不再發起新的刷新**（避免卡住的執行緒越積越多），
+/// 期間持續略過 report，每 `STUCK_LOG_WINDOW` 提醒一次。完成後取回 `System`、以完成當下為新的
+/// 基準（記 INFO），下一次 tick 恢復回報。
 struct Sampler {
-    /// 取樣用的 `System`；只在 blocking 閉包執行期間為 `None`
+    /// 取樣用的 `System`；blocking 閉包執行期間（含卡住時）為 `None`
     sys: Option<System>,
+    /// 是否另外取樣磁碟、網路與溫度（A4；測試替換刷新函式時不取樣）
+    collect_extras: bool,
+    /// 磁碟、網路與溫度的 sysinfo 物件；第一次刷新時在 blocking 執行緒建立，與 `sys` 一起移動
+    extras: Option<Extras>,
     /// 上次刷新 CPU 的時間；`None` 表示尚未建立基準
     last_refresh: Option<Instant>,
     /// 實際的刷新函式（測試時可替換，以驗證在哪個執行緒、呼叫幾次）
     refresh: fn(&mut System),
+    /// 單次刷新的逾時
+    timeout: Duration,
+    /// 逾時後仍在執行的刷新與其開始時間
+    stuck: Option<(RefreshTask, Instant)>,
+    /// 卡住期間略過的 report 次數（含逾時的那一次）
+    skipped: u64,
+    /// 卡住期間提醒用 WARN 的節流
+    stuck_log: LogThrottle,
 }
 
 impl Sampler {
-    fn new() -> Self {
-        Self::with_refresh(refresh_cpu_and_memory)
-    }
-
-    fn with_refresh(refresh: fn(&mut System)) -> Self {
+    fn new(timeout: Duration) -> Self {
         Self {
-            sys: Some(System::new()),
-            last_refresh: None,
-            refresh,
+            collect_extras: true,
+            ..Self::with_refresh(refresh_cpu_and_memory, timeout)
         }
     }
 
-    /// 取樣一次 CPU 與記憶體。runtime 關閉中時回傳 `None`。
-    async fn sample(&mut self) -> Option<Sample> {
+    fn with_refresh(refresh: fn(&mut System), timeout: Duration) -> Self {
+        Self {
+            sys: Some(System::new()),
+            collect_extras: false,
+            extras: None,
+            last_refresh: None,
+            refresh,
+            timeout,
+            stuck: None,
+            skipped: 0,
+            stuck_log: LogThrottle::new(STUCK_LOG_WINDOW),
+        }
+    }
+
+    /// 建立 CPU 使用率的基準（刷新一次、讀數不用）。runtime 關閉中時回傳 `None`；
+    /// 逾時時照常返回（之後由 [`Sampler::sample`] 處理卡住的刷新）。
+    async fn baseline(&mut self) -> Option<()> {
+        match self.refresh_and_read().await {
+            SampleOutcome::Stopped => None,
+            SampleOutcome::Ready(_) | SampleOutcome::Skipped => Some(()),
+        }
+    }
+
+    /// 取樣一次 CPU 與記憶體。
+    async fn sample(&mut self) -> SampleOutcome {
+        if self.stuck.is_some() {
+            return self.check_stuck().await;
+        }
         if self.last_refresh.is_none() {
             // 第一次：先刷新一次作為 CPU 使用率的基準，讀數本身不用
-            self.refresh_and_read().await?;
+            match self.refresh_and_read().await {
+                SampleOutcome::Ready(_) => {}
+                other => return other,
+            }
         }
         if let Some(last) = self.last_refresh {
             let since = last.elapsed();
@@ -473,42 +693,141 @@ impl Sampler {
         self.refresh_and_read().await
     }
 
-    /// 在 blocking 執行緒刷新一次並讀出取樣。
-    async fn refresh_and_read(&mut self) -> Option<Sample> {
-        let mut sys = self.sys.take()?;
+    /// 在 blocking 執行緒刷新一次並讀出取樣（含逾時）。
+    async fn refresh_and_read(&mut self) -> SampleOutcome {
+        let Some(mut sys) = self.sys.take() else {
+            // 只有卡住時 sys 才不在（由 sample 先處理），保守起見視為略過
+            return SampleOutcome::Skipped;
+        };
         let refresh = self.refresh;
-        let (sys, s) = blocking(move || {
+        let mut extras = self.extras.take();
+        let collect_extras = self.collect_extras;
+        let started = Instant::now();
+        let mut task = tokio::task::spawn_blocking(move || {
             refresh(&mut sys);
+            if collect_extras && extras.is_none() {
+                extras = Some(Extras::new());
+            }
+            let extra = extras
+                .as_mut()
+                .map(Extras::refresh_and_read)
+                .unwrap_or_default();
             let s = Sample {
                 ts: now_ts(),
                 cpu_usage: average_cpu_usage(&sys),
                 total_memory: sys.total_memory() / BYTES_PER_MB,
                 used_memory: sys.used_memory() / BYTES_PER_MB,
+                total_memory_bytes: sys.total_memory(),
+                used_memory_bytes: sys.used_memory(),
+                extra,
             };
-            (sys, s)
-        })
-        .await?;
-        self.sys = Some(sys);
-        self.last_refresh = Some(Instant::now());
-        Some(s)
+            (sys, extras, s)
+        });
+        match time::timeout(self.timeout, &mut task).await {
+            Ok(joined) => match finished(joined) {
+                Some((sys, extras, s)) => {
+                    self.sys = Some(sys);
+                    self.extras = extras;
+                    self.last_refresh = Some(Instant::now());
+                    SampleOutcome::Ready(s)
+                }
+                None => SampleOutcome::Stopped,
+            },
+            Err(_) => {
+                self.skipped = 1;
+                self.stuck_log = LogThrottle::new(STUCK_LOG_WINDOW);
+                self.stuck_log.check(Instant::now());
+                log::warn!(
+                    "系統資訊取樣（sysinfo）超過 {} 秒仍未完成，略過這次 report；heartbeat 照常送出，\
+                     伺服器端仍會顯示此主機在線，但不會收到新的 report。取樣完成前不再發起新的取樣\
+                     （每 {} 分鐘提醒一次）",
+                    self.timeout.as_secs_f64(),
+                    STUCK_LOG_WINDOW.as_secs() / 60
+                );
+                self.stuck = Some((task, started));
+                SampleOutcome::Skipped
+            }
+        }
+    }
+
+    /// 上一次刷新逾時後的處理：仍在執行 → 略過（節流提醒）；已完成 → 取回 `System`，
+    /// 以現在為新的基準，這次仍略過（讀數涵蓋卡住期間，不可靠），下次恢復回報。
+    async fn check_stuck(&mut self) -> SampleOutcome {
+        let Some((task, started)) = self.stuck.take() else {
+            return SampleOutcome::Skipped;
+        };
+        if !task.is_finished() {
+            self.skipped = self.skipped.saturating_add(1);
+            if self.stuck_log.check(Instant::now()).is_some() {
+                log::warn!(
+                    "系統資訊取樣仍未完成（已 {} 秒），持續略過 report（已略過 {} 次）",
+                    started.elapsed().as_secs(),
+                    self.skipped
+                );
+            }
+            self.stuck = Some((task, started));
+            return SampleOutcome::Skipped;
+        }
+        match finished(task.await) {
+            Some((sys, extras, _stale)) => {
+                self.sys = Some(sys);
+                self.extras = extras;
+                self.last_refresh = Some(Instant::now());
+                log::info!(
+                    "系統資訊取樣已恢復（卡住約 {} 秒，期間略過 {} 次 report）；以現在為新的 CPU 基準，\
+                     下次取樣恢復回報",
+                    started.elapsed().as_secs(),
+                    self.skipped
+                );
+                self.skipped = 0;
+                SampleOutcome::Skipped
+            }
+            None => SampleOutcome::Stopped,
+        }
     }
 }
 
-/// 收集 task：每 `interval` 取樣一次，以 `try_send` 交給連線 task。
+/// blocking 任務的結果：panic 時在呼叫端重新拋出（讓收集 task 以 panic 結束，由 main 監看並記錄）；
+/// runtime 正在關閉而被取消時回傳 `None`。
+fn finished<T>(joined: Result<T, tokio::task::JoinError>) -> Option<T> {
+    match joined {
+        Ok(v) => Some(v),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => None,
+    }
+}
+
+/// 收集 task：啟動時先建立 CPU 基準，之後每 `interval` 取樣一次（第一次在一個 `interval` 之後），
+/// 以 `try_send` 交給連線 task。
+///
+/// 第一筆 CPU 使用率因此涵蓋約一個 `interval`，而不是啟動當下約 200 ms 的瞬間值
+/// （剛好落在啟動負載上，與「約等於 `report.interval` 的平均」不符）。
+///
+/// 取樣超過 [`sample_timeout`] 仍未完成時略過該次 report 並記 WARN（見 [`Sampler`]）。
 ///
 /// 通道已滿（連線中斷或寫出卡住，上一筆還沒被取走）時**丟棄這次的新取樣**，
 /// 因此不會堆積；連線 task 在每次註冊成功後會清掉通道內殘留的舊取樣，
 /// 上一筆 report 尚未收到伺服器回應時也會略過新取樣。
 /// 接收端關閉或 runtime 關閉時結束。
 pub async fn collect_periodically(interval: Duration, tx: mpsc::Sender<Sample>) {
-    let mut sampler = Sampler::new();
-    let mut ticker = time::interval(interval);
+    collect_with(Sampler::new(sample_timeout(interval)), interval, tx).await;
+}
+
+/// [`collect_periodically`] 的實作，取樣器由呼叫端提供（測試時可替換刷新函式）。
+async fn collect_with(mut sampler: Sampler, interval: Duration, tx: mpsc::Sender<Sample>) {
+    // 先建立基準，並跳過 interval 立即觸發的第一次 tick：第一次取樣在一個 interval 之後
+    if sampler.baseline().await.is_none() {
+        return;
+    }
+    let mut ticker = time::interval_at(Instant::now() + interval, interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
-        let Some(s) = sampler.sample().await else {
-            return;
+        let s = match sampler.sample().await {
+            SampleOutcome::Ready(s) => s,
+            SampleOutcome::Skipped => continue,
+            SampleOutcome::Stopped => return,
         };
         match tx.try_send(s) {
             Ok(()) => {}
@@ -529,6 +848,94 @@ pub async fn collect_periodically(interval: Duration, tx: mpsc::Sender<Sample>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interface(name: &str, rx: u64, tx: u64) -> (String, u64, u64) {
+        (name.to_string(), rx, tx)
+    }
+
+    #[test]
+    fn extra_metrics_follow_the_startup_filters() {
+        let disks = vec![
+            disk("/", "ext4", "/dev/sda1", 1000),
+            disk("/opt/pulse/logs", "ext4", "/dev/sda1", 1000), // 重複掛載點
+            disk("/proc", "proc", "proc", 0),                   // 虛擬
+            disk("/data", "xfs", "/dev/sdb1", 2000),
+        ];
+        let interfaces = [
+            interface("eth0", 10, 20),
+            interface("lo", 1, 1),
+            interface("veth123", 1, 1),
+            interface("docker0", 1, 1),
+        ];
+        let temps = [
+            ("coretemp Package id 0".to_string(), Some(47.83_f32)),
+            ("acpitz".to_string(), None),
+            ("nvme".to_string(), Some(f32::NAN)),
+        ];
+        let metrics = extra_metrics(disks, &interfaces, &temps);
+        let names: Vec<(&str, Vec<&str>)> = metrics
+            .iter()
+            .map(|m| {
+                (
+                    m.name.as_str(),
+                    m.labels.values().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("system.filesystem.total", vec!["ext4", "/"]),
+                ("system.filesystem.available", vec!["ext4", "/"]),
+                ("system.filesystem.total", vec!["xfs", "/data"]),
+                ("system.filesystem.available", vec!["xfs", "/data"]),
+                ("system.network.received", vec!["eth0"]),
+                ("system.network.transmitted", vec!["eth0"]),
+                ("system.temperature", vec!["coretemp Package id 0"]),
+            ]
+        );
+        assert_eq!(metrics[2].value.as_u64(), Some(2000));
+        assert_eq!(metrics[5].value.as_u64(), Some(20));
+        // f32 的精度雜訊被去掉
+        assert_eq!(metrics[6].value.to_string(), "47.83");
+        // 都符合協定（加上 CPU 與記憶體後仍是合法的 report）
+        kairos_proto::validate_metrics(&metrics).unwrap();
+    }
+
+    #[test]
+    fn extra_metrics_are_capped_and_labels_sanitized() {
+        let disks = (0..100)
+            .map(|i| disk(&format!("/m{i}"), "ext4", &format!("/dev/x{i}"), 1))
+            .collect();
+        let interfaces: Vec<_> = (0..100)
+            .map(|i| interface(&format!("en{i:03}"), 1, 1))
+            .collect();
+        let temps: Vec<_> = (0..100)
+            .map(|i| (format!("s{i}"), Some(40.0_f32)))
+            .chain([("s0".to_string(), Some(1.0))]) // 重複的 label 只取第一個
+            .collect();
+        let metrics = extra_metrics(disks, &interfaces, &temps);
+        let count = |name: &str| metrics.iter().filter(|m| m.name == name).count();
+        assert_eq!(count("system.filesystem.total"), MAX_REPORTED_DISKS);
+        assert_eq!(count("system.network.received"), MAX_REPORTED_INTERFACES);
+        assert_eq!(count("system.temperature"), MAX_REPORTED_SENSORS);
+        assert!(metrics.len() + 3 <= kairos_proto::MAX_METRICS);
+        kairos_proto::validate_metrics(&metrics).unwrap();
+
+        // 掛載路徑含換行等禁止字元：替換成 ?；空白的 label 略過
+        let disks = vec![
+            disk(
+                "/mnt/a
+b", "ext4", "/dev/a", 1,
+            ),
+            disk(" ", "ext4", "/dev/b", 1),
+        ];
+        let temps = [(" ".to_string(), Some(1.0_f32))];
+        let metrics = extra_metrics(disks, &[], &temps);
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].labels["mountpoint"], "/mnt/a?b");
+        kairos_proto::validate_metrics(&metrics).unwrap();
+    }
 
     #[test]
     fn hostname_normalization() {
@@ -942,12 +1349,12 @@ mod tests {
 
     #[tokio::test]
     async fn sample_reads_real_values() {
-        let mut sampler = Sampler::new();
-        let s = sampler.sample().await.unwrap();
+        let mut sampler = Sampler::new(sample_timeout(Duration::from_secs(5)));
+        let s = ready(sampler.sample().await);
         assert!(s.total_memory > 0);
         assert!(s.used_memory <= s.total_memory);
         assert!(s.cpu_usage.is_finite());
-        let s = sampler.sample().await.unwrap();
+        let s = ready(sampler.sample().await);
         assert!(s.cpu_usage.is_finite() && (0.0..=100.0 + 1e-3).contains(&s.cpu_usage));
     }
 
@@ -971,9 +1378,9 @@ mod tests {
             .unwrap();
         let worker = std::thread::current().id();
         rt.block_on(async {
-            let mut sampler = Sampler::with_refresh(record_refresh_thread);
-            sampler.sample().await.unwrap();
-            sampler.sample().await.unwrap();
+            let mut sampler = Sampler::with_refresh(record_refresh_thread, Duration::from_secs(10));
+            ready(sampler.sample().await);
+            ready(sampler.sample().await);
         });
         let threads = REFRESH_THREADS.lock().unwrap().clone();
         // 第一次取樣：基準 + 讀數；第二次：只刷新一次
@@ -987,27 +1394,212 @@ mod tests {
         REFRESH_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    static FIRST_SAMPLE_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_first_sample_refresh(_: &mut System) {
+        FIRST_SAMPLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_sample_covers_a_full_interval() {
+        // Q3：啟動時先建立基準並跳過第一次 tick，第一筆取樣在一個 interval 之後，
+        // 只刷新一次（不再是「基準 + 200 ms 後的讀數」）
+        use std::sync::atomic::Ordering::SeqCst;
+        const INTERVAL: Duration = Duration::from_secs(5);
+        let (tx, mut rx) = mpsc::channel(4);
+        let start = Instant::now();
+        let task = tokio::spawn(collect_with(
+            Sampler::with_refresh(count_first_sample_refresh, Duration::from_secs(10)),
+            INTERVAL,
+            tx,
+        ));
+        // 第一個 interval 內沒有任何取樣，只建立了基準
+        time::sleep(INTERVAL - Duration::from_millis(10)).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(FIRST_SAMPLE_CALLS.load(SeqCst), 1, "只有基準");
+
+        rx.recv().await.unwrap();
+        let first_at = start.elapsed();
+        assert!(
+            first_at >= INTERVAL && first_at < INTERVAL + MINIMUM_CPU_UPDATE_INTERVAL,
+            "{first_at:?}"
+        );
+        assert_eq!(FIRST_SAMPLE_CALLS.load(SeqCst), 2, "基準 + 第一筆");
+
+        rx.recv().await.unwrap();
+        let second_at = start.elapsed();
+        assert!(
+            second_at >= INTERVAL * 2 && second_at < INTERVAL * 2 + MINIMUM_CPU_UPDATE_INTERVAL
+        );
+        assert_eq!(FIRST_SAMPLE_CALLS.load(SeqCst), 3);
+        task.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cpu_is_averaged_over_the_report_interval() {
         // R2-P3：之後每次取樣只刷新一次 CPU、不再額外等待 200 ms，
         // 因此 CPU 使用率涵蓋上次取樣到這次取樣之間的整段時間
         use std::sync::atomic::Ordering::SeqCst;
-        let mut sampler = Sampler::with_refresh(count_refresh);
+        let mut sampler = Sampler::with_refresh(count_refresh, Duration::from_secs(10));
         let t0 = Instant::now();
-        sampler.sample().await.unwrap();
+        ready(sampler.sample().await);
         assert_eq!(REFRESH_CALLS.load(SeqCst), 2, "第一次：基準 + 讀數");
         assert!(t0.elapsed() >= MINIMUM_CPU_UPDATE_INTERVAL);
         for i in 1..=3 {
             time::sleep(Duration::from_secs(5)).await;
             let t = Instant::now();
-            sampler.sample().await.unwrap();
+            ready(sampler.sample().await);
             assert_eq!(REFRESH_CALLS.load(SeqCst), 2 + i);
             assert!(t.elapsed() < MINIMUM_CPU_UPDATE_INTERVAL, "不應再額外等待");
         }
         // 兩次取樣間隔太短時才補足 sysinfo 要求的最短間隔
         let t = Instant::now();
-        sampler.sample().await.unwrap();
+        ready(sampler.sample().await);
         assert!(t.elapsed() >= MINIMUM_CPU_UPDATE_INTERVAL);
         assert_eq!(REFRESH_CALLS.load(SeqCst), 6);
+    }
+
+    /// 測試用：取出完成的取樣。
+    #[tokio::test]
+    async fn real_extra_metrics_are_valid() {
+        // 實際的磁碟、網路與溫度讀數也符合協定（各平台可能為空）
+        let metrics = tokio::task::spawn_blocking(|| Extras::new().refresh_and_read())
+            .await
+            .unwrap();
+        if !metrics.is_empty() {
+            kairos_proto::validate_metrics(&metrics).unwrap();
+        }
+    }
+
+    fn ready(outcome: SampleOutcome) -> Sample {
+        match outcome {
+            SampleOutcome::Ready(s) => s,
+            other => panic!("預期取樣完成：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_timeout_follows_interval_within_bounds() {
+        assert_eq!(
+            sample_timeout(Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            sample_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            sample_timeout(Duration::from_secs(3600)),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// 卡住測試用的刷新函式：`STUCK` 為 true 時一直等待（模擬 WMI 卡住）。
+    static STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static STUCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn maybe_stuck_refresh(_: &mut System) {
+        use std::sync::atomic::Ordering::SeqCst;
+        STUCK_CALLS.fetch_add(1, SeqCst);
+        while STUCK.load(SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn stuck_sampling_is_reported_and_skipped() {
+        // Q4：取樣卡住時記 WARN、略過 report，不再發起新的刷新；恢復後重新建立基準再回報
+        use std::sync::atomic::Ordering::SeqCst;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ((), logs) = crate::test_log::capture(|| {
+            rt.block_on(async {
+                let mut sampler =
+                    Sampler::with_refresh(maybe_stuck_refresh, Duration::from_millis(100));
+                sampler.baseline().await.unwrap();
+                assert_eq!(STUCK_CALLS.load(SeqCst), 1);
+
+                STUCK.store(true, SeqCst);
+                time::sleep(MINIMUM_CPU_UPDATE_INTERVAL).await;
+                let t = Instant::now();
+                assert!(matches!(sampler.sample().await, SampleOutcome::Skipped));
+                assert!(t.elapsed() >= Duration::from_millis(100));
+                assert!(t.elapsed() < Duration::from_secs(5), "逾時後立即返回");
+                // 仍卡住：不發起新的刷新、立即略過
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    assert!(matches!(sampler.sample().await, SampleOutcome::Skipped));
+                    assert!(t.elapsed() < Duration::from_millis(50));
+                }
+                assert_eq!(STUCK_CALLS.load(SeqCst), 2, "卡住期間不得再發起刷新");
+
+                // 恢復：取回 System，這次仍略過（重新建立基準），下次恢復回報
+                STUCK.store(false, SeqCst);
+                time::sleep(Duration::from_millis(200)).await;
+                assert!(matches!(sampler.sample().await, SampleOutcome::Skipped));
+                time::sleep(MINIMUM_CPU_UPDATE_INTERVAL).await;
+                ready(sampler.sample().await);
+                assert_eq!(STUCK_CALLS.load(SeqCst), 3);
+            });
+        });
+        let warns: Vec<_> = logs
+            .iter()
+            .filter(|(l, _)| *l == log::Level::Warn)
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "第一次逾時記一則，之後在節流視窗內：{logs:?}"
+        );
+        assert!(
+            warns[0].contains("略過這次 report") && warns[0].contains("heartbeat 照常送出"),
+            "{warns:?}"
+        );
+        assert!(
+            logs.iter().any(|(l, m)| *l == log::Level::Info
+                && m.contains("已恢復")
+                && m.contains("略過 4 次")),
+            "{logs:?}"
+        );
+    }
+
+    static STUCK_COLLECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn maybe_stuck_collect_refresh(_: &mut System) {
+        while STUCK_COLLECT.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_skips_reports_while_sampling_is_stuck() {
+        // Q4：收集 task 在取樣卡住期間不送出取樣，恢復後繼續
+        use std::sync::atomic::Ordering::SeqCst;
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(collect_with(
+            Sampler::with_refresh(maybe_stuck_collect_refresh, Duration::from_millis(100)),
+            Duration::from_millis(250),
+            tx,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        STUCK_COLLECT.store(true, SeqCst);
+        // 正在進行的取樣可能剛好在卡住前完成：先清掉
+        time::sleep(Duration::from_millis(300)).await;
+        while rx.try_recv().is_ok() {}
+        time::sleep(Duration::from_millis(1000)).await;
+        assert!(rx.try_recv().is_err(), "卡住期間不應有取樣");
+        STUCK_COLLECT.store(false, SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("恢復後應繼續送出取樣")
+            .unwrap();
+        task.abort();
     }
 }

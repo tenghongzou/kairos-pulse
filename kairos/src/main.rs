@@ -1,6 +1,12 @@
 mod auth;
 mod config;
 mod connection;
+mod dedup;
+mod expiry;
+mod export_cli;
+mod fsperm;
+mod hosts_cli;
+mod import_cli;
 #[cfg(test)]
 mod integration_tests;
 mod logger;
@@ -13,6 +19,7 @@ mod reload;
 mod retention;
 mod shutdown;
 mod storage;
+mod store;
 #[cfg(test)]
 mod test_pki;
 mod throttle;
@@ -31,9 +38,9 @@ use tokio::time::{MissedTickBehavior, interval, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::BindingPolicy;
-use crate::config::{AppConfig, CliAction, USAGE, parse_args};
+use crate::config::{AppConfig, CliAction, ListenAuth, USAGE, parse_args};
 use crate::connection::{ConnContext, handle_connection, is_peer_disconnect};
-use crate::per_ip::{PerIpLimiter, Rejected};
+use crate::per_ip::{ConnectionSlot, PerIpLimiter, PerIpPolicy, Rejected};
 use crate::rate::ReportLimiter;
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::{CONNECTIONS_DEADLINE, MONITOR_DEADLINE, Shutdown, WRITER_DEADLINE};
@@ -151,6 +158,7 @@ impl Saturation {
 
 /// accept 迴圈：先取得全域連線名額再 accept，再取得來源的名額（同時連線數與新連線速率）與
 /// 「握手中」的名額，為每條連線啟動 [`handle_connection`]，直到關機。
+/// 被拒的連線與全域上限的暫停時間記錄在 `per_ip` 的計數器（[`PerIpLimiter::stats`]）。
 /// 回傳仍在執行的連線（listener 隨之釋放，不再接受新連線）。
 pub(crate) async fn accept_loop(
     listener: TcpListener,
@@ -180,16 +188,22 @@ pub(crate) async fn accept_loop(
         let permit: OwnedSemaphorePermit = match limit.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
+                per_ip.stats().pause_begin(Instant::now());
                 if saturation.enter() {
-                    warn!("已達連線上限 {}，暫停接受新連線", max_connections);
+                    warn!(
+                        "已達同時連線上限 {}（server.max_connections），暫停接受新連線；之後的新連線在 TCP 層排隊或逾時",
+                        max_connections
+                    );
                 }
-                tokio::select! {
+                let permit = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break 'accept,
                     res = limit.clone().acquire_owned() => {
                         res.map_err(|_| Error::other("連線上限的 Semaphore 已關閉"))?
                     }
-                }
+                };
+                per_ip.stats().pause_end(Instant::now());
+                permit
             }
             Err(TryAcquireError::Closed) => {
                 return Err(Error::other("連線上限的 Semaphore 已關閉"));
@@ -205,9 +219,12 @@ pub(crate) async fn accept_loop(
                 _ = saturation_check.tick() => {
                     // 手上這個名額尚未使用，也算可用
                     if saturation.check_resume(limit.available_permits() + 1) {
+                        let global = per_ip.stats().snapshot(Instant::now()).global;
                         info!(
-                            "連線數已降至上限 {} 以下，恢復接受新連線",
-                            max_connections
+                            "連線數已降至上限 {} 以下，恢復接受新連線（啟動以來因全域上限暫停 {} 次、累計 {:.1} 秒）",
+                            max_connections,
+                            global.pauses,
+                            global.paused.as_secs_f64()
                         );
                     }
                 }
@@ -234,23 +251,49 @@ pub(crate) async fn accept_loop(
                 continue;
             }
         };
-        // 每個來源的同時連線數與新連線速率上限：超過時立即關閉，不進行 TLS 握手
-        // 依序檢查：該位址的同時連線數 → 握手中的連線數上限（保留名額給已通過 hello 的連線）→
-        // 該來源（IPv6 /64）的新連線速率。被前兩者拒絕的連線不扣速率額度。超過時立即關閉，不進行 TLS 握手
+        // 依序檢查：該位址的連線數（mTLS 時只計算握手中的連線）→ 握手中的連線數上限（保留名額給已通過
+        // hello 的連線）→ 該來源（IPv6 /64）的新連線速率。被前兩者拒絕的連線不扣速率額度。
+        // 超過任一上限時立即關閉，不進行 TLS 握手；被拒的連線依原因計數（per_ip::stats）
         let mut pre_auth = None;
         let ip_permit = match per_ip.try_acquire(peer.ip(), || {
             pre_auth = handshakes.clone().try_acquire_owned().ok();
             pre_auth.is_some()
         }) {
             Ok(p) => p,
-            Err(Rejected::Concurrency) => {
+            Err(Rejected::Concurrency(limit)) => {
+                // 設計包 KRS-W2201 的情境：寫出計算方式與要調的設定
+                let (counted, setting, hint) = match (per_ip.policy().mtls, limit.allowlisted) {
+                    (false, false) => (
+                        "同時連線數",
+                        "server.max_connections_per_ip",
+                        "；若這是多台主機共用的 NAT 出口，可將它加入 server.per_ip_allowlist",
+                    ),
+                    (true, false) => (
+                        "握手中（尚未通過 hello）的連線數",
+                        "server.max_connections_per_ip；啟用 mTLS 時通過 hello 的連線改依憑證身分計數",
+                        "；若這是多台主機共用的 NAT 出口，可將它加入 server.per_ip_allowlist",
+                    ),
+                    (false, true) => (
+                        "同時連線數",
+                        "此位址在 server.per_ip_allowlist 中，上限為 server.max_connections_per_allowlisted_ip 與 server.max_connections 的較小者",
+                        "",
+                    ),
+                    (true, true) => (
+                        "握手中（尚未通過 hello）的連線數",
+                        "此位址在 server.per_ip_allowlist 中，上限為 server.max_connections_per_allowlisted_ip 與 server.max_connections 的較小者",
+                        "",
+                    ),
+                };
                 throttled!(
                     throttle,
                     (Category::PerIpLimit, peer.ip()),
                     warn,
-                    "來自 {} 的同時連線數已達上限 {}（server.max_connections_per_ip），拒絕新連線",
+                    "來自 {} 的{}已達上限 {}（{}），在 TLS 握手前拒絕新連線{}",
                     peer.ip(),
-                    per_ip.max_per_ip()
+                    counted,
+                    limit.max,
+                    setting,
+                    hint
                 );
                 continue;
             }
@@ -259,7 +302,7 @@ pub(crate) async fn accept_loop(
                     throttle,
                     Category::HandshakeLimit,
                     warn,
-                    "握手中（尚未通過 hello）的連線數已達上限 {}，拒絕來自 {} 的新連線",
+                    "握手中（尚未通過 hello）的連線數已達上限 {}（server.max_connections 的一半），在 TLS 握手前拒絕來自 {} 的新連線",
                     max_handshakes,
                     peer.ip()
                 );
@@ -284,11 +327,12 @@ pub(crate) async fn accept_loop(
         let acceptor = ctx.tls.current().acceptor.clone();
         let ctx = ctx.clone();
         let throttle = throttle.clone();
+        // 來源位址與握手中的名額：hello 通過後依兩階段釋放（per_ip::ConnectionSlot）
+        let slot = ConnectionSlot::new(ip_permit, pre_auth);
         connections.spawn(async move {
-            // permit 在連線結束時釋放
+            // 全域名額在連線結束時釋放
             let _permit = permit;
-            let _ip_permit = ip_permit;
-            match handle_connection(ctx, acceptor, socket, peer, conn_id, pre_auth).await {
+            match handle_connection(ctx, acceptor, socket, peer, conn_id, slot).await {
                 Ok(()) => {}
                 // 對方未送 close_notify 就斷線、連線被重設或中止：屬正常的斷線情境
                 Err(e) if is_peer_disconnect(&e) => {
@@ -307,20 +351,97 @@ pub(crate) async fn accept_loop(
         });
     }
 
+    // 兩類被拒連線的累計值（S20／`/metrics` 尚未實作前，至少在關機時留下紀錄）
+    let summary = per_ip.snapshot(Instant::now()).summary();
+    info!("{}", summary);
     Ok(connections)
 }
 
-/// `run` 的結果對應的結束代碼：正常關機 0；因內部錯誤而關機或啟動失敗 1
+// ---- 結束代碼 ----
+//
+// 依設計包 `design/design-system/cli-style.md` §8（`kairos` 與 `pulse` 共用的結束代碼表）。
+// 常駐模式只用到下列代碼，另有正常結束 0、第二次收到關機訊號時的 130（`shutdown::FORCED_EXIT_CODE`）。
+// 不使用 sysexits（64、78 等）。`packaging/kairos.service` 以 `RestartPreventExitStatus` 讓 systemd
+// 不重試「重試也不會成功」的代碼（2、3、4）。
+
+/// 一般錯誤：內部錯誤（背景工作異常、看門狗強制結束）與未分類的啟動失敗（例如資料目錄、
+/// 日誌目錄無法建立），交由服務管理員重新啟動
+const EXIT_GENERAL: u8 = 1;
+/// 用法錯誤：命令列參數無法辨識、`--config` 缺少路徑或重複指定
+const EXIT_USAGE: u8 = 2;
+/// 設定錯誤：設定檔無法載入或驗證不通過、`auth.allow_unauthenticated` 未設定卻未啟用 mTLS
+/// 監聽對外位址（S1）等
+const EXIT_CONFIG: u8 = 3;
+/// 憑證錯誤：伺服器憑證、私鑰、客戶端 CA 或 CRL 無法讀取、格式錯誤或不成對
+const EXIT_CERT: u8 = 4;
+/// 衝突：`server.listen` 的連接埠已被佔用（例如另一個 Kairos 仍在執行）。
+/// 舊的行程結束後重試可能成功，因此不列入 `RestartPreventExitStatus`
+const EXIT_CONFLICT: u8 = 11;
+
+/// 帶有結束代碼的 [`Error`] 內容；訊息與 `kind` 不變
+#[derive(Debug)]
+struct Classified {
+    code: u8,
+    inner: Error,
+}
+
+impl std::fmt::Display for Classified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl std::error::Error for Classified {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+/// 為錯誤標上結束代碼（保留原本的 `kind` 與訊息）
+fn classify(e: Error, code: u8) -> Error {
+    Error::new(e.kind(), Classified { code, inner: e })
+}
+
+/// 標記為設定錯誤（[`EXIT_CONFIG`]）
+fn config_error(e: Error) -> Error {
+    classify(e, EXIT_CONFIG)
+}
+
+/// 標記為憑證錯誤（[`EXIT_CERT`]）
+fn cert_error(e: Error) -> Error {
+    classify(e, EXIT_CERT)
+}
+
+/// 監聽失敗：連接埠被佔用時標記為衝突（[`EXIT_CONFLICT`]），其他原因不標記（[`EXIT_GENERAL`]）
+fn listen_error(e: Error) -> Error {
+    if e.kind() == ErrorKind::AddrInUse {
+        classify(e, EXIT_CONFLICT)
+    } else {
+        e
+    }
+}
+
+/// 錯誤上標記的結束代碼（未標記時為 `None`）
+fn classified_code(e: &Error) -> Option<u8> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<Classified>())
+        .map(|c| c.code)
+}
+
+/// `run` 的結果對應的結束代碼：正常關機 0；標記過的啟動失敗為其代碼（3、4、11）；
+/// 因內部錯誤而關機或其他啟動失敗 [`EXIT_GENERAL`]（交由服務管理員重新啟動）
 fn exit_code(result: &Result<Option<String>, Error>) -> u8 {
     match result {
         Ok(None) => 0,
-        Ok(Some(_)) | Err(_) => 1,
+        Err(e) => classified_code(e).unwrap_or(EXIT_GENERAL),
+        Ok(Some(_)) => EXIT_GENERAL,
     }
 }
 
 fn main() -> ExitCode {
     // 日誌尚未初始化前的錯誤只能輸出到 stderr
-    let config_path = match parse_args(std::env::args().skip(1)) {
+    // args_os：非 UTF-8 的參數不會 panic，由 parse_args 回錯誤（審計 Q5）
+    let config_path = match parse_args(std::env::args_os().skip(1)) {
         Ok(CliAction::Run { config_path }) => config_path,
         Ok(CliAction::Help) => {
             println!("{}", USAGE);
@@ -330,17 +451,34 @@ fn main() -> ExitCode {
             println!("{}", VERSION);
             return ExitCode::SUCCESS;
         }
+        // 子命令：查詢後結束，不啟動伺服器、不寫日誌檔
+        Ok(CliAction::Hosts(cmd)) => return ExitCode::from(hosts_cli::run(cmd)),
+        Ok(CliAction::Reports(cmd)) => return ExitCode::from(export_cli::run(cmd)),
+        Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
         Err(e) => {
-            eprintln!("{}\n\n{}", e, USAGE);
-            return ExitCode::FAILURE;
+            let usage = match std::env::args_os().nth(1) {
+                Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
+                Some(a) if a == "reports" => {
+                    if std::env::args_os().nth(2).is_some_and(|a| a == "import") {
+                        import_cli::IMPORT_USAGE
+                    } else {
+                        export_cli::REPORTS_USAGE
+                    }
+                }
+                Some(a) if a == "db" => export_cli::DB_USAGE,
+                _ => USAGE,
+            };
+            eprintln!("{}\n\n{}", e, usage);
+            return ExitCode::from(EXIT_USAGE);
         }
     };
 
+    // 設定錯誤以 EXIT_CONFIG 結束，systemd 不再重試（RestartPreventExitStatus）
     let config = match AppConfig::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
 
@@ -349,14 +487,14 @@ fn main() -> ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
     let newest_log = match logger::setup(level) {
         Ok(newest) => newest,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
 
@@ -367,7 +505,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             error!("Kairos 啟動失敗: 無法建立 tokio runtime: {}", e);
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_GENERAL);
         }
     };
     let result = runtime.block_on(run(
@@ -476,8 +614,28 @@ async fn run(
         None if default_file.is_file() => info!("設定檔: {}", default_file.display()),
         None => info!("未找到 {}，使用程式內預設值", default_file.display()),
     }
+    // 預設拒絕：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動（S1）。
+    // 以解析後的位址判斷（server.listen 可以是主機名稱，例如 localhost:8080）
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.server.listen)
+        .await
+        .map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("無法解析 server.listen {}: {}", config.server.listen, e),
+            )
+        })?
+        .collect();
+    let listen_auth = config.check_listen_auth(&resolved).map_err(config_error)?;
     warn_if_fd_limit_low(config.server.max_connections);
-    if let Some((max, estimate)) = config.daily_limit_below_estimate() {
+    if let Some((max, estimate)) = config.total_limit_below_estimate() {
+        warn!(
+            "storage.max_total_bytes（{} bytes）小於以 {} 台主機、每 5 秒一筆 report 與目前保留天數估算的容量（約 {} bytes，見 STORAGE.md「容量估算」）；達到上限後會提早刪除最舊的原始 report 與彙總",
+            max, config.server.max_connections, estimate
+        );
+    }
+    if config.storage.writes_jsonl()
+        && let Some((max, estimate)) = config.daily_limit_below_estimate()
+    {
         warn!(
             "storage.max_daily_bytes（{} bytes）小於以 {} 條連線、每條每秒 1 則 report 估算的每日量（約 {} bytes）；達到上限後當天的 report 會回 storage_unavailable 而不寫入",
             max, config.server.max_connections, estimate
@@ -492,36 +650,63 @@ async fn run(
         crls: config.auth.crl_paths(),
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
-    let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths)?));
-    match &tls_paths.client_ca {
-        Some(ca) => info!(
-            "已啟用客戶端憑證驗證（mTLS），信任 {}，CRL {} 份；agent_id 必須與憑證的 SAN 相符",
-            ca,
-            tls_state.current().crl_count
+    let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths).map_err(cert_error)?));
+    // 伺服器憑證與 CRL 的到期預警（O1）：啟動時檢查一次，之後由重載工作（或停用重載時的定期工作）檢查
+    let mut expiry_warner = expiry::ExpiryWarner::new(config.expiry_policy());
+    expiry_warner.check_and_log(&tls_state.current().expiries, true);
+    // 伺服器私鑰權限過寬時提醒（S8；只在 Unix 檢查，熱重載換了私鑰時再檢查一次）
+    if let Some(message) = fsperm::key_permission_warning(Path::new(&tls_paths.key)) {
+        warn!("{}", message);
+    }
+    match (&tls_paths.client_ca, &listen_auth) {
+        (Some(ca), _) => {
+            info!(
+                "已啟用客戶端憑證驗證（mTLS），信任 {}，CRL {} 份；agent_id 必須與憑證的 SAN 相符",
+                ca,
+                tls_state.current().crl_count
+            );
+            if config.auth.allow_unauthenticated {
+                info!("已啟用 mTLS，auth.allow_unauthenticated 不生效");
+            }
+        }
+        (None, ListenAuth::UnauthenticatedAllowed { exposed }) => warn!(
+            "未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 {}（auth.allow_unauthenticated = true）：任何能連線的人都能以任意 agent_id 註冊、寫入 report，或把合法的 agent 踢下線。僅限隔離的測試環境，正式環境請啟用 mTLS",
+            exposed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("、")
         ),
-        None => warn!(
-            "未啟用客戶端憑證驗證（auth.client_ca），任何人都能以任意 agent_id 註冊，僅建議用於本機開發"
+        (None, _) => warn!(
+            "未啟用客戶端憑證驗證（auth.client_ca），只監聽 loopback 位址；同一台主機上的任何程式都能以任意 agent_id 註冊，僅建議用於本機開發"
         ),
     }
 
-    // 準備資料目錄與 report 寫入工作（按 UTC 日期分檔，啟動時與每小時清除過期檔案）
+    // 準備資料目錄與 report 的儲存（SQLite 或 JSONL，見 store 模組）
     let paths = storage::prepare_data_dir(Path::new(&config.storage.data_dir)).await?;
-    let (reports, writer_task) = storage::start_report_writer(
-        paths.data_dir.clone(),
-        config.storage.retention_days,
-        config.storage.max_daily_bytes,
-        chrono::Utc::now,
-        storage::RETENTION_SWEEP_INTERVAL,
-    )
-    .await?;
+    // 既有的資料、日誌目錄對其他使用者開放時提醒（S3；Kairos 不自行改變既有目錄的權限）
+    for (dir, what) in [
+        (paths.data_dir.as_path(), "資料目錄"),
+        (opts.log_dir.as_path(), "日誌目錄"),
+    ] {
+        if let Some(message) = fsperm::dir_permission_warning(dir, what) {
+            warn!("{}", message);
+        }
+    }
+    let store::Storage {
+        reports,
+        writer: writer_task,
+        inventory,
+        restored,
+    } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
 
     let listener = TcpListener::bind(&config.server.listen)
         .await
         .map_err(|e| {
-            Error::new(
+            listen_error(Error::new(
                 e.kind(),
                 format!("無法監聽 {}: {}", config.server.listen, e),
-            )
+            ))
         })?;
     let local_addr = listener
         .local_addr()
@@ -535,6 +720,14 @@ async fn run(
     }
 
     let registry = Arc::new(Registry::with_max_agents(config.max_agents()));
+    // 主機清冊中最近 24 小時出現過的主機以離線狀態放回狀態表（A6）
+    if !restored.is_empty() {
+        let n = registry.restore(restored, Instant::now(), chrono::Utc::now());
+        info!(
+            "已從主機清冊載回 {} 台最近 24 小時內出現過的主機（離線）",
+            n
+        );
+    }
     let writer = supervise(
         "report 寫入工作",
         tokio::spawn(writer_task),
@@ -547,6 +740,7 @@ async fn run(
         tokio::spawn(monitor::run(
             registry.clone(),
             paths.clone(),
+            inventory.clone(),
             monitor_stop.clone(),
         )),
         shutdown.clone(),
@@ -564,9 +758,22 @@ async fn run(
 
     // TLS 熱重載與現役連線的客戶端憑證重新驗證
     match config.server.reload_interval_secs {
-        0 => warn!(
-            "已停用 TLS 熱重載（server.reload_interval_secs = 0）：更換憑證、CA 或 CRL 需重新啟動，現役連線的客戶端憑證也不會重新驗證"
-        ),
+        0 => {
+            warn!(
+                "已停用 TLS 熱重載（server.reload_interval_secs = 0）：更換憑證、CA 或 CRL 需重新啟動，現役連線的客戶端憑證也不會重新驗證"
+            );
+            // 到期預警仍定期檢查（O1）
+            supervise(
+                "到期預警工作",
+                tokio::spawn(expiry::run(
+                    expiry_warner,
+                    tls_state.clone(),
+                    expiry::PERIODIC_CHECK_WITHOUT_RELOAD,
+                    shutdown.clone(),
+                )),
+                shutdown.clone(),
+            );
+        }
         secs => {
             info!("每 {} 秒檢查憑證、私鑰、客戶端 CA 與 CRL 是否變更", secs);
             supervise(
@@ -579,6 +786,7 @@ async fn run(
                     ),
                     registry.clone(),
                     tls_state.clone(),
+                    expiry_warner,
                     Duration::from_secs(secs),
                     shutdown.clone(),
                 )),
@@ -587,6 +795,12 @@ async fn run(
         }
     }
 
+    // 每 IP 上限、網段允許清單與 mTLS 時的兩階段計數（審計 A7）
+    let per_ip_policy = PerIpPolicy::from_config(&config).map_err(config_error)?;
+    if let Some(warning) = config.allowlisted_limit_warning() {
+        warn!("{}", warning);
+    }
+    info!("{}", per_ip_policy.describe());
     let throttle = Arc::new(LogThrottle::default());
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),
@@ -598,9 +812,9 @@ async fn run(
         binding: BindingPolicy {
             allow_multiple_dns_sans: config.auth.allow_multiple_dns_sans,
         },
-        report_limiter: Arc::new(ReportLimiter::new(config.max_connections_per_ip())),
+        report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
     });
-    let per_ip = PerIpLimiter::new(config.max_connections_per_ip());
+    let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
     info!(
         "Kairos 已啟動，監聽 {}（連線上限 {}，其中握手中 {}，每個來源 IP {}，狀態表上限 {}，資料目錄 {}）",
@@ -641,6 +855,10 @@ async fn run(
         info!("將 {} 個仍在線上的 agent 標記為離線", forced);
     }
 
+    // 最後一份狀態（所有 agent 已標為離線）交給 writer，結束前寫入主機清冊
+    if let Some(feed) = &inventory {
+        feed.send_replace(Some(Arc::new(registry.snapshot(chrono::Utc::now()))));
+    }
     // 釋放最後一個 report sender，writer 取完佇列、寫入並逐筆回覆後結束
     let pending = ctx.reports.pending();
     drop(ctx);
@@ -882,13 +1100,169 @@ Max open files            1024                 524288               files     \n
         );
         assert_eq!(exit_code(&result), 1);
 
-        // 啟動失敗（憑證不存在）：結束代碼 1
+        // 其他啟動失敗（資料目錄無法建立：路徑是一個檔案）：結束代碼 1
         let (opts, _) = run_options(&dir);
         let mut bad = run_config(&dir);
-        bad.server.cert_path = dir.join("missing.crt").to_string_lossy().into_owned();
+        std::fs::write(dir.join("not-a-dir"), b"x").unwrap();
+        bad.storage.data_dir = dir.join("not-a-dir").to_string_lossy().into_owned();
         let result = run(bad, None, None, opts).await;
         assert!(result.is_err());
-        assert_eq!(exit_code(&result), 1);
+        assert_eq!(exit_code(&result), EXIT_GENERAL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_classifies_certificate_and_listen_errors() {
+        // cli-style.md §8：伺服器憑證、私鑰、客戶端 CA、CRL 的問題為 4；連接埠被佔用為 11
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-run-codes-{}-{}",
+            std::process::id(),
+            next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(dir.join("not-pem.txt"), b"not a pem file\n").unwrap();
+        std::fs::write(dir.join("ca.pem"), test_pki::CA).unwrap();
+        let other_key = concat!(env!("CARGO_MANIFEST_DIR"), "/../pulse/testdata/server.key");
+
+        // (情境, 修改設定)
+        let mut cases: Vec<(&str, AppConfig)> = Vec::new();
+        let mut c = run_config(&dir);
+        c.server.cert_path = path("missing.pem");
+        cases.push(("伺服器憑證不存在", c));
+        let mut c = run_config(&dir);
+        c.server.key_path = path("not-pem.txt");
+        cases.push(("私鑰不是 PEM", c));
+        let mut c = run_config(&dir);
+        c.server.key_path = other_key.into();
+        cases.push(("私鑰與憑證不成對", c));
+        let mut c = run_config(&dir);
+        c.auth.client_ca = path("missing.pem");
+        cases.push(("客戶端 CA 不存在", c));
+        let mut c = run_config(&dir);
+        c.auth.client_ca = path("ca.pem");
+        c.auth.crl = vec![path("missing.pem")];
+        cases.push(("CRL 不存在", c));
+        for (what, config) in cases {
+            let (opts, _) = run_options(&dir);
+            let result = run(config, None, None, opts).await;
+            assert!(result.is_err(), "{what}: {result:?}");
+            assert_eq!(exit_code(&result), EXIT_CERT, "{what}: {result:?}");
+        }
+
+        // 連接埠已被佔用
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = run_config(&dir);
+        config.server.listen = occupied.local_addr().unwrap().to_string();
+        let (opts, _) = run_options(&dir);
+        let result = run(config, None, None, opts).await;
+        let err = result.as_ref().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AddrInUse, "{err}");
+        assert!(err.to_string().contains("無法監聽"), "{err}");
+        assert_eq!(exit_code(&result), EXIT_CONFLICT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classified_errors_keep_kind_and_message() {
+        let e = config_error(Error::new(ErrorKind::InvalidInput, "設定值超出範圍"));
+        assert_eq!(classified_code(&e), Some(EXIT_CONFIG));
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert_eq!(e.to_string(), "設定值超出範圍");
+        assert_eq!(exit_code(&Err(e)), EXIT_CONFIG);
+
+        let e = cert_error(Error::new(ErrorKind::NotFound, "找不到憑證"));
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        assert_eq!(e.to_string(), "找不到憑證");
+        assert_eq!(exit_code(&Err(e)), EXIT_CERT);
+
+        // 只有「連接埠被佔用」標記為衝突
+        assert_eq!(
+            exit_code(&Err(listen_error(Error::from(ErrorKind::AddrInUse)))),
+            EXIT_CONFLICT
+        );
+        assert_eq!(
+            exit_code(&Err(listen_error(Error::from(ErrorKind::AddrNotAvailable)))),
+            EXIT_GENERAL
+        );
+
+        // 未標記的錯誤：1
+        assert_eq!(classified_code(&Error::other("x")), None);
+        assert_eq!(classified_code(&Error::from(ErrorKind::NotFound)), None);
+        assert_eq!(exit_code(&Err(Error::other("x"))), EXIT_GENERAL);
+        assert_eq!(exit_code(&Ok(Some("內部錯誤".into()))), EXIT_GENERAL);
+        assert_eq!(exit_code(&Ok(None)), 0);
+    }
+
+    #[test]
+    fn unit_does_not_restart_when_retrying_cannot_help() {
+        // kairos.service 的 RestartPreventExitStatus 必須恰好是用法、設定、憑證錯誤（2、3、4）；
+        // 一般錯誤（1）與連接埠衝突（11）仍交由 systemd 重新啟動
+        let unit = include_str!("../packaging/kairos.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("RestartPreventExitStatus="))
+            .expect("kairos.service 應設定 RestartPreventExitStatus");
+        let codes: Vec<&str> = line["RestartPreventExitStatus=".len()..]
+            .split_whitespace()
+            .collect();
+        let expected = [EXIT_USAGE, EXIT_CONFIG, EXIT_CERT].map(|c| c.to_string());
+        assert_eq!(codes, expected, "{line}");
+        assert!(unit.lines().any(|l| l.trim() == "Restart=on-failure"));
+    }
+
+    #[tokio::test]
+    async fn run_refuses_unauthenticated_non_loopback_listen() {
+        // S1：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動，且在建立資料目錄與監聽之前
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-run-s1-{}-{}",
+            std::process::id(),
+            next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = run_config(&dir);
+        config.server.listen = "0.0.0.0:0".into();
+        let (opts, _) = run_options(&dir);
+        let result = run(config.clone(), None, None, opts).await;
+        let err = result.as_ref().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("auth.allow_unauthenticated"),
+            "{err}"
+        );
+        // 設定錯誤：結束代碼 3，systemd 不重試
+        assert_eq!(exit_code(&result), EXIT_CONFIG);
+        assert!(!dir.join("data").exists(), "拒絕啟動前不應建立資料目錄");
+
+        // 明確允許時照常啟動
+        config.auth.allow_unauthenticated = true;
+        let (opts, shutdown) = run_options(&dir);
+        let task = tokio::spawn(run(config, None, None, opts));
+        for _ in 0..250 {
+            if dir.join("data").join(storage::AGENTS_FILE).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown.trigger();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run 應在關機後結束")
+            .unwrap();
+        assert!(matches!(result, Ok(None)), "{result:?}");
+
+        // 主機名稱解析成 loopback 時照常啟動（不需 allow_unauthenticated）
+        let mut config = run_config(&dir);
+        config.server.listen = "localhost:0".into();
+        let (opts, shutdown) = run_options(&dir);
+        let task = tokio::spawn(run(config, None, None, opts));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.trigger();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Ok(None)), "{result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

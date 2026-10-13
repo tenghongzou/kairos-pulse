@@ -1,4 +1,5 @@
-//! 監控 task：每 1 秒 sweep、每 5 秒寫 agents.json、每 60 秒輸出摘要。
+//! 監控 task：每 1 秒 sweep、每 5 秒寫 agents.json（同一份快照交給 SQLite 的主機清冊同步）、
+//! 每 60 秒輸出摘要。
 //! 收到停止通知時結束；關機時的最後一份 agents.json 由 [`write_final_snapshot`] 寫出
 //! （由 main 呼叫，monitor 異常結束時也會寫出；R2-K17）。
 
@@ -11,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::registry::Registry;
 use crate::storage::{DataPaths, write_agents_snapshot};
+use crate::store::InventoryFeed;
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// 以 sweep 次數計算的週期
@@ -106,7 +108,12 @@ impl FailureLog {
     }
 }
 
-pub async fn run(registry: Arc<Registry>, paths: DataPaths, stop: CancellationToken) {
+pub async fn run(
+    registry: Arc<Registry>,
+    paths: DataPaths,
+    inventory: Option<InventoryFeed>,
+    stop: CancellationToken,
+) {
     let mut ticker = interval(SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut tick: u64 = 0;
@@ -160,7 +167,11 @@ pub async fn run(registry: Arc<Registry>, paths: DataPaths, stop: CancellationTo
         }
 
         if tick.is_multiple_of(SNAPSHOT_EVERY_TICKS) {
-            let snapshot = registry.snapshot(Utc::now());
+            let snapshot = Arc::new(registry.snapshot(Utc::now()));
+            // SQLite 時：writer 每 30 秒取最新的一份同步到主機清冊
+            if let Some(feed) = &inventory {
+                feed.send_replace(Some(snapshot.clone()));
+            }
             match write_agents_snapshot(&paths, &snapshot).await {
                 Ok(()) => {
                     if snapshot_failures.succeeded() {
@@ -255,6 +266,8 @@ mod tests {
                     agent_id: "a".into(),
                     hostname: "h".into(),
                     agent_version: "1".into(),
+                    proto: 1,
+                    host: None,
                     peer: "p".into(),
                     offline_after: Duration::from_millis(100),
                     client_chain: None,
@@ -264,7 +277,13 @@ mod tests {
             )
             .unwrap();
         let stop = CancellationToken::new();
-        let task = tokio::spawn(run(registry.clone(), paths.clone(), stop.clone()));
+        let (feed, feed_rx) = tokio::sync::watch::channel(None);
+        let task = tokio::spawn(run(
+            registry.clone(),
+            paths.clone(),
+            Some(Arc::new(feed)),
+            stop.clone(),
+        ));
 
         // 第一次 tick 立即 sweep 並寫出快照（此時仍在線）
         let mut first = None;
@@ -277,6 +296,9 @@ mod tests {
         }
         let first: serde_json::Value = serde_json::from_str(&first.expect("應寫出快照")).unwrap();
         assert_eq!(first["total"], 1);
+        // 同一份快照交給主機清冊
+        let fed = feed_rx.borrow().clone().expect("應送出快照給主機清冊");
+        assert_eq!(fed.agents[0].agent_id, "a");
 
         // 下一次 sweep（1 秒後）判定離線
         let mut offline = false;

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::UnixTime;
@@ -20,12 +20,15 @@ use tokio_util::codec::Framed;
 
 use crate::auth::{BindingError, BindingPolicy, cert_matches_agent_id};
 use crate::config::TimeoutSettings;
-use crate::per_ip::source_key;
+use crate::per_ip::{ConnectionSlot, source_key};
 use crate::protocol::{
-    ClientMsg, ErrorCode, Frame, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, NdjsonCodec,
-    PROTO_VERSION, Proto, ServerMsg, clamp_heartbeat_interval_ms, hello_seq_of_invalid,
-    normalize_agent_id, offline_after_ms, parse_client_msg, validate_client_msg, validate_hello,
-    validate_report,
+    ClientMsg, ErrorCode, Frame, HelloExt, HostInfo, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH,
+    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, NdjsonCodec, Proto,
+    ProtoRangeError, SERVER_FEATURES, SUPPORTED_PROTO, ServerMsg, Session,
+    clamp_heartbeat_interval_ms, client_proto_range, hello_seq_of_invalid, negotiate,
+    normalize_agent_id, offline_after_ms, parse_client_msg, server_cpu_usage,
+    unsupported_version_error, validate_client_msg, validate_features, validate_hello,
+    validate_host_info, validate_metrics, validate_report,
 };
 use crate::rate::{
     MAX_REPORT_PACING_DELAY, Pace, REPORT_BURST, REPORT_RATE_PER_SEC, ReportLimiter, ReportSource,
@@ -35,7 +38,7 @@ use crate::registry::{
     ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
 };
 use crate::shutdown::{CONNECTIONS_DEADLINE, Shutdown, drain_limit};
-use crate::storage::{ReportRecord, ReportSink, WriteStatus, fmt_time};
+use crate::storage::{DedupKey, RecordBody, ReportRecord, ReportSink, WriteStatus, fmt_time};
 use crate::throttle::{Category, Key, LogThrottle};
 use crate::throttled;
 use crate::tls::{RevocationFailure, TlsState, revocation_failure, verify_chain};
@@ -187,6 +190,56 @@ fn classify(frame: Frame) -> Incoming {
     }
 }
 
+/// 一個 MB（agents.json 的 `total_memory`／`used_memory` 單位，與 v1 report 相同）
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
+/// agents.json 的 `last_report`：v1 report 照舊；v2 的指標 report 取沒有 label 的
+/// `system.cpu.usage`、`system.memory.total`／`used`（bytes 換算成 MB），另記指標數
+fn last_report_of(record: &ReportRecord) -> LastReport {
+    let (cpu_usage, total_memory, used_memory, metrics) = match &record.body {
+        RecordBody::Legacy {
+            cpu_usage,
+            total_memory,
+            used_memory,
+        } => (
+            Some(*cpu_usage),
+            Some(*total_memory),
+            Some(*used_memory),
+            None,
+        ),
+        RecordBody::Metrics { metrics } => {
+            let find = |name: &str| {
+                metrics
+                    .iter()
+                    .find(|m| m.name == name && m.labels.is_empty())
+                    .map(|m| &m.value)
+            };
+            let mb = |name: &str| {
+                find(name)
+                    .and_then(|v| v.as_u64())
+                    .map(|b| b / BYTES_PER_MB)
+            };
+            (
+                find(METRIC_CPU_USAGE)
+                    .and_then(|v| v.as_f64())
+                    .map(server_cpu_usage),
+                mb(METRIC_MEMORY_TOTAL),
+                mb(METRIC_MEMORY_USED),
+                Some(metrics.len()),
+            )
+        }
+    };
+    LastReport {
+        recv_at: fmt_time(record.recv_at),
+        seq: record.seq,
+        ts: record.ts.clone(),
+        cpu_usage,
+        total_memory,
+        used_memory,
+        metrics,
+    }
+}
+
 /// 計算 `now + duration` 的期限；溢位時退回較短的期限，避免 `Instant + Duration` panic
 fn deadline_after(duration: Duration) -> Instant {
     const FALLBACK: Duration = Duration::from_secs(24 * 60 * 60);
@@ -218,6 +271,10 @@ pub(crate) enum StoreOutcome {
 ///    writer 已開始寫入而無法取消時，再等一小段，仍無結果則回 [`StoreOutcome::Unknown`]；
 /// 3. 寫入成功後才更新 last_report，並再更新一次 last_seen（等待寫檔期間收不到 heartbeat）。
 ///
+/// `record.dedup` 為 durable report 的去重鍵（A5，[`ReportRecord::with_dedup`]）：已保存過的那筆不再
+/// 寫入（[`WriteStatus::Duplicate`]），同樣回 [`StoreOutcome::Stored`]（連線回 `ack`），但不更新
+/// last_report。durable report 可能是補送的舊資料，只在 `ts` 不早於目前的 last_report 時更新。
+///
 /// 各次更新 last_seen 中只要有一次讓 agent 從離線恢復，就把 `revived` 設為 `true`（不論保存結果），
 /// 呼叫端據此記錄「恢復上線」（R2-K13）。
 pub(crate) async fn store_report(
@@ -240,18 +297,12 @@ pub(crate) async fn store_report(
         Touch::Updated => {}
     }
     let agent_id = record.agent_id.clone();
-    let last = LastReport {
-        recv_at: fmt_time(record.recv_at),
-        seq: record.seq,
-        ts: record.ts.clone(),
-        cpu_usage: record.cpu_usage,
-        total_memory: record.total_memory,
-        used_memory: record.used_memory,
-    };
+    let last = last_report_of(&record);
     let timed_out = || format!("寫入未在 {} 秒內完成", write_timeout.as_secs_f64());
     let deadline = deadline_after(write_timeout);
     // 等待期間（含等待佇列空間）以 keep_alive_while 定期更新本連線的 last_seen
     // （只更新 conn_id 相符的現役連線）。在放入佇列前逾時：這筆根本沒有進入佇列
+    let durable = record.dedup.is_some();
     let submit = keep_alive_while(registry, &agent_id, conn_id, revived, sink.submit(record));
     let mut pending = match timeout_at(deadline, submit).await {
         Ok(Ok(pending)) => pending,
@@ -281,9 +332,17 @@ pub(crate) async fn store_report(
         },
     };
     match status {
-        WriteStatus::Written => {
-            // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）
-            registry.set_last_report(&agent_id, conn_id, last);
+        WriteStatus::Written | WriteStatus::Duplicate => {
+            // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）。
+            // 重複的 report（at-least-once 的重送，先前已保存）不更新 last_report：它是較舊的資料。
+            // durable report 可能是補送的舊資料，只在 ts 不早於目前的 last_report 時更新
+            if status == WriteStatus::Written {
+                if durable {
+                    registry.set_last_report_unless_older(&agent_id, conn_id, last);
+                } else {
+                    registry.set_last_report(&agent_id, conn_id, last);
+                }
+            }
             let touch = registry.touch(&agent_id, conn_id, std::time::Instant::now(), Utc::now());
             if touch == Touch::Revived {
                 revived.store(true, Ordering::Relaxed);
@@ -340,6 +399,94 @@ struct Agent {
     hello_seq: u64,
     /// 是否已以 mTLS 驗證 agent_id 與客戶端憑證綁定（決定 report 限速的來源）
     authenticated: bool,
+    /// 協商結果（版本與 report 格式）
+    session: Session,
+    /// v2 hello 的主機資訊（v1、或全部欄位都省略時為 `None`）
+    host: Option<Arc<HostInfo>>,
+}
+
+/// 從 hello 取出、交給 [`Conn::accept_hello`] 的欄位
+struct HelloFields {
+    seq: u64,
+    proto: Proto,
+    agent_id: String,
+    hostname: String,
+    agent_version: String,
+    heartbeat_interval_ms: u64,
+    ext: HelloExt,
+}
+
+/// 依協商格式取出的 report 內容
+enum ReportContent {
+    /// v1 的三個欄位（`cpu_usage` 已轉成伺服器保存用的 f32）
+    Legacy {
+        cpu_usage: f32,
+        total_memory: u64,
+        used_memory: u64,
+    },
+    /// v2 的通用指標
+    Metrics(Vec<Metric>),
+}
+
+impl ReportContent {
+    /// 內容限制（違反時回 `invalid_report`）
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            ReportContent::Legacy {
+                cpu_usage,
+                total_memory,
+                used_memory,
+            } => validate_report(*cpu_usage, *total_memory, *used_memory),
+            ReportContent::Metrics(metrics) => validate_metrics(metrics),
+        }
+    }
+
+    /// debug 日誌用的摘要
+    fn summary(&self) -> String {
+        match self {
+            ReportContent::Legacy {
+                cpu_usage,
+                total_memory,
+                used_memory,
+            } => format!("cpu={cpu_usage:.2}% mem={used_memory}/{total_memory} MB"),
+            ReportContent::Metrics(metrics) => format!("{} 個指標", metrics.len()),
+        }
+    }
+
+    fn into_body(self) -> RecordBody {
+        match self {
+            ReportContent::Legacy {
+                cpu_usage,
+                total_memory,
+                used_memory,
+            } => RecordBody::Legacy {
+                cpu_usage,
+                total_memory,
+                used_memory,
+            },
+            ReportContent::Metrics(metrics) => RecordBody::Metrics { metrics },
+        }
+    }
+}
+
+/// 日誌中顯示主機指紋的前 19 個字元（`sha256:` 加 12 個十六進位字元）
+fn short_fingerprint(fp: &str) -> String {
+    let short: String = fp.chars().take(19).collect();
+    if short.len() < fp.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+/// [`Conn::accept_hello`] 的結果
+enum HelloOutcome {
+    /// 通過，可以註冊
+    Accepted(Agent),
+    /// hello 被拒（非 fatal 時繼續等待 hello）
+    Rejected(Flow),
+    /// 已送出 fatal 錯誤，連線結束
+    Closed,
 }
 
 /// 確保連線結束時（含 panic 與被中止）以 conn_id 標記離線（R2-K20）
@@ -400,14 +547,15 @@ struct Conn {
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
-/// `pre_auth` 為「握手中」連線的名額（R2-K2），在 hello 通過後（或連線結束時）釋放。
+/// `slot` 為 accept 時取得的來源位址與「握手中」的名額（R2-K2、A7）：hello 通過後歸還握手中的名額，
+/// 以 mTLS 驗證身分時另改依憑證身分計數（見 [`ConnectionSlot`]）；其餘在連線結束時釋放。
 pub async fn handle_connection(
     ctx: Arc<ConnContext>,
     acceptor: TlsAcceptor,
     socket: TcpStream,
     peer: SocketAddr,
     conn_id: u64,
-    pre_auth: Option<OwnedSemaphorePermit>,
+    mut slot: ConnectionSlot,
 ) -> Result<(), Error> {
     let shutdown = ctx.shutdown.clone();
     // into_fallible：握手失敗時 tokio-rustls 會先送出 TLS alert，再把底層 socket 交還
@@ -471,8 +619,8 @@ pub async fn handle_connection(
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
         return Ok(());
     };
-    // hello 已通過：不再佔用「握手中」的名額
-    drop(pre_auth);
+    // hello 已通過：不再佔用「握手中」的名額；mTLS 時改依憑證身分計數（A7）
+    slot.hello_passed(agent.authenticated.then_some(agent.agent_id.as_str()));
 
     // 註冊後不論結果如何（含 panic、被中止）都要以 conn_id 比對並標記離線
     let guard = DisconnectGuard::new(ctx.registry.clone(), agent.agent_id.clone(), conn_id);
@@ -827,47 +975,25 @@ impl Conn {
                     hostname,
                     agent_version,
                     heartbeat_interval_ms,
+                    ext,
                     ..
                 }) => {
-                    if proto != Proto::Version(PROTO_VERSION) {
-                        throttled!(
-                            self.throttle,
-                            Category::ProtocolViolation,
-                            warn,
-                            "[#{}] {} 的協定版本 {} 不受支援（agent_id={:?}），關閉連線",
-                            self.conn_id,
-                            self.peer,
-                            proto,
-                            agent_id
-                        );
-                        self.reply(ServerMsg::error(
-                            Some(seq),
-                            ErrorCode::UnsupportedVersion,
-                            format!("supported proto: {}", PROTO_VERSION),
-                        ))
-                        .await?;
-                        return Ok(None);
-                    }
-                    match validate_hello(&agent_id, &hostname, &agent_version) {
-                        Ok(()) => {
-                            // UUID 不分大小寫：之後的驗證、註冊、日誌與寫檔一律使用小寫
-                            let agent_id = normalize_agent_id(&agent_id);
-                            let Some(authenticated) = self.check_identity(seq, &agent_id).await?
-                            else {
-                                return Ok(None);
-                            };
+                    let hello = HelloFields {
+                        seq,
+                        proto,
+                        agent_id,
+                        hostname,
+                        agent_version,
+                        heartbeat_interval_ms,
+                        ext: *ext,
+                    };
+                    match self.accept_hello(hello).await? {
+                        HelloOutcome::Accepted(agent) => {
                             self.bad_requests = 0;
-                            return Ok(Some(Agent {
-                                agent_id,
-                                hostname,
-                                agent_version,
-                                heartbeat_interval_ms,
-                                hello_seq: seq,
-                                authenticated,
-                            }));
+                            return Ok(Some(agent));
                         }
-                        // 欄位不合規定：計入連續無效訊息，繼續等待 hello；回應帶回 hello 的 seq（F5）
-                        Err(message) => self.reply_bad_request(Some(seq), message).await?,
+                        HelloOutcome::Rejected(flow) => flow,
+                        HelloOutcome::Closed => return Ok(None),
                     }
                 }
                 Incoming::Msg(ClientMsg::Heartbeat { seq, .. } | ClientMsg::Report { seq, .. }) => {
@@ -895,6 +1021,97 @@ impl Conn {
         }
     }
 
+    /// 協商版本並驗證 hello 的欄位（A3）。
+    ///
+    /// 順序：`proto` 不合法或沒有共同版本 → fatal 的 `unsupported_version`；版本範圍或 features
+    /// 型別錯誤 → `bad_request`；v1 欄位（agent_id、hostname、agent_version）→ `bad_request`；
+    /// 協商為 v2 時再檢查 features 與主機資訊 → `bad_request`。協商為 v1 時主機資訊一律忽略，
+    /// 與 v1 Kairos 相同。`bad_request` 都帶回 hello 的 seq（F5），並計入連續無效訊息。
+    async fn accept_hello(&mut self, hello: HelloFields) -> Result<HelloOutcome, Error> {
+        let HelloFields {
+            seq,
+            proto,
+            agent_id,
+            hostname,
+            agent_version,
+            heartbeat_interval_ms,
+            ext,
+        } = hello;
+        let range = match client_proto_range(&proto, &ext.offer) {
+            Ok(range) => Some(range),
+            Err(ProtoRangeError::InvalidProto) => None,
+            Err(ProtoRangeError::BadOffer(message)) => {
+                return Ok(HelloOutcome::Rejected(
+                    self.reply_bad_request(Some(seq), message).await?,
+                ));
+            }
+        };
+        let Some(version) = range.and_then(|range| negotiate(range, SUPPORTED_PROTO)) else {
+            let offered = match range {
+                Some(r) if r.min != r.max => format!("{}（範圍 {}～{}）", proto, r.min, r.max),
+                _ => proto.to_string(),
+            };
+            throttled!(
+                self.throttle,
+                Category::ProtocolViolation,
+                warn,
+                "[#{}] {} 的協定版本 {} 不受支援（agent_id={:?}，本伺服器支援 {}～{}），關閉連線",
+                self.conn_id,
+                self.peer,
+                offered,
+                agent_id,
+                SUPPORTED_PROTO.min,
+                SUPPORTED_PROTO.max
+            );
+            self.reply(unsupported_version_error(Some(seq), SUPPORTED_PROTO))
+                .await?;
+            return Ok(HelloOutcome::Closed);
+        };
+        // 欄位不合規定：計入連續無效訊息，繼續等待 hello；回應帶回 hello 的 seq（F5）
+        if let Err(message) = validate_hello(&agent_id, &hostname, &agent_version) {
+            return Ok(HelloOutcome::Rejected(
+                self.reply_bad_request(Some(seq), message).await?,
+            ));
+        }
+        let client_features = match &ext.offer {
+            Ok(offer) => offer.features.clone().unwrap_or_default(),
+            Err(_) => Vec::new(), // client_proto_range 已拒絕
+        };
+        let session = Session::new(version, SERVER_FEATURES, &client_features);
+        let host = if session.is_v2() {
+            let checked = validate_features(&client_features).and_then(|()| {
+                let host = ext.host.map_err(|e| format!("invalid message: {e}"))?;
+                validate_host_info(&host)?;
+                Ok(host)
+            });
+            match checked {
+                Ok(host) => (host != HostInfo::default()).then(|| Arc::new(host)),
+                Err(message) => {
+                    return Ok(HelloOutcome::Rejected(
+                        self.reply_bad_request(Some(seq), message).await?,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        // UUID 不分大小寫：之後的驗證、註冊、日誌與寫檔一律使用小寫
+        let agent_id = normalize_agent_id(&agent_id);
+        let Some(authenticated) = self.check_identity(seq, &agent_id).await? else {
+            return Ok(HelloOutcome::Closed);
+        };
+        Ok(HelloOutcome::Accepted(Agent {
+            agent_id,
+            hostname,
+            agent_version,
+            heartbeat_interval_ms,
+            hello_seq: seq,
+            authenticated,
+            session,
+            host,
+        }))
+    }
+
     /// 註冊 agent 並處理後續訊息，直到連線結束
     async fn run_registered(&mut self, ctx: &ConnContext, agent: &Agent) -> Result<(), Error> {
         let clamped = clamp_heartbeat_interval_ms(agent.heartbeat_interval_ms);
@@ -919,6 +1136,8 @@ impl Conn {
                 agent_id: agent.agent_id.clone(),
                 hostname: agent.hostname.clone(),
                 agent_version: agent.agent_version.clone(),
+                proto: agent.session.proto,
+                host: agent.host.clone(),
                 peer: self.peer.to_string(),
                 offline_after,
                 client_chain: self.client_chain.clone(),
@@ -974,20 +1193,53 @@ impl Conn {
             self.throttle,
             self.agent_key(Category::AgentOnline, agent),
             info,
-            "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms",
+            "[#{}] agent {}（{}，v{}，{}）{}，離線門檻 {} ms，協定 v{}{}",
             self.conn_id,
             agent.agent_id,
             agent.hostname.escape_debug(),
             agent.agent_version.escape_debug(),
             self.peer,
             state,
-            offline_ms
+            offline_ms,
+            agent.session.proto,
+            if agent.session.durable {
+                "（durable：report 可補送、去重）"
+            } else {
+                ""
+            }
         );
+        if let Some(previous) = &registration.previous_fingerprint {
+            throttled!(
+                self.throttle,
+                self.agent_key(Category::HostFingerprintChanged, agent),
+                warn,
+                "[#{}] agent {} 的主機指紋與上次不同（{} → {}）：可能有多台主機共用同一份 agent.id（例如由映像檔複製的 VM），或主機已重灌",
+                self.conn_id,
+                agent.agent_id,
+                short_fingerprint(previous),
+                agent
+                    .host
+                    .as_ref()
+                    .and_then(|h| h.host_fingerprint.as_deref())
+                    .map_or_else(String::new, short_fingerprint)
+            );
+        }
 
+        let (features, server_time) = if agent.session.is_v2() {
+            (
+                Some(SERVER_FEATURES.iter().map(|f| f.to_string()).collect()),
+                Some(fmt_time(Utc::now())),
+            )
+        } else {
+            // v1：hello_ack 與 v1 Kairos 完全相同
+            (None, None)
+        };
         self.send(&ServerMsg::HelloAck {
             seq: agent.hello_seq,
-            proto: PROTO_VERSION,
+            proto: agent.session.proto,
             offline_after_ms: offline_ms,
+            features,
+            server_time,
         })
         .await?;
 
@@ -1190,13 +1442,45 @@ impl Conn {
                 );
                 Ok(Handled::alive(self.reply(ServerMsg::Ack { seq }).await?))
             }
-            ClientMsg::Report {
-                seq,
-                ts,
-                cpu_usage,
-                total_memory,
-                used_memory,
-            } => {
+            ClientMsg::Report { seq, ts, body } => {
+                // 依協商的格式取出內容；格式不符（欄位缺漏、型別錯誤）與 v1 的解析失敗相同：
+                // bad_request（seq 為 null）、不算合法訊息
+                let content = if agent.session.metrics {
+                    body.metric_list()
+                        .map(|metrics| ReportContent::Metrics(metrics.to_vec()))
+                } else {
+                    body.legacy_fields().map(|l| ReportContent::Legacy {
+                        // 線上型別為 f64；驗證、保存與日誌沿用 f32（A14，見 server_cpu_usage）
+                        cpu_usage: server_cpu_usage(l.cpu_usage),
+                        total_memory: l.total_memory,
+                        used_memory: l.used_memory,
+                    })
+                };
+                let content = match content {
+                    Ok(content) => content,
+                    Err(message) => {
+                        return Ok(Handled::not_alive(
+                            self.reply_bad_request(None, message).await?,
+                        ));
+                    }
+                };
+                // durable（A5）：必須帶 boot_id／report_seq；缺漏、型別錯誤或不符限制與其他欄位
+                // 相同，回 bad_request（seq 為 null）、不算合法訊息。未協商 durable 時一律忽略
+                let dedup = if agent.session.durable {
+                    match body.durable_seq() {
+                        Ok(durable) => Some(DedupKey {
+                            boot_id: durable.boot_id.to_ascii_lowercase(),
+                            report_seq: durable.report_seq,
+                        }),
+                        Err(message) => {
+                            return Ok(Handled::not_alive(
+                                self.reply_bad_request(None, message).await?,
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.bad_requests = 0;
                 if !self.pace_report(agent).await {
                     if !self.touch(ctx, agent) {
@@ -1211,7 +1495,7 @@ impl Conn {
                         .await?;
                     return Ok(Handled::alive(flow));
                 }
-                if let Err(message) = validate_report(cpu_usage, total_memory, used_memory) {
+                if let Err(message) = content.validate() {
                     // 不寫檔，但仍視為存活
                     if !self.touch(ctx, agent) {
                         return Ok(Handled::alive(self.reply_superseded(agent).await?));
@@ -1236,18 +1520,26 @@ impl Conn {
                     return Ok(Handled::alive(flow));
                 }
 
-                let record = ReportRecord {
-                    recv_at: received_at,
-                    peer: self.peer.to_string(),
-                    agent_id: agent.agent_id.clone(),
-                    hostname: agent.hostname.clone(),
+                let mut summary = content.summary();
+                if let Some(key) = &dedup {
+                    summary.push_str(&format!(
+                        " boot_id={} report_seq={} ts={}",
+                        key.boot_id,
+                        key.report_seq,
+                        ts.escape_debug()
+                    ));
+                }
+                let record = ReportRecord::new(
+                    received_at,
+                    self.peer.to_string(),
+                    agent.agent_id.clone(),
+                    agent.hostname.clone(),
                     seq,
                     ts,
-                    cpu_usage,
-                    total_memory,
-                    used_memory,
-                };
-                // ack 語意 = 已寫入資料檔；等待 writer 回覆（受寫出逾時限制）
+                    content.into_body(),
+                )
+                .with_dedup(dedup);
+                // ack 語意 = 已寫入資料庫或資料檔；等待 writer 回覆（受寫出逾時限制）
                 let revived = AtomicBool::new(false);
                 let outcome = store_report(
                     &ctx.registry,
@@ -1272,8 +1564,8 @@ impl Conn {
                     }
                     StoreOutcome::Stored(_) => {
                         debug!(
-                            "[#{}] agent {} report seq={} cpu={:.2}% mem={}/{} MB",
-                            self.conn_id, agent.agent_id, seq, cpu_usage, used_memory, total_memory
+                            "[#{}] agent {} report seq={} {}",
+                            self.conn_id, agent.agent_id, seq, summary
                         );
                         Ok(Handled::alive(self.reply(ServerMsg::Ack { seq }).await?))
                     }
@@ -1348,6 +1640,8 @@ mod tests {
             agent_id: AGENT.into(),
             hostname: "web-01".into(),
             agent_version: "0.1.0".into(),
+            proto: 1,
+            host: None,
             peer: "127.0.0.1:1".into(),
             offline_after: Duration::from_secs(5),
             client_chain: None,
@@ -1355,17 +1649,68 @@ mod tests {
     }
 
     fn record(seq: u64) -> ReportRecord {
-        ReportRecord {
-            recv_at: Utc::now(),
-            peer: "p".into(),
-            agent_id: AGENT.into(),
-            hostname: "web-01".into(),
+        ReportRecord::new(
+            Utc::now(),
+            "p".into(),
+            AGENT.into(),
+            "web-01".into(),
             seq,
-            ts: "t".into(),
-            cpu_usage: 1.0,
-            total_memory: 2,
-            used_memory: 1,
-        }
+            "t".into(),
+            RecordBody::Legacy {
+                cpu_usage: 1.0,
+                total_memory: 2,
+                used_memory: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn last_report_from_metrics_uses_the_standard_metrics() {
+        let metrics: Vec<Metric> = serde_json::from_str(
+            r#"[{"name":"system.cpu.usage","value":17.84,"unit":"%"},
+                {"name":"system.memory.total","value":51539607552,"unit":"By"},
+                {"name":"system.memory.used","value":38833356800,"unit":"By"},
+                {"name":"system.memory.used","value":1,"unit":"By","labels":{"kind":"x"}}]"#,
+        )
+        .unwrap();
+        let r = ReportRecord::new(
+            Utc::now(),
+            "p".into(),
+            AGENT.into(),
+            "h".into(),
+            3,
+            "t".into(),
+            RecordBody::Metrics { metrics },
+        );
+        let last = last_report_of(&r);
+        assert_eq!(last.cpu_usage, Some(17.84));
+        assert_eq!(last.total_memory, Some(49152));
+        assert_eq!(last.used_memory, Some(37034));
+        assert_eq!(last.metrics, Some(4));
+        // 沒有標準指標時不輸出這些欄位
+        let r = ReportRecord::new(
+            Utc::now(),
+            "p".into(),
+            AGENT.into(),
+            "h".into(),
+            4,
+            "t".into(),
+            RecordBody::Metrics {
+                metrics: vec![Metric::new("app.queue.depth", 3, "{items}")],
+            },
+        );
+        let v = serde_json::to_value(last_report_of(&r)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"recv_at": v["recv_at"], "seq": 4, "ts": "t", "metrics": 1})
+        );
+        // v1：與加入 v2 前的輸出相同
+        let v = serde_json::to_value(last_report_of(&record(5))).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"recv_at": v["recv_at"], "seq": 5, "ts": "t",
+                "cpu_usage": 1.0, "total_memory": 2, "used_memory": 1})
+        );
     }
 
     fn last_report_seq(registry: &Registry) -> Option<u64> {
@@ -1414,6 +1759,45 @@ mod tests {
         assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
         assert_eq!(writer.await.unwrap(), Some(7));
         assert_eq!(last_report_seq(&registry), Some(7));
+    }
+
+    #[tokio::test]
+    async fn duplicate_report_is_acked_without_updating_last_report() {
+        // 去重（durable，A5）：去重鍵隨紀錄交給 writer；writer 回 Duplicate（已保存過）時照常 ack，
+        // 但 last_report 不改成重送的舊資料
+        let registry = Registry::new();
+        let _reg = registry
+            .register(1, hello_info(), std::time::Instant::now(), Utc::now())
+            .unwrap();
+        let (sink, mut rx) = report_channel(4);
+        let writer = tokio::spawn(async move {
+            let mut keys = Vec::new();
+            for status in [WriteStatus::Written, WriteStatus::Duplicate] {
+                let req = rx.recv().await.unwrap();
+                assert!(req.ticket.claim());
+                keys.push(req.record.dedup.clone());
+                let _ = req.reply.send(status);
+            }
+            keys
+        });
+        let key = |report_seq| DedupKey {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq,
+        };
+        for (seq, report_seq) in [(9, 4), (8, 3)] {
+            let outcome = store_report(
+                &registry,
+                &sink,
+                1,
+                record(seq).with_dedup(Some(key(report_seq))),
+                Duration::from_secs(1),
+                &AtomicBool::new(false),
+            )
+            .await;
+            assert_eq!(outcome, StoreOutcome::Stored(Touch::Updated));
+        }
+        assert_eq!(writer.await.unwrap(), vec![Some(key(4)), Some(key(3))]);
+        assert_eq!(last_report_seq(&registry), Some(9));
     }
 
     #[tokio::test]

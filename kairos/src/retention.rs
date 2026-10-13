@@ -2,9 +2,9 @@
 //!
 //! reports（`reports-YYYY-MM-DD.jsonl`）與日誌（`kairos-YYYY-MM-DD.log`）共用；日期一律為 UTC。
 
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use date_guard::{DatedName, GuardEvent, LegacyState};
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Error, Write};
@@ -13,24 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs;
 
-/// 一天
-const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// 跳躍暫停中，日期比「跳躍時看到的日期」再往前（變晚）超過這麼多天時，重新起算暫停時間
-pub const JUMP_RESTART_DAYS: u64 = 2;
-
-/// 偵測到時鐘往前跳後，新的日期持續這麼久才接受並恢復清除
-pub const JUMP_ACCEPT_AFTER: Duration = DAY;
-
-/// 日期回撥（早於已接受的日期）持續這麼久後，把已接受的日期降回目前日期
-pub const ROLLBACK_ACCEPT_AFTER: Duration = DAY;
-
-/// 跨重新啟動時，基準點的停機時間與回撥計時的延續上限
-pub const MAX_CARRIED: Duration = DAY;
-
-/// 跨重新啟動時，跳躍暫停把停機時間算入的上限（R2-K5）。遠小於 [`JUMP_ACCEPT_AFTER`]：
-/// 停機時把時鐘調快再啟動，不會因停機的牆鐘差而立即被接受；暫停時間主要靠執行中累積
-pub const MAX_JUMP_DOWNTIME_CARRY: Duration = Duration::from_secs(60 * 60);
+// 日期合理性檢查的規則與狀態在 Kairos 與 Pulse 共用的 date-guard crate；
+// 這裡只負責狀態檔的讀寫（含舊檔名的沿用）與日誌措辭。
+pub use date_guard::{JUMP_ACCEPT_AFTER, ROLLBACK_ACCEPT_AFTER, should_delete};
 
 /// report 的 [`DateGuard`] 狀態檔（放在 `storage.data_dir`）。
 /// 檔名不符合任何 `<prefix>YYYY-MM-DD<suffix>`，不會被清除。
@@ -41,158 +26,16 @@ pub const GUARD_STATE_FILE: &str = ".retention-guard.json";
 /// 舊版放在 `logs/` 的 [`GUARD_STATE_FILE`] 只在新檔不存在時讀取一次。
 pub const LOG_GUARD_STATE_FILE: &str = ".retention-guard-logs.json";
 
-/// 狀態檔內容。舊版只有 `accepted` 與 `jump_since_unix`，其餘欄位缺少時視為未設定。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GuardState {
-    /// 最近一次接受的日期（YYYY-MM-DD）
-    accepted: String,
-    /// 日期基準點的日期，與存檔當時自基準點以來經過的時間（秒）
-    #[serde(default)]
-    anchor_date: Option<String>,
-    #[serde(default)]
-    anchor_elapsed_secs: Option<u64>,
-    /// 存檔時的牆鐘時間（Unix 秒）；重新啟動時以「現在 − 此值」延續基準點的經過時間
-    #[serde(default)]
-    saved_unix: Option<i64>,
-    /// 偵測到時鐘跳躍的牆鐘時間（Unix 秒，只供診斷）與當時的日期；沒有跳躍時為 `null`
-    #[serde(default)]
-    jump_since_unix: Option<i64>,
-    #[serde(default)]
-    jump_date: Option<String>,
-    /// 存檔時跳躍暫停已累積的時間（秒）；重新啟動時再加上 min(max(0, 現在 − saved_unix), 1 小時)
-    #[serde(default)]
-    jump_elapsed_secs: Option<u64>,
-    /// 偵測到日期回撥的牆鐘時間（Unix 秒）；沒有回撥時為 `null`
-    #[serde(default)]
-    rollback_since_unix: Option<i64>,
-}
-
-/// 計時：本次執行以單調時鐘計算，跨重新啟動以牆鐘差延續
-#[derive(Debug, Clone, Copy)]
-struct Timer {
-    /// 本次執行中開始（或延續）計時的時間（單調時鐘）
-    since: Instant,
-    /// 先前的執行已經過的時間
-    carried: Duration,
-    /// 開始計時的牆鐘時間（寫入狀態檔用）
-    since_wall: DateTime<Utc>,
-}
-
-impl Timer {
-    fn start(now: Instant, now_wall: DateTime<Utc>) -> Self {
-        Self {
-            since: now,
-            carried: Duration::ZERO,
-            since_wall: now_wall,
-        }
-    }
-
-    fn elapsed(&self, now: Instant) -> Duration {
-        self.carried
-            .saturating_add(now.saturating_duration_since(self.since))
-    }
-
-    /// 從狀態檔延續：經過時間 = 牆鐘差（`cap` 為上限）。牆鐘差為負（起點在未來）時改為從現在
-    /// 重新計時，回傳的 `bool` 為 `true` 表示起點已改寫、需要存檔（R2-K7）。
-    fn resume(
-        since_wall: DateTime<Utc>,
-        now: Instant,
-        now_wall: DateTime<Utc>,
-        cap: Duration,
-    ) -> (Self, bool) {
-        match (now_wall - since_wall).to_std() {
-            Ok(diff) => (
-                Self {
-                    since: now,
-                    carried: diff.min(cap),
-                    since_wall,
-                },
-                false,
-            ),
-            Err(_) => (Self::start(now, now_wall), true),
-        }
-    }
-}
-
-/// 偵測中的時鐘跳躍
-#[derive(Debug, Clone, Copy)]
-struct Jump {
-    timer: Timer,
-    /// 跳躍時看到的日期（舊版狀態檔沒有這個欄位時，在下一次檢查時補上）
-    date: Option<NaiveDate>,
-}
-
-/// 日期基準點：此時的日期可信。`timer` 只用來計算自基準點以來經過的時間
-#[derive(Debug, Clone, Copy)]
-struct Anchor {
-    date: NaiveDate,
-    timer: Timer,
-}
-
-impl Anchor {
-    /// 依經過時間推算、目前最晚可接受的日期：`基準日期 + ceil(經過時間 / 1 天) + 1 天`
-    fn allowed_max(&self, now: Instant) -> NaiveDate {
-        let elapsed = self.timer.elapsed(now).as_nanos();
-        let days = elapsed.div_ceil(DAY.as_nanos());
-        u64::try_from(days)
-            .ok()
-            .and_then(|d| d.checked_add(1))
-            .and_then(|d| self.date.checked_add_days(Days::new(d)))
-            .unwrap_or(NaiveDate::MAX)
-    }
-}
-
-/// 保留清除前的日期合理性檢查（R2-K4～K7）。
-///
-/// 系統時鐘被誤校到未來時，以「今天」計算的保留期限會把所有檔案判定為過期而刪光。
-/// 規則（Pulse 的日誌清除採用相同規則）：
-///
-/// 狀態（原子寫入狀態檔，重新啟動時讀回）：
-/// - `accepted`：最近一次接受的日期（清除以接受的日期為準）。
-/// - 基準點 `anchor = (anchor_date, anchor_time)`：此時的日期可信。只在啟動時沒有狀態、
-///   跳躍暫停被接受、回撥被接受時設定；正常推進時**不**更新。
-/// - 跳躍暫停：起點牆鐘時間 `jump_since`、跳躍時看到的日期 `jump_date`。
-/// - 回撥計時：起點牆鐘時間 `rollback_since`。
-///
-/// 經過時間：同一次執行以單調時鐘計；跨重新啟動以狀態檔記錄的牆鐘時間與現在的牆鐘差延續，
-/// 負值視為 0、上限 24 小時。基準點的經過時間存成「存檔時已經過的時間 + 存檔的牆鐘時間」
-/// （每次檢查都存檔），重新啟動時 = 已經過的時間 + min(max(0, 現在 − 存檔時間), 24 小時)；
-/// 執行中偵測到的跳躍在存檔時已反映在存檔的牆鐘時間裡，不會在重新啟動後被當成經過時間。
-/// 副作用：停機超過約 2 天後重新啟動，會暫停清除 24 小時並記 WARN（與第一輪「超過 2 天就暫停」一致）。
-///
-/// 每次檢查（`today` 為系統時鐘的 UTC 日期）：
-/// 1. `today < accepted`（回撥）：取消跳躍暫停；回撥計時未開始則開始。回撥持續 24 小時後
-///    `accepted = today`、`anchor = (today, 現在)`。以 `today` 清除（較早的日期只會刪得更少）。
-/// 2. `today == accepted`：取消跳躍暫停與回撥計時，以 `today` 清除。
-/// 3. `today > accepted`：取消回撥計時。允許的最晚日期
-///    `allowed_max = anchor_date + ceil(自 anchor 以來經過的時間 / 1 天) + 1 天`。
-///    - `today <= allowed_max`：取消跳躍暫停，`accepted = today`，以 `today` 清除。
-///    - 否則（跳躍）：不清除。暫停未開始則開始（`jump_since = 現在`、`jump_date = today`）；
-///      暫停中若 `today > jump_date + 2 天`，重新起算（`jump_since = 現在`、`jump_date = today`）；
-///      否則暫停持續 24 小時後接受：`accepted = today`、`anchor = (today, 現在)`，以 `today` 清除。
-///
-/// 跨重新啟動延續跳躍暫停：狀態檔記錄「存檔時暫停已累積的時間」（每次檢查都存檔），
-/// 重新啟動時 = 已累積的時間 + min(max(0, 現在 − 存檔時間), 1 小時)（R2-K5）。
-/// 回撥計時跨重新啟動延續量為牆鐘差（現在 − 回撥起點）、上限 24 小時；牆鐘差為負（起點在未來）
-/// 時把起點改寫為現在並存檔。存檔時間在未來時，停機期間的經過時間視為 0（下次存檔即改寫）。
-///
-/// 因此逐步把時鐘往前推（每次 2 天以內）也無法讓 `accepted` 超過實際經過的天數 + 1 天（R2-K4）；
-/// 與重新啟動同時發生的時鐘跳躍，最多只能被基準點當成 24 小時的經過時間、被跳躍暫停當成 1 小時。
+/// 保留清除前的日期合理性檢查（R2-K4～K7）。規則見 [`date_guard::DateGuard`]（Pulse 的日誌清除
+/// 使用同一份實作）；本型別加上狀態檔的保存（每次檢查都在 blocking 執行緒原子寫入）與日誌。
+/// 接受舊版（只有 `accepted` 與 `jump_since_unix`）的狀態檔格式。
 #[derive(Debug)]
 pub struct DateGuard {
     /// 日誌中稱呼這類檔案的名稱
     label: &'static str,
-    /// 最近一次接受的日期
-    accepted: NaiveDate,
-    anchor: Anchor,
-    /// 偵測中的跳躍
-    jump: Option<Jump>,
-    /// 偵測中的日期回撥
-    rollback: Option<Timer>,
+    core: date_guard::DateGuard,
     /// 狀態檔路徑；`None` 表示不保存
     state_path: Option<PathBuf>,
-    /// 尚未寫入狀態檔的變更
-    dirty: bool,
     /// 上次寫入狀態檔是否失敗（只在狀態改變時記錄，避免洗版）
     save_failed: bool,
 }
@@ -207,15 +50,8 @@ impl DateGuard {
     ) -> Self {
         Self {
             label,
-            accepted: baseline,
-            anchor: Anchor {
-                date: baseline,
-                timer: Timer::start(now, now_wall),
-            },
-            jump: None,
-            rollback: None,
+            core: date_guard::DateGuard::new(baseline, now, now_wall),
             state_path: None,
-            dirty: false,
             save_failed: false,
         }
     }
@@ -238,26 +74,16 @@ impl DateGuard {
                 _ => (None, state_path.as_path()),
             },
         };
-        match bytes {
-            Some(bytes) => match parse_state(&bytes, now, now_wall) {
-                Some(parsed) => {
-                    guard.accepted = parsed.accepted;
-                    guard.anchor = parsed.anchor;
-                    guard.jump = parsed.jump;
-                    guard.rollback = parsed.rollback;
-                    guard.dirty = parsed.rewritten || from != state_path.as_path();
-                }
-                None => {
-                    warn!(
-                        "{} 內容無效，改以 {} 作為清除過期的{}的日期基準",
-                        from.display(),
-                        fallback,
-                        label
-                    );
-                    guard.dirty = true;
-                }
-            },
-            None => guard.dirty = true,
+        if let Some(bytes) = bytes {
+            match date_guard::DateGuard::from_state(&bytes, LegacyState::Accept, now, now_wall) {
+                Some(core) => guard.core = core,
+                None => warn!(
+                    "{} 內容無效，改以 {} 作為清除過期的{}的日期基準",
+                    from.display(),
+                    fallback,
+                    label
+                ),
+            }
         }
         guard.state_path = Some(state_path);
         guard
@@ -272,174 +98,36 @@ impl DateGuard {
         now: Instant,
         now_wall: DateTime<Utc>,
     ) -> Option<NaiveDate> {
-        let result = self.decide(today, now, now_wall);
+        let decision = self.core.decide(today, now, now_wall);
+        for event in &decision.events {
+            self.log_event(event);
+        }
         if self.state_path.is_some() {
             self.save(now, now_wall).await;
         }
-        result
+        decision.cleanup_date
     }
 
-    /// 規則見型別說明；只更新記憶體中的狀態
-    fn decide(
-        &mut self,
-        today: NaiveDate,
-        now: Instant,
-        now_wall: DateTime<Utc>,
-    ) -> Option<NaiveDate> {
-        // 1. 日期回撥
-        if today < self.accepted {
-            if self.jump.take().is_some() {
-                info!("系統日期已回到 {}，恢復清除過期的{}", today, self.label);
-                self.dirty = true;
-            }
-            match self.rollback {
-                None => {
-                    info!(
-                        "系統日期 {} 早於先前的 {}（時鐘回撥）；以較早的日期清除過期的{}，持續 {} 小時後改以此日期為基準",
-                        today,
-                        self.accepted,
-                        self.label,
-                        ROLLBACK_ACCEPT_AFTER.as_secs() / 3600
-                    );
-                    self.rollback = Some(Timer::start(now, now_wall));
-                    self.dirty = true;
-                }
-                Some(timer) if timer.elapsed(now) >= ROLLBACK_ACCEPT_AFTER => {
-                    info!(
-                        "系統日期回撥至 {} 已持續 {} 小時，改以此日期作為清除過期的{}的基準",
-                        today,
-                        ROLLBACK_ACCEPT_AFTER.as_secs() / 3600,
-                        self.label
-                    );
-                    self.accept_as_anchor(today, now, now_wall);
-                }
-                Some(_) => {}
-            }
-            return Some(today);
-        }
-        if self.rollback.take().is_some() {
-            self.dirty = true;
-        }
-
-        // 2. 日期未變
-        if today == self.accepted {
-            if self.jump.take().is_some() {
-                info!("系統日期已回到 {}，恢復清除過期的{}", today, self.label);
-                self.dirty = true;
-            }
-            return Some(today);
-        }
-
-        // 3. 日期往前推進
-        let allowed_max = self.anchor.allowed_max(now);
-        if today <= allowed_max {
-            if self.jump.take().is_some() {
-                info!("系統日期已回到 {}，恢復清除過期的{}", today, self.label);
-            }
-            self.accepted = today;
-            self.dirty = true;
-            return Some(today);
-        }
-        match &mut self.jump {
-            None => {
-                warn!(
-                    "系統日期 {} 晚於依經過時間推算的最晚日期 {}（先前為 {}），可能是時鐘被誤校；暫停清除過期的{}以免誤刪。若日期正確，{} 小時後會恢復清除",
-                    today,
-                    allowed_max,
-                    self.accepted,
-                    self.label,
-                    JUMP_ACCEPT_AFTER.as_secs() / 3600
-                );
-                self.jump = Some(Jump {
-                    timer: Timer::start(now, now_wall),
-                    date: Some(today),
-                });
-                self.dirty = true;
-                None
-            }
-            Some(jump) => {
-                let jump_date = match jump.date {
-                    Some(d) => d,
-                    None => {
-                        jump.date = Some(today);
-                        self.dirty = true;
-                        today
-                    }
-                };
-                let restart_after = jump_date
-                    .checked_add_days(Days::new(JUMP_RESTART_DAYS))
-                    .unwrap_or(NaiveDate::MAX);
-                if today > restart_after {
-                    warn!(
-                        "暫停清除期間系統日期再往前跳到 {}（偵測到跳躍時為 {}），重新起算 {} 小時",
-                        today,
-                        jump_date,
-                        JUMP_ACCEPT_AFTER.as_secs() / 3600
-                    );
-                    *jump = Jump {
-                        timer: Timer::start(now, now_wall),
-                        date: Some(today),
-                    };
-                    self.dirty = true;
-                    None
-                } else if jump.timer.elapsed(now) >= JUMP_ACCEPT_AFTER {
-                    warn!(
-                        "系統日期 {} 已持續 {} 小時，接受為正確日期並恢復清除過期的{}",
-                        today,
-                        JUMP_ACCEPT_AFTER.as_secs() / 3600,
-                        self.label
-                    );
-                    self.accept_as_anchor(today, now, now_wall);
-                    Some(today)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    /// 接受 `today` 並以現在為新的基準點（跳躍暫停或回撥被接受時）
-    fn accept_as_anchor(&mut self, today: NaiveDate, now: Instant, now_wall: DateTime<Utc>) {
-        self.accepted = today;
-        self.anchor = Anchor {
-            date: today,
-            timer: Timer::start(now, now_wall),
-        };
-        self.jump = None;
-        self.rollback = None;
-        self.dirty = true;
-    }
-
-    fn state(&self, now: Instant, now_wall: DateTime<Utc>) -> GuardState {
-        let fmt = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
-        GuardState {
-            accepted: fmt(self.accepted),
-            anchor_date: Some(fmt(self.anchor.date)),
-            anchor_elapsed_secs: Some(self.anchor.timer.elapsed(now).as_secs()),
-            saved_unix: Some(now_wall.timestamp()),
-            jump_since_unix: self.jump.map(|j| j.timer.since_wall.timestamp()),
-            jump_date: self.jump.and_then(|j| j.date).map(fmt),
-            jump_elapsed_secs: self.jump.map(|j| j.timer.elapsed(now).as_secs()),
-            rollback_since_unix: self.rollback.map(|t| t.since_wall.timestamp()),
-        }
+    /// 記錄狀態變化（措辭與 A8 抽出共用 crate 之前相同）
+    fn log_event(&self, event: &GuardEvent) {
+        log_guard_event(self.label, event);
     }
 
     /// 原子寫入狀態檔（暫存檔同步到磁碟後 rename）
     async fn save(&mut self, now: Instant, now_wall: DateTime<Utc>) {
         let Some(path) = self.state_path.clone() else {
-            self.dirty = false;
             return;
         };
-        let state = self.state(now, now_wall);
+        let state = self.core.state(now, now_wall);
         let target = path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let json = serde_json::to_vec_pretty(&state).map_err(Error::other)?;
+            let json = state.to_file_bytes().map_err(Error::other)?;
             if let Some(dir) = target.parent()
                 && !dir.as_os_str().is_empty()
             {
-                std::fs::create_dir_all(dir)?;
+                crate::fsperm::create_dir_all(dir)?;
             }
-            write_atomically(&target, &[&json, b"\n"])
+            write_atomically(&target, &[&json])
         })
         .await
         .unwrap_or_else(|e| Err(Error::other(e)));
@@ -449,7 +137,6 @@ impl DateGuard {
                     info!("{} 已恢復寫入", path.display());
                 }
                 self.save_failed = false;
-                self.dirty = false;
             }
             Err(e) => {
                 if !self.save_failed {
@@ -465,103 +152,54 @@ impl DateGuard {
     }
 }
 
-/// 狀態檔解析結果
-struct Parsed {
-    accepted: NaiveDate,
-    anchor: Anchor,
-    jump: Option<Jump>,
-    rollback: Option<Timer>,
-    /// 載入時改寫了未來的起點，或補上舊版缺少的欄位：需要存檔
-    rewritten: bool,
-}
-
-/// 解析狀態檔；格式不符時回傳 `None`
-fn parse_state(bytes: &[u8], now: Instant, now_wall: DateTime<Utc>) -> Option<Parsed> {
-    let state: GuardState = serde_json::from_slice(bytes).ok()?;
-    let date = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
-    let wall = |unix: i64| DateTime::<Utc>::from_timestamp(unix, 0);
-    let accepted = date(&state.accepted)?;
-    let mut rewritten = false;
-    // 停機期間的牆鐘差（現在 − 存檔時間）；存檔時間在未來時視為 0、沒有存檔時間（舊版）時為 0
-    let downtime = match state.saved_unix {
-        None => Duration::ZERO,
-        Some(saved) => match (now_wall - wall(saved)?).to_std() {
-            Ok(gap) => gap,
-            Err(_) => {
-                rewritten = true;
-                Duration::ZERO
-            }
-        },
-    };
-
-    let anchor = match (
-        state.anchor_date,
-        state.anchor_elapsed_secs,
-        state.saved_unix,
-    ) {
-        (Some(d), Some(elapsed), Some(_)) => Anchor {
-            date: date(&d)?,
-            timer: Timer {
-                since: now,
-                // 停機期間的經過時間上限 24 小時
-                carried: Duration::from_secs(elapsed).saturating_add(downtime.min(MAX_CARRIED)),
-                since_wall: now_wall,
-            },
-        },
-        // 舊版狀態檔沒有基準點：以已接受的日期與現在為基準（較保守）
-        (None, None, None) => {
-            rewritten = true;
-            Anchor {
-                date: accepted,
-                timer: Timer::start(now, now_wall),
-            }
+/// 記錄 [`date_guard::DateGuard`] 的狀態變化；`label` 為被清除的資料的名稱（例如「 report 檔」）。
+/// JSONL 檔、日誌與 SQLite 的保留清除共用同一套措辭
+pub fn log_guard_event(label: &str, event: &GuardEvent) {
+    let hours = |d: Duration| d.as_secs() / 3600;
+    match *event {
+        GuardEvent::JumpCleared { today, .. } => {
+            info!("系統日期已回到 {}，恢復清除過期的{}", today, label)
         }
-        _ => return None,
-    };
-    let jump = match state.jump_since_unix {
-        None => None,
-        Some(unix) => {
-            // 起點只供診斷；在未來時改寫為現在
-            let since_wall = wall(unix)?;
-            let since_wall = if since_wall > now_wall {
-                rewritten = true;
-                now_wall
-            } else {
-                since_wall
-            };
-            // 已累積的時間 + 停機時間（上限 1 小時）；舊版沒有累積時間時從 0 起算（較保守）
-            let carried = Duration::from_secs(state.jump_elapsed_secs.unwrap_or(0))
-                .saturating_add(downtime.min(MAX_JUMP_DOWNTIME_CARRY));
-            let timer = Timer {
-                since: now,
-                carried,
-                since_wall,
-            };
-            let jump_date = match state.jump_date {
-                Some(d) => Some(date(&d)?),
-                None => None,
-            };
-            Some(Jump {
-                timer,
-                date: jump_date,
-            })
-        }
-    };
-    let rollback = match state.rollback_since_unix {
-        None => None,
-        Some(unix) => {
-            let (timer, changed) = Timer::resume(wall(unix)?, now, now_wall, MAX_CARRIED);
-            rewritten |= changed;
-            Some(timer)
-        }
-    };
-    Some(Parsed {
-        accepted,
-        anchor,
-        jump,
-        rollback,
-        rewritten,
-    })
+        GuardEvent::RollbackStarted { today, accepted } => info!(
+            "系統日期 {} 早於先前的 {}（時鐘回撥）；以較早的日期清除過期的{}，持續 {} 小時後改以此日期為基準",
+            today,
+            accepted,
+            label,
+            hours(ROLLBACK_ACCEPT_AFTER)
+        ),
+        GuardEvent::RollbackAccepted { today, .. } => info!(
+            "系統日期回撥至 {} 已持續 {} 小時，改以此日期作為清除過期的{}的基準",
+            today,
+            hours(ROLLBACK_ACCEPT_AFTER),
+            label
+        ),
+        // Kairos 不記錄回撥計時的取消（Pulse 記 debug）
+        GuardEvent::RollbackCleared { .. } => {}
+        GuardEvent::JumpStarted {
+            today,
+            allowed_max,
+            accepted,
+        } => warn!(
+            "系統日期 {} 晚於依經過時間推算的最晚日期 {}（先前為 {}），可能是時鐘被誤校；暫停清除過期的{}以免誤刪。若日期正確，{} 小時後會恢復清除",
+            today,
+            allowed_max,
+            accepted,
+            label,
+            hours(JUMP_ACCEPT_AFTER)
+        ),
+        GuardEvent::JumpRestarted { today, previous } => warn!(
+            "暫停清除期間系統日期再往前跳到 {}（偵測到跳躍時為 {}），重新起算 {} 小時",
+            today,
+            previous,
+            hours(JUMP_ACCEPT_AFTER)
+        ),
+        GuardEvent::JumpAccepted { today } => warn!(
+            "系統日期 {} 已持續 {} 小時，接受為正確日期並恢復清除過期的{}",
+            today,
+            hours(JUMP_ACCEPT_AFTER),
+            label
+        ),
+    }
 }
 
 /// 暫存檔名：`<檔名>.<隨機 16 位十六進位>.tmp`，放在同一個目錄（rename 才是原子的）
@@ -594,13 +232,17 @@ pub fn is_tmp_name_for(candidate: &str, file_name: &str) -> bool {
 
 /// 原子寫入：以 `create_new` 建立隨機檔名的暫存檔（不會跟隨預先放置的符號連結或覆寫既有檔案；
 /// R2-K9）、寫入並同步到磁碟後 rename 成 `path`。失敗時刪除暫存檔。同步 I/O，請在 blocking 執行緒呼叫。
+///
+/// Unix 上暫存檔以 mode 0640 建立（[`crate::fsperm::FILE_MODE`]，S3；實際權限再受 umask 限制），
+/// rename 後的目標檔（`agents.json`、`.retention-guard*.json`）從一開始就不會比 0640 寬，
+/// 不需事後收緊，也沒有暫存期間權限過寬的空窗。
 pub fn write_atomically(path: &Path, parts: &[&[u8]]) -> std::io::Result<()> {
     let tmp = unique_tmp_path(path);
     let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = crate::fsperm::private_std_options(
+            std::fs::OpenOptions::new().write(true).create_new(true),
+        )
+        .open(&tmp)?;
         for part in parts {
             file.write_all(part)?;
         }
@@ -631,45 +273,35 @@ pub struct DatedFiles {
 }
 
 impl DatedFiles {
+    /// 檔名規則（與 Pulse 共用的實作，見 [`date_guard::DatedName`]）
+    fn name(&self) -> DatedName {
+        DatedName {
+            prefix: self.prefix,
+            suffix: self.suffix,
+        }
+    }
+
     /// 某日期的檔名
     pub fn file_name(&self, date: NaiveDate) -> String {
-        format!("{}{}{}", self.prefix, date.format("%Y-%m-%d"), self.suffix)
+        self.name().file_name(date)
     }
 
     /// 只有**完全符合** `<prefix>YYYY-MM-DD<suffix>`（且為合法日期）才回傳日期
     pub fn parse(&self, name: &str) -> Option<NaiveDate> {
-        let date = name.strip_prefix(self.prefix)?.strip_suffix(self.suffix)?;
-        let bytes = date.as_bytes();
-        let well_formed = bytes.len() == 10
-            && bytes.iter().enumerate().all(|(i, &b)| {
-                if i == 4 || i == 7 {
-                    b == b'-'
-                } else {
-                    b.is_ascii_digit()
-                }
-            });
-        if !well_formed {
-            return None;
-        }
-        NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+        self.name().parse(name)
     }
 
     /// `dir` 中檔名合法、日期不晚於 `not_after` 的檔案裡最新的日期（沒有時為 `None`）。
     /// 晚於 `not_after` 的檔案（時鐘誤校到未來時建立的）不列入。
     /// 同步讀取目錄，只在啟動時呼叫一次（作為 [`DateGuard`] 沒有狀態檔時的基準）。
     pub fn newest(&self, dir: &Path, not_after: NaiveDate) -> Option<NaiveDate> {
-        std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .filter_map(|entry| entry.file_name().to_str().and_then(|n| self.parse(n)))
-            .filter(|date| *date <= not_after)
-            .max()
+        self.name().newest(dir, not_after)
     }
 
     /// 啟動時 [`DateGuard`] 的基準：既有最新檔案的日期，但不晚於今天
     /// （檔案日期在未來時以今天為準，避免之後的時鐘跳躍被當成正常）；沒有檔案時為今天
     pub fn guard_baseline(&self, newest: Option<NaiveDate>, today: NaiveDate) -> NaiveDate {
-        newest.map_or(today, |newest| newest.min(today))
+        date_guard::guard_baseline(newest, today)
     }
 
     /// 刪除 `dir` 中過期的檔案，回傳刪除數。檔名不完全符合的檔案一律不碰；刪除失敗只記 warn。
@@ -726,19 +358,10 @@ impl DatedFiles {
     }
 }
 
-/// 保留判斷：今天與前 `retention_days` 天保留，更早的刪除；`retention_days == 0` 表示永久保留
-pub fn should_delete(file_date: NaiveDate, today: NaiveDate, retention_days: u32) -> bool {
-    if retention_days == 0 {
-        return false;
-    }
-    today
-        .checked_sub_days(Days::new(u64::from(retention_days)))
-        .is_some_and(|oldest_kept| file_date < oldest_kept)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Days;
     use std::path::PathBuf;
 
     const REPORTS: DatedFiles = DatedFiles {
@@ -861,7 +484,7 @@ mod tests {
                 "第 {h} 小時"
             );
         }
-        assert_eq!(g.accepted, plus_days(base, (40 * 24 - 1 + 12) / 24));
+        assert_eq!(g.core.accepted(), plus_days(base, (40 * 24 - 1 + 12) / 24));
         // 不超過 ceil(經過時間) + 1 天的跳動也接受（例如換日前後的檢查、時區設定變動）
         let mut g = guard(t0);
         assert_eq!(
@@ -895,7 +518,7 @@ mod tests {
         }
         // 推進量不超過 ceil(經過時間) + 1 天
         assert!(latest_cleanup <= plus_days(base, 2), "{latest_cleanup}");
-        assert!(g.accepted <= plus_days(base, 2));
+        assert!(g.core.accepted() <= plus_days(base, 2));
         // 持續推進時暫停一直重新起算，即使超過 24 小時也不接受
         for h in 16..=60u32 {
             let today = plus_days(base, 2 * u64::from(h));
@@ -973,7 +596,7 @@ mod tests {
         let t1 = t0 + JUMP_ACCEPT_AFTER + H;
         let real = date(2026, 10, 10);
         assert_eq!(g.check(real, t1, Utc::now()).await, Some(real));
-        assert_eq!(g.accepted, future);
+        assert_eq!(g.core.accepted(), future);
         // 24 小時內回到未來日期：視為未變，照常
         assert_eq!(g.check(future, t1 + H, Utc::now()).await, Some(future));
         // 回撥計時重新開始，持續 24 小時後降回
@@ -984,11 +607,11 @@ mod tests {
                 .await,
             Some(real)
         );
-        assert_eq!(g.accepted, future);
+        assert_eq!(g.core.accepted(), future);
         let t3 = t2 + ROLLBACK_ACCEPT_AFTER;
         let real = date(2026, 10, 11);
         assert_eq!(g.check(real, t3, Utc::now()).await, Some(real));
-        assert_eq!(g.accepted, real);
+        assert_eq!(g.core.accepted(), real);
         // 之後再誤校到同一個未來日期 → 再次暫停
         assert_eq!(g.check(future, t3 + H, Utc::now()).await, None);
     }
@@ -1281,7 +904,7 @@ mod tests {
             g.check(date(2026, 1, 2), t2, wall(2026, 1, 2, 0)).await,
             Some(date(2026, 1, 2))
         );
-        assert_eq!(g.accepted, date(2026, 1, 2));
+        assert_eq!(g.core.accepted(), date(2026, 1, 2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1334,7 +957,7 @@ mod tests {
         // 舊版格式（只有 accepted 與 jump_since_unix）仍可讀取，並補上新欄位
         std::fs::write(&path, r#"{"accepted":"2026-10-09","jump_since_unix":null}"#).unwrap();
         let mut g = load();
-        assert_eq!(g.accepted, date(2026, 10, 9));
+        assert_eq!(g.core.accepted(), date(2026, 10, 9));
         assert_eq!(
             g.check(date(2026, 10, 9), t0, wall(2026, 10, 9, 0)).await,
             Some(date(2026, 10, 9))
@@ -1404,6 +1027,52 @@ mod tests {
 
         // 目標目錄不存在時回錯誤，不留下暫存檔
         assert!(write_atomically(&dir.join("missing").join("x.json"), &[b"x"]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_files_with_at_most_0640() {
+        // S3：暫存檔以 0640 建立，rename 後的檔案一開始就不比 0640 寬；
+        // 取代既有的寬鬆檔案時也不會沿用舊權限
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("atomic-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("agents.json");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        write_atomically(&target, &[b"{}"]).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & !crate::fsperm::FILE_MODE, 0, "mode {mode:o}");
+        // 擁有者仍可讀寫
+        assert_eq!(mode & 0o600, 0o600, "mode {mode:o}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guard_state_file_is_created_with_at_most_0640() {
+        // S3：.retention-guard*.json 由 write_atomically 產生，同樣不比 0640 寬；
+        // 狀態檔所在目錄不存在時以 0750 建立
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("guard-mode");
+        let state_dir = dir.join("data");
+        let path = state_dir.join(GUARD_STATE_FILE);
+        let t0 = Instant::now();
+        let now_wall = wall(2026, 10, 9, 12);
+        let mut g = DateGuard::load_or_new(
+            "report 檔",
+            path.clone(),
+            None,
+            date(2026, 10, 9),
+            t0,
+            now_wall,
+        );
+        g.check(date(2026, 10, 9), t0, now_wall).await;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & !crate::fsperm::FILE_MODE, 0, "mode {mode:o}");
+        let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode & !crate::fsperm::DIR_MODE, 0, "mode {dir_mode:o}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

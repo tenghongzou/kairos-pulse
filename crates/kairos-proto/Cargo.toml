@@ -1,0 +1,13 @@
+[package]
+name = "kairos-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Pulse ↔ Kairos 協定（v1、v2）的共用型別、序列化、版本協商與欄位驗證（兩個產品共用，規格見 PROTOCOL.md）"
+# 內部共用 crate，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
+publish = false
+
+[dependencies]
+# 只用 workspace 既有的依賴；不依賴 tokio 等執行環境，codec 與 I/O 留在各產品
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

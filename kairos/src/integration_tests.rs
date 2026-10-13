@@ -6,7 +6,7 @@
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +32,8 @@ use crate::auth::BindingPolicy;
 use crate::config::TimeoutSettings;
 use crate::connection::ConnContext;
 use crate::connection::{MESSAGE_BURST, MESSAGES_PER_SEC};
-use crate::per_ip::PerIpLimiter;
+use crate::per_ip::cidr::Allowlist;
+use crate::per_ip::{LimiterSnapshot, PerIpLimiter, PerIpPolicy};
 use crate::rate::{REPORT_INITIAL_TOKENS, REPORT_RATE_PER_SEC, ReportLimiter};
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::Shutdown;
@@ -56,6 +57,10 @@ struct Options {
     max_agents: usize,
     max_connections: usize,
     max_connections_per_ip: usize,
+    /// `server.per_ip_allowlist`
+    per_ip_allowlist: Vec<&'static str>,
+    /// 允許清單內每個位址的實際上限
+    max_connections_per_allowlisted_ip: usize,
     timeouts: TimeoutSettings,
     /// 取代真正的 report writer（例如模擬卡住的磁碟）
     reports: Option<ReportSink>,
@@ -70,6 +75,8 @@ impl Default for Options {
             max_agents: 100,
             max_connections: 64,
             max_connections_per_ip: 32,
+            per_ip_allowlist: Vec::new(),
+            max_connections_per_allowlisted_ip: 64,
             timeouts: TimeoutSettings::default(),
             reports: None,
             throttle_interval: crate::throttle::DEFAULT_INTERVAL,
@@ -84,6 +91,7 @@ struct Server {
     tls: Arc<TlsState>,
     shutdown: Arc<Shutdown>,
     throttle: Arc<LogThrottle>,
+    per_ip: Arc<PerIpLimiter>,
     accept: JoinHandle<()>,
 }
 
@@ -116,6 +124,12 @@ impl Server {
         let registry = Arc::new(Registry::with_max_agents(opts.max_agents));
         let shutdown = Arc::new(Shutdown::new());
         let throttle = Arc::new(LogThrottle::new(opts.throttle_interval));
+        let policy = PerIpPolicy {
+            max_per_ip: opts.max_connections_per_ip,
+            allowlist: Arc::new(Allowlist::parse(&opts.per_ip_allowlist).unwrap()),
+            max_per_allowlisted_ip: opts.max_connections_per_allowlisted_ip,
+            mtls: opts.mtls_crls.is_some(),
+        };
         let ctx = Arc::new(ConnContext {
             registry: registry.clone(),
             reports,
@@ -124,14 +138,16 @@ impl Server {
             tls: tls.clone(),
             throttle: throttle.clone(),
             binding: BindingPolicy::default(),
-            report_limiter: Arc::new(ReportLimiter::new(opts.max_connections_per_ip)),
+            report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // 與正式程式相同的 accept 迴圈（含全域與每 IP 的連線上限）
-        let per_ip = PerIpLimiter::new(opts.max_connections_per_ip);
+        let per_ip = PerIpLimiter::with_policy(policy);
         let max_connections = opts.max_connections;
+        let accept_per_ip = per_ip.clone();
         let accept = tokio::spawn(async move {
+            let per_ip = accept_per_ip;
             let mut connections = accept_loop(listener, ctx, max_connections, per_ip)
                 .await
                 .unwrap();
@@ -145,6 +161,7 @@ impl Server {
             tls,
             shutdown,
             throttle,
+            per_ip,
             accept,
         }
     }
@@ -170,7 +187,9 @@ impl Server {
             None => (None, Vec::new()),
             Some(crls) => {
                 let ca = dir.join("client-ca.crt");
-                std::fs::write(&ca, test_pki::CA).unwrap();
+                // 另含 NAT 情境用的測試 CA（testdata/pki/nat-ca.crt，簽發 nat-clients.bundle 的 40 個身分）
+                let nat_ca = std::fs::read_to_string(format!("{PKI}nat-ca.crt")).unwrap();
+                std::fs::write(&ca, format!("{}{}", test_pki::CA, nat_ca)).unwrap();
                 let paths = crls
                     .iter()
                     .enumerate()
@@ -787,6 +806,13 @@ async fn handshake_slots_are_limited_and_reserved_for_registered_connections() {
         }
     }
     assert!(rejected, "握手名額用盡時新連線不應完成握手");
+    // 因全域上限被拒（握手中上限）的次數；不計入每 IP 上限
+    let snap = server.per_ip.snapshot(Instant::now());
+    assert!(
+        snap.rejections.global.handshake_limit_rejected >= 1,
+        "{snap:?}"
+    );
+    assert_eq!(snap.rejections.per_ip.total, 0);
     // 已註冊的連線不受影響
     registered.send(&heartbeat(2)).await;
     assert_eq!(registered.recv().await["type"], "ack");
@@ -1138,4 +1164,654 @@ async fn unauthenticated_agent_events_are_throttled_by_ip_and_list_skipped_agent
         )),
         "{line}"
     );
+}
+
+/// `testdata/pki/nat-clients.bundle` 的 (agent_id, 憑證 PEM, 私鑰 PEM)：40 個由 NAT 測試 CA 簽發的身分
+fn nat_identities() -> Vec<(String, String, String)> {
+    let bundle = std::fs::read_to_string(format!("{PKI}nat-clients.bundle")).unwrap();
+    let end = "-----END PRIVATE KEY-----";
+    let ids: Vec<_> = bundle
+        .split_inclusive(end)
+        .filter(|chunk| chunk.contains(end))
+        .enumerate()
+        .map(|(i, chunk)| {
+            let at = chunk.find("-----BEGIN PRIVATE KEY-----").unwrap();
+            (
+                format!("4e470000-0000-4000-8000-{:012x}", i + 1),
+                chunk[..at].trim().to_string(),
+                chunk[at..].trim().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(ids.len(), 40);
+    ids
+}
+
+/// 嘗試建立 TLS 連線直到被伺服器在握手前關閉（停滯的連線可能尚未被 accept，稍後再試）；回傳是否被拒
+async fn rejected_before_handshake(addr: SocketAddr, connector: &TlsConnector) -> bool {
+    for _ in 0..50 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        match tokio::time::timeout(
+            RECV_TIMEOUT,
+            connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("伺服器應立即關閉超過上限的連線")
+        {
+            Err(_) => return true,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    false
+}
+
+/// 重試建立 TLS 連線直到成功（伺服器端歸還名額在背景進行）
+async fn connect_when_admitted(addr: SocketAddr, connector: &TlsConnector) -> Client {
+    for _ in 0..100 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        if let Ok(Ok(tls)) = tokio::time::timeout(
+            RECV_TIMEOUT,
+            connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        {
+            let handshake = tls.get_ref().1.handshake_kind();
+            let (r, w) = tokio::io::split(tls);
+            return Client {
+                lines: BufReader::new(r).lines(),
+                writer: w,
+                handshake,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("名額歸還後應可再建立連線");
+}
+
+/// 等待 `pred` 對伺服器的計數快照成立，回傳最後一次的快照
+async fn wait_for_snapshot(
+    server: &Server,
+    pred: impl Fn(&LimiterSnapshot) -> bool,
+) -> LimiterSnapshot {
+    let deadline = Instant::now() + RECV_TIMEOUT;
+    loop {
+        let snap = server.per_ip.snapshot(Instant::now());
+        if pred(&snap) || Instant::now() >= deadline {
+            return snap;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+const LOCALHOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+#[tokio::test]
+async fn mtls_counts_by_identity_so_more_than_32_agents_behind_one_nat_can_connect() {
+    // A7 根本解：同一個 NAT（此處為 127.0.0.1）後 40 台各自持有憑證的 agent，每 IP 上限維持預設 32，
+    // 全部都能連上；通過 hello 後依憑證身分計數，不佔來源位址的名額
+    let server = Server::start(Options {
+        mtls_crls: Some(Vec::new()),
+        max_connections: 128,
+        max_agents: 128,
+        ..Options::default()
+    })
+    .await;
+    let identities = nat_identities();
+    let mut clients = Vec::new();
+    for (id, cert, key) in &identities {
+        let mut c = Client::connect_with(&connector(Some((cert, key))), server.addr).await;
+        c.register(id).await;
+        clients.push(c);
+    }
+    assert_eq!(server.agent_ids().len(), 40);
+    let snap = wait_for_snapshot(&server, |s| s.counted_connections == 0).await;
+    assert_eq!(snap.counted_connections, 0, "{snap:?}");
+    assert_eq!((snap.identities, snap.identity_connections), (40, 40));
+    assert_eq!(snap.rejections.per_ip.total, 0);
+
+    // 同一身分再連線：與既有的 superseded 行為一致，新連線取代舊連線，身分數不變
+    let (id, cert, key) = &identities[0];
+    let mut again = Client::connect_with(&connector(Some((cert, key))), server.addr).await;
+    again.register(id).await;
+    clients[0].expect_error("superseded", true).await;
+    clients[0].expect_clean_close().await;
+    let snap = wait_for_snapshot(&server, |s| s.identity_connections == 40).await;
+    assert_eq!((snap.identities, snap.identity_connections), (40, 40));
+    assert_eq!(server.agent_ids().len(), 40);
+    for c in clients.iter_mut().skip(1) {
+        c.send(&heartbeat(2)).await;
+        assert_eq!(c.recv().await["type"], "ack");
+    }
+}
+
+#[tokio::test]
+async fn mtls_still_limits_connections_per_ip_before_hello() {
+    // K-S2：mTLS 時每 IP 上限仍保護握手前與握手中的階段（慢速握手）；已通過 hello 的連線不受影響
+    let server = Server::start(Options {
+        mtls_crls: Some(Vec::new()),
+        max_connections: 64,
+        max_connections_per_ip: 4,
+        ..Options::default()
+    })
+    .await;
+    let identities = nat_identities();
+    let mut registered = Vec::new();
+    for (id, cert, key) in identities.iter().take(6) {
+        let mut c = Client::connect_with(&connector(Some((cert, key))), server.addr).await;
+        c.register(id).await;
+        registered.push(c);
+    }
+    // 4 條只建立 TCP、不握手的連線佔滿該位址握手中的名額（全域握手中上限 32 仍有剩餘）
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        stalled.push(TcpStream::connect(server.addr).await.unwrap());
+    }
+    let (_, cert, key) = &identities[10];
+    assert!(rejected_before_handshake(server.addr, &connector(Some((cert, key)))).await);
+    let snap = server.per_ip.snapshot(Instant::now());
+    let rejected = &snap.rejections.per_ip;
+    assert!(rejected.total >= 1, "{snap:?}");
+    assert_eq!(rejected.sources[0].source, LOCALHOST);
+    assert_eq!(
+        (rejected.sources[0].limit, rejected.sources[0].allowlisted),
+        (4, false)
+    );
+    assert_eq!(snap.rejections.global.handshake_limit_rejected, 0);
+    let needle = "來自 127.0.0.1 的握手中（尚未通過 hello）的連線數已達上限 4（server.max_connections_per_ip";
+    let logs = server.wait_for_logs(1, |l| l.contains(needle)).await;
+    assert!(logs.iter().any(|l| l.contains(needle)), "{logs:#?}");
+    // 已通過 hello 的 6 條連線（超過每 IP 上限 4）不受影響
+    for c in &mut registered {
+        c.send(&heartbeat(2)).await;
+        assert_eq!(c.recv().await["type"], "ack");
+    }
+    // 停滯的連線關閉後，新的 agent 可以連上
+    drop(stalled);
+    let (id, cert, key) = &identities[11];
+    let mut c = connect_when_admitted(server.addr, &connector(Some((cert, key)))).await;
+    c.register(id).await;
+}
+
+#[tokio::test]
+async fn allowlisted_address_uses_the_allowlisted_limit_without_mtls() {
+    // A7 過渡方案：允許清單內的位址改用允許清單的上限；被拒時依來源計數並記錄對應的設定
+    let server = Server::start(Options {
+        max_connections_per_ip: 2,
+        per_ip_allowlist: vec!["127.0.0.0/8"],
+        max_connections_per_allowlisted_ip: 5,
+        ..Options::default()
+    })
+    .await;
+    let mut clients = Vec::new();
+    for i in 0..5 {
+        let mut c = Client::connect(server.addr).await;
+        c.register(&format!("4e470000-0000-4000-8000-{:012x}", 100 + i))
+            .await;
+        clients.push(c);
+    }
+    // 未啟用 mTLS：已註冊的連線仍依來源位址計數
+    let snap = server.per_ip.snapshot(Instant::now());
+    assert_eq!((snap.counted_connections, snap.identities), (5, 0));
+    assert!(rejected_before_handshake(server.addr, &connector(None)).await);
+    let snap = server.per_ip.snapshot(Instant::now());
+    let source = snap.rejections.per_ip.sources[0];
+    assert_eq!(source.source, LOCALHOST);
+    assert_eq!((source.limit, source.allowlisted), (5, true));
+    let needle = "來自 127.0.0.1 的同時連線數已達上限 5（此位址在 server.per_ip_allowlist 中";
+    let logs = server.wait_for_logs(1, |l| l.contains(needle)).await;
+    assert!(logs.iter().any(|l| l.contains(needle)), "{logs:#?}");
+    // 名額歸還後可再連線
+    drop(clients.pop());
+    let mut c = connect_when_admitted(server.addr, &connector(None)).await;
+    c.register(OTHER_ID).await;
+}
+
+#[tokio::test]
+async fn global_limit_pause_time_is_counted() {
+    // D15：因全域上限被拒（KRS-W2204）：暫停接受新連線的次數與累計時間
+    let server = Server::start(Options {
+        max_connections: 2,
+        ..Options::default()
+    })
+    .await;
+    let mut a = Client::connect(server.addr).await;
+    a.register(ID).await;
+    // 第 2 條停在握手前：用完全域名額，accept 迴圈暫停
+    let stalled = TcpStream::connect(server.addr).await.unwrap();
+    let snap = wait_for_snapshot(&server, |s| s.rejections.global.paused_now).await;
+    assert!(snap.rejections.global.paused_now, "{snap:?}");
+    assert_eq!(snap.rejections.global.pauses, 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // 釋放後恢復，累計時間包含整段暫停
+    drop(stalled);
+    let snap = wait_for_snapshot(&server, |s| !s.rejections.global.paused_now).await;
+    assert!(!snap.rejections.global.paused_now, "{snap:?}");
+    assert!(
+        snap.rejections.global.paused >= Duration::from_millis(50),
+        "{snap:?}"
+    );
+    assert_eq!(snap.rejections.per_ip.total, 0);
+    a.send(&heartbeat(2)).await;
+    assert_eq!(a.recv().await["type"], "ack");
+}
+
+// ---- 協定 v2 與相容矩陣（A3、A4、O6） ----
+
+/// 新版 Pulse 的 hello：proto 1 + 範圍 1～2 + features 與主機資訊
+fn hello_v2(seq: u64, agent_id: &str, features: &[&str]) -> Value {
+    json!({
+        "type": "hello", "seq": seq, "proto": 1, "proto_min": 1, "proto_max": 2,
+        "features": features, "agent_id": agent_id, "hostname": "web-01",
+        "agent_version": "0.2.0", "heartbeat_interval_ms": 1000,
+        "ts": "2026-10-09T00:00:00.000Z",
+        "host_fingerprint": format!("sha256:{}", "a".repeat(64)),
+        "display_name": "Web 01", "tags": ["env:prod"], "report_interval_ms": 5000,
+        "os": {"name": "Ubuntu", "version": "24.04", "kernel": "6.8.0", "arch": "x86_64"}
+    })
+}
+
+fn metrics_report(seq: u64, cpu: f64) -> String {
+    json!({
+        "type": "report", "seq": seq, "ts": "2026-10-09T00:00:00.000Z",
+        "metrics": [
+            {"name": "system.cpu.usage", "value": cpu, "unit": "%"},
+            {"name": "system.memory.total", "value": 51_539_607_552_u64, "unit": "By"},
+            {"name": "system.memory.used", "value": 38_833_356_800_u64, "unit": "By"},
+            {"name": "system.filesystem.total", "value": 1000, "unit": "By",
+             "labels": {"mountpoint": "/", "fstype": "ext4"}, "extra": "dropped"},
+            {"name": "system.temperature", "value": -3.5, "unit": "Cel",
+             "labels": {"sensor": "acpitz"}}
+        ]
+    })
+    .to_string()
+}
+
+impl Server {
+    /// report 檔的最後一行
+    fn last_report_line(&self) -> Value {
+        let text = std::fs::read_to_string(self.reports_file()).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn v1_pulse_gets_a_v1_session_on_the_new_server() {
+    // 舊 Pulse ↔ 新 Kairos：hello_ack、report 格式、JSONL（除了新增的 schema）都與 v1 相同
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let ack = c.register(ID).await;
+    assert_eq!(
+        ack,
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+    c.send(&report(2)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    let line = server.last_report_line();
+    assert_eq!(line["schema"], 1);
+    assert_eq!(line["cpu_usage"], 12.5);
+    assert_eq!(line["total_memory"], 1000);
+    assert!(line.get("metrics").is_none(), "{line}");
+    // v1 連線送 metrics 格式：與 v1 Kairos 相同，是缺欄位的 bad_request（seq 為 null）
+    c.send(&metrics_report(3, 1.0)).await;
+    let err = c.expect_error("bad_request", false).await;
+    assert_eq!(err["seq"], Value::Null);
+    assert!(
+        err["message"].as_str().unwrap().contains("cpu_usage"),
+        "{err}"
+    );
+    // v1 report 夾帶型別錯誤的 metrics：v1 Kairos 會忽略，這裡也忽略
+    let mut with_garbage: Value = serde_json::from_str(&report(4)).unwrap();
+    with_garbage["metrics"] = json!(5);
+    c.send(&with_garbage.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    let snap = server.registry.snapshot(Utc::now());
+    assert_eq!(snap.agents[0].proto, 1);
+    assert_eq!(snap.agents[0].host, None);
+}
+
+#[tokio::test]
+async fn v1_hello_ignores_v2_host_fields_with_bad_types() {
+    // 協商為 v1 時，主機資訊欄位與 v1 Kairos 一樣被忽略（不檢查型別與限制）
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let mut h: Value = serde_json::from_str(&hello(1, ID, 1000)).unwrap();
+    h["display_name"] = json!(42);
+    h["tags"] = json!("x");
+    h["os"] = json!({"name": "a\nb"});
+    c.send(&h.to_string()).await;
+    assert_eq!(
+        c.recv().await,
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+}
+
+#[tokio::test]
+async fn new_pulse_negotiates_v2_with_metrics() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "future-thing"]).to_string())
+        .await;
+    let ack = c.recv().await;
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    assert_eq!(ack["proto"], 2);
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
+    assert_eq!(ack["offline_after_ms"], 5000);
+    // server_time：RFC 3339 UTC 毫秒，接近現在
+    let server_time = ack["server_time"].as_str().unwrap();
+    assert_eq!(server_time.len(), 24, "{server_time}");
+    assert!(server_time.ends_with('Z'));
+    let t = chrono::DateTime::parse_from_rfc3339(server_time).unwrap();
+    assert!((Utc::now() - t.with_timezone(&Utc)).num_seconds().abs() < 60);
+
+    // 指標 report：原樣保存為 schema 2（指標物件中未定義的欄位不保存）
+    c.send(&metrics_report(2, 17.84)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    let line = server.last_report_line();
+    assert_eq!(line["schema"], 2);
+    assert_eq!(line["agent_id"], ID);
+    assert!(line.get("cpu_usage").is_none(), "{line}");
+    let mut expected: Value = serde_json::from_str(&metrics_report(2, 17.84)).unwrap();
+    expected["metrics"][3]
+        .as_object_mut()
+        .unwrap()
+        .remove("extra");
+    assert_eq!(line["metrics"], expected["metrics"]);
+    let text = std::fs::read_to_string(server.reports_file()).unwrap();
+    assert!(text.contains(r#""value":51539607552,"#), "{text}");
+
+    // agents.json：協定版本、主機資訊與由指標換算的 last_report
+    let snap = serde_json::to_value(server.registry.snapshot(Utc::now())).unwrap();
+    let a = &snap["agents"][0];
+    assert_eq!(a["proto"], 2);
+    assert_eq!(a["display_name"], "Web 01");
+    assert_eq!(a["report_interval_ms"], 5000);
+    assert_eq!(a["os"]["arch"], "x86_64");
+    assert_eq!(a["last_report"]["total_memory"], 49152);
+    assert_eq!(a["last_report"]["metrics"], 5);
+
+    // v2 metrics 連線送 v1 三欄位：缺 metrics 的 bad_request
+    c.send(&report(3)).await;
+    let err = c.expect_error("bad_request", false).await;
+    assert_eq!(err["seq"], Value::Null);
+    assert!(
+        err["message"].as_str().unwrap().contains("metrics"),
+        "{err}"
+    );
+    // 內容不合限制：invalid_report（帶 seq，不保存，連線保持）
+    c.send(&metrics_report(4, 101.0)).await;
+    let err = c.expect_error("invalid_report", false).await;
+    assert_eq!(err["seq"], 4);
+    let mut bad_name: Value = serde_json::from_str(&metrics_report(5, 1.0)).unwrap();
+    bad_name["metrics"][0]["name"] = json!("CPU");
+    c.send(&bad_name.to_string()).await;
+    assert_eq!(c.expect_error("invalid_report", false).await["seq"], 5);
+    // metrics 型別錯誤：bad_request
+    let mut bad_type: Value = serde_json::from_str(&metrics_report(6, 1.0)).unwrap();
+    bad_type["metrics"][0]["value"] = json!("1");
+    c.send(&bad_type.to_string()).await;
+    assert_eq!(
+        c.expect_error("bad_request", false).await["seq"],
+        Value::Null
+    );
+    c.send(&heartbeat(7)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":7}));
+    assert_eq!(server.last_report_line()["seq"], 2);
+}
+
+#[tokio::test]
+async fn v2_without_the_metrics_feature_keeps_the_v1_report_format() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &[]).to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(ack["proto"], 2, "{ack}");
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
+    c.send(&report(2)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    assert_eq!(server.last_report_line()["schema"], 1);
+    c.send(&metrics_report(3, 1.0)).await;
+    c.expect_error("bad_request", false).await;
+}
+
+#[tokio::test]
+async fn version_ranges_without_overlap_are_rejected_with_the_server_range() {
+    let server = Server::start(Options::default()).await;
+    for (proto, min, max) in [(3, Some(3), Some(4)), (0, None, None), (9, None, None)] {
+        let mut c = Client::connect(server.addr).await;
+        let mut h: Value = serde_json::from_str(&hello(5, ID, 1000)).unwrap();
+        h["proto"] = json!(proto);
+        if let (Some(min), Some(max)) = (min, max) {
+            h["proto_min"] = json!(min);
+            h["proto_max"] = json!(max);
+        }
+        c.send(&h.to_string()).await;
+        let err = c.expect_error("unsupported_version", true).await;
+        assert_eq!(err["seq"], 5);
+        assert_eq!(err["message"], "supported proto: 1-2");
+        assert_eq!(
+            (err["proto_min"].clone(), err["proto_max"].clone()),
+            (json!(1), json!(2))
+        );
+        c.expect_clean_close().await;
+    }
+    // proto 2（沒有範圍）：只支援 v2 的 client，新伺服器以 v2 接受
+    let mut c = Client::connect(server.addr).await;
+    let mut h: Value = serde_json::from_str(&hello(1, ID, 1000)).unwrap();
+    h["proto"] = json!(2);
+    c.send(&h.to_string()).await;
+    assert_eq!(c.recv().await["proto"], 2);
+    // 未來的 client（1～9）：取共同的最高版本 2
+    let mut c = Client::connect(server.addr).await;
+    let mut h = hello_v2(1, OTHER_ID, &["metrics"]);
+    h["proto_max"] = json!(9);
+    c.send(&h.to_string()).await;
+    assert_eq!(c.recv().await["proto"], 2);
+}
+
+#[tokio::test]
+async fn invalid_v2_hello_fields_are_bad_requests_with_the_seq() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let cases: Vec<(&str, Value)> = vec![
+        ("proto_min", json!(null)),       // 只有 proto_max
+        ("proto_min", json!(3)),          // min > max
+        ("proto_min", json!("1")),        // 型別錯誤
+        ("features", json!(["Metrics"])), // 格式
+    ];
+    for (i, (field, value)) in cases.into_iter().enumerate() {
+        let seq = 10 + i as u64;
+        let mut h = hello_v2(seq, ID, &["metrics"]);
+        h[field] = value;
+        c.send(&h.to_string()).await;
+        assert_eq!(
+            c.expect_error("bad_request", false).await["seq"],
+            seq,
+            "{field}"
+        );
+        // 不讓連續無效訊息達到上限
+        if i == 2 {
+            c = Client::connect(server.addr).await;
+        }
+    }
+    let mut c = Client::connect(server.addr).await;
+    for (i, (field, value)) in [
+        ("display_name", json!("a\u{202e}b")),
+        ("tags", json!(["a", "a"])),
+        ("report_interval_ms", json!(10)),
+        ("host_fingerprint", json!("md5:abc")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = 20 + i as u64;
+        let mut h = hello_v2(seq, ID, &["metrics"]);
+        h[field] = value;
+        c.send(&h.to_string()).await;
+        assert_eq!(
+            c.expect_error("bad_request", false).await["seq"],
+            seq,
+            "{field}"
+        );
+    }
+    // 修正後的 hello 仍可在同一條連線註冊
+    c.send(&hello_v2(30, ID, &["metrics"]).to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(
+        (ack["type"].clone(), ack["seq"].clone()),
+        (json!("hello_ack"), json!(30))
+    );
+}
+
+#[tokio::test]
+async fn changed_host_fingerprint_is_logged() {
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics"]).to_string()).await;
+    assert_eq!(c.recv().await["proto"], 2);
+    let mut h = hello_v2(1, ID, &["metrics"]);
+    h["host_fingerprint"] = json!(format!("sha256:{}", "b".repeat(64)));
+    let mut other = Client::connect(server.addr).await;
+    other.send(&h.to_string()).await;
+    assert_eq!(other.recv().await["proto"], 2);
+    let logs = server
+        .wait_for_logs(1, |l| l.contains("主機指紋與上次不同"))
+        .await;
+    let line = logs
+        .iter()
+        .find(|l| l.contains("主機指紋與上次不同"))
+        .expect("應記錄主機指紋改變");
+    assert!(line.contains("sha256:aaaaaaaaaaaa…"), "{line}");
+    assert!(line.contains("sha256:bbbbbbbbbbbb…"), "{line}");
+}
+
+// ---- durable：at-least-once（A5） ----
+
+const BOOT: &str = "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e";
+
+fn durable_report(seq: u64, boot_id: &str, report_seq: u64, ts: &str) -> String {
+    let mut r: Value = serde_json::from_str(&metrics_report(seq, 1.5)).unwrap();
+    r["boot_id"] = json!(boot_id);
+    r["report_seq"] = json!(report_seq);
+    r["ts"] = json!(ts);
+    r.to_string()
+}
+
+async fn durable_client(server: &Server, seq: u64) -> Client {
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(seq, ID, &["metrics", "durable"]).to_string())
+        .await;
+    let ack = c.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    c
+}
+
+fn durable_lines(server: &Server) -> Vec<Value> {
+    std::fs::read_to_string(server.reports_file())
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn durable_resend_is_acked_but_written_once() {
+    let server = Server::start(Options::default()).await;
+    let mut c = durable_client(&server, 1).await;
+    // 補送的歷史資料（3 天前）照收，ts 原樣保存
+    let old = "2026-10-06T03:15:45.210Z";
+    c.send(&durable_report(2, BOOT, 41, old)).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    // boot_id 大小寫不同仍是同一筆（伺服器轉小寫）
+    c.send(&durable_report(3, &BOOT.to_ascii_uppercase(), 41, old))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+    c.send(&durable_report(4, BOOT, 42, "2026-10-06T03:15:50.210Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    drop(c);
+
+    // 結果不明時斷線、重連後重送：回 ack，不重寫
+    let mut c = durable_client(&server, 1).await;
+    c.send(&durable_report(2, BOOT, 42, "2026-10-06T03:15:50.210Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    c.send(&durable_report(3, BOOT, 43, "2026-10-06T03:15:55.210Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+
+    let lines = durable_lines(&server);
+    let keys: Vec<(String, u64, String)> = lines
+        .iter()
+        .map(|l| {
+            (
+                l["boot_id"].as_str().unwrap().to_string(),
+                l["report_seq"].as_u64().unwrap(),
+                l["ts"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (BOOT.to_string(), 41, old.to_string()),
+            (BOOT.to_string(), 42, "2026-10-06T03:15:50.210Z".to_string()),
+            (BOOT.to_string(), 43, "2026-10-06T03:15:55.210Z".to_string()),
+        ]
+    );
+    assert!(lines.iter().all(|l| l["schema"] == 2));
+}
+
+#[tokio::test]
+async fn durable_report_without_valid_seq_fields_is_bad_request() {
+    let server = Server::start(Options::default()).await;
+    let mut c = durable_client(&server, 1).await;
+    let base: Value = serde_json::from_str(&metrics_report(2, 1.5)).unwrap();
+    let cases = [
+        json!({}),                                   // 缺漏
+        json!({"boot_id": BOOT}),                    // 只有一個
+        json!({"boot_id": BOOT, "report_seq": "1"}), // 型別錯誤
+        json!({"boot_id": BOOT, "report_seq": -1}),
+        json!({"boot_id": "not-a-uuid", "report_seq": 1}), // 不是 UUID
+        json!({"boot_id": BOOT, "report_seq": 0}),         // 至少為 1
+    ];
+    for (i, extra) in cases.iter().enumerate() {
+        let mut r = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        c.send(&r.to_string()).await;
+        let err = c.recv().await;
+        assert_eq!(err["code"], "bad_request", "{extra}: {err}");
+        assert_eq!(err["seq"], Value::Null, "{err}");
+        // 連續 5 則無效訊息會斷線：中間穿插一則 heartbeat
+        if i % 2 == 1 {
+            c.send(r#"{"type":"heartbeat","seq":9,"ts":"t"}"#).await;
+            assert_eq!(c.recv().await, json!({"type":"ack","seq":9}));
+        }
+    }
+    assert!(durable_lines(&server).is_empty());
+}
+
+#[tokio::test]
+async fn durable_fields_are_ignored_when_not_negotiated() {
+    // 0.2.0 Pulse（不宣告 durable）：report 帶了也忽略，型別錯誤也不檢查，與 0.2.0 Kairos 相同
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics"]).to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
+    let mut r: Value = serde_json::from_str(&metrics_report(2, 1.5)).unwrap();
+    r["boot_id"] = json!(5);
+    r["report_seq"] = json!("x");
+    c.send(&r.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    c.send(&durable_report(3, BOOT, 1, "2026-10-09T00:00:00.000Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+    c.send(&durable_report(4, BOOT, 1, "2026-10-09T00:00:00.000Z"))
+        .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    let lines = durable_lines(&server);
+    assert_eq!(lines.len(), 3, "未協商 durable 時不去重");
+    assert!(lines.iter().all(|l| l.get("boot_id").is_none()));
 }

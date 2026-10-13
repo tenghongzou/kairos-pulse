@@ -8,11 +8,13 @@
 #   - 專用使用者 pulse（無登入 shell），程式與設定在 /opt/pulse
 #   - /opt/pulse/agent.id 已事先以 `pulse --print-agent-id` 產生（ProtectSystem=strict
 #     下 /opt/pulse 本身唯讀，服務無法自行建立 agent.id）
-#   - /opt/pulse/logs 已建立且屬於 pulse（唯一可寫的目錄；不存在時 unit 會以
-#     226/NAMESPACE 啟動失敗）
+#   - /opt/pulse/logs 已建立且屬於 pulse（可寫；不存在時 unit 會以 226/NAMESPACE 啟動失敗）
+#   - /opt/pulse/buffer 已建立且屬於 pulse（本機緩衝，可寫；路徑前的 - 表示不存在時不影響啟動，
+#     但 Pulse 無法建立緩衝，會記 ERROR 並改為 at-most-once）
 #
 # 同一台主機要跑多個實例時，每個實例複製一份 unit（例如 pulse-2.service 對應 /opt/pulse-2），
-# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行；執行檔仍用 /opt/pulse/pulse。
+# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行（ReadWritePaths= 的兩個路徑都要改）；
+# 執行檔仍用 /opt/pulse/pulse。
 # 詳見 INSTALL.md 第 9 節。
 #
 # 修改請用 `systemctl edit pulse` 建立 drop-in，不要直接改這個檔案。
@@ -25,8 +27,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 只用 sd_notify 更新狀態文字（systemctl status 的「Status:」：已註冊／無法註冊：<錯誤碼>／
-# 重新連線中），不送 READY=1，因此維持 Type=simple；只接受主程序送來的通知
+# 只用 sd_notify 更新狀態文字（systemctl status 的「Status:」：連線中／已註冊／重新連線中／
+# 無法連線：伺服器憑證<原因>／無法註冊：<錯誤碼>），不送 READY=1，因此維持 Type=simple；
+# 只接受主程序送來的通知
 NotifyAccess=main
 User=pulse
 Group=pulse
@@ -36,7 +39,7 @@ ExecStart=/opt/pulse/pulse
 
 # 日誌只保留 logs/pulse-YYYY-MM-DD.log 一份（Pulse 的日誌寫到 stdout 與 logs/）。
 # stderr 仍進 journal：設定錯誤、日誌初始化失敗、panic 等「日誌檔還沒開好就發生」的
-# 錯誤都寫在 stderr，`journalctl -u pulse` 仍看得到。需要人工處理的持續性錯誤（憑證被撤銷、
+# 錯誤都寫在 stderr，`journalctl -u pulse` 仍看得到；憑證錯誤等使 Pulse 結束的原因也另寫一行。需要人工處理的持續性錯誤（憑證被撤銷、
 # auth_failed、狀態表已滿、本機憑證過期等）也會以 err 等級另寫一行到 stderr（同一原因每
 # 10 分鐘最多一行），`journalctl -u pulse -p err` 可篩選。理由見 INSTALL.md。
 StandardOutput=null
@@ -45,13 +48,19 @@ StandardError=journal
 # 正常結束：送出 close_notify 後約 1 秒內結束；再送一次訊號會以 130 強制結束
 KillSignal=SIGINT
 TimeoutStopSec=10
-# Pulse 本身會無限重連；這裡處理取樣任務異常、設定錯誤等以非 0 結束的情況
+# Pulse 本身會無限重連；這裡處理取樣任務異常等內部錯誤（結束代碼 1）。
+# 重試也不會成功的錯誤不重新啟動，服務停在 failed，修正後執行 systemctl restart pulse：
+#   2 用法錯誤（ExecStart 的命令列參數）
+#   3 設定錯誤（pulse.toml、PULSE__* 環境變數的語法、型別、範圍錯誤等）
+#   4 憑證錯誤（ca_cert、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，SAN 與 agent_id 不符，
+#     agent.id 無法讀取或內容不合法）
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=2 3 4
 
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict
-ReadWritePaths=/opt/pulse/logs
+ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

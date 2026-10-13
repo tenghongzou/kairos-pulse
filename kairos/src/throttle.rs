@@ -78,6 +78,8 @@ pub enum Category {
     AgentOnline,
     /// agent 離線（連線關閉、被取代）
     AgentOffline,
+    /// 同一個 agent_id 的主機指紋與上次登記時不同（可能是複製的主機共用 agent.id）
+    HostFingerprintChanged,
     /// 宣告的 heartbeat_interval_ms 超出範圍
     HeartbeatClamped,
     /// 內容無效的 report（invalid_report）
@@ -94,6 +96,8 @@ pub enum Category {
     WriteUnknown,
     /// report 檔開檔或寫入失敗、達到每日大小上限
     StorageWrite,
+    /// SQLite 的維護工作（彙總寫出、保留期限與容量上限的刪除、主機清冊同步）失敗或無法完成
+    StorageMaintenance,
 }
 
 /// 節流的來源

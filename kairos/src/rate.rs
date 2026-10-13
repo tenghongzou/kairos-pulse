@@ -3,7 +3,8 @@
 //! report 限速有兩層：
 //! - **來源**（跨連線共用、斷線後保留）：啟用 mTLS 時以 agent_id 為來源（憑證綁定，無法偽造）；
 //!   未啟用 mTLS 時 agent_id 可任意宣告，改以來源 IP（IPv6 以 /64 合併）為來源，容量與速率乘上
-//!   `server.max_connections_per_ip`，讓同一個 NAT 後的多個 agent 不會互相拖累。
+//!   `server.max_connections_per_ip`（來源與 `server.per_ip_allowlist` 有交集時改乘允許清單的實際上限），
+//!   讓同一個 NAT 後的多個 agent 不會互相拖累。
 //! - **連線**（未啟用 mTLS 時）：限制單一連線不得獨佔來源 IP 的額度。
 //!
 //! 新出現的來源與新連線都只給 [`REPORT_INITIAL_TOKENS`]（不給滿），重新連線無法取得新的額度。
@@ -12,6 +13,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use crate::per_ip::PerIpPolicy;
 
 /// report 限速：每個來源（或連線）的 token bucket 容量（可連續送出的筆數）
 pub const REPORT_BURST: f64 = 10.0;
@@ -129,15 +132,21 @@ pub enum Pace {
 /// 跨連線共用的 report 限速表
 #[derive(Debug)]
 pub struct ReportLimiter {
-    /// 以來源 IP 為來源時，容量與速率的倍數（`server.max_connections_per_ip`）
-    ip_scale: f64,
+    /// 以來源 IP 為來源時，容量與速率的倍數（每 IP 上限，見 [`PerIpPolicy::report_scale`]）
+    policy: PerIpPolicy,
     buckets: Mutex<HashMap<ReportSource, TokenBucket>>,
 }
 
 impl ReportLimiter {
+    /// 沒有允許清單時：以來源 IP 為來源的倍數為 `max_connections_per_ip`
+    #[cfg(test)]
     pub fn new(max_connections_per_ip: usize) -> Self {
+        Self::with_policy(PerIpPolicy::simple(max_connections_per_ip))
+    }
+
+    pub fn with_policy(policy: PerIpPolicy) -> Self {
         Self {
-            ip_scale: max_connections_per_ip.max(1) as f64,
+            policy,
             buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -160,7 +169,7 @@ impl ReportLimiter {
     fn source_bucket(&self, source: &ReportSource, now: Instant) -> TokenBucket {
         let scale = match source {
             ReportSource::Agent(_) => 1.0,
-            ReportSource::Ip(_) => self.ip_scale,
+            ReportSource::Ip(ip) => self.policy.report_scale(*ip).max(1) as f64,
         };
         TokenBucket::with_tokens(
             REPORT_BURST * scale,
@@ -357,5 +366,36 @@ mod tests {
         let later = t0 + Duration::from_secs(3600);
         limiter.acquire(ReportSource::Agent("new".into()), None, later, MAX);
         assert_eq!(limiter.tracked(), 1);
+    }
+
+    #[test]
+    fn allowlisted_source_ip_gets_the_allowlisted_scale() {
+        // 未啟用 mTLS：允許清單內的來源 IP（NAT 出口）的 report 額度乘上允許清單的實際上限
+        use crate::per_ip::{Allowlist, PerIpPolicy};
+        use std::sync::Arc;
+        let t0 = Instant::now();
+        let limiter = ReportLimiter::with_policy(PerIpPolicy {
+            max_per_ip: 1,
+            allowlist: Arc::new(Allowlist::parse(&["192.0.2.0/24"]).unwrap()),
+            max_per_allowlisted_ip: 100,
+            mtls: false,
+        });
+        // 新來源一開始有 REPORT_INITIAL_TOKENS × 倍數
+        let take_all = |source: ReportSource| {
+            (0..1000)
+                .take_while(|_| {
+                    limiter.acquire(source.clone(), None, t0, Duration::ZERO) != Pace::Reject
+                })
+                .count()
+        };
+        assert_eq!(
+            take_all(ReportSource::Ip(IP)),
+            (REPORT_INITIAL_TOKENS * 100.0) as usize
+        );
+        let outside = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(
+            take_all(ReportSource::Ip(outside)),
+            REPORT_INITIAL_TOKENS as usize
+        );
     }
 }

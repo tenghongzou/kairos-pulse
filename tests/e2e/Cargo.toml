@@ -1,0 +1,20 @@
+[package]
+name = "kp-e2e"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+# 只供測試：以實際編譯出的 kairos 與 pulse 執行檔跑端對端測試（審計 Q1），不發佈也不打包
+publish = false
+description = "Kairos + Pulse end-to-end tests (spawns the real binaries)"
+
+[lib]
+# 測試輔助程式（行程管理、暫存目錄、設定與 PKI）；本身沒有單元測試與文件測試
+test = false
+doctest = false
+
+[dependencies]
+# 解析 Kairos 寫出的 reports-*.jsonl 與 agents.json；與 kairos、pulse 使用的版本相同（不新增依賴）
+serde_json = "1"
+# 協定 v1 的假 client（模擬舊版 Pulse）以 mTLS 連上實際的 Kairos；與 kairos、pulse 經 tokio-rustls
+# 使用的版本與加密後端（ring）相同，Cargo.lock 不新增外部套件
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

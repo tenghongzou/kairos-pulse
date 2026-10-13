@@ -1,8 +1,10 @@
 [package]
 name = "pulse"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
+# 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,6 +15,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 config = { version = "0.15", default-features = false, features = ["toml"] }
 # 日誌輸出；date-based：按日分檔（logs/pulse-YYYY-MM-DD.log，UTC 日期）
 fern = { version = "0.7", features = ["date-based"] }
+# 與 Kairos 共用的日誌清除時鐘跳躍保護（workspace 內部 crate）
+date-guard = { path = "../crates/date-guard" }
+# 與 Kairos 共用的協定型別與驗證（workspace 內部 crate）
+kairos-proto = { path = "../crates/kairos-proto" }
 # SinkExt / StreamExt
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log = "0.4"

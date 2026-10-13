@@ -1,0 +1,25 @@
+# cargo-about 設定（商業審計 B2）：產生發佈包內附的 THIRD-PARTY-LICENSES。
+# 由 kairos/、pulse/ 的 packaging/build-release.sh 在 docker 建置容器內執行：
+#   cargo about generate --frozen -m <產品>/Cargo.toml -c packaging/about.toml packaging/about.hbs
+# 參考：https://embarkstudios.github.io/cargo-about/
+
+# 只列出發佈包目標平台實際連結的依賴（Windows／macOS 專屬的依賴不在 Linux 發佈包內）
+targets = ["x86_64-unknown-linux-musl"]
+# dev-dependencies 只用於測試，不在發佈的執行檔中；build-dependencies（例如 ring 的 cc）
+# 與 proc-macro 雖然也不連結進執行檔，仍保守地列出
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+
+# 與 deny.toml 的 [licenses] allow 相同；新依賴引入其他授權時產生失敗，需人工審查後兩邊一起加入。
+# 順序即選擇優先序：依賴為雙重授權（例如 MIT OR Apache-2.0）時採用排在前面的授權。
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+# kairos、pulse 與 crates/ 下的共用 crate 都是 publish = false 的本產品程式碼，不列入第三方清單
+[private]
+ignore = true

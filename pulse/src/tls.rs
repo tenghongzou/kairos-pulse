@@ -1,9 +1,12 @@
 //! TLS 設定（rustls）。
 //!
-//! - 信任：作業系統信任庫（rustls-native-certs，`server.use_system_roots = false` 時不載入）
-//!   + `server.ca_cert`（可含多張）。
+//! - 信任：作業系統信任庫（rustls-native-certs）+ `server.ca_cert`（可含多張）。
+//!   是否信任作業系統信任庫見 [`ServerConfig::trusts_system_roots`]：明確設定
+//!   `server.use_system_roots` 時以設定為準；未設定時，有 `ca_cert` 就只信任 `ca_cert`。
 //! - 客戶端憑證（mTLS）：`server.client_cert`（可含中繼 CA 鏈）+ `server.client_key`
 //!   （PKCS#8 / PKCS#1 / SEC1，RSA / ECDSA / Ed25519，不可加密）。金鑰與憑證不成對時在啟動時即報錯。
+//!   私鑰檔案權限過寬（Unix 的群組／其他使用者權限、Windows 的 ACL）時記 warn，規則見
+//!   [`crate::file_perms`]。
 //!   憑證有效期限在啟動時與之後每 24 小時檢查一次（[`TlsSetup::log_client_cert_validity`]）：
 //!   已過期記 error（仍會嘗試連線，以伺服器判定為準：可能只是本機時鐘不正確）、
 //!   尚未生效或 30 天內到期記 warn。
@@ -176,7 +179,8 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
                 provider: provider.clone(),
             }))
     } else {
-        let roots = load_roots(server.ca_cert.trim(), server.use_system_roots)?;
+        log::info!("{}", trust_store_message(server));
+        let roots = load_roots(server.ca_cert.trim(), server.trusts_system_roots())?;
         let verifier =
             WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
                 .build()
@@ -190,6 +194,13 @@ pub fn build(server: &ServerConfig) -> Result<TlsSetup, String> {
         (None, None)
     } else {
         let (chain, key) = load_client_cert(cert_path, key_path)?;
+        // 私鑰權限過寬只記 warn、不阻止啟動（與 agent.id 的策略一致）
+        if let Some(warning) = crate::file_perms::permission_warning(
+            std::path::Path::new(key_path),
+            crate::file_perms::CLIENT_KEY_FILE,
+        ) {
+            log::warn!("{warning}");
+        }
         // 已過期也不阻止啟動（記 error）：本機時鐘可能不正確，以伺服器的判定為準
         log_findings(&check_chain_validity(cert_path, &chain, Utc::now()));
         if let Some(warning) = multiple_dns_san_warning(cert_path, &chain[0]) {
@@ -247,6 +258,29 @@ impl ResolvesClientCert for RecordingClientCertResolver {
     }
 }
 
+/// 啟動時說明伺服器憑證的信任來源（INFO），讓升級後「不再信任系統信任庫」的變化看得到。
+fn trust_store_message(server: &ServerConfig) -> String {
+    let has_ca = !server.ca_cert.trim().is_empty();
+    match (server.use_system_roots, has_ca) {
+        (None, true) => "伺服器憑證信任來源：只信任 server.ca_cert（設定了 ca_cert 且未設定 \
+             server.use_system_roots，預設不信任作業系統信任庫；伺服器憑證由公開 CA 簽發時請設定 \
+             use_system_roots = true）"
+            .to_string(),
+        (None, false) => "伺服器憑證信任來源：作業系統信任庫（未設定 server.ca_cert）".to_string(),
+        (Some(true), true) => {
+            "伺服器憑證信任來源：作業系統信任庫 + server.ca_cert（server.use_system_roots = true）"
+                .to_string()
+        }
+        (Some(true), false) => {
+            "伺服器憑證信任來源：作業系統信任庫（server.use_system_roots = true）".to_string()
+        }
+        (Some(false), _) => {
+            "伺服器憑證信任來源：只信任 server.ca_cert（server.use_system_roots = false）"
+                .to_string()
+        }
+    }
+}
+
 /// 信任庫：作業系統信任庫（`use_system_roots` 為 true 時）+ `ca_cert`（可含多張）。
 ///
 /// 系統信任庫中個別憑證載入失敗只記 warn；兩者合計沒有任何可用憑證時回傳錯誤。
@@ -263,8 +297,6 @@ fn load_roots(ca_path: &str, use_system_roots: bool) -> Result<RootCertStore, St
             log::warn!("作業系統信任庫中有 {ignored} 張憑證無法使用，已略過");
         }
         log::debug!("已從作業系統信任庫載入 {added} 張憑證");
-    } else {
-        log::info!("server.use_system_roots = false：不信任作業系統信任庫，只信任 server.ca_cert");
     }
 
     if !ca_path.is_empty() {
@@ -282,7 +314,7 @@ fn load_roots(ca_path: &str, use_system_roots: bool) -> Result<RootCertStore, St
         return Err(if use_system_roots {
             "沒有任何可信任的憑證：作業系統信任庫無法載入，且未設定 server.ca_cert".to_string()
         } else {
-            "沒有任何可信任的憑證：server.use_system_roots = false 且未設定 server.ca_cert"
+            "沒有任何可信任的憑證：不信任作業系統信任庫（server.use_system_roots = false）且未設定 server.ca_cert"
                 .to_string()
         });
     }
@@ -667,7 +699,8 @@ mod tests {
             } else {
                 data(ca)
             },
-            use_system_roots: true,
+            // 測試沿用升級前的行為（同時信任系統信任庫），個別測試再改
+            use_system_roots: Some(true),
             client_cert: if cert.is_empty() {
                 String::new()
             } else {
@@ -702,7 +735,7 @@ mod tests {
         let roots = load_roots(&data("ca-bundle.pem"), false).unwrap();
         assert_eq!(roots.len(), 2);
         let mut cfg = server("ca-bundle.pem", "", "");
-        cfg.use_system_roots = false;
+        cfg.use_system_roots = Some(false);
         assert!(build(&cfg).is_ok());
         // 兩者皆無 → 錯誤（設定驗證會先擋下，這裡是第二道防線）
         let err = load_roots("", false).unwrap_err();
@@ -750,6 +783,77 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_key_permissions_are_checked() {
+        // S4：私鑰權限過寬時記 warn，但不阻止啟動
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join("pulse-tls-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("client.key");
+        std::fs::copy(data("client-rsa.key"), &key).unwrap();
+        let mut cfg = server("root.pem", "client-rsa.pem", "");
+        cfg.client_key = key.display().to_string();
+        let key_warnings = |logs: &[(Level, String)]| {
+            logs.iter()
+                .filter(|(l, m)| *l == Level::Warn && m.contains("server.client_key"))
+                .count()
+        };
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok());
+        assert_eq!(key_warnings(&logs), 0, "{logs:?}");
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok(), "權限過寬不阻止啟動");
+        assert_eq!(key_warnings(&logs), 1, "{logs:?}");
+        assert!(
+            logs.iter()
+                .any(|(_, m)| m.contains("644") && m.contains("chmod 600")),
+            "{logs:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_key_acl_is_checked() {
+        // S4：Windows 檢查 ACL；Users 可讀時記 warn，但不阻止啟動
+        let dir = std::env::temp_dir()
+            .join("pulse-tls-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("client.key");
+        std::fs::copy(data("client-rsa.key"), &key).unwrap();
+        let mut cfg = server("root.pem", "client-rsa.pem", "");
+        cfg.client_key = key.display().to_string();
+        let key_warnings = |logs: &[(Level, String)]| {
+            logs.iter()
+                .filter(|(l, m)| *l == Level::Warn && m.contains("server.client_key"))
+                .count()
+        };
+        // 使用者的 TEMP 只有本人、SYSTEM 與 Administrators 可存取
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok());
+        assert_eq!(key_warnings(&logs), 0, "{logs:?}");
+
+        let status = std::process::Command::new("icacls")
+            .arg(&key)
+            .args(["/grant", "*S-1-5-32-545:R"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (res, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(res.is_ok(), "權限過寬不阻止啟動");
+        assert_eq!(key_warnings(&logs), 1, "{logs:?}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1152,8 +1256,44 @@ mod tests {
     fn trusting_test_server() -> ServerConfig {
         let mut cfg = server("", "", "");
         cfg.ca_cert = data("server-ca.pem");
-        cfg.use_system_roots = false;
+        cfg.use_system_roots = Some(false);
         cfg
+    }
+
+    #[test]
+    fn trust_store_follows_ca_cert_unless_explicit() {
+        // S5：設定了 ca_cert 且未明確設定 use_system_roots → 只信任 ca_cert
+        let mut cfg = server("ca-bundle.pem", "", "");
+        cfg.use_system_roots = None;
+        let (setup, logs) = crate::test_log::capture(|| build(&cfg));
+        assert!(setup.is_ok());
+        assert!(
+            logs.iter()
+                .any(|(l, m)| *l == Level::Info && m.contains("只信任 server.ca_cert")),
+            "{logs:?}"
+        );
+        assert!(trust_store_message(&cfg).contains("use_system_roots = true"));
+        // 沒有 ca_cert → 作業系統信任庫
+        cfg.ca_cert = String::new();
+        assert!(trust_store_message(&cfg).contains("作業系統信任庫（未設定"));
+        // 明確設定時以設定為準
+        cfg.ca_cert = data("ca-bundle.pem");
+        cfg.use_system_roots = Some(true);
+        assert!(trust_store_message(&cfg).contains("作業系統信任庫 + server.ca_cert"));
+        cfg.use_system_roots = Some(false);
+        assert!(trust_store_message(&cfg).contains("use_system_roots = false"));
+    }
+
+    #[tokio::test]
+    async fn handshake_with_ca_cert_only_by_default() {
+        // S5：只設定 ca_cert（不寫 use_system_roots）就能連上私有 CA 簽發的伺服器
+        let (addr, server_task) = spawn_tls_server(None).await;
+        let mut cfg = server("", "", "");
+        cfg.ca_cert = data("server-ca.pem");
+        cfg.use_system_roots = None;
+        let (res, _) = handshake(&cfg, addr).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(server_task.await.unwrap().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1174,7 +1314,7 @@ mod tests {
     async fn handshake_rejects_untrusted_server_cert() {
         // 只用系統信任庫（不含測試 CA）、或信任另一個 CA → 簽發者不受信任
         let mut other_ca = server("root.pem", "", "");
-        other_ca.use_system_roots = false;
+        other_ca.use_system_roots = Some(false);
         for cfg in [server("", "", ""), other_ca] {
             let (addr, _server) = spawn_tls_server(None).await;
             let (res, _) = handshake(&cfg, addr).await;

@@ -1,10 +1,13 @@
 [server]
-listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080
+listen = "127.0.0.1:8080"     # 部署成中央伺服器時改成 0.0.0.0:8080，並同時設定 [auth] client_ca 啟用 mTLS（未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動）
 cert_path = "cert.pem"
 key_path = "key.pem"
 max_connections = 1024
-# max_connections_per_ip = 32 # 同一來源 IP 位址的同時連線數上限（含握手中的連線；IPv6 以單一位址計，新連線速率才以 /64 合併），1..=max_connections；未設定時為 min(32, max_connections)
+# max_connections_per_ip = 32 # 每個來源 IP 位址的連線數上限，1..=max_connections；未設定時為 min(32, max_connections)。未啟用 mTLS：計算全部連線（含握手中）；啟用 mTLS：只計算尚未通過 hello 的連線（握手前保護），通過後改依憑證身分計數，同一 NAT 後的 agent 數不受此限（IPv6 以單一位址計，新連線速率才以 /64 合併）
+per_ip_allowlist = []         # 每 IP 上限的網段允許清單（CIDR，IPv4／IPv6，只寫位址表示單一位址），例如 ["203.0.113.10", "10.20.0.0/16"]；清單內的位址改用下一項的上限
+# max_connections_per_allowlisted_ip = 4096 # 允許清單內每個位址的上限，1..=65535；實際上限為 min(此值, max_connections)。清單非空且此值大於 max_connections 時啟動記 WARN；清單為空時不生效
 reload_interval_secs = 30     # 每隔幾秒檢查憑證／私鑰／客戶端 CA／CRL 是否變更並重新驗證現役連線，0 = 停用，上限 3600
+cert_expiry_warning_days = 30 # 伺服器憑證到期前幾天開始記 WARN（啟動、重載與每個重載週期檢查），0 = 不預警（已過期仍記 ERROR），上限 365
 
 [timeouts]
 handshake_secs = 5
@@ -13,13 +16,23 @@ write_secs = 5                # 寫出訊息與等待 report 寫檔的上限，1
 
 [storage]
 data_dir = "data"
-retention_days = 30           # reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
-max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制；達到後當天的 report 回 storage_unavailable。設定值小於 max_connections × 每秒 1 則 × 約 250 bytes × 86400 時，啟動會記 WARN
+backend = "sqlite"            # report 的儲存：sqlite（<data_dir>/kairos.db：原始資料、彙總與主機清冊）或 jsonl（舊版的按日 JSONL，沒有主機清冊與彙總）；說明見 STORAGE.md
+jsonl_mirror = false          # backend = "sqlite" 時另外輸出 JSONL 鏡像 reports-YYYY-MM-DD.jsonl（盡力而為，不影響 ack）
+raw_retention_days = 7        # SQLite 原始 report 保留天數（今天與前 N 天，UTC），0 = 不依時間刪除，上限 3650
+rollup_5m_retention_days = 31 # 5 分鐘彙總（min/max/sum/count）保留天數，0 = 不依時間刪除
+rollup_1h_retention_days = 400 # 1 小時彙總保留天數，0 = 不依時間刪除
+max_total_bytes = 68719476736 # SQLite 資料庫的總容量上限（bytes，預設 64 GiB；0 = 不限制，否則至少 64 MiB）；超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總。小於估算量時啟動會記 WARN
+sqlite_synchronous = "normal" # normal：commit 寫入作業系統即 ack（與 JSONL 相同，斷電可能遺失最後幾個交易）；full：每次 commit 都 fsync
+# max_hosts = 100000          # 主機清冊最多幾台（limits.max_agents..=1000000）；未設定時為 max(100000, limits.max_agents)
+retention_days = 30           # JSONL（backend = "jsonl" 或鏡像）reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
+max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制；backend = "jsonl" 時達到後當天的 report 回 storage_unavailable（鏡像只是不再寫入鏡像）。寫 JSONL 且設定值小於 max_connections × 每秒 1 則 × 約 250 bytes × 86400 時，啟動會記 WARN
 
 [auth]
 client_ca = ""                # 非空：要求客戶端憑證（mTLS），以此 PEM（可含多張 CA）驗證，並強制 agent_id 綁定
 crl = []                      # CRL 檔路徑清單（PEM 或 DER），例如 ["agents.crl"]；只在設定 client_ca 時有效
 allow_multiple_dns_sans = false  # false：客戶端憑證必須恰好有一個 DNS SAN（避免一張憑證冒用多個 agent）
+crl_expiry_warning_days = 7   # CRL 的 nextUpdate 前幾天開始記 WARN（過期後所有 agent 都會被拒絕），0 = 不預警（已過期仍記 ERROR），上限 365
+allow_unauthenticated = false # false：未設定 client_ca 又監聽非 loopback 位址（例如 0.0.0.0）時拒絕啟動。true 只用於隔離的測試環境：任何人都能以任意 agent_id 註冊
 
 [limits]
 # max_agents = 10000          # 狀態表最多保留幾個 agent（達上限先淘汰離線最久者），max_connections..=100000；未設定時為 max(10000, max_connections)

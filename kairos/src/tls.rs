@@ -14,6 +14,8 @@ use tokio_rustls::rustls::server::danger::ClientCertVerifier;
 use tokio_rustls::rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use tokio_rustls::rustls::{CertificateError, RootCertStore, ServerConfig};
 
+use crate::expiry::{self, Expiry, ExpiryKind};
+
 /// 組成 TLS 設定所需的檔案
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsPaths {
@@ -76,6 +78,8 @@ pub struct TlsMaterial {
     pub verifier: Option<Arc<dyn ClientCertVerifier>>,
     /// 載入的 CRL 數量
     pub crl_count: usize,
+    /// 伺服器憑證的到期時間與各 CRL 的下次更新時間（到期預警用；O1）。無法讀出日期的項目不列入
+    pub expiries: Vec<Expiry>,
 }
 
 impl TlsMaterial {
@@ -92,10 +96,31 @@ pub fn build(paths: &TlsPaths) -> Result<TlsMaterial, Error> {
     let key =
         PrivateKeyDer::from_pem_file(&paths.key).map_err(|e| pem_error(&paths.key, "私鑰", e))?;
 
+    let mut expiries: Vec<Expiry> = expiry::cert_not_after(certs[0].as_ref())
+        .map(|at| Expiry {
+            kind: ExpiryKind::ServerCert,
+            path: paths.cert.clone(),
+            index: 0,
+            at,
+        })
+        .into_iter()
+        .collect();
+
     let (verifier, crl_count) = match &paths.client_ca {
         Some(ca_path) => {
             let crls = load_crls(&paths.crls)?;
+            for (path, index, crl) in &crls {
+                if let Some(at) = expiry::crl_next_update(crl.as_ref()) {
+                    expiries.push(Expiry {
+                        kind: ExpiryKind::Crl,
+                        path: path.clone(),
+                        index: *index,
+                        at,
+                    });
+                }
+            }
             let count = crls.len();
+            let crls = crls.into_iter().map(|(_, _, crl)| crl).collect();
             (Some(load_client_verifier(ca_path, crls)?), count)
         }
         None => (None, 0),
@@ -125,6 +150,7 @@ pub fn build(paths: &TlsPaths) -> Result<TlsMaterial, Error> {
         acceptor: TlsAcceptor::from(Arc::new(config)),
         verifier,
         crl_count,
+        expiries,
     })
 }
 
@@ -172,10 +198,19 @@ pub fn load_crl_file(path: &str) -> Result<Vec<CertificateRevocationListDer<'sta
     Ok(crls)
 }
 
-fn load_crls(paths: &[String]) -> Result<Vec<CertificateRevocationListDer<'static>>, Error> {
+/// 讀取所有 CRL 檔，回傳 (檔案路徑, 在檔案中的序號, CRL)
+#[allow(clippy::type_complexity)]
+fn load_crls(
+    paths: &[String],
+) -> Result<Vec<(String, usize, CertificateRevocationListDer<'static>)>, Error> {
     let mut all = Vec::new();
     for path in paths {
-        all.extend(load_crl_file(path)?);
+        all.extend(
+            load_crl_file(path)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, crl)| (path.clone(), i, crl)),
+        );
     }
     Ok(all)
 }
@@ -411,6 +446,39 @@ mod tests {
         let mtls = build(&paths(Some("test-ca.crt"), &["crl-revoke-a.crl"])).unwrap();
         assert!(mtls.auth_enabled());
         assert_eq!(mtls.crl_count, 1);
+    }
+
+    #[test]
+    fn build_collects_expiry_dates() {
+        // O1：伺服器憑證的 notAfter 與每份 CRL 的 nextUpdate
+        let at = chrono::DateTime::parse_from_rfc3339("2126-09-14T20:51:35Z")
+            .unwrap()
+            .to_utc();
+        let plain = build(&paths(None, &[])).unwrap();
+        assert_eq!(
+            plain.expiries,
+            [Expiry {
+                kind: ExpiryKind::ServerCert,
+                path: p("server.crt"),
+                index: 0,
+                at
+            }]
+        );
+        let mtls = build(&paths(
+            Some("test-ca.crt"),
+            &["crl-revoke-a.crl", "crl-empty.crl"],
+        ))
+        .unwrap();
+        let crls: Vec<_> = mtls
+            .expiries
+            .iter()
+            .filter(|e| e.kind == ExpiryKind::Crl)
+            .map(|e| (e.path.clone(), e.index, e.at))
+            .collect();
+        assert_eq!(
+            crls,
+            [(p("crl-revoke-a.crl"), 0, at), (p("crl-empty.crl"), 0, at)]
+        );
     }
 
     #[test]

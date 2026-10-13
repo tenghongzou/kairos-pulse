@@ -12,7 +12,7 @@
 //! 字串欄位以 `Arc<str>` 保存，snapshot 在鎖內只複製參考計數，格式化與排序都在鎖外進行。
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
+use crate::protocol::HostInfo;
 use crate::storage::fmt_time;
 use crate::tls::ChainRejection;
 
@@ -43,6 +44,10 @@ pub struct HelloInfo {
     pub agent_id: String,
     pub hostname: String,
     pub agent_version: String,
+    /// 協商出的協定版本
+    pub proto: u32,
+    /// v2 hello 的主機資訊（協商為 v1、或 client 沒有送任何主機資訊時為 `None`）
+    pub host: Option<Arc<HostInfo>>,
     pub peer: String,
     pub offline_after: Duration,
     /// 握手時取得的客戶端憑證鏈（[0] 為 end-entity）；未使用 mTLS 時為 None
@@ -69,15 +74,24 @@ pub struct LiveConnection {
     pub client_chain: Option<ClientChain>,
 }
 
-/// 最近一次合法的 report
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// 最近一次合法的 report（也存在 SQLite 主機清冊的 `hosts.last_report`，重新啟動時讀回）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastReport {
     pub recv_at: String,
     pub seq: u64,
     pub ts: String,
-    pub cpu_usage: f32,
-    pub total_memory: u64,
-    pub used_memory: u64,
+    /// v1 report 一定有值；v2 的指標 report 取自 `system.cpu.usage`，沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_usage: Option<f32>,
+    /// MB；v2 的指標 report 由 `system.memory.total`（bytes）換算，沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_memory: Option<u64>,
+    /// MB；v2 的指標 report 由 `system.memory.used`（bytes）換算，沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory: Option<u64>,
+    /// v2 的指標 report 中的指標數（v1 不輸出）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -86,6 +100,8 @@ pub struct AgentState {
     pub peer: Arc<str>,
     pub hostname: Arc<str>,
     pub agent_version: Arc<str>,
+    pub proto: u32,
+    pub host: Option<Arc<HostInfo>>,
     pub online: bool,
     pub offline_after: Duration,
     pub last_seen: Instant,
@@ -107,6 +123,21 @@ pub struct AgentState {
 
 /// 離線索引的 key：(離線時間, 序號)；序號讓同一時間離線的多個 agent 不會衝突
 type OfflineKey = (Instant, u64);
+
+/// 從 SQLite 主機清冊載回的 agent（啟動時；審計 A6），見 [`Registry::restore`]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredAgent {
+    pub agent_id: String,
+    pub hostname: String,
+    pub agent_version: String,
+    pub proto: u32,
+    pub host: Option<HostInfo>,
+    pub peer: String,
+    pub connected_at: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub offline_after: Duration,
+    pub last_report: Option<LastReport>,
+}
 
 /// 註冊結果的種類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +165,9 @@ pub struct Registration {
     pub kick: oneshot::Receiver<KickReason>,
     /// 狀態表已滿時，為了這次註冊而淘汰的離線 agent
     pub evicted: Option<Evicted>,
+    /// 同一個 agent_id 上次登記的主機指紋與這次不同時，為上次的指紋（設計包的身分衝突偵測：
+    /// 例如複製的 VM 沿用了 `agent.id`）。任一次沒有指紋時不比較
+    pub previous_fingerprint: Option<String>,
 }
 
 /// 狀態表已達上限，且沒有可淘汰的離線 agent。
@@ -185,6 +219,12 @@ pub struct AgentSnapshot {
     pub agent_id: String,
     pub hostname: String,
     pub agent_version: String,
+    /// 協商出的協定版本
+    pub proto: u32,
+    /// v2 hello 的主機資訊（`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`），
+    /// 只輸出有值的欄位
+    #[serde(flatten)]
+    pub host: Option<HostInfo>,
     pub peer: String,
     pub online: bool,
     pub conn_id: u64,
@@ -208,6 +248,8 @@ struct RawAgent {
     agent_id: Arc<str>,
     hostname: Arc<str>,
     agent_version: Arc<str>,
+    proto: u32,
+    host: Option<Arc<HostInfo>>,
     peer: Arc<str>,
     online: bool,
     conn_id: u64,
@@ -326,9 +368,17 @@ impl Registry {
             })?);
         }
         let (tx, rx) = oneshot::channel();
+        let fingerprint =
+            |host: &Option<Arc<HostInfo>>| host.as_ref().and_then(|h| h.host_fingerprint.clone());
+        let mut previous_fingerprint = None;
         let (kind, last_report, key) = match inner.remove(&info.agent_id) {
             None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
             Some(mut prev) => {
+                if let (Some(old), Some(new)) = (fingerprint(&prev.host), fingerprint(&info.host))
+                    && old != new
+                {
+                    previous_fingerprint = Some(old);
+                }
                 let previous_conn_id = prev.conn_id;
                 let kind = match prev.kick.take() {
                     // 舊連線仍在：通知它被取代。接收端已結束時 send 會失敗，可忽略。
@@ -355,6 +405,8 @@ impl Registry {
                 peer: info.peer.into(),
                 hostname: info.hostname.into(),
                 agent_version: info.agent_version.into(),
+                proto: info.proto,
+                host: info.host,
                 online: true,
                 offline_after: info.offline_after,
                 last_seen: now,
@@ -372,7 +424,64 @@ impl Registry {
             kind,
             kick: rx,
             evicted,
+            previous_fingerprint,
         })
+    }
+
+    /// 啟動時把主機清冊中離線未超過 [`OFFLINE_RETENTION`] 的 agent 以「離線」狀態放回狀態表
+    /// （審計 A6）：重新啟動後 `agents.json` 不再是空的，之後的 hello 記為「重新上線」，
+    /// 主機指紋的比對也延續到重新啟動之後。離線時間以清冊的 `last_seen` 起算（24 小時後照常由
+    /// sweep 移除）；最多放回狀態表上限的筆數（最近出現的優先），已在表中的 agent 不覆寫。
+    /// 回傳放回的筆數。
+    pub fn restore(
+        &self,
+        mut agents: Vec<RestoredAgent>,
+        now: Instant,
+        now_wall: DateTime<Utc>,
+    ) -> usize {
+        agents.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
+        let mut inner = self.lock();
+        let mut restored = 0;
+        for a in agents {
+            if inner.agents.len() >= self.max_agents {
+                break;
+            }
+            let offline_for = (now_wall - a.last_seen).to_std().unwrap_or_default();
+            if offline_for > OFFLINE_RETENTION || inner.agents.contains_key(a.agent_id.as_str()) {
+                continue;
+            }
+            // 開機不久時單調時鐘可能無法往回推，改以現在起算（最多讓移除晚一點）
+            let since = now.checked_sub(offline_for).unwrap_or(now);
+            let key = (since, inner.next_offline_seq);
+            inner.next_offline_seq += 1;
+            let agent_id: Arc<str> = Arc::from(a.agent_id);
+            inner.offline.insert(key, agent_id.clone());
+            inner.agents.insert(
+                agent_id,
+                AgentState {
+                    // 連線編號從 1 開始，0 不會與任何連線相符
+                    conn_id: 0,
+                    peer: a.peer.into(),
+                    hostname: a.hostname.into(),
+                    agent_version: a.agent_version.into(),
+                    proto: a.proto,
+                    host: a.host.map(Arc::new),
+                    online: false,
+                    offline_after: a.offline_after,
+                    last_seen: since,
+                    last_seen_wall: a.last_seen,
+                    connected_at: a.connected_at,
+                    offline_since: Some(since),
+                    last_report: a.last_report.map(Arc::new),
+                    client_chain: None,
+                    kick: None,
+                    connected: false,
+                    offline_key: Some(key),
+                },
+            );
+            restored += 1;
+        }
+        restored
     }
 
     /// 列出仍有連線（且尚未被通知結束）的 agent 與其客戶端憑證鏈
@@ -438,6 +547,34 @@ impl Registry {
             Some(state) if state.conn_id == conn_id => {
                 state.last_report = Some(Arc::new(report));
                 true
+            }
+            _ => false,
+        }
+    }
+
+    /// 同 [`Registry::set_last_report`]，但 `report.ts` 早於目前 last_report 的 `ts` 時不更新
+    /// （durable 補送的舊資料不蓋過較新的狀態；A5）。任一方的 `ts` 不是 RFC 3339 時照常更新。
+    /// 回傳是否更新
+    pub fn set_last_report_unless_older(
+        &self,
+        agent_id: &str,
+        conn_id: u64,
+        report: LastReport,
+    ) -> bool {
+        let mut inner = self.lock();
+        match inner.agents.get_mut(agent_id) {
+            Some(state) if state.conn_id == conn_id => {
+                let parse = |ts: &str| DateTime::parse_from_rfc3339(ts).ok();
+                let older = state.last_report.as_ref().is_some_and(|current| {
+                    matches!(
+                        (parse(&report.ts), parse(&current.ts)),
+                        (Some(new), Some(cur)) if new < cur
+                    )
+                });
+                if !older {
+                    state.last_report = Some(Arc::new(report));
+                }
+                !older
             }
             _ => false,
         }
@@ -547,6 +684,8 @@ impl Registry {
                     agent_id: agent_id.clone(),
                     hostname: s.hostname.clone(),
                     agent_version: s.agent_version.clone(),
+                    proto: s.proto,
+                    host: s.host.clone(),
                     peer: s.peer.clone(),
                     online: s.online,
                     conn_id: s.conn_id,
@@ -564,6 +703,8 @@ impl Registry {
                 agent_id: r.agent_id.to_string(),
                 hostname: r.hostname.to_string(),
                 agent_version: r.agent_version.to_string(),
+                proto: r.proto,
+                host: r.host.map(|h| (*h).clone()),
                 peer: r.peer.to_string(),
                 online: r.online,
                 conn_id: r.conn_id,
@@ -625,6 +766,8 @@ mod tests {
             agent_id: agent_id.into(),
             hostname: format!("host-{agent_id}"),
             agent_version: "0.1.0".into(),
+            proto: 1,
+            host: None,
             peer: peer.into(),
             offline_after: Duration::from_millis(5000),
             client_chain: None,
@@ -636,9 +779,10 @@ mod tests {
             recv_at: "2026-10-08T00:00:00.000Z".into(),
             seq,
             ts: "2026-10-08T00:00:00.000Z".into(),
-            cpu_usage: 1.5,
-            total_memory: 100,
-            used_memory: 50,
+            cpu_usage: Some(1.5),
+            total_memory: Some(100),
+            used_memory: Some(50),
+            metrics: None,
         }
     }
 
@@ -729,6 +873,35 @@ mod tests {
         assert_eq!(snap.agents[0].conn_id, 2);
         assert!(snap.agents[0].online);
         r.assert_consistent();
+    }
+
+    #[test]
+    fn durable_last_report_is_not_replaced_by_older_samples() {
+        // A5：補送的舊資料不蓋過較新的 last_report
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        let at = |seq, ts: &str| LastReport {
+            ts: ts.into(),
+            ..report(seq)
+        };
+        let last_seq = || {
+            r.snapshot(Utc::now()).agents[0]
+                .last_report
+                .as_ref()
+                .map(|r| r.seq)
+        };
+        assert!(r.set_last_report_unless_older("a", 1, at(1, "2026-10-08T03:00:00.000Z")));
+        assert!(!r.set_last_report_unless_older("a", 1, at(2, "2026-10-08T02:59:59.999Z")));
+        assert_eq!(last_seq(), Some(1));
+        // 同一時間或較新的照常更新；任一方無法解析時也更新
+        assert!(r.set_last_report_unless_older("a", 1, at(3, "2026-10-08T03:00:00.000Z")));
+        assert!(r.set_last_report_unless_older("a", 1, at(4, "2026-10-08T11:00:00+08:00")));
+        assert!(r.set_last_report_unless_older("a", 1, at(5, "not a time")));
+        assert!(r.set_last_report_unless_older("a", 1, at(6, "2001-01-01T00:00:00Z")));
+        assert_eq!(last_seq(), Some(6));
+        // 連線不符時不更新
+        assert!(!r.set_last_report_unless_older("a", 9, at(7, "2030-01-01T00:00:00Z")));
     }
 
     #[test]
@@ -1064,6 +1237,163 @@ mod tests {
         r.mark_all_offline(t0);
         assert!(r.lock().agents.get("b").unwrap().client_chain.is_none());
         assert_eq!(Arc::strong_count(&chain), 1);
+    }
+
+    fn hello_v2(agent_id: &str, fingerprint: Option<&str>) -> HelloInfo {
+        HelloInfo {
+            proto: 2,
+            host: Some(Arc::new(HostInfo {
+                host_fingerprint: fingerprint.map(str::to_string),
+                display_name: Some("Web 01".into()),
+                tags: Some(vec!["env:prod".into()]),
+                ..Default::default()
+            })),
+            ..hello(agent_id, "p")
+        }
+    }
+
+    #[test]
+    fn changed_host_fingerprint_is_reported() {
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let fp_a = format!("sha256:{}", "a".repeat(64));
+        let fp_b = format!("sha256:{}", "b".repeat(64));
+        let first = r
+            .register(1, hello_v2("x", Some(&fp_a)), t0, Utc::now())
+            .unwrap();
+        assert_eq!(first.previous_fingerprint, None);
+        // 相同指紋、沒有指紋（v1 或未送）都不算改變
+        let same = r
+            .register(2, hello_v2("x", Some(&fp_a)), t0, Utc::now())
+            .unwrap();
+        assert_eq!(same.previous_fingerprint, None);
+        let v1 = r.register(3, hello("x", "p"), t0, Utc::now()).unwrap();
+        assert_eq!(v1.previous_fingerprint, None);
+        let _ = r
+            .register(4, hello_v2("x", Some(&fp_a)), t0, Utc::now())
+            .unwrap();
+        let changed = r
+            .register(5, hello_v2("x", Some(&fp_b)), t0, Utc::now())
+            .unwrap();
+        assert_eq!(changed.previous_fingerprint, Some(fp_a));
+        assert!(matches!(changed.kind, RegisterKind::Superseded { .. }));
+    }
+
+    #[test]
+    fn snapshot_includes_proto_and_host_info() {
+        let r = Registry::new();
+        let t0 = Instant::now();
+        let fp = format!("sha256:{}", "a".repeat(64));
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        let _b = r
+            .register(2, hello_v2("b", Some(&fp)), t0, Utc::now())
+            .unwrap();
+        let snap = serde_json::to_value(r.snapshot(Utc::now())).unwrap();
+        let a = &snap["agents"][0];
+        let b = &snap["agents"][1];
+        // v1 agent：只多了 proto，沒有任何主機資訊欄位
+        assert_eq!(a["proto"], 1);
+        for field in [
+            "host_fingerprint",
+            "display_name",
+            "tags",
+            "report_interval_ms",
+            "os",
+        ] {
+            assert!(a.get(field).is_none(), "{field}: {a}");
+        }
+        assert_eq!(b["proto"], 2);
+        assert_eq!(b["host_fingerprint"], fp.as_str());
+        assert_eq!(b["display_name"], "Web 01");
+        assert_eq!(b["tags"], serde_json::json!(["env:prod"]));
+        assert!(b.get("os").is_none(), "{b}");
+    }
+
+    fn restored(
+        agent_id: &str,
+        offline_for: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> RestoredAgent {
+        RestoredAgent {
+            agent_id: agent_id.into(),
+            hostname: format!("host-{agent_id}"),
+            agent_version: "0.2.0".into(),
+            proto: 2,
+            host: Some(HostInfo {
+                host_fingerprint: Some(format!("sha256:{}", "a".repeat(64))),
+                ..Default::default()
+            }),
+            peer: "10.0.0.1:5000".into(),
+            connected_at: now - offline_for - chrono::Duration::hours(1),
+            last_seen: now - offline_for,
+            offline_after: Duration::from_secs(75),
+            last_report: Some(report(3)),
+        }
+    }
+
+    #[test]
+    fn restore_puts_recent_hosts_back_as_offline() {
+        // A6：重新啟動後，清冊中 24 小時內出現過的 agent 以離線狀態回到狀態表
+        let r = Registry::with_max_agents(3);
+        let t0 = Instant::now();
+        let now = Utc::now();
+        let n = r.restore(
+            vec![
+                restored("old", chrono::Duration::hours(25), now),
+                restored("a", chrono::Duration::hours(2), now),
+                restored("b", chrono::Duration::minutes(1), now),
+            ],
+            t0,
+            now,
+        );
+        assert_eq!(n, 2);
+        assert_eq!(r.counts(), (0, 2));
+        r.assert_consistent();
+        let snap = r.snapshot(now);
+        let a = &snap.agents[0];
+        assert_eq!(a.agent_id, "a");
+        assert!(!a.online);
+        assert_eq!(a.proto, 2);
+        assert_eq!(a.last_report.as_ref().map(|l| l.seq), Some(3));
+        assert_eq!(a.last_seen, fmt_time(now - chrono::Duration::hours(2)));
+        assert_eq!(a.offline_after_ms, 75_000);
+
+        // 重新連線：記為「重新上線」，並延續主機指紋的比對
+        let mut info = hello("a", "p");
+        info.host = Some(Arc::new(HostInfo {
+            host_fingerprint: Some(format!("sha256:{}", "b".repeat(64))),
+            ..Default::default()
+        }));
+        let reg = r.register(1, info, t0, now).unwrap();
+        assert_eq!(reg.kind, RegisterKind::Reconnected);
+        assert_eq!(
+            reg.previous_fingerprint,
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        r.assert_consistent();
+        // 舊的離線時間照常計算：b 離線 1 分鐘，24 小時後被移除
+        let res = r.sweep(t0 + OFFLINE_RETENTION);
+        assert_eq!(ids_removed(&res), ["b"]);
+        r.assert_consistent();
+
+        // 已在表中的 agent 不覆寫；超過上限的不放回
+        let r = Registry::with_max_agents(1);
+        assert_eq!(
+            r.restore(
+                vec![
+                    restored("x", chrono::Duration::hours(1), now),
+                    restored("y", chrono::Duration::hours(2), now)
+                ],
+                t0,
+                now
+            ),
+            1
+        );
+        assert_eq!(r.snapshot(now).agents[0].agent_id, "x");
+        assert_eq!(
+            r.restore(vec![restored("x", chrono::Duration::zero(), now)], t0, now),
+            0
+        );
     }
 
     #[test]

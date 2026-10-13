@@ -1,14 +1,15 @@
 //! 日誌：輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（依 UTC 日期分檔），並依保留天數清除舊檔。
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use log::{LevelFilter, info};
-use std::fs::{OpenOptions, create_dir_all};
-use std::io::Error;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Error, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::fsperm;
 use crate::retention::{
     DateGuard, DatedFiles, GUARD_STATE_FILE, LOG_GUARD_STATE_FILE, is_tmp_name_for,
 };
@@ -29,32 +30,92 @@ pub const LEGACY_LOG_FILE: &str = "kairos.log";
 /// 定期清除舊日誌的間隔
 pub const LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// 初始化日誌。檔名依 UTC 日期，換日時由 fern 自動切換到新檔；每筆日誌寫入後即 flush。
+/// 以附加模式開啟日誌檔。Unix 上新檔案為 0640，既有的檔案收緊到最多 0640（S3）。
+/// 會在日誌的寫入路徑上呼叫，因此不可以記錄日誌（會重入 logger）；收緊失敗時忽略
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let file =
+        fsperm::private_std_options(OpenOptions::new().create(true).append(true)).open(path)?;
+    let _ = fsperm::restrict_open_file(&file);
+    Ok(file)
+}
+
+/// 依 UTC 日期分檔的日誌輸出（取代 fern 的 `DateBased`，以便在 Unix 上指定新檔案的權限）。
+///
+/// fern 每筆日誌先寫入（可能分成多次 `write`）再呼叫一次 `flush`；只在一筆日誌的第一次 `write`
+/// 檢查日期，同一筆日誌不會被拆到兩個檔案。換日時關閉舊檔、開啟（必要時建立）新日期的檔案。
+pub struct DailyLogFile {
+    dir: PathBuf,
+    clock: fn() -> DateTime<Utc>,
+    current: Option<(NaiveDate, BufWriter<File>)>,
+    /// 下一次 `write` 是一筆新日誌的開頭
+    record_start: bool,
+}
+
+impl DailyLogFile {
+    pub fn new(dir: PathBuf, clock: fn() -> DateTime<Utc>) -> Self {
+        Self {
+            dir,
+            clock,
+            current: None,
+            record_start: true,
+        }
+    }
+
+    fn file(&mut self) -> std::io::Result<&mut BufWriter<File>> {
+        if self.record_start || self.current.is_none() {
+            let today = (self.clock)().date_naive();
+            if self.current.as_ref().map(|(d, _)| *d) != Some(today) {
+                if let Some((_, mut old)) = self.current.take() {
+                    let _ = old.flush();
+                }
+                let file = open_log_file(&self.dir.join(LOG_FILES.file_name(today)))?;
+                self.current = Some((today, BufWriter::new(file)));
+            }
+            self.record_start = false;
+        }
+        self.current
+            .as_mut()
+            .map(|(_, f)| f)
+            .ok_or_else(|| Error::other("日誌檔未開啟"))
+    }
+}
+
+impl Write for DailyLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file()?.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.record_start = true;
+        match self.current.as_mut() {
+            Some((_, f)) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 初始化日誌。檔名依 UTC 日期，換日時自動切換到新檔；每筆日誌寫入後即 flush。
+/// Unix 上日誌目錄（新建立時）為 0750、日誌檔最多 0640（S3）。
 ///
 /// 回傳建立今天的日誌檔**之前**既有最新日誌檔的日期，作為日誌保留清除的日期基準（見 [`run_cleanup`]）。
 pub fn setup(level: LevelFilter) -> Result<Option<NaiveDate>, Error> {
-    create_dir_all(LOG_DIR)
+    fsperm::create_dir_all(Path::new(LOG_DIR))
         .map_err(|e| Error::new(e.kind(), format!("無法建立日誌目錄 {}: {}", LOG_DIR, e)))?;
     let newest_before_start = LOG_FILES.newest(Path::new(LOG_DIR), Utc::now().date_naive());
 
-    // fern 在第一次寫入時才開檔；先開一次今天的檔案，讓權限等問題在啟動時就被發現
+    // 日誌檔在第一次寫入時才開啟；先開一次今天的檔案，讓權限等問題在啟動時就被發現
     let today = Path::new(LOG_DIR).join(LOG_FILES.file_name(Utc::now().date_naive()));
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&today)
-        .map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("無法開啟日誌檔 {}: {}", today.display(), e),
-            )
-        })?;
+    open_log_file(&today).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("無法開啟日誌檔 {}: {}", today.display(), e),
+        )
+    })?;
 
-    let file = fern::DateBased::new(
-        Path::new(LOG_DIR).join(LOG_FILES.prefix),
-        format!("%Y-%m-%d{}", LOG_FILES.suffix),
-    )
-    .utc_time();
+    let file = fern::Output::writer(
+        Box::new(DailyLogFile::new(PathBuf::from(LOG_DIR), Utc::now)),
+        "\n",
+    );
 
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -162,6 +223,51 @@ async fn remove_stale_guard_tmp_files(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static LOG_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+    fn log_clock() -> DateTime<Utc> {
+        Utc.timestamp_opt(LOG_CLOCK.load(Ordering::SeqCst), 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn daily_log_file_switches_files_only_between_records() {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-logfile-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        fsperm::create_dir_all(&dir).unwrap();
+        let day1 = Utc.with_ymd_and_hms(2026, 10, 9, 23, 59, 59).unwrap();
+        let day2 = Utc.with_ymd_and_hms(2026, 10, 10, 0, 0, 1).unwrap();
+        LOG_CLOCK.store(day1.timestamp(), Ordering::SeqCst);
+        let mut w = DailyLogFile::new(dir.clone(), log_clock);
+        // 一筆日誌分成多次 write：中途跨日也留在同一個檔案
+        w.write_all(b"a1 ").unwrap();
+        LOG_CLOCK.store(day2.timestamp(), Ordering::SeqCst);
+        w.write_all(b"a2\n").unwrap();
+        w.flush().unwrap();
+        // 下一筆寫進新日期的檔案
+        w.write_all(b"b\n").unwrap();
+        w.flush().unwrap();
+        let read = |d: DateTime<Utc>| {
+            std::fs::read_to_string(dir.join(LOG_FILES.file_name(d.date_naive()))).unwrap()
+        };
+        assert_eq!(read(day1), "a1 a2\n");
+        assert_eq!(read(day2), "b\n");
+        #[cfg(unix)]
+        {
+            // S3：新的日誌檔為 0640
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(LOG_FILES.file_name(day2.date_naive()));
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[tokio::test]
     async fn run_cleanup_deletes_old_logs_and_stops_on_shutdown() {

@@ -28,22 +28,27 @@ domain = "localhost"
 # 是否略過 TLS 憑證驗證。⚠️ 僅供開發測試，正式環境務必維持 false，
 # 否則容易遭中間人攻擊。使用自簽憑證時請改用下方的 ca_cert。
 accept_invalid_certs = false
-# 額外信任的 CA 或自簽憑證（PEM，可含多張）路徑；空字串 = 只使用作業系統信任庫。
+# 信任的 CA 或自簽憑證（PEM，可含多張）路徑；空字串 = 只使用作業系統信任庫。
 # 非空時於啟動時讀取，讀不到檔案或格式錯誤會直接結束程式。
 ca_cert = ""
-# 是否同時信任作業系統信任庫。使用私有 CA 時建議設為 false，只信任 ca_cert，
-# 避免任何公開 CA 簽發的同名憑證也被接受。設為 false 時 ca_cert 必填，否則啟動即報錯。
-use_system_roots = true
+# 是否同時信任作業系統信任庫。預設不寫：依是否設定 ca_cert 決定——
+#   - 設定了 ca_cert（私有 CA）→ 只信任 ca_cert，不信任作業系統信任庫，
+#     避免任何公開 CA 簽發的同名憑證也被接受；
+#   - 未設定 ca_cert → 信任作業系統信任庫（伺服器憑證由公開 CA 簽發）。
+# 明確設定時以設定為準：設定了 ca_cert 又需要信任公開 CA 時設為 true；
+# 設為 false 時 ca_cert 必填，否則啟動即報錯。
+# use_system_roots = true
 # mTLS 客戶端憑證（伺服器要求客戶端憑證時才需要）。兩者須同時設定或同時留空。
 # 憑證的 SAN 必須是 DNS:<本機 agent_id>（可用 `pulse --print-agent-id` 取得），EKU 需含 clientAuth。
 client_cert = ""   # 客戶端憑證 PEM：第一張為客戶端憑證本身，之後可接中繼 CA（整條鏈都會送出）
 client_key = ""    # 對應私鑰 PEM：PKCS#8 / PKCS#1 / SEC1 皆可，支援 RSA、ECDSA P-256 / P-384、Ed25519；
-                   # 不可加密。與憑證不成對時啟動即報錯
+                   # 不可加密。與憑證不成對時啟動即報錯；權限過寬時記 WARN（規則同 agent.id）
 # 啟動時與之後每 24 小時檢查客戶端憑證鏈的有效期限：已過期 → 記 ERROR（仍會繼續嘗試連線，
 # 以伺服器的判定為準；也請確認本機時鐘是否正確）；尚未生效或 30 天內到期 → 記 WARN
 
 [retry]
-# 連續連線失敗達此次數後，重連日誌由 warn 升級為 error（重試本身不設上限）
+# 連續連線失敗達此次數後，重連日誌由 warn 升級為 error（重試本身不設上限）；
+# error 每 10 分鐘最多一則，其餘改記 warn（伺服器長時間停機時避免洗版）
 max_retries = 5
 initial_delay = 2  # 第一次重連前的延遲（秒，1～3600），之後每次加倍
 max_delay = 60     # 重連延遲上限（秒，1～3600）；實際延遲另加 ±20% 抖動（不超過此上限）
@@ -52,21 +57,51 @@ max_delay = 60     # 重連延遲上限（秒，1～3600）；實際延遲另加
 # 連續第 2 次起不論維持多久都不重置退避，且該次延遲至少 30 秒（不受 max_delay 上限限制）
 
 [heartbeat]
-# 心跳間隔（秒，1～60）。讀取閒置逾時 = max(2 × interval, interval + 10 秒)（預設 11 秒），
-# 只依心跳間隔計算，與 report.interval 無關
-interval = 1
+# 心跳間隔（秒，1～60）。伺服器的離線判定為 max(5 × interval, 5 秒)（預設 75 秒）。
+# 讀取閒置逾時 = max(2 × interval, interval + 10 秒)（預設 30 秒），只依心跳間隔計算，與 report.interval 無關。
+# 啟動時與斷線後第一次重連前，另加 0～min(interval, 5) 秒的隨機延遲，避免大量 agent 同時連線
+interval = 15
 
 [report]
 # 系統資訊回報間隔（秒，1～3600）。CPU 使用率為上次取樣到這次取樣之間的平均（略過回報時仍會取樣）。
-# 上一筆 report 尚未收到伺服器回應（ack 或 error）時，略過這次取樣（記 WARN，有節流）
+# 啟用本機緩衝且 Kairos 支援 durable 時，取樣先寫進緩衝、依序送出（見 [buffer]）；
+# 否則（at-most-once）上一筆 report 尚未收到伺服器回應（ack 或 error）時，略過這次取樣（記 WARN，有節流）
 interval = 5
 
 [agent]
 # 存放 agent_id（UUID v4）的檔案；第一次啟動時自動產生，之後沿用。
 # 內容須為 8-4-4-4-12 格式的 UUID（大小寫皆可，讀入後一律轉小寫），不合法或超過 1024 bytes
 # 時啟動即報錯（刪除檔案可重新產生）。未啟用 mTLS 時 agent_id 等同身分憑據，請妥善保護：
-# Unix 上新建的檔案權限為 0600；Windows 請放在只有執行帳號可讀的目錄
+# Unix 上新建的檔案權限為 0600。啟動時檢查權限，過寬時記 WARN（Unix：群組或其他使用者有權限，
+# 擁有者為 root 時允許群組可讀；Windows：ACL 允許 Users、Everyone 等一般使用者存取）
 id_file = "agent.id"
+# 主控台的顯示名稱（1～255 bytes；空字串 = 不送，主控台以主機名稱顯示）與標籤
+# （最多 32 個、每個 1～64 bytes、不得重複，例如 ["env:prod", "team:web"]）。
+# 只在 Kairos 支援協定 v2 時送出；不得含控制字元、零寬空格等不可見字元，不符時啟動即報錯。
+# tags 只能在 pulse.toml 設定（環境變數不支援陣列）
+display_name = ""
+tags = []
+
+[buffer]
+# 本機緩衝（at-least-once）：取樣先寫進本機磁碟，收到 Kairos 的確認（ack）才刪除；
+# 斷線、Kairos 停機維護或寫入結果不明時資料留在緩衝中，重新連上後依序補送，再送新的取樣。
+# 需要 Kairos 0.3.0 以上（協定 feature「durable」）；連上舊版 Kairos 時照舊即時送出、送不出去就丟棄，
+# 緩衝中的積壓保留到連上新版 Kairos 為止。設為 false 時與 0.2.0 相同（不寫磁碟、不補送）。
+enabled = true
+# 緩衝目錄（相對路徑以工作目錄解析）。Unix 上以 0750 建立、檔案為 0640；
+# 目錄允許其他使用者（Windows：一般使用者）存取時記 WARN。同一個目錄只能給一個 Pulse 使用
+dir = "buffer"
+# 待送資料的上限，先到者為準；超過時丟掉最舊的資料並記 WARN（計入丟棄筆數）。
+# 一筆約 0.5～3 KB（視磁碟、網路介面與溫度感測器的數量而定），預設每 5 秒一筆時，
+# 50000 筆約 69 小時、64 MiB 約 1.5～4 天。磁碟用量最多約 max_mb 再加 8 MiB
+max_mb = 64              # MiB，1～102400
+max_records = 50000      # 筆，100～10000000
+# 取樣時間超過這麼久的資料不再送出、直接丟棄（小時，1～8760；預設 7 天）
+max_age_hours = 168
+# 兩筆 report 之間的最短間隔（毫秒，500～60000）。補送積壓時以這個速率送出（預設每秒約 0.83 筆，
+# 低於 Kairos 的 report 速率限制每秒 2 則；1 萬台同時恢復連線時約每秒 8,300 筆）。實際使用的值不超過
+# report.interval 的 60%（report.interval = 1 時為 600），否則新的取樣比送出的快、積壓補不完
+replay_interval_ms = 1200
 
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）

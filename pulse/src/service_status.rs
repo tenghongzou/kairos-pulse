@@ -338,6 +338,34 @@ mod tests {
     }
 
     #[test]
+    fn unit_file_matches_the_status_implementation() {
+        // O2：程式只以 sd_notify 送 STATUS=（不送 READY=1），unit 必須是 Type=simple 並設定
+        // NotifyAccess=main（否則 systemd 不設 NOTIFY_SOCKET、也不接受通知），且允許 AF_UNIX
+        let unit = include_str!("../packaging/pulse.service");
+        let directives: Vec<&str> = unit
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#') && l.contains('='))
+            .collect();
+        assert!(directives.contains(&"Type=simple"), "{directives:?}");
+        assert!(directives.contains(&"NotifyAccess=main"), "{directives:?}");
+        assert!(
+            !directives
+                .iter()
+                .any(|d| d.starts_with("Type=") && *d != "Type=simple"),
+            "{directives:?}"
+        );
+        let families = directives
+            .iter()
+            .find_map(|d| d.strip_prefix("RestrictAddressFamilies="))
+            .expect("RestrictAddressFamilies");
+        assert!(
+            families.split_whitespace().any(|f| f == "AF_UNIX"),
+            "sd_notify 需要 AF_UNIX：{families}"
+        );
+    }
+
+    #[test]
     fn capture_records_only_inside_capture() {
         attention("outside");
         let ((), events) = capture(|| {

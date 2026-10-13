@@ -32,9 +32,15 @@ LimitNOFILE=8192
 # 正常關機：Kairos 收到 SIGINT/SIGTERM 後最壞約 3 秒結束（看門狗 4 秒），10 秒足夠
 KillSignal=SIGINT
 TimeoutStopSec=10
-# 背景工作異常時 Kairos 以結束代碼 1 結束，交由 systemd 重新啟動
+# 背景工作異常等內部錯誤時 Kairos 以結束代碼 1 結束，交由 systemd 重新啟動；連接埠被佔用（11，
+# 例如舊的行程還沒結束）也會重試。重試也不會成功的錯誤不重新啟動，服務停在 failed，
+# 修正後執行 systemctl restart kairos：
+#   2 用法錯誤（ExecStart 的命令列參數）
+#   3 設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽對外位址等）
+#   4 憑證錯誤（伺服器憑證、私鑰、client CA、CRL 無法讀取、格式錯誤或不成對）
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=2 3 4
 
 # 監聽 1024 以下的連接埠（例如 443）時取消下一行的註解
 #AmbientCapabilities=CAP_NET_BIND_SERVICE
