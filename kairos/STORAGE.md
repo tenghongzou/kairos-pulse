@@ -1,6 +1,6 @@
 # Kairos 資料儲存（SQLite）
 
-本文件說明 Kairos 0.3 起的 report 儲存、主機清冊、彙總、保留期限與容量上限（商業審計 A1、A6、A9），以及 at-least-once（A5，協定 feature `durable`）的去重與補送資料的處理。設定的完整清單見 [README.md](README.md)「設定」。
+本文件說明 Kairos 0.3 起的 report 儲存、主機清冊、彙總、保留期限與容量上限（商業審計 A1、A6、A9），at-least-once（A5，協定 feature `durable`）的去重與補送資料的處理，以及匯入 0.2.x 的 JSONL（`kairos reports import`，第 13.1 節）。設定的完整清單見 [README.md](README.md)「設定」。
 
 ## 1. 架構
 
@@ -48,7 +48,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 
 Kairos 執行中把 `kairos.db` 刪除或替換時（Unix 上以裝置與 inode 比對，與 JSONL 的 `needs_reopen` 相同），下一批寫入前記 `WARN` 並建立新的資料庫，不會寫進已刪除的檔案後回 `ack`；記憶體中尚未寫出的彙總一併捨棄。
 
-## 3. Schema（v1）
+## 3. Schema（v2）
 
 `PRAGMA application_id = 0x4B525331`（「KRS1」），`PRAGMA user_version` 為 schema 版本。時間一律為 Unix 毫秒（彙總的 `bucket` 為 Unix 秒），UTC。
 
@@ -115,6 +115,15 @@ CREATE TABLE rollup_5m (                   -- 5 分鐘彙總（A9）
     PRIMARY KEY (host_id, bucket, series_id)
 ) WITHOUT ROWID;
 CREATE TABLE rollup_1h ( ...同上... ) WITHOUT ROWID;   -- 1 小時彙總
+
+-- v2：kairos reports import（第 13.1 節）
+ALTER TABLE hosts ADD COLUMN source TEXT;  -- 'import'：由 kairos reports import 建立；由連線建立的為 NULL
+CREATE TABLE import_keys (                 -- 匯入的去重鍵：主機＋取樣時間＋內容雜湊
+    host_id INTEGER NOT NULL,
+    ts      INTEGER NOT NULL,              -- 取樣時間（與 reports.ts 相同的規則）
+    hash    INTEGER NOT NULL,              -- 內容雜湊（64 位元）
+    PRIMARY KEY (host_id, ts, hash)
+) WITHOUT ROWID;
 ```
 
 - 不使用 `STRICT` 表與外鍵，讓較舊的 `sqlite3` 命令列工具（例如 RHEL 8 的 3.26）也能開啟備份檔檢查。
@@ -137,6 +146,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - 資料庫的版本比程式新（降版執行）時拒絕啟動，不做任何變更；請改用較新的版本，或從升級前的備份還原。
 - 檔案存在但 `application_id` 不是 Kairos、又有其他資料表時拒絕使用（例如 `storage.data_dir` 指錯）。
 - 新增欄位或資料表時加一個遷移，不修改既有遷移的內容。**升級 Kairos 前先備份**（第 9 節）：遷移後的資料庫無法給舊版使用。
+- 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）。`kairos reports import` 開啟資料庫時同樣會升級 schema。
 
 ## 4. 寫入路徑與批次策略
 
@@ -331,6 +341,7 @@ systemctl start kairos
 - 240 bytes／筆來自第 11 節的量測（含 `reports_host_ts` 索引與主機、序列等；資料表與索引本身約 203 bytes）；指標數不同時大致等比例調整（每個指標約 7～10 bytes）。0.2 的 JSONL 同一筆約 1.5 KB（`schema` 2，17 個指標），約為 SQLite 的 6 倍。
 - 預設上限 64 GiB 約可容納 1,300 台主機的預設保留期間。1 萬台時請依磁碟調高 `storage.max_total_bytes`，或縮短保留天數，例如原始 2 天、5 分鐘 14 天、1 小時 180 天：約 124 + 43 + 43 ≈ 210 GB。超過上限時依第 8.2 節提早刪除最舊的資料（原始資料先刪）。
 - 主機清冊每台約 1 KB，1 萬台約 10 MB，可忽略。
+- 以 `kairos reports import` 匯入的資料每行另有約 23 bytes 的去重鍵（`import_keys`，第 11.3 節），超過所有保留期限時在下一次匯入時刪除。
 - **補送**（A5）不增加長期的容量（補的是斷線期間本來就該有的資料），但恢復連線時寫入速率暫時升高：每台 Pulse 補送時約每秒 0.83 筆（`buffer.replay_interval_ms` 預設 1200），1 萬台同時恢復約每秒 8,300 筆（平常約 2,000 筆）。第 11 節量測了每秒 8,000～16,000 筆。原始資料保留天數縮短時，請一併檢查第 5.4 節的 `buffer.max_age_hours`。
 
 ## 11. 量測
@@ -388,6 +399,28 @@ kp-build（PVE VM，4 vCPU、3 GB RAM、本機虛擬磁碟，Ubuntu）2026-10-12
 
 分批之後，同步在 report 的批次之間逐步進行（每 100 ms 一步），report 的寫入最多被擋住約 17 ms；上一小節的補送量測都包含第 30 秒的這次同步（例如每秒 8,000 筆 60 秒的最大延遲 94 ms）。
 
+### 11.3 匯入舊的 JSONL（`kairos reports import`）
+
+`kairos/src/store/import_tests.rs` 的 `import_throughput`（`#[ignore]`）：產生 100 萬行的 JSONL（一半為 `schema` 2、17 個指標，Pulse 0.2.0 的典型值；一半為 `schema` 1；每台每 5 秒一筆），依序以試執行、匯入、再匯入一次（全部重複）處理同一個檔案。
+
+```bash
+cargo test -p kairos --release -- --ignored --nocapture import_throughput
+# 可調：KP_IMPORT_LINES（預設 1000000）、KP_IMPORT_HOSTS（預設 200）、
+#       KP_IMPORT_DAYS_AGO（資料的結束時間，預設 1 天前；超過原始資料保留期限時走「只進彙總」）、KP_IMPORT_DIR
+```
+
+kp-build（同上，4 vCPU、本機虛擬磁碟）2026-10-13：
+
+| 情境 | JSONL | 試執行 | 匯入 | 再匯入（全部重複） | 資料庫 |
+|---|---|---|---|---|---|
+| 200 台、原始資料（約 7 小時） | 100 萬行，984 MB | 12.2 秒（約 8.2 萬行／秒） | 24.4～25.9 秒（約 3.9～4.1 萬行／秒） | 14.4～14.9 秒（約 6.9 萬行／秒） | 143 MB（`VACUUM` 後 137 MB，其中 `import_keys` 22 MB，每行 22.5 bytes） |
+| 1 萬台、原始資料 | 100 萬行，968 MB | 12.2 秒 | 29.3 秒（約 3.4 萬行／秒） | 14.6 秒 | 145 MB（`import_keys` 23 MB） |
+| 1 萬台、只進彙總（10 天前） | 100 萬行，968 MB | 12.6 秒 | 47.4 秒（約 2.1 萬行／秒） | 14.8 秒 | 36 MB（`import_keys` 23 MB） |
+
+- 原始資料的每筆大小與第 10 節相同（約 120 bytes／筆的資料與索引，這裡半數是只有 3 個值的 `schema` 1），另加約 23 bytes 的去重鍵。
+- 「只進彙總」比較慢：每一行的每個指標都在同一個交易中直接累加進 5 分鐘與 1 小時彙總（與去重鍵在同一個交易，中斷後重新執行不會重複計算），不像原始資料先在記憶體中合併。
+- 估算：0.2 的 1,000 台、7 天的 JSONL 約 1.2 億行，以每秒約 4 萬行約需 50 分鐘。停機時間較長時，可以在升級前、0.2 仍在執行時先匯入前幾天的檔案（第 13.1 節「縮短停機」）。
+
 ## 12. 查詢範例
 
 以 `sqlite3`（唯讀：`sqlite3 'file:/opt/kairos/data/kairos.db?mode=ro'`）或任何 SQLite 用戶端查詢。
@@ -417,11 +450,79 @@ WHERE host_id = (SELECT host_id FROM hosts WHERE agent_id = '6f1c0e4a-1b2c-4d3e-
 ## 13. 從 JSONL（0.2）升級
 
 - 升級後預設改寫 SQLite（`data/kairos.db`），**不再寫 `reports-YYYY-MM-DD.jsonl`**。直接讀 JSONL 的工具有三個選擇：設定 `storage.jsonl_mirror = true`（同時寫兩份，磁碟用量約增加 6 倍）、改用 `kairos reports export`、或暫時設定 `storage.backend = "jsonl"`（與 0.2 完全相同，但沒有主機清冊與彙總）。
-- 既有的 `reports-*.jsonl` 不會匯入資料庫，也不會被修改。`jsonl_mirror = false` 時 JSONL writer 不執行，**舊檔不會再被自動清除**，請在不需要後自行搬移或刪除（或暫時開啟鏡像，讓 `storage.retention_days` 清掉過期的檔案）。`data/.retention-guard.json` 只給 JSONL 使用。
-- 主機清冊從空開始，主機在第一次送 report、或下一次清冊同步（30 秒內）時出現。
+- 既有的 `reports-*.jsonl` 不會自動匯入資料庫，也不會被修改；需要時以 `kairos reports import` 匯入（第 13.1 節）。`jsonl_mirror = false` 時 JSONL writer 不執行，**舊檔不會再被自動清除**，請在匯入、不需要後自行搬移或刪除（或暫時開啟鏡像，讓 `storage.retention_days` 清掉過期的檔案）。`data/.retention-guard.json` 只給 JSONL 使用。
+- 主機清冊從空開始（或由匯入建立），主機在第一次送 report、或下一次清冊同步（30 秒內）時出現。
 - 回到 0.2：0.2 不認得 `kairos.db`（忽略），照常寫 JSONL；之後再升級時資料庫中的資料仍在（期間的 report 只在 JSONL 中）。降版到 schema 較舊的 0.3.x 時會被拒絕（第 3.2 節）。
 - systemd 的 unit 不需修改：資料庫在原本的資料目錄 `/opt/kairos/data`（`ReadWritePaths` 已包含）。
 - **與 Pulse 0.3（durable）**：at-least-once 需要 Kairos 與 Pulse 都是 0.3（任一端是 0.2 時維持 at-most-once，見 CHANGELOG 的相容矩陣）。建議先升級 Kairos（CHANGELOG [0.3.0] 的升級步驟）。補送的資料以 Pulse 的取樣時間保存與彙總（第 5.2 節），從匯出或 JSONL 鏡像讀資料的工具請以 `ts` 作為取樣時間，`recv_at` 只是收到的時間。
+
+### 13.1 匯入舊的 JSONL（`kairos reports import`）
+
+0.2.x 以前寫的 `reports-YYYY-MM-DD.jsonl`（0.1.0 沒有 `schema` 的行、`schema` 1／2 的行、durable 時帶 `boot_id`／`report_seq` 的行；0.3 的 JSONL 鏡像與 `backend = "jsonl"` 的檔案格式相同，也可以）可以匯入資料庫，之後以 `kairos reports export`、彙總與 SQL 查詢使用。
+
+```bash
+# 試執行：只讀取，計算會匯入、重複、壞行與超出保留期的筆數（Kairos 執行中也可以）
+sudo -u kairos /opt/kairos/kairos reports import /opt/kairos/data --dry-run --config /opt/kairos/kairos.toml
+# 匯入：先停止 Kairos
+sudo systemctl stop kairos
+sudo -u kairos /opt/kairos/kairos reports import /opt/kairos/data --config /opt/kairos/kairos.toml
+sudo systemctl start kairos
+```
+
+```console
+[ OK ] reports-2026-10-03.jsonl：17,280 行，匯入 17,280
+[WARN] reports-2026-10-04.jsonl：17,282 行，匯入 17,280、壞行 2
+  壞行：第 3 行（不是合法的 JSON）、第 17282 行（最後一行不完整（沒有換行，檔案可能仍在寫入））
+[ OK ] 已匯入 2 個檔案到 /opt/kairos/data/kairos.db
+  讀取        34,562 行
+  匯入        34,560 筆（原始資料 34,560、只進彙總 0）
+  重複略過    0
+  壞行        2
+  超出保留期  0
+  新增主機    1 台
+[WARN] 警告 KRS-W4306：2 行不是合法的 report，已略過
+  處理方式：上方列出各檔案前幾個壞行的行號與原因；確認是否為截斷或手動編輯過的檔案。修正後重新執行，已匯入的部分不會重複。
+```
+
+每個檔案的結果寫 stderr，摘要寫 stdout（設計包 `cli-style.md`）；`--json` 時 stdout 只有一份純 ASCII 的 JSON（`schema` 為 `kairos.reports.import/v1`：`data.totals`、`data.files[]`、`data.issues[]`），stderr 保持空白。選項見 `kairos reports import --help`。
+
+- **來源**：參數為一或多個檔案或目錄。目錄只取其中的 `reports-YYYY-MM-DD.jsonl` 與舊版的 `reports.jsonl`，依日期排序，不進入子目錄。Kairos 的保留清除只刪檔、不壓縮，因此不支援壓縮檔：目錄中的 `reports-*.jsonl.gz` 等會被列出、提示先解壓縮（例如 `zcat reports-2026-09-01.jsonl.gz > /tmp/import/reports-2026-09-01.jsonl` 後匯入 `/tmp/import`）。
+- **只讀、不跟隨符號連結**：來源檔以唯讀方式開啟，不修改、不刪除。比照 `kairos db backup` 不跟隨預先放置的符號連結：參數本身是符號連結、目錄中的符號連結、FIFO 與裝置檔一律不讀取（列在摘要中）；Unix 上另比對檢查與開啟時的裝置與 inode，中間被換掉時拒絕。
+- **時間**：取樣時間與 Kairos 當初寫入 SQLite 時的規則相同（第 5.2 節）：durable 的行（帶 `boot_id`）用 `ts`（須在 `recv_at` 的 −367 天～＋5 分鐘之內），其他用 `recv_at`。`agent_ts`、`recv_lag` 照常保存，`kairos reports export` 輸出的行與原本的行相同（`peer`、`hostname` 為清冊中的值）。`--since`／`--until` 以取樣時間篩選（`2026-09-01`（UTC）、RFC 3339，或 `30d` 這類從現在往前的時間），範圍外的計入「不在範圍」。
+- **去重鍵（冪等）**：每一行以「主機＋取樣時間＋內容雜湊」記在 `import_keys`。內容雜湊為 64 位元（FNV-1a 再以 splitmix64 混合，跨版本、跨平台固定），涵蓋 `recv_at`、`seq`、`ts`、`boot_id`／`report_seq` 與每個指標的名稱、單位、label、值，欄位順序與空白不影響。重複執行、中斷後重新執行、同一行出現在兩個檔案（例如複本）都只匯入一次，計入「重複略過」。另外兩種重複也會略過：durable 的行以 Kairos 原本的唯一索引（主機＋`boot_id`＋`report_seq`）判斷，與 Kairos 已保存（或 Pulse 之後補送）的同一筆不會重複；非 durable 的行若資料庫中已有完全相同的原始 report（同一主機、取樣時間、`seq`、格式與內容，例如開啟鏡像之後 JSONL 中的行），也視為重複。因此匯入整個資料目錄（含開啟鏡像之後的檔案）也不會重複。雜湊碰撞（同一主機、同一毫秒的兩筆不同 report 雜湊相同）的機率約為 2⁻⁶⁴，會被當成重複略過。
+- **保留期限**：與 Kairos 的保留清除相同的日期計算（今天與前 N 天，UTC，以執行時的系統時鐘），依取樣時間：
+
+  | 取樣時間 | 處理 |
+  |---|---|
+  | 在 `raw_retention_days` 之內 | 寫入原始資料，併入 5 分鐘與 1 小時彙總 |
+  | 超過原始資料保留期限，仍在彙總的保留期限內 | **只併入彙總**（「只進彙總」），不寫入原始資料；超過 `rollup_5m_retention_days` 的只併入 1 小時彙總 |
+  | 超過所有彙總的保留期限 | 略過（「超出保留期」） |
+
+  選擇「只進彙總」而不是全部略過或全部寫入：寫入原始資料的舊資料會在下一輪保留清除（每小時）被刪除，白白佔用寫入時間；但它們的長期趨勢（1 小時彙總預設保留 400 天）仍有價值。只進彙總的去重鍵與彙總在同一個交易中寫入，重新匯入時不會重複計算。`raw_retention_days = 0` 等不依時間刪除的設定時一律寫入。
+- **彙總**：與 Kairos 處理遲到資料的方式相同（第 5.3 節）。取樣時間早於主機 `rollup_until` 的，在寫入原始資料的同一個交易中累加進已寫出的桶；其他的先在記憶體中合併，每個檔案結束（或記憶體中累積 40 萬列）時寫出並推進 `rollup_until`。開始前先把資料庫中尚未寫出彙總的原始資料（Kairos 停止時還在記憶體中的桶）讀進來一起寫出，因此 Kairos 再啟動時不會重複計算、也不會漏算。匯入中途被中斷時，已提交的原始資料由下一次 Kairos 啟動（或重新匯入）補回彙總。
+- **主機**：清冊中沒有的主機以離線狀態新增，`hosts.source = 'import'`（由連線建立的為 NULL），`first_seen`／`last_seen` 為匯入資料中最早／最晚的 `recv_at`，`identity_verified = 0`；`kairos hosts list` 中為「離線」。既有的主機只把 `first_seen` 往前推，`last_seen`、`hostname`、`peer` 只在匯入的資料比清冊中的新時才更新，hello 的主機資訊與線上狀態不變（不覆蓋較新的資訊）。主機數達 `storage.max_hosts`、或指標序列數達上限時，這些行略過並計入「無法匯入」。
+- **壞行**：不是合法的 JSON、欄位缺漏或型別錯誤、不支援的 `schema`、`agent_id` 不是 UUID、`boot_id` 與 `report_seq` 只有其中一個、內容不符合協定的限制（與 Kairos 收到 report 時的檢查相同）、超過 1 MiB 的行，以及沒有換行的最後一行（檔案可能仍在寫入，之後重新匯入即可補上）都略過，計入「壞行」，每個檔案列出前 5 個的行號與原因。`hostname`、`peer` 中不能顯示的字元改成 `?`（較舊的 Kairos 限制較寬鬆），不算壞行。空行不計。
+- **與服務並行：先停止 Kairos（會偵測）**。匯入以 SQLite 的 `locking_mode = EXCLUSIVE` 開啟資料庫，整個過程持有資料庫檔的獨占鎖。Kairos 執行中時（它的連線一直持有共用鎖）取不到，匯入不開始，以結束代碼 11 結束（`KRS-E4304`「資料庫正在使用中」）；反過來，匯入期間 Kairos 也無法開啟資料庫而啟動失敗（systemd 依 `Restart=on-failure` 每 5 秒重試，匯入結束後就會啟動），`kairos hosts list`、`reports export`、`db backup` 等待約 5 秒後失敗。不採用「與服務同時寫入」的原因：
+  1. Kairos 在記憶體中保存尚未寫出的彙總，並以 `rollup_until` 判斷遲到資料；另一個行程同時寫入原始資料、推進 `rollup_until` 時兩邊的狀態對不上，彙總可能重複或漏算。
+  2. 服務的寫入只有 `timeouts.write_secs`（5 秒）的預算（PROTOCOL.md 的 8 秒回應預算）：大量匯入的交易會讓服務的 writer 等待鎖，尖峰時回 `storage_unavailable`。
+  3. 匯入是升級時的一次性工作，速度約每秒 3～4 萬行（第 11.3 節），停機時間可以先以 `--dry-run` 估算（試執行約為匯入時間的一半）。Pulse 0.3 在停機期間把取樣存在本機緩衝，恢復後補送；0.2 的 Pulse 在停機期間的取樣會遺失，因此停機要短時請用下一點的作法。
+- **縮短停機**：0.2 的 Kairos 不使用 `kairos.db`，因此可以在**升級前、0.2 仍在執行時**，以新版的執行檔先匯入已經寫完的舊檔，停機升級時只匯入當天的檔案：
+
+  ```bash
+  # 0.2 仍在執行：匯入今天（UTC）以前的資料（資料庫在這時建立；以服務帳號執行）
+  sudo -u kairos ~/kairos-dist/pkg-new/kairos reports import /opt/kairos/data \
+      --until $(date -u +%F) --config /opt/kairos/kairos.toml
+  # 停止 0.2、換上 0.3（INSTALL 第 11 節），匯入當天的檔案後再啟動
+  sudo systemctl stop kairos
+  sudo -u kairos ~/kairos-dist/pkg-new/kairos reports import /opt/kairos/data/reports-$(date -u +%F).jsonl \
+      --config /opt/kairos/kairos.toml
+  ```
+
+  兩次匯入之間跨過 UTC 午夜時，停機時改為匯入整個目錄即可：已匯入的行以去重鍵略過（只多花讀取的時間，約每秒 7 萬行）。
+- **以服務帳號執行**：匯入會建立或寫入 `kairos.db`（與 `-wal`）。Linux 上以 root 執行、而資料目錄屬於其他帳號時拒絕（結束代碼 10），避免建立 Kairos 之後無法寫入的檔案；請以 `sudo -u kairos` 執行。
+- **結束代碼**：0 完成（有壞行時仍為 0，摘要中有 `KRS-W4306` 警告）、1 有來源無法讀取（其餘照常匯入）或匯入失敗、2 用法錯誤、3 設定錯誤、10 權限不足、11 資料庫使用中。每 2000 行一個交易，中途失敗時已提交的部分保留，修正後重新執行同一個命令即可（已匯入的計入「重複略過」）。
+- **容量**：總容量上限依寫入順序刪除原始 report（第 8.2 節），匯入的舊資料是最後寫入的，會比較晚被刪；匯入後超過 `storage.max_total_bytes` 時 Kairos 會先刪到較新的即時資料。匯入結束時若已超過上限，摘要中有 `KRS-W4202` 警告：請先調高上限或以 `--since` 縮小範圍。
+- 測試：`store::import::tests`（`schema` 1／2／沒有 `schema`、壞行、重複匯入與同一檔案中的重複、Kairos 已保存的 durable 與鏡像中的行、durable 的取樣時間與去重鍵、保留期限、彙總與 Kairos 尚未寫出的彙總和遲到的檔案、既有主機的資訊、時間範圍與主機上限、試執行與實際的計數相同、獨占鎖、內容雜湊）、`import_cli::tests`（參數、目錄的掃描與符號連結、結束代碼）、端對端 `tests/e2e/tests/import.rs`（Kairos 執行中拒絕、停止後匯入、重新啟動後匯出與清冊）。
 
 ## 14. 限制與後續
 
@@ -432,3 +533,4 @@ WHERE host_id = (SELECT host_id FROM hosts WHERE agent_id = '6f1c0e4a-1b2c-4d3e-
 - 清冊不會自動刪除主機（除役流程屬 F 系列）。
 - durable 連線的取樣時間以 Pulse 的時鐘為準（第 5.2 節）；Pulse 時鐘偏差超過 5 分鐘（偏快）或 367 天（偏慢）時改用收到的時間。
 - 原始資料保留天數小於 Pulse 的 `buffer.max_age_hours` 時，原始資料被刪除之後的重送會再寫入一次（第 5.4 節）。
+- `kairos reports import` 需要停止 Kairos（獨占資料庫，第 13.1 節）；不支援壓縮過的 JSONL，也不讀取標準輸入。

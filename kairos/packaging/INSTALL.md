@@ -454,7 +454,7 @@ systemctl list-timers kairos-crl.timer
 
 **未啟用 mTLS 的部署請先處理**：從舊版升級時，若 `kairos.toml` 的 `server.listen` 是非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca`，新版會拒絕啟動（舊版只記 `WARN`）。升級前先依第 6、7 節啟用 mTLS；只有隔離的測試環境才在 `[auth]` 加上 `allow_unauthenticated = true`。
 
-**從 0.2 升級到 0.3：report 改寫 SQLite**。升級後 report 寫入 `data/kairos.db`，不再寫 `reports-*.jsonl`；直接讀 JSONL 的工具請先改用 `kairos reports export`，或在 `kairos.toml` 的 `[storage]` 加上 `jsonl_mirror = true`（同時寫兩份），或暫時設定 `backend = "jsonl"` 維持舊行為。既有的 JSONL 檔不會匯入資料庫，不開鏡像時也不會再被自動清除。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用（舊版會拒絕啟動）。詳見 `STORAGE.md`「從 JSONL（0.2）升級」。
+**從 0.2 升級到 0.3：report 改寫 SQLite**。升級後 report 寫入 `data/kairos.db`，不再寫 `reports-*.jsonl`；直接讀 JSONL 的工具請先改用 `kairos reports export`，或在 `kairos.toml` 的 `[storage]` 加上 `jsonl_mirror = true`（同時寫兩份），或暫時設定 `backend = "jsonl"` 維持舊行為。既有的 JSONL 檔不會自動匯入資料庫，不開鏡像時也不會再被自動清除；需要舊資料的趨勢與匯出時，以 `kairos reports import` 匯入（下方步驟 3a，**需要停止 Kairos**，`STORAGE.md`「匯入舊的 JSONL」）。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用（舊版會拒絕啟動）。詳見 `STORAGE.md`「從 JSONL（0.2）升級」。
 
 **從 0.2 升級到 0.3：先升級 Kairos，再升級 Pulse**。Pulse 0.3 預設啟用本機緩衝，與 Kairos 0.3 協商 `durable` 後，Kairos 停機或網路中斷期間的取樣會在恢復後補送（at-least-once），Kairos 以唯一索引去重。Kairos 先升級後，Pulse 升級後的第一次斷線就能補送；Pulse 0.2 連 Kairos 0.3 時與 0.2 相同（at-most-once）。Pulse 端要先建立 `buffer/` 目錄並換上新版 unit（Pulse 的 INSTALL 第 10 節）。補送的資料以 Pulse 的取樣時間保存與彙總，`kairos reports export` 的 `ts` 可能比 `recv_at` 早數小時到數天；縮短 `storage.raw_retention_days` 時請一併檢查 Pulse 的 `buffer.max_age_hours`（`STORAGE.md`「保留期限、Pulse 的 buffer.max_age_hours 與去重範圍」）。大量 Pulse 同時恢復連線時的寫入尖峰見 `STORAGE.md`「量測」。
 
@@ -482,7 +482,7 @@ pkg-new/kairos --version
 diff /opt/kairos/kairos.example.toml pkg-new/kairos.example.toml
 diff /etc/systemd/system/kairos.service pkg-new/kairos.service
 
-# 3. 保留舊版以便回滾，換上新版（先備份資料庫：新版可能升級 schema）
+# 3. 保留舊版以便回滾，換上新版（先備份資料庫：新版可能升級 schema；從 0.2 升級時還沒有資料庫，略過備份）
 sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/kairos-before-upgrade-$(date -u +%F).db \
   --config /opt/kairos/kairos.toml
 cp -p /opt/kairos/kairos /opt/kairos/kairos.prev
@@ -494,6 +494,14 @@ install -o root -g root -m 644 pkg-new/kairos.example.toml pkg-new/INSTALL.md \
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/kairos.service /etc/systemd/system/kairos.service
 # systemctl daemon-reload
+
+# 3a. （選用，從 0.2 升級）匯入 0.2 的 JSONL：先試執行估算筆數，停止 Kairos 後匯入，再啟動。
+#     匯入期間獨占資料庫（Kairos 執行中時以結束代碼 11 拒絕）；速度約每秒 3～4 萬行。
+#     停機要短時，可在換上新版之前（0.2 仍在執行）先以 pkg-new/kairos 匯入前幾天的檔案（--until），
+#     這裡只匯入當天的（STORAGE.md「匯入舊的 JSONL」的「縮短停機」）
+sudo -u kairos /opt/kairos/kairos reports import /opt/kairos/data --dry-run --config /opt/kairos/kairos.toml
+systemctl stop kairos
+sudo -u kairos /opt/kairos/kairos reports import /opt/kairos/data --config /opt/kairos/kairos.toml
 
 # 4. 重新啟動並確認（第 9.1 節）
 systemctl restart kairos
@@ -541,4 +549,7 @@ userdel kairos
 | `不是 Kairos 的資料庫（application_id = …）` | `storage.data_dir` 指到其他程式的 SQLite 檔。確認設定 |
 | `SQLite 資料庫已使用 … bytes，超過 storage.max_total_bytes` | 已達總容量上限，Kairos 正在刪除最舊的原始 report（之後是彙總）。依 `STORAGE.md`「容量估算」調高上限或縮短保留天數 |
 | `kairos hosts list` 回 `KRS-E4003`，原因為權限不足 | 以 root 或服務帳號執行：`sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml` |
+| `kairos reports import` 回 `KRS-E4304`「資料庫正在使用中」（結束代碼 11） | Kairos 正在執行（或另一個 `kairos` 子命令正在使用資料庫）。`systemctl stop kairos` 後再匯入；`--dry-run` 不需要停止 |
+| 匯入期間 Kairos 啟動失敗（`database is locked`） | `kairos reports import` 正獨占資料庫。匯入結束後 systemd 會依 `Restart=on-failure` 自動重新啟動；匯入時請先停止服務 |
+| `kairos reports import` 以 root 執行時以結束代碼 10 拒絕 | 匯入會建立或寫入 `kairos.db`，請以服務帳號執行：`sudo -u kairos /opt/kairos/kairos reports import …` |
 | 其他錯誤訊息 | 見 `README.md`「疑難排解」 |

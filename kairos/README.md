@@ -525,13 +525,14 @@ sequenceDiagram
 
 ### `data/kairos.db`（SQLite，預設）
 
-`storage.backend = "sqlite"`（預設）時，report、5 分鐘與 1 小時彙總、主機清冊都在這個資料庫中（WAL 模式，另有 `kairos.db-wal`、`kairos.db-shm`）。schema、寫入與 `ack` 的語意、去重、彙總、保留期限與總容量上限、容量估算、量測、備份與還原見 [STORAGE.md](STORAGE.md)。維運用的子命令（都以唯讀方式開啟資料庫，Kairos 執行中也可以執行；用 `--config` 指向 Kairos 的設定檔以找到 `storage.data_dir`）：
+`storage.backend = "sqlite"`（預設）時，report、5 分鐘與 1 小時彙總、主機清冊都在這個資料庫中（WAL 模式，另有 `kairos.db-wal`、`kairos.db-shm`）。schema、寫入與 `ack` 的語意、去重、彙總、保留期限與總容量上限、容量估算、量測、備份與還原見 [STORAGE.md](STORAGE.md)。維運用的子命令（用 `--config` 指向 Kairos 的設定檔以找到 `storage.data_dir`；除了 `reports import`，都以唯讀方式開啟資料庫，Kairos 執行中也可以執行）：
 
 | 指令 | 用途 |
 |---|---|
 | `kairos hosts list [--offline-for 3d] [--json]` | 主機清冊：狀態（線上／離線／未知）、主機名稱、`agent_id`、IP、最後訊息；`--offline-for` 只列出失聯至少這麼久的主機 |
 | `kairos reports export [--since 1d] [--agent <agent_id>]` | 以 JSON Lines 匯出原始 report，每行的格式與下一節的 JSONL 相同（`peer`、`hostname` 為清冊中最後的值） |
 | `kairos db backup <備份檔>` | 線上備份（`VACUUM INTO`）；**執行中不可直接複製 `kairos.db`** |
+| `kairos reports import [--dry-run] [--since …] [--until …] <檔案或目錄>...` | 把 0.2.x 以前的 `reports-YYYY-MM-DD.jsonl` 匯入資料庫（重複執行不重複寫入；超過原始資料保留期限的只併入彙總）。**需要先停止 Kairos**（獨占資料庫，執行中時以結束代碼 11 拒絕；`--dry-run` 不需要），見 STORAGE.md「匯入舊的 JSONL」 |
 
 以 systemd 執行時請以服務帳號執行，例如 `sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml`。
 
@@ -807,9 +808,11 @@ kairos/
     ├── storage.rs         report 的寫入介面（ReportSink、WriteTicket、去重鍵）、JSONL 後端與鏡像、agents.json 快照
     ├── store/             report 的儲存後端（STORAGE.md）：mod.rs（ReportStore trait 與 writer task）、
     │                      sqlite.rs（SQLite 後端、主機清冊、保留與容量上限、checkpoint）、codec.rs（緊湊編碼）、
-    │                      rollup.rs（5 分鐘／1 小時彙總）、*tests.rs（單元測試與吞吐量量測）
+    │                      rollup.rs（5 分鐘／1 小時彙總）、import.rs（匯入舊 JSONL：去重鍵、保留期限、彙總）、
+    │                      *tests.rs（單元測試與吞吐量量測）
     ├── hosts_cli.rs       kairos hosts list（主機清冊查詢）
     ├── export_cli.rs      kairos reports export（JSON Lines 匯出）、kairos db backup（線上備份）
+    ├── import_cli.rs      kairos reports import（來源檔的收集與安全檢查、輸出與結束代碼）
     ├── monitor.rs         每秒存活檢查、每 5 秒快照、每 60 秒摘要、關機時最後快照
     ├── shutdown.rs        關機訊號、關機期限與看門狗
     ├── integration_tests.rs  透過真實 TLS 連線的整合測試（僅測試建置）
@@ -847,7 +850,7 @@ cargo fmt --check
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.99 cargo test -p kairos --locked
 ```
 
-協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。SQLite 儲存的測試在 `src/store/`：schema 建立與遷移（依序套用、失敗時整版不生效、拒絕較新或不是 Kairos 的資料庫）、緊湊編碼的往返、一批一個交易、commit 前失敗／磁碟已滿／結果未知的回報、去重（重複的回 `Duplicate`、同一批與跨重新開啟、結果不明後的重送只算一次）、取樣時間（durable 的 `ts` 與範圍）、遲到資料併入已寫出的彙總（不覆蓋、當掉後不重複）、補送中的桶延後寫出、資料庫或資料目錄被刪除時重建、主機清冊的同步（只寫有變化的、分批寫入、關機時寫完）與重新啟動後載回、彙總的寫出與當掉後補回（不重複計算）、保留期限（含時鐘跳躍保護）、總容量上限的刪除順序、趨勢查詢走索引（`EXPLAIN QUERY PLAN`）、匯出與線上備份；writer 的 commit 後才回覆、group commit、取消的要求不寫入、JSONL 鏡像與關機前的清冊同步。吞吐量量測為 ignored 測試（`cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput`，見 STORAGE.md「量測」）。測試數量以 `cargo test` 的輸出為準。
+協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。SQLite 儲存的測試在 `src/store/`：schema 建立與遷移（依序套用、失敗時整版不生效、拒絕較新或不是 Kairos 的資料庫）、緊湊編碼的往返、一批一個交易、commit 前失敗／磁碟已滿／結果未知的回報、去重（重複的回 `Duplicate`、同一批與跨重新開啟、結果不明後的重送只算一次）、取樣時間（durable 的 `ts` 與範圍）、遲到資料併入已寫出的彙總（不覆蓋、當掉後不重複）、補送中的桶延後寫出、資料庫或資料目錄被刪除時重建、主機清冊的同步（只寫有變化的、分批寫入、關機時寫完）與重新啟動後載回、彙總的寫出與當掉後補回（不重複計算）、保留期限（含時鐘跳躍保護）、總容量上限的刪除順序、趨勢查詢走索引（`EXPLAIN QUERY PLAN`）、匯出與線上備份、舊 JSONL 的匯入（`schema` 1／2／沒有 `schema`、壞行、重複匯入、與 Kairos 已保存的資料去重、保留期限、彙總不重複不漏算、獨占鎖；目錄掃描不跟隨符號連結）；writer 的 commit 後才回覆、group commit、取消的要求不寫入、JSONL 鏡像與關機前的清冊同步。吞吐量量測為 ignored 測試（`cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput`、匯入速度為 `import_throughput`，見 STORAGE.md「量測」）。測試數量以 `cargo test` 的輸出為準。
 
 > [!WARNING]
 > `src/test_pki.rs` 與 `testdata/`（例如 `testdata/pki/server.key`）中的私鑰**只供測試使用**，已公開在 repo 中，絕對不可用於任何部署環境。正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。

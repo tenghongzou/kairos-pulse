@@ -56,7 +56,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 | # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
 |---|---|---|---|---|
-| 1 | Kairos | **report 預設寫入 SQLite（`data/kairos.db`），不再寫 `reports-YYYY-MM-DD.jsonl`**（A1） | 直接讀取 `data/reports-*.jsonl` 的工具（匯入、報表、監控腳本），以及複製資料目錄的備份腳本 | 升級前擇一：讀取工具改用 `kairos reports export --since <時間> [--agent <agent_id>]`（每行格式與 JSONL 相同，`peer`、`hostname` 為清冊中最後的值）；或在 `[storage]` 加上 `jsonl_mirror = true` 同時輸出 JSONL（盡力而為、不影響 `ack`，磁碟用量約多 6 倍）；或暫時設定 `backend = "jsonl"`（與 0.2 相同，沒有主機清冊與彙總）。備份改用 `kairos db backup <檔案>`（**執行中不可直接複製 `kairos.db`**，INSTALL 第 10.2 節）。既有的 JSONL 檔不會匯入資料庫、不會被修改；不開鏡像時 JSONL 的保留清除不再執行，舊檔請自行搬移或刪除 |
+| 1 | Kairos | **report 預設寫入 SQLite（`data/kairos.db`），不再寫 `reports-YYYY-MM-DD.jsonl`**（A1） | 直接讀取 `data/reports-*.jsonl` 的工具（匯入、報表、監控腳本），以及複製資料目錄的備份腳本 | 升級前擇一：讀取工具改用 `kairos reports export --since <時間> [--agent <agent_id>]`（每行格式與 JSONL 相同，`peer`、`hostname` 為清冊中最後的值）；或在 `[storage]` 加上 `jsonl_mirror = true` 同時輸出 JSONL（盡力而為、不影響 `ack`，磁碟用量約多 6 倍）；或暫時設定 `backend = "jsonl"`（與 0.2 相同，沒有主機清冊與彙總）。備份改用 `kairos db backup <檔案>`（**執行中不可直接複製 `kairos.db`**，INSTALL 第 10.2 節）。既有的 JSONL 檔不會自動匯入資料庫、不會被修改；需要舊資料時以 `kairos reports import` 匯入（需要停止 Kairos，見下方升級步驟 2a）。不開鏡像時 JSONL 的保留清除不再執行，舊檔請在匯入後自行搬移或刪除 |
 | 2 | Kairos | **資料目錄必須在本機磁碟** | `storage.data_dir` 放在 NFS、SMB 等網路磁碟的部署 | SQLite 的 WAL 需要共享記憶體與檔案鎖；無法啟用 WAL 時拒絕啟動（`無法啟用 WAL`）。改到本機磁碟 |
 | 3 | Kairos | **總容量上限預設 64 GiB，超過時刪除最舊的資料**（A9） | 主機多（約 1,300 台以上）或保留天數調長的部署 | 依 STORAGE.md「容量估算」設定 `storage.max_total_bytes`（0 = 不限制）與 `raw_retention_days`／`rollup_5m_retention_days`／`rollup_1h_retention_days`（預設 7／31／400 天）。上限小於以 `server.max_connections` 台估算的容量時啟動記 `WARN`。縮短 `raw_retention_days` 時一併檢查第 6 項的 `buffer.max_age_hours` |
 | 4 | Kairos | **`agents.json` 在重新啟動後保留最近 24 小時內出現過的主機**（A6，行為改變） | 依「重新啟動後 `agents.json` 為空」或 `total` 計數的工具 | 重新啟動後這些主機以 `online: false`、`conn_id: 0` 出現，24 小時後照常移除；需要所有主機（含更早的）時用 `kairos hosts list --json` |
@@ -69,6 +69,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 1. **Kairos 升級前**：依第 1 項處理讀取 JSONL 的工具與備份腳本，依第 5 項檢查以 `recv_at` 當取樣時間的工具；確認資料目錄在本機磁碟並有足夠空間（第 2、3 項）。
 2. **升級 Kairos**：換上新版執行檔並重新啟動（Kairos INSTALL 第 11 節，unit 不需修改）。之後每次升級 Kairos 前先以 `kairos db backup` 備份：新版可能升級 schema，升級後的資料庫無法給舊版使用。
+   - 2a.（選用）**匯入 0.2 的 JSONL**：`kairos reports import --dry-run` 估算筆數後，停止 Kairos、`sudo -u kairos /opt/kairos/kairos reports import /opt/kairos/data --config /opt/kairos/kairos.toml`、再啟動（約每秒 3～4 萬行）。停機要短時，可在換上新版之前、0.2 仍在執行時，先以新版的執行檔匯入前幾天的檔案，停機時只匯入當天的（STORAGE.md「匯入舊的 JSONL」）。
 3. **確認 Kairos**：以 `sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml` 確認既有的 Pulse（0.2.0，at-most-once）重新連上後出現在清冊中。
 4. **每台 Pulse 主機：建立緩衝目錄**：`install -d -o pulse -g pulse -m 750 /opt/pulse/buffer`（第 6 項；多實例時每個實例各一個）。
 5. **換上新版 `pulse.service`** 並 `systemctl daemon-reload`（`ReadWritePaths` 加上 `-/opt/pulse/buffer`）。
@@ -95,6 +96,16 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **`kairos hosts list [--offline-for <時間>] [--wide] [--no-header] [--json] [--ascii]`**：查詢主機清冊（線上／離線／未知、主機名稱、`agent_id`、IP、最後訊息），回答「哪些主機已失聯 N 天」；`--json` 為純 ASCII（`schema` `kairos.hosts.list/v1`），錯誤為 `KRS-E4003`。輸出依設計包 `cli-style.md`。
 - **`kairos reports export [--since <時間>] [--agent <agent_id>]`**：以 JSON Lines 匯出 SQLite 中的原始 report，格式與 JSONL 檔相同（`schema` 1／2，durable 的另有 `boot_id`、`report_seq`；`--since` 依取樣時間）。
 - **`kairos db backup <檔案>`**：線上備份（`VACUUM INTO`），Kairos 執行中也可以執行，不覆寫既有檔案，備份檔 `0640`。
+- **`kairos reports import [--dry-run] [--since <時間>] [--until <時間>] [--json] <檔案或目錄>...`**：把 0.2.x 以前的 `reports-YYYY-MM-DD.jsonl`（0.1.0 沒有 `schema` 的行、`schema` 1／2、durable 的 `boot_id`／`report_seq`）匯入 SQLite（STORAGE.md「匯入舊的 JSONL」）。
+  - 取樣時間與 Kairos 寫入時的規則相同（durable 的行用 `ts`，其他用 `recv_at`），`reports export` 輸出的行與原本的相同。
+  - **冪等**：以「主機＋取樣時間＋內容雜湊」為去重鍵（新的 `import_keys` 表），重複執行、中斷後重新執行、同一行出現在兩個檔案都只匯入一次；durable 的行另以原本的唯一索引、非 durable 的行以「資料庫中已有完全相同的原始 report」（例如 JSONL 鏡像）判斷重複。
+  - **保留期限**：原始資料保留期限內的寫入原始資料並併入彙總；超過的**只併入彙總**（5 分鐘彙總也過期時只進 1 小時）；超過所有彙總保留期限的略過。彙總與 Kairos 的遲到資料相同的方式合併，並納入 Kairos 停止時尚未寫出的彙總，Kairos 再啟動時不重複計算。
+  - **主機**：清冊中沒有的主機以離線、`hosts.source = 'import'` 建立；既有的主機只在匯入的資料較新時更新 `last_seen`、`hostname`、`peer`。
+  - **需要停止 Kairos**：以 SQLite 的獨占鎖開啟資料庫，Kairos 執行中時以結束代碼 11（`KRS-E4304`「資料庫正在使用中」）拒絕，匯入期間 Kairos 也無法啟動；不與服務同時寫入（服務記憶體中的彙總與 8 秒回應預算）。`--dry-run` 以唯讀方式開啟，執行中也可以。
+  - 來源檔只讀取；目錄只取 `reports-*.jsonl` 與 `reports.jsonl`，不進入子目錄、不跟隨符號連結（參數本身是符號連結時也拒絕），壓縮檔列出提示先解壓縮；Linux 上以 root 執行而資料目錄屬於其他帳號時拒絕（結束代碼 10）。
+  - 壞行（不是 JSON、欄位缺漏、不合法、沒有換行的最後一行）略過並計數，每個檔案列出前 5 個的行號與原因；摘要列出讀取、匯入（原始資料／只進彙總）、重複略過、壞行、超出保留期、不在範圍、無法匯入與新增主機。結束代碼：0 完成（含有壞行）、1 有來源無法讀取或匯入失敗、2 用法、3 設定、10 權限、11 資料庫使用中。`--json` 為純 ASCII（`schema` `kairos.reports.import/v1`）。
+  - kp-build 上 100 萬行（984 MB）約 25 秒（每秒約 4 萬行；1 萬台主機時約 3.4 萬行、只進彙總時約 2.1 萬行），再匯入（全部重複）約 15 秒；去重鍵每行約 23 bytes（STORAGE.md「量測」）。
+- schema v2：`hosts.source` 與 `import_keys`（遷移在啟動或匯入時自動套用；以 0.3.0 開發中的建置建立的 v1 資料庫照常升級）。
 - **彙總**（A9）：每個指標的 5 分鐘與 1 小時 min／max／sum／count（`rollup_5m`、`rollup_1h`）；v1 的三個欄位對應到標準指標（記憶體換算成 bytes），與 v2 合併成同一條趨勢。重新啟動時從原始資料補回尚未寫出的部分，不漏算、不重複算。
 - **分層保留與總容量上限**（A9）：`storage.raw_retention_days`（預設 7）、`storage.rollup_5m_retention_days`（31）、`storage.rollup_1h_retention_days`（400），依取樣時間；`storage.max_total_bytes`（預設 64 GiB）超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，直到低於上限的 95%。刪除都分批進行（每步最多 5000 列、一個短交易），不會長時間鎖住資料庫；依時間的刪除沿用 DateGuard 的時鐘跳躍保護（狀態存在資料庫中）。
 - 新設定 `storage.backend`（`sqlite`／`jsonl`）、`storage.jsonl_mirror`（`sqlite` 時另輸出 JSONL 鏡像，沿用 `retention_days`、`max_daily_bytes` 與保留清除）、`storage.sqlite_synchronous`（`normal`／`full`）。範例設定與 README 的設定表已更新。
@@ -109,7 +120,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 #### 文件
 
-- 新增 `kairos/STORAGE.md`（發佈包內附）：架構、`ack` 語意、schema 與遷移、批次策略、去重、取樣時間與遲到資料、保留期限與 Pulse 緩衝的關係、主機清冊、彙總、保留與容量上限、設定、容量估算公式與表、吞吐量量測（含補送尖峰）、查詢範例、備份與還原、從 JSONL 升級。
+- 新增 `kairos/STORAGE.md`（發佈包內附）：架構、`ack` 語意、schema 與遷移、批次策略、去重、取樣時間與遲到資料、保留期限與 Pulse 緩衝的關係、主機清冊、彙總、保留與容量上限、設定、容量估算公式與表、吞吐量量測（含補送尖峰與匯入速度）、查詢範例、備份與還原、從 JSONL 升級（含 `kairos reports import` 的設計：去重鍵、保留期限、與服務並行、縮短停機的作法）。
 - README：設定表、資料輸出、檔案權限、專案結構、依賴與目前限制依 SQLite 與 durable 更新；INSTALL：資料目錄須為本機磁碟、確認清單加上 `kairos hosts list`、備份改用 `kairos db backup`、升級前備份與回滾、疑難排解。
 
 ### Pulse
@@ -136,7 +147,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 共用
 
-- 端對端測試（`tests/e2e`）改以預設的 SQLite 執行：report 以實際的 `kairos reports export` 從資料庫取出檢查，另檢查 JSONL 鏡像與資料庫一致、關機後 `kairos hosts list --json` 中主機為離線且帶主機資訊、重新啟動時從清冊載回主機。新增 durable 的端對端測試：Kairos 停機期間的取樣補送後不缺號、不重複；結果不明的重送與 Kairos 重新啟動後的重送都不重複。
+- 端對端測試（`tests/e2e`）改以預設的 SQLite 執行：report 以實際的 `kairos reports export` 從資料庫取出檢查，另檢查 JSONL 鏡像與資料庫一致、關機後 `kairos hosts list --json` 中主機為離線且帶主機資訊、重新啟動時從清冊載回主機。新增 durable 的端對端測試：Kairos 停機期間的取樣補送後不缺號、不重複；結果不明的重送與 Kairos 重新啟動後的重送都不重複。新增 `kairos reports import` 的端對端測試：Kairos 執行中拒絕（結束代碼 11，跨行程的檔案鎖）、停止後匯入與重複匯入、重新啟動後匯出與清冊。
 
 ### 發佈與建置
 
