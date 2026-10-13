@@ -336,7 +336,12 @@ pub(crate) fn file_identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// 資料庫與 `-wal`、`-shm` 檔：先以 0640 建立資料庫檔（SQLite 建立 `-wal`、`-shm` 時沿用
-/// 資料庫檔的權限），既有的檔案收緊到最多 0640（S3；Unix）
+/// 資料庫檔的權限），既有的檔案收緊到最多 0640（S3；Unix）。
+///
+/// 已存在的檔案**只以路徑**收緊權限，不以 `std::fs` 開啟：POSIX 的 fcntl 鎖以行程為單位，同一個
+/// 行程內關閉任何一個指向資料庫檔（或 `-shm`）的 fd，都會放掉 SQLite 連線在這個檔上的鎖。writer 在
+/// 資料庫被替換後重新開啟時，主控台的唯讀連線可能已經開著新檔；若在這裡開關它，`kairos reports import`
+/// 就偵測不到 Kairos 正在執行（`kairos/API.md` 第 7 節）。
 fn prepare_files(path: &Path) -> Result<(), Error> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -348,19 +353,29 @@ fn prepare_files(path: &Path) -> Result<(), Error> {
             )
         })?;
     }
-    let file = fsperm::private_std_options(std::fs::OpenOptions::new().create(true).append(true))
+    // 不存在時才建立（新檔不會有其他連線開著）；已存在（含建立時的競爭）時不開啟
+    match fsperm::private_std_options(std::fs::OpenOptions::new().write(true).create_new(true))
         .open(path)
-        .map_err(|e| Error::new(e.kind(), format!("無法開啟 {}: {}", path.display(), e)))?;
-    for (f, p) in [(Some(file), path.to_path_buf())]
-        .into_iter()
-        .chain(["-wal", "-shm"].iter().map(|s| {
-            let p = sidecar(path, s);
-            (std::fs::OpenOptions::new().read(true).open(&p).ok(), p)
-        }))
     {
-        if let Some(f) = f
-            && let Err(e) = fsperm::restrict_open_file(&f)
-        {
+        Ok(file) => {
+            if let Err(e) = fsperm::restrict_open_file(&file) {
+                warn!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(Error::new(
+                e.kind(),
+                format!("無法開啟 {}: {}", path.display(), e),
+            ));
+        }
+    }
+    for p in [
+        path.to_path_buf(),
+        sidecar(path, "-wal"),
+        sidecar(path, "-shm"),
+    ] {
+        if let Err(e) = fsperm::restrict_path(&p) {
             warn!("無法將 {} 的權限收緊為 0640: {}", p.display(), e);
         }
     }

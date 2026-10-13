@@ -1,12 +1,13 @@
 //! 端對端：`kairos reports import`（匯入 0.2.x 的 JSONL）以實際的執行檔執行。
 //!
-//! - Kairos 執行中時拒絕匯入（結束代碼 11，資料庫使用中；檔案鎖跨行程），`--dry-run` 可以；
+//! - Kairos 執行中時拒絕匯入（結束代碼 11，資料庫使用中；檔案鎖跨行程），主控台的唯讀與寫入連線都用過資料庫之後也一樣；
+//!   `--dry-run` 可以；
 //! - 停止 Kairos 後匯入，重複匯入不重複寫入；
 //! - Kairos 再啟動後（資料庫照常開啟）以 `reports export` 取出匯入的 report，主機出現在清冊中（離線）。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kp_e2e::{Kairos, TestDir, run_to_exit, test_pki};
+use kp_e2e::{Kairos, TestDir, WAIT, run_to_exit, test_pki};
 use serde_json::{Value, json};
 
 /// Unix 毫秒 → `YYYY-MM-DDTHH:MM:SS.mmmZ`（civil from days，Howard Hinnant 的演算法；不另外引入 chrono）
@@ -70,6 +71,14 @@ fn import_refuses_a_running_kairos_and_the_data_survives_a_restart() {
     .unwrap();
 
     let mut kairos = k.start();
+    // 主控台啟用時，同一個 Kairos 行程內另有唯讀連線池與低頻寫入的連線（kairos/API.md 第 7 節）：
+    // 先讓兩者都實際開過資料庫（查詢 → 唯讀連線；token 建立的稽核 → 寫入連線並 commit），
+    // 再確認匯入仍然偵測得到 Kairos 正在執行（任何一條在行程內以 std::fs 開關資料庫檔都會放掉鎖）
+    kairos.wait_for("主控台 API 已啟動", WAIT);
+    let api = k.api(&k.create_token("import-e2e"));
+    assert_eq!(api.data("/api/v1/hosts"), json!([]));
+    kairos.wait_for("API token 已建立", WAIT);
+    assert!(api.data("/api/v1/system/health")["service"]["version"].is_string());
     let (code, out, err) = import(&k, &["old-data"]);
     assert_eq!(code, 11, "Kairos 執行中應拒絕匯入\n{out}{err}");
     assert!(err.contains("KRS-E4304") && err.contains("使用中"), "{err}");
