@@ -57,13 +57,15 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 | `tests/compat.rs` | 協定 v1 相容：以假 client（`RawClient`，送出與舊版 0.1.0 Pulse 相同的 hello、heartbeat、report）與新版 Pulse 同時連同一個新版 Kairos。舊版得到與 v1 Kairos 相同的 `hello_ack`（`proto` 1，沒有 v2 欄位）與錯誤處理，匯出的 report 為 `schema` 1 且欄位與舊版的 JSONL 相同，新版為 `schema` 2，兩種格式也寫在同一個 JSONL 鏡像檔；`agents.json` 中 v1 的 agent 沒有主機資訊。新版 Pulse 沒有只用 v1 的設定，新版 Pulse 連舊版 Kairos 的方向由 Pulse 的單元測試涵蓋 |
 | `tests/durable.rs` | durable（at-least-once，A5）：Pulse 持續送資料時讓 Kairos 停機再啟動，停機期間的取樣補送後在 SQLite 中不缺號、不重複，收到時間（`recv_at`）比取樣時間（`ts`）晚；Kairos 已寫入、client 沒收到 `ack` 就斷線（結果不明）時重送只保存一次，Kairos 重新啟動後的重送也一樣（唯一索引） |
 | `tests/exit_codes.rs` | 兩端常駐模式啟動時的結束代碼（0、1、2、3、4、11，見下方「結束代碼」） |
+| `tests/api.rs` | 主控台 API（`kairos/API.md`）：以實際的 `kairos api-token create` 建立 token（Kairos 在日誌中記錄建立、不含秘密），先開 SSE 再啟動 Pulse → `host.added`；主機清單（狀態、CIDR 搜尋、計數）、詳情（durable）、CPU 趨勢、總覽、系統健康；Pulse 停止 → `host.offline`（`connection_closed`），以 `Last-Event-ID` 重連補送；CRL 撤銷 → `host.offline`（`certificate_rejected`），之後握手被拒的憑證歸屬到主機（`KRS-W1105`） |
+| `tests/import.rs` | `kairos reports import`：Kairos 執行中拒絕（檔案鎖跨行程；主控台的寫入連線不得放掉這把鎖）、停止後匯入、重新啟動後匯出與清冊 |
 
 - 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。
 - 每個測試使用自己的暫存目錄（`<系統暫存目錄>/kp-e2e-*`）與隨機埠，可平行執行；每個等待都有逾時（30 秒）。測試失敗時保留暫存目錄（路徑印在輸出中）並附上兩端的 stdout／stderr。
 - 測試用的設定縮短了時間：心跳與 report 每 1 秒、重連延遲 1～2 秒（A11 的啟動隨機延遲因此最多 1 秒）、Kairos 熱重載每 1 秒。Kairos 使用預設的 SQLite 並開啟 JSONL 鏡像（`storage.jsonl_mirror = true`）。
-- 憑證：Kairos 的伺服器憑證用 `pulse/testdata/server.pem`（Pulse 以 `server-ca.pem` 驗證）；客戶端憑證、私鑰、client CA 與 CRL 沿用 Kairos 整合測試的 `kairos/src/test_pki.rs`（以 `#[path]` 引用同一個檔案，`kairos/testdata/pki` 沒有客戶端私鑰）。`RawClient` 以 workspace 已使用的 `rustls`（ring）建立與 Pulse 相同的 mTLS 連線，不新增外部套件。
+- 憑證：Kairos 的伺服器憑證用 `pulse/testdata/server.pem`（Pulse 與主控台 API 的用戶端 `Api` 以 `server-ca.pem` 驗證；主控台在另一個隨機埠）；客戶端憑證、私鑰、client CA 與 CRL 沿用 Kairos 整合測試的 `kairos/src/test_pki.rs`（以 `#[path]` 引用同一個檔案，`kairos/testdata/pki` 沒有客戶端私鑰）。`RawClient` 以 workspace 已使用的 `rustls`（ring）建立與 Pulse 相同的 mTLS 連線，不新增外部套件。
 - 結束訊號：Unix 送 SIGTERM；Windows 以 `CREATE_NEW_PROCESS_GROUP` 啟動子行程後送 Ctrl+Break（兩個程式都會攔截並正常關機）。
-- 整套約 10 秒以內（不含第一次建置）；沒有標記 `#[ignore]` 的慢速測試。
+- 整套約 20 秒（不含第一次建置，各檔平行執行）；沒有標記 `#[ignore]` 的慢速測試。
 
 ## 結束代碼（兩個產品共用）
 

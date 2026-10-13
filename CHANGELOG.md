@@ -46,7 +46,53 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（0.3.0 之後的變更記在這裡。）
+（0.4.0 之後的變更記在這裡。）
+
+## [0.4.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.4.0**：商業審計路線圖「階段 3 MVP 產品面」的 F1（查詢與管理 API）第一版，主控台畫面的前提。新增 HTTPS 的主控台 API（`/api/v1`，唯讀）與 API token；Pulse 不需要升級（協定不變）。`kairos/Cargo.toml` 的版本**尚未**改為 0.4.0；發佈時依 RELEASING.md 改版本、填上日期並移除〔草稿〕標記。規格、端點、驗證、即時推送與量測見 `kairos/API.md`（發佈包內的 `API.md`）。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **預設監聽主控台 API `127.0.0.1:9443`**（`[console]`，HTTPS） | 9443 已被其他程式使用的主機；與 `server.listen` 使用同一個位址與連接埠的設定 | 升級前 `ss -ltnp \| grep :9443` 確認沒有被使用。被佔用時 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）：在 `kairos.toml` 加上 `[console]` 的 `listen`（換連接埠）或 `enabled = false`。與 `server.listen` 相同時以 `KRS-E0202` 拒絕啟動（結束代碼 3） |
+| 2 | Kairos | **資料庫 schema 升級到 v3**（`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`） | 所有 SQLite 部署 | 升級前 `kairos db backup`（INSTALL 第 11 節）；升級後 0.3 無法開啟資料庫（降版從備份還原） |
+| 3 | Kairos | **檔案描述元的需要量多了主控台的連線上限**：`server.max_connections` ＋ `console.max_connections`（預設 64）＋ 64（設計包 D21） | 自訂 `LimitNOFILE` 剛好等於舊算式的部署 | 啟動時不足會記 `WARN` 並附建議值；發佈包 unit 的 `LimitNOFILE=8192` 足夠 |
+
+**升級步驟**：備份資料庫 → 換上新版執行檔（INSTALL 第 11 節）→ 重新啟動 → 確認日誌有「主控台 API 已啟動，監聽 https://127.0.0.1:9443/api/v1/」→ 以 `kairos api-token create` 建立 token 並依 INSTALL 第 9.3 節確認；需要從其他主機使用時把 `console.listen` 改為對外位址，並以防火牆**只允許管理網段**。
+
+### 新增
+
+- **主控台 API**（F1；設計包 `screens.md` §24 #1、#4、#5、#19）：HTTPS（rustls／ring，HTTP/1.1，hyper 1），版本前綴 `/api/v1`，JSON，時間為 RFC 3339 UTC 毫秒，每個回應帶 `server_time`，錯誤為 `{"error":{"code","product_code","message"}}`（`product_code` 對照 `copywriting.md` 的 `KRS-` 代碼），游標分頁。端點：
+  - `GET /api/v1/hosts`：主機清冊列表，伺服器端篩選（狀態、從未連線、失聯超過 N、離線原因、tag、OS、版本、是否支援補送、CIDR、主機名稱／顯示名稱／IP／agent_id 搜尋）、排序（嚴重度、名稱、最後上線、IP、版本、CPU、記憶體）、游標分頁、總數與各狀態台數；
+  - `GET /api/v1/hosts/{agent_id}`：詳情（清冊欄位、主機指紋、OS、標籤、目前連線、最近一次 report、是否協商補送與補送中、握手時被拒的憑證）；
+  - `GET /api/v1/hosts/{agent_id}/metrics[/{name}]`：目前回報的指標、趨勢（依範圍自動選原始資料／5 分鐘／1 小時彙總，也可指定；min／max／avg／count；有 label 的序列分開；點數上限；尚未寫出的彙總由原始資料計算）；
+  - `GET /api/v1/overview`：各狀態台數、每分鐘上線數（24 小時）、與 1 小時前的差、離線最久、資源使用前 10、健康摘要；
+  - `GET /api/v1/system/health`：資料庫用量與容量上限、以目前回報中的主機與宣告的間隔估算保留期滿的用量、最近一次容量刪除、保留設定與最近一次清除、report 寫入統計（成功、`storage_unavailable`、結果不明、重複、速率限制）、支援補送／補送中的台數、連線使用率、TLS 到期、監聽位址、檔案描述元、驗證模式；
+  - `GET /api/v1/events`：即時變更推送（SSE）：`host.added`、`host.online`、`host.offline`（附原因），每 15 秒心跳，`Last-Event-ID` 在保留範圍（4,096 則）內補送、否則 `resync`，同時連線數上限 `console.max_streams`；
+  - `GET /api/v1/me`：目前的身分。
+- **API token**（暫行驗證，F6 之前）：`kairos api-token create|list|revoke`（設計包 `cli-style.md`；token 只在建立時顯示一次、資料庫只存 SHA-256、可設到期與唯讀範圍、撤銷立即生效）。`Authorization: Bearer`；常數時間比對；驗證失敗依來源 IP 速率限制；最後使用的時間與來源每 60 秒寫回；建立與撤銷由執行中的 Kairos 寫入日誌。
+- **設定 `[console]`**：`enabled`、`listen`（預設 `127.0.0.1:9443`）、`cert_path`／`key_path`（預設沿用伺服器憑證，熱重載）、`max_connections`（64）、`max_streams`（16）。
+- **握手時被拒的憑證歸屬到主機**（設計包 §24 #3）：已撤銷、已過期（或無法判定撤銷狀態）的客戶端憑證以 SAN 歸屬到 `agent_id`，記錄原因（`KRS-W1105`／`W1108`／`E1203`）、序號與來源位址，寫入主機清冊；主機詳情與列表的離線原因顯示「憑證被拒」。不受信任的 CA 簽發的憑證不歸屬（SAN 可偽造）。
+- **`KRS-W4202`**（容量上限刪除最舊的資料；設計包 §25.5 #3）：日誌改用代碼與 `copywriting.md` 的文案，開始與結束寫入 `meta.capacity_event`，系統健康顯示最近一次容量刪除。
+- 量測（`kairos/src/api/bench.rs`，kp-build 4 vCPU）：1 萬台主機的列表 p99 約 10 ms（每次重建索引的最壞情況約 40 ms）、30 天趨勢 p99 約 8～13 ms；每秒 2,000 筆 report 同時以主控台一般用量查詢時 `ack` p99 約 1 ms（只有寫入時約 2 ms），連續查詢的壓力下約 6 ms（API.md 第 9 節）。
+
+### 變更
+
+- 啟動時的檔案描述元檢查（`LimitNOFILE`）的需要量含主控台的連線上限（上方第 3 項）。
+- 狀態表記錄最近一次的離線原因（逾時、連線關閉、Kairos 關機、連線中憑證被拒）、是否協商了 `durable` 與最近一次收到補送資料的時間，供 API 使用；`agents.json` 的格式不變。
+- 發佈包另附 `API.md`。
+
+### 相容性
+
+- 協定、Pulse 不變；Kairos 0.4 與 Pulse 0.2／0.3 的組合與 0.3 相同（見「版本相容矩陣」）。
+- `kairos hosts list`、`reports export／import`、`db backup` 不變；`kairos reports import` 仍需要停止 Kairos（主控台的寫入連線不會讓它誤判）。
+- `storage.backend = "jsonl"` 時不啟動主控台（記 `WARN`）。
+
+### 已知限制
+
+- API 為唯讀；沒有使用者、角色、工作階段（F6）、告警（F3）與網頁介面（F2）。主機狀態只有 `online`、`offline`、`unknown`，`critical`／`warning`／`pending` 的計數為 `null`。其他限制、延後項目與待決定事項見 `kairos/API.md` 第 10 節。
 
 ## [0.3.0] - 〔草稿：發佈日期待定〕
 

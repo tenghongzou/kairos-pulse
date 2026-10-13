@@ -17,6 +17,7 @@
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
+| `API.md` | 644 | 主控台 API（HTTPS，`/api/v1`）：端點、驗證（API token）、即時推送、量測 |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `kairos.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `kairos-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -31,6 +32,7 @@
 | 服務使用者 | `kairos`（系統帳號，不能登入） |
 | 可寫目錄 | `/opt/kairos/data`、`/opt/kairos/logs`（擁有者 `kairos`） |
 | 監聽位址 | `0.0.0.0:8080`（與 Pulse 預設的 `server.port` 相同） |
+| 主控台 API | `127.0.0.1:9443`（預設只綁 loopback；開放給管理網段見第 9.3 節） |
 | 伺服器名稱 | `monitor.example.com`、`10.0.0.5`（換成實際值） |
 | PKI 工作目錄 | `~/kairos-pki`（**放在離線或受保護的管理主機**，不要放在 Kairos 主機上） |
 
@@ -42,6 +44,7 @@
 - 管理主機上的 OpenSSL 3.0 以上（建立 PKI；`openssl version` 確認）
 - 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
 - 防火牆允許 Pulse 連到監聽埠（本例 TCP 8080）
+- 主控台 API（TCP 9443）**只對管理網段開放**：預設只綁 `127.0.0.1`；改為對外位址時以防火牆限制來源（第 9.3 節）。不要對 agent 所在的網段或網際網路開放
 
 ## 2. 下載與驗證
 
@@ -106,7 +109,7 @@ install -d -o kairos -g kairos -m 750 /opt/kairos/data /opt/kairos/logs
 cd ~/kairos-dist/pkg
 install -o root -g root -m 755 kairos /opt/kairos/kairos
 install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL.md \
-  STORAGE.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
+  STORAGE.md API.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
 ## 6. 建立 PKI
@@ -339,7 +342,7 @@ systemctl status kairos --no-pager
 ```bash
 /opt/kairos/kairos --version                 # kairos <版本> (<commit>)
 journalctl -u kairos -n 50 --no-pager        # 啟動日誌
-ss -ltnp | grep kairos                       # 監聽 0.0.0.0:8080
+ss -ltnp | grep kairos                       # 監聽 0.0.0.0:8080 與主控台 127.0.0.1:9443
 tail -n 20 /opt/kairos/logs/kairos-$(date -u +%F).log
 cat /opt/kairos/data/agents.json             # 每 5 秒更新；online 等於已連線的 Pulse 數
 # 主機清冊（SQLite）：Pulse 上線後 30 秒內出現；--offline-for 3d 列出失聯 3 天以上的主機
@@ -354,17 +357,19 @@ sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 [INFO] 已啟用客戶端憑證驗證（mTLS），信任 client-ca.pem，CRL 1 份；agent_id 必須與憑證的 SAN 相符
 [INFO] 已建立資料庫 schema v1                  （第一次啟動時）
 [INFO] SQLite 資料庫 data/kairos.db（schema v1）：主機清冊 0 台、指標序列 0 個
+[INFO] 主控台 API 已啟動，監聽 https://127.0.0.1:9443/api/v1/（連線上限 64，SSE 上限 16，憑證 cert.pem）
 [INFO] Kairos 已啟動，監聽 0.0.0.0:8080（連線上限 1024，…）
 ```
 
 - `systemctl status kairos` 顯示 `(code=exited, status=3)` 且服務停在 `failed`、沒有重試：設定錯誤，用 `journalctl -u kairos -n 30` 看錯誤訊息，修正 `kairos.toml` 後 `systemctl restart kairos`。
 - 顯示 `status=4` 且停在 `failed`：憑證錯誤（伺服器憑證、私鑰、`client-ca.pem`、CRL 讀不到、格式錯誤或憑證與私鑰不成對；常見原因是檔案權限或路徑），錯誤訊息在 `journalctl -u kairos -n 30` 與 `logs/`。修正後 `systemctl restart kairos`。`status=2` 為 `ExecStart` 的命令列參數錯誤。
-- 顯示 `status=11` 並每 5 秒重試：`server.listen` 的連接埠被其他程式佔用（`ss -ltnp | grep :8080` 查看是誰）。
+- 顯示 `status=11` 並每 5 秒重試：`server.listen` 或主控台 `console.listen` 的連接埠被其他程式佔用（`ss -ltnp | grep -E ':8080|:9443'` 查看是誰；日誌為「無法監聽…」或「無法監聽主控台 console.listen …」）。不需要主控台時可在 `kairos.toml` 加上 `[console]` 的 `enabled = false`。
+- 顯示 `status=3` 且日誌有 `KRS-E0202`：`server.listen` 與 `console.listen` 使用同一個位址與連接埠，改其中一個。
 - 啟動失敗並出現 `未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動`：`kairos.toml` 沒有設定 `auth.client_ca`。依第 6、7 節啟用 mTLS。
 - 出現 `未啟用客戶端憑證驗證（auth.client_ca）卻監聽非 loopback 位址 …（auth.allow_unauthenticated = true）` 的 `WARN`：設定了 `auth.allow_unauthenticated = true`，正式環境不可如此。
 - 出現 `CRL … 將在 … 後過期` 或 `伺服器憑證 … 將在 … 後到期` 的 `WARN`（已過期時為 `ERROR`）：依第 10.1、10.3 節更新。
 - 出現 `伺服器私鑰 … 的權限過寬` 的 `WARN`：`key.pem` 讓其他使用者有權限、group 可寫入，或 group 可讀但群組不是 `kairos`。依訊息執行 `chown root:kairos /opt/kairos/key.pem && chmod 640 /opt/kairos/key.pem`。Kairos 在啟動時與熱重載換了私鑰時檢查，只記錄不拒絕啟動。
-- 出現 `可開啟的檔案數上限（RLIMIT_NOFILE soft limit）…` 的 `WARN`：unit 的 `LimitNOFILE` 沒有生效或小於 `server.max_connections` + 64；依訊息中的建議值以 drop-in 調高 `LimitNOFILE`（`systemctl show kairos -p LimitNOFILE` 可確認目前值）。
+- 出現 `可開啟的檔案數上限（RLIMIT_NOFILE soft limit）…` 的 `WARN`：unit 的 `LimitNOFILE` 沒有生效或小於 `server.max_connections` ＋ `console.max_connections`（預設 64）＋ 64；依訊息中的建議值以 drop-in 調高 `LimitNOFILE`（`systemctl show kairos -p LimitNOFILE` 可確認目前值）。
 - 從其他主機確認 TLS 與伺服器憑證：`openssl s_client -connect monitor.example.com:8080 -CAfile ca.pem -servername monitor.example.com </dev/null`（啟用 mTLS 時，沒帶客戶端憑證會在握手後被拒，這是正常的）。
 - Pulse 上線後，`agents.json` 的 `online` 會增加。多台 Pulse 經同一個 NAT 連入時，**以 `agents.json` 作為上線狀態的依據**：日誌的上線／離線事件有節流（見 `README.md`「日誌」）。
 
@@ -374,6 +379,36 @@ Kairos 的日誌同時寫到 stdout 與 `/opt/kairos/logs/kairos-YYYY-MM-DD.log`
 
 - 保留預設：可用 `journalctl -u kairos` 查詢，與 systemd 的啟停紀錄放在一起。
 - 只要檔案一份：以 drop-in 設定 `StandardOutput=null`。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
+
+### 9.3 主控台 API
+
+主控台 API（`API.md`）以 HTTPS 監聽 `console.listen`，預設 `127.0.0.1:9443`，憑證沿用 `cert.pem`／`key.pem`。所有端點都需要 API token：
+
+```bash
+# 建立唯讀 token（stdout 只有 token，只顯示這一次；預設 90 天後到期）
+TOKEN=$(sudo -u kairos /opt/kairos/kairos api-token create --name ops-check --config /opt/kairos/kairos.toml)
+# 在 Kairos 主機上確認（-k：自簽或私有 CA 的憑證；正式使用請以 --cacert 指定 CA）
+curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:9443/api/v1/system/health
+curl -sk -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:9443/api/v1/hosts?status=offline"
+# 列出、撤銷
+sudo -u kairos /opt/kairos/kairos api-token list --config /opt/kairos/kairos.toml
+sudo -u kairos /opt/kairos/kairos api-token revoke <token_id> --reason "確認完畢" --yes --config /opt/kairos/kairos.toml
+```
+
+- 日誌會出現「API token 已建立：token_id …」（10 秒內；不含 token 本身）。
+- **開放給管理網段**：把 `kairos.toml` 的 `[console]` 改為 `listen = "0.0.0.0:9443"` 後重新啟動，並以防火牆**只允許管理網段**連到 9443，例如：
+
+  ```bash
+  # ufw（Ubuntu）
+  ufw allow from 10.0.100.0/24 to any port 9443 proto tcp
+  # firewalld（RHEL）
+  firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="10.0.100.0/24" port port="9443" protocol="tcp" accept'
+  firewall-cmd --reload
+  ```
+
+  agent 連線埠（8080／8443）與主控台分開：agent 所在的網段不需要、也不應該能連到 9443。
+- 瀏覽器或整合要信任主控台的憑證時，建議另外簽發 SAN 為主控台網址的憑證，設定 `console.cert_path`／`console.key_path`（同樣熱重載）。
+- 主控台需要 SQLite（`storage.backend = "sqlite"`，預設）；`backend = "jsonl"` 時不啟動並記 `WARN`。
 
 ## 10. 日常維運
 
@@ -458,6 +493,8 @@ systemctl list-timers kairos-crl.timer
 
 **從 0.2 升級到 0.3：先升級 Kairos，再升級 Pulse**。Pulse 0.3 預設啟用本機緩衝，與 Kairos 0.3 協商 `durable` 後，Kairos 停機或網路中斷期間的取樣會在恢復後補送（at-least-once），Kairos 以唯一索引去重。Kairos 先升級後，Pulse 升級後的第一次斷線就能補送；Pulse 0.2 連 Kairos 0.3 時與 0.2 相同（at-most-once）。Pulse 端要先建立 `buffer/` 目錄並換上新版 unit（Pulse 的 INSTALL 第 10 節）。補送的資料以 Pulse 的取樣時間保存與彙總，`kairos reports export` 的 `ts` 可能比 `recv_at` 早數小時到數天；縮短 `storage.raw_retention_days` 時請一併檢查 Pulse 的 `buffer.max_age_hours`（`STORAGE.md`「保留期限、Pulse 的 buffer.max_age_hours 與去重範圍」）。大量 Pulse 同時恢復連線時的寫入尖峰見 `STORAGE.md`「量測」。
 
+**從 0.3 升級到 0.4：主控台 API 預設監聽 `127.0.0.1:9443`**。升級前確認 9443 沒有被其他程式使用（`ss -ltnp | grep :9443`），否則 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）；被佔用時在 `kairos.toml` 加上 `[console]` 的 `listen`（換連接埠）或 `enabled = false`。資料庫升級到 schema v3（新增 `api_tokens` 與被拒憑證的欄位）：**升級前以 `kairos db backup` 備份**，升級後 0.3 無法開啟。檔案描述元的需要量多了主控台的連線上限（預設 64）；發佈包 unit 的 `LimitNOFILE=8192` 足夠。
+
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
 **從 0.1.x 升級時的順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。**（0.2 → 0.3 見上方，先升級 Kairos。）協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
@@ -489,7 +526,7 @@ cp -p /opt/kairos/kairos /opt/kairos/kairos.prev
 install -o root -g root -m 755 pkg-new/kairos /opt/kairos/kairos.new
 mv /opt/kairos/kairos.new /opt/kairos/kairos
 install -o root -g root -m 644 pkg-new/kairos.example.toml pkg-new/INSTALL.md \
-  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/STORAGE.md pkg-new/CHANGELOG.md \
+  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/STORAGE.md pkg-new/API.md pkg-new/CHANGELOG.md \
   pkg-new/THIRD-PARTY-LICENSES /opt/kairos/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/kairos.service /etc/systemd/system/kairos.service

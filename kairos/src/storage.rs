@@ -465,15 +465,28 @@ pub fn results_after_failure(
 #[derive(Debug, Clone)]
 pub struct ReportSink {
     tx: mpsc::Sender<WriteRequest>,
+    /// 每筆 report 的結果統計（由連線記錄；系統健康的「report 寫入」）
+    stats: Arc<crate::stats::WriteStats>,
 }
 
 /// 建立 report 佇列（容量 `capacity`）
 pub fn report_channel(capacity: usize) -> (ReportSink, mpsc::Receiver<WriteRequest>) {
     let (tx, rx) = mpsc::channel(capacity);
-    (ReportSink { tx }, rx)
+    (
+        ReportSink {
+            tx,
+            stats: Arc::new(crate::stats::WriteStats::new()),
+        },
+        rx,
+    )
 }
 
 impl ReportSink {
+    /// 寫入結果的統計（所有 clone 共用一份）
+    pub fn stats(&self) -> &Arc<crate::stats::WriteStats> {
+        &self.stats
+    }
+
     /// 佇列中尚未被 writer 取出的筆數
     pub fn pending(&self) -> usize {
         self.tx.max_capacity() - self.tx.capacity()

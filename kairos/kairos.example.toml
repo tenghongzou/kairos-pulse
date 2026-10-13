@@ -40,3 +40,11 @@ allow_unauthenticated = false # false：未設定 client_ca 又監聽非 loopbac
 [log]
 level = "info"
 retention_days = 14           # logs/kairos-YYYY-MM-DD.log（UTC 日期）保留天數，0 = 永久保留，上限 3650
+
+[console]                     # 主控台 API（HTTPS，/api/v1，見 API.md）；需要 storage.backend = "sqlite"
+enabled = true                # false：不監聽主控台連接埠
+listen = "127.0.0.1:9443"     # 預設只綁 loopback；開放給管理網段時改成 0.0.0.0:9443，並以防火牆只允許管理網段。不可與 server.listen 相同（KRS-E0202）
+cert_path = ""                # 主控台的伺服器憑證；空字串時沿用 server.cert_path（瀏覽器要信任時建議另設 SAN 為主控台網址的憑證）
+key_path = ""                 # 與 cert_path 同時設定或同時留空；依 server.reload_interval_secs 熱重載
+max_connections = 64          # 主控台的同時連線上限（含 SSE），1..=4096；計入 LimitNOFILE 的需要量（server.max_connections + 此值 + 64）
+max_streams = 16              # 即時推送（SSE，/api/v1/events）的同時連線上限，1..=max_connections

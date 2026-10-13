@@ -942,6 +942,25 @@ fn capacity_limit_deletes_the_oldest_raw_reports_first() {
     while store.maintain() {}
     let after = store.used_bytes().unwrap();
     assert!(after <= cap / 100 * 95, "{after} > {cap}");
+    // KRS-W4202：開始與結束記在 meta.capacity_event（系統健康的「最近一次容量刪除」）
+    let event: CapacityEvent = serde_json::from_str(
+        &store
+            .conn
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_CAPACITY_EVENT],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(event.limit_bytes, cap);
+    assert_eq!(event.started_at, noon().timestamp_millis());
+    assert_eq!(event.ended_at, Some(noon().timestamp_millis()));
+    assert!(event.deleted_raw >= 5000, "{event:?}");
+    assert!(!event.exhausted);
     // 刪除的是最舊的（seq 小的），最新的保留；原始資料還有剩時不刪彙總
     let min_seq = count(&mut store, "SELECT min(seq) FROM reports");
     assert!(min_seq > 0);
