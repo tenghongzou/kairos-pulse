@@ -47,6 +47,7 @@ pulse status — 顯示服務、連線、身分與回報狀態
       --watch [秒]         每 N 秒（預設 2）重新顯示；按 Ctrl+C 結束
       --exit-codes=nagios  使用 Nagios 慣例的結束代碼（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN）並輸出單行
   -c, --config <路徑>      pulse.toml 的位置（狀態檔等相對路徑以它所在的目錄解析）
+      --instance <N>       多實例 N（讀取 /var/lib/pulse/N/status.json 與 pulse-N.service）
       --color <模式>       auto（預設）、always、never；也會遵守 NO_COLOR
       --no-color           同 --color never
       --ascii              不使用 Unicode 符號（也可設定 PULSE_SYMBOLS=ascii）
@@ -82,6 +83,8 @@ pub struct StatusArgs {
     /// `--exit-codes=nagios`
     pub nagios: bool,
     pub config: Option<String>,
+    /// `--instance <N>`：多實例 N（狀態檔 `/var/lib/pulse/N/status.json`）
+    pub instance: Option<u32>,
     pub color: Color,
     pub ascii: bool,
     pub quiet: bool,
@@ -233,6 +236,17 @@ fn parse_status(args: &[String]) -> Result<Command, UsageError> {
                 }
             },
             "-c" | "--config" => s.config = Some(value("設定檔路徑")?),
+            "--instance" => {
+                let v = value("實例編號")?;
+                match v.parse::<u32>() {
+                    Ok(n @ 1..=999) => s.instance = Some(n),
+                    _ => {
+                        return err(format!(
+                            "PLS-E0002：--instance 必須是 1～999 的整數（目前為「{v}」）"
+                        ));
+                    }
+                }
+            }
             "--color" => {
                 s.color = match value("模式（auto、always、never）")?.as_str() {
                     "auto" => Color::Auto,
@@ -388,6 +402,8 @@ mod tests {
             status(&["status", "--config=x.toml"]).config.as_deref(),
             Some("x.toml")
         );
+        assert_eq!(status(&["status", "--instance", "2"]).instance, Some(2));
+        assert!(err(&["status", "--instance", "0"]).contains("PLS-E0002"));
         assert_eq!(status(&["status", "--no-color"]).color, Color::Never);
         assert_eq!(
             status(&["status", "--color", "always"]).color,

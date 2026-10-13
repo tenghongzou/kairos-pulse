@@ -207,7 +207,8 @@ pub fn once(args: &StatusArgs) -> Output {
     // 狀態檔：status.file 未設定時讀設計包的位置，沿用舊 unit 的服務改寫在 logs/status.json（兩者都有時取較新的）
     let (primary, fallback) = match config.status.file.trim() {
         "" => (
-            sf::default_path(),
+            args.instance
+                .map_or_else(sf::default_path, sf::instance_path),
             Some(located.base.join(sf::LEGACY_RELATIVE)),
         ),
         file => (located.base.join(file), None),
@@ -228,8 +229,16 @@ pub fn once(args: &StatusArgs) -> Output {
         _ => None,
     };
 
-    // 服務管理員與行程
-    let unit_hint = file_ref.and_then(|f| f.service.unit.clone());
+    // 服務管理員與行程（還沒有狀態檔時，多實例 N 的 unit 為 pulse-N.service）
+    let unit_hint = file_ref.and_then(|f| f.service.unit.clone()).or_else(|| {
+        args.instance.map(|n| {
+            if cfg!(windows) {
+                format!("Pulse-{n}")
+            } else {
+                format!("pulse-{n}.service")
+            }
+        })
+    });
     let service = service::query(unit_hint.as_deref());
     let pid_alive = file_ref
         .filter(|f| f.running)

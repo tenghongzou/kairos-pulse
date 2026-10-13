@@ -539,6 +539,24 @@ mod win {
     }
 }
 
+/// systemd 設定的 `STATE_DIRECTORY`（可能以 `:` 分隔多個）的第一個絕對路徑
+pub fn state_directory(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let text = value?.to_str()?;
+    let first = text.split(':').next()?.trim();
+    let path = std::path::Path::new(first);
+    (!first.is_empty() && path.is_absolute()).then(|| path.to_path_buf())
+}
+
+/// 多實例 N 的預設位置（`cli-spec.md` §2.3：`/var/lib/pulse/N/`）
+pub fn instance_path(n: u32) -> std::path::PathBuf {
+    let default = default_path();
+    let dir = default
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    dir.join(n.to_string()).join("status.json")
+}
+
 /// 讀取狀態檔時的問題
 #[derive(Debug)]
 pub enum ReadError {
@@ -683,6 +701,29 @@ mod tests {
         } else {
             assert_eq!(p, std::path::Path::new("/var/lib/pulse/status.json"));
         }
+    }
+
+    #[test]
+    fn instance_and_state_directory_locations() {
+        let default = default_path();
+        let parent = default.parent().unwrap();
+        assert_eq!(instance_path(2), parent.join("2").join("status.json"));
+        if cfg!(unix) {
+            assert_eq!(
+                state_directory(Some(std::ffi::OsStr::new("/var/lib/pulse/2"))),
+                Some(std::path::PathBuf::from("/var/lib/pulse/2"))
+            );
+            assert_eq!(
+                state_directory(Some(std::ffi::OsStr::new("/var/lib/pulse:/var/lib/x"))),
+                Some(std::path::PathBuf::from("/var/lib/pulse"))
+            );
+            assert_eq!(
+                state_directory(Some(std::ffi::OsStr::new("relative"))),
+                None
+            );
+        }
+        assert_eq!(state_directory(Some(std::ffi::OsStr::new(""))), None);
+        assert_eq!(state_directory(None), None);
     }
 
     #[cfg(windows)]

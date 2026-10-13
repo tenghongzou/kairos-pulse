@@ -249,9 +249,11 @@ fn config_warnings(config: &AppConfig) -> Vec<status_file::CodeNote> {
 fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Tracker {
     let base = cwd.map(Path::to_path_buf).unwrap_or_default();
     // status.file 未設定：設計包的位置（/var/lib/pulse、%ProgramData%\Pulse），無法寫入時改寫 logs/
+    // systemd 的 StateDirectory=（多實例為 pulse/N）會設定 STATE_DIRECTORY，優先使用
     let (path, fallback) = match config.status.file.trim() {
         "" => (
-            status_file::default_path(),
+            status_file::state_directory(std::env::var_os("STATE_DIRECTORY").as_deref())
+                .map_or_else(status_file::default_path, |d| d.join("status.json")),
             Some(base.join(status_file::LEGACY_RELATIVE)),
         ),
         file => (base.join(file), None),
