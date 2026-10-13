@@ -18,9 +18,13 @@ use serde_json::Value;
 
 /// 執行 `pulse status <args>`，回傳結束代碼、stdout、stderr
 fn status(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    status_env(dir, args, &[])
+}
+
+fn status_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let mut all = vec!["status"];
     all.extend_from_slice(args);
-    let (code, p) = run_to_exit("pulse", dir, &all, &[]);
+    let (code, p) = run_to_exit("pulse", dir, &all, envs);
     (code, p.stdout(), p.stderr())
 }
 
@@ -239,8 +243,13 @@ fn status_follows_kairos_outage_and_pulse_exit() {
         err.contains(&format!("Pulse（PID {pid}）已結束，結束代碼 0")),
         "{err}"
     );
-    // 狀態檔：0640、最後一份記下結束代碼
-    let file = pulse.dir.join("logs").join("status.json");
+    // 狀態檔：所有人可讀（0644）、最後一份記下結束代碼；不含私鑰與 token
+    let file = pulse.dir.join("state").join("status.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        !text.contains("PRIVATE KEY") && !text.contains("client.key"),
+        "{text}"
+    );
     let raw: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(raw["schema"], "pulse.status-file/v1");
     assert_eq!(raw["running"], false);
@@ -249,15 +258,66 @@ fn status_follows_kairos_outage_and_pulse_exit() {
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode & 0o007, 0, "狀態檔不可給其他使用者：{mode:o}");
+        assert_eq!(mode, 0o644, "狀態檔應所有人可讀：{mode:o}");
+        let dir_mode = std::fs::metadata(file.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o755, "{dir_mode:o}");
     }
+    assert!(!pulse.dir.join("logs").join("status.json").exists());
     // 暫存檔不會留下
-    let leftovers: Vec<String> = std::fs::read_dir(pulse.dir.join("logs"))
+    let leftovers: Vec<String> = std::fs::read_dir(pulse.dir.join("state"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn unwritable_default_location_falls_back_to_logs() {
+    // status.file 未設定：預設位置 /var/lib/pulse 對測試帳號不可寫（相當於沿用沒有 StateDirectory= 的舊 unit），
+    // Pulse 照常執行，狀態檔改寫在 logs/status.json，pulse status 顯示設定警告（PLS-E8204）
+    if cfg!(not(unix))
+        || std::path::Path::new("/var/lib/pulse").exists()
+        || std::fs::create_dir("/var/lib/.pulse-e2e-probe").is_ok()
+    {
+        let _ = std::fs::remove_dir("/var/lib/.pulse-e2e-probe");
+        eprintln!("略過：/var/lib 可寫或已有 /var/lib/pulse");
+        return;
+    }
+    let root = TestDir::new("status-fallback");
+    let kairos = Kairos::new(&root, test_pki::CRL_EMPTY);
+    let pulse = Pulse::new(&root, "pulse", kairos.port, GOOD);
+    restrict_identity_files(&pulse.dir);
+    let env = [("PULSE__STATUS__FILE", "")];
+    let _k = kairos.start();
+    let mut p = pulse.start(&env);
+    p.wait_for(PULSE_REGISTERED, WAIT);
+    let mut last = (0, String::new(), String::new());
+    let ok = poll_until(WAIT, || {
+        last = status_env(&pulse.dir, &["--json"], &env);
+        last.0 == 8
+    });
+    assert!(ok, "{last:?}\n{}", p.dump());
+    let doc: Value = serde_json::from_str(&last.1).unwrap();
+    let d = &doc["data"];
+    assert_eq!(d["status"], "warning", "{doc:#}");
+    assert!(
+        d["status_file"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("logs/status.json"),
+        "{doc:#}"
+    );
+    assert_eq!(d["checks"][4]["id"], "config", "{doc:#}");
+    assert_eq!(d["checks"][4]["code"], "PLS-E8204", "{doc:#}");
+    assert!(p.is_running(), "{}", p.dump());
+    assert_eq!(p.count("status.write_failed PLS-E8204"), 1, "{}", p.dump());
+    let (code, _) = p.stop();
+    assert_eq!(code, 0, "{}", p.dump());
 }
 
 #[test]

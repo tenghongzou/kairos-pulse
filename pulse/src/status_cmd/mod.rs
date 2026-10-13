@@ -116,9 +116,12 @@ pub fn locate(explicit: Option<&Path>, cwd: &Path, exe_dir: Option<&Path>) -> Lo
             };
         }
     }
-    let default_status = AppConfig::defaults().status.file;
+    // 沒有 pulse.toml：執行檔所在目錄有舊位置的狀態檔（logs/status.json）時以它為準
     let base = match exe_dir {
-        Some(exe) if !cwd.join(&default_status).exists() && exe.join(&default_status).exists() => {
+        Some(exe)
+            if !cwd.join(sf::LEGACY_RELATIVE).exists()
+                && exe.join(sf::LEGACY_RELATIVE).exists() =>
+        {
             exe.to_path_buf()
         }
         _ => cwd.to_path_buf(),
@@ -201,11 +204,17 @@ pub fn once(args: &StatusArgs) -> Output {
         },
         None => AppConfig::defaults(),
     };
-    let status_path = located.base.join(config.status.file.trim());
+    // 狀態檔：status.file 未設定時讀設計包的位置，沿用舊 unit 的服務改寫在 logs/status.json（兩者都有時取較新的）
+    let (primary, fallback) = match config.status.file.trim() {
+        "" => (
+            sf::default_path(),
+            Some(located.base.join(sf::LEGACY_RELATIVE)),
+        ),
+        file => (located.base.join(file), None),
+    };
+    let (status_path, read) = choose_status_file(&primary, fallback.as_deref());
     let status_text = status_path.display().to_string();
-
-    // 狀態檔
-    let file = match sf::read(&status_path) {
+    let file = match read {
         Ok(f) => FileState::Ok(Box::new(f)),
         Err(ReadError::Missing) => FileState::Missing,
         Err(ReadError::Invalid(e)) => FileState::Invalid(one_line(&e)),
@@ -286,6 +295,39 @@ pub fn once(args: &StatusArgs) -> Output {
     }
 }
 
+/// 從設計包的位置與備用位置（舊 unit 時的 `logs/status.json`）選出要讀的狀態檔：
+/// 都讀得到時取較新的；只有一個讀得到時用它；都讀不到時回報預設位置的問題
+/// （預設位置不存在、備用位置沒有權限時回報備用位置的權限問題）
+pub fn choose_status_file(
+    primary: &Path,
+    fallback: Option<&Path>,
+) -> (PathBuf, Result<sf::StatusFile, ReadError>) {
+    let first = sf::read(primary);
+    let Some(fb) = fallback else {
+        return (primary.to_path_buf(), first);
+    };
+    let second = sf::read(fb);
+    let newer = |a: &sf::StatusFile, b: &sf::StatusFile| {
+        sf::parse_ts(&a.updated_at) >= sf::parse_ts(&b.updated_at)
+    };
+    match (first, second) {
+        (Ok(a), Ok(b)) => {
+            if newer(&a, &b) {
+                (primary.to_path_buf(), Ok(a))
+            } else {
+                (fb.to_path_buf(), Ok(b))
+            }
+        }
+        (Ok(a), _) => (primary.to_path_buf(), Ok(a)),
+        (_, Ok(b)) => (fb.to_path_buf(), Ok(b)),
+        (Err(ReadError::Missing), Err(ReadError::Missing)) => {
+            (primary.to_path_buf(), Err(ReadError::Missing))
+        }
+        (Err(ReadError::Missing), other) => (fb.to_path_buf(), other),
+        (other, _) => (primary.to_path_buf(), other),
+    }
+}
+
 /// 沒有權限讀取狀態檔：命令本身無法完成（結束代碼 10）
 fn permission_denied(
     args: &StatusArgs,
@@ -295,9 +337,11 @@ fn permission_denied(
     now: chrono::DateTime<Utc>,
 ) -> Output {
     let fix = if cfg!(windows) {
-        "以系統管理員身分執行，或請管理者讓這個帳號可以讀取狀態檔所在的目錄。".to_string()
+        "以系統管理員身分執行；或請管理者確認 Pulse 寫在 %ProgramData%\\Pulse\\status.json（Users 可讀）。"
+            .to_string()
     } else {
-        "以 root（sudo pulse status）或服務帳號群組（pulse）的成員執行；或請管理者把這個帳號加入該群組。"
+        "以 root（sudo pulse status）執行；或請管理者換上新版 pulse.service（StateDirectory=pulse），\
+         讓狀態檔寫到所有人可讀的 /var/lib/pulse/status.json（INSTALL.md 第 10 節）。"
             .to_string()
     };
     let issue = issues::Issue {
@@ -305,7 +349,7 @@ fn permission_denied(
         severity: issues::Severity::Error,
         title: "無法讀取狀態檔：權限不足".to_string(),
         cause: vec![format!(
-            "沒有權限讀取 {path}（{}）。狀態檔與日誌目錄只有服務帳號與其群組可讀。",
+            "沒有權限讀取 {path}（{}）。服務沿用舊的設定時，狀態檔寫在日誌目錄，只有服務帳號與其群組可讀。",
             one_line(&e.to_string())
         )],
         fix_intro: Some(fix),
@@ -409,6 +453,38 @@ mod tests {
         for d in [cwd, exe, other] {
             std::fs::remove_dir_all(d).unwrap();
         }
+    }
+
+    #[test]
+    fn status_file_is_read_from_the_newer_location() {
+        let dir = temp_dir("choose");
+        let primary = dir.join("state").join("status.json");
+        let fallback = dir.join("logs").join("status.json");
+        // 都沒有：回報預設位置不存在
+        let (p, r) = choose_status_file(&primary, Some(&fallback));
+        assert_eq!(p, primary);
+        assert!(matches!(r, Err(ReadError::Missing)));
+        let write = |path: &Path, at: &str, pid: u32| {
+            let f = sf::StatusFile {
+                schema: sf::SCHEMA.into(),
+                updated_at: at.into(),
+                pid,
+                ..sf::StatusFile::default()
+            };
+            sf::write_atomically(path, &serde_json::to_vec(&f).unwrap()).unwrap();
+        };
+        // 只有備用位置（舊 unit）
+        write(&fallback, "2026-10-09T06:35:00.000Z", 1);
+        let (p, r) = choose_status_file(&primary, Some(&fallback));
+        assert_eq!((p, r.unwrap().pid), (fallback.clone(), 1));
+        // 換上新 unit 後兩者都有：取較新的
+        write(&primary, "2026-10-09T06:36:00.000Z", 2);
+        let (p, r) = choose_status_file(&primary, Some(&fallback));
+        assert_eq!((p, r.unwrap().pid), (primary.clone(), 2));
+        // 指定了 status.file：只讀它
+        let (p, _) = choose_status_file(&fallback, None);
+        assert_eq!(p, fallback);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

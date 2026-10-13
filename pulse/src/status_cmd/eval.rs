@@ -182,6 +182,8 @@ pub struct Report {
     pub commit: String,
     pub hostname: String,
     pub agent_id: Option<String>,
+    /// 未啟用 mTLS，狀態檔刻意不含 agent_id（而這個帳號也讀不到 agent.id）
+    pub agent_id_hidden: bool,
     pub rows: Vec<Row>,
     pub issues: Vec<Issue>,
     pub brief: String,
@@ -759,6 +761,7 @@ pub fn evaluate(input: &Input) -> Report {
         version,
         commit,
         hostname,
+        agent_id_hidden: agent_id.is_none() && file.is_some_and(|f| f.agent_id_hidden),
         agent_id,
         rows,
         issues,
@@ -1315,6 +1318,7 @@ fn config_row(
     }
     let codes_list: Vec<&str> = warnings.iter().map(|w| w.code.as_str()).collect();
     let first_code = [
+        codes::E_STATUS_UNWRITABLE,
         codes::W_TLS_VERIFY_DISABLED,
         codes::W_BOTH_TRUST_STORES,
         codes::W_SYSTEM32_WORKDIR,

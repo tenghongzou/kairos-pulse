@@ -651,6 +651,46 @@ fn stale_status_file_is_unknown() {
 }
 
 #[test]
+fn agent_id_hidden_without_mtls() {
+    // 未啟用 mTLS：狀態檔不含 agent_id，讀不到 agent.id 的帳號看到「不顯示」
+    let mut f = base_file();
+    f.agent_id = None;
+    f.agent_id_hidden = true;
+    let mut inp = input(f);
+    inp.agent_id = None;
+    let report = eval::evaluate(&inp);
+    assert!(
+        render::rows(&report, &unicode())
+            .starts_with("Pulse 0.2.0 (a67c715) · plc-hmi-07 · agent_id （未啟用 mTLS，不顯示）\n")
+    );
+    // root 讀得到 agent.id 時照常顯示
+    let mut f = base_file();
+    f.agent_id = None;
+    f.agent_id_hidden = true;
+    let report = eval::evaluate(&input(f));
+    assert_eq!(report.agent_id.as_deref(), Some(AG));
+}
+
+#[test]
+fn status_file_fallback_is_a_config_warning() {
+    // 沿用舊 unit：狀態檔改寫在 logs/（PLS-E8204），設定列警告、結束代碼 8
+    let mut f = base_file();
+    f.config.warnings = vec![sf::CodeNote::new(
+        "PLS-E8204",
+        "無法寫入 /var/lib/pulse/status.json（Read-only file system (os error 30)），改寫在 /opt/pulse/logs/status.json",
+    )];
+    let report = eval::evaluate(&input(f));
+    let rows = render::rows(&report, &unicode());
+    assert!(
+        rows.contains("⚠ 警告 設定   /etc/pulse/pulse.toml：無法寫入狀態檔（PLS-E8204）"),
+        "{rows}"
+    );
+    assert_eq!(report.status.exit_code(), 8);
+    let issues = render::issues(&report, &unicode(), false, false);
+    assert!(issues.contains("StateDirectory=pulse"), "{issues}");
+}
+
+#[test]
 fn not_installed_and_foreground_runs() {
     // 沒有服務、沒有狀態檔：未安裝
     let mut inp = input(base_file());

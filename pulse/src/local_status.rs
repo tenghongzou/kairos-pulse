@@ -10,7 +10,7 @@
 //! 多數寫入在作業系統的快取中合併；比本機緩衝每 5 秒一筆取樣（不 fsync，每 10 秒 fsync 一次）小。
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,8 @@ pub struct State {
     buffer_error: Option<String>,
     retry: Option<(DateTime<Utc>, &'static str)>,
     changed: bool,
+    /// 不寫入狀態檔的 agent_id（未啟用 mTLS 時）
+    secret_id: Option<String>,
 }
 
 /// 註冊成功時的資訊
@@ -105,6 +107,7 @@ impl State {
             buffer_error: None,
             retry: None,
             changed: true,
+            secret_id: None,
         }
     }
 
@@ -293,8 +296,17 @@ impl State {
         self.changed = true;
     }
 
+    /// 記下 agent_id 與主機名稱。未啟用 mTLS 時 agent_id 就是身分憑據（README「agent.id」），
+    /// 而狀態檔所有人可讀：不寫入狀態檔，其他欄位中出現的 agent_id 也換成 `<agent_id>`
+    /// （呼叫前須已呼叫 [`State::set_client_cert`]）
     pub fn set_identity(&mut self, agent_id: &str, hostname: &str) {
-        self.file.agent_id = Some(agent_id.to_string());
+        if self.file.connection.mtls {
+            self.file.agent_id = Some(agent_id.to_string());
+        } else {
+            self.file.agent_id = None;
+            self.file.agent_id_hidden = true;
+            self.secret_id = Some(agent_id.to_string());
+        }
         self.file.hostname = Some(hostname.to_string());
         self.changed = true;
     }
@@ -460,31 +472,55 @@ fn buffer_snapshot(
 }
 
 /// 追蹤器：狀態、寫出的位置與本機緩衝
+/// 寫出的狀態（寫出時持有鎖，寫入依序進行）
+#[derive(Debug, Default)]
+struct WriteState {
+    /// 已寫出結束前的最後一份：之後的定期寫入不再覆寫
+    finalized: bool,
+    /// 預設位置無法寫入，本次執行改寫在備用位置
+    using_fallback: bool,
+    /// 已處理過備用位置上遺留的舊檔
+    fallback_cleaned: bool,
+}
+
 #[derive(Debug)]
 pub struct Tracker {
     state: Mutex<State>,
     changed: Notify,
+    /// 狀態檔的位置
     path: PathBuf,
+    /// 預設位置無法寫入時改寫的位置（`status.file` 未設定時為工作目錄的 `logs/status.json`）
+    fallback: Option<PathBuf>,
     spool: Mutex<Option<Arc<SharedSpool>>>,
     buffer: BufferSettings,
-    /// 寫出時持有（寫入依序進行）；`true` 表示已寫出結束前的最後一份，之後的定期寫入不再覆寫
-    finalized: Mutex<bool>,
+    writes: Mutex<WriteState>,
 }
 
 impl Tracker {
-    pub fn new(path: PathBuf, base: StatusFile, buffer: BufferSettings) -> Self {
+    pub fn new(
+        path: PathBuf,
+        fallback: Option<PathBuf>,
+        base: StatusFile,
+        buffer: BufferSettings,
+    ) -> Self {
         Self {
             state: Mutex::new(State::new(base)),
             changed: Notify::new(),
             path,
+            fallback,
             spool: Mutex::new(None),
             buffer,
-            finalized: Mutex::new(false),
+            writes: Mutex::new(WriteState::default()),
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// 目前寫出的位置（改寫在備用位置時為備用位置）
+    pub fn path(&self) -> PathBuf {
+        let writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        match &self.fallback {
+            Some(fb) if writes.using_fallback => fb.clone(),
+            _ => self.path.clone(),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -516,18 +552,61 @@ impl Tracker {
 
     /// 寫出一次；回傳寫入結果。已寫出結束前的最後一份時不再寫
     pub fn write(&self) -> std::io::Result<()> {
-        let finalized = self.finalized.lock().unwrap_or_else(|e| e.into_inner());
-        if *finalized {
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        if writes.finalized {
             return Ok(());
         }
-        self.write_locked()
+        self.write_locked(&mut writes)
     }
 
-    fn write_locked(&self) -> std::io::Result<()> {
+    /// 寫出的內容：未啟用 mTLS 時，任何欄位中出現的 agent_id 都換成 `<agent_id>`
+    fn render(&self) -> std::io::Result<Vec<u8>> {
         let file = self.snapshot();
-        let mut json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?;
-        json.push(b'\n');
-        sf::write_atomically(&self.path, &json)
+        let mut json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
+        let secret = self.lock().secret_id.clone();
+        if let Some(id) = secret.filter(|id| !id.is_empty()) {
+            json = json.replace(&id, "<agent_id>");
+        }
+        json.push('\n');
+        Ok(json.into_bytes())
+    }
+
+    fn write_locked(&self, writes: &mut WriteState) -> std::io::Result<()> {
+        if !writes.using_fallback {
+            match sf::write_atomically(&self.path, &self.render()?) {
+                Ok(()) => {
+                    // 換上新版 unit 之後：刪除備用位置上的舊檔，避免 pulse status 讀到過時的狀態
+                    if !writes.fallback_cleaned {
+                        writes.fallback_cleaned = true;
+                        if let Some(fb) = &self.fallback {
+                            let _ = std::fs::remove_file(fb);
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let Some(fb) = &self.fallback else {
+                        return Err(e);
+                    };
+                    writes.using_fallback = true;
+                    let msg = format!(
+                        "無法寫入 {}（{e}），改寫在 {}；一般使用者無法執行 pulse status。\
+                         請換上新版 pulse.service（StateDirectory=pulse）後重新啟動",
+                        self.path.display(),
+                        fb.display()
+                    );
+                    log::warn!(
+                        "{}{msg}",
+                        codes::tag(codes::STATUS_WRITE_FAILED, Some(codes::E_STATUS_UNWRITABLE))
+                    );
+                    self.update(|s| {
+                        s.add_config_warning(CodeNote::new(codes::E_STATUS_UNWRITABLE, msg));
+                    });
+                }
+            }
+        }
+        let fb = self.fallback.as_ref().unwrap_or(&self.path);
+        sf::write_atomically(fb, &self.render()?)
     }
 
     /// 結束前最後一次寫入：記錄結束時間與結束代碼（`pulse status` 顯示「上次結束」）
@@ -539,11 +618,11 @@ impl Tracker {
             s.file.exit_message = message.map(|m| m.replace(['\r', '\n'], " "));
             s.file.connection.next_retry_at = None;
         });
-        let mut finalized = self.finalized.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = self.write_locked() {
+        let mut writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = self.write_locked(&mut writes) {
             log::debug!("結束時無法寫入狀態檔 {}：{e}", self.path.display());
         }
-        *finalized = true;
+        writes.finalized = true;
     }
 }
 
@@ -690,10 +769,12 @@ pub async fn run_writer(tracker: Arc<Tracker>, shutdown: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn tracker(dir: &Path) -> Tracker {
         Tracker::new(
             dir.join("status.json"),
+            None,
             initial_file(
                 None,
                 Some("/opt/pulse/pulse.toml".into()),
@@ -860,15 +941,107 @@ mod tests {
         let dir = temp_dir();
         let t = tracker(&dir);
         t.write().unwrap();
-        let f = sf::read(t.path()).unwrap();
+        let f = sf::read(&t.path()).unwrap();
         assert!(f.running);
         assert_eq!(f.pid, std::process::id());
         assert_eq!(f.starts_1h.len(), 1);
         t.write_final(3, Some("設定錯誤\n第 4 行"));
-        let f = sf::read(t.path()).unwrap();
+        let f = sf::read(&t.path()).unwrap();
         assert!(!f.running);
         assert_eq!(f.exit_code, Some(3));
         assert_eq!(f.exit_message.as_deref(), Some("設定錯誤 第 4 行"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unwritable_default_location_falls_back_to_logs() {
+        // 沿用舊 unit（/var/lib/pulse 不可寫）：改寫在 logs/status.json，服務照常，並記 PLS-E8204
+        let dir = temp_dir();
+        std::fs::write(dir.join("not-a-dir"), b"x").unwrap();
+        let fallback = dir.join("logs").join("status.json");
+        let t = Tracker::new(
+            dir.join("not-a-dir").join("status.json"),
+            Some(fallback.clone()),
+            initial_file(None, None, None, Duration::from_secs(5), "a:1".into(), None),
+            BufferSettings::default(),
+        );
+        t.write().unwrap();
+        assert_eq!(t.path(), fallback);
+        let f = sf::read(&fallback).unwrap();
+        assert_eq!(f.config.warnings.len(), 1, "{:?}", f.config.warnings);
+        assert_eq!(f.config.warnings[0].code, "PLS-E8204");
+        assert!(
+            f.config.warnings[0]
+                .message
+                .contains("StateDirectory=pulse")
+        );
+        // 之後的寫入直接寫備用位置，不重複警告
+        t.write().unwrap();
+        assert_eq!(sf::read(&fallback).unwrap().config.warnings.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writable_default_location_removes_the_old_fallback_file() {
+        // 換上新版 unit 後：備用位置留下的舊檔刪除，pulse status 不會讀到過時的狀態
+        let dir = temp_dir();
+        let fallback = dir.join("logs").join("status.json");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, b"{}").unwrap();
+        let primary = dir.join("state").join("status.json");
+        let t = Tracker::new(
+            primary.clone(),
+            Some(fallback.clone()),
+            initial_file(None, None, None, Duration::from_secs(5), "a:1".into(), None),
+            BufferSettings::default(),
+        );
+        t.write().unwrap();
+        assert_eq!(t.path(), primary);
+        assert!(sf::read(&primary).unwrap().config.warnings.is_empty());
+        assert!(!fallback.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn agent_id_is_not_written_without_mtls() {
+        // 未啟用 mTLS 時 agent_id 等同身分憑據，狀態檔所有人可讀：任何欄位都不出現
+        const ID: &str = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        let dir = temp_dir();
+        let t = tracker(&dir);
+        t.update(|s| s.set_identity(ID, "web-01"));
+        t.update(|s| {
+            s.disconnected(Disconnected {
+                code: Some(codes::E_AGENT_ID_CONFLICT),
+                message: format!("superseded：agent_id {ID} 被取代"),
+                attention: true,
+                consecutive_failures: 2,
+                retry_in: Duration::from_secs(30),
+            })
+        });
+        t.write().unwrap();
+        let text = std::fs::read_to_string(t.path()).unwrap();
+        assert!(!text.contains(ID), "{text}");
+        let f = sf::read(&t.path()).unwrap();
+        assert_eq!(f.agent_id, None);
+        assert!(f.agent_id_hidden);
+        assert!(f.connection.last_error.unwrap().contains("<agent_id>"));
+        assert_eq!(f.hostname.as_deref(), Some("web-01"));
+
+        // 啟用 mTLS（身分由憑證與私鑰保護）：照常寫入
+        let t = tracker(&dir);
+        t.update(|s| {
+            s.set_client_cert(crate::tls::ClientCertInfo {
+                path: "client.pem".into(),
+                serial: Some("10:02".into()),
+                not_before: None,
+                not_after: None,
+            })
+        });
+        t.update(|s| s.set_identity(ID, "web-01"));
+        t.write().unwrap();
+        let f = sf::read(&t.path()).unwrap();
+        assert_eq!(f.agent_id.as_deref(), Some(ID));
+        assert!(!f.agent_id_hidden);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

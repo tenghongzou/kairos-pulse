@@ -5,8 +5,15 @@
 //!   **不 fsync**：狀態檔只描述「現在」，斷電後下一次寫入（10 秒內）就會更新；每 10 秒 fsync
 //!   一次在 eMMC／SD 卡的工控主機上是不必要的磨耗。斷電後少數檔案系統可能留下空檔，讀取端視同無法解析
 //!   （本機狀態「未知」，服務啟動 10 秒內恢復）。
-//! - **權限**：Unix 上以 0640 建立（S3 的規則，不依賴 umask；與日誌目錄相同，服務帳號的群組可讀）；
-//!   Windows 繼承所在目錄的 ACL。內容不含任何秘密（私鑰、token、伺服器送來的未清理文字都不寫入）。
+//! - **位置**（`cli-spec.md` §4.1）：`status.file` 未設定時，Linux 等為 `/var/lib/pulse/status.json`
+//!   （systemd unit 的 `StateDirectory=pulse`），Windows 為 `%ProgramData%\Pulse\status.json`。
+//!   無法寫入（例如沿用沒有 `StateDirectory=` 的舊 unit）時，改寫在工作目錄的 `logs/status.json`
+//!   （[`LEGACY_RELATIVE`]），並在狀態中記 `PLS-E8204`，服務照常執行。
+//! - **權限**：所有人可讀，`pulse status` 不需要 root。Unix 上檔案 0644、自行建立的目錄 0755，
+//!   以 `set_permissions` 明確設定（unit 的 `UMask=0077` 會把建立時的權限位元拿掉）；Windows 在檔案上
+//!   另外授予 BUILTIN\Users 讀取（目錄被管理者收緊時仍可讀）。
+//! - **不含秘密**：私鑰、token、伺服器送來的未清理文字都不寫入；未啟用 mTLS 時 agent_id 就是身分憑據，
+//!   不寫入（見 `local_status`）。
 //! - **過時判斷**：寫入時記錄單調時鐘（Linux `/proc/uptime`、Windows `GetTickCount64`，開機後經過的時間），
 //!   讀取端以同一個時鐘相減，不受系統時間調整或與 Kairos 的時鐘偏差影響（`cli-spec.md` §1.5）；
 //!   取不到單調時鐘的平台退回比較牆鐘時間。
@@ -33,12 +40,31 @@ pub const STALE_AFTER: Duration = Duration::from_secs(60);
 /// 狀態檔大小上限：正常約 3～5 KB；超過時讀取端拒絕解析（避免被換成大檔案時整個讀進記憶體）
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Unix 上建立的狀態檔權限（S3）
+/// Unix 上的狀態檔權限：所有人可讀（`cli-spec.md` §4.1）
 #[cfg_attr(not(unix), allow(dead_code))]
-const FILE_MODE: u32 = 0o640;
-/// Unix 上建立狀態檔所在目錄時的權限（與日誌、緩衝目錄相同）
+const FILE_MODE: u32 = 0o644;
+/// Unix 上自行建立狀態檔所在目錄時的權限（與 unit 的 `StateDirectoryMode=0755` 相同）
 #[cfg_attr(not(unix), allow(dead_code))]
-const DIR_MODE: u32 = 0o750;
+const DIR_MODE: u32 = 0o755;
+
+/// 無法寫入預設位置時改寫的位置（相對於工作目錄；0.4 草稿之前的位置）
+pub const LEGACY_RELATIVE: &str = "logs/status.json";
+
+/// `status.file` 未設定時的位置：Linux 等 `/var/lib/pulse/status.json`；
+/// Windows `%ProgramData%\Pulse\status.json`（取不到環境變數時為 `C:\ProgramData`）
+pub fn default_path() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let base = std::env::var_os("ProgramData")
+            .filter(|v| !v.is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from(r"C:\ProgramData"),
+                std::path::PathBuf::from,
+            );
+        base.join("Pulse").join("status.json")
+    } else {
+        std::path::PathBuf::from("/var/lib/pulse/status.json")
+    }
+}
 
 /// RFC 3339 UTC 毫秒（`2026-10-09T06:35:02.418Z`），`--json` 與狀態檔共用
 pub fn ts(t: DateTime<Utc>) -> String {
@@ -91,7 +117,9 @@ pub struct StatusFile {
     pub exit_message: Option<String>,
     pub version: String,
     pub commit: String,
+    /// 未啟用 mTLS 時不寫（agent_id 等同身分憑據，而狀態檔所有人可讀），並設 `agent_id_hidden`
     pub agent_id: Option<String>,
+    pub agent_id_hidden: bool,
     pub hostname: Option<String>,
     pub display_name: Option<String>,
     pub working_dir: Option<String>,
@@ -307,14 +335,13 @@ pub fn write_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     if !dir.is_dir() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
+        fs::DirBuilder::new().recursive(true).create(dir)?;
+        // 建立時的權限受 umask 影響（unit 的 UMask=0077），另外明確設定
         #[cfg(unix)]
         {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(DIR_MODE);
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE))?;
         }
-        builder.create(dir)?;
     }
     let name = path
         .file_name()
@@ -330,14 +357,186 @@ pub fn write_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
             options.mode(FILE_MODE);
         }
         let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
+        }
         file.write_all(content)?;
         drop(file);
+        // 改名不改變檔案的 ACL：在暫存檔上授權，取代後的檔案就是一般使用者可讀
+        #[cfg(windows)]
+        if let Err(e) = win::grant_users_read(&tmp) {
+            log::debug!("無法讓一般使用者讀取 {}：{e}", tmp.display());
+        }
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(windows)]
+mod win {
+    //! 在檔案的 DACL 加上 BUILTIN\Users（S-1-5-32-545）的讀取權限
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    const SE_FILE_OBJECT: i32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x4;
+    const ERROR_SUCCESS: u32 = 0;
+    /// FILE_GENERIC_READ
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    /// ACCESS_MODE::GRANT_ACCESS
+    const GRANT_ACCESS: i32 = 1;
+    const NO_INHERITANCE: u32 = 0;
+    /// TRUSTEE_FORM::TRUSTEE_IS_SID、TRUSTEE_TYPE::TRUSTEE_IS_WELL_KNOWN_GROUP
+    const TRUSTEE_IS_SID: i32 = 0;
+    const TRUSTEE_IS_WELL_KNOWN_GROUP: i32 = 5;
+
+    #[repr(C)]
+    struct TrusteeW {
+        multiple_trustee: *mut c_void,
+        multiple_trustee_operation: i32,
+        trustee_form: i32,
+        trustee_type: i32,
+        name: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct ExplicitAccessW {
+        access_permissions: u32,
+        access_mode: i32,
+        inheritance: u32,
+        trustee: TrusteeW,
+    }
+
+    #[link(name = "advapi32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn ConvertStringSidToSidW(sid: *const u16, out: *mut *mut c_void) -> i32;
+        fn GetNamedSecurityInfoW(
+            name: *const u16,
+            object_type: i32,
+            info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            sd: *mut *mut c_void,
+        ) -> u32;
+        fn SetEntriesInAclW(
+            count: u32,
+            entries: *const ExplicitAccessW,
+            old: *mut c_void,
+            new: *mut *mut c_void,
+        ) -> u32;
+        fn SetNamedSecurityInfoW(
+            name: *const u16,
+            object_type: i32,
+            info: u32,
+            owner: *mut c_void,
+            group: *mut c_void,
+            dacl: *mut c_void,
+            sacl: *mut c_void,
+        ) -> u32;
+    }
+
+    #[link(name = "kernel32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    /// LocalAlloc 配置的記憶體，離開時釋放
+    struct Local(*mut c_void);
+
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: 由 Win32 API 以 LocalAlloc 配置，只釋放一次
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    fn check(code: u32, what: &str) -> io::Result<()> {
+        if code == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("{what} 失敗（{code}）")))
+        }
+    }
+
+    pub fn grant_users_read(path: &Path) -> io::Result<()> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let sid_text: Vec<u16> = "S-1-5-32-545"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: 字串以 NUL 結尾；輸出指標指向區域變數；配置的記憶體由 Local 釋放；
+        // 舊的 DACL 指向 sd 之內，在 sd 釋放前使用完畢
+        unsafe {
+            let mut sid = std::ptr::null_mut();
+            if ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let sid = Local(sid);
+            let mut old_dacl = std::ptr::null_mut();
+            let mut sd = std::ptr::null_mut();
+            check(
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut old_dacl,
+                    std::ptr::null_mut(),
+                    &mut sd,
+                ),
+                "GetNamedSecurityInfoW",
+            )?;
+            let _sd = Local(sd);
+            let entry = ExplicitAccessW {
+                access_permissions: FILE_GENERIC_READ,
+                access_mode: GRANT_ACCESS,
+                inheritance: NO_INHERITANCE,
+                trustee: TrusteeW {
+                    multiple_trustee: std::ptr::null_mut(),
+                    multiple_trustee_operation: 0,
+                    trustee_form: TRUSTEE_IS_SID,
+                    trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                    name: sid.0,
+                },
+            };
+            let mut new_dacl = std::ptr::null_mut();
+            check(
+                SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl),
+                "SetEntriesInAclW",
+            )?;
+            let new_dacl = Local(new_dacl);
+            check(
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl.0,
+                    std::ptr::null_mut(),
+                ),
+                "SetNamedSecurityInfoW",
+            )
+        }
+    }
 }
 
 /// 讀取狀態檔時的問題
@@ -455,15 +654,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn status_file_is_created_0640_regardless_of_umask() {
+    fn status_file_is_world_readable_regardless_of_umask() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = temp_dir("mode");
+        let path = dir.join("state").join("status.json");
+        write_atomically(&path, b"{}").unwrap();
+        // 明確設定權限，不受 umask（systemd unit 的 UMask=0077）影響
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "{mode:o}");
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o755, "{dir_mode:o}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_location_follows_the_design() {
+        let p = default_path();
+        if cfg!(windows) {
+            assert!(
+                p.ends_with(std::path::Path::new("Pulse").join("status.json")),
+                "{}",
+                p.display()
+            );
+        } else {
+            assert_eq!(p, std::path::Path::new("/var/lib/pulse/status.json"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn users_can_read_the_status_file() {
+        let dir = temp_dir("acl");
         let path = dir.join("status.json");
         write_atomically(&path, b"{}").unwrap();
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        // umask 只會拿掉位元；0640 中不會多出其他使用者的權限
-        assert_eq!(mode & 0o007, 0, "{mode:o}");
-        assert_eq!(mode & 0o600, 0o600, "{mode:o}");
+        win::grant_users_read(&path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

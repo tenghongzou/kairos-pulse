@@ -70,7 +70,12 @@ fn summary(report: &Report) -> String {
 /// stdout 的內容：標頭、檢查列、本機狀態與摘要
 pub fn rows(report: &Report, style: &Style) -> String {
     let mut out = String::new();
-    let agent = report.agent_id.as_deref().unwrap_or("（未知）");
+    let agent = match report.agent_id.as_deref() {
+        Some(id) => id,
+        // 未啟用 mTLS 時 agent_id 等同身分憑據，狀態檔不寫；root 執行時從 agent.id 讀得到
+        None if report.agent_id_hidden => "（未啟用 mTLS，不顯示）",
+        None => "（未知）",
+    };
     out.push_str(&format!(
         "{} · {} · agent_id {agent}\n\n",
         style.paint(

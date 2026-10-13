@@ -248,8 +248,17 @@ fn config_warnings(config: &AppConfig) -> Vec<status_file::CodeNote> {
 /// 建立狀態追蹤器（`status.file` 以工作目錄解析；沿用上一個行程留下的狀態檔計算最近 1 小時的重啟次數）
 fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Tracker {
     let base = cwd.map(Path::to_path_buf).unwrap_or_default();
-    let path = base.join(config.status.file.trim());
-    let previous = status_file::read(&path).ok();
+    // status.file 未設定：設計包的位置（/var/lib/pulse、%ProgramData%\Pulse），無法寫入時改寫 logs/
+    let (path, fallback) = match config.status.file.trim() {
+        "" => (
+            status_file::default_path(),
+            Some(base.join(status_file::LEGACY_RELATIVE)),
+        ),
+        file => (base.join(file), None),
+    };
+    let previous = status_file::read(&path)
+        .ok()
+        .or_else(|| fallback.as_ref().and_then(|f| status_file::read(f).ok()));
     let config_file = config.local_file_found.then(|| {
         base.join(config_manager::LOCAL_CONFIG_FILE)
             .display()
@@ -282,7 +291,7 @@ fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Track
         max_age_hours: config.buffer.max_age_hours,
         replay_interval_ms: config.effective_replay_interval_ms(),
     };
-    local_status::Tracker::new(path, file, buffer)
+    local_status::Tracker::new(path, fallback, file, buffer)
 }
 
 fn main() -> ExitCode {
@@ -766,6 +775,25 @@ mod tests {
             ],
             "{line}"
         );
+    }
+
+    #[test]
+    fn unit_lets_the_service_write_the_default_status_file() {
+        // cli-spec §4.1：/var/lib/pulse/status.json 由 StateDirectory=pulse 建立，ProtectSystem=strict 下可寫
+        let unit = include_str!("../packaging/pulse.service");
+        let state_dir = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("StateDirectory="))
+            .expect("pulse.service 應設定 StateDirectory");
+        assert_eq!(state_dir, "pulse");
+        assert!(unit.lines().any(|l| l == "StateDirectoryMode=0755"));
+        if cfg!(unix) {
+            assert_eq!(
+                status_file::default_path(),
+                Path::new("/var/lib").join(state_dir).join("status.json")
+            );
+        }
+        assert_eq!(AppConfig::default_for_tests().status.file, "");
     }
 
     #[test]

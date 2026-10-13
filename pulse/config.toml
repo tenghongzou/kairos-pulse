@@ -104,10 +104,14 @@ max_age_hours = 168
 replay_interval_ms = 1200
 
 [status]
-# 本機狀態檔（pulse status 讀取；相對路徑以工作目錄解析）。執行中每 10 秒、狀態變化時另外以原子方式改寫
-# （寫暫存檔再改名，不 fsync）；內容不含秘密。Unix 上以 0640 建立，與 logs/ 相同只有服務帳號與其群組可讀。
-# 預設放在 logs/：systemd unit（ProtectSystem=strict）中服務只能寫 logs/ 與 buffer/
-file = "logs/status.json"
+# 本機狀態檔（pulse status 讀取）。執行中每 10 秒、狀態變化時另外以原子方式改寫（寫暫存檔再改名，不 fsync）。
+# 所有人可讀（pulse status 不需要 root）：Unix 上檔案 0644；Windows 另外授予 Users 讀取。內容不含秘密，
+# 未啟用 mTLS 時也不寫 agent_id。
+# 空字串 = 預設位置：Linux /var/lib/pulse/status.json（systemd unit 的 StateDirectory=pulse 建立），
+# Windows %ProgramData%\Pulse\status.json。預設位置無法寫入時（例如沿用沒有 StateDirectory= 的舊 unit）
+# 改寫在工作目錄的 logs/status.json 並記 WARN（PLS-E8204），服務照常執行。
+# 指定路徑時（相對路徑以工作目錄解析）只寫該位置；多實例請各自指定，例如 "/var/lib/pulse/2/status.json"
+file = ""
 
 [log]
 level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小寫，其他值啟動即報錯）

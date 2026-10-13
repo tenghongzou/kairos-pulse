@@ -116,7 +116,8 @@ pub struct BufferConfig {
 /// 本機狀態檔（`pulse status` 讀取，見 `status_file` 模組）
 #[derive(Debug, Clone, Deserialize)]
 pub struct StatusConfig {
-    /// 狀態檔路徑（相對路徑以工作目錄解析）
+    /// 狀態檔路徑（相對路徑以工作目錄解析）；空字串為設計包的位置（`status_file::default_path`），
+    /// 無法寫入時改寫工作目錄的 `logs/status.json`
     pub file: String,
 }
 
@@ -368,11 +369,7 @@ impl AppConfig {
             MIN_REPLAY_INTERVAL_MS,
             MAX_REPLAY_INTERVAL_MS,
         )?;
-        if self.status.file.trim().is_empty() {
-            return Err(ConfigError::Message(
-                "status.file 不可為空字串（pulse status 讀取的本機狀態檔）".to_string(),
-            ));
-        }
+
         range(
             "log.retention_days",
             u64::from(self.log.retention_days),

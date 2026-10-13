@@ -820,6 +820,9 @@ pub fn config_warning(_ctx: &Ctx, code: &str, message: &str) -> Issue {
             "不需要信任公開 CA 時，移除 use_system_roots（或設為 false），只信任 server.ca_cert。"
         }
         codes::W_SYSTEM32_WORKDIR => "在服務設定中把工作目錄設為 Pulse 所在的目錄。",
+        codes::E_STATUS_UNWRITABLE => {
+            "依 INSTALL.md 第 10 節換上新版 pulse.service（StateDirectory=pulse），執行 systemctl daemon-reload 後重新啟動 Pulse。"
+        }
         _ => "依說明修正設定。",
     };
     Issue::new(code, Severity::Warning)

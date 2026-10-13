@@ -815,6 +815,9 @@ interval = 1
 [report]
 interval = 1
 
+[status]
+file = "state/status.json"
+
 [log]
 level = "trace"
 "#
