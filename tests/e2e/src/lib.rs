@@ -227,6 +227,8 @@ fn is_ambient_setting(key: &str) -> bool {
                 | "PULSE_SYMBOLS"
                 | "NO_COLOR"
                 | "CLICOLOR_FORCE"
+                // systemd 的 StateDirectory=（在服務中執行測試時）：Pulse 的狀態檔預設位置會改用它
+                | "STATE_DIRECTORY"
         )
 }
 
@@ -627,7 +629,10 @@ impl Kairos {
     pub fn named(root: &TestDir, name: &str, crl: &str) -> Self {
         let dir = root.sub(name);
         let port = free_port();
-        let console_port = free_port();
+        // 兩次 free_port 理論上可能拿到同一個埠（之前的監聽已關閉），主控台埠另外確認不同
+        let console_port = std::iter::repeat_with(free_port)
+            .find(|p| *p != port)
+            .unwrap();
         std::fs::copy(pulse_testdata("server.pem"), dir.join("server.pem")).unwrap();
         std::fs::copy(pulse_testdata("server.key"), dir.join("server.key")).unwrap();
         std::fs::write(dir.join("client-ca.pem"), test_pki::CA).unwrap();
