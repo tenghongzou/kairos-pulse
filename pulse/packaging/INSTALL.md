@@ -506,13 +506,13 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chown root:pulse /opt/pulse/agent.id /opt/pulse/client.key
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
-- **升級到 0.4（本機狀態檔與 `pulse status`）**：新版 unit 多了 `StateDirectory=pulse`、`StateDirectoryMode=0755`，請依步驟 2 換上（多實例時依第 9 節步驟 2 重新產生，`StateDirectory=pulse/N`），並讓一般帳號可以執行 `pulse status`：
+- **升級到 0.4（本機狀態檔與 `pulse status`）**：協定不變，與 Kairos 0.3／0.4 任意順序升級皆可。新版 unit 多了 `StateDirectory=pulse`、`StateDirectoryMode=0755`，請依步驟 2 換上（多實例時依第 9 節步驟 2 重新產生，`StateDirectory=pulse/N`），並讓一般帳號可以執行 `pulse status`：
 
   ```bash
   chmod 751 /opt/pulse /opt/pulse-[0-9]* 2>/dev/null
   ```
 
-  沒有換 unit 時服務照常啟動與監控（不會因狀態檔而失敗）：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`PLS-E8204`），只有 root 能執行 `pulse status`，「設定」列提示更新 unit（第 8.2 節）。換上後重新啟動，`pulse status` 的「設定」列不再有 `PLS-E8204`。
+  沒有換 unit 時服務照常啟動與監控（不會因狀態檔而失敗）：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`PLS-E8204`），只有 root 能執行 `pulse status`，「設定」列提示更新 unit（第 8.2 節）。換上後重新啟動，`pulse status` 的「設定」列不再有 `PLS-E8204`。另外，0.4 起有固定事件的日誌行以「事件 代碼」開頭（例如 `conn.lost PLS-E2002 …`）：以行首比對日誌文字（例如 `[ERROR] 連線中斷`）的告警規則請在升級前改為比對事件或代碼，或改用包含比對（`ERROR-CODES.md`）。
 - 升級前請看新版發佈包中的 `CHANGELOG.md`「破壞性變更與升級步驟」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
 - **升級到 0.3.0**：新版預設啟用本機緩衝（第 6.2 節），升級前先建立緩衝目錄並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/buffer`；多實例時對每個 `/opt/pulse-N` 建立目錄並重新產生 `pulse-N.service`）：
 

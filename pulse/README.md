@@ -32,8 +32,8 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 | 新版 Pulse 連舊版 Kairos | v1：舊版 Kairos 只檢查 `proto == 1` 並忽略 v2 欄位；Pulse 送 v1 的三欄位 report，註冊日誌為「協定 v1」 |
 | 新版 Pulse 連新版 Kairos | v2：report 改為通用指標（CPU、記憶體、磁碟、網路、溫度），另送主機指紋等主機資訊；註冊日誌為「協定 v2」 |
 | 舊版 Pulse 連新版 Kairos | v1：與舊版相同 |
-| Pulse 0.3.0 連 Kairos 0.3.0 | v2＋`durable`：report 為 at-least-once（見「本機緩衝」），Kairos 的上線日誌註明「durable」 |
-| Pulse 0.3.0 連 Kairos 0.2.0 | v2，不啟用 `durable`：連線期間照舊 at-most-once；斷線期間寫進緩衝的積壓保留到連上 Kairos 0.3.0 為止，日誌以 `INFO` 說明「伺服器不支援 durable…暫不補送」 |
+| Pulse 0.3.0 以上連 Kairos 0.3.0 以上 | v2＋`durable`：report 為 at-least-once（見「本機緩衝」），Kairos 的上線日誌註明「durable」。0.4 的協定與 0.3 相同（`pulse status` 只讀本機狀態檔），Pulse 與 Kairos 0.3／0.4 可以任意混用 |
+| Pulse 0.3.0 以上連 Kairos 0.2.0 | v2，不啟用 `durable`：連線期間照舊 at-most-once；斷線期間寫進緩衝的積壓保留到連上 Kairos 0.3.0 為止，日誌以 `INFO` 說明「伺服器不支援 durable…暫不補送」 |
 
 更早的版本之間混用時可能出現下列問題：
 
@@ -524,7 +524,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 
 ```
 $ /opt/pulse/pulse status
-Pulse 0.3.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-112233445566
+Pulse 0.4.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-112233445566
 
 ✓ 通過 服務   pulse.service 執行中（PID 4151145，已執行 12 天 4 小時）
 ✓ 通過 連線   已註冊到 kairos.example.gov.tw:8443（TLS 1.3，mTLS），已連線 2 分 2 秒

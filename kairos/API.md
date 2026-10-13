@@ -558,11 +558,14 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | 稽核雜湊鏈（#11） | token 的建立與撤銷目前記在 `api_tokens` 與 Kairos 的日誌 |
 | OpenAPI 文件 | 本文件為規格；端點穩定後再產生 OpenAPI 3.1 |
 
+**已決定（使用者已核准，衝刺 3 整合）**
+
+- **預設啟用主控台，只綁 `127.0.0.1:9443`**：0.4 升級後預設監聽 loopback；9443 被其他程式佔用時 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試），以 `[console]` 的 `listen` 換連接埠或 `enabled = false` 停用（CHANGELOG 破壞性變更第 1 項、INSTALL 第 9.3 節）。開放給管理網段由管理者手動修改，並以防火牆只允許管理網段。
+- **token 的有效期限預設 90 天、上限 3,650 天**（第 4.1、4.2 節）；`--no-expiry` 仍可建立不過期的 token（不建議）。
+- **驗證失敗依來源 IP 速率限制**（第 4.3 節；IPv6 以 /64 合併）：同一個 NAT 後的合法用戶端可能被同一來源的錯誤 token 連帶限制（最多約 1 分鐘），接受這個取捨。
+
 **需要使用者或設計決定**
 
 1. **錯誤代碼**：API 的 `unauthorized`（401）、`forbidden`（403）、`rate_limited`（429）沒有對應的產品代碼。`copywriting.md` §3.3 的 6001 是登入畫面的帳號密碼錯誤；建議設計分配子類別 61（權限）的新號碼，例如 `KRS-E6101`（API token 無效或已過期）、`KRS-E6102`（權限不足）、`KRS-W6103`（驗證失敗太多次），以及主控台連接埠的啟動錯誤是否沿用 `KRS-E2001`。
-2. **預設啟用主控台**：0.4 升級後預設監聽 `127.0.0.1:9443`；9443 被其他程式佔用時 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）。另一種做法是預設停用、由管理者開啟。目前依設計包預設啟用，CHANGELOG 的升級步驟已列出。
-3. **token 的預設有效期限 90 天**與上限 3,650 天；設計包沒有規定。
-4. **驗證失敗的速率限制**以來源 IP 計算：同一個 NAT 後的合法用戶端會被同一來源的錯誤 token 連帶限制（最多約 1 分鐘）。
-5. **`unknown` 狀態的暖機期**定為 Kairos 啟動後 2 分鐘（設計包只寫「暖機期內」）。
-6. **主機詳情是否顯示「支援補送」**（`decisions/INTEGRATION.md` §25.8 #6）：API 已提供 `durable`、`replaying`、`connection.last_backfill_*`，畫面是否呈現由設計決定。
+2. **`unknown` 狀態的暖機期**定為 Kairos 啟動後 2 分鐘（設計包只寫「暖機期內」）。
+3. **主機詳情是否顯示「支援補送」**（`decisions/INTEGRATION.md` §25.8 #6）：API 已提供 `durable`、`replaying`、`connection.last_backfill_*`，畫面是否呈現由設計決定。
