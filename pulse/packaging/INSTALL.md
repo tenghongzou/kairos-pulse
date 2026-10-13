@@ -381,7 +381,7 @@ Pulse 每 10 秒（狀態改變時另外）把目前的狀態寫到 `/var/lib/pu
   ```
 
   motd 由 root 執行，不需要額外權限。
-- 監控系統（Nagios、Zabbix）可用 `--exit-codes=nagios`（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN，單行輸出）。
+- 監控系統（Nagios、Zabbix）可用 `--exit-codes=nagios`（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN，單行輸出；沒有權限讀取狀態檔時也是 3，不是 10）。
 
 ## 9. 多實例（同一台主機跑多個 Pulse）
 

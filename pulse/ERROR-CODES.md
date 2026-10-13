@@ -89,8 +89,8 @@
 |---|---|---|---|
 | `PLS-E8002` | `status_cmd/eval.rs` `evaluate` | 找不到服務（systemd unit／Windows 服務），也沒有狀態檔 | 服務列 ✗，結束代碼 9 |
 | `PLS-E8003` | 同上 | 服務管理員回報未執行（failed、inactive、正在重新啟動、已停止），或沒有服務管理員時狀態檔記錄的 PID 已不在 | 服務列 ✗（上次結束時間與結束代碼），其餘列為「最後已知狀態」 |
-| `PLS-W8004` | 同上 | 服務在執行，但狀態檔超過 60 秒未更新（單調時鐘）、不存在或無法解析 | 服務列 ⚠，本機狀態「未知」，結束代碼 9 |
-| `PLS-E8203` | `status_cmd::permission_denied` | 沒有權限讀取狀態檔 | stderr（`--json` 為 `error`），結束代碼 10 |
+| `PLS-W8004` | 同上 | 服務在執行，但狀態檔超過 60 秒未更新（單調時鐘）、不存在或無法解析 | 服務列 ⚠，本機狀態「未知」，結束代碼 9（Nagios 3）；連線、回報、身分、時鐘列依最後已知內容判定並標示「（最後已知，N 分鐘前）」，沒有內容時略過 |
+| `PLS-E8203` | `status_cmd::permission_denied` | 沒有權限讀取狀態檔 | stderr（`--json` 為 `error`），結束代碼 10（`--exit-codes=nagios` 為 3） |
 | `PLS-W8301` | `network.rs` `ClockSkewLog`；`eval.rs` `clock_row` | 與 Kairos 相差 30 秒～5 分鐘（以 `hello_ack` 的 `server_time` 量測；只在等級改變或偏差再變化超過 1 分鐘時記錄） | `clock.skew`（WARN）；時鐘列 ⚠ |
 | `PLS-E8302` | 同上 | 相差超過 5 分鐘 | `clock.skew`（ERROR，同時寫 stderr）；時鐘列 ✗。回到 30 秒以內時 `clock.skew -`（INFO） |
 
@@ -139,10 +139,11 @@
 
 ## 5. 與設計包不一致之處
 
+設計包 §26（`decisions/INTEGRATION.md`，2026-10-13）已把 `pulse status` 的結束代碼 10（`--exit-codes=nagios` 為 3）、`checks[]` 不新增 `unknown`（狀態檔過時時依最後已知內容判定並標示「（最後已知，N 分鐘前）」，沒有內容時 `skipped`）、`status.write_failed`（5020）與 `clock.skew` 的層級補進規格，與實作一致，不再列於下表。
+
 | 項目 | 設計包 | 實作 | 理由 |
 |---|---|---|---|
 | 狀態檔的備用位置 | `/var/lib/pulse/status.json`、`%ProgramData%\Pulse\status.json`，所有人可讀（`cli-spec.md` §4.1） | 依設計（2026-10-13 使用者決定）；另外在預設位置無法寫入時（沿用沒有 `StateDirectory=` 的舊 unit）改寫工作目錄的 `logs/status.json` 並以 `PLS-E8204` 警告 | 舊 unit 在 `ProtectSystem=strict` 下不能寫 `/var/lib/pulse`；不讓服務因狀態檔而啟動失敗。此時只有 root／`pulse` 群組讀得到 |
-| `pulse status` 的結束代碼 10 | §1.3 只列 0／7／8／9／2 | 無法讀取狀態檔時為 10（`cli-style.md` §8「權限不足」，`--json` 的 `ok: false`、`error`） | 權限不足時無法判斷主機狀態，不應回 9 讓監控誤判為「嚴重」；SCCM 以 SYSTEM 執行，不會遇到 |
 | 「身分」列 | 「…，2027-06-09 起自動更新」 | 沒有這一段；14 天內到期為 `PLS-W1110`（不會自動更新） | 這個版本沒有自動更新憑證 |
 | `PLS-E2003` 的說明 | 原因寫出解析出的 IP；處理方式 `sudo pulse check-config --connect` | 不寫 IP；以 `nc -vz <主機> <埠>`（Windows `Test-NetConnection`）檢查 | 連線失敗時拿不到實際連線的位址；`pulse check-config` 尚未實作 |
 | `PLS-E1105` 的處理方式 | `sudo pulse enroll --force --token <新 token>` | 請管理者重新簽發用戶端憑證、更新設定後重新啟動 | `pulse enroll` 尚未實作 |
@@ -150,7 +151,6 @@
 | 說明行 | `說明：pulse explain <代碼>` 指向本機完整說明 | `pulse explain` 只印標題並指向本文件 | 各代碼的完整說明頁尚未實作 |
 | 「時鐘」列在被拒時 | 4.6 範例「與 Kairos 相差 0.3 秒」 | 未連線時一律加「（上次連線時量測）」（與 4.5 相同） | 被拒期間沒有新的量測 |
 | 「離線（停用緩衝）」的寫法 | 4.5 註解：與第一行同一行；4.2 表格：第二行起 | 第二行起 | 依 4.2 表格 |
-| `checks[].result` | `ok／warning／error／offline／pending／skipped` | 狀態檔過時時服務列為 `warning`（`PLS-W8004`），本機狀態另判為 `unknown` | 列舉值沒有 `unknown`；不新增列舉值 |
 | `--json` 的補充欄位 | — | `connection` 另有 `server_verified`、`proto`、`features`、`last_error`；`reporting.buffer` 另有丟棄的取樣時間範圍、`retry_at` 等；`status_file.age_ms` | 只新增欄位，不影響既有欄位（`cli-style.md` §7.1） |
 
 ## 6. SCCM 指令碼核對（`design/pulse/sccm/*.ps1`）

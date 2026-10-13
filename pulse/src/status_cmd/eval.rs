@@ -362,6 +362,10 @@ pub fn evaluate(input: &Input) -> Report {
     let mut status_candidates: Vec<HostStatus> = Vec::new();
     let fresh = agent_running && file.is_some() && !stale_by_age;
     let stale = agent_running && !fresh;
+    // 狀態檔過時（服務執行中）：依賴狀態檔的連線、回報、身分、時鐘列以最後已知內容照常判定，摘要加
+    // 「（最後已知，N 分鐘前）」；本機狀態一律為「未知」（cli-spec.md §4.8、decisions/INTEGRATION.md §26.2 #8）
+    let last_known_only = stale && file.is_some();
+    let use_file = fresh || last_known_only;
 
     // 服務列
     let service_row = if agent_running {
@@ -484,7 +488,7 @@ pub fn evaluate(input: &Input) -> Report {
             input.zone,
         )
     });
-    let skip_reason = if fresh {
+    let skip_reason = if use_file {
         None
     } else if !agent_running && file.is_some() {
         Some(format!(
@@ -501,7 +505,9 @@ pub fn evaluate(input: &Input) -> Report {
     };
 
     let conn = file.map(|f| &f.connection);
-    let connected = fresh && conn.is_some_and(|c| c.state == "registered");
+    let connected = use_file && conn.is_some_and(|c| c.state == "registered");
+    // 最後已知內容產生的問題說明不列出（可能已不是現況；過時本身由服務列的 PLS-W8004 說明）
+    let issues_before = issues.len();
     let mut conn_error = false;
     let mut brief = BriefParts::default();
     match (&skip_reason, conn) {
@@ -706,11 +712,29 @@ pub fn evaluate(input: &Input) -> Report {
         }
     }
 
-    // 設定
+    if last_known_only {
+        issues.truncate(issues_before);
+    }
+
+    // 設定（照常：直接讀設定檔）
     rows.push(config_row(input, file, agent_running, &ctx, &mut issues));
 
     // 時鐘
-    rows.push(clock_row(file, fresh, connected, &ctx, &mut issues));
+    let issues_before = issues.len();
+    rows.push(clock_row(file, use_file, connected, &ctx, &mut issues));
+    if last_known_only {
+        issues.truncate(issues_before);
+        let ago = last_known_ago(file_age);
+        for row in rows.iter_mut().filter(|r| {
+            matches!(r.id, "connection" | "reporting" | "identity" | "clock")
+                && r.result != Outcome::Skipped
+        }) {
+            row.summary.push_str(&ago);
+            if let Some(first) = row.lines.first_mut() {
+                first.push_str(&ago);
+            }
+        }
+    }
 
     // ---- 本機狀態 ----
     for row in &rows {
@@ -723,10 +747,14 @@ pub fn evaluate(input: &Input) -> Report {
             _ => {}
         }
     }
-    let status = status_candidates
-        .into_iter()
-        .min()
-        .unwrap_or(HostStatus::Online);
+    let status = if last_known_only {
+        HostStatus::Unknown
+    } else {
+        status_candidates
+            .into_iter()
+            .min()
+            .unwrap_or(HostStatus::Online)
+    };
 
     // ---- --brief ----
     brief.codes = rows
@@ -1352,6 +1380,22 @@ fn config_error_line(message: &str) -> Option<u32> {
         .take_while(char::is_ascii_digit)
         .collect();
     digits.parse().ok()
+}
+
+/// 最後已知內容的標示：「（最後已知，N 分鐘前）」（`cli-spec.md` §4.8）
+fn last_known_ago(age: Option<Duration>) -> String {
+    match age {
+        Some(a) if a == Duration::MAX => "（最後已知，重新開機前）".to_string(),
+        Some(a) => {
+            let m = a.as_secs() / 60;
+            match m {
+                0..60 => format!("（最後已知，{m} 分鐘前）"),
+                60..1440 => format!("（最後已知，{} 小時前）", m / 60),
+                _ => format!("（最後已知，{} 天前）", m / 1440),
+            }
+        }
+        None => "（最後已知）".to_string(),
+    }
 }
 
 /// 「時鐘」列（`cli-spec.md` §4.2）

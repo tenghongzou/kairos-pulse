@@ -337,7 +337,8 @@ pub fn choose_status_file(
     }
 }
 
-/// 沒有權限讀取狀態檔：命令本身無法完成（結束代碼 10）
+/// 沒有權限讀取狀態檔：命令本身無法完成（結束代碼 10；`--exit-codes=nagios` 時為 3 UNKNOWN，
+/// `cli-spec.md` §1.3、`decisions/INTEGRATION.md` §26.2 #6）
 fn permission_denied(
     args: &StatusArgs,
     path: &str,
@@ -367,11 +368,12 @@ fn permission_denied(
             .into_iter()
             .collect(),
     };
+    let exit_code = if args.nagios { 3 } else { EXIT_PERMISSION };
     if args.json {
         return Output {
-            stdout: json::failure(&issue, EXIT_PERMISSION, now),
+            stdout: json::failure(&issue, exit_code, now),
             stderr: String::new(),
-            exit_code: EXIT_PERMISSION,
+            exit_code,
         };
     }
     if args.brief || args.nagios {
@@ -382,13 +384,13 @@ fn permission_denied(
                 codes::E_NEED_ADMIN
             ),
             stderr: String::new(),
-            exit_code: if args.nagios { 3 } else { EXIT_PERMISSION },
+            exit_code,
         };
     }
     Output {
         stdout: String::new(),
         stderr: render::issue_block(&issue, &style, args.verbose),
-        exit_code: EXIT_PERMISSION,
+        exit_code,
     }
 }
 
@@ -556,6 +558,22 @@ mod tests {
         let out = once(&args);
         assert_eq!(out.exit_code, 10);
         assert!(out.stderr.contains("PLS-E8203"), "{}", out.stderr);
+        // --exit-codes=nagios：沒有權限時為 3（UNKNOWN），--json 也一樣
+        let nagios = StatusArgs {
+            nagios: true,
+            ..args.clone()
+        };
+        let out = once(&nagios);
+        assert_eq!(out.exit_code, 3);
+        assert!(out.stdout.starts_with("unknown"), "{}", out.stdout);
+        let out = once(&StatusArgs {
+            json: true,
+            ..nagios
+        });
+        assert_eq!(out.exit_code, 3);
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["exit_code"], 3);
+        assert_eq!(v["error"]["code"], "PLS-E8203");
         let out = once(&StatusArgs { json: true, ..args });
         let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
         assert_eq!(v["ok"], false);

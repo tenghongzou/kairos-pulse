@@ -547,7 +547,7 @@ Pulse 0.4.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 | `--brief` | 單行，第一欄為本機狀態：`offline   plc-hmi-07 reconnecting 12m30s PLS-E2003 backlog=149` |
 | `--json` | 機器可讀（schema `pulse.status/v1`，純 ASCII，非 ASCII 字元以 `\uXXXX` 跳脫）；欄位見設計包 `cli-spec.md` §4.8，腳本請讀 `data.status`、`data.checks[]`、`data.issues[]` |
 | `--watch [秒]` | 每 N 秒（預設 2）重新顯示，按 Ctrl+C 結束 |
-| `--exit-codes=nagios` | 單行輸出，結束代碼為 Nagios 慣例（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN） |
+| `--exit-codes=nagios` | 單行輸出，結束代碼為 Nagios 慣例（0 OK、1 WARNING、2 CRITICAL、3 UNKNOWN；沒有權限讀取狀態檔時也是 3） |
 | `-c, --config <路徑>` | 指定 `pulse.toml`；狀態檔等相對路徑以它所在的目錄解析 |
 | `--instance <N>` | 多實例 N：讀 `/var/lib/pulse/N/status.json`，查詢 `pulse-N.service` |
 | `-q`／`-v` | 不顯示警告等級的說明／說明中加上技術細節 |
@@ -560,7 +560,7 @@ Pulse 0.4.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 | `warning` 警告 | 連線中但有警告：憑證 14 天內到期、時鐘相差 30 秒以上、設定或權限警告、最近 24 小時內本機緩衝丟過資料（`PLS-W4202`／`PLS-W4203`）、最近 1 小時內無法寫入緩衝（`PLS-W4103`）、緩衝無法使用（`PLS-E4004`）、Kairos 暫時無法保存（`PLS-W4101`） | 8 |
 | `offline` 離線 | 一般網路錯誤、中斷未滿 30 分鐘（Pulse 會自行重連） | 9 |
 | `critical` 嚴重 | 需要人工處理（憑證被撤銷、驗證失敗等）、中斷滿 30 分鐘、服務未執行或未安裝、時鐘相差超過 5 分鐘、設定檔有誤 | 9 |
-| `unknown` 未知 | 服務在執行，但狀態檔超過 60 秒沒有更新、不存在或無法解析（`PLS-W8004`，Pulse 可能卡住） | 9 |
+| `unknown` 未知 | 服務在執行，但狀態檔超過 60 秒沒有更新、不存在或無法解析（`PLS-W8004`，Pulse 可能卡住）。連線、回報、身分、時鐘列以最後已知內容顯示並標示「（最後已知，N 分鐘前）」，沒有內容時略過 | 9 |
 | — | 用法錯誤／沒有權限讀取狀態檔（`PLS-E8203`） | 2／10 |
 
 結束代碼 9 涵蓋三種狀態，要區分短暫重連與需要人工處理時請讀 `--json` 的 `data.status`（SCCM 的判讀方式見設計包 `pulse/sccm-deployment.md`）。

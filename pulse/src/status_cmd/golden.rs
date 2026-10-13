@@ -632,22 +632,98 @@ fn stale_status_file_is_unknown() {
         rows.contains("⚠ 警告 服務   pulse.service 執行中（PID 4151145），但狀態檔已 2 分 12 秒未更新（PLS-W8004）"),
         "{rows}"
     );
+    // cli-spec §4.8（decisions/INTEGRATION.md §26.2 #8）：依賴狀態檔的列以最後已知內容照常判定，
+    // 摘要加「（最後已知，N 分鐘前）」；設定列照常
     assert!(
-        rows.contains("- 略過 連線   狀態檔過時，以下為最後已知狀態（14:35:00）"),
+        rows.contains(
+            "✓ 通過 連線   已註冊到 kairos.example.gov.tw:8443（TLS 1.3，mTLS），已連線 3 天 4 小時（最後已知，2 分鐘前）"
+        ),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("✓ 通過 時鐘   與 Kairos 相差 0.2 秒（最後已知，2 分鐘前）"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("✓ 通過 設定   /etc/pulse/pulse.toml，無警告\n"),
         "{rows}"
     );
     assert!(rows.contains("本機狀態：未知"), "{rows}");
+    let text = super::json::document(&super::json::JsonInput {
+        report: &report,
+        file: &inp.file,
+        status_path: &inp.status_path,
+        service_manager: Some("systemd"),
+        service_unit: Some("pulse.service"),
+        config_file: None,
+        exit_code: report.status.exit_code(),
+        generated_at: inp.now,
+    });
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["data"]["status"], "unknown");
+    assert_eq!(v["data"]["status_file"]["stale"], true);
+    let checks = v["data"]["checks"].as_array().unwrap();
+    let check = |id: &str| checks.iter().find(|c| c["id"] == id).unwrap().clone();
+    assert_eq!(check("service")["result"], "warning");
+    assert_eq!(check("service")["code"], "PLS-W8004");
+    for id in ["connection", "reporting", "identity", "clock"] {
+        let c = check(id);
+        assert_eq!(c["result"], "ok", "{c}");
+        assert!(
+            c["summary"]
+                .as_str()
+                .unwrap()
+                .ends_with("（最後已知，2 分鐘前）"),
+            "{c}"
+        );
+    }
+    assert!(
+        !check("config")["summary"]
+            .as_str()
+            .unwrap()
+            .contains("最後已知")
+    );
     assert!(
         report.brief.starts_with("unknown   plc-hmi-07 stale 2m12s"),
         "{}",
         report.brief
     );
-    // 沒有狀態檔、服務在執行：同樣是未知
+    // 最後已知為被拒（錯誤）：列照常判定為錯誤，但本機狀態仍為「未知」，也不列出被拒的處理方式
+    let mut f = base_file();
+    f.connection.state = "rejected".into();
+    f.connection.last_error_code = Some("PLS-E1105".into());
+    f.connection.last_error = Some("伺服器回報致命錯誤 certificate_rejected".into());
+    let mut inp = input(f);
+    inp.now_mono = Some(MONO + 130_000);
+    let report = eval::evaluate(&inp);
+    assert_eq!(report.status, eval::HostStatus::Unknown);
+    let conn = report.rows.iter().find(|r| r.id == "connection").unwrap();
+    assert_eq!(conn.result, eval::Outcome::Error);
+    assert!(conn.summary.ends_with("（最後已知，2 分鐘前）"), "{conn:?}");
+    assert!(
+        report.issues.iter().all(|i| i.code != "PLS-E1105"),
+        "{:?}",
+        report.issues
+    );
+    // 沒有內容可判定的列為 skipped（沒有時鐘量測）
+    let mut f = base_file();
+    f.clock.offset_ms = None;
+    let mut inp = input(f);
+    inp.now_mono = Some(MONO + 130_000);
+    let report = eval::evaluate(&inp);
+    let clock = report.rows.iter().find(|r| r.id == "clock").unwrap();
+    assert_eq!(clock.result, eval::Outcome::Skipped);
+    assert!(!clock.summary.contains("最後已知"), "{clock:?}");
+    // 沒有狀態檔、服務在執行：同樣是未知，依賴狀態檔的列為 skipped
     let mut inp = input(base_file());
     inp.file = FileState::Missing;
     let report = eval::evaluate(&inp);
     assert_eq!(report.status, eval::HostStatus::Unknown);
     assert!(render::rows(&report, &unicode()).contains("但沒有狀態檔（PLS-W8004）"));
+    for id in ["connection", "reporting", "identity", "clock"] {
+        let r = report.rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(r.result, eval::Outcome::Skipped, "{r:?}");
+    }
 }
 
 #[test]
