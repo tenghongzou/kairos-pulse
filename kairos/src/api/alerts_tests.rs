@@ -163,7 +163,7 @@ async fn alerts_end_to_end_over_https() {
         )
         .unwrap();
     assert!(!String::from_utf8_lossy(&blob).contains("SECRETTOKEN"));
-    // 不合法的設定：KRS-E5110（暫定）
+    // 不合法的設定：KRS-E5110
     let bad = call(
         addr,
         "POST",
@@ -602,6 +602,41 @@ async fn alerts_end_to_end_over_https() {
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    // CLI 的動作（kairos alerts comment）：由執行中的 Kairos 處理，同樣寫入稽核雜湊鏈
+    let qid = crate::alerts::store::enqueue_action(
+        &f.admin(),
+        chrono::Utc::now().timestamp_millis(),
+        "ops",
+        &event_id,
+        "comment",
+        &json!({ "text": "由 CLI 加註" }),
+    )
+    .unwrap();
+    wait_for("CLI 的動作被處理", Duration::from_secs(30), || {
+        crate::alerts::store::action_result(&f.admin(), qid)
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let (actor, result): (String, String) = f
+        .admin()
+        .query_row(
+            "SELECT actor, result FROM audit_events WHERE category = 'alerts' AND action = 'alert.comment' AND actor = 'ops'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // 事件已解決（不在引擎中）：CLI 的註解失敗，稽核記錄失敗的結果
+    let processed = crate::alerts::store::action_result(&f.admin(), qid)
+        .unwrap()
+        .unwrap();
+    let expected = if processed["ok"] == true {
+        "ok"
+    } else {
+        "failed"
+    };
+    assert_eq!((actor.as_str(), result.as_str()), ("ops", expected));
 
     // 稽核紀錄：寫入都有記錄（類別 alerts），不含機密
     let audit: Vec<(String, String)> = {

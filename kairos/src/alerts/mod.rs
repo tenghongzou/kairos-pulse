@@ -780,7 +780,7 @@ impl AlertService {
                     Ok(v) => json!({ "ok": true, "data": v }),
                     Err(e) => json!({ "ok": false, "code": e.code, "message": e.message }),
                 };
-                results.push((a.id, result));
+                results.push((a, result));
             }
             let out = engine.take_output();
             drop(engine);
@@ -789,8 +789,24 @@ impl AlertService {
         if let Err(e) = self
             .db
             .write(move |conn| {
-                for (id, r) in &results {
-                    store::finish_action(conn, *id, now, r)?;
+                for (a, r) in &results {
+                    store::finish_action(conn, a.id, now, r)?;
+                    // 稽核雜湊鏈：與主控台 API 的確認、解決、註解相同的紀錄（執行者為 CLI 的作業系統帳號）
+                    let ok = r["ok"] == true;
+                    crate::enroll::store::audit(
+                        conn,
+                        now,
+                        &crate::enroll::store::Audit {
+                            actor: &a.actor,
+                            actor_ip: None,
+                            category: "alerts",
+                            action: &format!("alert.{}", a.action),
+                            object: Some(&a.event_id),
+                            result: if ok { "ok" } else { "failed" },
+                            code: None,
+                            details: Some(json!({ "params": a.params, "via": "cli" })),
+                        },
+                    )?;
                 }
                 Ok(())
             })
