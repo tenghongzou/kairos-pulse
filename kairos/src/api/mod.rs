@@ -1,12 +1,16 @@
 //! 主控台 API（審計 F1；規格見 `kairos/API.md`）。
 //!
 //! HTTPS（rustls）＋ hyper 的 HTTP/1.1 伺服器，監聽 `console.listen`（預設 127.0.0.1:9443），與
-//! agent 連線埠的名額、TLS 設定與連線處理完全分開。所有端點唯讀：
+//! agent 連線埠的名額、TLS 設定與連線處理完全分開：
 //!
 //! | 模組 | 內容 |
 //! |---|---|
 //! | [`http`] | 回應本文、JSON 與錯誤格式、查詢參數 |
-//! | [`auth`]、[`tokens`] | API token 的驗證與保存（`kairos api-token` 共用） |
+//! | [`auth`]、[`tokens`] | API token 與工作階段的驗證、權限（`kairos api-token` 共用 token 的保存） |
+//! | [`account`] | 登入、二階段驗證、登出、個人設定（`/api/v1/auth/…`、`/api/v1/me/…`） |
+//! | [`users`] | 使用者與角色、目錄服務的群組對應、API token 的管理 |
+//! | [`audit_log`] | 稽核日誌的查詢、匯出與完整性驗證 |
+//! | [`enroll`] | 註冊與 PKI 的管理端點 |
 //! | [`db`] | 唯讀連線池（WAL 讀者）與低頻寫入的連線 |
 //! | [`hosts`] | 主機清冊：列表與詳情 |
 //! | [`metrics`] | 指標趨勢 |
@@ -14,6 +18,8 @@
 //! | [`events`] | 即時變更推送（SSE） |
 //! | [`maint`] | 背景工作：每分鐘上線數、token 的最後使用與稽核日誌、被拒的憑證寫入清冊 |
 
+pub mod account;
+pub mod audit_log;
 pub mod auth;
 pub mod db;
 pub mod enroll;
@@ -25,7 +31,10 @@ mod maint;
 pub mod metrics;
 pub mod overview;
 pub mod tokens;
+pub mod users;
 
+#[cfg(test)]
+mod auth_tests;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -99,6 +108,43 @@ pub struct ApiContext {
     pub console_listen: SocketAddr,
     /// 註冊服務（SQLite 時；註冊與 PKI 的管理端點使用）
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    /// 使用者管理、登入、稽核等互動寫入（busy 最多等 2 秒）
+    pub admin: Arc<WriteConn>,
+    /// 登入的記憶體狀態（不存在帳號的鎖定、第二步的挑戰、雜湊的同時數）
+    pub login: account::LoginState,
+    /// 目錄服務（`[ldap]` 啟用時）
+    pub directory: Option<Arc<dyn crate::users::ldap::Directory>>,
+    /// 被拒絕的請求寫入稽核的節流（同一個執行者每分鐘最多 [`DeniedThrottle::PER_MINUTE`] 筆）
+    pub denied: DeniedThrottle,
+}
+
+/// 被拒絕（403）的寫入請求寫入稽核的節流：同一個執行者每分鐘最多 20 筆，超過的計數併入下一筆
+#[derive(Debug, Default)]
+pub struct DeniedThrottle {
+    entries: Mutex<std::collections::HashMap<String, (Instant, u32, u64)>>,
+}
+
+impl DeniedThrottle {
+    pub const PER_MINUTE: u32 = 20;
+
+    /// 可以寫入時回傳之前被略過的筆數；這一分鐘已達上限時回 `None`
+    pub fn allow(&self, actor: &str, now: Instant) -> Option<u64> {
+        let mut m = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() > 10_000 {
+            m.retain(|_, (start, _, _)| now.duration_since(*start) < Duration::from_secs(60));
+        }
+        let e = m.entry(actor.to_string()).or_insert((now, 0, 0));
+        if now.duration_since(e.0) >= Duration::from_secs(60) {
+            e.0 = now;
+            e.1 = 0;
+        }
+        if e.1 >= Self::PER_MINUTE {
+            e.2 += 1;
+            return None;
+        }
+        e.1 += 1;
+        Some(std::mem::take(&mut e.2))
+    }
 }
 
 impl ApiContext {
@@ -125,6 +171,8 @@ pub struct StartParams {
     pub shutdown: Arc<Shutdown>,
     pub agent_listen: SocketAddr,
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    /// 測試用：以替代的目錄服務取代 `[ldap]` 的連線
+    pub directory: Option<Arc<dyn crate::users::ldap::Directory>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -268,9 +316,32 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         .map_err(|e| StartError::Other(Error::other(e.message)))?;
 
     let started = Utc::now();
+    // 主控台金鑰（CSRF、TOTP 秘密的加密）：無法建立時工作階段無法使用，API token 照常
+    let console_key = match crate::users::secrets::ConsoleKey::load_or_create(&p.data_dir) {
+        Ok(k) => Some(Arc::new(k)),
+        Err(e) => {
+            log::error!(
+                "主控台金鑰 {} 無法使用，帳號登入停用（API token 不受影響）：{e}",
+                p.data_dir.join(crate::users::secrets::KEY_FILE).display()
+            );
+            None
+        }
+    };
+    let admin = WriteConn::with_busy(db_opts.clone(), db::ADMIN_WRITE_BUSY);
+    let directory: Option<Arc<dyn crate::users::ldap::Directory>> = match p.directory.clone() {
+        Some(d) => Some(d),
+        None if p.config.ldap.enabled => Some(Arc::new(crate::users::ldap::LdapDirectory {
+            settings: p.config.ldap.clone(),
+        })),
+        None => None,
+    };
     let ctx = Arc::new(ApiContext {
-        auth: Authenticator::new(pool.clone()),
+        auth: Authenticator::new(pool.clone(), admin.clone(), console_key, p.config.clone()),
         writer: WriteConn::new(db_opts),
+        admin,
+        login: account::LoginState::default(),
+        directory,
+        denied: DeniedThrottle::default(),
         hosts: HostIndex::default(),
         events: EventHub::new(started.timestamp_millis()),
         minutes: Mutex::new(MinuteSeries::default()),
@@ -439,7 +510,7 @@ async fn accept_loop(
     debug!("主控台已停止");
 }
 
-/// 處理一個請求：方法與本文的檢查、驗證、路由、逾時；記錄 DEBUG 日誌
+/// 處理一個請求：驗證、路由、權限、逾時；記錄 DEBUG 日誌。被拒絕（403）的寫入請求寫入稽核
 async fn handle(
     ctx: Arc<ApiContext>,
     peer: SocketAddr,
@@ -448,26 +519,39 @@ async fn handle(
     let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // 註冊與 PKI 的管理端點（API.md 第 11 節；含寫入）
-    if path.starts_with("/api/v1/enroll/")
-        || path.starts_with("/api/v1/pki/")
-        || path == "/api/v1/settings"
-        || path.starts_with("/api/v1/settings/")
-    {
-        let resp = enroll::handle(ctx.clone(), peer, req).await;
-        debug!(
-            "主控台 {} {} {} → {}（{:.1} ms）",
-            peer.ip(),
-            method,
-            path,
-            resp.status().as_u16(),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-        return resp;
-    }
-    let (resp, who) = match route(&ctx, peer, &req).await {
-        Ok((resp, who)) => (resp, who),
-        Err(e) => (e.into_response(Utc::now()), None),
+    let now = Utc::now();
+    let (result, principal) = route(&ctx, peer, req, now).await;
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => {
+            if e.status == StatusCode::FORBIDDEN
+                && e.code == "forbidden"
+                && auth::is_unsafe(&method)
+                && let Some(p) = &principal
+                && let Some(suppressed) = ctx.denied.allow(&p.actor(), Instant::now())
+            {
+                let mut details = e.details.clone().unwrap_or_else(|| serde_json::json!({}));
+                if suppressed > 0 {
+                    details["suppressed_since_last"] = serde_json::json!(suppressed);
+                }
+                account::audit(
+                    &ctx,
+                    crate::audit::Event {
+                        actor: p.actor(),
+                        actor_ip: Some(peer.ip().to_canonical().to_string()),
+                        category: "access",
+                        action: "access.denied",
+                        object: Some(format!("{method} {path}")),
+                        result: "denied",
+                        code: e.product_code,
+                        details: Some(details),
+                    },
+                    now.timestamp_millis(),
+                )
+                .await;
+            }
+            e.into_response(Utc::now())
+        }
     };
     debug!(
         "主控台 {} {} {} → {}（{:.1} ms{}）",
@@ -476,7 +560,9 @@ async fn handle(
         path,
         resp.status().as_u16(),
         started.elapsed().as_secs_f64() * 1000.0,
-        who.map(|w| format!("，{w}")).unwrap_or_default()
+        principal
+            .map(|p| format!("，{}", p.label()))
+            .unwrap_or_default()
     );
     resp
 }
@@ -490,26 +576,11 @@ fn segments(path: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-async fn route(
-    ctx: &Arc<ApiContext>,
-    peer: SocketAddr,
-    req: &Request<Incoming>,
-) -> Result<(Response<ApiBody>, Option<String>), ApiError> {
-    if ctx.shutdown.started_at().is_some() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shutting_down",
-            "Kairos 正在關機",
-        ));
-    }
-    let segs = segments(req.uri().path()).ok_or_else(ApiError::not_found)?;
-    let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-    let ["api", "v1", rest @ ..] = segs.as_slice() else {
-        return Err(ApiError::not_found());
-    };
-    if !matches!(
+/// 需要驗證的路徑（不在這裡的回 404，不先要求驗證）
+fn known_route(rest: &[&str]) -> bool {
+    matches!(
         rest,
-        ["me"]
+        ["me", ..]
             | ["hosts"]
             | ["hosts", _]
             | ["hosts", _, "metrics"]
@@ -517,61 +588,172 @@ async fn route(
             | ["overview"]
             | ["system", "health"]
             | ["events"]
-    ) {
-        return Err(ApiError::not_found());
-    }
-    if req.method() != Method::GET && req.method() != Method::HEAD {
-        return Err(ApiError::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method_not_allowed",
-            "本版的端點只接受 GET",
-        ));
-    }
-    let has_body = req.headers().contains_key(TRANSFER_ENCODING)
-        || req
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.trim() != "0");
-    if has_body {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            "這個端點不接受請求本文",
-        ));
-    }
-    let query = Query::parse(req.uri().query())?;
-    let now = Utc::now();
-    let principal = ctx.auth.authenticate(req.headers(), peer.ip(), now).await?;
-    principal.require(Permission::Read)?;
-    let who = Some(principal.label());
+            | ["enroll", ..]
+            | ["pki", ..]
+            | ["settings", ..]
+            | ["users", ..]
+            | ["roles"]
+            | ["directory", ..]
+            | ["api-tokens", ..]
+            | ["audit", ..]
+            | ["auth", "logout"]
+    )
+}
 
-    if let ["events"] = rest {
-        let last = req
-            .headers()
-            .get("last-event-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| query.get("last_event_id").map(str::to_string));
-        return Ok((events::stream(ctx.clone(), principal, last).await?, who));
-    }
-    let work = dispatch(ctx, rest, &query, &principal, now);
-    match tokio::time::timeout(REQUEST_TIMEOUT, work).await {
-        Ok(r) => r.map(|resp| (resp, who)),
-        Err(_) => {
-            warn!(
-                "主控台的請求 {} 超過 {} 秒",
-                req.uri().path(),
-                REQUEST_TIMEOUT.as_secs()
-            );
+/// 必須先變更密碼時仍可使用的端點
+fn allowed_before_password_change(method: &Method, rest: &[&str]) -> bool {
+    matches!(
+        (method.as_str(), rest),
+        ("GET" | "HEAD", ["me"]) | ("POST", ["me", "password"]) | ("POST", ["auth", "logout"])
+    )
+}
+
+async fn route(
+    ctx: &Arc<ApiContext>,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+    now: DateTime<Utc>,
+) -> (Result<Response<ApiBody>, ApiError>, Option<Principal>) {
+    if ctx.shutdown.started_at().is_some() {
+        return (
             Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "storage_unavailable",
-                "查詢逾時",
-            )
-            .with_product_code("KRS-E4003"))
+                "shutting_down",
+                "Kairos 正在關機",
+            )),
+            None,
+        );
+    }
+    let Some(segs) = segments(req.uri().path()) else {
+        return (Err(ApiError::not_found()), None);
+    };
+    let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+    let ["api", "v1", rest @ ..] = segs.as_slice() else {
+        return (Err(ApiError::not_found()), None);
+    };
+    let method = req.method().clone();
+    // 不需要驗證的端點：登入
+    match (method.as_str(), rest) {
+        ("GET" | "HEAD", ["auth", "methods"]) => return (Ok(account::methods(ctx, now)), None),
+        ("POST", ["auth", "login"]) => return (account::login(ctx, peer, req, now).await, None),
+        ("POST", ["auth", "login", "mfa"]) => {
+            return (account::login_mfa(ctx, peer, req, now).await, None);
+        }
+        (_, ["auth", "methods" | "login"] | ["auth", "login", "mfa"]) => {
+            return (
+                Err(ApiError::new(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "這個端點不接受這個方法",
+                )),
+                None,
+            );
+        }
+        _ => {}
+    }
+    if !known_route(rest) {
+        return (Err(ApiError::not_found()), None);
+    }
+    // 唯讀的端點：方法與本文在驗證之前檢查（與 0.4 相同）
+    let read_only = matches!(
+        rest,
+        ["hosts", ..] | ["overview"] | ["system", "health"] | ["events"]
+    );
+    if read_only {
+        if method != Method::GET && method != Method::HEAD {
+            return (
+                Err(ApiError::new(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "這個端點只接受 GET",
+                )),
+                None,
+            );
+        }
+        let has_body = req.headers().contains_key(TRANSFER_ENCODING)
+            || req
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim() != "0");
+        if has_body {
+            return (
+                Err(ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    "這個端點不接受請求本文",
+                )),
+                None,
+            );
         }
     }
+    let query = match Query::parse(req.uri().query()) {
+        Ok(q) => q,
+        Err(e) => return (Err(e), None),
+    };
+    let principal = match ctx
+        .auth
+        .authenticate(req.headers(), &method, peer.ip(), now)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return (Err(e), None),
+    };
+    if principal.must_change_password() && !allowed_before_password_change(&method, rest) {
+        return (Err(ApiError::password_change_required()), Some(principal));
+    }
+    let p = &principal;
+    let result = match rest {
+        ["auth", "logout"] if method == Method::POST => account::logout(ctx, p, peer, now).await,
+        ["auth", "logout"] => Err(ApiError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "登出只接受 POST",
+        )),
+        ["me"] if method == Method::GET || method == Method::HEAD => query
+            .reject_unknown(&[], &[])
+            .map(|_| http::ok(now, p.me_json())),
+        ["me", sub @ ..] => account::me(ctx, p, peer, sub, req, now).await,
+        ["enroll", ..] | ["pki", ..] | ["settings", ..] => {
+            enroll::handle(ctx, peer, req, p, now).await
+        }
+        ["users", ..] | ["roles"] | ["directory", ..] | ["api-tokens", ..] => {
+            users::handle(ctx, p, peer, rest, req, now).await
+        }
+        ["audit", sub @ ..] => audit_log::handle(ctx, p, peer, sub, &method, &query, now).await,
+        ["events"] => match p.host_access() {
+            Ok(access) => {
+                let last = req
+                    .headers()
+                    .get("last-event-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .or_else(|| query.get("last_event_id").map(str::to_string));
+                events::stream(ctx.clone(), principal.clone(), access, last).await
+            }
+            Err(e) => Err(e),
+        },
+        _ => {
+            let work = dispatch(ctx, rest, &query, p, now);
+            match tokio::time::timeout(REQUEST_TIMEOUT, work).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        "主控台的請求 {} 超過 {} 秒",
+                        req.uri().path(),
+                        REQUEST_TIMEOUT.as_secs()
+                    );
+                    Err(ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "storage_unavailable",
+                        "查詢逾時",
+                    )
+                    .with_product_code("KRS-E4003"))
+                }
+            }
+        }
+    };
+    (result, Some(principal))
 }
 
 async fn dispatch(
@@ -582,26 +764,29 @@ async fn dispatch(
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     match rest {
-        ["me"] => {
-            query.reject_unknown(&[], &[])?;
-            Ok(http::ok(now, principal))
-        }
-        ["hosts"] => hosts::list(ctx, query, now).await,
+        ["hosts"] => hosts::list(ctx, query, &principal.host_access()?, now).await,
         ["hosts", id] => {
             query.reject_unknown(&[], &[])?;
-            hosts::detail(ctx, id, now).await
+            hosts::detail(ctx, id, &principal.host_access()?, now).await
         }
         ["hosts", id, "metrics"] => {
             query.reject_unknown(&[], &[])?;
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
             metrics::list(ctx, id, now).await
         }
-        ["hosts", id, "metrics", name] => metrics::trend(ctx, id, name, query, now).await,
+        ["hosts", id, "metrics", name] => {
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            metrics::trend(ctx, id, name, query, now).await
+        }
         ["overview"] => {
             query.reject_unknown(&["group"], &[])?;
-            overview::get(ctx, now).await
+            let access = principal.host_access()?;
+            let show_health = principal.grants.has(Permission::HealthRead);
+            overview::get(ctx, &access, show_health, now).await
         }
         ["system", "health"] => {
             query.reject_unknown(&[], &[])?;
+            principal.require(Permission::HealthRead)?;
             Ok(http::ok(now, health::compute(ctx, now).await?))
         }
         _ => Err(ApiError::not_found()),

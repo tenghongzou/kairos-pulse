@@ -353,6 +353,93 @@ ALTER TABLE hosts ADD COLUMN last_grace_attempt TEXT;
 CREATE INDEX hosts_hostname ON hosts (hostname);
 ";
 
+/// schema v6（0.6）：使用者、角色指派、工作階段、TOTP 復原碼（審計 F6；`kairos/API.md` 第 12 節）、
+/// 稽核事件的雜湊鏈（`prev_hash`、`hash`，[`crate::audit`]）、API token 的擁有者與角色、主機群組
+/// （角色指派的範圍）。
+///
+/// **與 v5 的關係**：v5 保留給告警（另一條開發線）。這一版只建立新的資料表，並在 v4 既有的資料表
+/// （`api_tokens`、`audit_events`、`hosts`）加欄位，不依賴 v5 的任何物件：可以直接接在 v4 之後
+/// （本分支），也可以接在 v5 之後（整合後）。`migrate` 依版本號套用，版本號不必連續。
+///
+/// 既有的 API token：`role`、`owner_user_id` 為 NULL，維持升級前的範圍（`scope`）與權限（[`crate::rbac::LegacyScope`]）。
+/// 既有的稽核事件：沒有雜湊，第一次寫入或驗證時依 id 順序補上（[`crate::audit::seal_legacy`]）。
+const SCHEMA_V6: &str = "
+CREATE TABLE users (
+    user_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username       TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    display_name   TEXT,
+    email          TEXT,
+    source         TEXT NOT NULL DEFAULT 'local',
+    ldap_dn        TEXT,
+    password_hash  TEXT,
+    password_changed_at INTEGER,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    totp_secret    BLOB,
+    totp_pending   BLOB,
+    totp_enabled_at INTEGER,
+    totp_last_step INTEGER,
+    state          TEXT NOT NULL DEFAULT 'active',
+    failed_logins  INTEGER NOT NULL DEFAULT 0,
+    locked_until   INTEGER,
+    last_login_at  INTEGER,
+    last_login_ip  TEXT,
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    disabled_at    INTEGER,
+    disabled_by    TEXT,
+    disable_reason TEXT
+);
+
+CREATE TABLE user_recovery_codes (
+    user_id        INTEGER NOT NULL,
+    code_hash      BLOB NOT NULL,
+    used_at        INTEGER,
+    PRIMARY KEY (user_id, code_hash)
+) WITHOUT ROWID;
+
+CREATE TABLE role_assignments (
+    assignment_id  INTEGER PRIMARY KEY,
+    subject_type   TEXT NOT NULL,
+    subject        TEXT NOT NULL,
+    role           TEXT NOT NULL,
+    scope_type     TEXT NOT NULL DEFAULT 'global',
+    scope_value    TEXT NOT NULL DEFAULT '',
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    UNIQUE (subject_type, subject, role, scope_type, scope_value)
+);
+CREATE INDEX role_assignments_subject ON role_assignments (subject_type, subject);
+
+CREATE TABLE sessions (
+    session_hash   BLOB PRIMARY KEY,
+    public_id      TEXT NOT NULL UNIQUE,
+    user_id        INTEGER NOT NULL,
+    method         TEXT NOT NULL,
+    ldap_groups    TEXT,
+    created_at     INTEGER NOT NULL,
+    last_seen_at   INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    idle_timeout_ms INTEGER NOT NULL,
+    ip             TEXT,
+    user_agent     TEXT,
+    ended_at       INTEGER,
+    end_reason     TEXT,
+    ended_by       TEXT
+) WITHOUT ROWID;
+CREATE INDEX sessions_user ON sessions (user_id, ended_at);
+
+ALTER TABLE api_tokens ADD COLUMN owner_user_id INTEGER;
+ALTER TABLE api_tokens ADD COLUMN role TEXT;
+
+ALTER TABLE audit_events ADD COLUMN prev_hash TEXT;
+ALTER TABLE audit_events ADD COLUMN hash TEXT;
+CREATE INDEX audit_events_actor ON audit_events (actor, id);
+
+ALTER TABLE hosts ADD COLUMN host_group TEXT;
+CREATE INDEX hosts_group ON hosts (host_group);
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -371,10 +458,15 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: SCHEMA_V4,
     },
+    // v5：告警（另一條開發線，整合時插在這裡）
+    Migration {
+        version: 6,
+        sql: SCHEMA_V6,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";

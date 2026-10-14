@@ -120,13 +120,22 @@ pub fn query_failed(what: &'static str) -> impl Fn(rusqlite::Error) -> ApiError 
 /// （[`open_existing_read_write`]：在 Kairos 行程內以 `std::fs` 開關資料庫檔會放掉 writer 的鎖）
 pub struct WriteConn {
     opts: SqliteOptions,
+    busy: Duration,
     conn: Mutex<Option<Connection>>,
 }
 
+/// 使用者管理、登入、稽核等互動寫入的 busy 等待上限（比背景工作長：使用者正在等結果）
+pub const ADMIN_WRITE_BUSY: Duration = Duration::from_secs(2);
+
 impl WriteConn {
     pub fn new(opts: SqliteOptions) -> Arc<Self> {
+        Self::with_busy(opts, WRITE_BUSY)
+    }
+
+    pub fn with_busy(opts: SqliteOptions, busy: Duration) -> Arc<Self> {
         Arc::new(Self {
             opts,
+            busy,
             conn: Mutex::new(None),
         })
     }
@@ -142,7 +151,7 @@ impl WriteConn {
             let mut guard = this.conn.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_none() {
                 *guard = Some(
-                    open_existing_read_write(&this.opts.path, WRITE_BUSY)
+                    open_existing_read_write(&this.opts.path, this.busy)
                         .map_err(|e| e.to_string())?,
                 );
             }

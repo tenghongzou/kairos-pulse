@@ -11,9 +11,10 @@ use std::ffi::OsString;
 use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use crate::api::tokens::{self, NewToken, Revoked, SCOPE_READ, TokenRow, TokenState};
+use crate::api::tokens::{self, NewToken, Revoked, TokenGrant, TokenRow, TokenState};
 use crate::config::{AppConfig, StorageBackend, take_config_arg};
 use crate::hosts_cli::{ascii_json, display_width, parse_duration, use_unicode};
+use crate::rbac::{LegacyScope, Role};
 use crate::storage::fmt_time;
 use crate::store::sqlite::{DB_FILE, SqliteOptions, open_admin};
 
@@ -21,7 +22,7 @@ use crate::store::sqlite::{DB_FILE, SqliteOptions, open_admin};
 pub const TOKEN_USAGE: &str = "kairos api-token — 主控台 API（kairos/API.md）的 token
 
 用法：
-  kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期>] [選項]
+  kairos api-token create --name <名稱> [--role <角色> | --user <帳號> [--role <角色>]] [--expires-in <時間> | --expires-at <日期>] [選項]
   kairos api-token list [--all] [選項]
   kairos api-token revoke <token_id> [--reason <原因>] [--yes] [選項]
 
@@ -29,8 +30,10 @@ create 的選項：
   --name <名稱>          用途說明（1～64 個字元），例如 grafana、console-dev
   --expires-in <時間>    多久後到期，例如 90d、12h、2w（預設 90d，上限 3650d）
   --expires-at <日期>    到期日：2027-01-01（UTC 當天 00:00）或 RFC 3339 時間
-  --scope <範圍>         read（預設，唯讀）、operate（日常的註冊與憑證操作）、admin（另含簽發自動核准 token、
-                         模式、政策與 CA 的操作）；見 API.md 第 11.1 節
+  --role <角色>          token 的角色：viewer（預設，唯讀）、auditor、operator、admin（全站；kairos/API.md 第 12.1 節）
+  --user <帳號>          token 屬於這個使用者：權限＝使用者目前的權限（另有 --role 時取交集）；
+                         使用者停用或刪除時 token 立即失效
+  --scope <範圍>         〔已棄用〕0.5 的範圍 read、operate、admin（權限凍結在 0.5；改用 --role）
 
 list 的選項：
   --all                  也列出已撤銷與已過期的 token
@@ -79,6 +82,20 @@ pub enum Expiry {
     At(DateTime<Utc>),
 }
 
+/// token 的權限來源（命令列；`--user` 在執行時查詢使用者）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantSpec {
+    /// `--scope`（已棄用）
+    Legacy(LegacyScope),
+    /// `--role`（預設 viewer）
+    Role(Role),
+    /// `--user`（＋選用的 `--role`）
+    User {
+        username: String,
+        role: Option<Role>,
+    },
+}
+
 /// 子命令
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenAction {
@@ -86,8 +103,7 @@ pub enum TokenAction {
     Create {
         name: String,
         expiry: Expiry,
-        /// `read`（預設）、`operate`、`admin`（API.md 第 11.1 節）
-        scope: String,
+        grant: GrantSpec,
     },
     List {
         all: bool,
@@ -138,7 +154,9 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
     let mut config_path = None;
     let (mut json, mut ascii, mut all, mut yes) = (false, false, false, false);
     let mut name = None;
-    let mut scope: Option<String> = None;
+    let mut scope: Option<LegacyScope> = None;
+    let mut role: Option<Role> = None;
+    let mut user: Option<String> = None;
     let mut reason = None;
     let mut expires_in = None;
     let mut expires_at = None;
@@ -190,11 +208,19 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
             "--reason" if sub == "revoke" => reason = Some(value("--reason")?),
             "--scope" if sub == "create" => {
                 let s = value("--scope")?;
-                if !tokens::SCOPES.contains(&s.as_str()) {
-                    return Err(format!("--scope 的值 \"{s}\" 無效（read、operate、admin）"));
-                }
-                scope = Some(s);
+                scope = Some(LegacyScope::parse(&s).ok_or_else(|| {
+                    format!(
+                        "--scope 的值 \"{s}\" 無效（read、operate、admin；已棄用，建議改用 --role）"
+                    )
+                })?);
             }
+            "--role" if sub == "create" => {
+                let r = value("--role")?;
+                role = Some(Role::parse(&r).ok_or_else(|| {
+                    format!("--role 的值 \"{r}\" 無效（viewer、auditor、operator、admin）")
+                })?);
+            }
+            "--user" if sub == "create" => user = Some(value("--user")?),
             "--expires-in" if sub == "create" => {
                 let v = value("--expires-in")?;
                 let d = parse_duration(&v)
@@ -231,10 +257,18 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
                     return Err("--expires-in、--expires-at 只能擇一".to_string());
                 }
             };
+            let grant = match (scope, role, user) {
+                (Some(_), _, Some(_)) | (Some(_), Some(_), _) => {
+                    return Err("--scope（已棄用）不能與 --role、--user 一起使用".to_string());
+                }
+                (Some(s), None, None) => GrantSpec::Legacy(s),
+                (None, role, Some(username)) => GrantSpec::User { username, role },
+                (None, role, None) => GrantSpec::Role(role.unwrap_or(Role::Viewer)),
+            };
             TokenAction::Create {
                 name,
                 expiry,
-                scope: scope.unwrap_or_else(|| SCOPE_READ.to_string()),
+                grant,
             }
         }
         "list" => {
@@ -507,6 +541,9 @@ fn row_json(r: &TokenRow, now_ms: i64) -> Value {
         "token_id": r.token_id,
         "name": r.name,
         "scope": r.scope,
+        "role": r.role,
+        "owner": r.owner_username,
+        "grant": r.grant_label(),
         "state": r.state(now_ms).as_str(),
         "created_at": t(Some(r.created_at)),
         "created_by": r.created_by,
@@ -593,7 +630,7 @@ pub fn execute(
         TokenAction::Create {
             name,
             expiry,
-            scope,
+            grant,
         } => {
             let expires_at = match expiry {
                 Expiry::Default => Some(now_ms + (DEFAULT_EXPIRY_DAYS * 86_400_000) as i64),
@@ -620,8 +657,39 @@ pub fn execute(
                 Err(f) => return fail(f),
             };
             let by = operator();
+            let grant = match grant {
+                GrantSpec::Legacy(s) => TokenGrant::Legacy(*s),
+                GrantSpec::Role(r) => TokenGrant::Role(*r),
+                GrantSpec::User { username, role } => {
+                    match crate::users::store::find_user(&conn, username) {
+                        Ok(Some(u)) if u.active() => TokenGrant::User {
+                            user_id: u.user_id,
+                            username: u.username,
+                            role: *role,
+                        },
+                        Ok(Some(_)) => {
+                            return fail(Failure::new(
+                                format!("使用者 {username} 已停用"),
+                                "停用的使用者不能擁有新的 API token",
+                                vec!["先以 kairos users enable 啟用，或改用 --role。".to_string()],
+                                EXIT_USAGE,
+                            ));
+                        }
+                        Ok(None) => {
+                            return fail(Failure::new(
+                                format!("找不到使用者 {username}"),
+                                "--user 必須是既有的帳號",
+                                vec!["以 kairos users list 確認帳號。".to_string()],
+                                EXIT_USAGE,
+                            ));
+                        }
+                        Err(e) => return fail(db_failure(e)),
+                    }
+                }
+            };
             let NewToken { token, row } =
-                match tokens::create(&conn, name, scope, expires_at, Some(&by), now_ms) {
+                match tokens::create_with(&conn, name, &grant, expires_at, Some(&by), None, now_ms)
+                {
                     Ok(t) => t,
                     Err(e) => return fail(db_failure(e)),
                 };
@@ -643,8 +711,15 @@ pub fn execute(
             Output {
                 stdout: format!("{token}\n"),
                 stderr: format!(
-                    "{ok_mark} 已建立 API token「{}」（token_id {}，範圍 {}，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n",
-                    row.name, row.token_id, row.scope
+                    "{ok_mark} 已建立 API token「{}」（token_id {}，權限 {}，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n{}",
+                    row.name,
+                    row.token_id,
+                    row.grant_label(),
+                    if matches!(grant, TokenGrant::Legacy(_)) {
+                        "  注意：--scope 已棄用（權限凍結在 0.5 的範圍），建議改用 --role 或 --user。\n"
+                    } else {
+                        ""
+                    }
                 ),
                 exit: 0,
             }
@@ -688,7 +763,7 @@ pub fn execute(
             let mut t = vec![vec![
                 "TOKEN_ID".to_string(),
                 "名稱".to_string(),
-                "範圍".to_string(),
+                "權限".to_string(),
                 "狀態".to_string(),
                 format!("建立（{zone}）"),
                 format!("到期（{zone}）"),
@@ -701,7 +776,7 @@ pub fn execute(
                         .chars()
                         .map(|c| if c.is_control() { '?' } else { c })
                         .collect(),
-                    r.scope.clone(),
+                    r.grant_label(),
                     state_label(r.state(now_ms)).to_string(),
                     format!(
                         "{} {}",
@@ -909,7 +984,7 @@ mod tests {
             TokenAction::Create {
                 name: "grafana".into(),
                 expiry: Expiry::In(std::time::Duration::from_secs(30 * 86_400)),
-                scope: "read".into(),
+                grant: GrantSpec::Role(Role::Viewer),
             }
         );
         assert!(c.json);
@@ -1069,7 +1144,7 @@ mod tests {
                 TokenAction::Create {
                     name: "grafana".into(),
                     expiry: Expiry::Default,
-                    scope: "read".into(),
+                    grant: GrantSpec::Role(Role::Viewer),
                 },
                 false,
             ),
@@ -1095,7 +1170,7 @@ mod tests {
                 TokenAction::Create {
                     name: "主控台".into(),
                     expiry: Expiry::In(std::time::Duration::from_secs(10 * 86_400)),
-                    scope: "read".into(),
+                    grant: GrantSpec::Role(Role::Viewer),
                 },
                 true,
             ),
@@ -1226,7 +1301,7 @@ mod tests {
                 TokenAction::Create {
                     name: "x".into(),
                     expiry: Expiry::At(now - chrono::Duration::days(1)),
-                    scope: "read".into(),
+                    grant: GrantSpec::Role(Role::Viewer),
                 },
                 false,
             ),

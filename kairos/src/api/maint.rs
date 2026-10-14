@@ -23,6 +23,8 @@ use super::tokens::{self, LOGGED_CREATED, LOGGED_REVOKED};
 const TICK: Duration = Duration::from_secs(1);
 const MINUTE_EVERY: u64 = 60;
 const AUDIT_EVERY: u64 = 10;
+/// 每小時清除結束或逾時超過 30 天的工作階段紀錄
+const SESSION_PURGE_EVERY: u64 = 3600;
 
 pub async fn run(ctx: Arc<ApiContext>) {
     let mut ticker = interval(TICK);
@@ -38,6 +40,12 @@ pub async fn run(ctx: Arc<ApiContext>) {
             sample_minute(&ctx).await;
             flush_last_used(&ctx).await;
             ctx.auth.failures.prune(Instant::now());
+            let now_ms = Utc::now().timestamp_millis();
+            ctx.login.prune(now_ms);
+            ctx.login.phantom.prune(now_ms);
+        }
+        if tick.is_multiple_of(SESSION_PURGE_EVERY) {
+            purge_sessions(&ctx).await;
         }
         if tick.is_multiple_of(AUDIT_EVERY) {
             audit_tokens(&ctx).await;
@@ -47,6 +55,17 @@ pub async fn run(ctx: Arc<ApiContext>) {
     }
     // 關機前把最後使用時間寫回
     flush_last_used(&ctx).await;
+}
+
+async fn purge_sessions(ctx: &Arc<ApiContext>) {
+    let now_ms = Utc::now().timestamp_millis();
+    if let Err(e) = ctx
+        .admin
+        .write(move |c| crate::users::store::purge_sessions(c, now_ms))
+        .await
+    {
+        warn!("無法清除過期的工作階段紀錄（稍後重試）: {e}");
+    }
 }
 
 /// 每分鐘的上線數

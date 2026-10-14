@@ -12,7 +12,7 @@ use hyper::StatusCode;
 use hyper::body::Bytes;
 use log::debug;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,6 +22,7 @@ use tokio::time::{MissedTickBehavior, interval_at};
 use super::ApiContext;
 use super::auth::Principal;
 use super::http::{ApiBody, ApiError, event_stream, ts};
+use crate::rbac::HostAccess;
 use crate::registry::{HostChange, HostChangeKind};
 use crate::shutdown::Shutdown;
 
@@ -240,9 +241,39 @@ fn resync_event(reason: &str) -> Bytes {
 }
 
 /// `GET /api/v1/events`
+/// 群組範圍的身分看得到的主機（`None`：全部）
+async fn visible_hosts(ctx: &ApiContext, access: &HostAccess) -> Option<HashSet<String>> {
+    match access {
+        HostAccess::All => None,
+        a => Some(
+            ctx.hosts
+                .snapshot(ctx)
+                .await
+                .map(|snap| {
+                    snap.hosts
+                        .iter()
+                        .filter(|h| a.allows(h.host_group.as_deref()))
+                        .map(|h| h.agent_id.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// 事件屬於哪一台主機
+fn event_agent(data: &str) -> Option<String> {
+    serde_json::from_str::<Value>(data)
+        .ok()?
+        .get("agent_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
 pub async fn stream(
     ctx: Arc<ApiContext>,
     principal: Principal,
+    mut access: HostAccess,
     last_event_id: Option<String>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let permit: OwnedSemaphorePermit = ctx.streams.clone().try_acquire_owned().map_err(|_| {
@@ -277,13 +308,22 @@ pub async fn stream(
     }
     let hub = ctx.events.clone();
     let shutdown = ctx.shutdown.clone();
-    let token_id = principal.token_id().to_string();
     let ctx_for_auth = ctx.clone();
+    let mut allowed = visible_hosts(&ctx, &access).await;
     tokio::spawn(async move {
         let mut last_sent = last;
         let mut overflow = false;
+        let visible = |allowed: &Option<HashSet<String>>, data: &str| {
+            allowed
+                .as_ref()
+                .is_none_or(|set| event_agent(data).is_some_and(|a| set.contains(&a)))
+        };
         // 補送的事件可能比緩衝多：逐則等待送出
         for ev in backlog {
+            if !visible(&allowed, &ev.data) {
+                last_sent = last_sent.max(ev.seq);
+                continue;
+            }
             if tx
                 .send(sse_event(Some(&hub.id(ev.seq)), ev.kind, &ev.data))
                 .await
@@ -303,7 +343,8 @@ pub async fn stream(
                 msg = rx.recv() => match msg {
                     Ok(HubMsg::Event(ev)) if ev.seq > last_sent => {
                         last_sent = ev.seq;
-                        Some(sse_event(Some(&hub.id(ev.seq)), ev.kind, &ev.data))
+                        visible(&allowed, &ev.data)
+                            .then(|| sse_event(Some(&hub.id(ev.seq)), ev.kind, &ev.data))
                     }
                     Ok(HubMsg::Event(_)) => None,
                     Ok(HubMsg::Resync(reason)) => Some(resync_event(reason)),
@@ -315,10 +356,18 @@ pub async fn stream(
                 },
                 _ = heartbeat.tick() => {
                     let now = Utc::now();
-                    if !ctx_for_auth.auth.still_valid(&token_id, now).await {
-                        debug!("主控台事件：token {token_id} 已撤銷或過期，關閉串流");
-                        return;
+                    // 權限與範圍每次心跳重新計算：撤銷、結束、停用或降權後不再推送
+                    if let Some(a) = ctx_for_auth.auth.revalidate(&principal, now).await {
+                        if a == HostAccess::None {
+                            debug!(
+                                "主控台事件：{} 已撤銷、過期、結束或沒有主機的讀取權限，關閉串流",
+                                principal.label()
+                            );
+                            return;
+                        }
+                        access = a;
                     }
+                    allowed = visible_hosts(&ctx_for_auth, &access).await;
                     Some(Bytes::from(format!(": heartbeat {}\n\n", ts(now))))
                 }
             };
