@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use std::fmt;
 use std::io::{Error, ErrorKind};
 
+use crate::lifecycle::{Deregister, DeregisterAck, RenewRequest, RenewResult};
 use crate::metrics::Metric;
 
 /// 日誌中顯示無效 `proto` 原始值的長度上限（字元）
@@ -174,7 +175,7 @@ fn to_part<T: Serialize>(part: &Result<T, String>) -> Result<Value, String> {
     }
 }
 
-/// hello 中 v1 以外的欄位（v2 的版本協商與主機資訊）。
+/// hello 中 v1 以外的欄位（v2 的版本協商與主機資訊，以及 feature `deregister` 的 `intent`）。
 ///
 /// 兩部分各自解析：型別錯誤只讓該部分變成 `Err`（內含錯誤說明），hello 本身仍可解析，
 /// 由伺服器依協商結果決定是否回 `bad_request`。`Err` 的部分不能序列化。
@@ -184,15 +185,25 @@ pub struct HelloExt {
     pub offer: Result<ProtoOffer, String>,
     /// `host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`
     pub host: Result<HostInfo, String>,
+    /// `intent`（PROTOCOL.md「憑證輪替與除役」）：目前只定義
+    /// [`INTENT_DEREGISTER`](crate::INTENT_DEREGISTER)。不是字串時視為沒有；`None` 時不輸出
+    pub intent: Option<String>,
 }
 
 impl HelloExt {
-    /// v2 client 的 hello 欄位
+    /// v2 client 的 hello 欄位（沒有 `intent`）
     pub fn new(offer: ProtoOffer, host: HostInfo) -> Self {
         Self {
             offer: Ok(offer),
             host: Ok(host),
+            intent: None,
         }
+    }
+
+    /// 加上 `intent`（除役通知的連線）
+    pub fn with_intent(mut self, intent: impl Into<String>) -> Self {
+        self.intent = Some(intent.into());
+        self
     }
 }
 
@@ -205,7 +216,18 @@ impl Default for HelloExt {
 
 impl Serialize for HelloExt {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        serialize_merged(&[to_part(&self.offer), to_part(&self.host)], s)
+        let mut intent = Map::new();
+        if let Some(i) = &self.intent {
+            intent.insert("intent".into(), Value::String(i.clone()));
+        }
+        serialize_merged(
+            &[
+                to_part(&self.offer),
+                to_part(&self.host),
+                Ok(Value::Object(intent)),
+            ],
+            s,
+        )
     }
 }
 
@@ -215,6 +237,10 @@ impl<'de> Deserialize<'de> for HelloExt {
         Ok(Self {
             offer: parse_part(&fields),
             host: parse_part(&fields),
+            intent: fields
+                .get("intent")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 }
@@ -422,6 +448,10 @@ pub enum ClientMsg {
         #[serde(flatten)]
         body: ReportBody,
     },
+    /// 正常輪替（feature `renew`）。協商了 `renew` 時才會送出；沒有協商時伺服器視同不認得的 `type`
+    RenewRequest(Box<RenewRequest>),
+    /// 除役通知（feature `deregister`，只在 `intent: "deregister"` 的連線上）
+    Deregister(Box<Deregister>),
     /// 不認得的 `type`；`serde(other)` 只能用於 unit 變體，因此拿不到 seq。
     /// 只出現在解析結果中，不能序列化。
     #[serde(other, skip_serializing)]
@@ -443,6 +473,20 @@ pub enum ServerMsg {
         /// 伺服器送出 hello_ack 時的時間，RFC 3339 UTC 毫秒（v2；協商結果為 v1 時不送）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_time: Option<String>,
+        /// 過期寬限期的天數（雙方協商了 `renew` 時才送）。不是合法 u32 時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "de_lenient_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
+        expired_renew_grace_days: Option<u32>,
+        /// Kairos 要求這台主機提早輪替（雙方協商了 `renew` 時，選用）。不是布林時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "de_lenient_bool",
+            skip_serializing_if = "Option::is_none"
+        )]
+        renew_now: Option<bool>,
     },
     Ack {
         seq: u64,
@@ -473,6 +517,10 @@ pub enum ServerMsg {
         )]
         proto_max: Option<u32>,
     },
+    /// 正常輪替的結果（feature `renew`）
+    RenewResult(Box<RenewResult>),
+    /// 除役通知的回應（feature `deregister`）
+    DeregisterAck(Box<DeregisterAck>),
 }
 
 /// 寬鬆的 u32：不是合法 u32 的值（字串、負數、小數、null 等）視為 `None`
@@ -482,13 +530,24 @@ fn de_lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Err
         .and_then(|n| u32::try_from(n).ok()))
 }
 
+/// 寬鬆的布林：不是布林的值（字串、數字、null 等）視為 `None`
+fn de_lenient_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    Ok(Value::deserialize(d)?.as_bool())
+}
+
 /// error 訊息缺少 `fatal` 欄位時的預設值
 fn fatal_by_default() -> bool {
     true
 }
 
 /// [`ServerMsg`] 的所有 `type` 值；不在其中的視為未知類型（見 [`parse_server_msg`]）
-pub const SERVER_MSG_TYPES: [&str; 3] = ["hello_ack", "ack", "error"];
+pub const SERVER_MSG_TYPES: [&str; 5] = [
+    "hello_ack",
+    "ack",
+    "error",
+    "renew_result",
+    "deregister_ack",
+];
 
 /// 規格定義的錯誤碼（只能用這些）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,13 +564,19 @@ pub enum ErrorCode {
     AuthFailed,
     /// 連線期間重新驗證時，客戶端憑證已被撤銷、過期或不再受信任
     CertificateRejected,
-    /// 伺服器無法寫入這筆 report；資料未保存
+    /// 伺服器無法寫入這筆 report；資料未保存（`renew_request`、`deregister`：無法保存）
     StorageUnavailable,
+    /// `renew_request`：政策要求人工核准，已進入待核准佇列（核准後以同一個 CSR 重送）
+    RenewRequiresApproval,
+    /// `renew_request`：CSR 不符規定
+    InvalidCsr,
+    /// `renew_request`：同一個 `agent_id` 每小時超過 10 次
+    RateLimited,
 }
 
 impl ErrorCode {
     /// 所有錯誤碼（順序同 PROTOCOL.md 的錯誤碼表以外無特別意義）
-    pub const ALL: [ErrorCode; 11] = [
+    pub const ALL: [ErrorCode; 14] = [
         ErrorCode::UnsupportedVersion,
         ErrorCode::HelloRequired,
         ErrorCode::TooLong,
@@ -523,6 +588,9 @@ impl ErrorCode {
         ErrorCode::AuthFailed,
         ErrorCode::CertificateRejected,
         ErrorCode::StorageUnavailable,
+        ErrorCode::RenewRequiresApproval,
+        ErrorCode::InvalidCsr,
+        ErrorCode::RateLimited,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -538,6 +606,9 @@ impl ErrorCode {
             ErrorCode::AuthFailed => "auth_failed",
             ErrorCode::CertificateRejected => "certificate_rejected",
             ErrorCode::StorageUnavailable => "storage_unavailable",
+            ErrorCode::RenewRequiresApproval => "renew_requires_approval",
+            ErrorCode::InvalidCsr => "invalid_csr",
+            ErrorCode::RateLimited => "rate_limited",
         }
     }
 
@@ -613,6 +684,21 @@ pub fn hello_seq_of_invalid(line: &str) -> Option<u64> {
         return None;
     }
     probe.seq?.as_u64()
+}
+
+/// 一行訊息的 `type`（是 JSON 物件且 `type` 為字串時），不論其他欄位是否合法。
+/// 用來區分無法解析的 `renew_request`／`deregister`：沒有協商對應的 feature 時，伺服器與舊版一樣
+/// 回 `unknown_type`，而不是 `bad_request`
+pub fn message_type(line: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(rename = "type")]
+        kind: Option<Value>,
+    }
+    match serde_json::from_str::<Probe>(line).ok()?.kind? {
+        Value::String(kind) => Some(kind),
+        _ => None,
+    }
 }
 
 /// [`parse_server_msg`] 的失敗原因
@@ -747,6 +833,8 @@ mod tests {
                 offline_after_ms: offline_after_ms(1000),
                 features: None,
                 server_time: None,
+                expired_renew_grace_days: None,
+                renew_now: None,
             },
             server_vector("hello_ack"),
         );
@@ -1003,6 +1091,8 @@ mod tests {
                 offline_after_ms: 5000,
                 features: None,
                 server_time: None,
+                expired_renew_grace_days: None,
+                renew_now: None,
             }
         );
     }
@@ -1147,9 +1237,21 @@ mod tests {
                 offline_after_ms: 5000,
                 features: None,
                 server_time: None,
+                expired_renew_grace_days: None,
+                renew_now: None,
             },
             ServerMsg::Ack { seq: 1 },
             ServerMsg::error(None, ErrorCode::BadRequest, "x"),
+            parse_server_msg(crate::tests::server_vector_in(
+                crate::tests::Ver::Renew,
+                "renew_result",
+            ))
+            .unwrap(),
+            parse_server_msg(crate::tests::server_vector_in(
+                crate::tests::Ver::Deregister,
+                "deregister_ack",
+            ))
+            .unwrap(),
         ];
         let kinds: Vec<String> = samples
             .iter()
@@ -1261,6 +1363,8 @@ mod tests {
                 offline_after_ms: 75000,
                 features: Some(vec!["metrics".into()]),
                 server_time: Some("2026-10-08T03:15:40.012Z".into()),
+                expired_renew_grace_days: None,
+                renew_now: None,
             }
         );
         let body = report_body(client_vector_in(Ver::V2, "report"));
@@ -1570,6 +1674,8 @@ mod tests {
                 offline_after_ms: 5000,
                 features: None,
                 server_time: None,
+                expired_renew_grace_days: None,
+                renew_now: None,
             }
         );
         // 新 Pulse 在 v1 連線送出的 report 就是 v1 向量，舊 Kairos 可解析
@@ -1608,6 +1714,51 @@ mod tests {
                 fatal: true
             }
         );
+    }
+
+    #[test]
+    fn old_peers_and_the_lifecycle_messages() {
+        use crate::tests::client_vector_in;
+        // 舊版 Kairos（凍結的型別）收到 renew_request／deregister：不認得的 type（回 unknown_type），
+        // hello 的 intent 被忽略
+        for kind in ["renew_request", "deregister"] {
+            let ver = if kind == "deregister" {
+                Ver::Deregister
+            } else {
+                Ver::Renew
+            };
+            assert!(matches!(
+                serde_json::from_str::<frozen_v1::ClientMsg>(client_vector_in(ver, kind)).unwrap(),
+                frozen_v1::ClientMsg::Unknown
+            ));
+        }
+        assert!(matches!(
+            serde_json::from_str::<frozen_v1::ClientMsg>(client_vector_in(
+                Ver::Deregister,
+                "hello"
+            ))
+            .unwrap(),
+            frozen_v1::ClientMsg::Hello { .. }
+        ));
+        // 舊版 Pulse 收到帶新欄位的 hello_ack（只在它宣告 renew 時才會送，舊版不會宣告）也只會忽略
+        assert_eq!(
+            serde_json::from_str::<frozen_v1::ServerMsg>(server_vector_in(Ver::Renew, "hello_ack"))
+                .unwrap(),
+            frozen_v1::ServerMsg::HelloAck {
+                seq: 1,
+                proto: 2,
+                offline_after_ms: 75000
+            }
+        );
+        // 新版 Pulse 連上舊版 Kairos：hello_ack 沒有新欄位
+        assert!(matches!(
+            parse_server_msg(server_vector_in(Ver::V2, "hello_ack")).unwrap(),
+            ServerMsg::HelloAck {
+                expired_renew_grace_days: None,
+                renew_now: None,
+                ..
+            }
+        ));
     }
 
     #[test]

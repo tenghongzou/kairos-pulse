@@ -189,3 +189,92 @@ fn v1_client_and_new_pulse_share_one_new_kairos() {
     assert!(v2["os"].is_object(), "{agents}");
     assert!(!p.stderr().contains("[ERROR]"), "{}", p.dump());
 }
+
+#[test]
+fn old_pulse_wire_format_is_unchanged_with_the_lifecycle_features() {
+    // 0.5 的 Kairos（SQLite，有註冊服務）對沒有宣告 renew／deregister 的 client：hello_ack 與 0.4 相同，
+    // renew_request／deregister（含欄位不合法的）與 0.4 一樣是 unknown_type（seq 為 null、非 fatal）
+    let root = TestDir::new("compat-lifecycle");
+    let kairos = Kairos::new(&root, test_pki::CRL_EMPTY);
+    let mut k = kairos.start();
+    let unknown = json!({"type":"error","seq":null,"code":"unknown_type","message":"unknown message type","fatal":false});
+    let renew = json!({"type":"renew_request","seq":2,"ts":"2026-10-14T02:00:01.000Z",
+        "request_id":"5b0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","csr":"MIIB","sent_at":"2026-10-14T02:00:01.000Z"});
+
+    // v1（0.1.0）的 Pulse
+    let mut old = RawClient::connect(kairos.port, REVOKED);
+    old.send(&v1_hello(REVOKED.agent_id));
+    assert_eq!(
+        old.recv(),
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+    old.send(&renew);
+    assert_eq!(old.recv(), unknown);
+    old.send(&json!({"type":"deregister","seq":3}));
+    assert_eq!(old.recv(), unknown);
+    old.send(&json!({"type":"heartbeat","seq":4,"ts":"2026-10-14T02:00:02.000Z"}));
+    assert_eq!(old.recv(), json!({"type":"ack","seq":4}));
+    old.close();
+
+    // 0.4 的 Pulse（v2，宣告 metrics、durable）：hello_ack 只有 0.4 的欄位，features 不含 renew／deregister
+    let mut v04 = RawClient::connect(kairos.port, GOOD);
+    v04.send(&json!({
+        "type": "hello", "seq": 1, "proto": 1, "proto_min": 1, "proto_max": 2,
+        "features": ["metrics", "durable"], "agent_id": test_pki::GOOD_ID, "hostname": "pulse-04",
+        "agent_version": "0.4.0", "heartbeat_interval_ms": 1000, "ts": "2026-10-14T02:00:00.001Z"
+    }));
+    let ack = v04.recv();
+    let mut keys: Vec<&str> = ack
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "features",
+            "offline_after_ms",
+            "proto",
+            "seq",
+            "server_time",
+            "type"
+        ],
+        "{ack}"
+    );
+    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    assert_eq!(ack["proto"], 2);
+    v04.send(&renew);
+    assert_eq!(v04.recv(), unknown);
+    v04.send(&json!({"type":"heartbeat","seq":3,"ts":"2026-10-14T02:00:02.000Z"}));
+    assert_eq!(v04.recv(), json!({"type":"ack","seq":3}));
+    v04.close();
+
+    // 同一個 client 宣告 renew 時才列出，並帶寬限天數
+    let mut v05 = RawClient::connect(kairos.port, GOOD);
+    v05.send(&json!({
+        "type": "hello", "seq": 1, "proto": 1, "proto_min": 1, "proto_max": 2,
+        "features": ["metrics", "durable", "renew"], "agent_id": test_pki::GOOD_ID,
+        "hostname": "pulse-05", "agent_version": "0.5.0", "heartbeat_interval_ms": 1000,
+        "ts": "2026-10-14T02:00:00.001Z"
+    }));
+    let ack = v05.recv();
+    assert_eq!(
+        ack["features"],
+        json!(["metrics", "durable", "renew"]),
+        "{ack}"
+    );
+    assert!(ack["expired_renew_grace_days"].is_u64(), "{ack}");
+    // 協商了 renew：欄位不合法的 renew_request 是 bad_request（不是 unknown_type）
+    v05.send(&json!({"type":"renew_request","seq":2}));
+    let err = v05.recv();
+    assert_eq!(
+        (&err["code"], &err["fatal"]),
+        (&json!("bad_request"), &json!(false)),
+        "{err}"
+    );
+    v05.close();
+    let (code, _) = k.stop();
+    assert_eq!(code, 0, "{}", k.dump());
+}

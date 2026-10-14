@@ -95,6 +95,23 @@ pub struct AgentConfig {
     pub tags: Vec<String>,
 }
 
+/// 註冊取得的身分（`enroll` 模組）
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityConfig {
+    /// `identity/` 目錄（相對路徑以工作目錄解析）
+    pub dir: String,
+    /// 剩餘天數 ≤ 此值或已用壽命 2/3 時自動更新（取較早者；0 = 只看 2/3）
+    pub renew_before_days: u32,
+}
+
+/// 註冊端點（8444）
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnrollConfig {
+    /// 空字串 = 與 `server.address` 相同主機
+    pub address: String,
+    pub port: u16,
+}
+
 /// 本機緩衝（A5，見 `spool` 模組）
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
@@ -155,6 +172,8 @@ pub struct AppConfig {
     pub heartbeat: HeartbeatConfig,
     pub report: ReportConfig,
     pub agent: AgentConfig,
+    pub identity: IdentityConfig,
+    pub enroll: EnrollConfig,
     pub buffer: BufferConfig,
     pub status: StatusConfig,
     pub log: LogConfig,
@@ -340,6 +359,18 @@ impl AppConfig {
                 "{field} 不符合限制（{detail}，不得含控制字元、格式字元等不可見字元）：{e}"
             )));
         }
+        if self.identity.dir.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "identity.dir 不可為空字串".to_string(),
+            ));
+        }
+        range(
+            "identity.renew_before_days",
+            u64::from(self.identity.renew_before_days),
+            0,
+            365,
+        )?;
+        range("enroll.port", u64::from(self.enroll.port), 1, 65535)?;
         if self.buffer.enabled && self.buffer.dir.trim().is_empty() {
             return Err(ConfigError::Message(
                 "buffer.dir 不可為空字串（啟用本機緩衝時必須指定目錄）".to_string(),

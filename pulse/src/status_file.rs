@@ -273,6 +273,58 @@ pub struct Identity {
     pub not_after: Option<String>,
     /// 權限過寬（`PLS-W8201`、`PLS-W8202`）等身分相關警告
     pub warnings: Vec<CodeNote>,
+    /// 身分與註冊的狀態（設計包 `enrollment-ux.md` §4.2：`unenrolled`、`submitting`、`clock_rejected`、
+    /// `pending_approval`、`issued`、`registered`、`rejected`、`cert_expired`…）；身分不是由
+    /// `pulse enroll` 管理（手動憑證、未啟用 mTLS）時為 `null`
+    pub state: Option<String>,
+    /// 進行中或已結束的註冊申請（`cli-spec.md` §4.8 的 `identity.enrollment`）
+    pub enrollment: Option<EnrollmentStatus>,
+    /// 過期續簽（`identity.state = "cert_expired"` 時）
+    pub grace: Option<GraceStatus>,
+    /// 8443 正常輪替最近一次失敗的代碼（`PLS-W1111`）；成功或沒有輪替時為 `null`
+    pub renew_failed_code: Option<String>,
+    /// 下一次輪替的時點（已用壽命 2/3 或剩餘 `identity.renew_before_days`，取較早者）；不自動輪替時為 `null`
+    pub renew_after: Option<String>,
+}
+
+/// 註冊申請（不含秘密：沒有 token、`poll_secret`）
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnrollmentStatus {
+    pub state: String,
+    pub request_code: Option<String>,
+    pub submitted_at: Option<String>,
+    /// 申請的有效期限（Kairos 時間）
+    pub expires_at: Option<String>,
+    pub approved_by: Option<String>,
+    pub rejected_reason: Option<String>,
+    /// `clock_rejected`：本機減 Kairos（負值＝本機較慢）
+    pub offset_ms: Option<i64>,
+    pub local_time: Option<String>,
+    pub server_time: Option<String>,
+    pub next_submit_at: Option<String>,
+    pub next_poll_at: Option<String>,
+    pub last_code: Option<String>,
+    pub observed_ip: Option<String>,
+    pub enroll_server: Option<String>,
+    pub token_prefix: Option<String>,
+}
+
+/// 過期續簽（`cli-spec.md` §4.8 的 `identity.grace`）
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraceStatus {
+    pub days: Option<u32>,
+    /// 寬限期結束（依憑證的 `not_after` 加寬限天數；以 Kairos 的判斷為準）
+    pub ends_at: Option<String>,
+    pub renew_state: String,
+    pub attempts: u32,
+    pub last_attempt_at: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub last_code: Option<String>,
+    pub offset_ms: Option<i64>,
+    pub server_time: Option<String>,
+    pub request_code: Option<String>,
 }
 
 /// 與 Kairos 的時鐘偏差（`cli-spec.md` §1.5）
@@ -284,8 +336,11 @@ pub struct Clock {
     pub measured_at: Option<String>,
     /// 量測時的單調時鐘（判斷偏差是否仍有效：24 小時內、未重新開機）
     pub measured_mono_ms: Option<u64>,
-    /// `hello_ack`；未知為 `null`
+    /// `hello_ack`／`server_info`／`token_check`／`enroll_result`／`clock_skew`／
+    /// `server_info_unverified`；未知為 `null`
     pub source: Option<String>,
+    /// 偏差不可用於到期判定（`server_info_unverified`：伺服器憑證的有效期間未驗證，ENROLL.md 第 3 節）
+    pub unverified: bool,
 }
 
 /// 開機後經過的毫秒（單調，不受系統時間調整影響）；不支援的平台為 `None`

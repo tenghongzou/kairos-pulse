@@ -43,6 +43,10 @@ pub(crate) enum Ver {
     V1,
     V2,
     Durable,
+    /// 正常輪替（feature `renew`）
+    Renew,
+    /// 除役通知（feature `deregister`）
+    Deregister,
     Errors,
 }
 
@@ -52,6 +56,8 @@ impl Ver {
             Ver::V1 => "v1",
             Ver::V2 => "v2",
             Ver::Durable => "durable",
+            Ver::Renew => "輪替",
+            Ver::Deregister => "除役",
             Ver::Errors => "錯誤",
         }
     }
@@ -124,13 +130,17 @@ fn spec_vectors_are_found() {
     assert_eq!(vectors(Ver::V2, 'K').len(), 3);
     assert_eq!(vectors(Ver::Durable, 'P').len(), 2);
     assert_eq!(vectors(Ver::Durable, 'K').len(), 2);
+    assert_eq!(vectors(Ver::Renew, 'P').len(), 2);
+    assert_eq!(vectors(Ver::Renew, 'K').len(), 2);
+    assert_eq!(vectors(Ver::Deregister, 'P').len(), 2);
+    assert_eq!(vectors(Ver::Deregister, 'K').len(), 2);
     assert_eq!(vectors(Ver::Errors, 'P').len(), 0);
-    assert_eq!(vectors(Ver::Errors, 'K').len(), 2);
+    assert_eq!(vectors(Ver::Errors, 'K').len(), 5);
 }
 
 #[test]
 fn every_client_vector_round_trips() {
-    for ver in [Ver::V1, Ver::V2, Ver::Durable] {
+    for ver in [Ver::V1, Ver::V2, Ver::Durable, Ver::Renew, Ver::Deregister] {
         for line in vectors(ver, 'P') {
             let msg = parse_client_msg(line).unwrap();
             assert_ne!(msg, ClientMsg::Unknown, "{line}");
@@ -142,7 +152,14 @@ fn every_client_vector_round_trips() {
 
 #[test]
 fn every_server_vector_round_trips() {
-    for ver in [Ver::V1, Ver::V2, Ver::Durable, Ver::Errors] {
+    for ver in [
+        Ver::V1,
+        Ver::V2,
+        Ver::Durable,
+        Ver::Renew,
+        Ver::Deregister,
+        Ver::Errors,
+    ] {
         for line in vectors(ver, 'K') {
             let msg = parse_server_msg(line).unwrap();
             let back: Value = serde_json::from_str(&msg.to_line().unwrap()).unwrap();
@@ -243,9 +260,13 @@ fn spec_limits_match_constants() {
     has(format!(
         "每條連線最多 {MAX_DURABLE_IN_FLIGHT} 筆 report 在途"
     ));
-    // features 表與 SERVER_FEATURES 一致
-    for feature in SERVER_FEATURES {
+    // features 表與 SERVER_FEATURES、LIFECYCLE_FEATURES 一致
+    for feature in SERVER_FEATURES.iter().chain(LIFECYCLE_FEATURES.iter()) {
         has(format!("| `{feature}` |"));
+    }
+    // 訊息表列出所有 server 訊息類型
+    for kind in SERVER_MSG_TYPES {
+        has(format!("| `{kind}` |"));
     }
 }
 
@@ -288,4 +309,183 @@ pub(crate) fn host_fingerprint_examples() -> Vec<(&'static str, &'static str)> {
                 .then(|| (cells[1].trim_matches('`'), cells[2].trim_matches('`')))
         })
         .collect()
+}
+
+// ---- 8443 的憑證輪替與除役（feature renew、deregister） ----
+
+#[test]
+fn lifecycle_vectors_parse_into_the_shared_types() {
+    use crate::{FEATURE_DEREGISTER, FEATURE_RENEW, INTENT_DEREGISTER};
+    // 輪替：hello 宣告 renew；hello_ack 帶寬限天數與 renew_now
+    let ClientMsg::Hello { ext, .. } =
+        parse_client_msg(client_vector_in(Ver::Renew, "hello")).unwrap()
+    else {
+        panic!("應解析為 hello");
+    };
+    assert!(
+        ext.offer
+            .as_ref()
+            .unwrap()
+            .features
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|f| f == FEATURE_RENEW)
+    );
+    assert_eq!(ext.intent, None);
+    match parse_server_msg(server_vector_in(Ver::Renew, "hello_ack")).unwrap() {
+        ServerMsg::HelloAck {
+            expired_renew_grace_days,
+            renew_now,
+            ..
+        } => assert_eq!(
+            (expired_renew_grace_days, renew_now),
+            (Some(90), Some(true))
+        ),
+        other => panic!("{other:?}"),
+    }
+    let ClientMsg::RenewRequest(req) =
+        parse_client_msg(client_vector_in(Ver::Renew, "renew_request")).unwrap()
+    else {
+        panic!("應解析為 renew_request");
+    };
+    assert_eq!(req.seq, 2);
+    assert_eq!(req.request_id, "5b0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81");
+    let ServerMsg::RenewResult(res) =
+        parse_server_msg(server_vector_in(Ver::Renew, "renew_result")).unwrap()
+    else {
+        panic!("應解析為 renew_result");
+    };
+    assert_eq!(
+        (res.seq, res.state.as_str()),
+        (2, crate::lifecycle::RENEW_STATE_ISSUED)
+    );
+    assert_eq!(res.request_id, req.request_id);
+    assert_eq!(res.policy.unwrap().expired_renew_grace_days, 90);
+
+    // 除役：intent 與 deregister／deregister_ack
+    let ClientMsg::Hello { ext, .. } =
+        parse_client_msg(client_vector_in(Ver::Deregister, "hello")).unwrap()
+    else {
+        panic!("應解析為 hello");
+    };
+    assert_eq!(ext.intent.as_deref(), Some(INTENT_DEREGISTER));
+    assert_eq!(
+        ext.offer.as_ref().unwrap().features.as_deref(),
+        Some(&[FEATURE_DEREGISTER.to_string()][..])
+    );
+    let ClientMsg::Deregister(d) =
+        parse_client_msg(client_vector_in(Ver::Deregister, "deregister")).unwrap()
+    else {
+        panic!("應解析為 deregister");
+    };
+    assert_eq!(
+        d.reason,
+        crate::lifecycle::DEREGISTER_REASON_UNINSTALL_PURGE
+    );
+    assert!(crate::validate_client_msg(&ClientMsg::Deregister(d.clone())).is_ok());
+    let ServerMsg::DeregisterAck(ack) =
+        parse_server_msg(server_vector_in(Ver::Deregister, "deregister_ack")).unwrap()
+    else {
+        panic!("應解析為 deregister_ack");
+    };
+    assert_eq!(ack.seq, d.seq);
+    assert!(ack.certificate_revoked && !ack.already_decommissioned);
+    // 沒有 renew 時 hello_ack 不帶新欄位
+    let line = server_vector_in(Ver::Deregister, "hello_ack");
+    assert!(!line.contains("expired_renew_grace_days") && !line.contains("renew_now"));
+}
+
+#[test]
+fn lifecycle_additions_do_not_change_the_older_wire_format() {
+    // 舊版的向量（v1、v2、durable）照舊解析並序列化回相同的 JSON（every_*_round_trips），
+    // 而且不會出現任何新欄位：
+    for ver in [Ver::V1, Ver::V2, Ver::Durable] {
+        for line in vectors(ver, 'K').into_iter().chain(vectors(ver, 'P')) {
+            for new_field in ["intent", "expired_renew_grace_days", "renew_now"] {
+                assert!(!line.contains(new_field), "{line}");
+            }
+        }
+    }
+    // HelloExt::new（沒有 intent）序列化出的 hello 沒有 intent 欄位
+    let ClientMsg::Hello { ext, .. } =
+        parse_client_msg(client_vector_in(Ver::V2, "hello")).unwrap()
+    else {
+        panic!("應解析為 hello");
+    };
+    assert_eq!(ext.intent, None);
+    let v = serde_json::to_value(&*ext).unwrap();
+    assert!(v.get("intent").is_none(), "{v}");
+    // 加上 intent 時才輸出
+    let with = serde_json::to_value(ext.as_ref().clone().with_intent("deregister")).unwrap();
+    assert_eq!(with["intent"], "deregister");
+}
+
+#[test]
+fn lenient_lifecycle_fields() {
+    // hello 的 intent 不是字串：視為沒有（hello 仍可解析）
+    let line = client_vector_in(Ver::V2, "hello").replacen('{', r#"{"intent":7,"#, 1);
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!("應解析為 hello");
+    };
+    assert_eq!(ext.intent, None);
+    assert!(ext.offer.is_ok() && ext.host.is_ok());
+    // hello_ack 的新欄位型別不符：視為沒有，整則仍可解析
+    let line = r#"{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["renew"],"server_time":"2026-10-14T02:00:00.009Z","expired_renew_grace_days":"90","renew_now":"yes"}"#;
+    match parse_server_msg(line).unwrap() {
+        ServerMsg::HelloAck {
+            expired_renew_grace_days: None,
+            renew_now: None,
+            features: Some(f),
+            ..
+        } => assert_eq!(f, ["renew"]),
+        other => panic!("{other:?}"),
+    }
+    // deregister_ack 缺少布林欄位：預設 false
+    let line = r#"{"type":"deregister_ack","seq":2,"request_id":"r","agent_id":"a","state":"decommissioned","decommissioned_at":"2026-10-14T03:00:00.015Z"}"#;
+    let ServerMsg::DeregisterAck(ack) = parse_server_msg(line).unwrap() else {
+        panic!("應解析為 deregister_ack");
+    };
+    assert!(!ack.certificate_revoked && !ack.already_decommissioned);
+    // 必要欄位缺漏的 renew_request 是無法解析的訊息（伺服器依是否協商決定 bad_request 或 unknown_type）
+    let line = r#"{"type":"renew_request","seq":2}"#;
+    assert!(parse_client_msg(line).is_err());
+    assert_eq!(crate::message_type(line).as_deref(), Some("renew_request"));
+    assert_eq!(crate::message_type(r#"{"type":5}"#), None);
+    assert_eq!(crate::message_type("not json"), None);
+    // ts 的限制同其他訊息
+    let long = client_vector_in(Ver::Renew, "renew_request").replace(
+        "2026-10-14T02:00:01.000Z\",\"request_id",
+        &format!("{}\",\"request_id", "x".repeat(65)),
+    );
+    let msg = parse_client_msg(&long).unwrap();
+    assert!(crate::validate_client_msg(&msg).unwrap_err().contains("ts"));
+}
+
+#[test]
+fn new_error_codes_are_not_fatal() {
+    for (code, text) in [
+        (ErrorCode::RenewRequiresApproval, "renew_requires_approval"),
+        (ErrorCode::InvalidCsr, "invalid_csr"),
+        (ErrorCode::RateLimited, "rate_limited"),
+    ] {
+        assert_eq!(code.as_str(), text);
+        assert_eq!(ErrorCode::from_code(text), Some(code));
+        assert!(!code.default_fatal());
+        assert_eq!(
+            serde_json::to_value(ServerMsg::error(Some(2), code, "m")).unwrap(),
+            serde_json::json!({"type":"error","seq":2,"code":text,"message":"m","fatal":false})
+        );
+    }
+    // 錯誤範例的向量與 ServerMsg::error 的輸出相同
+    let v = server_error_vector("renew_requires_approval");
+    let built = ServerMsg::error(
+        Some(2),
+        ErrorCode::RenewRequiresApproval,
+        "renewal requires approval or offline issuance; resend the same CSR later",
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&built.to_line().unwrap()).unwrap(),
+        serde_json::from_str::<Value>(v).unwrap()
+    );
 }

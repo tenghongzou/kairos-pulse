@@ -2,13 +2,21 @@
 
 use config::{Config, Environment, File, FileFormat};
 use log::LevelFilter;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
+
+mod enroll;
+
+pub use enroll::{
+    CertPolicySettings, EnrollSettings, MAX_CERT_LIFETIME_DAYS, MAX_GRACE_DAYS,
+    MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
+};
 
 /// 未指定 `--config` 時讀取的設定檔（不存在則略過）
 pub const DEFAULT_CONFIG_FILE: &str = "kairos.toml";
@@ -104,6 +112,16 @@ pub const DEFAULT_CONSOLE_MAX_STREAMS: usize = 16;
 /// 除了連線之外，行程需要的檔案描述符（日誌、資料庫與 WAL、TLS 設定檔、listener 等）的估計量
 pub const FD_RESERVE: u64 = 64;
 
+/// `KRS-E0202`：兩個監聽位址相同（agent、主控台、註冊端點之間）
+pub fn listen_conflict_between(a_name: &str, a: &str, b_name: &str, b: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "錯誤 KRS-E0202：設定互相矛盾：{a_name}（{a}）與 {b_name}（{b}）使用同一個位址與連接埠。agent 連線埠（預設 8443）、註冊端點（預設 8444）與主控台（預設 9443）必須分開；請修改其中一個"
+        ),
+    )
+}
+
 /// 建議的 `LimitNOFILE` 下限
 pub const MIN_SUGGESTED_NOFILE: u64 = 4096;
 
@@ -115,14 +133,18 @@ kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\
 kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
 kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）\n       \
 kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n       \
-kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n\n\
+kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n       \
+kairos enroll-token create|list|show|disable [選項]（註冊 token）\n       \
+kairos enroll list|show|approve|reject|mode [選項]（註冊申請與註冊端點模式）\n       \
+kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
+kairos config show --effective（實際生效的設定與來源）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
 -h, --help       顯示此說明\n\n\
 環境變數 KAIROS__<SECTION>__<KEY> 可覆寫設定，例如 KAIROS__SERVER__LISTEN=0.0.0.0:8080";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
     pub server: ServerSettings,
@@ -132,10 +154,133 @@ pub struct AppConfig {
     pub limits: LimitSettings,
     pub log: LogSettings,
     pub console: ConsoleSettings,
+    /// 註冊通道（8444，`crates/kairos-proto/ENROLL.md`）
+    pub enroll: EnrollSettings,
+    /// PKI 與憑證政策（`kairos/PKI.md` 第 8 節）
+    pub pki: PkiSettings,
+    /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
+    #[serde(skip)]
+    pub provenance: Provenance,
+}
+
+/// 設定鍵（以 `.` 連接的小寫路徑，例如 `enroll.mode`）的來源
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Provenance {
+    /// 設定檔中出現的鍵
+    pub file_keys: BTreeSet<String>,
+    /// 以 `KAIROS__<SECTION>__<KEY>` 環境變數設定的鍵
+    pub env_keys: BTreeSet<String>,
+    /// 設定檔中的值（`kairos config show --effective` 的「被覆寫的值」）
+    pub file_values: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// 設定值的來源（`kairos config show --effective`、`GET /api/v1/enroll/mode`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingSource {
+    /// `KAIROS__…` 環境變數（主控台無法修改）
+    Environment,
+    /// 主控台或 CLI 寫入資料庫 `settings` 表的值
+    Console,
+    /// `kairos.toml`
+    File,
+    /// 程式內建預設
+    Default,
+}
+
+impl SettingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SettingSource::Environment => "environment",
+            SettingSource::Console => "console",
+            SettingSource::File => "file",
+            SettingSource::Default => "default",
+        }
+    }
+}
+
+impl Provenance {
+    /// 鍵對應的環境變數名稱（`enroll.mode` → `KAIROS__ENROLL__MODE`）
+    pub fn env_var(key: &str) -> String {
+        format!("KAIROS__{}", key.replace('.', "__").to_ascii_uppercase())
+    }
+
+    /// 不考慮資料庫覆寫時的來源
+    pub fn source(&self, key: &str) -> SettingSource {
+        if self.env_keys.contains(key) {
+            SettingSource::Environment
+        } else if self.file_keys.contains(key) {
+            SettingSource::File
+        } else {
+            SettingSource::Default
+        }
+    }
+
+    /// 目前行程的 `KAIROS__…` 環境變數設定了哪些鍵
+    pub fn env_keys_from_process() -> BTreeSet<String> {
+        std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .filter_map(|k| {
+                k.strip_prefix("KAIROS__").map(|rest| {
+                    rest.split("__")
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        .to_ascii_lowercase()
+                })
+            })
+            .filter(|k| !k.is_empty())
+            .collect()
+    }
+}
+
+/// 把設定檔的內容攤平成 鍵 → 值
+fn flatten_file_values(
+    prefix: &str,
+    value: &serde_json::Value,
+    out: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.to_ascii_lowercase()
+                } else {
+                    format!("{prefix}.{}", k.to_ascii_lowercase())
+                };
+                flatten_file_values(&key, v, out);
+            }
+        }
+        v => {
+            if !prefix.is_empty() {
+                out.insert(prefix.to_string(), v.clone());
+            }
+        }
+    }
+}
+
+/// 把 JSON 物件攤平成 `a.b.c` 形式的鍵（陣列與純量為葉節點）
+pub fn flatten_keys(prefix: &str, value: &serde_json::Value, out: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.to_ascii_lowercase()
+                } else {
+                    format!("{prefix}.{}", k.to_ascii_lowercase())
+                };
+                flatten_keys(&key, v, out);
+            }
+        }
+        _ => {
+            if !prefix.is_empty() {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
 }
 
 /// 主控台 API（`[console]`，見 `kairos/API.md` 第 2 節）
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConsoleSettings {
     /// `false`：不監聽主控台連接埠
@@ -206,7 +351,7 @@ pub fn suggested_nofile(needed: u64) -> u64 {
         .max(MIN_SUGGESTED_NOFILE)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerSettings {
     pub listen: String,
@@ -247,7 +392,7 @@ impl Default for ServerSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TimeoutSettings {
     pub handshake_secs: u64,
@@ -280,7 +425,7 @@ impl TimeoutSettings {
 }
 
 /// report 的儲存後端（`storage.backend`）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
     /// SQLite（`<data_dir>/kairos.db`）：原始資料、彙總與主機清冊（A1、A6、A9）
@@ -291,7 +436,7 @@ pub enum StorageBackend {
 }
 
 /// SQLite 的 `PRAGMA synchronous`（`storage.sqlite_synchronous`）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SqliteSynchronous {
     /// WAL 模式下 commit 只寫入作業系統（不 fsync）：行程當掉不會遺失已 `ack` 的資料，
@@ -302,7 +447,7 @@ pub enum SqliteSynchronous {
     Full,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageSettings {
     pub data_dir: String,
@@ -358,7 +503,7 @@ impl StorageSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AuthSettings {
     /// 非空：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 agent_id 與憑證綁定
@@ -408,7 +553,7 @@ impl AuthSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct LimitSettings {
     /// 狀態表（記憶體與 agents.json）最多保留幾個 agent。達上限時先淘汰離線最久的 agent；
@@ -418,7 +563,7 @@ pub struct LimitSettings {
     pub max_agents: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LogSettings {
     pub level: String,
@@ -482,6 +627,8 @@ pub enum CliAction {
     Db(crate::export_cli::DbCommand),
     /// `kairos api-token ...`（主控台 API 的 token，見 [`crate::token_cli`]）
     ApiToken(crate::token_cli::TokenCommand),
+    /// `kairos enroll-token|enroll|pki|config ...`（註冊與 PKI，見 [`crate::enroll_cli`]）
+    Enroll(crate::enroll_cli::Cmd),
 }
 
 /// `--config=<path>` 的前綴
@@ -536,6 +683,17 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();
         return crate::token_cli::parse_args(iter).map(CliAction::ApiToken);
+    }
+    for (name, group) in [
+        ("enroll-token", crate::enroll_cli::Group::EnrollToken),
+        ("enroll", crate::enroll_cli::Group::Enroll),
+        ("pki", crate::enroll_cli::Group::Pki),
+        ("config", crate::enroll_cli::Group::Config),
+    ] {
+        if iter.peek().is_some_and(|a| a == name) {
+            iter.next();
+            return crate::enroll_cli::parse_args(group, iter).map(CliAction::Enroll);
+        }
     }
     while let Some(arg) = iter.next() {
         let path = if arg == "--config" {
@@ -592,7 +750,7 @@ pub fn take_config_arg(
 }
 
 /// 字串清單：接受陣列，或以 [`LIST_SEPARATOR`] 分隔的單一字串
-fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+pub(crate) fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum OneOrMany {
@@ -803,8 +961,8 @@ impl AppConfig {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string());
 
-        let settings: AppConfig = Config::builder()
-            .add_source(file_source)
+        let mut settings: AppConfig = Config::builder()
+            .add_source(file_source.clone())
             .add_source(environment())
             .build()
             .and_then(|c| c.try_deserialize())
@@ -814,6 +972,22 @@ impl AppConfig {
                     format!("載入設定失敗（{} / KAIROS__ 環境變數）: {}", source_name, e),
                 )
             })?;
+        // 每個鍵的來源：只讀設定檔一次（上面已確認能解析），攤平成鍵的集合
+        let mut file_keys = BTreeSet::new();
+        let mut file_values = std::collections::BTreeMap::new();
+        if let Ok(v) = Config::builder()
+            .add_source(file_source)
+            .build()
+            .and_then(|c| c.try_deserialize::<serde_json::Value>())
+        {
+            flatten_keys("", &v, &mut file_keys);
+            flatten_file_values("", &v, &mut file_values);
+        }
+        settings.provenance = Provenance {
+            file_keys,
+            env_keys: Provenance::env_keys_from_process(),
+            file_values,
+        };
 
         settings.validate()?;
         Ok(settings)
@@ -991,8 +1165,48 @@ impl AppConfig {
             );
         }
         self.validate_console()?;
+        self.enroll.validate()?;
+        self.pki.validate()?;
+        self.validate_listen_conflicts()?;
         self.log.level_filter()?;
         Ok(())
+    }
+
+    /// 三個監聽位址（agent、主控台、註冊端點）不可相同（`KRS-E0202`，ENROLL.md 第 19.1 節第 1 項）。
+    /// 主機名稱形式的位址在啟動時解析後再比較一次
+    fn validate_listen_conflicts(&self) -> Result<(), Error> {
+        let mut named: Vec<(&str, String)> = vec![("server.listen", self.server.listen.clone())];
+        if self.console.enabled {
+            named.push(("console.listen", self.console.listen.clone()));
+        }
+        named.push((
+            "enroll.listen",
+            self.enroll.listen_addr(&self.server.listen),
+        ));
+        for i in 0..named.len() {
+            for j in i + 1..named.len() {
+                if let (Ok(a), Ok(b)) = (
+                    named[i].1.trim().parse::<SocketAddr>(),
+                    named[j].1.trim().parse::<SocketAddr>(),
+                ) && listen_addrs_conflict(&a, &b)
+                {
+                    return Err(listen_conflict_between(
+                        named[i].0,
+                        &named[i].1,
+                        named[j].0,
+                        &named[j].1,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 8444 是否可能監聽（模式可在執行中切換，與目前的模式無關）：需要 SQLite、mTLS 與 `pki.server_ca_path`
+    pub fn enroll_possible(&self) -> bool {
+        self.storage.backend == StorageBackend::Sqlite
+            && self.auth.client_ca_path().is_some()
+            && self.pki.server_ca().is_some()
     }
 
     /// `[console]` 的檢查，以及監聽位址不可相同（設計包 §24 #16 (a)、`KRS-E0202`）。
@@ -1037,12 +1251,22 @@ impl AppConfig {
     /// 檔案描述元的需要量（設計包 §24 #18 (b)(c)、D21）：agent 連線上限＋主控台連線上限＋預留。
     /// 啟動檢查與系統健康共用這個算式
     pub fn fd_needed(&self) -> u64 {
+        self.server.max_connections as u64 + self.extra_connections() + FD_RESERVE
+    }
+
+    /// agent 連線埠以外的連線上限：主控台（啟用時）＋註冊端點（可能監聽時，D21）
+    pub fn extra_connections(&self) -> u64 {
         let console = if self.console.enabled {
             self.console.max_connections as u64
         } else {
             0
         };
-        self.server.max_connections as u64 + console + FD_RESERVE
+        let enroll = if self.enroll_possible() {
+            self.enroll.max_connections as u64
+        } else {
+            0
+        };
+        console + enroll
     }
 }
 

@@ -9,12 +9,13 @@ use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder, LinesCodec, LinesCodecError};
 
 pub use kairos_proto::{
-    ClientMsg, ErrorCode, HelloExt, HostInfo, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH,
-    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, Proto, ProtoRangeError,
-    SERVER_FEATURES, SUPPORTED_PROTO, ServerMsg, Session, clamp_heartbeat_interval_ms,
-    client_proto_range, hello_seq_of_invalid, negotiate, normalize_agent_id, offline_after_ms,
-    parse_client_msg, server_cpu_usage, unsupported_version_error, validate_client_msg,
-    validate_features, validate_hello, validate_host_info, validate_metrics, validate_report,
+    ClientMsg, ErrorCode, FEATURE_DEREGISTER, FEATURE_RENEW, HelloExt, HostInfo, INTENT_DEREGISTER,
+    MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL,
+    METRIC_MEMORY_USED, Metric, Proto, ProtoRangeError, SERVER_FEATURES, SUPPORTED_PROTO,
+    ServerMsg, Session, clamp_heartbeat_interval_ms, client_proto_range, hello_seq_of_invalid,
+    message_type, negotiate, normalize_agent_id, offline_after_ms, parse_client_msg,
+    server_cpu_usage, unsupported_version_error, validate_client_msg, validate_features,
+    validate_hello, validate_host_info, validate_metrics, validate_report,
 };
 
 /// 從連線讀到的一個框架

@@ -65,8 +65,10 @@ sequenceDiagram
 |---|---|
 | `metrics` | report 改用通用指標 `metrics`（見「report（通用指標）」）。新版 Kairos 與 Pulse 都宣告 |
 | `durable` | report 改為 at-least-once：report 帶 `boot_id`／`report_seq`，伺服器據此去重，client 收到 `ack` 才刪除本機的資料（見「durable：at-least-once 投遞」）。Kairos 0.3.0 起宣告；Pulse 0.3.0 起在啟用本機緩衝（`buffer.enabled`，預設啟用）時宣告 |
+| `renew` | 憑證仍有效時經這條 mTLS 連線正常輪替（`renew_request`／`renew_result`），`hello_ack` 另帶 `expired_renew_grace_days`、選用的 `renew_now`（見「憑證輪替與除役」）。Kairos 0.5.0 起在**有註冊服務（SQLite）且 client 也宣告時**才列出；Pulse 0.5.0 起在身分由 `pulse enroll` 管理時宣告 |
+| `deregister` | 除役通知（`hello.intent` 為 `deregister` 的連線上送 `deregister`，回 `deregister_ack`）。Kairos 0.5.0 起同 `renew` 的條件列出；Pulse 0.5.0 起只在除役通知的連線（`pulse decommission`）宣告 |
 
-日後新增功能（例如註冊、除役通知、指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。
+日後新增功能（例如指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。註冊通道（8444 HTTPS）是另一份規格 [`ENROLL.md`](ENROLL.md)；8443 上與註冊有關的 `renew`、`deregister` 定義在本文件「憑證輪替與除役」（原為 ENROLL.md 第 13 節的草稿）。
 
 ### 相容矩陣
 
@@ -80,6 +82,9 @@ sequenceDiagram
 | 0.3.0 起（宣告 `durable`） | 0.2.0（v2，不宣告 `durable`） | v2＋`metrics`，**不啟用 durable**，維持 at-most-once：連線中的新取樣照舊送出、送不出去就丟棄；Pulse 本機緩衝中的積壓（斷線期間的取樣）不送出，保留到連上支援 `durable` 的 Kairos，或超過 `buffer.max_age`、容量上限而被丟棄 |
 | 0.2.0（不宣告 `durable`） | 0.3.0 起 | v2＋`metrics`，**不啟用 durable**，與 0.2.0 相同（report 不帶新欄位，伺服器不去重） |
 | 0.3.0 起，`buffer.enabled = false` | 0.3.0 起 | Pulse 不宣告 `durable` → at-most-once（與 0.2.0 相同） |
+| 0.4.0 以前（不宣告 `renew`／`deregister`） | 0.5.0 起 | 與 0.4.0 完全相同：Kairos 只在 client 宣告時才在 `hello_ack` 列出 `renew`、`deregister` 並帶 `expired_renew_grace_days`／`renew_now`，因此舊版 Pulse 收到的 `hello_ack` 不變 |
+| 0.5.0 起（宣告 `renew`） | 0.4.0 以前 | 舊版 Kairos 不列出 `renew`：Pulse 不送 `renew_request`，憑證到期前沒有自動輪替（維持 0.4 的行為：手動換憑證，或過期後經 8444 續簽）。除役通知的連線在 `hello_ack` 沒有 `deregister` 時直接關閉，不送 `deregister` |
+| 0.5.0 起（宣告 `renew`） | 0.5.0 起，`storage.backend = "jsonl"`（沒有註冊服務） | 同上：Kairos 不列出 `renew`、`deregister` |
 | 只支援 v2 的 client（`proto` 2，沒有範圍） | v1（舊版） | 舊版回 `unsupported_version`（`supported proto: 1`） |
 | 新版（1～2） | 未來只支援 v3 以上的伺服器 | `unsupported_version`，`proto_min`／`proto_max` 標示伺服器的範圍；Pulse 退避後重試，日誌提示更新 |
 
@@ -102,14 +107,20 @@ sequenceDiagram
 | `hello` | `proto`、`agent_id`、`hostname`（僅供顯示）、`agent_version`、`heartbeat_interval_ms`；v2 起另有選用的 `proto_min`、`proto_max`、`features`、`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os` |
 | `heartbeat` | 無 |
 | `report` | v1：`cpu_usage`（%）、`total_memory`（MB）、`used_memory`（MB）。v2 且協商了 `metrics`：`metrics`（陣列，見「report（通用指標）」），不送三欄位。協商了 `durable`：另有 `boot_id`、`report_seq`（見「durable：at-least-once 投遞」） |
+| `renew_request` | 協商了 `renew` 時：`request_id`、`csr`、`sent_at`（見「憑證輪替與除役」） |
+| `deregister` | 協商了 `deregister` 且 hello 帶 `intent: "deregister"` 時：`request_id`、`agent_id`、`reason`、`initiated_by`、`host_fingerprint`（選用）、`hostname`、`pulse_version`、`sent_at` |
+
+`hello` 另有選用的 `intent`（字串，目前只定義 `deregister`，見「憑證輪替與除役」）；不是字串時視為沒有。
 
 ### Kairos → Pulse
 
 | type | 欄位 |
 |---|---|
-| `hello_ack` | `seq`、`proto`、`offline_after_ms`；v2 另有 `features`（字串陣列）、`server_time`（伺服器送出時的時間，RFC 3339 UTC 毫秒，例如 `2026-10-08T03:15:40.012Z`，供 client 檢查時鐘偏差） |
+| `hello_ack` | `seq`、`proto`、`offline_after_ms`；v2 另有 `features`（字串陣列）、`server_time`（伺服器送出時的時間，RFC 3339 UTC 毫秒，例如 `2026-10-08T03:15:40.012Z`，供 client 檢查時鐘偏差）；協商了 `renew` 時另有 `expired_renew_grace_days`（u32）與選用的 `renew_now`（布林），型別不符時視為沒有 |
 | `ack` | `seq` |
 | `error` | `seq`（可為 `null`）、`code`、`message`、`fatal`；`unsupported_version` 另有 `proto_min`、`proto_max`（新版 Kairos 起） |
+| `renew_result` | 回應 `renew_request`：`seq`、`request_id`、`state`（`issued`）、`certificate`、`policy`、`server_time` |
+| `deregister_ack` | 回應 `deregister`：`seq`、`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned` |
 
 `fatal` 為 `true` 時，伺服器送出該錯誤後會關閉連線。
 
@@ -229,6 +240,9 @@ report 另帶兩個欄位：
 | `bad_request` | 該行不是合法 UTF-8、不是合法 JSON（含超出 f64 範圍的數字）、欄位缺漏或型別錯誤（含 v2 report 的 `metrics`、durable report 的 `boot_id`／`report_seq`）、`hello` 欄位不合限制（含 v2 的版本範圍、features 與主機資訊）、`ts` 超過 64 bytes 或含禁止的字元；另外，伺服器狀態表已滿而無法登記新的 `agent_id` 時，以 fatal 的 `bad_request` 回應 `hello`（`message` 為 `server agent registry is full`） | 否（連續達上限、或狀態表已滿時是） |
 | `unknown_type` | 不認得的 `type` | 否（連續達上限時是） |
 | `already_registered` | 同一連線送了第二次 `hello` | 否 |
+| `renew_requires_approval` | `renew_request`：政策要求人工核准，申請已進入待核准佇列（類型「憑證更新」）；核准後以**同一個 CSR** 重送即得到 `renew_result` | 否 |
+| `invalid_csr` | `renew_request`：`csr` 不是合法的 base64url DER、CSR 不符 ENROLL.md 第 15.1 節（SAN 與這條連線的 `agent_id` 不符、不是 P-256、簽章無效、公鑰與這台主機用過的相同），或同一個 CSR 的申請已被拒絕或逾期 | 否 |
+| `rate_limited` | `renew_request`：同一個 `agent_id` 每小時超過 10 次 | 否 |
 | `invalid_report` | v1 格式：`cpu_usage` 不是有限值或不在 0～100 之間，或 `used_memory` 大於 `total_memory`（Pulse 送出前會先把 `cpu_usage` 夾在 0～100）。v2 的 `metrics`：不符「report（通用指標）」的限制。這筆資料不會保存 | 否 |
 
 **連續無效訊息上限**：同一連線連續 5 則無效訊息（`bad_request` 與 `unknown_type` 合計，中間沒有合法訊息）時，第 5 則改為 fatal 並關閉連線。註冊前與註冊後都適用；`hello` 欄位不合限制也計入。
@@ -248,6 +262,34 @@ Kairos 設定了 `auth.client_ca` 時啟用雙向 TLS：
 - **撤銷**：伺服器可設定 CRL（`auth.crl`）。伺服器會定期重新載入憑證、CA 與 CRL 檔案，不需重啟；重新載入後，已連線但憑證已被撤銷、過期或不再受信任的代理會收到 `certificate_rejected` 並被斷線。
 
 未設定 `auth.client_ca` 時不要求客戶端憑證，任何能連上伺服器的人都能以任意 `agent_id` 註冊；Kairos 啟動時會記錄警告。僅建議用於本機開發。
+
+## 憑證輪替與除役
+
+feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草稿）。兩者都只在協商結果為 v2、雙方都宣告、且這條連線以用戶端憑證（mTLS）證明身分時使用；Kairos 只在 client 也宣告時才在 `hello_ack` 列出這兩個 feature（沒有宣告的 client 收到的 `hello_ack` 與 0.4 的 Kairos 完全相同）。沒有協商時，伺服器把 `renew_request`、`deregister` 視同不認得的 `type`（回 `unknown_type`，與舊版相同，欄位不合法時也是）。訊息內容的型別：`kairos-proto` 的 `lifecycle` 模組。
+
+### 正常輪替（feature `renew`）
+
+**憑證仍有效時一律走 8443 的既有 mTLS 連線**，身分由連線的用戶端憑證證明，不需要 token 或額外簽章。憑證已過期時改走註冊通道 8444 的過期續簽（ENROLL.md 第 7 節）。
+
+| 訊息 | 欄位 |
+|---|---|
+| `renew_request`（Pulse → Kairos） | `seq`、`ts`、`request_id`（UUID，同一個 CSR 重送時沿用）、`csr`（base64url DER，SAN 必須等於這條連線的 `agent_id`，新公鑰必須與這台主機用過的不同）、`sent_at`（只記錄） |
+| `renew_result`（Kairos → Pulse） | `seq`（回應的 `renew_request`）、`request_id`、`state`（`issued`）、`certificate`、`policy`（同 ENROLL.md 第 6.5 節）、`server_time` |
+| `error`（非 fatal，`seq` 為 `renew_request` 的 `seq`） | `renew_requires_approval`（Pulse `PLS-W1111`，依 1 → 12 小時退避以同一個 CSR 重送）、`invalid_csr`（Pulse 下次重新產生私鑰與 CSR）、`rate_limited`（依退避）、`storage_unavailable`、`bad_request`（`request_id` 不是 UUID、或已被另一個 CSR 使用） |
+
+- 冪等：同一 `agent_id`＋同一 CSR 只簽發一張（ENROLL.md 第 7.4 節的原則）。
+- `hello_ack` 另帶 `expired_renew_grace_days`（Pulse 快取到 `enrollment.json`），以及選用的 `renew_now: true`：Kairos 要求這台主機提早輪替（例如這張憑證不是由啟用中的簽發 CA 簽發，`kairos/PKI.md` 第 4 節），Pulse 在 0～6 小時的隨機延遲後開始輪替，不必等到觸發門檻（已使用壽命的 2/3，或剩餘 `identity.renew_before_days` 天，取較早者）。
+- Pulse 以新憑證建立第二條連線送 `hello` 成功後才替換本機檔案；Kairos 在**新序號第一次成功 `hello`** 時，依政策（`pki.policy.revoke_superseded`）把同一 `agent_id` 的舊憑證以 `superseded` 撤銷。
+- 不受 8444 的模式影響；不計入 8444 的速率限制，另以每 `agent_id` 每小時 10 次限制（`rate_limited`）。
+
+### 除役通知（feature `deregister`）
+
+**只走 8443**，以這台主機的用戶端憑證證明身分；8444 不受理除役。憑證已過期的主機不送除役（Pulse `PLS-W3107`）；等待核准中的主機改用 8444 的撤回（ENROLL.md 第 8 節）。
+
+- `hello` 帶 `intent: "deregister"` 並宣告 `deregister`：這條連線不算上線、不更新最後連線時間、不取代既有連線。Kairos 回 `hello_ack` 後只等待一則 `deregister`（期間的 `heartbeat` 忽略），回 `deregister_ack` 後關閉。沒有協商 `deregister` 卻帶 `intent: "deregister"` 時，Kairos 回 fatal 的 `bad_request`；client 在 `hello_ack` 沒有 `deregister` 時（舊版 Kairos）不送 `deregister`，直接關閉。
+- `deregister`：`seq`、`ts`、`request_id`（UUID，重送時沿用）、`agent_id`（必須等於憑證 SAN，否則 `auth_failed`）、`reason`（`uninstall_purge`）、`initiated_by`（`msi`、`install_script`、`package_manager`、`cli`）、`host_fingerprint`（選用）、`hostname`、`pulse_version`、`sent_at`。
+- `deregister_ack`：`seq`、`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned`（重送時為 `true`，冪等）。
+- **10 分鐘視窗**（ENROLL.md 第 18 節第 1 項）：依政策（`pki.policy.revoke_on_self_decommission`）撤銷這條連線的憑證，撤銷在除役後 10 分鐘生效。這段期間清冊已是「已除役」，該 `agent_id` 的 `hello` 只要不是 `intent: "deregister"` 一律以 fatal 的 `certificate_rejected` 關閉；`intent: "deregister"` 只回 `already_decommissioned: true`。所有狀態都在資料庫，Kairos 重新啟動不會延長或縮短視窗。
 
 ## 逾時與離線判定
 
@@ -321,11 +363,36 @@ P {"type":"report","seq":2,"ts":"2026-10-08T03:15:45.210Z","metrics":[{"name":"s
 K {"type":"ack","seq":2}
 ```
 
+### 輪替
+
+0.5.0 的 Pulse（身分由 `pulse enroll` 管理）與 0.5.0 的 Kairos：hello 宣告 `renew`，hello_ack 列出並帶寬限天數；`renew_request` 得到 `renew_result`（CSR 與憑證在此縮短）：
+
+```
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","renew"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.5.0","heartbeat_interval_ms":15000,"ts":"2026-10-14T02:00:00.001Z"}
+K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","renew"],"server_time":"2026-10-14T02:00:00.009Z","expired_renew_grace_days":90,"renew_now":true}
+P {"type":"renew_request","seq":2,"ts":"2026-10-14T02:00:01.000Z","request_id":"5b0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","csr":"MIIBDTCBtAIBADAAMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE","sent_at":"2026-10-14T02:00:01.000Z"}
+K {"type":"renew_result","seq":2,"request_id":"5b0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","state":"issued","certificate":{"serial":"3F2A9C0B7D41E8A5","not_before":"2026-10-14T01:55:01.000Z","not_after":"2027-10-14T01:55:01.000Z","client_cert_pem":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","chain_pem":"","ca_pem":"-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n"},"policy":{"cert_lifetime_days":365,"renew_before_days":30,"expired_renew_grace_days":90},"server_time":"2026-10-14T02:00:01.020Z"}
+```
+
+### 除役
+
+`pulse decommission` 的一次性連線（`intent: "deregister"`，只宣告 `deregister`）；重送時 `already_decommissioned` 為 `true`：
+
+```
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["deregister"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.5.0","heartbeat_interval_ms":15000,"ts":"2026-10-14T03:00:00.001Z","intent":"deregister"}
+K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","deregister"],"server_time":"2026-10-14T03:00:00.008Z"}
+P {"type":"deregister","seq":2,"ts":"2026-10-14T03:00:00.010Z","request_id":"6c0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","reason":"uninstall_purge","initiated_by":"msi","host_fingerprint":"sha256:355cf5ed40956a057645145cccf74f594102726167e94e3511aae182acc4ec43","hostname":"web-01","pulse_version":"0.5.0","sent_at":"2026-10-14T03:00:00.010Z"}
+K {"type":"deregister_ack","seq":2,"request_id":"6c0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","state":"decommissioned","decommissioned_at":"2026-10-14T03:00:00.015Z","certificate_revoked":true,"already_decommissioned":false}
+```
+
 ### 錯誤
 
 ```
 K {"type":"error","seq":1,"code":"unsupported_version","message":"supported proto: 1-2","fatal":true,"proto_min":1,"proto_max":2}
 K {"type":"error","seq":null,"code":"unknown_type","message":"unknown message type","fatal":false}
+K {"type":"error","seq":2,"code":"renew_requires_approval","message":"renewal requires approval or offline issuance; resend the same CSR later","fatal":false}
+K {"type":"error","seq":3,"code":"invalid_csr","message":"the new key must differ from previous keys of this agent_id","fatal":false}
+K {"type":"error","seq":4,"code":"rate_limited","message":"too many renewal requests; retry later","fatal":false}
 ```
 
 ## 手動測試

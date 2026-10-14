@@ -1,0 +1,367 @@
+//! 註冊通道（8444）的端對端測試（Kairos 端）：以實際的 `kairos` 執行檔與 CLI，測試用的 HTTPS 用戶端
+//! 打 8444（請求以 `kairos-proto` 的型別組成、CSR 以 rcgen 產生），取得的憑證再以 mTLS 連上 8443。
+//! 以實際的 `pulse enroll` 與 Pulse 服務跑的情境在 `enroll_pulse.rs`；兩者共用 `enroll_common`。
+//!
+//! 情境：申請 → 以 CLI 核准 → 長輪詢取回憑證 → 以該憑證連 8443（hello_ack 宣告 renew／deregister）；
+//! 同一個 CSR 重送得到同一筆；8443 的正常輪替（同一 CSR 重送同一張）；撤銷後 5 秒內被斷線；除役；
+//! 過期續簽（測試掛鉤縮短效期）、重放在重新啟動後仍被拒；時鐘偏差；模式切換；限流 429。
+
+mod enroll_common;
+
+use enroll_common::*;
+use kairos_proto::enroll::{
+    GraceRenewRequest, SignatureAlg, b64url_encode, format_rfc3339_ms, grace_renew_signing_input,
+    sign_ecdsa_p256_sha256,
+};
+use kairos_proto::{ClientMsg, RenewRequest};
+use kp_e2e::{WAIT, poll_until};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
+use serde_json::{Value, json};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+#[test]
+fn enroll_approve_connect_renew_revoke_and_deregister() {
+    let env = Env::new(
+        "enroll-flow",
+        "max_requests_per_ip_burst = 40\nmax_requests_per_ip_per_minute = 60",
+        &[],
+    );
+    let mut kairos = env.start();
+    let token = env.token("manual");
+
+    // server-info：8444 的鏈附上根 CA（只信任根 CA 的用戶端可以連上）
+    let (s, _, info) = env.call("GET", "/v1/enroll/server-info", None, None);
+    assert_eq!(s, 200, "{info}");
+    assert_eq!(info["accepts"]["new_enrollment"], true);
+
+    // 申請 → 待核准；同一個 CSR 重送得到同一筆
+    let a = agent("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+    let (s, v) = env.post("/v1/enroll/requests", &enroll_request(&a, &token, now_ms()));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["state"], "pending_approval");
+    let rid = v["request_id"].as_str().unwrap().to_string();
+    let code = v["request_code"].as_str().unwrap().to_string();
+    let (s, again) = env.post("/v1/enroll/requests", &enroll_request(&a, &token, now_ms()));
+    assert_eq!(s, 200, "{again}");
+    assert_eq!(again["request_id"], rid.as_str());
+
+    // 以 CLI 依申請編號核准（Kairos 執行中；常駐行程在 2 秒內簽發），長輪詢取回
+    let (c, p) = env.cli(&["enroll", "approve", &code, "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let started = Instant::now();
+    let (s, _, v) = env.call(
+        "GET",
+        &format!("/v1/enroll/requests/{rid}?wait=15"),
+        None,
+        Some(&a.poll_secret),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["state"], "issued", "{v}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let cert = cert_of(&v);
+    let serial = v["certificate"]["serial"].as_str().unwrap().to_string();
+    assert_eq!(
+        v["certificate"]["ca_pem"].as_str().unwrap().trim(),
+        env.pki.pem.trim()
+    );
+
+    // 以該憑證連 8443：hello_ack 宣告 renew／deregister 並帶寬限天數
+    let mut conn = Agent8443::connect(&env, &cert, &a.key.serialize_pem());
+    let ack = conn.hello(&a.id, None);
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    let features: Vec<String> = serde_json::from_value(ack["features"].clone()).unwrap();
+    assert!(
+        features.contains(&"renew".to_string()) && features.contains(&"deregister".to_string())
+    );
+    assert_eq!(ack["expired_renew_grace_days"], 90);
+
+    // 8443 的正常輪替；同一個 CSR 重送得到同一張
+    let b = agent(&a.id);
+    // 共用型別（kairos-proto 的 ClientMsg::RenewRequest）
+    let renew = serde_json::to_value(ClientMsg::RenewRequest(Box::new(RenewRequest {
+        seq: 2,
+        ts: format_rfc3339_ms(now_ms()),
+        request_id: "5b0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81".into(),
+        csr: b64url_encode(&b.csr),
+        sent_at: format_rfc3339_ms(now_ms()),
+    })))
+    .unwrap();
+    conn.send(&renew);
+    let r1 = conn.recv().unwrap();
+    assert_eq!(r1["type"], "renew_result", "{r1}");
+    assert_eq!(r1["seq"], 2);
+    let renewed = cert_of(&r1);
+    let new_serial = r1["certificate"]["serial"].as_str().unwrap().to_string();
+    assert_ne!(new_serial, serial);
+    let mut renew2 = renew.clone();
+    renew2["seq"] = json!(3);
+    conn.send(&renew2);
+    let r2 = conn.recv().unwrap();
+    assert_eq!(r2["certificate"]["serial"], new_serial.as_str(), "{r2}");
+    drop(conn);
+
+    // 新憑證第一次 hello：舊憑證以 superseded 撤銷
+    let mut conn = Agent8443::connect(&env, &renewed, &b.key.serialize_pem());
+    assert_eq!(conn.hello(&a.id, None)["type"], "hello_ack");
+    assert!(poll_until(WAIT, || {
+        let (_, p) = env.cli(&["pki", "certificates", "list", "--json"]);
+        let v: Value = serde_json::from_str(p.stdout().trim()).unwrap_or(Value::Null);
+        v["data"]["certificates"].as_array().is_some_and(|l| {
+            l.iter()
+                .any(|c| c["serial"] == serial.as_str() && c["revocation_reason"] == "superseded")
+        })
+    }));
+
+    // 撤銷使用中的憑證：5 秒內被斷線（certificate_rejected）
+    let (c, p) = env.cli(&[
+        "pki",
+        "revoke",
+        &new_serial,
+        "--reason",
+        "keyCompromise",
+        "--comment",
+        "e2e",
+        "--yes",
+        "--expect-count",
+        "1",
+    ]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let t0 = Instant::now();
+    let mut kicked = None;
+    while t0.elapsed() < Duration::from_secs(10) {
+        match conn.recv() {
+            Some(m) if m["type"] == "error" => {
+                kicked = Some(m);
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let kicked = kicked.expect("撤銷後應收到 certificate_rejected");
+    assert_eq!(kicked["code"], "certificate_rejected", "{kicked}");
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+
+    // 另一台：自動核准、除役（intent: deregister），之後一般的 hello 被拒
+    let auto = env.token("auto");
+    let d = agent("1a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+    let (s, v) = env.post("/v1/enroll/requests", &enroll_request(&d, &auto, now_ms()));
+    assert_eq!((s, v["state"].as_str()), (200, Some("issued")), "{v}");
+    let dcert = cert_of(&v);
+    let mut c1 = Agent8443::connect(&env, &dcert, &d.key.serialize_pem());
+    assert_eq!(c1.hello(&d.id, Some("deregister"))["type"], "hello_ack");
+    c1.send(&deregister(&d.id, 2));
+    let ack = c1.recv().unwrap();
+    assert_eq!(ack["type"], "deregister_ack", "{ack}");
+    assert_eq!(ack["already_decommissioned"], false);
+    assert_eq!(ack["certificate_revoked"], true);
+    // 10 分鐘內：一般的 hello 以 certificate_rejected 關閉；重送 deregister 得到 already_decommissioned
+    let mut c2 = Agent8443::connect(&env, &dcert, &d.key.serialize_pem());
+    let r = c2.hello(&d.id, None);
+    assert_eq!(r["code"], "certificate_rejected", "{r}");
+    let mut c3 = Agent8443::connect(&env, &dcert, &d.key.serialize_pem());
+    assert_eq!(c3.hello(&d.id, Some("deregister"))["type"], "hello_ack");
+    c3.send(&deregister(&d.id, 2));
+    assert_eq!(c3.recv().unwrap()["already_decommissioned"], true);
+
+    // 主控台 API：read 範圍不能核准（403），operate 可以；批次結果逐筆回報
+    let token_of = |scope: &str| {
+        let (c, p) = env.cli(&[
+            "api-token",
+            "create",
+            "--name",
+            scope,
+            "--scope",
+            scope,
+            "--json",
+        ]);
+        assert_eq!(c, 0, "{}", p.dump());
+        let v: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+        v["data"]["token"].as_str().unwrap().to_string()
+    };
+    let e = agent("3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+    let (_, v) = env.post("/v1/enroll/requests", &enroll_request(&e, &token, now_ms()));
+    let erid = v["request_id"].as_str().unwrap().to_string();
+    let body = json!({"request_ids": [erid]});
+    let (s, v) = env.console(
+        "POST",
+        "/api/v1/enroll/requests/approve",
+        &token_of("read"),
+        Some(&body),
+    );
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert_eq!(v["error"]["details"]["required"], "operate");
+    let (s, v) = env.console(
+        "POST",
+        "/api/v1/enroll/requests/approve",
+        &token_of("operate"),
+        Some(&body),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["results"][0]["result"], "issued", "{v}");
+    let (s, v) = env.console("GET", "/api/v1/enroll/mode", &token_of("read"), None);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["state"], "open");
+    assert_eq!(v["data"]["sources"]["enroll.mode"], "file");
+    kairos.stop();
+}
+
+#[test]
+fn grace_renewal_replay_survives_restart_and_clock_skew_is_rejected() {
+    // 測試掛鉤：簽發的憑證只有 3 秒效期（debug 建置才生效）
+    let env = Env::new(
+        "enroll-grace",
+        "",
+        &[("KAIROS_TEST_CERT_LIFETIME_SECS", "3")],
+    );
+    let mut kairos = env.start();
+    let auto = env.token("auto");
+    let a = agent("2a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+    // 時鐘快 7 分鐘：clock_skew，token 未消耗
+    let (s, v) = env.post(
+        "/v1/enroll/requests",
+        &enroll_request(&a, &auto, now_ms() + 7 * 60_000),
+    );
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (400, Some("clock_skew")),
+        "{v}"
+    );
+    let (s, v) = env.post("/v1/enroll/requests", &enroll_request(&a, &auto, now_ms()));
+    assert_eq!((s, v["state"].as_str()), (200, Some("issued")), "{v}");
+    let old_pem = cert_of(&v);
+    let old_der = CertificateDer::from_pem_slice(old_pem.as_bytes())
+        .unwrap()
+        .to_vec();
+    std::thread::sleep(Duration::from_secs(4));
+    let endpoint = format!("localhost:{}", env.enroll_port);
+    let new = agent(&a.id);
+    let renew = |sent_at: i64| {
+        let sent = format_rfc3339_ms(sent_at);
+        let input = grace_renew_signing_input(&a.id, FP, &new.csr, &sent, &endpoint).unwrap();
+        GraceRenewRequest {
+            agent_id: a.id.clone(),
+            csr: b64url_encode(&new.csr),
+            poll_secret: new.poll_secret.clone(),
+            sent_at: sent,
+            host_fingerprint: FP.into(),
+            expired_certificate: b64url_encode(&old_der),
+            signature: sign_ecdsa_p256_sha256(&a.key.serialize_der(), &input).unwrap(),
+            signature_alg: SignatureAlg::EcdsaP256Sha256,
+            hostname: "e2e-host".into(),
+            pulse_version: "0.5.0".into(),
+        }
+    };
+    // 過期的憑證在 8443 被拒（握手失敗，或 hello 前就被關閉）
+    let mut expired = Agent8443::connect(&env, &old_pem, &a.key.serialize_pem());
+    let mut ok = false;
+    expired.send(&json!({"type": "heartbeat", "seq": 1, "ts": "x"}));
+    if expired.recv().is_none() {
+        ok = true;
+    }
+    assert!(ok, "過期的憑證不應能連上 8443");
+    let req = renew(now_ms());
+    let (s, v) = env.post("/v1/enroll/renewals", &req);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["state"], "issued");
+    let serial = v["certificate"]["serial"].clone();
+    // 同一個 CSR、新的簽章：同一張
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(now_ms() + 1));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["certificate"]["serial"], serial);
+    // 原樣重送：重放；重新啟動後仍被拒
+    let (s, v) = env.post("/v1/enroll/renewals", &req);
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (400, Some("replayed_request")),
+        "{v}"
+    );
+    kairos.stop();
+    let mut kairos = env.start();
+    let (s, v) = env.post("/v1/enroll/renewals", &req);
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (400, Some("replayed_request")),
+        "{v}"
+    );
+    kairos.stop();
+}
+
+#[test]
+fn mode_switching_and_rate_limit() {
+    let env = Env::new(
+        "enroll-mode",
+        "max_requests_per_ip_burst = 5\nmax_requests_per_ip_per_minute = 1",
+        &[],
+    );
+    let mut kairos = env.start();
+    // 限流：第 6 個 server-info 回 429＋Retry-After
+    for _ in 0..5 {
+        assert_eq!(env.call("GET", "/v1/enroll/server-info", None, None).0, 200);
+    }
+    let (s, head, v) = env.call("GET", "/v1/enroll/server-info", None, None);
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (429, Some("rate_limited")),
+        "{v}"
+    );
+    assert!(head.to_ascii_lowercase().contains("retry-after:"), "{head}");
+    // 僅續簽：模式立即生效（不必重新啟動）
+    let (c, p) = env.cli(&["enroll", "mode", "renew_only", "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    kairos.wait_for("註冊端點模式：open → renew_only", WAIT);
+    // 關閉：停止監聽
+    let (c, p) = env.cli(&["enroll", "mode", "closed", "--yes", "--reason", "e2e"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    assert!(poll_until(WAIT, || std::net::TcpStream::connect((
+        "127.0.0.1",
+        env.enroll_port
+    ))
+    .is_err()));
+    // 改回開放：重新監聽
+    let (c, p) = env.cli(&["enroll", "mode", "open", "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    assert!(poll_until(WAIT, || std::net::TcpStream::connect((
+        "127.0.0.1",
+        env.enroll_port
+    ))
+    .is_ok()));
+    // 實際生效的設定：模式的來源是 console
+    let (c, p) = env.cli(&["config", "show", "--effective", "--json"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let v: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    assert_eq!(v["schema"], "kairos.config.effective/v1");
+    let find = |k: &str| {
+        v["data"]["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == k)
+            .cloned()
+            .unwrap()
+    };
+    let mode = find("enroll.mode");
+    assert_eq!(mode["source"], "console");
+    assert_eq!(mode["value"], "open");
+    assert!(mode["updated_by"].is_string());
+    assert_eq!(find("server.listen")["source"], "file");
+    // 改用設定檔的值
+    let (c, p) = env.cli(&["enroll", "mode", "renew_only", "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let (c, p) = env.cli(&["config", "show", "--effective", "enroll.mode"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    assert!(p.stdout().contains("設定檔：\"open\""), "{}", p.stdout());
+    let (c, p) = env.cli(&["config", "reset", "enroll.mode", "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let (_, p) = env.cli(&["config", "show", "--effective", "enroll.mode", "--json"]);
+    let v: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    assert_eq!(v["data"]["settings"][0]["source"], "file");
+    let _ = Path::new("x");
+    kairos.stop();
+}

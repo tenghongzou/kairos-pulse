@@ -523,6 +523,15 @@ pub fn evaluate(input: &Input) -> Report {
             );
         }
         (None, None) => unreachable!("fresh 時一定有狀態檔"),
+        (None, Some(_)) if file.and_then(|f| enrollment_rows(f, input)).is_some() => {
+            let (conn_row, _, state) = enrollment_rows(file.unwrap(), input).unwrap();
+            if conn_row.result == Outcome::Error {
+                conn_error = true;
+            }
+            brief.state = state;
+            brief.conn_code = conn_row.code.map(str::to_string);
+            rows.push(conn_row);
+        }
         (None, Some(c)) => {
             let server = c.server.as_str();
             let host = server.rsplit_once(':').map_or(server, |(h, _)| h);
@@ -679,6 +688,19 @@ pub fn evaluate(input: &Input) -> Report {
             ));
         }
         (None, None) => unreachable!(),
+        (None, Some(f)) if enrollment_rows(f, input).is_some() => {
+            let why = if f.identity.grace.is_some() {
+                "憑證過期期間不會連線，也不會回報"
+            } else {
+                "尚未註冊，不會回報"
+            };
+            rows.push(Row::new(
+                "reporting",
+                "回報",
+                Outcome::Skipped,
+                why.to_string(),
+            ));
+        }
         (None, Some(f)) => {
             let (row, eta) = reporting_row(f, input, connected, conn_error, &ctx, &mut issues);
             replay_eta_out = eta;
@@ -706,7 +728,10 @@ pub fn evaluate(input: &Input) -> Report {
             "沒有狀態檔，無法判斷".to_string(),
         )),
         Some(f) => {
-            let row = identity_row(f, input, clock_ok, &ctx, &mut issues);
+            let row = match enrollment_rows(f, input) {
+                Some((_, id_row, _)) => id_row,
+                None => identity_row(f, input, clock_ok, &ctx, &mut issues),
+            };
             brief.cert_days = cert_days(f, now);
             rows.push(row);
         }
@@ -809,6 +834,218 @@ pub fn evaluate(input: &Input) -> Report {
         replay_eta: replay_eta_out,
         clock_valid: clock_ok,
     }
+}
+
+/// 註冊申請或過期續簽進行中時的「連線」「身分」列與 `--brief` 的狀態欄（設計包 `enrollment-ux.md` §4.2、
+/// `cli-spec.md` §4.2、§4.6、§4.7）。不是由 `pulse enroll` 管理、或已註冊時為 `None`（照舊判定）
+fn enrollment_rows(f: &StatusFile, input: &Input) -> Option<(Row, Row, String)> {
+    let id = &f.identity;
+    let now = input.now;
+    let later = |t: &Option<String>| {
+        ts_opt(t).filter(|t| *t > now).map(|t| {
+            format!(
+                "{}（約 {}）",
+                fmt::later(since(t, now)),
+                fmt::time_only(t, input.zone)
+            )
+        })
+    };
+    let code_of = |c: &Option<String>| c.as_deref().and_then(codes::known);
+    if let Some(g) = &id.grace {
+        let code = code_of(&g.last_code).unwrap_or(codes::E_CLIENT_CERT_EXPIRED);
+        let expired = ts_opt(&id.not_after);
+        let days = expired.map(|na| (now - na).num_days().max(0));
+        let ends = ts_opt(&g.ends_at);
+        let left = ends.map(|e| (e - now).num_days().max(0));
+        let mut identity = match (expired, days) {
+            (Some(na), Some(d)) => format!(
+                "憑證已於 {} 過期（{d} 天前）",
+                input.zone.local(na).format("%Y-%m-%d")
+            ),
+            _ => "憑證已過期".to_string(),
+        };
+        if g.renew_state == "grace_exceeded" {
+            identity.push_str(&format!(
+                "；已超過寬限期（{} 天）；需重新註冊（{}）",
+                g.days.unwrap_or(90),
+                codes::E_GRACE_EXCEEDED
+            ));
+        } else if let (Some(l), Some(e)) = (left, ends) {
+            identity.push_str(&format!(
+                "；過期寬限期剩 {l} 天（至 {}）",
+                input.zone.local(e).format("%Y-%m-%d")
+            ));
+        }
+        let next = later(&g.next_attempt_at)
+            .map(|n| format!("下次嘗試 {n}"))
+            .unwrap_or_default();
+        let (conn_text, conn_code) = match g.renew_state.as_str() {
+            "grace_blocked" => (
+                "無法自動續簽：註冊端點無法連線".to_string(),
+                codes::E_ENROLL_UNREACHABLE,
+            ),
+            "grace_pending" => (
+                format!(
+                    "憑證已過期，續簽申請等待核准（申請編號 {}）",
+                    g.request_code.as_deref().unwrap_or("?")
+                ),
+                codes::I_PENDING_APPROVAL,
+            ),
+            "grace_exceeded" => (
+                "無法自動續簽：已超過過期寬限期".to_string(),
+                codes::E_GRACE_EXCEEDED,
+            ),
+            "grace_rejected" => (
+                "Kairos 拒絕自動續簽：主機識別資訊與紀錄不符".to_string(),
+                codes::E_GRACE_IDENTITY,
+            ),
+            "grace_clock_rejected" => (
+                "無法自動續簽：Kairos 因時鐘偏差暫不受理".to_string(),
+                codes::E_CLOCK_SKEW,
+            ),
+            _ => ("憑證已過期，正在自動續簽".to_string(), code),
+        };
+        let mut conn = Row::new(
+            "connection",
+            "連線",
+            Outcome::Error,
+            format!("{conn_text}（{conn_code}）"),
+        )
+        .code(conn_code)
+        .summary(conn_text);
+        let attempts = format!("已嘗試 {} 次", g.attempts);
+        conn = conn.more(if next.is_empty() {
+            attempts
+        } else {
+            format!("{attempts}，{next}")
+        });
+        let identity_row = Row::new("identity", "身分", Outcome::Error, identity.clone())
+            .code(codes::E_CLIENT_CERT_EXPIRED)
+            .summary(identity);
+        let mut brief = format!(
+            "cert_expired renew={}",
+            g.renew_state.trim_start_matches("grace_")
+        );
+        if let Some(l) = left {
+            brief = format!(
+                "cert_expired grace={l}d renew={}",
+                g.renew_state.trim_start_matches("grace_")
+            );
+        }
+        if let Some(o) = g.offset_ms {
+            brief.push_str(&format!(" offset={}", fmt_signed(o)));
+        }
+        return Some((conn, identity_row, brief));
+    }
+    let e = id.enrollment.as_ref()?;
+    let rc = e.request_code.as_deref().unwrap_or("尚未建立");
+    let code = code_of(&e.last_code);
+    let (result, conn_text, id_text, brief) = match e.state.as_str() {
+        "submitting" => {
+            let busy = matches!(
+                code,
+                Some(codes::E_ENROLL_RATE_LIMITED | codes::E_PENDING_QUEUE_FULL)
+            );
+            let next = later(&e.next_submit_at)
+                .map(|n| format!("，下次重試 {n}"))
+                .unwrap_or_default();
+            let t = if busy {
+                format!("註冊端點忙碌{next}（{}）", code.unwrap_or(""))
+            } else {
+                format!("正在送出註冊申請{next}")
+            };
+            (
+                Outcome::Pending,
+                format!("尚未註冊：{t}"),
+                t,
+                "submitting".to_string(),
+            )
+        }
+        "clock_rejected" => {
+            let off = e.offset_ms.unwrap_or(0);
+            let next = later(&e.next_submit_at)
+                .map(|n| format!("（下次 {n}）"))
+                .unwrap_or_default();
+            let t = format!(
+                "Kairos 因時鐘偏差暫不受理註冊：相差 {}；校正後自動重送{next}",
+                fmt::offset_amount(off)
+            );
+            (
+                Outcome::Error,
+                "尚未註冊：Kairos 因時鐘偏差暫不受理註冊申請（PLS-E8302）".to_string(),
+                t,
+                format!("clock_rejected offset={}", fmt_signed(off)),
+            )
+        }
+        "pending_approval" => {
+            let until = ts_opt(&e.expires_at)
+                .map(|t| format!("，有效至 {}", fmt::date_time(t, input.zone)))
+                .unwrap_or_default();
+            let t = format!("等待核准（申請編號 {rc}{until}）");
+            (
+                Outcome::Pending,
+                format!("等待核准：申請編號 {rc}"),
+                t,
+                "pending_approval".to_string(),
+            )
+        }
+        "issued" => (
+            Outcome::Pending,
+            "已核准，正在連線".to_string(),
+            "已取得憑證，正在連線".to_string(),
+            "issued".to_string(),
+        ),
+        "registered" => return None,
+        other => {
+            let c = code.unwrap_or(codes::E_NOT_ENROLLED);
+            let title = codes::title(c).unwrap_or("尚未註冊");
+            let t = match other {
+                "rejected" => format!(
+                    "申請被拒絕（原因：「{}」）",
+                    e.rejected_reason.as_deref().unwrap_or("未填寫")
+                ),
+                _ => title.to_string(),
+            };
+            (
+                Outcome::Error,
+                format!("無法註冊：{title}"),
+                t,
+                other.to_string(),
+            )
+        }
+    };
+    let row_code = code.or(match e.state.as_str() {
+        "pending_approval" => Some(codes::I_PENDING_APPROVAL),
+        "clock_rejected" => Some(codes::E_CLOCK_SKEW),
+        "issued" => Some(codes::I_ISSUED),
+        _ => None,
+    });
+    let with_code = |t: String| match row_code {
+        Some(c) if !t.contains(c) => format!("{t}（{c}）"),
+        _ => t,
+    };
+    let mut conn =
+        Row::new("connection", "連線", result, with_code(conn_text.clone())).summary(conn_text);
+    let mut idr = Row::new("identity", "身分", result, with_code(id_text.clone())).summary(id_text);
+    if let Some(c) = row_code {
+        conn = conn.code(c);
+        idr = idr.code(c);
+    }
+    if let Some(ip) = &e.observed_ip
+        && result != Outcome::Ok
+    {
+        conn = conn.more(format!("Kairos 看到的來源位址：{ip}"));
+    }
+    Some((conn, idr, brief))
+}
+
+/// `--brief` 的帶正負號偏差（`-7m42s`）
+fn fmt_signed(ms: i64) -> String {
+    let sign = if ms < 0 { "-" } else { "+" };
+    format!(
+        "{sign}{}",
+        fmt::compact(Duration::from_millis(ms.unsigned_abs()))
+    )
 }
 
 /// 狀態檔中的代碼字串轉成程式中的常數（只接受認得的代碼；未知的代碼不放進 `checks[].code`）

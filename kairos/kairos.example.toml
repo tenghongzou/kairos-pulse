@@ -48,3 +48,68 @@ cert_path = ""                # 主控台的伺服器憑證；空字串時沿用
 key_path = ""                 # 與 cert_path 同時設定或同時留空；依 server.reload_interval_secs 熱重載
 max_connections = 64          # 主控台的同時連線上限（含 SSE），1..=4096；計入 LimitNOFILE 的需要量（server.max_connections + 此值 + 64）
 max_streams = 16              # 即時推送（SSE，/api/v1/events）的同時連線上限，1..=max_connections
+
+[enroll]                      # 註冊通道（8444，HTTPS；crates/kairos-proto/ENROLL.md）；需要 SQLite、auth.client_ca 與 pki.server_ca_path
+# mode = "open"               # open（受理新註冊與過期續簽）／renew_only（只受理過期續簽）／closed（不監聽）；沒有設定時為 closed（KRS-I2010）。主控台或 kairos enroll mode 修改的值存在資料庫、優先於這裡
+auto_pause_enabled = true     # open 時連續 auto_pause_after_hours 小時沒有有效 token 就自動暫停新註冊（建立 token 時解除）
+auto_pause_after_hours = 24   # 1..=168
+listen = ""                   # 空字串：與 server.listen 同一個 IP、連接埠 8444；不可與 server.listen、console.listen 相同（KRS-E0202）
+advertise = ""                # 對外公告的註冊端點 host:port（安裝字串的 e、簽章內容的名稱之一）；空字串時不另外公告
+cert_path = ""                # 8444 的伺服器憑證；空字串時沿用 server.cert_path（鏈中沒有 pki.server_ca_path 的 CA 時自動接在鏈尾）
+key_path = ""
+max_connections = 1024        # L1：同時連線（握手中＝一半）；計入 LimitNOFILE 的需要量
+max_new_connections_per_sec = 200   # L1：全域新連線速率／可連續
+max_new_connections_burst = 1000
+max_connections_per_ip = 64   # L2
+max_new_connections_per_ip_per_sec = 20   # L3 軟上限（超過回 429；硬上限 4 倍，握手前關閉）
+max_new_connections_per_ip_burst = 200
+max_requests_per_ip_per_minute = 600   # L4：每個來源的 server-info、token-check、新註冊
+max_requests_per_ip_burst = 600
+max_renewals_per_ip_per_minute = 600   # L4r：每個來源的過期續簽
+max_renewals_per_ip_burst = 600
+token_min_drain_secs = 300    # L5：每個 token 最快多少秒用完（批次部署模式固定 60）；0 = 不限
+max_requests_per_token_burst = 100
+max_outside_subnet_requests_per_token_per_hour = 10   # L5b
+max_requests_per_agent_per_minute = 1   # L6
+max_requests_per_agent_burst = 5
+max_renewals_per_agent_per_hour = 10    # L6r
+max_invalid_tokens_per_ip = 20     # L7：時間窗內相異的無效值達此數就封鎖該來源（新註冊類、續簽類分開）
+max_invalid_renewals_per_ip = 20
+invalid_window_secs = 3600
+block_initial_secs = 900      # 封鎖時間；再犯加倍，上限 block_max_secs；封鎖寫入資料庫
+block_max_secs = 86400
+max_requests_per_sec = 50     # L8：全域申請速率（新註冊與過期續簽合計）
+max_requests_burst = 500
+max_pending = 20000           # L9：待核准佇列上限
+poll_min_interval_secs = 10   # L10：同一筆申請兩次輪詢的最短間隔（可連續 3 次）
+poll_after_base_secs = 30     # 動態 poll_after_ms ＝ max(基準, 同一來源待核准筆數 ÷ 目標速率)，上限
+poll_after_max_secs = 900
+poll_target_per_ip_per_sec = 5
+long_poll_secs = 60           # 長輪詢上限（0 = 停用）
+max_long_polls_per_ip = 32
+max_long_polls = 1000
+max_downloads_per_ip = 8      # L11（本版下載端點回 404）
+max_downloads = 64
+batch_sources = []            # 批次部署來源（CIDR）：L2、L3、L4、L11 乘以 batch_source_multiplier
+batch_source_multiplier = 10
+retry_after_max_secs = 600    # 429／503 的 Retry-After 上限（L7 封鎖與 L9 除外）
+header_timeout_secs = 10
+idle_timeout_secs = 15
+max_body_bytes = 65536
+request_expiry_days = 7       # 待核准申請的有效期限
+
+[pki]                         # PKI（kairos/PKI.md）
+# mode = "online"             # online（Kairos 持有簽發 CA 私鑰，核准後立即簽發；預設建議）／offline（匯出 CSR 佇列、在 CA 主機簽發後匯入）；沒有設定時為 offline
+server_ca_path = ""           # Pulse 信任的 CA（根 CA）：安裝字串的 CA 指紋、8444 的鏈尾、issued 的 ca_pem；未設定時 8444 不監聽
+crl_validity_days = 30        # Kairos 產生的 CRL 的 nextUpdate
+crl_refresh_hours = 24        # 每 24 小時與每次撤銷重新產生 CRL
+organization = "Kairos"       # 簽發 CA 的 subject：CN=<organization> Kairos Agent Issuing CA <ca_id>
+# issuing_ca_warning_days = 455   # 簽發 CA 剩餘天數低於此值時 KRS-W1304；未設定為政策有效天數＋寬限期
+
+[pki.policy]                  # 憑證政策（主控台修改的值存在資料庫、優先於這裡；kairos config show --effective 查看來源）
+cert_lifetime_days = 365      # 90..=825
+renew_before_days = 30        # 到期前幾天經 8443 輪替
+renew_requires_approval = false
+expired_renew_grace_days = 90 # 過期寬限期（0 = 不接受過期續簽）
+revoke_on_self_decommission = true
+revoke_superseded = true      # 新憑證第一次連線後以 superseded 撤銷舊憑證

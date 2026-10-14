@@ -18,6 +18,7 @@
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
 | `API.md` | 644 | 主控台 API（HTTPS，`/api/v1`）：端點、驗證（API token）、即時推送、量測 |
+| `PKI.md` | 644 | 註冊通道的 CA 架構、線上／離線簽發、簽發 CA 的輪替、CRL、資料模型與量測（0.5.0） |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `kairos.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `kairos-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -44,6 +45,7 @@
 - 管理主機上的 OpenSSL 3.0 以上（建立 PKI；`openssl version` 確認）
 - 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
 - 防火牆允許 Pulse 連到監聽埠（本例 TCP 8080）
+- 啟用註冊通道（0.5.0）時，防火牆允許**要註冊的主機**連到 TCP 8444（第 6.5 節）；不使用自動註冊時不必開放（沒有 `[enroll]` 時 Kairos 不監聽 8444）
 - 主控台 API（TCP 9443）**只對管理網段開放**：預設只綁 `127.0.0.1`；改為對外位址時以防火牆限制來源（第 9.3 節）。不要對 agent 所在的網段或網際網路開放
 
 ## 2. 下載與驗證
@@ -109,7 +111,7 @@ install -d -o kairos -g kairos -m 750 /opt/kairos/data /opt/kairos/logs
 cd ~/kairos-dist/pkg
 install -o root -g root -m 755 kairos /opt/kairos/kairos
 install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL.md \
-  STORAGE.md API.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
+  STORAGE.md API.md PKI.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
 ## 6. 建立 PKI
@@ -251,6 +253,49 @@ openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl
 
 > **CRL 過期會讓所有代理被拒。** Kairos 對 CRL 採 fail closed：超過 `nextUpdate`（上面設定為 30 天）就視為無法判定撤銷狀態。請在到期前定期重新產生並部署，例如每週一次（即使沒有新的撤銷；第 10.3 節的 `kairos-crl.timer`）。`openssl crl -in agents.crl -noout -nextupdate` 可查看到期時間。Kairos 在 `nextUpdate` 前 7 天（`auth.crl_expiry_warning_days`）起記 `WARN`，過期後記 `ERROR`。
 
+### 6.5 （選用，0.5.0）註冊通道與線上簽發 CA
+
+註冊通道（8444，`crates/kairos-proto/ENROLL.md`）讓 Pulse 以安裝字串自行申請憑證，取代第 6.3 節的逐台手動簽發。Kairos 持有一把**簽發 CA** 的私鑰（`data/pki/issuing-<ca_id>.key`，0600），核准後立即簽發（線上模式；架構與取捨見 `PKI.md`）。簽發 CA 由第 6.2 節的代理 CA（或另外的離線根 CA）簽發，代理 CA 的私鑰仍不離開管理主機。
+
+```bash
+# 1. Kairos 主機：產生簽發 CA 的私鑰與 CSR（預設寫到 data/pki/issuing-<ca_id>.csr）
+sudo -u kairos /opt/kairos/kairos pki issuing-ca new --config /opt/kairos/kairos.toml
+# 把 /opt/kairos/data/pki/issuing-1.csr 帶到管理主機的 ~/kairos-pki/agent-ca/
+
+# 2. 管理主機：以代理 CA 簽發（CA:TRUE、pathlen:0、keyCertSign／cRLSign、EKU clientAuth，5 年）
+cd ~/kairos-pki/agent-ca
+cat > issuing_ca_ext.cnf <<'EOF'
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+EOF
+openssl x509 -req -in issuing-1.csr -CA client-ca.pem -CAkey client-ca.key -CAcreateserial   -days 1825 -extfile issuing_ca_ext.cnf -out issuing-1.pem
+# 把 issuing-1.pem 帶回 Kairos 主機
+
+# 3. Kairos 主機：安裝（檢查與私鑰成對、擴充欄位、至少剩 2 年；第一個簽發 CA 自動啟用）
+sudo -u kairos /opt/kairos/kairos pki issuing-ca install issuing-1.pem --config /opt/kairos/kairos.toml
+sudo -u kairos /opt/kairos/kairos pki issuing-ca list --config /opt/kairos/kairos.toml
+```
+
+`kairos.toml` 加上（完整欄位見 `kairos.example.toml` 的 `[enroll]`、`[pki]`）：
+
+```toml
+[enroll]
+mode = "open"                 # 也可以之後以 kairos enroll mode open 或主控台切換
+
+[pki]
+mode = "online"
+server_ca_path = "ca.pem"     # Pulse 信任的 CA（第 6.1 節的伺服器 CA）；安裝字串的 CA 指紋
+```
+
+- 依路徑調整：上例在第 6.2 節的 `agent-ca/` 目錄執行（代理 CA 的 `client-ca.pem`、`client-ca.key`）；`ca.pem` 以 644 放到 `/opt/kairos/`。
+- 防火牆：允許要註冊的主機連到 8444（`ufw allow proto tcp from 10.0.0.0/16 to any port 8444`；firewalld 同第 9.3 節的 rich rule，改 port 8444）。8444 不需要對管理網段以外開放；不開放新註冊時以 `kairos enroll mode renew_only`（只受理過期續簽）或 `closed` 關閉。
+- 建立註冊 token：`sudo -u kairos /opt/kairos/kairos enroll-token create --name rollout --group <群組> --max-uses 50 --config /opt/kairos/kairos.toml` 建立 token（安裝字串寫在 stderr）；在 Pulse 主機執行 `pulse enroll --install-string <安裝字串>`。待核准的申請以 `kairos enroll list`、`kairos enroll approve <request_id>` 處理（或主控台，需要 `operate` 範圍的 API token）。
+- Kairos 自己產生簽發 CA 的 CRL（`data/pki/crl/issuing.crl`，每 24 小時與每次撤銷），撤銷以 `kairos pki revoke <序號或 agent_id> --reason <原因> --comment <說明>`，不必經過第 6.4 節的 `openssl ca`。
+- 不想讓私鑰放在伺服器上時採離線模式（`pki.mode = "offline"`）：核准後以 `kairos pki queue export` 匯出 CSR，在管理主機 `kairos pki sign-bundle` 簽發後 `kairos pki queue import` 匯入（`PKI.md` 第 6 節）。
+
 ## 7. 放置設定與憑證
 
 把第 6 節產生的檔案帶到 Kairos 主機（例如 `scp` 到 `~/kairos-files/`），再放到 `/opt/kairos`：
@@ -290,6 +335,7 @@ crl = ["agents.crl"]
 | `kairos.toml`、`key.pem` | `root:kairos` | 640（`key.pem` 由 root 擁有、只讓 `kairos` 群組讀取：服務帳號讀得到但不能改寫或替換） |
 | `cert.pem`、`client-ca.pem`、`agents.crl` | `root:kairos` | 644 |
 | `data/`、`logs/` | `kairos:kairos` | 750 |
+| `data/pki/`（0.5.0，第 6.5 節；Kairos 建立） | `kairos:kairos` | 700；簽發 CA 私鑰 `issuing-*.key` 600（群組或其他使用者有任何權限時不使用，`KRS-E1303`） |
 | `data/` 中的 `reports-*.jsonl`、`agents.json`；`logs/` 中的 `kairos-*.log` | `kairos:kairos` | 640（由 Kairos 建立） |
 
 Kairos 自己建立的 report 檔、`agents.json` 與日誌檔一律最多 640，自行建立的目錄為 750，不受 umask 影響（手動執行時 umask 常為 022 也一樣）；既有檔案在開啟時收緊到最多 640（不會放寬，600 維持 600）。`data/`、`logs/` 已存在時 Kairos 不改變其權限，但其他使用者可存取（例如 755）時啟動會記 `WARN` 並建議 `chmod 750`。`agents.json` 與日期保護狀態檔（`.retention-guard*.json`，只含日期）的暫存檔建立時就是 640，更名後同樣最多 640。
@@ -385,7 +431,8 @@ Kairos 的日誌同時寫到 stdout 與 `/opt/kairos/logs/kairos-YYYY-MM-DD.log`
 主控台 API（`API.md`）以 HTTPS 監聽 `console.listen`，預設 `127.0.0.1:9443`，憑證沿用 `cert.pem`／`key.pem`。所有端點都需要 API token：
 
 ```bash
-# 建立唯讀 token（stdout 只有 token，只顯示這一次；預設 90 天後到期）
+# 建立唯讀 token（stdout 只有 token，只顯示這一次；預設 90 天後到期）。
+# 註冊與 PKI 的寫入操作（0.5.0）需要 --scope operate（核准、拒絕）或 --scope admin（撤銷、模式、政策）
 TOKEN=$(sudo -u kairos /opt/kairos/kairos api-token create --name ops-check --config /opt/kairos/kairos.toml)
 # 在 Kairos 主機上確認（-k：自簽或私有 CA 的憑證；正式使用請以 --cacert 指定 CA）
 curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:9443/api/v1/system/health
@@ -443,6 +490,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
   備份檔不會覆寫既有的檔案；舊備份請自行輪替（例如 `find /var/backups/kairos -name 'kairos-*.db' -mtime +14 -delete`）。還原步驟見 `STORAGE.md`「備份與還原」。停機備份時直接複製整個 `data/` 即可。
 - 使用 JSONL（`storage.backend = "jsonl"` 或鏡像）時另備份 `/opt/kairos/data/reports-*.jsonl`；搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
 - 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
+- 使用線上簽發（第 6.5 節）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 
 ### 10.3 定期更新 CRL（kairos-crl.timer）
 
@@ -495,6 +543,10 @@ systemctl list-timers kairos-crl.timer
 
 **從 0.3 升級到 0.4：主控台 API 預設監聽 `127.0.0.1:9443`**。升級前確認 9443 沒有被其他程式使用（`ss -ltnp | grep :9443`），否則 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）；被佔用時在 `kairos.toml` 加上 `[console]` 的 `listen`（換連接埠）或 `enabled = false`。資料庫升級到 schema v3（新增 `api_tokens` 與被拒憑證的欄位）：**升級前以 `kairos db backup` 備份**，升級後 0.3 無法開啟。檔案描述元的需要量多了主控台的連線上限（預設 64）；發佈包 unit 的 `LimitNOFILE=8192` 足夠。協定不變，Kairos 與 Pulse 0.4 可以任意順序、分批升級（Pulse 0.4 的變更只在本機：`pulse status`、狀態檔與日誌的事件代碼，見 Pulse 的 INSTALL 第 10 節）。
 
+**從 0.4 升級到 0.5：註冊通道與 PKI（schema v4）**。資料庫升級到 schema v4（註冊 token、申請、簽發的憑證、CRL、設定、稽核等資料表）：**升級前以 `kairos db backup` 備份**，升級後 0.4 無法開啟。`kairos.toml` 沒有 `[enroll]` 時註冊通道維持關閉（啟動時記一次 `KRS-I2010`），沒有 `[pki]` 時為離線簽發，**行為與 0.4 相同**，不需要修改設定；要啟用時依第 6.5 節。啟用後檔案描述元的需要量另加 `enroll.max_connections`（預設 1024），發佈包 unit 的 `LimitNOFILE=8192` 足夠。既有的 API token 維持 `read`；寫入操作（核准、撤銷、模式切換）需要以 `--scope operate` 或 `--scope admin` 建立新的 token。主控台修改的註冊模式與憑證政策存在資料庫、優先於 `kairos.toml`，以 `kairos config show --effective` 查看來源。Pulse 0.4 照常以 8443 連線（`hello_ack` 與 0.4 相同）；註冊與 8443 的輪替需要 Pulse 0.5。
+
+**從 0.4 升級到 0.5 的順序：先升級 Kairos，再升級 Pulse**：(1) `kairos db backup` → (2) 換上新版 Kairos 並重新啟動（此時註冊通道仍關閉）→ (3) 建立簽發 CA 並在 `kairos.toml` 開啟 `[enroll]`、`[pki]`（第 6.5 節），重新啟動後確認日誌有「註冊端點（8444）已啟動」→ (4) 防火牆開放 8444，只允許要註冊的主機 → (5) 通知 Pulse 端升級（建立 `/opt/pulse/identity`、換上新版 `pulse.service`，Pulse 的 INSTALL 第 10 節）。`storage.backend = "jsonl"` 時沒有註冊服務（不監聽 8444）。完整步驟與版本組合見 `CHANGELOG.md` [0.5.0]。
+
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
 **從 0.1.x 升級時的順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。**（0.2 → 0.3 見上方，先升級 Kairos。）協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
@@ -526,7 +578,7 @@ cp -p /opt/kairos/kairos /opt/kairos/kairos.prev
 install -o root -g root -m 755 pkg-new/kairos /opt/kairos/kairos.new
 mv /opt/kairos/kairos.new /opt/kairos/kairos
 install -o root -g root -m 644 pkg-new/kairos.example.toml pkg-new/INSTALL.md \
-  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/STORAGE.md pkg-new/API.md pkg-new/CHANGELOG.md \
+  pkg-new/README.md pkg-new/PROTOCOL.md pkg-new/STORAGE.md pkg-new/API.md pkg-new/PKI.md pkg-new/CHANGELOG.md \
   pkg-new/THIRD-PARTY-LICENSES /opt/kairos/
 # unit 有變動時：
 # install -o root -g root -m 644 pkg-new/kairos.service /etc/systemd/system/kairos.service

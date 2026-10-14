@@ -48,6 +48,8 @@
 - **啟動失敗的結束代碼依原因區分**（舊版一律為 1）：命令列參數錯誤 2、設定錯誤 3（設定檔無法載入或驗證不通過、上述拒絕啟動）、憑證錯誤 4（伺服器憑證、私鑰、client CA、CRL）、連接埠已被佔用 11。`kairos.service` 新增 `RestartPreventExitStatus=2 3 4`，systemd 不再對這些錯誤無限重試；修正後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、其他啟動失敗（1）、第二次訊號強制結束（130）不變。
 - **啟用 mTLS 時 `server.max_connections_per_ip` 只計算尚未通過 hello 的連線**（行為改變，不需修改設定）：舊版不論是否啟用 mTLS，都計算同一位址的全部連線，同一個 NAT 後第 33 台 agent 起在握手前被斷線（審計 A7）；新版啟用 mTLS 時，連線通過 hello（憑證與 `agent_id` 綁定）後改依憑證身分計數，同一個 NAT 後的 agent 數只受 `server.max_connections` 限制。握手前與握手中的連線仍依位址限制（慢速握手防護）。為了 NAT 而調高 `server.max_connections_per_ip` 的 mTLS 部署可以改回預設；未啟用 mTLS 時行為不變。見「每 IP 上限、NAT 與網段允許清單」。
 
+- **0.5.0〔草稿〕：資料庫升級到 schema v4**（註冊通道與 PKI）。升級前以 `kairos db backup` 備份，升級後 0.4 無法開啟。沒有 `[enroll]`、`[pki]` 時行為與 0.4 相同（註冊通道關閉、離線簽發），不需要修改設定。見「註冊通道與 PKI」。從 0.4 升級時**先升級 Kairos**、建立簽發 CA、開放 8444，再升級 Pulse（INSTALL 第 11 節、CHANGELOG [0.5.0]）。
+
 ## 升級注意事項（與 Pulse 混用版本）
 
 **協定 v2 起不必同時升級**：新版 Kairos 支援協定 1～2，依 Pulse 的 hello 自動協商（PROTOCOL.md「版本協商」）：
@@ -57,6 +59,8 @@
 | 舊版 Pulse（只送 `proto: 1`）連新版 Kairos | v1：`hello_ack` 與舊版相同，report 為三個欄位，JSONL 為 `schema` 1、`agents.json` 的 `proto` 為 1 |
 | 新版 Pulse 連舊版 Kairos | v1：舊版 Kairos 只檢查 `proto == 1` 並忽略 v2 欄位，Pulse 依 `hello_ack` 改送三個欄位 |
 | 新版 Pulse 連新版 Kairos | v2：report 為通用指標，JSONL 為 `schema` 2 |
+| Pulse 0.4（以前）連 Kairos 0.5 | 與 0.4 相同：`renew`、`deregister` 只在 hello 宣告時才列進 `hello_ack`（並帶 `expired_renew_grace_days`）；沒有宣告的 client 送 `renew_request`／`deregister` 照舊回 `unknown_type` |
+| Pulse 0.5 連 Kairos 0.5 | 以 `pulse enroll` 註冊的主機宣告 `renew`（自動輪替）、`pulse decommission` 的連線宣告 `deregister`（PROTOCOL.md「憑證輪替與除役」）；手動憑證的主機與 0.4 相同 |
 
 讀取 JSONL 的工具請依每行的 `schema` 判斷格式（見「資料輸出」）；同一個檔案中可能同時有兩種格式的行。
 
@@ -469,10 +473,33 @@ kairos api-token list --config kairos.toml
 kairos api-token revoke <token_id> --yes --config kairos.toml
 ```
 
-- 只有 HTTPS（rustls／ring）、HTTP/1.1、只有 `GET`；每個回應帶 `server_time`（UTC、毫秒）；錯誤為 `{"error":{"code","product_code","message"}}`；CORS 關閉。
+- 只有 HTTPS（rustls／ring）、HTTP/1.1；查詢只有 `GET`，註冊與 PKI 的管理端點（0.5.0，API.md 第 11 節）另有 `POST`、`PUT`，需要 `operate`／`admin` 範圍的 token（`kairos api-token create --scope operate|admin`）；每個回應帶 `server_time`（UTC、毫秒）；錯誤為 `{"error":{"code","product_code","message"}}`；CORS 關閉。
 - 驗證失敗依來源 IP 速率限制（連續 10 次後每 6 秒 1 次）；token 的建立與撤銷由執行中的 Kairos 寫入日誌。
 - 主控台在自己的 tokio runtime 上執行、以唯讀連線查詢資料庫，不影響 agent 連線與 report 的 `ack`（API.md 第 9 節）。
 - 握手時被拒的客戶端憑證（已撤銷、已過期）以 SAN 歸屬到主機，主機詳情與列表的離線原因顯示「憑證被拒」；不受信任的 CA 簽發的憑證不歸屬（避免冒用）。
+
+## 註冊通道與 PKI（0.5.0〔草稿〕）
+
+Pulse 以安裝字串（註冊 token＋CA 指紋＋端點）連到 **8444**（HTTPS）申請用戶端憑證，管理者核准（或 token 設定自動核准）後由 Kairos 簽發，Pulse 換到 8443 連線；之後的輪替經 8443 的 `renew`，過期後在寬限期內（預設 90 天）可回 8444 續簽。協定見 `crates/kairos-proto/ENROLL.md`，CA 架構、離線簽發、資料模型與量測見 [PKI.md](PKI.md)，管理端點見 API.md 第 11 節，安裝步驟見 INSTALL 第 6.5 節。
+
+```bash
+kairos pki issuing-ca new                     # 簽發 CA 的私鑰與 CSR（以根 CA／代理 CA 簽發後 install）
+kairos pki issuing-ca install issuing-1.pem
+kairos enroll-token create --name rollout --group web --max-uses 50   # token 只顯示這一次；安裝字串在 stderr
+kairos enroll list
+kairos enroll approve <request_id>
+kairos enroll mode open|renew_only|closed
+kairos pki certificates list
+kairos pki revoke <序號或 agent_id> --reason keyCompromise --comment "主機遺失"
+kairos config show --effective enroll pki.policy   # 生效值與來源（環境變數／主控台／設定檔／預設）
+```
+
+- 模式：`open`（新註冊與過期續簽）、`renew_only`（只受理過期續簽）、`closed`（不監聽）。沒有設定時為 `closed`（`KRS-I2010`）；`open` 時連續 24 小時沒有有效 token 自動暫停新註冊。
+- 簽發：`pki.mode = "online"`（預設建議）時 Kairos 持有簽發 CA 私鑰（`data/pki/`，0600；權限不對時不使用，`KRS-E1303`），核准後 2 秒內簽發；`offline` 時匯出 CSR 佇列到 CA 主機簽發後匯入。簽發 CA 剩餘天數低於政策有效天數＋寬限期（預設 455 天）時記 `KRS-W1304`。
+- 撤銷：Kairos 自己產生簽發 CA 的 CRL（`data/pki/crl/issuing.crl`，每 `pki.crl_refresh_hours` 小時與每次撤銷），8443 立即重新載入。新憑證第一次連線後舊憑證以 `superseded` 撤銷；主機自行除役（`pulse deregister`）時以 `cessationOfOperation` 撤銷。
+- 防護：8444 有連線、來源、token、agent、全域多層速率限制（`[enroll]` 的 L1～L10，`429` 附 `Retry-After`）、無效 token 的來源封鎖（寫入資料庫）、時鐘偏差檢查、待核准佇列上限；8444 在自己的 runtime 上執行，1 萬台規模的註冊尖峰下 report 的 `ack` p99 維持在數十毫秒（PKI.md 第 12 節）。
+- 主控台修改的 `enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*` 存在資料庫、優先於 `kairos.toml`（環境變數最優先）；啟動時以 `INFO` 列出被覆寫的設定檔設定，`kairos config reset <設定鍵>` 改用設定檔的值。
+- 本版的下載端點（`/agent/…`）回 404：Pulse 以安裝套件安裝後執行 `pulse enroll`。
 
 ## 協定概述
 
@@ -907,4 +934,5 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_D
 - 現役連線的客戶端憑證在每個重載週期重新檢查，因此撤銷或過期最多延遲 `server.reload_interval_secs` 才生效；握手後、送出 hello 前的連線（最多 `timeouts.hello_secs`）不在週期檢查範圍內，但送出 hello 時會再驗證一次憑證鏈，註冊後也會在下一個週期被檢查
 - 關機時連線最晚到訊號後 2 秒就會被中止；網路極慢的連線可能收不到 `close_notify`（agent 端會視為斷線並重連）。被中止的連線若正在等待 report 寫入，該筆仍會寫入資料檔，但 `agents.json` 中該 agent 的 `last_report` 可能不會更新
 - `kairos.toml` 本身的設定只在啟動時讀取；熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL 檔的內容
+- 註冊通道（0.5.0〔草稿〕）尚未實作的部分：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具、下載端點、L11 與系統健康的整合（PKI.md 第 13 節）
 - 主控台 API 為唯讀的第一版：驗證只有 API token（沒有使用者、角色、工作階段），主機狀態只有線上、離線、未知；沒有網頁介面（限制與延後項目見 API.md 第 10 節）

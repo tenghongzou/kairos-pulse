@@ -3,12 +3,15 @@ mod backoff;
 mod cli;
 mod codes;
 mod config_manager;
+mod decommission;
+mod enroll;
 mod file_perms;
 mod local_status;
 mod log_files;
 mod log_throttle;
 mod network;
 mod protocol;
+mod rotation;
 mod service_status;
 mod shutdown;
 mod spool;
@@ -321,6 +324,19 @@ fn main() -> ExitCode {
         // pulse status：只讀狀態檔與服務管理員，不初始化日誌、不連線（cli-spec §4）
         cli::Command::Status(args) => return ExitCode::from(status_cmd::run(args)),
         cli::Command::Explain(code) => return ExitCode::from(status_cmd::explain(code)),
+        cli::Command::EnrollHelp => {
+            println!("{}", enroll::cli::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        cli::Command::DecommissionHelp => {
+            println!("{}", enroll::cli::DECOMMISSION_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        // pulse enroll／decommission：自行讀取設定（-c），不初始化日誌檔
+        cli::Command::Enroll(args) => return ExitCode::from(enroll::cli::run(args)),
+        cli::Command::Decommission(args) => {
+            return ExitCode::from(enroll::cli::run_decommission(args));
+        }
         _ => {}
     }
     // 不讀取設定：設定有誤時也能確認版本
@@ -490,6 +506,7 @@ async fn run(
     retention: log_files::LogRetention,
     shutdown: CancellationToken,
 ) -> Result<(), Failure> {
+    let mut config = config;
     // 完整版本字串（含 commit）；hello 的 agent_version 仍只送 CARGO_PKG_VERSION
     info!(
         "{}Pulse 地端程式啟動（{}，PID {}）...",
@@ -524,6 +541,40 @@ async fn run(
     // TLS 設定只在啟動時建立一次；憑證 / 私鑰讀不到、格式錯誤、不成對、過期都會在這裡直接失敗。
     // 讀取系統信任庫與憑證檔是阻塞 I/O（系統信任庫可能很慢），放到 blocking 執行緒，
     // 且收到 Ctrl+C 時不等它完成
+    // 註冊閘門（enroll::service）：沒有可用身分、而 enrollment.json 有進行中的申請時先完成申請；
+    // 申請已結束（被拒、逾期…）時不連線，等待新的 pulse enroll
+    let base = cwd.clone().unwrap_or_default();
+    let paths = enroll::identity_paths(&config, &base);
+    let mut background_pending = None;
+    let mut start_in_grace = false;
+    loop {
+        match enroll::service::gate(&paths, &config, &base) {
+            enroll::service::Gate::Normal { background } => {
+                background_pending = background;
+                break;
+            }
+            enroll::service::Gate::Grace(_) => {
+                start_in_grace = true;
+                break;
+            }
+            enroll::service::Gate::Pending(file) => {
+                match enroll::service::run_pending(&paths, *file, &shutdown).await {
+                    enroll::service::End::Shutdown => return Ok(()),
+                    enroll::service::End::Installed => config = reload_config()?,
+                    _ => {}
+                }
+            }
+            enroll::service::Gate::Idle(file) => {
+                if enroll::service::idle(&paths, &file, &shutdown).await
+                    == enroll::service::End::Shutdown
+                {
+                    return Ok(());
+                }
+                config = reload_config()?;
+            }
+        }
+    }
+
     let server_config = config.server.clone();
     let Some(tls) = blocking_or_shutdown(&shutdown, move || tls::build(&server_config))
         .await
@@ -660,7 +711,7 @@ async fn run(
     };
 
     // 系統資訊收集 task →（啟用本機緩衝時經緩衝寫入 task）→ 連線 task
-    let (report_tx, report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
+    let (report_tx, mut report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
     let (mut collector, mut ingest) = match &shared_spool {
         Some(shared) => {
             let (sample_tx, sample_rx) = mpsc::channel(SPOOL_QUEUE_CAPACITY);
@@ -686,19 +737,36 @@ async fn run(
         }
     };
 
-    let mut settings = network::Settings::new(&config, agent_id, hostname);
+    let mut settings = network::Settings::new(&config, agent_id.clone(), hostname.clone());
     if config.buffer.enabled && shared_spool.is_none() {
         // copywriting §4.2 範例 71：systemd Status 與服務描述也要看得到 PLS-E4004
         settings.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
     }
+    // 身分由 pulse enroll 管理（identity/client.pem）：宣告 renew、過期時改走 8444 過期續簽
+    let managed = enroll::service::identity_managed(&config, &base, &paths);
+    if managed {
+        settings.extra_features = vec![kairos_proto::FEATURE_RENEW.to_string()];
+        settings.rotation = Some(Arc::new(Mutex::new(rotation::Rotation::new(
+            paths.clone(),
+            &agent_id,
+            config.identity.renew_before_days,
+        ))));
+        settings.grace_on_expiry = true;
+    }
+    let net = connection_loop(
+        &mut config,
+        &base,
+        &paths,
+        settings,
+        tls,
+        &mut report_rx,
+        shared_spool.clone(),
+        &shutdown,
+        background_pending,
+        start_in_grace,
+    );
     let result = tokio::select! {
-        _ = network::run(settings, tls, report_rx, shared_spool.clone(), shutdown.clone()) => {
-            if shutdown.is_cancelled() {
-                Ok(())
-            } else {
-                Err("連線任務意外結束".to_string().into())
-            }
-        }
+        res = net => res,
         res = ingest_done => Err(match res {
             Ok(()) => "本機緩衝寫入任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("本機緩衝寫入任務發生 panic：{e}"),
@@ -721,6 +789,172 @@ async fn run(
         }
     }
     result
+}
+
+/// 重新讀取設定（`pulse enroll` 寫入了 pulse.toml）；有誤時以設定錯誤結束（結束代碼 3）
+fn reload_config() -> Result<AppConfig, Failure> {
+    AppConfig::load().map_err(|e| Failure {
+        code: EXIT_CONFIG,
+        message: format!("無法重新載入設定：{e}"),
+        pls: Some(codes::E_CONFIG_SYNTAX),
+    })
+}
+
+/// 依設定重新建立 TLS（取得新憑證後）
+fn rebuild_tls(config: &AppConfig) -> Result<tls::TlsSetup, Failure> {
+    let tls =
+        tls::build(&config.server).map_err(|e| Failure::cert(format!("無法載入新憑證：{e}")))?;
+    if let Some(info) = tls.client_cert_info() {
+        local_status::record(|s| s.set_client_cert(info));
+    }
+    Ok(tls)
+}
+
+/// 連線、過期續簽與正常輪替的主迴圈（直到 `shutdown`）
+#[allow(clippy::too_many_arguments)]
+async fn connection_loop(
+    config: &mut AppConfig,
+    base: &Path,
+    paths: &enroll::store::IdentityPaths,
+    settings: network::Settings,
+    tls: tls::TlsSetup,
+    reports: &mut mpsc::Receiver<system_info::Sample>,
+    spool: Option<Arc<spool::SharedSpool>>,
+    shutdown: &CancellationToken,
+    background_pending: Option<Box<enroll::store::EnrollmentFile>>,
+    start_in_grace: bool,
+) -> Result<(), Failure> {
+    let mut tls = tls;
+    let mut grace_now = start_in_grace;
+    let reload = Arc::new(tokio::sync::Notify::new());
+    // 目前的身分仍可用、但有進行中的申請（pulse enroll --force 等）：在背景接續，取得後重新連線
+    if let Some(file) = background_pending {
+        let paths = paths.clone();
+        let shutdown = shutdown.clone();
+        let reload = reload.clone();
+        tokio::spawn(async move {
+            if enroll::service::run_pending(&paths, *file, &shutdown).await
+                == enroll::service::End::Installed
+            {
+                reload.notify_one();
+            }
+        });
+    }
+    let info = enroll::flow::RequestInfo::new(&settings.hostname, &settings.host);
+    loop {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        if grace_now {
+            grace_now = false;
+            let (s, t) = (settings.clone(), tls.clone());
+            let end = enroll::service::run_grace(
+                paths,
+                config,
+                base,
+                &settings.agent_id,
+                &info,
+                shutdown,
+                move || {
+                    let (s, t) = (s.clone(), t.clone());
+                    async move { network::check_in(&s, &t).await }
+                },
+            )
+            .await;
+            match end {
+                enroll::service::End::Shutdown => return Ok(()),
+                enroll::service::End::Installed => {
+                    tls = rebuild_tls(config)?;
+                    info!(
+                        "{}已透過過期續簽取得新憑證  via=grace",
+                        codes::tag(codes::CERT_RENEWED, None)
+                    );
+                }
+                enroll::service::End::NotExpired => {
+                    // 依 Kairos 的時間仍有效：稍候以目前的憑證再連線
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                        _ = shutdown.cancelled() => return Ok(()),
+                    }
+                }
+                enroll::service::End::Stopped | enroll::service::End::Changed => {
+                    // 無法自動續簽：等待新的 pulse enroll（或服務重新啟動時再試一次）
+                    let file = paths.load_enrollment().ok().flatten().unwrap_or_default();
+                    if enroll::service::idle(paths, &file, shutdown).await
+                        == enroll::service::End::Shutdown
+                    {
+                        return Ok(());
+                    }
+                    *config = reload_config()?;
+                    tls = rebuild_tls(config)?;
+                }
+            }
+            continue;
+        }
+        let stop = CancellationToken::new();
+        let linker = {
+            let stop = stop.clone();
+            let shutdown = shutdown.clone();
+            let reload = reload.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = reload.notified() => {}
+                }
+                stop.cancel();
+            })
+        };
+        let exit = network::run(settings.clone(), tls.clone(), reports, spool.clone(), stop).await;
+        linker.abort();
+        match exit {
+            network::RunExit::Stopped if shutdown.is_cancelled() => return Ok(()),
+            network::RunExit::Stopped => {
+                // 背景申請取得了新憑證：重新讀設定並以新憑證連線
+                *config = reload_config()?;
+                tls = rebuild_tls(config)?;
+            }
+            network::RunExit::CertExpired => grace_now = true,
+            network::RunExit::Renewed => {
+                // 以新憑證另建連線送 hello，成功後才取代 client.pem／client.key（設計包 §5.6）
+                let mut next = config.server.clone();
+                next.client_cert = paths.next_cert().display().to_string();
+                next.client_key = paths.next_key().display().to_string();
+                let probe = match tls::build(&next) {
+                    Ok(t) => network::one_shot(
+                        &settings,
+                        &t,
+                        protocol::hello_features(spool.is_some()),
+                        None,
+                    )
+                    .await
+                    .map_err(|e| e.message),
+                    Err(e) => Err(e),
+                };
+                match probe {
+                    Ok(conn) => {
+                        conn.close().await;
+                        match rotation::promote(paths) {
+                            Ok(serial) => {
+                                info!(
+                                    "{}已更新用戶端憑證（新序號 {serial}）  via=rotation",
+                                    codes::tag(codes::CERT_RENEWED, None)
+                                );
+                                tls = rebuild_tls(config)?;
+                            }
+                            Err(e) => warn!("無法以新憑證取代 client.pem：{e}；繼續使用目前的憑證"),
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(rot) = &settings.rotation {
+                            rot.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .probe_failed(&e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `[buffer]` 設定對應的緩衝設定（已在載入時驗證範圍）
@@ -773,7 +1007,8 @@ mod tests {
             paths,
             [
                 format!("{workdir}/logs"),
-                format!("-{workdir}/{}", config.buffer.dir)
+                format!("-{workdir}/{}", config.buffer.dir),
+                format!("-{workdir}/{}", config.identity.dir)
             ],
             "{line}"
         );

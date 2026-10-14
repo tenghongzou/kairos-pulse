@@ -22,6 +22,28 @@ use crate::registry::{KickReason, Registry};
 use crate::shutdown::{self, Shutdown};
 use crate::tls::{self, ChainRejection, Fingerprint, TlsFileKind, TlsMaterial, TlsPaths, TlsState};
 
+/// 立即檢查一次（不等下一個週期）：Kairos 寫出新的簽發 CA 信任錨或 CRL 後觸發，撤銷在數秒內生效
+#[derive(Debug, Default)]
+pub struct Trigger {
+    notify: tokio::sync::Notify,
+}
+
+impl Trigger {
+    pub fn fire(&self) {
+        self.notify.notify_one();
+    }
+
+    pub async fn fired(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// 行程內唯一的觸發器
+pub fn trigger() -> &'static Trigger {
+    static T: std::sync::LazyLock<Trigger> = std::sync::LazyLock::new(Trigger::default);
+    &T
+}
+
 /// 每個週期等待檔案檢查完成的上限（不超過檢查間隔）
 pub const CHECK_WAIT: Duration = Duration::from_secs(10);
 
@@ -139,6 +161,51 @@ fn describe_kinds(kinds: &[TlsFileKind]) -> String {
         .join("、")
 }
 
+/// 停用定期重載（`server.reload_interval_secs = 0`）時：只在 [`trigger`] 觸發時重建設定並重新驗證
+/// 現役連線（Kairos 自己產生的 CRL、簽發 CA 的信任錨仍要立即生效）
+pub async fn run_on_trigger(
+    mut reloader: Reloader,
+    registry: Arc<Registry>,
+    state: Arc<TlsState>,
+    shutdown: Arc<Shutdown>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = trigger().fired() => {}
+        }
+        let registry = registry.clone();
+        let state = state.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let outcome = reloader.check();
+            if let ReloadOutcome::Failed(e) = &outcome {
+                error!("重新載入 TLS 設定失敗，繼續使用目前的設定: {}", e);
+            }
+            let kicked = revalidate(&registry, &state.current(), UnixTime::now());
+            (reloader, kicked)
+        })
+        .await;
+        match joined {
+            Ok((r, kicked)) => {
+                reloader = r;
+                for (agent_id, reason) in &kicked {
+                    warn!("agent {agent_id} 的客戶端憑證已不再有效（{reason}），關閉連線");
+                }
+            }
+            Err(e) => {
+                shutdown::fatal(
+                    &shutdown,
+                    format!(
+                        "重新驗證客戶端憑證的工作異常結束（{e}），無法確保已撤銷的憑證會被斷線"
+                    ),
+                );
+                break;
+            }
+        }
+    }
+}
+
 /// 以目前設定的驗證器重新驗證所有現役連線；不通過者送出 kick。回傳被踢的 (agent_id, 原因)。
 pub fn revalidate(
     registry: &Registry,
@@ -209,6 +276,7 @@ async fn run_with_wait(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
+            _ = trigger().fired() => {}
             _ = ticker.tick() => {}
         }
 
@@ -364,6 +432,8 @@ mod tests {
                 key: s("server.key"),
                 client_ca: Some(s("test-ca.crt")),
                 crls: vec![s("crl.crl")],
+                issuing_cas: None,
+                issuing_crl: None,
             };
             Self { dir, paths }
         }
@@ -489,6 +559,8 @@ mod tests {
             key: "k".into(),
             client_ca: Some("ca".into()),
             crls: vec!["crl1".into(), "crl2".into()],
+            issuing_cas: None,
+            issuing_crl: None,
         };
         let fp = |paths: &TlsPaths, hashes: &[Option<u64>]| -> Fingerprint {
             paths

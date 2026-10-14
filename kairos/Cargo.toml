@@ -1,6 +1,6 @@
 [package]
 name = "kairos"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.99"
 # 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
@@ -26,6 +26,9 @@ log = "0.4"
 # report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
 # 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# 註冊通道（8444）的簽發器：依範本簽發用戶端憑證、產生 CRL、產生簽發 CA 的金鑰與 CSR
+# （crates/kairos-proto/ENROLL.md 第 15.3 節選定；以 ring 為後端，不引入 aws-lc-rs）
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 # API token 的 SHA-256、常數時間比對與隨機數；與 rustls 使用的加密後端是同一個（已在依賴樹中）
 ring = "0.17"
 # API token 雜湊的常數時間比較（rustls 已依賴同一版本，不新增套件）
@@ -34,10 +37,14 @@ subtle = { version = "2", default-features = false }
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# rcgen 的日期型別（憑證的 notBefore／notAfter、CRL 的 thisUpdate／nextUpdate）；rcgen 已依賴同一版本
+time = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
 # 使用 ring 作為加密後端，避免 aws-lc-rs 在 Windows 上需要額外的 C 建置工具
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# 解析 CSR、憑證與 CRL 並以 ring 驗證 CSR 與舊憑證的簽章（ENROLL.md 第 15.3 節；rcgen 解析 CSR 時也使用它）
+x509-parser = { version = "0.18", features = ["verify"] }
 
 [dev-dependencies]
 # 測試以暫停的 tokio 時鐘執行（tokio::time::pause），不依賴實際時間；只啟用既有依賴的 feature，不引入新的 crate
