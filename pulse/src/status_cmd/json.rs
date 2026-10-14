@@ -73,13 +73,16 @@ struct Connection<'a> {
 
 #[derive(Debug, Serialize)]
 struct Identity<'a> {
-    state: &'static str,
+    state: String,
     enrollment: Option<Value>,
+    /// 過期續簽（`state = "cert_expired"` 時）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grace: Option<Value>,
     cert_serial: Option<&'a str>,
     not_after: Option<&'a str>,
     remaining_ms: Option<i64>,
     renew_after: Option<&'a str>,
-    /// 這個版本不自動更新憑證
+    /// `agent`：身分由 `pulse enroll` 管理，Kairos 支援時經 8443 自動更新；`none`：手動憑證
     rotation: &'static str,
     client_cert: Option<&'a str>,
     not_before: Option<&'a str>,
@@ -216,20 +219,24 @@ pub fn document(input: &JsonInput) -> String {
             == Some(crate::codes::E_CLIENT_CERT_REJECTED);
         let not_after = id.not_after.as_deref().and_then(sf::parse_ts);
         let remaining = not_after.map(|t| (t - now).num_milliseconds().max(0));
+        let managed = id.state.is_some();
         Identity {
-            state: if revoked {
-                "revoked"
-            } else if remaining == Some(0) {
-                "cert_expired"
-            } else {
-                "registered"
+            state: match &id.state {
+                _ if revoked => "revoked".to_string(),
+                Some(s) => s.clone(),
+                None if remaining == Some(0) => "cert_expired".to_string(),
+                None => "registered".to_string(),
             },
-            enrollment: None,
+            enrollment: id
+                .enrollment
+                .as_ref()
+                .and_then(|e| serde_json::to_value(e).ok()),
+            grace: id.grace.as_ref().and_then(|g| serde_json::to_value(g).ok()),
             cert_serial: id.cert_serial.as_deref(),
             not_after: id.not_after.as_deref(),
             remaining_ms: remaining,
-            renew_after: None,
-            rotation: "none",
+            renew_after: id.renew_after.as_deref(),
+            rotation: if managed { "agent" } else { "none" },
             client_cert: id.client_cert.as_deref(),
             not_before: id.not_before.as_deref(),
             agent_id_file: id.agent_id_file.as_deref(),
@@ -240,7 +247,7 @@ pub fn document(input: &JsonInput) -> String {
         synced: None,
         measured_at: file.and_then(|f| f.clock.measured_at.as_deref()),
         source: file.and_then(|f| f.clock.source.as_deref()),
-        valid: report.clock_valid,
+        valid: report.clock_valid && !file.is_some_and(|f| f.clock.unverified),
     };
     let checks = report
         .rows

@@ -85,8 +85,51 @@ events! {
     // ---- 3xxx 身分與憑證 ----
     /// 用戶端憑證即將到期（`PLS-W1110`）
     CERT_EXPIRING = "cert.expiring", Some(3000);
+    /// 自動或手動更新成功（8443 輪替或 8444 過期續簽）
+    CERT_RENEWED = "cert.renewed", Some(3001);
+    /// 正常輪替失敗（`PLS-W1111`）
+    CERT_RENEW_FAILED = "cert.renew_failed", Some(3002);
     /// 本機憑證已過期（`PLS-E1108`）
     CERT_EXPIRED = "cert.expired", Some(3003);
+    /// 達輪替門檻，開始更新（`PLS-I1112`）
+    CERT_RENEW_STARTED = "cert.renew_started", Some(3004);
+    /// 每次過期續簽嘗試（DEBUG）
+    CERT_GRACE_RENEW_ATTEMPT = "cert.grace_renew_attempt", None;
+    /// 過期續簽受阻（`PLS-E2007`／`PLS-E2202`／`PLS-E8302`／`PLS-W2107`）
+    CERT_GRACE_RENEW_BLOCKED = "cert.grace_renew_blocked", Some(3005);
+    /// `PLS-E1113`
+    CERT_GRACE_EXCEEDED = "cert.grace_exceeded", Some(3006);
+    /// `PLS-E1114`
+    CERT_GRACE_REJECTED = "cert.grace_rejected", Some(3007);
+    // ---- 4xxx 安裝與註冊 ----
+    /// `PLS-W3107`：完全移除時無法通知 Kairos 除役
+    INSTALL_DECOMMISSION_UNREPORTED = "install.decommission_unreported", Some(4002);
+    /// `PLS-W3310`：無法撤回待核准的註冊申請
+    INSTALL_WITHDRAWAL_UNREPORTED = "install.withdrawal_unreported", Some(4005);
+    /// 已送出註冊申請
+    ENROLL_SUBMITTED = "enroll.submitted", Some(4100);
+    /// 等待核准（`PLS-I3307`；只在狀態轉換時）
+    ENROLL_PENDING = "enroll.pending", Some(4101);
+    /// 已核准（`PLS-I3308`）
+    ENROLL_APPROVED = "enroll.approved", Some(4102);
+    /// `PLS-E3302`
+    ENROLL_REJECTED = "enroll.rejected", Some(4103);
+    /// `PLS-E3002`～`PLS-E3004`
+    ENROLL_TOKEN_ERROR = "enroll.token_error", Some(4104);
+    /// `PLS-E3303`
+    ENROLL_REQUEST_EXPIRED = "enroll.request_expired", Some(4105);
+    /// 危險操作（`pulse enroll --force`、`--reset-identity`、`--cancel`）
+    ADMIN_DANGEROUS_ACTION = "admin.dangerous_action", Some(4107);
+    /// `PLS-E2202`：註冊端點回 429／503
+    ENROLL_RATE_LIMITED = "enroll.rate_limited", Some(4108);
+    /// `PLS-E2008`
+    ENROLL_NOT_ACCEPTED = "enroll.not_accepted", Some(4109);
+    /// `PLS-E3005`
+    ENROLL_SOURCE_BLOCKED = "enroll.source_blocked", Some(4110);
+    /// `PLS-E3309`
+    ENROLL_QUEUE_FULL = "enroll.queue_full", Some(4111);
+    /// `PLS-E8302`：Kairos 因時鐘偏差暫不受理註冊
+    ENROLL_CLOCK_REJECTED = "enroll.clock_rejected", Some(4112);
     // ---- 5xxx 系統 ----
     /// `PLS-W8301`／`PLS-E8302`
     CLOCK_SKEW = "clock.skew", Some(5000);
@@ -172,11 +215,141 @@ pub const E_STATUS_UNWRITABLE: &str = "PLS-E8204";
 pub const W_CLOCK_SKEW: &str = "PLS-W8301";
 pub const E_CLOCK_SKEW: &str = "PLS-E8302";
 pub const E_CERT_NOT_YET_VALID: &str = "PLS-E8304";
+// ---- 註冊與憑證更新（衝刺 4，ENROLL.md） ----
+pub const E_ARG_CONFLICT: &str = "PLS-E0003";
+pub const E_NON_INTERACTIVE: &str = "PLS-E0004";
+pub const E_CLIENT_CERT_LOAD: &str = "PLS-E1104";
+pub const E_KEY_MISMATCH: &str = "PLS-E1107";
+pub const W_RENEW_FAILED: &str = "PLS-W1111";
+pub const I_RENEWING: &str = "PLS-I1112";
+pub const E_GRACE_EXCEEDED: &str = "PLS-E1113";
+pub const E_GRACE_IDENTITY: &str = "PLS-E1114";
+pub const E_CA_PIN: &str = "PLS-E1406";
+pub const W_TOFU: &str = "PLS-W1407";
+pub const E_ENROLL_UNREACHABLE: &str = "PLS-E2007";
+pub const E_ENROLL_NOT_ACCEPTED: &str = "PLS-E2008";
+pub const E_ENROLL_UNSUPPORTED: &str = "PLS-E2106";
+pub const E_ENROLL_RATE_LIMITED: &str = "PLS-E2202";
+pub const E_TOKEN_FORMAT: &str = "PLS-E3001";
+pub const E_TOKEN_INVALID: &str = "PLS-E3002";
+pub const E_TOKEN_EXPIRED: &str = "PLS-E3003";
+pub const E_TOKEN_EXHAUSTED: &str = "PLS-E3004";
+pub const E_SOURCE_BLOCKED: &str = "PLS-E3005";
+pub const W_DEREGISTER_UNREPORTED: &str = "PLS-W3107";
+pub const E_ALREADY_ENROLLED: &str = "PLS-E3301";
+pub const E_REQUEST_REJECTED: &str = "PLS-E3302";
+pub const E_REQUEST_EXPIRED: &str = "PLS-E3303";
+pub const E_REQUEST_INVALID: &str = "PLS-E3304";
+pub const E_ENROLL_IN_PROGRESS: &str = "PLS-E3305";
+pub const E_NOT_ENROLLED: &str = "PLS-E3306";
+pub const I_PENDING_APPROVAL: &str = "PLS-I3307";
+pub const I_ISSUED: &str = "PLS-I3308";
+pub const E_PENDING_QUEUE_FULL: &str = "PLS-E3309";
+pub const W_WITHDRAW_UNREPORTED: &str = "PLS-W3310";
+pub const E_LICENSE_EXHAUSTED: &str = "PLS-E7101";
+
+/// 程式中有常數的代碼（[`title`] 認得的代碼）；不認得時 `None`
+pub fn known(code: &str) -> Option<&'static str> {
+    ALL_CODES.iter().copied().find(|c| *c == code)
+}
+
+/// 所有代碼常數
+const ALL_CODES: &[&str] = &[
+    E_UNKNOWN_ARG,
+    E_BAD_ARG_VALUE,
+    E_CONFIG_SYNTAX,
+    E_CONFIG_RANGE,
+    W_TLS_VERIFY_DISABLED,
+    W_BOTH_TRUST_STORES,
+    E_CONFIG_UNREADABLE,
+    E_AGENT_ID_INVALID,
+    E_AGENT_ID_IO,
+    E_LOG_INIT,
+    E_CLIENT_CERT_REQUIRED,
+    E_CLIENT_CERT_MISMATCH,
+    E_CLIENT_CERT_MULTI_SAN,
+    E_CLIENT_CERT_REJECTED,
+    E_CLIENT_CERT_EXPIRED,
+    E_CLIENT_CERT_UNTRUSTED,
+    W_CLIENT_CERT_EXPIRING,
+    E_SERVER_CRL,
+    E_SERVER_CERT_UNTRUSTED,
+    E_SERVER_CERT_NAME,
+    E_SERVER_CERT_VALIDITY,
+    E_SERVER_CERT_REVOKED,
+    E_SERVER_CERT_PURPOSE,
+    E_DNS,
+    E_CONN_REFUSED,
+    E_CONN_TIMEOUT,
+    E_SERVER_SILENT,
+    E_PROTO_VERSION,
+    E_HELLO_REQUIRED,
+    E_LINE_TOO_LONG,
+    E_HELLO_BAD_REQUEST,
+    W_INVALID_REPORT,
+    W_SERVER_UNEXPECTED,
+    E_PER_IP_LIMIT,
+    W_REPORT_RATE,
+    W_SUPERSEDED,
+    E_AGENT_ID_CONFLICT,
+    E_REGISTRY_FULL,
+    E_BUFFER_UNAVAILABLE,
+    W_SERVER_STORAGE,
+    W_BUFFER_WRITE,
+    W_LOG_RETENTION_PAUSED,
+    W_BUFFER_FULL,
+    W_BUFFER_EXPIRED,
+    E_SERVICE_NOT_INSTALLED,
+    E_SERVICE_NOT_RUNNING,
+    W_STATUS_STALE,
+    W_SAMPLE_TIMEOUT,
+    W_SYSTEM32_WORKDIR,
+    W_AGENT_ID_PERMS,
+    W_KEY_PERMS,
+    E_NEED_ADMIN,
+    E_STATUS_UNWRITABLE,
+    W_CLOCK_SKEW,
+    E_CLOCK_SKEW,
+    E_CERT_NOT_YET_VALID,
+    E_ARG_CONFLICT,
+    E_NON_INTERACTIVE,
+    E_CLIENT_CERT_LOAD,
+    E_KEY_MISMATCH,
+    W_RENEW_FAILED,
+    I_RENEWING,
+    E_GRACE_EXCEEDED,
+    E_GRACE_IDENTITY,
+    E_CA_PIN,
+    W_TOFU,
+    E_ENROLL_UNREACHABLE,
+    E_ENROLL_NOT_ACCEPTED,
+    E_ENROLL_UNSUPPORTED,
+    E_ENROLL_RATE_LIMITED,
+    E_TOKEN_FORMAT,
+    E_TOKEN_INVALID,
+    E_TOKEN_EXPIRED,
+    E_TOKEN_EXHAUSTED,
+    E_SOURCE_BLOCKED,
+    W_DEREGISTER_UNREPORTED,
+    E_ALREADY_ENROLLED,
+    E_REQUEST_REJECTED,
+    E_REQUEST_EXPIRED,
+    E_REQUEST_INVALID,
+    E_ENROLL_IN_PROGRESS,
+    E_NOT_ENROLLED,
+    I_PENDING_APPROVAL,
+    I_ISSUED,
+    E_PENDING_QUEUE_FULL,
+    W_WITHDRAW_UNREPORTED,
+    E_LICENSE_EXHAUSTED,
+];
 
 /// 代碼的標題（`copywriting.md` §4.2 的範例標題；沒有範例的依 §3.3「情況」欄改寫）。
 /// 不認得的代碼回傳 `None`。
 pub fn title(code: &str) -> Option<&'static str> {
     Some(match code {
+        E_UNKNOWN_ARG => "未知的參數或命令",
+        E_BAD_ARG_VALUE => "參數值不合法",
         E_CONFIG_SYNTAX => "設定檔語法錯誤",
         E_CONFIG_RANGE => "設定值超出範圍",
         W_TLS_VERIFY_DISABLED => "已停用伺服器憑證驗證",
@@ -231,6 +404,37 @@ pub fn title(code: &str) -> Option<&'static str> {
         W_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 30 秒",
         E_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 5 分鐘",
         E_CERT_NOT_YET_VALID => "用戶端憑證尚未生效（本機時鐘可能落後）",
+        E_ARG_CONFLICT => "參數互斥",
+        E_NON_INTERACTIVE => "非互動模式缺少必要參數",
+        E_CLIENT_CERT_LOAD => "用戶端憑證或私鑰無法載入",
+        E_KEY_MISMATCH => "私鑰與憑證不成對",
+        W_RENEW_FAILED => "用戶端憑證自動更新失敗",
+        I_RENEWING => "正在更新用戶端憑證",
+        E_GRACE_EXCEEDED => "憑證過期已超過過期寬限期，無法自動續簽",
+        E_GRACE_IDENTITY => "Kairos 拒絕自動續簽：主機識別資訊與紀錄不符",
+        E_CA_PIN => "無法驗證 Kairos 身分（CA 指紋不符或未提供）",
+        W_TOFU => "未驗證伺服器身分",
+        E_ENROLL_UNREACHABLE => "無法連線到註冊端點",
+        E_ENROLL_NOT_ACCEPTED => "無法註冊：Kairos 目前不受理新的註冊申請",
+        E_ENROLL_UNSUPPORTED => "無法註冊：Kairos 版本不支援自動註冊",
+        E_ENROLL_RATE_LIMITED => "註冊申請暫緩送出：註冊端點忙碌中",
+        E_TOKEN_FORMAT => "註冊 token 格式錯誤",
+        E_TOKEN_INVALID => "註冊 token 無效",
+        E_TOKEN_EXPIRED => "註冊 token 已過期",
+        E_TOKEN_EXHAUSTED => "註冊 token 使用次數已滿",
+        E_SOURCE_BLOCKED => "此網路位址暫時被封鎖",
+        W_DEREGISTER_UNREPORTED => "無法通知 Kairos 這台主機已除役",
+        E_ALREADY_ENROLLED => "這台主機已註冊",
+        E_REQUEST_REJECTED => "註冊申請被拒絕",
+        E_REQUEST_EXPIRED => "註冊申請已逾期",
+        E_REQUEST_INVALID => "註冊申請內容不合法",
+        E_ENROLL_IN_PROGRESS => "已有進行中的註冊程序",
+        E_NOT_ENROLLED => "尚未註冊",
+        I_PENDING_APPROVAL => "等待核准",
+        I_ISSUED => "已核准，已取得憑證",
+        E_PENDING_QUEUE_FULL => "Kairos 的待核准佇列已滿",
+        W_WITHDRAW_UNREPORTED => "無法向 Kairos 撤回註冊申請",
+        E_LICENSE_EXHAUSTED => "授權節點數已滿",
         _ => return None,
     })
 }
@@ -293,6 +497,11 @@ mod tests {
 
     #[test]
     fn every_code_constant_has_a_title_and_a_valid_format() {
+        for &code in ALL_CODES {
+            assert!(title(code).is_some(), "{code}");
+            assert_eq!(known(code), Some(code));
+        }
+        assert_eq!(known("PLS-E9999"), None);
         for code in [
             E_CONFIG_SYNTAX,
             E_CLIENT_CERT_REJECTED,

@@ -141,7 +141,49 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 - `ca.key` 是整個信任鏈的根，務必離線保存。
 - 由公開 CA 簽發的伺服器憑證不需要設定 `ca_cert`：沒有 `ca_cert` 時 Pulse 預設信任作業系統的信任庫。同時設定了 `ca_cert` 又需要信任公開 CA 時，明確設定 `server.use_system_roots = true`。
 
+## 自動註冊（pulse enroll，0.5.0〔草稿〕）
+
+需要 Kairos 0.5 以上、註冊端點（預設 8444）為「開放」。規格：`crates/kairos-proto/ENROLL.md`；安裝步驟：INSTALL 第 5.0 節。
+
+```bash
+sudo pulse enroll --install-string 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…'
+sudo pulse enroll --server kairos.example.gov.tw --token KRT1-7G4Q-M2XD-9PBA-H6WN --ca-pin sha256:3f9a…
+pulse enroll --status          # 目前的註冊狀態
+sudo pulse enroll --cancel     # 撤回等待中的申請、刪除本機未使用的私鑰
+```
+
+流程：連線到註冊端點（只信任 CA 指紋、`--ca-file` 或人工確認的 CA，**不使用作業系統信任庫**；根 CA 可以是 P-256、P-384 或 RSA）→ `server-info`、`token-check`（token 有問題時不產生任何檔案）→ 在本機產生 ECDSA P-256 私鑰（`identity/request.key`，**不會離開主機**）、CSR 與 32 bytes 的輪詢憑據，先寫入 `identity/enrollment.json` 再送出 → 自動核准時當場取得憑證；需核准時顯示**申請編號**並輪詢（Kairos 支援時長輪詢，否則依 `poll_after_ms` 每次 ×1.5、上限 5 分鐘、±20%）→ 確認 SAN 為 `DNS:<agent_id>`、與私鑰成對、`ca_pem` 與指紋相同後原子寫入 `identity/client.pem`、`client.key`、`ca.pem` → 更新 `pulse.toml`（保留原有內容與註解，備份 `pulse.toml.bak-<時間>`）→ 以新憑證送一次 `hello` 確認，服務在執行時重新啟動它。
+
+| 檔案 | 權限 | 內容 |
+|---|---|---|
+| `identity/client.key`、`request.key`、`grace.key`、`client.next.key` | 0600（Windows 只有 SYSTEM 與 Administrators） | 私鑰（PKCS#8） |
+| `identity/enrollment.json` | 0600 | 申請的狀態、`request_id`、輪詢憑據、下次輪詢／重送時間、過期續簽的進度；申請**建立前**暫存 token（排隊或時鐘偏差時由服務重送），Kairos 受理後立即刪除 |
+| `identity/client.pem`、`ca.pem` | 0640 | 用戶端憑證（含中繼）、Kairos CA |
+
+寫入一律「暫存檔 → fsync → rename → fsync 目錄」；以 root 執行時新檔案改為 `identity/` 目錄的擁有者（服務帳號）。`pulse enroll` 與服務以 `identity/.lock` 互斥。
+
+**可靠性**：中斷（Ctrl+C、斷電）後重新執行或服務啟動時從 `enrollment.json` 接續，不重送新申請、不產生第二組私鑰；回應遺失後的重送沿用同一個 CSR 與輪詢憑據，Kairos 回傳同一筆申請。429／503 依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 排隊（絕不早於伺服器指定的時間，`PLS-E2202`／`PLS-E3309`），網路錯誤 2 秒起倍增、上限 5 分鐘。Kairos 因時鐘偏差暫不受理（`clock_skew`，`PLS-E8302`）時保留私鑰與 CSR，每 5 分鐘（±20%）以新的 `sent_at` 重送，偵測到本機時間被調整（牆鐘與單調時鐘的差距變動超過 1 秒）時立即重送。
+
+**服務**：沒有可用的身分而 `enrollment.json` 有進行中的申請時，服務先完成申請（依 `next_poll_at` 恢復，不立即輪詢）再連線；申請已結束（被拒、逾期、token 無效…）時不連線，`pulse status` 為嚴重，等待新的 `pulse enroll`。沒有 `enrollment.json` 的既有部署（手動憑證、未啟用 mTLS）行為不變。
+
+**憑證更新與過期**（身分由 `pulse enroll` 管理時）：
+
+- 正常輪替（8443 feature `renew`）：已使用壽命 2/3 或剩餘 `identity.renew_before_days`（預設 30）天時，在既有連線送 `renew_request`（新私鑰在 `client.next.key`，同一個 CSR 重送時沿用）；取得 `renew_result` 後以新憑證另建連線 `hello` 成功才取代 `client.pem`／`client.key`。需人工核准等失敗時 `PLS-W1111`、1 → 12 小時退避，繼續使用舊憑證。Kairos 不支援時不輪替（0.4 的行為）。
+- 過期寬限期續簽：Kairos 以 TLS alert `CertificateExpired` 確認過期後（不單憑本機時鐘），經 8444 `POST /v1/enroll/renewals` 以**舊私鑰**對含 `sent_at` 的簽章內容簽章（`kairos-proto` 的 `grace_renew_signing_input`），`sent_at` 不重複使用；`replayed_request` 立即重新簽章重送一次，仍被拒時 `PLS-W2107`。受阻時依 2 → 60 分鐘退避並對 8443 出示過期憑證報到；`grace_exceeded` 每 6 小時、`grace_clock_rejected` 每 5 分鐘、`grace_rejected` 停止（服務重新啟動時再試）。
+- 除役：安裝程式完全移除時執行 `pulse decommission --initiated-by <msi|install_script|package_manager>`：已註冊時經 8443（`hello` 帶 `intent: "deregister"`）送 `deregister`；等待核准中時經 8444 撤回申請（以申請時的私鑰對一次性 nonce 簽章）。最多 15 秒、重試 1 次，失敗時 `PLS-W3107`／`PLS-W3310`（結束代碼 8）。
+
+`pulse status` 的「連線」「身分」列與 `--json` 的 `data.identity.state`、`identity.enrollment`、`identity.grace` 呈現上述狀態（設計包 `enrollment-ux.md` §4.2），`--brief` 例如 `pending   plc-hmi-07 pending_approval PLS-I3307`、`critical  plc-hmi-07 clock_rejected offset=-7m42s PLS-E8302`。
+
+### 與 Kairos 端合併（衝刺 4）
+
+Pulse 端以測試用的假 8444 伺服器（`pulse/src/enroll/fake.rs`，依 ENROLL.md 與 `kairos-proto` 的型別實作）驗證。合併 Kairos 端時：
+
+1. 8443 的 `renew_request`／`renew_result`／`deregister`／`deregister_ack`、`hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now` 暫定義在 `pulse/src/lifecycle.rs`；Kairos 端在 `kairos-proto` 新增正式型別後，改用它們並刪除本檔（欄位與 ENROLL.md 第 13 節相同）。
+2. 以 `tests/e2e` 的實際執行檔跑 ENROLL.md 第 19.3 節的情境，取代假伺服器的情境測試（假伺服器可保留作單元測試）。
+
 ## 啟用 mTLS（客戶端憑證）
+
+以 `pulse enroll` 註冊（上一節）時不需要這一節的手動步驟。
 
 Kairos 設定了客戶端 CA（`auth.client_ca`）時會要求雙向 TLS：每台 Pulse 必須出示由該 CA 簽發、且 **SAN 為 `DNS:<自己的 agent_id>`**、EKU 含 `clientAuth` 的客戶端憑證，否則無法連線。Kairos 預設要求憑證只能有這一個 DNS SAN。這樣只知道某台主機 `agent_id` 的人，無法冒用它，也無法把它踢下線。詳細規則見 [PROTOCOL.md](PROTOCOL.md) 的「身分驗證（mTLS）」。
 
@@ -617,7 +659,7 @@ Pulse 0.4.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 ```
 src/
 ├── main.rs            進入點：載入設定、初始化日誌、建立 TLS 設定、啟動並監看背景任務
-├── cli.rs             命令列參數解析（status、explain、--print-agent-id、--version、--help）與版本字串
+├── cli.rs             命令列參數解析（status、explain、enroll、decommission、--print-agent-id、--version、--help）與版本字串
 ├── codes.rs           日誌事件（log-ux §4，含 Windows 事件識別碼）與錯誤代碼
 ├── status_file.rs     本機狀態檔的格式、原子寫入、讀取與單調時鐘
 ├── local_status.rs    執行中記錄狀態並定期寫出狀態檔
@@ -629,6 +671,13 @@ src/
 ├── protocol.rs        協定訊息定義（ClientMsg / ServerMsg）
 ├── network.rs         長 TLS 連線：hello / heartbeat / report / 逾時 / 重連 / 日誌清理；durable 時的補送與重送
 ├── spool.rs           本機緩衝（at-least-once）：區段檔、CRC 與尾端截斷、容量上限、收集 task 的寫入
+├── enroll/            註冊通道 8444 用戶端：pulse enroll（cli）、信任建立（trust）、HTTP/1.1（http、client）、
+│                      私鑰與 CSR（keys）、identity/ 與 enrollment.json（store）、排程與狀態機（schedule、machine）、
+│                      流程（flow）、服務端閘門與背景輪詢（service）、pulse.toml 改寫（toml_edit）、
+│                      測試用的假 8444 伺服器（fake）
+├── lifecycle.rs       8443 的 renew／deregister 訊息（ENROLL.md 第 13 節，合併時改用 kairos-proto）
+├── rotation.rs        8443 正常輪替：時點、待送的 CSR、驗證新憑證、確認後取代
+├── decommission.rs    pulse decommission 的除役通知（8443 deregister）
 ├── backoff.rs         指數退避與抖動
 ├── log_files.rs       日誌按日分檔與保留清除（含系統日期異常時暫停清除）
 ├── log_throttle.rs    日誌節流（同類訊息每個視窗最多記錄一則）
@@ -638,7 +687,7 @@ src/
 └── test_log.rs        測試用：擷取日誌輸出（僅測試建置）
 testdata/              測試用的憑證與私鑰（僅供測試、不可部署，見 testdata/README.md）：客戶端 CA / 中繼 CA / 客戶端憑證、
                        TLS 握手測試用的伺服器 CA 與伺服器憑證（server-ca.pem、server.pem、server.key）、
-                       多個 DNS SAN 的客戶端憑證（multi-san.pem）
+                       多個 DNS SAN 的客戶端憑證（multi-san.pem）、RSA 根 CA 的 8444 伺服器鏈（enroll-rsa-*）
 config.toml            預設設定（編譯時嵌入；發佈包中改名為 pulse.example.toml）
 build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
 packaging/             發佈包：build-release.sh（打包腳本）、pulse.service（systemd unit）、INSTALL.md（安裝指南）
@@ -685,6 +734,8 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 - 取樣卡住（例如 WMI 無回應）時只在本機記 `WARN` 並略過 report，heartbeat 照常送出；Kairos 目前不會因 `last_report` 停滯而告警（見「回報資料格式」）。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
 - `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
+- 註冊（`pulse enroll`）：沒有實作 `enroll.env` 的自動註冊、MSI／安裝腳本的串接、`--progress` 的原地重繪與 `PULSE_LANG`；Windows 的私鑰 ACL、服務重新啟動（`sc.exe`）只經過交叉編譯，沒有在 Windows 上實測。`pulse enroll` 不初始化日誌檔，`admin.dangerous_action` 等事件不會寫進 `logs/`。
+- 8444 本機時鐘偏差的例外（忽略伺服器憑證有效期間只取 `server_time`）只用於 `pulse enroll` 的錯誤訊息；服務端憑證到期判定仍以 Kairos 的 `CertificateExpired` 為準，沒有以 8444 `server-info` 校正（設計包 §8.1 (d)）。
 - Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
 
 ## 授權

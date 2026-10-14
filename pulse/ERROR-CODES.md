@@ -1,6 +1,6 @@
 # Pulse 錯誤代碼與日誌事件對照
 
-本文件列出 Pulse 0.4〔草稿〕已對應到設計包代碼的地方（代碼 → 程式位置 → 觸發條件 → 在哪裡看得到），以及尚未實作的代碼。代碼的唯一來源是設計包 `design-system/copywriting.md` §3.3（Pulse 共 109 個）；日誌事件依 `pulse/log-ux.md` §4。發佈包內附本文件，`pulse explain <代碼>` 印出代碼的標題並指向這裡。
+本文件列出 Pulse 0.4〔草稿〕與 0.5〔草稿〕（註冊通道）已對應到設計包代碼的地方（代碼 → 程式位置 → 觸發條件 → 在哪裡看得到），以及尚未實作的代碼。代碼的唯一來源是設計包 `design-system/copywriting.md` §3.3（Pulse 共 109 個）；日誌事件依 `pulse/log-ux.md` §4。發佈包內附本文件，`pulse explain <代碼>` 印出代碼的標題並指向這裡。
 
 ## 1. 代碼出現在哪裡
 
@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（56 個）
+## 2. 已對應的代碼（86 個）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -94,6 +94,43 @@
 | `PLS-W8301` | `network.rs` `ClockSkewLog`；`eval.rs` `clock_row` | 與 Kairos 相差 30 秒～5 分鐘（以 `hello_ack` 的 `server_time` 量測；只在等級改變或偏差再變化超過 1 分鐘時記錄） | `clock.skew`（WARN）；時鐘列 ⚠ |
 | `PLS-E8302` | 同上 | 相差超過 5 分鐘 | `clock.skew`（ERROR，同時寫 stderr）；時鐘列 ✗。回到 30 秒以內時 `clock.skew -`（INFO） |
 
+### 2.6 註冊與憑證更新（0.5〔草稿〕，`crates/kairos-proto/ENROLL.md`）
+
+8444 錯誤碼與 Pulse 代碼的對照以 `kairos-proto` 的 `EnrollErrorCode::pulse_code` 為準（ENROLL.md「錯誤碼」表）；Pulse 依端點再決定處置（`enroll/machine.rs`）。
+
+| 代碼 | 程式位置 | 觸發條件 | 看得到的地方 |
+|---|---|---|---|
+| `PLS-E0004` | `enroll/cli.rs` | 非互動模式缺少 `--server`／`--token`、危險操作（`--force`、`--reset-identity`、`--cancel`）沒有 `--yes` | stderr、`--json` 的 `error`，結束代碼 2 |
+| `PLS-E1104` | `enroll/flow.rs` `install` | 無法寫入取得的憑證或私鑰 | `pulse enroll` 結束代碼 4 |
+| `PLS-E1107` | `enroll/flow.rs` `install`、`rotation.rs` | 取得的憑證與申請時的私鑰不成對（私鑰遺失） | `pulse enroll` 結束代碼 4；`cert.renew_failed` |
+| `PLS-W1111` | `rotation.rs` | 8443 正常輪替失敗（`renew_requires_approval`、`invalid_csr`、`storage_unavailable`、以新憑證連線失敗）；1 → 12 小時退避 | `cert.renew_failed`（WARN）；`status.json` 的 `identity.renew_failed_code` |
+| `PLS-I1112` | `rotation.rs` | 達輪替門檻，送出 `renew_request` | `cert.renew_started` |
+| `PLS-E1113` | `enroll/machine.rs` `on_grace_error` | 過期續簽 `renew_grace_exceeded`；每 6 小時重試 | `cert.grace_exceeded`；身分列 ✗「已超過寬限期」、`identity.grace.renew_state = grace_exceeded` |
+| `PLS-E1114` | 同上；`flow.rs` `build_grace_request` | `renew_identity_mismatch`、`invalid_csr`；讀不到主機指紋或舊私鑰不是 P-256 | `cert.grace_rejected`；連線列 ✗ |
+| `PLS-E1406` | `enroll/trust.rs`、`flow.rs` `install`、`enroll/cli.rs` | 鏈中找不到指紋相符的 CA（不送出任何請求）；`issued` 的 `ca_pem` 與信任錨不同（不寫入）；非互動模式沒有指紋 | `pulse enroll` 結束代碼 5 |
+| `PLS-W1407` | `enroll/cli.rs` | 以 TOFU 信任 CA（`--trust-on-first-use` 或互動確認） | `pulse enroll` 的 `data.issues[]`，結束代碼 8 |
+| `PLS-E2007` | `enroll/machine.rs` | 8444 拒絕連線（多半是註冊端點為「關閉」）；過期續簽為 `grace_blocked` | `pulse enroll` 結束代碼 5；`cert.grace_renew_blocked`；連線列 ✗ |
+| `PLS-E2008` | 同上 | `enroll_not_accepted`、`server-info` 的 `accepts.new_enrollment = false` | `enroll.not_accepted`；結束代碼 6 |
+| `PLS-E2106` | 同上 | 404／405 且本文不是註冊通道的錯誤格式、`enroll_api` 沒有 `v1` | 結束代碼 5 |
+| `PLS-E2202` | 同上 | 429 `rate_limited`、503 `enroll_busy`：依 `Retry-After` 排隊重送（不視為失敗） | `enroll.rate_limited`（WARN）；身分列「註冊端點忙碌，下次重試…」、`pending` |
+| `PLS-E3001` | `enroll/cli.rs` | token 檢查碼不符（本機攔下、不送出） | 結束代碼 2 |
+| `PLS-E3002`～`PLS-E3004` | `enroll/machine.rs`、`cli.rs` | `token_invalid`／`token_expired`／`token_exhausted`（`token-check` 時不產生任何檔案） | `enroll.token_error`；結束代碼 6；身分列 ✗ |
+| `PLS-E3005` | 同上 | `source_blocked`：CLI 結束；服務等封鎖結束後重試 | `enroll.source_blocked`；結束代碼 6 |
+| `PLS-W3107` | `decommission.rs` | 除役通知未完成（`unreachable`／`unsupported`／`cert_expired`／`cert_rejected`／`server_error`） | `install.decommission_unreported`；`pulse decommission` 結束代碼 8 |
+| `PLS-E3301` | `enroll/cli.rs` | 已註冊，未加 `--force` | 結束代碼 11 |
+| `PLS-E3302` | `enroll/machine.rs` `result_state` | 申請被拒絕（刪除未使用的私鑰） | `enroll.rejected`；身分列 ✗（含原因） |
+| `PLS-E3303` | 同上 | 申請逾期、被新申請取代、輪詢時 `request_not_found` | `enroll.request_expired` |
+| `PLS-E3304` | 同上 | `invalid_csr`；送出前的自我檢查（`validate_enroll_request`）不通過 | 結束代碼 6 |
+| `PLS-E3305` | `enroll/cli.rs` | 已有進行中的申請，或另一個 `pulse enroll` 持有 `identity/.lock` | 結束代碼 11 |
+| `PLS-E3306` | `enroll/flow.rs` | `enrollment.json` 缺少重送需要的資料 | 身分列 ✗ |
+| `PLS-I3307` | `enroll/machine.rs` | 等待核准（新註冊、過期續簽） | `enroll.pending`；連線列 `…`，本機狀態「待核准」（結束代碼 7） |
+| `PLS-I3308` | 同上 | 已核准、已取得憑證 | `enroll.approved` |
+| `PLS-E3309` | 同上 | `pending_queue_full`：依 `Retry-After`（3600 秒）重試 | `enroll.queue_full` |
+| `PLS-W3310` | `enroll/flow.rs` `withdraw` | 撤回未完成（`unreachable`／`unsupported`／`already_approved`／`signature_rejected`／`server_error`） | `install.withdrawal_unreported`；`pulse enroll --cancel`、`pulse decommission` 結束代碼 8 |
+| `PLS-E7101` | `enroll/machine.rs` | `license_exhausted` | 結束代碼 6 |
+| `PLS-E8302` | `enroll/machine.rs` | 註冊或過期續簽時 `clock_skew`：每 5 分鐘重送，偵測到本機時間被調整時立即 | `enroll.clock_rejected`／`cert.grace_renew_blocked`（ERROR）；身分列 ✗「相差…；校正後自動重送」；`clock.source = clock_skew` |
+| `PLS-E1403`（8444） | `enroll/cli.rs` `connect_failure` | 註冊端點的伺服器憑證依本機時間已過期或尚未生效：以「忽略有效期間」再驗證一次、只送 `server-info`，訊息中寫出未驗證的 Kairos 時間 | `clock.source = server_info_unverified`、`valid: false` |
+
 ## 3. 日誌事件（`log-ux.md` §4）
 
 | 事件 | 事件識別碼 | 程式位置 | 已實作 |
@@ -112,20 +149,23 @@
 | `status.write_failed`、`status.write_restored` | 5020、5021 | `local_status.rs` | ✓（設計包 §26 補登） |
 | `conn.retry`、`conn.retry_summary` | —、2002 | — | 待辦（§4） |
 | `config.loaded`、`identity.clone_suspected`、`sysinfo.snapshot` | 1002、1006、1010 | — | 待辦 |
-| `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | — | 待辦（沒有自動更新憑證） |
-| `install.*`、`enroll.*`、`admin.dangerous_action` | 4000～4112 | — | 待辦（沒有安裝程式與 `pulse enroll`） |
+| `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | `main.rs` `connection_loop`、`rotation.rs`、`enroll/service.rs` | ✓（0.5〔草稿〕） |
+| `install.decommission_unreported`、`install.withdrawal_unreported` | 4002、4005 | `decommission.rs`、`enroll/cli.rs` | ✓（`pulse decommission`、`pulse enroll --cancel`；沒有初始化日誌時只寫 stderr） |
+| `enroll.submitted`～`enroll.request_expired`、`enroll.rate_limited`～`enroll.clock_rejected` | 4100～4105、4108～4112 | `enroll/service.rs` `ServiceObserver` | ✓（服務在背景接續申請時；`pulse enroll` 只輸出到終端機） |
+| `admin.dangerous_action` | 4107 | `enroll/cli.rs` | 部分：`pulse enroll` 不初始化日誌檔，事件沒有寫進 `logs/` |
+| `install.completed`、`install.failed`、`install.uninstalled`、`install.cancelled`、`enroll.identity_conflict` | 4000、4001、4003、4004、4106 | — | 待辦（沒有安裝程式；身分衝突沿用 `conn.superseded`） |
 
 事件識別碼定義在 `codes.rs`（`codes::ALL`，單元測試檢查名稱與識別碼不重複、5010～5015 與設計包一致）。**Pulse 目前不寫 Windows 事件記錄**：需要安裝程式註冊事件來源 `Pulse`（MSI 尚未實作），屆時直接使用這份對照。
 
 ## 4. 待辦
 
-### 4.1 尚未對應的代碼（53 個）
+### 4.1 尚未對應的代碼（23 個）
 
 | 類別 | 代碼 | 原因 |
 |---|---|---|
-| 命令列、設定 | `PLS-E0004`、`PLS-E0103`、`PLS-E0202`、`PLS-E0401`、`PLS-E0402`、`PLS-W0102`、`PLS-W0104`、`PLS-W0105` | 沒有非互動危險操作、未知欄位偵測、`PULSE_CONFIG`；必填欄位與矛盾設定目前都歸在 `PLS-E0201`。`PLS-E0402`（設定檔無法讀取）在 `pulse status` 中刻意不視為錯誤（以服務回報的設定為準）；`--config` 指定的檔案不存在暫用 `PLS-E0002` |
-| 憑證 | `PLS-W1001`、`PLS-E1104`、`PLS-E1106`、`PLS-E1107`、`PLS-W1111`、`PLS-I1112`、`PLS-E1113`、`PLS-E1114`、`PLS-E1406`、`PLS-W1407` | 啟動時的憑證／私鑰載入錯誤目前只有結束代碼 4 與 `agent.fatal`（訊息已具體），尚未逐一歸類；自動更新、過期續簽、CA 指紋與 TOFU 尚未實作 |
-| 連線、註冊 | `PLS-W2006`、`PLS-E2007`、`PLS-E2008`、`PLS-E2106`、`PLS-E2202`、`PLS-E3001`～`PLS-E3005`、`PLS-W3105`、`PLS-E3106`、`PLS-W3107`、`PLS-E3301`～`PLS-E3306`、`PLS-I3307`、`PLS-I3308`、`PLS-E3309`、`PLS-W3310`、`PLS-E7101` | 註冊端點 8444、`pulse enroll`、除役、身分鎖檔、連線不穩定的判定尚未實作 |
+| 命令列、設定 | `PLS-E0103`、`PLS-E0202`、`PLS-E0401`、`PLS-E0402`、`PLS-W0102`、`PLS-W0104`、`PLS-W0105` | 未知欄位偵測、`PULSE_CONFIG`；必填欄位與矛盾設定目前都歸在 `PLS-E0201`。`PLS-E0402`（設定檔無法讀取）在 `pulse status` 中刻意不視為錯誤（以服務回報的設定為準）；`--config` 指定的檔案不存在暫用 `PLS-E0002` |
+| 憑證 | `PLS-W1001`、`PLS-E1106` | Kairos 伺服器憑證即將到期的提醒、加密私鑰的專屬代碼尚未實作；啟動時的憑證／私鑰載入錯誤仍只有結束代碼 4 與 `agent.fatal`（`PLS-E1104`、`PLS-E1107` 目前只用於註冊流程） |
+| 連線、身分 | `PLS-W2006`、`PLS-W3105`、`PLS-E3106` | 連線不穩定的判定、`agent.id.host` 的複製主機偵測、常駐行程的身分鎖檔尚未實作 |
 | 儲存 | `PLS-E4001`、`PLS-E4301`、`PLS-W4302` | 磁碟空間檢查、`pulse diag` 尚未實作 |
 | 平台、安裝 | `PLS-E8001`、`PLS-W8006`、`PLS-E8007`、`PLS-W8008`、`PLS-E8102`、`PLS-E8103`、`PLS-E8104`、`PLS-W8303` | 安裝程式、MSI、`pulse preflight`、時間同步狀態偵測尚未實作 |
 
@@ -146,7 +186,11 @@
 | 狀態檔的備用位置 | `/var/lib/pulse/status.json`、`%ProgramData%\Pulse\status.json`，所有人可讀（`cli-spec.md` §4.1） | 依設計（2026-10-13 使用者決定）；另外在預設位置無法寫入時（沿用沒有 `StateDirectory=` 的舊 unit）改寫工作目錄的 `logs/status.json` 並以 `PLS-E8204` 警告 | 舊 unit 在 `ProtectSystem=strict` 下不能寫 `/var/lib/pulse`；不讓服務因狀態檔而啟動失敗。此時只有 root／`pulse` 群組讀得到 |
 | 「身分」列 | 「…，2027-06-09 起自動更新」 | 沒有這一段；14 天內到期為 `PLS-W1110`（不會自動更新） | 這個版本沒有自動更新憑證 |
 | `PLS-E2003` 的說明 | 原因寫出解析出的 IP；處理方式 `sudo pulse check-config --connect` | 不寫 IP；以 `nc -vz <主機> <埠>`（Windows `Test-NetConnection`）檢查 | 連線失敗時拿不到實際連線的位址；`pulse check-config` 尚未實作 |
-| `PLS-E1105` 的處理方式 | `sudo pulse enroll --force --token <新 token>` | 請管理者重新簽發用戶端憑證、更新設定後重新啟動 | `pulse enroll` 尚未實作 |
+| `PLS-E1105` 的處理方式 | `sudo pulse enroll --force --token <新 token>` | 請管理者重新簽發用戶端憑證、更新設定後重新啟動 | `pulse status` 的三段式尚未依「身分是否由 pulse enroll 管理」切換（0.5 待辦）；`pulse enroll` 的錯誤輸出已依設計包 |
+| `pulse.toml` 的寫入時機 | `issued` 時（設計包 §7） | Kairos **受理**申請（`pending_approval`／`issued`）或交給服務在背景重送時就寫入 | `/opt/pulse` 對服務唯讀，服務在背景取得憑證時無法改寫 `pulse.toml`；先寫好指向 `identity/` 的路徑，服務取得憑證後重新讀設定即可連線 |
+| token 是否寫入磁碟 | 不寫入（`enrollment.json` 只記前 4 碼） | 申請**建立前**（429／503 排隊、`clock_skew`）暫存在 `enrollment.json`（0600），Kairos 受理或無法再使用時立即刪除 | 設計包要求服務在背景重送（§5.5a、§5.12），沒有 token 無法重送 |
+| 申請被拒絕後的 `enrollment.json` | 刪除私鑰與 `enrollment.json` | 刪除私鑰與輪詢憑據，保留 `enrollment.json`（`state: rejected`） | 讓服務與 `pulse status` 在重新啟動後仍能顯示 `PLS-E3302`，並在新的 `pulse enroll` 之前不連線 |
+| 安裝程式的通知命令 | 未定義命令名稱（§5.10、§5.11 只寫「安裝程式」） | `pulse decommission --initiated-by <…>` | 需要一個命令讓 MSI／安裝腳本／`postrm` 呼叫；名稱待設計包負責人確認 |
 | `PLS-E8003` 的處理方式 | `sudo pulse check-config` | 修正設定檔（寫出錯誤）或查看日誌 | `pulse check-config` 尚未實作 |
 | 說明行 | `說明：pulse explain <代碼>` 指向本機完整說明 | `pulse explain` 只印標題並指向本文件 | 各代碼的完整說明頁尚未實作 |
 | 「時鐘」列在被拒時 | 4.6 範例「與 Kairos 相差 0.3 秒」 | 未連線時一律加「（上次連線時量測）」（與 4.5 相同） | 被拒期間沒有新的量測 |

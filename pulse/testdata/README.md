@@ -14,6 +14,8 @@
 | `not-pem.txt` | 非 PEM 內容（測試錯誤訊息） |
 | `server-ca.pem` | 測試**伺服器** CA（自簽，EC P-256），與上面的客戶端 CA 不同；只信任 `root.pem` 時伺服器憑證不受信任 |
 | `server.pem` / `server.key` | 由 `server-ca.pem` 簽發的伺服器憑證與私鑰（PKCS#8）：SAN `DNS:localhost`、`IP:127.0.0.1`，EKU `serverAuth`，`CA:FALSE`；供實際 TLS 握手測試使用 |
+| `enroll-rsa-root.pem` | 測試 **RSA 2048** 根 CA（自簽，`CA:TRUE`；私鑰已刪除）：註冊通道測試「既有部署的 RSA 根 CA」 |
+| `enroll-rsa-server.pem` / `enroll-rsa-server.key` | 由 `enroll-rsa-root.pem` 簽發的 EC P-256 伺服器憑證與私鑰（PKCS#8）：SAN `DNS:localhost`、`IP:127.0.0.1`，EKU `serverAuth`，`CA:FALSE`；假 8444 伺服器（`src/enroll/fake.rs`）使用 |
 | `multi-san.pem` | 自簽客戶端憑證（只有憑證、沒有私鑰）：SAN `DNS:6f1c0e4a-1b2c-4d3e-9f00-112233445566`、`DNS:11111111-2222-4333-8444-555555555555`，EKU `clientAuth`；測試啟動時對多個 DNS SAN 發出警告 |
 
 重新產生方式（OpenSSL 3.0+；Windows Git Bash 需先 `export MSYS_NO_PATHCONV=1`）：
@@ -50,3 +52,14 @@ openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout serv
 openssl x509 -req -in s.csr -CA server-ca.pem -CAkey server-ca.key -CAcreateserial -out server.pem -days 36500 -copy_extensions copyall
 rm -f s.csr *.srl server-ca.key
 ```
+
+註冊通道的 RSA 根 CA（`enroll-rsa-*`）：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout root.key -out enroll-rsa-root.pem -days 36500   -subj "/CN=Pulse Test RSA Root CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout enroll-rsa-server.key -out s.csr -subj "/CN=localhost"   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -addext "extendedKeyUsage=serverAuth" -addext "basicConstraints=critical,CA:FALSE"
+openssl x509 -req -in s.csr -CA enroll-rsa-root.pem -CAkey root.key -CAcreateserial -out enroll-rsa-server.pem -days 36500 -copy_extensions copyall
+rm -f root.key s.csr *.srl
+```
+
+P-256、P-384 根 CA 的情境由測試以 rcgen 在執行時產生，不需要檔案。

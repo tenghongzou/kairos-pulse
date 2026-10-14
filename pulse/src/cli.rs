@@ -20,6 +20,8 @@ pub const USAGE: &str = "\
 
 命令：
   status             顯示服務、連線、身分與回報狀態（讀取本機狀態檔，不需要連線；pulse status --help）
+  enroll             以註冊 token 向 Kairos 註冊這台主機（pulse enroll --help）
+  decommission       完全移除前通知 Kairos（安裝程式使用；pulse decommission --help）
   explain <代碼>     說明錯誤代碼，例如 pulse explain PLS-E2003
 
 選項：
@@ -108,6 +110,14 @@ pub enum Command {
     StatusHelp,
     /// `pulse explain <代碼>`
     Explain(String),
+    /// `pulse enroll`
+    Enroll(Box<crate::enroll::cli::EnrollArgs>),
+    /// `pulse enroll --help`
+    EnrollHelp,
+    /// `pulse decommission`
+    Decommission(crate::enroll::cli::DecommissionArgs),
+    /// `pulse decommission --help`
+    DecommissionHelp,
 }
 
 /// 參數錯誤：訊息與要附上的用法
@@ -118,7 +128,7 @@ pub struct UsageError {
 }
 
 impl UsageError {
-    fn new(message: String, usage: &'static str) -> Self {
+    pub fn new(message: String, usage: &'static str) -> Self {
         Self { message, usage }
     }
 }
@@ -147,6 +157,18 @@ where
             };
         }
         Some("run") => return parse_global(&args[1..]),
+        Some("enroll") => {
+            return Ok(match crate::enroll::cli::parse(&args[1..])? {
+                Some(a) => Command::Enroll(Box::new(a)),
+                None => Command::EnrollHelp,
+            });
+        }
+        Some("decommission") => {
+            return Ok(match crate::enroll::cli::parse_decommission(&args[1..])? {
+                Some(a) => Command::Decommission(a),
+                None => Command::DecommissionHelp,
+            });
+        }
         _ => {}
     }
     parse_global(&args)

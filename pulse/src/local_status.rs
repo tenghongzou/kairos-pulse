@@ -275,6 +275,7 @@ impl State {
             clock.measured_at = Some(ts(now));
             clock.measured_mono_ms = sf::mono_ms();
             clock.source = Some("hello_ack".into());
+            clock.unverified = false;
         }
         self.changed = true;
         restored
@@ -379,6 +380,45 @@ impl State {
             self.file.config.warnings.push(note);
             self.changed = true;
         }
+    }
+
+    /// 身分與註冊的狀態（`enroll` 模組；設計包 `enrollment-ux.md` §4.2）
+    pub fn set_enrollment(
+        &mut self,
+        state: Option<String>,
+        enrollment: Option<sf::EnrollmentStatus>,
+        grace: Option<sf::GraceStatus>,
+    ) {
+        let id = &mut self.file.identity;
+        if id.state != state || id.enrollment != enrollment || id.grace != grace {
+            id.state = state;
+            id.enrollment = enrollment;
+            id.grace = grace;
+            self.changed = true;
+        }
+    }
+
+    /// 8443 正常輪替失敗（`PLS-W1111`）
+    pub fn renew_failed(&mut self, code: &str) {
+        self.file.identity.renew_failed_code = Some(code.to_string());
+        self.changed = true;
+    }
+
+    /// 下一次輪替的時點
+    pub fn set_renew_after(&mut self, at: Option<DateTime<Utc>>) {
+        self.file.identity.renew_after = at.map(ts);
+    }
+
+    /// 由註冊端點（8444）的回應量測的時鐘偏差（`source` 為 `clock_skew`、`server_info_unverified` 等）
+    pub fn clock_from_enroll(&mut self, offset_ms: i64, source: &str) {
+        let now = Utc::now();
+        let clock = &mut self.file.clock;
+        clock.offset_ms = Some(offset_ms);
+        clock.measured_at = Some(ts(now));
+        clock.measured_mono_ms = sf::mono_ms();
+        clock.source = Some(source.to_string());
+        clock.unverified = source == "server_info_unverified";
+        self.changed = true;
     }
 
     pub fn set_client_cert(&mut self, info: crate::tls::ClientCertInfo) {

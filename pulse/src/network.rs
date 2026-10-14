@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backoff::Backoff;
 use crate::codes::{self, Event};
 use crate::config_manager::AppConfig;
+use crate::lifecycle::{self, HelloAckExtra};
 use crate::local_status::{self, Disconnected, Registered};
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
@@ -44,6 +45,7 @@ use crate::protocol::{
     SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, clock_skew_warning, hello_features,
     now_ts, parse_server_msg, report_message, sanitize_cpu_usage,
 };
+use crate::rotation::{Rotation, RotationLine};
 use crate::service_status;
 use crate::spool::{EntryInfo, SharedSpool, Spool, SpoolRecord};
 use crate::system_info::{self, Sample};
@@ -248,6 +250,12 @@ pub struct Settings {
     pub replay_interval: Duration,
     /// 已註冊時附加在 systemd 狀態文字後的提醒（例如無法開啟本機緩衝 `PLS-E4004`）
     pub status_note: Option<String>,
+    /// hello 另外宣告的 features（例如身分由 `pulse enroll` 管理時的 `renew`）
+    pub extra_features: Vec<String>,
+    /// 8443 正常輪替（ENROLL.md 第 13.1 節）；身分不是由 `pulse enroll` 管理時為 `None`
+    pub rotation: Option<Arc<std::sync::Mutex<Rotation>>>,
+    /// Kairos 以 TLS alert `CertificateExpired` 拒絕用戶端憑證時結束（改走 8444 過期續簽）
+    pub grace_on_expiry: bool,
 }
 
 impl Settings {
@@ -273,6 +281,9 @@ impl Settings {
             ),
             replay_interval: Duration::from_millis(config.effective_replay_interval_ms()),
             status_note: None,
+            extra_features: Vec::new(),
+            rotation: None,
+            grace_on_expiry: false,
         }
     }
 
@@ -318,6 +329,8 @@ enum SessionError {
     },
     /// 收到結束要求（Ctrl+C 等）
     Shutdown,
+    /// 經 8443 取得新的用戶端憑證（`renew_result`）：以新憑證重新連線
+    Renewed,
 }
 
 impl SessionError {
@@ -404,6 +417,7 @@ impl fmt::Display for SessionError {
                 Ok(())
             }
             Self::Shutdown => write!(f, "收到結束要求"),
+            Self::Renewed => write!(f, "已取得新的用戶端憑證，以新憑證重新連線"),
         }
     }
 }
@@ -474,6 +488,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         }
     }
 
+    /// 送出一行已序列化的 JSON（`kairos-proto` 尚未定義的訊息，見 `lifecycle`）
+    async fn send_line(&mut self, line: String) -> Result<()> {
+        self.last_line_len = line.len() + 1;
+        match time::timeout(WRITE_TIMEOUT, self.framed.send(line)).await {
+            Ok(res) => res.map_err(SessionError::Codec),
+            Err(_) => Err(SessionError::WriteTimeout),
+        }
+    }
+
     /// 寫出被中斷時，最近一則訊息是否已有一部分交給底層串流（之後可能送到伺服器）。
     ///
     /// `Framed` 只保留尚未寫出的部分：剩餘量介於 0 與整行長度之間代表「寫了一半」；
@@ -516,21 +539,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     }
 }
 
+/// [`run`] 結束的原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunExit {
+    /// `shutdown` 被觸發
+    Stopped,
+    /// Kairos 確認用戶端憑證已過期（`settings.grace_on_expiry`）：改走過期續簽
+    CertExpired,
+    /// 經 8443 取得新憑證（`client.next.pem`）：以新憑證確認後取代
+    Renewed,
+}
+
 /// 連線主迴圈：無限重連，直到 `shutdown` 被觸發才返回。
 ///
 /// `reports` 為 at-most-once 時的即時取樣；`spool` 為本機緩衝（停用時 `None`，不宣告 `durable`）。
 pub async fn run(
     settings: Settings,
     tls: TlsSetup,
-    mut reports: mpsc::Receiver<Sample>,
+    reports: &mut mpsc::Receiver<Sample>,
     spool: Option<Arc<SharedSpool>>,
     shutdown: CancellationToken,
-) {
+) -> RunExit {
     let dialer = TlsDialer {
         settings: &settings,
         tls: &tls,
     };
-    run_with(&settings, &dialer, &mut reports, spool.as_ref(), &shutdown).await;
+    run_with(&settings, &dialer, reports, spool.as_ref(), &shutdown).await
 }
 
 /// [`run`] 的實作，連線方式由 `dialer` 提供。
@@ -540,7 +574,7 @@ async fn run_with<D: Dialer>(
     reports: &mut mpsc::Receiver<Sample>,
     spool: Option<&Arc<SharedSpool>>,
     shutdown: &CancellationToken,
-) {
+) -> RunExit {
     let mut backoff = Backoff::new(settings.initial_delay, settings.max_delay);
     let mut throttles = ServerLogThrottles::default();
     // 連續因 superseded 而斷線的次數（其他原因斷線即歸零）
@@ -570,7 +604,7 @@ async fn run_with<D: Dialer>(
             _ = time::sleep(startup_delay) => {}
             _ = shutdown.cancelled() => {
                 log::debug!("啟動延遲中收到結束要求，連線任務已停止");
-                return;
+                return RunExit::Stopped;
             }
         }
     }
@@ -591,10 +625,19 @@ async fn run_with<D: Dialer>(
             Ok(never) => match never {},
             Err(SessionError::Shutdown) => {
                 log::debug!("連線任務已停止");
-                return;
+                return RunExit::Stopped;
+            }
+            Err(SessionError::Renewed) => {
+                log::info!("已取得新的用戶端憑證，結束目前的連線，改以新憑證連線");
+                return RunExit::Renewed;
             }
             Err(e) => e,
         };
+        if let Some(rot) = &settings.rotation {
+            rot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .on_disconnect();
+        }
 
         let superseded = err.server_code() == Some("superseded");
         superseded_streak = if superseded {
@@ -711,11 +754,20 @@ async fn run_with<D: Dialer>(
             service_status::attention(&msg);
         }
 
+        // Kairos 確認用戶端憑證已過期：改走 8444 過期續簽（設計包 enrollment-ux.md §8.1 (b)）
+        if settings.grace_on_expiry
+            && code == Some(codes::E_CLIENT_CERT_EXPIRED)
+            && client_cert_alert(&err, has_client_cert)
+                == Some(tokio_rustls::rustls::AlertDescription::CertificateExpired)
+        {
+            return RunExit::CertExpired;
+        }
+
         tokio::select! {
             _ = time::sleep(delay) => {}
             _ = shutdown.cancelled() => {
                 log::debug!("退避等待中收到結束要求，連線任務已停止");
-                return;
+                return RunExit::Stopped;
             }
         }
     }
@@ -1134,8 +1186,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             ProtoOffer {
                 proto_min: Some(SUPPORTED_PROTO.min),
                 proto_max: Some(SUPPORTED_PROTO.max),
-                // 停用本機緩衝時不宣告 durable（A5）
-                features: Some(hello_features(spool.is_some())),
+                // 停用本機緩衝時不宣告 durable（A5）；身分由 pulse enroll 管理時另外宣告 renew
+                features: Some({
+                    let mut f = hello_features(spool.is_some());
+                    f.extend(settings.extra_features.iter().cloned());
+                    f
+                }),
             },
             settings.host.clone(),
         )),
@@ -1150,6 +1206,25 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         session.durable = false;
     }
     *registered_at = Some(Instant::now());
+    if let Some(rot) = &settings.rotation {
+        let negotiated = session.is_v2()
+            && settings
+                .extra_features
+                .iter()
+                .any(|f| f == lifecycle::FEATURE_RENEW)
+            && ack
+                .server_features
+                .iter()
+                .any(|f| f == lifecycle::FEATURE_RENEW);
+        let offset = ack
+            .server_time
+            .as_deref()
+            .and_then(|t| kairos_proto::enroll::parse_rfc3339_ms(t).ok())
+            .map(|st| chrono::Utc::now().timestamp_millis() - st);
+        rot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .on_hello_ack(negotiated, &ack.extra, offset);
+    }
     let (level, msg) = registered_log(settings, &ack, tls_info);
     log::log!(level, "{}{msg}", codes::tag(codes::CONN_REGISTERED, None));
     if let Some((level, msg)) = ack
@@ -1249,6 +1324,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut pending_report: Option<u64> = None;
     // 這條連線上因上一筆 report 未回應而略過的取樣數
     let mut skipped_reports: u64 = 0;
+    let mut rotation_tick = time::interval(ROTATION_CHECK);
+    rotation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -1256,6 +1333,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 let seq = conn.next_seq();
                 conn.send(&ClientMsg::Heartbeat { seq, ts: now_ts() }).await?;
                 log::trace!("已送出 heartbeat（seq={seq}）");
+            }
+            _ = rotation_tick.tick(), if settings.rotation.is_some() => {
+                send_renew_if_due(conn, settings).await?;
             }
             Some(sample) = reports.recv() => {
                 if let Some(pending) = pending_report {
@@ -1286,6 +1366,10 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             }
             line = conn.framed.next() => {
                 let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
+                if rotation_line(settings, &line)? {
+                    idle.as_mut().reset(after(read_idle));
+                    continue;
+                }
                 let outcome = handle_server_line(&line, conn.seq, throttles)?;
                 // 只有合法的協定訊息才算「伺服器還活著」（與 Kairos 的閒置判定一致）；
                 // 無法解析的行不重置閒置計時，持續送垃圾的伺服器仍會被判定為閒置
@@ -1610,6 +1694,8 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
         );
     }
     let mut delivery = Delivery::new(settings.replay_interval, Instant::now() + spread, backlog);
+    let mut rotation_tick = time::interval(ROTATION_CHECK);
+    rotation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         let next_send = delivery.next_send_at(&shared.lock());
@@ -1619,6 +1705,9 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                 conn.send(&ClientMsg::Heartbeat { seq, ts: now_ts() }).await?;
                 delivery.sent(seq, None);
                 log::trace!("已送出 heartbeat（seq={seq}）");
+            }
+            _ = rotation_tick.tick(), if settings.rotation.is_some() => {
+                send_renew_if_due(conn, settings).await?;
             }
             // 收集 task 寫入了新的取樣：重新計算下一筆的送出時間
             _ = shared.notify.notified() => {}
@@ -1638,6 +1727,10 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
             }
             line = conn.framed.next() => {
                 let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
+                if rotation_line(settings, &line)? {
+                    idle.as_mut().reset(after(read_idle));
+                    continue;
+                }
                 let outcome = handle_server_line_in(&line, conn.seq, throttles, true)?;
                 if outcome.valid {
                     idle.as_mut().reset(after(read_idle));
@@ -1653,11 +1746,227 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// 正常輪替的時點檢查間隔（連線建立後立即檢查一次）
+const ROTATION_CHECK: Duration = Duration::from_secs(600);
+
+/// 到了正常輪替的時點時送出 `renew_request`
+async fn send_renew_if_due<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    settings: &Settings,
+) -> Result<()> {
+    let Some(rot) = &settings.rotation else {
+        return Ok(());
+    };
+    let seq = conn.seq.saturating_add(1);
+    let req = rot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .next_request(seq, chrono::Utc::now().timestamp_millis());
+    if let Some(req) = req {
+        let sent = conn.next_seq();
+        debug_assert_eq!(sent, req.seq);
+        conn.send_line(serde_json::to_string(&req).map_err(SessionError::Serialize)?)
+            .await?;
+        log::debug!(
+            "已送出 renew_request（seq={sent}，request_id={}）",
+            req.request_id
+        );
+    }
+    Ok(())
+}
+
+/// 一行伺服器訊息是否屬於正常輪替（是的話已處理，不再交給一般的處理）；取得新憑證時結束連線
+fn rotation_line(settings: &Settings, line: &str) -> Result<bool> {
+    let Some(rot) = &settings.rotation else {
+        return Ok(false);
+    };
+    match rot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .on_line(line)
+    {
+        RotationLine::Installed => Err(SessionError::Renewed),
+        RotationLine::Handled => Ok(true),
+        RotationLine::NotMine => Ok(false),
+    }
+}
+
 /// 現在時間加上 `d`；溢位時改用一年後（不 panic）。
 fn after(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d)
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600))
+}
+
+// ---------------------------------------------------------------------------
+// 一次性的連線：`pulse enroll` 以新憑證確認、正常輪替後的確認、除役通知（ENROLL.md 第 13.2 節）
+// ---------------------------------------------------------------------------
+
+/// 一次性連線失敗的原因
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneShotError {
+    /// 對應的 Pulse 代碼（無法歸類時 `None`）
+    pub code: Option<&'static str>,
+    pub message: String,
+    /// 伺服器送來的 `error.code`
+    pub server_code: Option<String>,
+    /// 一般網路錯誤（連不上、逾時、收到回應前斷線）：可以重試
+    pub retryable: bool,
+}
+
+impl OneShotError {
+    fn from_session(e: &SessionError, has_client_cert: bool) -> Self {
+        let code = error_code(e, 0, has_client_cert);
+        let retryable = matches!(
+            e,
+            SessionError::ConnectTimeout
+                | SessionError::Connect(_)
+                | SessionError::TlsTimeout
+                | SessionError::HelloAckTimeout
+                | SessionError::ClosedByServer
+                | SessionError::IdleTimeout(_)
+                | SessionError::WriteTimeout
+        ) || (matches!(
+            e,
+            SessionError::Tls(_) | SessionError::Codec(LinesCodecError::Io(_))
+        ) && client_cert_alert(e, has_client_cert).is_none()
+            && server_cert_problem(e).is_none())
+            || matches!(e, SessionError::Server { code, .. } if code == "storage_unavailable");
+        Self {
+            code: code.or(match e {
+                SessionError::Connect(_) | SessionError::ConnectTimeout => {
+                    Some(codes::E_CONN_TIMEOUT)
+                }
+                _ if retryable => Some(codes::E_SERVER_SILENT),
+                _ => None,
+            }),
+            message: e.to_string(),
+            server_code: e.server_code().map(str::to_string),
+            retryable,
+        }
+    }
+}
+
+/// 憑證已過期、8444 無法連線時對 8443 出示目前的（過期）憑證「報到」一次（設計包 §8：讓 Kairos 知道
+/// 主機已回到網路）。結果不影響流程，只記 DEBUG
+pub async fn check_in(settings: &Settings, tls: &TlsSetup) {
+    match connect(settings, tls).await {
+        Ok((mut stream, _)) => {
+            let mut buf = [0u8; 1];
+            let _ = time::timeout(
+                Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+            )
+            .await;
+            log::debug!(
+                "已對 {}:{} 出示過期憑證報到",
+                settings.address,
+                settings.port
+            );
+        }
+        Err(e) => log::debug!("對 8443 報到：{e}"),
+    }
+}
+
+/// 已完成 hello／hello_ack 的一次性連線
+pub struct OneShot {
+    conn: Connection<TlsStream<TcpStream>>,
+    /// 伺服器宣告的 features
+    pub server_features: Vec<String>,
+    pub proto: u32,
+    has_client_cert: bool,
+}
+
+/// TCP＋TLS＋hello（可帶 `intent`）＋等待 hello_ack。`features` 為 hello 宣告的 features
+pub async fn one_shot(
+    settings: &Settings,
+    tls: &TlsSetup,
+    features: Vec<String>,
+    intent: Option<&str>,
+) -> std::result::Result<OneShot, OneShotError> {
+    let has_client_cert = tls.has_client_cert();
+    let (stream, _) = connect(settings, tls)
+        .await
+        .map_err(|e| OneShotError::from_session(&e, has_client_cert))?;
+    let mut conn = Connection::new(stream);
+    let seq = conn.next_seq();
+    let hello = ClientMsg::Hello {
+        seq,
+        proto: Proto::Version(SUPPORTED_PROTO.min),
+        agent_id: settings.agent_id.clone(),
+        hostname: settings.hostname.clone(),
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        heartbeat_interval_ms: u64::try_from(settings.heartbeat_interval.as_millis())
+            .unwrap_or(u64::MAX),
+        ts: now_ts(),
+        ext: Box::new(HelloExt::new(
+            ProtoOffer {
+                proto_min: Some(SUPPORTED_PROTO.min),
+                proto_max: Some(SUPPORTED_PROTO.max),
+                features: Some(features),
+            },
+            settings.host.clone(),
+        )),
+    };
+    let result = async {
+        let line = lifecycle::hello_with_intent(&hello, intent).map_err(SessionError::Serialize)?;
+        conn.send_line(line).await?;
+        wait_hello_ack(&mut conn, seq, &mut ServerLogThrottles::default()).await
+    }
+    .await;
+    match result {
+        Ok(ack) => Ok(OneShot {
+            conn,
+            server_features: ack.server_features,
+            proto: ack.session.proto,
+            has_client_cert,
+        }),
+        Err(e) => {
+            conn.close_gracefully().await;
+            Err(OneShotError::from_session(&e, has_client_cert))
+        }
+    }
+}
+
+impl OneShot {
+    /// 伺服器是否宣告了 `feature`
+    pub fn supports(&self, feature: &str) -> bool {
+        self.proto >= kairos_proto::PROTO_V2 && self.server_features.iter().any(|f| f == feature)
+    }
+
+    /// 下一個 seq
+    pub fn next_seq(&mut self) -> u64 {
+        self.conn.next_seq()
+    }
+
+    /// 送出一則已序列化的訊息
+    pub async fn send_line(&mut self, line: String) -> std::result::Result<(), OneShotError> {
+        let has = self.has_client_cert;
+        self.conn
+            .send_line(line)
+            .await
+            .map_err(|e| OneShotError::from_session(&e, has))
+    }
+
+    /// 等待下一行（`timeout` 內）
+    pub async fn next_line(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<String, OneShotError> {
+        let has = self.has_client_cert;
+        let line = time::timeout(timeout, self.conn.framed.next())
+            .await
+            .map_err(|_| OneShotError::from_session(&SessionError::IdleTimeout(timeout), has))?
+            .ok_or(SessionError::ClosedByServer)
+            .and_then(|r| r.map_err(SessionError::Codec))
+            .map_err(|e| OneShotError::from_session(&e, has))?;
+        Ok(line)
+    }
+
+    /// 送出 close_notify 並關閉
+    pub async fn close(mut self) {
+        self.conn.close_gracefully().await;
+    }
 }
 
 /// 一條已完成握手的 TLS 連線的資訊（寫進日誌用）。
@@ -1766,6 +2075,10 @@ struct HelloAckInfo {
     session: Session,
     /// 伺服器時間（v2）
     server_time: Option<String>,
+    /// 伺服器宣告的 features（v2；`renew`、`deregister` 的協商用）
+    server_features: Vec<String>,
+    /// ENROLL.md 第 13 節的欄位（`expired_renew_grace_days`、`renew_now`）
+    extra: HelloAckExtra,
 }
 
 /// 等待 hello_ack（整體 5 s）。
@@ -1809,7 +2122,8 @@ fn handle_pre_ack_line(
                 return Err(SessionError::ProtoMismatch(proto));
             }
             // v1 Kairos 不送 features；v2 時取雙方都宣告的功能
-            let session = Session::new(proto, CLIENT_FEATURES, &features.unwrap_or_default());
+            let server_features = features.unwrap_or_default();
+            let session = Session::new(proto, CLIENT_FEATURES, &server_features);
             if seq != hello_seq {
                 // 每條連線最多一次（收到後即離開等待），不需節流
                 log::warn!(
@@ -1820,6 +2134,16 @@ fn handle_pre_ack_line(
                 offline_after_ms,
                 session,
                 server_time: server_time.filter(|_| session.is_v2()),
+                server_features: if session.is_v2() {
+                    server_features
+                } else {
+                    Vec::new()
+                },
+                extra: if session.is_v2() {
+                    HelloAckExtra::from_line(line)
+                } else {
+                    HelloAckExtra::default()
+                },
             }))
         }
         // 會結束連線，頻率受退避限制，不需節流；日誌由重連迴圈統一記錄一次
@@ -2151,7 +2475,7 @@ fn closed_before_handshake(e: &io::Error) -> bool {
 ///   變體選擇字元、私用區等，見 [`crate::protocol::is_forbidden_display_char`]）轉成 `\u{XXXX}`，
 ///   避免偽造日誌行或夾帶終端跳脫序列
 /// - 超過 `limit` 個字元時截斷，並附上原始長度
-fn sanitize_for_log(s: &str, limit: usize) -> String {
+pub(crate) fn sanitize_for_log(s: &str, limit: usize) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len().min(limit));
     for (i, c) in s.chars().enumerate() {
@@ -2205,6 +2529,9 @@ mod tests {
             host: HostInfo::default(),
             replay_interval: Duration::from_millis(600),
             status_note: None,
+            extra_features: Vec::new(),
+            rotation: None,
+            grace_on_expiry: false,
         }
     }
 
@@ -2794,6 +3121,8 @@ mod tests {
             offline_after_ms,
             session: Session::new(proto, CLIENT_FEATURES, CLIENT_FEATURES),
             server_time: None,
+            server_features: Vec::new(),
+            extra: HelloAckExtra::default(),
         };
         let (level, msg) = registered_log(&s, &ack(5000, 2), Some(&tls_info(true)));
         assert_eq!(level, log::Level::Info);
