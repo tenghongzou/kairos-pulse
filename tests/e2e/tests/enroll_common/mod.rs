@@ -134,6 +134,23 @@ impl Env {
 
     /// 同 [`Env::new`]，`extra_toml` 加在設定檔最後（例如 `[pki.policy]`）
     pub fn with(name: &str, extra_enroll: &str, extra_toml: &str, envs: &[(&str, &str)]) -> Env {
+        Self::build(name, extra_enroll, extra_toml, envs, false)
+    }
+
+    /// 離線簽發模式（`pki.mode = "offline"`，ENROLL.md 第 19.3 節 #16）：Kairos 沒有 CA 私鑰。
+    /// 測試另以根 CA 簽發一個簽發 CA（`issuing.pem`、`issuing.key`，供 `kairos pki sign-bundle`），
+    /// `auth.client_ca` 為根 CA 加上這個簽發 CA
+    pub fn offline(name: &str) -> Env {
+        Self::build(name, "", "", &[], true)
+    }
+
+    fn build(
+        name: &str,
+        extra_enroll: &str,
+        extra_toml: &str,
+        envs: &[(&str, &str)],
+        offline: bool,
+    ) -> Env {
         let root = TestDir::new(name);
         let dir = root.sub("kairos");
         let pki = Pki::new();
@@ -156,7 +173,7 @@ reload_interval_secs = 1
 data_dir = "data"
 
 [auth]
-client_ca = "root.pem"
+client_ca = "{client_ca}"
 
 [log]
 level = "debug"
@@ -172,7 +189,7 @@ poll_after_base_secs = 5
 {extra_enroll}
 
 [pki]
-mode = "online"
+mode = "{pki_mode}"
 server_ca_path = "root.pem"
 
 {extra_toml}
@@ -180,6 +197,8 @@ server_ca_path = "root.pem"
                 a = ports[0],
                 e = ports[1],
                 c = ports[2],
+                client_ca = if offline { "client-ca.pem" } else { "root.pem" },
+                pki_mode = if offline { "offline" } else { "online" },
             ),
         )
         .unwrap();
@@ -195,6 +214,33 @@ server_ca_path = "root.pem"
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         };
+        if offline {
+            // 離線的 CA 主機：簽發 CA 的私鑰不交給 Kairos
+            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut p = CertificateParams::default();
+            p.distinguished_name = DistinguishedName::new();
+            p.distinguished_name
+                .push(DnType::CommonName, "E2E Offline Issuing CA");
+            let csr = p.serialize_request(&key).unwrap().pem().unwrap();
+            let issuing = env.pki.sign_issuing(&csr);
+            std::fs::write(env.dir.join("issuing.pem"), &issuing).unwrap();
+            std::fs::write(env.dir.join("issuing.key"), key.serialize_pem()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(
+                    env.dir.join("issuing.key"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                env.dir.join("client-ca.pem"),
+                format!("{}{}", env.pki.pem, issuing),
+            )
+            .unwrap();
+            return env;
+        }
         // 簽發 CA：Kairos 產生私鑰與 CSR → 以根 CA 簽發 → 安裝（第一個自動啟用）
         let (code, p) = env.cli(&["pki", "issuing-ca", "new", "--out", "issuing.csr"]);
         assert_eq!(code, 0, "{}", p.dump());
@@ -511,12 +557,13 @@ impl Env {
             "e2e",
             "--group",
             "g",
-            "--max-uses",
-            "10",
             "--approval",
             approval,
             "--json",
         ];
+        if !extra.contains(&"--max-uses") {
+            args.extend(["--max-uses", "10"]);
+        }
         if approval == "auto" {
             args.extend(["--allow-cidr", "127.0.0.0/8"]);
         }

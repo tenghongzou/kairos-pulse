@@ -9,6 +9,8 @@
 //! | 1 | [`install_string_auto_approval_registers_and_the_service_connects`] |
 //! | 2 | [`manual_approval_is_fetched_by_the_background_service`] |
 //! | 3、4、5、10 | [`typo_wrong_pin_unknown_token_rejection_and_withdrawal`] |
+//! | 4 | [`expired_exhausted_and_disabled_tokens_are_refused`] |
+//! | 16 | [`offline_signing_export_sign_import_then_the_service_connects`] |
 //! | 7 | [`lost_response_is_resent_and_creates_one_request`] |
 //! | 8、9 | [`rate_limit_is_waited_out_and_renew_only_refuses_new_enrollments`] |
 //! | 11、12 | [`expired_certificate_is_renewed_in_the_grace_period`] |
@@ -647,4 +649,110 @@ fn new_pulse_against_a_kairos_without_8444() {
     assert_eq!(m.count(PULSE_REGISTERED), 1, "{}", m.dump());
     m.stop();
     k.stop();
+}
+
+#[test]
+fn expired_exhausted_and_disabled_tokens_are_refused() {
+    // #4：token 用完（PLS-E3004）、過期（PLS-E3003）、停用（對外不區分：PLS-E3002）；
+    // token-check 被拒時不產生任何檔案（結束代碼 6）
+    let env = Env::new("ep-tokens", "", &[]);
+    let mut kairos = env.start();
+    let refused = |host: &PulseHost, install: &str, code: &str| {
+        let (c, doc, p) = host.enroll(&["--install-string", install]);
+        assert_eq!(c, 6, "{}", p.dump());
+        assert_eq!(doc["error"]["code"], code, "{doc}");
+        assert!(!host.identity("enrollment.json").exists());
+        assert!(!host.identity("request.key").exists());
+    };
+
+    let once = env.token_doc("auto", &["--max-uses", "1"]);
+    let once_install = once["install_string"].as_str().unwrap();
+    let (c, _, p) = PulseHost::new(&env, "first").enroll(&["--install-string", once_install]);
+    assert_eq!(c, 0, "{}", p.dump());
+    refused(&PulseHost::new(&env, "second"), once_install, "PLS-E3004");
+
+    let soon = kairos_proto::enroll::format_rfc3339_ms(now_ms() + 2_000);
+    let expiring = env.token_doc("auto", &["--expires-at", &soon]);
+    std::thread::sleep(Duration::from_secs(3));
+    refused(
+        &PulseHost::new(&env, "expired"),
+        expiring["install_string"].as_str().unwrap(),
+        "PLS-E3003",
+    );
+
+    let disabled = env.token_doc("auto", &[]);
+    let (c, out) = env.cli(&[
+        "enroll-token",
+        "disable",
+        disabled["token_id"].as_str().unwrap(),
+        "--reason",
+        "e2e",
+        "--yes",
+    ]);
+    assert_eq!(c, 0, "{}", out.dump());
+    refused(
+        &PulseHost::new(&env, "disabled"),
+        disabled["install_string"].as_str().unwrap(),
+        "PLS-E3002",
+    );
+    kairos.stop();
+}
+
+#[test]
+fn offline_signing_export_sign_import_then_the_service_connects() {
+    // #16：離線簽發模式。核准後仍待簽發 → 匯出 → 在「CA 主機」以 kairos pki sign-bundle 簽發
+    // （不讀 Kairos 的設定與資料庫）→ 匯入 → Pulse 服務在下一次輪詢取得憑證並連上 8443
+    let env = Env::offline("ep-offline");
+    let mut kairos = env.start();
+    let t = env.token_doc("manual", &[]);
+    let host = PulseHost::new(&env, "pulse");
+    let (code, doc, p) = host.enroll_with(
+        &env,
+        t["token"].as_str().unwrap(),
+        t["ca_pin"].as_str().unwrap(),
+        &["--no-wait"],
+    );
+    assert_eq!(code, 7, "{}", p.dump());
+    let code_p = request_code(&doc);
+    let (c, out) = env.cli(&["enroll", "approve", &code_p, "--yes"]);
+    assert_eq!(c, 0, "{}", out.dump());
+    let mut svc = host.start();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        svc.count(PULSE_REGISTERED),
+        0,
+        "核准後仍待簽發\n{}",
+        svc.dump()
+    );
+
+    let (c, out) = env.cli(&["pki", "queue", "export", "--out", "queue.json"]);
+    assert_eq!(c, 0, "{}", out.dump());
+    let queue: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.dir.join("queue.json")).unwrap())
+            .unwrap();
+    assert_eq!(queue["items"].as_array().map(Vec::len), Some(1), "{queue}");
+    let (c, out) = kp_e2e::run_to_exit(
+        "kairos",
+        &env.dir,
+        &[
+            "pki",
+            "sign-bundle",
+            "--in",
+            "queue.json",
+            "--ca-cert",
+            "issuing.pem",
+            "--ca-key",
+            "issuing.key",
+            "--out",
+            "signed.json",
+        ],
+        &[],
+    );
+    assert_eq!(c, 0, "{}", out.dump());
+    let (c, out) = env.cli(&["pki", "queue", "import", "signed.json"]);
+    assert_eq!(c, 0, "{}", out.dump());
+    svc.wait_for(PULSE_REGISTERED, WAIT);
+    assert_eq!(host.enrollment()["request_code"], code_p.as_str());
+    svc.stop();
+    kairos.stop();
 }
