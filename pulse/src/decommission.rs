@@ -1,4 +1,6 @@
-//! 除役通知（feature `deregister`；ENROLL.md 第 13.2 節、設計包 `enrollment-ux.md` §5.10）。
+//! 除役通知（feature `deregister`；`kairos-proto` 的 PROTOCOL.md「憑證輪替與除役」、設計包
+//! `enrollment-ux.md` §5.10）。訊息是 `kairos-proto` 的共用型別（`ClientMsg::Deregister`、
+//! `ServerMsg::DeregisterAck`）。
 //!
 //! 完全移除時、刪除私鑰之前，經 8443 以這台主機的用戶端憑證送出 `hello`（`intent: "deregister"`）
 //! 與 `deregister`。每次嘗試的握手與等待各 5 秒；可重試的失敗在 2 秒後重試 1 次；整體最多 15 秒。
@@ -13,8 +15,12 @@ use tokio::time::Instant;
 
 use crate::codes;
 use crate::config_manager::AppConfig;
-use crate::lifecycle::{self, Deregister, Incoming};
 use crate::network;
+use kairos_proto::lifecycle::DEREGISTER_REASON_UNINSTALL_PURGE;
+use kairos_proto::{
+    ClientMsg, Deregister, DeregisterAck, FEATURE_DEREGISTER, INTENT_DEREGISTER, ServerMsg,
+    parse_server_msg,
+};
 
 /// 整體時限
 const TOTAL: Duration = Duration::from_secs(15);
@@ -36,7 +42,7 @@ pub struct Deregistration {
 }
 
 impl Deregistration {
-    fn ok(ack: &lifecycle::DeregisterAck, attempts: u32) -> Self {
+    fn ok(ack: &DeregisterAck, attempts: u32) -> Self {
         Self {
             result: "ok",
             code: None,
@@ -187,15 +193,8 @@ async fn attempt(
     initiated_by: &str,
     attempts: u32,
 ) -> Attempt {
-    let features = vec![lifecycle::FEATURE_DEREGISTER.to_string()];
-    let mut conn = match network::one_shot(
-        settings,
-        tls,
-        features,
-        Some(lifecycle::INTENT_DEREGISTER),
-    )
-    .await
-    {
+    let features = vec![FEATURE_DEREGISTER.to_string()];
+    let mut conn = match network::one_shot(settings, tls, features, Some(INTENT_DEREGISTER)).await {
         Ok(c) => c,
         Err(e) => {
             return match e.code {
@@ -218,7 +217,7 @@ async fn attempt(
             };
         }
     };
-    if !conn.supports(lifecycle::FEATURE_DEREGISTER) {
+    if !conn.supports(FEATURE_DEREGISTER) {
         conn.close().await;
         return Attempt::Done(Deregistration::unreported("unsupported", None, attempts));
     }
@@ -229,18 +228,18 @@ async fn attempt(
         ts: ts.clone(),
         request_id: request_id.to_string(),
         agent_id: agent_id.to_string(),
-        reason: "uninstall_purge".into(),
+        reason: DEREGISTER_REASON_UNINSTALL_PURGE.into(),
         initiated_by: initiated_by.to_string(),
         host_fingerprint: settings.host.host_fingerprint.clone(),
         hostname: hostname.to_string(),
         pulse_version: env!("CARGO_PKG_VERSION").to_string(),
         sent_at: ts,
     };
-    let line = match serde_json::to_string(&msg) {
-        Ok(l) => l,
-        Err(_) => return Attempt::Done(Deregistration::unreported("server_error", None, attempts)),
-    };
-    if conn.send_line(line).await.is_err() {
+    if conn
+        .send(&ClientMsg::Deregister(Box::new(msg)))
+        .await
+        .is_err()
+    {
         return Attempt::Retry("unreachable", Some(codes::E_SERVER_SILENT));
     }
     let deadline = Instant::now() + ACK_TIMEOUT;
@@ -250,15 +249,14 @@ async fn attempt(
             Ok(l) => l,
             Err(_) => return Attempt::Retry("unreachable", Some(codes::E_SERVER_SILENT)),
         };
-        if let Some(Incoming::DeregisterAck(ack)) = lifecycle::parse_incoming(&line)
+        let msg = parse_server_msg(&line);
+        if let Ok(ServerMsg::DeregisterAck(ack)) = &msg
             && ack.request_id == request_id
         {
             conn.close().await;
-            return Attempt::Done(Deregistration::ok(&ack, attempts));
+            return Attempt::Done(Deregistration::ok(ack, attempts));
         }
-        if let Ok(kairos_proto::ServerMsg::Error { code, .. }) =
-            kairos_proto::parse_server_msg(&line)
-        {
+        if let Ok(ServerMsg::Error { code, .. }) = msg {
             conn.close().await;
             if code == "storage_unavailable" {
                 return Attempt::Retry("server_error", None);

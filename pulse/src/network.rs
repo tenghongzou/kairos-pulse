@@ -37,7 +37,6 @@ use tokio_util::sync::CancellationToken;
 use crate::backoff::Backoff;
 use crate::codes::{self, Event};
 use crate::config_manager::AppConfig;
-use crate::lifecycle::{self, HelloAckExtra};
 use crate::local_status::{self, Disconnected, Registered};
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
@@ -45,7 +44,7 @@ use crate::protocol::{
     SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, clock_skew_warning, hello_features,
     now_ts, parse_server_msg, report_message, sanitize_cpu_usage,
 };
-use crate::rotation::{Rotation, RotationLine};
+use crate::rotation::{HelloAckExtra, Rotation, RotationLine};
 use crate::service_status;
 use crate::spool::{EntryInfo, SharedSpool, Spool, SpoolRecord};
 use crate::system_info::{self, Sample};
@@ -481,15 +480,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// 送出一則訊息（LinesCodec 會補上 `\n`），含寫出逾時。
     async fn send(&mut self, msg: &ClientMsg) -> Result<()> {
         let line = serde_json::to_string(msg).map_err(SessionError::Serialize)?;
-        self.last_line_len = line.len() + 1;
-        match time::timeout(WRITE_TIMEOUT, self.framed.send(line)).await {
-            Ok(res) => res.map_err(SessionError::Codec),
-            Err(_) => Err(SessionError::WriteTimeout),
-        }
-    }
-
-    /// 送出一行已序列化的 JSON（`kairos-proto` 尚未定義的訊息，見 `lifecycle`）
-    async fn send_line(&mut self, line: String) -> Result<()> {
         self.last_line_len = line.len() + 1;
         match time::timeout(WRITE_TIMEOUT, self.framed.send(line)).await {
             Ok(res) => res.map_err(SessionError::Codec),
@@ -1206,16 +1196,18 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         session.durable = false;
     }
     *registered_at = Some(Instant::now());
+    // 正常輪替（feature renew）：v2 且雙方都宣告
+    let renew_negotiated = session.is_v2()
+        && settings
+            .extra_features
+            .iter()
+            .any(|f| f == kairos_proto::FEATURE_RENEW)
+        && ack
+            .server_features
+            .iter()
+            .any(|f| f == kairos_proto::FEATURE_RENEW);
     if let Some(rot) = &settings.rotation {
-        let negotiated = session.is_v2()
-            && settings
-                .extra_features
-                .iter()
-                .any(|f| f == lifecycle::FEATURE_RENEW)
-            && ack
-                .server_features
-                .iter()
-                .any(|f| f == lifecycle::FEATURE_RENEW);
+        let negotiated = renew_negotiated;
         let offset = ack
             .server_time
             .as_deref()
@@ -1249,6 +1241,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 features: [
                     (session.metrics, kairos_proto::FEATURE_METRICS),
                     (session.durable, kairos_proto::FEATURE_DURABLE),
+                    (renew_negotiated, kairos_proto::FEATURE_RENEW),
                 ]
                 .into_iter()
                 .filter(|(on, _)| *on)
@@ -1765,12 +1758,9 @@ async fn send_renew_if_due<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(req) = req {
         let sent = conn.next_seq();
         debug_assert_eq!(sent, req.seq);
-        conn.send_line(serde_json::to_string(&req).map_err(SessionError::Serialize)?)
-            .await?;
-        log::debug!(
-            "已送出 renew_request（seq={sent}，request_id={}）",
-            req.request_id
-        );
+        let request_id = req.request_id.clone();
+        conn.send(&ClientMsg::RenewRequest(Box::new(req))).await?;
+        log::debug!("已送出 renew_request（seq={sent}，request_id={request_id}）");
     }
     Ok(())
 }
@@ -1799,7 +1789,7 @@ fn after(d: Duration) -> Instant {
 }
 
 // ---------------------------------------------------------------------------
-// 一次性的連線：`pulse enroll` 以新憑證確認、正常輪替後的確認、除役通知（ENROLL.md 第 13.2 節）
+// 一次性的連線：`pulse enroll` 以新憑證確認、正常輪替後的確認、除役通知（PROTOCOL.md「憑證輪替與除役」）
 // ---------------------------------------------------------------------------
 
 /// 一次性連線失敗的原因
@@ -1899,18 +1889,23 @@ pub async fn one_shot(
         heartbeat_interval_ms: u64::try_from(settings.heartbeat_interval.as_millis())
             .unwrap_or(u64::MAX),
         ts: now_ts(),
-        ext: Box::new(HelloExt::new(
-            ProtoOffer {
-                proto_min: Some(SUPPORTED_PROTO.min),
-                proto_max: Some(SUPPORTED_PROTO.max),
-                features: Some(features),
-            },
-            settings.host.clone(),
-        )),
+        ext: Box::new({
+            let ext = HelloExt::new(
+                ProtoOffer {
+                    proto_min: Some(SUPPORTED_PROTO.min),
+                    proto_max: Some(SUPPORTED_PROTO.max),
+                    features: Some(features),
+                },
+                settings.host.clone(),
+            );
+            match intent {
+                Some(i) => ext.with_intent(i),
+                None => ext,
+            }
+        }),
     };
     let result = async {
-        let line = lifecycle::hello_with_intent(&hello, intent).map_err(SessionError::Serialize)?;
-        conn.send_line(line).await?;
+        conn.send(&hello).await?;
         wait_hello_ack(&mut conn, seq, &mut ServerLogThrottles::default()).await
     }
     .await;
@@ -1939,11 +1934,11 @@ impl OneShot {
         self.conn.next_seq()
     }
 
-    /// 送出一則已序列化的訊息
-    pub async fn send_line(&mut self, line: String) -> std::result::Result<(), OneShotError> {
+    /// 送出一則訊息
+    pub async fn send(&mut self, msg: &ClientMsg) -> std::result::Result<(), OneShotError> {
         let has = self.has_client_cert;
         self.conn
-            .send_line(line)
+            .send(msg)
             .await
             .map_err(|e| OneShotError::from_session(&e, has))
     }
@@ -2077,7 +2072,7 @@ struct HelloAckInfo {
     server_time: Option<String>,
     /// 伺服器宣告的 features（v2；`renew`、`deregister` 的協商用）
     server_features: Vec<String>,
-    /// ENROLL.md 第 13 節的欄位（`expired_renew_grace_days`、`renew_now`）
+    /// 協商了 `renew` 時的欄位（`expired_renew_grace_days`、`renew_now`）
     extra: HelloAckExtra,
 }
 
@@ -2117,6 +2112,8 @@ fn handle_pre_ack_line(
             offline_after_ms,
             features,
             server_time,
+            expired_renew_grace_days,
+            renew_now,
         }) => {
             if !(SUPPORTED_PROTO.min..=SUPPORTED_PROTO.max).contains(&proto) {
                 return Err(SessionError::ProtoMismatch(proto));
@@ -2140,7 +2137,10 @@ fn handle_pre_ack_line(
                     Vec::new()
                 },
                 extra: if session.is_v2() {
-                    HelloAckExtra::from_line(line)
+                    HelloAckExtra {
+                        expired_renew_grace_days,
+                        renew_now,
+                    }
                 } else {
                     HelloAckExtra::default()
                 },
@@ -2158,6 +2158,15 @@ fn handle_pre_ack_line(
                 throttles.unexpected_ack,
                 debug,
                 "尚未收到 hello_ack 前收到 ack（seq={seq}），忽略"
+            );
+            Ok(None)
+        }
+        // 只在協商了 renew／deregister 之後才會出現（一次性連線與輪替另行處理）
+        Ok(ServerMsg::RenewResult(_) | ServerMsg::DeregisterAck(_)) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "尚未收到 hello_ack 前收到 renew_result／deregister_ack，忽略"
             );
             Ok(None)
         }
@@ -2285,6 +2294,15 @@ fn handle_server_line_in(
                 sanitize_for_log(&message, LOG_TEXT_LIMIT)
             );
             Ok(LineOutcome::valid(answered_seq(seq, last_sent_seq)))
+        }
+        // 正常輪替的結果由 rotation_line 先處理；到這裡的是不屬於目前申請（或沒有啟用輪替）的回應
+        Ok(ServerMsg::RenewResult(_) | ServerMsg::DeregisterAck(_)) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "收到不屬於這條連線的 renew_result／deregister_ack，忽略"
+            );
+            Ok(LineOutcome::valid(None))
         }
         Err(e) => {
             log_unparsable(throttles, line, &e);

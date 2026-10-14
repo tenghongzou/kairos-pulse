@@ -1,4 +1,6 @@
-//! 8443 上的正常輪替（feature `renew`；ENROLL.md 第 13.1 節、設計包 `enrollment-ux.md` §5.6、§8）。
+//! 8443 上的正常輪替（feature `renew`；`kairos-proto` 的 PROTOCOL.md「憑證輪替與除役」、
+//! 設計包 `enrollment-ux.md` §5.6、§8）。訊息是 `kairos-proto` 的共用型別
+//! （`ClientMsg::RenewRequest`、`ServerMsg::RenewResult`）。
 //!
 //! - 只在雙方都宣告 `renew`、且用戶端憑證由 `pulse enroll` 管理（`identity/client.pem`）時使用。
 //! - 時點：已使用壽命的 2/3，或剩餘 ≤ `identity.renew_before_days`，取較早者；「現在」以
@@ -13,14 +15,39 @@
 //! - Kairos 不支援 `renew`（舊版）：不輪替，維持 0.4 的行為（剩餘 14 天內 `PLS-W1110`）。
 
 use kairos_proto::enroll as ke;
-use kairos_proto::{ServerMsg, parse_server_msg};
+use kairos_proto::{RenewRequest, ServerMsg, parse_server_msg};
 use tokio::time::Instant;
 
 use crate::codes;
 use crate::enroll::schedule::{self, Exp};
 use crate::enroll::store::{self, FileKind, IdentityPaths, Rotation as Pending};
 use crate::enroll::{keys, x509};
-use crate::lifecycle::{HelloAckExtra, Incoming, RenewRequest, parse_incoming, rotation_due};
+
+/// `hello_ack` 中與輪替有關的欄位（雙方協商了 `renew` 時才有；`ServerMsg::HelloAck` 的
+/// `expired_renew_grace_days`、`renew_now`）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HelloAckExtra {
+    pub expired_renew_grace_days: Option<u32>,
+    pub renew_now: Option<bool>,
+}
+
+/// 用戶端憑證是否到了正常輪替的時點（設計包 `enrollment-ux.md` §8）：已使用壽命的 2/3，或剩餘
+/// ≤ `renew_before_days`，取較早者。`now_ms` 為（以時鐘偏差校正後的）目前時間
+pub fn rotation_due(
+    not_before_ms: i64,
+    not_after_ms: i64,
+    now_ms: i64,
+    renew_before_days: u32,
+) -> bool {
+    let lifetime = not_after_ms.saturating_sub(not_before_ms).max(0);
+    let two_thirds = not_before_ms.saturating_add(lifetime / 3 * 2);
+    let before = if renew_before_days == 0 {
+        i64::MAX
+    } else {
+        not_after_ms.saturating_sub(i64::from(renew_before_days) * 86_400_000)
+    };
+    now_ms >= two_thirds.min(before)
+}
 
 /// 一條連線上 [`Rotation::on_line`] 的結果
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +252,7 @@ impl Rotation {
 
     /// 處理一行伺服器訊息
     pub fn on_line(&mut self, line: &str) -> RotationLine {
-        if let Some(Incoming::RenewResult(r)) = parse_incoming(line) {
+        if let Ok(ServerMsg::RenewResult(r)) = parse_server_msg(line) {
             let pending = self
                 .paths
                 .load_enrollment()
@@ -527,6 +554,20 @@ mod tests {
             chain_pem: String::new(),
             ca_pem: ca_pem.to_string(),
         }
+    }
+
+    #[test]
+    fn rotation_is_due_at_two_thirds_or_thirty_days_left() {
+        let day = 86_400_000i64;
+        // 365 天的憑證：2/3 在第 243 天；剩 30 天在第 335 天 → 取較早者 243
+        assert!(!rotation_due(0, 365 * day, 243 * day, 30));
+        assert!(rotation_due(0, 365 * day, 244 * day, 30));
+        // 60 天的憑證：2/3 在第 40 天，剩 30 天在第 30 天 → 30
+        assert!(!rotation_due(0, 60 * day, 29 * day, 30));
+        assert!(rotation_due(0, 60 * day, 30 * day, 30));
+        // renew_before_days = 0：只看 2/3
+        assert!(!rotation_due(0, 60 * day, 30 * day, 0));
+        assert!(rotation_due(0, 60 * day, 40 * day, 0));
     }
 
     #[test]

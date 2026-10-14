@@ -12,6 +12,8 @@
 //! - at-least-once（A5）：durable 的 [`DurableSeq`]（`boot_id`／`report_seq`）與其限制
 //! - 欄位驗證：UUID 格式的 `agent_id`、顯示用字串的禁止字元表、hello（含 v2 的主機資訊）、
 //!   `ts`、report（v1 三欄位與 v2 的通用指標，A4）的限制
+//! - 8443 的憑證正常輪替與除役通知（feature `renew`、`deregister`，PROTOCOL.md「憑證輪替與除役」）：
+//!   [`lifecycle`] 模組與 [`ClientMsg`]／[`ServerMsg`] 的對應變體
 //! - 註冊通道（8444 HTTPS，[`ENROLL.md`](../ENROLL.md)）：[`enroll`] 模組
 //!
 //! 本 crate 只有純函式與資料型別，不做 I/O、不記日誌，也不依賴 tokio；NDJSON 的分行 codec
@@ -20,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod enroll;
+pub mod lifecycle;
 mod messages;
 mod metrics;
 mod negotiate;
@@ -28,9 +31,13 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
+pub use lifecycle::{
+    Deregister, DeregisterAck, FEATURE_DEREGISTER, FEATURE_RENEW, INTENT_DEREGISTER,
+    LIFECYCLE_FEATURES, RenewRequest, RenewResult,
+};
 pub use messages::{
     ClientMsg, DurableSeq, ErrorCode, HelloExt, HostInfo, LegacyReport, OsInfo, Proto, ProtoOffer,
-    ReportBody, SERVER_MSG_TYPES, ServerMsg, ServerMsgError, hello_seq_of_invalid,
+    ReportBody, SERVER_MSG_TYPES, ServerMsg, ServerMsgError, hello_seq_of_invalid, message_type,
     parse_client_msg, parse_server_msg,
 };
 pub use metrics::{

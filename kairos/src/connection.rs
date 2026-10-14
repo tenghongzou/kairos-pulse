@@ -22,13 +22,14 @@ use crate::auth::{BindingError, BindingPolicy, cert_matches_agent_id};
 use crate::config::TimeoutSettings;
 use crate::per_ip::{ConnectionSlot, source_key};
 use crate::protocol::{
-    ClientMsg, ErrorCode, Frame, HelloExt, HostInfo, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH,
-    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, NdjsonCodec, Proto,
-    ProtoRangeError, SERVER_FEATURES, SUPPORTED_PROTO, ServerMsg, Session,
-    clamp_heartbeat_interval_ms, client_proto_range, hello_seq_of_invalid, negotiate,
-    normalize_agent_id, offline_after_ms, parse_client_msg, server_cpu_usage,
-    unsupported_version_error, validate_client_msg, validate_features, validate_hello,
-    validate_host_info, validate_metrics, validate_report,
+    ClientMsg, ErrorCode, FEATURE_DEREGISTER, FEATURE_RENEW, Frame, HelloExt, HostInfo,
+    INTENT_DEREGISTER, MAX_CONSECUTIVE_BAD_REQUESTS, MAX_LINE_LENGTH, METRIC_CPU_USAGE,
+    METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, NdjsonCodec, Proto, ProtoRangeError,
+    SERVER_FEATURES, SUPPORTED_PROTO, ServerMsg, Session, clamp_heartbeat_interval_ms,
+    client_proto_range, hello_seq_of_invalid, message_type, negotiate, normalize_agent_id,
+    offline_after_ms, parse_client_msg, server_cpu_usage, unsupported_version_error,
+    validate_client_msg, validate_features, validate_hello, validate_host_info, validate_metrics,
+    validate_report,
 };
 use crate::rate::{
     MAX_REPORT_PACING_DELAY, Pace, REPORT_BURST, REPORT_RATE_PER_SEC, ReportLimiter, ReportSource,
@@ -167,6 +168,17 @@ enum Incoming {
         message: String,
         seq: Option<u64>,
     },
+    /// 無法解析或不合規定的 `renew_request`／`deregister`（`kind`）。協商了對應的 feature 時回
+    /// `bad_request`；沒有協商時與舊版相同，回 `unknown_type`
+    InvalidLifecycle {
+        kind: String,
+        message: String,
+    },
+}
+
+/// `renew_request`／`deregister` 的 `type`（PROTOCOL.md「憑證輪替與除役」）
+fn is_lifecycle_type(kind: &str) -> bool {
+    matches!(kind, "renew_request" | "deregister")
 }
 
 fn classify(frame: Frame) -> Incoming {
@@ -179,17 +191,32 @@ fn classify(frame: Frame) -> Incoming {
         Frame::Line(line) => match parse_client_msg(&line) {
             Ok(msg) => match validate_client_msg(&msg) {
                 Ok(()) => Incoming::Msg(msg),
-                Err(message) => Incoming::BadRequest {
-                    seq: match &msg {
-                        ClientMsg::Hello { seq, .. } => Some(*seq),
-                        _ => None,
+                Err(message) => match &msg {
+                    ClientMsg::RenewRequest(_) => Incoming::InvalidLifecycle {
+                        kind: "renew_request".into(),
+                        message,
                     },
-                    message,
+                    ClientMsg::Deregister(_) => Incoming::InvalidLifecycle {
+                        kind: "deregister".into(),
+                        message,
+                    },
+                    _ => Incoming::BadRequest {
+                        seq: match &msg {
+                            ClientMsg::Hello { seq, .. } => Some(*seq),
+                            _ => None,
+                        },
+                        message,
+                    },
                 },
             },
-            Err(message) => Incoming::BadRequest {
-                seq: hello_seq_of_invalid(&line),
-                message,
+            Err(message) => match message_type(&line) {
+                Some(kind) if is_lifecycle_type(&kind) => {
+                    Incoming::InvalidLifecycle { kind, message }
+                }
+                _ => Incoming::BadRequest {
+                    seq: hello_seq_of_invalid(&line),
+                    message,
+                },
             },
         },
     }
@@ -460,8 +487,6 @@ struct HelloFields {
     agent_version: String,
     heartbeat_interval_ms: u64,
     ext: HelloExt,
-    /// `intent`（`deregister`：除役通知的連線，ENROLL.md 第 13.2 節）
-    intent: Option<String>,
 }
 
 /// 依協商格式取出的 report 內容
@@ -770,11 +795,6 @@ fn log_handshake_failure(throttle: &LogThrottle, conn_id: u64, peer: SocketAddr,
 }
 
 impl Conn {
-    /// 送出一行已組好的 JSON（8443 的註冊訊息：`renew_result`、`deregister_ack`、帶額外欄位的 `hello_ack`）
-    async fn send_line(&mut self, line: String) -> Result<(), Error> {
-        with_timeout(self.write_timeout, "寫出訊息", self.framed.send(line)).await
-    }
-
     /// 這條連線的客戶端憑證序號（大寫十六進位）
     fn client_serial(&self) -> Option<String> {
         self.client_chain
@@ -785,21 +805,36 @@ impl Conn {
     }
 
     /// `hello_ack`：v2 時帶 features 與 `server_time`；協商了 `renew` 時另帶 `expired_renew_grace_days` 與
-    /// 選用的 `renew_now`（ENROLL.md 第 13.1 節）。`renew`、`deregister` 只在 client 也宣告時列出：沒有宣告的
-    /// client（0.4 以前的 Pulse）收到的 `hello_ack` 與 0.4 的 Kairos 完全相同
+    /// 選用的 `renew_now`（PROTOCOL.md「憑證輪替與除役」）。`renew`、`deregister` 只在 client 也宣告時列出：
+    /// 沒有宣告的 client（0.4 以前的 Pulse）收到的 `hello_ack` 與 0.4 的 Kairos 完全相同
     async fn send_hello_ack(&mut self, agent: &Agent, offline_ms: u64) -> Result<(), Error> {
         let (features, server_time) = if agent.session.is_v2() {
             let mut f: Vec<String> = SERVER_FEATURES.iter().map(|f| f.to_string()).collect();
             if agent.renew {
-                f.push(crate::enroll::agent::FEATURE_RENEW.to_string());
+                f.push(FEATURE_RENEW.to_string());
             }
             if agent.deregister {
-                f.push(crate::enroll::agent::FEATURE_DEREGISTER.to_string());
+                f.push(FEATURE_DEREGISTER.to_string());
             }
             (Some(f), Some(fmt_time(Utc::now())))
         } else {
             // v1：hello_ack 與 v1 Kairos 完全相同
             (None, None)
+        };
+        let renew = match (agent.renew, self.enroll.clone()) {
+            (true, Some(svc)) => {
+                let cert = self
+                    .client_chain
+                    .as_deref()
+                    .and_then(|c| c.first())
+                    .map(|c| c.as_ref().to_vec());
+                tokio::task::spawn_blocking(move || {
+                    crate::enroll::agent::hello_ack_renew(&svc, cert.as_deref())
+                })
+                .await
+                .unwrap_or_default()
+            }
+            _ => crate::enroll::agent::HelloAckRenew::default(),
         };
         let msg = ServerMsg::HelloAck {
             seq: agent.hello_seq,
@@ -807,59 +842,31 @@ impl Conn {
             offline_after_ms: offline_ms,
             features,
             server_time,
+            expired_renew_grace_days: renew.expired_renew_grace_days,
+            renew_now: renew.renew_now,
         };
-        if !agent.renew {
-            return self.send(&msg).await;
-        }
-        let Some(svc) = self.enroll.clone() else {
-            return self.send(&msg).await;
-        };
-        let cert = self
-            .client_chain
-            .as_deref()
-            .and_then(|c| c.first())
-            .map(|c| c.as_ref().to_vec());
-        let extra = tokio::task::spawn_blocking(move || {
-            crate::enroll::agent::hello_ack_extra(&svc, cert.as_deref())
-        })
-        .await
-        .unwrap_or_default();
-        let mut v =
-            serde_json::to_value(&msg).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(extra);
-        }
-        self.send_line(v.to_string()).await
+        self.send(&msg).await
     }
 
-    /// `renew_request`：正常輪替（ENROLL.md 第 13.1 節）。錯誤都不是 fatal
+    /// `renew_request`：正常輪替（PROTOCOL.md「憑證輪替與除役」）。錯誤都不是 fatal
     async fn handle_renew(
         &mut self,
         svc: &Arc<crate::enroll::EnrollService>,
         agent: &Agent,
-        line: &str,
+        req: kairos_proto::RenewRequest,
     ) -> Result<Handled, Error> {
         self.bad_requests = 0;
-        let req: crate::enroll::agent::RenewRequest = match serde_json::from_str(line) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(Handled::not_alive(
-                    self.reply_bad_request(None, format!("invalid renew_request: {e}"))
-                        .await?,
-                ));
-            }
-        };
         let seq = req.seq;
-        let line = match crate::enroll::agent::renew(svc, &agent.agent_id, req).await {
-            Ok(line) => line,
-            Err(e) => e.line(Some(seq)),
+        let reply = match crate::enroll::agent::renew(svc, &agent.agent_id, req).await {
+            Ok(result) => ServerMsg::RenewResult(Box::new(result)),
+            Err(e) => e.to_msg(Some(seq)),
         };
-        self.send_line(line).await?;
+        self.send(&reply).await?;
         Ok(Handled::alive(Flow::Continue))
     }
 
     /// `intent: "deregister"` 的連線：送出 `hello_ack`（不註冊、不算上線、不取代既有連線），等待一則
-    /// `deregister` 並回 `deregister_ack` 後關閉（ENROLL.md 第 13.2 節）
+    /// `deregister` 並回 `deregister_ack` 後關閉（PROTOCOL.md「憑證輪替與除役」）
     async fn run_deregister(
         &mut self,
         svc: &Arc<crate::enroll::EnrollService>,
@@ -889,12 +896,19 @@ impl Conn {
                     Ok(Some(Ok(f))) => f,
                 },
             };
-            let Frame::Line(line) = frame else {
-                continue;
-            };
-            match crate::enroll::agent::probe(&line).0.as_deref() {
-                Some("deregister") => {}
-                Some("heartbeat") => continue,
+            let msg = match classify(frame) {
+                Incoming::Msg(ClientMsg::Deregister(msg)) => msg,
+                Incoming::Msg(ClientMsg::Heartbeat { .. }) => continue,
+                Incoming::InvalidLifecycle { kind, message } if kind == "deregister" => {
+                    self.reply(ServerMsg::error_with_fatal(
+                        None,
+                        ErrorCode::BadRequest,
+                        format!("invalid deregister: {message}"),
+                        true,
+                    ))
+                    .await?;
+                    return Ok(());
+                }
                 _ => {
                     self.reply(ServerMsg::error_with_fatal(
                         None,
@@ -905,23 +919,10 @@ impl Conn {
                     .await?;
                     return Ok(());
                 }
-            }
-            let msg: crate::enroll::agent::Deregister = match serde_json::from_str(&line) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.reply(ServerMsg::error_with_fatal(
-                        None,
-                        ErrorCode::BadRequest,
-                        format!("invalid deregister: {e}"),
-                        true,
-                    ))
-                    .await?;
-                    return Ok(());
-                }
             };
             if normalize_agent_id(&msg.agent_id) != agent.agent_id {
                 self.reply(ServerMsg::error(
-                    msg.seq,
+                    Some(msg.seq),
                     ErrorCode::AuthFailed,
                     "agent_id does not match the client certificate",
                 ))
@@ -931,10 +932,14 @@ impl Conn {
             let seq = msg.seq;
             let serial = self.client_serial();
             let peer = self.peer.ip().to_string();
-            match crate::enroll::agent::deregister(svc, &agent.agent_id, serial, &peer, msg).await {
-                Ok(line) => self.send_line(line).await?,
-                Err(e) => self.send_line(e.line(seq)).await?,
-            }
+            let reply =
+                match crate::enroll::agent::deregister(svc, &agent.agent_id, serial, &peer, *msg)
+                    .await
+                {
+                    Ok(ack) => ServerMsg::DeregisterAck(Box::new(ack)),
+                    Err(e) => e.to_msg(Some(seq)),
+                };
+            self.send(&reply).await?;
             return self.close().await;
         }
     }
@@ -1217,10 +1222,6 @@ impl Conn {
             };
             self.pace_message().await;
 
-            let intent = match &frame {
-                Frame::Line(line) => crate::enroll::agent::probe(line).1,
-                _ => None,
-            };
             let flow = match classify(frame) {
                 Incoming::TooLong => self.reply_too_long().await?,
                 Incoming::BadRequest { message, seq } => {
@@ -1244,7 +1245,6 @@ impl Conn {
                         agent_version,
                         heartbeat_interval_ms,
                         ext: *ext,
-                        intent,
                     };
                     match self.accept_hello(hello).await? {
                         HelloOutcome::Accepted(agent) => {
@@ -1271,8 +1271,12 @@ impl Conn {
                     ))
                     .await?
                 }
-                // 不重置連續無效訊息的計數（避免與 bad_request 交錯送出來繞過上限）
-                Incoming::Msg(ClientMsg::Unknown) => self.reply_unknown_type().await?,
+                // 不重置連續無效訊息的計數（避免與 bad_request 交錯送出來繞過上限）。
+                // hello 之前的 renew_request／deregister 與舊版相同，視為不認得的 type
+                Incoming::Msg(
+                    ClientMsg::Unknown | ClientMsg::RenewRequest(_) | ClientMsg::Deregister(_),
+                )
+                | Incoming::InvalidLifecycle { .. } => self.reply_unknown_type().await?,
             };
             if let Flow::Close = flow {
                 return Ok(None);
@@ -1295,7 +1299,6 @@ impl Conn {
             agent_version,
             heartbeat_interval_ms,
             ext,
-            intent,
         } = hello;
         let range = match client_proto_range(&proto, &ext.offer) {
             Ok(range) => Some(range),
@@ -1342,8 +1345,8 @@ impl Conn {
         let both = |f: &str| {
             session.is_v2() && self.enroll.is_some() && client_features.iter().any(|c| c == f)
         };
-        let renew = both(crate::enroll::agent::FEATURE_RENEW);
-        let deregister = both(crate::enroll::agent::FEATURE_DEREGISTER);
+        let renew = both(FEATURE_RENEW);
+        let deregister = both(FEATURE_DEREGISTER);
         let host = if session.is_v2() {
             let checked = validate_features(&client_features).and_then(|()| {
                 let host = ext.host.map_err(|e| format!("invalid message: {e}"))?;
@@ -1377,7 +1380,7 @@ impl Conn {
             host,
             renew,
             deregister,
-            intent_deregister: intent.as_deref() == Some(crate::enroll::agent::INTENT_DEREGISTER),
+            intent_deregister: ext.intent.as_deref() == Some(INTENT_DEREGISTER),
         }))
     }
 
@@ -1655,13 +1658,6 @@ impl Conn {
         frame: Frame,
         received_at: DateTime<Utc>,
     ) -> Result<Handled, Error> {
-        if agent.renew
-            && let Frame::Line(line) = &frame
-            && crate::enroll::agent::probe(line).0.as_deref() == Some("renew_request")
-            && let Some(svc) = self.enroll.clone()
-        {
-            return self.handle_renew(&svc, agent, line).await;
-        }
         let msg = match classify(frame) {
             Incoming::TooLong => return Ok(Handled::not_alive(self.reply_too_long().await?)),
             Incoming::BadRequest { message, seq } => {
@@ -1669,13 +1665,32 @@ impl Conn {
                     self.reply_bad_request(seq, message).await?,
                 ));
             }
+            // 協商了 renew 的 renew_request 不合法：bad_request；其他（沒有協商、或一般連線上的
+            // deregister）與舊版相同，回 unknown_type
+            Incoming::InvalidLifecycle { kind, message } => {
+                let flow = if kind == "renew_request" && agent.renew && self.enroll.is_some() {
+                    self.reply_bad_request(None, format!("invalid renew_request: {message}"))
+                        .await?
+                } else {
+                    self.reply_unknown_type().await?
+                };
+                return Ok(Handled::not_alive(flow));
+            }
             Incoming::Msg(msg) => msg,
         };
 
-        // 只有合法訊息（hello、heartbeat、report）會把連續無效訊息的計數歸零
+        // 只有合法訊息（hello、heartbeat、report、協商了 renew 的 renew_request）會把連續無效訊息的
+        // 計數歸零
         match msg {
-            // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限
-            ClientMsg::Unknown => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
+            ClientMsg::RenewRequest(req) if agent.renew => match self.enroll.clone() {
+                Some(svc) => self.handle_renew(&svc, agent, *req).await,
+                None => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
+            },
+            // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限。沒有協商 renew 的 renew_request、
+            // 一般連線上的 deregister 與舊版相同，視為不認得的 type
+            ClientMsg::Unknown | ClientMsg::RenewRequest(_) | ClientMsg::Deregister(_) => {
+                Ok(Handled::not_alive(self.reply_unknown_type().await?))
+            }
             ClientMsg::Hello { seq, .. } => {
                 self.bad_requests = 0;
                 if !self.touch(ctx, agent) {

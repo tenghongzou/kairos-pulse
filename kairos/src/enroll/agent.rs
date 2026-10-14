@@ -1,15 +1,15 @@
-//! 8443 上與註冊有關的訊息（`crates/kairos-proto/ENROLL.md` 第 13 節）：正常輪替 `renew`、
+//! 8443 上與註冊有關的訊息（`crates/kairos-proto/PROTOCOL.md`「憑證輪替與除役」）：正常輪替 `renew`、
 //! 除役 `deregister`，以及輪替後撤銷舊憑證（新序號第一次成功 `hello` 時）。
 //!
-//! 這兩個 feature 的訊息型別目前定義在 Kairos 端（[`RenewRequest`]、[`Deregister`]），回應以 JSON
-//! 組成後直接送出：`kairos-proto` 的 `ServerMsg` 加入新變體會讓 Pulse 端的 `match` 無法編譯，
-//! 共用型別待兩端合併時移入 `kairos-proto`（見 PKI.md 第 12 節「與 Pulse 端合併時」）。
+//! 訊息型別是 `kairos-proto` 的共用型別（[`RenewRequest`]、[`Deregister`]、[`RenewResult`]、
+//! [`DeregisterAck`]，`ClientMsg`／`ServerMsg` 的對應變體）；本模組只處理資料庫與簽發。
 
-use kairos_proto::enroll::{b64url_decode, format_rfc3339_ms};
+use kairos_proto::enroll::{IssuedCertificate, b64url_decode, format_rfc3339_ms};
+use kairos_proto::lifecycle::{DEREGISTER_STATE_DECOMMISSIONED, RENEW_STATE_ISSUED};
+use kairos_proto::{Deregister, DeregisterAck, ErrorCode, RenewRequest, RenewResult, ServerMsg};
 use log::{info, warn};
 use rusqlite::TransactionBehavior;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,120 +21,60 @@ use crate::pki::issue::Reason;
 use crate::pki::store::{self as ps, CertRow, Revoke};
 use crate::pki::x509::pem_encode;
 
-/// 8443 的 feature：憑證仍有效時經既有的 mTLS 連線輪替
-pub const FEATURE_RENEW: &str = "renew";
-/// 8443 的 feature：主機自行除役
-pub const FEATURE_DEREGISTER: &str = "deregister";
-/// `hello.intent` 的除役值
-pub const INTENT_DEREGISTER: &str = "deregister";
-
-/// `renew_request`（Pulse → Kairos）
-#[derive(Debug, Clone, Deserialize)]
-pub struct RenewRequest {
-    pub seq: u64,
-    pub request_id: String,
-    pub csr: String,
-    /// 只記錄、不判定時鐘（連線本身已以 mTLS 證明身分）
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub sent_at: Option<String>,
-}
-
-/// `deregister`（Pulse → Kairos）
-#[derive(Debug, Clone, Deserialize)]
-pub struct Deregister {
-    #[serde(default)]
-    pub seq: Option<u64>,
-    pub request_id: String,
-    pub agent_id: String,
-    pub reason: String,
-    #[serde(default)]
-    pub initiated_by: Option<String>,
-    #[serde(default)]
-    pub host_fingerprint: Option<String>,
-    #[serde(default)]
-    pub hostname: Option<String>,
-    #[serde(default)]
-    pub pulse_version: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub sent_at: Option<String>,
-}
-
-/// 一行 client 訊息的 `type` 與 hello 的 `intent`（解析失敗時 `None`）
-pub fn probe(line: &str) -> (Option<String>, Option<String>) {
-    #[derive(Deserialize)]
-    struct Probe {
-        #[serde(rename = "type")]
-        kind: Option<Value>,
-        intent: Option<Value>,
-    }
-    match serde_json::from_str::<Probe>(line) {
-        Ok(p) => (
-            p.kind.and_then(|v| v.as_str().map(str::to_string)),
-            p.intent.and_then(|v| v.as_str().map(str::to_string)),
-        ),
-        Err(_) => (None, None),
-    }
-}
-
-/// 8443 上的錯誤（`error` 訊息的 `code`、`message` 與是否 fatal）
+/// 8443 上的錯誤（`error` 訊息的 `code` 與 `message`；都不是 fatal）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentError {
-    pub code: &'static str,
+    pub code: ErrorCode,
     pub message: String,
-    pub fatal: bool,
 }
 
 impl AgentError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
-            fatal: false,
         }
     }
 
-    /// `error` 訊息的一行 JSON
-    pub fn line(&self, seq: Option<u64>) -> String {
-        json!({
-            "type": "error",
-            "seq": seq,
-            "code": self.code,
-            "message": self.message,
-            "fatal": self.fatal,
-        })
-        .to_string()
+    /// 回應 `seq` 的 `error` 訊息（非 fatal）
+    pub fn to_msg(&self, seq: Option<u64>) -> ServerMsg {
+        ServerMsg::error_with_fatal(seq, self.code, self.message.clone(), false)
     }
 }
 
 fn storage() -> AgentError {
-    AgentError::new("storage_unavailable", "server could not store the request")
+    AgentError::new(
+        ErrorCode::StorageUnavailable,
+        "server could not store the request",
+    )
 }
 
-fn certificate_json(svc: &EnrollService, c: &CertRow) -> Option<Value> {
+fn issued_certificate(svc: &EnrollService, c: &CertRow) -> Option<IssuedCertificate> {
     let ca = svc.pki.server_ca()?;
-    Some(json!({
-        "serial": c.serial,
-        "not_before": format_rfc3339_ms(c.not_before),
-        "not_after": format_rfc3339_ms(c.not_after),
-        "client_cert_pem": pem_encode("CERTIFICATE", &c.cert_der),
-        "chain_pem": "",
-        "ca_pem": ca.pem,
-    }))
+    Some(IssuedCertificate {
+        serial: c.serial.clone(),
+        not_before: format_rfc3339_ms(c.not_before),
+        not_after: format_rfc3339_ms(c.not_after),
+        client_cert_pem: pem_encode("CERTIFICATE", &c.cert_der),
+        chain_pem: String::new(),
+        ca_pem: ca.pem.clone(),
+    })
 }
 
 /// `hello_ack` 另帶的欄位（雙方協商了 `renew` 時）：`expired_renew_grace_days`、
-/// 以及以非啟用中的簽發 CA 簽發的憑證要求提早輪替的 `renew_now`
-pub fn hello_ack_extra(
-    svc: &EnrollService,
-    client_cert: Option<&[u8]>,
-) -> serde_json::Map<String, Value> {
-    let mut m = serde_json::Map::new();
-    m.insert(
-        "expired_renew_grace_days".into(),
-        json!(svc.effective().policy.expired_renew_grace_days),
-    );
+/// 以及以非啟用中的簽發 CA 簽發的憑證要求提早輪替的 `renew_now`（不需要時 `None`，不輸出）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HelloAckRenew {
+    pub expired_renew_grace_days: Option<u32>,
+    pub renew_now: Option<bool>,
+}
+
+/// 計算 [`HelloAckRenew`]（會讀資料庫，在 blocking 執行緒呼叫）
+pub fn hello_ack_renew(svc: &EnrollService, client_cert: Option<&[u8]>) -> HelloAckRenew {
+    let mut m = HelloAckRenew {
+        expired_renew_grace_days: Some(svc.effective().policy.expired_renew_grace_days),
+        renew_now: None,
+    };
     if let (super::pki_mgr::IssueStatus::Online { ca_id }, Some(der)) =
         (svc.pki.status(), client_cert)
         && let Ok(info) = crate::pki::x509::parse_cert(der)
@@ -151,7 +91,7 @@ pub fn hello_ack_extra(
             .read_blocking(|conn| Ok(ps::get_cert(conn, &info.serial)?.is_some()))
             .unwrap_or(false);
         if issued_by_kairos && active_subject.is_some_and(|s| s != info.issuer_raw) {
-            m.insert("renew_now".into(), json!(true));
+            m.renew_now = Some(true);
         }
     }
     m
@@ -214,12 +154,12 @@ pub fn on_hello(svc: &Arc<EnrollService>, agent_id: &str, serial: &str) {
     });
 }
 
-/// 處理 `renew_request`：成功時回傳 `renew_result` 的一行 JSON
+/// 處理 `renew_request`：成功時回傳 `renew_result`
 pub async fn renew(
     svc: &Arc<EnrollService>,
     agent_id: &str,
     req: RenewRequest,
-) -> Result<String, AgentError> {
+) -> Result<RenewResult, AgentError> {
     // 每個 agent_id 每小時 10 次
     if svc
         .limits
@@ -234,15 +174,15 @@ pub async fn renew(
         .is_err()
     {
         return Err(AgentError::new(
-            "rate_limited",
+            ErrorCode::RateLimited,
             "too many renewal requests; retry later",
         ));
     }
     let der = b64url_decode(&req.csr)
         .ok()
         .filter(|d| !d.is_empty() && d.len() <= kairos_proto::enroll::MAX_CSR_DER_BYTES)
-        .ok_or_else(|| AgentError::new("invalid_csr", "csr must be base64url DER"))?;
-    let csr = check_csr(&der, agent_id).map_err(|m| AgentError::new("invalid_csr", m))?;
+        .ok_or_else(|| AgentError::new(ErrorCode::InvalidCsr, "csr must be base64url DER"))?;
+    let csr = check_csr(&der, agent_id).map_err(|m| AgentError::new(ErrorCode::InvalidCsr, m))?;
     let s = svc.clone();
     let agent = agent_id.to_string();
     let eff = svc.effective();
@@ -259,7 +199,7 @@ pub async fn renew(
             }
             if ps::spki_used_by_agent(&tx, &agent, &csr.spki_sha256)? {
                 return Ok(Err(AgentError::new(
-                    "invalid_csr",
+                    ErrorCode::InvalidCsr,
                     "the new key must differ from previous keys of this agent_id",
                 )));
             }
@@ -268,11 +208,14 @@ pub async fn renew(
             let id = if kairos_proto::is_uuid_text(&request_id) {
                 request_id.to_ascii_lowercase()
             } else {
-                return Ok(Err(AgentError::new("bad_request", "request_id must be a UUID")));
+                return Ok(Err(AgentError::new(
+                    ErrorCode::BadRequest,
+                    "request_id must be a UUID",
+                )));
             };
             if store::get_request(&tx, &id)?.is_some() {
                 return Ok(Err(AgentError::new(
-                    "bad_request",
+                    ErrorCode::BadRequest,
                     "request_id is already used by a different CSR",
                 )));
             }
@@ -370,39 +313,37 @@ pub async fn renew(
         DbState::PendingApproval => None,
         _ => {
             return Err(AgentError::new(
-                "invalid_csr",
+                ErrorCode::InvalidCsr,
                 "a previous request with this CSR was closed; generate a new key",
             ));
         }
     };
     let Some(cert) = cert.filter(|c| c.revoked_at.is_none()) else {
         return Err(AgentError::new(
-            "renew_requires_approval",
+            ErrorCode::RenewRequiresApproval,
             "renewal requires approval or offline issuance; resend the same CSR later",
         ));
     };
-    let certificate = certificate_json(svc, &cert).ok_or_else(storage)?;
-    Ok(json!({
-        "type": "renew_result",
-        "seq": req.seq,
-        "request_id": created.request_id,
-        "state": "issued",
-        "certificate": certificate,
-        "policy": svc.effective().protocol_policy(),
-        "server_time": format_rfc3339_ms(svc.now_ms()),
+    let certificate = issued_certificate(svc, &cert).ok_or_else(storage)?;
+    Ok(RenewResult {
+        seq: req.seq,
+        request_id: created.request_id,
+        state: RENEW_STATE_ISSUED.to_string(),
+        certificate,
+        policy: Some(svc.effective().protocol_policy()),
+        server_time: Some(format_rfc3339_ms(svc.now_ms())),
     })
-    .to_string())
 }
 
 /// 處理 `deregister`：生命週期改為已除役、依政策撤銷這條連線的憑證（10 分鐘後生效），回傳
-/// `deregister_ack` 的一行 JSON。已除役時回 `already_decommissioned: true`（冪等）
+/// `deregister_ack`。已除役時回 `already_decommissioned: true`（冪等）
 pub async fn deregister(
     svc: &Arc<EnrollService>,
     agent_id: &str,
     serial: Option<String>,
     peer: &str,
     msg: Deregister,
-) -> Result<String, AgentError> {
+) -> Result<DeregisterAck, AgentError> {
     let now = svc.now_ms();
     let revoke = svc.effective().policy.revoke_on_self_decommission;
     let agent = agent_id.to_string();
@@ -412,7 +353,11 @@ pub async fn deregister(
         .db
         .write(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let hostname = m.hostname.clone().unwrap_or_else(|| agent.clone());
+            let hostname = if m.hostname.is_empty() {
+                agent.clone()
+            } else {
+                m.hostname.clone()
+            };
             let already = store::decommission_host(&tx, &agent, &hostname, "self", now)?;
             let host = store::host_enroll(&tx, &agent)?;
             let at = host.and_then(|h| h.decommissioned_at).unwrap_or(now);
@@ -462,7 +407,7 @@ pub async fn deregister(
     if !already {
         info!(
             "agent {agent_id} 已自行除役（{}，來源 {}）{}",
-            msg.initiated_by.as_deref().unwrap_or("-"),
+            msg.initiated_by,
             msg.request_id,
             if revoked {
                 "，憑證在 10 分鐘後撤銷"
@@ -471,17 +416,13 @@ pub async fn deregister(
             }
         );
     }
-    let mut ack = json!({
-        "type": "deregister_ack",
-        "request_id": msg.request_id,
-        "agent_id": agent_id,
-        "state": "decommissioned",
-        "decommissioned_at": format_rfc3339_ms(at),
-        "certificate_revoked": revoked,
-        "already_decommissioned": already,
-    });
-    if let Some(seq) = msg.seq {
-        ack["seq"] = json!(seq);
-    }
-    Ok(ack.to_string())
+    Ok(DeregisterAck {
+        seq: msg.seq,
+        request_id: msg.request_id,
+        agent_id: agent_id.to_string(),
+        state: DEREGISTER_STATE_DECOMMISSIONED.to_string(),
+        decommissioned_at: format_rfc3339_ms(at),
+        certificate_revoked: revoked,
+        already_decommissioned: already,
+    })
 }

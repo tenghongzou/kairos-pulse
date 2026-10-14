@@ -420,7 +420,7 @@ impl EnrollService {
 
     /// 8443 的 features 中與註冊有關的部分（`renew`、`deregister`）
     pub fn agent_features(&self) -> Vec<&'static str> {
-        vec![agent::FEATURE_RENEW, agent::FEATURE_DEREGISTER]
+        kairos_proto::LIFECYCLE_FEATURES.to_vec()
     }
 
     // ---- 長輪詢 ----

@@ -6,7 +6,6 @@ mod config_manager;
 mod decommission;
 mod enroll;
 mod file_perms;
-mod lifecycle;
 mod local_status;
 mod log_files;
 mod log_throttle;
@@ -746,7 +745,7 @@ async fn run(
     // 身分由 pulse enroll 管理（identity/client.pem）：宣告 renew、過期時改走 8444 過期續簽
     let managed = enroll::service::identity_managed(&config, &base, &paths);
     if managed {
-        settings.extra_features = vec![lifecycle::FEATURE_RENEW.to_string()];
+        settings.extra_features = vec![kairos_proto::FEATURE_RENEW.to_string()];
         settings.rotation = Some(Arc::new(Mutex::new(rotation::Rotation::new(
             paths.clone(),
             &agent_id,
