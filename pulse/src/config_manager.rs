@@ -33,7 +33,7 @@ pub const MAX_REPLAY_INTERVAL_MS: u64 = 60_000;
 /// 1.67 倍（`report.interval = 1` 時為 600 ms）
 pub const MAX_REPLAY_SHARE_PERMILLE: u64 = 600;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ServerConfig {
     pub address: String,
     pub port: u16,
@@ -65,7 +65,7 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct RetryConfig {
     /// 連續失敗達此次數後，重連日誌由 warn 升級為 error（不限制重試次數）
     pub max_retries: u32,
@@ -75,17 +75,17 @@ pub struct RetryConfig {
     pub max_delay: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct HeartbeatConfig {
     pub interval: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ReportConfig {
     pub interval: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct AgentConfig {
     /// 存放 agent_id 的檔案路徑
     pub id_file: String,
@@ -96,7 +96,7 @@ pub struct AgentConfig {
 }
 
 /// 註冊取得的身分（`enroll` 模組）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct IdentityConfig {
     /// `identity/` 目錄（相對路徑以工作目錄解析）
     pub dir: String,
@@ -105,7 +105,7 @@ pub struct IdentityConfig {
 }
 
 /// 註冊端點（8444）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct EnrollConfig {
     /// 空字串 = 與 `server.address` 相同主機
     pub address: String,
@@ -113,7 +113,7 @@ pub struct EnrollConfig {
 }
 
 /// 本機緩衝（A5，見 `spool` 模組）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct BufferConfig {
     /// 是否啟用：啟用時向 Kairos 宣告 `durable`（at-least-once）；停用時與 0.2.0 相同（at-most-once）
     pub enabled: bool,
@@ -131,25 +131,116 @@ pub struct BufferConfig {
 }
 
 /// 本機狀態檔（`pulse status` 讀取，見 `status_file` 模組）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct StatusConfig {
     /// 狀態檔路徑（相對路徑以工作目錄解析）；空字串為設計包的位置（`status_file::default_path`），
     /// 無法寫入時改寫工作目錄的 `logs/status.json`
     pub file: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct LogConfig {
     /// 日誌級別；載入後已正規化為小寫並驗證過
     pub level: String,
     /// 日誌檔保留天數（今天與前 N 天）；0 = 永久保留，上限 `MAX_LOG_RETENTION_DAYS`
     pub retention_days: u32,
+    /// `text`（RFC 3339 帶時區）、`json`（`logs/pulse-YYYY-MM-DD.jsonl`）、`legacy`（0.5 以前的格式）
+    pub format: String,
+    /// `local` 或 `utc`（只影響 `text`）
+    pub timezone: String,
+    /// 同時寫到 stdout（互動執行時；服務的 stdout 由 unit 的 StandardOutput 決定）
+    pub stdout: bool,
+    /// syslog 外送（RFC 5424）
+    pub syslog: SyslogConfig,
+}
+
+/// `[log.syslog]`
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct SyslogConfig {
+    /// `udp://主機:埠`、`tcp://主機:埠`、`unix:///dev/log`；空字串＝不外送
+    pub target: String,
+    pub facility: String,
+    pub app_name: String,
+    /// `text` 或 `json`
+    pub payload: String,
 }
 
 impl LogConfig {
     /// 對應的 `LevelFilter`（`level` 已在載入時驗證，這裡不會失敗）。
     pub fn level_filter(&self) -> LevelFilter {
         parse_level(&self.level).unwrap_or(LevelFilter::Info)
+    }
+
+    /// `log.format`（已在載入時驗證）
+    pub fn log_format(&self) -> kp_obs::logfmt::LogFormat {
+        kp_obs::logfmt::LogFormat::parse(&self.format).unwrap_or_default()
+    }
+
+    /// `log.timezone`（已在載入時驗證）
+    pub fn log_timezone(&self) -> kp_obs::logfmt::LogTimezone {
+        kp_obs::logfmt::LogTimezone::parse(&self.timezone).unwrap_or_default()
+    }
+
+    /// `[log.syslog]` 轉成外送設定；`target` 為空時為 `None`
+    pub fn syslog_config(&self, hostname: &str) -> Result<Option<kp_obs::syslog::Config>, String> {
+        let s = &self.syslog;
+        if s.target.trim().is_empty() {
+            return Ok(None);
+        }
+        let transport = kp_obs::syslog::parse_target(&s.target)
+            .map_err(|e| format!("log.syslog.target 無效：{e}"))?;
+        let facility = kp_obs::syslog::parse_facility(&s.facility).ok_or_else(|| {
+            format!(
+                "log.syslog.facility「{}」無效（可用：daemon、user、auth、authpriv、local0～local7）",
+                s.facility
+            )
+        })?;
+        let payload = kp_obs::syslog::Payload::parse(&s.payload).ok_or_else(|| {
+            format!(
+                "log.syslog.payload「{}」無效（可用：text、json）",
+                s.payload
+            )
+        })?;
+        if s.app_name.trim().is_empty() {
+            return Err("log.syslog.app_name 不可為空字串".to_string());
+        }
+        Ok(Some(kp_obs::syslog::Config {
+            transport,
+            facility,
+            app_name: s.app_name.trim().to_string(),
+            hostname: hostname.to_string(),
+            payload,
+        }))
+    }
+}
+
+/// `[metrics]`：本機的 Prometheus 指標（預設都關閉）
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct MetricsConfig {
+    /// 本機 HTTP `/metrics` 的監聽位址（例如 `127.0.0.1:9465`）；空字串＝不監聽。只接受 loopback 位址
+    pub listen: String,
+    /// node_exporter textfile collector 的輸出檔（副檔名 `.prom`）；空字串＝不寫
+    pub textfile: String,
+    /// textfile 的更新間隔（秒，5～3600）
+    pub textfile_interval: u64,
+}
+
+impl MetricsConfig {
+    /// `listen` 解析後的位址（空字串時為 `None`）
+    pub fn listen_addr(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        let l = self.listen.trim();
+        if l.is_empty() {
+            return Ok(None);
+        }
+        let addr: std::net::SocketAddr = l
+            .parse()
+            .map_err(|_| format!("metrics.listen「{l}」必須是 IP:埠，例如 127.0.0.1:9465"))?;
+        if !addr.ip().to_canonical().is_loopback() {
+            return Err(format!(
+                "metrics.listen「{l}」必須是 loopback 位址（127.0.0.1 或 ::1）：本機指標不需要認證，不對外開放"
+            ));
+        }
+        Ok(Some(addr))
     }
 }
 
@@ -165,7 +256,7 @@ fn parse_level(level: &str) -> Option<LevelFilter> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub retry: RetryConfig,
@@ -177,6 +268,7 @@ pub struct AppConfig {
     pub buffer: BufferConfig,
     pub status: StatusConfig,
     pub log: LogConfig,
+    pub metrics: MetricsConfig,
     /// 載入時目前工作目錄下是否有 `pulse.toml`（啟動時記錄，方便確認設定來源）
     #[serde(skip)]
     pub local_file_found: bool,
@@ -406,6 +498,32 @@ impl AppConfig {
             u64::from(self.log.retention_days),
             0,
             u64::from(MAX_LOG_RETENTION_DAYS),
+        )?;
+        if kp_obs::logfmt::LogFormat::parse(&self.log.format).is_none() {
+            return Err(ConfigError::Message(format!(
+                "log.format「{}」無效（可用：text、json、legacy）",
+                self.log.format
+            )));
+        }
+        if kp_obs::logfmt::LogTimezone::parse(&self.log.timezone).is_none() {
+            return Err(ConfigError::Message(format!(
+                "log.timezone「{}」無效（可用：local、utc）",
+                self.log.timezone
+            )));
+        }
+        self.log.syslog_config("-").map_err(ConfigError::Message)?;
+        self.metrics.listen_addr().map_err(ConfigError::Message)?;
+        let textfile = self.metrics.textfile.trim();
+        if !textfile.is_empty() && !textfile.ends_with(".prom") {
+            return Err(ConfigError::Message(format!(
+                "metrics.textfile「{textfile}」的副檔名必須是 .prom（node_exporter 的 textfile collector 只讀 *.prom）"
+            )));
+        }
+        range(
+            "metrics.textfile_interval",
+            self.metrics.textfile_interval,
+            5,
+            3600,
         )?;
         if parse_level(&self.log.level).is_none() {
             return Err(ConfigError::Message(format!(

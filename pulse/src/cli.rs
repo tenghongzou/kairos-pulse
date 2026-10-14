@@ -22,10 +22,13 @@ pub const USAGE: &str = "\
   status             顯示服務、連線、身分與回報狀態（讀取本機狀態檔，不需要連線；pulse status --help）
   enroll             以註冊 token 向 Kairos 註冊這台主機（pulse enroll --help）
   decommission       完全移除前通知 Kairos（安裝程式使用；pulse decommission --help）
+  check-config       檢查設定檔（不連線；pulse check-config --help）
+  diag               產生支援診斷包（自動遮蔽私鑰、token 等敏感資料；pulse diag --help）
   explain <代碼>     說明錯誤代碼，例如 pulse explain PLS-E2003
 
 選項：
   --print-agent-id   印出本機 agent_id（agent.id 不存在時先產生）後結束，不連線
+  --check-config     同 pulse check-config
   -V, --version      顯示版本與建置的 commit 後結束（不讀取設定）
   -h, --help         顯示此說明
 
@@ -118,6 +121,14 @@ pub enum Command {
     Decommission(crate::enroll::cli::DecommissionArgs),
     /// `pulse decommission --help`
     DecommissionHelp,
+    /// `pulse check-config`／`pulse --check-config`
+    CheckConfig(crate::diag::CheckArgs),
+    /// `pulse check-config --help`
+    CheckConfigHelp,
+    /// `pulse diag`
+    Diag(crate::diag::DiagArgs),
+    /// `pulse diag --help`
+    DiagHelp,
 }
 
 /// 參數錯誤：訊息與要附上的用法
@@ -143,7 +154,25 @@ where
     S: AsRef<str>,
 {
     let args: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
+    let help = |rest: &[String]| rest.iter().any(|a| a == "-h" || a == "--help");
     match args.first().map(String::as_str) {
+        Some("check-config") if help(&args[1..]) => return Ok(Command::CheckConfigHelp),
+        Some("check-config") => {
+            return crate::diag::parse_check(&args[1..]).map(Command::CheckConfig);
+        }
+        Some("diag") if help(&args[1..]) => return Ok(Command::DiagHelp),
+        Some("diag") => return crate::diag::parse_diag(&args[1..]).map(Command::Diag),
+        _ if args.iter().any(|a| a == "--check-config") => {
+            let rest: Vec<String> = args
+                .iter()
+                .filter(|a| *a != "--check-config")
+                .cloned()
+                .collect();
+            if help(&rest) {
+                return Ok(Command::CheckConfigHelp);
+            }
+            return crate::diag::parse_check(&rest).map(Command::CheckConfig);
+        }
         Some("status") => return parse_status(&args[1..]),
         Some("explain") => {
             return match &args[1..] {

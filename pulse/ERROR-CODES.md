@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（86 個）
+## 2. 已對應的代碼（89 個）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -31,6 +31,9 @@
 | `PLS-W0302` | `tls.rs` `build`（日誌）；`main.rs` `config_warnings`（狀態） | `accept_invalid_certs = true` | `config.warning`（ERROR 等級，與先前相同）；設定列 ⚠ |
 | `PLS-W0303` | `main.rs` `config_warnings` | 設定了 `server.ca_cert` 又讓 `use_system_roots = true` | 設定列 ⚠ |
 | `PLS-W8101` | `main.rs` `startup_location_messages` | 工作目錄是 `System32`／`SysWOW64` | `config.warning`；設定列 ⚠ |
+| `PLS-E0401` | `diag.rs` `locate`（0.6〔草稿〕） | `pulse check-config`／`pulse diag` 以 `-c` 指定的設定檔不存在 | `check-config` 的「設定檔」列 ✗，結束代碼 3 |
+| `PLS-E4301` | `diag.rs` `run_diag`（0.6〔草稿〕） | 無法寫出診斷包（輸出檔已存在、無法寫入、產生前檢查仍有疑似秘密） | stderr，結束代碼 1 |
+| `PLS-W4302` | `diag.rs` `build`（0.6〔草稿〕） | 診斷包的日誌超過 50 MB 上限，只收集較新的部分 | `pulse diag` 的輸出，結束代碼 8 |
 
 ### 2.2 TLS、身分
 
@@ -159,19 +162,19 @@
 
 ## 4. 待辦
 
-### 4.1 尚未對應的代碼（23 個）
+### 4.1 尚未對應的代碼（20 個）
 
 | 類別 | 代碼 | 原因 |
 |---|---|---|
-| 命令列、設定 | `PLS-E0103`、`PLS-E0202`、`PLS-E0401`、`PLS-E0402`、`PLS-W0102`、`PLS-W0104`、`PLS-W0105` | 未知欄位偵測、`PULSE_CONFIG`；必填欄位與矛盾設定目前都歸在 `PLS-E0201`。`PLS-E0402`（設定檔無法讀取）在 `pulse status` 中刻意不視為錯誤（以服務回報的設定為準）；`--config` 指定的檔案不存在暫用 `PLS-E0002` |
+| 命令列、設定 | `PLS-E0103`、`PLS-E0202`、`PLS-E0402`、`PLS-W0102`、`PLS-W0104`、`PLS-W0105` | 未知欄位偵測、`PULSE_CONFIG`；必填欄位與矛盾設定目前都歸在 `PLS-E0201`。`PLS-E0402`（設定檔無法讀取）在 `pulse status` 中刻意不視為錯誤（以服務回報的設定為準），`pulse check-config`／`diag` 則以它表示無法讀取；`pulse status --config` 指定的檔案不存在暫用 `PLS-E0002`（`check-config`／`diag` 為 `PLS-E0401`） |
 | 憑證 | `PLS-W1001`、`PLS-E1106` | Kairos 伺服器憑證即將到期的提醒、加密私鑰的專屬代碼尚未實作；啟動時的憑證／私鑰載入錯誤仍只有結束代碼 4 與 `agent.fatal`（`PLS-E1104`、`PLS-E1107` 目前只用於註冊流程） |
 | 連線、身分 | `PLS-W2006`、`PLS-W3105`、`PLS-E3106` | 連線不穩定的判定、`agent.id.host` 的複製主機偵測、常駐行程的身分鎖檔尚未實作 |
-| 儲存 | `PLS-E4001`、`PLS-E4301`、`PLS-W4302` | 磁碟空間檢查、`pulse diag` 尚未實作 |
+| 儲存 | `PLS-E4001` | 磁碟空間檢查尚未實作 |
 | 平台、安裝 | `PLS-E8001`、`PLS-W8006`、`PLS-E8007`、`PLS-W8008`、`PLS-E8102`、`PLS-E8103`、`PLS-E8104`、`PLS-W8303` | 安裝程式、MSI、`pulse preflight`、時間同步狀態偵測尚未實作 |
 
 ### 4.2 日誌格式與其他
 
-- `log-ux.md` §6 的完整格式（RFC 3339 帶時區的時間、5 欄寬等級、`event` 補到 18 欄、`key=value` 欄位、`log.format = "json"`、`run_id`／`seq`）與 §5 的重試摘要（`conn.retry_summary`：1／5／15／30 分、之後每小時）尚未實作；目前仍是每次斷線一行（WARN／節流的 ERROR）。
+- 0.6〔草稿〕已實作 `log-ux.md` §6 的 RFC 3339 帶時區的時間、`log.format = "json"`（`v`、`ts`、`level`、`event`、`code`、`msg`、`agent_id`、`instance`、`run_id`、`seq`，事件專屬欄位在 `fields` 物件中）、`log.timezone` 與 syslog 外送；`text` 仍保留 0.5 的 `[等級] <event> <code> 訊息` 版面（未改為 5 欄寬等級、`event` 補到 18 欄）。§5 的重試摘要（`conn.retry_summary`：1／5／15／30 分、之後每小時）、`log.lang`、`log.stderr`、`log.outage_error_after` 尚未實作；目前仍是每次斷線一行（WARN／節流的 ERROR）。
 - systemd `Status:` 的文字仍是 0.2 的寫法（`無法註冊：certificate_rejected（…）`），尚未改為 `cli-spec.md` §2.2 的「標題（代碼，處理提示）」；`PLS-E4004` 已附在 `已註冊：…` 之後。
 - `clock.skew` 的 `ERROR` 與 `status.write_failed` 的 `ERROR` 目前寫日誌與 stderr；Windows 事件記錄與服務狀態（`log-ux.md` §3）待 Windows 事件記錄實作時一併處理。
 - Windows 事件記錄、服務描述欄位（`local-status.md` §5、§6）。

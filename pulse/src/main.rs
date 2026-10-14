@@ -4,11 +4,13 @@ mod cli;
 mod codes;
 mod config_manager;
 mod decommission;
+mod diag;
 mod enroll;
 mod file_perms;
 mod local_status;
 mod log_files;
 mod log_throttle;
+mod metrics;
 mod network;
 mod protocol;
 mod rotation;
@@ -108,28 +110,37 @@ impl From<String> for Failure {
     }
 }
 
-fn setup_logger(log_level: LevelFilter) -> Result<(), fern::InitError> {
+/// 初始化日誌：`logs/pulse-YYYY-MM-DD.log`（`log.format = "json"` 時為 `.jsonl`，UTC 日期），
+/// 可選擇同時寫 stdout（`log.stdout`）與 syslog（`[log.syslog]`）。行的格式見 `kp_obs::logfmt`
+fn setup_logger(config: &config_manager::LogConfig) -> Result<(), String> {
     // 確保日誌目錄存在
-    create_dir_all(log_files::LOG_DIR)?;
+    create_dir_all(log_files::LOG_DIR).map_err(|e| e.to_string())?;
+    let host = kp_obs::logfmt::hostname();
+    let syslog = match config.syslog_config(&host)? {
+        Some(c) => Some(
+            kp_obs::syslog::Sender::start(c).map_err(|e| format!("無法啟動 syslog 外送：{e}"))?,
+        ),
+        None => None,
+    };
+    let format = config.log_format();
+    let sink = Arc::new(kp_obs::logfmt::LogSink::new(
+        Arc::new(kp_obs::logfmt::LogMeta::new("pulse", host, true)),
+        format,
+        config.log_timezone(),
+        Box::new(log_files::daily_file(format)),
+        config.stdout,
+        syslog,
+    ));
+    log_files::set_sink(sink.clone());
 
     fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                message
-            ))
-        })
-        .level(log_level)
+        .level(config.level_filter())
         // 第三方套件的除錯訊息太多，只保留警告以上
         .level_for("config", LevelFilter::Warn)
         .level_for("rustls", LevelFilter::Warn)
-        .chain(std::io::stdout()) // 日誌輸出到終端
-        .chain(log_files::daily_output()) // 日誌輸出到 logs/pulse-YYYY-MM-DD.log（UTC 日期）
-        .apply()?;
-
-    Ok(())
+        .chain(fern::Output::call(move |record| sink.log(record)))
+        .apply()
+        .map_err(|e| e.to_string())
 }
 
 /// 每小時清除一次過期日誌檔（啟動時的清除已在 `main` 完成）。`retention_days == 0` 時不啟動。
@@ -337,6 +348,17 @@ fn main() -> ExitCode {
         cli::Command::Decommission(args) => {
             return ExitCode::from(enroll::cli::run_decommission(args));
         }
+        // pulse check-config／diag：自行讀取設定（-c），不初始化日誌檔、不連線
+        cli::Command::CheckConfigHelp => {
+            println!("{}", diag::CHECK_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        cli::Command::DiagHelp => {
+            println!("{}", diag::DIAG_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        cli::Command::CheckConfig(args) => return ExitCode::from(diag::run_check(args.clone())),
+        cli::Command::Diag(args) => return ExitCode::from(diag::run_diag(args.clone())),
         _ => {}
     }
     // 不讀取設定：設定有誤時也能確認版本
@@ -369,7 +391,7 @@ fn main() -> ExitCode {
         log_files::LogRetention::open(Path::new(log_files::LOG_DIR), config.log.retention_days);
 
     // 初始化日誌
-    if let Err(e) = setup_logger(config.log.level_filter()) {
+    if let Err(e) = setup_logger(&config.log) {
         eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
         return ExitCode::from(EXIT_GENERAL);
     }
@@ -390,6 +412,7 @@ fn main() -> ExitCode {
     };
     let code = runtime.block_on(async_main(config, retention));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    log_files::flush_all();
     code
 }
 
@@ -536,6 +559,12 @@ async fn run(
         tracker.path().display()
     );
     tokio::spawn(local_status::run_writer(tracker.clone(), shutdown.clone()));
+    // 本機指標（[metrics]；預設關閉）
+    metrics::spawn(
+        &config.metrics,
+        cwd.as_deref().unwrap_or(Path::new(".")),
+        shutdown.clone(),
+    );
     debug!("使用的配置: {:?}", config);
 
     // TLS 設定只在啟動時建立一次；憑證 / 私鑰讀不到、格式錯誤、不成對、過期都會在這裡直接失敗。
@@ -648,6 +677,12 @@ async fn run(
         return Ok(());
     };
     tracker.update(|s| s.set_identity(&agent_id, &hostname));
+    // JSON 日誌的 agent_id：未啟用 mTLS 時 agent_id 等同身分憑據，與狀態檔相同不寫出
+    if tls.client_cert_info().is_some()
+        && let Some(sink) = log_files::sink()
+    {
+        sink.meta.set_agent_id(Some(agent_id.clone()));
+    }
 
     spawn_log_cleanup(retention, config.log.retention_days);
     spawn_client_cert_recheck(tls.clone());

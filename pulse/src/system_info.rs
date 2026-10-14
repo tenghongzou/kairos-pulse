@@ -726,6 +726,9 @@ impl Sampler {
         match time::timeout(self.timeout, &mut task).await {
             Ok(joined) => match finished(joined) {
                 Some((sys, extras, s)) => {
+                    crate::metrics::global()
+                        .sample_duration
+                        .observe(started.elapsed());
                     self.sys = Some(sys);
                     self.extras = extras;
                     self.last_refresh = Some(Instant::now());
@@ -734,6 +737,7 @@ impl Sampler {
                 None => SampleOutcome::Stopped,
             },
             Err(_) => {
+                crate::metrics::global().sample_timeouts.inc();
                 self.skipped = 1;
                 self.stuck_log = LogThrottle::new(STUCK_LOG_WINDOW);
                 self.stuck_log.check(Instant::now());

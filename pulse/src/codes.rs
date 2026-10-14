@@ -4,11 +4,12 @@
 //! 的欄位相同：
 //!
 //! ```text
-//! 2026-10-13 14:22:16 [WARN] buffer.full PLS-W4202 本機緩衝已滿（待送 50000 筆…），丟掉最舊的資料…
+//! 2026-10-13T14:22:16.123+08:00 [WARN] buffer.full PLS-W4202 本機緩衝已滿（待送 50000 筆…），丟掉最舊的資料…
 //! ```
 //!
-//! 規則與搜尋只需要比對 `event` 與 `code`（固定、不翻譯），不依賴訊息文字。行首的時間與等級格式、
-//! `log.format = "json"` 等其餘 `log-ux.md` 的改版尚未實作（見 `ERROR-CODES.md`「待辦」）。
+//! 規則與搜尋只需要比對 `event` 與 `code`（固定、不翻譯），不依賴訊息文字。`log.format = "json"` 時
+//! 這兩欄是 JSON 的 `event`、`code`（由 `kp_obs::logfmt` 從訊息開頭取出）。重試摘要等其餘 `log-ux.md`
+//! 的改版見 `ERROR-CODES.md`「待辦」。
 //!
 //! `win_event_id` 為 Windows 事件記錄的事件識別碼（`log-ux.md` §4 的表）；Pulse 目前沒有寫入
 //! Windows 事件記錄（需要安裝程式註冊事件來源），先在這裡定案對照，供日後的事件記錄與測試使用。
@@ -247,6 +248,9 @@ pub const I_ISSUED: &str = "PLS-I3308";
 pub const E_PENDING_QUEUE_FULL: &str = "PLS-E3309";
 pub const W_WITHDRAW_UNREPORTED: &str = "PLS-W3310";
 pub const E_LICENSE_EXHAUSTED: &str = "PLS-E7101";
+pub const E_CONFIG_NOT_FOUND: &str = "PLS-E0401";
+pub const E_DIAG_FAILED: &str = "PLS-E4301";
+pub const W_DIAG_TRUNCATED: &str = "PLS-W4302";
 
 /// 程式中有常數的代碼（[`title`] 認得的代碼）；不認得時 `None`
 pub fn known(code: &str) -> Option<&'static str> {
@@ -342,6 +346,9 @@ const ALL_CODES: &[&str] = &[
     E_PENDING_QUEUE_FULL,
     W_WITHDRAW_UNREPORTED,
     E_LICENSE_EXHAUSTED,
+    E_CONFIG_NOT_FOUND,
+    E_DIAG_FAILED,
+    W_DIAG_TRUNCATED,
 ];
 
 /// 代碼的標題（`copywriting.md` §4.2 的範例標題；沒有範例的依 §3.3「情況」欄改寫）。
@@ -355,6 +362,9 @@ pub fn title(code: &str) -> Option<&'static str> {
         W_TLS_VERIFY_DISABLED => "已停用伺服器憑證驗證",
         W_BOTH_TRUST_STORES => "同時信任系統信任庫與私有 CA",
         E_CONFIG_UNREADABLE => "設定檔無法讀取",
+        E_CONFIG_NOT_FOUND => "指定的設定檔不存在",
+        E_DIAG_FAILED => "無法寫出診斷包",
+        W_DIAG_TRUNCATED => "診斷包內容已截斷",
         E_AGENT_ID_INVALID => "agent.id 內容不合法",
         E_AGENT_ID_IO => "agent.id 無法建立或讀取",
         E_LOG_INIT => "無法初始化日誌",
