@@ -158,6 +158,8 @@ pub struct EnrollService {
     last_hourly: Mutex<i64>,
     last_minutely: Mutex<i64>,
     last_crl_refresh: Mutex<HashMap<i64, i64>>,
+    /// 上次記錄 `KRS-W1304` 的時間（每 24 小時最多一次）
+    last_expiry_warning: Mutex<i64>,
 }
 
 /// 各層的限流狀態
@@ -312,6 +314,7 @@ impl EnrollService {
             last_hourly: Mutex::new(0),
             last_minutely: Mutex::new(0),
             last_crl_refresh: Mutex::new(HashMap::new()),
+            last_expiry_warning: Mutex::new(0),
         });
         // 簽發 CA、信任錨與 CRL：啟動時同步一次（8443 的 TLS 驗證器需要它們）
         svc.sync_pki(now, true);
@@ -679,6 +682,7 @@ impl EnrollService {
                 }
             }
             changed |= self.pki.write_crl_file(conn)?;
+            self.check_issuing_ca_expiry(conn, now);
             Ok(changed)
         });
         match result {
@@ -686,6 +690,53 @@ impl EnrollService {
             Ok(false) => {}
             Err(e) => warn!("無法同步簽發 CA 與 CRL（稍後重試）：{e}"),
         }
+    }
+
+    /// `KRS-W1304` 的門檻（毫秒）：設定值，或「政策有效天數（含有效 token 覆寫中最長者）＋過期寬限期」
+    pub fn issuing_ca_warning_ms(&self, conn: &Connection, now: i64) -> i64 {
+        if let Some(d) = self.config.pki.issuing_ca_warning_days {
+            return i64::from(d) * 86_400_000;
+        }
+        let eff = self.effective();
+        let longest_token = store::list_tokens(conn)
+            .map(|ts| {
+                ts.iter()
+                    .filter(|t| t.state(now) == store::TokenState::Active)
+                    .filter_map(|t| t.cert_lifetime_days)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let lifetime = i64::from(eff.policy.cert_lifetime_days).max(longest_token);
+        (lifetime + i64::from(eff.policy.expired_renew_grace_days)) * 86_400_000
+    }
+
+    /// 啟用中的簽發 CA 剩餘時間少於門檻時記 `KRS-W1304`（每 24 小時最多一次）；回傳 (ca_id, 到期時間)
+    fn check_issuing_ca_expiry(&self, conn: &Connection, now: i64) -> Option<(i64, i64)> {
+        let ca = crate::pki::store::list_cas(conn)
+            .ok()?
+            .into_iter()
+            .find(|c| c.state == crate::pki::store::CA_ACTIVE)?;
+        let not_after = ca.not_after?;
+        let threshold = self.issuing_ca_warning_ms(conn, now);
+        if not_after - now >= threshold {
+            return None;
+        }
+        let mut last = self
+            .last_expiry_warning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now - *last >= 86_400_000 {
+            *last = now;
+            warn!(
+                "警告 KRS-W1304：簽發 CA {} 將在 {} 到期（剩 {} 天，門檻 {} 天）：新簽發的憑證會被截短在簽發 CA 到期之前。處理方式：kairos pki issuing-ca new → 以根 CA 簽發 → install → activate（kairos/PKI.md 第 4 節）",
+                ca.ca_id,
+                crate::api::http::ts_ms(not_after),
+                (not_after - now).max(0) / 86_400_000,
+                threshold / 86_400_000
+            );
+        }
+        Some((ca.ca_id, not_after))
     }
 
     /// 重建 8443 的 TLS 設定（信任錨、CRL 改變），並重新驗證現役連線

@@ -3,11 +3,12 @@
 //!
 //! - 只有常駐行程讀取私鑰；CLI 不簽發（只把申請標為已核准，常駐行程在 2 秒內簽發）。
 //! - 私鑰檔或目錄的權限過寬、擁有者不是執行 Kairos 的帳號時**不使用**這把金鑰：線上簽發停用，
-//!   核准的申請停在「已核准，待簽發」，記 `ERROR` 與 `KRS-E1302`（不拒絕啟動：既有主機照常連線）。
+//!   核准的申請停在「已核准，待簽發」，記 `ERROR` 與 `KRS-E1303`（不拒絕啟動：既有主機照常連線）。
+//!   離線簽發模式（選擇的結果，不是錯誤）的代碼為 `KRS-E1302`；簽發 CA 即將到期為 `KRS-W1304`。
 //! - 一筆簽發＝產生序號 → 依範本簽章 → 單一交易寫入 `pki_certificates`、`enroll_requests`（`issued`）、
 //!   `hosts`（`current_serial`）、`audit_events`。交易失敗時憑證視同未簽發。
 
-use log::{error, info, warn};
+use log::{error, info};
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::json;
 use std::collections::HashMap;
@@ -63,6 +64,17 @@ pub fn load_server_ca(path: &str) -> Result<ServerCa, String> {
         spki: info.spki_der,
         der,
     })
+}
+
+impl IssueStatus {
+    /// `issuance_unavailable` 的產品代碼：離線簽發 `KRS-E1302`、線上但私鑰無法使用 `KRS-E1303`
+    pub fn product_code(&self) -> Option<&'static str> {
+        match self {
+            IssueStatus::Online { .. } => None,
+            IssueStatus::Offline => Some("KRS-E1302"),
+            IssueStatus::Unavailable(_) => Some("KRS-E1303"),
+        }
+    }
 }
 
 /// 簽發的結果
@@ -209,7 +221,7 @@ impl PkiManager {
                         .unwrap_or_else(|e| e.into_inner());
                     if logged.get(&ca.ca_id) != Some(&reason) {
                         error!(
-                            "錯誤 KRS-E1302：簽發 CA {} 的私鑰無法使用，不使用這把金鑰（{}）。線上簽發停用，核准的申請停在「已核准，待簽發」；既有主機照常連線。處理方式：chmod 600 {}、chmod 700 {}，擁有者為執行 Kairos 的帳號",
+                            "錯誤 KRS-E1303：簽發 CA {} 的私鑰無法使用，不使用這把金鑰（{}）。線上簽發停用，核准的申請停在「已核准，待簽發」；既有主機照常連線。處理方式：chmod 600 {}、chmod 700 {}，擁有者為執行 Kairos 的帳號",
                             ca.ca_id,
                             reason,
                             self.data_dir.join(key_file).display(),
@@ -238,7 +250,7 @@ impl PkiManager {
         if previous != status {
             match &status {
                 IssueStatus::Online { ca_id } => info!(
-                    "線上簽發已啟用：簽發 CA {}（私鑰在伺服器上，KRS-W1301：被入侵時可簽出任意 agent_id 的用戶端憑證；不願在線上持有 CA 私鑰時改用 pki.mode = \"offline\"）",
+                    "線上簽發已啟用：簽發 CA {}。警告 KRS-W1301：簽發 CA 私鑰存放在伺服器上（自動簽發的前提；被入侵時可簽出任意 agent_id 的用戶端憑證，但簽不出 Pulse 會信任的伺服器憑證）。不願在線上持有 CA 私鑰時改用 pki.mode = \"offline\"",
                     ca_id
                 ),
                 IssueStatus::Offline => {
@@ -246,7 +258,11 @@ impl PkiManager {
                         "離線簽發模式：Kairos 不持有 CA 私鑰，核准的申請以 kairos pki queue export／import 簽發"
                     )
                 }
-                IssueStatus::Unavailable(r) => warn!("線上簽發無法使用：{r}"),
+                IssueStatus::Unavailable(r) => {
+                    error!(
+                        "錯誤 KRS-E1303：線上簽發無法使用：{r}；核准的申請停在「已核准，待簽發」"
+                    )
+                }
             }
         }
         *self.issuers.write().unwrap_or_else(|e| e.into_inner()) = issuers;

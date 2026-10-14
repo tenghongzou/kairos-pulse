@@ -217,6 +217,9 @@ pub struct PkiSettings {
     pub crl_refresh_hours: u32,
     /// 簽發 CA 的組織名稱（subject `CN=<組織> Kairos Agent Issuing CA <ca_id>`）
     pub organization: String,
+    /// 簽發 CA 剩餘天數少於此值時記 `KRS-W1304`（需要輪替）。未設定時為「憑證政策的有效天數（含有效
+    /// token 覆寫中最長者）＋過期寬限期」（預設 455 天；設計包 INTEGRATION §27.4 #5）
+    pub issuing_ca_warning_days: Option<u32>,
     pub policy: CertPolicySettings,
 }
 
@@ -228,6 +231,7 @@ impl Default for PkiSettings {
             crl_validity_days: 30,
             crl_refresh_hours: 24,
             organization: "Kairos".to_string(),
+            issuing_ca_warning_days: None,
             policy: CertPolicySettings::default(),
         }
     }

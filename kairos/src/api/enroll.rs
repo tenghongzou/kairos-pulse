@@ -818,8 +818,8 @@ fn mode_view(svc: &EnrollService) -> Value {
         "pki_mode": svc.pki.mode().as_str(),
         "issuance": match svc.pki.status() {
             IssueStatus::Online { ca_id } => json!({"status": "online", "ca_id": ca_id}),
-            IssueStatus::Offline => json!({"status": "offline"}),
-            IssueStatus::Unavailable(r) => json!({"status": "unavailable", "reason": r, "product_code": "KRS-E1302"}),
+            IssueStatus::Offline => json!({"status": "offline", "product_code": "KRS-E1302"}),
+            IssueStatus::Unavailable(r) => json!({"status": "unavailable", "reason": r, "product_code": "KRS-E1303"}),
         },
         "sources": eff.sources_json(),
         "stats": {
@@ -1269,16 +1269,18 @@ async fn get_ca(
     svc: &Arc<EnrollService>,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
-    let cas = svc
+    let s2 = svc.clone();
+    let now_ms = now.timestamp_millis();
+    let (cas, threshold) = svc
         .db
-        .read(|conn| {
+        .read(move |conn| {
             let cas = ps::list_cas(conn)?;
             let mut out = Vec::new();
             for c in cas {
                 let n = ps::issued_count_by_ca(conn, c.ca_id)?;
                 out.push((c, n));
             }
-            Ok(out)
+            Ok((out, s2.issuing_ca_warning_ms(conn, now_ms)))
         })
         .await
         .map_err(db_error)?;
@@ -1287,6 +1289,7 @@ async fn get_ca(
         "pki_mode": svc.pki.mode().as_str(),
         "server_ca": server_ca.map(|c| json!({"ca_pin": c.pin, "path": svc.config.pki.server_ca_path})),
         "client_ca_file": svc.config.auth.client_ca_path(),
+        "expiry_warning_days": threshold / 86_400_000,
         "issuing_cas": cas.iter().map(|(c, n)| json!({
             "ca_id": c.ca_id,
             "subject": c.subject,
@@ -1295,6 +1298,8 @@ async fn get_ca(
             "not_after": c.not_after.map(ts_ms),
             "key": if c.key_file.is_some() { "on_server" } else { "offline" },
             "issued_count": n,
+            "expiry_warning": (c.state == ps::CA_ACTIVE && c.not_after.is_some_and(|t| t - now_ms < threshold))
+                .then_some("KRS-W1304"),
             "created_at": ts_ms(c.created_at),
             "retired_at": c.retired_at.map(ts_ms),
         })).collect::<Vec<_>>(),
@@ -1340,7 +1345,7 @@ async fn regenerate_crl(w: &Writer<'_>, now: DateTime<Utc>) -> Result<Response<A
             "issuance_unavailable",
             "線上簽發不可用（離線模式或私鑰無法使用），無法產生 CRL",
         )
-        .with_product_code("KRS-E1302"));
+        .with_product_code(w.svc.pki.status().product_code().unwrap_or("KRS-E1303")));
     }
     let svc = w.svc.clone();
     let actor = w.actor.to_string();
@@ -1429,7 +1434,7 @@ async fn import_queue(
                 Ok(serial) => {
                     json!({"request_id": r.request_id, "result": "issued", "serial": serial})
                 }
-                Err(e) => json!({"request_id": r.request_id, "result": "rejected", "reason": e}),
+                Err(e) => json!({"request_id": r.request_id, "result": "rejected", "reason": e, "product_code": "KRS-E1305"}),
             }
         })
         .collect();

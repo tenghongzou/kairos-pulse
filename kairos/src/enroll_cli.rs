@@ -1128,8 +1128,12 @@ fn read_file(path: &str) -> Result<String, Failure> {
     })
 }
 
+/// 匯入的憑證（簽發 CA、離線簽發的用戶端憑證）未通過檢查：`KRS-E1305`
 fn cert_fail(msg: impl Into<String>) -> Failure {
-    Failure::new("憑證檢查不通過", msg, Vec::new(), EXIT_CERT)
+    Failure {
+        code: Some("KRS-E1305"),
+        ..Failure::new("匯入的憑證未通過檢查", msg, Vec::new(), EXIT_CERT)
+    }
 }
 
 fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
