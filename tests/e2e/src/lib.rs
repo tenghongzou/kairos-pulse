@@ -916,6 +916,26 @@ fn api_connect(port: u16) -> rustls::StreamOwned<rustls::ClientConnection, std::
     rustls::StreamOwned::new(conn, tcp)
 }
 
+/// 送出一個完整的 HTTP/1.0 請求（含標頭與本文）到主控台；回傳狀態碼、標頭與本文
+pub fn api_raw(port: u16, request: &str) -> (u16, String, String) {
+    use std::io::{Read as _, Write as _};
+    let mut s = api_connect(port);
+    s.write_all(request.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("回應沒有標頭：{text}"));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, head.to_string(), body.to_string())
+}
+
 /// 主控台 API 的用戶端（每個請求一條 HTTP/1.0 連線）
 pub struct Api {
     pub port: u16,
