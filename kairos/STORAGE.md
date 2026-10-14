@@ -49,7 +49,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 
 Kairos 執行中把 `kairos.db` 刪除或替換時（Unix 上以裝置與 inode 比對，與 JSONL 的 `needs_reopen` 相同），下一批寫入前記 `WARN` 並建立新的資料庫，不會寫進已刪除的檔案後回 `ack`；記憶體中尚未寫出的彙總一併捨棄。
 
-## 3. Schema（v4）
+## 3. Schema（v5）
 
 `PRAGMA application_id = 0x4B525331`（「KRS1」），`PRAGMA user_version` 為 schema 版本。時間一律為 Unix 毫秒（彙總的 `bucket` 為 Unix 秒），UTC。
 
@@ -170,6 +170,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - 新增欄位或資料表時加一個遷移，不修改既有遷移的內容。**升級 Kairos 前先備份**（第 9 節）：遷移後的資料庫無法給舊版使用。
 - 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）、v3（0.4：`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`，主控台 API 使用）。`kairos reports import`、`kairos api-token` 開啟資料庫時同樣會升級 schema；升級到 v3 之後 0.3 的 Kairos 無法開啟（降版請從升級前的備份還原）。
 - v4（0.5.0〔草稿〕，衝刺 4）：註冊通道與 PKI 的資料表 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，以及 `hosts` 的 `lifecycle`、`decommissioned_at`、`decommissioned_by`、`current_serial`、`grace_override_until`、`expired_seen_at`、`last_grace_attempt` 與索引 `hosts_hostname`。完整的 SQL 與保存期限見 [`PKI.md`](PKI.md) 第 7、13 節（`store/sqlite.rs` 的 `SCHEMA_V4`）。升級到 v4 之後 0.4 的 Kairos 無法開啟；`kairos enroll-token`、`kairos enroll`、`kairos pki`、`kairos config` 開啟資料庫時同樣會升級 schema。
+- v5（0.6.0〔草稿〕，衝刺 5）：告警引擎的資料表 `alert_rules`（規則）、`alert_events`（事件，含彙總的 `parent_id`、處理狀態與通知進度 `notify_state`）、`alert_timeline`（處理紀錄）、`alert_silences`（靜音與維護時段）、`alert_channels`（通知管道；`secrets` 為 AES-256-GCM 密文）、`alert_deliveries`（發送紀錄）、`alert_actions`（CLI 交給執行中的 Kairos 處理的動作）與索引；`meta` 另有 `alerts_config_rev`（規則、靜音、管道的版本）與 `alerts_heartbeat`（停機期間的判斷）。完整的 SQL 見 `store/sqlite.rs` 的 `SCHEMA_V5`，欄位說明見 [`ALERTS.md`](ALERTS.md)。升級到 v5 之後 0.5 的 Kairos 無法開啟；`kairos alerts`、`kairos silences`、`kairos alert-rules`、`kairos alert-channels` 開啟資料庫時同樣會升級 schema。〔整合注意：使用者與角色的線（`sprint5/auth`）使用 v6，合併時兩邊的遷移依序排列即可（都只新增資料表與欄位）。〕
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -315,6 +316,19 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 - 結束：`INFO`「KRS-W4202 結束：SQLite 資料庫已降到 … bytes（上限 … bytes），停止刪除；這一輪刪除原始 report N 筆、5 分鐘彙總 M 列、1 小時彙總 L 列」；
 - 沒有東西可刪：`WARN`（節流）「警告 KRS-W4202：…已沒有原始 report 或彙總可刪除…；請調高上限」；
 - 開始與結束都寫入 `meta.capacity_event`（JSON：`started_at`、`ended_at`、`used_bytes`、`limit_bytes`、各層刪除的列數、`exhausted`），主控台的系統健康（`/api/v1/system/health` 的 `database`）以它顯示「最近一次容量刪除」，正在刪除或最近 24 小時內刪除過時為警告。
+
+### 8.3 告警歷史
+
+告警的資料表不受上面的容量刪除影響（它們的大小另有上限），由告警引擎每小時清除一次，每步最多 2,000 個事件：
+
+| 資料 | 設定 | 預設 |
+|---|---|---|
+| 已解決的事件（與其處理紀錄、發送紀錄） | `alerts.retention_days` | 400 天（依結案時間） |
+| 事件總數上限（超過時刪除最舊的已解決事件） | `alerts.max_events` | 100,000 |
+| 沒有事件的發送紀錄（測試通知、靜音結束的彙整等） | — | 30 天（不超過 `alerts.retention_days`） |
+| 已結束的靜音、處理過的 CLI 動作 | `alerts.retention_days`、7 天 | |
+
+未解決的事件不會被刪除。估算：一個事件約 1～2 KB（含處理紀錄與發送紀錄），10 萬個事件約 100～200 MB；請在 `storage.max_total_bytes` 之外預留這個空間（容量刪除只刪 report 與彙總）。
 
 注意：
 

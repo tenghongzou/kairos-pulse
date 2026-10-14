@@ -49,6 +49,36 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.5.0 之後的變更記在這裡。）
 
+## [0.6.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.6.0**：衝刺 5「告警引擎」（審計 F3；設計包 `kairos/alerts-ux.md`、`screens.md` S06～S11 與 §24 #2、#8、#9）。**版本號尚未改**（`kairos/Cargo.toml` 仍為 0.5.0），發佈時依 RELEASING.md 改為 0.6.0、填上日期並移除〔草稿〕標記。Pulse 與協定沒有變更。規格：[`kairos/ALERTS.md`](kairos/ALERTS.md)、`kairos/API.md` 第 12 節、`kairos/STORAGE.md` 第 3、8.3 節。
+
+### 破壞性變更與升級步驟
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **資料庫升級到 schema v5**：新增 `alert_rules`、`alert_events`、`alert_timeline`、`alert_silences`、`alert_channels`、`alert_deliveries`、`alert_actions` | 所有 SQLite 部署 | 升級前 `kairos db backup`；升級後 0.5 無法開啟資料庫（降版從備份還原）。`kairos alerts`、`silences`、`alert-rules`、`alert-channels` 開啟資料庫時同樣會升級 schema |
+| 2 | Kairos | **告警引擎預設啟用**（`[alerts] enabled = true`），第一次啟動時建立 30 條系統預設規則；**沒有任何通知管道**，事件只出現在主控台與 `kairos alerts list` | 所有 SQLite 部署 | 不需要時 `[alerts] enabled = false`。需要通知時以主控台 API 新增管道（`POST /api/v1/channels`，admin 範圍）並綁到規則 |
+| 3 | Kairos | 資料目錄多了 **`alerts-secrets.key`**（0600；通知管道機密的加密金鑰） | 備份資料目錄的部署 | `kairos db backup` 的備份只有密文：還原到新主機時一起複製金鑰檔，否則需重新輸入管道的機密 |
+| 4 | Kairos | 主機 API 的 `offline_reason` 多了 `write_unknown`（report 寫入結果未知，Kairos 關閉了連線） | 依 `offline_reason` 判斷的整合 | 只新增值；讀取端應忽略不認得的值 |
+
+### 新增
+
+- **事件匯流排**（`kairos/src/bus.rs`）：狀態表（上線、離線含原因分類、被取代）、連線（身分驗證失敗、狀態表淘汰、自行除役）、TLS 重載、系統檢查的狀態變化以結構化事件發布（設計包 §24 #2、#8 的事件部分；之後的 `/metrics`、稽核外送可以訂閱）。斷線原因分類：`idle_timeout`、`agent_closed`、`certificate_rejected`、`server_shutdown`、`write_unknown`（另以事件發布 `auth_failed`、`superseded`）。
+- **告警引擎**（`kairos/src/alerts/`）：四級嚴重度（D3）與處理類型（需要處理／規劃提醒／紀錄）；準位觸發的判定、去重、10 分鐘內重新開啟、抖動偵測；觸發 → 確認 → 恢復 → 解決的生命週期（未確認 24 小時、已確認 7 天自動結案，緊急不自動結案）；關聯彙總（系統事件 → 網段／大規模離線／重新啟動後未恢復 → 主機事件，子事件不通知、90% 恢復時父事件恢復並讓其餘子事件脫離）；告警暖機期與停機事件；30 條系統預設規則（CRL、伺服器憑證、回報無法寫入、容量、保留暫停、狀態表、連線上限、每 IP 上限、註冊端點、TLS 重載、未認證、管道失敗…）與使用者規則（主機離線、長期失聯、回報延遲、CPU／記憶體門檻含恢復門檻、身分衝突）；靜音與維護時段（範圍同欄位「或」、跨欄位「且」並提供符合台數，D23；臨時靜音上限 7 天／系統規則 24 小時／緊急 4 小時取最短、伺服器端驗證，D26；維護時段不抑制系統事件；結束時仍有異常送一則彙整）；規則的歷史試算（5 分鐘彙總重播）。
+- **通知**：Email（SMTP，STARTTLS／TLS、AUTH PLAIN／LOGIN、私有 CA）與 Webhook（Kairos JSON `kairos.alert.v1`＋HMAC-SHA256 簽章、Slack 類、Teams Adaptive Card、LINE Messaging API）；依嚴重度的重送與升級、每管道 30 秒的速率與「另有 N 則」合併、緊急不排隊、重試與退避（依 `Retry-After`）、15 分鐘放棄、連續 3 次失敗 → `KRS-E5107` 並改經其他管道、恢復後一則彙整；機密以 AES-256-GCM 加密保存，API、CLI、日誌、稽核只有遮蔽值。純 Rust，沒有新增 crate（hyper 啟用 `client` feature，帶入 `want`、`try-lock`）。
+- **主控台 API**（`/api/v1/alerts`、`/alert-rules`、`/silences`、`/channels`）與 SSE 的 `alert.created`／`alert.updated`／`alert.resolved`；每個端點的權限集中在一張表（`alerts:read`、`alerts:write`、`alert-rules:admin`、`channels:write`…），之後的 RBAC 直接對應。寫入都記在 `audit_events`（類別 `alerts`）。
+- **CLI**：`kairos alerts list|show|ack|resolve|comment`、`kairos silences list|create|end`、`kairos alert-rules list|enable|disable`、`kairos alert-channels list`。
+- **設定** `[alerts]`：`enabled`、`console_url`、`timezone`、`warmup_secs`、`retention_days`、`max_events`、`subnet_prefix_v4`、`subnet_prefix_v6`。告警歷史依保留天數與筆數上限清除（STORAGE.md 第 8.3 節）。
+
+### 暫定代碼
+
+`KRS-E5109`（SMTP 伺服器拒絕寄件者、收件者或內容）、`KRS-E5110`（通知管道的設定無效）：設計包沒有對應的代碼，待分配後更換（ALERTS.md 第 10 節）。
+
+### 未做
+
+週期性維護時段、警告的每日彙整、個人勿擾與個人通知（需要使用者模型）、資料磁碟空間、JSONL 資料檔將滿、CRL 自動更新失敗、agent 憑證與寬限期的到期提醒、過期續簽已暫停、連線容量規劃不足、授權、稽核日誌完整性等系統規則，主機狀態 `critical`／`warning` 依告警判定，主機離線類規則的歷史試算（ALERTS.md 第 10 節）。
+
 ## [0.5.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.5.0、Pulse 0.5.0**：衝刺 4「註冊通道 8444」。Kairos 新增註冊通道（8444 HTTPS）、自動簽發的 PKI（線上簽發 CA、CRL）與管理 API／CLI；Pulse 新增 `pulse enroll`、`pulse decommission`、過期寬限期續簽與 8443 的自動輪替。**協定版本不變**（仍為 v1～v2），8443 以新的 feature `renew`、`deregister` 協商，只在雙方都宣告時使用：0.4 的 Kairos 與 Pulse 不受影響，兩個產品可以分批升級（建議順序見下）。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.5.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。規格：`crates/kairos-proto/ENROLL.md`（8444）、`crates/kairos-proto/PROTOCOL.md`「憑證輪替與除役」（8443）、`kairos/PKI.md`、`kairos/API.md` 第 11 節。

@@ -2,7 +2,7 @@
 
 本文件是 Kairos 主控台與外部整合使用的查詢與管理 API 的規格（商業審計 F1；設計包 `kairos/screens.md` §24 #1、#3、#4、#5、#19 的後端部分）。0.4.0〔草稿〕起提供第一版：**唯讀**的主機清冊、單台詳情、指標趨勢、總覽 KPI、系統健康與即時變更推送（SSE），以 API token 驗證。使用者、角色與工作階段（#10、F6）屬於之後的版本，本版預留了接入的位置（第 4.4 節）。
 
-- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節。
+- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0〔草稿〕的告警（事件、規則、靜音、通知管道）見第 12 節。
 - 實作：`kairos/src/api/`（HTTP 伺服器、驗證、各端點）、`kairos/src/token_cli.rs`（`kairos api-token`）。
 - 量測（1 萬台主機的列表、30 天趨勢、與 report 寫入同時進行時的 `ack` 延遲）見第 9 節：列表 p99 約 10 ms、30 天趨勢 p99 約 8～13 ms（目標 200／300 ms）。
 
@@ -190,7 +190,8 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `GET /api/v1/hosts/{agent_id}/metrics/{name}` | S05 趨勢、S03 sparkline | 指標趨勢（第 5.3 節） |
 | `GET /api/v1/overview` | S03 總覽 | 各狀態台數、上線數 24 小時、離線最久、資源使用前 10（第 5.4 節） |
 | `GET /api/v1/system/health` | S20 系統健康、S03 健康條 | 檢查項目與數值（第 5.5 節） |
-| `GET /api/v1/events` | S04「有 12 台狀態變化」、S03 自動更新 | 即時變更推送（SSE，第 6 節） |
+| `GET /api/v1/events` | S04「有 12 台狀態變化」、S03 自動更新、S06 | 即時變更推送（SSE，第 6 節；告警的 `alert.*` 見第 12.6 節） |
+| `/api/v1/alerts…`、`/alert-rules…`、`/silences…`、`/channels…` | S06～S11 | 告警（第 12 節） |
 
 ### 5.0 `GET /api/v1/me`
 
@@ -311,7 +312,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
   - **只歸屬由信任的 CA 簽發的憑證**：已撤銷、無法判定撤銷狀態（兩者都在憑證鏈驗證之後才檢查），以及已過期但以效期的最後一秒重新驗證可以通過的。自簽或不受信任的 CA 簽發的憑證（`KRS-W1109`）**不歸屬**：SAN 由出示者自己決定，否則任何人都能讓別台主機顯示「憑證被拒」，或以大量假的 `agent_id` 填滿紀錄。
   - 記錄在記憶體中（最多 1 萬台），每 10 秒寫入主機清冊（`hosts.cert_rejected_at`、`cert_rejection`），重新啟動後仍在。清冊中沒有的 `agent_id`（例如已清除的主機）只留在記憶體中。
   - 連線中被踢掉（熱重載後重新驗證失敗，例如撤銷後 1 個重載週期內）的離線原因同樣是 `certificate_rejected`。
-- `offline_reason`（第 5.1 節）：`timeout`（超過離線門檻沒有合法訊息）、`connection_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）。只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
+- `offline_reason`（第 5.1 節）：`timeout`（超過離線門檻沒有合法訊息）、`connection_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。告警與 Webhook 使用另一組固定代碼（`idle_timeout`、`agent_closed`…，[`ALERTS.md`](ALERTS.md) 第 2 節）。只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
 - 404 `host_not_found`：清冊中沒有、狀態表中也沒有。
 
 `GET /api/v1/hosts/{agent_id}/metrics` 回傳這台主機最近一次 report 中的指標（v1 的三欄位 report 對應到 `system.cpu.usage`、`system.memory.total`、`system.memory.used`）：
@@ -428,7 +429,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 
 - **日誌**：開始時 `WARN`「警告 KRS-W4202：資料庫已達容量上限，正在提早刪除最舊的資料（已使用 … bytes，上限 storage.max_total_bytes = … bytes）…」；結束時 `INFO`「KRS-W4202 結束：…這一輪刪除原始 report N 筆、5 分鐘彙總 M 列、1 小時彙總 L 列」，文字依設計包 `copywriting.md` §4.2 範例 68。沒有東西可刪時另記 `WARN`（節流）。
 - **事件紀錄**：開始與結束寫入資料庫 `meta.capacity_event`（JSON：`started_at`、`ended_at`、`used_bytes`、`limit_bytes`、各層刪除的筆數），重新啟動後仍可在系統健康查到最近一次。
-- **系統健康**：`database` 項目為警告並帶 `KRS-W4202`（第 5.5 節）。告警事件（S06）需要告警引擎（F3），屬於之後的版本。
+- **系統健康**：`database` 項目為警告並帶 `KRS-W4202`（第 5.5 節）。0.6.0 起另有告警事件（系統規則 `sys.db_capacity`，第 12 節）。
 
 ## 6. 即時變更推送（SSE）
 
@@ -459,6 +460,7 @@ data: {"agent_id":"6f1c…","hostname":"hmi-line3-07","display_name":null,"statu
 | `host.added` | 清冊中沒有的主機第一次上線（新主機） | 同下，`status` 為 `online` |
 | `host.online` | 上線、重新上線、離線後恢復 | `agent_id`、`hostname`、`display_name`、`status`、`at`、`ip` |
 | `host.offline` | 離線 | 同上，另有 `reason`（第 5.2 節的 `offline_reason`） |
+| `alert.created`、`alert.updated`、`alert.resolved` | 告警事件的變化（0.6.0，第 12.6 節） | 事件的摘要 |
 | `resync` | 要求重新抓取列表（見下） | `reason`：`restarted`（Kairos 重新啟動過）、`too_old`（`Last-Event-ID` 已不在保留範圍）、`overflow`（連線太慢、事件來不及送出） |
 | 心跳 | 每 15 秒一行註解（`: heartbeat <時間>`） | 讓代理伺服器與用戶端偵測斷線；不是事件，不改變 `Last-Event-ID` |
 
@@ -560,7 +562,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | 項目 | 原因 |
 |---|---|
 | 首次啟動精靈（設計包 S02、#14） | 本衝刺範圍外；`console.listen` 預設只綁 127.0.0.1:9443，管理者手動改為對外位址 |
-| `KRS-W4202` 的告警事件（S06） | 需要告警引擎（F3）；本版有日誌、`meta.capacity_event` 與系統健康 |
+| `KRS-W4202` 的告警事件（S06） | 0.6.0 已加入（告警引擎的系統規則 `sys.db_capacity`，第 12 節） |
 | 啟動時的容量警告改用宣告的 report 間隔（§24 #19、§25.5 #4） | 系統健康已以目前回報中的主機與各自宣告的間隔估算（`database.values.estimate`）；啟動時的 `WARN` 仍以 `server.max_connections` 的最壞情況估算，與設計包的精靈、S21 一起調整 |
 | 握手時被拒、但 SAN 不可信（自簽、不受信任的 CA）的連線 | 只記日誌（`KRS-W1109`），不歸屬到主機（第 5.2 節）；設計包「被拒連線嘗試」以來源 IP 呈現時再加入 |
 | 稽核雜湊鏈（#11） | token 的建立與撤銷目前記在 `api_tokens` 與 Kairos 的日誌 |
@@ -766,3 +768,103 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 - `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes]`。
 - `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
 - 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
+
+## 12. 衝刺 5：告警（草稿）
+
+0.6.0〔草稿〕，**已實作**（`kairos/src/api/alerts.rs`；引擎見 [`ALERTS.md`](ALERTS.md)）。設計包 S06～S11、§24 #9。需要告警引擎（`[alerts] enabled = true`、SQLite），沒有啟動時所有端點回 503 `alerts_unavailable`。
+
+### 12.1 權限（集中標記）
+
+每個端點需要的 `Permission` 只在 `api/alerts.rs` 的 `route` 一處決定；權限不足的 403 另帶 `details.permission`（例 `alerts:write`）。之後的使用者與角色（`sprint5/auth`）只要把角色對應到下列權限：
+
+| `Permission`（名稱） | 範圍 | 端點 |
+|---|---|---|
+| `AlertsRead`（`alerts:read`） | `read` | `GET /alerts`、`/alerts/summary`、`/alerts/{event_id}` |
+| `AlertsWrite`（`alerts:write`） | `operate` | `POST /alerts/ack`、`/alerts/{event_id}/ack`、`assign`、`snooze`、`resolve`、`comments` |
+| `AlertRulesRead`（`alert-rules:read`） | `read` | `GET /alert-rules`、`/alert-rules/{rule_id}`、`POST /alert-rules/preview` |
+| `AlertRulesWrite`（`alert-rules:write`） | `operate` | `POST /alert-rules`、`PUT /alert-rules/{rule_id}`、`enable`、`disable`、`DELETE /alert-rules/{rule_id}` |
+| `AlertRulesAdmin`（`alert-rules:admin`） | `admin` | `PUT /alert-rules/{rule_id}` 修改**系統預設規則**的 `params`（S09：只有管理員） |
+| `SilencesRead`（`silences:read`） | `read` | `GET /silences`、`/silences/{silence_id}`、`POST /silences/preview` |
+| `SilencesWrite`（`silences:write`） | `operate` | `POST /silences`、`PUT /silences/{silence_id}`、`POST /silences/{silence_id}/end` |
+| `ChannelsRead`（`channels:read`） | `operate` | `GET /channels`、`/channels/{channel_id}`（S11：稽核員與唯讀看不到） |
+| `ChannelsTest`（`channels:test`） | `operate` | `POST /channels/{channel_id}/test` |
+| `ChannelsWrite`（`channels:write`） | `admin` | `POST /channels`、`POST /channels/test`（未儲存的設定）、`PUT`、`DELETE /channels/{channel_id}` |
+
+寫入的本文為 JSON（上限 256 KiB）；每個寫入都寫入 `audit_events`（類別 `alerts`，例 `alert.ack`、`silence.create`、`channel.update`），**不記錄機密的值**（管道只記更換了哪些機密欄位）。危險操作：停用系統預設規則需要 `reason`（L1）；刪除管道為 L2（`confirm_name` 等於管道名稱，有規則使用時另需 `replacement_channel_id` 或 `accept_no_channel: true`）；大範圍與包含緊急等級的靜音由主控台以 `preview` 的 `confirm` 決定是否顯示 L1 確認（伺服器不要求額外欄位，與第 11.1 節的 L1 相同）。
+
+新增的錯誤碼：
+
+| HTTP | `code` | `product_code` | 何時 |
+|---|---|---|---|
+| 400 | `rule_invalid` | `KRS-E5001` | 規則無法儲存（`details.parameter`；例：恢復門檻在觸發門檻的另一側、緊急等級沒有升級對象、系統規則的嚴重度低於預設） |
+| 400 | `silence_too_long` | — | 臨時靜音超過上限（`details.max_secs`、`requested_secs`、`system`、`emergency`；D26，伺服器端驗證） |
+| 400 | `channel_invalid` | `KRS-E5110`〔暫定〕 | 管道的設定無效（`details.parameter`） |
+| 400 | `confirmation_required` | — | 停用系統預設規則沒有 `reason`；刪除管道沒有確認（`details.rules` 為受影響的規則） |
+| 404 | `event_not_found`、`rule_not_found`、`silence_not_found`、`channel_not_found` | — | 對象不存在 |
+| 409 | `invalid_state` | — | 事件已解決（只能新增註解）、已結束的靜音不能修改 |
+| 409 | `not_acknowledgeable` | — | 規劃提醒與紀錄不需要確認、暫停通知、解決（`alerts-ux.md` §2.3） |
+| 409 | `builtin_rule` | — | 系統預設規則不可刪除 |
+| 503 | `alerts_unavailable` | — | 告警引擎沒有啟動 |
+
+### 12.2 事件（S06、S07）
+
+```
+GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
+```
+
+| 參數 | 說明 |
+|---|---|
+| `view` | `active`（預設：觸發中＋已確認，需要處理）、`needs_me`（未確認的觸發中，加上已恢復但未確認的緊急事件）、`recovered`（已恢復待結案）、`all`（含規劃提醒與紀錄、已解決） |
+| `severity`、`state`、`category`、`rule` | 逗號分隔，同一參數取「或」、不同參數取「且」 |
+| `agent_id`、`q`（事件編號、標題、對象）、`from`、`to`（RFC 3339，開始時間） | |
+| `include_children` | 預設只列頂層（彙總事件的子事件只在詳情列出） |
+| `limit`、`cursor` | 第 3 節；排序固定為嚴重度 → 未確認優先 → 開始時間由新到舊 |
+
+每個事件：`event_id`、`rule_id`、`kind`、`category`、`severity`、`attention`（`action`／`advisory`／`record`）、`attention_text`、`state`、`acked`、`title`、`subject`、`agent_id`、`code`、`parent_id`、`silenced`、`in_maintenance`、`flapping`、`started_at`、`updated_at`、`recovered_at`、`resolved_at`、`acked_at`、`acked_by`、`assignee`、`eta_at`、`root_cause`、`root_cause_label`、`resolve_note`、`snooze_until`、`occurrences`、`reopen_count`、`details`（主機名稱、IP、網段、中斷原因、數值等）、`notifications`（`sent`、`last_sent_at`、`escalated`）。`meta.counts`：`active`、`active_by_severity`、`unacknowledged`、`badge`（SideNav 徽章：觸發中、需要處理、頂層、未靜音）、`needs_me`、`recovered`、`silenced`；`meta.engine`：`running`、`last_tick_at`、`last_tick_duration_ms`、`warmup`（`active`、`until`、`expected_hosts`、`missing_hosts`）、`bus_dropped`、`last_error`（S06「告警引擎未在執行」）。
+
+`GET /api/v1/alerts/summary`：`counts`、`silences`（`active` 個數、`hosts` 以主機為範圍的靜音涵蓋的台數，S06「目前有 2 個靜音規則生效，影響 301 台主機」）、`engine`。
+
+`GET /api/v1/alerts/{event_id}`：另有 `timeline`（處理紀錄：`fired`、`notified`、`acknowledged`、`assigned`、`snoozed`、`commented`、`recovered`、`reopened`、`escalated`、`absorbed`、`detached`、`flapping`、`stable`、`eta_expired`、`resolved`）、`children`（`total`、最多 100 筆）、`parent`（`banner`：「此事件由系統事件『…』造成，請先處理該事件」）、`deliveries`（通知發送狀態：管道、種類、`state`〔`pending`／`held`／`sent`／`failed`／`dropped`／`merged`〕、`attempts`、`response_code`、`error_code`、`error`）、`rule`、`actions`（目前可做的動作）、`link`。
+
+| 方法與路徑 | 本文 | 說明 |
+|---|---|---|
+| `POST /alerts/{id}/ack` | `assign_to_me`、`eta_minutes`（1～1440） | 確認（重複確認不是錯誤） |
+| `POST /alerts/ack` | `event_ids`（1～1,000） | 批次確認：`results[]`、`summary`（`acknowledged`、`skipped`〔規劃提醒與紀錄〕、`failed`）、`message`（「已略過 N 筆不需要確認的事件」） |
+| `POST /alerts/{id}/assign` | `assignee` | 指派（不視為確認） |
+| `POST /alerts/{id}/snooze` | `hours`（1～24） | 暫停通知（只停止這個事件的重送） |
+| `POST /alerts/{id}/resolve` | `root_cause`（必填）、`note` | 解決；回 `detached_children`（脫離成為獨立事件的子事件數） |
+| `POST /alerts/{id}/comments` | `text`（1～2000） | 新增註解（已解決的事件也可以） |
+
+### 12.3 規則（S08、S09）
+
+`GET /api/v1/alert-rules`（篩選 `kind`、`category`、`severity`、`enabled`）：每條規則另有 `max_severity`（依天數升級者為最高等級）、`attention`、`scope_text`、`notify_effective`（套用嚴重度預設後的重送、恢復、升級）、`fires_7d`、`noise_7d`（7 天內 10 分鐘內自行恢復且未確認的比例）、`noisy`（> 50% 且至少 5 次）。
+
+`POST /api/v1/alert-rules`：`kind`（`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`、`identity_conflict`）、`name`、`severity`、`params`（`metric_threshold`：`metric`〔`cpu`／`memory`〕、`op`、`threshold`〔0～100〕、`for_secs`、`clear_threshold`、`clear_for_secs`）、`scope`（`tags`、`subnets`、`hosts`）、`channels`、`notify`（`repeat_interval_secs`、`repeat_max`、`notify_recovery`、`escalate_after_secs`、`escalate_channels`）、`description`、`enabled`。回 201。
+
+`PUT /api/v1/alert-rules/{rule_id}`：自訂規則可以修改所有欄位（種類除外）；系統預設規則可以修改 `channels`、`notify`、`description`、`severity`（系統類不可低於預設），`params` 只能改預設中已有的數值且需要 `alert-rules:admin`。
+
+`POST /api/v1/alert-rules/preview`（歷史試算，S09「以過去 7 天的資料試算」）：本文為 `rule_id` 或未儲存的 `kind`／`params`／`scope`，另有 `days`（1～31，預設 7）。回 `fires`、`hosts_involved`、`self_recovered_within_10m`、`noise_ratio`、`noisy`、`suggestion`（雜訊偏高時建議的持續時間與試算次數）、`per_day[]`、`examples[]`、`data_days`、`resolution_secs`（5 分鐘彙總；範圍超過 2,000 台時 1 小時）、`approximate: true`、`notes[]`。主機離線類規則回 `supported: false`（沒有連線歷史）。
+
+### 12.4 靜音與維護時段（S10）
+
+`POST /api/v1/silences/preview`：本文 `kind`、`scope`、`rules`、`from_event`。回 `matching_hosts`（使用中的主機）、`scope_text`（「範圍：標籤為 產線，且網段為 10.20.3.0/24 或 10.30.3.0/24」）、`rules_text`、`limit`（`max_secs`、`max_text`、`system`、`emergency`、`reason`：快捷時長下方的說明）、`confirm`（`required`、`reasons[]`）。
+
+`POST /api/v1/silences`：`kind`（`silence`／`maintenance`）、`name`、`reason`（必填）、`scope`、`rules`（不選＝所有規則）、`starts_at`（預設現在）、`ends_at` 或 `duration_secs`、`notify_on_end`（預設 true）、`exclude_uptime`、`from_event`。超過上限回 400 `silence_too_long`。`PUT` 修改尚未結束的靜音（重新驗證上限）；`POST /silences/{id}/end`（`reason`）提前結束。`GET /api/v1/silences?status=active|upcoming|ended|all`：每筆另有 `status`、`scope_text`、`scope_short`、`matching_hosts`、`remaining_secs`。
+
+### 12.5 通知管道（S11）
+
+`POST /api/v1/channels`：`name`、`kind`（`email`／`webhook`）、`enabled`、`config`（不含機密）、`secrets`（機密）。
+
+| `kind` | `config` | `secrets` |
+|---|---|---|
+| `email` | `host`、`port`、`security`（`starttls`／`tls`／`none`）、`username`、`from`、`to[]`（1～50）、`helo` | `password` |
+| `webhook` | `format`（`kairos`／`slack`／`teams`／`line`）、`method`（`POST`／`PUT`）、`allow_http`、`line_to` | `url`、`headers`（物件）、`hmac_secret`、`line_token` |
+| 共用 | `timeout_secs`（1～60，預設 10）、`timezone`、`show_ip`（`full`／`subnet`／`none`）、`min_severity`、`notify_ack`、`ca_file` | |
+
+回應的 `secrets` 只有遮蔽值（`url` 為 `https://主機/…`，其餘 `••••`）。`PUT` 時沒有提供的機密欄位沿用原本的值、值為 `null` 時刪除。列表與詳情另有 `state`（`ok`／`failed`／`disabled`）、`consecutive_failures`、`failed_since`、`last_attempt_at`、`last_success_at`、`last_error_code`、`last_error`（已移除機密）、`rules_using`；詳情另有 `rules[]` 與最近 20 筆 `deliveries`。
+
+`POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
+
+### 12.6 即時推送（SSE）
+
+第 6 節的 `/api/v1/events` 另有 `alert.created`、`alert.updated`、`alert.resolved`（`data` 為事件的摘要，欄位同第 12.2 節但沒有 `details`），編號與重連規則相同。只有內容（數值、台數）改變時不推送，最多每 60 秒寫回一次。

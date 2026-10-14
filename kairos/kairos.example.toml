@@ -113,3 +113,13 @@ renew_requires_approval = false
 expired_renew_grace_days = 90 # 過期寬限期（0 = 不接受過期續簽）
 revoke_on_self_decommission = true
 revoke_superseded = true      # 新憑證第一次連線後以 superseded 撤銷舊憑證
+
+[alerts]                      # 告警引擎（kairos/ALERTS.md）；需要 storage.backend = "sqlite"。規則、靜音與通知管道存在資料庫，以主控台 API 或 kairos alerts／silences／alert-rules 管理
+enabled = true                # false：不啟動告警引擎（告警端點回 503 alerts_unavailable）
+console_url = ""              # 通知中的事件連結，例如 "https://monitor.example.com"；空字串時通知不附連結
+timezone = "+08:00"           # 通知的時間與事件編號的日期：固定位移（+08:00、UTC），不支援時區名稱；管道可另外設定 timezone
+warmup_secs = 600             # 啟動後的告警暖機期（60..=3600）：期間不發主機離線通知，重新啟動前在線上的主機 98% 重新連上時提早結束
+retention_days = 400          # 已解決事件（含處理紀錄、發送紀錄）的保留天數，1..=3660
+max_events = 100000           # 事件筆數上限（超過時刪除最舊的已解決事件），1000..=10000000；一個事件約 1～2 KB
+subnet_prefix_v4 = 24         # 網段彙總（網段離線）的遮罩，8..=32
+subnet_prefix_v6 = 64         # 32..=128
