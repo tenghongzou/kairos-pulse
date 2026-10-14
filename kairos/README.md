@@ -409,6 +409,13 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `console.cert_path`、`console.key_path` | `KAIROS__CONSOLE__CERT_PATH`、`KAIROS__CONSOLE__KEY_PATH` | `""` | 主控台的伺服器憑證與私鑰；都留空時沿用 `server.cert_path`／`key_path`，必須同時設定或同時留空。內容變更時依 `server.reload_interval_secs` 熱重載 |
 | `console.max_connections` | `KAIROS__CONSOLE__MAX_CONNECTIONS` | `64` | 主控台的同時連線上限（含 SSE），1～4096；計入檔案描述元的需要量 |
 | `console.max_streams` | `KAIROS__CONSOLE__MAX_STREAMS` | `16` | 即時推送（SSE，`/api/v1/events`）的同時連線上限，1～`console.max_connections` |
+| `alerts.enabled` | `KAIROS__ALERTS__ENABLED` | `true` | 告警引擎（[ALERTS.md](ALERTS.md)）；需要 `storage.backend = "sqlite"` |
+| `alerts.console_url` | `KAIROS__ALERTS__CONSOLE_URL` | `""` | 通知中的事件連結的網址前綴（例 `https://monitor.example.com`）；空字串時通知不附連結 |
+| `alerts.timezone` | `KAIROS__ALERTS__TIMEZONE` | `+08:00` | 通知的時間與事件編號的日期使用的時區（固定位移，例 `+08:00`、`UTC`；不支援時區名稱）；管道可另外設定 |
+| `alerts.warmup_secs` | `KAIROS__ALERTS__WARMUP_SECS` | `600` | 啟動後的告警暖機期（秒），60～3600；重新啟動前在線上的主機 98% 重新連上時提早結束 |
+| `alerts.retention_days` | `KAIROS__ALERTS__RETENTION_DAYS` | `400` | 已解決的告警事件（含處理紀錄與發送紀錄）保留天數，1～3660 |
+| `alerts.max_events` | `KAIROS__ALERTS__MAX_EVENTS` | `100000` | 告警事件的筆數上限（超過時刪除最舊的已解決事件），1,000～10,000,000 |
+| `alerts.subnet_prefix_v4`、`alerts.subnet_prefix_v6` | `KAIROS__ALERTS__SUBNET_PREFIX_V4`、`…_V6` | `24`、`64` | 網段彙總（網段離線）的遮罩：IPv4 8～32、IPv6 32～128 |
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
@@ -500,6 +507,30 @@ kairos config show --effective enroll pki.policy   # 生效值與來源（環境
 - 防護：8444 有連線、來源、token、agent、全域多層速率限制（`[enroll]` 的 L1～L10，`429` 附 `Retry-After`）、無效 token 的來源封鎖（寫入資料庫）、時鐘偏差檢查、待核准佇列上限；8444 在自己的 runtime 上執行，1 萬台規模的註冊尖峰下 report 的 `ack` p99 維持在數十毫秒（PKI.md 第 12 節）。
 - 主控台修改的 `enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*` 存在資料庫、優先於 `kairos.toml`（環境變數最優先）；啟動時以 `INFO` 列出被覆寫的設定檔設定，`kairos config reset <設定鍵>` 改用設定檔的值。
 - 本版的下載端點（`/agent/…`）回 404：Pulse 以安裝套件安裝後執行 `pulse enroll`。
+
+## 告警（0.6.0〔草稿〕）
+
+主機離線、指標門檻、身分衝突、憑證被拒等主機事件，網段與大規模離線的彙總，以及 Kairos 本身的系統事件（CRL、伺服器憑證、回報無法寫入、容量、連線上限、註冊端點…），依四級嚴重度（緊急、嚴重、警告、資訊）通知到 Email（SMTP）與 Webhook（Kairos JSON、Slack 類、Teams、LINE）。規格見 [ALERTS.md](ALERTS.md)，端點見 API.md 第 12 節。
+
+```bash
+# 通知管道與規則以主控台 API 設定（admin 範圍的 token；機密只顯示遮蔽值）
+ADMIN=$(kairos api-token create --name alerts-admin --scope admin --config kairos.toml)
+curl -sk -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' https://127.0.0.1:9443/api/v1/channels \
+  -d '{"name":"值班 Email","kind":"email","config":{"host":"mail.example.com","from":"kairos@example.com","to":["oncall@example.com"],"username":"kairos"},"secrets":{"password":"…"}}'
+curl -sk -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -X POST https://127.0.0.1:9443/api/v1/channels/<channel_id>/test -d '{}'
+curl -sk -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -X PUT https://127.0.0.1:9443/api/v1/alert-rules/sys.host_offline -d '{"channels":["<channel_id>"]}'
+
+# 沒有網頁介面時以 CLI 處理
+kairos alerts list --config kairos.toml
+kairos alerts ack E-20261014-0003 --assign-to-me --config kairos.toml
+kairos silences create --name "B 廠歲修" --reason "年度歲修" --maintenance --duration 2d --subnet 10.30.0.0/16 --config kairos.toml
+kairos alert-rules list --config kairos.toml
+```
+
+- 30 條系統預設規則在第一次啟動時建立（不可刪除，停用要填原因）；初始沒有任何通知管道，事件只出現在主控台，設定管道並綁到規則後才會通知。
+- 一個根因一則通知：網段或大規模離線、CRL 過期、重新啟動後未恢復的主機合併成一則；Kairos 重新啟動（含升級）的 10 分鐘暖機期內不發主機離線通知，關機造成的離線永遠不通知。
+- 靜音只停止通知（事件照常記錄）；臨時靜音最長 7 天、包含系統規則 24 小時、包含緊急 4 小時（伺服器端驗證）；維護時段不受上限但不抑制系統事件。
+- 引擎在自己的執行緒上執行，report 的寫入路徑沒有新增工作（ALERTS.md 第 9 節）。
 
 ## 協定概述
 
@@ -935,4 +966,5 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_D
 - 關機時連線最晚到訊號後 2 秒就會被中止；網路極慢的連線可能收不到 `close_notify`（agent 端會視為斷線並重連）。被中止的連線若正在等待 report 寫入，該筆仍會寫入資料檔，但 `agents.json` 中該 agent 的 `last_report` 可能不會更新
 - `kairos.toml` 本身的設定只在啟動時讀取；熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL 檔的內容
 - 註冊通道（0.5.0〔草稿〕）尚未實作的部分：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具、下載端點、L11 與系統健康的整合（PKI.md 第 13 節）
+- 告警（0.6.0〔草稿〕）尚未實作的部分：週期性維護時段、警告的每日彙整、個人勿擾與個人通知、資料磁碟剩餘空間與授權等系統規則、主機離線類規則的歷史試算（ALERTS.md 第 10 節）
 - 主控台 API 為唯讀的第一版：驗證只有 API token（沒有使用者、角色、工作階段），主機狀態只有線上、離線、未知；沒有網頁介面（限制與延後項目見 API.md 第 10 節）

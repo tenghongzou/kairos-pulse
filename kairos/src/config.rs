@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+mod alerts;
 mod enroll;
 
+pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
 pub use enroll::{
     CertPolicySettings, EnrollSettings, MAX_CERT_LIFETIME_DAYS, MAX_GRACE_DAYS,
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
@@ -136,6 +138,10 @@ kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n
 kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n       \
 kairos enroll-token create|list|show|disable [選項]（註冊 token）\n       \
 kairos enroll list|show|approve|reject|mode [選項]（註冊申請與註冊端點模式）\n       \
+kairos alerts list|show|ack|resolve|comment [選項]（告警事件；kairos alerts --help 顯示說明）\n       \
+kairos silences list|create|end [選項]（靜音與維護時段）\n       \
+kairos alert-rules list|enable|disable [選項]（告警規則）\n       \
+kairos alert-channels list（通知管道）\n       \
 kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
 kairos config show --effective（實際生效的設定與來源）\n\n\
 選項:\n  \
@@ -158,6 +164,8 @@ pub struct AppConfig {
     pub enroll: EnrollSettings,
     /// PKI 與憑證政策（`kairos/PKI.md` 第 8 節）
     pub pki: PkiSettings,
+    /// 告警引擎（`kairos/ALERTS.md`）
+    pub alerts: AlertSettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,
@@ -629,6 +637,8 @@ pub enum CliAction {
     ApiToken(crate::token_cli::TokenCommand),
     /// `kairos enroll-token|enroll|pki|config ...`（註冊與 PKI，見 [`crate::enroll_cli`]）
     Enroll(crate::enroll_cli::Cmd),
+    /// `kairos alerts|silences|alert-rules|alert-channels ...`（告警，見 [`crate::alerts_cli`]）
+    Alerts(crate::alerts_cli::Cmd),
 }
 
 /// `--config=<path>` 的前綴
@@ -693,6 +703,17 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
         if iter.peek().is_some_and(|a| a == name) {
             iter.next();
             return crate::enroll_cli::parse_args(group, iter).map(CliAction::Enroll);
+        }
+    }
+    for (name, group) in [
+        ("alerts", crate::alerts_cli::Group::Alerts),
+        ("silences", crate::alerts_cli::Group::Silences),
+        ("alert-rules", crate::alerts_cli::Group::Rules),
+        ("alert-channels", crate::alerts_cli::Group::Channels),
+    ] {
+        if iter.peek().is_some_and(|a| a == name) {
+            iter.next();
+            return crate::alerts_cli::parse_args(group, iter).map(CliAction::Alerts);
         }
     }
     while let Some(arg) = iter.next() {
@@ -1167,6 +1188,7 @@ impl AppConfig {
         self.validate_console()?;
         self.enroll.validate()?;
         self.pki.validate()?;
+        self.alerts.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
         Ok(())

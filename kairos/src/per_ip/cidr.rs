@@ -115,14 +115,26 @@ impl Cidr {
         }
     }
 
-    #[cfg(test)]
     pub fn network(&self) -> IpAddr {
         self.network
     }
 
-    #[cfg(test)]
     pub fn prefix(&self) -> u8 {
         self.prefix
+    }
+
+    /// 包含 `ip` 的網段（前綴長度超過位址長度時取位址長度；IPv4-mapped IPv6 視為 IPv4）。
+    /// 告警的網段彙總以主機最後已知的位址計算（`alerts-ux.md` §3.3 C）
+    pub fn containing(ip: IpAddr, v4_prefix: u8, v6_prefix: u8) -> Self {
+        let ip = unmap(ip);
+        let prefix = match ip {
+            IpAddr::V4(_) => v4_prefix.min(32),
+            IpAddr::V6(_) => v6_prefix.min(128),
+        };
+        Self {
+            network: Self::mask(ip, prefix),
+            prefix,
+        }
     }
 
     /// `ip` 是否在網段內；IPv4-mapped IPv6 位址視為 IPv4，IPv6 網段也能涵蓋 IPv4-mapped 範圍

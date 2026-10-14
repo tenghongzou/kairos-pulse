@@ -149,6 +149,13 @@ fn fresh_database_has_the_current_schema() {
         "rollup_5m",
         "rollup_1h",
         "import_keys",
+        "alert_rules",
+        "alert_events",
+        "alert_timeline",
+        "alert_silences",
+        "alert_channels",
+        "alert_deliveries",
+        "alert_actions",
     ] {
         assert_eq!(
             count(
@@ -1533,5 +1540,66 @@ fn prepare_files_keeps_the_locks_of_open_connections() {
     drop(reader);
     drop(store);
     assert_eq!(probe_exclusive(&dir), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn upgrade_from_v4_to_v5_keeps_data_and_adds_the_alert_tables() {
+    let dir = temp_dir("v4v5");
+    let path = dir.join("m.db");
+    let mut conn = Connection::open(&path).unwrap();
+    // 0.5 的資料庫（schema v4）：有註冊的設定與稽核紀錄
+    assert_eq!(migrate(&mut conn, &MIGRATIONS[..4]).unwrap(), 4);
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at, updated_by) VALUES ('enroll.mode', 'open', 1, 't')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO audit_events (at, actor, category, action, result) VALUES (1, 't', 'enroll', 'x', 'success')",
+        [],
+    )
+    .unwrap();
+    let has = |conn: &Connection, t: &str| -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [t],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    };
+    assert!(!has(&conn, "alert_events"));
+    // 升級到 v5：資料保留，告警的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 5);
+    let mode: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'enroll.mode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "open");
+    for t in [
+        "alert_rules",
+        "alert_events",
+        "alert_timeline",
+        "alert_silences",
+        "alert_channels",
+        "alert_deliveries",
+        "alert_actions",
+    ] {
+        assert!(has(&conn, t), "{t}");
+    }
+    // 系統預設規則可以寫入；重複執行不重複（INSERT OR IGNORE）
+    let n = crate::alerts::store::ensure_builtin_rules(&conn, 1).unwrap();
+    assert_eq!(n, crate::alerts::rules::builtins().len());
+    assert_eq!(
+        crate::alerts::store::ensure_builtin_rules(&conn, 2).unwrap(),
+        0
+    );
+    // 再執行一次升級：不變
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 5);
+    drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }

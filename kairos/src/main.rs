@@ -1,5 +1,8 @@
+mod alerts;
+mod alerts_cli;
 mod api;
 mod auth;
+mod bus;
 mod config;
 mod connection;
 mod dedup;
@@ -67,6 +70,11 @@ pub const VERSION: &str = concat!(
     env!("KAIROS_BUILD_COMMIT"),
     ")"
 );
+
+/// 告警引擎的時鐘（Unix 毫秒；測試以假的時鐘驅動引擎本身）
+fn alerts_clock() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 
 /// accept 因資源問題失敗（例如檔案描述符用盡）後的等待時間
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -465,6 +473,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
         Ok(CliAction::ApiToken(cmd)) => return ExitCode::from(token_cli::run(cmd)),
         Ok(CliAction::Enroll(cmd)) => return ExitCode::from(enroll_cli::run(cmd)),
+        Ok(CliAction::Alerts(cmd)) => return ExitCode::from(alerts_cli::run(cmd)),
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
@@ -481,6 +490,10 @@ fn main() -> ExitCode {
                 Some(a) if a == "enroll" => enroll_cli::ENROLL_USAGE,
                 Some(a) if a == "pki" => enroll_cli::PKI_USAGE,
                 Some(a) if a == "config" => enroll_cli::CONFIG_USAGE,
+                Some(a) if a == "alerts" => alerts_cli::ALERTS_USAGE,
+                Some(a) if a == "silences" => alerts_cli::SILENCES_USAGE,
+                Some(a) if a == "alert-rules" => alerts_cli::RULES_USAGE,
+                Some(a) if a == "alert-channels" => alerts_cli::CHANNELS_USAGE,
                 _ => USAGE,
             };
             eprintln!("{}\n\n{}", e, usage);
@@ -929,6 +942,47 @@ async fn run(
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
+    // 告警引擎（kairos/ALERTS.md）：需要 SQLite；在自己的執行緒上執行
+    let agent_addr_for_alerts = listener.local_addr().ok();
+    let alerts = match (config.alerts.enabled, config.storage.backend) {
+        (false, _) => {
+            info!("告警引擎已停用（alerts.enabled = false）");
+            None
+        }
+        (true, StorageBackend::Jsonl) => {
+            warn!(
+                "告警引擎需要 SQLite（規則、事件與靜音存在資料庫中），storage.backend = \"jsonl\" 時不啟動"
+            );
+            None
+        }
+        (true, StorageBackend::Sqlite) => {
+            match alerts::AlertService::start(alerts::StartParams {
+                config: Arc::new(config.clone()),
+                data_dir: paths.data_dir.clone(),
+                db_path: enroll::db_path(&config, &paths.data_dir),
+                registry: registry.clone(),
+                write_stats: Some(ctx.reports.stats().clone()),
+                per_ip: Some(per_ip.clone()),
+                tls: Some(tls_state.clone()),
+                enroll: enroll_service.clone(),
+                agent_listen: agent_addr_for_alerts,
+                shutdown: shutdown.clone(),
+                enroll_closed_default: config.provenance.source(settings::KEY_MODE)
+                    == config::SettingSource::Default,
+                clock: alerts_clock,
+            })
+            .await
+            {
+                Ok(started) => Some(started),
+                Err(e) => {
+                    error!("告警引擎無法啟動（主機與系統事件不會產生告警，也不會發送通知）：{e}");
+                    None
+                }
+            }
+        }
+    };
+    let alert_service = alerts.as_ref().map(|(svc, _)| svc.clone());
+
     // 主控台 API（kairos/API.md）：需要 SQLite（API token 存在資料庫中）
     let console = match (config.console.enabled, config.storage.backend) {
         (false, _) => {
@@ -958,6 +1012,7 @@ async fn run(
                 shutdown: shutdown.clone(),
                 agent_listen: agent_addr,
                 enroll: enroll_service.clone(),
+                alerts: alert_service.clone(),
             })
             .await;
             match started {
@@ -982,8 +1037,14 @@ async fn run(
         config.storage.data_dir
     );
 
+    registry.bus().publish(bus::EventKind::Lifecycle {
+        phase: bus::Lifecycle::Started,
+    });
     let mut connections =
         accept_loop(listener, ctx.clone(), config.server.max_connections, per_ip).await?;
+    registry.bus().publish(bus::EventKind::Lifecycle {
+        phase: bus::Lifecycle::ShuttingDown,
+    });
 
     // ---- 關機 ----
     // 所有階段共用以 T0（收到訊號的時間）起算的期限
@@ -1017,6 +1078,11 @@ async fn run(
     let forced = registry.mark_all_offline(Instant::now());
     if forced > 0 {
         info!("將 {} 個仍在線上的 agent 標記為離線", forced);
+    }
+    // 告警引擎：寫入最後的事件與「正常關機」的心跳（下次啟動時判斷停機期間）
+    drop(alert_service);
+    if let Some((_, thread)) = alerts {
+        alerts::AlertService::join(thread, Duration::from_secs(3)).await;
     }
 
     // 最後一份狀態（所有 agent 已標為離線）交給 writer，結束前寫入主機清冊

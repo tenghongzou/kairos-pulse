@@ -55,18 +55,73 @@ pub enum Permission {
     /// 簽發 CA 的建立、安裝、啟用、退役（本版只有 CLI，API 之後再加）
     #[allow(dead_code)]
     PkiCaWrite,
+    /// 告警事件的查詢（S06、S07）
+    AlertsRead,
+    /// 確認、指派、暫停通知、解決、註解（S06、S07）
+    AlertsWrite,
+    /// 規則的查詢（S08）
+    AlertRulesRead,
+    /// 建立與編輯自訂規則、啟停規則、調整系統預設規則的通知（S08、S09：維運者）
+    AlertRulesWrite,
+    /// 調整系統預設規則的條件（S09：只有管理員）
+    AlertRulesAdmin,
+    /// 靜音與維護時段的查詢（S10）
+    SilencesRead,
+    /// 建立、修改、提前結束靜音與維護時段（S10：維運者）
+    SilencesWrite,
+    /// 通知管道的清單與狀態（S11：維運者只能看清單與寄送測試，稽核員與唯讀看不到）
+    ChannelsRead,
+    /// 寄送測試通知（S11）
+    ChannelsTest,
+    /// 新增、修改、刪除通知管道（S11：管理員）
+    ChannelsWrite,
 }
 
 impl Permission {
     /// 需要的範圍（read＝0、operate＝1、admin＝2）
     pub fn required_scope(self) -> &'static str {
         match self {
-            Permission::Read => SCOPE_READ,
+            Permission::Read
+            | Permission::AlertsRead
+            | Permission::AlertRulesRead
+            | Permission::SilencesRead => SCOPE_READ,
             Permission::EnrollTokenWrite
             | Permission::EnrollDecide
             | Permission::CertRevoke
-            | Permission::PkiQueue => super::tokens::SCOPE_OPERATE,
+            | Permission::PkiQueue
+            | Permission::AlertsWrite
+            | Permission::AlertRulesWrite
+            | Permission::SilencesWrite
+            | Permission::ChannelsRead
+            | Permission::ChannelsTest => super::tokens::SCOPE_OPERATE,
             _ => super::tokens::SCOPE_ADMIN,
+        }
+    }
+
+    /// 權限的名稱（`alerts:read` 形式；API 文件與之後的角色對應使用）
+    pub fn name(self) -> &'static str {
+        match self {
+            Permission::Read => "read",
+            Permission::EnrollTokenWrite => "enroll-tokens:write",
+            Permission::EnrollTokenAuto => "enroll-tokens:auto",
+            Permission::EnrollDecide => "enroll:decide",
+            Permission::EnrollLicenseOverflow => "enroll:license-overflow",
+            Permission::EnrollModeWrite => "enroll:mode",
+            Permission::CertRevoke => "certificates:revoke",
+            Permission::CertPolicyWrite => "certificates:policy",
+            Permission::GraceOverride => "certificates:grace-override",
+            Permission::PkiQueue => "pki:queue",
+            Permission::PkiCaWrite => "pki:ca",
+            Permission::AlertsRead => "alerts:read",
+            Permission::AlertsWrite => "alerts:write",
+            Permission::AlertRulesRead => "alert-rules:read",
+            Permission::AlertRulesWrite => "alert-rules:write",
+            Permission::AlertRulesAdmin => "alert-rules:admin",
+            Permission::SilencesRead => "silences:read",
+            Permission::SilencesWrite => "silences:write",
+            Permission::ChannelsRead => "channels:read",
+            Permission::ChannelsTest => "channels:test",
+            Permission::ChannelsWrite => "channels:write",
         }
     }
 }
@@ -96,8 +151,10 @@ impl Principal {
         if allowed {
             Ok(())
         } else {
-            Err(ApiError::forbidden()
-                .with_details(serde_json::json!({"required": permission.required_scope()})))
+            Err(ApiError::forbidden().with_details(serde_json::json!({
+                "required": permission.required_scope(),
+                "permission": permission.name(),
+            })))
         }
     }
 

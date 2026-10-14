@@ -170,7 +170,7 @@ fn method_not_allowed() -> ApiError {
     )
 }
 
-async fn read_body(req: Request<Incoming>, max: usize) -> Result<Value, ApiError> {
+pub(super) async fn read_body(req: Request<Incoming>, max: usize) -> Result<Value, ApiError> {
     let headers = req.headers();
     let ct = headers
         .get(CONTENT_TYPE)

@@ -14,6 +14,7 @@
 //! | [`events`] | 即時變更推送（SSE） |
 //! | [`maint`] | 背景工作：每分鐘上線數、token 的最後使用與稽核日誌、被拒的憑證寫入清冊 |
 
+pub mod alerts;
 pub mod auth;
 pub mod db;
 pub mod enroll;
@@ -27,9 +28,11 @@ pub mod overview;
 pub mod tokens;
 
 #[cfg(test)]
+mod alerts_tests;
+#[cfg(test)]
 mod bench;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use chrono::{DateTime, Utc};
 use hyper::body::Incoming;
@@ -99,6 +102,8 @@ pub struct ApiContext {
     pub console_listen: SocketAddr,
     /// 註冊服務（SQLite 時；註冊與 PKI 的管理端點使用）
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    /// 告警服務（SQLite 且 `alerts.enabled` 時；`/api/v1/alerts` 等端點使用）
+    pub alerts: Option<Arc<crate::alerts::AlertService>>,
 }
 
 impl ApiContext {
@@ -125,6 +130,7 @@ pub struct StartParams {
     pub shutdown: Arc<Shutdown>,
     pub agent_listen: SocketAddr,
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    pub alerts: Option<Arc<crate::alerts::AlertService>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -290,6 +296,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         agent_listen: p.agent_listen,
         console_listen: local_addr,
         enroll: p.enroll.clone(),
+        alerts: p.alerts.clone(),
     });
     ctx.hosts.load_known(known);
 
@@ -302,6 +309,14 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         p.shutdown.clone(),
     ));
     runtime.spawn(maint::run(ctx.clone()));
+    // 告警的變化 → SSE（`alert.created`、`alert.updated`、`alert.resolved`）
+    if let Some(svc) = &p.alerts {
+        runtime.spawn(events::alert_pump(
+            svc.subscribe(),
+            ctx.events.clone(),
+            p.shutdown.clone(),
+        ));
+    }
     let acceptor = Arc::new(RwLock::new(acceptor));
     if p.config.server.reload_interval_secs > 0 {
         runtime.spawn(reload_certificate(
@@ -448,6 +463,19 @@ async fn handle(
     let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // 告警（API.md 第 12 節；含寫入）
+    if alerts::owns(&path) {
+        let resp = alerts::handle(ctx.clone(), peer, req).await;
+        debug!(
+            "主控台 {} {} {} → {}（{:.1} ms）",
+            peer.ip(),
+            method,
+            path,
+            resp.status().as_u16(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        return resp;
+    }
     // 註冊與 PKI 的管理端點（API.md 第 11 節；含寫入）
     if path.starts_with("/api/v1/enroll/")
         || path.starts_with("/api/v1/pki/")

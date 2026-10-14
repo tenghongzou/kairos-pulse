@@ -353,6 +353,165 @@ ALTER TABLE hosts ADD COLUMN last_grace_attempt TEXT;
 CREATE INDEX hosts_hostname ON hosts (hostname);
 ";
 
+/// schema v5（0.6 草稿）：告警引擎（`kairos/ALERTS.md`；設計包 §24 #9）。規則、事件（含彙總的父子關係）、
+/// 事件的處理紀錄、靜音與維護時段、通知管道（機密欄位以 `alerts::secrets` 加密）、通知的發送紀錄，
+/// 以及 CLI 交給執行中的 Kairos 處理的動作佇列。保留期限與筆數上限見 `alerts.retention_days`、
+/// `alerts.max_events`
+const SCHEMA_V5: &str = "
+CREATE TABLE alert_rules (
+    rule_id        TEXT PRIMARY KEY,
+    builtin        INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    category       TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    enabled        INTEGER NOT NULL,
+    severity       TEXT NOT NULL,
+    params         TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    channels       TEXT NOT NULL,
+    notify         TEXT NOT NULL,
+    description    TEXT,
+    disabled_reason TEXT,
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    updated_by     TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE alert_events (
+    event_id       TEXT PRIMARY KEY,
+    rule_id        TEXT NOT NULL,
+    dedup_key      TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    category       TEXT NOT NULL,
+    severity       TEXT NOT NULL,
+    sev_rank       INTEGER NOT NULL,
+    attention      TEXT NOT NULL,
+    state          TEXT NOT NULL,
+    acked          INTEGER NOT NULL DEFAULT 0,
+    title          TEXT NOT NULL,
+    subject        TEXT NOT NULL,
+    agent_id       TEXT,
+    code           TEXT,
+    parent_id      TEXT,
+    episode        INTEGER,
+    details        TEXT NOT NULL,
+    started_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    last_signal_at INTEGER NOT NULL,
+    recovered_at   INTEGER,
+    resolved_at    INTEGER,
+    acked_at       INTEGER,
+    acked_by       TEXT,
+    assignee       TEXT,
+    eta_at         INTEGER,
+    root_cause     TEXT,
+    resolve_note   TEXT,
+    resolved_by    TEXT,
+    occurrences    INTEGER NOT NULL DEFAULT 1,
+    reopen_count   INTEGER NOT NULL DEFAULT 0,
+    flapping       INTEGER NOT NULL DEFAULT 0,
+    silenced       INTEGER NOT NULL DEFAULT 0,
+    in_maintenance INTEGER NOT NULL DEFAULT 0,
+    snooze_until   INTEGER,
+    notify_state   TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX alert_events_open ON alert_events (sev_rank, acked, started_at) WHERE state <> 'resolved';
+CREATE INDEX alert_events_started ON alert_events (started_at);
+CREATE INDEX alert_events_resolved ON alert_events (resolved_at) WHERE resolved_at IS NOT NULL;
+CREATE INDEX alert_events_dedup ON alert_events (dedup_key, started_at);
+CREATE INDEX alert_events_parent ON alert_events (parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX alert_events_agent ON alert_events (agent_id, started_at) WHERE agent_id IS NOT NULL;
+CREATE INDEX alert_events_rule ON alert_events (rule_id, started_at);
+
+CREATE TABLE alert_timeline (
+    id         INTEGER PRIMARY KEY,
+    event_id   TEXT NOT NULL,
+    at         INTEGER NOT NULL,
+    actor      TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    details    TEXT
+);
+CREATE INDEX alert_timeline_event ON alert_timeline (event_id, id);
+
+CREATE TABLE alert_silences (
+    silence_id     TEXT PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    rules          TEXT NOT NULL,
+    starts_at      INTEGER NOT NULL,
+    ends_at        INTEGER NOT NULL,
+    reason         TEXT NOT NULL,
+    notify_on_end  INTEGER NOT NULL DEFAULT 1,
+    exclude_uptime INTEGER NOT NULL DEFAULT 0,
+    from_event     TEXT,
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    updated_by     TEXT NOT NULL,
+    ended_at       INTEGER,
+    ended_by       TEXT,
+    end_reason     TEXT,
+    end_notified   INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE INDEX alert_silences_ends ON alert_silences (ends_at);
+
+CREATE TABLE alert_channels (
+    channel_id     TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    config         TEXT NOT NULL,
+    secrets        BLOB,
+    state          TEXT NOT NULL DEFAULT 'ok',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    failed_since   INTEGER,
+    last_attempt_at INTEGER,
+    last_success_at INTEGER,
+    last_error_code TEXT,
+    last_error     TEXT,
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    updated_by     TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE alert_deliveries (
+    id             INTEGER PRIMARY KEY,
+    event_id       TEXT,
+    channel_id     TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    state          TEXT NOT NULL,
+    urgent         INTEGER NOT NULL DEFAULT 0,
+    payload        TEXT NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL,
+    sent_at        INTEGER,
+    batch_id       INTEGER,
+    response_code  INTEGER,
+    error_code     TEXT,
+    error          TEXT
+);
+CREATE INDEX alert_deliveries_pending ON alert_deliveries (next_attempt_at) WHERE state = 'pending';
+CREATE INDEX alert_deliveries_event ON alert_deliveries (event_id) WHERE event_id IS NOT NULL;
+CREATE INDEX alert_deliveries_channel ON alert_deliveries (channel_id, created_at);
+CREATE INDEX alert_deliveries_created ON alert_deliveries (created_at);
+
+CREATE TABLE alert_actions (
+    id             INTEGER PRIMARY KEY,
+    created_at     INTEGER NOT NULL,
+    actor          TEXT NOT NULL,
+    event_id       TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    params         TEXT NOT NULL,
+    processed_at   INTEGER,
+    result         TEXT
+);
+CREATE INDEX alert_actions_pending ON alert_actions (id) WHERE processed_at IS NULL;
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -371,10 +530,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: SCHEMA_V4,
     },
+    Migration {
+        version: 5,
+        sql: SCHEMA_V5,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";
