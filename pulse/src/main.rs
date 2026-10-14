@@ -123,8 +123,14 @@ fn setup_logger(config: &config_manager::LogConfig) -> Result<(), String> {
         None => None,
     };
     let format = config.log_format();
+    let meta = kp_obs::logfmt::LogMeta::new("pulse", host, true);
+    // 多實例（pulse-N.service 的 StateDirectory=pulse/N）：JSON 日誌的 instance 為 N
+    meta.set_instance(
+        status_file::state_directory(std::env::var_os("STATE_DIRECTORY").as_deref())
+            .and_then(|d| status_file::instance_of(&d)),
+    );
     let sink = Arc::new(kp_obs::logfmt::LogSink::new(
-        Arc::new(kp_obs::logfmt::LogMeta::new("pulse", host, true)),
+        Arc::new(meta),
         format,
         config.log_timezone(),
         Box::new(log_files::daily_file(format)),

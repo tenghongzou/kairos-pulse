@@ -538,6 +538,8 @@ pub fn check(config_arg: Option<&str>) -> Report {
             Outcome::Warning,
             "log.format = \"legacy\" 是 0.5 以前的格式（本地時間不帶時區），只保留一個主要版本供過渡；請改用 text 或 json。",
         );
+        // 已棄用的設定值（設計包 INTEGRATION.md §28.5 #5；與 Kairos 的 KRS-W0104 同號）
+        log = log.code("PLS-W0104");
     }
     checks.push(log);
 
@@ -1070,6 +1072,24 @@ mod tests {
         assert!(c.strict && c.json);
         assert_eq!(c.config.as_deref(), Some("p.toml"));
         assert!(parse_check(&s(&["--connect"])).is_err());
+    }
+
+    #[test]
+    fn legacy_log_format_is_warned_with_a_code() {
+        let dir = std::env::temp_dir().join(format!("pulse-diag-l-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("pulse.toml");
+        std::fs::write(
+            &cfg,
+            "[log]
+format = \"legacy\"
+",
+        )
+        .unwrap();
+        let r = check(Some(&cfg.to_string_lossy()));
+        let text = r.render_text();
+        assert!(text.contains("PLS-W0104"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

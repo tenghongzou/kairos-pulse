@@ -96,7 +96,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 ### Pulse
 
 - **本機指標**（`[metrics]`，預設關閉）：loopback 的 HTTP `/metrics` 或 textfile collector 的檔案。
-- **JSON 日誌與 syslog**（同 Kairos）、**`pulse check-config`**、**`pulse diag`**（遮蔽規則與 Kairos 共用）。
+- **JSON 日誌與 syslog**（同 Kairos；多實例時 JSON 的 `instance` 為實例編號 N，取自 `pulse-N.service` 的 `StateDirectory=pulse/N`，單一實例為 `null`）、**`pulse check-config`**（`log.format = "legacy"` 時警告 `PLS-W0104`，與 Kairos 的 `KRS-W0104` 同號）、**`pulse diag`**（遮蔽規則與 Kairos 共用）。
 - `pulse.service` 維持 `StandardOutput=null`（理由見 unit 與 INSTALL.md 7.1）。
 
 ### 共用

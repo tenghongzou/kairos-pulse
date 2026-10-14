@@ -104,6 +104,8 @@ pub struct LogMeta {
     pub agent_fields: bool,
     seq: AtomicU64,
     agent_id: RwLock<Option<String>>,
+    /// Pulse 的多實例編號（`pulse-N.service`；單一實例時為 `None`，JSON 為 `null`）
+    instance: RwLock<Option<u32>>,
 }
 
 impl LogMeta {
@@ -115,7 +117,17 @@ impl LogMeta {
             agent_fields,
             seq: AtomicU64::new(0),
             agent_id: RwLock::new(None),
+            instance: RwLock::new(None),
         }
+    }
+
+    /// 設定 JSON 的 `instance`（Pulse 的多實例 N；設計包 `log-ux.md` §6.2）
+    pub fn set_instance(&self, n: Option<u32>) {
+        *self.instance.write().unwrap_or_else(|e| e.into_inner()) = n;
+    }
+
+    pub fn instance(&self) -> Option<u32> {
+        *self.instance.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 設定 JSON 的 `agent_id`（Pulse 讀取身分之後；未啟用 mTLS 時不設定，agent_id 等同身分憑據）
@@ -601,8 +613,10 @@ pub fn format_json(line: &Line, meta: &LogMeta, now: DateTime<Utc>) -> String {
         let id = meta.agent_id();
         let _ = write!(
             out,
-            ",\"agent_id\":{},\"instance\":null",
-            id.as_deref().map_or("null".to_string(), json_str)
+            ",\"agent_id\":{},\"instance\":{}",
+            id.as_deref().map_or("null".to_string(), json_str),
+            meta.instance()
+                .map_or("null".to_string(), |n| n.to_string())
         );
     }
     let _ = write!(
@@ -678,6 +692,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["agent_id"], "9422cb70-1b2c-4d3e-9f00-112233445566");
         assert_eq!(v["instance"], serde_json::Value::Null);
+        // 多實例：instance 為編號
+        let multi = meta(true);
+        multi.set_instance(Some(3));
+        let v3: serde_json::Value =
+            serde_json::from_str(&format_json(&line, &multi, at())).unwrap();
+        assert_eq!(v3["instance"], 3);
         assert_eq!(v["host"], "plc-hmi-07");
         assert_eq!(v["product"], "pulse");
         assert_eq!(v["seq"], 1);
