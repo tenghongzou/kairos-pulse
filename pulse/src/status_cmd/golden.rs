@@ -105,6 +105,7 @@ fn base_file() -> StatusFile {
             measured_at: Some("2026-10-09T06:22:10.000Z".into()),
             measured_mono_ms: Some(MONO - 800_000),
             source: Some("hello_ack".into()),
+            unverified: false,
         },
         ..StatusFile::default()
     }

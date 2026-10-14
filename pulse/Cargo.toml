@@ -38,7 +38,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 tokio-util = { version = "0.7", features = ["codec"] }
 # agent_id 產生
 uuid = { version = "1.27", features = ["v4"] }
+# 註冊通道（ENROLL.md 15.3 節選定）：在本機產生 P-256 私鑰（ring）與 CSR（rcgen，以 ring 為後端，
+# 不引入 aws-lc-rs）；兩者都已在依賴樹（rustls、kairos-proto 的測試）
+ring = "0.17"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [dev-dependencies]
 # 不是新依賴：只為測試多開 tokio 的 test-util（tokio::time::pause / 自動推進時間）
 tokio = { version = "1.53", features = ["test-util"] }
+# 不是新依賴（rcgen 的依賴）：測試用的假 8444 伺服器以指定的時間簽發憑證
+time = "0.3"

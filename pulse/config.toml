@@ -82,6 +82,21 @@ id_file = "agent.id"
 display_name = ""
 tags = []
 
+[identity]
+# 以 pulse enroll 註冊取得的身分檔案目錄（相對路徑以工作目錄解析）：client.key、client.pem、ca.pem、
+# enrollment.json（註冊與續簽的進度，含輪詢憑據）。Unix 上以 0700 建立、私鑰與 enrollment.json 為 0600；
+# Windows 只允許 SYSTEM 與 Administrators 存取。服務帳號必須能寫入（systemd unit 的 ReadWritePaths）
+dir = "identity"
+# 自動更新用戶端憑證（Kairos 支援協定 feature「renew」時，經 8443 送出新的 CSR）：
+# 已使用壽命的 2/3，或剩餘天數 ≤ 此值時開始更新，取較早者（0～365；0 = 只看 2/3）
+renew_before_days = 30
+
+[enroll]
+# 註冊端點（8444，HTTPS）。過期寬限期續簽與 pulse enroll（未指定 --enroll-server 時）使用。
+# 空字串 = 與 server.address 相同的主機（decisions/naming.md §4.2）
+address = ""
+port = 8444
+
 [buffer]
 # 本機緩衝（at-least-once）：取樣先寫進本機磁碟，收到 Kairos 的確認（ack）才刪除；
 # 斷線、Kairos 停機維護或寫入結果不明時資料留在緩衝中，重新連上後依序補送，再送新的取樣。

@@ -3,12 +3,15 @@ mod backoff;
 mod cli;
 mod codes;
 mod config_manager;
+mod enroll;
 mod file_perms;
+mod lifecycle;
 mod local_status;
 mod log_files;
 mod log_throttle;
 mod network;
 mod protocol;
+mod rotation;
 mod service_status;
 mod shutdown;
 mod spool;
@@ -660,7 +663,7 @@ async fn run(
     };
 
     // 系統資訊收集 task →（啟用本機緩衝時經緩衝寫入 task）→ 連線 task
-    let (report_tx, report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
+    let (report_tx, mut report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
     let (mut collector, mut ingest) = match &shared_spool {
         Some(shared) => {
             let (sample_tx, sample_rx) = mpsc::channel(SPOOL_QUEUE_CAPACITY);
@@ -692,7 +695,7 @@ async fn run(
         settings.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
     }
     let result = tokio::select! {
-        _ = network::run(settings, tls, report_rx, shared_spool.clone(), shutdown.clone()) => {
+        _ = network::run(settings, tls, &mut report_rx, shared_spool.clone(), shutdown.clone()) => {
             if shutdown.is_cancelled() {
                 Ok(())
             } else {
