@@ -35,9 +35,10 @@ use crate::rate::{
     TokenBucket,
 };
 use crate::registry::{
-    ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
+    BACKFILL_LAG_MS, ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
 };
 use crate::shutdown::{CONNECTIONS_DEADLINE, Shutdown, drain_limit};
+use crate::stats::WriteOutcome;
 use crate::storage::{DedupKey, RecordBody, ReportRecord, ReportSink, WriteStatus, fmt_time};
 use crate::throttle::{Category, Key, LogThrottle};
 use crate::throttled;
@@ -300,14 +301,31 @@ pub(crate) async fn store_report(
     let last = last_report_of(&record);
     let timed_out = || format!("寫入未在 {} 秒內完成", write_timeout.as_secs_f64());
     let deadline = deadline_after(write_timeout);
+    // 每筆的結果記入寫入統計（系統健康的「report 寫入」）
+    let stats = sink.stats().clone();
     // 等待期間（含等待佇列空間）以 keep_alive_while 定期更新本連線的 last_seen
     // （只更新 conn_id 相符的現役連線）。在放入佇列前逾時：這筆根本沒有進入佇列
     let durable = record.dedup.is_some();
+    // 補送的資料（取樣時間比收到的時間早 BACKFILL_LAG_MS 以上）：保存後記入狀態表（「補送中」）
+    let backfill_lag = if durable {
+        DateTime::parse_from_rfc3339(&record.ts)
+            .ok()
+            .map(|ts| record.recv_at.timestamp_millis() - ts.timestamp_millis())
+            .filter(|lag| *lag >= BACKFILL_LAG_MS)
+    } else {
+        None
+    };
     let submit = keep_alive_while(registry, &agent_id, conn_id, revived, sink.submit(record));
     let mut pending = match timeout_at(deadline, submit).await {
         Ok(Ok(pending)) => pending,
-        Ok(Err(reason)) => return StoreOutcome::Unavailable(reason),
-        Err(_) => return StoreOutcome::Unavailable(timed_out()),
+        Ok(Err(reason)) => {
+            stats.record(WriteOutcome::Unavailable);
+            return StoreOutcome::Unavailable(reason);
+        }
+        Err(_) => {
+            stats.record(WriteOutcome::Unavailable);
+            return StoreOutcome::Unavailable(timed_out());
+        }
     };
     let status = match timeout_at(
         deadline,
@@ -317,7 +335,10 @@ pub(crate) async fn store_report(
     {
         Ok(status) => status,
         // writer 尚未認領：取消成功後保證不會寫入
-        Err(_) if pending.cancel() => return StoreOutcome::Unavailable(timed_out()),
+        Err(_) if pending.cancel() => {
+            stats.record(WriteOutcome::Unavailable);
+            return StoreOutcome::Unavailable(timed_out());
+        }
         // writer 已在寫入這筆：結果很快就會出來，多等一小段
         Err(_) => match timeout(
             write_timeout.min(CLAIMED_WRITE_GRACE),
@@ -327,12 +348,28 @@ pub(crate) async fn store_report(
         {
             Ok(status) => status,
             Err(_) => {
+                stats.record(WriteOutcome::Unknown);
                 return StoreOutcome::Unknown(format!("{}，且寫入已開始、結果未知", timed_out()));
             }
         },
     };
+    stats.record(match &status {
+        WriteStatus::Written => WriteOutcome::Written,
+        WriteStatus::Duplicate => WriteOutcome::Duplicate,
+        WriteStatus::Failed(_) => WriteOutcome::Unavailable,
+        WriteStatus::Unknown(_) => WriteOutcome::Unknown,
+    });
     match status {
         WriteStatus::Written | WriteStatus::Duplicate => {
+            if let Some(lag) = backfill_lag {
+                registry.note_backfill(
+                    &agent_id,
+                    conn_id,
+                    lag,
+                    std::time::Instant::now(),
+                    Utc::now(),
+                );
+            }
             // 寫入與此處之間若剛好被取代，資料已保存，只是不更新 last_report（新連線會有自己的 report）。
             // 重複的 report（at-least-once 的重送，先前已保存）不更新 last_report：它是較舊的資料。
             // durable report 可能是補送的舊資料，只在 ts 不早於目前的 last_report 時更新
@@ -563,7 +600,11 @@ pub async fn handle_connection(
         biased;
         // 握手尚未完成，無法送 close_notify，直接放棄
         _ = shutdown.cancelled() => return Ok(()),
-        res = timeout(ctx.timeouts.handshake(), acceptor.accept(socket).into_fallible()) => res,
+        // 握手時被拒的客戶端憑證以來源位址記錄（tls::rejections，設計包 §24 #3）
+        res = timeout(
+            ctx.timeouts.handshake(),
+            crate::tls::HANDSHAKE_PEER.scope(peer, acceptor.accept(socket).into_fallible()),
+        ) => res,
     };
     let tls_stream = match handshake {
         Ok(Ok(stream)) => stream,
@@ -1170,6 +1211,9 @@ impl Conn {
                 return Ok(());
             }
         };
+        // 主控台 API 的「支援補送」與主機詳情（A5）
+        ctx.registry
+            .set_durable(&agent.agent_id, self.conn_id, agent.session.durable);
         if let Some(evicted) = &registration.evicted {
             throttled!(
                 self.throttle,
@@ -1486,6 +1530,7 @@ impl Conn {
                     if !self.touch(ctx, agent) {
                         return Ok(Handled::alive(self.reply_superseded(agent).await?));
                     }
+                    ctx.reports.stats().record(WriteOutcome::RateLimited);
                     let flow = self
                         .reply(ServerMsg::error(
                             Some(seq),

@@ -16,7 +16,7 @@ NAME=pulse                           # 執行檔名稱（Cargo 的 bin 名稱）
 EXAMPLE_SRC=config.toml              # 產品目錄中的預設設定（編譯時嵌入，放進 tar 作為範例）
 EXAMPLE_DST=pulse.example.toml       # 放進 tar 時的檔名
 UNIT_SRC=packaging/pulse.service     # systemd unit 範本
-EXTRA_SRC=""                         # 其他放進 tar 根目錄的檔案（無）
+EXTRA_SRC="ERROR-CODES.md"           # 其他放進 tar 根目錄的檔案：錯誤代碼對照（pulse explain 指向它）
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)

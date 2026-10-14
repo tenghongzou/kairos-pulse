@@ -91,6 +91,22 @@ pub const DEFAULT_CRL_EXPIRY_WARNING_DAYS: u32 = 7;
 /// 到期預警天數的上限（0 表示不預警，已過期時仍記錄 ERROR）
 pub const MAX_EXPIRY_WARNING_DAYS: u32 = 365;
 
+/// `console.listen` 的預設值：只綁 loopback（設計包 `ia.md` §3.2：初始化期間只綁 127.0.0.1:9443）
+pub const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:9443";
+
+/// `console.max_connections` 的預設值與上限
+pub const DEFAULT_CONSOLE_MAX_CONNECTIONS: usize = 64;
+pub const MAX_CONSOLE_MAX_CONNECTIONS: usize = 4096;
+
+/// `console.max_streams`（SSE 的同時連線數）的預設值
+pub const DEFAULT_CONSOLE_MAX_STREAMS: usize = 16;
+
+/// 除了連線之外，行程需要的檔案描述符（日誌、資料庫與 WAL、TLS 設定檔、listener 等）的估計量
+pub const FD_RESERVE: u64 = 64;
+
+/// 建議的 `LimitNOFILE` 下限
+pub const MIN_SUGGESTED_NOFILE: u64 = 4096;
+
 /// `auth.crl` 以環境變數設定時的清單分隔字元
 pub const LIST_SEPARATOR: &str = ",";
 
@@ -98,7 +114,8 @@ pub const USAGE: &str = "用法: kairos [--config <path>]\n       \
 kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\n       \
 kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
 kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）\n       \
-kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n\n\
+kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n       \
+kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
@@ -114,6 +131,79 @@ pub struct AppConfig {
     pub auth: AuthSettings,
     pub limits: LimitSettings,
     pub log: LogSettings,
+    pub console: ConsoleSettings,
+}
+
+/// 主控台 API（`[console]`，見 `kairos/API.md` 第 2 節）
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ConsoleSettings {
+    /// `false`：不監聽主控台連接埠
+    pub enabled: bool,
+    /// 監聽位址；預設只綁 loopback
+    pub listen: String,
+    /// 主控台的伺服器憑證；空字串時沿用 `server.cert_path`
+    pub cert_path: String,
+    /// 主控台的私鑰；空字串時沿用 `server.key_path`（與 `cert_path` 同時設定或同時留空）
+    pub key_path: String,
+    /// 同時連線上限（含 SSE）
+    pub max_connections: usize,
+    /// SSE（`/api/v1/events`）的同時連線上限
+    pub max_streams: usize,
+}
+
+impl Default for ConsoleSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: DEFAULT_CONSOLE_LISTEN.to_string(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            max_connections: DEFAULT_CONSOLE_MAX_CONNECTIONS,
+            max_streams: DEFAULT_CONSOLE_MAX_STREAMS,
+        }
+    }
+}
+
+impl ConsoleSettings {
+    /// 主控台實際使用的憑證與私鑰：未設定時沿用 agent 連線埠的（`server.cert_path`／`key_path`）
+    pub fn tls_files(&self, server: &ServerSettings) -> (String, String) {
+        if self.cert_path.trim().is_empty() {
+            (server.cert_path.clone(), server.key_path.clone())
+        } else {
+            (
+                self.cert_path.trim().to_string(),
+                self.key_path.trim().to_string(),
+            )
+        }
+    }
+}
+
+/// 兩個監聽位址是否會衝突：連接埠相同（且不是 0），且 IP 相同或其中一個是所有介面（`0.0.0.0`、`::`）
+pub fn listen_addrs_conflict(a: &SocketAddr, b: &SocketAddr) -> bool {
+    if a.port() == 0 || a.port() != b.port() {
+        return false;
+    }
+    let (x, y) = (a.ip().to_canonical(), b.ip().to_canonical());
+    x == y || x.is_unspecified() || y.is_unspecified()
+}
+
+/// `KRS-E0202`：agent 連線埠與主控台的監聽位址相同
+pub fn listen_conflict_error(agent: &str, console: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "錯誤 KRS-E0202：設定互相矛盾：server.listen（{agent}）與 console.listen（{console}）使用同一個位址與連接埠。agent 連線埠與主控台（預設 9443）必須分開；請修改其中一個，或以 console.enabled = false 停用主控台"
+        ),
+    )
+}
+
+/// 建議的 `LimitNOFILE`：不小於需要量的 2 的冪次，且至少 [`MIN_SUGGESTED_NOFILE`]
+pub fn suggested_nofile(needed: u64) -> u64 {
+    needed
+        .checked_next_power_of_two()
+        .unwrap_or(needed)
+        .max(MIN_SUGGESTED_NOFILE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -390,6 +480,8 @@ pub enum CliAction {
     Reports(crate::export_cli::ReportsCommand),
     /// `kairos db ...`（資料庫的線上備份，見 [`crate::export_cli`]）
     Db(crate::export_cli::DbCommand),
+    /// `kairos api-token ...`（主控台 API 的 token，見 [`crate::token_cli`]）
+    ApiToken(crate::token_cli::TokenCommand),
 }
 
 /// `--config=<path>` 的前綴
@@ -440,6 +532,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "db") {
         iter.next();
         return crate::export_cli::parse_db_args(iter).map(CliAction::Db);
+    }
+    if iter.peek().is_some_and(|a| a == "api-token") {
+        iter.next();
+        return crate::token_cli::parse_args(iter).map(CliAction::ApiToken);
     }
     while let Some(arg) = iter.next() {
         let path = if arg == "--config" {
@@ -597,8 +693,16 @@ impl AppConfig {
     /// 以 `hosts` 台主機、每 5 秒一筆 report 估算 SQLite 在保留期限內需要的容量（bytes；
     /// 公式見 `kairos/STORAGE.md`「容量估算」）。保留天數為 0（不依時間刪除）時以 365 天估算
     pub fn estimated_sqlite_bytes(&self, hosts: u64) -> u64 {
+        hosts.saturating_mul(
+            self.estimated_sqlite_bytes_per_host(ESTIMATE_REPORT_INTERVAL_SECS * 1000),
+        )
+    }
+
+    /// 一台每 `report_interval_ms` 一筆 report 的主機在保留期限內需要的容量（bytes）：
+    /// 系統健康以目前回報中的主機與各自宣告的間隔加總（設計包 §24 #19、§25.5 #4）
+    pub fn estimated_sqlite_bytes_per_host(&self, report_interval_ms: u64) -> u64 {
         let days = |d: u32| u64::from(if d == 0 { 365 } else { d + 1 });
-        let reports_per_day = 86_400 / ESTIMATE_REPORT_INTERVAL_SECS;
+        let reports_per_day = 86_400_000 / report_interval_ms.max(1000);
         let raw = reports_per_day * ESTIMATED_RAW_ROW_BYTES * days(self.storage.raw_retention_days);
         let rollup = |bucket_secs: u64, d: u32| {
             (86_400 / bucket_secs)
@@ -606,10 +710,8 @@ impl AppConfig {
                 * ESTIMATED_ROLLUP_ROW_BYTES
                 * days(d)
         };
-        let per_host = raw
-            + rollup(300, self.storage.rollup_5m_retention_days)
-            + rollup(3600, self.storage.rollup_1h_retention_days);
-        hosts.saturating_mul(per_host)
+        raw + rollup(300, self.storage.rollup_5m_retention_days)
+            + rollup(3600, self.storage.rollup_1h_retention_days)
     }
 
     /// SQLite 時 `storage.max_total_bytes` 小於以 `max_connections` 台主機估算的容量時回傳
@@ -888,8 +990,59 @@ impl AppConfig {
                 "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
             );
         }
+        self.validate_console()?;
         self.log.level_filter()?;
         Ok(())
+    }
+
+    /// `[console]` 的檢查，以及監聽位址不可相同（設計包 §24 #16 (a)、`KRS-E0202`）。
+    /// 主機名稱形式的位址在啟動時解析後再以 [`listen_addrs_conflict`] 比較一次
+    fn validate_console(&self) -> Result<(), Error> {
+        let c = &self.console;
+        let invalid = |msg: String| Err(Error::new(ErrorKind::InvalidInput, msg));
+        if !c.enabled {
+            return Ok(());
+        }
+        if c.listen.trim().is_empty() {
+            return invalid("console.listen 不可為空".to_string());
+        }
+        if !(1..=MAX_CONSOLE_MAX_CONNECTIONS).contains(&c.max_connections) {
+            return invalid(format!(
+                "console.max_connections 必須介於 1..={}（目前為 {}）",
+                MAX_CONSOLE_MAX_CONNECTIONS, c.max_connections
+            ));
+        }
+        if !(1..=c.max_connections).contains(&c.max_streams) {
+            return invalid(format!(
+                "console.max_streams 必須介於 1..=console.max_connections（{}）（目前為 {}）",
+                c.max_connections, c.max_streams
+            ));
+        }
+        if c.cert_path.trim().is_empty() != c.key_path.trim().is_empty() {
+            return invalid(
+                "console.cert_path 與 console.key_path 必須同時設定或同時留空（留空時沿用 server.cert_path／key_path）"
+                    .to_string(),
+            );
+        }
+        if let (Ok(agent), Ok(console)) = (
+            self.server.listen.trim().parse::<SocketAddr>(),
+            c.listen.trim().parse::<SocketAddr>(),
+        ) && listen_addrs_conflict(&agent, &console)
+        {
+            return Err(listen_conflict_error(&self.server.listen, &c.listen));
+        }
+        Ok(())
+    }
+
+    /// 檔案描述元的需要量（設計包 §24 #18 (b)(c)、D21）：agent 連線上限＋主控台連線上限＋預留。
+    /// 啟動檢查與系統健康共用這個算式
+    pub fn fd_needed(&self) -> u64 {
+        let console = if self.console.enabled {
+            self.console.max_connections as u64
+        } else {
+            0
+        };
+        self.server.max_connections as u64 + console + FD_RESERVE
     }
 }
 
@@ -938,6 +1091,100 @@ mod tests {
         assert_eq!(c.auth.client_ca, "");
         assert_eq!(c.auth.client_ca_path(), None);
         assert_eq!(c.log.level, "info");
+        assert!(c.console.enabled);
+        assert_eq!(c.console.listen, "127.0.0.1:9443");
+        assert_eq!(c.console.max_connections, 64);
+        assert_eq!(c.console.max_streams, 16);
+        assert_eq!(
+            c.console.tls_files(&c.server),
+            ("cert.pem".to_string(), "key.pem".to_string())
+        );
+        // 1024 + 64 + 64
+        assert_eq!(c.fd_needed(), 1152);
+        assert_eq!(suggested_nofile(c.fd_needed()), 4096);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn console_settings_are_validated() {
+        // 預設值合法；停用時不檢查其他欄位
+        let mut c = AppConfig::default();
+        c.console.enabled = false;
+        c.console.listen = String::new();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.fd_needed(), 1024 + 64);
+
+        let mutations: [fn(&mut AppConfig); 6] = [
+            |c| c.console.listen = " ".into(),
+            |c| c.console.max_connections = 0,
+            |c| c.console.max_connections = MAX_CONSOLE_MAX_CONNECTIONS + 1,
+            |c| c.console.max_streams = 0,
+            |c| c.console.max_streams = c.console.max_connections + 1,
+            |c| c.console.cert_path = "console.pem".into(),
+        ];
+        for mutate in mutations {
+            let mut c = AppConfig::default();
+            mutate(&mut c);
+            assert!(c.validate().is_err(), "{:?}", c.console);
+        }
+        // 另設憑證時兩者都要有
+        let mut c = AppConfig::default();
+        c.console.cert_path = "console.pem".into();
+        c.console.key_path = "console.key".into();
+        assert!(c.validate().is_ok());
+        assert_eq!(
+            c.console.tls_files(&c.server),
+            ("console.pem".to_string(), "console.key".to_string())
+        );
+
+        // 環境變數
+        let c = from_env(&[
+            ("KAIROS__CONSOLE__LISTEN", "0.0.0.0:9443"),
+            ("KAIROS__CONSOLE__MAX_CONNECTIONS", "128"),
+            ("KAIROS__CONSOLE__ENABLED", "false"),
+        ])
+        .unwrap();
+        assert_eq!(c.console.listen, "0.0.0.0:9443");
+        assert_eq!(c.console.max_connections, 128);
+        assert!(!c.console.enabled);
+    }
+
+    #[test]
+    fn listen_addresses_must_not_collide() {
+        // KRS-E0202：IP:port 相同，或其中一個是所有介面而連接埠相同
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(listen_addrs_conflict(
+            &a("127.0.0.1:9443"),
+            &a("127.0.0.1:9443")
+        ));
+        assert!(listen_addrs_conflict(
+            &a("0.0.0.0:9443"),
+            &a("127.0.0.1:9443")
+        ));
+        assert!(listen_addrs_conflict(&a("[::]:9443"), &a("10.0.0.5:9443")));
+        assert!(listen_addrs_conflict(
+            &a("[::ffff:127.0.0.1]:9443"),
+            &a("127.0.0.1:9443")
+        ));
+        assert!(!listen_addrs_conflict(
+            &a("127.0.0.1:8443"),
+            &a("127.0.0.1:9443")
+        ));
+        assert!(!listen_addrs_conflict(
+            &a("127.0.0.1:9443"),
+            &a("127.0.0.2:9443")
+        ));
+        // 連接埠 0（由作業系統分配）不會衝突
+        assert!(!listen_addrs_conflict(&a("127.0.0.1:0"), &a("127.0.0.1:0")));
+
+        let mut c = AppConfig::default();
+        c.server.listen = "0.0.0.0:9443".into();
+        c.auth.client_ca = "ca.pem".into();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("KRS-E0202"), "{err}");
+        assert!(err.to_string().contains("console.listen"), "{err}");
+        // 停用主控台時不檢查
+        c.console.enabled = false;
         assert!(c.validate().is_ok());
     }
 
@@ -1208,6 +1455,17 @@ mod tests {
         let per_host = 17280 * 240 * 8 + 288 * 20 * 50 * 32 + 24 * 20 * 50 * 401;
         assert_eq!(c.estimated_sqlite_bytes(1), per_host);
         assert_eq!(c.estimated_sqlite_bytes(1024), 1024 * per_host);
+        // 依宣告的 report 間隔：每 60 秒一筆時原始資料少 12 倍，彙總不變
+        assert_eq!(c.estimated_sqlite_bytes_per_host(5000), per_host);
+        assert_eq!(
+            c.estimated_sqlite_bytes_per_host(60_000),
+            1440 * 240 * 8 + 288 * 20 * 50 * 32 + 24 * 20 * 50 * 401
+        );
+        // 1 秒以下以 1 秒計
+        assert_eq!(
+            c.estimated_sqlite_bytes_per_host(10),
+            c.estimated_sqlite_bytes_per_host(1000)
+        );
         // 預設 1024 台約 53 GB，低於預設上限 64 GiB：不警告
         assert_eq!(c.total_limit_below_estimate(), None);
         let mut big = AppConfig::default();

@@ -738,9 +738,13 @@ impl Sampler {
                 self.stuck_log = LogThrottle::new(STUCK_LOG_WINDOW);
                 self.stuck_log.check(Instant::now());
                 log::warn!(
-                    "系統資訊取樣（sysinfo）超過 {} 秒仍未完成，略過這次 report；heartbeat 照常送出，\
+                    "{}系統資訊取樣（sysinfo）超過 {} 秒仍未完成，略過這次 report；heartbeat 照常送出，\
                      伺服器端仍會顯示此主機在線，但不會收到新的 report。取樣完成前不再發起新的取樣\
                      （每 {} 分鐘提醒一次）",
+                    crate::codes::tag(
+                        crate::codes::SAMPLE_TIMEOUT,
+                        Some(crate::codes::W_SAMPLE_TIMEOUT)
+                    ),
                     self.timeout.as_secs_f64(),
                     STUCK_LOG_WINDOW.as_secs() / 60
                 );
@@ -760,7 +764,11 @@ impl Sampler {
             self.skipped = self.skipped.saturating_add(1);
             if self.stuck_log.check(Instant::now()).is_some() {
                 log::warn!(
-                    "系統資訊取樣仍未完成（已 {} 秒），持續略過 report（已略過 {} 次）",
+                    "{}系統資訊取樣仍未完成（已 {} 秒），持續略過 report（已略過 {} 次）",
+                    crate::codes::tag(
+                        crate::codes::SAMPLE_TIMEOUT,
+                        Some(crate::codes::W_SAMPLE_TIMEOUT)
+                    ),
                     started.elapsed().as_secs(),
                     self.skipped
                 );
@@ -829,9 +837,11 @@ async fn collect_with(mut sampler: Sampler, interval: Duration, tx: mpsc::Sender
             SampleOutcome::Skipped => continue,
             SampleOutcome::Stopped => return,
         };
+        crate::local_status::record(crate::local_status::State::sampled);
         match tx.try_send(s) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(s)) => {
+                crate::local_status::record(crate::local_status::State::dropped_disconnected);
                 log::debug!(
                     "回報佇列已滿（目前未連線或寫出中），丟棄此次取樣（ts={}）",
                     s.ts

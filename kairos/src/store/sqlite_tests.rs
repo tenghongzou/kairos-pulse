@@ -942,6 +942,25 @@ fn capacity_limit_deletes_the_oldest_raw_reports_first() {
     while store.maintain() {}
     let after = store.used_bytes().unwrap();
     assert!(after <= cap / 100 * 95, "{after} > {cap}");
+    // KRS-W4202：開始與結束記在 meta.capacity_event（系統健康的「最近一次容量刪除」）
+    let event: CapacityEvent = serde_json::from_str(
+        &store
+            .conn
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_CAPACITY_EVENT],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(event.limit_bytes, cap);
+    assert_eq!(event.started_at, noon().timestamp_millis());
+    assert_eq!(event.ended_at, Some(noon().timestamp_millis()));
+    assert!(event.deleted_raw >= 5000, "{event:?}");
+    assert!(!event.exhausted);
     // 刪除的是最舊的（seq 小的），最新的保留；原始資料還有剩時不刪彙總
     let min_seq = count(&mut store, "SELECT min(seq) FROM reports");
     assert!(min_seq > 0);
@@ -1451,4 +1470,68 @@ fn inventory_sync_timing() {
         "BENCH inventory hosts={hosts} chunk_rows={INVENTORY_CHUNK_ROWS} chunks={} chunked_total={total:?} chunk_max={max:?} single_transaction={single:?}",
         chunks.len()
     );
+}
+
+/// 子行程：以 [`open_exclusive`] 嘗試取得資料庫的獨占鎖（與 `kairos reports import` 相同），以結束代碼
+/// 回報：0 取得、3 使用中、4 其他錯誤。只由 [`probe_exclusive`] 以環境變數啟動
+#[test]
+#[ignore = "只由 prepare_files_keeps_the_locks_of_open_connections 以子行程執行"]
+fn exclusive_lock_probe() {
+    let Some(dir) = std::env::var_os("KAIROS_TEST_LOCK_PROBE_DIR") else {
+        return;
+    };
+    let code = match open_exclusive(&opts(Path::new(&dir)), Duration::from_millis(100)) {
+        Ok(_) => 0,
+        Err(e) if e.kind() == ErrorKind::ResourceBusy => 3,
+        Err(_) => 4,
+    };
+    std::process::exit(code);
+}
+
+/// 在另一個行程中嘗試取得獨占鎖（POSIX 的 fcntl 鎖在同一個行程內不會互相衝突）
+#[cfg(unix)]
+fn probe_exclusive(dir: &Path) -> i32 {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "store::sqlite::tests::exclusive_lock_probe",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("KAIROS_TEST_LOCK_PROBE_DIR", dir)
+        .output()
+        .unwrap();
+    out.status.code().unwrap_or(-1)
+}
+
+/// writer 在資料庫被替換後重新開啟時會再呼叫 `prepare_files`，此時同一個行程內可能已有其他連線
+/// （主控台的唯讀連線池、背景 checkpoint）開著同一個檔：`prepare_files` 不得以 `std::fs` 開關它，
+/// 否則行程在這個檔上的 fcntl 鎖全部被放掉，`kairos reports import` 偵測不到 Kairos 正在執行
+#[cfg(unix)]
+#[test]
+fn prepare_files_keeps_the_locks_of_open_connections() {
+    let dir = temp_dir("locks");
+    let path = opts(&dir).path;
+    let (mut store, _) = open(&dir, noon);
+    assert_eq!(
+        store.write(&[legacy(A, 1, noon(), 1.0)]),
+        [WriteStatus::Written]
+    );
+    let reader = open_read_only(&path).unwrap();
+    let n: i64 = reader
+        .query_row("SELECT count(*) FROM reports", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(probe_exclusive(&dir), 3, "連線開著時應拿不到獨占鎖");
+    prepare_files(&path).unwrap();
+    assert_eq!(
+        probe_exclusive(&dir),
+        3,
+        "prepare_files 之後仍應拿不到獨占鎖（行程的鎖被放掉了）"
+    );
+    // 探測本身有效：所有連線關閉後可以取得
+    drop(reader);
+    drop(store);
+    assert_eq!(probe_exclusive(&dir), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

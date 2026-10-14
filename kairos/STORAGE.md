@@ -22,6 +22,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 
 - **抽象介面**：連線只認得 `ReportSink`（送出、等待結果、逾時取消），不知道後端。後端實作 `trait ReportStore`（`write_batch`、`sync_inventory`、`maintain`、`close`，同步 API、一批一個交易）。日後換成時序資料庫時實作這個 trait 即可，連線與協定不需修改。
 - **後端選擇**（`storage.backend`）：`sqlite`（預設）或 `jsonl`。`jsonl` 是舊版的按日 JSONL writer（`storage.rs`），保留給相容與回復使用，沒有主機清冊與彙總；durable 的去重只在記憶體中、範圍有限（第 5.1 節）。
+- **其他連線**（0.4 起，主控台 API，`API.md`）：唯讀連線池（WAL 讀者，最多 4 條同時查詢，不擋住寫入）；以及一條低頻寫入的連線（token 的最後使用時間每 60 秒、token 稽核旗標與被拒的憑證每 10 秒，各一個短交易，busy 最多等 250 ms）。report、彙總、清冊同步仍只由 writer 寫入；主控台只寫 `api_tokens` 與 `hosts.cert_rejected_at`／`cert_rejection` 這兩個 writer 不碰的欄位。`kairos api-token` 也是短交易的寫入者（可在 Kairos 執行中使用）。主控台的連線只經由 SQLite 開啟（不以 `std::fs` 開關資料庫檔），否則會放掉同一個行程中 writer 的 fcntl 鎖（第 13.1 節的獨占鎖偵測因此失效）。
 - **JSONL 鏡像**（`storage.jsonl_mirror = true`，只在 `sqlite` 時有效）：寫入 SQLite 成功（`Written`）的 report 另外交給 JSONL writer，格式、檔名、`storage.retention_days` 與 `storage.max_daily_bytes` 的規則與 `backend = "jsonl"` 完全相同（`retention.rs` 的保留清除與時鐘跳躍保護照常運作）。鏡像是盡力而為：鏡像的佇列已滿或寫入失敗時只記 `WARN`／`ERROR`，**不影響 `ack`**；重複的 report（`Duplicate`）不寫入鏡像。
 
 ### 1.1 `ack` 的語意（PROTOCOL.md「流程」第 2 點）
@@ -48,7 +49,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 
 Kairos 執行中把 `kairos.db` 刪除或替換時（Unix 上以裝置與 inode 比對，與 JSONL 的 `needs_reopen` 相同），下一批寫入前記 `WARN` 並建立新的資料庫，不會寫進已刪除的檔案後回 `ack`；記憶體中尚未寫出的彙總一併捨棄。
 
-## 3. Schema（v2）
+## 3. Schema（v3）
 
 `PRAGMA application_id = 0x4B525331`（「KRS1」），`PRAGMA user_version` 為 schema 版本。時間一律為 Unix 毫秒（彙總的 `bucket` 為 Unix 秒），UTC。
 
@@ -124,7 +125,28 @@ CREATE TABLE import_keys (                 -- 匯入的去重鍵：主機＋取�
     hash    INTEGER NOT NULL,              -- 內容雜湊（64 位元）
     PRIMARY KEY (host_id, ts, hash)
 ) WITHOUT ROWID;
+
+-- v3：主控台 API（API.md）
+CREATE TABLE api_tokens (                  -- API token（kairos api-token；秘密只存 SHA-256）
+    token_id      TEXT PRIMARY KEY,        -- 公開的識別碼（16 個十六進位字元）
+    name          TEXT NOT NULL,
+    secret_hash   BLOB NOT NULL,           -- SHA-256(秘密)
+    scope         TEXT NOT NULL,           -- 本版只有 'read'
+    created_at    INTEGER NOT NULL,
+    created_by    TEXT,                    -- 執行 kairos api-token 的作業系統帳號
+    expires_at    INTEGER,                 -- NULL：不過期
+    revoked_at    INTEGER,
+    revoked_by    TEXT,
+    revoke_reason TEXT,
+    last_used_at  INTEGER,                 -- 主控台每 60 秒寫回
+    last_used_ip  TEXT,
+    logged        INTEGER NOT NULL DEFAULT 0  -- 1：建立已寫入 Kairos 日誌；2：撤銷已寫入
+) WITHOUT ROWID;
+ALTER TABLE hosts ADD COLUMN cert_rejected_at INTEGER;  -- 握手時被拒的憑證（設計包 §24 #3）
+ALTER TABLE hosts ADD COLUMN cert_rejection TEXT;       -- JSON：reason、serial、peer、count
 ```
+
+`meta` 另有 `capacity_event`（最近一次容量上限刪除，第 8.2 節）與 `retention_last`（最近一次保留清除的結果），兩者由 writer 寫入、主控台的系統健康讀取。
 
 - 不使用 `STRICT` 表與外鍵，讓較舊的 `sqlite3` 命令列工具（例如 RHEL 8 的 3.26）也能開啟備份檔檢查。
 - `seq`、`report_seq` 是 u64，以 i64 的位元形式保存（超過 2^63 時讀回要轉回 u64）。
@@ -146,7 +168,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - 資料庫的版本比程式新（降版執行）時拒絕啟動，不做任何變更；請改用較新的版本，或從升級前的備份還原。
 - 檔案存在但 `application_id` 不是 Kairos、又有其他資料表時拒絕使用（例如 `storage.data_dir` 指錯）。
 - 新增欄位或資料表時加一個遷移，不修改既有遷移的內容。**升級 Kairos 前先備份**（第 9 節）：遷移後的資料庫無法給舊版使用。
-- 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）。`kairos reports import` 開啟資料庫時同樣會升級 schema。
+- 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）、v3（0.4：`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`，主控台 API 使用）。`kairos reports import`、`kairos api-token` 開啟資料庫時同樣會升級 schema；升級到 v3 之後 0.3 的 Kairos 無法開啟（降版請從升級前的備份還原）。
 
 ## 4. 寫入路徑與批次策略
 
@@ -285,7 +307,12 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 2. 原始 report 已刪光時，5 分鐘彙總最舊的一天；
 3. 再來是 1 小時彙總最舊的一天。
 
-刪到上限的 95% 以下才停止（避免在上限附近每幾秒刪一次），開始與結束各記一行（結束時附刪除的筆數）。主機清冊、序列與 `meta` 不會被刪除；沒有東西可刪時記 `WARN`。
+刪到上限的 95% 以下才停止（避免在上限附近每幾秒刪一次）。主機清冊、序列、`meta` 與 `api_tokens` 不會被刪除。0.4 起以設計包的代碼 `KRS-W4202`（容量已滿，提早刪除最舊的資料；`copywriting.md` §4.2 範例 68）記錄：
+
+- 開始：`WARN`「警告 KRS-W4202：資料庫已達容量上限，正在提早刪除最舊的資料：已使用 … bytes，超過 storage.max_total_bytes（… bytes）…」；
+- 結束：`INFO`「KRS-W4202 結束：SQLite 資料庫已降到 … bytes（上限 … bytes），停止刪除；這一輪刪除原始 report N 筆、5 分鐘彙總 M 列、1 小時彙總 L 列」；
+- 沒有東西可刪：`WARN`（節流）「警告 KRS-W4202：…已沒有原始 report 或彙總可刪除…；請調高上限」；
+- 開始與結束都寫入 `meta.capacity_event`（JSON：`started_at`、`ended_at`、`used_bytes`、`limit_bytes`、各層刪除的列數、`exhausted`），主控台的系統健康（`/api/v1/system/health` 的 `database`）以它顯示「最近一次容量刪除」，正在刪除或最近 24 小時內刪除過時為警告。
 
 注意：
 
@@ -527,7 +554,7 @@ sudo systemctl start kairos
 ## 14. 限制與後續
 
 - 單一寫入者：同一個資料目錄只能有一個 Kairos（A2 的 HA 需要外部資料庫）。
-- 沒有查詢 API；趨勢以 SQL 或 `kairos reports export` 取得（F1 的 API 會建立在這個 schema 上）。
+- 主控台 API（0.4，`API.md`）以唯讀連線查詢這個 schema；趨勢也可以 SQL 或 `kairos reports export` 取得。
 - `kairos reports export` 不做全域時間範圍的索引（未指定 `--agent` 時掃描整個 `reports` 表）。
 - 彙總的值以 f64 計算，超過 2^53 的整數會失去精度（原始資料保留原值）。
 - 清冊不會自動刪除主機（除役流程屬 F 系列）。

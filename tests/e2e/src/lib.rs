@@ -9,6 +9,7 @@
 //! - [`Kairos`]、[`Pulse`]：在暫存目錄中寫好設定、憑證與 `agent.id`，以隨機埠在 127.0.0.1 上啟動。
 //! - [`test_pki`]：與 Kairos 整合測試共用的 mTLS 測試 PKI（客戶端憑證、私鑰、CA 與 CRL）。
 //! - [`RawClient`]：以 mTLS 連上 Kairos、逐行收送 JSON 的假 client（模擬只支援協定 v1 的舊版 Pulse）。
+//! - [`Api`]、[`ApiStream`]：主控台 API（`kairos/API.md`）的 HTTPS 用戶端與 SSE 串流。
 //!
 //! 不連外部網路、不新增外部套件（只用標準函式庫與 workspace 已使用的 `serde_json`、`rustls`）。
 
@@ -217,7 +218,18 @@ impl Drop for TestDir {
 fn is_ambient_setting(key: &str) -> bool {
     key.starts_with("KAIROS__")
         || key.starts_with("PULSE__")
-        || matches!(key, "NOTIFY_SOCKET" | "JOURNAL_STREAM" | "BUILD_COMMIT")
+        || matches!(
+            key,
+            "NOTIFY_SOCKET"
+                | "JOURNAL_STREAM"
+                | "BUILD_COMMIT"
+                // pulse status 的符號與色彩（cli-style §3、§4）
+                | "PULSE_SYMBOLS"
+                | "NO_COLOR"
+                | "CLICOLOR_FORCE"
+                // systemd 的 StateDirectory=（在服務中執行測試時）：Pulse 的狀態檔預設位置會改用它
+                | "STATE_DIRECTORY"
+        )
 }
 
 /// 一個啟動中的 `kairos` 或 `pulse` 行程。結束時（含測試 panic）若仍在執行則強制終止。
@@ -338,6 +350,11 @@ impl Proc {
             self.name,
             tail(&self.stderr())
         )
+    }
+
+    /// 行程 ID
+    pub fn id(&self) -> u32 {
+        self.child.id()
     }
 
     /// 行程是否仍在執行（已結束時記下結束狀態）
@@ -594,10 +611,12 @@ pub const PULSE_REGISTERED: &str = "已向伺服器註冊";
 /// Pulse 優雅結束的日誌
 pub const PULSE_STOPPED: &str = "Pulse 已結束";
 
-/// 在暫存目錄中準備好的 Kairos（mTLS + CRL、熱重載每秒檢查一次）
+/// 在暫存目錄中準備好的 Kairos（mTLS + CRL、熱重載每秒檢查一次；主控台 API 在另一個隨機埠）
 pub struct Kairos {
     pub dir: PathBuf,
     pub port: u16,
+    /// 主控台 API 的連接埠（`console.listen`）
+    pub console_port: u16,
 }
 
 impl Kairos {
@@ -610,6 +629,10 @@ impl Kairos {
     pub fn named(root: &TestDir, name: &str, crl: &str) -> Self {
         let dir = root.sub(name);
         let port = free_port();
+        // 兩次 free_port 理論上可能拿到同一個埠（之前的監聽已關閉），主控台埠另外確認不同
+        let console_port = std::iter::repeat_with(free_port)
+            .find(|p| *p != port)
+            .unwrap();
         std::fs::copy(pulse_testdata("server.pem"), dir.join("server.pem")).unwrap();
         std::fs::copy(pulse_testdata("server.key"), dir.join("server.key")).unwrap();
         std::fs::write(dir.join("client-ca.pem"), test_pki::CA).unwrap();
@@ -635,11 +658,54 @@ crl = ["agents.crl"]
 
 [log]
 level = "debug"
+
+# 主控台 API：與 agent 連線埠共用伺服器憑證（SAN localhost）
+[console]
+listen = "127.0.0.1:{console_port}"
 "#
             ),
         )
         .unwrap();
-        Self { dir, port }
+        Self {
+            dir,
+            port,
+            console_port,
+        }
+    }
+
+    /// 以實際的 `kairos api-token create` 建立唯讀 token（Kairos 執行中也可以）
+    pub fn create_token(&self, name: &str) -> String {
+        let (code, p) = run_to_exit(
+            "kairos",
+            &self.dir,
+            &[
+                "api-token",
+                "create",
+                "--name",
+                name,
+                "--config",
+                "kairos.toml",
+                "--json",
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "kairos api-token create 失敗\n{}", p.dump());
+        let doc: serde_json::Value = serde_json::from_str(p.stdout().trim())
+            .unwrap_or_else(|e| panic!("api-token create --json 不是 JSON（{e}）：{}", p.stdout()));
+        assert_eq!(doc["schema"], "kairos.api-token.create/v1", "{doc}");
+        assert!(p.stdout().is_ascii());
+        doc["data"]["token"]
+            .as_str()
+            .expect("應有 token")
+            .to_string()
+    }
+
+    /// 主控台 API 的用戶端
+    pub fn api(&self, token: &str) -> Api {
+        Api {
+            port: self.console_port,
+            token: token.to_string(),
+        }
     }
 
     /// 啟動並等到開始監聽
@@ -801,6 +867,9 @@ interval = 1
 [report]
 interval = 1
 
+[status]
+file = "state/status.json"
+
 [log]
 level = "trace"
 "#
@@ -813,6 +882,175 @@ level = "trace"
     /// 啟動（不等待註冊）
     pub fn start(&self, envs: &[(&str, &str)]) -> Proc {
         Proc::spawn("pulse", &self.dir, &[], envs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 主控台 API（HTTPS）
+// ---------------------------------------------------------------------------
+
+/// 以伺服器端 TLS（信任 `pulse/testdata/server-ca.pem`、名稱 localhost）連上主控台
+fn api_connect(port: u16) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(pulse_testdata("server-ca.pem")).unwrap() {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let conn =
+        rustls::ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
+            .unwrap();
+    let tcp = std::net::TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("無法連上主控台 127.0.0.1:{port}：{e}"));
+    tcp.set_read_timeout(Some(WAIT)).unwrap();
+    rustls::StreamOwned::new(conn, tcp)
+}
+
+/// 主控台 API 的用戶端（每個請求一條 HTTP/1.0 連線）
+pub struct Api {
+    pub port: u16,
+    pub token: String,
+}
+
+impl Api {
+    /// `GET path`，回傳狀態碼與 JSON 本文
+    pub fn get(&self, path: &str) -> (u16, serde_json::Value) {
+        use std::io::{Read as _, Write as _};
+        let mut s = api_connect(self.port);
+        write!(
+            s,
+            "GET {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
+            self.token
+        )
+        .unwrap();
+        s.flush().unwrap();
+        let mut buf = Vec::new();
+        // 伺服器關閉時可能沒有 close_notify：已讀到的內容照常處理
+        let _ = s.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("回應沒有標頭：{text}"));
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let json =
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("回應不是 JSON（{e}）：{text}"));
+        (status, json)
+    }
+
+    /// `GET path` 並要求 200，回傳 `data`
+    pub fn data(&self, path: &str) -> serde_json::Value {
+        let (status, v) = self.get(path);
+        assert_eq!(status, 200, "GET {path}：{v}");
+        assert!(
+            v["server_time"].as_str().is_some_and(|t| t.ends_with('Z')),
+            "{v}"
+        );
+        v["data"].clone()
+    }
+}
+
+/// SSE 的一則事件
+#[derive(Debug, Clone)]
+pub struct ApiEvent {
+    pub id: Option<String>,
+    pub event: String,
+    pub data: serde_json::Value,
+}
+
+/// `/api/v1/events` 的串流
+pub struct ApiStream {
+    stream: rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    buf: String,
+}
+
+impl ApiStream {
+    pub fn open(api: &Api, last_event_id: Option<&str>) -> Self {
+        use std::io::{Read as _, Write as _};
+        let mut s = api_connect(api.port);
+        let resume = last_event_id
+            .map(|id| format!("Last-Event-ID: {id}\r\n"))
+            .unwrap_or_default();
+        write!(
+            s,
+            "GET /api/v1/events HTTP/1.0\r\nHost: localhost\r\nAccept: text/event-stream\r\nAuthorization: Bearer {}\r\n{resume}\r\n",
+            api.token
+        )
+        .unwrap();
+        s.flush().unwrap();
+        let mut raw = Vec::new();
+        let split = loop {
+            if let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = s.read(&mut chunk).expect("讀取 SSE 標頭失敗");
+            assert!(n > 0, "主控台在標頭之前關閉了連線");
+            raw.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        assert!(
+            head.starts_with("HTTP/1.0 200") || head.starts_with("HTTP/1.1 200"),
+            "{head}"
+        );
+        Self {
+            stream: s,
+            buf: String::from_utf8_lossy(&raw[split + 4..]).into_owned(),
+        }
+    }
+
+    /// 下一則事件（略過心跳註解與 `retry:`；讀取逾時為 [`WAIT`]）
+    pub fn next_event(&mut self) -> ApiEvent {
+        use std::io::Read as _;
+        loop {
+            while let Some(p) = self.buf.find("\n\n") {
+                let block: String = self.buf.drain(..p + 2).collect();
+                let (mut id, mut event, mut data) = (None, None, String::new());
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("id: ") {
+                        id = Some(v.to_string());
+                    } else if let Some(v) = line.strip_prefix("event: ") {
+                        event = Some(v.to_string());
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data.push_str(v);
+                    }
+                }
+                if let Some(event) = event {
+                    return ApiEvent {
+                        id,
+                        event,
+                        data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+                    };
+                }
+            }
+            let mut chunk = [0u8; 4096];
+            let n = self
+                .stream
+                .read(&mut chunk)
+                .expect("等待 SSE 事件逾時或失敗");
+            assert!(n > 0, "SSE 串流已結束");
+            self.buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+    }
+
+    /// 等到某種事件且 `agent_id` 相符（略過其他的）
+    pub fn wait_for(&mut self, kind: &str, agent_id: &str) -> ApiEvent {
+        loop {
+            let e = self.next_event();
+            if e.event == kind && (agent_id.is_empty() || e.data["agent_id"] == agent_id) {
+                return e;
+            }
+        }
     }
 }
 

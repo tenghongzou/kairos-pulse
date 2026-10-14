@@ -79,6 +79,34 @@ pub fn restrict_open_file(file: &std::fs::File) -> io::Result<bool> {
     Ok(false)
 }
 
+/// 以路徑把既有的一般檔案收緊到最多 0640（Unix），不開啟檔案；不存在或不是一般檔案時不做任何事。
+/// 回傳是否有變更。Windows 上不做任何事。
+///
+/// 用於 SQLite 正在使用的檔案：同一個行程內開關它們的 fd 會放掉 SQLite 的 fcntl 鎖
+/// （`store::sqlite` 的 `prepare_files`）。
+pub fn restrict_path(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if !meta.is_file() {
+            return Ok(false);
+        }
+        let mode = meta.permissions().mode() & 0o7777;
+        if restricted(mode) != mode {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(restricted(mode)))?;
+            return Ok(true);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(false)
+}
+
 /// [`restrict_open_file`] 的 tokio 版本
 pub async fn restrict_open_tokio_file(file: &tokio::fs::File) -> io::Result<bool> {
     #[cfg(unix)]

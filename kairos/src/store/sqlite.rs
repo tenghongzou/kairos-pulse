@@ -147,6 +147,29 @@ CREATE TABLE import_keys (
 ) WITHOUT ROWID;
 ";
 
+/// schema v3（0.4）：主控台 API 的 token（`kairos/API.md` 第 4 節），以及握手時被拒的客戶端憑證
+/// 歸屬到主機（設計包 §24 #3）
+const SCHEMA_V3: &str = "
+CREATE TABLE api_tokens (
+    token_id      TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    secret_hash   BLOB NOT NULL,
+    scope         TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    created_by    TEXT,
+    expires_at    INTEGER,
+    revoked_at    INTEGER,
+    revoked_by    TEXT,
+    revoke_reason TEXT,
+    last_used_at  INTEGER,
+    last_used_ip  TEXT,
+    logged        INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+ALTER TABLE hosts ADD COLUMN cert_rejected_at INTEGER;
+ALTER TABLE hosts ADD COLUMN cert_rejection TEXT;
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -157,10 +180,62 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: SCHEMA_V2,
     },
+    Migration {
+        version: 3,
+        sql: SCHEMA_V3,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
+
+/// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
+pub const META_CAPACITY_EVENT: &str = "capacity_event";
+/// `meta` 的鍵：最近一次保留清除（JSON，見 [`RetentionRun`]）
+pub const META_RETENTION_LAST: &str = "retention_last";
+
+/// 設計包 `copywriting.md` §3.3：容量已滿，提早刪除最舊的資料
+pub const CODE_CAPACITY: &str = "KRS-W4202";
+
+/// 容量上限刪除的事件（`meta.capacity_event`；主控台的系統健康，`kairos/API.md` 第 5.6 節）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapacityEvent {
+    /// 開始刪除的時間（Unix 毫秒）
+    pub started_at: i64,
+    /// 停止刪除的時間；仍在刪除時為 `None`
+    pub ended_at: Option<i64>,
+    /// 開始時（或結束時）的使用量
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    /// 刪除的列數：原始 report、5 分鐘彙總、1 小時彙總
+    pub deleted_raw: u64,
+    pub deleted_rollup_5m: u64,
+    pub deleted_rollup_1h: u64,
+    /// 已沒有東西可刪而停止（仍超過上限）
+    #[serde(default)]
+    pub exhausted: bool,
+}
+
+/// 最近一次保留清除（`meta.retention_last`）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetentionRun {
+    /// 這一輪結束的時間（Unix 毫秒）
+    pub finished_at: i64,
+    pub deleted_raw: u64,
+    pub deleted_rollup_5m: u64,
+    pub deleted_rollup_1h: u64,
+}
+
+/// 寫入 `meta`（失敗只影響系統健康的顯示，不影響寫入）
+fn put_meta(conn: &Connection, key: &str, value: &impl serde::Serialize) -> rusqlite::Result<()> {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![key, text],
+    )
+    .map(|_| ())
+}
 
 /// `hosts.source`：由 `kairos reports import` 建立的主機（由連線建立的為 NULL）
 pub const HOST_SOURCE_IMPORT: &str = "import";
@@ -228,10 +303,11 @@ impl SqliteOptions {
     }
 }
 
-pub(super) fn db_error(context: &str, e: rusqlite::Error) -> Error {
+pub(crate) fn db_error(context: &str, e: rusqlite::Error) -> Error {
     let kind = match e.sqlite_error_code() {
         Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly) => ErrorKind::PermissionDenied,
         Some(ErrorCode::CannotOpen) => ErrorKind::NotFound,
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => ErrorKind::ResourceBusy,
         _ => ErrorKind::Other,
     };
     Error::new(kind, format!("{context}: {e}"))
@@ -245,7 +321,7 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// 檔案身分：Unix 為（裝置, inode），其他平台只看是否存在（Windows 上開著的資料庫無法被刪除）
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn file_identity(path: &Path) -> Option<(u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
@@ -260,7 +336,12 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// 資料庫與 `-wal`、`-shm` 檔：先以 0640 建立資料庫檔（SQLite 建立 `-wal`、`-shm` 時沿用
-/// 資料庫檔的權限），既有的檔案收緊到最多 0640（S3；Unix）
+/// 資料庫檔的權限），既有的檔案收緊到最多 0640（S3；Unix）。
+///
+/// 已存在的檔案**只以路徑**收緊權限，不以 `std::fs` 開啟：POSIX 的 fcntl 鎖以行程為單位，同一個
+/// 行程內關閉任何一個指向資料庫檔（或 `-shm`）的 fd，都會放掉 SQLite 連線在這個檔上的鎖。writer 在
+/// 資料庫被替換後重新開啟時，主控台的唯讀連線可能已經開著新檔；若在這裡開關它，`kairos reports import`
+/// 就偵測不到 Kairos 正在執行（`kairos/API.md` 第 7 節）。
 fn prepare_files(path: &Path) -> Result<(), Error> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -272,19 +353,29 @@ fn prepare_files(path: &Path) -> Result<(), Error> {
             )
         })?;
     }
-    let file = fsperm::private_std_options(std::fs::OpenOptions::new().create(true).append(true))
+    // 不存在時才建立（新檔不會有其他連線開著）；已存在（含建立時的競爭）時不開啟
+    match fsperm::private_std_options(std::fs::OpenOptions::new().write(true).create_new(true))
         .open(path)
-        .map_err(|e| Error::new(e.kind(), format!("無法開啟 {}: {}", path.display(), e)))?;
-    for (f, p) in [(Some(file), path.to_path_buf())]
-        .into_iter()
-        .chain(["-wal", "-shm"].iter().map(|s| {
-            let p = sidecar(path, s);
-            (std::fs::OpenOptions::new().read(true).open(&p).ok(), p)
-        }))
     {
-        if let Some(f) = f
-            && let Err(e) = fsperm::restrict_open_file(&f)
-        {
+        Ok(file) => {
+            if let Err(e) = fsperm::restrict_open_file(&file) {
+                warn!("無法將 {} 的權限收緊為 0640: {}", path.display(), e);
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(Error::new(
+                e.kind(),
+                format!("無法開啟 {}: {}", path.display(), e),
+            ));
+        }
+    }
+    for p in [
+        path.to_path_buf(),
+        sidecar(path, "-wal"),
+        sidecar(path, "-shm"),
+    ] {
+        if let Err(e) = fsperm::restrict_path(&p) {
             warn!("無法將 {} 的權限收緊為 0640: {}", p.display(), e);
         }
     }
@@ -322,6 +413,15 @@ pub(super) fn open_exclusive(opts: &SqliteOptions, busy: Duration) -> Result<Con
             _ => db_error(&ctx("無法取得資料庫的獨占鎖"), e),
         })?;
     finish_open(conn, opts, &path)
+}
+
+/// 管理用的讀寫連線（`kairos api-token`、主控台 API 的低頻寫入）：與 writer 相同的開啟方式
+/// （必要時建立資料庫並升級 schema），busy 時最多等待 `busy`
+pub(crate) fn open_admin(opts: &SqliteOptions, busy: Duration) -> Result<Connection, Error> {
+    let conn = open_connection(opts)?;
+    conn.busy_timeout(busy)
+        .map_err(|e| db_error("無法設定 busy_timeout", e))?;
+    Ok(conn)
 }
 
 /// 開啟（必要時建立）資料庫、設定 PRAGMA 並升級 schema
@@ -737,6 +837,8 @@ struct Capacity {
     next_check: Option<Instant>,
     /// 這一輪刪除的列數：原始、5 分鐘、1 小時
     deleted: [u64; 3],
+    /// 這一輪開始的時間（Unix 毫秒）
+    started_at: i64,
 }
 
 /// 測試用：讓下一次寫入在提交前或提交時失敗（正式程式不會設定）
@@ -1356,16 +1458,20 @@ impl SqliteStore {
             }
             self.capacity.active = true;
             self.capacity.deleted = [0; 3];
+            self.capacity.started_at = (self.clock)().timestamp_millis();
+            // 設計包 copywriting.md §4.2 範例 68
             warn!(
-                "SQLite 資料庫已使用 {} bytes，超過 storage.max_total_bytes（{} bytes），開始依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，直到低於上限的 {}%",
+                "警告 {CODE_CAPACITY}：資料庫已達容量上限，正在提早刪除最舊的資料：已使用 {} bytes，超過 storage.max_total_bytes（{} bytes）；依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，直到低於上限的 {}%。新的回報照常保存，實際保留期會短於設定（處理方式：依 STORAGE.md「容量估算」調高 storage.max_total_bytes 或縮短保留天數後重新啟動 Kairos）",
                 used, cap, CAPACITY_LOW_WATERMARK_PERCENT
             );
+            self.save_capacity_event(used, None, false);
         } else if used <= cap / 100 * CAPACITY_LOW_WATERMARK_PERCENT {
             self.capacity.active = false;
             let [raw, m5, h1] = self.capacity.deleted;
             info!(
-                "SQLite 資料庫已降到 {used} bytes（上限 {cap} bytes），停止刪除；這一輪刪除原始 report {raw} 筆、5 分鐘彙總 {m5} 列、1 小時彙總 {h1} 列"
+                "{CODE_CAPACITY} 結束：SQLite 資料庫已降到 {used} bytes（上限 {cap} bytes），停止刪除；這一輪刪除原始 report {raw} 筆、5 分鐘彙總 {m5} 列、1 小時彙總 {h1} 列"
             );
+            self.save_capacity_event(used, Some((self.clock)().timestamp_millis()), false);
             return Ok(false);
         }
         let Some(conn) = self.conn.as_mut() else {
@@ -1391,11 +1497,33 @@ impl SqliteStore {
             self.throttle,
             Category::StorageMaintenance,
             warn,
-            "SQLite 資料庫使用 {} bytes，超過 storage.max_total_bytes（{} bytes），但已沒有原始 report 或彙總可刪除（主機清冊與序列不會自動刪除）；請調高上限",
+            "警告 {}：SQLite 資料庫使用 {} bytes，超過 storage.max_total_bytes（{} bytes），但已沒有原始 report 或彙總可刪除（主機清冊與序列不會自動刪除）；請調高上限",
+            CODE_CAPACITY,
             used,
             cap
         );
+        self.save_capacity_event(used, Some((self.clock)().timestamp_millis()), true);
         Ok(false)
+    }
+
+    /// 把這一輪容量上限刪除的狀態寫入 `meta.capacity_event`（系統健康的「最近一次容量刪除」）
+    fn save_capacity_event(&mut self, used: u64, ended_at: Option<i64>, exhausted: bool) {
+        let [raw, m5, h1] = self.capacity.deleted;
+        let event = CapacityEvent {
+            started_at: self.capacity.started_at,
+            ended_at,
+            used_bytes: used,
+            limit_bytes: self.opts.max_total_bytes,
+            deleted_raw: raw,
+            deleted_rollup_5m: m5,
+            deleted_rollup_1h: h1,
+            exhausted,
+        };
+        if let Some(conn) = self.conn.as_ref()
+            && let Err(e) = put_meta(conn, META_CAPACITY_EVENT, &event)
+        {
+            debug!("無法記錄容量刪除的事件: {e}");
+        }
     }
 
     /// 開始新一輪的保留期限刪除；日期保護判斷時鐘可能被誤校時不刪除
@@ -1535,6 +1663,15 @@ impl SqliteStore {
                 info!(
                     "已依保留期限刪除 SQLite 中過期的資料：原始 report {raw} 筆、5 分鐘彙總 {m5} 列、1 小時彙總 {h1} 列（storage.raw_retention_days、rollup_5m_retention_days、rollup_1h_retention_days）"
                 );
+            }
+            let run = RetentionRun {
+                finished_at: now.timestamp_millis(),
+                deleted_raw: raw,
+                deleted_rollup_5m: m5,
+                deleted_rollup_1h: h1,
+            };
+            if let Err(e) = put_meta(conn, META_RETENTION_LAST, &run) {
+                debug!("無法記錄保留清除的結果: {e}");
             }
             self.retention = None;
             // boot 對照表可能刪除了快取中的項目
@@ -2054,18 +2191,42 @@ pub struct HostRow {
 
 /// 以唯讀方式開啟資料庫（不建立檔案、不升級 schema）；Kairos 執行中也可以開啟（WAL）
 pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
+    open_existing(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        Duration::from_secs(5),
+    )
+}
+
+/// 在 Kairos 行程內開啟既有資料庫的讀寫連線（主控台 API 的低頻寫入）：只經由 SQLite 開啟，
+/// 不建立檔案、不升級 schema，也不以 `std::fs` 開關資料庫檔。
+///
+/// 不可以在 Kairos 行程內使用 [`open_admin`]：它的 `prepare_files` 以 `std::fs` 開啟再關閉資料庫檔，
+/// POSIX 的 fcntl 鎖以行程為單位，關閉任何一個檔案描述元就會放掉這個行程對該檔案的所有鎖
+/// （包括 writer 連線的 SHARED 鎖），`kairos reports import` 會因此誤判 Kairos 沒有在執行
+pub fn open_existing_read_write(path: &Path, busy: Duration) -> Result<Connection, Error> {
+    let conn = open_existing(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        busy,
+    )?;
+    // checkpoint 由 Kairos 的背景執行緒處理，這條連線 commit 時不 checkpoint
+    conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 0;")
+        .map_err(|e| db_error("無法設定 PRAGMA", e))?;
+    Ok(conn)
+}
+
+/// [`open_read_only`]、[`open_existing_read_write`] 共用：開啟既有的 Kairos 資料庫並檢查版本
+fn open_existing(path: &Path, flags: OpenFlags, busy: Duration) -> Result<Connection, Error> {
     if !path.is_file() {
         return Err(Error::new(
             ErrorKind::NotFound,
             format!("找不到資料庫 {}", path.display()),
         ));
     }
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| db_error(&format!("無法開啟 {}", path.display()), e))?;
-    conn.busy_timeout(Duration::from_secs(5))
+    let conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| db_error(&format!("無法開啟 {}", path.display()), e))?;
+    conn.busy_timeout(busy)
         .map_err(|e| db_error("無法設定 busy_timeout", e))?;
     let id: i32 = conn
         .query_row("PRAGMA application_id", [], |r| r.get(0))

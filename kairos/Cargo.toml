@@ -1,6 +1,6 @@
 [package]
 name = "kairos"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 # 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
@@ -18,10 +18,18 @@ date-guard = { path = "../crates/date-guard" }
 # 與 Pulse 共用的協定型別與驗證（workspace 內部 crate）
 kairos-proto = { path = "../crates/kairos-proto" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# 主控台 API（kairos/API.md 第 8 節）：只啟用 HTTP/1.1 伺服器；TLS 沿用 tokio-rustls
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+# hyper 與 tokio 之間的 I/O 與計時器轉接（TokioIo、TokioTimer）
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 log = "0.4"
 # report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
 # 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# API token 的 SHA-256、常數時間比對與隨機數；與 rustls 使用的加密後端是同一個（已在依賴樹中）
+ring = "0.17"
+# API token 雜湊的常數時間比較（rustls 已依賴同一版本，不新增套件）
+subtle = { version = "2", default-features = false }
 # 檢查 mTLS 客戶端憑證的 SAN；與 rustls 依賴的版本相同，只啟用 alloc（不引入其他加密後端）
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }

@@ -46,7 +46,101 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（0.3.0 之後的變更記在這裡。）
+（0.4.0 之後的變更記在這裡。）
+
+## [0.4.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.4.0、Pulse 0.4.0**：商業審計路線圖「階段 3 MVP 產品面」。Kairos 新增 F1（查詢與管理 API）第一版：HTTPS 的主控台 API（`/api/v1`，唯讀）與 API token，是主控台畫面的前提；Pulse 新增 `pulse status`、所有人可讀的本機狀態檔與日誌的事件代碼。**協定不變**（仍為 v1～v2＋`durable`），兩個產品可以分批、以任何順序升級。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.4.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。API 的規格、端點、驗證、即時推送與量測見 `kairos/API.md`（Kairos 發佈包內的 `API.md`）；Pulse 的錯誤代碼對照見 `pulse/ERROR-CODES.md`（Pulse 發佈包內的 `ERROR-CODES.md`）。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **預設監聽主控台 API `127.0.0.1:9443`**（`[console]`，HTTPS；預設啟用、只綁 loopback） | 9443 已被其他程式使用的主機；與 `server.listen` 使用同一個位址與連接埠的設定 | 升級前 `ss -ltnp \| grep :9443` 確認沒有被使用。被佔用時 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）：在 `kairos.toml` 加上 `[console]` 的 `listen`（換連接埠）或 `enabled = false`。與 `server.listen` 相同時以 `KRS-E0202` 拒絕啟動（結束代碼 3） |
+| 2 | Kairos | **資料庫 schema 升級到 v3**（`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`） | 所有 SQLite 部署 | 升級前 `kairos db backup`（Kairos INSTALL 第 11 節）；升級後 0.3 無法開啟資料庫（降版從備份還原） |
+| 3 | Kairos | **檔案描述元的需要量多了主控台的連線上限**：`server.max_connections` ＋ `console.max_connections`（預設 64）＋ 64（設計包 D21） | 自訂 `LimitNOFILE` 剛好等於舊算式的部署 | 啟動時不足會記 `WARN` 並附建議值；發佈包 unit 的 `LimitNOFILE=8192` 足夠 |
+| 4 | Pulse | **本機狀態檔改到 `/var/lib/pulse/status.json`，需要新版 `pulse.service`**（`StateDirectory=pulse`、`StateDirectoryMode=0755`；多實例 `StateDirectory=pulse/N`） | 以發佈包的 systemd unit 執行的部署（`ProtectSystem=strict` 下 `/var/lib/pulse` 不可寫）；要讓一般帳號執行 `pulse status` 的主機 | 換上新版 unit 並 `systemctl daemon-reload`（多實例依 Pulse INSTALL 第 9 節重新產生）；`chmod 751 /opt/pulse`（多實例的 `/opt/pulse-N` 也是）。沒有換 unit 時**服務照常啟動與監控**：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 只有 root 能用，「設定」列為警告（結束代碼 8） |
+| 5 | Pulse | **日誌訊息開頭加上事件與代碼**（例如 `buffer.full PLS-W4202 …`、`conn.registered - …`），`clock.skew` 超過 5 分鐘改為 `ERROR`；啟動失敗的 stderr 改為 `錯誤 PLS-E0101：…` | 以行首比對 Pulse 日誌文字的告警規則或腳本（例如比對 `[ERROR] 連線中斷`） | 升級前把規則改為比對事件或代碼（`conn.lost`、`PLS-E2002` 等，`pulse/ERROR-CODES.md`），或改用包含比對 |
+
+**升級步驟**（依序；協定不變，也可以先升級 Pulse，Kairos 與 Pulse 0.3／0.4 可以任意混用）：
+
+1. **Kairos 升級前**：`kairos db backup` 備份資料庫（第 2 項），確認 9443 沒有被使用（第 1 項）。
+2. **升級 Kairos**：換上新版執行檔並重新啟動（Kairos INSTALL 第 11 節，unit 不需修改）→ 確認日誌有「主控台 API 已啟動，監聽 https://127.0.0.1:9443/api/v1/」。
+3. **確認主控台 API**：以 `kairos api-token create` 建立 token（預設 90 天後到期）並依 Kairos INSTALL 第 9.3 節確認；需要從其他主機使用時把 `console.listen` 改為對外位址，並以防火牆**只允許管理網段**。
+4. **Pulse 升級前**：依第 5 項調整比對 Pulse 日誌文字的告警規則。
+5. **每台 Pulse 主機：換上新版 `pulse.service`**（第 4 項；多實例時對每個實例重新產生）並 `systemctl daemon-reload`；`chmod 751 /opt/pulse`。
+6. **升級 Pulse**：換上新版執行檔並重新啟動（Pulse INSTALL 第 10 節），以 `/opt/pulse/pulse status` 確認（結束代碼 0；「設定」列沒有 `PLS-E8204`）。
+
+### Kairos
+
+#### 新增
+
+- **主控台 API**（F1；設計包 `screens.md` §24 #1、#4、#5、#19）：HTTPS（rustls／ring，HTTP/1.1，hyper 1），版本前綴 `/api/v1`，JSON，時間為 RFC 3339 UTC 毫秒，每個回應帶 `server_time`，錯誤為 `{"error":{"code","product_code","message"}}`（`product_code` 對照 `copywriting.md` 的 `KRS-` 代碼），游標分頁。端點：
+  - `GET /api/v1/hosts`：主機清冊列表，伺服器端篩選（狀態、從未連線、失聯超過 N、離線原因、tag、OS、版本、是否支援補送、CIDR、主機名稱／顯示名稱／IP／agent_id 搜尋）、排序（嚴重度、名稱、最後上線、IP、版本、CPU、記憶體）、游標分頁、總數與各狀態台數；
+  - `GET /api/v1/hosts/{agent_id}`：詳情（清冊欄位、主機指紋、OS、標籤、目前連線、最近一次 report、是否協商補送與補送中、握手時被拒的憑證）；
+  - `GET /api/v1/hosts/{agent_id}/metrics[/{name}]`：目前回報的指標、趨勢（依範圍自動選原始資料／5 分鐘／1 小時彙總，也可指定；min／max／avg／count；有 label 的序列分開；點數上限；尚未寫出的彙總由原始資料計算）；
+  - `GET /api/v1/overview`：各狀態台數、每分鐘上線數（24 小時）、與 1 小時前的差、離線最久、資源使用前 10、健康摘要；
+  - `GET /api/v1/system/health`：資料庫用量與容量上限、以目前回報中的主機與宣告的間隔估算保留期滿的用量、最近一次容量刪除、保留設定與最近一次清除、report 寫入統計（成功、`storage_unavailable`、結果不明、重複、速率限制）、支援補送／補送中的台數、連線使用率、TLS 到期、監聽位址、檔案描述元、驗證模式；
+  - `GET /api/v1/events`：即時變更推送（SSE）：`host.added`、`host.online`、`host.offline`（附原因），每 15 秒心跳，`Last-Event-ID` 在保留範圍（4,096 則）內補送、否則 `resync`，同時連線數上限 `console.max_streams`；
+  - `GET /api/v1/me`：目前的身分。
+- **API 錯誤的產品代碼**（設計包 `copywriting.md` §3.4、`decisions/INTEGRATION.md` §26）：401 `unauthorized` → `KRS-E6010`、429 `rate_limited` → `KRS-W6011`、403 `forbidden` → `KRS-E6104`；`storage_unavailable`／`internal` → `KRS-E4003`；用法錯誤與暫時狀態為 `null`。每個來源第一次被限速時的 `WARN` 日誌為「警告 KRS-W6011：…」。
+- **API token**（暫行驗證，F6 之前）：`kairos api-token create|list|revoke`（設計包 `cli-style.md` §11.6；token 只在建立時顯示一次、資料庫只存 SHA-256、唯讀範圍、撤銷立即生效）。有效期限**預設 90 天、上限 3,650 天**（`--expires-in`／`--expires-at`），**不提供不過期的 token**（需要長期使用時 `--expires-in 3650d`）。給人看的時間用本機時區並標示時區（`--json` 為 UTC）；`list` 對 14 天內到期的有效 token 加 `⚠`（ASCII `[WARN]`）並提示輪替。`Authorization: Bearer`；常數時間比對；**驗證失敗依來源 IP 速率限制**（IPv6 以 /64 合併；可連續 10 次，之後每 6 秒恢復 1 次，額度用完回 429）；最後使用的時間與來源每 60 秒寫回；建立與撤銷由執行中的 Kairos 寫入日誌。
+- **狀態暖機期**（設計包 `ia.md` §5.1）：Kairos 啟動後 2 分鐘內，最後一次訊息在這次啟動之前、還沒連上的主機為 `unknown`（`status_detail.starting`），之後仍未連上改為 `offline`。
+- **設定 `[console]`**：`enabled`（預設 `true`）、`listen`（預設 `127.0.0.1:9443`）、`cert_path`／`key_path`（預設沿用伺服器憑證，熱重載）、`max_connections`（64）、`max_streams`（16）。
+- **握手時被拒的憑證歸屬到主機**（設計包 §24 #3）：已撤銷、已過期（或無法判定撤銷狀態）的客戶端憑證以 SAN 歸屬到 `agent_id`，記錄原因（`KRS-W1105`／`W1108`／`E1203`）、序號與來源位址，寫入主機清冊；主機詳情與列表的離線原因顯示「憑證被拒」。不受信任的 CA 簽發的憑證不歸屬（SAN 可偽造）。
+- **`KRS-W4202`**（容量上限刪除最舊的資料；設計包 §25.5 #3）：日誌改用代碼與 `copywriting.md` 的文案，開始與結束寫入 `meta.capacity_event`，系統健康顯示最近一次容量刪除。
+- 量測（`kairos/src/api/bench.rs`，kp-build 4 vCPU）：1 萬台主機的列表 p99 約 10 ms（每次重建索引的最壞情況約 40 ms）、30 天趨勢 p99 約 8～13 ms；每秒 2,000 筆 report 同時以主控台一般用量查詢時 `ack` p99 約 1 ms（只有寫入時約 2 ms），連續查詢的壓力下約 6 ms（API.md 第 9 節）。
+
+#### 變更
+
+- 啟動時的檔案描述元檢查（`LimitNOFILE`）的需要量含主控台的連線上限（上方第 3 項）。
+- 狀態表記錄最近一次的離線原因（逾時、連線關閉、Kairos 關機、連線中憑證被拒）、是否協商了 `durable` 與最近一次收到補送資料的時間，供 API 使用；`agents.json` 的格式不變。
+- 主控台在自己的 tokio runtime 上執行，查詢不影響 agent 連線與 report 寫入的延遲。
+- `kairos hosts list`、`reports export／import`、`db backup` 不變；`kairos reports import` 仍需要停止 Kairos（主控台的寫入連線不會放掉跨行程的檔案鎖，e2e `import.rs` 涵蓋）。
+- 資料庫在執行中被替換、writer 重新開啟時，不再以 `std::fs` 開關既有的資料庫檔與 `-wal`／`-shm`（只以路徑收緊權限）：同一個行程內關閉這些檔的 fd 會放掉其他連線（主控台的唯讀連線池、背景 checkpoint）的 fcntl 鎖，`kairos reports import` 可能誤判 Kairos 未執行。
+- `storage.backend = "jsonl"` 時不啟動主控台（記 `WARN`）。
+
+### Pulse
+
+#### 新增
+
+- **`pulse status`**（設計包 `pulse/cli-spec.md` §4）：讀取本機狀態檔與服務管理員（systemd、Windows 服務控制管理員），顯示服務、連線、回報、身分、設定、時鐘六列與本機狀態（線上／警告／離線／嚴重／未知），問題另以三段式說明（標題、原因、處理方式與代碼）寫到 stderr。`--brief`（單行）、`--json`（`pulse.status/v1`，純 ASCII）、`--watch [秒]`、`--exit-codes=nagios`、`--config`、`--ascii`、`--color`。不需要連線；結束代碼 0 線上、8 警告、9 離線／嚴重／未知、2 用法錯誤、10 無法讀取狀態檔。「回報」列寫出補送資訊：待補送筆數、最舊一筆的取樣時間、預計補完時間、最近 24 小時內因緩衝已滿或超過保存時間而丟棄的筆數與取樣時間範圍（`PLS-W4202`／`PLS-W4203`）、無法寫入緩衝（`PLS-W4103`）、緩衝無法使用（`PLS-E4004`）、Kairos 暫時無法保存（`PLS-W4101`）。README「本機狀態（pulse status）」、INSTALL 第 8.2 節。
+- **本機狀態檔**（`cli-spec.md` §4.1）：Linux `/var/lib/pulse/status.json`（`pulse.service` 新增 `StateDirectory=pulse`；多實例 `StateDirectory=pulse/N` 時依 `STATE_DIRECTORY` 寫 `/var/lib/pulse/N/`），Windows `%ProgramData%\Pulse\status.json`；`[status] file` 可改。**所有人可讀**（Unix 0644、目錄 0755，不受 unit 的 `UMask=0077` 影響；Windows 授予 Users 讀取），`pulse status` 不需要 root。執行中每 10 秒、狀態變化時另外以原子方式改寫（暫存檔＋rename，不 fsync）。內容不含秘密：沒有私鑰、token；未啟用 mTLS 時不含 agent_id（等同身分憑據）。以單調時鐘判斷是否過時（超過 60 秒為「未知」，`PLS-W8004`），正常結束前寫入結束代碼。
+- **`pulse explain <代碼>`**：印出錯誤代碼的標題；發佈包新增 `ERROR-CODES.md`（代碼 → 程式位置 → 觸發條件的對照表，與尚未實作的代碼）。
+- 子命令 `pulse run`（等同不帶參數）；`pulse status --instance <N>`（多實例）。
+
+#### 變更
+
+- **日誌加上固定事件與錯誤代碼**（上方第 5 項；設計包 `pulse/log-ux.md` §4、`decisions/INTEGRATION.md` §25.5）：有對應事件的行，訊息開頭為「`<event> <code> `」，例如 `buffer.full PLS-W4202`、`auth.rejected PLS-E1105`、`conn.registered -`。本機緩衝的 5010～5015（`buffer.opened`、`buffer.unavailable` `PLS-E4004`、`buffer.write_failed` `PLS-W4103`、`buffer.full` `PLS-W4202`、`buffer.expired` `PLS-W4203`、`buffer.replay_done`），連線中斷依原因分為 `conn.lost`（`PLS-E2002`～`E2005`、`E2201`）、`tls.server_cert_rejected`（`PLS-E1401`～`E1405`）、`auth.*`、`conn.superseded`、`proto.incompatible`、`server.full`；新增 `conn.restored`（恢復時記中斷時間、重試次數、待補送與丟棄筆數）與 `conn.outage`（中斷滿 30 分鐘時一次 `ERROR`，同時寫 stderr）。
+- **`clock.skew`**（事件 5000，`log-ux.md` §4.5）：30 秒～5 分鐘記 `WARN`（`PLS-W8301`），**超過 5 分鐘改記 `ERROR`**（`PLS-E8302`）並寫 stderr；只在等級改變或偏差再變化超過 1 分鐘時記錄（重連時不重複），回到 30 秒以內記一則 `INFO`（`clock.skew -`）。
+- **`status.write_failed`**（事件 5020，`PLS-E8204`）：執行中無法寫入狀態檔時第一次記 `WARN`，連續失敗滿 60 秒（`pulse status` 開始顯示「未知」）記 `ERROR` 並寫 stderr，之後每 10 分鐘一則 `ERROR` 摘要、其間 `DEBUG`；恢復寫入記 `status.write_restored`（事件 5021，`INFO`）。
+- **`pulse status` 遇到過時的狀態檔**（`cli-spec.md` §4.8）：連線、回報、身分、時鐘列以最後已知內容照常判定，並標示「（最後已知，N 分鐘前）」，沒有內容時略過（`skipped`）；本機狀態為「未知」（結束代碼 9）。沒有權限讀取狀態檔時結束代碼 10，`--exit-codes=nagios` 為 3（UNKNOWN）。
+- 啟動失敗的 stderr 訊息帶代碼：`錯誤 PLS-E0101：無法載入設定：…`（範圍錯誤為 `PLS-E0201`）、`錯誤 PLS-E4002：無法初始化日誌：…`；`agent.fatal` 帶 `PLS-E3103`／`PLS-E3104`（`agent.id`）、`PLS-E1102`（SAN 與 agent_id 不符）。命令列錯誤帶 `PLS-E0001`～`E0003`。
+- 無法開啟本機緩衝時，systemd 的 `Status:` 在「已註冊：…」後加上「；無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）」。
+- `--help` 列出 `status`、`explain`。
+
+#### 與設計包的差異與待辦
+
+見 `pulse/ERROR-CODES.md` §4、§5：尚未實作 Windows 事件記錄（`clock.skew`、`status.write_failed` 的 `ERROR` 目前只寫日誌與 stderr）、服務描述、`log-ux.md` 的完整格式（RFC 3339 時間、JSON）與重試摘要、`--all`、`--json-lines`，以及 53 個與註冊、安裝、自動更新憑證相關的代碼。Windows 的 MSI（含 SCCM 偵測指令碼依賴的 `install-result.json` 與執行檔的版本資源）尚未實作，在那之前不要以 `Detect-PulseInstalled.ps1` 作為必要部署的偵測規則（設計包 `sccm-deployment.md` §3、`decisions/INTEGRATION.md` §26.5 #8）。
+
+### 相容性
+
+- 協定不變：Kairos 0.4 與 Pulse 0.2／0.3／0.4 的組合，以及 Pulse 0.4 與 Kairos 0.2／0.3 的組合，都與對應的 0.3 組合相同（見「版本相容矩陣」與 0.3.0 的「相容性（A5）」）。
+- `pulse status` 只讀本機狀態檔，與連上的 Kairos 版本無關。
+
+### 已知限制
+
+- API 為唯讀；沒有使用者、角色、工作階段（F6）、告警（F3）與網頁介面（F2）。主機狀態只有 `online`、`offline`、`unknown`，`critical`／`warning`／`pending` 的計數為 `null`。其他限制、延後項目與待決定事項見 `kairos/API.md` 第 10 節。
+
+### 共用
+
+- 端對端測試（`tests/e2e`）新增 `api.rs`（以實際的 `kairos api-token create` 建立 token，經主控台 API 查主機與指標，SSE 收到上線／離線事件，撤銷的憑證歸屬到主機）與 `status.rs`（`pulse status` 隨 Kairos 停機、恢復與 Pulse 結束的變化）。每個 Kairos 另取一個隨機埠給主控台；子行程不繼承 `PULSE_SYMBOLS`、`NO_COLOR`、`CLICOLOR_FORCE`，狀態檔寫在各測試自己的暫存目錄。
+
+### 發佈與建置
+
+- 版本：`kairos`、`pulse` 改為 0.4.0；發佈包為 `kairos-0.4.0-<commit>-linux-x86_64.tar.gz`、`pulse-0.4.0-<commit>-linux-x86_64.tar.gz`。
+- Kairos 發佈包另附 `API.md`；Pulse 發佈包另附 `ERROR-CODES.md`，`pulse.service` 新增 `StateDirectory=pulse`、`StateDirectoryMode=0755`。
+- 新增依賴 `hyper`（只啟用 `server`、`http1`）、`hyper-util`（`tokio`）及其依賴 `http`、`http-body`、`httparse`、`httpdate`、`atomic-waker`（皆為 MIT／Apache-2.0）；`ring`、`subtle` 改為 Kairos 的直接依賴（原已在依賴樹中）。`deny.toml`、`packaging/about.toml` 的授權允許清單不需變更。
 
 ## [0.3.0] - 〔草稿：發佈日期待定〕
 
