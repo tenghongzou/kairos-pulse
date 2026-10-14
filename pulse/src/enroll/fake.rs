@@ -80,6 +80,7 @@ pub struct FakeRequest {
 /// 簽發過的用戶端憑證
 #[derive(Debug, Clone)]
 pub struct Issued {
+    #[allow(dead_code)]
     pub serial: String,
     pub spki: Vec<u8>,
     pub not_after_ms: i64,

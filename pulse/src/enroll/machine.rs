@@ -17,8 +17,6 @@ pub enum Phase {
     Submit,
     /// 輪詢（新註冊或過期續簽的申請）
     Poll,
-    /// 過期續簽（`POST /v1/enroll/renewals`）
-    Grace,
 }
 
 /// 錯誤的處置
@@ -64,7 +62,6 @@ pub fn on_error(
     let waiting = match phase {
         Phase::Submit => state::SUBMITTING,
         Phase::Poll => state::PENDING_APPROVAL,
-        Phase::Grace => grace_state::RENEWING,
     };
     match err {
         ApiError::Network { code, refused, .. } => Decision::Retry {
@@ -312,13 +309,13 @@ mod tests {
         if code == E::ClockSkew {
             body.offset_ms = Some(-462_120);
         }
-        ApiError::Server(ServerError {
+        ApiError::Server(Box::new(ServerError {
             status: code.http_status(),
             code,
             body,
             retry_after: retry_after.map(Duration::from_secs),
             server_time: "2026-10-11T02:20:47.120Z".into(),
-        })
+        }))
     }
 
     fn decide(err: &ApiError, phase: Phase) -> Decision {

@@ -1847,14 +1847,33 @@ impl OneShotError {
     }
 }
 
+/// 憑證已過期、8444 無法連線時對 8443 出示目前的（過期）憑證「報到」一次（設計包 §8：讓 Kairos 知道
+/// 主機已回到網路）。結果不影響流程，只記 DEBUG
+pub async fn check_in(settings: &Settings, tls: &TlsSetup) {
+    match connect(settings, tls).await {
+        Ok((mut stream, _)) => {
+            let mut buf = [0u8; 1];
+            let _ = time::timeout(
+                Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+            )
+            .await;
+            log::debug!(
+                "已對 {}:{} 出示過期憑證報到",
+                settings.address,
+                settings.port
+            );
+        }
+        Err(e) => log::debug!("對 8443 報到：{e}"),
+    }
+}
+
 /// 已完成 hello／hello_ack 的一次性連線
 pub struct OneShot {
     conn: Connection<TlsStream<TcpStream>>,
     /// 伺服器宣告的 features
     pub server_features: Vec<String>,
     pub proto: u32,
-    pub server_time: Option<String>,
-    pub extra: HelloAckExtra,
     has_client_cert: bool,
 }
 
@@ -1900,8 +1919,6 @@ pub async fn one_shot(
             conn,
             server_features: ack.server_features,
             proto: ack.session.proto,
-            server_time: ack.server_time,
-            extra: ack.extra,
             has_client_cert,
         }),
         Err(e) => {

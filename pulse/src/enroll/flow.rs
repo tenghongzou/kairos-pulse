@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use kairos_proto::enroll::{
     self as ke, CertPolicy, EnrollErrorCode, EnrollRequest, EnrollResult, GraceRenewRequest,
-    InitiatedBy, RequestKind, RequestState, SignatureAlg, WithdrawReason, WithdrawRequest,
+    InitiatedBy, RequestState, SignatureAlg, WithdrawReason, WithdrawRequest,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -74,13 +74,6 @@ pub enum Event {
 /// 事件的接收者
 pub trait Observer: Send {
     fn on(&mut self, file: &EnrollmentFile, event: &Event);
-}
-
-/// 不輸出任何東西的接收者
-pub struct Quiet;
-
-impl Observer for Quiet {
-    fn on(&mut self, _file: &EnrollmentFile, _event: &Event) {}
 }
 
 /// 一步之後
@@ -204,6 +197,7 @@ impl<'a> Driver<'a> {
     }
 
     /// 測試用：固定的亂數
+    #[cfg(test)]
     pub fn with_rand(mut self, rand: Box<dyn FnMut() -> f64 + Send>) -> Self {
         self.rand = rand;
         self
@@ -1183,11 +1177,6 @@ fn withdraw_error(mut out: Withdrawal, e: &ApiError) -> WStep {
     }
 }
 
-/// 申請是否已被 Kairos 受理（`request_id` 存在）
-pub fn has_request(file: &EnrollmentFile) -> bool {
-    file.request_id.is_some()
-}
-
 /// 新的過期續簽（服務偵測到 Kairos 確認憑證已過期時）
 pub fn start_grace(file: &mut EnrollmentFile, enroll_server: &str, trusted_pins: Vec<String>) {
     file.kind = "grace_renewal".to_string();
@@ -1201,12 +1190,4 @@ pub fn start_grace(file: &mut EnrollmentFile, enroll_server: &str, trusted_pins:
     file.poll_interval_ms = None;
     file.poll_floor_ms = None;
     file.last_code = Some(codes::E_CLIENT_CERT_EXPIRED.to_string());
-}
-
-/// 申請的種類字串
-pub fn kind_str(kind: RequestKind) -> &'static str {
-    match kind {
-        RequestKind::Enroll => "enroll",
-        RequestKind::GraceRenewal => "grace_renewal",
-    }
 }

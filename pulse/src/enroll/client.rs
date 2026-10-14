@@ -63,7 +63,7 @@ pub enum ApiError {
         detail: String,
     },
     /// 本規格的錯誤回應
-    Server(ServerError),
+    Server(Box<ServerError>),
 }
 
 /// 本規格的錯誤回應
@@ -402,13 +402,15 @@ impl EnrollClient {
         };
         self.record_time(&err.server_time, received_ms);
         match err.error.known_code() {
-            Some(code) if code.http_status() == resp.status => Err(ApiError::Server(ServerError {
-                status: resp.status,
-                code,
-                retry_after: resp.retry_after(),
-                server_time: err.server_time,
-                body: err.error,
-            })),
+            Some(code) if code.http_status() == resp.status => {
+                Err(ApiError::Server(Box::new(ServerError {
+                    status: resp.status,
+                    code,
+                    retry_after: resp.retry_after(),
+                    server_time: err.server_time,
+                    body: err.error,
+                })))
+            }
             _ => Err(ApiError::Unexpected {
                 status: Some(resp.status),
                 protocol_code: Some(crate::network::sanitize_for_log(&err.error.code, 64)),

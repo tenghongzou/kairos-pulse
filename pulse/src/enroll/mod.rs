@@ -24,6 +24,7 @@ pub mod machine;
 pub mod schedule;
 pub mod service;
 pub mod store;
+pub mod toml_edit;
 pub mod trust;
 pub mod x509;
 

@@ -37,8 +37,6 @@ pub const RENEW_BACKOFF_INITIAL: Duration = Duration::from_secs(3600);
 pub const RENEW_BACKOFF_MAX: Duration = Duration::from_secs(12 * 3600);
 /// `hello_ack.renew_now` 之後的隨機延遲上限
 pub const RENEW_NOW_SPREAD: Duration = Duration::from_secs(6 * 3600);
-/// 非互動模式首次送出前的隨機延遲上限（設計包 §3.4「降低合法流量」）
-pub const NON_INTERACTIVE_SPREAD: Duration = Duration::from_secs(15);
 
 /// `[0, 1]`（NaN 視為 0）
 fn unit(u: f64) -> f64 {

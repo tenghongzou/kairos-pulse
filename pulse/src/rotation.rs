@@ -87,6 +87,23 @@ impl Rotation {
         self.negotiated = negotiated;
         self.in_flight = None;
         self.offset_ms = offset_ms;
+        // 狀態檔的 renew_after（「…起自動更新」）：只在 Kairos 支援 renew 時
+        let after = self
+            .current_validity()
+            .filter(|_| negotiated)
+            .map(|(nb, na)| {
+                let lifetime = (na - nb).max(0);
+                let two_thirds = nb + lifetime / 3 * 2;
+                let before = if self.renew_before_days == 0 {
+                    i64::MAX
+                } else {
+                    na - i64::from(self.renew_before_days) * 86_400_000
+                };
+                two_thirds.min(before)
+            });
+        crate::local_status::record(|s| {
+            s.set_renew_after(after.and_then(chrono::DateTime::from_timestamp_millis));
+        });
         if negotiated && extra.renew_now == Some(true) && self.start_after.is_none() {
             let delay = crate::backoff::random_spread(schedule::RENEW_NOW_SPREAD);
             log::info!(
@@ -554,10 +571,8 @@ mod tests {
             (&first.request_id, &first.csr)
         );
         // 需要人工核准：PLS-W1111，退避 1 小時起
-        let line = format!(
-            r#"{{"type":"error","seq":2,"code":"renew_requires_approval","message":"x","fatal":false}}"#
-        );
-        assert_eq!(r.on_line(&line), RotationLine::Handled);
+        let line = r#"{"type":"error","seq":2,"code":"renew_requires_approval","message":"x","fatal":false}"#;
+        assert_eq!(r.on_line(line), RotationLine::Handled);
         assert!(r.next_request(3, now).is_none(), "退避中");
         assert_eq!(r.backoff_current(), std::time::Duration::from_secs(7200));
         // 核准後以同一個 CSR 取得新憑證

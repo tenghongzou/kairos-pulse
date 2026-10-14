@@ -40,7 +40,8 @@ impl Response {
             .map(Duration::from_secs)
     }
 
-    /// 本文是 JSON（`Content-Type: application/json`，可帶參數）
+    /// 本文是 JSON（`Content-Type: application/json`，可帶參數；測試用）
+    #[cfg(test)]
     pub fn is_json(&self) -> bool {
         self.header("content-type").is_some_and(|v| {
             v.split(';')

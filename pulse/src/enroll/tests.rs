@@ -223,7 +223,7 @@ async fn manual_approval_with_long_poll() {
     assert_eq!(file.request_id.as_deref(), Some(id.as_str()));
     assert_eq!(file.decided_by.as_deref(), Some("admin.chen"));
     assert!(
-        fake.lock().waits.iter().any(|&w| w == 2),
+        fake.lock().waits.contains(&2),
         "使用長輪詢：{:?}",
         fake.lock().waits
     );

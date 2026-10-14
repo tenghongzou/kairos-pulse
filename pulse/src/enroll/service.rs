@@ -420,8 +420,7 @@ pub fn status_of(
         return (
             Some(st),
             None,
-            Some(grace)
-                .filter(|_| !matches!(file.state.as_str(), state::ISSUED | state::REGISTERED)),
+            (!matches!(file.state.as_str(), state::ISSUED | state::REGISTERED)).then_some(grace),
         );
     }
     let enrollment = (file.state != state::REGISTERED).then(|| EnrollmentStatus {

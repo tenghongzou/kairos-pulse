@@ -55,7 +55,10 @@ impl CertInfo {
 }
 
 /// 一個 DER TLV：`(tag, 內容, 整個 TLV, 其後剩餘)`。只支援單一位元組的 tag 與至多 4 位元組的長度
-fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
+/// `(tag, 內容, 整個 TLV, 其後剩餘)`
+type Tlv<'a> = (u8, &'a [u8], &'a [u8], &'a [u8]);
+
+fn tlv(input: &[u8]) -> Option<Tlv<'_>> {
     let (&tag, rest) = input.split_first()?;
     let (&first, rest) = rest.split_first()?;
     let (len, rest) = if first < 0x80 {
@@ -181,6 +184,7 @@ pub fn parse_cert(der: &[u8]) -> Option<CertInfo> {
 }
 
 /// CSR（PKCS#10 DER）中的 SubjectPublicKeyInfo（完整 DER）
+#[cfg(test)]
 pub fn csr_spki(der: &[u8]) -> Option<Vec<u8>> {
     let (csr, _, _) = expect(der, SEQUENCE)?;
     let (info, _, _) = expect(csr, SEQUENCE)?;
