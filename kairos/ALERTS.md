@@ -38,8 +38,10 @@
 | `tls_reload` | TLS 重載工作 | `ok`、`crl`（變更涉及 CRL）、`message` |
 | `condition` | 系統檢查（狀態**變化**時才發布：成立、嚴重度改變、解除） | `check`（規則 ID）、`subject`、`active`、`severity`、`code`、`summary` |
 | `lifecycle` | 主程式 | `phase`：`started`、`shutting_down` |
+| `channel_secrets` | 告警服務（0.7；管道的機密變成無法解開或恢復時） | `channel_id`、`name`、`available` |
+| `audit_integrity` | 稽核的定期自我驗證（0.7；每次驗證） | `ok`、`reason`、`id`（斷點）、`summary` |
 
-**斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增，主機 API 的 `offline_reason` 也會出現）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
+**斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增）。**0.7 起主機 API、SSE 與 `/metrics` 都使用這組名稱**（過渡期主機 API 另帶舊名稱的 `offline_reason_legacy`，`API.md` 第 5.2 節）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
 
 `storage_unavailable`、寫入結果未知、retention 暫停、連線上限、CRL／伺服器憑證／簽發 CA 即將到期、註冊端點的過載／封鎖／限流／時鐘偏差／自動暫停，由系統檢查讀取各元件的計數與狀態，以 `condition` 發布（第 5.3 節）。`/healthz`、`/metrics`、JSON 日誌屬於另一條線（`sprint5/obs`），可以直接訂閱匯流排。
 
@@ -129,7 +131,8 @@ subnet_prefix_v6 = 64
 | `sys.enroll_closed_default` | 註冊端點維持關閉（升級） | 設定檔沒有 `[enroll]` 的 mode；啟動時一則 | 資訊（紀錄） | `KRS-I2010` | 設定 |
 | `sys.tls_reload_failed` | TLS 設定重新載入失敗 | 熱重載失敗，直到下一次成功 | 嚴重 | 涉及 CRL 時 `KRS-E1204` | 匯流排 |
 | `sys.unauthenticated` | 未認證連線已允許 | 未啟用 mTLS 卻監聽對外位址；每日提醒一次、**不可靜音** | 嚴重 | `KRS-W0302` | TLS 設定 |
-| `sys.channel_failed` | 通知管道失敗 | 同一管道連續 3 次發送失敗（每個管道一則）；改送其他所有健康的管道 | 嚴重 | `KRS-E5107` | 派送 |
+| `sys.channel_failed` | 通知管道失敗 | 同一管道連續 3 次發送失敗（每個管道一則）；改送其他所有健康的管道。0.7：機密無法解開（`secrets_unavailable`）時不必等到發送失敗，立即成立 | 嚴重 | `KRS-E5107`；機密無法解開 `KRS-E5110` | 派送 |
+| `sys.audit_integrity` | 稽核日誌完整性（0.7） | 定期自我驗證（`audit.verify_interval_hours`，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復 | 緊急 | `KRS-E6201` | 匯流排（`audit_integrity`） |
 | `sys.restarted`、`sys.downtime` | 第 5.2 節 | | 資訊（非預期：嚴重）、嚴重 | — | 心跳 |
 
 **使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（CPU 或記憶體使用率，`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。
@@ -161,8 +164,9 @@ subnet_prefix_v6 = 64
 - **機密**：SMTP 密碼、Webhook 網址、標頭、HMAC 金鑰、LINE token 以 AES-256-GCM 加密後存入資料庫（金鑰在資料目錄的 `alerts-secrets.key`，0600）；API 回應、CLI、日誌、稽核紀錄、`kairos db backup` 只有遮蔽值或密文。Webhook 網址顯示為 `https://主機/…`，其餘為 `••••`；錯誤訊息在寫入日誌與發送紀錄前移除機密（`secrets::scrub`）。還原到新主機時要一起複製金鑰檔，否則需重新輸入機密。
 - **速率與合併**：每個管道每 30 秒最多 1 則，期間累積的通知合併成一則「另有 N 則」（最多列 10 則）；緊急的第一則不排隊、不合併；彙總事件脫離的子事件同一組合併。
 - **重試與退避**：30 秒、1、2、4、5、5…分鐘；429／503 帶 `Retry-After` 時依它；超過 15 分鐘仍無法送出標為 `failed`（記錄錯誤代碼）。
+- **機密無法解開**（0.7）：資料目錄的 `alerts-secrets.key` 遺失（Kairos 會建立新的）或與資料庫不成對時，管道的狀態為 `secrets_unavailable`（`last_error_code` 為 `KRS-E5110`）：不會以空的網址或密碼嘗試發送，通知與失敗的管道同樣暫緩；API、`kairos alert-channels list` 顯示狀態，告警服務在狀態轉換時記一次 `WARN`（`alerts.channel.secrets_unavailable`）並發布 `channel_secrets`，「通知管道失敗」以 `KRS-E5110` 開事件。還原金鑰檔（`kairos db restore-keys`）並重新啟動，或重新輸入全部機密後恢復。
 - **管道失敗**：連續 3 次失敗 → 管道 `failed` → 系統事件 `KRS-E5107`（改送其他健康的管道）；之後要送到這個管道的通知暫緩（`held`），每 2 分鐘以最舊的一則試送，成功後管道恢復，暫緩的通知不逐則補發、改送一則彙整（最多保留 24 小時）。
-- **測試通知**：`POST /api/v1/channels/{id}/test`（或未儲存的 `POST /api/v1/channels/test`）以真實範本與假資料直接送出，回傳結果、回應碼與耗時（S11）。
+- **測試通知**：`POST /api/v1/channels/{id}/test`（或未儲存的 `POST /api/v1/channels/test`）以真實範本與假資料直接送出，回傳結果、回應碼與耗時（S11）。0.7 起限速：同一個管道 60 秒內 3 次、同一個使用者 10 分鐘內 10 次，超過回 429（〔暫定〕`KRS-W5111`，`Retry-After`），不送出。
 
 錯誤代碼：`KRS-E5101` 無法連線到 SMTP、`KRS-E5102` SMTP 驗證失敗、`KRS-E5103` 憑證不受信任、`KRS-E5104` 無法連線到外部網路（LINE、Teams）、`KRS-E5105` LINE token 無效、`KRS-E5106` Teams 4xx、`KRS-E5108` Webhook 無法連線或非 2xx、`KRS-E5107` 管道連續失敗、`KRS-E5109` SMTP 伺服器拒絕寄件者、收件者或內容、`KRS-E5110` 管道的設定無效（後兩者由設計包 `decisions/INTEGRATION.md` §28.3 分配）。
 
@@ -242,4 +246,4 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM，release）2026-10-14。1 萬台主�
 8. 機密以資料目錄的金鑰檔加密（金鑰與資料庫在同一台主機，防的是備份檔與資料庫檔外流）。
 9. 停用規則時，它進行中的事件轉為已恢復。
 
-**未做**（之後的版本）：週期性維護時段（每日／每週／每月）、警告的每日彙整、個人勿擾時段與個人管道（需要使用者模型）、指派給他人的個人通知、「加入處理」、資料磁碟剩餘空間（`KRS-W4001`，需要 statvfs）、JSONL 資料檔將滿（`KRS-E4102`）、CRL 自動更新失敗（`KRS-E1205`）、agent 憑證即將到期與過期寬限期即將結束（`KRS-W1110`、`KRS-W1115`）、過期續簽已暫停（`KRS-W2009`）、連線容量規劃不足（`KRS-W0204`，需要授權節點數）、授權（`KRS-E7101`）、稽核日誌完整性（`KRS-E6201`）、主機狀態 `critical`／`warning` 依告警判定（`ia.md` §5.1）、主機離線類規則的歷史試算（需要連線紀錄）、Alertmanager 相容格式、代理伺服器、Email 的 HTML 版。
+**未做**（之後的版本）：週期性維護時段（每日／每週／每月）、警告的每日彙整、個人勿擾時段與個人管道（需要使用者模型）、指派給他人的個人通知、「加入處理」、資料磁碟剩餘空間（`KRS-W4001`，需要 statvfs）、JSONL 資料檔將滿（`KRS-E4102`）、CRL 自動更新失敗（`KRS-E1205`）、agent 憑證即將到期與過期寬限期即將結束（`KRS-W1110`、`KRS-W1115`）、過期續簽已暫停（`KRS-W2009`）、連線容量規劃不足（`KRS-W0204`，需要授權節點數）、授權（`KRS-E7101`）、主機狀態 `critical`／`warning` 依告警判定（`ia.md` §5.1）、主機離線類規則的歷史試算（需要連線紀錄）、Alertmanager 相容格式、代理伺服器、Email 的 HTML 版。

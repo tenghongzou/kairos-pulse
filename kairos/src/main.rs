@@ -19,6 +19,7 @@ mod hosts_cli;
 mod import_cli;
 #[cfg(test)]
 mod integration_tests;
+mod keys_backup;
 mod logger;
 mod metrics;
 mod monitor;

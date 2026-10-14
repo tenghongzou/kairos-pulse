@@ -1431,6 +1431,11 @@ mod tests {
             b"CONSOLEKEYCONSOLEKEYCONSOLEKEYCO",
         )
         .unwrap();
+        std::fs::write(
+            data.join(crate::audit::KEY_FILE),
+            b"AUDITHMACKEYAUDITHMACKEYAUDITHMA",
+        )
+        .unwrap();
         {
             let mut conn =
                 rusqlite::Connection::open(data.join(crate::store::sqlite::DB_FILE)).unwrap();
@@ -1469,6 +1474,7 @@ mod tests {
             // 告警與帳號（0.6）
             "ALERTKEYALERTKEY",
             "CONSOLEKEYCONSOLEKEY",
+            "AUDITHMACKEYAUDITHMAC",
             "SEFTSEhBU0hIQVNI",
             "U0FMVFNBTFRTQUxU",
             "REJIQVNIREJIQVNI",

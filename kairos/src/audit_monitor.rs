@@ -25,10 +25,11 @@ pub const CODE_ANCHOR: &str = "KRS-I6202";
 /// 第一次外送與驗證：啟動後多久（啟動時的寫入先完成）
 pub const FIRST_RUN: Duration = Duration::from_secs(60);
 
-/// 鏈尾：(id, hash, hmac)；沒有紀錄時為 `None`
-fn tail(
-    conn: &rusqlite::Connection,
-) -> rusqlite::Result<Option<(i64, Option<String>, Option<String>)>> {
+/// 鏈尾：(id, hash, hmac)
+type Tail = (i64, Option<String>, Option<String>);
+
+/// 鏈尾；沒有紀錄時為 `None`
+fn tail(conn: &rusqlite::Connection) -> rusqlite::Result<Option<Tail>> {
     use rusqlite::OptionalExtension;
     conn.query_row(
         "SELECT id, hash, hmac FROM audit_events ORDER BY id DESC LIMIT 1",

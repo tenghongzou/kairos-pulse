@@ -531,7 +531,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 |---|---|---|
 | `/healthz` | 不需要 | 存活：`200 {"status":"ok"}`；關機中 `503 {"status":"shutting_down"}` |
 | `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用 |
-| `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403） | Prometheus 文字格式（0.0.4） |
+| `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403），且請求帶有反向代理的轉送標頭（`Forwarded`、`X-Forwarded-For`／`-Host`／`-Proto`、`X-Real-IP`、`Via`）時一律 403（0.7；第一次記 `WARN`〔暫定〕`KRS-W0304`）。**經反向代理提供 `/metrics` 時必須設定 token**：代理轉送的請求來源都是 loopback，而不加轉送標頭的代理（例如 nginx 的預設）Kairos 無法發現 | Prometheus 文字格式（0.0.4） |
 
 負載平衡器（L4 或 HTTP 探針）建議以 `/readyz` 判斷：主控台的監聽要開放給負載平衡器時，改用 `observability.listen` 綁在負載平衡器可達的位址（`/metrics` 仍只接受 loopback 或帶 token 的請求）。
 
@@ -540,7 +540,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 | 類別 | metric |
 |---|---|
 | 服務 | `kairos_build_info{version,commit}`、`kairos_start_time_seconds`、`kairos_shutting_down`、`kairos_ready` |
-| 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`idle_timeout`／`agent_closed`／`server_shutdown`／`certificate_rejected`／`write_unknown`，與告警 Webhook 的 `offline_reason` 相同；主機 API 的 `offline_reason` 仍為 0.4 起的 `timeout`／`connection_closed`）、`kairos_agent_superseded_total`、`kairos_agent_auth_failures_total`（KRS-W1102）、`kairos_host_events_lagged_total`。上線、離線、被取代、身分驗證失敗與淘汰由內部事件匯流排計數（與告警引擎同一個來源，不重複） |
+| 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`idle_timeout`／`agent_closed`／`server_shutdown`／`certificate_rejected`／`write_unknown`，與告警 Webhook、主機 API 的 `offline_reason` 相同；0.7 起主機 API 也改用這組名稱，過渡期另帶 `offline_reason_legacy`，API.md 第 5.2 節）、`kairos_agent_superseded_total`、`kairos_agent_auth_failures_total`（KRS-W1102）、`kairos_host_events_lagged_total`。上線、離線、被取代、身分驗證失敗與淘汰由內部事件匯流排計數（與告警引擎同一個來源，不重複） |
 | 告警 | `kairos_alerts_engine_enabled`、`kairos_alerts_engine_up`、`kairos_alerts_engine_last_tick_timestamp_seconds`、`kairos_alerts_engine_tick_duration_seconds`、`kairos_alerts_engine_warmup`、`kairos_alerts_open{severity,state}`（`state`：`firing`／`acknowledged`／`recovered`）、`kairos_alerts_fired_total{severity}`、`kairos_alerts_resolved_total{severity}`、`kairos_alerts_events_lagged_total`、`kairos_alert_channels{state}`（`ok`／`failed`／`disabled`）、`kairos_alert_notification_sends_total{kind,result}`（`kind`：`email`／`webhook`；`result`：`ok`／`error`；不含測試通知）、`kairos_alert_notifications_total{kind,state}`（`sent`／`failed`／`dropped`） |
 | 被拒的連線 | `kairos_connections_rejected_total{reason}`（`per_ip` KRS-W2201／`rate`／`handshake_limit` KRS-W2204）、`kairos_accept_pauses_total`、`kairos_accept_paused_seconds_total`、`kairos_accept_paused`、`kairos_report_rate_limited_total{scope}`（`identity`：mTLS 的憑證身分；`ip`：來源 IP） |
 | report 寫入 | `kairos_reports_received_total`、`kairos_reports_total{result}`（`written`／`duplicate`／`storage_unavailable`／`unknown`／`rate_limited`）、`kairos_report_write_queue_depth`、`kairos_report_write_queue_capacity`、`kairos_report_ack_duration_seconds`（直方圖：放入寫入佇列到寫入完成）、`kairos_storage_unavailable` |
@@ -610,7 +610,7 @@ kairos silences create --name "B 廠歲修" --reason "年度歲修" --maintenanc
 kairos alert-rules list --config kairos.toml
 ```
 
-- 30 條系統預設規則在第一次啟動時建立（不可刪除，停用要填原因）；初始沒有任何通知管道，事件只出現在主控台，設定管道並綁到規則後才會通知。
+- 31 條系統預設規則（0.7 新增「稽核日誌完整性」）在第一次啟動時建立（不可刪除，停用要填原因）；初始沒有任何通知管道，事件只出現在主控台，設定管道並綁到規則後才會通知。
 - 一個根因一則通知：網段或大規模離線、CRL 過期、重新啟動後未恢復的主機合併成一則；Kairos 重新啟動（含升級）的 10 分鐘暖機期內不發主機離線通知，關機造成的離線永遠不通知。
 - 靜音只停止通知（事件照常記錄）；臨時靜音最長 7 天、包含系統規則 24 小時、包含緊急 4 小時（伺服器端驗證）；維護時段不受上限但不抑制系統事件。
 - 引擎在自己的執行緒上執行，report 的寫入路徑沒有新增工作（ALERTS.md 第 9 節）。

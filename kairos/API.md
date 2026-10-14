@@ -232,7 +232,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `status` | `offline,unknown` | 主機狀態 token（六種之一，否則 400） |
 | `never_connected` | `true` | 從未連線（`unknown` 的一種） |
 | `offline_for` | `3d` | 失聯（不是 `online`）且 `last_seen` 至少在這麼久之前（`90m`、`12h`、`3d`、`2w`；設計包「失聯超過 N」、`kairos hosts list --offline-for`） |
-| `offline_reason` | `certificate_rejected` | 最後中斷原因（`timeout`、`connection_closed`、`server_shutdown`、`certificate_rejected`；第 5.2 節） |
+| `offline_reason` | `certificate_rejected` | 最後中斷原因（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；第 5.2 節）。0.7 的過渡期另接受舊名稱 `timeout`（＝`idle_timeout`）、`connection_closed`（＝`agent_closed`），0.8 移除 |
 | `tag` | `env:prod,line3` | 標籤（完全相同，不分大小寫） |
 | `os` | `Ubuntu,Windows` | `os.name`（完全相同，不分大小寫） |
 | `version` | `0.3.0,0.2.0` | `agent_version`（完全相同） |
@@ -259,7 +259,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
   "hostname": "hmi-line3-07",
   "display_name": null,
   "status": "offline",
-  "status_detail": { "offline_reason": "timeout", "never_connected": false, "starting": false, "long_offline": false },
+  "status_detail": { "offline_reason": "idle_timeout", "offline_reason_legacy": "timeout", "never_connected": false, "starting": false, "long_offline": false },
   "ip": "10.30.3.27",
   "agent_version": "0.3.1",
   "proto": 2,
@@ -325,7 +325,9 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
   - **只歸屬由信任的 CA 簽發的憑證**：已撤銷、無法判定撤銷狀態（兩者都在憑證鏈驗證之後才檢查），以及已過期但以效期的最後一秒重新驗證可以通過的。自簽或不受信任的 CA 簽發的憑證（`KRS-W1109`）**不歸屬**：SAN 由出示者自己決定，否則任何人都能讓別台主機顯示「憑證被拒」，或以大量假的 `agent_id` 填滿紀錄。
   - 記錄在記憶體中（最多 1 萬台），每 10 秒寫入主機清冊（`hosts.cert_rejected_at`、`cert_rejection`），重新啟動後仍在。清冊中沒有的 `agent_id`（例如已清除的主機）只留在記憶體中。
   - 連線中被踢掉（熱重載後重新驗證失敗，例如撤銷後 1 個重載週期內）的離線原因同樣是 `certificate_rejected`。
-- `offline_reason`（第 5.1 節）：`timeout`（超過離線門檻沒有合法訊息）、`connection_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。告警與 Webhook 使用另一組固定代碼（`idle_timeout`、`agent_closed`…，[`ALERTS.md`](ALERTS.md) 第 2 節）。只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
+- `offline_reason`（第 5.1 節）：`idle_timeout`（超過離線門檻沒有合法訊息）、`agent_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。**0.7〔草稿〕起與 Webhook 的 `offline_reason`、`/metrics` 的 `kairos_agent_disconnects_total{reason}` 是同一組名稱**（[`ALERTS.md`](ALERTS.md) 第 2 節；設計包 §28.5 #4）。
+  - **過渡期（0.7，破壞性變更）**：0.4～0.6 的名稱是 `timeout`、`connection_closed`。0.7 的回應在 `status_detail` 另帶 `offline_reason_legacy`（舊名稱；其餘三個值兩者相同），SSE 的 `host.offline` 另帶 `reason_legacy`，總覽的離線清單另帶 `offline_reason_legacy`；查詢參數 `offline_reason` 新舊名稱都接受。依舊名稱判斷的整合請改讀 `offline_reason`（新名稱）；`*_legacy` 欄位與舊的查詢值在 0.8 移除。
+  - 只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
 - 404 `host_not_found`：清冊中沒有、狀態表中也沒有。
 
 `GET /api/v1/hosts/{agent_id}/metrics` 回傳這台主機最近一次 report 中的指標（v1 的三欄位 report 對應到 `system.cpu.usage`、`system.memory.total`、`system.memory.used`）：
@@ -461,7 +463,7 @@ data: {"server_time":"…","last_event_id":"m3k2x9-1842","resumed":true}
 
 id: m3k2x9-1843
 event: host.offline
-data: {"agent_id":"6f1c…","hostname":"hmi-line3-07","display_name":null,"status":"offline","reason":"timeout","at":"…","ip":"10.30.3.27"}
+data: {"agent_id":"6f1c…","hostname":"hmi-line3-07","display_name":null,"status":"offline","reason":"idle_timeout","reason_legacy":"timeout","at":"…","ip":"10.30.3.27"}
 
 : heartbeat 2026-10-13T06:03:42.000Z
 
@@ -563,7 +565,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 - 只有唯讀端點；主機的顯示名稱、群組、標籤、除役、撤銷等寫入操作屬於之後的版本（需要 RBAC 與稽核雜湊鏈）。
 - 使用者、角色、工作階段、LDAP 與稽核雜湊鏈：0.6.0〔草稿〕，第 12 節（延後項目見第 12.11 節）。
 - 主機狀態只有 `online`、`offline`、`unknown`；`critical`、`warning`（告警，F3）、`pending`（註冊，F5）的計數為 `null`。
-- 離線原因只有 Kairos 這次啟動後發生的（`timeout`、`connection_closed`、`server_shutdown`、`certificate_rejected`），不寫入清冊，重新啟動後為 `null`；設計包 #2 的完整分類與每台主機的連線紀錄屬於之後的版本。
+- 離線原因只有 Kairos 這次啟動後發生的（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；0.7 起與 Webhook、`/metrics` 相同，舊名稱見第 5.2 節），不寫入清冊，重新啟動後為 `null`；設計包 #2 的完整分類與每台主機的連線紀錄屬於之後的版本。
 - 每分鐘的上線數（總覽的 24 小時 sparkline、「比 1 小時前」）只在記憶體中，重新啟動後從頭累積。
 - SSE 的事件只保留在記憶體中（4,096 則）；重新啟動後一律要求重新抓取。
 - 系統健康的「被拒的連線」是啟動以來的累計，不是設計包 S20 的「過去 1 小時」。
@@ -961,13 +963,18 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
 - 0.5 寫入的紀錄（沒有雜湊）在升級後**第一次**寫入或驗證時依 id 順序補上，並記在 `meta.audit_legacy_sealed`；之後每次寫入只計算它自己那一筆。繞過程式直接插入資料庫、沒有雜湊的紀錄不會被下一次寫入接進鏈中，驗證時以 `missing_hash` 指出。
 - 驗證在同一個讀取交易（同一個快照）中進行，驗證期間的寫入不會造成假的斷點。
 - 被拒絕的寫入請求（`access.denied`）同一個執行者每分鐘最多記 20 筆，超過的筆數併入下一筆的 `details.suppressed_since_last`（避免低權限的身分以大量請求灌爆稽核表）。
-- **限制**：雜湊鏈沒有秘密金鑰——能改寫資料庫檔的人可以重新計算整條鏈，資料庫本身無法發現；要防範這種情況，需要定期匯出（或外送到 syslog／SIEM，另一條開發線）並與副本比對最後一筆的雜湊。
+- **HMAC（0.7〔草稿〕，schema v7）**：雜湊鏈本身沒有秘密，能改寫資料庫檔的人可以重新計算整條鏈。0.7 起每筆另有 `hmac = HMAC-SHA256(K, "kairos-audit-record/v1\n" ‖ hash)`（小寫十六進位），`K = HMAC-SHA256(金鑰檔, "kairos-audit-hmac/v1")`；金鑰檔是資料目錄的 `audit-hmac.key`（32 bytes，0600），**與 `console.key` 分開**（交給外部稽核者驗證 HMAC 時不必同時交出 CSRF／TOTP 的金鑰；遺失或輪替 `console.key` 也不影響稽核鏈）。金鑰檔只由 Kairos 服務在啟動時建立，CLI 只讀取。`meta.audit_chain_head` 另帶 `mac`。
+  - **升級的邊界**：服務第一次以 0.7 啟動、建立金鑰後寫入的第一筆記在 `meta.audit_hmac`（`since_id`、`key_id`）。之前的紀錄（0.6 以前，或服務啟動前由 CLI 寫入的）只有雜湊鏈；`kairos audit verify` 與 API 的 `hmac` 物件寫出邊界（`since_id`、`chain_only` 筆數、`verified` 筆數）。
+  - 新的斷點原因：`missing_hmac`（起點之後沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被重新計算）、`hmac_boundary_mismatch`（起點被移動）、`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與起點記錄的 `key_id` 不同；不會以新的金鑰「接續」簽下去）。都是 `KRS-E6201`。
+  - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（〔暫定〕`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
+  - **自我驗證**：每 `audit.verify_interval_hours` 小時（預設 24，第一次在啟動後 1 分鐘）重新計算整條鏈與 HMAC，寫一筆 `audit.verify`（執行者 `system`，`details.via = "self_check"`），並發布內部事件；失敗時記 `ERROR`（`audit.chain_broken`）且告警引擎開系統規則「稽核日誌完整性」（`sys.audit_integrity`，緊急，`KRS-E6201`），下一次驗證通過時恢復。
+  - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；重播先前抄下的 head 也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/audit` | `audit:read`；只有 `audit:read_own` 時固定為自己的操作（`meta.own_only: true`） | `actor`、`category`、`action`（完全相同，或以 `.` 結尾為前綴：`user.`）、`target`（對象片段，不分大小寫）、`result`、`from`／`to`（RFC 3339）、`limit`（1～1000，預設 100）、`cursor`（新到舊，`page.next_cursor`）。每筆含 `prev_hash`、`hash` |
-| `GET /api/v1/audit/export` | `audit:export` | 同樣的篩選，`application/x-ndjson`：每行一筆（`type: "event"`，另有 `at_ms`、`details_raw`，可只靠該行重新計算雜湊），最後一行 `type: "chain"`（`count`、`first_id`、`first_prev_hash`、`last_id`、`last_hash`）。只以時間篩選時是連續的一段鏈，可整段驗證 |
-| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch`／`head_mismatch` 最後幾筆被刪除；`product_code: KRS-E6201`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
+| `GET /api/v1/audit/export` | `audit:export` | 同樣的篩選，`application/x-ndjson`：每行一筆（`type: "event"`，另有 `at_ms`、`details_raw`，可只靠該行重新計算雜湊；0.7 另有 `hmac`），最後一行 `type: "chain"`（`count`、`first_id`、`first_prev_hash`、`last_id`、`last_hash`；CLI 的匯出另有 `hmac_since`）。只以時間篩選時是連續的一段鏈，可整段驗證 |
+| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈與 HMAC：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch`／`head_mismatch` 最後幾筆被刪除／0.7 的 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`；`product_code: KRS-E6201`）、`hmac`（`status`：`not_started`／`verified`／`key_unavailable`／`key_mismatch`／`failed`，`since_id`、`key_id`、`verified`、`chain_only`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
 
 沒有修改或刪除的端點（`PUT`／`DELETE` 回 405）；CLI 也沒有。
 
@@ -1144,9 +1151,11 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 | `webhook` | `format`（`kairos`／`slack`／`teams`／`line`）、`method`（`POST`／`PUT`）、`allow_http`、`line_to` | `url`、`headers`（物件）、`hmac_secret`、`line_token` |
 | 共用 | `timeout_secs`（1～60，預設 10）、`timezone`、`show_ip`（`full`／`subnet`／`none`）、`min_severity`、`notify_ack`、`ca_file` | |
 
-回應的 `secrets` 只有遮蔽值（`url` 為 `https://主機/…`，其餘 `••••`）。`PUT` 時沒有提供的機密欄位沿用原本的值、值為 `null` 時刪除。列表與詳情另有 `state`（`ok`／`failed`／`disabled`）、`consecutive_failures`、`failed_since`、`last_attempt_at`、`last_success_at`、`last_error_code`、`last_error`（已移除機密）、`rules_using`；詳情另有 `rules[]` 與最近 20 筆 `deliveries`。
+回應的 `secrets` 只有遮蔽值（`url` 為 `https://主機/…`，其餘 `••••`）。`PUT` 時沒有提供的機密欄位沿用原本的值、值為 `null` 時刪除。列表與詳情另有 `state`（`ok`／`failed`／`secrets_unavailable`／`disabled`；`secrets_unavailable`〔0.7〕：機密無法解開——資料目錄的 `alerts-secrets.key` 遺失或與資料庫不成對——`last_error_code` 為 `KRS-E5110`，不會嘗試發送，「通知管道失敗」系統規則以 `KRS-E5110` 開事件；還原金鑰檔並重新啟動，或重新輸入全部機密後恢復）、`consecutive_failures`、`failed_since`、`last_attempt_at`、`last_success_at`、`last_error_code`、`last_error`（已移除機密）、`rules_using`；詳情另有 `rules[]` 與最近 20 筆 `deliveries`。
 
 `POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
+
+**限速（0.7〔草稿〕）**：測試通知會真的送到值班群組或信箱。同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含 `POST /api/v1/channels/test` 的未儲存管道）。超過時回 429 `rate_limited`（〔暫定〕`KRS-W5111`）、`Retry-After`，`details`：`scope`（`channel`／`user`）、`limit`、`window_secs`；不送出、不寫發送紀錄。計數只在記憶體中（重新啟動後歸零）。
 
 ### 13.6 即時推送（SSE）
 
