@@ -1431,18 +1431,20 @@ async fn new_enrollment(
     {
         out.step(2, 'x', "送出註冊申請");
         let pls = e.code();
+        // token 只顯示前 4 碼（ENROLL.md 第 14.2 節、第 18 節第 5 項，2026-10-14 決定）
+        let shown = format!("KRT1-{}…", target.token.prefix4());
         let cause = match code {
             ke::EnrollErrorCode::TokenExpired => format!(
                 "Kairos 拒絕了 token {}，這個 token 已過期。本機尚未產生任何檔案，不需要清理。",
-                target.token.hint()
+                shown
             ),
             ke::EnrollErrorCode::TokenExhausted => format!(
                 "token {} 的使用次數已滿。本機尚未產生任何檔案，不需要清理。",
-                target.token.hint()
+                shown
             ),
             _ => format!(
                 "Kairos 拒絕了 token {}（{}）。本機尚未產生任何檔案，不需要清理。",
-                target.token.hint(),
+                shown,
                 code.as_str()
             ),
         };
