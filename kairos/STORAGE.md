@@ -169,6 +169,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - 檔案存在但 `application_id` 不是 Kairos、又有其他資料表時拒絕使用（例如 `storage.data_dir` 指錯）。
 - 新增欄位或資料表時加一個遷移，不修改既有遷移的內容。**升級 Kairos 前先備份**（第 9 節）：遷移後的資料庫無法給舊版使用。
 - 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）、v3（0.4：`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`，主控台 API 使用）。`kairos reports import`、`kairos api-token` 開啟資料庫時同樣會升級 schema；升級到 v3 之後 0.3 的 Kairos 無法開啟（降版請從升級前的備份還原）。
+- 規劃中：v4（0.5.0〔草稿〕，衝刺 4）新增註冊通道與 PKI 的資料表（`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_cas`、`pki_crls`、`enroll_replay`、`settings`、`audit_events` 等）與 `hosts` 的生命週期欄位，規格見 [`PKI.md`](PKI.md) 第 7 節；實作後併入第 3 節。
 
 ## 4. 寫入路徑與批次策略
 
