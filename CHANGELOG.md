@@ -27,6 +27,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 同一個 Kairos 0.2.0 可以同時服務 v1 與 v2 的 Pulse：每個 agent 依自己的連線協商，同一個 `reports-*.jsonl` 中 `schema` 1 與 2 的行並存（讀取工具須依 `schema` 分流，見破壞性變更第 6 項）。
 - 0.3.0〔草稿〕的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
 - 0.5.0〔草稿〕的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
+- 0.6.0〔草稿〕的協定、8443 的 feature 與資料庫 schema 都與 0.5.0 相同，只新增可觀測性（日誌格式、syslog、`/healthz`、`/readyz`、`/metrics`、`diag`），0.5 與 0.6 的任何組合都相容。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
@@ -47,7 +48,87 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（0.5.0 之後的變更記在這裡。）
+（0.6.0〔草稿〕之後的變更記在這裡。）
+
+## [0.6.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.6.0、Pulse 0.6.0**：衝刺 5「可觀測性」（商業審計 O3、O8，S7 的日誌外送部分；設計包 `kairos/screens.md` S20 與 §24 #8、`pulse/log-ux.md`、`pulse/cli-spec.md` §6、§8）。兩端加上 JSON 日誌與 syslog 外送、Kairos 加上 `/healthz`、`/readyz`、`/metrics`、Pulse 加上本機指標，兩端都有 `--check-config` 與支援診斷包（`diag`）。**協定與資料庫 schema 不變**，與 0.5 的任何組合都能照常連線。版本號尚未改（`Cargo.toml` 仍為 0.5.0）；發佈時依 RELEASING.md 改版號、填上日期並移除〔草稿〕標記。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | 兩者 | **日誌行首的時間改為 RFC 3339、毫秒、帶時區位移**：`2026-10-14 14:22:16 [INFO] …` → `2026-10-14T14:22:16.123+08:00 [INFO] …`（`[等級] 訊息` 與 Pulse 的「`<event> <code> `」不變）。理由：審計 O3（本地時間不帶時區，跨時區、夏令時間與兩端對時都要猜） | 以 grok、正規表示式或 `cut` 解析行首時間的收集規則、腳本 | 更新規則（新格式可直接以 RFC 3339 解析）；需要時間過渡時設定 `log.format = "legacy"`（與 0.5 完全相同，保留一個主要版本，`--check-config` 會提醒）。建議改用 `log.format = "json"` |
+| 2 | Kairos | **主控台的監聽上新增不需要 API token 的 `/healthz`、`/readyz`**（只回傳狀態字，不含版本、路徑、數量與位址），以及 `/metrics`（未設定 `observability.metrics_token_file` 時只接受 loopback 來源） | 主控台開放給管理網段、且不希望任何未認證端點的部署 | 設定 `observability.on_console = false`（端點改由 `observability.listen` 提供，或完全不提供） |
+
+升級順序不拘（兩個產品互不依賴這些功能）。升級後可先執行 `kairos --check-config`、`pulse check-config` 確認設定。
+
+### 共用（`crates/kp-obs`，新的內部 crate）
+
+- 日誌格式：`text`、`json`（NDJSON，UTC，固定欄位 `v`、`ts`、`level`、`event`、`code`、`msg`、`product`、`host`、`run_id`、`seq`、`target`、`fields`；Pulse 另有 `agent_id`、`instance`）、`legacy`。`event`、`code` 取自 `log` 的結構化欄位、訊息開頭的「`<event> <code> `」或訊息中第一個 `KRS-`／`PLS-` 代碼；尚未指定固定事件的行以模組路徑代替（設計包 `log-ux.md` §6.2 的事件專屬欄位改放在 `fields` 物件中，避免與固定欄位撞名）。
+- syslog：RFC 5424（`MSGID` 為錯誤代碼或事件名稱、`STRUCTURED-DATA` 為 `-`、不加 BOM），UDP（RFC 5426，單則上限 8 KiB）、TCP（RFC 6587 octet counting）、本機 Unix socket；背景執行緒送出，佇列 4,096 行，滿或接收端無法連線時丟棄並計數，TCP 以 1～30 秒退避重連。結束前最多等 2 秒送完。
+- Prometheus 文字格式（0.0.4）的輸出、原子計數器與直方圖，以及測試用的嚴格解析器（語法、family 宣告順序、重複序列、直方圖的累積與 `+Inf`、命名慣例）。
+- 診斷包：tar.gz（ustar；deflate 以固定 Huffman 與 LZ77 自行實作，不引入壓縮套件）、敏感資料遮蔽（PEM 私鑰、API token、註冊 token、安裝字串、Bearer、名稱含 token／secret／password 的值）、主機名稱與 IP 的一致化代號、產生前的秘密檢查、以 0600 寫出。
+- 只用 workspace 既有的依賴（`chrono`、`log` 的 `kv` feature、`serde_json`），Cargo.lock 不新增外部套件。
+
+### Kairos
+
+- **`/healthz`、`/readyz`、`/metrics`**（README「健康檢查與 Prometheus」）：主控台的 HTTPS 監聽上提供（`observability.on_console`），另可以 `observability.listen` 純 HTTP 監聽（只有這三個端點，在自己的執行緒與 runtime 上）。`/readyz`：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖：以 `BEGIN IMMEDIATE` 檢查時量測到與 writer 搶鎖、ack 的 p99 上升，因此改掉）、最近 1 分鐘的 report 不是全部失敗、不在關機中；`?scope=enroll` 另外要求 8444 在監聽。`/metrics` 的 bearer token 以常數時間比較。
+- `/metrics` 的內容：連線數與上限、離線原因（`timeout`、`connection_closed`、`server_shutdown`、`certificate_rejected`）、被取代、狀態表使用量、淘汰與已滿的拒絕、被拒的連線（每 IP、新連線速率、握手中上限、暫停接受）、report 的接收、寫入、重複、`storage_unavailable`、結果未知與速率限制、依身分或 IP 的 report 限速、寫入佇列深度、`ack` 延遲直方圖、資料庫可寫與用量、容量刪除、保留清除暫停、被拒的用戶端憑證（依原因）、伺服器憑證、CRL 與簽發 CA 的剩餘天數、註冊端點的模式、監聽、請求、限流、封鎖、時鐘拒絕、簽發與待核准佇列、主控台 API 的請求（依路由分類與狀態碼分類）與認證失敗、日誌行數、syslog 的送出與丟棄、行程的記憶體、檔案描述元與 CPU（Linux）。完整名稱見 README；標籤只用有限集合的值，不以 agent_id 或 IP 當標籤。計數器在 `kairos/src/metrics.rs`（原子計數器；離線原因以狀態表的變化通知計數，不修改連線的程式），已有的統計（`WriteStats`、`per_ip` 的被拒計數、註冊端點的統計）在輸出時直接讀取。
+- **JSON 日誌與 syslog**：`log.format`、`log.timezone`、`log.stdout`、`[log.syslog]`（`target`、`facility`、`app_name`、`payload`）。JSON 的日誌檔為 `logs/kairos-YYYY-MM-DD.jsonl`；兩種副檔名都依 `log.retention_days` 清除。
+- **`kairos --check-config`**（也可寫 `kairos check-config`）：設定的載入（語法、型別、範圍、矛盾）、監聽位址（含 S1 的未認證檢查與 `observability.listen`）、TLS 憑證（成對、伺服器憑證 30 天內與 CRL 7 天內到期、私鑰權限）、主控台憑證、資料與日誌目錄、日誌格式與 syslog、`[observability]`（token 檔的權限、沒有任何監聽提供端點）、每 IP 上限的允許清單（`KRS-W0203`）、檔案描述元。結束代碼 0／8（`--strict`）／3／4；`--json`（`kairos.check-config/v1`）。
+- **`kairos diag`**：支援診斷包（`kairos-diag-<主機名稱>-<UTC 時間>.tar.gz`，0600，已存在時不覆寫）：版本、`--check-config` 的結果、設定檔與實際生效的設定（遮蔽後）、`KAIROS__` 環境變數、最近 3 天的日誌（`--since`，上限 50 MB）、資料庫摘要（唯讀開啟）、`agents.json` 的台數、執行中服務的 `/readyz` 與 `/metrics`（經 `observability.listen`，或以主控台自己的憑證釘選連線 HTTPS）、systemd 的 unit、狀態與 journal、相關檔案清單（不含內容）、`MANIFEST.json`、`REDACTION.txt`。`--redact-hosts` 把主機名稱與 IP 換成代號（對照表另存，不放進診斷包）、`--no-server`、`--json`（`kairos.diag/v1`）。
+- report 寫入的 `ack` 延遲以直方圖記錄（`WriteStats::ack_latency`，在 `PendingWrite::wait` 收到結果時）。
+
+### Pulse
+
+- **本機指標**（`[metrics]`，預設關閉；README「本機指標」）：loopback 的 HTTP `/metrics`（`metrics.listen`，只接受 loopback 位址），或 node_exporter textfile collector 的檔案（`metrics.textfile`，原子更新，正常結束時刪除）。內容：連線狀態、連續失敗、註冊次數、依錯誤代碼的斷線、取樣、送出（含補送）、ack、拒收、丟棄、送出到回應的延遲直方圖、取樣耗時直方圖與逾時、本機緩衝（待送筆數與大小、上限、使用率、最舊一筆、補送中、依原因的丟棄、寫入失敗）、時鐘偏差、用戶端憑證到期、日誌行數與 syslog。
+- **JSON 日誌與 syslog**：`log.format`、`log.timezone`、`log.stdout`、`[log.syslog]`（同 Kairos）。JSON 的日誌檔為 `logs/pulse-YYYY-MM-DD.jsonl`；`agent_id` 只在啟用 mTLS 時寫出（未啟用時等同身分憑據，與狀態檔相同）。
+- **`pulse check-config`**（`pulse --check-config`）：設定的載入、伺服器、信任（`PLS-W0302`、`PLS-W0303`）、用戶端憑證與私鑰（成對、14 天內到期 `PLS-W1110`、已過期、私鑰權限 `PLS-W8202`）、`agent.id`（內容、權限 `PLS-W8201`）、日誌目錄與格式、`[metrics]`、本機緩衝目錄。相對路徑以設定檔所在的目錄解析（與服務相同）。結束代碼 0／8（`--strict`）／3／4；`--json`（`pulse.check-config/v1`）。`--connect` 與 `--show-effective` 尚未實作。
+- **`pulse diag`**（`cli-spec.md` §8）：支援診斷包（tar.gz，0600）：`pulse status`（文字與 `--json`）、`check-config`、設定（遮蔽後）、實際生效的設定、`PULSE__` 環境變數、用戶端憑證的摘要（不含私鑰）、註冊進度的摘要（`poll_secret`、token 移除）、最近 3 天的日誌（上限 50 MB，`PLS-W4302`）、本機指標、系統資訊、systemd 的 unit、狀態與 journal（Windows 為 `sc qc`）、相關檔案清單（不含內容）。`--redact strict` 把主機名稱與 IP 換成代號；`--json`（`pulse.diag/v1`）。無法寫出為 `PLS-E4301`，無法讀取設定為 `PLS-E8203`（結束代碼 10）。Windows 也輸出 tar.gz（設計為 .zip；Windows 10 以上內建 `tar.exe`）。
+- `pulse.service` 維持 `StandardOutput=null`（重新評估的理由寫在 unit 與 INSTALL.md 7.1：交給 SIEM 改用 `[log.syslog]` 或 JSON 檔，要 journald 時以 drop-in 改 `StandardOutput=journal`）。
+- 新增代碼常數：`PLS-E0401`（指定的設定檔不存在，`check-config`／`diag`）、`PLS-E4301`、`PLS-W4302`（設計包已分配）。
+
+### 暫定代碼（設計包沒有，先用對應的編號，待設計確認）
+
+| 代碼 | 意義 | 使用處 |
+|---|---|---|
+| `KRS-E0101` | 設定檔無法載入（語法、型別錯誤或檔案不存在）；Pulse `PLS-E0101` 的對應 | `kairos --check-config` |
+| `KRS-W4302` | 診斷包內容已截斷（日誌超過 50 MB）；Pulse `PLS-W4302` 的對應 | `kairos diag` |
+
+`kairos diag` 無法產生時沿用 `KRS-E4301`（設計包為「無法產生匯出檔案（Kairos：CSV 匯出）」，語意延伸到診斷包）。
+
+### 量測
+
+kp-build（4 vCPU，與其他工作共用；取負載低於 1 時的兩輪），`api_bench_acks_under_load`（每秒 2,000 筆 report、1 萬台主機、每階段 20 秒），`ack` 延遲 p99：
+
+| 階段 | 0.5.0（17bfa6e） | 0.6.0〔草稿〕 |
+|---|---|---|
+| 只有寫入 | 2.43 ms／1.92 ms | 2.21 ms／（第二輪受其他工作干擾，25.9 ms，不採計） |
+| 4 個 API 用戶端連續查詢 | 14.26 ms／4.89 ms | 5.81 ms／5.40 ms |
+| 4 個 API 用戶端各每秒 1 次 | 7.52 ms／1.17 ms | 4.55 ms／1.37 ms |
+| 每秒抓取 1 次 `/metrics`（新增階段） | — | 5.43 ms／0.97 ms |
+| 連續抓取 `/metrics`（約 400 次／秒，新增階段） | — | 4.06 ms／1.72 ms |
+
+p50 兩版都在 0.54～0.67 ms。計數器的成本（每筆 report 一次直方圖記錄）在量測雜訊之內；`/metrics` 本身 p50 約 2 ms、p99 約 7 ms。開發中曾以 `BEGIN IMMEDIATE` 檢查資料庫可寫，每 5 秒與 writer 搶一次寫入鎖，抓取 `/metrics` 時 `ack` p99 升到約 30 ms，因此改為不取得寫入鎖的檢查。
+
+### 已知限制
+
+- 日誌的 `event`：Kairos 的日誌行與 Pulse 尚未指定事件的行以模組路徑代替，之後的版本逐步改為 `log-ux.md` 的固定事件；SIEM 規則請以 `code` 為主。`text` 仍是 0.5 的 `[等級] 訊息` 版面（未改為 5 欄寬等級、`event` 補到 18 欄、`key=value`）；`log-ux.md` §5 的重試摘要、`log.lang`、`log.stderr`、`log.outage_error_after` 尚未實作。
+- `/metrics` 的計數是啟動以來的累計值（重新啟動後歸零）；主控台 S20 的「過去 1 小時」由 Prometheus 的 `increase()` 計算。另一條工作線的內部事件匯流排完成後，計數器可改由事件訂閱。
+- syslog 的本機 socket（`unix:///dev/log`）送出 RFC 5424 格式；journald 的 `/dev/log` 以傳統格式解析，交給 journald 時請改用 stdout。
+- `pulse check-config --connect`、`--show-effective`、`pulse diag --include-debug-log` 尚未實作。
+
+### 測試
+
+- `kp-obs`：Prometheus 輸出與解析器（含錯誤輸入）、直方圖、JSON 與 text 的欄位與時間格式、kv、syslog 的 RFC 5424 標頭與 UDP／TCP（octet counting）／Unix socket 實際收送、接收端無法連線時不阻塞、tar 標頭與 gzip（自帶的 inflate 與系統的 `tar -xzf` 驗證）、遮蔽（私鑰、各種 token、JSON 與 TOML 的秘密值、冪等）、代號化、診斷包的大小上限與產生前的秘密檢查、檢查結果的輸出與結束代碼。
+- Kairos：`/healthz`、`/readyz`（不洩漏版本、路徑與位址；儲存無法使用、未監聽、`scope=enroll`）、`/metrics`（以解析器與命名檢查驗證、標籤不含 agent_id 與 IP、loopback 限制、bearer token）、純 HTTP 監聽、`--check-config`（通過、範圍錯誤、語法錯誤、憑證錯誤）、診斷包不含秘密（設定與日誌中刻意放入的 token、私鑰、Bearer）且權限為 0600。
+- Pulse：`/metrics` 的輸出、HTTP 回應、textfile 的原子更新、`check-config`／`diag` 的參數、註冊進度的摘要、診斷包不含秘密（私鑰檔、`poll_secret`、註冊 token、安裝字串、Bearer）與 `--redact strict`。
+
+### 發佈與建置
+
+- Kairos 發佈包加入 `prometheus.example.yml`（抓取設定）與 `kairos-alerts.example.yml`（告警規則）；Pulse 發佈包加入 `pulse-alerts.example.yml`。
+- 新的內部 crate `kp-obs`（publish = false）；外部依賴不變，`cargo deny check` 通過。
 
 ## [0.6.0] - 〔草稿：發佈日期待定〕
 

@@ -754,6 +754,7 @@ fn channel_of(r: &Row<'_>, secrets: Option<&SecretBox>) -> rusqlite::Result<Chan
     let secrets = match (blob, secrets) {
         (Some(b), Some(sb)) => sb.unseal(&b).unwrap_or_else(|e| {
             log::warn!(
+                event = "alerts.channel.decrypt_failed";
                 "通知管道 {} 的機密無法解密：{e}",
                 r.get::<_, String>(0).unwrap_or_default()
             );

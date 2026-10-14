@@ -174,10 +174,31 @@ pub(crate) async fn fixture_opts(
         })
         .await
         .unwrap();
+        // 與正式程式相同：/metrics 的告警計數訂閱告警的變化
+        tokio::spawn(crate::metrics::watch_alerts(
+            svc.subscribe(),
+            shutdown.clone(),
+        ));
         (Some(svc), Some(thread))
     } else {
         (None, None)
     };
+    let obs = crate::probe::ObsContext::new(crate::probe::ObsParams {
+        config: Arc::new(config.clone()),
+        registry: registry.clone(),
+        reports: storage.reports.clone(),
+        per_ip: crate::per_ip::PerIpLimiter::with_policy(
+            crate::per_ip::PerIpPolicy::from_config(&config).unwrap(),
+        ),
+        tls: agent_tls.clone(),
+        enroll: None,
+        shutdown: shutdown.clone(),
+        db_path: Some(SqliteOptions::from_config(&config, &paths.data_dir).path),
+        alerts: alert_svc.clone(),
+    })
+    .unwrap();
+    obs.agent_listening
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let console = match start(StartParams {
         config: Arc::new(config.clone()),
         config_file: None,
@@ -191,6 +212,7 @@ pub(crate) async fn fixture_opts(
         enroll: None,
         alerts: alert_svc.clone(),
         directory,
+        obs: Some(Arc::new(obs)),
     })
     .await
     {

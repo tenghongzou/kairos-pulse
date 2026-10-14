@@ -131,7 +131,7 @@ impl Pump {
         let queue = match d.db.read(|conn| Ok(store::pending_deliveries(conn)?)).await {
             Ok(q) => q,
             Err(e) => {
-                log::warn!("告警：無法讀取待送的通知：{e}");
+                log::warn!(event = "alerts.delivery.load_failed"; "告警：無法讀取待送的通知：{e}");
                 Vec::new()
             }
         };
@@ -185,16 +185,20 @@ impl Pump {
         let mut changed: Vec<Delivery> = Vec::new();
         let channels = d.channels.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // 管道已刪除或停用：放棄；暫緩超過 24 小時：失敗
+        let m = crate::metrics::global();
         for item in self.queue.iter_mut() {
             let ch = channels.get(&item.channel_id);
+            let kind = ch.map_or("other", |c| c.kind.as_str());
             if ch.is_none_or(|c| !c.enabled) {
                 item.state = "dropped".into();
                 item.error = Some("管道已停用或已刪除".into());
+                m.alert_delivery(kind, "dropped");
                 changed.push(item.clone());
             } else if item.state == "held" && now - item.created_at > HOLD_MAX_MS {
                 item.state = "failed".into();
                 item.error = Some("管道失敗期間暫緩超過 24 小時".into());
                 item.error_code = Some("KRS-E5107".into());
+                m.alert_delivery(kind, "failed");
                 changed.push(item.clone());
             }
         }
@@ -306,7 +310,7 @@ impl Dispatcher {
                     .collect();
             }
             Err(e) => {
-                log::warn!("告警：無法讀取通知管道（稍後重試）：{e}");
+                log::warn!(event = "alerts.channel.load_failed"; "告警：無法讀取通知管道（稍後重試）：{e}");
                 self.reload.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -437,8 +441,11 @@ impl Dispatcher {
             }
         };
         let mut recovered = false;
+        let m = crate::metrics::global();
+        let kind = channel.kind.as_str();
         for (unit, o) in &done.results {
             channel.last_attempt_at = Some(now);
+            m.alert_send(kind, o.ok);
             let batch = (unit.ids.len() > 1).then(|| unit.ids[0]);
             if o.ok {
                 recovered |= channel.failed();
@@ -450,6 +457,7 @@ impl Dispatcher {
                 channel.last_error_code = None;
                 last_sent.insert(channel.channel_id.clone(), now);
                 for d in queue.iter_mut().filter(|d| unit.ids.contains(&d.id)) {
+                    m.alert_delivery(kind, "sent");
                     d.state = "sent".into();
                     d.attempts += 1;
                     d.sent_at = Some(now);
@@ -467,6 +475,7 @@ impl Dispatcher {
                     channel.state = "failed".into();
                     channel.failed_since = Some(now);
                     log::warn!(
+                        event = "alerts.channel.failed";
                         "錯誤 KRS-E5107：通知管道「{}」連續 {} 次發送失敗，改由其他管道通知（最後的錯誤：{} {}）",
                         channel.name.escape_debug(),
                         channel.consecutive_failures,
@@ -483,7 +492,9 @@ impl Dispatcher {
                         d.next_attempt_at = now + PROBE_INTERVAL_MS;
                     } else if now - d.created_at >= GIVE_UP_MS {
                         d.state = "failed".into();
+                        m.alert_delivery(kind, "failed");
                         log::warn!(
+                            event = "alerts.notification.given_up";
                             "通知未送出（已重試 {} 次、超過 15 分鐘）：管道「{}」、事件 {}：{} {}",
                             d.attempts,
                             channel.name.escape_debug(),
@@ -526,6 +537,7 @@ impl Dispatcher {
                 self.persist(Vec::new(), Some((channel.channel_id.clone(), digest, now)))
                     .await;
                 log::info!(
+                    event = "alerts.channel.recovered";
                     "通知管道「{}」已恢復；失敗期間的 {} 則通知改送一則彙整",
                     channel.name.escape_debug(),
                     ids.len()
@@ -551,7 +563,7 @@ impl Dispatcher {
             .write(move |conn| Ok(store::update_channel_status(conn, &status)?))
             .await
         {
-            log::warn!("告警：無法寫入通知管道的狀態：{e}");
+            log::warn!(event = "alerts.channel.status_write_failed"; "告警：無法寫入通知管道的狀態：{e}");
         }
         self.persist(changed, None).await;
     }
@@ -612,7 +624,9 @@ impl Dispatcher {
                 );
             }
             Ok(_) => {}
-            Err(e) => log::warn!("告警：無法寫入通知的發送紀錄：{e}"),
+            Err(e) => {
+                log::warn!(event = "alerts.delivery.write_failed"; "告警：無法寫入通知的發送紀錄：{e}")
+            }
         }
     }
 }

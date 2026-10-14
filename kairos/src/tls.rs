@@ -538,6 +538,7 @@ impl RejectionLog {
         peer: Option<IpAddr>,
         at: DateTime<Utc>,
     ) {
+        crate::metrics::global().cert_rejection(reason);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if !entries.contains_key(&agent_id) && entries.len() >= MAX_REJECTIONS {
             let oldest = entries

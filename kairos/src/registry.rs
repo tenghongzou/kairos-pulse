@@ -534,9 +534,18 @@ impl Registry {
         if !inner.agents.contains_key(info.agent_id.as_str())
             && inner.agents.len() >= self.max_agents
         {
-            evicted = Some(inner.evict_oldest_offline(now).ok_or(RegistryFull {
-                max_agents: self.max_agents,
-            })?);
+            // 淘汰由連線發布 `RegistryEvicted` 到匯流排（crate::metrics::watch_bus 計數）；已滿在這裡計數
+            match inner.evict_oldest_offline(now) {
+                Some(e) => {
+                    evicted = Some(e);
+                }
+                None => {
+                    crate::metrics::global().registry_full.inc();
+                    return Err(RegistryFull {
+                        max_agents: self.max_agents,
+                    });
+                }
+            }
         }
         let (tx, rx) = oneshot::channel();
         let fingerprint =

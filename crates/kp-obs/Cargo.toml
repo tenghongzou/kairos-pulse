@@ -1,0 +1,15 @@
+[package]
+name = "kp-obs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Kairos 與 Pulse 共用的可觀測性元件：日誌格式（text／json／legacy）、syslog（RFC 5424）外送、Prometheus 文字格式、診斷包（tar.gz）與敏感資料遮蔽"
+# 內部共用 crate，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
+publish = false
+
+[dependencies]
+# 只用 workspace 既有的依賴（Cargo.lock 不新增外部套件）
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# kv：日誌的結構化欄位（`info!(event = "…", code = "…"; "…")`）；這個 feature 沒有額外的依賴
+log = { version = "0.4", features = ["std", "kv"] }
+serde_json = "1"

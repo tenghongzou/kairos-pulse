@@ -135,3 +135,34 @@ level = "info"  # 日誌級別（trace, debug, info, warn, error；不分大小�
 # 清除前會檢查系統日期是否合理：日期前進得比實際經過的時間多（例如時鐘被誤校到未來）時暫停清除，
 # 同一日期持續 24 小時後才接受。狀態存在 logs/.retention-guard.json，請勿刪除
 retention_days = 14
+# 每一行的格式：
+#   text   （預設）2026-10-14T14:22:16.123+08:00 [WARN] buffer.full PLS-W4202 本機緩衝已滿…
+#          時間為 RFC 3339、毫秒、帶時區位移；其餘與 0.5 相同（[等級]、有固定事件的行以「事件 代碼」開頭）
+#   json   一行一個 JSON（NDJSON，時間一律 UTC），檔名改為 logs/pulse-YYYY-MM-DD.jsonl；固定欄位
+#          v、ts、level、event、code、msg、agent_id、instance、product、host、run_id、seq、target、fields，
+#          供 SIEM 直接收集（rsyslog imfile、Filebeat、Fluent Bit），規則只依 event、code 判斷，不依訊息文字
+#   legacy 0.5 以前的格式（2026-10-14 14:22:16 [WARN] …，本地時間不帶時區），只保留一個主要版本供過渡
+format = "text"
+# text 的時間：local（本機時區，預設）或 utc（以 Z 結尾）。json 一律 UTC，legacy 一律本機時間
+timezone = "local"
+# 同時寫到 stdout（與日誌檔相同的格式）。以 systemd 執行時 stdout 由 unit 決定：
+# 發佈包的 pulse.service 為 StandardOutput=null（只保留日誌檔一份）；要讓 journald 收集時見 INSTALL.md
+stdout = true
+
+[log.syslog]
+# 外送到 syslog（RFC 5424）：udp://主機:埠（預設埠 514）、tcp://主機:埠（預設埠 601，RFC 6587 octet counting）、
+# unix:///dev/log（本機 socket，需要 rsyslog／syslog-ng 以 RFC 5424 解析）；空字串＝不外送（預設）。
+# 在背景送出：接收端無法連線時丟棄並計數（metrics 的 pulse_log_syslog_messages_total），不影響服務與日誌檔
+target = ""
+facility = "daemon"   # daemon、user、auth、authpriv、local0～local7
+app_name = "pulse"    # RFC 5424 的 APP-NAME
+payload = "text"      # text：訊息文字；json：與 format = "json" 相同的一行 JSON
+
+[metrics]
+# 本機的 Prometheus 指標（連線狀態、送出／ack／補送佇列、取樣耗時與逾時）。預設都關閉。
+# 本機 HTTP /metrics：只接受 loopback 位址（不需要認證，不對外開放），例如 "127.0.0.1:9465"
+listen = ""
+# 或寫成 node_exporter textfile collector 的檔案（副檔名必須是 .prom，例如
+# "/var/lib/node_exporter/textfile_collector/pulse.prom"；以寫暫存檔再改名的方式原子更新）
+textfile = ""
+textfile_interval = 15   # textfile 的更新間隔（秒，5～3600）

@@ -747,6 +747,7 @@ impl Authenticator {
     pub fn note_failure(&self, peer: IpAddr, why: &str) {
         if self.failures.fail(peer, Instant::now()) {
             warn!(
+                event = "auth.rate_limited";
                 "警告 {}：主控台 API：來自 {} 的請求驗證失敗太多次（{}），之後每 {} 秒只接受 1 次嘗試",
                 CODE_RATE_LIMITED,
                 crate::per_ip::source_key(peer),

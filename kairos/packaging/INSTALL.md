@@ -14,6 +14,7 @@
 | `kairos.example.toml` | 644 | 設定範本，複製成 `kairos.toml` 後修改 |
 | `kairos.service` | 644 | systemd unit 範本 |
 | `kairos-crl.service`、`kairos-crl.timer` | 644 | CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
+| `prometheus.example.yml`、`kairos-alerts.example.yml` | 644 | Prometheus 抓取設定與告警規則範例（第 9.2a 節，0.6.0） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
@@ -424,7 +425,28 @@ sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 Kairos 的日誌同時寫到 stdout 與 `/opt/kairos/logs/kairos-YYYY-MM-DD.log`（UTC 日期分檔，依 `log.retention_days` 清除）。在預設的 unit 下 stdout 進 journal，所以同一份日誌會存兩份：
 
 - 保留預設：可用 `journalctl -u kairos` 查詢，與 systemd 的啟停紀錄放在一起。
-- 只要檔案一份：以 drop-in 設定 `StandardOutput=null`。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
+- 只要檔案一份：以 drop-in 設定 `StandardOutput=null`，或在 `kairos.toml` 設定 `log.stdout = false`（0.6〔草稿〕）。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
+
+交給 SIEM（0.6〔草稿〕，審計 O3、S7）：`log.format = "json"`（檔名改為 `kairos-YYYY-MM-DD.jsonl`，一行一個 JSON、UTC、固定欄位 `ts`、`level`、`event`、`code`、`msg`、`fields`…），由 Filebeat／Fluent Bit 收集；或設定 `[log.syslog]` 的 `target`（`udp://`、`tcp://`、`unix:///dev/log`）以 RFC 5424 直接送出。`log.format = "legacy"` 保留 0.5 以前的行格式供既有的解析規則過渡（`text` 的行首改為 RFC 3339 帶時區，例如 `2026-10-14T14:22:16.123+08:00 [INFO] …`）。
+
+### 9.2a 健康檢查、Prometheus 與診斷包（0.6〔草稿〕）
+
+```bash
+# 設定檢查（不啟動服務、不連線）：0 通過、8 有警告（--strict）、3 設定錯誤、4 憑證錯誤
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+
+# 健康檢查（主控台的監聽上；不需要 token，只回傳狀態字）
+curl -sk https://127.0.0.1:9443/healthz        # {"status":"ok"}
+curl -sk https://127.0.0.1:9443/readyz         # 200 就緒／503 不就緒，本文為各項的狀態
+curl -sk https://127.0.0.1:9443/metrics | head # Prometheus 文字格式；未設定 token 時只接受 loopback
+
+# 支援診斷包（tar.gz，0600；遮蔽 token、密碼、私鑰）。交給外部廠商時加 --redact-hosts
+cd /tmp && sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml
+```
+
+- **負載平衡器的探針**：以 `GET /readyz` 判斷（200／503）。主控台不對外開放時，在 `kairos.toml` 設定 `[observability] listen = "<負載平衡器可達的位址>:9464"`（純 HTTP，只有 `/healthz`、`/readyz`、`/metrics` 三個端點，`/metrics` 仍只接受 loopback 或帶 token 的請求）；只負責 8444 的負載平衡器用 `/readyz?scope=enroll`。
+- **Prometheus**：同一台主機時抓 `http://127.0.0.1:9464/metrics`（`observability.listen = "127.0.0.1:9464"`）；從其他主機抓取時設定 `observability.metrics_token_file`（`openssl rand -hex 32 > /opt/kairos/metrics.token && chown root:kairos /opt/kairos/metrics.token && chmod 640 /opt/kairos/metrics.token`），經主控台的 HTTPS 以 bearer token 抓取。設定與建議的告警規則見 `prometheus.example.yml`、`kairos-alerts.example.yml`。
+- 另外建議在 Kairos 以外監看 `/healthz`（例如既有的 Zabbix）：Kairos 自己無法通知「自己已經停止」。
 
 ### 9.3 主控台 API
 

@@ -88,6 +88,9 @@ pub struct WriteStats {
     started: Instant,
     totals: [AtomicU64; KINDS],
     ring: Mutex<Ring>,
+    /// 從放入寫入佇列到收到寫入結果（之後連線回 `ack`）的時間（`/metrics`，O3）；
+    /// 只計入有結果的（逾時取消、結果不明不計入，另以結果的計數表示）
+    pub ack_latency: kp_obs::prom::Histogram,
 }
 
 impl Default for WriteStats {
@@ -109,6 +112,7 @@ impl WriteStats {
             ring: Mutex::new(Ring {
                 slots: [(0, [0; KINDS]); WINDOW_MINUTES],
             }),
+            ack_latency: kp_obs::prom::Histogram::latency(),
         }
     }
 

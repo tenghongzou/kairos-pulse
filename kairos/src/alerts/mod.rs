@@ -105,6 +105,22 @@ struct InvHost {
 }
 
 /// 告警服務：引擎、派送與 API 的入口
+/// [`AlertService::metrics`] 的結果
+#[derive(Debug, Clone, Default)]
+pub struct MetricsSnapshot {
+    /// 判定週期在 60 秒內執行過
+    pub running: bool,
+    /// 最近一個判定週期（Unix 毫秒；還沒有時為 0）
+    pub last_tick_ms: i64,
+    pub tick_seconds: f64,
+    /// 告警暖機期中
+    pub warmup: bool,
+    /// 未解決的事件：[嚴重度（emergency、critical、warning、info）][狀態（firing、acknowledged、recovered）]
+    pub open: [[u64; 3]; 4],
+    /// 通知管道：[ok、failed、disabled]
+    pub channels: [u64; 3],
+}
+
 pub struct AlertService {
     pub settings: AlertSettings,
     pub db: Arc<EnrollDb>,
@@ -312,6 +328,7 @@ impl AlertService {
         };
         svc.flush(out).await;
         log::info!(
+            event = "alerts.engine.started";
             "告警引擎已啟動：規則 {n_rules} 條、進行中的事件 {n_open} 個、暖機期 {} 秒（重新啟動前在線上 {n_expected} 台）",
             svc.settings.warmup_secs
         );
@@ -327,7 +344,7 @@ impl AlertService {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        log::error!("告警引擎無法建立 runtime：{e}");
+                        log::error!(event = "alerts.engine.failed"; "告警引擎無法建立 runtime：{e}");
                         return;
                     }
                 };
@@ -391,7 +408,7 @@ impl AlertService {
         self.flush(out).await;
         self.heartbeat(true).await;
         self.stopped.store(true, Ordering::SeqCst);
-        log::info!("告警引擎已停止");
+        log::info!(event = "alerts.engine.stopped"; "告警引擎已停止");
     }
 
     async fn heartbeat(&self, clean: bool) {
@@ -423,7 +440,7 @@ impl AlertService {
     }
 
     fn note_error(&self, e: String) {
-        log::warn!("告警引擎：{e}");
+        log::warn!(event = "alerts.engine.error"; "告警引擎：{e}");
         *self.last_error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e);
     }
 
@@ -796,6 +813,7 @@ impl AlertService {
                 Ok((p, more)) => {
                     if p.events > 0 {
                         log::info!(
+                            event = "alerts.retention.purged";
                             "已依保留期限與筆數上限刪除告警歷史：事件 {} 個、處理紀錄 {} 筆、發送紀錄 {} 筆（alerts.retention_days = {days}、alerts.max_events = {max}）",
                             p.events,
                             p.timeline,
@@ -891,6 +909,50 @@ impl AlertService {
             "bus_dropped": self.registry.bus().dropped(),
             "last_error": self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         })
+    }
+
+    /// `/metrics` 用的狀態（[`MetricsSnapshot`]；標籤只有嚴重度、事件狀態、管道狀態的有限集合）
+    pub async fn metrics(&self) -> MetricsSnapshot {
+        let now = (self.clock)();
+        let last = self.last_tick.load(Ordering::Relaxed);
+        let mut open = [[0u64; 3]; 4];
+        let warmup;
+        {
+            let engine = self.engine.lock().await;
+            warmup = !engine.warmup().ended;
+            for e in engine.events.values() {
+                let st = match e.state {
+                    model::EventState::Firing => 0,
+                    model::EventState::Acknowledged => 1,
+                    model::EventState::Recovered => 2,
+                    model::EventState::Resolved => continue,
+                };
+                let sev = model::Severity::ALL
+                    .iter()
+                    .position(|s| *s == e.severity)
+                    .unwrap_or(3);
+                open[sev][st] += 1;
+            }
+        }
+        let mut channels = [0u64; 3];
+        for c in self.dispatcher.channels() {
+            let i = if !c.enabled {
+                2
+            } else if c.failed() {
+                1
+            } else {
+                0
+            };
+            channels[i] += 1;
+        }
+        MetricsSnapshot {
+            running: !self.stopped.load(Ordering::SeqCst) && last > 0 && now - last < 60_000,
+            last_tick_ms: last,
+            tick_seconds: self.tick_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            warmup,
+            open,
+            channels,
+        }
     }
 
     /// 派送端的管道狀態（API 的「最近發送」與狀態欄）

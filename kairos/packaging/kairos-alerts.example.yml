@@ -1,0 +1,210 @@
+# Kairos 的 Prometheus 告警規則範例（0.6.0〔草稿〕）。門檻依設計包 kairos/screens.md S20「檢查項目、門檻與來源」；
+# 對應的產品代碼寫在 annotations.code，方便與 Kairos 的日誌、主控台的系統健康對照。
+# 依部署調整 for 與門檻後放到 /etc/prometheus/rules/kairos-alerts.yml，以 promtool check rules 檢查。
+#
+# 另外建議在 Kairos 以外監看 /healthz（例如既有的 Zabbix 或 blackbox_exporter）：Kairos 自己無法通知「自己已經停止」。
+
+groups:
+  - name: kairos
+    rules:
+      - alert: KairosDown
+        expr: up{job=~"kairos.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "無法抓取 Kairos 的 /metrics（{{ $labels.instance }}）"
+          description: "Kairos 可能已停止，或探針端點無法連線。執行 systemctl status kairos、kairos --check-config。"
+
+      - alert: KairosNotReady
+        expr: kairos_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kairos 不就緒（{{ $labels.instance }}）"
+          description: "agent 連線埠未監聽、資料庫無法寫入、儲存無法使用或正在關機；以 /readyz 查看是哪一項。"
+
+      - alert: KairosStorageUnavailable
+        expr: kairos_storage_unavailable == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          code: KRS-E4101
+          summary: "report 持續無法保存超過 5 分鐘（{{ $labels.instance }}）"
+          description: "Pulse 的資料留在本機緩衝等待補送；檢查資料磁碟、SQLite 與 Kairos 的日誌。"
+
+      - alert: KairosReportWriteFailures
+        expr: increase(kairos_reports_total{result=~"storage_unavailable|unknown"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-E4101
+          summary: "過去 10 分鐘有 report 寫入失敗或結果未知（{{ $labels.instance }}）"
+
+      - alert: KairosDatabaseUnwritable
+        expr: kairos_database_writable == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "資料庫無法寫入（{{ $labels.instance }}）"
+
+      - alert: KairosAckLatencyHigh
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(kairos_report_ack_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "report 寫入的 p99 超過 1 秒（{{ $labels.instance }}）"
+          description: "同時查看 kairos_report_write_queue_depth；寫入超過 timeouts.write_secs（預設 5 秒）會回 storage_unavailable。"
+
+      - alert: KairosConnectionsNearLimit
+        expr: kairos_agent_connections / kairos_agent_connections_max >= 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W2204
+          summary: "agent 連線達 server.max_connections 的 90%（{{ $labels.instance }}）"
+
+      - alert: KairosConnectionsAtLimit
+        expr: kairos_agent_connections / kairos_agent_connections_max >= 0.98 or kairos_accept_paused == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          code: KRS-W2204
+          summary: "agent 連線接近或已達上限，暫停接受新連線（{{ $labels.instance }}）"
+          description: "調高 server.max_connections（需重新啟動）並一併調高 LimitNOFILE。"
+
+      - alert: KairosRejectedByGlobalLimit
+        expr: increase(kairos_accept_pauses_total[1h]) > 0 or increase(kairos_connections_rejected_total{reason="handshake_limit"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W2204
+          summary: "過去 1 小時曾因全域上限拒絕連線（{{ $labels.instance }}）"
+
+      - alert: KairosRejectedByPerIpLimit
+        expr: increase(kairos_connections_rejected_total{reason="per_ip"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W2201
+          summary: "過去 1 小時曾因每 IP 上限拒絕連線（{{ $labels.instance }}）"
+          description: "多半是 NAT 出口：把網段加入 server.per_ip_allowlist，或調高 server.max_connections_per_ip。"
+
+      - alert: KairosRegistryNearFull
+        expr: kairos_registry_entries / kairos_registry_max_entries >= 0.8
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "狀態表達 limits.max_agents 的 80%（{{ $labels.instance }}）"
+
+      - alert: KairosRegistryFull
+        expr: increase(kairos_registry_full_rejections_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "狀態表已滿，新的 agent 被拒（{{ $labels.instance }}）"
+
+      - alert: KairosRetentionPaused
+        expr: kairos_retention_paused == 1
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W4201
+          summary: "系統日期異常，暫停清除過期資料（{{ $labels.instance }}）"
+
+      - alert: KairosCapacityDeleting
+        expr: kairos_storage_capacity_deleting == 1
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W4202
+          summary: "資料庫已達 storage.max_total_bytes，正在提早刪除最舊的資料（{{ $labels.instance }}）"
+
+      - alert: KairosServerCertificateExpiring
+        expr: kairos_certificate_days_remaining{kind="server_certificate"} <= 30
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W1001
+          summary: "伺服器憑證 {{ $value }} 天後到期（{{ $labels.instance }}）"
+
+      - alert: KairosServerCertificateCritical
+        expr: kairos_certificate_days_remaining{kind="server_certificate"} <= 7
+        labels:
+          severity: critical
+        annotations:
+          code: KRS-W1001
+          summary: "伺服器憑證 {{ $value }} 天後到期或已過期（{{ $labels.instance }}）"
+
+      - alert: KairosCrlExpiring
+        expr: kairos_certificate_days_remaining{kind="crl"} <= 7
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W1201
+          summary: "CRL 將在 {{ $value }} 天後過期（{{ $labels.instance }}）"
+
+      - alert: KairosCrlCritical
+        expr: kairos_certificate_days_remaining{kind="crl"} <= 1
+        labels:
+          severity: critical
+        annotations:
+          code: KRS-E1203
+          summary: "CRL 即將或已經過期，agent 會被拒絕（{{ $labels.instance }}）"
+
+      - alert: KairosIssuingCaExpiring
+        expr: kairos_certificate_days_remaining{kind="issuing_ca"} <= 60
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W1304
+          summary: "簽發 CA 將在 {{ $value }} 天後到期（{{ $labels.instance }}）"
+
+      - alert: KairosEnrollNotListening
+        expr: kairos_enroll_listening == 0 unless on (instance) kairos_enroll_mode{mode="closed"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          code: KRS-E2001
+          summary: "註冊端點（8444）應在監聽但未監聽（{{ $labels.instance }}）"
+
+      - alert: KairosEnrollRateLimited
+        expr: increase(kairos_enroll_rate_limited_total[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          code: KRS-W2202
+          summary: "過去 1 小時有註冊請求因速率限制延後（{{ $labels.instance }}）"
+
+      - alert: KairosEnrollPendingQueueHigh
+        expr: kairos_enroll_pending_requests > 1000
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "待核准的註冊申請超過 1,000 筆（{{ $labels.instance }}）"
+
+      - alert: KairosApiAuthFailures
+        expr: increase(kairos_api_auth_failures_total{reason="unauthorized"}[15m]) > 20
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-E6010
+          summary: "主控台 API 15 分鐘內有 {{ $value }} 次認證失敗（{{ $labels.instance }}）"
+
+      - alert: KairosSyslogDropping
+        expr: increase(kairos_log_syslog_messages_total{result="dropped"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "日誌外送到 syslog 失敗，訊息被丟棄（{{ $labels.instance }}）"
+          description: "日誌檔不受影響；確認 log.syslog.target 的接收端。"

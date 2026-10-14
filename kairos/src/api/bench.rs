@@ -433,6 +433,49 @@ async fn api_bench_acks_under_load() {
             api.len() as f64 / secs as f64
         );
     }
+
+    // 階段 4、5（0.6）：寫入同時抓取 /metrics（Prometheus 一般每 15 秒一次；這裡以每秒 1 次與連續抓取
+    // 量測上限），確認計數器與輸出不讓 ack 延遲上升
+    for (phase, interval_ms) in [("/metrics every 1 s", 1000u64), ("/metrics continuous", 0)] {
+        let client_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scraper = {
+            let f = f.clone();
+            let stop = stop.clone();
+            client_rt.spawn(async move {
+                let mut lat = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let t0 = Instant::now();
+                    let r = get(&f, "/metrics").await;
+                    lat.push(t0.elapsed());
+                    assert_eq!(r.status, 200);
+                    if interval_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    }
+                }
+                lat
+            })
+        };
+        let seq_base = if interval_ms == 0 {
+            5_000_000
+        } else {
+            4_000_000
+        };
+        let lat = writes(f.sink.clone(), agents.clone(), rate, secs, seq_base).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let scrapes = scraper.await.unwrap();
+        client_rt.shutdown_background();
+        println!("{}", summary(&format!("ack {rate}/s, {phase}"), lat));
+        println!(
+            "{} ({:.1} req/s)",
+            summary(&format!("/metrics during load ({phase})"), scrapes.clone()),
+            scrapes.len() as f64 / secs as f64
+        );
+    }
     match Arc::try_unwrap(f) {
         Ok(f) => f.stop().await,
         Err(_) => panic!("fixture 仍被使用"),

@@ -314,6 +314,46 @@ async fn alerts_end_to_end_over_https() {
         }
     }
     assert!(saw, "SSE 應推送 alert.created");
+    // /metrics：告警引擎的狀態、建立的事件與 Webhook 的發送（全域計數，其他測試也會累加：只檢查下限）
+    let r = super::tests::request(addr, "GET", "/metrics", None, &[]).await;
+    assert_eq!(r.status, 200);
+    let text = String::from_utf8(r.body.clone()).unwrap();
+    let p = kp_obs::prom::parse(&text).unwrap_or_else(|e| {
+        panic!(
+            "{e}
+{text}"
+        )
+    });
+    kp_obs::prom::lint(&p, "kairos_").unwrap();
+    assert_eq!(p.get("kairos_alerts_engine_enabled", &[]), Some(1.0));
+    assert!(
+        p.get("kairos_alerts_fired_total", &[("severity", "critical")])
+            .unwrap()
+            >= 1.0,
+        "{text}"
+    );
+    assert!(
+        p.get(
+            "kairos_alert_notification_sends_total",
+            &[("kind", "webhook"), ("result", "ok")]
+        )
+        .unwrap()
+            >= 1.0,
+        "{text}"
+    );
+    assert!(
+        p.get(
+            "kairos_alerts_open",
+            &[("severity", "critical"), ("state", "firing")]
+        )
+        .unwrap()
+            >= 1.0,
+        "{text}"
+    );
+    assert_eq!(
+        p.get("kairos_alert_channels", &[("state", "ok")]),
+        Some(1.0)
+    );
     // 0.5 的 token 的串流：同一段時間的主機事件有送出，告警的事件沒有
     let mut legacy_kinds = Vec::new();
     while let Ok(Some(ev)) =

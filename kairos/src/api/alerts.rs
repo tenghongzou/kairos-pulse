@@ -235,7 +235,7 @@ fn unavailable() -> ApiError {
 }
 
 fn db_error(e: impl std::fmt::Display) -> ApiError {
-    log::warn!("告警端點：資料庫無法讀寫：{e}");
+    log::warn!(event = "alerts.api.storage_error"; "告警端點：資料庫無法讀寫：{e}");
     ApiError::storage("告警資料")
 }
 
@@ -322,7 +322,7 @@ impl Ctx<'_> {
             })
             .await
         {
-            log::warn!("告警端點：無法寫入稽核紀錄：{e}");
+            log::warn!(event = "audit.write_failed"; "告警端點：無法寫入稽核紀錄：{e}");
         }
     }
 }
@@ -2008,7 +2008,7 @@ async fn save_channel(
     };
     let sealed = if secrets_changed {
         Some(c.svc.secrets.seal(&secrets).map_err(|e| {
-            log::warn!("無法加密通知管道的機密：{e}");
+            log::warn!(event = "alerts.channel.encrypt_failed"; "無法加密通知管道的機密：{e}");
             ApiError::internal()
         })?)
     } else {

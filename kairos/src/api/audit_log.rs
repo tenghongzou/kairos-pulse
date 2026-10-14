@@ -303,6 +303,7 @@ async fn verify(
         .await?;
     if let Some(b) = &report.broken {
         error!(
+            event = "audit.chain_broken";
             "錯誤 {CODE_CHAIN_BROKEN}：稽核日誌完整性驗證失敗：第 {} 筆（{}）。紀錄可能被修改或刪除，請保全資料庫檔並與匯出或外送的副本比對",
             b.id, b.reason
         );

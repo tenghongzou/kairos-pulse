@@ -372,6 +372,7 @@ impl Engine {
             .collect();
         let expected_n = expected.len();
         log::info!(
+            event = "alerts.warmup.ended";
             "告警暖機期結束：重新啟動前在線上的 {} 台主機中有 {} 台已重新連上",
             expected_n,
             back

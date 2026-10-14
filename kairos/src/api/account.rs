@@ -132,12 +132,12 @@ impl LoginState {
 /// 寫入一筆稽核（失敗只記日誌，不影響回應）
 pub(super) async fn audit(ctx: &Arc<ApiContext>, ev: Event, now_ms: i64) {
     if let Err(e) = ctx.admin.write(move |c| ev.append(c, now_ms)).await {
-        warn!("無法寫入稽核紀錄：{e}");
+        warn!(event = "audit.write_failed"; "無法寫入稽核紀錄：{e}");
     }
 }
 
 pub(super) fn storage_error(e: impl std::fmt::Display) -> ApiError {
-    warn!("主控台：使用者資料無法讀寫：{e}");
+    warn!(event = "accounts.storage_error"; "主控台：使用者資料無法讀寫：{e}");
     ApiError::storage("使用者資料")
 }
 
@@ -646,7 +646,7 @@ async fn login_ldap(
             .with_product_code("KRS-E6009"))
         }
         Err(e) => {
-            warn!("目錄服務登入失敗（{}）：{}", e.product_code(), e.detail());
+            warn!(event = "login.directory_failed"; "目錄服務登入失敗（{}）：{}", e.product_code(), e.detail());
             audit(
                 ctx,
                 Event {
@@ -1208,7 +1208,7 @@ async fn change_password(
         .blocking(move || password::hash(&new, params))
         .await?
         .map_err(|e| {
-            error!("無法雜湊密碼：{e}");
+            error!(event = "accounts.hash_failed"; "無法雜湊密碼：{e}");
             ApiError::internal()
         })?;
     let actor = p.actor();

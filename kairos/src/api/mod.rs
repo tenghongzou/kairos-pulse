@@ -41,6 +41,8 @@ mod auth_tests;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
+mod probe_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 use chrono::{DateTime, Utc};
@@ -121,6 +123,8 @@ pub struct ApiContext {
     pub directory: Option<Arc<dyn crate::users::ldap::Directory>>,
     /// 被拒絕的請求寫入稽核的節流（同一個執行者每分鐘最多 [`DeniedThrottle::PER_MINUTE`] 筆）
     pub denied: DeniedThrottle,
+    /// `/healthz`、`/readyz`、`/metrics`（`observability.on_console` 時在主控台的監聽上提供）
+    pub obs: Option<Arc<crate::probe::ObsContext>>,
 }
 
 /// 被拒絕（403）的寫入請求寫入稽核的節流：同一個執行者每分鐘最多 20 筆，超過的計數併入下一筆
@@ -179,6 +183,7 @@ pub struct StartParams {
     pub alerts: Option<Arc<crate::alerts::AlertService>>,
     /// 測試用：以替代的目錄服務取代 `[ldap]` 的連線
     pub directory: Option<Arc<dyn crate::users::ldap::Directory>>,
+    pub obs: Option<Arc<crate::probe::ObsContext>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -368,6 +373,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         console_listen: local_addr,
         enroll: p.enroll.clone(),
         alerts: p.alerts.clone(),
+        obs: p.obs.clone().filter(|_| p.config.observability.on_console),
     });
     ctx.hosts.load_known(known);
 
@@ -534,6 +540,18 @@ async fn handle(
     let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // 健康檢查與 Prometheus（審計 O3）：不經過 API token／工作階段的驗證，規則見 crate::probe
+    if let Some(obs) = &ctx.obs
+        && crate::probe::is_probe_path(&path)
+    {
+        let auth = req
+            .headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let resp = crate::probe::handle(obs, &method, &path, req.uri().query(), auth, peer).await;
+        crate::metrics::global().api_request(&path, resp.status().as_u16());
+        return resp;
+    }
     let now = Utc::now();
     let (result, principal) = route(&ctx, peer, req, now).await;
     let resp = match result {
@@ -568,6 +586,7 @@ async fn handle(
             e.into_response(Utc::now())
         }
     };
+    crate::metrics::global().api_request(&path, resp.status().as_u16());
     debug!(
         "主控台 {} {} {} → {}（{:.1} ms{}）",
         peer.ip(),
