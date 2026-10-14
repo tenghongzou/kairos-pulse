@@ -26,6 +26,8 @@ pub mod server;
 pub mod store;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 use kairos_proto::enroll::EnrollMode;

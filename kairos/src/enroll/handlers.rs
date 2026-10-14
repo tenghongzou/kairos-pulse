@@ -761,21 +761,37 @@ async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>,
     let csr2 = csr.clone();
     let now = ctx.received;
     let batch_source = svc.is_batch_source(peer);
+    let (s2, req3, checked3, csr3, token2, source2) = (
+        svc.clone(),
+        req.clone(),
+        checked.clone(),
+        csr.clone(),
+        token.clone(),
+        ctx.observed.clone(),
+    );
+    let pre = svc
+        .db
+        .read(move |conn| {
+            pre_assess(
+                &s2,
+                conn,
+                &req3,
+                &checked3,
+                &csr3,
+                &token2,
+                in_cidrs,
+                batch_source,
+                &source2,
+                now,
+            )
+        })
+        .await
+        .map_err(db_err)??;
     let created = svc
         .db
         .write(move |conn| {
             create_in_tx(
-                &s,
-                conn,
-                &req2,
-                &checked2,
-                &csr2,
-                &token_id,
-                in_cidrs,
-                batch_source,
-                &source_ip,
-                poll_hash,
-                now,
+                &s, conn, &req2, &checked2, &csr2, &token_id, &pre, &source_ip, poll_hash, now,
             )
         })
         .await
@@ -846,6 +862,100 @@ async fn idempotent(
     respond_with(ctx, r, cert).await
 }
 
+/// 交易前的判定（唯讀連線；不佔用寫入鎖）：公鑰重複、異常旗標、自動核准與否、L9 待核准佇列、授權
+struct Pre {
+    flags: Vec<String>,
+    auto: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pre_assess(
+    svc: &EnrollService,
+    conn: &rusqlite::Connection,
+    req: &EnrollRequest,
+    checked: &CheckedEnrollRequest,
+    csr: &crate::pki::csr::CheckedCsr,
+    token: &TokenRow,
+    in_cidrs: Option<bool>,
+    batch_source: bool,
+    source_ip: &str,
+    now: i64,
+) -> Result<Result<Pre, EnrollError>, DbError> {
+    // 公鑰不得是這個 agent_id 先前任何一張憑證的公鑰
+    if ps::spki_used_by_agent(conn, &checked.agent_id, &csr.spki_sha256)? {
+        let mut e = EnrollError::new(
+            EnrollErrorCode::InvalidCsr,
+            "csr public key was already used by a previous certificate of this agent_id",
+        );
+        e.body.field = Some("csr".into());
+        return Ok(Err(e));
+    }
+    // 異常旗標（S13）
+    let host = store::host_enroll(conn, &checked.agent_id)?;
+    let certs = ps::certs_of_agent(conn, &checked.agent_id)?;
+    // 已有有效憑證：Kairos 簽發的憑證未撤銷、未過期；或清冊中有這台主機、使用手動簽發的憑證
+    // （Kairos 不知道它的效期，視為有效）
+    let has_valid_cert = certs
+        .iter()
+        .any(|c| c.revoked_at.is_none() && c.not_after > now)
+        || host
+            .as_ref()
+            .is_some_and(|h| h.lifecycle == "active" && h.current_serial.is_none());
+    let mut flags = Vec::new();
+    if in_cidrs == Some(false) {
+        flags.push("source_outside_cidrs".to_string());
+    }
+    if store::hostname_in_use(conn, &req.hostname, &checked.agent_id)? {
+        flags.push("duplicate_hostname".to_string());
+    }
+    if has_valid_cert {
+        flags.push("agent_id_exists".to_string());
+    }
+    if !batch_source
+        && in_cidrs != Some(true)
+        && store::recent_count_from(conn, source_ip, now - BURST_WINDOW_MS)? + 1 >= BURST_COUNT
+    {
+        flags.push("burst_from_ip".to_string());
+    }
+    if req.server_verification == ServerVerification::Tofu {
+        flags.push("unverified_server".to_string());
+    }
+    if req.previous_serial.is_some() || certs.iter().any(|c| c.revoked_at.is_some()) {
+        flags.push("reenroll_after_revocation".to_string());
+    }
+    if let (Some(h), Some(fp)) = (&host, &req.host_fingerprint)
+        && h.host_fingerprint
+            .as_deref()
+            .is_some_and(|known| known != fp)
+    {
+        flags.push("fingerprint_mismatch".to_string());
+    }
+    // 自動核准：token 免審核、來源在網段內，且沒有已存在的有效憑證（避免以 token 取得另一台主機的身分）
+    let auto = token.approval == TokenApproval::Auto && !has_valid_cert;
+    // 12. L9 待核准佇列（結果會是待核准、或已核准待簽發時）
+    let online = matches!(svc.pki.status(), super::pki_mgr::IssueStatus::Online { .. });
+    let will_be_pending = !auto || !online;
+    if will_be_pending && store::pending_count(conn)? >= i64::from(svc.config.enroll.max_pending) {
+        let mut e = EnrollError::limited(
+            EnrollErrorCode::PendingQueueFull,
+            RateScope::Global,
+            Duration::from_secs(3600),
+            source_ip,
+        );
+        e.retry_after = Some(3600);
+        e.body.retry_after_ms = Some(3_600_000);
+        return Ok(Err(e));
+    }
+    // 13. 授權節點數（本版沒有授權機制）
+    if auto && !svc.license_allows(1) {
+        return Ok(Err(EnrollError::new(
+            EnrollErrorCode::LicenseExhausted,
+            "license node count would be exceeded",
+        )));
+    }
+    Ok(Ok(Pre { flags, auto }))
+}
+
 /// 新註冊的建立（交易內）。外層 `Result` 為資料庫錯誤，內層為協定錯誤
 #[allow(clippy::too_many_arguments)]
 fn create_in_tx(
@@ -855,8 +965,7 @@ fn create_in_tx(
     checked: &CheckedEnrollRequest,
     csr: &crate::pki::csr::CheckedCsr,
     token_id: &str,
-    in_cidrs: Option<bool>,
-    batch_source: bool,
+    pre: &Pre,
     source_ip: &str,
     poll_hash: [u8; 32],
     now: i64,
@@ -885,78 +994,8 @@ fn create_in_tx(
     if let Err(e) = token_usable(&token, now) {
         return Ok(Err(e));
     }
-    // 公鑰不得是這個 agent_id 先前任何一張憑證的公鑰
-    if ps::spki_used_by_agent(&tx, &checked.agent_id, &csr.spki_sha256)? {
-        let mut e = EnrollError::new(
-            EnrollErrorCode::InvalidCsr,
-            "csr public key was already used by a previous certificate of this agent_id",
-        );
-        e.body.field = Some("csr".into());
-        return Ok(Err(e));
-    }
-    // 異常旗標（S13）
-    let host = store::host_enroll(&tx, &checked.agent_id)?;
-    let certs = ps::certs_of_agent(&tx, &checked.agent_id)?;
-    // 已有有效憑證：Kairos 簽發的憑證未撤銷、未過期；或清冊中有這台主機、使用手動簽發的憑證
-    // （Kairos 不知道它的效期，視為有效）
-    let has_valid_cert = certs
-        .iter()
-        .any(|c| c.revoked_at.is_none() && c.not_after > now)
-        || host
-            .as_ref()
-            .is_some_and(|h| h.lifecycle == "active" && h.current_serial.is_none());
-    let mut flags = Vec::new();
-    if in_cidrs == Some(false) {
-        flags.push("source_outside_cidrs".to_string());
-    }
-    if store::hostname_in_use(&tx, &req.hostname, &checked.agent_id)? {
-        flags.push("duplicate_hostname".to_string());
-    }
-    if has_valid_cert {
-        flags.push("agent_id_exists".to_string());
-    }
-    if !batch_source
-        && in_cidrs != Some(true)
-        && store::recent_count_from(&tx, source_ip, now - BURST_WINDOW_MS)? + 1 >= BURST_COUNT
-    {
-        flags.push("burst_from_ip".to_string());
-    }
-    if req.server_verification == ServerVerification::Tofu {
-        flags.push("unverified_server".to_string());
-    }
-    if req.previous_serial.is_some() || certs.iter().any(|c| c.revoked_at.is_some()) {
-        flags.push("reenroll_after_revocation".to_string());
-    }
-    if let (Some(h), Some(fp)) = (&host, &req.host_fingerprint)
-        && h.host_fingerprint
-            .as_deref()
-            .is_some_and(|known| known != fp)
-    {
-        flags.push("fingerprint_mismatch".to_string());
-    }
-    // 自動核准：token 免審核、來源在網段內，且沒有已存在的有效憑證（避免以 token 取得另一台主機的身分）
-    let auto = token.approval == TokenApproval::Auto && !has_valid_cert;
-    // 12. L9 待核准佇列（結果會是待核准、或已核准待簽發時）
-    let online = matches!(svc.pki.status(), super::pki_mgr::IssueStatus::Online { .. });
-    let will_be_pending = !auto || !online;
-    if will_be_pending && store::pending_count(&tx)? >= i64::from(svc.config.enroll.max_pending) {
-        let mut e = EnrollError::limited(
-            EnrollErrorCode::PendingQueueFull,
-            RateScope::Global,
-            Duration::from_secs(3600),
-            source_ip,
-        );
-        e.retry_after = Some(3600);
-        e.body.retry_after_ms = Some(3_600_000);
-        return Ok(Err(e));
-    }
-    // 13. 授權節點數（本版沒有授權機制）
-    if auto && !svc.license_allows(1) {
-        return Ok(Err(EnrollError::new(
-            EnrollErrorCode::LicenseExhausted,
-            "license node count would be exceeded",
-        )));
-    }
+    let flags = pre.flags.clone();
+    let auto = pre.auto && token.approval == TokenApproval::Auto;
     // 14. 建立申請
     let request_id = new_uuid()?;
     let code = request_code_from_spki(&csr.spki_der);

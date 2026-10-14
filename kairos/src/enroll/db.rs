@@ -19,6 +19,10 @@ use crate::store::sqlite::{file_identity, open_existing_read_write, open_read_on
 pub const WRITE_BUSY: Duration = Duration::from_secs(2);
 /// 同時進行的唯讀查詢上限
 pub const MAX_READERS: usize = 4;
+/// 兩個寫入交易之間至少相隔的時間：report 的 writer 等待寫入鎖時（SQLite 的 busy handler 每隔數毫秒重試），
+/// 註冊服務連續的寫入不會一直搶先取得鎖，`ack` 不會被拖慢（量測見 `kairos/PKI.md` 第 12 節）。
+/// 註冊服務的寫入因此最多每秒約 500 個交易，遠高於 L8 的預設（每秒 50 筆申請）
+pub const WRITE_SPACING: Duration = Duration::from_millis(2);
 
 /// 資料庫無法使用（回 503 `storage_unavailable`）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +92,8 @@ impl EnrollDb {
         {
             *guard = None;
         }
+        // 持有寫入的 mutex 等待：下一個註冊服務的交易至少在這之後才開始
+        std::thread::sleep(WRITE_SPACING);
         result
     }
 

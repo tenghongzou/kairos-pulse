@@ -32,18 +32,18 @@ use crate::shutdown::Shutdown;
 
 const DAY: i64 = 86_400_000;
 
-fn t(secs: i64) -> time::OffsetDateTime {
+pub(super) fn t(secs: i64) -> time::OffsetDateTime {
     time::OffsetDateTime::from_unix_timestamp(secs).unwrap()
 }
 
 /// 測試用的根 CA（P-384）與 localhost 的伺服器憑證
-struct Root {
+pub(super) struct Root {
     key: KeyPair,
     params: CertificateParams,
-    pem: String,
+    pub(super) pem: String,
 }
 
-fn root() -> Root {
+pub(super) fn root() -> Root {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
     let mut p = CertificateParams::default();
     p.distinguished_name = DistinguishedName::new();
@@ -63,12 +63,12 @@ fn root() -> Root {
 }
 
 impl Root {
-    fn issuer(&self) -> Issuer<'_, &KeyPair> {
+    pub(super) fn issuer(&self) -> Issuer<'_, &KeyPair> {
         Issuer::from_params(&self.params, &self.key)
     }
 
     /// localhost／127.0.0.1 的伺服器憑證（serverAuth）
-    fn server_cert(&self) -> (String, String) {
+    pub(super) fn server_cert(&self) -> (String, String) {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut p = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         p.subject_alt_names
@@ -85,7 +85,7 @@ impl Root {
     }
 
     /// 以根 CA 簽發簽發 CA 的 CSR（INSTALL 的 issuing_ca_ext 範本）
-    fn sign_issuing(&self, csr_pem: &str) -> String {
+    pub(super) fn sign_issuing(&self, csr_pem: &str) -> String {
         let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
         csr.params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         csr.params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -99,15 +99,15 @@ impl Root {
 }
 
 /// 一個 Pulse 的身分：P-256 私鑰、CSR、poll_secret
-struct Agent {
-    id: String,
+pub(super) struct Agent {
+    pub(super) id: String,
     key: KeyPair,
-    csr: Vec<u8>,
-    poll_secret: String,
+    pub(super) csr: Vec<u8>,
+    pub(super) poll_secret: String,
     fingerprint: String,
 }
 
-fn agent(id: &str) -> Agent {
+pub(super) fn agent(id: &str) -> Agent {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let mut p = CertificateParams::new(vec![id.to_string()]).unwrap();
     p.distinguished_name = DistinguishedName::new();
@@ -132,7 +132,7 @@ impl Agent {
         a
     }
 
-    fn enroll_request(&self, token: &str, sent_at_ms: i64) -> EnrollRequest {
+    pub(super) fn enroll_request(&self, token: &str, sent_at_ms: i64) -> EnrollRequest {
         EnrollRequest {
             token: token.to_string(),
             agent_id: self.id.clone(),

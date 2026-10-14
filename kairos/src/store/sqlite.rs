@@ -256,6 +256,7 @@ CREATE INDEX enroll_requests_agent ON enroll_requests (agent_id);
 CREATE INDEX enroll_requests_code ON enroll_requests (request_code);
 CREATE INDEX enroll_requests_token ON enroll_requests (token_id);
 CREATE INDEX enroll_requests_source ON enroll_requests (source_ip, state);
+CREATE INDEX enroll_requests_source_time ON enroll_requests (source_ip, created_at);
 
 CREATE TABLE pki_certificates (
     serial         TEXT NOT NULL UNIQUE,
@@ -349,6 +350,7 @@ ALTER TABLE hosts ADD COLUMN current_serial TEXT;
 ALTER TABLE hosts ADD COLUMN grace_override_until INTEGER;
 ALTER TABLE hosts ADD COLUMN expired_seen_at INTEGER;
 ALTER TABLE hosts ADD COLUMN last_grace_attempt TEXT;
+CREATE INDEX hosts_hostname ON hosts (hostname);
 ";
 
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
