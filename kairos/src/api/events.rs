@@ -211,10 +211,12 @@ pub async fn alert_pump(
     }
 }
 
-/// 狀態表的變化 → 事件（直到關機）。`mark_known` 回傳這台主機是否第一次出現（`host.added`）
+/// 狀態表的變化 → 事件（直到關機）。`mark_known` 回傳這台主機是否第一次出現（`host.added`）；
+/// 每個變化也記入 `log`（每台主機最近的上線與離線紀錄）
 pub async fn pump(
     mut rx: broadcast::Receiver<HostChange>,
     hub: Arc<EventHub>,
+    log: Arc<super::conn_log::ConnLog>,
     mark_known: impl Fn(&str) -> bool + Send + 'static,
     shutdown: Arc<Shutdown>,
 ) {
@@ -226,6 +228,7 @@ pub async fn pump(
         };
         match change {
             Ok(change) => {
+                log.record(&change);
                 let is_new =
                     matches!(change.kind, HostChangeKind::Online) && mark_known(&change.agent_id);
                 let (kind, data) = event_of(&change, is_new);

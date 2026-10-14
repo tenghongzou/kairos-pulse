@@ -1,0 +1,4 @@
+# 嵌入執行檔的網頁檔與測試腳本一律以 LF 儲存與取出（Windows 的 core.autocrlf 不轉成 CRLF）：
+# 不同平台建置出的執行檔內容相同（ETag、可重現性），run.sh 也能在 Linux 直接執行。
+* text=auto eol=lf
+*.png binary

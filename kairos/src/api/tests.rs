@@ -881,8 +881,9 @@ async fn requests_are_authenticated_and_validated() {
     assert_eq!(r.status, 200);
     let r = request(addr, "DELETE", "/api/v1/hosts/x", Some(&f.token), &[]).await;
     assert_eq!(r.status, 405);
+    // "/" 起由網頁介面提供（web_ui_is_served_with_security_headers）；API 的路徑照舊回 JSON 的 404
     for path in [
-        "/",
+        "/api",
         "/api/v2/hosts",
         "/api/v1/nothing",
         "/api/v1/hosts/x/y/z/w",
@@ -911,13 +912,29 @@ async fn requests_are_authenticated_and_validated() {
     let expired = tokens::create(&conn, "old", "read", Some(1), None, 0).unwrap();
     let r = request(addr, "GET", "/api/v1/me", Some(&expired.token), &[]).await;
     assert_eq!(r.status, 401);
+    // 沒有出示憑據不扣額度（0.7.0）：連續 20 次都是 401
+    for _ in 0..20 {
+        assert_eq!(
+            request(addr, "GET", "/api/v1/me", None, &[]).await.status,
+            401
+        );
+    }
     // 到目前為止失敗 6 次；繼續失敗直到額度用完（10 次），之後連有效的 token 也 429
     let valid = tokens::create(&conn, "ok", "read", None, None, 0)
         .unwrap()
         .token;
     let mut limited = false;
     for _ in 0..12 {
-        match request(addr, "GET", "/api/v1/me", None, &[]).await.status {
+        match request(
+            addr,
+            "GET",
+            "/api/v1/me",
+            Some("kat_0000000000000000_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            &[],
+        )
+        .await
+        .status
+        {
             401 => {}
             429 => {
                 limited = true;
@@ -1094,5 +1111,171 @@ async fn rejected_certificates_show_up_in_details_and_the_inventory() {
     let stored: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(stored["reason"], "revoked");
     assert!(stored["count"].as_u64().unwrap() >= 1);
+    f.stop().await;
+}
+
+/// 0.7.0：網頁介面（`/`、SPA 路由、`/assets/…`）與每個回應的安全標頭（`kairos/API.md` 第 14 節）
+#[tokio::test]
+async fn web_ui_is_served_with_security_headers() {
+    let f = fixture("web", |_| {}).await;
+    let addr = f.addr();
+    // 不需要驗證：未登入時由前端導向 /login
+    for path in [
+        "/",
+        "/login",
+        "/hosts",
+        "/hosts/6f1c0e4a-1b2c-4d3e-9f00-1122334455aa/metrics",
+    ] {
+        let r = request(addr, "GET", path, None, &[]).await;
+        assert_eq!(r.status, 200, "{path}");
+        assert_eq!(r.header("content-type"), Some("text/html; charset=utf-8"));
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        let csp = r.header("content-security-policy").unwrap();
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert!(
+            !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+            "{csp}"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("require-trusted-types-for 'script'"), "{csp}");
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+        assert_eq!(r.header("x-frame-options"), Some("DENY"));
+        assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
+        assert!(
+            r.header("strict-transport-security")
+                .unwrap()
+                .starts_with("max-age=")
+        );
+        assert!(String::from_utf8_lossy(&r.body).contains("/assets/js/main.js"));
+    }
+    // 靜態檔：Content-Type、ETag、If-None-Match → 304
+    let r = request(addr, "GET", "/assets/js/main.js", None, &[]).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.header("content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert_eq!(r.header("cache-control"), Some("no-cache"));
+    let etag = r.header("etag").unwrap().to_string();
+    let r = request(
+        addr,
+        "GET",
+        "/assets/js/main.js",
+        None,
+        &[("If-None-Match", &etag)],
+    )
+    .await;
+    assert_eq!(r.status, 304);
+    assert!(r.body.is_empty());
+    let r = request(addr, "GET", "/assets/tokens.css", None, &[]).await;
+    assert_eq!(r.header("content-type"), Some("text/css; charset=utf-8"));
+    for path in ["/assets/nope.js", "/favicon.ico", "/assets/../index.html"] {
+        assert_eq!(
+            request(addr, "GET", path, None, &[]).await.status,
+            404,
+            "{path}"
+        );
+    }
+    let r = request(addr, "POST", "/", None, &[("Content-Length", "0")]).await;
+    assert_eq!(r.status, 405);
+    assert_eq!(r.header("allow"), Some("GET, HEAD"));
+    // HEAD：沒有本文
+    let r = request(addr, "HEAD", "/", None, &[]).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.is_empty());
+    // API 的回應同樣帶安全標頭（不是網頁：default-src 'none'）
+    let r = get(&f, "/api/v1/me").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.header("content-security-policy"),
+        Some("default-src 'none'; frame-ancestors 'none'")
+    );
+    assert!(r.header("strict-transport-security").is_some());
+    let r = request(addr, "GET", "/api/v1/nothing", None, &[]).await;
+    assert_eq!(r.status, 404);
+    assert_eq!(r.json()["error"]["code"], "not_found");
+    // 健康檢查不被網頁介面取代
+    assert_eq!(
+        request(addr, "GET", "/healthz", None, &[]).await.json()["status"],
+        "ok"
+    );
+    f.stop().await;
+}
+
+/// 0.7.0：篩選值、連線紀錄、詳情的憑證摘要（`kairos/API.md` 第 5.2、5.7、5.8 節）
+#[tokio::test]
+async fn facets_connections_and_certificate_summary() {
+    let f = fixture("facets", |_| {}).await;
+    let now = Utc::now();
+    let t = Instant::now();
+    let _a = f
+        .registry
+        .register(31, hello(A, "hmi-line3-07", "10.30.3.27:1"), t, now)
+        .unwrap();
+    let _b = f
+        .registry
+        .register(32, hello(B, "db-02", "10.30.4.9:1"), t, now)
+        .unwrap();
+    assert!(f.registry.disconnect(B, 32, t));
+    // 狀態表的變化經由背景工作記入連線紀錄
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while f.console.ctx.conn_log.get(B).len() < 2 {
+        assert!(Instant::now() < deadline, "連線紀錄應有上線與離線");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    f.console.ctx.hosts.invalidate().await;
+    let v = get(&f, &format!("/api/v1/hosts/{B}/connections"))
+        .await
+        .json();
+    let entries = v["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["event"], "offline");
+    assert_eq!(entries[0]["reason"], "connection_closed");
+    assert_eq!(entries[1]["event"], "online");
+    assert_eq!(entries[1]["ip"], "10.30.4.9");
+    assert_eq!(v["data"]["persisted"], false);
+    // 不存在的主機
+    let r = get(&f, &format!("/api/v1/hosts/{C}/connections")).await;
+    assert_eq!(r.status, 404);
+    assert_eq!(r.json()["error"]["code"], "host_not_found");
+    let r = get(&f, "/api/v1/hosts/facets?x=1").await;
+    assert_eq!(r.status, 400);
+    let v = get(&f, "/api/v1/hosts/facets").await.json();
+    assert_eq!(v["data"]["total"], 2);
+    assert_eq!(v["data"]["os"]["values"][0]["value"], "Ubuntu");
+    assert_eq!(v["data"]["os"]["values"][0]["count"], 2);
+    assert_eq!(v["data"]["tag"]["values"][0]["value"], "line3");
+    assert_eq!(v["data"]["version"]["values"][0]["value"], "0.3.0");
+    assert_eq!(
+        v["data"]["offline_reason"]["values"][0]["value"],
+        "connection_closed"
+    );
+    assert_eq!(v["data"]["no_group"]["count"], 2);
+    assert_eq!(v["data"]["no_group"]["online"], 1);
+    // 詳情：沒有簽發紀錄時 certificate 為 null；有時只給狀態與到期（不含序號）
+    let v = get(&f, &format!("/api/v1/hosts/{A}")).await.json();
+    assert!(v["data"]["certificate"].is_null());
+    let day = 86_400_000i64;
+    let conn = f.admin();
+    for (serial, not_after, revoked) in [
+        ("01", now.timestamp_millis() + 10 * day, None),
+        ("02", now.timestamp_millis() + 400 * day, None::<i64>),
+    ] {
+        conn.execute(
+            "INSERT INTO pki_certificates (serial, agent_id, spki_sha256, not_before, not_after, cert_der, issued_at, issued_via, revoked_at) \
+             VALUES (?1, ?2, x'00', 0, ?3, x'00', ?4, 'test', ?5)",
+            rusqlite::params![serial, A, not_after, not_after - 365 * day, revoked],
+        )
+        .unwrap();
+    }
+    let v = get(&f, &format!("/api/v1/hosts/{A}")).await.json();
+    assert_eq!(v["data"]["certificate"]["state"], "valid");
+    assert!(v["data"]["certificate"].get("serial").is_none());
+    conn.execute(
+        "UPDATE pki_certificates SET revoked_at = 1 WHERE serial = '02'",
+        [],
+    )
+    .unwrap();
+    let v = get(&f, &format!("/api/v1/hosts/{A}")).await.json();
+    assert_eq!(v["data"]["certificate"]["state"], "revoked");
     f.stop().await;
 }

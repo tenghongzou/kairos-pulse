@@ -1,0 +1,558 @@
+/*
+ * Kairos / Pulse 設計系統 — Design Tokens
+ * 版本：0.2.0（2026-10-10：告警嚴重度恢復四級，新增 --ds-severity-*；0.1.0 為 2026-10-09）
+ *
+ * 使用規則
+ * - 元件只能引用「語意 token」（本檔所有 --ds-*），不得在元件中寫死色碼。
+ * - 主題切換：只在 <html> 設定 data-theme="light" | "dark"；未設定時跟隨作業系統
+ *   （prefers-color-scheme）。不要在子元素上設 data-theme（別名 token 只在 :root 計算）。
+ * - 資訊密度：在 <html> 或表格容器設定 data-density="compact" | "comfortable"；未設定為 default。
+ * - 本檔不引用任何外部資源（字型、圖片、@import），可在離線（air-gapped）環境直接使用。
+ * - 對比值皆為 WCAG 2.x 相對亮度公式計算，完整表格見 README.md「色彩 > 對比驗證表」。
+ *
+ * 命名規則
+ *   --ds-<類別>-<語意>[-<變體>][-<狀態>]
+ *   類別：color、status、severity、chart、font、text、space、size、radius、shadow、duration、easing、z
+ *   狀態色固定六種＋一種資訊色：online、warning、critical、offline、unknown、pending、info
+ *   每種狀態都有：-fg（文字／圖示）、-bg（徽章底色）、-border、-badge-fg（徽章內文字）、-solid（圓點、長條、圖表）
+ *   告警嚴重度四級：emergency、critical、warning、info（與主機狀態是兩套詞彙，不新增主機狀態）
+ *   - emergency（緊急）只用於告警嚴重度，定義在 --ds-severity-emergency-*，另有 -subtle（橫幅、行內提示底色）
+ *   - critical／warning／info 的告警嚴重度以 --ds-severity-* 別名指向同名的 --ds-status-*（第 4 節）
+ */
+
+/* =========================================================================
+ * 1. 與主題無關的 token（字體、間距、尺寸、圓角、動效、層級）
+ * ========================================================================= */
+:root {
+  /* ---- 字型（僅系統字型；繁中字型放在 system-ui 之前，避免 Windows 以簡體字形顯示） ---- */
+  --ds-font-family-sans: "Segoe UI", "Microsoft JhengHei UI", "Microsoft JhengHei", "微軟正黑體",
+    "PingFang TC", "蘋方-繁", "Noto Sans TC", "Noto Sans CJK TC", "Source Han Sans TC",
+    -apple-system, BlinkMacSystemFont, system-ui, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --ds-font-family-mono: "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, "DejaVu Sans Mono",
+    "Liberation Mono", "Noto Sans Mono CJK TC", "Microsoft JhengHei", monospace;
+
+  /* ---- 字級（rem，根字級 16px；使用者放大瀏覽器字級時一起縮放） ---- */
+  --ds-font-size-xs: 0.75rem;    /* 12px：輔助說明、表格次要欄位；繁中最小字級 */
+  --ds-font-size-sm: 0.8125rem;  /* 13px：表格內文（compact）、徽章、標籤 */
+  --ds-font-size-md: 0.875rem;   /* 14px：預設內文、表單、表格 */
+  --ds-font-size-lg: 1rem;       /* 16px：小標題、對話框內文 */
+  --ds-font-size-xl: 1.125rem;   /* 18px：卡片標題 */
+  --ds-font-size-2xl: 1.25rem;   /* 20px：區段標題 */
+  --ds-font-size-3xl: 1.5rem;    /* 24px：頁面標題 */
+  --ds-font-size-4xl: 2rem;      /* 32px：KPI 數值 */
+
+  /* 微軟正黑體只有 Regular／Bold（另有 Light）：500 會顯示成 Regular，強調請用 700 */
+  --ds-font-weight-regular: 400;
+  --ds-font-weight-bold: 700;
+
+  --ds-line-height-tight: 1.25;  /* KPI 數值、單行標題 */
+  --ds-line-height-snug: 1.4;    /* 標題、按鈕、徽章 */
+  --ds-line-height-normal: 1.5;  /* 繁中內文最低建議值 */
+  --ds-line-height-relaxed: 1.7; /* 長段說明、錯誤訊息的「處理方式」 */
+
+  /* 組合字體（用法：font: var(--ds-text-body);） */
+  --ds-text-display: var(--ds-font-weight-bold) var(--ds-font-size-4xl)/var(--ds-line-height-tight) var(--ds-font-family-sans);
+  --ds-text-heading-1: var(--ds-font-weight-bold) var(--ds-font-size-3xl)/1.3 var(--ds-font-family-sans);
+  --ds-text-heading-2: var(--ds-font-weight-bold) var(--ds-font-size-2xl)/var(--ds-line-height-snug) var(--ds-font-family-sans);
+  --ds-text-heading-3: var(--ds-font-weight-bold) var(--ds-font-size-lg)/var(--ds-line-height-snug) var(--ds-font-family-sans);
+  --ds-text-body: var(--ds-font-weight-regular) var(--ds-font-size-md)/var(--ds-line-height-normal) var(--ds-font-family-sans);
+  --ds-text-body-strong: var(--ds-font-weight-bold) var(--ds-font-size-md)/var(--ds-line-height-normal) var(--ds-font-family-sans);
+  --ds-text-label: var(--ds-font-weight-bold) var(--ds-font-size-sm)/var(--ds-line-height-snug) var(--ds-font-family-sans);
+  --ds-text-caption: var(--ds-font-weight-regular) var(--ds-font-size-xs)/var(--ds-line-height-normal) var(--ds-font-family-sans);
+  --ds-text-code: var(--ds-font-weight-regular) var(--ds-font-size-sm)/var(--ds-line-height-normal) var(--ds-font-family-mono);
+
+  /* ---- 間距（4px 基準；數字 = 倍數 × 100） ---- */
+  --ds-space-0: 0;
+  --ds-space-50: 2px;
+  --ds-space-100: 4px;
+  --ds-space-150: 6px;
+  --ds-space-200: 8px;
+  --ds-space-300: 12px;
+  --ds-space-400: 16px;
+  --ds-space-500: 20px;
+  --ds-space-600: 24px;
+  --ds-space-800: 32px;
+  --ds-space-1000: 40px;
+  --ds-space-1200: 48px;
+  --ds-space-1600: 64px;
+
+  /* ---- 尺寸 ---- */
+  --ds-size-control-sm: 28px;     /* 表格內按鈕、篩選 chip */
+  --ds-size-control-md: 32px;     /* 預設按鈕、輸入框 */
+  --ds-size-control-lg: 40px;     /* 精靈、對話框主要動作 */
+  --ds-size-target-min: 24px;     /* WCAG 2.2 SC 2.5.8 最小點擊目標 */
+  --ds-size-icon-xs: 12px;        /* 只用於徽章內 */
+  --ds-size-icon-sm: 16px;
+  --ds-size-icon-md: 20px;
+  --ds-size-icon-lg: 24px;
+  --ds-size-icon-xl: 48px;        /* 空狀態、錯誤狀態 */
+  --ds-size-row-compact: 32px;
+  --ds-size-row-default: 40px;
+  --ds-size-row-comfortable: 48px;
+  --ds-size-topbar: 48px;
+  --ds-size-sidenav: 240px;
+  --ds-size-sidenav-collapsed: 56px;
+  --ds-size-dialog-sm: 400px;
+  --ds-size-dialog-md: 560px;
+  --ds-size-dialog-lg: 720px;
+  --ds-size-toast: 360px;
+  --ds-size-sparkline-w: 96px;
+  --ds-size-sparkline-h: 24px;
+  --ds-size-status-stripe: 4px;   /* 卡片／KPI 左側狀態色條 */
+  --ds-size-content-max: 1600px;
+
+  --ds-border-width: 1px;
+  --ds-border-width-strong: 2px;
+  --ds-focus-ring-width: 2px;
+  --ds-focus-ring-offset: 2px;
+
+  /* ---- 圓角 ---- */
+  --ds-radius-none: 0;
+  --ds-radius-sm: 4px;    /* 徽章、chip、核取方塊 */
+  --ds-radius-md: 6px;    /* 按鈕、輸入框 */
+  --ds-radius-lg: 8px;    /* 卡片、KPI、Toast */
+  --ds-radius-xl: 12px;   /* 對話框 */
+  --ds-radius-full: 9999px; /* 圓點、計數泡泡 */
+
+  /* ---- 動效 ---- */
+  --ds-duration-instant: 0ms;
+  --ds-duration-fast: 100ms;   /* hover、按下 */
+  --ds-duration-base: 160ms;   /* 展開、下拉選單 */
+  --ds-duration-slow: 240ms;   /* 對話框、側邊導覽收合、Toast 進出 */
+  --ds-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ds-easing-enter: cubic-bezier(0, 0, 0.2, 1);
+  --ds-easing-exit: cubic-bezier(0.4, 0, 1, 1);
+  /* 以下為行為時間（JS 讀取），不受 reduced-motion 影響 */
+  --ds-delay-spinner: 300ms;          /* 操作超過此時間才顯示載入指示，避免閃爍 */
+  --ds-duration-loading-min: 500ms;   /* 載入指示一旦出現，至少顯示這麼久 */
+  --ds-duration-toast: 6000ms;        /* 成功／資訊 Toast 自動關閉；錯誤 Toast 不自動關閉 */
+  --ds-duration-tooltip-delay: 500ms;
+
+  /* ---- 層級 ---- */
+  --ds-z-base: 0;
+  --ds-z-sticky: 100;      /* 表格表頭、批次操作列 */
+  --ds-z-sidenav: 200;
+  --ds-z-dropdown: 1000;
+  --ds-z-overlay: 1100;
+  --ds-z-dialog: 1200;
+  --ds-z-toast: 1300;
+  --ds-z-tooltip: 1400;
+
+  /* ---- 資訊密度（default） ---- */
+  --ds-table-row-height: var(--ds-size-row-default);
+  --ds-table-cell-padding-x: var(--ds-space-300);
+  --ds-table-font: var(--ds-text-body);
+}
+
+[data-density="compact"] {
+  --ds-table-row-height: var(--ds-size-row-compact);
+  --ds-table-cell-padding-x: var(--ds-space-200);
+  --ds-table-font: var(--ds-font-weight-regular) var(--ds-font-size-sm)/var(--ds-line-height-snug) var(--ds-font-family-sans);
+}
+
+[data-density="comfortable"] {
+  --ds-table-row-height: var(--ds-size-row-comfortable);
+  --ds-table-cell-padding-x: var(--ds-space-400);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --ds-duration-fast: 0ms;
+    --ds-duration-base: 0ms;
+    --ds-duration-slow: 0ms;
+  }
+}
+
+/* =========================================================================
+ * 2. 淺色主題（預設）
+ *    背景：surface #ffffff（L=1.000）、canvas #f5f6f8（L=0.921）
+ * ========================================================================= */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* ---- 背景 ---- */
+  --ds-color-bg-canvas: #f5f6f8;          /* 頁面底色 */
+  --ds-color-bg-surface: #ffffff;         /* 卡片、表格、側邊導覽 */
+  --ds-color-bg-surface-raised: #ffffff;  /* 對話框、下拉選單、Toast（以陰影區分） */
+  --ds-color-bg-subtle: #f0f2f5;          /* 表頭、程式碼區塊、唯讀欄位 */
+  --ds-color-bg-hover: #eef1f5;
+  --ds-color-bg-selected: #e8f0fc;
+  --ds-color-bg-inverse: #1a1f29;         /* Tooltip */
+  --ds-color-bg-skeleton: #e6e9ee;
+  --ds-color-overlay: rgba(15, 18, 24, 0.48);
+
+  /* ---- 文字 ---- */
+  --ds-color-text-primary: #1a1f29;       /* 16.51:1 on surface */
+  --ds-color-text-secondary: #4a5363;     /* 7.75:1 */
+  --ds-color-text-muted: #5f6878;         /* 5.62:1；placeholder 也用此色 */
+  --ds-color-text-disabled: #8b93a1;      /* 停用元件，WCAG 豁免 */
+  --ds-color-text-inverse: #ffffff;
+  --ds-color-text-on-accent: #ffffff;     /* 6.09:1 on accent */
+  --ds-color-text-on-danger: #ffffff;     /* 6.57:1 on danger */
+  --ds-color-text-link: #1f5fbf;          /* 6.09:1 */
+  --ds-color-text-link-hover: #184d9c;
+
+  /* ---- 邊框 ---- */
+  --ds-color-border-subtle: #e3e6eb;      /* 分隔線（裝飾性） */
+  --ds-color-border-default: #d3d8df;     /* 卡片外框（裝飾性） */
+  --ds-color-border-control: #808a9a;     /* 輸入框、核取方塊：3.49:1（SC 1.4.11） */
+  --ds-color-border-control-hover: #5f6878;
+  --ds-color-focus-ring: #1f5fbf;         /* 6.09:1 on surface */
+
+  /* ---- 強調色（只用於可互動元素，不用於裝飾） ---- */
+  --ds-color-accent: #1f5fbf;
+  --ds-color-accent-hover: #184d9c;       /* 白字 8.14:1 */
+  --ds-color-accent-active: #133d7c;
+  --ds-color-accent-subtle: #e8f0fc;
+
+  /* ---- 危險操作（按鈕語意；與 critical 狀態色同值但分開命名） ---- */
+  --ds-color-danger: #b42318;
+  --ds-color-danger-hover: #912018;       /* 白字 8.66:1 */
+  --ds-color-danger-subtle: #fdecea;
+  --ds-color-danger-text: #b42318;
+
+  /* ---- 狀態色 ----
+   *             fg（on surface / canvas）   badge-fg on bg   solid（非文字，≥3:1）
+   * online      #116b37  6.60 / 6.10        6.04             6.60
+   * warning     #8a5100  6.45 / 5.96        5.86             #b86e00 3.99
+   * critical    #b42318  6.57 / 6.08        5.75             6.57
+   * offline     #343a46 10.56–11.42         白字 11.42 (實心)  11.42
+   * unknown     #5b6474  5.97 / 5.52        5.37             5.97
+   * pending     #5b3fc4  7.11 / 6.58        6.19             7.11
+   * info        #1f5fbf  6.09 / 5.63        5.31             6.09
+   */
+  --ds-status-online-fg: #116b37;
+  --ds-status-online-bg: #ebf8ef;
+  --ds-status-online-border: #116b37;
+  --ds-status-online-badge-fg: #116b37;
+  --ds-status-online-solid: #116b37;
+
+  --ds-status-warning-fg: #8a5100;
+  --ds-status-warning-bg: #fdf3e1;
+  --ds-status-warning-border: #b86e00;
+  --ds-status-warning-badge-fg: #8a5100;
+  --ds-status-warning-solid: #b86e00;
+
+  --ds-status-critical-fg: #b42318;
+  --ds-status-critical-bg: #fdecea;
+  --ds-status-critical-border: #b42318;
+  --ds-status-critical-badge-fg: #b42318;
+  --ds-status-critical-solid: #b42318;
+
+  /* offline 是唯一的「實心反白」徽章：在整片淺色清單中一眼可辨 */
+  --ds-status-offline-fg: #343a46;
+  --ds-status-offline-bg: #343a46;
+  --ds-status-offline-border: #343a46;
+  --ds-status-offline-badge-fg: #ffffff;
+  --ds-status-offline-solid: #343a46;
+
+  /* unknown 用虛線外框（見 README 狀態徽章） */
+  --ds-status-unknown-fg: #5b6474;
+  --ds-status-unknown-bg: #f1f3f6;
+  --ds-status-unknown-border: #808a9a;
+  --ds-status-unknown-badge-fg: #5b6474;
+  --ds-status-unknown-solid: #5b6474;
+
+  --ds-status-pending-fg: #5b3fc4;
+  --ds-status-pending-bg: #f1edfd;
+  --ds-status-pending-border: #5b3fc4;
+  --ds-status-pending-badge-fg: #5b3fc4;
+  --ds-status-pending-solid: #5b3fc4;
+
+  --ds-status-info-fg: #1f5fbf;
+  --ds-status-info-bg: #e8f0fc;
+  --ds-status-info-border: #1f5fbf;
+  --ds-status-info-badge-fg: #1f5fbf;
+  --ds-status-info-solid: #1f5fbf;
+
+  /* ---- 告警嚴重度：緊急（emergency）----
+   * 只用於告警嚴重度，不是主機狀態（主機有未解決的緊急告警時，主機狀態為 critical）。
+   * 徽章是唯一的「實心紅底＋白字＋2px 外框」，再加警示燈圖示與文字，不只靠顏色（README §6.4.1）。
+   *                      值        WCAG 2.x 對比
+   * fg on surface        #8f1a12   9.03（canvas 8.35、bg-subtle 8.06、bg-hover 7.97、bg-selected 7.87）
+   * badge-fg on bg       #ffffff   9.03（實心徽章）
+   * fg on subtle         #fde8e6   7.68（text-primary 14.04）
+   * solid on surface     #8f1a12   9.03（非文字 ≥ 3）
+   */
+  --ds-severity-emergency-fg: #8f1a12;
+  --ds-severity-emergency-bg: #8f1a12;
+  --ds-severity-emergency-subtle: #fde8e6;
+  --ds-severity-emergency-border: #8f1a12;
+  --ds-severity-emergency-badge-fg: #ffffff;
+  --ds-severity-emergency-solid: #8f1a12;
+
+  /* ---- 圖表 ---- */
+  --ds-chart-series-1: #1f5fbf;   /* 6.09:1 */
+  --ds-chart-series-2: #0f7c86;   /* 4.94:1 */
+  --ds-chart-series-3: #a3307a;   /* 6.44:1 */
+  --ds-chart-grid: #e3e6eb;
+  --ds-chart-axis: #808a9a;
+  --ds-chart-area-opacity: 0.12;
+
+  /* ---- 陰影 ---- */
+  --ds-shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.10);
+  --ds-shadow-md: 0 4px 8px -2px rgba(16, 24, 40, 0.10), 0 2px 4px -2px rgba(16, 24, 40, 0.06);
+  --ds-shadow-lg: 0 12px 24px -4px rgba(16, 24, 40, 0.14), 0 4px 8px -2px rgba(16, 24, 40, 0.06);
+}
+
+/* =========================================================================
+ * 3. 深色主題
+ *    背景：surface #171b22（L=0.0108）、canvas #0e1116（L=0.0055）、raised #1f2430（L=0.0177）
+ *    同一組值寫兩次：跟隨系統（未指定 data-theme）與強制深色（data-theme="dark"）
+ * ========================================================================= */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --ds-color-bg-canvas: #0e1116;
+    --ds-color-bg-surface: #171b22;
+    --ds-color-bg-surface-raised: #1f2430;
+    --ds-color-bg-subtle: #1b2029;
+    --ds-color-bg-hover: #252b37;
+    --ds-color-bg-selected: #172a46;
+    --ds-color-bg-inverse: #e6e9ef;
+    --ds-color-bg-skeleton: #262c38;
+    --ds-color-overlay: rgba(0, 0, 0, 0.6);
+
+    --ds-color-text-primary: #e6e9ef;
+    --ds-color-text-secondary: #b3bac6;
+    --ds-color-text-muted: #8d96a5;
+    --ds-color-text-disabled: #5d6573;
+    --ds-color-text-inverse: #0e1116;
+    --ds-color-text-on-accent: #0e1116;
+    --ds-color-text-on-danger: #0e1116;
+    --ds-color-text-link: #6ea8ff;
+    --ds-color-text-link-hover: #8fbbff;
+
+    --ds-color-border-subtle: #262c36;
+    --ds-color-border-default: #333a47;
+    --ds-color-border-control: #6b7586;
+    --ds-color-border-control-hover: #8d96a5;
+    --ds-color-focus-ring: #8fbbff;
+
+    --ds-color-accent: #6ea8ff;
+    --ds-color-accent-hover: #8fbbff;
+    --ds-color-accent-active: #b0cfff;
+    --ds-color-accent-subtle: #172a46;
+
+    --ds-color-danger: #ff7b72;
+    --ds-color-danger-hover: #ff9a92;
+    --ds-color-danger-subtle: #3d1a1a;
+    --ds-color-danger-text: #ff7b72;
+
+    --ds-status-online-fg: #4cc38a;
+    --ds-status-online-bg: #12301f;
+    --ds-status-online-border: #4cc38a;
+    --ds-status-online-badge-fg: #4cc38a;
+    --ds-status-online-solid: #4cc38a;
+
+    --ds-status-warning-fg: #f0b54a;
+    --ds-status-warning-bg: #3a2a0c;
+    --ds-status-warning-border: #f0b54a;
+    --ds-status-warning-badge-fg: #f0b54a;
+    --ds-status-warning-solid: #f0b54a;
+
+    --ds-status-critical-fg: #ff7b72;
+    --ds-status-critical-bg: #3d1a1a;
+    --ds-status-critical-border: #ff7b72;
+    --ds-status-critical-badge-fg: #ff7b72;
+    --ds-status-critical-solid: #ff7b72;
+
+    --ds-status-offline-fg: #c9d1dc;
+    --ds-status-offline-bg: #c9d1dc;
+    --ds-status-offline-border: #c9d1dc;
+    --ds-status-offline-badge-fg: #0e1116;
+    --ds-status-offline-solid: #c9d1dc;
+
+    --ds-status-unknown-fg: #9aa4b2;
+    --ds-status-unknown-bg: #222833;
+    --ds-status-unknown-border: #6b7586;
+    --ds-status-unknown-badge-fg: #9aa4b2;
+    --ds-status-unknown-solid: #9aa4b2;
+
+    --ds-status-pending-fg: #b4a2ff;
+    --ds-status-pending-bg: #2a2350;
+    --ds-status-pending-border: #b4a2ff;
+    --ds-status-pending-badge-fg: #b4a2ff;
+    --ds-status-pending-solid: #b4a2ff;
+
+    --ds-status-info-fg: #6ea8ff;
+    --ds-status-info-bg: #172a46;
+    --ds-status-info-border: #6ea8ff;
+    --ds-status-info-badge-fg: #6ea8ff;
+    --ds-status-info-solid: #6ea8ff;
+
+    --ds-severity-emergency-fg: #ffb4ab;
+    --ds-severity-emergency-bg: #ffb4ab;
+    --ds-severity-emergency-subtle: #3d1414;
+    --ds-severity-emergency-border: #ffb4ab;
+    --ds-severity-emergency-badge-fg: #0e1116;
+    --ds-severity-emergency-solid: #ffb4ab;
+
+    --ds-chart-series-1: #6ea8ff;
+    --ds-chart-series-2: #3cc6c9;
+    --ds-chart-series-3: #f07cc4;
+    --ds-chart-grid: #2a303b;
+    --ds-chart-axis: #6b7586;
+    --ds-chart-area-opacity: 0.18;
+
+    --ds-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --ds-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+    --ds-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6);
+  }
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --ds-color-bg-canvas: #0e1116;
+  --ds-color-bg-surface: #171b22;
+  --ds-color-bg-surface-raised: #1f2430;
+  --ds-color-bg-subtle: #1b2029;
+  --ds-color-bg-hover: #252b37;
+  --ds-color-bg-selected: #172a46;
+  --ds-color-bg-inverse: #e6e9ef;
+  --ds-color-bg-skeleton: #262c38;
+  --ds-color-overlay: rgba(0, 0, 0, 0.6);
+
+  --ds-color-text-primary: #e6e9ef;       /* 14.20:1 on surface */
+  --ds-color-text-secondary: #b3bac6;     /* 8.84:1 */
+  --ds-color-text-muted: #8d96a5;         /* 5.79:1 */
+  --ds-color-text-disabled: #5d6573;
+  --ds-color-text-inverse: #0e1116;
+  --ds-color-text-on-accent: #0e1116;     /* 7.84:1 on accent（深色主題主要按鈕用深色字） */
+  --ds-color-text-on-danger: #0e1116;     /* 7.50:1 */
+  --ds-color-text-link: #6ea8ff;          /* 7.16:1 */
+  --ds-color-text-link-hover: #8fbbff;
+
+  --ds-color-border-subtle: #262c36;
+  --ds-color-border-default: #333a47;
+  --ds-color-border-control: #6b7586;     /* 3.71:1 on surface、3.34:1 on raised */
+  --ds-color-border-control-hover: #8d96a5;
+  --ds-color-focus-ring: #8fbbff;         /* 8.81:1 */
+
+  --ds-color-accent: #6ea8ff;
+  --ds-color-accent-hover: #8fbbff;
+  --ds-color-accent-active: #b0cfff;
+  --ds-color-accent-subtle: #172a46;
+
+  --ds-color-danger: #ff7b72;
+  --ds-color-danger-hover: #ff9a92;
+  --ds-color-danger-subtle: #3d1a1a;
+  --ds-color-danger-text: #ff7b72;
+
+  /*             fg（surface / canvas / raised）  badge-fg on bg
+   * online      #4cc38a  7.79 / 8.54 / 7.01        6.46
+   * warning     #f0b54a  9.38 / 10.28 / 8.43       7.53
+   * critical    #ff7b72  6.85 / 7.50 / 6.15        6.12
+   * offline     #c9d1dc 11.21 / 12.28 / 10.08      深字 12.28（實心）
+   * unknown     #9aa4b2  6.85 / 7.50 / 6.15        5.87
+   * pending     #b4a2ff  7.85 / 8.60 / 7.06        6.57
+   * info        #6ea8ff  7.16 / 7.84 / 6.43        5.98
+   */
+  --ds-status-online-fg: #4cc38a;
+  --ds-status-online-bg: #12301f;
+  --ds-status-online-border: #4cc38a;
+  --ds-status-online-badge-fg: #4cc38a;
+  --ds-status-online-solid: #4cc38a;
+
+  --ds-status-warning-fg: #f0b54a;
+  --ds-status-warning-bg: #3a2a0c;
+  --ds-status-warning-border: #f0b54a;
+  --ds-status-warning-badge-fg: #f0b54a;
+  --ds-status-warning-solid: #f0b54a;
+
+  --ds-status-critical-fg: #ff7b72;
+  --ds-status-critical-bg: #3d1a1a;
+  --ds-status-critical-border: #ff7b72;
+  --ds-status-critical-badge-fg: #ff7b72;
+  --ds-status-critical-solid: #ff7b72;
+
+  --ds-status-offline-fg: #c9d1dc;
+  --ds-status-offline-bg: #c9d1dc;
+  --ds-status-offline-border: #c9d1dc;
+  --ds-status-offline-badge-fg: #0e1116;
+  --ds-status-offline-solid: #c9d1dc;
+
+  --ds-status-unknown-fg: #9aa4b2;
+  --ds-status-unknown-bg: #222833;
+  --ds-status-unknown-border: #6b7586;
+  --ds-status-unknown-badge-fg: #9aa4b2;
+  --ds-status-unknown-solid: #9aa4b2;
+
+  --ds-status-pending-fg: #b4a2ff;
+  --ds-status-pending-bg: #2a2350;
+  --ds-status-pending-border: #b4a2ff;
+  --ds-status-pending-badge-fg: #b4a2ff;
+  --ds-status-pending-solid: #b4a2ff;
+
+  --ds-status-info-fg: #6ea8ff;
+  --ds-status-info-bg: #172a46;
+  --ds-status-info-border: #6ea8ff;
+  --ds-status-info-badge-fg: #6ea8ff;
+  --ds-status-info-solid: #6ea8ff;
+
+  /* 告警嚴重度：緊急（emergency），只用於告警，不是主機狀態
+   *                      值        對比（surface / canvas / raised）
+   * fg                   #ffb4ab   10.17 / 11.14 / 9.14（bg-subtle 9.62、bg-hover 8.36、bg-selected 8.49）
+   * badge-fg on bg       #0e1116   11.14（實心徽章）
+   * fg on subtle         #3d1414   9.45（text-primary 13.20）
+   */
+  --ds-severity-emergency-fg: #ffb4ab;
+  --ds-severity-emergency-bg: #ffb4ab;
+  --ds-severity-emergency-subtle: #3d1414;
+  --ds-severity-emergency-border: #ffb4ab;
+  --ds-severity-emergency-badge-fg: #0e1116;
+  --ds-severity-emergency-solid: #ffb4ab;
+
+  --ds-chart-series-1: #6ea8ff;   /* 7.16:1 */
+  --ds-chart-series-2: #3cc6c9;   /* 8.31:1 */
+  --ds-chart-series-3: #f07cc4;   /* 6.89:1 */
+  --ds-chart-grid: #2a303b;
+  --ds-chart-axis: #6b7586;
+  --ds-chart-area-opacity: 0.18;
+
+  --ds-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --ds-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --ds-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6);
+}
+
+/* =========================================================================
+ * 4. 別名（隨主題重新計算；放在主題區塊之後）
+ * ========================================================================= */
+:root,
+[data-theme="light"],
+[data-theme="dark"] {
+  /* 操作結果（Toast、行內提示）沿用狀態色，不另設色票 */
+  --ds-color-success-fg: var(--ds-status-online-fg);
+  --ds-color-success-bg: var(--ds-status-online-bg);
+  --ds-color-warning-fg: var(--ds-status-warning-fg);
+  --ds-color-warning-bg: var(--ds-status-warning-bg);
+  --ds-color-error-fg: var(--ds-status-critical-fg);
+  --ds-color-error-bg: var(--ds-status-critical-bg);
+
+  /* 告警嚴重度別名：critical／warning／info 與主機狀態同色（emergency 在各主題區塊定義） */
+  --ds-severity-critical-fg: var(--ds-status-critical-fg);
+  --ds-severity-critical-bg: var(--ds-status-critical-bg);
+  --ds-severity-critical-border: var(--ds-status-critical-border);
+  --ds-severity-critical-badge-fg: var(--ds-status-critical-badge-fg);
+  --ds-severity-critical-solid: var(--ds-status-critical-solid);
+  --ds-severity-warning-fg: var(--ds-status-warning-fg);
+  --ds-severity-warning-bg: var(--ds-status-warning-bg);
+  --ds-severity-warning-border: var(--ds-status-warning-border);
+  --ds-severity-warning-badge-fg: var(--ds-status-warning-badge-fg);
+  --ds-severity-warning-solid: var(--ds-status-warning-solid);
+  --ds-severity-info-fg: var(--ds-status-info-fg);
+  --ds-severity-info-bg: var(--ds-status-info-bg);
+  --ds-severity-info-border: var(--ds-status-info-border);
+  --ds-severity-info-badge-fg: var(--ds-status-info-badge-fg);
+  --ds-severity-info-solid: var(--ds-status-info-solid);
+
+  /* 圖表門檻線與斷線區間 */
+  --ds-chart-threshold-warning: var(--ds-status-warning-solid);
+  --ds-chart-threshold-critical: var(--ds-status-critical-solid);
+  --ds-chart-gap: var(--ds-status-offline-solid);
+
+  --ds-focus-ring: var(--ds-focus-ring-width) solid var(--ds-color-focus-ring);
+}

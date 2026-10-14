@@ -1262,6 +1262,52 @@ async fn group_scoped_roles_only_see_their_hosts() {
     .await
     .json();
     assert_eq!(v["page"]["total"], 1);
+    // 0.7.0：篩選值（/hosts/facets）與連線紀錄（/hosts/{id}/connections）同樣只含範圍內的主機
+    let v = call(
+        &f,
+        "GET",
+        "/api/v1/hosts/facets",
+        Auth::Session(&p4),
+        None,
+        &[],
+    )
+    .await
+    .json();
+    assert_eq!(v["data"]["total"], 2);
+    let groups = v["data"]["group"]["values"].as_array().unwrap();
+    assert!(
+        groups
+            .iter()
+            .all(|g| g["value"].as_str().unwrap().eq_ignore_ascii_case("line3")),
+        "{groups:?}"
+    );
+    let v = call(
+        &f,
+        "GET",
+        "/api/v1/hosts/facets",
+        Auth::Session(&boss),
+        None,
+        &[],
+    )
+    .await
+    .json();
+    assert_eq!(v["data"]["total"], 4);
+    assert_eq!(v["data"]["no_group"]["count"], 1);
+    for (id, status) in [
+        ("11111111-0000-4000-8000-000000000003", 404),
+        ("11111111-0000-4000-8000-000000000001", 200),
+    ] {
+        let r = call(
+            &f,
+            "GET",
+            &format!("/api/v1/hosts/{id}/connections"),
+            Auth::Session(&p4),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, status, "{id}");
+    }
     // 群組範圍的維運者沒有系統層級的權限（核准、設定、健康）
     assert_eq!(
         call(&f, "GET", "/api/v1/settings", Auth::Session(&p4), None, &[])
