@@ -39,7 +39,9 @@ Group=pulse
 WorkingDirectory=/opt/pulse
 ExecStart=/opt/pulse/pulse
 
-# 日誌只保留 logs/pulse-YYYY-MM-DD.log 一份（Pulse 的日誌寫到 stdout 與 logs/）。
+# 日誌只保留 logs/pulse-YYYY-MM-DD.log 一份（Pulse 的日誌寫到 stdout 與 logs/）。0.6 重新評估後維持 null：
+# 交給 SIEM 時改用 pulse.toml 的 [log.syslog]（RFC 5424 直接外送）或 log.format = "json" 由收集器讀檔；
+# 要讓 journald 收集 stdout 時以 systemctl edit pulse 設定 StandardOutput=journal（INSTALL.md 7.1）。
 # stderr 仍進 journal：設定錯誤、日誌初始化失敗、panic 等「日誌檔還沒開好就發生」的
 # 錯誤都寫在 stderr，`journalctl -u pulse` 仍看得到；憑證錯誤等使 Pulse 結束的原因也另寫一行。需要人工處理的持續性錯誤（憑證被撤銷、
 # auth_failed、狀態表已滿、本機憑證過期等）也會以 err 等級另寫一行到 stderr（同一原因每

@@ -1,0 +1,57 @@
+# Prometheus 抓取 Kairos 與 Pulse 指標的設定範例（0.6.0〔草稿〕；Kairos README「健康檢查與 Prometheus」、
+# Pulse README「本機指標」）。只列出 scrape_configs 與 rule_files，其餘沿用既有的 prometheus.yml。
+#
+# 告警規則：kairos-alerts.example.yml（Kairos）與 pulse 發佈包的 pulse-alerts.example.yml（Pulse）。
+
+rule_files:
+  - /etc/prometheus/rules/kairos-alerts.yml
+  - /etc/prometheus/rules/pulse-alerts.yml
+
+scrape_configs:
+  # ---- Kairos ---------------------------------------------------------------------------------
+  # 方式一（建議，Prometheus 或其代理在 Kairos 同一台主機上）：
+  #   kairos.toml 設定 [observability] listen = "127.0.0.1:9464"（純 HTTP，只有 /healthz、/readyz、/metrics），
+  #   /metrics 未設定 token 時只接受 loopback 來源。
+  - job_name: kairos
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+        labels:
+          site: hq
+
+  # 方式二（Prometheus 在另一台主機）：經主控台的 HTTPS（console.listen 開放給 Prometheus 所在的網段），
+  #   kairos.toml 設定 [observability] metrics_token_file = "/opt/kairos/metrics.token"
+  #   （openssl rand -hex 32 > /opt/kairos/metrics.token；chown root:kairos、chmod 640），
+  #   同一個 token 另存一份給 Prometheus（只有 prometheus 帳號可讀）。
+  # - job_name: kairos-console
+  #   scheme: https
+  #   scrape_interval: 15s
+  #   authorization:
+  #     type: Bearer
+  #     credentials_file: /etc/prometheus/kairos-metrics.token
+  #   tls_config:
+  #     ca_file: /etc/prometheus/kairos-console-ca.pem   # 簽發主控台憑證的 CA
+  #     server_name: kairos.example.gov.tw               # 主控台憑證的 SAN
+  #   static_configs:
+  #     - targets: ["kairos.example.gov.tw:9443"]
+
+  # ---- Pulse ----------------------------------------------------------------------------------
+  # 建議：node_exporter 的 textfile collector（不另外開連接埠）。pulse.toml 設定
+  #   [metrics] textfile = "/var/lib/node_exporter/textfile_collector/pulse.prom"
+  # 並以 drop-in 讓服務可以寫入該目錄（Pulse INSTALL.md「本機指標」）。指標隨 node_exporter 的 job 一起抓取：
+  - job_name: node
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["plc-hmi-07:9100", "plc-hmi-08:9100"]
+
+  # 或 Pulse 的本機 HTTP（只接受 loopback，給同一台主機上的代理，例如 Grafana Agent／OpenTelemetry Collector）：
+  #   [metrics] listen = "127.0.0.1:9465"
+  # - job_name: pulse
+  #   static_configs:
+  #     - targets: ["127.0.0.1:9465"]
+
+# 負載平衡器的探針（不是 Prometheus 設定，供參考）：
+#   HTTP 探針 GET /readyz（200 就緒、503 不就緒），間隔 5 秒、連續 2 次失敗移出；
+#   只負責註冊端點（8444）時用 GET /readyz?scope=enroll。
+#   探針位址：observability.listen（純 HTTP）或主控台的 HTTPS（/healthz、/readyz 不需要 token）。

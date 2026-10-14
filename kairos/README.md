@@ -28,7 +28,8 @@
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
 - 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試
-- 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除
+- 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除；時間為 RFC 3339 帶時區，可改為 JSON（`log.format = "json"`）並外送到 syslog（RFC 5424）〔0.6 草稿〕
+- `/healthz`、`/readyz`（負載平衡器的探針）與 `/metrics`（Prometheus）；`kairos --check-config` 檢查設定、`kairos diag` 產生遮蔽敏感資料的支援診斷包〔0.6 草稿〕
 - 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP；啟用 mTLS 時 agent 的上線、離線等事件改依 `agent_id`）節流，每 10 秒最多一行並附上略過的則數，未啟用 mTLS 時另列出被略過的 agent_id（見「日誌」的節流說明）
 
 ## 需求
@@ -404,6 +405,16 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `limits.max_agents` | `KAIROS__LIMITS__MAX_AGENTS` | 未設定時為 `max(10000, server.max_connections)` | 狀態表（記憶體與 `agents.json`）最多保留的 agent 數，明確設定時必須介於 `server.max_connections`～100000。滿時先淘汰連線已結束、離線最久的 agent（記 `INFO`）；沒有可淘汰者時，新的 `agent_id` 以 fatal 的 `bad_request`（`server agent registry is full`）拒絕並記 `WARN`（防禦性處理：因為此值不小於 `server.max_connections`，依設定範圍實際上不會發生）。已在狀態表中的 `agent_id` 重新連線不受影響 |
 | `log.level` | `KAIROS__LOG__LEVEL` | `info` | `off`、`error`、`warn`、`info`、`debug`、`trace` |
 | `log.retention_days` | `KAIROS__LOG__RETENTION_DAYS` | `14` | `logs/kairos-YYYY-MM-DD.log` 保留天數（今天與前 N 天保留），`0` = 永久保留，上限 3650 |
+| `log.format` | `KAIROS__LOG__FORMAT` | `text` | `text`（RFC 3339 帶時區）、`json`（一行一個 JSON，檔名 `.jsonl`）、`legacy`（0.5 以前的格式，過渡用）；見「`logs/kairos-YYYY-MM-DD.log`」 |
+| `log.timezone` | `KAIROS__LOG__TIMEZONE` | `local` | `text` 的時間：`local` 或 `utc`（`json` 一律 UTC，`legacy` 一律本地時間） |
+| `log.stdout` | `KAIROS__LOG__STDOUT` | `true` | 同時寫到 stdout（以 systemd 執行時進 journal）；只要日誌檔一份時設為 `false` |
+| `log.syslog.target` | `KAIROS__LOG__SYSLOG__TARGET` | 空字串 | syslog 外送（RFC 5424）：`udp://主機:埠`（預設埠 514）、`tcp://主機:埠`（預設埠 601，RFC 6587 octet counting）、`unix:///dev/log`；空字串＝不外送 |
+| `log.syslog.facility` | `KAIROS__LOG__SYSLOG__FACILITY` | `daemon` | `daemon`、`user`、`auth`、`authpriv`、`local0`～`local7` |
+| `log.syslog.app_name` | `KAIROS__LOG__SYSLOG__APP_NAME` | `kairos` | RFC 5424 的 APP-NAME |
+| `log.syslog.payload` | `KAIROS__LOG__SYSLOG__PAYLOAD` | `text` | `text`：訊息文字；`json`：與 `log.format = "json"` 相同的一行 JSON |
+| `observability.listen` | `KAIROS__OBSERVABILITY__LISTEN` | 空字串 | 另外以純 HTTP 監聽 `/healthz`、`/readyz`、`/metrics`（例如 `127.0.0.1:9464`）；空字串＝只在主控台的監聽上提供。不可與其他監聽位址相同（`KRS-E0202`） |
+| `observability.on_console` | `KAIROS__OBSERVABILITY__ON_CONSOLE` | `true` | 主控台的監聽（`console.listen`，HTTPS）也提供這三個端點 |
+| `observability.metrics_token_file` | `KAIROS__OBSERVABILITY__METRICS_TOKEN_FILE` | 空字串 | `/metrics` 的 bearer token 檔（一行，至少 16 個字元）；設定時任何來源都要帶 `Authorization: Bearer <token>`，未設定時只接受 loopback 來源。啟動時讀取，更換 token 後需重新啟動；檔案讀不到或內容不合格式時拒絕啟動（結束代碼 3） |
 | `console.enabled` | `KAIROS__CONSOLE__ENABLED` | `true` | 主控台 API（[API.md](API.md)）；`false` 時不監聽。需要 `storage.backend = "sqlite"`（`jsonl` 時不啟動並記 `WARN`） |
 | `console.listen` | `KAIROS__CONSOLE__LISTEN` | `127.0.0.1:9443` | 主控台的 HTTPS 監聽位址；預設只綁 loopback，開放給管理網段時改成 `0.0.0.0:9443` 並以防火牆限制來源。與 `server.listen` 的位址相同時拒絕啟動（`KRS-E0202`，結束代碼 3），連接埠被佔用時結束代碼 11 |
 | `console.cert_path`、`console.key_path` | `KAIROS__CONSOLE__CERT_PATH`、`KAIROS__CONSOLE__KEY_PATH` | `""` | 主控台的伺服器憑證與私鑰；都留空時沿用 `server.cert_path`／`key_path`，必須同時設定或同時留空。內容變更時依 `server.reload_interval_secs` 熱重載 |
@@ -477,6 +488,50 @@ kairos api-token revoke <token_id> --yes --config kairos.toml
 - 驗證失敗依來源 IP 速率限制（連續 10 次後每 6 秒 1 次）；token 的建立與撤銷由執行中的 Kairos 寫入日誌。
 - 主控台在自己的 tokio runtime 上執行、以唯讀連線查詢資料庫，不影響 agent 連線與 report 的 `ack`（API.md 第 9 節）。
 - 握手時被拒的客戶端憑證（已撤銷、已過期）以 SAN 歸屬到主機，主機詳情與列表的離線原因顯示「憑證被拒」；不受信任的 CA 簽發的憑證不歸屬（避免冒用）。
+
+## 健康檢查與 Prometheus（0.6.0〔草稿〕）
+
+審計 O3；設計包 `kairos/screens.md` S20、§24 #8。三個端點在主控台的監聽上提供（`console.listen`，HTTPS，預設 `127.0.0.1:9443`），也可以另外以純 HTTP 監聽（`observability.listen`，例如 `127.0.0.1:9464`；這個監聽只有這三個端點，在自己的執行緒上執行，與 agent 連線、report 的寫入分開）。
+
+| 端點 | 認證 | 回應 |
+|---|---|---|
+| `/healthz` | 不需要 | 存活：`200 {"status":"ok"}`；關機中 `503 {"status":"shutting_down"}` |
+| `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用 |
+| `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403） | Prometheus 文字格式（0.0.4） |
+
+負載平衡器（L4 或 HTTP 探針）建議以 `/readyz` 判斷：主控台的監聽要開放給負載平衡器時，改用 `observability.listen` 綁在負載平衡器可達的位址（`/metrics` 仍只接受 loopback 或帶 token 的請求）。
+
+`/metrics` 的內容（標籤只用有限集合的值，不以 agent_id 或 IP 當標籤）：
+
+| 類別 | metric |
+|---|---|
+| 服務 | `kairos_build_info{version,commit}`、`kairos_start_time_seconds`、`kairos_shutting_down`、`kairos_ready` |
+| 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`timeout`／`connection_closed`／`server_shutdown`／`certificate_rejected`）、`kairos_agent_superseded_total`、`kairos_host_events_lagged_total` |
+| 被拒的連線 | `kairos_connections_rejected_total{reason}`（`per_ip` KRS-W2201／`rate`／`handshake_limit` KRS-W2204）、`kairos_accept_pauses_total`、`kairos_accept_paused_seconds_total`、`kairos_accept_paused`、`kairos_report_rate_limited_total{scope}`（`identity`：mTLS 的憑證身分；`ip`：來源 IP） |
+| report 寫入 | `kairos_reports_received_total`、`kairos_reports_total{result}`（`written`／`duplicate`／`storage_unavailable`／`unknown`／`rate_limited`）、`kairos_report_write_queue_depth`、`kairos_report_write_queue_capacity`、`kairos_report_ack_duration_seconds`（直方圖：放入寫入佇列到寫入完成）、`kairos_storage_unavailable` |
+| 資料庫與保留 | `kairos_database_writable`、`kairos_database_used_bytes`、`kairos_database_file_bytes`、`kairos_database_wal_bytes`、`kairos_database_max_bytes`、`kairos_storage_capacity_deleting`（KRS-W4202）、`kairos_retention_paused`（KRS-W4201） |
+| TLS 與憑證 | `kairos_mtls_enabled`、`kairos_client_cert_rejected_total{reason}`、`kairos_certificate_expiry_timestamp_seconds{kind,index}`、`kairos_certificate_days_remaining{kind,index}`（`kind`：`server_certificate`、`crl`、`issuing_ca`） |
+| 註冊端點（8444） | `kairos_enroll_mode{mode}`、`kairos_enroll_listening`、`kairos_enroll_http_requests_total`、`kairos_enroll_submissions_total{kind}`、`kairos_enroll_rate_limited_total{kind}`、`kairos_enroll_blocked_total`、`kairos_enroll_busy_total`、`kairos_enroll_clock_rejected_total`、`kairos_enroll_pre_handshake_closed_total`、`kairos_enroll_issued_total`、`kairos_enroll_pending_created_total`、`kairos_enroll_pending_requests`、`kairos_enroll_blocked_sources` |
+| 主控台 API | `kairos_api_requests_total{route,code}`、`kairos_api_auth_failures_total{reason}`、`kairos_probe_requests_total{endpoint,result}` |
+| 日誌與行程 | `kairos_log_messages_total{level}`、`kairos_log_syslog_messages_total{result}`、`kairos_process_resident_memory_bytes`、`kairos_process_open_fds`、`kairos_process_max_fds`、`kairos_process_cpu_seconds_total`（Linux） |
+
+計數都是啟動以來的累計值（重新啟動後歸零，Prometheus 的 `rate()`／`increase()` 會自動處理）。抓取的設定與建議的告警規則見 [`packaging/prometheus.example.yml`](packaging/prometheus.example.yml) 與 [`packaging/kairos-alerts.example.yml`](packaging/kairos-alerts.example.yml)。量測：每秒 2,000 筆 report 同時連續抓取 `/metrics`（約 400 次／秒）時，`ack` p99 約 2～4 ms，與不抓取時在同一範圍（CHANGELOG [0.6.0]「量測」）。
+
+## 設定檢查與診斷包（0.6.0〔草稿〕）
+
+```bash
+# 檢查設定（不啟動服務、不連線）：語法與範圍、監聽位址、TLS 憑證與到期、主控台憑證、資料與日誌目錄、
+# 日誌與 syslog、[observability]、檔案描述元與容量估算。0 通過（有警告時仍為 0）、8 有警告（--strict）、3 設定錯誤、4 憑證錯誤
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+
+# 支援診斷包（tar.gz，權限 0600）：版本、--check-config 的結果、設定（遮蔽後）、最近 3 天的日誌（上限 50 MB）、
+# 資料庫摘要、執行中服務的 /readyz 與 /metrics、systemd 設定與 journal、相關檔案清單（不含內容）
+cd /tmp && sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml
+# 交給外部廠商時把主機名稱與 IP 換成代號（對照表另存，不放進診斷包）
+sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml --redact-hosts --since 7d
+```
+
+一律遮蔽：PEM 私鑰區塊、主控台 API token（只留 `kat_<id>_`）、註冊 token（只留前 4 碼 `KRT1-7G4Q…`）、安裝字串、`Bearer` 後的值、設定與 JSON 中名稱含 `token`／`secret`／`password`／`passphrase` 的值（名稱以 `_file`、`_path`、`_prefix`、`_hint` 等結尾的只是路徑或提示，保留）。私鑰檔的內容一律不收集。產生前再檢查一次，仍有疑似秘密時不寫出（`KRS-E4301`）。日誌超過上限時只收集較新的部分（`KRS-W4302`〔暫定代碼〕，結束代碼 8）。
 
 ## 註冊通道與 PKI（0.5.0〔草稿〕）
 
@@ -694,10 +749,19 @@ sequenceDiagram
 
 ### `logs/kairos-YYYY-MM-DD.log`
 
-與終端輸出相同，格式為 `YYYY-MM-DD HH:MM:SS [LEVEL] 訊息`，以附加方式寫入，每筆寫入後即 flush。
+與終端輸出相同，以附加方式寫入，每筆寫入後即 flush。每一行的格式依 `log.format`（〔0.6 草稿〕，審計 O3）：
 
-- **檔名用 UTC 日期，行內時間用本地時間**：檔名與 reports 一致採 UTC（換日時自動切換到新檔，同一行日誌不會被拆到兩個檔案），行內時間維持與 Pulse 相同的本地時間格式。因此在台灣（UTC+8），每天早上 8 點前的日誌會在前一天的檔案裡。
-- **保留**：啟動時與每小時刪除 `logs/` 中檔名**完全符合** `kairos-YYYY-MM-DD.log` 且早於「今天（UTC）− `log.retention_days`」的檔案，每刪一個記錄 `INFO`；`0` = 永久保留。清除前的日期檢查規則與 reports 相同（見「系統日期異常時暫停清除」）；狀態保存在 `logs/.retention-guard-logs.json`（與 report 的狀態檔不同名，`storage.data_dir` 設成 `logs` 時兩者也不會共用；新檔不存在時會讀取一次舊版的 `logs/.retention-guard.json` 沿用其狀態），沒有狀態檔時以啟動前 `logs/` 中不晚於今天的最新日誌檔日期為基準，伺服器停機超過約 2 天後重新啟動也會暫停清除 24 小時。日誌清除工作與其他背景工作一樣受監看，異常結束時走關機流程。
+| `log.format` | 一行的樣子 |
+|---|---|
+| `text`（預設） | `2026-10-14T14:22:16.123+08:00 [WARN] 警告 KRS-W3005：已暫時封鎖…`（RFC 3339、毫秒、帶時區位移；`log.timezone = "utc"` 時以 `Z` 結尾） |
+| `json` | `{"v":1,"ts":"2026-10-14T06:22:16.123Z","level":"warn","event":"kairos.enroll","code":"KRS-W3005","msg":"警告 KRS-W3005：已暫時封鎖…","product":"kairos","host":"kairos01","run_id":"r-5f2c91a0b3c4","seq":42,"target":"kairos::enroll","fields":{}}`，檔名改為 `kairos-YYYY-MM-DD.jsonl` |
+| `legacy` | `2026-10-14 14:22:16 [WARN] …`（0.5 以前的格式：本地時間、不帶時區）；只保留一個主要版本供既有的解析規則過渡 |
+
+JSON 的欄位：`v`（schema 版本，目前 1）、`ts`（UTC）、`level`（`error`／`warn`／`info`／`debug`／`trace`）、`event`、`code`（`KRS-…` 錯誤代碼，沒有時為 `null`）、`msg`（在地化的訊息，**不可用於程式判斷**）、`product`、`host`、`run_id`（每次啟動隨機產生）、`seq`（本次行程內遞增，可偵測遺漏）、`target`（模組）、`fields`（結構化欄位）。`code` 取自訊息中的第一個 `KRS-` 代碼；尚未指定固定事件名稱的行，`event` 為模組路徑（例如 `kairos.enroll.handlers`），之後的版本會逐步改為設計包 `log-ux.md` 的固定事件，SIEM 規則請以 `code` 為主。兩種格式的檔案不混在同一個檔案；切換 `log.format` 前後的檔案都依 `log.retention_days` 清除。
+
+- **檔名用 UTC 日期**：檔名與 reports 一致採 UTC（換日時自動切換到新檔，同一行日誌不會被拆到兩個檔案）；行內時間 `text` 為本地時間並帶時區位移（0.6 起，可直接與 Pulse、其他主機的日誌對時），`json` 一律 UTC。因此在台灣（UTC+8），每天早上 8 點前的日誌會在前一天的檔案裡。
+- **外送**：`[log.syslog]` 設定時另以 RFC 5424 送到 syslog（UDP、TCP 或本機 socket；`MSGID` 為錯誤代碼，沒有時為事件名稱）。在背景執行緒送出：接收端無法連線時丟棄並計數（`/metrics` 的 `kairos_log_syslog_messages_total{result="dropped"}`），不影響服務與日誌檔。以 systemd 執行時 stdout 會進 journal（`log.stdout = false` 可關閉，只保留日誌檔）。
+- **保留**：啟動時與每小時刪除 `logs/` 中檔名**完全符合** `kairos-YYYY-MM-DD.log`（或 `.jsonl`）且早於「今天（UTC）− `log.retention_days`」的檔案，每刪一個記錄 `INFO`；`0` = 永久保留。清除前的日期檢查規則與 reports 相同（見「系統日期異常時暫停清除」）；狀態保存在 `logs/.retention-guard-logs.json`（與 report 的狀態檔不同名，`storage.data_dir` 設成 `logs` 時兩者也不會共用；新檔不存在時會讀取一次舊版的 `logs/.retention-guard.json` 沿用其狀態），沒有狀態檔時以啟動前 `logs/` 中不晚於今天的最新日誌檔日期為基準，伺服器停機超過約 2 天後重新啟動也會暫停清除 24 小時。日誌清除工作與其他背景工作一樣受監看，異常結束時走關機流程。
 - **舊版 `logs/kairos.log`**：啟動時若存在，記錄一次 `INFO`；不再寫入，也不會被自動刪除。
 - **節流**：可能被掃描或攻擊大量觸發的日誌，每個節流 key 每 10 秒最多記錄一行，下一次記錄時附上「上次記錄後另有 N 則略過」。略過的則數要等到該 key 下一次記錄時才會出現。
   - **只以類別為 key**（全域共用）：TLS 握手失敗、hello 前後的協定違規（`hello_required`、`unsupported_version`、`too_long`、連續無效訊息）、hello 逾時、其他連線錯誤、accept 失敗、握手中連線數已達上限、狀態表已滿、狀態表淘汰離線 agent（與「狀態表已滿」分開節流）、寫入結果未知、report 檔開檔／寫入失敗與達到每日大小上限。
@@ -844,7 +908,10 @@ kairos/
 └── src/
     ├── main.rs            元件組裝、accept 迴圈與連線上限、背景工作監看、關機流程
     ├── config.rs          設定載入（預設值、kairos.toml、環境變數、--config）
-    ├── logger.rs          日誌初始化（按 UTC 日期分檔，Unix 上日誌檔 0640）與舊日誌清除
+    ├── logger.rs          日誌初始化（按 UTC 日期分檔，Unix 上日誌檔 0640；格式、stdout、syslog）與舊日誌清除
+    ├── metrics.rs         執行中的計數器（離線原因、狀態表淘汰、被拒的憑證、API 請求等；/metrics 讀取）
+    ├── probe.rs           /healthz、/readyz、/metrics（主控台的監聽與 observability.listen 的純 HTTP 監聽）
+    ├── diag.rs            kairos --check-config 與 kairos diag（支援診斷包）
     ├── fsperm.rs          檔案與目錄權限（Unix：資料檔與日誌檔最多 0640、目錄 0750）
     ├── tls.rs             憑證、私鑰、客戶端 CA 與 CRL 載入；可替換的目前 TLS 設定；憑證鏈重新驗證
     ├── reload.rs          TLS 熱重載與現役連線的客戶端憑證重新驗證
@@ -892,6 +959,7 @@ kairos/
 | `chrono` | RFC 3339 時間戳記與日誌時間 |
 | `config` | 設定檔與環境變數疊加（0.15，只啟用 `toml`） |
 | `log`、`fern` | 日誌輸出到終端與按日分檔的檔案（分檔由 `logger.rs` 自行處理，以便指定檔案權限） |
+| `kp-obs`（workspace 內部 crate） | 與 Pulse 共用：日誌格式（text／json／legacy）、syslog（RFC 5424）、Prometheus 文字格式、診斷包（tar.gz、遮蔽）；只用既有的依賴，Cargo.lock 不新增外部套件 |
 | `rusqlite` | SQLite 儲存（`bundled`：編譯內附的 SQLite 原始碼，SQLite 為 public domain，不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝；不啟用其他 feature） |
 | `hyper`、`hyper-util` | 主控台 API 的 HTTP/1.1 伺服器（只啟用 `server`、`http1`；`hyper-util` 只啟用 `tokio`）。選型理由見 API.md 第 8 節 |
 | `ring`、`subtle` | API token：SHA-256、作業系統的隨機數（rustls 已依賴的加密後端）、雜湊的常數時間比較（rustls 已依賴同一版本） |

@@ -16,7 +16,9 @@ kairos-pulse/
 ├── packaging/             兩個產品共用的打包實作、release.sh、簽章、可重現性檢查與 cargo-about 設定
 ├── crates/                兩個產品共用的內部 crate（publish = false）
 │   ├── kairos-proto/      協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
-│   └── date-guard/        依日期命名檔案的保留清除規則與時鐘跳躍／回撥保護（DateGuard）
+│   ├── date-guard/        依日期命名檔案的保留清除規則與時鐘跳躍／回撥保護（DateGuard）
+│   └── kp-obs/            可觀測性：日誌格式（text／json／legacy）、syslog（RFC 5424）、Prometheus 文字格式、
+│                          診斷包（tar.gz、敏感資料遮蔽）、--check-config 的輸出
 ├── kairos/                Kairos 伺服器（說明見 kairos/README.md）
 ├── pulse/                 Pulse 代理（說明見 pulse/README.md）
 └── tests/e2e/             端對端測試 kp-e2e（publish = false）：啟動實際的 kairos 與 pulse 執行檔
