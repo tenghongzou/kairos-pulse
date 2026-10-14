@@ -29,7 +29,8 @@ create 的選項：
   --name <名稱>          用途說明（1～64 個字元），例如 grafana、console-dev
   --expires-in <時間>    多久後到期，例如 90d、12h、2w（預設 90d，上限 3650d）
   --expires-at <日期>    到期日：2027-01-01（UTC 當天 00:00）或 RFC 3339 時間
-  --scope read           範圍；本版只有 read（唯讀）
+  --scope <範圍>         read（預設，唯讀）、operate（日常的註冊與憑證操作）、admin（另含簽發自動核准 token、
+                         模式、政策與 CA 的操作）；見 API.md 第 11.1 節
 
 list 的選項：
   --all                  也列出已撤銷與已過期的 token
@@ -85,6 +86,8 @@ pub enum TokenAction {
     Create {
         name: String,
         expiry: Expiry,
+        /// `read`（預設）、`operate`、`admin`（API.md 第 11.1 節）
+        scope: String,
     },
     List {
         all: bool,
@@ -135,6 +138,7 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
     let mut config_path = None;
     let (mut json, mut ascii, mut all, mut yes) = (false, false, false, false);
     let mut name = None;
+    let mut scope: Option<String> = None;
     let mut reason = None;
     let mut expires_in = None;
     let mut expires_at = None;
@@ -186,9 +190,10 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
             "--reason" if sub == "revoke" => reason = Some(value("--reason")?),
             "--scope" if sub == "create" => {
                 let s = value("--scope")?;
-                if s != SCOPE_READ {
-                    return Err(format!("--scope 的值 \"{s}\" 無效（本版只有 read）"));
+                if !tokens::SCOPES.contains(&s.as_str()) {
+                    return Err(format!("--scope 的值 \"{s}\" 無效（read、operate、admin）"));
                 }
+                scope = Some(s);
             }
             "--expires-in" if sub == "create" => {
                 let v = value("--expires-in")?;
@@ -226,7 +231,11 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
                     return Err("--expires-in、--expires-at 只能擇一".to_string());
                 }
             };
-            TokenAction::Create { name, expiry }
+            TokenAction::Create {
+                name,
+                expiry,
+                scope: scope.unwrap_or_else(|| SCOPE_READ.to_string()),
+            }
         }
         "list" => {
             if !positional.is_empty() {
@@ -266,16 +275,21 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
 
 /// 命令失敗
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Failure {
-    code: Option<&'static str>,
-    title: String,
-    cause: String,
-    fix: Vec<String>,
-    exit: u8,
+pub(crate) struct Failure {
+    pub(crate) code: Option<&'static str>,
+    pub(crate) title: String,
+    pub(crate) cause: String,
+    pub(crate) fix: Vec<String>,
+    pub(crate) exit: u8,
 }
 
 impl Failure {
-    fn new(title: impl Into<String>, cause: impl Into<String>, fix: Vec<String>, exit: u8) -> Self {
+    pub(crate) fn new(
+        title: impl Into<String>,
+        cause: impl Into<String>,
+        fix: Vec<String>,
+        exit: u8,
+    ) -> Self {
         Self {
             code: None,
             title: title.into(),
@@ -285,7 +299,7 @@ impl Failure {
         }
     }
 
-    fn human(&self, unicode: bool) -> String {
+    pub(crate) fn human(&self, unicode: bool) -> String {
         let mark = if unicode { "✗" } else { "[FAIL]" };
         let code = self.code.map(|c| format!(" {c}")).unwrap_or_default();
         let mut out = format!(
@@ -301,7 +315,7 @@ impl Failure {
         out
     }
 
-    fn json(&self, schema: &str, now: DateTime<Utc>) -> String {
+    pub(crate) fn json(&self, schema: &str, now: DateTime<Utc>) -> String {
         ascii_json(&json!({
             "schema": schema,
             "ok": false,
@@ -322,7 +336,7 @@ impl Failure {
 }
 
 /// 執行命令的作業系統帳號（稽核用）
-fn operator() -> String {
+pub(crate) fn operator() -> String {
     let user = ["SUDO_USER", "USER", "LOGNAME", "USERNAME"]
         .iter()
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
@@ -356,7 +370,7 @@ fn refuse_root(data_dir: &Path) -> Option<Failure> {
         };
         (owner != 0).then(|| {
             Failure::new(
-                "無法寫入 API token：請以 Kairos 的服務帳號執行",
+                "無法寫入資料庫：請以 Kairos 的服務帳號執行",
                 format!(
                     "以 root 執行，但資料目錄 {} 屬於 uid {owner}：建立的資料庫檔會屬於 root，Kairos（服務帳號）之後無法寫入",
                     data_dir.display()
@@ -374,7 +388,10 @@ fn refuse_root(data_dir: &Path) -> Option<Failure> {
 }
 
 /// 載入設定並開啟資料庫（`create` 時必要時建立）；資料庫不存在且 `create` 為 `false` 時回 `Ok(None)`
-fn open(config_path: Option<&Path>, create: bool) -> Result<Option<rusqlite::Connection>, Failure> {
+pub(crate) fn open(
+    config_path: Option<&Path>,
+    create: bool,
+) -> Result<Option<rusqlite::Connection>, Failure> {
     let config = AppConfig::load(config_path).map_err(|e| Failure {
         code: Some("KRS-E0201"),
         ..Failure::new(
@@ -386,8 +403,8 @@ fn open(config_path: Option<&Path>, create: bool) -> Result<Option<rusqlite::Con
     })?;
     if config.storage.backend != StorageBackend::Sqlite {
         return Err(Failure::new(
-            "API token 需要 SQLite",
-            "storage.backend 為 \"jsonl\"：主控台 API 與 token 存在 SQLite 資料庫中。",
+            "這個命令需要 SQLite",
+            "storage.backend 為 \"jsonl\"：主控台 API、token、註冊與 PKI 的資料存在 SQLite 資料庫中。",
             vec!["改回 storage.backend = \"sqlite\"（預設值）並重新啟動 Kairos。".to_string()],
             EXIT_CONFIG,
         ));
@@ -421,9 +438,9 @@ fn open(config_path: Option<&Path>, create: bool) -> Result<Option<rusqlite::Con
         })
 }
 
-fn db_failure(e: impl std::fmt::Display) -> Failure {
+pub(crate) fn db_failure(e: impl std::fmt::Display) -> Failure {
     Failure::new(
-        "無法讀寫 API token",
+        "無法讀寫資料庫",
         e.to_string(),
         vec!["確認資料庫沒有損毀；必要時從備份還原（STORAGE.md「備份與還原」）。".to_string()],
         EXIT_GENERAL,
@@ -431,7 +448,7 @@ fn db_failure(e: impl std::fmt::Display) -> Failure {
 }
 
 /// 時區標示：`UTC+8`、`UTC-3:30`、`UTC`（copywriting.md §5.1）
-fn zone_label(tz: FixedOffset) -> String {
+pub(crate) fn zone_label(tz: FixedOffset) -> String {
     let secs = tz.local_minus_utc();
     if secs == 0 {
         return "UTC".to_string();
@@ -446,19 +463,19 @@ fn zone_label(tz: FixedOffset) -> String {
 }
 
 /// 人看的時間（本機時區，不含時區標示；表格只在欄位標題標示）
-fn human_time(ms: i64, tz: FixedOffset) -> String {
+pub(crate) fn human_time(ms: i64, tz: FixedOffset) -> String {
     DateTime::from_timestamp_millis(ms)
         .map(|t| t.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
 }
 
 /// 人看的時間＋時區標示：`2027-04-11 14:03 UTC+8`
-fn human_time_zoned(ms: i64, tz: FixedOffset) -> String {
+pub(crate) fn human_time_zoned(ms: i64, tz: FixedOffset) -> String {
     format!("{} {}", human_time(ms, tz), zone_label(tz))
 }
 
 /// 相對時間：`12 秒前`、`3 分鐘前`、`2 小時 15 分前`、`14 天前`（cli-style.md §11.6 的範例）
-fn relative(now_ms: i64, ms: i64) -> String {
+pub(crate) fn relative(now_ms: i64, ms: i64) -> String {
     let secs = (now_ms - ms).max(0) / 1000;
     match secs {
         0..60 => format!("{secs} 秒前"),
@@ -511,7 +528,7 @@ fn state_label(s: TokenState) -> &'static str {
 }
 
 /// 表格（2 個空格分隔、依顯示寬度對齊）
-fn table(rows: &[Vec<String>]) -> String {
+pub(crate) fn table(rows: &[Vec<String>]) -> String {
     let cols = rows.first().map_or(0, Vec::len);
     let widths: Vec<usize> = (0..cols)
         .map(|i| rows.iter().map(|r| display_width(&r[i])).max().unwrap_or(0))
@@ -573,7 +590,11 @@ pub fn execute(
             stdout: format!("{TOKEN_USAGE}\n"),
             ..Default::default()
         },
-        TokenAction::Create { name, expiry } => {
+        TokenAction::Create {
+            name,
+            expiry,
+            scope,
+        } => {
             let expires_at = match expiry {
                 Expiry::Default => Some(now_ms + (DEFAULT_EXPIRY_DAYS * 86_400_000) as i64),
                 Expiry::In(d) => Some(now_ms + i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
@@ -600,7 +621,7 @@ pub fn execute(
             };
             let by = operator();
             let NewToken { token, row } =
-                match tokens::create(&conn, name, SCOPE_READ, expires_at, Some(&by), now_ms) {
+                match tokens::create(&conn, name, scope, expires_at, Some(&by), now_ms) {
                     Ok(t) => t,
                     Err(e) => return fail(db_failure(e)),
                 };
@@ -622,8 +643,8 @@ pub fn execute(
             Output {
                 stdout: format!("{token}\n"),
                 stderr: format!(
-                    "{ok_mark} 已建立 API token「{}」（token_id {}，範圍 read，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n",
-                    row.name, row.token_id
+                    "{ok_mark} 已建立 API token「{}」（token_id {}，範圍 {}，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n",
+                    row.name, row.token_id, row.scope
                 ),
                 exit: 0,
             }
@@ -887,7 +908,8 @@ mod tests {
             c.action,
             TokenAction::Create {
                 name: "grafana".into(),
-                expiry: Expiry::In(std::time::Duration::from_secs(30 * 86_400))
+                expiry: Expiry::In(std::time::Duration::from_secs(30 * 86_400)),
+                scope: "read".into(),
             }
         );
         assert!(c.json);
@@ -1047,6 +1069,7 @@ mod tests {
                 TokenAction::Create {
                     name: "grafana".into(),
                     expiry: Expiry::Default,
+                    scope: "read".into(),
                 },
                 false,
             ),
@@ -1072,6 +1095,7 @@ mod tests {
                 TokenAction::Create {
                     name: "主控台".into(),
                     expiry: Expiry::In(std::time::Duration::from_secs(10 * 86_400)),
+                    scope: "read".into(),
                 },
                 true,
             ),
@@ -1202,6 +1226,7 @@ mod tests {
                 TokenAction::Create {
                     name: "x".into(),
                     expiry: Expiry::At(now - chrono::Duration::days(1)),
+                    scope: "read".into(),
                 },
                 false,
             ),
