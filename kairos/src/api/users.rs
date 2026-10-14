@@ -61,7 +61,7 @@ fn refused(r: Refused, name: &str) -> ApiError {
         Refused::Exists => ApiError::conflict("user_exists", format!("使用者 {name} 已存在")),
         Refused::NotLocal => ApiError::conflict(
             "directory_account",
-            "目錄服務帳號的密碼與二階段驗證由目錄服務（AD）管理",
+            "目錄服務帳號的密碼與兩步驟驗證由目錄服務（AD）管理",
         ),
     }
 }

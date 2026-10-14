@@ -117,15 +117,15 @@ pub const CODE_UNAUTHORIZED: &str = "KRS-E6010";
 pub const CODE_RATE_LIMITED: &str = "KRS-W6011";
 /// 403 `forbidden` 的產品代碼
 pub const CODE_FORBIDDEN: &str = "KRS-E6104";
-/// 403 `csrf_failed`：工作階段的請求缺少或帶錯 CSRF token、或來源不同（〔暫定〕代碼，設計包尚未分配）
+/// 403 `csrf_failed`：工作階段的請求缺少或帶錯 CSRF token、或來源不同（設計包 §28.3）
 pub const CODE_CSRF: &str = "KRS-E6105";
 /// 帳號或密碼不正確（`copywriting.md` §3.3）
 pub const CODE_BAD_CREDENTIALS: &str = "KRS-E6001";
 /// 帳號已鎖定
 pub const CODE_LOCKED: &str = "KRS-E6003";
-/// 二階段驗證碼不正確或已使用過（〔暫定〕代碼，設計包尚未分配）
+/// 兩步驟驗證碼不正確或已使用過（設計包 §28.3）
 pub const CODE_BAD_MFA: &str = "KRS-E6012";
-/// 必須先變更密碼（管理員建立或重設後的第一次登入；〔暫定〕代碼）
+/// 必須先變更密碼（管理員建立或重設後的第一次登入；設計包 §28.3）
 pub const CODE_PASSWORD_CHANGE: &str = "KRS-E6013";
 
 /// API 的錯誤（`kairos/API.md` 第 1.2 節）

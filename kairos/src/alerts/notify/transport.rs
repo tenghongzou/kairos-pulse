@@ -39,9 +39,9 @@ pub const CODE_LINE_TOKEN: &str = "KRS-E5105";
 pub const CODE_TEAMS_4XX: &str = "KRS-E5106";
 /// Webhook 目的地無法連線或回應不是 2xx
 pub const CODE_WEBHOOK: &str = "KRS-E5108";
-/// 〔暫定〕SMTP 伺服器拒絕寄件者、收件者或內容（設計包沒有對應代碼，見 ALERTS.md 第 10 節）
+/// SMTP 伺服器拒絕寄件者、收件者或內容（設計包 `decisions/INTEGRATION.md` §28.3）
 pub const CODE_SMTP_REJECTED: &str = "KRS-E5109";
-/// 〔暫定〕通知管道的設定無效（缺少欄位、網址格式錯誤；設計包沒有對應代碼）
+/// 通知管道的設定無效（缺少欄位、網址格式錯誤；設計包 §28.3）
 pub const CODE_CHANNEL_CONFIG: &str = "KRS-E5110";
 
 /// LINE Messaging API 的 push 端點（`url` 未設定時）

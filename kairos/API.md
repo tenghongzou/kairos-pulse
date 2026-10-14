@@ -57,13 +57,13 @@
 | 400 | `invalid_cursor` | — | `cursor` 無法解析、或與目前的排序不符（改變排序後要從第一頁開始） |
 | 401 | `unauthorized` | `KRS-E6010` | 沒有 `Authorization`（或工作階段）、格式錯誤、token 不存在、已撤銷或已過期（對外不區分），附 `WWW-Authenticate: Bearer realm="kairos"`；工作階段已結束或逾時時 `details.reason = "session_expired"`（第 12.3 節） |
 | 401 | `invalid_credentials` | `KRS-E6001` | 登入的帳號或密碼不正確（不區分哪一個；第 12.2 節） |
-| 401 | `invalid_mfa_code` | `KRS-E6012`〔暫定〕 | TOTP 或復原碼不正確或已使用過 |
+| 401 | `invalid_mfa_code` | `KRS-E6012` | TOTP 或復原碼不正確或已使用過 |
 | 401 | `mfa_challenge_expired` | — | 登入第二步的挑戰逾時或無效，重新輸入帳號密碼 |
 | 403 | `forbidden` | `KRS-E6104` | 權限不足：`details.permission` 為所需的權限、`details.required` 為擁有它的最低角色（0.4／0.5 的 token 為範圍；第 11.1、12.1 節） |
 | 403 | `account_locked` | `KRS-E6003` | 連續登入失敗而鎖定，附 `Retry-After` 與 `details.locked_until` |
 | 403 | `account_disabled` | `KRS-E6009` | 目錄服務回報帳號已停用或鎖定 |
-| 403 | `csrf_failed` | `KRS-E6105`〔暫定〕 | 以工作階段送出的寫入請求缺少或帶錯 `X-CSRF-Token`，或來自其他網站（第 12.3 節） |
-| 403 | `password_change_required` | `KRS-E6013`〔暫定〕 | 第一次登入必須先變更密碼 |
+| 403 | `csrf_failed` | `KRS-E6105` | 以工作階段送出的寫入請求缺少或帶錯 `X-CSRF-Token`，或來自其他網站（第 12.3 節） |
+| 403 | `password_change_required` | `KRS-E6013` | 第一次登入必須先變更密碼 |
 | 409 | `last_admin`、`cannot_target_self`、`target_is_self`、`user_exists`、`directory_account` | — | 使用者管理的防呆（第 12.5 節） |
 | 503 | `directory_unavailable` | `KRS-E6002`／`E6005`／`E6006`／`E6007` | 無法以目錄服務登入（`details.reason`） |
 | 404 | `not_found` | — | 沒有這個路徑 |
@@ -856,7 +856,7 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 - **不透露帳號是否存在**：帳號不存在、密碼錯誤、帳號停用、目錄服務帳號以本機方式登入，一律 401 `invalid_credentials`（`KRS-E6001`）。
 - **鎖定**（`KRS-E6003`）：連續失敗 `accounts.lockout_threshold`（預設 5）次後鎖定 `accounts.lockout_minutes`（預設 15）分鐘，回 403 `account_locked`，`details.locked_until`、`Retry-After`；鎖定期間正確的密碼也一樣。**不存在的帳號同樣會「鎖定」**（記憶體中計數，最多 1 萬個名稱），回應與存在的帳號相同。TOTP 第二步、變更密碼與綁定 TOTP 時輸入錯誤的目前密碼，都計入同一個計數。管理員以 `kairos users unlock` 或啟用帳號解除。
 - **依來源限速**（`KRS-W6011`）：登入失敗與 API token 驗證失敗共用同一個依來源 IP 的額度（第 4.3 節：可連續 10 次，之後每 6 秒 1 次）；用完時登入也回 429。每次登入（與第二步）**先扣**一次額度、成功或與密碼無關的錯誤（本文格式、目錄服務無法使用）時退回：同時送出的大量嘗試不會在扣減之前都通過檢查。帳號的鎖定在建立工作階段的交易中再確認一次（等待雜湊期間被鎖定、停用的帳號不會登入成功）。同時等待密碼雜湊的請求超過 32 個時回 503 `busy`（`Retry-After: 1`）。放在反向代理之後時，所有使用者共用代理的來源位址與額度。
-- **首次登入必須變更密碼**：管理員建立或重設密碼（含系統產生的一次性密碼）的帳號，登入後只能呼叫 `GET /api/v1/me`、`POST /api/v1/me/password`、登出，其他端點回 403 `password_change_required`（〔暫定〕`KRS-E6013`）。
+- **首次登入必須變更密碼**：管理員建立或重設密碼（含系統產生的一次性密碼）的帳號，登入後只能呼叫 `GET /api/v1/me`、`POST /api/v1/me/password`、登出，其他端點回 403 `password_change_required`（`KRS-E6013`）。
 - **密碼政策**：至少 `accounts.password_min_length`（預設 12，最少 8）個字元、最多 256、不含控制字元、不包含帳號名稱、不是同一個字元重複、不是常見的密碼（例如 `password`、`P@ssw0rd2026`）。產生的一次性密碼為 4 組 5 個字元（約 116 位元）。
 - **目錄服務**（`method: "ldap"`，第 12.7 節）：第一次登入時建立來源為 `ldap` 的使用者（沒有密碼）；同名的本機帳號存在時拒絕（不讓目錄服務接管本機帳號）。錯誤：密碼錯誤或查無使用者 401 `KRS-E6001`；AD 回報停用或鎖定 403 `account_disabled`（`KRS-E6009`）；連不上、憑證不受信任、服務帳號 bind 失敗、搜尋基底不存在 503 `directory_unavailable`（`product_code` 依原因為 `KRS-E6002`、`E6005`、`E6006`、`E6007`，`details.reason`；伺服器名稱等細節只寫日誌）。
 - 每次成功、失敗、鎖定、登出都寫入稽核（第 12.8 節）。失敗的執行者一律為 `anonymous`、對象為輸入的帳號（不記錄密碼）；帳號不存在且輸入不符合帳號格式時（例如把密碼打進帳號欄）只記 SHA-256 的前 8 碼。
@@ -866,7 +866,7 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 - **cookie**：`__Host-kairos_session=<秘密>; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=<絕對逾時>`。秘密為 32 bytes CSPRNG 的 base64url，資料庫只保存 SHA-256（`sessions.session_hash`）；清單中以 16 個十六進位字元的公開 `session_id` 識別。每次登入都是新的工作階段（沒有 session fixation）。
 - **逾時**：閒置 `accounts.session_idle_minutes`（預設 30）分鐘、絕對 `accounts.session_absolute_hours`（預設 12）小時。最後活動時間最多每 60 秒寫回一次（閒置的判斷誤差 1 分鐘以內）；SSE 不更新最後活動時間。
 - **立即失效**：每個請求都查詢資料庫——工作階段被結束、逾時、使用者停用或刪除、目錄服務帳號而 `[ldap]` 已停用時回 401 `unauthorized`（`KRS-E6010`，`details.reason = "session_expired"`）；SSE 每次心跳（15 秒）重新確認身分並**重新計算權限與主機範圍**：失效或已沒有主機的讀取權限時關閉，降為群組範圍時只再推送範圍內的主機。
-- **CSRF**：以工作階段驗證的 `POST`／`PUT`／`PATCH`／`DELETE` 必須帶 `X-CSRF-Token`（登入回應與 `GET /api/v1/me` 的 `csrf_token`；由 cookie 秘密以主控台金鑰 HMAC 衍生，常數時間比對），且 `Origin`（有帶時）必須等於 `https://<Host>`、`Sec-Fetch-Site` 不可是 `cross-site`；否則 403 `csrf_failed`（〔暫定〕`KRS-E6105`）。經反向代理時代理必須保留原本的 `Host`。登入端點要求 `Content-Type: application/json`（跨站的表單無法送出），CORS 關閉。
+- **CSRF**：以工作階段驗證的 `POST`／`PUT`／`PATCH`／`DELETE` 必須帶 `X-CSRF-Token`（登入回應與 `GET /api/v1/me` 的 `csrf_token`；由 cookie 秘密以主控台金鑰 HMAC 衍生，常數時間比對），且 `Origin`（有帶時）必須等於 `https://<Host>`、`Sec-Fetch-Site` 不可是 `cross-site`；否則 403 `csrf_failed`（`KRS-E6105`）。經反向代理時代理必須保留原本的 `Host`。登入端點要求 `Content-Type: application/json`（跨站的表單無法送出），CORS 關閉。
 - 同時帶 `Authorization` 與 cookie 時以 `Authorization`（API token）為準，不需要 CSRF token。
 - **主控金鑰**：`<storage.data_dir>/console.key`（32 bytes，0600），第一次啟動主控台時建立；用於 CSRF token、TOTP 秘密的加密（AES-256-GCM，以使用者 id 為附加資料）與復原碼的 HMAC。無法建立或讀取時帳號登入停用（API token 照常），日誌有 `ERROR`。遺失時已綁定的 TOTP 無法驗證，以 `kairos users reset-mfa` 重設。
 
@@ -881,10 +881,10 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 | `POST /api/v1/me/password` | `current_password`、`new_password`：變更自己的密碼（本機帳號）；其他工作階段結束、保留目前這個 |
 | `POST /api/v1/me/totp/setup` | `password`：產生 TOTP 秘密（20 bytes），回 `secret`（base32）與 `otpauth_uri`（QR code 內容；SHA1、6 位數、30 秒）。已啟用時 409 |
 | `POST /api/v1/me/totp/enable` | `code`：以驗證器顯示的碼確認後啟用，回 10 組 `recovery_codes`（**只在這次回應出現**） |
-| `POST /api/v1/me/totp/disable` | `password` 與 `code`（目前的 TOTP 或一組復原碼）：停用並刪除復原碼；只知道密碼的人不能關掉二階段驗證 |
+| `POST /api/v1/me/totp/disable` | `password` 與 `code`（目前的 TOTP 或一組復原碼）：停用並刪除復原碼；只知道密碼的人不能關掉兩步驟驗證 |
 
-- 這些端點只接受工作階段（API token 回 400 `not_a_session`）。目錄服務帳號的密碼與二階段驗證由 AD 管理（409 `directory_account`）。
-- TOTP 驗證接受前後各 1 個時間步，同一個時間步只能使用一次（重放回 401 `invalid_mfa_code`，〔暫定〕`KRS-E6012`）；復原碼各只能用一次。
+- 這些端點只接受工作階段（API token 回 400 `not_a_session`）。目錄服務帳號的密碼與兩步驟驗證由 AD 管理（409 `directory_account`）。
+- TOTP 驗證接受前後各 1 個時間步，同一個時間步只能使用一次（重放回 401 `invalid_mfa_code`，`KRS-E6012`）；復原碼各只能用一次。
 
 ### 12.5 使用者與角色（S16）
 
@@ -1081,7 +1081,7 @@ retention_days = 1095           # 稽核紀錄保留天數，90..=36500（獨立
 |---|---|---|---|
 | 400 | `rule_invalid` | `KRS-E5001` | 規則無法儲存（`details.parameter`；例：恢復門檻在觸發門檻的另一側、緊急等級沒有升級對象、系統規則的嚴重度低於預設） |
 | 400 | `silence_too_long` | — | 臨時靜音超過上限（`details.max_secs`、`requested_secs`、`system`、`emergency`；D26，伺服器端驗證） |
-| 400 | `channel_invalid` | `KRS-E5110`〔暫定〕 | 管道的設定無效（`details.parameter`） |
+| 400 | `channel_invalid` | `KRS-E5110` | 管道的設定無效（`details.parameter`） |
 | 400 | `confirmation_required` | — | 停用系統預設規則沒有 `reason`；刪除管道沒有確認（`details.rules` 為受影響的規則） |
 | 404 | `event_not_found`、`rule_not_found`、`silence_not_found`、`channel_not_found` | — | 對象不存在 |
 | 409 | `invalid_state` | — | 事件已解決（只能新增註解）、已結束的靜音不能修改 |

@@ -104,19 +104,21 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 新的內部 crate `crates/kp-obs`：日誌格式、syslog（RFC 5424）、Prometheus 文字格式與測試用的嚴格解析器、診斷包（tar.gz）與遮蔽。只用 workspace 既有的依賴。
 - rustls 0.23.45 → 0.23.46（RUSTSEC-2026-0346～0349，`cargo deny` 的新公告）。
 
-### 暫定代碼（設計包尚未分配，`decisions/INTEGRATION.md` §28 預定）
+### 新增的產品代碼（設計包 `decisions/INTEGRATION.md` §28.3 正式分配）
 
 | 代碼 | 意義 | 使用處 |
 |---|---|---|
-| `KRS-E6012` | 二階段驗證碼不正確或已使用過（HTTP 401 `invalid_mfa_code`） | 登入第二步 |
+| `KRS-E6012` | 兩步驟驗證碼不正確或已使用過（HTTP 401 `invalid_mfa_code`） | 登入第二步 |
 | `KRS-E6013` | 第一次登入必須先變更密碼（HTTP 403 `password_change_required`） | 主控台 API |
 | `KRS-E6105` | 工作階段的寫入請求缺少或帶錯 CSRF token、或來自其他網站（HTTP 403 `csrf_failed`） | 主控台 API |
 | `KRS-E5109` | SMTP 伺服器拒絕寄件者、收件者或內容 | 通知 |
 | `KRS-E5110` | 通知管道的設定無效（HTTP 400 `channel_invalid`） | 告警 API |
-| `KRS-E0101` | 設定檔無法載入（Pulse `PLS-E0101` 的對應） | `kairos --check-config` |
-| `KRS-W4302` | 診斷包內容已截斷（Pulse `PLS-W4302` 的對應） | `kairos diag` |
+| `KRS-E0101` | 設定檔語法或型別錯誤（類比 `PLS-E0101`） | `kairos --check-config` |
+| `KRS-E0401` | `--config` 指定的設定檔不存在（類比 `PLS-E0401`） | `kairos --check-config` |
+| `KRS-E0402` | 設定檔無法讀取：權限、I/O（類比 `PLS-E0402`） | `kairos --check-config` |
+| `KRS-W4302` | 診斷包內容已截斷（類比 `PLS-W4302`） | `kairos diag` |
 
-`kairos diag` 無法產生時沿用 `KRS-E4301`（設計包為 CSV 匯出，語意延伸到診斷包）。工作階段結束或逾時沿用 `KRS-E6010`（`details.reason = "session_expired"`）。
+`kairos diag` 無法產生時沿用 `KRS-E4301`（§28.3 定案為語意延伸：「無法產生匯出檔案或診斷包」）。工作階段結束或逾時沿用 `KRS-E6010`（`details.reason = "session_expired"`，§28.3 定案）。啟動時的設定檔錯誤仍只印出訊息與結束代碼 3（代碼只在 `--check-config` 中顯示）。
 
 ### 量測
 

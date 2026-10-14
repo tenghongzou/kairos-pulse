@@ -763,7 +763,7 @@ pub fn execute(
                 ),
                 UsersAction::ResetMfa(_) => confirm_l1(
                     &format!(
-                        "即將重設「{}」的二階段驗證（TOTP 與復原碼一併刪除，下次登入只需要密碼，之後可重新綁定）",
+                        "即將重設「{}」的兩步驟驗證（TOTP 與復原碼一併刪除，下次登入只需要密碼，之後可重新綁定）",
                         u.username
                     ),
                     &format!("kairos users reset-mfa {name}"),
@@ -797,7 +797,7 @@ pub fn execute(
                         Ok(())
                     } else {
                         match io.ask(&format!(
-                            "即將刪除使用者「{}」\n影響：\n  • 角色指派、二階段驗證一併刪除，所有工作階段結束，擁有的 API token 撤銷。\n  • 稽核紀錄保留。這個操作無法復原。\n請輸入帳號「{}」以確認（按 Ctrl+C 取消）：",
+                            "即將刪除使用者「{}」\n影響：\n  • 角色指派、兩步驟驗證一併刪除，所有工作階段結束，擁有的 API token 撤銷。\n  • 稽核紀錄保留。這個操作無法復原。\n請輸入帳號「{}」以確認（按 Ctrl+C 取消）：",
                             u.username, u.username
                         )) {
                             Some(a) if a.trim().eq_ignore_ascii_case(&u.username) => Ok(()),
@@ -919,7 +919,7 @@ pub fn execute(
                 UsersAction::Enable(_) => format!("已啟用「{}」", u.username),
                 UsersAction::Delete(_) => format!("已刪除「{}」", u.username),
                 UsersAction::Unlock(_) => format!("已解除「{}」的鎖定", u.username),
-                UsersAction::ResetMfa(_) => format!("已重設「{}」的二階段驗證", u.username),
+                UsersAction::ResetMfa(_) => format!("已重設「{}」的兩步驟驗證", u.username),
                 UsersAction::EndSessions(_) => {
                     format!("已結束 {} 的所有工作階段（{ended} 個）", u.username)
                 }

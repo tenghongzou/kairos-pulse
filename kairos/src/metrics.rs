@@ -20,10 +20,11 @@ use crate::bus::{BusEvent, DisconnectReason, EventBus, EventKind};
 use crate::shutdown::Shutdown;
 use crate::tls::RejectionReason;
 
-/// 斷線（離線）原因的標籤值，順序與 [`offline_index`] 相同
+/// 斷線（離線）原因的標籤值，順序與 [`offline_index`] 相同。與事件匯流排、告警與 Webhook 的
+/// `offline_reason` 固定代碼相同（[`DisconnectReason::as_str`]；設計包 `decisions/INTEGRATION.md` §28.5 #4）
 pub const OFFLINE_REASONS: [&str; 5] = [
-    "timeout",
-    "connection_closed",
+    "idle_timeout",
+    "agent_closed",
     "server_shutdown",
     "certificate_rejected",
     "write_unknown",
@@ -416,6 +417,19 @@ mod tests {
         assert_eq!(m.superseded.get(), 1);
         assert_eq!(m.registry_evictions.get(), 1);
         assert_eq!(m.agent_auth_failed.get(), 1);
+    }
+
+    #[test]
+    fn offline_reason_labels_match_the_bus_codes() {
+        for r in [
+            DisconnectReason::IdleTimeout,
+            DisconnectReason::AgentClosed,
+            DisconnectReason::ServerShutdown,
+            DisconnectReason::CertificateRejected,
+            DisconnectReason::WriteUnknown,
+        ] {
+            assert_eq!(OFFLINE_REASONS[offline_index(r).unwrap()], r.as_str());
+        }
     }
 
     #[test]

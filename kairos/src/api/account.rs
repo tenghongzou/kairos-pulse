@@ -1,4 +1,4 @@
-//! 登入、二階段驗證、登出與個人設定（`kairos/API.md` 第 12.2～12.4 節；設計包 S01、S23、D25）。
+//! 登入、兩步驟驗證、登出與個人設定（`kairos/API.md` 第 12.2～12.4 節；設計包 S01、S23、D25）。
 //!
 //! | 方法與路徑 | 說明 |
 //! |---|---|
@@ -693,7 +693,7 @@ pub async fn login_mfa(
     if let Err(retry) = ctx.auth.failures.check(ip, Instant::now()) {
         return Err(ApiError::rate_limited(retry));
     }
-    ctx.auth.note_failure(ip, "二階段驗證嘗試");
+    ctx.auth.note_failure(ip, "兩步驟驗證嘗試");
     let r = login_mfa_charged(ctx, peer, req, now).await;
     if r.as_ref().err().is_none_or(|e| !counts_as_attempt(e)) {
         ctx.auth.failures.refund(ip, Instant::now());
@@ -1134,7 +1134,7 @@ async fn verify_current_password(
     if user.source != SOURCE_LOCAL {
         return Err(ApiError::conflict(
             "directory_account",
-            "目錄服務帳號的密碼與二階段驗證由目錄服務（AD）管理",
+            "目錄服務帳號的密碼與兩步驟驗證由目錄服務（AD）管理",
         ));
     }
     if let Some(until) = user.locked_until.filter(|t| *t > now_ms) {
@@ -1304,7 +1304,7 @@ async fn totp_action(
             if user.totp_enabled_at.is_some() {
                 return Err(ApiError::conflict(
                     "mfa_already_enabled",
-                    "已啟用二階段驗證；要更換時先停用",
+                    "已啟用兩步驟驗證；要更換時先停用",
                 ));
             }
             let secret = totp::generate_secret().map_err(|_| ApiError::internal())?;
@@ -1383,7 +1383,7 @@ async fn totp_action(
             let pw = str_field(&b, "password").unwrap_or("").to_string();
             let code = str_field(&b, "code").unwrap_or("").to_string();
             verify_current_password(ctx, uid, username, pw, ip, now_ms).await?;
-            // 停用也需要目前的驗證碼（或一組復原碼）：只拿到密碼的人不能關掉二階段驗證
+            // 停用也需要目前的驗證碼（或一組復原碼）：只拿到密碼的人不能關掉兩步驟驗證
             if !second_factor_ok(ctx, &key, uid, &code, now_ms).await? {
                 ctx.auth.note_failure(ip, "停用 TOTP 的驗證碼不正確");
                 return Err(bad_mfa());

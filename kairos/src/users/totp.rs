@@ -1,4 +1,4 @@
-//! TOTP 二階段驗證（RFC 6238：HMAC-SHA1、30 秒、6 位數；設計包 S01 第二步、S02、S16、S23）與
+//! TOTP 兩步驟驗證（RFC 6238：HMAC-SHA1、30 秒、6 位數；設計包 S01 第二步、S02、S16、S23）與
 //! 10 組一次性的復原碼。
 //!
 //! - 秘密為 20 bytes 的 CSPRNG 隨機值；資料庫中以主控台金鑰加密保存（[`super::secrets::ConsoleKey::seal`]）。

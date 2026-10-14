@@ -20,14 +20,17 @@ use std::time::Duration;
 
 use crate::config::{AppConfig, DEFAULT_CONFIG_FILE, StorageBackend};
 
-/// 錯誤代碼：設定檔無法載入（語法、型別錯誤或檔案不存在）。設計包只有 Pulse 的 `PLS-E0101`，
-/// 這裡先用對應的 Kairos 編號〔暫定〕
+/// 錯誤代碼：設定檔語法或型別錯誤（設計包 `decisions/INTEGRATION.md` §28.3；類比 `PLS-E0101`）
 pub const CODE_CONFIG_LOAD: &str = "KRS-E0101";
+/// `--config` 指定的設定檔不存在（§28.3；類比 `PLS-E0401`）
+pub const CODE_CONFIG_MISSING: &str = "KRS-E0401";
+/// 設定檔無法讀取：權限、I/O（§28.3；類比 `PLS-E0402`）
+pub const CODE_CONFIG_UNREADABLE: &str = "KRS-E0402";
 /// 設定值超出範圍
 pub const CODE_CONFIG_RANGE: &str = "KRS-E0201";
 /// 無法產生匯出檔案（`copywriting.md` §3.3 4301）
 pub const CODE_DIAG_FAILED: &str = "KRS-E4301";
-/// 診斷包內容已截斷（Pulse `PLS-W4302` 的對應〔暫定〕）
+/// 診斷包內容已截斷（§28.3；類比 `PLS-W4302`）
 pub const CODE_DIAG_TRUNCATED: &str = "KRS-W4302";
 
 /// 日誌收集的上限（與 `pulse diag` 相同，`cli-spec.md` §8.5）
@@ -281,6 +284,10 @@ pub fn check(path: Option<&Path>) -> CheckReport {
                 }
             } else if e.kind() == ErrorKind::InvalidInput {
                 CODE_CONFIG_RANGE
+            } else if e.kind() == ErrorKind::NotFound {
+                CODE_CONFIG_MISSING
+            } else if file.as_ref().is_some_and(|f| std::fs::read(f).is_err()) {
+                CODE_CONFIG_UNREADABLE
             } else {
                 CODE_CONFIG_LOAD
             };
@@ -1331,6 +1338,29 @@ mod tests {
         let r = check(Some(&bad));
         assert_eq!(r.checks[0].code, Some(CODE_CONFIG_LOAD));
         assert_eq!(r.exit_code(false), 3);
+        // 指定的設定檔不存在：KRS-E0401
+        let r = check(Some(&dir.join("no-such.toml")));
+        assert_eq!(r.checks[0].code, Some(CODE_CONFIG_MISSING));
+        assert_eq!(r.exit_code(false), 3);
+        // 無法讀取（權限）：KRS-E0402（以 root 執行時讀得到，略過）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.join("locked.toml");
+            std::fs::write(&locked, "").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&locked).is_err() {
+                let r = check(Some(&locked));
+                assert_eq!(
+                    r.checks[0].code,
+                    Some(CODE_CONFIG_UNREADABLE),
+                    "{}",
+                    r.render_text()
+                );
+                assert_eq!(r.exit_code(false), 3);
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         // 憑證錯誤：結束代碼 4
         std::fs::write(
             &bad,

@@ -319,7 +319,7 @@ fn operator_acknowledges_an_offline_alert_delivered_by_webhook_with_json_logs() 
         ("kairos_alert_channels{state=\"ok\"}", 1.0),
         ("kairos_agent_online_total", 1.0),
         (
-            "kairos_agent_disconnects_total{reason=\"connection_closed\"}",
+            "kairos_agent_disconnects_total{reason=\"agent_closed\"}",
             1.0,
         ),
     ] {

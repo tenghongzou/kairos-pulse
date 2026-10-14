@@ -7,7 +7,7 @@
 //! |---|---|
 //! | [`http`] | 回應本文、JSON 與錯誤格式、查詢參數 |
 //! | [`auth`]、[`tokens`] | API token 與工作階段的驗證、權限（`kairos api-token` 共用 token 的保存） |
-//! | [`account`] | 登入、二階段驗證、登出、個人設定（`/api/v1/auth/…`、`/api/v1/me/…`） |
+//! | [`account`] | 登入、兩步驟驗證、登出、個人設定（`/api/v1/auth/…`、`/api/v1/me/…`） |
 //! | [`users`] | 使用者與角色、目錄服務的群組對應、API token 的管理 |
 //! | [`audit_log`] | 稽核日誌的查詢、匯出與完整性驗證 |
 //! | [`enroll`] | 註冊與 PKI 的管理端點 |
