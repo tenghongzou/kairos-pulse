@@ -49,7 +49,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 
 Kairos 執行中把 `kairos.db` 刪除或替換時（Unix 上以裝置與 inode 比對，與 JSONL 的 `needs_reopen` 相同），下一批寫入前記 `WARN` 並建立新的資料庫，不會寫進已刪除的檔案後回 `ack`；記憶體中尚未寫出的彙總一併捨棄。
 
-## 3. Schema（v3）
+## 3. Schema（v4）
 
 `PRAGMA application_id = 0x4B525331`（「KRS1」），`PRAGMA user_version` 為 schema 版本。時間一律為 Unix 毫秒（彙總的 `bucket` 為 Unix 秒），UTC。
 
@@ -169,7 +169,8 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - 檔案存在但 `application_id` 不是 Kairos、又有其他資料表時拒絕使用（例如 `storage.data_dir` 指錯）。
 - 新增欄位或資料表時加一個遷移，不修改既有遷移的內容。**升級 Kairos 前先備份**（第 9 節）：遷移後的資料庫無法給舊版使用。
 - 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）、v3（0.4：`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`，主控台 API 使用）。`kairos reports import`、`kairos api-token` 開啟資料庫時同樣會升級 schema；升級到 v3 之後 0.3 的 Kairos 無法開啟（降版請從升級前的備份還原）。
-- 規劃中：v4（0.5.0〔草稿〕，衝刺 4）新增註冊通道與 PKI 的資料表（`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_cas`、`pki_crls`、`enroll_replay`、`settings`、`audit_events` 等）與 `hosts` 的生命週期欄位，規格見 [`PKI.md`](PKI.md) 第 7 節；實作後併入第 3 節。
+- v4（0.5.0〔草稿〕，衝刺 4）：註冊通道與 PKI 的資料表 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，以及 `hosts` 的 `lifecycle`、`decommissioned_at`、`decommissioned_by`、`current_serial`、`grace_override_until`、`expired_seen_at`、`last_grace_attempt` 與索引 `hosts_hostname`。完整的 SQL 與保存期限見 [`PKI.md`](PKI.md) 第 7、13 節（`store/sqlite.rs` 的 `SCHEMA_V4`）。升級到 v4 之後 0.4 的 Kairos 無法開啟；`kairos enroll-token`、`kairos enroll`、`kairos pki`、`kairos config` 開啟資料庫時同樣會升級 schema。
+- 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
 
@@ -344,6 +345,8 @@ systemctl start kairos
 ```
 
 備份檔是完整的 Kairos 資料庫，可以直接啟動；備份之後收到的 report 不在其中。`agents.json` 不需要備份（啟動時由清冊重建）。
+
+**PKI 的檔案**（0.5.0 起，線上簽發時）：`data/pki/issuing-<ca_id>.key` 是簽發 CA 的私鑰，**不在資料庫備份中**；遺失時舊簽發 CA 簽發的憑證仍有效，但無法再為它產生 CRL（處置見 `PKI.md` 第 4 節「私鑰遺失」）。以加密的方式另外備份 `data/pki/`（例如 `tar -C /opt/kairos/data -cf - pki | gpg -c > pki-$(date +%F).tar.gpg`），還原時保持擁有者為 `kairos`、權限 0700／0600；`issuing-cas.pem` 與 `crl/` 由 Kairos 依資料庫重新寫出，不需備份。
 
 **JSONL 匯出**（給原本讀取 `reports-*.jsonl` 的工具）：`kairos reports export --since 1d [--agent <agent_id>] > reports.jsonl`，每行的格式與 JSONL 檔相同（`schema` 1／2；`peer`、`hostname` 為清冊中最後的值）。未指定 `--agent` 時會掃描整個 `reports` 表。
 
