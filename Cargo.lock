@@ -458,8 +458,11 @@ dependencies = [
 name = "kp-e2e"
 version = "0.0.0"
 dependencies = [
+ "kairos-proto",
+ "rcgen",
  "rustls",
  "serde_json",
+ "time",
 ]
 
 [[package]]
