@@ -400,9 +400,23 @@ fn install_info(
         _ => server.to_string(),
     };
     let s = kairos_proto::enroll::normalize_endpoint(&agent).ok();
-    let e = (!adv.is_empty())
-        .then(|| kairos_proto::enroll::normalize_endpoint(adv).ok())
-        .flatten();
+    // 註冊端點：advertise，沒有時為 enroll.listen（與主控台 API 相同）；等於「s 的主機:8444」時省略
+    let enroll_endpoint = if adv.is_empty() {
+        config.enroll.listen_addr(server)
+    } else {
+        adv.to_string()
+    };
+    let derived = s.as_ref().and_then(|s| {
+        kairos_proto::enroll::normalize_endpoint(&format!(
+            "{}:{}",
+            kairos_proto::enroll::endpoint_host(s),
+            kairos_proto::enroll::DEFAULT_ENROLL_PORT
+        ))
+        .ok()
+    });
+    let e = kairos_proto::enroll::normalize_endpoint(&enroll_endpoint)
+        .ok()
+        .filter(|e| Some(e) != derived.as_ref());
     let install = s.and_then(|s| {
         kairos_proto::enroll::InstallString {
             s,
