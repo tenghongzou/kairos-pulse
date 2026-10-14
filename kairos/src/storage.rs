@@ -223,6 +223,9 @@ pub struct WriteRequest {
 pub struct PendingWrite {
     result: oneshot::Receiver<WriteStatus>,
     ticket: WriteTicket,
+    /// 放入佇列的時間與統計（收到結果時記錄 `ack` 延遲）
+    submitted: std::time::Instant,
+    stats: Arc<crate::stats::WriteStats>,
 }
 
 /// 等待寫入的結果
@@ -242,7 +245,10 @@ impl PendingWrite {
     /// 等待寫入結果。可安全地被逾時中斷，之後可再次呼叫。
     pub async fn wait(&mut self) -> WriteStatus {
         match (&mut self.result).await {
-            Ok(status) => status,
+            Ok(status) => {
+                self.stats.ack_latency.observe(self.submitted.elapsed());
+                status
+            }
             Err(_) if self.ticket.is_claimed() => {
                 WriteStatus::Unknown("report 寫入工作未回覆即結束".to_string())
             }
@@ -461,6 +467,25 @@ pub fn results_after_failure(
         .collect()
 }
 
+/// 寫入佇列的深度（[`ReportSink::queue_probe`]）
+#[derive(Debug, Clone)]
+pub struct QueueProbe {
+    tx: mpsc::WeakSender<WriteRequest>,
+    capacity: usize,
+}
+
+impl QueueProbe {
+    /// 佇列中的筆數；writer 已停止（所有 sender 都已釋放）時為 `None`
+    pub fn depth(&self) -> Option<usize> {
+        let tx = self.tx.upgrade()?;
+        Some(tx.max_capacity() - tx.capacity())
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 /// 送往 writer task 的 handle
 #[derive(Debug, Clone)]
 pub struct ReportSink {
@@ -492,6 +517,14 @@ impl ReportSink {
         self.tx.max_capacity() - self.tx.capacity()
     }
 
+    /// 不阻止 writer 結束的佇列深度讀取（`/metrics`）：只持有弱參照，關機時不延後 writer 的結束
+    pub fn queue_probe(&self) -> QueueProbe {
+        QueueProbe {
+            tx: self.tx.downgrade(),
+            capacity: self.tx.max_capacity(),
+        }
+    }
+
     /// 放入佇列（佇列滿時等待），回傳可等待結果的 [`PendingWrite`]。
     /// 佇列已關閉（writer 已停止）時回傳 `Err`。在放入前被逾時中斷時，這筆不會進入佇列。
     ///
@@ -500,6 +533,7 @@ impl ReportSink {
     pub async fn submit(&self, record: ReportRecord) -> Result<PendingWrite, String> {
         let (reply, result) = oneshot::channel();
         let ticket = WriteTicket::default();
+        let submitted = std::time::Instant::now();
         self.tx
             .send(WriteRequest {
                 record,
@@ -508,7 +542,12 @@ impl ReportSink {
             })
             .await
             .map_err(|_| "report 寫入工作已停止".to_string())?;
-        Ok(PendingWrite { result, ticket })
+        Ok(PendingWrite {
+            result,
+            ticket,
+            submitted,
+            stats: self.stats.clone(),
+        })
     }
 
     /// 不等待結果、佇列滿時不等待地放入一筆（JSONL 鏡像用）；放不進去時回傳 `false`

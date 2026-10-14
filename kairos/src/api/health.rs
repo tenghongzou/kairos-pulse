@@ -61,15 +61,15 @@ pub struct Health {
 
 /// 資料庫的數值（唯讀連線取得）
 #[derive(Debug, Default)]
-struct DbStats {
-    used_bytes: u64,
-    page_size: u64,
-    capacity: Option<CapacityEvent>,
-    retention: Option<RetentionRun>,
-    guard: Option<date_guard::GuardState>,
+pub(crate) struct DbStats {
+    pub(crate) used_bytes: u64,
+    pub(crate) page_size: u64,
+    pub(crate) capacity: Option<CapacityEvent>,
+    pub(crate) retention: Option<RetentionRun>,
+    pub(crate) guard: Option<date_guard::GuardState>,
 }
 
-fn read_db_stats(conn: &rusqlite::Connection) -> rusqlite::Result<DbStats> {
+pub(crate) fn read_db_stats(conn: &rusqlite::Connection) -> rusqlite::Result<DbStats> {
     let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0));
     let page_size = pragma("page_size")?;
     let pages = pragma("page_count")? - pragma("freelist_count")?;

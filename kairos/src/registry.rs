@@ -503,9 +503,19 @@ impl Registry {
         if !inner.agents.contains_key(info.agent_id.as_str())
             && inner.agents.len() >= self.max_agents
         {
-            evicted = Some(inner.evict_oldest_offline(now).ok_or(RegistryFull {
-                max_agents: self.max_agents,
-            })?);
+            let m = crate::metrics::global();
+            match inner.evict_oldest_offline(now) {
+                Some(e) => {
+                    m.registry_evictions.inc();
+                    evicted = Some(e);
+                }
+                None => {
+                    m.registry_full.inc();
+                    return Err(RegistryFull {
+                        max_agents: self.max_agents,
+                    });
+                }
+            }
         }
         let (tx, rx) = oneshot::channel();
         let fingerprint =
@@ -527,11 +537,15 @@ impl Registry {
                 let kind = match prev.kick.take() {
                     // 舊連線仍在：通知它被取代。接收端已結束時 send 會失敗，可忽略。
                     Some(kick) => {
+                        crate::metrics::global().superseded.inc();
                         let _ = kick.send(KickReason::Superseded);
                         RegisterKind::Superseded { previous_conn_id }
                     }
                     // 舊連線已被通知結束（例如憑證被拒）但尚未關閉：同樣是取代，只是不必再通知
-                    None if prev.connected => RegisterKind::Superseded { previous_conn_id },
+                    None if prev.connected => {
+                        crate::metrics::global().superseded.inc();
+                        RegisterKind::Superseded { previous_conn_id }
+                    }
                     None => RegisterKind::Reconnected,
                 };
                 (

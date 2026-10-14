@@ -29,6 +29,8 @@ pub mod tokens;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
+mod probe_tests;
+#[cfg(test)]
 mod tests;
 
 use chrono::{DateTime, Utc};
@@ -99,6 +101,8 @@ pub struct ApiContext {
     pub console_listen: SocketAddr,
     /// 註冊服務（SQLite 時；註冊與 PKI 的管理端點使用）
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    /// `/healthz`、`/readyz`、`/metrics`（`observability.on_console` 時在主控台的監聽上提供）
+    pub obs: Option<Arc<crate::probe::ObsContext>>,
 }
 
 impl ApiContext {
@@ -125,6 +129,7 @@ pub struct StartParams {
     pub shutdown: Arc<Shutdown>,
     pub agent_listen: SocketAddr,
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    pub obs: Option<Arc<crate::probe::ObsContext>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -290,6 +295,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         agent_listen: p.agent_listen,
         console_listen: local_addr,
         enroll: p.enroll.clone(),
+        obs: p.obs.clone().filter(|_| p.config.observability.on_console),
     });
     ctx.hosts.load_known(known);
 
@@ -448,6 +454,18 @@ async fn handle(
     let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // 健康檢查與 Prometheus（審計 O3）：不經過 API token 的驗證，規則見 crate::probe
+    if let Some(obs) = &ctx.obs
+        && crate::probe::is_probe_path(&path)
+    {
+        let auth = req
+            .headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let resp = crate::probe::handle(obs, &method, &path, req.uri().query(), auth, peer).await;
+        crate::metrics::global().api_request(&path, resp.status().as_u16());
+        return resp;
+    }
     // 註冊與 PKI 的管理端點（API.md 第 11 節；含寫入）
     if path.starts_with("/api/v1/enroll/")
         || path.starts_with("/api/v1/pki/")
@@ -455,6 +473,7 @@ async fn handle(
         || path.starts_with("/api/v1/settings/")
     {
         let resp = enroll::handle(ctx.clone(), peer, req).await;
+        crate::metrics::global().api_request(&path, resp.status().as_u16());
         debug!(
             "主控台 {} {} {} → {}（{:.1} ms）",
             peer.ip(),
@@ -469,6 +488,7 @@ async fn handle(
         Ok((resp, who)) => (resp, who),
         Err(e) => (e.into_response(Utc::now()), None),
     };
+    crate::metrics::global().api_request(&path, resp.status().as_u16());
     debug!(
         "主控台 {} {} {} → {}（{:.1} ms{}）",
         peer.ip(),

@@ -122,6 +122,21 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         .unwrap(),
     ));
     let shutdown = Arc::new(Shutdown::new());
+    let obs = crate::probe::ObsContext::new(crate::probe::ObsParams {
+        config: Arc::new(config.clone()),
+        registry: registry.clone(),
+        reports: storage.reports.clone(),
+        per_ip: crate::per_ip::PerIpLimiter::with_policy(
+            crate::per_ip::PerIpPolicy::from_config(&config).unwrap(),
+        ),
+        tls: agent_tls.clone(),
+        enroll: None,
+        shutdown: shutdown.clone(),
+        db_path: Some(SqliteOptions::from_config(&config, &paths.data_dir).path),
+    })
+    .unwrap();
+    obs.agent_listening
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let console = match start(StartParams {
         config: Arc::new(config.clone()),
         config_file: None,
@@ -133,6 +148,7 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         shutdown: shutdown.clone(),
         agent_listen: "127.0.0.1:8080".parse().unwrap(),
         enroll: None,
+        obs: Some(Arc::new(obs)),
     })
     .await
     {

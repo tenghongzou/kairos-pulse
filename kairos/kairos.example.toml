@@ -40,6 +40,24 @@ allow_unauthenticated = false # false：未設定 client_ca 又監聽非 loopbac
 [log]
 level = "info"
 retention_days = 14           # logs/kairos-YYYY-MM-DD.log（UTC 日期）保留天數，0 = 永久保留，上限 3650
+format = "text"               # text：2026-10-14T14:22:16.123+08:00 [WARN] 訊息（RFC 3339 帶時區）；
+                              # json：一行一個 JSON（UTC），檔名改為 logs/kairos-YYYY-MM-DD.jsonl，固定欄位 v、ts、level、
+                              #       event、code、msg、product、host、run_id、seq、target、fields（README「日誌」）；
+                              # legacy：0.5 以前的格式（2026-10-14 14:22:16 [WARN] 訊息，本地時間不帶時區），過渡用
+timezone = "local"            # text 的時間：local（本機時區）或 utc；json 一律 UTC，legacy 一律本機時間
+stdout = true                 # 同時寫到 stdout（以 systemd 執行時進 journal）；只要日誌檔一份時設為 false
+
+[log.syslog]                  # 外送到 syslog（RFC 5424）；預設不外送
+target = ""                   # udp://主機:埠（預設 514）、tcp://主機:埠（預設 601，RFC 6587 octet counting）、unix:///dev/log
+facility = "daemon"           # daemon、user、auth、authpriv、local0～local7
+app_name = "kairos"           # RFC 5424 的 APP-NAME
+payload = "text"              # text：訊息文字；json：與 format = "json" 相同的一行 JSON（SIEM 依 event、code 欄位判斷）
+
+[observability]               # /healthz、/readyz、/metrics（README「健康檢查與 Prometheus」）
+listen = ""                   # 另外以純 HTTP 監聽這三個端點，例如 "127.0.0.1:9464"；空字串＝只在主控台的監聽上提供
+on_console = true             # 主控台的監聽（console.listen，HTTPS）也提供這三個端點
+metrics_token_file = ""       # /metrics 的 bearer token 檔（一行，至少 16 個字元，例如 openssl rand -hex 32 > metrics.token）；
+                              # 未設定時 /metrics 只接受 loopback 來源。/healthz、/readyz 不需要認證，只回傳狀態字
 
 [console]                     # 主控台 API（HTTPS，/api/v1，見 API.md）；需要 storage.backend = "sqlite"
 enabled = true                # false：不監聽主控台連接埠
