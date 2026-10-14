@@ -13,6 +13,7 @@ mod integration_tests;
 mod logger;
 mod monitor;
 mod per_ip;
+mod pki;
 mod protocol;
 mod rate;
 mod registry;
@@ -563,13 +564,18 @@ fn parse_nofile_soft_limit(limits: &str) -> Option<u64> {
 /// soft limit 低於需要量（`server.max_connections` ＋ 主控台的連線上限 ＋ 預留，設計包 §24 #18、D21）
 /// 時的警告訊息（D4：具體指出建議做法）；足夠時回傳 `None`
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn fd_limit_warning(soft: u64, max_connections: usize, console_connections: u64) -> Option<String> {
-    let needed = max_connections as u64 + console_connections + FD_RESERVE;
+fn fd_limit_warning(
+    soft: u64,
+    max_connections: usize,
+    console_connections: u64,
+    enroll_connections: u64,
+) -> Option<String> {
+    let needed = max_connections as u64 + console_connections + enroll_connections + FD_RESERVE;
     if soft >= needed {
         return None;
     }
     let suggested = suggested_nofile(needed);
-    let reserve = console_connections + FD_RESERVE;
+    let reserve = console_connections + enroll_connections + FD_RESERVE;
     let lower = if soft > reserve {
         format!(
             "；或將 server.max_connections 調低至 {} 以下（= 目前上限 {} − 預留 {}）",
@@ -580,11 +586,16 @@ fn fd_limit_warning(soft: u64, max_connections: usize, console_connections: u64)
     } else {
         String::new()
     };
-    let console = if console_connections > 0 {
+    let mut console = if console_connections > 0 {
         format!("、主控台的連線上限（console.max_connections {console_connections}）")
     } else {
         String::new()
     };
+    if enroll_connections > 0 {
+        console.push_str(&format!(
+            "、註冊端點的連線上限（enroll.max_connections {enroll_connections}）"
+        ));
+    }
     Some(format!(
         "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）{}加上預留的 {}（共 {}）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE={}，手動執行時先執行 ulimit -n {}{}",
         soft, max_connections, console, FD_RESERVE, needed, suggested, suggested, lower
@@ -611,8 +622,10 @@ fn warn_if_fd_limit_low(config: &AppConfig) {
     } else {
         0
     };
+    let enroll = config.extra_connections() - console;
     if let Some(soft) = nofile_soft_limit()
-        && let Some(message) = fd_limit_warning(soft, config.server.max_connections, console)
+        && let Some(message) =
+            fd_limit_warning(soft, config.server.max_connections, console, enroll)
     {
         warn!("{}", message);
     }
@@ -1064,22 +1077,22 @@ Max open files            1024                 524288               files     \n
     #[test]
     fn fd_limit_warning_suggests_concrete_fixes() {
         // D4：Ubuntu 預設 soft 1024、範例設定 max_connections = 1024（停用主控台時與 0.3 相同）
-        let message = fd_limit_warning(1024, 1024, 0).unwrap();
+        let message = fd_limit_warning(1024, 1024, 0, 0).unwrap();
         assert_eq!(
             message,
             "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 1024，低於 server.max_connections（1024）加上預留的 64（共 1088）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE=4096，手動執行時先執行 ulimit -n 4096；或將 server.max_connections 調低至 960 以下（= 目前上限 1024 − 預留 64）"
         );
         // D21：主控台的連線上限計入需要量
-        let message = fd_limit_warning(1100, 1024, 64).unwrap();
+        let message = fd_limit_warning(1100, 1024, 64, 0).unwrap();
         assert!(message.contains("console.max_connections 64"), "{message}");
         assert!(message.contains("（共 1152）"), "{message}");
         assert!(message.contains("調低至 972 以下"), "{message}");
-        assert_eq!(fd_limit_warning(1152, 1024, 64), None);
+        assert_eq!(fd_limit_warning(1152, 1024, 64, 0), None);
         // 足夠時不警告
-        assert_eq!(fd_limit_warning(1088, 1024, 0), None);
-        assert_eq!(fd_limit_warning(u64::MAX, 65535, 4096), None);
+        assert_eq!(fd_limit_warning(1088, 1024, 0, 0), None);
+        assert_eq!(fd_limit_warning(u64::MAX, 65535, 4096, 0), None);
         // 需要量較大時建議值隨之提高；soft 小於預留量時不建議調低 max_connections
-        let message = fd_limit_warning(32, 10_000, 64).unwrap();
+        let message = fd_limit_warning(32, 10_000, 64, 0).unwrap();
         assert!(message.contains("LimitNOFILE=16384"), "{message}");
         assert!(!message.contains("調低"), "{message}");
     }

@@ -170,6 +170,187 @@ ALTER TABLE hosts ADD COLUMN cert_rejected_at INTEGER;
 ALTER TABLE hosts ADD COLUMN cert_rejection TEXT;
 ";
 
+/// schema v4（0.5）：註冊通道（8444）與 PKI（`kairos/PKI.md` 第 7 節、`crates/kairos-proto/ENROLL.md`）。
+/// 與 PKI.md 的差異：`enroll_requests` 另有 `cert_lifetime_days`（核准時指定或 token 的有效天數）、
+/// `issue_error`（最近一次簽發失敗的原因）與 `(source_ip, state)` 索引（動態 `poll_after_ms` 依同一來源的
+/// 待核准筆數計算）；`hosts` 另有 `decommissioned_by`（除役來源）
+const SCHEMA_V4: &str = "
+CREATE TABLE pki_cas (
+    ca_id        INTEGER PRIMARY KEY,
+    subject      TEXT NOT NULL,
+    spki_sha256  BLOB NOT NULL UNIQUE,
+    cert_der     BLOB,
+    not_before   INTEGER,
+    not_after    INTEGER,
+    key_file     TEXT,
+    state        TEXT NOT NULL,
+    next_crl_number INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL,
+    retired_at   INTEGER
+);
+
+CREATE TABLE enroll_tokens (
+    token_id       TEXT PRIMARY KEY,
+    secret_hash    BLOB NOT NULL UNIQUE,
+    hint           TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    group_name     TEXT NOT NULL,
+    tags           TEXT,
+    approval       TEXT NOT NULL,
+    max_uses       INTEGER NOT NULL,
+    used           INTEGER NOT NULL DEFAULT 0,
+    expires_at     INTEGER NOT NULL,
+    allowed_cidrs  TEXT,
+    batch_mode     INTEGER NOT NULL DEFAULT 0,
+    allowed_agent_ids TEXT,
+    cert_lifetime_days INTEGER,
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    disabled_at    INTEGER,
+    disabled_by    TEXT,
+    disable_reason TEXT,
+    last_used_at   INTEGER
+) WITHOUT ROWID;
+
+CREATE TABLE enroll_requests (
+    request_id     TEXT PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    agent_id       TEXT NOT NULL,
+    request_code   TEXT NOT NULL,
+    state          TEXT NOT NULL,
+    csr_der        BLOB NOT NULL,
+    csr_sha256     BLOB NOT NULL,
+    spki_sha256    BLOB NOT NULL,
+    poll_secret_hash BLOB,
+    token_id       TEXT,
+    expired_serial TEXT,
+    previous_serial TEXT,
+    source_ip      TEXT NOT NULL,
+    hostname       TEXT NOT NULL,
+    display_name   TEXT,
+    tags           TEXT,
+    os             TEXT,
+    host_fingerprint TEXT,
+    pulse_version  TEXT,
+    server_verification TEXT,
+    flags          TEXT,
+    cert_lifetime_days INTEGER,
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    decided_at     INTEGER,
+    decided_by     TEXT,
+    reject_reason_code TEXT,
+    reject_reason  TEXT,
+    issued_serial  TEXT,
+    issue_error    TEXT,
+    delivered_at   INTEGER,
+    withdrawn_at   INTEGER,
+    withdraw_reason TEXT,
+    withdraw_initiated_by TEXT,
+    withdraw_ip    TEXT,
+    closed_at      INTEGER
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX enroll_requests_csr ON enroll_requests (agent_id, csr_sha256);
+CREATE INDEX enroll_requests_state ON enroll_requests (state, created_at);
+CREATE INDEX enroll_requests_agent ON enroll_requests (agent_id);
+CREATE INDEX enroll_requests_code ON enroll_requests (request_code);
+CREATE INDEX enroll_requests_token ON enroll_requests (token_id);
+CREATE INDEX enroll_requests_source ON enroll_requests (source_ip, state);
+
+CREATE TABLE pki_certificates (
+    serial         TEXT NOT NULL UNIQUE,
+    ca_id          INTEGER,
+    agent_id       TEXT NOT NULL,
+    spki_sha256    BLOB NOT NULL,
+    not_before     INTEGER NOT NULL,
+    not_after      INTEGER NOT NULL,
+    cert_der       BLOB NOT NULL,
+    issued_at      INTEGER NOT NULL,
+    issued_via     TEXT NOT NULL,
+    request_id     TEXT,
+    approved_by    TEXT,
+    first_used_at  INTEGER,
+    revoked_at     INTEGER,
+    revoke_effective_at INTEGER,
+    revocation_reason TEXT,
+    revoked_by     TEXT,
+    revoke_comment TEXT,
+    crl_number     INTEGER
+);
+CREATE INDEX pki_certificates_agent ON pki_certificates (agent_id, issued_at);
+CREATE INDEX pki_certificates_not_after ON pki_certificates (not_after);
+CREATE INDEX pki_certificates_pending_crl ON pki_certificates (ca_id, revoke_effective_at)
+    WHERE revoked_at IS NOT NULL;
+
+CREATE TABLE pki_crls (
+    ca_id          INTEGER NOT NULL,
+    crl_number     INTEGER NOT NULL,
+    this_update    INTEGER NOT NULL,
+    next_update    INTEGER NOT NULL,
+    revoked_count  INTEGER NOT NULL,
+    der            BLOB NOT NULL,
+    source         TEXT NOT NULL,
+    created_by     TEXT,
+    PRIMARY KEY (ca_id, crl_number)
+) WITHOUT ROWID;
+
+CREATE TABLE enroll_replay (
+    key            BLOB PRIMARY KEY,
+    expires_at     INTEGER NOT NULL,
+    agent_id       TEXT NOT NULL,
+    first_seen_at  INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX enroll_replay_expires ON enroll_replay (expires_at);
+
+CREATE TABLE enroll_blocks (
+    source         TEXT NOT NULL,
+    class          TEXT NOT NULL,
+    blocked_until  INTEGER NOT NULL,
+    offenses       INTEGER NOT NULL,
+    last_offense_at INTEGER NOT NULL,
+    PRIMARY KEY (source, class)
+) WITHOUT ROWID;
+
+CREATE TABLE enroll_relaxations (
+    id             INTEGER PRIMARY KEY,
+    cidr           TEXT NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL,
+    created_by     TEXT NOT NULL,
+    reason         TEXT NOT NULL
+);
+
+CREATE TABLE settings (
+    key            TEXT PRIMARY KEY,
+    value          TEXT NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    updated_by     TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE audit_events (
+    id             INTEGER PRIMARY KEY,
+    at             INTEGER NOT NULL,
+    actor          TEXT NOT NULL,
+    actor_ip       TEXT,
+    category       TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    object         TEXT,
+    result         TEXT NOT NULL,
+    code           TEXT,
+    details        TEXT
+);
+CREATE INDEX audit_events_at ON audit_events (at);
+CREATE INDEX audit_events_object ON audit_events (object);
+
+ALTER TABLE hosts ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE hosts ADD COLUMN decommissioned_at INTEGER;
+ALTER TABLE hosts ADD COLUMN decommissioned_by TEXT;
+ALTER TABLE hosts ADD COLUMN current_serial TEXT;
+ALTER TABLE hosts ADD COLUMN grace_override_until INTEGER;
+ALTER TABLE hosts ADD COLUMN expired_seen_at INTEGER;
+ALTER TABLE hosts ADD COLUMN last_grace_attempt TEXT;
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -184,10 +365,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: SCHEMA_V3,
     },
+    Migration {
+        version: 4,
+        sql: SCHEMA_V4,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";

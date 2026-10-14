@@ -428,15 +428,18 @@ dependencies = [
  "hyper-util",
  "kairos-proto",
  "log",
+ "rcgen",
  "ring",
  "rusqlite",
  "rustls-webpki",
  "serde",
  "serde_json",
  "subtle",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "x509-parser",
 ]
 
 [[package]]
