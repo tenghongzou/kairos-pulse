@@ -478,14 +478,14 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 { "server_time": "…", "data": {
   "agent_id": "6f1c…", "since": "2026-10-15T00:00:02.000Z", "persisted": false, "max_entries": 50,
   "entries": [
-    { "at": "2026-10-15T05:49:05.000Z", "event": "offline", "reason": "timeout", "ip": "10.30.3.27" },
+    { "at": "2026-10-15T05:49:05.000Z", "event": "offline", "reason": "idle_timeout", "ip": "10.30.3.27" },
     { "at": "2026-10-15T01:00:02.000Z", "event": "online", "reason": null, "ip": "10.30.3.27" }
   ]
 } }
 ```
 
 - 由狀態表的變化累積（與 SSE 的 `host.*` 同一個來源），新到舊，每台主機最多 50 筆、最多 2 萬台（超過時捨棄最久沒有變化的主機）。**只在記憶體中**：`since` 為 Kairos 這次啟動的時間，重新啟動後從頭記錄（`persisted: false`）。
-- `reason` 為第 5.2 節的 `offline_reason`。每次連線的建立時間、來源連接埠、持續時間與協定錯誤碼的完整、持久的連線紀錄（設計包 §24 #2）屬於之後的版本。
+- `reason` 為第 5.2 節的 `offline_reason`（新名稱；這個端點 0.7 才新增，不帶 `*_legacy`）。每次連線的建立時間、來源連接埠、持續時間與協定錯誤碼的完整、持久的連線紀錄（設計包 §24 #2）屬於之後的版本。
 
 ## 6. 即時變更推送（SSE）
 

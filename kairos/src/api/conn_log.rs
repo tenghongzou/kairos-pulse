@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(got[0].at.timestamp(), PER_HOST as i64 + 4);
         assert_eq!(got[0].ip.as_deref(), Some("10.0.0.5"));
         let offline = got.iter().find(|e| !e.online).unwrap();
-        assert_eq!(offline.reason, Some("timeout"));
+        assert_eq!(offline.reason, Some("idle_timeout"));
         assert_eq!(offline.json()["event"], "offline");
         assert!(log.get("b").is_empty());
     }

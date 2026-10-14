@@ -1243,7 +1243,7 @@ async fn facets_connections_and_certificate_summary() {
         .json();
     let entries = v["data"]["entries"].as_array().unwrap();
     assert_eq!(entries[0]["event"], "offline");
-    assert_eq!(entries[0]["reason"], "connection_closed");
+    assert_eq!(entries[0]["reason"], "agent_closed");
     assert_eq!(entries[1]["event"], "online");
     assert_eq!(entries[1]["ip"], "10.30.4.9");
     assert_eq!(v["data"]["persisted"], false);
@@ -1261,7 +1261,7 @@ async fn facets_connections_and_certificate_summary() {
     assert_eq!(v["data"]["version"]["values"][0]["value"], "0.3.0");
     assert_eq!(
         v["data"]["offline_reason"]["values"][0]["value"],
-        "connection_closed"
+        "agent_closed"
     );
     assert_eq!(v["data"]["no_group"]["count"], 2);
     assert_eq!(v["data"]["no_group"]["online"], 1);
