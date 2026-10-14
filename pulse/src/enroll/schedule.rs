@@ -32,6 +32,37 @@ pub const GRACE_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 pub const GRACE_EXCEEDED_RETRY: Duration = Duration::from_secs(6 * 3600);
 /// 服務啟動或剛偵測到過期時，過期續簽前的隨機延遲上限
 pub const GRACE_START_SPREAD: Duration = Duration::from_secs(120);
+
+/// e2e 測試掛鉤 `PULSE_TEST_GRACE_DELAY_SECS`：過期續簽的啟動分散上限與失敗後的退避都改為這個秒數
+/// （`tests/e2e` 不必等 0～120 秒與 2 分鐘起的退避）。**只在 debug 建置生效**，發佈用的 release
+/// 建置一律忽略
+fn grace_test_delay() -> Option<Duration> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("PULSE_TEST_GRACE_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(Duration::from_secs)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+/// 過期續簽開始前的隨機延遲上限（[`GRACE_START_SPREAD`]，或測試掛鉤的值）
+pub fn grace_start_spread() -> Duration {
+    grace_test_delay().unwrap_or(GRACE_START_SPREAD)
+}
+
+/// 過期續簽失敗後的退避（初始, 上限）（[`GRACE_BACKOFF_INITIAL`]／[`GRACE_BACKOFF_MAX`]，或測試掛鉤的值）
+pub fn grace_backoff() -> (Duration, Duration) {
+    match grace_test_delay() {
+        Some(d) => (d, d),
+        None => (GRACE_BACKOFF_INITIAL, GRACE_BACKOFF_MAX),
+    }
+}
 /// 8443 正常輪替失敗的退避
 pub const RENEW_BACKOFF_INITIAL: Duration = Duration::from_secs(3600);
 pub const RENEW_BACKOFF_MAX: Duration = Duration::from_secs(12 * 3600);

@@ -174,11 +174,8 @@ impl<'a> Driver<'a> {
     ) -> Self {
         let poller = (file.poll_floor_ms.is_some() || file.poll_interval_ms.is_some())
             .then(|| Poller::resume(file.poll_interval_ms, file.poll_floor_ms));
-        let grace_backoff = Exp::resume(
-            schedule::GRACE_BACKOFF_INITIAL,
-            schedule::GRACE_BACKOFF_MAX,
-            file.grace_backoff_ms,
-        );
+        let (grace_initial, grace_max) = schedule::grace_backoff();
+        let grace_backoff = Exp::resume(grace_initial, grace_max, file.grace_backoff_ms);
         Self {
             paths,
             file,

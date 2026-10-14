@@ -94,6 +94,16 @@ impl ApiError {
             Self::Network { code, .. } | Self::Trust { code, .. } => code,
             Self::Unsupported { .. } => codes::E_ENROLL_UNSUPPORTED,
             Self::Unexpected { .. } => codes::W_SERVER_UNEXPECTED,
+            // 路徑或方法不存在（ENROLL.md 錯誤碼表：server-info 時為 PLS-E2106；其他端點的處置見
+            // machine::decide，同樣是「不支援自動註冊」）
+            Self::Server(e)
+                if matches!(
+                    e.code,
+                    EnrollErrorCode::NotFound | EnrollErrorCode::MethodNotAllowed
+                ) =>
+            {
+                codes::E_ENROLL_UNSUPPORTED
+            }
             Self::Server(e) => e.code.pulse_code().unwrap_or(codes::W_SERVER_UNEXPECTED),
         }
     }

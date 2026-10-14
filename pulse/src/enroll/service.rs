@@ -191,16 +191,9 @@ async fn step_loop(
             }
         };
         match paths.load_enrollment() {
-            Ok(Some(f))
-                if f.request_id == started.request_id
-                    && f.csr == started.csr
-                    && f.kind == started.kind =>
-            {
+            Ok(Some(f)) if same_request(&f, &driver.file, &started) => {
                 // 同一筆申請：沿用磁碟上的版本（`pulse enroll` 可能已推進它）
                 driver.file = f;
-            }
-            Ok(Some(f)) if driver.file.request_id.is_none() && f.csr == started.csr => {
-                driver.file = f
             }
             _ => {
                 drop(lock);
@@ -216,6 +209,21 @@ async fn step_loop(
             Next::Done(Finish::Stopped { .. }) => return End::Stopped,
         }
     }
+}
+
+/// 磁碟上的 `enrollment.json`（`disk`）是否仍是這個迴圈處理中的同一筆申請：與 driver 目前的版本
+/// （`current`，driver 每次改變都會存檔）或開始時的版本（`started`）的 `request_id`、CSR、種類相同。
+///
+/// 只和開始時比對是不夠的：過期續簽開始時還沒有 CSR，第一步產生並存檔後，若第一次送出沒有成功
+/// （回應遺失、429、時鐘偏差、網路錯誤），下一輪會誤判為「被 `pulse enroll` 改變」而停止續簽。
+/// `pulse enroll` 取消或重新申請時 `request_id`／CSR 會與兩者都不同
+fn same_request(disk: &EnrollmentFile, current: &EnrollmentFile, started: &EnrollmentFile) -> bool {
+    let same = |a: &EnrollmentFile, b: &EnrollmentFile| {
+        a.request_id == b.request_id && a.csr == b.csr && a.kind == b.kind
+    };
+    same(disk, current)
+        || same(disk, started)
+        || (current.request_id.is_none() && disk.csr == started.csr)
 }
 
 /// 完成進行中的新註冊申請（送出、排隊重送、時鐘偏差重送、輪詢）
@@ -345,7 +353,7 @@ where
     );
     if fresh {
         // 服務啟動或剛偵測到過期：0～120 秒的隨機延遲（大量主機同時恢復時分散）
-        let spread = crate::backoff::random_spread(schedule::GRACE_START_SPREAD);
+        let spread = crate::backoff::random_spread(schedule::grace_start_spread());
         file.grace_next_attempt_at = Some(ke::format_rfc3339_ms(
             chrono::Utc::now().timestamp_millis() + i64::try_from(spread.as_millis()).unwrap_or(0),
         ));
@@ -709,6 +717,39 @@ mod tests {
 
     fn cfg() -> AppConfig {
         AppConfig::default_for_tests()
+    }
+
+    #[test]
+    fn step_loop_keeps_a_grace_renewal_after_its_csr_is_created() {
+        let started = EnrollmentFile {
+            kind: "grace_renewal".into(),
+            ..Default::default()
+        };
+        // 第一步產生 CSR 並存檔（尚未取得 request_id）：仍是同一筆
+        let mut current = started.clone();
+        current.csr = Some("csr-1".into());
+        let disk = current.clone();
+        assert!(same_request(&disk, &current, &started));
+        // Kairos 受理後有 request_id：仍是同一筆
+        current.request_id = Some("r-1".into());
+        assert!(same_request(&current.clone(), &current, &started));
+        // pulse enroll 改成另一筆申請（不同的 CSR 與 request_id）：已改變
+        let mut other = current.clone();
+        other.csr = Some("csr-2".into());
+        other.request_id = Some("r-2".into());
+        assert!(!same_request(&other, &current, &started));
+        // 新註冊：開始時就有 CSR，pulse enroll 推進同一筆（取得 request_id）
+        let mut new = EnrollmentFile {
+            kind: "enroll".into(),
+            csr: Some("c".into()),
+            ..Default::default()
+        };
+        let begun = new.clone();
+        new.request_id = Some("r".into());
+        assert!(same_request(&new, &begun, &begun));
+        // 取消（檔案刪除後重建、kind 不同）：已改變
+        let cancelled = EnrollmentFile::default();
+        assert!(!same_request(&cancelled, &new, &begun));
     }
 
     #[test]
