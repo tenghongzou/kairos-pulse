@@ -133,6 +133,7 @@ revoke_on_self_decommission = true
 revoke_superseded = true      # 新憑證第一次連線後以 superseded 撤銷舊憑證
 
 [alerts]                      # 告警引擎（kairos/ALERTS.md）；需要 storage.backend = "sqlite"。規則、靜音與通知管道存在資料庫，以主控台 API 或 kairos alerts／silences／alert-rules 管理
+                              # 通知管道的機密以 data/alerts-secrets.key 加密（kairos db backup 不含；備份與還原時一起複製，INSTALL 第 10.2 節）
 enabled = true                # false：不啟動告警引擎（告警端點回 503 alerts_unavailable）
 console_url = ""              # 通知中的事件連結，例如 "https://monitor.example.com"；空字串時通知不附連結
 timezone = "+08:00"           # 通知的時間與事件編號的日期：固定位移（+08:00、UTC），不支援時區名稱；管道可另外設定 timezone

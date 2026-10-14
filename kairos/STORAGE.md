@@ -361,6 +361,19 @@ systemctl start kairos
 
 備份檔是完整的 Kairos 資料庫，可以直接啟動；備份之後收到的 report 不在其中。`agents.json` 不需要備份（啟動時由清冊重建）。
 
+**金鑰檔**（0.6.0 起）：`data/alerts-secrets.key`（通知管道機密的 AES-256-GCM 金鑰）與 `data/console.key`（CSRF 與 TOTP 秘密的加密金鑰）**不在資料庫備份中**，資料庫只有密文。以加密的方式與資料庫備份一起保存，**還原時與 `kairos.db` 一起複製**（擁有者 `kairos`、權限 0600）：
+
+```bash
+systemctl stop kairos
+install -o kairos -g kairos -m 640 /var/backups/kairos/kairos-2026-10-12.db /opt/kairos/data/kairos.db
+gpg -d /var/backups/kairos/keys-2026-10-12.tar.gpg | tar -C /opt/kairos/data -xf -   # alerts-secrets.key、console.key
+chown kairos:kairos /opt/kairos/data/alerts-secrets.key /opt/kairos/data/console.key
+chmod 600 /opt/kairos/data/alerts-secrets.key /opt/kairos/data/console.key
+systemctl start kairos
+```
+
+少了 `alerts-secrets.key` 時 Kairos 會建立新的金鑰，既有管道的機密無法解密（需重新輸入）；少了 `console.key` 時同樣建立新的金鑰，已綁定的 TOTP 需重設（`kairos users reset-mfa`）。
+
 **PKI 的檔案**（0.5.0 起，線上簽發時）：`data/pki/issuing-<ca_id>.key` 是簽發 CA 的私鑰，**不在資料庫備份中**；遺失時舊簽發 CA 簽發的憑證仍有效，但無法再為它產生 CRL（處置見 `PKI.md` 第 4 節「私鑰遺失」）。以加密的方式另外備份 `data/pki/`（例如 `tar -C /opt/kairos/data -cf - pki | gpg -c > pki-$(date +%F).tar.gpg`），還原時保持擁有者為 `kairos`、權限 0700／0600；`issuing-cas.pem` 與 `crl/` 由 Kairos 依資料庫重新寫出，不需備份。
 
 **JSONL 匯出**（給原本讀取 `reports-*.jsonl` 的工具）：`kairos reports export --since 1d [--agent <agent_id>] > reports.jsonl`，每行的格式與 JSONL 檔相同（`schema` 1／2；`peer`、`hostname` 為清冊中最後的值）。未指定 `--agent` 時會掃描整個 `reports` 表。
