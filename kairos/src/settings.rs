@@ -245,6 +245,120 @@ pub fn show_effective(
     out
 }
 
+/// 一個設定鍵的實際生效值與來源（`cli-style.md` §11.7、API `GET /api/v1/settings`）
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingView {
+    pub key: String,
+    pub value: Value,
+    pub source: SettingSource,
+    /// 對應的環境變數名稱
+    pub env_var: String,
+    /// 主控台（資料庫）的修改者與時間
+    pub updated_by: Option<String>,
+    pub updated_at: Option<i64>,
+    /// 較低優先層中與生效值不同的值：(來源, 值)
+    pub overridden: Vec<(SettingSource, Value)>,
+}
+
+impl SettingView {
+    /// `--json` 與 API 的寫法（來源為 `env`／`console`／`file`／`default`）
+    pub fn json(&self) -> Value {
+        json!({
+            "key": self.key,
+            "value": self.value,
+            "source": short_source(self.source),
+            "env_var": self.env_var,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.map(crate::api::http::ts_ms),
+            "overridden": self.overridden.iter().map(|(s, v)| json!({"source": short_source(*s), "value": v})).collect::<Vec<_>>(),
+            "pending_restart": null,
+        })
+    }
+}
+
+/// `env`／`console`／`file`／`default`
+pub fn short_source(s: SettingSource) -> &'static str {
+    match s {
+        SettingSource::Environment => "env",
+        SettingSource::Console => "console",
+        SettingSource::File => "file",
+        SettingSource::Default => "default",
+    }
+}
+
+/// 所有設定鍵的生效值、來源、修改者與被覆寫的值。`rows` 為資料庫 `settings` 表的內容
+pub fn effective_view(
+    config: &AppConfig,
+    rows: &[(String, Value, i64, String)],
+) -> Vec<SettingView> {
+    let overrides = overrides_from(rows);
+    let all = show_effective(config, &overrides);
+    let prov = &config.provenance;
+    all.into_iter()
+        .map(|(key, (value, source))| {
+            let row = rows
+                .iter()
+                .find(|(k, ..)| *k == key && CONSOLE_KEYS.contains(&k.as_str()));
+            let mut overridden = Vec::new();
+            if source == SettingSource::Environment
+                && let Some((_, v, ..)) = row
+                && *v != value
+            {
+                overridden.push((SettingSource::Console, v.clone()));
+            }
+            if matches!(source, SettingSource::Environment | SettingSource::Console)
+                && let Some(v) = prov.file_values.get(&key)
+                && !same_value(v, &value)
+            {
+                overridden.push((SettingSource::File, v.clone()));
+            }
+            SettingView {
+                env_var: crate::config::Provenance::env_var(&key),
+                updated_by: (source == SettingSource::Console)
+                    .then(|| row.map(|r| r.3.clone()))
+                    .flatten(),
+                updated_at: (source == SettingSource::Console)
+                    .then(|| row.map(|r| r.2))
+                    .flatten(),
+                key,
+                value,
+                source,
+                overridden,
+            }
+        })
+        .collect()
+}
+
+/// 設定檔的值（toml 的整數、字串）與生效值相同
+fn same_value(file: &Value, effective: &Value) -> bool {
+    file == effective || file.as_str().is_some_and(|s| Some(s) == effective.as_str())
+}
+
+/// 啟動時記一行 `INFO`：被資料庫（主控台）覆寫的設定檔設定（設計包 INTEGRATION §27.4 #2）
+pub fn overridden_file_settings(
+    config: &AppConfig,
+    rows: &[(String, Value, i64, String)],
+) -> Vec<String> {
+    effective_view(config, rows)
+        .into_iter()
+        .filter(|v| v.source == SettingSource::Console)
+        .filter_map(|v| {
+            v.overridden
+                .iter()
+                .find(|(s, _)| *s == SettingSource::File)
+                .map(|(_, f)| {
+                    format!(
+                        "{}（設定檔 {} → 生效 {}，{}）",
+                        v.key,
+                        f,
+                        v.value,
+                        v.updated_by.clone().unwrap_or_default()
+                    )
+                })
+        })
+        .collect()
+}
+
 fn flatten_values(prefix: &str, value: &Value, out: &mut BTreeMap<String, Value>) {
     match value {
         Value::Object(map) => {
@@ -279,7 +393,7 @@ mod tests {
         c.enroll.mode = Some(EnrollMode::Open);
         c.provenance = Provenance {
             file_keys: [KEY_MODE.to_string()].into(),
-            env_keys: Default::default(),
+            ..Default::default()
         };
         let e = effective(&c, &Overrides::new());
         assert_eq!(
@@ -318,6 +432,35 @@ mod tests {
         assert!(validate_override(KEY_CERT_LIFETIME_DAYS, &json!(825)).is_ok());
         assert!(validate_override("server.listen", &json!("x")).is_err());
         assert!(validate_override(KEY_RENEW_REQUIRES_APPROVAL, &json!(1)).is_err());
+    }
+
+    #[test]
+    fn effective_view_reports_modifier_and_overridden_file_value() {
+        let mut c = AppConfig::default();
+        c.enroll.mode = Some(EnrollMode::Open);
+        c.provenance.file_keys.insert(KEY_MODE.into());
+        c.provenance
+            .file_values
+            .insert(KEY_MODE.into(), json!("open"));
+        let rows = vec![(
+            KEY_MODE.to_string(),
+            json!("renew_only"),
+            1_760_000_000_000,
+            "admin.chen".to_string(),
+        )];
+        let view = effective_view(&c, &rows);
+        let m = view.iter().find(|v| v.key == KEY_MODE).unwrap();
+        assert_eq!(m.value, json!("renew_only"));
+        assert_eq!(m.source, SettingSource::Console);
+        assert_eq!(m.updated_by.as_deref(), Some("admin.chen"));
+        assert_eq!(m.overridden, vec![(SettingSource::File, json!("open"))]);
+        assert_eq!(m.json()["source"], "console");
+        let o = overridden_file_settings(&c, &rows);
+        assert_eq!(o.len(), 1);
+        assert!(o[0].starts_with("enroll.mode"), "{o:?}");
+        // 設定檔與生效值相同時沒有被覆寫的值
+        let listen = view.iter().find(|v| v.key == "server.listen").unwrap();
+        assert!(listen.overridden.is_empty());
     }
 
     #[test]

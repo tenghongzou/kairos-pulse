@@ -910,6 +910,11 @@ pub fn set_setting(
     Ok(())
 }
 
+/// 刪除 `settings` 的鍵（改用設定檔的值）；回傳是否存在
+pub fn delete_setting(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM settings WHERE key = ?1", [key])? > 0)
+}
+
 /// 稽核事件（`audit_events`）
 #[derive(Debug, Clone, Default)]
 pub struct Audit<'a> {

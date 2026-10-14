@@ -170,6 +170,8 @@ pub struct Provenance {
     pub file_keys: BTreeSet<String>,
     /// 以 `KAIROS__<SECTION>__<KEY>` 環境變數設定的鍵
     pub env_keys: BTreeSet<String>,
+    /// 設定檔中的值（`kairos config show --effective` 的「被覆寫的值」）
+    pub file_values: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// 設定值的來源（`kairos config show --effective`、`GET /api/v1/enroll/mode`）
@@ -228,6 +230,31 @@ impl Provenance {
             })
             .filter(|k| !k.is_empty())
             .collect()
+    }
+}
+
+/// 把設定檔的內容攤平成 鍵 → 值
+fn flatten_file_values(
+    prefix: &str,
+    value: &serde_json::Value,
+    out: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.to_ascii_lowercase()
+                } else {
+                    format!("{prefix}.{}", k.to_ascii_lowercase())
+                };
+                flatten_file_values(&key, v, out);
+            }
+        }
+        v => {
+            if !prefix.is_empty() {
+                out.insert(prefix.to_string(), v.clone());
+            }
+        }
     }
 }
 
@@ -947,16 +974,19 @@ impl AppConfig {
             })?;
         // 每個鍵的來源：只讀設定檔一次（上面已確認能解析），攤平成鍵的集合
         let mut file_keys = BTreeSet::new();
+        let mut file_values = std::collections::BTreeMap::new();
         if let Ok(v) = Config::builder()
             .add_source(file_source)
             .build()
             .and_then(|c| c.try_deserialize::<serde_json::Value>())
         {
             flatten_keys("", &v, &mut file_keys);
+            flatten_file_values("", &v, &mut file_values);
         }
         settings.provenance = Provenance {
             file_keys,
             env_keys: Provenance::env_keys_from_process(),
+            file_values,
         };
 
         settings.validate()?;

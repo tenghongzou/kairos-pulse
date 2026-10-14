@@ -757,9 +757,32 @@ fn mode_switching_and_rate_limit() {
     let (c, p) = env.cli(&["config", "show", "--effective", "--json"]);
     assert_eq!(c, 0, "{}", p.dump());
     let v: Value = serde_json::from_str(p.stdout().trim()).unwrap();
-    assert_eq!(v["data"]["enroll.mode"]["source"], "console");
-    assert_eq!(v["data"]["enroll.mode"]["value"], "open");
-    assert_eq!(v["data"]["server.listen"]["source"], "file");
+    assert_eq!(v["schema"], "kairos.config.effective/v1");
+    let find = |k: &str| {
+        v["data"]["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == k)
+            .cloned()
+            .unwrap()
+    };
+    let mode = find("enroll.mode");
+    assert_eq!(mode["source"], "console");
+    assert_eq!(mode["value"], "open");
+    assert!(mode["updated_by"].is_string());
+    assert_eq!(find("server.listen")["source"], "file");
+    // 改用設定檔的值
+    let (c, p) = env.cli(&["enroll", "mode", "renew_only", "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let (c, p) = env.cli(&["config", "show", "--effective", "enroll.mode"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    assert!(p.stdout().contains("設定檔：\"open\""), "{}", p.stdout());
+    let (c, p) = env.cli(&["config", "reset", "enroll.mode", "--yes"]);
+    assert_eq!(c, 0, "{}", p.dump());
+    let (_, p) = env.cli(&["config", "show", "--effective", "enroll.mode", "--json"]);
+    let v: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    assert_eq!(v["data"]["settings"][0]["source"], "file");
     let _ = Path::new("x");
     kairos.stop();
 }

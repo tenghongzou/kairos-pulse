@@ -449,7 +449,11 @@ async fn handle(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // 註冊與 PKI 的管理端點（API.md 第 11 節；含寫入）
-    if path.starts_with("/api/v1/enroll/") || path.starts_with("/api/v1/pki/") {
+    if path.starts_with("/api/v1/enroll/")
+        || path.starts_with("/api/v1/pki/")
+        || path == "/api/v1/settings"
+        || path.starts_with("/api/v1/settings/")
+    {
         let resp = enroll::handle(ctx.clone(), peer, req).await;
         debug!(
             "主控台 {} {} {} → {}（{:.1} ms）",

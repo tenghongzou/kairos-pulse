@@ -258,7 +258,7 @@ impl EnrollService {
             }
         }
         let now = (p.clock)();
-        let (overrides, blocks, decommissioned) = db
+        let (overrides, blocks, decommissioned, rows) = db
             .write_blocking(|conn| {
                 let rows = store::load_settings(conn)?;
                 let blocks = store::load_blocks(conn)?;
@@ -267,10 +267,17 @@ impl EnrollService {
                 let decom: HashSet<String> = stmt
                     .query_map([], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
-                Ok((settings::overrides_from(&rows), blocks, decom))
+                Ok((settings::overrides_from(&rows), blocks, decom, rows))
             })
             .map_err(|e| format!("無法讀取註冊設定：{e}"))?;
         let eff = settings::effective(&p.config, &overrides);
+        let overridden = settings::overridden_file_settings(&p.config, &rows);
+        if !overridden.is_empty() {
+            info!(
+                "主控台修改的設定優先於 kairos.toml（存在資料庫）：{}；以 kairos config show --effective 查看，kairos config reset <設定鍵> 改用設定檔的值",
+                overridden.join("、")
+            );
+        }
         let limits = Limits::new(&p.config.enroll);
         for b in blocks {
             if let (Ok(ip), Some(class)) =

@@ -695,6 +695,49 @@ pub fn set_policy(
     Ok(())
 }
 
+/// 改用設定檔的值：刪除 `settings` 中的鍵（L1、稽核）。回傳 (鍵, 先前是否由主控台管理)
+pub fn reset_settings(
+    conn: &mut Connection,
+    keys: &[String],
+    by: &str,
+    actor_ip: Option<&str>,
+    now_ms: i64,
+) -> Result<Vec<(String, bool)>, OpError> {
+    for k in keys {
+        if !settings::CONSOLE_KEYS.contains(&k.as_str()) {
+            return Err(OpError::invalid(
+                "keys",
+                format!(
+                    "{k} 不是可從主控台修改的設定（{}）",
+                    settings::CONSOLE_KEYS.join("、")
+                ),
+            ));
+        }
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut out = Vec::new();
+    for k in keys {
+        let existed = store::delete_setting(&tx, k)?;
+        store::audit(
+            &tx,
+            now_ms,
+            &Audit {
+                actor: by,
+                actor_ip,
+                category: "settings",
+                action: "setting.reset",
+                object: Some(k),
+                result: if existed { "ok" } else { "rejected" },
+                details: Some(json!({"existed": existed})),
+                ..Audit::default()
+            },
+        )?;
+        out.push((k.clone(), existed));
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
 /// 允許再次自動續簽（S14，D12）
 pub fn grace_override(
     conn: &mut Connection,

@@ -156,6 +156,8 @@ async fn route(
             export_queue(&svc, now).await
         }
         ("POST", ["pki", "signing-queue", "import"]) => import_queue(&w, b(), now).await,
+        ("GET" | "HEAD", ["settings"]) => list_settings(&svc, now).await,
+        ("POST", ["settings", "reset"]) => reset_settings(&w, b(), now).await,
         _ => Err(ApiError::not_found()),
     }
 }
@@ -796,6 +798,66 @@ async fn reject(
     Ok(http::ok(
         now,
         json!({"results": results, "summary": summary(&results)}),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// 設定（S21）：每一項的來源、修改者與被覆寫的值；改用設定檔的值
+// ---------------------------------------------------------------------------
+
+async fn list_settings(
+    svc: &Arc<EnrollService>,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    let rows = svc
+        .db
+        .read(|conn| Ok(store::load_settings(conn)?))
+        .await
+        .map_err(db_error)?;
+    let list: Vec<Value> = settings::effective_view(&svc.config, &rows)
+        .iter()
+        .map(|v| {
+            let mut j = v.json();
+            j["console_editable"] = json!(
+                settings::CONSOLE_KEYS.contains(&v.key.as_str())
+                    && v.source != crate::config::SettingSource::Environment
+            );
+            j
+        })
+        .collect();
+    Ok(http::ok(now, json!({"settings": list})))
+}
+
+async fn reset_settings(
+    w: &Writer<'_>,
+    b: Value,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    let keys = str_list(&b, "keys")?
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| ApiError::param("keys", "keys 必填"))?;
+    for k in &keys {
+        let perm = if k.starts_with("enroll.") {
+            Permission::EnrollModeWrite
+        } else {
+            Permission::CertPolicyWrite
+        };
+        w.principal.require(perm)?;
+        locked(w.svc, k)?;
+    }
+    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
+    let now_ms = now.timestamp_millis();
+    let results = w
+        .svc
+        .db
+        .write(move |conn| Ok(ops::reset_settings(conn, &keys, &actor, Some(&ip), now_ms)))
+        .await
+        .map_err(db_error)?
+        .map_err(op_error)?;
+    w.svc.wake();
+    Ok(http::ok(
+        now,
+        json!({"results": results.iter().map(|(k, e)| json!({"key": k, "was_console": e})).collect::<Vec<_>>()}),
     ))
 }
 

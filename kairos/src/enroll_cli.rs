@@ -99,7 +99,8 @@ pub const PKI_USAGE: &str = "kairos pki — 簽發 CA、憑證與 CRL（kairos/P
 pub const CONFIG_USAGE: &str = "kairos config — 設定
 
 用法：
-  kairos config show --effective [--config <path>] [--json]
+  kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--config <path>] [--json]
+  kairos config reset <設定鍵>... [--yes]（改用設定檔的值：刪除主控台的設定）
 
 列出每一個設定鍵實際生效的值與來源：environment（KAIROS__ 環境變數）＞ console（主控台或 CLI 寫入資料庫
 的 settings 表）＞ file（kairos.toml）＞ default（程式內建）。結束代碼：0 完成、2 用法錯誤、3 設定錯誤";
@@ -1642,35 +1643,186 @@ fn sign_bundle(cmd: &Cmd, env: &Env<'_>) -> Result<Output, Failure> {
 // config
 // ---------------------------------------------------------------------------
 
+/// 來源的寫法（`cli-style.md` §11.7）
+fn source_text(v: &settings::SettingView, tz: FixedOffset) -> String {
+    match v.source {
+        SettingSource::Environment => format!("環境變數 {}", v.env_var),
+        SettingSource::Console => format!(
+            "主控台（{}，{}）",
+            v.updated_by.as_deref().unwrap_or("-"),
+            v.updated_at.map(|t| human_time(t, tz)).unwrap_or_default()
+        ),
+        SettingSource::File => "設定檔".into(),
+        SettingSource::Default => "內建預設".into(),
+    }
+}
+
 fn config_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
-    if cmd.sub(0) != Some("show") || !cmd.flag("--effective") {
-        return Err(usage_err("用法：kairos config show --effective"));
+    match cmd.sub(0) {
+        Some("show") => config_show(cmd, env),
+        Some("reset") => config_reset(cmd, env),
+        _ => Err(usage_err(
+            "用法：kairos config show --effective、kairos config reset <設定鍵>...",
+        )),
+    }
+}
+
+fn config_show(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
+    if !cmd.flag("--effective") {
+        return Err(usage_err(
+            "用法：kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default]",
+        ));
     }
     let config = load_config(cmd.config_path.as_deref())?;
-    let overrides = match open(cmd.config_path.as_deref(), false) {
-        Ok(Some(conn)) => {
-            settings::overrides_from(&store::load_settings(&conn).unwrap_or_default())
-        }
-        _ => settings::Overrides::new(),
+    let rows = match open(cmd.config_path.as_deref(), false) {
+        Ok(Some(conn)) => store::load_settings(&conn).map_err(db_failure)?,
+        Ok(None) => Vec::new(),
+        Err(f) => return Err(f),
     };
-    let all = settings::show_effective(&config, &overrides);
-    if cmd.json {
-        let data: serde_json::Map<String, Value> = all
-            .iter()
-            .map(|(k, (v, s))| (k.clone(), json!({"value": v, "source": s.as_str()})))
-            .collect();
-        return Ok(ok_json(cmd, env.now, Value::Object(data)));
+    let filters: Vec<&str> = cmd.args[1..].iter().map(String::as_str).collect();
+    let source = cmd.opt("--source");
+    if let Some(s) = source
+        && !matches!(s, "env" | "console" | "file" | "default")
+    {
+        return Err(usage_err(format!(
+            "--source 的值 \"{s}\" 無效（env、console、file、default）"
+        )));
     }
-    let mut t = vec![vec!["設定鍵".to_string(), "值".into(), "來源".into()]];
-    for (k, (v, s)) in &all {
-        let shown = match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
+    let all = settings::effective_view(&config, &rows);
+    for f in &filters {
+        if !all
+            .iter()
+            .any(|v| v.key == *f || v.key.starts_with(&format!("{f}.")))
+        {
+            return Err(usage_err(format!("不認得的設定鍵或前綴：{f}")));
+        }
+    }
+    let shown: Vec<&settings::SettingView> = all
+        .iter()
+        .filter(|v| {
+            filters.is_empty()
+                || filters
+                    .iter()
+                    .any(|f| v.key == *f || v.key.starts_with(&format!("{f}.")))
+        })
+        .filter(|v| source.is_none_or(|s| settings::short_source(v.source) == s))
+        .collect();
+    if cmd.json {
+        return Ok(Output {
+            stdout: ascii_json(&json!({
+                "schema": "kairos.config.effective/v1", "ok": true, "generated_at": fmt_time(env.now),
+                "data": {"settings": shown.iter().map(|v| v.json()).collect::<Vec<_>>()},
+                "warnings": [], "error": null,
+            })) + "\n",
+            ..Default::default()
+        });
+    }
+    let mut t = vec![vec![
+        "設定鍵".to_string(),
+        "生效值".into(),
+        "來源".into(),
+        "被覆寫的值".into(),
+    ]];
+    for v in &shown {
+        let over = if v.overridden.is_empty() {
+            "—".to_string()
+        } else {
+            v.overridden
+                .iter()
+                .map(|(s, val)| {
+                    format!(
+                        "{}：{val}",
+                        match s {
+                            SettingSource::Console => "主控台",
+                            SettingSource::File => "設定檔",
+                            SettingSource::Environment => "環境變數",
+                            SettingSource::Default => "內建預設",
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("、")
         };
-        t.push(vec![k.clone(), shown, s.as_str().into()]);
+        t.push(vec![
+            v.key.clone(),
+            v.value.to_string(),
+            source_text(v, env.tz),
+            over,
+        ]);
+    }
+    let console = shown
+        .iter()
+        .filter(|v| v.source == SettingSource::Console)
+        .count();
+    let envs = shown
+        .iter()
+        .filter(|v| v.source == SettingSource::Environment)
+        .count();
+    let mut out = table(&t);
+    if console + envs > 0 {
+        out.push_str(&format!(
+            "\n{} {console} 個設定由主控台管理，優先於 kairos.toml；{envs} 個由環境變數決定（主控台無法修改）。\n  要改回設定檔的值：在主控台該欄位按「改用設定檔的值」，或執行 kairos config reset <設定鍵>。\n",
+            if env.unicode { "ⓘ" } else { "[INFO]" }
+        ));
     }
     Ok(Output {
-        stdout: table(&t),
+        stdout: out,
+        ..Default::default()
+    })
+}
+
+fn config_reset(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
+    let keys: Vec<String> = cmd.args[1..].to_vec();
+    if keys.is_empty() {
+        return Err(usage_err(
+            "需要至少一個設定鍵，例如 kairos config reset enroll.mode",
+        ));
+    }
+    if !cmd.flag("--yes") {
+        let ok = (env.confirm)(&format!("即將刪除主控台對 {} 的設定，改用 kairos.toml（或內建預設）的值；執行中的 Kairos 在 2 秒內套用。\n是否繼續？[y/N] ", keys.join("、")))
+            .is_some_and(|a| matches!(a.trim(), "y" | "Y" | "yes"));
+        if !ok {
+            return Err(Failure::new(
+                "未變更",
+                "沒有確認（非互動執行時需要 --yes）",
+                Vec::new(),
+                EXIT_USAGE,
+            ));
+        }
+    }
+    let mut conn = db(cmd)?;
+    let results = ops::reset_settings(
+        &mut conn,
+        &keys,
+        &operator(),
+        None,
+        env.now.timestamp_millis(),
+    )
+    .map_err(op_failure)?;
+    if cmd.json {
+        return Ok(Output {
+            stdout: ascii_json(&json!({
+                "schema": "kairos.config.reset/v1", "ok": true, "generated_at": fmt_time(env.now),
+                "data": {"results": results.iter().map(|(k, e)| json!({"key": k, "was_console": e})).collect::<Vec<_>>()},
+                "warnings": [], "error": null,
+            })) + "\n",
+            ..Default::default()
+        });
+    }
+    let mut text = String::new();
+    for (k, existed) in results {
+        text.push_str(&format!(
+            "{} {k}：{}\n",
+            mark(env),
+            if existed {
+                "已改用設定檔的值"
+            } else {
+                "原本就不是由主控台管理"
+            }
+        ));
+    }
+    Ok(Output {
+        stdout: text,
         ..Default::default()
     })
 }
