@@ -181,6 +181,20 @@ fn is_lifecycle_type(kind: &str) -> bool {
     matches!(kind, "renew_request" | "deregister")
 }
 
+/// 8443 的註冊 feature（`renew`、`deregister`）是否使用：協商為 v2、Kairos 有註冊服務、client 也宣告，
+/// **且這條連線以用戶端憑證證明了 `agent_id`**（PROTOCOL.md「憑證輪替與除役」）。未啟用 mTLS 時
+/// `agent_id` 是自行宣告的，若接受 `renew_request` 就等於替任何人簽發任意 `agent_id` 的憑證
+fn lifecycle_features(
+    authenticated: bool,
+    v2: bool,
+    has_enroll: bool,
+    client_features: &[String],
+) -> (bool, bool) {
+    let both =
+        |f: &str| authenticated && v2 && has_enroll && client_features.iter().any(|c| c == f);
+    (both(FEATURE_RENEW), both(FEATURE_DEREGISTER))
+}
+
 fn classify(frame: Frame) -> Incoming {
     match frame {
         Frame::TooLong => Incoming::TooLong,
@@ -1341,12 +1355,6 @@ impl Conn {
             Err(_) => Vec::new(), // client_proto_range 已拒絕
         };
         let session = Session::new(version, SERVER_FEATURES, &client_features);
-        // 8443 的註冊 feature：v2、Kairos 有註冊服務、且 client 也宣告時才使用
-        let both = |f: &str| {
-            session.is_v2() && self.enroll.is_some() && client_features.iter().any(|c| c == f)
-        };
-        let renew = both(FEATURE_RENEW);
-        let deregister = both(FEATURE_DEREGISTER);
         let host = if session.is_v2() {
             let checked = validate_features(&client_features).and_then(|()| {
                 let host = ext.host.map_err(|e| format!("invalid message: {e}"))?;
@@ -1369,6 +1377,12 @@ impl Conn {
         let Some(authenticated) = self.check_identity(seq, &agent_id).await? else {
             return Ok(HelloOutcome::Closed);
         };
+        let (renew, deregister) = lifecycle_features(
+            authenticated,
+            session.is_v2(),
+            self.enroll.is_some(),
+            &client_features,
+        );
         Ok(HelloOutcome::Accepted(Agent {
             agent_id,
             hostname,
@@ -2494,6 +2508,22 @@ mod tests {
             classify(Frame::Line(line)),
             Incoming::BadRequest { message: m, seq: None } if m.contains("ts")
         ));
+    }
+
+    #[test]
+    fn lifecycle_features_require_an_authenticated_v2_connection() {
+        let both = vec!["metrics".to_string(), "renew".into(), "deregister".into()];
+        assert_eq!(lifecycle_features(true, true, true, &both), (true, true));
+        // 未以用戶端憑證證明身分（未啟用 mTLS）：不使用，hello_ack 不列出
+        assert_eq!(lifecycle_features(false, true, true, &both), (false, false));
+        // v1、沒有註冊服務（JSONL）、client 沒有宣告
+        assert_eq!(lifecycle_features(true, false, true, &both), (false, false));
+        assert_eq!(lifecycle_features(true, true, false, &both), (false, false));
+        assert_eq!(
+            lifecycle_features(true, true, true, &["renew".to_string()]),
+            (true, false)
+        );
+        assert_eq!(lifecycle_features(true, true, true, &[]), (false, false));
     }
 
     #[test]

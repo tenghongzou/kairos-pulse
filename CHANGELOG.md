@@ -89,7 +89,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 主控台 API 第 11 節：註冊 token、申請（含批次核准）、模式與影響評估、憑證政策、憑證清冊與撤銷、CRL、簽發 CA、離線簽發佇列、`GET /api/v1/settings`（每項的來源、修改者、被覆寫的值）與 `POST /api/v1/settings/reset`（改用設定檔的值）；下載端點不可用時以 `downloads` 標示。token 只顯示前 4 碼（`KRT1-XXXX…`）。所有寫入記稽核（`audit_events`）。
 - CLI：`kairos enroll-token`、`kairos enroll`（list／show／approve／reject／mode）、`kairos pki`（issuing-ca list／new／install／activate／retire、certificates list、revoke、queue export／import、sign-bundle）、`kairos config show --effective`、`kairos config reset`；`kairos api-token create --scope read|operate|admin`。
 - 設定：`[enroll]`、`[pki]`、`[pki.policy]`（`kairos.example.toml`）；8444 與 8443／9443 的監聽衝突在啟動時拒絕（`KRS-E0202`）；檔案描述元的需要量包含 `enroll.max_connections`。新的產品代碼 `KRS-E1303`、`KRS-W1304`、`KRS-E1305`。
-- 修正：`kairos api-token list` 的「最後使用」超過 7 天改顯示日期時間（copywriting §5.3）；`kairos enroll-token create` 的安裝字串在註冊端點不是 8444、又沒有設定 `enroll.advertise` 時漏了 `e`（Pulse 因此連到 8444），改為與主控台 API 相同。
+- 修正：`kairos api-token list` 的「最後使用」超過 7 天改顯示日期時間（copywriting §5.3）；`kairos enroll-token create` 的安裝字串在註冊端點不是 8444、又沒有設定 `enroll.advertise` 時漏了 `e`（Pulse 因此連到 8444），改為與主控台 API 相同；8443 的 `renew`、`deregister` 只在連線以用戶端憑證證明了 `agent_id` 時才協商（合併前 `renew` 沒有檢查：未啟用 mTLS 而註冊服務開啟時，任何連線都能以自行宣告的 `agent_id` 取得簽發的憑證）。
 
 ### Pulse
 

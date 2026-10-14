@@ -784,25 +784,30 @@ level = "debug"
         (code, doc)
     }
 
-    /// 這台主機目錄下所有檔案的內容（檢查秘密是否外洩用；二進位檔以 lossy 讀取）
+    /// 這台主機目錄下所有檔案的內容（檢查秘密是否外洩用）
     pub fn all_files_text(&self) -> Vec<(PathBuf, String)> {
-        fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-            let Ok(rd) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if let Ok(b) = std::fs::read(&p) {
-                    out.push((p, String::from_utf8_lossy(&b).into_owned()));
-                }
+        files_text(&self.dir)
+    }
+}
+
+/// 目錄下所有檔案的內容（遞迴；二進位檔如 SQLite 資料庫以 lossy 讀取），檢查秘密是否外洩用
+pub fn files_text(dir: &Path) -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if let Ok(b) = std::fs::read(&p) {
+                out.push((p, String::from_utf8_lossy(&b).into_owned()));
             }
         }
-        let mut out = Vec::new();
-        walk(&self.dir, &mut out);
-        out
     }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
 }
 
 /// 等到 `cond` 成立（最多 `WAIT`），逾時 panic 並附上 `what`

@@ -143,6 +143,31 @@ fn install_string_auto_approval_registers_and_the_service_connects() {
             );
         }
     }
+    // Kairos 端：資料庫（含 WAL）與其他檔案只有 token 與輪詢憑據的雜湊；data/pki 0700、簽發 CA 私鑰 0600
+    for (path, text) in files_text(&env.dir) {
+        assert!(!text.contains(&secret), "token 出現在 {}", path.display());
+        if !poll_secret.is_empty() {
+            assert!(
+                !text.contains(&poll_secret),
+                "輪詢憑據出現在 {}",
+                path.display()
+            );
+        }
+    }
+    if cfg!(unix) {
+        let pki = env.dir.join("data").join("pki");
+        assert_eq!(mode_of(&pki), Some(0o700));
+        let keys: Vec<_> = std::fs::read_dir(&pki)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "key"))
+            .collect();
+        assert!(!keys.is_empty());
+        for k in keys {
+            assert_eq!(mode_of(&k), Some(0o600), "{}", k.display());
+        }
+    }
     for out in [p.output(), svc.output(), kairos.output()] {
         assert!(!out.contains(&secret), "token 出現在輸出中");
         assert!(!out.contains(&key), "私鑰出現在輸出中");
