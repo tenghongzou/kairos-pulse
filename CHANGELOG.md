@@ -50,6 +50,32 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.6.0〔草稿〕之後的變更記在這裡。）
 
+## [0.7.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.7.0**：衝刺 6 的**主控台網頁介面地基**（審計 F2 的第一部分；設計包 `kairos/screens.md` S01、S03、S04、S05、S23、`ia.md`、`design-system/`、`decisions/INTEGRATION.md` §28.6）。版本號尚未變更（`kairos/Cargo.toml` 仍為 0.6.0）。架構與慣例見 [`kairos/web/README.md`](kairos/web/README.md)，伺服器端的規則見 `kairos/API.md` 第 14 節。
+
+### 新增
+
+- **網頁介面**（Kairos）：與主控台 API 同一個 HTTPS 監聽（預設 `https://127.0.0.1:9443/`）。原生 ES modules＋vanilla JS，沒有第三方套件與 npm 建置步驟；`kairos/build.rs` 在編譯時把 `kairos/web/index.html` 與 `kairos/web/assets/` 嵌入執行檔（依路徑排序，不影響可重現性）。`/assets/…` 帶 `ETag`、`Cache-Control: no-cache`；其他沒有副檔名的路徑回 `index.html`（History API 路由）。
+- **畫面**：S01 登入（本機／AD、兩步驟驗證的驗證碼或復原碼、第一次登入變更密碼、鎖定剩餘時間、工作階段已結束的說明、公開健康燈、`next` 只接受站內路徑）；S03 總覽（六個狀態磚、1 小時變化、24 小時上線數、系統健康條、進行中事件、群組健康、離線最久、資源使用前 10）；S04 主機清單（搜尋含 CIDR、狀態 chip、離線原因／群組／標籤／OS／版本、伺服器端排序與游標分頁、即時更新不重排）；S05 主機詳情（概覽、純 SVG 的趨勢圖〔平均＋最小／最大，空缺不補 0〕、24 小時時間軸、連線與憑證、連線紀錄）；全域搜尋（Ctrl+K）；S23 個人設定（主題、減少動態效果、時間顯示與時區〔只存在這個瀏覽器〕、變更密碼、兩步驟驗證〔本機產生 QR code、10 組復原碼只顯示一次〕、我的工作階段與「結束其他所有工作階段」）。沒有後端或沒有畫面的元素依 §28.6 隱藏（清單見 `kairos/web/README.md` 第 8 節）。
+- **框架層**：路由、API 用戶端（CSRF 標頭、錯誤代碼 → 設計包的三段式說明、401 帶 `next` 回登入頁、403 顯示所需權限）、共用的 SSE 管理（重連、權限改變時重新判斷）、依 `/api/v1/me` 權限顯示的導覽與按鈕、亮暗主題、繁中文案集中（`strings.js`）、表格、對話框、Toast、空狀態／載入／錯誤狀態元件、瀏覽器端的閒置逾時。
+- **API**（唯讀，`hosts:read`，群組範圍只含範圍內的主機）：`GET /api/v1/hosts/facets`（篩選列的選項與台數、群組的線上數）；`GET /api/v1/hosts/{agent_id}/connections`（Kairos 這次啟動後的上線與離線紀錄，記憶體中、每台最多 50 筆）；`GET /api/v1/hosts/{agent_id}` 新增 `certificate`（最新一張由 Kairos 簽發的憑證的狀態與到期，不含序號）。`kairos/API.md` 第 5.2、5.7、5.8 節。
+- **安全標頭**：主控台的每個回應帶 HSTS、`X-Content-Type-Options`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、COOP／CORP、`Permissions-Policy` 與 CSP（網頁：`script-src 'self'`、`style-src 'self'`、`frame-ancestors 'none'`、`require-trusted-types-for 'script'`；API：`default-src 'none'`）。
+- **設計 token**：`kairos/web/assets/tokens.css` 為設計包 `design-system/tokens.css` 的複本，`cargo test` 檢查與記錄的 SHA-256 相同（找得到設計包時逐位元組比對）；`kairos/web/tools/sync-design.mjs` 重新複製並產生錯誤代碼的資料。
+- **端對端測試**：`kairos/web/tests/run.sh`（Playwright＋axe，不在 `cargo test` 中）對真的 Kairos 執行 12 個流程（CSP、XSS、RBAC、兩步驟驗證、鍵盤、即時更新、深色主題、窄螢幕…），axe 0 違規。
+
+### 變更
+
+- **沒有出示任何憑據的請求不再扣驗證失敗的額度**（`kairos/API.md` 第 4.3 節）：沒有 `Authorization` 也沒有工作階段 cookie 的請求仍回 401，但不計入同一來源的失敗次數（未登入的瀏覽器開啟主控台時會讀取 `/api/v1/me`；否則重新整理登入頁幾次就會被限速）。出示錯誤或失效的 token、工作階段照常計入。
+- `GET /`（以及其他不是 `/api/`、健康檢查的路徑）由 JSON 的 404 改為網頁介面（`/api/…` 不存在的路徑仍是 JSON 的 `not_found`）。
+
+### 已知限制
+
+- 告警、註冊與 PKI、使用者與角色、稽核、系統健康與設定的畫面尚未提供（選單不顯示），請以 CLI 或 API 操作。
+- 連線紀錄只在記憶體中（重新啟動後從頭記錄）；完整、持久的連線紀錄屬於之後的版本。
+- 偏好（主題、時區）沒有伺服器端儲存，只套用在各自的瀏覽器。
+- 只在 Chromium 上測試（Trusted Types 需要 Chromium；其他瀏覽器照常使用 CSP 的其餘部分）。
+
 ## [0.6.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.6.0、Pulse 0.6.0**：衝刺 5 的三條線——**告警引擎**（審計 F3；設計包 `kairos/alerts-ux.md`、`screens.md` S06～S11、§24 #2、#8、#9）、**使用者、角色、工作階段與稽核**（審計 F6、S7 的雜湊鏈部分；`screens.md` S01、S16～S18、S23、§24 #10、#11、D25）、**可觀測性**（審計 O3、O8；`screens.md` S20、§24 #8、`pulse/log-ux.md`、`pulse/cli-spec.md` §6、§8）。版本號已改為 0.6.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。**協定不變**（v1～v2，8443 的 feature 與 0.5 相同），Kairos 與 Pulse 0.5／0.6 的任何組合都能照常連線。Pulse 只有可觀測性的變更。

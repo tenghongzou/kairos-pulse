@@ -498,18 +498,34 @@ sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name
     --config /opt/kairos/kairos.toml < /root/admin.pw && shred -u /root/admin.pw
   ```
 
-- 登入（主控台網頁介面完成前，可用 curl 確認）：
+- 登入主控台（0.7.0〔草稿〕起有網頁介面，見 9.5）：以瀏覽器開啟 `https://<Kairos 主機>:9443/`，以 `admin` 與初始密碼登入，畫面會要求先變更密碼。沒有瀏覽器時也可以 curl 確認：
 
   ```bash
-  curl -sk -c cookies.txt -H 'Content-Type: application/json' \
-    -d '{"username":"admin","password":"<初始密碼>"}' https://127.0.0.1:9443/api/v1/auth/login
+  curl -sk -c cookies.txt -H 'Content-Type: application/json'     -d '{"username":"admin","password":"<初始密碼>"}' https://127.0.0.1:9443/api/v1/auth/login
   ```
 
   回應的 `csrf_token` 要放在之後每個寫入請求的 `X-CSRF-Token` 標頭（例如 `POST /api/v1/me/password` 變更密碼）。
-- 建議接著：以 `POST /api/v1/me/totp/setup`、`/enable` 綁定 TOTP（回應的 10 組復原碼離線保存）；為其他人建立各自的帳號（`kairos users create <帳號> --role operator|auditor|viewer`），不要共用 `admin`；至少保留兩位管理員（最後一位管理員不能被停用或移除）。
+- 建議接著：在主控台的「個人設定」啟用兩步驟驗證（或 `POST /api/v1/me/totp/setup`、`/enable`；10 組復原碼離線保存）；為其他人建立各自的帳號（`kairos users create <帳號> --role operator|auditor|viewer`），不要共用 `admin`；至少保留兩位管理員（最後一位管理員不能被停用或移除）。
 - 確認稽核日誌：`sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml`（完整時結束代碼 0；斷裂時 9、`KRS-E6201`）。
 - 使用 AD／LDAP 時，在 `kairos.toml` 設定 `[ldap]`（`ca_file` 必填；服務帳號密碼放在 `chmod 600` 的 `bind_password_file`），重新啟動後以 `kairos users map-group "<群組 DN>" --role operator` 對應角色（API.md 第 12.7 節）。
 - 主控台金鑰 `data/console.key`（0600）在第一次啟動主控台時建立，用於 CSRF 與 TOTP 秘密的加密；備份資料庫時一併（加密）備份，遺失時已綁定的 TOTP 需以 `kairos users reset-mfa` 重設。
+
+### 9.5 開啟主控台（0.7.0〔草稿〕）
+
+網頁介面與 API 在同一個 HTTPS 監聽上（`console.listen`，預設 `127.0.0.1:9443`），網頁檔已嵌入 `kairos` 執行檔，不需要另外安裝。
+
+1. **連線方式**：預設只綁 loopback。
+   - 在 Kairos 主機上：開啟 `https://127.0.0.1:9443/`。
+   - 從管理電腦經 SSH 轉送：`ssh -L 9443:127.0.0.1:9443 <管理者>@<Kairos 主機>`，再開啟 `https://127.0.0.1:9443/`。
+   - 開放給管理網段：在 `kairos.toml` 的 `[console]` 設定 `listen = "0.0.0.0:9443"`，重新啟動 Kairos，並以防火牆只允許管理網段連到 9443。
+2. **憑證**：預設沿用 agent 連接埠的伺服器憑證（`server.cert_path`），瀏覽器通常會顯示「不受信任」。正式使用時以 `console.cert_path`／`console.key_path` 設定由組織 CA 簽發、SAN 為主控台網址（例如 `monitor.example.gov.tw`）的憑證（依 `server.reload_interval_secs` 熱重載），並把組織 CA 匯入管理電腦。
+3. **首位管理員登入**：以 9.4 建立的 `admin` 與一次性初始密碼登入，畫面會先要求變更密碼（至少 12 個字元、不包含帳號、不是常見密碼）；完成後進入「總覽」。接著在右上角「個人設定」啟用兩步驟驗證並保存 10 組復原碼。
+4. **確認**：總覽的六個狀態磚與「資料時間」、主機清單的總數與 `kairos hosts list` 一致；右上角的系統狀態燈顯示系統健康的整體狀態與第一個需要注意的項目（細節以 `GET /api/v1/system/health` 或 `kairos --check-config` 查看；系統健康畫面之後提供）。
+5. **瀏覽器需求**：Chromium（Chrome、Edge）最近的版本（Trusted Types 需要 Chromium；Firefox、Safari 可以使用，但未在發佈前測試）。需要啟用 JavaScript；不需要外部網路（所有檔案都由 Kairos 提供）。
+
+- 閒置 30 分鐘（`accounts.session_idle_minutes`）沒有操作時自動登出，即使總覽仍在自動更新。
+- 0.7.0 的畫面：登入、總覽、主機清單、主機詳情、個人設定。告警、註冊與憑證、使用者、稽核、系統設定請先以 CLI（`kairos alerts`、`kairos enroll`、`kairos users`、`kairos audit`…）或 API 操作。
+- 反向代理：可以放在 nginx 等之後，代理必須保留原本的 `Host`（CSRF 檢查以 `Origin` 與 `Host` 比對）、不要緩衝 `/api/v1/events`（SSE）；所有使用者會共用代理的來源位址與登入失敗額度（API.md 第 4.3 節）。
 
 ## 10. 日常維運
 

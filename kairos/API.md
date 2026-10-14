@@ -18,7 +18,7 @@
 | 伺服器時間 | **每個回應**（含錯誤）的最外層都有 `server_time`：Kairos 產生回應時的系統時間，讓主控台計算相對時間（「3 分鐘前」）時不依賴瀏覽器的時鐘 |
 | 方法 | 查詢端點只有 `GET`（`HEAD` 視同 `GET` 但不回本文），其他方法回 405（`Allow: GET, HEAD`）。0.5.0 起註冊與 PKI 的管理端點另有 `POST`、`PUT`（第 11 節） |
 | 快取 | 所有回應 `Cache-Control: no-store` |
-| CORS | **預設關閉**：不回任何 `Access-Control-*` 標頭，瀏覽器的跨來源請求一律失敗。主控台日後與 API 同源提供，不需要 CORS |
+| CORS | **預設關閉**：不回任何 `Access-Control-*` 標頭，瀏覽器的跨來源請求一律失敗。網頁介面與 API 同源提供（0.7.0〔草稿〕，第 14 節），不需要 CORS |
 | 字元 | 主機名稱等由 agent 提供的字串原樣輸出（JSON 跳脫），顯示時由主控台處理（Pulse 已把不能顯示的字元換成 `?`） |
 
 ### 1.1 成功回應
@@ -177,7 +177,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 
 ### 4.3 失敗的速率限制
 
-- 同一來源（IPv4 位址；IPv6 以 /64 合併，與 agent 連線埠的新連線速率相同）**驗證失敗**（含登入失敗，第 12.2 節）時扣額度：可連續 10 次，之後每 6 秒恢復 1 次（每分鐘 10 次）。額度用完時該來源的**所有請求**回 429 `rate_limited`（`Retry-After` 為恢復 1 次所需的秒數），不再檢查 token，直到額度恢復。成功的請求不扣額度。
+- 同一來源（IPv4 位址；IPv6 以 /64 合併，與 agent 連線埠的新連線速率相同）**驗證失敗**（含登入失敗，第 12.2 節）時扣額度。0.7.0 起**沒有出示任何憑據**（沒有 `Authorization`、也沒有工作階段 cookie，例如未登入的瀏覽器開啟主控台時讀取 `/api/v1/me`）回 401 但**不扣額度**：沒有猜測任何秘密，否則同一個 NAT 後的使用者重新整理登入頁幾次就會被限速；出示了錯誤或失效的 token、工作階段照常扣。額度：可連續 10 次，之後每 6 秒恢復 1 次（每分鐘 10 次）。額度用完時該來源的**所有請求**回 429 `rate_limited`（`Retry-After` 為恢復 1 次所需的秒數），不再檢查 token，直到額度恢復。成功的請求不扣額度。
 - 每個來源第一次被限制時記一行 `WARN`（`警告 KRS-W6011：主控台 API：來自 … 的請求驗證失敗太多次…`；同一來源恢復額度前不再記），不記錄 token 內容。
 - 記憶體中最多追蹤 10,000 個來源，超過時清掉最久沒有失敗的來源。
 
@@ -197,6 +197,8 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `GET /api/v1/hosts` | S04 主機清單、全域搜尋、S03 連結 | 清冊列表：篩選、排序、游標分頁、總數（第 5.1 節） |
 | `GET /api/v1/hosts/{agent_id}` | S05 主機詳情 | 單台詳情（第 5.2 節） |
 | `GET /api/v1/hosts/{agent_id}/metrics` | S05 趨勢分頁 | 這台主機目前回報的指標（名稱、單位、label 組合） |
+| `GET /api/v1/hosts/facets` | S04 篩選列、S03 群組健康 | 範圍內主機的 OS、agent 版本、標籤、群組、離線原因與各自的台數（0.7.0，第 5.7 節） |
+| `GET /api/v1/hosts/{agent_id}/connections` | S05「連線與憑證」 | 這台主機在 Kairos 這次啟動後的上線與離線紀錄（記憶體中；0.7.0，第 5.8 節） |
 | `GET /api/v1/hosts/{agent_id}/metrics/{name}` | S05 趨勢、S03 sparkline | 指標趨勢（第 5.3 節） |
 | `GET /api/v1/overview` | S03 總覽 | 各狀態台數、上線數 24 小時、離線最久、資源使用前 10（第 5.4 節） |
 | `GET /api/v1/system/health` | S20 系統健康、S03 健康條 | 檢查項目與數值（第 5.5 節） |
@@ -326,6 +328,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
   - 記錄在記憶體中（最多 1 萬台），每 10 秒寫入主機清冊（`hosts.cert_rejected_at`、`cert_rejection`），重新啟動後仍在。清冊中沒有的 `agent_id`（例如已清除的主機）只留在記憶體中。
   - 連線中被踢掉（熱重載後重新驗證失敗，例如撤銷後 1 個重載週期內）的離線原因同樣是 `certificate_rejected`。
 - `offline_reason`（第 5.1 節）：`timeout`（超過離線門檻沒有合法訊息）、`connection_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。告警與 Webhook 使用另一組固定代碼（`idle_timeout`、`agent_closed`…，[`ALERTS.md`](ALERTS.md) 第 2 節）。只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
+- `certificate`（0.7.0）：這台主機最新一張由 Kairos 簽發的憑證的摘要 `{"state", "not_after", "revoked_at"}`，`state` 為 `valid`、`expiring`（30 天內到期）、`expired`、`revoked`；沒有簽發紀錄（手動配置的憑證）時為 `null`。只需要 `hosts:read`（設計包 S05：唯讀角色也看得到「有效，至 2028-01-12」）；序號、指紋與簽發方式需要 `pki:read`，見 `GET /api/v1/pki/certificates?agent_id=`（第 11.5 節）。
 - 404 `host_not_found`：清冊中沒有、狀態表中也沒有。
 
 `GET /api/v1/hosts/{agent_id}/metrics` 回傳這台主機最近一次 report 中的指標（v1 的三欄位 report 對應到 `system.cpu.usage`、`system.memory.total`、`system.memory.used`）：
@@ -443,6 +446,44 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - **日誌**：開始時 `WARN`「警告 KRS-W4202：資料庫已達容量上限，正在提早刪除最舊的資料（已使用 … bytes，上限 storage.max_total_bytes = … bytes）…」；結束時 `INFO`「KRS-W4202 結束：…這一輪刪除原始 report N 筆、5 分鐘彙總 M 列、1 小時彙總 L 列」，文字依設計包 `copywriting.md` §4.2 範例 68。沒有東西可刪時另記 `WARN`（節流）。
 - **事件紀錄**：開始與結束寫入資料庫 `meta.capacity_event`（JSON：`started_at`、`ended_at`、`used_bytes`、`limit_bytes`、各層刪除的筆數），重新啟動後仍可在系統健康查到最近一次。
 - **系統健康**：`database` 項目為警告並帶 `KRS-W4202`（第 5.5 節）。0.6.0 起另有告警事件（系統規則 `sys.db_capacity`，第 13 節）。
+
+### 5.7 `GET /api/v1/hosts/facets`（0.7.0）
+
+主機清單篩選列的選項與台數（設計包 S04 的「離線原因／群組／標籤／OS／agent 版本」下拉選單、S03「群組健康」）。只計算身分**範圍內**的主機（群組範圍的身分只看到自己的群組，第 12.1 節），不受其他篩選條件影響；由列表的記憶體索引回答（第 9 節），不查詢資料庫。權限 `hosts:read`；不接受查詢參數。
+
+```json
+{ "server_time": "…", "data": {
+  "total": 1181,
+  "os": { "values": [ { "value": "Windows", "count": 820 }, { "value": "Ubuntu", "count": 361 } ], "truncated": false },
+  "version": { "values": [ { "value": "0.6.0", "count": 1100 } ], "truncated": false },
+  "tag": { "values": [ { "value": "HMI", "count": 300 } ], "truncated": false },
+  "group": { "values": [ { "value": "B廠產線", "count": 300, "online": 290 } ], "truncated": false },
+  "no_group": { "count": 12, "online": 12 },
+  "offline_reason": { "values": [ { "value": "timeout", "count": 9 } ], "truncated": false },
+  "data_as_of": "…"
+} }
+```
+
+- 每一種依台數由多到少、再依值排序，最多 200 個（超過時 `truncated: true`）。值與列表的篩選參數相同（`os`、`version`、`tag`、`group`、`offline_reason`），可直接帶入 `GET /api/v1/hosts`。
+- `group[].online`：該群組線上的台數；`no_group`：沒有群組的主機。`offline_reason` 只計不在線上的主機（第 5.2 節的代碼）。
+- 路徑中的 `facets` 不會與 `agent_id`（UUID）衝突。
+
+### 5.8 `GET /api/v1/hosts/{agent_id}/connections`（0.7.0）
+
+這台主機最近的上線與離線（設計包 S05「連線與憑證」的連線紀錄、斷線紀錄的最小版本）。權限 `hosts:read`；範圍外或不存在的主機回 404 `host_not_found`。
+
+```json
+{ "server_time": "…", "data": {
+  "agent_id": "6f1c…", "since": "2026-10-15T00:00:02.000Z", "persisted": false, "max_entries": 50,
+  "entries": [
+    { "at": "2026-10-15T05:49:05.000Z", "event": "offline", "reason": "timeout", "ip": "10.30.3.27" },
+    { "at": "2026-10-15T01:00:02.000Z", "event": "online", "reason": null, "ip": "10.30.3.27" }
+  ]
+} }
+```
+
+- 由狀態表的變化累積（與 SSE 的 `host.*` 同一個來源），新到舊，每台主機最多 50 筆、最多 2 萬台（超過時捨棄最久沒有變化的主機）。**只在記憶體中**：`since` 為 Kairos 這次啟動的時間，重新啟動後從頭記錄（`persisted: false`）。
+- `reason` 為第 5.2 節的 `offline_reason`。每次連線的建立時間、來源連接埠、持續時間與協定錯誤碼的完整、持久的連線紀錄（設計包 §24 #2）屬於之後的版本。
 
 ## 6. 即時變更推送（SSE）
 
@@ -568,7 +609,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 - SSE 的事件只保留在記憶體中（4,096 則）；重新啟動後一律要求重新抓取。
 - 系統健康的「被拒的連線」是啟動以來的累計，不是設計包 S20 的「過去 1 小時」。
 - 主控台的設定（`[console]`）需要重新啟動才生效（憑證檔的內容會熱重載）。
-- 沒有網頁介面（F2）；本版的 API 是主控台的前提。
+- 網頁介面：0.7.0〔草稿〕起由主控台的監聽提供（第 14 節）；0.6 以前只有 API。
 
 **延後項目**
 
@@ -1151,3 +1192,21 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 ### 13.6 即時推送（SSE）
 
 第 6 節的 `/api/v1/events` 另有 `alert.created`、`alert.updated`、`alert.resolved`（`data` 為事件的摘要，欄位同第 13.2 節但沒有 `details`），編號與重連規則相同。只有內容（數值、台數）改變時不推送，最多每 60 秒寫回一次。
+
+## 14. 網頁介面與安全標頭（0.7.0〔草稿〕）
+
+主控台的監聽同時提供網頁介面（審計 F2；實作 `kairos/src/api/web.rs`，前端與慣例見 [`web/README.md`](web/README.md)）。網頁的檔案在編譯時嵌入執行檔（`kairos/build.rs`，依路徑排序、內容只取決於檔案本身，不影響可重現性），不讀取檔案系統。
+
+| 路徑 | 回應 |
+|---|---|
+| `/api/…` | 本文件的 API |
+| `/healthz`、`/readyz`、`/metrics` | 健康檢查（README「健康檢查與 Prometheus」）；`observability.on_console = false` 時為 JSON 的 404 |
+| `/assets/<檔案>` | 嵌入的檔案，`ETag`（內容的 SHA-256 前 16 bytes）、`Cache-Control: no-cache`，`If-None-Match` 相符時 304；不存在時 404 |
+| 最後一段含 `.` 的其他路徑 | 404（純文字） |
+| 其他路徑（`/`、`/login`、`/hosts/<agent_id>/metrics`…） | 單頁應用的 `index.html`，`Cache-Control: no-store`；畫面由瀏覽器端依網址決定（不需要驗證：資料一律經由需要驗證的 API）。第一段不是主控台的路由（`login`、`hosts`、`account`、`alerts`、`enrollment`、`certificates`、`audit`、`reports`、`admin`、`system`、`setup`、`error`、`docs`、`help`、`t`；設計包 `ia.md` §3）時本文同樣是 `index.html`（瀏覽器顯示 404 頁），但狀態碼為 **404**：例如 Pulse 的 `--enroll-server` 誤設為主控台的連接埠時，`/v1/enroll/server-info` 得到 404 而判定為不支援自動註冊（`PLS-E2106`） |
+
+- 只接受 `GET`／`HEAD`（其他 405，`Allow: GET, HEAD`）。
+- **每個回應**（API、健康檢查、網頁）都帶：`Strict-Transport-Security: max-age=31536000`（主控台只有 HTTPS；不加 `includeSubDomains`）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Cross-Origin-Opener-Policy: same-origin`、`Cross-Origin-Resource-Policy: same-origin`、`Permissions-Policy`。
+- **Content-Security-Policy**：網頁（`index.html`）為 `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'`（不允許 inline script、`eval`、inline style；Trusted Types 讓瀏覽器拒絕 `innerHTML` 等 DOM XSS 的入口）；其他回應為 `default-src 'none'; frame-ancestors 'none'`。
+- 網頁介面以工作階段的 cookie 驗證（第 12.3 節），寫入帶 `X-CSRF-Token`；不在瀏覽器的 storage 保存 token。
+- 網頁的請求不計入 `kairos_api_requests_total`（只計 API）。

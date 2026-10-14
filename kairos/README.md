@@ -13,6 +13,7 @@
 - 每秒檢查存活狀態，上線／離線／恢復都會記錄日誌（「標記為離線」與「從狀態表移除」每 10 秒最多各逐一記錄 20／5 個，其餘在時間窗結束後合併成一行摘要）；離線超過 24 小時的 agent 自動從狀態表移除；每 60 秒輸出一行摘要
 - 主控台 API（審計 F1；[API.md](API.md)）：HTTPS（預設只綁 `127.0.0.1:9443`，`console.listen`）的唯讀 `/api/v1`：主機清單（伺服器端篩選、排序、游標分頁、CIDR 搜尋、總數）、主機詳情（含補送狀態、握手時被拒的憑證）、指標趨勢（自動選原始資料或彙總，min／max／avg／count）、總覽 KPI、系統健康（資料庫用量與容量刪除 `KRS-W4202`、寫入統計、補送台數、連線、TLS 到期、檔案描述元）與即時變更推送（SSE）。以 API token 驗證（`kairos api-token create|list|revoke`，資料庫只存 SHA-256），1 萬台主機時列表 p99 約 10 ms
 - 使用者、角色與稽核（審計 F6；0.6.0〔草稿〕，API.md 第 12 節）：本機帳號（Argon2id、密碼政策、連續失敗鎖定、TOTP 兩步驟驗證與復原碼）與 LDAP／AD（bind 驗證、群組對應角色、TLS 一律驗證憑證）；四個內建角色（管理員、維運者、稽核員、唯讀）與主機群組範圍，所有 `/api/v1` 端點依集中定義的權限檢查；主控台的工作階段（`__Host-` cookie、HttpOnly、Secure、SameSite=Strict、CSRF token、閒置與絕對逾時、D25 的兩種結束 API）；稽核事件以 SHA-256 雜湊鏈保存（`kairos audit verify` 指出第一個斷點，`kairos audit export` 匯出 JSONL）。首位管理員以 `kairos users create <帳號> --role admin` 建立（沒有預設帳號與密碼）
+- 主控台網頁介面（審計 F2；0.7.0〔草稿〕，[web/README.md](web/README.md)）：與 API 同一個 HTTPS 監聽（`https://127.0.0.1:9443/`），網頁檔在編譯時嵌入執行檔（不需要另外安裝、沒有 npm 建置步驟）。登入（本機／AD、兩步驟驗證、第一次登入變更密碼）、總覽、主機清單（伺服器端篩選與排序、CIDR 搜尋、即時更新）、主機詳情（趨勢圖、連線紀錄、憑證）、全域搜尋（Ctrl+K）與個人設定；選單與按鈕依角色權限顯示；嚴格的 CSP（不允許 inline script、Trusted Types）、HSTS 等安全標頭
 - 主機清冊（審計 A6）：所有出現過的主機保存在 SQLite（`hosts`），每 30 秒從狀態表同步、關機時寫入最後狀態；重新啟動時最近 24 小時內出現過的主機以離線狀態放回狀態表（`agents.json` 不再重新啟動就清空）。`kairos hosts list [--offline-for 3d]` 查詢哪些主機已失聯多久
 - 驗證 hello 欄位（`agent_id` 必須是 UUID 文字格式，`hostname`、`agent_version` 有長度與字元限制），並以 `limits.max_agents` 限制狀態表筆數（預設 `max(10000, server.max_connections)`；滿時先淘汰離線最久的 agent，沒有可淘汰者才拒絕新的 `agent_id`），避免狀態表與 `agents.json` 被任意資料灌爆
 - 預設拒絕未認證的對外監聽：監聽非 loopback 位址（例如 `0.0.0.0`）又沒有設定 `auth.client_ca` 時拒絕啟動，除非明確設定 `auth.allow_unauthenticated = true`（見「啟用 mTLS」）
@@ -498,6 +499,18 @@ kairos api-token revoke <token_id> --yes --config kairos.toml
 - 驗證失敗依來源 IP 速率限制（連續 10 次後每 6 秒 1 次）；token 的建立與撤銷由執行中的 Kairos 寫入日誌。
 - 主控台在自己的 tokio runtime 上執行、以唯讀連線查詢資料庫，不影響 agent 連線與 report 的 `ack`（API.md 第 9 節）。
 - 握手時被拒的客戶端憑證（已撤銷、已過期）以 SAN 歸屬到主機，主機詳情與列表的離線原因顯示「憑證被拒」；不受信任的 CA 簽發的憑證不歸屬（避免冒用）。
+
+## 主控台網頁介面（0.7.0〔草稿〕）
+
+架構、慣例與測試見 [web/README.md](web/README.md)；伺服器端的規則（路徑、快取、安全標頭）見 [API.md](API.md) 第 14 節。
+
+1. 以服務帳號建立首位管理員（一次性密碼只在 stdout 顯示這一次）：`sudo -u kairos /opt/kairos/kairos users create admin --role admin --config /opt/kairos/kairos.toml`。
+2. 以瀏覽器開啟 `https://<Kairos 主機>:9443/`（預設只綁 `127.0.0.1:9443`：在 Kairos 主機上開啟，或以 SSH 轉送 `ssh -L 9443:127.0.0.1:9443 <Kairos 主機>` 後開啟 `https://127.0.0.1:9443/`；開放給管理網段時把 `console.listen` 改為 `0.0.0.0:9443` 並以防火牆限制來源）。
+3. 以 `admin` 與初始密碼登入，依畫面變更密碼；之後在「個人設定」啟用兩步驟驗證，並為其他人建立各自的帳號。
+
+- 主控台的憑證預設沿用 `server.cert_path`；要讓瀏覽器信任時以 `console.cert_path`／`key_path` 設定 SAN 為主控台網址、由組織 CA 簽發的憑證（自簽憑證時瀏覽器會顯示警告）。
+- 網頁介面只用同源的 API 與工作階段 cookie（HttpOnly、SameSite=Strict），不在瀏覽器保存 token；顯示偏好（主題、時區）只存在各自的瀏覽器。
+- 0.7.0 的畫面：登入、總覽、主機清單、主機詳情、個人設定；告警、註冊與憑證、使用者、稽核、系統設定的畫面尚未提供，請以 CLI 或 API 操作（沒有畫面的功能不顯示在選單中）。
 
 ## 使用者、角色與稽核（0.6.0〔草稿〕）
 
