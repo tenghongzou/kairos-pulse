@@ -82,18 +82,33 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
 
 /// 啟動主控台（SQLite 資料庫、狀態表、一個唯讀 token）
 pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fixture {
-    fixture_with(tag, tweak, false).await
+    fixture_opts(tag, tweak, false, None).await
 }
 
 fn real_clock() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// [`fixture`]；`alerts` 時另外啟動告警服務（與正式程式相同的執行緒與判定週期）
+/// [`fixture`]，另可替換目錄服務（LDAP）
 pub(crate) async fn fixture_with(
     tag: &str,
     tweak: impl FnOnce(&mut AppConfig),
+    directory: Option<Arc<dyn crate::users::ldap::Directory>>,
+) -> Fixture {
+    fixture_opts(tag, tweak, false, directory).await
+}
+
+/// [`fixture`]，另外啟動告警服務（與正式程式相同的執行緒與判定週期）
+pub(crate) async fn fixture_alerts(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fixture {
+    fixture_opts(tag, tweak, true, None).await
+}
+
+/// [`fixture`]；`alerts` 時另外啟動告警服務，`directory` 替換目錄服務（LDAP）
+pub(crate) async fn fixture_opts(
+    tag: &str,
+    tweak: impl FnOnce(&mut AppConfig),
     alerts: bool,
+    directory: Option<Arc<dyn crate::users::ldap::Directory>>,
 ) -> Fixture {
     let dir = temp_dir(tag);
     let mut config = AppConfig::default();
@@ -175,6 +190,7 @@ pub(crate) async fn fixture_with(
         agent_listen: "127.0.0.1:8080".parse().unwrap(),
         enroll: None,
         alerts: alert_svc.clone(),
+        directory,
     })
     .await
     {
@@ -215,7 +231,7 @@ fn connector() -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
-async fn connect(addr: SocketAddr) -> TlsStream<TcpStream> {
+pub(crate) async fn connect(addr: SocketAddr) -> TlsStream<TcpStream> {
     let tcp = TcpStream::connect(addr).await.unwrap();
     connector()
         .connect(
@@ -277,6 +293,27 @@ fn request_text(method: &str, path: &str, token: Option<&str>, extra: &[(&str, &
     }
     req.push_str("\r\n");
     req
+}
+
+/// 送出一個已組好的請求（含標頭與本文）並讀完回應
+pub(crate) async fn send_raw(addr: SocketAddr, raw: &[u8]) -> Resp {
+    let mut tls = connect(addr).await;
+    tls.write_all(raw).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, tls.read_to_end(&mut buf))
+        .await
+        .expect("讀取回應逾時")
+        .ok();
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("回應沒有標頭");
+    let (status, headers) = parse_head(&String::from_utf8_lossy(&buf[..split]));
+    Resp {
+        status,
+        headers,
+        body: buf[split + 4..].to_vec(),
+    }
 }
 
 /// 送出一個請求並讀完回應

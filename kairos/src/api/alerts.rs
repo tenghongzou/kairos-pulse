@@ -1,9 +1,11 @@
-//! 告警的端點（`kairos/API.md` 第 12 節；設計包 S06～S11、§24 #9）：事件、規則、靜音與維護時段、
+//! 告警的端點（`kairos/API.md` 第 13 節；設計包 S06～S11、§24 #9）：事件、規則、靜音與維護時段、
 //! 通知管道。
 //!
 //! **權限集中標記**：每個端點需要的權限只在 [`route`] 這一張表決定（[`ROUTES`] 是同一張表的文件版，
-//! 測試確認兩者一致）。之後的使用者與角色（RBAC）只要把角色對應到 [`Permission`]，端點不需修改。
-//! 寫入都寫入 `audit_events`（類別 `alerts`；執行者 `token:<token_id>`、來源 IP）。
+//! 測試確認兩者一致）。權限與角色的對應在 [`crate::rbac`]（管理員全部；維運者處理事件、自訂規則、靜音、
+//! 管道的清單與測試；稽核員與唯讀唯讀，`ia.md` §4.2）。驗證（API token 或工作階段；工作階段的寫入另需
+//! CSRF token）在 [`super::route`] 完成後才進入這裡。
+//! 寫入都寫入稽核雜湊鏈（`audit_events`，類別 `alerts`；執行者 `token:<token_id>` 或 `user:<帳號>`、來源 IP）。
 
 use chrono::{DateTime, Utc};
 use hyper::body::Incoming;
@@ -211,7 +213,8 @@ pub fn route(method: &str, rest: &[&str]) -> Option<(Endpoint, Permission)> {
     })
 }
 
-/// 這個路徑是否屬於告警的端點
+/// 這個路徑是否屬於告警的端點（路由在 [`super::route`] 的 `known_route`；這裡供測試對照）
+#[cfg(test)]
 pub fn owns(path: &str) -> bool {
     [
         "/api/v1/alerts",
@@ -324,32 +327,15 @@ impl Ctx<'_> {
     }
 }
 
-/// 處理 `/api/v1/alerts…`、`/alert-rules…`、`/silences…`、`/channels…`
+/// 處理 `/api/v1/alerts…`、`/alert-rules…`、`/silences…`、`/channels…`（已通過驗證；
+/// 驗證與 CSRF 在 [`super::route`]）
 pub async fn handle(
-    ctx: Arc<ApiContext>,
-    peer: SocketAddr,
-    req: Request<Incoming>,
-) -> Response<ApiBody> {
-    let now = Utc::now();
-    match dispatch(&ctx, peer, req, now).await {
-        Ok(r) => r,
-        Err(e) => e.into_response(Utc::now()),
-    }
-}
-
-async fn dispatch(
     ctx: &Arc<ApiContext>,
     peer: SocketAddr,
     req: Request<Incoming>,
+    principal: &Principal,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
-    if ctx.shutdown.started_at().is_some() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shutting_down",
-            "Kairos 正在關機",
-        ));
-    }
     let segs = segments(req.uri().path());
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let ["api", "v1", rest @ ..] = segs.as_slice() else {
@@ -371,7 +357,6 @@ async fn dispatch(
         }
     })?;
     let query = Query::parse(req.uri().query())?;
-    let principal = ctx.auth.authenticate(req.headers(), peer.ip(), now).await?;
     principal.require(permission)?;
     let svc = ctx.alerts.clone().ok_or_else(unavailable)?;
     let body = if method == Method::POST || method == Method::PUT || method == Method::DELETE {
@@ -381,7 +366,7 @@ async fn dispatch(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim() != "0");
         if has_len {
-            super::enroll::read_body(req, MAX_BODY).await?
+            http::read_json(req, MAX_BODY).await?
         } else {
             json!({})
         }
@@ -391,8 +376,8 @@ async fn dispatch(
     let c = Ctx {
         api: ctx,
         svc: &svc,
-        principal: &principal,
-        actor: format!("token:{}", principal.token_id()),
+        principal,
+        actor: principal.actor(),
         ip: peer.ip().to_canonical().to_string(),
         now,
     };
@@ -2314,13 +2299,26 @@ mod tests {
         assert!(
             owns("/api/v1/alerts") && owns("/api/v1/channels/c-1/test") && !owns("/api/v1/alertsx")
         );
-        // 讀取為 read、處理為 operate、管道的設定為 admin
-        assert_eq!(Permission::AlertsRead.required_scope(), "read");
-        assert_eq!(Permission::AlertsWrite.required_scope(), "operate");
-        assert_eq!(Permission::ChannelsRead.required_scope(), "operate");
-        assert_eq!(Permission::ChannelsWrite.required_scope(), "admin");
-        assert_eq!(Permission::AlertRulesAdmin.required_scope(), "admin");
+        // 讀取為唯讀以上、處理為維運者以上、管道的設定為管理員（角色對應在 crate::rbac）
+        use crate::rbac::Role;
+        assert_eq!(Permission::AlertsRead.least_role(), Role::Viewer);
+        assert_eq!(Permission::AlertsWrite.least_role(), Role::Operator);
+        assert_eq!(Permission::ChannelsRead.least_role(), Role::Operator);
+        assert_eq!(Permission::ChannelsWrite.least_role(), Role::Admin);
+        assert_eq!(Permission::AlertRulesAdmin.least_role(), Role::Admin);
         assert_eq!(Permission::SilencesWrite.name(), "silences:write");
+        // 每個寫入的端點都不是唯讀的權限；每個權限都在 rbac 的列舉中
+        for (method, _, perm) in ROUTES {
+            assert!(crate::rbac::Permission::ALL.contains(perm));
+            if *method != "GET"
+                && !matches!(perm, Permission::AlertRulesRead | Permission::SilencesRead)
+            {
+                assert!(
+                    !crate::rbac::Role::Viewer.permissions().contains(*perm),
+                    "{method} {perm:?}"
+                );
+            }
+        }
     }
 
     #[test]

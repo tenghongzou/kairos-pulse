@@ -1,8 +1,8 @@
 # Kairos 主控台 API（v1）
 
-本文件是 Kairos 主控台與外部整合使用的查詢與管理 API 的規格（商業審計 F1；設計包 `kairos/screens.md` §24 #1、#3、#4、#5、#19 的後端部分）。0.4.0〔草稿〕起提供第一版：**唯讀**的主機清冊、單台詳情、指標趨勢、總覽 KPI、系統健康與即時變更推送（SSE），以 API token 驗證。使用者、角色與工作階段（#10、F6）屬於之後的版本，本版預留了接入的位置（第 4.4 節）。
+本文件是 Kairos 主控台與外部整合使用的查詢與管理 API 的規格（商業審計 F1；設計包 `kairos/screens.md` §24 #1、#3、#4、#5、#19 的後端部分）。0.4.0〔草稿〕起提供第一版：**唯讀**的主機清冊、單台詳情、指標趨勢、總覽 KPI、系統健康與即時變更推送（SSE），以 API token 驗證。0.6.0〔草稿〕起另有使用者、角色（RBAC）、主控台的工作階段與稽核雜湊鏈（設計包 #10、#11、D25；審計 F6），見第 12 節。
 
-- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0〔草稿〕的告警（事件、規則、靜音、通知管道）見第 12 節。
+- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0〔草稿〕的使用者、角色與稽核見第 12 節，告警（事件、規則、靜音、通知管道）見第 13 節。
 - 實作：`kairos/src/api/`（HTTP 伺服器、驗證、各端點）、`kairos/src/token_cli.rs`（`kairos api-token`）。
 - 量測（1 萬台主機的列表、30 天趨勢、與 report 寫入同時進行時的 `ack` 延遲）見第 9 節：列表 p99 約 10 ms、30 天趨勢 p99 約 8～13 ms（目標 200／300 ms）。
 
@@ -55,8 +55,17 @@
 |---|---|---|---|
 | 400 | `invalid_parameter` | — | 查詢參數不合法（`details.parameter` 寫出是哪一個） |
 | 400 | `invalid_cursor` | — | `cursor` 無法解析、或與目前的排序不符（改變排序後要從第一頁開始） |
-| 401 | `unauthorized` | `KRS-E6010` | 沒有 `Authorization`、格式錯誤、token 不存在、已撤銷或已過期（對外不區分），附 `WWW-Authenticate: Bearer realm="kairos"` |
-| 403 | `forbidden` | `KRS-E6104` | token 的範圍不包含這個操作（`details.required` 為所需的範圍；第 11.1 節） |
+| 401 | `unauthorized` | `KRS-E6010` | 沒有 `Authorization`（或工作階段）、格式錯誤、token 不存在、已撤銷或已過期（對外不區分），附 `WWW-Authenticate: Bearer realm="kairos"`；工作階段已結束或逾時時 `details.reason = "session_expired"`（第 12.3 節） |
+| 401 | `invalid_credentials` | `KRS-E6001` | 登入的帳號或密碼不正確（不區分哪一個；第 12.2 節） |
+| 401 | `invalid_mfa_code` | `KRS-E6012`〔暫定〕 | TOTP 或復原碼不正確或已使用過 |
+| 401 | `mfa_challenge_expired` | — | 登入第二步的挑戰逾時或無效，重新輸入帳號密碼 |
+| 403 | `forbidden` | `KRS-E6104` | 權限不足：`details.permission` 為所需的權限、`details.required` 為擁有它的最低角色（0.4／0.5 的 token 為範圍；第 11.1、12.1 節） |
+| 403 | `account_locked` | `KRS-E6003` | 連續登入失敗而鎖定，附 `Retry-After` 與 `details.locked_until` |
+| 403 | `account_disabled` | `KRS-E6009` | 目錄服務回報帳號已停用或鎖定 |
+| 403 | `csrf_failed` | `KRS-E6105`〔暫定〕 | 以工作階段送出的寫入請求缺少或帶錯 `X-CSRF-Token`，或來自其他網站（第 12.3 節） |
+| 403 | `password_change_required` | `KRS-E6013`〔暫定〕 | 第一次登入必須先變更密碼 |
+| 409 | `last_admin`、`cannot_target_self`、`target_is_self`、`user_exists`、`directory_account` | — | 使用者管理的防呆（第 12.5 節） |
+| 503 | `directory_unavailable` | `KRS-E6002`／`E6005`／`E6006`／`E6007` | 無法以目錄服務登入（`details.reason`） |
 | 404 | `not_found` | — | 沒有這個路徑 |
 | 404 | `host_not_found` | — | 清冊中沒有這個 `agent_id`（設計包 S05「主機不存在 → 404 頁」） |
 | 404 | `metric_not_found` | — | 這台主機在查詢範圍內沒有這個指標 |
@@ -112,9 +121,9 @@ GET /api/v1/hosts?status=offline&sort=-last_seen&limit=100&cursor=eyJ2IjoxLC...
 - 改變篩選條件時沿用游標仍可運作（以排序鍵定位）；改變**排序**時回 400 `invalid_cursor`，請從第一頁開始。
 - 不提供頁碼（設計包 `ia.md` §3.2：2 萬台時跳頁不一致）。
 
-## 4. 驗證（暫行：API token）
+## 4. 驗證：API token
 
-本版只有 **API token**：給主控台開發、整合（Grafana、腳本）與自動化使用。完整的使用者、角色與工作階段（設計包 §24 #10、D25；審計 F6）在之後的版本加入。
+**API token** 給整合（Grafana、腳本）與自動化使用；主控台的網頁介面以帳號登入、使用工作階段的 cookie（0.6.0〔草稿〕，第 12.2、12.3 節）。兩者得到同樣的身分（`Principal`）與權限（第 12.1 節）。
 
 ### 4.1 token
 
@@ -125,7 +134,7 @@ Authorization: Bearer kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuL
 - 格式：`kat_` ＋ 16 個十六進位字元的 **token_id**（公開的識別碼，用於列表、撤銷與日誌）＋ `_` ＋ 43 個 base64url 字元的**秘密**（32 bytes 隨機值，以作業系統的 CSPRNG 產生）。`kat_` 前綴讓 secret 掃描工具容易辨識。
 - 伺服器只保存秘密的 **SHA-256 雜湊**（`api_tokens.secret_hash`）。秘密有 256 位元的亂度，不需要慢速雜湊（bcrypt／Argon2 是為了低亂度的密碼）。比對時先以 token_id 查詢，再以**常數時間**比較雜湊；token_id 不存在時仍做一次同樣的比較，回應時間不洩漏 token_id 是否存在。
 - token 只在建立時顯示一次，之後無法取回；遺失時撤銷後重新建立。
-- **範圍**（`scope`）：`read`（唯讀：所有 `GET` 端點；預設）、`operate`、`admin`（0.5.0，第 11.1 節；階層式 admin ⊃ operate ⊃ read）。範圍不足的請求回 403。
+- **權限**：0.6 起 token 屬於某個**角色**（`--role`，預設 `viewer`）或某個**使用者**（`--user`，權限＝使用者目前的權限）；0.4／0.5 建立的 token 保留原本的範圍 `read`／`operate`／`admin`，權限凍結在升級前（第 12.1 節）。權限不足的請求回 403。
 - **到期**：建立時指定，預設 90 天、上限 3,650 天；不提供不過期的 token（設計包 `cli-style.md` §11.6：外洩後只能靠人工撤銷）。需要長期使用的整合以 `--expires-in 3650d` 建立，`kairos api-token list` 出現 14 天內到期的提示時輪替。到期後回 401（`KRS-E6010`）。
 - **最後使用**：成功驗證時在記憶體中記下時間與來源 IP，每 60 秒以一個短交易寫回資料庫（`last_used_at`、`last_used_ip`；`kairos api-token list` 顯示）。
 - 回應、日誌與 `kairos api-token list` 都不會出現秘密或雜湊；日誌只記 token_id 與名稱。
@@ -133,7 +142,7 @@ Authorization: Bearer kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuL
 ### 4.2 `kairos api-token`
 
 ```
-kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期或時間>] [--scope read|operate|admin] [--json] [--config <檔案>]
+kairos api-token create --name <名稱> [--role <角色> | --user <帳號> [--role <角色>]] [--expires-in <時間> | --expires-at <日期或時間>] [--json] [--config <檔案>]
 kairos api-token list [--all] [--json] [--config <檔案>]
 kairos api-token revoke <token_id> [--reason <原因>] [--yes] [--json] [--config <檔案>]
 ```
@@ -164,43 +173,47 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - 結束代碼：0 完成、1 資料庫錯誤、2 用法錯誤、3 設定錯誤、10 權限不足（以 root 執行而資料目錄屬於服務帳號時拒絕，與 `kairos reports import` 相同）、11 資料庫被 `kairos reports import` 獨占中。
 - 以服務帳號執行（`sudo -u kairos`），Kairos 執行中也可以（只寫一個短交易）；資料庫不存在時建立（並升級 schema）。
 
-**稽核**：建立與撤銷都寫入 `api_tokens`（建立者與撤銷者為執行命令的作業系統帳號：`SUDO_USER`、`USER`、`LOGNAME` 依序取第一個有值的，另記 uid；撤銷原因），並由執行中的 Kairos 在 **10 秒內**寫入 Kairos 的日誌（`INFO`「API token 已建立／已撤銷：token_id …、名稱 …、範圍 …、到期 …、建立者 …」；Kairos 未執行時在下次啟動時寫入）。完整、不可竄改的稽核雜湊鏈（設計包 §24 #11）屬於之後的版本。
+**稽核**：建立與撤銷都寫入 `api_tokens`（建立者與撤銷者為執行命令的作業系統帳號：`SUDO_USER`、`USER`、`LOGNAME` 依序取第一個有值的，另記 uid；撤銷原因），並在同一個交易中寫入稽核雜湊鏈（0.6，第 12.8 節）；執行中的 Kairos 另在 **10 秒內**寫入 Kairos 的日誌（`INFO`「API token 已建立／已撤銷：token_id …、名稱 …、範圍 …、到期 …、建立者 …」；Kairos 未執行時在下次啟動時寫入）。
 
 ### 4.3 失敗的速率限制
 
-- 同一來源（IPv4 位址；IPv6 以 /64 合併，與 agent 連線埠的新連線速率相同）**驗證失敗**時扣額度：可連續 10 次，之後每 6 秒恢復 1 次（每分鐘 10 次）。額度用完時該來源的**所有請求**回 429 `rate_limited`（`Retry-After` 為恢復 1 次所需的秒數），不再檢查 token，直到額度恢復。成功的請求不扣額度。
+- 同一來源（IPv4 位址；IPv6 以 /64 合併，與 agent 連線埠的新連線速率相同）**驗證失敗**（含登入失敗，第 12.2 節）時扣額度：可連續 10 次，之後每 6 秒恢復 1 次（每分鐘 10 次）。額度用完時該來源的**所有請求**回 429 `rate_limited`（`Retry-After` 為恢復 1 次所需的秒數），不再檢查 token，直到額度恢復。成功的請求不扣額度。
 - 每個來源第一次被限制時記一行 `WARN`（`警告 KRS-W6011：主控台 API：來自 … 的請求驗證失敗太多次…`；同一來源恢復額度前不再記），不記錄 token 內容。
 - 記憶體中最多追蹤 10,000 個來源，超過時清掉最久沒有失敗的來源。
 
-### 4.4 之後接入工作階段與 RBAC 的位置
+### 4.4 工作階段與 RBAC（0.6.0〔草稿〕，已實作）
 
-- 每個請求先經過 `api::auth::authenticate`，得到 `Principal`（目前只有 `Principal::ApiToken { token_id, name, scope }`）。之後加入 `Principal::Session { user, roles, scopes }`（cookie＋CSRF token，D25 的「結束某使用者全部工作階段」以 `sessions` 表處理），端點不需修改。
-- 端點以 `principal.require(Permission::HostsRead)` 檢查權限；目前 `read` 範圍包含所有讀取權限，日後角色（管理員、維運者、稽核員、唯讀，`ia.md` §4.1）對應到一組 `Permission`。
-- 群組範圍（`ia.md` §4.3）：主機清冊的篩選在 `HostIndex::query` 以 `principal.host_filter()` 加上一層條件，總數與 KPI 也只算範圍內的主機。本版沒有群組，`host_filter()` 一律為全部。
-- `GET /api/v1/me` 回傳目前的身分，主控台以它決定顯示哪些功能（權限差異）。
+- 每個請求先經過 `api::auth::Authenticator::authenticate`（`Authorization` 優先，其次是工作階段的 cookie），得到 `Principal`（`ApiToken` 或 `Session`）與它的權限（`Grants`：全站的一組，加上每個主機群組的一組）。
+- 端點以 `principal.require(Permission::…)` 檢查權限（集中定義在 `kairos/src/rbac.rs`）；主機的讀取另以 `principal.host_access()` 篩選群組範圍（列表、詳情、趨勢、總覽、SSE）。
+- `GET /api/v1/me` 回傳目前的身分與 `permissions`，主控台以它決定顯示哪些功能（權限差異）。
+- 詳見第 12 節。
 
 ## 5. 端點
 
 | 方法與路徑 | 用途（設計包畫面） | 說明 |
 |---|---|---|
-| `GET /api/v1/me` | 全部 | 目前的身分與範圍（第 5.0 節） |
+| `GET /api/v1/me` | 全部 | 目前的身分與權限（第 5.0、12.4 節） |
+| `/api/v1/auth/…`、`/api/v1/me/…`、`/api/v1/users…`、`/api/v1/roles`、`/api/v1/directory…`、`/api/v1/api-tokens…`、`/api/v1/audit…` | S01、S16、S17、S18、S21、S23 | 登入、工作階段、使用者與角色、目錄服務、API token、稽核日誌（第 12 節） |
 | `GET /api/v1/hosts` | S04 主機清單、全域搜尋、S03 連結 | 清冊列表：篩選、排序、游標分頁、總數（第 5.1 節） |
 | `GET /api/v1/hosts/{agent_id}` | S05 主機詳情 | 單台詳情（第 5.2 節） |
 | `GET /api/v1/hosts/{agent_id}/metrics` | S05 趨勢分頁 | 這台主機目前回報的指標（名稱、單位、label 組合） |
 | `GET /api/v1/hosts/{agent_id}/metrics/{name}` | S05 趨勢、S03 sparkline | 指標趨勢（第 5.3 節） |
 | `GET /api/v1/overview` | S03 總覽 | 各狀態台數、上線數 24 小時、離線最久、資源使用前 10（第 5.4 節） |
 | `GET /api/v1/system/health` | S20 系統健康、S03 健康條 | 檢查項目與數值（第 5.5 節） |
-| `GET /api/v1/events` | S04「有 12 台狀態變化」、S03 自動更新、S06 | 即時變更推送（SSE，第 6 節；告警的 `alert.*` 見第 12.6 節） |
-| `/api/v1/alerts…`、`/alert-rules…`、`/silences…`、`/channels…` | S06～S11 | 告警（第 12 節） |
+| `GET /api/v1/events` | S04「有 12 台狀態變化」、S03 自動更新、S06 | 即時變更推送（SSE，第 6 節；告警的 `alert.*` 見第 13.6 節） |
+| `/api/v1/alerts…`、`/alert-rules…`、`/silences…`、`/channels…` | S06～S11 | 告警（第 13 節） |
 
 ### 5.0 `GET /api/v1/me`
 
 ```json
 { "server_time": "…", "data": {
   "type": "api_token", "token_id": "3f9c2a71b4e05d18", "name": "grafana",
-  "scopes": ["read"], "expires_at": "2027-04-11T06:03:27.000Z"
+  "scopes": [], "role": "viewer", "owner": null, "expires_at": "2027-04-11T06:03:27.000Z",
+  "permissions": ["hosts:read", "health:read"], "group_permissions": {}
 } }
 ```
+
+`scopes` 只在 0.4／0.5 建立的 token 有值（`["read"]` 等）。工作階段的回應見第 12.4 節。
 
 ### 5.1 `GET /api/v1/hosts`
 
@@ -429,7 +442,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 
 - **日誌**：開始時 `WARN`「警告 KRS-W4202：資料庫已達容量上限，正在提早刪除最舊的資料（已使用 … bytes，上限 storage.max_total_bytes = … bytes）…」；結束時 `INFO`「KRS-W4202 結束：…這一輪刪除原始 report N 筆、5 分鐘彙總 M 列、1 小時彙總 L 列」，文字依設計包 `copywriting.md` §4.2 範例 68。沒有東西可刪時另記 `WARN`（節流）。
 - **事件紀錄**：開始與結束寫入資料庫 `meta.capacity_event`（JSON：`started_at`、`ended_at`、`used_bytes`、`limit_bytes`、各層刪除的筆數），重新啟動後仍可在系統健康查到最近一次。
-- **系統健康**：`database` 項目為警告並帶 `KRS-W4202`（第 5.5 節）。0.6.0 起另有告警事件（系統規則 `sys.db_capacity`，第 12 節）。
+- **系統健康**：`database` 項目為警告並帶 `KRS-W4202`（第 5.5 節）。0.6.0 起另有告警事件（系統規則 `sys.db_capacity`，第 13 節）。
 
 ## 6. 即時變更推送（SSE）
 
@@ -460,7 +473,7 @@ data: {"agent_id":"6f1c…","hostname":"hmi-line3-07","display_name":null,"statu
 | `host.added` | 清冊中沒有的主機第一次上線（新主機） | 同下，`status` 為 `online` |
 | `host.online` | 上線、重新上線、離線後恢復 | `agent_id`、`hostname`、`display_name`、`status`、`at`、`ip` |
 | `host.offline` | 離線 | 同上，另有 `reason`（第 5.2 節的 `offline_reason`） |
-| `alert.created`、`alert.updated`、`alert.resolved` | 告警事件的變化（0.6.0，第 12.6 節） | 事件的摘要 |
+| `alert.created`、`alert.updated`、`alert.resolved` | 告警事件的變化（0.6.0，第 13.6 節；只送給有 `alerts:read` 的身分） | 事件的摘要 |
 | `resync` | 要求重新抓取列表（見下） | `reason`：`restarted`（Kairos 重新啟動過）、`too_old`（`Last-Event-ID` 已不在保留範圍）、`overflow`（連線太慢、事件來不及送出） |
 | 心跳 | 每 15 秒一行註解（`: heartbeat <時間>`） | 讓代理伺服器與用戶端偵測斷線；不是事件，不改變 `Last-Event-ID` |
 
@@ -548,7 +561,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 **本版的限制**
 
 - 只有唯讀端點；主機的顯示名稱、群組、標籤、除役、撤銷等寫入操作屬於之後的版本（需要 RBAC 與稽核雜湊鏈）。
-- 驗證只有 API token（暫行）：沒有使用者、角色、工作階段、LDAP（設計包 #10、D25、審計 F6）。所有 token 都是全站範圍、唯讀。
+- 使用者、角色、工作階段、LDAP 與稽核雜湊鏈：0.6.0〔草稿〕，第 12 節（延後項目見第 12.11 節）。
 - 主機狀態只有 `online`、`offline`、`unknown`；`critical`、`warning`（告警，F3）、`pending`（註冊，F5）的計數為 `null`。
 - 離線原因只有 Kairos 這次啟動後發生的（`timeout`、`connection_closed`、`server_shutdown`、`certificate_rejected`），不寫入清冊，重新啟動後為 `null`；設計包 #2 的完整分類與每台主機的連線紀錄屬於之後的版本。
 - 每分鐘的上線數（總覽的 24 小時 sparkline、「比 1 小時前」）只在記憶體中，重新啟動後從頭累積。
@@ -562,10 +575,9 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | 項目 | 原因 |
 |---|---|
 | 首次啟動精靈（設計包 S02、#14） | 本衝刺範圍外；`console.listen` 預設只綁 127.0.0.1:9443，管理者手動改為對外位址 |
-| `KRS-W4202` 的告警事件（S06） | 0.6.0 已加入（告警引擎的系統規則 `sys.db_capacity`，第 12 節） |
+| `KRS-W4202` 的告警事件（S06） | 0.6.0 已加入（告警引擎的系統規則 `sys.db_capacity`，第 13 節） |
 | 啟動時的容量警告改用宣告的 report 間隔（§24 #19、§25.5 #4） | 系統健康已以目前回報中的主機與各自宣告的間隔估算（`database.values.estimate`）；啟動時的 `WARN` 仍以 `server.max_connections` 的最壞情況估算，與設計包的精靈、S21 一起調整 |
 | 握手時被拒、但 SAN 不可信（自簽、不受信任的 CA）的連線 | 只記日誌（`KRS-W1109`），不歸屬到主機（第 5.2 節）；設計包「被拒連線嘗試」以來源 IP 呈現時再加入 |
-| 稽核雜湊鏈（#11） | token 的建立與撤銷目前記在 `api_tokens` 與 Kairos 的日誌 |
 | OpenAPI 文件 | 本文件為規格；端點穩定後再產生 OpenAPI 3.1 |
 
 **已決定（使用者已核准，衝刺 3 整合）**
@@ -587,7 +599,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 
 ### 11.1 寫入權限：範圍與 `Permission`
 
-本版第一次出現寫入端點，延伸第 4.4 節的 `Principal`／`Permission`：
+本版第一次出現寫入端點，延伸第 4.4 節的 `Principal`／`Permission`（0.6 起權限集中定義在 `kairos/src/rbac.rs`，名稱與角色的對應見第 12.1 節；下表的範圍只適用於 0.4／0.5 建立的 token）：
 
 | API token 的 `scope` | 包含 | 對應的角色（設計包 `ia.md` §4.1） |
 |---|---|---|
@@ -609,9 +621,9 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | `PkiQueue` | ✓ | ✓ | 離線模式的 CSR 佇列匯出與匯入、上傳 CRL（S15：維運者在管理員允許時） |
 | `PkiCaWrite` | | ✓ | 簽發 CA 的建立、安裝、啟用、退役（L3） |
 
-- 權限不足回 403 `forbidden`（`KRS-E6104`），`details.required` 為所需的範圍。
+- 權限不足回 403 `forbidden`（`KRS-E6104`），`details.required` 為所需的範圍（0.6 起另有 `details.permission`）。寫入端點的權限在註冊服務是否啟動之前檢查（沒有權限時一律 403）。
 - **寫入請求**：方法 `POST`、`PUT`；本文為 JSON（`Content-Type: application/json`，其他 415），上限 1 MiB（CSR 佇列匯入 32 MiB）；回應與錯誤格式同第 1 節。主控台日後以 cookie 工作階段呼叫時另需 CSRF token（第 4.4 節）。
-- **稽核**：每個寫入都寫入 `audit_events`（`PKI.md` 第 7 節）：執行者（`token:<token_id>` 或使用者）、來源 IP、對象、原因、結果；被拒絕的請求（403、409）也記錄。
+- **稽核**：每個寫入都寫入 `audit_events`（`PKI.md` 第 7 節；0.6 起接上雜湊鏈，第 12.8 節）：執行者（`token:<token_id>` 或 `user:<帳號>`）、來源 IP、對象、原因、結果；被拒絕（403）的寫入請求以 `access.denied` 記錄。
 - **危險操作的確認**（設計包 `screens.md` §0.3、`cli-style.md` §5.4 的 API 版）：L1 不需額外欄位；L2 必須帶 `reason`（撤銷、拒絕為必填）與 `expected_count`（等於這次處理的筆數，不符時 409 `count_mismatch`）；L3 必須帶 `confirm`（固定字串，例如 `"重建 CA"`）。影響範圍可能在送出前改變的操作（關閉註冊端點、縮短寬限期）另需第 11.4 節的 `impact_token`。
 
 新增的錯誤碼（`product_code` 依 `copywriting.md` §3.3 既有代碼；「—」為就地處理）：
@@ -769,28 +781,299 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 - `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
 - 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
 
-## 12. 衝刺 5：告警（草稿）
+## 12. 使用者、角色、工作階段與稽核（0.6.0〔草稿〕）
+
+衝刺 5，**已實作**（審計 F6、S7 的雜湊鏈部分；設計包 `kairos/screens.md` S01、S16、S17、S18、S23、§24 #10、#11、`README.md` D25）。程式：`kairos/src/rbac.rs`（權限的集中定義）、`kairos/src/users/`（密碼、TOTP、主控台金鑰、資料表、LDAP）、`kairos/src/audit.rs`（雜湊鏈）、`kairos/src/api/{auth,account,users,audit_log}.rs`、`kairos/src/users_cli.rs`、`kairos/src/audit_cli.rs`。資料庫為 **schema v6**（第 12.10 節）。
+
+### 12.1 權限、角色與範圍
+
+權限（`Permission`）集中定義在 `kairos/src/rbac.rs`：每個端點以 `principal.require(Permission::…)` 檢查，權限名稱（`<資源>:<動作>`）是對外的穩定識別字（`/api/v1/me` 的 `permissions`、403 的 `details.permission`）。新功能（例如告警的 `alerts:read`、`alerts:write`）只要在 `Permission` 加一個變體與名稱、加進 `Permission::ALL`，並在 `Role::permissions` 決定哪些角色擁有它。
+
+內建角色依設計包 `ia.md` §4.1、§4.2（自訂角色屬於 v1.0 之後）：
+
+| 權限 | 管理員 `admin` | 維運者 `operator` | 稽核員 `auditor` | 唯讀 `viewer` | 用於 |
+|---|:-:|:-:|:-:|:-:|---|
+| `hosts:read` | ✓ | ✓ | ✓ | ✓ | 主機、趨勢、總覽、SSE |
+| `health:read` | ✓ | ✓ | ✓ | ✓ | 系統健康（S20） |
+| `enroll:read` | ✓ | ✓ | ✓ | | 註冊 token、申請、模式（S12、S13） |
+| `enroll.tokens:write` | ✓ | ✓ | | | 建立需核准的 token、停用 |
+| `enroll.tokens:auto_approve` | ✓ | | | | 自動核准 token |
+| `enroll.requests:decide` | ✓ | ✓ | | | 核准、拒絕申請 |
+| `enroll.license:overflow` | ✓ | | | | 超出授權節點數時核准 |
+| `enroll.mode:write` | ✓ | | | | 註冊端點模式 |
+| `pki:read` | ✓ | ✓ | ✓ | | 憑證、CA、CRL（S14、S15） |
+| `pki.certificates:revoke` | ✓ | ✓ | | | 撤銷、立即重新產生 CRL |
+| `pki.policy:write` | ✓ | | | | 憑證政策 |
+| `pki.grace:override` | ✓ | | | | 允許再次自動續簽（D12） |
+| `pki.queue:manage` | ✓ | ✓ | | | 離線簽發的 CSR 佇列 |
+| `pki.ca:write` | ✓ | | | | 簽發 CA（本版只有 CLI） |
+| `settings:read` | ✓ | ✓ | ✓ | | 設定與來源（S21；維運者唯讀，D16） |
+| `users:read` | ✓ | | ✓ | | 使用者、角色指派、工作階段清單（S16） |
+| `users:write` | ✓ | | | | 建立、停用、刪除、角色、重設密碼與 MFA |
+| `sessions:revoke` | ✓ | | | | 結束他人的所有工作階段（D25） |
+| `api_tokens:read` | ✓ | | ✓ | | API token 清單（S21「整合」） |
+| `api_tokens:write` | ✓ | | | | 建立、撤銷 API token |
+| `directory:read` | ✓ | | ✓ | | 目錄服務設定（bind 密碼遮蔽）與群組對應（S17） |
+| `directory:write` | ✓ | | | | 群組對應、以帳號測試登入 |
+| `audit:read` | ✓ | | ✓ | | 所有人的稽核紀錄、驗證完整性（S18） |
+| `audit:read_own` | ✓ | ✓ | | | 只看自己的操作（維運者 `actor=me` 固定） |
+| `audit:export` | ✓ | | ✓ | | 匯出稽核紀錄 |
+| `alerts:read` | ✓ | ✓ | ✓ | ✓ | 告警事件、SSE 的 `alert.*`（S06、S07；第 13 節） |
+| `alerts:write` | ✓ | ✓ | | | 確認、指派、暫停通知、解決、註解 |
+| `alert-rules:read` | ✓ | ✓ | ✓ | | 告警規則與試算（S08） |
+| `alert-rules:write` | ✓ | ✓ | | | 自訂規則、啟停、系統規則的通知設定（S08、S09） |
+| `alert-rules:admin` | ✓ | | | | 系統預設規則的條件（S09） |
+| `silences:read` | ✓ | ✓ | ✓ | ✓ | 靜音與維護時段（S10） |
+| `silences:write` | ✓ | ✓ | | | 建立、修改、提前結束靜音與維護時段 |
+| `channels:read` | ✓ | ✓ | | | 通知管道的清單與狀態（S11；機密只有遮蔽值） |
+| `channels:test` | ✓ | ✓ | | | 寄送測試通知 |
+| `channels:write` | ✓ | | | | 新增、修改、刪除通知管道（含機密） |
+
+個人設定（`/api/v1/me/…`：自己的工作階段、密碼、TOTP）不需要權限，只需要以帳號登入的工作階段。
+
+**範圍**（`ia.md` §4.3）：每筆角色指派是（主體, 角色, 範圍）。主體為本機或目錄服務的使用者、或目錄服務的群組；範圍為 `global`（全站）或 `group:<主機群組>`。群組範圍的指派**只授予該群組主機的讀取**：主機列表、詳情、趨勢、總覽與 SSE 只看得到 `hosts.host_group` 相符（不分大小寫）的主機，範圍外的主機回 404（與不存在相同）；註冊、PKI、設定、使用者、稽核等系統層級的操作一律需要全站範圍的指派（設計包「系統層級頁面只對全站範圍的角色開放」；群組範圍的管理員能在群組內做什麼，等主機的寫入操作出現時再擴充，見第 12.11 節）。主機的群組在簽發時取自註冊 token 的 `group`（已有群組的主機不覆寫）；主機列表帶 `group` 欄位，`GET /api/v1/hosts?group=` 可篩選。租戶範圍（F12）保留、不接受。
+
+**API token** 的權限有三種來源（`kairos api-token create`、`POST /api/v1/api-tokens`）：
+
+| 種類 | 權限 | 建立方式 |
+|---|---|---|
+| 角色 | 該角色的全站權限 | `--role viewer`（**0.6 起的預設**）、`--role operator` … |
+| 使用者 | 擁有者**目前**的權限（個人指派；不含目錄服務群組的對應）；另指定角色時取交集。擁有者停用或刪除時 token 立即失效 | `--user chen.y [--role viewer]` |
+| 舊範圍（0.4／0.5） | **凍結在升級前**：`read`＝所有讀取（主機、總覽、健康、事件、註冊、PKI、設定），`operate`＝`read`＋需核准的 token、核准拒絕、撤銷、CSR 佇列，`admin`＝`operate`＋自動核准 token、模式、政策、寬限期覆寫、簽發 CA。升級後新增的權限（使用者、稽核、目錄服務、API token 管理、告警…）**不會**給它們 | 升級前建立的 token；`--scope`（已棄用） |
+
+403 的 `details`：`permission`（所需的權限）與 `required`（擁有它的最低角色；舊範圍的 token 為 0.5 的範圍名稱，與 0.5 相同）。
+
+### 12.2 登入（S01）
+
+| 方法與路徑 | 說明 |
+|---|---|
+| `GET /api/v1/auth/methods` | 不需驗證：`local`、`ldap`（是否啟用目錄服務登入）、`mfa`（`totp`） |
+| `POST /api/v1/auth/login` | 本文 `username`、`password`、`method`（`local`，預設；或 `ldap`）。成功時 `Set-Cookie` 與 `data.user`、`data.csrf_token`、`data.session`、`data.must_change_password`；帳號啟用 TOTP 時改回 `{"mfa_required": true, "mfa_token", "mfa_expires_at"}`（沒有 cookie） |
+| `POST /api/v1/auth/login/mfa` | 第二步：`mfa_token` 與 `code`（6 位數 TOTP，或 10 組復原碼之一 `XXXXX-XXXXX`，不分大小寫、可省略連字號）。挑戰 5 分鐘有效、最多嘗試 5 次 |
+| `POST /api/v1/auth/logout` | 結束目前的工作階段並清除 cookie（需要 CSRF） |
+
+- **密碼**：Argon2id（PHC 字串；預設 m=19 MiB、t=2、p=1，`[accounts]` 可調）。驗證以雜湊中記錄的參數計算，參數調整後舊雜湊仍可驗證，下次登入成功時以新參數重新雜湊。帳號不存在、或是目錄服務帳號時仍以同樣的參數驗證一次假的雜湊，回應時間不透露帳號是否存在。同時進行的雜湊最多 2 個（每個約 19 MiB 記憶體）。
+- **不透露帳號是否存在**：帳號不存在、密碼錯誤、帳號停用、目錄服務帳號以本機方式登入，一律 401 `invalid_credentials`（`KRS-E6001`）。
+- **鎖定**（`KRS-E6003`）：連續失敗 `accounts.lockout_threshold`（預設 5）次後鎖定 `accounts.lockout_minutes`（預設 15）分鐘，回 403 `account_locked`，`details.locked_until`、`Retry-After`；鎖定期間正確的密碼也一樣。**不存在的帳號同樣會「鎖定」**（記憶體中計數，最多 1 萬個名稱），回應與存在的帳號相同。TOTP 第二步、變更密碼與綁定 TOTP 時輸入錯誤的目前密碼，都計入同一個計數。管理員以 `kairos users unlock` 或啟用帳號解除。
+- **依來源限速**（`KRS-W6011`）：登入失敗與 API token 驗證失敗共用同一個依來源 IP 的額度（第 4.3 節：可連續 10 次，之後每 6 秒 1 次）；用完時登入也回 429。每次登入（與第二步）**先扣**一次額度、成功或與密碼無關的錯誤（本文格式、目錄服務無法使用）時退回：同時送出的大量嘗試不會在扣減之前都通過檢查。帳號的鎖定在建立工作階段的交易中再確認一次（等待雜湊期間被鎖定、停用的帳號不會登入成功）。同時等待密碼雜湊的請求超過 32 個時回 503 `busy`（`Retry-After: 1`）。放在反向代理之後時，所有使用者共用代理的來源位址與額度。
+- **首次登入必須變更密碼**：管理員建立或重設密碼（含系統產生的一次性密碼）的帳號，登入後只能呼叫 `GET /api/v1/me`、`POST /api/v1/me/password`、登出，其他端點回 403 `password_change_required`（〔暫定〕`KRS-E6013`）。
+- **密碼政策**：至少 `accounts.password_min_length`（預設 12，最少 8）個字元、最多 256、不含控制字元、不包含帳號名稱、不是同一個字元重複、不是常見的密碼（例如 `password`、`P@ssw0rd2026`）。產生的一次性密碼為 4 組 5 個字元（約 116 位元）。
+- **目錄服務**（`method: "ldap"`，第 12.7 節）：第一次登入時建立來源為 `ldap` 的使用者（沒有密碼）；同名的本機帳號存在時拒絕（不讓目錄服務接管本機帳號）。錯誤：密碼錯誤或查無使用者 401 `KRS-E6001`；AD 回報停用或鎖定 403 `account_disabled`（`KRS-E6009`）；連不上、憑證不受信任、服務帳號 bind 失敗、搜尋基底不存在 503 `directory_unavailable`（`product_code` 依原因為 `KRS-E6002`、`E6005`、`E6006`、`E6007`，`details.reason`；伺服器名稱等細節只寫日誌）。
+- 每次成功、失敗、鎖定、登出都寫入稽核（第 12.8 節）。失敗的執行者一律為 `anonymous`、對象為輸入的帳號（不記錄密碼）；帳號不存在且輸入不符合帳號格式時（例如把密碼打進帳號欄）只記 SHA-256 的前 8 碼。
+
+### 12.3 工作階段與 CSRF
+
+- **cookie**：`__Host-kairos_session=<秘密>; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=<絕對逾時>`。秘密為 32 bytes CSPRNG 的 base64url，資料庫只保存 SHA-256（`sessions.session_hash`）；清單中以 16 個十六進位字元的公開 `session_id` 識別。每次登入都是新的工作階段（沒有 session fixation）。
+- **逾時**：閒置 `accounts.session_idle_minutes`（預設 30）分鐘、絕對 `accounts.session_absolute_hours`（預設 12）小時。最後活動時間最多每 60 秒寫回一次（閒置的判斷誤差 1 分鐘以內）；SSE 不更新最後活動時間。
+- **立即失效**：每個請求都查詢資料庫——工作階段被結束、逾時、使用者停用或刪除、目錄服務帳號而 `[ldap]` 已停用時回 401 `unauthorized`（`KRS-E6010`，`details.reason = "session_expired"`）；SSE 每次心跳（15 秒）重新確認身分並**重新計算權限與主機範圍**：失效或已沒有主機的讀取權限時關閉，降為群組範圍時只再推送範圍內的主機。
+- **CSRF**：以工作階段驗證的 `POST`／`PUT`／`PATCH`／`DELETE` 必須帶 `X-CSRF-Token`（登入回應與 `GET /api/v1/me` 的 `csrf_token`；由 cookie 秘密以主控台金鑰 HMAC 衍生，常數時間比對），且 `Origin`（有帶時）必須等於 `https://<Host>`、`Sec-Fetch-Site` 不可是 `cross-site`；否則 403 `csrf_failed`（〔暫定〕`KRS-E6105`）。經反向代理時代理必須保留原本的 `Host`。登入端點要求 `Content-Type: application/json`（跨站的表單無法送出），CORS 關閉。
+- 同時帶 `Authorization` 與 cookie 時以 `Authorization`（API token）為準，不需要 CSRF token。
+- **主控金鑰**：`<storage.data_dir>/console.key`（32 bytes，0600），第一次啟動主控台時建立；用於 CSRF token、TOTP 秘密的加密（AES-256-GCM，以使用者 id 為附加資料）與復原碼的 HMAC。無法建立或讀取時帳號登入停用（API token 照常），日誌有 `ERROR`。遺失時已綁定的 TOTP 無法驗證，以 `kairos users reset-mfa` 重設。
+
+### 12.4 個人設定（S23；D25）
+
+| 方法與路徑 | 說明 |
+|---|---|
+| `GET /api/v1/me` | 目前的身分：工作階段為 `type: "session"`、`user`、`roles`（含 `via_group`：來自哪個目錄服務群組）、`session`、`csrf_token`；API token 為 `type: "api_token"`、`token_id`、`name`、`scopes`（舊範圍）、`role`、`owner`。兩者都有 `permissions`（全站）與 `group_permissions` |
+| `GET /api/v1/me/sessions` | 自己的有效工作階段（`current` 標出目前這個） |
+| `POST /api/v1/me/sessions/revoke-others` | **結束其他所有工作階段、保留目前這個**（D25；S23 與 S16 對象是自己）。回 `ended`（N）、`kept_current: true` |
+| `POST /api/v1/me/sessions/{session_id}/revoke` | 結束自己的一個工作階段（目前這個時一併清除 cookie） |
+| `POST /api/v1/me/password` | `current_password`、`new_password`：變更自己的密碼（本機帳號）；其他工作階段結束、保留目前這個 |
+| `POST /api/v1/me/totp/setup` | `password`：產生 TOTP 秘密（20 bytes），回 `secret`（base32）與 `otpauth_uri`（QR code 內容；SHA1、6 位數、30 秒）。已啟用時 409 |
+| `POST /api/v1/me/totp/enable` | `code`：以驗證器顯示的碼確認後啟用，回 10 組 `recovery_codes`（**只在這次回應出現**） |
+| `POST /api/v1/me/totp/disable` | `password` 與 `code`（目前的 TOTP 或一組復原碼）：停用並刪除復原碼；只知道密碼的人不能關掉二階段驗證 |
+
+- 這些端點只接受工作階段（API token 回 400 `not_a_session`）。目錄服務帳號的密碼與二階段驗證由 AD 管理（409 `directory_account`）。
+- TOTP 驗證接受前後各 1 個時間步，同一個時間步只能使用一次（重放回 401 `invalid_mfa_code`，〔暫定〕`KRS-E6012`）；復原碼各只能用一次。
+
+### 12.5 使用者與角色（S16）
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/users` | `users:read` | 列表：`source`（`local`／`ldap`）、`status`（`active`／`disabled`／`locked`）、`role`、`q`；每列含 `roles`、`mfa`、`last_login_at`、`active_sessions` |
+| `POST /api/v1/users` | `users:write` | `username`（1～64 字元：英數字與 `. _ - @`）、`display_name`、`email`、`roles`（`["admin", "operator@group:B廠產線"]`）、`password`（選填；沒有時產生一次性密碼，**只在回應的 `initial_password` 出現一次**）。一律在第一次登入時必須變更。201 |
+| `GET /api/v1/users/{username}` | `users:read` | 詳情、有效權限、有效的工作階段、擁有的 API token |
+| `PUT /api/v1/users/{username}` | `users:write` | `display_name`、`email` |
+| `PUT /api/v1/users/{username}/roles` | `users:write` | 以 `roles` 取代全部指派（L1，`reason` 選填）；回應帶 `permissions_added`、`permissions_removed`（S16「顯示權限差異」） |
+| `POST /api/v1/users/{username}/disable` | `users:write` | 停用（L1，`reason`）：所有工作階段立即結束，擁有的 API token 失效 |
+| `POST /api/v1/users/{username}/enable` | `users:write` | 啟用（同時解除鎖定） |
+| `POST /api/v1/users/{username}/delete` | `users:write` | 刪除（L2：`confirm` 必須等於帳號）：角色指派、TOTP 一併刪除，工作階段結束，擁有的 API token 撤銷；稽核紀錄保留 |
+| `POST /api/v1/users/{username}/unlock` | `users:write` | 解除登入失敗的鎖定 |
+| `POST /api/v1/users/{username}/password` | `users:write` | 重設密碼（本機帳號；`password` 或產生一次性的 `password`）：所有工作階段結束、下次登入必須變更 |
+| `POST /api/v1/users/{username}/mfa/reset` | `users:write` | 重設 MFA（L1）：TOTP 與復原碼刪除 |
+| `GET /api/v1/users/{username}/sessions` | `users:read` | 有效的工作階段 |
+| `POST /api/v1/users/{username}/sessions/revoke-all` | `sessions:revoke` | **結束某使用者的全部工作階段**（D25，L1，`reason`）。對象是自己時回 409 `target_is_self`，請改用 `POST /api/v1/me/sessions/revoke-others` |
+| `GET /api/v1/roles` | `users:read` | 四個內建角色的權限矩陣與成員數（S16「角色與權限」分頁），所有權限名稱 |
+
+防呆（S16）：不能移除最後一位**啟用中、有全站管理員個人指派**的使用者的管理員角色、不能停用或刪除他（409 `last_admin`；目錄服務群組帶來的管理員不計入，因為無法預先確定群組成員）；不能停用或刪除自己（409 `cannot_target_self`；以自己擁有的 API token 操作也算自己）。`user_id` 不重複使用（`AUTOINCREMENT`）：刪除後建立的帳號不會接手舊帳號的工作階段紀錄。檢查與變更在同一個寫入交易中，兩位管理員同時操作不會一起被移除。
+
+### 12.6 API token（S21「整合」）
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/api-tokens?all=true` | `api_tokens:read` | 清單（預設只有有效的）：`grant`（`role:operator`、`user:chen.y∩viewer`、`scope:read`）、到期、最後使用；不含秘密與雜湊 |
+| `POST /api/v1/api-tokens` | `api_tokens:write` | `name`、`role` 與／或 `owner`（帳號；至少一個）、`expires_in_secs` 或 `expires_at`（預設 90 天，最長 3,650 天，不提供不過期）。201，`token` 只出現這一次 |
+| `POST /api/v1/api-tokens/{token_id}/revoke` | `api_tokens:write` | 撤銷（L1，`reason`）；重複撤銷不是錯誤（`already_revoked`） |
+
+建立與撤銷（API 與 `kairos api-token` 都一樣）在同一個交易中寫入稽核雜湊鏈；執行中的 Kairos 另在 10 秒內寫入日誌（第 4.2 節）。
+
+### 12.7 目錄服務（LDAP／AD；S17）
+
+設定在 `kairos.toml` 的 `[ldap]`（第 12.10 節）；群組對應存在資料庫。
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/directory` | `directory:read` | 設定（伺服器、加密方式、CA 檔、bind DN、搜尋基底與屬性；**bind 密碼一律顯示 `********`**）與群組對應 |
+| `PUT /api/v1/directory/mappings` | `directory:write` | `mappings: [{"group_dn": "CN=IT-Ops,OU=Groups,…", "role": "operator@group:B廠產線"}]` 取代全部（L1）；DN 以小寫、去除 `,`／`=` 前後空白比對 |
+| `POST /api/v1/directory/test` | `directory:write` | 「以帳號測試登入」：`username`、`password`，回這個帳號的 DN、群組與會得到的角色（`ok: true`），或錯誤的 `product_code`、`reason`、`detail`（給管理員看的細節）；不建立工作階段。失敗計入來源的失敗額度 |
+
+- **驗證流程**：連線（LDAPS 或 `ldap://`＋StartTLS；**一律驗證伺服器憑證鏈與名稱**，只信任 `ldap.ca_file` 中的 CA，不使用系統的信任清單、沒有略過驗證的選項）→ 以服務帳號 bind（`ldap.bind_dn`＋`ldap.bind_password_file`；沒有設定時匿名）→ 在 `ldap.user_base` 以 `(&<user_filter>(<login_attribute>=<帳號>))` 搜尋（帳號依 RFC 4515 跳脫）→ 搜尋結果必須恰好一筆 → 以該 DN 與輸入的密碼 bind → 讀取 `ldap.group_attribute`（AD 為 `memberOf`）。**空密碼一律拒絕**（LDAP 以空密碼 bind 會成為匿名 bind 而回成功）。主要伺服器連不上（或憑證問題）時依序改試 `ldap.fallback_urls`。
+- **未加密**：`ldap://` 沒有 StartTLS 時拒絕啟動，除非 `ldap.allow_plaintext = true`（設計包 S17：需要管理員明確確認；密碼會以明文經過網路）。
+- **權限**：個人指派＋所屬群組的對應；群組在登入時讀取並保存在工作階段中（AD 的群組異動在下次登入或工作階段逾時後生效，見第 12.11 節）。
+- 純 Rust 實作：`ldap3` 0.12（`tls-rustls-ring`，與其他連接埠共用 rustls 0.23＋ring），`cargo deny` 通過。
+
+### 12.8 稽核日誌與雜湊鏈（S18）
+
+**記錄的事件**（`category`／`action`）：
+
+| 類別 | 動作 |
+|---|---|
+| `login` | `login.success`、`login.failure`（含原因、方式）、`account.lock`、`logout` |
+| `user` | `user.create`／`update`／`disable`／`enable`／`delete`／`unlock`、`role.change`（新增、移除的指派與權限差異）、`password.change`／`reset`、`mfa.enable`／`disable`／`reset`、`session.revoke`／`revoke_others`／`revoke_all`、`directory.mappings.change`、`directory.test` |
+| `api_token` | `token.create`、`token.revoke` |
+| `settings` | `mode.change`、`policy.change`、`setting.reset`（0.5 起） |
+| `enroll`、`pki`、`host` | 註冊申請、核准、拒絕、撤回、簽發、撤銷、CA、CRL、除役（0.5 起） |
+| `access` | `access.denied`：被拒絕（403）的寫入請求（方法、路徑、所需的權限） |
+| `audit` | `audit.query`（第一頁）、`audit.export`、`audit.verify`：稽核員與管理員自己的查詢與匯出也記錄 |
+| `system` | `system.start`、`system.shutdown`（版本、設定檔） |
+
+每筆有 `at`、`actor`（`user:<帳號>`、`token:<token_id>`、執行 CLI 的作業系統帳號、`system`、`anonymous`）、`actor_ip`、`object`、`result`（`ok`／`failed`／`denied`／`rejected`）、`code`（產品代碼）、`details`（原因、變更前後；**不含密碼、token、秘密**）。
+
+**雜湊鏈**：
+
+```text
+hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, action, object, result, code, details]) )
+```
+
+- JSON 為 serde_json 的精簡格式（沒有空白，非 ASCII 原樣以 UTF-8 輸出），`details` 是資料庫中保存的**字串本身**（匯出的 `details_raw`），沒有值時為 `null`；`at` 為 Unix 毫秒（匯出的 `at_ms`）；雜湊為小寫十六進位。第一筆的 `prev_hash` 為 64 個 `0`。
+- 寫入一律經由 `audit::append`：先 INSERT 取得寫入鎖再計算，Kairos、主控台與 CLI 同時寫入也不會分岔；與被記錄的變更在**同一個交易**中（例如建立使用者與它的稽核要嘛都寫入、要嘛都沒有）。
+- 保留期限（`audit.retention_days`，預設 1,095 天＝3 年，獨立於 report 的保留天數）每小時清除最舊的一段，被清除的最後一筆的雜湊記在 `meta.audit_chain_anchor`，剩下的第一筆必須接在它之後；最新一筆記在 `meta.audit_chain_head`，只刪除最後幾筆也會被發現。
+- 0.5 寫入的紀錄（沒有雜湊）在升級後**第一次**寫入或驗證時依 id 順序補上，並記在 `meta.audit_legacy_sealed`；之後每次寫入只計算它自己那一筆。繞過程式直接插入資料庫、沒有雜湊的紀錄不會被下一次寫入接進鏈中，驗證時以 `missing_hash` 指出。
+- 驗證在同一個讀取交易（同一個快照）中進行，驗證期間的寫入不會造成假的斷點。
+- 被拒絕的寫入請求（`access.denied`）同一個執行者每分鐘最多記 20 筆，超過的筆數併入下一筆的 `details.suppressed_since_last`（避免低權限的身分以大量請求灌爆稽核表）。
+- **限制**：雜湊鏈沒有秘密金鑰——能改寫資料庫檔的人可以重新計算整條鏈，資料庫本身無法發現；要防範這種情況，需要定期匯出（或外送到 syslog／SIEM，另一條開發線）並與副本比對最後一筆的雜湊。
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/audit` | `audit:read`；只有 `audit:read_own` 時固定為自己的操作（`meta.own_only: true`） | `actor`、`category`、`action`（完全相同，或以 `.` 結尾為前綴：`user.`）、`target`（對象片段，不分大小寫）、`result`、`from`／`to`（RFC 3339）、`limit`（1～1000，預設 100）、`cursor`（新到舊，`page.next_cursor`）。每筆含 `prev_hash`、`hash` |
+| `GET /api/v1/audit/export` | `audit:export` | 同樣的篩選，`application/x-ndjson`：每行一筆（`type: "event"`，另有 `at_ms`、`details_raw`，可只靠該行重新計算雜湊），最後一行 `type: "chain"`（`count`、`first_id`、`first_prev_hash`、`last_id`、`last_hash`）。只以時間篩選時是連續的一段鏈，可整段驗證 |
+| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch`／`head_mismatch` 最後幾筆被刪除；`product_code: KRS-E6201`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
+
+沒有修改或刪除的端點（`PUT`／`DELETE` 回 405）；CLI 也沒有。
+
+### 12.9 CLI
+
+```
+kairos users create <帳號> --role <角色>[@group:<群組>] [--role …] [--display-name <名稱>] [--email <Email>] [--password-stdin]
+kairos users list [--all] | show <帳號> | sessions <帳號> | groups
+kairos users grant <帳號> --role <角色> | revoke-role <帳號> --role <角色> [--yes]
+kairos users disable <帳號> [--reason <原因>] [--yes] | enable <帳號> | unlock <帳號>
+kairos users delete <帳號> [--yes]
+kairos users reset-password <帳號> [--password-stdin] [--yes] | reset-mfa <帳號> [--yes]
+kairos users end-sessions <帳號> [--reason <原因>] [--yes]
+kairos users map-group <群組 DN> --role <角色> | unmap-group <群組 DN> --role <角色>
+kairos audit list [--actor …] [--category …] [--action …] [--target …] [--result …] [--since 24h | --from … --to …] [--limit N]
+kairos audit verify
+kairos audit export [--out <檔案>] [--since … | --from … --to …]
+kairos api-token create --name <名稱> [--role <角色> | --user <帳號> [--role <角色>]] [--expires-in …]
+```
+
+- **首位管理員**（沒有預設帳號與密碼）：`sudo -u kairos /opt/kairos/kairos users create admin --role admin --config /opt/kairos/kairos.toml`。產生的一次性密碼**只在 stdout 顯示這一次**（`PW=$(…)`），第一次登入時必須變更；要自行指定時以 `--password-stdin` 從管線或檔案提供（標準輸入是終端機時拒絕，避免密碼顯示在畫面上；自行指定的密碼不要求第一次登入變更）。Kairos 不需要停止。
+- 危險操作（`cli-style.md` §5.4）：`disable`、`revoke-role`、`reset-password`、`reset-mfa`、`end-sessions` 為 L1（互動 `是否繼續？[y/N]`，非互動需要 `--yes`），`delete` 為 L2（互動時輸入帳號，非互動需要 `--yes`）。
+- `kairos audit verify`：結束代碼 0 完整、9 斷裂（`KRS-E6201`，三段式寫出第一個斷點）；驗證前補上 0.5 的紀錄的雜湊。`kairos audit export` 不覆寫既有檔案（結束代碼 11），檔案權限 0640。
+- 每個變更都寫入稽核雜湊鏈，執行者為作業系統帳號（`SUDO_USER`、`USER`…）。`--json` 的 `schema` 為 `kairos.users.<子命令>/v1`、`kairos.audit.<子命令>/v1`。
+- 結束代碼（`cli-style.md` §8）：0 完成、1 資料庫錯誤或找不到、2 用法錯誤、3 設定錯誤、6 被拒絕（最後一位管理員、目錄服務帳號）、9 雜湊鏈斷裂、10 權限不足、11 衝突（帳號已存在、輸出檔已存在、資料庫使用中）。
+- `kairos api-token create` 未指定 `--role`／`--user` 時為 `--role viewer`（0.5 的預設是 `read` 範圍，見 CHANGELOG [0.6.0] 破壞性變更）；`--scope` 仍可使用但已棄用（權限凍結在 0.5）。`list` 的「權限」欄顯示 `role:…`、`user:…`、`scope:…`。
+
+### 12.10 設定與資料表
+
+```toml
+[accounts]
+password_min_length = 12        # 8..=128
+lockout_threshold = 5           # 連續失敗幾次鎖定，1..=100
+lockout_minutes = 15            # 1..=1440
+session_idle_minutes = 30       # 閒置逾時，5..=1440（不可大於絕對逾時）
+session_absolute_hours = 12     # 絕對逾時，1..=168
+argon2_memory_kib = 19456       # 8192..=1048576
+argon2_iterations = 2           # 1..=10
+argon2_parallelism = 1          # 1..=8
+mfa_issuer = "Kairos"           # 驗證器 App 顯示的發行者
+
+[ldap]
+enabled = false
+url = "ldaps://dc01.example.gov.tw:636"
+fallback_urls = ["ldaps://dc02.example.gov.tw:636"]
+starttls = false                # ldap:// 以 StartTLS 升級
+allow_plaintext = false         # 允許未加密的 ldap://（不建議）
+ca_file = "/opt/kairos/ad-ca.pem"     # 使用 TLS 時必填
+bind_dn = "CN=svc-kairos,OU=Service,DC=example,DC=gov,DC=tw"
+bind_password_file = "/opt/kairos/ldap-bind.secret"   # 只有服務帳號可讀（0600）
+user_base = "OU=Staff,DC=example,DC=gov,DC=tw"
+user_filter = "(&(objectCategory=person)(objectClass=user))"   # 預設；排除 AD 的電腦帳號
+login_attribute = "sAMAccountName"
+display_name_attribute = "displayName"
+email_attribute = "mail"
+group_attribute = "memberOf"
+timeout_secs = 10               # 1..=60
+
+[audit]
+retention_days = 1095           # 稽核紀錄保留天數，90..=36500（獨立於 report）
+```
+
+所有設定都只在 `kairos.toml`（與環境變數）中；需要重新啟動才生效。秘密不寫在設定檔（bind 密碼在另一個檔案；`kairos config show --effective` 只顯示路徑）。
+
+**schema v6**（`store/sqlite.rs` 的 `SCHEMA_V6`）：新增 `users`（帳號、來源、Argon2id 雜湊、加密的 TOTP 秘密、狀態、失敗次數與鎖定、最後登入）、`user_recovery_codes`（HMAC）、`role_assignments`（主體類型 `user`／`ldap_group`、角色、範圍）、`sessions`（`session_hash` 為主鍵、公開 id、方式、目錄服務群組、建立、最後活動、絕對逾時、閒置逾時、IP、User-Agent、結束時間與原因）；`api_tokens` 加 `owner_user_id`、`role`；`audit_events` 加 `prev_hash`、`hash` 與索引 `audit_events_actor`；`hosts` 加 `host_group` 與索引。v5 保留給告警（另一條開發線）：v6 只建立新資料表、並在 v4 既有的資料表加欄位，可以直接接在 v4 之後，也可以接在 v5 之後；`migrate` 依版本號套用，版本號不必連續。工作階段的紀錄在結束或逾時 30 天後清除。
+
+### 12.11 延後項目與待決定
+
+| 項目 | 現況與原因 |
+|---|---|
+| 目錄服務的定期同步（S17「每 15 分鐘重新確認帳號狀態與群組；AD 停用時立即結束工作階段」） | 群組在登入時讀取；AD 停用的帳號在下次登入時被拒，已登入的工作階段最長到絕對逾時（預設 12 小時）。需要背景以服務帳號查詢所有 LDAP 使用者，延後 |
+| 「從目錄服務加入」（S16，搜尋 AD 後預先建立帳號） | 目錄服務帳號在第一次登入時建立；預先指派個人角色要等它登入過一次，或以群組對應 |
+| 擁有者是目錄服務帳號的 API token | 只有個人指派的權限（token 沒有登入時的群組） |
+| 群組範圍的寫入權限（群組管理員管理其群組內的主機、token、規則；`ia.md` §4.3） | 本版群組範圍只授予主機的讀取；告警（第 13 節）也只對全站範圍的角色開放（群組範圍的維運者看不到告警，整合時選擇的保守做法）。主機的寫入操作（標籤、除役…）與群組內的告警處理延後 |
+| 主機群組的管理（S21「主機群組與標籤」） | 群組取自註冊 token；沒有修改群組的 API |
+| 雙人覆核（four-eyes）、重新驗證（L3 的「重新輸入密碼」） | 本版沒有 L3 的使用者操作 |
+| 稽核外送（syslog／SIEM）與外部錨定 | 另一條開發線 |
+| 使用者權限清冊 CSV（S16 稽核員匯出） | `GET /api/v1/users` 的 JSON 已有相同內容 |
+| 個人的 API token（S23「我的 API token」） | 本版由管理員以 `owner` 建立 |
+
+## 13. 衝刺 5：告警（草稿）
 
 0.6.0〔草稿〕，**已實作**（`kairos/src/api/alerts.rs`；引擎見 [`ALERTS.md`](ALERTS.md)）。設計包 S06～S11、§24 #9。需要告警引擎（`[alerts] enabled = true`、SQLite），沒有啟動時所有端點回 503 `alerts_unavailable`。
 
-### 12.1 權限（集中標記）
+### 13.1 權限（集中標記）與角色
 
-每個端點需要的 `Permission` 只在 `api/alerts.rs` 的 `route` 一處決定；權限不足的 403 另帶 `details.permission`（例 `alerts:write`）。之後的使用者與角色（`sprint5/auth`）只要把角色對應到下列權限：
+每個端點需要的 `Permission` 只在 `api/alerts.rs` 的 `route` 一處決定；權限與角色的對應在 `kairos/src/rbac.rs`（第 12.1 節，設計包 `ia.md` §4.2 的 S06～S11）。權限不足的 403 帶 `details.permission`（例 `alerts:write`）與 `details.required`（擁有它的最低角色）。驗證與 CSRF 和其他端點相同（第 12.3 節：工作階段的寫入需要 `X-CSRF-Token`）。
 
-| `Permission`（名稱） | 範圍 | 端點 |
-|---|---|---|
-| `AlertsRead`（`alerts:read`） | `read` | `GET /alerts`、`/alerts/summary`、`/alerts/{event_id}` |
-| `AlertsWrite`（`alerts:write`） | `operate` | `POST /alerts/ack`、`/alerts/{event_id}/ack`、`assign`、`snooze`、`resolve`、`comments` |
-| `AlertRulesRead`（`alert-rules:read`） | `read` | `GET /alert-rules`、`/alert-rules/{rule_id}`、`POST /alert-rules/preview` |
-| `AlertRulesWrite`（`alert-rules:write`） | `operate` | `POST /alert-rules`、`PUT /alert-rules/{rule_id}`、`enable`、`disable`、`DELETE /alert-rules/{rule_id}` |
-| `AlertRulesAdmin`（`alert-rules:admin`） | `admin` | `PUT /alert-rules/{rule_id}` 修改**系統預設規則**的 `params`（S09：只有管理員） |
-| `SilencesRead`（`silences:read`） | `read` | `GET /silences`、`/silences/{silence_id}`、`POST /silences/preview` |
-| `SilencesWrite`（`silences:write`） | `operate` | `POST /silences`、`PUT /silences/{silence_id}`、`POST /silences/{silence_id}/end` |
-| `ChannelsRead`（`channels:read`） | `operate` | `GET /channels`、`/channels/{channel_id}`（S11：稽核員與唯讀看不到） |
-| `ChannelsTest`（`channels:test`） | `operate` | `POST /channels/{channel_id}/test` |
-| `ChannelsWrite`（`channels:write`） | `admin` | `POST /channels`、`POST /channels/test`（未儲存的設定）、`PUT`、`DELETE /channels/{channel_id}` |
+| `Permission`（名稱） | 管理員 | 維運者 | 稽核員 | 唯讀 | 端點 |
+|---|---|---|---|---|---|
+| `AlertsRead`（`alerts:read`） | ✓ | ✓ | ✓ | ✓ | `GET /alerts`、`/alerts/summary`、`/alerts/{event_id}`；SSE 的 `alert.*` |
+| `AlertsWrite`（`alerts:write`） | ✓ | ✓ | — | — | `POST /alerts/ack`、`/alerts/{event_id}/ack`、`assign`、`snooze`、`resolve`、`comments` |
+| `AlertRulesRead`（`alert-rules:read`） | ✓ | ✓ | ✓ | — | `GET /alert-rules`、`/alert-rules/{rule_id}`、`POST /alert-rules/preview` |
+| `AlertRulesWrite`（`alert-rules:write`） | ✓ | ✓ | — | — | `POST /alert-rules`、`PUT /alert-rules/{rule_id}`、`enable`、`disable`、`DELETE /alert-rules/{rule_id}` |
+| `AlertRulesAdmin`（`alert-rules:admin`） | ✓ | — | — | — | `PUT /alert-rules/{rule_id}` 修改**系統預設規則**的 `params`（S09：只有管理員） |
+| `SilencesRead`（`silences:read`） | ✓ | ✓ | ✓ | ✓ | `GET /silences`、`/silences/{silence_id}`、`POST /silences/preview` |
+| `SilencesWrite`（`silences:write`） | ✓ | ✓ | — | — | `POST /silences`、`PUT /silences/{silence_id}`、`POST /silences/{silence_id}/end` |
+| `ChannelsRead`（`channels:read`） | ✓ | ✓ | — | — | `GET /channels`、`/channels/{channel_id}`（機密一律只有遮蔽值；S11：稽核員與唯讀看不到） |
+| `ChannelsTest`（`channels:test`） | ✓ | ✓ | — | — | `POST /channels/{channel_id}/test` |
+| `ChannelsWrite`（`channels:write`） | ✓ | — | — | — | `POST /channels`、`POST /channels/test`（未儲存的設定）、`PUT`、`DELETE /channels/{channel_id}` |
 
-寫入的本文為 JSON（上限 256 KiB）；每個寫入都寫入 `audit_events`（類別 `alerts`，例 `alert.ack`、`silence.create`、`channel.update`），**不記錄機密的值**（管道只記更換了哪些機密欄位）。危險操作：停用系統預設規則需要 `reason`（L1）；刪除管道為 L2（`confirm_name` 等於管道名稱，有規則使用時另需 `replacement_channel_id` 或 `accept_no_channel: true`）；大範圍與包含緊急等級的靜音由主控台以 `preview` 的 `confirm` 決定是否顯示 L1 確認（伺服器不要求額外欄位，與第 11.1 節的 L1 相同）。
+- 告警的權限**只由全站範圍的角色指派**授予：群組範圍（`operator@group:…`）的指派只授予該群組主機的讀取（第 12.1 節），看不到告警（最保守的做法；群組範圍的告警屬於延後項目，第 12.11 節）。
+- **0.4／0.5 的 API token（`read`／`operate`／`admin` 範圍）升級後沒有告警的權限**（權限凍結在升級前，第 12.1 節）：需要告警的整合以 `kairos api-token create --role viewer|operator|admin` 建立新 token。它們的 SSE 也收不到 `alert.*`。
+- SSE 的 `alert.*` 只送給全站範圍有 `alerts:read` 的身分，每次心跳（第 6 節）重新計算權限：撤銷、工作階段結束、停用或降權後不再推送。
+
+寫入的本文為 JSON（上限 256 KiB）；每個寫入都寫入稽核雜湊鏈（`audit_events`，第 12.8 節；類別 `alerts`，例 `alert.ack`、`silence.create`、`channel.update`；執行者 `user:<帳號>` 或 `token:<token_id>`），**不記錄機密的值**（管道只記更換了哪些機密欄位）。危險操作：停用系統預設規則需要 `reason`（L1）；刪除管道為 L2（`confirm_name` 等於管道名稱，有規則使用時另需 `replacement_channel_id` 或 `accept_no_channel: true`）；大範圍與包含緊急等級的靜音由主控台以 `preview` 的 `confirm` 決定是否顯示 L1 確認（伺服器不要求額外欄位，與第 11.1 節的 L1 相同）。
 
 新增的錯誤碼：
 
@@ -806,7 +1089,7 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 | 409 | `builtin_rule` | — | 系統預設規則不可刪除 |
 | 503 | `alerts_unavailable` | — | 告警引擎沒有啟動 |
 
-### 12.2 事件（S06、S07）
+### 13.2 事件（S06、S07）
 
 ```
 GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
@@ -835,7 +1118,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 | `POST /alerts/{id}/resolve` | `root_cause`（必填）、`note` | 解決；回 `detached_children`（脫離成為獨立事件的子事件數） |
 | `POST /alerts/{id}/comments` | `text`（1～2000） | 新增註解（已解決的事件也可以） |
 
-### 12.3 規則（S08、S09）
+### 13.3 規則（S08、S09）
 
 `GET /api/v1/alert-rules`（篩選 `kind`、`category`、`severity`、`enabled`）：每條規則另有 `max_severity`（依天數升級者為最高等級）、`attention`、`scope_text`、`notify_effective`（套用嚴重度預設後的重送、恢復、升級）、`fires_7d`、`noise_7d`（7 天內 10 分鐘內自行恢復且未確認的比例）、`noisy`（> 50% 且至少 5 次）。
 
@@ -845,13 +1128,13 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 `POST /api/v1/alert-rules/preview`（歷史試算，S09「以過去 7 天的資料試算」）：本文為 `rule_id` 或未儲存的 `kind`／`params`／`scope`，另有 `days`（1～31，預設 7）。回 `fires`、`hosts_involved`、`self_recovered_within_10m`、`noise_ratio`、`noisy`、`suggestion`（雜訊偏高時建議的持續時間與試算次數）、`per_day[]`、`examples[]`、`data_days`、`resolution_secs`（5 分鐘彙總；範圍超過 2,000 台時 1 小時）、`approximate: true`、`notes[]`。主機離線類規則回 `supported: false`（沒有連線歷史）。
 
-### 12.4 靜音與維護時段（S10）
+### 13.4 靜音與維護時段（S10）
 
 `POST /api/v1/silences/preview`：本文 `kind`、`scope`、`rules`、`from_event`。回 `matching_hosts`（使用中的主機）、`scope_text`（「範圍：標籤為 產線，且網段為 10.20.3.0/24 或 10.30.3.0/24」）、`rules_text`、`limit`（`max_secs`、`max_text`、`system`、`emergency`、`reason`：快捷時長下方的說明）、`confirm`（`required`、`reasons[]`）。
 
 `POST /api/v1/silences`：`kind`（`silence`／`maintenance`）、`name`、`reason`（必填）、`scope`、`rules`（不選＝所有規則）、`starts_at`（預設現在）、`ends_at` 或 `duration_secs`、`notify_on_end`（預設 true）、`exclude_uptime`、`from_event`。超過上限回 400 `silence_too_long`。`PUT` 修改尚未結束的靜音（重新驗證上限）；`POST /silences/{id}/end`（`reason`）提前結束。`GET /api/v1/silences?status=active|upcoming|ended|all`：每筆另有 `status`、`scope_text`、`scope_short`、`matching_hosts`、`remaining_secs`。
 
-### 12.5 通知管道（S11）
+### 13.5 通知管道（S11）
 
 `POST /api/v1/channels`：`name`、`kind`（`email`／`webhook`）、`enabled`、`config`（不含機密）、`secrets`（機密）。
 
@@ -865,6 +1148,6 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 `POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
 
-### 12.6 即時推送（SSE）
+### 13.6 即時推送（SSE）
 
-第 6 節的 `/api/v1/events` 另有 `alert.created`、`alert.updated`、`alert.resolved`（`data` 為事件的摘要，欄位同第 12.2 節但沒有 `details`），編號與重連規則相同。只有內容（數值、台數）改變時不推送，最多每 60 秒寫回一次。
+第 6 節的 `/api/v1/events` 另有 `alert.created`、`alert.updated`、`alert.resolved`（`data` 為事件的摘要，欄位同第 13.2 節但沒有 `details`），編號與重連規則相同。只有內容（數值、台數）改變時不推送，最多每 60 秒寫回一次。

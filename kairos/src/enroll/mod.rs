@@ -57,8 +57,6 @@ pub const TICK: Duration = Duration::from_secs(2);
 pub const MAX_NONCES: usize = 100_000;
 /// 結束的申請保存 30 天（S13「最近結束」）
 pub const CLOSED_KEEP_MS: i64 = 30 * 86_400_000;
-/// 稽核事件保存 400 天
-pub const AUDIT_KEEP_MS: i64 = 400 * 86_400_000;
 /// 除役後只受理 deregister 的視窗（ENROLL.md 第 18 節第 1 項）
 pub const DEREGISTER_WINDOW_MS: i64 = 10 * 60_000;
 /// 時鐘被拒的主機在 token 的部署進度中保留 15 分鐘（API.md 第 11.2 節）
@@ -875,11 +873,12 @@ impl EnrollService {
         if now - *last_hour >= 3_600_000 {
             *last_hour = now;
             drop(last_hour);
-            let result = self.db.write_blocking(|conn| {
+            let audit_keep_ms = i64::from(self.config.audit.retention_days) * 86_400_000;
+            let result = self.db.write_blocking(move |conn| {
                 let (expired, purged) = store::expire_and_purge(conn, now, CLOSED_KEEP_MS)?;
                 store::purge_blocks(conn, now)?;
                 store::purge_relaxations(conn, now)?;
-                store::purge_audit(conn, now - AUDIT_KEEP_MS)?;
+                store::purge_audit(conn, now - audit_keep_ms, now)?;
                 conn.execute(
                     "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
                     [now - 400 * 86_400_000],

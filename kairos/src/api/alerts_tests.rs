@@ -5,20 +5,23 @@
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-use super::tests::{Sse, call, fixture_with, hello};
-use super::tokens::{self, SCOPE_ADMIN, SCOPE_OPERATE};
+use super::tests::{Sse, call, fixture_alerts, hello};
+use super::tokens::{self, TokenGrant};
 use crate::alerts::notify::fake::FakeHttp;
+use crate::rbac::Role;
 
 const H: &str = "7e2f0a11-0000-4000-8000-0000000000a1";
 
-fn token(f: &super::tests::Fixture, scope: &str) -> String {
+/// 角色的 API token（0.6 的 RBAC；`f.token` 是 0.4／0.5 的 `read` 範圍，沒有告警的權限）
+fn token(f: &super::tests::Fixture, role: Role) -> String {
     let conn = f.admin();
-    tokens::create(
+    tokens::create_with(
         &conn,
-        scope,
-        scope,
+        role.as_str(),
+        &TokenGrant::Role(role),
         None,
         Some("tester"),
+        None,
         chrono::Utc::now().timestamp_millis(),
     )
     .unwrap()
@@ -36,10 +39,50 @@ async fn wait_for<F: Fn() -> bool>(what: &str, limit: Duration, cond: F) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alerts_end_to_end_over_https() {
     let hook = FakeHttp::start().await;
-    let f = fixture_with("alerts", |c| c.alerts.warmup_secs = 60, true).await;
+    let f = fixture_alerts("alerts", |c| c.alerts.warmup_secs = 60).await;
     let addr = f.addr();
-    let admin = token(&f, SCOPE_ADMIN);
-    let operate = token(&f, SCOPE_OPERATE);
+    let admin = token(&f, Role::Admin);
+    let operate = token(&f, Role::Operator);
+    let viewer = token(&f, Role::Viewer);
+    let auditor = token(&f, Role::Auditor);
+    let legacy = f.token.clone();
+
+    // 0.5 的 token（範圍 read）：升級後權限凍結，沒有告警的權限（403，所需的最低角色為 viewer）
+    let r = call(addr, "GET", "/api/v1/alerts", Some(&legacy), None).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["error"]["details"]["permission"], "alerts:read");
+    // 唯讀看不到規則（S08 為「—」），稽核員可以
+    let r = call(addr, "GET", "/api/v1/alert-rules", Some(&viewer), None).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(
+        r.json()["error"]["details"]["permission"],
+        "alert-rules:read"
+    );
+    assert_eq!(
+        call(addr, "GET", "/api/v1/alert-rules", Some(&auditor), None)
+            .await
+            .status,
+        200
+    );
+    // 稽核員看不到通知管道、不能建立靜音
+    assert_eq!(
+        call(addr, "GET", "/api/v1/channels", Some(&auditor), None)
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        call(
+            addr,
+            "POST",
+            "/api/v1/silences",
+            Some(&auditor),
+            Some(&json!({"kind": "silence", "name": "x", "scope": {}, "duration_secs": 600, "reason": "x"}))
+        )
+        .await
+        .status,
+        403
+    );
     let url = format!("http://{}/hook?token=SECRETTOKEN", hook.addr);
     let channel = json!({
         "name": "SIEM",
@@ -53,7 +96,7 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "POST",
         "/api/v1/channels",
-        Some(&f.token),
+        Some(&viewer),
         Some(&channel),
     )
     .await;
@@ -83,7 +126,7 @@ async fn alerts_end_to_end_over_https() {
     );
     // 唯讀看不到管道（S11：稽核員與唯讀看不到此頁）
     assert_eq!(
-        call(addr, "GET", "/api/v1/channels", Some(&f.token), None)
+        call(addr, "GET", "/api/v1/channels", Some(&viewer), None)
             .await
             .status,
         403
@@ -205,7 +248,7 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "POST",
         "/api/v1/alert-rules/preview",
-        Some(&f.token),
+        Some(&auditor),
         Some(&json!({ "rule_id": custom })),
     )
     .await;
@@ -215,15 +258,18 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "POST",
         "/api/v1/alert-rules/preview",
-        Some(&f.token),
+        Some(&auditor),
         Some(&json!({ "rule_id": "sys.host_offline" })),
     )
     .await;
     assert_eq!(r.json()["data"]["supported"], false);
 
     // 主機上線、離線 → 事件 → Webhook
-    let mut sse = Sse::open(addr, &f.token, None).await;
+    let mut sse = Sse::open(addr, &viewer, None).await;
     let _ = sse.next().await; // ready
+    // 0.5 的 token 也可以開 SSE（主機的讀取），但收不到告警的事件
+    let mut legacy_sse = Sse::open(addr, &legacy, None).await;
+    let _ = legacy_sse.next().await; // ready
     f.registry
         .register(
             77,
@@ -268,13 +314,28 @@ async fn alerts_end_to_end_over_https() {
         }
     }
     assert!(saw, "SSE 應推送 alert.created");
+    // 0.5 的 token 的串流：同一段時間的主機事件有送出，告警的事件沒有
+    let mut legacy_kinds = Vec::new();
+    while let Ok(Some(ev)) =
+        tokio::time::timeout(Duration::from_millis(1500), legacy_sse.next()).await
+    {
+        legacy_kinds.push(ev.event);
+    }
+    assert!(
+        legacy_kinds.iter().any(|k| k.starts_with("host.")),
+        "{legacy_kinds:?}"
+    );
+    assert!(
+        !legacy_kinds.iter().any(|k| k.starts_with("alert.")),
+        "{legacy_kinds:?}"
+    );
 
     // 列表、摘要、詳情
     let r = call(
         addr,
         "GET",
         "/api/v1/alerts?view=needs_me",
-        Some(&f.token),
+        Some(&viewer),
         None,
     )
     .await;
@@ -283,7 +344,7 @@ async fn alerts_end_to_end_over_https() {
     assert_eq!(v["page"]["total"], 1);
     assert_eq!(v["data"][0]["event_id"], event_id);
     assert_eq!(v["meta"]["engine"]["running"], true);
-    let r = call(addr, "GET", "/api/v1/alerts/summary", Some(&f.token), None).await;
+    let r = call(addr, "GET", "/api/v1/alerts/summary", Some(&viewer), None).await;
     assert_eq!(
         r.json()["data"]["counts"]["active_by_severity"]["critical"],
         1
@@ -292,7 +353,7 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "GET",
         &format!("/api/v1/alerts/{event_id}"),
-        Some(&f.token),
+        Some(&viewer),
         None,
     )
     .await;
@@ -318,7 +379,7 @@ async fn alerts_end_to_end_over_https() {
             addr,
             "POST",
             &format!("/api/v1/alerts/{event_id}/ack"),
-            Some(&f.token),
+            Some(&viewer),
             Some(&json!({}))
         )
         .await
@@ -381,7 +442,7 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "POST",
         "/api/v1/silences/preview",
-        Some(&f.token),
+        Some(&viewer),
         Some(
             &json!({ "scope": { "tags": ["line3"], "subnets": ["10.30.3.0/24", "10.99.0.0/16"] } }),
         ),
@@ -403,7 +464,7 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "POST",
         "/api/v1/silences/preview",
-        Some(&f.token),
+        Some(&viewer),
         Some(&json!({ "scope": { "groups": ["B廠"] } })),
     )
     .await;
@@ -424,7 +485,7 @@ async fn alerts_end_to_end_over_https() {
         addr,
         "GET",
         "/api/v1/silences?status=active",
-        Some(&f.token),
+        Some(&viewer),
         None,
     )
     .await;
@@ -467,7 +528,7 @@ async fn alerts_end_to_end_over_https() {
     )
     .await;
     assert_eq!(r.json()["data"]["enabled"], false);
-    let r = call(addr, "GET", "/api/v1/alert-rules", Some(&f.token), None).await;
+    let r = call(addr, "GET", "/api/v1/alert-rules", Some(&auditor), None).await;
     let rules = r.json()["data"].as_array().unwrap().clone();
     assert!(rules.len() >= 31);
     let ho = rules

@@ -915,36 +915,12 @@ pub fn delete_setting(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("DELETE FROM settings WHERE key = ?1", [key])? > 0)
 }
 
-/// 稽核事件（`audit_events`）
-#[derive(Debug, Clone, Default)]
-pub struct Audit<'a> {
-    pub actor: &'a str,
-    pub actor_ip: Option<&'a str>,
-    pub category: &'a str,
-    pub action: &'a str,
-    pub object: Option<&'a str>,
-    pub result: &'a str,
-    pub code: Option<&'a str>,
-    pub details: Option<Value>,
-}
+/// 稽核事件（`audit_events`）：結構與雜湊鏈在 [`crate::audit`]
+pub use crate::audit::Audit;
 
+/// 寫入一筆稽核事件（接上雜湊鏈，[`crate::audit::append`]）
 pub fn audit(conn: &Connection, at_ms: i64, a: &Audit<'_>) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO audit_events (at, actor, actor_ip, category, action, object, result, code, details)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            at_ms,
-            a.actor,
-            a.actor_ip,
-            a.category,
-            a.action,
-            a.object,
-            a.result,
-            a.code,
-            a.details.as_ref().map(Value::to_string)
-        ],
-    )?;
-    Ok(())
+    crate::audit::append(conn, at_ms, a).map(|_| ())
 }
 
 /// 最近的稽核事件（測試與 CLI）：(時間, 執行者, 動作, 對象, 結果, 代碼)
@@ -970,8 +946,9 @@ pub fn recent_audit(
     rows.collect()
 }
 
-pub fn purge_audit(conn: &Connection, before_ms: i64) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM audit_events WHERE at < ?1", [before_ms])
+/// 依保留期限清除稽核事件（保留雜湊鏈的錨點，[`crate::audit::purge`]）
+pub fn purge_audit(conn: &Connection, before_ms: i64, now_ms: i64) -> rusqlite::Result<usize> {
+    crate::audit::purge(conn, before_ms, now_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1026,22 @@ pub fn upsert_host_on_issue(
             serial
         ],
     )?;
+    Ok(())
+}
+
+/// 主機群組（角色指派的範圍）：還沒有群組的主機，採用簽發它的註冊 token 的群組
+pub fn set_host_group_from_token(
+    conn: &Connection,
+    agent_id: &str,
+    token_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    if let Some(t) = token_id {
+        conn.execute(
+            "UPDATE hosts SET host_group = (SELECT group_name FROM enroll_tokens WHERE token_id = ?2)
+             WHERE agent_id = ?1 AND host_group IS NULL",
+            params![agent_id, t],
+        )?;
+    }
     Ok(())
 }
 

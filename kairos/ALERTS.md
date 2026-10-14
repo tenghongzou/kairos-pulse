@@ -1,6 +1,6 @@
 # Kairos 告警引擎（0.6.0〔草稿〕）
 
-商業審計 F3；設計包 `kairos/alerts-ux.md`（全文）、`kairos/screens.md` S06～S11 與 §24 #2、#8、#9，決策 D3（四級嚴重度）、D23（靜音範圍）、D26（靜音時長上限）。端點見 [`API.md`](API.md) 第 12 節，資料表見 [`STORAGE.md`](STORAGE.md) 第 3 節（schema v5）。
+商業審計 F3；設計包 `kairos/alerts-ux.md`（全文）、`kairos/screens.md` S06～S11 與 §24 #2、#8、#9，決策 D3（四級嚴重度）、D23（靜音範圍）、D26（靜音時長上限）。端點見 [`API.md`](API.md) 第 13 節，資料表見 [`STORAGE.md`](STORAGE.md) 第 3 節（schema v5）。
 
 - 實作：`kairos/src/bus.rs`（事件匯流排）、`kairos/src/alerts/`（引擎、系統檢查、通知、資料表）、`kairos/src/api/alerts.rs`（端點）、`kairos/src/alerts_cli.rs`（CLI）。
 - 需要 SQLite（`storage.backend = "sqlite"`，預設）；`[alerts] enabled = false` 時不啟動，告警端點回 503 `alerts_unavailable`。
@@ -168,13 +168,18 @@ subnet_prefix_v6 = 64
 
 ## 7. API 與權限
 
-見 [`API.md`](API.md) 第 12 節。每個端點需要的權限只在 `api/alerts.rs` 的 `route` 決定（`ROUTES` 是文件版，測試確認一致），之後的 RBAC（`sprint5/auth`）只要把角色對應到這些 `Permission`：
+見 [`API.md`](API.md) 第 13 節。每個端點需要的權限只在 `api/alerts.rs` 的 `route` 決定（`ROUTES` 是文件版，測試確認一致），權限與角色的對應在 `kairos/src/rbac.rs`（API.md 第 12.1 節；設計包 `ia.md` §4.2）：
 
-| 權限 | API token 範圍 | 端點 |
+| 權限 | 角色 | 端點 |
 |---|---|---|
-| `alerts:read`、`alert-rules:read`、`silences:read` | `read` | 查詢、規則試算、靜音預覽 |
-| `alerts:write`、`alert-rules:write`、`silences:write`、`channels:read`、`channels:test` | `operate` | 確認、指派、暫停、解決、註解；自訂規則與啟停；靜音；管道清單與寄送測試 |
-| `alert-rules:admin`、`channels:write` | `admin` | 系統預設規則的條件；新增、修改、刪除管道 |
+| `alerts:read`、`silences:read` | 管理員、維運者、稽核員、唯讀 | 事件與靜音的查詢、靜音預覽、SSE 的 `alert.*` |
+| `alert-rules:read` | 管理員、維運者、稽核員 | 規則的查詢與試算（唯讀看不到規則） |
+| `alerts:write`、`alert-rules:write`、`silences:write`、`channels:read`、`channels:test` | 管理員、維運者 | 確認、指派、暫停、解決、註解；自訂規則與啟停；靜音；管道清單（機密只有遮蔽值）與寄送測試 |
+| `alert-rules:admin`、`channels:write` | 管理員 | 系統預設規則的條件；新增、修改、刪除管道（含機密） |
+
+- 只有**全站範圍**的角色指派授予告警的權限；群組範圍的指派看不到告警（保守做法，延後）。
+- **0.4／0.5 建立的 API token（`--scope read|operate|admin`）沒有告警的權限**（權限凍結在升級前）：整合改以 `kairos api-token create --role viewer|operator|admin` 建立新 token。
+- 寫入（API 與 CLI）都寫入稽核雜湊鏈（`audit_events`，類別 `alerts`；API.md 第 12.8 節），執行者為 `user:<帳號>`、`token:<token_id>` 或 CLI 的作業系統帳號；工作階段的寫入需要 CSRF token。
 
 ## 8. CLI
 

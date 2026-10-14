@@ -1,13 +1,24 @@
-//! API token 的保存（`api_tokens`，schema v3）：`kairos api-token` 與主控台 API 共用
-//! （`kairos/API.md` 第 4 節）。
+//! API token 的保存（`api_tokens`，schema v3；v6 加上擁有者與角色）：`kairos api-token` 與主控台 API 共用
+//! （`kairos/API.md` 第 4 節、第 12.5 節）。
+//!
+//! token 的權限有三種來源（[`TokenGrant`]）：
+//! - **角色**（0.6 起建立的預設）：`role` 為內建角色，全站範圍；
+//! - **使用者**：`owner_user_id` 為擁有者，權限＝擁有者目前的權限（∩ `role`，有指定時）；擁有者停用或刪除時
+//!   token 立即失效；
+//! - **舊範圍**（0.4／0.5 建立）：`role`、`owner_user_id` 為 NULL，`scope` 為 `read`／`operate`／`admin`，
+//!   權限凍結在升級前（[`crate::rbac::LegacyScope`]）。
+//!
+//! 建立與撤銷在同一個交易中寫入稽核雜湊鏈（[`crate::audit`]）。
 //!
 //! token 為 `kat_<token_id>_<secret>`：`token_id` 是 16 個十六進位字元（8 bytes 隨機值），公開、
 //! 用於查詢與撤銷；`secret` 是 32 bytes 隨機值的 base64url（43 個字元），資料庫只保存它的 SHA-256。
 
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::json;
 
 use super::http::{b64url_decode, b64url_encode};
+use crate::rbac::{LegacyScope, Role};
 
 /// token 的前綴（secret 掃描工具以此辨識）
 pub const TOKEN_PREFIX: &str = "kat_";
@@ -18,19 +29,9 @@ pub const SECRET_BYTES: usize = 32;
 /// 秘密的 base64url 長度
 pub const SECRET_LEN: usize = 43;
 
-/// 範圍：唯讀（所有 GET）
+/// 0.4／0.5 的範圍 `read`（測試建立舊 token 用；新的 token 以角色或擁有者建立）
+#[cfg(test)]
 pub const SCOPE_READ: &str = "read";
-/// 範圍：`read`＋日常的註冊與憑證操作（API.md 第 11.1 節）
-pub const SCOPE_OPERATE: &str = "operate";
-/// 範圍：`operate`＋安全影響等同簽發新憑證或改變對外服務的操作
-pub const SCOPE_ADMIN: &str = "admin";
-/// 範圍（階層式：admin ⊃ operate ⊃ read）
-pub const SCOPES: [&str; 3] = [SCOPE_READ, SCOPE_OPERATE, SCOPE_ADMIN];
-
-/// 範圍的等級（不認得的值為 `None`）
-pub fn scope_rank(scope: &str) -> Option<u8> {
-    SCOPES.iter().position(|s| *s == scope).map(|i| i as u8)
-}
 
 /// `api_tokens.logged`：建立已寫入 Kairos 日誌
 pub const LOGGED_CREATED: i64 = 1;
@@ -80,12 +81,53 @@ pub fn generate() -> Result<(String, String), String> {
     Ok((id, b64url_encode(&secret)))
 }
 
+/// token 的權限來源
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenGrant {
+    /// 0.4／0.5 的範圍（`read`、`operate`、`admin`；`--scope`，已棄用）
+    Legacy(LegacyScope),
+    /// 內建角色（全站）
+    Role(Role),
+    /// 屬於使用者（權限＝擁有者的權限，∩ 角色）
+    User {
+        user_id: i64,
+        username: String,
+        role: Option<Role>,
+    },
+}
+
+impl TokenGrant {
+    /// 列表與日誌中的寫法：`role:operator`、`user:chen.y`、`user:chen.y∩viewer`、`scope:read`
+    pub fn label(&self) -> String {
+        match self {
+            TokenGrant::Legacy(s) => format!("scope:{}", s.as_str()),
+            TokenGrant::Role(r) => format!("role:{}", r.as_str()),
+            TokenGrant::User {
+                username,
+                role: None,
+                ..
+            } => format!("user:{username}"),
+            TokenGrant::User {
+                username,
+                role: Some(r),
+                ..
+            } => format!("user:{username}∩{}", r.as_str()),
+        }
+    }
+}
+
 /// `api_tokens` 的一列（不含雜湊）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenRow {
     pub token_id: String,
     pub name: String,
+    /// 舊範圍（0.4／0.5）；角色或使用者的 token 為空字串
     pub scope: String,
+    /// 角色（0.6）
+    pub role: Option<String>,
+    /// 擁有者
+    pub owner_user_id: Option<i64>,
+    pub owner_username: Option<String>,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub expires_at: Option<i64>,
@@ -115,6 +157,24 @@ impl TokenState {
 }
 
 impl TokenRow {
+    /// 權限來源的寫法（[`TokenGrant::label`]）；無法辨識時為 `unknown`
+    pub fn grant_label(&self) -> String {
+        match (&self.owner_user_id, &self.role) {
+            (Some(_), r) => {
+                let u = self.owner_username.as_deref().unwrap_or("（已刪除）");
+                match r {
+                    Some(r) => format!("user:{u}∩{r}"),
+                    None => format!("user:{u}"),
+                }
+            }
+            (None, Some(r)) => format!("role:{r}"),
+            (None, None) if LegacyScope::parse(&self.scope).is_some() => {
+                format!("scope:{}", self.scope)
+            }
+            _ => "unknown".to_string(),
+        }
+    }
+
     pub fn state(&self, now_ms: i64) -> TokenState {
         if self.revoked_at.is_some() {
             TokenState::Revoked
@@ -127,13 +187,17 @@ impl TokenRow {
 }
 
 const COLUMNS: &str = "token_id, name, scope, created_at, created_by, expires_at, revoked_at, \
-                       revoked_by, revoke_reason, last_used_at, last_used_ip";
+                       revoked_by, revoke_reason, last_used_at, last_used_ip, role, owner_user_id, \
+                       (SELECT username FROM users WHERE users.user_id = api_tokens.owner_user_id)";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRow> {
     Ok(TokenRow {
         token_id: r.get(0)?,
         name: r.get(1)?,
         scope: r.get(2)?,
+        role: r.get(11)?,
+        owner_user_id: r.get(12)?,
+        owner_username: r.get(13)?,
         created_at: r.get(3)?,
         created_by: r.get(4)?,
         expires_at: r.get(5)?,
@@ -167,7 +231,8 @@ pub struct NewToken {
     pub row: TokenRow,
 }
 
-/// 建立 token（一個 INSERT）
+/// 建立 token（0.4／0.5 的範圍；測試用）
+#[cfg(test)]
 pub fn create(
     conn: &Connection,
     name: &str,
@@ -176,21 +241,73 @@ pub fn create(
     created_by: Option<&str>,
     now_ms: i64,
 ) -> Result<NewToken, String> {
+    let grant = TokenGrant::Legacy(
+        LegacyScope::parse(scope).ok_or_else(|| format!("範圍 \"{scope}\" 無效"))?,
+    );
+    create_with(conn, name, &grant, expires_at, created_by, None, now_ms)
+}
+
+/// 建立 token，並在同一個交易中寫入稽核
+pub fn create_with(
+    conn: &Connection,
+    name: &str,
+    grant: &TokenGrant,
+    expires_at: Option<i64>,
+    created_by: Option<&str>,
+    ip: Option<&str>,
+    now_ms: i64,
+) -> Result<NewToken, String> {
     validate_name(name)?;
     let (token_id, secret) = generate()?;
     let hash = hash_secret(&secret);
-    conn.execute(
-        "INSERT INTO api_tokens (token_id, name, secret_hash, scope, created_at, created_by, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![token_id, name, &hash[..], scope, now_ms, created_by, expires_at],
-    )
+    let (scope, role, owner) = match grant {
+        TokenGrant::Legacy(s) => (s.as_str().to_string(), None, None),
+        TokenGrant::Role(r) => (String::new(), Some(r.as_str()), None),
+        TokenGrant::User { user_id, role, .. } => {
+            (String::new(), role.map(Role::as_str), Some(*user_id))
+        }
+    };
+    let by = created_by.unwrap_or("（未知）");
+    crate::audit::in_write_tx(conn, |conn| {
+        conn.execute(
+            "INSERT INTO api_tokens (token_id, name, secret_hash, scope, created_at, created_by, expires_at,
+                role, owner_user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![token_id, name, &hash[..], scope, now_ms, created_by, expires_at, role, owner],
+        )?;
+        crate::audit::append(
+            conn,
+            now_ms,
+            &crate::audit::Audit {
+                actor: by,
+                actor_ip: ip,
+                category: "api_token",
+                action: "token.create",
+                object: Some(&token_id),
+                result: "ok",
+                details: Some(json!({
+                    "name": name,
+                    "grant": grant.label(),
+                    "expires_at": expires_at.map(super::http::ts_ms),
+                })),
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    })
     .map_err(|e| format!("無法寫入 api_tokens: {e}"))?;
     Ok(NewToken {
         token: format!("{TOKEN_PREFIX}{token_id}_{secret}"),
         row: TokenRow {
             token_id,
             name: name.to_string(),
-            scope: scope.to_string(),
+            scope,
+            role: role.map(str::to_string),
+            owner_user_id: owner,
+            owner_username: match grant {
+                TokenGrant::User { username, .. } => Some(username.clone()),
+                _ => None,
+            },
             created_at: now_ms,
             created_by: created_by.map(str::to_string),
             expires_at,
@@ -238,15 +355,45 @@ pub fn revoke(
     reason: Option<&str>,
     now_ms: i64,
 ) -> rusqlite::Result<Revoked> {
-    let changed = conn.execute(
-        "UPDATE api_tokens SET revoked_at = ?2, revoked_by = ?3, revoke_reason = ?4
-         WHERE token_id = ?1 AND revoked_at IS NULL",
-        params![token_id, now_ms, by, reason],
-    )?;
-    Ok(match (changed, get(conn, token_id)?) {
-        (_, None) => Revoked::NotFound,
-        (0, Some(row)) => Revoked::Already(row),
-        (_, Some(row)) => Revoked::Now(row),
+    revoke_with(conn, token_id, by, None, reason, now_ms)
+}
+
+/// 撤銷，並在同一個交易中寫入稽核（重複撤銷不寫入）
+pub fn revoke_with(
+    conn: &Connection,
+    token_id: &str,
+    by: Option<&str>,
+    ip: Option<&str>,
+    reason: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<Revoked> {
+    crate::audit::in_write_tx(conn, |conn| {
+        let changed = conn.execute(
+            "UPDATE api_tokens SET revoked_at = ?2, revoked_by = ?3, revoke_reason = ?4
+             WHERE token_id = ?1 AND revoked_at IS NULL",
+            params![token_id, now_ms, by, reason],
+        )?;
+        if changed > 0 {
+            crate::audit::append(
+                conn,
+                now_ms,
+                &crate::audit::Audit {
+                    actor: by.unwrap_or("（未知）"),
+                    actor_ip: ip,
+                    category: "api_token",
+                    action: "token.revoke",
+                    object: Some(token_id),
+                    result: "ok",
+                    details: Some(json!({ "reason": reason })),
+                    ..Default::default()
+                },
+            )?;
+        }
+        Ok(match (changed, get(conn, token_id)?) {
+            (_, None) => Revoked::NotFound,
+            (0, Some(row)) => Revoked::Already(row),
+            (_, Some(row)) => Revoked::Now(row),
+        })
     })
 }
 
@@ -258,11 +405,14 @@ pub struct StoredToken {
     pub scope: String,
     pub expires_at: Option<i64>,
     pub revoked_at: Option<i64>,
+    pub role: Option<String>,
+    pub owner_user_id: Option<i64>,
 }
 
 pub fn lookup(conn: &Connection, token_id: &str) -> rusqlite::Result<Option<StoredToken>> {
     conn.query_row(
-        "SELECT secret_hash, name, scope, expires_at, revoked_at FROM api_tokens WHERE token_id = ?1",
+        "SELECT secret_hash, name, scope, expires_at, revoked_at, role, owner_user_id
+         FROM api_tokens WHERE token_id = ?1",
         [token_id],
         |r| {
             Ok(StoredToken {
@@ -271,6 +421,8 @@ pub fn lookup(conn: &Connection, token_id: &str) -> rusqlite::Result<Option<Stor
                 scope: r.get(2)?,
                 expires_at: r.get(3)?,
                 revoked_at: r.get(4)?,
+                role: r.get(5)?,
+                owner_user_id: r.get(6)?,
             })
         },
     )
@@ -284,7 +436,7 @@ pub fn pending_audit(conn: &Connection) -> rusqlite::Result<Vec<(TokenRow, i64)>
          WHERE (logged & 1) = 0 OR (revoked_at IS NOT NULL AND (logged & 2) = 0)
          ORDER BY created_at LIMIT 100"
     ))?;
-    let rows = stmt.query_map([], |r| Ok((row_of(r)?, r.get::<_, i64>(11)?)))?;
+    let rows = stmt.query_map([], |r| Ok((row_of(r)?, r.get::<_, i64>(14)?)))?;
     rows.collect()
 }
 
@@ -428,6 +580,6 @@ mod tests {
                 "{bad:?}"
             );
         }
-        assert!(create(&conn, &"主".repeat(64), SCOPE_READ, None, None, 0).is_ok());
+        assert!(create(&conn, &"主".repeat(64), "read", None, None, 0).is_ok());
     }
 }

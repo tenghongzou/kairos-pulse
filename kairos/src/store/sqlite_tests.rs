@@ -1544,7 +1544,7 @@ fn prepare_files_keeps_the_locks_of_open_connections() {
 }
 
 #[test]
-fn upgrade_from_v4_to_v5_keeps_data_and_adds_the_alert_tables() {
+fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_tables() {
     let dir = temp_dir("v4v5");
     let path = dir.join("m.db");
     let mut conn = Connection::open(&path).unwrap();
@@ -1570,8 +1570,24 @@ fn upgrade_from_v4_to_v5_keeps_data_and_adds_the_alert_tables() {
             == 1
     };
     assert!(!has(&conn, "alert_events"));
-    // 升級到 v5：資料保留，告警的資料表建立
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 5);
+    // 只套用 v5：告警的資料表建立
+    assert_eq!(migrate(&mut conn, &MIGRATIONS[..5]).unwrap(), 5);
+    assert!(has(&conn, "alert_events"));
+    assert!(!has(&conn, "users"));
+    // 再升級到 v6（整合後的線性順序 v4 → v5 → v6）：使用者的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 6);
+    assert_eq!(
+        MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
+    for t in [
+        "users",
+        "role_assignments",
+        "sessions",
+        "user_recovery_codes",
+    ] {
+        assert!(has(&conn, t), "{t}");
+    }
     let mode: String = conn
         .query_row(
             "SELECT value FROM settings WHERE key = 'enroll.mode'",
@@ -1599,7 +1615,7 @@ fn upgrade_from_v4_to_v5_keeps_data_and_adds_the_alert_tables() {
         0
     );
     // 再執行一次升級：不變
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 5);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 6);
     drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }

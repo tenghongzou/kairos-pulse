@@ -11,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+mod accounts;
 mod alerts;
 mod enroll;
 
 pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
+
+pub use accounts::{AccountSettings, AuditSettings, LdapSettings};
 pub use enroll::{
     CertPolicySettings, EnrollSettings, MAX_CERT_LIFETIME_DAYS, MAX_GRACE_DAYS,
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
@@ -143,7 +146,9 @@ kairos silences list|create|end [選項]（靜音與維護時段）\n       \
 kairos alert-rules list|enable|disable [選項]（告警規則）\n       \
 kairos alert-channels list（通知管道）\n       \
 kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
-kairos config show --effective（實際生效的設定與來源）\n\n\
+kairos config show --effective（實際生效的設定與來源）\n       \
+kairos users create|list|show|grant|revoke-role|disable|enable|delete|reset-password|reset-mfa|unlock|sessions|end-sessions|map-group [選項]（使用者與角色）\n       \
+kairos audit list|verify|export [選項]（稽核日誌）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
@@ -166,6 +171,12 @@ pub struct AppConfig {
     pub pki: PkiSettings,
     /// 告警引擎（`kairos/ALERTS.md`）
     pub alerts: AlertSettings,
+    /// 本機帳號、密碼政策、登入鎖定與工作階段（`kairos/API.md` 第 12 節）
+    pub accounts: AccountSettings,
+    /// 目錄服務（LDAP／AD）
+    pub ldap: LdapSettings,
+    /// 稽核日誌
+    pub audit: AuditSettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,
@@ -639,6 +650,10 @@ pub enum CliAction {
     Enroll(crate::enroll_cli::Cmd),
     /// `kairos alerts|silences|alert-rules|alert-channels ...`（告警，見 [`crate::alerts_cli`]）
     Alerts(crate::alerts_cli::Cmd),
+    /// `kairos users ...`（使用者、角色指派、工作階段，見 [`crate::users_cli`]）
+    Users(crate::users_cli::UsersCommand),
+    /// `kairos audit ...`（稽核日誌的查詢、驗證與匯出，見 [`crate::audit_cli`]）
+    Audit(crate::audit_cli::AuditCommand),
 }
 
 /// `--config=<path>` 的前綴
@@ -689,6 +704,14 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "db") {
         iter.next();
         return crate::export_cli::parse_db_args(iter).map(CliAction::Db);
+    }
+    if iter.peek().is_some_and(|a| a == "users") {
+        iter.next();
+        return crate::users_cli::parse_args(iter).map(CliAction::Users);
+    }
+    if iter.peek().is_some_and(|a| a == "audit") {
+        iter.next();
+        return crate::audit_cli::parse_args(iter).map(CliAction::Audit);
     }
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();
@@ -1189,6 +1212,9 @@ impl AppConfig {
         self.enroll.validate()?;
         self.pki.validate()?;
         self.alerts.validate()?;
+        self.accounts.validate()?;
+        self.ldap.validate()?;
+        self.audit.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
         Ok(())

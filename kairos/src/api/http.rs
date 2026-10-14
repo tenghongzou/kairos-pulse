@@ -115,8 +115,18 @@ pub fn event_stream(body: ApiBody) -> Response<ApiBody> {
 pub const CODE_UNAUTHORIZED: &str = "KRS-E6010";
 /// 429 `rate_limited`（同一來源驗證失敗太多次）的產品代碼；第一次限制該來源時的 `WARN` 日誌也帶它
 pub const CODE_RATE_LIMITED: &str = "KRS-W6011";
-/// 403 `forbidden` 的產品代碼（0.4 只有 `read` 範圍，不會出現）
+/// 403 `forbidden` 的產品代碼
 pub const CODE_FORBIDDEN: &str = "KRS-E6104";
+/// 403 `csrf_failed`：工作階段的請求缺少或帶錯 CSRF token、或來源不同（〔暫定〕代碼，設計包尚未分配）
+pub const CODE_CSRF: &str = "KRS-E6105";
+/// 帳號或密碼不正確（`copywriting.md` §3.3）
+pub const CODE_BAD_CREDENTIALS: &str = "KRS-E6001";
+/// 帳號已鎖定
+pub const CODE_LOCKED: &str = "KRS-E6003";
+/// 二階段驗證碼不正確或已使用過（〔暫定〕代碼，設計包尚未分配）
+pub const CODE_BAD_MFA: &str = "KRS-E6012";
+/// 必須先變更密碼（管理員建立或重設後的第一次登入；〔暫定〕代碼）
+pub const CODE_PASSWORD_CHANGE: &str = "KRS-E6013";
 
 /// API 的錯誤（`kairos/API.md` 第 1.2 節）
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +201,42 @@ impl ApiError {
             "這個 token 的範圍不包含這個操作",
         )
         .with_product_code(CODE_FORBIDDEN)
+    }
+
+    /// 401：工作階段已結束、逾時，或使用者已停用（`KRS-E6010`，`details.reason = session_expired`）
+    pub fn session_expired() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "工作階段已結束或逾時，請重新登入",
+        )
+        .with_product_code(CODE_UNAUTHORIZED)
+        .with_details(json!({ "reason": "session_expired" }))
+    }
+
+    /// 403 `csrf_failed`：缺少或不正確的 `X-CSRF-Token`，或請求來自其他網站
+    pub fn csrf_failed() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "csrf_failed",
+            "請求缺少有效的 X-CSRF-Token，或來自其他網站",
+        )
+        .with_product_code(CODE_CSRF)
+    }
+
+    /// 403 `password_change_required`：必須先變更密碼（只能呼叫 `/me`、`/me/password`、登出）
+    pub fn password_change_required() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "password_change_required",
+            "請先變更密碼（POST /api/v1/me/password）",
+        )
+        .with_product_code(CODE_PASSWORD_CHANGE)
+    }
+
+    /// 409 `conflict` 類的錯誤（`code` 自訂）
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
     }
 
     pub fn not_found() -> Self {
@@ -358,6 +404,91 @@ impl Query {
                 format!("{name} 的值 \"{v}\" 必須是 true 或 false"),
             )),
         }
+    }
+}
+
+/// 讀取 JSON 本文（`Content-Type: application/json`、必須有 `Content-Length`、不接受 chunked、上限 `max`）
+pub async fn read_json(
+    req: hyper::Request<hyper::body::Incoming>,
+    max: usize,
+) -> Result<Value, ApiError> {
+    use hyper::body::Body as _;
+    let headers = req.headers();
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/json")
+    {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "本文必須是 application/json",
+        ));
+    }
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return Err(ApiError::param(
+            "content-length",
+            "請以 Content-Length 送出本文（不接受 chunked）",
+        ));
+    }
+    let len = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .ok_or_else(|| ApiError::param("content-length", "需要 Content-Length"))?;
+    if len > max {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!("本文超過 {max} bytes"),
+        ));
+    }
+    let mut body = req.into_body();
+    let mut buf = Vec::with_capacity(len);
+    loop {
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        match frame {
+            None => break,
+            Some(Err(_)) => return Err(ApiError::param("body", "本文無法讀取")),
+            Some(Ok(f)) => {
+                if let Ok(d) = f.into_data() {
+                    if buf.len() + d.len() > len {
+                        return Err(ApiError::param("body", "本文比 Content-Length 長"));
+                    }
+                    buf.extend_from_slice(&d);
+                }
+            }
+        }
+    }
+    serde_json::from_slice(&buf)
+        .map_err(|e| ApiError::param("body", format!("本文不是有效的 JSON：{e}")))
+}
+
+/// 本文中的字串欄位
+pub fn str_field<'a>(b: &'a Value, name: &str) -> Option<&'a str> {
+    b.get(name).and_then(Value::as_str)
+}
+
+/// 本文中的字串陣列欄位（沒有或 `null` 時為 `None`）
+pub fn str_list(b: &Value, name: &str) -> Result<Option<Vec<String>>, ApiError> {
+    match b.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ApiError::param(name, format!("{name} 必須是字串陣列")))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(ApiError::param(name, format!("{name} 必須是字串陣列"))),
     }
 }
 

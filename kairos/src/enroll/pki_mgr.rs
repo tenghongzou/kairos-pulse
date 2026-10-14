@@ -399,6 +399,7 @@ impl PkiManager {
             &cert.serial,
             now_ms,
         )?;
+        es::set_host_group_from_token(&tx, &req.agent_id, req.token_id.as_deref())?;
         es::audit(
             &tx,
             now_ms,

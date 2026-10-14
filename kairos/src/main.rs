@@ -1,6 +1,8 @@
 mod alerts;
 mod alerts_cli;
 mod api;
+mod audit;
+mod audit_cli;
 mod auth;
 mod bus;
 mod config;
@@ -21,6 +23,7 @@ mod per_ip;
 mod pki;
 mod protocol;
 mod rate;
+mod rbac;
 mod registry;
 mod reload;
 mod retention;
@@ -35,6 +38,8 @@ mod testhooks;
 mod throttle;
 mod tls;
 mod token_cli;
+mod users;
+mod users_cli;
 
 use log::{debug, error, info, warn};
 use std::io::{Error, ErrorKind};
@@ -474,6 +479,8 @@ fn main() -> ExitCode {
         Ok(CliAction::ApiToken(cmd)) => return ExitCode::from(token_cli::run(cmd)),
         Ok(CliAction::Enroll(cmd)) => return ExitCode::from(enroll_cli::run(cmd)),
         Ok(CliAction::Alerts(cmd)) => return ExitCode::from(alerts_cli::run(cmd)),
+        Ok(CliAction::Users(cmd)) => return ExitCode::from(users_cli::run(cmd)),
+        Ok(CliAction::Audit(cmd)) => return ExitCode::from(audit_cli::run(cmd)),
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
@@ -494,6 +501,8 @@ fn main() -> ExitCode {
                 Some(a) if a == "silences" => alerts_cli::SILENCES_USAGE,
                 Some(a) if a == "alert-rules" => alerts_cli::RULES_USAGE,
                 Some(a) if a == "alert-channels" => alerts_cli::CHANNELS_USAGE,
+                Some(a) if a == "users" => users_cli::USERS_USAGE,
+                Some(a) if a == "audit" => audit_cli::AUDIT_USAGE,
                 _ => USAGE,
             };
             eprintln!("{}\n\n{}", e, usage);
@@ -556,6 +565,43 @@ fn main() -> ExitCode {
     }
     log::logger().flush();
     ExitCode::from(exit_code(&result))
+}
+
+/// 系統事件（啟動、關機）寫入稽核雜湊鏈（SQLite 時；失敗只記日誌）
+async fn system_audit(
+    svc: Option<&Arc<enroll::EnrollService>>,
+    action: &'static str,
+    config_path: Option<&Path>,
+) {
+    let Some(svc) = svc else {
+        return;
+    };
+    let details = serde_json::json!({
+        "version": VERSION,
+        "config_file": config_path.map(|p| p.display().to_string()),
+    });
+    let now = chrono::Utc::now().timestamp_millis();
+    let r = svc
+        .db
+        .write(move |conn| {
+            crate::audit::append(
+                conn,
+                now,
+                &crate::audit::Audit {
+                    actor: "system",
+                    category: "system",
+                    action,
+                    result: "ok",
+                    details: Some(details),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = r {
+        warn!("無法寫入稽核紀錄（{action}）：{e}");
+    }
 }
 
 /// [`run`] 的執行環境（測試可替換）
@@ -1013,6 +1059,7 @@ async fn run(
                 agent_listen: agent_addr,
                 enroll: enroll_service.clone(),
                 alerts: alert_service.clone(),
+                directory: None,
             })
             .await;
             match started {
@@ -1040,6 +1087,9 @@ async fn run(
     registry.bus().publish(bus::EventKind::Lifecycle {
         phase: bus::Lifecycle::Started,
     });
+    // 稽核：系統事件（啟動）
+    system_audit(enroll_service.as_ref(), "system.start", config_path).await;
+
     let mut connections =
         accept_loop(listener, ctx.clone(), config.server.max_connections, per_ip).await?;
     registry.bus().publish(bus::EventKind::Lifecycle {
@@ -1050,6 +1100,7 @@ async fn run(
     // 所有階段共用以 T0（收到訊號的時間）起算的期限
     let t0 = shutdown.started_at().unwrap_or_else(Instant::now);
     info!("已停止接受新連線");
+    system_audit(enroll_service.as_ref(), "system.shutdown", config_path).await;
     // 主控台：停止接受並中斷所有連線（含 SSE）
     if let Some(console) = console {
         let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), console.join()).await;
