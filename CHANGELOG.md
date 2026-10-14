@@ -26,6 +26,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 - 同一個 Kairos 0.2.0 可以同時服務 v1 與 v2 的 Pulse：每個 agent 依自己的連線協商，同一個 `reports-*.jsonl` 中 `schema` 1 與 2 的行並存（讀取工具須依 `schema` 分流，見破壞性變更第 6 項）。
 - 0.3.0〔草稿〕的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
+- 0.5.0〔草稿〕的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
@@ -46,59 +47,84 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（0.4.0 之後的變更記在這裡。）
+（0.5.0 之後的變更記在這裡。）
 
-## [0.5.0]〔草稿〕
+## [0.5.0] - 〔草稿：發佈日期待定〕
 
-〔草稿〕**Kairos 0.5.0**：註冊通道 8444 與 PKI（衝刺 4，Kairos 端）。版本號尚未修改（`kairos/Cargo.toml` 仍為 0.4.0），發佈時依 RELEASING.md 修改並填上日期。Pulse 端（`pulse enroll`、8443 的 `renew`／`deregister`）另行記錄。
+〔草稿〕**Kairos 0.5.0、Pulse 0.5.0**：衝刺 4「註冊通道 8444」。Kairos 新增註冊通道（8444 HTTPS）、自動簽發的 PKI（線上簽發 CA、CRL）與管理 API／CLI；Pulse 新增 `pulse enroll`、`pulse decommission`、過期寬限期續簽與 8443 的自動輪替。**協定版本不變**（仍為 v1～v2），8443 以新的 feature `renew`、`deregister` 協商，只在雙方都宣告時使用：0.4 的 Kairos 與 Pulse 不受影響，兩個產品可以分批升級（建議順序見下）。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.5.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。規格：`crates/kairos-proto/ENROLL.md`（8444）、`crates/kairos-proto/PROTOCOL.md`「憑證輪替與除役」（8443）、`kairos/PKI.md`、`kairos/API.md` 第 11 節。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
-1. **資料庫升級到 schema v4**：新增 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，`hosts` 新增憑證與除役的欄位。**升級前以 `kairos db backup` 備份**，升級後 0.4 無法開啟（STORAGE.md）。
-2. **預設不改變行為**：沒有 `[enroll]` 時註冊通道關閉（不監聽 8444，啟動時記一次 `KRS-I2010`），沒有 `[pki]` 時為離線簽發；手動 PKI（`auth.client_ca`、`auth.crl`）照舊。啟用步驟見 INSTALL 第 6.5 節。
-3. **API token 的範圍**：新增 `operate`、`admin`（階層式）；既有 token 維持 `read`，寫入操作回 403（`details.required`）。
-4. **設定的優先順序**：主控台修改的 `enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*` 存在資料庫，優先於 `kairos.toml`（環境變數最優先）；啟動時以 `INFO` 列出被覆寫的設定檔設定。
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **資料庫升級到 schema v4**：新增 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，`hosts` 新增憑證與除役的欄位 | 所有 SQLite 部署 | 升級前 `kairos db backup`（Kairos INSTALL 第 11 節）；升級後 0.4 無法開啟資料庫（降版從備份還原）。`kairos enroll-token`、`kairos enroll`、`kairos pki`、`kairos config` 開啟資料庫時同樣會升級 schema |
+| 2 | Kairos | **API token 新增 `operate`、`admin` 範圍**（階層式） | 以主控台 API 執行寫入的整合 | 既有 token 維持 `read`，寫入操作回 403（`details.required`）；需要核准、撤銷、模式切換時以 `kairos api-token create --scope operate|admin` 建立新的 token |
+| 3 | Kairos | **主控台修改的設定存在資料庫、優先於 `kairos.toml`**：`enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*`（環境變數仍最優先） | 以 `kairos.toml` 管理這些鍵的部署 | 以 `kairos config show --effective` 查看每項的實際值與來源；`kairos config reset <鍵>` 改回設定檔的值。啟動時以 `INFO` 列出被覆寫的設定檔設定 |
+| 4 | Kairos | 啟用註冊通道時，**檔案描述元的需要量另加 `enroll.max_connections`**（預設 1024） | 自訂 `LimitNOFILE` 的部署 | 啟動時不足會記 `WARN` 並附建議值；發佈包 unit 的 `LimitNOFILE=8192` 足夠 |
+| 5 | Pulse | **要使用 `pulse enroll` 時需要新版 `pulse.service`**（`ReadWritePaths=` 多了 `-/opt/pulse/identity`）與 `identity/` 目錄 | 以 `pulse enroll` 註冊的主機 | `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，換上新版 unit 並 `systemctl daemon-reload`（多實例時重新產生每個 `pulse-N.service`，Pulse INSTALL 第 9、10 節）。沿用手動憑證的部署不需要任何變更：沒有 `identity/enrollment.json` 時行為與 0.4 相同 |
+
+**沒有 `[enroll]`、`[pki]` 的 Kairos 與沒有 `identity/` 的 Pulse，行為與 0.4 相同**：註冊通道關閉（不監聽 8444，啟動時記一次 `KRS-I2010`）、離線簽發，手動 PKI（`auth.client_ca`、`auth.crl`）照舊。
+
+**升級步驟**（建議依序；只升級其中一個產品也可以，見「相容性」）：
+
+1. **Kairos 升級前**：`kairos db backup` 備份資料庫（第 1 項）。
+2. **升級 Kairos**：換上新版執行檔並重新啟動（Kairos INSTALL 第 11 節，unit 不需修改）。此時註冊通道仍關閉，0.4 的 Pulse 照常以 8443 連線（`hello_ack` 與 0.4 相同）。
+3. **（要使用自動註冊時）建立簽發 CA**：`kairos pki issuing-ca new` → 以代理 CA（或根 CA）簽發 → `kairos pki issuing-ca install`（Kairos INSTALL 第 6.5 節）；在 `kairos.toml` 加上 `[enroll]`（`mode`）與 `[pki]`（`mode = "online"`、`server_ca_path`）並重新啟動，確認日誌有「註冊端點（8444）已啟動」。
+4. **開放 8444 的防火牆**：只允許**要註冊的主機**連到 Kairos 的 TCP 8444（或 `enroll.listen` 的連接埠）。不使用自動註冊時不必開放。
+5. **升級 Pulse**：換上新版執行檔與 `pulse.service`（第 5 項），`install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，`systemctl daemon-reload` 後重新啟動（Pulse INSTALL 第 10 節）。既有主機沿用手動憑證即可；新主機以 `pulse enroll --install-string …` 註冊（Pulse INSTALL 第 5.0 節）。
+6. **確認**：`pulse status`（連線列的 features 出現 `renew` 表示身分由 `pulse enroll` 管理且 Kairos 支援自動輪替）、`kairos enroll list`、`kairos pki certificates list`。
+
+### 協定（kairos-proto）
+
+- `crates/kairos-proto/ENROLL.md`：Pulse ↔ Kairos 註冊通道（8444 HTTPS）協定 v1 的唯一規格——端點 `/v1/enroll/server-info`、`token-check`、`requests`（新註冊）、`requests/{request_id}`（輪詢與取回憑證，含長輪詢）、`renewals`（過期寬限期續簽）、撤回的兩段式 challenge／withdraw；錯誤碼與 `KRS-`／`PLS-` 對照、時鐘檢查、三段模式、多層速率限制、同一個 CSR 只簽發一張憑證（設計包 `INTEGRATION.md` §23.9 定案）、安全審查項目的處置、端對端測試情境與實作現況（第 19.5 節）。
+- `kairos-proto` 的 `enroll` 模組：註冊通道的請求與回應型別、欄位驗證、路徑與模式白名單、註冊 token（`KRT1-…`，GF(32) 檢查碼）、安裝字串、CA 指紋、申請編號、簽章內容的正規化與 ECDSA P-256 驗證；單元測試直接解析 ENROLL.md 的錯誤碼表、範例與測試向量。`kairos-proto` 因此依賴 `ring`、`chrono`（兩者原本就在依賴樹中）；測試另用 `rcgen`、`x509-parser`（MIT OR Apache-2.0）。
+- **8443 的 feature `renew`、`deregister`**（ENROLL.md 第 13 節的草稿移入 PROTOCOL.md「憑證輪替與除役」）：`kairos-proto` 新增 `lifecycle` 模組與 `ClientMsg::RenewRequest`／`Deregister`、`ServerMsg::RenewResult`／`DeregisterAck` 變體，`hello` 的 `intent`、`hello_ack` 的 `expired_renew_grace_days`／`renew_now`（型別不符時視為沒有，`None` 時不輸出），錯誤碼 `renew_requires_approval`、`invalid_csr`、`rate_limited`（非 fatal）。兩個產品都以這些共用型別收發（合併前各自定義的 `pulse/src/lifecycle.rs` 與 Kairos 的自行解析已刪除）。PROTOCOL.md 新增輪替、除役與三個錯誤碼的測試向量，並以凍結的舊版型別驗證舊端看到新訊息時的行為（舊 Kairos 回 `unknown_type`、舊 Pulse 忽略多出的欄位）。
 
 ### Kairos
 
 - 註冊通道 8444（`crates/kairos-proto/ENROLL.md`）：`server-info`、`token-check`、新註冊、輪詢（含長輪詢）、過期續簽、撤回（challenge／withdraw）；三段模式 `open`／`renew_only`／`closed` 與 24 小時沒有有效 token 的自動暫停；時鐘偏差檢查；同一個 CSR 只簽發一張憑證；重送防護（跨重啟）。
 - 多層速率限制 L1～L10（連線、來源、token、agent、全域、待核准佇列、輪詢間隔），`429`／`503` 附依佇列位置計算的 `Retry-After`；無效 token 的來源封鎖（再犯加倍，寫入資料庫）；批次部署來源的倍率。8444 在獨立的 runtime 上執行，1 萬台規模下 report 的 `ack` p99 維持在數十毫秒（PKI.md 第 12 節）。
 - PKI（`kairos/PKI.md`）：線上簽發 CA（`data/pki/`，私鑰 0600；權限或成對檢查不通過時不使用，`KRS-E1303`）、離線簽發佇列（`kairos pki queue export`／`sign-bundle`／`queue import`，不通過時 `KRS-E1305`）、簽發 CA 的建立／安裝／啟用／退役與到期預警（`KRS-W1304`，預設剩 455 天）；依政策簽發用戶端憑證；Kairos 自行產生簽發 CA 的 CRL（每 `pki.crl_refresh_hours`＝24 小時與每次撤銷）。
-- 8443：信任錨加入簽發 CA 與其 CRL（依簽發者選擇驗證器），撤銷後立即重新載入；`renew`（到期前輪替、`hello_ack.renew_now`）、`deregister`（主機自行除役，撤銷憑證，之後 10 分鐘內只接受除役）；新憑證第一次連線後以 `superseded` 撤銷舊憑證。
+- 8443：信任錨加入簽發 CA 與其 CRL（依簽發者選擇驗證器），撤銷後立即重新載入；`renew`（到期前輪替、`hello_ack.renew_now`）、`deregister`（主機自行除役，撤銷憑證，之後 10 分鐘內只接受除役）；新憑證第一次連線後以 `superseded` 撤銷舊憑證。`renew`、`deregister` 只在 client 宣告時才列進 `hello_ack.features`；沒有協商時 `renew_request`／`deregister` 照舊回 `unknown_type`（線上格式與 0.4 相同）。
 - 主控台 API 第 11 節：註冊 token、申請（含批次核准）、模式與影響評估、憑證政策、憑證清冊與撤銷、CRL、簽發 CA、離線簽發佇列、`GET /api/v1/settings`（每項的來源、修改者、被覆寫的值）與 `POST /api/v1/settings/reset`（改用設定檔的值）；下載端點不可用時以 `downloads` 標示。token 只顯示前 4 碼（`KRT1-XXXX…`）。所有寫入記稽核（`audit_events`）。
 - CLI：`kairos enroll-token`、`kairos enroll`（list／show／approve／reject／mode）、`kairos pki`（issuing-ca list／new／install／activate／retire、certificates list、revoke、queue export／import、sign-bundle）、`kairos config show --effective`、`kairos config reset`；`kairos api-token create --scope read|operate|admin`。
-- 設定：`[enroll]`、`[pki]`、`[pki.policy]`（`kairos.example.toml`）；8444 與 8443／9443 的監聽衝突在啟動時拒絕（`KRS-E0202`）；檔案描述元的需要量包含 `enroll.max_connections`。
-- 修正：`kairos api-token list` 的「最後使用」超過 7 天改顯示日期時間（copywriting §5.3）。
+- 設定：`[enroll]`、`[pki]`、`[pki.policy]`（`kairos.example.toml`）；8444 與 8443／9443 的監聽衝突在啟動時拒絕（`KRS-E0202`）；檔案描述元的需要量包含 `enroll.max_connections`。新的產品代碼 `KRS-E1303`、`KRS-W1304`、`KRS-E1305`。
+- 修正：`kairos api-token list` 的「最後使用」超過 7 天改顯示日期時間（copywriting §5.3）；`kairos enroll-token create` 的安裝字串在註冊端點不是 8444、又沒有設定 `enroll.advertise` 時漏了 `e`（Pulse 因此連到 8444），改為與主控台 API 相同。
 
-### 已知限制
-
-- 未實作：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具與上傳、撤銷清單匯出、下載端點（`/agent/…` 回 404）、L11 下載限制、放寬設定與解除封鎖的管理端點、系統健康的整合（S20）、列表的游標分頁。見 PKI.md 第 13 節。
-
-### 新增（衝刺 4：註冊通道 8444 的規格）
-
-- `crates/kairos-proto/ENROLL.md`：Pulse ↔ Kairos 註冊通道（8444 HTTPS）協定 v1 的唯一規格——端點 `/v1/enroll/server-info`、`token-check`、`requests`（新註冊）、`requests/{request_id}`（輪詢與取回憑證，含長輪詢）、`renewals`（過期寬限期續簽）、撤回的兩段式 challenge／withdraw；錯誤碼與 `KRS-`／`PLS-` 對照、時鐘檢查、三段模式、多層速率限制、同一個 CSR 只簽發一張憑證（設計包 `INTEGRATION.md` §23.9 定案）、8443 的 `renew`／`deregister` 草稿、安全審查項目的處置、實作分工與端對端測試情境。協定不變：0.4 的 Kairos 與 Pulse 不受影響。
-- `kairos-proto` 新增 `enroll` 模組：註冊通道的請求與回應型別、欄位驗證、路徑與模式白名單、註冊 token（`KRT1-…`，GF(32) 檢查碼）、安裝字串、CA 指紋、申請編號、簽章內容的正規化與 ECDSA P-256 驗證；單元測試直接解析 ENROLL.md 的錯誤碼表、範例與測試向量。`kairos-proto` 因此依賴 `ring`、`chrono`（兩者原本就在依賴樹中）；測試另用 `rcgen`、`x509-parser`（MIT OR Apache-2.0）。
-- `kairos/PKI.md`：自動簽發的 CA 架構（根 CA 離線、Kairos 線上持有代理簽發 CA）、用戶端憑證格式、簽發 CA 的輪替、Kairos 自行產生 CRL、離線簽發模式（CSR 佇列匯出與匯入）、資料庫 schema v4。標出待使用者確認的決定。
-- `kairos/API.md` 第 11 節：註冊 token、申請（含批次核准）、註冊端點模式、憑證與 CRL、離線簽發佇列的管理端點；API token 範圍新增 `operate`、`admin`；CLI `kairos enroll-token`、`kairos enroll`、`kairos pki`。
-
-## [0.5.0] - 〔草稿：發佈日期待定〕
-
-〔草稿〕衝刺 4「註冊通道 8444」。本節目前只有 **Pulse** 的條目（Kairos 端另行補上）；`pulse/Cargo.toml` 的版本尚未改為 0.5.0。規格：`crates/kairos-proto/ENROLL.md`。
-
-### 新增（Pulse）
+### Pulse
 
 - **`pulse enroll`**（設計包 `cli-spec.md` §5）：以安裝字串（`pulse-enroll:v1:…`）或 `--server`／`--token`／`--ca-pin` 向 Kairos 註冊。私鑰（ECDSA P-256）在本機產生、不離開主機；只信任 CA 指紋、`--ca-file` 或人工確認的 CA（TOFU 需 `--trust-on-first-use` 或互動確認，`PLS-W1407`），不使用作業系統信任庫，根 CA 可為 P-256、P-384 或 RSA；需人工核准時顯示申請編號並（長）輪詢；`--status`、`--cancel`（撤回申請）、`--force`、`--reset-identity`、`--json`（`pulse.enroll/v1`）。中斷後重新執行從 `identity/enrollment.json` 接續，回應遺失時以同一個 CSR 與輪詢憑據重送（不會產生第二筆申請）。
 - **服務的註冊閘門與背景輪詢**：沒有可用身分時先完成進行中的申請（依 `next_poll_at` 恢復）；申請被拒、逾期、token 無效等無法自動恢復時不連線並以嚴重呈現。429／503 依 `Retry-After` 排隊（`PLS-E2202`／`PLS-E3309`），Kairos 因時鐘偏差暫不受理時每 5 分鐘重送並在本機時間被調整時立即重送（`PLS-E8302`）。
 - **過期寬限期續簽**：Kairos 以 `CertificateExpired` 拒絕用戶端憑證時，經 8444 以舊私鑰對含 `sent_at` 的內容簽章自動續簽；`grace_blocked`（`PLS-E2007`，並對 8443 報到）、`grace_pending`、`grace_exceeded`（`PLS-E1113`）、`grace_rejected`（`PLS-E1114`）、`grace_clock_rejected`（`PLS-E8302`）；`replayed_request` 重新簽章重送一次。
-- **8443 正常輪替與除役（協定 feature `renew`、`deregister`，ENROLL.md 第 13 節）**：身分由 `pulse enroll` 管理時 hello 宣告 `renew`，到期前（已用 2/3 或剩餘 `identity.renew_before_days` 天）送出新的 CSR，以新憑證連線成功後才取代；Kairos 不支援時維持 0.4 的行為。`pulse decommission --initiated-by …`（安裝程式完全移除時）：已註冊經 8443 除役通知、等待核准中經 8444 撤回（`PLS-W3107`／`PLS-W3310`）。
-- **`pulse status`**：「連線」「身分」列與 `--json` 的 `identity.state`、`identity.enrollment`、`identity.grace`、`identity.renew_after`、`clock.source`（`clock_skew`、`server_info_unverified`）；`--brief` 的 `pending_approval`、`clock_rejected offset=…`、`cert_expired grace=… renew=…`。
+- **8443 正常輪替與除役（feature `renew`、`deregister`）**：身分由 `pulse enroll` 管理時 hello 宣告 `renew`，到期前（已用 2/3 或剩餘 `identity.renew_before_days` 天）送出新的 CSR，以新憑證連線成功後才取代；Kairos 不支援時維持 0.4 的行為。`pulse decommission --initiated-by …`（安裝程式完全移除時）：已註冊經 8443 除役通知（hello 帶 `intent: "deregister"`、只宣告 `deregister`）、等待核准中經 8444 撤回（`PLS-W3107`／`PLS-W3310`）。手動憑證的主機不宣告這兩個 feature，hello 與 0.4 相同。
+- **`pulse status`**：「連線」「身分」列與 `--json` 的 `identity.state`、`identity.enrollment`、`identity.grace`、`identity.renew_after`、`clock.source`（`clock_skew`、`server_info_unverified`）、`connection.features` 列出協商到的 `renew`；`--brief` 的 `pending_approval`、`clock_rejected offset=…`、`cert_expired grace=… renew=…`。
 - 設定：`[identity]`（`dir`、`renew_before_days`）、`[enroll]`（`address`、`port`）。日誌事件 `enroll.*`、`cert.renewed`、`cert.renew_*`、`cert.grace_*`、`install.*_unreported`；`ERROR-CODES.md` 新增 30 個代碼的對應。
+- 修正（整合時以端對端測試發現）：過期續簽第一次送出沒有成功（回應遺失、429、時鐘偏差、網路錯誤）時，服務誤判為「申請已被 `pulse enroll` 改變」而停止續簽；註冊端點位址其實是別的 HTTPS 服務（`not_found`）時改為 `PLS-E2106`（原為 `PLS-W2107`）。
 
-### 升級（Pulse）
+### 相容性
 
-- 沿用手動憑證或未啟用 mTLS 的部署**不需要任何變更**：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
-- 要使用 `pulse enroll`：建立 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，換上新版 `pulse.service`（`ReadWritePaths=` 多了 `-/opt/pulse/identity`）並 `systemctl daemon-reload`（Pulse INSTALL 第 5.0、10 節）。需要 Kairos 0.5 以上且註冊端點不是「關閉」；連上沒有 8444 的 Kairos 時為 `PLS-E2106`／`PLS-E2007`，不影響既有連線。
-- 新的依賴：`rcgen`（MIT OR Apache-2.0，以 ring 為後端）、`ring` 改為直接依賴；兩者原本就在依賴樹中。
+| Kairos ＼ Pulse | Pulse 0.4（以前） | Pulse 0.5，手動憑證 | Pulse 0.5，`pulse enroll` |
+|---|---|---|---|
+| **Kairos 0.4（以前）** | 與 0.4 相同 | 與 0.4 相同（hello 不宣告 `renew`／`deregister`） | 無法註冊：8444 沒有監聽 → `PLS-E2007`；該位址是別的服務 → `PLS-E2106`（結束代碼 5）。已註冊的主機照常以 8443 連線，但沒有自動輪替、過期續簽與除役通知 |
+| **Kairos 0.5，註冊通道關閉** | 與 0.4 相同（`hello_ack` 不列出新 feature、不帶新欄位；`renew_request`／`deregister` 回 `unknown_type`） | 與 0.4 相同 | 新註冊：`PLS-E2007`；已註冊的主機：自動輪替（8443）與除役通知照常，過期續簽 `grace_blocked`（`PLS-E2007`，請改為「僅續簽」） |
+| **Kairos 0.5，`open`／`renew_only`** | 與 0.4 相同 | 與 0.4 相同 | 全部功能（`renew_only` 時不受理新註冊：`PLS-E2008`） |
+| **Kairos 0.5，`storage.backend = "jsonl"`** | 與 0.4 相同 | 與 0.4 相同 | 沒有註冊服務（不監聽 8444、不列出 `renew`／`deregister`），同「Kairos 0.4」 |
+
+- 驗證方式：`kairos-proto` 以凍結的舊版型別定義驗證舊端看到新訊息的行為；端對端測試 `tests/compat.rs` 以送出 0.1／0.4 Pulse 訊息的假 client 驗證 0.5 Kairos 的 `hello_ack` 欄位與 `unknown_type` 不變；`tests/enroll_pulse.rs` 以 0.4 設定的 Kairos 驗證新版 Pulse 的 `PLS-E2007`／`PLS-E2106` 與手動憑證的主機不受影響。
+
+### 已知限制
+
+- Kairos 未實作：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具與上傳、撤銷清單匯出、下載端點（`/agent/…` 回 404）、L11 下載限制、放寬設定與解除封鎖的管理端點、系統健康的整合（S20）、列表的游標分頁。見 PKI.md 第 13 節。
+- Pulse：`pulse enroll` 在 `server-info`／`token-check` 階段收到 429（同一來源的請求太多）時直接結束（結束代碼 6，`PLS-E2202`），不依 `Retry-After` 等候；送出申請之後的 429 才會排隊。
+
+### 測試
+
+- 端對端測試（`tests/e2e`）新增 `tests/enroll.rs`（測試用的 HTTPS 用戶端打 8444：核准、長輪詢、8443 輪替、撤銷、除役、過期續簽與重放跨重啟、時鐘偏差、模式、限流）與 `tests/enroll_pulse.rs`（實際的 `pulse enroll`／服務／`pulse decommission`：ENROLL.md 第 19.3 節 #1～#5、#7～#12、#15～#20），以及 `tests/compat.rs` 的 0.4 線上格式測試。測試掛鉤（只在 debug 建置生效）：Kairos 的 `KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_AUTO_PAUSE_SECS`、`KAIROS_TEST_DROP_ENROLL_RESPONSES`、`KAIROS_TEST_DROP_RENEWAL_RESPONSES`，Pulse 的 `PULSE_TEST_GRACE_DELAY_SECS`。
+
+### 發佈與建置
+
+- Kairos 發佈包加入 `PKI.md`；Pulse 發佈包的 `pulse.service` 多了 `-/opt/pulse/identity`。
+- 新的依賴：Pulse 直接依賴 `rcgen`（MIT OR Apache-2.0，以 ring 為後端）與 `ring`；Kairos 直接依賴 `rcgen`、`x509-parser`（以 ring 驗證 CSR 與憑證）、`time`。都原本就在依賴樹中，`cargo deny check` 通過。
 
 ## [0.4.0] - 〔草稿：發佈日期待定〕
 

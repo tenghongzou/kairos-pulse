@@ -5,7 +5,7 @@
 ## 1. 版本規則
 
 - Kairos 與 Pulse 各自採用 [SemVer](https://semver.org/lang/zh-TW/) `MAJOR.MINOR.PATCH`，版本號唯一的來源是產品 `Cargo.toml` 的 `[package] version`。
-  - `--version` 與啟動日誌第一行印出 `<名稱> <版本> (<commit>)`，例如 `kairos 0.4.0 (1a2b3c4)`；Pulse 在 hello 的 `agent_version` 只送版本號。
+  - `--version` 與啟動日誌第一行印出 `<名稱> <版本> (<commit>)`，例如 `kairos 0.5.0 (1a2b3c4)`；Pulse 在 hello 的 `agent_version` 只送版本號。
   - 發佈包檔名為 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz`，打包腳本會確認 `--version` 的輸出與檔名完全一致。
 - **1.0 之前（0.x）**：破壞性變更升 MINOR（0.2.x → 0.3.0），其餘新增與修正升 PATCH。**1.0 之後**依標準 SemVer：破壞性變更升 MAJOR。
 - **破壞性變更**指客戶升級時必須做事、否則會出問題的變更，例如：設定欄位的預設值改變或移除、原本接受的設定被拒絕、協定不相容、結束代碼改變、資料檔或日誌的格式與權限改變、systemd unit 需要更新、需要調整監控門檻。每一項都要寫進 `CHANGELOG.md` 的「破壞性變更與升級步驟」表。
@@ -15,14 +15,14 @@
 
 ## 2. 發佈步驟
 
-以下以 Kairos 0.4.0、Pulse 0.4.0 為例。
+以下以 Kairos 0.5.0、Pulse 0.5.0 為例。
 
 ### 2.1 準備發佈 commit
 
-1. 從 `main` 開分支（衝刺的整合分支 `sprintN/integration` 須先合併回 `main`），例如 `release/0.4.0`。
+1. 從 `main` 開分支（衝刺的整合分支 `sprintN/integration` 須先合併回 `main`），例如 `release/0.5.0`。
 2. 確認兩個產品 `Cargo.toml` 的 `version`，執行 `cargo metadata --format-version 1 >/dev/null` 更新 `Cargo.lock`；`git diff Cargo.lock` 只能有 `kairos`、`pulse` 等 workspace 成員的版本變動。
 3. 更新 `CHANGELOG.md`：
-   - 草稿段落 `## [0.4.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.4.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
+   - 草稿段落 `## [0.5.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.5.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
    - 更新「版本相容矩陣」，移除已確定項目的〔草稿〕標記。
 4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。
 5. 合併到整合分支後，記下合併後的 commit（以下稱 `<release-commit>`）；之後的步驟都在這個 commit 上進行。
@@ -33,9 +33,9 @@
 
 ```bash
 git switch --detach <release-commit>
-git tag -a kairos-v0.4.0 -m "Kairos 0.4.0"
-git tag -a pulse-v0.4.0  -m "Pulse 0.4.0"
-git push origin kairos-v0.4.0 pulse-v0.4.0
+git tag -a kairos-v0.5.0 -m "Kairos 0.5.0"
+git tag -a pulse-v0.5.0  -m "Pulse 0.5.0"
+git push origin kairos-v0.5.0 pulse-v0.5.0
 ```
 
 建議以個人的 SSH 金鑰簽署 tag（`git tag -s`，事先 `git config gpg.format ssh`、`git config user.signingkey ~/.ssh/id_ed25519.pub`），**不要**使用下一節的發佈金鑰：發佈金鑰只用來簽 `SHA256SUMS`，保存在離線的位置。tag 一旦推送就不再移動；發現問題時發佈新的 PATCH 版本。
@@ -45,7 +45,7 @@ git push origin kairos-v0.4.0 pulse-v0.4.0
 在乾淨的 checkout 上執行（Windows 請用 Git Bash；需要 Docker、cargo、cargo-deny）：
 
 ```bash
-git switch --detach kairos-v0.4.0          # 與 pulse-v0.4.0 是同一個 commit
+git switch --detach kairos-v0.5.0          # 與 pulse-v0.5.0 是同一個 commit
 SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 ```
 
@@ -60,8 +60,8 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 
 | 檔案 | 說明 |
 |---|---|
-| `kairos-0.4.0-<commit>-linux-x86_64.tar.gz`、`pulse-0.4.0-<commit>-linux-x86_64.tar.gz` | 發佈包（含 `THIRD-PARTY-LICENSES` 與 `<名稱>.cdx.json`） |
-| `kairos-0.4.0-<commit>-linux-x86_64.cdx.json`、`pulse-…cdx.json` | SBOM（與 tar 內相同），供客戶匯入掃描工具 |
+| `kairos-0.5.0-<commit>-linux-x86_64.tar.gz`、`pulse-0.5.0-<commit>-linux-x86_64.tar.gz` | 發佈包（含 `THIRD-PARTY-LICENSES` 與 `<名稱>.cdx.json`） |
+| `kairos-0.5.0-<commit>-linux-x86_64.cdx.json`、`pulse-…cdx.json` | SBOM（與 tar 內相同），供客戶匯入掃描工具 |
 | `SHA256SUMS` | 以上四個檔案的 SHA-256 |
 | `SHA256SUMS.sig` | `SHA256SUMS` 的簽章 |
 

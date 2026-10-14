@@ -48,7 +48,7 @@
 - **啟動失敗的結束代碼依原因區分**（舊版一律為 1）：命令列參數錯誤 2、設定錯誤 3（設定檔無法載入或驗證不通過、上述拒絕啟動）、憑證錯誤 4（伺服器憑證、私鑰、client CA、CRL）、連接埠已被佔用 11。`kairos.service` 新增 `RestartPreventExitStatus=2 3 4`，systemd 不再對這些錯誤無限重試；修正後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、其他啟動失敗（1）、第二次訊號強制結束（130）不變。
 - **啟用 mTLS 時 `server.max_connections_per_ip` 只計算尚未通過 hello 的連線**（行為改變，不需修改設定）：舊版不論是否啟用 mTLS，都計算同一位址的全部連線，同一個 NAT 後第 33 台 agent 起在握手前被斷線（審計 A7）；新版啟用 mTLS 時，連線通過 hello（憑證與 `agent_id` 綁定）後改依憑證身分計數，同一個 NAT 後的 agent 數只受 `server.max_connections` 限制。握手前與握手中的連線仍依位址限制（慢速握手防護）。為了 NAT 而調高 `server.max_connections_per_ip` 的 mTLS 部署可以改回預設；未啟用 mTLS 時行為不變。見「每 IP 上限、NAT 與網段允許清單」。
 
-- **0.5.0〔草稿〕：資料庫升級到 schema v4**（註冊通道與 PKI）。升級前以 `kairos db backup` 備份，升級後 0.4 無法開啟。沒有 `[enroll]`、`[pki]` 時行為與 0.4 相同（註冊通道關閉、離線簽發），不需要修改設定。見「註冊通道與 PKI」。
+- **0.5.0〔草稿〕：資料庫升級到 schema v4**（註冊通道與 PKI）。升級前以 `kairos db backup` 備份，升級後 0.4 無法開啟。沒有 `[enroll]`、`[pki]` 時行為與 0.4 相同（註冊通道關閉、離線簽發），不需要修改設定。見「註冊通道與 PKI」。從 0.4 升級時**先升級 Kairos**、建立簽發 CA、開放 8444，再升級 Pulse（INSTALL 第 11 節、CHANGELOG [0.5.0]）。
 
 ## 升級注意事項（與 Pulse 混用版本）
 
@@ -59,6 +59,8 @@
 | 舊版 Pulse（只送 `proto: 1`）連新版 Kairos | v1：`hello_ack` 與舊版相同，report 為三個欄位，JSONL 為 `schema` 1、`agents.json` 的 `proto` 為 1 |
 | 新版 Pulse 連舊版 Kairos | v1：舊版 Kairos 只檢查 `proto == 1` 並忽略 v2 欄位，Pulse 依 `hello_ack` 改送三個欄位 |
 | 新版 Pulse 連新版 Kairos | v2：report 為通用指標，JSONL 為 `schema` 2 |
+| Pulse 0.4（以前）連 Kairos 0.5 | 與 0.4 相同：`renew`、`deregister` 只在 hello 宣告時才列進 `hello_ack`（並帶 `expired_renew_grace_days`）；沒有宣告的 client 送 `renew_request`／`deregister` 照舊回 `unknown_type` |
+| Pulse 0.5 連 Kairos 0.5 | 以 `pulse enroll` 註冊的主機宣告 `renew`（自動輪替）、`pulse decommission` 的連線宣告 `deregister`（PROTOCOL.md「憑證輪替與除役」）；手動憑證的主機與 0.4 相同 |
 
 讀取 JSONL 的工具請依每行的 `schema` 判斷格式（見「資料輸出」）；同一個檔案中可能同時有兩種格式的行。
 

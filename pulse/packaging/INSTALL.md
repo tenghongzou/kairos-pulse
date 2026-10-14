@@ -483,6 +483,8 @@ tail -n 30 /opt/pulse-$N/logs/pulse-$(date -u +%F).log       # 「工作目錄�
 
 ## 10. 升級
 
+**從 0.4 升級到 0.5：先升級 Kairos，再升級 Pulse**。`pulse enroll`、自動輪替（8443 feature `renew`）與過期續簽都需要 Kairos 0.5 的註冊通道，順序為：Kairos 管理者升級 Kairos → 建立簽發 CA、在 `kairos.toml` 開啟 `[enroll]`／`[pki]` → 防火牆開放 8444（只允許要註冊的主機）→ 升級 Pulse：`install -d -o pulse -g pulse -m 700 /opt/pulse/identity`、換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/identity`）、`systemctl daemon-reload` 後重新啟動。協定不變：先升級 Pulse 也可以，手動憑證的主機與 0.4 完全相同；只是 `pulse enroll` 要等 Kairos 開放註冊端點才能使用（之前為 `PLS-E2007`）。完整步驟見 `CHANGELOG.md` [0.5.0]「升級步驟」。
+
 **從 0.2 升級到 0.3：建議先升級 Kairos，再升級 Pulse**（Kairos 0.3 才支援 `durable`；Pulse 升級後的第一次斷線就能補送）。先升級 Pulse 也可以：連 Kairos 0.2 時連線期間維持 at-most-once，斷線期間的積壓保留在緩衝中，Kairos 升級後才補送。完整步驟見 `CHANGELOG.md` [0.3.0]「升級步驟」。
 
 **從 0.1.x 升級時的順序：不必同時升級，建議先升級 Pulse、再升級 Kairos。** 協定 v2 以版本協商相容 v1：新舊版本混用時自動以協定 v1 通訊（線上格式與舊版相同），Kairos 與 Pulse 可以分批、以任何順序升級，混用期間照常運作；兩端都是新版後才使用協定 v2（通用指標、主機資訊）。仍建議先升級 Pulse 的理由：
@@ -541,7 +543,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
   沒有換 unit 時服務照常啟動與監控（不會因狀態檔而失敗）：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`PLS-E8204`），只有 root 能執行 `pulse status`，「設定」列提示更新 unit（第 8.2 節）。換上後重新啟動，`pulse status` 的「設定」列不再有 `PLS-E8204`。另外，0.4 起有固定事件的日誌行以「事件 代碼」開頭（例如 `conn.lost PLS-E2002 …`）：以行首比對日誌文字（例如 `[ERROR] 連線中斷`）的告警規則請在升級前改為比對事件或代碼，或改用包含比對（`ERROR-CODES.md`）。
 - 升級前請看新版發佈包中的 `CHANGELOG.md`「破壞性變更與升級步驟」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
-- **升級到 0.5.0〔草稿〕**：要使用 `pulse enroll` 時先 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/identity`；多實例同樣重新產生 `pulse-N.service`）。沿用手動憑證的部署不需要任何變更：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
+- **升級到 0.5.0〔草稿〕**（先確認 Kairos 已是 0.5，見本節開頭）：要使用 `pulse enroll` 時先 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/identity`；多實例同樣對每個 `/opt/pulse-N` 建立 `identity/` 並重新產生 `pulse-N.service`）。沿用手動憑證的部署不需要任何變更：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
 - **升級到 0.3.0**：新版預設啟用本機緩衝（第 6.2 節），升級前先建立緩衝目錄並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/buffer`；多實例時對每個 `/opt/pulse-N` 建立目錄並重新產生 `pulse-N.service`）：
 
   ```bash

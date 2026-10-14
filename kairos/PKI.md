@@ -437,13 +437,12 @@ KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_
 | 6 | 授權節點數 | 本版沒有授權機制：`license_exhausted` 不會出現，`EnrollLicenseOverflow` 保留 |
 | 7 | keep-alive 閒置 | hyper 的標頭讀取計時涵蓋閒置，實際閒置上限為 `min(header_timeout_secs, idle_timeout_secs)`（預設 10 秒） |
 | 8 | 列表的游標分頁 | 註冊與憑證的管理端點以 `limit`（1～1,000）回傳前 N 筆與總數，`next_cursor` 一律為 `null`（之後加入） |
-| 9 | 8443 的 `renew`／`deregister` 訊息 | 型別定義在 Kairos 端（`enroll/agent.rs`），回應以 JSON 直接送出；`hello_ack` 另帶的 `expired_renew_grace_days`、`renew_now` 以注入欄位的方式送出（第 14 節） |
+| 9 | 8443 的 `renew`／`deregister` 訊息 | 0.5.0 整合時已移入 `kairos-proto`（PROTOCOL.md「憑證輪替與除役」），兩個產品使用共用型別（第 14 節） |
 
 **延後**：`kairos pki certificates import`（手動憑證匯入簽發紀錄）、離線模式的 CRL 工具（`kairos pki revocations export`、`kairos pki gencrl --revocations`、`kairos pki crl upload` 與 `POST /api/v1/pki/crl`）、`GET /api/v1/pki/revocations/export`、下載端點（`/agent/`，回 404；主控台 API 的 `downloads.available = false`）、暫時放寬的管理（`enroll_relaxations` 只有讀取）、解除 L7 封鎖的端點、L11、S20 系統健康的「註冊端點」區塊（計數先放在 `GET /api/v1/enroll/mode` 的 `stats`）、`KRS-W2009`、`KRS-W1115` 的彙總事件。
 
-## 14. 與 Pulse 端合併時
+## 14. 與 Pulse 端合併（已完成，0.5.0 整合）
 
-- **8443 的訊息型別**：`renew_request`、`renew_result`、`deregister`、`deregister_ack` 與 `hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now` 目前沒有放進 `kairos-proto`：`ServerMsg` 加入新變體或 `HelloAck` 加欄位，會讓 Pulse 端窮舉的 `match` 無法編譯。合併時建議在 `kairos-proto` 新增這些變體與欄位（ENROLL.md 第 13 節移入 PROTOCOL.md），兩端改用共用型別；Kairos 端的欄位與 ENROLL.md 第 13 節一致（`deregister` 另接受選用的 `seq`，`deregister_ack` 在有 `seq` 時回傳）。
-- **8443 的 features**：Kairos 只在 hello 宣告了 `renew`／`deregister` 時把它們列進 `hello_ack.features`（沒有宣告的 0.4 以前 Pulse 收到的 `hello_ack` 與 0.4 相同；Pulse 照常取交集）。8444 `server-info` 的 `features` 則一律列出 Kairos 支援的全部（`metrics`、`durable`、`renew`、`deregister`）。
-- **8443 的錯誤碼**：`renew_requires_approval`、`invalid_csr`、`rate_limited`（renew，非 fatal）以 `ServerMsg::Error` 的字串 `code` 送出，`kairos-proto` 的 `ErrorCode` 沒有新增。
-- **測試掛鉤**（debug 建置）：`KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_AUTO_PAUSE_SECS`，ENROLL.md 第 19.3 節的端對端情境 #8、#11 可以使用。
+- **8443 的訊息型別**：`renew_request`、`renew_result`、`deregister`、`deregister_ack`、`hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now` 與錯誤碼 `renew_requires_approval`、`invalid_csr`、`rate_limited` 已移入 `kairos-proto`（`lifecycle` 模組、`ClientMsg`／`ServerMsg` 的變體、`ErrorCode`；ENROLL.md 第 13 節移入 PROTOCOL.md「憑證輪替與除役」）。Kairos 的 `enroll/agent.rs` 不再自行解析或以字串組 JSON；`deregister` 依規格必須帶 `seq` 等全部欄位（合併前接受的省略寫法不再接受，回 fatal 的 `bad_request`）。
+- **8443 的 features**：Kairos 只在 hello 宣告了 `renew`／`deregister` 時把它們列進 `hello_ack.features`（沒有宣告的 0.4 以前 Pulse 收到的 `hello_ack` 與 0.4 相同）。沒有協商時 `renew_request`／`deregister`（含欄位不合法的）回 `unknown_type`，與 0.4 相同。8444 `server-info` 的 `features` 一律列出 Kairos 支援的全部（`metrics`、`durable`、`renew`、`deregister`）。
+- **測試掛鉤**（debug 建置）：`KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_AUTO_PAUSE_SECS`、`KAIROS_TEST_DROP_ENROLL_RESPONSES`、`KAIROS_TEST_DROP_RENEWAL_RESPONSES`（`src/testhooks.rs`）。端對端情境的對應見 ENROLL.md 第 19.5 節。

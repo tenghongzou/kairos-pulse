@@ -403,7 +403,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
       { "id": "database", "status": "warning", "product_code": "KRS-W4202", "summary": "資料庫已達容量上限，正在提早刪除最舊的資料", "values": { … } },
       …
     ],
-    "service": { "version": "0.4.0", "commit": "4223101", "started_at": "…", "uptime_secs": 1036800, "config_file": "/opt/kairos/kairos.toml" }
+    "service": { "version": "0.5.0", "commit": "4223101", "started_at": "…", "uptime_secs": 1036800, "config_file": "/opt/kairos/kairos.toml" }
   }
 }
 ```

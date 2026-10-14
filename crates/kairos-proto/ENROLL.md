@@ -403,33 +403,17 @@ Pulse 端的完整狀態機（含 `clock_rejected`、`cert_expired` 的子狀態
 - 撤銷後重新註冊：一律需要新的 token（舊 token 若仍有效也可）；`previous_serial` 或清冊中同一 `agent_id` 有撤銷紀錄時標示「撤銷後重新申請」，建議人工核准。
 - 複製的 VM（相同 `agent_id`、不同主機指紋）在 8443 的 `hello` 由既有的 `superseded` 規則與主機指紋比對偵測（PROTOCOL.md、`KRS-W3102`／`PLS-E3102`）；`pulse enroll --reset-identity` 產生新的 `agent_id` 後走一般的新註冊。8444 不另做判斷，只在申請帶的 `host_fingerprint` 與清冊中同一 `agent_id` 的指紋不同時加上異常旗標。
 
-## 13. 8443 上的相關訊息（草稿，實作時移入 PROTOCOL.md）
+## 13. 8443 上的相關訊息（已移入 PROTOCOL.md）
 
-兩者都是 8443 的 NDJSON 訊息，以 feature 協商（PROTOCOL.md「版本協商」），協商結果為 v2 且雙方都宣告時才使用。本節定義欄位，實作時把本節移入 PROTOCOL.md 並在 `kairos-proto` 的 `ClientMsg`／`ServerMsg` 新增變體。
+正常輪替（feature `renew`）與除役通知（feature `deregister`）是 8443 的 NDJSON 訊息，0.5.0 實作時已依原計畫移入 [`PROTOCOL.md`](PROTOCOL.md)「憑證輪替與除役」，訊息型別在 `kairos-proto` 的 `lifecycle` 模組與 `ClientMsg`／`ServerMsg` 的對應變體。以下兩小節保留原本的編號供其他文件引用，內容以 PROTOCOL.md 為準。
 
 ### 13.1 正常輪替（feature `renew`）
 
-設計包 §5.6、§8，D1：**憑證仍有效時一律走 8443 的既有 mTLS 連線**，身分由連線的用戶端憑證證明，不需要 token 或額外簽章。
-
-| 訊息 | 欄位 |
-|---|---|
-| `renew_request`（Pulse → Kairos） | `seq`、`ts`、`request_id`（UUID，同一個 CSR 重送時沿用）、`csr`（base64url DER，SAN 必須等於這條連線的 `agent_id`，新公鑰必須與目前的不同）、`sent_at` |
-| `renew_result`（Kairos → Pulse） | `seq`、`request_id`、`state`（`issued`）、`certificate`、`policy`（同第 6.5 節）、`server_time` |
-| `error` | `renew_requires_approval`（非 fatal：政策要求人工核准，已進入待核准佇列，類型「憑證更新」；Pulse `renew_failed`／`PLS-W1111`，依 1 → 12 小時退避以**同一個 CSR** 重送，核准後重送即得到 `renew_result`）、`invalid_csr`（非 fatal）、`storage_unavailable`（非 fatal） |
-
-- 冪等：同一 `agent_id`＋同一 CSR 只簽發一張（第 7.4 節的原則）。
-- `hello_ack` 另帶 `expired_renew_grace_days`（雙方協商了 `renew` 時），Pulse 快取到 `enrollment.json`；以及選用的 `renew_now`（布林）：Kairos 要求這台主機提早輪替（例如簽發 CA 輪替，`kairos/PKI.md` 第 4 節），Pulse 在 0～6 小時的隨機延遲後開始輪替，不必等到第 8 節的觸發門檻。
-- Pulse 以新憑證建立第二條連線送 `hello` 成功後才替換本機檔案；Kairos 在**新序號第一次成功 `hello`** 時，依政策把舊憑證以 `superseded` 撤銷（設計包 S14「舊憑證在新憑證首次使用後撤銷」）。
-- 不受 8444 的模式影響；不計入 8444 的速率限制，另以每 `agent_id` 每小時 10 次限制（超過時非 fatal `rate_limited`，Pulse 依退避）。
+見 PROTOCOL.md「憑證輪替與除役 › 正常輪替」：`renew_request`／`renew_result`、`hello_ack.expired_renew_grace_days`／`renew_now`、錯誤 `renew_requires_approval`／`invalid_csr`／`rate_limited`（非 fatal）、同一 CSR 只簽發一張、新序號第一次 `hello` 時以 `superseded` 撤銷舊憑證、每 `agent_id` 每小時 10 次。
 
 ### 13.2 除役通知（feature `deregister`）
 
-設計包 §5.10、§24 #20。**只走 8443**，以這台主機的用戶端憑證證明身分；8444 不受理除役（D1：註冊端點只處理註冊相關請求，且可能為關閉）。憑證已過期的主機不送除役（`PLS-W3107`，`reason: cert_expired`）；等待核准中的主機改用第 8 節的撤回。
-
-- `hello` 帶 `intent: "deregister"`：這條連線不算上線、不更新最後連線時間、不取代既有連線。
-- `deregister`：`request_id`、`agent_id`（必須等於憑證 SAN，否則 `auth_failed`）、`reason`（`uninstall_purge`）、`initiated_by`、`host_fingerprint`、`hostname`、`pulse_version`、`sent_at`。
-- `deregister_ack`：`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned`（冪等）。
-- 撤銷的生效時間與 10 分鐘的重送保護見第 18 節第 1 項。
+見 PROTOCOL.md「憑證輪替與除役 › 除役通知」：`hello.intent: "deregister"`、`deregister`／`deregister_ack`、10 分鐘的重送保護（第 18 節第 1 項）。
 
 ## 14. 編碼與雜湊
 
@@ -626,6 +610,29 @@ HANDOFF §4 末的三項，以及本規格另外發現的項目：
 | 6 | `renew_only` 是否也接受 `token-check`（只查詢，不建立） | 維持設計包：不接受（`enroll_not_accepted`），以免透露 token 的存在 |
 | 7 | L1 全域握手速率與長輪詢名額 | 在目標硬體實測校正（設計包 D7 待辦） |
 | 8 | 過期續簽是否支援非 P-256 的舊憑證（手動以 RSA 簽發的既有部署） | 不支援，需以 token 重新註冊；若既有部署很多，再加 `rsa-pss-sha256` |
+
+### 19.5 實作現況（0.5.0 整合）
+
+第 19.1、19.2 節都已實作（延後的項目見 `kairos/PKI.md` 第 13 節）；第 13 節的訊息已移入 PROTOCOL.md，兩個產品使用 `kairos-proto` 的共用型別。第 19.3 節的端對端情境：
+
+| # | 測試（`tests/e2e/tests/`） | 備註 |
+|---|---|---|
+| 1 | `enroll_pulse.rs` `install_string_auto_approval_registers_and_the_service_connects` | 另檢查 `identity/` 權限，以及 token、私鑰、輪詢憑據不出現在檔案與日誌 |
+| 2 | `enroll_pulse.rs` `manual_approval_is_fetched_by_the_background_service`；`enroll.rs` `enroll_approve_connect_renew_revoke_and_deregister` | Pulse 服務在背景接續；長輪詢的「1 秒內」由 `enroll.rs`（測試用用戶端）量測 |
+| 3、4、5、10 | `enroll_pulse.rs` `typo_wrong_pin_unknown_token_rejection_and_withdrawal`、`expired_exhausted_and_disabled_tokens_are_refused` | #4 的 `source_blocked`（相異無效值達門檻）由 Kairos 的單元測試 `rate_limits_return_429_with_retry_after_and_distinct_invalid_tokens_block` 涵蓋 |
+| 6 | `enroll.rs` `grace_renewal_replay_survives_restart_and_clock_skew_is_rejected` | 以測試用用戶端改變 `sent_at`（實際的 Pulse 需要 `faketime`，未做） |
+| 7 | `enroll_pulse.rs` `lost_response_is_resent_and_creates_one_request` | Kairos 測試掛鉤 `KAIROS_TEST_DROP_ENROLL_RESPONSES` |
+| 8、9 | `enroll_pulse.rs` `rate_limit_is_waited_out_and_renew_only_refuses_new_enrollments`；`enroll.rs` `mode_switching_and_rate_limit` | 自動暫停由 Kairos 的單元測試 `mode_switching_and_auto_pause` 涵蓋 |
+| 11、12 | `enroll_pulse.rs` `expired_certificate_is_renewed_in_the_grace_period` | `KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_DROP_RENEWAL_RESPONSES`、Pulse 的 `PULSE_TEST_GRACE_DELAY_SECS` |
+| 13 | `enroll.rs` `grace_renewal_replay_survives_restart_and_clock_skew_is_rejected` | 原樣重送同一個請求（實際的 Pulse 不會這麼做） |
+| 14 | — | 未做端對端（Kairos 的單元測試 `grace_period_exceeded_and_override` 涵蓋） |
+| 15、17 | `enroll_pulse.rs` `revoked_host_is_disconnected_and_can_enroll_again_with_force` | |
+| 16 | `enroll_pulse.rs` `offline_signing_export_sign_import_then_the_service_connects` | 簽發 CA 由測試以根 CA 簽發，`auth.client_ca` 為根 CA 加上簽發 CA |
+| 18 | `enroll_pulse.rs` `rotation_over_8443_supersedes_the_old_certificate`；`enroll.rs` | 同一 CSR 重送同一張由 `enroll.rs` 涵蓋 |
+| 19 | `enroll_pulse.rs` `decommission_then_only_deregister_is_accepted`；`enroll.rs` | |
+| 20 | `enroll_pulse.rs` `new_pulse_against_a_kairos_without_8444`；`compat.rs` `old_pulse_wire_format_is_unchanged_with_the_lifecycle_features` | 以 0.4 設定的 Kairos（沒有 `[enroll]`）代替 0.4 的執行檔 |
+
+整合時以端對端測試發現並修正：Kairos CLI 的安裝字串在註冊端點不是 8444 時漏了 `e`；Pulse 服務的過期續簽在第一次送出失敗後停止；`server-info` 的 `not_found` 改為 `PLS-E2106`。
 
 ## 20. 序列圖
 

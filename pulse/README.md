@@ -34,6 +34,8 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 | 舊版 Pulse 連新版 Kairos | v1：與舊版相同 |
 | Pulse 0.3.0 以上連 Kairos 0.3.0 以上 | v2＋`durable`：report 為 at-least-once（見「本機緩衝」），Kairos 的上線日誌註明「durable」。0.4 的協定與 0.3 相同（`pulse status` 只讀本機狀態檔），Pulse 與 Kairos 0.3／0.4 可以任意混用 |
 | Pulse 0.3.0 以上連 Kairos 0.2.0 | v2，不啟用 `durable`：連線期間照舊 at-most-once；斷線期間寫進緩衝的積壓保留到連上 Kairos 0.3.0 為止，日誌以 `INFO` 說明「伺服器不支援 durable…暫不補送」 |
+| Pulse 0.5.0 連 Kairos 0.4（以前） | 手動憑證的主機與 0.4 相同。`pulse enroll` 需要 Kairos 0.5 的註冊端點：連不上 8444 時 `PLS-E2007`、該位址不是註冊端點時 `PLS-E2106`（結束代碼 5）；已註冊的主機照常連線，但沒有自動輪替（Kairos 不列出 `renew`）、過期續簽與除役通知 |
+| Pulse 0.4（以前）連 Kairos 0.5.0 | 與 0.4 相同：Kairos 只在 hello 宣告 `renew`／`deregister` 時才在 `hello_ack` 列出並帶新欄位 |
 
 更早的版本之間混用時可能出現下列問題：
 
@@ -66,7 +68,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 - **多實例**：同一台主機跑多個 Pulse 時，每個實例使用自己的 `/opt/pulse-N`（`agent.id`、憑證、`pulse.toml`、`logs/` 各自一份），執行檔共用 `/opt/pulse/pulse`；unit 只改 `WorkingDirectory` 與 `ReadWritePaths` 兩行。完整指令見 INSTALL.md 第 9 節。
 - **移除**：有多實例時先停用並移除所有 `pulse-N.service`，`daemon-reload`、`reset-failed` 後，最後才刪除 `/opt/pulse` 與使用者 `pulse`（見 INSTALL.md 第 12 節）。
 
-升級時建議先升級全部 Pulse，再升級 Kairos（不必同時升級，見上一節）。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/`（`pulse-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Kairos 共用的 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
+從 0.4 升級到 0.5 時**先升級 Kairos**（建立簽發 CA、開放 8444），再升級 Pulse 並建立 `identity/` 目錄（CHANGELOG [0.5.0]「升級步驟」、INSTALL 第 10 節）；更早的版本見上一節。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/`（`pulse-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Kairos 共用的 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
 
 ## 快速開始（搭配 Kairos，本機測試）
 
@@ -174,12 +176,11 @@ sudo pulse enroll --cancel     # 撤回等待中的申請、刪除本機未使�
 
 `pulse status` 的「連線」「身分」列與 `--json` 的 `data.identity.state`、`identity.enrollment`、`identity.grace` 呈現上述狀態（設計包 `enrollment-ux.md` §4.2），`--brief` 例如 `pending   plc-hmi-07 pending_approval PLS-I3307`、`critical  plc-hmi-07 clock_rejected offset=-7m42s PLS-E8302`。
 
-### 與 Kairos 端合併（衝刺 4）
+### 實作現況（0.5.0 整合）
 
-Pulse 端以測試用的假 8444 伺服器（`pulse/src/enroll/fake.rs`，依 ENROLL.md 與 `kairos-proto` 的型別實作）驗證。合併 Kairos 端時：
-
-1. 8443 的 `renew_request`／`renew_result`／`deregister`／`deregister_ack`、`hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now` 暫定義在 `pulse/src/lifecycle.rs`；Kairos 端在 `kairos-proto` 新增正式型別後，改用它們並刪除本檔（欄位與 ENROLL.md 第 13 節相同）。
-2. 以 `tests/e2e` 的實際執行檔跑 ENROLL.md 第 19.3 節的情境，取代假伺服器的情境測試（假伺服器可保留作單元測試）。
+- 8443 的訊息（`renew_request`／`renew_result`／`deregister`／`deregister_ack`、`hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now`、錯誤碼 `renew_requires_approval`／`invalid_csr`／`rate_limited`）使用 `kairos-proto` 的共用型別（PROTOCOL.md「憑證輪替與除役」）；合併前暫用的 `pulse/src/lifecycle.rs` 已刪除。
+- hello 只在身分由 `pulse enroll` 管理時宣告 `renew`、只在 `pulse decommission` 的一次性連線宣告 `deregister`；手動憑證的主機 hello 與 0.4 相同。
+- 端對端測試：`tests/e2e/tests/enroll_pulse.rs` 以實際的 `kairos` 與 `pulse` 執行檔跑 ENROLL.md 第 19.3 節的情境（第 19.5 節列出對應）；測試用的假 8444 伺服器（`pulse/src/enroll/fake.rs`）保留作單元測試。
 
 ## 啟用 mTLS（客戶端憑證）
 
@@ -566,7 +567,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 
 ```
 $ /opt/pulse/pulse status
-Pulse 0.4.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-112233445566
+Pulse 0.5.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-112233445566
 
 ✓ 通過 服務   pulse.service 執行中（PID 4151145，已執行 12 天 4 小時）
 ✓ 通過 連線   已註冊到 kairos.example.gov.tw:8443（TLS 1.3，mTLS），已連線 2 分 2 秒
@@ -675,7 +676,6 @@ src/
 │                      私鑰與 CSR（keys）、identity/ 與 enrollment.json（store）、排程與狀態機（schedule、machine）、
 │                      流程（flow）、服務端閘門與背景輪詢（service）、pulse.toml 改寫（toml_edit）、
 │                      測試用的假 8444 伺服器（fake）
-├── lifecycle.rs       8443 的 renew／deregister 訊息（ENROLL.md 第 13 節，合併時改用 kairos-proto）
 ├── rotation.rs        8443 正常輪替：時點、待送的 CSR、驗證新憑證、確認後取代
 ├── decommission.rs    pulse decommission 的除役通知（8443 deregister）
 ├── backoff.rs         指數退避與抖動
