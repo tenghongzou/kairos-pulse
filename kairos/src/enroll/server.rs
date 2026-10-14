@@ -427,10 +427,24 @@ async fn accept_loop(
             };
             drop(handshake);
             let info = Arc::new(ConnInfo { peer, soft_limited });
-            let service = service_fn(move |req| {
+            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let svc = svc2.clone();
                 let info = info.clone();
-                async move { Ok::<_, std::convert::Infallible>(handlers::handle(svc, info, req).await) }
+                let method = req.method().as_str().to_string();
+                let path = req.uri().path().to_string();
+                async move {
+                    let resp = handlers::handle(svc, info, req).await;
+                    // e2e 測試掛鉤（debug 建置）：已處理、但回應遺失（hyper 不送回應、關閉連線）
+                    if crate::testhooks::drop_enroll_response(
+                        &method,
+                        &path,
+                        resp.status().as_u16(),
+                    ) {
+                        debug!("測試掛鉤：丟棄 {method} {path} 的回應");
+                        return Err(std::io::Error::other("test hook: response dropped"));
+                    }
+                    Ok(resp)
+                }
             });
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder

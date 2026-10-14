@@ -218,6 +218,9 @@ impl Drop for TestDir {
 fn is_ambient_setting(key: &str) -> bool {
     key.starts_with("KAIROS__")
         || key.starts_with("PULSE__")
+        // 測試掛鉤（debug 建置）：只在測試明確指定時使用
+        || key.starts_with("KAIROS_TEST_")
+        || key.starts_with("PULSE_TEST_")
         || matches!(
             key,
             "NOTIFY_SOCKET"
