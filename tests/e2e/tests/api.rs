@@ -15,7 +15,7 @@ fn api_lists_hosts_and_metrics_and_streams_online_offline_events() {
     let token = kairos.create_token("e2e");
     // 稽核：執行中的 Kairos 把 token 的建立寫入日誌（不含秘密）
     k.wait_for("API token 已建立", WAIT);
-    let secret = token.rsplit('_').next().unwrap();
+    let secret = token.splitn(3, '_').nth(2).unwrap();
     assert!(!k.stdout().contains(secret), "日誌不應出現 token 的秘密");
     let api = kairos.api(&token);
 
