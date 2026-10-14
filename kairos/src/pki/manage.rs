@@ -65,6 +65,8 @@ pub fn create(
 pub struct Installed {
     pub ca_id: i64,
     pub subject: String,
+    /// 簽發者（根 CA）的 subject
+    pub issuer: String,
     pub not_after_ms: i64,
     pub activated: bool,
 }
@@ -116,6 +118,7 @@ pub fn install(
     .map_err(|e| e.to_string())?;
     Ok(Installed {
         ca_id: ca.ca_id,
+        issuer: info.issuer_text,
         subject: info.subject_text,
         not_after_ms: info.not_after_ms,
         activated,

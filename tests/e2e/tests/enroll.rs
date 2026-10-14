@@ -193,7 +193,7 @@ server_ca_path = "root.pem"
         std::fs::write(env.dir.join("issuing.pem"), env.pki.sign_issuing(&csr)).unwrap();
         let (code, p) = env.cli(&["pki", "issuing-ca", "install", "issuing.pem"]);
         assert_eq!(code, 0, "{}", p.dump());
-        assert!(p.stdout().contains("已啟用"), "{}", p.dump());
+        assert!(p.stdout().contains("啟用中"), "{}", p.dump());
         let _ = &env.root;
         env
     }

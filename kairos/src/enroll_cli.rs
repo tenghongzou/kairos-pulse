@@ -76,7 +76,7 @@ pub const PKI_USAGE: &str = "kairos pki — 簽發 CA、憑證與 CRL（kairos/P
 
 用法：
   kairos pki issuing-ca list
-  kairos pki issuing-ca new [--out <csr.pem>]
+  kairos pki issuing-ca new [--out <csr.pem>]（預設寫到 data/pki/issuing-<ca_id>.csr）
   kairos pki issuing-ca install <cert.pem>
   kairos pki issuing-ca activate <ca_id>
   kairos pki issuing-ca retire <ca_id> --confirm \"重建 CA\" [--compromised]
@@ -1183,29 +1183,39 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 now_ms,
             )
             .map_err(|e| Failure::new("無法建立簽發 CA", e, Vec::new(), EXIT_GENERAL))?;
-            if let Some(out) = cmd.opt("--out") {
-                write_new_file(out, n.csr_pem.as_bytes())?;
-            }
+            let key_path = data_dir.join(crate::pki::key_file_name(id));
+            // CSR：預設寫在私鑰旁（data/pki/issuing-<ca_id>.csr），--out 可另外指定
+            let csr_path = cmd.opt("--out").map(PathBuf::from).unwrap_or_else(|| {
+                crate::pki::pki_dir(&data_dir).join(format!("issuing-{id}.csr"))
+            });
+            write_new_file(&csr_path.to_string_lossy(), n.csr_pem.as_bytes())?;
+            let _ = store::audit(
+                &conn,
+                now_ms,
+                &store::Audit {
+                    actor: &operator(),
+                    category: "pki",
+                    action: "ca.new",
+                    object: Some(&id.to_string()),
+                    result: "ok",
+                    ..Default::default()
+                },
+            );
             if cmd.json {
                 return Ok(ok_json(
                     cmd,
                     env.now,
-                    json!({"ca_id": id, "subject": n.subject, "csr_pem": n.csr_pem, "key_file": crate::pki::key_file_name(id)}),
+                    json!({"ca_id": id, "subject": n.subject, "state": "pending", "csr_pem": n.csr_pem, "csr_path": csr_path, "key_path": key_path}),
                 ));
             }
+            let m = mark(env);
             Ok(Output {
-                stdout: if cmd.opt("--out").is_some() {
-                    String::new()
-                } else {
-                    n.csr_pem.clone()
-                },
-                stderr: format!(
-                    "{} 已建立簽發 CA {id}（{}）：私鑰 {}（0600，不要複製到其他主機）\n  下一步：在管理主機以根 CA 簽發這個 CSR（CA:TRUE、pathlen:0、keyCertSign＋cRLSign、EKU clientAuth、5 年），\n  再執行 kairos pki issuing-ca install <cert.pem>\n",
-                    mark(env),
-                    n.subject,
-                    data_dir.join(crate::pki::key_file_name(id)).display()
+                stdout: format!(
+                    "[1/2] {m} 產生簽發 CA 的私鑰（ECDSA P-256）：{}（0600）\n[2/2] {m} 產生憑證簽署要求（CSR）：{}\n\n{m} 已建立簽發 CA #{id}（狀態：等待根 CA 簽發）。私鑰不會離開這台伺服器。\n  下一步：\n    1. 把 issuing-{id}.csr 帶到管理主機，以根 CA 簽發（範本 issuing_ca_ext：CA:TRUE、pathlen:0、\n       keyCertSign／cRLSign、EKU clientAuth，有效 5 年；INSTALL 第 6 節）\n    2. sudo -u kairos /opt/kairos/kairos pki issuing-ca install issuing-{id}.pem\n    3. sudo -u kairos /opt/kairos/kairos pki issuing-ca activate {id}（第一個簽發 CA 安裝時自動啟用）\n",
+                    key_path.display(),
+                    csr_path.display()
                 ),
-                exit: 0,
+                ..Default::default()
             })
         }
         (Some("issuing-ca"), Some("install")) => {
@@ -1225,6 +1235,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     action: "ca.install",
                     object: Some(&r.ca_id.to_string()),
                     result: "ok",
+                    details: Some(json!({"activated": r.activated})),
                     ..Default::default()
                 },
             );
@@ -1232,20 +1243,27 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 return Ok(ok_json(
                     cmd,
                     env.now,
-                    json!({"ca_id": r.ca_id, "subject": r.subject, "activated": r.activated, "not_after": crate::api::http::ts_ms(r.not_after_ms)}),
+                    json!({"ca_id": r.ca_id, "subject": r.subject, "issuer": r.issuer, "activated": r.activated, "state": if r.activated { "active" } else { "trusted" }, "not_after": crate::api::http::ts_ms(r.not_after_ms)}),
                 ));
             }
+            let m = mark(env);
+            let years = (r.not_after_ms - now_ms) as f64 / (365.0 * 86_400_000.0);
             Ok(Output {
                 stdout: format!(
-                    "{} 已安裝簽發 CA {}（{}，到期 {}）{}\n",
-                    mark(env),
+                    "{m} 憑證與私鑰成對\n{m} 擴充欄位：CA:TRUE、pathlen:0、keyCertSign／cRLSign、EKU clientAuth\n{m} 簽發者：{}\n{m} 有效期間：至 {}（剩 {years:.1} 年，至少需 2 年）\n{m} 已安裝簽發 CA #{}（{}）\n",
+                    r.issuer,
+                    human_time(r.not_after_ms, env.tz)
+                        .split(' ')
+                        .next()
+                        .unwrap_or_default(),
                     r.ca_id,
-                    r.subject,
-                    human_time_zoned(r.not_after_ms, env.tz),
                     if r.activated {
-                        "，並已啟用（執行中的 Kairos 在 2 秒內開始線上簽發）"
+                        "狀態：啟用中。這是第一個簽發 CA，已自動啟用；執行中的 Kairos 在 2 秒內開始線上簽發".to_string()
                     } else {
-                        "；以 kairos pki issuing-ca activate 啟用"
+                        format!(
+                            "狀態：受信任，尚未啟用。執行 kairos pki issuing-ca activate {} 後新簽發改用它",
+                            r.ca_id
+                        )
                     }
                 ),
                 ..Default::default()
