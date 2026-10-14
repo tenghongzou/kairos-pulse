@@ -12,12 +12,14 @@
 //! - at-least-once（A5）：durable 的 [`DurableSeq`]（`boot_id`／`report_seq`）與其限制
 //! - 欄位驗證：UUID 格式的 `agent_id`、顯示用字串的禁止字元表、hello（含 v2 的主機資訊）、
 //!   `ts`、report（v1 三欄位與 v2 的通用指標，A4）的限制
+//! - 註冊通道（8444 HTTPS，[`ENROLL.md`](../ENROLL.md)）：[`enroll`] 模組
 //!
 //! 本 crate 只有純函式與資料型別，不做 I/O、不記日誌，也不依賴 tokio；NDJSON 的分行 codec
 //! 與日誌的措辭留在各產品。
 
 #![forbid(unsafe_code)]
 
+pub mod enroll;
 mod messages;
 mod metrics;
 mod negotiate;

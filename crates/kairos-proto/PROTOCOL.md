@@ -66,7 +66,7 @@ sequenceDiagram
 | `metrics` | report 改用通用指標 `metrics`（見「report（通用指標）」）。新版 Kairos 與 Pulse 都宣告 |
 | `durable` | report 改為 at-least-once：report 帶 `boot_id`／`report_seq`，伺服器據此去重，client 收到 `ack` 才刪除本機的資料（見「durable：at-least-once 投遞」）。Kairos 0.3.0 起宣告；Pulse 0.3.0 起在啟用本機緩衝（`buffer.enabled`，預設啟用）時宣告 |
 
-日後新增功能（例如註冊、除役通知、指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。
+日後新增功能（例如註冊、除役通知、指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。註冊通道（8444 HTTPS）是另一份規格 [`ENROLL.md`](ENROLL.md)；正常輪替與除役通知的 feature `renew`、`deregister` 目前以草稿寫在該文件第 13 節，實作時移入本文件。
 
 ### 相容矩陣
 
