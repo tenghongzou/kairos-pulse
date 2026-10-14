@@ -49,6 +49,58 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.5.0 之後的變更記在這裡。）
 
+## [0.6.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.6.0**：衝刺 5「使用者、角色、工作階段與稽核」（審計 F6、S7 的雜湊鏈部分；設計包 `kairos/screens.md` S01、S16、S17、S18、S23、§24 #10、#11、`README.md` D25）。**Pulse 不變**，協定不變。`kairos/Cargo.toml` 的版本**仍為 0.5.0**（版本號在發佈時再改）；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。規格：`kairos/API.md` 第 12 節。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **資料庫升級到 schema v6**：新增 `users`、`user_recovery_codes`、`role_assignments`、`sessions`；`api_tokens` 加 `owner_user_id`、`role`；`audit_events` 加 `prev_hash`、`hash`；`hosts` 加 `host_group` | 所有 SQLite 部署 | 升級前 `kairos db backup`；升級後 0.5 無法開啟資料庫（降版從備份還原）。`kairos users`、`kairos audit`、`kairos api-token` 等開啟資料庫時同樣會升級 schema |
+| 2 | Kairos | **`kairos api-token create` 的預設改為 `--role viewer`**（0.5 為範圍 `read`：另含註冊、PKI、設定的讀取）；`--scope` 已棄用（仍可使用，權限凍結在 0.5） | 以 `api-token create` 不帶 `--scope` 建立新 token、並讀取 `/api/v1/enroll`、`/pki`、`/settings` 的腳本 | 改以 `--role auditor`（唯讀全部）或 `--role operator` 建立。**既有的 token 不受影響**（保留原本的範圍與權限） |
+| 3 | Kairos | **主控台 API 的 403 多了 `details.permission`**；權限不足的寫入請求寫入稽核（`access.denied`） | 解析 403 的整合 | 只新增欄位；`details.required` 對 0.4／0.5 的 token 仍為範圍名稱 |
+
+沒有預設的帳號與密碼：升級（或新安裝）後以 `kairos users create <帳號> --role admin` 建立首位管理員（INSTALL 第 9.4 節）。不建立使用者時，API token 的行為與 0.5 相同。
+
+### 新增
+
+- **本機帳號**（API.md 第 12.2 節）：Argon2id 密碼雜湊（m=19 MiB、t=2、p=1，`[accounts]` 可調，參數改變後下次登入重新雜湊）、密碼政策（至少 12 字元、不含帳號、不是常見密碼）、連續失敗 5 次鎖定 15 分鐘（`KRS-E6003`；不存在的帳號回應相同，回應時間不透露帳號是否存在）、依來源 IP 限速（與 API token 共用）、管理員建立或重設的密碼第一次登入時必須變更。
+- **TOTP 二階段驗證**（RFC 6238）與 10 組一次性復原碼：登入第二步 `POST /api/v1/auth/login/mfa`；秘密以主控台金鑰（`data/console.key`，0600）AES-256-GCM 加密；同一個時間步只能用一次。
+- **LDAP／AD**（第 12.7 節）：bind 驗證（LDAPS 或 StartTLS，**一律驗證伺服器憑證與名稱**，只信任 `ldap.ca_file`；未加密需明確 `allow_plaintext`）、服務帳號搜尋（RFC 4515 跳脫）、空密碼一律拒絕、備援伺服器、群組對應角色（`PUT /api/v1/directory/mappings`、`kairos users map-group`）、「以帳號測試登入」。依賴 `ldap3` 0.12（`tls-rustls-ring`，與既有的 rustls 0.23＋ring 相同）。
+- **RBAC**（第 12.1 節）：權限集中定義在 `kairos/src/rbac.rs`（25 個，名稱如 `hosts:read`、`users:write`、`audit:export`；新功能加一個變體即可），四個內建角色（管理員、維運者、稽核員、唯讀，依設計包 `ia.md` §4.2），範圍為全站或主機群組（群組範圍只看得到該群組的主機）。所有 `/api/v1` 端點都接上權限檢查。
+- **工作階段**（第 12.3、12.4 節）：`__Host-kairos_session` cookie（HttpOnly、Secure、SameSite=Strict）、CSRF token（`X-CSRF-Token`＋Origin 檢查）、閒置 30 分鐘與絕對 12 小時逾時、資料庫只存 SHA-256。D25 的兩種結束 API：`POST /api/v1/me/sessions/revoke-others`（保留目前這個）、`POST /api/v1/users/{帳號}/sessions/revoke-all`（對象是自己時 409）；變更密碼、管理員重設密碼、停用帳號時自動結束。
+- **使用者管理 API**（第 12.5 節）：建立（一次性密碼）、角色指派（回應帶權限差異）、停用、啟用、刪除（L2）、解除鎖定、重設密碼與 MFA、工作階段清單、角色矩陣；不能移除最後一位全站管理員、不能停用或刪除自己。
+- **API token 屬於角色或使用者**（第 12.1、12.6 節）：`--role`、`--user`，以及 `GET/POST /api/v1/api-tokens`；使用者的 token 隨擁有者的權限與狀態（停用即失效）。
+- **稽核雜湊鏈**（第 12.8 節）：每筆 `audit_events` 含前一筆的雜湊；寫入與被記錄的變更在同一個交易中；保留期限 `audit.retention_days`（預設 3 年）清除時保留錨點。記錄登入、登出、失敗、鎖定、權限變更、密碼與 MFA、token 建立與撤銷、設定變更、註冊核准與拒絕、簽發與撤銷、被拒絕的請求、稽核本身的查詢與匯出、系統啟動與關機。`GET /api/v1/audit`（維運者只看自己的）、`GET /api/v1/audit/export`（JSONL，可離線重新計算）、`POST /api/v1/audit/verify`（`KRS-E6201`）；`kairos audit list|verify|export`。
+- **CLI**：`kairos users create|list|show|grant|revoke-role|disable|enable|delete|reset-password|reset-mfa|unlock|sessions|end-sessions|groups|map-group|unmap-group`、`kairos audit list|verify|export`。
+- 主機列表的 `group` 欄位與 `?group=` 篩選；主機的群組在簽發時取自註冊 token 的 `group`。
+
+### 變更
+
+- 主控台的請求一律先驗證、再依權限分派；註冊與 PKI 的寫入權限在註冊服務是否啟動之前檢查（沒有權限時一律 403）。
+- `kairos api-token list` 的「範圍」欄改為「權限」（`role:…`、`user:…`、`scope:…`）。
+- rustls 0.23.45 → 0.23.46（RUSTSEC-2026-0346～0349，`cargo deny` 的新公告；與本衝刺的功能無關，但不更新時 `cargo deny check` 不通過）。
+
+### 相容性
+
+- 0.4／0.5 建立的 API token：權限凍結在升級前（測試 `legacy_tokens_keep_their_pre_upgrade_permissions`、`legacy_tokens_keep_their_permissions_after_the_v6_upgrade` 以 v4 的資料庫升級後逐一驗證）。
+- 與 Pulse 的任何版本組合不變。
+
+### 暫定的產品代碼（待設計包分配）
+
+| 代碼 | 情況 |
+|---|---|
+| `KRS-E6012` | 二階段驗證碼不正確或已使用過（HTTP 401 `invalid_mfa_code`） |
+| `KRS-E6013` | 第一次登入必須先變更密碼（HTTP 403 `password_change_required`） |
+| `KRS-E6105` | 工作階段的寫入請求缺少或帶錯 CSRF token、或來自其他網站（HTTP 403 `csrf_failed`） |
+
+工作階段結束或逾時沿用 `KRS-E6010`（`details.reason = "session_expired"`；`decisions/INTEGRATION.md` §26.8 #4 待決定）。
+
+### 延後
+
+見 API.md 第 12.11 節：目錄服務的定期同步（AD 停用的帳號在下次登入時被拒）、「從目錄服務加入」、群組範圍的寫入權限、主機群組的管理 API、雙人覆核與 L3 的重新驗證、稽核外送（另一條開發線）。
+
 ## [0.5.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.5.0、Pulse 0.5.0**：衝刺 4「註冊通道 8444」。Kairos 新增註冊通道（8444 HTTPS）、自動簽發的 PKI（線上簽發 CA、CRL）與管理 API／CLI；Pulse 新增 `pulse enroll`、`pulse decommission`、過期寬限期續簽與 8443 的自動輪替。**協定版本不變**（仍為 v1～v2），8443 以新的 feature `renew`、`deregister` 協商，只在雙方都宣告時使用：0.4 的 Kairos 與 Pulse 不受影響，兩個產品可以分批升級（建議順序見下）。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.5.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。規格：`crates/kairos-proto/ENROLL.md`（8444）、`crates/kairos-proto/PROTOCOL.md`「憑證輪替與除役」（8443）、`kairos/PKI.md`、`kairos/API.md` 第 11 節。

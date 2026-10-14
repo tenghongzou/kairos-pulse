@@ -12,6 +12,7 @@
 - 依 agent 宣告的心跳間隔計算離線門檻：`max(5 × clamp(heartbeat_interval_ms, 1000, 60000), 5000)` ms（5～300 秒），只有合法訊息才算存活
 - 每秒檢查存活狀態，上線／離線／恢復都會記錄日誌（「標記為離線」與「從狀態表移除」每 10 秒最多各逐一記錄 20／5 個，其餘在時間窗結束後合併成一行摘要）；離線超過 24 小時的 agent 自動從狀態表移除；每 60 秒輸出一行摘要
 - 主控台 API（審計 F1；[API.md](API.md)）：HTTPS（預設只綁 `127.0.0.1:9443`，`console.listen`）的唯讀 `/api/v1`：主機清單（伺服器端篩選、排序、游標分頁、CIDR 搜尋、總數）、主機詳情（含補送狀態、握手時被拒的憑證）、指標趨勢（自動選原始資料或彙總，min／max／avg／count）、總覽 KPI、系統健康（資料庫用量與容量刪除 `KRS-W4202`、寫入統計、補送台數、連線、TLS 到期、檔案描述元）與即時變更推送（SSE）。以 API token 驗證（`kairos api-token create|list|revoke`，資料庫只存 SHA-256），1 萬台主機時列表 p99 約 10 ms
+- 使用者、角色與稽核（審計 F6；0.6.0〔草稿〕，API.md 第 12 節）：本機帳號（Argon2id、密碼政策、連續失敗鎖定、TOTP 二階段驗證與復原碼）與 LDAP／AD（bind 驗證、群組對應角色、TLS 一律驗證憑證）；四個內建角色（管理員、維運者、稽核員、唯讀）與主機群組範圍，所有 `/api/v1` 端點依集中定義的權限檢查；主控台的工作階段（`__Host-` cookie、HttpOnly、Secure、SameSite=Strict、CSRF token、閒置與絕對逾時、D25 的兩種結束 API）；稽核事件以 SHA-256 雜湊鏈保存（`kairos audit verify` 指出第一個斷點，`kairos audit export` 匯出 JSONL）。首位管理員以 `kairos users create <帳號> --role admin` 建立（沒有預設帳號與密碼）
 - 主機清冊（審計 A6）：所有出現過的主機保存在 SQLite（`hosts`），每 30 秒從狀態表同步、關機時寫入最後狀態；重新啟動時最近 24 小時內出現過的主機以離線狀態放回狀態表（`agents.json` 不再重新啟動就清空）。`kairos hosts list [--offline-for 3d]` 查詢哪些主機已失聯多久
 - 驗證 hello 欄位（`agent_id` 必須是 UUID 文字格式，`hostname`、`agent_version` 有長度與字元限制），並以 `limits.max_agents` 限制狀態表筆數（預設 `max(10000, server.max_connections)`；滿時先淘汰離線最久的 agent，沒有可淘汰者才拒絕新的 `agent_id`），避免狀態表與 `agents.json` 被任意資料灌爆
 - 預設拒絕未認證的對外監聽：監聽非 loopback 位址（例如 `0.0.0.0`）又沒有設定 `auth.client_ca` 時拒絕啟動，除非明確設定 `auth.allow_unauthenticated = true`（見「啟用 mTLS」）
@@ -47,6 +48,8 @@
 - **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 3（設定錯誤）結束；新版 `kairos.service` 的 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再反覆重試（沿用舊版 unit 時仍會依 `Restart=on-failure` 每 5 秒重試並失敗，請一併換上新版 unit）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
 - **啟動失敗的結束代碼依原因區分**（舊版一律為 1）：命令列參數錯誤 2、設定錯誤 3（設定檔無法載入或驗證不通過、上述拒絕啟動）、憑證錯誤 4（伺服器憑證、私鑰、client CA、CRL）、連接埠已被佔用 11。`kairos.service` 新增 `RestartPreventExitStatus=2 3 4`，systemd 不再對這些錯誤無限重試；修正後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、其他啟動失敗（1）、第二次訊號強制結束（130）不變。
 - **啟用 mTLS 時 `server.max_connections_per_ip` 只計算尚未通過 hello 的連線**（行為改變，不需修改設定）：舊版不論是否啟用 mTLS，都計算同一位址的全部連線，同一個 NAT 後第 33 台 agent 起在握手前被斷線（審計 A7）；新版啟用 mTLS 時，連線通過 hello（憑證與 `agent_id` 綁定）後改依憑證身分計數，同一個 NAT 後的 agent 數只受 `server.max_connections` 限制。握手前與握手中的連線仍依位址限制（慢速握手防護）。為了 NAT 而調高 `server.max_connections_per_ip` 的 mTLS 部署可以改回預設；未啟用 mTLS 時行為不變。見「每 IP 上限、NAT 與網段允許清單」。
+
+- **0.6.0〔草稿〕：資料庫升級到 schema v6**（使用者、角色、工作階段、稽核雜湊鏈）。升級前以 `kairos db backup` 備份，升級後 0.5 無法開啟。既有的 API token 保留原本的範圍與權限；`kairos api-token create` 未指定時改為 `--role viewer`（0.5 的預設 `read` 另含註冊、PKI 與設定的讀取，需要時以 `--role auditor` 或 `operator` 建立）。升級後以 `kairos users create <帳號> --role admin` 建立首位管理員才能以帳號登入主控台。見「使用者、角色與稽核」與 CHANGELOG [0.6.0]。
 
 - **0.5.0〔草稿〕：資料庫升級到 schema v4**（註冊通道與 PKI）。升級前以 `kairos db backup` 備份，升級後 0.4 無法開啟。沒有 `[enroll]`、`[pki]` 時行為與 0.4 相同（註冊通道關閉、離線簽發），不需要修改設定。見「註冊通道與 PKI」。從 0.4 升級時**先升級 Kairos**、建立簽發 CA、開放 8444，再升級 Pulse（INSTALL 第 11 節、CHANGELOG [0.5.0]）。
 
@@ -464,7 +467,7 @@ kairos --help         # 或 -h
 規格、端點、錯誤格式與量測見 [API.md](API.md)；以下為最短的使用方式。
 
 ```bash
-# 建立唯讀 token（只顯示這一次；資料庫只存 SHA-256；預設 90 天後到期）
+# 建立唯讀 token（角色 viewer；只顯示這一次；資料庫只存 SHA-256；預設 90 天後到期）
 TOKEN=$(kairos api-token create --name grafana --config kairos.toml)
 curl -sk -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:9443/api/v1/hosts?status=offline&sort=-last_seen"
 curl -sk -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:9443/api/v1/hosts/<agent_id>/metrics/system.cpu.usage?range=24h"
@@ -473,10 +476,35 @@ kairos api-token list --config kairos.toml
 kairos api-token revoke <token_id> --yes --config kairos.toml
 ```
 
-- 只有 HTTPS（rustls／ring）、HTTP/1.1；查詢只有 `GET`，註冊與 PKI 的管理端點（0.5.0，API.md 第 11 節）另有 `POST`、`PUT`，需要 `operate`／`admin` 範圍的 token（`kairos api-token create --scope operate|admin`）；每個回應帶 `server_time`（UTC、毫秒）；錯誤為 `{"error":{"code","product_code","message"}}`；CORS 關閉。
+- 只有 HTTPS（rustls／ring）、HTTP/1.1；查詢只有 `GET`，註冊、PKI、使用者等管理端點另有 `POST`、`PUT`，依角色檢查權限（`kairos api-token create --role operator|admin`，或 `--user <帳號>` 讓 token 擁有該使用者的權限；API.md 第 12.1 節）；每個回應帶 `server_time`（UTC、毫秒）；錯誤為 `{"error":{"code","product_code","message"}}`；CORS 關閉。
 - 驗證失敗依來源 IP 速率限制（連續 10 次後每 6 秒 1 次）；token 的建立與撤銷由執行中的 Kairos 寫入日誌。
 - 主控台在自己的 tokio runtime 上執行、以唯讀連線查詢資料庫，不影響 agent 連線與 report 的 `ack`（API.md 第 9 節）。
 - 握手時被拒的客戶端憑證（已撤銷、已過期）以 SAN 歸屬到主機，主機詳情與列表的離線原因顯示「憑證被拒」；不受信任的 CA 簽發的憑證不歸屬（避免冒用）。
+
+## 使用者、角色與稽核（0.6.0〔草稿〕）
+
+規格見 [API.md](API.md) 第 12 節。
+
+```bash
+# 首位管理員（沒有預設帳號與密碼）：一次性密碼只在 stdout 顯示這一次，第一次登入時必須變更
+sudo -u kairos /opt/kairos/kairos users create admin --role admin --config /opt/kairos/kairos.toml
+# 其他使用者與角色（admin、operator、auditor、viewer；限定主機群組：operator@group:B廠產線）
+kairos users create chen.y --role auditor --display-name 陳小姐 --config kairos.toml
+kairos users grant wang --role operator@group:Line3 --config kairos.toml
+kairos users end-sessions chen.y --yes --config kairos.toml   # 結束他的所有工作階段（D25）
+kairos users map-group "CN=IT-Ops,OU=Groups,DC=example,DC=gov,DC=tw" --role operator --config kairos.toml
+# 稽核日誌：驗證雜湊鏈（斷裂時結束代碼 9、KRS-E6201）、查詢、匯出 JSONL
+kairos audit verify --config kairos.toml
+kairos audit list --category user --since 7d --config kairos.toml
+kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --config kairos.toml
+```
+
+- **登入**：`POST /api/v1/auth/login`（本機或 `method: "ldap"`）→ `__Host-kairos_session` cookie（HttpOnly、Secure、SameSite=Strict）；寫入請求帶 `X-CSRF-Token`。啟用 TOTP 的帳號另有第二步（`/api/v1/auth/login/mfa`，6 位數或復原碼）。閒置 30 分鐘、絕對 12 小時逾時（`[accounts]`）。
+- **防護**：連續失敗 5 次鎖定 15 分鐘（`KRS-E6003`；不存在的帳號回應相同）、依來源 IP 限速（與 API token 共用）、Argon2id（m=19 MiB、t=2、p=1）、密碼至少 12 字元；密碼、工作階段與 TOTP 的秘密不出現在日誌、資料庫明文或回應中。
+- **結束工作階段**（D25）：自己「結束其他所有工作階段」（`POST /api/v1/me/sessions/revoke-others`，保留目前這個）；管理員對他人「結束所有工作階段」（`POST /api/v1/users/{帳號}/sessions/revoke-all`）。變更密碼、管理員重設密碼、停用帳號時自動結束。
+- **LDAP／AD**：`[ldap]` 設定伺服器、`ca_file`（必填，一律驗證伺服器憑證）、服務帳號（密碼放在 `bind_password_file`）與搜尋基底；群組以 `kairos users map-group` 或 `PUT /api/v1/directory/mappings` 對應角色。
+- **API token**：0.6 起屬於某個角色（`--role`，預設 `viewer`）或某個使用者（`--user`）；升級前建立的 token 保留原本的範圍與權限（凍結在 0.5，不會多出使用者、稽核等新權限）。
+- **稽核**：登入、登出、失敗、鎖定、角色變更、密碼與 MFA、token 建立與撤銷、設定變更、註冊核准與拒絕、簽發與撤銷、被拒絕的請求、系統啟動與關機都寫入 `audit_events`，每筆含前一筆的雜湊；保留 `audit.retention_days`（預設 3 年）。
 
 ## 註冊通道與 PKI（0.5.0〔草稿〕）
 
@@ -870,6 +898,12 @@ kairos/
     │                      events.rs（SSE）、maint.rs（背景工作）、tests.rs（以 HTTPS 用戶端的整合測試）、bench.rs（量測）
     ├── stats.rs           report 寫入結果的統計（啟動以來與每分鐘）
     ├── token_cli.rs       kairos api-token create|list|revoke
+    ├── users_cli.rs       kairos users …（使用者、角色指派、工作階段、目錄服務群組對應）
+    ├── audit_cli.rs       kairos audit list|verify|export
+    ├── audit.rs           稽核事件的雜湊鏈（寫入、補上舊紀錄的雜湊、清除與錨點、驗證、查詢）
+    ├── rbac.rs            權限（集中定義）、內建角色、範圍、0.4／0.5 token 的凍結範圍
+    ├── users/             帳號：password.rs（Argon2id、政策）、totp.rs（RFC 6238、復原碼）、secrets.rs（主控台金鑰）、
+    │                      store.rs（users、role_assignments、sessions）、ldap.rs（LDAP／AD）
     ├── hosts_cli.rs       kairos hosts list（主機清冊查詢）
     ├── export_cli.rs      kairos reports export（JSON Lines 匯出）、kairos db backup（線上備份）
     ├── import_cli.rs      kairos reports import（來源檔的收集與安全檢查、輸出與結束代碼）

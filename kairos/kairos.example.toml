@@ -113,3 +113,34 @@ renew_requires_approval = false
 expired_renew_grace_days = 90 # 過期寬限期（0 = 不接受過期續簽）
 revoke_on_self_decommission = true
 revoke_superseded = true      # 新憑證第一次連線後以 superseded 撤銷舊憑證
+
+[accounts]                    # 主控台的本機帳號、密碼政策、登入失敗鎖定與工作階段（API.md 第 12 節）；首位管理員以 kairos users create <帳號> --role admin 建立
+password_min_length = 12      # 密碼至少幾個字元，8..=128
+lockout_threshold = 5         # 連續登入失敗幾次後鎖定（KRS-E6003），1..=100；不存在的帳號回應相同
+lockout_minutes = 15          # 鎖定幾分鐘，1..=1440
+session_idle_minutes = 30     # 工作階段閒置逾時（分鐘），5..=1440，不可大於絕對逾時
+session_absolute_hours = 12   # 工作階段從登入起最長幾小時，1..=168
+argon2_memory_kib = 19456     # 密碼雜湊 Argon2id 的記憶體成本（KiB），8192..=1048576；調整後舊雜湊仍可驗證，下次登入時以新參數重新雜湊
+argon2_iterations = 2         # 1..=10
+argon2_parallelism = 1        # 1..=8
+mfa_issuer = "Kairos"         # TOTP 驗證器 App 顯示的發行者名稱
+
+[ldap]                        # 目錄服務（LDAP／AD）登入；群組對應角色以 kairos users map-group 或主控台設定（存在資料庫）
+enabled = false
+# url = "ldaps://dc01.example.gov.tw:636"          # ldaps://；ldap:// 需搭配 starttls = true
+# fallback_urls = ["ldaps://dc02.example.gov.tw:636"]
+# starttls = false
+# allow_plaintext = false     # 允許未加密的 ldap://（密碼以明文經過網路；不建議）
+# ca_file = "/opt/kairos/ad-ca.pem"                # 簽發網域控制站憑證的 CA（PEM）；使用 TLS 時必填，伺服器憑證一律驗證
+# bind_dn = "CN=svc-kairos,OU=Service,DC=example,DC=gov,DC=tw"
+# bind_password_file = "/opt/kairos/ldap-bind.secret"   # 服務帳號的密碼檔（chown kairos、chmod 600）；密碼不寫在本檔
+# user_base = "OU=Staff,DC=example,DC=gov,DC=tw"
+# user_filter = "(&(objectCategory=person)(objectClass=user))"   # 預設只比對人員（排除 AD 的電腦帳號）
+# login_attribute = "sAMAccountName"
+# display_name_attribute = "displayName"
+# email_attribute = "mail"
+# group_attribute = "memberOf"
+# timeout_secs = 10
+
+[audit]                       # 稽核日誌（雜湊鏈；kairos audit verify|list|export）
+retention_days = 1095         # 保留天數（預設 3 年，獨立於 report 的保留天數），90..=36500

@@ -287,7 +287,7 @@ CREATE TABLE settings (                      -- 主控台修改的設定（第 8
     updated_by     TEXT NOT NULL
 ) WITHOUT ROWID;
 
-CREATE TABLE audit_events (                  -- 稽核（之後的雜湊鏈 #11 在此表加欄位）
+CREATE TABLE audit_events (                  -- 稽核（schema v6 加上雜湊鏈的 prev_hash、hash，API.md 第 12.8 節）
     id             INTEGER PRIMARY KEY,
     at             INTEGER NOT NULL,
     actor          TEXT NOT NULL,            -- 使用者、token:<token_id>、system、host:<agent_id 前 8 碼>
@@ -326,7 +326,7 @@ ALTER TABLE hosts ADD COLUMN last_grace_attempt TEXT;    -- JSON：時間、結�
 | `pki_crls` | 每個 CA 保留最近 100 版 |
 | `enroll_replay` | 每分鐘刪除 `expires_at` 已過的 |
 | `enroll_blocks`、`enroll_relaxations` | 到期後刪除 |
-| `audit_events` | 400 天（之後由 #11 的設定取代） |
+| `audit_events` | `audit.retention_days`（0.6 起；預設 1,095 天，清除時保留雜湊鏈的錨點，API.md 第 12.8 節） |
 
 **schema 版本**：v4（0.5.0）。升級到 v4 之後 0.4 無法開啟資料庫（STORAGE.md 第 3.2 節的規則）；`kairos db backup` 涵蓋所有新資料表。STORAGE.md 在實作時更新第 3 節。
 
