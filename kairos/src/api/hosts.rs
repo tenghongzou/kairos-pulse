@@ -1198,6 +1198,7 @@ pub(crate) mod tests {
             durable: Some(true),
             backfill: None,
             offline_reason: (!online).then_some(OfflineReason::Timeout),
+            offline_for: None,
         }
     }
 

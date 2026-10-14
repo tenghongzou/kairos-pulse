@@ -332,6 +332,11 @@ async fn run_with_wait(
         match outcome {
             ReloadOutcome::Unchanged => {}
             ReloadOutcome::Reloaded(changed) => {
+                registry.bus().publish(crate::bus::EventKind::TlsReload {
+                    ok: true,
+                    crl: changed.contains(&TlsFileKind::Crl),
+                    message: None,
+                });
                 info!(
                     "已重新載入 TLS 設定（變更：{}；mTLS：{}，CRL {} 份）",
                     describe_kinds(&changed),
@@ -351,6 +356,11 @@ async fn run_with_wait(
                 }
             }
             ReloadOutcome::Failed(e) => {
+                registry.bus().publish(crate::bus::EventKind::TlsReload {
+                    ok: false,
+                    crl: !paths.crls.is_empty() || paths.issuing_crl.is_some(),
+                    message: Some(e.to_string()),
+                });
                 error!("重新載入 TLS 設定失敗，繼續使用目前的設定: {}", e)
             }
         }

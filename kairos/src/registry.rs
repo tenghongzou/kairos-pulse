@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, oneshot};
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
+use crate::bus::{DisconnectReason, EventBus, EventKind, peer_ip};
 use crate::protocol::HostInfo;
 use crate::storage::fmt_time;
 use crate::tls::ChainRejection;
@@ -55,6 +56,8 @@ pub enum OfflineReason {
     /// 連線中重新驗證客戶端憑證時被拒（撤銷、過期、不再受信任）；握手時被拒的另由
     /// `tls::rejections` 記錄
     CertificateRejected,
+    /// report 的寫入結果未知，Kairos 關閉了連線（設計包 §24 #2）
+    WriteUnknown,
 }
 
 impl OfflineReason {
@@ -64,6 +67,7 @@ impl OfflineReason {
             OfflineReason::ConnectionClosed => "connection_closed",
             OfflineReason::ServerShutdown => "server_shutdown",
             OfflineReason::CertificateRejected => "certificate_rejected",
+            OfflineReason::WriteUnknown => "write_unknown",
         }
     }
 }
@@ -116,6 +120,8 @@ pub struct LiveAgent {
     pub durable: Option<bool>,
     pub backfill: Option<Backfill>,
     pub offline_reason: Option<OfflineReason>,
+    /// 離線多久了（線上時為 `None`；由主機清冊載回的主機以載回的時間起算）
+    pub offline_for: Option<Duration>,
 }
 
 impl LiveAgent {
@@ -434,6 +440,8 @@ pub struct Registry {
     max_agents: usize,
     /// 狀態變化的廣播（[`Registry::subscribe`]）
     events: broadcast::Sender<HostChange>,
+    /// Kairos 內部的事件匯流排（[`crate::bus`]）：上線、離線、被取代也發布到這裡
+    bus: Arc<EventBus>,
 }
 
 impl Default for Registry {
@@ -453,7 +461,13 @@ impl Registry {
             inner: Mutex::new(Inner::default()),
             max_agents: max_agents.max(1),
             events: broadcast::channel(HOST_CHANGE_CAPACITY).0,
+            bus: EventBus::new(),
         }
+    }
+
+    /// 事件匯流排（狀態表建立時一併建立；其他元件經由狀態表取得同一個匯流排）
+    pub fn bus(&self) -> Arc<EventBus> {
+        self.bus.clone()
     }
 
     /// 訂閱之後的狀態變化（上線、離線）
@@ -469,6 +483,23 @@ impl Registry {
         kind: HostChangeKind,
         at: DateTime<Utc>,
     ) {
+        let ip = peer_ip(&state.peer);
+        self.bus.publish_at(
+            at,
+            match kind {
+                HostChangeKind::Online => EventKind::HostOnline {
+                    agent_id: agent_id.clone(),
+                    hostname: state.hostname.clone(),
+                    ip,
+                },
+                HostChangeKind::Offline(reason) => EventKind::HostOffline {
+                    agent_id: agent_id.clone(),
+                    hostname: state.hostname.clone(),
+                    ip,
+                    reason: DisconnectReason::from_offline(reason),
+                },
+            },
+        );
         if self.events.receiver_count() == 0 {
             return;
         }
@@ -513,6 +544,7 @@ impl Registry {
         let mut previous_fingerprint = None;
         let mut was_online = false;
         let mut previous_reason = None;
+        let mut superseded_peer = None;
         let (kind, last_report, key) = match inner.remove(&info.agent_id) {
             None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
             Some(mut prev) => {
@@ -528,10 +560,14 @@ impl Registry {
                     // 舊連線仍在：通知它被取代。接收端已結束時 send 會失敗，可忽略。
                     Some(kick) => {
                         let _ = kick.send(KickReason::Superseded);
+                        superseded_peer = Some(prev.peer.clone());
                         RegisterKind::Superseded { previous_conn_id }
                     }
                     // 舊連線已被通知結束（例如憑證被拒）但尚未關閉：同樣是取代，只是不必再通知
-                    None if prev.connected => RegisterKind::Superseded { previous_conn_id },
+                    None if prev.connected => {
+                        superseded_peer = Some(prev.peer.clone());
+                        RegisterKind::Superseded { previous_conn_id }
+                    }
                     None => RegisterKind::Reconnected,
                 };
                 (
@@ -571,6 +607,16 @@ impl Registry {
         );
         if !was_online && let Some(state) = inner.agents.get(&event_key) {
             self.emit(&event_key, state, HostChangeKind::Online, now_wall);
+        }
+        if let (Some(previous), Some(state)) = (superseded_peer, inner.agents.get(&event_key)) {
+            self.bus.publish_at(
+                now_wall,
+                EventKind::HostSuperseded {
+                    agent_id: event_key.clone(),
+                    previous_ip: peer_ip(&previous),
+                    ip: peer_ip(&state.peer),
+                },
+            );
         }
         Ok(Registration {
             kind,
@@ -674,6 +720,19 @@ impl Registry {
         }
     }
 
+    /// 連線即將由 Kairos 關閉時記下原因（例如 report 寫入結果未知），之後的離線以這個原因記錄；
+    /// conn_id 不符或已離線時不更新
+    pub fn set_close_reason(&self, agent_id: &str, conn_id: u64, reason: OfflineReason) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+            && state.online
+            && state.kick_reason.is_none()
+        {
+            state.kick_reason = Some(reason);
+        }
+    }
+
     /// hello 通過後記錄這條連線是否協商了 durable（A5）；conn_id 不符時不更新
     pub fn set_durable(&self, agent_id: &str, conn_id: u64, durable: bool) {
         let mut inner = self.lock();
@@ -707,21 +766,23 @@ impl Registry {
 
     /// 主控台 API 用：所有 agent 的即時狀態（持鎖期間只複製參考計數）
     pub fn live_view(&self) -> Vec<LiveAgent> {
+        let now = Instant::now();
         let inner = self.lock();
         inner
             .agents
             .iter()
-            .map(|(id, s)| Self::live_of(id, s))
+            .map(|(id, s)| Self::live_of(id, s, now))
             .collect()
     }
 
     /// 主控台 API 用：一台 agent 的即時狀態
     pub fn live_get(&self, agent_id: &str) -> Option<LiveAgent> {
+        let now = Instant::now();
         let inner = self.lock();
         inner
             .agents
             .get_key_value(agent_id)
-            .map(|(id, s)| Self::live_of(id, s))
+            .map(|(id, s)| Self::live_of(id, s, now))
     }
 
     /// 狀態表中的筆數與連線工作仍在的 agent 數
@@ -735,7 +796,7 @@ impl Registry {
         self.max_agents
     }
 
-    fn live_of(id: &Arc<str>, s: &AgentState) -> LiveAgent {
+    fn live_of(id: &Arc<str>, s: &AgentState, now: Instant) -> LiveAgent {
         LiveAgent {
             agent_id: id.clone(),
             hostname: s.hostname.clone(),
@@ -752,6 +813,11 @@ impl Registry {
             durable: s.durable,
             backfill: s.backfill,
             offline_reason: s.offline_reason,
+            offline_for: if s.online {
+                None
+            } else {
+                s.offline_since.map(|t| now.saturating_duration_since(t))
+            },
         }
     }
 
