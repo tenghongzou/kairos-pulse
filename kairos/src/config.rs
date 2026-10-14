@@ -133,7 +133,11 @@ kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\
 kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
 kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）\n       \
 kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n       \
-kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n\n\
+kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n       \
+kairos enroll-token create|list|show|disable [選項]（註冊 token）\n       \
+kairos enroll list|show|approve|reject|mode [選項]（註冊申請與註冊端點模式）\n       \
+kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
+kairos config show --effective（實際生效的設定與來源）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
@@ -596,6 +600,8 @@ pub enum CliAction {
     Db(crate::export_cli::DbCommand),
     /// `kairos api-token ...`（主控台 API 的 token，見 [`crate::token_cli`]）
     ApiToken(crate::token_cli::TokenCommand),
+    /// `kairos enroll-token|enroll|pki|config ...`（註冊與 PKI，見 [`crate::enroll_cli`]）
+    Enroll(crate::enroll_cli::Cmd),
 }
 
 /// `--config=<path>` 的前綴
@@ -650,6 +656,17 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();
         return crate::token_cli::parse_args(iter).map(CliAction::ApiToken);
+    }
+    for (name, group) in [
+        ("enroll-token", crate::enroll_cli::Group::EnrollToken),
+        ("enroll", crate::enroll_cli::Group::Enroll),
+        ("pki", crate::enroll_cli::Group::Pki),
+        ("config", crate::enroll_cli::Group::Config),
+    ] {
+        if iter.peek().is_some_and(|a| a == name) {
+            iter.next();
+            return crate::enroll_cli::parse_args(group, iter).map(CliAction::Enroll);
+        }
     }
     while let Some(arg) = iter.next() {
         let path = if arg == "--config" {

@@ -4,6 +4,7 @@ mod config;
 mod connection;
 mod dedup;
 mod enroll;
+mod enroll_cli;
 mod expiry;
 mod export_cli;
 mod fsperm;
@@ -463,6 +464,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Reports(cmd)) => return ExitCode::from(export_cli::run(cmd)),
         Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
         Ok(CliAction::ApiToken(cmd)) => return ExitCode::from(token_cli::run(cmd)),
+        Ok(CliAction::Enroll(cmd)) => return ExitCode::from(enroll_cli::run(cmd)),
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
@@ -475,6 +477,10 @@ fn main() -> ExitCode {
                     }
                 }
                 Some(a) if a == "db" => export_cli::DB_USAGE,
+                Some(a) if a == "enroll-token" => enroll_cli::ENROLL_TOKEN_USAGE,
+                Some(a) if a == "enroll" => enroll_cli::ENROLL_USAGE,
+                Some(a) if a == "pki" => enroll_cli::PKI_USAGE,
+                Some(a) if a == "config" => enroll_cli::CONFIG_USAGE,
                 _ => USAGE,
             };
             eprintln!("{}\n\n{}", e, usage);
@@ -893,7 +899,6 @@ async fn run(
                 data_dir: paths.data_dir.clone(),
                 db_path: enroll::db_path(&config, &paths.data_dir),
                 shutdown: shutdown.clone(),
-                registry: Some(registry.clone()),
                 other_listens,
                 clock: enroll::system_clock(),
             })
