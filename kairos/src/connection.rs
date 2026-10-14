@@ -784,13 +784,16 @@ impl Conn {
             .map(|s| s.to_ascii_uppercase())
     }
 
-    /// `hello_ack`：v2 時帶 features（含雙方協商的 `renew`、`deregister`）與 `server_time`；協商了 `renew`
-    /// 時另帶 `expired_renew_grace_days` 與選用的 `renew_now`（ENROLL.md 第 13.1 節）
+    /// `hello_ack`：v2 時帶 features 與 `server_time`；協商了 `renew` 時另帶 `expired_renew_grace_days` 與
+    /// 選用的 `renew_now`（ENROLL.md 第 13.1 節）。`renew`、`deregister` 只在 client 也宣告時列出：沒有宣告的
+    /// client（0.4 以前的 Pulse）收到的 `hello_ack` 與 0.4 的 Kairos 完全相同
     async fn send_hello_ack(&mut self, agent: &Agent, offline_ms: u64) -> Result<(), Error> {
         let (features, server_time) = if agent.session.is_v2() {
             let mut f: Vec<String> = SERVER_FEATURES.iter().map(|f| f.to_string()).collect();
-            if self.enroll.is_some() {
+            if agent.renew {
                 f.push(crate::enroll::agent::FEATURE_RENEW.to_string());
+            }
+            if agent.deregister {
                 f.push(crate::enroll::agent::FEATURE_DEREGISTER.to_string());
             }
             (Some(f), Some(fmt_time(Utc::now())))
