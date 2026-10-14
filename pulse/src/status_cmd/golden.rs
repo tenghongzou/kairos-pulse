@@ -1009,3 +1009,136 @@ fn windows_service_labels() {
     assert!(rows.contains("✗ 錯誤 服務   Pulse 服務已停止"), "{rows}");
     assert!(render::issues(&report, &unicode(), false, false).contains("Restart-Service Pulse"));
 }
+
+// ---- 註冊申請與過期續簽（衝刺 4，enrollment-ux.md §4.2、cli-spec.md §4.6、§4.7） ----
+
+fn enrolling(state: &str) -> StatusFile {
+    let mut f = base_file();
+    f.connection.state = "connecting".into();
+    f.identity.state = Some(state.into());
+    f.identity.enrollment = Some(sf::EnrollmentStatus {
+        state: state.into(),
+        request_code: Some("7KQ2-M9XD".into()),
+        expires_at: Some("2026-10-16T06:23:40.000Z".into()),
+        ..Default::default()
+    });
+    f
+}
+
+#[test]
+fn pending_approval_is_pending_with_exit_7() {
+    let report = eval::evaluate(&input(enrolling("pending_approval")));
+    let text = render::rows(&report, &unicode());
+    assert!(
+        text.contains("… 等待 連線   等待核准：申請編號 7KQ2-M9XD（PLS-I3307）"),
+        "{text}"
+    );
+    assert!(
+        text.contains("身分   等待核准（申請編號 7KQ2-M9XD，有效至 2026-10-16 14:23"),
+        "{text}"
+    );
+    assert_eq!(report.status.token(), "pending");
+    assert_eq!(report.status.exit_code(), 7);
+    assert!(
+        report
+            .brief
+            .starts_with("pending   plc-hmi-07 pending_approval"),
+        "{}",
+        report.brief
+    );
+}
+
+#[test]
+fn rate_limited_submission_and_clock_rejected() {
+    let mut f = enrolling("submitting");
+    let e = f.identity.enrollment.as_mut().unwrap();
+    e.last_code = Some("PLS-E2202".into());
+    e.next_submit_at = Some("2026-10-09T06:35:44.418Z".into());
+    let report = eval::evaluate(&input(f));
+    assert_eq!(report.status.token(), "pending");
+    assert!(
+        report.brief.contains("submitting") && report.brief.contains("PLS-E2202"),
+        "{}",
+        report.brief
+    );
+    let text = render::rows(&report, &unicode());
+    assert!(text.contains("註冊端點忙碌，下次重試 42 秒後"), "{text}");
+
+    let mut f = enrolling("clock_rejected");
+    let e = f.identity.enrollment.as_mut().unwrap();
+    e.last_code = Some("PLS-E8302".into());
+    e.offset_ms = Some(-462_000);
+    let report = eval::evaluate(&input(f));
+    assert_eq!(report.status.token(), "critical");
+    assert_eq!(report.status.exit_code(), 9);
+    let text = render::rows(&report, &unicode());
+    assert!(
+        text.contains("Kairos 因時鐘偏差暫不受理註冊：相差 7 分 42 秒"),
+        "{text}"
+    );
+    assert!(
+        report
+            .brief
+            .contains("clock_rejected offset=-7m42s PLS-E8302"),
+        "{}",
+        report.brief
+    );
+}
+
+#[test]
+fn rejected_and_token_errors_are_critical() {
+    let mut f = enrolling("rejected");
+    let e = f.identity.enrollment.as_mut().unwrap();
+    e.last_code = Some("PLS-E3302".into());
+    e.rejected_reason = Some("非本單位主機".into());
+    let report = eval::evaluate(&input(f));
+    assert_eq!(report.status.token(), "critical");
+    let text = render::rows(&report, &unicode());
+    assert!(
+        text.contains("申請被拒絕（原因：「非本單位主機」）（PLS-E3302）"),
+        "{text}"
+    );
+    let mut f = enrolling("token_error");
+    f.identity.enrollment.as_mut().unwrap().last_code = Some("PLS-E3003".into());
+    let text = render::rows(&eval::evaluate(&input(f)), &unicode());
+    assert!(
+        text.contains("無法註冊：註冊 token 已過期（PLS-E3003）"),
+        "{text}"
+    );
+}
+
+#[test]
+fn grace_blocked_shows_expiry_and_remaining_grace() {
+    let mut f = base_file();
+    f.connection.state = "reconnecting".into();
+    f.identity.state = Some("cert_expired".into());
+    f.identity.not_after = Some("2026-09-27T16:00:00.000Z".into());
+    f.identity.grace = Some(sf::GraceStatus {
+        days: Some(90),
+        ends_at: Some("2026-12-26T16:00:00.000Z".into()),
+        renew_state: "grace_blocked".into(),
+        attempts: 6,
+        next_attempt_at: Some("2026-10-09T07:27:02.418Z".into()),
+        last_code: Some("PLS-E2007".into()),
+        ..Default::default()
+    });
+    let report = eval::evaluate(&input(f));
+    let text = render::rows(&report, &unicode());
+    assert!(
+        text.contains("無法自動續簽：註冊端點無法連線（PLS-E2007）"),
+        "{text}"
+    );
+    assert!(text.contains("已嘗試 6 次，下次嘗試 52 分鐘後"), "{text}");
+    assert!(
+        text.contains("憑證已於 2026-09-28 過期（11 天前）；過期寬限期剩 78 天（至 2026-12-27）"),
+        "{text}"
+    );
+    assert_eq!(report.status.token(), "critical");
+    assert!(
+        report
+            .brief
+            .contains("cert_expired grace=78d renew=blocked"),
+        "{}",
+        report.brief
+    );
+}

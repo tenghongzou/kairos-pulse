@@ -29,7 +29,7 @@ pub mod trust;
 pub mod x509;
 
 #[cfg(test)]
-mod fake;
+pub mod fake;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

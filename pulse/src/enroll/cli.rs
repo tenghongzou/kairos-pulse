@@ -893,10 +893,11 @@ async fn run_async(args: &EnrollArgs, out: &Out) -> Report {
     let new_request =
         args.token.is_some() || args.token_file.is_some() || args.install_string.is_some();
     // 接續進行中的申請
-    if let Some(f) = existing
-        .as_ref()
-        .filter(|f| state::is_active(&f.state) && !f.is_grace())
-    {
+    if let Some(f) = existing.as_ref().filter(|f| {
+        state::is_active(&f.state)
+            && !f.is_grace()
+            && !(f.state == state::ISSUED && f.certificate.is_none())
+    }) {
         if !new_request && !args.force {
             return resume(args, out, &paths, f.clone(), &located).await;
         }
@@ -2243,6 +2244,166 @@ mod tests {
         assert_eq!(exit_for("PLS-E3001"), 2);
         assert_eq!(exit_for("PLS-E3301"), 11);
         assert_eq!(exit_for("PLS-E1107"), 4);
+    }
+
+    fn quiet_out() -> Out {
+        Out {
+            style: Style {
+                unicode: false,
+                color: false,
+            },
+            json: true,
+            quiet: true,
+            total: 6,
+        }
+    }
+
+    fn temp_config(server_port: u16) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("pulse-enroll-cli-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("pulse.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "# 測試
+[server]
+address = \"127.0.0.1\"
+port = {server_port}
+
+[log]
+level = \"info\"
+"
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn enroll_writes_config_then_refuses_a_second_enrollment() {
+        use crate::enroll::fake::{FakeKairos, Options};
+        let fake = FakeKairos::start(Options::default()).await;
+        let token = "KRT1-GE8Q-MMGW-WG5P-DP97";
+        fake.lock()
+            .add_token(token, ke::TokenApproval::Auto, "valid");
+        let cfg = temp_config(1);
+        let base = cfg.parent().unwrap().to_path_buf();
+        let args = EnrollArgs {
+            server: Some("127.0.0.1:1".into()),
+            enroll_server: Some(fake.endpoint.clone()),
+            token: Some(token.into()),
+            ca_pin: Some(fake.ca_pin.clone()),
+            non_interactive: true,
+            json: true,
+            config: Some(cfg.display().to_string()),
+            ..Default::default()
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        // 8443（127.0.0.1:1）連不上：已註冊但尚未確認連上，結束代碼 8
+        assert_eq!((r.result, r.exit), ("registered", 8), "{:?}", r.error);
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.starts_with("# 測試"), "保留註解：{text}");
+        assert!(
+            text.contains("client_cert = \"identity/client.pem\""),
+            "{text}"
+        );
+        assert!(text.contains("use_system_roots = false"), "{text}");
+        assert!(
+            text.contains("[enroll]"),
+            "註冊端點與推導值不同時寫 [enroll]：{text}"
+        );
+        let config = AppConfig::load_file(&cfg).unwrap();
+        assert_eq!(config.server.domain, "127.0.0.1");
+        assert!(base.join("identity/client.pem").is_file());
+        assert!(std::fs::read_dir(&base).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pulse.toml.bak-")
+        }));
+        // 再執行一次（沒有 --force）：PLS-E3301，結束代碼 11
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!((r.error.unwrap().code, r.exit), ("PLS-E3301", 11));
+    }
+
+    #[tokio::test]
+    async fn pending_request_can_be_cancelled_from_the_cli() {
+        use crate::enroll::fake::{FakeKairos, Options};
+        let fake = FakeKairos::start(Options::default()).await;
+        let token = "KRT1-GE8Q-MMGW-WG5P-DP97";
+        fake.lock()
+            .add_token(token, ke::TokenApproval::Manual, "valid");
+        let cfg = temp_config(1);
+        let base = cfg.parent().unwrap().to_path_buf();
+        let args = EnrollArgs {
+            server: Some("127.0.0.1:1".into()),
+            enroll_server: Some(fake.endpoint.clone()),
+            token: Some(token.into()),
+            ca_pin: Some(fake.ca_pin.clone()),
+            no_wait: true,
+            non_interactive: true,
+            json: true,
+            config: Some(cfg.display().to_string()),
+            ..Default::default()
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!((r.result, r.exit), ("pending", 7));
+        // 進行中：新的 token 不加 --force 時 PLS-E3305
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!((r.error.unwrap().code, r.exit), ("PLS-E3305", 11));
+        let cancel = EnrollArgs {
+            cancel: true,
+            yes: true,
+            json: true,
+            config: Some(cfg.display().to_string()),
+            ..Default::default()
+        };
+        let r = run_async(&cancel, &quiet_out()).await;
+        assert_eq!(
+            (r.result, r.exit),
+            ("cancelled", 0),
+            "{:?}",
+            r.issues.first().map(|i| &i.cause)
+        );
+        assert_eq!(r.data["withdrawal"]["result"], "ok");
+        assert_eq!(fake.lock().requests[0].state, ke::RequestState::Withdrawn);
+        assert!(!base.join("identity/enrollment.json").exists());
+        assert!(!base.join("identity/request.key").exists());
+        assert!(base.join("agent.id").exists(), "agent_id 保留");
+    }
+
+    #[tokio::test]
+    async fn token_rejected_by_token_check_leaves_no_files() {
+        use crate::enroll::fake::{FakeKairos, Options};
+        let fake = FakeKairos::start(Options::default()).await;
+        let token = "KRT1-GE8Q-MMGW-WG5P-DP97";
+        fake.lock()
+            .add_token(token, ke::TokenApproval::Auto, "expired");
+        let cfg = temp_config(1);
+        let base = cfg.parent().unwrap().to_path_buf();
+        let args = EnrollArgs {
+            server: Some("127.0.0.1:1".into()),
+            enroll_server: Some(fake.endpoint.clone()),
+            token: Some(token.into()),
+            ca_pin: Some(fake.ca_pin.clone()),
+            non_interactive: true,
+            json: true,
+            config: Some(cfg.display().to_string()),
+            ..Default::default()
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!((r.error.unwrap().code, r.exit), ("PLS-E3003", 6));
+        assert!(!base.join("identity/request.key").exists());
+        assert_eq!(fake.lock().hits("requests"), 0, "不送出申請");
+        // 非互動、沒有指紋：PLS-E1406，結束代碼 5，不連線
+        let args = EnrollArgs {
+            ca_pin: None,
+            ..args
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!((r.error.unwrap().code, r.exit), ("PLS-E1406", 5));
     }
 
     #[test]

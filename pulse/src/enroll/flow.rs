@@ -269,8 +269,6 @@ impl<'a> Driver<'a> {
                     SleepEnd::Elapsed if sleep_for < wait => return RunOutcome::TimedOut,
                     SleepEnd::Elapsed | SleepEnd::ClockAdjusted => {}
                 }
-            } else if deadline.is_some_and(|d| Instant::now() >= d) {
-                return RunOutcome::TimedOut;
             }
             if cancel.is_cancelled() {
                 return RunOutcome::Cancelled;
