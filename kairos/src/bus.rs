@@ -178,6 +178,20 @@ pub enum EventKind {
     },
     /// Kairos 的生命週期
     Lifecycle { phase: Lifecycle },
+    /// 通知管道的機密無法解開（`available = false`，`KRS-E5110`）或已恢復；告警服務在狀態轉換時發布
+    ChannelSecrets {
+        channel_id: String,
+        name: String,
+        available: bool,
+    },
+    /// 稽核日誌的定期自我驗證（[`crate::audit::monitor`]）：`ok = false` 時 `KRS-E6201`
+    /// （`reason` 為斷點的原因，`id` 為斷點的紀錄）。每次驗證都發布
+    AuditIntegrity {
+        ok: bool,
+        reason: Option<String>,
+        id: Option<i64>,
+        summary: String,
+    },
 }
 
 impl EventKind {
@@ -194,6 +208,8 @@ impl EventKind {
             EventKind::TlsReload { .. } => "tls_reload",
             EventKind::Condition { .. } => "condition",
             EventKind::Lifecycle { .. } => "lifecycle",
+            EventKind::ChannelSecrets { .. } => "channel_secrets",
+            EventKind::AuditIntegrity { .. } => "audit_integrity",
         }
     }
 }

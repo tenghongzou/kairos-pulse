@@ -2194,6 +2194,32 @@ async fn test_channel(
         }
     };
     let now = c.now_ms();
+    // 限速（每管道、每使用者）：超過時不送出、不寫發送紀錄
+    if let Err(l) = c.svc.check_test_limit(id, &c.actor, now) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            match l.scope {
+                "channel" => format!(
+                    "這個管道的測試通知太頻繁（{} 秒內最多 {} 次），請 {} 秒後再試",
+                    l.window_secs, l.limit, l.retry_after_secs
+                ),
+                _ => format!(
+                    "你的測試通知太頻繁（{} 分鐘內最多 {} 次），請 {} 秒後再試",
+                    l.window_secs / 60,
+                    l.limit,
+                    l.retry_after_secs
+                ),
+            },
+        )
+        .with_product_code(crate::alerts::test_limit::CODE_TEST_RATE_LIMITED)
+        .with_details(json!({
+            "scope": l.scope,
+            "limit": l.limit,
+            "window_secs": l.window_secs,
+        }))
+        .with_retry_after(l.retry_after_secs));
+    }
     let o = crate::alerts::notify::send_test(&ch, severity, &c.svc.dispatch_config(), now).await;
     let message = scrub(&o.message, &ch.secrets);
     if id.is_some() {

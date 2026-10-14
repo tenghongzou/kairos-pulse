@@ -519,10 +519,13 @@ fn main() -> ExitCode {
     };
 
     // 設定錯誤以 EXIT_CONFIG 結束，systemd 不再重試（RestartPreventExitStatus）
+    // 訊息帶產品代碼（KRS-E0101／E0401／E0402／E0201／E0202，與 --check-config 相同的判斷；
+    // 設計包 decisions/INTEGRATION.md §28.5），結束代碼不變
     let config = match AppConfig::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Kairos 啟動失敗: {}", e);
+            let code = diag::config_load_code(&e, config_path.as_deref());
+            eprintln!("錯誤 {code}：Kairos 啟動失敗: {e}");
             return ExitCode::from(EXIT_CONFIG);
         }
     };
@@ -531,7 +534,7 @@ fn main() -> ExitCode {
     let level = match config.log.level_filter() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Kairos 啟動失敗: {}", e);
+            eprintln!("錯誤 {}：Kairos 啟動失敗: {e}", diag::CODE_CONFIG_RANGE);
             return ExitCode::from(EXIT_CONFIG);
         }
     };

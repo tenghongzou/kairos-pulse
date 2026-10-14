@@ -89,6 +89,8 @@ fn config_errors_exit_3() {
     );
     // 明確指定的設定檔不存在
     kairos_exit(&k, &["--config", "missing.toml"], &[], 3, "missing.toml");
+    // 啟動時的設定檔錯誤帶產品代碼（設計包 §28.5）：不存在 KRS-E0401
+    kairos_exit(&k, &["--config", "missing.toml"], &[], 3, "KRS-E0401");
     // S1：未啟用 mTLS 又監聽非 loopback 位址
     let s1 = Kairos::named(&root, "kairos-s1", test_pki::CRL_EMPTY);
     std::fs::write(
@@ -101,6 +103,7 @@ fn config_errors_exit_3() {
     let broken = Kairos::named(&root, "kairos-broken", test_pki::CRL_EMPTY);
     std::fs::write(broken.dir.join("kairos.toml"), "[server\nlisten = 1\n").unwrap();
     kairos_exit(&broken, &CONFIG, &[], 3, "kairos.toml");
+    kairos_exit(&broken, &CONFIG, &[], 3, "KRS-E0101");
 
     let p = Pulse::new(&root, "pulse", k.port, GOOD);
     pulse_exit(
@@ -118,6 +121,7 @@ fn config_errors_exit_3() {
     let broken = Pulse::new(&root, "pulse-broken", k.port, GOOD);
     std::fs::write(broken.dir.join("pulse.toml"), "[server\nport = \"x\"\n").unwrap();
     pulse_exit(&broken, &[], 3, "無法載入設定");
+    pulse_exit(&broken, &[], 3, "PLS-E0101");
 }
 
 #[test]

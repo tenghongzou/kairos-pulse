@@ -656,4 +656,44 @@ mod tests {
         assert_eq!(backoff_ms(5), MAX_BACKOFF_MS);
         assert_eq!(backoff_ms(50), MAX_BACKOFF_MS);
     }
+
+    #[tokio::test]
+    async fn channels_whose_secrets_cannot_be_unsealed_are_never_contacted() {
+        // 機密無法解開：不連線（網址為空也不嘗試），直接以 KRS-E5110 失敗
+        let ch = Channel {
+            channel_id: "c-1".into(),
+            name: "x".into(),
+            kind: ChannelKind::Webhook,
+            enabled: true,
+            config: json!({"allow_http": true}),
+            secrets: json!({}),
+            state: store::STATE_SECRETS_UNAVAILABLE.into(),
+            consecutive_failures: 0,
+            failed_since: None,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: None,
+            last_error: None,
+            created_at: 0,
+            created_by: String::new(),
+            updated_at: 0,
+            updated_by: String::new(),
+        };
+        let cfg = DispatchConfig {
+            offset: FixedOffset::east_opt(8 * 3600).unwrap(),
+            console_url: String::new(),
+        };
+        let o = send_test(&ch, Severity::Critical, &cfg, 0).await;
+        assert!(!o.ok);
+        assert_eq!(o.code, Some("KRS-E5110"));
+        assert!(o.message.contains("alerts-secrets.key"));
+        let email = Channel {
+            kind: ChannelKind::Email,
+            ..ch
+        };
+        assert_eq!(
+            send_test(&email, Severity::Critical, &cfg, 0).await.code,
+            Some("KRS-E5110")
+        );
+    }
 }

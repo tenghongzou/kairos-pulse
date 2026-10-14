@@ -1056,8 +1056,18 @@ fn channels_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     match cmd.sub() {
         Some("list") => {
             let conn = db(cmd)?;
-            // 只顯示遮蔽值：不解密機密
-            let list = store::load_channels(&conn, None).map_err(db_failure)?;
+            // 只顯示狀態與遮蔽值；機密只解開來判斷能否使用（金鑰檔遺失或不成對時為
+            // secrets_unavailable，KRS-E5110），不輸出。金鑰檔無法讀取（權限）時不判斷
+            let checker = conn
+                .path()
+                .filter(|p| !p.is_empty())
+                .and_then(|p| {
+                    std::path::Path::new(p)
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                })
+                .and_then(|dir| crate::alerts::secrets::SecretBox::for_check(&dir).ok());
+            let list = store::load_channels(&conn, checker.as_ref()).map_err(db_failure)?;
             if cmd.json {
                 return Ok(ok_json(cmd, env.now, json!(list.iter().map(|c| json!({
                     "channel_id": c.channel_id, "name": c.name, "kind": c.kind, "enabled": c.enabled,
@@ -1085,6 +1095,8 @@ fn channels_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     (false, _, _) => "停用".to_string(),
                     (true, "failed", true) => "✗ 失敗".into(),
                     (true, "failed", false) => "[FAIL] 失敗".into(),
+                    (true, store::STATE_SECRETS_UNAVAILABLE, true) => "✗ 無法解開機密".into(),
+                    (true, store::STATE_SECRETS_UNAVAILABLE, false) => "[FAIL] 無法解開機密".into(),
                     (true, _, true) => "✓ 正常".into(),
                     (true, _, false) => "[ OK ] 正常".into(),
                 };
@@ -1106,8 +1118,15 @@ fn channels_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     c.last_error_code.clone().unwrap_or_else(|| "—".into()),
                 ]);
             }
+            let mut stdout = table(&rows);
+            if list.iter().any(|c| c.enabled && c.secrets_unavailable()) {
+                stdout.push_str(&format!(
+                    "\n{} 錯誤 KRS-E5110：有管道的機密無法解開，這些管道不會發送通知\n  原因：資料目錄的 alerts-secrets.key 遺失或與資料庫不成對。\n  處理方式：\n    1. 從備份還原金鑰檔：kairos db restore-keys <備份的 .keys 檔> --password-file <檔案>，再重新啟動 Kairos。\n    2. 或在主控台重新輸入這些管道的機密。\n",
+                    if env.unicode { "✗" } else { "[FAIL]" }
+                ));
+            }
             Ok(Output {
-                stdout: table(&rows),
+                stdout,
                 ..Default::default()
             })
         }

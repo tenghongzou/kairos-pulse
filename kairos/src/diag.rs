@@ -230,6 +230,27 @@ fn config_file(path: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// [`AppConfig::load`] 失敗的產品代碼（`--check-config`、啟動與 CLI 共用；設計包 §28.3、§28.5 #1）：
+/// 值超出範圍 `KRS-E0201`、互相矛盾 `KRS-E0202`、`--config` 指定的檔案不存在 `KRS-E0401`、
+/// 無法讀取 `KRS-E0402`、其餘（語法、型別）`KRS-E0101`
+pub fn config_load_code(e: &std::io::Error, path: Option<&Path>) -> &'static str {
+    if let Some(c) = kp_obs::logfmt::find_code(&e.to_string()) {
+        if c == "KRS-E0202" {
+            "KRS-E0202"
+        } else {
+            CODE_CONFIG_RANGE
+        }
+    } else if e.kind() == ErrorKind::InvalidInput {
+        CODE_CONFIG_RANGE
+    } else if e.kind() == ErrorKind::NotFound {
+        CODE_CONFIG_MISSING
+    } else if config_file(path).is_some_and(|f| std::fs::read(f).is_err()) {
+        CODE_CONFIG_UNREADABLE
+    } else {
+        CODE_CONFIG_LOAD
+    }
+}
+
 /// 目錄是否可寫（建立一個暫存檔再刪除）；不存在時為 `None`
 fn dir_writable(dir: &Path) -> Option<Result<(), String>> {
     if !dir.is_dir() {
@@ -276,21 +297,7 @@ pub fn check(path: Option<&Path>) -> CheckReport {
         }
         Err(e) => {
             let msg = e.to_string();
-            let code = if let Some(c) = kp_obs::logfmt::find_code(&msg) {
-                if c == "KRS-E0202" {
-                    "KRS-E0202"
-                } else {
-                    CODE_CONFIG_RANGE
-                }
-            } else if e.kind() == ErrorKind::InvalidInput {
-                CODE_CONFIG_RANGE
-            } else if e.kind() == ErrorKind::NotFound {
-                CODE_CONFIG_MISSING
-            } else if file.as_ref().is_some_and(|f| std::fs::read(f).is_err()) {
-                CODE_CONFIG_UNREADABLE
-            } else {
-                CODE_CONFIG_LOAD
-            };
+            let code = config_load_code(&e, path);
             checks.push(
                 Check::new("config", "設定檔", Outcome::Error, "無法載入")
                     .code(code)

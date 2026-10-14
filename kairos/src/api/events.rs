@@ -182,6 +182,8 @@ pub fn event_of(change: &HostChange, is_new: bool) -> (&'static str, Value) {
         HostChangeKind::Offline(reason) => {
             data["status"] = json!("offline");
             data["reason"] = json!(reason.as_str());
+            // 0.7 過渡期：0.4～0.6 的名稱（API.md 第 5.2 節）
+            data["reason_legacy"] = json!(crate::registry::legacy_offline_reason(reason.as_str()));
             "host.offline"
         }
     };
@@ -482,7 +484,8 @@ mod tests {
         };
         let (kind, data) = event_of(&change, false);
         assert_eq!(kind, "host.offline");
-        assert_eq!(data["reason"], "timeout");
+        assert_eq!(data["reason"], "idle_timeout");
+        assert_eq!(data["reason_legacy"], "timeout");
         assert_eq!(data["status"], "offline");
         assert_eq!(data["ip"], "10.30.3.27");
         assert_eq!(data["at"], "2025-10-13T06:03:27.123Z");

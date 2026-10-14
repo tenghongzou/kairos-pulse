@@ -68,6 +68,8 @@ pub mod ids {
     pub const CHANNEL_FAILED: &str = "sys.channel_failed";
     pub const RESTARTED: &str = "sys.restarted";
     pub const DOWNTIME: &str = "sys.downtime";
+    /// 稽核日誌完整性（0.7；設計包 `decisions/INTEGRATION.md` §28.5 #10）
+    pub const AUDIT_INTEGRITY: &str = "sys.audit_integrity";
 }
 
 fn builtin(
@@ -337,6 +339,13 @@ pub fn builtins() -> Vec<Rule> {
             Critical,
             json!({"min_secs": 300}),
             "非計畫性停機超過 5 分鐘（不在維護時段內），供上線率報表標註。",
+        ),
+        sys(
+            ids::AUDIT_INTEGRITY,
+            "稽核日誌完整性",
+            Emergency,
+            json!({"code": "KRS-E6201"}),
+            "定期自我驗證（audit.verify_interval_hours，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復。",
         ),
     ]
 }

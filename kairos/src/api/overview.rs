@@ -59,6 +59,7 @@ fn brief(h: &HostView, now_ms: i64) -> Value {
         "last_seen": ts_ms(h.last_seen),
         "offline_for_secs": h.offline_for_secs(now_ms),
         "offline_reason": h.offline_reason,
+        "offline_reason_legacy": h.offline_reason.map(crate::registry::legacy_offline_reason),
         "cpu_usage": h.cpu(),
         "memory_used_ratio": h.mem_ratio(),
     })

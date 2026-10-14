@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `/healthz` | 不需要 | 存活：行程在服務請求就回 200 `{"status":"ok"}`；關機中 503 |
 //! | `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫、儲存不是 `storage_unavailable`、不在關機中；不符時 503。只回傳各項的狀態字，不含版本、路徑、數量與位址 |
-//! | `/metrics` | `observability.metrics_token_file` 設定時必須帶 `Authorization: Bearer <token>`；未設定時只接受 loopback 來源 | Prometheus 文字格式 |
+//! | `/metrics` | `observability.metrics_token_file` 設定時必須帶 `Authorization: Bearer <token>`；未設定時只接受 loopback 來源，且請求帶有反向代理的轉送標頭（[`PROXY_HEADERS`]）時一律拒絕（經代理轉送時來源都是 loopback，不能據以判斷） | Prometheus 文字格式 |
 //!
 //! 提供的位置：主控台的監聽（`console.listen`，HTTPS；`observability.on_console = false` 時不提供），
 //! 以及可選的純 HTTP 監聽 `observability.listen`（只有這三個端點，在自己的執行緒與 runtime 上執行，
@@ -16,7 +16,7 @@
 
 use chrono::{DateTime, Utc};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{self, HeaderValue};
+use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -47,6 +47,28 @@ pub const DB_BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 /// 純 HTTP 監聽的同時連線上限
 pub const MAX_PROBE_CONNECTIONS: usize = 64;
 
+/// 反向代理轉送時會加上的標頭（RFC 7239 `Forwarded`、慣用的 `X-Forwarded-*`、`X-Real-IP`，以及
+/// RFC 9110 的 `Via`）。未設定 `observability.metrics_token_file` 時，帶有任何一個的 `/metrics`
+/// 請求一律拒絕：經同一台主機上的反向代理轉送時來源是 loopback，「只接受 loopback」會被繞過。
+/// 不帶這些標頭的代理（例如 nginx 的預設設定）無法由 Kairos 發現，INSTALL 要求經代理時必須設定 token
+pub const PROXY_HEADERS: [&str; 6] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "via",
+];
+
+/// 〔暫定〕`/metrics` 經反向代理轉送、但沒有設定 `observability.metrics_token_file` 而拒絕
+/// （子類別 03「安全預設」；正式號碼待設計包分配）
+pub const CODE_METRICS_PROXIED: &str = "KRS-W0304";
+
+/// 請求是否帶有反向代理的轉送標頭（[`PROXY_HEADERS`]）
+pub fn is_proxied(headers: &HeaderMap) -> bool {
+    PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
 /// 端點需要的狀態（啟動時建立，主控台與純 HTTP 監聽共用）
 pub struct ObsContext {
     pub config: Arc<AppConfig>,
@@ -66,6 +88,8 @@ pub struct ObsContext {
     pub metrics_token: Option<String>,
     /// 告警服務（啟動時；`/metrics` 的告警引擎狀態）
     pub alerts: Option<Arc<crate::alerts::AlertService>>,
+    /// 已記錄過「經反向代理而拒絕」的 WARN（每次啟動只記一次，之後只計數）
+    proxied_warned: AtomicBool,
 }
 
 /// [`ObsContext::new`] 的參數
@@ -101,10 +125,22 @@ impl ObsContext {
             db: p.db_path.map(DbProbe::new),
             metrics_token,
             alerts: p.alerts,
+            proxied_warned: AtomicBool::new(false),
         })
     }
 
-    /// `/metrics` 是否允許這個請求
+    /// 沒有 token 時，帶有轉送標頭的 `/metrics` 請求：拒絕並記一次 WARN（含代碼）
+    fn reject_proxied(&self, peer: SocketAddr) {
+        if !self.proxied_warned.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                event = "observability.metrics_proxied", code = CODE_METRICS_PROXIED;
+                "警告 {CODE_METRICS_PROXIED}：/metrics 的請求帶有反向代理的轉送標頭（來源 {}），但沒有設定 observability.metrics_token_file，已拒絕（403）。經反向代理提供 /metrics 時必須設定 token（INSTALL 9.2a）；之後同樣的請求只計數不再記錄",
+                peer.ip()
+            );
+        }
+    }
+
+    /// `/metrics` 是否允許這個請求（不含轉送標頭的檢查，見 [`handle`]）
     pub fn metrics_allowed(&self, peer: SocketAddr, authorization: Option<&str>) -> bool {
         match &self.metrics_token {
             Some(token) => authorization
@@ -960,9 +996,12 @@ pub async fn handle(
     method: &Method,
     path: &str,
     query: Option<&str>,
-    authorization: Option<&str>,
+    headers: &HeaderMap,
     peer: SocketAddr,
 ) -> Response<ApiBody> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
     let m = metrics::global();
     if method != Method::GET && method != Method::HEAD {
         let mut r = json_response(
@@ -1000,7 +1039,11 @@ pub async fn handle(
             )
         }
         _ => {
-            if !ctx.metrics_allowed(peer, authorization) {
+            let proxied = ctx.metrics_token.is_none() && is_proxied(headers);
+            if proxied {
+                ctx.reject_proxied(peer);
+            }
+            if proxied || !ctx.metrics_allowed(peer, authorization) {
                 m.probe(2, 2);
                 let (status, reason) = if ctx.metrics_token.is_some() {
                     (StatusCode::UNAUTHORIZED, "unauthorized")
@@ -1109,11 +1152,15 @@ async fn serve(listener: tokio::net::TcpListener, ctx: Arc<ObsContext>) {
                 async move {
                     let path = req.uri().path().to_string();
                     let resp = if is_probe_path(&path) {
-                        let auth = req
-                            .headers()
-                            .get(header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok());
-                        handle(&ctx, req.method(), &path, req.uri().query(), auth, peer).await
+                        handle(
+                            &ctx,
+                            req.method(),
+                            &path,
+                            req.uri().query(),
+                            req.headers(),
+                            peer,
+                        )
+                        .await
                     } else {
                         json_response(StatusCode::NOT_FOUND, &json!({"status": "not_found"}))
                     };

@@ -602,8 +602,14 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// 失敗：連續 3 次發送失敗（`failed`），或機密無法解開（`secrets_unavailable`，不會嘗試發送）
     pub fn failed(&self) -> bool {
-        self.state == "failed"
+        self.state == "failed" || self.secrets_unavailable()
+    }
+
+    /// 機密無法解開（`alerts-secrets.key` 遺失或與資料庫不成對；[`super::store::STATE_SECRETS_UNAVAILABLE`]）
+    pub fn secrets_unavailable(&self) -> bool {
+        self.state == super::store::STATE_SECRETS_UNAVAILABLE
     }
 
     /// 是否接收這個嚴重度的通知：警告只送 Email（`alerts-ux.md` §2.1.1；Webhook 管道可以設定

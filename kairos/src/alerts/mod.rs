@@ -27,6 +27,7 @@ pub mod rules;
 pub mod scope;
 pub mod secrets;
 pub mod store;
+pub mod test_limit;
 
 #[cfg(test)]
 mod bench;
@@ -144,6 +145,10 @@ pub struct AlertService {
     offline_since: Mutex<HashMap<String, i64>>,
     pub started_ms: i64,
     stopped: AtomicBool,
+    /// 機密無法解開的管道（狀態轉換時記 WARN 並發布內部事件，[`AlertService::watch_secrets`]）
+    secrets_missing: Mutex<HashSet<String>>,
+    /// 「寄送測試通知」的限速（每管道、每使用者）
+    test_limits: Mutex<test_limit::TestLimiter>,
 }
 
 fn db_err(e: DbError) -> String {
@@ -319,6 +324,8 @@ impl AlertService {
             offline_since: Mutex::new(HashMap::new()),
             started_ms: now,
             stopped: AtomicBool::new(false),
+            secrets_missing: Mutex::new(HashSet::new()),
+            test_limits: Mutex::new(test_limit::TestLimiter::default()),
         });
         // 啟動時的事件（重新啟動、停機）先寫入
         let (out, n_rules, n_open) = {
@@ -585,6 +592,7 @@ impl AlertService {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let channels = self.dispatcher.channels();
+        self.watch_secrets(&channels);
         let mut engine = self.engine.lock().await;
         let (conditions, checked) = {
             let mut probe = self.probe.lock().unwrap_or_else(|e| e.into_inner());
@@ -969,6 +977,71 @@ impl AlertService {
             open,
             channels,
         }
+    }
+
+    /// 機密無法解開的管道：狀態轉換時記一次 WARN（`KRS-E5110`）並發布內部事件
+    /// （[`crate::bus::EventKind::ChannelSecrets`]）；事件本身由「通知管道失敗」系統規則開立
+    fn watch_secrets(&self, channels: &[model::Channel]) {
+        let now: HashSet<String> = channels
+            .iter()
+            .filter(|c| c.secrets_unavailable())
+            .map(|c| c.channel_id.clone())
+            .collect();
+        let mut prev = self
+            .secrets_missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *prev == now {
+            return;
+        }
+        for c in channels {
+            let id = &c.channel_id;
+            match (prev.contains(id), now.contains(id)) {
+                (false, true) => {
+                    log::warn!(
+                        event = "alerts.channel.secrets_unavailable", code = "KRS-E5110";
+                        "錯誤 KRS-E5110：通知管道「{}」（{id}）的機密無法解開：資料目錄的 alerts-secrets.key 遺失或與資料庫不成對。這個管道不會發送通知；請從備份還原金鑰檔（kairos db restore-keys）後重新啟動，或在主控台重新輸入機密",
+                        c.name.escape_debug()
+                    );
+                    self.registry
+                        .bus()
+                        .publish(crate::bus::EventKind::ChannelSecrets {
+                            channel_id: id.clone(),
+                            name: c.name.clone(),
+                            available: false,
+                        });
+                }
+                (true, false) => {
+                    log::info!(
+                        event = "alerts.channel.secrets_restored";
+                        "通知管道「{}」（{id}）的機密已可解開",
+                        c.name.escape_debug()
+                    );
+                    self.registry
+                        .bus()
+                        .publish(crate::bus::EventKind::ChannelSecrets {
+                            channel_id: id.clone(),
+                            name: c.name.clone(),
+                            available: true,
+                        });
+                }
+                _ => {}
+            }
+        }
+        *prev = now;
+    }
+
+    /// 「寄送測試通知」的限速；超過時回傳限制的內容
+    pub fn check_test_limit(
+        &self,
+        channel: Option<&str>,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), test_limit::Limited> {
+        self.test_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check(channel, actor, now)
     }
 
     /// 派送端的管道狀態（API 的「最近發送」與狀態欄）
