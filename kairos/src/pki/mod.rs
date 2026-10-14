@@ -19,6 +19,7 @@
 pub mod csr;
 pub mod issue;
 pub mod manage;
+pub mod queue;
 pub mod store;
 pub mod x509;
 

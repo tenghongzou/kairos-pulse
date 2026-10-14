@@ -625,8 +625,8 @@ async fn respond_with(
 /// 新註冊建立申請的結果
 enum Created {
     /// 冪等：同一個申請
-    Existing(RequestRow, Option<CertRow>),
-    New(RequestRow, bool),
+    Existing(Box<(RequestRow, Option<CertRow>)>),
+    New(Box<RequestRow>, bool),
 }
 
 async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, EnrollError> {
@@ -666,7 +666,7 @@ async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>,
     if token
         .allowed_agent_ids
         .as_ref()
-        .is_some_and(|ids| !ids.iter().any(|i| *i == checked.agent_id))
+        .is_some_and(|ids| !ids.contains(&checked.agent_id))
     {
         return Err(invalid());
     }
@@ -781,10 +781,11 @@ async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>,
         .await
         .map_err(db_err)?;
     let (row, auto) = match created {
-        Ok(Created::Existing(r, cert)) => {
+        Ok(Created::Existing(b)) => {
+            let (r, cert) = *b;
             return idempotent(ctx, &r, cert.as_ref(), &poll_hash).await;
         }
-        Ok(Created::New(r, auto)) => (r, auto),
+        Ok(Created::New(r, auto)) => (*r, auto),
         Err(e) => return Err(e),
     };
     // 15. 自動核准：線上簽發
@@ -867,7 +868,7 @@ fn create_in_tx(
             Some(s) => ps::get_cert(&tx, s)?,
             None => None,
         };
-        return Ok(Ok(Created::Existing(r, cert)));
+        return Ok(Ok(Created::Existing(Box::new((r, cert)))));
     }
     let Some(token) = store::get_token(&tx, token_id)? else {
         return Ok(Err(EnrollError::new(
@@ -1041,7 +1042,7 @@ fn create_in_tx(
     for id in &replaced {
         svc.notify_request(id);
     }
-    Ok(Ok(Created::New(row, auto)))
+    Ok(Ok(Created::New(Box::new(row), auto)))
 }
 
 fn new_uuid() -> Result<String, DbError> {
@@ -1269,9 +1270,9 @@ fn verify_grace_identity(
 
 /// 過期續簽在交易中的判定（第 8～16 步）
 enum GraceOutcome {
-    Respond(RequestRow, Option<CertRow>),
+    Respond(Box<(RequestRow, Option<CertRow>)>),
     /// 建立了申請；`true`：立即簽發
-    Created(RequestRow, bool),
+    Created(Box<RequestRow>, bool),
     Error(EnrollError, bool),
 }
 
@@ -1361,8 +1362,9 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
             }
             Err(e)
         }
-        GraceOutcome::Respond(r, cert) => respond_with(ctx, &r, cert.as_ref()).await,
+        GraceOutcome::Respond(b) => respond_with(ctx, &b.0, b.1.as_ref()).await,
         GraceOutcome::Created(r, issue) => {
+            let r = *r;
             if issue {
                 if let Some((r2, cert)) = issue_now(svc, &r.request_id, "system").await? {
                     info!(
@@ -1460,14 +1462,14 @@ fn grace_in_tx(
                 if latest {
                     store::set_last_grace_attempt(&tx, agent, &attempt("issued"))?;
                     tx.commit()?;
-                    return Ok(GraceOutcome::Respond(r, cert));
+                    return Ok(GraceOutcome::Respond(Box::new((r, cert))));
                 }
             }
             s if s.is_pending() => {
                 store::update_poll_secret(&tx, &r.request_id, &sha256(&checked.poll_secret))?;
                 let r = store::get_request(&tx, &r.request_id)?.unwrap_or(r);
                 tx.commit()?;
-                return Ok(GraceOutcome::Respond(r, None));
+                return Ok(GraceOutcome::Respond(Box::new((r, None))));
             }
             _ => {}
         }
@@ -1647,7 +1649,7 @@ fn grace_in_tx(
         },
     )?;
     tx.commit()?;
-    Ok(GraceOutcome::Created(row, !needs_approval))
+    Ok(GraceOutcome::Created(Box::new(row), !needs_approval))
 }
 
 // ---------------------------------------------------------------------------

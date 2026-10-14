@@ -34,7 +34,9 @@ pub struct RenewRequest {
     pub seq: u64,
     pub request_id: String,
     pub csr: String,
+    /// 只記錄、不判定時鐘（連線本身已以 mTLS 證明身分）
     #[serde(default)]
+    #[allow(dead_code)]
     pub sent_at: Option<String>,
 }
 
@@ -55,6 +57,7 @@ pub struct Deregister {
     #[serde(default)]
     pub pulse_version: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub sent_at: Option<String>,
 }
 

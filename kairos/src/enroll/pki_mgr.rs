@@ -491,6 +491,9 @@ pub fn issued_via(kind: DbKind) -> &'static str {
     }
 }
 
+/// [`issue_approved`] 的結果：(簽發的申請, 失敗的 (request_id, 原因))
+pub type IssuedBatch = (Vec<RequestRow>, Vec<(String, String)>);
+
 /// 把待簽發的申請（核准但尚未簽發）簽發：常駐行程每 2 秒（CLI 核准的申請）與核准後立即呼叫。
 /// 回傳 (簽發的 request_id, 失敗的 (request_id, 原因))
 pub fn issue_approved(
@@ -499,7 +502,7 @@ pub fn issue_approved(
     eff: &Effective,
     now_ms: i64,
     limit: usize,
-) -> Result<(Vec<RequestRow>, Vec<(String, String)>), DbError> {
+) -> Result<IssuedBatch, DbError> {
     if mgr.active_issuer().is_err() {
         return Ok((Vec::new(), Vec::new()));
     }

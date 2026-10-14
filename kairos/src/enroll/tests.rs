@@ -227,7 +227,6 @@ impl Env {
             data_dir: data.clone(),
             db_path: super::db_path(&self.config, &data),
             shutdown: self.shutdown.clone(),
-            registry: None,
             other_listens: Vec::new(),
             clock: Arc::new(move || {
                 chrono::Utc::now().timestamp_millis() + offset.load(Ordering::Relaxed)
@@ -477,7 +476,7 @@ async fn manual_enrollment_is_approved_and_delivered_with_the_pinned_ca() {
     let mut conn = env.conn();
     ops::approve(
         &mut conn,
-        &[r.request_id.clone()],
+        std::slice::from_ref(&r.request_id),
         "admin.chen",
         None,
         None,
@@ -700,7 +699,7 @@ async fn grace_period_exceeded_and_override() {
     let mut conn = env.conn();
     ops::grace_override(
         &mut conn,
-        &[a.id.clone()],
+        std::slice::from_ref(&a.id),
         env.now() + 7 * DAY,
         "admin",
         None,
@@ -992,7 +991,7 @@ async fn revocation_regenerates_the_crl_and_blocks_grace_renewal() {
     let mut conn = env.conn();
     ops::revoke(
         &mut conn,
-        &[serial.clone()],
+        std::slice::from_ref(&serial),
         crate::pki::issue::Reason::KeyCompromise,
         "測試",
         "admin",

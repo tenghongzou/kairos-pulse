@@ -22,7 +22,8 @@ use crate::api::http::ApiBody;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnrollError {
     pub code: EnrollErrorCode,
-    pub body: ErrorBody,
+    /// 錯誤本文（裝箱：讓 `Result<_, EnrollError>` 保持精簡）
+    pub body: Box<ErrorBody>,
     /// `Retry-After`（秒）
     pub retry_after: Option<u64>,
     /// 405 的 `Allow`
@@ -33,7 +34,7 @@ impl EnrollError {
     pub fn new(code: EnrollErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            body: ErrorBody::new(code, message),
+            body: Box::new(ErrorBody::new(code, message)),
             retry_after: None,
             allow: None,
         }
@@ -95,7 +96,7 @@ impl EnrollError {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = ErrorResponse {
             server_time: format_rfc3339_ms(now_ms),
-            error: self.body,
+            error: *self.body,
         };
         let mut resp = json_response(status, &body);
         if let Some(secs) = self.retry_after
@@ -260,7 +261,7 @@ async fn collect(mut body: Incoming, len: usize) -> Result<Bytes, EnrollError> {
 
 /// 解析 JSON 本文；失敗時 400 `bad_request`（`field` 盡量指出是哪一個欄位）
 pub fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, EnrollError> {
-    if !bytes.first().is_some_and(|b| *b == b'{') && !bytes.iter().any(|b| *b == b'{') {
+    if !bytes.contains(&b'{') {
         return Err(EnrollError::bad_request(
             "body",
             "request body must be a JSON object",

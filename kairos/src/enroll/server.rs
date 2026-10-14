@@ -274,12 +274,11 @@ impl Listener {
             }
         }
         let listener = TcpListener::bind(listen.trim()).await.map_err(|e| {
-            let msg = if e.kind() == std::io::ErrorKind::AddrInUse {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
                 format!("錯誤 KRS-E2001：無法監聽 {listen}：連接埠已被其他程式佔用（{e}）；應在監聽但未監聽，每 2 秒重試")
             } else {
                 format!("無法監聽 {listen}：{e}")
-            };
-            msg
+            }
         })?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         Ok((listener, addr))

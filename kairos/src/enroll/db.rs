@@ -37,6 +37,9 @@ impl From<rusqlite::Error> for DbError {
     }
 }
 
+/// 寫入連線與開啟時的檔案身分
+type WriterSlot = Option<(Connection, Option<(u64, u64)>)>;
+
 struct Reader {
     conn: Connection,
     file: Option<(u64, u64)>,
@@ -45,7 +48,7 @@ struct Reader {
 /// 寫入連線與唯讀連線池
 pub struct EnrollDb {
     path: PathBuf,
-    writer: Mutex<Option<(Connection, Option<(u64, u64)>)>>,
+    writer: Mutex<WriterSlot>,
     readers: Mutex<Vec<Reader>>,
     read_permits: Arc<Semaphore>,
 }
@@ -58,10 +61,6 @@ impl EnrollDb {
             readers: Mutex::new(Vec::new()),
             read_permits: Arc::new(Semaphore::new(MAX_READERS)),
         })
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
     }
 
     /// 以寫入連線執行 `f`（目前的執行緒；呼叫端必須已在 blocking 執行緒上）。失敗時關閉連線，下次重新開啟

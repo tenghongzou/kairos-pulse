@@ -42,7 +42,6 @@ use tokio::sync::Notify;
 
 use crate::config::{AppConfig, PkiMode};
 use crate::per_ip::Allowlist;
-use crate::registry::Registry;
 use crate::settings::{self, Effective};
 use crate::shutdown::Shutdown;
 use db::{DbError, EnrollDb};
@@ -117,6 +116,9 @@ pub struct EnrollStats {
     pub clock_since_log: AtomicU64,
 }
 
+/// 長輪詢的登記：(通知, 等待中的數量, 登記時的狀態)
+type Waiter = (Arc<Notify>, usize, String);
+
 /// 註冊服務
 pub struct EnrollService {
     pub config: Arc<AppConfig>,
@@ -132,7 +134,7 @@ pub struct EnrollService {
     /// request_id → (nonce, 到期時間)
     nonces: Mutex<HashMap<String, (String, i64)>>,
     /// 長輪詢中的申請 → 通知
-    waiters: Mutex<HashMap<String, (Arc<Notify>, usize, String)>>,
+    waiters: Mutex<HashMap<String, Waiter>>,
     pub listen: Mutex<ListenState>,
     /// 簽章內容最後一行可接受的註冊端點名稱（ENROLL.md 第 16.3 節）
     names: RwLock<Vec<String>>,
@@ -147,8 +149,6 @@ pub struct EnrollService {
     pub clock_rejected: Mutex<HashMap<String, (Option<String>, i64)>>,
     /// agent_id → (token_id, 時間)：以這個 token 送出、目前被 429 延後（部署進度的 `queued`）
     pub queued: Mutex<HashMap<String, (String, i64)>>,
-    /// 8443 的狀態表（輪替後撤銷、除役時使用）
-    pub registry: Option<Arc<Registry>>,
     /// 喚醒背景工作（主控台修改模式後立即生效）
     wake: Notify,
     pub shutdown: Arc<Shutdown>,
@@ -235,7 +235,6 @@ pub struct StartParams {
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
     pub shutdown: Arc<Shutdown>,
-    pub registry: Option<Arc<Registry>>,
     /// 8443、主控台的監聽位址（`KRS-E0202` 的檢查）
     pub other_listens: Vec<std::net::SocketAddr>,
     pub clock: Clock,
@@ -305,7 +304,6 @@ impl EnrollService {
             first_used: Mutex::new(HashSet::new()),
             clock_rejected: Mutex::new(HashMap::new()),
             queued: Mutex::new(HashMap::new()),
-            registry: p.registry.clone(),
             wake: Notify::new(),
             shutdown: p.shutdown.clone(),
             started_ms: now,
@@ -879,7 +877,6 @@ pub fn humanize_ms(ms: i64) -> String {
 /// 啟動中的註冊服務（自己的 runtime）
 pub struct Running {
     pub service: Arc<EnrollService>,
-    pub listener: Arc<server::Listener>,
     task: Option<tokio::task::JoinHandle<()>>,
     runtime: Option<tokio::runtime::Runtime>,
 }
@@ -927,7 +924,6 @@ pub async fn start(p: StartParams) -> Result<Running, String> {
     let task = runtime.spawn(service.clone().run(listener.clone()));
     Ok(Running {
         service,
-        listener,
         task: Some(task),
         runtime: Some(runtime),
     })

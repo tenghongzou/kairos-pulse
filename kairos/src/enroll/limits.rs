@@ -75,12 +75,6 @@ impl Gcra {
         Err(wait.max(Duration::from_millis(1)))
     }
 
-    /// 不扣額度，只看是否還有額度
-    pub fn has_token(&mut self, now: Instant) -> bool {
-        self.refill(now);
-        self.tokens >= 1.0
-    }
-
     /// 補充後是否已滿（閒置，可以清掉）
     pub fn is_full(&mut self, now: Instant) -> bool {
         self.refill(now);
@@ -124,11 +118,6 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
             .or_insert_with(|| Gcra::new(capacity, rate, now));
         b.retune(capacity, rate);
         b.take(now, max_wait)
-    }
-
-    /// 筆數（測試、系統健康）
-    pub fn len(&self) -> usize {
-        self.map.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// 清掉已補滿的項目
@@ -206,10 +195,6 @@ impl InvalidTracker {
             policy: Mutex::new(policy),
             state: Mutex::new(InvalidState::default()),
         }
-    }
-
-    pub fn set_policy(&self, policy: InvalidPolicy) {
-        *self.policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
     }
 
     /// 載入資料庫中的封鎖（重新啟動後仍有效）
@@ -299,6 +284,7 @@ impl InvalidTracker {
     }
 
     /// 解除封鎖
+    #[cfg(test)]
     pub fn unblock(&self, source: IpAddr, class: InvalidClass) -> bool {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.blocks.remove(&(source, class)).is_some()
@@ -372,6 +358,7 @@ impl<K: Eq + Hash + Clone> Slots<K> {
     }
 
     /// 目前使用中的名額
+    #[cfg(test)]
     pub fn in_use(&self) -> usize {
         self.total.load(Ordering::Relaxed)
     }

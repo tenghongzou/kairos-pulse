@@ -368,16 +368,6 @@ pub fn ca_ids_with_pending_revocations(
     rows.collect()
 }
 
-/// 下一個尚未生效的撤銷時間（除役的 10 分鐘視窗）
-pub fn next_pending_effective(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        "SELECT min(revoke_effective_at) FROM pki_certificates
-         WHERE revoked_at IS NOT NULL AND crl_number IS NULL AND revoke_effective_at > ?1",
-        [now_ms],
-        |r| r.get(0),
-    )
-}
-
 /// CRL 的一個版本
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrlRow {

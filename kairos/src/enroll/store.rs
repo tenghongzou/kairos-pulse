@@ -853,14 +853,6 @@ pub fn upsert_block(conn: &Connection, b: &BlockRow) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// 解除封鎖（主控台；本版只供測試與之後的端點）
-pub fn delete_block(conn: &Connection, source: &str, class: &str) -> rusqlite::Result<usize> {
-    conn.execute(
-        "DELETE FROM enroll_blocks WHERE source = ?1 AND class = ?2",
-        params![source, class],
-    )
-}
-
 /// 封鎖到期、且 24 小時沒有再犯的列刪除
 pub fn purge_blocks(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
     conn.execute(
@@ -951,6 +943,7 @@ pub fn audit(conn: &Connection, at_ms: i64, a: &Audit<'_>) -> rusqlite::Result<(
 }
 
 /// 最近的稽核事件（測試與 CLI）：(時間, 執行者, 動作, 對象, 結果, 代碼)
+#[cfg(test)]
 #[allow(clippy::type_complexity)]
 pub fn recent_audit(
     conn: &Connection,
