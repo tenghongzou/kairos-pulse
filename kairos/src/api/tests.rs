@@ -622,7 +622,11 @@ async fn hosts_metrics_overview_and_health_over_https() {
     assert_eq!(a["os"]["name"], "Ubuntu");
     assert_eq!(a["last_report"]["cpu_usage"], 30.0);
     let b = data.iter().find(|h| h["agent_id"] == B).unwrap();
-    assert_eq!(b["status_detail"]["offline_reason"], "connection_closed");
+    assert_eq!(b["status_detail"]["offline_reason"], "agent_closed");
+    assert_eq!(
+        b["status_detail"]["offline_reason_legacy"],
+        "connection_closed"
+    );
     let c = data.iter().find(|h| h["agent_id"] == C).unwrap();
     assert_eq!(c["ip"], "10.0.0.1");
     assert_eq!(c["durable"], Value::Null);
@@ -657,6 +661,15 @@ async fn hosts_metrics_overview_and_health_over_https() {
     assert_eq!(
         ids(&get(&f, "/api/v1/hosts?offline_reason=connection_closed").await),
         [B]
+    );
+    // 0.7 的名稱（與 Webhook、/metrics 相同）；舊名稱在過渡期仍接受（上一行）
+    assert_eq!(
+        ids(&get(&f, "/api/v1/hosts?offline_reason=agent_closed").await),
+        [B]
+    );
+    assert_eq!(
+        ids(&get(&f, "/api/v1/hosts?offline_reason=idle_timeout,timeout").await),
+        Vec::<String>::new()
     );
     // 游標分頁：每頁 1 台，3 頁走完
     let mut seen = Vec::new();
@@ -988,7 +1001,8 @@ async fn sse_pushes_host_changes_and_resumes_with_last_event_id() {
     let first_id = e.id.clone().unwrap();
     assert!(f.registry.disconnect(A, 21, t));
     let e = s.wait_for("host.offline").await;
-    assert_eq!(e.data["reason"], "connection_closed");
+    assert_eq!(e.data["reason"], "agent_closed");
+    assert_eq!(e.data["reason_legacy"], "connection_closed");
     let _d = f
         .registry
         .register(22, hello(A, "hmi-07", "10.30.3.27:2"), t, Utc::now())

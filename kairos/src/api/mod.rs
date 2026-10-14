@@ -575,11 +575,8 @@ async fn handle_api(
     if let Some(obs) = &ctx.obs
         && crate::probe::is_probe_path(&path)
     {
-        let auth = req
-            .headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-        let resp = crate::probe::handle(obs, &method, &path, req.uri().query(), auth, peer).await;
+        let resp =
+            crate::probe::handle(obs, &method, &path, req.uri().query(), req.headers(), peer).await;
         crate::metrics::global().api_request(&path, resp.status().as_u16());
         return resp;
     }

@@ -270,6 +270,8 @@ pub struct Engine {
     pub(super) decommissions: VecDeque<(i64, String)>,
     pub(super) evictions: VecDeque<i64>,
     pub(super) tls_failed: Option<(i64, bool, String)>,
+    /// 稽核日誌的自我驗證失敗：(時間, 原因, 斷點的 id, 說明)
+    pub(super) audit_failed: Option<(i64, String, Option<i64>, String)>,
     pub(super) flaps: HashMap<String, VecDeque<i64>>,
     pub(super) warmup: Warmup,
     pub(super) seq_by_day: HashMap<String, u64>,
@@ -306,6 +308,7 @@ impl Engine {
             decommissions: VecDeque::new(),
             evictions: VecDeque::new(),
             tls_failed: None,
+            audit_failed: None,
             flaps: HashMap::new(),
             warmup,
             seq_by_day: loaded.seq_by_day,
@@ -1188,6 +1191,24 @@ impl Engine {
                     self.tls_failed = None;
                 } else if self.tls_failed.is_none() {
                     self.tls_failed = Some((at, *crl, message.clone().unwrap_or_default()));
+                }
+            }
+            EventKind::AuditIntegrity {
+                ok,
+                reason,
+                id,
+                summary,
+            } => {
+                if *ok {
+                    self.audit_failed = None;
+                } else {
+                    let since = self.audit_failed.as_ref().map_or(at, |f| f.0);
+                    self.audit_failed = Some((
+                        since,
+                        reason.clone().unwrap_or_default(),
+                        *id,
+                        summary.clone(),
+                    ));
                 }
             }
             _ => {}

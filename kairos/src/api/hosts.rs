@@ -263,6 +263,8 @@ impl HostView {
             "status": self.status.as_str(),
             "status_detail": {
                 "offline_reason": self.offline_reason,
+                // 0.7 過渡期：0.4～0.6 的名稱（timeout、connection_closed），0.8 移除（API.md 第 5.2 節）
+                "offline_reason_legacy": self.offline_reason.map(crate::registry::legacy_offline_reason),
                 "never_connected": self.never_connected,
                 "starting": self.starting,
                 "long_offline": offline_for.is_some_and(|s| s > LONG_OFFLINE_SECS),
@@ -625,11 +627,14 @@ pub struct Filter {
     scope: Option<Vec<String>>,
 }
 
-const OFFLINE_REASONS: [&str; 4] = [
-    "timeout",
-    "connection_closed",
+/// `offline_reason` 參數接受的值（0.7 的名稱；舊名稱 `timeout`、`connection_closed` 在過渡期也接受，
+/// 見 [`crate::registry::normalize_offline_reason`]）
+const OFFLINE_REASONS: [&str; 5] = [
+    "idle_timeout",
+    "agent_closed",
     "server_shutdown",
     "certificate_rejected",
+    "write_unknown",
 ];
 
 fn parse_cidr(param: &str, text: &str) -> Result<Cidr, ApiError> {
@@ -669,16 +674,17 @@ impl Filter {
             })?);
         }
         for r in q.list("offline_reason") {
-            if !OFFLINE_REASONS.contains(&r.as_str()) {
+            let name = crate::registry::normalize_offline_reason(&r);
+            if !OFFLINE_REASONS.contains(&name) {
                 return Err(ApiError::param(
                     "offline_reason",
                     format!(
-                        "offline_reason 的值 \"{r}\" 無效（{}）",
+                        "offline_reason 的值 \"{r}\" 無效（{}；舊名稱 timeout、connection_closed 在 0.7 仍接受）",
                         OFFLINE_REASONS.join("、")
                     ),
                 ));
             }
-            f.offline_reason.push(r);
+            f.offline_reason.push(name.to_string());
         }
         f.tags = q.list("tag").iter().map(|t| t.to_lowercase()).collect();
         f.os = q.list("os").iter().map(|t| t.to_lowercase()).collect();
@@ -1506,7 +1512,10 @@ pub(crate) mod tests {
         let l = live(&id(1), false, now - chrono::Duration::seconds(90));
         let v = view_of(Some(&d), Some(&l), None, &short).unwrap();
         assert_eq!(v.status, Status::Offline);
-        assert_eq!(v.offline_reason, Some("timeout"));
+        assert_eq!(v.offline_reason, Some("idle_timeout"));
+        let s = v.summary(now_ms);
+        assert_eq!(s["status_detail"]["offline_reason"], "idle_timeout");
+        assert_eq!(s["status_detail"]["offline_reason_legacy"], "timeout");
         // 之後憑證被拒：原因改為 certificate_rejected
         let r = CertRejection {
             at: now,
@@ -1600,6 +1609,9 @@ pub(crate) mod tests {
         assert_eq!(run(&format!("q={}", &id(42)[..8])), 1);
         assert_eq!(run("q=0000002a"), 1);
         assert_eq!(run("offline_reason=timeout"), 0);
+        // 0.7 的名稱與舊名稱都接受，結果相同
+        assert_eq!(run("offline_reason=idle_timeout"), 0);
+        assert_eq!(run("offline_reason=write_unknown"), 0);
         // 狀態計數不受 status 篩選影響
         let qq = q("status=offline&tag=line3");
         let page = query(

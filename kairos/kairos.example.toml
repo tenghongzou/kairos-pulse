@@ -172,3 +172,5 @@ enabled = false
 
 [audit]                       # 稽核日誌（雜湊鏈；kairos audit verify|list|export）
 retention_days = 1095         # 保留天數（預設 3 年，獨立於 report 的保留天數），90..=36500
+anchor_log_minutes = 60       # 每隔幾分鐘把鏈尾雜湊寫一行到日誌（audit.chain_anchor；經 syslog 外送），0 不寫，5..=1440
+verify_interval_hours = 24    # 每隔幾小時自我驗證雜湊鏈與 HMAC（失敗：KRS-E6201＋「稽核日誌完整性」緊急事件），1..=168

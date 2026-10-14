@@ -270,7 +270,7 @@ fn op_failure(e: OpError) -> Failure {
 
 fn load_config(path: Option<&Path>) -> Result<AppConfig, Failure> {
     AppConfig::load(path).map_err(|e| Failure {
-        code: Some("KRS-E0201"),
+        code: Some(crate::diag::config_load_code(&e, path)),
         ..Failure::new(
             "設定檔無法載入",
             e.to_string(),

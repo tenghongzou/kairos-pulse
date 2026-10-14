@@ -216,7 +216,9 @@ impl Metrics {
             EventKind::HostDecommissioned { .. }
             | EventKind::TlsReload { .. }
             | EventKind::Condition { .. }
-            | EventKind::Lifecycle { .. } => {}
+            | EventKind::Lifecycle { .. }
+            | EventKind::ChannelSecrets { .. }
+            | EventKind::AuditIntegrity { .. } => {}
         }
     }
 

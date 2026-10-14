@@ -348,10 +348,20 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                     ..Default::default()
                 };
             }
+            // HMAC 的邊界：之前的紀錄只有雜湊鏈（0.7 之前或服務第一次以 0.7 啟動前寫入）
+            let boundary = match (report.hmac.since_id, report.first_id) {
+                (None, _) => "HMAC：尚未開始（Kairos 服務以 0.7 啟動、建立 audit-hmac.key 之後寫入的第一筆起才有）".to_string(),
+                (Some(s), Some(first)) if s > first => format!(
+                    "HMAC：第 {s} 筆起（{} 筆）；第 {first}～{} 筆只有雜湊鏈（0.7 之前寫入）",
+                    report.hmac.verified,
+                    s - 1
+                ),
+                (Some(s), _) => format!("HMAC：第 {s} 筆起（{} 筆）", report.hmac.verified),
+            };
             match &report.broken {
                 None => Output {
                     stdout: format!(
-                        "{} 稽核日誌完整：{} 筆，雜湊鏈連續（第 {}～{} 筆）\n  鏈的終點：{}\n",
+                        "{} 稽核日誌完整：{} 筆，雜湊鏈連續（第 {}～{} 筆）\n  {boundary}\n  鏈的終點：{}\n",
                         if unicode { "✓" } else { "[ OK ]" },
                         report.checked,
                         report.first_id.map_or("—".into(), |x| x.to_string()),
@@ -360,22 +370,30 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                     ),
                     ..Default::default()
                 },
-                Some(b) => Output {
-                    stderr: format!(
-                        "{} 錯誤 {CODE_CHAIN_BROKEN}：稽核日誌完整性驗證失敗\n  原因：第 {} 筆紀錄的雜湊鏈斷裂（{}）；紀錄可能被修改、刪除或插入。\n  處理方式：\n    1. 保全資料庫檔（複製 kairos.db 與 -wal），不要再寫入。\n    2. 與先前匯出（kairos audit export）或外送的副本比對，找出差異。\n",
-                        if unicode { "✗" } else { "[FAIL]" },
-                        b.id,
-                        match b.reason {
-                            "hash_mismatch" => "內容與雜湊不符",
-                            "prev_mismatch" => "與前一筆接不上",
-                            "missing_hash" => "沒有雜湊",
-                            "anchor_mismatch" => "第一筆與清除時的錨點不符",
-                            _ => "最後幾筆被刪除或最新一筆被修改",
-                        }
-                    ),
-                    exit,
-                    ..Default::default()
-                },
+                Some(b) => {
+                    let key_problem =
+                        matches!(b.reason, "hmac_key_unavailable" | "hmac_key_mismatch");
+                    Output {
+                        stderr: format!(
+                            "{} 錯誤 {CODE_CHAIN_BROKEN}：稽核日誌完整性驗證失敗\n  原因：第 {} 筆：{}。{}\n  {boundary}\n  處理方式：\n{}",
+                            if unicode { "✗" } else { "[FAIL]" },
+                            b.id,
+                            crate::audit_monitor::describe(b.reason),
+                            if key_problem {
+                                "雜湊鏈本身完整，但無法確認紀錄沒有被整段重新計算。"
+                            } else {
+                                "紀錄可能被修改、刪除或插入。"
+                            },
+                            if key_problem {
+                                "    1. 從備份還原資料目錄的 audit-hmac.key（kairos db restore-keys），再執行 kairos audit verify。\n    2. 金鑰確實遺失時，保全資料庫檔，並以外送的鏈尾雜湊（audit.chain_anchor）確認之前的紀錄。\n"
+                            } else {
+                                "    1. 保全資料庫檔（複製 kairos.db 與 -wal），不要再寫入。\n    2. 與先前匯出（kairos audit export）或外送的鏈尾雜湊（audit.chain_anchor）比對，找出差異。\n"
+                            }
+                        ),
+                        exit,
+                        ..Default::default()
+                    }
+                }
             }
         }
         AuditAction::Export { out } => {
@@ -413,6 +431,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 "type": "chain", "generated_at": fmt_time(now), "count": count,
                 "first_id": first.as_ref().map(|x| x.0), "first_prev_hash": first.and_then(|x| x.1),
                 "last_id": last.as_ref().map(|x| x.0), "last_hash": last.and_then(|x| x.1),
+                "hmac_since": audit::hmac_since(&conn).ok().flatten().map(|s| s.0),
             }).to_string());
             text.push('\n');
             note(

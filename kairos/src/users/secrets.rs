@@ -19,7 +19,7 @@ use crate::api::http::b64url_encode;
 pub const KEY_FILE: &str = "console.key";
 
 /// 金鑰檔的權限收緊到 0600（Unix；其他人與群組都不能讀）
-fn restrict_0600(path: &Path) {
+pub(crate) fn restrict_0600(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

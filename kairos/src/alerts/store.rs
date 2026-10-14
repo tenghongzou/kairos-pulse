@@ -11,6 +11,7 @@ use super::model::{
     Attention, Category, Channel, ChannelKind, Event, EventState, NotifyPolicy, NotifyState,
     RootCause, Rule, Scope, Severity, Silence, SilenceKind,
 };
+use super::notify::transport::CODE_CHANNEL_CONFIG;
 use super::rules;
 use super::secrets::SecretBox;
 
@@ -747,21 +748,50 @@ pub fn mark_silences_notified(conn: &Connection, ids: &[String]) -> rusqlite::Re
 // 通知管道
 // ---------------------------------------------------------------------------
 
+/// 管道的狀態：機密無法解開（`alerts-secrets.key` 遺失、與資料庫不成對，或密文被修改）。
+/// 不會嘗試發送，視同失敗（[`Channel::failed`]），由「通知管道失敗」系統規則以 `KRS-E5110` 開事件
+/// （設計包 `decisions/INTEGRATION.md` §28.5 #8、`alerts-ux.md` 5.5）
+pub const STATE_SECRETS_UNAVAILABLE: &str = "secrets_unavailable";
+/// [`STATE_SECRETS_UNAVAILABLE`] 時的錯誤訊息（API、CLI 與發送紀錄）
+pub const SECRETS_UNAVAILABLE_MESSAGE: &str = "無法解開管道的機密：資料目錄的 alerts-secrets.key 遺失或與資料庫不成對。請從備份還原金鑰檔（kairos db restore-keys）並重新啟動，或重新輸入這個管道的機密";
+
 const CHANNEL_COLUMNS: &str = "channel_id, name, kind, enabled, config, secrets, state, consecutive_failures, failed_since, last_attempt_at, last_success_at, last_error_code, last_error, created_at, created_by, updated_at, updated_by";
 
 fn channel_of(r: &Row<'_>, secrets: Option<&SecretBox>) -> rusqlite::Result<Channel> {
     let blob: Option<Vec<u8>> = r.get(5)?;
-    let secrets = match (blob, secrets) {
-        (Some(b), Some(sb)) => sb.unseal(&b).unwrap_or_else(|e| {
-            log::warn!(
-                event = "alerts.channel.decrypt_failed";
-                "通知管道 {} 的機密無法解密：{e}",
-                r.get::<_, String>(0).unwrap_or_default()
-            );
-            json!({})
-        }),
-        _ => json!({}),
+    // 機密能否解開：None 為沒有檢查（不解密的讀取，或管道沒有機密）
+    let (secrets, unsealed) = match (blob, secrets) {
+        (Some(b), Some(sb)) => match sb.unseal(&b) {
+            Ok(v) => (v, Some(true)),
+            Err(e) => {
+                // 狀態轉換時由告警服務記一次 WARN 並發布內部事件（AlertService::watch_secrets），
+                // 這裡每次讀取都會經過，只記 DEBUG
+                log::debug!(
+                    "通知管道 {} 的機密無法解密：{e}",
+                    r.get::<_, String>(0).unwrap_or_default()
+                );
+                (json!({}), Some(false))
+            }
+        },
+        _ => (json!({}), None),
     };
+    let mut state: String = r.get(6)?;
+    let mut last_error_code: Option<String> = r.get(11)?;
+    let mut last_error: Option<String> = r.get(12)?;
+    match unsealed {
+        Some(false) => {
+            state = STATE_SECRETS_UNAVAILABLE.to_string();
+            last_error_code = Some(CODE_CHANNEL_CONFIG.to_string());
+            last_error = Some(SECRETS_UNAVAILABLE_MESSAGE.to_string());
+        }
+        // 金鑰檔已還原或機密已重新輸入：恢復（之後的發送結果決定狀態）
+        Some(true) if state == STATE_SECRETS_UNAVAILABLE => {
+            state = "ok".to_string();
+            last_error_code = None;
+            last_error = None;
+        }
+        _ => {}
+    }
     Ok(Channel {
         channel_id: r.get(0)?,
         name: r.get(1)?,
@@ -769,13 +799,13 @@ fn channel_of(r: &Row<'_>, secrets: Option<&SecretBox>) -> rusqlite::Result<Chan
         enabled: r.get::<_, i64>(3)? != 0,
         config: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_else(|_| json!({})),
         secrets,
-        state: r.get(6)?,
+        state,
         consecutive_failures: r.get::<_, i64>(7)? as u32,
         failed_since: r.get(8)?,
         last_attempt_at: r.get(9)?,
         last_success_at: r.get(10)?,
-        last_error_code: r.get(11)?,
-        last_error: r.get(12)?,
+        last_error_code,
+        last_error,
         created_at: r.get(13)?,
         created_by: r.get(14)?,
         updated_at: r.get(15)?,
@@ -1199,6 +1229,65 @@ mod tests {
         let mut conn = Connection::open(dir.join("k.db")).unwrap();
         crate::store::sqlite::migrate(&mut conn, crate::store::sqlite::MIGRATIONS).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn channel_secrets_that_cannot_be_unsealed_mark_the_channel_unavailable() {
+        let (dir, conn) = db();
+        let right = SecretBox::from_key(&[1u8; 32]).unwrap();
+        let wrong = SecretBox::from_key(&[2u8; 32]).unwrap();
+        let ch = Channel {
+            channel_id: "c-1".into(),
+            name: "SIEM".into(),
+            kind: ChannelKind::Webhook,
+            enabled: true,
+            config: json!({}),
+            secrets: json!({}),
+            state: "ok".into(),
+            consecutive_failures: 0,
+            failed_since: None,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: None,
+            last_error: None,
+            created_at: 0,
+            created_by: "admin".into(),
+            updated_at: 0,
+            updated_by: "admin".into(),
+        };
+        let blob = right
+            .seal(&json!({"url": "https://hooks.example/x"}))
+            .unwrap();
+        save_channel(&conn, &ch, Some(blob)).unwrap();
+        // 正確的金鑰：可以解開
+        let c = &load_channels(&conn, Some(&right)).unwrap()[0];
+        assert_eq!(c.state, "ok");
+        assert!(!c.failed());
+        assert_eq!(c.secrets["url"], "https://hooks.example/x");
+        // 不成對的金鑰：secrets_unavailable、KRS-E5110，機密為空、視同失敗
+        let c = load_channels(&conn, Some(&wrong)).unwrap().remove(0);
+        assert_eq!(c.state, STATE_SECRETS_UNAVAILABLE);
+        assert!(c.secrets_unavailable() && c.failed());
+        assert_eq!(c.last_error_code.as_deref(), Some("KRS-E5110"));
+        assert_eq!(c.secrets, json!({}));
+        // 不解密的讀取：顯示資料庫的狀態；派送端寫回的狀態在金鑰還原後恢復為 ok
+        update_channel_status(&conn, &c).unwrap();
+        assert_eq!(
+            load_channels(&conn, None).unwrap()[0].state,
+            STATE_SECRETS_UNAVAILABLE
+        );
+        let c = &load_channels(&conn, Some(&right)).unwrap()[0];
+        assert_eq!(c.state, "ok");
+        assert_eq!(c.last_error_code, None);
+        // 金鑰檔不存在時的檢查（CLI）：隨機的金鑰，已加密的機密都無法解開
+        let check = SecretBox::for_check(&dir).unwrap();
+        assert!(load_channels(&conn, Some(&check)).unwrap()[0].secrets_unavailable());
+        assert!(
+            !dir.join(crate::alerts::secrets::KEY_FILE).exists(),
+            "檢查不建立金鑰檔"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn event(

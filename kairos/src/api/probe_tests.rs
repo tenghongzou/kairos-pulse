@@ -217,8 +217,70 @@ async fn metrics_requires_the_bearer_token_when_configured() {
     // /healthz 不需要 token
     let r = request(f.addr(), "GET", "/healthz", None, &[]).await;
     assert_eq!(r.status, 200);
+    // 設定了 token：經反向代理（帶轉送標頭）時以 bearer 驗證，照常允許
+    let r = request(
+        f.addr(),
+        "GET",
+        "/metrics",
+        Some("s3cr3t-metrics-token-0123456789"),
+        &[("X-Forwarded-For", "203.0.113.9")],
+    )
+    .await;
+    assert_eq!(r.status, 200);
     f.stop().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_without_token_rejects_requests_forwarded_by_a_proxy() {
+    // 沒有 token：loopback 來源照常允許；帶任何一個轉送標頭（大小寫不拘）一律 403
+    let f = fixture("probe-proxy", |_| {}).await;
+    let r = request(f.addr(), "GET", "/metrics", None, &[]).await;
+    assert_eq!(r.status, 200);
+    for (name, value) in [
+        ("Forwarded", "for=203.0.113.9;proto=https"),
+        ("X-Forwarded-For", "203.0.113.9"),
+        ("x-real-ip", "203.0.113.9"),
+        ("X-Forwarded-Host", "metrics.example.com"),
+        ("X-Forwarded-Proto", "https"),
+        ("Via", "1.1 nginx"),
+        // 值為空字串也算（只看標頭是否存在）
+        ("X-Forwarded-For", ""),
+    ] {
+        let r = request(f.addr(), "GET", "/metrics", None, &[(name, value)]).await;
+        assert_eq!(r.status, 403, "{name}: {value}");
+        assert_eq!(r.json(), serde_json::json!({"status": "forbidden"}));
+        // 帶了錯誤的 bearer 也一樣（沒有設定 token 時不看 Authorization）
+        let r = request(
+            f.addr(),
+            "GET",
+            "/metrics",
+            Some("x".repeat(40).as_str()),
+            &[(name, value)],
+        )
+        .await;
+        assert_eq!(r.status, 403, "{name}");
+    }
+    // /healthz、/readyz 不受影響
+    let r = request(
+        f.addr(),
+        "GET",
+        "/healthz",
+        None,
+        &[("X-Forwarded-For", "203.0.113.9")],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert!(probe::is_proxied(&{
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            "x-real-ip",
+            hyper::header::HeaderValue::from_static("1.2.3.4"),
+        );
+        h
+    }));
+    assert!(!probe::is_proxied(&hyper::HeaderMap::new()));
+    f.stop().await;
 }
 
 /// 以純 HTTP 取得一個路徑：(狀態碼, 本文)

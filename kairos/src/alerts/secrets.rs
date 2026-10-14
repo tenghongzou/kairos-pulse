@@ -84,6 +84,31 @@ impl SecretBox {
         })
     }
 
+    /// 只檢查機密能否解開（CLI；不建立金鑰檔）：金鑰檔存在時讀取它；不存在時以一把隨機的金鑰
+    /// 代替，使所有已加密的機密都判為無法解開（[`super::store::STATE_SECRETS_UNAVAILABLE`]）
+    pub fn for_check(data_dir: &Path) -> Result<Self, Error> {
+        let path = data_dir.join(KEY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => Self::from_key(&bytes).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{} 無效：{e}", path.display()),
+                )
+            }),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let mut key = [0u8; 32];
+                SystemRandom::new()
+                    .fill(&mut key)
+                    .map_err(|_| Error::other("無法產生隨機數"))?;
+                Self::from_key(&key).map_err(Error::other)
+            }
+            Err(e) => Err(Error::new(
+                e.kind(),
+                format!("無法讀取 {}: {e}", path.display()),
+            )),
+        }
+    }
+
     pub fn from_key(bytes: &[u8]) -> Result<Self, String> {
         let unbound = UnboundKey::new(&AES_256_GCM, bytes)
             .map_err(|_| "金鑰長度必須是 32 bytes".to_string())?;

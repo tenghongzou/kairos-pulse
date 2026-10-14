@@ -1691,6 +1691,7 @@ async fn audit_log_query_export_and_verify() {
             details: l["details_raw"].as_str().map(str::to_string),
             prev_hash: None,
             hash: None,
+            hmac: None,
         };
         assert_eq!(
             crate::audit::compute_hash(l["prev_hash"].as_str().unwrap(), &row),

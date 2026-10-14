@@ -3,6 +3,7 @@ mod alerts_cli;
 mod api;
 mod audit;
 mod audit_cli;
+mod audit_monitor;
 mod auth;
 mod bus;
 mod config;
@@ -18,6 +19,7 @@ mod hosts_cli;
 mod import_cli;
 #[cfg(test)]
 mod integration_tests;
+mod keys_backup;
 mod logger;
 mod metrics;
 mod monitor;
@@ -519,10 +521,13 @@ fn main() -> ExitCode {
     };
 
     // 設定錯誤以 EXIT_CONFIG 結束，systemd 不再重試（RestartPreventExitStatus）
+    // 訊息帶產品代碼（KRS-E0101／E0401／E0402／E0201／E0202，與 --check-config 相同的判斷；
+    // 設計包 decisions/INTEGRATION.md §28.5），結束代碼不變
     let config = match AppConfig::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Kairos 啟動失敗: {}", e);
+            let code = diag::config_load_code(&e, config_path.as_deref());
+            eprintln!("錯誤 {code}：Kairos 啟動失敗: {e}");
             return ExitCode::from(EXIT_CONFIG);
         }
     };
@@ -531,7 +536,7 @@ fn main() -> ExitCode {
     let level = match config.log.level_filter() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Kairos 啟動失敗: {}", e);
+            eprintln!("錯誤 {}：Kairos 啟動失敗: {e}", diag::CODE_CONFIG_RANGE);
             return ExitCode::from(EXIT_CONFIG);
         }
     };
@@ -948,6 +953,16 @@ async fn run(
             "資訊 KRS-I2010：設定檔沒有 [enroll] 的 mode，註冊端點（8444）預設為關閉；需要自動註冊時設定 enroll.mode = \"open\" 或 \"renew_only\"（主控台或 kairos enroll mode 也可以修改）"
         );
     }
+    // 稽核雜湊鏈的 HMAC 金鑰（data/audit-hmac.key）：只由服務建立，之後的稽核紀錄都帶 HMAC
+    if config.storage.backend == StorageBackend::Sqlite
+        && let Err(e) = audit::ensure_key(&paths.data_dir)
+    {
+        error!(
+            event = "audit.key_unavailable", code = audit::CODE_CHAIN_BROKEN;
+            "錯誤 {}：無法建立或讀取稽核 HMAC 的金鑰檔（稽核紀錄不會帶 HMAC，完整性驗證會失敗）：{e}",
+            audit::CODE_CHAIN_BROKEN
+        );
+    }
     let enroll = match config.storage.backend {
         StorageBackend::Jsonl => None,
         StorageBackend::Sqlite => {
@@ -980,6 +995,15 @@ async fn run(
         }
     };
     let enroll_service = enroll.as_ref().map(|r| r.service.clone());
+    // 稽核：定期外送鏈尾雜湊與自我驗證（失敗時告警引擎開「稽核日誌完整性」）
+    if let Some(svc) = &enroll_service {
+        tokio::spawn(audit_monitor::run(
+            svc.db.clone(),
+            registry.bus(),
+            config.audit.clone(),
+            shutdown.clone(),
+        ));
+    }
 
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),

@@ -545,7 +545,7 @@ pub fn open_db(
     title: &str,
 ) -> Result<rusqlite::Connection, CliError> {
     let config = AppConfig::load(config_path).map_err(|e| CliError {
-        code: "KRS-E0201",
+        code: crate::diag::config_load_code(&e, config_path),
         title: "設定檔無法載入".to_string(),
         cause: e.to_string(),
         fix: vec!["修正設定檔後再執行，或以 --config 指定 Kairos 使用的設定檔。".to_string()],

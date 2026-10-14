@@ -285,12 +285,20 @@ impl LdapSettings {
 pub struct AuditSettings {
     /// 保留天數（獨立於 report 的保留天數；設計包 S18：預設 3 年）
     pub retention_days: u32,
+    /// 每隔幾分鐘把鏈尾的雜湊寫一行到日誌（`audit.chain_anchor`，`KRS-I6202`〔暫定〕；經 syslog
+    /// 外送後成為資料庫之外的副本）。0 為不寫；5～1440，預設 60
+    pub anchor_log_minutes: u32,
+    /// 每隔幾小時自我驗證一次雜湊鏈與 HMAC（失敗時 `KRS-E6201` 並開「稽核日誌完整性」事件）。
+    /// 1～168，預設 24（設計包 §28.5 #10）；不提供關閉
+    pub verify_interval_hours: u32,
 }
 
 impl Default for AuditSettings {
     fn default() -> Self {
         Self {
             retention_days: 1095,
+            anchor_log_minutes: 60,
+            verify_interval_hours: 24,
         }
     }
 }
@@ -302,6 +310,20 @@ impl AuditSettings {
             self.retention_days.into(),
             90,
             36_500,
+        )?;
+        if self.anchor_log_minutes != 0 {
+            range(
+                "audit.anchor_log_minutes",
+                self.anchor_log_minutes.into(),
+                5,
+                1440,
+            )?;
+        }
+        range(
+            "audit.verify_interval_hours",
+            self.verify_interval_hours.into(),
+            1,
+            168,
         )
     }
 }
@@ -329,7 +351,16 @@ mod tests {
             ..AccountSettings::default()
         };
         assert!(a.validate().is_err());
-        assert!(AuditSettings { retention_days: 30 }.validate().is_err());
+        let audit = |retention_days, anchor_log_minutes, verify_interval_hours| AuditSettings {
+            retention_days,
+            anchor_log_minutes,
+            verify_interval_hours,
+        };
+        assert!(audit(30, 60, 24).validate().is_err());
+        assert!(audit(1095, 0, 24).validate().is_ok());
+        assert!(audit(1095, 4, 24).validate().is_err());
+        assert!(audit(1095, 60, 0).validate().is_err());
+        assert!(audit(1095, 60, 169).validate().is_err());
     }
 
     #[test]

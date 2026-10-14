@@ -798,7 +798,7 @@ fn run_inner(
     unicode: bool,
 ) -> Result<(String, u8), Failure> {
     let config = AppConfig::load(opts.config_path.as_deref()).map_err(|e| Failure {
-        code: "KRS-E0201",
+        code: crate::diag::config_load_code(&e, opts.config_path.as_deref()),
         title: "設定檔無法載入".to_string(),
         cause: e.to_string(),
         fix: vec!["修正設定檔後再執行，或以 --config 指定 Kairos 使用的設定檔。".to_string()],

@@ -856,6 +856,14 @@ pub async fn send(
     now_ms: i64,
     message_id: &str,
 ) -> Outcome {
+    // 機密無法解開：不連線，直接以 KRS-E5110 失敗（不要以空的 URL、密碼嘗試發送）
+    if channel.secrets_unavailable() {
+        return Outcome::fail(
+            CODE_CHANNEL_CONFIG,
+            crate::alerts::store::SECRETS_UNAVAILABLE_MESSAGE,
+            Instant::now(),
+        );
+    }
     match channel.kind {
         ChannelKind::Email => {
             let msg = super::render::message(payload, view, now_ms);
