@@ -108,6 +108,7 @@ useradd --system --user-group --home-dir /opt/pulse --no-create-home \
 install -d -o root  -g pulse -m 751 /opt/pulse
 install -d -o pulse -g pulse -m 750 /opt/pulse/logs
 install -d -o pulse -g pulse -m 750 /opt/pulse/buffer
+install -d -o pulse -g pulse -m 700 /opt/pulse/identity   # 以 pulse enroll 註冊時（第 5.0 節）
 
 cd ~/pulse-dist/pkg
 install -o root -g root -m 755 pulse /opt/pulse/pulse
@@ -118,6 +119,32 @@ install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.
 `/opt/pulse` 本身屬於 root，pulse 使用者只能讀取執行檔、設定與憑證；其他使用者（751）只能執行 `/opt/pulse/pulse`（例如 `pulse status`），不能列出目錄，也讀不到 640 的 `pulse.toml`、`agent.id`、`client.key` 與 750 的 `logs/`、`buffer/`。unit 以 `ProtectSystem=strict` 讓服務只能寫 `logs/`、`buffer/` 與 systemd 建立的 `/var/lib/pulse`（本機狀態檔，第 8.2 節；不需要手動建立）。**`logs/` 必須在啟動前存在**，否則 unit 以 `226/NAMESPACE` 啟動失敗。`buffer/` 是本機緩衝（斷線或 Kairos 維護期間的資料暫存在這裡，Kairos 確認後才刪除，見第 6.2 節）；沒有建立時服務仍會啟動，但 Pulse 無法寫入緩衝，記 `ERROR` 後改為 at-most-once（斷線期間的資料不補送）。
 
 ## 5. 產生 agent_id 並申請客戶端憑證
+
+Kairos 0.5〔草稿〕起有兩種方式：**以 `pulse enroll` 自動註冊（第 5.0 節，建議）**，或沿用手動 CSR（第 5.1～5.3 節，Kairos 0.4 以前或沒有開放註冊端點時）。
+
+### 5.0 以 pulse enroll 註冊（Kairos 0.5 以上）
+
+前提：Kairos 的註冊端點（預設 8444）為「開放」，管理者已在主控台「註冊與憑證 › 註冊 token」建立 token，並給你**安裝字串**（`pulse-enroll:v1:…`，含 Kairos 位址、token 與 CA 指紋），或 Kairos 位址、token 與 CA 指紋三項。
+
+```bash
+# 1. agent_id（服務帳號要讀得到；/opt/pulse 本身唯讀，必須在這裡先產生）
+cd /opt/pulse
+./pulse --print-agent-id
+chown root:pulse agent.id && chmod 640 agent.id
+
+# 2. 註冊（私鑰在本機產生、不會離開這台主機）
+./pulse enroll --install-string 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…'
+#   或：./pulse enroll --server kairos.example.gov.tw --token KRT1-7G4Q-M2XD-9PBA-H6WN \
+#              --ca-pin sha256:3f9a1c07b2d48e610a9c55f27d13c8a0e4b729610f3d8ac291e56b04d7afe21b
+```
+
+- 需人工核准的 token：畫面顯示**申請編號**（例如 `7KQ2-M9XD`），請把它告訴管理者核准。終端機上預設等待 10 分鐘（`--wait <秒>`、`--no-wait` 可調）；時間到或按 Ctrl+C 都不會遺失申請，安裝服務（第 7 節）後由服務在背景接續，核准後自動連線。
+- 完成後 `identity/` 有 `client.key`（0600）、`client.pem`、`ca.pem` 與 `enrollment.json`（0600，含輪詢憑據），`pulse.toml` 的 `[server]` 已寫入位址、`client_cert`、`client_key`、`ca_cert` 與 `use_system_roots = false`（原檔備份為 `pulse.toml.bak-<時間>`）；跳過第 6 節的手動設定，直接到第 6.1 節確認權限與第 7 節。
+- 註冊端點不在 Kairos 位址的 8444 時：`--enroll-server host:port`（或只改連接埠 `--enroll-server :9444`），會另外寫入 `pulse.toml` 的 `[enroll]`（過期寬限期續簽使用）。
+- 沒有 CA 指紋：互動模式會顯示指紋請你與主控台核對；非互動（部署工具）以 `PLS-E1406` 結束，確定要信任時加 `--trust-on-first-use`（主控台會標示「未驗證伺服器身分」）。
+- 常見結果與結束代碼：0 已註冊；7 等待核准或排隊中（服務接續）；6 被拒絕（token 無效／過期／用完、申請被拒、註冊端點不受理新註冊 `PLS-E2008`）；5 無法連線或伺服器身分驗證失敗；11 已註冊（重新註冊加 `--force`）。完整說明見 Pulse README「自動註冊」與 `ERROR-CODES.md`。
+- 本機時鐘與 Kairos 相差超過 5 分鐘時 Kairos 暫不受理（`PLS-E8302`）：校正時間（`timedatectl set-ntp true`）後服務會自動重送，不需要新的 token。
+- 取消等待中的申請：`./pulse enroll --cancel`（向 Kairos 撤回後刪除本機未使用的私鑰）。
 
 ### 5.1 產生 agent_id
 
@@ -514,6 +541,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
   沒有換 unit 時服務照常啟動與監控（不會因狀態檔而失敗）：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`PLS-E8204`），只有 root 能執行 `pulse status`，「設定」列提示更新 unit（第 8.2 節）。換上後重新啟動，`pulse status` 的「設定」列不再有 `PLS-E8204`。另外，0.4 起有固定事件的日誌行以「事件 代碼」開頭（例如 `conn.lost PLS-E2002 …`）：以行首比對日誌文字（例如 `[ERROR] 連線中斷`）的告警規則請在升級前改為比對事件或代碼，或改用包含比對（`ERROR-CODES.md`）。
 - 升級前請看新版發佈包中的 `CHANGELOG.md`「破壞性變更與升級步驟」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
+- **升級到 0.5.0〔草稿〕**：要使用 `pulse enroll` 時先 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/identity`；多實例同樣重新產生 `pulse-N.service`）。沿用手動憑證的部署不需要任何變更：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
 - **升級到 0.3.0**：新版預設啟用本機緩衝（第 6.2 節），升級前先建立緩衝目錄並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/buffer`；多實例時對每個 `/opt/pulse-N` 建立目錄並重新產生 `pulse-N.service`）：
 
   ```bash
@@ -528,6 +556,15 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 ## 11. 憑證更新與 agent_id 重新產生
 
+以 `pulse enroll` 註冊的主機（Kairos 0.5 以上）：
+
+- **憑證自動更新**：Kairos 支援時（8443 協定 feature `renew`），已使用壽命 2/3 或剩餘 30 天（`identity.renew_before_days`）時經既有連線送出新的 CSR，以新憑證連線成功後才取代 `identity/client.pem`／`client.key`。政策要求人工核准時記 `cert.renew_failed PLS-W1111`，核准後自動完成。
+- **憑證已過期**（例如長時間關機）：Kairos 以 `CertificateExpired` 拒絕時，服務改經註冊端點（8444）以舊私鑰簽章自動續簽（過期寬限期預設 90 天，以 Kairos 為準），不需要到現場；註冊端點為「關閉」時記 `cert.grace_renew_blocked PLS-E2007`，請管理者改為「僅續簽」或「開放」。超過寬限期（`PLS-E1113`）或主機識別資訊不符（`PLS-E1114`）時需要新的 token：`./pulse enroll --force --token <新 token>`。
+- **被撤銷後重新註冊**：`./pulse enroll --force --token <新 token>`（沿用 agent_id、產生新私鑰；申請會附前一張憑證的序號）。
+- **複製的 VM**：`./pulse enroll --reset-identity --token <新 token> --yes`（產生新的 agent_id）。
+
+手動簽發的憑證：
+
 - **憑證快到期**（日誌出現「剩餘不超過 N 天」的 `WARN`）：沿用同一個 agent_id，重做 5.2（新私鑰與 CSR，私鑰同樣設為 `root:pulse 640`）請管理者簽發，替換 `client.key`、`client.pem` 後 `systemctl restart pulse`。
 - **重新產生 agent_id**（例如複製 VM 後）：`systemctl stop pulse`，刪除 `/opt/pulse/agent.id`，重做第 5 節全部步驟，並請管理者撤銷舊憑證。只換 `agent.id` 不換憑證時，Pulse 啟動即因 SAN 不符而結束。
 
@@ -535,8 +572,15 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 在 root shell 中執行。有多實例（第 9 節）時，**先移除所有 `pulse-N`，最後才移除 `/opt/pulse` 與使用者**：`pulse-N` 共用 `/opt/pulse/pulse` 與使用者 `pulse`，先刪掉它們會讓殘留的 `pulse-N.service` 以 `Restart=always` 每 10 秒啟動失敗一次。
 
+以 `pulse enroll` 註冊的主機，在刪除 `identity/` 之前先通知 Kairos（已註冊時經 8443 除役通知；等待核准中時經 8444 撤回申請；最多 15 秒，失敗時以 `PLS-W3107`／`PLS-W3310` 警告，結束代碼 8，本機照常移除）：
+
 ```bash
-# 1. 記下每個實例的 agent_id，交給 Kairos 管理者撤銷憑證
+systemctl stop pulse
+cd /opt/pulse && ./pulse decommission --initiated-by install_script
+```
+
+```bash
+# 1. 記下每個實例的 agent_id，交給 Kairos 管理者撤銷憑證（已 pulse decommission 的主機不需要）
 grep -H . /opt/pulse/agent.id /opt/pulse-[0-9]*/agent.id 2>/dev/null
 
 # 2. 停用並移除所有多實例 pulse-N（沒有多實例時不會做任何事）

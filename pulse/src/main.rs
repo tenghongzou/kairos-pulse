@@ -1008,7 +1008,8 @@ mod tests {
             paths,
             [
                 format!("{workdir}/logs"),
-                format!("-{workdir}/{}", config.buffer.dir)
+                format!("-{workdir}/{}", config.buffer.dir),
+                format!("-{workdir}/{}", config.identity.dir)
             ],
             "{line}"
         );

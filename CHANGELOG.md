@@ -55,6 +55,25 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - `kairos/PKI.md`：自動簽發的 CA 架構（根 CA 離線、Kairos 線上持有代理簽發 CA）、用戶端憑證格式、簽發 CA 的輪替、Kairos 自行產生 CRL、離線簽發模式（CSR 佇列匯出與匯入）、資料庫 schema v4。標出待使用者確認的決定。
 - `kairos/API.md` 第 11 節：註冊 token、申請（含批次核准）、註冊端點模式、憑證與 CRL、離線簽發佇列的管理端點；API token 範圍新增 `operate`、`admin`；CLI `kairos enroll-token`、`kairos enroll`、`kairos pki`。
 
+## [0.5.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕衝刺 4「註冊通道 8444」。本節目前只有 **Pulse** 的條目（Kairos 端另行補上）；`pulse/Cargo.toml` 的版本尚未改為 0.5.0。規格：`crates/kairos-proto/ENROLL.md`。
+
+### 新增（Pulse）
+
+- **`pulse enroll`**（設計包 `cli-spec.md` §5）：以安裝字串（`pulse-enroll:v1:…`）或 `--server`／`--token`／`--ca-pin` 向 Kairos 註冊。私鑰（ECDSA P-256）在本機產生、不離開主機；只信任 CA 指紋、`--ca-file` 或人工確認的 CA（TOFU 需 `--trust-on-first-use` 或互動確認，`PLS-W1407`），不使用作業系統信任庫，根 CA 可為 P-256、P-384 或 RSA；需人工核准時顯示申請編號並（長）輪詢；`--status`、`--cancel`（撤回申請）、`--force`、`--reset-identity`、`--json`（`pulse.enroll/v1`）。中斷後重新執行從 `identity/enrollment.json` 接續，回應遺失時以同一個 CSR 與輪詢憑據重送（不會產生第二筆申請）。
+- **服務的註冊閘門與背景輪詢**：沒有可用身分時先完成進行中的申請（依 `next_poll_at` 恢復）；申請被拒、逾期、token 無效等無法自動恢復時不連線並以嚴重呈現。429／503 依 `Retry-After` 排隊（`PLS-E2202`／`PLS-E3309`），Kairos 因時鐘偏差暫不受理時每 5 分鐘重送並在本機時間被調整時立即重送（`PLS-E8302`）。
+- **過期寬限期續簽**：Kairos 以 `CertificateExpired` 拒絕用戶端憑證時，經 8444 以舊私鑰對含 `sent_at` 的內容簽章自動續簽；`grace_blocked`（`PLS-E2007`，並對 8443 報到）、`grace_pending`、`grace_exceeded`（`PLS-E1113`）、`grace_rejected`（`PLS-E1114`）、`grace_clock_rejected`（`PLS-E8302`）；`replayed_request` 重新簽章重送一次。
+- **8443 正常輪替與除役（協定 feature `renew`、`deregister`，ENROLL.md 第 13 節）**：身分由 `pulse enroll` 管理時 hello 宣告 `renew`，到期前（已用 2/3 或剩餘 `identity.renew_before_days` 天）送出新的 CSR，以新憑證連線成功後才取代；Kairos 不支援時維持 0.4 的行為。`pulse decommission --initiated-by …`（安裝程式完全移除時）：已註冊經 8443 除役通知、等待核准中經 8444 撤回（`PLS-W3107`／`PLS-W3310`）。
+- **`pulse status`**：「連線」「身分」列與 `--json` 的 `identity.state`、`identity.enrollment`、`identity.grace`、`identity.renew_after`、`clock.source`（`clock_skew`、`server_info_unverified`）；`--brief` 的 `pending_approval`、`clock_rejected offset=…`、`cert_expired grace=… renew=…`。
+- 設定：`[identity]`（`dir`、`renew_before_days`）、`[enroll]`（`address`、`port`）。日誌事件 `enroll.*`、`cert.renewed`、`cert.renew_*`、`cert.grace_*`、`install.*_unreported`；`ERROR-CODES.md` 新增 30 個代碼的對應。
+
+### 升級（Pulse）
+
+- 沿用手動憑證或未啟用 mTLS 的部署**不需要任何變更**：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
+- 要使用 `pulse enroll`：建立 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，換上新版 `pulse.service`（`ReadWritePaths=` 多了 `-/opt/pulse/identity`）並 `systemctl daemon-reload`（Pulse INSTALL 第 5.0、10 節）。需要 Kairos 0.5 以上且註冊端點不是「關閉」；連上沒有 8444 的 Kairos 時為 `PLS-E2106`／`PLS-E2007`，不影響既有連線。
+- 新的依賴：`rcgen`（MIT OR Apache-2.0，以 ring 為後端）、`ring` 改為直接依賴；兩者原本就在依賴樹中。
+
 ## [0.4.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.4.0、Pulse 0.4.0**：商業審計路線圖「階段 3 MVP 產品面」。Kairos 新增 F1（查詢與管理 API）第一版：HTTPS 的主控台 API（`/api/v1`，唯讀）與 API token，是主控台畫面的前提；Pulse 新增 `pulse status`、所有人可讀的本機狀態檔與日誌的事件代碼。**協定不變**（仍為 v1～v2＋`durable`），兩個產品可以分批、以任何順序升級。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.4.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。API 的規格、端點、驗證、即時推送與量測見 `kairos/API.md`（Kairos 發佈包內的 `API.md`）；Pulse 的錯誤代碼對照見 `pulse/ERROR-CODES.md`（Pulse 發佈包內的 `ERROR-CODES.md`）。

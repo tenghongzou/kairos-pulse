@@ -11,9 +11,11 @@
 #   - /opt/pulse/logs 已建立且屬於 pulse（可寫；不存在時 unit 會以 226/NAMESPACE 啟動失敗）
 #   - /opt/pulse/buffer 已建立且屬於 pulse（本機緩衝，可寫；路徑前的 - 表示不存在時不影響啟動，
 #     但 Pulse 無法建立緩衝，會記 ERROR 並改為 at-most-once）
+#   - 以 pulse enroll 註冊時：/opt/pulse/identity 已建立且屬於 pulse、0700（私鑰、憑證與
+#     enrollment.json；服務在背景輪詢待核准的申請、過期續簽與自動更新憑證時寫入）
 #
 # 同一台主機要跑多個實例時，每個實例複製一份 unit（例如 pulse-2.service 對應 /opt/pulse-2），
-# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行（ReadWritePaths= 的兩個路徑都要改）；
+# 只改 WorkingDirectory= 與 ReadWritePaths= 兩行（ReadWritePaths= 的三個路徑都要改）；
 # 執行檔仍用 /opt/pulse/pulse。
 # 詳見 INSTALL.md 第 9 節。
 #
@@ -67,7 +69,7 @@ StateDirectoryMode=0755
 
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict
-ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer
+ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer -/opt/pulse/identity
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
