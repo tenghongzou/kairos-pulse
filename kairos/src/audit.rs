@@ -39,7 +39,7 @@ pub struct Audit<'a> {
     /// 執行者：`user:<帳號>`、`token:<token_id>`、作業系統帳號（CLI）、`system`、`anonymous`
     pub actor: &'a str,
     pub actor_ip: Option<&'a str>,
-    /// 類別：`login`、`user`、`api_token`、`settings`、`enroll`、`pki`、`host`、`audit`、`system`
+    /// 類別：`login`、`user`、`api_token`、`settings`、`enroll`、`pki`、`host`、`audit`、`system`、`access`、`alerts`
     pub category: &'a str,
     /// 動作（`<對象>.<動詞>`，例如 `login.success`、`user.disable`、`token.create`）
     pub action: &'a str,

@@ -634,5 +634,21 @@ async fn alerts_end_to_end_over_https() {
             .iter()
             .all(|(_, d)| !d.contains("SECRETTOKEN") && !d.contains("hk-secret"))
     );
+    // 告警與靜音的操作接上稽核雜湊鏈：執行者為 token:<id>、結果 ok，鏈完整
+    {
+        let conn = f.admin();
+        let (actor, result, hash): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT actor, result, hash FROM audit_events WHERE category = 'alerts' AND action = 'alert.ack' ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(actor.starts_with("token:"), "{actor}");
+        assert_eq!(result, "ok");
+        assert_eq!(hash.map(|h| h.len()), Some(64));
+        let v = crate::audit::verify(&conn).unwrap();
+        assert!(v.ok(), "{v:?}");
+    }
     f.stop().await;
 }

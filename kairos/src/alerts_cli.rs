@@ -816,7 +816,7 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     category: "alerts",
                     action: "silence.create",
                     object: Some(&silence.silence_id),
-                    result: "success",
+                    result: "ok",
                     code: None,
                     details: Some(
                         json!({ "name": silence.name, "scope": scope::sentence(&silence.scope), "rules": silence.rules, "reason": silence.reason }),
@@ -881,7 +881,7 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                         category: "alerts",
                         action: "silence.end",
                         object: Some(id),
-                        result: "success",
+                        result: "ok",
                         code: None,
                         details: Some(json!({ "reason": s.end_reason })),
                     },
@@ -1022,7 +1022,7 @@ fn rules_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                             "alert_rule.disable"
                         },
                         object: Some(id),
-                        result: "success",
+                        result: "ok",
                         code: None,
                         details: Some(json!({ "reason": reason })),
                     },

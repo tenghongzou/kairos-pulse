@@ -678,7 +678,7 @@ async fn alert_action(
     c.audit(
         &format!("alert.{action}"),
         Some(id),
-        if ok { "success" } else { "failure" },
+        if ok { "ok" } else { "failed" },
         json!({ "params": body }),
     )
     .await;
@@ -773,7 +773,7 @@ async fn batch_ack(c: &Ctx<'_>, body: &Value) -> Result<Response<ApiBody>, ApiEr
     c.audit(
         "alert.ack_batch",
         None,
-        "success",
+        "ok",
         json!({ "count": ids.len(), "acked": acked, "skipped": skipped, "failed": failed }),
     )
     .await;
@@ -1057,7 +1057,7 @@ async fn create_rule(c: &Ctx<'_>, body: &Value) -> Result<Response<ApiBody>, Api
     c.audit(
         "alert_rule.create",
         Some(&rule.rule_id),
-        "success",
+        "ok",
         json!({ "name": rule.name, "kind": rule.kind, "severity": rule.severity }),
     )
     .await;
@@ -1158,7 +1158,7 @@ async fn update_rule(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Response<Api
     c.audit(
         "alert_rule.update",
         Some(id),
-        "success",
+        "ok",
         json!({ "changes": body }),
     )
     .await;
@@ -1207,7 +1207,7 @@ async fn enable_rule(
             "alert_rule.disable"
         },
         Some(id),
-        "success",
+        "ok",
         json!({ "reason": reason }),
     )
     .await;
@@ -1233,7 +1233,7 @@ async fn delete_rule(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiErro
     c.audit(
         "alert_rule.delete",
         Some(id),
-        "success",
+        "ok",
         json!({ "name": rule.name }),
     )
     .await;
@@ -1532,7 +1532,7 @@ async fn save_silence(
             "silence.create"
         },
         Some(&silence.silence_id),
-        "success",
+        "ok",
         json!({
             "kind": silence.kind,
             "name": silence.name,
@@ -1592,7 +1592,7 @@ async fn end_silence(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Response<Api
     c.audit(
         "silence.end",
         Some(id),
-        "success",
+        "ok",
         json!({ "reason": s.end_reason }),
     )
     .await;
@@ -2030,7 +2030,7 @@ async fn save_channel(
     c.audit(
         if base.is_some() { "channel.update" } else { "channel.create" },
         Some(&ch.channel_id),
-        "success",
+        "ok",
         json!({ "name": ch.name, "kind": ch.kind, "config": ch.config, "secrets_changed": changed_secrets }),
     )
     .await;
@@ -2132,7 +2132,7 @@ async fn delete_channel(
     c.audit(
         "channel.delete",
         Some(id),
-        "success",
+        "ok",
         json!({ "name": ch.name, "rules": affected, "replacement": replacement }),
     )
     .await;
@@ -2251,7 +2251,7 @@ async fn test_channel(
         c.audit(
             "channel.test",
             id,
-            if o.ok { "success" } else { "failure" },
+            if o.ok { "ok" } else { "failed" },
             json!({ "severity": severity, "code": o.code }),
         )
         .await;
