@@ -48,6 +48,13 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.4.0 之後的變更記在這裡。）
 
+### 新增（衝刺 4：註冊通道 8444 的規格，尚未實作）
+
+- `crates/kairos-proto/ENROLL.md`：Pulse ↔ Kairos 註冊通道（8444 HTTPS）協定 v1 的唯一規格——端點 `/v1/enroll/server-info`、`token-check`、`requests`（新註冊）、`requests/{request_id}`（輪詢與取回憑證，含長輪詢）、`renewals`（過期寬限期續簽）、撤回的兩段式 challenge／withdraw；錯誤碼與 `KRS-`／`PLS-` 對照、時鐘檢查、三段模式、多層速率限制、同一個 CSR 只簽發一張憑證（設計包 `INTEGRATION.md` §23.9 定案）、8443 的 `renew`／`deregister` 草稿、安全審查項目的處置、實作分工與端對端測試情境。協定不變：0.4 的 Kairos 與 Pulse 不受影響。
+- `kairos-proto` 新增 `enroll` 模組：註冊通道的請求與回應型別、欄位驗證、路徑與模式白名單、註冊 token（`KRT1-…`，GF(32) 檢查碼）、安裝字串、CA 指紋、申請編號、簽章內容的正規化與 ECDSA P-256 驗證；單元測試直接解析 ENROLL.md 的錯誤碼表、範例與測試向量。`kairos-proto` 因此依賴 `ring`、`chrono`（兩者原本就在依賴樹中）；測試另用 `rcgen`、`x509-parser`（MIT OR Apache-2.0）。
+- `kairos/PKI.md`：自動簽發的 CA 架構（根 CA 離線、Kairos 線上持有代理簽發 CA）、用戶端憑證格式、簽發 CA 的輪替、Kairos 自行產生 CRL、離線簽發模式（CSR 佇列匯出與匯入）、資料庫 schema v4。標出待使用者確認的決定。
+- `kairos/API.md` 第 11 節：註冊 token、申請（含批次核准）、註冊端點模式、憑證與 CRL、離線簽發佇列的管理端點；API token 範圍新增 `operate`、`admin`；CLI `kairos enroll-token`、`kairos enroll`、`kairos pki`。
+
 ## [0.4.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.4.0、Pulse 0.4.0**：商業審計路線圖「階段 3 MVP 產品面」。Kairos 新增 F1（查詢與管理 API）第一版：HTTPS 的主控台 API（`/api/v1`，唯讀）與 API token，是主控台畫面的前提；Pulse 新增 `pulse status`、所有人可讀的本機狀態檔與日誌的事件代碼。**協定不變**（仍為 v1～v2＋`durable`），兩個產品可以分批、以任何順序升級。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.4.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。API 的規格、端點、驗證、即時推送與量測見 `kairos/API.md`（Kairos 發佈包內的 `API.md`）；Pulse 的錯誤代碼對照見 `pulse/ERROR-CODES.md`（Pulse 發佈包內的 `ERROR-CODES.md`）。
