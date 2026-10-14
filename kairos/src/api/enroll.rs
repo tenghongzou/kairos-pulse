@@ -1,12 +1,12 @@
 //! 註冊與 PKI 的管理端點（`kairos/API.md` 第 11 節；S12～S15、S21）。
 //!
 //! 寫入端點（`POST`、`PUT`）的本文為 JSON（`Content-Type: application/json`，上限 1 MiB；CSR 佇列匯入
-//! 32 MiB），以 `principal.require(Permission::…)` 檢查範圍，每個寫入都寫入 `audit_events`
-//! （執行者 `token:<token_id>`、來源 IP）。操作本身與 CLI 共用 [`crate::enroll::ops`]。
+//! 32 MiB），以 `principal.require(Permission::…)` 檢查權限，每個寫入都寫入 `audit_events`
+//! （執行者 `token:<token_id>` 或 `user:<帳號>`、來源 IP）。操作本身與 CLI 共用 [`crate::enroll::ops`]。
+//! 驗證在 [`super::handle`] 完成，這裡收到的是已驗證的 [`Principal`]。
 
 use chrono::{DateTime, Utc};
-use hyper::body::{Bytes, Incoming};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
+use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use kairos_proto::enroll::{EnrollMode, TokenApproval};
 use serde_json::{Value, json};
@@ -70,44 +70,35 @@ fn segments(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// 處理 `/api/v1/enroll/…`、`/api/v1/pki/…`
+/// 處理 `/api/v1/enroll/…`、`/api/v1/pki/…`、`/api/v1/settings…`（已驗證）
 pub async fn handle(
-    ctx: Arc<ApiContext>,
-    peer: SocketAddr,
-    req: Request<Incoming>,
-) -> Response<ApiBody> {
-    let now = Utc::now();
-    match route(&ctx, peer, req, now).await {
-        Ok(r) => r,
-        Err(e) => e.into_response(Utc::now()),
-    }
-}
-
-async fn route(
     ctx: &Arc<ApiContext>,
     peer: SocketAddr,
     req: Request<Incoming>,
+    principal: &Principal,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
-    if ctx.shutdown.started_at().is_some() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shutting_down",
-            "Kairos 正在關機",
-        ));
-    }
     let segs = segments(req.uri().path());
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let method = req.method().clone();
     let query = Query::parse(req.uri().query())?;
-    let principal = ctx.auth.authenticate(req.headers(), peer.ip(), now).await?;
-    principal.require(Permission::Read)?;
+    // 讀取的權限依區段（ia.md §4.2：唯讀看不到註冊、PKI 與設定）
+    let read_perm = match segs.get(2).copied() {
+        Some("enroll") => Permission::EnrollRead,
+        Some("pki") => Permission::PkiRead,
+        _ => Permission::SettingsRead,
+    };
+    principal.require(read_perm)?;
+    // 寫入的權限先檢查（註冊服務沒有啟動時也回 403 而不是 503；各操作另外再檢查一次）
+    if let Some(p) = write_permission(method.as_str(), &segs[2..]) {
+        principal.require(p)?;
+    }
     let svc = ctx.enroll.clone().ok_or_else(unavailable)?;
-    let actor = format!("token:{}", principal.token_id());
+    let actor = principal.actor();
     let ip = peer.ip().to_canonical().to_string();
     let w = Writer {
         svc: &svc,
-        principal: &principal,
+        principal,
         actor: &actor,
         ip: &ip,
     };
@@ -162,6 +153,25 @@ async fn route(
     }
 }
 
+/// 寫入端點需要的權限（`settings/reset` 依設定鍵而定，在操作中檢查）
+fn write_permission(method: &str, rest: &[&str]) -> Option<Permission> {
+    Some(match (method, rest) {
+        ("POST", ["enroll", "tokens"] | ["enroll", "tokens", _, "disable"]) => {
+            Permission::EnrollTokenWrite
+        }
+        ("POST", ["enroll", "requests", "approve" | "reject"]) => Permission::EnrollDecide,
+        ("PUT", ["enroll", "mode"]) => Permission::EnrollModeWrite,
+        ("POST", ["pki", "certificates", "revoke"] | ["pki", "crl", "regenerate"]) => {
+            Permission::CertRevoke
+        }
+        ("PUT", ["pki", "policy"]) => Permission::CertPolicyWrite,
+        ("POST", ["pki", "grace-overrides"]) => Permission::GraceOverride,
+        ("GET" | "HEAD", ["pki", "signing-queue", "export"])
+        | ("POST", ["pki", "signing-queue", "import"]) => Permission::PkiQueue,
+        _ => return None,
+    })
+}
+
 fn method_not_allowed() -> ApiError {
     ApiError::new(
         StatusCode::METHOD_NOT_ALLOWED,
@@ -171,63 +181,7 @@ fn method_not_allowed() -> ApiError {
 }
 
 async fn read_body(req: Request<Incoming>, max: usize) -> Result<Value, ApiError> {
-    let headers = req.headers();
-    let ct = headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !ct
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .eq_ignore_ascii_case("application/json")
-    {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-            "本文必須是 application/json",
-        ));
-    }
-    if headers.contains_key(TRANSFER_ENCODING) {
-        return Err(ApiError::param(
-            "content-length",
-            "請以 Content-Length 送出本文（不接受 chunked）",
-        ));
-    }
-    let len = headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .ok_or_else(|| ApiError::param("content-length", "需要 Content-Length"))?;
-    if len > max {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            format!("本文超過 {max} bytes"),
-        ));
-    }
-    use hyper::body::Body;
-    let mut body = req.into_body();
-    let mut buf = Vec::with_capacity(len);
-    loop {
-        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
-        match frame {
-            None => break,
-            Some(Err(_)) => return Err(ApiError::param("body", "本文無法讀取")),
-            Some(Ok(f)) => {
-                if let Ok(d) = f.into_data() {
-                    if buf.len() + d.len() > len {
-                        return Err(ApiError::param("body", "本文比 Content-Length 長"));
-                    }
-                    buf.extend_from_slice(&d);
-                }
-            }
-        }
-    }
-    let bytes = Bytes::from(buf);
-    serde_json::from_slice(&bytes)
-        .map_err(|e| ApiError::param("body", format!("本文不是有效的 JSON：{e}")))
+    http::read_json(req, max).await
 }
 
 /// 寫入的上下文
@@ -238,25 +192,7 @@ struct Writer<'a> {
     ip: &'a str,
 }
 
-fn str_field<'a>(b: &'a Value, name: &str) -> Option<&'a str> {
-    b.get(name).and_then(Value::as_str)
-}
-
-fn str_list(b: &Value, name: &str) -> Result<Option<Vec<String>>, ApiError> {
-    match b.get(name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(a)) => a
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| ApiError::param(name, format!("{name} 必須是字串陣列")))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        _ => Err(ApiError::param(name, format!("{name} 必須是字串陣列"))),
-    }
-}
+use super::http::{str_field, str_list};
 
 fn parse_time(s: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(s)

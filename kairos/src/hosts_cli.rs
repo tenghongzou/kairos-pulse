@@ -225,7 +225,7 @@ pub fn display_width(s: &str) -> usize {
 }
 
 /// 輸出前跳脫控制字元（避免終端機跳脫序列注入）
-fn escape_text(s: &str) -> String {
+pub fn escape_text(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
             if c.is_control() {

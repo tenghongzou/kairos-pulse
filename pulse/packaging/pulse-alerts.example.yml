@@ -1,0 +1,74 @@
+# Pulse 的 Prometheus 告警規則範例（0.6.0〔草稿〕）。指標來自 [metrics]（node_exporter textfile collector 或本機 HTTP），
+# 見 Pulse README「本機指標」與 Kairos 發佈包的 prometheus.example.yml。對應的產品代碼寫在 annotations.code。
+# 主機是否在線的權威來源仍是 Kairos（主控台、kairos_agents_online）；這裡的規則補上「主機本身看到的原因」。
+
+groups:
+  - name: pulse
+    rules:
+      - alert: PulseDisconnected
+        expr: pulse_connected == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          code: PLS-E2003
+          summary: "Pulse 已 30 分鐘未連上 Kairos（{{ $labels.instance }}）"
+          description: "與 log.outage_error_after 預設的 30 分鐘一致；執行 pulse status 查看原因。"
+
+      - alert: PulseRejected
+        expr: pulse_connection_state{state="rejected"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pulse 被 Kairos 拒絕，需要人工處理（{{ $labels.instance }}）"
+          description: "例如憑證被撤銷、名稱不符；pulse status 的「連線」列有錯誤代碼。"
+
+      - alert: PulseBufferFilling
+        expr: pulse_buffer_usage_ratio > 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "本機緩衝已用 {{ $value | humanizePercentage }}（{{ $labels.instance }}）"
+          description: "滿了以後會丟掉最舊的資料（PLS-W4202）。"
+
+      - alert: PulseBufferDropping
+        expr: increase(pulse_buffer_dropped_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          code: PLS-W4202
+          summary: "過去 1 小時有待補送資料被丟棄（{{ $labels.instance }}，原因 {{ $labels.reason }}）"
+
+      - alert: PulseSampleTimeouts
+        expr: increase(pulse_sample_timeouts_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          code: PLS-W8005
+          summary: "系統資訊取樣逾時，略過 report（{{ $labels.instance }}）"
+
+      - alert: PulseClientCertExpiring
+        expr: (pulse_client_cert_expiry_timestamp_seconds - time()) / 86400 < 14
+        labels:
+          severity: warning
+        annotations:
+          code: PLS-W1110
+          summary: "用戶端憑證 14 天內到期（{{ $labels.instance }}）"
+
+      - alert: PulseClockSkew
+        expr: abs(pulse_clock_offset_seconds) > 30
+        labels:
+          severity: warning
+        annotations:
+          code: PLS-W8301
+          summary: "本機時鐘與 Kairos 相差 {{ $value }} 秒（{{ $labels.instance }}）"
+
+      - alert: PulseClockSkewCritical
+        expr: abs(pulse_clock_offset_seconds) > 300
+        labels:
+          severity: critical
+        annotations:
+          code: PLS-E8302
+          summary: "本機時鐘與 Kairos 相差超過 5 分鐘（{{ $labels.instance }}）"

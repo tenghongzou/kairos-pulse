@@ -11,8 +11,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+mod accounts;
+mod alerts;
 mod enroll;
 
+pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
+
+pub use accounts::{AccountSettings, AuditSettings, LdapSettings};
 pub use enroll::{
     CertPolicySettings, EnrollSettings, MAX_CERT_LIFETIME_DAYS, MAX_GRACE_DAYS,
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
@@ -136,8 +141,16 @@ kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n
 kairos api-token create|list|revoke [選項]（主控台 API 的 token；kairos api-token --help 顯示說明）\n       \
 kairos enroll-token create|list|show|disable [選項]（註冊 token）\n       \
 kairos enroll list|show|approve|reject|mode [選項]（註冊申請與註冊端點模式）\n       \
+kairos alerts list|show|ack|resolve|comment [選項]（告警事件；kairos alerts --help 顯示說明）\n       \
+kairos silences list|create|end [選項]（靜音與維護時段）\n       \
+kairos alert-rules list|enable|disable [選項]（告警規則）\n       \
+kairos alert-channels list（通知管道）\n       \
 kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
-kairos config show --effective（實際生效的設定與來源）\n\n\
+kairos config show --effective（實際生效的設定與來源）\n       \
+kairos users create|list|show|grant|revoke-role|disable|enable|delete|reset-password|reset-mfa|unlock|sessions|end-sessions|map-group [選項]（使用者與角色）\n       \
+kairos audit list|verify|export [選項]（稽核日誌）\n\n\
+kairos --check-config [--config <path>] [--strict] [--json]（檢查設定後結束）\n       \
+kairos diag [選項]（產生支援診斷包；kairos diag --help 顯示說明）\n\n\
 選項:\n  \
 --config <path>  指定設定檔（預設讀取目前工作目錄的 kairos.toml，不存在則使用預設值）\n  \
 -V, --version    顯示版本與建置的 commit\n  \
@@ -154,10 +167,20 @@ pub struct AppConfig {
     pub limits: LimitSettings,
     pub log: LogSettings,
     pub console: ConsoleSettings,
+    /// `/healthz`、`/readyz`、`/metrics`（審計 O3）
+    pub observability: ObservabilitySettings,
     /// 註冊通道（8444，`crates/kairos-proto/ENROLL.md`）
     pub enroll: EnrollSettings,
     /// PKI 與憑證政策（`kairos/PKI.md` 第 8 節）
     pub pki: PkiSettings,
+    /// 告警引擎（`kairos/ALERTS.md`）
+    pub alerts: AlertSettings,
+    /// 本機帳號、密碼政策、登入鎖定與工作階段（`kairos/API.md` 第 12 節）
+    pub accounts: AccountSettings,
+    /// 目錄服務（LDAP／AD）
+    pub ldap: LdapSettings,
+    /// 稽核日誌
+    pub audit: AuditSettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,
@@ -569,6 +592,15 @@ pub struct LogSettings {
     pub level: String,
     /// logs/kairos-YYYY-MM-DD.log 保留天數（今天與前 N 天），0 = 永久保留
     pub retention_days: u32,
+    /// `text`（預設，RFC 3339 帶時區）、`json`（一行一個 JSON，`logs/kairos-YYYY-MM-DD.jsonl`）、
+    /// `legacy`（0.5 以前的格式：本地時間不帶時區，過渡用）
+    pub format: String,
+    /// `local`（預設）或 `utc`：`text` 的時間；`json` 一律 UTC、`legacy` 一律本地時間
+    pub timezone: String,
+    /// 同時寫到 stdout（以 systemd 執行時進 journal）；預設 `true`（與 0.5 相同）
+    pub stdout: bool,
+    /// syslog 外送（RFC 5424）
+    pub syslog: SyslogSettings,
 }
 
 impl Default for LogSettings {
@@ -576,11 +608,154 @@ impl Default for LogSettings {
         Self {
             level: "info".to_string(),
             retention_days: 14,
+            format: "text".to_string(),
+            timezone: "local".to_string(),
+            stdout: true,
+            syslog: SyslogSettings::default(),
         }
     }
 }
 
+/// `[log.syslog]`：外送到 syslog（審計 S7、O3）
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SyslogSettings {
+    /// `udp://主機:埠`（預設埠 514）、`tcp://主機:埠`（預設埠 601，RFC 6587 octet counting）、
+    /// `unix:///dev/log`；空字串＝不外送
+    pub target: String,
+    /// `daemon`（預設）、`user`、`auth`、`authpriv`、`local0`～`local7`
+    pub facility: String,
+    /// RFC 5424 的 APP-NAME
+    pub app_name: String,
+    /// `text`（預設）或 `json`（MSG 為與 `log.format = "json"` 相同的一行 JSON）
+    pub payload: String,
+}
+
+impl Default for SyslogSettings {
+    fn default() -> Self {
+        Self {
+            target: String::new(),
+            facility: "daemon".to_string(),
+            app_name: "kairos".to_string(),
+            payload: "text".to_string(),
+        }
+    }
+}
+
+/// `[observability]`：健康檢查與 Prometheus 端點（審計 O3；設計包 §24 #8）
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ObservabilitySettings {
+    /// 另外以純 HTTP 監聽 `/healthz`、`/readyz`、`/metrics` 的位址（例如 `127.0.0.1:9464`）；
+    /// 空字串＝不另外監聽（端點仍在主控台的監聽上）
+    pub listen: String,
+    /// 主控台的監聽（`console.listen`，HTTPS）也提供這三個端點
+    pub on_console: bool,
+    /// `/metrics` 的 bearer token 所在的檔案（內容為 token，一行）。設定時任何來源都要帶
+    /// `Authorization: Bearer <token>`；未設定時 `/metrics` 只接受 loopback 來源。
+    /// `/healthz`、`/readyz` 不需要認證（只回傳狀態，不含版本、路徑與數量）
+    pub metrics_token_file: String,
+}
+
+impl Default for ObservabilitySettings {
+    fn default() -> Self {
+        Self {
+            listen: String::new(),
+            on_console: true,
+            metrics_token_file: String::new(),
+        }
+    }
+}
+
+/// `observability.metrics_token_file` 的 token 最短長度
+pub const MIN_METRICS_TOKEN_LEN: usize = 16;
+
+impl ObservabilitySettings {
+    /// 讀取 `/metrics` 的 token（未設定時為 `None`）
+    pub fn metrics_token(&self) -> Result<Option<String>, Error> {
+        let path = self.metrics_token_file.trim();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("無法讀取 observability.metrics_token_file {path}：{e}"),
+            )
+        })?;
+        let token = text.trim().to_string();
+        if token.len() < MIN_METRICS_TOKEN_LEN || !token.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "observability.metrics_token_file {path} 的內容必須是至少 {MIN_METRICS_TOKEN_LEN} 個可列印 ASCII 字元的一行 token（例如 openssl rand -hex 32 的輸出）"
+                ),
+            ));
+        }
+        Ok(Some(token))
+    }
+}
+
 impl LogSettings {
+    /// `log.format`
+    pub fn log_format(&self) -> Result<kp_obs::logfmt::LogFormat, Error> {
+        kp_obs::logfmt::LogFormat::parse(&self.format).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "log.format 的值 \"{}\" 無效，可用值: text、json、legacy",
+                    self.format
+                ),
+            )
+        })
+    }
+
+    /// `log.timezone`
+    pub fn log_timezone(&self) -> Result<kp_obs::logfmt::LogTimezone, Error> {
+        kp_obs::logfmt::LogTimezone::parse(&self.timezone).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "log.timezone 的值 \"{}\" 無效，可用值: local、utc",
+                    self.timezone
+                ),
+            )
+        })
+    }
+
+    /// `[log.syslog]` 轉成外送設定；`target` 為空時為 `None`
+    pub fn syslog_config(&self, hostname: &str) -> Result<Option<kp_obs::syslog::Config>, Error> {
+        let s = &self.syslog;
+        if s.target.trim().is_empty() {
+            return Ok(None);
+        }
+        let invalid = |m: String| Error::new(ErrorKind::InvalidInput, m);
+        let transport = kp_obs::syslog::parse_target(&s.target)
+            .map_err(|e| invalid(format!("log.syslog.target 無效：{e}")))?;
+        let facility = kp_obs::syslog::parse_facility(&s.facility).ok_or_else(|| {
+            invalid(format!(
+                "log.syslog.facility 的值 \"{}\" 無效，可用值: daemon、user、auth、authpriv、local0～local7",
+                s.facility
+            ))
+        })?;
+        let payload = kp_obs::syslog::Payload::parse(&s.payload).ok_or_else(|| {
+            invalid(format!(
+                "log.syslog.payload 的值 \"{}\" 無效，可用值: text、json",
+                s.payload
+            ))
+        })?;
+        if s.app_name.trim().is_empty() {
+            return Err(invalid("log.syslog.app_name 不可為空".to_string()));
+        }
+        Ok(Some(kp_obs::syslog::Config {
+            transport,
+            facility,
+            app_name: s.app_name.trim().to_string(),
+            hostname: hostname.to_string(),
+            payload,
+        }))
+    }
+
     pub fn level_filter(&self) -> Result<LevelFilter, Error> {
         LevelFilter::from_str(self.level.trim()).map_err(|_| {
             Error::new(
@@ -629,6 +804,16 @@ pub enum CliAction {
     ApiToken(crate::token_cli::TokenCommand),
     /// `kairos enroll-token|enroll|pki|config ...`（註冊與 PKI，見 [`crate::enroll_cli`]）
     Enroll(crate::enroll_cli::Cmd),
+    /// `kairos alerts|silences|alert-rules|alert-channels ...`（告警，見 [`crate::alerts_cli`]）
+    Alerts(crate::alerts_cli::Cmd),
+    /// `kairos users ...`（使用者、角色指派、工作階段，見 [`crate::users_cli`]）
+    Users(crate::users_cli::UsersCommand),
+    /// `kairos audit ...`（稽核日誌的查詢、驗證與匯出，見 [`crate::audit_cli`]）
+    Audit(crate::audit_cli::AuditCommand),
+    /// `kairos diag ...`（支援診斷包，見 [`crate::diag`]）
+    Diag(crate::diag::DiagArgs),
+    /// `kairos --check-config`／`kairos check-config`（檢查設定後結束，見 [`crate::diag`]）
+    CheckConfig(crate::diag::CheckArgs),
 }
 
 /// `--config=<path>` 的前綴
@@ -667,6 +852,17 @@ fn strip_config_eq(arg: &OsStr) -> Option<Result<OsString, String>> {
 /// 會 panic。設定檔路徑可以不是 UTF-8；其他非 UTF-8 的參數回錯誤（訊息中以 U+FFFD 取代無法辨識的部分）。
 pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction, String> {
     let mut config_path = None;
+    let args: Vec<OsString> = args.into_iter().collect();
+    if args.first().is_some_and(|a| a == "diag") {
+        return crate::diag::parse_args(args.into_iter().skip(1)).map(CliAction::Diag);
+    }
+    if args.first().is_some_and(|a| a == "check-config") {
+        return crate::diag::parse_check_args(args.into_iter().skip(1)).map(CliAction::CheckConfig);
+    }
+    if args.iter().any(|a| a == "--check-config") {
+        return crate::diag::parse_check_args(args.into_iter().filter(|a| a != "--check-config"))
+            .map(CliAction::CheckConfig);
+    }
     let mut iter = args.into_iter().peekable();
     if iter.peek().is_some_and(|a| a == "hosts") {
         iter.next();
@@ -679,6 +875,14 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "db") {
         iter.next();
         return crate::export_cli::parse_db_args(iter).map(CliAction::Db);
+    }
+    if iter.peek().is_some_and(|a| a == "users") {
+        iter.next();
+        return crate::users_cli::parse_args(iter).map(CliAction::Users);
+    }
+    if iter.peek().is_some_and(|a| a == "audit") {
+        iter.next();
+        return crate::audit_cli::parse_args(iter).map(CliAction::Audit);
     }
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();
@@ -693,6 +897,17 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
         if iter.peek().is_some_and(|a| a == name) {
             iter.next();
             return crate::enroll_cli::parse_args(group, iter).map(CliAction::Enroll);
+        }
+    }
+    for (name, group) in [
+        ("alerts", crate::alerts_cli::Group::Alerts),
+        ("silences", crate::alerts_cli::Group::Silences),
+        ("alert-rules", crate::alerts_cli::Group::Rules),
+        ("alert-channels", crate::alerts_cli::Group::Channels),
+    ] {
+        if iter.peek().is_some_and(|a| a == name) {
+            iter.next();
+            return crate::alerts_cli::parse_args(group, iter).map(CliAction::Alerts);
         }
     }
     while let Some(arg) = iter.next() {
@@ -1167,8 +1382,32 @@ impl AppConfig {
         self.validate_console()?;
         self.enroll.validate()?;
         self.pki.validate()?;
+        self.alerts.validate()?;
+        self.accounts.validate()?;
+        self.ldap.validate()?;
+        self.audit.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
+        self.log.log_format()?;
+        self.log.log_timezone()?;
+        self.log.syslog_config("-")?;
+        self.validate_observability()?;
+        Ok(())
+    }
+
+    /// `[observability]` 的檢查：位址的格式、token 檔可讀且格式正確（主機名稱在啟動時解析）
+    fn validate_observability(&self) -> Result<(), Error> {
+        let o = &self.observability;
+        let listen = o.listen.trim();
+        if !listen.is_empty() && !listen.contains(':') {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "observability.listen 應為 位址:埠（例如 127.0.0.1:9464），目前為 {listen}"
+                ),
+            ));
+        }
+        o.metrics_token()?;
         Ok(())
     }
 
@@ -1183,6 +1422,9 @@ impl AppConfig {
             "enroll.listen",
             self.enroll.listen_addr(&self.server.listen),
         ));
+        if !self.observability.listen.trim().is_empty() {
+            named.push(("observability.listen", self.observability.listen.clone()));
+        }
         for i in 0..named.len() {
             for j in i + 1..named.len() {
                 if let (Ok(a), Ok(b)) = (

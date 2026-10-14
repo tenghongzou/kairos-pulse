@@ -14,6 +14,7 @@
 | `kairos.example.toml` | 644 | 設定範本，複製成 `kairos.toml` 後修改 |
 | `kairos.service` | 644 | systemd unit 範本 |
 | `kairos-crl.service`、`kairos-crl.timer` | 644 | CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
+| `prometheus.example.yml`、`kairos-alerts.example.yml` | 644 | Prometheus 抓取設定與告警規則範例（第 9.2a 節，0.6.0） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
@@ -424,15 +425,37 @@ sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 Kairos 的日誌同時寫到 stdout 與 `/opt/kairos/logs/kairos-YYYY-MM-DD.log`（UTC 日期分檔，依 `log.retention_days` 清除）。在預設的 unit 下 stdout 進 journal，所以同一份日誌會存兩份：
 
 - 保留預設：可用 `journalctl -u kairos` 查詢，與 systemd 的啟停紀錄放在一起。
-- 只要檔案一份：以 drop-in 設定 `StandardOutput=null`。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
+- 只要檔案一份：以 drop-in 設定 `StandardOutput=null`，或在 `kairos.toml` 設定 `log.stdout = false`（0.6〔草稿〕）。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
+
+交給 SIEM（0.6〔草稿〕，審計 O3、S7）：`log.format = "json"`（檔名改為 `kairos-YYYY-MM-DD.jsonl`，一行一個 JSON、UTC、固定欄位 `ts`、`level`、`event`、`code`、`msg`、`fields`…），由 Filebeat／Fluent Bit 收集；或設定 `[log.syslog]` 的 `target`（`udp://`、`tcp://`、`unix:///dev/log`）以 RFC 5424 直接送出。`log.format = "legacy"` 保留 0.5 以前的行格式供既有的解析規則過渡（`text` 的行首改為 RFC 3339 帶時區，例如 `2026-10-14T14:22:16.123+08:00 [INFO] …`）。
+
+### 9.2a 健康檢查、Prometheus 與診斷包（0.6〔草稿〕）
+
+```bash
+# 設定檢查（不啟動服務、不連線）：0 通過、8 有警告（--strict）、3 設定錯誤、4 憑證錯誤
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+
+# 健康檢查（主控台的監聽上；不需要 token，只回傳狀態字）
+curl -sk https://127.0.0.1:9443/healthz        # {"status":"ok"}
+curl -sk https://127.0.0.1:9443/readyz         # 200 就緒／503 不就緒，本文為各項的狀態
+curl -sk https://127.0.0.1:9443/metrics | head # Prometheus 文字格式；未設定 token 時只接受 loopback
+
+# 支援診斷包（tar.gz，0600；遮蔽 token、密碼、私鑰）。交給外部廠商時加 --redact-hosts
+cd /tmp && sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml
+```
+
+- **負載平衡器的探針**：以 `GET /readyz` 判斷（200／503）。主控台不對外開放時，在 `kairos.toml` 設定 `[observability] listen = "<負載平衡器可達的位址>:9464"`（純 HTTP，只有 `/healthz`、`/readyz`、`/metrics` 三個端點，`/metrics` 仍只接受 loopback 或帶 token 的請求）；只負責 8444 的負載平衡器用 `/readyz?scope=enroll`。
+- **Prometheus**：同一台主機時抓 `http://127.0.0.1:9464/metrics`（`observability.listen = "127.0.0.1:9464"`）；從其他主機抓取時設定 `observability.metrics_token_file`（`openssl rand -hex 32 > /opt/kairos/metrics.token && chown root:kairos /opt/kairos/metrics.token && chmod 640 /opt/kairos/metrics.token`），經主控台的 HTTPS 以 bearer token 抓取。設定與建議的告警規則見 `prometheus.example.yml`、`kairos-alerts.example.yml`。
+- 另外建議在 Kairos 以外監看 `/healthz`（例如既有的 Zabbix）：Kairos 自己無法通知「自己已經停止」。
 
 ### 9.3 主控台 API
 
-主控台 API（`API.md`）以 HTTPS 監聽 `console.listen`，預設 `127.0.0.1:9443`，憑證沿用 `cert.pem`／`key.pem`。所有端點都需要 API token：
+主控台 API（`API.md`）以 HTTPS 監聽 `console.listen`，預設 `127.0.0.1:9443`，憑證沿用 `cert.pem`／`key.pem`。所有端點都需要驗證：整合與腳本用 API token，人員以帳號登入（工作階段，0.6.0；第 9.4 節）。
 
 ```bash
-# 建立唯讀 token（stdout 只有 token，只顯示這一次；預設 90 天後到期）。
-# 註冊與 PKI 的寫入操作（0.5.0）需要 --scope operate（核准、拒絕）或 --scope admin（撤銷、模式、政策）
+# 建立唯讀 token（角色 viewer；stdout 只有 token，只顯示這一次；預設 90 天後到期）。
+# 寫入操作需要對應的角色：--role operator（核准、拒絕、撤銷）或 --role admin（模式、政策、使用者）；
+# 或以 --user <帳號> 讓 token 擁有該使用者的權限（API.md 第 12.1 節）
 TOKEN=$(sudo -u kairos /opt/kairos/kairos api-token create --name ops-check --config /opt/kairos/kairos.toml)
 # 在 Kairos 主機上確認（-k：自簽或私有 CA 的憑證；正式使用請以 --cacert 指定 CA）
 curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:9443/api/v1/system/health
@@ -456,6 +479,37 @@ sudo -u kairos /opt/kairos/kairos api-token revoke <token_id> --reason "確認�
   agent 連線埠（8080／8443）與主控台分開：agent 所在的網段不需要、也不應該能連到 9443。
 - 瀏覽器或整合要信任主控台的憑證時，建議另外簽發 SAN 為主控台網址的憑證，設定 `console.cert_path`／`console.key_path`（同樣熱重載）。
 - 主控台需要 SQLite（`storage.backend = "sqlite"`，預設）；`backend = "jsonl"` 時不啟動並記 `WARN`。
+
+### 9.4 建立首位管理員（0.6.0）
+
+Kairos **沒有預設的帳號與密碼**。安裝（或從 0.5 升級）後，以服務帳號建立第一位管理員；Kairos 執行中也可以：
+
+```bash
+sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name "系統管理員" \
+  --config /opt/kairos/kairos.toml
+```
+
+- stdout 的那一行是**一次性的初始密碼**（只顯示這一次，4 組 5 個字元）：立即交給管理員本人，第一次登入主控台時必須變更（變更前其他功能都回 `password_change_required`）。
+- 要自行指定密碼時加上 `--password-stdin`，從檔案或管線提供（標準輸入是終端機時會被拒絕，避免密碼顯示在畫面上）：
+
+  ```bash
+  install -m 600 /dev/null /root/admin.pw && vi /root/admin.pw      # 寫入至少 12 個字元的密碼
+  sudo -u kairos /opt/kairos/kairos users create admin --role admin --password-stdin \
+    --config /opt/kairos/kairos.toml < /root/admin.pw && shred -u /root/admin.pw
+  ```
+
+- 登入（主控台網頁介面完成前，可用 curl 確認）：
+
+  ```bash
+  curl -sk -c cookies.txt -H 'Content-Type: application/json' \
+    -d '{"username":"admin","password":"<初始密碼>"}' https://127.0.0.1:9443/api/v1/auth/login
+  ```
+
+  回應的 `csrf_token` 要放在之後每個寫入請求的 `X-CSRF-Token` 標頭（例如 `POST /api/v1/me/password` 變更密碼）。
+- 建議接著：以 `POST /api/v1/me/totp/setup`、`/enable` 綁定 TOTP（回應的 10 組復原碼離線保存）；為其他人建立各自的帳號（`kairos users create <帳號> --role operator|auditor|viewer`），不要共用 `admin`；至少保留兩位管理員（最後一位管理員不能被停用或移除）。
+- 確認稽核日誌：`sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml`（完整時結束代碼 0；斷裂時 9、`KRS-E6201`）。
+- 使用 AD／LDAP 時，在 `kairos.toml` 設定 `[ldap]`（`ca_file` 必填；服務帳號密碼放在 `chmod 600` 的 `bind_password_file`），重新啟動後以 `kairos users map-group "<群組 DN>" --role operator` 對應角色（API.md 第 12.7 節）。
+- 主控台金鑰 `data/console.key`（0600）在第一次啟動主控台時建立，用於 CSRF 與 TOTP 秘密的加密；備份資料庫時一併（加密）備份，遺失時已綁定的 TOTP 需以 `kairos users reset-mfa` 重設。
 
 ## 10. 日常維運
 
@@ -490,6 +544,11 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
   備份檔不會覆寫既有的檔案；舊備份請自行輪替（例如 `find /var/backups/kairos -name 'kairos-*.db' -mtime +14 -delete`）。還原步驟見 `STORAGE.md`「備份與還原」。停機備份時直接複製整個 `data/` 即可。
 - 使用 JSONL（`storage.backend = "jsonl"` 或鏡像）時另備份 `/opt/kairos/data/reports-*.jsonl`；搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
 - 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
+- **資料目錄中的兩個金鑰檔**（0.6.0 起；`kairos db backup` 的備份**不含**，資料庫中只有以它們加密的密文）：
+  - `data/alerts-secrets.key`：通知管道機密（SMTP 密碼、Webhook 網址、HMAC 金鑰、LINE token）的 AES-256-GCM 金鑰。
+  - `data/console.key`：主控台的 CSRF 與 TOTP 秘密的加密金鑰。
+
+  以加密的方式與資料庫備份一起保存（例如 `tar -C /opt/kairos/data -cf - alerts-secrets.key console.key | gpg -c > keys-$(date -u +%F).tar.gpg`）。**還原到同一台或新主機時，資料庫與這兩個檔案要一起複製**（擁有者 `kairos`、權限 0600）：少了 `alerts-secrets.key` 時所有通知管道的機密無法解密（管道需重新輸入機密，日誌 `alerts.channel.decrypt_failed`），少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。金鑰與資料庫要是同一次備份的組合（不要拿新金鑰配舊資料庫）。
 - 使用線上簽發（第 6.5 節）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 
 ### 10.3 定期更新 CRL（kairos-crl.timer）
@@ -544,6 +603,8 @@ systemctl list-timers kairos-crl.timer
 **從 0.3 升級到 0.4：主控台 API 預設監聽 `127.0.0.1:9443`**。升級前確認 9443 沒有被其他程式使用（`ss -ltnp | grep :9443`），否則 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）；被佔用時在 `kairos.toml` 加上 `[console]` 的 `listen`（換連接埠）或 `enabled = false`。資料庫升級到 schema v3（新增 `api_tokens` 與被拒憑證的欄位）：**升級前以 `kairos db backup` 備份**，升級後 0.3 無法開啟。檔案描述元的需要量多了主控台的連線上限（預設 64）；發佈包 unit 的 `LimitNOFILE=8192` 足夠。協定不變，Kairos 與 Pulse 0.4 可以任意順序、分批升級（Pulse 0.4 的變更只在本機：`pulse status`、狀態檔與日誌的事件代碼，見 Pulse 的 INSTALL 第 10 節）。
 
 **從 0.4 升級到 0.5：註冊通道與 PKI（schema v4）**。資料庫升級到 schema v4（註冊 token、申請、簽發的憑證、CRL、設定、稽核等資料表）：**升級前以 `kairos db backup` 備份**，升級後 0.4 無法開啟。`kairos.toml` 沒有 `[enroll]` 時註冊通道維持關閉（啟動時記一次 `KRS-I2010`），沒有 `[pki]` 時為離線簽發，**行為與 0.4 相同**，不需要修改設定；要啟用時依第 6.5 節。啟用後檔案描述元的需要量另加 `enroll.max_connections`（預設 1024），發佈包 unit 的 `LimitNOFILE=8192` 足夠。既有的 API token 維持 `read`；寫入操作（核准、撤銷、模式切換）需要以 `--scope operate` 或 `--scope admin` 建立新的 token。主控台修改的註冊模式與憑證政策存在資料庫、優先於 `kairos.toml`，以 `kairos config show --effective` 查看來源。Pulse 0.4 照常以 8443 連線（`hello_ack` 與 0.4 相同）；註冊與 8443 的輪替需要 Pulse 0.5。
+
+**從 0.5 升級到 0.6：告警、使用者與稽核、可觀測性（schema v6）**。資料庫依序升級到 schema v5（告警）與 v6（使用者、角色指派、工作階段、稽核雜湊鏈）：**升級前以 `kairos db backup` 備份**，升級後 0.5 無法開啟。資料目錄會多出 `alerts-secrets.key`、`console.key`（0600），之後的備份要一起保存（第 10.2 節）。既有的 API token **保留原本的範圍與權限**（`read`／`operate`／`admin`），**不會**得到 0.6 新增的權限（使用者、稽核、告警）：需要讀寫告警的整合以 `kairos api-token create --role viewer|operator|admin` 建立新 token；`kairos api-token create` 未指定時改為 `--role viewer`（主機、健康、告警事件與靜音的讀取），需要註冊、PKI 或設定的讀取時以 `--role auditor` 或 `--role operator` 建立。告警引擎預設啟用、沒有通知管道（不需要時 `[alerts] enabled = false`）。日誌行首的時間改為 RFC 3339（需要過渡時 `log.format = "legacy"`）；主控台的監聽上多了不需認證的 `/healthz`、`/readyz` 與只接受 loopback 的 `/metrics`（第 9.2a 節；不要時 `observability.on_console = false`）。既有的稽核紀錄在升級後第一次寫入時補上雜湊。升級前可先以新版執行 `kairos --check-config --config /opt/kairos/kairos.toml`；升級後依第 9.4 節建立首位管理員。協定不變，Pulse 可以任何順序升級。
 
 **從 0.4 升級到 0.5 的順序：先升級 Kairos，再升級 Pulse**：(1) `kairos db backup` → (2) 換上新版 Kairos 並重新啟動（此時註冊通道仍關閉）→ (3) 建立簽發 CA 並在 `kairos.toml` 開啟 `[enroll]`、`[pki]`（第 6.5 節），重新啟動後確認日誌有「註冊端點（8444）已啟動」→ (4) 防火牆開放 8444，只允許要註冊的主機 → (5) 通知 Pulse 端升級（建立 `/opt/pulse/identity`、換上新版 `pulse.service`，Pulse 的 INSTALL 第 10 節）。`storage.backend = "jsonl"` 時沒有註冊服務（不監聽 8444）。完整步驟與版本組合見 `CHANGELOG.md` [0.5.0]。
 

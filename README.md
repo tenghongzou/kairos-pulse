@@ -16,7 +16,9 @@ kairos-pulse/
 ├── packaging/             兩個產品共用的打包實作、release.sh、簽章、可重現性檢查與 cargo-about 設定
 ├── crates/                兩個產品共用的內部 crate（publish = false）
 │   ├── kairos-proto/      協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
-│   └── date-guard/        依日期命名檔案的保留清除規則與時鐘跳躍／回撥保護（DateGuard）
+│   ├── date-guard/        依日期命名檔案的保留清除規則與時鐘跳躍／回撥保護（DateGuard）
+│   └── kp-obs/            可觀測性：日誌格式（text／json／legacy）、syslog（RFC 5424）、Prometheus 文字格式、
+│                          診斷包（tar.gz、敏感資料遮蔽）、--check-config 的輸出
 ├── kairos/                Kairos 伺服器（說明見 kairos/README.md）
 ├── pulse/                 Pulse 代理（說明見 pulse/README.md）
 └── tests/e2e/             端對端測試 kp-e2e（publish = false）：啟動實際的 kairos 與 pulse 執行檔
@@ -60,6 +62,8 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 | `tests/api.rs` | 主控台 API（`kairos/API.md`）：以實際的 `kairos api-token create` 建立 token（Kairos 在日誌中記錄建立、不含秘密），先開 SSE 再啟動 Pulse → `host.added`；主機清單（狀態、CIDR 搜尋、計數）、詳情（durable）、CPU 趨勢、總覽、系統健康；Pulse 停止 → `host.offline`（`connection_closed`），以 `Last-Event-ID` 重連補送；CRL 撤銷 → `host.offline`（`certificate_rejected`），之後握手被拒的憑證歸屬到主機（`KRS-W1105`） |
 | `tests/enroll.rs` | 註冊通道 8444（Kairos 端，測試用的 HTTPS 用戶端以 `kairos-proto` 的型別組請求）：申請 → CLI 核准 → 長輪詢取回 → 以該憑證連 8443（`hello_ack` 宣告 `renew`／`deregister`）；8443 的正常輪替與 `superseded`；撤銷後 5 秒內被斷線；除役與 10 分鐘視窗；過期續簽、重放在 Kairos 重新啟動後仍被拒、時鐘偏差；模式切換、`config show --effective`、限流 |
 | `tests/enroll_pulse.rs` | 註冊通道的完整流程（實際的 `pulse enroll`、Pulse 服務、`pulse decommission`）：安裝字串自動核准、人工核准由背景服務取回、token 錯字／無效／過期／用完／停用、CA 指紋不符、拒絕、撤回、離線簽發（匯出 → `sign-bundle` → 匯入）、回應遺失後重送、限流與僅續簽、過期寬限期續簽（含回應遺失）、撤銷後斷線與 `--force` 重新註冊、8443 輪替、除役、沒有 8444 的 Kairos；並檢查 `identity/` 權限與秘密不外洩（ENROLL.md 第 19.5 節） |
+| `tests/users.rs` | 使用者與稽核（0.6.0）：沒有預設帳號，首位管理員以實際的 `kairos users create --role admin` 建立 → 以一次性密碼登入（必須先變更密碼；cookie 的 HttpOnly、Secure、SameSite=Strict 與 CSRF）→ 建立其他使用者；`kairos audit verify` 驗證雜湊鏈，啟動、登入、密碼變更、關機都在鏈中，日誌與輸出不含密碼 |
+| `tests/alerts.rs` | 三條線的整合（0.6.0，兩端的日誌都是 `log.format = "json"`）：首位管理員 → 建立維運者與唯讀 → 管理員新增 Webhook 管道（測試內的本機 HTTP 接收器；維運者 403）並綁到主機離線規則 → Pulse 停止 → Webhook 收到簽章的 `kairos.alert.v1` → 唯讀確認 403、沒有 CSRF token 403 → 維運者以工作階段確認 → `/metrics` 有告警、通知與主機的計數 → `kairos audit verify` 通過，告警操作與被拒的請求在鏈中；兩端的每一行輸出都是 v1 的 JSON 日誌，日誌不含機密與密碼 |
 | `tests/import.rs` | `kairos reports import`：Kairos 執行中拒絕（檔案鎖跨行程；主控台的寫入連線不得放掉這把鎖）、停止後匯入、重新啟動後匯出與清冊 |
 
 - 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。

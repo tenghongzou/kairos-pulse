@@ -188,6 +188,7 @@ impl ReportLimiter {
         now: Instant,
         max_wait: Duration,
     ) -> Pace {
+        let by_identity = matches!(source, ReportSource::Agent(_));
         let mut buckets = self.lock();
         if !buckets.contains_key(&source) && buckets.len() >= PRUNE_THRESHOLD {
             buckets.retain(|_, b| !b.is_full(now));
@@ -205,6 +206,13 @@ impl ReportLimiter {
             wait = wait.max(c.wait_needed(now));
         }
         if wait > max_wait.saturating_add(PACING_TOLERANCE) {
+            // /metrics：依身分（mTLS）或依來源 IP 被拒（O3）
+            let m = crate::metrics::global();
+            if by_identity {
+                m.report_rate_limited_identity.inc();
+            } else {
+                m.report_rate_limited_ip.inc();
+            }
             return Pace::Reject;
         }
         bucket.consume();

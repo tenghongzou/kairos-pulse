@@ -27,6 +27,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 同一個 Kairos 0.2.0 可以同時服務 v1 與 v2 的 Pulse：每個 agent 依自己的連線協商，同一個 `reports-*.jsonl` 中 `schema` 1 與 2 的行並存（讀取工具須依 `schema` 分流，見破壞性變更第 6 項）。
 - 0.3.0〔草稿〕的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
 - 0.5.0〔草稿〕的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
+- 0.6.0〔草稿〕的協定與 8443 的 feature 都與 0.5.0 相同，0.5 與 0.6 的任何組合都能連線；Kairos 的資料庫升級到 schema v6（告警、使用者與稽核），Pulse 只新增可觀測性（日誌格式、syslog、本機指標、`diag`）。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
@@ -47,7 +48,99 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（0.5.0 之後的變更記在這裡。）
+（0.6.0〔草稿〕之後的變更記在這裡。）
+
+## [0.6.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.6.0、Pulse 0.6.0**：衝刺 5 的三條線——**告警引擎**（審計 F3；設計包 `kairos/alerts-ux.md`、`screens.md` S06～S11、§24 #2、#8、#9）、**使用者、角色、工作階段與稽核**（審計 F6、S7 的雜湊鏈部分；`screens.md` S01、S16～S18、S23、§24 #10、#11、D25）、**可觀測性**（審計 O3、O8；`screens.md` S20、§24 #8、`pulse/log-ux.md`、`pulse/cli-spec.md` §6、§8）。版本號已改為 0.6.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。**協定不變**（v1～v2，8443 的 feature 與 0.5 相同），Kairos 與 Pulse 0.5／0.6 的任何組合都能照常連線。Pulse 只有可觀測性的變更。
+
+規格：告警 [`kairos/ALERTS.md`](kairos/ALERTS.md)、`kairos/API.md` 第 13 節；使用者與稽核 `kairos/API.md` 第 12 節；健康檢查與 `/metrics` 見 `kairos/README.md`「健康檢查與 Prometheus」；資料表 `kairos/STORAGE.md` 第 3 節。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **資料庫升級到 schema v6**（0.5.0 為 v4；依序套用 v5、v6，各自一個交易）。v5：告警的 `alert_rules`、`alert_events`、`alert_timeline`、`alert_silences`、`alert_channels`、`alert_deliveries`、`alert_actions`；v6：`users`、`user_recovery_codes`、`role_assignments`、`sessions`，`api_tokens` 加 `owner_user_id`、`role`，`audit_events` 加 `prev_hash`、`hash`，`hosts` 加 `host_group` | 所有 SQLite 部署 | 升級前 `kairos db backup`；升級後 0.5 無法開啟資料庫（降版從備份還原）。`kairos alerts`、`users`、`audit`、`api-token` 等開啟資料庫時同樣會升級 schema |
+| 2 | Kairos | **資料目錄多了兩個金鑰檔**：`alerts-secrets.key`（通知管道機密的 AES-256-GCM 金鑰）、`console.key`（CSRF 與 TOTP 秘密），都是 0600，`kairos db backup` **不含** | 備份、還原、搬移資料目錄的部署 | 與資料庫備份一起（加密）保存，**還原時一起複製**（INSTALL 第 10.2 節、STORAGE.md 第 9 節）；少了 `alerts-secrets.key` 時管道的機密需重新輸入，少了 `console.key` 時 TOTP 需重設 |
+| 3 | Kairos | **0.4／0.5 的 API token 權限凍結在升級前**：`read`／`operate`／`admin` 範圍不會得到 0.6 新增的權限（使用者、稽核、目錄服務、API token 管理、**告警**）。`kairos api-token create` 的預設改為 `--role viewer`；`--scope` 已棄用（仍可使用，權限同樣凍結） | 要讀寫告警、使用者或稽核的整合；以 `api-token create` 不帶參數建立 token、並讀取 `/api/v1/enroll`、`/pki`、`/settings` 的腳本 | 以 `--role viewer`（告警與靜音唯讀）、`--role auditor`（唯讀全部）、`--role operator`（處理告警、核准註冊）或 `--role admin` 建立新 token。既有 token 的既有用途不受影響 |
+| 4 | Kairos | **告警引擎預設啟用**（`[alerts] enabled = true`），第一次啟動時建立 30 條系統預設規則；**沒有任何通知管道**，事件只出現在主控台與 `kairos alerts list` | 所有 SQLite 部署 | 不需要時 `[alerts] enabled = false`。需要通知時由管理員新增管道（`POST /api/v1/channels`）並綁到規則 |
+| 5 | 兩者 | **日誌行首的時間改為 RFC 3339、毫秒、帶時區位移**：`2026-10-14 14:22:16 [INFO] …` → `2026-10-14T14:22:16.123+08:00 [INFO] …`；有固定事件的行在訊息前加「`<event> <code> `」（審計 O3） | 以 grok、正規表示式或 `cut` 解析行首時間的收集規則、腳本 | 更新規則；需要時間過渡時設定 `log.format = "legacy"`（與 0.5 相同，保留一個主要版本）。建議改用 `log.format = "json"` |
+| 6 | Kairos | **主控台的監聽上新增不需要認證的 `/healthz`、`/readyz`**（只回傳狀態字），以及 `/metrics`（未設定 `observability.metrics_token_file` 時只接受 loopback） | 主控台開放給管理網段、且不希望任何未認證端點的部署 | 設定 `observability.on_console = false`（端點改由 `observability.listen` 提供，或完全不提供） |
+| 7 | Kairos | 主控台 API 的 403 多了 `details.permission`；權限不足的寫入請求寫入稽核（`access.denied`）。主機 API 的 `offline_reason` 多了 `write_unknown` | 解析 403、依 `offline_reason` 判斷的整合 | 只新增欄位與值；讀取端應忽略不認得的值 |
+
+**升級步驟**：先 `kairos db backup` 並另外保存資料目錄的金鑰檔 → 換上 Kairos 0.6.0（`kairos --check-config` 確認設定）→ 以 `kairos users create <帳號> --role admin` 建立首位管理員（沒有預設帳號與密碼；INSTALL 第 9.4 節）→ 需要通知時新增管道並綁到規則 → 以 `--role` 重新建立需要告警權限的整合 token。Pulse 可以任何順序升級（只有日誌格式與本機指標）。
+
+### Kairos：告警
+
+- **內部事件匯流排**（`kairos/src/bus.rs`）：狀態表（上線、離線含原因分類、被取代）、連線（身分驗證失敗、狀態表淘汰、自行除役）、TLS 重載、系統檢查的狀態變化以結構化事件發布；告警引擎與 `/metrics` 都訂閱它。斷線原因：`idle_timeout`、`agent_closed`、`certificate_rejected`、`server_shutdown`、`write_unknown`。
+- **告警引擎**（`kairos/src/alerts/`）：四級嚴重度（D3）與處理類型；準位觸發、去重、10 分鐘內重新開啟、抖動偵測；觸發 → 確認 → 恢復 → 解決（未確認 24 小時、已確認 7 天自動結案，緊急不自動結案）；關聯彙總（系統事件 → 網段／大規模離線／重新啟動後未恢復 → 主機事件）；暖機期與停機事件；30 條系統預設規則與使用者規則（主機離線、長期失聯、回報延遲、CPU／記憶體門檻、身分衝突）；靜音與維護時段（D23、D26，伺服器端驗證上限）；規則的歷史試算。
+- **通知**：Email（SMTP，STARTTLS／TLS、AUTH PLAIN／LOGIN、私有 CA）與 Webhook（`kairos.alert.v1`＋HMAC-SHA256 簽章、Slack 類、Teams、LINE）；重送與升級、每管道 30 秒合併、緊急不排隊、重試與退避、15 分鐘放棄、連續 3 次失敗 `KRS-E5107` 並改經其他管道；機密以 AES-256-GCM 加密保存，API、CLI、日誌、稽核、診斷包只有遮蔽值。hyper 啟用 `client` feature（帶入 `want`、`try-lock`）。
+- **主控台 API**（`/api/v1/alerts`、`/alert-rules`、`/silences`、`/channels`，API.md 第 13 節）與 SSE 的 `alert.created`／`alert.updated`／`alert.resolved`；**CLI** `kairos alerts|silences|alert-rules|alert-channels`；**設定** `[alerts]`。
+
+### Kairos：使用者、角色、工作階段與稽核
+
+- **本機帳號**：Argon2id（m=19 MiB、t=2、p=1，可調）、密碼政策、連續失敗 5 次鎖定 15 分鐘（`KRS-E6003`；不存在的帳號回應相同）、依來源 IP 限速、第一次登入必須變更密碼。**TOTP** 與 10 組復原碼。**LDAP／AD**（LDAPS／StartTLS，一律驗證伺服器憑證；群組對應角色）。依賴 `argon2` 0.5、`ldap3` 0.12（`tls-rustls-ring`）。
+- **RBAC**（API.md 第 12.1 節）：權限集中在 `kairos/src/rbac.rs`（35 個，含告警的 10 個），四個內建角色（管理員、維運者、稽核員、唯讀，依 `ia.md` §4.2），範圍為全站或主機群組。告警的權限（`alerts:read|write`、`alert-rules:read|write|admin`、`silences:read|write`、`channels:read|test|write`）：管理員全部；維運者處理事件、自訂規則、靜音、管道清單與測試；稽核員事件／規則／靜音唯讀；唯讀事件與靜音唯讀；**管道的新增、修改、刪除（含機密）與系統規則的條件只限管理員**；群組範圍的指派不授予告警的權限（API.md 第 13.1 節）。
+- **工作階段**：`__Host-kairos_session` cookie（HttpOnly、Secure、SameSite=Strict）、CSRF token（`X-CSRF-Token`＋Origin／`Sec-Fetch-Site` 檢查，告警的寫入同樣需要）、閒置 30 分鐘與絕對 12 小時逾時；D25 的兩種結束 API。
+- **使用者管理 API 與 CLI**（`kairos users …`）、**API token 屬於角色或使用者**（`--role`、`--user`）。
+- **稽核雜湊鏈**（API.md 第 12.8 節）：每筆 `audit_events` 含前一筆的雜湊；登入、權限變更、token、設定、註冊與 PKI、被拒絕的請求、**告警的確認、指派、解決、註解，靜音、規則、管道的變更**（API 與 CLI）、系統啟動與關機都在鏈中；`kairos audit list|verify|export`、`POST /api/v1/audit/verify`（`KRS-E6201`）。
+- SSE（`/api/v1/events`）在每次心跳重新計算權限：撤銷、工作階段結束、停用或降權後不再推送；`alert.*` 只送給全站範圍有 `alerts:read` 的身分。
+
+### Kairos：可觀測性
+
+- **`/healthz`、`/readyz`、`/metrics`**：主控台的 HTTPS 監聽上提供（`observability.on_console`），另可以 `observability.listen` 純 HTTP 監聽。`/readyz` 不取得寫入鎖檢查資料庫。
+- `/metrics`：連線、狀態表、被拒的連線、report 寫入與 `ack` 延遲直方圖、資料庫與保留、TLS 與憑證剩餘天數、註冊端點、主控台 API（`route` 含 0.6 的新路徑）、日誌與行程，以及**告警**：引擎狀態（`kairos_alerts_engine_up` 等）、未解決事件（`kairos_alerts_open{severity,state}`）、建立與解決的事件數、管道狀態、通知的發送結果（`kairos_alert_notification_sends_total{kind,result}`）與最後狀態（`kairos_alert_notifications_total{kind,state}`）。**主機的上線、離線、被取代、hello 身分驗證失敗（新 `kairos_agent_auth_failures_total`）與狀態表淘汰改由事件匯流排訂閱計數**；`kairos_agent_disconnects_total` 的 `reason` 與 Webhook 的 `offline_reason` 相同（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；主機 API 仍為 0.4 起的 `timeout`、`connection_closed`）（與告警引擎同一個來源，不重複計數，`connection.rs` 不變）。標籤只用有限集合的值，不以 agent_id 或 IP 當標籤。
+- **JSON 日誌與 syslog**（`log.format = text|json|legacy`、`log.timezone`、`log.stdout`、`[log.syslog]`）；告警與帳號模組的日誌有固定的 `event`（例 `alerts.channel.failed`、`alerts.engine.started`、`audit.chain_broken`、`login.directory_failed`）。
+- **`kairos --check-config`**、**`kairos diag`**（支援診斷包，0600）。診斷包一律遮蔽私鑰、API token、註冊 token、安裝字串、Bearer、名稱含 token／secret／password 的值，**另遮蔽密碼雜湊（PHC）、TOTP 的 `otpauth://`、工作階段 cookie 與 CSRF token、網址中的秘密（帳號密碼、查詢字串、Webhook 路徑中的長片段）**；`alerts-secrets.key`、`console.key`、資料庫與私鑰檔的內容永不收集。
+
+### Pulse
+
+- **本機指標**（`[metrics]`，預設關閉）：loopback 的 HTTP `/metrics` 或 textfile collector 的檔案。
+- **JSON 日誌與 syslog**（同 Kairos；多實例時 JSON 的 `instance` 為實例編號 N，取自 `pulse-N.service` 的 `StateDirectory=pulse/N`，單一實例為 `null`）、**`pulse check-config`**（`log.format = "legacy"` 時警告 `PLS-W0104`，與 Kairos 的 `KRS-W0104` 同號）、**`pulse diag`**（遮蔽規則與 Kairos 共用）。
+- `pulse.service` 維持 `StandardOutput=null`（理由見 unit 與 INSTALL.md 7.1）。
+
+### 共用
+
+- 新的內部 crate `crates/kp-obs`：日誌格式、syslog（RFC 5424）、Prometheus 文字格式與測試用的嚴格解析器、診斷包（tar.gz）與遮蔽。只用 workspace 既有的依賴。
+- rustls 0.23.45 → 0.23.46（RUSTSEC-2026-0346～0349，`cargo deny` 的新公告）。
+
+### 新增的產品代碼（設計包 `decisions/INTEGRATION.md` §28.3 正式分配）
+
+| 代碼 | 意義 | 使用處 |
+|---|---|---|
+| `KRS-E6012` | 兩步驟驗證碼不正確或已使用過（HTTP 401 `invalid_mfa_code`） | 登入第二步 |
+| `KRS-E6013` | 第一次登入必須先變更密碼（HTTP 403 `password_change_required`） | 主控台 API |
+| `KRS-E6105` | 工作階段的寫入請求缺少或帶錯 CSRF token、或來自其他網站（HTTP 403 `csrf_failed`） | 主控台 API |
+| `KRS-E5109` | SMTP 伺服器拒絕寄件者、收件者或內容 | 通知 |
+| `KRS-E5110` | 通知管道的設定無效（HTTP 400 `channel_invalid`） | 告警 API |
+| `KRS-E0101` | 設定檔語法或型別錯誤（類比 `PLS-E0101`） | `kairos --check-config` |
+| `KRS-E0401` | `--config` 指定的設定檔不存在（類比 `PLS-E0401`） | `kairos --check-config` |
+| `KRS-E0402` | 設定檔無法讀取：權限、I/O（類比 `PLS-E0402`） | `kairos --check-config` |
+| `KRS-W4302` | 診斷包內容已截斷（類比 `PLS-W4302`） | `kairos diag` |
+
+`kairos diag` 無法產生時沿用 `KRS-E4301`（§28.3 定案為語意延伸：「無法產生匯出檔案或診斷包」）。工作階段結束或逾時沿用 `KRS-E6010`（`details.reason = "session_expired"`，§28.3 定案）。啟動時的設定檔錯誤仍只印出訊息與結束代碼 3（代碼只在 `--check-config` 中顯示）。
+
+### 量測
+
+可觀測性線在 kp-build（4 vCPU）以 `api_bench_acks_under_load`（每秒 2,000 筆 report、1 萬台主機）量測 `ack` p99：只有寫入 2.21 ms、4 個 API 用戶端連續查詢 5.81／5.40 ms、每秒抓取一次 `/metrics` 5.43／0.97 ms、連續抓取 `/metrics` 4.06／1.72 ms（0.5.0：2.43／1.92、14.26／4.89 ms）。整合後 `/metrics` 的主機計數改為事件匯流排的訂閱者（不在連線的程式中），告警引擎在自己的執行緒上。
+
+### 已知限制
+
+- 告警的權限只由全站範圍的角色指派授予；群組範圍的維運者看不到告警（群組內的告警處理延後）。
+- 週期性維護時段、警告的每日彙整、個人勿擾與個人通知、部分系統規則（資料磁碟空間、CRL 自動更新失敗、agent 憑證到期提醒等）、主機離線類規則的歷史試算尚未實作（ALERTS.md 第 10 節）。
+- 目錄服務的定期同步、「從目錄服務加入」、群組範圍的寫入權限、主機群組的管理 API、雙人覆核、稽核外送延後（API.md 第 12.11 節）。
+- 日誌的 `event`：其餘模組尚未指定事件的行以模組路徑代替；`text` 版面、`log-ux.md` §5 的重試摘要等尚未實作。`/metrics` 的計數為啟動以來的累計值。syslog 的 `unix:///dev/log` 送出 RFC 5424（journald 請改用 stdout）。`pulse check-config --connect`、`--show-effective`、`pulse diag --include-debug-log` 尚未實作。
+
+### 測試
+
+- 端對端（`tests/e2e/tests/alerts.rs`，日誌為 JSON）：首位管理員（CLI）→ 登入並變更密碼 → 建立維運者與唯讀 → 管理員新增 Webhook 管道（測試內的本機 HTTP 接收器）並綁到主機離線規則 → Pulse 停止 → Webhook 收到簽章的 `kairos.alert.v1` → 唯讀確認 403、沒有 CSRF token 403 → 維運者確認 → `/metrics` 有告警、通知與主機的計數 → `kairos audit verify` 通過，`alert.ack`、`channel.create`、`access.denied` 在鏈中；Kairos 與 Pulse 的每一行輸出都是 v1 的 JSON 日誌。另有 `users.rs`（首位管理員與稽核鏈）。
+- Kairos：RBAC 矩陣測試含所有告警端點（四個角色＋沒有角色）與工作階段寫入的 CSRF 拒絕；告警的權限表與設計矩陣一致；0.5（v4）資料庫升級到 v6 後三種舊 token 的權限不變、告警端點一律 403、SSE 收不到 `alert.*`；告警操作的稽核在雜湊鏈中；`/metrics` 的告警與匯流排計數；JSON 日誌欄位；診斷包不含金鑰檔、密碼雜湊、TOTP、工作階段、CSRF、SMTP 密碼與 Webhook 網址的秘密。
+- `kp-obs`：Prometheus、JSON／text、syslog、tar／gzip、遮蔽（含新的憑證類別與冪等）。Pulse：本機指標、`check-config`、`diag`。
+
+### 發佈與建置
+
+- Kairos 發佈包加入 `prometheus.example.yml` 與 `kairos-alerts.example.yml`；Pulse 發佈包加入 `pulse-alerts.example.yml`。
+- 新依賴：`argon2`、`ldap3`（及其依賴），`cargo deny check` 通過；新的內部 crate `kp-obs`（publish = false）。
 
 ## [0.5.0] - 〔草稿：發佈日期待定〕
 

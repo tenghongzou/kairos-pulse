@@ -149,6 +149,13 @@ fn fresh_database_has_the_current_schema() {
         "rollup_5m",
         "rollup_1h",
         "import_keys",
+        "alert_rules",
+        "alert_events",
+        "alert_timeline",
+        "alert_silences",
+        "alert_channels",
+        "alert_deliveries",
+        "alert_actions",
     ] {
         assert_eq!(
             count(
@@ -1533,5 +1540,82 @@ fn prepare_files_keeps_the_locks_of_open_connections() {
     drop(reader);
     drop(store);
     assert_eq!(probe_exclusive(&dir), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_tables() {
+    let dir = temp_dir("v4v5");
+    let path = dir.join("m.db");
+    let mut conn = Connection::open(&path).unwrap();
+    // 0.5 的資料庫（schema v4）：有註冊的設定與稽核紀錄
+    assert_eq!(migrate(&mut conn, &MIGRATIONS[..4]).unwrap(), 4);
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at, updated_by) VALUES ('enroll.mode', 'open', 1, 't')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO audit_events (at, actor, category, action, result) VALUES (1, 't', 'enroll', 'x', 'success')",
+        [],
+    )
+    .unwrap();
+    let has = |conn: &Connection, t: &str| -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [t],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    };
+    assert!(!has(&conn, "alert_events"));
+    // 只套用 v5：告警的資料表建立
+    assert_eq!(migrate(&mut conn, &MIGRATIONS[..5]).unwrap(), 5);
+    assert!(has(&conn, "alert_events"));
+    assert!(!has(&conn, "users"));
+    // 再升級到 v6（整合後的線性順序 v4 → v5 → v6）：使用者的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 6);
+    assert_eq!(
+        MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
+    for t in [
+        "users",
+        "role_assignments",
+        "sessions",
+        "user_recovery_codes",
+    ] {
+        assert!(has(&conn, t), "{t}");
+    }
+    let mode: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'enroll.mode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "open");
+    for t in [
+        "alert_rules",
+        "alert_events",
+        "alert_timeline",
+        "alert_silences",
+        "alert_channels",
+        "alert_deliveries",
+        "alert_actions",
+    ] {
+        assert!(has(&conn, t), "{t}");
+    }
+    // 系統預設規則可以寫入；重複執行不重複（INSERT OR IGNORE）
+    let n = crate::alerts::store::ensure_builtin_rules(&conn, 1).unwrap();
+    assert_eq!(n, crate::alerts::rules::builtins().len());
+    assert_eq!(
+        crate::alerts::store::ensure_builtin_rules(&conn, 2).unwrap(),
+        0
+    );
+    // 再執行一次升級：不變
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 6);
+    drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }

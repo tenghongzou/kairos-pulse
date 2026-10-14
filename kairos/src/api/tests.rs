@@ -33,6 +33,9 @@ pub(crate) struct Fixture {
     pub shutdown: Arc<Shutdown>,
     writer: tokio::task::JoinHandle<()>,
     pub config: AppConfig,
+    /// 告警服務（`fixture_with(.., true)` 時）
+    pub alerts: Option<Arc<crate::alerts::AlertService>>,
+    alerts_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Fixture {
@@ -45,6 +48,10 @@ impl Fixture {
         tokio::time::timeout(Duration::from_secs(10), self.console.join())
             .await
             .expect("主控台應在關機後結束");
+        drop(self.alerts);
+        if let Some(t) = self.alerts_thread {
+            crate::alerts::AlertService::join(t, Duration::from_secs(10)).await;
+        }
         drop(self.sink);
         let _ = tokio::time::timeout(Duration::from_secs(10), self.writer).await;
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -75,6 +82,34 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
 
 /// 啟動主控台（SQLite 資料庫、狀態表、一個唯讀 token）
 pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fixture {
+    fixture_opts(tag, tweak, false, None).await
+}
+
+fn real_clock() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// [`fixture`]，另可替換目錄服務（LDAP）
+pub(crate) async fn fixture_with(
+    tag: &str,
+    tweak: impl FnOnce(&mut AppConfig),
+    directory: Option<Arc<dyn crate::users::ldap::Directory>>,
+) -> Fixture {
+    fixture_opts(tag, tweak, false, directory).await
+}
+
+/// [`fixture`]，另外啟動告警服務（與正式程式相同的執行緒與判定週期）
+pub(crate) async fn fixture_alerts(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fixture {
+    fixture_opts(tag, tweak, true, None).await
+}
+
+/// [`fixture`]；`alerts` 時另外啟動告警服務，`directory` 替換目錄服務（LDAP）
+pub(crate) async fn fixture_opts(
+    tag: &str,
+    tweak: impl FnOnce(&mut AppConfig),
+    alerts: bool,
+    directory: Option<Arc<dyn crate::users::ldap::Directory>>,
+) -> Fixture {
     let dir = temp_dir(tag);
     let mut config = AppConfig::default();
     config.storage.data_dir = dir.join("data").to_string_lossy().into_owned();
@@ -122,6 +157,48 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         .unwrap(),
     ));
     let shutdown = Arc::new(Shutdown::new());
+    let (alert_svc, alerts_thread) = if alerts {
+        let (svc, thread) = crate::alerts::AlertService::start(crate::alerts::StartParams {
+            config: Arc::new(config.clone()),
+            data_dir: paths.data_dir.clone(),
+            db_path: SqliteOptions::from_config(&config, &paths.data_dir).path,
+            registry: registry.clone(),
+            write_stats: Some(storage.reports.stats().clone()),
+            per_ip: None,
+            tls: Some(agent_tls.clone()),
+            enroll: None,
+            agent_listen: Some("127.0.0.1:8080".parse().unwrap()),
+            shutdown: shutdown.clone(),
+            enroll_closed_default: false,
+            clock: real_clock,
+        })
+        .await
+        .unwrap();
+        // 與正式程式相同：/metrics 的告警計數訂閱告警的變化
+        tokio::spawn(crate::metrics::watch_alerts(
+            svc.subscribe(),
+            shutdown.clone(),
+        ));
+        (Some(svc), Some(thread))
+    } else {
+        (None, None)
+    };
+    let obs = crate::probe::ObsContext::new(crate::probe::ObsParams {
+        config: Arc::new(config.clone()),
+        registry: registry.clone(),
+        reports: storage.reports.clone(),
+        per_ip: crate::per_ip::PerIpLimiter::with_policy(
+            crate::per_ip::PerIpPolicy::from_config(&config).unwrap(),
+        ),
+        tls: agent_tls.clone(),
+        enroll: None,
+        shutdown: shutdown.clone(),
+        db_path: Some(SqliteOptions::from_config(&config, &paths.data_dir).path),
+        alerts: alert_svc.clone(),
+    })
+    .unwrap();
+    obs.agent_listening
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let console = match start(StartParams {
         config: Arc::new(config.clone()),
         config_file: None,
@@ -133,6 +210,9 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         shutdown: shutdown.clone(),
         agent_listen: "127.0.0.1:8080".parse().unwrap(),
         enroll: None,
+        alerts: alert_svc.clone(),
+        directory,
+        obs: Some(Arc::new(obs)),
     })
     .await
     {
@@ -148,6 +228,8 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         shutdown,
         writer,
         config,
+        alerts: alert_svc,
+        alerts_thread,
     }
 }
 
@@ -171,7 +253,7 @@ fn connector() -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
-async fn connect(addr: SocketAddr) -> TlsStream<TcpStream> {
+pub(crate) async fn connect(addr: SocketAddr) -> TlsStream<TcpStream> {
     let tcp = TcpStream::connect(addr).await.unwrap();
     connector()
         .connect(
@@ -235,6 +317,27 @@ fn request_text(method: &str, path: &str, token: Option<&str>, extra: &[(&str, &
     req
 }
 
+/// 送出一個已組好的請求（含標頭與本文）並讀完回應
+pub(crate) async fn send_raw(addr: SocketAddr, raw: &[u8]) -> Resp {
+    let mut tls = connect(addr).await;
+    tls.write_all(raw).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, tls.read_to_end(&mut buf))
+        .await
+        .expect("讀取回應逾時")
+        .ok();
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("回應沒有標頭");
+    let (status, headers) = parse_head(&String::from_utf8_lossy(&buf[..split]));
+    Resp {
+        status,
+        headers,
+        body: buf[split + 4..].to_vec(),
+    }
+}
+
 /// 送出一個請求並讀完回應
 pub(crate) async fn request(
     addr: SocketAddr,
@@ -247,6 +350,46 @@ pub(crate) async fn request(
     tls.write_all(request_text(method, path, token, extra).as_bytes())
         .await
         .unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, tls.read_to_end(&mut buf))
+        .await
+        .expect("讀取回應逾時")
+        .ok();
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("回應沒有標頭");
+    let (status, headers) = parse_head(&String::from_utf8_lossy(&buf[..split]));
+    Resp {
+        status,
+        headers,
+        body: buf[split + 4..].to_vec(),
+    }
+}
+
+/// 送出帶 JSON 本文的請求
+pub(crate) async fn call(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+) -> Resp {
+    let mut tls = connect(addr).await;
+    let text = body.map(|b| b.to_string()).unwrap_or_default();
+    let mut req = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
+    if let Some(t) = token {
+        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    }
+    if body.is_some() {
+        req.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            text.len()
+        ));
+    }
+    req.push_str("\r\n");
+    req.push_str(&text);
+    tls.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     tokio::time::timeout(IO_TIMEOUT, tls.read_to_end(&mut buf))
         .await

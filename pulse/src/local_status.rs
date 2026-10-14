@@ -200,21 +200,25 @@ impl State {
 
     /// 取得一筆取樣
     pub fn sampled(&mut self) {
+        crate::metrics::global().sampled.inc();
         self.slot().sampled += 1;
     }
 
     /// 不補送時（at-most-once）因未連線、寫出中或上一筆未回應而丟掉的取樣
     pub fn dropped_disconnected(&mut self) {
+        crate::metrics::global().dropped_disconnected.inc();
         self.slot().dropped_disconnected += 1;
     }
 
     /// 送出了一筆 report
     pub fn report_sent(&mut self) {
+        crate::metrics::global().report_sent();
         self.file.reporting.last_report_at = Some(ts(Utc::now()));
     }
 
     /// Kairos 確認了一筆 report
     pub fn report_acked(&mut self) {
+        crate::metrics::global().report_answered(true);
         self.slot().acked += 1;
         self.file.reporting.last_ack_at = Some(ts(Utc::now()));
         if self.retry.take().is_some() {
@@ -224,6 +228,7 @@ impl State {
 
     /// Kairos 拒收或無法保存一筆 report
     pub fn report_rejected(&mut self) {
+        crate::metrics::global().report_answered(false);
         self.slot().rejected_by_server += 1;
     }
 
@@ -243,6 +248,9 @@ impl State {
 
     /// 註冊成功；之前有中斷時回傳中斷的摘要
     pub fn registered(&mut self, info: Registered) -> Option<Restored> {
+        let m = crate::metrics::global();
+        m.registrations.inc();
+        m.connection_reset();
         let now = Utc::now();
         let c = &mut self.file.connection;
         let outage = self.outage_started.take();
@@ -283,6 +291,7 @@ impl State {
 
     /// 連線中斷（或連線失敗）
     pub fn disconnected(&mut self, d: Disconnected) {
+        crate::metrics::global().disconnected(d.code);
         let now = Utc::now();
         if self.outage_started.is_none() {
             self.outage_started = Some((Instant::now(), now));
@@ -636,6 +645,16 @@ impl Tracker {
     pub fn set_spool(&self, spool: Arc<SharedSpool>) {
         *self.spool.lock().unwrap_or_else(|e| e.into_inner()) = Some(spool);
         self.update(State::buffer_changed);
+    }
+
+    /// 目前的內容，但不清除「有變化」的標記（`/metrics` 讀取，不影響狀態檔的寫出時機）
+    pub fn peek(&self) -> StatusFile {
+        let spool = self.spool.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut state = self.lock();
+        let changed = state.changed;
+        let file = state.snapshot(spool.as_deref(), &self.buffer);
+        state.changed = changed;
+        file
     }
 
     /// 目前的內容

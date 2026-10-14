@@ -400,6 +400,20 @@ file = ""                      # 本機狀態檔；空字串 = /var/lib/pulse/st
 [log]
 level = "info"                 # 日誌級別：trace / debug / info / warn / error（不分大小寫）
 retention_days = 14            # 日誌檔保留天數（今天與前 N 天）；0 = 永久保留
+format = "text"                # text（RFC 3339 帶時區）／json（logs/pulse-YYYY-MM-DD.jsonl）／legacy（0.5 以前的格式）
+timezone = "local"             # text 的時間：local 或 utc（json 一律 UTC）
+stdout = true                  # 同時寫到 stdout
+
+[log.syslog]
+target = ""                    # udp://主機:埠、tcp://主機:埠、unix:///dev/log；空字串＝不外送
+facility = "daemon"
+app_name = "pulse"
+payload = "text"               # text 或 json
+
+[metrics]                      # 本機的 Prometheus 指標（見「本機指標」），預設關閉
+listen = ""                    # 例如 "127.0.0.1:9465"（只接受 loopback）
+textfile = ""                  # 例如 "/var/lib/node_exporter/textfile_collector/pulse.prom"
+textfile_interval = 15
 ```
 
 `server.use_system_roots` 也可用環境變數設定（例如 `PULSE__SERVER__USE_SYSTEM_ROOTS=true`）。未設定時的預設值依 `ca_cert` 決定：
@@ -427,6 +441,14 @@ retention_days = 14            # 日誌檔保留天數（今天與前 N 天）�
 | `retry.max_delay` | 1～3600 秒，且 ≥ `initial_delay` | 唯一例外：連續被 `superseded` 時延遲至少 30 秒（見「重連行為」） |
 | `log.level` | `trace` / `debug` / `info` / `warn` / `error` | 不分大小寫（`DEBUG`、`Warn` 皆可）；其他值啟動即報錯，不會默默改用 `info` |
 | `log.retention_days` | 0～3650 天 | 0 = 永久保留 |
+| `log.format` | `text` / `json` / `legacy` | 不分大小寫；見「日誌」 |
+| `log.timezone` | `local` / `utc` | 只影響 `text` |
+| `log.syslog.target` | 空字串、`udp://主機[:埠]`、`tcp://主機[:埠]`、`unix:///絕對路徑` | IPv6 位址以 `[ ]` 包住；`unix://` 只在 Unix 平台 |
+| `log.syslog.facility` | `daemon`、`user`、`auth`、`authpriv`、`local0`～`local7` | |
+| `log.syslog.payload` | `text` / `json` | |
+| `metrics.listen` | 空字串或 loopback 的 `IP:埠` | 不接受 `0.0.0.0` 等對外位址（本機指標不需要認證） |
+| `metrics.textfile` | 空字串或副檔名 `.prom` 的路徑 | node_exporter 的 textfile collector 只讀 `*.prom` |
+| `metrics.textfile_interval` | 5～3600 秒 | |
 | `agent.id_file` | 非空字串 | |
 | `agent.display_name` | 空字串，或 1～255 bytes | 不得含控制字元、格式字元等不可見字元（規則同 Kairos 對 `hostname` 的限制）；只在 Kairos 支援協定 v2 時送出 |
 | `agent.tags` | 最多 32 個，每個 1～64 bytes，不得重複 | 字元限制同上；只能在 `pulse.toml` 設定（環境變數不支援陣列） |
@@ -679,7 +701,9 @@ src/
 ├── rotation.rs        8443 正常輪替：時點、待送的 CSR、驗證新憑證、確認後取代
 ├── decommission.rs    pulse decommission 的除役通知（8443 deregister）
 ├── backoff.rs         指數退避與抖動
-├── log_files.rs       日誌按日分檔與保留清除（含系統日期異常時暫停清除）
+├── log_files.rs       日誌按日分檔（.log／.jsonl）與保留清除（含系統日期異常時暫停清除）、日誌輸出（格式與 syslog 由 kp-obs 處理）
+├── metrics.rs         本機指標（Prometheus）：計數、/metrics（loopback HTTP）與 textfile
+├── diag.rs            pulse check-config 與 pulse diag（支援診斷包）
 ├── log_throttle.rs    日誌節流（同類訊息每個視窗最多記錄一則）
 ├── agent_id.rs        agent_id 產生、驗證與讀取
 ├── shutdown.rs        結束訊號監聽（Ctrl+C、Ctrl+Break、主控台關閉、系統關機）
@@ -695,12 +719,14 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 
 ## 日誌
 
-- 同時輸出到終端（stdout）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）
-- **事件與錯誤代碼**：有固定事件的日誌行，訊息開頭為「`<event> <code> `」（沒有代碼時為 `-`），例如 `[WARN] buffer.full PLS-W4202 本機緩衝已滿…`、`[ERROR] auth.rejected PLS-E1105 連線中斷…`、`[INFO] conn.registered - 已向伺服器註冊…`。事件名稱與代碼固定、不翻譯（設計包 `pulse/log-ux.md` §4、`copywriting.md` §3.3），告警規則與搜尋請比對這兩欄。哪些代碼已對應、在程式的哪裡、何時觸發，見 `ERROR-CODES.md`；行首時間與 JSON 格式等其餘 `log-ux.md` 的改版尚未實作。本機緩衝的事件：`buffer.opened`（啟動時）、`buffer.unavailable`（`PLS-E4004`）、`buffer.write_failed`（`PLS-W4103`）、`buffer.full`（`PLS-W4202`）、`buffer.expired`（`PLS-W4203`）、`buffer.replay_done`（補送完成，附筆數與耗時）；連線恢復時另記 `conn.restored`（中斷時間、重試次數、待補送與丟棄筆數），中斷滿 30 分鐘記一次 `conn.outage`（`ERROR`，同時寫 stderr）
+- 同時輸出到終端（stdout，`log.stdout = false` 可關閉）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）；`log.format = "json"` 時改為 `logs/pulse-YYYY-MM-DD.jsonl`
+- **格式**（〔0.6 草稿〕，審計 O3；設計包 `pulse/log-ux.md` §6）：`text`（預設）為 `2026-10-14T14:22:16.123+08:00 [WARN] buffer.full PLS-W4202 本機緩衝已滿…`（RFC 3339、毫秒、帶時區位移；`log.timezone = "utc"` 時以 `Z` 結尾；0.5 以前行首是不帶時區的本地時間）；`json` 為一行一個 JSON（UTC），固定欄位 `v`、`ts`、`level`、`event`、`code`、`msg`、`agent_id`（啟用 mTLS 時才有值，未啟用時 agent_id 等同身分憑據，與狀態檔相同不寫出）、`instance`（多實例 `pulse-N.service`〔`StateDirectory=pulse/N`〕時為 N，單一實例為 `null`）、`product`、`host`、`run_id`（每次啟動隨機產生）、`seq`（本次行程內遞增）、`target`、`fields`；`legacy` 保留 0.5 以前的格式一個主要版本供過渡。`event`、`code` 取自訊息開頭的「`<event> <code> `」；尚未指定固定事件的行，`event` 為模組路徑（例如 `pulse.network`）
+- **syslog 外送**：`[log.syslog]` 的 `target` 設定時另以 RFC 5424 送到 syslog（`udp://`、`tcp://`、`unix://`；`MSGID` 為錯誤代碼，沒有時為事件名稱；`payload = "json"` 時 `MSG` 為一行 JSON）。在背景執行緒送出，接收端無法連線時丟棄並計數，不影響服務與日誌檔
+- **事件與錯誤代碼**：有固定事件的日誌行，訊息開頭為「`<event> <code> `」（沒有代碼時為 `-`），例如 `[WARN] buffer.full PLS-W4202 本機緩衝已滿…`、`[ERROR] auth.rejected PLS-E1105 連線中斷…`、`[INFO] conn.registered - 已向伺服器註冊…`。事件名稱與代碼固定、不翻譯（設計包 `pulse/log-ux.md` §4、`copywriting.md` §3.3），告警規則與搜尋請比對這兩欄（`json` 格式時為 `event`、`code` 欄位）。哪些代碼已對應、在程式的哪裡、何時觸發，見 `ERROR-CODES.md`；`log-ux.md` 的重試摘要排程、`log.lang` 等其餘改版尚未實作。本機緩衝的事件：`buffer.opened`（啟動時）、`buffer.unavailable`（`PLS-E4004`）、`buffer.write_failed`（`PLS-W4103`）、`buffer.full`（`PLS-W4202`）、`buffer.expired`（`PLS-W4203`）、`buffer.replay_done`（補送完成，附筆數與耗時）；連線恢復時另記 `conn.restored`（中斷時間、重試次數、待補送與丟棄筆數），中斷滿 30 分鐘記一次 `conn.outage`（`ERROR`，同時寫 stderr）
 - **需要人工處理的錯誤另寫一行到 stderr**：伺服器憑證驗證錯誤（不受信任、名稱不符、過期、尚未生效、被撤銷、用途不符、被標記為 CA、其他驗證失敗；第一次發生就記 `ERROR`，原因改變時立即再記）、伺服器送來的致命錯誤與註冊前的錯誤（`certificate_rejected`、`auth_failed`、狀態表已滿等）、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕（撤銷、過期等），以及本機客戶端憑證已過期。內容與日誌的 `ERROR` 行相同，節流也相同（同一原因每 10 分鐘最多一行，其餘只在日誌記 `WARN`）；一般連線錯誤（拒絕連線、逾時、連線被重設等）不寫。以 systemd 執行（有 `JOURNAL_STREAM` 環境變數）時行首加上 `<3>`，journal 以 err 等級記錄（`journalctl -u pulse -p err`），訊息中不會出現 `<3>`。stdout 與 stderr 都是終端機（互動執行）時不重複寫。`pulse.service` 設定 `StandardOutput=null`，所以 journal 中只會看到這些行與啟動失敗等 stderr 訊息
 - **systemd 狀態文字**：Linux 上有 `NOTIFY_SOCKET` 時以 sd_notify 送出 `STATUS=`，`systemctl status` 顯示為 `Status:` 行：`連線中`（啟動後、第一次註冊或斷線前，含啟動時的隨機延遲）、`已註冊：<位址>:<連接埠>`、`重新連線中`（一般連線錯誤）、`無法連線：伺服器憑證<原因>（<處理提示>）`（例如 `無法連線：伺服器憑證不受信任（簽發者不在信任庫中，自簽憑證或私有 CA 請以 server.ca_cert 指定）`、`無法連線：伺服器憑證名稱不符（請把 server.domain 設為伺服器憑證 SAN 中的名稱）`；原因另有已過期、尚未生效、已被撤銷、用途不符、被標記為 CA、驗證失敗）、`無法註冊：<錯誤碼>（<處理提示>）`（錯誤碼如 `certificate_rejected`、`TLS alert CertificateRevoked`、`auth_failed`、`bad_request`、`unsupported_version`、`proto_mismatch`、`superseded`）。只送狀態文字、不送 `READY=1`，unit 維持 `Type=simple`，需設定 `NotifyAccess=main`（發佈包的 `pulse.service` 已設定）；沒有 `NOTIFY_SOCKET` 時（Windows、直接執行）不做任何事
-- **按日分檔**：檔名日期為 **UTC**（與 Kairos 相同），UTC 午夜換新檔；每行開頭的時間戳記則是本機時間
-- **保留**：保留今天與前 `log.retention_days` 天（預設 14），更早的檔案於啟動時與之後每小時刪除；`0` 表示永久保留。只會刪除檔名**完全符合** `pulse-YYYY-MM-DD.log` 的檔案，其他檔案（例如舊版的 `pulse.log`）一律不碰
+- **按日分檔**：檔名日期為 **UTC**（與 Kairos 相同），UTC 午夜換新檔；`text` 每行開頭的時間是本機時間並帶時區位移，`json` 一律 UTC
+- **保留**：保留今天與前 `log.retention_days` 天（預設 14），更早的檔案於啟動時與之後每小時刪除；`0` 表示永久保留。只會刪除檔名**完全符合** `pulse-YYYY-MM-DD.log`（或 `.jsonl`）的檔案，其他檔案（例如舊版的 `pulse.log`）一律不碰
 - **系統日期異常時暫停清除**（規則與 Kairos 相同；`log.retention_days = 0` 時不檢查）：系統時鐘被誤校到未來時，以「今天」計算的保留期限會把所有日誌檔判定為過期，因此清除前先檢查日期是否合理，「已接受的日期」只能隨實際經過的時間推進：
   - 基準點（可信的日期與當時的時間）只在三種情況設定：啟動時沒有狀態、接受跳躍後的日期、日期回撥後降回已接受的日期。
   - 經過時間在同一次執行內用單調時鐘；跨重新啟動時為「存檔時已經過的時間 + min(max(0, 現在 − 存檔時間), 24 小時)」（每次檢查都存檔）。
@@ -721,6 +747,45 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
   ```
 
   避免故障或惡意的伺服器在短時間內灌爆日誌檔。會結束連線的錯誤（fatal error、註冊前的 error）每次斷線只記一則（見「重連行為」），其頻率由重連退避限制；其中需要人工處理的錯誤另依錯誤碼節流 `ERROR`（每 10 分鐘最多一則，其餘記 `WARN`）。
+
+## 本機指標（Prometheus，0.6.0〔草稿〕）
+
+預設關閉（審計 O3）。兩種提供方式，可同時使用：
+
+```toml
+[metrics]
+listen = "127.0.0.1:9465"     # 本機 HTTP GET /metrics；只接受 loopback 位址（不需要認證，不對外開放）
+textfile = "/var/lib/node_exporter/textfile_collector/pulse.prom"   # node_exporter textfile collector（建議）
+textfile_interval = 15        # textfile 的更新間隔（秒，5～3600）
+```
+
+textfile 以「寫暫存檔再改名」的方式原子更新，Pulse 正常結束時刪除（避免留下過時的數值）；以 systemd 執行時需要以 drop-in 讓服務可以寫入該目錄（INSTALL.md「本機指標」）。
+
+| 類別 | metric |
+|---|---|
+| 連線 | `pulse_connected`、`pulse_connection_state{state}`（`connecting`／`registered`／`reconnecting`／`rejected`）、`pulse_connection_consecutive_failures`、`pulse_registrations_total`、`pulse_disconnects_total{code}`（錯誤代碼，無法歸類為 `unknown`） |
+| report | `pulse_reports_sampled_total`、`pulse_reports_sent_total`（含補送）、`pulse_reports_acked_total`、`pulse_reports_rejected_total`、`pulse_reports_dropped_total{reason}`、`pulse_report_ack_duration_seconds`（直方圖：送出到收到回應） |
+| 取樣 | `pulse_sample_duration_seconds`（直方圖）、`pulse_sample_timeouts_total`（`PLS-W8005`） |
+| 本機緩衝（補送佇列） | `pulse_delivery_durable`、`pulse_buffer_enabled`、`pulse_buffer_available`、`pulse_buffer_pending_records`、`pulse_buffer_pending_bytes`、`pulse_buffer_max_bytes`、`pulse_buffer_max_records`、`pulse_buffer_usage_ratio`、`pulse_buffer_oldest_sample_timestamp_seconds`、`pulse_buffer_replaying`、`pulse_buffer_dropped_total{reason}`（`full`／`expired`／`rejected`）、`pulse_buffer_write_failures_total` |
+| 其他 | `pulse_build_info{version,commit}`、`pulse_start_time_seconds`、`pulse_clock_offset_seconds`、`pulse_client_cert_expiry_timestamp_seconds`、`pulse_log_messages_total{level}`、`pulse_log_syslog_messages_total{result}` |
+
+標籤只用有限集合的值，不含 agent_id 或主機名稱（由 Prometheus 的 `instance` 區分主機）。告警規則範例：`packaging/pulse-alerts.example.yml`。
+
+## 設定檢查與診斷包（0.6.0〔草稿〕）
+
+```bash
+# 檢查設定（不連線、不影響服務）：語法與範圍、伺服器、信任、用戶端憑證與私鑰（成對、到期、權限）、agent.id、
+# 日誌、[metrics]、本機緩衝目錄。相對路徑以設定檔所在的目錄解析（與服務相同）
+sudo pulse check-config -c /opt/pulse/pulse.toml        # 或 pulse --check-config
+#   0 通過（有警告時仍為 0）、8 有警告（--strict）、3 設定錯誤、4 憑證或私鑰錯誤；--json 輸出 pulse.check-config/v1
+
+# 支援診斷包（tar.gz，權限 0600）：pulse status 與 check-config 的輸出、設定（遮蔽後）、用戶端憑證的摘要、
+# 註冊進度的摘要、最近 3 天的日誌（上限 50 MB）、本機指標、系統與服務資訊、相關檔案清單（不含內容）
+cd /tmp && sudo pulse diag -c /opt/pulse/pulse.toml
+sudo pulse diag -c /opt/pulse/pulse.toml --redact strict --since 7d   # 主機名稱與 IP 換成代號
+```
+
+私鑰（`client.key`）、token、`poll_secret` 永不收集；設定與日誌中的 token、密碼、PEM 私鑰區塊、`Bearer` 後的值一律遮蔽，產生前再檢查一次，仍有疑似秘密時不寫出（`PLS-E4301`）。Windows 也輸出 tar.gz（Windows 10 以上內建的 `tar.exe` 可解開）。`check-config --connect`、`--show-effective` 與 `diag --include-debug-log` 尚未實作。
 
 ## 目前限制
 

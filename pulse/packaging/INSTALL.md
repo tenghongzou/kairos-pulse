@@ -16,6 +16,7 @@
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `ERROR-CODES.md` | 644 | 錯誤代碼與日誌事件的對照（`pulse explain <代碼>` 指向這裡） |
+| `pulse-alerts.example.yml` | 644 | Prometheus 告警規則範例（第 7.2 節，0.6.0） |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `pulse.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `pulse-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -293,6 +294,30 @@ Pulse 把日誌同時寫到 stdout 與 `logs/pulse-YYYY-MM-DD.log`。systemd 預
 - stderr 仍進 journal（`StandardError=journal`）：設定錯誤、日誌檔無法建立、panic 這類**日誌檔還沒開好就發生**的錯誤都寫在 stderr；憑證錯誤等日誌初始化之後才發生、使 Pulse 結束的錯誤，也會另寫一行 `[ERROR] …` 到 stderr，所以啟動失敗時 `journalctl -u pulse` 仍看得到原因。
 
 想改成只用 journal：以 `systemctl edit pulse` 加上 `[Service]`、`StandardOutput=journal`，並視需要把 `log.retention_days` 調小（`logs/` 仍會寫入，Pulse 沒有關閉檔案日誌的設定）。
+
+0.6〔草稿〕重新評估後維持 `StandardOutput=null`（審計 S7）：要把日誌交給 SIEM 時，不需要經過 journal：
+
+- **syslog**：`pulse.toml` 設定 `[log.syslog]` 的 `target`（`udp://`、`tcp://` 或 `unix:///dev/log`），以 RFC 5424 直接送出；`payload = "json"` 時 `MSG` 為一行 JSON。在背景送出，接收端無法連線時丟棄並計數，不影響服務。
+- **檔案收集**：`log.format = "json"`（檔名改為 `logs/pulse-YYYY-MM-DD.jsonl`），由 rsyslog `imfile`、Filebeat、Fluent Bit 收集；規則只依 `event`、`code` 欄位判斷。
+- **journald**：上述 drop-in 改 `StandardOutput=journal`；`log.stdout`（預設 `true`）會讓 stdout 與日誌檔同一格式。
+
+### 7.2 本機指標（選用）
+
+Prometheus 以 node_exporter 的 textfile collector 收集時（Pulse 不另外開連接埠）：
+
+```bash
+# pulse.toml
+#   [metrics]
+#   textfile = "/var/lib/node_exporter/textfile_collector/pulse.prom"
+# 讓服務可以寫入該目錄（ProtectSystem=strict 下預設唯讀）
+systemctl edit pulse
+#   [Service]
+#   ReadWritePaths=/var/lib/node_exporter/textfile_collector
+chgrp pulse /var/lib/node_exporter/textfile_collector && chmod 775 /var/lib/node_exporter/textfile_collector
+systemctl restart pulse
+```
+
+或 `listen = "127.0.0.1:9465"`（本機 HTTP，只接受 loopback）。設定後以 `pulse check-config` 確認。告警規則範例：`pulse-alerts.example.yml`。
 
 ## 8. 啟動與確認
 

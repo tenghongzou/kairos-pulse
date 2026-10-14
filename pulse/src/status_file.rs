@@ -602,6 +602,14 @@ pub fn state_directory(value: Option<&std::ffi::OsStr>) -> Option<std::path::Pat
     (!first.is_empty() && path.is_absolute()).then(|| path.to_path_buf())
 }
 
+/// 狀態目錄對應的多實例編號：`…/pulse/N`（`pulse-N.service` 的 `StateDirectory=pulse/N`，N 為 1～999）；
+/// 單一實例（`…/pulse`）或其他位置為 `None`
+pub fn instance_of(dir: &std::path::Path) -> Option<u32> {
+    let n: u32 = dir.file_name()?.to_str()?.parse().ok()?;
+    let parent = dir.parent()?.file_name()?.to_str()?;
+    ((1..=999).contains(&n) && parent == "pulse").then_some(n)
+}
+
 /// 多實例 N 的預設位置（`cli-spec.md` §2.3：`/var/lib/pulse/N/`）
 pub fn instance_path(n: u32) -> std::path::PathBuf {
     let default = default_path();
@@ -756,6 +764,16 @@ mod tests {
         } else {
             assert_eq!(p, std::path::Path::new("/var/lib/pulse/status.json"));
         }
+    }
+
+    #[test]
+    fn instance_number_from_the_state_directory() {
+        use std::path::Path;
+        assert_eq!(instance_of(Path::new("/var/lib/pulse/2")), Some(2));
+        assert_eq!(instance_of(Path::new("/var/lib/pulse")), None);
+        assert_eq!(instance_of(Path::new("/var/lib/pulse/0")), None);
+        assert_eq!(instance_of(Path::new("/var/lib/other/2")), None);
+        assert_eq!(instance_of(Path::new("/var/lib/pulse/x")), None);
     }
 
     #[test]

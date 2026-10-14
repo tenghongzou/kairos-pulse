@@ -1,8 +1,14 @@
+mod alerts;
+mod alerts_cli;
 mod api;
+mod audit;
+mod audit_cli;
 mod auth;
+mod bus;
 mod config;
 mod connection;
 mod dedup;
+mod diag;
 mod enroll;
 mod enroll_cli;
 mod expiry;
@@ -13,11 +19,14 @@ mod import_cli;
 #[cfg(test)]
 mod integration_tests;
 mod logger;
+mod metrics;
 mod monitor;
 mod per_ip;
 mod pki;
+mod probe;
 mod protocol;
 mod rate;
+mod rbac;
 mod registry;
 mod reload;
 mod retention;
@@ -32,6 +41,8 @@ mod testhooks;
 mod throttle;
 mod tls;
 mod token_cli;
+mod users;
+mod users_cli;
 
 use log::{debug, error, info, warn};
 use std::io::{Error, ErrorKind};
@@ -67,6 +78,11 @@ pub const VERSION: &str = concat!(
     env!("KAIROS_BUILD_COMMIT"),
     ")"
 );
+
+/// 告警引擎的時鐘（Unix 毫秒；測試以假的時鐘驅動引擎本身）
+fn alerts_clock() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 
 /// accept 因資源問題失敗（例如檔案描述符用盡）後的等待時間
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -465,6 +481,11 @@ fn main() -> ExitCode {
         Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
         Ok(CliAction::ApiToken(cmd)) => return ExitCode::from(token_cli::run(cmd)),
         Ok(CliAction::Enroll(cmd)) => return ExitCode::from(enroll_cli::run(cmd)),
+        Ok(CliAction::Alerts(cmd)) => return ExitCode::from(alerts_cli::run(cmd)),
+        Ok(CliAction::Users(cmd)) => return ExitCode::from(users_cli::run(cmd)),
+        Ok(CliAction::Audit(cmd)) => return ExitCode::from(audit_cli::run(cmd)),
+        Ok(CliAction::Diag(args)) => return ExitCode::from(diag::run(args)),
+        Ok(CliAction::CheckConfig(args)) => return ExitCode::from(diag::run_check(args)),
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
@@ -481,6 +502,15 @@ fn main() -> ExitCode {
                 Some(a) if a == "enroll" => enroll_cli::ENROLL_USAGE,
                 Some(a) if a == "pki" => enroll_cli::PKI_USAGE,
                 Some(a) if a == "config" => enroll_cli::CONFIG_USAGE,
+                Some(a) if a == "alerts" => alerts_cli::ALERTS_USAGE,
+                Some(a) if a == "silences" => alerts_cli::SILENCES_USAGE,
+                Some(a) if a == "alert-rules" => alerts_cli::RULES_USAGE,
+                Some(a) if a == "alert-channels" => alerts_cli::CHANNELS_USAGE,
+                Some(a) if a == "users" => users_cli::USERS_USAGE,
+                Some(a) if a == "audit" => audit_cli::AUDIT_USAGE,
+                Some(a) if a == "diag" => diag::DIAG_USAGE,
+                Some(a) if a == "check-config" => diag::CHECK_USAGE,
+                _ if std::env::args_os().any(|a| a == "--check-config") => diag::CHECK_USAGE,
                 _ => USAGE,
             };
             eprintln!("{}\n\n{}", e, usage);
@@ -505,7 +535,7 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONFIG);
         }
     };
-    let newest_log = match logger::setup(level) {
+    let newest_log = match logger::setup(level, &config.log) {
         Ok(newest) => newest,
         Err(e) => {
             eprintln!("Kairos 啟動失敗: {}", e);
@@ -541,8 +571,45 @@ fn main() -> ExitCode {
         Ok(Some(reason)) => error!("Kairos 因內部錯誤而結束: {}", reason),
         Err(e) => error!("Kairos 啟動失敗: {}", e),
     }
-    log::logger().flush();
+    logger::flush_all();
     ExitCode::from(exit_code(&result))
+}
+
+/// 系統事件（啟動、關機）寫入稽核雜湊鏈（SQLite 時；失敗只記日誌）
+async fn system_audit(
+    svc: Option<&Arc<enroll::EnrollService>>,
+    action: &'static str,
+    config_path: Option<&Path>,
+) {
+    let Some(svc) = svc else {
+        return;
+    };
+    let details = serde_json::json!({
+        "version": VERSION,
+        "config_file": config_path.map(|p| p.display().to_string()),
+    });
+    let now = chrono::Utc::now().timestamp_millis();
+    let r = svc
+        .db
+        .write(move |conn| {
+            crate::audit::append(
+                conn,
+                now,
+                &crate::audit::Audit {
+                    actor: "system",
+                    category: "system",
+                    action,
+                    result: "ok",
+                    details: Some(details),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = r {
+        warn!("無法寫入稽核紀錄（{action}）：{e}");
+    }
 }
 
 /// [`run`] 的執行環境（測試可替換）
@@ -929,6 +996,102 @@ async fn run(
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
+    // 告警引擎（kairos/ALERTS.md）：需要 SQLite；在自己的執行緒上執行
+    let agent_addr_for_alerts = listener.local_addr().ok();
+    let alerts = match (config.alerts.enabled, config.storage.backend) {
+        (false, _) => {
+            info!("告警引擎已停用（alerts.enabled = false）");
+            None
+        }
+        (true, StorageBackend::Jsonl) => {
+            warn!(
+                "告警引擎需要 SQLite（規則、事件與靜音存在資料庫中），storage.backend = \"jsonl\" 時不啟動"
+            );
+            None
+        }
+        (true, StorageBackend::Sqlite) => {
+            match alerts::AlertService::start(alerts::StartParams {
+                config: Arc::new(config.clone()),
+                data_dir: paths.data_dir.clone(),
+                db_path: enroll::db_path(&config, &paths.data_dir),
+                registry: registry.clone(),
+                write_stats: Some(ctx.reports.stats().clone()),
+                per_ip: Some(per_ip.clone()),
+                tls: Some(tls_state.clone()),
+                enroll: enroll_service.clone(),
+                agent_listen: agent_addr_for_alerts,
+                shutdown: shutdown.clone(),
+                enroll_closed_default: config.provenance.source(settings::KEY_MODE)
+                    == config::SettingSource::Default,
+                clock: alerts_clock,
+            })
+            .await
+            {
+                Ok(started) => Some(started),
+                Err(e) => {
+                    error!("告警引擎無法啟動（主機與系統事件不會產生告警，也不會發送通知）：{e}");
+                    None
+                }
+            }
+        }
+    };
+    let alert_service = alerts.as_ref().map(|(svc, _)| svc.clone());
+    // 健康檢查與 Prometheus（審計 O3；crate::probe）：主控台的監聽上提供，另可以純 HTTP 監聽
+    let obs = Arc::new(
+        probe::ObsContext::new(probe::ObsParams {
+            config: Arc::new(config.clone()),
+            registry: registry.clone(),
+            reports: ctx.reports.clone(),
+            per_ip: per_ip.clone(),
+            tls: tls_state.clone(),
+            enroll: enroll_service.clone(),
+            shutdown: shutdown.clone(),
+            db_path: (config.storage.backend == StorageBackend::Sqlite)
+                .then(|| store::sqlite::SqliteOptions::from_config(&config, &paths.data_dir).path),
+            alerts: alert_service.clone(),
+        })
+        .map_err(config_error)?,
+    );
+    // `/metrics` 的主機計數：訂閱內部事件匯流排（與告警引擎相同的事件，不在連線的程式中重複計數）
+    tokio::spawn(metrics::watch_bus(registry.bus(), shutdown.clone()));
+    if let Some(svc) = &alert_service {
+        tokio::spawn(metrics::watch_alerts(svc.subscribe(), shutdown.clone()));
+    }
+    let probe_server = match config.observability.listen.trim() {
+        "" => None,
+        addr => {
+            let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr)
+                .await
+                .map(|a| a.collect())
+                .unwrap_or_default();
+            let agent_addr = listener
+                .local_addr()
+                .map_err(|e| Error::new(e.kind(), format!("無法取得監聽位址: {e}")))?;
+            if resolved
+                .iter()
+                .any(|a| config::listen_addrs_conflict(a, &agent_addr))
+            {
+                return Err(config_error(config::listen_conflict_between(
+                    "server.listen",
+                    &config.server.listen,
+                    "observability.listen",
+                    addr,
+                )));
+            }
+            let server = probe::start_listener(obs.clone(), addr).map_err(listen_error)?;
+            info!(
+                "健康檢查與 Prometheus 端點：http://{}/healthz、/readyz、/metrics（{}）",
+                server.local_addr,
+                if obs.metrics_token.is_some() {
+                    "/metrics 需要 bearer token"
+                } else {
+                    "/metrics 只接受 loopback 來源"
+                }
+            );
+            Some(server)
+        }
+    };
+
     // 主控台 API（kairos/API.md）：需要 SQLite（API token 存在資料庫中）
     let console = match (config.console.enabled, config.storage.backend) {
         (false, _) => {
@@ -958,6 +1121,9 @@ async fn run(
                 shutdown: shutdown.clone(),
                 agent_listen: agent_addr,
                 enroll: enroll_service.clone(),
+                alerts: alert_service.clone(),
+                directory: None,
+                obs: Some(obs.clone()),
             })
             .await;
             match started {
@@ -982,13 +1148,28 @@ async fn run(
         config.storage.data_dir
     );
 
-    let mut connections =
-        accept_loop(listener, ctx.clone(), config.server.max_connections, per_ip).await?;
+    registry.bus().publish(bus::EventKind::Lifecycle {
+        phase: bus::Lifecycle::Started,
+    });
+    // 稽核：系統事件（啟動）
+    system_audit(enroll_service.as_ref(), "system.start", config_path).await;
+
+    obs.agent_listening
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let connections =
+        accept_loop(listener, ctx.clone(), config.server.max_connections, per_ip).await;
+    obs.agent_listening
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut connections = connections?;
+    registry.bus().publish(bus::EventKind::Lifecycle {
+        phase: bus::Lifecycle::ShuttingDown,
+    });
 
     // ---- 關機 ----
     // 所有階段共用以 T0（收到訊號的時間）起算的期限
     let t0 = shutdown.started_at().unwrap_or_else(Instant::now);
     info!("已停止接受新連線");
+    system_audit(enroll_service.as_ref(), "system.shutdown", config_path).await;
     // 主控台：停止接受並中斷所有連線（含 SSE）
     if let Some(console) = console {
         let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), console.join()).await;
@@ -996,6 +1177,14 @@ async fn run(
     // 註冊端點：停止監聽，進行中的請求最多 5 秒
     if let Some(enroll) = enroll {
         let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), enroll.join()).await;
+    }
+    // 探針的純 HTTP 監聽（自己的執行緒，關機時停止 accept）
+    if let Some(server) = probe_server {
+        let _ = timeout_at(
+            tokio_deadline(t0 + CONNECTIONS_DEADLINE),
+            tokio::task::spawn_blocking(move || server.join()),
+        )
+        .await;
     }
 
     while connections.try_join_next().is_some() {}
@@ -1017,6 +1206,11 @@ async fn run(
     let forced = registry.mark_all_offline(Instant::now());
     if forced > 0 {
         info!("將 {} 個仍在線上的 agent 標記為離線", forced);
+    }
+    // 告警引擎：寫入最後的事件與「正常關機」的心跳（下次啟動時判斷停機期間）
+    drop(alert_service);
+    if let Some((_, thread)) = alerts {
+        alerts::AlertService::join(thread, Duration::from_secs(3)).await;
     }
 
     // 最後一份狀態（所有 agent 已標為離線）交給 writer，結束前寫入主機清冊

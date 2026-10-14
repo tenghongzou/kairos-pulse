@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.99"
 # 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
@@ -17,6 +17,8 @@ config = { version = "0.15", default-features = false, features = ["toml"] }
 fern = { version = "0.7", features = ["date-based"] }
 # 與 Kairos 共用的日誌清除時鐘跳躍保護（workspace 內部 crate）
 date-guard = { path = "../crates/date-guard" }
+# 與 Pulse／Kairos 共用的可觀測性元件：日誌格式、syslog、Prometheus 文字格式、診斷包（workspace 內部 crate）
+kp-obs = { path = "../crates/kp-obs" }
 # 與 Kairos 共用的協定型別與驗證（workspace 內部 crate）
 kairos-proto = { path = "../crates/kairos-proto" }
 # SinkExt / StreamExt

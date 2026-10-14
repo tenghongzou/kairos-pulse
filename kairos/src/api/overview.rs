@@ -10,6 +10,7 @@ use super::ApiContext;
 use super::health::{self, Level};
 use super::hosts::{HostView, LONG_OFFLINE_SECS, Snapshot, Status, status_counts};
 use super::http::{ApiError, ok, ts_ms};
+use crate::rbac::HostAccess;
 
 /// 每分鐘的上線數保留多久（24 小時）
 pub const MINUTE_SAMPLES: usize = 24 * 60;
@@ -64,14 +65,15 @@ fn brief(h: &HostView, now_ms: i64) -> Value {
 }
 
 /// 依 `key` 由大到小取前 `n` 台
-fn top_by(
-    hosts: &[HostView],
+fn top_by<'a>(
+    hosts: &[&'a HostView],
     n: usize,
     filter: impl Fn(&HostView) -> bool,
     key: impl Fn(&HostView) -> Option<f64>,
-) -> Vec<&HostView> {
-    let mut list: Vec<(&HostView, f64)> = hosts
+) -> Vec<&'a HostView> {
+    let mut list: Vec<(&'a HostView, f64)> = hosts
         .iter()
+        .copied()
         .filter(|h| filter(h))
         .filter_map(|h| key(h).map(|k| (h, k)))
         .collect();
@@ -85,14 +87,25 @@ fn top_by(
 /// `GET /api/v1/overview`
 pub async fn get(
     ctx: &Arc<ApiContext>,
+    access: &HostAccess,
+    show_health: bool,
     now: DateTime<Utc>,
 ) -> Result<hyper::Response<super::http::ApiBody>, ApiError> {
     let snap = ctx.hosts.snapshot(ctx).await?;
     let now_ms = now.timestamp_millis();
-    let c = counts(&snap);
+    let all = *access == HostAccess::All;
+    let hosts: Vec<&HostView> = snap
+        .hosts
+        .iter()
+        .filter(|h| access.allows(h.host_group.as_deref()))
+        .collect();
+    let mut c: HashMap<Status, u64> = HashMap::new();
+    for h in &hosts {
+        *c.entry(h.status).or_insert(0) += 1;
+    }
     let online = c.get(&Status::Online).copied().unwrap_or(0);
     let offline = c.get(&Status::Offline).copied().unwrap_or(0);
-    let total = snap.hosts.len() as u64;
+    let total = hosts.len() as u64;
     let (series, change) = {
         let m = ctx.minutes.lock().unwrap_or_else(|e| e.into_inner());
         let change = m.at_or_before(now_ms - 3_600_000).map(|(_, o, t)| {
@@ -104,32 +117,44 @@ pub async fn get(
         });
         (m.points(), change)
     };
+    // 每分鐘的上線數與投遞計數是全站的數字：群組範圍的身分看不到
+    let (series, change) = if all {
+        (series, change)
+    } else {
+        (Vec::new(), None)
+    };
     let live = ctx.registry.live_view();
     let (d_online, durable, replaying) = health::delivery_counts(&live, std::time::Instant::now());
+    let delivery =
+        all.then(|| json!({ "online": d_online, "durable": durable, "replaying": replaying }));
     let longest = top_by(
-        &snap.hosts,
+        &hosts,
         5,
         |h| h.status == Status::Offline,
         |h| Some(-(h.last_seen as f64)),
     );
-    let top_cpu = top_by(&snap.hosts, 10, |h| h.status == Status::Online, |h| h.cpu());
+    let top_cpu = top_by(&hosts, 10, |h| h.status == Status::Online, |h| h.cpu());
     let top_mem = top_by(
-        &snap.hosts,
+        &hosts,
         10,
         |h| h.status == Status::Online,
         |h| h.mem_ratio(),
     );
-    let health = health::compute(ctx, now).await.ok();
+    let health = if show_health {
+        health::compute(ctx, now).await.ok()
+    } else {
+        None
+    };
     Ok(ok(
         now,
         json!({
             "status_counts": status_counts(&c),
             "total": total,
-            "never_connected": snap.hosts.iter().filter(|h| h.never_connected).count(),
-            "long_offline": snap.hosts.iter().filter(|h| h.offline_for_secs(now_ms).is_some_and(|s| s > LONG_OFFLINE_SECS)).count(),
+            "never_connected": hosts.iter().filter(|h| h.never_connected).count(),
+            "long_offline": hosts.iter().filter(|h| h.offline_for_secs(now_ms).is_some_and(|s| s > LONG_OFFLINE_SECS)).count(),
             "change_1h": change,
             "online_series": { "interval_secs": 60, "points": series },
-            "delivery": { "online": d_online, "durable": durable, "replaying": replaying },
+            "delivery": delivery,
             "longest_offline": longest.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),
             "top_cpu": top_cpu.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),
             "top_memory": top_mem.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),

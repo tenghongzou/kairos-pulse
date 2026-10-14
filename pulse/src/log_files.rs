@@ -40,16 +40,58 @@ const LOG_NAMES: DatedName = DatedName {
     suffix: SUFFIX,
 };
 
+/// `log.format = "json"` 的日誌檔：`logs/pulse-YYYY-MM-DD.jsonl`（兩種格式不混在同一個檔案）
+const LOG_NAMES_JSON: DatedName = DatedName {
+    prefix: PREFIX,
+    suffix: ".jsonl",
+};
+
+/// 以附加模式開啟日誌檔
+fn open_append(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// 按日分檔的日誌輸出（UTC 日期；副檔名依格式：`.log` 或 `.jsonl`）
+pub fn daily_file(format: kp_obs::logfmt::LogFormat) -> kp_obs::logfmt::DailyFile {
+    kp_obs::logfmt::DailyFile::new(
+        PathBuf::from(LOG_DIR),
+        PREFIX,
+        format.file_suffix(),
+        open_append,
+        Utc::now,
+    )
+}
+
+/// 已初始化的日誌輸出（`/metrics` 的 syslog 計數、結束前送完 syslog 佇列、JSON 的 agent_id）
+static SINK: std::sync::OnceLock<std::sync::Arc<kp_obs::logfmt::LogSink>> =
+    std::sync::OnceLock::new();
+
+/// 記下已初始化的日誌輸出
+pub fn set_sink(sink: std::sync::Arc<kp_obs::logfmt::LogSink>) {
+    let _ = SINK.set(sink);
+}
+
+/// 已初始化的日誌輸出（初始化日誌之前為 `None`）
+pub fn sink() -> Option<&'static std::sync::Arc<kp_obs::logfmt::LogSink>> {
+    SINK.get()
+}
+
+/// 結束前：寫出緩衝並等待 syslog 佇列送完（最多 2 秒）
+pub fn flush_all() {
+    log::logger().flush();
+    if let Some(s) = sink() {
+        s.flush();
+        if let Some(syslog) = &s.syslog {
+            syslog.flush(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
 /// [`DateGuard`] 狀態檔的檔名（放在日誌目錄中）；不符合日誌檔名，不會被清除。
 pub const GUARD_STATE_FILE: &str = ".retention-guard.json";
 
 /// 偵測到時鐘跳躍（或日期回撥）後，新的日期持續這麼久才接受（規則見 [`date_guard::DateGuard`]）。
 pub use date_guard::JUMP_ACCEPT_AFTER;
-
-/// fern 的按日分檔輸出：`logs/pulse-YYYY-MM-DD.log`，以 UTC 日期換檔。
-pub fn daily_output() -> fern::DateBased {
-    fern::DateBased::new(format!("{LOG_DIR}/{PREFIX}"), format!("%Y-%m-%d{SUFFIX}")).utc_time()
-}
 
 /// 某日期的日誌檔名。
 #[cfg(test)]
@@ -57,15 +99,17 @@ fn file_name(date: NaiveDate) -> String {
     LOG_NAMES.file_name(date)
 }
 
-/// 只有完全符合 `pulse-YYYY-MM-DD.log`（且為合法日期）才回傳日期。
-fn parse(name: &str) -> Option<NaiveDate> {
-    LOG_NAMES.parse(name)
+/// 只有完全符合 `pulse-YYYY-MM-DD.log` 或 `.jsonl`（且為合法日期）才回傳日期。
+pub fn parse(name: &str) -> Option<NaiveDate> {
+    LOG_NAMES.parse(name).or_else(|| LOG_NAMES_JSON.parse(name))
 }
 
 /// `dir` 中檔名合法、日期不晚於 `not_after` 的日誌檔裡最新的日期（沒有時為 `None`）。
 /// 晚於 `not_after` 的檔案（時鐘誤校到未來時建立的）不列入。
 fn newest_log_date(dir: &Path, not_after: NaiveDate) -> Option<NaiveDate> {
-    LOG_NAMES.newest(dir, not_after)
+    LOG_NAMES
+        .newest(dir, not_after)
+        .max(LOG_NAMES_JSON.newest(dir, not_after))
 }
 
 /// 日誌檔保留清除（含時鐘跳躍保護）。

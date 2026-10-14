@@ -633,6 +633,8 @@ struct Conn {
     messages: TokenBucket,
     /// 註冊服務（8443 的 `renew`、`deregister`）
     enroll: Option<Arc<crate::enroll::EnrollService>>,
+    /// 事件匯流排（身分驗證失敗、除役、狀態表淘汰；[`crate::bus`]）
+    bus: Arc<crate::bus::EventBus>,
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
@@ -708,6 +710,7 @@ pub async fn handle_connection(
         report_limiter: ctx.report_limiter.clone(),
         messages: TokenBucket::new(MESSAGE_BURST, MESSAGES_PER_SEC, std::time::Instant::now()),
         enroll: ctx.enroll.clone(),
+        bus: ctx.registry.bus(),
     };
 
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
@@ -946,11 +949,20 @@ impl Conn {
             let seq = msg.seq;
             let serial = self.client_serial();
             let peer = self.peer.ip().to_string();
+            let initiated_by = Some(msg.initiated_by.clone());
             let reply =
                 match crate::enroll::agent::deregister(svc, &agent.agent_id, serial, &peer, *msg)
                     .await
                 {
-                    Ok(ack) => ServerMsg::DeregisterAck(Box::new(ack)),
+                    Ok(ack) => {
+                        self.bus.publish(crate::bus::EventKind::HostDecommissioned {
+                            agent_id: agent.agent_id.clone(),
+                            ip: Some(self.peer.ip().to_canonical()),
+                            initiated_by,
+                            already: ack.already_decommissioned,
+                        });
+                        ServerMsg::DeregisterAck(Box::new(ack))
+                    }
                     Err(e) => e.to_msg(Some(seq)),
                 };
             self.send(&reply).await?;
@@ -1161,6 +1173,10 @@ impl Conn {
                     agent_id.escape_debug(),
                     reason
                 );
+                self.bus.publish(crate::bus::EventKind::AuthFailed {
+                    agent_id: agent_id.to_string(),
+                    ip: self.peer.ip().to_canonical(),
+                });
                 self.reply(ServerMsg::error(
                     Some(seq),
                     ErrorCode::AuthFailed,
@@ -1469,6 +1485,10 @@ impl Conn {
                 evicted.hostname.escape_debug(),
                 evicted.offline_for.as_secs_f64() / 3600.0
             );
+            self.bus.publish(crate::bus::EventKind::RegistryEvicted {
+                agent_id: evicted.agent_id.clone(),
+                hostname: evicted.hostname.clone(),
+            });
         }
         let state = match registration.kind {
             RegisterKind::New => "上線".to_string(),
@@ -1888,6 +1908,11 @@ impl Conn {
                             agent.agent_id,
                             seq,
                             reason
+                        );
+                        ctx.registry.set_close_reason(
+                            &agent.agent_id,
+                            self.conn_id,
+                            crate::registry::OfflineReason::WriteUnknown,
                         );
                         self.close().await?;
                         Ok(Handled::alive(Flow::Close))

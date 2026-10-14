@@ -1,14 +1,19 @@
-//! 日誌：輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（依 UTC 日期分檔），並依保留天數清除舊檔。
+//! 日誌：輸出到 `logs/kairos-YYYY-MM-DD.log`（`log.format = "json"` 時為 `.jsonl`，依 UTC 日期分檔），
+//! 可選擇同時寫 stdout（`log.stdout`）與 syslog（`[log.syslog]`），並依保留天數清除舊檔。
+//!
+//! 行的格式見 [`kp_obs::logfmt`]：`text`（預設，RFC 3339 帶時區）、`json`、`legacy`（0.5 以前）。
 
 use chrono::{DateTime, NaiveDate, Utc};
+use kp_obs::logfmt::{LogFormat, LogMeta, LogSink};
 use log::{LevelFilter, info};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Error, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::config::LogSettings;
 use crate::fsperm;
 use crate::retention::{
     DateGuard, DatedFiles, GUARD_STATE_FILE, LOG_GUARD_STATE_FILE, is_tmp_name_for,
@@ -24,11 +29,29 @@ pub const LOG_FILES: DatedFiles = DatedFiles {
     label: "日誌檔",
 };
 
+/// `log.format = "json"` 的日誌檔：`logs/kairos-YYYY-MM-DD.jsonl`（兩種格式不混在同一個檔案）
+pub const LOG_FILES_JSON: DatedFiles = DatedFiles {
+    prefix: "kairos-",
+    suffix: ".jsonl",
+    label: "日誌檔",
+};
+
+/// 某個格式的日誌檔名規則
+pub fn log_files(format: LogFormat) -> DatedFiles {
+    match format {
+        LogFormat::Json => LOG_FILES_JSON,
+        _ => LOG_FILES,
+    }
+}
+
 /// 舊版（按日分檔前）的單一日誌檔
 pub const LEGACY_LOG_FILE: &str = "kairos.log";
 
 /// 定期清除舊日誌的間隔
 pub const LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// 結束前等待 syslog 佇列送完的上限
+pub const SYSLOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 以附加模式開啟日誌檔。Unix 上新檔案為 0640，既有的檔案收緊到最多 0640（S3）。
 /// 會在日誌的寫入路徑上呼叫，因此不可以記錄日誌（會重入 logger）；收緊失敗時忽略
@@ -41,10 +64,11 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
 
 /// 依 UTC 日期分檔的日誌輸出（取代 fern 的 `DateBased`，以便在 Unix 上指定新檔案的權限）。
 ///
-/// fern 每筆日誌先寫入（可能分成多次 `write`）再呼叫一次 `flush`；只在一筆日誌的第一次 `write`
+/// 每筆日誌先寫入（可能分成多次 `write`）再呼叫一次 `flush`；只在一筆日誌的第一次 `write`
 /// 檢查日期，同一筆日誌不會被拆到兩個檔案。換日時關閉舊檔、開啟（必要時建立）新日期的檔案。
 pub struct DailyLogFile {
     dir: PathBuf,
+    files: DatedFiles,
     clock: fn() -> DateTime<Utc>,
     current: Option<(NaiveDate, BufWriter<File>)>,
     /// 下一次 `write` 是一筆新日誌的開頭
@@ -52,9 +76,15 @@ pub struct DailyLogFile {
 }
 
 impl DailyLogFile {
+    #[cfg(test)]
     pub fn new(dir: PathBuf, clock: fn() -> DateTime<Utc>) -> Self {
+        Self::with_files(dir, LOG_FILES, clock)
+    }
+
+    pub fn with_files(dir: PathBuf, files: DatedFiles, clock: fn() -> DateTime<Utc>) -> Self {
         Self {
             dir,
+            files,
             clock,
             current: None,
             record_start: true,
@@ -68,7 +98,7 @@ impl DailyLogFile {
                 if let Some((_, mut old)) = self.current.take() {
                     let _ = old.flush();
                 }
-                let file = open_log_file(&self.dir.join(LOG_FILES.file_name(today)))?;
+                let file = open_log_file(&self.dir.join(self.files.file_name(today)))?;
                 self.current = Some((today, BufWriter::new(file)));
             }
             self.record_start = false;
@@ -94,41 +124,78 @@ impl Write for DailyLogFile {
     }
 }
 
+/// 已初始化的日誌輸出（`/metrics` 的 syslog 計數、結束前送完 syslog 佇列）
+static SINK: OnceLock<Arc<LogSink>> = OnceLock::new();
+
+/// 已初始化的日誌輸出（[`setup`] 之前為 `None`）
+pub fn sink() -> Option<&'static Arc<LogSink>> {
+    SINK.get()
+}
+
+/// 結束前：寫出緩衝並等待 syslog 佇列送完（最多 [`SYSLOG_FLUSH_TIMEOUT`]）
+pub fn flush_all() {
+    log::logger().flush();
+    if let Some(s) = sink() {
+        s.flush();
+        if let Some(syslog) = &s.syslog {
+            syslog.flush(SYSLOG_FLUSH_TIMEOUT);
+        }
+    }
+}
+
+/// 啟動前最新日誌檔（兩種副檔名中較新者）的日期，不晚於 `not_after`
+pub fn newest_log_date(dir: &Path, not_after: NaiveDate) -> Option<NaiveDate> {
+    LOG_FILES
+        .newest(dir, not_after)
+        .max(LOG_FILES_JSON.newest(dir, not_after))
+}
+
 /// 初始化日誌。檔名依 UTC 日期，換日時自動切換到新檔；每筆日誌寫入後即 flush。
 /// Unix 上日誌目錄（新建立時）為 0750、日誌檔最多 0640（S3）。
 ///
 /// 回傳建立今天的日誌檔**之前**既有最新日誌檔的日期，作為日誌保留清除的日期基準（見 [`run_cleanup`]）。
-pub fn setup(level: LevelFilter) -> Result<Option<NaiveDate>, Error> {
+pub fn setup(level: LevelFilter, settings: &LogSettings) -> Result<Option<NaiveDate>, Error> {
+    let format = settings.log_format()?;
+    let tz = settings.log_timezone()?;
+    let host = kp_obs::logfmt::hostname();
+    let syslog_config = settings.syslog_config(&host)?;
     fsperm::create_dir_all(Path::new(LOG_DIR))
         .map_err(|e| Error::new(e.kind(), format!("無法建立日誌目錄 {}: {}", LOG_DIR, e)))?;
-    let newest_before_start = LOG_FILES.newest(Path::new(LOG_DIR), Utc::now().date_naive());
+    let newest_before_start = newest_log_date(Path::new(LOG_DIR), Utc::now().date_naive());
 
     // 日誌檔在第一次寫入時才開啟；先開一次今天的檔案，讓權限等問題在啟動時就被發現
-    let today = Path::new(LOG_DIR).join(LOG_FILES.file_name(Utc::now().date_naive()));
+    let files = log_files(format);
+    let today = Path::new(LOG_DIR).join(files.file_name(Utc::now().date_naive()));
     open_log_file(&today).map_err(|e| {
         Error::new(
             e.kind(),
             format!("無法開啟日誌檔 {}: {}", today.display(), e),
         )
     })?;
+    let syslog = match syslog_config {
+        Some(c) => Some(
+            kp_obs::syslog::Sender::start(c)
+                .map_err(|e| Error::other(format!("無法啟動 syslog 外送: {e}")))?,
+        ),
+        None => None,
+    };
 
-    let file = fern::Output::writer(
-        Box::new(DailyLogFile::new(PathBuf::from(LOG_DIR), Utc::now)),
-        "\n",
-    );
-
+    let sink = Arc::new(LogSink::new(
+        Arc::new(LogMeta::new("kairos", host, false)),
+        format,
+        tz,
+        Box::new(DailyLogFile::with_files(
+            PathBuf::from(LOG_DIR),
+            files,
+            Utc::now,
+        )),
+        settings.stdout,
+        syslog,
+    ));
+    let _ = SINK.set(sink.clone());
     fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                message
-            ))
-        })
         .level(level)
-        .chain(std::io::stdout()) // 日誌輸出到終端
-        .chain(file) // 日誌輸出到按日分檔的檔案
+        .chain(fern::Output::call(move |record| sink.log(record)))
         .apply()
         .map_err(|e| Error::other(format!("無法初始化日誌: {}", e)))?;
     Ok(newest_before_start)
@@ -198,7 +265,9 @@ async fn run_cleanup_every(
             .check(now_wall.date_naive(), Instant::now(), now_wall)
             .await
         {
+            // 兩種格式的檔案都清除（切換 log.format 前後的檔案並存）
             LOG_FILES.cleanup(dir, today, retention_days).await;
+            LOG_FILES_JSON.cleanup(dir, today, retention_days).await;
         }
     }
 }
@@ -224,6 +293,43 @@ async fn remove_stale_guard_tmp_files(dir: &Path) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// 告警與帳號模組的日誌在 JSON 模式下有固定的 event、代碼與所有共同欄位（`log.format = "json"`）
+    #[test]
+    fn alert_and_auth_log_lines_have_complete_json_fields() {
+        use kp_obs::logfmt::{Line, LogMeta, LogTimezone, format_line};
+        let meta = LogMeta::new("kairos", "kp-test".into(), false);
+        let kvs: [(&str, &str); 1] = [("event", "alerts.channel.failed")];
+        const MSG: &str = "錯誤 KRS-E5107：通知管道「值班」連續 3 次發送失敗，改由其他管道通知";
+        let line = Line::from_record(
+            &log::Record::builder()
+                .level(log::Level::Warn)
+                .target("kairos::alerts::notify")
+                .args(format_args!("{MSG}"))
+                .key_values(&kvs)
+                .build(),
+            MSG.to_string(),
+        );
+        let now = Utc.with_ymd_and_hms(2026, 10, 15, 1, 2, 3).unwrap();
+        let json = format_line(&line, &meta, LogFormat::Json, LogTimezone::Utc, now);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for k in [
+            "v", "ts", "level", "event", "code", "msg", "product", "host", "run_id", "seq",
+            "target", "fields",
+        ] {
+            assert!(v.get(k).is_some(), "{k}: {json}");
+        }
+        assert_eq!(v["event"], "alerts.channel.failed");
+        assert_eq!(v["code"], "KRS-E5107");
+        assert_eq!(v["level"], "warn");
+        assert_eq!(v["product"], "kairos");
+        // text：事件與代碼在訊息前（與 Pulse 的「<event> <code> 訊息」一致）
+        let text = format_line(&line, &meta, LogFormat::Text, LogTimezone::Utc, now);
+        assert!(
+            text.contains("[WARN] alerts.channel.failed KRS-E5107 錯誤 KRS-E5107"),
+            "{text}"
+        );
+    }
     use std::sync::atomic::{AtomicI64, Ordering};
 
     static LOG_CLOCK: AtomicI64 = AtomicI64::new(0);

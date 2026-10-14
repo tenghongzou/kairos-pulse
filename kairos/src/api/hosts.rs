@@ -23,6 +23,7 @@ use super::http::{ApiBody, ApiError, Query, b64url_decode, b64url_encode, ok, ts
 use crate::hosts_cli::parse_duration;
 use crate::per_ip::cidr::Cidr;
 use crate::protocol::HostInfo;
+use crate::rbac::HostAccess;
 use crate::registry::{LastReport, LiveAgent};
 use crate::store::sqlite::HOST_SOURCE_IMPORT;
 use crate::tls::{CertRejection, RejectionReason};
@@ -120,13 +121,15 @@ pub struct DbHost {
     pub last_report: Option<Arc<LastReport>>,
     pub imported: bool,
     pub rejection: Option<CertRejection>,
+    /// 主機群組（角色指派的範圍；`hosts.host_group`）
+    pub host_group: Option<Arc<str>>,
 }
 
 /// `hosts` 的欄位（[`DbHost`] 的順序；第一欄 host_id 未使用）
 pub const HOST_COLUMNS: &str = "host_id, agent_id, hostname, display_name, agent_version, proto, \
      host_fingerprint, tags, os, report_interval_ms, peer, identity_verified, first_seen, \
      connected_at, last_seen, offline_after_ms, last_report, source, cert_rejected_at, \
-     cert_rejection";
+     cert_rejection, host_group";
 
 /// 清冊中保存的被拒憑證（`hosts.cert_rejection`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +181,7 @@ fn host_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<DbHost> {
             .map(Arc::new),
         imported: text(17)?.as_deref() == Some(HOST_SOURCE_IMPORT),
         rejection,
+        host_group: arc(text(20)?),
     })
 }
 
@@ -226,6 +230,8 @@ pub struct HostView {
     pub last_report: Option<Arc<LastReport>>,
     pub imported: bool,
     pub rejection: Option<CertRejection>,
+    /// 主機群組（角色指派的範圍；`hosts.host_group`）
+    pub host_group: Option<Arc<str>>,
     /// 排序與搜尋用：顯示名稱（沒有時為主機名稱）的小寫
     name_lower: String,
     hostname_lower: String,
@@ -266,6 +272,7 @@ impl HostView {
             "proto": self.proto,
             "os": self.os.as_deref().map(os_json),
             "tags": &*self.tags,
+            "group": self.host_group.as_deref(),
             "first_seen": ts_ms(self.first_seen),
             "last_seen": ts_ms(self.last_seen),
             "offline_for_secs": offline_for,
@@ -449,6 +456,7 @@ pub fn view_of(
         last_report,
         imported,
         rejection,
+        host_group: db.and_then(|d| d.host_group.clone()),
         cpu,
         mem_ratio,
     })
@@ -611,6 +619,10 @@ pub struct Filter {
     durable: Option<bool>,
     subnets: Vec<Cidr>,
     search: Option<Search>,
+    /// `group` 參數（小寫，取「或」）
+    groups: Vec<String>,
+    /// 角色指派的範圍：只看得到這些主機群組（小寫）；`None` 為全部
+    scope: Option<Vec<String>>,
 }
 
 const OFFLINE_REASONS: [&str; 4] = [
@@ -671,6 +683,7 @@ impl Filter {
         f.tags = q.list("tag").iter().map(|t| t.to_lowercase()).collect();
         f.os = q.list("os").iter().map(|t| t.to_lowercase()).collect();
         f.versions = q.list("version");
+        f.groups = q.list("group").iter().map(|t| t.to_lowercase()).collect();
         f.durable = q.bool("durable")?;
         for s in q.list("subnet") {
             f.subnets.push(parse_cidr("subnet", &s)?);
@@ -698,8 +711,27 @@ impl Filter {
         Ok(f)
     }
 
+    /// 套用身分的主機範圍（群組範圍的角色只看得到自己的群組）
+    pub fn with_access(mut self, access: &HostAccess) -> Self {
+        self.scope = match access {
+            HostAccess::All => None,
+            HostAccess::Groups(g) => Some(g.clone()),
+            HostAccess::None => Some(Vec::new()),
+        };
+        self
+    }
+
     /// 狀態以外的條件
     fn matches_except_status(&self, h: &HostView, now_ms: i64) -> bool {
+        let group = h.host_group.as_deref().map(|g| g.trim().to_lowercase());
+        if let Some(scope) = &self.scope
+            && !group.as_ref().is_some_and(|g| scope.contains(g))
+        {
+            return false;
+        }
+        if !self.groups.is_empty() && !group.as_ref().is_some_and(|g| self.groups.contains(g)) {
+            return false;
+        }
         if let Some(nc) = self.never_connected
             && h.never_connected != nc
         {
@@ -1033,10 +1065,11 @@ const LIST_PARAMS: [&str; 14] = [
 pub async fn list(
     ctx: &Arc<ApiContext>,
     q: &Query,
+    access: &HostAccess,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     q.reject_unknown(&LIST_PARAMS, &[])?;
-    let filter = Filter::parse(q)?;
+    let filter = Filter::parse(q)?.with_access(access);
     let sort = Sort::parse(q.get("sort"))?;
     let limit = match q.get("limit") {
         None => DEFAULT_LIMIT,
@@ -1081,10 +1114,42 @@ pub fn parse_agent_id(text: &str) -> Result<String, ApiError> {
     }
 }
 
+/// 單台主機的端點（趨勢、指標清單）：這台主機是否在身分的範圍內（不在範圍內時與不存在相同，回 404）
+pub async fn check_access(
+    ctx: &Arc<ApiContext>,
+    agent_id: &str,
+    access: &HostAccess,
+) -> Result<(), ApiError> {
+    if *access == HostAccess::All {
+        return Ok(());
+    }
+    let id = parse_agent_id(agent_id)?;
+    let q = id.clone();
+    let group: Option<String> = ctx
+        .pool
+        .read("主機詳情", move |conn| {
+            conn.query_row(
+                "SELECT host_group FROM hosts WHERE agent_id = ?1",
+                [&q],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(query_failed("主機詳情"))
+        })
+        .await?;
+    if access.allows(group.as_deref()) {
+        Ok(())
+    } else {
+        Err(ApiError::host_not_found(&id))
+    }
+}
+
 /// `GET /api/v1/hosts/{agent_id}`
 pub async fn detail(
     ctx: &Arc<ApiContext>,
     agent_id: &str,
+    access: &HostAccess,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let agent_id = parse_agent_id(agent_id)?;
@@ -1095,6 +1160,10 @@ pub async fn detail(
             load_host(conn, &id).map_err(query_failed("主機詳情"))
         })
         .await?;
+    // 範圍外的主機與不存在的主機相同（不透露它存在）
+    if !access.allows(db.as_ref().and_then(|d| d.host_group.as_deref())) {
+        return Err(ApiError::host_not_found(&agent_id));
+    }
     let live = ctx.registry.live_get(&agent_id);
     let rejection = crate::tls::rejections().get(&agent_id);
     let env = ctx.merge_env();
@@ -1170,6 +1239,7 @@ pub(crate) mod tests {
             last_report: None,
             imported: false,
             rejection: None,
+            host_group: None,
         }
     }
 
@@ -1198,6 +1268,7 @@ pub(crate) mod tests {
             durable: Some(true),
             backfill: None,
             offline_reason: (!online).then_some(OfflineReason::Timeout),
+            offline_for: None,
         }
     }
 
