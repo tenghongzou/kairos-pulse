@@ -2,24 +2,25 @@
 
 本文件是 Kairos 端「註冊與憑證」的工程規格：CA 架構、簽發金鑰的保管、憑證格式、撤銷與 CRL、離線簽發模式，以及資料庫 schema v4。8444 註冊通道的線上協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，主控台與 CLI 見 [`API.md`](API.md) 第 11 節。
 
-- 狀態：**0.5.0〔草稿〕規格，尚未實作**。標「**待使用者確認**」的項目是建議的預設，實作前請確認。
+- 狀態：**0.5.0〔草稿〕規格**。第 1 節原本標「待使用者確認」的項目已由使用者決定（2026-10-14），標為「已決定（2026-10-14）」。
 - 設計依據（設計包，唯讀）：`kairos/screens.md` S02 步驟 3、S12～S15、§24 #6、#7、#13、#20；`pulse/enrollment-ux.md` §1、§8；`design-system/cli-style.md` §11.3；`decisions/INTEGRATION.md` §17。
 - 現況：0.4 沒有內建的 PKI。`packaging/INSTALL.md` 第 6 節以 openssl 在管理主機建立兩個離線 CA（伺服器 CA、代理 CA），手動簽發與撤銷，`kairos-crl.timer` 定期重新產生 CRL；Kairos 只讀取 `auth.client_ca` 與 `auth.crl`。
 
 ## 1. 決定摘要
 
-| # | 決定 | 預設 | 待使用者確認 |
+| # | 決定 | 預設 | 狀態 |
 |---|---|---|---|
-| 1 | **根 CA 離線、Kairos 線上持有「代理簽發 CA」（中繼 CA）的私鑰**，核准後立即簽發 | `pki.mode = "online"` | **是**：線上持有簽發金鑰是自動簽發的前提，也是新的攻擊面（第 3 節） |
-| 2 | Kairos 的 mTLS 信任錨是**簽發 CA 本身**（不是根 CA） | — | 否（技術決定，理由見第 2 節） |
-| 3 | 簽發 CA 憑證帶 `pathLenConstraint = 0` 與 EKU `clientAuth`，有效 5 年；新簽發的用戶端憑證不得晚於簽發 CA 到期 | — | 否 |
-| 4 | 演算法：簽發 CA 與用戶端金鑰 **ECDSA P-256**；根 CA **ECDSA P-384**（新安裝）或沿用既有的 RSA 3072／4096 | — | **是**：根 CA 的演算法（P-384 或 RSA 4096；沿用 INSTALL 的 RSA 時不需變更） |
-| 5 | 用戶端憑證 365 天（D2）、序號 16 bytes 隨機值、`notBefore` 往前 10 分鐘 | — | 否（D2 已定） |
-| 6 | **離線簽發模式**（`pki.mode = "offline"`）：不在線上持有任何 CA 私鑰，核准後匯出 CSR 佇列、在 CA 主機簽發、再匯入 | 不是預設 | **是**：高安全場域是否改為預設 |
-| 7 | Kairos 自己產生並載入簽發 CA 的 CRL（每次撤銷與每 24 小時），不再需要 `kairos-crl.timer`（離線模式仍需要） | — | 否 |
-| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **是**：`pki init` 與首次啟動精靈（S02）一起排入之後的衝刺 |
-| 9 | 續簽重放快取持久化、除役 10 分鐘視窗以「延後生效的撤銷」實作 | — | 否（ENROLL.md 第 18 節，安全審查的處置） |
-| 10 | 主控台變更的註冊端點模式與憑證政策存在資料庫的 `settings` 表，優先於 `kairos.toml` | — | **是**：設計包 #14 要求寫回 `kairos.toml`；本衝刺先用資料庫，精靈實作時統一 |
+| 1 | **根 CA 離線、Kairos 線上持有「代理簽發 CA」（中繼 CA）的私鑰**（0600），核准後立即簽發 | `pki.mode = "online"` | **已決定（2026-10-14）**：預設線上簽發。線上持有簽發金鑰是自動簽發的前提，也是新的攻擊面（第 3 節） |
+| 2 | Kairos 的 mTLS 信任錨是**簽發 CA 本身**（不是根 CA） | — | 技術決定（理由見第 2 節） |
+| 3 | 簽發 CA 憑證帶 `pathLenConstraint = 0` 與 EKU `clientAuth`，有效 5 年；新簽發的用戶端憑證不得晚於簽發 CA 到期 | — | 技術決定 |
+| 4 | 演算法：簽發 CA 與用戶端金鑰 **ECDSA P-256**；根 CA 新安裝用 **ECDSA P-384**，既有的 RSA 根 CA（RSA 3072／4096）照用，簽發 CA 可由 RSA 根 CA 簽發 | — | **已決定（2026-10-14）** |
+| 5 | 用戶端憑證 365 天（D2）、序號 16 bytes 隨機值、`notBefore` 往前 10 分鐘 | — | 已定（D2） |
+| 6 | **離線簽發模式**（`pki.mode = "offline"`）：不在線上持有任何 CA 私鑰，核准後匯出 CSR 佇列、在 CA 主機簽發、再匯入 | 不是預設 | **已決定（2026-10-14）**：可切換的選項，**不是**高安全場域的預設；需要時由管理者明確設定 |
+| 7 | Kairos 自己產生並載入簽發 CA 的 CRL（每次撤銷與每 24 小時），不再需要 `kairos-crl.timer`（離線模式仍需要） | — | 技術決定 |
+| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **已決定（2026-10-14）**：`pki init` 延後到首次啟動精靈（S02） |
+| 9 | 續簽重放快取持久化、除役 10 分鐘視窗以「延後生效的撤銷」實作 | — | 技術決定（ENROLL.md 第 18 節，安全審查的處置） |
+| 10 | 主控台變更的註冊端點模式與憑證政策存在資料庫的 `settings` 表，**優先於 `kairos.toml`**；以 `kairos config show --effective` 查詢實際生效值與每一項的來源 | — | **已決定（2026-10-14）**：設計包 #14 要求寫回 `kairos.toml`，精靈實作時再評估是否統一 |
+| 11 | 註冊 token 的列表與詳情只顯示**前 4 碼**（`KRT1-GE8Q…`），不顯示後 4 碼 | — | **已決定（2026-10-14）**：ENROLL.md 第 18 節第 5 項 |
 
 ## 2. CA 架構
 
@@ -338,7 +339,7 @@ crl_validity_days = 30             # Kairos 產生的 CRL 的 nextUpdate
 crl_refresh_hours = 24             # 沒有新撤銷時重新產生的間隔
 ```
 
-- 憑證政策（S14：有效天數、輪替觸發天數、輪替需人工核准、過期寬限期、主機自行除役時撤銷）與註冊端點模式（`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`）可由主控台修改，存在 `settings` 表。**優先順序**：環境變數 ＞ `settings`（主控台）＞ `kairos.toml` ＞ 程式內建預設。被環境變數覆寫的項目，主控台顯示為鎖定並說明來源（設計包 #14）；`kairos --check-config --show-effective` 列出每個值的來源。**待使用者確認**（第 1 節第 10 項）。
+- 憑證政策（S14：有效天數、輪替觸發天數、輪替需人工核准、過期寬限期、主機自行除役時撤銷）與註冊端點模式（`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`）可由主控台修改，存在 `settings` 表。**優先順序**：環境變數 ＞ `settings`（主控台）＞ `kairos.toml` ＞ 程式內建預設。被環境變數覆寫的項目，主控台顯示為鎖定並說明來源（設計包 #14）；`kairos config show --effective` 列出每個值的實際生效值與來源（`environment`／`console`／`file`／`default`）。**已決定（2026-10-14）**（第 1 節第 10 項）。
 - `[pki]` 不存在、或 `pki.server_ca_path` 未設定時，8444 不監聽（即使 `enroll.mode` 不是 `closed`），啟動時記錄原因：沒有被釘選的 CA，Pulse 無法驗證 Kairos。
 - `auth.client_ca` 仍必填（mTLS）；線上簽發 CA 自動加入信任錨，不必寫進檔案。
 
