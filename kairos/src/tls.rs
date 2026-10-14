@@ -33,6 +33,11 @@ pub struct TlsPaths {
     pub client_ca: Option<String>,
     /// CRL 檔（PEM 或 DER）；只在啟用 mTLS 時使用
     pub crls: Vec<String>,
+    /// Kairos 簽發 CA 的信任錨（`<data_dir>/pki/issuing-cas.pem`，由 Kairos 寫出；不存在或空白時沒有）。
+    /// 只在啟用 mTLS 時使用
+    pub issuing_cas: Option<String>,
+    /// Kairos 產生的簽發 CA 的 CRL（`<data_dir>/pki/crl/issuing.crl`；不存在時沒有）
+    pub issuing_crl: Option<String>,
 }
 
 /// 監看的 TLS 設定檔種類（熱重載日誌用；F8）
@@ -74,6 +79,12 @@ impl TlsPaths {
         if let Some(ca) = &self.client_ca {
             files.push((TlsFileKind::ClientCa, ca.as_str()));
             files.extend(self.crls.iter().map(|p| (TlsFileKind::Crl, p.as_str())));
+            if let Some(p) = &self.issuing_cas {
+                files.push((TlsFileKind::ClientCa, p.as_str()));
+            }
+            if let Some(p) = &self.issuing_crl {
+                files.push((TlsFileKind::Crl, p.as_str()));
+            }
         }
         files
     }
@@ -129,7 +140,12 @@ pub fn build(paths: &TlsPaths) -> Result<TlsMaterial, Error> {
             }
             let count = crls.len();
             let crls = crls.into_iter().map(|(_, _, crl)| crl).collect();
-            (Some(load_client_verifier(ca_path, crls)?), count)
+            let issuing = load_issuing(paths, &mut expiries)?;
+            let issuing_crls = issuing.as_ref().map_or(0, |i| i.1.len());
+            (
+                Some(load_client_verifier(ca_path, crls, issuing)?),
+                count + issuing_crls,
+            )
         }
         None => (None, 0),
     };
@@ -223,15 +239,60 @@ fn load_crls(
     Ok(all)
 }
 
+/// Kairos 簽發 CA 的信任錨（DER）與它們的 CRL
+type Issuing = (
+    Vec<CertificateDer<'static>>,
+    Vec<CertificateRevocationListDer<'static>>,
+);
+
+/// 讀取 Kairos 簽發 CA 的信任錨與 CRL（檔案不存在或沒有內容時為 `None`）
+fn load_issuing(paths: &TlsPaths, expiries: &mut Vec<Expiry>) -> Result<Option<Issuing>, Error> {
+    let Some(ca_path) = &paths.issuing_cas else {
+        return Ok(None);
+    };
+    let Ok(bytes) = std::fs::read(ca_path) else {
+        return Ok(None);
+    };
+    let cas = CertificateDer::pem_slice_iter(&bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pem_error(ca_path, "簽發 CA 憑證", e))?;
+    if cas.is_empty() {
+        return Ok(None);
+    }
+    let mut crls = Vec::new();
+    if let Some(crl_path) = &paths.issuing_crl
+        && std::fs::metadata(crl_path).is_ok_and(|m| m.len() > 0)
+    {
+        for (i, crl) in load_crl_file(crl_path)?.into_iter().enumerate() {
+            if let Some(at) = expiry::crl_next_update(crl.as_ref()) {
+                expiries.push(Expiry {
+                    kind: ExpiryKind::Crl,
+                    path: crl_path.clone(),
+                    index: i,
+                    at,
+                });
+            }
+            crls.push(crl);
+        }
+    }
+    Ok(Some((cas, crls)))
+}
+
 /// 以 auth.client_ca（可含多張 CA）與 CRL 建立客戶端憑證驗證器。
 ///
 /// 設定 CRL 時採用最嚴格的檢查（fail closed）：
 /// - 檢查整條鏈（不只 end-entity）的撤銷狀態；
 /// - 無法判定撤銷狀態（缺少該層 CA 的 CRL）視為失敗；
 /// - CRL 超過 nextUpdate 視為失敗，避免過期的 CRL 漏掉之後的撤銷。
+///
+/// 另有 Kairos 簽發 CA（`issuing`）時，以兩個驗證器組成（[`CompositeVerifier`]）：用戶端憑證的簽發者是
+/// 簽發 CA 時，以簽發 CA 為唯一的信任錨、Kairos 產生的 CRL 驗證；其他以 `auth.client_ca` 與 `auth.crl`
+/// 驗證（與先前相同）。兩組的 CRL 分開：`auth.crl` 不必涵蓋簽發 CA，簽發 CA 的 CRL 也不會讓
+/// `auth.client_ca` 的憑證因缺少 CRL 而被拒（fail closed 的範圍不變）
 fn load_client_verifier(
     ca_path: &str,
     crls: Vec<CertificateRevocationListDer<'static>>,
+    issuing: Option<Issuing>,
 ) -> Result<Arc<dyn ClientCertVerifier>, Error> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path, "CA 憑證")? {
@@ -246,14 +307,122 @@ fn load_client_verifier(
     if !crls.is_empty() {
         builder = builder.with_crls(crls).enforce_revocation_expiration();
     }
-    let inner = builder.build().map_err(|e| {
+    let file = builder.build().map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
             format!("無法以 {} 建立客戶端憑證驗證器: {}", ca_path, e),
         )
     })?;
+    let inner: Arc<dyn ClientCertVerifier> = match issuing {
+        None => file,
+        Some((cas, issuing_crls)) => {
+            let mut roots = RootCertStore::empty();
+            let mut subjects = Vec::new();
+            for ca in cas {
+                if let Ok(info) = crate::pki::x509::parse_cert(ca.as_ref()) {
+                    subjects.push(info.subject_raw);
+                }
+                roots.add(ca).map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Kairos 簽發 CA 的憑證無效: {e}"),
+                    )
+                })?;
+            }
+            let mut b = WebPkiClientVerifier::builder(Arc::new(roots));
+            if !issuing_crls.is_empty() {
+                b = b.with_crls(issuing_crls).enforce_revocation_expiration();
+            }
+            let issuing = b.build().map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("無法以 Kairos 簽發 CA 建立客戶端憑證驗證器: {e}"),
+                )
+            })?;
+            let mut hints = file.root_hint_subjects().to_vec();
+            hints.extend(issuing.root_hint_subjects().iter().cloned());
+            Arc::new(CompositeVerifier {
+                file,
+                issuing,
+                issuing_subjects: subjects,
+                hints,
+            })
+        }
+    };
     // 驗證結果不變；被拒時把憑證歸屬到 agent_id 並記錄（設計包 §24 #3）
     Ok(Arc::new(RecordingVerifier { inner }))
+}
+
+/// `auth.client_ca` 與 Kairos 簽發 CA 的兩組驗證器：依用戶端憑證的簽發者選擇
+#[derive(Debug)]
+struct CompositeVerifier {
+    file: Arc<dyn ClientCertVerifier>,
+    issuing: Arc<dyn ClientCertVerifier>,
+    /// 簽發 CA 的 subject（DER）
+    issuing_subjects: Vec<Vec<u8>>,
+    hints: Vec<DistinguishedName>,
+}
+
+impl CompositeVerifier {
+    fn pick(&self, end_entity: &CertificateDer<'_>) -> &Arc<dyn ClientCertVerifier> {
+        let issued_by_kairos = crate::pki::x509::parse_cert(end_entity.as_ref())
+            .is_ok_and(|i| self.issuing_subjects.contains(&i.issuer_raw));
+        if issued_by_kairos {
+            &self.issuing
+        } else {
+            &self.file
+        }
+    }
+}
+
+impl ClientCertVerifier for CompositeVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.file.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.file.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, tokio_rustls::rustls::Error> {
+        self.pick(end_entity)
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        self.file.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        self.file.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.file.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.file.requires_raw_public_keys()
+    }
 }
 
 // ---- 被拒的客戶端憑證（設計包 §24 #3「握手失敗時從憑證 SAN／序號歸屬到 agent_id」）----
@@ -761,6 +930,8 @@ mod tests {
             key: p("server.key"),
             client_ca: client_ca.map(p),
             crls: crls.iter().map(|c| p(c)).collect(),
+            issuing_cas: None,
+            issuing_crl: None,
         }
     }
 
@@ -879,7 +1050,7 @@ mod tests {
 
     #[test]
     fn missing_client_ca_file_reports_path() {
-        let err = load_client_verifier("does-not-exist/ca.pem", Vec::new())
+        let err = load_client_verifier("does-not-exist/ca.pem", Vec::new(), None)
             .err()
             .unwrap();
         assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -891,7 +1062,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kairos-empty-ca-{}.pem", std::process::id()));
         std::fs::write(&path, "not a pem file\n").unwrap();
         let p = path.to_string_lossy().to_string();
-        let err = load_client_verifier(&p, Vec::new()).err().unwrap();
+        let err = load_client_verifier(&p, Vec::new(), None).err().unwrap();
         assert!(err.to_string().contains(&p), "{err}");
         std::fs::remove_file(&path).unwrap();
     }
@@ -1111,6 +1282,8 @@ mod tests {
             key: f("k"),
             client_ca: None,
             crls: vec![f("crl")],
+            issuing_cas: None,
+            issuing_crl: None,
         };
         // 未啟用 mTLS 時不監看 CRL
         assert_eq!(tp.watched_files().len(), 2);

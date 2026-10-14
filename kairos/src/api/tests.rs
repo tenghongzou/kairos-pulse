@@ -116,6 +116,8 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
             key: config.server.key_path.clone(),
             client_ca: None,
             crls: Vec::new(),
+            issuing_cas: None,
+            issuing_crl: None,
         })
         .unwrap(),
     ));
@@ -130,6 +132,7 @@ pub(crate) async fn fixture(tag: &str, tweak: impl FnOnce(&mut AppConfig)) -> Fi
         data_dir: paths.data_dir.clone(),
         shutdown: shutdown.clone(),
         agent_listen: "127.0.0.1:8080".parse().unwrap(),
+        enroll: None,
     })
     .await
     {

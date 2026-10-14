@@ -96,6 +96,8 @@ pub struct ApiContext {
     pub started_i: Instant,
     pub agent_listen: SocketAddr,
     pub console_listen: SocketAddr,
+    /// 註冊服務（SQLite 時；註冊與 PKI 的管理端點使用）
+    pub enroll: Option<Arc<crate::enroll::EnrollService>>,
 }
 
 impl ApiContext {
@@ -121,6 +123,7 @@ pub struct StartParams {
     pub data_dir: PathBuf,
     pub shutdown: Arc<Shutdown>,
     pub agent_listen: SocketAddr,
+    pub enroll: Option<Arc<crate::enroll::EnrollService>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -285,6 +288,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         started_i: Instant::now(),
         agent_listen: p.agent_listen,
         console_listen: local_addr,
+        enroll: p.enroll.clone(),
     });
     ctx.hosts.load_known(known);
 
@@ -305,6 +309,8 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
                 key: key.clone(),
                 client_ca: None,
                 crls: Vec::new(),
+                issuing_cas: None,
+                issuing_crl: None,
             },
             acceptor.clone(),
             Duration::from_secs(p.config.server.reload_interval_secs),

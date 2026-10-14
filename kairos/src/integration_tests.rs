@@ -139,6 +139,7 @@ impl Server {
             throttle: throttle.clone(),
             binding: BindingPolicy::default(),
             report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
+            enroll: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -207,6 +208,8 @@ impl Server {
             key: format!("{PKI}server.key"),
             client_ca,
             crls: crl_paths,
+            issuing_cas: None,
+            issuing_crl: None,
         }
     }
 

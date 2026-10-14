@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod connection;
 mod dedup;
+mod enroll;
 mod expiry;
 mod export_cli;
 mod fsperm;
@@ -19,12 +20,14 @@ mod rate;
 mod registry;
 mod reload;
 mod retention;
+mod settings;
 mod shutdown;
 mod stats;
 mod storage;
 mod store;
 #[cfg(test)]
 mod test_pki;
+mod testhooks;
 mod throttle;
 mod tls;
 mod token_cli;
@@ -675,11 +678,27 @@ async fn run(
     }
 
     // 載入 TLS 設定；設定 auth.client_ca 時啟用 mTLS。先取指紋再建立，之間的變更會在下一次重載偵測到。
+    // Kairos 簽發 CA 的信任錨與 CRL（kairos/PKI.md 第 2、10 節）：SQLite 且啟用 mTLS 時才可能存在
+    let pki_files = (config.storage.backend == StorageBackend::Sqlite
+        && config.auth.client_ca_path().is_some())
+    .then(|| {
+        let data_dir = Path::new(&config.storage.data_dir);
+        (
+            pki::issuing_cas_path(data_dir)
+                .to_string_lossy()
+                .into_owned(),
+            pki::issuing_crl_path(data_dir)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    });
     let tls_paths = TlsPaths {
         cert: config.server.cert_path.clone(),
         key: config.server.key_path.clone(),
         client_ca: config.auth.client_ca_path().map(str::to_string),
         crls: config.auth.crl_paths(),
+        issuing_cas: pki_files.as_ref().map(|(a, _)| a.clone()),
+        issuing_crl: pki_files.map(|(_, c)| c),
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
     let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths).map_err(cert_error)?));
@@ -794,6 +813,21 @@ async fn run(
             warn!(
                 "已停用 TLS 熱重載（server.reload_interval_secs = 0）：更換憑證、CA 或 CRL 需重新啟動，現役連線的客戶端憑證也不會重新驗證"
             );
+            // Kairos 自己產生的 CRL 與簽發 CA 的信任錨仍要立即生效
+            supervise(
+                "TLS 重建工作",
+                tokio::spawn(reload::run_on_trigger(
+                    reload::Reloader::new(
+                        tls_paths.clone(),
+                        initial_fingerprint,
+                        tls_state.clone(),
+                    ),
+                    registry.clone(),
+                    tls_state.clone(),
+                    shutdown.clone(),
+                )),
+                shutdown.clone(),
+            );
             // 到期預警仍定期檢查（O1）
             supervise(
                 "到期預警工作",
@@ -834,6 +868,47 @@ async fn run(
     }
     info!("{}", per_ip_policy.describe());
     let throttle = Arc::new(LogThrottle::default());
+
+    // 註冊通道（8444）與線上 PKI（ENROLL.md、PKI.md）：需要 SQLite
+    if config.provenance.source(settings::KEY_MODE) == config::SettingSource::Default {
+        info!(
+            "資訊 KRS-I2010：設定檔沒有 [enroll] 的 mode，註冊端點（8444）預設為關閉；需要自動註冊時設定 enroll.mode = \"open\" 或 \"renew_only\"（主控台或 kairos enroll mode 也可以修改）"
+        );
+    }
+    let enroll = match config.storage.backend {
+        StorageBackend::Jsonl => None,
+        StorageBackend::Sqlite => {
+            let mut other_listens = vec![
+                listener
+                    .local_addr()
+                    .map_err(|e| Error::new(e.kind(), format!("無法取得監聽位址: {e}")))?,
+            ];
+            if config.console.enabled
+                && let Ok(addrs) = tokio::net::lookup_host(config.console.listen.trim()).await
+            {
+                other_listens.extend(addrs);
+            }
+            match enroll::start(enroll::StartParams {
+                config: Arc::new(config.clone()),
+                data_dir: paths.data_dir.clone(),
+                db_path: enroll::db_path(&config, &paths.data_dir),
+                shutdown: shutdown.clone(),
+                registry: Some(registry.clone()),
+                other_listens,
+                clock: enroll::system_clock(),
+            })
+            .await
+            {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    error!("註冊服務無法啟動（8444 不監聽、不簽發；既有主機照常連線）：{e}");
+                    None
+                }
+            }
+        }
+    };
+    let enroll_service = enroll.as_ref().map(|r| r.service.clone());
+
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),
         reports,
@@ -845,6 +920,7 @@ async fn run(
             allow_multiple_dns_sans: config.auth.allow_multiple_dns_sans,
         },
         report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
+        enroll: enroll_service.clone(),
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
@@ -876,6 +952,7 @@ async fn run(
                 data_dir: paths.data_dir.clone(),
                 shutdown: shutdown.clone(),
                 agent_listen: agent_addr,
+                enroll: enroll_service.clone(),
             })
             .await;
             match started {
@@ -910,6 +987,10 @@ async fn run(
     // 主控台：停止接受並中斷所有連線（含 SSE）
     if let Some(console) = console {
         let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), console.join()).await;
+    }
+    // 註冊端點：停止監聽，進行中的請求最多 5 秒
+    if let Some(enroll) = enroll {
+        let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), enroll.join()).await;
     }
 
     while connections.try_join_next().is_some() {}
