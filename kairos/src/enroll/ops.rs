@@ -866,6 +866,7 @@ pub fn token_json(t: &TokenRow, now_ms: i64) -> Value {
     json!({
         "token_id": t.token_id,
         "hint": t.hint,
+        "token_hint": t.hint,
         "name": t.name,
         "group": t.group_name,
         "tags": t.tags,

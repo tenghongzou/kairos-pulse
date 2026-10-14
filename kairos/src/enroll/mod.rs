@@ -64,6 +64,19 @@ pub const DEREGISTER_WINDOW_MS: i64 = 10 * 60_000;
 /// 時鐘被拒的主機在 token 的部署進度中保留 15 分鐘（API.md 第 11.2 節）
 pub const CLOCK_REJECTED_KEEP_MS: i64 = 15 * 60_000;
 
+/// 下載端點（`/agent/<檔名>`）本版回 404（ENROLL.md 第 19.4 節第 3 項）；主控台據此隱藏一行指令與下載連結
+/// （設計包 INTEGRATION §27.4 #3）
+pub const DOWNLOADS_AVAILABLE: bool = false;
+
+/// 下載端點的狀態（主控台 API 的 `downloads`）
+pub fn downloads_json() -> serde_json::Value {
+    json!({
+        "available": DOWNLOADS_AVAILABLE,
+        "reason": "本版的註冊端點不提供安裝腳本與套件的下載（/agent/ 回 404）",
+        "alternative": "以安裝套件（MSI、deb、rpm）安裝 Pulse 後執行 pulse enroll --install-string <安裝字串>",
+    })
+}
+
 /// 現在時間（Unix 毫秒）；測試可替換
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 

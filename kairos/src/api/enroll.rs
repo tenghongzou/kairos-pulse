@@ -364,7 +364,8 @@ async fn list_tokens(
     Ok(http::json(
         StatusCode::OK,
         now,
-        json!({"data": data, "page": {"limit": limit, "total": total, "next_cursor": null}}),
+        json!({"data": data, "page": {"limit": limit, "total": total, "next_cursor": null},
+            "meta": {"downloads": crate::enroll::downloads_json()}}),
     ))
 }
 
@@ -537,6 +538,7 @@ async fn create_token(
         }
     }
     data["enroll_mode"] = json!(w.svc.mode_state().as_str());
+    data["downloads"] = crate::enroll::downloads_json();
     data["auto_pause_cleared"] = json!(was_paused);
     Ok(http::json(StatusCode::CREATED, now, json!({"data": data})))
 }
@@ -878,6 +880,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "listen_addr": listen.addr,
         "not_listening_reason": listen.reason,
         "pki_mode": svc.pki.mode().as_str(),
+        "downloads": crate::enroll::downloads_json(),
         "issuance": match svc.pki.status() {
             IssueStatus::Online { ca_id } => json!({"status": "online", "ca_id": ca_id}),
             IssueStatus::Offline => json!({"status": "offline", "product_code": "KRS-E1302"}),
