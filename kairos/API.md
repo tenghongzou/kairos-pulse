@@ -159,7 +159,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - stdout 只有 token 一行（`TOKEN=$(kairos api-token create …)`），其他說明寫 stderr。
 - `--expires-in`：`90m`、`12h`、`30d`、`2w`（與 `kairos hosts list --offline-for` 相同的寫法），上限 3650 天；`--expires-at`：`2027-01-01`（UTC 當天 00:00）或 RFC 3339。`--no-expiry`（0.4 草稿）已移除：指定時以結束代碼 2 拒絕並提示 `--expires-in 3650d`。
 - `--name`：1～64 個字元，不可含控制字元；不必唯一（以 token_id 區分）。
-- `list`：預設只列出有效的 token；`--all` 另列已撤銷與已過期的。欄位：token_id、名稱、範圍、狀態（有效／已撤銷／已過期）、建立時間與建立者、到期、最後使用（相對時間與 IP）。時間為本機時區，只在欄位標題標示；剩餘 14 天以內的有效 token 在到期時間後加 `⚠`（`--ascii` 或非 UTF-8 終端機為 `[WARN]`），並在 stderr 提示輪替。
+- `list`：預設只列出有效的 token；`--all` 另列已撤銷與已過期的。欄位：token_id、名稱、範圍、狀態（有效／已撤銷／已過期）、建立時間與建立者、到期、最後使用（7 天內為相對時間，7 天以上改為日期時間，copywriting.md §5.3；附 IP）。時間為本機時區，只在欄位標題標示；剩餘 14 天以內的有效 token 在到期時間後加 `⚠`（`--ascii` 或非 UTF-8 終端機為 `[WARN]`），並在 stderr 提示輪替。
 - `revoke`：危險操作 L1（`cli-style.md` §5.4）：互動模式詢問 `是否繼續？[y/N]`，非互動需 `--yes`（否則結束代碼 2）。撤銷立即生效（每個請求都查詢資料庫）。重複撤銷已撤銷的 token 不算錯誤。
 - 結束代碼：0 完成、1 資料庫錯誤、2 用法錯誤、3 設定錯誤、10 權限不足（以 root 執行而資料目錄屬於服務帳號時拒絕，與 `kairos reports import` 相同）、11 資料庫被 `kairos reports import` 獨占中。
 - 以服務帳號執行（`sudo -u kairos`），Kairos 執行中也可以（只寫一個短交易）；資料庫不存在時建立（並升級 schema）。

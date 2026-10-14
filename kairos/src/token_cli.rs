@@ -468,6 +468,15 @@ fn relative(now_ms: i64, ms: i64) -> String {
     }
 }
 
+/// 「最後使用」欄：7 天內用相對時間，7 天以上改用本機時區的日期時間（copywriting.md §5.3）
+fn last_used_text(now_ms: i64, ms: i64, tz: FixedOffset) -> String {
+    if now_ms - ms >= 7 * 86_400_000 {
+        human_time(ms, tz)
+    } else {
+        relative(now_ms, ms)
+    }
+}
+
 /// 有效且剩餘 [`EXPIRY_WARN_DAYS`] 天以內
 fn expires_soon(r: &TokenRow, now_ms: i64) -> bool {
     r.state(now_ms) == TokenState::Active
@@ -689,8 +698,10 @@ pub fn execute(
                         Some(e) => human_time(e, tz),
                     },
                     match (r.last_used_at, &r.last_used_ip) {
-                        (Some(t), Some(ip)) => format!("{}（{ip}）", relative(now_ms, t)),
-                        (Some(t), None) => relative(now_ms, t),
+                        (Some(t), Some(ip)) => {
+                            format!("{}（{ip}）", last_used_text(now_ms, t, tz))
+                        }
+                        (Some(t), None) => last_used_text(now_ms, t, tz),
                         _ => "-".to_string(),
                     },
                 ]);
@@ -969,6 +980,17 @@ mod tests {
         assert_eq!(relative(ms + 180_000, ms), "3 分鐘前");
         assert_eq!(relative(ms + 8_100_000, ms), "2 小時 15 分前");
         assert_eq!(relative(ms + 14 * 86_400_000, ms), "14 天前");
+        // 「最後使用」：7 天內為相對時間，7 天以上改為日期時間（copywriting.md §5.3）
+        assert_eq!(last_used_text(ms + 180_000, ms, tz8()), "3 分鐘前");
+        assert_eq!(last_used_text(ms + 7 * 86_400_000 - 1, ms, tz8()), "6 天前");
+        assert_eq!(
+            last_used_text(ms + 7 * 86_400_000, ms, tz8()),
+            "2025-10-13 14:03"
+        );
+        assert_eq!(
+            last_used_text(ms + 30 * 86_400_000, ms, tz8()),
+            "2025-10-13 14:03"
+        );
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
