@@ -18,8 +18,19 @@ pub const SECRET_BYTES: usize = 32;
 /// 秘密的 base64url 長度
 pub const SECRET_LEN: usize = 43;
 
-/// 本版唯一的範圍：唯讀
+/// 範圍：唯讀（所有 GET）
 pub const SCOPE_READ: &str = "read";
+/// 範圍：`read`＋日常的註冊與憑證操作（API.md 第 11.1 節）
+pub const SCOPE_OPERATE: &str = "operate";
+/// 範圍：`operate`＋安全影響等同簽發新憑證或改變對外服務的操作
+pub const SCOPE_ADMIN: &str = "admin";
+/// 範圍（階層式：admin ⊃ operate ⊃ read）
+pub const SCOPES: [&str; 3] = [SCOPE_READ, SCOPE_OPERATE, SCOPE_ADMIN];
+
+/// 範圍的等級（不認得的值為 `None`）
+pub fn scope_rank(scope: &str) -> Option<u8> {
+    SCOPES.iter().position(|s| *s == scope).map(|i| i as u8)
+}
 
 /// `api_tokens.logged`：建立已寫入 Kairos 日誌
 pub const LOGGED_CREATED: i64 = 1;

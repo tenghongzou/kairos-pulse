@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod db;
+pub mod enroll;
 pub mod events;
 pub mod health;
 pub mod hosts;
@@ -96,6 +97,8 @@ pub struct ApiContext {
     pub started_i: Instant,
     pub agent_listen: SocketAddr,
     pub console_listen: SocketAddr,
+    /// 註冊服務（SQLite 時；註冊與 PKI 的管理端點使用）
+    pub enroll: Option<Arc<crate::enroll::EnrollService>>,
 }
 
 impl ApiContext {
@@ -121,6 +124,7 @@ pub struct StartParams {
     pub data_dir: PathBuf,
     pub shutdown: Arc<Shutdown>,
     pub agent_listen: SocketAddr,
+    pub enroll: Option<Arc<crate::enroll::EnrollService>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -285,6 +289,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         started_i: Instant::now(),
         agent_listen: p.agent_listen,
         console_listen: local_addr,
+        enroll: p.enroll.clone(),
     });
     ctx.hosts.load_known(known);
 
@@ -305,6 +310,8 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
                 key: key.clone(),
                 client_ca: None,
                 crls: Vec::new(),
+                issuing_cas: None,
+                issuing_crl: None,
             },
             acceptor.clone(),
             Duration::from_secs(p.config.server.reload_interval_secs),
@@ -441,6 +448,23 @@ async fn handle(
     let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // 註冊與 PKI 的管理端點（API.md 第 11 節；含寫入）
+    if path.starts_with("/api/v1/enroll/")
+        || path.starts_with("/api/v1/pki/")
+        || path == "/api/v1/settings"
+        || path.starts_with("/api/v1/settings/")
+    {
+        let resp = enroll::handle(ctx.clone(), peer, req).await;
+        debug!(
+            "主控台 {} {} {} → {}（{:.1} ms）",
+            peer.ip(),
+            method,
+            path,
+            resp.status().as_u16(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        return resp;
+    }
     let (resp, who) = match route(&ctx, peer, &req).await {
         Ok((resp, who)) => (resp, who),
         Err(e) => (e.into_response(Utc::now()), None),

@@ -3,6 +3,8 @@ mod auth;
 mod config;
 mod connection;
 mod dedup;
+mod enroll;
+mod enroll_cli;
 mod expiry;
 mod export_cli;
 mod fsperm;
@@ -13,17 +15,20 @@ mod integration_tests;
 mod logger;
 mod monitor;
 mod per_ip;
+mod pki;
 mod protocol;
 mod rate;
 mod registry;
 mod reload;
 mod retention;
+mod settings;
 mod shutdown;
 mod stats;
 mod storage;
 mod store;
 #[cfg(test)]
 mod test_pki;
+mod testhooks;
 mod throttle;
 mod tls;
 mod token_cli;
@@ -459,6 +464,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Reports(cmd)) => return ExitCode::from(export_cli::run(cmd)),
         Ok(CliAction::Db(cmd)) => return ExitCode::from(export_cli::run_db(cmd)),
         Ok(CliAction::ApiToken(cmd)) => return ExitCode::from(token_cli::run(cmd)),
+        Ok(CliAction::Enroll(cmd)) => return ExitCode::from(enroll_cli::run(cmd)),
         Err(e) => {
             let usage = match std::env::args_os().nth(1) {
                 Some(a) if a == "hosts" => hosts_cli::HOSTS_USAGE,
@@ -471,6 +477,10 @@ fn main() -> ExitCode {
                     }
                 }
                 Some(a) if a == "db" => export_cli::DB_USAGE,
+                Some(a) if a == "enroll-token" => enroll_cli::ENROLL_TOKEN_USAGE,
+                Some(a) if a == "enroll" => enroll_cli::ENROLL_USAGE,
+                Some(a) if a == "pki" => enroll_cli::PKI_USAGE,
+                Some(a) if a == "config" => enroll_cli::CONFIG_USAGE,
                 _ => USAGE,
             };
             eprintln!("{}\n\n{}", e, usage);
@@ -563,13 +573,18 @@ fn parse_nofile_soft_limit(limits: &str) -> Option<u64> {
 /// soft limit 低於需要量（`server.max_connections` ＋ 主控台的連線上限 ＋ 預留，設計包 §24 #18、D21）
 /// 時的警告訊息（D4：具體指出建議做法）；足夠時回傳 `None`
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn fd_limit_warning(soft: u64, max_connections: usize, console_connections: u64) -> Option<String> {
-    let needed = max_connections as u64 + console_connections + FD_RESERVE;
+fn fd_limit_warning(
+    soft: u64,
+    max_connections: usize,
+    console_connections: u64,
+    enroll_connections: u64,
+) -> Option<String> {
+    let needed = max_connections as u64 + console_connections + enroll_connections + FD_RESERVE;
     if soft >= needed {
         return None;
     }
     let suggested = suggested_nofile(needed);
-    let reserve = console_connections + FD_RESERVE;
+    let reserve = console_connections + enroll_connections + FD_RESERVE;
     let lower = if soft > reserve {
         format!(
             "；或將 server.max_connections 調低至 {} 以下（= 目前上限 {} − 預留 {}）",
@@ -580,11 +595,16 @@ fn fd_limit_warning(soft: u64, max_connections: usize, console_connections: u64)
     } else {
         String::new()
     };
-    let console = if console_connections > 0 {
+    let mut console = if console_connections > 0 {
         format!("、主控台的連線上限（console.max_connections {console_connections}）")
     } else {
         String::new()
     };
+    if enroll_connections > 0 {
+        console.push_str(&format!(
+            "、註冊端點的連線上限（enroll.max_connections {enroll_connections}）"
+        ));
+    }
     Some(format!(
         "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 {}，低於 server.max_connections（{}）{}加上預留的 {}（共 {}）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE={}，手動執行時先執行 ulimit -n {}{}",
         soft, max_connections, console, FD_RESERVE, needed, suggested, suggested, lower
@@ -611,8 +631,10 @@ fn warn_if_fd_limit_low(config: &AppConfig) {
     } else {
         0
     };
+    let enroll = config.extra_connections() - console;
     if let Some(soft) = nofile_soft_limit()
-        && let Some(message) = fd_limit_warning(soft, config.server.max_connections, console)
+        && let Some(message) =
+            fd_limit_warning(soft, config.server.max_connections, console, enroll)
     {
         warn!("{}", message);
     }
@@ -662,11 +684,27 @@ async fn run(
     }
 
     // 載入 TLS 設定；設定 auth.client_ca 時啟用 mTLS。先取指紋再建立，之間的變更會在下一次重載偵測到。
+    // Kairos 簽發 CA 的信任錨與 CRL（kairos/PKI.md 第 2、10 節）：SQLite 且啟用 mTLS 時才可能存在
+    let pki_files = (config.storage.backend == StorageBackend::Sqlite
+        && config.auth.client_ca_path().is_some())
+    .then(|| {
+        let data_dir = Path::new(&config.storage.data_dir);
+        (
+            pki::issuing_cas_path(data_dir)
+                .to_string_lossy()
+                .into_owned(),
+            pki::issuing_crl_path(data_dir)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    });
     let tls_paths = TlsPaths {
         cert: config.server.cert_path.clone(),
         key: config.server.key_path.clone(),
         client_ca: config.auth.client_ca_path().map(str::to_string),
         crls: config.auth.crl_paths(),
+        issuing_cas: pki_files.as_ref().map(|(a, _)| a.clone()),
+        issuing_crl: pki_files.map(|(_, c)| c),
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
     let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths).map_err(cert_error)?));
@@ -781,6 +819,21 @@ async fn run(
             warn!(
                 "已停用 TLS 熱重載（server.reload_interval_secs = 0）：更換憑證、CA 或 CRL 需重新啟動，現役連線的客戶端憑證也不會重新驗證"
             );
+            // Kairos 自己產生的 CRL 與簽發 CA 的信任錨仍要立即生效
+            supervise(
+                "TLS 重建工作",
+                tokio::spawn(reload::run_on_trigger(
+                    reload::Reloader::new(
+                        tls_paths.clone(),
+                        initial_fingerprint,
+                        tls_state.clone(),
+                    ),
+                    registry.clone(),
+                    tls_state.clone(),
+                    shutdown.clone(),
+                )),
+                shutdown.clone(),
+            );
             // 到期預警仍定期檢查（O1）
             supervise(
                 "到期預警工作",
@@ -821,6 +874,46 @@ async fn run(
     }
     info!("{}", per_ip_policy.describe());
     let throttle = Arc::new(LogThrottle::default());
+
+    // 註冊通道（8444）與線上 PKI（ENROLL.md、PKI.md）：需要 SQLite
+    if config.provenance.source(settings::KEY_MODE) == config::SettingSource::Default {
+        info!(
+            "資訊 KRS-I2010：設定檔沒有 [enroll] 的 mode，註冊端點（8444）預設為關閉；需要自動註冊時設定 enroll.mode = \"open\" 或 \"renew_only\"（主控台或 kairos enroll mode 也可以修改）"
+        );
+    }
+    let enroll = match config.storage.backend {
+        StorageBackend::Jsonl => None,
+        StorageBackend::Sqlite => {
+            let mut other_listens = vec![
+                listener
+                    .local_addr()
+                    .map_err(|e| Error::new(e.kind(), format!("無法取得監聽位址: {e}")))?,
+            ];
+            if config.console.enabled
+                && let Ok(addrs) = tokio::net::lookup_host(config.console.listen.trim()).await
+            {
+                other_listens.extend(addrs);
+            }
+            match enroll::start(enroll::StartParams {
+                config: Arc::new(config.clone()),
+                data_dir: paths.data_dir.clone(),
+                db_path: enroll::db_path(&config, &paths.data_dir),
+                shutdown: shutdown.clone(),
+                other_listens,
+                clock: enroll::system_clock(),
+            })
+            .await
+            {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    error!("註冊服務無法啟動（8444 不監聽、不簽發；既有主機照常連線）：{e}");
+                    None
+                }
+            }
+        }
+    };
+    let enroll_service = enroll.as_ref().map(|r| r.service.clone());
+
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),
         reports,
@@ -832,6 +925,7 @@ async fn run(
             allow_multiple_dns_sans: config.auth.allow_multiple_dns_sans,
         },
         report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
+        enroll: enroll_service.clone(),
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
@@ -863,6 +957,7 @@ async fn run(
                 data_dir: paths.data_dir.clone(),
                 shutdown: shutdown.clone(),
                 agent_listen: agent_addr,
+                enroll: enroll_service.clone(),
             })
             .await;
             match started {
@@ -897,6 +992,10 @@ async fn run(
     // 主控台：停止接受並中斷所有連線（含 SSE）
     if let Some(console) = console {
         let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), console.join()).await;
+    }
+    // 註冊端點：停止監聽，進行中的請求最多 5 秒
+    if let Some(enroll) = enroll {
+        let _ = timeout_at(tokio_deadline(t0 + CONNECTIONS_DEADLINE), enroll.join()).await;
     }
 
     while connections.try_join_next().is_some() {}
@@ -1064,22 +1163,22 @@ Max open files            1024                 524288               files     \n
     #[test]
     fn fd_limit_warning_suggests_concrete_fixes() {
         // D4：Ubuntu 預設 soft 1024、範例設定 max_connections = 1024（停用主控台時與 0.3 相同）
-        let message = fd_limit_warning(1024, 1024, 0).unwrap();
+        let message = fd_limit_warning(1024, 1024, 0, 0).unwrap();
         assert_eq!(
             message,
             "可開啟的檔案數上限（RLIMIT_NOFILE soft limit）為 1024，低於 server.max_connections（1024）加上預留的 64（共 1088）；連線數接近上限時可能 accept 失敗（EMFILE）。建議：以 systemd 執行時在 unit 的 [Service] 加上 LimitNOFILE=4096，手動執行時先執行 ulimit -n 4096；或將 server.max_connections 調低至 960 以下（= 目前上限 1024 − 預留 64）"
         );
         // D21：主控台的連線上限計入需要量
-        let message = fd_limit_warning(1100, 1024, 64).unwrap();
+        let message = fd_limit_warning(1100, 1024, 64, 0).unwrap();
         assert!(message.contains("console.max_connections 64"), "{message}");
         assert!(message.contains("（共 1152）"), "{message}");
         assert!(message.contains("調低至 972 以下"), "{message}");
-        assert_eq!(fd_limit_warning(1152, 1024, 64), None);
+        assert_eq!(fd_limit_warning(1152, 1024, 64, 0), None);
         // 足夠時不警告
-        assert_eq!(fd_limit_warning(1088, 1024, 0), None);
-        assert_eq!(fd_limit_warning(u64::MAX, 65535, 4096), None);
+        assert_eq!(fd_limit_warning(1088, 1024, 0, 0), None);
+        assert_eq!(fd_limit_warning(u64::MAX, 65535, 4096, 0), None);
         // 需要量較大時建議值隨之提高；soft 小於預留量時不建議調低 max_connections
-        let message = fd_limit_warning(32, 10_000, 64).unwrap();
+        let message = fd_limit_warning(32, 10_000, 64, 0).unwrap();
         assert!(message.contains("LimitNOFILE=16384"), "{message}");
         assert!(!message.contains("調低"), "{message}");
     }

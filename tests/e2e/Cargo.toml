@@ -18,3 +18,11 @@ serde_json = "1"
 # 協定 v1 的假 client（模擬舊版 Pulse）以 mTLS 連上實際的 Kairos；與 kairos、pulse 經 tokio-rustls
 # 使用的版本與加密後端（ring）相同，Cargo.lock 不新增外部套件
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+
+[dev-dependencies]
+# 註冊通道（8444）的 e2e 測試：以共用型別組請求、以 rcgen 產生根 CA、伺服器憑證與 CSR（與 kairos 使用的版本
+# 與加密後端相同，Cargo.lock 不新增外部套件）
+kairos-proto = { path = "../../crates/kairos-proto" }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# rcgen 的日期型別（與 rcgen 使用的版本相同）
+time = { version = "0.3", default-features = false, features = ["std"] }

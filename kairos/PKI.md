@@ -2,24 +2,26 @@
 
 本文件是 Kairos 端「註冊與憑證」的工程規格：CA 架構、簽發金鑰的保管、憑證格式、撤銷與 CRL、離線簽發模式，以及資料庫 schema v4。8444 註冊通道的線上協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，主控台與 CLI 見 [`API.md`](API.md) 第 11 節。
 
-- 狀態：**0.5.0〔草稿〕規格，尚未實作**。標「**待使用者確認**」的項目是建議的預設，實作前請確認。
+- 狀態：**0.5.0〔草稿〕，Kairos 端已實作**（分支 `sprint4/kairos-enroll`；實作與規格的差異、量測與延後項目見第 12～14 節）。第 1 節原本標「待使用者確認」的項目已由使用者決定（2026-10-14），標為「已決定（2026-10-14）」。
+- 實作：`kairos/src/pki/`（CSR 檢查、依範本簽發、CRL、簽發 CA 的檔案、離線佇列）、`kairos/src/enroll/`（8444、簽發器、限流、管理操作）、`kairos/src/enroll_cli.rs`（`kairos enroll-token`／`enroll`／`pki`／`config`）、`kairos/src/api/enroll.rs`（管理端點）、`kairos/src/tls.rs`（8443 的驗證器）。
 - 設計依據（設計包，唯讀）：`kairos/screens.md` S02 步驟 3、S12～S15、§24 #6、#7、#13、#20；`pulse/enrollment-ux.md` §1、§8；`design-system/cli-style.md` §11.3；`decisions/INTEGRATION.md` §17。
 - 現況：0.4 沒有內建的 PKI。`packaging/INSTALL.md` 第 6 節以 openssl 在管理主機建立兩個離線 CA（伺服器 CA、代理 CA），手動簽發與撤銷，`kairos-crl.timer` 定期重新產生 CRL；Kairos 只讀取 `auth.client_ca` 與 `auth.crl`。
 
 ## 1. 決定摘要
 
-| # | 決定 | 預設 | 待使用者確認 |
+| # | 決定 | 預設 | 狀態 |
 |---|---|---|---|
-| 1 | **根 CA 離線、Kairos 線上持有「代理簽發 CA」（中繼 CA）的私鑰**，核准後立即簽發 | `pki.mode = "online"` | **是**：線上持有簽發金鑰是自動簽發的前提，也是新的攻擊面（第 3 節） |
-| 2 | Kairos 的 mTLS 信任錨是**簽發 CA 本身**（不是根 CA） | — | 否（技術決定，理由見第 2 節） |
-| 3 | 簽發 CA 憑證帶 `pathLenConstraint = 0` 與 EKU `clientAuth`，有效 5 年；新簽發的用戶端憑證不得晚於簽發 CA 到期 | — | 否 |
-| 4 | 演算法：簽發 CA 與用戶端金鑰 **ECDSA P-256**；根 CA **ECDSA P-384**（新安裝）或沿用既有的 RSA 3072／4096 | — | **是**：根 CA 的演算法（P-384 或 RSA 4096；沿用 INSTALL 的 RSA 時不需變更） |
-| 5 | 用戶端憑證 365 天（D2）、序號 16 bytes 隨機值、`notBefore` 往前 10 分鐘 | — | 否（D2 已定） |
-| 6 | **離線簽發模式**（`pki.mode = "offline"`）：不在線上持有任何 CA 私鑰，核准後匯出 CSR 佇列、在 CA 主機簽發、再匯入 | 不是預設 | **是**：高安全場域是否改為預設 |
-| 7 | Kairos 自己產生並載入簽發 CA 的 CRL（每次撤銷與每 24 小時），不再需要 `kairos-crl.timer`（離線模式仍需要） | — | 否 |
-| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **是**：`pki init` 與首次啟動精靈（S02）一起排入之後的衝刺 |
-| 9 | 續簽重放快取持久化、除役 10 分鐘視窗以「延後生效的撤銷」實作 | — | 否（ENROLL.md 第 18 節，安全審查的處置） |
-| 10 | 主控台變更的註冊端點模式與憑證政策存在資料庫的 `settings` 表，優先於 `kairos.toml` | — | **是**：設計包 #14 要求寫回 `kairos.toml`；本衝刺先用資料庫，精靈實作時統一 |
+| 1 | **根 CA 離線、Kairos 線上持有「代理簽發 CA」（中繼 CA）的私鑰**（0600），核准後立即簽發 | `pki.mode = "online"` | **已決定（2026-10-14）**：預設線上簽發。線上持有簽發金鑰是自動簽發的前提，也是新的攻擊面（第 3 節） |
+| 2 | Kairos 的 mTLS 信任錨是**簽發 CA 本身**（不是根 CA） | — | 技術決定（理由見第 2 節） |
+| 3 | 簽發 CA 憑證帶 `pathLenConstraint = 0` 與 EKU `clientAuth`，有效 5 年；新簽發的用戶端憑證不得晚於簽發 CA 到期 | — | 技術決定 |
+| 4 | 演算法：簽發 CA 與用戶端金鑰 **ECDSA P-256**；根 CA 新安裝用 **ECDSA P-384**，既有的 RSA 根 CA（RSA 3072／4096）照用，簽發 CA 可由 RSA 根 CA 簽發 | — | **已決定（2026-10-14）** |
+| 5 | 用戶端憑證 365 天（D2）、序號 16 bytes 隨機值、`notBefore` 往前 10 分鐘 | — | 已定（D2） |
+| 6 | **離線簽發模式**（`pki.mode = "offline"`）：不在線上持有任何 CA 私鑰，核准後匯出 CSR 佇列、在 CA 主機簽發、再匯入 | 不是預設 | **已決定（2026-10-14）**：可切換的選項，**不是**高安全場域的預設；需要時由管理者明確設定 |
+| 7 | Kairos 自己產生並載入簽發 CA 的 CRL（每次撤銷與每 24 小時），不再需要 `kairos-crl.timer`（離線模式仍需要） | — | 技術決定 |
+| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **已決定（2026-10-14）**：`pki init` 延後到首次啟動精靈（S02） |
+| 9 | 續簽重放快取持久化、除役 10 分鐘視窗以「延後生效的撤銷」實作 | — | 技術決定（ENROLL.md 第 18 節，安全審查的處置） |
+| 10 | 主控台變更的註冊端點模式與憑證政策存在資料庫的 `settings` 表，**優先於 `kairos.toml`**；以 `kairos config show --effective` 查詢實際生效值與每一項的來源 | — | **已決定（2026-10-14）**：設計包 #14 要求寫回 `kairos.toml`，精靈實作時再評估是否統一 |
+| 11 | 註冊 token 的列表與詳情只顯示**前 4 碼**（`KRT1-GE8Q…`），不顯示後 4 碼 | — | **已決定（2026-10-14）**：ENROLL.md 第 18 節第 5 項 |
 
 ## 2. CA 架構
 
@@ -41,10 +43,10 @@
 | 項目 | 規則 |
 |---|---|
 | 位置 | `<storage.data_dir>/pki/`，目錄 **0700**（擁有者 `kairos`）。簽發 CA 私鑰 `issuing-<ca_id>.key`：PKCS#8 PEM、**0600**；憑證 `issuing-<ca_id>.pem`：0644 |
-| 權限檢查 | 啟動時與每次重新載入時檢查（沿用 `fsperm.rs`）：私鑰的群組或其他使用者有任何權限、或擁有者不是執行 Kairos 的帳號時，**不使用**這把金鑰（不拒絕啟動：既有主機照常連線），線上簽發停用，核准的申請停在 `approved_awaiting_issuance`，記 `ERROR` 與 `KRS-E1302`（原因：「私鑰權限過寬」；是否另配代碼見 ENROLL.md 第 19.4 節）。目錄的權限過寬時同樣處理 |
+| 權限檢查 | 啟動時與每次重新載入時檢查（沿用 `fsperm.rs`）：私鑰的群組或其他使用者有任何權限、或擁有者不是執行 Kairos 的帳號時，**不使用**這把金鑰（不拒絕啟動：既有主機照常連線），線上簽發停用，核准的申請停在 `approved_awaiting_issuance`，記 `ERROR` 與 **`KRS-E1303`**（設計包 INTEGRATION §27.3；`KRS-E1302` 只用於選擇離線簽發）。目錄的權限過寬、私鑰無法讀取或與憑證不成對時同樣處理 |
 | 與資料庫的關係 | `kairos.db` 維持 0640（`kairos` 群組可讀，供備份）；**資料庫中沒有任何私鑰**（只有 token 雜湊、`poll_secret` 雜湊、CSR 與憑證）。`kairos db backup` 不含 `data/pki/`；簽發 CA 私鑰另外備份（加密），遺失時見第 4 節 |
 | 誰讀私鑰 | 只有 Kairos 常駐行程（簽發器）。CLI（`kairos enroll approve`）不簽發，只把申請標為已核准，常駐行程在 2 秒內簽發（第 10 節）。`kairos pki` 的離線指令（第 6 節）在 CA 主機上執行，讀的是離線金鑰 |
-| 記錄 | 啟動時記一次 `KRS-W1301`（CA 私鑰存放在伺服器上）的 `INFO`／`WARN`：說明線上簽發的取捨與離線模式；S15 的憑證鏈顯示「私鑰：在伺服器 · 簽發 N 張」 |
+| 記錄 | 線上簽發啟用時記一次 `KRS-W1301`（簽發 CA 私鑰存放在伺服器上）的 `INFO`：說明線上簽發的取捨與離線模式；S15 的憑證鏈顯示「私鑰：在伺服器 · 簽發 N 張」 |
 | 選用的加密（之後） | systemd `LoadCredentialEncrypted=` 提供私鑰（TPM 或主機金鑰加密），Kairos 從 `$CREDENTIALS_DIRECTORY` 讀取；本衝刺不實作，設定鍵 `pki.issuing_key_path` 先保留可指向任意路徑 |
 
 ## 4. 簽發 CA 的輪替與遺失
@@ -56,7 +58,7 @@
 3. **依進度重新簽發**：8443 的 `hello_ack.renew_now`（ENROLL.md 第 13.1 節）要求仍使用舊 CA 憑證的主機提早輪替（分散在 6 小時內）；S15 顯示「還有 N 台使用舊 CA 簽發的憑證」。
 4. **移除舊 CA**：N＝0（或剩下的都已撤銷、過期超過寬限期）後才能 `retire`；狀態 `retired`，從信任錨移除，私鑰檔刪除。
 
-- **何時輪替**：簽發 CA 剩餘有效期少於「用戶端憑證最長有效天數（825 天）＋ 90 天」時，系統健康為警告；新簽發的 `notAfter` 一律截在簽發 CA 的 `notAfter` 之前（第 5 節），所以不會簽出比 CA 長命的憑證。
+- **何時輪替**：啟用中的簽發 CA 剩餘有效期少於「政策的有效天數（含有效 token 覆寫中最長者）＋過期寬限期」（預設 365＋90＝455 天，`pki.issuing_ca_warning_days` 可覆寫）時記 `KRS-W1304`（每 24 小時最多一次；`GET /api/v1/pki/ca` 的 `expiry_warning`）。門檻依設計包 INTEGRATION §27.4 #5：825＋90 天會讓 5 年的簽發 CA 從剩 2.5 年起一直警告；新簽發的 `notAfter` 一律截在簽發 CA 的 `notAfter` 之前（第 5 節），所以不會簽出比 CA 長命的憑證。
 - **私鑰遺失**（沒有備份）：舊 CA 簽發的憑證仍有效，但**無法再為它產生 CRL**，也就無法撤銷。處置：立即建立新的簽發 CA（上述 1～3 步），舊 CA 的 CRL 停在最後一版；最後一版到期（`nextUpdate`）前完成輪替，否則以舊 CA 憑證連線的主機會因 CRL 過期被拒（fail closed）。S15 以嚴重提示這個期限。
 - **私鑰外洩**：從信任錨移除舊 CA（`kairos pki issuing-ca retire --compromised`，L3）：以舊 CA 憑證連線的主機立即被拒，需以過期續簽以外的方式（新 token）重新註冊；過期續簽以舊 CA 的憑證證明身分，也一併失效。
 
@@ -335,10 +337,20 @@ ALTER TABLE hosts ADD COLUMN last_grace_attempt TEXT;    -- JSON：時間、結�
 mode = "online"                    # online | offline；沒有 [pki] 時為 offline（升級不會自動開始簽發，與 enroll.mode 的雙層預設同一原則）
 server_ca_path = "/opt/kairos/ca.pem"  # Pulse 信任的 CA（CA 指紋、8444 鏈尾、enroll 回應的 ca_pem）；必填才能啟用 8444
 crl_validity_days = 30             # Kairos 產生的 CRL 的 nextUpdate
-crl_refresh_hours = 24             # 沒有新撤銷時重新產生的間隔
+crl_refresh_hours = 24             # 沒有新撤銷時重新產生的間隔（小時）；每次撤銷另外立即產生
+organization = "Kairos"            # 簽發 CA 的 subject：CN=<organization> Kairos Agent Issuing CA <ca_id>
+# issuing_ca_warning_days = 455    # 簽發 CA 剩餘天數低於此值時 KRS-W1304；未設定為政策有效天數＋寬限期
+
+[pki.policy]                       # 憑證政策（S14）；主控台修改的值存在 settings 表、優先於這裡
+cert_lifetime_days = 365           # 90..=825
+renew_before_days = 30             # 1..=180，小於有效天數
+renew_requires_approval = false    # 8443 輪替與過期續簽是否需要人工核准
+expired_renew_grace_days = 90      # 0..=365；0＝不接受過期續簽
+revoke_on_self_decommission = true # 主機自行除役時撤銷（10 分鐘後生效）
+revoke_superseded = true           # 新憑證第一次 hello 後以 superseded 撤銷舊憑證
 ```
 
-- 憑證政策（S14：有效天數、輪替觸發天數、輪替需人工核准、過期寬限期、主機自行除役時撤銷）與註冊端點模式（`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`）可由主控台修改，存在 `settings` 表。**優先順序**：環境變數 ＞ `settings`（主控台）＞ `kairos.toml` ＞ 程式內建預設。被環境變數覆寫的項目，主控台顯示為鎖定並說明來源（設計包 #14）；`kairos --check-config --show-effective` 列出每個值的來源。**待使用者確認**（第 1 節第 10 項）。
+- 憑證政策（S14：有效天數、輪替觸發天數、輪替需人工核准、過期寬限期、主機自行除役時撤銷）與註冊端點模式（`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`）可由主控台修改，存在 `settings` 表。**優先順序**：環境變數 ＞ `settings`（主控台）＞ `kairos.toml` ＞ 程式內建預設。被環境變數覆寫的項目，主控台顯示為鎖定並說明來源（設計包 #14）；`kairos config show --effective` 列出每個值的實際生效值、來源（環境變數／主控台〔修改者、時間〕／設定檔／內建預設）與被覆寫的值（設計包 `cli-style.md` §11.7）；「改用設定檔的值」＝刪除 `settings` 的鍵（`kairos config reset <設定鍵>`、`POST /api/v1/settings/reset`）。啟動時有設定檔的值被資料庫覆寫，記一行 `INFO` 列出設定鍵。**已決定（2026-10-14）**（第 1 節第 10 項）。
 - `[pki]` 不存在、或 `pki.server_ca_path` 未設定時，8444 不監聽（即使 `enroll.mode` 不是 `closed`），啟動時記錄原因：沒有被釘選的 CA，Pulse 無法驗證 Kairos。
 - `auth.client_ca` 仍必填（mTLS）；線上簽發 CA 自動加入信任錨，不必寫進檔案。
 
@@ -350,15 +362,15 @@ crl_refresh_hours = 24             # 沒有新撤銷時重新產生的間隔
    - **維持離線**：`pki.mode = "offline"`，註冊與核准在線上完成，簽發用第 6 節的匯出／匯入（代理 CA 私鑰不離開管理主機）。
    - **改為線上**：`kairos pki issuing-ca new` → 在管理主機以**代理 CA** 簽發（代理 CA 在此扮演根 CA）→ `install`、`activate`；`pki.mode = "online"`。舊的手動憑證繼續有效（代理 CA 仍在 `auth.client_ca`），到期前由 8443 的 `renew` 換成線上簽發的憑證。
 4. 設定 `[enroll]`（`mode = "open"` 或 `renew_only`），開放 8444 的防火牆。
-5. 手動簽發的既有憑證可以 `kairos pki certificates import <目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們）；不匯入也能連線。
+5. 手動簽發的既有憑證可以 `kairos pki certificates import <目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；本版尚未實作，第 13 節）；不匯入也能連線。
 
 ## 10. 簽發流程（Kairos 內部）
 
 - **簽發器**：常駐行程內的單一工作，持有線上簽發 CA 的私鑰。來源：(a) 8444 的自動核准與過期續簽（同步呼叫，受請求的 5 秒處理時限約束）；(b) 主控台 API 的核准（同步，批次核准逐筆在背景進行，設計包 S13 的進度）；(c) CLI 寫入的 `approved` 申請（每 2 秒掃描一次）；(d) 8443 的 `renew_request`。
 - **一筆簽發**＝ 產生序號 → 依第 5.1 節組出並簽章 → 單一交易寫入 `pki_certificates`、`enroll_requests`（`issued`）、`hosts`（`current_serial`）、`audit_events` → commit 後喚醒該申請的長輪詢。交易失敗時憑證視同未簽發（序號不會重用：寫入時才佔用）。
 - **冪等**：寫入前以 `enroll_requests (agent_id, csr_sha256)` 確認沒有已簽發的紀錄（ENROLL.md 第 7.4 節）；同一個 CSR 永遠只有一張憑證。
-- **撤銷**：寫入 `revoked_at`、`revoke_effective_at`（一般為現在；除役為 +10 分鐘）→ 在生效時刻重新產生該 CA 的 CRL（`crl_number` 遞增，寫入 `pki_crls` 與 `data/pki/crl/agents-<ca_id>.crl`）→ 以新的 CRL 原子替換 TLS 驗證器（沿用 `tls.rs` 的 `TlsMaterial` 替換與既有連線重新驗證，被撤銷的連線收到 `certificate_rejected` 並斷線）。多筆撤銷在 2 秒內合併成一次 CRL。CRL 收錄已生效、且 `not_after` 尚未超過 1 天以上的撤銷。
-- **定期 CRL**：每 `crl_refresh_hours` 與啟動時（`next_update` 在 7 天內）重新產生；失敗時記 `KRS-E1205`，`next_update` 剩 7 天起 `KRS-W1201`（沿用既有代碼與 `auth.crl_expiry_warning_days`）。
+- **撤銷**：寫入 `revoked_at`、`revoke_effective_at`（一般為現在；除役為 +10 分鐘）→ 在生效時刻重新產生該 CA 的 CRL（`crl_number` 遞增，寫入 `pki_crls` 與 `data/pki/crl/issuing.crl`〔各簽發 CA 目前的 CRL，PEM〕；信任錨寫在 `data/pki/issuing-cas.pem`）→ 以新的 CRL 原子替換 TLS 驗證器（沿用 `tls.rs` 的 `TlsMaterial` 替換與既有連線重新驗證，被撤銷的連線收到 `certificate_rejected` 並斷線）。常駐行程每 2 秒（或被主控台 API 喚醒時立即）檢查已生效、尚未收錄的撤銷，合併成一次 CRL；CLI 的撤銷也在 2 秒內生效。8443 的驗證器依用戶端憑證的簽發者分成兩組：簽發者是 Kairos 簽發 CA 時，以簽發 CA 為唯一的信任錨、Kairos 產生的 CRL 驗證（fail closed）；其他以 `auth.client_ca`／`auth.crl` 驗證（與 0.4 相同），兩組的 CRL 互不影響。CRL 收錄已生效、且 `not_after` 尚未超過 1 天以上的撤銷。
+- **定期 CRL**：每 `crl_refresh_hours`（預設 24 小時）、每次撤銷，以及啟動時（沒有 CRL 或 `next_update` 在 7 天內）重新產生；失敗時記 `KRS-E1205`，`next_update` 剩 7 天起 `KRS-W1201`（沿用既有代碼與 `auth.crl_expiry_warning_days`）。
 - **輪替後撤銷舊憑證**：新序號第一次成功 `hello` 時寫 `first_used_at`，並依政策以 `superseded` 撤銷同一 `agent_id` 的前一張（ENROLL.md 第 13.1 節）。
 
 ## 11. 與設計包的對照
@@ -370,4 +382,68 @@ crl_refresh_hours = 24             # 沒有新撤銷時重新產生的間隔
 | S02 步驟 3：根 CA＋agent 專用中繼 CA；根 CA 私鑰加密下載後刪除 | 第 2、3 節；`pki init` 延後（第 1 節第 8 項） |
 | S14 憑證政策、撤銷原因、「撤銷待生效」 | 第 5、6、10 節 |
 | S15 憑證鏈、CA 輪替四步、CRL 版本歷史 | 第 4、7 節 |
-| `copywriting.md` `KRS-W1301`、`KRS-E1302`、`KRS-W1201`、`KRS-E1205`、`KRS-E1206` | 第 3、6、10 節（沿用，不新增代碼） |
+| `copywriting.md` `KRS-W1301`、`KRS-E1302`、`KRS-W1201`、`KRS-E1205`、`KRS-E1206` | 第 3、6、10 節 |
+| INTEGRATION §27.3 新代碼 `KRS-E1303`（簽發 CA 私鑰無法使用）、`KRS-W1304`（簽發 CA 即將到期）、`KRS-E1305`（匯入的憑證未通過檢查：`issuing-ca install`、`queue import`） | 第 3、4、6 節 |
+
+## 12. 實作摘要與量測（衝刺 4）
+
+**8444 的處理架構**
+
+- 註冊服務在自己的 tokio runtime（2 個工作執行緒、最多 16 個 blocking 執行緒）上執行，與 agent 連線、report 的 writer、主控台分開排程。
+- 資料庫：一條寫入連線（交易依序進行，`busy_timeout` 2 秒）與最多 4 條唯讀連線（輪詢、token 查詢、新註冊交易前的判定）。新註冊的異常旗標、公鑰重複與 L9 的查詢在**交易外**進行，寫入交易只做冪等的再確認與寫入；兩個寫入交易之間至少相隔 2 ms，report 的 writer 等待寫入鎖時不會一直被搶先（註冊服務的寫入上限約每秒 500 個交易，遠高於 L8 的每秒 50 筆）。
+- 長輪詢：每筆申請一個通知；常駐行程內的核准、撤回立即喚醒，CLI 造成的變化由每 2 秒的背景工作偵測。
+- 撤回的 nonce 只在記憶體（重新啟動後全部失效，Pulse 從 challenge 重來）；重放快取與 L7 封鎖在資料庫。
+
+**量測**：`kairos/src/enroll/bench.rs`（`#[ignore]`）。kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-10-14，release 建置，與 report 的 writer 共用同一個 SQLite 資料庫；用戶端在另一個 runtime（與伺服器共用 4 個 vCPU），**每個請求一條新的 TLS 連線**（最壞情況，Pulse 實際以 keep-alive 送出 2～3 個請求），同時以每秒 2,000 筆 report（相當於 1 萬台 × 每 5 秒）量測每筆 report 從放入佇列到 `ack` 的延遲。
+
+```bash
+cargo test -p kairos --release -- --ignored --nocapture enroll_bench_10k
+cargo test -p kairos --release -- --ignored --nocapture enroll_bench_default_limits
+KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_bench_default_limits
+```
+
+*容量*（`enroll_bench_10k`：同一個來源設為批次部署來源並放寬 L4、L5、L8，量測伺服器本身的能力；1 萬台、同時 256 個請求）：
+
+| 階段 | 請求 | 註冊端點的結果 | 同時的 report `ack` |
+|---|---|---|---|
+| 只有 report 寫入 | — | — | p50 0.63 ms、p99 2.6 ms、最大 11 ms |
+| 1 萬台同時新註冊（需核准，建立申請） | 86 req/s，p50 2.8 s、p99 5.0 s | 7,755 筆 200、2,245 筆 503（5 秒處理時限，`storage_unavailable`） | p50 1.7 ms、**p99 23 ms**、最大 108 ms |
+| 每台輪詢一次 | 2,084 req/s，p50 154 ms、p99 557 ms | 全部 200；動態 `poll_after_ms` 到 900,000（同一來源 7,755 筆待核准） | p50 0.9 ms、p99 247 ms（TLS 握手的 CPU 競爭） |
+| 1 萬台同時新註冊（自動核准，線上簽發） | 73 req/s，p50 3.7 s、p99 5.0 s | 6,508 筆簽發、3,492 筆 503 | p50 1.7 ms、**p99 19 ms**、最大 78 ms |
+| 資料庫 | — | 175 MB（含 1 萬台的 report 與 8,164 張憑證、8,728 筆待核准） | — |
+
+- 修正前（旗標與佇列的查詢在寫入交易中、交易之間沒有空檔）同一個測試的 `ack` p50 為 5.4 s／p99 13 s（自動核准時 p99 61 s）：註冊服務連續的寫入交易搶走 report writer 的寫入鎖。修正後 `ack` p99 在 20 ms 左右，仍遠低於 `timeouts.write_secs`（5 秒）。
+- 建立申請的上限約每秒 70～90 筆（每筆約 10 ms 的寫入交易，含 2 ms 空檔），高於 L8 的預設（每秒 50 筆）；超過時由 5 秒的處理時限回 503，Pulse 依 `Retry-After` 重送，不會建立重複的申請（冪等）。
+
+*預設限流*（`enroll_bench_default_limits`：1 萬台從同一個 NAT 在 30 秒內不斷送出新註冊，不遵守 `Retry-After`）：
+
+| 情況 | 30 秒的結果 | `Retry-After` | 同時的 report `ack` |
+|---|---|---|---|
+| 一般來源（L3、L4 生效） | 800 筆建立申請、2,400 筆 429（`rate_limited`，`scope: ip`）、約 20 萬條連線在 TLS 握手前被關閉（L3 硬上限） | p50 51 s、p99 90 s | p50 0.56 ms、**p99 3.5 ms** |
+| 批次部署來源（L2～L4 × 10，L8 每秒 50 筆生效） | 3,077 筆建立申請、2,692 筆 503（`enroll_busy`）、1,123 筆 429、約 20 萬條連線握手前關閉 | p50 9 s、p99 26 s、最大 600 s（上限） | p50 0.60 ms、**p99 8.3 ms** |
+
+- 結論：在預設限流下，即使單一來源以遠超過 Pulse 的頻率灌入請求，report 的 `ack` p99 仍在 10 ms 以內；`Retry-After` 依排隊位置分散（GCRA），不是固定值。
+- L1 全域握手速率與長輪詢名額仍待在目標硬體上校正（ENROLL.md 第 19.4 節第 7 項）。
+
+## 13. 實作與規格的差異、限制
+
+| # | 項目 | 實作 |
+|---|---|---|
+| 1 | `enroll_requests` | 另有 `cert_lifetime_days`、`issue_error`；索引另有 `(source_ip, state)`、`(source_ip, created_at)`；`hosts` 另有 `decommissioned_by` 與 `hostname` 索引 |
+| 2 | 信任錨與 CRL 的檔案 | `data/pki/issuing-cas.pem`、`data/pki/crl/issuing.crl`（各簽發 CA 的 CRL 合在一個 PEM），不是每個 CA 一個檔案 |
+| 3 | 第一個簽發 CA | `issuing-ca install` 在沒有啟用中的簽發 CA 時自動啟用（之後的 CA 需 `activate`） |
+| 4 | 過期續簽的身分 | `expired_certificate` 必須由信任錨（簽發 CA 或 `auth.client_ca` 中的 CA）**直接**簽發（Pulse 只送出用戶端憑證，不送中繼憑證）；清冊沒有最新序號（手動簽發、未匯入）的主機只檢查沒有撤銷紀錄 |
+| 5 | 過期續簽的「最後嘗試」 | `hosts.last_grace_attempt` 只在通過身分驗證後寫入（時鐘被拒的請求尚未驗證身分，不寫入清冊，避免任何人替別台主機寫入資料） |
+| 6 | 授權節點數 | 本版沒有授權機制：`license_exhausted` 不會出現，`EnrollLicenseOverflow` 保留 |
+| 7 | keep-alive 閒置 | hyper 的標頭讀取計時涵蓋閒置，實際閒置上限為 `min(header_timeout_secs, idle_timeout_secs)`（預設 10 秒） |
+| 8 | 列表的游標分頁 | 註冊與憑證的管理端點以 `limit`（1～1,000）回傳前 N 筆與總數，`next_cursor` 一律為 `null`（之後加入） |
+| 9 | 8443 的 `renew`／`deregister` 訊息 | 型別定義在 Kairos 端（`enroll/agent.rs`），回應以 JSON 直接送出；`hello_ack` 另帶的 `expired_renew_grace_days`、`renew_now` 以注入欄位的方式送出（第 14 節） |
+
+**延後**：`kairos pki certificates import`（手動憑證匯入簽發紀錄）、離線模式的 CRL 工具（`kairos pki revocations export`、`kairos pki gencrl --revocations`、`kairos pki crl upload` 與 `POST /api/v1/pki/crl`）、`GET /api/v1/pki/revocations/export`、下載端點（`/agent/`，回 404；主控台 API 的 `downloads.available = false`）、暫時放寬的管理（`enroll_relaxations` 只有讀取）、解除 L7 封鎖的端點、L11、S20 系統健康的「註冊端點」區塊（計數先放在 `GET /api/v1/enroll/mode` 的 `stats`）、`KRS-W2009`、`KRS-W1115` 的彙總事件。
+
+## 14. 與 Pulse 端合併時
+
+- **8443 的訊息型別**：`renew_request`、`renew_result`、`deregister`、`deregister_ack` 與 `hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now` 目前沒有放進 `kairos-proto`：`ServerMsg` 加入新變體或 `HelloAck` 加欄位，會讓 Pulse 端窮舉的 `match` 無法編譯。合併時建議在 `kairos-proto` 新增這些變體與欄位（ENROLL.md 第 13 節移入 PROTOCOL.md），兩端改用共用型別；Kairos 端的欄位與 ENROLL.md 第 13 節一致（`deregister` 另接受選用的 `seq`，`deregister_ack` 在有 `seq` 時回傳）。
+- **8443 的 features**：Kairos 只在 hello 宣告了 `renew`／`deregister` 時把它們列進 `hello_ack.features`（沒有宣告的 0.4 以前 Pulse 收到的 `hello_ack` 與 0.4 相同；Pulse 照常取交集）。8444 `server-info` 的 `features` 則一律列出 Kairos 支援的全部（`metrics`、`durable`、`renew`、`deregister`）。
+- **8443 的錯誤碼**：`renew_requires_approval`、`invalid_csr`、`rate_limited`（renew，非 fatal）以 `ServerMsg::Error` 的字串 `code` 送出，`kairos-proto` 的 `ErrorCode` 沒有新增。
+- **測試掛鉤**（debug 建置）：`KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_AUTO_PAUSE_SECS`，ENROLL.md 第 19.3 節的端對端情境 #8、#11 可以使用。

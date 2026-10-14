@@ -28,11 +28,47 @@ pub const FAILURE_REFILL_PER_SEC: f64 = 1.0 / 6.0;
 /// 追蹤的來源數上限
 pub const MAX_TRACKED_SOURCES: usize = 10_000;
 
-/// 權限（之後的角色對應到一組權限；`ia.md` §4.2）
+/// 權限（之後的角色對應到一組權限；`ia.md` §4.2、API.md 第 11.1 節）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     /// 所有讀取端點（主機、趨勢、總覽、系統健康、事件）
     Read,
+    /// 建立、停用註冊 token（`operate` 只能建立需核准的 token）
+    EnrollTokenWrite,
+    /// 建立自動核准的 token；自動核准 token 的批次部署模式
+    EnrollTokenAuto,
+    /// 核准、拒絕申請
+    EnrollDecide,
+    /// 核准後會超過授權節點數（本版沒有授權機制，保留給之後的版本）
+    #[allow(dead_code)]
+    EnrollLicenseOverflow,
+    /// 切換註冊端點模式、自動暫停
+    EnrollModeWrite,
+    /// 撤銷憑證、立即重新產生 CRL
+    CertRevoke,
+    /// 憑證政策
+    CertPolicyWrite,
+    /// 允許再次自動續簽
+    GraceOverride,
+    /// 離線模式的 CSR 佇列匯出與匯入
+    PkiQueue,
+    /// 簽發 CA 的建立、安裝、啟用、退役（本版只有 CLI，API 之後再加）
+    #[allow(dead_code)]
+    PkiCaWrite,
+}
+
+impl Permission {
+    /// 需要的範圍（read＝0、operate＝1、admin＝2）
+    pub fn required_scope(self) -> &'static str {
+        match self {
+            Permission::Read => SCOPE_READ,
+            Permission::EnrollTokenWrite
+            | Permission::EnrollDecide
+            | Permission::CertRevoke
+            | Permission::PkiQueue => super::tokens::SCOPE_OPERATE,
+            _ => super::tokens::SCOPE_ADMIN,
+        }
+    }
 }
 
 /// 通過驗證的身分
@@ -50,15 +86,18 @@ pub enum Principal {
 impl Principal {
     /// 檢查權限；沒有時回 403 `forbidden`
     pub fn require(&self, permission: Permission) -> Result<(), ApiError> {
-        let allowed = match (self, permission) {
-            (Principal::ApiToken { scopes, .. }, Permission::Read) => {
-                scopes.iter().any(|s| s == SCOPE_READ)
-            }
+        let need = super::tokens::scope_rank(permission.required_scope()).unwrap_or(u8::MAX);
+        let allowed = match self {
+            Principal::ApiToken { scopes, .. } => scopes
+                .iter()
+                .filter_map(|s| super::tokens::scope_rank(s))
+                .any(|rank| rank >= need),
         };
         if allowed {
             Ok(())
         } else {
-            Err(ApiError::forbidden())
+            Err(ApiError::forbidden()
+                .with_details(serde_json::json!({"required": permission.required_scope()})))
         }
     }
 

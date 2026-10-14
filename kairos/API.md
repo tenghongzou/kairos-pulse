@@ -16,7 +16,7 @@
 | 格式 | 請求與回應都是 JSON（UTF-8），`Content-Type: application/json; charset=utf-8`；SSE 為 `text/event-stream` |
 | 時間 | RFC 3339、**UTC**、`Z` 結尾、毫秒，例：`2026-10-13T06:03:27.123Z`（與 `hello_ack` 的 `server_time` 相同，設計包 §24 #23）。持續時間以數字表示並在欄位名稱帶單位（`_ms`、`_secs`），容量為 `_bytes` |
 | 伺服器時間 | **每個回應**（含錯誤）的最外層都有 `server_time`：Kairos 產生回應時的系統時間，讓主控台計算相對時間（「3 分鐘前」）時不依賴瀏覽器的時鐘 |
-| 方法 | 本版只有 `GET`（`HEAD` 視同 `GET` 但不回本文）。其他方法回 405（`Allow: GET, HEAD`） |
+| 方法 | 查詢端點只有 `GET`（`HEAD` 視同 `GET` 但不回本文），其他方法回 405（`Allow: GET, HEAD`）。0.5.0 起註冊與 PKI 的管理端點另有 `POST`、`PUT`（第 11 節） |
 | 快取 | 所有回應 `Cache-Control: no-store` |
 | CORS | **預設關閉**：不回任何 `Access-Control-*` 標頭，瀏覽器的跨來源請求一律失敗。主控台日後與 API 同源提供，不需要 CORS |
 | 字元 | 主機名稱等由 agent 提供的字串原樣輸出（JSON 跳脫），顯示時由主控台處理（Pulse 已把不能顯示的字元換成 `?`） |
@@ -56,7 +56,7 @@
 | 400 | `invalid_parameter` | — | 查詢參數不合法（`details.parameter` 寫出是哪一個） |
 | 400 | `invalid_cursor` | — | `cursor` 無法解析、或與目前的排序不符（改變排序後要從第一頁開始） |
 | 401 | `unauthorized` | `KRS-E6010` | 沒有 `Authorization`、格式錯誤、token 不存在、已撤銷或已過期（對外不區分），附 `WWW-Authenticate: Bearer realm="kairos"` |
-| 403 | `forbidden` | `KRS-E6104` | token 的範圍不包含這個操作（本版的端點都只需要 `read`，保留給之後的寫入操作） |
+| 403 | `forbidden` | `KRS-E6104` | token 的範圍不包含這個操作（`details.required` 為所需的範圍；第 11.1 節） |
 | 404 | `not_found` | — | 沒有這個路徑 |
 | 404 | `host_not_found` | — | 清冊中沒有這個 `agent_id`（設計包 S05「主機不存在 → 404 頁」） |
 | 404 | `metric_not_found` | — | 這台主機在查詢範圍內沒有這個指標 |
@@ -125,7 +125,7 @@ Authorization: Bearer kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuL
 - 格式：`kat_` ＋ 16 個十六進位字元的 **token_id**（公開的識別碼，用於列表、撤銷與日誌）＋ `_` ＋ 43 個 base64url 字元的**秘密**（32 bytes 隨機值，以作業系統的 CSPRNG 產生）。`kat_` 前綴讓 secret 掃描工具容易辨識。
 - 伺服器只保存秘密的 **SHA-256 雜湊**（`api_tokens.secret_hash`）。秘密有 256 位元的亂度，不需要慢速雜湊（bcrypt／Argon2 是為了低亂度的密碼）。比對時先以 token_id 查詢，再以**常數時間**比較雜湊；token_id 不存在時仍做一次同樣的比較，回應時間不洩漏 token_id 是否存在。
 - token 只在建立時顯示一次，之後無法取回；遺失時撤銷後重新建立。
-- **範圍**（`scope`）：本版只有 `read`（唯讀：所有 `GET` 端點）。之後的寫入端點會要求 `write` 等範圍，`read` 的 token 回 403。
+- **範圍**（`scope`）：`read`（唯讀：所有 `GET` 端點；預設）、`operate`、`admin`（0.5.0，第 11.1 節；階層式 admin ⊃ operate ⊃ read）。範圍不足的請求回 403。
 - **到期**：建立時指定，預設 90 天、上限 3,650 天；不提供不過期的 token（設計包 `cli-style.md` §11.6：外洩後只能靠人工撤銷）。需要長期使用的整合以 `--expires-in 3650d` 建立，`kairos api-token list` 出現 14 天內到期的提示時輪替。到期後回 401（`KRS-E6010`）。
 - **最後使用**：成功驗證時在記憶體中記下時間與來源 IP，每 60 秒以一個短交易寫回資料庫（`last_used_at`、`last_used_ip`；`kairos api-token list` 顯示）。
 - 回應、日誌與 `kairos api-token list` 都不會出現秘密或雜湊；日誌只記 token_id 與名稱。
@@ -133,7 +133,7 @@ Authorization: Bearer kat_3f9c2a71b4e05d18_Qm9yZW1hbi1pcy1ub3QtYS1yZWFsLXRva2VuL
 ### 4.2 `kairos api-token`
 
 ```
-kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期或時間>] [--scope read] [--json] [--config <檔案>]
+kairos api-token create --name <名稱> [--expires-in <時間> | --expires-at <日期或時間>] [--scope read|operate|admin] [--json] [--config <檔案>]
 kairos api-token list [--all] [--json] [--config <檔案>]
 kairos api-token revoke <token_id> [--reason <原因>] [--yes] [--json] [--config <檔案>]
 ```
@@ -159,7 +159,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - stdout 只有 token 一行（`TOKEN=$(kairos api-token create …)`），其他說明寫 stderr。
 - `--expires-in`：`90m`、`12h`、`30d`、`2w`（與 `kairos hosts list --offline-for` 相同的寫法），上限 3650 天；`--expires-at`：`2027-01-01`（UTC 當天 00:00）或 RFC 3339。`--no-expiry`（0.4 草稿）已移除：指定時以結束代碼 2 拒絕並提示 `--expires-in 3650d`。
 - `--name`：1～64 個字元，不可含控制字元；不必唯一（以 token_id 區分）。
-- `list`：預設只列出有效的 token；`--all` 另列已撤銷與已過期的。欄位：token_id、名稱、範圍、狀態（有效／已撤銷／已過期）、建立時間與建立者、到期、最後使用（相對時間與 IP）。時間為本機時區，只在欄位標題標示；剩餘 14 天以內的有效 token 在到期時間後加 `⚠`（`--ascii` 或非 UTF-8 終端機為 `[WARN]`），並在 stderr 提示輪替。
+- `list`：預設只列出有效的 token；`--all` 另列已撤銷與已過期的。欄位：token_id、名稱、範圍、狀態（有效／已撤銷／已過期）、建立時間與建立者、到期、最後使用（7 天內為相對時間，7 天以上改為日期時間，copywriting.md §5.3；附 IP）。時間為本機時區，只在欄位標題標示；剩餘 14 天以內的有效 token 在到期時間後加 `⚠`（`--ascii` 或非 UTF-8 終端機為 `[WARN]`），並在 stderr 提示輪替。
 - `revoke`：危險操作 L1（`cli-style.md` §5.4）：互動模式詢問 `是否繼續？[y/N]`，非互動需 `--yes`（否則結束代碼 2）。撤銷立即生效（每個請求都查詢資料庫）。重複撤銷已撤銷的 token 不算錯誤。
 - 結束代碼：0 完成、1 資料庫錯誤、2 用法錯誤、3 設定錯誤、10 權限不足（以 root 執行而資料目錄屬於服務帳號時拒絕，與 `kairos reports import` 相同）、11 資料庫被 `kairos reports import` 獨占中。
 - 以服務帳號執行（`sudo -u kairos`），Kairos 執行中也可以（只寫一個短交易）；資料庫不存在時建立（並升級 schema）。
@@ -581,7 +581,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 
 ## 11. 衝刺 4：註冊與 PKI 的管理端點（草稿）
 
-0.5.0〔草稿〕規格，尚未實作。8444 的協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，資料表與簽發流程見 [`PKI.md`](PKI.md)。本節的端點是主控台 S12（註冊 token）、S13（待核准）、S14（憑證）、S15（CA 與 CRL）、S21（註冊端點模式）的後端（設計包 §24 #6、#7、#16 (d)）。實作時同步更新第 1 節（方法）、第 4 節（範圍）、第 5 節（端點一覽）與第 10 節。
+0.5.0〔草稿〕，**已實作**（`kairos/src/api/enroll.rs`、`kairos/src/enroll_cli.rs`；與本節不同之處見第 11.8、11.9 節）。8444 的協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，資料表與簽發流程見 [`PKI.md`](PKI.md)。本節的端點是主控台 S12（註冊 token）、S13（待核准）、S14（憑證）、S15（CA 與 CRL）、S21（註冊端點模式）的後端（設計包 §24 #6、#7、#16 (d)）。實作時同步更新第 1 節（方法）、第 4 節（範圍）、第 5 節（端點一覽）與第 10 節。
 
 ### 11.1 寫入權限：範圍與 `Permission`
 
@@ -623,7 +623,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | 409 | `invalid_state` | — | 對象的狀態不允許這個操作，`details.state` |
 | 400 | `confirmation_required` | — | L2／L3 缺少 `reason`、`expected_count` 或 `confirm` |
 | 403 | `license_exhausted` | `KRS-E7101` | 核准後會超過授權節點數，且沒有 `EnrollLicenseOverflow` |
-| 503 | `issuance_unavailable` | `KRS-E1302` | 線上簽發不可用（離線模式或私鑰無法使用）；核准仍會記錄，申請停在「已核准，待簽發」 |
+| 503 | `issuance_unavailable` | `KRS-E1302`／`KRS-E1303` | 線上簽發不可用：離線簽發模式為 `KRS-E1302`，線上模式但簽發 CA 私鑰無法使用為 `KRS-E1303`（設計包 INTEGRATION §27.3）；核准仍會記錄，申請停在「已核准，待簽發」 |
 
 ### 11.2 註冊 token（S12）
 
@@ -692,7 +692,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | `POST /api/v1/pki/signing-queue/import` | `PkiQueue` | 匯入 `kairos-signed-certs/v1`；逐張結果（`issued`／`rejected` 與原因） |
 | `GET /api/v1/pki/revocations/export` | `PkiQueue` | `kairos-revocations/v1`（離線產生 CRL 用） |
 
-簽發 CA 的建立、安裝、啟用與退役（L3）本衝刺只提供 CLI（第 11.6 節），API 之後再加。
+簽發 CA 的建立、安裝、啟用與退役（L3）本衝刺只提供 CLI（第 11.6 節），API 之後再加。`GET /api/v1/pki/ca` 的每個簽發 CA 另有 `expiry_warning`（剩餘天數低於門檻時為 `KRS-W1304`），頂層 `expiry_warning_days` 為門檻；`signing-queue/import` 不通過的項目附 `product_code: KRS-E1305`。
 
 ### 11.6 CLI
 
@@ -743,3 +743,26 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 - **結束代碼**（`cli-style.md` §8）：0 完成；1 資料庫錯誤或批次中有失敗；2 用法錯誤（含非互動缺少 `--yes`／`--expect-count`／`--confirm`）；3 設定錯誤（含被環境變數覆寫）；4 憑證錯誤（CA 憑證或私鑰有問題、匯入的憑證檢查不通過）；6 被拒絕（對象的狀態不允許，例如核准已結束的申請）；10 權限不足；11 衝突（資料庫被 `kairos reports import` 獨占、輸出檔已存在）。
 - **`--json` 的 `schema`**：`kairos.enroll-token.<動作>/v1`、`kairos.enroll.<動作>/v1`、`kairos.pki.<動作>/v1`。
 - 申請編號的輸入規則同 ENROLL.md 第 14.3 節（不分大小寫、連字號可省略）；同一個編號對到多筆待核准申請時（40 位元不保證唯一）列出候選並以結束代碼 2 要求改用 `request_id`。
+
+### 11.7 設定的來源與改用設定檔的值（S21；已決定（2026-10-14））
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/settings` | `read` | 每個設定鍵的 `value`、`source`（`env`／`console`／`file`／`default`）、`env_var`、`updated_by`、`updated_at`（主控台修改時）、`overridden[]`（較低優先層中與生效值不同的值：`source`、`value`）、`console_editable`、`pending_restart`（本版一律 `null`）。與 `kairos config show --effective --json` 相同 |
+| `POST /api/v1/settings/reset` | `enroll.*` 需 `EnrollModeWrite`，`pki.policy.*` 需 `CertPolicyWrite` | 本文 `keys`（設定鍵陣列）：「改用設定檔的值」＝刪除 `settings` 的鍵（L1，寫入稽核）；被環境變數覆寫時 409 `locked_by_environment`。回 `results[]`（`key`、`was_console`） |
+
+- 優先順序：環境變數 ＞ 主控台（資料庫 `settings`）＞ `kairos.toml` ＞ 內建預設。可從主控台修改的鍵：`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`、`pki.policy.*`。
+- `GET /api/v1/enroll/mode` 另帶 `downloads`（`available`、`reason`、`alternative`）：本版下載端點回 404，主控台據此隱藏一行指令與下載連結（設計包 INTEGRATION §27.4 #3）；token 建立回應的 `downloads`、token 列表的 `meta.downloads` 相同。同一個回應另有 `stats`（啟動以來的請求、429、封鎖、時鐘被拒、握手前關閉、簽發的計數；S20 的資料來源，系統健康的整合之後再做）。
+
+### 11.8 實作與本節的差異
+
+- 列表（token、申請、憑證）以 `limit`（1～1,000，預設 100）回傳前 N 筆與 `page.total`，`page.next_cursor` 一律為 `null`；游標分頁之後加入。
+- 未實作：`POST /api/v1/pki/crl`（上傳 CRL）、`GET /api/v1/pki/revocations/export`（離線模式的 CRL 工具，PKI.md 第 13 節）。
+- token 的 JSON 有 `hint` 與 `token_hint`（相同的值，只有前 4 碼 `KRT1-XXXX…`）；建立時另有完整的 `token`（只出現這一次）、`install_string`、`ca_pin`、`ca_pin_display`、`agent_endpoint`、`enroll_endpoint`、`enroll_mode`、`auto_pause_cleared`、`downloads`。
+- 拒絕、撤銷的 L2 確認以 `expected_count` 進行；切換到 `closed` 一律需要 `impact_token`（L2 時另需 `reason`）。
+
+### 11.9 CLI 與第 11.6 節的差異
+
+- `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes]`。
+- `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
+- 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
