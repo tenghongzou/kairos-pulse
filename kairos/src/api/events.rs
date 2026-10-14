@@ -187,6 +187,29 @@ pub fn event_of(change: &HostChange, is_new: bool) -> (&'static str, Value) {
     (kind, data)
 }
 
+/// 告警的變化 → 事件（直到關機）：`alert.created`、`alert.updated`、`alert.resolved`，`data` 為事件的摘要
+/// （`kairos/API.md` 第 12.6 節）。落後時送出 `resync`
+pub async fn alert_pump(
+    mut rx: broadcast::Receiver<crate::alerts::engine::Change>,
+    hub: Arc<EventHub>,
+    shutdown: Arc<Shutdown>,
+) {
+    loop {
+        let change = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            c = rx.recv() => c,
+        };
+        match change {
+            Ok(c) => {
+                hub.publish(c.kind, c.event);
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => hub.resync_all("overflow"),
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// 狀態表的變化 → 事件（直到關機）。`mark_known` 回傳這台主機是否第一次出現（`host.added`）
 pub async fn pump(
     mut rx: broadcast::Receiver<HostChange>,
