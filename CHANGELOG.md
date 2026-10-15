@@ -113,6 +113,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **安全標頭**：主控台的每個回應帶 HSTS、`X-Content-Type-Options`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、COOP／CORP、`Permissions-Policy` 與 CSP（網頁：`script-src 'self'`、`style-src 'self'`、`frame-ancestors 'none'`、`require-trusted-types-for 'script'`；API：`default-src 'none'`）。
 - **設計 token**：`kairos/web/assets/tokens.css` 為設計包 `design-system/tokens.css` 的複本，`cargo test` 檢查與記錄的 SHA-256 相同（找得到設計包時逐位元組比對）；`kairos/web/tools/sync-design.mjs` 重新複製並產生錯誤代碼的資料。
 - **端對端測試**：`kairos/web/tests/run.sh`（Playwright＋axe，不在 `cargo test` 中）對真的 Kairos 執行 12 個流程（CSP、XSS、RBAC、兩步驟驗證、鍵盤、即時更新、深色主題、窄螢幕…），axe 0 違規。
+- **註冊與憑證畫面**（S12～S15）：註冊 token（建立時只顯示一次、之後只顯示前 4 碼；下載端點未提供時改顯示 `pulse enroll --install-string`；停用；部署進度漏斗）、待核准（全選只選無異常、批次核准 L1、拒絕 L2、申請詳情、最近結束）、憑證（狀態 KpiTile、撤銷 L2、寬限期內／需重新註冊、允許再次自動續簽、建立限定主機的 token、待簽發的 CSR 佇列匯出與匯入）、CA 與撤銷清單（CRL 狀態與 nextUpdate、立即更新 CRL、簽發 CA 與 `KRS-W1304`、`KRS-E1303`）。按鈕依 `enroll:*`、`pki:*` 權限顯示。`GET /api/v1/pki/certificates` 另帶 `hostname`、`group`，`q` 也比對主機名稱（`kairos/API.md` 第 11.8 節）。端對端測試另啟動一個 mTLS＋註冊端點的 Kairos，以實際的 `pulse` 註冊。
 
 #### 變更
 

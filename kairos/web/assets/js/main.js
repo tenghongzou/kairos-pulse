@@ -28,6 +28,11 @@ const ROUTES = [
   { path: '/hosts', permAny: 'hosts:read', title: 'hosts.title', load: () => import('./screens/hosts.js') },
   { path: '/hosts/:id/:tab?', permAny: 'hosts:read', title: 'nav.hosts', load: () => import('./screens/host-detail.js') },
   { path: '/account', session: true, title: 'account.title', load: () => import('./screens/account.js') },
+  // 註冊與憑證（S12～S15）
+  { path: '/enrollment/pending', perm: 'enroll:read', title: 'enroll.title', load: () => import('./screens/enroll-pending.js') },
+  { path: '/enrollment/tokens/:id?', perm: 'enroll:read', title: 'token.title', load: () => import('./screens/enroll-tokens.js') },
+  { path: '/certificates/ca', perm: 'pki:read', title: 'ca.title', load: () => import('./screens/pki-ca.js') },
+  { path: '/certificates/:serial?', perm: 'pki:read', title: 'cert.title', load: () => import('./screens/pki-certs.js') },
 ];
 
 const appRoot = document.getElementById('app');

@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { FakeAgent } from './fake-agent.mjs';
+import { pkiTests } from './e2e-pki.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -507,6 +508,9 @@ test('帳號鎖定的訊息（KRS-E6003）與帳號密碼錯誤（KRS-E6001）',
   await ctx.close();
 });
 
+
+// 註冊與憑證（S12～S15）：第二個 Kairos（tests/pki-env.sh）
+pkiTests({ test, newPage, axe, shot });
 
 // ---------------------------------------------------------------------------
 async function main() {

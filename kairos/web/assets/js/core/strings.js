@@ -6,6 +6,8 @@
 // - 狀態標籤不得改寫：線上、警告、嚴重、離線、未知、待核准；告警嚴重度：緊急、嚴重、警告、資訊。
 // - 錯誤代碼（KRS-…）的三段式不在這裡：由 error-codes.js（設計包 copywriting.md §3.3、§4.2 產生）提供。
 
+import { PKI_STRINGS } from './strings-pki.js';
+
 const M = {
   // ---- 共用 ----
   'common.loading': '載入中…',
@@ -550,6 +552,7 @@ const M = {
   'account.apiTokens': 'API token',
   'account.apiTokensNote': '需要 API token 時請洽管理員（這個版本由管理員以「屬於使用者」的方式建立）。',
 };
+Object.assign(M, PKI_STRINGS); // 註冊與憑證（S12～S15）的文字在 strings-pki.js
 
 /** 文字；缺少 key 時回傳 key 本身並記錄錯誤（Playwright 測試檢查主控台沒有錯誤） */
 export function t(key, params) {
