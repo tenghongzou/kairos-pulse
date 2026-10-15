@@ -18,6 +18,7 @@
 //! | 18 | [`rotation_over_8443_supersedes_the_old_certificate`] |
 //! | 19 | [`decommission_then_only_deregister_is_accepted`] |
 //! | 20 | [`new_pulse_against_a_kairos_without_8444`] |
+//! | —（0.8.0） | [`pki_init_then_install_string_registers_and_the_service_connects`]：`kairos pki init` 產生的 PKI |
 //!
 //! #13（重放在 Kairos 重新啟動後仍被拒）、#6（時鐘偏差）在 `enroll.rs` 以測試用的 HTTPS 用戶端涵蓋
 //! （需要原樣重送同一個請求、或改變送出時間，實際的 Pulse 不會這麼做）。
@@ -779,5 +780,63 @@ fn offline_signing_export_sign_import_then_the_service_connects() {
     svc.wait_for(PULSE_REGISTERED, WAIT);
     assert_eq!(host.enrollment()["request_code"], code_p.as_str());
     svc.stop();
+    kairos.stop();
+}
+
+/// `kairos pki init`（kairos/PKI.md 第 15 節）：不經 openssl，PKI 全部由 Kairos 產生，設定只照 init 印出的
+/// 建議值填寫；Pulse 以安裝字串（CA 指紋＝init 的根 CA）註冊，服務以 mTLS 連上 8443。
+/// 第二次 init 被拒（不覆寫）；線上模式的 `kairos pki gencrl` 在 Kairos 執行中也可以使用
+#[test]
+fn pki_init_then_install_string_registers_and_the_service_connects() {
+    let (env, init) = Env::from_pki_init("ep-pki-init");
+    let pin = init["data"]["root"]["pin"].as_str().unwrap().to_string();
+    if cfg!(unix) {
+        assert_eq!(mode_of(&env.dir.join("root-ca")), Some(0o700));
+        assert_eq!(
+            mode_of(&env.dir.join("root-ca").join("root-ca.key")),
+            Some(0o600)
+        );
+        assert_eq!(
+            mode_of(&env.dir.join("data").join("pki").join("server.key")),
+            Some(0o600)
+        );
+    }
+    let mut kairos = env.start();
+    let t = env.token_doc("auto", &[]);
+    let install = t["install_string"].as_str().unwrap().to_string();
+    assert_eq!(t["ca_pin"].as_str(), Some(pin.as_str()), "{t}");
+
+    let host = PulseHost::new(&env, "pulse");
+    let (code, doc, p) = host.enroll(&["--install-string", &install]);
+    assert_eq!(code, 0, "{}\n{}", p.dump(), kairos.dump());
+    assert_eq!(doc["data"]["result"], "registered", "{doc}");
+    let mut svc = host.start();
+    svc.wait_for(PULSE_REGISTERED, WAIT);
+    let mut last = Value::Null;
+    let online = kp_e2e::poll_until(WAIT, || {
+        let (code, d) = host.status();
+        last = d;
+        code == 0 && last["data"]["connection"]["state"] == "registered"
+    });
+    assert!(online, "pulse status 應為線上：{last:#}\n{}", svc.dump());
+    assert_eq!(last["data"]["connection"]["mtls"], true, "{last:#}");
+
+    // 線上模式的 gencrl（與主控台「立即產生 CRL」相同）；第二次 init 不覆寫
+    let (code, p) = env.cli(&["pki", "gencrl"]);
+    assert_eq!(code, 0, "{}", p.dump());
+    assert!(p.stdout().contains("CRL"), "{}", p.dump());
+    let (code, p) = env.cli(&[
+        "pki",
+        "init",
+        "--name",
+        "localhost",
+        "--root-dir",
+        "root-ca-2",
+    ]);
+    assert_eq!(code, 11, "{}", p.dump());
+    assert!(!env.dir.join("root-ca-2").join("root-ca.key").exists());
+
+    let (code, _) = svc.stop();
+    assert_eq!(code, 0, "{}", svc.dump());
     kairos.stop();
 }

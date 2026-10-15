@@ -18,7 +18,7 @@
 | 5 | 用戶端憑證 365 天（D2）、序號 16 bytes 隨機值、`notBefore` 往前 10 分鐘 | — | 已定（D2） |
 | 6 | **離線簽發模式**（`pki.mode = "offline"`）：不在線上持有任何 CA 私鑰，核准後匯出 CSR 佇列、在 CA 主機簽發、再匯入 | 不是預設 | **已決定（2026-10-14）**：可切換的選項，**不是**高安全場域的預設；需要時由管理者明確設定 |
 | 7 | Kairos 自己產生並載入簽發 CA 的 CRL（每次撤銷與每 24 小時），不再需要 `kairos-crl.timer`（離線模式仍需要） | — | 技術決定 |
-| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **已決定（2026-10-14）**：`pki init` 延後到首次啟動精靈（S02） |
+| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **已決定（2026-10-14）**：`pki init` 延後到首次啟動精靈（S02）。**0.8.0〔草稿〕已實作 CLI 版**（第 15 節；商業審計 O5）：根 CA 私鑰以明文 0600 寫在指定目錄、提示移到離線保存，加密匯出仍待精靈 |
 | 9 | 續簽重放快取持久化、除役 10 分鐘視窗以「延後生效的撤銷」實作 | — | 技術決定（ENROLL.md 第 18 節，安全審查的處置） |
 | 10 | 主控台變更的註冊端點模式與憑證政策存在資料庫的 `settings` 表，**優先於 `kairos.toml`**；以 `kairos config show --effective` 查詢實際生效值與每一項的來源 | — | **已決定（2026-10-14）**：設計包 #14 要求寫回 `kairos.toml`，精靈實作時再評估是否統一 |
 | 11 | 註冊 token 的列表與詳情只顯示**前 4 碼**（`KRT1-GE8Q…`），不顯示後 4 碼 | — | **已決定（2026-10-14）**：ENROLL.md 第 18 節第 5 項 |
@@ -439,10 +439,89 @@ KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_
 | 8 | 列表的游標分頁 | 註冊與憑證的管理端點以 `limit`（1～1,000）回傳前 N 筆與總數，`next_cursor` 一律為 `null`（之後加入） |
 | 9 | 8443 的 `renew`／`deregister` 訊息 | 0.5.0 整合時已移入 `kairos-proto`（PROTOCOL.md「憑證輪替與除役」），兩個產品使用共用型別（第 14 節） |
 
-**延後**：`kairos pki certificates import`（手動憑證匯入簽發紀錄）、離線模式的 CRL 工具（`kairos pki revocations export`、`kairos pki gencrl --revocations`、`kairos pki crl upload` 與 `POST /api/v1/pki/crl`）、`GET /api/v1/pki/revocations/export`、下載端點（`/agent/`，回 404；主控台 API 的 `downloads.available = false`）、暫時放寬的管理（`enroll_relaxations` 只有讀取）、解除 L7 封鎖的端點、L11、S20 系統健康的「註冊端點」區塊（計數先放在 `GET /api/v1/enroll/mode` 的 `stats`）、`KRS-W2009`、`KRS-W1115` 的彙總事件。
+**延後**：`kairos pki certificates import`（手動憑證匯入簽發紀錄）、離線模式的 CRL 上傳（`kairos pki crl upload` 與 `POST /api/v1/pki/crl`；0.8.0 起 `kairos pki revocations export`、`kairos pki gencrl --revocations` 已實作，產生的 CRL 以 `auth.crl` 部署，第 15 節）、`GET /api/v1/pki/revocations/export`、下載端點（`/agent/`，回 404；主控台 API 的 `downloads.available = false`）、暫時放寬的管理（`enroll_relaxations` 只有讀取）、解除 L7 封鎖的端點、L11、S20 系統健康的「註冊端點」區塊（計數先放在 `GET /api/v1/enroll/mode` 的 `stats`）、`KRS-W2009`、`KRS-W1115` 的彙總事件。
 
 ## 14. 與 Pulse 端合併（已完成，0.5.0 整合）
 
 - **8443 的訊息型別**：`renew_request`、`renew_result`、`deregister`、`deregister_ack`、`hello.intent`、`hello_ack.expired_renew_grace_days`／`renew_now` 與錯誤碼 `renew_requires_approval`、`invalid_csr`、`rate_limited` 已移入 `kairos-proto`（`lifecycle` 模組、`ClientMsg`／`ServerMsg` 的變體、`ErrorCode`；ENROLL.md 第 13 節移入 PROTOCOL.md「憑證輪替與除役」）。Kairos 的 `enroll/agent.rs` 不再自行解析或以字串組 JSON；`deregister` 依規格必須帶 `seq` 等全部欄位（合併前接受的省略寫法不再接受，回 fatal 的 `bad_request`）。
 - **8443 的 features**：Kairos 只在 hello 宣告了 `renew`／`deregister` 時把它們列進 `hello_ack.features`（沒有宣告的 0.4 以前 Pulse 收到的 `hello_ack` 與 0.4 相同）。沒有協商時 `renew_request`／`deregister`（含欄位不合法的）回 `unknown_type`，與 0.4 相同。8444 `server-info` 的 `features` 一律列出 Kairos 支援的全部（`metrics`、`durable`、`renew`、`deregister`）。
 - **測試掛鉤**（debug 建置）：`KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_AUTO_PAUSE_SECS`、`KAIROS_TEST_DROP_ENROLL_RESPONSES`、`KAIROS_TEST_DROP_RENEWAL_RESPONSES`（`src/testhooks.rs`）。端對端情境的對應見 ENROLL.md 第 19.5 節。
+
+## 15. 管理者的 CA 工具（0.8.0〔草稿〕；商業審計 O5）
+
+`kairos pki init`、`kairos pki sign`、`kairos pki gencrl`、`kairos pki revocations export`（實作 `kairos/src/pki/ca.rs`、`kairos/src/pki_cli.rs`）取代 INSTALL 舊版以 openssl 手寫 `ca.cnf` 的流程。與 8444 的線上簽發、主控台 S15 共用同一套程式碼與儲存：
+
+| 共用的部分 | 位置 |
+|---|---|
+| 用戶端憑證範本（第 5.1 節） | `issue::client_params`（線上簽發、`sign-bundle`、`pki sign --profile client`） |
+| CRL 的產生 | `issue::crl_der`（線上簽發 CA、離線的 `pki gencrl`）；線上模式的 `pki gencrl` 直接呼叫主控台「立即產生 CRL」的 `PkiManager::regenerate_crl` 與 `write_crl_file`（`pki_crls`、`data/pki/crl/issuing.crl`） |
+| 代理簽發 CA 的建立與安裝 | `manage::create`／`manage::install`（`pki_cas`、`data/pki/issuing-<ca_id>.key`），與 `issuing-ca new|install` 相同 |
+| 信任錨檔 | `PkiManager::sync_cas` 寫出的 `data/pki/issuing-cas.pem` |
+| 稽核 | `audit_events`（`pki.init`、`crl.generate`；雜湊鏈，API.md 第 12.8 節） |
+
+### 15.1 `kairos pki init`（新安裝）
+
+以服務帳號在 Kairos 主機執行一次：
+
+```bash
+sudo -u kairos /opt/kairos/kairos pki init --config /opt/kairos/kairos.toml \
+  --name monitor.example.com --name 10.0.0.5 --root-dir /opt/kairos/root-ca
+```
+
+| 步驟 | 產出 |
+|---|---|
+| 1 根 CA | ECDSA P-384、`CN=<組織> Kairos Root CA`、`CA:TRUE, pathlen:1`（critical）、`keyCertSign, cRLSign`（critical）、10 年。私鑰 `<root-dir>/root-ca.key`（0600，目錄 0700）、憑證 `<root-dir>/root-ca.pem` 與 `data/pki/root-ca.pem` |
+| 2 伺服器憑證 | ECDSA P-256 私鑰 `data/pki/server.key`（0600）、憑證 `data/pki/server.pem`：CN＝第一個名稱、SAN＝所有 `--name`（DNS 或 IP）、`CA:FALSE`（critical）、`digitalSignature`（critical）、EKU `serverAuth`、825 天（`--server-days`） |
+| 3 代理簽發 CA | `manage::create` → 以根 CA 簽發（第 5.2 節的範本，5 年）→ `manage::install`（第一個，自動啟用） |
+| 4 信任錨 | `data/pki/issuing-cas.pem` |
+
+建議的設定（init 也會印出；deb／rpm 的預設 `kairos.toml` 已是這些路徑，見 INSTALL）：
+
+```toml
+[server]
+cert_path = "data/pki/server.pem"
+key_path = "data/pki/server.key"
+[auth]
+client_ca = "data/pki/issuing-cas.pem"   # 只信任 Kairos 管理的簽發 CA（不是根 CA）
+[pki]
+mode = "online"
+server_ca_path = "data/pki/root-ca.pem"
+```
+
+- **`auth.client_ca` 指向 `issuing-cas.pem` 而不是根 CA**：以根 CA 當 `auth.client_ca` 時，`auth.client_ca` 這組驗證器沒有 CRL，持有已**退役**簽發 CA 簽發的憑證、並自行附上該簽發 CA 憑證的用戶端，可以經由根 CA 這條鏈通過驗證（第 10 節的分組只對狀態為 `active`／`trusted` 的簽發 CA 生效）。`issuing-cas.pem` 由 Kairos 依狀態重寫，退役的 CA 立即移除。第 9 節「改為線上」的既有部署（代理 CA 在 `auth.client_ca`）有同樣的情況，見第 15.4 節。
+- **覆寫保護**：資料庫已有任何簽發 CA、或任何一個要寫出的檔案已存在時拒絕（結束代碼 11），不會產生第二個根 CA。根 CA 目錄不得在 `storage.data_dir` 之下（資料目錄會被備份、診斷包會列出檔名）。
+- **根 CA 私鑰**：init 之後在這台伺服器上，印出 `KRS-W1306`〔暫定〕要求立即複製到離線媒體並刪除（`shred -u`）。之後簽發伺服器憑證或新的簽發 CA 時在離線主機以 `kairos pki sign` 使用它。私鑰以明文 PKCS#8（0600）寫出；加密匯出（設計包 S02「加密下載後刪除」）留給首次啟動精靈。
+- 稽核：`pki.init`（根 CA 的 subject 與指紋、伺服器憑證序號與 SAN、簽發 CA 編號、根 CA 私鑰路徑）。
+
+### 15.2 `kairos pki sign`（CA 主機）
+
+| `--profile` | 輸入 | 範本 | 預設／上限天數 |
+|---|---|---|---|
+| `server` | `--csr`（P-256／P-384／RSA）或 `--new-key <檔案>`（在這裡產生 P-256 私鑰，0600）；`--name`（可重複） | 第 15.1 節步驟 2 | 825／825 |
+| `issuing-ca` | `--csr`（`issuing-ca new` 產生的，必須是 P-256） | 第 5.2 節；簽發者帶 `pathlen:0` 時拒絕 | 1825／1825 |
+| `client` | `--csr`（P-256）、`--agent-id` | 第 5.1 節（與線上簽發相同；CSR 的 CN 與 `--agent-id` 不同時拒絕） | 365／825 |
+
+- 簽發者（`--ca-cert`、`--ca-key`）：ECDSA P-256、P-384 或 RSA（未加密的 PKCS#8 PEM；舊的 `BEGIN RSA PRIVATE KEY` 以 `openssl pkcs8 -topk8 -nocrypt` 轉換）。必須是 CA、與私鑰成對、`keyUsage` 有 `keyCertSign`（有 `keyUsage` 時）、在有效期間內；有效期間一律截在簽發者的 `notAfter` 之前。CSR 必須通過自身的簽章驗證，擴充欄位一律不複製。
+- 私鑰檔的權限：群組或其他使用者有任何權限時拒絕（`KRS-E1307`〔暫定〕，結束代碼 4）。輸出檔與 `--new-key` 已存在時拒絕（結束代碼 11）。
+- 紀錄：簽發前在 CA 私鑰所在的目錄附加一行 JSON 到 `kairos-ca.log`（0600；時間、執行者、`sign`、profile、序號、簽發者與其公鑰雜湊、SAN／subject／agent_id、`notAfter`、輸出檔）；寫不進去時不簽發。
+- `--profile client` 簽出的憑證不在 Kairos 的簽發紀錄（S14）中；需要在主控台管理時改用註冊通道。
+
+### 15.3 `kairos pki gencrl` 與 `kairos pki revocations export`
+
+| 用法 | 說明 |
+|---|---|
+| `kairos pki gencrl`（Kairos 主機，線上模式） | 立即重新產生每個持有私鑰的簽發 CA 的 CRL（`source = manual`），寫入 `pki_crls` 與 `data/pki/crl/issuing.crl`，稽核 `crl.generate`。與主控台 S15「立即產生 CRL」同一個函式。這是 CLI 唯一讀取簽發 CA 私鑰的命令（第 3 節「誰讀私鑰」的例外，與常駐行程以資料庫交易排序，CRL 版本不會重複）；執行中的 Kairos 在下一次 TLS 重載載入 |
+| `kairos pki revocations export --ca-cert <CA>`（Kairos 主機，離線模式） | `kairos-revocations/v1`：`issuer`、`issuer_spki_sha256`、`revoked[]`（`serial`、`agent_id`、`revoked_at`〔RFC 3339〕、`reason`）。只列出由該 CA 簽發（以憑證的 issuer 比對）、撤銷已生效、憑證過期未超過 1 天的。不含秘密、不改變狀態 |
+| `kairos pki gencrl --ca-cert … --ca-key … [--revocations <檔案>] --out <檔案> [--days 30]`（CA 主機） | 產生 PEM 的 CRL。撤銷清單必須是同一個 CA 匯出的（公鑰雜湊相同）。不帶 `--revocations` 時產生空的 CRL（取代舊 INSTALL 的第一份 `openssl ca -gencrl`）。CRL 版本＝Unix 秒數，且大於 `kairos-ca.log` 中同一個 CA 的最後一版（時鐘倒退時仍遞增）。`nextUpdate` 截在 CA 的 `notAfter` 之前。產生的 CRL 以 `auth.crl` 部署（Kairos 在重載週期載入）；`kairos pki crl upload` 仍未實作 |
+
+### 15.4 待使用者決定
+
+1. **既有部署以代理 CA（或根 CA）當 `auth.client_ca`**（第 9 節「改為線上」、INSTALL 舊版 6.5）：如第 15.1 節所述，退役的簽發 CA 簽出的憑證在用戶端自行附上中繼憑證時仍可經由這組驗證器通過。建議：(a) INSTALL 的升級步驟改為把 `auth.client_ca` 改成 `data/pki/issuing-cas.pem` 加上仍需要的舊代理 CA；或 (b) 在 `CompositeVerifier` 中拒絕「鏈經過已退役簽發 CA」的憑證（需要保留退役 CA 的 subject）。本衝刺只在新安裝（`pki init`）採用 (a)。
+2. **根 CA 私鑰的加密保存**：目前明文 0600＋提示。建議沿用 `keys_backup.rs` 的 Argon2id＋AES-256-GCM 格式加上 `--encrypt-root`，`pki sign` 支援讀取加密的私鑰。
+
+### 15.5 新的產品代碼〔暫定〕
+
+| 代碼 | 等級 | 何時 |
+|---|---|---|
+| `KRS-W1306` | 警告 | `pki init` 完成時：根 CA 私鑰仍在這台伺服器上 |
+| `KRS-E1307` | 錯誤 | `pki sign`、離線 `pki gencrl`：CA 憑證或私鑰無法使用（權限過寬、不成對、不是 CA、沒有 `keyCertSign`／`cRLSign`、已過期、格式不支援） |
