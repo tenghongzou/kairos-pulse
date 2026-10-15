@@ -209,6 +209,14 @@ registerProvider({
 
 每個主要畫面在淺色與深色主題各跑一次 axe（目標 0 違規），截圖在 `OUT_DIR`。
 
+**結束代碼**：任何測試失敗、任何 axe 違規、瀏覽器主控台錯誤、或沒有執行任何測試（`ONLY` 打錯）時，`run.sh` 以非 0 結束（`e2e.mjs` 最後一行寫出原因）；全部通過才是 0。CI 只看結束代碼即可。自我檢查（確認失敗真的會被抓到）：
+
+```sh
+SELFTEST=fail ONLY=自我檢查 bash kairos/web/tests/run.sh; echo "exit=$?"   # 應為 exit=1
+SELFTEST=axe  ONLY=自我檢查 bash kairos/web/tests/run.sh; echo "exit=$?"   # 應為 exit=1（有 axe 違規）
+ONLY=不存在的名稱       bash kairos/web/tests/run.sh; echo "exit=$?"     # 應為 exit=1（沒有執行任何測試）
+```
+
 ## 8. 0.7.0 的範圍與隱藏的元素
 
 | 畫面 | 有 | 隱藏或標示（原因） |
