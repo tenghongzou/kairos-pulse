@@ -589,6 +589,205 @@ pub fn impact(conn: &Connection, grace_days: u32, now_ms: i64) -> Result<Impact,
     Ok(Impact { n, m, l, r, t })
 }
 
+/// 最早受影響的主機最多列出幾台（設計包 S14「列出 K 台與最早受影響的主機」）
+pub const GRACE_IMPACT_LIST: usize = 10;
+
+/// 縮短過期寬限期的影響（設計包 `screens.md` S14「儲存過期寬限期時的確認」、`README.md` D11）。
+///
+/// 寬限期在續簽當下判斷，縮短會立即影響已過期的主機：**K** ＝目前在寬限期內、以新的寬限期計算已經結束、
+/// 也沒有個別延長（「允許再次自動續簽」）的主機。K＞0 時是 L2（輸入「停止續簽 K 台」，原因必填）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraceImpact {
+    pub from_days: u32,
+    pub to_days: u32,
+    pub k: i64,
+    /// 最早受影響的主機（依原本寬限期的結束時間排序，最多 [`GRACE_IMPACT_LIST`] 台）：
+    /// (agent_id, 主機名稱, 憑證到期, 原本寬限期的結束)
+    pub earliest: Vec<(String, String, i64, i64)>,
+}
+
+/// 計算把寬限期由 `from_days` 改為 `to_days` 的影響（不是縮短時 K＝0）
+pub fn grace_impact(
+    conn: &Connection,
+    from_days: u32,
+    to_days: u32,
+    now_ms: i64,
+) -> Result<GraceImpact, OpError> {
+    let mut out = GraceImpact {
+        from_days,
+        to_days,
+        k: 0,
+        earliest: Vec::new(),
+    };
+    if to_days >= from_days {
+        return Ok(out);
+    }
+    let (from_ms, to_ms) = (
+        i64::from(from_days) * 86_400_000,
+        i64::from(to_days) * 86_400_000,
+    );
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, COALESCE(NULLIF(h.display_name, ''), h.hostname), c.not_after, h.grace_override_until
+         FROM hosts h JOIN pki_certificates c ON c.serial = h.current_serial
+         WHERE h.lifecycle = 'active' AND c.revoked_at IS NULL AND c.not_after <= ?1",
+    )?;
+    let rows = stmt.query_map([now_ms], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    let mut hit = Vec::new();
+    for row in rows {
+        let (agent_id, name, not_after, override_until) = row?;
+        if override_until.is_some_and(|u| u > now_ms) {
+            continue;
+        }
+        let in_grace_now = now_ms < not_after + from_ms;
+        let in_grace_after = now_ms < not_after + to_ms;
+        if in_grace_now && !in_grace_after {
+            hit.push((agent_id, name, not_after, not_after + from_ms));
+        }
+    }
+    hit.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
+    out.k = hit.len() as i64;
+    hit.truncate(GRACE_IMPACT_LIST);
+    out.earliest = hit;
+    Ok(out)
+}
+
+/// 會讓主機無法續簽的設定變更（關閉註冊端點、縮短寬限期）的影響與確認 token。
+///
+/// `PUT /api/v1/pki/policy` 與 `POST /api/v1/settings/reset`（「改用設定檔的值」）共用：送出前以
+/// `GET …/impact` 取得數字與 `impact_token`，送出時伺服器重新計算，不符時 409 `impact_changed`（同第 11.4 節）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeImpact {
+    /// 註冊端點模式由非關閉改為關閉時：(原本的模式, 切換到關閉的影響)
+    pub closing: Option<(EnrollMode, Impact)>,
+    /// 寬限期縮短時
+    pub grace: Option<GraceImpact>,
+}
+
+impl ChangeImpact {
+    /// 是否需要 `impact_token`（關閉註冊端點或縮短寬限期）
+    pub fn required(&self) -> bool {
+        self.closing.is_some() || self.grace.as_ref().is_some_and(|g| g.to_days < g.from_days)
+    }
+
+    /// 會停止續簽的台數：關閉時 N＋M（寬限期內的主機已包含在 N 中），否則 K
+    pub fn count(&self) -> i64 {
+        match (&self.closing, &self.grace) {
+            (Some((_, i)), _) => i.n + i.m,
+            (None, Some(g)) => g.k,
+            (None, None) => 0,
+        }
+    }
+
+    /// 確認等級與 L2 的確認字串（「停止續簽 K 台」，與 S21 關閉註冊端點相同）
+    pub fn level(&self) -> (&'static str, Option<String>) {
+        let n = self.count();
+        if n > 0 {
+            ("L2", Some(format!("停止續簽 {n} 台")))
+        } else {
+            ("L1", None)
+        }
+    }
+
+    pub fn token(&self, window: i64) -> String {
+        let closing = self.closing.as_ref().map_or_else(String::new, |(from, i)| {
+            format!("{}>{}|{}|{}|{}|{}", from.as_str(), i.n, i.m, i.l, i.r, i.t)
+        });
+        let grace = self.grace.as_ref().map_or_else(String::new, |g| {
+            format!("{}>{}|{}", g.from_days, g.to_days, g.k)
+        });
+        let text = format!("change|{closing}|{grace}|{window}");
+        kairos_proto::enroll::sha256_hex(text.as_bytes())[..24].to_string()
+    }
+
+    /// `impact_token` 是否仍符合目前的數字（目前或前一個時間窗）
+    pub fn verify(&self, token: &str, now_ms: i64) -> bool {
+        let w = now_ms / IMPACT_WINDOW_MS;
+        token == self.token(w) || token == self.token(w - 1)
+    }
+
+    pub fn json(&self, now_ms: i64) -> Value {
+        let (level, confirm) = self.level();
+        json!({
+            "required": self.required(),
+            "count": self.count(),
+            "level": level,
+            "confirm_text": confirm,
+            "impact_token": self.token(now_ms / IMPACT_WINDOW_MS),
+            "mode": self.closing.as_ref().map(|(from, i)| json!({
+                "from": from.as_str(),
+                "to": "closed",
+                "N": i.n, "M": i.m, "L": i.l, "R": i.r, "T": i.t,
+            })),
+            "grace": self.grace.as_ref().map(|g| json!({
+                "from_days": g.from_days,
+                "to_days": g.to_days,
+                "K": g.k,
+                "earliest": g.earliest.iter().map(|(id, name, not_after, ends)| json!({
+                    "agent_id": id,
+                    "hostname": name,
+                    "not_after": crate::api::http::ts_ms(*not_after),
+                    "grace_ends_at": crate::api::http::ts_ms(*ends),
+                })).collect::<Vec<_>>(),
+            })),
+        })
+    }
+
+    /// 稽核紀錄的 `impact`
+    pub fn audit_json(&self) -> Value {
+        json!({
+            "mode": self.closing.as_ref().map(|(from, i)| json!({"from": from.as_str(), "N": i.n, "M": i.m, "L": i.l, "R": i.r, "T": i.t})),
+            "grace": self.grace.as_ref().map(|g| json!({"from_days": g.from_days, "to_days": g.to_days, "K": g.k})),
+        })
+    }
+}
+
+/// 確認過的影響（寫入稽核：等級、原因、確認時的數字）
+#[derive(Debug, Clone, Copy)]
+pub struct Confirmed<'a> {
+    pub level: &'a str,
+    pub reason: Option<&'a str>,
+    pub impact: &'a ChangeImpact,
+}
+
+impl Confirmed<'_> {
+    fn add_to(&self, d: &mut serde_json::Map<String, Value>) {
+        d.insert("level".into(), json!(self.level));
+        d.insert("reason".into(), json!(self.reason));
+        d.insert("impact".into(), self.impact.audit_json());
+    }
+}
+
+/// 由目前與變更後的生效值計算影響（關閉註冊端點、縮短寬限期；其他變更沒有影響）
+pub fn change_impact(
+    conn: &Connection,
+    before: &settings::Effective,
+    after: &settings::Effective,
+    now_ms: i64,
+) -> Result<ChangeImpact, OpError> {
+    let mut out = ChangeImpact::default();
+    if after.mode == EnrollMode::Closed && before.mode != EnrollMode::Closed {
+        out.closing = Some((
+            before.mode,
+            impact(conn, before.policy.expired_renew_grace_days, now_ms)?,
+        ));
+    }
+    let (from, to) = (
+        before.policy.expired_renew_grace_days,
+        after.policy.expired_renew_grace_days,
+    );
+    if to < from {
+        out.grace = Some(grace_impact(conn, from, to, now_ms)?);
+    }
+    Ok(out)
+}
+
 /// 修改模式與自動暫停（寫入 `settings` 與稽核）。`expected` 為 L2 時確認過的影響數字
 #[allow(clippy::too_many_arguments)]
 pub fn set_mode(
@@ -663,6 +862,7 @@ pub fn set_policy(
     values: &[(&'static str, Value)],
     by: &str,
     actor_ip: Option<&str>,
+    confirmed: Option<&Confirmed<'_>>,
     now_ms: i64,
 ) -> Result<(), OpError> {
     for (k, v) in values {
@@ -682,12 +882,16 @@ pub fn set_policy(
             action: "policy.change",
             object: Some("pki.policy"),
             result: "ok",
-            details: Some(Value::Object(
-                values
+            details: Some({
+                let mut d: serde_json::Map<String, Value> = values
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), v.clone()))
-                    .collect(),
-            )),
+                    .collect();
+                if let Some(c) = confirmed {
+                    c.add_to(&mut d);
+                }
+                Value::Object(d)
+            }),
             ..Audit::default()
         },
     )?;
@@ -701,6 +905,7 @@ pub fn reset_settings(
     keys: &[String],
     by: &str,
     actor_ip: Option<&str>,
+    confirmed: Option<&Confirmed<'_>>,
     now_ms: i64,
 ) -> Result<Vec<(String, bool)>, OpError> {
     for k in keys {
@@ -728,7 +933,14 @@ pub fn reset_settings(
                 action: "setting.reset",
                 object: Some(k),
                 result: if existed { "ok" } else { "rejected" },
-                details: Some(json!({"existed": existed})),
+                details: Some({
+                    let mut d = serde_json::Map::new();
+                    d.insert("existed".into(), json!(existed));
+                    if let Some(c) = confirmed {
+                        c.add_to(&mut d);
+                    }
+                    Value::Object(d)
+                }),
                 ..Audit::default()
             },
         )?;
@@ -929,4 +1141,139 @@ pub fn token_progress(conn: &Connection, token_id: &str) -> Result<Value, OpErro
 /// 申請種類（API 的篩選）
 pub fn parse_kind(s: &str) -> Option<DbKind> {
     DbKind::parse(s)
+}
+
+#[cfg(test)]
+mod impact_tests {
+    use super::*;
+    use crate::store::sqlite::{MIGRATIONS, migrate};
+
+    const DAY: i64 = 86_400_000;
+    const NOW: i64 = 1_000 * DAY;
+
+    fn db() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn, MIGRATIONS).unwrap();
+        conn
+    }
+
+    /// 一台主機與它目前的憑證（`expired_days`：已過期幾天，負值＝還有幾天到期）
+    fn host(conn: &Connection, n: u8, expired_days: i64, override_until: Option<i64>) {
+        let agent_id = format!("00000000-0000-4000-8000-0000000000{n:02}");
+        let serial = format!("S{n:02}");
+        conn.execute(
+            "INSERT INTO hosts (agent_id, hostname, first_seen, last_seen, current_serial, grace_override_until)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5)",
+            rusqlite::params![agent_id, format!("host-{n:02}"), NOW, serial, override_until],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pki_certificates (serial, agent_id, spki_sha256, not_before, not_after, cert_der, issued_at, issued_via)
+             VALUES (?1, ?2, x'00', 0, ?3, x'00', 0, 'test')",
+            rusqlite::params![serial, agent_id, NOW - expired_days * DAY],
+        )
+        .unwrap();
+    }
+
+    fn eff(mode: EnrollMode, grace: u32) -> settings::Effective {
+        let mut config = crate::config::AppConfig::default();
+        config.pki.policy.expired_renew_grace_days = grace;
+        let mut e = settings::effective(&config, &settings::Overrides::new());
+        e.mode = mode;
+        e
+    }
+
+    #[test]
+    fn shortening_the_grace_period_counts_hosts_that_stop_renewing() {
+        let conn = db();
+        host(&conn, 1, 5, None); // 寬限期 90 → 30：仍在寬限期內
+        host(&conn, 2, 45, None); // 立即無法續簽
+        host(&conn, 3, 60, None); // 立即無法續簽（較早結束）
+        host(&conn, 4, 45, Some(NOW + 10 * DAY)); // 個別延長：不受影響
+        host(&conn, 5, 120, None); // 原本就超過寬限期
+        host(&conn, 6, -10, None); // 尚未過期
+        let g = grace_impact(&conn, 90, 30, NOW).unwrap();
+        assert_eq!(g.k, 2);
+        // 依原本寬限期的結束排序：60 天前過期的較早結束
+        assert_eq!(g.earliest[0].1, "host-03");
+        assert_eq!(g.earliest[1].1, "host-02");
+        assert_eq!(g.earliest[0].3, NOW - 60 * DAY + 90 * DAY);
+        // 延長或不變：沒有影響
+        assert_eq!(grace_impact(&conn, 30, 90, NOW).unwrap().k, 0);
+        assert_eq!(grace_impact(&conn, 90, 90, NOW).unwrap().k, 0);
+        // 改為 0：寬限期內的 4 台中，個別延長的那台以外都受影響
+        assert_eq!(grace_impact(&conn, 90, 0, NOW).unwrap().k, 3);
+    }
+
+    #[test]
+    fn change_impact_levels_tokens_and_confirm_text() {
+        let conn = db();
+        host(&conn, 1, 45, None);
+        // 沒有關閉、沒有縮短：不需要確認
+        let none = change_impact(
+            &conn,
+            &eff(EnrollMode::Open, 90),
+            &eff(EnrollMode::RenewOnly, 120),
+            NOW,
+        )
+        .unwrap();
+        assert!(!none.required());
+        assert_eq!(none.level(), ("L1", None));
+        // 縮短寬限期：K＝1 → L2「停止續簽 1 台」
+        let grace = change_impact(
+            &conn,
+            &eff(EnrollMode::Open, 90),
+            &eff(EnrollMode::Open, 30),
+            NOW,
+        )
+        .unwrap();
+        assert!(grace.required());
+        assert_eq!(grace.count(), 1);
+        assert_eq!(grace.level(), ("L2", Some("停止續簽 1 台".to_string())));
+        // 縮短但沒有主機受影響：仍需要 impact_token，等級為 L1
+        let grace_l1 = change_impact(
+            &conn,
+            &eff(EnrollMode::Open, 90),
+            &eff(EnrollMode::Open, 60),
+            NOW,
+        )
+        .unwrap();
+        assert!(grace_l1.required());
+        assert_eq!(grace_l1.level().0, "L1");
+        // 關閉：寬限期內的主機（N）計入；同時縮短時以 N＋M 為準
+        let closing = change_impact(
+            &conn,
+            &eff(EnrollMode::Open, 90),
+            &eff(EnrollMode::Closed, 30),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            closing.closing.as_ref().map(|(m, i)| (*m, i.n)),
+            Some((EnrollMode::Open, 1))
+        );
+        assert_eq!(closing.count(), 1);
+        // token：同一時間窗與前一個時間窗有效，數字改變後失效
+        let tok = grace.token(NOW / IMPACT_WINDOW_MS);
+        assert!(grace.verify(&tok, NOW));
+        assert!(grace.verify(&tok, NOW + IMPACT_WINDOW_MS));
+        assert!(!grace.verify(&tok, NOW + 2 * IMPACT_WINDOW_MS));
+        assert!(!grace_l1.verify(&tok, NOW));
+        host(&conn, 2, 50, None);
+        let changed = change_impact(
+            &conn,
+            &eff(EnrollMode::Open, 90),
+            &eff(EnrollMode::Open, 30),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(changed.count(), 2);
+        assert!(!changed.verify(&tok, NOW));
+        let j = changed.json(NOW);
+        assert_eq!(j["level"], "L2");
+        assert_eq!(j["confirm_text"], "停止續簽 2 台");
+        assert_eq!(j["grace"]["K"], 2);
+        assert_eq!(j["grace"]["earliest"][0]["hostname"], "host-02");
+        assert!(j["mode"].is_null());
+    }
 }

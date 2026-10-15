@@ -50,6 +50,35 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.6.0〔草稿〕之後的變更記在這裡。）
 
+## [0.8.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.8.0**：衝刺 7 的主控台收尾——設計包 `decisions/INTEGRATION.md` §29.5 的 #3～#5、§29.6 的「S20 項目併入 `system/health`」、`ia.md` §2／§7 的計數泡泡與全站 Banner，以及會讓主機無法續簽的設定變更的影響預覽（`impact_token`）。版本號仍為 0.7.0（發佈時再升）。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **`PUT /api/v1/pki/policy` 縮短過期寬限期時 `impact_token` 必填**（API.md 第 11.5 節原本就這樣寫，0.7 沒有檢查）：缺少時 400 `confirmation_required`、數字已改變時 409 `impact_changed`；使主機立即無法續簽時 `reason` 必填 | 以腳本縮短寬限期的整合 | 先 `GET /api/v1/pki/policy/impact?expired_renew_grace_days=N`，把回應的 `impact_token`（與 L2 時的 `reason`）一起送出 |
+| 2 | Kairos | **「改用設定檔的值」會關閉註冊端點或縮短寬限期時需要確認**：`POST /api/v1/settings/reset` 同上（`GET /api/v1/settings/reset/impact?keys=…`）；`kairos config reset` 有主機受影響時為 L2（互動輸入「停止續簽 N 台」，非互動 `--yes --expect-count <N> --reason <原因>`，數字不符時結束代碼 6） | 以 `kairos config reset enroll.mode` 或 API 改回設定檔的部署腳本 | 腳本加上 `--expect-count` 與 `--reason`（或先查影響再帶 `impact_token`）；其他設定鍵不受影響 |
+
+### Kairos
+
+- **系統健康併入四項**（§29.6）：`GET /api/v1/system/health` 新增 `issuing_ca`（`KRS-W1304`、`KRS-E1303`、離線簽發的待簽發超過 24 小時）、`enroll`（S20「註冊端點」狀態表：`KRS-E2001`、`KRS-W2009`、`KRS-W2011`、`KRS-W3005`、僅續簽仍有有效 token）、`alerts`（告警引擎沒有在執行為嚴重）、`metrics`（S20「/metrics 端點」列的三種寫法；這次啟動後曾拒絕經反向代理轉送的請求時註明）。整體狀態與各項狀態對所有人相同，這四項的 `summary`／`values` 只給有 `pki:read`／`enroll:read`／`alerts:read`／`settings:read` 的身分（其他身分 `restricted: true`）；總覽的 `health` 同樣省略。
+- **影響預覽**：`GET /api/v1/pki/policy/impact`、`GET /api/v1/settings/reset/impact`——K（目前在寬限期內、以新的寬限期計算已經結束、沒有個別延長的主機）、最早受影響的 10 台、N／M／L／R／T（關閉時）、`level`、`confirm_text`（「停止續簽 K 台」）、`impact_token`（5 分鐘）；確認時的等級、原因與數字寫進稽核。
+- **`GET /api/v1/enroll/requests` 的 `state`**（`pending_approval`／`approved`，只用於 `view=pending`）：主控台「待核准」計數泡泡的來源。
+- **稽核列表的 `meta.integrity`**：最近一次驗證（自我驗證或手動；結果、執行者、斷點）與目前的 HMAC 起點；`audit.verify` 的 `details` 另帶 `hmac`、`hmac_since_id`。
+
+### 主控台（Web）
+
+- **側邊導覽的計數泡泡**（`ia.md` §7）：「待核准」（待核准申請數，已逾期與已核准待簽發的不算）、「系統健康」（警告或嚴重的項目數，有嚴重時用嚴重樣式），數字在連結的可存取名稱中；S13 核准或拒絕後立即更新。
+- **全站 Banner**（`ia.md` §2、`design-system/README.md` §6.13）：CRL 與伺服器憑證即將到期或已過期、回報持續無法寫入（`KRS-E4101`）、以未驗證的方式接受 agent 連線（`KRS-W0302`）、告警引擎沒有在執行。嚴重不可關閉；警告可「24 小時內不再顯示」（只記在這個瀏覽器）。頂列狀態燈改寫最重要一項的摘要（不再用「需要注意」）。
+- **S20 系統健康**：只讀健康 API，頁首「整體」與頂列狀態燈一致；「/metrics 端點」列附「經反向代理提供 /metrics 時必須設定 token…」（`KRS-W0304`）；簽發 CA 私鑰無法使用改為嚴重；註冊端點列依狀態表；沒有權限的項目只顯示狀態；處置捷徑。
+- **S18 稽核日誌**：頁首「完整性：✓ 已驗證至 …（雜湊鏈連續；HMAC 自第 N 筆起）· 系統自動驗證」；驗證通過的第一行改為「N 筆，雜湊鏈連續（第 1～N 筆）」；竄改類斷點的「前往第 N 筆」；HMAC 起點之後卻沒有 HMAC 的紀錄不再寫成「啟用 HMAC 前」；拿掉 Banner 中錯誤代碼登錄表的原文；只看自己操作的維運者沒有完整性區塊。
+- **S11 通知管道**：測試通知 429（`KRS-W5111`，依 `product_code` 與驗證失敗的限速 `KRS-W6011` 區分）在按鈕下方就地倒數 `Retry-After`、按鈕 `aria-disabled`、保留上一次結果（清單每列各自顯示）；機密無法解開時狀態為「失敗」、原因「無法解開機密」，「寄送測試通知」停用並說明；刪除對話框的確認按鈕改為「刪除通知管道」。
+- **S21 系統設定**：「改用設定檔的值／內建預設值」先預覽影響，會關閉註冊端點或縮短寬限期時列出受影響的主機並帶 `impact_token`，有主機受影響時 L2；套用模式或改用設定檔的值送出時數字已改變（409）會關閉對話框、以新的數字重新確認（0.7 只換 token、沿用舊的確認字串）；「整合」分頁的 /metrics 反向代理說明；模式按鈕的提示「已是目前的模式」、寬限期 0 天的說明指向憑證政策。
+- **S12、S13、S16**：註冊端點為僅續簽或關閉時，管理員看到「前往系統設定」、其他角色看到「請管理員…」；批次結果訊息的主機名稱不再重複括號；使用者詳情對自己或最後一位全站管理員的「刪除使用者…」改為 `aria-disabled` 並說明原因。
+- **權限的自動掃描**（`tests/e2e-rbac.mjs`）：每個角色逐頁（含清單第一筆的詳情頁）比對看得到的寫入按鈕與 `ia.md` §4.2，沒有分類的寫入按鈕視為失敗，並反向確認有權限的角色看得到主要的寫入按鈕。
+
 ## [0.7.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.7.0、Pulse 0.7.0**：衝刺 6 的**主控台網頁介面**（審計 F2：S01、S03～S18、S20、S21、S23）與後端補強——設計包 `decisions/INTEGRATION.md` §28.5 的待辦與 §28.9 #3（金鑰檔的備份）。**協定不變**，Pulse 只有設定檔錯誤代碼的小修正。

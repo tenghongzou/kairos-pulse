@@ -294,10 +294,24 @@ export function register({ test, newPage, login, waitTitle, axe, shot, FakeAgent
         await page.locator('#ch-test:not([aria-busy])').waitFor();
       }
       await page.getByRole('button', { name: '寄送測試通知' }).click();
-      await page.getByText('測試通知太頻繁').waitFor({ timeout: 20000 });
+      // 按鈕下方就地顯示 KRS-W5111 與倒數；上一次的結果保留；倒數期間 aria-disabled（screens.md S11、範例 93）
+      await page.getByText('測試通知太頻繁，請稍後再試').waitFor({ timeout: 20000 });
       await page.getByText(/同一個管道 60 秒內最多 3 次/).waitFor();
-      await page.locator('.k-test-out').getByText('KRS-W5111').waitFor();
-      assert.equal(got.length, 4, '限速的請求不應送出');
+      await page.locator('.k-test-limit').getByText('KRS-W5111').waitFor();
+      await page.locator('.k-test-out').getByText('已送達').waitFor();
+      const testBtn = page.locator('#ch-test');
+      assert.equal(await testBtn.getAttribute('aria-disabled'), 'true');
+      const describedBy = await testBtn.getAttribute('aria-describedby');
+      assert.ok(describedBy && (await page.locator(`#${describedBy}`).count()) === 1, '按鈕要以 aria-describedby 指向限速說明');
+      const secs = async () => Number(await page.locator('.k-test-limit .k-countdown').textContent());
+      const s1 = await secs();
+      await page.waitForTimeout(2100);
+      assert.ok((await secs()) < s1, '剩餘秒數應每秒倒數');
+      // Playwright 把 aria-disabled 視為不可點選：強制點選，模擬使用者仍按得到（不送出，只朗讀原因）
+      await testBtn.click({ force: true });
+      await page.waitForTimeout(500);
+      assert.equal(got.length, 4, '限速的請求與倒數期間的點選都不應送出');
+      await axe(page, '通知管道：測試通知限速');
       // 維運者：只能看與寄送測試（沒有新增、儲存、刪除）
       const o = await newPage();
       await login(o.page, 'operator', PW, `/alerts/channels/${id}`);

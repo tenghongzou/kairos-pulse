@@ -3,6 +3,8 @@
 
 /* 側邊導覽的計數泡泡（ia.md §7）：嚴重為外框、緊急為實心 */
 .ds-sidenav__count.k-count--critical { background: var(--ds-status-critical-bg); color: var(--ds-status-critical-badge-fg); border-color: var(--ds-status-critical-border); }
+.ds-sidenav__count.k-count--warning { background: var(--ds-status-warning-bg); color: var(--ds-status-warning-badge-fg); border-color: var(--ds-status-warning-border); }
+.ds-sidenav__count.k-count--pending { background: var(--ds-status-pending-bg); color: var(--ds-status-pending-badge-fg); border-color: var(--ds-status-pending-border); }
 .ds-sidenav__count.k-count--emergency { background: var(--ds-severity-emergency-bg); color: var(--ds-severity-emergency-badge-fg); border-color: var(--ds-severity-emergency-border); border-width: var(--ds-border-width-strong); }
 
 /* 告警引擎的橫幅放在內容區（不是全站 Banner） */
@@ -60,5 +62,7 @@
 .k-bar { display: inline-block; height: 10px; min-width: 2px; margin-right: var(--ds-space-200); background: var(--ds-color-accent); border-radius: var(--ds-radius-sm); vertical-align: middle; }
 .k-bars caption { text-align: left; font: var(--ds-text-label); color: var(--ds-color-text-secondary); padding-bottom: var(--ds-space-100); }
 .k-lead { margin: 0 0 var(--ds-space-300); }
-.k-test-out:not(:empty) { margin-top: var(--ds-space-300); }
+.k-test-out:not(:empty), .k-test-limit:not(:empty) { margin-top: var(--ds-space-300); }
+/* 清單：每列的測試結果在按鈕下方（寬度跟著欄位） */
+.k-test-cell { min-width: 12rem; }
 fieldset > .ds-checkbox { display: flex; }

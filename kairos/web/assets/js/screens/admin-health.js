@@ -1,10 +1,8 @@
-// S20 系統健康（/system/health；設計包 screens.md S20「0.6 後端現況」；API.md 第 5.5 節）。
+// S20 系統健康（/system/health；設計包 screens.md S20；API.md 第 5.5 節）。
 //
-// - 檢查項目：GET /api/v1/system/health（資料庫與容量、保留清除、回報寫入、補送、連線、伺服器憑證與 CRL、監聽、
-//   檔案描述元、身分驗證），每 30 秒更新。
-// - 依權限另外加入（各自的 API，失敗時只略過該列）：簽發 CA 到期（pki:read，GET /api/v1/pki/ca）、註冊端點
-//   （enroll:read，GET /api/v1/enroll/mode）、告警引擎（alerts:read，GET /api/v1/alerts/summary 的 engine）、
-//   /metrics 端點（settings:read，GET /api/v1/settings 的 observability.*）。
+// - 只讀一支 API：GET /api/v1/system/health（每 30 秒更新）。0.8 起簽發 CA、註冊端點、告警引擎、/metrics 端點也由
+//   後端併入（INTEGRATION §29.6）：頁首「整體」與頂列系統狀態燈都依 API 的 status，兩處一致；沒有對應權限的
+//   項目只有狀態與代碼（restricted），不顯示數值。
 // - 「下載診斷包」沒有 API：改為「如何產生診斷包」與可複製的 kairos diag 指令；「目錄服務」列隱藏（§28.6）。
 // - 唯讀（沒有 settings:read）只看整體狀態與各項 StatusBadge，不看數值細節（S20 權限差異）。
 // - 健康 API 本身無回應：整頁 Banner「無法取得健康狀態」，與「全部正常」在視覺上完全不同。
@@ -27,91 +25,13 @@ function itemLabel(id) {
   return has(`adm.health.item.${id}`) ? t(`adm.health.item.${id}`) : has(`health.${id}`) ? t(`health.${id}`) : id;
 }
 
-async function extraItems(now) {
-  const out = [];
-  const jobs = [];
-  if (session.can('pki:read')) {
-    jobs.push(
-      api('/api/v1/pki/ca')
-        .then((d) => {
-          const active = (d.issuing_cas || []).filter((c) => c.state === 'active');
-          if (!active.length) {
-            out.push({ id: 'issuing_ca', status: 'ok', summary: d.pki_mode === 'offline' ? t('adm.health.ca.offline') : t('adm.health.ca.none') });
-            return;
-          }
-          for (const c of active) {
-            const left = c.not_after ? (Date.parse(c.not_after) - now) / 86400e3 : null;
-            const status = left != null && left <= 0 ? 'critical' : c.expiry_warning ? 'warning' : 'ok';
-            out.push({
-              id: 'issuing_ca',
-              status,
-              product_code: status === 'critical' ? 'KRS-E1303' : c.expiry_warning || null,
-              summary: left == null ? t('adm.health.ca.noExpiry', { s: c.subject }) : t('adm.health.ca.expires', { s: c.subject, n: Math.max(0, Math.floor(left)), d: fmt.date(c.not_after) }),
-            });
-          }
-        })
-        .catch(() => {}),
-    );
-  }
-  if (session.can('enroll:read')) {
-    jobs.push(
-      api('/api/v1/enroll/mode')
-        .then((m) => {
-          const modeLabel = has(`adm.mode.${m.state}`) ? t(`adm.mode.${m.state}`) : m.state;
-          const shouldListen = m.mode !== 'closed';
-          const status = shouldListen && !m.listening ? 'critical' : 'ok';
-          out.push({
-            id: 'enroll',
-            status,
-            product_code: status === 'critical' ? 'KRS-E2001' : null,
-            summary: shouldListen ? (m.listening ? t('adm.health.enroll.listening', { mode: modeLabel, addr: m.listen_addr || '—' }) : t('adm.health.enroll.notListening', { mode: modeLabel })) : t('adm.health.enroll.closed'),
-          });
-        })
-        .catch(() => {}),
-    );
-  }
-  if (session.can('alerts:read')) {
-    jobs.push(
-      api('/api/v1/alerts/summary')
-        .then((s) => {
-          const e = s.engine || {};
-          out.push({
-            id: 'alerts',
-            status: e.running ? 'ok' : 'critical',
-            summary: e.running
-              ? e.warmup && e.warmup.active
-                ? t('adm.health.alerts.warmup', { t: fmt.time(e.warmup.until) })
-                : t('adm.health.alerts.running', { t: e.last_tick_at ? fmt.relative(e.last_tick_at) : '—' })
-              : t('adm.health.alerts.stopped', { err: e.last_error || '—' }),
-          });
-        })
-        .catch((err) => {
-          if (err && err.status === 503) out.push({ id: 'alerts', status: 'ok', summary: t('adm.health.alerts.disabled') });
-        }),
-    );
-  }
-  if (session.can('settings:read')) {
-    jobs.push(
-      api('/api/v1/settings')
-        .then((d) => {
-          const get = (k) => {
-            const s = (d.settings || []).find((x) => x.key === k);
-            return s ? s.value : null;
-          };
-          const onConsole = get('observability.on_console') !== false;
-          const listen = get('observability.listen') || '';
-          const token = get('observability.metrics_token_file') || '';
-          const parts = [];
-          parts.push(onConsole ? t('adm.health.metrics.console') : t('adm.health.metrics.noConsole'));
-          if (onConsole) parts.push(token ? t('adm.health.metrics.token') : t('adm.health.metrics.loopback'));
-          if (listen) parts.push(t('adm.health.metrics.listen', { addr: listen }));
-          out.push({ id: 'metrics', status: 'ok', summary: parts.join(' · ') });
-        })
-        .catch(() => {}),
-    );
-  }
-  await Promise.all(jobs);
-  return out;
+/** 各項的處置捷徑（依權限；S20「處理捷徑」） */
+function shortcut(it) {
+  if (it.id === 'connections' && session.can('settings:read')) return h('a', { href: '/system/settings/security' }, t('adm.health.toSettings'));
+  if (it.id === 'enroll' && session.can('settings:read')) return h('a', { href: '/system/settings/security' }, t('adm.health.toEnrollMode'));
+  if ((it.id === 'issuing_ca' || it.id === 'tls') && session.can('pki:read') && it.status !== 'ok') return h('a', { href: '/certificates/ca' }, t('adm.health.toCa'));
+  if (it.id === 'alerts' && session.can('alerts:read') && it.status !== 'ok') return h('a', { href: '/alerts/events' }, t('adm.health.toAlerts'));
+  return null;
 }
 
 export function render(ctx) {
@@ -158,13 +78,13 @@ export function render(ctx) {
       );
       return;
     }
-    const extra = detail || session.can('pki:read') || session.can('alerts:read') ? await extraItems(fmt.serverNow()) : [];
     if (my !== seq || disposed) return;
-    const items = [...(hd.items || []), ...extra];
+    const items = [...(hd.items || [])];
     const order = { critical: 0, warning: 1, ok: 2 };
     items.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
     const bad = items.filter((i) => i.status !== 'ok');
-    const worst = items.some((i) => i.status === 'critical') ? 'critical' : bad.length ? 'warning' : 'ok';
+    // 整體狀態只依 API（與頂列系統狀態燈相同，screens.md S20）
+    const worst = hd.status || 'ok';
     mount(meta, t('adm.health.overall'), ' ', levelBadge(worst), bad.length ? ` ${t('adm.health.issues', { n: bad.length })}` : '', ' · ', t('adm.health.updated'), ' ', fmt.timeEl(fmt.serverNow()));
     mount(
       listEl,
@@ -180,8 +100,14 @@ export function render(ctx) {
               'div',
               { class: 'k-grow' },
               h('p', { class: 'strong' }, itemLabel(it.id), it.product_code && it.status !== 'ok' ? [' ', codeTag(it.product_code)] : null),
-              detail && it.summary ? h('p', { class: 'secondary' }, it.summary) : null,
-              detail && it.id === 'connections' && session.can('settings:read') ? h('p', null, h('a', { href: '/system/settings/security' }, t('adm.health.toSettings'))) : null,
+              detail && it.summary && !it.restricted ? h('p', { class: 'secondary' }, it.summary) : null,
+              detail && it.restricted ? h('p', { class: 'caption' }, t('adm.health.restricted')) : null,
+              // /metrics 端點：說明一律附反向代理的限制（screens.md S20「/metrics 端點」列，D42）
+              detail && it.id === 'metrics' ? h('p', { class: 'caption' }, t('adm.health.metrics.proxy'), ' ', codeTag('KRS-W0304')) : null,
+              detail ? (() => {
+                const a = shortcut(it);
+                return a ? h('p', null, a) : null;
+              })() : null,
             ),
           ),
         ),

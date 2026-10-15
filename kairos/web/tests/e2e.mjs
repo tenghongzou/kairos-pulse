@@ -531,6 +531,27 @@ registerRbac({ test, newPage, login, waitTitle, URL0, PW });
 // 發佈前的 WCAG A 級修正（j／k 的範圍、閒置逾時的提醒）：e2e-wcag.mjs
 registerWcag({ test, newPage, login, waitTitle, axe, URL0, PW });
 
+// 結束代碼的自我檢查（README 第 7 節）：SELFTEST=fail 加入一個必定失敗的測試、SELFTEST=axe 加入一個有 axe 違規
+// （沒有替代文字的圖片）的畫面。兩者都必須讓 run.sh 以非 0 結束；搭配 ONLY=自我檢查 只跑這一個。
+if (process.env.SELFTEST === 'fail') {
+  test('自我檢查：必定失敗的測試', async () => {
+    assert.fail('SELFTEST=fail：刻意失敗，run.sh 應以非 0 結束');
+  });
+}
+if (process.env.SELFTEST === 'axe') {
+  test('自我檢查：有 axe 違規的畫面', async () => {
+    const { page } = await newPage();
+    await page.goto(`${URL0}/login`);
+    await page.locator('#page-title, h1').first().waitFor();
+    await page.evaluate(() => {
+      const img = document.createElement('img');
+      img.src = '/assets/favicon.svg';
+      document.querySelector('main, body').appendChild(img);
+    });
+    await axe(page, '自我檢查（刻意違規）');
+  });
+}
+
 // ---------------------------------------------------------------------------
 async function main() {
   for (const a of AGENTS) {
@@ -574,7 +595,14 @@ async function main() {
   writeFileSync(join(OUT, 'results.json'), JSON.stringify({ results, axe: axeResults, consoleErrors }, null, 1));
   const total = results.length;
   console.log(`${total - failed} / ${total} 通過`);
-  process.exit(failed || consoleErrors.length ? 1 : 0);
+  // 結束代碼：任何測試失敗、任何 axe 違規（即使呼叫端吞掉了例外）、瀏覽器主控台錯誤、沒有執行任何測試，都是非 0
+  const problems = [];
+  if (failed) problems.push(`${failed} 個測試失敗`);
+  if (axeViolations) problems.push(`axe ${axeViolations} 個違規`);
+  if (consoleErrors.length) problems.push(`瀏覽器主控台錯誤 ${consoleErrors.length} 則`);
+  if (!total) problems.push(`沒有執行任何測試（ONLY=${only || ''}）`);
+  if (problems.length) console.log(`結果：失敗（${problems.join('、')}）`);
+  process.exit(problems.length ? 1 : 0);
 }
 
 main().catch((e) => {

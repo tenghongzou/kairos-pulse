@@ -840,6 +840,19 @@ async fn hosts_metrics_overview_and_health_over_https() {
     assert_eq!(item("report_writes")["status"], "ok");
     assert_eq!(item("delivery")["values"]["durable"], 1);
     assert!(item("tls")["values"]["expiries"].as_array().unwrap().len() == 1);
+    // 0.8：/metrics 端點與告警引擎併入（設計包 §29.6）；沒有註冊服務時不列簽發 CA 與註冊端點
+    assert_eq!(item("metrics")["status"], "ok");
+    assert_eq!(item("metrics")["summary"], "只接受本機（loopback）");
+    assert_eq!(item("metrics")["values"]["token"], false);
+    // 0.4 的 read 範圍 token 沒有 alerts:read（告警是 0.6 才有）：只有狀態，細節省略
+    assert_eq!(item("alerts")["status"], "ok");
+    assert_eq!(item("alerts")["restricted"], true);
+    assert_eq!(item("alerts")["summary"], "");
+    assert!(
+        !items
+            .iter()
+            .any(|i| i["id"] == "enroll" || i["id"] == "issuing_ca")
+    );
     assert_eq!(v["data"]["service"]["version"], env!("CARGO_PKG_VERSION"));
 
     // /me

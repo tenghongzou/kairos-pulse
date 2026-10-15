@@ -237,6 +237,13 @@ export function pkiTests({ test, newPage, axe, shot }) {
     const prefix = agentId.slice(0, 8);
     const row = await waitRow(page, `${BASE}/enrollment/pending?q=${prefix}`, prefix);
     assert.equal((await row.locator('button[data-open]').innerText()).trim(), XSS_NAME);
+    // 側邊導覽「待核准」的計數泡泡（ia.md §7）：與 API 的待核准數相同，數字在連結的可存取名稱中
+    const pendingTotal = () => page.evaluate(async () => (await (await fetch('/api/v1/enroll/requests?view=pending&state=pending_approval&limit=1')).json()).page.total);
+    const navPending = page.locator('.ds-sidenav__link', { hasText: '待核准' });
+    const before = await pendingTotal();
+    assert.ok(before >= 1, `待核准數 ${before}`);
+    await navPending.locator('[data-count="pending"]', { hasText: String(before) }).waitFor();
+    assert.match(await navPending.textContent(), new RegExp(`，${before} 筆待核准`));
     // 未驗證伺服器身分（TOFU）的旗標
     await row.getByText('未驗證伺服器身分').waitFor();
     await row.locator('button[data-open]').click();
@@ -257,6 +264,9 @@ export function pkiTests({ test, newPage, axe, shot }) {
     await dlg.locator('textarea[name="reason"]').fill('不明主機（e2e）');
     await ok.click();
     await page.locator('.ds-table__summary[role="status"]', { hasText: '已拒絕 1 筆註冊申請' }).waitFor();
+    // 拒絕後計數泡泡立即更新（少 1；為 0 時不顯示）
+    if (before > 1) await navPending.locator('[data-count="pending"]', { hasText: String(before - 1) }).waitFor();
+    else await navPending.locator('[data-count="pending"]').waitFor({ state: 'detached' });
     // 最近結束：已拒絕
     await page.goto(`${BASE}/enrollment/pending?view=closed&q=${prefix}`);
     const closed = page.locator('tbody tr[data-key]', { hasText: XSS_NAME });

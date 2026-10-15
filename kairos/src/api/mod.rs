@@ -858,13 +858,19 @@ async fn dispatch(
         ["overview"] => {
             query.reject_unknown(&["group"], &[])?;
             let access = principal.host_access()?;
-            let show_health = principal.grants.has(Permission::HealthRead);
-            overview::get(ctx, &access, show_health, now).await
+            let health_for = principal
+                .grants
+                .has(Permission::HealthRead)
+                .then_some(&principal.grants);
+            overview::get(ctx, &access, health_for, now).await
         }
         ["system", "health"] => {
             query.reject_unknown(&[], &[])?;
             principal.require(Permission::HealthRead)?;
-            Ok(http::ok(now, health::compute(ctx, now).await?))
+            Ok(http::ok(
+                now,
+                health::compute(ctx, now).await?.redact(&principal.grants),
+            ))
         }
         _ => Err(ApiError::not_found()),
     }

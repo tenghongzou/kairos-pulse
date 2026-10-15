@@ -7,6 +7,10 @@
 // - 可從主控台修改的鍵：註冊端點模式與自動暫停（PUT /api/v1/enroll/mode；L1，關閉且有受影響主機時 L2 輸入
 //   「停止續簽 N 台」、原因必填）。憑證政策（pki.policy.*）在憑證管理（S14）修改，這裡顯示來源並可「改用設定檔的值」。
 //   「改用設定檔的值」＝刪除資料庫的值（POST /api/v1/settings/reset，L1）。被環境變數鎖定的鍵唯讀。
+// - 影響預覽（0.8）：「改用設定檔的值」先以 GET /api/v1/settings/reset/impact 取得影響——改回去會關閉註冊端點或縮短
+//   過期寬限期時，對話框列出會停止續簽的主機並帶 impact_token；有主機受影響時為 L2（輸入「停止續簽 N 台」、原因必填，
+//   screens.md §0.3）。送出時數字已改變（409 impact_changed）：關閉對話框，以新的數字重新確認（不沿用舊的確認字串）。
+//   套用註冊端點模式同樣處理。
 // - 分頁：一般、連線與安全、資料保留與儲存、整合（API token 在「整合」）；「主機群組與標籤」沒有後端，隱藏。
 //   維運者只看得到「連線與安全」（唯讀，D16）；稽核員全部唯讀。
 // - 隱藏（§28.6）：「整合」的 [log]／[observability] 沒有修改 API，唯讀並標示「在 kairos.toml 修改、需重新啟動」；
@@ -62,6 +66,36 @@ function sourceText(s) {
     parts.push(t(o.source === 'file' ? 'adm.set.overriddenFile' : 'adm.set.overriddenConsole', { v: valueText(o.value) }));
   }
   return parts.join(' ');
+}
+
+/** 影響預覽（GET …/impact 的 data）：關閉註冊端點的 N／M／L 與縮短寬限期的 K、最早受影響的主機 */
+function impactBlock(imp) {
+  const items = [];
+  if (imp.mode) {
+    items.push(h('li', null, t('adm.mode.impactN', { n: fmt.num(imp.mode.N) })), h('li', null, t('adm.mode.impactM', { n: fmt.num(imp.mode.M) })), h('li', null, t('adm.mode.impactL', { n: fmt.num(imp.mode.L) })));
+  }
+  if (imp.grace) {
+    const g = imp.grace;
+    items.push(h('li', null, t('adm.impact.grace', { from: g.from_days, to: g.to_days, k: fmt.num(g.K) })));
+  }
+  const earliest = (imp.grace && imp.grace.earliest) || [];
+  return h(
+    'div',
+    { class: 'k-impact-box' },
+    h('p', { class: 'strong' }, t('adm.impact.title')),
+    h('ul', { class: 'k-impact' }, items),
+    earliest.length
+      ? [
+          h('p', null, t('adm.impact.earliest')),
+          h(
+            'ul',
+            null,
+            earliest.map((e) => h('li', null, h('span', null, e.hostname), ' ', h('span', { class: 'caption' }, t('adm.impact.graceEnds', { t: `${fmt.dateTime(e.grace_ends_at, { seconds: false })} ${fmt.tzLabel()}` })))),
+            imp.grace.K > earliest.length ? h('li', { class: 'caption' }, t('adm.impact.more', { n: fmt.num(imp.grace.K - earliest.length) })) : null,
+          ),
+        ]
+      : null,
+  );
 }
 
 function keyLabel(key) {
@@ -120,48 +154,90 @@ export function render(ctx) {
     mount(body, h('div', { class: 'k-stack' }, blocks));
   }
 
+  /** 改用設定檔的值：先查影響，再依等級確認（數字改變時以新的數字重新確認） */
+  async function resetFlow(s, imp, notice) {
+    const fileVal = fileValueOf(s);
+    const label = fileVal !== undefined ? t('adm.set.useFile') : t('adm.set.useDefault');
+    let changed = null;
+    const send = async ({ reason, errBox }) => {
+      try {
+        await api('/api/v1/settings/reset', { method: 'POST', body: { keys: [s.key], reason: reason || undefined, impact_token: imp.required ? imp.impact_token : undefined } });
+        toast({ kind: 'success', title: fileVal !== undefined ? t('adm.set.usedFile') : t('adm.set.usedDefault'), desc: s.key });
+        load();
+        return true;
+      } catch (err) {
+        if (err.code === 'impact_changed' && err.details) {
+          changed = err.details;
+          return true;
+        }
+        const a = errorAlert(err, { title: t('adm.set.resetFailed') });
+        mount(errBox, a);
+        a.focus();
+        return false;
+      }
+    };
+    const summary = h(
+      'div',
+      null,
+      notice,
+      h('p', null, codeTag(s.key)),
+      h('ul', null, h('li', null, t('adm.set.nowConsole', { v: valueText(s.value) })), h('li', null, fileVal !== undefined ? t('adm.set.thenFile', { v: valueText(fileVal) }) : t('adm.set.thenDefault'))),
+      imp.required ? impactBlock(imp) : null,
+      h('p', null, t('adm.set.resetEffect')),
+    );
+    if (imp.level === 'L2') {
+      await confirmL2({
+        title: fileVal !== undefined ? t('adm.set.useFileTitle') : t('adm.set.useDefaultTitle'),
+        lead: t('adm.impact.lead', { n: fmt.num(imp.count) }),
+        body: summary,
+        phrase: imp.confirm_text,
+        confirmText: label,
+        reason: 'required',
+        onConfirm: send,
+      });
+    } else {
+      await confirmL1({
+        title: fileVal !== undefined ? t('adm.set.useFileTitle') : t('adm.set.useDefaultTitle'),
+        body: summary,
+        confirmText: label,
+        reason: imp.required ? 'optional' : null,
+        onConfirm: send,
+      });
+    }
+    if (changed) await resetFlow(s, changed, inlineAlert({ kind: 'warning', title: t('adm.impact.changed'), body: t('adm.impact.changedBody') }));
+  }
+
   function resetButton(s) {
     const perm = writePerm(s.key);
     if (s.source !== 'console' || !perm || !session.can(perm)) return null;
     const fileVal = fileValueOf(s);
     const label = fileVal !== undefined ? t('adm.set.useFile') : t('adm.set.useDefault');
-    return h(
+    const btn = h(
       'button',
       {
         type: 'button',
         class: 'ds-button ds-button--secondary ds-button--sm',
         'aria-label': `${label}：${s.key}`,
         on: {
-          click: () =>
-            confirmL1({
-              title: fileVal !== undefined ? t('adm.set.useFileTitle') : t('adm.set.useDefaultTitle'),
-              body: h(
-                'div',
-                null,
-                h('p', null, codeTag(s.key)),
-                h('ul', null, h('li', null, t('adm.set.nowConsole', { v: valueText(s.value) })), h('li', null, fileVal !== undefined ? t('adm.set.thenFile', { v: valueText(fileVal) }) : t('adm.set.thenDefault'))),
-                h('p', null, t('adm.set.resetEffect')),
-              ),
-              confirmText: label,
-              reason: null,
-              onConfirm: async ({ errBox }) => {
-                try {
-                  await api('/api/v1/settings/reset', { method: 'POST', body: { keys: [s.key] } });
-                  toast({ kind: 'success', title: fileVal !== undefined ? t('adm.set.usedFile') : t('adm.set.usedDefault'), desc: s.key });
-                  load();
-                  return true;
-                } catch (err) {
-                  const a = errorAlert(err, { title: t('adm.set.resetFailed') });
-                  mount(errBox, a);
-                  a.focus();
-                  return false;
-                }
-              },
-            }),
+          click: async () => {
+            // 影響預覽：改回去會不會關閉註冊端點或縮短寬限期（GET /api/v1/settings/reset/impact）
+            let imp;
+            btn.setAttribute('aria-busy', 'true');
+            try {
+              imp = await api(`/api/v1/settings/reset/impact${qs({ keys: s.key })}`);
+            } catch (err) {
+              toast({ kind: 'error', title: t('adm.impact.failed'), desc: err.message });
+              return;
+            } finally {
+              btn.removeAttribute('aria-busy');
+            }
+            await resetFlow(s, imp, null);
+          },
         },
       },
       label,
     );
+    return btn;
   }
 
   function settingRow(s) {
@@ -183,6 +259,8 @@ export function render(ctx) {
       title: has(`adm.set.section.${sec}`) ? t(`adm.set.section.${sec}`) : sec,
       body: [
         h('p', { class: 'caption' }, restart ? t('adm.set.fileOnly') : sec === 'pki' ? t('adm.set.pkiNote') : t('adm.set.consoleKeys')),
+        // 「整合」：/metrics 經反向代理時必須設定 token（screens.md S21「整合」、D42）
+        sec === 'observability' ? h('p', { class: 'caption' }, t('adm.health.metrics.proxy'), ' ', codeTag('KRS-W0304')) : null,
         h(
           'div',
           { class: 'k-scroll-x' },
@@ -282,7 +360,7 @@ export function render(ctx) {
     });
     const N = impact ? impact.N : null;
     const M = impact ? impact.M : null;
-    const impactBlock = impact
+    const impactInfo = impact
       ? N + M + impact.L === 0
         ? h('p', null, t('adm.mode.noImpact'))
         : h(
@@ -311,7 +389,6 @@ export function render(ctx) {
         fh.setError('');
         ch.auto_pause_after_hours = Number(ch.auto_pause_after_hours);
       }
-      const target = ch.mode || m.mode;
       let imp = null;
       if (ch.mode === 'closed') {
         try {
@@ -320,8 +397,15 @@ export function render(ctx) {
           toast({ kind: 'error', title: t('adm.mode.impactFailed') });
           return;
         }
-        ch.impact_token = imp.impact_token;
       }
+      await confirmMode(ch, imp, null);
+    }
+
+    /** 套用模式的確認；送出時影響數字已改變（409 impact_changed）就關閉對話框、以新的數字重新確認 */
+    async function confirmMode(ch, imp, notice) {
+      const target = ch.mode || m.mode;
+      if (imp) ch.impact_token = imp.impact_token;
+      let changed = null;
       const send = async ({ reason, errBox }) => {
         try {
           await api('/api/v1/enroll/mode', { method: 'PUT', body: { ...ch, reason: reason || undefined } });
@@ -330,7 +414,8 @@ export function render(ctx) {
           return true;
         } catch (err) {
           if (err.code === 'impact_changed' && err.details) {
-            ch.impact_token = err.details.impact_token;
+            changed = err.details;
+            return true;
           }
           const a = errorAlert(err, { title: t('adm.mode.applyFailed') });
           mount(errBox, a);
@@ -338,6 +423,7 @@ export function render(ctx) {
           return false;
         }
       };
+      const again = () => (changed ? confirmMode(ch, changed, inlineAlert({ kind: 'warning', title: t('adm.impact.changed'), body: t('adm.impact.changedBody') })) : null);
       const lines = [];
       if (ch.mode) lines.push(t('adm.mode.change.mode', { from: t(`adm.mode.opt.${m.mode}`), to: t(`adm.mode.opt.${ch.mode}`) }));
       if ('auto_pause_enabled' in ch) lines.push(ch.auto_pause_enabled ? t('adm.mode.change.autoOn') : t('adm.mode.change.autoOff'));
@@ -350,6 +436,7 @@ export function render(ctx) {
           body: h(
             'div',
             null,
+            notice,
             h('ul', { class: 'k-impact' }, h('li', null, t('adm.mode.impactN', { n: fmt.num(imp.N) })), h('li', null, t('adm.mode.impactM', { n: fmt.num(imp.M) })), h('li', null, t('adm.mode.impactL', { n: fmt.num(imp.L) })), h('li', null, t('adm.mode.effect.closed', { t: fmt.num(imp.T), r: fmt.num(imp.R) }))),
             inlineAlert({ kind: 'info', title: t('adm.mode.considerRenewOnly') }),
           ),
@@ -358,14 +445,16 @@ export function render(ctx) {
           reason: 'required',
           onConfirm: send,
         });
+        await again();
         return;
       }
       await confirmL1({
         title: ch.mode ? t(`adm.mode.confirmTitle.${ch.mode}`) : t('adm.mode.confirmTitle.auto'),
-        body: h('div', null, h('ul', null, lines.map((l) => h('li', null, l))), consequence ? h('p', null, consequence) : null, h('p', { class: 'caption' }, t('adm.mode.audited'))),
+        body: h('div', null, notice, h('ul', null, lines.map((l) => h('li', null, l))), consequence ? h('p', null, consequence) : null, h('p', { class: 'caption' }, t('adm.mode.audited'))),
         confirmText: ch.mode ? t(`adm.mode.confirm.${ch.mode}`) : t('adm.mode.apply').replace('…', ''),
         onConfirm: send,
       });
+      await again();
     }
 
     const srcLine = (s, id) => h('p', { class: 'caption', id }, neutralBadge(sourceLabel(s.source), s.source === 'env' ? 'lock' : null), ' ', sourceText(s), ' ', resetButton(s));
@@ -402,7 +491,7 @@ export function render(ctx) {
         srcLine(sHours, srcIds.hours),
       ),
       h('h3', { class: 'k-section-title' }, t('adm.mode.impactTitle')),
-      impactBlock || h('p', { class: 'muted' }, '—'),
+      impactInfo || h('p', { class: 'muted' }, '—'),
       applyBtn ? h('div', { class: 'ds-button-row' }, applyBtn, pending) : null,
     );
     refresh();

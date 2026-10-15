@@ -126,7 +126,10 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     const self = page.getByRole('button', { name: '停用帳號…' });
     assert.equal(await self.getAttribute('aria-disabled'), 'true');
     await page.getByText('不能停用或刪除自己的帳號。').waitFor();
-    assert.equal(await page.getByRole('button', { name: /刪除使用者/ }).count(), 0);
+    // 「刪除使用者…」同樣 aria-disabled，指向同一段原因
+    const delSelf = page.getByRole('button', { name: /刪除使用者/ });
+    assert.equal(await delSelf.getAttribute('aria-disabled'), 'true');
+    assert.equal(await delSelf.getAttribute('aria-describedby'), await self.getAttribute('aria-describedby'));
     // 一次性密碼沒有進入 Kairos 的日誌
     if (process.env.KAIROS_LOG) assert.ok(!readFileSync(process.env.KAIROS_LOG, 'utf8').includes(pw), '一次性密碼不應出現在 Kairos 的日誌');
     await ctx.close();
@@ -208,7 +211,14 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     await page.getByRole('button', { name: '驗證完整性' }).click();
     await page.getByText(/雜湊鏈完整/).waitFor();
     const txt = await page.locator('.ds-alert--success').innerText();
-    assert.match(txt, /已檢查 [\d,]+ 筆/);
+    assert.match(txt, /[\d,]+ 筆，雜湊鏈連續（第 \d+～\d+ 筆）/);
+    // 頁首「完整性」帶 HMAC 起點（screens.md S18 0.7）；重新整理後由 meta.integrity 讀出同樣的內容
+    const headRe = /已驗證至 .+（雜湊鏈連續；HMAC 自第 \d+ 筆起）/;
+    assert.match(await page.locator('.k-integrity-head').innerText(), headRe);
+    await page.reload();
+    await page.locator('tbody tr[data-key]').first().waitFor();
+    await page.locator('.k-integrity-head', { hasText: '由 auditor 驗證' }).waitFor();
+    assert.match(await page.locator('.k-integrity-head').innerText(), headRe);
     // run.sh 先以 CLI 建立帳號（服務啟動前、沒有 HMAC），之後的紀錄有 HMAC：結果寫出邊界
     assert.match(txt, /HMAC 已驗證 [\d,]+ 筆（自第 \d+ 筆起）；之前的 [1-9][\d,]* 筆/);
     // JSONL 匯出：最後一行是鏈的起訖
@@ -226,6 +236,9 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     await waitTitle(o.page, '稽核日誌');
     await o.page.getByText('只顯示你自己的操作').waitFor();
     assert.equal(await o.page.getByRole('button', { name: '驗證完整性' }).count(), 0);
+    // 只看自己的操作：沒有完整性區塊（沒有驗證按鈕，也沒有頁首的完整性）
+    assert.equal(await o.page.locator('.k-integrity-head').count(), 0);
+    assert.equal(await o.page.getByRole('heading', { name: '完整性' }).count(), 0);
     assert.equal(await o.page.getByRole('link', { name: /匯出/ }).count(), 0);
     await o.ctx.close();
   });
@@ -262,9 +275,30 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
       for (let i = 0; i < 50 && (await page.getByLabel('自動暫停前的時數').inputValue()) !== '36'; i += 1) await page.waitForTimeout(100);
     });
     assert.equal(await page.getByLabel('自動暫停前的時數').inputValue(), '36');
-    // 模式也恢復內建預設（關閉）
+    // 模式也恢復內建預設（關閉）：等於關閉註冊端點，先預覽影響並帶 impact_token（0.8）
+    const noToken = await apiCall(page, 'POST', '/api/v1/settings/reset', { keys: ['enroll.mode'] });
+    assert.equal(noToken.status, 400);
+    assert.equal(noToken.body.error.code, 'confirmation_required');
+    assert.equal(noToken.body.error.details.required, true);
+    const pre = await apiCall(page, 'GET', '/api/v1/settings/reset/impact?keys=enroll.mode');
+    assert.equal(pre.body.data.mode.to, 'closed');
+    assert.equal(pre.body.data.level, 'L1');
+    const stale = await apiCall(page, 'POST', '/api/v1/settings/reset', { keys: ['enroll.mode'], impact_token: 'stale' });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.error.code, 'impact_changed');
+    // 縮短寬限期同樣需要 impact_token（S14 維持唯讀，只檢查 API）
+    const gi = await apiCall(page, 'GET', '/api/v1/pki/policy/impact?expired_renew_grace_days=30');
+    assert.equal(gi.body.data.required, true);
+    assert.equal(gi.body.data.grace.to_days, 30);
+    const gp = await apiCall(page, 'PUT', '/api/v1/pki/policy', { expired_renew_grace_days: 30 });
+    assert.equal(gp.status, 400);
+    assert.equal(gp.body.error.code, 'confirmation_required');
     await page.getByRole('button', { name: '改用內建預設值：enroll.mode' }).click();
-    await page.getByRole('dialog').getByRole('button', { name: '改用內建預設值', exact: true }).click();
+    const rd = page.getByRole('dialog');
+    await rd.getByText('影響', { exact: true }).waitFor();
+    await rd.getByText(/已過期、在寬限期內：\d+ 台/).waitFor();
+    await axe(page, '系統設定：改用內建預設值的影響預覽');
+    await rd.getByRole('button', { name: '改用內建預設值', exact: true }).click();
     await page.getByText('已改用內建預設值').waitFor();
     await page.getByRole('radio', { name: /^關閉/ }).and(page.locator(':checked')).waitFor();
     const s = await apiCall(page, 'GET', '/api/v1/settings');
@@ -403,6 +437,59 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     // 頂列的系統狀態燈連到這裡
     assert.equal(await page.locator('a.k-status-light').getAttribute('href'), '/system/health');
     await ctx.close();
+  });
+
+  test('全站 Banner 與系統健康的計數泡泡（ia.md §2、§7）：嚴重不可關閉、警告 24 小時內不再顯示', async () => {
+    // 以假的健康 API 回應模擬 CRL 已過期（嚴重）與伺服器憑證 20 天後到期（警告）；其他項目照真的回應
+    for (const scheme of ['light', 'dark']) {
+      const { ctx, page } = await newPage({ colorScheme: scheme });
+      await ctx.route('**/api/v1/system/health', async (route) => {
+        const real = await (await route.fetch()).json();
+        const items = (real.data.items || []).map((i) =>
+          i.id === 'tls'
+            ? { ...i, status: 'critical', product_code: 'KRS-E1203', summary: 'CRL 0 天後到期 · 伺服器憑證 20 天後到期', values: { ...i.values, expiries: [{ kind: 'crl', days_left: -0.5, status: 'critical' }, { kind: 'server_certificate', days_left: 20.2, status: 'warning' }] } }
+            : i.id === 'file_descriptors'
+              ? { ...i, status: 'warning', summary: '1024（需要 1100）' }
+              : { ...i, status: 'ok' },
+        );
+        await route.fulfill({ json: { ...real, data: { ...real.data, status: 'critical', items } } });
+      });
+      await login(page, 'admin', PW, '/');
+      await waitTitle(page, '總覽');
+      const crit = page.locator('[data-banner="crl.expired"]');
+      const warn = page.locator('[data-banner="cert.warning"]');
+      await crit.waitFor();
+      await warn.waitFor();
+      assert.equal(await crit.getAttribute('role'), 'alert');
+      assert.match(await crit.innerText(), /撤銷清單（CRL）已過期，所有 agent 都會被拒絕連線/);
+      assert.match(await crit.innerText(), /KRS-E1203/);
+      assert.equal(await crit.getByRole('button', { name: '24 小時內不再顯示' }).count(), 0);
+      assert.match(await warn.innerText(), /伺服器憑證將在 20 天後到期/);
+      // 系統健康的計數泡泡：警告或嚴重的項目數（有嚴重時用嚴重樣式），數字在連結的可存取名稱中
+      const nav = page.locator('.ds-sidenav__link', { hasText: '系統健康' });
+      const bubble = nav.locator('[data-count="health"]');
+      assert.equal((await bubble.innerText()).trim(), '2');
+      assert.match(await bubble.getAttribute('class'), /k-count--critical/);
+      assert.match(await nav.textContent(), /，2 項警告或嚴重/);
+      // 頂列系統狀態燈：最重要一項（嚴重）的摘要，不用「需要注意」（ia.md §2）
+      const light = await page.locator('a.k-status-light').innerText();
+      assert.match(light, /憑證與撤銷清單：CRL 0 天後到期/);
+      assert.doesNotMatch(light, /需要注意/);
+      await axe(page, `全站 Banner（${scheme === 'dark' ? '深色' : '淺色'}）`);
+      if (scheme === 'light') await shot(page, 'global-banner-light');
+      // 警告可關閉 24 小時（只記在這個瀏覽器）；嚴重的照常顯示，換頁與重新整理後仍在
+      await warn.getByRole('button', { name: '24 小時內不再顯示' }).click();
+      await warn.waitFor({ state: 'detached' });
+      assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.id), 'page-title');
+      await page.goto(`${URL0}/system/health`);
+      await waitTitle(page, '系統健康');
+      await crit.waitFor();
+      assert.equal(await warn.count(), 0);
+      // S20 的整體狀態與狀態燈一致（都依 API 的 status）
+      await page.locator('.k-page-head__meta', { hasText: '嚴重' }).first().waitFor();
+      await page.locator('[data-item="tls"][data-status="critical"]').waitFor();
+      await ctx.close();
+    }
   });
 
   test('管理畫面的深色主題：axe 0 違規', async () => {
