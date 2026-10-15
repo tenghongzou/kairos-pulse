@@ -5,7 +5,7 @@
 //!   兩者都不經過這裡；其餘路徑：
 //!   - `/assets/<檔案>`：嵌入的檔案，帶 `ETag`（內容的 SHA-256），`Cache-Control: no-cache`
 //!     （每次以 `If-None-Match` 重新確認，換版後立即生效，不需要在檔名加雜湊）；不存在時 404。
-//!   - 最後一段含 `.` 的路徑（`/favicon.ico`、`/robots.txt`）：404（不是頁面）。
+//!   - 最後一段含 `.` 的路徑（`/favicon.ico`、`/robots.txt`）：404（不是頁面）；網頁介面路由第二段以後的參數例外（帳號 `alice.w`）。
 //!   - 其他路徑（`/`、`/hosts`、`/hosts/<agent_id>/metrics`、`/login`…）：單頁應用的 `index.html`，
 //!     `Cache-Control: no-store`，路由由瀏覽器端決定（不存在的頁面由前端顯示 404 頁）。第一段不是主控台的
 //!     路由（[`SPA_ROOTS`]）時同樣回 `index.html`，但狀態碼為 404（例如 Pulse 把註冊端點誤設為主控台的連接埠）。
@@ -223,7 +223,10 @@ pub fn serve(method: &Method, path: &str, req_headers: &HeaderMap) -> (Response<
         };
     }
     let last = path.rsplit('/').next().unwrap_or("");
-    if last.contains('.') {
+    // 含 `.` 的最後一段多半是檔案（/favicon.ico、/robots.txt）；但網頁介面路由下第二段以後的參數可能含 `.`
+    // （帳號 `alice.w`：/admin/users/alice.w），這些仍回 index.html
+    let segments = path.trim_matches('/').split('/').count();
+    if last.contains('.') && !(segments >= 2 && is_spa_route(path)) {
         return (plain(StatusCode::NOT_FOUND, "404 not found\n"), false);
     }
     match ASSETS.get("index.html") {
@@ -310,6 +313,12 @@ mod tests {
         assert!(is_spa_route("/") && is_spa_route("/account") && !is_spa_route("/nope"));
         let (r, _) = serve(&Method::GET, "/favicon.ico", &h);
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let (r, _) = serve(&Method::GET, "/v1/foo.json", &h);
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        // 路由的參數可以含 `.`（帳號 alice.w）
+        let (r, html) = serve(&Method::GET, "/admin/users/alice.w", &h);
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(html);
         let (r, _) = serve(&Method::GET, "/assets/nope.js", &h);
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         let (r, _) = serve(&Method::GET, "/assets/../index.html", &h);

@@ -27,6 +27,7 @@ PW_DIR="${PW_DIR:-$HOME/pw}"
 OUT_DIR="${OUT_DIR:-$HERE/out}"
 CONSOLE_PORT="${CONSOLE_PORT:-39443}"
 AGENT_PORT="${AGENT_PORT:-38080}"
+ENROLL_PORT="${ENROLL_PORT:-38445}"
 
 PKI_CONSOLE_PORT="${PKI_CONSOLE_PORT:-39444}"
 PKI_AGENT_PORT="${PKI_AGENT_PORT:-38081}"
@@ -82,6 +83,11 @@ argon2_iterations = 1
 
 [alerts]
 enabled = true
+
+# S21 的測試：設定檔的值（主控台修改後「改用設定檔的值」）；模式維持內建預設（關閉）
+[enroll]
+listen = "127.0.0.1:$ENROLL_PORT"
+auto_pause_after_hours = 36
 EOF
 
 PW='correct horse battery staple'
@@ -104,7 +110,8 @@ create noroles viewer
 # 管理員建立、沒有自行指定密碼：一次性密碼只在 stdout，第一次登入必須變更
 NEWBIE_PW="$("$KAIROS_BIN" users create newbie --role viewer --config "$CFG" 2>/dev/null | tail -n 1 | tr -d '[:space:]')"
 
-"$KAIROS_BIN" --config "$CFG" >"$TMP/kairos.out" 2>&1 &
+# S21 的測試：環境變數鎖定的設定（主控台唯讀、API 409 locked_by_environment）
+KAIROS__ENROLL__AUTO_PAUSE_ENABLED=true "$KAIROS_BIN" --config "$CFG" >"$TMP/kairos.out" 2>&1 &
 KAIROS_PID=$!
 for _ in $(seq 1 100); do
     if curl -sk "https://127.0.0.1:$CONSOLE_PORT/healthz" >/dev/null 2>&1; then break; fi

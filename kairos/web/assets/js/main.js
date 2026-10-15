@@ -13,6 +13,7 @@ import { closeMenu } from './ui/menu.js';
 import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
 import './screens/alerts-boot.js';
+import { ADMIN_ROUTES } from './routes-admin.js';
 
 /**
  * 路由表。欄位：
@@ -43,6 +44,8 @@ const ROUTES = [
   { path: '/certificates/ca', perm: 'pki:read', title: 'ca.title', load: () => import('./screens/pki-ca.js') },
   { path: '/certificates/:serial?', perm: 'pki:read', title: 'cert.title', load: () => import('./screens/pki-certs.js') },
 ];
+// 稽核、管理、系統（S16～S18、S20、S21）：routes-admin.js（allow：需要任一權限時）
+ROUTES.push(...ADMIN_ROUTES);
 
 const appRoot = document.getElementById('app');
 let current = null;
@@ -130,7 +133,7 @@ async function onRoute() {
     focus();
     return;
   }
-  if ((route.perm && !session.can(route.perm)) || (route.permAny && !session.canAny(route.permAny)) || (route.session && !session.isSession())) {
+  if ((route.perm && !session.can(route.perm)) || (route.permAny && !session.canAny(route.permAny)) || (route.session && !session.isSession()) || (route.allow && !route.allow())) {
     forbidden(content, { perm: route.perm || route.permAny });
     setDocTitle(t('error.403.title'));
     focus();
