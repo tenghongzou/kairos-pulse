@@ -15,6 +15,7 @@
 //! |---|---|---|
 //! | `issuing-<ca_id>.key` | 代理簽發 CA 的私鑰（PKCS#8 PEM） | 0600 |
 //! | `issuing-cas.pem` | 狀態為 `active`／`trusted` 的簽發 CA 憑證（mTLS 的信任錨之一；Kairos 寫出） | 0644 |
+//! | `issuing-cas-retired.pem` | 狀態為 `retired` 的簽發 CA 憑證（經過它們的用戶端憑證鏈一律拒絕；Kairos 寫出） | 0644 |
 //! | `crl/issuing.crl` | 各簽發 CA 目前的 CRL（PEM，Kairos 產生） | 0644 |
 //! | `root-ca.pem` | `kairos pki init` 建立的根 CA 憑證（`pki.server_ca_path`；私鑰不在這裡） | 0644 |
 //! | `server.pem`、`server.key` | `kairos pki init` 簽發的伺服器憑證與私鑰（8443／8444／9443） | 0644、0600 |
@@ -34,6 +35,8 @@ use std::path::{Path, PathBuf};
 pub const PKI_DIR: &str = "pki";
 /// 簽發 CA 的信任錨（Kairos 由資料庫寫出）
 pub const ISSUING_CAS_FILE: &str = "issuing-cas.pem";
+/// 已退役的簽發 CA（Kairos 由資料庫寫出；mTLS 拒絕經過它們的鏈，PKI.md 第 15.4 節）
+pub const RETIRED_CAS_FILE: &str = "issuing-cas-retired.pem";
 /// Kairos 產生的 CRL（`pki/crl/` 下）
 pub const ISSUING_CRL_FILE: &str = "issuing.crl";
 /// CRL 目錄
@@ -47,6 +50,11 @@ pub fn pki_dir(data_dir: &Path) -> PathBuf {
 /// `<data_dir>/pki/issuing-cas.pem`
 pub fn issuing_cas_path(data_dir: &Path) -> PathBuf {
     pki_dir(data_dir).join(ISSUING_CAS_FILE)
+}
+
+/// `<data_dir>/pki/issuing-cas-retired.pem`
+pub fn retired_cas_path(data_dir: &Path) -> PathBuf {
+    pki_dir(data_dir).join(RETIRED_CAS_FILE)
 }
 
 /// `<data_dir>/pki/crl/issuing.crl`

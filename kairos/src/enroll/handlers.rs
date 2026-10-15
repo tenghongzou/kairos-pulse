@@ -1284,6 +1284,15 @@ fn verify_grace_identity(
     {
         return Err("certificate is not issued by a trusted CA");
     }
+    // 已退役的簽發 CA 簽出的憑證：`auth.client_ca` 直接含有那張簽發 CA 時仍會通過上面的檢查（PKI.md 第 15.4 節）
+    if svc
+        .pki
+        .retired_ca_ders()
+        .iter()
+        .any(|ca| verify_cert_signature(cert_der, ca))
+    {
+        return Err("certificate is issued by a retired issuing CA");
+    }
     if info.other_sans != 0 || info.dns_sans.len() != 1 || info.dns_sans[0] != agent_id {
         return Err("certificate SAN does not match agent_id");
     }

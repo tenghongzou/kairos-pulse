@@ -488,7 +488,7 @@ mode = "online"
 server_ca_path = "data/pki/root-ca.pem"
 ```
 
-- **`auth.client_ca` 指向 `issuing-cas.pem` 而不是根 CA**：以根 CA 當 `auth.client_ca` 時，`auth.client_ca` 這組驗證器沒有 CRL，持有已**退役**簽發 CA 簽發的憑證、並自行附上該簽發 CA 憑證的用戶端，可以經由根 CA 這條鏈通過驗證（第 10 節的分組只對狀態為 `active`／`trusted` 的簽發 CA 生效）。`issuing-cas.pem` 由 Kairos 依狀態重寫，退役的 CA 立即移除。第 9 節「改為線上」的既有部署（代理 CA 在 `auth.client_ca`）有同樣的情況，見第 15.4 節。
+- **`auth.client_ca` 指向 `issuing-cas.pem` 而不是根 CA**：以根 CA 當 `auth.client_ca` 時，根 CA 底下**任何** CA 簽出的用戶端憑證都能經由 `auth.client_ca` 這組驗證器通過，而這組驗證器只有 `auth.crl`、沒有 Kairos 產生的 CRL。`issuing-cas.pem` 由 Kairos 依狀態重寫，退役的 CA 立即移除。已**退役**的簽發 CA 另外列在 `issuing-cas-retired.pem`，經過它們的鏈不論由哪一組驗證器通過都拒絕（0.8.0 起，第 15.4 節第 1 項），因此以根 CA 當 `auth.client_ca` 不再能讓退役簽發 CA 的憑證通過，但前一點仍成立。
 - **覆寫保護**：資料庫已有任何簽發 CA、或任何一個要寫出的檔案已存在時拒絕（結束代碼 11），不會產生第二個根 CA。根 CA 目錄不得在 `storage.data_dir` 之下（資料目錄會被備份、診斷包會列出檔名）。
 - **根 CA 私鑰**：init 之後在這台伺服器上，印出 `KRS-W1306`〔暫定〕要求立即複製到離線媒體並刪除（`shred -u`）。之後簽發伺服器憑證或新的簽發 CA 時在離線主機以 `kairos pki sign` 使用它。私鑰以明文 PKCS#8（0600）寫出；加密匯出（設計包 S02「加密下載後刪除」）留給首次啟動精靈。
 - 稽核：`pki.init`（根 CA 的 subject 與指紋、伺服器憑證序號與 SAN、簽發 CA 編號、根 CA 私鑰路徑）。
@@ -516,7 +516,10 @@ server_ca_path = "data/pki/root-ca.pem"
 
 ### 15.4 待使用者決定
 
-1. **既有部署以代理 CA（或根 CA）當 `auth.client_ca`**（第 9 節「改為線上」、INSTALL 附錄 P.5）：如第 15.1 節所述，退役的簽發 CA 簽出的憑證在用戶端自行附上中繼憑證時仍可經由這組驗證器通過（`tls.rs` 的測試 `retired_issuing_ca_chain_depends_on_the_client_ca_choice` 確認了這個行為，並確認 `pki init` 的設定會拒絕）。`issuing-ca retire --compromised` 因此在這類部署中**不能**阻止持有外洩私鑰的人簽出可用的用戶端憑證。建議：(a) INSTALL 的升級步驟改為把 `auth.client_ca` 改成 `data/pki/issuing-cas.pem` 加上仍需要的舊代理 CA；或 (b) 在 `CompositeVerifier` 中拒絕「鏈經過已退役簽發 CA」的憑證（需要保留退役 CA 的 subject）。本衝刺只在新安裝（`pki init`）採用 (a)。
+1. **既有部署以代理 CA（或根 CA）當 `auth.client_ca`**（第 9 節「改為線上」、INSTALL 附錄 P.5）——**0.8.0 整合時已修正（兩個方案都採用）**。0.7 在這類部署中，退役的簽發 CA 簽出的憑證只要用戶端自行附上中繼憑證，就能經由 `auth.client_ca` 這組驗證器通過，`issuing-ca retire --compromised` 擋不住持有外洩私鑰的人。
+   - (b) **驗證器一律拒絕經過退役簽發 CA 的鏈**：`PkiManager::sync_cas` 把狀態為 `retired` 的簽發 CA 憑證寫成 `data/pki/issuing-cas-retired.pem`（0644，沒有時不寫），8443 的驗證器（`tls.rs` 的 `RetiredCaGuard`，包在第 10 節的兩組驗證器之外）在驗證通過後檢查用戶端送出的每一張憑證：公鑰與退役簽發 CA 相同，或由退役簽發 CA 簽出，就以「已撤銷」拒絕（`KRS-W1105`，主控台「憑證被拒」；Pulse 端 `PLS-E1105`）。這個檔案在熱重載的監看清單中：`issuing-ca retire` 後常駐行程在數秒內寫出、重建 TLS 設定，既有的連線在重新驗證時中斷。8444 的過期續簽同樣拒絕由退役簽發 CA 簽出的憑證（`auth.client_ca` 直接列出那張簽發 CA 時，0.7 會通過）。測試：`tls.rs` 的 `retired_issuing_ca_chains_are_rejected_whatever_the_client_ca`、`pki::ca` 的 `retiring_an_issuing_ca_writes_the_retired_list`、註冊服務的 `retired_issuing_ca_blocks_grace_renewal_even_if_client_ca_lists_it`。
+   - (a) **建議改用 `issuing-cas.pem`**：INSTALL 第 11 節的 0.7 → 0.8 升級說明建議把 `auth.client_ca` 改為 `data/pki/issuing-cas.pem`（所有主機都改用 Kairos 簽發的憑證之後；仍有手動簽發的憑證時，只保留那張舊代理 CA，不要放根 CA）。
+   - 限制：只比對用戶端送出的憑證。管理者自行把「與退役簽發 CA 同一把金鑰、但名稱不同的 CA 憑證」放進 `auth.client_ca` 時無法察覺（Kairos 不會產生這種憑證）。升級後的第一次啟動在 TLS 設定建立之後才寫出清單，之間的數秒內沿用 0.7 的行為。
 2. **根 CA 私鑰的加密保存**：目前明文 0600＋提示。建議沿用 `keys_backup.rs` 的 Argon2id＋AES-256-GCM 格式加上 `--encrypt-root`，`pki sign` 支援讀取加密的私鑰。
 
 ### 15.5 新的產品代碼〔暫定〕

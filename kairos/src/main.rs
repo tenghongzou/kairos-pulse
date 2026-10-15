@@ -769,6 +769,9 @@ async fn run(
             pki::issuing_crl_path(data_dir)
                 .to_string_lossy()
                 .into_owned(),
+            pki::retired_cas_path(data_dir)
+                .to_string_lossy()
+                .into_owned(),
         )
     });
     let tls_paths = TlsPaths {
@@ -776,8 +779,9 @@ async fn run(
         key: config.server.key_path.clone(),
         client_ca: config.auth.client_ca_path().map(str::to_string),
         crls: config.auth.crl_paths(),
-        issuing_cas: pki_files.as_ref().map(|(a, _)| a.clone()),
-        issuing_crl: pki_files.map(|(_, c)| c),
+        issuing_cas: pki_files.as_ref().map(|(a, _, _)| a.clone()),
+        issuing_crl: pki_files.as_ref().map(|(_, c, _)| c.clone()),
+        retired_cas: pki_files.map(|(_, _, r)| r),
     };
     let initial_fingerprint = tls::fingerprint(&tls_paths);
     let tls_state = Arc::new(TlsState::new(tls::build(&tls_paths).map_err(cert_error)?));

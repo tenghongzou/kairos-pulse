@@ -156,6 +156,7 @@ pub(crate) async fn fixture_opts(
             crls: Vec::new(),
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         })
         .unwrap(),
     ));

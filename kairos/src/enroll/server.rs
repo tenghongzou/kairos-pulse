@@ -132,6 +132,7 @@ impl Listener {
             crls: Vec::new(),
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         };
         if let Some(ca) = svc.config.pki.server_ca() {
             // server CA 的變化也要重新載入：放在 client_ca 的位置只為了納入指紋

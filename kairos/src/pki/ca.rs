@@ -1188,4 +1188,77 @@ mod tests {
         assert!(matches!(init(&conn2, &bad, NOW), Err(InitError::Usage(_))));
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// 簽發 CA 退役後，常駐行程的同步寫出 `issuing-cas-retired.pem`（8443 的驗證器拒絕經過它的鏈）並保留
+    /// 記憶體中的副本（8444 的過期續簽）；沒有變化時不重寫、不要求重建 TLS 設定
+    #[test]
+    fn retiring_an_issuing_ca_writes_the_retired_list() {
+        let base = std::env::temp_dir().join(format!("kairos-pki-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = test_db();
+        let plan = InitPlan {
+            organization: "Example Org".into(),
+            names: vec![ServerName::parse("monitor.example.com").unwrap()],
+            root_dir: base.join("root-ca"),
+            data_dir: data.clone(),
+            server_days: SERVER_DAYS,
+        };
+        let o = init(&conn, &plan, NOW).unwrap();
+        let mgr = crate::enroll::pki_mgr::PkiManager::new(&data, crate::config::PkiMode::Online);
+        let retired_path = super::super::retired_cas_path(&data);
+        // 還沒有退役的簽發 CA：不寫檔、不要求重建
+        mgr.sync_cas(&conn).unwrap();
+        assert!(!retired_path.exists());
+        assert!(mgr.retired_ca_ders().is_empty());
+        // 第二個簽發 CA → 啟用 → 退役第一個
+        let root = CaKey::load(
+            &std::fs::read_to_string(&o.root_cert).unwrap(),
+            &std::fs::read_to_string(&o.root_key).unwrap(),
+        )
+        .unwrap();
+        let (_, n) = super::super::manage::create(&conn, &data, "Example Org", NOW).unwrap();
+        let csr = parse_csr(&n.csr_pem).unwrap();
+        let second = root
+            .sign_issuing_ca(
+                &csr.spki_der,
+                csr.common_name.as_deref().unwrap_or_default(),
+                ISSUING_DAYS,
+                NOW,
+            )
+            .unwrap();
+        let installed = super::super::manage::install(
+            &conn,
+            &data,
+            &pem_encode("CERTIFICATE", &second.der),
+            NOW,
+        )
+        .unwrap();
+        ps::activate_ca(&conn, installed.ca_id).unwrap();
+        ps::retire_ca(&conn, o.ca_id, NOW).unwrap();
+        assert!(mgr.sync_cas(&conn).unwrap(), "退役後要求重建 TLS 設定");
+        let first_der = ps::get_ca(&conn, o.ca_id)
+            .unwrap()
+            .unwrap()
+            .cert_der
+            .unwrap();
+        let listed =
+            pem_decode_all(&std::fs::read_to_string(&retired_path).unwrap(), None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1, first_der);
+        assert_eq!(mgr.retired_ca_ders(), vec![first_der.clone()]);
+        // 信任錨只剩第二個
+        let anchors =
+            pem_decode_all(&std::fs::read_to_string(&o.client_ca).unwrap(), None).unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_ne!(anchors[0].1, first_der);
+        // 沒有變化：不重寫
+        assert!(!mgr.sync_cas(&conn).unwrap());
+        // 另一個行程（重新啟動）：檔案相同也重建一次記憶體中的清單
+        let mgr2 = crate::enroll::pki_mgr::PkiManager::new(&data, crate::config::PkiMode::Online);
+        mgr2.sync_cas(&conn).unwrap();
+        assert_eq!(mgr2.retired_ca_ders(), vec![first_der]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

@@ -413,6 +413,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
                 crls: Vec::new(),
                 issuing_cas: None,
                 issuing_crl: None,
+                retired_cas: None,
             },
             acceptor.clone(),
             Duration::from_secs(p.config.server.reload_interval_secs),

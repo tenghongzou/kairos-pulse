@@ -239,6 +239,7 @@ impl Server {
             crls: crl_paths,
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         }
     }
 
