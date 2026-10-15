@@ -159,7 +159,7 @@ docker run --rm rust:1.99-alpine@sha256:<新 digest> sh -c \
 - deb／rpm：nfpm 的 `mtime` 設為 commit 時間（套件內檔案與控制資料的時間）。
 - zip：檔案依名稱排序、mtime 為 commit 時間、`TZ=UTC`（DOS 時間是本地時間）、`-X` 不寫額外的時間欄位。
 - MSI：wixl 與 msibuild 在 libfaketime 下以 commit 時間執行（摘要資訊的建立／儲存時間、OLE 目錄的時間），`NO_FAKE_STAT=1` 讓 CAB 內的檔案時間取自（已固定的）mtime；PackageCode 由「版本＋commit」、ProductCode 由版本推導（不使用 wixl 產生的隨機值）。
-- Windows 執行檔以 `-Wl,--no-insert-timestamp` 連結（PE 標頭的時間戳記為 0）。
+- Windows 執行檔以 `-Wl,--no-insert-timestamp` 連結（PE 標頭的時間戳記為 0），並以 `-C strip=symbols` 去掉符號表（rustc 為 raw-dylib 產生的匯入程式庫在隨機命名的暫存目錄中，目錄名稱會留在 COFF 符號表）。
 
 ## 6. SBOM 與第三方授權
 

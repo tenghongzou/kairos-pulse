@@ -86,7 +86,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 - **aarch64 Linux（musl）**：Kairos、Pulse 都以 cargo-zigbuild 0.23.4＋zig 0.16.0 交叉編譯，以 qemu-aarch64 在建置容器內執行 `--version` 確認。
 - 發佈腳本（`packaging/build-release-common.sh`）改為多目標：`TARGETS`（預設 Kairos 為 Linux x86_64／aarch64，Pulse 另加 Windows x86_64）、`PACKAGES`（預設 `deb rpm`）、`BUILD_JOBS`（容器內 cargo 的平行數，預設 2）。THIRD-PARTY-LICENSES 與 SBOM 每個目標各自產生（Windows 的依賴不同）。
-- **可重現**：所有新產物以 commit 時間為時間戳記（tar、zip〔TZ=UTC〕、nfpm 的 `mtime`、MSI〔libfaketime〕），MSI 的 PackageCode／ProductCode 由版本與 commit 推導，Windows 執行檔以 `--no-insert-timestamp` 連結；`packaging/check-reproducible.sh` 比對所有產物。
+- **可重現**：所有新產物以 commit 時間為時間戳記（tar、zip〔TZ=UTC〕、nfpm 的 `mtime`、MSI〔libfaketime〕），MSI 的 PackageCode／ProductCode 由版本與 commit 推導，Windows 執行檔以 `--no-insert-timestamp` 連結並去掉符號表；`packaging/check-reproducible.sh` 比對所有產物。
 - 建置容器多安裝的 Alpine 套件（版本固定）：`zig`、`qemu-aarch64`、`mingw-w64-gcc`、`msitools`、`libfaketime`、`zip`；nfpm 以固定版本下載並核對 SHA-256。
 
 ### 新的產品代碼〔暫定，需設計包分配〕

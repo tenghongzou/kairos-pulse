@@ -51,7 +51,7 @@
 # EXTRA_SRC（其餘皆 644）。可重現：tar 的擁有者一律為 0:0、檔案依名稱排序；tar、zip、deb、rpm、MSI
 # 內所有檔案的時間戳記固定為 commit 時間（SOURCE_DATE_EPOCH；nfpm 的 mtime、zip 以 TZ=UTC、
 # MSI 以 libfaketime）；MSI 的 PackageCode 與 ProductCode 由版本與 commit 推導；Windows 執行檔以
-# --no-insert-timestamp 連結（PE 標頭沒有建置時間）。PROTOCOL.md 取自兩個產品共用的唯一規格，
+# --no-insert-timestamp 連結（PE 標頭沒有建置時間）並去掉符號表。PROTOCOL.md 取自兩個產品共用的唯一規格，
 # CHANGELOG.md 取自 repo 根目錄。
 #
 # THIRD-PARTY-LICENSES（商業審計 B2）與 SBOM（D4）每個目標各自在容器內依 Cargo.lock 重新產生，
@@ -294,9 +294,10 @@ for T in $TARGETS; do
     aarch64-unknown-linux-musl)
         cargo zigbuild --release --locked --target "$T" ;;
     x86_64-pc-windows-gnu)
-        # PE 標頭不寫建置時間（可重現）
+        # 可重現：PE 標頭不寫建置時間；去掉符號表（rustc 為 raw-dylib 產生的匯入程式庫放在隨機命名的
+        # 暫存目錄 rustcXXXXXX，目錄名稱會進入 COFF 符號表，每次建置都不同）
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
-        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C link-arg=-Wl,--no-insert-timestamp" \
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C link-arg=-Wl,--no-insert-timestamp -C strip=symbols" \
             cargo build --release --locked --target "$T" ;;
     *)
         cargo build --release --locked --target "$T" ;;
