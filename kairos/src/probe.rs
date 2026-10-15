@@ -60,8 +60,8 @@ pub const PROXY_HEADERS: [&str; 6] = [
     "via",
 ];
 
-/// 〔暫定〕`/metrics` 經反向代理轉送、但沒有設定 `observability.metrics_token_file` 而拒絕
-/// （子類別 03「安全預設」；正式號碼待設計包分配）
+/// `/metrics` 經反向代理轉送、但沒有設定 `observability.metrics_token_file` 而拒絕
+/// （子類別 03「安全預設」；設計包 `decisions/INTEGRATION.md` §29.3 正式分配）
 pub const CODE_METRICS_PROXIED: &str = "KRS-W0304";
 
 /// 請求是否帶有反向代理的轉送標頭（[`PROXY_HEADERS`]）

@@ -7,12 +7,12 @@
 //! | 同一個管道（不分使用者） | [`PER_CHANNEL`]：60 秒內 3 次 |
 //! | 同一個使用者（不分管道，含未儲存的管道） | [`PER_ACTOR`]：10 分鐘內 10 次 |
 //!
-//! 超過時回 429 `rate_limited`（〔暫定〕[`CODE_TEST_RATE_LIMITED`]）與 `Retry-After`，不送出、
+//! 超過時回 429 `rate_limited`（[`CODE_TEST_RATE_LIMITED`]）與 `Retry-After`，不送出、
 //! 不寫發送紀錄。只在記憶體中計數（重新啟動後歸零）。
 
 use std::collections::{HashMap, VecDeque};
 
-/// 〔暫定〕測試通知太頻繁（子類別 51「通知管道」；正式號碼待設計包分配）
+/// 測試通知太頻繁（子類別 51「通知管道」；設計包 `decisions/INTEGRATION.md` §29.3 正式分配）
 pub const CODE_TEST_RATE_LIMITED: &str = "KRS-W5111";
 /// 同一個管道：(次數, 視窗毫秒)
 pub const PER_CHANNEL: (usize, i64) = (3, 60_000);

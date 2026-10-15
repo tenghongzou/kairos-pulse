@@ -17,7 +17,7 @@
 //!   （12 bytes 隨機 nonce）。都是既有的依賴（`argon2`、`ring`），不引入 age 等新的 crate。
 //! - 附加資料（AAD）是 `format`、`kdf`、`cipher` 的正規 JSON：竄改參數、鹽或 nonce 都會使解密失敗。
 //! - 明文是簡單的二進位串列（名稱長度、名稱、內容長度、內容），不經過 JSON 字串，整段在記憶體中用完
-//!   即清除（`zeroize`）；密碼也一樣。錯誤的密碼與被修改的檔案無法區分（同一個錯誤，〔暫定〕
+//!   即清除（`zeroize`）；密碼也一樣。錯誤的密碼與被修改的檔案無法區分（同一個錯誤，
 //!   [`CODE_KEYS_BACKUP`]）。
 //! - 讀取時限制 KDF 參數的上限（避免被修改的檔案要求數十 GB 記憶體）。
 
@@ -31,8 +31,8 @@ use zeroize::Zeroizing;
 
 use crate::api::http::{b64url_decode, b64url_encode};
 
-/// 〔暫定〕金鑰備份無法解開或還原（密碼錯誤、檔案被修改、格式不符、無法寫回資料目錄）；
-/// 子類別 43「匯出與匯入」，正式號碼待設計包分配
+/// 金鑰檔的加密備份無法建立、解開或還原（密碼錯誤、檔案被修改、格式不符、無法寫回資料目錄）；
+/// 子類別 43「匯出、匯入與備份」（設計包 `decisions/INTEGRATION.md` §29.3 正式分配）
 pub const CODE_KEYS_BACKUP: &str = "KRS-E4307";
 /// 格式名稱
 pub const FORMAT: &str = "kairos.keys-backup/v1";

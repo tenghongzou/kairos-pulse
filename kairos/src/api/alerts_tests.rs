@@ -708,7 +708,7 @@ async fn undecryptable_channel_secrets_and_test_rate_limit() {
     let cid = r.json()["data"]["channel_id"].as_str().unwrap().to_string();
     let test_path = format!("/api/v1/channels/{cid}/test");
 
-    // 限速：同一個管道 60 秒內 3 次，第 4 次 429（Retry-After、暫定代碼），不送出
+    // 限速：同一個管道 60 秒內 3 次，第 4 次 429（Retry-After、KRS-W5111），不送出
     for _ in 0..3 {
         let r = call(addr, "POST", &test_path, Some(&admin), Some(&json!({}))).await;
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));

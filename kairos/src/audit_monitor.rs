@@ -1,7 +1,7 @@
 //! 稽核雜湊鏈的定期工作（0.7〔草稿〕；設計包 `decisions/INTEGRATION.md` §28.5 #10）：
 //!
 //! - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘寫一行固定事件 `audit.chain_anchor`
-//!   （〔暫定〕[`CODE_ANCHOR`]，INFO），欄位 `last_id`、`last_hash`、`hmac_since`。以 syslog 或日誌收集器
+//!   （[`CODE_ANCHOR`]，INFO），欄位 `last_id`、`last_hash`、`hmac_since`。以 syslog 或日誌收集器
 //!   送到其他主機後，就是資料庫之外的副本：能改寫資料庫（甚至 HMAC 金鑰）的人也改不了已經送出的行。
 //!   比對方式見 `kairos/API.md` 第 12.8 節。
 //! - **自我驗證**：每 `audit.verify_interval_hours` 小時（第一次在啟動後 [`FIRST_RUN`]）重新計算整條鏈與
@@ -20,7 +20,7 @@ use crate::config::AuditSettings;
 use crate::enroll::db::{DbError, EnrollDb};
 use crate::shutdown::Shutdown;
 
-/// 〔暫定〕定期外送的鏈尾雜湊（子類別 62「稽核日誌」；正式號碼待設計包分配）
+/// 定期外送的鏈尾雜湊（子類別 62「稽核日誌」；設計包 `decisions/INTEGRATION.md` §29.3 正式分配）
 pub const CODE_ANCHOR: &str = "KRS-I6202";
 /// 第一次外送與驗證：啟動後多久（啟動時的寫入先完成）
 pub const FIRST_RUN: Duration = Duration::from_secs(60);

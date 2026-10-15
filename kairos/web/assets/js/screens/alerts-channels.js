@@ -5,7 +5,7 @@
 // - 權限：管理員（channels:write）新增、修改、刪除；維運者（channels:read＋channels:test）只能看與寄送測試。
 // - 機密（SMTP 密碼、Webhook 網址、標頭、HMAC 金鑰、LINE token）只顯示遮蔽值，只能更換不能檢視；PUT 只送出更換的欄位。
 // - 狀態 secrets_unavailable：機密無法解開（alerts-secrets.key 遺失或不成對，KRS-E5110），寫出處理方式。
-// - 測試通知的限速（429，〔暫定〕KRS-W5111）：寫出是哪一種限制與幾秒後再試。
+// - 測試通知的限速（429，KRS-W5111）：寫出是哪一種限制與幾秒後再試。
 // - 0.7.0 隱藏（decisions/INTEGRATION.md §28.6）：每日彙整、Email 的 HTML 版（「內容格式」只有純文字）、Alertmanager 相容格式、
 //   代理伺服器欄位（LINE、Teams 需要直接連外）。
 

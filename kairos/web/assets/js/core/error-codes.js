@@ -1,6 +1,6 @@
 // 自動產生，請勿手動修改：node kairos/web/tools/sync-design.mjs
-// 來源：設計包 prototype/kairos/error-codes.js（copywriting.md §3.3 錯誤代碼總表、§4.2 三段式範例；產生於 2026-10-14）
-// 只含 Kairos（KRS-）的 100 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
+// 來源：設計包 prototype/kairos/error-codes.js（copywriting.md §3.3 錯誤代碼總表、§4.2 三段式範例；產生於 2026-10-15）
+// 只含 Kairos（KRS-）的 104 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
 export const ERROR_CODES = {
  "KRS-E0101": {
   "level": "E",
@@ -57,6 +57,13 @@ export const ERROR_CODES = {
   "title": null,
   "reason": null,
   "fix": null
+ },
+ "KRS-W0304": {
+  "level": "W",
+  "text": "`/metrics` 拒絕經反向代理轉送的請求：沒有設定 `observability.metrics_token_file`（`/metrics` 只接受 loopback）時，帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 或 `Via` 標頭的請求回 403。理由：同一台主機上的反向代理轉送進來的來源都是 `127.0.0.1`，「只接受 loopback」會變成任何能連到代理的人都能讀取指標。Kairos 第一次拒絕時記一行 `WARN`（日誌事件 `observability.metrics_proxied`），之後不重複記錄；不推播、不開事件。不加這些標頭的代理 Kairos 無法發現，所以不能以這個檢查代替 token。子類別 03（安全預設）。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §29）",
+  "title": "已拒絕經反向代理轉送的 /metrics 請求",
+  "reason": "`/metrics` 沒有設定 token（`observability.metrics_token_file`），只接受本機（loopback）的連線；這個請求帶有 `X-Forwarded-For: 10.20.0.15`，是經由同一台主機上的反向代理轉送進來的。若允許，任何能連到代理的人都能讀取主機數量、憑證到期日等指標。",
+  "fix": "1. 建立 token 檔（例如 `openssl rand -hex 32 | sudo tee /opt/kairos/metrics.token`，擁有者 `kairos`、權限 0600），在 `kairos.toml` 設定 `observability.metrics_token_file = \"/opt/kairos/metrics.token\"`，重新啟動 Kairos。\n2. Prometheus 的抓取設定加上 bearer token（`authorization: { credentials_file: … }`）。\n3. 不需要經過代理時，讓 Prometheus 直接抓 `https://127.0.0.1:9443/metrics`，或另開 `observability.listen` 只綁 Prometheus 可達的位址。"
  },
  "KRS-E0401": {
   "level": "E",
@@ -485,6 +492,13 @@ export const ERROR_CODES = {
   "reason": "`reports-2026-10-04.jsonl` 第 3 行不是合法的 JSON；第 17282 行是沒有換行的最後一行（檔案可能仍在寫入）。其餘 34,560 筆已匯入。",
   "fix": "確認是否為截斷或手動編輯過的檔案；最後一行不完整時，等檔案寫完後重新執行（已匯入的部分不會重複）。"
  },
+ "KRS-E4307": {
+  "level": "E",
+  "text": "金鑰檔的加密備份無法建立、解開或還原（`kairos db backup --include-keys`、`kairos db restore-keys`，`design-system/cli-style.md` §11.12）：還原時備份密碼錯誤或 `.keys` 檔被修改、截斷（兩者在加密上無法區分）、不是 `kairos.keys-backup/v1` 格式、資料目錄已有內容不同的金鑰檔（確認資料庫來自同一份備份後加 `--overwrite`）、無法寫回 `storage.data_dir`；建立時備份密碼不符合要求（少於 12 個字元、含換行）、金鑰檔無法讀取或長度不對、`.keys` 無法寫出。一律不寫入任何金鑰檔（還原時先檢查全部再寫入，不會只還原一半；建立時不留下資料庫備份），結束代碼 1。資料庫備份本身的失敗（備份檔已存在、磁碟已滿）仍是 `4301`。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §29）",
+  "title": "無法還原金鑰檔：備份密碼錯誤或檔案已被修改",
+  "reason": "以提供的備份密碼無法解開 `/var/backups/kairos/kairos-2026-10-15.db.keys`。密碼錯誤與檔案被修改、截斷在加密上無法區分。資料目錄沒有寫入任何金鑰檔。",
+  "fix": "1. 確認使用的是建立這份備份時的備份密碼（密碼檔的第一行；注意編輯器加上的 BOM 或結尾空白）。\n2. 確認檔案是 `kairos db backup --include-keys` 產生的 `<備份檔>.keys`，大小與備份時相同、傳輸時沒有被轉換換行。\n3. 密碼確實遺失時無法解開：通知管道的機密要在「通知管道」重新輸入、所有人的兩步驟驗證要重設（`kairos users reset-mfa`）、稽核日誌的 HMAC 無法驗證（`KRS-E6201`，以外送的鏈尾雜湊確認之前的紀錄）。"
+ },
  "KRS-E5001": {
   "level": "E",
   "text": "告警規則無法儲存",
@@ -557,10 +571,17 @@ export const ERROR_CODES = {
  },
  "KRS-E5110": {
   "level": "E",
-  "text": "通知管道的設定無效，無法儲存或發送：缺少必填欄位、網址或 Email 格式錯誤、Webhook 用 `http://` 但未允許（`allow_http`）、`security = \"none\"` 卻設定了 SMTP 密碼、`ca_file` 無法讀取等（主控台 API 400 `channel_invalid`，`details.parameter` 指出欄位）。S11 在欄位旁就地顯示；已儲存的管道在發送時才發現（例如 `ca_file` 被刪除）時記在發送紀錄。2026-10-15 分配",
+  "text": "通知管道的設定無效，無法儲存或發送：缺少必填欄位、網址或 Email 格式錯誤、Webhook 用 `http://` 但未允許（`allow_http`）、`security = \"none\"` 卻設定了 SMTP 密碼、`ca_file` 無法讀取等（主控台 API 400 `channel_invalid`，`details.parameter` 指出欄位）。S11 在欄位旁就地顯示；已儲存的管道在發送時才發現（例如 `ca_file` 被刪除）時記在發送紀錄。2026-10-15 分配。0.7 起資料目錄的 `alerts-secrets.key` 遺失或與資料庫不成對時，管道狀態為 `secrets_unavailable`（「無法解開機密」）也用此碼：不嘗試發送，「通知管道失敗」以此碼開事件（`kairos/alerts-ux.md` 5.5）",
   "title": "無法儲存通知管道「值班 Webhook」：網址必須是 https://",
   "reason": "Webhook 網址為 `http://10.20.0.8/hook`。Kairos 預設只送 HTTPS，避免告警內容與簽章金鑰以明文經過網路。",
   "fix": "改用 `https://` 網址；內部閘道確實只支援 HTTP 時，勾選「允許未加密的 HTTP」（`allow_http`）並了解內容會以明文傳送。"
+ },
+ "KRS-W5111": {
+  "level": "W",
+  "text": "測試通知太頻繁（HTTP 429 `rate_limited`，附 `Retry-After`；`details.scope` 為 `channel` 或 `user`）：同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含尚未儲存的管道）。超過時不送出、不寫發送紀錄；計數只在記憶體中，Kairos 重新啟動後歸零。理由：測試通知會真的送到值班群組或信箱。與驗證失敗的限速（`6011`）是不同的情況，HTTP 的 `code` 相同，主控台依 `product_code` 區分。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §29）",
+  "title": "測試通知太頻繁，請稍後再試",
+  "reason": "「值班 LINE」在 60 秒內已寄送 3 次測試通知。測試通知會真的送到值班群組或信箱，為了避免洗版，每個管道 60 秒內最多 3 次、每個人 10 分鐘內最多 10 次。",
+  "fix": "45 秒後再按「寄送測試通知」。要確認設定是否正確，先看上一次測試的結果與回應碼（在按鈕下方）。"
  },
  "KRS-E6001": {
   "level": "E",
@@ -627,7 +648,7 @@ export const ERROR_CODES = {
  },
  "KRS-E6010": {
   "level": "E",
-  "text": "主控台 API 驗證失敗（HTTP 401 `unauthorized`）：沒有 `Authorization` 標頭或格式錯誤、API token 不存在、已撤銷或已過期；對外不區分是哪一種，附 `WWW-Authenticate: Bearer realm=\"kairos\"`。每次失敗都扣該來源的驗證失敗額度（`6011`）。登入畫面的帳號密碼錯誤用 `6001`。2026-10-13 分配（`decisions/INTEGRATION.md` §26）。**主控台的工作階段**（cookie）結束、閒置或絕對逾時、使用者被停用或刪除時也用此碼，`details.reason = \"session_expired\"`：主控台不顯示錯誤頁，而是帶 `next` 回到 S01 並顯示「工作階段已結束，請重新登入」（2026-10-15 定案，§26.8 #4、§28）",
+  "text": "主控台 API 驗證失敗（HTTP 401 `unauthorized`）：沒有 `Authorization` 標頭或格式錯誤、API token 不存在、已撤銷或已過期；對外不區分是哪一種，附 `WWW-Authenticate: Bearer realm=\"kairos\"`。出示了 API token 或工作階段 cookie 而失敗時扣該來源的驗證失敗額度（`6011`）；**完全沒有出示憑據**（沒有 `Authorization`、也沒有工作階段 cookie）的請求仍回 401，但**不扣額度**（0.7 起，`decisions/INTEGRATION.md` §29：未登入的瀏覽器開啟主控台時會先讀取 `/api/v1/me`，否則重新整理登入頁幾次就會被限速）。登入畫面的帳號密碼錯誤用 `6001`。2026-10-13 分配（`decisions/INTEGRATION.md` §26）。**主控台的工作階段**（cookie）結束、閒置或絕對逾時、使用者被停用或刪除時也用此碼，`details.reason = \"session_expired\"`：主控台不顯示錯誤頁，而是帶 `next` 回到 S01 並顯示「工作階段已結束，請重新登入」（2026-10-15 定案，§26.8 #4、§28）",
   "title": "API token 無效或已過期，請求被拒絕",
   "reason": "請求沒有可用的 API token。可能是沒有帶 `Authorization` 標頭或格式不是 `Bearer kat_…`、只貼了 token_id 而不是整串 token、token 已撤銷，或已過期（預設建立後 90 天）。Kairos 對外不區分這幾種情況，避免透露哪些 token 存在。",
   "fix": "1. 確認請求帶的是建立時顯示的整串 token：`Authorization: Bearer kat_<token_id>_<秘密>`。\n2. 請 Kairos 管理者查 token 的狀態與到期日：`sudo -u kairos /opt/kairos/kairos api-token list --all --config /opt/kairos/kairos.toml`。已撤銷或已過期時建立新的 token（`cli-style.md` §11.6），更新到使用它的系統後，撤銷不再使用的舊 token。\n3. 修正前先停止會自動重試的腳本：連續失敗超過 10 次時，同一來源 IP 的所有請求會被暫時拒絕（`KRS-W6011`）。"
@@ -655,7 +676,7 @@ export const ERROR_CODES = {
  },
  "KRS-W6011": {
   "level": "W",
-  "text": "同一來源驗證失敗太多次，暫時拒絕該來源的**所有** API 請求（HTTP 429 `rate_limited`，附 `Retry-After`，不再檢查 token）：依來源 IP 計算（IPv6 以 /64 合併），可連續失敗 10 次、之後每 6 秒恢復 1 次，最多約 1 分鐘；成功的請求不扣額度。同一 NAT 或代理後的其他用戶端會被連帶限制。每個來源第一次被限制時 Kairos 記一行 `WARN`（不記 token 內容）。與註冊端點的速率限制（`2202`）無關。2026-10-13 分配",
+  "text": "同一來源驗證失敗太多次，暫時拒絕該來源的**所有** API 請求（HTTP 429 `rate_limited`，附 `Retry-After`，不再檢查 token）：依來源 IP 計算（IPv6 以 /64 合併），可連續失敗 10 次、之後每 6 秒恢復 1 次，最多約 1 分鐘；成功的請求、完全沒有出示憑據的請求（0.7 起）不扣額度。同一 NAT 或代理後的其他用戶端會被連帶限制。每個來源第一次被限制時 Kairos 記一行 `WARN`（不記 token 內容）。與註冊端點的速率限制（`2202`）無關。2026-10-13 分配",
   "title": "驗證失敗太多次，這個來源暫時無法使用主控台 API",
   "reason": "來自 10.20.5.31 的請求在短時間內驗證失敗超過 10 次（例如腳本帶著已過期的 token 反覆重試），Kairos 暫時拒絕這個來源的所有 API 請求，帶有效 token 的請求也一樣。額度每 6 秒恢復 1 次，停止失敗後最多約 1 分鐘恢復；同一個 NAT 或代理後的其他用戶端也會一起被限制。",
   "fix": "1. 找出並停止帶錯誤 token 的程式：Kairos 日誌中 `KRS-W6011` 那一行寫出來源位址；來源是 NAT 或代理時，檢查同一出口後的所有用戶端。\n2. 依回應的 `Retry-After` 秒數等待後再試，不需要重新啟動 Kairos。"
@@ -669,10 +690,17 @@ export const ERROR_CODES = {
  },
  "KRS-E6201": {
   "level": "E",
-  "text": "稽核日誌完整性驗證失敗（雜湊鏈斷裂）",
-  "title": null,
-  "reason": null,
-  "fix": null
+  "text": "稽核日誌完整性驗證失敗（`kairos audit verify` 結束代碼 9、API `POST /api/v1/audit/verify` 的 `broken`、每 24 小時的自我驗證）。「原因」寫出第一個斷點的編號與是哪一種：**雜湊鏈斷裂**——`hash_mismatch`（內容被修改）、`prev_mismatch`（前一筆被刪除或順序被改）、`missing_hash`（缺少雜湊）、`anchor_mismatch`（保留清除後的起點不符）、`head_mismatch`（最後幾筆被刪除）；**HMAC 不符**（0.7 起，稽核紀錄另以資料目錄的 `audit-hmac.key` 計算 HMAC）——`missing_hmac`（HMAC 起點之後的紀錄沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被整段重新計算）、`hmac_boundary_mismatch`（HMAC 的起點被移動）；**無法驗證 HMAC**——`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與 HMAC 起點記錄的不同）。前兩類表示紀錄可能被修改、刪除或插入，處理方式是保全資料庫檔並與匯出或外送的鏈尾雜湊（`6202`）比對；第三類雜湊鏈本身完整，但無法排除整段被重新計算，處理方式是從備份還原 `audit-hmac.key`（`kairos db restore-keys`）。三類同號：都代表「無法證明稽核日誌沒有被竄改」，系統規則「稽核日誌完整性」（緊急）一律開事件；處理方式以「原因」區分（`decisions/INTEGRATION.md` §29）。HMAC 起點之前的紀錄（0.7 之前寫入）只有雜湊鏈，不是錯誤，驗證結果寫出邊界",
+  "title": "稽核日誌完整性驗證失敗：第 12,391 筆的 HMAC 不符",
+  "reason": "第 12,391 筆的雜湊鏈前後相接，但 HMAC 與以 `audit-hmac.key` 重新計算的值不同：紀錄被修改後，整條雜湊鏈被重新計算過（只有能改寫資料庫檔的人做得到）。",
+  "fix": "1. 保全資料庫檔（複製 `kairos.db` 與 `kairos.db-wal`），不要再寫入。\n2. 與先前匯出的 JSONL（`kairos audit export`）或外送的鏈尾雜湊（`audit.chain_anchor`，`KRS-I6202`）比對，找出被修改、刪除或插入的紀錄。\n3. 原因是「HMAC 的金鑰檔遺失或無法讀取」或「金鑰檔與啟用時不同」時，雜湊鏈本身完整：從備份還原 `audit-hmac.key`（`kairos db restore-keys`）後再執行 `kairos audit verify`。"
+ },
+ "KRS-I6202": {
+  "level": "I",
+  "text": "稽核鏈尾的定期外送：每 `audit.anchor_log_minutes` 分鐘（預設 60；0 不寫，範圍 5～1440）寫一行固定日誌事件 `audit.chain_anchor`（`INFO`；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`），經 syslog 或日誌收集器送到其他主機後，就是資料庫以外的副本，用來發現「改寫資料庫並重新計算整條鏈」或「刪除 HMAC 把鏈降級」。只在日誌，不在主控台、不推播、不寫稽核紀錄。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §29）",
+  "title": "稽核鏈尾已記錄：第 12,408 筆",
+  "reason": "Kairos 每 60 分鐘（`audit.anchor_log_minutes`）把最後一筆稽核紀錄的編號、雜湊與 HMAC 寫一行到日誌。這些行經 syslog 送到其他主機後，就是資料庫以外的副本：即使有人改寫資料庫並重新計算整條鏈，也會與外送的這一行對不上。",
+  "fix": "不需要處理。請確認這些行確實送到另一台主機（`[log.syslog]` 或日誌收集器）並保存至少與稽核日誌保留期間一樣久。調查時取外送的某一行，確認資料庫中同一筆的雜湊相同、之後的紀錄能從它接上（`kairos audit verify`、`kairos audit export`）。"
  },
  "KRS-E7001": {
   "level": "E",

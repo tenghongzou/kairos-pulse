@@ -153,7 +153,7 @@ export const ALERT_STRINGS = {
   'alerts.assign.title1': '指派事件',
   'alerts.assign.titleN': '指派 {n} 筆事件',
   'alerts.assign.who': '負責人（帳號）',
-  'alerts.assign.hint': '指派不等於確認，對方仍需確認。這個版本不會另外通知被指派的人。',
+  'alerts.assign.hint': '請輸入完整帳號（例如 chen.y）。指派不等於確認，對方仍需確認。這個版本不會另外通知被指派的人。',
   'alerts.assign.required': '請輸入負責人的帳號。',
   'alerts.assign.submit': '指派',
   'alerts.assign.done': '已指派給 {who}（{n} 筆）',

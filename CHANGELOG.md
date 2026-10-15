@@ -70,12 +70,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 ### Kairos
 
 - **`offline_reason` 名稱統一**（§28.5 #4）：主機列表、詳情、總覽與 SSE 改用 `idle_timeout`／`agent_closed`；過渡期另帶 `*_legacy`，查詢參數接受新舊名稱；`offline_reason` 查詢另接受 `write_unknown`（0.6 漏列）。
-- **金鑰檔的加密備份**（§28.5 #8、§28.9 #3）：`kairos db backup --include-keys (--password-file <檔案> | --password-stdin)` 把存在的 `alerts-secrets.key`、`console.key`、`audit-hmac.key` 以備份密碼加密寫成 `<備份檔>.keys`（0600；Argon2id m=64 MiB／t=3／p=1 衍生金鑰＋AES-256-GCM，`format`、KDF 參數與鹽為 AAD），預設不含；不接受命令列上的密碼。`kairos db restore-keys <檔案>` 解開並以 0600 寫回資料目錄（暫存檔＋改名；以 root 執行時擁有者改為資料目錄的擁有者；不同的既有檔案需 `--overwrite`，舊檔改名保留）。密碼錯誤與檔案被修改都以〔暫定〕`KRS-E4307` 拒絕。密碼、衍生金鑰與解開的金鑰在記憶體中以 `zeroize` 清除（`zeroize` 已在依賴樹中，經 rustls）。
+- **金鑰檔的加密備份**（§28.5 #8、§28.9 #3）：`kairos db backup --include-keys (--password-file <檔案> | --password-stdin)` 把存在的 `alerts-secrets.key`、`console.key`、`audit-hmac.key` 以備份密碼加密寫成 `<備份檔>.keys`（0600；Argon2id m=64 MiB／t=3／p=1 衍生金鑰＋AES-256-GCM，`format`、KDF 參數與鹽為 AAD），預設不含；不接受命令列上的密碼。`kairos db restore-keys <檔案>` 解開並以 0600 寫回資料目錄（暫存檔＋改名；以 root 執行時擁有者改為資料目錄的擁有者；不同的既有檔案需 `--overwrite`，舊檔改名保留）。密碼錯誤與檔案被修改都以`KRS-E4307` 拒絕。密碼、衍生金鑰與解開的金鑰在記憶體中以 `zeroize` 清除（`zeroize` 已在依賴樹中，經 rustls）。
 - **稽核雜湊鏈的 HMAC**（審計 S7 的強化）：每筆紀錄的雜湊另以 `audit-hmac.key` 衍生的金鑰計算 HMAC-SHA256，head 另帶 mac；HMAC 的起點記在 `meta.audit_hmac`，`kairos audit verify`、`POST /api/v1/audit/verify` 寫出邊界與 `hmac` 結果。新的斷點原因 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`。金鑰與 `console.key` 分開（取捨見 `kairos/src/audit.rs`）。
-- **鏈尾外送與自我驗證**（§28.5 #10）：每 `audit.anchor_log_minutes`（預設 60）分鐘寫一行固定事件 `audit.chain_anchor`（〔暫定〕`KRS-I6202`），經 syslog 外送成為資料庫之外的副本；每 `audit.verify_interval_hours`（預設 24）小時自我驗證，結果發布到內部事件匯流排（`audit_integrity`），失敗時記 `ERROR` 並開 `sys.audit_integrity`。
-- **`/metrics` 與反向代理**：見破壞性變更第 5 項；第一次拒絕時記 `WARN`（`observability.metrics_proxied`，〔暫定〕`KRS-W0304`）。
+- **鏈尾外送與自我驗證**（§28.5 #10）：每 `audit.anchor_log_minutes`（預設 60）分鐘寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`），經 syslog 外送成為資料庫之外的副本；每 `audit.verify_interval_hours`（預設 24）小時自我驗證，結果發布到內部事件匯流排（`audit_integrity`），失敗時記 `ERROR` 並開 `sys.audit_integrity`。
+- **`/metrics` 與反向代理**：見破壞性變更第 5 項；第一次拒絕時記 `WARN`（`observability.metrics_proxied`，`KRS-W0304`）。
 - **通知管道的機密無法解開**：狀態 `secrets_unavailable`（`KRS-E5110`），API、`kairos alert-channels list` 顯示；不嘗試發送；告警服務在狀態轉換時記 `WARN` 並發布內部事件 `channel_secrets`，「通知管道失敗」以 `KRS-E5110` 開事件（原本只在日誌記 `alerts.channel.decrypt_failed`）。
-- **測試通知的限速**：每管道 60 秒 3 次、每使用者 10 分鐘 10 次（429，〔暫定〕`KRS-W5111`）。
+- **測試通知的限速**：每管道 60 秒 3 次、每使用者 10 分鐘 10 次（429，`KRS-W5111`）。
 - **啟動時的設定檔錯誤帶代碼**：`錯誤 KRS-E0101／E0401／E0402（或 E0201／E0202）：Kairos 啟動失敗: …`，與 `--check-config` 相同的判斷，結束代碼仍為 3；CLI 的設定檔錯誤同樣改用正確的代碼（原本一律 `KRS-E0201`）。
 - **`kairos api-token create`**：沒有 `--role`／`--user` 時在 stderr 提示「i 未指定 --role，使用唯讀（viewer）；需要讀取註冊、憑證與設定時請改用 --role auditor」；`--scope` 改以 `⚠ 警告 KRS-W0104` 提醒（`--json` 放在 `warnings`）。
 - 設定：`[audit] anchor_log_minutes`（0 或 5～1440）、`verify_interval_hours`（1～168）。依賴：`zeroize`（直接依賴，版本與 rustls 使用的相同，不新增套件）。
@@ -84,12 +84,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 - 啟動時 `pulse.toml` 存在但無法讀取（權限、I/O）改以 `PLS-E0402` 說明（原本為 `PLS-E0101`）。
 
-### 暫定的產品代碼（待設計包正式分配）
+### 新的產品代碼（設計包 `decisions/INTEGRATION.md` §29.3 正式分配，號碼與工程暫定的相同）
 
 | 代碼 | 意義 | 使用處 |
 |---|---|---|
 | `KRS-W0304` | `/metrics` 經反向代理轉送、但沒有設定 `observability.metrics_token_file` 而拒絕 | 日誌（第一次） |
-| `KRS-E4307` | 金鑰備份無法解開或還原（密碼錯誤、檔案被修改、格式不符、無法寫回資料目錄） | `kairos db backup --include-keys`、`kairos db restore-keys` |
+| `KRS-E4307` | 金鑰檔的加密備份無法建立、解開或還原（密碼錯誤、檔案被修改、格式不符、無法寫回資料目錄；子類別 43 改名為「匯出、匯入與備份」） | `kairos db backup --include-keys`、`kairos db restore-keys` |
 | `KRS-W5111` | 測試通知太頻繁（429 `rate_limited`） | `POST /api/v1/channels/{id}/test` |
 | `KRS-I6202` | 稽核鏈尾的定期外送（固定事件 `audit.chain_anchor`） | 日誌、syslog |
 

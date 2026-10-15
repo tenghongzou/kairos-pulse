@@ -544,7 +544,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 |---|---|---|
 | `/healthz` | 不需要 | 存活：`200 {"status":"ok"}`；關機中 `503 {"status":"shutting_down"}` |
 | `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用 |
-| `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403），且請求帶有反向代理的轉送標頭（`Forwarded`、`X-Forwarded-For`／`-Host`／`-Proto`、`X-Real-IP`、`Via`）時一律 403（0.7；第一次記 `WARN`〔暫定〕`KRS-W0304`）。**經反向代理提供 `/metrics` 時必須設定 token**：代理轉送的請求來源都是 loopback，而不加轉送標頭的代理（例如 nginx 的預設）Kairos 無法發現 | Prometheus 文字格式（0.0.4） |
+| `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403），且請求帶有反向代理的轉送標頭（`Forwarded`、`X-Forwarded-For`／`-Host`／`-Proto`、`X-Real-IP`、`Via`）時一律 403（0.7；第一次記 `WARN``KRS-W0304`）。**經反向代理提供 `/metrics` 時必須設定 token**：代理轉送的請求來源都是 loopback，而不加轉送標頭的代理（例如 nginx 的預設）Kairos 無法發現 | Prometheus 文字格式（0.0.4） |
 
 負載平衡器（L4 或 HTTP 探針）建議以 `/readyz` 判斷：主控台的監聽要開放給負載平衡器時，改用 `observability.listen` 綁在負載平衡器可達的位址（`/metrics` 仍只接受 loopback 或帶 token 的請求）。
 

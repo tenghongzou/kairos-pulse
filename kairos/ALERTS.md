@@ -166,7 +166,7 @@ subnet_prefix_v6 = 64
 - **重試與退避**：30 秒、1、2、4、5、5…分鐘；429／503 帶 `Retry-After` 時依它；超過 15 分鐘仍無法送出標為 `failed`（記錄錯誤代碼）。
 - **機密無法解開**（0.7）：資料目錄的 `alerts-secrets.key` 遺失（Kairos 會建立新的）或與資料庫不成對時，管道的狀態為 `secrets_unavailable`（`last_error_code` 為 `KRS-E5110`）：不會以空的網址或密碼嘗試發送，通知與失敗的管道同樣暫緩；API、`kairos alert-channels list` 顯示狀態，告警服務在狀態轉換時記一次 `WARN`（`alerts.channel.secrets_unavailable`）並發布 `channel_secrets`，「通知管道失敗」以 `KRS-E5110` 開事件。還原金鑰檔（`kairos db restore-keys`）並重新啟動，或重新輸入全部機密後恢復。
 - **管道失敗**：連續 3 次失敗 → 管道 `failed` → 系統事件 `KRS-E5107`（改送其他健康的管道）；之後要送到這個管道的通知暫緩（`held`），每 2 分鐘以最舊的一則試送，成功後管道恢復，暫緩的通知不逐則補發、改送一則彙整（最多保留 24 小時）。
-- **測試通知**：`POST /api/v1/channels/{id}/test`（或未儲存的 `POST /api/v1/channels/test`）以真實範本與假資料直接送出，回傳結果、回應碼與耗時（S11）。0.7 起限速：同一個管道 60 秒內 3 次、同一個使用者 10 分鐘內 10 次，超過回 429（〔暫定〕`KRS-W5111`，`Retry-After`），不送出。
+- **測試通知**：`POST /api/v1/channels/{id}/test`（或未儲存的 `POST /api/v1/channels/test`）以真實範本與假資料直接送出，回傳結果、回應碼與耗時（S11）。0.7 起限速：同一個管道 60 秒內 3 次、同一個使用者 10 分鐘內 10 次，超過回 429（`KRS-W5111`，`Retry-After`），不送出。
 
 錯誤代碼：`KRS-E5101` 無法連線到 SMTP、`KRS-E5102` SMTP 驗證失敗、`KRS-E5103` 憑證不受信任、`KRS-E5104` 無法連線到外部網路（LINE、Teams）、`KRS-E5105` LINE token 無效、`KRS-E5106` Teams 4xx、`KRS-E5108` Webhook 無法連線或非 2xx、`KRS-E5107` 管道連續失敗、`KRS-E5109` SMTP 伺服器拒絕寄件者、收件者或內容、`KRS-E5110` 管道的設定無效（後兩者由設計包 `decisions/INTEGRATION.md` §28.3 分配）。
 

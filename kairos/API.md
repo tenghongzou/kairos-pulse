@@ -1008,7 +1008,7 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
 - **HMAC（0.7〔草稿〕，schema v7）**：雜湊鏈本身沒有秘密，能改寫資料庫檔的人可以重新計算整條鏈。0.7 起每筆另有 `hmac = HMAC-SHA256(K, "kairos-audit-record/v1\n" ‖ hash)`（小寫十六進位），`K = HMAC-SHA256(金鑰檔, "kairos-audit-hmac/v1")`；金鑰檔是資料目錄的 `audit-hmac.key`（32 bytes，0600），**與 `console.key` 分開**（交給外部稽核者驗證 HMAC 時不必同時交出 CSRF／TOTP 的金鑰；遺失或輪替 `console.key` 也不影響稽核鏈）。金鑰檔只由 Kairos 服務在啟動時建立，CLI 只讀取。`meta.audit_chain_head` 另帶 `mac`。
   - **升級的邊界**：服務第一次以 0.7 啟動、建立金鑰後寫入的第一筆記在 `meta.audit_hmac`（`since_id`、`key_id`）。之前的紀錄（0.6 以前，或服務啟動前由 CLI 寫入的）只有雜湊鏈；`kairos audit verify` 與 API 的 `hmac` 物件寫出邊界（`since_id`、`chain_only` 筆數、`verified` 筆數）。
   - 新的斷點原因：`missing_hmac`（起點之後沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被重新計算）、`hmac_boundary_mismatch`（起點被移動）、`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與起點記錄的 `key_id` 不同；不會以新的金鑰「接續」簽下去）。都是 `KRS-E6201`。
-  - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（〔暫定〕`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
+  - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
   - **自我驗證**：每 `audit.verify_interval_hours` 小時（預設 24，第一次在啟動後 1 分鐘）重新計算整條鏈與 HMAC，寫一筆 `audit.verify`（執行者 `system`，`details.via = "self_check"`），並發布內部事件；失敗時記 `ERROR`（`audit.chain_broken`）且告警引擎開系統規則「稽核日誌完整性」（`sys.audit_integrity`，緊急，`KRS-E6201`），下一次驗證通過時恢復。
   - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；重播先前抄下的 head 也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
 
@@ -1197,7 +1197,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 `POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
 
-**限速（0.7〔草稿〕）**：測試通知會真的送到值班群組或信箱。同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含 `POST /api/v1/channels/test` 的未儲存管道）。超過時回 429 `rate_limited`（〔暫定〕`KRS-W5111`）、`Retry-After`，`details`：`scope`（`channel`／`user`）、`limit`、`window_secs`；不送出、不寫發送紀錄。計數只在記憶體中（重新啟動後歸零）。
+**限速（0.7〔草稿〕）**：測試通知會真的送到值班群組或信箱。同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含 `POST /api/v1/channels/test` 的未儲存管道）。超過時回 429 `rate_limited`（`KRS-W5111`）、`Retry-After`，`details`：`scope`（`channel`／`user`）、`limit`、`window_secs`；不送出、不寫發送紀錄。計數只在記憶體中（重新啟動後歸零）。
 
 ### 13.6 即時推送（SSE）
 

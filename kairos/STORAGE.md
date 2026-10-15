@@ -390,7 +390,7 @@ systemctl start kairos
 
 - 寫回 `storage.data_dir`：先寫同目錄的暫存檔（0600）再改名；以 root 執行時擁有者改為資料目錄的擁有者。先檢查全部再寫入，不會只還原一半。
 - 與既有檔案相同時不變；不同時拒絕（資料庫可能是用既有的金鑰加密的），確認後加 `--overwrite`，舊檔改名為 `<名稱>.replaced-<時間>` 保留（之後自行刪除）。
-- 密碼錯誤與檔案被修改無法區分，都以〔暫定〕`KRS-E4307` 拒絕，不寫入任何檔案。
+- 密碼錯誤與檔案被修改無法區分，都以`KRS-E4307` 拒絕，不寫入任何檔案。
 - 不使用 `--include-keys` 的部署仍可自行加密保存三個檔案（`tar -C /opt/kairos/data -cf - alerts-secrets.key console.key audit-hmac.key | gpg -c > keys-$(date +%F).tar.gpg`），還原後 `chown kairos:kairos`、`chmod 600`。
 
 少了 `alerts-secrets.key` 時 Kairos 會建立新的金鑰，既有管道的機密無法解開：管道的狀態為 `secrets_unavailable`（`KRS-E5110`；不發送，開「通知管道失敗」事件），還原舊金鑰（`--overwrite`）並重新啟動，或重新輸入機密。少了 `console.key` 時同樣建立新的金鑰，已綁定的 TOTP 需重設（`kairos users reset-mfa`）。少了 `audit-hmac.key` 時 Kairos 建立新的金鑰，但不會以它接續稽核鏈：`kairos audit verify` 與自我驗證以 `hmac_key_unavailable`／`hmac_key_mismatch`（`KRS-E6201`）失敗，直到還原原本的金鑰。

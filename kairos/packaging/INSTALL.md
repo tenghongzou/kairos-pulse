@@ -446,7 +446,7 @@ cd /tmp && sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml
 
 - **負載平衡器的探針**：以 `GET /readyz` 判斷（200／503）。主控台不對外開放時，在 `kairos.toml` 設定 `[observability] listen = "<負載平衡器可達的位址>:9464"`（純 HTTP，只有 `/healthz`、`/readyz`、`/metrics` 三個端點，`/metrics` 仍只接受 loopback 或帶 token 的請求）；只負責 8444 的負載平衡器用 `/readyz?scope=enroll`。
 - **Prometheus**：同一台主機時抓 `http://127.0.0.1:9464/metrics`（`observability.listen = "127.0.0.1:9464"`）；從其他主機抓取時設定 `observability.metrics_token_file`（`openssl rand -hex 32 > /opt/kairos/metrics.token && chown root:kairos /opt/kairos/metrics.token && chmod 640 /opt/kairos/metrics.token`），經主控台的 HTTPS 以 bearer token 抓取。設定與建議的告警規則見 `prometheus.example.yml`、`kairos-alerts.example.yml`。
-- **經反向代理（nginx、Apache、HAProxy 等）提供 `/metrics` 時，必須設定 `observability.metrics_token_file`**，並讓 Prometheus 帶 bearer token。代理與 Kairos 在同一台主機時，轉送進來的請求來源都是 `127.0.0.1`，「未設定 token 時只接受 loopback」會變成任何能連到代理的人都能讀取。0.7〔草稿〕起，未設定 token 時帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 或 `Via` 標頭的 `/metrics` 請求一律回 403，並在第一次時記一行 `WARN`（`observability.metrics_proxied`，〔暫定〕`KRS-W0304`）；但**不加這些標頭的代理（例如 nginx 只寫 `proxy_pass` 的預設設定）Kairos 無法發現**，所以不能以這個檢查代替 token。
+- **經反向代理（nginx、Apache、HAProxy 等）提供 `/metrics` 時，必須設定 `observability.metrics_token_file`**，並讓 Prometheus 帶 bearer token。代理與 Kairos 在同一台主機時，轉送進來的請求來源都是 `127.0.0.1`，「未設定 token 時只接受 loopback」會變成任何能連到代理的人都能讀取。0.7〔草稿〕起，未設定 token 時帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 或 `Via` 標頭的 `/metrics` 請求一律回 403，並在第一次時記一行 `WARN`（`observability.metrics_proxied`，`KRS-W0304`）；但**不加這些標頭的代理（例如 nginx 只寫 `proxy_pass` 的預設設定）Kairos 無法發現**，所以不能以這個檢查代替 token。
 - 另外建議在 Kairos 以外監看 `/healthz`（例如既有的 Zabbix）：Kairos 自己無法通知「自己已經停止」。
 - **稽核鏈尾的外送**（0.7〔草稿〕）：Kairos 每 `audit.anchor_log_minutes` 分鐘（預設 60）寫一行 `audit.chain_anchor`（INFO，含最後一筆稽核紀錄的 id 與雜湊）。設定 `[log.syslog]` 或以日誌收集器把這些行送到**另一台主機**保存，才有資料庫之外的副本（`API.md` 第 12.8 節）。
 
@@ -593,7 +593,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
   sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml
   ```
 
-  - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以〔暫定〕`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
+  - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
   - `data/` 已有內容不同的金鑰檔時（例如 Kairos 在還原前已啟動並產生了新的金鑰），`restore-keys` 拒絕；確認後加 `--overwrite`，原本的檔案改名為 `<名稱>.replaced-<時間>` 保留。
   - 少了 `alerts-secrets.key`（或與資料庫不成對）時，通知管道的狀態為 `secrets_unavailable`（`KRS-E5110`，主控台、`kairos alert-channels list` 與「通知管道失敗」事件都會顯示），不會發送；還原金鑰檔後重新啟動即恢復，或重新輸入機密。少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。少了 `audit-hmac.key` 時，`kairos audit verify` 與每日的自我驗證以 `hmac_key_unavailable`（`KRS-E6201`）失敗，並開「稽核日誌完整性」緊急事件。
 - 使用線上簽發（第 6.5 節）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）

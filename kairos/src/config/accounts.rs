@@ -285,7 +285,7 @@ impl LdapSettings {
 pub struct AuditSettings {
     /// 保留天數（獨立於 report 的保留天數；設計包 S18：預設 3 年）
     pub retention_days: u32,
-    /// 每隔幾分鐘把鏈尾的雜湊寫一行到日誌（`audit.chain_anchor`，`KRS-I6202`〔暫定〕；經 syslog
+    /// 每隔幾分鐘把鏈尾的雜湊寫一行到日誌（`audit.chain_anchor`，`KRS-I6202`；經 syslog
     /// 外送後成為資料庫之外的副本）。0 為不寫；5～1440，預設 60
     pub anchor_log_minutes: u32,
     /// 每隔幾小時自我驗證一次雜湊鏈與 HMAC（失敗時 `KRS-E6201` 並開「稽核日誌完整性」事件）。
