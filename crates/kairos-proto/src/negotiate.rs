@@ -1,7 +1,10 @@
 //! 版本協商（商業審計 A3）：hello 的 `proto`／`proto_min`／`proto_max`／`features` 與
 //! hello_ack 的 `proto`／`features`。規則見 PROTOCOL.md「版本協商」。
 
-use crate::{ErrorCode, PROTO_V1, PROTO_V2, Proto, ProtoOffer, ServerMsg};
+use crate::{
+    ErrorCode, FEATURE_INVENTORY, FEATURE_PROCESSES, PROTO_V1, PROTO_V2, Proto, ProtoOffer,
+    ServerMsg,
+};
 
 /// 協定版本範圍（含兩端）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +120,10 @@ pub struct Session {
     /// report 是否為 at-least-once（v2 且雙方都宣告 [`FEATURE_DURABLE`]）：report 必須帶
     /// `boot_id`／`report_seq`，伺服器去重
     pub durable: bool,
+    /// 是否送 `inventory` 訊息（v2 且雙方都宣告 [`FEATURE_INVENTORY`]；METRICS.md）
+    pub inventory: bool,
+    /// report 是否另帶 `processes`（v2、協商了 `metrics`，且雙方都宣告 [`FEATURE_PROCESSES`]；METRICS.md）
+    pub processes: bool,
 }
 
 impl Session {
@@ -125,6 +132,8 @@ impl Session {
         proto: PROTO_V1,
         metrics: false,
         durable: false,
+        inventory: false,
+        processes: false,
     };
 
     /// 依協商出的版本與雙方宣告的功能建立。v1 時忽略 features。
@@ -133,10 +142,14 @@ impl Session {
             ours.iter().any(|f| f.as_ref() == feature)
                 && theirs.iter().any(|f| f.as_ref() == feature)
         };
+        let v2 = proto >= PROTO_V2;
+        let metrics = v2 && both(FEATURE_METRICS);
         Session {
             proto,
-            metrics: proto >= PROTO_V2 && both(FEATURE_METRICS),
-            durable: proto >= PROTO_V2 && both(FEATURE_DURABLE),
+            metrics,
+            durable: v2 && both(FEATURE_DURABLE),
+            inventory: v2 && both(FEATURE_INVENTORY),
+            processes: metrics && both(FEATURE_PROCESSES),
         }
     }
 
@@ -244,6 +257,8 @@ mod tests {
                 proto: 2,
                 metrics: true,
                 durable: false,
+                inventory: false,
+                processes: false,
             }
         );
         assert!(!Session::new(2, &both, &none).metrics);
@@ -270,5 +285,31 @@ mod tests {
         let only_durable = Session::new(2, &new, &[FEATURE_DURABLE]);
         assert!(only_durable.durable && !only_durable.metrics);
         assert_eq!(Session::new(1, &new, &new), Session::V1);
+    }
+
+    #[test]
+    fn inventory_and_processes_need_v2_and_both_sides() {
+        // 相容矩陣（METRICS.md「相容性」）：0.7 以前的 Kairos／Pulse 不宣告這兩個 feature
+        let new = [
+            FEATURE_METRICS,
+            FEATURE_DURABLE,
+            FEATURE_INVENTORY,
+            FEATURE_PROCESSES,
+        ];
+        let old = [FEATURE_METRICS, FEATURE_DURABLE];
+        let s = Session::new(2, &new, &new);
+        assert!(s.inventory && s.processes && s.metrics && s.durable);
+        for (ours, theirs) in [(&new[..], &old[..]), (&old[..], &new[..])] {
+            let s = Session::new(2, ours, theirs);
+            assert!(!s.inventory && !s.processes && s.metrics && s.durable);
+        }
+        assert_eq!(Session::new(1, &new, &new), Session::V1);
+        // inventory 不依賴 metrics；processes 是 report 的欄位，必須協商了 metrics
+        let no_metrics = [FEATURE_INVENTORY, FEATURE_PROCESSES];
+        let s = Session::new(2, &no_metrics, &new);
+        assert!(s.inventory && !s.processes && !s.metrics);
+        // 新功能不在 SERVER_FEATURES：由 Kairos 實作時依儲存後端決定是否宣告（METRICS.md）
+        assert!(!SERVER_FEATURES.contains(&FEATURE_INVENTORY));
+        assert!(!SERVER_FEATURES.contains(&FEATURE_PROCESSES));
     }
 }

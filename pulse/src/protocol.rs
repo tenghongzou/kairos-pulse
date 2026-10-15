@@ -291,6 +291,8 @@ mod tests {
                 proto: 2,
                 metrics: false,
                 durable: false,
+                inventory: false,
+                processes: false,
             },
             None,
         );
@@ -308,6 +310,8 @@ mod tests {
             proto: 2,
             metrics: true,
             durable: true,
+            inventory: false,
+            processes: false,
         };
         let fs = Metric::new("system.temperature", 40, "Cel");
         let (first, _) =
@@ -338,6 +342,8 @@ mod tests {
             proto: 2,
             metrics: true,
             durable: false,
+            inventory: false,
+            processes: false,
         };
         let (msg, summary) = report_message(4, sample(vec![fs]), session, None);
         let v = to_value(&msg);
@@ -371,6 +377,8 @@ mod tests {
             proto: 2,
             metrics: true,
             durable: false,
+            inventory: false,
+            processes: false,
         };
         let (msg, summary) = report_message(5, sample(extra), session, None);
         let line = serde_json::to_string(&msg).unwrap();
@@ -394,6 +402,8 @@ mod tests {
             proto: 2,
             metrics: true,
             durable: false,
+            inventory: false,
+            processes: false,
         };
         let (msg, _) = report_message(1, s, session, None);
         let ClientMsg::Report { body, .. } = &msg else {

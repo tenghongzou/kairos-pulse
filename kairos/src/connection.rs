@@ -178,7 +178,9 @@ enum Incoming {
 
 /// `renew_request`／`deregister` 的 `type`（PROTOCOL.md「憑證輪替與除役」）
 fn is_lifecycle_type(kind: &str) -> bool {
-    matches!(kind, "renew_request" | "deregister")
+    // inventory（feature `inventory`，crates/kairos-proto/METRICS.md）：本版尚未實作也不宣告，
+    // 不論內容是否合法都與舊版相同，回 unknown_type
+    matches!(kind, "renew_request" | "deregister" | "inventory")
 }
 
 /// 8443 的註冊 feature（`renew`、`deregister`）是否使用：協商為 v2、Kairos 有註冊服務、client 也宣告，
@@ -212,6 +214,10 @@ fn classify(frame: Frame) -> Incoming {
                     },
                     ClientMsg::Deregister(_) => Incoming::InvalidLifecycle {
                         kind: "deregister".into(),
+                        message,
+                    },
+                    ClientMsg::Inventory(_) => Incoming::InvalidLifecycle {
+                        kind: "inventory".into(),
                         message,
                     },
                     _ => Incoming::BadRequest {
@@ -1304,7 +1310,10 @@ impl Conn {
                 // 不重置連續無效訊息的計數（避免與 bad_request 交錯送出來繞過上限）。
                 // hello 之前的 renew_request／deregister 與舊版相同，視為不認得的 type
                 Incoming::Msg(
-                    ClientMsg::Unknown | ClientMsg::RenewRequest(_) | ClientMsg::Deregister(_),
+                    ClientMsg::Unknown
+                    | ClientMsg::RenewRequest(_)
+                    | ClientMsg::Deregister(_)
+                    | ClientMsg::Inventory(_),
                 )
                 | Incoming::InvalidLifecycle { .. } => self.reply_unknown_type().await?,
             };
@@ -1721,10 +1730,12 @@ impl Conn {
                 None => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
             },
             // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限。沒有協商 renew 的 renew_request、
-            // 一般連線上的 deregister 與舊版相同，視為不認得的 type
-            ClientMsg::Unknown | ClientMsg::RenewRequest(_) | ClientMsg::Deregister(_) => {
-                Ok(Handled::not_alive(self.reply_unknown_type().await?))
-            }
+            // 一般連線上的 deregister、inventory（本版不宣告 feature `inventory`）與舊版相同，
+            // 視為不認得的 type
+            ClientMsg::Unknown
+            | ClientMsg::RenewRequest(_)
+            | ClientMsg::Deregister(_)
+            | ClientMsg::Inventory(_) => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
             ClientMsg::Hello { seq, .. } => {
                 self.bad_requests = 0;
                 if !self.touch(ctx, agent) {

@@ -3,7 +3,7 @@ name = "kairos-proto"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "Pulse ↔ Kairos 協定（v1、v2）與註冊通道（8444，ENROLL.md）的共用型別、序列化、版本協商、欄位驗證與簽章內容（兩個產品共用，規格見 PROTOCOL.md、ENROLL.md）"
+description = "Pulse ↔ Kairos 協定（v1、v2）與註冊通道（8444，ENROLL.md）的共用型別、序列化、版本協商、欄位驗證與簽章內容，以及指標擴充（METRICS.md）的行程排行、主機資產（兩個產品共用，規格見 PROTOCOL.md、ENROLL.md、METRICS.md）"
 # 內部共用 crate，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
 publish = false
 

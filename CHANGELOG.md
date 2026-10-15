@@ -50,6 +50,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.6.0〔草稿〕之後的變更記在這裡。）
 
+### 共用 crate（衝刺 7 規格：指標擴充，審計 F4）
+
+- **`crates/kairos-proto/METRICS.md`**〔0.8.0 規格〕：磁碟（每個掛載點的用量與使用率、I/O）、網路（封包、錯誤）、負載、置換空間、行程數、uptime 等 19 個新標準指標（共 27 個），行程排行（feature `processes`）與主機資產（feature `inventory`、新訊息 `inventory`）；採集來源與上限、計數器的重置處理、相容矩陣、隱私、Kairos schema v8 草案、查詢 API、告警、主控台與實作分工。PROTOCOL.md 的標準指標表、features 表、訊息表與錯誤碼表同步更新。**協定版本不變（v1～v2）**；新指標沿用 `metrics` 陣列，0.2.0～0.7.0 的 Kairos 只檢查格式、原樣保存。
+- `kairos-proto`：`StandardMetric` 增加 `kind`（量測值／計數器）與 `labels`；`counter_rate`、`filesystem_usage`；`ProcessList` 等與 `ReportBody::processes`；`Inventory` 等、`ClientMsg::Inventory`、`validate_inventory`、`inventory_digest`；`Session::inventory`、`Session::processes`。兩個新 feature 不在 `SERVER_FEATURES` 中（由 Kairos 依儲存後端宣告）。`StandardMetric`、`Session`、`ReportBody` 新增欄位，以結構常值建立它們的程式需要補上欄位。
+- Kairos：在實作前收到 `inventory` 一律回 `unknown_type`（與舊版相同；不宣告 `inventory`）。
+
 ## [0.7.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.7.0、Pulse 0.7.0**：衝刺 6 的**主控台網頁介面**（審計 F2：S01、S03～S18、S20、S21、S23）與後端補強——設計包 `decisions/INTEGRATION.md` §28.5 的待辦與 §28.9 #3（金鑰檔的備份）。**協定不變**，Pulse 只有設定檔錯誤代碼的小修正。

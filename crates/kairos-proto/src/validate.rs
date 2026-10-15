@@ -302,6 +302,7 @@ pub fn validate_client_msg(msg: &ClientMsg) -> Result<(), String> {
         }
         ClientMsg::RenewRequest(r) => &r.ts,
         ClientMsg::Deregister(d) => &d.ts,
+        ClientMsg::Inventory(i) => &i.ts,
         ClientMsg::Unknown => return Ok(()),
     };
     if ts.len() > MAX_TS_BYTES {

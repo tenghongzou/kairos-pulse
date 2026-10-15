@@ -2792,6 +2792,8 @@ mod tests {
                 proto: 2,
                 metrics: true,
                 durable: false,
+                inventory: false,
+                processes: false,
             }
         );
         assert_eq!(v2.server_time.as_deref(), Some("2026-10-08T03:15:40.012Z"));
@@ -2805,6 +2807,8 @@ mod tests {
                 proto: 2,
                 metrics: false,
                 durable: false,
+                inventory: false,
+                processes: false,
             }
         );
         // v1 的 hello_ack 夾帶 v2 欄位：不使用
