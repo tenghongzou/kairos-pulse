@@ -80,7 +80,7 @@ fn read_machine_id() -> Option<String> {
 /// 機器 ID：Windows 為 `HKLM\SOFTWARE\Microsoft\Cryptography` 的 `MachineGuid`
 #[cfg(windows)]
 fn read_machine_id() -> Option<String> {
-    windows::machine_guid()
+    registry::machine_guid()
 }
 
 /// 其他平台：沒有定義機器 ID 的來源，不送主機指紋
@@ -89,14 +89,17 @@ fn read_machine_id() -> Option<String> {
     None
 }
 
+/// Windows 登錄（`HKEY_LOCAL_MACHINE`）的讀取：機器 ID、資產的 BIOS 與 CPU 標稱時脈
 #[cfg(windows)]
-mod windows {
+pub(crate) mod registry {
     use std::ffi::c_void;
 
     /// `HKEY_LOCAL_MACHINE`：`(HKEY)(ULONG_PTR)(LONG)0x80000002`（符號延伸成指標寬度）
     const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
     /// `RRF_RT_REG_SZ`：只接受 REG_SZ
     const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    /// `RRF_RT_REG_DWORD`：只接受 REG_DWORD
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
     /// `RRF_SUBKEY_WOW6464KEY`：一律讀 64 位元檢視（32 位元行程也讀到同一個值）
     const RRF_SUBKEY_WOW6464KEY: u32 = 0x0001_0000;
     const ERROR_SUCCESS: i32 = 0;
@@ -119,11 +122,11 @@ mod windows {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub(super) fn machine_guid() -> Option<String> {
-        let sub_key = wide(r"SOFTWARE\Microsoft\Cryptography");
-        let value = wide("MachineGuid");
-        // GUID 為 36 個字元；保留足夠空間給結尾的 NUL
-        let mut buf = [0u16; 128];
+    /// `HKLM\<sub_key>` 的 REG_SZ 值（最多 1023 個字元）；不存在、型別不符或為空時 `None`
+    pub fn read_sz(sub_key: &str, value: &str) -> Option<String> {
+        let sub_key = wide(sub_key);
+        let value = wide(value);
+        let mut buf = [0u16; 1024];
         let mut len = u32::try_from(std::mem::size_of_val(&buf)).ok()?;
         // SAFETY: 字串皆以 NUL 結尾且在呼叫期間有效；data 指向 buf，len 為其位元組數，
         // API 最多寫入 len 個位元組並回寫實際長度
@@ -145,6 +148,31 @@ mod windows {
         let text = String::from_utf16_lossy(&buf[..units]);
         let text = text.trim_end_matches('\0').trim();
         (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// `HKLM\<sub_key>` 的 REG_DWORD 值；不存在或型別不符時 `None`
+    pub fn read_dword(sub_key: &str, value: &str) -> Option<u32> {
+        let sub_key = wide(sub_key);
+        let value = wide(value);
+        let mut data: u32 = 0;
+        let mut len = u32::try_from(std::mem::size_of::<u32>()).ok()?;
+        // SAFETY: 同上；data 指向一個 u32，len 為 4
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                sub_key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
+                std::ptr::null_mut(),
+                (&raw mut data).cast(),
+                &mut len,
+            )
+        };
+        (status == ERROR_SUCCESS).then_some(data)
+    }
+
+    pub(super) fn machine_guid() -> Option<String> {
+        read_sz(r"SOFTWARE\Microsoft\Cryptography", "MachineGuid")
     }
 }
 

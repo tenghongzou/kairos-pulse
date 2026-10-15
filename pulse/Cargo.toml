@@ -45,6 +45,11 @@ uuid = { version = "1.27", features = ["v4"] }
 ring = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
+# Linux：statvfs（檔案系統的 f_bfree，METRICS.md 的 system.filesystem.used = total − free）。
+# 不是新依賴：tokio、ring、sysinfo 已依賴同一個版本
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # 不是新依賴：只為測試多開 tokio 的 test-util（tokio::time::pause / 自動推進時間）
 tokio = { version = "1.53", features = ["test-util"] }

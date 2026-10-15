@@ -8,23 +8,64 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 
 pub use kairos_proto::{
-    ClientMsg, DurableSeq, FEATURE_DURABLE, FEATURE_METRICS, HelloExt, HostInfo, MAX_LINE_LENGTH,
-    METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric, Proto, ProtoOffer,
-    ReportBody, SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, is_forbidden_display_char,
-    parse_server_msg,
+    ClientMsg, DurableSeq, FEATURE_DURABLE, FEATURE_INVENTORY, FEATURE_METRICS, FEATURE_PROCESSES,
+    HelloExt, HostInfo, MAX_LINE_LENGTH, METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED,
+    Metric, ProcessList, Proto, ProtoOffer, ReportBody, SUPPORTED_PROTO, ServerMsg, ServerMsgError,
+    Session, is_forbidden_display_char, parse_server_msg,
 };
 
 use crate::system_info::Sample;
 
-/// Pulse 支援的功能（與 Kairos 相同的一組）。`durable` 只在啟用本機緩衝時於 hello 宣告
-/// （見 [`hello_features`]）
-pub const CLIENT_FEATURES: &[&str] = &[FEATURE_METRICS, FEATURE_DURABLE];
+/// Pulse 支援的功能。`durable` 只在啟用本機緩衝時、`inventory`／`processes` 只在設定啟用時於 hello
+/// 宣告（見 [`hello_features`]）
+pub const CLIENT_FEATURES: &[&str] = &[
+    FEATURE_METRICS,
+    FEATURE_DURABLE,
+    FEATURE_INVENTORY,
+    FEATURE_PROCESSES,
+];
 
-/// hello 宣告的功能：停用本機緩衝（`buffer.enabled = false`）時不宣告 `durable`
-pub fn hello_features(durable: bool) -> Vec<String> {
+/// hello 宣告哪些可選的功能（`metrics` 一律宣告）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionalFeatures {
+    /// 啟用本機緩衝（`buffer.enabled` 且緩衝開啟成功）
+    pub durable: bool,
+    /// `inventory.enabled`
+    pub inventory: bool,
+    /// `processes.enabled`
+    pub processes: bool,
+}
+
+impl OptionalFeatures {
+    /// 全部宣告（預設設定、緩衝開啟成功）
+    #[cfg(test)]
+    pub const ALL: Self = Self {
+        durable: true,
+        inventory: true,
+        processes: true,
+    };
+
+    /// 一次性的連線（`pulse enroll` 的確認、輪替後的確認）：不送 report 與資產，不宣告 inventory、processes
+    pub fn one_shot(durable: bool) -> Self {
+        Self {
+            durable,
+            inventory: false,
+            processes: false,
+        }
+    }
+}
+
+/// hello 宣告的功能：停用本機緩衝（`buffer.enabled = false`）時不宣告 `durable`；
+/// `inventory.enabled`／`processes.enabled = false` 時不宣告對應的 feature（METRICS.md 第 7.1 節）
+pub fn hello_features(optional: OptionalFeatures) -> Vec<String> {
     CLIENT_FEATURES
         .iter()
-        .filter(|f| durable || **f != FEATURE_DURABLE)
+        .filter(|f| match **f {
+            FEATURE_DURABLE => optional.durable,
+            FEATURE_INVENTORY => optional.inventory,
+            FEATURE_PROCESSES => optional.processes,
+            _ => true,
+        })
         .map(|f| f.to_string())
         .collect()
 }
@@ -84,11 +125,55 @@ pub fn clock_skew_warning(server_time: &str, now: DateTime<Utc>) -> Option<Strin
     ))
 }
 
-/// 依協商結果組出 report 訊息，並回傳 debug 日誌用的摘要。
+/// 組出的 report 訊息
+#[derive(Debug, Clone)]
+pub struct BuiltReport {
+    pub msg: ClientMsg,
+    /// debug 日誌用的摘要
+    pub summary: String,
+    /// 超過單行上限而捨去的內容（METRICS.md 第 4.4 節；沒有捨去時 `None`）。呼叫端以節流的 WARN 記錄
+    pub trimmed: Option<String>,
+}
+
+/// 截斷時指標所屬的「組」（METRICS.md 第 4.4 節：以整組捨去，不留下不完整的組）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrimClass {
+    /// 沒有 label 的指標：一律保留
+    Keep,
+    Filesystem,
+    Disk,
+    Network,
+    /// 溫度（以及其他帶 label 的指標）
+    Temperature,
+}
+
+fn trim_class(m: &Metric) -> (TrimClass, String) {
+    if m.labels.is_empty() {
+        return (TrimClass::Keep, String::new());
+    }
+    let label = |k: &str| m.labels.get(k).cloned().unwrap_or_default();
+    if m.name.starts_with("system.filesystem.") {
+        (TrimClass::Filesystem, label("mountpoint"))
+    } else if m.name.starts_with("system.disk.") {
+        (TrimClass::Disk, label("device"))
+    } else if m.name.starts_with("system.network.") {
+        (TrimClass::Network, label("device"))
+    } else {
+        (
+            TrimClass::Temperature,
+            serde_json::to_string(&m.labels).unwrap_or_default(),
+        )
+    }
+}
+
+/// 依協商結果組出 report 訊息。
 ///
 /// - 沒有協商 `metrics`（v1 Kairos、或 v2 但未宣告）：`cpu_usage`／`total_memory`／`used_memory`
-/// - 協商了 `metrics`：CPU、記憶體三個標準指標加上磁碟、網路、溫度（A4）。整行超過單行上限時，
-///   捨去後面的磁碟、網路、溫度指標（CPU 與記憶體一定保留）
+/// - 協商了 `metrics`：CPU、記憶體總量／已使用加上 `sample.extra`（F4 的標準指標）；協商了 `processes`
+///   時附上行程排行（這筆取樣有的話）
+/// - 整行超過單行上限（或指標數超過 256）時依 METRICS.md 第 4.4 節的順序捨去，直到不超過：
+///   行程的命令列 → 行程清單縮成各 3 項 → 整個行程排行 → 溫度 → 優先順序最低的介面、磁碟 I/O 裝置、
+///   掛載點（以整組捨去）。沒有 label 的指標一律保留
 /// - `durable`：協商了 durable 時附上緩衝記錄的 `boot_id`／`report_seq`（A5）。同一筆取樣在同一種
 ///   格式下組出的內容固定，重送時與第一次送出的相同
 pub fn report_message(
@@ -96,7 +181,7 @@ pub fn report_message(
     sample: Sample,
     session: Session,
     durable: Option<DurableSeq>,
-) -> (ClientMsg, String) {
+) -> BuiltReport {
     let with_durable = |body: ReportBody| match &durable {
         Some(d) => body.with_durable(d.clone()),
         None => body,
@@ -117,7 +202,11 @@ pub fn report_message(
                 sample.used_memory,
             )),
         };
-        return (msg, summary);
+        return BuiltReport {
+            msg,
+            summary,
+            trimmed: None,
+        };
     }
     let core = [
         Metric::new(
@@ -133,33 +222,122 @@ pub fn report_message(
             "By",
         ),
     ];
-    let mut extra = sample.extra;
-    let total_extra = extra.len();
-    let build = |extra: &[Metric]| ClientMsg::Report {
-        seq,
-        ts: sample.ts.clone(),
-        body: with_durable(ReportBody::metrics(
-            core.iter().chain(extra).cloned().collect(),
-        )),
+    let extra = sample.extra;
+    // 行程排行：只在協商了 processes 時附上；送出前以與 Kairos 相同的規則檢查（正常不會不符）
+    let mut processes = sample.processes.filter(|_| session.processes).filter(|p| {
+        let ok = kairos_proto::validate_process_list(p);
+        if let Err(e) = &ok {
+            log::debug!("行程排行不符合協定限制，這筆不附上：{e}");
+        }
+        ok.is_ok()
+    });
+    let classes: Vec<(TrimClass, String)> = extra.iter().map(trim_class).collect();
+    let mut kept = vec![true; extra.len()];
+    let build = |kept: &[bool], processes: &Option<ProcessList>| {
+        let metrics: Vec<Metric> = core
+            .iter()
+            .cloned()
+            .chain(
+                extra
+                    .iter()
+                    .zip(kept)
+                    .filter(|(_, k)| **k)
+                    .map(|(m, _)| m.clone()),
+            )
+            .collect();
+        let count = metrics.len();
+        let mut body = ReportBody::metrics(metrics);
+        if let Some(p) = processes {
+            body = body.with_processes(p.clone());
+        }
+        let msg = ClientMsg::Report {
+            seq,
+            ts: sample.ts.clone(),
+            body: with_durable(body),
+        };
+        let fits = count <= kairos_proto::MAX_METRICS && serialized_len(&msg) <= MAX_LINE_LENGTH;
+        (msg, fits)
     };
-    let mut msg = build(&extra);
-    while !extra.is_empty() && serialized_len(&msg) > MAX_LINE_LENGTH {
-        extra.truncate(extra.len() / 2);
-        msg = build(&extra);
+    let mut dropped: Vec<String> = Vec::new();
+    let (mut msg, mut fits) = build(&kept, &processes);
+
+    // 1. 行程的命令列
+    if !fits
+        && let Some(p) = &mut processes
+        && p.top_cpu
+            .iter()
+            .chain(&p.top_memory)
+            .any(|e| e.command.is_some())
+    {
+        for e in p.top_cpu.iter_mut().chain(p.top_memory.iter_mut()) {
+            e.command = None;
+        }
+        dropped.push("行程命令列".to_string());
+        (msg, fits) = build(&kept, &processes);
     }
+    // 2. 行程清單縮成各 3 項，再捨去整個行程排行
+    if !fits && let Some(p) = &mut processes {
+        p.top_cpu.truncate(3);
+        p.top_memory.truncate(3);
+        (msg, fits) = build(&kept, &processes);
+        if fits {
+            dropped.push("行程排行縮成各 3 項".to_string());
+        } else {
+            processes = None;
+            dropped.push("行程排行".to_string());
+            (msg, fits) = build(&kept, &processes);
+        }
+    }
+    // 3. 溫度 → 4. 介面、磁碟 I/O 裝置、掛載點：從優先順序最低（最後面）的組開始整組捨去
+    for (class, what) in [
+        (TrimClass::Temperature, "溫度感測器"),
+        (TrimClass::Network, "網路介面"),
+        (TrimClass::Disk, "磁碟 I/O 裝置"),
+        (TrimClass::Filesystem, "掛載點"),
+    ] {
+        let mut groups = 0usize;
+        while !fits {
+            let Some(last) = (0..extra.len())
+                .rev()
+                .find(|&i| kept[i] && classes[i].0 == class)
+            else {
+                break;
+            };
+            let key = classes[last].1.clone();
+            for (i, (c, k)) in classes.iter().enumerate() {
+                if *c == class && *k == key {
+                    kept[i] = false;
+                }
+            }
+            groups += 1;
+            (msg, fits) = build(&kept, &processes);
+        }
+        if groups > 0 {
+            dropped.push(format!("{groups} 個{what}"));
+        }
+    }
+
+    let sent_metrics = core.len() + kept.iter().filter(|k| **k).count();
     let mut summary = format!(
-        "CPU {cpu_usage:.2}%，記憶體 {}/{} MB，共 {} 個指標",
-        sample.used_memory,
-        sample.total_memory,
-        core.len() + extra.len()
+        "CPU {cpu_usage:.2}%，記憶體 {}/{} MB，共 {sent_metrics} 個指標",
+        sample.used_memory, sample.total_memory
     );
-    if extra.len() < total_extra {
+    if let Some(p) = &processes {
         summary.push_str(&format!(
-            "；超過單行上限，捨去 {} 個磁碟／網路／溫度指標",
-            total_extra - extra.len()
+            "，行程排行 {}＋{} 項",
+            p.top_cpu.len(),
+            p.top_memory.len()
         ));
     }
-    (msg, summary)
+    let trimmed = (!dropped.is_empty()).then(|| dropped.join("、"));
+    if let Some(t) = &trimmed {
+        summary.push_str(&format!("；超過單行上限，捨去{t}"));
+    }
+    BuiltReport {
+        msg,
+        summary,
+        trimmed,
+    }
 }
 
 /// 序列化後的長度（無法序列化時視為超長）
@@ -266,6 +444,7 @@ mod tests {
             total_memory_bytes: 51_539_607_552,
             used_memory_bytes: 38_833_356_800,
             extra,
+            processes: None,
         }
     }
 
@@ -276,7 +455,8 @@ mod tests {
     #[test]
     fn v1_session_sends_the_three_fields() {
         let fs = Metric::new("system.filesystem.total", 1, "By").with_label("mountpoint", "/");
-        let (msg, summary) = report_message(3, sample(vec![fs]), Session::V1, None);
+        let BuiltReport { msg, summary, .. } =
+            report_message(3, sample(vec![fs]), Session::V1, None);
         assert_eq!(
             to_value(&msg),
             serde_json::json!({"type":"report","seq":3,"ts":"2026-10-09T00:00:00.000Z",
@@ -284,7 +464,7 @@ mod tests {
         );
         assert_eq!(summary, "CPU 7.50%，記憶體 37034/49152 MB");
         // v2 但沒有協商 metrics：同 v1
-        let (msg, _) = report_message(
+        let BuiltReport { msg, .. } = report_message(
             3,
             sample(vec![]),
             Session {
@@ -314,11 +494,10 @@ mod tests {
             processes: false,
         };
         let fs = Metric::new("system.temperature", 40, "Cel");
-        let (first, _) =
-            report_message(3, sample(vec![fs.clone()]), session, Some(durable.clone()));
-        let (again, _) = report_message(9, sample(vec![fs]), session, Some(durable.clone()));
-        let mut a = to_value(&first);
-        let mut b = to_value(&again);
+        let first = report_message(3, sample(vec![fs.clone()]), session, Some(durable.clone()));
+        let again = report_message(9, sample(vec![fs]), session, Some(durable.clone()));
+        let mut a = to_value(&first.msg);
+        let mut b = to_value(&again.msg);
         assert_eq!(
             (&a["boot_id"], &a["report_seq"]),
             (&serde_json::json!(durable.boot_id), &serde_json::json!(42))
@@ -327,12 +506,30 @@ mod tests {
         b.as_object_mut().unwrap().remove("seq");
         assert_eq!(a, b);
         // v1 格式也可以帶（durable 與 metrics 各自協商）
-        let (msg, _) = report_message(1, sample(vec![]), Session::V1, Some(durable));
+        let BuiltReport { msg, .. } = report_message(1, sample(vec![]), Session::V1, Some(durable));
         let v = to_value(&msg);
         assert!(v.get("cpu_usage").is_some() && v["report_seq"] == 42, "{v}");
         // 停用本機緩衝時不宣告 durable
-        assert_eq!(hello_features(true), vec!["metrics", "durable"]);
-        assert_eq!(hello_features(false), vec!["metrics"]);
+        assert_eq!(
+            hello_features(OptionalFeatures::ALL),
+            vec!["metrics", "durable", "inventory", "processes"]
+        );
+        assert_eq!(
+            hello_features(OptionalFeatures {
+                durable: false,
+                ..OptionalFeatures::ALL
+            }),
+            vec!["metrics", "inventory", "processes"]
+        );
+        // METRICS.md 第 7.1 節：inventory.enabled／processes.enabled = false 時不宣告
+        assert_eq!(
+            hello_features(OptionalFeatures {
+                durable: true,
+                inventory: false,
+                processes: false,
+            }),
+            vec!["metrics", "durable"]
+        );
     }
 
     #[test]
@@ -345,7 +542,7 @@ mod tests {
             inventory: false,
             processes: false,
         };
-        let (msg, summary) = report_message(4, sample(vec![fs]), session, None);
+        let BuiltReport { msg, summary, .. } = report_message(4, sample(vec![fs]), session, None);
         let v = to_value(&msg);
         assert!(v.get("cpu_usage").is_none(), "{v}");
         assert_eq!(
@@ -380,7 +577,7 @@ mod tests {
             inventory: false,
             processes: false,
         };
-        let (msg, summary) = report_message(5, sample(extra), session, None);
+        let BuiltReport { msg, summary, .. } = report_message(5, sample(extra), session, None);
         let line = serde_json::to_string(&msg).unwrap();
         assert!(line.len() <= MAX_LINE_LENGTH, "{}", line.len());
         let v = to_value(&msg);
@@ -405,11 +602,264 @@ mod tests {
             inventory: false,
             processes: false,
         };
-        let (msg, _) = report_message(1, s, session, None);
+        let BuiltReport { msg, .. } = report_message(1, s, session, None);
         let ClientMsg::Report { body, .. } = &msg else {
             unreachable!()
         };
         kairos_proto::validate_metrics(body.metric_list().unwrap()).unwrap();
+    }
+
+    const FULL: Session = Session {
+        proto: 2,
+        metrics: true,
+        durable: true,
+        inventory: true,
+        processes: true,
+    };
+
+    /// METRICS.md 第 16.1 節驗收的最壞情況：16 個掛載點、8 個裝置、16 個介面、32 個感測器，
+    /// label 值都是 256 bytes，`processes.command = "full"`（每個命令列 1024 bytes）
+    fn worst_case_sample() -> Sample {
+        let long = |p: &str, i: usize| format!("{p}{i:02}{}", "x".repeat(300))[..256].to_string();
+        let mut extra = vec![
+            Metric::new("system.cpu.load_1m", 1, "1"),
+            Metric::new("system.cpu.load_5m", 1, "1"),
+            Metric::new("system.cpu.load_15m", 1, "1"),
+            Metric::new("system.memory.available", 1, "By"),
+            Metric::new("system.swap.total", 1, "By"),
+            Metric::new("system.swap.used", 1, "By"),
+            Metric::new("system.process.count", 1, "{processes}"),
+            Metric::new("system.uptime", 1, "s"),
+        ];
+        for i in 0..16 {
+            for name in ["total", "available", "used", "usage"] {
+                extra.push(
+                    Metric::new(
+                        &format!("system.filesystem.{name}"),
+                        1,
+                        if name == "usage" { "%" } else { "By" },
+                    )
+                    .with_label("mountpoint", long("/m", i))
+                    .with_label("fstype", long("fs", i)),
+                );
+            }
+        }
+        for i in 0..8 {
+            for (name, unit) in [
+                ("read", "By"),
+                ("written", "By"),
+                ("read_ops", "{operations}"),
+                ("write_ops", "{operations}"),
+                ("io_time", "ms"),
+            ] {
+                extra.push(
+                    Metric::new(&format!("system.disk.{name}"), 1, unit)
+                        .with_label("device", long("d", i)),
+                );
+            }
+        }
+        for i in 0..16 {
+            for (name, unit) in [
+                ("received", "By"),
+                ("transmitted", "By"),
+                ("packets_received", "{packets}"),
+                ("packets_transmitted", "{packets}"),
+                ("errors_received", "{errors}"),
+                ("errors_transmitted", "{errors}"),
+            ] {
+                extra.push(
+                    Metric::new(&format!("system.network.{name}"), 1, unit)
+                        .with_label("device", long("n", i)),
+                );
+            }
+        }
+        for i in 0..32 {
+            extra.push(
+                Metric::new("system.temperature", 40, "Cel").with_label("sensor", long("t", i)),
+            );
+        }
+        let entry = |pid: u32| kairos_proto::ProcessEntry {
+            pid,
+            name: "n".repeat(256),
+            cpu_usage: 1.0,
+            memory: 1,
+            user: None,
+            command: Some("c".repeat(kairos_proto::MAX_PROCESS_COMMAND_BYTES)),
+        };
+        Sample {
+            extra,
+            processes: Some(ProcessList {
+                top_cpu: (1..=10).map(entry).collect(),
+                top_memory: (11..=20).map(entry).collect(),
+            }),
+            ..sample(vec![])
+        }
+    }
+
+    /// report 中各類「組」的 label（依出現順序、不重複）
+    fn groups(v: &serde_json::Value, prefix: &str, label: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for m in v["metrics"].as_array().unwrap() {
+            if m["name"].as_str().unwrap().starts_with(prefix) {
+                let l = m["labels"][label].as_str().unwrap().to_string();
+                if !out.contains(&l) {
+                    out.push(l);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn worst_case_report_is_trimmed_by_whole_groups_in_the_spec_order() {
+        let s = worst_case_sample();
+        assert_eq!(s.extra.len() + 3, 243);
+        let durable = DurableSeq {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq: u64::MAX,
+        };
+        let built = report_message(u64::MAX, s, FULL, Some(durable));
+        let line = serde_json::to_string(&built.msg).unwrap();
+        assert!(line.len() <= MAX_LINE_LENGTH, "{}", line.len());
+        let ClientMsg::Report { body, .. } = &built.msg else {
+            unreachable!()
+        };
+        let metrics = body.metric_list().unwrap();
+        assert!(metrics.len() <= kairos_proto::MAX_METRICS);
+        kairos_proto::validate_metrics(metrics).unwrap();
+        // 沒有 label 的 11 個一律保留
+        assert_eq!(metrics.iter().filter(|m| m.labels.is_empty()).count(), 11);
+        // 依序捨去：命令列 → 行程排行 → 溫度 → 介面 → …（這個大小下掛載點與磁碟都保留）
+        let v = to_value(&built.msg);
+        assert!(v.get("processes").is_none(), "{}", built.summary);
+        assert!(groups(&v, "system.temperature", "sensor").is_empty());
+        assert_eq!(groups(&v, "system.filesystem.", "mountpoint").len(), 16);
+        assert_eq!(groups(&v, "system.disk.", "device").len(), 8);
+        let nics = groups(&v, "system.network.", "device");
+        assert!(nics.len() < 16, "{}", nics.len());
+        // 留下的是優先順序高（前面）的介面，而且每組都完整
+        for (i, n) in nics.iter().enumerate() {
+            assert!(n.starts_with(&format!("n{i:02}")), "{n}");
+            let count = metrics
+                .iter()
+                .filter(|m| m.labels.get("device") == Some(n))
+                .count();
+            assert_eq!(count, 6, "{n}");
+        }
+        let trimmed = built.trimmed.unwrap();
+        assert!(
+            trimmed.starts_with("行程命令列、行程排行、32 個溫度感測器、"),
+            "{trimmed}"
+        );
+        assert!(trimmed.contains("個網路介面"), "{trimmed}");
+        assert!(built.summary.contains("超過單行上限"), "{}", built.summary);
+    }
+
+    #[test]
+    fn process_commands_are_dropped_first() {
+        // 只有行程的命令列讓整行超過上限：只捨去命令列，指標與排行都保留
+        let mut s = worst_case_sample();
+        s.extra.retain(|m| m.labels.is_empty());
+        let mut big = s.processes.clone().unwrap();
+        for e in big.top_cpu.iter_mut().chain(big.top_memory.iter_mut()) {
+            e.command = Some("c".repeat(kairos_proto::MAX_PROCESS_COMMAND_BYTES));
+        }
+        // 20 個 1024 bytes 的命令列約 20 KB，不會超過；把指標加大到接近上限
+        s.extra.extend((0..150).map(|i| {
+            Metric::new("app.queue.depth", 1, "1")
+                .with_label("queue", format!("{i:03}{}", "q".repeat(253)))
+        }));
+        s.processes = Some(big);
+        let built = report_message(1, s.clone(), FULL, None);
+        let v = to_value(&built.msg);
+        assert!(serde_json::to_string(&built.msg).unwrap().len() <= MAX_LINE_LENGTH);
+        assert_eq!(
+            built.trimmed.as_deref(),
+            Some("行程命令列"),
+            "{}",
+            built.summary
+        );
+        let p = &v["processes"];
+        assert_eq!(p["top_cpu"].as_array().unwrap().len(), 10);
+        assert!(p["top_cpu"][0].get("command").is_none());
+        assert_eq!(v["metrics"].as_array().unwrap().len(), 3 + 8 + 150);
+
+        // 沒有協商 processes（舊版 Kairos）時不附上行程排行，也不需要截斷
+        let built = report_message(
+            1,
+            Sample {
+                extra: vec![],
+                ..s.clone()
+            },
+            Session {
+                processes: false,
+                ..FULL
+            },
+            None,
+        );
+        assert!(to_value(&built.msg).get("processes").is_none());
+        assert_eq!(built.trimmed, None);
+        // v1 一律不帶
+        let built = report_message(1, s, Session::V1, None);
+        assert!(to_value(&built.msg).get("processes").is_none());
+    }
+
+    #[test]
+    fn processes_ride_on_the_report_and_survive_a_replay() {
+        // durable：含 processes 的緩衝記錄，補送時與第一次送出的內容相同（只有 seq 不同）
+        let mut s = sample(vec![Metric::new("system.uptime", 10, "s")]);
+        s.processes = Some(ProcessList {
+            top_cpu: vec![kairos_proto::ProcessEntry {
+                pid: 2211,
+                name: "postgres".into(),
+                cpu_usage: 9.41,
+                memory: 4_294_967_296,
+                user: None,
+                command: None,
+            }],
+            top_memory: vec![],
+        });
+        let durable = DurableSeq {
+            boot_id: "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e".into(),
+            report_seq: 7,
+        };
+        // 緩衝的 JSON 往返
+        let stored: Sample = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(stored, s);
+        let live = report_message(3, s, FULL, Some(durable.clone()));
+        let replay = report_message(40, stored, FULL, Some(durable));
+        let mut a = to_value(&live.msg);
+        let mut b = to_value(&replay.msg);
+        a.as_object_mut().unwrap().remove("seq");
+        b.as_object_mut().unwrap().remove("seq");
+        assert_eq!(a, b);
+        assert_eq!(a["processes"]["top_cpu"][0]["name"], "postgres");
+        assert!(
+            live.summary.contains("行程排行 1＋0 項"),
+            "{}",
+            live.summary
+        );
+        // 送出的內容經 kairos-proto 解析後通過伺服器的檢查
+        let line = serde_json::to_string(&live.msg).unwrap();
+        let parsed = kairos_proto::parse_client_msg(&line).unwrap();
+        kairos_proto::validate_client_msg(&parsed).unwrap();
+        let ClientMsg::Report { body, .. } = parsed else {
+            unreachable!()
+        };
+        assert_eq!(body.process_list().unwrap().unwrap().top_cpu[0].pid, 2211);
+    }
+
+    #[test]
+    fn samples_written_by_0_7_are_still_readable() {
+        // 0.7 的緩衝記錄沒有 processes 欄位
+        let old = r#"{"ts":"2026-10-09T00:00:00.000Z","cpu_usage":7.5,"total_memory":49152,
+            "used_memory":37034,"total_memory_bytes":51539607552,"used_memory_bytes":38833356800,
+            "extra":[{"name":"system.filesystem.total","value":1000,"unit":"By","labels":{"mountpoint":"/"}}]}"#;
+        let s: Sample = serde_json::from_str(old).unwrap();
+        assert_eq!(s.processes, None);
+        assert_eq!(s.extra.len(), 1);
+        // 沒有行程時序列化不輸出 processes（與 0.7 寫出的格式相同）
+        assert!(!serde_json::to_string(&s).unwrap().contains("processes"));
     }
 
     #[test]

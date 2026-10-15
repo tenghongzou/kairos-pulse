@@ -107,9 +107,10 @@ enabled = true
 # 目錄允許其他使用者（Windows：一般使用者）存取時記 WARN。同一個目錄只能給一個 Pulse 使用
 dir = "buffer"
 # 待送資料的上限，先到者為準；超過時丟掉最舊的資料並記 WARN（計入丟棄筆數）。
-# 一筆約 0.5～3 KB（視磁碟、網路介面與溫度感測器的數量而定），預設每 5 秒一筆時，
-# 50000 筆約 69 小時、64 MiB 約 1.5～4 天。磁碟用量最多約 max_mb 再加 8 MiB
-max_mb = 64              # MiB，1～102400
+# 一筆約 1.5～5 KB（視磁碟、網路介面與溫度感測器的數量而定；帶行程排行的那筆再多約 1 KB），
+# 預設每 5 秒一筆時，50000 筆約 69 小時、128 MiB 約 2～3 天。磁碟用量最多約 max_mb 再加 8 MiB
+# （0.8.0 起預設由 64 改為 128：每筆記錄因新增的指標變大，METRICS.md 第 17 節 D7）
+max_mb = 128             # MiB，1～102400
 max_records = 50000      # 筆，100～10000000
 # 取樣時間超過這麼久的資料不再送出、直接丟棄（小時，1～8760；預設 7 天）
 max_age_hours = 168
@@ -117,6 +118,56 @@ max_age_hours = 168
 # 低於 Kairos 的 report 速率限制每秒 2 則；1 萬台同時恢復連線時約每秒 8,300 筆）。實際使用的值不超過
 # report.interval 的 60%（report.interval = 1 時為 600），否則新的取樣比送出的快、積壓補不完
 replay_interval_ms = 1200
+
+[collect]
+# 標準指標的採集範圍（METRICS.md 第 3、4 節；協商了 metrics 的 Kairos 0.2.0 以上才送）。
+# CPU、記憶體、負載（只有 Linux）、置換空間、行程數、開機時間一律送；以下各類可個別關閉。
+# 虛擬檔案系統（tmpfs、overlay、squashfs…）、容量為 0 與重複的掛載點、loopback 與虛擬網路介面
+# （veth*、docker*、br-*、virbr*、cni*、flannel*、cali*…）一律不送
+filesystems = true     # system.filesystem.*（每個掛載點：total、available、used、usage）
+disk_io = true         # system.disk.*（每個裝置的累計讀寫量；Linux 另有讀寫次數與忙碌時間）
+network = true         # system.network.*（每個介面的累計收發位元組、封包與錯誤數）
+temperature = true     # system.temperature
+# 每類的上限（每筆 report 最多 256 個指標，Kairos 0.7.0 以前超過就整筆拒絕，因此不可再提高）；
+# 0 = 不送該類。超過上限時依優先順序保留：掛載點為 /（Windows 為系統磁碟機）→ 容量大者；
+# 磁碟 I/O 裝置依掛載點的順序；介面為有 IPv4 位址者 → 累計流量大者。
+# 被略過的項目在啟動後第一次取樣時記一則 INFO（sysinfo.snapshot），之後每 24 小時最多一則
+max_filesystems = 16   # 0～16
+max_disks = 8          # 0～8
+max_interfaces = 16    # 0～16
+# 額外排除的網路介面（glob，* 與 ?，區分大小寫；最多 32 個）。只能在 pulse.toml 設定（環境變數不支援陣列），
+# 例如 ["tap*", "wg?"]
+interface_exclude = []
+
+[processes]
+# 行程數（system.process.count）與行程排行（Kairos 0.8.0 以上、SQLite 儲存時協商 feature「processes」）。
+# false = 不宣告 processes，也不送行程數
+enabled = true
+# 行程排行的間隔（秒，1～3600；實際不小於 report.interval）。排行附在當時的 report 上，
+# CPU 使用率為兩次排行之間的平均（占整台主機的百分比）
+interval = 60
+# 依 CPU、依記憶體（常駐記憶體）各取幾個行程（1～10）
+top = 5
+# 命令列：參數常含密碼、token、連線字串，預設不送（METRICS.md 第 8 節）
+#   none        不送（只送執行檔名稱，例如 postgres）
+#   executable  只送執行檔的完整路徑（不含參數；Linux 讀不到其他使用者行程的路徑時改用命令列的第一段）
+#   full        送完整命令列（含參數，截斷到 1024 bytes）。Kairos 不做遮罩，主控台會提示可能含敏感資訊
+command = "none"
+# 送行程的使用者名稱：本版尚未實作（METRICS.md 第 17 節 D3），設為 true 只會記一則 WARN
+include_user = false
+
+[inventory]
+# 主機資產：作業系統、CPU、記憶體、廠牌型號、序號、BIOS、磁碟、網卡 MAC／IP
+# （Kairos 0.8.0 以上、SQLite 儲存時協商 feature「inventory」）。連線後送一次，之後內容改變才送，
+# 距離上次送達滿 24 小時也送一次。false = 不宣告 inventory、不收集
+enabled = true
+# 重新收集資產的間隔（秒，300～86400）
+interval = 3600
+# 送系統序號（SMBIOS）。Linux 的序號只有 root 能讀：發佈包的 pulse.service 在啟動前以
+# ExecStartPre=+ 複製到 /run/pulse/product_serial；讀不到時不送並記一則 INFO（PLS-I8009）
+hardware_serials = true
+# 送網路介面的 MAC 與 IP 位址
+network_addresses = true
 
 [status]
 # 本機狀態檔（pulse status 讀取）。執行中每 10 秒、狀態變化時另外以原子方式改寫（寫暫存檔再改名，不 fsync）。

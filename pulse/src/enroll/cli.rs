@@ -1885,7 +1885,7 @@ async fn confirm(located: &Located, agent_id: &str) -> Result<(), String> {
     let conn = crate::network::one_shot(
         &settings,
         &tls,
-        crate::protocol::hello_features(false),
+        crate::protocol::hello_features(crate::protocol::OptionalFeatures::one_shot(false)),
         None,
     )
     .await

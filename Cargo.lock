@@ -1035,6 +1035,7 @@ dependencies = [
  "futures-util",
  "kairos-proto",
  "kp-obs",
+ "libc",
  "log",
  "rcgen",
  "ring",

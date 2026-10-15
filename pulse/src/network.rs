@@ -37,12 +37,14 @@ use tokio_util::sync::CancellationToken;
 use crate::backoff::Backoff;
 use crate::codes::{self, Event};
 use crate::config_manager::AppConfig;
+use crate::inventory::{InventoryAgent, InventoryConn};
 use crate::local_status::{self, Disconnected, Registered};
 use crate::log_throttle::{DEFAULT_WINDOW, LogThrottle, suppressed_note};
 use crate::protocol::{
-    CLIENT_FEATURES, ClientMsg, DurableSeq, HelloExt, HostInfo, MAX_LINE_LENGTH, Proto, ProtoOffer,
-    SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session, clock_skew_warning, hello_features,
-    now_ts, parse_server_msg, report_message, sanitize_cpu_usage,
+    BuiltReport, CLIENT_FEATURES, ClientMsg, DurableSeq, HelloExt, HostInfo, MAX_LINE_LENGTH,
+    OptionalFeatures, Proto, ProtoOffer, SUPPORTED_PROTO, ServerMsg, ServerMsgError, Session,
+    clock_skew_warning, hello_features, now_ts, parse_server_msg, report_message,
+    sanitize_cpu_usage,
 };
 use crate::rotation::{HelloAckExtra, Rotation, RotationLine};
 use crate::service_status;
@@ -114,6 +116,9 @@ macro_rules! throttled {
 /// 每筆 report 都會收到 storage_unavailable 並持續到換日，10 秒一則會洗版一整天。
 const STORAGE_UNAVAILABLE_LOG_WINDOW: Duration = Duration::from_secs(300);
 
+/// report 超過單行上限而捨去部分內容的 WARN 節流視窗（METRICS.md 第 4.4 節）
+const REPORT_TRIMMED_LOG_WINDOW: Duration = Duration::from_secs(600);
+
 /// 「伺服器送了怪東西」各類日誌的節流狀態；跨連線保留，避免重連後又重新灌爆日誌。
 #[derive(Debug)]
 struct ServerLogThrottles {
@@ -139,6 +144,8 @@ struct ServerLogThrottles {
     spool_expired: LogThrottle,
     /// 與 Kairos 的時鐘偏差（`clock.skew`，跨連線保留：只在等級改變時記錄）
     clock_skew: ClockSkewLog,
+    /// report 超過單行上限而捨去部分內容（METRICS.md 第 4.4 節：每 10 分鐘最多一則 WARN）
+    report_trimmed: LogThrottle,
 }
 
 impl Default for ServerLogThrottles {
@@ -155,6 +162,7 @@ impl Default for ServerLogThrottles {
             spool_error: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
             spool_expired: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
             clock_skew: ClockSkewLog::default(),
+            report_trimmed: LogThrottle::new(REPORT_TRIMMED_LOG_WINDOW),
         }
     }
 }
@@ -255,6 +263,10 @@ pub struct Settings {
     pub rotation: Option<Arc<std::sync::Mutex<Rotation>>>,
     /// Kairos 以 TLS alert `CertificateExpired` 拒絕用戶端憑證時結束（改走 8444 過期續簽）
     pub grace_on_expiry: bool,
+    /// `processes.enabled`：hello 宣告 `processes`（METRICS.md 第 7.1 節）
+    pub processes_feature: bool,
+    /// `inventory.enabled` 時的資產收集與送出紀錄：hello 宣告 `inventory`（`None` 時不宣告）
+    pub inventory: Option<Arc<InventoryAgent>>,
 }
 
 impl Settings {
@@ -283,6 +295,8 @@ impl Settings {
             extra_features: Vec::new(),
             rotation: None,
             grace_on_expiry: false,
+            processes_feature: config.processes.enabled,
+            inventory: None,
         }
     }
 
@@ -1178,7 +1192,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 proto_max: Some(SUPPORTED_PROTO.max),
                 // 停用本機緩衝時不宣告 durable（A5）；身分由 pulse enroll 管理時另外宣告 renew
                 features: Some({
-                    let mut f = hello_features(spool.is_some());
+                    let mut f = hello_features(OptionalFeatures {
+                        durable: spool.is_some(),
+                        inventory: settings.inventory.is_some(),
+                        processes: settings.processes_feature,
+                    });
                     f.extend(settings.extra_features.iter().cloned());
                     f
                 }),
@@ -1195,6 +1213,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         // 沒有宣告 durable：即使伺服器宣告了也不啟用
         session.durable = false;
     }
+    // inventory、processes 也只在自己有宣告時啟用（METRICS.md 第 7.1 節）
+    session.inventory &= settings.inventory.is_some();
+    session.processes &= settings.processes_feature;
     *registered_at = Some(Instant::now());
     // 正常輪替（feature renew）：v2 且雙方都宣告
     let renew_negotiated = session.is_v2()
@@ -1241,6 +1262,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 features: [
                     (session.metrics, kairos_proto::FEATURE_METRICS),
                     (session.durable, kairos_proto::FEATURE_DURABLE),
+                    (session.inventory, kairos_proto::FEATURE_INVENTORY),
+                    (session.processes, kairos_proto::FEATURE_PROCESSES),
                     (renew_negotiated, kairos_proto::FEATURE_RENEW),
                 ]
                 .into_iter()
@@ -1286,11 +1309,17 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // 斷線期間殘留在佇列中的舊取樣直接丟棄（at-most-once，不重送舊資料）
     while reports.try_recv().is_ok() {}
 
+    // 主機資產（feature inventory，METRICS.md 第 6.3 節）：協商了就要求收集一次並送出，不經過本機緩衝
+    let mut inventory = match (&settings.inventory, session.inventory) {
+        (Some(agent), true) => Some(InventoryConn::start(agent.clone(), Instant::now())),
+        _ => None,
+    };
+
     // 本機緩衝（A5）：協商了 durable 時改走 at-least-once 的迴圈；沒有協商（舊版 Kairos）時，
     // 這條連線期間的新取樣照舊即時送出（at-most-once），緩衝中的積壓保留到連上支援 durable 的 Kairos
     if let Some(shared) = spool {
         if session.durable {
-            return serve_durable(conn, settings, session, shared, throttles).await;
+            return serve_durable(conn, settings, session, shared, inventory, throttles).await;
         }
         let backlog = shared.lock().len();
         if backlog > 0 {
@@ -1330,6 +1359,14 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             _ = rotation_tick.tick(), if settings.rotation.is_some() => {
                 send_renew_if_due(conn, settings).await?;
             }
+            _ = sleep_until_opt(inventory.as_ref().map(InventoryConn::next_wake)) => {
+                let snap = inventory.as_mut().and_then(|i| i.on_wake(Instant::now()));
+                send_inventory(conn, inventory.as_mut(), snap, None).await?;
+            }
+            _ = inventory_changed(&mut inventory) => {
+                let snap = inventory.as_mut().and_then(|i| i.on_snapshot(Instant::now()));
+                send_inventory(conn, inventory.as_mut(), snap, None).await?;
+            }
             Some(sample) = reports.recv() => {
                 if let Some(pending) = pending_report {
                     // 伺服器寫檔緩慢時不再堆送：report 為 at-most-once，這次取樣直接丟棄
@@ -1351,11 +1388,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     log::debug!("CPU 使用率 {} 不合理，送出前調整為 {sanitized}", sample.cpu_usage);
                 }
                 // v1（或沒有協商 metrics）送三個欄位；v2 送通用指標（A4）
-                let (msg, summary) = report_message(seq, sample, session, None);
-                conn.send(&msg).await?;
+                let built = report_message(seq, sample, session, None);
+                conn.send(&built.msg).await?;
                 pending_report = Some(seq);
                 local_status::record(local_status::State::report_sent);
-                log::debug!("已送出 report（seq={seq}，{summary}）");
+                log::debug!("已送出 report（seq={seq}，{}）", built.summary);
+                log_trimmed(throttles, &built);
             }
             line = conn.framed.next() => {
                 let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
@@ -1363,7 +1401,10 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     idle.as_mut().reset(after(read_idle));
                     continue;
                 }
-                let outcome = handle_server_line(&line, conn.seq, throttles)?;
+                let outcome = match inventory_line(&mut inventory, &line, conn.seq) {
+                    Some(answered) => LineOutcome::valid(answered),
+                    None => handle_server_line(&line, conn.seq, throttles)?,
+                };
                 // 只有合法的協定訊息才算「伺服器還活著」（與 Kairos 的閒置判定一致）；
                 // 無法解析的行不重置閒置計時，持續送垃圾的伺服器仍會被判定為閒置
                 if outcome.valid {
@@ -1654,6 +1695,7 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
     settings: &Settings,
     session: Session,
     shared: &Arc<SharedSpool>,
+    mut inventory: Option<InventoryConn>,
     throttles: &mut ServerLogThrottles,
 ) -> Result<Infallible> {
     let read_idle = settings.read_idle_timeout();
@@ -1702,6 +1744,14 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
             _ = rotation_tick.tick(), if settings.rotation.is_some() => {
                 send_renew_if_due(conn, settings).await?;
             }
+            _ = sleep_until_opt(inventory.as_ref().map(InventoryConn::next_wake)) => {
+                let snap = inventory.as_mut().and_then(|i| i.on_wake(Instant::now()));
+                send_inventory(conn, inventory.as_mut(), snap, Some(&mut delivery)).await?;
+            }
+            _ = inventory_changed(&mut inventory) => {
+                let snap = inventory.as_mut().and_then(|i| i.on_snapshot(Instant::now()));
+                send_inventory(conn, inventory.as_mut(), snap, Some(&mut delivery)).await?;
+            }
             // 收集 task 寫入了新的取樣：重新計算下一筆的送出時間
             _ = shared.notify.notified() => {}
             _ = sleep_until_opt(next_send) => {
@@ -1712,11 +1762,16 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                     boot_id: record.boot_id,
                     report_seq: record.report_seq,
                 };
-                let (msg, summary) = report_message(seq, record.sample, session, Some(durable));
-                conn.send(&msg).await?;
+                let built = report_message(seq, record.sample, session, Some(durable));
+                conn.send(&built.msg).await?;
                 delivery.sent(seq, Some(entry.id));
                 local_status::record(local_status::State::report_sent);
-                log::debug!("已送出 report（seq={seq}，report_seq={}，{summary}）", entry.report_seq);
+                log::debug!(
+                    "已送出 report（seq={seq}，report_seq={}，{}）",
+                    entry.report_seq,
+                    built.summary
+                );
+                log_trimmed(throttles, &built);
             }
             line = conn.framed.next() => {
                 let line = line.ok_or(SessionError::ClosedByServer)?.map_err(SessionError::Codec)?;
@@ -1724,10 +1779,14 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                     idle.as_mut().reset(after(read_idle));
                     continue;
                 }
-                let outcome = handle_server_line_in(&line, conn.seq, throttles, true)?;
+                let outcome = match inventory_line(&mut inventory, &line, conn.seq) {
+                    Some(answered) => LineOutcome::valid(answered),
+                    None => handle_server_line_in(&line, conn.seq, throttles, true)?,
+                };
                 if outcome.valid {
                     idle.as_mut().reset(after(read_idle));
                 }
+                // inventory 的回應也要從在途清單移除（緩衝記錄編號為 None，不影響緩衝）
                 if let Some((seq, reply)) = durable_reply(&line) {
                     delivery.on_reply(seq, conn.seq, reply, &mut shared.lock(), throttles);
                 }
@@ -1737,6 +1796,67 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
+}
+
+/// report 超過單行上限而捨去部分內容時：每次記 DEBUG（在送出的 debug 行中），每 10 分鐘最多一則 WARN
+fn log_trimmed(throttles: &mut ServerLogThrottles, built: &BuiltReport) {
+    let Some(trimmed) = &built.trimmed else {
+        return;
+    };
+    if let Some(n) = throttles.report_trimmed.check(Instant::now()) {
+        log::warn!(
+            "report 超過單行上限（{MAX_LINE_LENGTH} bytes），這筆捨去{trimmed}；無 label 的指標一律保留\
+             （可調低 collect.max_* 或關閉 processes.command）{}",
+            suppressed_note(n, REPORT_TRIMMED_LOG_WINDOW)
+        );
+    }
+}
+
+/// 等主機資產的新收集結果；沒有協商 inventory 時永遠等待（`select!` 中的停用分支）
+async fn inventory_changed(inventory: &mut Option<InventoryConn>) {
+    match inventory {
+        Some(i) => i.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 送出主機資產（`snap` 為 `None` 時不送）。durable 連線另記入在途清單，讓回應的順序對得上
+async fn send_inventory<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    inventory: Option<&mut InventoryConn>,
+    snap: Option<Arc<crate::inventory::Snapshot>>,
+    delivery: Option<&mut Delivery>,
+) -> Result<()> {
+    let (Some(inv), Some(snap)) = (inventory, snap) else {
+        return Ok(());
+    };
+    let seq = conn.next_seq();
+    conn.send(&InventoryConn::message(seq, &snap)).await?;
+    inv.sent(seq, &snap, Instant::now());
+    if let Some(d) = delivery {
+        d.sent(seq, None);
+    }
+    log::debug!("已送出 inventory（seq={seq}，{}）", snap.digest);
+    Ok(())
+}
+
+/// 一行伺服器訊息若是在途 `inventory` 的回應，交給 [`InventoryConn::on_line`] 處理並回傳它回應的 seq；
+/// 其他訊息回傳 `None`（照一般的方式處理）
+fn inventory_line(
+    inventory: &mut Option<InventoryConn>,
+    line: &str,
+    last_sent_seq: u64,
+) -> Option<Option<u64>> {
+    let inv = inventory.as_mut()?;
+    let answered = match parse_server_msg(line) {
+        Ok(ServerMsg::Ack { seq }) => answered_seq(Some(seq), last_sent_seq),
+        Ok(ServerMsg::Error {
+            seq, fatal: false, ..
+        }) => answered_seq(seq, last_sent_seq),
+        _ => None,
+    };
+    inv.on_line(line, answered, Instant::now())
+        .map(|_| answered)
 }
 
 /// 正常輪替的時點檢查間隔（連線建立後立即檢查一次）
@@ -2550,6 +2670,8 @@ mod tests {
             extra_features: Vec::new(),
             rotation: None,
             grace_on_expiry: false,
+            processes_feature: false,
+            inventory: None,
         }
     }
 
@@ -3570,6 +3692,7 @@ mod tests {
             total_memory_bytes: 2048,
             used_memory_bytes: 1024,
             extra: Vec::new(),
+            processes: None,
         }
     }
 
@@ -4652,6 +4775,7 @@ mod tests {
             total_memory_bytes: 2 * 1024 * 1024,
             used_memory_bytes: 1024 * 1024,
             extra: Vec::new(),
+            processes: None,
         }
     }
 
@@ -5238,6 +5362,189 @@ mod tests {
         let ((err, _), ()) = tokio::join!(serve_with_reports(client, &s, &mut rx), feeder);
         let (hello, report) = srv.await.unwrap();
         (hello, report, err)
+    }
+
+    // ---- F4：processes、inventory 的協商（METRICS.md 第 7 節、第 16.1 節驗收） ----
+
+    fn fake_inventory(
+        _: &crate::system_info::inventory::InventoryOptions,
+    ) -> (kairos_proto::Inventory, Vec<&'static str>) {
+        (
+            kairos_proto::Inventory {
+                os: Some(kairos_proto::OsInventory {
+                    family: Some("linux".into()),
+                    name: Some("Ubuntu".into()),
+                    ..Default::default()
+                }),
+                boot_time: Some("2026-10-02T08:11:04Z".into()),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+    }
+
+    fn f4_settings(processes: bool, inventory: bool) -> Settings {
+        let mut s = settings(60);
+        s.processes_feature = processes;
+        s.inventory = inventory.then(|| {
+            InventoryAgent::with_collector(
+                Duration::from_secs(3600),
+                crate::system_info::inventory::InventoryOptions {
+                    hardware_serials: true,
+                    network_addresses: true,
+                    interface_exclude: Vec::new(),
+                },
+                fake_inventory,
+            )
+        });
+        s
+    }
+
+    fn sample_with_processes() -> Sample {
+        let mut s = test_sample(1);
+        s.extra = vec![crate::protocol::Metric::new("system.uptime", 42, "s")];
+        s.processes = Some(kairos_proto::ProcessList {
+            top_cpu: vec![kairos_proto::ProcessEntry {
+                pid: 2211,
+                name: "postgres".into(),
+                cpu_usage: 9.41,
+                memory: 4096,
+                user: None,
+                command: None,
+            }],
+            top_memory: vec![],
+        });
+        s
+    }
+
+    /// 以 `server_features` 回覆 hello_ack，對每則訊息回 ack；收集約 `window` 內收到的訊息
+    async fn f4_exchange(
+        s: &Settings,
+        server_features: &'static [&'static str],
+        window: Duration,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        if let Some(agent) = &s.inventory {
+            tokio::spawn(crate::inventory::run_worker(agent.clone()));
+        }
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            let hello = accept_hello_v2(&mut f, server_features).await;
+            let mut got = Vec::new();
+            let deadline = Instant::now() + window;
+            while let Ok(Some(Ok(line))) = time::timeout_at(deadline, f.next()).await {
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                f.send(format!(r#"{{"type":"ack","seq":{}}}"#, v["seq"]))
+                    .await
+                    .unwrap();
+                got.push(v);
+            }
+            (hello, got)
+        });
+        let (tx, mut rx) = mpsc::channel::<Sample>(1);
+        let feeder = async {
+            time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(sample_with_processes()).await;
+        };
+        let ((err, registered), ()) = tokio::join!(serve_with_reports(client, s, &mut rx), feeder);
+        assert!(registered, "{err:?}");
+        srv.await.unwrap()
+    }
+
+    fn of_type<'a>(got: &'a [serde_json::Value], t: &str) -> Vec<&'a serde_json::Value> {
+        got.iter().filter(|v| v["type"] == t).collect()
+    }
+
+    #[tokio::test]
+    async fn inventory_and_processes_are_sent_only_when_both_sides_declare_them() {
+        let window = Duration::from_millis(800);
+        // 0.8.0 × 0.8.0（SQLite）：全部功能
+        let s = f4_settings(true, true);
+        let (hello, got) = f4_exchange(&s, &["metrics", "inventory", "processes"], window).await;
+        assert_eq!(
+            hello["features"],
+            serde_json::json!(["metrics", "inventory", "processes"])
+        );
+        let inv = of_type(&got, "inventory");
+        assert_eq!(inv.len(), 1, "連線後送一次：{got:?}");
+        assert_eq!(inv[0]["inventory"]["os"]["name"], "Ubuntu");
+        kairos_proto::validate_client_msg(
+            &kairos_proto::parse_client_msg(&inv[0].to_string()).unwrap(),
+        )
+        .unwrap();
+        let reports = of_type(&got, "report");
+        assert_eq!(reports.len(), 1, "{got:?}");
+        assert_eq!(reports[0]["processes"]["top_cpu"][0]["name"], "postgres");
+
+        // 舊版 Kairos（0.2.0～0.7.0，不宣告）：新指標照送，processes 與 inventory 不送
+        let (_, got) = f4_exchange(&s, &["metrics"], window).await;
+        assert!(of_type(&got, "inventory").is_empty(), "{got:?}");
+        let reports = of_type(&got, "report");
+        assert!(reports[0].get("processes").is_none(), "{got:?}");
+        assert!(
+            reports[0]["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"] == "system.uptime")
+        );
+
+        // 只宣告其中一個
+        let (_, got) = f4_exchange(&s, &["metrics", "processes"], window).await;
+        assert!(of_type(&got, "inventory").is_empty());
+        assert!(of_type(&got, "report")[0].get("processes").is_some());
+        let (_, got) = f4_exchange(&s, &["metrics", "inventory"], window).await;
+        assert_eq!(of_type(&got, "inventory").len(), 1);
+        assert!(of_type(&got, "report")[0].get("processes").is_none());
+
+        // Pulse 端關閉（processes.enabled／inventory.enabled = false）：不宣告、也不送
+        let s = f4_settings(false, false);
+        let (hello, got) = f4_exchange(&s, &["metrics", "inventory", "processes"], window).await;
+        assert_eq!(hello["features"], serde_json::json!(["metrics"]));
+        assert!(of_type(&got, "inventory").is_empty());
+        assert!(of_type(&got, "report")[0].get("processes").is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_session_sends_inventory_outside_the_buffer() {
+        // durable 連線：inventory 不寫入緩衝，回應與 report 的 ack 交錯也能對上
+        let (_dir, shared) = test_spool("inventory", 3);
+        let s = f4_settings(true, true);
+        if let Some(agent) = &s.inventory {
+            tokio::spawn(crate::inventory::run_worker(agent.clone()));
+        }
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            accept_hello_v2(&mut f, &["metrics", "durable", "inventory", "processes"]).await;
+            let mut got = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while let Ok(Some(Ok(line))) = time::timeout_at(deadline, f.next()).await {
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                f.send(format!(r#"{{"type":"ack","seq":{}}}"#, v["seq"]))
+                    .await
+                    .unwrap();
+                let done = v["type"] == "report" && v["report_seq"] == 3;
+                got.push(v);
+                if done && got.iter().any(|v| v["type"] == "inventory") {
+                    break;
+                }
+            }
+            got
+        });
+        let err = serve_spool(client, &s, &shared).await;
+        assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
+        let got = srv.await.unwrap();
+        assert_eq!(of_type(&got, "inventory").len(), 1, "{got:?}");
+        let seqs: Vec<u64> = of_type(&got, "report")
+            .iter()
+            .map(|r| r["report_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, [1, 2, 3]);
+        assert!(
+            shared.lock().is_empty(),
+            "report 的 ack 都已處理，緩衝已清空"
+        );
     }
 
     #[tokio::test(start_paused = true)]

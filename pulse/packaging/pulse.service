@@ -69,6 +69,18 @@ RestartPreventExitStatus=2 3 4
 StateDirectory=pulse
 StateDirectoryMode=0755
 
+# 主機資產的系統序號（0.8.0，METRICS.md 第 4.5 節、第 17 節 D4）：/sys/class/dmi/id/product_serial
+# 只有 root 能讀，而 Pulse 以 pulse 使用者、沒有任何 capability 執行。啟動前以 root 執行一次複製
+# （前綴 + 不受下方的沙箱與 User= 限制；前綴 - 表示失敗不影響啟動，例如沒有 DMI 的虛擬機），
+# 放到 RuntimeDirectory（/run/pulse，擁有者 pulse），Pulse 讀 /run/pulse/product_serial。
+# 讀不到時 Pulse 不送序號並記一次 PLS-I8009。不想送序號時在 pulse.toml 設定
+# [inventory] hardware_serials = false（這幾行可保留）。多實例共用同一個 /run/pulse，
+# 因此 RuntimeDirectoryPreserve=yes（停止其中一個實例時不刪除）
+RuntimeDirectory=pulse
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStartPre=-+/usr/bin/install -o pulse -g pulse -m 0400 /sys/class/dmi/id/product_serial /run/pulse/product_serial
+
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict
 ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer -/opt/pulse/identity
