@@ -103,6 +103,10 @@ const axeResults = [];
 async function axe(page, label) {
   await page.evaluate(AXE);
   const res = await page.evaluate(async () => {
+    // 進行中的 CSS 轉場（例如按鈕由停用變為可用時的 background-color）結束後才檢查：轉場中的中間色會被
+    // color-contrast 誤判（S14 撤銷對話框曾因此偶發失敗）。無限循環的動畫（骨架、轉圈）不等。
+    const finite = document.getAnimations().filter((a) => a.playState === 'running' && a.effect && a.effect.getTiming().iterations !== Infinity);
+    await Promise.race([Promise.all(finite.map((a) => a.finished.catch(() => {}))), new Promise((r) => setTimeout(r, 2000))]);
     // eslint-disable-next-line no-undef
     const r = await axe.run(document, { resultTypes: ['violations'] });
     return r.violations.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.map((n) => n.target.join(' ')).slice(0, 5) }));
