@@ -136,6 +136,7 @@ pub async fn handle(
         ("GET" | "HEAD", ["pki", "certificates"]) => list_certs(&svc, &query, now).await,
         ("POST", ["pki", "certificates", "revoke"]) => revoke(&w, b(), now).await,
         ("GET" | "HEAD", ["pki", "certificates", serial]) => get_cert(&svc, serial, now).await,
+        ("GET" | "HEAD", ["pki", "policy", "impact"]) => policy_impact(&svc, &query, now).await,
         ("PUT", ["pki", "policy"]) => set_policy(&w, b(), now).await,
         ("POST", ["pki", "grace-overrides"]) => grace_overrides(&w, b(), now).await,
         ("GET" | "HEAD", ["pki", "ca"]) => get_ca(&svc, now).await,
@@ -148,6 +149,7 @@ pub async fn handle(
         }
         ("POST", ["pki", "signing-queue", "import"]) => import_queue(&w, b(), now).await,
         ("GET" | "HEAD", ["settings"]) => list_settings(&svc, now).await,
+        ("GET" | "HEAD", ["settings", "reset", "impact"]) => reset_impact(&svc, &query, now).await,
         ("POST", ["settings", "reset"]) => reset_settings(&w, b(), now).await,
         _ => Err(ApiError::not_found()),
     }
@@ -519,11 +521,28 @@ async fn list_requests(
     q: &Query,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
-    q.reject_unknown(&["view", "token", "kind", "flag", "q", "limit"], &[])?;
+    q.reject_unknown(
+        &["view", "token", "kind", "flag", "q", "limit", "state"],
+        &[],
+    )?;
     let closed = match q.get("view").unwrap_or("pending") {
         "pending" => false,
         "closed" => true,
         _ => return Err(ApiError::param("view", "view 必須是 pending 或 closed")),
+    };
+    // 待核准檢視內再以狀態篩選（側邊導覽「待核准」的計數泡泡只算 pending_approval，設計包 ia.md §7）
+    let state = match q.get("state") {
+        None => None,
+        Some(s) => Some(
+            store::DbState::parse(s)
+                .filter(|st| st.is_pending() && !closed)
+                .ok_or_else(|| {
+                    ApiError::param(
+                        "state",
+                        "state 必須是 pending_approval 或 approved（只用於 view=pending）",
+                    )
+                })?,
+        ),
     };
     let kind = match q.get("kind") {
         None => None,
@@ -536,7 +555,7 @@ async fn list_requests(
         closed,
         token_id: q.get("token").map(str::to_string),
         kind,
-        state: None,
+        state,
         limit: 100_000,
     };
     let rows = svc
@@ -783,12 +802,31 @@ async fn reset_settings(
         w.principal.require(perm)?;
         locked(w.svc, k)?;
     }
-    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
     let now_ms = now.timestamp_millis();
+    // 改用設定檔的值可能等於關閉註冊端點或縮短寬限期：與 PUT /enroll/mode、PUT /pki/policy 相同的確認
+    let (before, after) = reset_effective(w.svc, &keys).await?;
+    let impact = change_impact(w.svc, before, after, now_ms).await?;
+    let reason = str_field(&b, "reason").map(str::to_string);
+    let level = check_impact(&impact, &b, reason.as_deref(), now_ms)?;
+    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
     let results = w
         .svc
         .db
-        .write(move |conn| Ok(ops::reset_settings(conn, &keys, &actor, Some(&ip), now_ms)))
+        .write(move |conn| {
+            let confirmed = impact.required().then_some(ops::Confirmed {
+                level,
+                reason: reason.as_deref(),
+                impact: &impact,
+            });
+            Ok(ops::reset_settings(
+                conn,
+                &keys,
+                &actor,
+                Some(&ip),
+                confirmed.as_ref(),
+                now_ms,
+            ))
+        })
         .await
         .map_err(db_error)?
         .map_err(op_error)?;
@@ -797,6 +835,129 @@ async fn reset_settings(
         now,
         json!({"results": results.iter().map(|(k, e)| json!({"key": k, "was_console": e})).collect::<Vec<_>>()}),
     ))
+}
+
+/// 刪除 `keys` 的資料庫值前後的生效值（「改用設定檔的值」）
+async fn reset_effective(
+    svc: &Arc<EnrollService>,
+    keys: &[String],
+) -> Result<(settings::Effective, settings::Effective), ApiError> {
+    let rows = svc
+        .db
+        .read(|conn| Ok(store::load_settings(conn)?))
+        .await
+        .map_err(db_error)?;
+    let overrides = settings::overrides_from(&rows);
+    let before = settings::effective(&svc.config, &overrides);
+    let mut rest = overrides;
+    for k in keys {
+        rest.remove(k);
+    }
+    Ok((before, settings::effective(&svc.config, &rest)))
+}
+
+async fn change_impact(
+    svc: &Arc<EnrollService>,
+    before: settings::Effective,
+    after: settings::Effective,
+    now_ms: i64,
+) -> Result<ops::ChangeImpact, ApiError> {
+    svc.db
+        .read(move |conn| {
+            ops::change_impact(conn, &before, &after, now_ms)
+                .map_err(|e| crate::enroll::db::DbError(e.message))
+        })
+        .await
+        .map_err(db_error)
+}
+
+/// 需要確認的變更：`impact_token` 必填且必須符合目前的數字（否則 409 `impact_changed`，附新的數字）；
+/// L2 時 `reason` 必填。回傳確認等級
+fn check_impact(
+    impact: &ops::ChangeImpact,
+    b: &Value,
+    reason: Option<&str>,
+    now_ms: i64,
+) -> Result<&'static str, ApiError> {
+    let (level, _) = impact.level();
+    if !impact.required() {
+        return Ok(level);
+    }
+    let token = str_field(b, "impact_token").ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "confirmation_required",
+            "這項變更會讓主機無法自動續簽（關閉註冊端點或縮短過期寬限期），需要 impact_token",
+        )
+        .with_details(impact.json(now_ms))
+    })?;
+    if !impact.verify(token, now_ms) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "impact_changed",
+            "影響數字在確認後改變，請重新確認",
+        )
+        .with_details(impact.json(now_ms)));
+    }
+    if level == "L2" && reason.is_none_or(|r| r.trim().is_empty()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "confirmation_required",
+            "L2 的操作必須填寫 reason",
+        ));
+    }
+    Ok(level)
+}
+
+/// `GET /api/v1/pki/policy/impact?expired_renew_grace_days=N`：縮短過期寬限期的影響（S14、D11）
+async fn policy_impact(
+    svc: &Arc<EnrollService>,
+    q: &Query,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    q.reject_unknown(&["expired_renew_grace_days"], &[])?;
+    let max = crate::config::MAX_GRACE_DAYS;
+    let days = q
+        .get("expired_renew_grace_days")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|d| *d <= max)
+        .ok_or_else(|| {
+            ApiError::param(
+                "expired_renew_grace_days",
+                format!("expired_renew_grace_days 必須介於 0..={max}"),
+            )
+        })?;
+    let before = svc.effective();
+    let mut after = before.clone();
+    after.policy.expired_renew_grace_days = days;
+    let now_ms = now.timestamp_millis();
+    let impact = change_impact(svc, before, after, now_ms).await?;
+    Ok(http::ok(now, impact.json(now_ms)))
+}
+
+/// `GET /api/v1/settings/reset/impact?keys=a,b`：「改用設定檔的值」的影響（關閉註冊端點、縮短寬限期）
+async fn reset_impact(
+    svc: &Arc<EnrollService>,
+    q: &Query,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    q.reject_unknown(&["keys"], &[])?;
+    let keys = q.list("keys");
+    if keys.is_empty() {
+        return Err(ApiError::param("keys", "keys 必填"));
+    }
+    for k in &keys {
+        if !settings::CONSOLE_KEYS.contains(&k.as_str()) {
+            return Err(ApiError::param(
+                "keys",
+                format!("{k} 不是可從主控台修改的設定"),
+            ));
+        }
+    }
+    let (before, after) = reset_effective(svc, &keys).await?;
+    let now_ms = now.timestamp_millis();
+    let impact = change_impact(svc, before, after, now_ms).await?;
+    Ok(http::ok(now, impact.json(now_ms)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,11 +1409,37 @@ async fn set_policy(
     if values.is_empty() {
         return Err(ApiError::param("body", "至少要修改一項政策"));
     }
-    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
+    for (k, v) in &values {
+        settings::validate_override(k, v).map_err(|e| ApiError::param("policy", e))?;
+    }
+    // 縮短過期寬限期：影響數字與 impact_token（設計包 S14、D11；同第 11.4 節）
+    let before = w.svc.effective();
+    let mut after = before.clone();
+    if let Some((_, v)) = values.iter().find(|(k, _)| *k == settings::KEY_GRACE_DAYS) {
+        after.policy.expired_renew_grace_days = v.as_u64().unwrap_or(0) as u32;
+    }
     let now_ms = now.timestamp_millis();
+    let impact = change_impact(w.svc, before, after, now_ms).await?;
+    let reason = str_field(&b, "reason").map(str::to_string);
+    let level = check_impact(&impact, &b, reason.as_deref(), now_ms)?;
+    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
     w.svc
         .db
-        .write(move |conn| Ok(ops::set_policy(conn, &values, &actor, Some(&ip), now_ms)))
+        .write(move |conn| {
+            let confirmed = impact.required().then_some(ops::Confirmed {
+                level,
+                reason: reason.as_deref(),
+                impact: &impact,
+            });
+            Ok(ops::set_policy(
+                conn,
+                &values,
+                &actor,
+                Some(&ip),
+                confirmed.as_ref(),
+                now_ms,
+            ))
+        })
         .await
         .map_err(db_error)?
         .map_err(op_error)?;

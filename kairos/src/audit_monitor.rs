@@ -111,6 +111,7 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
         "via": "self_check",
         "checked": report.checked,
         "hmac": report.hmac.status,
+        "hmac_since_id": report.hmac.since_id,
         "broken": report.broken.as_ref().map(|b| serde_json::json!({"id": b.id, "reason": b.reason})),
     });
     let now = chrono::Utc::now().timestamp_millis();

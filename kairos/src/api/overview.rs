@@ -89,7 +89,7 @@ fn top_by<'a>(
 pub async fn get(
     ctx: &Arc<ApiContext>,
     access: &HostAccess,
-    show_health: bool,
+    health_for: Option<&crate::rbac::Grants>,
     now: DateTime<Utc>,
 ) -> Result<hyper::Response<super::http::ApiBody>, ApiError> {
     let snap = ctx.hosts.snapshot(ctx).await?;
@@ -141,10 +141,10 @@ pub async fn get(
         |h| h.status == Status::Online,
         |h| h.mem_ratio(),
     );
-    let health = if show_health {
-        health::compute(ctx, now).await.ok()
-    } else {
-        None
+    // 有 health:read 時；摘要依權限省略（與 GET /api/v1/system/health 相同）
+    let health = match health_for {
+        Some(g) => health::compute(ctx, now).await.ok().map(|h| h.redact(g)),
+        None => None,
     };
     Ok(ok(
         now,
@@ -163,6 +163,7 @@ pub async fn get(
                 "status": h.status,
                 "items": h.items.iter().filter(|i| i.status != Level::Ok).map(|i| json!({
                     "id": i.id, "status": i.status, "product_code": i.product_code, "summary": i.summary,
+                    "restricted": i.restricted,
                 })).collect::<Vec<_>>(),
             })),
         }),

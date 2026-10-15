@@ -100,10 +100,12 @@ pub const CONFIG_USAGE: &str = "kairos config — 設定
 
 用法：
   kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--config <path>] [--json]
-  kairos config reset <設定鍵>... [--yes]（改用設定檔的值：刪除主控台的設定）
+  kairos config reset <設定鍵>... [--yes] [--reason <原因>] [--expect-count <N>]（改用設定檔的值：刪除主控台的設定）
 
 列出每一個設定鍵實際生效的值與來源：environment（KAIROS__ 環境變數）＞ console（主控台或 CLI 寫入資料庫
-的 settings 表）＞ file（kairos.toml）＞ default（程式內建）。結束代碼：0 完成、2 用法錯誤、3 設定錯誤";
+的 settings 表）＞ file（kairos.toml）＞ default（程式內建）。reset 會關閉註冊端點或縮短過期寬限期、使主機
+無法自動續簽時為 L2：互動輸入「停止續簽 N 台」，非互動需要 --yes --expect-count <N> 與 --reason。
+結束代碼：0 完成、2 用法錯誤、3 設定錯誤、6 被拒絕（影響台數已改變）";
 
 /// 命令的種類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1810,8 +1812,72 @@ fn config_reset(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             "需要至少一個設定鍵，例如 kairos config reset enroll.mode",
         ));
     }
-    if !cmd.flag("--yes") {
-        let ok = (env.confirm)(&format!("即將刪除主控台對 {} 的設定，改用 kairos.toml（或內建預設）的值；執行中的 Kairos 在 2 秒內套用。\n是否繼續？[y/N] ", keys.join("、")))
+    let now_ms = env.now.timestamp_millis();
+    let config = load_config(cmd.config_path.as_deref())?;
+    let mut conn = db(cmd)?;
+    // 改回設定檔的值可能等於關閉註冊端點或縮短寬限期：與 enroll mode closed、主控台相同的 L2
+    // （設計包 screens.md §0.3；API POST /api/v1/settings/reset 的 impact_token）
+    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let before = settings::effective(&config, &overrides);
+    let mut rest = overrides.clone();
+    for k in &keys {
+        rest.remove(k);
+    }
+    let after = settings::effective(&config, &rest);
+    let impact = ops::change_impact(&conn, &before, &after, now_ms).map_err(op_failure)?;
+    let (level, confirm_text) = impact.level();
+    if level == "L2" {
+        let n = impact.count();
+        if cmd.opt("--reason").is_none() {
+            return Err(usage_err(format!(
+                "改用設定檔的值會讓 {n} 台主機無法自動續簽（L2）：--reason 必填"
+            )));
+        }
+        if cmd.flag("--yes") {
+            let expect = int_opt(cmd, "--expect-count")?
+                .ok_or_else(|| usage_err("非互動執行時需要 --yes --expect-count <N>（L2）"))?;
+            if expect != n {
+                return Err(Failure::new(
+                    "未變更",
+                    format!("影響台數已改變：目前 {n} 台（--expect-count {expect}）"),
+                    vec!["確認數字後以新的 --expect-count 重新執行。".into()],
+                    EXIT_REJECTED,
+                ));
+            }
+        } else {
+            let want = confirm_text.unwrap_or_default();
+            let mut what = Vec::new();
+            if let Some((from, i)) = &impact.closing {
+                what.push(format!(
+                    "註冊端點模式 {} → closed：寬限期內 {} 台、30 天內進入寬限期且離線 {} 台將無法自動續簽",
+                    from.as_str(),
+                    i.n,
+                    i.m
+                ));
+            }
+            if let Some(g) = &impact.grace {
+                what.push(format!(
+                    "過期寬限期 {} 天 → {} 天：{} 台立即無法續簽",
+                    g.from_days, g.to_days, g.k
+                ));
+            }
+            let typed = (env.confirm)(&format!(
+                "{}。
+請輸入「{want}」確認：",
+                what.join("；")
+            ));
+            if typed.as_deref().map(str::trim) != Some(want.as_str()) {
+                return Err(Failure::new(
+                    "未變更",
+                    "確認字串不符（非互動執行時需要 --yes --expect-count）",
+                    Vec::new(),
+                    EXIT_USAGE,
+                ));
+            }
+        }
+    } else if !cmd.flag("--yes") {
+        let ok = (env.confirm)(&format!("即將刪除主控台對 {} 的設定，改用 kairos.toml（或內建預設）的值；執行中的 Kairos 在 2 秒內套用。
+是否繼續？[y/N] ", keys.join("、")))
             .is_some_and(|a| matches!(a.trim(), "y" | "Y" | "yes"));
         if !ok {
             return Err(Failure::new(
@@ -1822,13 +1888,18 @@ fn config_reset(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             ));
         }
     }
-    let mut conn = db(cmd)?;
+    let confirmed = impact.required().then_some(ops::Confirmed {
+        level,
+        reason: cmd.opt("--reason"),
+        impact: &impact,
+    });
     let results = ops::reset_settings(
         &mut conn,
         &keys,
         &operator(),
         None,
-        env.now.timestamp_millis(),
+        confirmed.as_ref(),
+        now_ms,
     )
     .map_err(op_failure)?;
     if cmd.json {

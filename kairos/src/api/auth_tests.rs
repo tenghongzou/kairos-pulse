@@ -402,6 +402,68 @@ async fn first_login_must_change_password() {
 }
 
 /// 每個角色對一組端點：允許的不是 403，拒絕的是 403
+/// 系統健康：整體狀態與各項狀態對所有人相同，併入的項目（/metrics、告警引擎…）細節依權限省略（§29.6）
+#[tokio::test]
+async fn health_details_follow_permissions() {
+    let f = fixture("auth-health", cheap).await;
+    add_user(&f, "ad", &["admin"], false);
+    add_user(&f, "vi", &["viewer"], false);
+    let ad = login(&f, "ad").await;
+    let vi = login(&f, "vi").await;
+    let get = |s: Session| {
+        let f = &f;
+        async move {
+            call(
+                f,
+                "GET",
+                "/api/v1/system/health",
+                Auth::Session(&s),
+                None,
+                &[],
+            )
+            .await
+            .json()
+        }
+    };
+    let a = get(ad.clone()).await;
+    let v = get(vi.clone()).await;
+    assert_eq!(a["data"]["status"], v["data"]["status"]);
+    let ids = |x: &Value| {
+        x["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| (i["id"].clone(), i["status"].clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&a), ids(&v));
+    let item = |x: &Value, id: &str| {
+        x["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    // 唯讀有 alerts:read（告警引擎看得到），沒有 settings:read（/metrics 端點只看狀態）
+    assert!(item(&v, "alerts").get("restricted").is_none());
+    let id = "metrics";
+    assert_eq!(item(&v, id)["restricted"], true);
+    assert_eq!(item(&v, id)["summary"], "");
+    assert!(item(&v, id)["values"].is_null());
+    assert!(item(&a, id).get("restricted").is_none());
+    assert_ne!(item(&a, id)["summary"], "");
+    // 原本的項目不受影響（唯讀的細節由主控台決定是否顯示）
+    assert!(item(&v, "database").get("restricted").is_none());
+    // 總覽的健康摘要同樣省略
+    let o = call(&f, "GET", "/api/v1/overview", Auth::Session(&vi), None, &[])
+        .await
+        .json();
+    assert_eq!(o["data"]["health"]["status"], a["data"]["status"]);
+    f.stop().await;
+}
+
 #[tokio::test]
 async fn every_role_is_denied_what_it_lacks() {
     let f = fixture("auth-rbac", cheap).await;
@@ -490,6 +552,19 @@ async fn every_role_is_denied_what_it_lacks() {
             &["ad"],
         ),
         ("PUT", "/api/v1/pki/policy", Some(json!({})), &["ad"]),
+        // 影響數字的查詢（0.8）：讀取權限同所在區段
+        (
+            "GET",
+            "/api/v1/pki/policy/impact?expired_renew_grace_days=30",
+            None,
+            &["ad", "op", "au"],
+        ),
+        (
+            "GET",
+            "/api/v1/settings/reset/impact?keys=enroll.mode",
+            None,
+            &["ad", "op", "au"],
+        ),
         (
             "POST",
             "/api/v1/pki/certificates/revoke",
@@ -1734,6 +1809,22 @@ async fn audit_log_query_export_and_verify() {
     assert_eq!(v["data"]["ok"], false);
     assert_eq!(v["data"]["broken"]["id"], 3);
     assert_eq!(v["data"]["broken"]["product_code"], "KRS-E6201");
+    // 頁首「完整性」：列表的 meta 帶最近一次驗證與 HMAC 起點（只看自己操作的身分沒有）
+    let v = call(&f, "GET", "/api/v1/audit", Auth::Session(&aud), None, &[])
+        .await
+        .json();
+    let i = &v["meta"]["integrity"];
+    assert_eq!(i["last_verify"]["result"], "failed", "{i}");
+    assert_eq!(i["last_verify"]["broken"]["id"], 3, "{i}");
+    assert_eq!(i["last_verify"]["actor"], "user:aud", "{i}");
+    assert_eq!(i["last_verify"]["self_check"], false, "{i}");
+    // 測試的資料目錄沒有 audit-hmac.key：HMAC 尚未開始（null），欄位仍在
+    assert!(i.get("hmac_since_id").is_some(), "{i}");
+    assert_eq!(i["last_verify"]["hmac_since_id"], i["hmac_since_id"], "{i}");
+    let v = call(&f, "GET", "/api/v1/audit", Auth::Session(&op), None, &[])
+        .await
+        .json();
+    assert!(v["meta"]["integrity"].is_null(), "{v}");
     // 查詢與匯出本身也被記錄
     let actions: Vec<String> = audit_actions(&f).into_iter().map(|a| a.0).collect();
     for a in ["audit.query", "audit.export", "audit.verify"] {

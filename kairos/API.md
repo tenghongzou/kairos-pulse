@@ -438,8 +438,14 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `listeners` | agent 連線埠與主控台的實際監聽位址 | — |
 | `file_descriptors` | `RLIMIT_NOFILE` 的 soft limit（只在 Linux）、需要量、建議值（第 2 節） | 警告：soft limit 低於需要量 |
 | `auth` | 是否啟用 mTLS、`auth.allow_unauthenticated` | 嚴重：未啟用 mTLS 而監聽對外位址（`KRS-W0302`） |
+| `issuing_ca`（0.8；有註冊服務時） | `pki_mode`、`expiry_warning_days`、`active[]`（啟用中的簽發 CA：`subject`、`not_after`、`days_left`、`status`）、`signing_queue_stale`（離線簽發時超過 24 小時的待簽發筆數）、`signing_queue_oldest` | 警告：即將到期（`KRS-W1304`）、離線簽發且有超過 24 小時的待簽發；嚴重：已到期或線上簽發但私鑰無法使用（`KRS-E1303`） |
+| `enroll`（0.8；有註冊服務時） | `mode`、`state`、`listening`、`listen_addr`、`not_listening_reason`、`expired_renew_grace_days`、`blocked_sources`、`impact`（`N`、`M`、`L`、`R`、`T`，第 11.4 節） | 嚴重：模式不是關閉卻沒有在監聽（`KRS-E2001`）；警告：關閉且 N＋M＞0（`KRS-W2009`）、僅續簽但寬限期為 0 天（`KRS-W2011`）、僅續簽但仍有有效 token、封鎖中的來源 ≥ 1（`KRS-W3005`）（設計包 S20「註冊端點」） |
+| `alerts`（0.8） | `enabled`；啟用時同 `GET /api/v1/alerts/summary` 的 `engine`（`running`、`last_tick_at`、`warmup`、`last_error`…） | 嚴重：告警引擎沒有在執行（最近 60 秒沒有完成判定）。`alerts.enabled = false` 時為正常（「已停用」） |
+| `metrics`（0.8） | `on_console`、`token`（是否設定 `observability.metrics_token_file`）、`listen`、`proxied_rejected`（這次啟動後曾拒絕經反向代理轉送的請求，`KRS-W0304`） | —（摘要為設計包 S20「/metrics 端點」列的寫法） |
 
-〔之後〕CRL 自動更新（#6）、註冊端點（#16）、授權（#13）、告警引擎（#9）、時鐘（NTP）在對應功能實作時加入。
+**細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
+
+〔之後〕CRL 自動更新（#6）、授權（#13）、時鐘（NTP）、目錄服務的最近一次連線結果在對應功能實作時加入。
 
 ### 5.6 `KRS-W4202`：容量上限刪除最舊的資料
 
@@ -714,7 +720,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
-| `GET /api/v1/enroll/requests` | `read` | 列表。`view`：`pending`（預設）／`closed`（最近結束，30 天）；篩選 `token`、`kind`（`enroll`、`grace_renewal`、`renewal`）、`flag`（`none`、`any` 或旗標名稱）、`subnet`、`q`（申請編號〔含不含連字號、不分大小寫〕、主機名稱、IP、`agent_id` 前綴）；排序 `created_at`（預設）、`hostname`、`source_ip`；游標分頁 |
+| `GET /api/v1/enroll/requests` | `read` | 列表。`view`：`pending`（預設）／`closed`（最近結束，30 天）；`state`（0.8，只用於 `pending`）：`pending_approval`（待核准，主控台側邊導覽的計數泡泡以 `limit=1` 的 `page.total` 取得）或 `approved`（已核准、待簽發）；篩選 `token`、`kind`（`enroll`、`grace_renewal`、`renewal`）、`flag`（`none`、`any` 或旗標名稱）、`subnet`、`q`（申請編號〔含不含連字號、不分大小寫〕、主機名稱、IP、`agent_id` 前綴）；排序 `created_at`（預設）、`hostname`、`source_ip`；游標分頁 |
 | `GET /api/v1/enroll/requests/{request_id}` | `read` | 詳情：申請編號、公鑰指紋前 8 碼、CSR 摘要、主機資訊、來源 IP 歷史、旗標說明、撤回資訊 |
 | `POST /api/v1/enroll/requests/approve` | `EnrollDecide` | 核准（L1，含批次）：`request_ids`（1～1,000）、`cert_lifetime_days`（選填） |
 | `POST /api/v1/enroll/requests/reject` | `EnrollDecide` | 拒絕（L2）：`request_ids`（1～1,000）、`expected_count`、`reason_code`（`unknown_host`／`source_mismatch`／`duplicate`／`other`）、`reason`（必填，顯示給 agent 端，`PLS-E3302`） |
@@ -738,7 +744,22 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | `GET /api/v1/pki/certificates` | `read` | 列表：`state`（`valid`、`expiring`、`revoked`、`revocation_pending`、`expired_in_grace`、`expired_beyond_grace`）、`expires_within`、`agent_id`、`q`（序號、主機名稱、`agent_id` 前綴）；每筆含 `hostname`、`group`（第 11.8 節）；游標分頁 |
 | `GET /api/v1/pki/certificates/{serial}` | `read` | 詳情（不含私鑰；`cert_pem` 可下載） |
 | `POST /api/v1/pki/certificates/revoke` | `CertRevoke` | 撤銷（L2）：`serials`（1～1,000）、`expected_count`、`reason`（`keyCompromise`／`cessationOfOperation`／`superseded`／`unspecified`）、`comment`（必填）。回各筆結果與預計收錄的 CRL 版本；線上模式數秒內生效，離線模式為「撤銷待生效」 |
-| `PUT /api/v1/pki/policy` | `CertPolicyWrite` | 憑證政策（S14）：`cert_lifetime_days`、`renew_before_days`、`renew_requires_approval`、`expired_renew_grace_days`、`revoke_on_self_decommission`；縮短寬限期使 K＞0 台立即無法續簽時為 L2（`impact_token`，同第 11.4 節） |
+| `GET /api/v1/pki/policy/impact?expired_renew_grace_days=N` | `read` | （0.8）把過期寬限期改為 N 天的影響（設計包 S14「儲存過期寬限期時的確認」、D11），格式見下方「會讓主機無法續簽的設定變更」 |
+| `PUT /api/v1/pki/policy` | `CertPolicyWrite` | 憑證政策（S14）：`cert_lifetime_days`、`renew_before_days`、`renew_requires_approval`、`expired_renew_grace_days`、`revoke_on_self_decommission`、`reason`、`impact_token`。**縮短寬限期時 `impact_token` 必填**（0.8 起實際檢查；缺少時 400 `confirmation_required`、與目前的數字不符時 409 `impact_changed`，兩者都附新的數字）；使 K＞0 台立即無法續簽時為 L2，`reason` 必填。稽核紀錄的 `details` 帶 `level`、`reason`、`impact` |
+
+**會讓主機無法續簽的設定變更**（0.8；`PUT /api/v1/pki/policy` 縮短寬限期、`POST /api/v1/settings/reset` 改用設定檔的值而關閉註冊端點或縮短寬限期）：影響查詢的回應 `data`：
+
+```json
+{ "required": true, "count": 2, "level": "L2", "confirm_text": "停止續簽 2 台", "impact_token": "…",
+  "mode": null,
+  "grace": { "from_days": 90, "to_days": 30, "K": 2,
+             "earliest": [ { "agent_id": "…", "hostname": "plc-gw-07", "not_after": "…", "grace_ends_at": "…" } ] } }
+```
+
+- `required`：這項變更是否需要 `impact_token`（關閉註冊端點或縮短寬限期時為 `true`；其他變更為 `false`，送出時不檢查）。
+- `grace.K`：目前在寬限期內、以新的寬限期計算已經結束、沒有個別延長（「允許再次自動續簽」）的主機；`earliest` 依原本寬限期的結束排序，最多 10 台。
+- `mode`（改用設定檔的值使模式由開放或僅續簽變為關閉時）：`from`、`to`、`N`、`M`、`L`、`R`、`T`（同第 11.4 節）。同時關閉與縮短時 `count` 為 N＋M（寬限期內的主機已包含在 N 中）。
+- `level`：`count`＞0 時為 `L2`，`confirm_text` 為「停止續簽 {count} 台」（與第 11.4 節相同的字串）；否則 `L1`。`impact_token` 是數字的雜湊，5 分鐘有效。
 | `POST /api/v1/pki/grace-overrides` | `GraceOverride` | 允許再次自動續簽（L1，原因必填）：`agent_ids`、`until`（最長 90 天）、`reason`、`also_set_renew_only`（布林，模式為關閉時一併改為僅續簽） |
 | `GET /api/v1/pki/ca` | `read` | 信任錨與簽發 CA（狀態、到期、私鑰位置、簽發張數、還在使用舊 CA 的主機數） |
 | `GET /api/v1/pki/crl` | `read` | 各 CA 目前的 CRL（版本、`this_update`、`next_update`、撤銷筆數、載入時間）與版本歷史 |
@@ -806,7 +827,8 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/settings` | `read` | 每個設定鍵的 `value`、`source`（`env`／`console`／`file`／`default`）、`env_var`、`updated_by`、`updated_at`（主控台修改時）、`overridden[]`（較低優先層中與生效值不同的值：`source`、`value`）、`console_editable`、`pending_restart`（本版一律 `null`）。與 `kairos config show --effective --json` 相同 |
-| `POST /api/v1/settings/reset` | `enroll.*` 需 `EnrollModeWrite`，`pki.policy.*` 需 `CertPolicyWrite` | 本文 `keys`（設定鍵陣列）：「改用設定檔的值」＝刪除 `settings` 的鍵（L1，寫入稽核）；被環境變數覆寫時 409 `locked_by_environment`。回 `results[]`（`key`、`was_console`） |
+| `GET /api/v1/settings/reset/impact?keys=a,b` | `read` | （0.8）改用設定檔的值的影響：刪除這些鍵之後若註冊端點變為關閉或寬限期縮短，回傳數字與 `impact_token`（格式同第 11.5 節「會讓主機無法續簽的設定變更」）；其他鍵 `required: false` |
+| `POST /api/v1/settings/reset` | `enroll.*` 需 `EnrollModeWrite`，`pki.policy.*` 需 `CertPolicyWrite` | 本文 `keys`（設定鍵陣列）、`reason`、`impact_token`：「改用設定檔的值」＝刪除 `settings` 的鍵（L1，寫入稽核）；被環境變數覆寫時 409 `locked_by_environment`。**0.8 起**刪除後會關閉註冊端點或縮短寬限期時 `impact_token` 必填（400 `confirmation_required`／409 `impact_changed`，附新的數字），使主機無法續簽時為 L2、`reason` 必填（`kairos config reset` 同樣為 L2：互動輸入「停止續簽 N 台」，非互動 `--yes --expect-count <N> --reason`）。回 `results[]`（`key`、`was_console`） |
 
 - 優先順序：環境變數 ＞ 主控台（資料庫 `settings`）＞ `kairos.toml` ＞ 內建預設。可從主控台修改的鍵：`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`、`pki.policy.*`。
 - `GET /api/v1/enroll/mode` 另帶 `downloads`（`available`、`reason`、`alternative`）：本版下載端點回 404，主控台據此隱藏一行指令與下載連結（設計包 INTEGRATION §27.4 #3）；token 建立回應的 `downloads`、token 列表的 `meta.downloads` 相同。同一個回應另有 `stats`（啟動以來的請求、429、封鎖、時鐘被拒、握手前關閉、簽發的計數；S20 的資料來源，系統健康的整合之後再做）。
@@ -821,7 +843,7 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 
 ### 11.9 CLI 與第 11.6 節的差異
 
-- `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes]`。
+- `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes] [--reason <原因>] [--expect-count <N>]`（0.8 起刪除後會關閉註冊端點或縮短寬限期、使主機無法續簽時為 L2，同 `enroll mode closed`）。
 - `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
 - 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
 
@@ -1010,6 +1032,7 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
   - 新的斷點原因：`missing_hmac`（起點之後沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被重新計算）、`hmac_boundary_mismatch`（起點被移動）、`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與起點記錄的 `key_id` 不同；不會以新的金鑰「接續」簽下去）。都是 `KRS-E6201`。
   - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
   - **自我驗證**：每 `audit.verify_interval_hours` 小時（預設 24，第一次在啟動後 1 分鐘）重新計算整條鏈與 HMAC，寫一筆 `audit.verify`（執行者 `system`，`details.via = "self_check"`），並發布內部事件；失敗時記 `ERROR`（`audit.chain_broken`）且告警引擎開系統規則「稽核日誌完整性」（`sys.audit_integrity`，緊急，`KRS-E6201`），下一次驗證通過時恢復。
+  - **列表的 `meta.integrity`**（0.8；`audit:read` 的第一頁，只看自己操作的身分為 `null`）：`hmac_since_id`（目前的 HMAC 起點，尚未開始為 `null`）與 `last_verify`（最近一筆 `audit.verify`：`at`、`actor`、`result`、`self_check`、`checked`、`broken`、`hmac_since_id`），主控台 S18 頁首「完整性：✓ 已驗證至 …（雜湊鏈連續；HMAC 自第 N 筆起）」的來源。`audit.verify` 的 `details` 0.8 起另帶 `hmac`（狀態）與 `hmac_since_id`。
   - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；重播先前抄下的 head 也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
 
 | 方法與路徑 | 權限 | 說明 |
