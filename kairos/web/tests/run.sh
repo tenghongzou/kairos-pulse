@@ -30,7 +30,7 @@ PW_DIR="${PW_DIR:-$HOME/pw}"
 OUT_DIR="${OUT_DIR:-$HERE/out}"
 
 # ---- 連接埠：指定的沿用，其餘自動挑選 ----
-# pick_ports N [避開的連接埠...]：印出 N 個互不相同、目前可以在 127.0.0.1 綁定的連接埠（挑選期間全部占住，
+# pick_ports N [避開的連接埠...]：以空白分隔印出 N 個互不相同、目前可以在 127.0.0.1 綁定的連接埠（挑選期間全部占住，
 # 避免挑到同一個）。範圍 20000～31999 低於 Linux 預設的暫時連接埠範圍（32768～60999），對外連線的來源連接埠
 # 不會在 Kairos 啟動前搶走它。
 pick_ports() {
@@ -56,8 +56,7 @@ const out = [];
   }
   for (const s of held) s.close();
   if (out.length < n) process.exit(1);
-  console.log(out.join("
-"));
+  console.log(out.join(" "));
 })();
 ' "$@"
 }
@@ -69,7 +68,7 @@ for v in "${PORT_VARS[@]}"; do
 done
 if [ "${#need[@]}" -gt 0 ]; then
     picked=()
-    while IFS= read -r p; do picked+=("$p"); done < <(pick_ports "${#need[@]}" ${given[@]+"${given[@]}"} || true)
+    read -r -a picked < <(pick_ports "${#need[@]}" ${given[@]+"${given[@]}"} || true) || true
     [ "${#picked[@]}" -eq "${#need[@]}" ] || { echo "找不到足夠的空連接埠" >&2; exit 2; }
     for i in "${!need[@]}"; do printf -v "${need[$i]}" '%s' "${picked[$i]}"; done
 fi

@@ -57,7 +57,8 @@ web/
 │                           admin-audit（S18）、admin-health（S20）、admin-settings（S21）、admin-tokens（S21 API token）、
 │                           admin-common（共用呈現）；文字在 core/strings-admin.js
 ├── tests/                  Playwright＋axe 的端對端測試（不嵌入、不在 cargo test 中；第 7 節）；
-│                           告警在 e2e-alerts.mjs、註冊與憑證在 e2e-pki.mjs（第二個 Kairos：pki-env.sh）、管理在 e2e-admin.mjs
+│                           告警在 e2e-alerts.mjs、註冊與憑證在 e2e-pki.mjs（第二個 Kairos：pki-env.sh）、管理在 e2e-admin.mjs、
+│                           權限的整體檢查在 e2e-rbac.mjs
 └── tools/sync-design.mjs   從設計包複製 tokens.css、產生 error-codes.js（開發時執行）
 ```
 
@@ -197,6 +198,7 @@ registerProvider({
 18. 權限：唯讀看不到「註冊與憑證」且直接存取 403；稽核員沒有寫入按鈕、直接呼叫寫入端點 403；維運者的自動核准選項停用。
 19. 註冊與憑證畫面的深色主題 axe 與 375px 無水平溢出。
 20. 管理畫面（`tests/e2e-admin.mjs`）：建立使用者與一次性密碼（只顯示一次、不在畫面／網址／儲存／日誌）→ 該使用者登入須變更密碼、角色變更、結束工作階段、停用；API token（只顯示一次、清單前 4 碼、撤銷後 401）；稽核查詢、詳情、完整性驗證（HMAC 邊界）、JSONL 匯出；設定修改 → 來源變為主控台 → 改用設定檔的值；環境變數鎖定（唯讀、API 409）；稽核員／唯讀／維運者的權限差異；使用者顯示名稱 XSS；目錄服務群組對應、系統健康；深色主題 axe。`run.sh` 另設 `[enroll] auto_pause_after_hours = 36`（設定檔的值）與 `KAIROS__ENROLL__AUTO_PAUSE_ENABLED=true`（環境變數鎖定），註冊端點監聽 `ENROLL_PORT`（預設 38445；第二個 Kairos 用 38444）。
+21. 權限整體檢查（`e2e-rbac.mjs`，三組畫面合併後）：管理員、維運者、稽核員、唯讀逐一登入，側邊導覽的項目與區塊順序符合 `ia.md` §3、§4.2；17 個頁面逐頁確認可見或 403、可見的頁面載入時沒有任何 API 回 403、稽核員與唯讀沒有寫入按鈕；角色沒有的寫入權限直接呼叫 30 個寫入端點一律 403（對象都是不存在的名稱）；工作階段的寫入不帶 `X-CSRF-Token` 回 403。
 
 每個主要畫面在淺色與深色主題各跑一次 axe（目標 0 違規），截圖在 `OUT_DIR`。
 

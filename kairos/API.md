@@ -1212,7 +1212,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 | `/api/…` | 本文件的 API |
 | `/healthz`、`/readyz`、`/metrics` | 健康檢查（README「健康檢查與 Prometheus」）；`observability.on_console = false` 時為 JSON 的 404 |
 | `/assets/<檔案>` | 嵌入的檔案，`ETag`（內容的 SHA-256 前 16 bytes）、`Cache-Control: no-cache`，`If-None-Match` 相符時 304；不存在時 404 |
-| 最後一段含 `.` 的其他路徑 | 404（純文字） |
+| 最後一段含 `.` 的其他路徑 | 404（純文字）；第一段是主控台的路由、`.` 在第二段以後的參數時例外（`/admin/users/alice.w` 回 `index.html`） |
 | 其他路徑（`/`、`/login`、`/hosts/<agent_id>/metrics`…） | 單頁應用的 `index.html`，`Cache-Control: no-store`；畫面由瀏覽器端依網址決定（不需要驗證：資料一律經由需要驗證的 API）。第一段不是主控台的路由（`login`、`hosts`、`account`、`alerts`、`enrollment`、`certificates`、`audit`、`reports`、`admin`、`system`、`setup`、`error`、`docs`、`help`、`t`；設計包 `ia.md` §3）時本文同樣是 `index.html`（瀏覽器顯示 404 頁），但狀態碼為 **404**：例如 Pulse 的 `--enroll-server` 誤設為主控台的連接埠時，`/v1/enroll/server-info` 得到 404 而判定為不支援自動註冊（`PLS-E2106`） |
 
 - 只接受 `GET`／`HEAD`（其他 405，`Allow: GET, HEAD`）。

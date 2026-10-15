@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { FakeAgent } from './fake-agent.mjs';
 import { pkiTests } from './e2e-pki.mjs';
 import { registerAdmin } from './e2e-admin.mjs';
+import { registerRbac } from './e2e-rbac.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -518,6 +519,9 @@ registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0, PW, XSS_NAME }
 (await import('./e2e-alerts.mjs')).register({ test, newPage, login, waitTitle, axe, shot, FakeAgent, URL0, PW });
 // 註冊與憑證（S12～S15）：第二個 Kairos（tests/pki-env.sh）
 pkiTests({ test, newPage, axe, shot });
+
+// 三組畫面合併後的權限整體檢查（每個角色逐頁、直接呼叫寫入 API）：e2e-rbac.mjs
+registerRbac({ test, newPage, login, waitTitle, URL0, PW });
 
 // ---------------------------------------------------------------------------
 async function main() {

@@ -318,7 +318,7 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     const v = await newPage();
     await login(v.page, 'viewer');
     await waitTitle(v.page, '總覽');
-    assert.deepEqual(await navLabels(v.page), ['總覽', '主機', '系統健康']);
+    assert.deepEqual(await navLabels(v.page), ['總覽', '主機', '告警事件', '靜音與維護', '系統健康']);
     for (const p of ['/admin/users', '/admin/directory', '/audit', '/system/settings']) {
       await v.page.goto(`${URL0}${p}`);
       await v.page.locator('#page-title', { hasText: '沒有權限檢視這個畫面' }).waitFor();
