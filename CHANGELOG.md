@@ -56,6 +56,42 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - `kairos-proto`：`StandardMetric` 增加 `kind`（量測值／計數器）與 `labels`；`counter_rate`、`filesystem_usage`；`ProcessList` 等與 `ReportBody::processes`；`Inventory` 等、`ClientMsg::Inventory`、`validate_inventory`、`inventory_digest`；`Session::inventory`、`Session::processes`。兩個新 feature 不在 `SERVER_FEATURES` 中（由 Kairos 依儲存後端宣告）。`StandardMetric`、`Session`、`ReportBody` 新增欄位，以結構常值建立它們的程式需要補上欄位。
 - Kairos：在實作前收到 `inventory` 一律回 `unknown_type`（與舊版相同；不宣告 `inventory`）。
 
+## [0.8.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕衝刺 7：指標擴充（審計 F4，規格 `crates/kairos-proto/METRICS.md`）。**協定版本不變（v1～v2）**。本段由各實作線分別補上，以下為 Pulse 線的部分。
+
+### Pulse（指標擴充，審計 F4）
+
+#### 行為改變（升級前請確認）
+
+| # | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|
+| 1 | **`buffer.max_mb` 預設由 64 改為 128**（METRICS.md D7）：每筆緩衝記錄因新指標變大（約 1.5～5 KB），128 MiB 約保存 2～3 天，與 `buffer.max_records` 的約 69 小時相近 | 沒有在 `pulse.toml` 設定 `buffer.max_mb` 的部署：緩衝目錄最多多用約 64 MiB | 磁碟空間不足時在 `pulse.toml` 明確設定 `[buffer] max_mb = 64` |
+| 2 | **每筆 report 的指標變多**：協商了 `metrics` 時由最多 163 個（磁碟、介面、感測器各 32）改為最多 243 個，**掛載點與介面的上限由 32 改為 16**、磁碟 I/O 裝置 8 | 掛載點或網路介面超過 16 個的主機：優先順序最低的不再送（第一次取樣時記一則 `INFO`，`sysinfo.snapshot`） | 需要時以 `collect.interface_exclude` 排除不需要的介面，或關閉某一類（`collect.*`） |
+| 3 | **systemd unit 新增 `RuntimeDirectory=pulse` 與 `ExecStartPre=-+/usr/bin/install … /sys/class/dmi/id/product_serial /run/pulse/product_serial`**（METRICS.md D4：以 root 把系統序號複製給 Pulse 讀，Pulse 本身仍不需要特權） | 自行維護 unit 或以 drop-in 覆寫的部署：沒有這幾行時資產不含序號（記一次 `PLS-I8009`） | 換上新版 `pulse.service` 後 `systemctl daemon-reload && systemctl restart pulse`；不想送序號時設定 `[inventory] hardware_serials = false` |
+
+#### 新增
+
+- **19 個新的標準指標**（共 27 個；METRICS.md 第 3 節）：負載（`system.cpu.load_1m`／`5m`／`15m`，只有 Linux）、可用記憶體、置換空間（總量／已使用）、每個掛載點的已使用量與使用率（`used` = total − free，`usage` 與 `df` 的 Use% 相同；Linux 以 `statvfs` 取 `f_bfree`、Windows 以 `GetDiskFreeSpaceExW`）、磁碟 I/O（累計讀寫量；Linux 另有讀寫次數與忙碌時間，直接讀 `/proc/diskstats`，裝置名稱支援 device mapper 的 `dm-N`）、網路封包與錯誤、行程數（同 `ps -e`）、開機秒數。**計數器一律送原始累計值**，速率由 Kairos 計算。協商了 `metrics` 的 0.2.0～0.7.0 Kairos 只檢查格式、原樣保存。
+- **每類上限與優先順序、以整組為單位的截斷**：掛載點 16（`/` 或系統磁碟機優先，其餘容量大者）、磁碟 I/O 裝置 8（依掛載點順序）、介面 16（有 IPv4 → 流量大者）、溫度 32；整行超過 65536 bytes 時依序捨去行程命令列 → 行程排行（先縮成各 3 項）→ 溫度 → 介面 → 磁碟 I/O 裝置 → 掛載點，每組（例如一個掛載點的 4 個指標）一起捨去，無 label 的指標一律保留；每 10 分鐘最多一則 `WARN`。
+- **行程排行**（feature `processes`；`[processes]`）：每 60 秒附在 report 上，依 CPU、記憶體各 5 個；CPU 為占整台主機的百分比。命令列預設不送（`processes.command = "none"`），可設 `executable`（只送執行檔路徑）或 `full`（含參數，截斷到 1024 bytes）。行程排行隨 report 存入本機緩衝、斷線後一起補送；0.7 寫入的緩衝記錄仍可讀取。只看得到自己的行程（`ProtectProc=invisible`）時不送行程數與排行，記一次 `PLS-I8009`。
+- **主機資產**（feature `inventory`、新訊息 `inventory`；`[inventory]`）：OS、開機時間、CPU（型號、廠商、實體／邏輯核心數、標稱時脈）、記憶體、廠牌型號序號（SMBIOS）、主機板、BIOS、磁碟（掛載點、裝置、檔案系統、容量、SSD／HDD、可移除、唯讀）、網卡（MAC、IP、MTU）。連線後送一次、內容改變才送、距離上次送達滿 24 小時也送；`invalid_report` 後同樣的內容不再送（`inventory.rejected PLS-W2108`〔暫定〕），`storage_unavailable` 5 分鐘後重送。不經過本機緩衝。
+- 設定：`[collect]`（`filesystems`、`disk_io`、`network`、`temperature`、`max_filesystems`、`max_disks`、`max_interfaces`、`interface_exclude`）、`[processes]`（`enabled`、`interval`、`top`、`command`、`include_user`〔本版不實作〕）、`[inventory]`（`enabled`、`interval`、`hardware_serials`、`network_addresses`）。hello 依設定宣告 `inventory`、`processes`；本機狀態檔（`status.json`、`pulse status --json`）的 `features` 列出協商結果。
+- 代碼（暫定號，待設計組正式分配）：`PLS-W2108`（資產資訊被伺服器拒絕）、`PLS-I8009`（部分系統資訊無法取得：序號、磁碟 I/O、行程）。事件 `sysinfo.snapshot`、`sysinfo.limited`、`inventory.rejected`（Windows 事件識別碼待分配）。
+
+#### 相容性
+
+| Pulse | Kairos | 結果 |
+|---|---|---|
+| 0.8.0 | 0.1.0（v1） | v1 三欄位，與以前相同 |
+| 0.8.0 | 0.2.0～0.7.0 | v2＋`metrics`（＋`durable`）：新指標照送、原樣保存；不送行程排行與資產（舊版不宣告） |
+| 0.8.0 | 0.8.0（JSONL 後端） | 同上（JSONL 後端不宣告 `processes`、`inventory`） |
+| 0.8.0 | 0.8.0（SQLite） | 全部功能 |
+
+#### 尚未實機驗證
+
+- Windows（只經過 `x86_64-pc-windows-gnu` 的交叉編譯與 clippy）：虛擬服務帳號 `NT SERVICE\Pulse` 下的磁碟 I/O（`IOCTL_DISK_PERFORMANCE`）、行程清單與命令列、SMBIOS 序號、`GetDiskFreeSpaceExW`、登錄的 BIOS 與 `~MHz`。
+
 ## [0.7.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.7.0、Pulse 0.7.0**：衝刺 6 的**主控台網頁介面**（審計 F2：S01、S03～S18、S20、S21、S23）與後端補強——設計包 `decisions/INTEGRATION.md` §28.5 的待辦與 §28.9 #3（金鑰檔的備份）。**協定不變**，Pulse 只有設定檔錯誤代碼的小修正。

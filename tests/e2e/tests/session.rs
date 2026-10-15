@@ -109,6 +109,19 @@ fn registers_heartbeats_reports_and_shuts_down_gracefully() {
         let total = metric(r, "system.memory.total")["value"].as_u64().unwrap();
         let used = metric(r, "system.memory.used")["value"].as_u64().unwrap();
         assert!(total > 0 && used <= total, "{r}");
+        // 0.8.0 的 Pulse（METRICS.md）：新的標準指標由不宣告 processes／inventory 的 Kairos 原樣保存，
+        // report 不帶行程排行
+        for name in [
+            "system.memory.available",
+            "system.swap.total",
+            "system.uptime",
+        ] {
+            assert!(metric(r, name)["value"].is_u64(), "{name}: {r}");
+        }
+        if cfg!(target_os = "linux") {
+            assert!(metric(r, "system.cpu.load_1m")["value"].is_number(), "{r}");
+        }
+        assert!(r.get("processes").is_none(), "{r}");
         let seq = r["seq"].as_u64().unwrap();
         assert!(seq > last_seq, "seq 應遞增：{reports:?}");
         last_seq = seq;

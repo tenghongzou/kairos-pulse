@@ -6,7 +6,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ## 功能特色
 
-- 🖥️ 收集系統資訊：CPU 使用率、記憶體；Kairos 支援協定 v2 時另外回報磁碟容量、網路累計流量與元件溫度（啟動時也印出一次；`info` 等級略過虛擬檔案系統與虛擬網路介面）
+- 🖥️ 收集系統資訊：CPU 使用率、記憶體；Kairos 支援協定 v2 時另外回報 27 個標準指標（磁碟用量與使用率、磁碟 I/O、網路流量／封包／錯誤、負載、可用記憶體、置換空間、行程數、開機時間、溫度；0.8.0〔草稿〕起），Kairos 0.8.0 以上另有行程排行（依 CPU、記憶體）與主機資產（OS、CPU、記憶體、廠牌型號序號、BIOS、磁碟、網卡 MAC／IP；見「回報資料格式」）
 - 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON，v1、v2 自動協商），預設**驗證伺服器憑證**（設定了自訂 CA `ca_cert` 時只信任它，否則使用作業系統信任庫；可明確設定同時信任兩者）
 - 🪪 每台主機有固定的 `agent_id`（UUID v4，存於 `agent.id`），換主機名稱也不影響識別
 - 💓 每 15 秒（`heartbeat.interval`）送出 heartbeat，伺服器據此判斷上線 / 離線
@@ -36,6 +36,9 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 | Pulse 0.3.0 以上連 Kairos 0.2.0 | v2，不啟用 `durable`：連線期間照舊 at-most-once；斷線期間寫進緩衝的積壓保留到連上 Kairos 0.3.0 為止，日誌以 `INFO` 說明「伺服器不支援 durable…暫不補送」 |
 | Pulse 0.5.0 連 Kairos 0.4（以前） | 手動憑證的主機與 0.4 相同。`pulse enroll` 需要 Kairos 0.5 的註冊端點：連不上 8444 時 `PLS-E2007`、該位址不是註冊端點時 `PLS-E2106`（結束代碼 5）；已註冊的主機照常連線，但沒有自動輪替（Kairos 不列出 `renew`）、過期續簽與除役通知 |
 | Pulse 0.4（以前）連 Kairos 0.5.0 | 與 0.4 相同：Kairos 只在 hello 宣告 `renew`／`deregister` 時才在 `hello_ack` 列出並帶新欄位 |
+| Pulse 0.8.0 連 Kairos 0.2.0～0.7.0 | v2＋`metrics`：19 個新的標準指標照送（舊版 Kairos 只檢查格式、原樣保存，升級後就能在趨勢中看到）；舊版 Kairos 不宣告 `processes`、`inventory`，Pulse 不送行程排行與資產 |
+| Pulse 0.8.0 連 Kairos 0.8.0（`storage.backend = "jsonl"`） | 同上：JSONL 後端不宣告 `processes`、`inventory` |
+| Pulse 0.2.0～0.7.0 連 Kairos 0.8.0 | 與以前相同（8 個指標）；Kairos 以磁碟總容量與可用空間推算使用率 |
 
 更早的版本之間混用時可能出現下列問題：
 
@@ -389,10 +392,33 @@ tags = []                      # 標籤，例如 ["env:prod", "team:web"]（協�
 [buffer]
 enabled = true                 # 本機緩衝（at-least-once）；false = 與 0.2.0 相同，不寫磁碟、不補送
 dir = "buffer"                 # 緩衝目錄（相對於工作目錄）
-max_mb = 64                    # 待送資料的總大小上限（MiB）
+max_mb = 128                   # 待送資料的總大小上限（MiB；0.8.0 起預設由 64 改為 128）
 max_records = 50000            # 待送資料的筆數上限（與 max_mb 先到者為準，滿時丟掉最舊的）
 max_age_hours = 168            # 取樣超過這麼久（小時）的資料不再送出
 replay_interval_ms = 1200      # 兩筆 report 之間的最短間隔（毫秒；補送積壓的速率，不超過 report.interval 的 60%）
+
+[collect]                      # 標準指標的採集範圍（0.8.0〔草稿〕起；見「回報資料格式」）
+filesystems = true             # system.filesystem.*（每個掛載點：total、available、used、usage）
+disk_io = true                 # system.disk.*（累計讀寫量；Linux 另有讀寫次數與忙碌時間）
+network = true                 # system.network.*（累計收發位元組、封包、錯誤）
+temperature = true             # system.temperature
+max_filesystems = 16           # 掛載點上限（0～16；0 = 不送）
+max_disks = 8                  # 磁碟 I/O 裝置上限（0～8）
+max_interfaces = 16            # 網路介面上限（0～16）
+interface_exclude = []         # 額外排除的介面（glob，* 與 ?，例如 ["tap*", "wg?"]；只能在 pulse.toml 設定）
+
+[processes]                    # 行程數與行程排行（0.8.0〔草稿〕起）
+enabled = true                 # false = 不宣告 processes、不送 system.process.count
+interval = 60                  # 行程排行的間隔（秒，1～3600；實際不小於 report.interval）
+top = 5                        # 依 CPU、依記憶體各取幾個（1～10）
+command = "none"               # 命令列：none（不送）／executable（只送執行檔路徑）／full（含參數，截斷到 1024 bytes）
+include_user = false           # 送使用者名稱：本版尚未實作，設為 true 只記一則 WARN
+
+[inventory]                    # 主機資產（0.8.0〔草稿〕起）
+enabled = true                 # false = 不宣告 inventory、不收集
+interval = 3600                # 重新收集的間隔（秒，300～86400）；內容改變才送，滿 24 小時也送一次
+hardware_serials = true        # 送系統序號（Linux 需要 pulse.service 的 ExecStartPre=，見 INSTALL.md）
+network_addresses = true       # 送網卡的 MAC 與 IP 位址
 
 [status]
 file = ""                      # 本機狀態檔；空字串 = /var/lib/pulse/status.json（Windows %ProgramData%\Pulse\status.json）
@@ -461,6 +487,14 @@ textfile_interval = 15
 | `buffer.max_age_hours` | 1～8760 小時 | |
 | `buffer.replay_interval_ms` | 500～60000 毫秒 | 下限 500 毫秒對應 Kairos 的 report 速率限制（每秒 2 則）。實際使用的值不超過 `report.interval` 的 60%（否則積壓補不完；被調整時啟動記 `INFO`） |
 | `status.file` | 空字串或路徑 | 空字串為預設位置（見「本機狀態（pulse status）」） |
+| `collect.max_filesystems` | 0～16 | 0 = 不送 `system.filesystem.*`。上限不可再提高：每筆 report 最多 256 個指標，Kairos 0.7.0 以前超過就整筆拒絕 |
+| `collect.max_disks` | 0～8 | 同上，`system.disk.*` |
+| `collect.max_interfaces` | 0～16 | 同上，`system.network.*` |
+| `collect.interface_exclude` | 最多 32 個，每個 1～256 bytes 的 glob | 只能在 `pulse.toml` 設定 |
+| `processes.interval` | 1～3600 秒 | 小於 `report.interval` 時以 `report.interval` 為準（不報錯） |
+| `processes.top` | 1～10 | |
+| `processes.command` | `none` / `executable` / `full` | 見「回報資料格式」的隱私說明 |
+| `inventory.interval` | 300～86400 秒 | |
 
 ### ⚠️ 安全性提醒
 
@@ -476,7 +510,7 @@ textfile_interval = 15
 - 一條長 TLS 連線，**NDJSON**（UTF-8，一行一則 JSON，以 `\n` 結尾），單行上限 65536 bytes
 - 每則訊息有 `type` 與 `seq`；`seq` 每條連線從 1 開始遞增，重連後重新計算
 - 流程：Pulse 送 `hello` → Kairos 回 `hello_ack` → 之後 Pulse 每 `heartbeat.interval` 秒送 `heartbeat`、每 `report.interval` 秒送 `report`，Kairos 對每則訊息回 `ack`
-- **版本協商**：hello 送 `"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable"]`（舊版 Kairos 只看 `proto`；`buffer.enabled = false` 時不宣告 `durable`）。`hello_ack` 的 `proto` 是協商結果：1 → report 為三個欄位；2 且 Kairos 也宣告 `metrics` → report 為通用指標。`proto` 不在 1～2 時斷線並記 `ERROR`（`proto_mismatch`），Kairos 回 `unsupported_version` 時同樣以 `ERROR` 記錄（`message` 含 Kairos 支援的範圍）
+- **版本協商**：hello 送 `"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","inventory","processes"]`（舊版 Kairos 只看 `proto`；`buffer.enabled = false` 時不宣告 `durable`，`inventory.enabled`／`processes.enabled = false` 時不宣告對應的 feature）。本機狀態檔（`status.json`、`pulse status --json`）的 `features` 列出雙方都宣告的部分。`hello_ack` 的 `proto` 是協商結果：1 → report 為三個欄位；2 且 Kairos 也宣告 `metrics` → report 為通用指標。`proto` 不在 1～2 時斷線並記 `ERROR`（`proto_mismatch`），Kairos 回 `unsupported_version` 時同樣以 `ERROR` 記錄（`message` 含 Kairos 支援的範圍）
 - **hello 的主機資訊**（v2，舊版 Kairos 忽略）：`host_fingerprint`（機器 ID 的 SHA-256，不送原始值，計算方式見 PROTOCOL.md「主機指紋」；Linux 讀 `/etc/machine-id`、Windows 讀 `MachineGuid`，讀不到時不送）、`display_name` 與 `tags`（設定 `agent.display_name`、`agent.tags`，未設定時不送）、`report_interval_ms`（`report.interval`）、`os`（sysinfo 取得的作業系統名稱、版本、核心版本與 CPU 架構）
 - **時鐘檢查**：v2 的 `hello_ack` 帶 Kairos 的 `server_time`。與本機時鐘相差 30 秒～5 分鐘記 `WARN`（`clock.skew PLS-W8301`），超過 5 分鐘記 `ERROR`（`clock.skew PLS-E8302`，同時寫 stderr），請檢查 NTP。只在等級改變或偏差再變化超過 1 分鐘時記錄（重連時不重複），回到 30 秒以內記一則 `INFO`（`clock.skew -`）
 - `report` 的 `ack` 代表該筆資料已寫入伺服器的資料庫或資料檔；伺服器確定沒有寫入時改回非 fatal 的 `storage_unavailable`（message 為 `report could not be stored`：寫入失敗或達到伺服器的每日檔案大小上限；或 `report rate limit exceeded`：同一來源送得太快）。Pulse 收到時記 `WARN`（節流，見「日誌」），連線保持。伺服器無法確定是否已寫入時會不回應、直接關閉連線，Pulse 視為斷線並重連。協商了 `durable` 時這兩種情況的資料都留在本機緩衝、稍後重送（Kairos 去重，不會重複）；沒有協商時（舊版 Kairos 或停用本機緩衝），**該筆 report 視為未送達、不重送**
@@ -514,30 +548,63 @@ textfile_interval = 15
 }
 ```
 
-協商結果為 v2 且雙方都宣告 `metrics` 時（新版 Kairos），改送通用指標（名稱、單位與限制見 PROTOCOL.md「report（通用指標）」）：
+協商結果為 v2 且雙方都宣告 `metrics` 時（Kairos 0.2.0 以上），改送通用指標。名稱、單位、種類（量測值／計數器）與各平台的來源以 monorepo 的 `crates/kairos-proto/METRICS.md`（第 3 節）為準，以下為摘要（每筆 report 中 CPU、記憶體以外的指標依序為：沒有 label 的 → 掛載點 → 磁碟 I/O 裝置 → 網路介面 → 溫度）：
 
 ```json
 {
   "type": "report",
   "seq": 3,
-  "ts": "2026-10-08T03:15:45.210Z",
+  "ts": "2026-10-20T02:00:05.210Z",
   "metrics": [
     {"name": "system.cpu.usage", "value": 17.84, "unit": "%"},
     {"name": "system.memory.total", "value": 51539607552, "unit": "By"},
     {"name": "system.memory.used", "value": 38833356800, "unit": "By"},
-    {"name": "system.filesystem.total", "value": 502468108288, "unit": "By", "labels": {"fstype": "ext4", "mountpoint": "/"}},
-    {"name": "system.filesystem.available", "value": 211312345088, "unit": "By", "labels": {"fstype": "ext4", "mountpoint": "/"}},
-    {"name": "system.network.received", "value": 98765432101, "unit": "By", "labels": {"device": "eth0"}},
-    {"name": "system.network.transmitted", "value": 1234567890, "unit": "By", "labels": {"device": "eth0"}},
+    {"name": "system.cpu.load_1m", "value": 2.15, "unit": "1"},
+    {"name": "system.memory.available", "value": 12706250752, "unit": "By"},
+    {"name": "system.swap.total", "value": 4294967296, "unit": "By"},
+    {"name": "system.process.count", "value": 312, "unit": "{processes}"},
+    {"name": "system.uptime", "value": 1532941, "unit": "s"},
+    {"name": "system.filesystem.used", "value": 265601859584, "unit": "By", "labels": {"fstype": "ext4", "mountpoint": "/"}},
+    {"name": "system.filesystem.usage", "value": 55.69, "unit": "%", "labels": {"fstype": "ext4", "mountpoint": "/"}},
+    {"name": "system.disk.read", "value": 912345678848, "unit": "By", "labels": {"device": "nvme0n1p2"}},
+    {"name": "system.network.packets_received", "value": 87654321, "unit": "{packets}", "labels": {"device": "eth0"}},
     {"name": "system.temperature", "value": 48.5, "unit": "Cel", "labels": {"sensor": "coretemp Package id 0"}}
-  ]
+  ],
+  "processes": {
+    "top_cpu": [{"pid": 2211, "name": "postgres", "cpu_usage": 9.41, "memory": 4294967296}],
+    "top_memory": [{"pid": 1873, "name": "java", "cpu_usage": 3.2, "memory": 8589934592}]
+  }
 }
 ```
 
-- 記憶體、磁碟與網路以 bytes 為單位（v1 的記憶體為 MB）；網路是開機以來的累計量，速率請由相鄰兩筆相減。
-- 磁碟與網路介面的篩選與啟動時的 INFO 清單相同：略過虛擬檔案系統、容量為 0 與同一磁碟的重複掛載點（例如 systemd 沙箱的 bind mount），略過迴路與虛擬網路介面（`lo`、`veth*`、`docker*`、`br-*` 等）；讀不到溫度的感測器略過。磁碟、網路介面、溫度感測器各最多 32 個，同一個掛載點／介面／感測器名稱只送第一個；label 中的控制字元等禁止字元替換成 `?`，長度截到 256 bytes。
-- 整行超過單行上限 65536 bytes 時，捨去後面的磁碟、網路、溫度指標（CPU 與記憶體一定保留），並在 debug 日誌註明。
-- 磁碟、網路與溫度在每次取樣時一起刷新（第一次取樣時建立清單，之後會反映新增或移除的掛載點、介面與感測器）；與 CPU、記憶體一樣受取樣逾時保護。
+| 類別 | 指標 | 說明 |
+|---|---|---|
+| 沒有 label | `system.cpu.usage`、`system.memory.total`／`used`／`available`、`system.cpu.load_1m`／`5m`／`15m`、`system.swap.total`／`used`、`system.process.count`、`system.uptime` | 負載只有 Linux（Windows 不送，不是送 0）。`system.memory.used` = total − available。行程數同 `ps -e` 的列數（不含一般執行緒），`processes.enabled = false` 或只看得到 Pulse 自己的行程（systemd 的 `ProtectProc=invisible`）時不送 |
+| 掛載點（label `mountpoint`、`fstype`） | `system.filesystem.total`、`available`、`used`、`usage` | `used` = total − free（free 含保留給 root 的部分，Linux 為 `statvfs` 的 `f_bfree`）；`usage` = used ÷ (used + available)，與 `df` 的 Use% 相同 |
+| 磁碟 I/O（label `device`） | `system.disk.read`、`written`；Linux 另有 `read_ops`、`write_ops`、`io_time`（毫秒） | 計數器。Linux 直接讀 `/proc/diskstats`（裝置名稱如 `nvme0n1p2`、`sdb1`、`dm-0`），Windows 為磁碟機代號（`C:`）。讀不到時不送並記一次 `PLS-I8009` |
+| 網路介面（label `device`） | `system.network.received`、`transmitted`、`packets_received`、`packets_transmitted`、`errors_received`、`errors_transmitted` | 計數器 |
+| 溫度（label `sensor`） | `system.temperature` | 讀不到溫度的感測器略過 |
+
+- **計數器送原始累計值**（開機或介面啟用以來），不在 Pulse 換算速率：取樣遺失或補送時，Kairos 仍能以相鄰兩筆算出正確的平均速率（計數器重置與重新開機的規則見 METRICS.md 第 2.2 節）。記憶體、磁碟與網路以 bytes 為單位（v1 的記憶體為 MB）。
+- **篩選**：略過虛擬檔案系統（`tmpfs`、`overlay`、`squashfs` 等）、容量為 0 與同一磁碟的重複掛載點（例如 systemd 沙箱的 bind mount）、迴路與虛擬網路介面（`lo`、`veth*`、`docker*`、`br-*`、`virbr*`、`cni*`、`flannel*`、`cali*`、`vxlan*`、`tunl*`、`kube-*`、`lxcbr*`、`lxdbr*`）與 `collect.interface_exclude`。label 中的控制字元等禁止字元替換成 `?`，長度截到 256 bytes。
+- **每類上限與優先順序**：掛載點 16（`/`，Windows 為系統磁碟機，排第一，其餘容量大者優先）、磁碟 I/O 裝置 8（依掛載點的順序）、網路介面 16（有 IPv4 位址者 → 累計流量大者）、溫度感測器 32，合計最多 243 個，不超過協定的 256 個。被略過的項目在第一次取樣時記一則 `INFO`（`sysinfo.snapshot`，附 `skipped_filesystems` 等計數），之後每 24 小時最多一則。
+- **單行上限 65536 bytes**：超過時依序捨去，直到不超過：行程的命令列 → 行程排行縮成各 3 項 → 整個行程排行 → 溫度 → 優先順序最低的網路介面、磁碟 I/O 裝置、掛載點（以「整組」捨去，例如一個掛載點的 4 個指標一起捨去）。沒有 label 的指標一律保留。捨去的內容只影響這一筆，debug 日誌註明，每 10 分鐘最多一則 `WARN`。
+- 磁碟、網路與溫度在每次取樣時一起刷新（之後會反映新增或移除的掛載點、介面與感測器）；與 CPU、記憶體一樣受取樣逾時保護。
+
+**行程排行**（`processes`，雙方都宣告 feature `processes` 時；Kairos 0.8.0 以上、SQLite 儲存）：每 `processes.interval`（預設 60 秒）的那筆 report 附上依 CPU、依記憶體（常駐記憶體：Linux RSS、Windows Working Set）各前 `processes.top`（預設 5）個行程，其他 report 不帶。`cpu_usage` 是占整台主機的百分比（與 `system.cpu.usage` 同一尺度），期間為上一次排行到這次。行程的詳細資料只在排行的那次取樣讀取，行程數每次取樣只列舉、不讀詳細資料。協商了 `durable` 時隨 report 存入本機緩衝、斷線後一起補送。
+
+- **隱私**：預設只送執行檔名稱（例如 `postgres`，不含路徑與參數）。命令列的參數常含密碼、token、連線字串，**預設不送**；`processes.command = "executable"` 只送執行檔的完整路徑，`"full"` 送完整命令列（含參數，禁止字元換成 `?`、截斷到 1024 bytes），由管理者自行承擔，Kairos 不做遮罩。行程的使用者名稱本版不送。
+
+**主機資產**（`inventory` 訊息，雙方都宣告 feature `inventory` 時；Kairos 0.8.0 以上、SQLite 儲存）：
+
+```json
+{"type":"inventory","seq":2,"ts":"2026-10-20T02:00:00.120Z","inventory":{"os":{"family":"linux","name":"Ubuntu","version":"24.04","long_version":"Ubuntu 24.04.1 LTS","kernel":"6.8.0-45-generic","arch":"x86_64"},"boot_time":"2026-10-02T08:11:04Z","cpu":{"model":"Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz","vendor":"GenuineIntel","physical_cores":32,"logical_cores":64,"frequency_mhz":2000},"memory":{"total":51539607552,"swap_total":4294967296},"system":{"vendor":"Dell Inc.","product":"PowerEdge R650","serial":"7XK2LM3","board_vendor":"Dell Inc.","board_product":"0PJPW3","bios_vendor":"Dell Inc.","bios_version":"1.12.1"},"disks":[{"mountpoint":"/","device":"nvme0n1p2","fstype":"ext4","total":502468108288,"kind":"ssd","removable":false,"read_only":false}],"network_interfaces":[{"name":"eth0","mac":"52:54:00:12:34:56","addresses":["192.168.10.21/24","fe80::5054:ff:fe12:3456/64"],"mtu":1500}]}}
+```
+
+- **何時送**：連線建立（`hello_ack` 之後）收集一次並送出（不論與上次是否相同）；之後每 `inventory.interval`（預設 1 小時）重新收集，內容（`inventory_digest`，不含開機時間）改變才送，距離上次送達滿 24 小時也送一次。Kairos 回 `invalid_report` 時記 `WARN`（`inventory.rejected PLS-W2108`〔暫定〕），同樣的內容不再送；回 `storage_unavailable` 時 5 分鐘後重送。資產不經過本機緩衝（它是狀態，不是時序；重新連線後一定會再送一次）。收集在背景執行緒進行，超過 10 秒記 `WARN`（`PLS-W8005`）、這次不送，不影響 report 的取樣。
+- **內容**：取不到的欄位省略（不是空字串或 0）。磁碟與網路介面的篩選、名稱與指標相同，但不受每類上限限制（各最多 64 個）。CPU 時脈為標稱值（型號字串中的「@ 2.00GHz」、Linux 的 `base_frequency`／`cpuinfo_max_freq`、Windows 登錄的 `~MHz`），不用會隨負載變動的目前時脈。BIOS 在 Linux 讀 `/sys/class/dmi/id/bios_*`（所有人可讀），Windows 讀登錄 `HKLM\HARDWARE\DESCRIPTION\System\BIOS`。
+- **系統序號**：Linux 的 `/sys/class/dmi/id/product_serial` 只有 root 能讀；發佈包的 `pulse.service` 以 `ExecStartPre=+`（以 root 執行、不受沙箱限制）在啟動前複製到 `/run/pulse/product_serial`，Pulse 依序讀該檔、再直接讀 sysfs（以 root 互動執行時）。都讀不到，或是廠商的預設字串（`To Be Filled By O.E.M.`、`Default string` 等）時不送，記一次 `INFO`（`sysinfo.limited PLS-I8009`〔暫定〕）。Windows 由 SMBIOS 讀取，不需要系統管理員權限。`inventory.hardware_serials = false` 不送序號，`inventory.network_addresses = false` 不送 MAC 與 IP。
+- 整則超過單行上限時，依序捨去介面的位址（每個介面只留第一個 IPv4 與第一個 IPv6）、再捨去優先順序最低的介面與磁碟。
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。
 
@@ -576,7 +643,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 - **`boot_id` 與 `report_seq`**：`boot_id` 是 Pulse **每次程序啟動**時產生的 UUID v4（啟動日誌「本機緩衝：…本次 boot_id …」），`report_seq` 從 1 開始、每筆取樣加 1。重新啟動前留在緩衝中的資料沿用原本的 `boot_id` 與 `report_seq`。
 - **補送速率**：兩筆 report 之間至少間隔 `buffer.replay_interval_ms`（預設 1200 毫秒，每秒約 0.83 筆，低於 Kairos 的 report 速率限制每秒 2 則），同一時間最多 4 筆在途。實際使用的間隔不超過 `report.interval` 的 60%（`report.interval = 1` 時為 600 毫秒），否則新的取樣比送出的快、積壓補不完；啟動日誌「本機緩衝：…補送間隔 N 毫秒…」為實際的值。有積壓時，開始補送前另加 0～`min(heartbeat.interval, 5)` 秒的隨機延遲（與重連的分散相同）。以預設值，積壓每秒約減少 0.63 筆（新的取樣同時以每 5 秒一筆加入）：斷線 1 小時（720 筆）約 19 分鐘補完、24 小時（約 17,000 筆）約 7.6 小時補完。預設值依 1 萬台同時恢復連線時 Kairos 的寫入量（約每秒 8,300 筆）決定，見 Kairos 的 STORAGE.md 第 11.1 節；主機少、希望補得快時可調小（500 時 24 小時的積壓約 2.7 小時補完）。
 - **Kairos 回應**：`ack` → 刪除；`storage_unavailable`（Kairos 磁碟已滿、每日大小上限、寫入逾時、速率限制）→ 保留，退避 2 秒起、加倍到 60 秒後從最舊的未確認資料重送；`invalid_report`、`bad_request`（這筆永遠不會被接受）→ 丟棄並記 `WARN`。
-- **容量**：待送資料超過 `buffer.max_mb`（預設 64 MiB）或 `buffer.max_records`（預設 50,000 筆）時丟掉最舊的資料並記 `WARN`（節流，附累計丟棄筆數）；取樣時間超過 `buffer.max_age_hours`（預設 7 天）的資料不再送出。一筆約 0.5～3 KB，預設每 5 秒一筆時約可保存 1.5～3 天。磁碟用量最多約 `max_mb` 再加 8 MiB。
+- **容量**：待送資料超過 `buffer.max_mb`（預設 128 MiB；0.7 以前為 64）或 `buffer.max_records`（預設 50,000 筆）時丟掉最舊的資料並記 `WARN`（節流，附累計丟棄筆數）；取樣時間超過 `buffer.max_age_hours`（預設 7 天）的資料不再送出。0.8.0 起每筆約 1.5～5 KB（帶行程排行的那筆再多約 1 KB），預設每 5 秒一筆時約可保存 2～3 天（與 `max_records` 的約 69 小時相近，先到者為準）。磁碟用量最多約 `max_mb` 再加 8 MiB。0.7 寫入的緩衝記錄（沒有行程排行）升級後仍可讀取、照常補送。
 - **斷電與效能的取捨**：寫入不逐筆 fsync，最多每 10 秒（以及換區段檔與正常結束時）fsync 一次，因此斷電時最多遺失最近約 10 秒的取樣（預設約 2 筆）；每筆記錄有長度與 CRC-32，啟動時偵測並截掉寫到一半的尾端（記 `WARN`）。已送達的位置（`spool.ack`）最多每 5 秒更新一次，斷電後可能有幾筆已送達的資料再送一次，由 Kairos 去重。
 - **檔案**：`buffer/spool-<區段編號>.dat`（區段檔，`max_mb / 16`、64 KiB～4 MiB，全部送達後刪除）與 `buffer/spool.ack`（送達位置）。Unix 上目錄以 0750、檔案以 0640 建立；目錄允許其他使用者存取時啟動記 `WARN`。Windows 上檔案繼承目錄的 ACL，目錄允許 Users、Everyone 等一般使用者存取時記 `WARN`，建議以 `icacls "<目錄>" /inheritance:r /grant:r "<執行帳號>:(OI)(CI)M" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"` 只授權給執行帳號、SYSTEM 與 Administrators。**一個緩衝目錄只能給一個 Pulse 使用**（多實例時各自一個，見 INSTALL.md 第 9 節）。
 - **舊版 Kairos**（0.2.0 以前，不宣告 `durable`）：連線期間的取樣照舊即時送出（at-most-once，不寫入緩衝）；斷線期間寫進緩衝的積壓不會送給舊版 Kairos，保留到連上 0.3.0 以上的 Kairos，或超過 `max_age_hours`、容量上限而被丟棄。
@@ -789,7 +856,9 @@ sudo pulse diag -c /opt/pulse/pulse.toml --redact strict --since 7d   # 主機�
 
 ## 目前限制
 
-- 只回報 CPU 使用率與記憶體；磁碟、網路、溫度僅在啟動時印出到日誌，不會送給伺服器。
+- 連上 Kairos 0.2.0 以前（協定 v1）時只回報 CPU 使用率與記憶體（v1 的三個欄位）。
+- Windows 上的磁碟 I/O（`IOCTL_DISK_PERFORMANCE`）、行程清單與 SMBIOS 序號在虛擬服務帳號（`NT SERVICE\Pulse`）下的行為只經過交叉編譯，沒有在 Windows 上實測（METRICS.md 第 4.5 節的〔待實測〕）；讀不到磁碟 I/O 時不送 `system.disk.*` 並記 `PLS-I8009`，受保護行程的記憶體取不到時不列入記憶體排行。
+- 主機資產的「上次送達的摘要」只存在記憶體中：Pulse 重新啟動後第一次連線一定再送一次（Kairos 以摘要判斷內容未變，不寫變更歷史）。IPv6 的暫時位址（privacy extensions）定期更換時會被視為資產改變而重送。
 - 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 的去重有範圍限制（SQLite 為原始資料保存的期間；`backend = "jsonl"` 為記憶體中的視窗，見 PROTOCOL.md 與 Kairos 的 STORAGE.md），極少數情況下可能重複寫入。`buffer.max_age_hours` 建議不超過 Kairos `storage.raw_retention_days` × 24。
 - 本機緩衝不加鎖：同一個 `buffer.dir` 只能由一個 Pulse 使用。
 - Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
