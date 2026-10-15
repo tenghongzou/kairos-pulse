@@ -7,7 +7,7 @@
 use chrono::{DateTime, Days, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +18,12 @@ use super::http::{ApiError, Query, ts_ms};
 use crate::hosts_cli::parse_duration;
 use crate::protocol::{METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED};
 use crate::store::codec::{self, BYTES_PER_MB, FORMAT_LEGACY, FORMAT_METRICS};
+use crate::store::derive::{DERIVED_ESTIMATED, DERIVED_RATE, derived_name, estimated_usage};
 use crate::store::rollup::{Agg, BUCKET_1H_SECS, BUCKET_5M_SECS, bucket_start};
+use kairos_proto::{
+    CounterSample, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL, METRIC_FILESYSTEM_USAGE,
+    METRIC_UPTIME, MetricKind, counter_rate, standard_metric,
+};
 
 /// 每條序列的點數上限：預設、最小、最大
 pub const DEFAULT_MAX_POINTS: usize = 1000;
@@ -122,6 +127,20 @@ struct Point {
     /// 桶的開始（Unix 毫秒；原始資料為取樣時間）
     t: i64,
     agg: Agg,
+    /// 這個點（的一部分）是推算值（舊版 Pulse 的磁碟使用率；METRICS.md 第 9.2 節）
+    est: bool,
+}
+
+/// 一個桶的（實際值, 推算值）
+type BucketPair = (Option<Agg>, Option<Agg>);
+
+/// 計數器的呈現方式（`transform` 參數）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transform {
+    /// 每秒速率（計數器的預設）
+    Rate,
+    /// 原始累計值（只有原始資料解析度）
+    None,
 }
 
 /// 查詢的參數
@@ -135,6 +154,17 @@ struct TrendQuery {
     max_points: usize,
     labels: BTreeMap<String, String>,
     starts: RetentionStarts,
+    transform: Transform,
+}
+
+/// 一條輸出的序列
+#[derive(Debug)]
+struct OutSeries {
+    unit: String,
+    labels: BTreeMap<String, String>,
+    /// `rate`、`estimated` 或 `None`（原始序列）
+    derived: Option<&'static str>,
+    points: Vec<Point>,
 }
 
 /// 查詢的結果
@@ -142,58 +172,70 @@ struct TrendQuery {
 struct TrendResult {
     resolution: Resolution,
     bucket_secs: Option<i64>,
-    series: Vec<(String, BTreeMap<String, String>, Vec<Point>)>,
+    /// `gauge` 或 `counter`
+    kind: &'static str,
+    series: Vec<OutSeries>,
     truncated: bool,
 }
 
-/// 從原始資料讀出 `wanted` 序列在 [from, to) 的值，交給 `f(series_id, ts, value)`
-fn read_raw(
+/// 輸出的一條序列由哪些資料組成
+#[derive(Debug, Default)]
+struct Group {
+    unit: String,
+    labels: String,
+    derived: Option<&'static str>,
+    /// 彙總中的序列：(series_id, 是否為推算值)。推算值只補沒有實際值的桶
+    rollup: Vec<(i64, bool)>,
+    /// 原始資料中直接取值的序列
+    raw: Option<i64>,
+    /// 原始資料中的計數器（以相鄰兩筆算出速率）
+    counter: Option<i64>,
+    /// 原始資料中推算使用率的 total、available 序列
+    estimate: Option<(i64, i64)>,
+}
+
+/// 原始資料的一筆 report：取樣時間與（序列 → 值）
+fn read_reports(
     conn: &Connection,
     host_id: i64,
     from_ms: i64,
     to_ms: i64,
-    wanted: &HashSet<i64>,
     legacy: [Option<i64>; 3],
-    mut f: impl FnMut(i64, i64, f64),
+    mut f: impl FnMut(i64, &HashMap<i64, serde_json::Number>),
 ) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "SELECT ts, format, body FROM reports WHERE host_id = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts",
     )?;
     let mut rows = stmt.query(params![host_id, from_ms, to_ms])?;
+    let mut values: HashMap<i64, serde_json::Number> = HashMap::new();
     while let Some(r) = rows.next()? {
         let t: i64 = r.get(0)?;
         let format: i64 = r.get(1)?;
         let rusqlite::types::ValueRef::Blob(body) = r.get_ref(2)? else {
             continue;
         };
+        values.clear();
         match format {
             FORMAT_LEGACY => {
                 if let Some((cpu, total, used)) = codec::decode_legacy(body) {
-                    let values = [
-                        f64::from(cpu),
-                        (total * BYTES_PER_MB) as f64,
-                        (used * BYTES_PER_MB) as f64,
+                    let nums = [
+                        serde_json::Number::from_f64(f64::from(cpu)),
+                        Some(serde_json::Number::from(total * BYTES_PER_MB)),
+                        Some(serde_json::Number::from(used * BYTES_PER_MB)),
                     ];
-                    for (id, v) in legacy.iter().zip(values) {
-                        if let Some(id) = id
-                            && wanted.contains(id)
-                        {
-                            f(*id, t, v);
+                    for (id, v) in legacy.iter().zip(nums) {
+                        if let (Some(id), Some(v)) = (id, v) {
+                            values.insert(*id, v);
                         }
                     }
                 }
             }
             FORMAT_METRICS => {
-                for (id, v) in codec::decode_metrics(body).unwrap_or_default() {
-                    if wanted.contains(&id)
-                        && let Some(v) = v.as_f64()
-                    {
-                        f(id, t, v);
-                    }
-                }
+                values.extend(codec::decode_metrics(body).unwrap_or_default());
             }
-            _ => {}
+            _ => continue,
         }
+        f(t, &values);
     }
     Ok(())
 }
@@ -204,11 +246,44 @@ fn regroup(points: &[Point], bucket_secs: i64) -> Vec<Point> {
     for p in points {
         let t = bucket_start(p.t, bucket_secs) * 1000;
         match out.last_mut() {
-            Some(last) if last.t == t => last.agg.merge(&p.agg),
-            _ => out.push(Point { t, agg: p.agg }),
+            Some(last) if last.t == t => {
+                last.agg.merge(&p.agg);
+                last.est |= p.est;
+            }
+            _ => out.push(Point {
+                t,
+                agg: p.agg,
+                est: p.est,
+            }),
         }
     }
     out
+}
+
+/// 這台主機這個名稱的序列：(series_id, unit, labels, derived)。v8 起以 `host_series` 只列出這台主機
+/// 用過的序列；沒有對應時（例如 v7 升級時只出現在原始資料、尚未彙總的序列）改列出這個名稱的所有序列
+fn host_series_of(
+    conn: &Connection,
+    host_id: i64,
+    name: &str,
+) -> rusqlite::Result<Vec<(i64, String, String, i64)>> {
+    let collect = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<Vec<_>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(p, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    };
+    let list = collect(
+        "SELECT s.series_id, s.unit, s.labels, s.derived FROM series s
+         JOIN host_series h USING (series_id) WHERE h.host_id = ?1 AND s.name = ?2",
+        &[&host_id, &name],
+    )?;
+    if !list.is_empty() {
+        return Ok(list);
+    }
+    collect(
+        "SELECT series_id, unit, labels, derived FROM series WHERE name = ?1",
+        &[&name],
+    )
 }
 
 fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, ApiError> {
@@ -232,16 +307,7 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
     else {
         return Ok(None);
     };
-    // 這個名稱的所有序列（單位＋label 的組合）
-    let mut series: Vec<(i64, String, String)> = {
-        let mut stmt = tx
-            .prepare("SELECT series_id, unit, labels FROM series WHERE name = ?1")
-            .map_err(&failed)?;
-        let rows = stmt
-            .query_map([&q.name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(&failed)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(&failed)?
-    };
+    let mut series = host_series_of(&tx, host_id, &q.name).map_err(&failed)?;
     if series.is_empty() {
         return Err(ApiError::new(
             hyper::StatusCode::NOT_FOUND,
@@ -256,14 +322,105 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
             serde_json::from_str(s).unwrap_or_default()
         }
     };
-    series.retain(|(_, _, labels)| {
+    series.retain(|(_, _, labels, _)| {
         let labels = parse_labels(labels);
         q.labels.iter().all(|(k, v)| labels.get(k) == Some(v))
     });
-    series.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
-    let truncated = series.len() > MAX_SERIES;
-    series.truncate(MAX_SERIES);
-    let wanted: HashSet<i64> = series.iter().map(|s| s.0).collect();
+    let std = standard_metric(&q.name);
+    let counter = std.is_some_and(|s| s.kind == MetricKind::Counter);
+    let resolution_req = q.requested;
+    if counter
+        && q.transform == Transform::None
+        && resolution_req.is_some_and(|r| r != Resolution::Raw)
+    {
+        return Err(ApiError::param(
+            "transform",
+            "transform=none（原始累計值）只有原始資料解析度，resolution 必須是 raw 或 auto",
+        ));
+    }
+    // 輸出的序列（依單位與 label 合併原始、速率、推算）
+    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
+    for (id, unit, labels, derived) in &series {
+        let is_std_unit = std.is_some_and(|s| s.unit == unit);
+        match *derived {
+            DERIVED_RATE => {
+                if counter && q.transform == Transform::Rate {
+                    let g = groups.entry((unit.clone(), labels.clone())).or_default();
+                    g.unit.clone_from(unit);
+                    g.labels.clone_from(labels);
+                    g.derived = Some("rate");
+                    g.rollup.push((*id, false));
+                }
+            }
+            DERIVED_ESTIMATED => {
+                let g = groups.entry((unit.clone(), labels.clone())).or_default();
+                g.unit.clone_from(unit);
+                g.labels.clone_from(labels);
+                g.rollup.push((*id, true));
+            }
+            _ if counter && is_std_unit => {
+                let (out_unit, rate) = match q.transform {
+                    Transform::Rate => (format!("{unit}/s"), true),
+                    Transform::None => (unit.clone(), false),
+                };
+                let g = groups
+                    .entry((out_unit.clone(), labels.clone()))
+                    .or_default();
+                g.unit = out_unit;
+                g.labels.clone_from(labels);
+                if rate {
+                    g.derived = Some("rate");
+                    g.counter = Some(*id);
+                } else {
+                    g.raw = Some(*id);
+                }
+            }
+            _ => {
+                let g = groups.entry((unit.clone(), labels.clone())).or_default();
+                g.unit.clone_from(unit);
+                g.labels.clone_from(labels);
+                g.raw = Some(*id);
+                g.rollup.push((*id, false));
+            }
+        }
+    }
+    // 推算的使用率：原始資料中以同一組 label 的 total、available 計算（彙總中已有推算序列）
+    if q.name == METRIC_FILESYSTEM_USAGE {
+        let totals = host_series_of(&tx, host_id, METRIC_FILESYSTEM_TOTAL).map_err(&failed)?;
+        let avails = host_series_of(&tx, host_id, METRIC_FILESYSTEM_AVAILABLE).map_err(&failed)?;
+        for (tid, tunit, labels, tder) in &totals {
+            if *tder != 0 || tunit != "By" {
+                continue;
+            }
+            let lbl = parse_labels(labels);
+            if !q.labels.iter().all(|(k, v)| lbl.get(k) == Some(v)) {
+                continue;
+            }
+            if let Some((aid, ..)) = avails
+                .iter()
+                .find(|a| a.2 == *labels && a.3 == 0 && a.1 == "By")
+            {
+                let g = groups.entry(("%".to_string(), labels.clone())).or_default();
+                g.unit = "%".to_string();
+                g.labels.clone_from(labels);
+                g.estimate = Some((*tid, *aid));
+            }
+        }
+    }
+    // 只有推算的資料（沒有 Pulse 送的使用率）的序列標示為推算
+    for g in groups.values_mut() {
+        let only_estimates = g.rollup.iter().all(|(_, e)| *e);
+        if g.raw.is_none()
+            && g.counter.is_none()
+            && only_estimates
+            && (!g.rollup.is_empty() || g.estimate.is_some())
+        {
+            g.derived = Some("estimated");
+        }
+    }
+    let mut groups: Vec<Group> = groups.into_values().collect();
+    let truncated = groups.len() > MAX_SERIES;
+    groups.truncate(MAX_SERIES);
     // v1 的三欄位 report 對應的標準序列
     let mut legacy = [None; 3];
     for (slot, (name, unit)) in legacy.iter_mut().zip([
@@ -274,7 +431,7 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
         if name == q.name {
             *slot = tx
                 .query_row(
-                    "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = ''",
+                    "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = '' AND derived = 0",
                     params![name, unit],
                     |r| r.get(0),
                 )
@@ -282,41 +439,134 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
                 .map_err(&failed)?;
         }
     }
-
-    let resolution = q.requested.unwrap_or_else(|| {
-        choose_resolution(
-            q.from_ms,
-            q.to_ms,
-            interval.unwrap_or(DEFAULT_REPORT_INTERVAL_MS),
-            q.max_points,
-            &q.starts,
+    let uptime_id: Option<i64> = if groups.iter().any(|g| g.counter.is_some()) {
+        tx.query_row(
+            "SELECT series_id FROM series WHERE name = ?1 AND unit = 's' AND labels = '' AND derived = 0",
+            [METRIC_UPTIME],
+            |r| r.get(0),
         )
-    });
-    let mut points: HashMap<i64, Vec<Point>> = HashMap::new();
-    match resolution {
-        Resolution::Raw => {
-            read_raw(
-                &tx,
-                host_id,
+        .optional()
+        .map_err(&failed)?
+    } else {
+        None
+    };
+
+    let resolution = if counter && q.transform == Transform::None {
+        Resolution::Raw
+    } else {
+        resolution_req.unwrap_or_else(|| {
+            choose_resolution(
                 q.from_ms,
                 q.to_ms,
-                &wanted,
-                legacy,
-                |id, t, v| {
-                    points.entry(id).or_default().push(Point {
+                interval.unwrap_or(DEFAULT_REPORT_INTERVAL_MS),
+                q.max_points,
+                &q.starts,
+            )
+        })
+    };
+
+    // 原始資料：每條輸出序列在 [from, to) 的 (時間, 值, 是否推算)
+    let read_raw_points = |from: i64, to: i64| -> rusqlite::Result<Vec<Vec<(i64, f64, bool)>>> {
+        let mut out: Vec<Vec<(i64, f64, bool)>> = groups.iter().map(|_| Vec::new()).collect();
+        // 計數器的上一筆：from 之前最近的一筆 report
+        let mut prev: Vec<Option<CounterSample>> = groups.iter().map(|_| None).collect();
+        let need_prev = groups.iter().any(|g| g.counter.is_some());
+        let mut step = |t: i64, values: &HashMap<i64, serde_json::Number>, emit: bool| {
+            let uptime = uptime_id
+                .and_then(|u| values.get(&u))
+                .and_then(|v| v.as_u64());
+            for (i, g) in groups.iter().enumerate() {
+                if let Some(id) = g.raw
+                    && let Some(v) = values.get(&id).and_then(|v| v.as_f64())
+                {
+                    if emit {
+                        out[i].push((t, v, false));
+                    }
+                    continue;
+                }
+                if let Some(c) = g.counter {
+                    if let Some(v) = values.get(&c).and_then(|v| v.as_u64()) {
+                        let cur = CounterSample {
+                            value: v,
+                            ts_ms: t,
+                            uptime_secs: uptime,
+                        };
+                        if let Some(p) = prev[i]
+                            && emit
+                            && let Some(rate) = counter_rate(p, cur)
+                        {
+                            out[i].push((t, rate, false));
+                        }
+                        if prev[i].is_none_or(|p| t > p.ts_ms) {
+                            prev[i] = Some(cur);
+                        }
+                    }
+                    continue;
+                }
+                if emit
+                    && let Some((tid, aid)) = g.estimate
+                    && let (Some(total), Some(avail)) = (
+                        values.get(&tid).and_then(|v| v.as_f64()),
+                        values.get(&aid).and_then(|v| v.as_f64()),
+                    )
+                    && let Some(v) = estimated_usage(total, avail)
+                {
+                    out[i].push((t, v, true));
+                }
+            }
+        };
+        if need_prev {
+            let seed: Option<i64> = tx
+                .query_row(
+                    "SELECT ts FROM reports WHERE host_id = ?1 AND ts < ?2 ORDER BY ts DESC LIMIT 1",
+                    params![host_id, from],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(t) = seed {
+                read_reports(&tx, host_id, t, t + 1, legacy, |t, v| step(t, v, false))?;
+            }
+        }
+        read_reports(&tx, host_id, from, to, legacy, |t, v| step(t, v, true))?;
+        Ok(out)
+    };
+
+    let mut points: Vec<Vec<Point>> = groups.iter().map(|_| Vec::new()).collect();
+    match resolution {
+        Resolution::Raw => {
+            let raw = read_raw_points(q.from_ms, q.to_ms).map_err(&failed)?;
+            for (i, list) in raw.into_iter().enumerate() {
+                points[i] = list
+                    .into_iter()
+                    .map(|(t, v, est)| Point {
                         t,
                         agg: Agg::new(v),
-                    });
-                },
-            )
-            .map_err(&failed)?;
+                        est,
+                    })
+                    .collect();
+            }
         }
         Resolution::M5 | Resolution::H1 => {
             let (table, secs) = match resolution {
                 Resolution::M5 => ("rollup_5m", BUCKET_5M_SECS),
                 _ => ("rollup_1h", BUCKET_1H_SECS),
             };
-            let mut buckets: HashMap<(i64, i64), Agg> = HashMap::new();
+            // (group, bucket) → (實際值, 推算值)
+            let mut buckets: Vec<BTreeMap<i64, BucketPair>> =
+                groups.iter().map(|_| BTreeMap::new()).collect();
+            let mut by_id: HashMap<i64, (usize, bool)> = HashMap::new();
+            for (i, g) in groups.iter().enumerate() {
+                for (id, est) in &g.rollup {
+                    by_id.insert(*id, (i, *est));
+                }
+            }
+            let put = |slot: &mut (Option<Agg>, Option<Agg>), agg: Agg, est: bool| {
+                let target = if est { &mut slot.1 } else { &mut slot.0 };
+                match target {
+                    Some(a) => a.merge(&agg),
+                    None => *target = Some(agg),
+                }
+            };
             let from_bucket = bucket_start(q.from_ms, secs);
             {
                 let mut stmt = tx
@@ -330,9 +580,9 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
                     .map_err(&failed)?;
                 while let Some(r) = rows.next().map_err(&failed)? {
                     let id: i64 = r.get(1).map_err(&failed)?;
-                    if !wanted.contains(&id) {
+                    let Some(&(i, est)) = by_id.get(&id) else {
                         continue;
-                    }
+                    };
                     let agg = Agg {
                         min: r.get(2).map_err(&failed)?,
                         max: r.get(3).map_err(&failed)?,
@@ -340,39 +590,40 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
                         count: u64::try_from(r.get::<_, i64>(5).map_err(&failed)?).unwrap_or(0),
                     };
                     let bucket: i64 = r.get(0).map_err(&failed)?;
-                    buckets
-                        .entry((id, bucket))
-                        .and_modify(|a| a.merge(&agg))
-                        .or_insert(agg);
+                    put(buckets[i].entry(bucket).or_default(), agg, est);
                 }
             }
             // 尚未寫出彙總的最新部分：由原始資料計算
             let tail_from = (from_bucket * 1000).max(rollup_until);
             if q.to_ms > tail_from {
-                read_raw(
-                    &tx,
-                    host_id,
-                    tail_from,
-                    q.to_ms,
-                    &wanted,
-                    legacy,
-                    |id, t, v| {
-                        buckets
-                            .entry((id, bucket_start(t, secs)))
-                            .and_modify(|a| a.add(v))
-                            .or_insert(Agg::new(v));
-                    },
-                )
-                .map_err(&failed)?;
+                let raw = read_raw_points(tail_from, q.to_ms).map_err(&failed)?;
+                for (i, list) in raw.into_iter().enumerate() {
+                    for (t, v, est) in list {
+                        put(
+                            buckets[i].entry(bucket_start(t, secs)).or_default(),
+                            Agg::new(v),
+                            est,
+                        );
+                    }
+                }
             }
-            for ((id, bucket), agg) in buckets {
-                points.entry(id).or_default().push(Point {
-                    t: bucket * 1000,
-                    agg,
-                });
-            }
-            for list in points.values_mut() {
-                list.sort_by_key(|p| p.t);
+            for (i, b) in buckets.into_iter().enumerate() {
+                points[i] = b
+                    .into_iter()
+                    .filter_map(|(bucket, (real, est))| {
+                        // Pulse 送的實際值優先；沒有時才用推算值
+                        let (agg, is_est) = match (real, est) {
+                            (Some(a), _) => (a, false),
+                            (None, Some(e)) => (e, true),
+                            (None, None) => return None,
+                        };
+                        Some(Point {
+                            t: bucket * 1000,
+                            agg,
+                            est: is_est,
+                        })
+                    })
+                    .collect();
             }
         }
     }
@@ -381,11 +632,11 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
     // 點數上限：相鄰的點合併成較大的桶（所有序列用同一個桶長，時間對齊）
     let base = resolution.base_secs();
     let range_secs = ((q.to_ms - q.from_ms) / 1000).max(1);
-    let too_many = points.values().any(|p| p.len() > q.max_points);
+    let too_many = points.iter().any(|p| p.len() > q.max_points);
     let bucket_secs = if too_many {
         let per = (range_secs + q.max_points as i64 - 2) / (q.max_points as i64 - 1).max(1);
         let b = ((per.max(base) + base - 1) / base) * base;
-        for list in points.values_mut() {
+        for list in points.iter_mut() {
             *list = regroup(list, b);
         }
         Some(b)
@@ -394,16 +645,20 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
     } else {
         Some(base)
     };
-    let series = series
+    let series = groups
         .into_iter()
-        .map(|(id, unit, labels): (i64, String, String)| {
-            let labels = parse_labels(labels.as_str());
-            (unit, labels, points.remove(&id).unwrap_or_default())
+        .zip(points)
+        .map(|(g, points)| OutSeries {
+            labels: parse_labels(&g.labels),
+            unit: g.unit,
+            derived: g.derived,
+            points,
         })
         .collect();
     Ok(Some(TrendResult {
         resolution,
         bucket_secs,
+        kind: if counter { "counter" } else { "gauge" },
         series,
         truncated,
     }))
@@ -420,7 +675,14 @@ fn parse_time(param: &str, text: &str) -> Result<DateTime<Utc>, ApiError> {
         })
 }
 
-const TREND_PARAMS: [&str; 5] = ["range", "from", "to", "resolution", "max_points"];
+const TREND_PARAMS: [&str; 6] = [
+    "range",
+    "from",
+    "to",
+    "resolution",
+    "max_points",
+    "transform",
+];
 
 /// `GET /api/v1/hosts/{agent_id}/metrics/{name}`
 pub async fn trend(
@@ -492,6 +754,16 @@ pub async fn trend(
                 )
             })?,
     };
+    let transform = match q.get("transform").unwrap_or("rate") {
+        "rate" => Transform::Rate,
+        "none" => Transform::None,
+        other => {
+            return Err(ApiError::param(
+                "transform",
+                format!("transform 的值 \"{other}\" 無效（rate、none）"),
+            ));
+        }
+    };
     let labels: BTreeMap<String, String> = q
         .with_prefix("label.")
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -527,6 +799,7 @@ pub async fn trend(
         max_points,
         labels,
         starts,
+        transform,
     };
     let query = tq.clone();
     let result = match ctx
@@ -539,6 +812,10 @@ pub async fn trend(
         None if ctx.registry.live_get(&agent_id).is_some() => TrendResult {
             resolution: requested.unwrap_or(Resolution::Raw),
             bucket_secs: None,
+            kind: match standard_metric(name) {
+                Some(s) if s.kind == MetricKind::Counter => "counter",
+                _ => "gauge",
+            },
             series: Vec::new(),
             truncated: false,
         },
@@ -572,18 +849,29 @@ pub async fn trend(
     let series: Vec<Value> = result
         .series
         .iter()
-        .map(|(unit, labels, points)| {
-            json!({
-                "unit": unit,
-                "labels": labels,
-                "points": points.iter().map(|p| json!({
-                    "t": ts_ms(p.t),
-                    "min": p.agg.min,
-                    "max": p.agg.max,
-                    "avg": if p.agg.count > 0 { p.agg.sum / p.agg.count as f64 } else { f64::NAN },
-                    "count": p.agg.count,
-                })).collect::<Vec<_>>(),
-            })
+        .map(|s| {
+            let mut v = json!({
+                "unit": s.unit,
+                "labels": s.labels,
+                "kind": result.kind,
+                "points": s.points.iter().map(|p| {
+                    let mut o = json!({
+                        "t": ts_ms(p.t),
+                        "min": p.agg.min,
+                        "max": p.agg.max,
+                        "avg": if p.agg.count > 0 { p.agg.sum / p.agg.count as f64 } else { f64::NAN },
+                        "count": p.agg.count,
+                    });
+                    if p.est {
+                        o["estimated"] = json!(true);
+                    }
+                    o
+                }).collect::<Vec<_>>(),
+            });
+            if let Some(d) = s.derived {
+                v["derived"] = json!(d);
+            }
+            v
         })
         .collect();
     Ok(super::http::ok(
@@ -595,6 +883,12 @@ pub async fn trend(
             "to": ts_ms(tq.to_ms),
             "resolution": result.resolution.as_str(),
             "requested_resolution": requested.map_or("auto", |r| r.as_str()),
+            "kind": result.kind,
+            "transform": if result.kind == "counter" {
+                Some(match transform { Transform::Rate => "rate", Transform::None => "none" })
+            } else {
+                None
+            },
             "bucket_secs": result.bucket_secs,
             "series": series,
             "truncated": result.truncated,
@@ -647,7 +941,7 @@ fn available(
             ] {
                 if let Some(id) = conn
                     .query_row(
-                        "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = ''",
+                        "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = '' AND derived = 0",
                         params![name, unit],
                         |r| r.get(0),
                     )
@@ -682,30 +976,80 @@ fn available(
             )
         }
     };
-    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut out: Vec<(String, String, String, Option<&'static str>)> = Vec::new();
     let mut stmt = conn
-        .prepare("SELECT name, unit, labels FROM series WHERE series_id = ?1")
+        .prepare("SELECT name, unit, labels, derived FROM series WHERE series_id = ?1")
         .map_err(&failed)?;
     for id in ids {
-        if let Some(row) = stmt
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        if let Some((name, unit, labels, derived)) = stmt
+            .query_row([id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
             .optional()
             .map_err(&failed)?
         {
-            out.push(row);
+            match derived {
+                // 彙總中的速率序列代表原本的計數器（v8 起計數器只彙總速率）
+                DERIVED_RATE => {
+                    let unit = unit.strip_suffix("/s").unwrap_or(&unit).to_string();
+                    out.push((name, unit, labels, None));
+                }
+                d => out.push((name, unit, labels, derived_name(d))),
+            }
+        }
+    }
+    // 推算的使用率：有 total 與 available、沒有 usage 的掛載點（0.2.0～0.7.0 的 Pulse）
+    let has = |out: &[(String, String, String, Option<&'static str>)], name: &str, labels: &str| {
+        out.iter().any(|o| o.0 == name && o.2 == labels)
+    };
+    let fs: Vec<String> = out
+        .iter()
+        .filter(|o| o.0 == METRIC_FILESYSTEM_TOTAL && o.3.is_none())
+        .map(|o| o.2.clone())
+        .collect();
+    for labels in fs {
+        if has(&out, METRIC_FILESYSTEM_AVAILABLE, &labels)
+            && !has(&out, METRIC_FILESYSTEM_USAGE, &labels)
+        {
+            out.push((
+                METRIC_FILESYSTEM_USAGE.to_string(),
+                "%".to_string(),
+                labels,
+                Some("estimated"),
+            ));
         }
     }
     out.sort();
     out.dedup();
     let metrics = out
         .into_iter()
-        .map(|(name, unit, labels)| {
+        .map(|(name, unit, labels, derived)| {
             let labels: BTreeMap<String, String> = if labels.is_empty() {
                 BTreeMap::new()
             } else {
                 serde_json::from_str(&labels).unwrap_or_default()
             };
-            json!({ "name": name, "unit": unit, "labels": labels })
+            let std = standard_metric(&name).filter(|s| s.unit == unit);
+            let kind = match std {
+                Some(s) if s.kind == MetricKind::Counter => "counter",
+                _ => "gauge",
+            };
+            let mut v = json!({
+                "name": name,
+                "unit": unit,
+                "labels": labels,
+                "kind": kind,
+                "standard": std.is_some(),
+            });
+            if let Some(d) = derived {
+                v["derived"] = json!(d);
+            }
+            v
         })
         .collect();
     Ok(Some((metrics, as_of)))
@@ -784,6 +1128,7 @@ pub(crate) mod tests {
     fn regrouping_keeps_min_max_sum_and_count() {
         let p = |t: i64, v: f64| Point {
             t,
+            est: false,
             agg: Agg::new(v),
         };
         let points = vec![p(0, 1.0), p(400, 5.0), p(1000, 3.0), p(70_000, 2.0)];

@@ -7,6 +7,7 @@ mod decommission;
 mod diag;
 mod enroll;
 mod file_perms;
+mod inventory;
 mod local_status;
 mod log_files;
 mod log_throttle;
@@ -820,6 +821,7 @@ async fn run(
             let (sample_tx, sample_rx) = mpsc::channel(SPOOL_QUEUE_CAPACITY);
             let collector = tokio::spawn(system_info::collect_periodically(
                 Duration::from_secs(config.report.interval),
+                system_info::CollectOptions::from_config(&config),
                 sample_tx,
             ));
             let ingest = tokio::spawn(spool::ingest(sample_rx, shared.clone(), report_tx));
@@ -828,6 +830,7 @@ async fn run(
         None => (
             tokio::spawn(system_info::collect_periodically(
                 Duration::from_secs(config.report.interval),
+                system_info::CollectOptions::from_config(&config),
                 report_tx,
             )),
             None,
@@ -844,6 +847,25 @@ async fn run(
     if config.buffer.enabled && shared_spool.is_none() {
         // copywriting §4.2 範例 71：systemd Status 與服務描述也要看得到 PLS-E4004
         settings.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
+    }
+    // 主機資產（F4，feature inventory）：連線協商後才收集（背景的 blocking 執行緒）
+    if config.inventory.enabled {
+        let agent = inventory::InventoryAgent::new(
+            Duration::from_secs(config.inventory.interval),
+            system_info::inventory::InventoryOptions {
+                hardware_serials: config.inventory.hardware_serials,
+                network_addresses: config.inventory.network_addresses,
+                interface_exclude: config.collect.interface_exclude.clone(),
+            },
+        );
+        tokio::spawn(inventory::run_worker(agent.clone()));
+        settings.inventory = Some(agent);
+    }
+    if config.processes.enabled && config.processes.include_user {
+        warn!(
+            "{}processes.include_user = true：本版尚未支援送出行程的使用者名稱（METRICS.md 第 17 節 D3），忽略此設定",
+            codes::tag(codes::CONFIG_WARNING, None)
+        );
     }
     // 身分由 pulse enroll 管理（identity/client.pem）：宣告 renew、過期時改走 8444 過期續簽
     let managed = enroll::service::identity_managed(&config, &base, &paths);
@@ -1026,7 +1048,9 @@ async fn connection_loop(
                     Ok(t) => network::one_shot(
                         &settings,
                         &t,
-                        protocol::hello_features(spool.is_some()),
+                        protocol::hello_features(protocol::OptionalFeatures::one_shot(
+                            spool.is_some(),
+                        )),
                         None,
                     )
                     .await
@@ -1115,6 +1139,31 @@ mod tests {
             ],
             "{line}"
         );
+    }
+
+    #[test]
+    fn unit_copies_the_system_serial_where_pulse_reads_it() {
+        // METRICS.md D4：ExecStartPre=+（root、不受沙箱限制）把序號複製到 RuntimeDirectory，
+        // 複製的目的地與 Pulse 讀取的位置相同，且失敗不影響啟動（前綴 -）
+        let unit = include_str!("../packaging/pulse.service");
+        let pre = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStartPre="))
+            .expect("pulse.service 應以 ExecStartPre= 複製序號");
+        assert!(pre.starts_with("-+") || pre.starts_with("+-"), "{pre}");
+        let args: Vec<&str> = pre.split_whitespace().collect();
+        assert_eq!(args.last(), Some(&system_info::inventory::SERIAL_COPY_PATH));
+        assert!(args.contains(&"/sys/class/dmi/id/product_serial"), "{pre}");
+        assert!(args.windows(2).any(|w| w == ["-o", "pulse"]), "{pre}");
+        let runtime = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("RuntimeDirectory="))
+            .expect("pulse.service 應設定 RuntimeDirectory");
+        assert_eq!(
+            Path::new(system_info::inventory::SERIAL_COPY_PATH).parent(),
+            Some(Path::new("/run").join(runtime).as_path())
+        );
+        assert!(unit.lines().any(|l| l == "RuntimeDirectoryPreserve=yes"));
     }
 
     #[test]

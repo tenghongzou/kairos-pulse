@@ -482,6 +482,8 @@ impl AlertService {
                     last_report_at: None,
                     cpu: None,
                     memory: None,
+                    detail: None,
+                    logical_cores: None,
                 },
             );
         }
@@ -508,6 +510,8 @@ impl AlertService {
                     last_report_at: None,
                     cpu: None,
                     memory: None,
+                    detail: None,
+                    logical_cores: None,
                 });
             entry.hostname = l.hostname.clone();
             if let Some(info) = &l.host {
@@ -539,7 +543,9 @@ impl AlertService {
                     (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
                     _ => None,
                 };
+                entry.detail = Some(r.clone());
             }
+            entry.logical_cores = l.assets.as_ref().and_then(|a| a.logical_cores);
             if l.online {
                 since.remove(&*l.agent_id);
                 entry.offline_at = None;

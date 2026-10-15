@@ -67,6 +67,8 @@ sequenceDiagram
 | `durable` | report 改為 at-least-once：report 帶 `boot_id`／`report_seq`，伺服器據此去重，client 收到 `ack` 才刪除本機的資料（見「durable：at-least-once 投遞」）。Kairos 0.3.0 起宣告；Pulse 0.3.0 起在啟用本機緩衝（`buffer.enabled`，預設啟用）時宣告 |
 | `renew` | 憑證仍有效時經這條 mTLS 連線正常輪替（`renew_request`／`renew_result`），`hello_ack` 另帶 `expired_renew_grace_days`、選用的 `renew_now`（見「憑證輪替與除役」）。Kairos 0.5.0 起在**有註冊服務（SQLite）且 client 也宣告時**才列出；Pulse 0.5.0 起在身分由 `pulse enroll` 管理時宣告 |
 | `deregister` | 除役通知（`hello.intent` 為 `deregister` 的連線上送 `deregister`，回 `deregister_ack`）。Kairos 0.5.0 起同 `renew` 的條件列出；Pulse 0.5.0 起只在除役通知的連線（`pulse decommission`）宣告 |
+| `inventory` | 主機資產：連線後與資產改變時送 `inventory` 訊息（作業系統、CPU、記憶體、廠牌型號序號、磁碟、網卡），回 `ack`（見 [`METRICS.md`](METRICS.md)「資產」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `inventory.enabled`（預設啟用）時宣告 |
+| `processes` | report 另帶行程排行 `processes`（依 CPU、依記憶體各前 N 個；需同時協商 `metrics`，見 [`METRICS.md`](METRICS.md)「行程」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `processes.enabled`（預設啟用）時宣告 |
 
 日後新增功能（例如指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。註冊通道（8444 HTTPS）是另一份規格 [`ENROLL.md`](ENROLL.md)；8443 上與註冊有關的 `renew`、`deregister` 定義在本文件「憑證輪替與除役」（原為 ENROLL.md 第 13 節的草稿）。
 
@@ -106,9 +108,10 @@ sequenceDiagram
 |---|---|
 | `hello` | `proto`、`agent_id`、`hostname`（僅供顯示）、`agent_version`、`heartbeat_interval_ms`；v2 起另有選用的 `proto_min`、`proto_max`、`features`、`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os` |
 | `heartbeat` | 無 |
-| `report` | v1：`cpu_usage`（%）、`total_memory`（MB）、`used_memory`（MB）。v2 且協商了 `metrics`：`metrics`（陣列，見「report（通用指標）」），不送三欄位。協商了 `durable`：另有 `boot_id`、`report_seq`（見「durable：at-least-once 投遞」） |
+| `report` | v1：`cpu_usage`（%）、`total_memory`（MB）、`used_memory`（MB）。v2 且協商了 `metrics`：`metrics`（陣列，見「report（通用指標）」），不送三欄位。協商了 `durable`：另有 `boot_id`、`report_seq`（見「durable：at-least-once 投遞」）。協商了 `processes`：另有選用的 `processes`（見 [`METRICS.md`](METRICS.md)「行程」） |
 | `renew_request` | 協商了 `renew` 時：`request_id`、`csr`、`sent_at`（見「憑證輪替與除役」） |
 | `deregister` | 協商了 `deregister` 且 hello 帶 `intent: "deregister"` 時：`request_id`、`agent_id`、`reason`、`initiated_by`、`host_fingerprint`（選用）、`hostname`、`pulse_version`、`sent_at` |
+| `inventory` | 協商了 `inventory` 時：`inventory`（物件，見 [`METRICS.md`](METRICS.md)「資產」），回 `ack`。沒有協商時伺服器視為不認得的 `type`（`unknown_type`） |
 
 `hello` 另有選用的 `intent`（字串，目前只定義 `deregister`，見「憑證輪替與除役」）；不是字串時視為沒有。
 
@@ -179,7 +182,7 @@ Pulse 端的 `heartbeat.interval` 設定上限為 60 秒，與上表一致。v2 
 
 元素中的其他欄位忽略，不會保存。整個陣列 1～256 個元素；同一個 `name` 與 `labels` 組合不得重複；同時有沒有 label 的 `system.memory.used` 與 `system.memory.total` 時，前者不得大於後者。單行上限 65536 bytes 仍適用，Pulse 送出前會確認不超過（超過時捨去標準指標以外的部分）。
 
-標準指標（Pulse 送出；伺服器另外檢查單位與範圍）：
+標準指標（Pulse 送出；伺服器另外檢查單位與範圍，label 名稱只是慣例、伺服器不檢查）：
 
 | `name` | `unit` | 範圍 | `labels` | 說明 |
 |---|---|---|---|---|
@@ -191,6 +194,27 @@ Pulse 端的 `heartbeat.interval` 設定上限為 60 秒，與上表一致。v2 
 | `system.network.received` | `By` | ≥ 0 | `device` | 網路介面開機以來累計接收量（計數器，速率由使用端相減） |
 | `system.network.transmitted` | `By` | ≥ 0 | `device` | 網路介面開機以來累計傳送量 |
 | `system.temperature` | `Cel` | 不限 | `sensor` | 元件溫度 |
+| `system.cpu.load_1m` | `1` | ≥ 0 | 無 | 1 分鐘平均負載（只有 Linux） |
+| `system.cpu.load_5m` | `1` | ≥ 0 | 無 | 5 分鐘平均負載（只有 Linux） |
+| `system.cpu.load_15m` | `1` | ≥ 0 | 無 | 15 分鐘平均負載（只有 Linux） |
+| `system.memory.available` | `By` | ≥ 0 | 無 | 可用記憶體 |
+| `system.swap.total` | `By` | ≥ 0 | 無 | 置換空間（swap／分頁檔）總量 |
+| `system.swap.used` | `By` | ≥ 0 | 無 | 置換空間已使用量 |
+| `system.filesystem.used` | `By` | ≥ 0 | `mountpoint`、`fstype` | 檔案系統已使用量 |
+| `system.filesystem.usage` | `%` | 0～100 | `mountpoint`、`fstype` | 檔案系統使用率（同 `df`） |
+| `system.disk.read` | `By` | ≥ 0 | `device` | 磁碟累計讀取量（計數器） |
+| `system.disk.written` | `By` | ≥ 0 | `device` | 磁碟累計寫入量（計數器） |
+| `system.disk.read_ops` | `{operations}` | ≥ 0 | `device` | 磁碟累計讀取次數（計數器，只有 Linux） |
+| `system.disk.write_ops` | `{operations}` | ≥ 0 | `device` | 磁碟累計寫入次數（計數器，只有 Linux） |
+| `system.disk.io_time` | `ms` | ≥ 0 | `device` | 磁碟累計忙碌時間（計數器，只有 Linux） |
+| `system.network.packets_received` | `{packets}` | ≥ 0 | `device` | 累計接收封包數（計數器） |
+| `system.network.packets_transmitted` | `{packets}` | ≥ 0 | `device` | 累計傳送封包數（計數器） |
+| `system.network.errors_received` | `{errors}` | ≥ 0 | `device` | 累計接收錯誤數（計數器） |
+| `system.network.errors_transmitted` | `{errors}` | ≥ 0 | `device` | 累計傳送錯誤數（計數器） |
+| `system.process.count` | `{processes}` | ≥ 0 | 無 | 行程數 |
+| `system.uptime` | `s` | ≥ 0 | 無 | 開機後經過的時間 |
+
+`system.temperature` 以前的 8 個是 0.2.0 起的指標，其後是 0.8.0（商業審計 F4）新增的指標，語意、各平台的來源、計數器的重置處理與 Pulse 的送出上限見 [`METRICS.md`](METRICS.md)。新增的指標沿用同一個 `metrics` 陣列、**不需要新的 feature**：0.2.0～0.7.0 的 Kairos 對不認得的 `system.*` 名稱只檢查格式（上表的名稱、單位與 label 都符合），原樣保存。
 
 違反時的錯誤：`metrics` 缺漏或型別錯誤（不是陣列、元素缺 `name`／`value`／`unit`、`value` 不是數字、`labels` 不是字串對字串的物件）回 `bad_request`（`seq` 為 `null`，與 v1 的欄位錯誤相同）；格式正確但不符上述限制回 `invalid_report`（帶 `seq`，這筆不保存）。
 
@@ -236,14 +260,14 @@ report 另帶兩個欄位：
 | `superseded` | 同一個 `agent_id` 建立了新連線，舊連線被關閉 | 是 |
 | `auth_failed` | 伺服器啟用 mTLS 時，`hello` 的 `agent_id` 與客戶端憑證不符（`message` 為 `agent_id does not match client certificate`），或憑證含多個 DNS SAN（`message` 為 `client certificate must contain exactly one DNS SAN`）（見「身分驗證」） | 是 |
 | `certificate_rejected` | 伺服器啟用 mTLS 時，收到 `hello` 時重新驗證不通過，或連線期間伺服器重新驗證時發現（見「身分驗證」）。客戶端憑證已被撤銷、過期或不再受信任時 `message` 為 `client certificate has been revoked or is no longer trusted`；伺服器無法判定撤銷狀態（CRL 已過期、或缺少某一層 CA 的 CRL）時 `message` 為 `revocation status unavailable`，屬伺服器端問題，客戶端不需重新簽發憑證 | 是 |
-| `storage_unavailable` | 伺服器沒有保存這筆 `report`；伺服器只在**確定未寫入**時回此錯誤，這筆資料未保存（協商了 `durable` 時 client 稍後重送）。`message` 為 `report could not be stored`（寫入失敗，例如磁碟已滿、資料目錄無法寫入、等待寫入逾時且已取消、當天的資料檔已達伺服器的每日大小上限，或伺服器的主機清冊已滿）或 `report rate limit exceeded`（同一來源的 `report` 送得太快，見「逾時與離線判定」的速率限制） | 否 |
+| `storage_unavailable` | 伺服器沒有保存這筆 `report`；伺服器只在**確定未寫入**時回此錯誤，這筆資料未保存（協商了 `durable` 時 client 稍後重送）。`message` 為 `report could not be stored`（寫入失敗，例如磁碟已滿、資料目錄無法寫入、等待寫入逾時且已取消、當天的資料檔已達伺服器的每日大小上限，或伺服器的主機清冊已滿）或 `report rate limit exceeded`（同一來源的 `report` 送得太快，見「逾時與離線判定」的速率限制）。`inventory` 也以此錯誤表示未保存（`message` 同上，或 `inventory rate limit exceeded`：同一條連線兩則 `inventory` 間隔不到 60 秒；client 稍後重送） | 否 |
 | `bad_request` | 該行不是合法 UTF-8、不是合法 JSON（含超出 f64 範圍的數字）、欄位缺漏或型別錯誤（含 v2 report 的 `metrics`、durable report 的 `boot_id`／`report_seq`）、`hello` 欄位不合限制（含 v2 的版本範圍、features 與主機資訊）、`ts` 超過 64 bytes 或含禁止的字元；另外，伺服器狀態表已滿而無法登記新的 `agent_id` 時，以 fatal 的 `bad_request` 回應 `hello`（`message` 為 `server agent registry is full`） | 否（連續達上限、或狀態表已滿時是） |
 | `unknown_type` | 不認得的 `type` | 否（連續達上限時是） |
 | `already_registered` | 同一連線送了第二次 `hello` | 否 |
 | `renew_requires_approval` | `renew_request`：政策要求人工核准，申請已進入待核准佇列（類型「憑證更新」）；核准後以**同一個 CSR** 重送即得到 `renew_result` | 否 |
 | `invalid_csr` | `renew_request`：`csr` 不是合法的 base64url DER、CSR 不符 ENROLL.md 第 15.1 節（SAN 與這條連線的 `agent_id` 不符、不是 P-256、簽章無效、公鑰與這台主機用過的相同），或同一個 CSR 的申請已被拒絕或逾期 | 否 |
 | `rate_limited` | `renew_request`：同一個 `agent_id` 每小時超過 10 次 | 否 |
-| `invalid_report` | v1 格式：`cpu_usage` 不是有限值或不在 0～100 之間，或 `used_memory` 大於 `total_memory`（Pulse 送出前會先把 `cpu_usage` 夾在 0～100）。v2 的 `metrics`：不符「report（通用指標）」的限制。這筆資料不會保存 | 否 |
+| `invalid_report` | v1 格式：`cpu_usage` 不是有限值或不在 0～100 之間，或 `used_memory` 大於 `total_memory`（Pulse 送出前會先把 `cpu_usage` 夾在 0～100）。v2 的 `metrics`：不符「report（通用指標）」的限制。協商了 `processes` 的 report：`processes` 不符 METRICS.md 的限制；協商了 `inventory` 的 `inventory`：內容不符 METRICS.md 的限制。這筆資料不會保存 | 否 |
 
 **連續無效訊息上限**：同一連線連續 5 則無效訊息（`bad_request` 與 `unknown_type` 合計，中間沒有合法訊息）時，第 5 則改為 fatal 並關閉連線。註冊前與註冊後都適用；`hello` 欄位不合限制也計入。
 

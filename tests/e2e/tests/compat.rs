@@ -243,7 +243,12 @@ fn old_pulse_wire_format_is_unchanged_with_the_lifecycle_features() {
         ],
         "{ack}"
     );
-    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    // 0.8 起 SQLite 後端另宣告 inventory、processes（METRICS.md 第 7.1 節）；0.4 的 Pulse 不認得、忽略
+    assert_eq!(
+        ack["features"],
+        json!(["metrics", "durable", "inventory", "processes"]),
+        "{ack}"
+    );
     assert_eq!(ack["proto"], 2);
     v04.send(&renew);
     assert_eq!(v04.recv(), unknown);
@@ -262,7 +267,7 @@ fn old_pulse_wire_format_is_unchanged_with_the_lifecycle_features() {
     let ack = v05.recv();
     assert_eq!(
         ack["features"],
-        json!(["metrics", "durable", "renew"]),
+        json!(["metrics", "durable", "inventory", "processes", "renew"]),
         "{ack}"
     );
     assert!(ack["expired_renew_grace_days"].is_u64(), "{ack}");

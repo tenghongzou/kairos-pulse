@@ -15,6 +15,9 @@
 //! - 8443 的憑證正常輪替與除役通知（feature `renew`、`deregister`，PROTOCOL.md「憑證輪替與除役」）：
 //!   [`lifecycle`] 模組與 [`ClientMsg`]／[`ServerMsg`] 的對應變體
 //! - 註冊通道（8444 HTTPS，[`ENROLL.md`](../ENROLL.md)）：[`enroll`] 模組
+//! - 指標擴充（商業審計 F4，[`METRICS.md`](../METRICS.md)）：F4 新增的標準指標與計數器速率
+//!   （[`STANDARD_METRICS`]、[`counter_rate`]）、行程排行（feature `processes`，[`ProcessList`]）與
+//!   主機資產（feature `inventory`，[`Inventory`]、[`ClientMsg::Inventory`]）
 //!
 //! 本 crate 只有純函式與資料型別，不做 I/O、不記日誌，也不依賴 tokio；NDJSON 的分行 codec
 //! 與日誌的措辭留在各產品。
@@ -22,15 +25,26 @@
 #![forbid(unsafe_code)]
 
 pub mod enroll;
+mod inventory;
 pub mod lifecycle;
 mod messages;
 mod metrics;
 mod negotiate;
+mod processes;
 mod validate;
+
+#[cfg(test)]
+mod metrics_spec_tests;
 
 #[cfg(test)]
 mod tests;
 
+pub use inventory::{
+    CpuInventory, DISK_KINDS, DiskInventory, FEATURE_INVENTORY, INVENTORY_MIN_INTERVAL_MS,
+    InterfaceInventory, Inventory, InventoryReport, MAX_INTERFACE_ADDRESSES, MAX_INVENTORY_DISKS,
+    MAX_INVENTORY_INTERFACES, MAX_INVENTORY_TEXT_BYTES, MemoryInventory, OsInventory,
+    SystemInventory, inventory_digest, is_ip_cidr, is_mac_address, validate_inventory,
+};
 pub use lifecycle::{
     Deregister, DeregisterAck, FEATURE_DEREGISTER, FEATURE_RENEW, INTENT_DEREGISTER,
     LIFECYCLE_FEATURES, RenewRequest, RenewResult,
@@ -41,14 +55,26 @@ pub use messages::{
     parse_client_msg, parse_server_msg,
 };
 pub use metrics::{
-    METRIC_CPU_USAGE, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL, METRIC_MEMORY_TOTAL,
-    METRIC_MEMORY_USED, METRIC_NETWORK_RECEIVED, METRIC_NETWORK_TRANSMITTED, METRIC_TEMPERATURE,
-    Metric, STANDARD_METRICS, StandardMetric, is_valid_label_key, is_valid_metric_name,
-    is_valid_unit, validate_metric, validate_metrics,
+    CounterSample, LEGACY_STANDARD_METRICS, METRIC_CPU_LOAD_1M, METRIC_CPU_LOAD_5M,
+    METRIC_CPU_LOAD_15M, METRIC_CPU_USAGE, METRIC_DISK_IO_TIME, METRIC_DISK_READ,
+    METRIC_DISK_READ_OPS, METRIC_DISK_WRITE_OPS, METRIC_DISK_WRITTEN, METRIC_FILESYSTEM_AVAILABLE,
+    METRIC_FILESYSTEM_TOTAL, METRIC_FILESYSTEM_USAGE, METRIC_FILESYSTEM_USED,
+    METRIC_MEMORY_AVAILABLE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED,
+    METRIC_NETWORK_ERRORS_RECEIVED, METRIC_NETWORK_ERRORS_TRANSMITTED,
+    METRIC_NETWORK_PACKETS_RECEIVED, METRIC_NETWORK_PACKETS_TRANSMITTED, METRIC_NETWORK_RECEIVED,
+    METRIC_NETWORK_TRANSMITTED, METRIC_PROCESS_COUNT, METRIC_SWAP_TOTAL, METRIC_SWAP_USED,
+    METRIC_TEMPERATURE, METRIC_UPTIME, Metric, MetricKind, STANDARD_METRICS, StandardMetric,
+    counter_rate, filesystem_usage, is_valid_label_key, is_valid_metric_name, is_valid_unit,
+    standard_metric, validate_metric, validate_metrics,
 };
 pub use negotiate::{
     FEATURE_DURABLE, FEATURE_METRICS, ProtoRange, ProtoRangeError, SERVER_FEATURES,
     SUPPORTED_PROTO, Session, client_proto_range, negotiate, unsupported_version_error,
+};
+pub use processes::{
+    FEATURE_PROCESSES, MAX_PROCESS_COMMAND_BYTES, MAX_PROCESS_NAME_BYTES, MAX_TOP_PROCESSES,
+    ProcessEntry, ProcessList, normalize_process_cpu, sanitize_process_command,
+    validate_process_list,
 };
 pub use validate::{
     clamp_heartbeat_interval_ms, is_forbidden_display_char, is_host_fingerprint, is_uuid_text,

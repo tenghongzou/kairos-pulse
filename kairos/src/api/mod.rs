@@ -22,6 +22,7 @@
 
 pub mod account;
 pub mod alerts;
+pub mod assets;
 pub mod audit_log;
 pub mod auth;
 pub mod conn_log;
@@ -648,6 +649,9 @@ fn known_route(rest: &[&str]) -> bool {
             | ["hosts", _, "metrics"]
             | ["hosts", _, "metrics", _]
             | ["hosts", _, "connections"]
+            | ["hosts", _, "inventory"]
+            | ["hosts", _, "inventory", "changes"]
+            | ["hosts", _, "processes"]
             | ["overview"]
             | ["system", "health"]
             | ["events"]
@@ -854,6 +858,19 @@ async fn dispatch(
         ["hosts", id, "metrics", name] => {
             hosts::check_access(ctx, id, &principal.host_access()?).await?;
             metrics::trend(ctx, id, name, query, now).await
+        }
+        ["hosts", id, "inventory"] => {
+            query.reject_unknown(&[], &[])?;
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            assets::inventory(ctx, id, now).await
+        }
+        ["hosts", id, "inventory", "changes"] => {
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            assets::changes(ctx, id, query, now).await
+        }
+        ["hosts", id, "processes"] => {
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            assets::processes(ctx, id, query, now).await
         }
         ["overview"] => {
             query.reject_unknown(&["group"], &[])?;

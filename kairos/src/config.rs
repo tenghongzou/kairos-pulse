@@ -61,11 +61,19 @@ pub const MAX_MAX_HOSTS: usize = 1_000_000;
 
 /// 容量估算（`kairos/STORAGE.md`「容量估算」）：每台主機每 5 秒一筆 report
 pub const ESTIMATE_REPORT_INTERVAL_SECS: u64 = 5;
-/// 容量估算：每筆原始 report 在 SQLite 中的大小（含索引與主機、序列等；Pulse 0.2.0 的 17 個指標
-/// 實測約 235 bytes，見 STORAGE.md「量測」）
-pub const ESTIMATED_RAW_ROW_BYTES: u64 = 240;
-/// 容量估算：每台主機的序列（指標名稱＋label 組合）數
-pub const ESTIMATED_SERIES_PER_HOST: u64 = 20;
+/// 容量估算：每筆原始 report 在 SQLite 中的大小（含索引與主機、序列等）。0.8.0 的 Pulse 在一般伺服器
+/// （2 個掛載點、2 個磁碟 I/O 裝置、2 個介面）約 41 個指標、約 530 bytes（METRICS.md 第 9.6 節；
+/// 0.2.0 的 17 個指標實測約 235 bytes，見 STORAGE.md「量測」）
+pub const ESTIMATED_RAW_ROW_BYTES: u64 = 530;
+/// 容量估算：每台主機彙總的序列（指標名稱＋label 組合）數；計數器只彙總速率（METRICS.md 第 9.6 節）
+pub const ESTIMATED_SERIES_PER_HOST: u64 = 47;
+/// 容量估算：行程快照每台每天的大小（每 60 秒一筆、約 1 KB；保留期限同原始資料）
+pub const ESTIMATED_PROCESS_BYTES_PER_DAY: u64 = 1440 * 1000;
+/// `storage.max_series_per_host` 的預設值（METRICS.md 第 9.1 節）
+pub const DEFAULT_MAX_SERIES_PER_HOST: usize = 2048;
+/// `storage.max_series_per_host` 的範圍
+pub const MIN_MAX_SERIES_PER_HOST: usize = 64;
+pub const MAX_MAX_SERIES_PER_HOST: usize = 65_536;
 /// 容量估算：每列彙總的大小
 pub const ESTIMATED_ROLLUP_ROW_BYTES: u64 = 50;
 
@@ -499,6 +507,9 @@ pub struct StorageSettings {
     /// 主機清冊最多幾台主機（新主機超過時其 report 回 `storage_unavailable`）。未設定時為
     /// `max(100000, limits.max_agents)`，見 [`AppConfig::max_hosts`]
     pub max_hosts: Option<usize>,
+    /// 每台主機最多幾個指標序列（含 Kairos 算出的速率與推算序列）。超過時新序列的指標不保存
+    /// （`KRS-W4104`），其餘照存並回 `ack`（METRICS.md 第 9.1 節）
+    pub max_series_per_host: usize,
 }
 
 impl Default for StorageSettings {
@@ -515,6 +526,7 @@ impl Default for StorageSettings {
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             sqlite_synchronous: SqliteSynchronous::Normal,
             max_hosts: None,
+            max_series_per_host: DEFAULT_MAX_SERIES_PER_HOST,
         }
     }
 }
@@ -1083,7 +1095,8 @@ impl AppConfig {
                 * ESTIMATED_ROLLUP_ROW_BYTES
                 * days(d)
         };
-        raw + rollup(300, self.storage.rollup_5m_retention_days)
+        raw + ESTIMATED_PROCESS_BYTES_PER_DAY * days(self.storage.raw_retention_days)
+            + rollup(300, self.storage.rollup_5m_retention_days)
             + rollup(3600, self.storage.rollup_1h_retention_days)
     }
 
@@ -1371,6 +1384,19 @@ impl AppConfig {
                     self.max_agents(),
                     MAX_MAX_HOSTS,
                     max_hosts
+                ),
+            ));
+        }
+        if !(MIN_MAX_SERIES_PER_HOST..=MAX_MAX_SERIES_PER_HOST)
+            .contains(&self.storage.max_series_per_host)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "storage.max_series_per_host 必須介於 {}..={}（目前為 {}）",
+                    MIN_MAX_SERIES_PER_HOST,
+                    MAX_MAX_SERIES_PER_HOST,
+                    self.storage.max_series_per_host
                 ),
             ));
         }
@@ -1915,25 +1941,33 @@ mod tests {
 
     #[test]
     fn sqlite_estimate_follows_the_documented_formula() {
-        // STORAGE.md「容量估算」：每台每天 原始 17280 × 240 × (7+1) 天
-        // + 5 分鐘 288 × 20 × 50 × (31+1) 天 + 1 小時 24 × 20 × 50 × (400+1) 天
+        // STORAGE.md「容量估算」：每台每天 原始 17280 × 530 × (7+1) 天＋行程快照 1440 × 1000 × (7+1) 天
+        // + 5 分鐘 288 × 47 × 50 × (31+1) 天 + 1 小時 24 × 47 × 50 × (400+1) 天
         let c = AppConfig::default();
-        let per_host = 17280 * 240 * 8 + 288 * 20 * 50 * 32 + 24 * 20 * 50 * 401;
+        let processes = 1440 * 1000 * 8;
+        let per_host = 17280 * 530 * 8 + processes + 288 * 47 * 50 * 32 + 24 * 47 * 50 * 401;
         assert_eq!(c.estimated_sqlite_bytes(1), per_host);
         assert_eq!(c.estimated_sqlite_bytes(1024), 1024 * per_host);
         // 依宣告的 report 間隔：每 60 秒一筆時原始資料少 12 倍，彙總不變
         assert_eq!(c.estimated_sqlite_bytes_per_host(5000), per_host);
         assert_eq!(
             c.estimated_sqlite_bytes_per_host(60_000),
-            1440 * 240 * 8 + 288 * 20 * 50 * 32 + 24 * 20 * 50 * 401
+            1440 * 530 * 8 + processes + 288 * 47 * 50 * 32 + 24 * 47 * 50 * 401
         );
         // 1 秒以下以 1 秒計
         assert_eq!(
             c.estimated_sqlite_bytes_per_host(10),
             c.estimated_sqlite_bytes_per_host(1000)
         );
-        // 預設 1024 台約 53 GB，低於預設上限 64 GiB：不警告
-        assert_eq!(c.total_limit_below_estimate(), None);
+        // 0.8.0 起每台約 129 MB（METRICS.md 第 9.6 節）：預設 1024 台約 132 GB，超過預設上限 64 GiB，
+        // 啟動時警告（D1：不改預設上限，由管理者依規模調整）；500 台以下不警告
+        assert_eq!(
+            c.total_limit_below_estimate(),
+            Some((DEFAULT_MAX_TOTAL_BYTES, 1024 * per_host))
+        );
+        let mut small = AppConfig::default();
+        small.server.max_connections = 500;
+        assert_eq!(small.total_limit_below_estimate(), None);
         let mut big = AppConfig::default();
         big.server.max_connections = 10000;
         let (max, estimate) = big.total_limit_below_estimate().unwrap();

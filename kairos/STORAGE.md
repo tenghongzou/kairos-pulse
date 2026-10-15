@@ -174,6 +174,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v5（0.6.0〔草稿〕，衝刺 5）：告警引擎的資料表 `alert_rules`（規則）、`alert_events`（事件，含彙總的 `parent_id`、處理狀態與通知進度 `notify_state`）、`alert_timeline`（處理紀錄）、`alert_silences`（靜音與維護時段）、`alert_channels`（通知管道；`secrets` 為 AES-256-GCM 密文）、`alert_deliveries`（發送紀錄）、`alert_actions`（CLI 交給執行中的 Kairos 處理的動作）與索引；`meta` 另有 `alerts_config_rev`（規則、靜音、管道的版本）與 `alerts_heartbeat`（停機期間的判斷）。完整的 SQL 見 `store/sqlite.rs` 的 `SCHEMA_V5`，欄位說明見 [`ALERTS.md`](ALERTS.md)。升級到 v5 之後 0.5 的 Kairos 無法開啟；`kairos alerts`、`kairos silences`、`kairos alert-rules`、`kairos alert-channels` 開啟資料庫時同樣會升級 schema。
 - v6（0.6.0〔草稿〕，衝刺 5）：使用者、角色指派、工作階段與 TOTP 復原碼（`users`、`role_assignments`、`sessions`、`user_recovery_codes`），`api_tokens` 的 `owner_user_id`、`role`，`audit_events` 的雜湊鏈欄位 `prev_hash`、`hash`（索引 `audit_events_actor`），`hosts.host_group`（角色指派的範圍）。v6 接在 v5（告警）之後，不依賴 v5 的物件；0.5.0（v4）的資料庫在第一次啟動時依序升級 v5 → v6（各自一個交易），既有的 API token 權限不變（凍結在 0.5，沒有告警與使用者等新權限）。完整的說明見 [`API.md`](API.md) 第 12.10 節。升級後 0.5 的 Kairos 無法開啟；`kairos users`、`kairos audit` 開啟資料庫時同樣會升級 schema。密碼只存 Argon2id 雜湊、工作階段只存 SHA-256、TOTP 秘密以 `data/console.key` 加密（金鑰不在資料庫中，`kairos db backup` 不含它）。
 - v7（0.7.0〔草稿〕，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v8（0.8.0〔草稿〕，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -283,7 +284,7 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 ## 7. 彙總（A9）
 
 - **兩層**：5 分鐘（`rollup_5m`）與 1 小時（`rollup_1h`），每列為一台主機、一個序列、一個時間桶的 `vmin`、`vmax`、`vsum`、`cnt`（平均 = `vsum / cnt`）。
-- **哪些值**：每筆 report 的每個指標（數值以 f64 計）。v1 的三個欄位對應到標準序列：`cpu_usage` → `system.cpu.usage`（`%`），`total_memory`／`used_memory`（MB）× 1048576 → `system.memory.total`／`used`（`By`），與 v2 的指標合併成同一條趨勢。網路流量是累計計數器，彙總的是計數器本身的值（速率由使用端以前後相減計算）。
+- **哪些值**：每筆 report 的每個指標（數值以 f64 計）。v1 的三個欄位對應到標準序列：`cpu_usage` → `system.cpu.usage`（`%`），`total_memory`／`used_memory`（MB）× 1048576 → `system.memory.total`／`used`（`By`），與 v2 的指標合併成同一條趨勢。**計數器**（網路收發、磁碟 I/O 等，METRICS.md 第 3 節）：v8 起只彙總 Kairos 算出的每秒速率序列（第 15.1 節），累計值本身不彙總；v7 以前寫入的累計值彙總保留到保留期限自然刪除。缺少使用率的掛載點另彙總推算的使用率（第 15.2 節）。
 - **怎麼算**：依取樣時間（第 5.2 節）分桶。commit 成功後才把值加進記憶體中尚未寫出的 5 分鐘桶；桶結束 15 秒、且該主機在這個桶 15 秒沒有新值之後（等待排隊中的 report、補送中的桶補完）分批寫出（每步最多約 5000 列，只在主機的邊界切開，每台主機依時間順序），同一個交易中合併進 1 小時彙總（`ON CONFLICT DO UPDATE` 合併 min／max／sum／count），並把這些主機的 `hosts.rollup_until` 推進到桶的結束時間。
 - **遲到的資料**（取樣時間早於 `rollup_until`）在寫入原始資料的同一個交易中直接累加進已寫出的桶（第 5.3 節）。
 - **重新啟動不漏算、不重複算**：啟動時，各主機從 `rollup_until` 起重新讀取原始資料補回記憶體中的桶；已寫出的桶與直接合併的遲到資料不會再算一次（`rollup_until` 與寫出在同一個交易）。commit 結果不明之後也以同樣的方式重建（第 5.1 節）。
@@ -300,6 +301,8 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 | 原始 report | `storage.raw_retention_days` | 7（今天與前 7 天，UTC） |
 | 5 分鐘彙總 | `storage.rollup_5m_retention_days` | 31 |
 | 1 小時彙總 | `storage.rollup_1h_retention_days` | 400 |
+| 行程快照（`process_snapshots`，0.8.0） | 同原始 report | 7 |
+| 資產變更歷史（`inventory_changes`，0.8.0） | 同 1 小時彙總（另有每台主機 1,000 筆的上限） | 400 |
 
 依取樣時間（`reports.ts`、彙總的桶）；與 Pulse 補送的關係見第 5.4 節。0 表示不依時間刪除。啟動後立即執行一次，之後每小時一輪；每一步刪除最多 5000 列（一個交易，每台主機以 `(host_id, ts)` 索引或主鍵範圍刪除），步與步之間讓 report 先寫，不會長時間鎖住資料庫。一輪結束時刪除已沒有任何 report 引用的 `boots` 列，並記一行 `INFO`（刪除的筆數）。
 
@@ -309,7 +312,7 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 
 `storage.max_total_bytes`（預設 64 GiB，0 = 不限制，否則至少 64 MiB）。每 10 秒檢查一次資料庫的使用量 =（`page_count` − `freelist_count`）× `page_size`；超過時依序刪除，每步一個交易：
 
-1. 最舊的原始 report（依寫入順序，每步 5000 筆）；
+1. 最舊的原始 report（依寫入順序，每步 5000 筆）；同一步刪除取樣時間早於剩下最舊一筆原始 report 的行程快照（與原始資料同一層，0.8.0）；
 2. 原始 report 已刪光時，5 分鐘彙總最舊的一天；
 3. 再來是 1 小時彙總最舊的一天。
 
@@ -400,6 +403,16 @@ systemctl start kairos
 **JSONL 匯出**（給原本讀取 `reports-*.jsonl` 的工具）：`kairos reports export --since 1d [--agent <agent_id>] > reports.jsonl`，每行的格式與 JSONL 檔相同（`schema` 1／2；`peer`、`hostname` 為清冊中最後的值）。未指定 `--agent` 時會掃描整個 `reports` 表。
 
 ## 10. 容量估算
+
+> **0.8.0〔草稿〕起**（METRICS.md 第 9.6 節；D1）：Pulse 0.8.0 在一般伺服器（2 個掛載點、2 個磁碟 I/O 裝置、2 個介面）約 41 個指標，每筆約 530 bytes、彙總約 47 個序列（計數器只彙總速率），另有行程快照每台每天約 1.4 MB：
+>
+> ```text
+> 每台主機每天：原始 17280 × 530 ≈ 9.2 MB；行程快照 1440 × 1 KB ≈ 1.4 MB；
+>               5 分鐘 288 × 47 × 50 ≈ 0.68 MB；1 小時 24 × 47 × 50 ≈ 0.056 MB
+> 預設保留期限下每台 ≈ 9.2 × 8 + 1.4 × 8 + 0.68 × 32 + 0.056 × 401 ≈ 129 MB
+> ```
+>
+> 預設上限 64 GiB 約可完整保留 530 台（0.7.0 約 1,200 台）；`server.max_connections` 預設 1024 時啟動會記錄容量不足的警告（`AppConfig::total_limit_below_estimate`）。D1 的建議是不改預設的上限，由管理者依規模調整。下面的舊估算是 0.2.0～0.7.0 的 Pulse（17 個指標）。
 
 以每台主機每 5 秒一筆 report、約 17 個指標（Pulse 0.2.0 的典型值：CPU、記憶體 2、3 個掛載點的容量 6、2 張網卡的流量 4、溫度 4）、約 20 個序列估算（`AppConfig::estimated_sqlite_bytes`）：
 
@@ -603,6 +616,40 @@ sudo systemctl start kairos
 - **結束代碼**：0 完成（有壞行時仍為 0，摘要中有 `KRS-W4306` 警告）、1 有來源無法讀取（其餘照常匯入）或匯入失敗、2 用法錯誤、3 設定錯誤、10 權限不足、11 資料庫使用中。每 2000 行一個交易，中途失敗時已提交的部分保留，修正後重新執行同一個命令即可（已匯入的計入「重複略過」）。
 - **容量**：總容量上限依寫入順序刪除原始 report（第 8.2 節），匯入的舊資料是最後寫入的，會比較晚被刪；匯入後超過 `storage.max_total_bytes` 時 Kairos 會先刪到較新的即時資料。匯入結束時若已超過上限，摘要中有 `KRS-W4202` 警告：請先調高上限或以 `--since` 縮小範圍。
 - 測試：`store::import::tests`（`schema` 1／2／沒有 `schema`、壞行、重複匯入與同一檔案中的重複、Kairos 已保存的 durable 與鏡像中的行、durable 的取樣時間與去重鍵、保留期限、彙總與 Kairos 尚未寫出的彙總和遲到的檔案、既有主機的資訊、時間範圍與主機上限、試執行與實際的計數相同、獨占鎖、內容雜湊）、`import_cli::tests`（參數、目錄的掃描與符號連結、結束代碼）、端對端 `tests/e2e/tests/import.rs`（Kairos 執行中拒絕、停止後匯入、重新啟動後匯出與清冊）。
+
+## 15. 指標擴充（schema v8；0.8.0〔草稿〕）
+
+規格：[`crates/kairos-proto/METRICS.md`](../crates/kairos-proto/METRICS.md) 第 9 節。實作：`store/sqlite.rs`（寫入與補回）、`store/derive.rs`（速率與推算的純計算）、`store/assets.rs`（資產合併與變更歷史）、`store/sqlite_assets.rs`。
+
+### 15.1 計數器的速率序列
+
+- 標準計數器（名稱與單位都相符）寫入時，以 `kairos_proto::counter_rate` 與同一台主機、同一序列的上一筆相減，另存為衍生序列：`name`、`labels` 相同，`unit` 為 `<原單位>/s`，`derived = 1`。速率點的時間為後一筆的取樣時間，**只進彙總**（原始資料只有累計值；主控台 API 查原始解析度時以相鄰兩筆即時計算）。
+- 重置（值變小）、`system.uptime` 變小（重新開機過）、時間沒有前進時沒有速率點（缺口，不補 0）。晚到的資料（取樣時間不晚於上一筆，例如 Pulse 重新啟動、舊的 `boot_id` 還有積壓）不產生速率點，也不更新上一筆。重複的 durable report（去重）不影響上一筆。
+- 上一筆放在記憶體（每台主機、每個計數器序列）。Kairos 重新啟動後：補回彙總時（第 7 節）從 `rollup_until` 之前最近的一筆開始依時間重算；之後第一筆 report 以原始資料中時間最近且早於它的一筆作為上一筆（每台主機只查一次）。交易失敗時與其他快取一起清除、重新載入。
+- `kairos reports import`（0.2 的 JSONL）不計算速率（匯入的累計值照舊彙總；原始解析度的查詢仍可算出速率）。
+
+### 15.2 推算的使用率
+
+同一筆 report 中某個掛載點（同一組 label）有 `system.filesystem.total` 與 `available`、但沒有 `system.filesystem.usage` 時（Pulse 0.2.0～0.7.0），以 `(total − available) ÷ total × 100`（小數 2 位、夾在 0～100）存成 `system.filesystem.usage`、`%`、`derived = 2` 的序列（只進彙總）。保留給 root 的空間算成已使用，比 `df` 略高；主控台標示「推算」。
+
+### 15.3 每台主機的序列數上限
+
+`host_series` 記錄每台主機用過的序列（含衍生序列；主控台 API 以它只列出這台主機的序列）。數量達到 `storage.max_series_per_host`（預設 2048，64～65,536）時，新序列的指標**不保存**，同一筆的其他指標照存並回 `ack`，記 `WARN`「警告 KRS-W4104：主機 … 的指標序列數已達上限 …」（每台主機每小時最多一次），並記下 `hosts.series_limited_at`（主控台 S05 的提示）。原因多半是介面或掛載點名稱不斷變化（容器網路）；全域上限 1,000,000（`SERIES_FULL`）不變。`host_series` 不會自動清除（之後的版本再考慮依彙總的保留期限清除）。
+
+### 15.4 資產與變更歷史
+
+- `host_inventory`（每台主機一列）：合併後的資產（`body`，JSON，不含 `boot_time`）、摘要 `digest`（`kairos_proto::inventory_digest`）、`collected_at`（`inventory` 的 `ts`；無法解析或與收到時間相差太多時為收到時間）、`received_at`、`changed_at`（摘要最後一次改變），以及主機清單篩選用的冗餘欄位。`hosts.boot_time`（Unix 秒）隨每則 `inventory` 更新，不算資產變更。
+- 合併：有出現的 `os`、`cpu`、`memory`、`system` 逐欄覆蓋，省略的欄位保留舊值；`disks`、`network_interfaces` 有出現時整個取代。
+- 變更歷史（`inventory_changes`）：摘要改變時寫入逐欄的差異（第一次收到不寫）。**IPv6 暫時位址**：介面位址的比較中，IPv6 的非 link-local 位址只比較所在的 /64 前綴，同一個前綴內的隱私位址輪換不寫入（Pulse 仍會因摘要改變而重送，目前的資產保存實際的位址）。每台主機最多 1,000 筆（超過時刪最舊的），保留期限見第 8.1 節。
+- `inventory` 在 writer 上與 report 依序寫入（一則一個交易），在第一筆 report 之前到達時同樣建立主機的清冊列。
+
+### 15.5 行程快照
+
+`process_snapshots`（主鍵 host_id＋ts，WITHOUT ROWID；索引 `process_snapshots_ts`）：每筆帶 `processes` 的 report 一列（`ProcessList` 的 JSON），與 report 同一個交易；去重判定為重複的 report 不寫。保留期限與容量刪除與原始資料同一層（第 8 節）。主控台 API 由資料庫讀取最新一筆（規格提到的「registry 中的最新一筆」沒有實作：查詢走主鍵、成本很低）。
+
+### 15.6 JSONL 後端
+
+`storage.backend = "jsonl"` 不宣告 `inventory`、`processes`；新的標準指標照常寫入 `schema` 2 的行。JSONL 鏡像（`storage.jsonl_mirror`）也不輸出 `processes` 與資產（`ReportRecord::processes` 不序列化）。
 
 ## 14. 限制與後續
 

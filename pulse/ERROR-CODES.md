@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（91 個，含 2.7 的 2 個暫定代碼）
+## 2. 已對應的代碼（93 個，含暫定號 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔0.8.0 指標擴充〕與 2.7 的 `PLS-E8205`、`PLS-E8206`〔0.8.0 Windows 服務〕）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -70,6 +70,7 @@
 | `PLS-E3201` | `network.rs` `error_code` | `bad_request`：`server agent registry is full` | `server.full`；連線列 ✗ |
 | `PLS-W2105` | `network.rs` `handle_server_line_in`、`Delivery::on_reply` | `invalid_report`（at-most-once 的日誌；durable 時丟棄並計數） | `report.rejected`；回報列 ⚠「被 Kairos 拒收」 |
 | `PLS-W2107` | `network.rs` `log_unparsable`、`handle_server_line_in`、`durable_reply` | 無法解析的行、註冊後重複的 `hello_ack`、其他非致命 `error` | `server.unexpected` |
+| `PLS-W2108`〔暫定〕 | `inventory.rs` `InventoryConn::on_line` | Kairos 以 `invalid_report`（或其他非 `storage_unavailable` 的非致命 `error`）拒收 `inventory`：同樣的內容不再送，內容改變才再送（METRICS.md 第 6.3 節）。`storage_unavailable` 時改記 `PLS-W4101`／`PLS-W2203`，5 分鐘後重送 | `inventory.rejected`（節流 10 分鐘） |
 | `PLS-W2203` | `network.rs` `storage_code` | `storage_unavailable`：`report rate limit exceeded` | `report.rejected`；回報列 ⚠（退避中） |
 | `PLS-W4101` | `network.rs` `storage_code` | `storage_unavailable`：無法保存（durable 時保留並退避重送） | `report.rejected`；回報列 ⚠「Kairos 暫時無法保存（PLS-W4101）…秒後重送」 |
 
@@ -84,7 +85,8 @@
 | `PLS-W4201` | `log_files.rs` `log_event` | 系統日期異常，暫停清除日誌 | `log.retention_paused` |
 | `PLS-E4002` | `main.rs` `main` | 無法初始化日誌（結束代碼 1） | stderr |
 | `PLS-E8204` | `local_status.rs` `Tracker::write_locked`、`run_writer` | 預設位置（`/var/lib/pulse`、`%ProgramData%\Pulse`）無法寫入而改寫 `logs/status.json`（記一次）；執行中無法寫入（第一次 `WARN`、連續失敗滿 60 秒 `ERROR` 並寫 stderr、之後每 10 分鐘一則 `ERROR` 摘要、其間 `DEBUG`；恢復時記 `status.write_restored`） | `status.write_failed`；前者為「設定」列 ⚠（提示更新 unit），後者 `pulse status` 隨後顯示「未知」 |
-| `PLS-W8005` | `system_info.rs` `Sampler::refresh_and_read`、`check_stuck` | 系統資訊取樣逾時 | `sample.timeout` |
+| `PLS-W8005` | `system_info.rs` `Sampler::refresh_and_read`、`check_stuck`；`inventory.rs` `run_worker` | 系統資訊取樣逾時；收集主機資產超過 10 秒（這次不送 `inventory`，不影響 report） | `sample.timeout` |
+| `PLS-I8009`〔暫定〕 | `system_info.rs` `report_limited` | 部分系統資訊因權限或平台限制無法取得，每個項目只記一次 `INFO`：系統序號（Linux 沒有 `/run/pulse/product_serial` 且不是 root、或 SMBIOS 沒有序號）、磁碟 I/O（讀不到 `/proc/diskstats`；Windows 讀不到效能計數器）、行程（只看得到自己的行程，例如 `ProtectProc=invisible`）。METRICS.md 第 4.5 節；`8006`～`8008` 保留給安裝前檢查 | `sysinfo.limited` |
 
 ### 2.5 `pulse status` 專用
 
@@ -148,7 +150,9 @@
 | `agent.start`、`agent.stop`、`agent.fatal` | 1000、1001、1020 | `main.rs` | ✓ |
 | `config.warning` | 1003 | `main.rs`、`tls.rs` | ✓ |
 | `identity.loaded`、`identity.created` | 1004、1005 | `main.rs` | ✓ |
-| `sample.timeout` | 1030 | `system_info.rs` | ✓ |
+| `sample.timeout` | 1030 | `system_info.rs`、`inventory.rs` | ✓（0.8.0 起含主機資產的收集逾時） |
+| `sysinfo.snapshot` | 1010 | `system_info.rs` `Extras::log_skipped` | 部分（0.8.0〔草稿〕）：只記超過每類上限而略過的掛載點、磁碟 I/O 裝置、網路介面（`skipped_*`），第一次取樣時一則、之後每 24 小時最多一則；啟動時的完整系統資訊仍是沒有事件的 INFO 行 |
+| `sysinfo.limited`、`inventory.rejected` | 〔待分配〕 | `system_info.rs` `report_limited`、`inventory.rs` | ✓（0.8.0〔草稿〕；設計包沒有，事件名稱與識別碼待設計組確認，見 METRICS.md 第 14 節） |
 | `conn.registered`、`conn.lost`、`conn.restored`、`conn.outage` | 2000、2001、2003、2004 | `network.rs` | ✓（`conn.restored` 附待補送筆數與丟棄筆數） |
 | `tls.server_cert_rejected`、`auth.*`、`conn.superseded`、`proto.incompatible`、`server.full` | 2100～2301 | `network.rs` `disconnect_event` | ✓ |
 | `report.rejected`、`report.skipped`、`server.unexpected` | 2400～2402 | `network.rs` | ✓ |
@@ -158,7 +162,7 @@
 | `buffer.opened`、`buffer.unavailable`、`buffer.write_failed`、`buffer.full`、`buffer.expired`、`buffer.replay_done` | 5010～5015 | `main.rs`、`spool.rs`、`network.rs` | ✓ |
 | `status.write_failed`、`status.write_restored` | 5020、5021 | `local_status.rs` | ✓（設計包 §26 補登） |
 | `conn.retry`、`conn.retry_summary` | —、2002 | — | 待辦（§4） |
-| `config.loaded`、`identity.clone_suspected`、`sysinfo.snapshot` | 1002、1006、1010 | — | 待辦 |
+| `config.loaded`、`identity.clone_suspected` | 1002、1006 | — | 待辦 |
 | `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | `main.rs` `connection_loop`、`rotation.rs`、`enroll/service.rs` | ✓（0.5〔草稿〕） |
 | `install.decommission_unreported`、`install.withdrawal_unreported` | 4002、4005 | `decommission.rs`、`enroll/cli.rs` | ✓（`pulse decommission`、`pulse enroll --cancel`；沒有初始化日誌時只寫 stderr） |
 | `enroll.submitted`～`enroll.request_expired`、`enroll.rate_limited`～`enroll.clock_rejected` | 4100～4105、4108～4112 | `enroll/service.rs` `ServiceObserver` | ✓（服務在背景接續申請時；`pulse enroll` 只輸出到終端機） |

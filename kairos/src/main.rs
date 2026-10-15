@@ -828,6 +828,7 @@ async fn run(
         writer: writer_task,
         inventory,
         restored,
+        assets,
     } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
 
     let listener = TcpListener::bind(&config.server.listen)
@@ -1018,6 +1019,7 @@ async fn run(
         },
         report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
         enroll: enroll_service.clone(),
+        assets,
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 

@@ -77,7 +77,29 @@ export function render(ctx) {
     pageHead({
       title: t('alerts.rules.title'),
       crumbs: [{ text: t('nav.section.alerts'), href: '/alerts/events' }, { text: t('alerts.rules.title') }],
-      actions: canWrite ? h('a', { class: 'ds-button ds-button--primary', href: '/alerts/rules/new' }, icon('plus'), t('alerts.rules.new')) : null,
+      actions: canWrite
+        ? [
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'ds-button ds-button--secondary',
+                'aria-haspopup': 'menu',
+                on: {
+                  click: (ev) =>
+                    openMenu(
+                      ev.currentTarget,
+                      ['cpu90', 'disk90', 'disk95'].map((k) => ({ text: t(`alerts.template.${k}`), onSelect: () => navigate(`/alerts/rules/new${qs({ template: k })}`) })),
+                      { label: t('alerts.rules.templates') },
+                    ),
+                },
+              },
+              t('alerts.rules.templates'),
+              icon('chevron-down'),
+            ),
+            h('a', { class: 'ds-button ds-button--primary', href: '/alerts/rules/new' }, icon('plus'), t('alerts.rules.new')),
+          ]
+        : null,
     }),
     canWrite ? null : inlineAlert({ kind: 'info', title: t('alerts.readOnly'), body: t('alerts.rules.readOnlyBody') }),
     h('section', { class: 'ds-filterbar', 'aria-label': t('alerts.rules.filters') }, h('div', { class: 'ds-filterbar__row' }, searchField), selRow),

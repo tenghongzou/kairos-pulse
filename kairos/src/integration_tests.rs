@@ -66,6 +66,8 @@ struct Options {
     reports: Option<ReportSink>,
     /// 日誌節流的時間窗
     throttle_interval: Duration,
+    /// 以 SQLite 後端保存（`<dir>/kairos.db`；宣告 `inventory`、`processes`）。預設為 JSONL
+    sqlite: bool,
 }
 
 impl Default for Options {
@@ -80,6 +82,7 @@ impl Default for Options {
             timeouts: TimeoutSettings::default(),
             reports: None,
             throttle_interval: crate::throttle::DEFAULT_INTERVAL,
+            sqlite: false,
         }
     }
 }
@@ -105,8 +108,33 @@ impl Server {
         std::fs::create_dir_all(&dir).unwrap();
         let tls_paths = Self::tls_paths(&dir, opts.mtls_crls.as_deref());
         let tls = Arc::new(TlsState::new(tls::build(&tls_paths).unwrap()));
-        let reports = match opts.reports {
-            Some(sink) => sink,
+        let (reports, assets) = match opts.reports {
+            Some(sink) => (sink, None),
+            None if opts.sqlite => {
+                let o = crate::store::sqlite::SqliteOptions {
+                    path: dir.join(crate::store::sqlite::DB_FILE),
+                    synchronous: crate::config::SqliteSynchronous::Normal,
+                    raw_retention_days: 7,
+                    rollup_5m_retention_days: 31,
+                    rollup_1h_retention_days: 400,
+                    max_total_bytes: 0,
+                    max_hosts: 1000,
+                    max_series_per_host: crate::config::DEFAULT_MAX_SERIES_PER_HOST,
+                    mtls: false,
+                };
+                let (store, _) = crate::store::sqlite::SqliteStore::open(o, Utc::now).unwrap();
+                let (sink, rx) = report_channel(1024);
+                let (asink, arx) = crate::store::asset_channel(16);
+                let (_feed, inventory_rx) = tokio::sync::watch::channel(None);
+                tokio::spawn(crate::store::run_store_writer_with_assets(
+                    store,
+                    rx,
+                    Some(arx),
+                    inventory_rx,
+                    None,
+                ));
+                (sink, Some(asink))
+            }
             None => {
                 let (sink, writer) = start_report_writer(
                     dir.join("data"),
@@ -118,7 +146,7 @@ impl Server {
                 .await
                 .unwrap();
                 tokio::spawn(writer);
-                sink
+                (sink, None)
             }
         };
         let registry = Arc::new(Registry::with_max_agents(opts.max_agents));
@@ -140,6 +168,7 @@ impl Server {
             binding: BindingPolicy::default(),
             report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
             enroll: None,
+            assets,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1817,4 +1846,228 @@ async fn durable_fields_are_ignored_when_not_negotiated() {
     let lines = durable_lines(&server);
     assert_eq!(lines.len(), 3, "未協商 durable 時不去重");
     assert!(lines.iter().all(|l| l.get("boot_id").is_none()));
+}
+
+// ---- 指標擴充：processes、inventory（crates/kairos-proto/METRICS.md） ----
+
+const METRICS_SPEC: &str = include_str!("../../crates/kairos-proto/METRICS.md");
+
+/// METRICS.md「範例」節中某個小節的訊息：(方向 `P`／`K`, JSON)
+fn spec_messages(section: &str) -> Vec<(char, Value)> {
+    // 換行可能是 CRLF（Windows 的 checkout）
+    let heading = format!("### {section}");
+    let start = METRICS_SPEC
+        .match_indices(&heading)
+        .map(|(i, _)| i)
+        .find(|i| {
+            matches!(
+                METRICS_SPEC.as_bytes().get(i + heading.len()),
+                Some(b'\r' | b'\n')
+            )
+        })
+        .unwrap_or_else(|| panic!("METRICS.md 沒有小節 {section}"));
+    let rest = &METRICS_SPEC[start..];
+    let block = rest.split("```").nth(1).unwrap();
+    block
+        .lines()
+        .filter_map(|l| {
+            let (dir, json) = l.trim_end().split_once(' ')?;
+            let dir = dir.chars().next()?;
+            matches!(dir, 'P' | 'K').then(|| (dir, serde_json::from_str(json).unwrap()))
+        })
+        .collect()
+}
+
+fn sqlite_server_options() -> Options {
+    Options {
+        sqlite: true,
+        ..Options::default()
+    }
+}
+
+impl Server {
+    fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.dir.join(crate::store::sqlite::DB_FILE)).unwrap()
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        self.db().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn metrics_spec_examples_get_the_documented_responses() {
+    let server = Server::start(sqlite_server_options()).await;
+    let mut c = Client::connect(server.addr).await;
+    let msgs = spec_messages("協商與 report");
+    // hello → hello_ack（server_time 以外與範例相同）
+    assert_eq!(msgs[0].0, 'P');
+    c.send(&msgs[0].1.to_string()).await;
+    let mut ack = c.recv().await;
+    let mut expected = msgs[1].1.clone();
+    ack.as_object_mut().unwrap().remove("server_time");
+    expected.as_object_mut().unwrap().remove("server_time");
+    assert_eq!(ack, expected);
+    // report（新指標、processes、durable）→ ack
+    c.send(&msgs[2].1.to_string()).await;
+    assert_eq!(c.recv().await, msgs[3].1);
+    // inventory → ack
+    let inv = spec_messages("inventory");
+    c.send(&inv[0].1.to_string()).await;
+    assert_eq!(c.recv().await, inv[1].1);
+    // 60 秒內再送一次 → storage_unavailable；內容不合法 → invalid_report（不受 60 秒限制）
+    let errors = spec_messages("錯誤");
+    let mut again = inv[0].1.clone();
+    again["seq"] = json!(4);
+    c.send(&again.to_string()).await;
+    assert_eq!(c.recv().await, errors[0].1);
+    let mut bad = inv[0].1.clone();
+    bad["seq"] = json!(5);
+    bad["inventory"]["network_interfaces"][0]["mac"] = json!("52-54-00-12-34-56");
+    c.send(&bad.to_string()).await;
+    assert_eq!(c.recv().await, errors[1].1);
+    // 型別錯誤（協商了 inventory）：bad_request，seq 為 null
+    let mut wrong = inv[0].1.clone();
+    wrong["seq"] = json!(6);
+    wrong["inventory"]["memory"]["total"] = json!("8G");
+    c.send(&wrong.to_string()).await;
+    let err = c.expect_error("bad_request", false).await;
+    assert_eq!(err["seq"], Value::Null);
+    // 保存的內容：行程快照、資產、速率與推算以外的序列
+    c.send(&heartbeat(7)).await;
+    assert_eq!(c.recv().await["type"], "ack");
+    assert_eq!(server.count("SELECT count(*) FROM process_snapshots"), 1);
+    assert_eq!(server.count("SELECT count(*) FROM host_inventory"), 1);
+    assert_eq!(
+        server.count("SELECT cpu_logical_cores FROM host_inventory"),
+        64
+    );
+    assert_eq!(
+        server.count("SELECT count(*) FROM hosts WHERE boot_time IS NOT NULL"),
+        1
+    );
+    // 36 個指標都是新序列（每主機上限 2048 之內）
+    assert_eq!(server.count("SELECT count(*) FROM host_series"), 36);
+    // registry：協商結果與資產摘要（告警的每核心負載）
+    let live = server.registry.live_get(ID).unwrap();
+    assert_eq!((live.inventory, live.processes), (Some(true), Some(true)));
+    // 最近一次被拒的資產（KRS-W2108；主控台 S05 的提示）
+    assert!(live.inventory_rejected.as_ref().unwrap().1.contains("mac"));
+    assert_eq!(live.assets.unwrap().logical_cores, Some(64));
+    let last = live.last_report.unwrap();
+    assert_eq!(last.detail.filesystems.len(), 2);
+    assert_eq!(last.detail.uptime_secs, Some(1_532_941));
+}
+
+#[tokio::test]
+async fn processes_are_validated_only_when_negotiated() {
+    let server = Server::start(sqlite_server_options()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "processes"]).to_string())
+        .await;
+    let ack = c.recv().await;
+    assert_eq!(
+        ack["features"],
+        json!(["metrics", "durable", "inventory", "processes"])
+    );
+    let with = |seq: u64, processes: Value| {
+        let mut r: Value = serde_json::from_str(&metrics_report(seq, 1.0)).unwrap();
+        r["processes"] = processes;
+        r.to_string()
+    };
+    // cpu_usage 超過 100：invalid_report（不保存）
+    c.send(&with(
+        2,
+        json!({"top_cpu": [{"pid": 1, "name": "x", "cpu_usage": 120.0, "memory": 1}]}),
+    ))
+    .await;
+    let err = c.expect_error("invalid_report", false).await;
+    assert_eq!(err["seq"], 2);
+    assert!(
+        err["message"].as_str().unwrap().starts_with("processes"),
+        "{err}"
+    );
+    // 型別錯誤：bad_request
+    c.send(&with(3, json!({"top_cpu": [{"pid": -1}]}))).await;
+    c.expect_error("bad_request", false).await;
+    c.send(&with(
+        4,
+        json!({"top_memory": [{"pid": 9, "name": "java", "cpu_usage": 1.0, "memory": 5}]}),
+    ))
+    .await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":4}));
+    assert_eq!(server.count("SELECT count(*) FROM process_snapshots"), 1);
+    assert_eq!(server.count("SELECT count(*) FROM reports"), 1);
+    // 沒有協商 inventory：inventory 為不認得的 type
+    let inv = spec_messages("inventory");
+    c.send(&inv[0].1.to_string()).await;
+    c.expect_error("unknown_type", false).await;
+    assert_eq!(server.count("SELECT count(*) FROM host_inventory"), 0);
+}
+
+#[tokio::test]
+async fn jsonl_backend_does_not_declare_inventory_or_processes() {
+    // METRICS.md 第 7.2、9.5 節：JSONL 後端只有 metrics、durable；processes 被忽略，新指標照存
+    let server = Server::start(Options::default()).await;
+    let mut c = Client::connect(server.addr).await;
+    let msgs = spec_messages("協商與 report");
+    c.send(&msgs[0].1.to_string()).await;
+    let ack = c.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]));
+    let mut report = msgs[2].1.clone();
+    report["processes"] = json!("沒有協商時型別錯誤也不檢查");
+    c.send(&report.to_string()).await;
+    assert_eq!(c.recv().await, msgs[3].1);
+    let line = server.last_report_line();
+    assert_eq!(line["metrics"].as_array().unwrap().len(), 36);
+    assert!(line.get("processes").is_none(), "{line}");
+    let inv = spec_messages("inventory");
+    c.send(&inv[0].1.to_string()).await;
+    c.expect_error("unknown_type", false).await;
+    // 格式錯誤的 inventory 也與舊版相同
+    c.send(r#"{"type":"inventory","seq":9,"ts":1}"#).await;
+    c.expect_error("unknown_type", false).await;
+}
+
+#[tokio::test]
+async fn old_pulse_metrics_get_estimated_usage_on_the_new_server() {
+    // 0.2.0～0.7.0 的 Pulse（只有 8 個指標、不宣告新 feature）× 0.8.0 Kairos（SQLite）
+    let server = Server::start(sqlite_server_options()).await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "durable"]).to_string())
+        .await;
+    assert_eq!(c.recv().await["type"], "hello_ack");
+    let old = |seq: u64, ts: &str, rx: u64| {
+        json!({
+            "type": "report", "seq": seq, "ts": ts,
+            "boot_id": "0b5e3c1d-7a2f-4e8b-9c6d-5f4a3b2c1d0e", "report_seq": seq,
+            "metrics": [
+                {"name": "system.cpu.usage", "value": 5.0, "unit": "%"},
+                {"name": "system.filesystem.total", "value": 1000, "unit": "By", "labels": {"mountpoint": "/", "fstype": "ext4"}},
+                {"name": "system.filesystem.available", "value": 400, "unit": "By", "labels": {"mountpoint": "/", "fstype": "ext4"}},
+                {"name": "system.network.received", "value": rx, "unit": "By", "labels": {"device": "eth0"}}
+            ]
+        })
+        .to_string()
+    };
+    let now = Utc::now();
+    let t0 = crate::storage::fmt_time(now - chrono::Duration::seconds(10));
+    let t1 = crate::storage::fmt_time(now - chrono::Duration::seconds(5));
+    c.send(&old(2, &t0, 1000)).await;
+    assert_eq!(c.recv().await["type"], "ack");
+    c.send(&old(3, &t1, 6000)).await;
+    assert_eq!(c.recv().await["type"], "ack");
+    let last = server.registry.live_get(ID).unwrap().last_report.unwrap();
+    let fs = &last.detail.filesystems[0];
+    assert_eq!((fs.usage, fs.estimated), (Some(60.0), true));
+    assert_eq!(last.detail.network[0].rx_rate, Some(1000.0));
+    // 推算序列與速率序列已建立（彙總在桶結束後寫出）
+    assert_eq!(
+        server.count("SELECT count(*) FROM series WHERE derived = 2"),
+        1
+    );
+    assert_eq!(
+        server.count("SELECT count(*) FROM series WHERE derived = 1"),
+        1
+    );
 }

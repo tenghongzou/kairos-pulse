@@ -16,7 +16,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -25,11 +25,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::codec::{self, AgentTs, BYTES_PER_MB, FORMAT_LEGACY, FORMAT_METRICS, canonical_labels};
+use super::derive;
 use super::rollup::{BUCKET_1H_SECS, Rollup, RollupRow, aggregate, bucket_start};
 use super::{ReportStore, sample_time_ms};
 use crate::config::{AppConfig, SqliteSynchronous};
 use crate::fsperm;
-use crate::protocol::{HostInfo, METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED};
+use crate::protocol::{
+    HostInfo, METRIC_CPU_USAGE, METRIC_MEMORY_TOTAL, METRIC_MEMORY_USED, Metric,
+};
 use crate::registry::{
     AgentSnapshot, LastReport, OFFLINE_RETENTION, RegistrySnapshot, RestoredAgent,
 };
@@ -37,6 +40,9 @@ use crate::retention::log_guard_event;
 use crate::storage::{Clock, RecordBody, ReportRecord, WriteStatus};
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
+
+#[path = "sqlite_assets.rs"]
+mod sqlite_assets;
 
 /// 資料庫檔名（放在 `storage.data_dir`）
 pub const DB_FILE: &str = "kairos.db";
@@ -606,6 +612,80 @@ const SCHEMA_V7: &str = "
 ALTER TABLE audit_events ADD COLUMN hmac TEXT;
 ";
 
+/// schema v8（0.8〔草稿〕）：指標擴充（`crates/kairos-proto/METRICS.md` 第 9 節）。
+///
+/// - `series` 加上 `derived`（0 原始、1 由計數器算出的每秒速率、2 推算值），唯一鍵改為
+///   (name, unit, labels, derived)：推算的磁碟使用率與 Pulse 送的使用率名稱、單位、label 都相同。
+///   SQLite 無法修改唯一鍵，因此重建資料表（`series_id` 不變，彙總與原始資料的引用照舊有效）。
+/// - `host_series`：每台主機用過的序列（主控台只列出這台主機的序列、每主機序列數上限
+///   `storage.max_series_per_host`）。既有的資料由彙總表補上；只出現在尚未彙總的原始資料中的序列
+///   在下一筆 report 寫入時補上。
+/// - `hosts.boot_time`、`host_inventory`（目前的資產）、`inventory_changes`（資產變更歷史）、
+///   `process_snapshots`（行程排行，保留期限同原始資料）。
+///
+/// 外鍵（`REFERENCES … ON DELETE CASCADE`）記錄資料之間的關係；Kairos 目前沒有刪除主機的功能，
+/// 也未開啟 `PRAGMA foreign_keys`。0.7 無法開啟 v8 的資料庫（降版從備份還原）。
+const SCHEMA_V8: &str = "
+CREATE TABLE series_v8 (
+    series_id INTEGER PRIMARY KEY,
+    name      TEXT NOT NULL,
+    unit      TEXT NOT NULL,
+    labels    TEXT NOT NULL,
+    derived   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (name, unit, labels, derived)
+);
+INSERT INTO series_v8 (series_id, name, unit, labels, derived)
+    SELECT series_id, name, unit, labels, 0 FROM series;
+DROP TABLE series;
+ALTER TABLE series_v8 RENAME TO series;
+CREATE INDEX series_name ON series (name);
+
+CREATE TABLE host_series (
+    host_id   INTEGER NOT NULL REFERENCES hosts (host_id) ON DELETE CASCADE,
+    series_id INTEGER NOT NULL,
+    PRIMARY KEY (host_id, series_id)
+) WITHOUT ROWID;
+INSERT OR IGNORE INTO host_series (host_id, series_id)
+    SELECT DISTINCT host_id, series_id FROM rollup_1h;
+INSERT OR IGNORE INTO host_series (host_id, series_id)
+    SELECT DISTINCT host_id, series_id FROM rollup_5m;
+
+ALTER TABLE hosts ADD COLUMN boot_time INTEGER;
+ALTER TABLE hosts ADD COLUMN series_limited_at INTEGER;
+
+CREATE TABLE host_inventory (
+    host_id           INTEGER PRIMARY KEY REFERENCES hosts (host_id) ON DELETE CASCADE,
+    digest            TEXT NOT NULL,
+    body              TEXT NOT NULL,
+    collected_at      INTEGER NOT NULL,
+    received_at       INTEGER NOT NULL,
+    changed_at        INTEGER NOT NULL,
+    os_family         TEXT,
+    cpu_model         TEXT,
+    cpu_logical_cores INTEGER,
+    memory_total      INTEGER,
+    vendor            TEXT,
+    product           TEXT,
+    serial            TEXT
+);
+
+CREATE TABLE inventory_changes (
+    id         INTEGER PRIMARY KEY,
+    host_id    INTEGER NOT NULL REFERENCES hosts (host_id) ON DELETE CASCADE,
+    changed_at INTEGER NOT NULL,
+    changes    TEXT NOT NULL
+);
+CREATE INDEX inventory_changes_host ON inventory_changes (host_id, changed_at);
+
+CREATE TABLE process_snapshots (
+    host_id INTEGER NOT NULL REFERENCES hosts (host_id) ON DELETE CASCADE,
+    ts      INTEGER NOT NULL,
+    body    BLOB NOT NULL,
+    PRIMARY KEY (host_id, ts)
+) WITHOUT ROWID;
+CREATE INDEX process_snapshots_ts ON process_snapshots (ts);
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -636,10 +716,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 7,
         sql: SCHEMA_V7,
     },
+    Migration {
+        version: 8,
+        sql: SCHEMA_V8,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";
@@ -723,6 +807,11 @@ const META_RETENTION_GUARD: &str = "retention_guard";
 /// 日誌中稱呼 SQLite 中的資料的名稱（DateGuard 的事件訊息）
 const GUARD_LABEL: &str = " SQLite 資料";
 
+/// 每台主機的序列數已達上限（METRICS.md 第 9.1、14 節；設計包 `copywriting.md` 範例 97，2026-10-15 正式分配）
+pub const CODE_SERIES_CAPPED: &str = "KRS-W4104";
+/// 同一台主機「序列數已達上限」的日誌間隔
+const SERIES_CAP_LOG_INTERVAL: Duration = Duration::from_secs(3600);
+
 const HOSTS_FULL: &str = "主機清冊已達上限（storage.max_hosts），不接受新主機的 report";
 const SERIES_FULL: &str = "指標序列數已達上限，不接受含新序列的 report";
 
@@ -736,6 +825,8 @@ pub struct SqliteOptions {
     pub rollup_1h_retention_days: u32,
     pub max_total_bytes: u64,
     pub max_hosts: usize,
+    /// 每台主機的序列數上限（`storage.max_series_per_host`）
+    pub max_series_per_host: usize,
     /// 伺服器是否啟用 mTLS（agent_id 與客戶端憑證綁定），寫入 `hosts.identity_verified`
     pub mtls: bool,
 }
@@ -750,6 +841,7 @@ impl SqliteOptions {
             rollup_1h_retention_days: config.storage.rollup_1h_retention_days,
             max_total_bytes: config.storage.max_total_bytes,
             max_hosts: config.max_hosts(),
+            max_series_per_host: config.storage.max_series_per_host,
             mtls: config.auth.client_ca_path().is_some(),
         }
     }
@@ -1073,14 +1165,30 @@ struct HostEntry {
     synced: Option<(u64, i64)>,
 }
 
+/// 衍生計算需要的序列資訊（[`derive::Role`] 不是 `Other` 的序列）
+#[derive(Debug, Clone)]
+pub(super) struct SeriesInfo {
+    pub name: String,
+    pub unit: String,
+    pub labels: String,
+    pub role: derive::Role,
+}
+
 /// 主機、序列與 boot 的快取。交易失敗時整個清空、下一次寫入前從資料庫重新載入
 /// （失敗的交易中新建立的編號已不存在）
 #[derive(Debug, Default)]
 pub(super) struct Caches {
     loaded: bool,
     hosts: HashMap<String, HostEntry>,
-    /// `name \x1f unit \x1f labels` → series_id
+    /// `name \x1f unit \x1f labels`（衍生序列另加 `\x1f derived`）→ series_id
     series: HashMap<String, i64>,
+    /// 計數器、uptime、檔案系統容量等序列（衍生計算用；其他序列不在這裡）
+    roles: HashMap<i64, Arc<SeriesInfo>>,
+    /// 每台主機用過的序列（`host_series`）
+    host_series: HashMap<i64, HashSet<i64>>,
+    /// 每台主機各計數器序列的上一筆（速率計算）；已載入「上一筆」的主機在 `seeded` 中
+    counters: HashMap<i64, derive::CounterState>,
+    seeded: HashSet<i64>,
     /// 每台主機最近一次使用的 boot：(boot_id, boot_ref)
     boots: HashMap<i64, (String, i64)>,
     /// v1 三欄位對應的標準序列：cpu、memory.total、memory.used
@@ -1106,23 +1214,46 @@ impl Caches {
             let (agent_id, entry) = row?;
             caches.hosts.insert(agent_id, entry);
         }
-        let mut stmt = conn.prepare("SELECT series_id, name, unit, labels FROM series")?;
+        let mut stmt = conn.prepare("SELECT series_id, name, unit, labels, derived FROM series")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                series_key(
-                    &r.get::<_, String>(1)?,
-                    &r.get::<_, String>(2)?,
-                    &r.get::<_, String>(3)?,
-                ),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })?;
         for row in rows {
-            let (id, key) = row?;
-            caches.series.insert(key, id);
+            let (id, name, unit, labels, derived) = row?;
+            caches
+                .series
+                .insert(series_key_derived(&name, &unit, &labels, derived), id);
+            caches.note_role(id, name, unit, labels, derived);
+        }
+        let mut stmt = conn.prepare("SELECT host_id, series_id FROM host_series")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (host, series) = row?;
+            caches.host_series.entry(host).or_default().insert(series);
         }
         caches.loaded = true;
         Ok(caches)
+    }
+
+    fn note_role(&mut self, id: i64, name: String, unit: String, labels: String, derived: i64) {
+        let role = derive::role_of(&name, &unit, derived);
+        if role != derive::Role::Other {
+            self.roles.insert(
+                id,
+                Arc::new(SeriesInfo {
+                    name,
+                    unit,
+                    labels,
+                    role,
+                }),
+            );
+        }
     }
 
     /// report 的主機編號；第一次出現的主機在清冊中新增一列。清冊已滿時為 `None`
@@ -1133,7 +1264,27 @@ impl Caches {
         ts_ms: i64,
         opts: &SqliteOptions,
     ) -> rusqlite::Result<Option<i64>> {
-        if let Some(e) = self.hosts.get(record.agent_id.as_str()) {
+        self.host_id_of(
+            tx,
+            &record.agent_id,
+            &record.hostname,
+            &record.peer,
+            ts_ms,
+            opts,
+        )
+    }
+
+    /// 主機編號（[`Caches::host_id`]，也用於資產等不是 report 的寫入）
+    fn host_id_of(
+        &mut self,
+        tx: &Transaction,
+        agent_id: &str,
+        hostname: &str,
+        peer: &str,
+        ts_ms: i64,
+        opts: &SqliteOptions,
+    ) -> rusqlite::Result<Option<i64>> {
+        if let Some(e) = self.hosts.get(agent_id) {
             return Ok(Some(e.host_id));
         }
         if self.hosts.len() >= opts.max_hosts {
@@ -1142,15 +1293,15 @@ impl Caches {
         tx.execute(
             "INSERT INTO hosts (agent_id, hostname, peer, identity_verified, online, first_seen, last_seen)
              VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5) ON CONFLICT (agent_id) DO NOTHING",
-            params![record.agent_id, record.hostname, record.peer, opts.mtls, ts_ms],
+            params![agent_id, hostname, peer, opts.mtls, ts_ms],
         )?;
         let (host_id, rollup_until) = tx.query_row(
             "SELECT host_id, rollup_until FROM hosts WHERE agent_id = ?1",
-            [&record.agent_id],
+            [agent_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         self.hosts.insert(
-            record.agent_id.clone(),
+            agent_id.to_string(),
             HostEntry {
                 host_id,
                 rollup_until,
@@ -1160,7 +1311,7 @@ impl Caches {
         Ok(Some(host_id))
     }
 
-    /// 序列編號；第一次出現時新增。數量已達 [`MAX_SERIES`] 時為 `None`
+    /// 序列編號（原始序列）；第一次出現時新增。數量已達 [`MAX_SERIES`] 時為 `None`
     pub(super) fn series_id(
         &mut self,
         tx: &Transaction,
@@ -1168,8 +1319,25 @@ impl Caches {
         unit: &str,
         labels: &str,
     ) -> rusqlite::Result<Option<i64>> {
+        self.series_id_derived(tx, name, unit, labels, derive::DERIVED_NONE)
+    }
+
+    /// 序列編號（`derived` 見 [`derive::DERIVED_RATE`] 等）；第一次出現時新增。數量已達
+    /// [`MAX_SERIES`] 時為 `None`
+    pub(super) fn series_id_derived(
+        &mut self,
+        tx: &Transaction,
+        name: &str,
+        unit: &str,
+        labels: &str,
+        derived: i64,
+    ) -> rusqlite::Result<Option<i64>> {
         self.key.clear();
         push_series_key(&mut self.key, name, unit, labels);
+        if derived != derive::DERIVED_NONE {
+            self.key.push('\u{1f}');
+            self.key.push_str(&derived.to_string());
+        }
         if let Some(&id) = self.series.get(self.key.as_str()) {
             return Ok(Some(id));
         }
@@ -1177,17 +1345,48 @@ impl Caches {
             return Ok(None);
         }
         tx.execute(
-            "INSERT INTO series (name, unit, labels) VALUES (?1, ?2, ?3)
-             ON CONFLICT (name, unit, labels) DO NOTHING",
-            params![name, unit, labels],
+            "INSERT INTO series (name, unit, labels, derived) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (name, unit, labels, derived) DO NOTHING",
+            params![name, unit, labels, derived],
         )?;
         let id: i64 = tx.query_row(
-            "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = ?3",
-            params![name, unit, labels],
+            "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = ?3 AND derived = ?4",
+            params![name, unit, labels, derived],
             |r| r.get(0),
         )?;
         self.series.insert(self.key.clone(), id);
+        self.note_role(
+            id,
+            name.to_string(),
+            unit.to_string(),
+            labels.to_string(),
+            derived,
+        );
         Ok(Some(id))
+    }
+
+    /// 這台主機可以使用這個序列：已用過、或尚未達 `cap`（新序列寫入 `host_series`）。
+    /// 已達上限時回傳 `false`（這個指標不保存）
+    pub(super) fn admit(
+        &mut self,
+        tx: &Transaction,
+        host_id: i64,
+        series_id: i64,
+        cap: usize,
+    ) -> rusqlite::Result<bool> {
+        let set = self.host_series.entry(host_id).or_default();
+        if set.contains(&series_id) {
+            return Ok(true);
+        }
+        if set.len() >= cap {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO host_series (host_id, series_id) VALUES (?1, ?2)",
+            params![host_id, series_id],
+        )?;
+        set.insert(series_id);
+        Ok(true)
     }
 
     /// v1 的三個欄位在彙總中對應的標準序列（記憶體換算成 bytes，與 v2 的指標合併）
@@ -1234,6 +1433,63 @@ impl Caches {
         self.boots.insert(host_id, (boot_id.to_string(), boot_ref));
         Ok(boot_ref)
     }
+
+    /// 已解碼的原始資料（`decode_metrics` 的結果）轉成衍生計算的輸入；只保留計數器、uptime、
+    /// 檔案系統容量等序列
+    pub(super) fn derive_items<'a>(
+        &'a self,
+        decoded: &'a [(i64, serde_json::Number)],
+    ) -> Vec<derive::Item<'a>> {
+        decoded
+            .iter()
+            .filter_map(|(id, v)| {
+                let info = self.roles.get(id)?;
+                Some(derive::Item {
+                    id: *id,
+                    name: &info.name,
+                    unit: &info.unit,
+                    labels: &info.labels,
+                    role: info.role,
+                    value: v,
+                })
+            })
+            .collect()
+    }
+
+    /// 是否為標準計數器（v8 起原始累計值不彙總）
+    pub(super) fn is_counter(&self, id: i64) -> bool {
+        self.roles
+            .get(&id)
+            .is_some_and(|i| i.role == derive::Role::Counter)
+    }
+
+    /// 這台主機的計數器狀態；第一次使用時以 `before_ms` 之前最近的一筆原始資料為「上一筆」
+    /// （Kairos 重新啟動後；只查一次）
+    pub(super) fn seed_counters(
+        &mut self,
+        tx: &Transaction,
+        host_id: i64,
+        before_ms: i64,
+    ) -> rusqlite::Result<()> {
+        if !self.seeded.insert(host_id) {
+            return Ok(());
+        }
+        let prev: Option<(i64, Vec<u8>)> = tx
+            .query_row(
+                "SELECT ts, body FROM reports WHERE host_id = ?1 AND ts < ?2 AND format = ?3
+                 ORDER BY ts DESC LIMIT 1",
+                params![host_id, before_ms, FORMAT_METRICS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((ts, body)) = prev {
+            let decoded = codec::decode_metrics(&body).unwrap_or_default();
+            let mut state = derive::CounterState::new();
+            derive::derive(&self.derive_items(&decoded), ts, &mut state);
+            self.counters.insert(host_id, state);
+        }
+        Ok(())
+    }
 }
 
 fn push_series_key(key: &mut String, name: &str, unit: &str, labels: &str) {
@@ -1244,9 +1500,13 @@ fn push_series_key(key: &mut String, name: &str, unit: &str, labels: &str) {
     key.push_str(labels);
 }
 
-fn series_key(name: &str, unit: &str, labels: &str) -> String {
-    let mut key = String::with_capacity(name.len() + unit.len() + labels.len() + 2);
+fn series_key_derived(name: &str, unit: &str, labels: &str, derived: i64) -> String {
+    let mut key = String::with_capacity(name.len() + unit.len() + labels.len() + 4);
     push_series_key(&mut key, name, unit, labels);
+    if derived != derive::DERIVED_NONE {
+        key.push('\u{1f}');
+        key.push_str(&derived.to_string());
+    }
     key
 }
 
@@ -1270,14 +1530,19 @@ struct RetentionJob {
     /// 刪除 `bucket`（秒）早於此值的彙總
     rollup_5m_before: Option<i64>,
     rollup_1h_before: Option<i64>,
-    deleted: [u64; 4],
+    /// 刪除的列數：原始、5 分鐘、1 小時、boot、行程快照、資產變更歷史
+    deleted: [u64; 6],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetentionStage {
     Raw,
+    /// 行程快照（保留期限同原始資料）
+    Processes,
     Rollup5m,
     Rollup1h,
+    /// 資產變更歷史（保留期限同 1 小時彙總）
+    Changes,
     Boots,
 }
 
@@ -1328,6 +1593,8 @@ pub struct SqliteStore {
     rollup_stale: bool,
     /// 主機清冊中尚未寫入的列（最新一份快照中有變化的主機），每次維護步驟寫入一批
     pending_inventory: VecDeque<InventoryRow>,
+    /// 每台主機上次記錄「序列數已達上限」的時間（`KRS-W4104`）
+    series_cap_logged: HashMap<String, Instant>,
     /// 測試用的失敗注入
     pub(crate) fail_next: Option<FailPoint>,
 }
@@ -1368,6 +1635,7 @@ impl SqliteStore {
             buf: Vec::with_capacity(4096),
             rollup_stale: false,
             pending_inventory: VecDeque::new(),
+            series_cap_logged: HashMap::new(),
             fail_next: None,
         };
         store.ensure_ready().map_err(Error::other)?;
@@ -1481,12 +1749,17 @@ impl SqliteStore {
     }
 
     /// 在一個交易中寫入一批。取樣時間不早於主機 `rollup_until` 的數值放進 `samples`（提交後才加入
-    /// 記憶體中的桶）；早於的（遲到資料：對應的桶已寫出）在同一個交易中直接合併進彙總表
+    /// 記憶體中的桶）；早於的（遲到資料：對應的桶已寫出）在同一個交易中直接合併進彙總表。
+    ///
+    /// v8：計數器的原始累計值不彙總，改彙總由 [`derive`] 算出的速率；缺少使用率的掛載點彙總推算值；
+    /// 每台主機的序列數超過 `max_series_per_host` 時，新序列的指標不保存（`capped`：主機、略過的數目）；
+    /// 帶 `processes` 的 report 另寫一列行程快照（與 report 同一個交易，重複的 report 不寫）
     fn insert_batch(
         &mut self,
         records: &[ReportRecord],
         statuses: &mut [WriteStatus],
         samples: &mut Vec<Sample>,
+        capped: &mut Vec<(String, usize)>,
     ) -> Result<(), BatchError> {
         let Self {
             conn,
@@ -1503,6 +1776,7 @@ impl SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(before)?;
+        let cap = opts.max_series_per_host;
         let mut late: Vec<Sample> = Vec::new();
         {
             let mut insert = tx
@@ -1522,6 +1796,8 @@ impl SqliteStore {
                 };
                 record_samples.clear();
                 buf.clear();
+                // 保存的指標（序列編號、名稱、單位、正規化的 label、值）
+                let mut kept: Vec<(i64, &Metric, String)> = Vec::new();
                 let format = match &r.body {
                     RecordBody::Legacy {
                         cpu_usage,
@@ -1533,6 +1809,9 @@ impl SqliteStore {
                             statuses[i] = WriteStatus::Failed(SERIES_FULL.to_string());
                             continue;
                         };
+                        for id in [cpu, total, used] {
+                            caches.admit(&tx, host_id, id, cap).map_err(before)?;
+                        }
                         codec::encode_legacy(buf, *cpu_usage, *total_memory, *used_memory);
                         record_samples.extend([
                             (host_id, cpu, ts, f64::from(*cpu_usage)),
@@ -1542,29 +1821,36 @@ impl SqliteStore {
                         FORMAT_LEGACY
                     }
                     RecordBody::Metrics { metrics } => {
-                        let mut ids = Vec::with_capacity(metrics.len());
+                        let mut dropped = 0;
                         for m in metrics {
                             let labels = canonical_labels(&m.labels);
                             match caches
                                 .series_id(&tx, &m.name, &m.unit, &labels)
                                 .map_err(before)?
                             {
-                                Some(id) => ids.push(id),
+                                Some(id) => {
+                                    if caches.admit(&tx, host_id, id, cap).map_err(before)? {
+                                        kept.push((id, m, labels));
+                                    } else {
+                                        dropped += 1;
+                                    }
+                                }
                                 None => {
                                     statuses[i] = WriteStatus::Failed(SERIES_FULL.to_string());
                                     continue 'records;
                                 }
                             }
                         }
-                        codec::encode_metrics(
-                            buf,
-                            ids.iter().copied().zip(metrics.iter().map(|m| &m.value)),
-                        );
-                        record_samples.extend(
-                            ids.iter()
-                                .zip(metrics)
-                                .map(|(&id, m)| (host_id, id, ts, m.value_f64())),
-                        );
+                        if dropped > 0 {
+                            capped.push((r.agent_id.clone(), dropped));
+                            // 主控台 S05 的提示（設計包 §30.5 #7）
+                            tx.execute(
+                                "UPDATE hosts SET series_limited_at = ?2 WHERE host_id = ?1",
+                                params![host_id, recv_ms],
+                            )
+                            .map_err(before)?;
+                        }
+                        codec::encode_metrics(buf, kept.iter().map(|(id, m, _)| (*id, &m.value)));
                         FORMAT_METRICS
                     }
                 };
@@ -1590,9 +1876,51 @@ impl SqliteStore {
                     ])
                     .map_err(before)?;
                 if changed == 0 {
-                    // 重複（已保存過）：不寫入、不加入彙總
+                    // 重複（已保存過）：不寫入、不加入彙總、不更新計數器的上一筆
                     statuses[i] = WriteStatus::Duplicate;
                     continue;
+                }
+                if format == FORMAT_METRICS {
+                    caches.seed_counters(&tx, host_id, ts).map_err(before)?;
+                    let items: Vec<derive::Item> = kept
+                        .iter()
+                        .map(|(id, m, labels)| derive::Item {
+                            id: *id,
+                            name: &m.name,
+                            unit: &m.unit,
+                            labels,
+                            role: derive::role_of(&m.name, &m.unit, derive::DERIVED_NONE),
+                            value: &m.value,
+                        })
+                        .collect();
+                    // 量測值照常彙總；計數器只彙總速率
+                    record_samples.extend(
+                        items
+                            .iter()
+                            .filter(|it| it.role != derive::Role::Counter)
+                            .map(|it| (host_id, it.id, ts, it.value.as_f64().unwrap_or(f64::NAN))),
+                    );
+                    let state = caches.counters.entry(host_id).or_default();
+                    let points = derive::derive(&items, ts, state);
+                    for p in points {
+                        let Some(id) = caches
+                            .series_id_derived(&tx, &p.name, &p.unit, &p.labels, p.derived)
+                            .map_err(before)?
+                        else {
+                            continue;
+                        };
+                        if caches.admit(&tx, host_id, id, cap).map_err(before)? {
+                            record_samples.push((host_id, id, ts, p.value));
+                        }
+                    }
+                }
+                if let Some(processes) = &r.processes {
+                    let body = serde_json::to_vec(processes).unwrap_or_default();
+                    tx.execute(
+                        "INSERT OR REPLACE INTO process_snapshots (host_id, ts, body) VALUES (?1, ?2, ?3)",
+                        params![host_id, ts, body],
+                    )
+                    .map_err(before)?;
                 }
                 let rollup_until = caches
                     .hosts
@@ -1633,6 +1961,28 @@ impl SqliteStore {
         tx.commit().map_err(BatchError::Commit)
     }
 
+    /// 每台主機的序列數已達上限、部分指標未保存（`KRS-W4104`；每台主機每小時最多記一次）
+    fn log_series_capped(&mut self, capped: Vec<(String, usize)>) {
+        let now = Instant::now();
+        for (agent_id, dropped) in capped {
+            let due = self
+                .series_cap_logged
+                .get(&agent_id)
+                .is_none_or(|t| now.saturating_duration_since(*t) >= SERIES_CAP_LOG_INTERVAL);
+            if !due {
+                continue;
+            }
+            if self.series_cap_logged.len() >= 10_000 {
+                self.series_cap_logged.clear();
+            }
+            self.series_cap_logged.insert(agent_id.clone(), now);
+            warn!(
+                "警告 {CODE_SERIES_CAPPED}：主機 {agent_id} 的指標序列數已達上限（{}，storage.max_series_per_host），部分指標未保存：這筆 report 中 {dropped} 個新序列的指標未保存，既有的序列照常保存。常見原因是網路介面名稱不斷變化（例如容器的虛擬介面）或大量自訂指標；處理方式：在這台主機的 pulse.toml 以 collect.interface_exclude 排除這些介面並重新啟動 Pulse，確實需要更多序列時調高 storage.max_series_per_host（每台主機每小時最多記錄一次）",
+                self.opts.max_series_per_host
+            );
+        }
+    }
+
     /// 寫入一批（一個交易）。回傳每筆的結果
     fn write(&mut self, records: &[ReportRecord]) -> Vec<WriteStatus> {
         if records.is_empty() {
@@ -1651,9 +2001,11 @@ impl SqliteStore {
         }
         let mut statuses = vec![WriteStatus::Written; records.len()];
         let mut samples = Vec::new();
-        let result = self.insert_batch(records, &mut statuses, &mut samples);
+        let mut capped = Vec::new();
+        let result = self.insert_batch(records, &mut statuses, &mut samples, &mut capped);
         match result {
             Ok(()) => {
+                self.log_series_capped(capped);
                 let now_ms = (self.clock)().timestamp_millis();
                 for (host_id, series_id, ts, value) in samples {
                     self.rollup.add(host_id, series_id, ts, value, now_ms);
@@ -1775,6 +2127,7 @@ impl SqliteStore {
             conn,
             caches,
             rollup,
+            opts,
             ..
         } = self;
         let Some(conn) = conn.as_mut() else {
@@ -1783,14 +2136,18 @@ impl SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut count = 0;
         {
-            let mut stmt =
-                tx.prepare("SELECT ts, format, body FROM reports WHERE host_id = ?1 AND ts >= ?2")?;
+            let mut stmt = tx.prepare(
+                "SELECT ts, format, body FROM reports WHERE host_id = ?1 AND ts >= ?2 ORDER BY ts",
+            )?;
+            let cap = opts.max_series_per_host;
             let hosts: Vec<(i64, i64)> = caches
                 .hosts
                 .values()
                 .map(|e| (e.host_id, e.rollup_until))
                 .collect();
             for (host_id, until) in hosts {
+                // 計數器的上一筆：rollup_until 之前最近的一筆（不加入彙總）
+                caches.seed_counters(&tx, host_id, until)?;
                 let rows = stmt.query_map(params![host_id, until], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
@@ -1812,16 +2169,30 @@ impl SqliteStore {
                             }
                         }
                         FORMAT_METRICS => {
-                            for (series_id, value) in
-                                codec::decode_metrics(&body).unwrap_or_default()
-                            {
-                                rollup.add(
-                                    host_id,
-                                    series_id,
-                                    ts,
-                                    value.as_f64().unwrap_or(f64::NAN),
-                                    now_ms,
-                                );
+                            let decoded = codec::decode_metrics(&body).unwrap_or_default();
+                            for (series_id, value) in &decoded {
+                                // v8：計數器只彙總速率
+                                if !caches.is_counter(*series_id) {
+                                    rollup.add(
+                                        host_id,
+                                        *series_id,
+                                        ts,
+                                        value.as_f64().unwrap_or(f64::NAN),
+                                        now_ms,
+                                    );
+                                }
+                            }
+                            let mut state = caches.counters.remove(&host_id).unwrap_or_default();
+                            let points =
+                                derive::derive(&caches.derive_items(&decoded), ts, &mut state);
+                            caches.counters.insert(host_id, state);
+                            for p in points {
+                                if let Some(id) = caches.series_id_derived(
+                                    &tx, &p.name, &p.unit, &p.labels, p.derived,
+                                )? && caches.admit(&tx, host_id, id, cap)?
+                                {
+                                    rollup.add(host_id, id, ts, p.value, now_ms);
+                                }
                             }
                         }
                         _ => {}
@@ -1933,7 +2304,19 @@ impl SqliteStore {
             "DELETE FROM reports WHERE id IN (SELECT id FROM reports ORDER BY id LIMIT ?1)",
             [DELETE_BATCH_ROWS],
         )?;
-        if raw > 0 {
+        // 行程快照與原始資料同一層：刪到目前最舊（最早寫入）的一筆原始 report 的取樣時間為止
+        // （沒有原始資料時全部刪除）
+        let oldest_raw: Option<i64> = conn
+            .query_row("SELECT ts FROM reports ORDER BY id LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let processes = conn.execute(
+            "DELETE FROM process_snapshots WHERE (host_id, ts) IN
+             (SELECT host_id, ts FROM process_snapshots WHERE ts < ?1 ORDER BY ts LIMIT ?2)",
+            params![oldest_raw.unwrap_or(i64::MAX), DELETE_BATCH_ROWS],
+        )?;
+        if raw > 0 || processes > 0 {
             self.capacity.deleted[0] += raw as u64;
             return Ok(true);
         }
@@ -2025,7 +2408,7 @@ impl SqliteStore {
             raw_before_ms: before(opts.raw_retention_days).map(|s| s * 1000),
             rollup_5m_before: before(opts.rollup_5m_retention_days),
             rollup_1h_before: before(opts.rollup_1h_retention_days),
-            deleted: [0; 4],
+            deleted: [0; 6],
         })
     }
 
@@ -2057,6 +2440,16 @@ impl SqliteStore {
                      (SELECT id FROM reports WHERE host_id = ?1 AND ts < ?2 LIMIT ?3)",
                     job.raw_before_ms,
                 ),
+                RetentionStage::Processes => (
+                    "DELETE FROM process_snapshots WHERE (host_id, ts) IN
+                     (SELECT host_id, ts FROM process_snapshots WHERE host_id = ?1 AND ts < ?2 LIMIT ?3)",
+                    job.raw_before_ms,
+                ),
+                RetentionStage::Changes => (
+                    "DELETE FROM inventory_changes WHERE id IN
+                     (SELECT id FROM inventory_changes WHERE host_id = ?1 AND changed_at < ?2 LIMIT ?3)",
+                    job.rollup_1h_before.map(|s| s * 1000),
+                ),
                 RetentionStage::Rollup5m => (
                     "DELETE FROM rollup_5m WHERE (host_id, bucket, series_id) IN
                      (SELECT host_id, bucket, series_id FROM rollup_5m WHERE host_id = ?1 AND bucket < ?2 LIMIT ?3)",
@@ -2084,8 +2477,10 @@ impl SqliteStore {
                 }
             };
             let next_stage = |s| match s {
-                RetentionStage::Raw => RetentionStage::Rollup5m,
+                RetentionStage::Raw => RetentionStage::Processes,
+                RetentionStage::Processes => RetentionStage::Rollup5m,
                 RetentionStage::Rollup5m => RetentionStage::Rollup1h,
+                RetentionStage::Rollup1h => RetentionStage::Changes,
                 _ => RetentionStage::Boots,
             };
             let (Some(before), Some(&host_id)) = (before, job.hosts.get(job.cursor)) else {
@@ -2098,7 +2493,9 @@ impl SqliteStore {
             let slot = match job.stage {
                 RetentionStage::Raw => 0,
                 RetentionStage::Rollup5m => 1,
-                _ => 2,
+                RetentionStage::Rollup1h => 2,
+                RetentionStage::Processes => 4,
+                _ => 5,
             };
             job.deleted[slot] += n as u64;
             budget -= n;
@@ -2110,10 +2507,10 @@ impl SqliteStore {
         tx.commit()?;
         let done = job.stage == RetentionStage::Boots && budget > 0;
         if done {
-            let [raw, m5, h1, boots] = job.deleted;
-            if raw + m5 + h1 + boots > 0 {
+            let [raw, m5, h1, boots, processes, changes] = job.deleted;
+            if raw + m5 + h1 + boots + processes + changes > 0 {
                 info!(
-                    "已依保留期限刪除 SQLite 中過期的資料：原始 report {raw} 筆、5 分鐘彙總 {m5} 列、1 小時彙總 {h1} 列（storage.raw_retention_days、rollup_5m_retention_days、rollup_1h_retention_days）"
+                    "已依保留期限刪除 SQLite 中過期的資料：原始 report {raw} 筆、5 分鐘彙總 {m5} 列、1 小時彙總 {h1} 列、行程快照 {processes} 筆、資產變更歷史 {changes} 筆（storage.raw_retention_days、rollup_5m_retention_days、rollup_1h_retention_days）"
                 );
             }
             let run = RetentionRun {
@@ -2547,6 +2944,13 @@ fn load_restored(conn: &Connection, since_ms: i64) -> rusqlite::Result<Vec<Resto
 impl ReportStore for SqliteStore {
     fn write_batch(&mut self, records: &[ReportRecord]) -> Vec<WriteStatus> {
         self.write(records)
+    }
+
+    fn write_assets(
+        &mut self,
+        write: &crate::store::AssetWrite,
+    ) -> Result<crate::store::AssetOutcome, String> {
+        self.store_assets(write)
     }
 
     fn sync_inventory(&mut self, snapshot: &RegistrySnapshot) {

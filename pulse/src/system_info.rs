@@ -1,21 +1,23 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, System};
+use sysinfo::{Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, NetworkData, Networks, System};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant, MissedTickBehavior};
 
-use kairos_proto::{
-    MAX_LABEL_VALUE_BYTES, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL,
-    METRIC_NETWORK_RECEIVED, METRIC_NETWORK_TRANSMITTED, METRIC_TEMPERATURE, Metric,
-    sanitize_display_text,
-};
+use kairos_proto::{MAX_LABEL_VALUE_BYTES, Metric, ProcessList, sanitize_display_text};
 
 use crate::log_throttle::LogThrottle;
 use crate::protocol::{is_forbidden_display_char, now_ts};
 
+mod diskstats;
 pub mod host;
+pub mod inventory;
+mod procs;
+mod readings;
+
+pub use readings::CollectOptions;
 
 /// 一個 MB 的位元組數，用來把 sysinfo 回傳的 bytes 換算成 MB。
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -23,6 +25,7 @@ const BYTES_PER_MB: u64 = 1024 * 1024;
 /// 一次系統資訊取樣，由收集 task 產生、經 mpsc 交給連線 task 組成 report 訊息。
 ///
 /// 啟用本機緩衝（A5）時以 JSON 原樣存進緩衝（`spool`），送出時才依協商的格式組成 report。
+/// 0.8.0 新增的欄位一律可省略（`serde(default)`），0.7 寫入的緩衝記錄仍可讀取。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     /// 取樣時間（RFC 3339 UTC 毫秒），作為 report 的 `ts`
@@ -37,151 +40,327 @@ pub struct Sample {
     pub total_memory_bytes: u64,
     /// 已使用記憶體（bytes；協定 v2 的 `system.memory.used`）
     pub used_memory_bytes: u64,
-    /// 磁碟、網路與溫度的指標（A4；只在協定 v2 協商了 `metrics` 時送出，v1 不送）
+    /// CPU 與記憶體總量／已使用以外的標準指標（A4、F4；只在協定 v2 協商了 `metrics` 時送出，v1 不送）。
+    /// 順序即截斷時的優先順序（見 `readings` 模組）
     pub extra: Vec<Metric>,
+    /// 行程排行（F4；每 `processes.interval` 的那次取樣才有，只在協商了 `processes` 時送出）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<ProcessList>,
 }
-
-/// 每次 report 最多送出的磁碟、網路介面與溫度感測器數（各自計算）。
-/// 合計最多 2 × 32 + 2 × 32 + 32 = 160 個，加上 CPU 與記憶體共 163 個，低於協定上限 256
-const MAX_REPORTED_DISKS: usize = 32;
-const MAX_REPORTED_INTERFACES: usize = 32;
-const MAX_REPORTED_SENSORS: usize = 32;
 
 /// label 值：整理成符合協定限制的字串（禁止字元換成 `?`、截到 256 bytes），空的回傳 `None`
 fn label_value(raw: &str) -> Option<String> {
     sanitize_display_text(raw, MAX_LABEL_VALUE_BYTES)
 }
 
-/// 數值四捨五入到小數 2 位（避免 f32 轉 f64 的精度雜訊，例如 `47.83000183105469`）
-fn round2(v: f32) -> Option<serde_json::Number> {
-    serde_json::Number::from_f64((f64::from(v) * 100.0).round() / 100.0)
+/// 系統磁碟機的掛載點：Linux `/`；Windows 為 `%SystemDrive%\`（通常 `C:\`）
+fn root_mount() -> String {
+    if cfg!(windows) {
+        let drive = std::env::var("SystemDrive")
+            .ok()
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| "C:".to_string());
+        format!("{}\\", drive.trim().trim_end_matches('\\'))
+    } else {
+        "/".to_string()
+    }
 }
 
-/// 磁碟、網路與溫度的指標（A4）。篩選規則與啟動時的 INFO 清單相同：略過虛擬檔案系統、容量為 0
-/// 與同一磁碟的重複掛載點，略過迴路與虛擬網路介面，略過讀不到溫度的感測器；
-/// 各類最多 [`MAX_REPORTED_DISKS`] 等個數，同一個 label 只送第一個。
-fn extra_metrics(
-    disks: Vec<DiskEntry>,
-    interfaces: &[(String, u64, u64)],
-    temperatures: &[(String, Option<f32>)],
-) -> Vec<Metric> {
-    let mut out = Vec::new();
+/// 網路介面的讀數（累計值；介面優先順序用的 IPv4 判斷）
+fn interface_reading(name: &str, data: &NetworkData) -> readings::InterfaceReading {
+    readings::InterfaceReading {
+        name: name.to_string(),
+        rx_bytes: data.total_received(),
+        tx_bytes: data.total_transmitted(),
+        rx_packets: data.total_packets_received(),
+        tx_packets: data.total_packets_transmitted(),
+        rx_errors: data.total_errors_on_received(),
+        tx_errors: data.total_errors_on_transmitted(),
+        has_ipv4: data.ip_networks().iter().any(|n| n.addr.is_ipv4()),
+    }
+}
 
-    let meaningful = disks
-        .into_iter()
-        .filter(|d| is_meaningful_disk(&d.file_system, d.total_space))
+/// 部分系統資訊因權限或平台限制無法取得（`PLS-I8009`〔暫定〕，METRICS.md 第 4.5 節）：
+/// 每個項目在這個行程中只記一次 INFO
+pub(crate) fn report_limited(item: &'static str, detail: &str) {
+    static LOGGED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut logged = LOGGED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if logged.contains(&item) {
+        return;
+    }
+    logged.push(item);
+    info!(
+        "{}部分系統資訊無法取得，不送 {item}：{detail}",
+        crate::codes::tag(
+            crate::codes::SYSINFO_LIMITED,
+            Some(crate::codes::I_SYSINFO_LIMITED)
+        )
+    );
+}
+
+/// 掛載點的裝置對應到 `system.disk.*` 的 `device` label（Linux 為 diskstats 的名稱，Windows 為磁碟機代號）
+struct DeviceResolver {
+    #[cfg(target_os = "linux")]
+    dm_names: Vec<(String, String)>,
+}
+
+impl DeviceResolver {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            dm_names: diskstats::read_dm_names(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve(&self, source: &str, _mount_point: &str) -> Option<String> {
+        diskstats::resolve_linux_device(source, &self.dm_names)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn resolve(&self, _source: &str, mount_point: &str) -> Option<String> {
+        diskstats::windows_device_label(mount_point)
+    }
+}
+
+/// 掛載點的可用空間（含保留給 root 的部分，`statvfs` 的 `f_bfree`；Windows 為
+/// `GetDiskFreeSpaceExW` 的 `TotalNumberOfFreeBytes`）。`system.filesystem.used` = total − free
+#[cfg(unix)]
+fn filesystem_free_bytes(mount_point: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs 為 POD，以 0 初始化合法；path 以 NUL 結尾且在呼叫期間有效
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)] // f_bfree／f_frsize 的型別依平台而異
+    let free = (st.f_bfree as u64).checked_mul(st.f_frsize as u64)?;
+    Some(free)
+}
+
+#[cfg(windows)]
+fn filesystem_free_bytes(mount_point: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = mount_point
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
         .collect();
-    let (kept, _) = dedupe_disks(meaningful);
-    let mut seen = HashSet::new();
-    for disk in kept {
-        let Some(mount) = label_value(&disk.mount_point) else {
-            continue;
-        };
-        if !seen.insert(mount.clone()) {
-            continue;
-        }
-        if seen.len() > MAX_REPORTED_DISKS {
-            break;
-        }
-        let with_labels = |m: Metric| {
-            let m = m.with_label("mountpoint", mount.clone());
-            match label_value(&disk.file_system) {
-                Some(fs) => m.with_label("fstype", fs),
-                None => m,
-            }
-        };
-        out.push(with_labels(Metric::new(
-            METRIC_FILESYSTEM_TOTAL,
-            disk.total_space,
-            "By",
-        )));
-        out.push(with_labels(Metric::new(
-            METRIC_FILESYSTEM_AVAILABLE,
-            disk.available_space,
-            "By",
-        )));
-    }
-
-    let mut seen = HashSet::new();
-    for (name, received, transmitted) in interfaces {
-        if !is_meaningful_interface(name) {
-            continue;
-        }
-        let Some(device) = label_value(name) else {
-            continue;
-        };
-        if !seen.insert(device.clone()) {
-            continue;
-        }
-        if seen.len() > MAX_REPORTED_INTERFACES {
-            break;
-        }
-        out.push(
-            Metric::new(METRIC_NETWORK_RECEIVED, *received, "By")
-                .with_label("device", device.clone()),
-        );
-        out.push(
-            Metric::new(METRIC_NETWORK_TRANSMITTED, *transmitted, "By")
-                .with_label("device", device),
-        );
-    }
-
-    let mut seen = HashSet::new();
-    for (label, temperature) in temperatures {
-        let (Some(sensor), Some(value)) = (label_value(label), temperature.and_then(round2)) else {
-            continue;
-        };
-        if !seen.insert(sensor.clone()) {
-            continue;
-        }
-        if seen.len() > MAX_REPORTED_SENSORS {
-            break;
-        }
-        out.push(Metric::new(METRIC_TEMPERATURE, value, "Cel").with_label("sensor", sensor));
-    }
-    out
+    let (mut caller, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: wide 以 NUL 結尾且在呼叫期間有效；三個輸出參數指向各自的 u64（ULARGE_INTEGER）
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut caller, &mut total, &mut free) };
+    (ok != 0).then_some(free)
 }
 
-/// 取樣磁碟、網路與溫度用的 sysinfo 物件（第一次在 blocking 執行緒建立，之後沿用）
+#[cfg(not(any(unix, windows)))]
+fn filesystem_free_bytes(_mount_point: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// 取樣磁碟、網路、溫度與行程用的 sysinfo 物件（第一次在 blocking 執行緒建立，之後沿用）
 struct Extras {
+    opts: Arc<CollectOptions>,
     disks: Disks,
     networks: Networks,
     components: Components,
+    resolver: DeviceResolver,
+    /// `processes.enabled = false` 時 `None`
+    procs: Option<procs::ProcessCollector>,
+    /// 超過上限而略過的項目：第一次取樣記一則 INFO，之後每 24 小時最多一則（項目改變時也記）
+    skipped_log: LogThrottle,
+    last_skipped: readings::Skipped,
 }
 
+/// `sysinfo.snapshot` 中略過項目的提醒間隔
+const SKIPPED_LOG_WINDOW: Duration = Duration::from_secs(24 * 3600);
+
 impl Extras {
-    fn new() -> Self {
+    fn new(opts: Arc<CollectOptions>) -> Self {
+        let wants_disks = opts.filesystems || opts.disk_io;
         Self {
-            disks: Disks::new_with_refreshed_list(),
-            networks: Networks::new_with_refreshed_list(),
-            components: Components::new_with_refreshed_list(),
+            disks: if wants_disks {
+                Disks::new_with_refreshed_list()
+            } else {
+                Disks::new()
+            },
+            networks: if opts.network {
+                Networks::new_with_refreshed_list()
+            } else {
+                Networks::new()
+            },
+            components: if opts.temperature {
+                Components::new_with_refreshed_list()
+            } else {
+                Components::new()
+            },
+            resolver: DeviceResolver::new(),
+            procs: opts.processes.clone().map(procs::ProcessCollector::new),
+            skipped_log: LogThrottle::new(SKIPPED_LOG_WINDOW),
+            last_skipped: readings::Skipped::default(),
+            opts,
         }
     }
 
-    /// 刷新（含新增與移除的磁碟、介面、感測器）並轉成指標
-    fn refresh_and_read(&mut self) -> Vec<Metric> {
-        self.disks.refresh(true);
-        self.networks.refresh(true);
-        self.components.refresh(true);
-        let disks = self.disks.iter().map(DiskEntry::from_disk).collect();
-        let mut interfaces: Vec<(String, u64, u64)> = self
+    /// 磁碟 I/O 的讀數（取不到時 `None` 並記一次 `PLS-I8009`）
+    fn disk_io(&self) -> Option<Vec<(String, readings::DiskIoReading)>> {
+        if !self.opts.disk_io || self.opts.max_disks == 0 {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(stats) = diskstats::read_linux_diskstats() else {
+                report_limited("system.disk.*", "無法讀取 /proc/diskstats");
+                return None;
+            };
+            Some(stats.into_iter().collect())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let io: Vec<(String, readings::DiskIoReading)> = self
+                .disks
+                .iter()
+                .filter_map(|d| {
+                    let device =
+                        diskstats::windows_device_label(&d.mount_point().to_string_lossy())?;
+                    let u = d.usage();
+                    Some((
+                        device,
+                        readings::DiskIoReading {
+                            read_bytes: u.total_read_bytes,
+                            written_bytes: u.total_written_bytes,
+                            ..Default::default()
+                        },
+                    ))
+                })
+                .collect();
+            // IOCTL_DISK_PERFORMANCE 打不開時 sysinfo 的讀數一律為 0（虛擬服務帳號下待實測）
+            if io
+                .iter()
+                .all(|(_, r)| r.read_bytes == 0 && r.written_bytes == 0)
+            {
+                report_limited(
+                    "system.disk.*",
+                    "讀不到磁碟的效能計數器（IOCTL_DISK_PERFORMANCE），可能是服務帳號的權限不足",
+                );
+                return None;
+            }
+            Some(io)
+        }
+    }
+
+    /// 刷新（含新增與移除的磁碟、介面、感測器）並轉成指標；到了 `processes.interval` 時另附行程排行
+    fn refresh_and_read(&mut self, sys: &System) -> (Vec<Metric>, Option<ProcessList>) {
+        let opts = self.opts.clone();
+        if opts.filesystems || opts.disk_io {
+            self.disks.refresh(true);
+        }
+        if opts.network {
+            self.networks.refresh(true);
+        }
+        if opts.temperature {
+            self.components.refresh(true);
+        }
+        let (process_count, processes) = match &mut self.procs {
+            Some(p) => {
+                let s = p.sample();
+                if s.restricted {
+                    report_limited(
+                        "system.process.count、processes",
+                        "只看得到 Pulse 自己的行程（例如 systemd 的 ProtectProc=invisible）",
+                    );
+                }
+                (s.count, s.top)
+            }
+            None => (None, None),
+        };
+        let resolver = &self.resolver;
+        let disks = self
+            .disks
+            .iter()
+            .map(|d| DiskEntry::from_disk(d, resolver))
+            .collect();
+        let mut interfaces: Vec<readings::InterfaceReading> = self
             .networks
             .iter()
-            .map(|(name, data)| {
-                (
-                    name.clone(),
-                    data.total_received(),
-                    data.total_transmitted(),
-                )
-            })
+            .map(|(name, data)| interface_reading(name, data))
             .collect();
-        interfaces.sort();
-        let temperatures: Vec<(String, Option<f32>)> = self
+        interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+        let temperatures = self
             .components
             .iter()
             .map(|c| (c.label().to_string(), c.temperature()))
             .collect();
-        extra_metrics(disks, &interfaces, &temperatures)
+        let load = cfg!(target_os = "linux").then(|| {
+            let l = System::load_average();
+            [l.one, l.five, l.fifteen]
+        });
+        let readings = readings::Readings {
+            unlabeled: readings::UnlabeledReadings {
+                load,
+                memory_available: sys.available_memory(),
+                swap_total: sys.total_swap(),
+                swap_used: sys.used_swap(),
+                process_count,
+                uptime_secs: System::uptime(),
+            },
+            disks,
+            root_mount: root_mount(),
+            disk_io: self.disk_io(),
+            interfaces,
+            temperatures,
+        };
+        let (metrics, skipped) = readings::build_metrics(readings, &opts);
+        self.log_skipped(skipped);
+        (metrics, processes)
+    }
+
+    /// `sysinfo.snapshot`：超過每類上限而略過的項目（METRICS.md 第 4.3 節）
+    fn log_skipped(&mut self, skipped: readings::Skipped) {
+        if skipped.is_empty() {
+            self.last_skipped = skipped;
+            return;
+        }
+        let changed = skipped != self.last_skipped;
+        if changed {
+            self.skipped_log = LogThrottle::new(SKIPPED_LOG_WINDOW);
+        }
+        if self.skipped_log.check(Instant::now()).is_some() {
+            let list = |v: &[String]| {
+                if v.is_empty() {
+                    "—".to_string()
+                } else {
+                    v.join("、")
+                }
+            };
+            info!(
+                "{}超過每類上限，下列項目不送（collect.max_filesystems={}、max_disks={}、max_interfaces={}）：\
+                 掛載點 {}；磁碟 I/O 裝置 {}；網路介面 {}  skipped_filesystems={} skipped_disks={} skipped_interfaces={}",
+                crate::codes::tag(crate::codes::SYSINFO_SNAPSHOT, None),
+                self.opts.max_filesystems,
+                self.opts.max_disks,
+                self.opts.max_interfaces,
+                list(&skipped.filesystems),
+                list(&skipped.disks),
+                list(&skipped.interfaces),
+                skipped.filesystems.len(),
+                skipped.disks.len(),
+                skipped.interfaces.len()
+            );
+        }
+        self.last_skipped = skipped;
     }
 }
 
@@ -333,7 +512,7 @@ fn format_disk_bytes(bytes: u64) -> String {
     }
 }
 
-/// 啟動時磁碟清單的一筆（已轉成顯示用的文字）。
+/// 一個掛載點（啟動時的磁碟清單、`system.filesystem.*`、`system.disk.*` 與資產共用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiskEntry {
     mount_point: String,
@@ -342,17 +521,29 @@ struct DiskEntry {
     name: String,
     total_space: u64,
     available_space: u64,
+    /// 含保留給 root 的可用空間（`statvfs` 的 `f_bfree`）；取不到時 `None`
+    free_space: Option<u64>,
+    removable: bool,
+    read_only: bool,
+    /// `system.disk.*` 的 `device` label（Linux 為 diskstats 的名稱、Windows 為磁碟機代號）
+    device: Option<String>,
 }
 
 impl DiskEntry {
-    fn from_disk(disk: &sysinfo::Disk) -> Self {
+    fn from_disk(disk: &sysinfo::Disk, resolver: &DeviceResolver) -> Self {
+        let mount_point = disk.mount_point().display().to_string();
+        let name = disk.name().to_string_lossy().into_owned();
         Self {
-            mount_point: disk.mount_point().display().to_string(),
+            device: resolver.resolve(&name, &mount_point),
+            free_space: filesystem_free_bytes(disk.mount_point()),
+            mount_point,
             file_system: disk.file_system().to_string_lossy().into_owned(),
             kind: disk.kind().to_string(),
-            name: disk.name().to_string_lossy().into_owned(),
+            name,
             total_space: disk.total_space(),
             available_space: disk.available_space(),
+            removable: disk.is_removable(),
+            read_only: disk.is_read_only(),
         }
     }
 
@@ -490,10 +681,11 @@ pub fn get_system_info() {
     // 磁碟資訊（虛擬檔案系統、容量為 0 的掛載點與同一磁碟的重複掛載點只記 debug）
     info!("=> 磁碟資訊:");
     let disks = Disks::new_with_refreshed_list();
+    let resolver = DeviceResolver::new();
     let mut hidden_disks = 0usize;
     let mut meaningful = Vec::new();
     for disk in &disks {
-        let entry = DiskEntry::from_disk(disk);
+        let entry = DiskEntry::from_disk(disk, &resolver);
         if is_meaningful_disk(&entry.file_system, entry.total_space) {
             meaningful.push(entry);
         } else {
@@ -623,8 +815,8 @@ type RefreshTask = tokio::task::JoinHandle<(System, Option<Extras>, Sample)>;
 struct Sampler {
     /// 取樣用的 `System`；blocking 閉包執行期間（含卡住時）為 `None`
     sys: Option<System>,
-    /// 是否另外取樣磁碟、網路與溫度（A4；測試替換刷新函式時不取樣）
-    collect_extras: bool,
+    /// 磁碟、網路、溫度與行程的採集設定（A4、F4）；測試替換刷新函式時為 `None`（不取樣）
+    collect: Option<Arc<CollectOptions>>,
     /// 磁碟、網路與溫度的 sysinfo 物件；第一次刷新時在 blocking 執行緒建立，與 `sys` 一起移動
     extras: Option<Extras>,
     /// 上次刷新 CPU 的時間；`None` 表示尚未建立基準
@@ -642,9 +834,9 @@ struct Sampler {
 }
 
 impl Sampler {
-    fn new(timeout: Duration) -> Self {
+    fn new(timeout: Duration, opts: CollectOptions) -> Self {
         Self {
-            collect_extras: true,
+            collect: Some(Arc::new(opts)),
             ..Self::with_refresh(refresh_cpu_and_memory, timeout)
         }
     }
@@ -652,7 +844,7 @@ impl Sampler {
     fn with_refresh(refresh: fn(&mut System), timeout: Duration) -> Self {
         Self {
             sys: Some(System::new()),
-            collect_extras: false,
+            collect: None,
             extras: None,
             last_refresh: None,
             refresh,
@@ -701,16 +893,18 @@ impl Sampler {
         };
         let refresh = self.refresh;
         let mut extras = self.extras.take();
-        let collect_extras = self.collect_extras;
+        let collect = self.collect.clone();
         let started = Instant::now();
         let mut task = tokio::task::spawn_blocking(move || {
             refresh(&mut sys);
-            if collect_extras && extras.is_none() {
-                extras = Some(Extras::new());
+            if let Some(opts) = collect
+                && extras.is_none()
+            {
+                extras = Some(Extras::new(opts));
             }
-            let extra = extras
+            let (extra, processes) = extras
                 .as_mut()
-                .map(Extras::refresh_and_read)
+                .map(|e| e.refresh_and_read(&sys))
                 .unwrap_or_default();
             let s = Sample {
                 ts: now_ts(),
@@ -720,6 +914,7 @@ impl Sampler {
                 total_memory_bytes: sys.total_memory(),
                 used_memory_bytes: sys.used_memory(),
                 extra,
+                processes,
             };
             (sys, extras, s)
         });
@@ -821,8 +1016,12 @@ fn finished<T>(joined: Result<T, tokio::task::JoinError>) -> Option<T> {
 /// 因此不會堆積；連線 task 在每次註冊成功後會清掉通道內殘留的舊取樣，
 /// 上一筆 report 尚未收到伺服器回應時也會略過新取樣。
 /// 接收端關閉或 runtime 關閉時結束。
-pub async fn collect_periodically(interval: Duration, tx: mpsc::Sender<Sample>) {
-    collect_with(Sampler::new(sample_timeout(interval)), interval, tx).await;
+pub async fn collect_periodically(
+    interval: Duration,
+    opts: CollectOptions,
+    tx: mpsc::Sender<Sample>,
+) {
+    collect_with(Sampler::new(sample_timeout(interval), opts), interval, tx).await;
 }
 
 /// [`collect_periodically`] 的實作，取樣器由呼叫端提供（測試時可替換刷新函式）。
@@ -862,94 +1061,6 @@ async fn collect_with(mut sampler: Sampler, interval: Duration, tx: mpsc::Sender
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn interface(name: &str, rx: u64, tx: u64) -> (String, u64, u64) {
-        (name.to_string(), rx, tx)
-    }
-
-    #[test]
-    fn extra_metrics_follow_the_startup_filters() {
-        let disks = vec![
-            disk("/", "ext4", "/dev/sda1", 1000),
-            disk("/opt/pulse/logs", "ext4", "/dev/sda1", 1000), // 重複掛載點
-            disk("/proc", "proc", "proc", 0),                   // 虛擬
-            disk("/data", "xfs", "/dev/sdb1", 2000),
-        ];
-        let interfaces = [
-            interface("eth0", 10, 20),
-            interface("lo", 1, 1),
-            interface("veth123", 1, 1),
-            interface("docker0", 1, 1),
-        ];
-        let temps = [
-            ("coretemp Package id 0".to_string(), Some(47.83_f32)),
-            ("acpitz".to_string(), None),
-            ("nvme".to_string(), Some(f32::NAN)),
-        ];
-        let metrics = extra_metrics(disks, &interfaces, &temps);
-        let names: Vec<(&str, Vec<&str>)> = metrics
-            .iter()
-            .map(|m| {
-                (
-                    m.name.as_str(),
-                    m.labels.values().map(String::as_str).collect(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            names,
-            [
-                ("system.filesystem.total", vec!["ext4", "/"]),
-                ("system.filesystem.available", vec!["ext4", "/"]),
-                ("system.filesystem.total", vec!["xfs", "/data"]),
-                ("system.filesystem.available", vec!["xfs", "/data"]),
-                ("system.network.received", vec!["eth0"]),
-                ("system.network.transmitted", vec!["eth0"]),
-                ("system.temperature", vec!["coretemp Package id 0"]),
-            ]
-        );
-        assert_eq!(metrics[2].value.as_u64(), Some(2000));
-        assert_eq!(metrics[5].value.as_u64(), Some(20));
-        // f32 的精度雜訊被去掉
-        assert_eq!(metrics[6].value.to_string(), "47.83");
-        // 都符合協定（加上 CPU 與記憶體後仍是合法的 report）
-        kairos_proto::validate_metrics(&metrics).unwrap();
-    }
-
-    #[test]
-    fn extra_metrics_are_capped_and_labels_sanitized() {
-        let disks = (0..100)
-            .map(|i| disk(&format!("/m{i}"), "ext4", &format!("/dev/x{i}"), 1))
-            .collect();
-        let interfaces: Vec<_> = (0..100)
-            .map(|i| interface(&format!("en{i:03}"), 1, 1))
-            .collect();
-        let temps: Vec<_> = (0..100)
-            .map(|i| (format!("s{i}"), Some(40.0_f32)))
-            .chain([("s0".to_string(), Some(1.0))]) // 重複的 label 只取第一個
-            .collect();
-        let metrics = extra_metrics(disks, &interfaces, &temps);
-        let count = |name: &str| metrics.iter().filter(|m| m.name == name).count();
-        assert_eq!(count("system.filesystem.total"), MAX_REPORTED_DISKS);
-        assert_eq!(count("system.network.received"), MAX_REPORTED_INTERFACES);
-        assert_eq!(count("system.temperature"), MAX_REPORTED_SENSORS);
-        assert!(metrics.len() + 3 <= kairos_proto::MAX_METRICS);
-        kairos_proto::validate_metrics(&metrics).unwrap();
-
-        // 掛載路徑含換行等禁止字元：替換成 ?；空白的 label 略過
-        let disks = vec![
-            disk(
-                "/mnt/a
-b", "ext4", "/dev/a", 1,
-            ),
-            disk(" ", "ext4", "/dev/b", 1),
-        ];
-        let temps = [(" ".to_string(), Some(1.0_f32))];
-        let metrics = extra_metrics(disks, &[], &temps);
-        assert_eq!(metrics.len(), 2);
-        assert_eq!(metrics[0].labels["mountpoint"], "/mnt/a?b");
-        kairos_proto::validate_metrics(&metrics).unwrap();
-    }
 
     #[test]
     fn hostname_normalization() {
@@ -1085,6 +1196,10 @@ b", "ext4", "/dev/a", 1,
             name: name.to_string(),
             total_space: total,
             available_space: total / 2,
+            free_space: None,
+            removable: false,
+            read_only: false,
+            device: None,
         }
     }
 
@@ -1363,7 +1478,10 @@ b", "ext4", "/dev/a", 1,
 
     #[tokio::test]
     async fn sample_reads_real_values() {
-        let mut sampler = Sampler::new(sample_timeout(Duration::from_secs(5)));
+        let mut sampler = Sampler::new(
+            sample_timeout(Duration::from_secs(5)),
+            CollectOptions::defaults(),
+        );
         let s = ready(sampler.sample().await);
         assert!(s.total_memory > 0);
         assert!(s.used_memory <= s.total_memory);
@@ -1478,12 +1596,42 @@ b", "ext4", "/dev/a", 1,
     #[tokio::test]
     async fn real_extra_metrics_are_valid() {
         // 實際的磁碟、網路與溫度讀數也符合協定（各平台可能為空）
-        let metrics = tokio::task::spawn_blocking(|| Extras::new().refresh_and_read())
-            .await
-            .unwrap();
-        if !metrics.is_empty() {
-            kairos_proto::validate_metrics(&metrics).unwrap();
+        let (metrics, processes) = tokio::task::spawn_blocking(|| {
+            let mut sys = System::new();
+            refresh_cpu_and_memory(&mut sys);
+            let mut extras = Extras::new(Arc::new(CollectOptions::defaults()));
+            extras.refresh_and_read(&sys)
+        })
+        .await
+        .unwrap();
+        // 沒有 label 的新指標一定有（負載只有 Linux）
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        for name in [
+            "system.memory.available",
+            "system.swap.total",
+            "system.uptime",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
         }
+        assert_eq!(
+            names.contains(&"system.cpu.load_1m"),
+            cfg!(target_os = "linux")
+        );
+        kairos_proto::validate_metrics(&metrics).unwrap();
+        assert!(
+            processes.is_none(),
+            "建立時只是基準，排行在 processes.interval 之後"
+        );
+        // 每個送出的掛載點都有完整的一組（total、available、used、usage）
+        let count = |n: &str| names.iter().filter(|x| **x == n).count();
+        assert_eq!(
+            count("system.filesystem.total"),
+            count("system.filesystem.used")
+        );
+        assert_eq!(
+            count("system.filesystem.total"),
+            count("system.filesystem.usage")
+        );
     }
 
     fn ready(outcome: SampleOutcome) -> Sample {

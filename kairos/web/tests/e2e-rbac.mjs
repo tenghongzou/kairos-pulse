@@ -19,6 +19,10 @@ const PAGES = [
   // [路徑, 頁面標題（可見時）, 可見的角色]
   ['/', '總覽', ['admin', 'operator', 'auditor', 'viewer']],
   ['/hosts', '主機', ['admin', 'operator', 'auditor', 'viewer']],
+  // F4：主機詳情的行程與資產資訊（hosts:read；METRICS.md 第 10 節）
+  ['/hosts/11111111-1111-4111-8111-000000000001/processes', 'web-01', ['admin', 'operator', 'auditor', 'viewer']],
+  ['/hosts/11111111-1111-4111-8111-000000000001/inventory', 'web-01', ['admin', 'operator', 'auditor', 'viewer']],
+  ['/hosts/11111111-1111-4111-8111-000000000001/metrics?metric=io', 'web-01', ['admin', 'operator', 'auditor', 'viewer']],
   ['/alerts/events', '告警事件', ['admin', 'operator', 'auditor', 'viewer']],
   ['/alerts/rules', '告警規則', ['admin', 'operator', 'auditor']],
   ['/alerts/silences', '靜音與維護時段', ['admin', 'operator', 'auditor', 'viewer']],

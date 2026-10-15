@@ -52,8 +52,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [0.8.0] - 〔草稿：發佈日期待定〕
 
-〔草稿〕**Kairos 0.8.0**：衝刺 7 的主控台收尾——設計包 `decisions/INTEGRATION.md` §29.5 的 #3～#5、§29.6 的「S20 項目併入 `system/health`」、`ia.md` §2／§7 的計數泡泡與全站 Banner，以及會讓主機無法續簽的設定變更的影響預覽（`impact_token`）。版本號仍為 0.7.0（發佈時再升）。
-〔草稿〕**Kairos 0.8.0、Pulse 0.8.0**（分支 `sprint7/packaging`；`Cargo.toml` 的版本尚未調整，整合時一併改為 0.8.0）：衝刺 7 的**安裝與平台**（商業審計 O4、O5）。**協定、資料庫 schema、設定欄位都不變**，0.7 與 0.8 的任何組合都能連線。
+〔草稿〕**Kairos 0.8.0、Pulse 0.8.0**：衝刺 7 的三條線——**指標擴充**（審計 F4，規格 `crates/kairos-proto/METRICS.md`）、**安裝與平台**（商業審計 O4、O5：`kairos pki`、deb／rpm、aarch64、Pulse 的 Windows 服務與 MSI、一行安裝腳本）與**主控台收尾**（設計包 `decisions/INTEGRATION.md` §29.5 的 #3～#5、§29.6 的「S20 項目併入 `system/health`」、`ia.md` §2／§7 的計數泡泡與全站 Banner、會讓主機無法續簽的設定變更的影響預覽 `impact_token`），**協定版本不變（v1～v2）**，新增 feature `inventory`、`processes`（雙方都宣告時才使用），0.7 與 0.8 的任何組合都能連線；Kairos 的資料庫升級到 **schema v8**。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -61,13 +60,50 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 |---|---|---|---|---|
 | 1 | Kairos | **`PUT /api/v1/pki/policy` 縮短過期寬限期時 `impact_token` 必填**（API.md 第 11.5 節原本就這樣寫，0.7 沒有檢查）：缺少時 400 `confirmation_required`、數字已改變時 409 `impact_changed`；使主機立即無法續簽時 `reason` 必填 | 以腳本縮短寬限期的整合 | 先 `GET /api/v1/pki/policy/impact?expired_renew_grace_days=N`，把回應的 `impact_token`（與 L2 時的 `reason`）一起送出 |
 | 2 | Kairos | **「改用設定檔的值」會關閉註冊端點或縮短寬限期時需要確認**：`POST /api/v1/settings/reset` 同上（`GET /api/v1/settings/reset/impact?keys=…`）；`kairos config reset` 有主機受影響時為 L2（互動輸入「停止續簽 N 台」，非互動 `--yes --expect-count <N> --reason <原因>`，數字不符時結束代碼 6） | 以 `kairos config reset enroll.mode` 或 API 改回設定檔的部署腳本 | 腳本加上 `--expect-count` 與 `--reason`（或先查影響再帶 `impact_token`）；其他設定鍵不受影響 |
+| 3 | Kairos | **`kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`**（`kairos pki init` 的根 CA 暫存目錄對服務不可見；目錄不存在時沒有影響） | 自行把 Kairos 需要讀取的檔案放在 `/opt/kairos/root-ca` 的部署（不應如此） | 不需要動作；換上新版 unit 後 `systemctl daemon-reload` |
+| 4 | 兩者 | **發佈檔的種類與檔名增加**：`linux-aarch64`、`.deb`、`.rpm`，Pulse 另有 `windows-x86_64.zip`／`.msi` 與 `pulse-install.sh`；`SHA256SUMS` 的列數增加 | 以檔名樣式抓取 `dist/` 或 `SHA256SUMS` 的自動化（例如只預期 4 個檔案） | 依新的檔名調整；既有的 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz` 不變 |
+| 5 | Kairos | **資料庫 schema v8**：遷移時重建 `series`（`series_id` 不變），大型資料庫的第一次啟動會多花一些時間；升級後 0.7 的 Kairos 無法開啟 | 所有 SQLite 部署 | 升級前 `kairos db backup`；降版從備份還原 |
+| 6 | Kairos | **容量估算由每台約 52 MB 改為約 129 MB**（METRICS.md 第 9.6 節、D1）：預設 `storage.max_total_bytes` 64 GiB 約可完整保留 530 台，`server.max_connections` 為預設 1024 時啟動會記容量不足的 `WARN`；系統健康與 `sys.db_capacity` 的預估同步改變 | 主機數多、沿用預設上限的部署 | 依 STORAGE.md 第 10 節調高 `storage.max_total_bytes` 或縮短保留天數 |
+| 7 | Kairos | **`GET /api/v1/hosts/{id}/metrics/{name}` 的計數器預設回傳每秒速率**（`transform=rate`），單位 `<原單位>/s`；累計值改用 `transform=none`（只有原始資料解析度）。v8 起計數器的累計值不再彙總 | 以 API 讀取網路流量趨勢的整合（0.7 的主控台沒有使用） | 改讀速率，或加上 `transform=none&resolution=raw` |
+| 8 | Kairos | **SQLite 後端的 `hello_ack` 另宣告 `inventory`、`processes`** | 舊版 Pulse 不認得、忽略；比對 `features` 全文的監控腳本 | 無 |
+| 9 | Kairos | 趨勢查詢只列出這台主機用過的序列（0.7 會列出所有主機的同名序列，其他主機的為空的 `points`） | 依 `series` 數量判斷的整合 | 無 |
+| 10 | Pulse | **`buffer.max_mb` 預設由 64 改為 128**（METRICS.md D7）：每筆緩衝記錄因新指標變大（約 1.5～5 KB），128 MiB 約保存 2～3 天，與 `buffer.max_records` 的約 69 小時相近 | 沒有在 `pulse.toml` 設定 `buffer.max_mb` 的部署：緩衝目錄最多多用約 64 MiB | 磁碟空間不足時在 `pulse.toml` 明確設定 `[buffer] max_mb = 64` |
+| 11 | Pulse | **每筆 report 的指標變多**：協商了 `metrics` 時由最多 163 個（磁碟、介面、感測器各 32）改為最多 243 個，**掛載點與介面的上限由 32 改為 16**、磁碟 I/O 裝置 8 | 掛載點或網路介面超過 16 個的主機：優先順序最低的不再送（第一次取樣時記一則 `INFO`，`sysinfo.snapshot`） | 需要時以 `collect.interface_exclude` 排除不需要的介面，或關閉某一類（`collect.*`） |
+| 12 | Pulse | **systemd unit 新增 `RuntimeDirectory=pulse` 與 `ExecStartPre=-+/usr/bin/install … /sys/class/dmi/id/product_serial /run/pulse/product_serial`**（METRICS.md D4：以 root 把系統序號複製給 Pulse 讀，Pulse 本身仍不需要特權） | 自行維護 unit 或以 drop-in 覆寫的部署：沒有這幾行時資產不含序號（記一次 `PLS-I8009`） | 換上新版 `pulse.service` 後 `systemctl daemon-reload && systemctl restart pulse`；不想送序號時設定 `[inventory] hardware_serials = false` |
 
-### Kairos
+**升級步驟**：先 `kairos db backup <檔案> --include-keys --password-stdin < <密碼檔>`（schema v8 升級後 0.7 無法開啟資料庫）→ 確認 `storage.max_total_bytes` 足夠（第 6 項）→ 換上 Kairos 0.8.0（tar.gz 安裝照 INSTALL 第 11 節換執行檔，換上新版 `kairos.service` 並 `systemctl daemon-reload`）→ 啟動（第一次啟動會遷移 `series`）→ 換上 Pulse 0.8.0 與新版 `pulse.service`（`daemon-reload` 後重新啟動）。以腳本縮短寬限期或改回設定檔的值的整合，依第 1、2 項加上 `impact_token`／`--expect-count`。**不要**把既有的 tar.gz 安裝直接改裝成 deb／rpm（套件的預設設定是全新安裝用的；兩者版面相同，但 unit 改放 `/usr/lib/systemd/system`）。
+
+### 相容性
+
+| Pulse | Kairos | 結果 |
+|---|---|---|
+| 0.8.0 | 0.1.0（v1） | v1 三欄位，與以前相同 |
+| 0.8.0 | 0.2.0～0.7.0 | v2＋`metrics`（＋`durable`）：新指標照送、原樣保存；不送行程排行與資產（舊版不宣告） |
+| 0.8.0 | 0.8.0（JSONL 後端） | 同上（JSONL 後端不宣告 `processes`、`inventory`） |
+| 0.8.0 | 0.8.0（SQLite） | 全部功能 |
+
+- 0.7 的 Pulse × 0.8 的 Kairos：與 0.7 × 0.7 相同；0.2.0～0.7.0 的 Pulse 在 0.8 的 Kairos 上由磁碟總量與可用量推算使用率（`derived = 2`），主控台標示「推算」。端對端測試涵蓋 0.8×0.8、0.8 Pulse×0.7 Kairos、0.7 Pulse×0.8 Kairos（`tests/e2e/tests/metrics.rs`）。
+
+### Kairos：指標擴充（F4）
+
+- **協定**：依儲存後端宣告 `inventory`、`processes`（JSONL 不宣告）；`inventory` 的驗證、每條連線 60 秒的間隔、保存與回應（`invalid_report` 記 `KRS-W2108`）；report 的 `processes` 驗證（型別錯誤 `bad_request`、內容不符 `invalid_report`）與保存。
+- **儲存（schema v8）**：計數器的每秒速率序列（重置、重新開機、晚到的資料沒有速率；重新啟動後以原始資料接續）、Pulse 0.2.0～0.7.0 的推算磁碟使用率（`derived = 2`）、每台主機的序列數上限 `storage.max_series_per_host`（預設 2048，超過時新序列不保存並記 `KRS-W4104`）、資產（合併）與變更歷史（IPv6 暫時位址輪換不記）、行程快照（保留期限與容量刪除同原始資料）、`hosts.boot_time`。STORAGE.md 第 15 節。
+- **API**：`GET /api/v1/hosts/{id}/inventory`、`…/inventory/changes`、`…/processes`（權限 `hosts:read`）；趨勢的 `transform`、`kind`、`derived`、推算的點；指標清單的 `kind`、`standard`；主機清單的 `inventory`（不含序號）、`os_family`、`boot_time`、`uptime_secs`、`last_report.disk`，篩選 `os_family`、排序 `disk`、`uptime`，facets 的 `os_family`；詳情的檔案系統、置換空間、負載、行程數、網路與磁碟速率、資產（含序號）；總覽 `top_disk`。API.md 第 5.1～5.4、5.9、5.10 節。
+- **告警**：指標門檻新增 `disk`（每個掛載點各自觸發與恢復、`mountpoints` 範圍）、`swap`、`load`（每核心）、`network_rx`／`network_tx`（Mbps、`devices` 範圍）；預覽與回測支援新指標並列出沒有回報的主機數。新的內建規則 **`sys.host_rebooted`「主機重新開機」**（資訊、不通知、預設啟用；D5），內建規則共 32 條。ALERTS.md 第 5.3 節。
+
+### Kairos：主控台收尾的後端
 
 - **系統健康併入四項**（§29.6）：`GET /api/v1/system/health` 新增 `issuing_ca`（`KRS-W1304`、`KRS-E1303`、離線簽發的待簽發超過 24 小時）、`enroll`（S20「註冊端點」狀態表：`KRS-E2001`、`KRS-W2009`、`KRS-W2011`、`KRS-W3005`、僅續簽仍有有效 token）、`alerts`（告警引擎沒有在執行為嚴重）、`metrics`（S20「/metrics 端點」列的三種寫法；這次啟動後曾拒絕經反向代理轉送的請求時註明）。整體狀態與各項狀態對所有人相同，這四項的 `summary`／`values` 只給有 `pki:read`／`enroll:read`／`alerts:read`／`settings:read` 的身分（其他身分 `restricted: true`）；總覽的 `health` 同樣省略。
 - **影響預覽**：`GET /api/v1/pki/policy/impact`、`GET /api/v1/settings/reset/impact`——K（目前在寬限期內、以新的寬限期計算已經結束、沒有個別延長的主機）、最早受影響的 10 台、N／M／L／R／T（關閉時）、`level`、`confirm_text`（「停止續簽 K 台」）、`impact_token`（5 分鐘）；確認時的等級、原因與數字寫進稽核。
 - **`GET /api/v1/enroll/requests` 的 `state`**（`pending_approval`／`approved`，只用於 `view=pending`）：主控台「待核准」計數泡泡的來源。
 - **稽核列表的 `meta.integrity`**：最近一次驗證（自我驗證或手動；結果、執行者、斷點）與目前的 HMAC 起點；`audit.verify` 的 `details` 另帶 `hmac`、`hmac_since_id`。
+
+### Kairos：`kairos pki`（O5）
+
+- **`kairos pki init`**：一個指令建立根 CA（ECDSA P-384、`pathlen:1`、10 年）、伺服器憑證（P-256、SAN＝`--name`、EKU `serverAuth`、`CA:FALSE`、825 天）與代理簽發 CA（沿用 `issuing-ca new`／`install` 的程式碼與儲存，自動啟用線上簽發），並寫出 `data/pki/issuing-cas.pem` 作為 `auth.client_ca`。只能執行一次（已有簽發 CA 或任何檔案已存在時結束代碼 11）；寫稽核 `pki.init`；提醒把根 CA 私鑰移到離線保存（`KRS-W1306`〔暫定〕）。INSTALL 不再需要手寫 `ca.cnf`（舊流程移到附錄 P）。
+- **`kairos pki sign --profile server|issuing-ca|client`**：在 CA 主機簽發伺服器憑證（`--csr` 或 `--new-key`）、代理簽發 CA、用戶端憑證；簽發者可以是 P-256、P-384 或既有的 RSA 根 CA（PKCS#8）。CSR 驗證簽章、擴充欄位一律不複製；CA 私鑰權限不是 0600 時拒絕（`KRS-E1307`〔暫定〕）；輸出檔不覆寫；簽發前先在私鑰旁的 `kairos-ca.log`（0600）附加紀錄。
+- **`kairos pki gencrl`**：線上模式呼叫主控台 S15「立即產生 CRL」的同一個函式（`PkiManager::regenerate_crl`，寫稽核 `crl.generate`）；離線模式（`--ca-cert`／`--ca-key`）依 `kairos pki revocations export` 匯出的 `kairos-revocations/v1` 產生 CRL，版本單調遞增。
+- 規格與設計取捨：`PKI.md` 第 15 節（含待決定事項：既有部署以根 CA／代理 CA 當 `auth.client_ca` 時，退役的簽發 CA 簽出的憑證仍可能經由那一組驗證器通過；根 CA 私鑰的加密保存）。
 
 ### 主控台（Web）
 
@@ -79,29 +115,28 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **S21 系統設定**：「改用設定檔的值／內建預設值」先預覽影響，會關閉註冊端點或縮短寬限期時列出受影響的主機並帶 `impact_token`，有主機受影響時 L2；套用模式或改用設定檔的值送出時數字已改變（409）會關閉對話框、以新的數字重新確認（0.7 只換 token、沿用舊的確認字串）；「整合」分頁的 /metrics 反向代理說明；模式按鈕的提示「已是目前的模式」、寬限期 0 天的說明指向憑證政策。
 - **S12、S13、S16**：註冊端點為僅續簽或關閉時，管理員看到「前往系統設定」、其他角色看到「請管理員…」；批次結果訊息的主機名稱不再重複括號；使用者詳情對自己或最後一位全站管理員的「刪除使用者…」改為 `aria-disabled` 並說明原因。
 - **權限的自動掃描**（`tests/e2e-rbac.mjs`）：每個角色逐頁（含清單第一筆的詳情頁）比對看得到的寫入按鈕與 `ia.md` §4.2，沒有分類的寫入按鈕視為失敗，並反向確認有權限的角色看得到主要的寫入按鈕。
-| 1 | Kairos | **`kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`**（`kairos pki init` 的根 CA 暫存目錄對服務不可見；目錄不存在時沒有影響） | 自行把 Kairos 需要讀取的檔案放在 `/opt/kairos/root-ca` 的部署（不應如此） | 不需要動作；換上新版 unit 後 `systemctl daemon-reload` |
-| 2 | 兩者 | **發佈檔的種類與檔名增加**：`linux-aarch64`、`.deb`、`.rpm`，Pulse 另有 `windows-x86_64.zip`／`.msi` 與 `pulse-install.sh`；`SHA256SUMS` 的列數增加 | 以檔名樣式抓取 `dist/` 或 `SHA256SUMS` 的自動化（例如只預期 4 個檔案） | 依新的檔名調整；既有的 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz` 不變 |
+- **指標擴充**（F4）：S05 主機概覽的目前數值（置換空間、負載與每核心、使用率最高的掛載點與「將滿」、運作時間、行程數）；趨勢的六個指標群組（掛載點小倍數、忙碌時間比例、網路錯誤數、負載參考線、表格檢視）；「行程」與「資產資訊」分頁（序號只在詳情）；S04 的磁碟欄、作業系統（家族）篩選與欄位設定；S03 的磁碟排行；S09 告警規則的 7 個指標、掛載點／介面範圍與預覽的「沒有回報」；S08 的新範本；舊版 Pulse 與 Windows 的空狀態。
 
-**升級步驟**：tar.gz 安裝的部署照 INSTALL 第 11 節換執行檔即可（設定不變）。**不要**把既有的 tar.gz 安裝直接改裝成 deb／rpm（套件的預設設定是全新安裝用的；兩者版面相同，但 unit 改放 `/usr/lib/systemd/system`）。
+### Pulse：指標擴充（F4）
 
-### Kairos：`kairos pki`（O5）
-
-- **`kairos pki init`**：一個指令建立根 CA（ECDSA P-384、`pathlen:1`、10 年）、伺服器憑證（P-256、SAN＝`--name`、EKU `serverAuth`、`CA:FALSE`、825 天）與代理簽發 CA（沿用 `issuing-ca new`／`install` 的程式碼與儲存，自動啟用線上簽發），並寫出 `data/pki/issuing-cas.pem` 作為 `auth.client_ca`。只能執行一次（已有簽發 CA 或任何檔案已存在時結束代碼 11）；寫稽核 `pki.init`；提醒把根 CA 私鑰移到離線保存（`KRS-W1306`〔暫定〕）。INSTALL 不再需要手寫 `ca.cnf`（舊流程移到附錄 P）。
-- **`kairos pki sign --profile server|issuing-ca|client`**：在 CA 主機簽發伺服器憑證（`--csr` 或 `--new-key`）、代理簽發 CA、用戶端憑證；簽發者可以是 P-256、P-384 或既有的 RSA 根 CA（PKCS#8）。CSR 驗證簽章、擴充欄位一律不複製；CA 私鑰權限不是 0600 時拒絕（`KRS-E1307`〔暫定〕）；輸出檔不覆寫；簽發前先在私鑰旁的 `kairos-ca.log`（0600）附加紀錄。
-- **`kairos pki gencrl`**：線上模式呼叫主控台 S15「立即產生 CRL」的同一個函式（`PkiManager::regenerate_crl`，寫稽核 `crl.generate`）；離線模式（`--ca-cert`／`--ca-key`）依 `kairos pki revocations export` 匯出的 `kairos-revocations/v1` 產生 CRL，版本單調遞增。
-- 規格與設計取捨：`PKI.md` 第 15 節（含待決定事項：既有部署以根 CA／代理 CA 當 `auth.client_ca` 時，退役的簽發 CA 簽出的憑證仍可能經由那一組驗證器通過；根 CA 私鑰的加密保存）。
-
-### 套件與安裝（O5）
-
-- **deb／rpm**（nfpm 2.47.0，在建置容器內產生）：Kairos 與 Pulse 各一個，x86_64 與 aarch64。版面與 tar.gz 相同（`/opt/<名稱>`），加上 `/usr/lib/systemd/system/<名稱>.service`、`/usr/bin/<名稱>`；預設設定為 config（升級不覆寫）；安裝前建立系統帳號，安裝後建立可寫目錄（Pulse 另產生 `agent.id`）、`systemctl enable`（不啟動），升級時 `try-restart`，移除時 `disable --now`；移除與 purge 都不刪除 Kairos 的資料目錄。Kairos 套件的預設設定以絕對路徑指向 `kairos pki init` 寫出的檔案，安裝後只要 `pki init` 與 `systemctl start`（INSTALL 第 A 節）。
-- **`pulse-install.sh`**（一行安裝腳本）：以從另一個管道取得的 `allowed_signers` 驗證 `SHA256SUMS` 的簽章 → 依架構與套件管理員選出套件、核對 SHA-256（不接受 `-dirty`）→ 安裝 → `pulse enroll --install-string`（安裝字串可由環境變數傳入）→ 啟動服務。也支援已下載好的目錄（`--dir`，離線環境）。
-- **Ansible role（最小版）**：`packaging/ansible/`（role `pulse`、範例 `site-pulse.yml`），做與安裝腳本相同的驗證、安裝與註冊；只經過 syntax-check，尚未對實際主機執行（Pulse 的 INSTALL 第 A.4 節）。Kairos 沒有 role。
+- **19 個新的標準指標**（共 27 個；METRICS.md 第 3 節）：負載（`system.cpu.load_1m`／`5m`／`15m`，只有 Linux）、可用記憶體、置換空間（總量／已使用）、每個掛載點的已使用量與使用率（`used` = total − free，`usage` 與 `df` 的 Use% 相同；Linux 以 `statvfs` 取 `f_bfree`、Windows 以 `GetDiskFreeSpaceExW`）、磁碟 I/O（累計讀寫量；Linux 另有讀寫次數與忙碌時間，直接讀 `/proc/diskstats`，裝置名稱支援 device mapper 的 `dm-N`）、網路封包與錯誤、行程數（同 `ps -e`）、開機秒數。**計數器一律送原始累計值**，速率由 Kairos 計算。協商了 `metrics` 的 0.2.0～0.7.0 Kairos 只檢查格式、原樣保存。
+- **每類上限與優先順序、以整組為單位的截斷**：掛載點 16（`/` 或系統磁碟機優先，其餘容量大者）、磁碟 I/O 裝置 8（依掛載點順序）、介面 16（有 IPv4 → 流量大者）、溫度 32；整行超過 65536 bytes 時依序捨去行程命令列 → 行程排行（先縮成各 3 項）→ 溫度 → 介面 → 磁碟 I/O 裝置 → 掛載點，每組（例如一個掛載點的 4 個指標）一起捨去，無 label 的指標一律保留；每 10 分鐘最多一則 `WARN`。
+- **行程排行**（feature `processes`；`[processes]`）：每 60 秒附在 report 上，依 CPU、記憶體各 5 個；CPU 為占整台主機的百分比。命令列預設不送（`processes.command = "none"`），可設 `executable`（只送執行檔路徑）或 `full`（含參數，截斷到 1024 bytes）。行程排行隨 report 存入本機緩衝、斷線後一起補送；0.7 寫入的緩衝記錄仍可讀取。只看得到自己的行程（`ProtectProc=invisible`）時不送行程數與排行，記一次 `PLS-I8009`。
+- **主機資產**（feature `inventory`、新訊息 `inventory`；`[inventory]`）：OS、開機時間、CPU（型號、廠商、實體／邏輯核心數、標稱時脈）、記憶體、廠牌型號序號（SMBIOS）、主機板、BIOS、磁碟（掛載點、裝置、檔案系統、容量、SSD／HDD、可移除、唯讀）、網卡（MAC、IP、MTU）。連線後送一次、內容改變才送、距離上次送達滿 24 小時也送；`invalid_report` 後同樣的內容不再送（`inventory.rejected PLS-W2108`〔暫定〕），`storage_unavailable` 5 分鐘後重送。不經過本機緩衝。
+- 設定：`[collect]`（`filesystems`、`disk_io`、`network`、`temperature`、`max_filesystems`、`max_disks`、`max_interfaces`、`interface_exclude`）、`[processes]`（`enabled`、`interval`、`top`、`command`、`include_user`〔本版不實作〕）、`[inventory]`（`enabled`、`interval`、`hardware_serials`、`network_addresses`）。hello 依設定宣告 `inventory`、`processes`；本機狀態檔（`status.json`、`pulse status --json`）的 `features` 列出協商結果。
+- 代碼（暫定號，待設計組正式分配）：`PLS-W2108`（資產資訊被伺服器拒絕）、`PLS-I8009`（部分系統資訊無法取得：序號、磁碟 I/O、行程）。事件 `sysinfo.snapshot`、`sysinfo.limited`、`inventory.rejected`（Windows 事件識別碼待分配）。
 
 ### Pulse：Windows（O4）
 
 - **Windows 服務**：`pulse service install|uninstall|run`（`windows-service` 0.8.1）。服務 `Pulse`、自動啟動、LocalSystem、失敗時 10 秒後重新啟動（一天最多 3 次）。`service run` 先把工作目錄切換到 `pulse.exe` 所在目錄（或 `--workdir`），**不再落在 `C:\Windows\System32`**；停止與關機要求與 Ctrl+C 相同地送出 close_notify 後結束。新增暫定代碼 `PLS-E8205`、`PLS-E8206`〔暫定〕。
 - **MSI**（msitools 0.106 的 `wixl`，在 Linux 建置容器內產生）：安裝到 `C:\Program Files\Pulse\`、註冊服務（不加入 PATH：wixl 的 `<Environment>` 無法重現）；`pulse.toml` 升級與移除都保留；MajorUpgrade。另有內容相同的 zip。
 - **未在 Windows 實機驗證**（只在 kp-build 交叉編譯、clippy 與產生 MSI）：服務的安裝與啟停、MSI 的安裝／升級／移除、工作目錄、`pulse enroll` 重新啟動服務、檔案 ACL 都待在 Windows 上測試。Windows 事件記錄、MSI 的安裝字串參數與移除時的 `pulse decommission`、程式碼簽章仍未做。
+
+### 套件與安裝（O5）
+
+- **deb／rpm**（nfpm 2.47.0，在建置容器內產生）：Kairos 與 Pulse 各一個，x86_64 與 aarch64。版面與 tar.gz 相同（`/opt/<名稱>`），加上 `/usr/lib/systemd/system/<名稱>.service`、`/usr/bin/<名稱>`；預設設定為 config（升級不覆寫）；安裝前建立系統帳號，安裝後建立可寫目錄（Pulse 另產生 `agent.id`）、`systemctl enable`（不啟動），升級時 `try-restart`，移除時 `disable --now`；移除與 purge 都不刪除 Kairos 的資料目錄。Kairos 套件的預設設定以絕對路徑指向 `kairos pki init` 寫出的檔案，安裝後只要 `pki init` 與 `systemctl start`（INSTALL 第 A 節）。
+- **`pulse-install.sh`**（一行安裝腳本）：以從另一個管道取得的 `allowed_signers` 驗證 `SHA256SUMS` 的簽章 → 依架構與套件管理員選出套件、核對 SHA-256（不接受 `-dirty`）→ 安裝 → `pulse enroll --install-string`（安裝字串可由環境變數傳入）→ 啟動服務。也支援已下載好的目錄（`--dir`，離線環境）。
+- **Ansible role（最小版）**：`packaging/ansible/`（role `pulse`、範例 `site-pulse.yml`），做與安裝腳本相同的驗證、安裝與註冊；只經過 syntax-check，尚未對實際主機執行（Pulse 的 INSTALL 第 A.4 節）。Kairos 沒有 role。
 
 ### 平台與發佈（O4）
 
@@ -110,20 +145,41 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **可重現**：所有新產物以 commit 時間為時間戳記（tar、zip〔TZ=UTC〕、nfpm 的 `mtime`、MSI〔libfaketime〕），MSI 的 PackageCode／ProductCode 由版本與 commit 推導，Windows 執行檔以 `--no-insert-timestamp` 連結並去掉符號表；`packaging/check-reproducible.sh` 比對所有產物。
 - 建置容器多安裝的 Alpine 套件（版本固定）：`zig`、`qemu-aarch64`、`mingw-w64-gcc`、`msitools`、`libfaketime`、`zip`；nfpm 以固定版本下載並核對 SHA-256。
 
-### 新的產品代碼〔暫定，需設計包分配〕
+### 共用 crate（指標擴充規格）
+
+- **`crates/kairos-proto/METRICS.md`**〔0.8.0 規格〕：磁碟（每個掛載點的用量與使用率、I/O）、網路（封包、錯誤）、負載、置換空間、行程數、uptime 等 19 個新標準指標（共 27 個），行程排行（feature `processes`）與主機資產（feature `inventory`、新訊息 `inventory`）；採集來源與上限、計數器的重置處理、相容矩陣、隱私、Kairos schema v8 草案、查詢 API、告警、主控台與實作分工。PROTOCOL.md 的標準指標表、features 表、訊息表與錯誤碼表同步更新。**協定版本不變（v1～v2）**；新指標沿用 `metrics` 陣列，0.2.0～0.7.0 的 Kairos 只檢查格式、原樣保存。
+- `kairos-proto`：`StandardMetric` 增加 `kind`（量測值／計數器）與 `labels`；`counter_rate`、`filesystem_usage`；`ProcessList` 等與 `ReportBody::processes`；`Inventory` 等、`ClientMsg::Inventory`、`validate_inventory`、`inventory_digest`；`Session::inventory`、`Session::processes`。兩個新 feature 不在 `SERVER_FEATURES` 中（由 Kairos 依儲存後端宣告）。`StandardMetric`、`Session`、`ReportBody` 新增欄位，以結構常值建立它們的程式需要補上欄位。
+
+### 新的產品代碼
+
+設計包 §30 正式分配 `KRS-W2108`、`KRS-W4104`（號碼與工程暫定的相同）；其餘標〔暫定〕的待設計包分配後替換。
 
 | 代碼 | 等級 | 何時 |
 |---|---|---|
-| `KRS-W1306` | 警告 | `kairos pki init` 完成時：根 CA 私鑰仍在這台伺服器上 |
-| `KRS-E1307` | 錯誤 | `kairos pki sign`、離線 `kairos pki gencrl`：CA 憑證或私鑰無法使用 |
-| `PLS-E8205` | 錯誤 | `pulse service install`／`uninstall`：服務控制管理員回報錯誤（多半是沒有系統管理員權限） |
-| `PLS-E8206` | 錯誤 | `pulse service run` 不是由服務控制管理員啟動，或工作目錄無法切換 |
+| `KRS-W2108` | 警告 | 資產資訊不合法：Kairos 以 `invalid_report` 拒收 `inventory` |
+| `KRS-W4104` | 警告 | 主機的指標序列數已達上限（`storage.max_series_per_host`），部分指標未保存 |
+| `PLS-W2108`〔暫定〕 | 警告 | 資產資訊被伺服器拒絕（同樣的內容不再送） |
+| `PLS-I8009`〔暫定〕 | 資訊 | 部分系統資訊因權限或平台限制無法取得（序號、磁碟 I/O、行程），每項只記一次 |
+| `KRS-W1306`〔暫定〕 | 警告 | `kairos pki init` 完成時：根 CA 私鑰仍在這台伺服器上 |
+| `KRS-E1307`〔暫定〕 | 錯誤 | `kairos pki sign`、離線 `kairos pki gencrl`：CA 憑證或私鑰無法使用 |
+| `PLS-E8205`〔暫定〕 | 錯誤 | `pulse service install`／`uninstall`：服務控制管理員回報錯誤（多半是沒有系統管理員權限） |
+| `PLS-E8206`〔暫定〕 | 錯誤 | `pulse service run` 不是由服務控制管理員啟動，或工作目錄無法切換 |
+
+事件 `sysinfo.snapshot`、`sysinfo.limited`、`inventory.rejected`（Pulse；Windows 事件識別碼待分配）。
 
 ### 測試
 
 - Kairos：`pki::ca`（根 CA 擴充欄位、伺服器憑證通過 webpki 的 `serverAuth` 與名稱驗證、簽發 CA 通過 `issuing-ca install` 的檢查、既有 RSA 根 CA、CSR 簽章、離線 CRL 與撤銷清單、`pki init` 的覆寫保護與權限）、`pki_cli`（`sign` 的紀錄與不覆寫、私鑰權限、離線 `gencrl` 的版本遞增、用法錯誤）。
 - 端對端：`pki_init_then_install_string_registers_and_the_service_connects`——只以 `kairos pki init` 產生的 PKI 啟動 Kairos，Pulse 以安裝字串註冊並以 mTLS 連上；線上 `pki gencrl`；第二次 `pki init` 被拒。
 - Pulse：`pulse service` 的參數解析與工作目錄；Linux 與 `x86_64-pc-windows-gnu` 的 clippy。
+- 指標擴充：Kairos 的 schema v8 遷移、速率與推算序列、資產與行程的協定處理、新告警指標與回測；Pulse 的各平台採集、截斷與優先順序、資產摘要與重送；端對端 `tests/e2e/tests/metrics.rs`；主控台 `e2e-metrics.mjs`。
+- 主控台收尾：`e2e-rbac.mjs` 的寫入按鈕自動掃描、`e2e-admin.mjs`／`e2e-pki.mjs` 的 Banner 與計數泡泡、影響預覽；`run.sh` 在任何失敗、axe 違規、主控台錯誤或沒有執行測試時以非 0 結束。
+
+### 尚未實機驗證
+
+- Windows（只經過 `x86_64-pc-windows-gnu` 的交叉編譯與 clippy）：虛擬服務帳號 `NT SERVICE\Pulse` 下的磁碟 I/O（`IOCTL_DISK_PERFORMANCE`）、行程清單與命令列、SMBIOS 序號、`GetDiskFreeSpaceExW`、登錄的 BIOS 與 `~MHz`。
+- Pulse 的 Windows 服務與 MSI（見上方「Pulse：Windows」）；Ansible role 只經過 syntax-check。
+
 
 ## [0.7.0] - 〔草稿：發佈日期待定〕
 

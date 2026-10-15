@@ -1054,6 +1054,7 @@ mod tests {
             total_memory_bytes: 2048,
             used_memory_bytes: 1024,
             extra: vec![Metric::new("system.temperature", 40, "Cel")],
+            processes: None,
         }
     }
 

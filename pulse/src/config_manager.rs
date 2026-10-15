@@ -32,6 +32,20 @@ pub const MAX_REPLAY_INTERVAL_MS: u64 = 60_000;
 /// 間隔不小於取樣間隔時，送出的速度追不上新的取樣、積壓永遠補不完。60% 時送出速率至少是取樣速率的
 /// 1.67 倍（`report.interval = 1` 時為 600 ms）
 pub const MAX_REPLAY_SHARE_PERMILLE: u64 = 600;
+/// `collect.max_filesystems`／`max_disks`／`max_interfaces` 的上限（METRICS.md 第 4.3 節：
+/// 合計最多 243 個指標，不超過每筆 report 256 個）
+pub const MAX_COLLECT_FILESYSTEMS: u64 = 16;
+pub const MAX_COLLECT_DISKS: u64 = 8;
+pub const MAX_COLLECT_INTERFACES: u64 = 16;
+/// `collect.interface_exclude` 的項目數上限
+pub const MAX_INTERFACE_EXCLUDE: usize = 32;
+/// `processes.interval` 的上限（秒）
+pub const MAX_PROCESSES_INTERVAL: u64 = 3600;
+/// `inventory.interval` 的範圍（秒）
+pub const MIN_INVENTORY_INTERVAL: u64 = 300;
+pub const MAX_INVENTORY_INTERVAL: u64 = 86_400;
+/// `processes.command` 可用的值
+pub const PROCESS_COMMAND_MODES: [&str; 3] = ["none", "executable", "full"];
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ServerConfig {
@@ -128,6 +142,56 @@ pub struct BufferConfig {
     /// 兩筆 report 之間的最短間隔（毫秒；補送積壓時的速率）。實際使用的值見
     /// [`AppConfig::effective_replay_interval_ms`]
     pub replay_interval_ms: u64,
+}
+
+/// `[collect]`：標準指標的採集範圍與每類上限（METRICS.md 第 4.3、4.6 節）
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct CollectConfig {
+    /// 送 `system.filesystem.*`
+    pub filesystems: bool,
+    /// 送 `system.disk.*`
+    pub disk_io: bool,
+    /// 送 `system.network.*`
+    pub network: bool,
+    /// 送 `system.temperature`
+    pub temperature: bool,
+    /// 掛載點上限（0～[`MAX_COLLECT_FILESYSTEMS`]；0 = 不送）
+    pub max_filesystems: u64,
+    /// 磁碟 I/O 裝置上限（0～[`MAX_COLLECT_DISKS`]）
+    pub max_disks: u64,
+    /// 網路介面上限（0～[`MAX_COLLECT_INTERFACES`]）
+    pub max_interfaces: u64,
+    /// 額外排除的網路介面名稱（glob：`*`、`?`；最多 [`MAX_INTERFACE_EXCLUDE`] 個）
+    pub interface_exclude: Vec<String>,
+}
+
+/// `[processes]`：行程數與行程排行（METRICS.md 第 5 節）
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ProcessesConfig {
+    /// 宣告 feature `processes` 並送 `system.process.count`
+    pub enabled: bool,
+    /// 行程排行的間隔（秒，1～3600；實際不小於 `report.interval`，見
+    /// [`AppConfig::effective_processes_interval`]）
+    pub interval: u64,
+    /// 依 CPU、依記憶體各取幾個（1～10）
+    pub top: u64,
+    /// 命令列：`none`（不送）／`executable`（只送執行檔路徑）／`full`（含參數，截斷到 1024 bytes）
+    pub command: String,
+    /// 送行程的使用者名稱（METRICS.md 第 17 節 D3：本版不實作，設為 true 只記一則 WARN）
+    pub include_user: bool,
+}
+
+/// `[inventory]`：主機資產（METRICS.md 第 6 節）
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct InventoryConfig {
+    /// 宣告 feature `inventory`
+    pub enabled: bool,
+    /// 重新收集資產的間隔（秒，300～86400）
+    pub interval: u64,
+    /// 送系統序號（`system.serial`）
+    pub hardware_serials: bool,
+    /// 送網路介面的 MAC 與 IP 位址
+    pub network_addresses: bool,
 }
 
 /// 本機狀態檔（`pulse status` 讀取，見 `status_file` 模組）
@@ -266,6 +330,9 @@ pub struct AppConfig {
     pub identity: IdentityConfig,
     pub enroll: EnrollConfig,
     pub buffer: BufferConfig,
+    pub collect: CollectConfig,
+    pub processes: ProcessesConfig,
+    pub inventory: InventoryConfig,
     pub status: StatusConfig,
     pub log: LogConfig,
     pub metrics: MetricsConfig,
@@ -313,6 +380,12 @@ impl AppConfig {
             .saturating_mul(MAX_REPLAY_SHARE_PERMILLE)
             .max(MIN_REPLAY_INTERVAL_MS);
         self.buffer.replay_interval_ms.min(cap)
+    }
+
+    /// 實際的行程排行間隔（秒）：`processes.interval`，但不小於 `report.interval`
+    /// （行程排行附在 report 上，比 report 更密沒有意義；不因此拒絕舊的設定）
+    pub fn effective_processes_interval(&self) -> u64 {
+        self.processes.interval.max(self.report.interval)
     }
 
     /// 實際的載入邏輯。
@@ -494,6 +567,64 @@ impl AppConfig {
         )?;
 
         range(
+            "collect.max_filesystems",
+            self.collect.max_filesystems,
+            0,
+            MAX_COLLECT_FILESYSTEMS,
+        )?;
+        range(
+            "collect.max_disks",
+            self.collect.max_disks,
+            0,
+            MAX_COLLECT_DISKS,
+        )?;
+        range(
+            "collect.max_interfaces",
+            self.collect.max_interfaces,
+            0,
+            MAX_COLLECT_INTERFACES,
+        )?;
+        if self.collect.interface_exclude.len() > MAX_INTERFACE_EXCLUDE {
+            return Err(ConfigError::Message(format!(
+                "collect.interface_exclude 最多 {MAX_INTERFACE_EXCLUDE} 個（目前 {} 個）",
+                self.collect.interface_exclude.len()
+            )));
+        }
+        if let Some(bad) = self
+            .collect
+            .interface_exclude
+            .iter()
+            .find(|g| g.trim().is_empty() || g.len() > 256)
+        {
+            return Err(ConfigError::Message(format!(
+                "collect.interface_exclude 的每一項必須是 1～256 bytes 的 glob（例如 \"tap*\"），不可為空字串：{bad:?}"
+            )));
+        }
+        range(
+            "processes.interval",
+            self.processes.interval,
+            1,
+            MAX_PROCESSES_INTERVAL,
+        )?;
+        range(
+            "processes.top",
+            self.processes.top,
+            1,
+            kairos_proto::MAX_TOP_PROCESSES as u64,
+        )?;
+        if !PROCESS_COMMAND_MODES.contains(&self.processes.command.trim()) {
+            return Err(ConfigError::Message(format!(
+                "processes.command「{}」無效（可用：none、executable、full）",
+                self.processes.command
+            )));
+        }
+        range(
+            "inventory.interval",
+            self.inventory.interval,
+            MIN_INVENTORY_INTERVAL,
+            MAX_INVENTORY_INTERVAL,
+        )?;
+        range(
             "log.retention_days",
             u64::from(self.log.retention_days),
             0,
@@ -573,7 +704,8 @@ mod tests {
         // A5：本機緩衝預設啟用
         assert!(cfg.buffer.enabled);
         assert_eq!(cfg.buffer.dir, "buffer");
-        assert_eq!(cfg.buffer.max_mb, 64);
+        // METRICS.md D7：每筆紀錄變大後改為 128 MiB（約 2～3 天）
+        assert_eq!(cfg.buffer.max_mb, 128);
         assert_eq!(cfg.buffer.max_records, 50_000);
         assert_eq!(cfg.buffer.max_age_hours, 168);
         // 1 萬台同時恢復連線時約每秒 8,300 筆（STORAGE.md 第 11.1 節）
@@ -999,5 +1131,108 @@ mod tests {
             .to_string();
         assert!(err.contains("agent.tags"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metrics_collection_defaults_follow_the_spec() {
+        // METRICS.md 第 4.6 節的預設值
+        let cfg = AppConfig::default_for_tests();
+        assert!(cfg.collect.filesystems && cfg.collect.disk_io);
+        assert!(cfg.collect.network && cfg.collect.temperature);
+        assert_eq!(
+            (
+                cfg.collect.max_filesystems,
+                cfg.collect.max_disks,
+                cfg.collect.max_interfaces
+            ),
+            (16, 8, 16)
+        );
+        assert!(cfg.collect.interface_exclude.is_empty());
+        assert!(cfg.processes.enabled);
+        assert_eq!(cfg.processes.interval, 60);
+        assert_eq!(cfg.effective_processes_interval(), 60);
+        assert_eq!(cfg.processes.top, 5);
+        assert_eq!(cfg.processes.command, "none");
+        assert!(!cfg.processes.include_user);
+        assert!(cfg.inventory.enabled);
+        assert_eq!(cfg.inventory.interval, 3600);
+        assert!(cfg.inventory.hardware_serials && cfg.inventory.network_addresses);
+    }
+
+    #[test]
+    fn metrics_collection_settings_are_validated() {
+        for (key, value, name) in [
+            (
+                "PULSE__COLLECT__MAX_FILESYSTEMS",
+                "17",
+                "collect.max_filesystems",
+            ),
+            ("PULSE__COLLECT__MAX_DISKS", "9", "collect.max_disks"),
+            (
+                "PULSE__COLLECT__MAX_INTERFACES",
+                "17",
+                "collect.max_interfaces",
+            ),
+            ("PULSE__PROCESSES__INTERVAL", "0", "processes.interval"),
+            ("PULSE__PROCESSES__INTERVAL", "3601", "processes.interval"),
+            ("PULSE__PROCESSES__TOP", "0", "processes.top"),
+            ("PULSE__PROCESSES__TOP", "11", "processes.top"),
+            ("PULSE__PROCESSES__COMMAND", "args", "processes.command"),
+            ("PULSE__INVENTORY__INTERVAL", "299", "inventory.interval"),
+            ("PULSE__INVENTORY__INTERVAL", "86401", "inventory.interval"),
+        ] {
+            let err = build_err(&[(key, value)]);
+            assert!(err.contains(name), "{key}={value}: {err}");
+        }
+        // 上限 0 = 該類不送；邊界值可接受
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__COLLECT__MAX_FILESYSTEMS", "0"),
+                ("PULSE__COLLECT__MAX_DISKS", "8"),
+                ("PULSE__PROCESSES__COMMAND", "full"),
+                ("PULSE__PROCESSES__TOP", "10"),
+                ("PULSE__INVENTORY__INTERVAL", "300"),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(cfg.collect.max_filesystems, 0);
+        assert_eq!(cfg.processes.command, "full");
+        // 行程排行附在 report 上：間隔不小於 report.interval（不因此拒絕舊設定）
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__REPORT__INTERVAL", "300"),
+                ("PULSE__PROCESSES__INTERVAL", "60"),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_processes_interval(), 300);
+    }
+
+    #[test]
+    fn interface_exclude_from_pulse_toml_is_validated() {
+        let dir = std::env::temp_dir().join(format!("pulse-cfg-exclude-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulse.toml");
+        let load = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            AppConfig::build(Some(&path), Some(Map::new()))
+        };
+        let cfg = load("[collect]\ninterface_exclude = [\"tap*\", \"wg?\"]\n").unwrap();
+        assert_eq!(cfg.collect.interface_exclude, ["tap*", "wg?"]);
+        let err = load("[collect]\ninterface_exclude = [\" \"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("collect.interface_exclude"), "{err}");
+        let many: Vec<String> = (0..33).map(|i| format!("\"x{i}\"")).collect();
+        let err = load(&format!(
+            "[collect]\ninterface_exclude = [{}]\n",
+            many.join(", ")
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("最多 32 個"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

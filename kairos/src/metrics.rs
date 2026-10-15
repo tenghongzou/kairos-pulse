@@ -214,6 +214,7 @@ impl Metrics {
             EventKind::AuthFailed { .. } => self.agent_auth_failed.inc(),
             EventKind::RegistryEvicted { .. } => self.registry_evictions.inc(),
             EventKind::HostDecommissioned { .. }
+            | EventKind::HostRebooted { .. }
             | EventKind::TlsReload { .. }
             | EventKind::Condition { .. }
             | EventKind::Lifecycle { .. }

@@ -12,6 +12,7 @@ import { pkiTests } from './e2e-pki.mjs';
 import { registerAdmin } from './e2e-admin.mjs';
 import { registerRbac } from './e2e-rbac.mjs';
 import { registerWcag } from './e2e-wcag.mjs';
+import { registerMetrics } from './e2e-metrics.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -33,7 +34,8 @@ mkdirSync(OUT, { recursive: true });
 // 測試資料：假 agent（含主機名稱帶 HTML 的主機，XSS 測試）
 const XSS_NAME = '<script>window.__xss=1</script><img src=x onerror="window.__xss=2">';
 const AGENTS = [
-  { agentId: '11111111-1111-4111-8111-000000000001', hostname: 'web-01', tags: ['env:prod', 'web'] },
+  // web-01：模擬 Pulse 0.8.0（新指標、行程排行、資產；F4）
+  { agentId: '11111111-1111-4111-8111-000000000001', hostname: 'web-01', tags: ['env:prod', 'web'], f4: true },
   { agentId: '11111111-1111-4111-8111-000000000002', hostname: 'db-02', tags: ['env:prod', 'db'], os: { name: 'Windows', version: '10 IoT LTSC', arch: 'x86_64' } },
   { agentId: '11111111-1111-4111-8111-000000000003', hostname: XSS_NAME, tags: ['lab'] },
   { agentId: '11111111-1111-4111-8111-000000000004', hostname: 'hmi-line3-07', tags: ['HMI', 'Line3'], os: { name: 'Windows', version: '10 IoT LTSC', arch: 'x86_64' } },
@@ -530,6 +532,9 @@ registerRbac({ test, newPage, login, waitTitle, URL0, PW });
 
 // 發佈前的 WCAG A 級修正（j／k 的範圍、閒置逾時的提醒）：e2e-wcag.mjs
 registerWcag({ test, newPage, login, waitTitle, axe, URL0, PW });
+
+// 指標擴充（F4：S03、S04、S05、S09）：e2e-metrics.mjs
+registerMetrics({ test, newPage, login, waitTitle, axe, shot, URL0, PW });
 
 // 結束代碼的自我檢查（README 第 7 節）：SELFTEST=fail 加入一個必定失敗的測試、SELFTEST=axe 加入一個有 axe 違規
 // （沒有替代文字的圖片）的畫面。兩者都必須讓 run.sh 以非 0 結束；搭配 ONLY=自我檢查 只跑這一個。

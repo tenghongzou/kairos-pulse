@@ -195,7 +195,11 @@ fn connect_durable(kairos: &Kairos) -> RawClient {
     c.send(&durable_hello(REVOKED.agent_id));
     let ack = c.recv();
     assert_eq!(ack["type"], "hello_ack", "{ack}");
-    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    assert_eq!(
+        ack["features"],
+        json!(["metrics", "durable", "inventory", "processes"]),
+        "{ack}"
+    );
     c
 }
 
