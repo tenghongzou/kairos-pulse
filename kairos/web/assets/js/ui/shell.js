@@ -17,11 +17,25 @@ let lastOkAt = null;
 // 側邊導覽的計數泡泡（ia.md §7）：nav.js 項目的 count 鍵 → { n, tone, label }（由各功能設定，例如告警）
 const navCounts = new Map();
 
+const navCountListeners = new Set();
+
 /** 設定導覽項目的計數泡泡；value 為 null 時不顯示 */
 export function setNavCount(key, value) {
   if (value) navCounts.set(key, value);
   else navCounts.delete(key);
   renderNav();
+  for (const fn of navCountListeners) fn(key);
+}
+
+/** 目前的計數（{ n, tone, label } 或 undefined） */
+export function getNavCount(key) {
+  return navCounts.get(key);
+}
+
+/** 計數改變時通知（分頁標題的未確認數；ia.md §7） */
+export function onNavCount(fn) {
+  navCountListeners.add(fn);
+  return () => navCountListeners.delete(fn);
 }
 
 function countBubble(key) {

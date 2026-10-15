@@ -96,6 +96,14 @@ export function register({ test, newPage, login, waitTitle, axe, shot, FakeAgent
     await page.getByRole('button', { name: '建立規則' }).click();
     await page.getByText('恢復門檻不可高於觸發門檻', { exact: false }).first().waitFor();
     await axe(page, '告警規則編輯');
+    // 未儲存的變更：站內換頁先詢問（router 的 setLeaveGuard）；取消後留在原頁、內容不變
+    await page.locator('.ds-sidenav__link', { hasText: '告警事件' }).click();
+    await page.getByRole('dialog').getByText('要放棄變更嗎？').waitFor();
+    await axe(page, '未儲存變更的詢問');
+    await page.getByRole('dialog').getByRole('button', { name: '取消' }).click();
+    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    assert.equal(new URL(page.url()).pathname, '/alerts/rules/new');
+    assert.equal(await page.getByLabel(/^名稱/).inputValue(), 'E2E CPU');
     // 改為主機離線、寬限 0 分鐘、範圍為標籤 alert-e2e
     await page.getByRole('radio', { name: '主機離線', exact: true }).check();
     await page.getByText('主機離線類規則目前無法以歷史資料試算').waitFor({ timeout: 15000 });
@@ -135,6 +143,11 @@ export function register({ test, newPage, login, waitTitle, axe, shot, FakeAgent
     await row.locator('[data-status="critical"]').waitFor();
     // 側邊導覽的計數泡泡
     await p.locator('.ds-sidenav__link', { hasText: '告警事件' }).locator('.ds-sidenav__count').waitFor({ timeout: 15000 });
+    // 分頁標題的未確認數與計數泡泡相同（ia.md §7：「(3) Kairos｜告警事件」）
+    await p.waitForFunction(() => {
+      const b = document.querySelector('.ds-sidenav__count');
+      return b && document.title === `(${b.textContent.trim()}) Kairos｜告警事件`;
+    }, null, { timeout: 15000 });
     await axe(p, '告警事件');
     await shot(p, 'alert-events-light');
     // 確認（行內按鈕 → 預計處理時間）

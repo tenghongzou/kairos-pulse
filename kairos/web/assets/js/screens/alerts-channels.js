@@ -234,13 +234,7 @@ function renderDetail(ctx, id) {
     return {};
   }
   mount(root, pageHead({ title: isNew ? t('alerts.ch.newTitle') : id, crumbs: crumbs(isNew ? t('alerts.ch.newTitle') : id) }), skeletonBlock(8));
-  const onBeforeUnload = (ev) => {
-    if (dirty) {
-      ev.preventDefault();
-      ev.returnValue = '';
-    }
-  };
-  window.addEventListener('beforeunload', onBeforeUnload);
+  // 未儲存的變更：main.js 依 isDirty() 在站內換頁與關閉分頁時詢問
 
   async function load() {
     if (isNew) {
@@ -701,8 +695,8 @@ function renderDetail(ctx, id) {
   return {
     dispose() {
       disposed = true;
-      window.removeEventListener('beforeunload', onBeforeUnload);
     },
+    isDirty: () => dirty,
   };
 }
 

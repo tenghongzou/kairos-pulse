@@ -7,8 +7,9 @@ import * as fmt from './core/format.js';
 import * as session from './core/session.js';
 import * as sse from './core/sse.js';
 import { api, setHooks } from './core/api.js';
-import { setRoutes, resolve, start, navigate, query } from './core/router.js';
-import { mountShell, unmountShell, refreshShell, setOffline } from './ui/shell.js';
+import { setRoutes, resolve, start, navigate, query, setLeaveGuard } from './core/router.js';
+import { mountShell, unmountShell, refreshShell, setOffline, getNavCount, onNavCount } from './ui/shell.js';
+import { confirm } from './ui/dialog.js';
 import { closeMenu } from './ui/menu.js';
 import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
@@ -56,9 +57,37 @@ function currentPath() {
   return location.pathname + location.search;
 }
 
-function setDocTitle(text) {
-  document.title = text ? `Kairos｜${text}` : 'Kairos';
+// 分頁標題：「(3) Kairos｜總覽」，括號內與側邊導覽「告警事件」的計數泡泡相同（ia.md §7）
+let docTitle = '';
+function applyDocTitle() {
+  const c = getNavCount('alerts');
+  const base = docTitle ? `Kairos｜${docTitle}` : 'Kairos';
+  document.title = c && c.n ? `(${c.n > 99 ? '99+' : c.n}) ${base}` : base;
 }
+function setDocTitle(text) {
+  docTitle = text || '';
+  applyDocTitle();
+}
+onNavCount((key) => {
+  if (key === 'alerts') applyDocTitle();
+});
+
+// 未儲存的變更：畫面的 render() 回傳 isDirty() 時，站內換頁先詢問（router 的 setLeaveGuard），
+// 關閉或重新整理分頁時由瀏覽器詢問（beforeunload）
+function currentDirty() {
+  const inst = current && current.instance;
+  return Boolean(inst && typeof inst.isDirty === 'function' && inst.isDirty());
+}
+setLeaveGuard({
+  dirty: currentDirty,
+  ask: () => confirm({ title: t('app.leaveTitle'), body: t('app.leaveBody'), confirmText: t('app.leaveConfirm'), danger: true }),
+});
+window.addEventListener('beforeunload', (ev) => {
+  if (currentDirty()) {
+    ev.preventDefault();
+    ev.returnValue = '';
+  }
+});
 
 function focusTitle() {
   const el = document.getElementById('page-title');

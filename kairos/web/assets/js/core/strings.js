@@ -27,6 +27,9 @@ const M = {
   'unit.hosts': '台',
   'app.bootFailed': '無法開啟 Kairos 主控台',
   'app.loadFailed': '無法載入這個畫面',
+  'app.leaveTitle': '要放棄變更嗎？',
+  'app.leaveBody': '這個頁面有尚未儲存的變更，離開後不會保留。',
+  'app.leaveConfirm': '放棄變更',
 
   // ---- 狀態與嚴重度（ia.md §5.1；不得改寫） ----
   'status.critical': '嚴重',

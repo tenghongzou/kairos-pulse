@@ -86,6 +86,8 @@ export function render(ctx) {
     return {};
   }
   const readOnlyAll = !session.can('enroll.mode:write') && !session.can('pki.policy:write');
+  // 註冊端點模式卡片的「尚未套用」變更（screens.md S21：離開頁面時的「未儲存變更」提示；main.js 依 isDirty() 詢問）
+  let modeDirty = null;
   const body = h('div', null, skeletonBlock(10));
   mount(
     root,
@@ -271,6 +273,7 @@ export function render(ctx) {
       autoBox.disabled = !canWrite || autoLocked || !isOpen;
       hours.disabled = !canWrite || hoursLocked || !isOpen || !autoBox.checked;
     };
+    modeDirty = canWrite ? () => Object.keys(changes()).length > 0 : null;
     for (const r of Object.values(radios)) r.addEventListener('change', refresh);
     autoBox.addEventListener('change', refresh);
     hours.addEventListener('input', () => {
@@ -406,7 +409,5 @@ export function render(ctx) {
   }
 
   load();
-  return {};
+  return { isDirty: () => Boolean(modeDirty && modeDirty()) };
 }
-
-

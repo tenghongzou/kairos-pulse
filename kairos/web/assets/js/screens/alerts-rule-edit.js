@@ -65,13 +65,7 @@ export function render(ctx) {
   }
   mount(root, pageHead({ title: isNew ? t('alerts.edit.newTitle') : ruleId, crumbs: crumbs(isNew ? t('alerts.edit.newTitle') : ruleId) }), skeletonBlock(8));
 
-  const onBeforeUnload = (ev) => {
-    if (dirty) {
-      ev.preventDefault();
-      ev.returnValue = '';
-    }
-  };
-  window.addEventListener('beforeunload', onBeforeUnload);
+  // 未儲存的變更：main.js 依 isDirty() 在站內換頁與關閉分頁時詢問
 
   async function load() {
     try {
@@ -726,7 +720,7 @@ export function render(ctx) {
   return {
     dispose() {
       disposed = true;
-      window.removeEventListener('beforeunload', onBeforeUnload);
     },
+    isDirty: () => dirty,
   };
 }

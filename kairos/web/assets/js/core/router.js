@@ -56,14 +56,48 @@ export function query() {
   return new URLSearchParams(location.search);
 }
 
+// 站內換頁前的攔截（未儲存的變更；main.js 設定）：dirty() 為 true 時以 ask() 詢問，回傳 true 才換頁。
+// 只攔截使用者發起、會換到另一個路徑的換頁（連結、上一頁／下一頁、畫面呼叫 navigate）；
+// replace（登出、工作階段失效、登入後轉址）一律不攔截。
+let leaveGuard = null;
+let shownUrl = null;
+
+/** 設定換頁前的攔截：{ dirty: () => boolean, ask: () => Promise<boolean> } */
+export function setLeaveGuard(guard) {
+  leaveGuard = guard;
+}
+
+function needsAsk(toPathname, fromPathname = location.pathname) {
+  if (!leaveGuard || toPathname === fromPathname) return false;
+  try {
+    return Boolean(leaveGuard.dirty());
+  } catch {
+    return false;
+  }
+}
+
+async function ask() {
+  try {
+    return Boolean(await leaveGuard.ask());
+  } catch {
+    return true;
+  }
+}
+
+function go() {
+  shownUrl = location.pathname + location.search + location.hash;
+  if (onRoute) onRoute({ pathChanged: true });
+}
+
 /** 換頁（同源路徑）；replace：取代目前的歷史紀錄（篩選條件改變時） */
-export function navigate(to, { replace = false } = {}) {
+export async function navigate(to, { replace = false } = {}) {
   const url = new URL(to, location.origin);
   if (url.origin !== location.origin) return;
+  if (!replace && needsAsk(url.pathname) && !(await ask())) return;
   const same = url.pathname + url.search === location.pathname + location.search;
   if (replace || same) history.replaceState(null, '', url.pathname + url.search + url.hash);
   else history.pushState(null, '', url.pathname + url.search + url.hash);
-  if (onRoute) onRoute({ pathChanged: true });
+  go();
 }
 
 /** 只更新查詢參數（不重畫畫面；清單的篩選、排序寫回網址） */
@@ -111,6 +145,16 @@ export function start(handler) {
     ev.preventDefault();
     navigate(a.getAttribute('href'));
   });
-  window.addEventListener('popstate', () => onRoute && onRoute({ pathChanged: true }));
-  onRoute({ pathChanged: true });
+  window.addEventListener('popstate', async () => {
+    // 上一頁／下一頁：瀏覽器已經換了網址；有未儲存的變更時先把原本的網址放回去再詢問（畫面不重畫）
+    const prev = shownUrl;
+    const target = location.pathname + location.search + location.hash;
+    if (prev && needsAsk(location.pathname, new URL(prev, location.origin).pathname)) {
+      history.pushState(null, '', prev);
+      if (!(await ask())) return;
+      history.replaceState(null, '', target);
+    }
+    go();
+  });
+  go();
 }
