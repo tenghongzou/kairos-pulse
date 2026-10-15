@@ -12,6 +12,7 @@ import { mountShell, unmountShell, refreshShell, setOffline } from './ui/shell.j
 import { closeMenu } from './ui/menu.js';
 import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
+import { ADMIN_ROUTES } from './routes-admin.js';
 
 /**
  * 路由表。欄位：
@@ -29,6 +30,8 @@ const ROUTES = [
   { path: '/hosts/:id/:tab?', permAny: 'hosts:read', title: 'nav.hosts', load: () => import('./screens/host-detail.js') },
   { path: '/account', session: true, title: 'account.title', load: () => import('./screens/account.js') },
 ];
+// 稽核、管理、系統（S16～S18、S20、S21）：routes-admin.js（allow：需要任一權限時）
+ROUTES.push(...ADMIN_ROUTES);
 
 const appRoot = document.getElementById('app');
 let current = null;
@@ -116,7 +119,7 @@ async function onRoute() {
     focus();
     return;
   }
-  if ((route.perm && !session.can(route.perm)) || (route.permAny && !session.canAny(route.permAny)) || (route.session && !session.isSession())) {
+  if ((route.perm && !session.can(route.perm)) || (route.permAny && !session.canAny(route.permAny)) || (route.session && !session.isSession()) || (route.allow && !route.allow())) {
     forbidden(content, { perm: route.perm || route.permAny });
     setDocTitle(t('error.403.title'));
     focus();

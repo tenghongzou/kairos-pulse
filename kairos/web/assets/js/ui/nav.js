@@ -4,6 +4,7 @@
 // 沒有權限的項目不顯示（ia.md §4.2「—＝SideNav 不顯示，直接存取回 403」）；整個區塊都沒有可見項目時
 // 區塊標題也不顯示。只列出**已實作**的畫面：沒有畫面的功能不顯示停用中的假選單
 // （decisions/INTEGRATION.md §28.6「隱藏」的原則）。新增畫面時在這裡加一項，並在 routes.js 加路由。
+import { ADMIN_NAV } from './nav-admin.js';
 
 export const NAV = [
   {
@@ -17,3 +18,5 @@ export const NAV = [
     ],
   },
 ];
+// 稽核、管理、系統（S16～S18、S20、S21）：nav-admin.js
+NAV.push(...ADMIN_NAV);

@@ -18,6 +18,7 @@ let lastOkAt = null;
 function navVisible(item) {
   if (item.perm && !session.can(item.perm)) return false;
   if (item.permAny && !session.canAny(item.permAny)) return false;
+  if (item.allow && !item.allow()) return false;
   return true;
 }
 
@@ -179,7 +180,8 @@ export function mountShell(root, { onLogout }) {
     h('span', { class: 'k-label' }, t('shell.searchPlaceholder')),
     h('kbd', null, 'Ctrl K'),
   );
-  const light = h('span', { class: 'k-status-light', hidden: true });
+  // 系統狀態燈：點選到系統健康（ia.md §2）
+  const light = h('a', { class: 'k-status-light', href: '/system/health', hidden: true });
   const userBtn = h('button', { type: 'button', class: 'ds-button ds-button--ghost k-user-btn', id: 'user-menu-btn', 'aria-haspopup': 'menu', 'aria-expanded': 'false' });
   userBtn.addEventListener('click', () =>
     openMenu(
