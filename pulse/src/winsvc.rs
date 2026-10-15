@@ -1,7 +1,7 @@
 //! Windows 服務（商業審計 O4）：`pulse service install|uninstall|run`。
 //!
 //! - `install`：向服務控制管理員註冊 `Pulse`（自動啟動、LocalSystem、失敗時 10 秒後重新啟動，
-//!   一天內最多 3 次）。執行檔路徑為目前的 `pulse.exe`，服務參數為 `service run --workdir <目錄>`。
+//!   一天內最多 3 次；由 MSI 註冊時，服務第一次啟動會自行補上這個失敗動作）。執行檔路徑為目前的 `pulse.exe`，服務參數為 `service run --workdir <目錄>`。
 //!   MSI 安裝時不使用這個命令：服務由 MSI 的 `ServiceInstall` 表註冊（同樣的參數，見
 //!   `pulse/packaging/windows/pulse.wxs`）。
 //! - `uninstall`：停止（最多等 15 秒）並刪除服務。
@@ -236,20 +236,7 @@ mod imp {
         };
         let _ = service.set_description(DESCRIPTION);
         // 失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動；一天內最多 3 次，避免設定錯誤時無限重試
-        let restart = ServiceAction {
-            action_type: ServiceActionType::Restart,
-            delay: Duration::from_secs(10),
-        };
-        let actions = ServiceFailureActions {
-            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-            reboot_msg: None,
-            command: None,
-            actions: Some(vec![restart.clone(), restart.clone(), restart]),
-        };
-        if let Err(e) = service
-            .update_failure_actions(actions)
-            .and_then(|_| service.set_failure_actions_on_non_crash_failures(true))
-        {
+        if let Err(e) = set_failure_actions(&service) {
             eprintln!("警告：無法設定失敗時的重新啟動：{e}");
         }
         println!(
@@ -266,6 +253,45 @@ mod imp {
             println!("啟動：sc.exe start {SERVICE_NAME}（或 pulse enroll 完成後自動重新啟動）");
         }
         0
+    }
+
+    /// 失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動；一天內最多 3 次，避免設定錯誤時無限重試
+    fn set_failure_actions(
+        service: &windows_service::service::Service,
+    ) -> windows_service::Result<()> {
+        let restart = ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(10),
+        };
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart.clone(), restart.clone(), restart]),
+        })?;
+        service.set_failure_actions_on_non_crash_failures(true)
+    }
+
+    /// 服務啟動時：沒有設定失敗動作（例如由 MSI 的 ServiceInstall 註冊，wixl 不支援
+    /// MsiServiceConfigFailureActions）時補上，與 pulse service install 相同
+    fn ensure_failure_actions() {
+        let Ok(manager) =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        else {
+            return;
+        };
+        let Ok(service) = manager.open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG,
+        ) else {
+            return;
+        };
+        let configured = service
+            .get_failure_actions()
+            .is_ok_and(|a| a.actions.is_some_and(|v| !v.is_empty()));
+        if !configured {
+            let _ = set_failure_actions(&service);
+        }
     }
 
     fn uninstall() -> u8 {
@@ -366,6 +392,7 @@ mod imp {
                 Err(_) => return,
             };
         let _ = handle.set_service_status(status(ServiceState::Running, 0, Duration::ZERO));
+        ensure_failure_actions();
         let code = crate::run_agent(false, Some(stop));
         let _ = handle.set_service_status(status(ServiceState::Stopped, code, Duration::ZERO));
     }

@@ -381,6 +381,16 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// 根 CA 的 CN：`<組織> Kairos Root CA`；組織名稱就是 `Kairos`（預設）時為 `Kairos Root CA`
+fn root_common_name(organization: &str) -> String {
+    let org = organization.trim();
+    if org.eq_ignore_ascii_case("kairos") {
+        "Kairos Root CA".to_string()
+    } else {
+        format!("{org} Kairos Root CA")
+    }
+}
+
 /// 新的根 CA：ECDSA P-384、`CN=<組織> Kairos Root CA`、`CA:TRUE, pathlen:1`、10 年
 pub fn new_root(organization: &str, now_ms: i64) -> Result<CaKey, String> {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384)
@@ -390,10 +400,7 @@ pub fn new_root(organization: &str, now_ms: i64) -> Result<CaKey, String> {
     p.not_before = to_time(now_ms - NOT_BEFORE_BACKDATE_MS)?;
     p.not_after = to_time(now_ms + ROOT_DAYS * DAY_MS)?;
     let mut dn = DistinguishedName::new();
-    dn.push(
-        DnType::CommonName,
-        format!("{} Kairos Root CA", organization.trim()),
-    );
+    dn.push(DnType::CommonName, root_common_name(organization));
     p.distinguished_name = dn;
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -873,6 +880,7 @@ mod tests {
             i.common_names,
             vec!["Example Org Kairos Root CA".to_string()]
         );
+        assert_eq!(root_common_name(" Kairos "), "Kairos Root CA");
         assert_eq!(i.not_after_ms, NOW + ROOT_DAYS * DAY_MS);
         assert_eq!(i.serial.len(), 32);
         // PEM 往返：CaKey::load 讀回同一把金鑰

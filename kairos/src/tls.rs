@@ -1271,6 +1271,72 @@ mod tests {
         assert!(verify_chain(v.as_ref(), Some(&other), UnixTime::now()).is_err());
     }
 
+    /// `auth.client_ca` 的選擇（PKI.md 第 15.1、15.4 節）：已退役（不在 issuing-cas.pem）的簽發 CA 簽出的
+    /// 用戶端憑證，用戶端自行附上該簽發 CA 憑證時——
+    /// - `auth.client_ca` 是根 CA：經由 `auth.client_ca` 這組驗證器（沒有 CRL）**通過**（已知的限制，
+    ///   待使用者決定；修正後這個斷言要改）；
+    /// - `auth.client_ca` 是 `issuing-cas.pem`（`kairos pki init` 的設定）：被拒。
+    #[test]
+    fn retired_issuing_ca_chain_depends_on_the_client_ca_choice() {
+        use crate::pki::ca::{CaKey, new_root};
+        use crate::pki::x509::pem_encode;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let root = new_root("T", now_ms).unwrap();
+        let issuing = |cn: &str| {
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = root
+                .sign_issuing_ca(
+                    &rcgen::PublicKeyData::subject_public_key_info(&key),
+                    cn,
+                    1825,
+                    now_ms,
+                )
+                .unwrap();
+            CaKey::load(&pem_encode("CERTIFICATE", &cert.der), &key.serialize_pem()).unwrap()
+        };
+        let retired = issuing("Retired Issuing CA");
+        let active = issuing("Active Issuing CA");
+        let id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = retired
+            .sign_client(
+                &rcgen::PublicKeyData::subject_public_key_info(&leaf_key),
+                id,
+                365,
+                now_ms,
+            )
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("kairos-retired-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |n: &str, der: &[u8]| {
+            let f = dir.join(n);
+            std::fs::write(&f, pem_encode("CERTIFICATE", der)).unwrap();
+            f.to_string_lossy().into_owned()
+        };
+        let root_pem = w("root.pem", &root.cert_der);
+        let issuing_cas = w("issuing-cas.pem", &active.cert_der);
+        let chain = vec![
+            CertificateDer::from(leaf.der.clone()),
+            CertificateDer::from(retired.cert_der.clone()),
+        ];
+        let with = |client_ca: &str| {
+            let mut tp = paths(None, &[]);
+            tp.client_ca = Some(client_ca.to_string());
+            tp.issuing_cas = Some(issuing_cas.clone());
+            build(&tp).unwrap().verifier.unwrap()
+        };
+        let now = UnixTime::now();
+        assert!(
+            verify_chain(with(&root_pem).as_ref(), Some(&chain), now).is_ok(),
+            "已知的限制：auth.client_ca 為根 CA 時，退役簽發 CA 的鏈經由 auth.client_ca 通過"
+        );
+        assert!(verify_chain(with(&issuing_cas).as_ref(), Some(&chain), now).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fingerprint_tracks_content_and_watched_files() {
         let dir = std::env::temp_dir().join(format!("kairos-fp-{}", std::process::id()));
