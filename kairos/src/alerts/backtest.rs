@@ -8,7 +8,7 @@
 //!   紀錄屬於之後的版本），回 `supported: false` 並說明原因，不提供不準確的數字。
 
 use chrono::FixedOffset;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -25,9 +25,138 @@ pub const MAX_DAYS: u32 = 31;
 type Series = Vec<(i64, f64)>;
 
 fn series_ids(conn: &Connection, name: &str) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT series_id FROM series WHERE name = ?1 AND labels = ''")?;
+    let mut stmt = conn
+        .prepare("SELECT series_id FROM series WHERE name = ?1 AND labels = '' AND derived = 0")?;
     let rows = stmt.query_map([name], |r| r.get(0))?;
     rows.collect()
+}
+
+/// 這台主機某個名稱的序列（有 label 的指標，例如每個掛載點）：(series_id, label 的值, derived)
+fn labeled_series(
+    conn: &Connection,
+    host_id: i64,
+    name: &str,
+    label: &str,
+) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.series_id, s.labels, s.derived FROM series s JOIN host_series h USING (series_id)
+         WHERE h.host_id = ?1 AND s.name = ?2",
+    )?;
+    let rows = stmt.query_map(params![host_id, name], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, labels, derived) = row?;
+        let map: BTreeMap<String, String> = serde_json::from_str(&labels).unwrap_or_default();
+        if let Some(v) = map.get(label) {
+            out.push((id, v.clone(), derived));
+        }
+    }
+    Ok(out)
+}
+
+/// 一台主機在試算期間的資料：每個對象（磁碟為掛載點、網路為介面；其他為一個）一條等間隔的序列
+fn host_data(
+    conn: &Connection,
+    table: &str,
+    host_id: i64,
+    metric: &str,
+    params_v: &Value,
+    from: i64,
+    std_ids: &(Vec<i64>, Vec<i64>),
+) -> rusqlite::Result<Vec<Series>> {
+    use super::rules::metric as m;
+    let ratio = |a: BTreeMap<i64, f64>, b: &BTreeMap<i64, f64>, scale: f64| -> Series {
+        a.iter()
+            .filter_map(|(t, u)| {
+                b.get(t)
+                    .filter(|tot| **tot > 0.0)
+                    .map(|tot| (*t, u / tot * scale))
+            })
+            .collect()
+    };
+    let in_scope = |key: &str, name: &str| {
+        super::rules::globs(params_v, key)
+            .is_none_or(|g| g.iter().any(|p| super::rules::glob_match(p, name)))
+    };
+    Ok(match metric {
+        m::MEMORY | m::SWAP => {
+            let a = load_series(conn, table, host_id, &std_ids.0, from)?;
+            let b = load_series(conn, table, host_id, &std_ids.1, from)?;
+            vec![ratio(a, &b, 100.0)]
+        }
+        m::LOAD => {
+            let cores: Option<i64> = conn
+                .query_row(
+                    "SELECT cpu_logical_cores FROM host_inventory WHERE host_id = ?1",
+                    [host_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            match cores.filter(|c| *c > 0) {
+                Some(c) => vec![
+                    load_series(conn, table, host_id, &std_ids.0, from)?
+                        .into_iter()
+                        .map(|(t, v)| (t, v / c as f64))
+                        .collect(),
+                ],
+                None => Vec::new(),
+            }
+        }
+        m::DISK => {
+            // 每個掛載點：Pulse 送的使用率優先，沒有時用推算值（0.2.0～0.7.0 的 Pulse）
+            let mut by_mount: BTreeMap<String, BTreeMap<i64, f64>> = BTreeMap::new();
+            let mut list = labeled_series(
+                conn,
+                host_id,
+                kairos_proto::METRIC_FILESYSTEM_USAGE,
+                "mountpoint",
+            )?;
+            list.sort_by_key(|(_, _, derived)| std::cmp::Reverse(*derived));
+            for (id, mount, _) in list {
+                if !in_scope("mountpoints", &mount) {
+                    continue;
+                }
+                let data = load_series(conn, table, host_id, &[id], from)?;
+                by_mount.entry(mount).or_default().extend(data);
+            }
+            by_mount
+                .into_values()
+                .map(|d| d.into_iter().collect())
+                .collect()
+        }
+        m::NETWORK_RX | m::NETWORK_TX => {
+            let name = if metric == m::NETWORK_RX {
+                kairos_proto::METRIC_NETWORK_RECEIVED
+            } else {
+                kairos_proto::METRIC_NETWORK_TRANSMITTED
+            };
+            let mut out = Vec::new();
+            for (id, dev, derived) in labeled_series(conn, host_id, name, "device")? {
+                if derived != crate::store::derive::DERIVED_RATE || !in_scope("devices", &dev) {
+                    continue;
+                }
+                out.push(
+                    load_series(conn, table, host_id, &[id], from)?
+                        .into_iter()
+                        .map(|(t, v)| (t, v * 8.0 / 1_000_000.0))
+                        .collect(),
+                );
+            }
+            out
+        }
+        _ => vec![
+            load_series(conn, table, host_id, &std_ids.0, from)?
+                .into_iter()
+                .collect(),
+        ],
+    })
 }
 
 fn load_series(
@@ -197,17 +326,26 @@ pub fn preview(
         ("rollup_5m", 300)
     };
     let from = now_ms / 1000 - i64::from(days) * 86_400;
-    let (num, den) = if metric == "memory" {
-        (
+    use super::rules::metric as m;
+    let std_ids = match metric {
+        m::MEMORY => (
             series_ids(conn, crate::protocol::METRIC_MEMORY_USED)?,
             series_ids(conn, crate::protocol::METRIC_MEMORY_TOTAL)?,
-        )
-    } else {
-        (
+        ),
+        m::SWAP => (
+            series_ids(conn, kairos_proto::METRIC_SWAP_USED)?,
+            series_ids(conn, kairos_proto::METRIC_SWAP_TOTAL)?,
+        ),
+        m::LOAD => (
+            series_ids(conn, kairos_proto::METRIC_CPU_LOAD_5M)?,
+            Vec::new(),
+        ),
+        _ => (
             series_ids(conn, crate::protocol::METRIC_CPU_USAGE)?,
             Vec::new(),
-        )
+        ),
     };
+    let mut without_metric = 0u64;
     let mut fires = 0u64;
     let mut quick = 0u64;
     let mut involved = 0u64;
@@ -217,48 +355,43 @@ pub fn preview(
     let mut alt: BTreeMap<i64, u64> = BTreeMap::new();
     let candidates = [for_secs * 3 / 2, for_secs * 2, for_secs.max(900)];
     for (host_id, agent, name) in &hosts {
-        let a = load_series(conn, table, *host_id, &num, from)?;
-        let data: Series = if metric == "memory" {
-            let b = load_series(conn, table, *host_id, &den, from)?;
-            a.iter()
-                .filter_map(|(t, u)| {
-                    b.get(t)
-                        .filter(|tot| **tot > 0.0)
-                        .map(|tot| (*t, u / tot * 100.0))
-                })
-                .collect()
-        } else {
-            a.into_iter().collect()
-        };
-        if let Some((t, _)) = data.first() {
-            oldest = Some(oldest.map_or(*t, |o: i64| o.min(*t)));
+        let all = host_data(conn, table, *host_id, metric, p, from, &std_ids)?;
+        if all.iter().all(|d| d.is_empty()) {
+            // 這台主機沒有回報這個指標（舊版 Pulse、Windows 的負載、沒有資產的主機）
+            without_metric += 1;
         }
-        let r = replay(&data, step, op, threshold, for_secs, clear, clear_for);
-        if !r.fires.is_empty() {
+        let mut host_fires = 0;
+        for data in &all {
+            if let Some((t, _)) = data.first() {
+                oldest = Some(oldest.map_or(*t, |o: i64| o.min(*t)));
+            }
+            let r = replay(data, step, op, threshold, for_secs, clear, clear_for);
+            host_fires += r.fires.len();
+            for (at, dur) in &r.fires {
+                fires += 1;
+                if dur.is_some_and(|d| d <= 600) {
+                    quick += 1;
+                }
+                let day = chrono::DateTime::from_timestamp(*at, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&offset)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                *per_day.entry(day).or_default() += 1;
+            }
+            for c in candidates {
+                if c > for_secs {
+                    *alt.entry(c).or_default() +=
+                        replay(data, step, op, threshold, c, clear, clear_for)
+                            .fires
+                            .len() as u64;
+                }
+            }
+        }
+        if host_fires > 0 {
             involved += 1;
             if examples.len() < 5 {
-                examples
-                    .push(json!({ "agent_id": agent, "hostname": name, "fires": r.fires.len() }));
-            }
-        }
-        for (at, dur) in &r.fires {
-            fires += 1;
-            if dur.is_some_and(|d| d <= 600) {
-                quick += 1;
-            }
-            let day = chrono::DateTime::from_timestamp(*at, 0)
-                .unwrap_or_default()
-                .with_timezone(&offset)
-                .format("%Y-%m-%d")
-                .to_string();
-            *per_day.entry(day).or_default() += 1;
-        }
-        for c in candidates {
-            if c > for_secs {
-                *alt.entry(c).or_default() +=
-                    replay(&data, step, op, threshold, c, clear, clear_for)
-                        .fires
-                        .len() as u64;
+                examples.push(json!({ "agent_id": agent, "hostname": name, "fires": host_fires }));
             }
         }
     }
@@ -286,6 +419,12 @@ pub fn preview(
     if data_days.is_none() {
         notes.push("範圍內沒有這個指標的彙總資料".to_string());
     }
+    if without_metric > 0 && !hosts.is_empty() {
+        notes.push(format!(
+            "範圍內的 {} 台主機中，有 {without_metric} 台沒有回報這個指標（Pulse 版本較舊、Windows 沒有負載、或尚未收到資產），不會觸發",
+            hosts.len()
+        ));
+    }
     if for_secs < step {
         notes.push(format!(
             "持續時間少於 {} 分鐘，以 {} 分鐘計",
@@ -300,6 +439,7 @@ pub fn preview(
         "resolution_secs": step,
         "approximate": true,
         "hosts_in_scope": hosts.len(),
+        "hosts_without_metric": without_metric,
         "fires": fires,
         "hosts_involved": involved,
         "self_recovered_within_10m": quick,

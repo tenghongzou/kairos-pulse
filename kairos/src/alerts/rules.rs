@@ -24,6 +24,8 @@ pub mod kind {
     pub const SUBNET_OFFLINE: &str = "subnet_offline";
     pub const MASS_OFFLINE: &str = "mass_offline";
     pub const RESTART_UNRECOVERED: &str = "restart_unrecovered";
+    /// 主機重新開機（METRICS.md 第 11.2 節；D5）
+    pub const HOST_REBOOTED: &str = "host_rebooted";
     pub const SYSTEM: &str = "system";
 
     /// 使用者可以建立的種類（S09；憑證即將到期、版本過舊在之後的版本加入）
@@ -70,6 +72,136 @@ pub mod ids {
     pub const DOWNTIME: &str = "sys.downtime";
     /// 稽核日誌完整性（0.7；設計包 `decisions/INTEGRATION.md` §28.5 #10）
     pub const AUDIT_INTEGRITY: &str = "sys.audit_integrity";
+    /// 主機重新開機（0.8〔草稿〕；METRICS.md 第 11.2 節、D5：資訊等級、不通知、預設啟用）
+    pub const HOST_REBOOTED: &str = "sys.host_rebooted";
+}
+
+/// 指標門檻（`metric_threshold`）的指標（METRICS.md 第 11.1 節）
+pub mod metric {
+    pub const CPU: &str = "cpu";
+    pub const MEMORY: &str = "memory";
+    /// 每個掛載點的使用率（%）
+    pub const DISK: &str = "disk";
+    /// 置換空間使用率（%）
+    pub const SWAP: &str = "swap";
+    /// 5 分鐘平均負載 ÷ 邏輯處理器數（倍）
+    pub const LOAD: &str = "load";
+    /// 每個介面的接收／傳送速率（Mbps）
+    pub const NETWORK_RX: &str = "network_rx";
+    pub const NETWORK_TX: &str = "network_tx";
+
+    pub const ALL: [&str; 7] = [CPU, MEMORY, DISK, SWAP, LOAD, NETWORK_RX, NETWORK_TX];
+
+    /// 門檻的上限：百分比與每核心負載 100，網路 1,000,000 Mbps
+    pub fn max_threshold(metric: &str) -> f64 {
+        match metric {
+            NETWORK_RX | NETWORK_TX => 1_000_000.0,
+            _ => 100.0,
+        }
+    }
+
+    /// 門檻的單位（訊息與事件標題）
+    pub fn unit(metric: &str) -> &'static str {
+        match metric {
+            NETWORK_RX | NETWORK_TX => " Mbps",
+            LOAD => " 倍",
+            _ => "%",
+        }
+    }
+
+    /// 事件標題中的名稱
+    pub fn label(metric: &str) -> &'static str {
+        match metric {
+            MEMORY => "記憶體",
+            DISK => "磁碟使用率",
+            SWAP => "置換空間",
+            LOAD => "每核心負載",
+            NETWORK_RX => "網路接收",
+            NETWORK_TX => "網路傳送",
+            _ => "CPU",
+        }
+    }
+}
+
+/// `params.mountpoints`、`params.devices` 最多幾個 glob
+pub const MAX_SCOPE_GLOBS: usize = 32;
+
+/// glob 比對（`*` 任意字元、`?` 單一字元；區分大小寫）
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// `params` 中的 glob 清單（`mountpoints`、`devices`）；空的或沒有時為 `None`（全部）
+pub fn globs(params: &Value, key: &str) -> Option<Vec<String>> {
+    let list: Vec<String> = params
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+fn validate_globs(p: &Map<String, Value>, key: &str) -> Result<Option<Vec<String>>, Invalid> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_SCOPE_GLOBS {
+                return Err(invalid(
+                    &format!("params.{key}"),
+                    format!("{key} 最多 {MAX_SCOPE_GLOBS} 個"),
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for v in items {
+                match v.as_str() {
+                    Some(s)
+                        if !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control) =>
+                    {
+                        if !out.iter().any(|o: &String| o == s) {
+                            out.push(s.to_string());
+                        }
+                    }
+                    _ => {
+                        return Err(invalid(
+                            &format!("params.{key}"),
+                            format!(
+                                "{key} 的每一項必須是 1～256 bytes、不含控制字元的字串（可用 * 與 ?）"
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok((!out.is_empty()).then_some(out))
+        }
+        Some(_) => Err(invalid(
+            &format!("params.{key}"),
+            format!("{key} 必須是字串陣列"),
+        )),
+    }
 }
 
 fn builtin(
@@ -340,6 +472,15 @@ pub fn builtins() -> Vec<Rule> {
             json!({"min_secs": 300}),
             "非計畫性停機超過 5 分鐘（不在維護時段內），供上線率報表標註。",
         ),
+        builtin(
+            ids::HOST_REBOOTED,
+            kind::HOST_REBOOTED,
+            Host,
+            "主機重新開機",
+            Info,
+            json!({}),
+            "Pulse 回報的開機後經過時間（system.uptime）變小：主機重新開機過。資訊等級，不需要確認、不通知，只記錄在事件列表與主機詳情（需要 Pulse 0.8.0 以上）。",
+        ),
         sys(
             ids::AUDIT_INTEGRITY,
             "稽核日誌完整性",
@@ -422,29 +563,38 @@ pub fn validate_params(kind_name: &str, params: &Value) -> Result<Value, Invalid
         }),
         kind::METRIC_THRESHOLD => {
             let metric = p.get("metric").and_then(Value::as_str).unwrap_or("");
-            if !matches!(metric, "cpu" | "memory") {
+            if !metric::ALL.contains(&metric) {
                 return Err(invalid(
                     "params.metric",
-                    "metric 必須是 cpu 或 memory（磁碟、網路在 F4 之後加入）",
+                    format!("metric 必須是 {} 之一", metric::ALL.join("、")),
                 ));
             }
             let op = p.get("op").and_then(Value::as_str).unwrap_or(">");
             if !matches!(op, ">" | ">=" | "<" | "<=") {
                 return Err(invalid("params.op", "op 必須是 >、>=、<、<= 之一"));
             }
+            let max = metric::max_threshold(metric);
+            let range_text = match metric {
+                metric::NETWORK_RX | metric::NETWORK_TX => "0～1000000（Mbps）",
+                metric::LOAD => "0～100（每核心負載，倍）",
+                _ => "0～100（百分比）",
+            };
             let threshold = num(p, "threshold")
-                .filter(|t| (0.0..=100.0).contains(t))
-                .ok_or_else(|| invalid("params.threshold", "threshold 必須是 0～100（百分比）"))?;
+                .filter(|t| (0.0..=max).contains(t))
+                .ok_or_else(|| {
+                    invalid("params.threshold", format!("threshold 必須是 {range_text}"))
+                })?;
             let for_secs = int_in(p, "for_secs", 600, 0..=86_400)?;
             let clear = match p.get("clear_threshold") {
                 None | Some(Value::Null) => None,
-                Some(v) => Some(
-                    v.as_f64()
-                        .filter(|t| (0.0..=100.0).contains(t))
-                        .ok_or_else(|| {
-                            invalid("params.clear_threshold", "clear_threshold 必須是 0～100")
-                        })?,
-                ),
+                Some(v) => Some(v.as_f64().filter(|t| (0.0..=max).contains(t)).ok_or_else(
+                    || {
+                        invalid(
+                            "params.clear_threshold",
+                            format!("clear_threshold 必須是 {range_text}"),
+                        )
+                    },
+                )?),
             };
             if let Some(c) = clear {
                 let above = op.starts_with('>');
@@ -460,14 +610,39 @@ pub fn validate_params(kind_name: &str, params: &Value) -> Result<Value, Invalid
                 }
             }
             let clear_for = int_in(p, "clear_for_secs", 0, 0..=86_400)?;
-            json!({
+            let mut out = json!({
                 "metric": metric,
                 "op": op,
                 "threshold": threshold,
                 "for_secs": for_secs,
                 "clear_threshold": clear,
                 "clear_for_secs": clear_for,
-            })
+            });
+            // 範圍：磁碟為掛載點、網路為介面（glob；省略為全部）。其他指標不接受
+            let (scope_key, other_key) = match metric {
+                metric::DISK => (Some("mountpoints"), "devices"),
+                metric::NETWORK_RX | metric::NETWORK_TX => (Some("devices"), "mountpoints"),
+                _ => (None, ""),
+            };
+            for key in ["mountpoints", "devices"] {
+                let list = validate_globs(p, key)?;
+                if list.is_some() && scope_key != Some(key) {
+                    return Err(invalid(
+                        &format!("params.{key}"),
+                        if key == other_key {
+                            format!(
+                                "{key} 不適用於 {metric}（磁碟使用 mountpoints、網路使用 devices）"
+                            )
+                        } else {
+                            format!("{key} 只適用於磁碟（mountpoints）或網路（devices）")
+                        },
+                    ));
+                }
+                if let Some(list) = list {
+                    out[key] = json!(list);
+                }
+            }
+            out
         }
         other => {
             return Err(invalid(
@@ -650,6 +825,10 @@ mod tests {
         // 資訊等級一律為紀錄
         let dec = builtin_default(ids::HOST_DECOMMISSIONED).unwrap();
         assert_eq!(dec.attention(), super::super::model::Attention::Record);
+        // D5：主機重新開機為資訊等級（紀錄、不通知），預設啟用
+        let reboot = builtin_default(ids::HOST_REBOOTED).unwrap();
+        assert_eq!(reboot.severity, Severity::Info);
+        assert_eq!(reboot.attention(), super::super::model::Attention::Record);
         for r in &all {
             assert!(r.builtin && r.enabled, "{}", r.rule_id);
             assert!(r.rule_id.starts_with("sys."));
@@ -674,10 +853,74 @@ mod tests {
         assert!(
             validate_params(
                 kind::METRIC_THRESHOLD,
-                &json!({"metric": "disk", "threshold": 1})
+                &json!({"metric": "gpu", "threshold": 1})
             )
             .is_err()
         );
+        // F4：磁碟（掛載點範圍）、網路（Mbps、介面範圍）、置換空間、每核心負載
+        let disk = validate_params(
+            kind::METRIC_THRESHOLD,
+            &json!({"metric": "disk", "threshold": 90, "mountpoints": ["/", "/data*", "/"]}),
+        )
+        .unwrap();
+        assert_eq!(disk["mountpoints"], json!(["/", "/data*"]));
+        assert!(disk.get("devices").is_none());
+        let net = validate_params(
+            kind::METRIC_THRESHOLD,
+            &json!({"metric": "network_rx", "threshold": 800, "devices": ["eth*"]}),
+        )
+        .unwrap();
+        assert_eq!(net["threshold"], 800.0);
+        assert_eq!(net["devices"], json!(["eth*"]));
+        // 網路以外的門檻上限 100；網路 1,000,000 Mbps
+        assert!(
+            validate_params(
+                kind::METRIC_THRESHOLD,
+                &json!({"metric": "swap", "threshold": 800})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_params(
+                kind::METRIC_THRESHOLD,
+                &json!({"metric": "network_tx", "threshold": 1_000_001})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_params(
+                kind::METRIC_THRESHOLD,
+                &json!({"metric": "load", "threshold": 2.5})
+            )
+            .is_ok()
+        );
+        // 範圍只適用於對應的指標
+        let e = validate_params(
+            kind::METRIC_THRESHOLD,
+            &json!({"metric": "disk", "threshold": 90, "devices": ["eth0"]}),
+        )
+        .unwrap_err();
+        assert_eq!(e.field, "params.devices");
+        assert!(
+            validate_params(
+                kind::METRIC_THRESHOLD,
+                &json!({"metric": "cpu", "threshold": 90, "mountpoints": ["/"]})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_params(
+                kind::METRIC_THRESHOLD,
+                &json!({"metric": "disk", "threshold": 90, "mountpoints": "/"})
+            )
+            .is_err()
+        );
+        assert!(glob_match("/data*", "/data2"));
+        assert!(glob_match("C:\\", "C:\\"));
+        assert!(!glob_match("/data*", "/"));
+        assert!(glob_match("eth?", "eth0"));
+        assert!(!glob_match("eth?", "eth10"));
+        assert!(glob_match("*", ""));
         assert!(
             validate_params(
                 kind::METRIC_THRESHOLD,

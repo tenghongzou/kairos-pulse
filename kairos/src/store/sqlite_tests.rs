@@ -28,6 +28,7 @@ fn opts(dir: &Path) -> SqliteOptions {
         rollup_1h_retention_days: 400,
         max_total_bytes: 0,
         max_hosts: 1000,
+        max_series_per_host: crate::config::DEFAULT_MAX_SERIES_PER_HOST,
         mtls: true,
     }
 }
@@ -596,6 +597,7 @@ fn agent_snapshot(agent: &str, online: bool, last_seen: DateTime<Utc>) -> AgentS
             total_memory: Some(4096),
             used_memory: Some(1024),
             metrics: Some(8),
+            detail: Default::default(),
         }),
     }
 }
@@ -1574,11 +1576,11 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(migrate(&mut conn, &MIGRATIONS[..5]).unwrap(), 5);
     assert!(has(&conn, "alert_events"));
     assert!(!has(&conn, "users"));
-    // 再升級到 v7（整合後的線性順序 v4 → v5 → v6 → v7）：使用者的資料表建立
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 7);
+    // 再升級到 v8（整合後的線性順序 v4 → v5 → v6 → v7 → v8）：使用者的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 8);
     assert_eq!(
         MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7]
+        [1, 2, 3, 4, 5, 6, 7, 8]
     );
     for t in [
         "users",
@@ -1615,7 +1617,350 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
         0
     );
     // 再執行一次升級：不變
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 7);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 8);
     drop(conn);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- schema v8：指標擴充（METRICS.md 第 9 節）----
+
+/// 0.8 的 report：uptime、一個介面的接收位元組、一個掛載點（沒有 usage，與 0.7 的 Pulse 相同）
+fn f4_record(agent: &str, seq: u64, recv_at: DateTime<Utc>, rx: u64, uptime: u64) -> ReportRecord {
+    let metrics = vec![
+        Metric::new("system.cpu.usage", 10, "%"),
+        Metric::new("system.uptime", uptime, "s"),
+        Metric::new("system.network.received", rx, "By").with_label("device", "eth0"),
+        Metric::new("system.filesystem.total", 1000_u64, "By")
+            .with_label("mountpoint", "/")
+            .with_label("fstype", "ext4"),
+        Metric::new("system.filesystem.available", 250_u64, "By")
+            .with_label("mountpoint", "/")
+            .with_label("fstype", "ext4"),
+    ];
+    ReportRecord::new(
+        recv_at,
+        "10.0.0.3:5000".into(),
+        agent.into(),
+        "f4".into(),
+        seq,
+        crate::storage::fmt_time(recv_at),
+        RecordBody::Metrics { metrics },
+    )
+}
+
+/// 名稱、derived 的序列在 rollup_5m 的 (cnt, sum)；沒有時 (0, 0)
+fn rollup_of(store: &SqliteStore, name: &str, derived: i64) -> (i64, f64) {
+    store
+        .conn
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT coalesce(sum(cnt), 0), coalesce(sum(vsum), 0) FROM rollup_5m JOIN series USING (series_id)
+             WHERE name = ?1 AND derived = ?2",
+            params![name, derived],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn v7_database_upgrades_to_v8_keeping_series_ids_and_data() {
+    let dir = temp_dir("v7v8");
+    {
+        let mut conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        assert_eq!(migrate(&mut conn, &MIGRATIONS[..7]).unwrap(), 7);
+        conn.execute_batch(
+            "INSERT INTO hosts (host_id, agent_id, hostname, first_seen, last_seen) VALUES (3, '6f1c0e4a-1b2c-4d3e-9f00-112233445566', 'old', 1, 1);
+             INSERT INTO series (series_id, name, unit, labels) VALUES (7, 'system.network.received', 'By', '{\"device\":\"eth0\"}');
+             INSERT INTO series (series_id, name, unit, labels) VALUES (9, 'system.cpu.usage', '%', '');
+             INSERT INTO rollup_1h VALUES (3, 3600, 7, 1, 2, 3, 2);
+             INSERT INTO rollup_5m VALUES (3, 3600, 9, 1, 2, 3, 2);",
+        )
+        .unwrap();
+    }
+    let (mut store, _) = open(&dir, noon);
+    assert_eq!(count(&mut store, "PRAGMA user_version"), 8);
+    // 序列編號不變、derived 為 0；host_series 由彙總補上
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT count(*) FROM series WHERE series_id IN (7, 9) AND derived = 0"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT count(*) FROM host_series WHERE host_id = 3"
+        ),
+        2
+    );
+    for t in [
+        "host_inventory",
+        "inventory_changes",
+        "process_snapshots",
+        "host_series",
+    ] {
+        assert_eq!(
+            count(
+                &mut store,
+                &format!(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '{t}'"
+                )
+            ),
+            1,
+            "{t}"
+        );
+    }
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT count(*) FROM hosts WHERE boot_time IS NULL"
+        ),
+        1
+    );
+    // 升級後的寫入沿用既有的序列
+    assert_eq!(
+        store.write(&[f4_record(A, 1, noon(), 100, 50)]),
+        [WriteStatus::Written]
+    );
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT series_id FROM series WHERE name = 'system.network.received' AND derived = 0"
+        ),
+        7
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn counters_are_rolled_up_as_rates_and_missing_usage_is_estimated() {
+    settable_clock!(clock, NOW);
+    set_clock(&NOW, noon());
+    let dir = temp_dir("rates");
+    let (mut store, _) = open(&dir, clock);
+    let at = |s: i64| noon() + chrono::Duration::seconds(s);
+    // 5 秒 5000 bytes → 1000 B/s；第 3 筆重新開機（uptime 變小）→ 沒有速率；第 4 筆 500 B/s
+    for (i, (rx, up)) in [(1000, 100), (6000, 105), (6100, 2), (8600, 7)]
+        .into_iter()
+        .enumerate()
+    {
+        let r = f4_record(A, i as u64, at(i as i64 * 5), rx, up);
+        assert_eq!(store.write(&[r]), [WriteStatus::Written]);
+    }
+    set_clock(&NOW, noon() + chrono::Duration::seconds(320));
+    while store.maintain() {}
+    // 計數器的累計值不彙總；速率序列 2 個點
+    assert_eq!(rollup_of(&store, "system.network.received", 0), (0, 0.0));
+    assert_eq!(rollup_of(&store, "system.network.received", 1), (2, 1500.0));
+    let unit: String = store
+        .conn
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT unit FROM series WHERE name = 'system.network.received' AND derived = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unit, "By/s");
+    // 推算的使用率：(1000 − 250) ÷ 1000 = 75%
+    assert_eq!(rollup_of(&store, "system.filesystem.usage", 2), (4, 300.0));
+    // 量測值照常
+    assert_eq!(rollup_of(&store, "system.cpu.usage", 0), (4, 40.0));
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn counter_state_survives_a_restart() {
+    settable_clock!(clock, NOW);
+    set_clock(&NOW, noon());
+    let dir = temp_dir("rates-restart");
+    let (mut store, _) = open(&dir, clock);
+    let at = |s: i64| noon() + chrono::Duration::seconds(s);
+    store.write(&[f4_record(A, 1, at(0), 1000, 100)]);
+    store.write(&[f4_record(A, 2, at(5), 2000, 105)]);
+    // 「當掉」：記憶體中的彙總與上一筆遺失；重新啟動後由原始資料補回
+    drop(store);
+    let (mut store, _) = open(&dir, clock);
+    store.write(&[f4_record(A, 3, at(10), 3000, 110)]);
+    // 晚到（取樣時間早於上一筆）：不產生速率
+    store.write(&[f4_record(A, 4, at(7), 2500, 107)]);
+    set_clock(&NOW, noon() + chrono::Duration::seconds(320));
+    while store.maintain() {}
+    let (cnt, sum) = rollup_of(&store, "system.network.received", 1);
+    assert_eq!(cnt, 2, "重新啟動前後各一個速率點，晚到的那筆沒有");
+    assert_eq!(sum, 400.0);
+    // 寫入後才啟動：第一筆以原始資料中最近的一筆為上一筆
+    drop(store);
+    let (mut store, _) = open(&dir, clock);
+    store.write(&[f4_record(A, 5, at(20), 4000, 120)]);
+    assert_eq!(store.caches.counters.get(&1).map(|c| c.len()), Some(1));
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn per_host_series_limit_drops_only_new_series() {
+    let dir = temp_dir("series-cap");
+    let mut o = opts(&dir);
+    o.max_series_per_host = 4;
+    let (mut store, _) = SqliteStore::open(o, noon).unwrap();
+    // 5 個指標 + 推算的使用率：只保存前 4 個序列，其餘略過，仍回 Written
+    assert_eq!(
+        store.write(&[f4_record(A, 1, noon(), 1, 1)]),
+        [WriteStatus::Written]
+    );
+    assert_eq!(count(&mut store, "SELECT count(*) FROM host_series"), 4);
+    let body: Vec<u8> = store
+        .conn
+        .as_ref()
+        .unwrap()
+        .query_row("SELECT body FROM reports", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(codec::decode_metrics(&body).unwrap().len(), 4);
+    assert!(store.series_cap_logged.contains_key(A));
+    // 另一台主機有自己的上限
+    assert_eq!(
+        store.write(&[f4_record(B, 1, noon(), 1, 1)]),
+        [WriteStatus::Written]
+    );
+    assert_eq!(count(&mut store, "SELECT count(*) FROM host_series"), 8);
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn process_snapshots_follow_the_report_and_raw_retention() {
+    settable_clock!(clock, NOW);
+    set_clock(&NOW, noon());
+    let dir = temp_dir("processes");
+    let mut o = opts(&dir);
+    o.raw_retention_days = 2;
+    let (mut store, _) = SqliteStore::open(o, clock).unwrap();
+    let list: kairos_proto::ProcessList = serde_json::from_value(serde_json::json!({
+        "top_cpu": [{"pid": 1, "name": "init", "cpu_usage": 1.5, "memory": 10}],
+    }))
+    .unwrap();
+    let old = noon() - chrono::Duration::days(5);
+    let rec = |seq, t: DateTime<Utc>| {
+        f4_record(A, seq, t, 1, 1)
+            .with_dedup(dedup("boot-p", seq))
+            .with_processes(Some(list.clone()))
+    };
+    assert_eq!(store.write(&[rec(1, old)]), [WriteStatus::Written]);
+    assert_eq!(store.write(&[rec(2, noon())]), [WriteStatus::Written]);
+    // durable 重送：重複的 report 不寫出重複的快照
+    assert_eq!(store.write(&[rec(2, noon())]), [WriteStatus::Duplicate]);
+    assert_eq!(
+        count(&mut store, "SELECT count(*) FROM process_snapshots"),
+        2
+    );
+    let body: Vec<u8> = store
+        .conn
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT body FROM process_snapshots WHERE ts = ?1",
+            [noon().timestamp_millis()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let back: kairos_proto::ProcessList = serde_json::from_slice(&body).unwrap();
+    assert_eq!(back, list);
+    store.rollup.clear();
+    store.capacity.next_check = Some(Instant::now() + Duration::from_secs(3600));
+    while store.maintain() {}
+    assert_eq!(
+        count(&mut store, "SELECT count(*) FROM process_snapshots"),
+        1
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn assets_are_merged_and_changes_recorded() {
+    use crate::store::{AssetWrite, ReportStore};
+    let dir = temp_dir("assets");
+    let (mut store, _) = open(&dir, noon);
+    let inv =
+        |v: serde_json::Value| -> kairos_proto::Inventory { serde_json::from_value(v).unwrap() };
+    let w = |ms: i64, i: kairos_proto::Inventory| AssetWrite {
+        agent_id: A.into(),
+        hostname: "web-01".into(),
+        peer: "10.0.0.1:1".into(),
+        collected_ms: ms,
+        received_ms: ms,
+        inventory: i,
+    };
+    let first = inv(serde_json::json!({
+        "os": {"family": "linux", "long_version": "Linux (Ubuntu 24.04)"},
+        "boot_time": "2026-10-02T08:11:04Z",
+        "cpu": {"model": "Xeon", "logical_cores": 8},
+        "memory": {"total": 8_589_934_592_u64},
+        "system": {"vendor": "QEMU", "product": "Standard PC", "serial": "S1"}
+    }));
+    // 資產在第一筆 report 之前到達：建立主機
+    let o = store.write_assets(&w(1000, first.clone())).unwrap();
+    assert!(o.first && !o.changed);
+    assert_eq!(o.logical_cores, Some(8));
+    assert_eq!(o.os_family.as_deref(), Some("linux"));
+    assert_eq!(
+        count(&mut store, "SELECT count(*) FROM inventory_changes"),
+        0
+    );
+    assert_eq!(
+        count(&mut store, "SELECT boot_time FROM hosts"),
+        1_790_928_664
+    );
+    // 相同（只有開機時間不同）：不算變更
+    let mut same = first.clone();
+    same.boot_time = Some("2026-10-03T00:00:00Z".into());
+    let o = store.write_assets(&w(2000, same)).unwrap();
+    assert!(!o.first && !o.changed);
+    // 記憶體加大、這次沒有序號（保留舊值）
+    let o = store
+        .write_assets(&w(
+            3000,
+            inv(serde_json::json!({"memory": {"total": 17_179_869_184_u64}, "system": {"vendor": "QEMU"}})),
+        ))
+        .unwrap();
+    assert!(o.changed);
+    assert_eq!(o.history, 1);
+    let conn = store.conn.as_ref().unwrap();
+    let (changes, at): (String, i64) = conn
+        .query_row(
+            "SELECT changes, changed_at FROM inventory_changes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(at, 3000);
+    let changes: serde_json::Value = serde_json::from_str(&changes).unwrap();
+    assert_eq!(changes[0]["path"], "memory.total");
+    assert_eq!(changes[0]["after"], 17_179_869_184_u64);
+    let (serial, memory, changed_at): (String, i64, i64) = conn
+        .query_row(
+            "SELECT serial, memory_total, changed_at FROM host_inventory",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(serial, "S1");
+    assert_eq!(memory, 17_179_869_184);
+    assert_eq!(changed_at, 3000);
+    // 清冊已滿時拒絕新主機的資產
+    drop(store);
+    let mut o = opts(&dir);
+    o.max_hosts = 1;
+    let (mut store, _) = SqliteStore::open(o, noon).unwrap();
+    let mut other = w(4000, first);
+    other.agent_id = B.into();
+    assert!(store.write_assets(&other).is_err());
+    drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }

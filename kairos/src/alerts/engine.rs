@@ -83,6 +83,10 @@ pub struct HostView {
     /// 最近一次 report 的 CPU 使用率、記憶體使用比例（百分比）
     pub cpu: Option<f64>,
     pub memory: Option<f64>,
+    /// 最近一次 report 的 F4 指標（磁碟、置換空間、負載、網路速率；METRICS.md 第 11.1 節）
+    pub detail: Option<Arc<crate::registry::LastReport>>,
+    /// CPU 邏輯處理器數（資產；每核心負載）
+    pub logical_cores: Option<u32>,
 }
 
 impl HostView {
@@ -1180,6 +1184,22 @@ impl Engine {
                     self.on_decommissioned(agent_id, *ip, initiated_by.as_deref(), at);
                 }
             }
+            EventKind::HostRebooted {
+                agent_id,
+                hostname,
+                uptime_secs,
+                previous_uptime_secs,
+                boot_time,
+            } => {
+                self.on_rebooted(
+                    agent_id,
+                    hostname,
+                    *uptime_secs,
+                    *previous_uptime_secs,
+                    boot_time.as_deref(),
+                    at,
+                );
+            }
             EventKind::RegistryEvicted { .. } => {
                 self.evictions.push_back(at);
                 while self.evictions.len() > 10_000 {
@@ -1497,6 +1517,50 @@ impl Engine {
     }
 
     /// 主機自行除役：每台一則紀錄；之前觸發、未恢復的主機事件自動結束（§2.2）
+    /// 主機重新開機（`sys.host_rebooted`；D5）：資訊等級，建立後立即結案（只留紀錄，不通知）
+    fn on_rebooted(
+        &mut self,
+        agent_id: &str,
+        hostname: &str,
+        uptime_secs: u64,
+        previous_uptime_secs: u64,
+        boot_time: Option<&str>,
+        at: i64,
+    ) {
+        let Some(rule) = self.rule(ids::HOST_REBOOTED).filter(|r| r.enabled).cloned() else {
+            return;
+        };
+        let host = self.last_hosts.iter().find(|h| &*h.agent_id == agent_id);
+        if host.is_some_and(|h| h.decommissioned) {
+            return;
+        }
+        let name = host
+            .map(|h| h.name().to_string())
+            .unwrap_or_else(|| hostname.to_string());
+        let ip = host.and_then(|h| h.ip).map(|i| i.to_string());
+        let id = self.open(
+            &rule,
+            agent_id,
+            Signal {
+                severity: rule.severity,
+                title: format!("{name} 重新開機"),
+                code: None,
+                agent_id: Some(agent_id.to_string()),
+                details: json!({
+                    "hostname": name,
+                    "ip": ip,
+                    "uptime_secs": uptime_secs,
+                    "previous_uptime_secs": previous_uptime_secs,
+                    "boot_time": boot_time,
+                }),
+                episode: Some(at),
+                parent: None,
+            },
+            at,
+        );
+        self.close(&id, at, RootCause::ConditionCleared, "system", None);
+    }
+
     fn on_decommissioned(
         &mut self,
         agent_id: &str,

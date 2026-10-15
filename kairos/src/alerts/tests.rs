@@ -108,6 +108,8 @@ fn host(id: &str, ip: &str) -> HostView {
         last_report_at: None,
         cpu: None,
         memory: None,
+        detail: None,
+        logical_cores: None,
     }
 }
 
@@ -1149,4 +1151,178 @@ fn disabled_rules_stop_and_recover_their_events() {
             .iter()
             .all(|x| !x.state.is_active())
     );
+}
+
+// ---- F4：磁碟、網路、置換空間、負載、重新開機（METRICS.md 第 11 節）----
+
+fn metric_rule(id: &str, params: serde_json::Value) -> Rule {
+    let mut r = rules::builtin_default(ids::HOST_OFFLINE).unwrap();
+    r.rule_id = id.into();
+    r.builtin = false;
+    r.kind = rules::kind::METRIC_THRESHOLD.into();
+    r.name = id.into();
+    r.severity = Severity::Warning;
+    r.params = params;
+    r
+}
+
+fn with_detail(mut h: HostView, d: crate::registry::ReportDetail) -> HostView {
+    h.detail = Some(Arc::new(crate::registry::LastReport {
+        recv_at: "2026-10-20T00:00:00.000Z".into(),
+        seq: 1,
+        ts: "2026-10-20T00:00:00.000Z".into(),
+        cpu_usage: None,
+        total_memory: None,
+        used_memory: None,
+        metrics: Some(10),
+        detail: d,
+    }));
+    h
+}
+
+fn disks(usages: &[(&str, f64)]) -> crate::registry::ReportDetail {
+    crate::registry::ReportDetail {
+        filesystems: usages
+            .iter()
+            .map(|(m, u)| crate::registry::FsLast {
+                mountpoint: m.to_string(),
+                usage: Some(*u),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn disk_threshold_fires_and_recovers_per_mountpoint() {
+    let mut rules = rules_with_channels();
+    rules.push(metric_rule(
+        "r-disk",
+        json!({"metric": "disk", "op": ">", "threshold": 90.0, "for_secs": 600, "clear_threshold": 85.0, "mountpoints": ["/", "/data*"]}),
+    ));
+    let mut e = engine_with(rules, vec![], &[], true);
+    let h = |root: f64, data: f64, boot: f64| {
+        with_detail(
+            host("a", "10.0.0.1"),
+            disks(&[("/", root), ("/data1", data), ("/boot", boot)]),
+        )
+    };
+    e.tick(world(T0, vec![h(95.0, 95.0, 99.0)]));
+    e.tick(world(T0 + 10 * MIN, vec![h(95.0, 95.0, 99.0)]));
+    // 每個掛載點各一則；/boot 不在範圍內
+    let subjects: Vec<String> = by_rule(&e, "r-disk")
+        .iter()
+        .map(|x| x.subject.clone())
+        .collect();
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert!(subjects.contains(&"a|/".to_string()));
+    assert!(subjects.contains(&"a|/data1".to_string()));
+    let ev = by_rule(&e, "r-disk");
+    let root = ev.iter().find(|x| x.subject == "a|/").unwrap();
+    assert_eq!(root.details["mountpoint"], "/");
+    assert_eq!(root.agent_id.as_deref(), Some("a"));
+    // / 恢復（低於 85）、/data1 仍在 88（未低於恢復門檻）
+    e.tick(world(T0 + 11 * MIN, vec![h(50.0, 88.0, 99.0)]));
+    let still: Vec<String> = by_rule(&e, "r-disk")
+        .iter()
+        .filter(|x| x.state.is_active())
+        .map(|x| x.subject.clone())
+        .collect();
+    assert_eq!(still, ["a|/data1"]);
+}
+
+#[test]
+fn network_swap_and_load_thresholds_use_their_units() {
+    let mut rules = rules_with_channels();
+    rules.push(metric_rule(
+        "r-rx",
+        json!({"metric": "network_rx", "op": ">", "threshold": 800.0, "for_secs": 0, "devices": ["eth*"]}),
+    ));
+    rules.push(metric_rule(
+        "r-swap",
+        json!({"metric": "swap", "op": ">", "threshold": 50.0, "for_secs": 0}),
+    ));
+    rules.push(metric_rule(
+        "r-load",
+        json!({"metric": "load", "op": ">", "threshold": 2.0, "for_secs": 0}),
+    ));
+    let mut e = engine_with(rules, vec![], &[], true);
+    let io = |dev: &str, rate: f64| crate::registry::IoLast {
+        device: dev.into(),
+        rx_rate: Some(rate),
+        ..Default::default()
+    };
+    let detail = crate::registry::ReportDetail {
+        // 120 MB/s = 960 Mbps（eth0 觸發）；docker0 不在範圍內
+        network: vec![io("eth0", 120_000_000.0), io("docker0", 900_000_000.0)],
+        swap_total: Some(1000),
+        swap_used: Some(600),
+        load_5m: Some(18.0),
+        ..Default::default()
+    };
+    let mut h = with_detail(host("a", "10.0.0.1"), detail.clone());
+    h.logical_cores = Some(8);
+    e.tick(world(T0, vec![h.clone()]));
+    let rx = by_rule(&e, "r-rx");
+    assert_eq!(rx.len(), 1);
+    assert_eq!(rx[0].subject, "a|eth0");
+    let v = rx[0].details["value"].as_f64().unwrap();
+    assert!((v - 960.0).abs() < 1e-6, "{v}");
+    assert_eq!(by_rule(&e, "r-swap").len(), 1);
+    // 18 ÷ 8 = 2.25 倍
+    assert_eq!(by_rule(&e, "r-load").len(), 1);
+    // 沒有資產（核心數）或 swap 為 0 的主機沒有值：不觸發
+    let mut e2 = engine_with(
+        {
+            let mut v = rules_with_channels();
+            v.push(metric_rule(
+                "r-load",
+                json!({"metric": "load", "op": ">", "threshold": 0.0, "for_secs": 0}),
+            ));
+            v.push(metric_rule(
+                "r-swap",
+                json!({"metric": "swap", "op": ">=", "threshold": 0.0, "for_secs": 0}),
+            ));
+            v
+        },
+        vec![],
+        &[],
+        true,
+    );
+    let mut d = detail;
+    d.swap_total = Some(0);
+    e2.tick(world(T0, vec![with_detail(host("b", "10.0.0.2"), d)]));
+    assert!(by_rule(&e2, "r-load").is_empty());
+    assert!(by_rule(&e2, "r-swap").is_empty());
+}
+
+#[test]
+fn reboot_is_recorded_as_information_without_notification() {
+    let mut e = engine();
+    e.tick(world(T0, vec![host("a", "10.0.0.1")]));
+    e.take_output();
+    e.on_bus(&BusEvent {
+        seq: 1,
+        at: chrono::DateTime::from_timestamp_millis(T0 + MIN).unwrap(),
+        kind: EventKind::HostRebooted {
+            agent_id: "a".into(),
+            hostname: "h-a".into(),
+            uptime_secs: 30,
+            previous_uptime_secs: 86_400,
+            boot_time: Some("2025-10-09T08:01:10.000Z".into()),
+        },
+    });
+    let out = e.take_output();
+    let rec = out
+        .events
+        .iter()
+        .find(|x| x.rule_id == ids::HOST_REBOOTED)
+        .unwrap();
+    assert_eq!(rec.severity, Severity::Info);
+    assert_eq!(rec.attention, Attention::Record);
+    assert_eq!(rec.state, EventState::Resolved);
+    assert_eq!(rec.details["uptime_secs"], 30);
+    assert!(rec.title.contains("重新開機"), "{}", rec.title);
+    assert!(out.deliveries.is_empty());
 }

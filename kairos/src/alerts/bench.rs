@@ -136,6 +136,7 @@ async fn alerts_bench_acks_under_load() {
                 total_memory: Some(1000),
                 used_memory: Some(500),
                 metrics: Some(3),
+                detail: Default::default(),
             },
         );
     }

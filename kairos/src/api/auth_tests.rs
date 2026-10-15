@@ -1231,6 +1231,21 @@ async fn group_scoped_roles_only_see_their_hosts() {
     )
     .await;
     assert_eq!(r.status, 404);
+    // 資產與行程（METRICS.md 第 10 節）：同樣是 hosts:read 加群組範圍
+    for sub in ["inventory", "inventory/changes", "processes"] {
+        for (id, status) in [("3", 404), ("1", 200)] {
+            let r = call(
+                &f,
+                "GET",
+                &format!("/api/v1/hosts/11111111-0000-4000-8000-00000000000{id}/{sub}"),
+                Auth::Session(&p4),
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(r.status, status, "{sub} {id}");
+        }
+    }
     assert_eq!(
         call(
             &f,

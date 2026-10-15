@@ -1278,6 +1278,7 @@ mod tests {
             rollup_1h_retention_days: 400,
             max_total_bytes: 0,
             max_hosts: 1000,
+            max_series_per_host: crate::config::DEFAULT_MAX_SERIES_PER_HOST,
             mtls: false,
         };
         let (store, _) = crate::store::sqlite::SqliteStore::open(store_opts, Utc::now).unwrap();

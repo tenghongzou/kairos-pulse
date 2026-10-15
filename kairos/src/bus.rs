@@ -161,6 +161,14 @@ pub enum EventKind {
         initiated_by: Option<String>,
         already: bool,
     },
+    /// 主機重新開機（`system.uptime` 變小；METRICS.md 第 11.2 節）。`boot_time` 為推算的開機時間
+    HostRebooted {
+        agent_id: String,
+        hostname: String,
+        uptime_secs: u64,
+        previous_uptime_secs: u64,
+        boot_time: Option<String>,
+    },
     /// TLS 設定（憑證、CA、CRL）重新載入的結果；`crl`：變更涉及 CRL（失敗時 `KRS-E1204`）
     TlsReload {
         ok: bool,
@@ -205,6 +213,7 @@ impl EventKind {
             EventKind::AuthFailed { .. } => "auth_failed",
             EventKind::RegistryEvicted { .. } => "registry_evicted",
             EventKind::HostDecommissioned { .. } => "host_decommissioned",
+            EventKind::HostRebooted { .. } => "host_rebooted",
             EventKind::TlsReload { .. } => "tls_reload",
             EventKind::Condition { .. } => "condition",
             EventKind::Lifecycle { .. } => "lifecycle",

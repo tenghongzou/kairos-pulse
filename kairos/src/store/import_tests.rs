@@ -30,6 +30,7 @@ fn opts(dir: &Path) -> SqliteOptions {
         rollup_1h_retention_days: 400,
         max_total_bytes: 0,
         max_hosts: 1000,
+        max_series_per_host: crate::config::DEFAULT_MAX_SERIES_PER_HOST,
         mtls: true,
     }
 }
@@ -674,6 +675,7 @@ fn import_throughput() {
     let o = SqliteOptions {
         max_total_bytes: 0,
         max_hosts: 100_000,
+        max_series_per_host: crate::config::DEFAULT_MAX_SERIES_PER_HOST,
         ..opts(&dir)
     };
     for (label, dry) in [
