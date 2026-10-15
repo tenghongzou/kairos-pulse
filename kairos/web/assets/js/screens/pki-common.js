@@ -7,6 +7,7 @@
 import { h, icon, uid, mount } from '../core/dom.js';
 import { t } from '../core/strings.js';
 import { api } from '../core/api.js';
+import * as session from '../core/session.js';
 import { openDialog } from '../ui/dialog.js';
 import { inlineAlert, errorAlert, setBusy, neutralBadge, statusBadge, copyButton } from '../ui/components.js';
 
@@ -267,11 +268,14 @@ export function modeAlert(mode) {
   if (mode.state === 'open_paused') {
     return inlineAlert({ kind: 'info', title: t('pki.mode.paused.title'), body: t('pki.mode.paused.body') });
   }
+  // 能改模式的人（管理員）看到設定的連結；其他人看到「請管理員…」（screens.md S12「註冊端點模式提示」）
+  const canMode = session.can('enroll.mode:write');
+  const toSettings = session.can('settings:read') ? h('a', { href: '/system/settings/security' }, t('pki.mode.toSettings')) : null;
   if (mode.state === 'renew_only') {
-    return inlineAlert({ kind: 'warning', title: t('pki.mode.renewOnly.title'), body: t('pki.mode.renewOnly.body') });
+    return inlineAlert({ kind: 'warning', title: t('pki.mode.renewOnly.title'), body: h('div', null, h('p', null, t('pki.mode.renewOnly.body')), h('p', null, canMode ? toSettings : t('pki.mode.renewOnly.askAdmin'))) });
   }
   if (mode.state === 'closed') {
-    return inlineAlert({ kind: 'warning', title: t('pki.mode.closed.title'), body: t('pki.mode.closed.body') });
+    return inlineAlert({ kind: 'warning', title: t('pki.mode.closed.title'), body: h('div', null, h('p', null, t('pki.mode.closed.body')), toSettings ? h('p', null, toSettings) : null) });
   }
   if (mode.listening === false && mode.not_listening_reason) {
     return inlineAlert({ kind: 'warning', title: t('pki.mode.notListening.title'), body: mode.not_listening_reason });

@@ -14,6 +14,7 @@ import { closeMenu } from './ui/menu.js';
 import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
 import './screens/alerts-boot.js';
+import './screens/enroll-boot.js';
 import { ADMIN_ROUTES } from './routes-admin.js';
 
 /**

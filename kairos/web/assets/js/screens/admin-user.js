@@ -7,7 +7,7 @@
 // 防呆（S16）：不能停用或刪除自己；最後一位全站管理員（啟用中、有全站管理員個人指派）不能停用、刪除或移除管理員；
 // 對象是自己時「結束其他所有工作階段」（保留目前這個，與個人設定相同）。目錄服務帳號沒有重設密碼與重設兩步驟驗證。
 
-import { h, icon, mount } from '../core/dom.js';
+import { h, icon, mount, announce } from '../core/dom.js';
 import { t, permissionLabel } from '../core/strings.js';
 import { api } from '../core/api.js';
 import * as session from '../core/session.js';
@@ -96,6 +96,14 @@ export function render(ctx) {
       }
       if (!self && !lastAdmin) {
         dangerActions.push(h('button', { type: 'button', class: 'ds-button ds-button--danger-secondary', on: { click: () => del(u) } }, icon('trash'), t('adm.user.delete')));
+      } else {
+        // 自己或最後一位全站管理員：「刪除」與「停用」同樣以 aria-disabled 顯示，共用同一段原因（screens.md S16）
+        const why = self ? t('adm.user.cannotSelf') : t('adm.user.lastAdminWhy');
+        const note = dangerActions.find((el) => el.tagName === 'P' && el.id);
+        const del2 = h('button', { type: 'button', class: 'ds-button ds-button--danger-secondary', 'aria-disabled': 'true', 'aria-describedby': note ? note.id : null }, icon('trash'), t('adm.user.delete'));
+        del2.addEventListener('click', () => announce(why));
+        if (note) dangerActions.splice(dangerActions.indexOf(note), 0, del2);
+        else dangerActions.push(del2);
       }
     }
 

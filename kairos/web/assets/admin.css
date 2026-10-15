@@ -16,3 +16,6 @@ a.k-status-light:hover .k-status-light__text { text-decoration: underline; }
 .k-settings-table td .caption { margin: var(--ds-space-100) 0 0; }
 .k-matrix tbody th[scope="row"] { font: var(--ds-text-body); color: var(--ds-color-text-primary); text-align: left; }
 .k-matrix thead th .k-host-id { font-family: inherit; }
+
+/* S18「前往第 N 筆」：斷點那一列 */
+.ds-table tr.is-highlight { background: var(--ds-color-bg-selected); }

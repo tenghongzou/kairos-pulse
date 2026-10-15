@@ -24,7 +24,7 @@ export const NAV = [
     // 註冊與憑證（S12～S15；ia.md §3）
     section: 'nav.section.pki',
     items: [
-      { path: '/enrollment/pending', label: 'nav.pending', icon: 'enrollment', perm: 'enroll:read', match: (p) => p.startsWith('/enrollment/pending') },
+      { path: '/enrollment/pending', label: 'nav.pending', icon: 'enrollment', perm: 'enroll:read', count: 'pending', match: (p) => p.startsWith('/enrollment/pending') },
       { path: '/enrollment/tokens', label: 'nav.tokens', icon: 'key', perm: 'enroll:read', match: (p) => p.startsWith('/enrollment/tokens') },
       { path: '/certificates', label: 'nav.certificates', icon: 'certificate', perm: 'pki:read', match: (p) => p === '/certificates' || (p.startsWith('/certificates/') && p !== '/certificates/ca') },
       { path: '/certificates/ca', label: 'nav.ca', icon: 'shield-check', perm: 'pki:read', match: (p) => p === '/certificates/ca' },

@@ -20,6 +20,7 @@ import { pageHead, emptyState, errorState, field, inlineAlert, copyButton, dl, s
 import { openDialog } from '../ui/dialog.js';
 import { toast } from '../ui/toast.js';
 import { createTable } from '../ui/table.js';
+import { refreshPendingCount } from './enroll-boot.js';
 import { actionDialog, selectField, textareaField, linkTabs, fetchMode, issuanceAlert, flagBadge, flagLabel, FLAGS, kindLabel, requestStateBadge, shortId, osLine, loadTokenMap } from './pki-common.js';
 
 const REASON_CODES = ['unknown_host', 'source_mismatch', 'duplicate', 'other'];
@@ -315,7 +316,10 @@ export function render(ctx) {
       (res.results || [])
         .filter((x) => x.result === kind)
         .slice(0, 3)
-        .map((x) => (byId.get(x.request_id) ? who(byId.get(x.request_id)) : x.request_id))
+        .map((x) => {
+          const r = byId.get(x.request_id);
+          return r ? t('enroll.whoInline', { host: r.hostname, code: r.request_code }) : x.request_id;
+        })
         .join('、');
     const parts = [];
     const ok = (s.issued || 0) + (s.approved || 0);
@@ -529,6 +533,8 @@ export function render(ctx) {
   }
 
   async function reload({ keepResult = false } = {}) {
+    // 側邊導覽「待核准」的計數泡泡與清單同步（ia.md §7）
+    refreshPendingCount();
     replaceQuery(params());
     if (!keepResult) result.hidden = true;
     changeBar.hidden = true;
