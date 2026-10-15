@@ -18,9 +18,41 @@
 //!   `meta.audit_legacy_sealed` 記下已補上（[`seal_legacy`]）。之後只有 [`append`] 本身寫入的那一筆會被計算
 //!   雜湊：繞過程式直接插入資料庫的紀錄（沒有雜湊）不會被「合法化」，驗證時以 `missing_hash` 指出。
 //! - 任何角色都不能經由 API 或 CLI 修改或刪除紀錄（只有保留期限的清除）。
+//!
+//! ## HMAC（0.7〔草稿〕，schema v7 的 `hmac` 欄位）
+//!
+//! 雜湊鏈只靠公開的演算法：能寫入資料庫的人可以修改一筆後把之後的鏈全部重新計算。0.7 起每一筆另有
+//!
+//! ```text
+//! hmac = HMAC-SHA256( K, "kairos-audit-record/v1\n" ‖ hash )    K = HMAC-SHA256(金鑰檔, "kairos-audit-hmac/v1")
+//! ```
+//!
+//! 金鑰在資料目錄的 [`KEY_FILE`]（32 bytes 隨機值，0600），**與 `console.key` 分開**：外部稽核者或
+//! SIEM 需要獨立驗證 HMAC 時可以只交付這把金鑰，不會同時拿到 CSRF 與 TOTP 的金鑰；輪替或遺失
+//! `console.key`（所有人重設兩步驟驗證）也不會讓整條稽核鏈無法驗證。代價是多一個要備份的檔案
+//! （`kairos db backup --include-keys` 一併加密備份）。
+//!
+//! - 金鑰檔只由 Kairos 服務在啟動時建立（[`ensure_key`]）；CLI 只讀取（以 root 執行的 CLI 不會建立
+//!   一個服務帳號讀不到的金鑰檔）。寫入時依連線的資料庫路徑找到同一個資料目錄的金鑰（[`key_for`]）。
+//! - **升級時的邊界**：有金鑰之後寫入的第一筆記在 `meta.audit_hmac`（`since_id`、`key_id`）。這一筆
+//!   之前的紀錄（0.6 以前、或服務第一次以 0.7 啟動前由 CLI 寫入的）只有雜湊鏈，驗證時明確列出邊界；
+//!   之後的每一筆都必須有正確的 HMAC（`missing_hmac`、`hmac_mismatch`），邊界之前出現 HMAC 表示邊界
+//!   被移動（`hmac_boundary_mismatch`）。
+//! - `meta.audit_chain_head` 另帶 `mac`：沒有金鑰無法把 head 改成較早的一筆來掩蓋刪除最後幾筆
+//!   （重播先前抄下的 head 仍需靠定期外送的鏈尾雜湊發現，[`crate::audit_monitor`]）。
+//! - 金鑰遺失或與 `meta.audit_hmac.key_id` 不符時驗證失敗（`hmac_key_unavailable`／`hmac_key_mismatch`，
+//!   `KRS-E6201`）；雜湊鏈本身仍會先完整檢查。金鑰不符時不以新的金鑰繼續簽（不「接續」鏈）。
+//! - 已知限制：能同時寫入資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人可以把鏈「降級」成 0.7
+//!   之前的樣子；由外送的鏈尾雜湊（含 HMAC 起點）在外部發現。
 
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::{Error, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 第一筆的 `prev_hash`
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -30,8 +62,179 @@ pub const META_ANCHOR: &str = "audit_chain_anchor";
 pub const META_HEAD: &str = "audit_chain_head";
 /// `meta` 的鍵：升級前（沒有雜湊）的紀錄已補上雜湊（`{"through_id","sealed_at"}`）
 pub const META_LEGACY_SEALED: &str = "audit_legacy_sealed";
+/// `meta` 的鍵：HMAC 的起點（`{"since_id","key_id","started_at"}`）
+pub const META_HMAC: &str = "audit_hmac";
 /// 完整性驗證失敗的產品代碼（`copywriting.md` §3.3）
 pub const CODE_CHAIN_BROKEN: &str = "KRS-E6201";
+/// HMAC 的金鑰檔（資料目錄下）
+pub const KEY_FILE: &str = "audit-hmac.key";
+
+/// 稽核 HMAC 的金鑰（由 [`KEY_FILE`] 衍生；原始金鑰不留在記憶體中）
+pub struct AuditKey {
+    mac: hmac::Key,
+    key_id: String,
+}
+
+impl std::fmt::Debug for AuditKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuditKey({})", self.key_id)
+    }
+}
+
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(subtle::ConstantTimeEq::ct_eq(a.as_bytes(), b.as_bytes()))
+}
+
+impl AuditKey {
+    pub fn from_bytes(key: &[u8; 32]) -> Self {
+        let base = hmac::Key::new(hmac::HMAC_SHA256, key);
+        let derived = hmac::sign(&base, b"kairos-audit-hmac/v1");
+        let id = hmac::sign(&base, b"kairos-audit-key-id/v1");
+        Self {
+            mac: hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref()),
+            key_id: hex(&id.as_ref()[..8]),
+        }
+    }
+
+    /// 金鑰的識別（不是秘密；`meta.audit_hmac.key_id`，用來區分「金鑰不符」與「紀錄被修改」）
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// 一筆紀錄的 HMAC（對它的雜湊）
+    pub fn record_mac(&self, hash: &str) -> String {
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        ctx.update(b"kairos-audit-record/v1\n");
+        ctx.update(hash.as_bytes());
+        hex(ctx.sign().as_ref())
+    }
+
+    /// `meta.audit_chain_head` 的 HMAC
+    pub fn head_mac(&self, id: i64, hash: &str) -> String {
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        ctx.update(b"kairos-audit-head/v1\n");
+        ctx.update(id.to_string().as_bytes());
+        ctx.update(b"\n");
+        ctx.update(hash.as_bytes());
+        hex(ctx.sign().as_ref())
+    }
+
+    /// 讀取資料目錄的金鑰檔；不存在時為 `Ok(None)`（不建立）
+    pub fn load(data_dir: &Path) -> Result<Option<Self>, Error> {
+        let path = data_dir.join(KEY_FILE);
+        let mut buf = zeroize::Zeroizing::new(Vec::new());
+        match std::fs::File::open(&path) {
+            Ok(mut f) => {
+                f.read_to_end(&mut buf)?;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::new(
+                    e.kind(),
+                    format!("無法讀取 {}: {e}", path.display()),
+                ));
+            }
+        }
+        let key: zeroize::Zeroizing<[u8; 32]> =
+            zeroize::Zeroizing::new(buf.as_slice().try_into().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{} 的長度不是 32 bytes（檔案可能已損毀）", path.display()),
+                )
+            })?);
+        Ok(Some(Self::from_bytes(&key)))
+    }
+
+    /// 讀取金鑰檔；不存在時建立（0600，只寫一次，不覆寫）。只由 Kairos 服務在啟動時呼叫
+    pub fn load_or_create(data_dir: &Path) -> Result<Self, Error> {
+        if let Some(k) = Self::load(data_dir)? {
+            crate::users::secrets::restrict_0600(&data_dir.join(KEY_FILE));
+            return Ok(k);
+        }
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        SystemRandom::new()
+            .fill(&mut key[..])
+            .map_err(|_| Error::other("無法取得隨機數（作業系統的 CSPRNG）"))?;
+        let path = data_dir.join(KEY_FILE);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(mut f) => {
+                f.write_all(&key[..])?;
+                f.sync_all()?;
+                Ok(Self::from_bytes(&key))
+            }
+            // 另一個行程剛建立：改讀它的
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Self::load(data_dir)?
+                .ok_or_else(|| Error::other(format!("{} 剛建立卻無法讀取", path.display()))),
+            Err(e) => Err(Error::new(
+                e.kind(),
+                format!("無法建立 {}: {e}", path.display()),
+            )),
+        }
+    }
+}
+
+/// 已讀取的金鑰（以資料目錄為鍵；只快取讀到的金鑰，不存在時每次重新檢查）
+fn key_cache() -> &'static Mutex<HashMap<PathBuf, Arc<AuditKey>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<AuditKey>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 這個連線的資料庫所在資料目錄的金鑰（記憶體中的資料庫、沒有金鑰檔或無法讀取時為 `None`）
+pub fn key_for(conn: &Connection) -> Option<Arc<AuditKey>> {
+    let path = conn.path().filter(|p| !p.is_empty())?;
+    let dir = Path::new(path).parent()?.to_path_buf();
+    if let Some(k) = key_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dir)
+    {
+        return Some(k.clone());
+    }
+    match AuditKey::load(&dir) {
+        Ok(Some(k)) => {
+            let k = Arc::new(k);
+            key_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(dir, k.clone());
+            Some(k)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::debug!("無法讀取稽核 HMAC 的金鑰檔：{e}");
+            None
+        }
+    }
+}
+
+/// 服務啟動時：建立或讀取金鑰並放進快取（之後的寫入都帶 HMAC）
+pub fn ensure_key(data_dir: &Path) -> Result<Arc<AuditKey>, Error> {
+    let k = Arc::new(AuditKey::load_or_create(data_dir)?);
+    // SQLite 回報的資料庫路徑是絕對路徑：兩種寫法都放進快取（找不到時 key_for 會重新讀檔）
+    let mut cache = key_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(abs) = std::fs::canonicalize(data_dir) {
+        cache.insert(abs, k.clone());
+    }
+    cache.insert(data_dir.to_path_buf(), k.clone());
+    Ok(k)
+}
+
+/// `meta.audit_hmac`：(since_id, key_id)
+pub fn hmac_since(conn: &Connection) -> rusqlite::Result<Option<(i64, String)>> {
+    Ok(meta_get(conn, META_HMAC)?.and_then(|v| {
+        Some((
+            v.get("since_id")?.as_i64()?,
+            v.get("key_id")?.as_str()?.to_string(),
+        ))
+    }))
+}
 
 /// 一筆稽核事件（寫入用）
 #[derive(Debug, Clone, Default)]
@@ -100,10 +303,11 @@ pub struct AuditRow {
     pub details: Option<String>,
     pub prev_hash: Option<String>,
     pub hash: Option<String>,
+    /// 0.7 起（schema v7）：雜湊的 HMAC（[`AuditKey::record_mac`]）；邊界之前的紀錄為 `None`
+    pub hmac: Option<String>,
 }
 
-const COLUMNS: &str =
-    "id, at, actor, actor_ip, category, action, object, result, code, details, prev_hash, hash";
+const COLUMNS: &str = "id, at, actor, actor_ip, category, action, object, result, code, details, prev_hash, hash, hmac";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
     Ok(AuditRow {
@@ -119,6 +323,7 @@ fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
         details: r.get(9)?,
         prev_hash: r.get(10)?,
         hash: r.get(11)?,
+        hmac: r.get(12)?,
     })
 }
 
@@ -182,8 +387,19 @@ pub(crate) fn in_write_tx<R>(
     }
 }
 
-/// 寫入一筆稽核事件並接上雜湊鏈；回傳 id
+/// 寫入一筆稽核事件並接上雜湊鏈（資料目錄有金鑰檔時另加 HMAC）；回傳 id
 pub fn append(conn: &Connection, at_ms: i64, a: &Audit<'_>) -> rusqlite::Result<i64> {
+    let key = key_for(conn);
+    append_with_key(conn, at_ms, a, key.as_deref())
+}
+
+/// [`append`]，指定 HMAC 的金鑰（`None`：不加 HMAC；已開始 HMAC 時這一筆在驗證時為 `missing_hmac`）
+pub fn append_with_key(
+    conn: &Connection,
+    at_ms: i64,
+    a: &Audit<'_>,
+    key: Option<&AuditKey>,
+) -> rusqlite::Result<i64> {
     in_write_tx(conn, |conn| {
         conn.execute(
             "INSERT INTO audit_events (at, actor, actor_ip, category, action, object, result, code, details)
@@ -207,8 +423,45 @@ pub fn append(conn: &Connection, at_ms: i64, a: &Audit<'_>) -> rusqlite::Result<
         } else {
             seal_one(conn, id)?;
         }
+        if let Some(k) = key {
+            sign_one(conn, id, k)?;
+        }
         Ok(id)
     })
+}
+
+/// 剛寫入的這一筆加上 HMAC；第一次時記下起點。金鑰與起點記錄的不同時不簽（驗證時以
+/// `hmac_key_mismatch` 指出，不用另一把金鑰把鏈「接續」下去）
+fn sign_one(conn: &Connection, id: i64, key: &AuditKey) -> rusqlite::Result<()> {
+    match hmac_since(conn)? {
+        Some((_, kid)) if kid != key.key_id() => return Ok(()),
+        Some(_) => {}
+        None => meta_set(
+            conn,
+            META_HMAC,
+            &json!({ "since_id": id, "key_id": key.key_id(), "started_at": chrono::Utc::now().timestamp_millis() }),
+        )?,
+    }
+    let hash: Option<String> =
+        conn.query_row("SELECT hash FROM audit_events WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?;
+    let Some(hash) = hash else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE audit_events SET hmac = ?2 WHERE id = ?1",
+        params![id, key.record_mac(&hash)],
+    )?;
+    let max: i64 = conn.query_row("SELECT max(id) FROM audit_events", [], |r| r.get(0))?;
+    if max == id {
+        meta_set(
+            conn,
+            META_HEAD,
+            &json!({"id": id, "hash": hash, "mac": key.head_mac(id, &hash)}),
+        )?;
+    }
+    Ok(())
 }
 
 /// 只計算剛插入的這一筆：接在 id 比它小、有雜湊的最後一筆之後（中間若有沒有雜湊的紀錄，驗證時
@@ -369,6 +622,22 @@ pub struct VerifyReport {
     pub first_prev_hash: Option<String>,
     /// 第一個斷點
     pub broken: Option<ChainBreak>,
+    /// HMAC 的邊界與結果
+    pub hmac: HmacReport,
+}
+
+/// HMAC 的驗證結果
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HmacReport {
+    /// 第一筆有 HMAC 的紀錄（`meta.audit_hmac.since_id`；還沒開始時為 `None`）
+    pub since_id: Option<i64>,
+    pub key_id: Option<String>,
+    /// `not_started`（還沒有金鑰或還沒寫入）、`verified`、`key_unavailable`、`key_mismatch`、`failed`
+    pub status: &'static str,
+    /// 驗證過 HMAC 的筆數
+    pub verified: u64,
+    /// 邊界之前、只有雜湊鏈的筆數
+    pub chain_only: u64,
 }
 
 /// 斷點
@@ -402,26 +671,58 @@ impl VerifyReport {
                 "at": b.at.map(crate::api::http::ts_ms),
                 "product_code": CODE_CHAIN_BROKEN,
             })),
+            "hmac": {
+                "status": self.hmac.status,
+                "since_id": self.hmac.since_id,
+                "key_id": self.hmac.key_id,
+                "verified": self.hmac.verified,
+                "chain_only": self.hmac.chain_only,
+            },
         })
     }
 }
 
 /// 從頭到尾重新計算雜湊鏈，回報第一個斷點（不修改任何資料）。所有讀取在同一個讀取交易（同一個
 /// 快照）中進行：驗證期間其他連線寫入的紀錄不會造成假的斷點
+///
+/// HMAC 的金鑰依資料庫路徑取得（[`key_for`]）
 pub fn verify(conn: &Connection) -> rusqlite::Result<VerifyReport> {
+    let key = key_for(conn);
+    verify_with_key(conn, key.as_deref())
+}
+
+/// [`verify`]，指定 HMAC 的金鑰
+pub fn verify_with_key(
+    conn: &Connection,
+    key: Option<&AuditKey>,
+) -> rusqlite::Result<VerifyReport> {
     if !conn.is_autocommit() {
-        return verify_in_snapshot(conn);
+        return verify_in_snapshot(conn, key);
     }
     conn.execute_batch("BEGIN")?;
-    let r = verify_in_snapshot(conn);
+    let r = verify_in_snapshot(conn, key);
     let _ = conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
     r
 }
 
-fn verify_in_snapshot(conn: &Connection) -> rusqlite::Result<VerifyReport> {
+fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Result<VerifyReport> {
     let anchor = anchor(conn)?;
-    let head = meta_get(conn, META_HEAD)?
+    let head_meta = meta_get(conn, META_HEAD)?;
+    let head = head_meta
+        .as_ref()
         .and_then(|v| Some((v.get("id")?.as_i64()?, v.get("hash")?.as_str()?.to_string())));
+    let head_mac = head_meta
+        .as_ref()
+        .and_then(|v| v.get("mac")?.as_str().map(str::to_string));
+    let since = hmac_since(conn)?;
+    // 能否逐筆驗證 HMAC：有起點、有金鑰且與起點記錄的相同
+    let key_state = match (&since, key) {
+        (None, _) => "not_started",
+        (Some(_), None) => "key_unavailable",
+        (Some((_, kid)), Some(k)) if kid != k.key_id() => "key_mismatch",
+        (Some(_), Some(_)) => "verified",
+    };
+    let check_mac = if key_state == "verified" { key } else { None };
     let mut report = VerifyReport {
         checked: 0,
         first_id: None,
@@ -429,6 +730,13 @@ fn verify_in_snapshot(conn: &Connection) -> rusqlite::Result<VerifyReport> {
         last_hash: None,
         first_prev_hash: None,
         broken: None,
+        hmac: HmacReport {
+            since_id: since.as_ref().map(|s| s.0),
+            key_id: since.as_ref().map(|s| s.1.clone()),
+            status: key_state,
+            verified: 0,
+            chain_only: 0,
+        },
     };
     let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM audit_events ORDER BY id"))?;
     let mut rows = stmt.query([])?;
@@ -466,6 +774,30 @@ fn verify_in_snapshot(conn: &Connection) -> rusqlite::Result<VerifyReport> {
             report.broken = Some(brk("hash_mismatch"));
             break;
         }
+        // HMAC：邊界之前不應該有（有表示邊界被移動）；之後每一筆都必須有，金鑰可用時逐筆比對
+        match &since {
+            Some((sid, _)) if row.id >= *sid => match (&row.hmac, check_mac) {
+                (None, _) => {
+                    report.broken = Some(brk("missing_hmac"));
+                    break;
+                }
+                (Some(m), Some(k)) => {
+                    if !ct_eq_str(m, &k.record_mac(h)) {
+                        report.broken = Some(brk("hmac_mismatch"));
+                        break;
+                    }
+                    report.hmac.verified += 1;
+                }
+                (Some(_), None) => {}
+            },
+            _ => {
+                if row.hmac.is_some() {
+                    report.broken = Some(brk("hmac_boundary_mismatch"));
+                    break;
+                }
+                report.hmac.chain_only += 1;
+            }
+        }
         report.last_id = Some(row.id);
         report.last_hash = Some(h.clone());
         prev = Some(h.clone());
@@ -473,7 +805,17 @@ fn verify_in_snapshot(conn: &Connection) -> rusqlite::Result<VerifyReport> {
     if report.broken.is_none()
         && let Some((hid, hh)) = head
     {
-        let ok = report.last_id == Some(hid) && report.last_hash.as_deref() == Some(hh.as_str());
+        let mut ok =
+            report.last_id == Some(hid) && report.last_hash.as_deref() == Some(hh.as_str());
+        // HMAC 開始之後的 head 必須帶正確的 mac（沒有金鑰無法把 head 改成較早的一筆）
+        if ok
+            && let (Some((sid, _)), Some(k)) = (&since, check_mac)
+            && hid >= *sid
+        {
+            ok = head_mac
+                .as_deref()
+                .is_some_and(|m| ct_eq_str(m, &k.head_mac(hid, &hh)));
+        }
         if !ok {
             report.broken = Some(ChainBreak {
                 id: hid,
@@ -481,6 +823,32 @@ fn verify_in_snapshot(conn: &Connection) -> rusqlite::Result<VerifyReport> {
                 at: None,
             });
         }
+    }
+    // 雜湊鏈完整，但 HMAC 無法驗證：金鑰遺失或不符（不能確認紀錄沒有被整段重新計算）
+    if report.broken.is_none()
+        && let Some((sid, _)) = &since
+        && report.last_id.is_some_and(|l| l >= *sid)
+    {
+        let reason = match key_state {
+            "key_unavailable" => Some("hmac_key_unavailable"),
+            "key_mismatch" => Some("hmac_key_mismatch"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            report.broken = Some(ChainBreak {
+                id: *sid,
+                reason,
+                at: None,
+            });
+        }
+    }
+    if key_state == "verified"
+        && report
+            .broken
+            .as_ref()
+            .is_some_and(|b| b.reason.contains("hmac") || b.reason == "head_mismatch")
+    {
+        report.hmac.status = "failed";
     }
     Ok(report)
 }
@@ -613,6 +981,7 @@ impl AuditRow {
             "details": self.details.as_deref().and_then(|d| serde_json::from_str::<Value>(d).ok()),
             "prev_hash": self.prev_hash,
             "hash": self.hash,
+            "hmac": self.hmac,
         })
     }
 
@@ -785,6 +1154,284 @@ mod tests {
         assert_eq!(seal_legacy(&conn).unwrap(), 1);
         assert_eq!(seal_legacy(&conn).unwrap(), 0);
         assert!(verify(&conn).unwrap().ok());
+    }
+
+    /// 把整條鏈依目前的內容重新計算（模擬能寫入資料庫、但沒有 HMAC 金鑰的人）
+    fn recompute_chain(conn: &Connection) {
+        let rows = export_batch(conn, &AuditFilter::default(), 1000).unwrap();
+        let mut prev = GENESIS.to_string();
+        let mut last = None;
+        for r in rows {
+            let h = compute_hash(&prev, &r);
+            conn.execute(
+                "UPDATE audit_events SET prev_hash = ?2, hash = ?3 WHERE id = ?1",
+                params![r.id, prev, h],
+            )
+            .unwrap();
+            last = Some((r.id, h.clone()));
+            prev = h;
+        }
+        let (id, h) = last.unwrap();
+        meta_set(conn, META_HEAD, &json!({"id": id, "hash": h})).unwrap();
+    }
+
+    #[test]
+    fn hmac_detects_a_recomputed_chain_that_the_hash_chain_alone_accepts() {
+        let conn = db();
+        let k = AuditKey::from_bytes(&[3u8; 32]);
+        for i in 0..4 {
+            append_with_key(&conn, i, &ev("user.create", Some("bob")), Some(&k)).unwrap();
+        }
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(r.hmac.since_id, Some(1));
+        assert_eq!(
+            (r.hmac.status, r.hmac.verified, r.hmac.chain_only),
+            ("verified", 4, 0)
+        );
+        assert_eq!(r.json()["hmac"]["status"], "verified");
+        // 修改一筆並重新計算整條雜湊鏈：只看雜湊鏈時是完整的，HMAC 不符
+        conn.execute("UPDATE audit_events SET object = 'eve' WHERE id = 3", [])
+            .unwrap();
+        recompute_chain(&conn);
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert_eq!(
+            r.broken.as_ref().map(|b| (b.id, b.reason)),
+            Some((3, "hmac_mismatch"))
+        );
+        assert_eq!(r.hmac.status, "failed");
+        // 偽造 HMAC 需要金鑰：用另一把金鑰簽也不符
+        let other = AuditKey::from_bytes(&[4u8; 32]);
+        assert_ne!(other.key_id(), k.key_id());
+        let h: String = conn
+            .query_row("SELECT hash FROM audit_events WHERE id = 3", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "UPDATE audit_events SET hmac = ?1 WHERE id = 3",
+            [other.record_mac(&h)],
+        )
+        .unwrap();
+        assert_eq!(
+            verify_with_key(&conn, Some(&k))
+                .unwrap()
+                .broken
+                .map(|b| b.reason),
+            Some("hmac_mismatch")
+        );
+    }
+
+    #[test]
+    fn hmac_boundary_key_problems_and_head_truncation_are_reported() {
+        let k = AuditKey::from_bytes(&[5u8; 32]);
+        // 金鑰遺失：雜湊鏈完整，但驗證失敗（hmac_key_unavailable，指向起點）
+        let conn = db();
+        for i in 0..3 {
+            append_with_key(&conn, i, &ev("a", None), Some(&k)).unwrap();
+        }
+        let b = verify_with_key(&conn, None).unwrap().broken.unwrap();
+        assert_eq!((b.id, b.reason), (1, "hmac_key_unavailable"));
+        // 金鑰不符：不以新的金鑰接續簽（之後的紀錄沒有 HMAC），驗證指出金鑰不符
+        let other = AuditKey::from_bytes(&[6u8; 32]);
+        let b = verify_with_key(&conn, Some(&other))
+            .unwrap()
+            .broken
+            .unwrap();
+        assert_eq!((b.id, b.reason), (1, "hmac_key_mismatch"));
+        append_with_key(&conn, 9, &ev("b", None), Some(&other)).unwrap();
+        let hm: Option<String> = conn
+            .query_row("SELECT hmac FROM audit_events WHERE id = 4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(hm, None);
+        // 起點之後沒有 HMAC 的紀錄（例如金鑰無法讀取時寫入）：missing_hmac
+        let b = verify_with_key(&conn, Some(&k)).unwrap().broken.unwrap();
+        assert_eq!((b.id, b.reason), (4, "missing_hmac"));
+
+        // 起點被往後移（想讓被改過的紀錄落在「只有雜湊鏈」的範圍）：hmac_boundary_mismatch
+        let conn = db();
+        for i in 0..3 {
+            append_with_key(&conn, i, &ev("a", None), Some(&k)).unwrap();
+        }
+        meta_set(
+            &conn,
+            META_HMAC,
+            &json!({"since_id": 3, "key_id": k.key_id()}),
+        )
+        .unwrap();
+        let b = verify_with_key(&conn, Some(&k)).unwrap().broken.unwrap();
+        assert_eq!((b.id, b.reason), (1, "hmac_boundary_mismatch"));
+
+        // 刪除最後一筆並把 head 改成前一筆（雜湊是公開的，但 head 的 mac 需要金鑰）
+        let conn = db();
+        for i in 0..3 {
+            append_with_key(&conn, i, &ev("a", None), Some(&k)).unwrap();
+        }
+        let h2: String = conn
+            .query_row("SELECT hash FROM audit_events WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM audit_events WHERE id = 3", [])
+            .unwrap();
+        meta_set(&conn, META_HEAD, &json!({"id": 2, "hash": h2})).unwrap();
+        let b = verify_with_key(&conn, Some(&k)).unwrap().broken.unwrap();
+        assert_eq!((b.id, b.reason), (2, "head_mismatch"));
+        // 有正確 mac 的 head（重播先前的 head 需要外送的鏈尾雜湊才能發現）
+        meta_set(
+            &conn,
+            META_HEAD,
+            &json!({"id": 2, "hash": h2, "mac": k.head_mac(2, &h2)}),
+        )
+        .unwrap();
+        assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
+    }
+
+    #[test]
+    fn upgrade_from_a_0_6_chain_starts_hmac_at_a_clear_boundary() {
+        // 0.6（schema v6）寫入的雜湊鏈：沒有 HMAC
+        let conn = db();
+        for i in 0..3 {
+            append_with_key(&conn, i, &ev("a", None), None).unwrap();
+        }
+        let r = verify_with_key(&conn, None).unwrap();
+        assert!(r.ok());
+        assert_eq!(
+            (r.hmac.status, r.hmac.since_id, r.hmac.chain_only),
+            ("not_started", None, 3)
+        );
+        // 0.7 的服務有了金鑰：從下一筆起帶 HMAC，之前的 3 筆只有雜湊鏈
+        let k = AuditKey::from_bytes(&[7u8; 32]);
+        for i in 3..5 {
+            append_with_key(&conn, i, &ev("b", None), Some(&k)).unwrap();
+        }
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(r.hmac.since_id, Some(4));
+        assert_eq!((r.hmac.verified, r.hmac.chain_only), (2, 3));
+        // 保留期限清除到起點之後也能驗證
+        assert_eq!(purge(&conn, 4, 99).unwrap(), 4);
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!((r.hmac.verified, r.hmac.chain_only), (1, 0));
+    }
+
+    #[test]
+    fn a_0_6_database_file_and_chain_upgrade_to_v7_with_hmac() {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-audit-v6-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = Connection::open(dir.join(crate::store::sqlite::DB_FILE)).unwrap();
+        assert_eq!(migrate(&mut conn, &MIGRATIONS[..6]).unwrap(), 6);
+        // 0.6 寫入的雜湊鏈（v6 沒有 hmac 欄位；以 0.6 的算式補上雜湊與 head）
+        let mut prev = GENESIS.to_string();
+        for i in 1..=3i64 {
+            conn.execute(
+                "INSERT INTO audit_events (at, actor, category, action, result) VALUES (?1, 'system', 'system', 'system.start', 'ok')",
+                [i],
+            )
+            .unwrap();
+            let row = AuditRow {
+                id: i,
+                at: i,
+                actor: "system".into(),
+                actor_ip: None,
+                category: "system".into(),
+                action: "system.start".into(),
+                object: None,
+                result: "ok".into(),
+                code: None,
+                details: None,
+                prev_hash: None,
+                hash: None,
+                hmac: None,
+            };
+            let h = compute_hash(&prev, &row);
+            conn.execute(
+                "UPDATE audit_events SET prev_hash = ?2, hash = ?3 WHERE id = ?1",
+                params![i, prev, h],
+            )
+            .unwrap();
+            prev = h;
+        }
+        meta_set(&conn, META_HEAD, &json!({"id": 3, "hash": prev})).unwrap();
+        meta_set(
+            &conn,
+            META_LEGACY_SEALED,
+            &json!({"through_id": 3, "sealed": 3}),
+        )
+        .unwrap();
+        // 升級到 v7、服務建立金鑰後寫入：0.6 的 3 筆只有雜湊鏈，第 4 筆起有 HMAC
+        assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 7);
+        let r = verify(&conn).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(r.hmac.status, "not_started");
+        ensure_key(&dir).unwrap();
+        append(&conn, 10, &ev("system.start", None)).unwrap();
+        let r = verify(&conn).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(
+            (
+                r.checked,
+                r.hmac.since_id,
+                r.hmac.chain_only,
+                r.hmac.verified
+            ),
+            (4, Some(4), 3, 1)
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn key_file_is_created_once_found_by_database_path_and_private() {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-audit-key-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 還沒有金鑰：CLI 不建立，寫入不帶 HMAC
+        assert!(AuditKey::load(&dir).unwrap().is_none());
+        let mut conn = Connection::open(dir.join(crate::store::sqlite::DB_FILE)).unwrap();
+        migrate(&mut conn, MIGRATIONS).unwrap();
+        assert!(key_for(&conn).is_none());
+        append(&conn, 1, &ev("a", None)).unwrap();
+        // 服務啟動：建立金鑰，之後依資料庫路徑找到同一把
+        let k = ensure_key(&dir).unwrap();
+        assert_eq!(std::fs::read(dir.join(KEY_FILE)).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
+        assert_eq!(key_for(&conn).unwrap().key_id(), k.key_id());
+        assert_eq!(
+            AuditKey::load_or_create(&dir).unwrap().key_id(),
+            k.key_id(),
+            "不覆寫既有的金鑰檔"
+        );
+        append(&conn, 2, &ev("b", None)).unwrap();
+        let r = verify(&conn).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(
+            (r.hmac.since_id, r.hmac.verified, r.hmac.chain_only),
+            (Some(2), 1, 1)
+        );
+        // 損毀的金鑰檔：拒絕使用
+        std::fs::write(dir.join(KEY_FILE), b"short").unwrap();
+        assert!(AuditKey::load(&dir).is_err());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -61,14 +61,35 @@ pub enum OfflineReason {
 }
 
 impl OfflineReason {
+    /// 主機 API、SSE、Webhook 與 `/metrics` 共用的名稱（0.7 起統一為事件匯流排的名稱，
+    /// [`crate::bus::DisconnectReason::as_str`]；設計包 `decisions/INTEGRATION.md` §28.5 #4）
     pub fn as_str(self) -> &'static str {
         match self {
-            OfflineReason::Timeout => "timeout",
-            OfflineReason::ConnectionClosed => "connection_closed",
+            OfflineReason::Timeout => "idle_timeout",
+            OfflineReason::ConnectionClosed => "agent_closed",
             OfflineReason::ServerShutdown => "server_shutdown",
             OfflineReason::CertificateRejected => "certificate_rejected",
             OfflineReason::WriteUnknown => "write_unknown",
         }
+    }
+}
+
+/// 0.4～0.6 的主機 API 使用的舊名稱（`timeout`、`connection_closed`）：0.7 的過渡期在回應另帶
+/// `offline_reason_legacy`，查詢參數也接受舊名稱（`kairos/API.md` 第 5.2 節）；其餘名稱相同
+pub fn legacy_offline_reason(name: &str) -> &str {
+    match name {
+        "idle_timeout" => "timeout",
+        "agent_closed" => "connection_closed",
+        other => other,
+    }
+}
+
+/// 舊名稱 → 0.7 的名稱（查詢參數的相容；不認得的值原樣回傳）
+pub fn normalize_offline_reason(name: &str) -> &str {
+    match name {
+        "timeout" => "idle_timeout",
+        "connection_closed" => "agent_closed",
+        other => other,
     }
 }
 

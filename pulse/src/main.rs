@@ -377,9 +377,15 @@ fn main() -> ExitCode {
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(e) => {
-            let code = match e {
-                config::ConfigError::Message(_) => codes::E_CONFIG_RANGE,
-                _ => codes::E_CONFIG_SYNTAX,
+            // 檔案存在但無法讀取（權限、I/O）：PLS-E0402（與 pulse check-config 相同；設計包 §28.5）
+            let local = Path::new(config_manager::LOCAL_CONFIG_FILE);
+            let code = if local.is_file() && std::fs::File::open(local).is_err() {
+                codes::E_CONFIG_UNREADABLE
+            } else {
+                match e {
+                    config::ConfigError::Message(_) => codes::E_CONFIG_RANGE,
+                    _ => codes::E_CONFIG_SYNTAX,
+                }
             };
             eprintln!("錯誤 {code}：無法載入設定：{e}");
             // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）

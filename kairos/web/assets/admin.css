@@ -1,0 +1,18 @@
+/* 管理與系統畫面（S16～S18、S20、S21）的版面補充。只引用設計 token（--ds-*）。 */
+
+a.k-status-light { text-decoration: none; }
+a.k-status-light:hover .k-status-light__text { text-decoration: underline; }
+
+.k-grow { flex: 1; min-width: 0; }
+.k-block { display: block; }
+.k-break { overflow-wrap: anywhere; word-break: break-all; }
+.k-page-actions { margin-bottom: var(--ds-space-500); }
+.k-perm-list { margin: 0; padding-left: var(--ds-space-500); columns: 2 18rem; column-gap: var(--ds-space-600); }
+.k-perm-list li { break-inside: avoid; }
+.k-check-list li > .ds-status-badge { flex: none; min-width: 4.5rem; }
+.k-check-list li p { margin: 0; }
+.k-settings-table th[scope="row"] { font: var(--ds-text-body); color: var(--ds-color-text-primary); min-width: 14rem; }
+.k-settings-table td:nth-child(2) { min-width: 8rem; }
+.k-settings-table td .caption { margin: var(--ds-space-100) 0 0; }
+.k-matrix tbody th[scope="row"] { font: var(--ds-text-body); color: var(--ds-color-text-primary); text-align: left; }
+.k-matrix thead th .k-host-id { font-family: inherit; }

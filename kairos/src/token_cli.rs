@@ -87,8 +87,10 @@ pub enum Expiry {
 pub enum GrantSpec {
     /// `--scope`（已棄用）
     Legacy(LegacyScope),
-    /// `--role`（預設 viewer）
+    /// `--role`
     Role(Role),
+    /// 沒有 `--role`、`--user`：唯讀（viewer），並在 stderr 提示（`cli-style.md` §11.6）
+    DefaultViewer,
     /// `--user`（＋選用的 `--role`）
     User {
         username: String,
@@ -263,7 +265,8 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<TokenCommand, 
                 }
                 (Some(s), None, None) => GrantSpec::Legacy(s),
                 (None, role, Some(username)) => GrantSpec::User { username, role },
-                (None, role, None) => GrantSpec::Role(role.unwrap_or(Role::Viewer)),
+                (None, Some(role), None) => GrantSpec::Role(role),
+                (None, None, None) => GrantSpec::DefaultViewer,
             };
             TokenAction::Create {
                 name,
@@ -427,7 +430,7 @@ pub(crate) fn open(
     create: bool,
 ) -> Result<Option<rusqlite::Connection>, Failure> {
     let config = AppConfig::load(config_path).map_err(|e| Failure {
-        code: Some("KRS-E0201"),
+        code: Some(crate::diag::config_load_code(&e, config_path)),
         ..Failure::new(
             "設定檔無法載入",
             e.to_string(),
@@ -660,6 +663,7 @@ pub fn execute(
             let grant = match grant {
                 GrantSpec::Legacy(s) => TokenGrant::Legacy(*s),
                 GrantSpec::Role(r) => TokenGrant::Role(*r),
+                GrantSpec::DefaultViewer => TokenGrant::Role(Role::Viewer),
                 GrantSpec::User { username, role } => {
                     match crate::users::store::find_user(&conn, username) {
                         Ok(Some(u)) if u.active() => TokenGrant::User {
@@ -696,10 +700,22 @@ pub fn execute(
             if cmd.json {
                 let mut data = row_json(&row, now_ms);
                 data["token"] = json!(token);
+                // warnings 只放命令用法的警告（cli-style.md §7.2）：已棄用的 --scope
+                let warnings: Vec<Value> = if matches!(grant, TokenGrant::Legacy(_)) {
+                    vec![json!({
+                        "code": "KRS-W0104", "severity": "warning",
+                        "title": "--scope 已棄用",
+                        "cause": "--scope 的權限凍結在 0.5 的範圍，不會得到之後新增的權限。",
+                        "fix": ["改用 --role 或 --user 建立新的 token。"],
+                        "details": { "flag": "--scope" }, "explain": null,
+                    })]
+                } else {
+                    Vec::new()
+                };
                 return Output {
                     stdout: ascii_json(&json!({
                         "schema": schema, "ok": true, "generated_at": fmt_time(now),
-                        "data": data, "warnings": [], "error": null,
+                        "data": data, "warnings": warnings, "error": null,
                     })) + "\n",
                     ..Default::default()
                 };
@@ -708,18 +724,33 @@ pub fn execute(
                 || "不過期".to_string(),
                 |e| format!("到期 {}", human_time_zoned(e, tz)),
             );
+            // 提示與警告（cli-style.md §5.2、§11.6）：未指定角色時說明已使用 viewer；--scope 以 KRS-W0104 提醒
+            let mut notes = String::new();
+            if matches!(
+                cmd.action,
+                TokenAction::Create {
+                    grant: GrantSpec::DefaultViewer,
+                    ..
+                }
+            ) {
+                notes.push_str(&format!(
+                    "{} 未指定 --role，使用唯讀（viewer）；需要讀取註冊、憑證與設定時請改用 --role auditor\n",
+                    if unicode { "i" } else { "[INFO]" }
+                ));
+            }
+            if matches!(grant, TokenGrant::Legacy(_)) {
+                notes.push_str(&format!(
+                    "{} 警告 KRS-W0104：--scope 已棄用（權限凍結在 0.5 的範圍）\n  處理方式：改用 --role 或 --user 建立新的 token。\n",
+                    if unicode { "⚠" } else { "[WARN]" }
+                ));
+            }
             Output {
                 stdout: format!("{token}\n"),
                 stderr: format!(
-                    "{ok_mark} 已建立 API token「{}」（token_id {}，權限 {}，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n{}",
+                    "{ok_mark} 已建立 API token「{}」（token_id {}，權限 {}，{expiry_text}）\n  這是唯一一次顯示 token，請立即保存到密碼管理工具；遺失時撤銷後重新建立。\n  使用方式：Authorization: Bearer <token>（https://<主機>:9443/api/v1/）\n{notes}",
                     row.name,
                     row.token_id,
                     row.grant_label(),
-                    if matches!(grant, TokenGrant::Legacy(_)) {
-                        "  注意：--scope 已棄用（權限凍結在 0.5 的範圍），建議改用 --role 或 --user。\n"
-                    } else {
-                        ""
-                    }
                 ),
                 exit: 0,
             }
@@ -984,7 +1015,7 @@ mod tests {
             TokenAction::Create {
                 name: "grafana".into(),
                 expiry: Expiry::In(std::time::Duration::from_secs(30 * 86_400)),
-                grant: GrantSpec::Role(Role::Viewer),
+                grant: GrantSpec::DefaultViewer,
             }
         );
         assert!(c.json);
@@ -1144,7 +1175,7 @@ mod tests {
                 TokenAction::Create {
                     name: "grafana".into(),
                     expiry: Expiry::Default,
-                    grant: GrantSpec::Role(Role::Viewer),
+                    grant: GrantSpec::DefaultViewer,
                 },
                 false,
             ),
@@ -1163,6 +1194,15 @@ mod tests {
         );
         assert!(out.stderr.contains(parsed.token_id));
         assert!(!out.stderr.contains(parsed.secret), "說明中不應再出現秘密");
+        // 沒有指定 --role：stderr 提示已使用 viewer（cli-style.md §11.6）；stdout 仍只有 token
+        assert!(
+            out.stderr.contains(
+                "[INFO] 未指定 --role，使用唯讀（viewer）；需要讀取註冊、憑證與設定時請改用 --role auditor"
+            ),
+            "{}",
+            out.stderr
+        );
+        assert!(!out.stdout.contains("viewer"));
 
         // --json：純 ASCII，含 token
         let out = execute(
@@ -1311,10 +1351,29 @@ mod tests {
             &mut no,
         );
         assert_eq!(out.exit, EXIT_USAGE);
-        // 設定錯誤
+        // --scope（已棄用）：KRS-W0104；有權限來源時沒有 viewer 的提示
+        let legacy = || TokenAction::Create {
+            name: "old".into(),
+            expiry: Expiry::Default,
+            grant: GrantSpec::Legacy(LegacyScope::parse("read").unwrap()),
+        };
+        let out = execute(&cmd(legacy(), false), now, tz8(), true, &mut no);
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert!(
+            out.stderr.contains("⚠ 警告 KRS-W0104：--scope 已棄用"),
+            "{}",
+            out.stderr
+        );
+        assert!(!out.stderr.contains("未指定 --role"), "{}", out.stderr);
+        let out = execute(&cmd(legacy(), true), now, tz8(), false, &mut no);
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["warnings"][0]["code"], "KRS-W0104");
+        // 設定錯誤：設定檔不存在為 KRS-E0401（與啟動、--check-config 相同）
         let mut bad = cmd(TokenAction::List { all: false }, false);
         bad.config_path = Some(dir.join("missing.toml"));
-        assert_eq!(execute(&bad, now, tz8(), false, &mut no).exit, EXIT_CONFIG);
+        let out = execute(&bad, now, tz8(), false, &mut no);
+        assert_eq!(out.exit, EXIT_CONFIG);
+        assert!(out.stderr.contains("KRS-E0401"), "{}", out.stderr);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "kairos"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.99"
 # 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
@@ -36,6 +36,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 ring = "0.17"
 # API token 雜湊的常數時間比較（rustls 已依賴同一版本，不新增套件）
 subtle = { version = "2", default-features = false }
+# 金鑰與備份密碼在記憶體中用完即清除（rustls 已依賴同一版本，不新增套件）
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # 檢查 mTLS 客戶端憑證的 SAN；與 rustls 依賴的版本相同，只啟用 alloc（不引入其他加密後端）
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }

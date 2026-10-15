@@ -12,16 +12,19 @@
 //! | [`audit_log`] | 稽核日誌的查詢、匯出與完整性驗證 |
 //! | [`enroll`] | 註冊與 PKI 的管理端點 |
 //! | [`db`] | 唯讀連線池（WAL 讀者）與低頻寫入的連線 |
-//! | [`hosts`] | 主機清冊：列表與詳情 |
+//! | [`hosts`] | 主機清冊：列表、詳情、篩選值（`/hosts/facets`） |
+//! | [`conn_log`] | 每台主機最近的上線與離線紀錄（記憶體中，`/hosts/{agent_id}/connections`） |
 //! | [`metrics`] | 指標趨勢 |
 //! | [`overview`]、[`health`] | 總覽、系統健康 |
 //! | [`events`] | 即時變更推送（SSE） |
 //! | [`maint`] | 背景工作：每分鐘上線數、token 的最後使用與稽核日誌、被拒的憑證寫入清冊 |
+//! | [`web`] | 網頁介面的靜態檔（編譯時嵌入）與所有回應的安全標頭 |
 
 pub mod account;
 pub mod alerts;
 pub mod audit_log;
 pub mod auth;
+pub mod conn_log;
 pub mod db;
 pub mod enroll;
 pub mod events;
@@ -33,6 +36,7 @@ pub mod metrics;
 pub mod overview;
 pub mod tokens;
 pub mod users;
+pub mod web;
 
 #[cfg(test)]
 mod alerts_tests;
@@ -125,6 +129,8 @@ pub struct ApiContext {
     pub denied: DeniedThrottle,
     /// `/healthz`、`/readyz`、`/metrics`（`observability.on_console` 時在主控台的監聽上提供）
     pub obs: Option<Arc<crate::probe::ObsContext>>,
+    /// 每台主機最近的上線與離線紀錄（記憶體中；`/api/v1/hosts/{agent_id}/connections`）
+    pub conn_log: Arc<conn_log::ConnLog>,
 }
 
 /// 被拒絕（403）的寫入請求寫入稽核的節流：同一個執行者每分鐘最多 20 筆，超過的計數併入下一筆
@@ -374,6 +380,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         enroll: p.enroll.clone(),
         alerts: p.alerts.clone(),
         obs: p.obs.clone().filter(|_| p.config.observability.on_console),
+        conn_log: Arc::new(conn_log::ConnLog::default()),
     });
     ctx.hosts.load_known(known);
 
@@ -382,6 +389,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
     runtime.spawn(events::pump(
         p.registry.subscribe(),
         ctx.events.clone(),
+        ctx.conn_log.clone(),
         move |id| index_ctx.hosts.mark_known(id),
         p.shutdown.clone(),
     ));
@@ -531,8 +539,31 @@ async fn accept_loop(
     debug!("主控台已停止");
 }
 
-/// 處理一個請求：驗證、路由、權限、逾時；記錄 DEBUG 日誌。被拒絕（403）的寫入請求寫入稽核
+/// 處理一個請求：網頁介面的靜態檔（[`web`]）或 API／健康檢查；每個回應都加上安全標頭
 async fn handle(
+    ctx: Arc<ApiContext>,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+) -> Response<ApiBody> {
+    if web::is_web_path(req.uri().path()) {
+        let (mut resp, html) = web::serve(req.method(), req.uri().path(), req.headers());
+        web::apply_security_headers(resp.headers_mut(), html);
+        debug!(
+            "主控台 {} {} {} → {}（網頁）",
+            peer.ip(),
+            req.method(),
+            req.uri().path(),
+            resp.status().as_u16()
+        );
+        return resp;
+    }
+    let mut resp = handle_api(ctx, peer, req).await;
+    web::apply_security_headers(resp.headers_mut(), false);
+    resp
+}
+
+/// 處理一個 API 或健康檢查的請求：驗證、路由、權限、逾時；記錄 DEBUG 日誌。被拒絕（403）的寫入請求寫入稽核
+async fn handle_api(
     ctx: Arc<ApiContext>,
     peer: SocketAddr,
     req: Request<Incoming>,
@@ -544,11 +575,8 @@ async fn handle(
     if let Some(obs) = &ctx.obs
         && crate::probe::is_probe_path(&path)
     {
-        let auth = req
-            .headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-        let resp = crate::probe::handle(obs, &method, &path, req.uri().query(), auth, peer).await;
+        let resp =
+            crate::probe::handle(obs, &method, &path, req.uri().query(), req.headers(), peer).await;
         crate::metrics::global().api_request(&path, resp.status().as_u16());
         return resp;
     }
@@ -619,6 +647,7 @@ fn known_route(rest: &[&str]) -> bool {
             | ["hosts", _]
             | ["hosts", _, "metrics"]
             | ["hosts", _, "metrics", _]
+            | ["hosts", _, "connections"]
             | ["overview"]
             | ["system", "health"]
             | ["events"]
@@ -807,6 +836,12 @@ async fn dispatch(
 ) -> Result<Response<ApiBody>, ApiError> {
     match rest {
         ["hosts"] => hosts::list(ctx, query, &principal.host_access()?, now).await,
+        // agent_id 是 UUID，不會與 "facets" 相同
+        ["hosts", "facets"] => hosts::facets(ctx, query, &principal.host_access()?, now).await,
+        ["hosts", id, "connections"] => {
+            query.reject_unknown(&[], &[])?;
+            hosts::connections(ctx, id, &principal.host_access()?, now).await
+        }
         ["hosts", id] => {
             query.reject_unknown(&[], &[])?;
             hosts::detail(ctx, id, &principal.host_access()?, now).await

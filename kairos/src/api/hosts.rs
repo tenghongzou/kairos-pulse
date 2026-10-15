@@ -263,6 +263,8 @@ impl HostView {
             "status": self.status.as_str(),
             "status_detail": {
                 "offline_reason": self.offline_reason,
+                // 0.7 過渡期：0.4～0.6 的名稱（timeout、connection_closed），0.8 移除（API.md 第 5.2 節）
+                "offline_reason_legacy": self.offline_reason.map(crate::registry::legacy_offline_reason),
                 "never_connected": self.never_connected,
                 "starting": self.starting,
                 "long_offline": offline_for.is_some_and(|s| s > LONG_OFFLINE_SECS),
@@ -625,11 +627,14 @@ pub struct Filter {
     scope: Option<Vec<String>>,
 }
 
-const OFFLINE_REASONS: [&str; 4] = [
-    "timeout",
-    "connection_closed",
+/// `offline_reason` 參數接受的值（0.7 的名稱；舊名稱 `timeout`、`connection_closed` 在過渡期也接受，
+/// 見 [`crate::registry::normalize_offline_reason`]）
+const OFFLINE_REASONS: [&str; 5] = [
+    "idle_timeout",
+    "agent_closed",
     "server_shutdown",
     "certificate_rejected",
+    "write_unknown",
 ];
 
 fn parse_cidr(param: &str, text: &str) -> Result<Cidr, ApiError> {
@@ -669,16 +674,17 @@ impl Filter {
             })?);
         }
         for r in q.list("offline_reason") {
-            if !OFFLINE_REASONS.contains(&r.as_str()) {
+            let name = crate::registry::normalize_offline_reason(&r);
+            if !OFFLINE_REASONS.contains(&name) {
                 return Err(ApiError::param(
                     "offline_reason",
                     format!(
-                        "offline_reason 的值 \"{r}\" 無效（{}）",
+                        "offline_reason 的值 \"{r}\" 無效（{}；舊名稱 timeout、connection_closed 在 0.7 仍接受）",
                         OFFLINE_REASONS.join("、")
                     ),
                 ));
             }
-            f.offline_reason.push(r);
+            f.offline_reason.push(name.to_string());
         }
         f.tags = q.list("tag").iter().map(|t| t.to_lowercase()).collect();
         f.os = q.list("os").iter().map(|t| t.to_lowercase()).collect();
@@ -1104,6 +1110,159 @@ pub async fn list(
     ))
 }
 
+/// 篩選值的每一種最多列出幾個
+pub const FACET_MAX: usize = 200;
+
+/// 一種篩選值的計數：`(值, 台數, 其中線上的台數)`，依台數由多到少、再依值排序
+fn facet_json(counts: HashMap<String, (u64, u64)>, with_online: bool) -> Value {
+    let mut items: Vec<(String, (u64, u64))> = counts.into_iter().collect();
+    items.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    let truncated = items.len() > FACET_MAX;
+    items.truncate(FACET_MAX);
+    let values: Vec<Value> = items
+        .into_iter()
+        .map(|(v, (n, online))| {
+            if with_online {
+                json!({ "value": v, "count": n, "online": online })
+            } else {
+                json!({ "value": v, "count": n })
+            }
+        })
+        .collect();
+    json!({ "values": values, "truncated": truncated })
+}
+
+/// `GET /api/v1/hosts/facets`：主機清單篩選列的選項（設計包 S04 的 OS、agent 版本、標籤、群組、
+/// 離線原因下拉選單；S03 的群組健康）。只計算身分範圍內的主機，不受其他篩選條件影響
+pub async fn facets(
+    ctx: &Arc<ApiContext>,
+    q: &Query,
+    access: &HostAccess,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    q.reject_unknown(&[], &[])?;
+    let snap = ctx.hosts.snapshot(ctx).await?;
+    let mut os: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut version: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut tag: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut group: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut reason: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut total = 0u64;
+    let mut no_group = (0u64, 0u64);
+    let bump = |m: &mut HashMap<String, (u64, u64)>, k: &str, online: bool| {
+        let e = m.entry(k.to_string()).or_default();
+        e.0 += 1;
+        e.1 += u64::from(online);
+    };
+    for h in snap
+        .hosts
+        .iter()
+        .filter(|h| access.allows(h.host_group.as_deref()))
+    {
+        total += 1;
+        let online = h.status == Status::Online;
+        if let Some(name) = h.os.as_ref().and_then(|o| o.name.as_deref()) {
+            bump(&mut os, name, online);
+        }
+        if let Some(v) = h.agent_version.as_deref() {
+            bump(&mut version, v, online);
+        }
+        for t in h.tags.iter() {
+            bump(&mut tag, t, online);
+        }
+        match h.host_group.as_deref() {
+            Some(g) => bump(&mut group, g, online),
+            None => {
+                no_group.0 += 1;
+                no_group.1 += u64::from(online);
+            }
+        }
+        if let Some(r) = h.offline_reason.filter(|_| !online) {
+            bump(&mut reason, r, online);
+        }
+    }
+    Ok(ok(
+        now,
+        json!({
+            "total": total,
+            "os": facet_json(os, false),
+            "version": facet_json(version, false),
+            "tag": facet_json(tag, false),
+            "group": facet_json(group, true),
+            "no_group": { "count": no_group.0, "online": no_group.1 },
+            "offline_reason": facet_json(reason, false),
+            "data_as_of": ts(snap.at),
+        }),
+    ))
+}
+
+/// `GET /api/v1/hosts/{agent_id}/connections`：這台主機最近的上線與離線（記憶體中，
+/// [`super::conn_log`]）。範圍外或不存在的主機回 404
+pub async fn connections(
+    ctx: &Arc<ApiContext>,
+    agent_id: &str,
+    access: &HostAccess,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    let id = parse_agent_id(agent_id)?;
+    let q = id.clone();
+    let exists_group: Option<Option<String>> = ctx
+        .pool
+        .read("主機詳情", move |conn| {
+            conn.query_row(
+                "SELECT host_group FROM hosts WHERE agent_id = ?1",
+                [&q],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(query_failed("主機詳情"))
+        })
+        .await?;
+    let known = exists_group.is_some() || ctx.registry.live_get(&id).is_some();
+    let group = exists_group.flatten();
+    if !known || !access.allows(group.as_deref()) {
+        return Err(ApiError::host_not_found(&id));
+    }
+    let entries: Vec<Value> = ctx.conn_log.get(&id).iter().map(|e| e.json()).collect();
+    Ok(ok(
+        now,
+        json!({
+            "agent_id": id,
+            "since": ts(ctx.started),
+            "persisted": false,
+            "max_entries": super::conn_log::PER_HOST,
+            "entries": entries,
+        }),
+    ))
+}
+
+/// 這台主機最新一張憑證的摘要（不含序號與指紋：那些需要 `pki:read`，見 `/api/v1/pki/certificates`）
+fn certificate_summary(conn: &Connection, agent_id: &str, now_ms: i64) -> rusqlite::Result<Value> {
+    let row = conn
+        .query_row(
+            "SELECT not_after, revoked_at FROM pki_certificates WHERE agent_id = ?1 \
+             ORDER BY issued_at DESC LIMIT 1",
+            [agent_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        None => Value::Null,
+        Some((not_after, revoked_at)) => {
+            let state = if revoked_at.is_some() {
+                "revoked"
+            } else if not_after <= now_ms {
+                "expired"
+            } else if not_after - now_ms <= 30 * 86_400_000 {
+                "expiring"
+            } else {
+                "valid"
+            };
+            json!({ "state": state, "not_after": ts_ms(not_after), "revoked_at": revoked_at.map(ts_ms) })
+        }
+    })
+}
+
 /// 路徑中的 agent_id：UUID（不分大小寫）
 pub fn parse_agent_id(text: &str) -> Result<String, ApiError> {
     let id = text.to_ascii_lowercase();
@@ -1154,10 +1313,13 @@ pub async fn detail(
 ) -> Result<Response<ApiBody>, ApiError> {
     let agent_id = parse_agent_id(agent_id)?;
     let id = agent_id.clone();
-    let db = ctx
+    let now_ms = now.timestamp_millis();
+    let (db, certificate) = ctx
         .pool
         .read("主機詳情", move |conn| {
-            load_host(conn, &id).map_err(query_failed("主機詳情"))
+            let host = load_host(conn, &id).map_err(query_failed("主機詳情"))?;
+            let cert = certificate_summary(conn, &id, now_ms).map_err(query_failed("主機詳情"))?;
+            Ok((host, cert))
         })
         .await?;
     // 範圍外的主機與不存在的主機相同（不透露它存在）
@@ -1169,7 +1331,6 @@ pub async fn detail(
     let env = ctx.merge_env();
     let view = view_of(db.as_ref(), live.as_ref(), rejection.as_ref(), &env)
         .ok_or_else(|| ApiError::host_not_found(&agent_id))?;
-    let now_ms = now.timestamp_millis();
     let mut data = view.summary(now_ms);
     data["host_fingerprint"] = json!(view.host_fingerprint.as_deref());
     data["peer"] = json!(view.peer.as_deref());
@@ -1206,6 +1367,8 @@ pub async fn detail(
         }),
         None => Value::Null,
     };
+    // 0.7.0：最新一張憑證的有效狀態（S05「有效，至 …」；序號與指紋需要 pki:read）
+    data["certificate"] = certificate;
     Ok(ok(now, data))
 }
 
@@ -1349,7 +1512,10 @@ pub(crate) mod tests {
         let l = live(&id(1), false, now - chrono::Duration::seconds(90));
         let v = view_of(Some(&d), Some(&l), None, &short).unwrap();
         assert_eq!(v.status, Status::Offline);
-        assert_eq!(v.offline_reason, Some("timeout"));
+        assert_eq!(v.offline_reason, Some("idle_timeout"));
+        let s = v.summary(now_ms);
+        assert_eq!(s["status_detail"]["offline_reason"], "idle_timeout");
+        assert_eq!(s["status_detail"]["offline_reason_legacy"], "timeout");
         // 之後憑證被拒：原因改為 certificate_rejected
         let r = CertRejection {
             at: now,
@@ -1443,6 +1609,9 @@ pub(crate) mod tests {
         assert_eq!(run(&format!("q={}", &id(42)[..8])), 1);
         assert_eq!(run("q=0000002a"), 1);
         assert_eq!(run("offline_reason=timeout"), 0);
+        // 0.7 的名稱與舊名稱都接受，結果相同
+        assert_eq!(run("offline_reason=idle_timeout"), 0);
+        assert_eq!(run("offline_reason=write_unknown"), 0);
         // 狀態計數不受 status 篩選影響
         let qq = q("status=offline&tag=line3");
         let page = query(

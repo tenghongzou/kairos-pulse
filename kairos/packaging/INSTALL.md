@@ -446,7 +446,9 @@ cd /tmp && sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml
 
 - **負載平衡器的探針**：以 `GET /readyz` 判斷（200／503）。主控台不對外開放時，在 `kairos.toml` 設定 `[observability] listen = "<負載平衡器可達的位址>:9464"`（純 HTTP，只有 `/healthz`、`/readyz`、`/metrics` 三個端點，`/metrics` 仍只接受 loopback 或帶 token 的請求）；只負責 8444 的負載平衡器用 `/readyz?scope=enroll`。
 - **Prometheus**：同一台主機時抓 `http://127.0.0.1:9464/metrics`（`observability.listen = "127.0.0.1:9464"`）；從其他主機抓取時設定 `observability.metrics_token_file`（`openssl rand -hex 32 > /opt/kairos/metrics.token && chown root:kairos /opt/kairos/metrics.token && chmod 640 /opt/kairos/metrics.token`），經主控台的 HTTPS 以 bearer token 抓取。設定與建議的告警規則見 `prometheus.example.yml`、`kairos-alerts.example.yml`。
+- **經反向代理（nginx、Apache、HAProxy 等）提供 `/metrics` 時，必須設定 `observability.metrics_token_file`**，並讓 Prometheus 帶 bearer token。代理與 Kairos 在同一台主機時，轉送進來的請求來源都是 `127.0.0.1`，「未設定 token 時只接受 loopback」會變成任何能連到代理的人都能讀取。0.7〔草稿〕起，未設定 token 時帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 或 `Via` 標頭的 `/metrics` 請求一律回 403，並在第一次時記一行 `WARN`（`observability.metrics_proxied`，`KRS-W0304`）；但**不加這些標頭的代理（例如 nginx 只寫 `proxy_pass` 的預設設定）Kairos 無法發現**，所以不能以這個檢查代替 token。
 - 另外建議在 Kairos 以外監看 `/healthz`（例如既有的 Zabbix）：Kairos 自己無法通知「自己已經停止」。
+- **稽核鏈尾的外送**（0.7〔草稿〕）：Kairos 每 `audit.anchor_log_minutes` 分鐘（預設 60）寫一行 `audit.chain_anchor`（INFO，含最後一筆稽核紀錄的 id 與雜湊）。設定 `[log.syslog]` 或以日誌收集器把這些行送到**另一台主機**保存，才有資料庫之外的副本（`API.md` 第 12.8 節）。
 
 ### 9.3 主控台 API
 
@@ -498,18 +500,34 @@ sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name
     --config /opt/kairos/kairos.toml < /root/admin.pw && shred -u /root/admin.pw
   ```
 
-- 登入（主控台網頁介面完成前，可用 curl 確認）：
+- 登入主控台（0.7.0〔草稿〕起有網頁介面，見 9.5）：以瀏覽器開啟 `https://<Kairos 主機>:9443/`，以 `admin` 與初始密碼登入，畫面會要求先變更密碼。沒有瀏覽器時也可以 curl 確認：
 
   ```bash
-  curl -sk -c cookies.txt -H 'Content-Type: application/json' \
-    -d '{"username":"admin","password":"<初始密碼>"}' https://127.0.0.1:9443/api/v1/auth/login
+  curl -sk -c cookies.txt -H 'Content-Type: application/json'     -d '{"username":"admin","password":"<初始密碼>"}' https://127.0.0.1:9443/api/v1/auth/login
   ```
 
   回應的 `csrf_token` 要放在之後每個寫入請求的 `X-CSRF-Token` 標頭（例如 `POST /api/v1/me/password` 變更密碼）。
-- 建議接著：以 `POST /api/v1/me/totp/setup`、`/enable` 綁定 TOTP（回應的 10 組復原碼離線保存）；為其他人建立各自的帳號（`kairos users create <帳號> --role operator|auditor|viewer`），不要共用 `admin`；至少保留兩位管理員（最後一位管理員不能被停用或移除）。
+- 建議接著：在主控台的「個人設定」啟用兩步驟驗證（或 `POST /api/v1/me/totp/setup`、`/enable`；10 組復原碼離線保存）；為其他人建立各自的帳號（`kairos users create <帳號> --role operator|auditor|viewer`），不要共用 `admin`；至少保留兩位管理員（最後一位管理員不能被停用或移除）。
 - 確認稽核日誌：`sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml`（完整時結束代碼 0；斷裂時 9、`KRS-E6201`）。
 - 使用 AD／LDAP 時，在 `kairos.toml` 設定 `[ldap]`（`ca_file` 必填；服務帳號密碼放在 `chmod 600` 的 `bind_password_file`），重新啟動後以 `kairos users map-group "<群組 DN>" --role operator` 對應角色（API.md 第 12.7 節）。
 - 主控台金鑰 `data/console.key`（0600）在第一次啟動主控台時建立，用於 CSRF 與 TOTP 秘密的加密；備份資料庫時一併（加密）備份，遺失時已綁定的 TOTP 需以 `kairos users reset-mfa` 重設。
+
+### 9.5 開啟主控台（0.7.0〔草稿〕）
+
+網頁介面與 API 在同一個 HTTPS 監聽上（`console.listen`，預設 `127.0.0.1:9443`），網頁檔已嵌入 `kairos` 執行檔，不需要另外安裝。
+
+1. **連線方式**：預設只綁 loopback。
+   - 在 Kairos 主機上：開啟 `https://127.0.0.1:9443/`。
+   - 從管理電腦經 SSH 轉送：`ssh -L 9443:127.0.0.1:9443 <管理者>@<Kairos 主機>`，再開啟 `https://127.0.0.1:9443/`。
+   - 開放給管理網段：在 `kairos.toml` 的 `[console]` 設定 `listen = "0.0.0.0:9443"`，重新啟動 Kairos，並以防火牆只允許管理網段連到 9443。
+2. **憑證**：預設沿用 agent 連接埠的伺服器憑證（`server.cert_path`），瀏覽器通常會顯示「不受信任」。正式使用時以 `console.cert_path`／`console.key_path` 設定由組織 CA 簽發、SAN 為主控台網址（例如 `monitor.example.gov.tw`）的憑證（依 `server.reload_interval_secs` 熱重載），並把組織 CA 匯入管理電腦。
+3. **首位管理員登入**：以 9.4 建立的 `admin` 與一次性初始密碼登入，畫面會先要求變更密碼（至少 12 個字元、不包含帳號、不是常見密碼）；完成後進入「總覽」。接著在右上角「個人設定」啟用兩步驟驗證並保存 10 組復原碼。
+4. **確認**：總覽的六個狀態磚與「資料時間」、主機清單的總數與 `kairos hosts list` 一致；右上角的系統狀態燈顯示系統健康的整體狀態與第一個需要注意的項目（細節以 `GET /api/v1/system/health` 或 `kairos --check-config` 查看；系統健康畫面之後提供）。
+5. **瀏覽器需求**：0.7 支援 **Chromium 系（Chrome、Edge）** 最近的版本（Trusted Types 需要 Chromium）；Firefox、Safari 可以使用，但未在發佈前驗證。需要啟用 JavaScript；不需要外部網路（所有檔案都由 Kairos 提供）。
+
+- 閒置 30 分鐘（`accounts.session_idle_minutes`）沒有操作時自動登出，即使總覽仍在自動更新。
+- 0.7.0 的畫面：登入、總覽、主機清單、主機詳情、個人設定。告警、註冊與憑證、使用者、稽核、系統設定請先以 CLI（`kairos alerts`、`kairos enroll`、`kairos users`、`kairos audit`…）或 API 操作。
+- 反向代理：可以放在 nginx 等之後，代理必須保留原本的 `Host`（CSRF 檢查以 `Origin` 與 `Host` 比對）、不要緩衝 `/api/v1/events`（SSE）；所有使用者會共用代理的來源位址與登入失敗額度（API.md 第 4.3 節）。
 
 ## 10. 日常維運
 
@@ -544,11 +562,40 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
   備份檔不會覆寫既有的檔案；舊備份請自行輪替（例如 `find /var/backups/kairos -name 'kairos-*.db' -mtime +14 -delete`）。還原步驟見 `STORAGE.md`「備份與還原」。停機備份時直接複製整個 `data/` 即可。
 - 使用 JSONL（`storage.backend = "jsonl"` 或鏡像）時另備份 `/opt/kairos/data/reports-*.jsonl`；搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
 - 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
-- **資料目錄中的兩個金鑰檔**（0.6.0 起；`kairos db backup` 的備份**不含**，資料庫中只有以它們加密的密文）：
-  - `data/alerts-secrets.key`：通知管道機密（SMTP 密碼、Webhook 網址、HMAC 金鑰、LINE token）的 AES-256-GCM 金鑰。
-  - `data/console.key`：主控台的 CSRF 與 TOTP 秘密的加密金鑰。
+- **資料目錄中的金鑰檔**（`kairos db backup` 的資料庫備份**不含**，資料庫中只有以它們加密的密文或 HMAC）：
+  - `data/alerts-secrets.key`（0.6.0 起）：通知管道機密（SMTP 密碼、Webhook 網址、HMAC 金鑰、LINE token）的 AES-256-GCM 金鑰。
+  - `data/console.key`（0.6.0 起）：主控台的 CSRF 與 TOTP 秘密的加密金鑰。
+  - `data/audit-hmac.key`（0.7〔草稿〕起）：稽核雜湊鏈的 HMAC 金鑰（`API.md` 第 12.8 節）。
 
-  以加密的方式與資料庫備份一起保存（例如 `tar -C /opt/kairos/data -cf - alerts-secrets.key console.key | gpg -c > keys-$(date -u +%F).tar.gpg`）。**還原到同一台或新主機時，資料庫與這兩個檔案要一起複製**（擁有者 `kairos`、權限 0600）：少了 `alerts-secrets.key` 時所有通知管道的機密無法解密（管道需重新輸入機密，日誌 `alerts.channel.decrypt_failed`），少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。金鑰與資料庫要是同一次備份的組合（不要拿新金鑰配舊資料庫）。
+  **以 `--include-keys` 一併加密備份**（0.7〔草稿〕；預設不含，需要另外指定）：金鑰檔以備份密碼加密（Argon2id 衍生金鑰＋AES-256-GCM），寫成與資料庫備份並列的 `<備份檔>.keys`（0600）。密碼只能從檔案或 stdin 讀取（不接受命令列上的密碼，避免留在 shell 歷史與行程清單），至少 12 個字元；**請把備份密碼與備份分開保管**（例如密碼管理工具），密碼遺失時無法解開。
+
+  ```bash
+  # 備份密碼檔：只有 root 可讀（sudo -u kairos 執行時以 stdin 傳入，服務帳號不需要讀取它）
+  install -m 600 /dev/null /root/kairos-backup.pass && openssl rand -base64 24 > /root/kairos-backup.pass
+  sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/kairos-$(date -u +%F).db \
+    --include-keys --password-stdin --config /opt/kairos/kairos.toml < /root/kairos-backup.pass
+  # → kairos-YYYY-MM-DD.db（資料庫，0640）與 kairos-YYYY-MM-DD.db.keys（加密的金鑰檔，0600）
+  ```
+
+  `.keys` 可以與資料庫備份分開存放（例如另一個保管位置），資料庫備份外流時金鑰不會一起外流；兩者都外流時，強度取決於備份密碼。不使用 `--include-keys` 時，請自行以加密方式保存這三個檔案（例如 `tar -C /opt/kairos/data -cf - alerts-secrets.key console.key audit-hmac.key | gpg -c > keys-$(date -u +%F).tar.gpg`）。
+
+  **還原**（同一台或新主機；資料庫與金鑰要是同一次備份的組合，不要拿新金鑰配舊資料庫）：
+
+  ```bash
+  sudo systemctl stop kairos
+  # 1. 資料庫：複製備份並刪除舊的 WAL（STORAGE.md「備份與還原」）
+  sudo -u kairos cp /var/backups/kairos/kairos-2026-10-15.db /opt/kairos/data/kairos.db
+  sudo -u kairos rm -f /opt/kairos/data/kairos.db-wal /opt/kairos/data/kairos.db-shm
+  # 2. 金鑰檔：解開並寫回 data/（0600；以 root 執行時擁有者改為資料目錄的擁有者）
+  sudo -u kairos /opt/kairos/kairos db restore-keys /var/backups/kairos/kairos-2026-10-15.db.keys \
+    --password-stdin --config /opt/kairos/kairos.toml < /root/kairos-backup.pass
+  sudo systemctl start kairos
+  sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml
+  ```
+
+  - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
+  - `data/` 已有內容不同的金鑰檔時（例如 Kairos 在還原前已啟動並產生了新的金鑰），`restore-keys` 拒絕；確認後加 `--overwrite`，原本的檔案改名為 `<名稱>.replaced-<時間>` 保留。
+  - 少了 `alerts-secrets.key`（或與資料庫不成對）時，通知管道的狀態為 `secrets_unavailable`（`KRS-E5110`，主控台、`kairos alert-channels list` 與「通知管道失敗」事件都會顯示），不會發送；還原金鑰檔後重新啟動即恢復，或重新輸入機密。少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。少了 `audit-hmac.key` 時，`kairos audit verify` 與每日的自我驗證以 `hmac_key_unavailable`（`KRS-E6201`）失敗，並開「稽核日誌完整性」緊急事件。
 - 使用線上簽發（第 6.5 節）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 
 ### 10.3 定期更新 CRL（kairos-crl.timer）

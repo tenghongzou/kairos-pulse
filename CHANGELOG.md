@@ -50,6 +50,124 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 （0.6.0〔草稿〕之後的變更記在這裡。）
 
+## [0.7.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.7.0、Pulse 0.7.0**：衝刺 6 的**主控台網頁介面**（審計 F2：S01、S03～S18、S20、S21、S23）與後端補強——設計包 `decisions/INTEGRATION.md` §28.5 的待辦與 §28.9 #3（金鑰檔的備份）。**協定不變**，Pulse 只有設定檔錯誤代碼的小修正。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **主機 API 的 `offline_reason` 改用事件匯流排的名稱**：`timeout` → `idle_timeout`、`connection_closed` → `agent_closed`（`server_shutdown`、`certificate_rejected`、`write_unknown` 不變），與 Webhook 的 `offline_reason`、`/metrics` 的 `kairos_agent_disconnects_total{reason}` 相同（§28.5 #4）。SSE `host.offline` 的 `reason` 同樣改變 | 讀取 `status_detail.offline_reason`、`host.offline` 的 `reason`，或以 `?offline_reason=timeout` 查詢的整合 | **過渡期（0.7）**：回應另帶舊名稱的 `status_detail.offline_reason_legacy`、SSE 的 `reason_legacy`、總覽離線清單的 `offline_reason_legacy`；查詢參數新舊名稱都接受。請在 0.7 期間改讀新名稱；`*_legacy` 與舊的查詢值在 0.8 移除 |
+| 2 | Kairos | **資料庫升級到 schema v7**（`audit_events.hmac`） | 所有 SQLite 部署 | 升級前 `kairos db backup`；升級後 0.6 無法開啟資料庫（降版從備份還原） |
+| 3 | Kairos | **資料目錄多了 `audit-hmac.key`**（稽核鏈的 HMAC 金鑰，0600），服務第一次以 0.7 啟動時建立。之後的稽核紀錄都帶 HMAC；**金鑰遺失或不符時 `kairos audit verify` 以 `KRS-E6201` 失敗（結束代碼 9），並開「稽核日誌完整性」緊急事件** | 備份、還原、搬移資料目錄的部署；監看 `kairos audit verify` 結束代碼的腳本 | 把 `audit-hmac.key` 加進備份（`kairos db backup --include-keys`，或自行加密保存）；還原時與資料庫一起還原 |
+| 4 | Kairos | **新增系統預設規則「稽核日誌完整性」**（`sys.audit_integrity`，緊急，`KRS-E6201`，共 31 條），每 24 小時自我驗證一次 | 所有啟用告警的部署 | 不需要動作；需要時以 `audit.verify_interval_hours` 調整頻率 |
+| 5 | Kairos | **`/metrics` 在未設定 token 時拒絕帶有反向代理轉送標頭的請求**（`Forwarded`、`X-Forwarded-For`／`-Host`／`-Proto`、`X-Real-IP`、`Via` → 403） | 經同一台主機上的反向代理、未設定 token 抓取 `/metrics` 的部署（原本就不安全） | 設定 `observability.metrics_token_file`，讓 Prometheus 帶 bearer token（INSTALL 9.2a） |
+| 6 | Kairos | **寄送測試通知加上限速**：每管道 60 秒 3 次、每使用者 10 分鐘 10 次，超過回 429 | 以腳本大量呼叫 `POST /api/v1/channels/{id}/test` 的整合 | 依 `Retry-After` 重試 |
+
+**升級步驟**：先 `kairos db backup <檔案> --include-keys --password-stdin < <密碼檔>`（同時加密備份三個金鑰檔）→ 換上 Kairos 0.7.0（`kairos --check-config`）→ 啟動後 `kairos audit verify`：0.6 的紀錄只有雜湊鏈，輸出寫出「第 N 筆起有 HMAC」的邊界 → 讀取 `offline_reason` 的整合改用新名稱 → 經反向代理抓 `/metrics` 的部署設定 token。
+
+### Kairos
+
+- **`offline_reason` 名稱統一**（§28.5 #4）：主機列表、詳情、總覽與 SSE 改用 `idle_timeout`／`agent_closed`；過渡期另帶 `*_legacy`，查詢參數接受新舊名稱；`offline_reason` 查詢另接受 `write_unknown`（0.6 漏列）。
+- **金鑰檔的加密備份**（§28.5 #8、§28.9 #3）：`kairos db backup --include-keys (--password-file <檔案> | --password-stdin)` 把存在的 `alerts-secrets.key`、`console.key`、`audit-hmac.key` 以備份密碼加密寫成 `<備份檔>.keys`（0600；Argon2id m=64 MiB／t=3／p=1 衍生金鑰＋AES-256-GCM，`format`、KDF 參數與鹽為 AAD），預設不含；不接受命令列上的密碼。`kairos db restore-keys <檔案>` 解開並以 0600 寫回資料目錄（暫存檔＋改名；以 root 執行時擁有者改為資料目錄的擁有者；不同的既有檔案需 `--overwrite`，舊檔改名保留）。密碼錯誤與檔案被修改都以`KRS-E4307` 拒絕。密碼、衍生金鑰與解開的金鑰在記憶體中以 `zeroize` 清除（`zeroize` 已在依賴樹中，經 rustls）。
+- **稽核雜湊鏈的 HMAC**（審計 S7 的強化）：每筆紀錄的雜湊另以 `audit-hmac.key` 衍生的金鑰計算 HMAC-SHA256，head 另帶 mac；HMAC 的起點記在 `meta.audit_hmac`，`kairos audit verify`、`POST /api/v1/audit/verify` 寫出邊界與 `hmac` 結果。新的斷點原因 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`。金鑰與 `console.key` 分開（取捨見 `kairos/src/audit.rs`）。
+- **鏈尾外送與自我驗證**（§28.5 #10）：每 `audit.anchor_log_minutes`（預設 60）分鐘寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`），經 syslog 外送成為資料庫之外的副本；每 `audit.verify_interval_hours`（預設 24）小時自我驗證，結果發布到內部事件匯流排（`audit_integrity`），失敗時記 `ERROR` 並開 `sys.audit_integrity`。
+- **`/metrics` 與反向代理**：見破壞性變更第 5 項；第一次拒絕時記 `WARN`（`observability.metrics_proxied`，`KRS-W0304`）。
+- **通知管道的機密無法解開**：狀態 `secrets_unavailable`（`KRS-E5110`），API、`kairos alert-channels list` 顯示；不嘗試發送；告警服務在狀態轉換時記 `WARN` 並發布內部事件 `channel_secrets`，「通知管道失敗」以 `KRS-E5110` 開事件（原本只在日誌記 `alerts.channel.decrypt_failed`）。
+- **測試通知的限速**：每管道 60 秒 3 次、每使用者 10 分鐘 10 次（429，`KRS-W5111`）。
+- **啟動時的設定檔錯誤帶代碼**：`錯誤 KRS-E0101／E0401／E0402（或 E0201／E0202）：Kairos 啟動失敗: …`，與 `--check-config` 相同的判斷，結束代碼仍為 3；CLI 的設定檔錯誤同樣改用正確的代碼（原本一律 `KRS-E0201`）。
+- **`kairos api-token create`**：沒有 `--role`／`--user` 時在 stderr 提示「i 未指定 --role，使用唯讀（viewer）；需要讀取註冊、憑證與設定時請改用 --role auditor」；`--scope` 改以 `⚠ 警告 KRS-W0104` 提醒（`--json` 放在 `warnings`）。
+- 設定：`[audit] anchor_log_minutes`（0 或 5～1440）、`verify_interval_hours`（1～168）。依賴：`zeroize`（直接依賴，版本與 rustls 使用的相同，不新增套件）。
+
+### Pulse
+
+- 啟動時 `pulse.toml` 存在但無法讀取（權限、I/O）改以 `PLS-E0402` 說明（原本為 `PLS-E0101`）。
+
+### 新的產品代碼（設計包 `decisions/INTEGRATION.md` §29.3 正式分配，號碼與工程暫定的相同）
+
+| 代碼 | 意義 | 使用處 |
+|---|---|---|
+| `KRS-W0304` | `/metrics` 經反向代理轉送、但沒有設定 `observability.metrics_token_file` 而拒絕 | 日誌（第一次） |
+| `KRS-E4307` | 金鑰檔的加密備份無法建立、解開或還原（密碼錯誤、檔案被修改、格式不符、無法寫回資料目錄；子類別 43 改名為「匯出、匯入與備份」） | `kairos db backup --include-keys`、`kairos db restore-keys` |
+| `KRS-W5111` | 測試通知太頻繁（429 `rate_limited`） | `POST /api/v1/channels/{id}/test` |
+| `KRS-I6202` | 稽核鏈尾的定期外送（固定事件 `audit.chain_anchor`） | 日誌、syslog |
+
+沿用的代碼：通知管道的機密無法解開沿用 `KRS-E5110`（§28.5 #8）；HMAC 的各種失敗與自我驗證失敗沿用 `KRS-E6201`。
+
+### 測試
+
+- Kairos：主機 API／SSE 的新舊名稱與查詢相容；`/metrics` 的轉送標頭（六種標頭、空值、有 token 時照常）；管道機密無法解開的狀態轉換（store、引擎、派送、API、內部事件、系統事件）與測試通知的限速（單元與 HTTPS 端點）；稽核 HMAC（重新計算的鏈、金鑰遺失與不符、邊界移動、head 截斷、保留清除、0.6〔v6〕資料庫與鏈升級到 v7）；自我驗證發布事件、竄改後開「稽核日誌完整性」並在通過後恢復；金鑰備份（往返、錯誤密碼、竄改密文／nonce／鹽／KDF 參數、異常的記憶體參數、權限 0600、不覆寫、不只還原一半、`--overwrite` 保留舊檔）；CLI 的參數（拒絕命令列密碼）；設定檔錯誤代碼；`api-token create` 的提示。
+- 端對端：`exit_codes.rs` 檢查啟動時的 `KRS-E0401`、`KRS-E0101`、`PLS-E0101`；`api.rs` 檢查 `agent_closed` 與 `*_legacy`。
+
+### 主控台網頁介面
+
+衝刺 6 的**主控台網頁介面**（審計 F2；設計包 `kairos/screens.md`、`ia.md`、`design-system/`、`decisions/INTEGRATION.md` §28.6）：地基與 S01、S03～S05、S23，加上告警（S06～S11）、註冊與憑證（S12～S15）、管理與系統（S16～S18、S20、S21）三組畫面。架構與慣例見 [`kairos/web/README.md`](kairos/web/README.md)（各畫面有與隱藏的元素見第 8 節），伺服器端的規則見 `kairos/API.md` 第 14 節。
+
+#### 地基
+
+- **網頁介面**（Kairos）：與主控台 API 同一個 HTTPS 監聽（預設 `https://127.0.0.1:9443/`）。原生 ES modules＋vanilla JS，沒有第三方套件與 npm 建置步驟；`kairos/build.rs` 在編譯時把 `kairos/web/index.html` 與 `kairos/web/assets/` 嵌入執行檔（依路徑排序，不影響可重現性）。`/assets/…` 帶 `ETag`、`Cache-Control: no-cache`；其他沒有副檔名的路徑回 `index.html`（History API 路由）。
+- **畫面**：S01 登入（本機／AD、兩步驟驗證的驗證碼或復原碼、第一次登入變更密碼、鎖定剩餘時間、工作階段已結束的說明、公開健康燈、`next` 只接受站內路徑）；S03 總覽（六個狀態磚、1 小時變化、24 小時上線數、系統健康條、進行中事件、群組健康、離線最久、資源使用前 10）；S04 主機清單（搜尋含 CIDR、狀態 chip、離線原因／群組／標籤／OS／版本、伺服器端排序與游標分頁、即時更新不重排）；S05 主機詳情（概覽、純 SVG 的趨勢圖〔平均＋最小／最大，空缺不補 0〕、24 小時時間軸、連線與憑證、連線紀錄）；全域搜尋（Ctrl+K）；S23 個人設定（主題、減少動態效果、時間顯示與時區〔只存在這個瀏覽器〕、變更密碼、兩步驟驗證〔本機產生 QR code、10 組復原碼只顯示一次〕、我的工作階段與「結束其他所有工作階段」）。沒有後端或沒有畫面的元素依 §28.6 隱藏（清單見 `kairos/web/README.md` 第 8 節）。
+- **框架層**：路由、API 用戶端（CSRF 標頭、錯誤代碼 → 設計包的三段式說明、401 帶 `next` 回登入頁、403 顯示所需權限）、共用的 SSE 管理（重連、權限改變時重新判斷）、依 `/api/v1/me` 權限顯示的導覽與按鈕、亮暗主題、繁中文案集中（`strings.js`）、表格、對話框、Toast、空狀態／載入／錯誤狀態元件、瀏覽器端的閒置逾時。
+- **API**（唯讀，`hosts:read`，群組範圍只含範圍內的主機）：`GET /api/v1/hosts/facets`（篩選列的選項與台數、群組的線上數）；`GET /api/v1/hosts/{agent_id}/connections`（Kairos 這次啟動後的上線與離線紀錄，記憶體中、每台最多 50 筆）；`GET /api/v1/hosts/{agent_id}` 新增 `certificate`（最新一張由 Kairos 簽發的憑證的狀態與到期，不含序號）。`kairos/API.md` 第 5.2、5.7、5.8 節。
+- **安全標頭**：主控台的每個回應帶 HSTS、`X-Content-Type-Options`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、COOP／CORP、`Permissions-Policy` 與 CSP（網頁：`script-src 'self'`、`style-src 'self'`、`frame-ancestors 'none'`、`require-trusted-types-for 'script'`；API：`default-src 'none'`）。
+- **設計 token**：`kairos/web/assets/tokens.css` 為設計包 `design-system/tokens.css` 的複本，`cargo test` 檢查與記錄的 SHA-256 相同（找得到設計包時逐位元組比對）；`kairos/web/tools/sync-design.mjs` 重新複製並產生錯誤代碼的資料。
+- **端對端測試**：`kairos/web/tests/run.sh`（Playwright＋axe，不在 `cargo test` 中）對真的 Kairos 執行流程測試（CSP、XSS、RBAC、兩步驟驗證、鍵盤、即時更新、深色主題、窄螢幕…；告警、註冊與憑證、管理各有獨立的測試檔），axe 0 違規。未指定的連接埠自動挑選空的連接埠，同一台機器可同時執行多份。
+
+#### 變更（地基）
+
+- **沒有出示任何憑據的請求不再扣驗證失敗的額度**（`kairos/API.md` 第 4.3 節）：沒有 `Authorization` 也沒有工作階段 cookie 的請求仍回 401，但不計入同一來源的失敗次數（未登入的瀏覽器開啟主控台時會讀取 `/api/v1/me`；否則重新整理登入頁幾次就會被限速）。出示錯誤或失效的 token、工作階段照常計入。
+- `GET /`（以及其他不是 `/api/`、健康檢查的路徑）由 JSON 的 404 改為網頁介面（`/api/…` 不存在的路徑仍是 JSON 的 `not_found`）。
+
+#### 告警畫面（S06～S11）
+
+設計包 `kairos/screens.md` S06～S11、`alerts-ux.md`。只使用既有的告警 API（`kairos/API.md` 第 13 節），沒有新增端點。
+
+- **S06 告警事件**：進行中／需要我處理／已恢復待結案／全部、嚴重度（附進行中數）／狀態／類型／規則／開始時間篩選與搜尋（寫在網址）、彙總事件展開子事件、即時更新（SSE `alert.*`，列就地更新、新事件提示「更新列表」）、行內與批次確認、指派、解決、從事件建立靜音；告警引擎沒有執行、暖機中、靜音生效、沒有通知管道的提示。
+- **S07 事件詳情**：狀態列（嚴重度、處理類型、規則、負責人、升級、暫停）、判讀（由事件內容組出）、受影響主機（子事件）、處理紀錄與註解、通知發送狀態（含錯誤代碼與「查看錯誤」）；確認並指派給我（預計處理時間）、指派、暫停通知 1 小時、解決（根因必選）。
+- **S08 告警規則**、**S09 規則編輯**：啟用開關（停用系統預設規則需要原因）、7 天觸發與雜訊；自訂規則（主機離線、長期失聯、回報延遲、CPU／記憶體門檻含恢復門檻、身分衝突）、範圍與符合台數、依嚴重度的通知預設、升級對象、歷史試算（離線類寫出不支援）。
+- **S10 靜音與維護時段**：符合台數與範圍的文字、時長上限與伺服器驗證錯誤、大範圍與緊急等級的 L1 確認、提前結束。
+- **S11 通知管道**：Email（SMTP）與 Webhook（Kairos JSON、Slack 類、Teams、LINE）、機密只顯示遮蔽值（只能更換）、寄送測試通知（含 429 限速）、`secrets_unavailable` 的處理方式、刪除（L2，替代管道）。
+- **S03 總覽**：嚴重、警告磚改由進行中的告警推算（線上主機）；進行中事件可行內確認、連到事件詳情。側邊導覽的「告警事件」計數泡泡（緊急時實心）；全域搜尋加入告警事件。
+- 隱藏（§28.6）：S06 群組與負責人篩選；S07「加入處理」、匯出 PDF、通知重送；S08／S09 未實作的規則類型與系統規則；S10 週期性維護與群組範圍；S11 每日彙整、HTML 版、Alertmanager 格式、代理伺服器。
+
+#### 註冊與憑證畫面（S12～S15）
+
+- **S12 註冊 token**：清單與部署進度、建立（核准方式、限定來源網段、批次部署、限定主機、簽發憑證有效期；自動核准限管理員）、建立完成只顯示一次（SecretField 預設遮蔽、CA 指紋、安裝字串、`pulse enroll --install-string` 指令；之後只顯示前 4 碼）、停用（L1）、詳情的部署進度漏斗；下載端點未提供，隱藏一行指令與 MSI 下載。
+- **S13 待核准**：篩選與搜尋、全選只選無異常、批次核准（L1）、拒絕（L2：單筆輸入主機名稱、批次「拒絕 N 筆」，原因必填）、申請詳情（申請編號、公鑰指紋、旗標說明）、最近結束、每 10 秒確認清單變化。
+- **S14 憑證**：狀態 KpiTile（含 CRL 剩餘、寬限期內、需重新註冊）、撤銷（L2）、詳情（`/certificates/:serial`、下載 PEM）、允許再次自動續簽（L1，限管理員；維運者停用並說明）、建立限定這些主機的 token、待簽發（匯出 CSR 佇列、匯入簽發結果）。
+- **S15 CA 與撤銷清單**：每個簽發 CA 的 CRL（`KRS-E1203`、`KRS-W1201`）、立即更新 CRL（L1，維運者也可）、信任錨與簽發 CA（`KRS-W1304`）、簽發方式（`KRS-E1303`）、CRL 版本歷史。
+- **API**：`GET /api/v1/pki/certificates` 與 `/{serial}` 另帶 `hostname`（主機清冊；尚未連線時取申請的主機名稱）與 `group`，`q` 也比對主機名稱片段（`kairos/API.md` 第 11.5、11.8 節）。
+- 端對端測試另啟動一個 mTLS＋註冊端點＋線上簽發的 Kairos（`pki-env.sh` 以 openssl 建立測試 PKI），以實際的 `pulse enroll` 註冊、核准、取得憑證。
+
+#### 管理與系統畫面（S16～S18、S20、S21）
+
+- **S16 使用者與角色**：清單（來源、角色、狀態、兩步驟驗證、搜尋）、新增本機帳號（一次性密碼只顯示一次，關閉前須勾選「我已記下」）、詳情（有效權限、工作階段、擁有的 API token）、角色指派（L1，顯示權限差異）、停用／啟用、解除鎖定、重設密碼與兩步驟驗證、結束所有工作階段、刪除（L2）、角色與權限矩陣；自己與最後一位全站管理員的停用／刪除停用並說明。
+- **S17 目錄服務**：連線設定唯讀（bind 密碼遮蔽、「此設定在 kairos.toml」）、未加密時的警告、以帳號測試登入、群組對應的新增與移除（L1）。
+- **S18 稽核日誌**：查詢（條件在網址）、詳情（細節、前一筆雜湊、雜湊、HMAC）、驗證完整性（第一個斷點與原因、HMAC 邊界）、JSONL 匯出；維運者只看自己的操作（`audit:read_own`）。
+- **S20 系統健康**：健康 API 各項，依權限加入簽發 CA 到期、註冊端點、告警引擎、`/metrics`；頂列的系統狀態燈改為連到這裡；「下載診斷包」改為可複製的 `kairos diag` 指令。
+- **S21 系統設定**：一般、連線與安全、資料保留與儲存、整合；每個設定鍵的生效值、來源（環境變數／主控台／設定檔／內建預設）、修改者與時間；註冊端點模式與自動暫停（L1；關閉且有受影響主機時 L2）；改用設定檔的值；環境變數鎖定的鍵唯讀；API token（建立只顯示一次、清單前 4 碼、撤銷 L1）。維運者只有「連線與安全」（唯讀）。
+- **伺服器端**：網頁介面路由第二段以後的參數可含「.」（`/admin/users/alice.w` 回 `index.html`；最後一段含「.」的其他路徑仍為 404）。
+
+#### 導覽與共用（整合）
+
+- **側邊導覽**依 `ia.md` §3：監控（總覽、主機、告警事件、告警規則、靜音與維護、通知管道）→ 註冊與憑證（待核准、註冊 token、憑證、CA 與撤銷清單）→ 稽核與報表（稽核日誌）→ 管理（使用者與角色、目錄服務）→ 系統（系統健康、系統設定）；項目依 `/api/v1/me` 的權限顯示，沒有可見項目的區塊不顯示標題。唯讀角色看到：總覽、主機、告警事件、靜音與維護、系統健康。
+- **分頁標題的未確認數**：有未確認的告警時為「(3) Kairos｜總覽」，與「告警事件」的計數泡泡相同（`ia.md` §7）。
+- **無障礙（WCAG A 級，設計包 §29.5 #6、#7）**：告警事件的 `j`／`k` 快速鍵只在焦點位於事件表格內時生效（2.1.4，不再整頁攔截）；閒置逾時前 2 分鐘以對話框提醒（`alertdialog`，焦點在「繼續使用」、`aria-live` 讀出剩餘時間），「繼續使用」或 Esc 延長，逾時才登出（2.2.1）。
+- **稽核日誌的斷點**（S18）：同為 `KRS-E6201`，金鑰問題（`hmac_key_unavailable`、`hmac_key_mismatch`）另以「無法驗證 HMAC」與「從備份還原 `audit-hmac.key`」呈現（設計包範例 95）；`kairos audit` 說明的結束代碼 9 改為「稽核日誌完整性驗證失敗（雜湊鏈斷裂、HMAC 不符或無法驗證 HMAC）」。
+- **未儲存的變更**：規則編輯（S09）、通知管道（S11）、系統設定的註冊端點模式（S21）有未儲存的變更時，站內換頁（連結、上一頁／下一頁）先詢問「要放棄變更嗎？」，關閉或重新整理分頁時由瀏覽器詢問。
+
+#### 已知限制
+
+- **沒有畫面**：S02 首次啟動精靈、S19 合規報表、S22 授權資訊（選單不顯示）；主機的寫入操作（編輯、維護、除役、刪除資料）與主機詳情的資產資訊、事件、稽核紀錄分頁。
+- **依 `decisions/INTEGRATION.md` §28.6 隱藏的元素**（沒有後端；各畫面的完整清單見 `kairos/web/README.md` 第 8 節）：S06 群組與負責人篩選；S07「加入處理」、匯出 PDF、通知重送；S08／S09「憑證即將到期」「版本過舊」類型與未實作的系統規則；S10 週期性維護與群組範圍；S11 每日彙整、HTML 版、Alertmanager 格式、代理伺服器；S16「從目錄服務加入」與權限清冊 CSV；S17 定期同步與連線設定的主控台編輯（唯讀）；S18 CSV 匯出、外送 SIEM、保留期限的調整；S20「下載診斷包」（改為 `kairos diag` 指令）與目錄服務列；S21「主機群組與標籤」分頁、`[log]`／`[observability]` 與需要重新啟動的設定唯讀；S23 我的通知、我的 API token。
+- **註冊與憑證**（web-pki 線回報）：沒有安裝程式下載端點，只提供 `pulse enroll --install-string`（INTEGRATION §27.4 #3）；S13 沒有排隊台數與佇列已滿提示、OS 與來源網段篩選；S14 沒有匯出清冊、手動簽發 CSR、重新簽發、憑證政策的修改；S15 沒有上傳／下載 CRL、CA 輪替精靈（簽發 CA 以 CLI 管理）。
+- **導覽**：只有「告警事件」有計數泡泡；「待核准」與「系統健康」的計數泡泡（`ia.md` §7）、全域橫幅（CRL 到期等）尚未提供。S03 總覽的範圍選擇器、憑證磚與最近變更尚未提供。
+- **未儲存的變更**：上一頁／下一頁取消離開時以 `pushState` 放回原網址，瀏覽器的「下一頁」紀錄會被清除。
+- 連線紀錄只在記憶體中（重新啟動後從頭記錄）；完整、持久的連線紀錄屬於之後的版本。
+- 偏好（主題、時區）沒有伺服器端儲存，只套用在各自的瀏覽器。
+- **支援的瀏覽器：Chromium 系（Chrome、Edge）**（設計包 D44 #2）。Trusted Types 只有 Chromium 支援；Firefox、Safari 可以使用（CSP 的其餘部分照常生效），但未在發佈前驗證，跨瀏覽器與真人螢幕報讀器的驗證屬於之後的版本。
+
 ## [0.6.0] - 〔草稿：發佈日期待定〕
 
 〔草稿〕**Kairos 0.6.0、Pulse 0.6.0**：衝刺 5 的三條線——**告警引擎**（審計 F3；設計包 `kairos/alerts-ux.md`、`screens.md` S06～S11、§24 #2、#8、#9）、**使用者、角色、工作階段與稽核**（審計 F6、S7 的雜湊鏈部分；`screens.md` S01、S16～S18、S23、§24 #10、#11、D25）、**可觀測性**（審計 O3、O8；`screens.md` S20、§24 #8、`pulse/log-ux.md`、`pulse/cli-spec.md` §6、§8）。版本號已改為 0.6.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。**協定不變**（v1～v2，8443 的 feature 與 0.5 相同），Kairos 與 Pulse 0.5／0.6 的任何組合都能照常連線。Pulse 只有可觀測性的變更。

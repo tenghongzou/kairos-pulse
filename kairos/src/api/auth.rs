@@ -486,7 +486,9 @@ impl Authenticator {
                 self.authenticate_session(headers, method, &secret, peer, now)
                     .await
             }
-            None => Err(self.failed(peer, "沒有 Authorization: Bearer 或工作階段")),
+            // 沒有出示任何憑據（未登入的瀏覽器開啟主控台、登入頁讀取 /api/v1/me）不是猜測，不扣失敗額度
+            // （0.7.0；API.md 第 4.3 節）。出示了錯誤的 token 或已失效的工作階段照常扣
+            None => Err(ApiError::unauthorized()),
         }
     }
 

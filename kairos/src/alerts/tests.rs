@@ -968,6 +968,61 @@ fn channel_failure_event_goes_to_the_other_channels_only() {
 }
 
 #[test]
+fn undecryptable_channel_opens_a_channel_failure_with_e5110() {
+    let mut e = engine();
+    let mut chans = vec![
+        channel("w", ChannelKind::Webhook),
+        channel("mail", ChannelKind::Email),
+    ];
+    chans[0].state = super::store::STATE_SECRETS_UNAVAILABLE.into();
+    e.set_channels(chans);
+    e.tick(world(T0, vec![]));
+    let ev = by_rule(&e, ids::CHANNEL_FAILED);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].subject, "w");
+    assert_eq!(ev[0].code.as_deref(), Some("KRS-E5110"));
+}
+
+#[test]
+fn audit_self_check_failure_opens_the_integrity_event_until_it_passes() {
+    let mut e = engine();
+    let at = |t: i64| chrono::DateTime::from_timestamp_millis(t).unwrap();
+    e.on_bus(&BusEvent {
+        seq: 1,
+        at: at(T0),
+        kind: EventKind::AuditIntegrity {
+            ok: false,
+            reason: Some("hmac_mismatch".into()),
+            id: Some(42),
+            summary: "第 42 筆：HMAC 不符".into(),
+        },
+    });
+    e.tick(world(T0, vec![]));
+    let ev = by_rule(&e, ids::AUDIT_INTEGRITY);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].severity, Severity::Emergency);
+    assert_eq!(ev[0].code.as_deref(), Some("KRS-E6201"));
+    assert!(ev[0].title.contains("第 42 筆"), "{}", ev[0].title);
+    // 下一次驗證通過：恢復
+    e.on_bus(&BusEvent {
+        seq: 2,
+        at: at(T0 + MIN),
+        kind: EventKind::AuditIntegrity {
+            ok: true,
+            reason: None,
+            id: None,
+            summary: String::new(),
+        },
+    });
+    e.tick(world(T0 + MIN, vec![]));
+    assert!(
+        by_rule(&e, ids::AUDIT_INTEGRITY)
+            .iter()
+            .all(|x| x.state != super::model::EventState::Firing)
+    );
+}
+
+#[test]
 fn startup_records_restart_and_unplanned_downtime() {
     let mut e = engine();
     e.record_startup(Some((T0 - 23 * MIN, false)), true, false, T0);

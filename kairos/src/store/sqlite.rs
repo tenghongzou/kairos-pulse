@@ -599,6 +599,13 @@ ALTER TABLE hosts ADD COLUMN host_group TEXT;
 CREATE INDEX hosts_group ON hosts (host_group);
 ";
 
+/// schema v7（0.7〔草稿〕）：稽核事件的 HMAC（[`crate::audit`] 模組說明的「HMAC」）。既有的紀錄為
+/// NULL（只有雜湊鏈）；服務以 0.7 啟動、有了 `audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在
+/// `meta.audit_hmac`。0.6 無法開啟 v7 的資料庫（降版從備份還原）。
+const SCHEMA_V7: &str = "
+ALTER TABLE audit_events ADD COLUMN hmac TEXT;
+";
+
 /// 依序套用的 schema 變更；最後一項的版本即目前的 schema 版本
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -625,10 +632,14 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: SCHEMA_V6,
     },
+    Migration {
+        version: 7,
+        sql: SCHEMA_V7,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";

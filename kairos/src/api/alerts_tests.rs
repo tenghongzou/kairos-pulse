@@ -687,3 +687,129 @@ async fn alerts_end_to_end_over_https() {
     }
     f.stop().await;
 }
+
+/// 管道的機密無法解開（金鑰檔遺失或與資料庫不成對）：API 顯示 `secrets_unavailable`、不嘗試發送、
+/// 發布內部事件並開「通知管道失敗」事件（`KRS-E5110`）；測試通知的限速（每管道 60 秒 3 次）
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undecryptable_channel_secrets_and_test_rate_limit() {
+    let hook = FakeHttp::start().await;
+    let f = fixture_alerts("alerts-secrets", |c| c.alerts.warmup_secs = 0).await;
+    let addr = f.addr();
+    let admin = token(&f, Role::Admin);
+    let mut bus = f.registry.bus().subscribe();
+    let body = json!({
+        "name": "值班群組",
+        "kind": "webhook",
+        "config": { "format": "kairos", "allow_http": true, "min_severity": "warning" },
+        "secrets": { "url": format!("http://{}/hook", hook.addr) },
+    });
+    let r = call(addr, "POST", "/api/v1/channels", Some(&admin), Some(&body)).await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let cid = r.json()["data"]["channel_id"].as_str().unwrap().to_string();
+    let test_path = format!("/api/v1/channels/{cid}/test");
+
+    // 限速：同一個管道 60 秒內 3 次，第 4 次 429（Retry-After、KRS-W5111），不送出
+    for _ in 0..3 {
+        let r = call(addr, "POST", &test_path, Some(&admin), Some(&json!({}))).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["data"]["ok"], true);
+    }
+    let r = call(addr, "POST", &test_path, Some(&admin), Some(&json!({}))).await;
+    assert_eq!(r.status, 429);
+    let secs: u64 = r.header("retry-after").unwrap().parse().unwrap();
+    assert!((1..=60).contains(&secs), "{secs}");
+    let v = r.json();
+    assert_eq!(v["error"]["code"], "rate_limited");
+    assert_eq!(v["error"]["product_code"], "KRS-W5111");
+    assert_eq!(v["error"]["details"]["scope"], "channel");
+
+    // 以另一把金鑰加密的機密（模擬金鑰檔遺失後重新產生、或資料庫與金鑰檔不成對）
+    let other = crate::alerts::secrets::SecretBox::from_key(&[9u8; 32]).unwrap();
+    let blob = other
+        .seal(&json!({ "url": format!("http://{}/hook", hook.addr) }))
+        .unwrap();
+    {
+        let conn = f.admin();
+        conn.execute(
+            "UPDATE alert_channels SET secrets = ?2 WHERE channel_id = ?1",
+            rusqlite::params![cid, blob],
+        )
+        .unwrap();
+        crate::alerts::store::bump_config_rev(&conn).unwrap();
+    }
+    f.alerts.as_ref().unwrap().request_reload();
+    // API：狀態為 secrets_unavailable，錯誤代碼 KRS-E5110（派送端重新載入之後）
+    let t0 = Instant::now();
+    let ch = loop {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/channels/{cid}"),
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        let d = r.json()["data"].clone();
+        if d["state"] == "secrets_unavailable" {
+            break d;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "{d}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(ch["last_error_code"], "KRS-E5110");
+    assert!(
+        ch["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("alerts-secrets.key")
+    );
+    let list = call(addr, "GET", "/api/v1/channels", Some(&admin), None)
+        .await
+        .json();
+    assert_eq!(list["data"][0]["state"], "secrets_unavailable");
+    // 內部事件
+    let t0 = Instant::now();
+    loop {
+        match bus.try_recv() {
+            Ok(e) => {
+                if let crate::bus::EventKind::ChannelSecrets {
+                    channel_id,
+                    available,
+                    ..
+                } = &e.kind
+                {
+                    assert_eq!(channel_id, &cid);
+                    assert!(!available);
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(30),
+                    "應發布 ChannelSecrets"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    // 「通知管道失敗」系統事件（KRS-E5110）
+    let t0 = Instant::now();
+    loop {
+        let v = call(addr, "GET", "/api/v1/alerts", Some(&admin), None)
+            .await
+            .json();
+        if v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["rule_id"] == "sys.channel_failed" && e["code"] == "KRS-E5110")
+        {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "{v}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    f.stop().await;
+}

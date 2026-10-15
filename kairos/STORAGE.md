@@ -44,6 +44,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 | `data/kairos.db-wal`、`kairos.db-shm` | WAL 與共用記憶體檔，SQLite 建立時沿用資料庫檔的權限（`0640`）。Kairos 正常關機時刪除。**備份或搬移時不可只複製 `kairos.db`**（見第 9 節） |
 | `data/agents.json` | 狀態表的即時快照（每 5 秒），與 0.2 相同；重新啟動後含最近 24 小時內出現過的主機（見第 6 節） |
 | `data/reports-YYYY-MM-DD.jsonl`、`.retention-guard.json` | 只在 `backend = "jsonl"` 或 `jsonl_mirror = true` 時寫入 |
+| `data/alerts-secrets.key`、`data/console.key`、`data/audit-hmac.key` | 金鑰檔（各 32 bytes，0600）：通知管道機密、CSRF／TOTP、稽核鏈的 HMAC（0.7〔草稿〕）。不在資料庫中，資料庫備份不含；備份與還原見第 9 節 |
 
 資料目錄所在的檔案系統必須支援共享記憶體與 POSIX 檔案鎖（本機磁碟；**不要放在 NFS／SMB 等網路磁碟**）。無法啟用 WAL 時 Kairos 拒絕啟動。
 
@@ -172,6 +173,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v4（0.5.0〔草稿〕，衝刺 4）：註冊通道與 PKI 的資料表 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，以及 `hosts` 的 `lifecycle`、`decommissioned_at`、`decommissioned_by`、`current_serial`、`grace_override_until`、`expired_seen_at`、`last_grace_attempt` 與索引 `hosts_hostname`。完整的 SQL 與保存期限見 [`PKI.md`](PKI.md) 第 7、13 節（`store/sqlite.rs` 的 `SCHEMA_V4`）。升級到 v4 之後 0.4 的 Kairos 無法開啟；`kairos enroll-token`、`kairos enroll`、`kairos pki`、`kairos config` 開啟資料庫時同樣會升級 schema。
 - v5（0.6.0〔草稿〕，衝刺 5）：告警引擎的資料表 `alert_rules`（規則）、`alert_events`（事件，含彙總的 `parent_id`、處理狀態與通知進度 `notify_state`）、`alert_timeline`（處理紀錄）、`alert_silences`（靜音與維護時段）、`alert_channels`（通知管道；`secrets` 為 AES-256-GCM 密文）、`alert_deliveries`（發送紀錄）、`alert_actions`（CLI 交給執行中的 Kairos 處理的動作）與索引；`meta` 另有 `alerts_config_rev`（規則、靜音、管道的版本）與 `alerts_heartbeat`（停機期間的判斷）。完整的 SQL 見 `store/sqlite.rs` 的 `SCHEMA_V5`，欄位說明見 [`ALERTS.md`](ALERTS.md)。升級到 v5 之後 0.5 的 Kairos 無法開啟；`kairos alerts`、`kairos silences`、`kairos alert-rules`、`kairos alert-channels` 開啟資料庫時同樣會升級 schema。
 - v6（0.6.0〔草稿〕，衝刺 5）：使用者、角色指派、工作階段與 TOTP 復原碼（`users`、`role_assignments`、`sessions`、`user_recovery_codes`），`api_tokens` 的 `owner_user_id`、`role`，`audit_events` 的雜湊鏈欄位 `prev_hash`、`hash`（索引 `audit_events_actor`），`hosts.host_group`（角色指派的範圍）。v6 接在 v5（告警）之後，不依賴 v5 的物件；0.5.0（v4）的資料庫在第一次啟動時依序升級 v5 → v6（各自一個交易），既有的 API token 權限不變（凍結在 0.5，沒有告警與使用者等新權限）。完整的說明見 [`API.md`](API.md) 第 12.10 節。升級後 0.5 的 Kairos 無法開啟；`kairos users`、`kairos audit` 開啟資料庫時同樣會升級 schema。密碼只存 Argon2id 雜湊、工作階段只存 SHA-256、TOTP 秘密以 `data/console.key` 加密（金鑰不在資料庫中，`kairos db backup` 不含它）。
+- v7（0.7.0〔草稿〕，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -361,18 +363,37 @@ systemctl start kairos
 
 備份檔是完整的 Kairos 資料庫，可以直接啟動；備份之後收到的 report 不在其中。`agents.json` 不需要備份（啟動時由清冊重建）。
 
-**金鑰檔**（0.6.0 起）：`data/alerts-secrets.key`（通知管道機密的 AES-256-GCM 金鑰）與 `data/console.key`（CSRF 與 TOTP 秘密的加密金鑰）**不在資料庫備份中**，資料庫只有密文。以加密的方式與資料庫備份一起保存，**還原時與 `kairos.db` 一起複製**（擁有者 `kairos`、權限 0600）：
+**金鑰檔**：`data/alerts-secrets.key`（0.6.0 起；通知管道機密的 AES-256-GCM 金鑰）、`data/console.key`（0.6.0 起；CSRF 與 TOTP 秘密的加密金鑰）、`data/audit-hmac.key`（0.7〔草稿〕起；稽核鏈的 HMAC 金鑰）**不在資料庫備份中**，資料庫只有密文與 HMAC。還原時金鑰與 `kairos.db` 要是同一次備份的組合。
+
+**金鑰檔的加密備份**（0.7〔草稿〕；預設不含，需要另外指定 `--include-keys`）：
+
+```bash
+sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/kairos-$(date +%F).db \
+    --include-keys --password-stdin --config /opt/kairos/kairos.toml < /root/kairos-backup.pass
+# kairos-YYYY-MM-DD.db.keys（0600）
+```
+
+- 格式 `kairos.keys-backup/v1`（一份 JSON）：Argon2id（m=64 MiB、t=3、p=1、16 bytes 隨機鹽）由備份密碼衍生 32 bytes 金鑰，AES-256-GCM（12 bytes 隨機 nonce）加密；`format`、`kdf`（含鹽）、`cipher` 是附加資料（AAD），被修改即無法解開。只用既有的依賴（`argon2`、`ring`），沒有引入 age 等新 crate。
+- 密碼只從 `--password-file <檔案>`（第一行）或 `--password-stdin` 讀取，至少 12 個字元；不接受命令列上的密碼。密碼、衍生的金鑰與解開後的金鑰在記憶體中用完即清除（`zeroize`），不寫入暫存檔（加密後才寫出）。
+- 先寫 `.keys` 再備份資料庫；任何一步失敗時不留下另一個檔案。資料目錄中不存在的金鑰檔略過並在輸出中列出。
+
+**還原金鑰檔**（Kairos 停止時）：
 
 ```bash
 systemctl stop kairos
 install -o kairos -g kairos -m 640 /var/backups/kairos/kairos-2026-10-12.db /opt/kairos/data/kairos.db
-gpg -d /var/backups/kairos/keys-2026-10-12.tar.gpg | tar -C /opt/kairos/data -xf -   # alerts-secrets.key、console.key
-chown kairos:kairos /opt/kairos/data/alerts-secrets.key /opt/kairos/data/console.key
-chmod 600 /opt/kairos/data/alerts-secrets.key /opt/kairos/data/console.key
+rm -f /opt/kairos/data/kairos.db-wal /opt/kairos/data/kairos.db-shm
+sudo -u kairos /opt/kairos/kairos db restore-keys /var/backups/kairos/kairos-2026-10-12.db.keys \
+    --password-stdin --config /opt/kairos/kairos.toml < /root/kairos-backup.pass
 systemctl start kairos
 ```
 
-少了 `alerts-secrets.key` 時 Kairos 會建立新的金鑰，既有管道的機密無法解密（需重新輸入）；少了 `console.key` 時同樣建立新的金鑰，已綁定的 TOTP 需重設（`kairos users reset-mfa`）。
+- 寫回 `storage.data_dir`：先寫同目錄的暫存檔（0600）再改名；以 root 執行時擁有者改為資料目錄的擁有者。先檢查全部再寫入，不會只還原一半。
+- 與既有檔案相同時不變；不同時拒絕（資料庫可能是用既有的金鑰加密的），確認後加 `--overwrite`，舊檔改名為 `<名稱>.replaced-<時間>` 保留（之後自行刪除）。
+- 密碼錯誤與檔案被修改無法區分，都以`KRS-E4307` 拒絕，不寫入任何檔案。
+- 不使用 `--include-keys` 的部署仍可自行加密保存三個檔案（`tar -C /opt/kairos/data -cf - alerts-secrets.key console.key audit-hmac.key | gpg -c > keys-$(date +%F).tar.gpg`），還原後 `chown kairos:kairos`、`chmod 600`。
+
+少了 `alerts-secrets.key` 時 Kairos 會建立新的金鑰，既有管道的機密無法解開：管道的狀態為 `secrets_unavailable`（`KRS-E5110`；不發送，開「通知管道失敗」事件），還原舊金鑰（`--overwrite`）並重新啟動，或重新輸入機密。少了 `console.key` 時同樣建立新的金鑰，已綁定的 TOTP 需重設（`kairos users reset-mfa`）。少了 `audit-hmac.key` 時 Kairos 建立新的金鑰，但不會以它接續稽核鏈：`kairos audit verify` 與自我驗證以 `hmac_key_unavailable`／`hmac_key_mismatch`（`KRS-E6201`）失敗，直到還原原本的金鑰。
 
 **PKI 的檔案**（0.5.0 起，線上簽發時）：`data/pki/issuing-<ca_id>.key` 是簽發 CA 的私鑰，**不在資料庫備份中**；遺失時舊簽發 CA 簽發的憑證仍有效，但無法再為它產生 CRL（處置見 `PKI.md` 第 4 節「私鑰遺失」）。以加密的方式另外備份 `data/pki/`（例如 `tar -C /opt/kairos/data -cf - pki | gpg -c > pki-$(date +%F).tar.gpg`），還原時保持擁有者為 `kairos`、權限 0700／0600；`issuing-cas.pem` 與 `crl/` 由 Kairos 依資料庫重新寫出，不需備份。
 

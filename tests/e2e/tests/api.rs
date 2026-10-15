@@ -110,12 +110,18 @@ fn api_lists_hosts_and_metrics_and_streams_online_offline_events() {
     let (code, _) = p.stop();
     assert_eq!(code, 0, "{}", p.dump());
     let offline = events.wait_for("host.offline", GOOD.agent_id);
-    assert_eq!(offline.data["reason"], "connection_closed", "{:?}", offline);
+    assert_eq!(offline.data["reason"], "agent_closed", "{:?}", offline);
+    assert_eq!(
+        offline.data["reason_legacy"], "connection_closed",
+        "{:?}",
+        offline
+    );
     assert!(
         poll_until(WAIT, || {
             let v = api.data("/api/v1/hosts?status=offline");
             v[0]["agent_id"] == GOOD.agent_id
-                && v[0]["status_detail"]["offline_reason"] == "connection_closed"
+                && v[0]["status_detail"]["offline_reason"] == "agent_closed"
+                && v[0]["status_detail"]["offline_reason_legacy"] == "connection_closed"
         }),
         "主機清單應顯示離線與原因"
     );

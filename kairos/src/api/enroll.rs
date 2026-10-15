@@ -1004,10 +1004,45 @@ fn cert_state(c: &ps::CertRow, grace_days: u32, now_ms: i64) -> &'static str {
     }
 }
 
-fn cert_json(c: &ps::CertRow, grace_days: u32, now_ms: i64, with_pem: bool) -> Value {
+/// 憑證所屬主機的名稱與群組（主控台 S14 的「主機」「群組」欄；0.7.0）：主機清冊的 `hostname`、
+/// `host_group`；主機還沒連線過（清冊沒有這台）時用申請的主機名稱
+type CertHost = (Option<String>, Option<String>);
+
+fn cert_hosts(
+    conn: &rusqlite::Connection,
+    serial: Option<&str>,
+) -> rusqlite::Result<std::collections::HashMap<String, CertHost>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.serial, coalesce(h.hostname, r.hostname), h.host_group
+         FROM pki_certificates c
+         LEFT JOIN hosts h ON h.agent_id = c.agent_id
+         LEFT JOIN enroll_requests r ON r.request_id = c.request_id
+         WHERE ?1 IS NULL OR c.serial = ?1",
+    )?;
+    let rows = stmt.query_map([serial], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ),
+        ))
+    })?;
+    rows.collect()
+}
+
+fn cert_json(
+    c: &ps::CertRow,
+    host: Option<&CertHost>,
+    grace_days: u32,
+    now_ms: i64,
+    with_pem: bool,
+) -> Value {
     let mut v = json!({
         "serial": c.serial,
         "agent_id": c.agent_id,
+        "hostname": host.and_then(|h| h.0.clone()),
+        "group": host.and_then(|h| h.1.clone()),
         "ca_id": c.ca_id,
         "state": cert_state(c, grace_days, now_ms),
         "not_before": ts_ms(c.not_before),
@@ -1038,9 +1073,14 @@ async fn list_certs(
 ) -> Result<Response<ApiBody>, ApiError> {
     q.reject_unknown(&["state", "agent_id", "q", "expires_within", "limit"], &[])?;
     let limit = limit_of(q)?;
-    let rows = svc
+    let (rows, hosts) = svc
         .db
-        .read(|conn| Ok(ps::list_certs(conn, 1_000_000, None)?))
+        .read(|conn| {
+            Ok((
+                ps::list_certs(conn, 1_000_000, None)?,
+                cert_hosts(conn, None)?,
+            ))
+        })
         .await
         .map_err(db_error)?;
     let now_ms = now.timestamp_millis();
@@ -1055,18 +1095,23 @@ async fn list_certs(
     };
     let state = q.get("state");
     let agent = q.get("agent_id").map(str::to_ascii_lowercase);
-    let text = q.get("q").map(str::to_ascii_uppercase);
+    let text = q.get("q").map(|t| t.trim().to_lowercase());
     let matched: Vec<Value> = rows
         .iter()
         .filter(|c| state.is_none_or(|s| cert_state(c, grace, now_ms) == s))
         .filter(|c| agent.as_deref().is_none_or(|a| c.agent_id == a))
         .filter(|c| {
             text.as_deref().is_none_or(|t| {
-                c.serial.contains(t) || c.agent_id.to_ascii_uppercase().starts_with(t)
+                c.serial.to_ascii_lowercase().contains(t)
+                    || c.agent_id.starts_with(t)
+                    || hosts
+                        .get(&c.serial)
+                        .and_then(|h| h.0.as_deref())
+                        .is_some_and(|n| n.to_lowercase().contains(t))
             })
         })
         .filter(|c| within.is_none_or(|w| c.not_after > now_ms && c.not_after - now_ms <= w))
-        .map(|c| cert_json(c, grace, now_ms, false))
+        .map(|c| cert_json(c, hosts.get(&c.serial), grace, now_ms, false))
         .collect();
     let total = matched.len();
     Ok(http::json(
@@ -1082,9 +1127,13 @@ async fn get_cert(
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let s = serial.to_ascii_uppercase();
-    let c = svc
+    let (c, hosts) = svc
         .db
-        .read(move |conn| Ok(ps::get_cert(conn, &s)?))
+        .read(move |conn| {
+            let c = ps::get_cert(conn, &s)?;
+            let hosts = cert_hosts(conn, Some(&s))?;
+            Ok(c.map(|c| (c, hosts)))
+        })
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -1097,7 +1146,13 @@ async fn get_cert(
     let grace = svc.effective().policy.expired_renew_grace_days;
     Ok(http::ok(
         now,
-        cert_json(&c, grace, now.timestamp_millis(), true),
+        cert_json(
+            &c,
+            hosts.get(&c.serial),
+            grace,
+            now.timestamp_millis(),
+            true,
+        ),
     ))
 }
 

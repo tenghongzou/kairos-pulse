@@ -655,6 +655,16 @@ impl Engine {
                 details: json!({ "since": at, "message": message }),
             });
         }
+        if let Some((since, reason, id, summary)) = &self.audit_failed {
+            out.push(SystemCondition {
+                rule_id: ids::AUDIT_INTEGRITY,
+                subject: "audit".into(),
+                severity: Severity::Emergency,
+                title: format!("稽核日誌完整性驗證失敗：{summary}"),
+                code: Some("KRS-E6201"),
+                details: json!({ "since": since, "reason": reason, "id": id }),
+            });
+        }
         let window = self
             .rule(ids::REGISTRY_CAPACITY)
             .map_or(3600, |r| r.param_u64("window_secs", 3600)) as i64
@@ -679,7 +689,23 @@ impl Engine {
             .rule(ids::CHANNEL_FAILED)
             .map_or(3, |r| r.param_u64("failures", 3)) as u32;
         for c in self.channels.values() {
-            if c.enabled && (c.failed() || c.consecutive_failures >= failures) {
+            if c.enabled && c.secrets_unavailable() {
+                // 機密無法解開（金鑰檔遺失或不成對）：不必等到發送失敗（設計包 §28.5 #8）
+                out.push(SystemCondition {
+                    rule_id: ids::CHANNEL_FAILED,
+                    subject: c.channel_id.clone(),
+                    severity: Severity::Critical,
+                    title: format!("通知管道無法使用：{}（無法解開機密）", c.name),
+                    code: Some("KRS-E5110"),
+                    details: json!({
+                        "channel_id": c.channel_id,
+                        "channel_name": c.name,
+                        "reason": "secrets_unavailable",
+                        "consecutive_failures": c.consecutive_failures,
+                        "last_error_code": c.last_error_code,
+                    }),
+                });
+            } else if c.enabled && (c.failed() || c.consecutive_failures >= failures) {
                 out.push(SystemCondition {
                     rule_id: ids::CHANNEL_FAILED,
                     subject: c.channel_id.clone(),
@@ -705,7 +731,11 @@ impl Engine {
     fn eval_system(&mut self, external: &[SystemCondition], checked: &[&'static str], now: i64) {
         let mut conditions: Vec<SystemCondition> = external.to_vec();
         conditions.extend(self.internal_conditions(now));
-        let internal = [ids::TLS_RELOAD_FAILED, ids::CHANNEL_FAILED];
+        let internal = [
+            ids::TLS_RELOAD_FAILED,
+            ids::CHANNEL_FAILED,
+            ids::AUDIT_INTEGRITY,
+        ];
         // 同一規則、同一對象取最嚴重的一項
         let mut by_rule: HashMap<&'static str, HashMap<String, SystemCondition>> = HashMap::new();
         for c in conditions {

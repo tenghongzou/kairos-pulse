@@ -1,6 +1,7 @@
 //! `kairos audit list|verify|export`：稽核日誌（`kairos/API.md` 第 12.8 節；設計包 S18）。
 //!
-//! - `verify`：重新計算雜湊鏈，指出第一個斷點；斷裂時結束代碼 9（有嚴重問題）並以 `KRS-E6201` 說明。
+//! - `verify`：重新計算雜湊鏈與 HMAC，指出第一個斷點；驗證失敗（雜湊鏈斷裂、HMAC 不符、無法驗證 HMAC）時
+//!   結束代碼 9（有嚴重問題）並以 `KRS-E6201` 說明（設計包 copywriting.md 範例 95）。
 //! - `export`：JSONL（每行一筆，含 `prev_hash` 與 `hash`，最後一行為鏈的起訖值），可離線重新計算。
 //! - 驗證與匯出本身也寫入稽核（執行者為作業系統帳號）。
 
@@ -38,7 +39,7 @@ pub const AUDIT_USAGE: &str = "kairos audit — 稽核日誌（雜湊鏈；kairo
 任何角色都不能修改或刪除稽核紀錄；保留期限由 audit.retention_days 決定（預設 1095 天）。
 
 結束代碼：0 完成（verify：雜湊鏈完整）、1 資料庫錯誤、2 用法錯誤、3 設定錯誤、
-9 雜湊鏈斷裂（KRS-E6201）、10 權限不足、11 輸出檔已存在或資料庫使用中";
+9 稽核日誌完整性驗證失敗（雜湊鏈斷裂、HMAC 不符或無法驗證 HMAC；KRS-E6201）、10 權限不足、11 輸出檔已存在或資料庫使用中";
 
 const EXIT_BROKEN: u8 = 9;
 const EXIT_CONFLICT: u8 = 11;
@@ -348,10 +349,20 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                     ..Default::default()
                 };
             }
+            // HMAC 的邊界：之前的紀錄只有雜湊鏈（0.7 之前或服務第一次以 0.7 啟動前寫入）
+            let boundary = match (report.hmac.since_id, report.first_id) {
+                (None, _) => "HMAC：尚未開始（Kairos 服務以 0.7 啟動、建立 audit-hmac.key 之後寫入的第一筆起才有）".to_string(),
+                (Some(s), Some(first)) if s > first => format!(
+                    "HMAC：第 {s} 筆起（{} 筆）；第 {first}～{} 筆只有雜湊鏈（0.7 之前寫入）",
+                    report.hmac.verified,
+                    s - 1
+                ),
+                (Some(s), _) => format!("HMAC：第 {s} 筆起（{} 筆）", report.hmac.verified),
+            };
             match &report.broken {
                 None => Output {
                     stdout: format!(
-                        "{} 稽核日誌完整：{} 筆，雜湊鏈連續（第 {}～{} 筆）\n  鏈的終點：{}\n",
+                        "{} 稽核日誌完整：{} 筆，雜湊鏈連續（第 {}～{} 筆）\n  {boundary}\n  鏈的終點：{}\n",
                         if unicode { "✓" } else { "[ OK ]" },
                         report.checked,
                         report.first_id.map_or("—".into(), |x| x.to_string()),
@@ -360,22 +371,30 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                     ),
                     ..Default::default()
                 },
-                Some(b) => Output {
-                    stderr: format!(
-                        "{} 錯誤 {CODE_CHAIN_BROKEN}：稽核日誌完整性驗證失敗\n  原因：第 {} 筆紀錄的雜湊鏈斷裂（{}）；紀錄可能被修改、刪除或插入。\n  處理方式：\n    1. 保全資料庫檔（複製 kairos.db 與 -wal），不要再寫入。\n    2. 與先前匯出（kairos audit export）或外送的副本比對，找出差異。\n",
-                        if unicode { "✗" } else { "[FAIL]" },
-                        b.id,
-                        match b.reason {
-                            "hash_mismatch" => "內容與雜湊不符",
-                            "prev_mismatch" => "與前一筆接不上",
-                            "missing_hash" => "沒有雜湊",
-                            "anchor_mismatch" => "第一筆與清除時的錨點不符",
-                            _ => "最後幾筆被刪除或最新一筆被修改",
-                        }
-                    ),
-                    exit,
-                    ..Default::default()
-                },
+                Some(b) => {
+                    let key_problem =
+                        matches!(b.reason, "hmac_key_unavailable" | "hmac_key_mismatch");
+                    Output {
+                        stderr: format!(
+                            "{} 錯誤 {CODE_CHAIN_BROKEN}：稽核日誌完整性驗證失敗\n  原因：第 {} 筆：{}。{}\n  {boundary}\n  處理方式：\n{}",
+                            if unicode { "✗" } else { "[FAIL]" },
+                            b.id,
+                            crate::audit_monitor::describe(b.reason),
+                            if key_problem {
+                                "雜湊鏈本身完整，但無法確認紀錄沒有被整段重新計算。"
+                            } else {
+                                "紀錄可能被修改、刪除或插入。"
+                            },
+                            if key_problem {
+                                "    1. 從備份還原資料目錄的 audit-hmac.key（kairos db restore-keys），再執行 kairos audit verify。\n    2. 金鑰確實遺失時，保全資料庫檔，並以外送的鏈尾雜湊（audit.chain_anchor）確認之前的紀錄。\n"
+                            } else {
+                                "    1. 保全資料庫檔（複製 kairos.db 與 -wal），不要再寫入。\n    2. 與先前匯出（kairos audit export）或外送的鏈尾雜湊（audit.chain_anchor）比對，找出差異。\n"
+                            }
+                        ),
+                        exit,
+                        ..Default::default()
+                    }
+                }
             }
         }
         AuditAction::Export { out } => {
@@ -413,6 +432,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 "type": "chain", "generated_at": fmt_time(now), "count": count,
                 "first_id": first.as_ref().map(|x| x.0), "first_prev_hash": first.and_then(|x| x.1),
                 "last_id": last.as_ref().map(|x| x.0), "last_hash": last.and_then(|x| x.1),
+                "hmac_since": audit::hmac_since(&conn).ok().flatten().map(|s| s.0),
             }).to_string());
             text.push('\n');
             note(

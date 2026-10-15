@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "kairos"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "argon2",
  "chrono",
@@ -702,6 +702,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -1025,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "pulse"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "config",
