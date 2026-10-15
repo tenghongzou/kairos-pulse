@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（89 個）
+## 2. 已對應的代碼（91 個，含 2.7 的 2 個暫定代碼）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -133,6 +133,13 @@
 | `PLS-E7101` | `enroll/machine.rs` | `license_exhausted` | 結束代碼 6 |
 | `PLS-E8302` | `enroll/machine.rs` | 註冊或過期續簽時 `clock_skew`：每 5 分鐘重送，偵測到本機時間被調整時立即 | `enroll.clock_rejected`／`cert.grace_renew_blocked`（ERROR）；身分列 ✗「相差…；校正後自動重送」；`clock.source = clock_skew` |
 | `PLS-E1403`（8444） | `enroll/cli.rs` `connect_failure` | 註冊端點的伺服器憑證依本機時間已過期或尚未生效：以「忽略有效期間」再驗證一次、只送 `server-info`，訊息中寫出未驗證的 Kairos 時間 | `clock.source = server_info_unverified`、`valid: false` |
+
+### 2.7 Windows 服務（0.8〔草稿〕，代碼〔暫定〕，設計包尚未分配）
+
+| 代碼 | 程式位置 | 觸發條件 | 看得到的地方 |
+|---|---|---|---|
+| `PLS-E8205` | `winsvc.rs` `install`、`uninstall` | 服務控制管理員回報錯誤：沒有系統管理員權限、服務 `Pulse` 已存在（install）或不存在（uninstall）、無法啟動（`--start`） | stderr，`pulse service` 結束代碼 1 |
+| `PLS-E8206` | `winsvc.rs` `run_service` | `pulse service run` 不是由服務控制管理員啟動（在主控台執行），或無法切換到 `--workdir` | stderr，結束代碼 2／1 |
 
 ## 3. 日誌事件（`log-ux.md` §4）
 

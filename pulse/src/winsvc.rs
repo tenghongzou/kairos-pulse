@@ -30,11 +30,8 @@ pub const DISPLAY_NAME: &str = "Pulse monitoring agent";
 pub const DESCRIPTION: &str =
     "Pulse：把本機的系統資訊回報給 Kairos 監控伺服器（mTLS）。設定、身分與日誌在安裝目錄下。";
 /// Windows 服務的安裝、移除、啟動失敗（需要系統管理員權限、服務已存在或不存在）〔暫定〕
-#[cfg_attr(not(windows), allow(dead_code))]
-pub const E_SERVICE_INSTALL: &str = "PLS-E8205";
-/// 服務進入點無法執行（不是由服務控制管理員啟動、工作目錄不存在）〔暫定〕
-#[cfg_attr(not(windows), allow(dead_code))]
-pub const E_SERVICE_RUN: &str = "PLS-E8206";
+#[cfg_attr(not(windows), allow(unused_imports))]
+pub use crate::codes::{E_SERVICE_INSTALL, E_SERVICE_RUN};
 
 /// `pulse service --help`
 pub const USAGE: &str = "\
