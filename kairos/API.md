@@ -335,7 +335,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 }
 ```
 
-0.8.0〔草稿〕起 `last_report` 另有（舊版 Pulse 沒有的為 `null` 或空陣列）：`filesystems`（每個掛載點 `{mountpoint, fstype, total, used, available, usage, estimated}`）、`swap`（`{total, used, usage}`）、`load`（`{"1m", "5m", "15m"}`，只有 Linux）、`process_count`、`memory_available_bytes`、`uptime_secs`、`network`（每個介面 `{device, rx_bytes_per_sec, tx_bytes_per_sec}`）、`disk_io`（每個裝置 `{device, read_bytes_per_sec, write_bytes_per_sec}`）。速率由最後兩筆 report 算出（`kairos_proto::counter_rate`：重置或重新開機時為 `null`）。`inventory` 為詳情才有序號的資產摘要；`features`：最近一次連線是否協商了 `inventory`、`processes`（Kairos 重新啟動後尚未連線時 `null`）。
+0.8.0〔草稿〕起 `last_report` 另有（舊版 Pulse 沒有的為 `null` 或空陣列）：`filesystems`（每個掛載點 `{mountpoint, fstype, total, used, available, usage, estimated}`）、`swap`（`{total, used, usage}`）、`load`（`{"1m", "5m", "15m"}`，只有 Linux）、`process_count`、`memory_available_bytes`、`uptime_secs`、`network`（每個介面 `{device, rx_bytes_per_sec, tx_bytes_per_sec}`）、`disk_io`（每個裝置 `{device, read_bytes_per_sec, write_bytes_per_sec}`）。速率由最後兩筆 report 算出（`kairos_proto::counter_rate`：重置或重新開機時為 `null`）。`inventory` 為詳情才有序號的資產摘要；`features`：最近一次連線是否協商了 `inventory`、`processes`（Kairos 重新啟動後尚未連線時 `null`）。`inventory_rejection`：這次啟動後最近一次資產被拒（`KRS-W2108`）`{at, reason, product_code}`，之後的資產保存成功時清除；`series_limited_at`：最近一次因每主機序列數上限而有指標未保存的時間（`KRS-W4104`，主機清冊中保存）。兩者供 S05 的 `InlineAlert`（設計包 §30.5 #7）。
 
 - `connection`：目前或最近一次連線的投遞資訊（Kairos 重新啟動後尚未連線時為 `null`）。`last_backfill_*`：最近一次收到補送資料的時間與當時的落後量（收到時間 − 取樣時間）。
 - `certificate_rejection`：**握手時被拒的憑證歸屬**（設計包 §24 #3、`ia.md` §5.2「憑證被拒」）：最近一次以這台主機的憑證（SAN 為 `agent_id`）連線、在 TLS 握手時被拒的時間、原因、序號與來源位址，`count` 為累計次數。`reason`：`revoked`（`KRS-W1105`）、`expired`（`KRS-W1108`）、`revocation_status_unavailable`（`KRS-E1203`，伺服器端的 CRL 問題）。沒有時為 `null`。之後成功上線的主機仍保留紀錄，但不再算作「憑證被拒」的離線原因（`offline_reason` 只在被拒時間晚於 `last_seen` 時為 `certificate_rejected`）。
@@ -532,6 +532,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - `source`：`inventory`（Pulse 回報）、`hello`（還沒有資產，`inventory` 只有 hello 的 `os`：Pulse 0.2.0～0.7.0，或 0.8.0 尚未送出）、`null`（都沒有：v1 的 Pulse，`inventory` 為 `null`）。
 - `supported`：這台主機最近一次連線是否協商了 `inventory`（Kairos 重新啟動後尚未連線時，以是否有資產判斷）。主控台據此區分「Pulse 版本不回報此資訊」與「尚未收到回報」。
 - `changed_at`：內容（摘要）最後一次改變的時間；`collected_at`：最後一次收集的時間（`inventory` 的 `ts`，不合理時為收到的時間）。
+- `last_rejection`：這次啟動後最近一次被拒的資產（`KRS-W2108`）`{at, reason, product_code}`；沒有時 `null`（同第 5.2 節的 `inventory_rejection`）。
 
 `GET /api/v1/hosts/{agent_id}/inventory/changes?limit=50&before=<id>`：
 

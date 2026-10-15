@@ -87,7 +87,10 @@ pub async fn inventory(
         .and_then(|h| h.2)
         .and_then(|b| DateTime::from_timestamp(b, 0))
         .map(crate::storage::fmt_time);
-    let data = match inv {
+    let rejection = live.as_ref().and_then(|l| l.inventory_rejected.clone()).map(|(at, reason)| {
+        json!({ "at": crate::storage::fmt_time(at), "reason": &*reason, "product_code": "KRS-W2108" })
+    });
+    let mut data = match inv {
         Some((digest, body, collected, received, changed)) => json!({
             "agent_id": agent_id,
             "supported": supported,
@@ -111,6 +114,7 @@ pub async fn inventory(
             "inventory": hello_os.map(|os| json!({ "os": os })),
         }),
     };
+    data["last_rejection"] = json!(rejection);
     Ok(super::http::ok(now, data))
 }
 

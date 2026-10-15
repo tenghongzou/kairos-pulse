@@ -127,6 +127,8 @@ pub struct DbHost {
     pub boot_time: Option<i64>,
     /// 資產摘要（`host_inventory`；沒有資產時 `None`）
     pub inventory: Option<Arc<InventorySummary>>,
+    /// 最近一次因每主機序列數上限而有指標未保存的時間（Unix 毫秒；`KRS-W4104`）
+    pub series_limited_at: Option<i64>,
 }
 
 /// 主機清單（S04）篩選與排序用的資產摘要（`host_inventory` 的冗餘欄位；METRICS.md 第 10.1 節）
@@ -162,7 +164,7 @@ impl InventorySummary {
 
 /// 清冊查詢另取的欄位：開機時間與資產摘要（以子查詢的別名避免與 `hosts` 的欄位同名）
 const HOST_EXTRA_COLUMNS: &str = "boot_time, i_os_family, i_cpu_model, i_cores, i_memory, \
-     i_vendor, i_product, i_serial";
+     i_vendor, i_product, i_serial, series_limited_at";
 const HOST_EXTRA_JOIN: &str = "LEFT JOIN (SELECT host_id AS i_host, os_family AS i_os_family, \
      cpu_model AS i_cpu_model, cpu_logical_cores AS i_cores, memory_total AS i_memory, \
      vendor AS i_vendor, product AS i_product, serial AS i_serial FROM host_inventory) \
@@ -239,6 +241,7 @@ fn host_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<DbHost> {
             // 有資產時 os_family 等至少一欄有值；全部為 NULL 視為沒有資產
             (s != InventorySummary::default()).then(|| Arc::new(s))
         },
+        series_limited_at: r.get(29)?,
     })
 }
 
@@ -1099,6 +1102,15 @@ impl Sort {
     }
 }
 
+/// `version`（SemVer）是否早於 `(major, minor)`；無法解析時 `false`
+pub fn version_before(version: &str, (major, minor): (u64, u64)) -> bool {
+    let n = version_numbers(version);
+    match (n.first(), n.get(1)) {
+        (Some(a), Some(b)) => (*a, *b) < (major, minor),
+        _ => false,
+    }
+}
+
 /// SemVer 的數字部分（`0.3.1-rc.1` → [0, 3, 1]）；無法解析的部分略過
 fn version_numbers(v: &str) -> Vec<u64> {
     v.split(['-', '+'])
@@ -1550,6 +1562,14 @@ pub async fn detail(
         None => Value::Null,
     };
     data["inventory"] = json!(view.inventory.as_deref().map(|i| i.json(true)));
+    // 設計包 §30.5 #7：S05 的 KRS-W2108、KRS-W4104 提示
+    data["inventory_rejection"] = match live.as_ref().and_then(|l| l.inventory_rejected.clone()) {
+        Some((at, reason)) => {
+            json!({ "at": ts(at), "reason": &*reason, "product_code": "KRS-W2108" })
+        }
+        None => Value::Null,
+    };
+    data["series_limited_at"] = json!(db.as_ref().and_then(|d| d.series_limited_at).map(ts_ms));
     data["features"] = match live.as_ref().filter(|l| l.seen_since_start) {
         Some(l) => json!({ "inventory": l.inventory, "processes": l.processes }),
         None => Value::Null,
@@ -1604,6 +1624,7 @@ pub(crate) mod tests {
             host_group: None,
             boot_time: None,
             inventory: None,
+            series_limited_at: None,
         }
     }
 
@@ -1634,6 +1655,7 @@ pub(crate) mod tests {
             inventory: Some(true),
             processes: Some(true),
             assets: None,
+            inventory_rejected: None,
             backfill: None,
             offline_reason: (!online).then_some(OfflineReason::Timeout),
             offline_for: None,

@@ -346,6 +346,14 @@ pub fn preview(
         ),
     };
     let mut without_metric = 0u64;
+    // 沒有回報的原因（設計包 §30.5 #5）：舊版 Pulse、Windows（負載）、沒有資料
+    let mut not_reported: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut swap_zero = 0u64;
+    let mut items_in_scope = 0u64;
+    let mut info_stmt = conn.prepare(
+        "SELECT h.agent_version, h.os, i.os_family, i.cpu_logical_cores FROM hosts h
+         LEFT JOIN host_inventory i ON i.host_id = h.host_id WHERE h.host_id = ?1",
+    )?;
     let mut fires = 0u64;
     let mut quick = 0u64;
     let mut involved = 0u64;
@@ -356,9 +364,34 @@ pub fn preview(
     let candidates = [for_secs * 3 / 2, for_secs * 2, for_secs.max(900)];
     for (host_id, agent, name) in &hosts {
         let all = host_data(conn, table, *host_id, metric, p, from, &std_ids)?;
+        if matches!(metric, m::DISK | m::NETWORK_RX | m::NETWORK_TX) {
+            items_in_scope += all.len() as u64;
+        }
         if all.iter().all(|d| d.is_empty()) {
             // 這台主機沒有回報這個指標（舊版 Pulse、Windows 的負載、沒有資產的主機）
             without_metric += 1;
+            let (version, os, family, cores): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+            ) = info_stmt.query_row([host_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            let windows = family.as_deref() == Some("windows")
+                || os.is_some_and(|o| o.to_lowercase().contains("windows"));
+            let old = version
+                .as_deref()
+                .is_some_and(|v| crate::api::hosts::version_before(v, (0, 8)));
+            let reason = match metric {
+                m::LOAD if windows => "windows",
+                m::SWAP | m::LOAD if old => "old_pulse",
+                m::LOAD if cores.is_none() => "no_inventory",
+                _ => "no_data",
+            };
+            *not_reported.entry(reason).or_default() += 1;
+        } else if metric == m::SWAP && all.iter().all(|d| d.iter().all(|(_, v)| v.is_nan())) {
+            swap_zero += 1;
         }
         let mut host_fires = 0;
         for data in &all {
@@ -440,6 +473,9 @@ pub fn preview(
         "approximate": true,
         "hosts_in_scope": hosts.len(),
         "hosts_without_metric": without_metric,
+        "not_reported": not_reported,
+        "swap_total_zero": swap_zero,
+        "items_in_scope": matches!(metric, m::DISK | m::NETWORK_RX | m::NETWORK_TX).then_some(items_in_scope),
         "fires": fires,
         "hosts_involved": involved,
         "self_recovered_within_10m": quick,
@@ -491,5 +527,85 @@ mod tests {
         let r = replay(&data(&[5.0, 5.0, 50.0]), 300, "<", 10.0, 300, None, 0);
         assert_eq!(r.fires.len(), 1);
         assert_eq!(r.fires[0].1, Some(600));
+    }
+
+    #[test]
+    fn f4_metrics_replay_per_mountpoint_and_count_hosts_without_the_metric() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::store::sqlite::migrate(&mut conn, crate::store::sqlite::MIGRATIONS).unwrap();
+        let now_ms: i64 = 1_800_000_000_000;
+        let start = now_ms / 1000 - 3600;
+        conn.execute_batch(&format!(
+            "INSERT INTO hosts (host_id, agent_id, hostname, agent_version, os, first_seen, last_seen) VALUES
+               (1, 'a', 'linux-08', '0.8.0', NULL, 0, 0),
+               (2, 'b', 'win-08', '0.8.0', '{{\"name\":\"Windows\"}}', 0, 0),
+               (3, 'c', 'linux-07', '0.7.0', NULL, 0, 0);
+             INSERT INTO host_inventory (host_id, digest, body, collected_at, received_at, changed_at, os_family, cpu_logical_cores)
+               VALUES (1, 'd', '{{}}', 0, 0, 0, 'linux', 4), (2, 'd', '{{}}', 0, 0, 0, 'windows', 8);
+             INSERT INTO series (series_id, name, unit, labels, derived) VALUES
+               (10, 'system.filesystem.usage', '%', '{{\"mountpoint\":\"/\"}}', 0),
+               (11, 'system.filesystem.usage', '%', '{{\"mountpoint\":\"/data\"}}', 0),
+               (12, 'system.filesystem.usage', '%', '{{\"mountpoint\":\"/\"}}', 2),
+               (20, 'system.cpu.load_5m', '1', '', 0);
+             INSERT INTO host_series VALUES (1, 10), (1, 11), (3, 12), (1, 20);"
+        ))
+        .unwrap();
+        // 主機 1：/ 一直 95%、/data 50%；主機 3（0.7，推算）：/ 一直 96%；負載只有主機 1（8 ÷ 4 = 2 倍）
+        for i in 0..12_i64 {
+            let b = start + i * 300;
+            for (host, series, v) in [(1, 10, 95.0), (1, 11, 50.0), (3, 12, 96.0), (1, 20, 8.0)] {
+                conn.execute(
+                    "INSERT INTO rollup_5m VALUES (?1, ?2, ?3, ?4, ?4, ?4, 1)",
+                    params![host, b, series, v],
+                )
+                .unwrap();
+            }
+        }
+        let rule = |params: Value| {
+            let mut r =
+                super::super::rules::builtin_default(super::super::rules::ids::HOST_OFFLINE)
+                    .unwrap();
+            r.kind = kind::METRIC_THRESHOLD.into();
+            r.params = params;
+            r
+        };
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let disk = preview(
+            &conn,
+            &rule(json!({"metric": "disk", "op": ">", "threshold": 90.0, "for_secs": 600})),
+            1,
+            now_ms,
+            utc,
+        )
+        .unwrap();
+        // 主機 1 的 / 與主機 3 的 /（推算）各觸發一次；/data 不觸發；主機 2 沒有磁碟資料
+        assert_eq!(disk["fires"], 2, "{disk}");
+        assert_eq!(disk["hosts_involved"], 2);
+        assert_eq!(disk["hosts_without_metric"], 1);
+        assert_eq!(disk["items_in_scope"], 3);
+        assert_eq!(disk["not_reported"]["no_data"], 1);
+        // 範圍只限 /data：不觸發
+        let scoped = preview(
+            &conn,
+            &rule(json!({"metric": "disk", "op": ">", "threshold": 90.0, "for_secs": 600, "mountpoints": ["/data*"]})),
+            1,
+            now_ms,
+            utc,
+        )
+        .unwrap();
+        assert_eq!(scoped["fires"], 0, "{scoped}");
+        // 負載：Windows 與舊版 Pulse 分開計數
+        let load = preview(
+            &conn,
+            &rule(json!({"metric": "load", "op": ">", "threshold": 1.5, "for_secs": 600})),
+            1,
+            now_ms,
+            utc,
+        )
+        .unwrap();
+        assert_eq!(load["fires"], 1, "{load}");
+        assert_eq!(load["not_reported"]["windows"], 1);
+        assert_eq!(load["not_reported"]["old_pulse"], 1);
+        assert!(load["items_in_scope"].is_null());
     }
 }

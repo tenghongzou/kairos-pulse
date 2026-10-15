@@ -1951,6 +1951,8 @@ async fn metrics_spec_examples_get_the_documented_responses() {
     // registry：協商結果與資產摘要（告警的每核心負載）
     let live = server.registry.live_get(ID).unwrap();
     assert_eq!((live.inventory, live.processes), (Some(true), Some(true)));
+    // 最近一次被拒的資產（KRS-W2108；主控台 S05 的提示）
+    assert!(live.inventory_rejected.as_ref().unwrap().1.contains("mac"));
     assert_eq!(live.assets.unwrap().logical_cores, Some(64));
     let last = live.last_report.unwrap();
     assert_eq!(last.detail.filesystems.len(), 2);

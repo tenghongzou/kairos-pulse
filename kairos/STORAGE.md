@@ -174,7 +174,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v5（0.6.0〔草稿〕，衝刺 5）：告警引擎的資料表 `alert_rules`（規則）、`alert_events`（事件，含彙總的 `parent_id`、處理狀態與通知進度 `notify_state`）、`alert_timeline`（處理紀錄）、`alert_silences`（靜音與維護時段）、`alert_channels`（通知管道；`secrets` 為 AES-256-GCM 密文）、`alert_deliveries`（發送紀錄）、`alert_actions`（CLI 交給執行中的 Kairos 處理的動作）與索引；`meta` 另有 `alerts_config_rev`（規則、靜音、管道的版本）與 `alerts_heartbeat`（停機期間的判斷）。完整的 SQL 見 `store/sqlite.rs` 的 `SCHEMA_V5`，欄位說明見 [`ALERTS.md`](ALERTS.md)。升級到 v5 之後 0.5 的 Kairos 無法開啟；`kairos alerts`、`kairos silences`、`kairos alert-rules`、`kairos alert-channels` 開啟資料庫時同樣會升級 schema。
 - v6（0.6.0〔草稿〕，衝刺 5）：使用者、角色指派、工作階段與 TOTP 復原碼（`users`、`role_assignments`、`sessions`、`user_recovery_codes`），`api_tokens` 的 `owner_user_id`、`role`，`audit_events` 的雜湊鏈欄位 `prev_hash`、`hash`（索引 `audit_events_actor`），`hosts.host_group`（角色指派的範圍）。v6 接在 v5（告警）之後，不依賴 v5 的物件；0.5.0（v4）的資料庫在第一次啟動時依序升級 v5 → v6（各自一個交易），既有的 API token 權限不變（凍結在 0.5，沒有告警與使用者等新權限）。完整的說明見 [`API.md`](API.md) 第 12.10 節。升級後 0.5 的 Kairos 無法開啟；`kairos users`、`kairos audit` 開啟資料庫時同樣會升級 schema。密碼只存 Argon2id 雜湊、工作階段只存 SHA-256、TOTP 秘密以 `data/console.key` 加密（金鑰不在資料庫中，`kairos db backup` 不含它）。
 - v7（0.7.0〔草稿〕，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
-- v8（0.8.0〔草稿〕，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v8（0.8.0〔草稿〕，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -634,7 +634,7 @@ sudo systemctl start kairos
 
 ### 15.3 每台主機的序列數上限
 
-`host_series` 記錄每台主機用過的序列（含衍生序列；主控台 API 以它只列出這台主機的序列）。數量達到 `storage.max_series_per_host`（預設 2048，64～65,536）時，新序列的指標**不保存**，同一筆的其他指標照存並回 `ack`，記 `WARN`「警告 KRS-W4104〔暫定〕：主機 … 的指標序列數已達上限 …」（每台主機每小時最多一次）。原因多半是介面或掛載點名稱不斷變化（容器網路）；全域上限 1,000,000（`SERIES_FULL`）不變。`host_series` 不會自動清除（之後的版本再考慮依彙總的保留期限清除）。
+`host_series` 記錄每台主機用過的序列（含衍生序列；主控台 API 以它只列出這台主機的序列）。數量達到 `storage.max_series_per_host`（預設 2048，64～65,536）時，新序列的指標**不保存**，同一筆的其他指標照存並回 `ack`，記 `WARN`「警告 KRS-W4104：主機 … 的指標序列數已達上限 …」（每台主機每小時最多一次），並記下 `hosts.series_limited_at`（主控台 S05 的提示）。原因多半是介面或掛載點名稱不斷變化（容器網路）；全域上限 1,000,000（`SERIES_FULL`）不變。`host_series` 不會自動清除（之後的版本再考慮依彙總的保留期限清除）。
 
 ### 15.4 資產與變更歷史
 

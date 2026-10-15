@@ -24,7 +24,7 @@ rollup_1h_retention_days = 400 # 1 小時彙總保留天數，0 = 不依時間�
 max_total_bytes = 68719476736 # SQLite 資料庫的總容量上限（bytes，預設 64 GiB；0 = 不限制，否則至少 64 MiB）；超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總。小於估算量時啟動會記 WARN
 sqlite_synchronous = "normal" # normal：commit 寫入作業系統即 ack（與 JSONL 相同，斷電可能遺失最後幾個交易）；full：每次 commit 都 fsync
 # max_hosts = 100000          # 主機清冊最多幾台（limits.max_agents..=1000000）；未設定時為 max(100000, limits.max_agents)
-max_series_per_host = 2048    # 每台主機最多幾個指標序列（64～65536；含速率與推算序列）；超過時新序列的指標不保存（KRS-W4104〔暫定〕），其他照存
+max_series_per_host = 2048    # 每台主機最多幾個指標序列（64～65536；含速率與推算序列）；超過時新序列的指標不保存（KRS-W4104），其他照存
 retention_days = 30           # JSONL（backend = "jsonl" 或鏡像）reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
 max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制；backend = "jsonl" 時達到後當天的 report 回 storage_unavailable（鏡像只是不再寫入鏡像）。寫 JSONL 且設定值小於 max_connections × 每秒 1 則 × 約 250 bytes × 86400 時，啟動會記 WARN
 

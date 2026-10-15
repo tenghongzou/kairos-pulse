@@ -123,8 +123,9 @@ pub mod metric {
     }
 }
 
-/// `params.mountpoints`、`params.devices` 最多幾個 glob
-pub const MAX_SCOPE_GLOBS: usize = 32;
+/// `params.mountpoints`、`params.devices` 最多幾個 glob（設計包 §30.5 #11：與 Pulse 每台最多 16 個掛載點、
+/// 16 個介面一致）
+pub const MAX_SCOPE_GLOBS: usize = 16;
 
 /// glob 比對（`*` 任意字元、`?` 單一字元；區分大小寫）
 pub fn glob_match(pattern: &str, text: &str) -> bool {

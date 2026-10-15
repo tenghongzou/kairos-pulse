@@ -260,7 +260,7 @@ fn classify(frame: Frame) -> Incoming {
     }
 }
 
-/// 資產資訊不合法（METRICS.md 第 14 節；暫定號，待設計組正式分配）
+/// 資產資訊不合法（METRICS.md 第 14 節；設計包 `copywriting.md` 範例 96，2026-10-15 正式分配）
 pub const CODE_INVALID_INVENTORY: &str = "KRS-W2108";
 
 /// 一個 MB（agents.json 的 `total_memory`／`used_memory` 單位，與 v1 report 相同）
@@ -1857,7 +1857,7 @@ impl Conn {
     }
 
     /// `inventory`（協商了 feature `inventory`；METRICS.md 第 6.2 節）：內容不符 `validate_inventory` →
-    /// `invalid_report`（`KRS-W2108`〔暫定〕）；距離上一則不到 60 秒 → `storage_unavailable`；保存後 `ack`，
+    /// `invalid_report`（`KRS-W2108`）；距離上一則不到 60 秒 → `storage_unavailable`；保存後 `ack`，
     /// 寫入失敗 → `storage_unavailable`。計入訊息速率與連續無效訊息，不計入 report 的速率限制
     async fn handle_inventory(
         &mut self,
@@ -1876,13 +1876,16 @@ impl Conn {
                 self.throttle,
                 (Category::InvalidReport, self.peer.ip()),
                 warn,
-                "警告 {}〔暫定〕：[#{}] agent {} 的資產資訊（inventory seq={}）不合法，不保存: {}",
+                "警告 {}：已拒絕 {}（agent {}）送出的資產資訊：內容不合法：{}。這一次的資產資訊（inventory seq={}）沒有保存，主控台仍顯示上一次的內容；指標回報不受影響。處理方式：確認這台主機的 Pulse 是正式版本，若是請以 pulse diag 產生診斷包並回報 [#{}]",
                 CODE_INVALID_INVENTORY,
-                self.conn_id,
+                agent.hostname.escape_debug(),
                 agent.agent_id,
+                message,
                 seq,
-                message
+                self.conn_id
             );
+            ctx.registry
+                .set_inventory_rejected(&agent.agent_id, self.conn_id, &message);
             let flow = self
                 .reply(ServerMsg::error(
                     Some(seq),

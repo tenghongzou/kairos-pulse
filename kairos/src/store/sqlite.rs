@@ -651,6 +651,7 @@ INSERT OR IGNORE INTO host_series (host_id, series_id)
     SELECT DISTINCT host_id, series_id FROM rollup_5m;
 
 ALTER TABLE hosts ADD COLUMN boot_time INTEGER;
+ALTER TABLE hosts ADD COLUMN series_limited_at INTEGER;
 
 CREATE TABLE host_inventory (
     host_id           INTEGER PRIMARY KEY REFERENCES hosts (host_id) ON DELETE CASCADE,
@@ -806,7 +807,7 @@ const META_RETENTION_GUARD: &str = "retention_guard";
 /// 日誌中稱呼 SQLite 中的資料的名稱（DateGuard 的事件訊息）
 const GUARD_LABEL: &str = " SQLite 資料";
 
-/// 每台主機的序列數已達上限（METRICS.md 第 9.1、14 節；暫定號，待設計組正式分配）
+/// 每台主機的序列數已達上限（METRICS.md 第 9.1、14 節；設計包 `copywriting.md` 範例 97，2026-10-15 正式分配）
 pub const CODE_SERIES_CAPPED: &str = "KRS-W4104";
 /// 同一台主機「序列數已達上限」的日誌間隔
 const SERIES_CAP_LOG_INTERVAL: Duration = Duration::from_secs(3600);
@@ -1592,7 +1593,7 @@ pub struct SqliteStore {
     rollup_stale: bool,
     /// 主機清冊中尚未寫入的列（最新一份快照中有變化的主機），每次維護步驟寫入一批
     pending_inventory: VecDeque<InventoryRow>,
-    /// 每台主機上次記錄「序列數已達上限」的時間（`KRS-W4104`〔暫定〕）
+    /// 每台主機上次記錄「序列數已達上限」的時間（`KRS-W4104`）
     series_cap_logged: HashMap<String, Instant>,
     /// 測試用的失敗注入
     pub(crate) fail_next: Option<FailPoint>,
@@ -1842,6 +1843,12 @@ impl SqliteStore {
                         }
                         if dropped > 0 {
                             capped.push((r.agent_id.clone(), dropped));
+                            // 主控台 S05 的提示（設計包 §30.5 #7）
+                            tx.execute(
+                                "UPDATE hosts SET series_limited_at = ?2 WHERE host_id = ?1",
+                                params![host_id, recv_ms],
+                            )
+                            .map_err(before)?;
                         }
                         codec::encode_metrics(buf, kept.iter().map(|(id, m, _)| (*id, &m.value)));
                         FORMAT_METRICS
@@ -1954,7 +1961,7 @@ impl SqliteStore {
         tx.commit().map_err(BatchError::Commit)
     }
 
-    /// 每台主機的序列數已達上限、部分指標未保存（`KRS-W4104`〔暫定〕；每台主機每小時最多記一次）
+    /// 每台主機的序列數已達上限、部分指標未保存（`KRS-W4104`；每台主機每小時最多記一次）
     fn log_series_capped(&mut self, capped: Vec<(String, usize)>) {
         let now = Instant::now();
         for (agent_id, dropped) in capped {
@@ -1970,7 +1977,7 @@ impl SqliteStore {
             }
             self.series_cap_logged.insert(agent_id.clone(), now);
             warn!(
-                "警告 {CODE_SERIES_CAPPED}〔暫定〕：主機 {agent_id} 的指標序列數已達上限 {}（storage.max_series_per_host），這筆 report 中 {dropped} 個新序列的指標未保存，其他照常保存。常見原因是介面或掛載點名稱不斷變化（例如容器網路）；處理方式：在 Pulse 以 collect.interface_exclude 排除，或調高 storage.max_series_per_host（每台主機每小時最多記錄一次）",
+                "警告 {CODE_SERIES_CAPPED}：主機 {agent_id} 的指標序列數已達上限（{}，storage.max_series_per_host），部分指標未保存：這筆 report 中 {dropped} 個新序列的指標未保存，既有的序列照常保存。常見原因是網路介面名稱不斷變化（例如容器的虛擬介面）或大量自訂指標；處理方式：在這台主機的 pulse.toml 以 collect.interface_exclude 排除這些介面並重新啟動 Pulse，確實需要更多序列時調高 storage.max_series_per_host（每台主機每小時最多記錄一次）",
                 self.opts.max_series_per_host
             );
         }

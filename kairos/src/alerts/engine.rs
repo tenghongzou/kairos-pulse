@@ -1543,7 +1543,7 @@ impl Engine {
             agent_id,
             Signal {
                 severity: rule.severity,
-                title: format!("{name} 重新開機"),
+                title: format!("{name} 已重新開機"),
                 code: None,
                 agent_id: Some(agent_id.to_string()),
                 details: json!({
@@ -1552,6 +1552,7 @@ impl Engine {
                     "uptime_secs": uptime_secs,
                     "previous_uptime_secs": previous_uptime_secs,
                     "boot_time": boot_time,
+                    "note": "這段期間的磁碟讀寫與網路速率沒有資料（計數器重置）",
                 }),
                 episode: Some(at),
                 parent: None,

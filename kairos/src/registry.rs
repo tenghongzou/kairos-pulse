@@ -144,6 +144,8 @@ pub struct LiveAgent {
     pub processes: Option<bool>,
     /// 這次啟動後最近一次保存的資產摘要
     pub assets: Option<Arc<AssetSummary>>,
+    /// 這次啟動後最近一次資產被拒（`KRS-W2108`）的時間與原因
+    pub inventory_rejected: Option<(DateTime<Utc>, Arc<str>)>,
     pub backfill: Option<Backfill>,
     pub offline_reason: Option<OfflineReason>,
     /// 離線多久了（線上時為 `None`；由主機清冊載回的主機以載回的時間起算）
@@ -430,6 +432,8 @@ pub struct AgentState {
     pub processes: Option<bool>,
     /// 最近一次保存的資產摘要（[`Registry::set_assets`]）
     pub assets: Option<Arc<AssetSummary>>,
+    /// 最近一次資產被拒（`KRS-W2108`）的時間與原因（[`Registry::set_inventory_rejected`]）
+    pub inventory_rejected: Option<(DateTime<Utc>, Arc<str>)>,
     /// 最近一次收到補送的資料（[`Registry::note_backfill`]）
     pub backfill: Option<Backfill>,
     /// 最近一次離線的原因（線上時保留上一次的值，供詳情顯示）
@@ -759,6 +763,7 @@ impl Registry {
         let mut was_online = false;
         let mut previous_reason = None;
         let mut previous_assets = None;
+        let mut previous_rejected = None;
         let mut superseded_peer = None;
         let (kind, last_report, key) = match inner.remove(&info.agent_id) {
             None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
@@ -766,6 +771,7 @@ impl Registry {
                 was_online = prev.online;
                 previous_reason = prev.offline_reason;
                 previous_assets = prev.assets.take();
+                previous_rejected = prev.inventory_rejected.take();
                 if let (Some(old), Some(new)) = (fingerprint(&prev.host), fingerprint(&info.host))
                     && old != new
                 {
@@ -819,6 +825,7 @@ impl Registry {
                 inventory: None,
                 processes: None,
                 assets: previous_assets,
+                inventory_rejected: previous_rejected,
                 backfill: None,
                 offline_reason: previous_reason,
                 kick_reason: None,
@@ -898,6 +905,7 @@ impl Registry {
                     inventory: None,
                     processes: None,
                     assets: None,
+                    inventory_rejected: None,
                     backfill: None,
                     offline_reason: None,
                     kick_reason: None,
@@ -983,6 +991,18 @@ impl Registry {
             && state.conn_id == conn_id
         {
             state.assets = Some(Arc::new(assets));
+            // 之後的資產已保存：不再顯示「最近一次被拒」
+            state.inventory_rejected = None;
+        }
+    }
+
+    /// 資產被拒（`KRS-W2108`）：記下時間與原因（主控台 S05 的提示）；conn_id 不符時不更新
+    pub fn set_inventory_rejected(&self, agent_id: &str, conn_id: u64, reason: &str) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+        {
+            state.inventory_rejected = Some((Utc::now(), Arc::from(reason)));
         }
     }
 
@@ -1057,6 +1077,7 @@ impl Registry {
             inventory: s.inventory,
             processes: s.processes,
             assets: s.assets.clone(),
+            inventory_rejected: s.inventory_rejected.clone(),
             backfill: s.backfill,
             offline_reason: s.offline_reason,
             offline_for: if s.online {

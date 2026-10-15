@@ -113,7 +113,7 @@ subnet_prefix_v6 = 64
 | `sys.identity_conflict` | 身分衝突 | `window_secs`（3600）內被取代 ≥ `min_count`（5）次、來源 ≥ `min_sources`（2）個 | 嚴重 | `KRS-W3102` | 匯流排 |
 | `sys.cert_rejected` | 憑證被拒（單機） | 握手時被拒的憑證歸屬到主機（已撤銷 `KRS-W1105`、過期 `KRS-W1108`），或 `auth_failed`（`KRS-W1102`）；管理員撤銷（PKI 中已撤銷的序號）、已除役的主機、主機之後已上線者不觸發 | 嚴重 | 同左 | `tls::rejections`、匯流排 |
 | `sys.host_decommissioned` | 主機自行除役 | 每台一則紀錄；之前觸發的主機事件自動結束 | 資訊 | — | 匯流排 |
-| `sys.host_rebooted` | 主機重新開機（0.8〔草稿〕，D5） | `system.uptime` 變小（需要 Pulse 0.8.0）；建立後立即結案，只留紀錄、**不通知**，不需要確認 | 資訊（紀錄） | — | 匯流排（`host_rebooted`） |
+| `sys.host_rebooted` | 主機重新開機（0.8〔草稿〕，D5） | `system.uptime` 變小（需要 Pulse 0.8.0）；標題「{主機} 已重新開機」，內容有前後的運作時間與推算的開機時間；建立後立即結案，只留紀錄、**不通知**，不需要確認 | 資訊（紀錄） | — | 匯流排（`host_rebooted`） |
 | `sys.mass_decommission` | 短時間大量除役 | 10 分鐘內 ≥ 20 台；60 分鐘沒有新的除役時恢復 | 警告 | `KRS-W3108` | 匯流排 |
 | `sys.subnet_offline`、`sys.mass_offline`、`sys.restart_unrecovered` | 第 5.2 節 | | 緊急、緊急、嚴重 | — | 狀態表 |
 | `sys.crl_expiring` | CRL 即將到期 | 剩 7／3／1 天 | 警告→嚴重→緊急 | `KRS-W1201` | TLS 設定的到期日 |
@@ -149,9 +149,9 @@ subnet_prefix_v6 = 64
 | `load` | 5 分鐘平均負載 ÷ 邏輯處理器數（倍；處理器數取自資產） | 0～100 | 每台主機；Windows（沒有負載）與沒有資產的主機沒有值 |
 | `network_rx`、`network_tx` | 每個介面的接收／傳送速率 Mbps（位元組速率 × 8 ÷ 10⁶） | 0～1,000,000 | 每個介面（`<agent_id>\|<介面>`）；`params.devices`（選用，glob）限定範圍 |
 
-- glob 只支援 `*`、`?`，區分大小寫，每個清單最多 32 個；`mountpoints` 只用於 `disk`、`devices` 只用於網路，其他組合 `KRS-E5001`。
+- glob 只支援 `*`、`?`，區分大小寫，每個清單最多 16 個（設計包 §30.5 #11）；`mountpoints` 只用於 `disk`、`devices` 只用於網路，其他組合 `KRS-E5001`。
 - 評估方式不變：每 5 秒以狀態表的最近一次 report 判斷（`LastReport` 另保存每個掛載點的使用率、置換空間、負載、介面與磁碟的速率；速率以最後兩筆 report 算出）。離線主機沒有值。
-- 預覽與回測（`POST /api/v1/alert-rules/preview`）以 `rollup_5m` 的平均值重播：磁碟用 `system.filesystem.usage`（沒有時用推算值），網路用速率序列，負載用資產的處理器數。回應另帶 `hosts_without_metric`（範圍內沒有這個指標資料的台數，「符合主機數」照算），`notes` 有對應的說明。
+- 預覽與回測（`POST /api/v1/alert-rules/preview`）以 `rollup_5m` 的平均值重播：磁碟用 `system.filesystem.usage`（沒有時用推算值），網路用速率序列，負載用資產的處理器數。回應另帶 `hosts_without_metric`（範圍內沒有這個指標資料的台數，「符合主機數」照算）、`not_reported`（原因的台數：`old_pulse`（Pulse 0.8.0 以前，置換空間與負載）、`windows`（負載）、`no_inventory`（負載，沒有資產的處理器數）、`no_data`）、`swap_total_zero`（置換空間總量為 0）、`items_in_scope`（磁碟與網路：涉及的掛載點／介面數），`notes` 有對應的說明（設計包 §30.5 #5）。
 - 範本（`alerts-ux.md` §2.2，主控台 S09）：「磁碟使用率 > 90% 持續 10 分鐘，低於 85% 恢復」（警告）、「磁碟使用率 > 95% 持續 5 分鐘」（嚴重）。
 
 ### 5.4 靜音與維護時段（§4；D23、D26）

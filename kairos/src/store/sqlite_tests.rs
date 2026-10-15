@@ -1823,6 +1823,13 @@ fn per_host_series_limit_drops_only_new_series() {
         .unwrap();
     assert_eq!(codec::decode_metrics(&body).unwrap().len(), 4);
     assert!(store.series_cap_logged.contains_key(A));
+    assert_eq!(
+        count(
+            &mut store,
+            "SELECT count(*) FROM hosts WHERE series_limited_at IS NOT NULL"
+        ),
+        1
+    );
     // 另一台主機有自己的上限
     assert_eq!(
         store.write(&[f4_record(B, 1, noon(), 1, 1)]),

@@ -74,14 +74,14 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 #### 新增
 
-- **協定**：依儲存後端宣告 `inventory`、`processes`（JSONL 不宣告）；`inventory` 的驗證、每條連線 60 秒的間隔、保存與回應（`invalid_report` 記 `KRS-W2108`〔暫定〕）；report 的 `processes` 驗證（型別錯誤 `bad_request`、內容不符 `invalid_report`）與保存。
-- **儲存（schema v8）**：計數器的每秒速率序列（重置、重新開機、晚到的資料沒有速率；重新啟動後以原始資料接續）、Pulse 0.2.0～0.7.0 的推算磁碟使用率（`derived = 2`）、每台主機的序列數上限 `storage.max_series_per_host`（預設 2048，超過時新序列不保存並記 `KRS-W4104`〔暫定〕）、資產（合併）與變更歷史（IPv6 暫時位址輪換不記）、行程快照（保留期限與容量刪除同原始資料）、`hosts.boot_time`。STORAGE.md 第 15 節。
+- **協定**：依儲存後端宣告 `inventory`、`processes`（JSONL 不宣告）；`inventory` 的驗證、每條連線 60 秒的間隔、保存與回應（`invalid_report` 記 `KRS-W2108`）；report 的 `processes` 驗證（型別錯誤 `bad_request`、內容不符 `invalid_report`）與保存。
+- **儲存（schema v8）**：計數器的每秒速率序列（重置、重新開機、晚到的資料沒有速率；重新啟動後以原始資料接續）、Pulse 0.2.0～0.7.0 的推算磁碟使用率（`derived = 2`）、每台主機的序列數上限 `storage.max_series_per_host`（預設 2048，超過時新序列不保存並記 `KRS-W4104`）、資產（合併）與變更歷史（IPv6 暫時位址輪換不記）、行程快照（保留期限與容量刪除同原始資料）、`hosts.boot_time`。STORAGE.md 第 15 節。
 - **API**：`GET /api/v1/hosts/{id}/inventory`、`…/inventory/changes`、`…/processes`（權限 `hosts:read`）；趨勢的 `transform`、`kind`、`derived`、推算的點；指標清單的 `kind`、`standard`；主機清單的 `inventory`（不含序號）、`os_family`、`boot_time`、`uptime_secs`、`last_report.disk`，篩選 `os_family`、排序 `disk`、`uptime`，facets 的 `os_family`；詳情的檔案系統、置換空間、負載、行程數、網路與磁碟速率、資產（含序號）；總覽 `top_disk`。API.md 第 5.1～5.4、5.9、5.10 節。
 - **告警**：指標門檻新增 `disk`（每個掛載點各自觸發與恢復、`mountpoints` 範圍）、`swap`、`load`（每核心）、`network_rx`／`network_tx`（Mbps、`devices` 範圍）；預覽與回測支援新指標並列出沒有回報的主機數。新的內建規則 **`sys.host_rebooted`「主機重新開機」**（資訊、不通知、預設啟用；D5），內建規則共 31 條。ALERTS.md 第 5.3 節。
 
 #### 代碼（暫定號，待設計組正式分配）
 
-- `KRS-W2108`〔暫定〕資產資訊不合法；`KRS-W4104`〔暫定〕主機的指標序列數已達上限，部分指標未保存。
+- `KRS-W2108`資產資訊不合法；`KRS-W4104`主機的指標序列數已達上限，部分指標未保存。
 
 ### Pulse（指標擴充，審計 F4）
 

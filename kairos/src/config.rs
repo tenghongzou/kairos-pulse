@@ -508,7 +508,7 @@ pub struct StorageSettings {
     /// `max(100000, limits.max_agents)`，見 [`AppConfig::max_hosts`]
     pub max_hosts: Option<usize>,
     /// 每台主機最多幾個指標序列（含 Kairos 算出的速率與推算序列）。超過時新序列的指標不保存
-    /// （`KRS-W4104`〔暫定〕），其餘照存並回 `ack`（METRICS.md 第 9.1 節）
+    /// （`KRS-W4104`），其餘照存並回 `ack`（METRICS.md 第 9.1 節）
     pub max_series_per_host: usize,
 }
 
