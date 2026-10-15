@@ -844,11 +844,10 @@ async fn hosts_metrics_overview_and_health_over_https() {
     assert_eq!(item("metrics")["status"], "ok");
     assert_eq!(item("metrics")["summary"], "只接受本機（loopback）");
     assert_eq!(item("metrics")["values"]["token"], false);
-    assert_eq!(
-        item("alerts")["summary"],
-        "已停用（alerts.enabled = false）"
-    );
-    assert!(item("alerts").get("restricted").is_none());
+    // 0.4 的 read 範圍 token 沒有 alerts:read（告警是 0.6 才有）：只有狀態，細節省略
+    assert_eq!(item("alerts")["status"], "ok");
+    assert_eq!(item("alerts")["restricted"], true);
+    assert_eq!(item("alerts")["summary"], "");
     assert!(
         !items
             .iter()
