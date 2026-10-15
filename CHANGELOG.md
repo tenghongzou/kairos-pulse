@@ -2,7 +2,7 @@
 
 本檔案記錄 Kairos、Pulse 與共用 crate 值得注意的變更，格式依 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)。
 
-Kairos 與 Pulse 自 0.2.0 起各自採用 [SemVer](https://semver.org/lang/zh-TW/)：`--version` 印出 `<名稱> <版本> (<commit>)`，發佈包為 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz`。1.0 之前，破壞性變更升 MINOR（0.2 → 0.3），其餘升 PATCH。0.2.0 之前的建置一律顯示 `0.1.0 (<commit>)`，只能以 commit 區分。版本規則、打 tag 與發佈流程見 [RELEASING.md](RELEASING.md)（只在原始碼 repo 中）。
+Kairos 與 Pulse 自 0.2.0 起各自採用 [SemVer](https://semver.org/lang/zh-TW/)：`--version` 印出 `<名稱> <版本> (<commit>)`，發佈包為 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`（0.7 以前只有 `linux-x86_64.tar.gz`；0.8.0〔草稿〕起另有 aarch64、deb、rpm 與 Pulse 的 Windows zip／msi）。1.0 之前，破壞性變更升 MINOR（0.2 → 0.3），其餘升 PATCH。0.2.0 之前的建置一律顯示 `0.1.0 (<commit>)`，只能以 commit 區分。版本規則、打 tag 與發佈流程見 [RELEASING.md](RELEASING.md)（只在原始碼 repo 中）。
 
 各項後的代號（例如 S1、A11）對應商業審計的項目編號。
 
@@ -43,12 +43,66 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | PATCH 版本 | 同一 MINOR 版本線內不含破壞性變更，可直接升級 |
 | Kairos／Pulse 混用 | 保證相鄰兩個 MINOR 版本線可以混用（例如 Kairos 0.3 搭配 Pulse 0.2），以便分批升級〔待定〕 |
 | 終止支援通知 | 至少提前〔待定：建議 3 個月〕在本檔案與發佈公告中通知 |
-| 平台 | Linux x86_64（musl 靜態連結）、systemd 247 以上；其他平台目前不提供發佈包 |
+| 平台 | Linux x86_64、aarch64（musl 靜態連結；aarch64 自 0.8.0〔草稿〕起）、systemd 247 以上；Pulse 另有 Windows x86_64（0.8.0〔草稿〕起，**未在 Windows 實機驗證前不列入支援**）；macOS 不提供 |
 | 1.0 之後 | 另訂長期支援（LTS）政策〔待定〕 |
 
 ## [Unreleased]
 
 （0.6.0〔草稿〕之後的變更記在這裡。）
+
+## [0.8.0] - 〔草稿：發佈日期待定〕
+
+〔草稿〕**Kairos 0.8.0、Pulse 0.8.0**（分支 `sprint7/packaging`；`Cargo.toml` 的版本尚未調整，整合時一併改為 0.8.0）：衝刺 7 的**安裝與平台**（商業審計 O4、O5）。**協定、資料庫 schema、設定欄位都不變**，0.7 與 0.8 的任何組合都能連線。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **`kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`**（`kairos pki init` 的根 CA 暫存目錄對服務不可見；目錄不存在時沒有影響） | 自行把 Kairos 需要讀取的檔案放在 `/opt/kairos/root-ca` 的部署（不應如此） | 不需要動作；換上新版 unit 後 `systemctl daemon-reload` |
+| 2 | 兩者 | **發佈檔的種類與檔名增加**：`linux-aarch64`、`.deb`、`.rpm`，Pulse 另有 `windows-x86_64.zip`／`.msi` 與 `pulse-install.sh`；`SHA256SUMS` 的列數增加 | 以檔名樣式抓取 `dist/` 或 `SHA256SUMS` 的自動化（例如只預期 4 個檔案） | 依新的檔名調整；既有的 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz` 不變 |
+
+**升級步驟**：tar.gz 安裝的部署照 INSTALL 第 11 節換執行檔即可（設定不變）。**不要**把既有的 tar.gz 安裝直接改裝成 deb／rpm（套件的預設設定是全新安裝用的；兩者版面相同，但 unit 改放 `/usr/lib/systemd/system`）。
+
+### Kairos：`kairos pki`（O5）
+
+- **`kairos pki init`**：一個指令建立根 CA（ECDSA P-384、`pathlen:1`、10 年）、伺服器憑證（P-256、SAN＝`--name`、EKU `serverAuth`、`CA:FALSE`、825 天）與代理簽發 CA（沿用 `issuing-ca new`／`install` 的程式碼與儲存，自動啟用線上簽發），並寫出 `data/pki/issuing-cas.pem` 作為 `auth.client_ca`。只能執行一次（已有簽發 CA 或任何檔案已存在時結束代碼 11）；寫稽核 `pki.init`；提醒把根 CA 私鑰移到離線保存（`KRS-W1306`〔暫定〕）。INSTALL 不再需要手寫 `ca.cnf`（舊流程移到附錄 P）。
+- **`kairos pki sign --profile server|issuing-ca|client`**：在 CA 主機簽發伺服器憑證（`--csr` 或 `--new-key`）、代理簽發 CA、用戶端憑證；簽發者可以是 P-256、P-384 或既有的 RSA 根 CA（PKCS#8）。CSR 驗證簽章、擴充欄位一律不複製；CA 私鑰權限不是 0600 時拒絕（`KRS-E1307`〔暫定〕）；輸出檔不覆寫；簽發前先在私鑰旁的 `kairos-ca.log`（0600）附加紀錄。
+- **`kairos pki gencrl`**：線上模式呼叫主控台 S15「立即產生 CRL」的同一個函式（`PkiManager::regenerate_crl`，寫稽核 `crl.generate`）；離線模式（`--ca-cert`／`--ca-key`）依 `kairos pki revocations export` 匯出的 `kairos-revocations/v1` 產生 CRL，版本單調遞增。
+- 規格與設計取捨：`PKI.md` 第 15 節（含待決定事項：既有部署以根 CA／代理 CA 當 `auth.client_ca` 時，退役的簽發 CA 簽出的憑證仍可能經由那一組驗證器通過；根 CA 私鑰的加密保存）。
+
+### 套件與安裝（O5）
+
+- **deb／rpm**（nfpm 2.47.0，在建置容器內產生）：Kairos 與 Pulse 各一個，x86_64 與 aarch64。版面與 tar.gz 相同（`/opt/<名稱>`），加上 `/usr/lib/systemd/system/<名稱>.service`、`/usr/bin/<名稱>`；預設設定為 config（升級不覆寫）；安裝前建立系統帳號，安裝後建立可寫目錄（Pulse 另產生 `agent.id`）、`systemctl enable`（不啟動），升級時 `try-restart`，移除時 `disable --now`；移除與 purge 都不刪除 Kairos 的資料目錄。Kairos 套件的預設設定以絕對路徑指向 `kairos pki init` 寫出的檔案，安裝後只要 `pki init` 與 `systemctl start`（INSTALL 第 A 節）。
+- **`pulse-install.sh`**（一行安裝腳本）：以從另一個管道取得的 `allowed_signers` 驗證 `SHA256SUMS` 的簽章 → 依架構與套件管理員選出套件、核對 SHA-256（不接受 `-dirty`）→ 安裝 → `pulse enroll --install-string`（安裝字串可由環境變數傳入）→ 啟動服務。也支援已下載好的目錄（`--dir`，離線環境）。
+- **Ansible role（最小版）**：`packaging/ansible/`（role `pulse`、範例 `site-pulse.yml`），做與安裝腳本相同的驗證、安裝與註冊；只經過 syntax-check，尚未對實際主機執行（Pulse 的 INSTALL 第 A.4 節）。Kairos 沒有 role。
+
+### Pulse：Windows（O4）
+
+- **Windows 服務**：`pulse service install|uninstall|run`（`windows-service` 0.8.1）。服務 `Pulse`、自動啟動、LocalSystem、失敗時 10 秒後重新啟動（一天最多 3 次）。`service run` 先把工作目錄切換到 `pulse.exe` 所在目錄（或 `--workdir`），**不再落在 `C:\Windows\System32`**；停止與關機要求與 Ctrl+C 相同地送出 close_notify 後結束。新增暫定代碼 `PLS-E8205`、`PLS-E8206`〔暫定〕。
+- **MSI**（msitools 0.106 的 `wixl`，在 Linux 建置容器內產生）：安裝到 `C:\Program Files\Pulse\`、註冊服務（不加入 PATH：wixl 的 `<Environment>` 無法重現）；`pulse.toml` 升級與移除都保留；MajorUpgrade。另有內容相同的 zip。
+- **未在 Windows 實機驗證**（只在 kp-build 交叉編譯、clippy 與產生 MSI）：服務的安裝與啟停、MSI 的安裝／升級／移除、工作目錄、`pulse enroll` 重新啟動服務、檔案 ACL 都待在 Windows 上測試。Windows 事件記錄、MSI 的安裝字串參數與移除時的 `pulse decommission`、程式碼簽章仍未做。
+
+### 平台與發佈（O4）
+
+- **aarch64 Linux（musl）**：Kairos、Pulse 都以 cargo-zigbuild 0.23.4＋zig 0.16.0 交叉編譯，以 qemu-aarch64 在建置容器內執行 `--version` 確認。
+- 發佈腳本（`packaging/build-release-common.sh`）改為多目標：`TARGETS`（預設 Kairos 為 Linux x86_64／aarch64，Pulse 另加 Windows x86_64）、`PACKAGES`（預設 `deb rpm`）、`BUILD_JOBS`（容器內 cargo 的平行數，預設 2）。THIRD-PARTY-LICENSES 與 SBOM 每個目標各自產生（Windows 的依賴不同）。
+- **可重現**：所有新產物以 commit 時間為時間戳記（tar、zip〔TZ=UTC〕、nfpm 的 `mtime`、MSI〔libfaketime〕），MSI 的 PackageCode／ProductCode 由版本與 commit 推導，Windows 執行檔以 `--no-insert-timestamp` 連結；`packaging/check-reproducible.sh` 比對所有產物。
+- 建置容器多安裝的 Alpine 套件（版本固定）：`zig`、`qemu-aarch64`、`mingw-w64-gcc`、`msitools`、`libfaketime`、`zip`；nfpm 以固定版本下載並核對 SHA-256。
+
+### 新的產品代碼〔暫定，需設計包分配〕
+
+| 代碼 | 等級 | 何時 |
+|---|---|---|
+| `KRS-W1306` | 警告 | `kairos pki init` 完成時：根 CA 私鑰仍在這台伺服器上 |
+| `KRS-E1307` | 錯誤 | `kairos pki sign`、離線 `kairos pki gencrl`：CA 憑證或私鑰無法使用 |
+| `PLS-E8205` | 錯誤 | `pulse service install`／`uninstall`：服務控制管理員回報錯誤（多半是沒有系統管理員權限） |
+| `PLS-E8206` | 錯誤 | `pulse service run` 不是由服務控制管理員啟動，或工作目錄無法切換 |
+
+### 測試
+
+- Kairos：`pki::ca`（根 CA 擴充欄位、伺服器憑證通過 webpki 的 `serverAuth` 與名稱驗證、簽發 CA 通過 `issuing-ca install` 的檢查、既有 RSA 根 CA、CSR 簽章、離線 CRL 與撤銷清單、`pki init` 的覆寫保護與權限）、`pki_cli`（`sign` 的紀錄與不覆寫、私鑰權限、離線 `gencrl` 的版本遞增、用法錯誤）。
+- 端對端：`pki_init_then_install_string_registers_and_the_service_connects`——只以 `kairos pki init` 產生的 PKI 啟動 Kairos，Pulse 以安裝字串註冊並以 mTLS 連上；線上 `pki gencrl`；第二次 `pki init` 被拒。
+- Pulse：`pulse service` 的參數解析與工作目錄；Linux 與 `x86_64-pc-windows-gnu` 的 clippy。
 
 ## [0.7.0] - 〔草稿：發佈日期待定〕
 

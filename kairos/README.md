@@ -79,22 +79,34 @@
 
 **部署順序**：協定 v2 起不必同時升級，任何順序都能以協定 v1 混用；仍建議先升級全部 Pulse，再升級 Kairos，以避開上表「舊版 Pulse 連新版 Kairos」的風險。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。各版本組合見 CHANGELOG「版本相容矩陣」。
 
-## 從發佈包安裝
+## 安裝
 
-地端正式部署請使用預編譯的發佈包 `kairos-<版本>-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`kairos-crl.service`／`kairos-crl.timer`（CRL 定期更新範例）、`INSTALL.md`、本文件、`PROTOCOL.md`、`CHANGELOG.md`（變更紀錄與升級步驟）、`THIRD-PARTY-LICENSES`（第三方授權聲明）與 SBOM（CycloneDX）。
+**0.8.0〔草稿〕起建議以 deb／rpm 套件安裝**（Debian、Ubuntu、RHEL 系；x86_64、aarch64），PKI 以 `kairos pki init` 一個指令建立，不必再寫 `ca.cnf`：
+
+```bash
+apt install ./kairos-<版本>-<commit>-linux-x86_64.deb      # 或 dnf install ./….rpm
+sudo -u kairos kairos pki init --config /opt/kairos/kairos.toml   --name monitor.example.com --name 10.0.0.5 --root-dir /opt/kairos/root-ca
+systemctl start kairos                                    # 之後把 /opt/kairos/root-ca 移到離線保存
+```
+
+完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md) 第 A 節；`kairos pki init／sign／gencrl／revocations export` 的規格見 [`PKI.md`](PKI.md) 第 15 節。
+
+### 從發佈包安裝
+
+不使用套件管理員時，使用預編譯的發佈包 `kairos-<版本>-<commit>-linux-<arch>.tar.gz`（x86_64 或 aarch64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`kairos.example.toml`、`kairos.service`（系統層級 systemd unit 範本）、`kairos-crl.service`／`kairos-crl.timer`（CRL 定期更新範例）、`INSTALL.md`、本文件、`PROTOCOL.md`、`CHANGELOG.md`（變更紀錄與升級步驟）、`THIRD-PARTY-LICENSES`（第三方授權聲明）與 SBOM（CycloneDX）。
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下：
 
 1. 以 `ssh-keygen -Y verify` 驗證 `SHA256SUMS.sig`（發佈公鑰 `allowed_signers` 須從另一個管道取得）、`sha256sum -c --ignore-missing SHA256SUMS` 驗證雜湊後解壓（`tar xzf … --strip-components=1`），`./kairos --version` 確認版本與 commit（輸出 `kairos <版本> (<commit>)`，見「設定」最後的命令列參數）。
 2. 建立系統使用者 `kairos` 與 `/opt/kairos`、`/opt/kairos/data`、`/opt/kairos/logs`。
-3. 在管理主機建立伺服器 CA 與以 `openssl ca` 管理的代理 CA（可撤銷、產生 CRL），簽發伺服器憑證與各 Pulse 送來的 CSR。
-4. 放置 `cert.pem`、`key.pem`、`client-ca.pem`、`agents.crl`，以 `kairos.example.toml` 建立 `kairos.toml`（至少改 `server.listen` 並啟用 `auth.client_ca`、`auth.crl`）。
+3. 以 `kairos pki init` 建立根 CA、伺服器憑證與代理簽發 CA（0.8.0〔草稿〕；0.7 以前以 openssl 手動管理的方式見 INSTALL 附錄 P）。
+4. 以 `kairos.example.toml` 建立 `kairos.toml`，填入 `pki init` 印出的路徑（`server.cert_path`、`auth.client_ca`、`pki.server_ca_path` 等），改 `server.listen`。
 5. 安裝 `kairos.service`（`User=kairos`、`WorkingDirectory=/opt/kairos`、`ExecStart=/opt/kairos/kairos --config /opt/kairos/kairos.toml`、`LimitNOFILE=8192`、`Restart=on-failure`、`KillSignal=SIGINT`、`ProtectSystem=strict` 且只開放 `data/`、`logs/` 可寫），`systemctl enable --now kairos`。
 6. 確認 `--version`、`journalctl -u kairos` 與 `data/agents.json`。
 
 不要以 `systemd-run --user` 執行正式服務：沒有開啟 linger 時，最後一個登入 session 結束就會一起被停掉。升級時建議先升級全部 Pulse，再升級 Kairos（不必同時升級，見上一節）。
 
-發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/kairos-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Pulse 共用的 `dist/SHA256SUMS`（工作目錄有未提交的變更時檔名加上 `-dirty`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
+發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 Linux x86_64／aarch64 的 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/`（`kairos-<版本>-<commit>-linux-<arch>.tar.gz`、`.deb`、`.rpm`、SBOM），並更新與 Pulse 共用的 `dist/SHA256SUMS`（工作目錄有未提交的變更時檔名加上 `-dirty`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
 
 ## 快速開始
 
@@ -293,6 +305,8 @@ crl = ["agents.crl"]          # 選用：CRL 檔（PEM 或 DER），見下一節
 檔案讀不到、沒有憑證、CRL 格式錯誤或無法建立驗證器時，Kairos 會在啟動時報錯並結束（訊息附檔案路徑）。
 
 ### 4. 撤銷客戶端憑證（CRL）
+
+> 0.5 起以 `pulse enroll` 註冊、由 Kairos 線上簽發的憑證以 `kairos pki revoke` 撤銷，Kairos 自己產生 CRL；0.8 起以 `kairos pki init` 建立的部署不需要本節。以下是手動 PKI 的做法，其中的 openssl 指令也可以改用 `kairos pki sign --profile client` 與 `kairos pki gencrl --revocations`（`PKI.md` 第 15 節）。
 
 要撤銷代理憑證，需要用 `openssl ca` 管理簽發紀錄。建立代理 CA 時改用下列方式，之後簽發、撤銷、產生 CRL 都透過同一個資料庫：
 

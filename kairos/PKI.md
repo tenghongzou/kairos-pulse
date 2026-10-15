@@ -516,7 +516,7 @@ server_ca_path = "data/pki/root-ca.pem"
 
 ### 15.4 待使用者決定
 
-1. **既有部署以代理 CA（或根 CA）當 `auth.client_ca`**（第 9 節「改為線上」、INSTALL 舊版 6.5）：如第 15.1 節所述，退役的簽發 CA 簽出的憑證在用戶端自行附上中繼憑證時仍可經由這組驗證器通過。建議：(a) INSTALL 的升級步驟改為把 `auth.client_ca` 改成 `data/pki/issuing-cas.pem` 加上仍需要的舊代理 CA；或 (b) 在 `CompositeVerifier` 中拒絕「鏈經過已退役簽發 CA」的憑證（需要保留退役 CA 的 subject）。本衝刺只在新安裝（`pki init`）採用 (a)。
+1. **既有部署以代理 CA（或根 CA）當 `auth.client_ca`**（第 9 節「改為線上」、INSTALL 附錄 P.5）：如第 15.1 節所述，退役的簽發 CA 簽出的憑證在用戶端自行附上中繼憑證時仍可經由這組驗證器通過（`tls.rs` 的測試 `retired_issuing_ca_chain_depends_on_the_client_ca_choice` 確認了這個行為，並確認 `pki init` 的設定會拒絕）。`issuing-ca retire --compromised` 因此在這類部署中**不能**阻止持有外洩私鑰的人簽出可用的用戶端憑證。建議：(a) INSTALL 的升級步驟改為把 `auth.client_ca` 改成 `data/pki/issuing-cas.pem` 加上仍需要的舊代理 CA；或 (b) 在 `CompositeVerifier` 中拒絕「鏈經過已退役簽發 CA」的憑證（需要保留退役 CA 的 subject）。本衝刺只在新安裝（`pki init`）採用 (a)。
 2. **根 CA 私鑰的加密保存**：目前明文 0600＋提示。建議沿用 `keys_backup.rs` 的 Argon2id＋AES-256-GCM 格式加上 `--encrypt-root`，`pki sign` 支援讀取加密的私鑰。
 
 ### 15.5 新的產品代碼〔暫定〕

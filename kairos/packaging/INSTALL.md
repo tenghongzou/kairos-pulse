@@ -1,25 +1,76 @@
-# Kairos 安裝指南（從發佈包安裝）
+# Kairos 安裝指南
 
-本文件給地端管理者使用：從預編譯的發佈包把 Kairos 安裝成**系統層級 systemd 服務**。功能、設定欄位與協定細節請見同目錄的 `README.md` 與 `PROTOCOL.md`。
+本文件給地端管理者使用：把 Kairos 安裝成**系統層級 systemd 服務**。功能、設定欄位與協定細節請見同目錄的 `README.md` 與 `PROTOCOL.md`。
+
+- **第 A 節（建議，0.8.0〔草稿〕起）**：以 deb／rpm 套件安裝，`kairos pki init` 一個指令建立 PKI。從下載到第一台 Pulse 連上約 10 個指令。
+- **第 0～13 節**：從 tar.gz 發佈包手動安裝（不使用套件管理員的環境），以及共通的維運、升級與疑難排解。第 6 節同樣改用 `kairos pki init`；0.7 以前以 openssl 手動管理 PKI 的方式移到附錄 P。
 
 > 不要用 `systemd-run --user` 或使用者層級的 unit 跑正式服務：沒有開啟 linger 時，最後一個登入 session 結束，user manager 會連同 Kairos 一起被停掉。
 
+## A. 以 deb／rpm 套件安裝（0.8.0〔草稿〕）
+
+支援：Debian 12、Ubuntu 22.04／24.04（deb），RHEL／Rocky／Alma 9（rpm）；x86_64 與 aarch64。套件的版面與 tar.gz 相同（`/opt/kairos`），另外安裝 `/usr/lib/systemd/system/kairos.service` 與 `/usr/bin/kairos`。
+
+```bash
+# A.1 下載與驗證（allowed_signers 必須從另一個管道取得，見第 2 節）
+ssh-keygen -Y verify -f allowed_signers -I release@kairos-pulse -n kairos-pulse-release \
+  -s SHA256SUMS.sig < SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS          # 下載的套件必須顯示 OK
+
+# A.2 安裝（建立系統帳號 kairos、/opt/kairos/data、logs、root-ca，啟用但不啟動服務）
+apt install ./kairos-<版本>-<commit>-linux-x86_64.deb          # Debian／Ubuntu
+dnf install ./kairos-<版本>-<commit>-linux-x86_64.rpm          # RHEL／Rocky／Alma
+
+# A.3 PKI：根 CA、伺服器憑證、代理簽發 CA 一次建立。--name 填 Pulse 連線時使用的所有名稱與 IP
+sudo -u kairos kairos pki init --config /opt/kairos/kairos.toml \
+  --name monitor.example.com --name 10.0.0.5 --root-dir /opt/kairos/root-ca
+
+# A.4 根 CA 私鑰移到離線保存（加密的隨身碟等，保存兩份），再從伺服器刪除
+tar -C /opt/kairos -cf - root-ca | gpg -c > /media/offline/kairos-root-ca-$(date -u +%F).tar.gpg
+shred -u /opt/kairos/root-ca/root-ca.key && rm -rf /opt/kairos/root-ca/*
+
+# A.5 啟動、建立首位管理員、建立註冊 token
+systemctl start kairos
+sudo -u kairos kairos users create admin --role admin --config /opt/kairos/kairos.toml   # stdout 為初始密碼
+sudo -u kairos kairos enroll-token create --name rollout --group default --max-uses 50 \
+  --config /opt/kairos/kairos.toml          # stdout 為 token；stderr 為安裝字串（pulse-enroll:v1:…）
+
+# A.6 防火牆：Pulse 所在網段 → 8080（回報）、8444（註冊）；主控台 9443 只給管理網段（第 9.3 節）
+ufw allow proto tcp from 10.0.0.0/16 to any port 8080,8444
+```
+
+- **預設設定**（`/opt/kairos/kairos.toml`，升級不覆寫）：監聽 `0.0.0.0:8080`、mTLS（`auth.client_ca` 指向 Kairos 管理的簽發 CA）、線上簽發、註冊端點 `open`（8444）、主控台 `127.0.0.1:9443`；所有路徑都是絕對路徑，`sudo -u kairos kairos …` 在任何目錄執行都使用同一份資料。`kairos pki init` 寫出的檔案正好是設定指向的位置，不需要編輯設定檔。完整欄位見 `/opt/kairos/kairos.example.toml`。
+- `kairos pki init` 印出的 **CA 指紋**（`sha256:…`）就是安裝字串中的指紋；Pulse 以安裝字串註冊（Pulse 的 INSTALL 第 A 節，可用一行安裝腳本），不必再逐台簽發憑證。
+- 根 CA 私鑰只在建立伺服器憑證與新的簽發 CA 時需要：到期或輪替時在離線主機以 `kairos pki sign` 簽發（第 10.4 節）。`/opt/kairos/root-ca` 對 Kairos 服務本身不可見（unit 的 `InaccessiblePaths=`）。
+- 確認：`systemctl status kairos`、`journalctl -u kairos -n 30`（有「註冊端點（8444）已啟動」）、`sudo -u kairos kairos --check-config --config /opt/kairos/kairos.toml`。之後的日常維運、備份與升級見第 9～11 節（套件安裝時「換上新版」改為 `apt install ./新版.deb`／`dnf install ./新版.rpm`，見第 11.1 節）。
+- **套件做的事**（`packaging/pkg/*.sh`）：安裝前建立系統帳號 `kairos`；安裝後建立 `data/`、`logs/`（`kairos:kairos` 750）與 `root-ca/`（700，只在新安裝），`systemctl enable kairos`；升級時 `systemctl try-restart kairos`；移除時 `systemctl disable --now kairos`。**移除與 purge 都不刪除 `/opt/kairos/data`**（資料庫與 `data/pki` 的私鑰），purge 只刪除日誌；系統帳號保留。
+- 套件檔案與權限：`/opt/kairos` `root:kairos` 750；`kairos`（執行檔）755；`kairos.toml` `root:kairos` 640（設定檔，`dpkg` conffile／rpm `%config(noreplace)`）；文件與範例 644。以 `dpkg -L kairos`、`rpm -ql kairos` 查看清單。
+
 ## 0. 發佈包內容
 
-發佈包 `kairos-<版本>-<commit>-linux-x86_64.tar.gz` 內含一層 `kairos-<版本>-<commit>-linux-x86_64/` 目錄：
+每個版本的發佈檔（0.8.0〔草稿〕起；`<arch>` 為 `x86_64` 或 `aarch64`）：
+
+| 檔案 | 說明 |
+|---|---|
+| `kairos-<版本>-<commit>-linux-<arch>.tar.gz` | 發佈包（本節以下的內容；第 1～13 節的手動安裝） |
+| `kairos-<版本>-<commit>-linux-<arch>.deb`、`.rpm` | 套件（第 A 節）；內容與 tar.gz 相同，另有 systemd unit、預設設定與安裝腳本 |
+| `kairos-<版本>-<commit>-linux-<arch>.cdx.json` | SBOM（與發佈包內的相同） |
+| `SHA256SUMS`、`SHA256SUMS.sig` | 與 Pulse 共用的雜湊清單與簽章（第 2 節） |
+
+發佈包 `kairos-<版本>-<commit>-linux-<arch>.tar.gz` 內含一層 `kairos-<版本>-<commit>-linux-<arch>/` 目錄：
 
 | 檔案 | 權限 | 說明 |
 |---|---|---|
-| `kairos` | 755 | 執行檔（x86_64、musl 靜態連結，不依賴系統函式庫） |
+| `kairos` | 755 | 執行檔（x86_64 或 aarch64、musl 靜態連結，不依賴系統函式庫） |
 | `kairos.example.toml` | 644 | 設定範本，複製成 `kairos.toml` 後修改 |
 | `kairos.service` | 644 | systemd unit 範本 |
-| `kairos-crl.service`、`kairos-crl.timer` | 644 | CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
+| `kairos-crl.service`、`kairos-crl.timer` | 644 | 手動 PKI（附錄 P）的 CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
 | `prometheus.example.yml`、`kairos-alerts.example.yml` | 644 | Prometheus 抓取設定與告警規則範例（第 9.2a 節，0.6.0） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
 | `API.md` | 644 | 主控台 API（HTTPS，`/api/v1`）：端點、驗證（API token）、即時推送、量測 |
-| `PKI.md` | 644 | 註冊通道的 CA 架構、線上／離線簽發、簽發 CA 的輪替、CRL、資料模型與量測（0.5.0） |
+| `PKI.md` | 644 | 註冊通道的 CA 架構、線上／離線簽發、簽發 CA 的輪替、CRL、資料模型與量測（0.5.0）；`kairos pki init／sign／gencrl`（第 15 節，0.8.0） |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `kairos.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `kairos-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -36,17 +87,17 @@
 | 監聽位址 | `0.0.0.0:8080`（與 Pulse 預設的 `server.port` 相同） |
 | 主控台 API | `127.0.0.1:9443`（預設只綁 loopback；開放給管理網段見第 9.3 節） |
 | 伺服器名稱 | `monitor.example.com`、`10.0.0.5`（換成實際值） |
-| PKI 工作目錄 | `~/kairos-pki`（**放在離線或受保護的管理主機**，不要放在 Kairos 主機上） |
+| 根 CA 的暫存目錄 | `/opt/kairos/root-ca`（`kairos pki init` 寫出根 CA 私鑰；**之後移到離線保存**） |
 
 指令以 root 執行（或在前面加 `sudo`）。
 
 ## 1. 需求
 
-- Linux x86_64、systemd（建議 247 以上；Ubuntu 22.04／24.04、Debian 12、RHEL 9 皆可）
-- 管理主機上的 OpenSSL 3.0 以上（建立 PKI；`openssl version` 確認）
+- Linux x86_64 或 aarch64（0.8.0〔草稿〕起）、systemd（建議 247 以上；Ubuntu 22.04／24.04、Debian 12、RHEL 9 皆可）
+- 不需要 OpenSSL：PKI 由 `kairos pki init` 建立（第 6 節）。只有沿用附錄 P 的手動 PKI 才需要管理主機上的 OpenSSL 3.0 以上
 - 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
 - 防火牆允許 Pulse 連到監聽埠（本例 TCP 8080）
-- 啟用註冊通道（0.5.0）時，防火牆允許**要註冊的主機**連到 TCP 8444（第 6.5 節）；不使用自動註冊時不必開放（沒有 `[enroll]` 時 Kairos 不監聽 8444）
+- 啟用註冊通道（0.5.0）時，防火牆允許**要註冊的主機**連到 TCP 8444（第 7 節的 `[enroll]`）；不使用自動註冊時不必開放（沒有 `[enroll]` 時 Kairos 不監聽 8444）
 - 主控台 API（TCP 9443）**只對管理網段開放**：預設只綁 `127.0.0.1`；改為對外位址時以防火牆限制來源（第 9.3 節）。不要對 agent 所在的網段或網際網路開放
 
 ## 2. 下載與驗證
@@ -86,7 +137,7 @@ awk '{print $3, $4}' allowed_signers | ssh-keygen -lf -   # 印出 256 SHA256:�
 cd ~/kairos-dist
 mkdir -p pkg
 tar xzf kairos-<版本>-<commit>-linux-x86_64.tar.gz -C pkg --strip-components=1
-file pkg/kairos              # 應為 ELF 64-bit x86-64 static-pie linked
+file pkg/kairos              # 應為 ELF 64-bit x86-64（或 ARM aarch64）static-pie linked
 pkg/kairos --version         # 輸出 kairos <版本> (<commit>)，commit 應與檔名一致
 ```
 
@@ -115,217 +166,59 @@ install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL
   STORAGE.md API.md PKI.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
-## 6. 建立 PKI
+## 6. 建立 PKI（kairos pki init，0.8.0〔草稿〕）
 
-正式環境需要兩個 CA，用途不同、請分開建立：
+`kairos pki init` 一次建立 Kairos 需要的三樣東西（`PKI.md` 第 15 節），取代 0.7 以前以 openssl 手寫 `ca.cnf` 的流程（舊流程見附錄 P，既有部署照常可用）：
 
-| CA | 用途 | 管理方式 |
+| 產出 | 內容 | 位置 |
 |---|---|---|
-| 伺服器 CA（`ca.pem`） | 簽發 Kairos 的伺服器憑證；每台 Pulse 只信任它 | `openssl x509 -req`（伺服器憑證不需撤銷，到期重簽即可） |
-| 代理 CA（`client-ca.pem`） | **只**用來簽發 Pulse 的客戶端憑證（mTLS） | `openssl ca` 資料庫，才能撤銷並產生 CRL |
-
-兩把 CA 私鑰（`ca.key`、`client-ca.key`）都在管理主機上產生並離線保存，**不要**複製到 Kairos 主機。以下指令在管理主機執行。
-
-### 6.1 伺服器 CA 與伺服器憑證
+| 根 CA | ECDSA P-384、10 年；**Pulse 信任的對象**（安裝字串的 CA 指紋） | 私鑰 `<--root-dir>/root-ca.key`（0600，**之後移到離線保存**）；憑證另放 `data/pki/root-ca.pem`（`pki.server_ca_path`） |
+| 伺服器憑證 | ECDSA P-256、825 天；SAN＝所有 `--name`、EKU `serverAuth`、`CA:FALSE`（8443、8444、主控台共用） | `data/pki/server.pem`、`data/pki/server.key`（0600） |
+| 代理簽發 CA | ECDSA P-256、5 年；由根 CA 簽發、已安裝並啟用（線上簽發 Pulse 的用戶端憑證） | `data/pki/issuing-1.key`（0600）、資料庫；信任錨 `data/pki/issuing-cas.pem`（`auth.client_ca`） |
 
 ```bash
-mkdir -p ~/kairos-pki/server-ca && cd ~/kairos-pki/server-ca
-umask 077
-
-# 伺服器 CA（只需一次）
-openssl req -x509 -newkey rsa:4096 -nodes \
-  -keyout ca.key -out ca.pem -days 3650 -subj "/CN=Kairos Server CA" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign"
-
-# 伺服器私鑰與 CSR：SAN 填 Pulse 連線時使用的所有名稱／IP
-openssl req -new -newkey rsa:2048 -nodes \
-  -keyout key.pem -out server.csr -subj "/CN=monitor.example.com" \
-  -addext "subjectAltName=DNS:monitor.example.com,IP:10.0.0.5" \
-  -addext "basicConstraints=critical,CA:FALSE" \
-  -addext "extendedKeyUsage=serverAuth"
-
-# 以伺服器 CA 簽發（-copy_extensions copyall 需 OpenSSL 3.0+，才會帶入 SAN）
-openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
-  -out cert.pem -days 825 -copy_extensions copyall
-
-openssl x509 -in cert.pem -noout -ext subjectAltName,basicConstraints,extendedKeyUsage
-```
-
-- `cert.pem`、`key.pem` 交給 Kairos（第 7 節）。
-- `ca.pem` 交給每台 Pulse（`server.ca_cert`），Pulse 的 `server.domain` 填 SAN 中的名稱。
-- `basicConstraints=critical,CA:FALSE` 不能省：rustls 不接受 CA 憑證當伺服器憑證（`CaUsedAsEndEntity`）。
-
-### 6.2 代理 CA（openssl ca 資料庫，可撤銷）
-
-```bash
-mkdir -p ~/kairos-pki/agent-ca/newcerts && cd ~/kairos-pki/agent-ca
-umask 077
-touch index.txt
-echo 1000 > serial
-echo 1000 > crlnumber
-
-cat > ca.cnf <<'EOF'
-# 簽發時以環境變數 AGENT_ID 指定代理的 agent_id；未設定時簽發會失敗（避免簽出錯誤的 SAN）
-AGENT_ID =
-
-[ ca ]
-default_ca = agent_ca
-
-[ agent_ca ]
-# 路徑相對於「目前目錄」：所有 openssl ca 指令都必須在 agent-ca/ 目錄內執行
-dir              = .
-database         = $dir/index.txt
-serial           = $dir/serial
-crlnumber        = $dir/crlnumber
-new_certs_dir    = $dir/newcerts
-certificate      = $dir/client-ca.pem
-private_key      = $dir/client-ca.key
-default_md       = sha256
-default_days     = 825
-default_crl_days = 30
-policy           = policy_any
-# 不複製 CSR 中的擴充欄位：SAN 一律由簽發者以 AGENT_ID 指定，CSR 夾帶的其他 SAN 不會進入憑證
-copy_extensions  = none
-# 允許同一個 agent_id 重新簽發（換金鑰）而不必先撤銷舊憑證
-unique_subject   = no
-
-[ policy_any ]
-commonName       = supplied
-
-[ client_ext ]
-basicConstraints       = critical,CA:FALSE
-keyUsage               = critical,digitalSignature
-extendedKeyUsage       = clientAuth
-subjectAltName         = DNS:${ENV::AGENT_ID}
-subjectKeyIdentifier   = hash
-authorityKeyIdentifier = keyid,issuer
-
-[ crl_ext ]
-authorityKeyIdentifier = keyid:always
-EOF
-
-# 代理 CA 憑證（只需一次）
-openssl req -x509 -newkey rsa:3072 -nodes \
-  -keyout client-ca.key -out client-ca.pem -days 3650 -subj "/CN=Kairos Agent CA" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign"
-
-# 第一份 CRL（即使還沒有撤銷任何憑證也要產生，Kairos 設定了 auth.crl 就必須讀得到）
-openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl
-openssl crl -in agents.crl -noout -lastupdate -nextupdate
-```
-
-- `client-ca.pem` 與 `agents.crl` 交給 Kairos（第 7 節）；`client-ca.key` 與整個 `agent-ca/` 目錄離線保存並備份（`index.txt` 遺失就無法撤銷先前簽發的憑證）。
-- 代理 CA 只用來簽發代理的客戶端憑證：Kairos 信任它簽發的**任何**客戶端憑證。
-
-### 6.3 簽發代理的客戶端憑證
-
-每台 Pulse 的管理者依 Pulse 的 `INSTALL.md` 在代理主機上產生 `agent_id`、私鑰與 CSR，把 **CSR 與 agent_id** 交給你（私鑰不離開代理主機）。
-
-```bash
-cd ~/kairos-pki/agent-ca
-AGENT_ID=6f1c0e4a-1b2c-4d3e-9f00-112233445566     # 對方提供的 agent_id（小寫 UUID）
-mkdir -p issued
-
-# 先檢視 CSR：確認 CN／SAN 與 agent_id 一致（不一致時向對方確認，不要直接簽）
-openssl req -in "$AGENT_ID.csr" -noout -verify -subject
-openssl req -in "$AGENT_ID.csr" -noout -text | grep -A1 "Subject Alternative Name"
-
-# 簽發：SAN 強制為 DNS:<AGENT_ID>，CN 強制為 agent_id
-AGENT_ID="$AGENT_ID" openssl ca -batch -config ca.cnf -extensions client_ext \
-  -subj "/CN=$AGENT_ID" -in "$AGENT_ID.csr" -out "issued/$AGENT_ID.pem" -notext
-
-openssl x509 -in "issued/$AGENT_ID.pem" -noout -serial -enddate \
-  -ext subjectAltName,extendedKeyUsage
-```
-
-把 `issued/$AGENT_ID.pem`（對方存成 `client.pem`）與伺服器 CA 的 `ca.pem` 交回給該台代理。記下序號與 agent_id 的對應（`index.txt` 也有紀錄），之後撤銷時要用。
-
-### 6.4 撤銷與定期更新 CRL
-
-```bash
-cd ~/kairos-pki/agent-ca
-openssl ca -batch -config ca.cnf -revoke "issued/$AGENT_ID.pem" -crl_reason keyCompromise
-openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl
-```
-
-把新的 `agents.crl` 部署到 Kairos（第 10.1 節）。Kairos 在下一個重載週期（`server.reload_interval_secs`，預設 30 秒）載入，被撤銷的代理收到 `certificate_rejected` 並被斷線，之後重連在 TLS 握手階段就被拒；其他代理不受影響。
-
-> **CRL 過期會讓所有代理被拒。** Kairos 對 CRL 採 fail closed：超過 `nextUpdate`（上面設定為 30 天）就視為無法判定撤銷狀態。請在到期前定期重新產生並部署，例如每週一次（即使沒有新的撤銷；第 10.3 節的 `kairos-crl.timer`）。`openssl crl -in agents.crl -noout -nextupdate` 可查看到期時間。Kairos 在 `nextUpdate` 前 7 天（`auth.crl_expiry_warning_days`）起記 `WARN`，過期後記 `ERROR`。
-
-### 6.5 （選用，0.5.0）註冊通道與線上簽發 CA
-
-註冊通道（8444，`crates/kairos-proto/ENROLL.md`）讓 Pulse 以安裝字串自行申請憑證，取代第 6.3 節的逐台手動簽發。Kairos 持有一把**簽發 CA** 的私鑰（`data/pki/issuing-<ca_id>.key`，0600），核准後立即簽發（線上模式；架構與取捨見 `PKI.md`）。簽發 CA 由第 6.2 節的代理 CA（或另外的離線根 CA）簽發，代理 CA 的私鑰仍不離開管理主機。
-
-```bash
-# 1. Kairos 主機：產生簽發 CA 的私鑰與 CSR（預設寫到 data/pki/issuing-<ca_id>.csr）
-sudo -u kairos /opt/kairos/kairos pki issuing-ca new --config /opt/kairos/kairos.toml
-# 把 /opt/kairos/data/pki/issuing-1.csr 帶到管理主機的 ~/kairos-pki/agent-ca/
-
-# 2. 管理主機：以代理 CA 簽發（CA:TRUE、pathlen:0、keyCertSign／cRLSign、EKU clientAuth，5 年）
-cd ~/kairos-pki/agent-ca
-cat > issuing_ca_ext.cnf <<'EOF'
-basicConstraints = critical,CA:TRUE,pathlen:0
-keyUsage = critical,keyCertSign,cRLSign
-extendedKeyUsage = clientAuth
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid
-EOF
-openssl x509 -req -in issuing-1.csr -CA client-ca.pem -CAkey client-ca.key -CAcreateserial   -days 1825 -extfile issuing_ca_ext.cnf -out issuing-1.pem
-# 把 issuing-1.pem 帶回 Kairos 主機
-
-# 3. Kairos 主機：安裝（檢查與私鑰成對、擴充欄位、至少剩 2 年；第一個簽發 CA 自動啟用）
-sudo -u kairos /opt/kairos/kairos pki issuing-ca install issuing-1.pem --config /opt/kairos/kairos.toml
-sudo -u kairos /opt/kairos/kairos pki issuing-ca list --config /opt/kairos/kairos.toml
-```
-
-`kairos.toml` 加上（完整欄位見 `kairos.example.toml` 的 `[enroll]`、`[pki]`）：
-
-```toml
-[enroll]
-mode = "open"                 # 也可以之後以 kairos enroll mode open 或主控台切換
-
-[pki]
-mode = "online"
-server_ca_path = "ca.pem"     # Pulse 信任的 CA（第 6.1 節的伺服器 CA）；安裝字串的 CA 指紋
-```
-
-- 依路徑調整：上例在第 6.2 節的 `agent-ca/` 目錄執行（代理 CA 的 `client-ca.pem`、`client-ca.key`）；`ca.pem` 以 644 放到 `/opt/kairos/`。
-- 防火牆：允許要註冊的主機連到 8444（`ufw allow proto tcp from 10.0.0.0/16 to any port 8444`；firewalld 同第 9.3 節的 rich rule，改 port 8444）。8444 不需要對管理網段以外開放；不開放新註冊時以 `kairos enroll mode renew_only`（只受理過期續簽）或 `closed` 關閉。
-- 建立註冊 token：`sudo -u kairos /opt/kairos/kairos enroll-token create --name rollout --group <群組> --max-uses 50 --config /opt/kairos/kairos.toml` 建立 token（安裝字串寫在 stderr）；在 Pulse 主機執行 `pulse enroll --install-string <安裝字串>`。待核准的申請以 `kairos enroll list`、`kairos enroll approve <request_id>` 處理（或主控台，需要 `operate` 範圍的 API token）。
-- Kairos 自己產生簽發 CA 的 CRL（`data/pki/crl/issuing.crl`，每 24 小時與每次撤銷），撤銷以 `kairos pki revoke <序號或 agent_id> --reason <原因> --comment <說明>`，不必經過第 6.4 節的 `openssl ca`。
-- 不想讓私鑰放在伺服器上時採離線模式（`pki.mode = "offline"`）：核准後以 `kairos pki queue export` 匯出 CSR，在管理主機 `kairos pki sign-bundle` 簽發後 `kairos pki queue import` 匯入（`PKI.md` 第 6 節）。
-
-## 7. 放置設定與憑證
-
-把第 6 節產生的檔案帶到 Kairos 主機（例如 `scp` 到 `~/kairos-files/`），再放到 `/opt/kairos`：
-
-```bash
-cd ~/kairos-files
-install -o root -g kairos -m 644 cert.pem       /opt/kairos/cert.pem
-install -o root -g kairos -m 640 key.pem        /opt/kairos/key.pem
-install -o root -g kairos -m 644 client-ca.pem  /opt/kairos/client-ca.pem
-install -o root -g kairos -m 644 agents.crl     /opt/kairos/agents.crl
-
+# 設定檔（pki init 讀取 storage.data_dir 等；第 7 節再填入 init 印出的值）
 install -o root -g kairos -m 640 /opt/kairos/kairos.example.toml /opt/kairos/kairos.toml
+# 根 CA 私鑰的暫存目錄（Kairos 服務本身看不到，unit 的 InaccessiblePaths=）
+install -d -o kairos -g kairos -m 700 /opt/kairos/root-ca
+cd /opt/kairos     # kairos.toml 的相對路徑（data/ 等）以目前目錄解析
+sudo -u kairos /opt/kairos/kairos pki init --config /opt/kairos/kairos.toml \
+  --name monitor.example.com --name 10.0.0.5 --root-dir /opt/kairos/root-ca
 ```
 
-編輯 `/opt/kairos/kairos.toml`（完整欄位見 `README.md`「設定」），至少修改：
+- `--name`：Pulse 連線時使用的**所有**名稱與 IP（可重複；DNS 名稱或 IP，不接受萬用字元）。之後要增加名稱時以 `kairos pki sign --profile server` 重新簽發（第 10.4 節）。
+- 只能執行一次：資料庫已有簽發 CA、或任何一個要寫出的檔案已存在時拒絕（結束代碼 11），不會覆寫。
+- 組織名稱（憑證的 CN）預設取 `pki.organization`（預設 `Kairos`），可用 `--organization` 指定。
+- 完成時印出要放進 `kairos.toml` 的設定（第 7 節）與 **CA 指紋**，並以 `KRS-W1306`〔暫定〕提醒：**立即把 `/opt/kairos/root-ca` 複製到離線媒體（加密、兩份）後從伺服器刪除**（`shred -u /opt/kairos/root-ca/root-ca.key`）。根 CA 私鑰外洩時，任何人都能簽出 Pulse 會信任的伺服器憑證。
+- 不想讓任何 CA 私鑰放在伺服器上時（離線簽發模式，`PKI.md` 第 6 節）：不使用 `pki init`，沿用附錄 P 的手動 PKI（`kairos pki sign`、`gencrl` 可取代其中的 openssl 指令）。
+
+`kairos pki` 的完整說明：`kairos pki --help`、`PKI.md` 第 15 節（`init`、`sign`、`gencrl`、`revocations export`）。
+
+## 7. 設定
+
+編輯 `/opt/kairos/kairos.toml`（完整欄位見 `README.md`「設定」），填入第 6 節 `kairos pki init` 印出的值：
 
 ```toml
 [server]
-listen = "0.0.0.0:8080"          # 預設只聽 127.0.0.1，其他主機連不進來
-# max_connections = 1024         # 調高時，unit 的 LimitNOFILE 也要 > max_connections + 64
+listen = "0.0.0.0:8080"                    # 預設只聽 127.0.0.1，其他主機連不進來
+cert_path = "data/pki/server.pem"
+key_path = "data/pki/server.key"
+# max_connections = 1024                   # 調高時，unit 的 LimitNOFILE 也要 > max_connections + 64
 
 [auth]
-client_ca = "client-ca.pem"      # 啟用 mTLS（正式環境必須；監聽 0.0.0.0 卻沒有設定時 Kairos 拒絕啟動）
-crl = ["agents.crl"]
+client_ca = "data/pki/issuing-cas.pem"     # 啟用 mTLS：只信任 Kairos 管理的簽發 CA（PKI.md 第 15.1 節）
+
+[enroll]
+mode = "open"                              # 註冊通道（8444）：受理 pulse enroll
+
+[pki]
+mode = "online"
+server_ca_path = "data/pki/root-ca.pem"    # Pulse 信任的根 CA；安裝字串的 CA 指紋
 ```
 
 `server.listen` 不是 loopback 位址（`127.0.0.0/8`、`::1`）又沒有設定 `auth.client_ca` 時，Kairos 會拒絕啟動並記錄 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」。`auth.allow_unauthenticated = true` 可以略過這項檢查，但任何能連線的人都能以任意 `agent_id` 註冊，**不可用於正式環境**。
 
-相對路徑以工作目錄 `/opt/kairos` 解析，`cert.pem`、`key.pem`、`data/`、`logs/` 維持預設即可。
+相對路徑以工作目錄 `/opt/kairos` 解析（unit 的 `WorkingDirectory=`；CLI 請先 `cd /opt/kairos`，或像套件的預設設定一樣改寫成絕對路徑）。沿用附錄 P 手動 PKI 的部署，`cert_path`、`key_path`、`client_ca`、`crl` 指向附錄 P.4 放置的檔案。
 
 檔案權限總覽：
 
@@ -336,7 +229,7 @@ crl = ["agents.crl"]
 | `kairos.toml`、`key.pem` | `root:kairos` | 640（`key.pem` 由 root 擁有、只讓 `kairos` 群組讀取：服務帳號讀得到但不能改寫或替換） |
 | `cert.pem`、`client-ca.pem`、`agents.crl` | `root:kairos` | 644 |
 | `data/`、`logs/` | `kairos:kairos` | 750 |
-| `data/pki/`（0.5.0，第 6.5 節；Kairos 建立） | `kairos:kairos` | 700；簽發 CA 私鑰 `issuing-*.key` 600（群組或其他使用者有任何權限時不使用，`KRS-E1303`） |
+| `data/pki/`（0.5.0；`kairos pki init`、Kairos 建立；`server.key`、`issuing-*.key` 600） | `kairos:kairos` | 700；簽發 CA 私鑰 `issuing-*.key` 600（群組或其他使用者有任何權限時不使用，`KRS-E1303`） |
 | `data/` 中的 `reports-*.jsonl`、`agents.json`；`logs/` 中的 `kairos-*.log` | `kairos:kairos` | 640（由 Kairos 建立） |
 
 Kairos 自己建立的 report 檔、`agents.json` 與日誌檔一律最多 640，自行建立的目錄為 750，不受 umask 影響（手動執行時 umask 常為 022 也一樣）；既有檔案在開啟時收緊到最多 640（不會放寬，600 維持 600）。`data/`、`logs/` 已存在時 Kairos 不改變其權限，但其他使用者可存取（例如 755）時啟動會記 `WARN` 並建議 `chmod 750`。`agents.json` 與日期保護狀態檔（`.retention-guard*.json`，只含日期）的暫存檔建立時就是 640，更名後同樣最多 640。
@@ -401,7 +294,7 @@ sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 ```
 [INFO] kairos <版本> (<commit>)
 [INFO] 設定檔: /opt/kairos/kairos.toml
-[INFO] 已啟用客戶端憑證驗證（mTLS），信任 client-ca.pem，CRL 1 份；agent_id 必須與憑證的 SAN 相符
+[INFO] 已啟用客戶端憑證驗證（mTLS），信任 data/pki/issuing-cas.pem；agent_id 必須與憑證的 SAN 相符
 [INFO] 已建立資料庫 schema v1                  （第一次啟動時）
 [INFO] SQLite 資料庫 data/kairos.db（schema v1）：主機清冊 0 台、指標序列 0 個
 [INFO] 主控台 API 已啟動，監聽 https://127.0.0.1:9443/api/v1/（連線上限 64，SSE 上限 16，憑證 cert.pem）
@@ -417,7 +310,7 @@ sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 - 出現 `CRL … 將在 … 後過期` 或 `伺服器憑證 … 將在 … 後到期` 的 `WARN`（已過期時為 `ERROR`）：依第 10.1、10.3 節更新。
 - 出現 `伺服器私鑰 … 的權限過寬` 的 `WARN`：`key.pem` 讓其他使用者有權限、group 可寫入，或 group 可讀但群組不是 `kairos`。依訊息執行 `chown root:kairos /opt/kairos/key.pem && chmod 640 /opt/kairos/key.pem`。Kairos 在啟動時與熱重載換了私鑰時檢查，只記錄不拒絕啟動。
 - 出現 `可開啟的檔案數上限（RLIMIT_NOFILE soft limit）…` 的 `WARN`：unit 的 `LimitNOFILE` 沒有生效或小於 `server.max_connections` ＋ `console.max_connections`（預設 64）＋ 64；依訊息中的建議值以 drop-in 調高 `LimitNOFILE`（`systemctl show kairos -p LimitNOFILE` 可確認目前值）。
-- 從其他主機確認 TLS 與伺服器憑證：`openssl s_client -connect monitor.example.com:8080 -CAfile ca.pem -servername monitor.example.com </dev/null`（啟用 mTLS 時，沒帶客戶端憑證會在握手後被拒，這是正常的）。
+- 從其他主機確認 TLS 與伺服器憑證：`openssl s_client -connect monitor.example.com:8080 -CAfile root-ca.pem -servername monitor.example.com </dev/null`（`root-ca.pem` 為 `data/pki/root-ca.pem` 的複本）（啟用 mTLS 時，沒帶客戶端憑證會在握手後被拒，這是正常的）。
 - Pulse 上線後，`agents.json` 的 `online` 會增加。多台 Pulse 經同一個 NAT 連入時，**以 `agents.json` 作為上線狀態的依據**：日誌的上線／離線事件有節流（見 `README.md`「日誌」）。
 
 ### 9.2 日誌放在哪裡
@@ -561,7 +454,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 
   備份檔不會覆寫既有的檔案；舊備份請自行輪替（例如 `find /var/backups/kairos -name 'kairos-*.db' -mtime +14 -delete`）。還原步驟見 `STORAGE.md`「備份與還原」。停機備份時直接複製整個 `data/` 即可。
 - 使用 JSONL（`storage.backend = "jsonl"` 或鏡像）時另備份 `/opt/kairos/data/reports-*.jsonl`；搬移或備份時一併保留 `data/.retention-guard.json` 與 `logs/.retention-guard-logs.json`，不要刪除
-- 管理主機的 `~/kairos-pki/`（含 CA 私鑰，離線保存）
+- 離線保存的根 CA（第 6 節的 `root-ca/`；手動 PKI 為管理主機的 `~/kairos-pki/`）
 - **資料目錄中的金鑰檔**（`kairos db backup` 的資料庫備份**不含**，資料庫中只有以它們加密的密文或 HMAC）：
   - `data/alerts-secrets.key`（0.6.0 起）：通知管道機密（SMTP 密碼、Webhook 網址、HMAC 金鑰、LINE token）的 AES-256-GCM 金鑰。
   - `data/console.key`（0.6.0 起）：主控台的 CSRF 與 TOTP 秘密的加密金鑰。
@@ -596,11 +489,13 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
   - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
   - `data/` 已有內容不同的金鑰檔時（例如 Kairos 在還原前已啟動並產生了新的金鑰），`restore-keys` 拒絕；確認後加 `--overwrite`，原本的檔案改名為 `<名稱>.replaced-<時間>` 保留。
   - 少了 `alerts-secrets.key`（或與資料庫不成對）時，通知管道的狀態為 `secrets_unavailable`（`KRS-E5110`，主控台、`kairos alert-channels list` 與「通知管道失敗」事件都會顯示），不會發送；還原金鑰檔後重新啟動即恢復，或重新輸入機密。少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。少了 `audit-hmac.key` 時，`kairos audit verify` 與每日的自我驗證以 `hmac_key_unavailable`（`KRS-E6201`）失敗，並開「稽核日誌完整性」緊急事件。
-- 使用線上簽發（第 6.5 節）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
+- 使用線上簽發（第 6 節的 `pki init`）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 
-### 10.3 定期更新 CRL（kairos-crl.timer）
+### 10.3 定期更新 CRL（kairos-crl.timer；只用於附錄 P 的手動 PKI）
 
-發佈包附有 `kairos-crl.service`（重新產生 CRL、檢查後部署）與 `kairos-crl.timer`（每週執行一次）範例。安裝在**保存代理 CA 的主機**（第 6.2 節的 `agent-ca/`）上；`kairos-crl.service` 依序：
+以 `kairos pki init` 建立的線上簽發 CA 不需要這一節：Kairos 每 24 小時與每次撤銷自己重新產生 CRL（`PKI.md` 第 10 節）。以下只適用於 `auth.crl` 由外部 CA 產生的部署（附錄 P、離線簽發模式）；其中的 `openssl ca -gencrl` 可以改用 `kairos pki gencrl --revocations`（`PKI.md` 第 15.3 節）。
+
+發佈包附有 `kairos-crl.service`（重新產生 CRL、檢查後部署）與 `kairos-crl.timer`（每週執行一次）範例。安裝在**保存代理 CA 的主機**（第 P.2 節的 `agent-ca/`）上；`kairos-crl.service` 依序：
 
 1. `openssl ca -gencrl` 產生到 `agents.crl.new`；
 2. 確認由 `client-ca.pem` 簽發、`nextUpdate` 在未來；
@@ -637,7 +532,22 @@ systemctl list-timers kairos-crl.timer
 
 更新間隔要遠小於 CRL 的有效期間（`ca.cnf` 的 `default_crl_days = 30` 時每週一次，可容許連續失敗 3 次）。排程失敗時 Kairos 會在 `nextUpdate` 前 7 天起記 `WARN`「CRL … 將在 … 後過期」，請以 `systemctl status kairos-crl.service` 檢查。
 
-伺服器憑證到期前 30 天（`server.cert_expiry_warning_days`）起 Kairos 也會記 `WARN`，請依第 6.1 節重新簽發並依第 10.1 節覆寫。
+### 10.4 伺服器憑證到期、增加名稱（kairos pki sign，0.8.0〔草稿〕）
+
+伺服器憑證到期前 30 天（`server.cert_expiry_warning_days`）起 Kairos 會記 `WARN`。以離線保存的根 CA 重新簽發（在離線主機執行；`kairos` 執行檔不需要設定與資料庫）：
+
+```bash
+# 離線主機：產生新的私鑰與憑證（--name 列出全部名稱；根 CA 私鑰必須是 0600）
+kairos pki sign --profile server --ca-cert root-ca/root-ca.pem --ca-key root-ca/root-ca.key   --name monitor.example.com --name 10.0.0.5 --new-key server.key --out server.pem
+# 帶回 Kairos 主機，原子覆寫（Kairos 在下一個重載週期載入，不需重新啟動；第 10.1 節）
+install -o kairos -g kairos -m 600 server.key /opt/kairos/data/pki/server.key.new
+install -o kairos -g kairos -m 644 server.pem /opt/kairos/data/pki/server.pem.new
+mv /opt/kairos/data/pki/server.key.new /opt/kairos/data/pki/server.key
+mv /opt/kairos/data/pki/server.pem.new /opt/kairos/data/pki/server.pem
+```
+
+- `pki sign` 在根 CA 私鑰所在的目錄寫一筆紀錄到 `kairos-ca.log`（0600），輸出檔已存在時不覆寫。私鑰不想離開 Kairos 主機時，改以 `--csr` 簽發 Kairos 主機產生的 CSR。
+- 代理簽發 CA 的輪替（5 年；`KRS-W1304` 提醒）：`kairos pki issuing-ca new` → 在離線主機 `kairos pki sign --profile issuing-ca --csr issuing-N.csr …` → `issuing-ca install`、`activate`（`PKI.md` 第 4 節）。
 
 ## 11. 升級
 
@@ -649,11 +559,13 @@ systemctl list-timers kairos-crl.timer
 
 **從 0.3 升級到 0.4：主控台 API 預設監聽 `127.0.0.1:9443`**。升級前確認 9443 沒有被其他程式使用（`ss -ltnp | grep :9443`），否則 Kairos 以結束代碼 11 無法啟動（systemd 每 5 秒重試）；被佔用時在 `kairos.toml` 加上 `[console]` 的 `listen`（換連接埠）或 `enabled = false`。資料庫升級到 schema v3（新增 `api_tokens` 與被拒憑證的欄位）：**升級前以 `kairos db backup` 備份**，升級後 0.3 無法開啟。檔案描述元的需要量多了主控台的連線上限（預設 64）；發佈包 unit 的 `LimitNOFILE=8192` 足夠。協定不變，Kairos 與 Pulse 0.4 可以任意順序、分批升級（Pulse 0.4 的變更只在本機：`pulse status`、狀態檔與日誌的事件代碼，見 Pulse 的 INSTALL 第 10 節）。
 
-**從 0.4 升級到 0.5：註冊通道與 PKI（schema v4）**。資料庫升級到 schema v4（註冊 token、申請、簽發的憑證、CRL、設定、稽核等資料表）：**升級前以 `kairos db backup` 備份**，升級後 0.4 無法開啟。`kairos.toml` 沒有 `[enroll]` 時註冊通道維持關閉（啟動時記一次 `KRS-I2010`），沒有 `[pki]` 時為離線簽發，**行為與 0.4 相同**，不需要修改設定；要啟用時依第 6.5 節。啟用後檔案描述元的需要量另加 `enroll.max_connections`（預設 1024），發佈包 unit 的 `LimitNOFILE=8192` 足夠。既有的 API token 維持 `read`；寫入操作（核准、撤銷、模式切換）需要以 `--scope operate` 或 `--scope admin` 建立新的 token。主控台修改的註冊模式與憑證政策存在資料庫、優先於 `kairos.toml`，以 `kairos config show --effective` 查看來源。Pulse 0.4 照常以 8443 連線（`hello_ack` 與 0.4 相同）；註冊與 8443 的輪替需要 Pulse 0.5。
+**從 0.4 升級到 0.5：註冊通道與 PKI（schema v4）**。資料庫升級到 schema v4（註冊 token、申請、簽發的憑證、CRL、設定、稽核等資料表）：**升級前以 `kairos db backup` 備份**，升級後 0.4 無法開啟。`kairos.toml` 沒有 `[enroll]` 時註冊通道維持關閉（啟動時記一次 `KRS-I2010`），沒有 `[pki]` 時為離線簽發，**行為與 0.4 相同**，不需要修改設定；要啟用時依附錄 P 的第 P.5 節（0.8.0 起的新安裝改用第 6 節的 `kairos pki init`）。啟用後檔案描述元的需要量另加 `enroll.max_connections`（預設 1024），發佈包 unit 的 `LimitNOFILE=8192` 足夠。既有的 API token 維持 `read`；寫入操作（核准、撤銷、模式切換）需要以 `--scope operate` 或 `--scope admin` 建立新的 token。主控台修改的註冊模式與憑證政策存在資料庫、優先於 `kairos.toml`，以 `kairos config show --effective` 查看來源。Pulse 0.4 照常以 8443 連線（`hello_ack` 與 0.4 相同）；註冊與 8443 的輪替需要 Pulse 0.5。
 
 **從 0.5 升級到 0.6：告警、使用者與稽核、可觀測性（schema v6）**。資料庫依序升級到 schema v5（告警）與 v6（使用者、角色指派、工作階段、稽核雜湊鏈）：**升級前以 `kairos db backup` 備份**，升級後 0.5 無法開啟。資料目錄會多出 `alerts-secrets.key`、`console.key`（0600），之後的備份要一起保存（第 10.2 節）。既有的 API token **保留原本的範圍與權限**（`read`／`operate`／`admin`），**不會**得到 0.6 新增的權限（使用者、稽核、告警）：需要讀寫告警的整合以 `kairos api-token create --role viewer|operator|admin` 建立新 token；`kairos api-token create` 未指定時改為 `--role viewer`（主機、健康、告警事件與靜音的讀取），需要註冊、PKI 或設定的讀取時以 `--role auditor` 或 `--role operator` 建立。告警引擎預設啟用、沒有通知管道（不需要時 `[alerts] enabled = false`）。日誌行首的時間改為 RFC 3339（需要過渡時 `log.format = "legacy"`）；主控台的監聽上多了不需認證的 `/healthz`、`/readyz` 與只接受 loopback 的 `/metrics`（第 9.2a 節；不要時 `observability.on_console = false`）。既有的稽核紀錄在升級後第一次寫入時補上雜湊。升級前可先以新版執行 `kairos --check-config --config /opt/kairos/kairos.toml`；升級後依第 9.4 節建立首位管理員。協定不變，Pulse 可以任何順序升級。
 
-**從 0.4 升級到 0.5 的順序：先升級 Kairos，再升級 Pulse**：(1) `kairos db backup` → (2) 換上新版 Kairos 並重新啟動（此時註冊通道仍關閉）→ (3) 建立簽發 CA 並在 `kairos.toml` 開啟 `[enroll]`、`[pki]`（第 6.5 節），重新啟動後確認日誌有「註冊端點（8444）已啟動」→ (4) 防火牆開放 8444，只允許要註冊的主機 → (5) 通知 Pulse 端升級（建立 `/opt/pulse/identity`、換上新版 `pulse.service`，Pulse 的 INSTALL 第 10 節）。`storage.backend = "jsonl"` 時沒有註冊服務（不監聽 8444）。完整步驟與版本組合見 `CHANGELOG.md` [0.5.0]。
+**從 0.4 升級到 0.5 的順序：先升級 Kairos，再升級 Pulse**：(1) `kairos db backup` → (2) 換上新版 Kairos 並重新啟動（此時註冊通道仍關閉）→ (3) 建立簽發 CA 並在 `kairos.toml` 開啟 `[enroll]`、`[pki]`（第 P.5 節），重新啟動後確認日誌有「註冊端點（8444）已啟動」→ (4) 防火牆開放 8444，只允許要註冊的主機 → (5) 通知 Pulse 端升級（建立 `/opt/pulse/identity`、換上新版 `pulse.service`，Pulse 的 INSTALL 第 10 節）。`storage.backend = "jsonl"` 時沒有註冊服務（不監聽 8444）。完整步驟與版本組合見 `CHANGELOG.md` [0.5.0]。
+
+**從 0.7 升級到 0.8（〔草稿〕）：套件、`kairos pki`、aarch64**。資料庫、設定與協定都不變，不需要修改 `kairos.toml`。0.8 新增的 deb／rpm 是另一種安裝方式：既有的 tar.gz 安裝**不要**直接改裝套件（套件的預設設定是全新安裝用的；兩者版面相同，但 `kairos.service` 會從 `/etc/systemd/system` 換到 `/usr/lib/systemd/system`），照下方的步驟換執行檔即可。新版 `kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`（`kairos pki init` 的根 CA 暫存目錄；目錄不存在時沒有影響），手動 PKI 的部署可以沿用舊 unit。`auth.client_ca` 指向根 CA 或代理 CA 的既有部署，請看 `PKI.md` 第 15.4 節第 1 項（退役簽發 CA 的注意事項）。
 
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
@@ -710,7 +622,19 @@ journalctl -u kairos -n 30 --no-pager
 - 重啟後，主機清冊中最近 24 小時內出現過的主機以離線狀態出現在 `agents.json`，線上的 agent 重連後恢復上線（`storage.backend = "jsonl"` 時沒有清冊，`agents.json` 從空開始）。
 - 回滾：`mv /opt/kairos/kairos.prev /opt/kairos/kairos && systemctl restart kairos`。新版升級過 schema 時，舊版會以「資料庫的 schema 版本 … 比本版 Kairos 支援的 … 新」拒絕啟動：停止服務後把升級前的備份還原成 `data/kairos.db`（`STORAGE.md`「備份與還原」）再啟動舊版；備份之後收到的 report 不在其中。
 
+### 11.1 以套件安裝時的升級（0.8.0〔草稿〕起）
+
+```bash
+# 先驗證新版的 SHA256SUMS 與簽章（第 2 節），備份資料庫，再安裝新版套件
+sudo -u kairos kairos db backup /var/backups/kairos/kairos-before-upgrade-$(date -u +%F).db   --config /opt/kairos/kairos.toml
+apt install ./kairos-<新版本>-<commit>-linux-x86_64.deb       # 或 dnf install ./….rpm
+```
+
+套件升級時保留 `/opt/kairos/kairos.toml`（設定檔有修改時，dpkg 會詢問是否採用新版的預設值：選擇保留〔預設〕；rpm 把新版的預設值寫成 `kairos.toml.rpmnew`），`data/`、`logs/` 不動，執行中的服務自動重新啟動（`systemctl try-restart`）。回滾：`apt install ./kairos-<舊版本>-….deb`（`dnf downgrade ./….rpm`）並依上方「回滾」還原資料庫。
+
 ## 12. 移除
+
+以套件安裝時：`apt remove kairos`（`dnf remove kairos`）停止並移除程式與 unit，`/opt/kairos/data`、`kairos.toml`、系統帳號保留；`apt purge kairos` 另外刪除 `kairos.toml` 與 `logs/`，**資料目錄仍保留**（資料庫與 `data/pki` 的私鑰），確定不再需要時自行 `rm -rf /opt/kairos` 並 `userdel kairos`。以發佈包安裝時：
 
 ```bash
 systemctl disable --now kairos
@@ -725,7 +649,7 @@ rm -rf /opt/kairos          # 含伺服器私鑰與所有 report 資料
 userdel kairos
 ```
 
-管理主機上的 `~/kairos-pki/`（CA 私鑰與簽發資料庫）不會被刪除，依組織政策另行處理。
+離線保存的根 CA（手動 PKI 為管理主機上的 `~/kairos-pki/`）不會被刪除，依組織政策另行處理。
 
 ## 13. 疑難排解
 
@@ -738,9 +662,9 @@ userdel kairos
 | `無法開啟 key.pem: Permission denied` | 私鑰權限或群組不對：應為 `root:kairos` 640 |
 | `無法監聽 0.0.0.0:443: Permission denied` | 監聽 1024 以下的連接埠需要 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（第 8 節 drop-in） |
 | 日誌在 journal 與 `logs/` 各一份 | 預設行為，見第 9.2 節 |
-| 所有代理突然被拒，日誌出現 `ExpiredRevocationList` 或 `CRL … 已過期` | CRL 過期。依第 6.4 節重新產生並依第 10.1 節部署；之後設定第 10.3 節的 `kairos-crl.timer` |
+| 所有代理突然被拒，日誌出現 `ExpiredRevocationList` 或 `CRL … 已過期` | `data/pki/crl/issuing.crl`（線上簽發）過期：Kairos 沒有重新產生（檢查 `KRS-E1205`、`KRS-E1303`），以 `sudo -u kairos kairos pki gencrl` 立即產生。`auth.crl`（手動 PKI）過期：依第 P.4 節重新產生並依第 10.1 節部署，之後設定第 10.3 節的 `kairos-crl.timer` |
 | `[WARN] CRL … 將在 … 後過期` | CRL 即將過期：依第 6.4、10.1 節更新；使用 `kairos-crl.timer` 時檢查 `journalctl -u kairos-crl` |
-| `[WARN] 伺服器憑證 … 將在 … 後到期` | 依第 6.1 節重新簽發，依第 10.1 節覆寫 |
+| `[WARN] 伺服器憑證 … 將在 … 後到期` | 依第 10.4 節以 `kairos pki sign` 重新簽發（手動 PKI 依第 P.1 節），依第 10.1 節覆寫 |
 | `無法啟用 WAL（journal_mode 為 …）` | `data/` 所在的檔案系統不支援 SQLite 的 WAL（例如 NFS、SMB）。改用本機磁碟 |
 | `資料庫的 schema 版本 N 比本版 Kairos 支援的 M 新` | 降版執行。改用較新的版本，或停止服務後還原升級前的備份（第 11 節） |
 | `不是 Kairos 的資料庫（application_id = …）` | `storage.data_dir` 指到其他程式的 SQLite 檔。確認設定 |
@@ -750,3 +674,203 @@ userdel kairos
 | 匯入期間 Kairos 啟動失敗（`database is locked`） | `kairos reports import` 正獨占資料庫。匯入結束後 systemd 會依 `Restart=on-failure` 自動重新啟動；匯入時請先停止服務 |
 | `kairos reports import` 以 root 執行時以結束代碼 10 拒絕 | 匯入會建立或寫入 `kairos.db`，請以服務帳號執行：`sudo -u kairos /opt/kairos/kairos reports import …` |
 | 其他錯誤訊息 | 見 `README.md`「疑難排解」 |
+
+## 附錄 P：以 openssl 手動管理 PKI（0.7 以前的部署）
+
+0.8.0 起新安裝改用第 6 節的 `kairos pki init`。以下是 0.7 以前的步驟，留給沿用既有 CA 的部署、或不讓任何 CA 私鑰放在伺服器上的離線簽發模式（`PKI.md` 第 6 節）。其中的 openssl 指令可以用 `kairos pki sign`（伺服器憑證、代理簽發 CA、用戶端憑證）與 `kairos pki gencrl`（CRL）取代，免寫 `ca.cnf`（`PKI.md` 第 15 節）。
+
+
+正式環境需要兩個 CA，用途不同、請分開建立：
+
+| CA | 用途 | 管理方式 |
+|---|---|---|
+| 伺服器 CA（`ca.pem`） | 簽發 Kairos 的伺服器憑證；每台 Pulse 只信任它 | `openssl x509 -req`（伺服器憑證不需撤銷，到期重簽即可） |
+| 代理 CA（`client-ca.pem`） | **只**用來簽發 Pulse 的客戶端憑證（mTLS） | `openssl ca` 資料庫，才能撤銷並產生 CRL |
+
+兩把 CA 私鑰（`ca.key`、`client-ca.key`）都在管理主機上產生並離線保存，**不要**複製到 Kairos 主機。以下指令在管理主機執行。
+
+### P.1 伺服器 CA 與伺服器憑證
+
+```bash
+mkdir -p ~/kairos-pki/server-ca && cd ~/kairos-pki/server-ca
+umask 077
+
+# 伺服器 CA（只需一次）
+openssl req -x509 -newkey rsa:4096 -nodes \
+  -keyout ca.key -out ca.pem -days 3650 -subj "/CN=Kairos Server CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# 伺服器私鑰與 CSR：SAN 填 Pulse 連線時使用的所有名稱／IP
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout key.pem -out server.csr -subj "/CN=monitor.example.com" \
+  -addext "subjectAltName=DNS:monitor.example.com,IP:10.0.0.5" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "extendedKeyUsage=serverAuth"
+
+# 以伺服器 CA 簽發（-copy_extensions copyall 需 OpenSSL 3.0+，才會帶入 SAN）
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -out cert.pem -days 825 -copy_extensions copyall
+
+openssl x509 -in cert.pem -noout -ext subjectAltName,basicConstraints,extendedKeyUsage
+```
+
+- `cert.pem`、`key.pem` 交給 Kairos（第 P.6 節）。
+- `ca.pem` 交給每台 Pulse（`server.ca_cert`），Pulse 的 `server.domain` 填 SAN 中的名稱。
+- `basicConstraints=critical,CA:FALSE` 不能省：rustls 不接受 CA 憑證當伺服器憑證（`CaUsedAsEndEntity`）。
+
+### P.2 代理 CA（openssl ca 資料庫，可撤銷）
+
+```bash
+mkdir -p ~/kairos-pki/agent-ca/newcerts && cd ~/kairos-pki/agent-ca
+umask 077
+touch index.txt
+echo 1000 > serial
+echo 1000 > crlnumber
+
+cat > ca.cnf <<'EOF'
+# 簽發時以環境變數 AGENT_ID 指定代理的 agent_id；未設定時簽發會失敗（避免簽出錯誤的 SAN）
+AGENT_ID =
+
+[ ca ]
+default_ca = agent_ca
+
+[ agent_ca ]
+# 路徑相對於「目前目錄」：所有 openssl ca 指令都必須在 agent-ca/ 目錄內執行
+dir              = .
+database         = $dir/index.txt
+serial           = $dir/serial
+crlnumber        = $dir/crlnumber
+new_certs_dir    = $dir/newcerts
+certificate      = $dir/client-ca.pem
+private_key      = $dir/client-ca.key
+default_md       = sha256
+default_days     = 825
+default_crl_days = 30
+policy           = policy_any
+# 不複製 CSR 中的擴充欄位：SAN 一律由簽發者以 AGENT_ID 指定，CSR 夾帶的其他 SAN 不會進入憑證
+copy_extensions  = none
+# 允許同一個 agent_id 重新簽發（換金鑰）而不必先撤銷舊憑證
+unique_subject   = no
+
+[ policy_any ]
+commonName       = supplied
+
+[ client_ext ]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = clientAuth
+subjectAltName         = DNS:${ENV::AGENT_ID}
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+
+[ crl_ext ]
+authorityKeyIdentifier = keyid:always
+EOF
+
+# 代理 CA 憑證（只需一次）
+openssl req -x509 -newkey rsa:3072 -nodes \
+  -keyout client-ca.key -out client-ca.pem -days 3650 -subj "/CN=Kairos Agent CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# 第一份 CRL（即使還沒有撤銷任何憑證也要產生，Kairos 設定了 auth.crl 就必須讀得到）
+openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl
+openssl crl -in agents.crl -noout -lastupdate -nextupdate
+```
+
+- `client-ca.pem` 與 `agents.crl` 交給 Kairos（第 P.6 節）；`client-ca.key` 與整個 `agent-ca/` 目錄離線保存並備份（`index.txt` 遺失就無法撤銷先前簽發的憑證）。
+- 代理 CA 只用來簽發代理的客戶端憑證：Kairos 信任它簽發的**任何**客戶端憑證。
+
+### P.3 簽發代理的客戶端憑證
+
+每台 Pulse 的管理者依 Pulse 的 `INSTALL.md` 在代理主機上產生 `agent_id`、私鑰與 CSR，把 **CSR 與 agent_id** 交給你（私鑰不離開代理主機）。
+
+```bash
+cd ~/kairos-pki/agent-ca
+AGENT_ID=6f1c0e4a-1b2c-4d3e-9f00-112233445566     # 對方提供的 agent_id（小寫 UUID）
+mkdir -p issued
+
+# 先檢視 CSR：確認 CN／SAN 與 agent_id 一致（不一致時向對方確認，不要直接簽）
+openssl req -in "$AGENT_ID.csr" -noout -verify -subject
+openssl req -in "$AGENT_ID.csr" -noout -text | grep -A1 "Subject Alternative Name"
+
+# 簽發：SAN 強制為 DNS:<AGENT_ID>，CN 強制為 agent_id
+AGENT_ID="$AGENT_ID" openssl ca -batch -config ca.cnf -extensions client_ext \
+  -subj "/CN=$AGENT_ID" -in "$AGENT_ID.csr" -out "issued/$AGENT_ID.pem" -notext
+
+openssl x509 -in "issued/$AGENT_ID.pem" -noout -serial -enddate \
+  -ext subjectAltName,extendedKeyUsage
+```
+
+把 `issued/$AGENT_ID.pem`（對方存成 `client.pem`）與伺服器 CA 的 `ca.pem` 交回給該台代理。記下序號與 agent_id 的對應（`index.txt` 也有紀錄），之後撤銷時要用。
+
+### P.4 撤銷與定期更新 CRL
+
+```bash
+cd ~/kairos-pki/agent-ca
+openssl ca -batch -config ca.cnf -revoke "issued/$AGENT_ID.pem" -crl_reason keyCompromise
+openssl ca -batch -config ca.cnf -gencrl -crlexts crl_ext -out agents.crl
+```
+
+把新的 `agents.crl` 部署到 Kairos（第 10.1 節）。Kairos 在下一個重載週期（`server.reload_interval_secs`，預設 30 秒）載入，被撤銷的代理收到 `certificate_rejected` 並被斷線，之後重連在 TLS 握手階段就被拒；其他代理不受影響。
+
+> **CRL 過期會讓所有代理被拒。** Kairos 對 CRL 採 fail closed：超過 `nextUpdate`（上面設定為 30 天）就視為無法判定撤銷狀態。請在到期前定期重新產生並部署，例如每週一次（即使沒有新的撤銷；第 10.3 節的 `kairos-crl.timer`）。`openssl crl -in agents.crl -noout -nextupdate` 可查看到期時間。Kairos 在 `nextUpdate` 前 7 天（`auth.crl_expiry_warning_days`）起記 `WARN`，過期後記 `ERROR`。
+
+### P.5 （選用，0.5.0）註冊通道與線上簽發 CA
+
+註冊通道（8444，`crates/kairos-proto/ENROLL.md`）讓 Pulse 以安裝字串自行申請憑證，取代第 P.3 節的逐台手動簽發。Kairos 持有一把**簽發 CA** 的私鑰（`data/pki/issuing-<ca_id>.key`，0600），核准後立即簽發（線上模式；架構與取捨見 `PKI.md`）。簽發 CA 由第 P.2 節的代理 CA（或另外的離線根 CA）簽發，代理 CA 的私鑰仍不離開管理主機。
+
+```bash
+# 1. Kairos 主機：產生簽發 CA 的私鑰與 CSR（預設寫到 data/pki/issuing-<ca_id>.csr）
+sudo -u kairos /opt/kairos/kairos pki issuing-ca new --config /opt/kairos/kairos.toml
+# 把 /opt/kairos/data/pki/issuing-1.csr 帶到管理主機的 ~/kairos-pki/agent-ca/
+
+# 2. 管理主機：以代理 CA 簽發（CA:TRUE、pathlen:0、keyCertSign／cRLSign、EKU clientAuth，5 年）
+cd ~/kairos-pki/agent-ca
+cat > issuing_ca_ext.cnf <<'EOF'
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+EOF
+openssl x509 -req -in issuing-1.csr -CA client-ca.pem -CAkey client-ca.key -CAcreateserial   -days 1825 -extfile issuing_ca_ext.cnf -out issuing-1.pem
+# 把 issuing-1.pem 帶回 Kairos 主機
+
+# 3. Kairos 主機：安裝（檢查與私鑰成對、擴充欄位、至少剩 2 年；第一個簽發 CA 自動啟用）
+sudo -u kairos /opt/kairos/kairos pki issuing-ca install issuing-1.pem --config /opt/kairos/kairos.toml
+sudo -u kairos /opt/kairos/kairos pki issuing-ca list --config /opt/kairos/kairos.toml
+```
+
+`kairos.toml` 加上（完整欄位見 `kairos.example.toml` 的 `[enroll]`、`[pki]`）：
+
+```toml
+[enroll]
+mode = "open"                 # 也可以之後以 kairos enroll mode open 或主控台切換
+
+[pki]
+mode = "online"
+server_ca_path = "ca.pem"     # Pulse 信任的 CA（第 P.1 節的伺服器 CA）；安裝字串的 CA 指紋
+```
+
+- 依路徑調整：上例在第 P.2 節的 `agent-ca/` 目錄執行（代理 CA 的 `client-ca.pem`、`client-ca.key`）；`ca.pem` 以 644 放到 `/opt/kairos/`。
+- 防火牆：允許要註冊的主機連到 8444（`ufw allow proto tcp from 10.0.0.0/16 to any port 8444`；firewalld 同第 9.3 節的 rich rule，改 port 8444）。8444 不需要對管理網段以外開放；不開放新註冊時以 `kairos enroll mode renew_only`（只受理過期續簽）或 `closed` 關閉。
+- 建立註冊 token：`sudo -u kairos /opt/kairos/kairos enroll-token create --name rollout --group <群組> --max-uses 50 --config /opt/kairos/kairos.toml` 建立 token（安裝字串寫在 stderr）；在 Pulse 主機執行 `pulse enroll --install-string <安裝字串>`。待核准的申請以 `kairos enroll list`、`kairos enroll approve <request_id>` 處理（或主控台，需要 `operate` 範圍的 API token）。
+- Kairos 自己產生簽發 CA 的 CRL（`data/pki/crl/issuing.crl`，每 24 小時與每次撤銷），撤銷以 `kairos pki revoke <序號或 agent_id> --reason <原因> --comment <說明>`，不必經過第 P.4 節的 `openssl ca`。
+- 不想讓私鑰放在伺服器上時採離線模式（`pki.mode = "offline"`）：核准後以 `kairos pki queue export` 匯出 CSR，在管理主機 `kairos pki sign-bundle` 簽發後 `kairos pki queue import` 匯入（`PKI.md` 第 6 節）。
+
+### P.6 放置憑證
+
+把以上產生的檔案帶到 Kairos 主機（例如 `scp` 到 `~/kairos-files/`），再放到 `/opt/kairos`：
+
+```bash
+cd ~/kairos-files
+install -o root -g kairos -m 644 cert.pem       /opt/kairos/cert.pem
+install -o root -g kairos -m 640 key.pem        /opt/kairos/key.pem
+install -o root -g kairos -m 644 client-ca.pem  /opt/kairos/client-ca.pem
+install -o root -g kairos -m 644 agents.crl     /opt/kairos/agents.crl
+
+```
+
+`kairos.toml` 的 `[server]` 改為 `cert_path = "cert.pem"`、`key_path = "key.pem"`，`[auth]` 改為 `client_ca = "client-ca.pem"`、`crl = ["agents.crl"]`。
