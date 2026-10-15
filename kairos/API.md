@@ -560,7 +560,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 ```
 
 - `cpu_usage` 為占整台主機的百分比；`memory` 為常駐記憶體 bytes。Pulse 設定 `processes.command` 時另有 `command`，**原樣回傳**（可能含敏感資訊，Kairos 不遮罩）。
-- 超出保留期限（同原始資料，預設 7 天）或沒有資料時 `sampled_at` 為 `null`、清單為空陣列。`supported` 同第 5.9 節（`processes`）。
+- 超出保留期限（同原始資料，預設 7 天；回應的 `retention_days` 為 `storage.raw_retention_days`）或沒有資料時 `sampled_at` 為 `null`、清單為空陣列。`supported` 同第 5.9 節（`processes`）。
 - `at` 不是 RFC 3339 時 400。
 
 ## 6. 即時變更推送（SSE）

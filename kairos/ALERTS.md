@@ -151,7 +151,7 @@ subnet_prefix_v6 = 64
 
 - glob 只支援 `*`、`?`，區分大小寫，每個清單最多 16 個（設計包 §30.5 #11）；`mountpoints` 只用於 `disk`、`devices` 只用於網路，其他組合 `KRS-E5001`。
 - 評估方式不變：每 5 秒以狀態表的最近一次 report 判斷（`LastReport` 另保存每個掛載點的使用率、置換空間、負載、介面與磁碟的速率；速率以最後兩筆 report 算出）。離線主機沒有值。
-- 預覽與回測（`POST /api/v1/alert-rules/preview`）以 `rollup_5m` 的平均值重播：磁碟用 `system.filesystem.usage`（沒有時用推算值），網路用速率序列，負載用資產的處理器數。回應另帶 `hosts_without_metric`（範圍內沒有這個指標資料的台數，「符合主機數」照算）、`not_reported`（原因的台數：`old_pulse`（Pulse 0.8.0 以前，置換空間與負載）、`windows`（負載）、`no_inventory`（負載，沒有資產的處理器數）、`no_data`）、`swap_total_zero`（置換空間總量為 0）、`items_in_scope`（磁碟與網路：涉及的掛載點／介面數），`notes` 有對應的說明（設計包 §30.5 #5）。
+- 預覽與回測（`POST /api/v1/alert-rules/preview`）以 `rollup_5m` 的平均值重播：磁碟用 `system.filesystem.usage`（沒有時用推算值），網路用速率序列，負載用資產的處理器數。回應另帶 `hosts_without_metric`（範圍內沒有這個指標資料的台數，「符合主機數」照算）、`not_reported`（原因的台數：`old_pulse`（Pulse 0.8.0 以前，置換空間與負載）、`windows`（負載）、`no_inventory`（負載，沒有資產的處理器數）、`no_data`）、`swap_total_zero`（置換空間總量為 0）、`items_in_scope`（磁碟與網路：涉及的掛載點／介面數）（設計包 §30.5 #5）。
 - 範本（`alerts-ux.md` §2.2，主控台 S09）：「磁碟使用率 > 90% 持續 10 分鐘，低於 85% 恢復」（警告）、「磁碟使用率 > 95% 持續 5 分鐘」（嚴重）。
 
 ### 5.4 靜音與維護時段（§4；D23、D26）

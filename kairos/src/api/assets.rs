@@ -256,6 +256,7 @@ pub async fn processes(
             "at": ts_ms(at_ms),
             "sampled_at": sampled_at,
             "supported": supported,
+            "retention_days": ctx.config.storage.raw_retention_days,
             "top_cpu": field("top_cpu"),
             "top_memory": field("top_memory"),
         }),

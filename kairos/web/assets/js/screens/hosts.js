@@ -5,10 +5,15 @@
 //   API 回 400 並建議正確的寫法，顯示在搜尋欄下。
 // - 即時更新：已載入的列的狀態欄就地更新（不重排），頂部顯示「有 N 台狀態變化 · 更新列表」（§6.3）。
 // - 0.7.0 隱藏（沒有後端，decisions/INTEGRATION.md §28.6 的原則）：批次操作與勾選框（主機的寫入操作）、
-//   匯出 CSV、「新增主機」（S12 尚無畫面）、已儲存的檢視、欄位設定、憑證與生命週期篩選；
+//   匯出 CSV、「新增主機」（S12 尚無畫面）、已儲存的檢視、憑證與生命週期篩選；
 //   API 為 null 的狀態（嚴重、警告、待核准）不顯示狀態 chip。
+// - 0.8.0〔草稿〕（F4，設計包 §30 D49）：預設顯示「磁碟」（使用率最高的掛載點）；可選欄位（CPU 型號、邏輯處理器、
+//   記憶體總量、廠牌與型號、運作時間）由「欄位設定」開啟，只存在這個瀏覽器；「作業系統」篩選依家族
+//   （os_family）。序號不提供欄位（D47）。
 
 import { h, icon, announce, mount } from '../core/dom.js';
+import * as prefs from '../core/prefs.js';
+import { openDialog } from '../ui/dialog.js';
 import { t, statusLabel } from '../core/strings.js';
 import { api, qs } from '../core/api.js';
 import * as sse from '../core/sse.js';
@@ -16,14 +21,14 @@ import * as fmt from '../core/format.js';
 import { replaceQuery } from '../core/router.js';
 import { pageHead, emptyState, field } from '../ui/components.js';
 import { createTable } from '../ui/table.js';
-import { hostNameCell, statusCell, osText, memRatio, offlineFor, reasonText } from './host-common.js';
+import { hostNameCell, statusCell, osText, memRatio, offlineFor, reasonText, isOldPulse, F4_VERSION } from './host-common.js';
 
 const STATUSES = ['critical', 'offline', 'warning', 'unknown', 'pending', 'online'];
 const SELECTS = [
   { key: 'offline_reason', label: 'hosts.filter.reason', facet: 'offline_reason', fmt: (v) => reasonText(v) },
   { key: 'group', label: 'hosts.filter.group', facet: 'group' },
   { key: 'tag', label: 'hosts.filter.tag', facet: 'tag' },
-  { key: 'os', label: 'hosts.filter.os', facet: 'os' },
+  { key: 'os_family', label: 'hosts.filter.osFamily', facet: 'os_family', fmt: (v) => t(`hosts.osFamily.${v}`) },
   { key: 'version', label: 'hosts.filter.version', facet: 'version' },
 ];
 const PAGE = 100;
@@ -37,7 +42,7 @@ function parseState(q) {
     offline_reason: q.get('offline_reason') || '',
     group: q.get('group') || '',
     tag: q.get('tag') || '',
-    os: q.get('os') || '',
+    os_family: q.get('os_family') || '',
     version: q.get('version') || '',
     sort: { key: sortRaw.replace(/^-/, ''), desc: sortRaw.startsWith('-') },
   };
@@ -50,7 +55,7 @@ function apiParams(st, cursor) {
     offline_reason: st.offline_reason,
     group: st.group,
     tag: st.tag,
-    os: st.os,
+    os_family: st.os_family,
     version: st.version,
     sort: `${st.sort.desc ? '-' : ''}${st.sort.key}`,
     limit: PAGE,
@@ -217,7 +222,27 @@ export function render(ctx) {
   }
 
   // ---- 表格 ----
-  const cols = [
+  // 資產欄位：舊版 Pulse（沒有資產）時「—」，title 寫完整的原因（設計包 S04）
+  const na = (r) => (isOldPulse(r) ? h('span', { class: 'muted', title: t('host.na.oldPulse', { version: F4_VERSION }) }, '—') : '—');
+  const inv = (r, k) => (r.inventory && r.inventory[k] != null ? r.inventory[k] : null);
+  const diskCell = (r) => {
+    const d = r.last_report && r.last_report.disk;
+    if (!d || d.usage == null) return na(r);
+    return [
+      h('span', { title: t('col.diskTitle') }, `${d.mountpoint} ${fmt.pct(d.usage)}`),
+      d.usage >= 95 ? h('span', { class: 'k-full' }, icon('status-critical'), t('host.values.diskFull')) : null,
+      d.estimated ? h('span', { class: 'k-sub' }, t('host.estimated')) : null,
+    ];
+  };
+  const OPTIONAL = [
+    { code: 'm', key: 'cpu_model', label: t('col.cpuModel'), render: (r) => inv(r, 'cpu_model') || na(r) },
+    { code: 'c', key: 'cores', label: t('col.cores'), num: true, render: (r) => (inv(r, 'cpu_logical_cores') != null ? fmt.num(inv(r, 'cpu_logical_cores')) : na(r)) },
+    { code: 't', key: 'memory_total', label: t('col.memoryTotal'), num: true, render: (r) => (inv(r, 'memory_total') != null ? fmt.gib(inv(r, 'memory_total')) : na(r)) },
+    { code: 'v', key: 'vendor_product', label: t('col.vendorProduct'), render: (r) => [inv(r, 'vendor'), inv(r, 'product')].filter(Boolean).join(' ') || na(r) },
+    { code: 'u', key: 'uptime', label: t('col.uptime'), sort: 'uptime', num: true, render: (r) => (r.uptime_secs != null ? fmt.duration(r.uptime_secs) : r.status === 'online' ? na(r) : '—') },
+  ];
+  const chosen = () => new Set(String(prefs.get('hostColumns') || '').split(',').filter(Boolean));
+  const baseCols = [
     { key: 'status', label: t('col.status'), sort: 'status', render: statusCell },
     { key: 'hostname', label: t('col.host'), sort: 'hostname', cls: 'k-cell-host', render: (r) => hostNameCell(r) },
     { key: 'group', label: t('col.group'), render: (r) => r.group || '—' },
@@ -228,7 +253,39 @@ export function render(ctx) {
     { key: 'offline_for', label: t('col.offlineFor'), render: offlineFor },
     { key: 'cpu', label: t('col.cpu'), sort: 'cpu', num: true, defaultDesc: true, render: (r) => (r.status === 'online' && r.last_report ? fmt.pct(r.last_report.cpu_usage) : '—') },
     { key: 'memory', label: t('col.memory'), sort: 'memory', num: true, defaultDesc: true, render: (r) => (r.status === 'online' ? fmt.pct(memRatio(r.last_report)) : '—') },
+    { key: 'disk', label: t('col.disk'), sort: 'disk', defaultDesc: true, render: (r) => (r.status === 'online' ? diskCell(r) : '—') },
   ];
+  const cols = [];
+  const setColumns = () => {
+    const on = chosen();
+    cols.length = 0;
+    cols.push(...baseCols, ...OPTIONAL.filter((c) => on.has(c.code)));
+  };
+  setColumns();
+  function columnSettings() {
+    const on = chosen();
+    const boxes = OPTIONAL.map((c) => {
+      const cb = h('input', { type: 'checkbox', class: 'ds-check', name: `col-${c.key}`, checked: on.has(c.code), dataset: { code: c.code } });
+      return h('label', { class: 'ds-checkbox' }, cb, c.label);
+    });
+    const apply = h('button', { type: 'button', class: 'ds-button ds-button--primary' }, t('hosts.columns.apply'));
+    const d = openDialog({
+      title: t('hosts.columns.title'),
+      size: 'sm',
+      body: [h('p', { class: 'secondary' }, t('hosts.columns.hint')), h('fieldset', { class: 'k-fieldset' }, h('legend', null, t('hosts.columns.optional')), boxes)],
+      actions: [h('button', { type: 'button', class: 'ds-button ds-button--secondary', on: { click: () => d.close() } }, t('common.cancel')), apply],
+    });
+    apply.addEventListener('click', () => {
+      const codes = boxes.map((b) => b.querySelector('input')).filter((i) => i.checked).map((i) => i.dataset.code);
+      prefs.set('hostColumns', codes.join(','));
+      d.close();
+      setColumns();
+      // 排序依據的欄位被隱藏時回到預設排序
+      if (!cols.some((c) => c.sort === st.sort.key)) st.sort = { key: 'status', desc: false };
+      announce(t('hosts.columns.applied'));
+      reload();
+    });
+  }
   const table = createTable({
     caption: t('hosts.caption'),
     columns: cols,
@@ -244,7 +301,11 @@ export function render(ctx) {
   });
 
   mount(root, 
-    pageHead({ title: t('hosts.title'), meta: totalMeta }),
+    pageHead({
+      title: t('hosts.title'),
+      meta: totalMeta,
+      actions: h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: columnSettings } }, icon('settings'), t('hosts.columns.title')),
+    }),
     h(
       'section',
       { class: 'ds-filterbar', 'aria-label': t('hosts.filters') },

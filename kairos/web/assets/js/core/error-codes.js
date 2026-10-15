@@ -1,6 +1,6 @@
 // 自動產生，請勿手動修改：node kairos/web/tools/sync-design.mjs
 // 來源：設計包 prototype/kairos/error-codes.js（copywriting.md §3.3 錯誤代碼總表、§4.2 三段式範例；產生於 2026-10-15）
-// 只含 Kairos（KRS-）的 104 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
+// 只含 Kairos（KRS-）的 106 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
 export const ERROR_CODES = {
  "KRS-E0101": {
   "level": "E",
@@ -296,6 +296,13 @@ export const ERROR_CODES = {
   "reason": null,
   "fix": null
  },
+ "KRS-W2108": {
+  "level": "W",
+  "text": "資產資訊不合法（`inventory` 訊息被以 `invalid_report` 拒絕，不保存；Pulse 對同一份內容不再重送，等內容改變；範例 96）。與 report 不合法（`2105`）分開。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §30）",
+  "title": "已拒絕 his-db-01 送出的資產資訊：內容不合法",
+  "reason": "Pulse 送出的資產資訊（`inventory`）有欄位不符規格：網路介面 eth0 的 MAC 位址不是 6 組以「:」分隔的小寫十六進位。這一次的資產資訊沒有保存，主控台仍顯示上一次的內容；指標回報不受影響。通常是 Pulse 的錯誤或被修改過的 Pulse。",
+  "fix": "確認這台主機的 Pulse 是正式版本（主機詳情的 Pulse 版本、`pulse --version`）。若是正式版本，請以 `pulse diag` 產生診斷包並回報；Pulse 在內容改變之前不會重送同一份資產資訊。"
+ },
  "KRS-W2201": {
   "level": "W",
   "text": "同一 IP 連線數超過上限（Pulse 端：伺服器在加密連線建立前中斷）。8443：NAT 後超過 `server.max_connections_per_ip`（審計 A7，可加入 `server.per_ip_allowlist`）；8444：每 IP 同時連線或新連線硬上限，可重試",
@@ -435,6 +442,13 @@ export const ERROR_CODES = {
   "title": "今天的 JSONL 資料檔已達上限，之後的回報無法保存",
   "reason": "Kairos 使用 JSONL 儲存（`storage.backend = \"jsonl\"`），`reports-2026-10-09.jsonl` 已達 `storage.max_daily_bytes`（5 GB）。到換日（2026-10-10 08:00 UTC+8，即 UTC 午夜）之前的回報都會收到 `storage_unavailable`：支援補送的主機把資料留在本機緩衝、換日後補送（補送的資料寫入收到當天的檔案，隔天可能較快達到上限）；不支援補送的主機（Pulse 0.2 以前）這段資料遺失。",
   "fix": "改回預設的 SQLite 儲存（`storage.backend = \"sqlite\"`：依總容量上限刪除最舊的資料，不會拒收新的回報）；必須沿用 JSONL 時，調高 `storage.max_daily_bytes`（`0` 表示不限制）後重新啟動 Kairos。也請檢查是否有主機異常大量回報。"
+ },
+ "KRS-W4104": {
+  "level": "W",
+  "text": "主機的指標序列數已達上限（`storage.max_series_per_host`，預設 2,048）：新序列的指標不保存，其他照存並回 `ack`；每台主機每小時最多記一次。常見於網路介面名稱不斷變化（容器網路）或大量自訂指標（範例 97）。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §30）",
+  "title": "his-ap-01 的指標序列數已達上限（2,048），部分指標未保存",
+  "reason": "這台主機在資料庫中已有 2,048 個指標序列（每個「指標名稱＋掛載點或網路介面」是一個序列），新的序列不再保存，既有的序列照常保存。常見於網路介面名稱不斷變化的主機（例如每次啟動容器都建立新的虛擬介面），或回報了大量自訂指標。",
+  "fix": "1. 在主機詳情的「趨勢 › 網路」檢查介面清單，找出名稱一直改變的介面。\n2. 在這台主機的 `pulse.toml` 以 `collect.interface_exclude` 排除這些介面（例如 `[\"veth*\", \"tap*\"]`），重新啟動 Pulse。\n3. 舊的序列依保留期限自然刪除，不需手動清理；確實需要更多序列時調高 `storage.max_series_per_host`。"
  },
  "KRS-W4201": {
   "level": "W",

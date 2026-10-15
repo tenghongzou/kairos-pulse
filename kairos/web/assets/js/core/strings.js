@@ -9,6 +9,7 @@
 import { ALERT_STRINGS } from './strings-alerts.js';
 import { PKI_STRINGS } from './strings-pki.js';
 import { ADMIN_STRINGS } from './strings-admin.js';
+import { METRICS_STRINGS } from './strings-metrics.js';
 
 const M = {
   // ---- 共用 ----
@@ -456,6 +457,8 @@ const M = {
   'chart.noData': '{label}：這段時間沒有資料',
   'chart.range': '（範圍 {min}～{max}）',
   'chart.asTable': '以表格檢視資料',
+  'chart.multiSummary': '{label}，{from}～{to}：最新 {last}。以方向鍵逐點檢視。',
+  'chart.gapLegend': '離線或未保存（不補線）',
   'chart.col.time': '時間（{tz}）',
   'chart.col.avg': '平均',
   'chart.col.min': '最小',
@@ -568,6 +571,9 @@ Object.assign(M, ALERT_STRINGS);
 
 // 管理與系統畫面（S16～S18、S20、S21）的文字
 Object.assign(M, ADMIN_STRINGS);
+
+// 指標擴充（F4：S03、S04、S05、S09）的文字
+Object.assign(M, METRICS_STRINGS);
 
 /** 文字；缺少 key 時回傳 key 本身並記錄錯誤（Playwright 測試檢查主控台沒有錯誤） */
 export function t(key, params) {

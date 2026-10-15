@@ -10,7 +10,7 @@
 // - 範圍不支援群組（隱藏）；範圍為 0 台時不能儲存。
 
 import { h, icon, uid, mount, announce } from '../core/dom.js';
-import { t, severityLabel } from '../core/strings.js';
+import { t, has, severityLabel } from '../core/strings.js';
 import { api } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as fmt from '../core/format.js';
@@ -39,6 +39,19 @@ const PARAMS = {
     { key: 'min_count', unit: 1, label: 'alerts.edit.p.minCount', def: 5, min: 2, max: 1000 },
     { key: 'min_sources', unit: 1, label: 'alerts.edit.p.minSources', def: 2, min: 1, max: 100 },
   ],
+};
+
+/** 指標門檻的指標（設計包 S09「指標門檻的新指標與範圍」、§30 D48；API.md、ALERTS.md 第 5.3 節） */
+const METRICS = ['cpu', 'memory', 'disk', 'swap', 'load', 'network_rx', 'network_tx'];
+const metricMax = (m) => (m === 'network_rx' || m === 'network_tx' ? 1000000 : 100);
+const metricUnit = (m) => (m === 'network_rx' || m === 'network_tx' ? t('alerts.unit.mbps') : m === 'load' ? t('alerts.unit.load') : '%');
+const scopeKey = (m) => (m === 'disk' ? 'mountpoints' : m === 'network_rx' || m === 'network_tx' ? 'devices' : null);
+
+/** S08「從範本新增」（alerts-ux.md 2.2）：/alerts/rules/new?template= */
+export const TEMPLATES = {
+  cpu90: { name: 'alerts.template.name.cpu90', severity: 'warning', params: { metric: 'cpu', op: '>', threshold: 90, for_secs: 600, clear_threshold: null, clear_for_secs: 0 } },
+  disk90: { name: 'alerts.template.name.disk90', severity: 'warning', params: { metric: 'disk', op: '>', threshold: 90, for_secs: 600, clear_threshold: 85, clear_for_secs: 0 } },
+  disk95: { name: 'alerts.template.name.disk95', severity: 'critical', params: { metric: 'disk', op: '>', threshold: 95, for_secs: 300, clear_threshold: null, clear_for_secs: 0 } },
 };
 
 function numInput(name, value, { step = 'any', min, max, disabled } = {}) {
@@ -76,9 +89,13 @@ export function render(ctx) {
       ]);
       if (disposed) return;
       channels = ch;
+      const tpl = isNew ? TEMPLATES[ctx.query.get('template')] : null;
+      if (tpl) {
+        base = { kind: 'metric_threshold', builtin: false, category: 'host', name: t(tpl.name), severity: tpl.severity, params: { ...tpl.params }, scope: { tags: [], subnets: [], hosts: [] }, channels: [], notify: { escalate_channels: [] }, description: '', enabled: true };
+      }
       if (copyId && r) {
         base = { ...r, rule_id: null, builtin: false, name: t('alerts.edit.copyName', { name: r.name }), enabled: true };
-      } else {
+      } else if (!tpl) {
         base = r;
       }
       draw();
@@ -151,13 +168,15 @@ export function render(ctx) {
       if (paramsLocked && !readOnly && builtin) nodes.push(h('p', { class: 'k-why-disabled caption' }, icon('lock'), t('alerts.edit.adminOnly')));
       if (kind === 'metric_threshold') {
         const p = { metric: 'cpu', op: '>', threshold: 90, for_secs: 600, clear_threshold: null, clear_for_secs: 0, ...params };
-        const metric = h('select', { class: 'ds-select', name: 'metric', 'aria-label': t('alerts.edit.metric') }, ['cpu', 'memory'].map((m) => h('option', { value: m, selected: p.metric === m }, t(`alerts.metric.${m}`))));
+        const max = metricMax(p.metric);
+        const unit = metricUnit(p.metric);
+        const metric = h('select', { class: 'ds-select', name: 'metric', 'aria-label': t('alerts.edit.metric') }, METRICS.map((m) => h('option', { value: m, selected: p.metric === m }, t(`alerts.metric.${m}`))));
         const op = h('select', { class: 'ds-select', name: 'op', 'aria-label': t('alerts.edit.op') }, ['>', '>=', '<', '<='].map((o) => h('option', { value: o, selected: p.op === o }, t(`alerts.op.${o}`))));
-        const thr = numInput('threshold', p.threshold, { min: 0, max: 100 });
+        const thr = numInput('threshold', p.threshold, { min: 0, max });
         thr.setAttribute('aria-label', t('alerts.edit.threshold'));
         const forM = numInput('for_minutes', p.for_secs / 60, { min: 0, max: 1440 });
         forM.setAttribute('aria-label', t('alerts.edit.forMinutes'));
-        const clr = numInput('clear_threshold', p.clear_threshold, { min: 0, max: 100 });
+        const clr = numInput('clear_threshold', p.clear_threshold, { min: 0, max });
         clr.setAttribute('aria-label', t('alerts.edit.clearThreshold'));
         const clrFor = numInput('clear_for_minutes', p.clear_for_secs / 60, { min: 0, max: 1440 });
         clrFor.setAttribute('aria-label', t('alerts.edit.clearForMinutes'));
@@ -166,19 +185,59 @@ export function render(ctx) {
           clrDir.textContent = op.value.startsWith('>') ? t('alerts.edit.below') : t('alerts.edit.above');
         };
         setDir();
-        for (const el of [metric, op, thr, forM, clr, clrFor]) {
+        // 範圍：磁碟為掛載點、網路為網路介面（glob，最多 16 個；所有／只限指定）
+        const sk = scopeKey(p.metric);
+        const what = sk ? t(`alerts.edit.scope.${sk}`) : '';
+        const scopeList = sk && Array.isArray(p[sk]) ? p[sk] : [];
+        const scopeMode = sk
+          ? h(
+              'select',
+              { class: 'ds-select', name: 'scope_mode', 'aria-label': what },
+              h('option', { value: 'all', selected: !scopeList.length }, t('alerts.edit.scope.all', { what })),
+              h('option', { value: 'some', selected: scopeList.length > 0 }, t('alerts.edit.scope.some', { what })),
+            )
+          : null;
+        const scopeText = sk ? h('textarea', { class: 'ds-input k-mono-area', name: sk, rows: 3, spellcheck: 'false' }, scopeList.join('\n')) : null;
+        const scopeField = sk ? field({ label: t('alerts.edit.scope.list', { what }), input: scopeText, hint: t('alerts.edit.scope.hint', { what }) }) : null;
+        if (scopeField) scopeField.hidden = !scopeList.length;
+        if (scopeMode) {
+          scopeMode.addEventListener('change', () => {
+            scopeField.hidden = scopeMode.value !== 'some';
+          });
+        }
+        const readScopeList = () =>
+          sk && scopeMode.value === 'some'
+            ? scopeText.value
+                .split('\n')
+                .map((x) => x.trim())
+                .filter(Boolean)
+            : [];
+        for (const el of [metric, op, thr, forM, clr, clrFor, scopeMode, scopeText].filter(Boolean)) {
           el.disabled = paramsLocked;
           el.addEventListener('input', () => { markDirty(); setDir(); schedulePreview(); });
           el.addEventListener('change', () => { markDirty(); setDir(); schedulePreview(); });
         }
+        // 換指標：單位、範圍上限與範圍欄位跟著換（保留其他已填的值）
+        metric.addEventListener('change', () => {
+          Object.assign(params, fields.params.read(), { metric: metric.value });
+          delete params.mountpoints;
+          delete params.devices;
+          drawCondition();
+          const again = condBody.querySelector('select[name="metric"]');
+          if (again) again.focus();
+        });
+        const noteKey = p.metric === 'network_rx' || p.metric === 'network_tx' ? 'net' : p.metric;
         const errThr = h('p', { class: 'ds-field__error', id: uid('err'), hidden: true });
         const errClr = h('p', { class: 'ds-field__error', id: uid('err'), hidden: true });
         thr.setAttribute('aria-describedby', errThr.id);
         clr.setAttribute('aria-describedby', errClr.id);
         nodes.push(
-          h('div', { class: 'ds-sentence' }, t('alerts.edit.when'), metric, op, thr, '%', t('alerts.edit.for'), forM, t('alerts.edit.minutes')),
+          h('div', { class: 'ds-sentence' }, t('alerts.edit.when'), metric, op, thr, unit, t('alerts.edit.for'), forM, t('alerts.edit.minutes')),
           errThr,
-          h('div', { class: 'ds-sentence' }, t('alerts.edit.clearWhen'), clrDir, clr, '%', t('alerts.edit.for'), clrFor, t('alerts.edit.minutes')),
+          has(`alerts.edit.metricNote.${noteKey}`) ? h('p', { class: 'ds-field__hint' }, t(`alerts.edit.metricNote.${noteKey}`)) : null,
+          sk ? h('div', { class: 'ds-sentence' }, scopeMode) : null,
+          scopeField,
+          h('div', { class: 'ds-sentence' }, t('alerts.edit.clearWhen'), clrDir, clr, unit, t('alerts.edit.for'), clrFor, t('alerts.edit.minutes')),
           h('p', { class: 'ds-field__hint' }, t('alerts.edit.clearHint')),
           errClr,
         );
@@ -187,6 +246,8 @@ export function render(ctx) {
             const out = { metric: metric.value, op: op.value, threshold: Number(thr.value), for_secs: Math.round(Number(forM.value || 0) * 60) };
             if (clr.value !== '') out.clear_threshold = Number(clr.value);
             out.clear_for_secs = Math.round(Number(clrFor.value || 0) * 60);
+            const list = readScopeList();
+            if (sk && list.length) out[sk] = list;
             return out;
           },
           validate() {
@@ -199,15 +260,21 @@ export function render(ctx) {
             thr.removeAttribute('aria-invalid');
             clr.removeAttribute('aria-invalid');
             const v = Number(thr.value);
-            if (thr.value === '' || Number.isNaN(v) || v < 0 || v > 100) {
-              show(errThr, t('alerts.edit.thresholdRange'));
+            if (thr.value === '' || Number.isNaN(v) || v < 0 || v > max) {
+              show(errThr, max === 100 ? t('alerts.edit.thresholdRange') : t('alerts.edit.thresholdRangeN', { max: fmt.num(max) }));
               thr.setAttribute('aria-invalid', 'true');
               return thr;
+            }
+            if (sk && scopeMode.value === 'some') {
+              const list = readScopeList();
+              const msg = !list.length ? t('alerts.edit.scope.empty') : list.length > 16 ? t('alerts.edit.scope.tooMany') : '';
+              scopeField.setError(msg);
+              if (msg) return scopeText;
             }
             if (clr.value !== '') {
               const c = Number(clr.value);
               const above = op.value.startsWith('>');
-              if (Number.isNaN(c) || c < 0 || c > 100 || (above && c > v) || (!above && c < v)) {
+              if (Number.isNaN(c) || c < 0 || c > max || (above && c > v) || (!above && c < v)) {
                 show(errClr, above ? t('alerts.edit.clearAbove') : t('alerts.edit.clearBelow'));
                 clr.setAttribute('aria-invalid', 'true');
                 return clr;
@@ -216,6 +283,10 @@ export function render(ctx) {
             return null;
           },
           showError(param, msg) {
+            if (sk && (param === 'params.mountpoints' || param === 'params.devices')) {
+              scopeField.setError(msg);
+              return scopeText;
+            }
             const target = param === 'params.clear_threshold' || param === 'params.clear_for_secs' ? errClr : errThr;
             target.textContent = msg;
             target.hidden = false;
@@ -523,6 +594,13 @@ export function render(ctx) {
         h('p', null, t('alerts.preview.intro', { d: p.days })),
         h('p', { class: 'k-preview-big' }, t('alerts.preview.fires', { n: fmt.num(p.fires), hosts: fmt.num(p.hosts_involved) })),
         h('p', null, t('alerts.preview.quick', { n: fmt.num(p.self_recovered_within_10m) })),
+        Object.entries(p.not_reported || {})
+          .filter(([, n]) => n > 0)
+          .map(([reason, n]) => h('p', null, t('alerts.preview.missing', { count: fmt.num(n), reason: has(`alerts.preview.missing.${reason}`) ? t(`alerts.preview.missing.${reason}`) : reason }))),
+        p.swap_total_zero ? h('p', null, t('alerts.preview.swapZero', { count: fmt.num(p.swap_total_zero) })) : null,
+        p.items_in_scope != null && scopeKey(fields.params.read().metric)
+          ? h('p', { class: 'caption' }, t('alerts.preview.items', { count: fmt.num(p.items_in_scope), what: t(`alerts.edit.scope.${scopeKey(fields.params.read().metric)}`) }))
+          : null,
         p.noisy
           ? inlineAlert({
               kind: 'warning',

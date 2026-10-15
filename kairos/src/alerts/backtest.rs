@@ -452,12 +452,6 @@ pub fn preview(
     if data_days.is_none() {
         notes.push("範圍內沒有這個指標的彙總資料".to_string());
     }
-    if without_metric > 0 && !hosts.is_empty() {
-        notes.push(format!(
-            "範圍內的 {} 台主機中，有 {without_metric} 台沒有回報這個指標（Pulse 版本較舊、Windows 沒有負載、或尚未收到資產），不會觸發",
-            hosts.len()
-        ));
-    }
     if for_secs < step {
         notes.push(format!(
             "持續時間少於 {} 分鐘，以 {} 分鐘計",
@@ -535,20 +529,20 @@ mod tests {
         crate::store::sqlite::migrate(&mut conn, crate::store::sqlite::MIGRATIONS).unwrap();
         let now_ms: i64 = 1_800_000_000_000;
         let start = now_ms / 1000 - 3600;
-        conn.execute_batch(&format!(
+        conn.execute_batch(
             "INSERT INTO hosts (host_id, agent_id, hostname, agent_version, os, first_seen, last_seen) VALUES
                (1, 'a', 'linux-08', '0.8.0', NULL, 0, 0),
-               (2, 'b', 'win-08', '0.8.0', '{{\"name\":\"Windows\"}}', 0, 0),
+               (2, 'b', 'win-08', '0.8.0', '{\"name\":\"Windows\"}', 0, 0),
                (3, 'c', 'linux-07', '0.7.0', NULL, 0, 0);
              INSERT INTO host_inventory (host_id, digest, body, collected_at, received_at, changed_at, os_family, cpu_logical_cores)
-               VALUES (1, 'd', '{{}}', 0, 0, 0, 'linux', 4), (2, 'd', '{{}}', 0, 0, 0, 'windows', 8);
+               VALUES (1, 'd', '{}', 0, 0, 0, 'linux', 4), (2, 'd', '{}', 0, 0, 0, 'windows', 8);
              INSERT INTO series (series_id, name, unit, labels, derived) VALUES
-               (10, 'system.filesystem.usage', '%', '{{\"mountpoint\":\"/\"}}', 0),
-               (11, 'system.filesystem.usage', '%', '{{\"mountpoint\":\"/data\"}}', 0),
-               (12, 'system.filesystem.usage', '%', '{{\"mountpoint\":\"/\"}}', 2),
+               (10, 'system.filesystem.usage', '%', '{\"mountpoint\":\"/\"}', 0),
+               (11, 'system.filesystem.usage', '%', '{\"mountpoint\":\"/data\"}', 0),
+               (12, 'system.filesystem.usage', '%', '{\"mountpoint\":\"/\"}', 2),
                (20, 'system.cpu.load_5m', '1', '', 0);
              INSERT INTO host_series VALUES (1, 10), (1, 11), (3, 12), (1, 20);"
-        ))
+        )
         .unwrap();
         // 主機 1：/ 一直 95%、/data 50%；主機 3（0.7，推算）：/ 一直 96%；負載只有主機 1（8 ÷ 4 = 2 倍）
         for i in 0..12_i64 {
