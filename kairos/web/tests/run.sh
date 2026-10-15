@@ -5,7 +5,8 @@
 #   bash kairos/web/tests/run.sh
 #
 # 環境變數（皆有預設值）：
-#   KAIROS_BIN   kairos 執行檔（預設先 cargo build -p kairos，用 $CARGO_TARGET_DIR/debug/kairos）
+#   KAIROS_BIN   kairos 執行檔（預設先 cargo build -p kairos -p pulse，用 $CARGO_TARGET_DIR/debug/kairos）
+#   PULSE_BIN    pulse 執行檔（預設與 KAIROS_BIN 同一個目錄；註冊與憑證的測試以它送出註冊申請）
 #   NODE         node 執行檔（預設 ~/opt/node/bin/node，否則 PATH 中的 node）
 #   PW_DIR       含 node_modules/playwright 與 node_modules/axe-core 的目錄（預設 ~/pw）
 #   OUT_DIR      截圖與結果（預設 kairos/web/tests/out）
@@ -14,6 +15,8 @@
 #
 # 流程：建立暫存目錄與 kairos.toml（主控台 127.0.0.1:39443、agent 連接埠 127.0.0.1:38080，未啟用 mTLS、
 # 只綁 loopback）→ 以 kairos users create 建立測試帳號 → 啟動 Kairos → node e2e.mjs（假 agent、瀏覽器）。
+# 註冊與憑證（S12～S15）的測試另外啟動第二個 Kairos（mTLS、註冊端點、線上簽發；以 openssl 建立測試用的
+# 根 CA、伺服器憑證與簽發 CA）：主控台 127.0.0.1:39444、agent 38081、註冊端點 38444（e2e-pki.mjs）。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,19 +28,28 @@ OUT_DIR="${OUT_DIR:-$HERE/out}"
 CONSOLE_PORT="${CONSOLE_PORT:-39443}"
 AGENT_PORT="${AGENT_PORT:-38080}"
 
+PKI_CONSOLE_PORT="${PKI_CONSOLE_PORT:-39444}"
+PKI_AGENT_PORT="${PKI_AGENT_PORT:-38081}"
+PKI_ENROLL_PORT="${PKI_ENROLL_PORT:-38444}"
+
 if [ -z "${KAIROS_BIN:-}" ]; then
-    (cd "$REPO" && cargo build -p kairos --locked --quiet)
+    (cd "$REPO" && cargo build -p kairos -p pulse --locked --quiet)
     KAIROS_BIN="${CARGO_TARGET_DIR:-$REPO/target}/debug/kairos"
 fi
 [ -x "$KAIROS_BIN" ] || { echo "找不到 kairos 執行檔：$KAIROS_BIN" >&2; exit 2; }
+PULSE_BIN="${PULSE_BIN:-$(dirname "$KAIROS_BIN")/pulse}"
+[ -x "$PULSE_BIN" ] || { echo "找不到 pulse 執行檔：$PULSE_BIN" >&2; exit 2; }
 
 TMP="$(mktemp -d -t kairos-web-XXXXXX)"
 KAIROS_PID=""
+PKI_PID=""
 cleanup() {
-    if [ -n "$KAIROS_PID" ] && kill -0 "$KAIROS_PID" 2>/dev/null; then
-        kill "$KAIROS_PID" 2>/dev/null || true
-        wait "$KAIROS_PID" 2>/dev/null || true
-    fi
+    for pid in "$KAIROS_PID" "$PKI_PID"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
     if [ "${KEEP:-0}" = "1" ]; then echo "保留暫存目錄：$TMP"; else rm -rf "$TMP"; fi
 }
 trap cleanup EXIT
@@ -99,6 +111,10 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 curl -sk "https://127.0.0.1:$CONSOLE_PORT/healthz" >/dev/null || { cat "$TMP/kairos.out" >&2; exit 1; }
+
+# 註冊與憑證（S12～S15）用的第二個 Kairos
+# shellcheck source=pki-env.sh
+. "$HERE/pki-env.sh"
 
 mkdir -p "$OUT_DIR"
 export KAIROS_URL="https://localhost:$CONSOLE_PORT" AGENT_PORT PW NEWBIE_PW OUT_DIR PW_DIR KAIROS_LOG="$TMP/kairos.out"

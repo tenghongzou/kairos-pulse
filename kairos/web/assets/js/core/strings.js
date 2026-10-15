@@ -7,6 +7,7 @@
 // - 錯誤代碼（KRS-…）的三段式不在這裡：由 error-codes.js（設計包 copywriting.md §3.3、§4.2 產生）提供。
 
 import { ALERT_STRINGS } from './strings-alerts.js';
+import { PKI_STRINGS } from './strings-pki.js';
 
 const M = {
   // ---- 共用 ----
@@ -552,6 +553,7 @@ const M = {
   'account.apiTokens': 'API token',
   'account.apiTokensNote': '需要 API token 時請洽管理員（這個版本由管理員以「屬於使用者」的方式建立）。',
 };
+Object.assign(M, PKI_STRINGS); // 註冊與憑證（S12～S15）的文字在 strings-pki.js
 
 Object.assign(M, ALERT_STRINGS);
 

@@ -205,6 +205,38 @@ fn enroll_approve_connect_renew_revoke_and_deregister() {
     );
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["data"]["results"][0]["result"], "issued", "{v}");
+    // 憑證清單帶主機名稱（還沒連上 8443 的主機用申請的主機名稱；主控台 S14），q 也比對主機名稱
+    let eserial = v["data"]["results"][0]["serial"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = token_of("read");
+    let (s, v) = env.console("GET", "/api/v1/pki/certificates?q=E2E-HOST", &read, None);
+    assert_eq!(s, 200, "{v}");
+    let row = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["serial"] == eserial.as_str())
+        .unwrap_or_else(|| panic!("清單中沒有 {eserial}：{v}"))
+        .clone();
+    assert_eq!(row["hostname"], "e2e-host", "{row}");
+    assert!(row.get("group").is_some(), "{row}");
+    let (s, v) = env.console(
+        "GET",
+        &format!("/api/v1/pki/certificates/{eserial}"),
+        &read,
+        None,
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["hostname"], "e2e-host", "{v}");
+    let (s, v) = env.console(
+        "GET",
+        "/api/v1/pki/certificates?q=no-such-host",
+        &read,
+        None,
+    );
+    assert_eq!((s, v["page"]["total"].as_u64()), (200, Some(0)), "{v}");
     let (s, v) = env.console("GET", "/api/v1/enroll/mode", &token_of("read"), None);
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["data"]["state"], "open");

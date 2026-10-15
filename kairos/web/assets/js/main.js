@@ -37,6 +37,11 @@ const ROUTES = [
   { path: '/alerts/rules/:id', perm: 'alert-rules:read', title: 'alerts.rules.title', load: () => import('./screens/alerts-rule-edit.js') },
   { path: '/alerts/silences/:id?', perm: 'silences:read', title: 'alerts.sl.title', load: () => import('./screens/alerts-silences.js') },
   { path: '/alerts/channels/:id?', perm: 'channels:read', title: 'alerts.ch.title', load: () => import('./screens/alerts-channels.js') },
+  // 註冊與憑證（S12～S15）
+  { path: '/enrollment/pending', perm: 'enroll:read', title: 'enroll.title', load: () => import('./screens/enroll-pending.js') },
+  { path: '/enrollment/tokens/:id?', perm: 'enroll:read', title: 'token.title', load: () => import('./screens/enroll-tokens.js') },
+  { path: '/certificates/ca', perm: 'pki:read', title: 'ca.title', load: () => import('./screens/pki-ca.js') },
+  { path: '/certificates/:serial?', perm: 'pki:read', title: 'cert.title', load: () => import('./screens/pki-certs.js') },
 ];
 
 const appRoot = document.getElementById('app');

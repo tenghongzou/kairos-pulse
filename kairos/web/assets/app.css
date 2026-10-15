@@ -810,3 +810,20 @@ fieldset > .k-stack--sm { margin-top: var(--ds-space-200); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }
+
+/* =========================================================================
+ * 註冊與憑證（S12～S15）
+ * ========================================================================= */
+/* 看起來像連結的按鈕（表格中開啟詳情對話框的主機名稱、序號） */
+.k-linklike { background: none; border: 0; padding: 0; font: inherit; color: var(--ds-color-text-link); text-decoration: underline; cursor: pointer; text-align: left; min-height: 24px; overflow-wrap: anywhere; }
+.k-linklike:hover { text-decoration-thickness: 2px; }
+.k-linklike:focus-visible { outline: var(--ds-focus-ring); outline-offset: 2px; }
+/* 申請編號（大字、等寬；電話比對用） */
+.k-req-code { font-family: var(--ds-font-family-mono); font-size: var(--ds-font-size-2xl); font-weight: var(--ds-font-weight-bold); letter-spacing: 0.05em; }
+/* 部署進度漏斗 */
+.k-funnel { display: flex; flex-wrap: wrap; gap: var(--ds-space-200); list-style: none; margin: 0; padding: 0; }
+.k-funnel__step { display: flex; flex-direction: column; gap: var(--ds-space-100); min-width: 112px; padding: var(--ds-space-200) var(--ds-space-300); border: var(--ds-border-width) solid var(--ds-color-border-subtle); border-radius: var(--ds-radius-md); }
+.k-funnel__step strong, .k-funnel__step a { font-size: var(--ds-font-size-xl); font-variant-numeric: tabular-nums; }
+/* 簽發 CA 清單 */
+.k-ca-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--ds-space-400); }
+.k-ca-list > li { padding-top: var(--ds-space-300); border-top: var(--ds-border-width) solid var(--ds-color-border-subtle); }
