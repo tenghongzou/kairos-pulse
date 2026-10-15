@@ -1,0 +1,9 @@
+# Pulse 的 Ansible 範例（Pulse 的 INSTALL.md 第 A.4 節）：
+#   ansible-playbook -i inventory.ini site-pulse.yml --ask-vault-pass \
+#     -e pulse_dist_dir=$HOME/kairos-pulse-dist/0.8.0 -e pulse_allowed_signers=$HOME/allowed_signers
+# pulse_install_string 放在 Ansible Vault（group_vars/all/vault.yml）。
+- name: Pulse
+  hosts: pulse_agents
+  become: true
+  roles:
+    - pulse

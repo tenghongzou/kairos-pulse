@@ -1,0 +1,13 @@
+# Pulse 的 Ansible role（最小版，0.8.0〔草稿〕；Pulse 的 INSTALL.md 第 A.4 節）。
+# 控制機上要有同一次發佈的檔案（SHA256SUMS、SHA256SUMS.sig 與套件），以及從另一個管道取得的發佈公鑰。
+
+# 控制機上放發佈檔的目錄（例如 ~/kairos-pulse-dist/0.8.0）
+pulse_dist_dir: ""
+# 控制機上的發佈公鑰（allowed_signers；必須從另一個管道取得，不要和發佈檔放在一起）
+pulse_allowed_signers: ""
+# 要安裝的版本（目錄中只有一個版本時可以留空）
+pulse_version: ""
+# Kairos 管理者提供的安裝字串（pulse-enroll:v1:…）；請放在 Ansible Vault，例如 group_vars/all/vault.yml
+pulse_install_string: ""
+# 送出申請後是否啟動服務（需人工核准時服務在背景接續）
+pulse_start: true
