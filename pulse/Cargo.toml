@@ -50,3 +50,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 tokio = { version = "1.53", features = ["test-util"] }
 # 不是新依賴（rcgen 的依賴）：測試用的假 8444 伺服器以指定的時間簽發憑證
 time = "0.3"
+
+# Windows 服務（商業審計 O4；pulse service install|uninstall|run，src/winsvc.rs）：服務控制管理員的註冊與
+# 服務進入點。MIT／Apache-2.0；依賴的 windows-sys 0.61 已在依賴樹中，另外只多 widestring
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
