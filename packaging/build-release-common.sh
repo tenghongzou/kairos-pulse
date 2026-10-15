@@ -271,6 +271,15 @@ grep -q "^members = \[\"$PKG_SUBDIR\", \"crates/\*\"\]" "$SBOM_SRC/Cargo.toml" |
     exit 1
 }
 
+# rpm 的 payload（cpio）起點：lead 96 bytes → 簽章 header（補齊到 8 的倍數）→ 主 header。
+# header 為 magic(3)＋版本(1)＋保留(4)＋索引數(4, big-endian)＋資料長度(4)＋索引(16×N)＋資料
+be32() { od -An -tu1 -v -j "$2" -N4 "$1" | awk "{print ((\$1*256+\$2)*256+\$3)*256+\$4}"; }
+rpm_payload_offset() {
+    off=96
+    off=$((off + 16 + 16 * $(be32 "$1" $((off + 8))) + $(be32 "$1" $((off + 12)))))
+    off=$(((off + 7) / 8 * 8))
+    echo $((off + 16 + 16 * $(be32 "$1" $((off + 8))) + $(be32 "$1" $((off + 12)))))
+}
 MTIME=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 FAKE_NOW=$(date -u -d "@$SOURCE_DATE_EPOCH" "+%Y-%m-%d %H:%M:%S")
 # 依字串推導固定的 GUID（MSI 的 ProductCode／PackageCode）：SHA-256 的前 128 位元，標成第 4 版
@@ -420,6 +429,26 @@ for T in $TARGETS; do
                 mv "/out/$PKG.$p.tmp" "/out/$PKG.$p"
                 NEW_FILES="$NEW_FILES $PKG.$p"
                 echo "    $PKG.$p（$(wc -c < "/out/$PKG.$p") bytes）"
+                # 套件中的 systemd unit 必須與發佈包的 unit（$UNIT_SRC）逐位元相同：兩者只有一個來源，
+                # 以這個檢查防止日後有人另外維護一份（例如 pulse.service 的序號複製只改了其中一份）
+                UNIT_CHECK=/tmp/unit-check
+                rm -rf "$UNIT_CHECK"
+                mkdir -p "$UNIT_CHECK"
+                case "$p" in
+                deb)
+                    ar p "/out/$PKG.$p" data.tar.gz |
+                        tar -xzf - -C "$UNIT_CHECK" --wildcards "*usr/lib/systemd/system/$NAME.service"
+                    ;;
+                rpm)
+                    tail -c +$(($(rpm_payload_offset "/out/$PKG.$p") + 1)) "/out/$PKG.$p" | gunzip |
+                        (cd "$UNIT_CHECK" && cpio -idm 2>/dev/null)
+                    ;;
+                esac
+                if ! cmp "$SRC/$UNIT_SRC" "$UNIT_CHECK/usr/lib/systemd/system/$NAME.service"; then
+                    echo "錯誤：$PKG.$p 中的 /usr/lib/systemd/system/$NAME.service 與 $UNIT_SRC 不同" >&2
+                    exit 1
+                fi
+                echo "    unit 與 $UNIT_SRC 相同"
             done
         fi
     else
