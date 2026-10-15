@@ -11,6 +11,7 @@ import { FakeAgent } from './fake-agent.mjs';
 import { pkiTests } from './e2e-pki.mjs';
 import { registerAdmin } from './e2e-admin.mjs';
 import { registerRbac } from './e2e-rbac.mjs';
+import { registerWcag } from './e2e-wcag.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -522,6 +523,9 @@ pkiTests({ test, newPage, axe, shot });
 
 // 三組畫面合併後的權限整體檢查（每個角色逐頁、直接呼叫寫入 API）：e2e-rbac.mjs
 registerRbac({ test, newPage, login, waitTitle, URL0, PW });
+
+// 發佈前的 WCAG A 級修正（j／k 的範圍、閒置逾時的提醒）：e2e-wcag.mjs
+registerWcag({ test, newPage, login, waitTitle, axe, URL0, PW });
 
 // ---------------------------------------------------------------------------
 async function main() {

@@ -523,7 +523,7 @@ sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name
 2. **憑證**：預設沿用 agent 連接埠的伺服器憑證（`server.cert_path`），瀏覽器通常會顯示「不受信任」。正式使用時以 `console.cert_path`／`console.key_path` 設定由組織 CA 簽發、SAN 為主控台網址（例如 `monitor.example.gov.tw`）的憑證（依 `server.reload_interval_secs` 熱重載），並把組織 CA 匯入管理電腦。
 3. **首位管理員登入**：以 9.4 建立的 `admin` 與一次性初始密碼登入，畫面會先要求變更密碼（至少 12 個字元、不包含帳號、不是常見密碼）；完成後進入「總覽」。接著在右上角「個人設定」啟用兩步驟驗證並保存 10 組復原碼。
 4. **確認**：總覽的六個狀態磚與「資料時間」、主機清單的總數與 `kairos hosts list` 一致；右上角的系統狀態燈顯示系統健康的整體狀態與第一個需要注意的項目（細節以 `GET /api/v1/system/health` 或 `kairos --check-config` 查看；系統健康畫面之後提供）。
-5. **瀏覽器需求**：Chromium（Chrome、Edge）最近的版本（Trusted Types 需要 Chromium；Firefox、Safari 可以使用，但未在發佈前測試）。需要啟用 JavaScript；不需要外部網路（所有檔案都由 Kairos 提供）。
+5. **瀏覽器需求**：0.7 支援 **Chromium 系（Chrome、Edge）** 最近的版本（Trusted Types 需要 Chromium）；Firefox、Safari 可以使用，但未在發佈前驗證。需要啟用 JavaScript；不需要外部網路（所有檔案都由 Kairos 提供）。
 
 - 閒置 30 分鐘（`accounts.session_idle_minutes`）沒有操作時自動登出，即使總覽仍在自動更新。
 - 0.7.0 的畫面：登入、總覽、主機清單、主機詳情、個人設定。告警、註冊與憑證、使用者、稽核、系統設定請先以 CLI（`kairos alerts`、`kairos enroll`、`kairos users`、`kairos audit`…）或 API 操作。

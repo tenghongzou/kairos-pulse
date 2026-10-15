@@ -219,7 +219,7 @@ export const ALERT_STRINGS = {
   'alerts.events.emptyBody': '有新的事件時會自動出現在這裡。',
   'alerts.events.emptyAll': '還沒有任何告警事件',
   'alerts.events.noMatch': '沒有符合條件的事件。',
-  'alerts.events.keys': '快速鍵：j／k 移到下一筆／上一筆事件，Enter 開啟。',
+  'alerts.events.keys': '快速鍵（焦點在事件表格內時）：j／k 移到下一筆／上一筆事件，Enter 開啟。',
 
   // ---- S07 事件詳情 ----
   'alerts.ev.notFound': '找不到這個事件',

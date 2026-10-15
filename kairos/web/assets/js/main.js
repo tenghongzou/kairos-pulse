@@ -9,7 +9,7 @@ import * as sse from './core/sse.js';
 import { api, setHooks } from './core/api.js';
 import { setRoutes, resolve, start, navigate, query, setLeaveGuard } from './core/router.js';
 import { mountShell, unmountShell, refreshShell, setOffline, getNavCount, onNavCount } from './ui/shell.js';
-import { confirm } from './ui/dialog.js';
+import { confirm, openDialog } from './ui/dialog.js';
 import { closeMenu } from './ui/menu.js';
 import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
@@ -184,22 +184,97 @@ async function onRoute() {
 // ---- 閒置逾時 ----
 // 總覽與清單會定期自動更新，伺服器把這些請求也當成活動；為了讓「閒置 N 分鐘後登出」（accounts.session_idle_minutes）
 // 仍然成立，瀏覽器端另外追蹤使用者的操作：超過工作階段的閒置時間沒有操作就結束工作階段並回登入頁。
+// 到期前 2 分鐘先以對話框提醒，「繼續使用」（或 Esc）延長（WCAG 2.2.1；設計包 INTEGRATION §29.5 #7）。
+// 提醒顯示期間只有「繼續使用」算數：在對話框內按 Tab 等操作不會默默延長。
+const IDLE_WARN_MS = 2 * 60 * 1000;
 let lastInteraction = Date.now();
+let idleWarning = null;
 function resetIdle() {
+  if (idleWarning) return;
   lastInteraction = Date.now();
 }
 for (const ev of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
   window.addEventListener(ev, resetIdle, { passive: true, capture: true });
 }
-setInterval(() => {
+
+function idleLimitMs() {
   const me = session.current();
-  if (!me || me.type !== 'session' || !me.session) return;
-  const idle = (me.session.idle_timeout_secs || 1800) * 1000;
-  if (Date.now() - lastInteraction > idle) {
+  if (!me || me.type !== 'session' || !me.session) return null;
+  return (me.session.idle_timeout_secs || 1800) * 1000;
+}
+
+function mmss(ms) {
+  const sec = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+}
+
+function closeIdleWarning() {
+  if (!idleWarning) return;
+  const w = idleWarning;
+  idleWarning = null;
+  clearInterval(w.timer);
+  w.dlg.close();
+}
+
+function showIdleWarning(limit) {
+  const deadline = lastInteraction + limit;
+  const clock = h('strong', { class: 'mono', 'aria-hidden': 'true' }, mmss(deadline - Date.now()));
+  // 朗讀：開啟時一次，之後只在 60、30、10 秒時更新（避免每秒朗讀）
+  const live = h('p', { class: 'ds-visually-hidden', 'aria-live': 'assertive' }, t('app.idle.live', { left: mmss(deadline - Date.now()) }));
+  const keep = () => {
+    closeIdleWarning();
+    lastInteraction = Date.now();
+    // 讓伺服器端也記一次活動（沒有自動更新的畫面）
+    session.refresh();
+  };
+  const keepBtn = h('button', { type: 'button', class: 'ds-button ds-button--primary', on: { click: keep } }, t('app.idle.keep'));
+  const outBtn = h('button', { type: 'button', class: 'ds-button ds-button--secondary', on: { click: () => { closeIdleWarning(); app.logout(); } } }, t('app.idle.logout'));
+  const dlg = openDialog({
+    title: t('app.idle.title'),
+    size: 'sm',
+    body: h('div', null, h('p', null, t('app.idle.body'), ' ', clock), live),
+    actions: [outBtn, keepBtn],
+    initialFocus: keepBtn,
+    onClose: () => {
+      // Esc 或右上角關閉＝繼續使用
+      if (idleWarning) keep();
+    },
+  });
+  dlg.el.setAttribute('role', 'alertdialog');
+  let spoken = Infinity;
+  const timer = setInterval(() => {
+    const left = deadline - Date.now();
+    clock.textContent = mmss(left);
+    for (const mark of [60000, 30000, 10000]) {
+      if (left <= mark && spoken > mark) {
+        spoken = mark;
+        live.textContent = t('app.idle.live', { left: mmss(left) });
+      }
+    }
+    if (left <= 0) {
+      closeIdleWarning();
+      lastInteraction = Date.now();
+      app.logout('session_expired');
+    }
+  }, 1000);
+  idleWarning = { dlg, timer };
+}
+
+setInterval(() => {
+  const limit = idleLimitMs();
+  if (!limit) {
+    closeIdleWarning();
+    return;
+  }
+  if (idleWarning) return;
+  const left = lastInteraction + limit - Date.now();
+  if (left <= 0) {
     lastInteraction = Date.now();
     app.logout('session_expired');
+  } else if (left <= IDLE_WARN_MS) {
+    showIdleWarning(limit);
   }
-}, 30000);
+}, 5000);
 
 // ---- 全域處理 ----
 setHooks({

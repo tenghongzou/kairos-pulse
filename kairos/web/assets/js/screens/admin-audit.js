@@ -272,6 +272,7 @@ export function verifyResult(r) {
   const b = r.broken || {};
   const e = lookup('KRS-E6201');
   const reason = BREAK_REASONS.includes(b.reason) ? t(`adm.audit.break.${b.reason}`) : b.reason;
+  const keyIssue = b.reason === 'hmac_key_unavailable' || b.reason === 'hmac_key_mismatch';
   return [
     h(
       'div',
@@ -280,10 +281,13 @@ export function verifyResult(r) {
       h(
         'div',
         { class: 'ds-banner__body' },
-        h('p', { class: 'strong' }, t('adm.audit.broken', { id: b.id ?? '—' }), ' ', codeTag(b.product_code || 'KRS-E6201')),
-        h('p', null, t('adm.audit.brokenReason', { r: reason })),
-        h('p', null, e && e.text ? e.text : ''),
-        h('p', null, t('adm.audit.brokenFix')),
+        // 同為 KRS-E6201 的兩種寫法（screens.md S18、copywriting.md 範例 95）：紀錄可能被竄改／金鑰問題
+        keyIssue
+          ? h('p', { class: 'strong' }, t('adm.audit.brokenKey'), ' ', codeTag(b.product_code || 'KRS-E6201'))
+          : h('p', { class: 'strong' }, t('adm.audit.broken', { id: b.id ?? '—' }), ' ', codeTag(b.product_code || 'KRS-E6201')),
+        h('p', null, keyIssue ? t('adm.audit.brokenKeyReason', { what: t(`adm.audit.brokenKeyWhat.${b.reason}`) }) : t('adm.audit.brokenReason', { r: reason })),
+        keyIssue ? null : h('p', null, e && e.text ? e.text : ''),
+        h('p', null, keyIssue ? t('adm.audit.brokenKeyFix') : t('adm.audit.brokenFix')),
         h('p', null, t('adm.audit.checked', { n: fmt.num(r.checked), first: r.first_id ?? '—', last: r.last_id ?? '—' })),
         h('p', null, hmacLine),
       ),

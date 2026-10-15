@@ -610,7 +610,8 @@ export function render(ctx) {
     }, 1500);
   }
 
-  // j／k：上下移動到事件連結
+  // j／k：上下移動到事件連結。只在焦點位於事件表格內時生效（WCAG 2.1.4；S23 沒有關閉快速鍵的開關，
+  // 設計包 INTEGRATION §29.5 #6）：監聽在表格上，不攔截整頁的按鍵
   function onKey(ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey || isTyping(ev.target) || document.querySelector('dialog[open]')) return;
     if (ev.key !== 'j' && ev.key !== 'k') return;
@@ -621,7 +622,7 @@ export function render(ctx) {
     const next = ev.key === 'j' ? Math.min(links.length - 1, i + 1) : Math.max(0, i - 1);
     links[next].focus();
   }
-  document.addEventListener('keydown', onKey);
+  table.el.addEventListener('keydown', onKey);
 
   renderTabs();
   renderSelects();
@@ -635,7 +636,7 @@ export function render(ctx) {
       clearTimeout(searchTimer);
       clearTimeout(summaryTimer);
       clearTimeout(catchUpTimer);
-      document.removeEventListener('keydown', onKey);
+      table.el.removeEventListener('keydown', onKey);
       if (ctrl) ctrl.abort();
     },
   };

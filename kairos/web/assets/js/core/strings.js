@@ -30,6 +30,11 @@ const M = {
   'app.leaveTitle': '要放棄變更嗎？',
   'app.leaveBody': '這個頁面有尚未儲存的變更，離開後不會保留。',
   'app.leaveConfirm': '放棄變更',
+  'app.idle.title': '即將因閒置而登出',
+  'app.idle.body': '你已經一段時間沒有操作，為了安全會自動登出。剩餘時間：',
+  'app.idle.live': '即將因閒置而登出，剩餘 {left}。選「繼續使用」可延長。',
+  'app.idle.keep': '繼續使用',
+  'app.idle.logout': '立即登出',
 
   // ---- 狀態與嚴重度（ia.md §5.1；不得改寫） ----
   'status.critical': '嚴重',

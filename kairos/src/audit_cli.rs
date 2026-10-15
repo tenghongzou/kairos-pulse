@@ -1,6 +1,7 @@
 //! `kairos audit list|verify|export`：稽核日誌（`kairos/API.md` 第 12.8 節；設計包 S18）。
 //!
-//! - `verify`：重新計算雜湊鏈，指出第一個斷點；斷裂時結束代碼 9（有嚴重問題）並以 `KRS-E6201` 說明。
+//! - `verify`：重新計算雜湊鏈與 HMAC，指出第一個斷點；驗證失敗（雜湊鏈斷裂、HMAC 不符、無法驗證 HMAC）時
+//!   結束代碼 9（有嚴重問題）並以 `KRS-E6201` 說明（設計包 copywriting.md 範例 95）。
 //! - `export`：JSONL（每行一筆，含 `prev_hash` 與 `hash`，最後一行為鏈的起訖值），可離線重新計算。
 //! - 驗證與匯出本身也寫入稽核（執行者為作業系統帳號）。
 
@@ -38,7 +39,7 @@ pub const AUDIT_USAGE: &str = "kairos audit — 稽核日誌（雜湊鏈；kairo
 任何角色都不能修改或刪除稽核紀錄；保留期限由 audit.retention_days 決定（預設 1095 天）。
 
 結束代碼：0 完成（verify：雜湊鏈完整）、1 資料庫錯誤、2 用法錯誤、3 設定錯誤、
-9 雜湊鏈斷裂（KRS-E6201）、10 權限不足、11 輸出檔已存在或資料庫使用中";
+9 稽核日誌完整性驗證失敗（雜湊鏈斷裂、HMAC 不符或無法驗證 HMAC；KRS-E6201）、10 權限不足、11 輸出檔已存在或資料庫使用中";
 
 const EXIT_BROKEN: u8 = 9;
 const EXIT_CONFLICT: u8 = 11;
