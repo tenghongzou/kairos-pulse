@@ -3,18 +3,31 @@
 #
 # 不要直接執行：由 kairos/packaging/build-release.sh、pulse/packaging/build-release.sh
 # 設定好產品參數後以「.」載入。呼叫端必須先設定：
-#   SCRIPT_DIR   產品的 packaging/ 目錄（絕對路徑）
-#   NAME         執行檔名稱（Cargo 的 bin 名稱，也是發佈包名稱的開頭）
-#   EXAMPLE_SRC  產品目錄中的範例設定；EXAMPLE_DST 為放進 tar 時的檔名
-#   UNIT_SRC     systemd unit 範本（相對於產品目錄）
-#   EXTRA_SRC    其他放進 tar 根目錄的檔案（相對於產品目錄，以空白分隔，可為空）
+#   SCRIPT_DIR       產品的 packaging/ 目錄（絕對路徑）
+#   NAME             執行檔名稱（Cargo 的 bin 名稱，也是發佈包名稱的開頭）
+#   EXAMPLE_SRC      產品目錄中的範例設定；EXAMPLE_DST 為放進發佈包時的檔名
+#   UNIT_SRC         systemd unit 範本（相對於產品目錄；只放進 Linux 的發佈包）
+#   EXTRA_SRC        其他放進發佈包根目錄的檔案（相對於產品目錄，以空白分隔，可為空）
+#   DEFAULT_TARGETS  預設建置的目標（Rust target，以空白分隔；可用環境變數 TARGETS 覆寫）
+#   EXTRA_DIST       （可為空）直接放到輸出目錄的檔案，格式「<相對於產品目錄的來源>:<輸出檔名>」
 #
-# 以 docker 的 rust alpine image（以 @sha256 digest 固定）建置 musl 靜態連結的 release 執行檔，
-# 產出：
-#   <DIST_DIR>/<名稱>-<版本>-<commit>[-dirty]-linux-x86_64.tar.gz
-#   <DIST_DIR>/<名稱>-<版本>-<commit>[-dirty]-linux-x86_64.cdx.json   SBOM（與 tar 內的相同）
+# 在 docker 的 rust alpine image（以 @sha256 digest 固定）內建置 release 執行檔並打包。每個目標的產出
+# （<基本名稱> = <名稱>-<版本>-<commit>[-dirty]-<os>-<arch>）：
+#
+#   | 目標 | 產出 |
+#   |---|---|
+#   | x86_64-unknown-linux-musl  | <基本名稱>.tar.gz、.deb、.rpm、.cdx.json（os-arch = linux-x86_64） |
+#   | aarch64-unknown-linux-musl | 同上（linux-aarch64；cargo-zigbuild＋zig 交叉編譯，以 qemu-aarch64 執行 --version） |
+#   | x86_64-pc-windows-gnu      | <基本名稱>.zip、.msi、.cdx.json（windows-x86_64；mingw-w64 交叉編譯、msitools 的 wixl 產生 MSI；
+#   |                            | 無法在容器內執行，--version 的檢查改為確認是 PE 執行檔） |
+#
 #   <DIST_DIR>/SHA256SUMS   兩個產品共用的合併清單：只更新本次產出檔案的那幾列，
 #                           保留其他產品的列；最後以 sha256sum -c 確認整份清單與目錄內容一致
+#
+# deb／rpm 以 nfpm（固定版本，下載後以 SHA-256 核對）依產品的 packaging/pkg/nfpm.yaml.in 產生：
+# 版面與 tar.gz 相同（/opt/<名稱>），另有 systemd unit（/usr/lib/systemd/system）、/usr/bin/<名稱> 的
+# 符號連結、預設設定（config|noreplace，升級不覆寫）與 packaging/pkg/ 的安裝前後腳本。
+# MSI 以產品的 packaging/windows/<名稱>.wxs 產生（只有 Pulse）。
 #
 # 建置來源不是工作目錄，而是以 git -c core.autocrlf=false archive 匯出的 commit 內容（repo 中
 # 儲存的 LF 版本），經 stdin 傳進容器。Windows 上 core.autocrlf=true 的工作目錄是 CRLF，直接掛載
@@ -24,23 +37,31 @@
 #
 # 可用的環境變數：
 #   DIST_DIR      輸出目錄，預設為 repo 根目錄的 dist/（兩個產品共用，SHA256SUMS 才能合併）
+#   TARGETS       要建置的目標（以空白分隔），預設為產品的 DEFAULT_TARGETS；例如只建 x86_64 Linux：
+#                 TARGETS=x86_64-unknown-linux-musl
+#   PACKAGES      Linux 目標要產生的套件格式（預設 "deb rpm"；空字串＝只產生 tar.gz）
+#   BUILD_JOBS    容器內 cargo 的平行工作數（CARGO_BUILD_JOBS），預設 2；只影響建置時間，不影響產物
 #   BUILD_VOLUME  CARGO_TARGET_DIR 使用的 docker volume，預設 sync-build-<repo 目錄名稱>；
 #                 可重現性檢查以全新的 volume 指定，確保不是沿用上次的建置產物
 #   SIGNING_KEY   簽章私鑰路徑（repo 之外）。有設定時打包後以 packaging/sign-release.sh 簽署
 #                 SHA256SUMS；沒有設定時，因 SHA256SUMS 已改變，刪除舊的 SHA256SUMS.sig
 #
-# tar 內容（一層 <套件名稱>/ 目錄）：執行檔（755）、範例設定、README.md、PROTOCOL.md、
-# CHANGELOG.md、INSTALL.md、THIRD-PARTY-LICENSES、<名稱>.cdx.json、systemd unit 與
-# EXTRA_SRC（其餘皆 644），擁有者一律為 0:0，時間戳記固定為 commit 時間（SOURCE_DATE_EPOCH），
-# 檔案依名稱排序。PROTOCOL.md 取自兩個產品共用的唯一規格，CHANGELOG.md 取自 repo 根目錄。
+# 發佈包內容（一層 <基本名稱>/ 目錄）：執行檔（755）、範例設定、README.md、PROTOCOL.md、
+# CHANGELOG.md、INSTALL.md、THIRD-PARTY-LICENSES、<名稱>.cdx.json、systemd unit（Linux）與
+# EXTRA_SRC（其餘皆 644）。可重現：tar 的擁有者一律為 0:0、檔案依名稱排序；tar、zip、deb、rpm、MSI
+# 內所有檔案的時間戳記固定為 commit 時間（SOURCE_DATE_EPOCH；nfpm 的 mtime、zip 以 TZ=UTC、
+# MSI 以 libfaketime）；MSI 的 PackageCode 與 ProductCode 由版本與 commit 推導；Windows 執行檔以
+# --no-insert-timestamp 連結（PE 標頭沒有建置時間）並去掉符號表。PROTOCOL.md 取自兩個產品共用的唯一規格，
+# CHANGELOG.md 取自 repo 根目錄。
 #
-# THIRD-PARTY-LICENSES（商業審計 B2）與 SBOM（D4）每次建置都在容器內依 Cargo.lock 重新產生，
-# 不會過期：
-#   - cargo-about（設定 packaging/about.toml、範本 packaging/about.hbs）以 --frozen 離線執行，
-#     授權全文只取自 crate 原始碼內的檔案；依賴出現 about.toml 未允許的授權時建置失敗。
+# THIRD-PARTY-LICENSES（商業審計 B2）與 SBOM（D4）每個目標各自在容器內依 Cargo.lock 重新產生，
+# 不會過期（Windows 的依賴與 Linux 不同，例如 windows-service、windows-sys）：
+#   - cargo-about（設定 packaging/about.toml，targets 換成該目標；範本 packaging/about.hbs）以
+#     --frozen 離線執行，授權全文只取自 crate 原始碼內的檔案；依賴出現 about.toml 未允許的授權時建置失敗。
 #   - cargo-cyclonedx 產生 CycloneDX 1.5 JSON（只含目標平台、非建置期的依賴）；
 #     SOURCE_DATE_EPOCH 讓 metadata.timestamp 固定為 commit 時間。
-#   兩個工具以固定版本 cargo install --locked 安裝在 BUILD_VOLUME 的 tools/ 下，之後重複使用。
+#   兩個工具與 cargo-zigbuild 以固定版本 cargo install --locked 安裝在 BUILD_VOLUME 的 tools/ 下，之後重複使用；
+#   nfpm 下載到同一處。
 #   已知限制：cargo metadata 會把只由弱依賴特性（dep?/feature）提到、實際未啟用的可選依賴
 #   列入 resolve，SBOM 因此可能多列少數沒有編譯進執行檔的 crate（0.2.0 為 toml 的 indexmap、
 #   toml_writer 與 indexmap 的 hashbrown、equivalent）；cargo-auditable 有同樣的限制。
@@ -50,16 +71,25 @@
 # rust:1.99-alpine（Alpine 3.24.2、rustc 1.99.0）的 multi-arch index digest，2026-10-12 查得。
 # 以 digest 固定後，rustc、gcc、musl-dev 等 image 內的檔案都不會再變動；tag 只供閱讀。
 IMAGE=rust:1.99-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627
-# image 內沒有 GNU tar（busybox tar 不支援 --sort、--owner 等可重現打包所需的選項），
-# 只有這個套件需要從 Alpine 套件庫安裝；版本鎖定為 image 的 Alpine 版本（v3.24）當時的版本。
-# Alpine 套件庫只保留最新的修訂版：此版本被取代後 apk 會失敗，需依 RELEASING.md 一併更新。
-APK_PACKAGES="tar=1.35-r5"
-TARGET=x86_64-unknown-linux-musl
+# image 內沒有、需要從 Alpine 套件庫安裝的套件；版本鎖定為 image 的 Alpine 版本（v3.24）當時的版本。
+# Alpine 套件庫只保留最新的修訂版：任一版本被取代後 apk 會失敗，需依 RELEASING.md 一併更新。
+#   tar：GNU tar（busybox tar 不支援 --sort、--owner 等可重現打包所需的選項）
+#   zig、qemu-aarch64：aarch64 musl 的交叉編譯（cargo-zigbuild）與 --version 檢查
+#   mingw-w64-gcc：x86_64-pc-windows-gnu 的連結器與 C 編譯器（ring、SQLite）
+#   msitools、libfaketime、zip：Windows 的 MSI（wixl、msibuild）與 zip
+APK_BASE="tar=1.35-r5"
+APK_AARCH64="zig=0.16.0-r1 qemu-aarch64=11.0.3-r0"
+APK_WINDOWS="mingw-w64-gcc=15.2.0-r0 msitools=0.106-r0 libfaketime=0.9.13-r0 zip=3.0-r13"
+HOST_TRIPLE=x86_64-unknown-linux-musl
 RUST_TOOLCHAIN=1.99.0
 CARGO_VOLUME=sync-cargo
-# 產生 THIRD-PARTY-LICENSES 與 SBOM 的工具（cargo install --locked，固定版本）
+# 產生 THIRD-PARTY-LICENSES 與 SBOM 的工具、aarch64 的交叉編譯（cargo install --locked，固定版本）
 CARGO_ABOUT_VERSION=0.9.2
 CARGO_CYCLONEDX_VERSION=0.5.9
+CARGO_ZIGBUILD_VERSION=0.23.4
+# deb／rpm：nfpm（goreleaser/nfpm 的發佈檔，2026-06-20；SHA-256 取自該版的 checksums.txt 並與下載檔核對）
+NFPM_VERSION=2.47.0
+NFPM_SHA256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
 PROTOCOL_SRC=crates/kairos-proto/PROTOCOL.md  # 協定規格（相對於 repo 根目錄）
 ABOUT_CONFIG=packaging/about.toml              # cargo-about 設定（相對於 repo 根目錄）
 ABOUT_TEMPLATE=packaging/about.hbs             # THIRD-PARTY-LICENSES 範本（相對於 repo 根目錄）
@@ -99,6 +129,38 @@ for f in Cargo.toml README.md "$EXAMPLE_SRC" packaging/INSTALL.md "$UNIT_SRC" ${
     [ -f "$PKG_SUBDIR/$f" ] || die "缺少 $PKG_SUBDIR/$f"
 done
 
+TARGETS=${TARGETS:-$DEFAULT_TARGETS}
+PACKAGES=${PACKAGES-deb rpm}
+BUILD_JOBS=${BUILD_JOBS:-2}
+APK_PACKAGES=$APK_BASE
+for t in $TARGETS; do
+    case "$t" in
+    x86_64-unknown-linux-musl) ;;
+    aarch64-unknown-linux-musl) APK_PACKAGES="$APK_PACKAGES $APK_AARCH64" ;;
+    x86_64-pc-windows-gnu)
+        APK_PACKAGES="$APK_PACKAGES $APK_WINDOWS"
+        for f in "$NAME.wxs" "$NAME.default.toml"; do
+            [ -f "$PKG_SUBDIR/packaging/windows/$f" ] || die "缺少 $PKG_SUBDIR/packaging/windows/$f（Windows 目標的 MSI 需要）"
+        done
+        ;;
+    *) die "不支援的目標 $t（x86_64-unknown-linux-musl、aarch64-unknown-linux-musl、x86_64-pc-windows-gnu）" ;;
+    esac
+done
+for p in $PACKAGES; do
+    case "$p" in
+    deb | rpm) ;;
+    *) die "不支援的套件格式 $p（deb、rpm）" ;;
+    esac
+done
+if [ -n "$PACKAGES" ]; then
+    for f in nfpm.yaml.in "$NAME.default.toml" preinstall.sh postinstall.sh preremove.sh postremove.sh; do
+        [ -f "$PKG_SUBDIR/packaging/pkg/$f" ] || die "缺少 $PKG_SUBDIR/packaging/pkg/$f（deb／rpm 需要）"
+    done
+fi
+for e in ${EXTRA_DIST:-}; do
+    [ -f "$PKG_SUBDIR/${e%%:*}" ] || die "缺少 $PKG_SUBDIR/${e%%:*}"
+done
+
 # ---- 版本與 commit ---------------------------------------------------------
 # 版本取自產品 Cargo.toml [package] 的 version（第一個 version 欄位）；--version 也是這個值
 VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$PKG_SUBDIR/Cargo.toml" | head -n 1)
@@ -124,10 +186,9 @@ if [ -n "$DIRTY" ]; then
         echo "警告：未追蹤的檔案不會進入建置（請先 git add 或提交）" >&2
     fi
 fi
-# tar 內檔案的時間戳記固定為該 commit 的時間，同一份原始碼重複打包時內容一致
+# 所有檔案的時間戳記固定為該 commit 的時間，同一份原始碼重複打包時內容一致
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD)
 BUILD_COMMIT="$COMMIT$DIRTY"
-PKG="$NAME-$VERSION-$BUILD_COMMIT-linux-x86_64"
 
 # ---- 輸出目錄與 docker volume ----------------------------------------------
 DIST_DIR=${DIST_DIR:-$REPO/dist}
@@ -135,9 +196,9 @@ mkdir -p "$DIST_DIR"
 HOST_DIST=$(host_path "$DIST_DIR")
 BUILD_VOLUME=${BUILD_VOLUME:-sync-build-$(basename "$REPO")}
 
-echo "==> 建置 $PKG"
+echo "==> 建置 $NAME $VERSION（$BUILD_COMMIT）"
 echo "    image=$IMAGE"
-echo "    target=$TARGET 輸出=$HOST_DIST"
+echo "    targets=$TARGETS packages=${PACKAGES:-（無）} 輸出=$HOST_DIST"
 echo "    volumes: $BUILD_VOLUME（target）、$CARGO_VOLUME（registry）"
 
 # 容器內執行的腳本（以 sh -c 傳入；變數用 -e 傳入，這裡的 $ 不在主機展開）
@@ -148,70 +209,58 @@ set -eu
 # 是否需要重新編譯，沿用 commit 時間可能讓切換到較舊的 commit 時誤用上次的建置產物
 mkdir -p /src
 tar -x -m -f - -C /src
-apk add --no-cache $APK_PACKAGES >/dev/null || {
-    echo "錯誤：apk 無法安裝 $APK_PACKAGES（Alpine 套件庫可能已更新該套件），請依 RELEASING.md 更新 image digest 與 APK_PACKAGES" >&2
+# 網路暫時失敗（套件庫的 TLS 錯誤等）時重試；版本不存在時三次都會失敗
+retry() {
+    n=1
+    until "$@"; do
+        [ "$n" -lt 3 ] || return 1
+        echo "注意：$1 失敗，10 秒後重試（第 $n 次）" >&2
+        n=$((n + 1))
+        sleep 10
+    done
+}
+# shellcheck disable=SC2086
+retry apk add --no-cache $APK_PACKAGES >/dev/null || {
+    echo "錯誤：apk 無法安裝 $APK_PACKAGES（Alpine 套件庫可能已更新其中的套件），請依 RELEASING.md 更新 image digest 與套件版本" >&2
     exit 1
 }
 
-# 授權清單與 SBOM 的工具：已安裝同版本時 cargo install 會直接略過
+# 授權清單、SBOM、交叉編譯的工具：已安裝同版本時 cargo install 會直接略過
 TOOLS=/build/tools
-for tool in "cargo-about@$CARGO_ABOUT_VERSION --features cli" "cargo-cyclonedx@$CARGO_CYCLONEDX_VERSION"; do
+TOOL_LIST="cargo-about@$CARGO_ABOUT_VERSION --features cli
+cargo-cyclonedx@$CARGO_CYCLONEDX_VERSION"
+case " $TARGETS " in *" aarch64-unknown-linux-musl "*)
+    TOOL_LIST="$TOOL_LIST
+cargo-zigbuild@$CARGO_ZIGBUILD_VERSION" ;;
+esac
+echo "$TOOL_LIST" | while read -r tool; do
     # shellcheck disable=SC2086
     CARGO_TARGET_DIR=/build/tools-target cargo install --quiet --locked --root "$TOOLS" $tool
+done
+export PATH="$TOOLS/bin:$PATH"
+
+# nfpm：固定版本的發佈檔，核對 SHA-256 後解開到 tools/
+NFPM="$TOOLS/nfpm-$NFPM_VERSION/nfpm"
+if [ -n "$PACKAGES" ] && [ ! -x "$NFPM" ]; then
+    mkdir -p "$TOOLS/nfpm-$NFPM_VERSION"
+    retry wget -q -O /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+    echo "$NFPM_SHA256  /tmp/nfpm.tar.gz" | sha256sum -c - >/dev/null || {
+        echo "錯誤：nfpm $NFPM_VERSION 的 SHA-256 不符" >&2
+        exit 1
+    }
+    tar -xzf /tmp/nfpm.tar.gz -C "$TOOLS/nfpm-$NFPM_VERSION" nfpm
+fi
+
+for T in $TARGETS; do
+    [ "$T" = "$HOST_TRIPLE" ] || retry rustup target add "$T" >/dev/null
 done
 
 # 在成員目錄內執行 cargo build 只會建置該成員；Cargo.lock 取自 workspace 根目錄（/src）
 SRC="/src/$PKG_SUBDIR"
 # cargo-about／cargo-cyclonedx 會讀取所有平台的依賴資訊，先下載 Cargo.lock 中的全部 crate
 (cd /src && cargo fetch --locked --quiet)
-cd "$SRC"
-cargo build --release --locked --target "$TARGET"
-BIN="$CARGO_TARGET_DIR/$TARGET/release/$NAME"
-[ -x "$BIN" ] || { echo "找不到建置產物 $BIN" >&2; exit 1; }
 
-echo "==> $NAME --version"
-EXPECTED="$NAME $VERSION ($BUILD_COMMIT)"
-ACTUAL=$("$BIN" --version) || {
-    echo "錯誤：$NAME --version 執行失敗（發佈包必須能以 --version 確認版本與 commit）" >&2
-    exit 1
-}
-echo "    $ACTUAL"
-[ "$ACTUAL" = "$EXPECTED" ] || {
-    echo "錯誤：--version 輸出「$ACTUAL」，預期「$EXPECTED」" >&2
-    exit 1
-}
-
-STAGE=/tmp/stage
-rm -rf "$STAGE"
-mkdir -p "$STAGE/$PKG"
-chmod 755 "$STAGE/$PKG"
-install -m 755 "$BIN"                    "$STAGE/$PKG/$NAME"
-install -m 644 "$SRC/$EXAMPLE_SRC"       "$STAGE/$PKG/$EXAMPLE_DST"
-install -m 644 "$SRC/README.md"          "$STAGE/$PKG/README.md"
-install -m 644 "/src/$PROTOCOL_SRC"     "$STAGE/$PKG/PROTOCOL.md"
-install -m 644 "/src/$CHANGELOG_SRC"    "$STAGE/$PKG/CHANGELOG.md"
-install -m 644 "$SRC/packaging/INSTALL.md" "$STAGE/$PKG/INSTALL.md"
-install -m 644 "$SRC/$UNIT_SRC"          "$STAGE/$PKG/$(basename "$UNIT_SRC")"
-for f in $EXTRA_SRC; do
-    install -m 644 "$SRC/$f" "$STAGE/$PKG/$(basename "$f")"
-done
-
-echo "==> THIRD-PARTY-LICENSES（cargo-about $CARGO_ABOUT_VERSION）"
-(cd /src && "$TOOLS/bin/cargo-about" generate --frozen \
-    -m "$PKG_SUBDIR/Cargo.toml" -c "$ABOUT_CONFIG" \
-    -o /tmp/THIRD-PARTY-LICENSES "$ABOUT_TEMPLATE")
-grep -q "^Used by:" /tmp/THIRD-PARTY-LICENSES || {
-    echo "錯誤：產生的 THIRD-PARTY-LICENSES 沒有任何授權條目" >&2
-    exit 1
-}
-install -m 644 /tmp/THIRD-PARTY-LICENSES "$STAGE/$PKG/THIRD-PARTY-LICENSES"
-sed -n "/^Overview/,/^$/p" /tmp/THIRD-PARTY-LICENSES | sed "s/^/    /"
-
-echo "==> SBOM（cargo-cyclonedx $CARGO_CYCLONEDX_VERSION）"
-# cargo-cyclonedx 把結果寫在 Cargo.toml 旁邊，因此在另一個固定路徑複製一份 workspace
-# （SBOM 的 bom-ref 含此路徑，固定才能重現），不影響 /src 的建置。
-# cargo metadata 會合併整個 workspace 的 feature（例如 Kairos 的 tokio "full" 會讓 Pulse 的
-# SBOM 多出 parking_lot），因此複本的 workspace 只保留本產品與共用 crate，與實際建置一致。
+# SBOM 用的 workspace 複本（見下方 SBOM 的說明），所有目標共用
 SBOM_SRC=/work/kairos-pulse
 rm -rf "$SBOM_SRC"
 mkdir -p "$SBOM_SRC"
@@ -221,37 +270,199 @@ grep -q "^members = \[\"$PKG_SUBDIR\", \"crates/\*\"\]" "$SBOM_SRC/Cargo.toml" |
     echo "錯誤：無法在 SBOM 用的 workspace 複本中縮減 members（Cargo.toml 格式改變？）" >&2
     exit 1
 }
-(cd "$SBOM_SRC/$PKG_SUBDIR" && CARGO_NET_OFFLINE=true "$TOOLS/bin/cargo-cyclonedx" cyclonedx \
-    --quiet --format json --spec-version 1.5 --target "$TARGET" \
-    --describe binaries --no-build-deps)
-SBOM="$SBOM_SRC/$PKG_SUBDIR/${NAME}_bin.cdx.json"
-[ -s "$SBOM" ] || { echo "錯誤：找不到 cargo-cyclonedx 的輸出 $SBOM" >&2; exit 1; }
-grep -q "\"version\": \"$VERSION\"" "$SBOM" || {
-    echo "錯誤：SBOM 中沒有版本 $VERSION" >&2
-    exit 1
-}
-# 縮減 members 後 cargo 會從複本的 Cargo.lock 移除用不到的套件，但不得改變任何版本：
-# 複本中的每個「名稱 版本」都必須出現在原本的 Cargo.lock
-lock_pairs() { awk "/^name = /{n=\$3} /^version = /{print n, \$3}" "$1" | sort -u; }
-lock_pairs /src/Cargo.lock > /tmp/lock-src
-lock_pairs "$SBOM_SRC/Cargo.lock" > /tmp/lock-sbom
-if grep -Fxv -f /tmp/lock-src /tmp/lock-sbom; then
-    echo "錯誤：產生 SBOM 時 Cargo.lock 的版本被改變（上面列出）" >&2
-    exit 1
-fi
-install -m 644 "$SBOM" "$STAGE/$PKG/$NAME.cdx.json"
-echo "    $(grep -c "\"bom-ref\"" "$SBOM") 個 bom-ref"
 
-cd "$STAGE"
-tar --owner=0 --group=0 --numeric-owner --sort=name \
-    --mtime="@$SOURCE_DATE_EPOCH" -cf - "$PKG" | gzip -n -9 > "/out/$PKG.tar.gz.tmp"
-mv "/out/$PKG.tar.gz.tmp" "/out/$PKG.tar.gz"
-# SBOM 另外放一份在 tar 外，掃描工具（Dependency-Track 等）不必先解壓
-install -m 644 "$STAGE/$PKG/$NAME.cdx.json" "/out/$PKG.cdx.json"
+MTIME=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
+FAKE_NOW=$(date -u -d "@$SOURCE_DATE_EPOCH" "+%Y-%m-%d %H:%M:%S")
+# 依字串推導固定的 GUID（MSI 的 ProductCode／PackageCode）：SHA-256 的前 128 位元，標成第 4 版
+guid_of() {
+    h=$(printf "%s" "$1" | sha256sum | cut -c1-32 | tr "a-f" "A-F")
+    printf "%s-%s-4%s-8%s-%s" "$(echo "$h" | cut -c1-8)" "$(echo "$h" | cut -c9-12)" \
+        "$(echo "$h" | cut -c14-16)" "$(echo "$h" | cut -c18-20)" "$(echo "$h" | cut -c21-32)"
+}
+NEW_FILES=""
+
+for T in $TARGETS; do
+    case "$T" in
+    x86_64-unknown-linux-musl) OS=linux; ARCH=x86_64; GOARCH=amd64; EXE="" ;;
+    aarch64-unknown-linux-musl) OS=linux; ARCH=aarch64; GOARCH=arm64; EXE="" ;;
+    x86_64-pc-windows-gnu) OS=windows; ARCH=x86_64; GOARCH=""; EXE=.exe ;;
+    esac
+    PKG="$NAME-$VERSION-$BUILD_COMMIT-$OS-$ARCH"
+    echo "==> [$T] cargo build（$PKG）"
+    cd "$SRC"
+    case "$T" in
+    aarch64-unknown-linux-musl)
+        cargo zigbuild --release --locked --target "$T" ;;
+    x86_64-pc-windows-gnu)
+        # 可重現：PE 標頭不寫建置時間；去掉符號表（rustc 為 raw-dylib 產生的匯入程式庫放在隨機命名的
+        # 暫存目錄 rustcXXXXXX，目錄名稱會進入 COFF 符號表，每次建置都不同）
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C link-arg=-Wl,--no-insert-timestamp -C strip=symbols" \
+            cargo build --release --locked --target "$T" ;;
+    *)
+        cargo build --release --locked --target "$T" ;;
+    esac
+    BIN="$CARGO_TARGET_DIR/$T/release/$NAME$EXE"
+    [ -f "$BIN" ] || { echo "找不到建置產物 $BIN" >&2; exit 1; }
+
+    EXPECTED="$NAME $VERSION ($BUILD_COMMIT)"
+    case "$T" in
+    x86_64-pc-windows-gnu)
+        # 容器內無法執行 Windows 執行檔：確認是 PE（MZ）且內嵌的版本字串與檔名一致
+        [ "$(head -c 2 "$BIN")" = MZ ] || { echo "錯誤：$BIN 不是 PE 執行檔" >&2; exit 1; }
+        grep -aq "$EXPECTED" "$BIN" || { echo "錯誤：$BIN 中找不到版本字串「$EXPECTED」" >&2; exit 1; }
+        echo "    （Windows 執行檔：已確認 PE 格式與內嵌的「$EXPECTED」，未執行）"
+        ;;
+    *)
+        RUNNER=""
+        [ "$T" = aarch64-unknown-linux-musl ] && RUNNER=qemu-aarch64
+        ACTUAL=$($RUNNER "$BIN" --version) || {
+            echo "錯誤：$NAME --version 執行失敗（發佈包必須能以 --version 確認版本與 commit）" >&2
+            exit 1
+        }
+        echo "    $ACTUAL"
+        [ "$ACTUAL" = "$EXPECTED" ] || {
+            echo "錯誤：--version 輸出「$ACTUAL」，預期「$EXPECTED」" >&2
+            exit 1
+        }
+        ;;
+    esac
+
+    STAGE=/tmp/stage
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE/$PKG"
+    chmod 755 "$STAGE/$PKG"
+    install -m 755 "$BIN"                    "$STAGE/$PKG/$NAME$EXE"
+    install -m 644 "$SRC/$EXAMPLE_SRC"       "$STAGE/$PKG/$EXAMPLE_DST"
+    install -m 644 "$SRC/README.md"          "$STAGE/$PKG/README.md"
+    install -m 644 "/src/$PROTOCOL_SRC"     "$STAGE/$PKG/PROTOCOL.md"
+    install -m 644 "/src/$CHANGELOG_SRC"    "$STAGE/$PKG/CHANGELOG.md"
+    install -m 644 "$SRC/packaging/INSTALL.md" "$STAGE/$PKG/INSTALL.md"
+    [ "$OS" = windows ] || install -m 644 "$SRC/$UNIT_SRC" "$STAGE/$PKG/$(basename "$UNIT_SRC")"
+    for f in $EXTRA_SRC; do
+        case "$OS:$f" in windows:*.service | windows:*.timer) continue ;; esac
+        install -m 644 "$SRC/$f" "$STAGE/$PKG/$(basename "$f")"
+    done
+
+    echo "==> [$T] THIRD-PARTY-LICENSES（cargo-about $CARGO_ABOUT_VERSION）"
+    sed "s|^targets = .*|targets = [\"$T\"]|" "/src/$ABOUT_CONFIG" > /tmp/about.toml
+    grep -q "^targets = \[\"$T\"\]" /tmp/about.toml || {
+        echo "錯誤：無法在 $ABOUT_CONFIG 中替換 targets" >&2
+        exit 1
+    }
+    (cd /src && "$TOOLS/bin/cargo-about" generate --frozen \
+        -m "$PKG_SUBDIR/Cargo.toml" -c /tmp/about.toml \
+        -o /tmp/THIRD-PARTY-LICENSES "$ABOUT_TEMPLATE")
+    grep -q "^Used by:" /tmp/THIRD-PARTY-LICENSES || {
+        echo "錯誤：產生的 THIRD-PARTY-LICENSES 沒有任何授權條目" >&2
+        exit 1
+    }
+    install -m 644 /tmp/THIRD-PARTY-LICENSES "$STAGE/$PKG/THIRD-PARTY-LICENSES"
+    sed -n "/^Overview/,/^$/p" /tmp/THIRD-PARTY-LICENSES | sed "s/^/    /"
+
+    echo "==> [$T] SBOM（cargo-cyclonedx $CARGO_CYCLONEDX_VERSION）"
+    # cargo-cyclonedx 把結果寫在 Cargo.toml 旁邊，因此在另一個固定路徑的 workspace 複本執行
+    # （SBOM 的 bom-ref 含此路徑，固定才能重現），不影響 /src 的建置。
+    # cargo metadata 會合併整個 workspace 的 feature（例如 Kairos 的 tokio "full" 會讓 Pulse 的
+    # SBOM 多出 parking_lot），因此複本的 workspace 只保留本產品與共用 crate，與實際建置一致。
+    SBOM="$SBOM_SRC/$PKG_SUBDIR/${NAME}_bin.cdx.json"
+    rm -f "$SBOM"
+    (cd "$SBOM_SRC/$PKG_SUBDIR" && CARGO_NET_OFFLINE=true "$TOOLS/bin/cargo-cyclonedx" cyclonedx \
+        --quiet --format json --spec-version 1.5 --target "$T" \
+        --describe binaries --no-build-deps)
+    [ -s "$SBOM" ] || { echo "錯誤：找不到 cargo-cyclonedx 的輸出 $SBOM" >&2; exit 1; }
+    grep -q "\"version\": \"$VERSION\"" "$SBOM" || {
+        echo "錯誤：SBOM 中沒有版本 $VERSION" >&2
+        exit 1
+    }
+    # 縮減 members 後 cargo 會從複本的 Cargo.lock 移除用不到的套件，但不得改變任何版本：
+    # 複本中的每個「名稱 版本」都必須出現在原本的 Cargo.lock
+    lock_pairs() { awk "/^name = /{n=\$3} /^version = /{print n, \$3}" "$1" | sort -u; }
+    lock_pairs /src/Cargo.lock > /tmp/lock-src
+    lock_pairs "$SBOM_SRC/Cargo.lock" > /tmp/lock-sbom
+    if grep -Fxv -f /tmp/lock-src /tmp/lock-sbom; then
+        echo "錯誤：產生 SBOM 時 Cargo.lock 的版本被改變（上面列出）" >&2
+        exit 1
+    fi
+    install -m 644 "$SBOM" "$STAGE/$PKG/$NAME.cdx.json"
+    echo "    $(grep -c "\"bom-ref\"" "$SBOM") 個 bom-ref"
+    # SBOM 另外放一份在發佈包外，掃描工具（Dependency-Track 等）不必先解壓
+    install -m 644 "$STAGE/$PKG/$NAME.cdx.json" "/out/$PKG.cdx.json"
+    NEW_FILES="$NEW_FILES $PKG.cdx.json"
+
+    # 所有檔案的時間戳記固定為 commit 時間（zip、MSI 的 CAB 取檔案的 mtime）
+    find "$STAGE/$PKG" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+
+    if [ "$OS" = linux ]; then
+        cd "$STAGE"
+        tar --owner=0 --group=0 --numeric-owner --sort=name \
+            --mtime="@$SOURCE_DATE_EPOCH" -cf - "$PKG" | gzip -n -9 > "/out/$PKG.tar.gz.tmp"
+        mv "/out/$PKG.tar.gz.tmp" "/out/$PKG.tar.gz"
+        NEW_FILES="$NEW_FILES $PKG.tar.gz"
+        echo "==> [$T] tar 內容"
+        tar tzvf "/out/$PKG.tar.gz"
+
+        # deb／rpm（nfpm）：文件與範例逐一列出（執行檔、unit 與預設設定另外寫在範本中）
+        if [ -n "$PACKAGES" ]; then
+            PKGDIR="$SRC/packaging/pkg"
+            : > /tmp/docs.yaml
+            for f in $(cd "$STAGE/$PKG" && ls | LC_ALL=C sort); do
+                case "$f" in "$NAME" | "$NAME.service") continue ;; esac
+                printf "  - src: \"%s\"\n    dst: /opt/%s/%s\n    file_info: {mode: 0644, owner: root, group: root}\n" \
+                    "$STAGE/$PKG/$f" "$NAME" "$f" >> /tmp/docs.yaml
+            done
+            sed -e "s|@ARCH@|$GOARCH|g" -e "s|@VERSION@|$VERSION|g" -e "s|@MTIME@|$MTIME|g" \
+                -e "s|@STAGE@|$STAGE/$PKG|g" -e "s|@PKGDIR@|$PKGDIR|g" \
+                -e "/@DOCS@/r /tmp/docs.yaml" -e "/@DOCS@/d" "$PKGDIR/nfpm.yaml.in" > /tmp/nfpm.yaml
+            for p in $PACKAGES; do
+                echo "==> [$T] $p（nfpm $NFPM_VERSION）"
+                "$NFPM" package --config /tmp/nfpm.yaml --packager "$p" --target "/out/$PKG.$p.tmp" >/dev/null
+                mv "/out/$PKG.$p.tmp" "/out/$PKG.$p"
+                NEW_FILES="$NEW_FILES $PKG.$p"
+                echo "    $PKG.$p（$(wc -c < "/out/$PKG.$p") bytes）"
+            done
+        fi
+    else
+        # Windows：zip（檔案依名稱排序；DOS 時間以 UTC 記錄）與 MSI
+        cd "$STAGE"
+        rm -f "/out/$PKG.zip.tmp"
+        find "$PKG" | LC_ALL=C sort | TZ=UTC zip -X -D -9 -q "/out/$PKG.zip.tmp" -@
+        mv "/out/$PKG.zip.tmp" "/out/$PKG.zip"
+        NEW_FILES="$NEW_FILES $PKG.zip"
+        echo "==> [$T] zip 內容"
+        unzip -l "/out/$PKG.zip" | sed "s/^/    /"
+
+        echo "==> [$T] msi（msitools wixl）"
+        MSI_SRC=/tmp/msi-src
+        rm -rf "$MSI_SRC"
+        mkdir -p "$MSI_SRC"
+        cp -p "$STAGE/$PKG"/* "$MSI_SRC/"
+        install -m 644 "$SRC/packaging/windows/$NAME.default.toml" "$MSI_SRC/$NAME.toml"
+        touch -d "@$SOURCE_DATE_EPOCH" "$MSI_SRC"/*
+        # MSI 的 ProductVersion 只能是數字（去掉預發佈標記）
+        MSI_VERSION=${VERSION%%-*}
+        PRODUCT_CODE=$(guid_of "$NAME-msi-product-$MSI_VERSION")
+        PACKAGE_CODE=$(guid_of "$NAME-msi-package-$VERSION-$BUILD_COMMIT")
+        sed -e "s|@VERSION@|$MSI_VERSION|g" -e "s|@PRODUCT_CODE@|$PRODUCT_CODE|g" -e "s|@SRC@|$MSI_SRC|g" \
+            "$SRC/packaging/windows/$NAME.wxs" > /tmp/product.wxs
+        FAKE="NO_FAKE_STAT=1 LD_PRELOAD=/usr/lib/faketime/libfaketime.so.1 FAKETIME_DONT_FAKE_MONOTONIC=1"
+        env $FAKE FAKETIME="@$FAKE_NOW" wixl -a x64 -o "/out/$PKG.msi.tmp" /tmp/product.wxs
+        env $FAKE FAKETIME="@$FAKE_NOW" msibuild "/out/$PKG.msi.tmp" \
+            -s "Pulse" "Kairos-Pulse" "x64;1033" "{$PACKAGE_CODE}"
+        mv "/out/$PKG.msi.tmp" "/out/$PKG.msi"
+        NEW_FILES="$NEW_FILES $PKG.msi"
+        msiinfo suminfo "/out/$PKG.msi" | sed "s/^/    /"
+        msiinfo export "/out/$PKG.msi" File | cut -f1,3,4 | sed "s/^/    /"
+    fi
+done
+
+for e in $EXTRA_DIST; do
+    install -m 644 "$SRC/${e%%:*}" "/out/${e#*:}"
+    NEW_FILES="$NEW_FILES ${e#*:}"
+done
 
 # 合併版 SHA256SUMS：去掉本次產出檔案的舊列與已不存在的檔案，加上新列，依檔名排序
 cd /out
-NEW_FILES="$PKG.tar.gz $PKG.cdx.json"
 : > SHA256SUMS.new
 if [ -f SHA256SUMS ]; then
     while read -r sum file; do
@@ -278,8 +489,9 @@ if [ -n "${HOST_UID:-}" ]; then
     # shellcheck disable=SC2086
     chown "$HOST_UID:$HOST_GID" $NEW_FILES SHA256SUMS
 fi
-echo "==> tar 內容"
-tar tzvf "$PKG.tar.gz"
+echo "==> 產出"
+# shellcheck disable=SC2086
+ls -l $NEW_FILES | sed "s/^/    /"
 '
 
 # Linux 主機上讓產出檔案屬於目前使用者（Windows/macOS 的 Docker Desktop 不需要）
@@ -299,13 +511,15 @@ git -c core.autocrlf=false archive --format=tar "$TREEISH" |
     -v "$BUILD_VOLUME:/build" \
     -v "$CARGO_VOLUME:/usr/local/cargo/registry" \
     -e CARGO_TARGET_DIR=/build/target \
-    -e RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN-$TARGET" \
+    -e CARGO_BUILD_JOBS="$BUILD_JOBS" \
+    -e RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN-$HOST_TRIPLE" \
     -e APK_PACKAGES="$APK_PACKAGES" \
     -e BUILD_COMMIT="$BUILD_COMMIT" \
     -e NAME="$NAME" \
     -e VERSION="$VERSION" \
-    -e TARGET="$TARGET" \
-    -e PKG="$PKG" \
+    -e TARGETS="$TARGETS" \
+    -e PACKAGES="$PACKAGES" \
+    -e HOST_TRIPLE="$HOST_TRIPLE" \
     -e PKG_SUBDIR="$PKG_SUBDIR" \
     -e EXAMPLE_SRC="$EXAMPLE_SRC" \
     -e EXAMPLE_DST="$EXAMPLE_DST" \
@@ -316,7 +530,11 @@ git -c core.autocrlf=false archive --format=tar "$TREEISH" |
     -e ABOUT_TEMPLATE="$ABOUT_TEMPLATE" \
     -e CARGO_ABOUT_VERSION="$CARGO_ABOUT_VERSION" \
     -e CARGO_CYCLONEDX_VERSION="$CARGO_CYCLONEDX_VERSION" \
+    -e CARGO_ZIGBUILD_VERSION="$CARGO_ZIGBUILD_VERSION" \
+    -e NFPM_VERSION="$NFPM_VERSION" \
+    -e NFPM_SHA256="$NFPM_SHA256" \
     -e EXTRA_SRC="${EXTRA_SRC:-}" \
+    -e EXTRA_DIST="${EXTRA_DIST:-}" \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e HOST_UID="$HOST_UID" \
     -e HOST_GID="$HOST_GID" \
@@ -331,8 +549,6 @@ elif [ -f "$DIST_DIR/SHA256SUMS.sig" ]; then
 fi
 
 echo
-echo "==> 完成"
-echo "    $HOST_DIST/$PKG.tar.gz"
-echo "    $HOST_DIST/$PKG.cdx.json"
-echo "    $HOST_DIST/SHA256SUMS："
+echo "==> 完成：$HOST_DIST"
+echo "    SHA256SUMS："
 sed 's/^/      /' "$DIST_DIR/SHA256SUMS"

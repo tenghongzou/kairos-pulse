@@ -7,6 +7,7 @@
 //! | [`csr`] | CSR 的檢查（ENROLL.md 第 15.1 節） |
 //! | [`issue`] | 簽發器：用戶端憑證、CRL、新的簽發 CA 的金鑰與 CSR |
 //! | [`store`] | `pki_cas`、`pki_certificates`、`pki_crls` 的讀寫 |
+//! | [`ca`] | 管理者的 CA 工具：`pki init`（根 CA、伺服器憑證、簽發 CA）、`pki sign`、`pki gencrl`、撤銷清單的匯出 |
 //!
 //! 檔案（`<storage.data_dir>/pki/`，目錄 0700）：
 //!
@@ -15,7 +16,10 @@
 //! | `issuing-<ca_id>.key` | 代理簽發 CA 的私鑰（PKCS#8 PEM） | 0600 |
 //! | `issuing-cas.pem` | 狀態為 `active`／`trusted` 的簽發 CA 憑證（mTLS 的信任錨之一；Kairos 寫出） | 0644 |
 //! | `crl/issuing.crl` | 各簽發 CA 目前的 CRL（PEM，Kairos 產生） | 0644 |
+//! | `root-ca.pem` | `kairos pki init` 建立的根 CA 憑證（`pki.server_ca_path`；私鑰不在這裡） | 0644 |
+//! | `server.pem`、`server.key` | `kairos pki init` 簽發的伺服器憑證與私鑰（8443／8444／9443） | 0644、0600 |
 
+pub mod ca;
 pub mod csr;
 pub mod issue;
 pub mod manage;

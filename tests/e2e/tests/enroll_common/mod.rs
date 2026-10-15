@@ -253,6 +253,77 @@ server_ca_path = "root.pem"
         env
     }
 
+    /// 以 `kairos pki init` 建立 PKI 的 Kairos（kairos/PKI.md 第 15 節）：根 CA（P-384）、localhost／127.0.0.1
+    /// 的伺服器憑證與線上簽發 CA 都由 Kairos 產生，設定檔只照 init 印出的建議值填寫
+    /// （`data/pki/server.pem`、`auth.client_ca = data/pki/issuing-cas.pem`、`pki.server_ca_path = data/pki/root-ca.pem`）
+    pub fn from_pki_init(name: &str) -> (Env, Value) {
+        let root = TestDir::new(name);
+        let dir = root.sub("kairos");
+        let ports = distinct_ports(3);
+        let base = format!(
+            "[server]\nlisten = \"127.0.0.1:{a}\"\nmax_connections = 64\nreload_interval_secs = 1\n\n[storage]\ndata_dir = \"data\"\n\n[log]\nlevel = \"debug\"\n\n[console]\nlisten = \"127.0.0.1:{c}\"\n",
+            a = ports[0],
+            c = ports[2],
+        );
+        std::fs::write(dir.join("kairos.toml"), &base).unwrap();
+        let (code, p) = run_to_exit(
+            "kairos",
+            &dir,
+            &[
+                "pki",
+                "init",
+                "--name",
+                "localhost",
+                "--name",
+                "127.0.0.1",
+                "--organization",
+                "E2E",
+                "--root-dir",
+                "root-ca",
+                "--config",
+                "kairos.toml",
+                "--json",
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{}", p.dump());
+        let doc: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+        let cfg = &doc["data"]["config"];
+        let s = |k: &str| cfg[k].as_str().unwrap().to_string();
+        let with_cert = base.replace(
+            "reload_interval_secs = 1\n",
+            &format!(
+                "reload_interval_secs = 1\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
+                s("server.cert_path"),
+                s("server.key_path")
+            ),
+        );
+        std::fs::write(
+            dir.join("kairos.toml"),
+            format!(
+                "{with_cert}\n[auth]\nclient_ca = \"{}\"\n\n[enroll]\nmode = \"open\"\nlisten = \"127.0.0.1:{}\"\npoll_after_base_secs = 5\n\n[pki]\nmode = \"online\"\nserver_ca_path = \"{}\"\n",
+                s("auth.client_ca"),
+                ports[1],
+                s("pki.server_ca_path"),
+            ),
+        )
+        .unwrap();
+        let root_pem = std::fs::read_to_string(dir.join(s("pki.server_ca_path"))).unwrap();
+        let env = Env {
+            root,
+            dir,
+            pki: Pki {
+                pem: root_pem,
+                ..Pki::new()
+            },
+            agent_port: ports[0],
+            enroll_port: ports[1],
+            console_port: ports[2],
+            envs: Vec::new(),
+        };
+        (env, doc)
+    }
+
     pub fn cli(&self, args: &[&str]) -> (i32, Proc) {
         let mut all: Vec<&str> = args.to_vec();
         all.extend(["--config", "kairos.toml"]);

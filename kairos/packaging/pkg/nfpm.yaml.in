@@ -1,0 +1,51 @@
+# Kairos 的 deb／rpm（nfpm；packaging/build-release-common.sh 以 sed 代入 @…@ 後在建置容器內執行）。
+# 版面與發佈包（tar.gz）相同：/opt/kairos；另外放 systemd unit 與 /usr/bin/kairos 的符號連結。
+# 套件只含程式、文件與預設設定；data/、logs/、root-ca/ 由 postinstall 建立，移除套件時不刪除資料。
+name: kairos
+arch: "@ARCH@"
+platform: linux
+version: "@VERSION@"
+version_schema: semver
+release: "1"
+section: net
+priority: optional
+maintainer: "Kairos-Pulse release <release@kairos-pulse>"
+vendor: Kairos-Pulse
+homepage: https://kairos-pulse.invalid/
+license: Proprietary
+description: |-
+  Kairos monitoring server: receives Pulse agent reports over mTLS,
+  stores them in SQLite and serves the HTTPS console API.
+mtime: "@MTIME@"
+disable_globbing: true
+contents:
+  - dst: /opt/kairos
+    type: dir
+    file_info: {mode: 0750, owner: root, group: kairos}
+  - src: "@STAGE@/kairos"
+    dst: /opt/kairos/kairos
+    file_info: {mode: 0755, owner: root, group: root}
+  - src: "@PKGDIR@/kairos.default.toml"
+    dst: /opt/kairos/kairos.toml
+    type: config|noreplace
+    file_info: {mode: 0640, owner: root, group: kairos}
+  - src: "@STAGE@/kairos.service"
+    dst: /usr/lib/systemd/system/kairos.service
+    file_info: {mode: 0644, owner: root, group: root}
+  - src: /opt/kairos/kairos
+    dst: /usr/bin/kairos
+    type: symlink
+    file_info: {mode: 0777, owner: root, group: root}
+@DOCS@
+scripts:
+  preinstall: "@PKGDIR@/preinstall.sh"
+  postinstall: "@PKGDIR@/postinstall.sh"
+  preremove: "@PKGDIR@/preremove.sh"
+  postremove: "@PKGDIR@/postremove.sh"
+deb:
+  compression: gzip
+rpm:
+  # 固定的建置主機名稱（預設為容器的 hostname，每次不同，會讓 rpm 無法重現）
+  buildhost: kairos-pulse-build
+  group: System Environment/Daemons
+  compression: gzip

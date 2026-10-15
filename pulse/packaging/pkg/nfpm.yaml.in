@@ -1,0 +1,51 @@
+# Pulse 的 deb／rpm（nfpm；packaging/build-release-common.sh 以 sed 代入 @…@ 後在建置容器內執行）。
+# 版面與發佈包（tar.gz）相同：/opt/pulse；另外放 systemd unit 與 /usr/bin/pulse 的符號連結。
+# logs/、buffer/、identity/、agent.id 由 postinstall 建立（不屬於套件，升級時不動）。
+name: pulse
+arch: "@ARCH@"
+platform: linux
+version: "@VERSION@"
+version_schema: semver
+release: "1"
+section: admin
+priority: optional
+maintainer: "Kairos-Pulse release <release@kairos-pulse>"
+vendor: Kairos-Pulse
+homepage: https://kairos-pulse.invalid/
+license: Proprietary
+description: |-
+  Pulse monitoring agent: reports system information to a Kairos server
+  over mTLS; enrolls with `pulse enroll --install-string`.
+mtime: "@MTIME@"
+disable_globbing: true
+contents:
+  - dst: /opt/pulse
+    type: dir
+    file_info: {mode: 0751, owner: root, group: pulse}
+  - src: "@STAGE@/pulse"
+    dst: /opt/pulse/pulse
+    file_info: {mode: 0755, owner: root, group: root}
+  - src: "@PKGDIR@/pulse.default.toml"
+    dst: /opt/pulse/pulse.toml
+    type: config|noreplace
+    file_info: {mode: 0640, owner: root, group: pulse}
+  - src: "@STAGE@/pulse.service"
+    dst: /usr/lib/systemd/system/pulse.service
+    file_info: {mode: 0644, owner: root, group: root}
+  - src: /opt/pulse/pulse
+    dst: /usr/bin/pulse
+    type: symlink
+    file_info: {mode: 0777, owner: root, group: root}
+@DOCS@
+scripts:
+  preinstall: "@PKGDIR@/preinstall.sh"
+  postinstall: "@PKGDIR@/postinstall.sh"
+  preremove: "@PKGDIR@/preremove.sh"
+  postremove: "@PKGDIR@/postremove.sh"
+deb:
+  compression: gzip
+rpm:
+  # 固定的建置主機名稱（預設為容器的 hostname，每次不同，會讓 rpm 無法重現）
+  buildhost: kairos-pulse-build
+  group: System Environment/Base
+  compression: gzip

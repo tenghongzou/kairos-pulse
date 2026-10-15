@@ -1,0 +1,4 @@
+# Pulse 設定：MSI 安裝的初始檔（C:\Program Files\Pulse\pulse.toml）。
+# 只寫要覆蓋內建預設值的項目；內建預設值與每一項的說明見同目錄的 pulse.example.toml。
+# pulse enroll 會在這裡加上 [server]（Kairos 位址、client_cert、client_key、ca_cert），
+# 原檔備份為 pulse.toml.bak-<時間>。MSI 升級與移除都不會覆寫或刪除這個檔案。

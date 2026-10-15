@@ -25,6 +25,7 @@ mod metrics;
 mod monitor;
 mod per_ip;
 mod pki;
+mod pki_cli;
 mod probe;
 mod protocol;
 mod rate;

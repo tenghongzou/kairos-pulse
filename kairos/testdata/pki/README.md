@@ -34,3 +34,5 @@ for i in $(seq 1 40); do
 done
 rm -f c.* ca.key
 ```
+
+`rsa-root.key`：`kairos pki sign`／`gencrl` 以既有 RSA 根 CA 簽發的測試（`kairos/src/pki/ca.rs`）使用的 RSA 2048 私鑰（PKCS#8，**公開的測試金鑰**），以 `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048` 產生；測試在執行時以它自簽 CA 憑證。

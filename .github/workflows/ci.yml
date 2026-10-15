@@ -83,7 +83,7 @@ jobs:
 
   # 審計 D3 後半：打包前必須通過上面兩個 job（Linux／Windows 的 fmt、clippy、test 與 cargo deny）
   package:
-    name: package (linux-x86_64)
+    name: package (linux x86_64/aarch64, windows x86_64)
     needs: [check, deny]
     runs-on: ubuntu-latest
     steps:
@@ -98,6 +98,7 @@ jobs:
           shellcheck -x -P SCRIPTDIR
           packaging/build-release-common.sh packaging/release.sh packaging/sign-release.sh
           packaging/check-reproducible.sh kairos/packaging/build-release.sh pulse/packaging/build-release.sh
+          pulse/packaging/install.sh kairos/packaging/pkg/*.sh pulse/packaging/pkg/*.sh
 
       # 檢查已由 check、deny job 完成；release.sh 會確認工作目錄乾淨、清除 dist/ 後打包兩個產品，
       # 產出合併版 SHA256SUMS。CI 沒有私鑰，不簽章。
@@ -115,7 +116,12 @@ jobs:
           name: release-${{ github.sha }}
           path: |
             dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/*.zip
+            dist/*.msi
             dist/*.cdx.json
+            dist/pulse-install.sh
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30

@@ -25,6 +25,7 @@ pub const USAGE: &str = "\
   check-config       檢查設定檔（不連線；pulse check-config --help）
   diag               產生支援診斷包（自動遮蔽私鑰、token 等敏感資料；pulse diag --help）
   explain <代碼>     說明錯誤代碼，例如 pulse explain PLS-E2003
+  service            Windows 服務的安裝、移除與服務進入點（pulse service --help）
 
 選項：
   --print-agent-id   印出本機 agent_id（agent.id 不存在時先產生）後結束，不連線
@@ -129,6 +130,10 @@ pub enum Command {
     Diag(crate::diag::DiagArgs),
     /// `pulse diag --help`
     DiagHelp,
+    /// `pulse service install|uninstall|run`（Windows 服務）
+    Service(crate::winsvc::ServiceArgs),
+    /// `pulse service --help`
+    ServiceHelp,
 }
 
 /// 參數錯誤：訊息與要附上的用法
@@ -190,6 +195,12 @@ where
             return Ok(match crate::enroll::cli::parse(&args[1..])? {
                 Some(a) => Command::Enroll(Box::new(a)),
                 None => Command::EnrollHelp,
+            });
+        }
+        Some("service") => {
+            return Ok(match crate::winsvc::parse(&args[1..])? {
+                Some(a) => Command::Service(a),
+                None => Command::ServiceHelp,
             });
         }
         Some("decommission") => {

@@ -51,9 +51,36 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 **部署順序**：協定 v2 起不必同時升級，任何順序都能以協定 v1 混用；仍建議先升級全部 Pulse，再升級 Kairos，以避開上表「舊版 Pulse 連新版 Kairos」的風險。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。各版本組合見 CHANGELOG「版本相容矩陣」。
 
+## 安裝（0.8.0〔草稿〕起：套件、一行安裝腳本、Windows MSI）
+
+| 平台 | 方式 | 說明 |
+|---|---|---|
+| Linux x86_64／aarch64（Debian、Ubuntu、RHEL 系） | 一行安裝腳本 `pulse-install.sh` | 驗證 `SHA256SUMS` 的簽章與套件雜湊 → 安裝 deb／rpm → `pulse enroll --install-string` → 啟動服務（INSTALL.md 第 A.1 節） |
+| 同上 | `apt install ./pulse-…-linux-<arch>.deb`／`dnf install ./….rpm` | 套件建立帳號 `pulse`、`/opt/pulse` 的目錄與 `agent.id`、啟用 `pulse.service`；之後 `sudo pulse enroll --install-string …`、`systemctl start pulse`（第 A.2 節） |
+| Windows x86_64 | `msiexec /i pulse-…-windows-x86_64.msi` | 安裝到 `C:\Program Files\Pulse\` 並註冊服務 `Pulse`；之後 `pulse enroll --install-string …`（第 A.3 節）。**尚未在 Windows 實機驗證** |
+| 其他、多實例、手動憑證 | tar.gz 發佈包 | 下方「從發佈包安裝」與 INSTALL.md 第 0～12 節 |
+
+```bash
+sudo PULSE_INSTALL_STRING='pulse-enroll:v1:…' sh pulse-install.sh   --base-url https://downloads.example.com/kairos-pulse/0.8.0 --allowed-signers /etc/kairos-pulse/allowed_signers
+```
+
+### Windows 服務（pulse service，0.8.0〔草稿〕）
+
+```powershell
+pulse service install [--workdir <目錄>] [--start]   # 以系統管理員執行：註冊服務 Pulse（MSI 已註冊時不需要）
+pulse service uninstall                              # 停止並刪除服務（不刪除任何檔案）
+pulse service run [--workdir <目錄>]                 # 服務進入點，由服務控制管理員啟動
+```
+
+- 服務名稱 `Pulse`（`pulse status` 查詢的名稱）、自動啟動、LocalSystem；失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動，一天內最多 3 次（設定錯誤時不會無限重試）。
+- `service run` 先把目前目錄切換到 `--workdir`（預設為 `pulse.exe` 所在目錄），**不會落在 `C:\Windows\System32`**：`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這個目錄下；本機狀態檔為 `%ProgramData%\Pulse\status.json`。
+- 服務的「停止」與「關機」要求與 Ctrl+C 相同：送出 TLS close_notify 後結束；結束代碼以服務特定代碼回報（`sc.exe query Pulse` 的 `SERVICE_EXIT_CODE`，1／3／4 與 Linux 相同）。
+- 錯誤代碼：`PLS-E8205`〔暫定〕服務無法安裝、移除或啟動（多半是沒有系統管理員權限）；`PLS-E8206`〔暫定〕`service run` 不是由服務控制管理員啟動，或工作目錄不存在。
+- 只在 Linux 上以 `x86_64-pc-windows-gnu` 交叉編譯與 clippy 檢查，**未在 Windows 實機執行**；Windows 事件記錄尚未實作。
+
 ## 從發佈包安裝
 
-地端正式部署請使用預編譯的發佈包 `pulse-<版本>-<commit>-linux-x86_64.tar.gz`（x86_64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件、`PROTOCOL.md`、`CHANGELOG.md`（變更紀錄與升級步驟）、`THIRD-PARTY-LICENSES`（第三方授權聲明）與 SBOM（CycloneDX）。
+地端正式部署也可以使用預編譯的發佈包 `pulse-<版本>-<commit>-linux-<arch>.tar.gz`（x86_64 或 aarch64、musl 靜態連結，不依賴系統函式庫），不需要安裝 Rust。發佈包內含執行檔、`pulse.example.toml`（內建預設值的參考，與 repo 的 `config.toml` 相同）、`pulse.service`（系統層級 systemd unit 範本）、`INSTALL.md`、本文件、`PROTOCOL.md`、`CHANGELOG.md`（變更紀錄與升級步驟）、`THIRD-PARTY-LICENSES`（第三方授權聲明）與 SBOM（CycloneDX）。
 
 完整步驟見 [`packaging/INSTALL.md`](packaging/INSTALL.md)（發佈包根目錄的 `INSTALL.md`），概要如下。所有步驟請在**同一個 root shell**（`sudo -i`）中依序執行，不能只在每個指令前加 `sudo`：`/opt/pulse` 的權限是 750，一般帳號無法 `cd` 進去，而 `agent.id`、私鑰與 CSR 都寫到目前目錄，`AGENT_ID` 變數也要在步驟間延續。
 
@@ -68,7 +95,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 - **多實例**：同一台主機跑多個 Pulse 時，每個實例使用自己的 `/opt/pulse-N`（`agent.id`、憑證、`pulse.toml`、`logs/` 各自一份），執行檔共用 `/opt/pulse/pulse`；unit 只改 `WorkingDirectory` 與 `ReadWritePaths` 兩行。完整指令見 INSTALL.md 第 9 節。
 - **移除**：有多實例時先停用並移除所有 `pulse-N.service`，`daemon-reload`、`reset-failed` 後，最後才刪除 `/opt/pulse` 與使用者 `pulse`（見 INSTALL.md 第 12 節）。
 
-從 0.4 升級到 0.5 時**先升級 Kairos**（建立簽發 CA、開放 8444），再升級 Pulse 並建立 `identity/` 目錄（CHANGELOG [0.5.0]「升級步驟」、INSTALL 第 10 節）；更早的版本見上一節。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 musl 靜態執行檔，輸出到 monorepo 根目錄的 `dist/`（`pulse-<版本>-<commit>-linux-x86_64.tar.gz`，並更新與 Kairos 共用的 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
+從 0.4 升級到 0.5 時**先升級 Kairos**（建立簽發 CA、開放 8444），再升級 Pulse 並建立 `identity/` 目錄（CHANGELOG [0.5.0]「升級步驟」、INSTALL 第 10 節）；更早的版本見上一節。發佈包由 [`packaging/build-release.sh`](packaging/build-release.sh) 產生：以 docker 的 `rust:1.99-alpine`（以 `@sha256:` digest 固定）建置 Linux x86_64／aarch64 的 musl 靜態執行檔與 Windows x86_64 執行檔，輸出到 monorepo 根目錄的 `dist/`（tar.gz、deb、rpm、zip、msi、SBOM、`pulse-install.sh`，並更新與 Kairos 共用的 `SHA256SUMS`）；需要 Docker，Windows 請在 Git Bash 執行 `sh packaging/build-release.sh`。正式發佈的流程見 monorepo 根目錄的 `RELEASING.md`。
 
 ## 快速開始（搭配 Kairos，本機測試）
 
@@ -355,7 +382,7 @@ cargo run
 [INFO] 工作目錄：/opt/pulse（設定中的相對路徑都以此為準）；設定檔：已讀取 /opt/pulse/pulse.toml
 ```
 
-> **以 Windows 服務執行時**，預設工作目錄是 `C:\Windows\System32`：`pulse.toml` 必須放在那裡才會被讀取，`agent.id` 與 `logs/` 也會建立在那裡。Pulse 偵測到工作目錄是 `System32` 或 `SysWOW64` 時會記 `WARN`。請在服務設定中把工作目錄指定為 Pulse 所在的目錄（例如以服務包裝工具設定啟動目錄）。
+> **以 Windows 服務執行時**（0.8.0〔草稿〕起以 `pulse service run` 或 MSI 註冊），服務先把工作目錄切換到 `pulse.exe` 所在目錄（或 `--workdir`），`pulse.toml`、`agent.id` 與 `logs/` 都在那裡。以其他服務包裝工具執行舊的命令列時，預設工作目錄仍是 `C:\Windows\System32`：Pulse 偵測到工作目錄是 `System32` 或 `SysWOW64` 時會記 `WARN`，請改用 `pulse service install`（見「Windows 服務」）。
 
 環境變數的值一律以字串讀入：數值與布林欄位在載入時才轉成對應型別，路徑、`domain`、`address` 等字串欄位保持原樣（例如 `PULSE__AGENT__ID_FILE=0001` 就是 `0001`，不會被改寫成 `1`）。
 
@@ -792,14 +819,13 @@ sudo pulse diag -c /opt/pulse/pulse.toml --redact strict --since 7d   # 主機�
 - 只回報 CPU 使用率與記憶體；磁碟、網路、溫度僅在啟動時印出到日誌，不會送給伺服器。
 - 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 的去重有範圍限制（SQLite 為原始資料保存的期間；`backend = "jsonl"` 為記憶體中的視窗，見 PROTOCOL.md 與 Kairos 的 STORAGE.md），極少數情況下可能重複寫入。`buffer.max_age_hours` 建議不超過 Kairos `storage.raw_retention_days` × 24。
 - 本機緩衝不加鎖：同一個 `buffer.dir` 只能由一個 Pulse 使用。
-- Windows 服務模式的預設工作目錄是 `System32`，需自行在服務設定中指定工作目錄（見「設定」）。
-- 不寫 Windows 事件記錄、不更新 Windows 服務描述（需要安裝程式註冊事件來源；事件識別碼已在 `codes.rs` 定案）。`pulse status` 在 Windows 上查詢的服務名稱固定為 `Pulse`，以服務包裝工具註冊成其他名稱時改以狀態檔的 PID 判斷。
+- Windows 服務（`pulse service`、MSI，0.8.0〔草稿〕）只經過交叉編譯，未在 Windows 實機驗證。不寫 Windows 事件記錄（需要安裝程式註冊事件來源；事件識別碼已在 `codes.rs` 定案）。`pulse status` 在 Windows 上查詢的服務名稱固定為 `Pulse`，以服務包裝工具註冊成其他名稱時改以狀態檔的 PID 判斷。MSI 沒有安裝字串的參數、移除時不會自動 `pulse decommission`。
 - `pulse status` 尚不支援 `--all`（列出所有實例）與 `--json-lines`；「連線中斷 30 分鐘」的門檻固定。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
 - 取樣卡住（例如 WMI 無回應）時只在本機記 `WARN` 並略過 report，heartbeat 照常送出；Kairos 目前不會因 `last_report` 停滯而告警（見「回報資料格式」）。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
 - `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
-- 註冊（`pulse enroll`）：沒有實作 `enroll.env` 的自動註冊、MSI／安裝腳本的串接、`--progress` 的原地重繪與 `PULSE_LANG`；Windows 的私鑰 ACL、服務重新啟動（`sc.exe`）只經過交叉編譯，沒有在 Windows 上實測。`pulse enroll` 不初始化日誌檔，`admin.dangerous_action` 等事件不會寫進 `logs/`。
+- 註冊（`pulse enroll`）：沒有實作 `enroll.env` 的自動註冊、MSI 的串接（Linux 的安裝腳本 `pulse-install.sh` 已串接，0.8.0〔草稿〕）、`--progress` 的原地重繪與 `PULSE_LANG`；Windows 的私鑰 ACL、服務重新啟動（`sc.exe`）只經過交叉編譯，沒有在 Windows 上實測。`pulse enroll` 不初始化日誌檔，`admin.dangerous_action` 等事件不會寫進 `logs/`。
 - 8444 本機時鐘偏差的例外（忽略伺服器憑證有效期間只取 `server_time`）只用於 `pulse enroll` 的錯誤訊息；服務端憑證到期判定仍以 Kairos 的 `CertificateExpired` 為準，沒有以 8444 `server-info` 校正（設計包 §8.1 (d)）。
 - Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
 

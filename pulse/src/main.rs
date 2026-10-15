@@ -23,6 +23,7 @@ mod system_info;
 #[cfg(test)]
 mod test_log;
 mod tls;
+mod winsvc;
 
 use config_manager::AppConfig;
 use log::{Level, LevelFilter, debug, error, info, warn};
@@ -365,6 +366,12 @@ fn main() -> ExitCode {
         }
         cli::Command::CheckConfig(args) => return ExitCode::from(diag::run_check(args.clone())),
         cli::Command::Diag(args) => return ExitCode::from(diag::run_diag(args.clone())),
+        cli::Command::ServiceHelp => {
+            println!("{}", winsvc::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        // pulse service install|uninstall|run（Windows 服務；其他平台以用法錯誤結束）
+        cli::Command::Service(args) => return ExitCode::from(winsvc::run(args)),
         _ => {}
     }
     // 不讀取設定：設定有誤時也能確認版本
@@ -372,7 +379,15 @@ fn main() -> ExitCode {
         println!("{}", cli::VERSION);
         return ExitCode::SUCCESS;
     }
+    ExitCode::from(run_agent(command == cli::Command::PrintAgentId, None))
+}
 
+/// 讀取設定、初始化日誌後執行監控代理（`pulse`／`pulse run`），或 `--print-agent-id`。
+///
+/// 設定檔與相對路徑以目前目錄解析：以 Windows 服務執行時，[`winsvc`] 先把目前目錄切換到安裝目錄
+/// （或 `--workdir`），不會落在 `System32`。`external_stop` 是服務控制管理員的停止要求（Windows
+/// 服務）；`None` 時只依結束訊號（SIGINT／SIGTERM、Ctrl+C 等）結束。回傳結束代碼
+fn run_agent(print_id: bool, external_stop: Option<CancellationToken>) -> u8 {
     // 設定：嵌入預設 → pulse.toml → PULSE__* 環境變數（含數值範圍與 log.level 驗證）
     let config = match AppConfig::load() {
         Ok(config) => config,
@@ -389,11 +404,11 @@ fn main() -> ExitCode {
             };
             eprintln!("錯誤 {code}：無法載入設定：{e}");
             // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
-            return ExitCode::from(EXIT_CONFIG);
+            return EXIT_CONFIG;
         }
     };
 
-    if command == cli::Command::PrintAgentId {
+    if print_id {
         return print_agent_id(&config);
     }
 
@@ -405,7 +420,7 @@ fn main() -> ExitCode {
     // 初始化日誌
     if let Err(e) = setup_logger(&config.log) {
         eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
-        return ExitCode::from(EXIT_GENERAL);
+        return EXIT_GENERAL;
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
     retention.run();
@@ -419,10 +434,10 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             error!("無法建立 tokio runtime：{e}");
-            return ExitCode::from(EXIT_GENERAL);
+            return EXIT_GENERAL;
         }
     };
-    let code = runtime.block_on(async_main(config, retention));
+    let code = runtime.block_on(async_main(config, retention, external_stop));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     log_files::flush_all();
     code
@@ -431,7 +446,7 @@ fn main() -> ExitCode {
 /// `--print-agent-id`：讀取（或第一次產生）agent_id，只把 ID 一行印到 stdout。
 ///
 /// 不連線、不初始化日誌；其他說明一律寫到 stderr，方便腳本直接取用 stdout。
-fn print_agent_id(config: &AppConfig) -> ExitCode {
+fn print_agent_id(config: &AppConfig) -> u8 {
     let path = PathBuf::from(&config.agent.id_file);
     match agent_id::load_or_create(&path) {
         Ok((id, created)) => {
@@ -443,11 +458,11 @@ fn print_agent_id(config: &AppConfig) -> ExitCode {
                 eprintln!("警告：{warning}");
             }
             println!("{id}");
-            ExitCode::SUCCESS
+            0
         }
         Err(e) => {
             eprintln!("錯誤：{e}");
-            ExitCode::from(EXIT_GENERAL)
+            EXIT_GENERAL
         }
     }
 }
@@ -456,22 +471,34 @@ fn print_agent_id(config: &AppConfig) -> ExitCode {
 ///
 /// 收到結束訊號（見 [`shutdown::Signals`]）後通知各任務結束（已連線時會先送 TLS close_notify），
 /// 最多等待 `GRACEFUL_SHUTDOWN_TIMEOUT`；期間再收到一次訊號就直接強制結束。
-async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> ExitCode {
-    let mut signals = match shutdown::Signals::new() {
-        Ok(s) => s,
-        Err(e) => {
+async fn async_main(
+    config: AppConfig,
+    retention: log_files::LogRetention,
+    external_stop: Option<CancellationToken>,
+) -> u8 {
+    // 以 Windows 服務執行時沒有主控台：無法監聽 Ctrl+C 等事件時只依服務控制管理員的停止要求結束
+    let mut signals = match (shutdown::Signals::new(), &external_stop) {
+        (Ok(s), _) => Some(s),
+        (Err(e), Some(_)) => {
+            debug!("{e}（以服務執行，改由服務控制管理員的停止要求結束）");
+            None
+        }
+        (Err(e), None) => {
             error!("{e}");
-            return ExitCode::from(EXIT_GENERAL);
+            return EXIT_GENERAL;
         }
     };
+    let external = external_stop.unwrap_or_default();
+    // 第二次結束要求只看結束訊號（服務的停止要求只有一次）
+    let never = CancellationToken::new();
     let shutdown = CancellationToken::new();
     let work = run(config, retention, shutdown.clone());
     tokio::pin!(work);
 
     let result = tokio::select! {
         res = &mut work => res,
-        name = signals.recv() => {
-            info!("收到 {name} 訊號，正在結束（再送一次訊號可強制結束）...");
+        name = next_signal(&mut signals, &external) => {
+            info!("收到 {name}，正在結束（再送一次訊號可強制結束）...");
             shutdown.cancel();
             tokio::select! {
                 res = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut work) => match res {
@@ -484,8 +511,8 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
                         Ok(())
                     }
                 },
-                name = signals.recv() => {
-                    warn!("再次收到 {name} 訊號，強制結束");
+                name = next_signal(&mut signals, &never) => {
+                    warn!("再次收到 {name}，強制結束");
                     std::process::exit(shutdown::FORCED_EXIT_CODE);
                 }
             }
@@ -498,7 +525,7 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
                 t.write_final(0, None);
             }
             info!("{}Pulse 已結束", codes::tag(codes::AGENT_STOP, None));
-            ExitCode::SUCCESS
+            0
         }
         Err(failure) => {
             if let Some(t) = local_status::tracker() {
@@ -512,8 +539,37 @@ async fn async_main(config: AppConfig, retention: log_files::LogRetention) -> Ex
             // 日誌只寫到 stdout 與 logs/（pulse.service 為 StandardOutput=null）；以非 0 結束的原因
             // 另寫一行到 stderr，`journalctl -u pulse` 看得到服務為何停在 failed（例如憑證錯誤 4）
             service_status::attention(&failure.message.replace(['\r', '\n'], " "));
-            ExitCode::from(failure.code)
+            failure.code
         }
+    }
+}
+
+/// 下一個結束要求：結束訊號，或（Windows 服務）服務控制管理員的停止要求
+async fn next_signal(
+    signals: &mut Option<shutdown::Signals>,
+    external: &CancellationToken,
+) -> &'static str {
+    let signal = async {
+        match signals {
+            Some(s) => {
+                let name = s.recv().await;
+                // 與服務的「停止要求」區分：日誌寫「收到 SIGTERM 訊號」
+                match name {
+                    "SIGINT" => "SIGINT 訊號",
+                    "SIGTERM" => "SIGTERM 訊號",
+                    "Ctrl+C" => "Ctrl+C 訊號",
+                    "Ctrl+Break" => "Ctrl+Break 訊號",
+                    "主控台關閉" => "主控台關閉訊號",
+                    "系統關機" => "系統關機訊號",
+                    other => other,
+                }
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        name = signal => name,
+        _ = external.cancelled() => "服務控制管理員的停止要求",
     }
 }
 

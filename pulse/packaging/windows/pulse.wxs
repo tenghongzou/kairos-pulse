@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pulse 的 Windows Installer 套件（商業審計 O4）。在 Linux 的建置容器內以 msitools 的 wixl 產生
+  （packaging/build-release-common.sh），@…@ 由腳本代入：
+    @VERSION@       MSI 的 ProductVersion（Cargo 版本去掉預發佈標記，例如 0.8.0）
+    @PRODUCT_CODE@  依版本推導的固定 GUID（同一版本的建置相同；不同版本不同，MajorUpgrade 才會取代舊版）
+    @SRC@           要放進 MSI 的檔案所在的目錄
+  可重現：Package 的 revision（PackageCode）由腳本以 msibuild 改成依版本與 commit 推導的值，
+  時間戳記以 libfaketime 固定為 commit 時間，CAB 內的檔案時間取自檔案的 mtime（同樣固定）。
+
+  安裝：C:\Program Files\Pulse\（pulse.exe、文件、初始的 pulse.toml），註冊服務 Pulse
+  （自動啟動、LocalSystem，參數 service run：工作目錄為 pulse.exe 所在目錄）。
+  不把安裝目錄加到系統 PATH：wixl 0.106 會為 <Environment> 產生隨機的主鍵（Id 被忽略；刪除後字串仍留在
+  字串池中），MSI 因此無法重現。
+  服務在安裝時不啟動：以 pulse enroll 註冊後由 pulse enroll 重新啟動（或 sc.exe start Pulse）。
+  移除：停止並刪除服務、刪除安裝的檔案；pulse.toml（Permanent）與執行時產生的 agent.id、identity\、
+  buffer\、logs\ 保留（重新安裝後沿用同一個身分）。完全移除前先執行 pulse decommission。
+  升級：pulse.toml 是沒有版本的檔案，Windows Installer 只在檔案的修改時間等於建立時間（沒有被改過）時
+  覆寫；pulse enroll 寫入過的 pulse.toml 不會被覆寫（wixl 不支援 NeverOverwrite，因此依賴這個預設規則）。
+
+  UpgradeCode 永遠不變（所有版本相同）；Component 的 GUID 對同一個檔案永遠不變。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="@PRODUCT_CODE@" Name="Pulse" Language="1033" Version="@VERSION@"
+           Manufacturer="Kairos-Pulse" UpgradeCode="6A0B8C2E-0D71-4E52-9B57-3C1A6E4F2D10">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="Pulse monitoring agent" Comments="Pulse @VERSION@"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Pulse is already installed."/>
+    <Media Id="1" Cabinet="pulse.cab" EmbedCab="yes"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="Pulse">
+          <Component Id="PulseExe" Guid="3D2C7A10-5B1E-4C8F-9A61-0E2B7D4F1001" Win64="yes">
+            <File Id="PulseExe" Name="pulse.exe" Source="@SRC@/pulse.exe" KeyPath="yes"/>
+            <ServiceInstall Id="PulseService" Name="Pulse" DisplayName="Pulse monitoring agent"
+                            Description="Pulse: reports system information to the Kairos monitoring server (mTLS)."
+                            Type="ownProcess" Start="auto" ErrorControl="normal" Arguments="service run"/>
+            <ServiceControl Id="PulseServiceControl" Name="Pulse" Stop="both" Remove="uninstall" Wait="yes"/>
+          </Component>
+          <Component Id="PulseConfig" Guid="3D2C7A10-5B1E-4C8F-9A61-0E2B7D4F1002" Win64="yes" Permanent="yes">
+            <File Id="PulseToml" Name="pulse.toml" Source="@SRC@/pulse.toml" KeyPath="yes"/>
+          </Component>
+          <Component Id="PulseDocs" Guid="3D2C7A10-5B1E-4C8F-9A61-0E2B7D4F1003" Win64="yes">
+            <File Id="PulseExample" Name="pulse.example.toml" Source="@SRC@/pulse.example.toml" KeyPath="yes"/>
+            <File Id="PulseReadme" Name="README.md" Source="@SRC@/README.md"/>
+            <File Id="PulseInstall" Name="INSTALL.md" Source="@SRC@/INSTALL.md"/>
+            <File Id="PulseProtocol" Name="PROTOCOL.md" Source="@SRC@/PROTOCOL.md"/>
+            <File Id="PulseChangelog" Name="CHANGELOG.md" Source="@SRC@/CHANGELOG.md"/>
+            <File Id="PulseErrorCodes" Name="ERROR-CODES.md" Source="@SRC@/ERROR-CODES.md"/>
+            <File Id="PulseLicenses" Name="THIRD-PARTY-LICENSES" Source="@SRC@/THIRD-PARTY-LICENSES"/>
+            <File Id="PulseSbom" Name="pulse.cdx.json" Source="@SRC@/pulse.cdx.json"/>
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="Pulse" Level="1">
+      <ComponentRef Id="PulseExe"/>
+      <ComponentRef Id="PulseConfig"/>
+      <ComponentRef Id="PulseDocs"/>
+    </Feature>
+  </Product>
+</Wix>

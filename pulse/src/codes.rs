@@ -213,6 +213,10 @@ pub const W_AGENT_ID_PERMS: &str = "PLS-W8201";
 pub const W_KEY_PERMS: &str = "PLS-W8202";
 pub const E_NEED_ADMIN: &str = "PLS-E8203";
 pub const E_STATUS_UNWRITABLE: &str = "PLS-E8204";
+/// Windows 服務無法安裝、移除或啟動（`pulse service install|uninstall`）〔暫定，設計包未分配〕
+pub const E_SERVICE_INSTALL: &str = "PLS-E8205";
+/// `pulse service run` 不是由服務控制管理員啟動，或無法切換到工作目錄〔暫定，設計包未分配〕
+pub const E_SERVICE_RUN: &str = "PLS-E8206";
 pub const W_CLOCK_SKEW: &str = "PLS-W8301";
 pub const E_CLOCK_SKEW: &str = "PLS-E8302";
 pub const E_CERT_NOT_YET_VALID: &str = "PLS-E8304";
@@ -312,6 +316,8 @@ const ALL_CODES: &[&str] = &[
     W_KEY_PERMS,
     E_NEED_ADMIN,
     E_STATUS_UNWRITABLE,
+    E_SERVICE_INSTALL,
+    E_SERVICE_RUN,
     W_CLOCK_SKEW,
     E_CLOCK_SKEW,
     E_CERT_NOT_YET_VALID,
@@ -411,6 +417,8 @@ pub fn title(code: &str) -> Option<&'static str> {
         W_KEY_PERMS => "私鑰檔案權限過寬",
         E_NEED_ADMIN => "需要系統管理員權限",
         E_STATUS_UNWRITABLE => "無法寫入狀態檔",
+        E_SERVICE_INSTALL => "無法安裝或移除 Windows 服務",
+        E_SERVICE_RUN => "服務進入點無法執行",
         W_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 30 秒",
         E_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 5 分鐘",
         E_CERT_NOT_YET_VALID => "用戶端憑證尚未生效（本機時鐘可能落後）",

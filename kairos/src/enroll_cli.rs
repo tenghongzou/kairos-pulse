@@ -28,12 +28,12 @@ use crate::token_cli::{
     zone_label,
 };
 
-const EXIT_GENERAL: u8 = 1;
-const EXIT_USAGE: u8 = 2;
-const EXIT_CONFIG: u8 = 3;
-const EXIT_CERT: u8 = 4;
+pub(crate) const EXIT_GENERAL: u8 = 1;
+pub(crate) const EXIT_USAGE: u8 = 2;
+pub(crate) const EXIT_CONFIG: u8 = 3;
+pub(crate) const EXIT_CERT: u8 = 4;
 const EXIT_REJECTED: u8 = 6;
-const EXIT_CONFLICT: u8 = 11;
+pub(crate) const EXIT_CONFLICT: u8 = 11;
 
 /// `kairos enroll-token --help`
 pub const ENROLL_TOKEN_USAGE: &str = "kairos enroll-token — 註冊 token（S12；crates/kairos-proto/ENROLL.md 第 14.2 節）
@@ -75,6 +75,11 @@ mode 不帶模式時只顯示目前狀態與每一項的來源；切換到 close
 pub const PKI_USAGE: &str = "kairos pki — 簽發 CA、憑證與 CRL（kairos/PKI.md）
 
 用法：
+  # 新安裝：根 CA（P-384）、伺服器憑證與代理簽發 CA 一次建立（以服務帳號執行；只能執行一次）
+  kairos pki init --name <DNS 名稱或 IP>... --root-dir <目錄> [--organization <組織>] [--server-days <N>]
+
+  kairos pki gencrl（線上模式：立即重新產生簽發 CA 的 CRL，同主控台 S15「立即產生 CRL」）
+  kairos pki revocations export --ca-cert <CA 憑證> [--out <檔案>]（離線模式：匯出撤銷清單）
   kairos pki issuing-ca list
   kairos pki issuing-ca new [--out <csr.pem>]（預設寫到 data/pki/issuing-<ca_id>.csr）
   kairos pki issuing-ca install <cert.pem>
@@ -87,6 +92,14 @@ pub const PKI_USAGE: &str = "kairos pki — 簽發 CA、憑證與 CRL（kairos/P
 
   # 在離線的 CA 主機上（不讀 Kairos 的設定與資料庫）：
   kairos pki sign-bundle --in <檔案> --ca-cert <檔案> --ca-key <檔案> --out <檔案>
+  kairos pki sign --profile server --ca-cert <根 CA> --ca-key <根 CA 私鑰> --name <名稱>...
+                  (--csr <server.csr> | --new-key <server.key>) --out <server.pem> [--days <N，≤825>]
+  kairos pki sign --profile issuing-ca --ca-cert <根 CA> --ca-key <根 CA 私鑰> --csr <issuing-N.csr> --out <檔案>
+  kairos pki sign --profile client --ca-cert <CA> --ca-key <私鑰> --agent-id <agent_id> --csr <檔案> --out <檔案>
+  kairos pki gencrl --ca-cert <CA> --ca-key <私鑰> [--revocations <檔案>] --out <agents.crl> [--days <N>]
+
+sign、gencrl 在 CA 私鑰所在的目錄附加一筆紀錄到 kairos-ca.log（0600）；私鑰權限過寬（不是 0600）時拒絕。
+輸出檔已存在時一律不覆寫。根 CA 可以是 ECDSA P-256／P-384 或既有的 RSA（PKCS#8 PEM）。
 
 簽發 CA 的流程：issuing-ca new 在 data/pki/ 產生私鑰（0600）與 CSR → 在管理主機以根 CA 簽發
 （basicConstraints=critical,CA:TRUE,pathlen:0、keyUsage=critical,keyCertSign,cRLSign、extendedKeyUsage=clientAuth）
@@ -144,7 +157,7 @@ const FLAGS: [&str; 9] = [
 ];
 
 impl Cmd {
-    fn opt(&self, name: &str) -> Option<&str> {
+    pub(crate) fn opt(&self, name: &str) -> Option<&str> {
         self.opts
             .iter()
             .rev()
@@ -152,7 +165,7 @@ impl Cmd {
             .map(|(_, v)| v.as_str())
     }
 
-    fn opts_all(&self, name: &str) -> Vec<String> {
+    pub(crate) fn opts_all(&self, name: &str) -> Vec<String> {
         self.opts
             .iter()
             .filter(|(k, _)| k == name)
@@ -160,15 +173,15 @@ impl Cmd {
             .collect()
     }
 
-    fn flag(&self, name: &str) -> bool {
+    pub(crate) fn flag(&self, name: &str) -> bool {
         self.flags.iter().any(|f| f == name)
     }
 
-    fn sub(&self, i: usize) -> Option<&str> {
+    pub(crate) fn sub(&self, i: usize) -> Option<&str> {
         self.args.get(i).map(String::as_str)
     }
 
-    fn schema(&self) -> String {
+    pub(crate) fn schema(&self) -> String {
         let group = match self.group {
             Group::EnrollToken => "enroll-token",
             Group::Enroll => "enroll",
@@ -176,7 +189,11 @@ impl Cmd {
             Group::Config => "config",
         };
         let action = match (self.group, self.sub(0), self.sub(1)) {
-            (Group::Pki, Some(a @ ("issuing-ca" | "certificates" | "queue")), Some(b)) => {
+            (
+                Group::Pki,
+                Some(a @ ("issuing-ca" | "certificates" | "queue" | "revocations")),
+                Some(b),
+            ) => {
                 format!("{a}.{b}")
             }
             (_, Some(a), _) => a.to_string(),
@@ -251,7 +268,7 @@ fn usage(group: Group) -> &'static str {
     }
 }
 
-fn usage_err(msg: impl Into<String>) -> Failure {
+pub(crate) fn usage_err(msg: impl Into<String>) -> Failure {
     Failure::new(
         "用法錯誤",
         msg,
@@ -270,7 +287,7 @@ fn op_failure(e: OpError) -> Failure {
     Failure::new("操作未完成", e.message, Vec::new(), exit)
 }
 
-fn load_config(path: Option<&Path>) -> Result<AppConfig, Failure> {
+pub(crate) fn load_config(path: Option<&Path>) -> Result<AppConfig, Failure> {
     AppConfig::load(path).map_err(|e| Failure {
         code: Some(crate::diag::config_load_code(&e, path)),
         ..Failure::new(
@@ -282,7 +299,7 @@ fn load_config(path: Option<&Path>) -> Result<AppConfig, Failure> {
     })
 }
 
-fn db(cmd: &Cmd) -> Result<rusqlite::Connection, Failure> {
+pub(crate) fn db(cmd: &Cmd) -> Result<rusqlite::Connection, Failure> {
     match open(cmd.config_path.as_deref(), true)? {
         Some(c) => Ok(c),
         None => Err(db_failure("資料庫不存在")),
@@ -297,7 +314,7 @@ pub struct Env<'a> {
     pub confirm: &'a mut dyn FnMut(&str) -> Option<String>,
 }
 
-fn ok_json(cmd: &Cmd, now: DateTime<Utc>, data: Value) -> Output {
+pub(crate) fn ok_json(cmd: &Cmd, now: DateTime<Utc>, data: Value) -> Output {
     Output {
         stdout: ascii_json(&json!({
             "schema": cmd.schema(), "ok": true, "generated_at": fmt_time(now),
@@ -339,7 +356,7 @@ pub fn execute(cmd: &Cmd, env: &mut Env<'_>) -> Output {
     }
 }
 
-fn mark(env: &Env<'_>) -> &'static str {
+pub(crate) fn mark(env: &Env<'_>) -> &'static str {
     if env.unicode { "✓" } else { "[ OK ]" }
 }
 
@@ -371,7 +388,7 @@ fn parse_expiry(cmd: &Cmd, now_ms: i64) -> Result<Option<i64>, Failure> {
     }
 }
 
-fn int_opt(cmd: &Cmd, name: &str) -> Result<Option<i64>, Failure> {
+pub(crate) fn int_opt(cmd: &Cmd, name: &str) -> Result<Option<i64>, Failure> {
     cmd.opt(name)
         .map(|v| {
             v.parse::<i64>()
@@ -1106,7 +1123,7 @@ fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
 // pki
 // ---------------------------------------------------------------------------
 
-fn write_new_file(path: &str, content: &[u8]) -> Result<(), Failure> {
+pub(crate) fn write_new_file(path: &str, content: &[u8]) -> Result<(), Failure> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1134,7 +1151,7 @@ fn write_new_file(path: &str, content: &[u8]) -> Result<(), Failure> {
     })
 }
 
-fn read_file(path: &str) -> Result<String, Failure> {
+pub(crate) fn read_file(path: &str) -> Result<String, Failure> {
     std::fs::read_to_string(path).map_err(|e| {
         Failure::new(
             format!("無法讀取 {path}"),
@@ -1157,6 +1174,10 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     let now_ms = env.now.timestamp_millis();
     match (cmd.sub(0), cmd.sub(1)) {
         (Some("sign-bundle"), _) => sign_bundle(cmd, env),
+        (Some("init"), _) => crate::pki_cli::init(cmd, env),
+        (Some("sign"), _) => crate::pki_cli::sign(cmd, env),
+        (Some("gencrl"), _) => crate::pki_cli::gencrl(cmd, env),
+        (Some("revocations"), Some("export")) => crate::pki_cli::revocations_export(cmd, env),
         (Some("issuing-ca"), Some("list")) => {
             let conn = db(cmd)?;
             let cas = ps::list_cas(&conn).map_err(db_failure)?;
