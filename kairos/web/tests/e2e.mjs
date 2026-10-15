@@ -170,11 +170,12 @@ test('登入 → 總覽 → 主機清單（篩選、排序、CIDR）→ 主機�
   await page.getByText('登入後將前往：主機').waitFor();
   await login(page, 'admin', PW, '/');
   await waitTitle(page, '總覽');
-  // 六個狀態磚：線上至少 3 台；嚴重、警告、待核准為「—」（不顯示 0）
+  // 六個狀態磚：線上至少 3 台；嚴重、警告由進行中的告警推算（有 alerts:read），待核准為「—」（不顯示 0）
   await page.locator('[data-kpi="online"]').waitFor();
   const online = Number((await page.locator('[data-kpi="online"]').innerText()).replace(/[^\d]/g, ''));
   assert.ok(online >= 3, `線上 ${online}`);
-  assert.equal((await page.locator('[data-kpi="critical"]').innerText()).trim(), '—');
+  assert.match((await page.locator('[data-kpi="critical"]').innerText()).trim(), /^\d/);
+  assert.equal((await page.locator('[data-kpi="pending"]').innerText()).trim(), '—');
   await axe(page, '總覽');
   const nav = await page.evaluate(() => {
     const n = document.querySelector('.ds-sidenav');
@@ -425,7 +426,7 @@ test('權限：沒有角色的帳號看不到監控選單，直接存取回 403�
   const v = await newPage();
   await login(v.page, 'viewer');
   await waitTitle(v.page, '總覽');
-  assert.deepEqual(await v.page.locator('.ds-sidenav__link .ds-sidenav__label').allTextContents(), ['總覽', '主機']);
+  assert.deepEqual(await v.page.locator('.ds-sidenav__link .ds-sidenav__label').allTextContents(), ['總覽', '主機', '告警事件', '靜音與維護']);
   await v.page.locator('.k-status-light:not([hidden])').waitFor();
   await v.ctx.close();
 });
@@ -507,6 +508,9 @@ test('帳號鎖定的訊息（KRS-E6003）與帳號密碼錯誤（KRS-E6001）',
   await ctx.close();
 });
 
+
+// 告警畫面（S06～S11）：tests/e2e-alerts.mjs
+(await import('./e2e-alerts.mjs')).register({ test, newPage, login, waitTitle, axe, shot, FakeAgent, URL0, PW });
 
 // ---------------------------------------------------------------------------
 async function main() {
