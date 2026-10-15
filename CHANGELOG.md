@@ -142,6 +142,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **deb／rpm**（nfpm 2.47.0，在建置容器內產生）：Kairos 與 Pulse 各一個，x86_64 與 aarch64。版面與 tar.gz 相同（`/opt/<名稱>`），加上 `/usr/lib/systemd/system/<名稱>.service`、`/usr/bin/<名稱>`；預設設定為 config（升級不覆寫）；安裝前建立系統帳號，安裝後建立可寫目錄（Pulse 另產生 `agent.id`）、`systemctl enable`（不啟動），升級時 `try-restart`，移除時 `disable --now`；移除與 purge 都不刪除 Kairos 的資料目錄。Kairos 套件的預設設定以絕對路徑指向 `kairos pki init` 寫出的檔案，安裝後只要 `pki init` 與 `systemctl start`（INSTALL 第 A 節）。
 - **`pulse-install.sh`**（一行安裝腳本）：以從另一個管道取得的 `allowed_signers` 驗證 `SHA256SUMS` 的簽章 → 依架構與套件管理員選出套件、核對 SHA-256（不接受 `-dirty`）→ 安裝 → `pulse enroll --install-string`（安裝字串可由環境變數傳入）→ 啟動服務。也支援已下載好的目錄（`--dir`，離線環境）。
 - **Ansible role（最小版）**：`packaging/ansible/`（role `pulse`、範例 `site-pulse.yml`），做與安裝腳本相同的驗證、安裝與註冊；只經過 syntax-check，尚未對實際主機執行（Pulse 的 INSTALL 第 A.4 節）。Kairos 沒有 role。
+- **套件的 systemd unit 與發佈包的 unit 為同一份檔案**（`kairos/packaging/kairos.service`、`pulse/packaging/pulse.service`）：`build-release-common.sh` 打包後從 deb（`ar`＋`tar`）與 rpm（解析 header 後的 cpio）取出 `/usr/lib/systemd/system/<名稱>.service` 與來源檔逐位元比對，不同時建置失敗；`pulse.service` 的序號複製（`ExecStartPre=-+/usr/bin/install …`、`RuntimeDirectory=pulse`）因此也在 deb／rpm 中。
 
 ### 平台與發佈（O4）
 
