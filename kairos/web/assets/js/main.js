@@ -12,6 +12,7 @@ import { mountShell, unmountShell, refreshShell, setOffline } from './ui/shell.j
 import { closeMenu } from './ui/menu.js';
 import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
+import './screens/alerts-boot.js';
 
 /**
  * 路由表。欄位：
@@ -28,6 +29,14 @@ const ROUTES = [
   { path: '/hosts', permAny: 'hosts:read', title: 'hosts.title', load: () => import('./screens/hosts.js') },
   { path: '/hosts/:id/:tab?', permAny: 'hosts:read', title: 'nav.hosts', load: () => import('./screens/host-detail.js') },
   { path: '/account', session: true, title: 'account.title', load: () => import('./screens/account.js') },
+  // 告警（S06～S11）
+  { path: '/alerts', perm: 'alerts:read', title: 'alerts.events.title', load: () => import('./screens/alerts-events.js') },
+  { path: '/alerts/events', perm: 'alerts:read', title: 'alerts.events.title', load: () => import('./screens/alerts-events.js') },
+  { path: '/alerts/events/:id', perm: 'alerts:read', title: 'alerts.events.title', load: () => import('./screens/alerts-event.js') },
+  { path: '/alerts/rules', perm: 'alert-rules:read', title: 'alerts.rules.title', load: () => import('./screens/alerts-rules.js') },
+  { path: '/alerts/rules/:id', perm: 'alert-rules:read', title: 'alerts.rules.title', load: () => import('./screens/alerts-rule-edit.js') },
+  { path: '/alerts/silences/:id?', perm: 'silences:read', title: 'alerts.sl.title', load: () => import('./screens/alerts-silences.js') },
+  { path: '/alerts/channels/:id?', perm: 'channels:read', title: 'alerts.ch.title', load: () => import('./screens/alerts-channels.js') },
 ];
 
 const appRoot = document.getElementById('app');

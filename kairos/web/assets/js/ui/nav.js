@@ -11,9 +11,12 @@ export const NAV = [
     items: [
       { path: '/', label: 'nav.overview', icon: 'dashboard', permAny: 'hosts:read', match: (p) => p === '/' },
       { path: '/hosts', label: 'nav.hosts', icon: 'server', permAny: 'hosts:read', match: (p) => p === '/hosts' || p.startsWith('/hosts/') },
-      // 告警（S06～S11）、註冊與憑證（S12～S15）、稽核（S18）、管理（S16、S17）、系統（S20～S22）：
-      // 後續衝刺加入，例：
-      // { path: '/alerts/events', label: 'nav.alerts', icon: 'bell', perm: 'alerts:read', badge: 'alerts' },
+      // 告警（S06～S11）；count：計數泡泡的鍵（shell.setNavCount，screens/alerts-boot.js）
+      { path: '/alerts/events', label: 'nav.alertEvents', icon: 'bell', perm: 'alerts:read', count: 'alerts', match: (p) => p === '/alerts' || p.startsWith('/alerts/events') },
+      { path: '/alerts/rules', label: 'nav.alertRules', icon: 'filter', perm: 'alert-rules:read', match: (p) => p.startsWith('/alerts/rules') },
+      { path: '/alerts/silences', label: 'nav.silences', icon: 'bell-off', perm: 'silences:read', match: (p) => p.startsWith('/alerts/silences') },
+      { path: '/alerts/channels', label: 'nav.channels', icon: 'network', perm: 'channels:read', match: (p) => p.startsWith('/alerts/channels') },
+      // 註冊與憑證（S12～S15）、稽核（S18）、管理（S16、S17）、系統（S20～S22）：後續加入
     ],
   },
 ];

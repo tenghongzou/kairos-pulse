@@ -1,0 +1,64 @@
+/* 告警畫面（S06～S11）的版面補充；只引用 --ds-* token（設計包 design-system/tokens.css）。
+ * 與 app.css 分開，讓其他畫面的開發線不需要修改同一段樣式。 */
+
+/* 側邊導覽的計數泡泡（ia.md §7）：嚴重為外框、緊急為實心 */
+.ds-sidenav__count.k-count--critical { background: var(--ds-status-critical-bg); color: var(--ds-status-critical-badge-fg); border-color: var(--ds-status-critical-border); }
+.ds-sidenav__count.k-count--emergency { background: var(--ds-severity-emergency-bg); color: var(--ds-severity-emergency-badge-fg); border-color: var(--ds-severity-emergency-border); border-width: var(--ds-border-width-strong); }
+
+/* 告警引擎的橫幅放在內容區（不是全站 Banner） */
+.k-alert-banner { border-radius: var(--ds-radius-md); margin-bottom: var(--ds-space-300); }
+
+/* 事件清單 */
+.k-event-cell { display: flex; align-items: flex-start; gap: var(--ds-space-100); min-width: 260px; }
+.k-event-cell > span { display: inline; }
+.k-cell-wrap { white-space: normal !important; overflow-wrap: anywhere; }
+.k-flag--muted { color: var(--ds-color-text-secondary); margin-left: var(--ds-space-100); }
+.k-keys-hint { margin-top: var(--ds-space-200); }
+.ds-table tr.is-disabled td { color: var(--ds-color-text-secondary); }
+
+/* 事件詳情 */
+.k-event-status { margin: calc(-1 * var(--ds-space-200)) 0 var(--ds-space-400); }
+.k-alert-actions { display: flex; flex-wrap: wrap; gap: var(--ds-space-200); }
+.k-grow { flex: 1; min-width: 0; }
+.k-pad { padding: 0 var(--ds-space-400) var(--ds-space-400); }
+.k-pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.k-timeline .k-sub.k-pre { display: block; margin: var(--ds-space-100) 0 0; color: var(--ds-color-text-secondary); }
+.k-comment-form { margin-top: var(--ds-space-300); display: flex; flex-direction: column; gap: var(--ds-space-200); align-items: flex-start; }
+.k-comment-form .ds-field { align-self: stretch; }
+.k-plain-list { margin: 0; padding-left: var(--ds-space-500); }
+@media (max-width: 768px) {
+  /* 窄螢幕：事件的動作固定在底部（screens.md S07） */
+  .k-alert-actions { position: sticky; bottom: 0; z-index: var(--ds-z-sticky); background: var(--ds-color-bg-surface); padding: var(--ds-space-200) 0; border-top: var(--ds-border-width) solid var(--ds-color-border-default); width: 100%; }
+}
+
+/* 規則清單的啟用開關（role=switch） */
+.k-switch { all: unset; display: inline-flex; align-items: center; gap: var(--ds-space-200); cursor: pointer; min-height: var(--ds-size-target-min); border-radius: var(--ds-radius-sm); }
+.k-switch:focus-visible { outline: var(--ds-focus-ring); outline-offset: 2px; }
+.k-switch:disabled { cursor: progress; opacity: 0.6; }
+.k-switch__track { position: relative; width: 36px; height: 20px; border-radius: var(--ds-radius-full); background: var(--ds-color-bg-subtle); border: var(--ds-border-width) solid var(--ds-color-border-control); flex: none; }
+.k-switch__thumb { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: var(--ds-radius-full); background: var(--ds-color-text-secondary); transition: left var(--ds-duration-fast) var(--ds-easing-standard); }
+.k-switch[aria-checked="true"] .k-switch__track { background: var(--ds-color-accent); border-color: var(--ds-color-accent); }
+.k-switch[aria-checked="true"] .k-switch__thumb { left: 18px; background: var(--ds-color-text-on-accent); }
+.k-switch__text { font: var(--ds-text-label); }
+@media (forced-colors: active) { .k-switch__track { border-color: ButtonText; } .k-switch[aria-checked="true"] .k-switch__thumb { background: Highlight; } }
+.k-row--tight { gap: var(--ds-space-100); }
+
+/* 規則編輯、靜音表單 */
+.k-form-section { margin-bottom: var(--ds-space-500); }
+.k-form-section > .k-section-title { margin-top: 0; }
+.k-fieldset { border: var(--ds-border-width) solid var(--ds-color-border-subtle); border-radius: var(--ds-radius-md); padding: var(--ds-space-300); margin-top: var(--ds-space-300); }
+.ds-sentence .ds-input--num { width: 88px; }
+.ds-sentence .ds-select { width: auto; }
+.k-impact-box { margin-top: var(--ds-space-300); padding: var(--ds-space-300); border: var(--ds-border-width) solid var(--ds-color-border-default); border-radius: var(--ds-radius-md); background: var(--ds-color-bg-subtle); }
+.k-impact-box p { margin: 0 0 var(--ds-space-100); }
+.k-check-columns { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0 var(--ds-space-300); }
+.ds-radio.is-disabled { text-decoration: line-through; }
+.k-picker__chips { display: flex; flex-wrap: wrap; gap: var(--ds-space-200); margin: calc(-1 * var(--ds-space-100)) 0 var(--ds-space-200); }
+.k-picker__results { list-style: none; margin: 0 0 var(--ds-space-300); padding: 0; display: flex; flex-wrap: wrap; gap: var(--ds-space-100); }
+.k-preview-big { font: var(--ds-text-heading-3); margin: var(--ds-space-200) 0; }
+.k-bars td:last-child { width: 70%; }
+.k-bar { display: inline-block; height: 10px; min-width: 2px; margin-right: var(--ds-space-200); background: var(--ds-color-accent); border-radius: var(--ds-radius-sm); vertical-align: middle; }
+.k-bars caption { text-align: left; font: var(--ds-text-label); color: var(--ds-color-text-secondary); padding-bottom: var(--ds-space-100); }
+.k-lead { margin: 0 0 var(--ds-space-300); }
+.k-test-out:not(:empty) { margin-top: var(--ds-space-300); }
+fieldset > .ds-checkbox { display: flex; }

@@ -2,8 +2,9 @@
 //
 // 0.7.0 呈現：A1 六個狀態 KpiTile、B 系統健康條、A2／C 進行中告警（有 alerts:read 時）、D 群組健康（有群組時）、
 // E 離線最久、F 資源使用前 10。隱藏（沒有後端或沒有畫面）：範圍選擇器（?group=）、kiosk 模式、
-// A2 的憑證磚（需要 S14）、區塊 G 最近變更（需要 S18）、事件列的行內「確認」（S06／S07 之後）。
-// 嚴重、警告、待核准的主機計數 API 為 null（尚無判定），顯示「—」與說明，不顯示 0（S03「無法取得時不可顯示 0」）。
+// A2 的憑證磚（需要 S14）、區塊 G 最近變更（需要 S18）。事件列可行內「確認」（alerts:write）。
+// 嚴重、警告的主機數在 API 為 null 時由進行中的告警推算（hostAlertCounts；沒有 alerts:read 時維持「—」）；
+// 待核准 API 為 null，顯示「—」與說明，不顯示 0（S03「無法取得時不可顯示 0」）。
 
 import { h, icon, mount } from '../core/dom.js';
 import { t, statusLabel, severityLabel, healthItemText } from '../core/strings.js';
@@ -14,6 +15,7 @@ import * as fmt from '../core/format.js';
 import { pageHead, card, kpiTile, kpiSkeleton, emptyState, errorState, statusBadge, skeletonBlock } from '../ui/components.js';
 import { sparkline } from '../ui/chart.js';
 import { hostNameCell, reasonText, offlineFor } from './host-common.js';
+import { ackDialog, who } from './alerts-common.js';
 
 const ORDER = ['critical', 'offline', 'warning', 'unknown', 'pending', 'online'];
 
@@ -23,8 +25,32 @@ function deltaText(n) {
   return `${n > 0 ? '▲' : '▼'} ${fmt.num(Math.abs(n))} ${t('overview.vs1h')}`;
 }
 
-function kpis(o) {
-  const counts = o.status_counts || {};
+/**
+ * 嚴重、警告的主機數（S03 A1；ia.md §5.1「線上，且有未解決的緊急或嚴重／警告等級告警」）。
+ * 主機 API 尚未依告警判定這兩個狀態（ALERTS.md 第 10 節「未做」），由進行中的告警推算：
+ * 有 agent_id、需要處理、未解決的事件，排除主機已離線的種類（主機離線、長期失聯、憑證被拒）。
+ * 沒有 alerts:read 或告警引擎沒有啟動時回 null（磚維持「—」）。
+ */
+const OFFLINE_KINDS = ['host_offline', 'host_long_offline', 'cert_rejected'];
+function hostAlertCounts(res) {
+  if (!res || res.error || !Array.isArray(res.data)) return null;
+  const crit = new Set();
+  const warn = new Set();
+  for (const e of res.data) {
+    if (!e.agent_id || e.attention !== 'action' || OFFLINE_KINDS.includes(e.kind)) continue;
+    if (e.severity === 'emergency' || e.severity === 'critical') crit.add(e.agent_id);
+    else if (e.severity === 'warning') warn.add(e.agent_id);
+  }
+  for (const a of crit) warn.delete(a);
+  return { critical: crit.size, warning: warn.size, partial: Boolean(res.page && res.page.next_cursor) };
+}
+
+function kpis(o, hostAlerts) {
+  const counts = { ...(o.status_counts || {}) };
+  if (hostAlerts) {
+    if (counts.critical == null) counts.critical = hostAlerts.critical;
+    if (counts.warning == null) counts.warning = hostAlerts.warning;
+  }
   const change = o.change_1h || null;
   return h(
     'div',
@@ -51,14 +77,16 @@ function kpis(o) {
               )
             : null;
         const sortParam = st === 'offline' ? '-last_seen' : null;
+        // 嚴重、警告由告警推算：連到告警事件（主機清單沒有這兩個狀態的篩選）
+        const fromAlerts = hostAlerts && (st === 'critical' || st === 'warning') && (o.status_counts || {})[st] == null;
         tile = kpiTile({
           status: st,
           label,
-          value: fmt.num(n),
+          value: fmt.num(n) + (fromAlerts && hostAlerts.partial ? '+' : ''),
           unit: t('unit.hosts'),
           delta,
-          sub,
-          href: `/hosts${qs({ status: st, sort: sortParam })}`,
+          sub: fromAlerts && n > 0 ? t(`overview.fromAlerts.${st}`) : sub,
+          href: fromAlerts ? `/alerts/events${qs({ severity: st === 'critical' ? 'emergency,critical' : 'warning' })}` : `/hosts${qs({ status: st, sort: sortParam })}`,
           tone: n > 0,
 
           extra: spark,
@@ -89,7 +117,7 @@ function healthStrip(health) {
   );
 }
 
-function alertsBlock(res) {
+function alertsBlock(res, onAck) {
   if (!res) return null;
   if (res.error) {
     if (res.error.code === 'alerts_unavailable') {
@@ -112,7 +140,15 @@ function alertsBlock(res) {
           h(
             'thead',
             null,
-            h('tr', null, h('th', { scope: 'col' }, t('overview.col.severity')), h('th', { scope: 'col' }, t('overview.col.event')), h('th', { scope: 'col' }, t('overview.col.duration')), h('th', { scope: 'col' }, t('overview.col.assignee'))),
+            h(
+              'tr',
+              null,
+              h('th', { scope: 'col' }, t('overview.col.severity')),
+              h('th', { scope: 'col' }, t('overview.col.event')),
+              h('th', { scope: 'col' }, t('overview.col.duration')),
+              h('th', { scope: 'col' }, t('overview.col.assignee')),
+              onAck ? h('th', { scope: 'col' }, h('span', { class: 'ds-visually-hidden' }, t('alerts.col.actions'))) : null,
+            ),
           ),
           h(
             'tbody',
@@ -122,9 +158,14 @@ function alertsBlock(res) {
                 'tr',
                 { class: e.severity === 'emergency' ? 'is-emergency' : null },
                 h('td', null, statusBadge(e.severity === 'info' ? 'info' : e.severity, severityLabel(e.severity))),
-                h('td', null, e.title, e.subject ? h('span', { class: 'k-sub' }, e.subject) : null),
+                h('td', null, h('a', { href: `/alerts/events/${encodeURIComponent(e.event_id)}` }, e.title), e.subject ? h('span', { class: 'k-sub' }, e.subject) : null),
                 h('td', null, fmt.duration((fmt.serverNow() - Date.parse(e.started_at)) / 1000)),
-                h('td', null, e.assignee || '—'),
+                h('td', null, who(e.assignee) || '—'),
+                onAck
+                  ? h('td', null, e.state === 'firing' && !e.acked && e.attention === 'action'
+                    ? h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', 'aria-label': t('alerts.ack.aria', { title: e.title }), on: { click: () => onAck(e) } }, t('alerts.ack.short'))
+                    : null)
+                  : null,
               ),
             ),
           ),
@@ -133,7 +174,10 @@ function alertsBlock(res) {
     : emptyState({ title: t('overview.noEvents'), iconName: 'success' });
   return card({
     title: t('overview.alerts'),
-    actions: h('span', { class: 'k-page-head__meta' }, t('overview.alertsSummary', { summary, n: fmt.num(counts.unacknowledged || 0) })),
+    actions: [
+      h('span', { class: 'k-page-head__meta' }, t('overview.alertsSummary', { summary, n: fmt.num(counts.unacknowledged || 0) })),
+      h('a', { href: '/alerts/events' }, t('overview.alertsAll')),
+    ],
     body,
   });
 }
@@ -270,11 +314,14 @@ export function render(ctx) {
     ctrl = new AbortController();
     const signal = ctrl.signal;
     const wantAlerts = session.can('alerts:read');
-    const [ov, facets, alerts] = await Promise.all([
+    const [ov, facets, alerts, hostEvents] = await Promise.all([
       api('/api/v1/overview', { signal }).then((d) => ({ d }), (e) => ({ e })),
       api('/api/v1/hosts/facets', { signal }).then((d) => d, () => null),
       wantAlerts
         ? api('/api/v1/alerts?view=active&limit=8', { signal, raw: true }).then((r) => r, (e) => ({ error: e }))
+        : Promise.resolve(null),
+      wantAlerts
+        ? api(`/api/v1/alerts${qs({ view: 'active', category: 'host,identity', limit: 1000 })}`, { signal, raw: true }).then((r) => r, (e) => ({ error: e }))
         : Promise.resolve(null),
     ]);
     if (disposed || signal.aborted) return;
@@ -296,13 +343,13 @@ export function render(ctx) {
       return;
     }
     mount(body, 
-      kpis(o),
+      kpis(o, hostAlertCounts(hostEvents)),
       healthStrip(o.health),
       h(
         'div',
         { class: 'k-stack' },
         (() => {
-          const a = alertsBlock(alerts);
+          const a = alertsBlock(alerts, session.can('alerts:write') ? ackFromOverview : null);
           const g = groupsBlock(facets);
           if (a && g) return h('div', { class: 'k-grid k-grid--3-1' }, a, g);
           return a || g;
@@ -310,6 +357,10 @@ export function render(ctx) {
         h('div', { class: 'k-grid k-grid--1-1' }, longestBlock(o.longest_offline), topBlock(o)),
       ),
     );
+  }
+
+  async function ackFromOverview(e) {
+    if (await ackDialog(e)) load();
   }
 
   refreshBtn.addEventListener('click', load);

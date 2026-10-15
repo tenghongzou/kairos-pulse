@@ -14,6 +14,24 @@ import { openSearch } from './search.js';
 let shell = null;
 let healthTimer = null;
 let lastOkAt = null;
+// 側邊導覽的計數泡泡（ia.md §7）：nav.js 項目的 count 鍵 → { n, tone, label }（由各功能設定，例如告警）
+const navCounts = new Map();
+
+/** 設定導覽項目的計數泡泡；value 為 null 時不顯示 */
+export function setNavCount(key, value) {
+  if (value) navCounts.set(key, value);
+  else navCounts.delete(key);
+  renderNav();
+}
+
+function countBubble(key) {
+  const c = key && navCounts.get(key);
+  if (!c || !c.n) return null;
+  return [
+    h('span', { class: ['ds-sidenav__count', `k-count--${c.tone || 'critical'}`], 'aria-hidden': 'true' }, c.n > 99 ? '99+' : String(c.n)),
+    h('span', { class: 'ds-visually-hidden' }, `，${c.label}`),
+  ];
+}
 
 function navVisible(item) {
   if (item.perm && !session.can(item.perm)) return false;
@@ -50,6 +68,7 @@ function renderNav() {
               },
               icon(it.icon),
               h('span', { class: 'ds-sidenav__label' }, t(it.label)),
+              countBubble(it.count),
             ),
           ),
         ),
