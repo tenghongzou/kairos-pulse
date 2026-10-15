@@ -35,6 +35,7 @@
 | `auth_failed` | 連線（hello 的 agent_id 與用戶端憑證不符，`KRS-W1102`） | `agent_id`（自稱）、`ip` |
 | `registry_evicted` | 連線（狀態表已滿，淘汰離線最久的主機，`KRS-E3201`） | `agent_id`、`hostname` |
 | `host_decommissioned` | 8443 的 `deregister` 成功 | `ip`、`initiated_by`、`already` |
+| `host_rebooted` | 狀態表（0.8〔草稿〕；report 的 `system.uptime` 比上一筆小、且取樣時間較晚） | `agent_id`、`hostname`、`uptime_secs`、`previous_uptime_secs`、`boot_time`（推算） |
 | `tls_reload` | TLS 重載工作 | `ok`、`crl`（變更涉及 CRL）、`message` |
 | `condition` | 系統檢查（狀態**變化**時才發布：成立、嚴重度改變、解除） | `check`（規則 ID）、`subject`、`active`、`severity`、`code`、`summary` |
 | `lifecycle` | 主程式 | `phase`：`started`、`shutting_down` |
@@ -112,6 +113,7 @@ subnet_prefix_v6 = 64
 | `sys.identity_conflict` | 身分衝突 | `window_secs`（3600）內被取代 ≥ `min_count`（5）次、來源 ≥ `min_sources`（2）個 | 嚴重 | `KRS-W3102` | 匯流排 |
 | `sys.cert_rejected` | 憑證被拒（單機） | 握手時被拒的憑證歸屬到主機（已撤銷 `KRS-W1105`、過期 `KRS-W1108`），或 `auth_failed`（`KRS-W1102`）；管理員撤銷（PKI 中已撤銷的序號）、已除役的主機、主機之後已上線者不觸發 | 嚴重 | 同左 | `tls::rejections`、匯流排 |
 | `sys.host_decommissioned` | 主機自行除役 | 每台一則紀錄；之前觸發的主機事件自動結束 | 資訊 | — | 匯流排 |
+| `sys.host_rebooted` | 主機重新開機（0.8〔草稿〕，D5） | `system.uptime` 變小（需要 Pulse 0.8.0）；建立後立即結案，只留紀錄、**不通知**，不需要確認 | 資訊（紀錄） | — | 匯流排（`host_rebooted`） |
 | `sys.mass_decommission` | 短時間大量除役 | 10 分鐘內 ≥ 20 台；60 分鐘沒有新的除役時恢復 | 警告 | `KRS-W3108` | 匯流排 |
 | `sys.subnet_offline`、`sys.mass_offline`、`sys.restart_unrecovered` | 第 5.2 節 | | 緊急、緊急、嚴重 | — | 狀態表 |
 | `sys.crl_expiring` | CRL 即將到期 | 剩 7／3／1 天 | 警告→嚴重→緊急 | `KRS-W1201` | TLS 設定的到期日 |
@@ -135,7 +137,22 @@ subnet_prefix_v6 = 64
 | `sys.audit_integrity` | 稽核日誌完整性（0.7） | 定期自我驗證（`audit.verify_interval_hours`，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復 | 緊急 | `KRS-E6201` | 匯流排（`audit_integrity`） |
 | `sys.restarted`、`sys.downtime` | 第 5.2 節 | | 資訊（非預期：嚴重）、嚴重 | — | 心跳 |
 
-**使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（CPU 或記憶體使用率，`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。
+**使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。
+
+**指標門檻的 `metric`**（0.8〔草稿〕起擴充；[`METRICS.md`](../crates/kairos-proto/METRICS.md) 第 11.1 節）：
+
+| `metric` | 值 | 門檻範圍 | 對象（事件的 `subject`） |
+|---|---|---|---|
+| `cpu`、`memory` | 使用率 % | 0～100 | 每台主機（`<agent_id>`） |
+| `disk` | 每個掛載點的使用率 %（Pulse 0.2.0～0.7.0 為推算值，事件 `details.estimated: true`） | 0～100 | **每個掛載點各自觸發與恢復**（`<agent_id>\|<掛載點>`）；`params.mountpoints`（選用，glob 清單，例 `["/", "/data*", "C:\\"]`）限定範圍 |
+| `swap` | `swap.used ÷ swap.total` % | 0～100 | 每台主機；總量為 0 時沒有值（不觸發） |
+| `load` | 5 分鐘平均負載 ÷ 邏輯處理器數（倍；處理器數取自資產） | 0～100 | 每台主機；Windows（沒有負載）與沒有資產的主機沒有值 |
+| `network_rx`、`network_tx` | 每個介面的接收／傳送速率 Mbps（位元組速率 × 8 ÷ 10⁶） | 0～1,000,000 | 每個介面（`<agent_id>\|<介面>`）；`params.devices`（選用，glob）限定範圍 |
+
+- glob 只支援 `*`、`?`，區分大小寫，每個清單最多 32 個；`mountpoints` 只用於 `disk`、`devices` 只用於網路，其他組合 `KRS-E5001`。
+- 評估方式不變：每 5 秒以狀態表的最近一次 report 判斷（`LastReport` 另保存每個掛載點的使用率、置換空間、負載、介面與磁碟的速率；速率以最後兩筆 report 算出）。離線主機沒有值。
+- 預覽與回測（`POST /api/v1/alert-rules/preview`）以 `rollup_5m` 的平均值重播：磁碟用 `system.filesystem.usage`（沒有時用推算值），網路用速率序列，負載用資產的處理器數。回應另帶 `hosts_without_metric`（範圍內沒有這個指標資料的台數，「符合主機數」照算），`notes` 有對應的說明。
+- 範本（`alerts-ux.md` §2.2，主控台 S09）：「磁碟使用率 > 90% 持續 10 分鐘，低於 85% 恢復」（警告）、「磁碟使用率 > 95% 持續 5 分鐘」（嚴重）。
 
 ### 5.4 靜音與維護時段（§4；D23、D26）
 

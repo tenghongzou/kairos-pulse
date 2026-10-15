@@ -2,7 +2,7 @@
 
 本文件定義 Pulse 採集、Pulse ↔ Kairos 傳送、Kairos 儲存與呈現的**主機指標、行程排行與主機資產**，位於 monorepo 的 `crates/kairos-proto/METRICS.md`，與 [`PROTOCOL.md`](PROTOCOL.md)（8443 長連線）、[`ENROLL.md`](ENROLL.md)（8444 註冊通道）並列。兩邊共用的型別與純函式在 `kairos-proto`（`metrics`、`processes`、`inventory` 模組）；該 crate 的單元測試以 `include_str!` 讀入本文件，從「標準指標」節比對指標表、從「範例」節解析每一則訊息。改規格時改這裡與 `kairos-proto` 即可。
 
-- 狀態：**衝刺 7 規格（0.8.0〔草稿〕）**。共用型別已完成；Pulse 端與 Kairos 端尚未實作（分工見第 16 節）。
+- 狀態：**衝刺 7 規格（0.8.0〔草稿〕）**。共用型別、Pulse 端已完成；Kairos 端的協定、儲存（schema v8）、API 與告警已完成（實作與本文件的差異見 `kairos/STORAGE.md` 第 15 節與 `kairos/API.md` 第 5.9、5.10 節），主控台進行中（分工見第 16 節）。
 - 線上格式的規則（`metrics` 陣列、features、錯誤碼）仍以 PROTOCOL.md 為準；本文件補上語意、來源、頻率、上限、儲存、API、告警與主控台。PROTOCOL.md 的標準指標表與本文件第 3 節由測試確認一致。
 - 設計依據（設計包，唯讀）：`kairos/screens.md` S03 區塊 F、S04、S05（概覽「目前數值」、趨勢分頁、資產資訊分頁）、S09（指標門檻）、S19、§24 #5 #15；`design-system/copywriting.md` §2.1、§3、§5.4、§6；`design-system/README.md` §6.7、§6.16；`decisions/INTEGRATION.md` §25.1（保留期限與容量）；`kairos/alerts-ux.md` §2.2；`pulse/log-ux.md`（`sysinfo.snapshot`）；`HANDOFF.md` §4。本文件與設計包不同或設計包沒有的部分列在第 18 節。
 
@@ -287,7 +287,7 @@ Pulse 一律經由 `sysinfo`（第 4.1 節）；下表列出 `sysinfo` 0.39 實�
 | `processes` | 0.8.0 起，`storage.backend = "sqlite"`（JSONL 後端不宣告，第 9.5 節） | 0.8.0 起，`processes.enabled = true` |
 | `inventory` | 0.8.0 起，`storage.backend = "sqlite"` | 0.8.0 起，`inventory.enabled = true` |
 
-這兩個 feature **不在** `kairos_proto::SERVER_FEATURES` 中，由 Kairos 依儲存後端決定是否宣告（與 `renew` 的作法相同）；共用 crate 以 `Session::inventory`、`Session::processes` 表示協商結果。在 Kairos 實作完成前，`kairos` 收到 `inventory` 一律回 `unknown_type`（本衝刺規格分支已加上這個處理）。
+這兩個 feature **不在** `kairos_proto::SERVER_FEATURES` 中，由 Kairos 依儲存後端決定是否宣告（與 `renew` 的作法相同）；共用 crate 以 `Session::inventory`、`Session::processes` 表示協商結果。Kairos 0.8.0（SQLite）在 `hello_ack` 的 `features` 一律列出 `inventory`、`processes`（與 `metrics`、`durable` 相同，列出伺服器支援的；`renew` 等註冊 feature 才只在 client 也宣告時列出）。
 
 ### 7.2 相容矩陣
 
