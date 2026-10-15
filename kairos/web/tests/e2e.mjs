@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { FakeAgent } from './fake-agent.mjs';
+import { registerAdmin } from './e2e-admin.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -425,7 +426,7 @@ test('權限：沒有角色的帳號看不到監控選單，直接存取回 403�
   const v = await newPage();
   await login(v.page, 'viewer');
   await waitTitle(v.page, '總覽');
-  assert.deepEqual(await v.page.locator('.ds-sidenav__link .ds-sidenav__label').allTextContents(), ['總覽', '主機']);
+  assert.deepEqual(await v.page.locator('.ds-sidenav__link .ds-sidenav__label').allTextContents(), ['總覽', '主機', '系統健康']);
   await v.page.locator('.k-status-light:not([hidden])').waitFor();
   await v.ctx.close();
 });
@@ -507,6 +508,8 @@ test('帳號鎖定的訊息（KRS-E6003）與帳號密碼錯誤（KRS-E6001）',
   await ctx.close();
 });
 
+// 管理與系統畫面（S16～S18、S20、S21）：e2e-admin.mjs
+registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0, PW, XSS_NAME });
 
 // ---------------------------------------------------------------------------
 async function main() {
