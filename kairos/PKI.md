@@ -490,7 +490,7 @@ server_ca_path = "data/pki/root-ca.pem"
 
 - **`auth.client_ca` 指向 `issuing-cas.pem` 而不是根 CA**：以根 CA 當 `auth.client_ca` 時，根 CA 底下**任何** CA 簽出的用戶端憑證都能經由 `auth.client_ca` 這組驗證器通過，而這組驗證器只有 `auth.crl`、沒有 Kairos 產生的 CRL。`issuing-cas.pem` 由 Kairos 依狀態重寫，退役的 CA 立即移除。已**退役**的簽發 CA 另外列在 `issuing-cas-retired.pem`，經過它們的鏈不論由哪一組驗證器通過都拒絕（0.8.0 起，第 15.4 節第 1 項），因此以根 CA 當 `auth.client_ca` 不再能讓退役簽發 CA 的憑證通過，但前一點仍成立。
 - **覆寫保護**：資料庫已有任何簽發 CA、或任何一個要寫出的檔案已存在時拒絕（結束代碼 11），不會產生第二個根 CA。根 CA 目錄不得在 `storage.data_dir` 之下（資料目錄會被備份、診斷包會列出檔名）。
-- **根 CA 私鑰**：init 之後在這台伺服器上，印出 `KRS-W1306`〔暫定〕要求立即複製到離線媒體並刪除（`shred -u`）。之後簽發伺服器憑證或新的簽發 CA 時在離線主機以 `kairos pki sign` 使用它。私鑰以明文 PKCS#8（0600）寫出；加密匯出（設計包 S02「加密下載後刪除」）留給首次啟動精靈。
+- **根 CA 私鑰**：init 之後在這台伺服器上，印出 `KRS-W1306`要求立即複製到離線媒體並刪除（`shred -u`）。之後簽發伺服器憑證或新的簽發 CA 時在離線主機以 `kairos pki sign` 使用它。私鑰以明文 PKCS#8（0600）寫出；加密匯出（設計包 S02「加密下載後刪除」）留給首次啟動精靈。
 - 稽核：`pki.init`（根 CA 的 subject 與指紋、伺服器憑證序號與 SAN、簽發 CA 編號、根 CA 私鑰路徑）。
 
 ### 15.2 `kairos pki sign`（CA 主機）
@@ -502,7 +502,7 @@ server_ca_path = "data/pki/root-ca.pem"
 | `client` | `--csr`（P-256）、`--agent-id` | 第 5.1 節（與線上簽發相同；CSR 的 CN 與 `--agent-id` 不同時拒絕） | 365／825 |
 
 - 簽發者（`--ca-cert`、`--ca-key`）：ECDSA P-256、P-384 或 RSA（未加密的 PKCS#8 PEM；舊的 `BEGIN RSA PRIVATE KEY` 以 `openssl pkcs8 -topk8 -nocrypt` 轉換）。必須是 CA、與私鑰成對、`keyUsage` 有 `keyCertSign`（有 `keyUsage` 時）、在有效期間內；有效期間一律截在簽發者的 `notAfter` 之前。CSR 必須通過自身的簽章驗證，擴充欄位一律不複製。
-- 私鑰檔的權限：群組或其他使用者有任何權限時拒絕（`KRS-E1307`〔暫定〕，結束代碼 4）。輸出檔與 `--new-key` 已存在時拒絕（結束代碼 11）。
+- 私鑰檔的權限：群組或其他使用者有任何權限時拒絕（`KRS-E1307`，結束代碼 4）。輸出檔與 `--new-key` 已存在時拒絕（結束代碼 11）。
 - 紀錄：簽發前在 CA 私鑰所在的目錄附加一行 JSON 到 `kairos-ca.log`（0600；時間、執行者、`sign`、profile、序號、簽發者與其公鑰雜湊、SAN／subject／agent_id、`notAfter`、輸出檔）；寫不進去時不簽發。
 - `--profile client` 簽出的憑證不在 Kairos 的簽發紀錄（S14）中；需要在主控台管理時改用註冊通道。
 
@@ -522,7 +522,7 @@ server_ca_path = "data/pki/root-ca.pem"
    - 限制：只比對用戶端送出的憑證。管理者自行把「與退役簽發 CA 同一把金鑰、但名稱不同的 CA 憑證」放進 `auth.client_ca` 時無法察覺（Kairos 不會產生這種憑證）。升級後的第一次啟動在 TLS 設定建立之後才寫出清單，之間的數秒內沿用 0.7 的行為。
 2. **根 CA 私鑰的加密保存**：目前明文 0600＋提示。建議沿用 `keys_backup.rs` 的 Argon2id＋AES-256-GCM 格式加上 `--encrypt-root`，`pki sign` 支援讀取加密的私鑰。
 
-### 15.5 新的產品代碼〔暫定〕
+### 15.5 新的產品代碼（設計包 `decisions/INTEGRATION.md` §30.3 正式分配，號碼不變）
 
 | 代碼 | 等級 | 何時 |
 |---|---|---|

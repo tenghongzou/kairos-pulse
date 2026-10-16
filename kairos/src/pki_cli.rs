@@ -20,9 +20,9 @@ use crate::pki::ca::{self, CaKey, InitError, InitPlan, ServerName};
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode};
 use crate::token_cli::{Failure, Output, db_failure, human_time, operator};
 
-/// 根 CA 私鑰仍在伺服器上（`pki init` 之後提醒移到離線保存）〔暫定〕
+/// 根 CA 私鑰仍在伺服器上（`pki init` 之後提醒移到離線保存）
 pub const CODE_ROOT_KEY_ON_SERVER: &str = "KRS-W1306";
-/// `pki sign`／`gencrl` 的 CA 憑證或私鑰無法使用（權限過寬、不成對、不是 CA、已過期）〔暫定〕
+/// `pki sign`／`gencrl` 的 CA 憑證或私鑰無法使用（權限過寬、不成對、不是 CA、已過期）
 pub const CODE_CA_UNUSABLE: &str = "KRS-E1307";
 
 fn ca_failure(msg: impl Into<String>) -> Failure {
@@ -195,7 +195,7 @@ pub fn init(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
              \x20 [enroll]\n\
              \x20 mode = \"open\"\n\
              \n\
-             {warn} 警告 {code}〔暫定〕：根 CA 私鑰目前在這台伺服器上（{root_dir}）。\n\
+             {warn} 警告 {code}：根 CA 私鑰目前在這台伺服器上（{root_dir}）。\n\
              \x20 根 CA 是 Pulse 信任的對象：私鑰外洩時任何人都能冒充 Kairos。請立即把整個目錄複製到離線媒體\n\
              \x20 （加密保存兩份），再從這台主機刪除：shred -u {root_key} && rm -r {root_dir}\n\
              \x20 之後簽發伺服器憑證或新的簽發 CA 時，在離線主機以 kairos pki sign 使用它。\n",

@@ -1,6 +1,6 @@
 // 自動產生，請勿手動修改：node kairos/web/tools/sync-design.mjs
 // 來源：設計包 prototype/kairos/error-codes.js（copywriting.md §3.3 錯誤代碼總表、§4.2 三段式範例；產生於 2026-10-15）
-// 只含 Kairos（KRS-）的 106 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
+// 只含 Kairos（KRS-）的 108 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
 export const ERROR_CODES = {
  "KRS-E0101": {
   "level": "E",
@@ -225,6 +225,20 @@ export const ERROR_CODES = {
   "title": "無法匯入憑證：issuing-2.pem 未通過檢查",
   "reason": "這張簽發 CA 憑證缺少擴充欄位 `pathlen:0`（實際為「未限制」）。Kairos 只接受 `CA:TRUE`、`pathlen:0`、`keyCertSign`／`cRLSign`、EKU `clientAuth`、與 Kairos 產生的私鑰成對、剩餘至少 2 年的簽發 CA 憑證；離線簽發的用戶端憑證則需鏈到目前的簽發 CA、SAN 與公鑰等於申請、序號未使用、EKU `clientAuth`。",
   "fix": "1. 在管理主機以 INSTALL 的 `issuing_ca_ext` 範本（離線簽發的用戶端憑證用 `client_ext`，或 `kairos pki sign-bundle`）重新簽發後再匯入。\n2. 確認簽發時使用的是這次 `kairos pki issuing-ca new` 或 `kairos pki queue export` 產生的 CSR，不是舊檔。"
+ },
+ "KRS-W1306": {
+  "level": "W",
+  "text": "`kairos pki init` 完成時，根 CA 私鑰仍在這台伺服器上（明文 PKCS#8、0600）：請立即複製到離線媒體（加密、兩份）並從伺服器刪除；之後簽發伺服器憑證或新的簽發 CA 時在離線主機以 `kairos pki sign` 使用（範例 99）。與 `1301`（**簽發 CA** 私鑰在伺服器上，線上簽發的正常取捨）不同：根 CA 私鑰不應留在線上。2026-10-15 分配（工程暫定同號，`decisions/INTEGRATION.md` §30）",
+  "title": "私有 CA 已建立：請立即把根 CA 私鑰移到離線保存",
+  "reason": "`kairos pki init` 已建立根 CA、伺服器憑證與簽發 CA。根 CA 私鑰目前以檔案存在這台伺服器上（`/opt/kairos/root-ca/root-ca.key`）。根 CA 私鑰可以簽出任何 Kairos 會信任的 CA，留在線上的伺服器上，一旦伺服器被入侵就必須重建整套 PKI、所有主機重新註冊。",
+  "fix": "1. 把 `/opt/kairos/root-ca` 整個目錄複製到離線媒體（加密，至少兩份，分開保管）。\n2. 確認副本可以讀取後，從伺服器刪除：`sudo shred -u /opt/kairos/root-ca/root-ca.key`。\n3. 之後要簽發新的伺服器憑證或簽發 CA 時，在離線的 CA 主機以 `kairos pki sign` 使用這把私鑰。"
+ },
+ "KRS-E1307": {
+  "level": "E",
+  "text": "`kairos pki sign`、離線 `kairos pki gencrl`（CA 主機）：CA 憑證或私鑰無法使用——私鑰檔權限過寬（群組或其他使用者有任何權限）、與憑證不成對、不是 CA、沒有 `keyCertSign`／`cRLSign`、已過期、格式不支援（加密或舊式 RSA PEM）；不簽發、不寫紀錄，結束代碼 4（範例 100）。執行中的 Kairos 的簽發 CA 私鑰問題仍是 `1303`；匯入的憑證未通過檢查仍是 `1305`。2026-10-15 分配（工程暫定同號，§30）",
+  "title": "無法簽發：CA 私鑰檔的權限過寬",
+  "reason": "`/media/ca/issuing-ca.key` 的群組或其他使用者有讀取權限（目前 0644）。為了避免私鑰外流，`kairos pki sign` 不使用權限過寬的私鑰檔。沒有簽發任何憑證，也沒有寫入 `kairos-ca.log`。",
+  "fix": "執行 `chmod 600 /media/ca/issuing-ca.key`（擁有者為執行指令的帳號）後重新執行。若私鑰檔曾經可被其他帳號讀取，請評估是否需要輪替這張 CA。"
  },
  "KRS-E2001": {
   "level": "E",

@@ -1,6 +1,6 @@
 # Pulse 錯誤代碼與日誌事件對照
 
-本文件列出 Pulse 0.4〔草稿〕與 0.5〔草稿〕（註冊通道）已對應到設計包代碼的地方（代碼 → 程式位置 → 觸發條件 → 在哪裡看得到），以及尚未實作的代碼。代碼的唯一來源是設計包 `design-system/copywriting.md` §3.3（Pulse 共 109 個）；日誌事件依 `pulse/log-ux.md` §4。發佈包內附本文件，`pulse explain <代碼>` 印出代碼的標題並指向這裡。
+本文件列出 Pulse 0.4〔草稿〕與 0.5〔草稿〕（註冊通道）已對應到設計包代碼的地方（代碼 → 程式位置 → 觸發條件 → 在哪裡看得到），以及尚未實作的代碼。代碼的唯一來源是設計包 `design-system/copywriting.md` §3.3（Pulse 共 113 個，0.8.0 依 `decisions/INTEGRATION.md` §30.3 新增 4 個）；日誌事件依 `pulse/log-ux.md` §4。發佈包內附本文件，`pulse explain <代碼>` 印出代碼的標題並指向這裡。
 
 ## 1. 代碼出現在哪裡
 
@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（93 個，含暫定號 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔0.8.0 指標擴充〕與 2.7 的 `PLS-E8205`、`PLS-E8206`〔0.8.0 Windows 服務〕）
+## 2. 已對應的代碼（93 個，含 0.8.0 新增的 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔指標擴充〕與 2.7 的 `PLS-E8105`、`PLS-E8106`〔Windows 服務〕，設計包 §30.3 正式分配）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -70,7 +70,7 @@
 | `PLS-E3201` | `network.rs` `error_code` | `bad_request`：`server agent registry is full` | `server.full`；連線列 ✗ |
 | `PLS-W2105` | `network.rs` `handle_server_line_in`、`Delivery::on_reply` | `invalid_report`（at-most-once 的日誌；durable 時丟棄並計數） | `report.rejected`；回報列 ⚠「被 Kairos 拒收」 |
 | `PLS-W2107` | `network.rs` `log_unparsable`、`handle_server_line_in`、`durable_reply` | 無法解析的行、註冊後重複的 `hello_ack`、其他非致命 `error` | `server.unexpected` |
-| `PLS-W2108`〔暫定〕 | `inventory.rs` `InventoryConn::on_line` | Kairos 以 `invalid_report`（或其他非 `storage_unavailable` 的非致命 `error`）拒收 `inventory`：同樣的內容不再送，內容改變才再送（METRICS.md 第 6.3 節）。`storage_unavailable` 時改記 `PLS-W4101`／`PLS-W2203`，5 分鐘後重送 | `inventory.rejected`（節流 10 分鐘） |
+| `PLS-W2108` | `inventory.rs` `InventoryConn::on_line` | Kairos 以 `invalid_report`（或其他非 `storage_unavailable` 的非致命 `error`）拒收 `inventory`：同樣的內容不再送，內容改變才再送（METRICS.md 第 6.3 節）。`storage_unavailable` 時 5 分鐘後重送：Kairos 暫時無法保存記 `PLS-W4101`；資產的速率限制（`inventory rate limit exceeded`，正常的 Pulse 不會發生）只記 `DEBUG`、沒有代碼（§30.3） | `inventory.rejected`（節流 10 分鐘） |
 | `PLS-W2203` | `network.rs` `storage_code` | `storage_unavailable`：`report rate limit exceeded` | `report.rejected`；回報列 ⚠（退避中） |
 | `PLS-W4101` | `network.rs` `storage_code` | `storage_unavailable`：無法保存（durable 時保留並退避重送） | `report.rejected`；回報列 ⚠「Kairos 暫時無法保存（PLS-W4101）…秒後重送」 |
 
@@ -86,7 +86,7 @@
 | `PLS-E4002` | `main.rs` `main` | 無法初始化日誌（結束代碼 1） | stderr |
 | `PLS-E8204` | `local_status.rs` `Tracker::write_locked`、`run_writer` | 預設位置（`/var/lib/pulse`、`%ProgramData%\Pulse`）無法寫入而改寫 `logs/status.json`（記一次）；執行中無法寫入（第一次 `WARN`、連續失敗滿 60 秒 `ERROR` 並寫 stderr、之後每 10 分鐘一則 `ERROR` 摘要、其間 `DEBUG`；恢復時記 `status.write_restored`） | `status.write_failed`；前者為「設定」列 ⚠（提示更新 unit），後者 `pulse status` 隨後顯示「未知」 |
 | `PLS-W8005` | `system_info.rs` `Sampler::refresh_and_read`、`check_stuck`；`inventory.rs` `run_worker` | 系統資訊取樣逾時；收集主機資產超過 10 秒（這次不送 `inventory`，不影響 report） | `sample.timeout` |
-| `PLS-I8009`〔暫定〕 | `system_info.rs` `report_limited` | 部分系統資訊因權限或平台限制無法取得，每個項目只記一次 `INFO`：系統序號（Linux 沒有 `/run/pulse/product_serial` 且不是 root、或 SMBIOS 沒有序號）、磁碟 I/O（讀不到 `/proc/diskstats`；Windows 讀不到效能計數器）、行程（只看得到自己的行程，例如 `ProtectProc=invisible`）。METRICS.md 第 4.5 節；`8006`～`8008` 保留給安裝前檢查 | `sysinfo.limited` |
+| `PLS-I8009` | `system_info.rs` `report_limited` | 部分系統資訊因權限或平台限制無法取得，每個項目只記一次 `INFO`：系統序號（Linux 沒有 `/run/pulse/product_serial` 且不是 root、或 SMBIOS 沒有序號）、磁碟 I/O（讀不到 `/proc/diskstats`；Windows 讀不到效能計數器）、行程（只看得到自己的行程，例如 `ProtectProc=invisible`）。METRICS.md 第 4.5 節；`8006`～`8008` 保留給安裝前檢查 | `sysinfo.limited` |
 
 ### 2.5 `pulse status` 專用
 
@@ -136,12 +136,12 @@
 | `PLS-E8302` | `enroll/machine.rs` | 註冊或過期續簽時 `clock_skew`：每 5 分鐘重送，偵測到本機時間被調整時立即 | `enroll.clock_rejected`／`cert.grace_renew_blocked`（ERROR）；身分列 ✗「相差…；校正後自動重送」；`clock.source = clock_skew` |
 | `PLS-E1403`（8444） | `enroll/cli.rs` `connect_failure` | 註冊端點的伺服器憑證依本機時間已過期或尚未生效：以「忽略有效期間」再驗證一次、只送 `server-info`，訊息中寫出未驗證的 Kairos 時間 | `clock.source = server_info_unverified`、`valid: false` |
 
-### 2.7 Windows 服務（0.8〔草稿〕，代碼〔暫定〕，設計包尚未分配）
+### 2.7 Windows 服務（0.8〔草稿〕；設計包 §30.3 分配到子類別 81，工程暫定的 `8205`／`8206` 已改號）
 
 | 代碼 | 程式位置 | 觸發條件 | 看得到的地方 |
 |---|---|---|---|
-| `PLS-E8205` | `winsvc.rs` `install`、`uninstall` | 服務控制管理員回報錯誤：沒有系統管理員權限、服務 `Pulse` 已存在（install）或不存在（uninstall）、無法啟動（`--start`） | stderr，`pulse service` 結束代碼 1 |
-| `PLS-E8206` | `winsvc.rs` `run_service` | `pulse service run` 不是由服務控制管理員啟動（在主控台執行），或無法切換到 `--workdir` | stderr，結束代碼 2／1 |
+| `PLS-E8105` | `winsvc.rs` `install`、`uninstall` | 服務控制管理員回報錯誤：沒有系統管理員權限、服務 `Pulse` 已存在（install）或不存在（uninstall）、無法啟動（`--start`） | stderr，`pulse service` 結束代碼 1 |
+| `PLS-E8106` | `winsvc.rs` `run_service` | `pulse service run` 不是由服務控制管理員啟動（在主控台執行），或無法切換到 `--workdir` | stderr，結束代碼 2／1 |
 
 ## 3. 日誌事件（`log-ux.md` §4）
 

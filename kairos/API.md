@@ -895,8 +895,8 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `enroll mode` | L1／L2 | 不帶模式時只顯示目前狀態與來源。切換到 `closed` 且 N＋M＞0 時為 L2：互動輸入「停止續簽 {N＋M} 台」，非互動需 `--yes --expect-count <N＋M>` 與 `--reason`；數字在確認後改變時中止並重新顯示（同 `impact_changed`）。被環境變數覆寫時結束代碼 3 並寫出變數名稱 |
 | `pki revoke` | L2 | 沿用 `cli-style.md` §5.4 的範例 |
 | `pki issuing-ca retire`、`pki crl upload`（筆數較少） | L3 | 非互動需 `--confirm "重建 CA"`／`--confirm "上傳較舊的 CRL"`，`--yes` 不足以略過 |
-| `pki sign-bundle`、`pki sign`、`pki gencrl --ca-key` | — | 在 CA 主機執行；私鑰檔權限過寬時拒絕（結束代碼 4，`sign`／`gencrl` 為 `KRS-E1307`〔暫定〕）；輸出檔已存在時不覆寫（結束代碼 11）；`sign`／`gencrl` 先在私鑰所在目錄的 `kairos-ca.log` 附加一筆紀錄，寫不進去時不簽發（PKI.md 第 15 節） |
-| `pki init` | — | 只能執行一次：資料庫已有簽發 CA 或要寫出的檔案已存在時結束代碼 11；成功時寫稽核 `pki.init`，並提醒把根 CA 私鑰移到離線保存（`KRS-W1306`〔暫定〕） |
+| `pki sign-bundle`、`pki sign`、`pki gencrl --ca-key` | — | 在 CA 主機執行；私鑰檔權限過寬時拒絕（結束代碼 4，`sign`／`gencrl` 為 `KRS-E1307`）；輸出檔已存在時不覆寫（結束代碼 11）；`sign`／`gencrl` 先在私鑰所在目錄的 `kairos-ca.log` 附加一筆紀錄，寫不進去時不簽發（PKI.md 第 15 節） |
+| `pki init` | — | 只能執行一次：資料庫已有簽發 CA 或要寫出的檔案已存在時結束代碼 11；成功時寫稽核 `pki.init`，並提醒把根 CA 私鑰移到離線保存（`KRS-W1306`） |
 | `pki gencrl`（線上） | — | 與主控台 S15「立即產生 CRL」相同（`PkiManager::regenerate_crl`）；寫稽核 `crl.generate`；離線模式結束代碼 2 |
 
 - **結束代碼**（`cli-style.md` §8）：0 完成；1 資料庫錯誤或批次中有失敗；2 用法錯誤（含非互動缺少 `--yes`／`--expect-count`／`--confirm`）；3 設定錯誤（含被環境變數覆寫）；4 憑證錯誤（CA 憑證或私鑰有問題、匯入的憑證檢查不通過）；6 被拒絕（對象的狀態不允許，例如核准已結束的申請）；10 權限不足；11 衝突（資料庫被 `kairos reports import` 獨占、輸出檔已存在）。

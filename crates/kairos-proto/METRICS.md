@@ -174,7 +174,7 @@ Pulse 一律經由 `sysinfo`（第 4.1 節）；下表列出 `sysinfo` 0.39 實�
 
 | 平台 | 項目 | 說明 |
 |---|---|---|
-| Linux | 系統序號 `system.serial` | `/sys/class/dmi/id/product_serial` 為 root 才能讀（0400），而 Pulse 以 `pulse` 使用者、`CapabilityBoundingSet=` 執行，**讀不到**。建議 unit 加 `ExecStartPre=+`（以 root 執行、不受沙箱限制）把序號複製到 `RuntimeDirectory=pulse` 的檔案，Pulse 優先讀該檔（第 17 節 D4）。讀不到時不送該欄位，啟動時記一次 `PLS-I8009`〔暫定〕 |
+| Linux | 系統序號 `system.serial` | `/sys/class/dmi/id/product_serial` 為 root 才能讀（0400），而 Pulse 以 `pulse` 使用者、`CapabilityBoundingSet=` 執行，**讀不到**。建議 unit 加 `ExecStartPre=+`（以 root 執行、不受沙箱限制）把序號複製到 `RuntimeDirectory=pulse` 的檔案，Pulse 優先讀該檔（第 17 節 D4）。讀不到時不送該欄位，啟動時記一次 `PLS-I8009` |
 | Linux | 其他資產 | `sys_vendor`、`product_name`、`board_*`、`bios_*` 所有人可讀；`PrivateDevices=yes` 不影響 `/proc`、`/sys` 的讀取 |
 | Linux | 行程 | unit 沒有 `ProtectProc=`，可以看到所有行程；命令列（`/proc/<pid>/cmdline`）所有人可讀。若管理者加上 `ProtectProc=invisible`，只看得到 pulse 自己的行程：此時 `system.process.count` 與 `processes` **不送**（看到的數目明顯少於 2 時判定為受限），記一次 `PLS-I8009` |
 | Windows | 行程 | 虛擬服務帳號 `NT SERVICE\Pulse` 以 `PROCESS_QUERY_LIMITED_INFORMATION` 可取得名稱、CPU 時間與 Working Set；受保護的行程（例如 `csrss.exe`）的記憶體可能取不到（視為 0，不列入記憶體排行）。命令列需要 `PROCESS_VM_READ`，其他帳號的行程取不到 → 該行程不帶 `command` |
@@ -261,7 +261,7 @@ Pulse 一律經由 `sysinfo`（第 4.1 節）；下表列出 `sysinfo` 0.39 實�
 |---|---|
 | 保存成功（含內容與上次相同） | `ack` |
 | 不是合法 JSON、欄位型別錯誤（例如 `inventory` 不是物件、`total` 不是 u64） | `bad_request`（`seq` 為 `null`，同其他訊息） |
-| 內容不符 `validate_inventory` | `invalid_report`（帶 `seq`，不保存；Kairos 記 `KRS-W2108`〔暫定〕） |
+| 內容不符 `validate_inventory` | `invalid_report`（帶 `seq`，不保存；Kairos 記 `KRS-W2108`） |
 | 同一條連線兩則 `inventory` 間隔不到 60 秒（`INVENTORY_MIN_INTERVAL_MS`） | `storage_unavailable`（`inventory rate limit exceeded`，不保存） |
 | 寫入失敗 | `storage_unavailable`（`report could not be stored`），同 report |
 | 沒有協商 `inventory` | `unknown_type`（與舊版 Kairos 相同） |
@@ -272,7 +272,7 @@ Pulse 一律經由 `sysinfo`（第 4.1 節）；下表列出 `sysinfo` 0.39 實�
 
 1. `hello_ack` 協商了 `inventory` 後，收集一次並送出（不論與上次是否相同：伺服器可能是新的、或資料被清除過）。
 2. 之後每 `inventory.interval` 重新收集，以 `inventory_digest` 與「上次收到 `ack` 的摘要」比較，不同才送；距離上次收到 `ack` 滿 24 小時也送。
-3. 收到 `invalid_report`：記 `PLS-W2108`〔暫定〕，同一個摘要不再重送（等內容改變）。收到 `storage_unavailable`：5 分鐘後重送（不超過 `inventory.interval`）。斷線時在途的 `inventory` 視同沒有送出，重連後依第 1 點再送。
+3. 收到 `invalid_report`：記 `PLS-W2108`，同一個摘要不再重送（等內容改變）。收到 `storage_unavailable`：5 分鐘後重送（不超過 `inventory.interval`）。斷線時在途的 `inventory` 視同沒有送出，重連後依第 1 點再送。
 4. `inventory` **不經過本機緩衝**（它是狀態，不是時序；重連後一定會再送一次）。
 5. 收集在 blocking 執行緒進行，逾時（10 秒）時這次不送、記 `PLS-W8005`；不影響 report 的取樣。
 6. 單行上限：一般主機約 2～6 KB。超過 65536 bytes 時（例如上百個介面），依序捨去介面的 `addresses`（每個介面只留第一個 IPv4 與第一個 IPv6）、再捨去優先順序最低的介面與磁碟，直到不超過。
@@ -345,7 +345,7 @@ ALTER TABLE series ADD COLUMN derived INTEGER NOT NULL DEFAULT 0;  -- 0 原始�
 - 原始累計值仍存在 `reports` 中（原始資料保留期限內可以重算），**但不再彙總**：v8 起計數器只彙總衍生的速率序列（累計值的平均、最小、最大沒有意義）。v7 以前已經寫入的累計值彙總保留到保留期限自然刪除。
 - 每台主機的「上一筆」放在記憶體中（`host_id, series_id → CounterSample`）；Kairos 重新啟動後，該主機第一筆 report 以 `reports` 中時間最近且早於它的一筆作為上一筆（只查一次）。`system.uptime` 取自同一筆 report。
 - 晚到的資料（`ts` 不晚於上一筆，例如 durable 補送與即時資料交錯）不產生速率點，也不更新「上一筆」；Pulse 依序送出，正常只在 Pulse 重新啟動、舊的 `boot_id` 還有積壓時發生。
-- 每台主機的序列數上限 **2048**（新增，`storage.max_series_per_host`）：超過時新序列的指標不保存，其他照存並回 `ack`，記 `KRS-W4104`〔暫定〕（每台主機每小時最多一次）。避免介面名稱不斷變化（容器網路）時序列無限增加；全域上限 1,000,000（`SERIES_FULL`）不變。
+- 每台主機的序列數上限 **2048**（新增，`storage.max_series_per_host`）：超過時新序列的指標不保存，其他照存並回 `ack`，記 `KRS-W4104`（每台主機每小時最多一次）。避免介面名稱不斷變化（容器網路）時序列無限增加；全域上限 1,000,000（`SERIES_FULL`）不變。
 
 ### 9.2 推算的使用率（相容 0.2.0～0.7.0 的 Pulse）
 
@@ -415,9 +415,9 @@ CREATE TABLE process_snapshots (
 | 彙總每台每天 | 約 0.31 MB | 約 0.73 MB |
 | 行程快照每台每天（每 60 秒、約 1 KB） | — | 約 1.4 MB |
 | 資產與變更歷史 | — | 可忽略（每台數 KB） |
-| **預設保留期限下每台合計** | 約 52 MB | 約 **120 MB** |
+| **預設保留期限下每台合計** | 約 52 MB | 約 **129.1 MB**（原始 9.16 MB＋行程 1.44 MB 每天 × 8 天＝84.8 MB、5 分鐘彙總 21.7 MB、1 小時彙總 22.6 MB；設計包 §30.5 #1） |
 
-`storage.max_total_bytes` 預設 64 GiB 時，約可完整保留 530 台（0.7.0 約 1,200 台）；超過時依既有規則先刪最舊的原始資料。這是第 17 節 D1 需要決定的事項。
+`storage.max_total_bytes` 預設 64 GiB 時，約可完整保留 532 台（0.7.0 約 1,320 台）；超過時依既有規則先刪最舊的原始資料。這是第 17 節 D1 需要決定的事項。
 
 ## 10. Kairos 端：查詢 API
 
@@ -443,7 +443,7 @@ CREATE TABLE process_snapshots (
 
 ### 10.3 CSV 匯出
 
-S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核心數、記憶體、廠牌、型號、序號、開機時間欄；S05 趨勢的「匯出圖表資料 CSV」沿用目前的格式，欄名為指標名稱與 label（例 `system.filesystem.usage{mountpoint=/}`）。
+S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核心數、記憶體、廠牌、型號、開機時間欄，**不含序號**（與清單 API 相同，減少大量匯出外流；序號只在主機詳情與 S19 合規報表，設計包 §30.4 #4、D47）；S05 趨勢的「匯出圖表資料 CSV」沿用目前的格式，欄名為指標名稱與 label（例 `system.filesystem.usage{mountpoint=/}`）。
 
 ## 11. Kairos 端：告警
 
@@ -504,14 +504,14 @@ S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核�
 
 既有代碼沿用：`KRS-W2105`／`PLS-W2105`（report 不合法，含 `processes` 不合法）、`KRS-E4101`／`PLS-W4101`（無法寫入）、`PLS-W8005`（取樣逾時，含行程與資產的收集）、`KRS-E4003`（主控台無法載入資料，含資產與行程）、`KRS-E5001`（告警規則無法儲存，含新指標的門檻範圍錯誤）。
 
-需要新增的代碼（暫定號，**待設計組正式分配**；目前總數 213：Kairos 104、Pulse 109，分配後為 217：Kairos 106、Pulse 111）：
+新增的代碼（設計包 `decisions/INTEGRATION.md` §30.3 正式分配，號碼與工程暫定的相同；連同打包線的 `KRS-W1306`、`KRS-E1307`、`PLS-E8105`、`PLS-E8106`，總數 213 → 221：Kairos 108、Pulse 113）：
 
-| 暫定代碼 | 標題（建議） | 情境 | 類別 |
+| 代碼 | 標題 | 情境 | 類別 |
 |---|---|---|---|
-| `KRS-W2108`〔暫定〕 | 資產資訊不合法 | Kairos 以 `invalid_report` 拒絕 `inventory`（第 6.2 節） | 21 協定與版本（鏡像） |
-| `PLS-W2108`〔暫定〕 | 資產資訊被伺服器拒絕 | Pulse 收到 `inventory` 的 `invalid_report`（第 6.3 節） | 21（鏡像） |
-| `KRS-W4104`〔暫定〕 | 主機的指標序列數已達上限，部分指標未保存 | 第 9.1 節的每主機 2048 序列上限 | 41 寫入 |
-| `PLS-I8009`〔暫定〕 | 部分系統資訊無法取得 | 權限或平台限制使序號、行程、磁碟 I/O 等取不到（第 4.5 節），啟動時記一次、列出取不到的項目 | 80 平台 |
+| `KRS-W2108` | 資產資訊不合法 | Kairos 以 `invalid_report` 拒絕 `inventory`（第 6.2 節） | 21 協定與版本（鏡像） |
+| `PLS-W2108` | 資產資訊被伺服器拒絕 | Pulse 收到 `inventory` 的 `invalid_report`（第 6.3 節） | 21（鏡像） |
+| `KRS-W4104` | 主機的指標序列數已達上限，部分指標未保存 | 第 9.1 節的每主機 2048 序列上限 | 41 寫入 |
+| `PLS-I8009` | 部分系統資訊無法取得 | 權限或平台限制使序號、行程、磁碟 I/O 等取不到（第 4.5 節），啟動時記一次、列出取不到的項目 | 80 平台、systemd 與系統資訊（子類別改名） |
 
 `8006`～`8008` 已保留給安裝前檢查（設計包 ERROR-CODES §4.1），因此取 `8009`。
 
@@ -540,7 +540,7 @@ S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核�
 3. 行程：`processes.*` 設定、只在 `processes.interval` 的那次取樣更新行程清單、`normalize_process_cpu`、命令列的三種模式、`ProtectProc` 受限的判定；`Sample` 增加 `processes`（緩衝的紀錄格式向下相容：舊紀錄沒有這個欄位時視為沒有）。
 4. 資產：收集（sysinfo＋BIOS 的 `/sys`／登錄）、第 6.3 節的送出規則、`inventory.*` 設定；序號的 `ExecStartPre` 檔案（若 D4 採用，改 `packaging/pulse.service` 與 INSTALL.md）。
 5. hello 的 `features` 依設定加入 `inventory`、`processes`；`pulse status` 的 features 列出協商結果。
-6. 代碼 `PLS-W2108`、`PLS-I8009`（暫定號，分配後替換）；README 的設定與 report 格式章節；`sysinfo.snapshot` 日誌加上新的 skipped 計數。
+6. 代碼 `PLS-W2108`、`PLS-I8009`（設計包 §30.3 正式分配）；README 的設定與 report 格式章節；`sysinfo.snapshot` 日誌加上新的 skipped 計數。
 
 驗收（測試）：
 
@@ -558,7 +558,7 @@ S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核�
 3. Registry 與告警：`LastReport` 擴充；`metric_threshold` 的新 `metric`、掛載點／介面範圍、預覽；範本；（D5 採用時）主機重新開機事件；`ALERTS.md` 更新。
 4. API（第 10 節）與 `API.md`；CSV 匯出欄位。
 5. 主控台（`kairos/web`）：第 13 節（S05 概覽、趨勢、資產資訊、行程；S03 磁碟排行；S04 欄位與篩選；S09 指標選單），用語與單位依 copywriting；〔待設計〕的部分先以既有元件實作並標記，設計組補上後調整。
-6. 代碼 `KRS-W2108`、`KRS-W4104`（暫定號）。
+6. 代碼 `KRS-W2108`、`KRS-W4104`（設計包 §30.3 正式分配）。
 
 驗收（測試）：
 
@@ -576,7 +576,7 @@ S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核�
 
 | # | 事項 | 建議 |
 |---|---|---|
-| D1 | 每台主機的儲存量約從 52 MB 增加到 120 MB（第 9.6 節），64 GiB 預設可完整保留的主機數從約 1,200 降到約 530 | **接受並更新估算與 S02 的公式**；不改預設的 `storage.max_total_bytes`（由管理者依規模調整，S02 會提示）。不建議降低 `report.interval` 的預設或少送指標：磁碟與網路是 MVP 的核心需求 |
+| D1 | 每台主機的儲存量約從 52 MB 增加到 129.1 MB（第 9.6 節），64 GiB 預設可完整保留的主機數從約 1,320 降到約 532 | **接受並更新估算與 S02 的公式**；不改預設的 `storage.max_total_bytes`（由管理者依規模調整，S02 會提示）。不建議降低 `report.interval` 的預設或少送指標：磁碟與網路是 MVP 的核心需求 |
 | D2 | 資產（序號、MAC、IP）與行程（可能含命令列）是否需要獨立權限 | **沿用 `hosts:read`、不新增權限**（維持 35 個）：命令列預設不送，序號與網路位址對能看主機的人本來就是必要資訊。若之後要開放 `processes.command = "full"` 給大客戶，再新增 `hosts.processes:read`（只給管理者與維運者） |
 | D3 | 行程的使用者名稱 | **本衝刺不送**（型別已預留 `user`）。需要時以自行實作的 uid／SID 查詢加入，不啟用 sysinfo 的 `user` feature |
 | D4 | Linux 讀不到系統序號（root 才能讀） | **採用 `ExecStartPre=+` 複製到 `/run/pulse/`** 的作法（unit 改動小、Pulse 本身仍不需要特權）；不採用給 Pulse `CAP_DAC_READ_SEARCH`（權限過大） |
@@ -595,8 +595,8 @@ S04 的 CSV 匯出（`KRS-E4301` 為失敗代碼）另加 OS、CPU 型號、核�
 5. 舊版 Pulse 的**空狀態文案**（「這台主機的 Pulse 版本不回報此資訊（需要 0.8.0 以上）」）與「推算」標示的文案與 tooltip。
 6. 「主機重新開機」事件（D5 採用時）的文案、等級與在 S05 時間軸的呈現。
 7. 新指標與資產欄位的 **i18n key 與用語**（例：負載、置換空間、行程、開機時間、序號、BIOS、網卡）；`copywriting.md` §6 補上磁碟讀寫速率（MB/s，十進位）的寫法。
-8. 第 14 節 4 個暫定錯誤代碼的**正式分配**、標題與說明文案（§3、§4.2 範例）。
-9. S02 的**容量估算公式**（每筆 report 約 530 bytes、每台約 120 MB，第 9.6 節）與原型 `mock-data.js` 的 `rawBytesPerReport`。
+8. 第 14 節 4 個錯誤代碼的**正式分配**（已完成，設計包 §30.3）、標題與說明文案（§3、§4.2 範例）。
+9. S02 的**容量估算公式**（每筆 report 約 530 bytes、每台約 129.1 MB，第 9.6 節）與原型 `mock-data.js` 的 `rawBytesPerReport`。
 10. S04 **可選欄位**的最終清單（CPU、記憶體總量、廠牌型號、開機時間）與 OS 家族篩選。
 
 ## 範例

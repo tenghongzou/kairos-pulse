@@ -12,14 +12,15 @@
 #
 # 用法：
 #   sh pulse-install.sh (--base-url <URL> | --dir <目錄>) --allowed-signers <檔案>
-#                       [--install-string <安裝字串>] [--version <版本>] [--no-enroll] [--no-start]
+#                       [--install-string-file <檔案>] [--version <版本>] [--no-enroll] [--no-start]
 #
 #   --base-url <URL>          發佈處（含 SHA256SUMS、SHA256SUMS.sig 與套件的目錄）
 #   --dir <目錄>              離線安裝：已下載好的發佈檔案所在的目錄
 #   --allowed-signers <檔案>  發佈公鑰（必須從另一個管道取得，INSTALL.md 第 2 節）；
 #                             也可用環境變數 PULSE_ALLOWED_SIGNERS
-#   --install-string <字串>   Kairos 管理者提供的安裝字串；建議改用環境變數 PULSE_INSTALL_STRING
-#                             （避免留在 shell 歷史中）。沒有時只安裝、不註冊
+#   --install-string-file <檔案>  從檔案讀取 Kairos 管理者提供的安裝字串（建議；或用環境變數
+#                             PULSE_INSTALL_STRING）。沒有安裝字串時只安裝、不註冊
+#   --install-string <字串>   同上，但不建議：命令列參數會留在 shell 歷史，執行期間其他帳號也能從 ps 看到
 #   --version <版本>          要安裝的版本（目錄中有多個版本時必填）
 #   --no-enroll               只安裝套件，不執行 pulse enroll
 #   --no-start                不啟動服務
@@ -59,10 +60,16 @@ while [ $# -gt 0 ]; do
     --dir) DIR=${2:?--dir 需要目錄}; shift 2 ;;
     --allowed-signers) SIGNERS=${2:?--allowed-signers 需要檔案}; shift 2 ;;
     --install-string) INSTALL_STRING=${2:?--install-string 需要安裝字串}; shift 2 ;;
+    --install-string-file)
+        f=${2:?--install-string-file 需要檔案}
+        [ -r "$f" ] || die 2 "無法讀取 $f"
+        INSTALL_STRING=$(sed -n '/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$f")
+        shift 2
+        ;;
     --version) VERSION=${2:?--version 需要版本}; shift 2 ;;
     --no-enroll) ENROLL=0; shift ;;
     --no-start) START=0; shift ;;
-    -h | --help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,33p' "$0"; exit 0 ;;
     *) die 2 "未知的參數「$1」（--help 查看用法）" ;;
     esac
 done
@@ -73,7 +80,7 @@ done
 [ -n "$SIGNERS" ] || die 2 "需要 --allowed-signers（發佈公鑰；從供應商另外提供的管道取得，不要和套件從同一處下載）"
 [ -f "$SIGNERS" ] || die 2 "找不到 $SIGNERS"
 if [ "$ENROLL" = 1 ] && [ -z "$INSTALL_STRING" ]; then
-    echo "注意：沒有安裝字串（--install-string 或 PULSE_INSTALL_STRING），只安裝套件、不註冊" >&2
+    echo "注意：沒有安裝字串（--install-string-file 或 PULSE_INSTALL_STRING），只安裝套件、不註冊" >&2
     ENROLL=0
 fi
 command -v sha256sum >/dev/null 2>&1 || die 3 "找不到 sha256sum"
@@ -162,8 +169,10 @@ fi
 code=0
 if [ "$ENROLL" = 1 ]; then
     say "pulse enroll"
-    /opt/pulse/pulse enroll --install-string "$INSTALL_STRING" --non-interactive --no-wait \
-        -c /opt/pulse/pulse.toml || code=$?
+    # 安裝字串（含 token）經 stdin 傳給 pulse，不放在命令列（執行期間其他帳號可從 ps 看到命令列）
+    printf '%s\n' "$INSTALL_STRING" |
+        /opt/pulse/pulse enroll --install-string-file - --non-interactive --no-wait \
+            -c /opt/pulse/pulse.toml || code=$?
     case "$code" in
     0) ;;
     7) echo "已送出註冊申請，等待 Kairos 管理者核准（申請編號見上方）；核准後服務自動連線" >&2 ;;

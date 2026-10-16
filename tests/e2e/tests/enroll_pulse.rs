@@ -807,7 +807,10 @@ fn pki_init_then_install_string_registers_and_the_service_connects() {
     assert_eq!(t["ca_pin"].as_str(), Some(pin.as_str()), "{t}");
 
     let host = PulseHost::new(&env, "pulse");
-    let (code, doc, p) = host.enroll(&["--install-string", &install]);
+    // 安裝字串從檔案讀取（--install-string-file；一行安裝腳本與 Ansible 以 stdin 的 - 傳入），不出現在命令列
+    let install_file = env.dir.join("install-string.txt");
+    std::fs::write(&install_file, format!("{install}\n")).unwrap();
+    let (code, doc, p) = host.enroll(&["--install-string-file", install_file.to_str().unwrap()]);
     assert_eq!(code, 0, "{}\n{}", p.dump(), kairos.dump());
     assert_eq!(doc["data"]["result"], "registered", "{doc}");
     let mut svc = host.start();

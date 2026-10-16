@@ -37,7 +37,8 @@ pulse enroll — 以註冊 token 向 Kairos 註冊這台主機
   pulse enroll --server <host[:port]> --token <token> [--ca-pin <sha256:…> | --ca-file <路徑>]
                [--enroll-server <host[:port] | :port>] [--name <顯示名稱>] [--tag <標籤>]...
                [--wait <秒> | --no-wait] [--force] [--reset-identity] [--trust-on-first-use]
-  pulse enroll --install-string <字串> [...]
+  pulse enroll --install-string-file <路徑|-> [...]
+  pulse enroll --install-string <字串> [...]（不建議：命令列參數在執行期間其他帳號可從 ps 看到）
   pulse enroll --token-file <路徑|-> [...]
   pulse enroll --status            顯示目前的註冊狀態
   pulse enroll --cancel            撤回進行中的申請並刪除本機未使用的私鑰（L1）
@@ -52,7 +53,9 @@ pulse enroll — 以註冊 token 向 Kairos 註冊這台主機
       --enroll-server <host[:port]>   註冊端點；只改連接埠時寫 :port（預設 <server 主機>:8444）
       --token <token>                 註冊 token（KRT1-XXXX-XXXX-XXXX-XXXX，不分大小寫、連字號可省略）
       --token-file <路徑|->           從檔案（- 為 stdin）讀取 token
-      --install-string <字串>         安裝字串（pulse-enroll:v1:…，含位址、token 與 CA 指紋）
+      --install-string-file <路徑|->  從檔案（- 為 stdin）讀取安裝字串（建議；不會出現在 ps 中）
+      --install-string <字串>         安裝字串（pulse-enroll:v1:…，含位址、token 與 CA 指紋）；
+                                      不建議：執行期間其他帳號可從 ps 看到，改用 --install-string-file
       --ca-pin <sha256:…>             Kairos CA 的指紋
       --ca-file <路徑>                Kairos CA 憑證（PEM）
       --trust-on-first-use            非互動模式下沒有指紋時信任註冊端點出示的 CA（未驗證伺服器身分）
@@ -74,7 +77,7 @@ pulse enroll — 以註冊 token 向 Kairos 註冊這台主機
   -h, --help                          顯示此說明
 
 範例：
-  sudo pulse enroll --install-string pulse-enroll:v1:eyJzIjoia2Fpcm9z…
+  echo 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…' | sudo pulse enroll --install-string-file -
   sudo pulse enroll --server kairos.example.gov.tw --token KRT1-7G4Q-M2XD-9PBA-H6WN \\
                     --ca-pin sha256:3f9a1c07b2d48e610a9c55f27d13c8a0e4b729610f3d8ac291e56b04d7afe21b
 
@@ -90,6 +93,8 @@ pub struct EnrollArgs {
     pub token: Option<String>,
     pub token_file: Option<String>,
     pub install_string: Option<String>,
+    /// `--install-string-file <路徑|->`：從檔案或 stdin 讀取安裝字串（不出現在命令列）
+    pub install_string_file: Option<String>,
     pub ca_pin: Option<String>,
     pub ca_file: Option<String>,
     pub name: Option<String>,
@@ -140,6 +145,7 @@ pub fn parse(args: &[String]) -> Result<Option<EnrollArgs>, UsageError> {
             "--token" => a.token = Some(value("token")?),
             "--token-file" => a.token_file = Some(value("路徑")?),
             "--install-string" => a.install_string = Some(value("安裝字串")?),
+            "--install-string-file" => a.install_string_file = Some(value("路徑")?),
             "--ca-pin" => a.ca_pin = Some(value("CA 指紋")?),
             "--ca-file" => a.ca_file = Some(value("路徑")?),
             "--name" => a.name = Some(value("顯示名稱")?),
@@ -190,9 +196,20 @@ pub fn parse(args: &[String]) -> Result<Option<EnrollArgs>, UsageError> {
             a.token.is_some() && a.token_file.is_some(),
             "--token 與 --token-file",
         ),
+        (
+            a.install_string.is_some() && a.install_string_file.is_some(),
+            "--install-string 與 --install-string-file",
+        ),
+        (
+            a.token_file.as_deref() == Some("-") && a.install_string_file.as_deref() == Some("-"),
+            "--token-file - 與 --install-string-file -",
+        ),
         (a.cancel && a.status, "--cancel 與 --status"),
         (
-            (a.cancel || a.status) && (a.token.is_some() || a.install_string.is_some()),
+            (a.cancel || a.status)
+                && (a.token.is_some()
+                    || a.install_string.is_some()
+                    || a.install_string_file.is_some()),
             "--cancel／--status 與 token",
         ),
     ];
@@ -585,6 +602,36 @@ fn read_token(args: &EnrollArgs) -> Result<Option<String>, String> {
     ))
 }
 
+/// 讀取安裝字串：`--install-string`，或 `--install-string-file`（`-` 為 stdin）的第一個非空白行。
+/// 建議用檔案或 stdin：命令列參數在執行期間其他帳號可以從 `ps`／`/proc/<pid>/cmdline` 看到
+fn read_install_string(args: &EnrollArgs) -> Result<Option<String>, String> {
+    if let Some(s) = &args.install_string {
+        return Ok(Some(s.clone()));
+    }
+    let Some(path) = &args.install_string_file else {
+        return Ok(None);
+    };
+    let text = if path == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(std::io::stdin().lock(), 64 * 1024),
+            &mut s,
+        )
+        .map_err(|e| format!("無法從 stdin 讀取安裝字串：{e}"))?;
+        s
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("無法讀取 {path}：{e}"))?
+    };
+    first_line(&text)
+        .map(|l| Some(l.to_string()))
+        .ok_or_else(|| format!("{path} 中沒有安裝字串（pulse-enroll:v1:…）"))
+}
+
+/// 第一個非空白的行（去掉前後空白）
+fn first_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|l| !l.is_empty())
+}
+
 /// `--server`：連接埠預設 8443
 fn normalize_server(input: &str, default_port: u16) -> Result<String, String> {
     let t = input.trim();
@@ -634,7 +681,8 @@ fn resolve_target(args: &EnrollArgs) -> Result<Target, Report> {
         usage_report(code, cause, fix_for(code, "<Kairos 位址>"))
     };
     let token_text = read_token(args).map_err(|e| bad(codes::E_BAD_ARG_VALUE, e))?;
-    let decoded = match &args.install_string {
+    let install_text = read_install_string(args).map_err(|e| bad(codes::E_BAD_ARG_VALUE, e))?;
+    let decoded = match &install_text {
         Some(s) => Some(InstallString::decode(s).map_err(|e| {
             usage_report(
                 codes::E_BAD_ARG_VALUE,
@@ -890,8 +938,10 @@ async fn run_async(args: &EnrollArgs, out: &Out) -> Report {
             matches!(f.state.as_str(), state::ISSUED | state::REGISTERED)
                 && paths.client_cert().is_file()
         });
-    let new_request =
-        args.token.is_some() || args.token_file.is_some() || args.install_string.is_some();
+    let new_request = args.token.is_some()
+        || args.token_file.is_some()
+        || args.install_string.is_some()
+        || args.install_string_file.is_some();
     // 接續進行中的申請
     if let Some(f) = existing.as_ref().filter(|f| {
         state::is_active(&f.state)
@@ -923,8 +973,10 @@ async fn run_async(args: &EnrollArgs, out: &Out) -> Report {
     if !new_request {
         return usage_report(
             codes::E_NON_INTERACTIVE,
-            "缺少 --token、--token-file 或 --install-string".into(),
-            vec!["例如：sudo pulse enroll --install-string <安裝字串>".into()],
+            "缺少 --token、--token-file、--install-string-file 或 --install-string".into(),
+            vec![
+                "例如：sudo pulse enroll --install-string-file <檔案>（或 - 從 stdin 讀取）".into(),
+            ],
         );
     }
     let target = match resolve_target(args) {
@@ -2175,6 +2227,65 @@ mod tests {
             resolve_enroll_server(None, "[2001:db8::1]:8443").unwrap(),
             "[2001:db8::1]:8444"
         );
+    }
+
+    /// `--install-string-file`：從檔案讀取（不出現在命令列），結果與 `--install-string` 相同；
+    /// 與 `--install-string` 互斥；空檔案、讀不到的檔案為用法錯誤
+    #[test]
+    fn install_string_can_be_read_from_a_file() {
+        let v = crate::enroll::vectors::Vectors::load();
+        let dir = std::env::temp_dir().join(format!("pulse-install-string-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("install-string");
+        std::fs::write(&file, format!("\n  {}  \r\n", v.get("install_string_full"))).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let parsed = parse(&["--install-string-file".to_string(), path.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.install_string_file.as_deref(), Some(path.as_str()));
+        assert_eq!(parsed.install_string, None);
+        let from_file = resolve_target(&parsed).unwrap_or_else(|_| panic!("應可解析"));
+        let direct = resolve_target(&EnrollArgs {
+            install_string: Some(v.get("install_string_full").into()),
+            ..Default::default()
+        })
+        .unwrap_or_else(|_| panic!("應可解析"));
+        assert_eq!(
+            (&from_file.server, &from_file.enroll_server, &from_file.pin),
+            (&direct.server, &direct.enroll_server, &direct.pin)
+        );
+        // 互斥
+        let e = parse(&[
+            "--install-string-file".to_string(),
+            path.clone(),
+            "--install-string".to_string(),
+            v.get("install_string").to_string(),
+        ])
+        .unwrap_err();
+        assert!(e.message.contains("PLS-E0003"), "{}", e.message);
+        assert!(
+            parse(&[
+                "--install-string-file=-".to_string(),
+                "--token-file=-".to_string()
+            ])
+            .is_err()
+        );
+        // 空檔案、不存在的檔案
+        std::fs::write(&file, "\n \n").unwrap();
+        let empty = EnrollArgs {
+            install_string_file: Some(path.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_target(&empty).err().unwrap().error.unwrap().code,
+            "PLS-E0002"
+        );
+        let missing = EnrollArgs {
+            install_string_file: Some(dir.join("nope").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_target(&missing).err().unwrap().exit, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

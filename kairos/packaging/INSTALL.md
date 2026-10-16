@@ -189,7 +189,7 @@ sudo -u kairos /opt/kairos/kairos pki init --config /opt/kairos/kairos.toml \
 - `--name`：Pulse 連線時使用的**所有**名稱與 IP（可重複；DNS 名稱或 IP，不接受萬用字元）。之後要增加名稱時以 `kairos pki sign --profile server` 重新簽發（第 10.4 節）。
 - 只能執行一次：資料庫已有簽發 CA、或任何一個要寫出的檔案已存在時拒絕（結束代碼 11），不會覆寫。
 - 組織名稱（憑證的 CN）預設取 `pki.organization`（預設 `Kairos`），可用 `--organization` 指定。
-- 完成時印出要放進 `kairos.toml` 的設定（第 7 節）與 **CA 指紋**，並以 `KRS-W1306`〔暫定〕提醒：**立即把 `/opt/kairos/root-ca` 複製到離線媒體（加密、兩份）後從伺服器刪除**（`shred -u /opt/kairos/root-ca/root-ca.key`）。根 CA 私鑰外洩時，任何人都能簽出 Pulse 會信任的伺服器憑證。
+- 完成時印出要放進 `kairos.toml` 的設定（第 7 節）與 **CA 指紋**，並以 `KRS-W1306`提醒：**立即把 `/opt/kairos/root-ca` 複製到離線媒體（加密、兩份）後從伺服器刪除**（`shred -u /opt/kairos/root-ca/root-ca.key`）。根 CA 私鑰外洩時，任何人都能簽出 Pulse 會信任的伺服器憑證。
 - 不想讓任何 CA 私鑰放在伺服器上時（離線簽發模式，`PKI.md` 第 6 節）：不使用 `pki init`，沿用附錄 P 的手動 PKI（`kairos pki sign`、`gencrl` 可取代其中的 openssl 指令）。
 
 `kairos pki` 的完整說明：`kairos pki --help`、`PKI.md` 第 15 節（`init`、`sign`、`gencrl`、`revocations export`）。

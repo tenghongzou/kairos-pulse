@@ -80,7 +80,7 @@ fn interface_reading(name: &str, data: &NetworkData) -> readings::InterfaceReadi
     }
 }
 
-/// 部分系統資訊因權限或平台限制無法取得（`PLS-I8009`〔暫定〕，METRICS.md 第 4.5 節）：
+/// 部分系統資訊因權限或平台限制無法取得（`PLS-I8009`，METRICS.md 第 4.5 節）：
 /// 每個項目在這個行程中只記一次 INFO
 pub(crate) fn report_limited(item: &'static str, detail: &str) {
     static LOGGED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());

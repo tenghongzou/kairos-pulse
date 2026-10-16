@@ -45,11 +45,12 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
 # 依第 2 節驗證 SHA256SUMS 的簽章與套件的雜湊後：
 apt install ./pulse-<版本>-<commit>-linux-x86_64.deb     # Debian／Ubuntu（aarch64 為 linux-aarch64）
 dnf install ./pulse-<版本>-<commit>-linux-x86_64.rpm     # RHEL／Rocky／Alma
-sudo pulse enroll --install-string 'pulse-enroll:v1:…'   # 需人工核准時顯示申請編號；Ctrl+C 不會遺失申請
+sudo pulse enroll --install-string-file - < install-string.txt   # 安裝字串存成檔案（0600）；需人工核准時顯示申請編號；Ctrl+C 不會遺失申請
 sudo systemctl start pulse
 pulse status
 ```
 
+- **安裝字串含註冊 token，不要放在命令列**（0.8.0）：`--install-string <字串>` 在 `pulse enroll` 執行期間其他帳號可從 `ps`／`/proc/<pid>/cmdline` 看到，也會留在 shell 歷史。建議存成只有 root 能讀的檔案後 `--install-string-file <檔案>`，或從 stdin 傳入 `--install-string-file -`（例如 `sudo pulse enroll --install-string-file - < install-string.txt`）；`--install-string` 保留相容但不建議。一行安裝腳本與 Ansible role 都經 stdin 傳入。
 - 套件的版面與 tar.gz 相同（`/opt/pulse`），另外安裝 `/usr/lib/systemd/system/pulse.service` 與 `/usr/bin/pulse`。`/opt/pulse/pulse.toml` 是初始設定（只有註解；`pulse enroll` 會加上 `[server]`），升級不覆寫。
 - **套件做的事**（`packaging/pkg/*.sh`）：安裝前建立系統帳號 `pulse`；安裝後建立 `logs/`、`buffer/`（`pulse:pulse` 750）、`identity/`（700），產生 `agent.id`（`root:pulse` 640；已存在時沿用），`systemctl enable pulse`（不啟動）；升級時 `systemctl try-restart pulse`；移除時 `systemctl disable --now pulse`。
 - **移除**：`apt remove pulse`／`dnf remove pulse` 保留身分（`identity/`、`agent.id`）、設定與日誌，重新安裝後沿用（rpm 會把改過的設定改名為 `pulse.toml.rpmsave`，重新安裝後改回 `pulse.toml`）；`apt purge pulse` 另外刪除身分、緩衝、日誌與 `/var/lib/pulse`。**完全移除前先通知 Kairos**（`cd /opt/pulse && ./pulse decommission --initiated-by package_manager`，第 12 節）：套件的移除腳本不會自動執行，避免暫時移除（例如重新安裝）就撤銷憑證。
@@ -62,7 +63,7 @@ pulse status
 ```powershell
 # 依第 2 節驗證 SHA256SUMS（Windows 11 內建的 ssh-keygen、Get-FileHash -Algorithm SHA256）後：
 msiexec /i pulse-<版本>-<commit>-windows-x86_64.msi /qn /l*v pulse-install.log
-& "C:\Program Files\Pulse\pulse.exe" enroll --install-string "pulse-enroll:v1:…"
+Get-Content .\install-string.txt | & "C:\Program Files\Pulse\pulse.exe" enroll --install-string-file -
 sc.exe start Pulse            # pulse enroll 成功後會自動重新啟動服務；首次安裝時以這行啟動
 & "C:\Program Files\Pulse\pulse.exe" status
 ```
@@ -227,7 +228,7 @@ cd /opt/pulse
 chown root:pulse agent.id && chmod 640 agent.id
 
 # 2. 註冊（私鑰在本機產生、不會離開這台主機）
-./pulse enroll --install-string 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…'
+./pulse enroll --install-string-file - < install-string.txt   # 安裝字串（pulse-enroll:v1:…）存成檔案；不建議放在命令列（ps 看得到）
 #   或：./pulse enroll --server kairos.example.gov.tw --token KRT1-7G4Q-M2XD-9PBA-H6WN \
 #              --ca-pin sha256:3f9a1c07b2d48e610a9c55f27d13c8a0e4b729610f3d8ac291e56b04d7afe21b
 ```

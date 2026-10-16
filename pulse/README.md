@@ -78,7 +78,7 @@ pulse service run [--workdir <目錄>]                 # 服務進入點，由�
 - 服務名稱 `Pulse`（`pulse status` 查詢的名稱）、自動啟動、LocalSystem；失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動，一天內最多 3 次（設定錯誤時不會無限重試）。
 - `service run` 先把目前目錄切換到 `--workdir`（預設為 `pulse.exe` 所在目錄），**不會落在 `C:\Windows\System32`**：`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這個目錄下；本機狀態檔為 `%ProgramData%\Pulse\status.json`。
 - 服務的「停止」與「關機」要求與 Ctrl+C 相同：送出 TLS close_notify 後結束；結束代碼以服務特定代碼回報（`sc.exe query Pulse` 的 `SERVICE_EXIT_CODE`，1／3／4 與 Linux 相同）。
-- 錯誤代碼：`PLS-E8205`〔暫定〕服務無法安裝、移除或啟動（多半是沒有系統管理員權限）；`PLS-E8206`〔暫定〕`service run` 不是由服務控制管理員啟動，或工作目錄不存在。
+- 錯誤代碼：`PLS-E8105` 服務無法安裝、移除或啟動（多半是沒有系統管理員權限）；`PLS-E8106` `service run` 不是由服務控制管理員啟動，或工作目錄不存在。
 - 只在 Linux 上以 `x86_64-pc-windows-gnu` 交叉編譯與 clippy 檢查，**未在 Windows 實機執行**；Windows 事件記錄尚未實作。
 
 ## 從發佈包安裝
@@ -178,7 +178,8 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 需要 Kairos 0.5 以上、註冊端點（預設 8444）為「開放」。規格：`crates/kairos-proto/ENROLL.md`；安裝步驟：INSTALL 第 5.0 節。
 
 ```bash
-sudo pulse enroll --install-string 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…'
+sudo pulse enroll --install-string-file - < install-string.txt   # 建議：安裝字串不出現在命令列（ps）
+sudo pulse enroll --install-string 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…'   # 相容，但不建議
 sudo pulse enroll --server kairos.example.gov.tw --token KRT1-7G4Q-M2XD-9PBA-H6WN --ca-pin sha256:3f9a…
 pulse enroll --status          # 目前的註冊狀態
 sudo pulse enroll --cancel     # 撤回等待中的申請、刪除本機未使用的私鑰
@@ -628,9 +629,9 @@ textfile_interval = 15
 {"type":"inventory","seq":2,"ts":"2026-10-20T02:00:00.120Z","inventory":{"os":{"family":"linux","name":"Ubuntu","version":"24.04","long_version":"Ubuntu 24.04.1 LTS","kernel":"6.8.0-45-generic","arch":"x86_64"},"boot_time":"2026-10-02T08:11:04Z","cpu":{"model":"Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz","vendor":"GenuineIntel","physical_cores":32,"logical_cores":64,"frequency_mhz":2000},"memory":{"total":51539607552,"swap_total":4294967296},"system":{"vendor":"Dell Inc.","product":"PowerEdge R650","serial":"7XK2LM3","board_vendor":"Dell Inc.","board_product":"0PJPW3","bios_vendor":"Dell Inc.","bios_version":"1.12.1"},"disks":[{"mountpoint":"/","device":"nvme0n1p2","fstype":"ext4","total":502468108288,"kind":"ssd","removable":false,"read_only":false}],"network_interfaces":[{"name":"eth0","mac":"52:54:00:12:34:56","addresses":["192.168.10.21/24","fe80::5054:ff:fe12:3456/64"],"mtu":1500}]}}
 ```
 
-- **何時送**：連線建立（`hello_ack` 之後）收集一次並送出（不論與上次是否相同）；之後每 `inventory.interval`（預設 1 小時）重新收集，內容（`inventory_digest`，不含開機時間）改變才送，距離上次送達滿 24 小時也送一次。Kairos 回 `invalid_report` 時記 `WARN`（`inventory.rejected PLS-W2108`〔暫定〕），同樣的內容不再送；回 `storage_unavailable` 時 5 分鐘後重送。資產不經過本機緩衝（它是狀態，不是時序；重新連線後一定會再送一次）。收集在背景執行緒進行，超過 10 秒記 `WARN`（`PLS-W8005`）、這次不送，不影響 report 的取樣。
+- **何時送**：連線建立（`hello_ack` 之後）收集一次並送出（不論與上次是否相同）；之後每 `inventory.interval`（預設 1 小時）重新收集，內容（`inventory_digest`，不含開機時間）改變才送，距離上次送達滿 24 小時也送一次。Kairos 回 `invalid_report` 時記 `WARN`（`inventory.rejected PLS-W2108`），同樣的內容不再送；回 `storage_unavailable` 時 5 分鐘後重送（Kairos 暫時無法保存記 `PLS-W4101`；資產的速率限制只記 `DEBUG`）。資產不經過本機緩衝（它是狀態，不是時序；重新連線後一定會再送一次）。收集在背景執行緒進行，超過 10 秒記 `WARN`（`PLS-W8005`）、這次不送，不影響 report 的取樣。
 - **內容**：取不到的欄位省略（不是空字串或 0）。磁碟與網路介面的篩選、名稱與指標相同，但不受每類上限限制（各最多 64 個）。CPU 時脈為標稱值（型號字串中的「@ 2.00GHz」、Linux 的 `base_frequency`／`cpuinfo_max_freq`、Windows 登錄的 `~MHz`），不用會隨負載變動的目前時脈。BIOS 在 Linux 讀 `/sys/class/dmi/id/bios_*`（所有人可讀），Windows 讀登錄 `HKLM\HARDWARE\DESCRIPTION\System\BIOS`。
-- **系統序號**：Linux 的 `/sys/class/dmi/id/product_serial` 只有 root 能讀；發佈包的 `pulse.service` 以 `ExecStartPre=+`（以 root 執行、不受沙箱限制）在啟動前複製到 `/run/pulse/product_serial`，Pulse 依序讀該檔、再直接讀 sysfs（以 root 互動執行時）。都讀不到，或是廠商的預設字串（`To Be Filled By O.E.M.`、`Default string` 等）時不送，記一次 `INFO`（`sysinfo.limited PLS-I8009`〔暫定〕）。Windows 由 SMBIOS 讀取，不需要系統管理員權限。`inventory.hardware_serials = false` 不送序號，`inventory.network_addresses = false` 不送 MAC 與 IP。
+- **系統序號**：Linux 的 `/sys/class/dmi/id/product_serial` 只有 root 能讀；發佈包的 `pulse.service` 以 `ExecStartPre=+`（以 root 執行、不受沙箱限制）在啟動前複製到 `/run/pulse/product_serial`，Pulse 依序讀該檔、再直接讀 sysfs（以 root 互動執行時）。都讀不到，或是廠商的預設字串（`To Be Filled By O.E.M.`、`Default string` 等）時不送，記一次 `INFO`（`sysinfo.limited PLS-I8009`）。Windows 由 SMBIOS 讀取，不需要系統管理員權限。`inventory.hardware_serials = false` 不送序號，`inventory.network_addresses = false` 不送 MAC 與 IP。
 - 整則超過單行上限時，依序捨去介面的位址（每個介面只留第一個 IPv4 與第一個 IPv6）、再捨去優先順序最低的介面與磁碟。
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。

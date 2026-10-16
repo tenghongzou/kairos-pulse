@@ -84,18 +84,20 @@
   when: pulse_pkg_ext == 'rpm'
   notify: restart pulse
 
-# 5. 註冊：已有身分（client.pem）或進行中的申請（enrollment.json）時不再執行
+# 5. 註冊：已有身分（client.pem）或進行中的申請（enrollment.json）時不再執行。
+#    安裝字串經 stdin 傳入（--install-string-file -），不放在命令列：命令列參數在執行期間其他帳號可從 ps 看到
 - name: pulse enroll
   ansible.builtin.command:
     argv:
       - /opt/pulse/pulse
       - enroll
-      - --install-string
-      - "{{ pulse_install_string }}"
+      - --install-string-file
+      - "-"
       - --non-interactive
       - --no-wait
       - -c
       - /opt/pulse/pulse.toml
+    stdin: "{{ pulse_install_string }}"
     creates: /opt/pulse/identity/enrollment.json
   register: pulse_enroll
   no_log: true

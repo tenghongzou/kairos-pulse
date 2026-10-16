@@ -373,14 +373,22 @@ impl InventoryConn {
                     );
                 }
             }
+            InventoryReply::Retry { message } if message.contains("rate limit") => {
+                // 資產的速率限制（每條連線 60 秒一則）：正常的 Pulse 不會發生，只記 DEBUG、不對應任何代碼
+                // （設計包 §30.3「不分配代碼的情況」；不可當成 PLS-W4101）
+                let delay = self.agent.retry_delay();
+                self.retry_at = Some(now + delay);
+                log::debug!(
+                    "inventory（seq={}）被 Kairos 限速（{}）；{} 秒後重送",
+                    f.seq,
+                    crate::network::sanitize_for_log(message, 200),
+                    delay.as_secs()
+                );
+            }
             InventoryReply::Retry { message } => {
                 let delay = self.agent.retry_delay();
                 self.retry_at = Some(now + delay);
-                let code = if message.contains("rate limit") {
-                    codes::W_REPORT_RATE
-                } else {
-                    codes::W_SERVER_STORAGE
-                };
+                let code = codes::W_SERVER_STORAGE;
                 if let Some(n) = self.warn_log.check(now) {
                     log::warn!(
                         "{}Kairos 暫時無法保存這台主機的資產資訊（seq={}，storage_unavailable）：{}；{} 秒後重送{}",
@@ -555,6 +563,27 @@ mod tests {
             (Inventory::default(), Vec::new())
         });
         assert_eq!(short.retry_delay(), Duration::from_secs(120));
+    }
+
+    /// 資產的速率限制（`inventory rate limit exceeded`）：同樣稍後重送，但只記 DEBUG，不消耗 WARN 的節流
+    /// （設計包 §30.3：不對應 `PLS-W4101` 或任何代碼）
+    #[tokio::test(start_paused = true)]
+    async fn inventory_rate_limit_is_retried_quietly() {
+        let agent = agent();
+        let t0 = Instant::now();
+        let mut conn = InventoryConn::start(agent.clone(), t0);
+        conn.on_wake(t0);
+        publish(&agent, snap(8));
+        let s = conn.on_snapshot(t0).unwrap();
+        conn.sent(2, &s, t0);
+        let line = r#"{"type":"error","seq":2,"code":"storage_unavailable","message":"inventory rate limit exceeded","fatal":false}"#;
+        let r = conn.on_line(line, Some(2), t0);
+        assert!(matches!(r, Some(InventoryReply::Retry { .. })));
+        assert_eq!(conn.next_wake(), t0 + RETRY_AFTER_STORAGE);
+        assert!(
+            conn.warn_log.check(t0).is_some(),
+            "速率限制不應記 WARN（節流仍未使用）"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -51,7 +51,7 @@ events! {
     /// 採集範圍摘要：超過每類上限而略過的掛載點、磁碟 I/O 裝置、網路介面（`pulse/log-ux.md`
     /// §4 的 `sysinfo.snapshot`，1010；METRICS.md 第 4.3 節）
     SYSINFO_SNAPSHOT = "sysinfo.snapshot", Some(1010);
-    /// 部分系統資訊因權限或平台限制無法取得（`PLS-I8009`〔暫定〕；METRICS.md 第 4.5 節）。
+    /// 部分系統資訊因權限或平台限制無法取得（`PLS-I8009`；METRICS.md 第 4.5 節）。
     /// Windows 事件識別碼待設計組分配
     SYSINFO_LIMITED = "sysinfo.limited", None;
     // ---- 2xxx 連線 ----
@@ -89,7 +89,7 @@ events! {
     REPORT_SKIPPED = "report.skipped", Some(2401);
     /// 無法解析的行、重複 hello_ack 等（`PLS-W2107`）
     SERVER_UNEXPECTED = "server.unexpected", Some(2402);
-    /// Kairos 拒收或暫時無法保存資產資訊（`PLS-W2108`〔暫定〕、`PLS-W4101`；METRICS.md 第 6.3 節）。
+    /// Kairos 拒收或暫時無法保存資產資訊（`PLS-W2108`；METRICS.md 第 6.3 節）。
     /// Windows 事件識別碼待設計組分配
     INVENTORY_REJECTED = "inventory.rejected", None;
     // ---- 3xxx 身分與憑證 ----
@@ -202,7 +202,7 @@ pub const E_LINE_TOO_LONG: &str = "PLS-E2103";
 pub const E_HELLO_BAD_REQUEST: &str = "PLS-E2104";
 pub const W_INVALID_REPORT: &str = "PLS-W2105";
 pub const W_SERVER_UNEXPECTED: &str = "PLS-W2107";
-/// 資產資訊被伺服器拒絕（METRICS.md 第 14 節的**暫定號**，待設計組正式分配後替換）
+/// 資產資訊被伺服器拒絕（設計包 `decisions/INTEGRATION.md` §30.3；METRICS.md 第 6.3 節）
 pub const W_INVENTORY_REJECTED: &str = "PLS-W2108";
 pub const E_PER_IP_LIMIT: &str = "PLS-E2201";
 pub const W_REPORT_RATE: &str = "PLS-W2203";
@@ -219,17 +219,17 @@ pub const E_SERVICE_NOT_INSTALLED: &str = "PLS-E8002";
 pub const E_SERVICE_NOT_RUNNING: &str = "PLS-E8003";
 pub const W_STATUS_STALE: &str = "PLS-W8004";
 pub const W_SAMPLE_TIMEOUT: &str = "PLS-W8005";
-/// 部分系統資訊無法取得（METRICS.md 第 14 節的**暫定號**；`8006`～`8008` 已保留給安裝前檢查）
+/// 部分系統資訊無法取得（設計包 §30.3；`8006`～`8008` 為安裝前檢查）
 pub const I_SYSINFO_LIMITED: &str = "PLS-I8009";
 pub const W_SYSTEM32_WORKDIR: &str = "PLS-W8101";
 pub const W_AGENT_ID_PERMS: &str = "PLS-W8201";
 pub const W_KEY_PERMS: &str = "PLS-W8202";
 pub const E_NEED_ADMIN: &str = "PLS-E8203";
 pub const E_STATUS_UNWRITABLE: &str = "PLS-E8204";
-/// Windows 服務無法安裝、移除或啟動（`pulse service install|uninstall`）〔暫定，設計包未分配〕
-pub const E_SERVICE_INSTALL: &str = "PLS-E8205";
-/// `pulse service run` 不是由服務控制管理員啟動，或無法切換到工作目錄〔暫定，設計包未分配〕
-pub const E_SERVICE_RUN: &str = "PLS-E8206";
+/// Windows 服務無法安裝、移除或啟動（`pulse service install|uninstall`；設計包 §30.3，子類別 81）
+pub const E_SERVICE_INSTALL: &str = "PLS-E8105";
+/// `pulse service run` 不是由服務控制管理員啟動，或無法切換到工作目錄（設計包 §30.3，子類別 81）
+pub const E_SERVICE_RUN: &str = "PLS-E8106";
 pub const W_CLOCK_SKEW: &str = "PLS-W8301";
 pub const E_CLOCK_SKEW: &str = "PLS-E8302";
 pub const E_CERT_NOT_YET_VALID: &str = "PLS-E8304";

@@ -29,7 +29,7 @@ pub const DISPLAY_NAME: &str = "Pulse monitoring agent";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const DESCRIPTION: &str =
     "Pulse：把本機的系統資訊回報給 Kairos 監控伺服器（mTLS）。設定、身分與日誌在安裝目錄下。";
-/// Windows 服務的安裝、移除、啟動失敗（需要系統管理員權限、服務已存在或不存在）〔暫定〕
+/// Windows 服務的安裝、移除、啟動失敗（需要系統管理員權限、服務已存在或不存在）
 #[cfg_attr(not(windows), allow(unused_imports))]
 pub use crate::codes::{E_SERVICE_INSTALL, E_SERVICE_RUN};
 
@@ -49,7 +49,7 @@ pulse service — Windows 服務
   以 MSI 安裝時服務已由 MSI 註冊，不需要執行 install。
   uninstall 停止並刪除服務（不刪除任何檔案；完全移除前先執行 pulse decommission）。
 
-結束代碼：0 完成、1 服務控制管理員回報錯誤（PLS-E8205）、2 用法錯誤或不是 Windows";
+結束代碼：0 完成、1 服務控制管理員回報錯誤（PLS-E8105）、2 用法錯誤或不是 Windows";
 
 /// `pulse service` 的動作
 #[derive(Debug, Clone, PartialEq, Eq)]

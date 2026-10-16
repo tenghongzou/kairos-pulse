@@ -412,7 +412,7 @@ systemctl start kairos
 > 預設保留期限下每台 ≈ 9.2 × 8 + 1.4 × 8 + 0.68 × 32 + 0.056 × 401 ≈ 129 MB
 > ```
 >
-> 預設上限 64 GiB 約可完整保留 530 台（0.7.0 約 1,200 台）；`server.max_connections` 預設 1024 時啟動會記錄容量不足的警告（`AppConfig::total_limit_below_estimate`）。D1 的建議是不改預設的上限，由管理者依規模調整。下面的舊估算是 0.2.0～0.7.0 的 Pulse（17 個指標）。
+> 預設上限 64 GiB 約可完整保留 532 台（0.7.0 約 1,320 台）；`server.max_connections` 預設 1024 時啟動會記錄容量不足的警告（`AppConfig::total_limit_below_estimate`）。D1 的建議是不改預設的上限，由管理者依規模調整。下面的舊估算是 0.2.0～0.7.0 的 Pulse（17 個指標）。
 
 以每台主機每 5 秒一筆 report、約 17 個指標（Pulse 0.2.0 的典型值：CPU、記憶體 2、3 個掛載點的容量 6、2 張網卡的流量 4、溫度 4）、約 20 個序列估算（`AppConfig::estimated_sqlite_bytes`）：
 
