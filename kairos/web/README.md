@@ -42,6 +42,7 @@ web/
 │       │   ├── strings-pki.js     註冊與憑證畫面的文字
 │       │   ├── strings-admin.js   管理與系統畫面的文字
 │       │   ├── strings-metrics.js 指標擴充（F4：S03、S04、S05、S09）的文字
+│       │   ├── strings-export.js  指標轉出（F7：S21「整合」的 Prometheus exporter、OTLP）的文字
 │       │   ├── errors.js   錯誤 → 三段式（原因、處理方式、代碼）
 │       │   └── error-codes.js  KRS- 代碼與三段式（由設計包產生，不要手改）
 │       ├── ui/             共用元件：components（StatusBadge、KpiTile、Card、EmptyState、ErrorState、
@@ -58,10 +59,11 @@ web/
 │                           pki-common（動作對話框 L1／L2、模式與簽發方式的提示、標籤）；文字在 core/strings-pki.js
 │                           管理與系統：admin-users（S16 清單與角色）、admin-user（S16 詳情）、admin-directory（S17）、
 │                           admin-audit（S18）、admin-health（S20）、admin-settings（S21）、admin-tokens（S21 API token）、
+│                           admin-export（S21 指標轉出，F7）、
 │                           admin-common（共用呈現）；文字在 core/strings-admin.js
 ├── tests/                  Playwright＋axe 的端對端測試（不嵌入、不在 cargo test 中；第 7 節）；
 │                           告警在 e2e-alerts.mjs、註冊與憑證在 e2e-pki.mjs（第二個 Kairos：pki-env.sh）、管理在 e2e-admin.mjs、
-│                           權限的整體檢查在 e2e-rbac.mjs、指標擴充（F4）在 e2e-metrics.mjs
+│                           權限的整體檢查在 e2e-rbac.mjs、指標擴充（F4）在 e2e-metrics.mjs、指標轉出（F7）在 e2e-export.mjs
 └── tools/sync-design.mjs   從設計包複製 tokens.css、產生 error-codes.js（開發時執行）
 ```
 

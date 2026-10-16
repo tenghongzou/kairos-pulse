@@ -48,7 +48,19 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（目前沒有 0.8.0 之後的變更。）
+下一版預定為 **Kairos 0.9.0**（Cargo 版本號尚未更改）。
+
+### 新增：指標轉出（商業審計 F7；`kairos/EXPORT.md`）
+
+- **Prometheus exporter**：`GET /api/v1/export/prometheus`（主控台的監聽，HTTPS）以 Prometheus text 0.0.4 或 OpenMetrics 1.0（依 `Accept`）輸出所有可見主機的最新指標。以 API token 驗證、權限 `hosts:read`（viewer 角色即可；群組範圍的使用者只看得到自己的群組，另可 `?group=` 分群抓取）。每個序列帶 `agent_id`、`hostname`、`host_group`；另有 `kairos_host_up`、`kairos_host_info`（顯示名稱、版本、作業系統、標籤）、`kairos_host_last_sample_timestamp_seconds`、`kairos_exporter_hosts`。離線或最後一筆超過 `stale_after_secs`（預設 300）的主機不輸出指標；行程排行預設不輸出（`include_processes`）。預設**停用**（`[export.prometheus] enabled`，未啟用時 `404 export_disabled`）。
+- **OTLP/HTTP 推送**：`[export.otlp]` 把每一筆保存成功的 report 以 protobuf 推送到 OpenTelemetry collector：批次（`max_batch_points`）、有上限的佇列與丟棄策略（`queue_max_points`、`drop_policy`）、重試（429／502／503／504 與連線失敗，指數退避、`Retry-After`）、TLS（作業系統的 CA＋`ca_file`、可帶用戶端憑證）、自訂標頭（`headers_file` 或主控台輸入，加密保存）、resource 屬性（`host.name`、`host.id`、`host.arch`、`os.type`、`kairos.host.*`、`resource_attributes`）。名稱預設對應 OpenTelemetry semantic conventions（`naming = "semconv"`：`system.cpu.utilization`、`system.memory.usage{system.memory.state}`、`system.network.io{network.io.direction}`…），可改回 Kairos 的名稱。不支援 gRPC 與 gzip。預設停用。
+- **Grafana**：儀表板 `kairos/packaging/grafana-kairos-hosts.json`（Prometheus 資料來源；群組與主機變數、CPU、記憶體、負載、磁碟、網路、運作時間、主機清單）與抓取範例 `kairos/packaging/prometheus-export.example.yml`，兩者與 `EXPORT.md` 一起放進發佈包。
+- **主控台**：S21「系統設定 → 整合」新增「指標轉出」卡片：Prometheus 的最近一次抓取、OTLP 的佇列／送出／丟棄／最近一次成功與錯誤；管理員可修改啟用、過期門檻、行程排行、OTLP 的啟用／端點／間隔／名稱／標頭（值只能更換不能檢視）與測試連線。設定存在資料庫 `settings` 表、優先於 `kairos.toml`，環境變數鎖定（`409 locked_by_environment`），寫入稽核（`export.change`、`export.otlp_test`）。
+- **API**：`GET`／`PUT /api/v1/export/settings`、`POST /api/v1/export/otlp/test`（API.md 第 15 節）；新權限 **`export:write`**（只有管理員；0.4／0.5 的舊範圍 token 沒有）。
+- **`/metrics`**：`kairos_export_prometheus_enabled`、`kairos_export_prometheus_scrapes_total`、`kairos_export_otlp_enabled`、`kairos_export_otlp_queue_points`、`kairos_export_otlp_sent_points_total`、`kairos_export_otlp_requests_total{result}`、`kairos_export_otlp_dropped_points_total{reason}`、`kairos_export_otlp_last_success_timestamp_seconds`。
+- **錯誤代碼（暫定，待設計包分配）**：`KRS-E4311` OTLP 推送失敗、`KRS-E4312` collector 拒絕資料、`KRS-W4313` OTLP 佇列已滿而丟棄、`KRS-E4314` 指標轉出的設定無效、`KRS-E4315` Prometheus exporter 未啟用。
+- **依賴**：沒有新增 crate（OTLP 的 protobuf 為手寫編碼，HTTP 用戶端沿用 hyper 與 tokio-rustls）；資料庫 schema 不變（v8）。
+- **量測**（`export_bench`，10,000 台、每台 43 個指標）：Prometheus 輸出 359 ms、56.9 MB；保存最新值約 7 KB／台；OTLP 編碼約 83 萬點／秒（EXPORT.md 第 5 節）。
 
 ## [0.8.0] - 2026-10-16
 

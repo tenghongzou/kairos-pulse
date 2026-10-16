@@ -975,6 +975,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `channels:read` | ✓ | ✓ | | | 通知管道的清單與狀態（S11；機密只有遮蔽值） |
 | `channels:test` | ✓ | ✓ | | | 寄送測試通知 |
 | `channels:write` | ✓ | | | | 新增、修改、刪除通知管道（含機密） |
+| `export:write` | ✓ | | | | 指標轉出的設定與測試連線（S21「整合」；OTLP 標頭含機密；0.9.0，第 15 節） |
 
 個人設定（`/api/v1/me/…`：自己的工作階段、密碼、TOTP）不需要權限，只需要以帳號登入的工作階段。
 
@@ -1324,3 +1325,17 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 - **Content-Security-Policy**：網頁（`index.html`）為 `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'`（不允許 inline script、`eval`、inline style；Trusted Types 讓瀏覽器拒絕 `innerHTML` 等 DOM XSS 的入口）；其他回應為 `default-src 'none'; frame-ancestors 'none'`。
 - 網頁介面以工作階段的 cookie 驗證（第 12.3 節），寫入帶 `X-CSRF-Token`；不在瀏覽器的 storage 保存 token。
 - 網頁的請求不計入 `kairos_api_requests_total`（只計 API）。
+
+## 15. 指標轉出（0.9.0〔草稿〕）
+
+商業審計 F7；完整規格、名稱對應、取捨與量測見 [EXPORT.md](EXPORT.md)。
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/export/prometheus[?group=…]` | `hosts:read`（依主機群組篩選） | 所有可見主機的最新指標，Prometheus text 0.0.4；`Accept: application/openmetrics-text` 時為 OpenMetrics 1.0。未啟用時 `404 export_disabled`（`KRS-E4315`，暫定）。回應不是 JSON（錯誤仍是第 1.2 節的 JSON） |
+| `GET /api/v1/export/settings` | `settings:read` | 生效的設定、每個主控台可修改的鍵的來源與鎖定、Prometheus 抓取與 OTLP 推送的狀態 |
+| `PUT /api/v1/export/settings` | `export:write` | 修改 `prometheus.{enabled,stale_after_secs,include_processes}`、`otlp.{enabled,endpoint,interval_secs,naming,headers}`；`null` 為改用設定檔的值；`reason` 選填。不合法 `400 invalid_parameter`（`KRS-E4314`，暫定）、環境變數鎖定 `409 locked_by_environment`；寫入稽核（`settings`／`export.change`，標頭只記名稱） |
+| `POST /api/v1/export/otlp/test` | `export:write` | 以已儲存的設定送出空的 OTLP 請求，回 `{ok, status, code, message, elapsed_ms, endpoint}`；寫入稽核（`export.otlp_test`） |
+
+- 指標轉出的鍵存在同一張 `settings` 表，但不列入第 11.7 節的 `GET /api/v1/settings`／`POST /api/v1/settings/reset`（那裡只有設定檔與環境變數的值）。
+- 新權限 `export:write` 只給管理員；0.4／0.5 的舊範圍 token 沒有這個權限（凍結）。

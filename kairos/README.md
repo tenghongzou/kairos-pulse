@@ -31,6 +31,7 @@
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
 - 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試
 - 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除；時間為 RFC 3339 帶時區，可改為 JSON（`log.format = "json"`）並外送到 syslog（RFC 5424）（0.6）
+- 指標轉出（審計 F7；0.9.0〔草稿〕，[EXPORT.md](EXPORT.md)）：所有主機的最新指標以 Prometheus text／OpenMetrics 提供（`GET /api/v1/export/prometheus`，唯讀角色的 API token、依主機群組篩選），或以 OTLP/HTTP（protobuf）推送到 OpenTelemetry collector（批次、重試、有上限的佇列、OpenTelemetry semantic conventions 的名稱與 `host.*` 屬性）；附 Grafana 儀表板（`packaging/grafana-kairos-hosts.json`）。主控台「系統設定 → 整合」可修改與查看狀態；沒有新增依賴
 - `/healthz`、`/readyz`（負載平衡器的探針）與 `/metrics`（Prometheus）；`kairos --check-config` 檢查設定、`kairos diag` 產生遮蔽敏感資料的支援診斷包（0.6）
 - 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP；啟用 mTLS 時 agent 的上線、離線等事件改依 `agent_id`）節流，每 10 秒最多一行並附上略過的則數，未啟用 mTLS 時另列出被略過的 agent_id（見「日誌」的節流說明）
 
@@ -445,6 +446,12 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `alerts.retention_days` | `KAIROS__ALERTS__RETENTION_DAYS` | `400` | 已解決的告警事件（含處理紀錄與發送紀錄）保留天數，1～3660 |
 | `alerts.max_events` | `KAIROS__ALERTS__MAX_EVENTS` | `100000` | 告警事件的筆數上限（超過時刪除最舊的已解決事件），1,000～10,000,000 |
 | `alerts.subnet_prefix_v4`、`alerts.subnet_prefix_v6` | `KAIROS__ALERTS__SUBNET_PREFIX_V4`、`…_V6` | `24`、`64` | 網段彙總（網段離線）的遮罩：IPv4 8～32、IPv6 32～128 |
+| `export.prometheus.enabled` | `KAIROS__EXPORT__PROMETHEUS__ENABLED` | `false` | Prometheus exporter（`GET /api/v1/export/prometheus`，[EXPORT.md](EXPORT.md)）；主控台可修改（存在資料庫、優先於設定檔） |
+| `export.prometheus.stale_after_secs` | `KAIROS__EXPORT__PROMETHEUS__STALE_AFTER_SECS` | `300` | 最後一筆 report 超過幾秒就不輸出該主機的指標，30～86400；主控台可修改 |
+| `export.prometheus.include_processes`、`processes_top_n` | `KAIROS__EXPORT__PROMETHEUS__INCLUDE_PROCESSES`、`…__PROCESSES_TOP_N` | `false`、`5` | 另外輸出行程排行（高基數）與每台主機的名次數（1～10）；前者主控台可修改 |
+| `export.otlp.enabled`、`endpoint`、`interval_secs`、`naming` | `KAIROS__EXPORT__OTLP__ENABLED` 等 | `false`、`""`、`10`、`semconv` | OTLP/HTTP 推送（EXPORT.md 第 3 節）；主控台可修改 |
+| `export.otlp.headers_file`、`ca_file`、`client_cert`、`client_key` | `KAIROS__EXPORT__OTLP__HEADERS_FILE` 等 | `""` | 自訂 HTTP 標頭檔（`名稱: 值`；主控台輸入的標頭優先）、私有 CA、mTLS 的用戶端憑證 |
+| `export.otlp.timeout_secs`、`max_batch_points`、`queue_max_points`、`drop_policy`、`max_retries`、`resource_attributes` | `KAIROS__EXPORT__OTLP__…` | `10`、`8192`、`500000`、`oldest`、`5`、`[]` | 逾時、批次、佇列上限與丟棄策略（`KRS-W4313`）、重試次數、額外的 resource 屬性（`名稱=值`） |
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
@@ -550,6 +557,15 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 - **LDAP／AD**：`[ldap]` 設定伺服器、`ca_file`（必填，一律驗證伺服器憑證）、服務帳號（密碼放在 `bind_password_file`）與搜尋基底；群組以 `kairos users map-group` 或 `PUT /api/v1/directory/mappings` 對應角色。
 - **API token**：0.6 起屬於某個角色（`--role`，預設 `viewer`）或某個使用者（`--user`）；升級前建立的 token 保留原本的範圍與權限（凍結在 0.5，不會多出使用者、稽核等新權限）。
 - **稽核**：登入、登出、失敗、鎖定、角色變更、密碼與 MFA、token 建立與撤銷、設定變更、註冊核准與拒絕、簽發與撤銷、被拒絕的請求、系統啟動與關機都寫入 `audit_events`，每筆含前一筆的雜湊；保留 `audit.retention_days`（預設 3 年）。
+## 指標轉出：Prometheus、OTLP、Grafana（0.9.0〔草稿〕）
+
+審計 F7；完整說明、取捨與量測見 [EXPORT.md](EXPORT.md)。兩種方式都只轉出主機指標（Kairos 自身的狀態仍在下一節的 `/metrics`）：
+
+- **Prometheus exporter**：`[export.prometheus] enabled = true`（或主控台「系統設定 → 整合 → 指標轉出」），Prometheus 以 viewer 角色的 API token 抓 `https://<console.listen>/api/v1/export/prometheus`。每個序列帶 `agent_id`、`hostname`、`host_group`；`kairos_host_up` 表示主機是否線上，離線或超過 `stale_after_secs` 的主機不輸出指標；行程排行預設不輸出。範例：[`packaging/prometheus-export.example.yml`](packaging/prometheus-export.example.yml)。
+- **OTLP 推送**：`[export.otlp] enabled = true`、`endpoint = "https://<collector>:4318/v1/metrics"`；HTTP 標頭（例如 `Authorization`）放在 `headers_file` 或由主控台輸入（加密保存）。名稱預設對應 OpenTelemetry semantic conventions（`naming = "semconv"`）。
+- **Grafana**：Prometheus 資料來源＋匯入 [`packaging/grafana-kairos-hosts.json`](packaging/grafana-kairos-hosts.json)。
+- 主控台可修改的鍵（啟用、過期門檻、行程排行、OTLP 的啟用／端點／間隔／名稱／標頭）存在資料庫、優先於 `kairos.toml`；環境變數最優先且主控台不能修改。只有管理員（新權限 `export:write`）能修改。
+
 ## 健康檢查與 Prometheus（0.6.0）
 
 審計 O3；設計包 `kairos/screens.md` S20、§24 #8。三個端點在主控台的監聽上提供（`console.listen`，HTTPS，預設 `127.0.0.1:9443`），也可以另外以純 HTTP 監聽（`observability.listen`，例如 `127.0.0.1:9464`；這個監聽只有這三個端點，在自己的執行緒上執行，與 agent 連線、report 的寫入分開）。
@@ -575,6 +591,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 | TLS 與憑證 | `kairos_mtls_enabled`、`kairos_client_cert_rejected_total{reason}`、`kairos_certificate_expiry_timestamp_seconds{kind,index}`、`kairos_certificate_days_remaining{kind,index}`（`kind`：`server_certificate`、`crl`、`issuing_ca`） |
 | 註冊端點（8444） | `kairos_enroll_mode{mode}`、`kairos_enroll_listening`、`kairos_enroll_http_requests_total`、`kairos_enroll_submissions_total{kind}`、`kairos_enroll_rate_limited_total{kind}`、`kairos_enroll_blocked_total`、`kairos_enroll_busy_total`、`kairos_enroll_clock_rejected_total`、`kairos_enroll_pre_handshake_closed_total`、`kairos_enroll_issued_total`、`kairos_enroll_pending_created_total`、`kairos_enroll_pending_requests`、`kairos_enroll_blocked_sources` |
 | 主控台 API | `kairos_api_requests_total{route,code}`（`route` 為路徑的第一段：`hosts`、`alerts`、`users`、`audit`…，其他為 `other`）、`kairos_api_auth_failures_total{reason}`、`kairos_probe_requests_total{endpoint,result}` |
+| 指標轉出（0.9.0） | `kairos_export_prometheus_enabled`、`kairos_export_prometheus_scrapes_total`、`kairos_export_otlp_enabled`、`kairos_export_otlp_queue_points`、`kairos_export_otlp_sent_points_total`、`kairos_export_otlp_requests_total{result}`、`kairos_export_otlp_dropped_points_total{reason}`（`queue_full`／`failed`／`rejected`）、`kairos_export_otlp_last_success_timestamp_seconds`（EXPORT.md 第 6.3 節） |
 | 日誌與行程 | `kairos_log_messages_total{level}`、`kairos_log_syslog_messages_total{result}`、`kairos_process_resident_memory_bytes`、`kairos_process_open_fds`、`kairos_process_max_fds`、`kairos_process_cpu_seconds_total`（Linux） |
 
 計數都是啟動以來的累計值（重新啟動後歸零，Prometheus 的 `rate()`／`increase()` 會自動處理）。抓取的設定與建議的告警規則見 [`packaging/prometheus.example.yml`](packaging/prometheus.example.yml) 與 [`packaging/kairos-alerts.example.yml`](packaging/kairos-alerts.example.yml)。量測：每秒 2,000 筆 report 同時連續抓取 `/metrics`（約 400 次／秒）時，`ack` p99 約 2～4 ms，與不抓取時在同一範圍（CHANGELOG [0.6.0]「量測」）。
@@ -988,8 +1005,9 @@ kairos/
 ├── PROTOCOL.md            Pulse ↔ Kairos 協定規格
 ├── STORAGE.md             資料儲存（SQLite）：schema、保留、容量、量測
 ├── API.md                 主控台 API：端點、驗證、SSE、量測
+├── EXPORT.md              指標轉出：Prometheus exporter、OTLP、Grafana
 ├── build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
-├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、kairos-crl.service／kairos-crl.timer（CRL 定期更新範例）、INSTALL.md（安裝指南）
+├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、kairos-crl.service／kairos-crl.timer（CRL 定期更新範例）、INSTALL.md（安裝指南）、Prometheus 範例與 Grafana 儀表板（grafana-kairos-hosts.json）
 ├── testdata/              單元測試用的憑證樣本；pki/ 為測試用 CA、代理憑證與 CRL（見其中的 README）；含測試用私鑰，不可部署
 └── src/
     ├── main.rs            元件組裝、accept 迴圈與連線上限、背景工作監看、關機流程
@@ -1021,6 +1039,9 @@ kairos/
     │                      查詢參數）、auth.rs／tokens.rs（API token 的驗證與保存）、db.rs（唯讀連線池）、hosts.rs
     │                      （主機清冊的索引、篩選、排序、游標）、metrics.rs（趨勢）、overview.rs、health.rs、
     │                      events.rs（SSE）、maint.rs（背景工作）、tests.rs（以 HTTPS 用戶端的整合測試）、bench.rs（量測）
+    ├── export/            指標轉出（EXPORT.md）：mod.rs（ExportHub：最新值、OTLP 佇列與狀態）、settings.rs（生效值與來源、
+    │                      標頭加密）、prom.rs（Prometheus text／OpenMetrics）、otlp.rs（名稱對應、編碼、推送）、proto.rs
+    │                      （protobuf 編碼器）、tests.rs（假的 collector）、bench.rs（量測）；api/export.rs 為端點
     ├── stats.rs           report 寫入結果的統計（啟動以來與每分鐘）
     ├── token_cli.rs       kairos api-token create|list|revoke
     ├── users_cli.rs       kairos users …（使用者、角色指派、工作階段、目錄服務群組對應）
