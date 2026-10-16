@@ -653,7 +653,7 @@ sudo systemctl start kairos
 
 ## 14. 限制與後續
 
-- 單一寫入者：同一個資料目錄只能有一個 Kairos（A2 的 HA 需要外部資料庫）。
+- 單一寫入者：同一個資料目錄只能有一個 Kairos（A2 的 HA 需要外部資料庫；規格草稿見 [`HA.md`](HA.md)：PostgreSQL 後端、主動／備援與多主動連線層、schema v9）。
 - 主控台 API（0.4，`API.md`）以唯讀連線查詢這個 schema；趨勢也可以 SQL 或 `kairos reports export` 取得。
 - `kairos reports export` 不做全域時間範圍的索引（未指定 `--agent` 時掃描整個 `reports` 表）。
 - 彙總的值以 f64 計算，超過 2^53 的整數會失去精度（原始資料保留原值）。
