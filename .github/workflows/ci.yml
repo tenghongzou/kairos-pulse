@@ -49,7 +49,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --locked --exclude kp-e2e
+        run: cargo test --workspace --locked --exclude kp-e2e --no-fail-fast
 
       # 端對端測試（審計 Q1，tests/e2e）：以實際的 kairos、pulse 執行檔在 127.0.0.1 上以 mTLS 互連，
       # 不連外部網路。先在這一步建置執行檔（--locked），測試內的 cargo build 因此不需重新建置。
@@ -58,7 +58,7 @@ jobs:
         run: cargo build -p kairos -p pulse --bins --locked
 
       - name: End-to-end tests
-        run: cargo test -p kp-e2e --locked
+        run: cargo test -p kp-e2e --locked --no-fail-fast
         timeout-minutes: 10
 
   deny:

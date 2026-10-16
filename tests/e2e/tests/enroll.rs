@@ -64,7 +64,8 @@ fn enroll_approve_connect_renew_revoke_and_deregister() {
     let serial = v["certificate"]["serial"].as_str().unwrap().to_string();
     assert_eq!(
         v["certificate"]["ca_pem"].as_str().unwrap().trim(),
-        env.pki.pem.trim()
+        // rcgen 的 pem() 在 Windows 上用 CRLF，Kairos 回傳的是 LF：比較前統一換行
+        env.pki.pem.replace("\r\n", "\n").trim()
     );
 
     // 以該憑證連 8443：hello_ack 宣告 renew／deregister 並帶寬限天數
