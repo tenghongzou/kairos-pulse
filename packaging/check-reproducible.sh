@@ -24,7 +24,7 @@ WORK=${REPRO_DIR:-$REPO/dist/repro}
 RUN_ID="repro-$$-$(date +%s)"
 VOLUMES=""
 
-# shellcheck disable=SC2329 # 由 trap 呼叫
+# shellcheck disable=SC2317,SC2329 # 由 trap 呼叫（shellcheck 0.10 以前報 SC2317，0.11 起改為 SC2329）
 cleanup() {
     for v in $VOLUMES; do
         docker volume rm -f "$v" >/dev/null 2>&1 || true
