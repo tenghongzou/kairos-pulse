@@ -139,6 +139,18 @@ async fn list(
             audit::query(c, &f2, limit).map_err(query_failed("稽核日誌"))
         })
         .await?;
+    // 頁首「完整性」（設計包 S18 0.7）：最近一次驗證（自我驗證或手動）與 HMAC 的起點；只看自己操作的身分沒有
+    let integrity = if own_only || !first_page {
+        None
+    } else {
+        Some(
+            ctx.pool
+                .read("稽核日誌", |c| {
+                    integrity_of(c).map_err(query_failed("稽核日誌"))
+                })
+                .await?,
+        )
+    };
     let next = (rows.len() == limit)
         .then(|| rows.last().map(|r| r.id.to_string()))
         .flatten();
@@ -166,7 +178,7 @@ async fn list(
         json!({
             "data": rows.iter().map(audit::AuditRow::json).collect::<Vec<_>>(),
             "page": { "limit": limit, "total": total, "next_cursor": next },
-            "meta": { "own_only": own_only },
+            "meta": { "own_only": own_only, "integrity": integrity },
         }),
     ))
 }
@@ -282,6 +294,36 @@ async fn export(
     Ok(resp)
 }
 
+/// 最近一次完整性驗證（`audit.verify` 紀錄）與目前的 HMAC 起點（`meta.audit_hmac`）
+fn integrity_of(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
+    let since = audit::hmac_since(c)?.map(|(id, _)| id);
+    let f = AuditFilter {
+        action: Some("audit.verify".into()),
+        ..AuditFilter::default()
+    };
+    let (rows, _) = audit::query(c, &f, 1)?;
+    Ok(json!({
+        "hmac_since_id": since,
+        "last_verify": rows.first().map(|r| {
+            let d = r
+                .details
+                .as_deref()
+                .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                .unwrap_or(Value::Null);
+            json!({
+                "id": r.id,
+                "at": http::ts_ms(r.at),
+                "actor": r.actor,
+                "result": r.result,
+                "self_check": d["via"] == "self_check",
+                "checked": d["checked"],
+                "broken": d["broken"],
+                "hmac_since_id": d["hmac_since_id"],
+            })
+        }),
+    }))
+}
+
 async fn verify(
     ctx: &Arc<ApiContext>,
     p: &Principal,
@@ -320,6 +362,8 @@ async fn verify(
             code: (!report.ok()).then_some(CODE_CHAIN_BROKEN),
             details: Some(json!({
                 "checked": report.checked,
+                "hmac": report.hmac.status,
+                "hmac_since_id": report.hmac.since_id,
                 "broken": report.broken.as_ref().map(|b| json!({"id": b.id, "reason": b.reason})),
             })),
         },

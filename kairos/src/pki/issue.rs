@@ -106,7 +106,7 @@ pub fn random_serial() -> Result<[u8; 16], String> {
     Ok(b)
 }
 
-fn to_time(ms: i64) -> Result<OffsetDateTime, String> {
+pub(super) fn to_time(ms: i64) -> Result<OffsetDateTime, String> {
     OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000))
         .map_err(|e| format!("時間超出範圍：{e}"))
 }
@@ -166,23 +166,7 @@ impl IssuingCa {
         if not_after_ms <= now_ms {
             return Err("簽發 CA 已過期，無法簽發".to_string());
         }
-        let mut p = CertificateParams::default();
-        p.serial_number = Some(SerialNumber::from_slice(&serial));
-        p.not_before = to_time(not_before_ms)?;
-        p.not_after = to_time(not_after_ms)?;
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, agent_id);
-        p.distinguished_name = dn;
-        p.subject_alt_names = vec![SanType::DnsName(
-            agent_id
-                .to_string()
-                .try_into()
-                .map_err(|e| format!("agent_id 無法放入 SAN：{e}"))?,
-        )];
-        p.is_ca = IsCa::ExplicitNoCa;
-        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        p.use_authority_key_identifier_extension = true;
+        let p = client_params(agent_id, &serial, not_before_ms, not_after_ms)?;
         let cert = p
             .signed_by(&public, &self.issuer)
             .map_err(|e| format!("簽發失敗：{e}"))?;
@@ -205,30 +189,75 @@ impl IssuingCa {
         next_update_ms: i64,
         revoked: &[RevokedEntry],
     ) -> Result<Vec<u8>, String> {
-        let mut revoked_certs = Vec::with_capacity(revoked.len());
-        for r in revoked {
-            revoked_certs.push(RevokedCertParams {
-                serial_number: SerialNumber::from_slice(
-                    &serial_bytes(&r.serial).ok_or_else(|| format!("序號 {} 不合法", r.serial))?,
-                ),
-                revocation_time: to_time(r.revoked_at_ms)?,
-                reason_code: Some(r.reason.rcgen()),
-                invalidity_date: None,
-            });
-        }
-        let params = CertificateRevocationListParams {
-            this_update: to_time(this_update_ms)?,
-            next_update: to_time(next_update_ms)?,
-            crl_number: SerialNumber::from_slice(&crl_number.to_be_bytes()),
-            issuing_distribution_point: None,
-            revoked_certs,
-            key_identifier_method: rcgen::KeyIdMethod::Sha256,
-        };
-        let crl = params
-            .signed_by(&self.issuer)
-            .map_err(|e| format!("CRL 產生失敗：{e}"))?;
-        Ok(crl.der().to_vec())
+        crl_der(
+            &self.issuer,
+            crl_number,
+            this_update_ms,
+            next_update_ms,
+            revoked,
+        )
     }
+}
+
+/// 用戶端憑證的範本（第 5.1 節）：`CN=<agent_id>`、SAN 恰好一個 `DNS:<agent_id>`、`CA:FALSE`、
+/// `digitalSignature`、EKU `clientAuth`、AKI。線上簽發與 `kairos pki sign --profile client` 共用
+pub(super) fn client_params(
+    agent_id: &str,
+    serial: &[u8],
+    not_before_ms: i64,
+    not_after_ms: i64,
+) -> Result<CertificateParams, String> {
+    let mut p = CertificateParams::default();
+    p.serial_number = Some(SerialNumber::from_slice(serial));
+    p.not_before = to_time(not_before_ms)?;
+    p.not_after = to_time(not_after_ms)?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, agent_id);
+    p.distinguished_name = dn;
+    p.subject_alt_names = vec![SanType::DnsName(
+        agent_id
+            .to_string()
+            .try_into()
+            .map_err(|e| format!("agent_id 無法放入 SAN：{e}"))?,
+    )];
+    p.is_ca = IsCa::ExplicitNoCa;
+    p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    p.use_authority_key_identifier_extension = true;
+    Ok(p)
+}
+
+/// 以 `issuer` 產生 CRL（DER）；線上簽發 CA 與 `kairos pki gencrl` 共用
+pub(super) fn crl_der(
+    issuer: &Issuer<'_, KeyPair>,
+    crl_number: u64,
+    this_update_ms: i64,
+    next_update_ms: i64,
+    revoked: &[RevokedEntry],
+) -> Result<Vec<u8>, String> {
+    let mut revoked_certs = Vec::with_capacity(revoked.len());
+    for r in revoked {
+        revoked_certs.push(RevokedCertParams {
+            serial_number: SerialNumber::from_slice(
+                &serial_bytes(&r.serial).ok_or_else(|| format!("序號 {} 不合法", r.serial))?,
+            ),
+            revocation_time: to_time(r.revoked_at_ms)?,
+            reason_code: Some(r.reason.rcgen()),
+            invalidity_date: None,
+        });
+    }
+    let params = CertificateRevocationListParams {
+        this_update: to_time(this_update_ms)?,
+        next_update: to_time(next_update_ms)?,
+        crl_number: SerialNumber::from_slice(&crl_number.to_be_bytes()),
+        issuing_distribution_point: None,
+        revoked_certs,
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let crl = params
+        .signed_by(issuer)
+        .map_err(|e| format!("CRL 產生失敗：{e}"))?;
+    Ok(crl.der().to_vec())
 }
 
 /// 代理簽發 CA 憑證的要求（`kairos/PKI.md` 第 5.2 節）：`CA:TRUE`、`pathlen:0`、`keyCertSign`＋`cRLSign`、

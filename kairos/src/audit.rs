@@ -1366,8 +1366,11 @@ mod tests {
             &json!({"through_id": 3, "sealed": 3}),
         )
         .unwrap();
-        // 升級到 v7、服務建立金鑰後寫入：0.6 的 3 筆只有雜湊鏈，第 4 筆起有 HMAC
-        assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 7);
+        // 升級到 v7（0.8 起再到 v8）、服務建立金鑰後寫入：0.6 的 3 筆只有雜湊鏈，第 4 筆起有 HMAC
+        assert_eq!(
+            migrate(&mut conn, MIGRATIONS).unwrap(),
+            crate::store::sqlite::SCHEMA_VERSION
+        );
         let r = verify(&conn).unwrap();
         assert!(r.ok(), "{r:?}");
         assert_eq!(r.hmac.status, "not_started");

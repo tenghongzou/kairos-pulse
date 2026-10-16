@@ -827,3 +827,20 @@ fieldset > .k-stack--sm { margin-top: var(--ds-space-200); }
 /* 簽發 CA 清單 */
 .k-ca-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--ds-space-400); }
 .k-ca-list > li { padding-top: var(--ds-space-300); border-top: var(--ds-border-width) solid var(--ds-color-border-subtle); }
+
+/* ---- 指標擴充（F4；設計包 kairos/screens.md S05「F4 指標擴充」、§30 D45～D49）---- */
+.k-chart .k-ref { stroke: var(--ds-chart-axis); stroke-dasharray: 4 3; stroke-width: 1; fill: none; }
+.k-legend svg.k-chart { width: 28px; height: 10px; overflow: visible; }
+.k-metric-groups { margin-bottom: var(--ds-space-300); }
+.k-multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--ds-space-400); }
+.k-multiple { min-width: 0; }
+.k-multiple__title { font: var(--ds-text-label); color: var(--ds-color-text-primary); margin: 0 0 var(--ds-space-100); }
+.k-full { display: inline-flex; align-items: center; gap: var(--ds-space-100); margin-left: var(--ds-space-100); font: var(--ds-text-label); color: var(--ds-status-critical-fg); }
+.k-mount-list { margin: var(--ds-space-200) 0 0; padding-left: var(--ds-space-500); font-size: var(--ds-font-size-sm); }
+.k-mount-list li + li { margin-top: var(--ds-space-100); }
+.k-fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: var(--ds-space-100); }
+.k-fieldset legend { font: var(--ds-text-label); color: var(--ds-color-text-secondary); margin-bottom: var(--ds-space-100); }
+.k-mono-area { font-family: var(--ds-font-family-mono); min-height: 5rem; width: 100%; resize: vertical; }
+.k-cmd summary { cursor: pointer; }
+.k-cmd code { font-family: var(--ds-font-family-mono); font-size: var(--ds-font-size-sm); white-space: pre-wrap; word-break: break-all; }
+.k-row-wrap { margin: var(--ds-space-200) 0; }

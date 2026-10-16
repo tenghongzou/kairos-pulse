@@ -1,7 +1,9 @@
 // S05 主機詳情（設計包 kairos/screens.md S05；API GET /api/v1/hosts/{id}、/metrics/{name}、/connections）。
 //
-// 分頁（以連結實作，網址可分享）：概覽 /hosts/:id、趨勢 /hosts/:id/metrics、連線與憑證 /hosts/:id/connection。
-// 0.7.0 隱藏（沒有後端或沒有畫面）：資產資訊（F4）、事件（S06／S07 之後）、稽核紀錄（S18 之後）、
+// 分頁（以連結實作，網址可分享）：概覽 /hosts/:id、趨勢 /hosts/:id/metrics、行程 /hosts/:id/processes、
+// 資產資訊 /hosts/:id/inventory、連線與憑證 /hosts/:id/connection。0.8.0〔草稿〕（F4，設計包 §30）起有行程與
+// 資產資訊（host-processes.js、host-inventory.js），趨勢分為六個指標群組（host-metrics.js）。
+// 隱藏（沒有後端或沒有畫面）：事件（S06／S07 之後）、稽核紀錄（S18 之後）、
 // 編輯顯示名稱、進入維護、除役、撤銷憑證、刪除資料（主機的寫入操作）。
 // 斷線紀錄：GET /hosts/{id}/connections（Kairos 這次啟動後的上線與離線，記憶體中）＋24 小時上線時間軸
 // （由回報資料的空缺推算）。憑證：詳情的 certificate 摘要；有 pki:read 時另列序號、指紋與簽發方式。
@@ -13,15 +15,20 @@ import * as session from '../core/session.js';
 import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
 import { pageHead, card, dl, emptyState, errorState, inlineAlert, statusBadge, copyButton, skeletonBlock, codeTag } from '../ui/components.js';
-import { sparkline, trendChart } from '../ui/chart.js';
-import { hostName, reasonText, osText, memRatio } from './host-common.js';
+import { sparkline } from '../ui/chart.js';
+import { hostName, reasonText, osText, memRatio, isOldPulse, osFamily, oldPulseCell } from './host-common.js';
+import { metricsTab } from './host-metrics.js';
+import { processesTab } from './host-processes.js';
+import { inventoryTab } from './host-inventory.js';
 
-const RANGES = ['1h', '24h', '7d', '30d'];
+const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection'];
 
 function tabs(id, active) {
   const items = [
     ['overview', `/hosts/${id}`, t('host.tab.overview')],
     ['metrics', `/hosts/${id}/metrics`, t('host.tab.metrics')],
+    ['processes', `/hosts/${id}/processes`, t('host.tab.processes')],
+    ['inventory', `/hosts/${id}/inventory`, t('host.tab.inventory')],
     ['connection', `/hosts/${id}/connection`, t('host.tab.connection')],
   ];
   return h(
@@ -92,16 +99,7 @@ function overviewTab(hst, el) {
 
   const r = hst.last_report;
   const online = hst.status === 'online';
-  const cpu = r && r.cpu_usage != null ? fmt.pct(r.cpu_usage) : '—';
-  const mem = r && r.memory_total_bytes ? `${fmt.bytes(r.memory_used_bytes)} / ${fmt.bytes(r.memory_total_bytes)}（${fmt.pct(memRatio(r))}）` : '—';
-  const valuesBody = r
-    ? dl([
-        [t('col.cpu'), online ? cpu : t('host.beforeOffline', { v: cpu })],
-        [t('col.memory'), online ? mem : t('host.beforeOffline', { v: mem })],
-        [t('host.reportAt'), r.recv_at ? [fmt.timeEl(r.recv_at)] : '—'],
-        r.metrics != null ? [t('host.metricsCount'), fmt.num(r.metrics)] : null,
-      ])
-    : h('p', { class: 'muted' }, t('host.noReport'));
+  const valuesBody = r ? currentValues(hst, r, online) : h('p', { class: 'muted' }, t('host.noReport'));
 
   const sparkCpu = h('div', null, skeletonBlock(1));
   const sparkMem = h('div', null, skeletonBlock(1));
@@ -147,6 +145,108 @@ function overviewTab(hst, el) {
   metricSeries(hst.agent_id, 'system.cpu.usage', '24h')
     .then((res) => mount(uptime, uptimeBar(res)))
     .catch(() => mount(uptime, h('p', { class: 'muted' }, t('host.noData'))));
+}
+
+/** 目前數值（設計包 S05「目前數值」、§30 D45）：CPU、記憶體、置換空間、負載、磁碟、運作時間、行程 */
+function currentValues(hst, r, online) {
+  const old = isOldPulse(hst);
+  const windows = osFamily(hst) === 'windows';
+  const before = (v) => (online ? v : t('host.beforeOffline', { v }));
+  const cpu = r.cpu_usage != null ? fmt.pct(r.cpu_usage) : '—';
+  const mem = r.memory_total_bytes
+    ? t('host.values.memoryValue', { pct: fmt.pct(memRatio(r)), used: fmt.gib(r.memory_used_bytes), total: fmt.gib(r.memory_total_bytes) })
+    : '—';
+  // 置換空間
+  let swap;
+  if (r.swap && r.swap.total === 0) swap = t('host.values.noSwap');
+  else if (r.swap && r.swap.total != null) swap = before(t('host.values.swapValue', { pct: fmt.pct(r.swap.usage), used: fmt.gib(r.swap.used), total: fmt.gib(r.swap.total) }));
+  else swap = old ? oldPulseCell() : t('host.na.notYet');
+  // 負載
+  let load;
+  if (windows) load = h('span', { class: 'muted' }, `— ${t('host.na.windowsLoad')}`);
+  else if (r.load && r.load['5m'] != null) {
+    const cores = hst.inventory && hst.inventory.cpu_logical_cores;
+    load = [
+      before(t('host.values.loadValue', { l1: fmt.load(r.load['1m']), l5: fmt.load(r.load['5m']), l15: fmt.load(r.load['15m']) })),
+      cores ? h('span', { class: 'k-sub' }, t('host.values.loadPerCore', { value: fmt.load(r.load['5m'] / cores), count: fmt.num(cores) })) : null,
+    ];
+  } else load = old ? oldPulseCell() : t('host.na.notYet');
+  // 磁碟：使用率最高的掛載點＋「＋N 個掛載點」展開
+  const fs = (r.filesystems || []).filter((f) => f.usage != null).sort((a, b) => b.usage - a.usage);
+  let disk = '—';
+  let diskNote = null;
+  if (fs.length) {
+    const est = (f) => (f.estimated ? t('host.estimatedSuffix') : '');
+    const fullMark = (f) => (f.usage >= 95 ? h('span', { class: 'k-full' }, icon('status-critical'), t('host.values.diskFull')) : null);
+    const top = fs[0];
+    const listId = `mounts-${hst.agent_id.slice(0, 8)}`;
+    const list = h(
+      'ul',
+      { class: 'k-mount-list', id: listId, hidden: true },
+      fs.map((f) =>
+        h(
+          'li',
+          null,
+          t('host.values.mountLine', { mount: f.mountpoint, pct: `${fmt.pct(f.usage)}${est(f)}`, used: fmt.bytes(f.used), total: fmt.bytes(f.total), fs: f.fstype ? `，${f.fstype}` : '' }),
+          ' ',
+          fullMark(f),
+        ),
+      ),
+    );
+    const toggle =
+      fs.length > 1
+        ? h(
+            'button',
+            {
+              type: 'button',
+              class: 'ds-button ds-button--ghost ds-button--sm',
+              'aria-expanded': 'false',
+              'aria-controls': listId,
+              on: {
+                click: (ev) => {
+                  const b = ev.currentTarget;
+                  const open = b.getAttribute('aria-expanded') !== 'true';
+                  b.setAttribute('aria-expanded', open ? 'true' : 'false');
+                  b.textContent = open ? t('host.values.lessMounts') : t('host.values.moreMounts', { count: fmt.num(fs.length - 1) });
+                  list.hidden = !open;
+                },
+              },
+            },
+            t('host.values.moreMounts', { count: fmt.num(fs.length - 1) }),
+          )
+        : null;
+    disk = [h('span', { class: 'k-top-mount' }, before(`${top.mountpoint} ${fmt.pct(top.usage)}${est(top)}`)), ' ', fullMark(top), toggle, list];
+    if (fs.some((f) => f.estimated)) diskNote = h('p', { class: 'caption' }, t('host.estimated.desc', { version: hst.agent_version || '—' }));
+  }
+  // 運作時間
+  let uptime;
+  if (hst.uptime_secs != null) {
+    const booted = fmt.serverNow() - hst.uptime_secs * 1000;
+    uptime = [fmt.duration(hst.uptime_secs), h('span', { class: 'k-sub' }, t('host.values.bootedAt', { time: fmt.dateTime(hst.boot_time || booted, { seconds: false }) }))];
+  } else if (!online && r.uptime_secs != null) {
+    uptime = t('host.values.uptimeOffline', { d: fmt.duration(r.uptime_secs) });
+  } else uptime = old ? oldPulseCell() : t('host.na.notYet');
+  // 行程
+  const procs =
+    r.process_count != null
+      ? [before(t('host.values.processCount', { n: fmt.num(r.process_count) })), ' · ', h('a', { href: `/hosts/${hst.agent_id}/processes` }, t('host.values.seeProcesses'))]
+      : old
+        ? oldPulseCell()
+        : t('host.na.notYet');
+  return [
+    dl([
+      [t('col.cpu'), before(cpu)],
+      [t('col.memory'), before(mem)],
+      [t(windows ? 'host.values.swapWindows' : 'host.values.swap'), swap],
+      [t('host.values.load'), load],
+      [t('host.values.disk'), disk],
+      [t('host.values.uptime'), uptime],
+      [t('host.values.processes'), procs],
+      [t('host.reportAt'), r.recv_at ? [fmt.timeEl(r.recv_at)] : '—'],
+      r.metrics != null ? [t('host.metricsCount'), fmt.num(r.metrics)] : null,
+    ]),
+    diskNote,
+  ];
 }
 
 function uptimeBar(res) {
@@ -206,75 +306,6 @@ async function memoryPercent(id, range, signal) {
     })
     .filter(Boolean);
   return { ...used, points };
-}
-
-// ---------------------------------------------------------------------------
-// 趨勢
-function metricsTab(hst, el, ctx) {
-  let range = RANGES.includes(ctx.query.get('range')) ? ctx.query.get('range') : '24h';
-  let ctrl = null;
-  const group = h(
-    'div',
-    { class: 'k-timerange', role: 'group', 'aria-label': t('host.range') },
-    RANGES.map((r) =>
-      h(
-        'button',
-        {
-          type: 'button',
-          'aria-pressed': r === range ? 'true' : 'false',
-          dataset: { range: r },
-          on: {
-            click: () => {
-              range = r;
-              for (const b of group.querySelectorAll('button')) b.setAttribute('aria-pressed', b.dataset.range === r ? 'true' : 'false');
-              history.replaceState(null, '', `${location.pathname}?range=${r}`);
-              load();
-            },
-          },
-        },
-        t(`host.range.${r}`),
-      ),
-    ),
-  );
-  const info = h('p', { class: 'caption', role: 'status' });
-  const cpuBox = h('div');
-  const memBox = h('div');
-  mount(el, 
-    h('div', { class: 'k-chart-head' }, h('span', { class: 'secondary' }, t('host.rangeTz', { tz: fmt.tzLabel() })), group),
-    info,
-    h('div', { class: 'k-stack' }, card({ title: t('host.chartCpu'), body: cpuBox }), card({ title: t('host.chartMem'), body: memBox })),
-  );
-  const show = (box, p, label, emptyKey) =>
-    p
-      .then((res) => {
-        mount(box, 
-          res.points.length
-            ? trendChart({ label, from: res.from, to: res.to, bucketSecs: res.bucket_secs || (hst.report_interval_ms || 5000) / 1000, points: res.points, yMax: 100, format: (v) => fmt.pct(v) })
-            : emptyState({ title: t(emptyKey), iconName: 'clock' }),
-        );
-        return res;
-      })
-      .catch((e) => {
-        if (e.name === 'AbortError') return null;
-        mount(box, e.code === 'metric_not_found' ? emptyState({ title: t('host.noMetric'), iconName: 'clock' }) : errorState(e, { title: t('host.trendFailed'), onRetry: load }));
-        return null;
-      });
-  function load() {
-    if (ctrl) ctrl.abort();
-    ctrl = new AbortController();
-    mount(cpuBox, skeletonBlock(5));
-    mount(memBox, skeletonBlock(5));
-    info.textContent = '';
-    show(cpuBox, metricSeries(hst.agent_id, 'system.cpu.usage', range, ctrl.signal), t('host.chartCpu'), 'host.noDataRange').then((res) => {
-      if (!res) return;
-      const resText = has(`host.res.${res.resolution}`) ? t(`host.res.${res.resolution}`) : res.resolution;
-      const notes = (res.notes || []).join(' ');
-      info.textContent = `${t('host.resolution', { r: resText })}${notes ? ` · ${notes}` : ''}`;
-    });
-    show(memBox, memoryPercent(hst.agent_id, range, ctrl.signal), t('host.chartMem'), 'host.noDataRange');
-  }
-  load();
-  return () => ctrl && ctrl.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +420,7 @@ function connectionTab(hst, el) {
 // ---------------------------------------------------------------------------
 export function render(ctx) {
   const id = String(ctx.params.id || '').toLowerCase();
-  const tab = ctx.params.tab === 'metrics' ? 'metrics' : ctx.params.tab === 'connection' ? 'connection' : ctx.params.tab ? null : 'overview';
+  const tab = ctx.params.tab ? (TABS.includes(ctx.params.tab) && ctx.params.tab !== 'overview' ? ctx.params.tab : null) : 'overview';
   const root = ctx.root;
   if (!tab) {
     ctx.app.notFound();
@@ -425,6 +456,8 @@ export function render(ctx) {
       cleanup = null;
       if (tab === 'overview') overviewTab(hst, tabBody);
       else if (tab === 'metrics') cleanup = metricsTab(hst, tabBody, ctx);
+      else if (tab === 'processes') cleanup = processesTab(hst, tabBody, ctx);
+      else if (tab === 'inventory') cleanup = inventoryTab(hst, tabBody);
       else connectionTab(hst, tabBody);
       ctx.focusTitle();
     } catch (e) {
@@ -452,7 +485,7 @@ export function render(ctx) {
     if (!ev.type.startsWith('host.') || !ev.data || ev.data.agent_id !== id) return;
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
-      if (tab !== 'metrics') load();
+      if (tab === 'overview' || tab === 'connection') load();
     }, 1000);
   });
   return {

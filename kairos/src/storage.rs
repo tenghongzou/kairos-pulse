@@ -145,6 +145,10 @@ pub struct ReportRecord {
     pub dedup: Option<DedupKey>,
     #[serde(flatten)]
     pub body: RecordBody,
+    /// 行程排行（feature `processes`；METRICS.md 第 5 節）。只存入 SQLite 的 `process_snapshots`，
+    /// JSONL（主要輸出與鏡像）不輸出（第 9.5 節）
+    #[serde(skip)]
+    pub processes: Option<kairos_proto::ProcessList>,
 }
 
 impl ReportRecord {
@@ -167,7 +171,14 @@ impl ReportRecord {
             ts,
             dedup: None,
             body,
+            processes: None,
         }
+    }
+
+    /// 附上行程排行（協商了 `processes` 的連線上帶 `processes` 的 report）
+    pub fn with_processes(mut self, processes: Option<kairos_proto::ProcessList>) -> Self {
+        self.processes = processes;
+        self
     }
 
     /// 附上去重鍵（`durable`：連線協商到 `durable` 時；`kairos reports export` 讀回時）

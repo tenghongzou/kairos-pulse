@@ -397,6 +397,14 @@ pub fn check(path: Option<&Path>) -> CheckReport {
             .as_ref()
             .map(|(_, b)| b.clone())
             .filter(|p| Path::new(p).is_file()),
+        retired_cas: (c.storage.backend == StorageBackend::Sqlite
+            && c.auth.client_ca_path().is_some())
+        .then(|| {
+            crate::pki::retired_cas_path(Path::new(&c.storage.data_dir))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|p| Path::new(p).is_file()),
     };
     match crate::tls::build(&paths) {
         Ok(material) => {

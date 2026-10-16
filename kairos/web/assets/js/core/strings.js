@@ -9,6 +9,7 @@
 import { ALERT_STRINGS } from './strings-alerts.js';
 import { PKI_STRINGS } from './strings-pki.js';
 import { ADMIN_STRINGS } from './strings-admin.js';
+import { METRICS_STRINGS } from './strings-metrics.js';
 
 const M = {
   // ---- 共用 ----
@@ -85,12 +86,33 @@ const M = {
   'shell.logout': '登出',
   'shell.healthPrefix': '系統狀態：',
   'shell.healthOk': '系統正常',
-  'shell.healthIssues': '{n} 項需要注意：{first}',
+  // ia.md §2：狀態燈寫最重要一項的摘要；檢查項目一律用「正常／警告／嚴重」，不用「需要注意」
+  'shell.healthIssues': '{first}',
+  'shell.healthIssuesMore': '{first}（另 {m} 項）',
+  // 全站 Banner（ia.md §2；design-system README §6.13；文字依 copywriting.md 範例 1、2、8，其餘〔暫定〕）
+  'banner.crlExpired': '撤銷清單（CRL）已過期，所有 agent 都會被拒絕連線',
+  'banner.crlSoon': '撤銷清單（CRL）將在 {n} 天後過期',
+  'banner.crlBody': '過期後所有 agent 都會被拒絕連線。請重新產生 CRL（線上簽發時可在「CA 與撤銷清單」立即更新），Kairos 會在 30 秒內自動載入。',
+  'banner.certExpired': '伺服器憑證已過期，所有 agent 都無法連線',
+  'banner.certSoon': '伺服器憑證將在 {n} 天後到期',
+  'banner.certBody': '到期後所有 agent 都無法連線。請更換 server.cert 指向的憑證，Kairos 會在 30 秒內自動載入（不需要重新啟動）。',
+  'banner.writes': '無法寫入回報資料，新的回報目前無法保存',
+  'banner.writesBody': '最近 5 分鐘每一分鐘都有回報無法保存。支援補送的主機會在恢復後自動補送；請到系統健康查看原因。',
+  'banner.unauth': '正在接受未經驗證的 agent 連線',
+  'banner.unauthBody': 'auth.allow_unauthenticated = true 且 agent 連線埠監聽對外位址：任何人都能以任意 agent_id 回報資料。請盡快啟用 mTLS。',
+  'banner.alerts': '告警引擎沒有在執行，告警通知目前無法送出',
+  'banner.alertsBody': '新的離線、門檻與系統事件不會被開立，也不會通知。請查看 Kairos 的日誌。',
+  'banner.toHealth': '查看系統健康',
+  'banner.toCa': '前往 CA 與撤銷清單',
+  'banner.dismiss': '24 小時內不再顯示',
   'shell.offline': '與 Kairos 伺服器的連線中斷，正在重新連線… 畫面上的資料停在 {time}。',
   'nav.section.monitoring': '監控',
   'nav.overview': '總覽',
   'nav.hosts': '主機',
   'nav.collapse': '收合導覽',
+  // 計數泡泡的可存取名稱（ia.md §7、design-system README §6.14）
+  'nav.badge.pending': '{n} 筆待核准',
+  'nav.badge.health': '{n} 項警告或嚴重',
   'nav.expand': '展開導覽',
 
   // ---- 錯誤（copywriting.md §4） ----
@@ -268,6 +290,10 @@ const M = {
   'health.listeners': '監聽',
   'health.file_descriptors': '檔案描述元',
   'health.auth': '身分驗證',
+  'health.issuing_ca': '簽發 CA',
+  'health.enroll': '註冊端點',
+  'health.alerts': '告警引擎',
+  'health.metrics': '/metrics 端點',
   'health.item': '{label}：{summary}',
 
   // ---- 總覽（S03） ----
@@ -456,6 +482,8 @@ const M = {
   'chart.noData': '{label}：這段時間沒有資料',
   'chart.range': '（範圍 {min}～{max}）',
   'chart.asTable': '以表格檢視資料',
+  'chart.multiSummary': '{label}，{from}～{to}：最新 {last}。以方向鍵逐點檢視。',
+  'chart.gapLegend': '離線或未保存（不補線）',
   'chart.col.time': '時間（{tz}）',
   'chart.col.avg': '平均',
   'chart.col.min': '最小',
@@ -569,6 +597,9 @@ Object.assign(M, ALERT_STRINGS);
 // 管理與系統畫面（S16～S18、S20、S21）的文字
 Object.assign(M, ADMIN_STRINGS);
 
+// 指標擴充（F4：S03、S04、S05、S09）的文字
+Object.assign(M, METRICS_STRINGS);
+
 /** 文字；缺少 key 時回傳 key 本身並記錄錯誤（Playwright 測試檢查主控台沒有錯誤） */
 export function t(key, params) {
   let s = M[key];
@@ -588,7 +619,9 @@ export function has(key) {
 /** 系統健康項目的一行文字（「檔案描述元：…」） */
 export function healthItemText(item) {
   const label = has(`health.${item.id}`) ? M[`health.${item.id}`] : item.id;
-  return t('health.item', { label, summary: item.summary || '' });
+  // 沒有權限看細節的項目（restricted）沒有摘要：只寫名稱
+  if (!item.summary) return label;
+  return t('health.item', { label, summary: item.summary });
 }
 
 export function statusLabel(s) {

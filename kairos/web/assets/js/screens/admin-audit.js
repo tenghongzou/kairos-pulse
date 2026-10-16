@@ -6,7 +6,11 @@
 //   （since_id 之前的紀錄只有雜湊鏈）。
 // - 匯出（audit:export）：只有 JSONL（可離線驗證）；CSV、外送 syslog／SIEM、完整性告警設定、保留期限的調整隱藏
 //   （INTEGRATION.md §28.6）。
-// - 詳情：對話框列出完整欄位、細節（變更前後）、前一筆雜湊、雜湊與 HMAC。
+// - 詳情：對話框列出完整欄位、細節（變更前後）、前一筆雜湊、雜湊與 HMAC（HMAC 起點之前的紀錄寫「啟用 HMAC 前」，
+//   起點之後卻沒有 HMAC 的不這樣寫）。
+// - 頁首「完整性」（screens.md S18 0.7）：列表第一頁的 meta.integrity（最近一次自我驗證或手動驗證、HMAC 起點），
+//   例「✓ 已驗證至 10/15 02:20（雜湊鏈連續；HMAC 自第 11902 筆起）· 系統自動驗證」。只看自己操作的維運者沒有這一區。
+// - 斷點為紀錄可能被竄改時提供「前往第 N 筆」（清除篩選、從第 N 筆開始列出）；金鑰問題不提供。
 
 import { h, icon, mount } from '../core/dom.js';
 import { t, has } from '../core/strings.js';
@@ -14,7 +18,6 @@ import { api, qs } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as fmt from '../core/format.js';
 import { replaceQuery } from '../core/router.js';
-import { lookup } from '../core/errors.js';
 import { pageHead, card, dl, emptyState, errorAlert, field, inlineAlert, statusBadge, setBusy, codeTag } from '../ui/components.js';
 import { createTable } from '../ui/table.js';
 import { openDialog } from '../ui/dialog.js';
@@ -23,6 +26,8 @@ const CATEGORIES = ['login', 'user', 'api_token', 'settings', 'enroll', 'pki', '
 const RESULTS = ['ok', 'failed', 'denied', 'rejected'];
 const PERIODS = { '24h': 24 * 3600e3, '7d': 7 * 86400e3, '30d': 30 * 86400e3 };
 const PAGE = 100;
+// 目前的 HMAC 起點（meta.integrity.hmac_since_id；null＝尚未啟用）；undefined＝還不知道
+let hmacSince;
 
 export function actorText(actor) {
   if (!actor) return '—';
@@ -66,7 +71,7 @@ function detailsDialog(row) {
       dl([
         [t('adm.audit.prevHash'), h('span', { class: 'mono k-break' }, row.prev_hash || '—')],
         [t('adm.audit.hash'), h('span', { class: 'mono k-break' }, row.hash || '—')],
-        ['HMAC', row.hmac ? h('span', { class: 'mono k-break' }, row.hmac) : t('adm.audit.noHmac')],
+        ['HMAC', row.hmac ? h('span', { class: 'mono k-break' }, row.hmac) : hmacSince != null && row.id >= hmacSince ? t('adm.audit.hmacMissing') : t('adm.audit.noHmac')],
       ]),
     ),
   });
@@ -97,6 +102,9 @@ export function render(ctx) {
 
   // ---- 完整性 ----
   const integrity = h('div', { 'aria-live': 'polite' }, h('p', null, t('adm.audit.notVerified')));
+  const headIntegrity = h('span', { class: 'k-integrity-head' });
+  let verifiedHere = false;
+  let startCursor = null;
   const verifyBtn = canAll ? h('button', { type: 'button', class: 'ds-button ds-button--secondary', on: { click: () => verify() } }, icon('shield-check'), t('adm.audit.verify')) : null;
   const exportLink = canExport ? h('a', { class: 'ds-button ds-button--secondary', href: '#', download: '', dataset: { native: '1' } }, icon('download'), t('adm.audit.exportJsonl')) : null;
 
@@ -169,8 +177,8 @@ export function render(ctx) {
 
   mount(
     root,
-    pageHead({ title: t('adm.audit.title'), actions: [verifyBtn, exportLink].filter(Boolean) }),
-    card({ title: t('adm.audit.integrity'), body: [integrity, h('p', { class: 'caption' }, t('adm.audit.limits'))] }),
+    pageHead({ title: t('adm.audit.title'), meta: canAll ? headIntegrity : null, actions: [verifyBtn, exportLink].filter(Boolean) }),
+    canAll ? card({ title: t('adm.audit.integrity'), body: [integrity, h('p', { class: 'caption' }, t('adm.audit.limits'))] }) : null,
     ownNote,
     h('section', { class: 'ds-filterbar', 'aria-label': t('adm.audit.filters') }, filterRow, selects),
     table.el,
@@ -178,7 +186,7 @@ export function render(ctx) {
 
   function params(c) {
     const from = st.period && PERIODS[st.period] ? new Date(fmt.serverNow() - PERIODS[st.period]).toISOString() : undefined;
-    return { actor: st.actor, category: st.category, action: st.action, target: st.target, result: st.result, from, limit: PAGE, cursor: c };
+    return { actor: st.actor, category: st.category, action: st.action, target: st.target, result: st.result, from, limit: PAGE, cursor: c || startCursor || undefined };
   }
 
   function updateExport() {
@@ -199,6 +207,10 @@ export function render(ctx) {
       if (my !== seq) return;
       cursor = res.page && res.page.next_cursor;
       mount(ownNote, res.meta && res.meta.own_only ? inlineAlert({ kind: 'info', title: t('adm.audit.ownOnly') }) : null);
+      if (res.meta && res.meta.integrity && !verifiedHere) {
+        hmacSince = res.meta.integrity.hmac_since_id;
+        mount(headIntegrity, ...integrityHead(res.meta.integrity));
+      }
       const rows = res.data || [];
       if (!rows.length) {
         const filtered = Boolean(st.actor || st.category || st.action || st.target || st.result || st.period);
@@ -226,11 +238,30 @@ export function render(ctx) {
     }
   }
 
+  /** 前往第 N 筆：清除篩選，從第 N 筆開始列出（cursor＝N＋1：列出編號小於它的） */
+  function jumpTo(id) {
+    for (const k of Object.keys(st)) st[k] = '';
+    for (const el of root.querySelectorAll('.ds-filterbar input, .ds-filterbar select')) el.value = '';
+    startCursor = String(id + 1);
+    load().then(() => {
+      const row = root.querySelector(`tbody tr[data-key="${id}"]`);
+      if (row) {
+        row.classList.add('is-highlight');
+        const btn = row.querySelector('button');
+        if (btn) btn.focus();
+      }
+    });
+  }
+
   async function verify() {
     setBusy(verifyBtn, true, t('adm.audit.verifying'));
     try {
       const r = await api('/api/v1/audit/verify', { method: 'POST' });
-      mount(integrity, ...verifyResult(r));
+      verifiedHere = true;
+      if (r.hmac) hmacSince = r.hmac.since_id;
+      mount(integrity, ...verifyResult(r, { onJump: jumpTo }));
+      // 頁首以這次的結果更新（與重新整理後 meta.integrity 的寫法相同）
+      mount(headIntegrity, ...integrityHead({ hmac_since_id: r.hmac ? r.hmac.since_id : null, last_verify: { at: fmt.serverNow(), actor: session.current() && session.current().user ? `user:${session.current().user.username}` : null, result: r.ok ? 'ok' : 'failed', self_check: false, broken: r.broken } }));
     } catch (err) {
       mount(integrity, errorAlert(err, { title: t('adm.audit.verifyFailed') }));
     } finally {
@@ -242,10 +273,25 @@ export function render(ctx) {
   return {};
 }
 
+/** 頁首「完整性」（screens.md S18 0.7：「✓ 已驗證至 02:20（雜湊鏈連續；HMAC 自第 11902 筆起）」） */
+export function integrityHead(ig) {
+  const v = ig && ig.last_verify;
+  if (!v) return [t('adm.audit.head.label'), ' ', statusBadge('unknown', t('adm.audit.head.never'))];
+  const at = `${fmt.dateTime(v.at, { seconds: false })} ${fmt.tzLabel()}`;
+  const by = v.self_check || v.actor === 'system' ? t('adm.audit.head.bySystem') : t('adm.audit.head.byUser', { who: actorText(v.actor) });
+  if (v.result === 'ok') {
+    const hm = ig.hmac_since_id != null ? t('adm.audit.head.hmacSince', { n: ig.hmac_since_id }) : t('adm.audit.head.hmacNone');
+    return [t('adm.audit.head.label'), ' ', statusBadge('online', t('adm.audit.head.okBadge')), ' ', t('adm.audit.head.ok', { at, hmac: hm }), ' · ', by];
+  }
+  const b = v.broken || {};
+  const reason = BREAK_REASONS.includes(b.reason) ? t(`adm.audit.break.${b.reason}`) : b.reason || '—';
+  return [t('adm.audit.head.label'), ' ', statusBadge('critical', t('adm.audit.head.failedBadge')), ' ', t('adm.audit.head.failed', { at, id: b.id ?? '—', r: reason }), ' ', codeTag('KRS-E6201'), ' · ', by];
+}
+
 const BREAK_REASONS = ['hash_mismatch', 'prev_mismatch', 'missing_hash', 'anchor_mismatch', 'head_mismatch', 'missing_hmac', 'hmac_mismatch', 'hmac_boundary_mismatch', 'hmac_key_unavailable', 'hmac_key_mismatch'];
 
 /** 驗證結果：雜湊鏈與 HMAC 的邊界 */
-export function verifyResult(r) {
+export function verifyResult(r, { onJump } = {}) {
   const at = `${fmt.dateTime(fmt.serverNow())} ${fmt.tzLabel()}`;
   const hm = r.hmac || {};
   const hmacLine =
@@ -262,7 +308,7 @@ export function verifyResult(r) {
         body: h(
           'ul',
           null,
-          h('li', null, t('adm.audit.checked', { n: fmt.num(r.checked), first: r.first_id ?? '—', last: r.last_id ?? '—' })),
+          h('li', null, t('adm.audit.checkedOk', { n: fmt.num(r.checked), first: r.first_id ?? '—', last: r.last_id ?? '—' })),
           h('li', null, hmacLine),
           r.last_hash ? h('li', null, t('adm.audit.lastHash'), ' ', h('span', { class: 'mono k-break' }, r.last_hash)) : null,
         ),
@@ -270,7 +316,6 @@ export function verifyResult(r) {
     ];
   }
   const b = r.broken || {};
-  const e = lookup('KRS-E6201');
   const reason = BREAK_REASONS.includes(b.reason) ? t(`adm.audit.break.${b.reason}`) : b.reason;
   const keyIssue = b.reason === 'hmac_key_unavailable' || b.reason === 'hmac_key_mismatch';
   return [
@@ -286,11 +331,12 @@ export function verifyResult(r) {
           ? h('p', { class: 'strong' }, t('adm.audit.brokenKey'), ' ', codeTag(b.product_code || 'KRS-E6201'))
           : h('p', { class: 'strong' }, t('adm.audit.broken', { id: b.id ?? '—' }), ' ', codeTag(b.product_code || 'KRS-E6201')),
         h('p', null, keyIssue ? t('adm.audit.brokenKeyReason', { what: t(`adm.audit.brokenKeyWhat.${b.reason}`) }) : t('adm.audit.brokenReason', { r: reason })),
-        keyIssue ? null : h('p', null, e && e.text ? e.text : ''),
         h('p', null, keyIssue ? t('adm.audit.brokenKeyFix') : t('adm.audit.brokenFix')),
         h('p', null, t('adm.audit.checked', { n: fmt.num(r.checked), first: r.first_id ?? '—', last: r.last_id ?? '—' })),
         h('p', null, hmacLine),
       ),
+      // 紀錄可能被竄改：「前往第 N 筆」；金鑰問題沒有特定的紀錄可看（screens.md S18）
+      !keyIssue && b.id != null && onJump ? h('div', { class: 'ds-banner__actions' }, h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => onJump(b.id) } }, t('adm.audit.jumpTo', { id: b.id }))) : null,
     ),
   ];
 }

@@ -1,0 +1,4 @@
+- name: restart pulse
+  ansible.builtin.systemd:
+    name: pulse.service
+    state: restarted

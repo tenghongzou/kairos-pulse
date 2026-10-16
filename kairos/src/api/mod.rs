@@ -22,6 +22,7 @@
 
 pub mod account;
 pub mod alerts;
+pub mod assets;
 pub mod audit_log;
 pub mod auth;
 pub mod conn_log;
@@ -412,6 +413,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
                 crls: Vec::new(),
                 issuing_cas: None,
                 issuing_crl: None,
+                retired_cas: None,
             },
             acceptor.clone(),
             Duration::from_secs(p.config.server.reload_interval_secs),
@@ -648,6 +650,9 @@ fn known_route(rest: &[&str]) -> bool {
             | ["hosts", _, "metrics"]
             | ["hosts", _, "metrics", _]
             | ["hosts", _, "connections"]
+            | ["hosts", _, "inventory"]
+            | ["hosts", _, "inventory", "changes"]
+            | ["hosts", _, "processes"]
             | ["overview"]
             | ["system", "health"]
             | ["events"]
@@ -855,16 +860,35 @@ async fn dispatch(
             hosts::check_access(ctx, id, &principal.host_access()?).await?;
             metrics::trend(ctx, id, name, query, now).await
         }
+        ["hosts", id, "inventory"] => {
+            query.reject_unknown(&[], &[])?;
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            assets::inventory(ctx, id, now).await
+        }
+        ["hosts", id, "inventory", "changes"] => {
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            assets::changes(ctx, id, query, now).await
+        }
+        ["hosts", id, "processes"] => {
+            hosts::check_access(ctx, id, &principal.host_access()?).await?;
+            assets::processes(ctx, id, query, now).await
+        }
         ["overview"] => {
             query.reject_unknown(&["group"], &[])?;
             let access = principal.host_access()?;
-            let show_health = principal.grants.has(Permission::HealthRead);
-            overview::get(ctx, &access, show_health, now).await
+            let health_for = principal
+                .grants
+                .has(Permission::HealthRead)
+                .then_some(&principal.grants);
+            overview::get(ctx, &access, health_for, now).await
         }
         ["system", "health"] => {
             query.reject_unknown(&[], &[])?;
             principal.require(Permission::HealthRead)?;
-            Ok(http::ok(now, health::compute(ctx, now).await?))
+            Ok(http::ok(
+                now,
+                health::compute(ctx, now).await?.redact(&principal.grants),
+            ))
         }
         _ => Err(ApiError::not_found()),
     }

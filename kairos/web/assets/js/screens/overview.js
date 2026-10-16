@@ -238,19 +238,32 @@ function longestBlock(list) {
 function topBlock(o) {
   let mode = 'cpu';
   const body = h('div');
-  const btnCpu = h('button', { type: 'button', 'aria-pressed': 'true' }, t('overview.top.cpu'));
-  const btnMem = h('button', { type: 'button', 'aria-pressed': 'false' }, t('overview.top.memory'));
+  const modes = ['cpu', 'memory', 'disk'];
+  const buttons = modes.map((m) => h('button', { type: 'button', 'aria-pressed': m === mode ? 'true' : 'false', dataset: { top: m } }, t(`overview.top.${m}`)));
+  const caption = { cpu: 'overview.top.cpuCaption', memory: 'overview.top.memCaption', disk: 'overview.top.diskCaption' };
+  // 磁碟（F4，設計包 §30 D49）：每台主機使用率最高的掛載點，寫「掛載點 使用率」；推算值加「（推算）」
+  const diskText = (d) => (d ? `${d.mountpoint} ${fmt.pct(d.usage)}${d.estimated ? t('host.estimatedSuffix') : ''}` : '—');
   const draw = () => {
-    btnCpu.setAttribute('aria-pressed', mode === 'cpu' ? 'true' : 'false');
-    btnMem.setAttribute('aria-pressed', mode === 'memory' ? 'true' : 'false');
-    const list = (mode === 'cpu' ? o.top_cpu : o.top_memory) || [];
-    mount(body, 
+    buttons.forEach((b, i) => b.setAttribute('aria-pressed', modes[i] === mode ? 'true' : 'false'));
+    const list = (mode === 'cpu' ? o.top_cpu : mode === 'memory' ? o.top_memory : o.top_disk) || [];
+    mount(body,
       list.length
         ? h(
             'table',
             { class: 'k-mini-table' },
-            h('caption', { class: 'ds-visually-hidden' }, mode === 'cpu' ? t('overview.top.cpuCaption') : t('overview.top.memCaption')),
-            h('thead', null, h('tr', null, h('th', { scope: 'col' }, t('col.host')), h('th', { scope: 'col', class: 'num' }, t('col.cpu')), h('th', { scope: 'col', class: 'num' }, t('col.memory')))),
+            h('caption', { class: 'ds-visually-hidden' }, t(caption[mode])),
+            h(
+              'thead',
+              null,
+              h(
+                'tr',
+                null,
+                h('th', { scope: 'col' }, t('col.host')),
+                mode === 'disk' ? h('th', { scope: 'col', class: 'num' }, t('overview.top.diskCol')) : null,
+                h('th', { scope: 'col', class: 'num' }, t('col.cpu')),
+                h('th', { scope: 'col', class: 'num' }, t('col.memory')),
+              ),
+            ),
             h(
               'tbody',
               null,
@@ -259,6 +272,7 @@ function topBlock(o) {
                   'tr',
                   null,
                   h('td', null, hostNameCell(r)),
+                  mode === 'disk' ? h('td', { class: 'num' }, diskText(r.disk)) : null,
                   h('td', { class: 'num' }, fmt.pct(r.cpu_usage)),
                   h('td', { class: 'num' }, r.memory_used_ratio == null ? '—' : fmt.pct(r.memory_used_ratio * 100)),
                 ),
@@ -268,18 +282,16 @@ function topBlock(o) {
         : h('p', { class: 'muted' }, t('overview.top.none')),
     );
   };
-  btnCpu.addEventListener('click', () => {
-    mode = 'cpu';
-    draw();
-  });
-  btnMem.addEventListener('click', () => {
-    mode = 'memory';
-    draw();
-  });
+  buttons.forEach((b, i) =>
+    b.addEventListener('click', () => {
+      mode = modes[i];
+      draw();
+    }),
+  );
   draw();
   return card({
     title: t('overview.top'),
-    actions: h('div', { class: 'k-timerange', role: 'group', 'aria-label': t('overview.top.switch') }, btnCpu, btnMem),
+    actions: h('div', { class: 'k-timerange', role: 'group', 'aria-label': t('overview.top.switch') }, buttons),
     body,
   });
 }

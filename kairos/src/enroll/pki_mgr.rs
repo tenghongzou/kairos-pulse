@@ -19,7 +19,7 @@ use super::db::DbError;
 use super::store::{self as es, Audit, DbKind, DbState, RequestRow};
 use crate::config::PkiMode;
 use crate::pki::issue::{IssuingCa, random_serial};
-use crate::pki::store::{self as ps, CA_ACTIVE, CA_TRUSTED, CertRow};
+use crate::pki::store::{self as ps, CA_ACTIVE, CA_RETIRED, CA_TRUSTED, CertRow};
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode};
 use crate::pki::{self, csr::check_csr};
 use crate::settings::Effective;
@@ -120,6 +120,10 @@ pub struct PkiManager {
     status: RwLock<IssueStatus>,
     /// 上次寫出的信任錨（ca_id, 狀態）；有變化才重寫檔案
     anchors: Mutex<Option<Vec<(i64, String)>>>,
+    /// 上次寫出的已退役簽發 CA（ca_id）；有變化才重寫 `pki/issuing-cas-retired.pem`
+    retired_written: Mutex<Option<Vec<i64>>>,
+    /// 已退役簽發 CA 的憑證（DER）：8444 的過期續簽拒絕它們簽出的憑證
+    retired: RwLock<Vec<Vec<u8>>>,
     /// 已記錄過的私鑰問題（避免每 2 秒重複記錄）
     logged_problems: Mutex<HashMap<i64, String>>,
     pub server_ca: RwLock<Option<ServerCa>>,
@@ -136,6 +140,8 @@ impl PkiManager {
                 PkiMode::Online => IssueStatus::Unavailable("尚未載入簽發 CA".into()),
             }),
             anchors: Mutex::new(None),
+            retired_written: Mutex::new(None),
+            retired: RwLock::new(Vec::new()),
             logged_problems: Mutex::new(HashMap::new()),
             server_ca: RwLock::new(None),
         }
@@ -154,6 +160,14 @@ impl PkiManager {
 
     pub fn server_ca(&self) -> Option<ServerCa> {
         self.server_ca
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 已退役簽發 CA 的憑證（DER；上次與資料庫同步時）
+    pub fn retired_ca_ders(&self) -> Vec<Vec<u8>> {
+        self.retired
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -180,14 +194,57 @@ impl PkiManager {
         }
     }
 
-    /// 由資料庫同步簽發 CA：載入私鑰（線上模式）、更新簽發狀態；信任錨有變化時重寫
-    /// `pki/issuing-cas.pem` 並回傳 `true`（呼叫端重建 8443 的 TLS 設定）
+    /// 由資料庫同步簽發 CA：載入私鑰（線上模式）、更新簽發狀態；信任錨或已退役的簽發 CA 有變化時重寫
+    /// `pki/issuing-cas.pem`／`pki/issuing-cas-retired.pem` 並回傳 `true`（呼叫端重建 8443 的 TLS 設定）
     pub fn sync_cas(&self, conn: &Connection) -> Result<bool, DbError> {
         let cas = ps::list_cas(conn)?;
+        let retired_changed = self.sync_retired(&cas);
+        Ok(self.sync_active(&cas)? | retired_changed)
+    }
+
+    /// 已退役的簽發 CA（PKI.md 第 15.4 節）：`auth.client_ca` 為根 CA 或代理 CA 時，用戶端自附退役簽發 CA 的
+    /// 憑證就能經由那一組驗證器通過，因此 8443 的驗證器另讀這個檔案、拒絕經過它們的鏈。
+    /// 檔案有變化時回傳 `true`
+    fn sync_retired(&self, cas: &[ps::CaRow]) -> bool {
+        let retired: Vec<&ps::CaRow> = cas
+            .iter()
+            .filter(|c| c.state == CA_RETIRED && c.cert_der.is_some())
+            .collect();
+        *self.retired.write().unwrap_or_else(|e| e.into_inner()) =
+            retired.iter().filter_map(|c| c.cert_der.clone()).collect();
+        let ids: Vec<i64> = retired.iter().map(|c| c.ca_id).collect();
+        let path = pki::retired_cas_path(&self.data_dir);
+        let mut last = self
+            .retired_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.as_ref() == Some(&ids) && (ids.is_empty() || path.exists()) {
+            return false;
+        }
+        if ids.is_empty() && !path.exists() {
+            *last = Some(ids);
+            return false;
+        }
+        let pem: String = retired
+            .iter()
+            .filter_map(|c| c.cert_der.as_deref())
+            .map(|der| pem_encode("CERTIFICATE", der))
+            .collect();
+        if let Err(e) = pki::ensure_pki_dir(&self.data_dir)
+            .and_then(|_| pki::write_public_atomically(&path, pem.as_bytes()))
+        {
+            error!("無法寫入已退役簽發 CA 的清單 {}：{e}", path.display());
+            return false;
+        }
+        *last = Some(ids);
+        true
+    }
+
+    fn sync_active(&self, cas: &[ps::CaRow]) -> Result<bool, DbError> {
         let mut issuers = HashMap::new();
         let mut active = None;
         let mut problem = None;
-        for ca in &cas {
+        for ca in cas {
             if ca.state != CA_ACTIVE && ca.state != CA_TRUSTED {
                 continue;
             }

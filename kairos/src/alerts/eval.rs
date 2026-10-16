@@ -10,7 +10,7 @@ use super::engine::{
     SystemCondition, WARMUP_RECONNECT_RATIO, World, dedup_key,
 };
 use super::model::{Attention, Category, EventState, RootCause, Rule, Severity};
-use super::rules::{ids, kind};
+use super::rules::{self, ids, kind};
 use super::scope::Compiled;
 use crate::bus::DisconnectReason;
 use crate::per_ip::cidr::Cidr;
@@ -31,6 +31,58 @@ fn minutes_text(ms: i64) -> String {
         format!("{} 小時 {} 分", m / 60, m % 60)
     } else {
         format!("{} 天", m / (24 * 60))
+    }
+}
+
+/// 指標門檻的值：每個對象（磁碟為掛載點、網路為介面；其他為 `None`）與目前的值（沒有回報為 `None`）。
+/// 磁碟與網路只列出最近一次 report 中有的對象，並依 `params.mountpoints`／`devices`（glob）篩選
+pub(super) fn metric_values(
+    metric: &str,
+    params: &Value,
+    h: &HostView,
+) -> Vec<(Option<String>, Option<f64>)> {
+    use rules::metric as m;
+    let detail = h.detail.as_ref().map(|r| &r.detail);
+    let in_scope = |key: &str, name: &str| {
+        rules::globs(params, key).is_none_or(|g| g.iter().any(|p| rules::glob_match(p, name)))
+    };
+    match metric {
+        m::MEMORY => vec![(None, h.memory)],
+        m::DISK => detail
+            .map(|d| {
+                d.filesystems
+                    .iter()
+                    .filter(|f| in_scope("mountpoints", &f.mountpoint))
+                    .map(|f| (Some(f.mountpoint.clone()), f.usage))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        m::SWAP => vec![(None, detail.and_then(|d| d.swap_percent()))],
+        m::LOAD => vec![(
+            None,
+            match (detail.and_then(|d| d.load_5m), h.logical_cores) {
+                (Some(l), Some(c)) if c > 0 => Some(l / f64::from(c)),
+                _ => None,
+            },
+        )],
+        m::NETWORK_RX | m::NETWORK_TX => detail
+            .map(|d| {
+                d.network
+                    .iter()
+                    .filter(|n| in_scope("devices", &n.device))
+                    .map(|n| {
+                        let rate = if metric == m::NETWORK_RX {
+                            n.rx_rate
+                        } else {
+                            n.tx_rate
+                        };
+                        // bytes/s → Mbps
+                        (Some(n.device.clone()), rate.map(|r| r * 8.0 / 1_000_000.0))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => vec![(None, h.cpu)],
     }
 }
 
@@ -956,83 +1008,107 @@ impl Engine {
                 "<" => v < t,
                 _ => v <= t,
             };
+            let unit = rules::metric::unit(&metric);
+            let label = rules::metric::label(&metric);
             let mut signals = Vec::new();
             for h in hosts {
                 if h.decommissioned || !scope.matches(&h.facts()) {
                     continue;
                 }
-                let key = dedup_key(&rule.rule_id, &h.agent_id);
-                seen.insert(key.clone());
-                let open = self.active_event(&rule.rule_id, &h.agent_id).is_some();
-                let value = if h.online {
-                    if metric == "memory" { h.memory } else { h.cpu }
-                } else {
-                    None
-                };
-                let streak = self.streaks.entry(key).or_default();
-                if let Some(v) = value {
-                    if cmp(v, threshold) {
-                        streak.since.get_or_insert(now);
-                        streak.clear_since = None;
-                    } else {
-                        streak.since = None;
-                        // 恢復條件：有恢復門檻時「越過恢復門檻」，沒有時「觸發條件不成立」
-                        let cleared = match clear {
-                            Some(c) => {
-                                if op.starts_with('>') {
-                                    v < c
-                                } else {
-                                    v > c
-                                }
-                            }
-                            None => true,
-                        };
-                        if cleared {
-                            streak.clear_since.get_or_insert(now);
-                        } else {
+                // 每台主機的每個對象（磁碟為每個掛載點、網路為每個介面）各自判斷
+                for (item, value) in metric_values(&metric, &rule.params, h) {
+                    let subject = match &item {
+                        Some(i) => format!("{}|{}", h.agent_id, i),
+                        None => h.agent_id.to_string(),
+                    };
+                    let key = dedup_key(&rule.rule_id, &subject);
+                    seen.insert(key.clone());
+                    let open = self.active_event(&rule.rule_id, &subject).is_some();
+                    let value = if h.online { value } else { None };
+                    let streak = self.streaks.entry(key).or_default();
+                    if let Some(v) = value {
+                        if cmp(v, threshold) {
+                            streak.since.get_or_insert(now);
                             streak.clear_since = None;
+                        } else {
+                            streak.since = None;
+                            // 恢復條件：有恢復門檻時「越過恢復門檻」，沒有時「觸發條件不成立」
+                            let cleared = match clear {
+                                Some(c) => {
+                                    if op.starts_with('>') {
+                                        v < c
+                                    } else {
+                                        v > c
+                                    }
+                                }
+                                None => true,
+                            };
+                            if cleared {
+                                streak.clear_since.get_or_insert(now);
+                            } else {
+                                streak.clear_since = None;
+                            }
                         }
                     }
+                    let streak = *streak;
+                    let active = if open {
+                        !streak.clear_since.is_some_and(|c| now - c >= clear_for)
+                    } else {
+                        streak.since.is_some_and(|s| now - s >= for_ms)
+                    };
+                    if !active {
+                        continue;
+                    }
+                    let what = match &item {
+                        Some(i) => format!("{label}（{i}）"),
+                        None => label.to_string(),
+                    };
+                    let mut details = json!({
+                        "hostname": h.name(),
+                        "ip": h.ip.map(|i| i.to_string()),
+                        "metric": metric,
+                        "op": op,
+                        "threshold": threshold,
+                        "unit": unit.trim(),
+                        "value": value,
+                        "since": streak.since,
+                    });
+                    match metric.as_str() {
+                        rules::metric::DISK => details["mountpoint"] = json!(item),
+                        rules::metric::NETWORK_RX | rules::metric::NETWORK_TX => {
+                            details["device"] = json!(item)
+                        }
+                        _ => {}
+                    }
+                    if metric == rules::metric::DISK
+                        && let Some(fs) = h.detail.as_ref().and_then(|r| {
+                            r.detail
+                                .filesystems
+                                .iter()
+                                .find(|f| Some(&f.mountpoint) == item.as_ref())
+                        })
+                        && fs.estimated
+                    {
+                        details["estimated"] = json!(true);
+                    }
+                    signals.push((
+                        subject,
+                        Signal {
+                            severity: rule.severity,
+                            title: format!(
+                                "{} {what} {op} {threshold}{unit} 持續 {}：{}",
+                                rule.name,
+                                minutes_text(for_ms),
+                                h.name()
+                            ),
+                            code: None,
+                            agent_id: Some(h.agent_id.to_string()),
+                            details,
+                            episode: streak.since,
+                            parent: None,
+                        },
+                    ));
                 }
-                let streak = *streak;
-                let active = if open {
-                    !streak.clear_since.is_some_and(|c| now - c >= clear_for)
-                } else {
-                    streak.since.is_some_and(|s| now - s >= for_ms)
-                };
-                if !active {
-                    continue;
-                }
-                let label = if metric == "memory" {
-                    "記憶體"
-                } else {
-                    "CPU"
-                };
-                signals.push((
-                    h.agent_id.to_string(),
-                    Signal {
-                        severity: rule.severity,
-                        title: format!(
-                            "{} {label} {op} {threshold}% 持續 {}：{}",
-                            rule.name,
-                            minutes_text(for_ms),
-                            h.name()
-                        ),
-                        code: None,
-                        agent_id: Some(h.agent_id.to_string()),
-                        details: json!({
-                            "hostname": h.name(),
-                            "ip": h.ip.map(|i| i.to_string()),
-                            "metric": metric,
-                            "op": op,
-                            "threshold": threshold,
-                            "value": value,
-                            "since": streak.since,
-                        }),
-                        episode: streak.since,
-                        parent: None,
-                    },
-                ));
             }
             self.reconcile(&rule, signals, now, false);
         }

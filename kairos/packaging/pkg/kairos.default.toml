@@ -1,0 +1,35 @@
+# Kairos 設定：deb／rpm 套件安裝的預設值（/opt/kairos/kairos.toml）。
+# 完整欄位與說明見 /opt/kairos/kairos.example.toml、README.md「設定」。
+# 套件升級不會覆寫這個檔案（deb conffile／rpm %config(noreplace)）；新版的預設值另見 kairos.example.toml。
+#
+# 路徑一律寫絕對路徑，CLI（sudo -u kairos kairos …）在任何目錄執行都讀寫同一份資料。
+# 第一次安裝後（INSTALL.md 第 A 節）：
+#   sudo -u kairos kairos pki init --config /opt/kairos/kairos.toml \
+#     --name <Pulse 連線時使用的伺服器名稱> --name <IP> --root-dir /opt/kairos/root-ca
+#   systemctl start kairos
+# pki init 寫出的檔案正好是下面 [server]、[auth]、[pki] 指向的路徑。
+
+[server]
+listen = "0.0.0.0:8080"
+cert_path = "/opt/kairos/data/pki/server.pem"
+key_path = "/opt/kairos/data/pki/server.key"
+
+[storage]
+data_dir = "/opt/kairos/data"
+
+[auth]
+# Kairos 管理的簽發 CA（kairos pki init、issuing-ca install 後由 Kairos 依狀態重寫）
+client_ca = "/opt/kairos/data/pki/issuing-cas.pem"
+
+[console]
+# 主控台 API 預設只綁 loopback；開放給管理網段見 INSTALL.md 第 9.3 節
+listen = "127.0.0.1:9443"
+
+[enroll]
+# 註冊通道（8444）：受理 pulse enroll 的新註冊；不開放新註冊時改為 renew_only 或 closed
+mode = "open"
+
+[pki]
+mode = "online"
+server_ca_path = "/opt/kairos/data/pki/root-ca.pem"
+organization = "Kairos"

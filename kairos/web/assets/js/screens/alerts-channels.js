@@ -5,11 +5,14 @@
 // - 權限：管理員（channels:write）新增、修改、刪除；維運者（channels:read＋channels:test）只能看與寄送測試。
 // - 機密（SMTP 密碼、Webhook 網址、標頭、HMAC 金鑰、LINE token）只顯示遮蔽值，只能更換不能檢視；PUT 只送出更換的欄位。
 // - 狀態 secrets_unavailable：機密無法解開（alerts-secrets.key 遺失或不成對，KRS-E5110），寫出處理方式。
-// - 測試通知的限速（429，KRS-W5111）：寫出是哪一種限制與幾秒後再試。
+// - 測試通知的限速（429，KRS-W5111；screens.md S11、copywriting.md 範例 93）：按鈕下方就地顯示並倒數 Retry-After，
+//   倒數期間按鈕 aria-disabled（不用 disabled，報讀器仍讀得到原因）；上一次的測試結果保留不清除。
+//   驗證失敗的限速（KRS-W6011，同為 429）依 product_code 區分，照一般錯誤呈現。
+// - 機密無法解開時「寄送測試通知」停用（aria-disabled）並說明原因；狀態欄為「失敗」、原因「無法解開機密」。
 // - 0.7.0 隱藏（decisions/INTEGRATION.md §28.6）：每日彙整、Email 的 HTML 版（「內容格式」只有純文字）、Alertmanager 相容格式、
 //   代理伺服器欄位（LINE、Teams 需要直接連外）。
 
-import { h, icon, uid, mount } from '../core/dom.js';
+import { h, icon, uid, mount, announce } from '../core/dom.js';
 import { t, has, severityLabel } from '../core/strings.js';
 import { api } from '../core/api.js';
 import * as session from '../core/session.js';
@@ -28,6 +31,8 @@ const MASK = '••••';
 function stateBadge(ch) {
   const map = { ok: 'online', failed: 'critical', secrets_unavailable: 'critical', disabled: 'unknown' };
   if (ch.state === 'ok' && ch.rules_using === 0) return statusBadge('unknown', t('alerts.ch.state.unused'));
+  // 機密無法解開：狀態「失敗」、原因「無法解開機密」（screens.md S11 0.7、alerts-ux.md 5.5）
+  if (ch.state === 'secrets_unavailable') return h('span', null, statusBadge('critical', t('alerts.ch.state.failed')), ' ', h('span', { class: 'caption' }, t('alerts.ch.state.secretsReason')));
   return statusBadge(map[ch.state] || 'unknown', has(`alerts.ch.state.${ch.state}`) ? t(`alerts.ch.state.${ch.state}`) : ch.state);
 }
 
@@ -51,27 +56,111 @@ function lastSend(ch) {
 }
 
 /** 機密無法解開的說明（KRS-E5110；ALERTS.md 第 6 節） */
-function secretsNotice(n) {
+function secretsNotice(n, { single = false } = {}) {
   return inlineAlert({
     kind: 'error',
-    title: t('alerts.ch.secretsTitle', { n }),
+    title: single ? t('alerts.ch.secretsTitleOne') : t('alerts.ch.secretsTitle', { n }),
     code: 'KRS-E5110',
     body: h('div', null, h('p', null, t('alerts.ch.secretsReason')), h('ol', { class: 'k-fix-steps' }, h('li', null, t('alerts.ch.secretsFix1')), h('li', null, t('alerts.ch.secretsFix2')))),
   });
 }
 
-/** 測試通知的結果（就地顯示；429 寫出限制） */
+/** 測試通知太頻繁（KRS-W5111）；驗證失敗的限速 KRS-W6011 也是 429，依 product_code 區分（copywriting.md §3.4） */
+function isTestLimit(err) {
+  return Boolean(err && err.status === 429 && (err.productCode === 'KRS-W5111' || (!err.productCode && err.details && err.details.scope)));
+}
+
+/**
+ * 「寄送測試通知」按鈕的就地結果與限速倒數（screens.md S11；copywriting.md 範例 93）。
+ * - out：上一次的結果（成功、未送達、錯誤）；限速時保留不清除。
+ * - limit：按鈕正下方的限速訊息（aria-live="polite"，插入時朗讀一次；畫面上的秒數每秒更新，不重複朗讀）。
+ * - blocked：機密無法解開等，按鈕 aria-disabled 並以 aria-describedby 說明原因。
+ */
+function testControl(btn, send, { blocked = null } = {}) {
+  const out = h('div', { 'aria-live': 'polite', class: 'k-test-out' });
+  const limit = h('div', { 'aria-live': 'polite', class: 'k-test-limit' });
+  const reasonId = uid('test-reason');
+  let until = 0;
+  let timer = null;
+  let counter = null;
+  const left = () => Math.max(0, Math.ceil((until - Date.now()) / 1000));
+  function setDisabled(on, describedBy) {
+    if (on) {
+      btn.setAttribute('aria-disabled', 'true');
+      btn.setAttribute('aria-describedby', describedBy);
+    } else {
+      btn.removeAttribute('aria-disabled');
+      btn.removeAttribute('aria-describedby');
+    }
+  }
+  function clearLimit() {
+    clearInterval(timer);
+    timer = null;
+    until = 0;
+    mount(limit);
+    if (!blocked) setDisabled(false);
+  }
+  function startLimit(err) {
+    const d = err.details || {};
+    until = Date.now() + Math.max(1, Number(err.retryAfter) || 60) * 1000;
+    counter = h('span', { class: 'k-countdown', 'aria-hidden': 'true' }, String(left()));
+    const scope = d.scope === 'channel' ? t('alerts.test.limitedChannel', { n: d.limit ?? 3, s: d.window_secs ?? 60 }) : t('alerts.test.limitedUser', { n: d.limit ?? 10, m: Math.round((d.window_secs || 600) / 60) });
+    const alert = inlineAlert({
+      kind: 'warning',
+      title: t('alerts.test.limited'),
+      code: err.productCode || 'KRS-W5111',
+      body: h(
+        'div',
+        null,
+        h('p', null, scope),
+        // 畫面上的秒數每秒更新；報讀器只在出現時讀一次（隱藏文字為當下的秒數）
+        h('p', null, counter, h('span', { class: 'ds-visually-hidden' }, String(left())), t('alerts.test.retryAfter')),
+      ),
+    });
+    alert.id = reasonId;
+    mount(limit, alert);
+    setDisabled(true, reasonId);
+    clearInterval(timer);
+    timer = setInterval(() => {
+      if (!btn.isConnected) {
+        clearInterval(timer);
+        return;
+      }
+      if (left() <= 0) {
+        clearLimit();
+        return;
+      }
+      counter.textContent = String(left());
+    }, 1000);
+  }
+  if (blocked) {
+    const note = h('p', { class: 'ds-field__hint', id: reasonId }, blocked);
+    limit.appendChild(note);
+    setDisabled(true, reasonId);
+  }
+  btn.addEventListener('click', async (ev) => {
+    if (btn.getAttribute('aria-disabled') === 'true') {
+      ev.preventDefault();
+      announce(blocked || t('alerts.test.wait', { s: left() }));
+      return;
+    }
+    setBusy(btn, true, t('alerts.test.sending'));
+    try {
+      const r = await send();
+      clearLimit();
+      mount(out, testResult(r));
+    } catch (err) {
+      if (isTestLimit(err)) startLimit(err);
+      else mount(out, testResult(null, err));
+    }
+    setBusy(btn, false, true);
+  });
+  return { out, limit };
+}
+
+/** 測試通知的結果（就地顯示） */
 function testResult(res, err) {
   if (err) {
-    if (err.status === 429) {
-      const d = err.details || {};
-      return inlineAlert({
-        kind: 'warning',
-        title: t('alerts.test.limited'),
-        code: err.productCode || 'KRS-W5111',
-        body: h('p', null, d.scope === 'channel' ? t('alerts.test.limitedChannel', { n: d.limit, s: d.window_secs }) : t('alerts.test.limitedUser', { n: d.limit, m: Math.round((d.window_secs || 600) / 60) }), ' ', t('alerts.test.retryAfter', { s: err.retryAfter || '—' })),
-      });
-    }
     if (err.code === 'channel_invalid') {
       return inlineAlert({ kind: 'error', title: t('alerts.test.invalid'), code: err.productCode, body: err.message });
     }
@@ -127,17 +216,6 @@ function renderList(ctx) {
   );
   mount(body, skeletonBlock(5));
 
-  async function testRow(ch, btn, out) {
-    setBusy(btn, true, t('alerts.test.sending'));
-    try {
-      const r = await api(`/api/v1/channels/${encodeURIComponent(ch.channel_id)}/test`, { method: 'POST', body: {} });
-      mount(out, testResult(r));
-    } catch (err) {
-      mount(out, testResult(null, err));
-    }
-    setBusy(btn, false, true);
-  }
-
   async function load() {
     try {
       const list = await api('/api/v1/channels');
@@ -155,11 +233,9 @@ function renderList(ctx) {
         return;
       }
       const locked = list.filter((c) => c.state === 'secrets_unavailable').length;
-      const out = h('div', { 'aria-live': 'polite' });
       mount(
         body,
         locked ? secretsNotice(locked) : null,
-        out,
         h(
           'div',
           { class: 'ds-card ds-card--flush' },
@@ -184,10 +260,13 @@ function renderList(ctx) {
                 'tbody',
                 null,
                 list.map((ch) => {
-                  const btn = canTest && ch.state !== 'secrets_unavailable' && ch.enabled
-                    ? button({ text: t('alerts.test.button'), size: 'sm', attrs: { 'aria-label': t('alerts.test.aria', { name: ch.name }) } })
+                  // 每列在按鈕下方有自己的結果與限速訊息；機密無法解開時按鈕停用並說明
+                  const btn = canTest && ch.enabled ? button({ text: t('alerts.test.button'), size: 'sm', attrs: { 'aria-label': t('alerts.test.aria', { name: ch.name }) } }) : null;
+                  const ctl = btn
+                    ? testControl(btn, () => api(`/api/v1/channels/${encodeURIComponent(ch.channel_id)}/test`, { method: 'POST', body: {} }), {
+                        blocked: ch.state === 'secrets_unavailable' ? t('alerts.test.blockedSecrets') : null,
+                      })
                     : null;
-                  if (btn) btn.addEventListener('click', () => testRow(ch, btn, out));
                   return h(
                     'tr',
                     { dataset: { key: ch.channel_id } },
@@ -197,7 +276,7 @@ function renderList(ctx) {
                     h('td', null, targetText(ch)),
                     h('td', { class: 'num' }, fmt.num(ch.rules_using || 0)),
                     h('td', null, lastSend(ch)),
-                    canTest ? h('td', null, btn) : null,
+                    canTest ? h('td', { class: 'k-test-cell' }, btn, ctl ? [ctl.limit, ctl.out] : null) : null,
                   );
                 }),
               ),
@@ -483,32 +562,31 @@ function renderDetail(ctx, id) {
     }
 
     // ---- 測試通知 ----
-    const testOut = h('div', { 'aria-live': 'polite', class: 'k-test-out' });
     const testSev = h('select', { class: 'ds-select', name: 'test_severity' }, ['emergency', 'critical', 'warning'].map((s) => h('option', { value: s }, severityLabel(s))));
     const testBtn = button({ text: t('alerts.test.button'), iconName: 'bell', attrs: { id: 'ch-test' } });
     const testNote = h('p', { class: 'ds-field__hint' }, isNew ? t('alerts.test.unsavedNote') : t('alerts.test.savedNote'));
-    testBtn.addEventListener('click', async () => {
-      clearErrors();
-      setBusy(testBtn, true, t('alerts.test.sending'));
-      try {
-        let r;
-        if (isNew) {
-          r = await api('/api/v1/channels/test', { method: 'POST', body: { kind, name: f.name.value.trim() || undefined, config: readConfig(), secrets: readSecrets({ full: true }), severity: testSev.value } });
-        } else {
-          r = await api(`/api/v1/channels/${encodeURIComponent(ch.channel_id)}/test`, { method: 'POST', body: { severity: testSev.value } });
+    const testCtl = testControl(
+      testBtn,
+      async () => {
+        clearErrors();
+        try {
+          if (isNew) {
+            return await api('/api/v1/channels/test', { method: 'POST', body: { kind, name: f.name.value.trim() || undefined, config: readConfig(), secrets: readSecrets({ full: true }), severity: testSev.value } });
+          }
+          return await api(`/api/v1/channels/${encodeURIComponent(ch.channel_id)}/test`, { method: 'POST', body: { severity: testSev.value } });
+        } catch (err) {
+          if (err.code === 'channel_invalid') showParamError(err);
+          throw err;
         }
-        mount(testOut, testResult(r));
-      } catch (err) {
-        if (err.code === 'channel_invalid') showParamError(err);
-        mount(testOut, testResult(null, err));
-      }
-      setBusy(testBtn, false, true);
-    });
-    const canRunTest = isNew ? canWrite : canTest && ch.state !== 'secrets_unavailable';
+      },
+      // 機密無法解開：「寄送測試通知」停用並說明（screens.md S11）
+      { blocked: !isNew && ch.state === 'secrets_unavailable' ? t('alerts.test.blockedSecrets') : null },
+    );
+    const canRunTest = isNew ? canWrite : canTest;
     const testCard = canRunTest
       ? card({
           title: t('alerts.test.title'),
-          body: [h('div', { class: 'k-row' }, h('label', { class: 'k-labelled-select' }, t('alerts.test.severity'), testSev), testBtn), testNote, testOut],
+          body: [h('div', { class: 'k-row' }, h('label', { class: 'k-labelled-select' }, t('alerts.test.severity'), testSev), testBtn), testCtl.limit, testNote, testCtl.out],
         })
       : null;
 
@@ -518,7 +596,7 @@ function renderDetail(ctx, id) {
     const form = h(
       'form',
       { novalidate: true, class: 'k-stack' },
-      ch.state === 'secrets_unavailable' ? secretsNotice(1) : null,
+      ch.state === 'secrets_unavailable' ? secretsNotice(1, { single: true }) : null,
       ro ? inlineAlert({ kind: 'info', title: t('alerts.ch.operatorTitle'), body: t('alerts.ch.operatorBody') }) : null,
       card({ title: t(`alerts.ch.section.${kind}`), body: [fields.name, h('label', { class: 'ds-checkbox' }, f.enabled, t('alerts.ch.f.enabled')), ...kindBody] }),
       card({
@@ -635,7 +713,8 @@ function renderDetail(ctx, id) {
     const confirmF = field({ label: t('alerts.ch.del.type', { name: ch.name }), input: confirmIn, required: true });
     const repSel = h('select', { class: 'ds-select', name: 'replacement', 'aria-label': t('alerts.ch.del.replaceWith') }, others.map((o) => h('option', { value: o.channel_id }, o.name)));
     const errBox = h('div');
-    const ok = button({ text: t('alerts.ch.delete'), variant: 'danger' });
+    // 對話框內的確認按鈕不加「…」、重複標題的動詞（copywriting.md §1.2）
+    const ok = button({ text: t('alerts.ch.deleteConfirm'), variant: 'danger' });
     const cancel = button({ text: t('common.cancel'), onClick: () => d.close() });
     const choice = rules.length
       ? h(

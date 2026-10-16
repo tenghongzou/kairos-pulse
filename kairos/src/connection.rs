@@ -36,7 +36,8 @@ use crate::rate::{
     TokenBucket,
 };
 use crate::registry::{
-    BACKFILL_LAG_MS, ClientChain, HelloInfo, KickReason, LastReport, RegisterKind, Registry, Touch,
+    AssetSummary, BACKFILL_LAG_MS, ClientChain, FsLast, HelloInfo, IoLast, KickReason, LastReport,
+    RegisterKind, Registry, ReportDetail, Touch,
 };
 use crate::shutdown::{CONNECTIONS_DEADLINE, Shutdown, drain_limit};
 use crate::stats::WriteOutcome;
@@ -45,6 +46,10 @@ use crate::throttle::{Category, Key, LogThrottle};
 use crate::throttled;
 use crate::tls::{
     MSG_CERTIFICATE_REJECTED, RevocationFailure, TlsState, revocation_failure, verify_chain,
+};
+use kairos_proto::{
+    FEATURE_INVENTORY, FEATURE_PROCESSES, INVENTORY_MIN_INTERVAL_MS, InventoryReport,
+    validate_inventory, validate_process_list,
 };
 
 /// 送出 close_notify 後，讀取並丟棄對方剩餘資料的最長時間（平常；關機期間另有更短的上限）。
@@ -132,6 +137,19 @@ pub struct ConnContext {
     pub report_limiter: Arc<ReportLimiter>,
     /// 註冊服務：8443 的 `renew`、`deregister`、除役後的 hello 判定（SQLite 時）
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
+    /// 資產的寫入佇列（SQLite 時）。有值時宣告 `inventory`、`processes`（METRICS.md 第 7.1 節）
+    pub assets: Option<crate::store::AssetSink>,
+}
+
+/// Kairos 宣告的 feature：[`SERVER_FEATURES`]，儲存後端保存資產與行程時（SQLite）另加 `inventory`、
+/// `processes`（與 `renew` 相同，不在共用的 `SERVER_FEATURES` 中；METRICS.md 第 7.1 節）
+pub fn server_features(assets: bool) -> Vec<&'static str> {
+    let mut f = SERVER_FEATURES.to_vec();
+    if assets {
+        f.push(FEATURE_INVENTORY);
+        f.push(FEATURE_PROCESSES);
+    }
+    f
 }
 
 type Transport = Framed<TlsStream<TcpStream>, NdjsonCodec>;
@@ -178,7 +196,9 @@ enum Incoming {
 
 /// `renew_request`／`deregister` 的 `type`（PROTOCOL.md「憑證輪替與除役」）
 fn is_lifecycle_type(kind: &str) -> bool {
-    matches!(kind, "renew_request" | "deregister")
+    // inventory（feature `inventory`，crates/kairos-proto/METRICS.md）：協商了時格式錯誤回 bad_request，
+    // 沒有協商時與舊版相同，回 unknown_type
+    matches!(kind, "renew_request" | "deregister" | "inventory")
 }
 
 /// 8443 的註冊 feature（`renew`、`deregister`）是否使用：協商為 v2、Kairos 有註冊服務、client 也宣告，
@@ -214,6 +234,10 @@ fn classify(frame: Frame) -> Incoming {
                         kind: "deregister".into(),
                         message,
                     },
+                    ClientMsg::Inventory(_) => Incoming::InvalidLifecycle {
+                        kind: "inventory".into(),
+                        message,
+                    },
                     _ => Incoming::BadRequest {
                         seq: match &msg {
                             ClientMsg::Hello { seq, .. } => Some(*seq),
@@ -235,6 +259,9 @@ fn classify(frame: Frame) -> Incoming {
         },
     }
 }
+
+/// 資產資訊不合法（METRICS.md 第 14 節；設計包 `copywriting.md` 範例 96，2026-10-15 正式分配）
+pub const CODE_INVALID_INVENTORY: &str = "KRS-W2108";
 
 /// 一個 MB（agents.json 的 `total_memory`／`used_memory` 單位，與 v1 report 相同）
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -275,6 +302,10 @@ fn last_report_of(record: &ReportRecord) -> LastReport {
             )
         }
     };
+    let detail = match &record.body {
+        RecordBody::Metrics { metrics } => report_detail(metrics),
+        RecordBody::Legacy { .. } => ReportDetail::default(),
+    };
     LastReport {
         recv_at: fmt_time(record.recv_at),
         seq: record.seq,
@@ -283,7 +314,125 @@ fn last_report_of(record: &ReportRecord) -> LastReport {
         total_memory,
         used_memory,
         metrics,
+        detail,
     }
+}
+
+/// report 中 F4 指標的摘要（registry 的 `LastReport`：告警與主控台的「目前數值」）。速率由 registry
+/// 以上一筆算出；沒有 `system.filesystem.usage` 的掛載點以 total 與 available 推算（METRICS.md 第 9.2 節）
+fn report_detail(metrics: &[Metric]) -> ReportDetail {
+    use kairos_proto::{
+        METRIC_CPU_LOAD_1M, METRIC_CPU_LOAD_5M, METRIC_CPU_LOAD_15M, METRIC_DISK_READ,
+        METRIC_DISK_WRITTEN, METRIC_FILESYSTEM_AVAILABLE, METRIC_FILESYSTEM_TOTAL,
+        METRIC_FILESYSTEM_USAGE, METRIC_FILESYSTEM_USED, METRIC_MEMORY_AVAILABLE,
+        METRIC_NETWORK_RECEIVED, METRIC_NETWORK_TRANSMITTED, METRIC_PROCESS_COUNT,
+        METRIC_SWAP_TOTAL, METRIC_SWAP_USED, METRIC_UPTIME, standard_metric,
+    };
+    let mut d = ReportDetail::default();
+    // 只採用單位與標準相符的標準指標（自訂或單位不符的同名指標不採用）
+    let std_ok = |m: &Metric| standard_metric(&m.name).is_some_and(|s| s.unit == m.unit);
+    let fs_of = |d: &mut ReportDetail, m: &Metric| -> Option<usize> {
+        let mp = m.labels.get("mountpoint")?;
+        let i = match d.filesystems.iter().position(|f| &f.mountpoint == mp) {
+            Some(i) => i,
+            None => {
+                if d.filesystems.len() >= 64 {
+                    return None;
+                }
+                d.filesystems.push(FsLast {
+                    mountpoint: mp.clone(),
+                    fstype: m.labels.get("fstype").cloned(),
+                    ..Default::default()
+                });
+                d.filesystems.len() - 1
+            }
+        };
+        Some(i)
+    };
+    let io_of = |list: &mut Vec<IoLast>, m: &Metric| -> Option<usize> {
+        let dev = m.labels.get("device")?;
+        match list.iter().position(|f| &f.device == dev) {
+            Some(i) => Some(i),
+            None if list.len() < 64 => {
+                list.push(IoLast {
+                    device: dev.clone(),
+                    ..Default::default()
+                });
+                Some(list.len() - 1)
+            }
+            None => None,
+        }
+    };
+    for m in metrics.iter().filter(|m| std_ok(m)) {
+        let u = m.value.as_u64();
+        let f = m.value.as_f64();
+        match m.name.as_str() {
+            METRIC_UPTIME if m.labels.is_empty() => d.uptime_secs = u,
+            METRIC_MEMORY_AVAILABLE if m.labels.is_empty() => d.memory_available = u,
+            METRIC_SWAP_TOTAL if m.labels.is_empty() => d.swap_total = u,
+            METRIC_SWAP_USED if m.labels.is_empty() => d.swap_used = u,
+            METRIC_CPU_LOAD_1M if m.labels.is_empty() => d.load_1m = f,
+            METRIC_CPU_LOAD_5M if m.labels.is_empty() => d.load_5m = f,
+            METRIC_CPU_LOAD_15M if m.labels.is_empty() => d.load_15m = f,
+            METRIC_PROCESS_COUNT if m.labels.is_empty() => d.process_count = u,
+            METRIC_FILESYSTEM_TOTAL => {
+                if let Some(i) = fs_of(&mut d, m) {
+                    d.filesystems[i].total = u;
+                }
+            }
+            METRIC_FILESYSTEM_AVAILABLE => {
+                if let Some(i) = fs_of(&mut d, m) {
+                    d.filesystems[i].available = u;
+                }
+            }
+            METRIC_FILESYSTEM_USED => {
+                if let Some(i) = fs_of(&mut d, m) {
+                    d.filesystems[i].used = u;
+                }
+            }
+            METRIC_FILESYSTEM_USAGE => {
+                if let Some(i) = fs_of(&mut d, m) {
+                    d.filesystems[i].usage = f;
+                }
+            }
+            METRIC_NETWORK_RECEIVED => {
+                if let Some(i) = io_of(&mut d.network, m) {
+                    d.network[i].rx = u;
+                }
+            }
+            METRIC_NETWORK_TRANSMITTED => {
+                if let Some(i) = io_of(&mut d.network, m) {
+                    d.network[i].tx = u;
+                }
+            }
+            METRIC_DISK_READ => {
+                if let Some(i) = io_of(&mut d.disks, m) {
+                    d.disks[i].rx = u;
+                }
+            }
+            METRIC_DISK_WRITTEN => {
+                if let Some(i) = io_of(&mut d.disks, m) {
+                    d.disks[i].tx = u;
+                }
+            }
+            _ => {}
+        }
+    }
+    for fs in &mut d.filesystems {
+        if fs.usage.is_none()
+            && let (Some(t), Some(a)) = (fs.total, fs.available)
+        {
+            fs.usage = crate::store::derive::estimated_usage(t as f64, a as f64);
+            fs.estimated = fs.usage.is_some();
+        }
+        if fs.used.is_none()
+            && fs.estimated
+            && let (Some(t), Some(a)) = (fs.total, fs.available)
+        {
+            fs.used = Some(t.saturating_sub(a));
+        }
+    }
+    d
 }
 
 /// 計算 `now + duration` 的期限；溢位時退回較短的期限，避免 `Instant + Duration` panic
@@ -635,6 +784,10 @@ struct Conn {
     enroll: Option<Arc<crate::enroll::EnrollService>>,
     /// 事件匯流排（身分驗證失敗、除役、狀態表淘汰；[`crate::bus`]）
     bus: Arc<crate::bus::EventBus>,
+    /// 上一則接受（通過檢查、送去保存）的 `inventory` 的時間（每條連線最多每 60 秒一則）
+    last_inventory: Option<Instant>,
+    /// 資產的寫入佇列（SQLite 時；有值時宣告 `inventory`、`processes`）
+    assets: Option<crate::store::AssetSink>,
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
@@ -711,6 +864,8 @@ pub async fn handle_connection(
         messages: TokenBucket::new(MESSAGE_BURST, MESSAGES_PER_SEC, std::time::Instant::now()),
         enroll: ctx.enroll.clone(),
         bus: ctx.registry.bus(),
+        last_inventory: None,
+        assets: ctx.assets.clone(),
     };
 
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
@@ -826,7 +981,10 @@ impl Conn {
     /// 沒有宣告的 client（0.4 以前的 Pulse）收到的 `hello_ack` 與 0.4 的 Kairos 完全相同
     async fn send_hello_ack(&mut self, agent: &Agent, offline_ms: u64) -> Result<(), Error> {
         let (features, server_time) = if agent.session.is_v2() {
-            let mut f: Vec<String> = SERVER_FEATURES.iter().map(|f| f.to_string()).collect();
+            let mut f: Vec<String> = server_features(self.assets.is_some())
+                .iter()
+                .map(|f| f.to_string())
+                .collect();
             if agent.renew {
                 f.push(FEATURE_RENEW.to_string());
             }
@@ -1304,7 +1462,10 @@ impl Conn {
                 // 不重置連續無效訊息的計數（避免與 bad_request 交錯送出來繞過上限）。
                 // hello 之前的 renew_request／deregister 與舊版相同，視為不認得的 type
                 Incoming::Msg(
-                    ClientMsg::Unknown | ClientMsg::RenewRequest(_) | ClientMsg::Deregister(_),
+                    ClientMsg::Unknown
+                    | ClientMsg::RenewRequest(_)
+                    | ClientMsg::Deregister(_)
+                    | ClientMsg::Inventory(_),
                 )
                 | Incoming::InvalidLifecycle { .. } => self.reply_unknown_type().await?,
             };
@@ -1370,7 +1531,11 @@ impl Conn {
             Ok(offer) => offer.features.clone().unwrap_or_default(),
             Err(_) => Vec::new(), // client_proto_range 已拒絕
         };
-        let session = Session::new(version, SERVER_FEATURES, &client_features);
+        let session = Session::new(
+            version,
+            &server_features(self.assets.is_some()),
+            &client_features,
+        );
         let host = if session.is_v2() {
             let checked = validate_features(&client_features).and_then(|()| {
                 let host = ext.host.map_err(|e| format!("invalid message: {e}"))?;
@@ -1472,9 +1637,15 @@ impl Conn {
                 return Ok(());
             }
         };
-        // 主控台 API 的「支援補送」與主機詳情（A5）
+        // 主控台 API 的「支援補送」與主機詳情（A5）、資產與行程的支援（METRICS.md）
         ctx.registry
             .set_durable(&agent.agent_id, self.conn_id, agent.session.durable);
+        ctx.registry.set_features(
+            &agent.agent_id,
+            self.conn_id,
+            agent.session.inventory,
+            agent.session.processes,
+        );
         if let Some(evicted) = &registration.evicted {
             throttled!(
                 self.throttle,
@@ -1685,6 +1856,128 @@ impl Conn {
         }
     }
 
+    /// `inventory`（協商了 feature `inventory`；METRICS.md 第 6.2 節）：內容不符 `validate_inventory` →
+    /// `invalid_report`（`KRS-W2108`）；距離上一則不到 60 秒 → `storage_unavailable`；保存後 `ack`，
+    /// 寫入失敗 → `storage_unavailable`。計入訊息速率與連續無效訊息，不計入 report 的速率限制
+    async fn handle_inventory(
+        &mut self,
+        ctx: &ConnContext,
+        agent: &Agent,
+        inv: InventoryReport,
+        received_at: DateTime<Utc>,
+    ) -> Result<Handled, Error> {
+        self.bad_requests = 0;
+        if !self.touch(ctx, agent) {
+            return Ok(Handled::alive(self.reply_superseded(agent).await?));
+        }
+        let seq = inv.seq;
+        if let Err(message) = validate_inventory(&inv.inventory) {
+            throttled!(
+                self.throttle,
+                (Category::InvalidReport, self.peer.ip()),
+                warn,
+                "警告 {}：已拒絕 {}（agent {}）送出的資產資訊：內容不合法：{}。這一次的資產資訊（inventory seq={}）沒有保存，主控台仍顯示上一次的內容；指標回報不受影響。處理方式：確認這台主機的 Pulse 是正式版本，若是請以 pulse diag 產生診斷包並回報 [#{}]",
+                CODE_INVALID_INVENTORY,
+                agent.hostname.escape_debug(),
+                agent.agent_id,
+                message,
+                seq,
+                self.conn_id
+            );
+            ctx.registry
+                .set_inventory_rejected(&agent.agent_id, self.conn_id, &message);
+            let flow = self
+                .reply(ServerMsg::error(
+                    Some(seq),
+                    ErrorCode::InvalidReport,
+                    message,
+                ))
+                .await?;
+            return Ok(Handled::alive(flow));
+        }
+        let now = Instant::now();
+        let min_interval = Duration::from_millis(INVENTORY_MIN_INTERVAL_MS);
+        if self
+            .last_inventory
+            .is_some_and(|t| now.saturating_duration_since(t) < min_interval)
+        {
+            debug!(
+                "[#{}] agent {} 的 inventory seq={} 距離上一則不到 60 秒，不保存",
+                self.conn_id, agent.agent_id, seq
+            );
+            let flow = self
+                .reply(ServerMsg::error(
+                    Some(seq),
+                    ErrorCode::StorageUnavailable,
+                    "inventory rate limit exceeded",
+                ))
+                .await?;
+            return Ok(Handled::alive(flow));
+        }
+        self.last_inventory = Some(now);
+        let Some(sink) = self.assets.clone() else {
+            // 宣告 inventory 時一定有寫入佇列；防禦性處理
+            return Ok(Handled::not_alive(self.reply_unknown_type().await?));
+        };
+        let received_ms = received_at.timestamp_millis();
+        // ts 是收集資產的時間；無法解析或與收到的時間相差超過 5 分鐘（或早於 1 天）時以收到的時間代替
+        let collected_ms = DateTime::parse_from_rfc3339(&inv.ts)
+            .ok()
+            .map(|t| t.timestamp_millis())
+            .filter(|t| *t <= received_ms + 300_000 && *t >= received_ms - 86_400_000)
+            .unwrap_or(received_ms);
+        let write = crate::store::AssetWrite {
+            agent_id: agent.agent_id.clone(),
+            hostname: agent.hostname.clone(),
+            peer: self.peer.to_string(),
+            collected_ms,
+            received_ms,
+            inventory: inv.inventory,
+        };
+        match sink.write(write, self.write_timeout).await {
+            Ok(outcome) => {
+                ctx.registry.set_assets(
+                    &agent.agent_id,
+                    self.conn_id,
+                    AssetSummary {
+                        logical_cores: outcome.logical_cores,
+                        os_family: outcome.os_family.clone(),
+                    },
+                );
+                debug!(
+                    "[#{}] agent {} inventory seq={}（{}）",
+                    self.conn_id,
+                    agent.agent_id,
+                    seq,
+                    if outcome.first {
+                        "首次收到資產"
+                    } else if outcome.changed {
+                        "資產已改變"
+                    } else {
+                        "與上次相同"
+                    }
+                );
+                Ok(Handled::alive(self.reply(ServerMsg::Ack { seq }).await?))
+            }
+            Err(reason) => {
+                debug!(
+                    "[#{}] agent {} 的 inventory seq={} 未保存: {}",
+                    self.conn_id, agent.agent_id, seq, reason
+                );
+                // 未保存：下一則不受 60 秒限制
+                self.last_inventory = None;
+                let flow = self
+                    .reply(ServerMsg::error(
+                        Some(seq),
+                        ErrorCode::StorageUnavailable,
+                        "report could not be stored",
+                    ))
+                    .await?;
+                Ok(Handled::alive(flow))
+            }
+        }
+    }
+
     async fn handle_registered(
         &mut self,
         ctx: &ConnContext,
@@ -1705,6 +1998,10 @@ impl Conn {
                 let flow = if kind == "renew_request" && agent.renew && self.enroll.is_some() {
                     self.reply_bad_request(None, format!("invalid renew_request: {message}"))
                         .await?
+                } else if kind == "inventory" && agent.session.inventory {
+                    // 協商了 inventory：格式錯誤（型別、ts）與其他訊息相同，bad_request（seq 為 null）
+                    self.reply_bad_request(None, format!("invalid inventory: {message}"))
+                        .await?
                 } else {
                     self.reply_unknown_type().await?
                 };
@@ -1720,11 +2017,15 @@ impl Conn {
                 Some(svc) => self.handle_renew(&svc, agent, *req).await,
                 None => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
             },
-            // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限。沒有協商 renew 的 renew_request、
-            // 一般連線上的 deregister 與舊版相同，視為不認得的 type
-            ClientMsg::Unknown | ClientMsg::RenewRequest(_) | ClientMsg::Deregister(_) => {
-                Ok(Handled::not_alive(self.reply_unknown_type().await?))
+            ClientMsg::Inventory(inv) if agent.session.inventory => {
+                self.handle_inventory(ctx, agent, *inv, received_at).await
             }
+            // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限。沒有協商 renew 的 renew_request、
+            // 一般連線上的 deregister、沒有協商 inventory 的 inventory 與舊版相同，視為不認得的 type
+            ClientMsg::Unknown
+            | ClientMsg::RenewRequest(_)
+            | ClientMsg::Deregister(_)
+            | ClientMsg::Inventory(_) => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
             ClientMsg::Hello { seq, .. } => {
                 self.bad_requests = 0;
                 if !self.touch(ctx, agent) {
@@ -1776,6 +2077,20 @@ impl Conn {
                         ));
                     }
                 };
+                // 行程排行（METRICS.md 第 5 節）：只在協商了 processes 的連線上解析；型別錯誤為
+                // bad_request，內容不符限制在下方與指標一起回 invalid_report。沒有協商時一律忽略
+                let processes = if agent.session.processes {
+                    match body.process_list() {
+                        Ok(p) => p.cloned(),
+                        Err(message) => {
+                            return Ok(Handled::not_alive(
+                                self.reply_bad_request(None, message).await?,
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
                 // durable（A5）：必須帶 boot_id／report_seq；缺漏、型別錯誤或不符限制與其他欄位
                 // 相同，回 bad_request（seq 為 null）、不算合法訊息。未協商 durable 時一律忽略
                 let dedup = if agent.session.durable {
@@ -1808,7 +2123,11 @@ impl Conn {
                         .await?;
                     return Ok(Handled::alive(flow));
                 }
-                if let Err(message) = content.validate() {
+                let checked = content.validate().and_then(|()| match &processes {
+                    Some(p) => validate_process_list(p).map_err(|e| format!("processes: {e}")),
+                    None => Ok(()),
+                });
+                if let Err(message) = checked {
                     // 不寫檔，但仍視為存活
                     if !self.touch(ctx, agent) {
                         return Ok(Handled::alive(self.reply_superseded(agent).await?));
@@ -1851,7 +2170,8 @@ impl Conn {
                     ts,
                     content.into_body(),
                 )
-                .with_dedup(dedup);
+                .with_dedup(dedup)
+                .with_processes(processes);
                 // ack 語意 = 已寫入資料庫或資料檔；等待 writer 回覆（受寫出逾時限制）
                 let revived = AtomicBool::new(false);
                 let outcome = store_report(
@@ -1980,6 +2300,43 @@ mod tests {
                 used_memory: 1,
             },
         )
+    }
+
+    #[test]
+    fn report_detail_collects_f4_metrics_and_estimates_missing_usage() {
+        let metrics: Vec<Metric> = serde_json::from_str(
+            r#"[{"name":"system.uptime","value":1532941,"unit":"s"},
+                {"name":"system.cpu.load_5m","value":1.98,"unit":"1"},
+                {"name":"system.swap.total","value":4294967296,"unit":"By"},
+                {"name":"system.swap.used","value":0,"unit":"By"},
+                {"name":"system.process.count","value":312,"unit":"{processes}"},
+                {"name":"system.filesystem.total","value":1000,"unit":"By","labels":{"mountpoint":"/","fstype":"ext4"}},
+                {"name":"system.filesystem.available","value":250,"unit":"By","labels":{"mountpoint":"/","fstype":"ext4"}},
+                {"name":"system.filesystem.total","value":100,"unit":"By","labels":{"mountpoint":"/data"}},
+                {"name":"system.filesystem.usage","value":70.0,"unit":"%","labels":{"mountpoint":"/data"}},
+                {"name":"system.network.received","value":98765,"unit":"By","labels":{"device":"eth0"}},
+                {"name":"system.disk.written","value":5,"unit":"By","labels":{"device":"dm-0"}},
+                {"name":"system.uptime","value":7,"unit":"min"}]"#,
+        )
+        .unwrap();
+        let d = report_detail(&metrics);
+        assert_eq!(d.uptime_secs, Some(1_532_941), "單位不符的同名指標不採用");
+        assert_eq!(d.load_5m, Some(1.98));
+        assert_eq!(d.swap_percent(), Some(0.0));
+        assert_eq!(d.process_count, Some(312));
+        let root = &d.filesystems[0];
+        assert_eq!(root.mountpoint, "/");
+        assert_eq!(root.fstype.as_deref(), Some("ext4"));
+        assert_eq!(
+            (root.usage, root.estimated, root.used),
+            (Some(75.0), true, Some(750))
+        );
+        let data = &d.filesystems[1];
+        assert_eq!((data.usage, data.estimated), (Some(70.0), false));
+        assert_eq!(d.top_filesystem().unwrap().mountpoint, "/");
+        assert_eq!(d.network[0].rx, Some(98_765));
+        assert_eq!(d.disks[0].device, "dm-0");
+        assert_eq!(d.disks[0].tx, Some(5));
     }
 
     #[test]

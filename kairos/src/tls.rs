@@ -38,6 +38,10 @@ pub struct TlsPaths {
     pub issuing_cas: Option<String>,
     /// Kairos 產生的簽發 CA 的 CRL（`<data_dir>/pki/crl/issuing.crl`；不存在時沒有）
     pub issuing_crl: Option<String>,
+    /// 已退役的簽發 CA（`<data_dir>/pki/issuing-cas-retired.pem`，由 Kairos 寫出；不存在時沒有）。
+    /// 經過其中任何一張的用戶端憑證鏈一律拒絕，不論是哪一組信任錨驗證通過（PKI.md 第 15.4 節）。
+    /// 只在啟用 mTLS 時使用
+    pub retired_cas: Option<String>,
 }
 
 /// 監看的 TLS 設定檔種類（熱重載日誌用；F8）
@@ -84,6 +88,9 @@ impl TlsPaths {
             }
             if let Some(p) = &self.issuing_crl {
                 files.push((TlsFileKind::Crl, p.as_str()));
+            }
+            if let Some(p) = &self.retired_cas {
+                files.push((TlsFileKind::ClientCa, p.as_str()));
             }
         }
         files
@@ -142,8 +149,9 @@ pub fn build(paths: &TlsPaths) -> Result<TlsMaterial, Error> {
             let crls = crls.into_iter().map(|(_, _, crl)| crl).collect();
             let issuing = load_issuing(paths, &mut expiries)?;
             let issuing_crls = issuing.as_ref().map_or(0, |i| i.1.len());
+            let retired = load_retired(paths)?;
             (
-                Some(load_client_verifier(ca_path, crls, issuing)?),
+                Some(load_client_verifier(ca_path, crls, issuing, retired)?),
                 count + issuing_crls,
             )
         }
@@ -278,6 +286,34 @@ fn load_issuing(paths: &TlsPaths, expiries: &mut Vec<Expiry>) -> Result<Option<I
     Ok(Some((cas, crls)))
 }
 
+/// 讀取已退役的簽發 CA（檔案不存在時沒有；內容不是 PEM 憑證時回錯誤，與 `issuing-cas.pem` 相同）
+fn load_retired(paths: &TlsPaths) -> Result<Vec<RetiredCa>, Error> {
+    let Some(path) = &paths.retired_cas else {
+        return Ok(Vec::new());
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(Vec::new());
+    };
+    let certs = CertificateDer::pem_slice_iter(&bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pem_error(path, "已退役的簽發 CA 憑證", e))?;
+    certs
+        .into_iter()
+        .map(|c| {
+            let info = crate::pki::x509::parse_cert(c.as_ref()).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{path} 中的已退役簽發 CA 憑證無效: {e}"),
+                )
+            })?;
+            Ok(RetiredCa {
+                der: c.as_ref().to_vec(),
+                spki: info.spki_der,
+            })
+        })
+        .collect()
+}
+
 /// 以 auth.client_ca（可含多張 CA）與 CRL 建立客戶端憑證驗證器。
 ///
 /// 設定 CRL 時採用最嚴格的檢查（fail closed）：
@@ -288,11 +324,15 @@ fn load_issuing(paths: &TlsPaths, expiries: &mut Vec<Expiry>) -> Result<Option<I
 /// 另有 Kairos 簽發 CA（`issuing`）時，以兩個驗證器組成（[`CompositeVerifier`]）：用戶端憑證的簽發者是
 /// 簽發 CA 時，以簽發 CA 為唯一的信任錨、Kairos 產生的 CRL 驗證；其他以 `auth.client_ca` 與 `auth.crl`
 /// 驗證（與先前相同）。兩組的 CRL 分開：`auth.crl` 不必涵蓋簽發 CA，簽發 CA 的 CRL 也不會讓
-/// `auth.client_ca` 的憑證因缺少 CRL 而被拒（fail closed 的範圍不變）
+/// `auth.client_ca` 的憑證因缺少 CRL 而被拒（fail closed 的範圍不變）。
+///
+/// 有已退役的簽發 CA（`retired`）時，兩組驗證器之外再包一層 [`RetiredCaGuard`]：驗證通過的鏈若經過退役的
+/// 簽發 CA 仍拒絕（PKI.md 第 15.4 節）
 fn load_client_verifier(
     ca_path: &str,
     crls: Vec<CertificateRevocationListDer<'static>>,
     issuing: Option<Issuing>,
+    retired: Vec<RetiredCa>,
 ) -> Result<Arc<dyn ClientCertVerifier>, Error> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path, "CA 憑證")? {
@@ -349,8 +389,111 @@ fn load_client_verifier(
             })
         }
     };
+    let inner: Arc<dyn ClientCertVerifier> = if retired.is_empty() {
+        inner
+    } else {
+        Arc::new(RetiredCaGuard { inner, retired })
+    };
     // 驗證結果不變；被拒時把憑證歸屬到 agent_id 並記錄（設計包 §24 #3）
     Ok(Arc::new(RecordingVerifier { inner }))
+}
+
+/// 已退役的簽發 CA
+#[derive(Debug)]
+struct RetiredCa {
+    der: Vec<u8>,
+    /// SubjectPublicKeyInfo（DER）
+    spki: Vec<u8>,
+}
+
+/// 拒絕經過已退役簽發 CA 的用戶端憑證鏈（PKI.md 第 15.4 節）。
+///
+/// 簽發 CA 退役後不在 `issuing-cas.pem` 中，但 `auth.client_ca` 是根 CA 或代理 CA 時，用戶端自附那張簽發 CA
+/// 的憑證，鏈仍能經由 `auth.client_ca` 這組驗證器通過（`auth.client_ca` 直接含有退役的簽發 CA 時也一樣）。
+/// 內層驗證通過後另檢查用戶端送出的每一張憑證：它的公鑰是退役簽發 CA 的公鑰（自附的中繼憑證，含以同一把
+/// 金鑰重新簽出的憑證），或它由退役簽發 CA 簽出（簽發者名稱相符且簽章驗證通過），就以「已撤銷」拒絕
+/// （`KRS-W1105`；與撤銷相同，Pulse 端顯示 `PLS-E1105`）。內層驗證失敗時照原樣回傳
+#[derive(Debug)]
+struct RetiredCaGuard {
+    inner: Arc<dyn ClientCertVerifier>,
+    retired: Vec<RetiredCa>,
+}
+
+impl RetiredCaGuard {
+    fn through_retired(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+    ) -> bool {
+        std::iter::once(end_entity)
+            .chain(intermediates)
+            .any(|cert| {
+                let spki = crate::pki::x509::parse_cert(cert.as_ref())
+                    .ok()
+                    .map(|i| i.spki_der);
+                self.retired.iter().any(|r| {
+                    spki.as_deref() == Some(r.spki.as_slice())
+                        || crate::pki::x509::verify_cert_signature(cert.as_ref(), &r.der)
+                })
+            })
+    }
+}
+
+impl ClientCertVerifier for RetiredCaGuard {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, tokio_rustls::rustls::Error> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        if self.through_retired(end_entity, intermediates) {
+            return Err(tokio_rustls::rustls::Error::InvalidCertificate(
+                CertificateError::Revoked,
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
 }
 
 /// `auth.client_ca` 與 Kairos 簽發 CA 的兩組驗證器：依用戶端憑證的簽發者選擇
@@ -933,6 +1076,7 @@ mod tests {
             crls: crls.iter().map(|c| p(c)).collect(),
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         }
     }
 
@@ -1051,7 +1195,7 @@ mod tests {
 
     #[test]
     fn missing_client_ca_file_reports_path() {
-        let err = load_client_verifier("does-not-exist/ca.pem", Vec::new(), None)
+        let err = load_client_verifier("does-not-exist/ca.pem", Vec::new(), None, Vec::new())
             .err()
             .unwrap();
         assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -1063,7 +1207,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kairos-empty-ca-{}.pem", std::process::id()));
         std::fs::write(&path, "not a pem file\n").unwrap();
         let p = path.to_string_lossy().to_string();
-        let err = load_client_verifier(&p, Vec::new(), None).err().unwrap();
+        let err = load_client_verifier(&p, Vec::new(), None, Vec::new())
+            .err()
+            .unwrap();
         assert!(err.to_string().contains(&p), "{err}");
         std::fs::remove_file(&path).unwrap();
     }
@@ -1271,6 +1417,121 @@ mod tests {
         assert!(verify_chain(v.as_ref(), Some(&other), UnixTime::now()).is_err());
     }
 
+    /// 已退役的簽發 CA（PKI.md 第 15.1、15.4 節）：退役（不在 issuing-cas.pem、列在 issuing-cas-retired.pem）的
+    /// 簽發 CA 簽出的用戶端憑證，不論 `auth.client_ca` 是根 CA、退役的簽發 CA 本身或 `issuing-cas.pem`，
+    /// 也不論用戶端是否自附那張簽發 CA 的憑證，一律被拒（0.7 在 `auth.client_ca` 為根 CA 時會通過）；
+    /// 啟用中的簽發 CA 的憑證照常通過；被拒時以「已撤銷」歸屬到 agent_id
+    #[test]
+    fn retired_issuing_ca_chains_are_rejected_whatever_the_client_ca() {
+        use crate::pki::ca::{CaKey, new_root};
+        use crate::pki::x509::pem_encode;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let root = new_root("T", now_ms).unwrap();
+        let issuing = |cn: &str| {
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = root
+                .sign_issuing_ca(
+                    &rcgen::PublicKeyData::subject_public_key_info(&key),
+                    cn,
+                    1825,
+                    now_ms,
+                )
+                .unwrap();
+            CaKey::load(&pem_encode("CERTIFICATE", &cert.der), &key.serialize_pem()).unwrap()
+        };
+        let retired = issuing("Retired Issuing CA");
+        let active = issuing("Active Issuing CA");
+        let leaf = |ca: &CaKey, id: &str| {
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            ca.sign_client(
+                &rcgen::PublicKeyData::subject_public_key_info(&key),
+                id,
+                365,
+                now_ms,
+            )
+            .unwrap()
+            .der
+        };
+        let old_id = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+        let new_id = "6f1c0e4a-1b2c-4d3e-9f00-112233445567";
+        let old_leaf = leaf(&retired, old_id);
+        let new_leaf = leaf(&active, new_id);
+        let dir = std::env::temp_dir().join(format!("kairos-retired-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |n: &str, ders: &[&[u8]]| {
+            let f = dir.join(n);
+            let pem: String = ders.iter().map(|d| pem_encode("CERTIFICATE", d)).collect();
+            std::fs::write(&f, pem).unwrap();
+            f.to_string_lossy().into_owned()
+        };
+        let root_pem = w("root.pem", &[&root.cert_der]);
+        let retired_ca_pem = w("retired-ca.pem", &[&retired.cert_der]);
+        let issuing_cas = w("issuing-cas.pem", &[&active.cert_der]);
+        let retired_cas = w("issuing-cas-retired.pem", &[&retired.cert_der]);
+        let chain = |leaf: &[u8], ca: Option<&CaKey>| {
+            let mut c = vec![CertificateDer::from(leaf.to_vec())];
+            c.extend(ca.map(|ca| CertificateDer::from(ca.cert_der.clone())));
+            c
+        };
+        let with = |client_ca: &str| {
+            let mut tp = paths(None, &[]);
+            tp.client_ca = Some(client_ca.to_string());
+            tp.issuing_cas = Some(issuing_cas.clone());
+            tp.retired_cas = Some(retired_cas.clone());
+            build(&tp).unwrap().verifier.unwrap()
+        };
+        let now = UnixTime::now();
+        let revoked = |r: Result<(), ChainRejection>| {
+            assert_eq!(r.unwrap_err().revocation, Some(RevocationFailure::Revoked));
+        };
+        // auth.client_ca 為根 CA：自附退役簽發 CA 的鏈被拒（0.7 會通過），沒有自附時本來就不受信任
+        let v = with(&root_pem);
+        revoked(verify_chain(
+            v.as_ref(),
+            Some(&chain(&old_leaf, Some(&retired))),
+            now,
+        ));
+        assert!(verify_chain(v.as_ref(), Some(&chain(&old_leaf, None)), now).is_err());
+        // 啟用中的簽發 CA：只送 leaf（issuing-cas.pem）或自附中繼憑證（經由根 CA）都通過
+        assert!(verify_chain(v.as_ref(), Some(&chain(&new_leaf, None)), now).is_ok());
+        assert!(verify_chain(v.as_ref(), Some(&chain(&new_leaf, Some(&active))), now).is_ok());
+        // 被拒的憑證以「已撤銷」歸屬到 agent_id（主控台的「憑證被拒」）
+        assert_eq!(
+            rejections().get(old_id).map(|r| r.reason),
+            Some(RejectionReason::Revoked)
+        );
+        // auth.client_ca 直接是退役的簽發 CA（代理 CA 當信任錨）：只送 leaf 也被拒
+        revoked(verify_chain(
+            with(&retired_ca_pem).as_ref(),
+            Some(&chain(&old_leaf, None)),
+            now,
+        ));
+        // auth.client_ca 為 issuing-cas.pem（pki init 的設定）：與先前相同，被拒
+        assert!(
+            verify_chain(
+                with(&issuing_cas).as_ref(),
+                Some(&chain(&old_leaf, Some(&retired))),
+                now
+            )
+            .is_err()
+        );
+        // 退役清單是監看的檔案：retire 後寫出的清單會觸發熱重載
+        let mut tp = paths(Some("test-ca.crt"), &[]);
+        tp.retired_cas = Some(retired_cas.clone());
+        assert!(tp.watched_files().contains(&retired_cas.as_str()));
+        // 沒有退役清單（或清單為空）時不包一層，其他行為不變
+        let empty = w("empty-retired.pem", &[]);
+        let mut tp = paths(None, &[]);
+        tp.client_ca = Some(root_pem.clone());
+        tp.retired_cas = Some(empty);
+        let v = build(&tp).unwrap().verifier.unwrap();
+        assert!(verify_chain(v.as_ref(), Some(&chain(&new_leaf, Some(&active))), now).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fingerprint_tracks_content_and_watched_files() {
         let dir = std::env::temp_dir().join(format!("kairos-fp-{}", std::process::id()));
@@ -1285,6 +1546,7 @@ mod tests {
             crls: vec![f("crl")],
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         };
         // 未啟用 mTLS 時不監看 CRL
         assert_eq!(tp.watched_files().len(), 2);

@@ -202,6 +202,40 @@ export function bytes(n) {
   return `${n} B`;
 }
 
+/** 記憶體與置換空間：二進位（§6 的例外，F4）：≥ 1 GiB 整數不帶小數、其餘小數 1 位；以下整數 MiB */
+export function gib(n) {
+  if (n == null || Number.isNaN(n)) return '—';
+  const g = n / 1024 ** 3;
+  if (g >= 1) {
+    const r = Math.round(g * 10) / 10;
+    return `${Number.isInteger(r) ? r : r.toFixed(1)} GiB`;
+  }
+  return `${Math.round(n / 1024 ** 2)} MiB`;
+}
+
+/** 磁碟讀寫速率（bytes／秒 → 十進位 KB/s、MB/s、GB/s；§6，F4） */
+export function rateBytes(bps) {
+  if (bps == null || Number.isNaN(bps)) return '—';
+  if (bps >= 1e9) return `${(bps / 1e9).toFixed(1)} GB/s`;
+  if (bps >= 1e6) return `${(bps / 1e6).toFixed(1)} MB/s`;
+  return `${Math.round(bps / 1e3)} KB/s`;
+}
+
+/** 網路速率（bytes／秒 → bit：kbps、Mbps、Gbps；§6） */
+export function rateBits(bps) {
+  if (bps == null || Number.isNaN(bps)) return '—';
+  const bits = bps * 8;
+  if (bits >= 1e9) return `${(bits / 1e9).toFixed(1)} Gbps`;
+  if (bits >= 1e6) return `${(bits / 1e6).toFixed(1)} Mbps`;
+  return `${Math.round(bits / 1e3)} kbps`;
+}
+
+/** 負載：小數 2 位、沒有單位 */
+export function load(v) {
+  if (v == null || Number.isNaN(v)) return '—';
+  return Number(v).toFixed(2);
+}
+
 /** 數字＋中文單位（「37 台」） */
 export function count(n, unit) {
   return `${num(n)} ${unit}`;

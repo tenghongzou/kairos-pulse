@@ -1041,6 +1041,71 @@ async fn revocation_regenerates_the_crl_and_blocks_grace_renewal() {
     assert_eq!((s, code(&v)), (403, "certificate_revoked"), "{v}");
 }
 
+/// 已退役的簽發 CA 簽出的憑證不能以過期續簽換新憑證（PKI.md 第 15.4 節）：`auth.client_ca` 直接含有那張
+/// 簽發 CA 時，0.7 的身分檢查會通過
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_issuing_ca_blocks_grace_renewal_even_if_client_ca_lists_it() {
+    let env = Env::new("retired", |_| {}).await;
+    let token = env.token(TokenApproval::Auto, 5);
+    let a = agent("88888888-2222-4333-8444-555555555555");
+    let (s, v) = env.enroll(&a, &token).await;
+    assert_eq!(s, 200, "{v}");
+    let old = pem_decode_all(v["certificate"]["client_cert_pem"].as_str().unwrap(), None)
+        .unwrap()
+        .remove(0)
+        .1;
+    let conn = env.conn();
+    let first = ps::list_cas(&conn).unwrap().remove(0);
+    // auth.client_ca 另列出第一個簽發 CA（以前手動設定 PKI 的部署可能如此）
+    let mut client_ca = env.root.pem.clone();
+    client_ca.push_str(&crate::pki::x509::pem_encode(
+        "CERTIFICATE",
+        first.cert_der.as_ref().unwrap(),
+    ));
+    std::fs::write(&env.config.auth.client_ca, client_ca).unwrap();
+    // 第二個簽發 CA → 啟用 → 第一個退役（--compromised）
+    let data = PathBuf::from(&env.config.storage.data_dir);
+    let (_, n) = crate::pki::manage::create(&conn, &data, "Test", env.now()).unwrap();
+    let cert = env.root.sign_issuing(&n.csr_pem);
+    let second = crate::pki::manage::install(&conn, &data, &cert, env.now()).unwrap();
+    ps::activate_ca(&conn, second.ca_id).unwrap();
+    ps::retire_ca(&conn, first.ca_id, env.now()).unwrap();
+    env.svc().wake();
+    let mut synced = false;
+    for _ in 0..100 {
+        if !env.svc().pki.retired_ca_ders().is_empty()
+            && crate::pki::retired_cas_path(&data).exists()
+        {
+            synced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        synced,
+        "退役的簽發 CA 應在 10 秒內寫進 issuing-cas-retired.pem"
+    );
+    env.advance(375 * DAY);
+    let new = a.rekey();
+    let sent = format_rfc3339_ms(env.now());
+    let input =
+        grace_renew_signing_input(&a.id, &a.fingerprint, &new.csr, &sent, &env.endpoint()).unwrap();
+    let req = GraceRenewRequest {
+        agent_id: a.id.clone(),
+        csr: b64url_encode(&new.csr),
+        poll_secret: new.poll_secret.clone(),
+        sent_at: sent,
+        host_fingerprint: a.fingerprint.clone(),
+        expired_certificate: b64url_encode(&old),
+        signature: sign_ecdsa_p256_sha256(&a.key.serialize_der(), &input).unwrap(),
+        signature_alg: SignatureAlg::EcdsaP256Sha256,
+        hostname: "h".into(),
+        pulse_version: "0.7.0".into(),
+    };
+    let (s, v) = env.post("/v1/enroll/renewals", &req).await;
+    assert_eq!((s, code(&v)), (403, "renew_identity_mismatch"), "{v}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn protocol_errors_have_the_spec_shape() {
     let env = Env::new("errors", |_| {}).await;

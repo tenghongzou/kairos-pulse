@@ -89,11 +89,12 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 
 `kairos.service`、`pulse.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再重試「重試也不會成功」的錯誤：服務停在 `failed`（`systemctl status` 顯示 `status=2`／`3`／`4`），修正後執行 `systemctl restart`。只判斷「非 0」的腳本不受影響。
 
-發佈包（Linux x86_64 musl 靜態執行檔，需要 Docker）：
+發佈檔（需要 Docker；0.8.0〔草稿〕起：Linux x86_64／aarch64 的 tar.gz、deb、rpm，Pulse 另有 Windows x86_64 的 zip、msi 與一行安裝腳本）：
 
 ```bash
-sh kairos/packaging/build-release.sh    # 輸出到 dist/kairos-<版本>-<commit>-linux-x86_64.tar.gz
-sh pulse/packaging/build-release.sh     # 輸出到 dist/pulse-<版本>-<commit>-linux-x86_64.tar.gz
+sh kairos/packaging/build-release.sh    # dist/kairos-<版本>-<commit>-linux-{x86_64,aarch64}.{tar.gz,deb,rpm,cdx.json}
+sh pulse/packaging/build-release.sh     # dist/pulse-…-linux-{x86_64,aarch64}.{tar.gz,deb,rpm,cdx.json}、…-windows-x86_64.{zip,msi,cdx.json}、pulse-install.sh
+TARGETS=x86_64-unknown-linux-musl PACKAGES= sh kairos/packaging/build-release.sh   # 只建 x86_64 的 tar.gz（開發用）
 ```
 
 兩個腳本都輸出到根目錄的 `dist/`，並更新同一份合併的 `dist/SHA256SUMS`（只替換本次產出檔案的那幾列）。共用實作在 `packaging/build-release-common.sh`：建置 image 以 `@sha256:` digest 固定，來源取自 `git archive`（與工作目錄的行尾設定無關），發佈包內附 `THIRD-PARTY-LICENSES` 與 SBOM。正式發佈（檢查、打包、簽章）請用 `sh packaging/release.sh`，流程見 [RELEASING.md](RELEASING.md)；`sh packaging/check-reproducible.sh` 檢查建置是否可重現。

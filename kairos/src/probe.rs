@@ -130,6 +130,11 @@ impl ObsContext {
     }
 
     /// 沒有 token 時，帶有轉送標頭的 `/metrics` 請求：拒絕並記一次 WARN（含代碼）
+    /// 這次啟動後是否曾拒絕經反向代理轉送的 `/metrics` 請求（`KRS-W0304`；系統健康的「/metrics 端點」列）
+    pub fn proxied_rejected(&self) -> bool {
+        self.proxied_warned.load(Ordering::Relaxed)
+    }
+
     fn reject_proxied(&self, peer: SocketAddr) {
         if !self.proxied_warned.swap(true, Ordering::Relaxed) {
             log::warn!(

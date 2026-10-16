@@ -1,0 +1,119 @@
+# 1. 控制機：以發佈公鑰驗證 SHA256SUMS 的簽章（只做一次）
+- name: 檢查參數
+  ansible.builtin.assert:
+    that:
+      - pulse_dist_dir | length > 0
+      - pulse_allowed_signers | length > 0
+    fail_msg: 需要 pulse_dist_dir 與 pulse_allowed_signers（發佈公鑰，必須從另一個管道取得）
+
+- name: 驗證 SHA256SUMS 的簽章（控制機）
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -Y
+      - verify
+      - -f
+      - "{{ pulse_allowed_signers }}"
+      - -I
+      - release@kairos-pulse
+      - -n
+      - kairos-pulse-release
+      - -s
+      - "{{ pulse_dist_dir }}/SHA256SUMS.sig"
+    stdin: "{{ lookup('ansible.builtin.file', pulse_dist_dir + '/SHA256SUMS') }}\n"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+
+# 2. 依目標主機的架構與套件格式，從已驗證的 SHA256SUMS 選出套件與雜湊（不接受 -dirty）
+- name: 選出套件
+  ansible.builtin.set_fact:
+    pulse_pkg_arch: "{{ 'aarch64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'x86_64' }}"
+    pulse_pkg_ext: "{{ 'deb' if ansible_facts.os_family == 'Debian' else 'rpm' }}"
+
+- name: 在 SHA256SUMS 中找套件
+  ansible.builtin.set_fact:
+    pulse_pkg_line: >-
+      {{ lookup('ansible.builtin.file', pulse_dist_dir + '/SHA256SUMS').splitlines()
+         | select('search', '  \*?pulse-' + (pulse_version | default('', true) or '[0-9][^-]*')
+                  + '-[0-9a-f]+-linux-' + pulse_pkg_arch + '\.' + pulse_pkg_ext + '$')
+         | list }}
+
+- name: 確認恰好一個套件
+  ansible.builtin.assert:
+    that: pulse_pkg_line | length == 1
+    fail_msg: "SHA256SUMS 中符合的套件數為 {{ pulse_pkg_line | length }}（多個版本時以 pulse_version 指定）"
+
+- name: 套件名稱與雜湊
+  ansible.builtin.set_fact:
+    pulse_pkg_sha256: "{{ pulse_pkg_line[0].split()[0] }}"
+    pulse_pkg_file: "{{ pulse_pkg_line[0].split()[1] | replace('*', '') }}"
+
+# 3. 複製並核對雜湊（copy 的 checksum 是 SHA-1，另以 stat 的 SHA-256 核對）
+- name: 複製套件
+  ansible.builtin.copy:
+    src: "{{ pulse_dist_dir }}/{{ pulse_pkg_file }}"
+    dest: "/var/tmp/{{ pulse_pkg_file }}"
+    mode: "0644"
+
+- name: 核對 SHA-256
+  ansible.builtin.stat:
+    path: "/var/tmp/{{ pulse_pkg_file }}"
+    checksum_algorithm: sha256
+  register: pulse_pkg_stat
+  failed_when: pulse_pkg_stat.stat.checksum != pulse_pkg_sha256
+
+# 4. 安裝（升級時保留 pulse.toml、identity/、agent.id）
+- name: 安裝 deb
+  ansible.builtin.apt:
+    deb: "/var/tmp/{{ pulse_pkg_file }}"
+  environment:
+    PULSE_INSTALL_QUIET: "1"
+  when: pulse_pkg_ext == 'deb'
+  notify: restart pulse
+
+- name: 安裝 rpm
+  ansible.builtin.dnf:
+    name: "/var/tmp/{{ pulse_pkg_file }}"
+    state: present
+    # 套件以簽過章的 SHA256SUMS 驗證（上方），rpm 本身沒有 GPG 簽章
+    disable_gpg_check: true
+  environment:
+    PULSE_INSTALL_QUIET: "1"
+  when: pulse_pkg_ext == 'rpm'
+  notify: restart pulse
+
+# 5. 註冊：已有身分（client.pem）或進行中的申請（enrollment.json）時不再執行。
+#    安裝字串經 stdin 傳入（--install-string-file -），不放在命令列：命令列參數在執行期間其他帳號可從 ps 看到
+- name: pulse enroll
+  ansible.builtin.command:
+    argv:
+      - /opt/pulse/pulse
+      - enroll
+      - --install-string-file
+      - "-"
+      - --non-interactive
+      - --no-wait
+      - -c
+      - /opt/pulse/pulse.toml
+    stdin: "{{ pulse_install_string }}"
+    creates: /opt/pulse/identity/enrollment.json
+  register: pulse_enroll
+  no_log: true
+  when: pulse_install_string | length > 0
+  failed_when: pulse_enroll.rc is defined and pulse_enroll.rc not in [0, 7, 11]
+
+- name: 註冊結果
+  ansible.builtin.debug:
+    msg: >-
+      {{ {0: '已註冊', 7: '等待 Kairos 管理者核准（申請編號見主控台「註冊申請」）', 11: '已註冊過，沿用既有的身分'}
+         .get(pulse_enroll.rc | default(-1), '略過（已有申請或沒有安裝字串）') }}
+
+# 6. 啟動服務
+- name: 啟用並啟動 pulse.service
+  ansible.builtin.systemd:
+    name: pulse.service
+    enabled: true
+    state: started
+  when: pulse_start | bool

@@ -444,6 +444,7 @@ mod tests {
                 crls: vec![s("crl.crl")],
                 issuing_cas: None,
                 issuing_crl: None,
+                retired_cas: None,
             };
             Self { dir, paths }
         }
@@ -571,6 +572,7 @@ mod tests {
             crls: vec!["crl1".into(), "crl2".into()],
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         };
         let fp = |paths: &TlsPaths, hashes: &[Option<u64>]| -> Fingerprint {
             paths

@@ -13,8 +13,10 @@ use serde_json::{Map, Value};
 use std::fmt;
 use std::io::{Error, ErrorKind};
 
+use crate::inventory::InventoryReport;
 use crate::lifecycle::{Deregister, DeregisterAck, RenewRequest, RenewResult};
 use crate::metrics::Metric;
+use crate::processes::ProcessList;
 
 /// 日誌中顯示無效 `proto` 原始值的長度上限（字元）
 pub(crate) const MAX_PROTO_DISPLAY_CHARS: usize = 32;
@@ -279,6 +281,13 @@ pub struct DurableSeq {
     pub report_seq: u64,
 }
 
+/// report 的 `processes`（feature `processes`）；`null` 視同省略
+#[derive(Serialize, Deserialize)]
+struct ProcessesPart {
+    #[serde(default)]
+    processes: Option<ProcessList>,
+}
+
 /// report 中 durable 的兩個欄位；`null` 視同省略
 #[derive(Deserialize)]
 struct DurablePart {
@@ -307,13 +316,16 @@ impl DurablePart {
 /// 另一種格式的欄位一律忽略（與 v1 Kairos 忽略未知欄位相同）。序列化時只輸出 `Ok` 的部分。
 ///
 /// durable 的 `boot_id`／`report_seq` 也在這裡另外解析（[`ReportBody::durable_seq`]），
-/// 只在協商了 durable 的連線上使用，其他連線忽略（型別錯誤也不檢查）。
+/// 只在協商了 durable 的連線上使用，其他連線忽略（型別錯誤也不檢查）。行程排行 `processes`
+/// （feature `processes`，METRICS.md）同樣另外解析（[`ReportBody::process_list`]），沒有協商時忽略。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportBody {
     pub legacy: Result<LegacyReport, String>,
     pub metrics: Result<Vec<Metric>, String>,
     /// durable 的投遞識別；兩個欄位都省略時為 `Ok(None)`
     pub durable: Result<Option<DurableSeq>, String>,
+    /// 行程排行；省略時為 `Ok(None)`
+    pub processes: Result<Option<ProcessList>, String>,
 }
 
 impl ReportBody {
@@ -327,6 +339,7 @@ impl ReportBody {
             }),
             metrics: Err("missing field `metrics`".to_string()),
             durable: Ok(None),
+            processes: Ok(None),
         }
     }
 
@@ -336,6 +349,7 @@ impl ReportBody {
             legacy: Err("missing field `cpu_usage`".to_string()),
             metrics: Ok(metrics),
             durable: Ok(None),
+            processes: Ok(None),
         }
     }
 
@@ -343,6 +357,22 @@ impl ReportBody {
     pub fn with_durable(mut self, durable: DurableSeq) -> Self {
         self.durable = Ok(Some(durable));
         self
+    }
+
+    /// 附上行程排行（協商了 `processes` 的連線上的 report）
+    pub fn with_processes(mut self, processes: ProcessList) -> Self {
+        self.processes = Ok(Some(processes));
+        self
+    }
+
+    /// 協商了 `processes` 的連線上的行程排行：省略時 `Ok(None)`（例如這次取不到）；型別錯誤時回傳
+    /// `bad_request` 的說明。內容的限制由 [`validate_process_list`](crate::validate_process_list)
+    /// 檢查（違反時 `invalid_report`）
+    pub fn process_list(&self) -> Result<Option<&ProcessList>, String> {
+        match &self.processes {
+            Ok(p) => Ok(p.as_ref()),
+            Err(e) => Err(format!("invalid message: {e}")),
+        }
     }
 
     /// v1 格式的欄位；缺漏或型別錯誤時回傳 `bad_request` 的說明
@@ -403,6 +433,16 @@ impl Serialize for ReportBody {
             Ok(None) => {}
             Err(e) => parts.push(Err(format!("an invalid field cannot be serialized: {e}"))),
         }
+        match &self.processes {
+            Ok(Some(processes)) => parts.push(
+                serde_json::to_value(ProcessesPart {
+                    processes: Some(processes.clone()),
+                })
+                .map_err(|e| e.to_string()),
+            ),
+            Ok(None) => {}
+            Err(e) => parts.push(Err(format!("an invalid field cannot be serialized: {e}"))),
+        }
         serialize_merged(&parts, s)
     }
 }
@@ -414,6 +454,7 @@ impl<'de> Deserialize<'de> for ReportBody {
             legacy: parse_part(&fields),
             metrics: parse_part::<MetricsPart>(&fields).map(|p| p.metrics),
             durable: parse_part::<DurablePart>(&fields).and_then(DurablePart::into_seq),
+            processes: parse_part::<ProcessesPart>(&fields).map(|p| p.processes),
         })
     }
 }
@@ -452,6 +493,8 @@ pub enum ClientMsg {
     RenewRequest(Box<RenewRequest>),
     /// 除役通知（feature `deregister`，只在 `intent: "deregister"` 的連線上）
     Deregister(Box<Deregister>),
+    /// 主機資產（feature `inventory`，METRICS.md）。沒有協商時伺服器視同不認得的 `type`
+    Inventory(Box<InventoryReport>),
     /// 不認得的 `type`；`serde(other)` 只能用於 unit 變體，因此拿不到 seq。
     /// 只出現在解析結果中，不能序列化。
     #[serde(other, skip_serializing)]
@@ -1472,6 +1515,7 @@ mod tests {
                 legacy: Err("x".into()),
                 metrics: Err("y".into()),
                 durable: Ok(None),
+                processes: Ok(None),
             },
         };
         assert!(serde_json::to_string(&empty).is_err());

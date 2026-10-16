@@ -199,6 +199,9 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `GET /api/v1/hosts/{agent_id}/metrics` | S05 趨勢分頁 | 這台主機目前回報的指標（名稱、單位、label 組合） |
 | `GET /api/v1/hosts/facets` | S04 篩選列、S03 群組健康 | 範圍內主機的 OS、agent 版本、標籤、群組、離線原因與各自的台數（0.7.0，第 5.7 節） |
 | `GET /api/v1/hosts/{agent_id}/connections` | S05「連線與憑證」 | 這台主機在 Kairos 這次啟動後的上線與離線紀錄（記憶體中；0.7.0，第 5.8 節） |
+| `GET /api/v1/hosts/{agent_id}/inventory` | S05「資產資訊」 | 主機資產（OS、CPU、記憶體、廠牌型號序號、BIOS、磁碟、網卡；0.8.0〔草稿〕，第 5.9 節） |
+| `GET /api/v1/hosts/{agent_id}/inventory/changes` | S05「資產變更歷史」 | 資產變更歷史（第 5.9 節） |
+| `GET /api/v1/hosts/{agent_id}/processes` | S05 行程〔待設計〕 | 行程排行快照（依 CPU、依記憶體；第 5.10 節） |
 | `GET /api/v1/hosts/{agent_id}/metrics/{name}` | S05 趨勢、S03 sparkline | 指標趨勢（第 5.3 節） |
 | `GET /api/v1/overview` | S03 總覽 | 各狀態台數、上線數 24 小時、離線最久、資源使用前 10（第 5.4 節） |
 | `GET /api/v1/system/health` | S20 系統健康、S03 健康條 | 檢查項目與數值（第 5.5 節） |
@@ -237,6 +240,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `offline_reason` | `certificate_rejected` | 最後中斷原因（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；第 5.2 節）。0.7 的過渡期另接受舊名稱 `timeout`（＝`idle_timeout`）、`connection_closed`（＝`agent_closed`），0.8 移除 |
 | `tag` | `env:prod,line3` | 標籤（完全相同，不分大小寫） |
 | `os` | `Ubuntu,Windows` | `os.name`（完全相同，不分大小寫） |
+| `os_family` | `linux,windows` | 作業系統家族（0.8.0〔草稿〕）：資產（`inventory.os.family`）優先，沒有資產時由 hello 的 `os.name` 推斷（含 `windows` 為 `windows`，其他為 `linux`）。其他值 400 |
 | `version` | `0.3.0,0.2.0` | `agent_version`（完全相同） |
 | `durable` | `true` | 最近一次連線是否協商了補送（`durable`）；Kairos 重新啟動後尚未連線的主機不知道，兩種值都不符合 |
 | `subnet` | `10.30.3.0/24,2001:db8::/48` | 最後已知 IP 在網段內（CIDR；只寫位址表示單一位址；主機位元必須為 0，否則 400 並建議正確的寫法） |
@@ -252,6 +256,8 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `ip` | 最後已知 IP（數值順序，IPv4 在 IPv6 前；沒有 IP 的在最後） |
 | `agent_version` | 版本（依 SemVer 的數字比較，無法解析的以字串比較） |
 | `cpu`、`memory` | 最近一次 report 的 CPU 使用率、記憶體使用比例（沒有 report 的在最後） |
+| `disk` | 使用率最高的掛載點的使用率（含推算值；0.8.0〔草稿〕） |
+| `uptime` | 開機後經過的時間（只有線上主機；依開機時間排序，換頁時穩定；0.8.0〔草稿〕） |
 
 **一台主機**（`data[]` 的元素；詳情另有第 5.2 節的欄位）：
 
@@ -285,6 +291,11 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - `durable`、`replaying`：最近一次連線是否協商了補送、目前是否正在補送（最近 60 秒內收到取樣時間比收到時間早 60 秒以上的 durable report）；Kairos 重新啟動後尚未連線的主機為 `null`。
 - `last_report`：最近一次 report 的摘要（CPU、記憶體）；沒有時為 `null`。
 - `source`：`agent`（由連線建立）或 `import`（由 `kairos reports import` 建立）。
+- 0.8.0〔草稿〕（[`METRICS.md`](../crates/kairos-proto/METRICS.md) 第 10.1 節）：
+  - `os_family`：`linux`／`windows`（同 `os_family` 篩選的判斷）；`null` 為不知道。
+  - `inventory`：資產摘要 `{os_family, cpu_model, cpu_logical_cores, memory_total, vendor, product}`；沒有資產（Pulse 0.7.0 以前、或還沒收到）時 `null`。**序號不在清單中**（只在詳情；減少大量匯出時的外流面）。
+  - `boot_time`：開機時間（資產）；`uptime_secs`：線上主機開機後經過的秒數（最後一筆 report 的 `system.uptime` 加上之後經過的時間，沒有時由 `boot_time` 算出），不在線上時 `null`。
+  - `last_report.disk`：使用率最高的掛載點 `{mountpoint, usage, estimated}`；`estimated: true` 為由總容量與可用空間推算的值（Pulse 0.2.0～0.7.0，比 `df` 略高，主控台標示「推算」）。
 
 **`meta`**：
 
@@ -318,9 +329,13 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
   "certificate_rejection": {
     "at": "2026-10-13T05:50:11.000Z", "product_code": "KRS-W1105", "protocol_code": "certificate_rejected",
     "reason": "revoked", "serial": "1a2f", "peer": "10.30.3.27", "count": 4
-  }
+  },
+  "inventory": { "os_family": "linux", "cpu_model": "Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz", "cpu_logical_cores": 64, "memory_total": 51539607552, "vendor": "Dell Inc.", "product": "PowerEdge R650", "serial": "7XK2LM3" },
+  "features": { "inventory": true, "processes": true }
 }
 ```
+
+0.8.0〔草稿〕起 `last_report` 另有（舊版 Pulse 沒有的為 `null` 或空陣列）：`filesystems`（每個掛載點 `{mountpoint, fstype, total, used, available, usage, estimated}`）、`swap`（`{total, used, usage}`）、`load`（`{"1m", "5m", "15m"}`，只有 Linux）、`process_count`、`memory_available_bytes`、`uptime_secs`、`network`（每個介面 `{device, rx_bytes_per_sec, tx_bytes_per_sec}`）、`disk_io`（每個裝置 `{device, read_bytes_per_sec, write_bytes_per_sec}`）。速率由最後兩筆 report 算出（`kairos_proto::counter_rate`：重置或重新開機時為 `null`）。`inventory` 為詳情才有序號的資產摘要；`features`：最近一次連線是否協商了 `inventory`、`processes`（Kairos 重新啟動後尚未連線時 `null`）。`inventory_rejection`：這次啟動後最近一次資產被拒（`KRS-W2108`）`{at, reason, product_code}`，之後的資產保存成功時清除；`series_limited_at`：最近一次因每主機序列數上限而有指標未保存的時間（`KRS-W4104`，主機清冊中保存）。兩者供 S05 的 `InlineAlert`（設計包 §30.5 #7）。
 
 - `connection`：目前或最近一次連線的投遞資訊（Kairos 重新啟動後尚未連線時為 `null`）。`last_backfill_*`：最近一次收到補送資料的時間與當時的落後量（收到時間 − 取樣時間）。
 - `certificate_rejection`：**握手時被拒的憑證歸屬**（設計包 §24 #3、`ia.md` §5.2「憑證被拒」）：最近一次以這台主機的憑證（SAN 為 `agent_id`）連線、在 TLS 握手時被拒的時間、原因、序號與來源位址，`count` 為累計次數。`reason`：`revoked`（`KRS-W1105`）、`expired`（`KRS-W1108`）、`revocation_status_unavailable`（`KRS-E1203`，伺服器端的 CRL 問題）。沒有時為 `null`。之後成功上線的主機仍保留紀錄，但不再算作「憑證被拒」的離線原因（`offline_reason` 只在被拒時間晚於 `last_seen` 時為 `certificate_rejected`）。
@@ -337,10 +352,14 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 
 ```json
 { "server_time": "…", "data": { "agent_id": "…", "as_of": "…", "metrics": [
-  { "name": "system.cpu.usage", "unit": "%", "labels": {} },
-  { "name": "system.filesystem.available", "unit": "By", "labels": { "fstype": "ext4", "mountpoint": "/" } }
+  { "name": "system.cpu.usage", "unit": "%", "labels": {}, "kind": "gauge", "standard": true },
+  { "name": "system.filesystem.available", "unit": "By", "labels": { "fstype": "ext4", "mountpoint": "/" }, "kind": "gauge", "standard": true },
+  { "name": "system.filesystem.usage", "unit": "%", "labels": { "fstype": "ext4", "mountpoint": "/" }, "kind": "gauge", "standard": true, "derived": "estimated" },
+  { "name": "system.network.received", "unit": "By", "labels": { "device": "eth0" }, "kind": "counter", "standard": true }
 ] } }
 ```
+
+0.8.0〔草稿〕：`kind`（`gauge`／`counter`）、`standard`（是否為標準指標，名稱與單位都相符）。掛載點有總容量與可用空間、但沒有使用率時（Pulse 0.2.0～0.7.0），另列出 `derived: "estimated"` 的使用率（趨勢可以查詢）。
 
 ### 5.3 `GET /api/v1/hosts/{agent_id}/metrics/{name}`
 
@@ -356,6 +375,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `resolution` | `auto`（預設）、`raw`、`5m`、`1h` |
 | `max_points` | 每條序列最多幾個點，10～5000，預設 1000 |
 | `label.<key>` | 只取 label 相符的序列（可重複，例：`label.mountpoint=/`） |
+| `transform` | 計數器（`kind: "counter"`）的呈現（0.8.0〔草稿〕）：`rate`（預設，每秒速率，單位 `<原單位>/s`）、`none`（原始累計值，只有原始資料；`resolution` 為 `5m`／`1h` 時 400 `invalid_parameter`）。量測值忽略。其他值 400 |
 
 - **解析度（`auto`）**：依序選第一個同時滿足兩個條件的：(1) `from` 在該層的保留期限內（`storage.raw_retention_days`、`rollup_5m_retention_days`、`rollup_1h_retention_days`，與保留清除相同的「今天與前 N 天」）；(2) 預估點數不超過 `max_points`（原始資料以這台主機宣告的 report 間隔估算，沒有宣告時 5 秒）。都不滿足時用 1 小時彙總。預設下：1 小時 → 原始資料（720 點）、24 小時 → 5 分鐘（288 點）、7 天 → 1 小時（168 點）、30 天 → 1 小時（720 點）。設計包 S05「解析度依範圍」。
 - **點數上限**：結果超過 `max_points` 時，把相鄰的點依時間合併成較大的桶（min 取最小、max 取最大、avg 以 count 加權、count 相加），`bucket_secs` 為合併後的桶長。指定 `resolution=raw` 查 7 天也不會回傳 12 萬個點。
@@ -364,6 +384,10 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - **最新的桶**：5 分鐘／1 小時彙總在桶結束約 15 秒後才寫入資料庫（STORAGE.md 第 7 節）；尚未寫入的部分（主機的 `rollup_until` 之後）由原始資料即時計算，趨勢的最右端不會缺。
 - **時間**：durable 的資料以 Pulse 的取樣時間（`ts`）排列，補送的資料會補進過去的空缺（STORAGE.md 第 5.2 節）。
 - 超過所有保留期限的範圍：`from` 調到 1 小時彙總保留的起點，`notes` 寫明（設計包 S05「只保留最近 400 天的 1 小時彙總」）。指定的解析度在查詢範圍的一部分沒有資料（超過該層的保留期限）時，`notes` 寫出該層的保留天數。範圍最長 3,660 天。
+- **計數器（0.8.0〔草稿〕，行為變更）**：網路、磁碟 I/O 等計數器（METRICS.md 第 3 節）預設回傳**每秒速率**（`transform=rate`）：彙總中為 Kairos 寫入時算出的速率序列（`series.derived = 1`），原始資料與尚未彙總的部分以相鄰兩筆即時計算（第一個點以查詢範圍前最近的一筆為起點）。重置、`system.uptime` 變小（重新開機）、時間沒有前進時該段沒有點（缺口，不補 0）。0.7.0 回傳累計值（主控台沒有使用，API 為草稿）；需要累計值時用 `transform=none`。v8 起計數器的累計值不再彙總，v7 以前寫入的累計值彙總保留到保留期限自然刪除。
+- **推算的使用率（0.8.0〔草稿〕）**：`system.filesystem.usage` 在沒有 Pulse 送的值時，以同一個掛載點的 `(total − available) ÷ total × 100` 推算（Pulse 0.2.0～0.7.0；把保留給 root 的空間算成已使用）。序列帶 `derived: "estimated"`（全部為推算值時），每個推算的點帶 `estimated: true`；同一個桶有實際值時以實際值為準。
+- **序列只列出這台主機的**（0.8.0〔草稿〕）：依 `host_series`（STORAGE.md 第 15 節）；0.7.0 會列出所有主機用過的同名序列（其他主機的為空的 `points`）。
+- 每條序列另帶 `kind`，衍生的序列帶 `derived`（`rate`／`estimated`）；`data` 另帶 `kind` 與 `transform`（計數器時）。
 - 404 `metric_not_found`：Kairos 從未收過這個名稱的指標（任何主機）。主機有這個指標、但查詢範圍內沒有資料時回 200、`points` 為空陣列；剛上線、第一筆 report 尚未寫入的主機回 200、`series` 為空陣列。
 
 ```json
@@ -399,6 +423,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
     "longest_offline": [ { "agent_id": "…", "hostname": "lab-pc-17", "display_name": null, "last_seen": "…", "offline_for_secs": 259200, "offline_reason": null } ],
     "top_cpu": [ { "agent_id": "…", "hostname": "his-ap-01", "display_name": null, "cpu_usage": 97.0, "memory_used_ratio": 0.82 } ],
     "top_memory": [ … ],
+    "top_disk": [ { "agent_id": "…", "hostname": "db-01", "display_name": null, "cpu_usage": 12.0, "memory_used_ratio": 0.4, "disk": { "mountpoint": "/data", "usage": 96.2, "estimated": false } } ],
     "health": { "status": "warning", "items": [ { "id": "database", "status": "warning", "product_code": "KRS-W4202", "summary": "…" } ] }
   }
 }
@@ -406,7 +431,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 
 - `total`：清冊中的主機數（以清冊為準，重新啟動後不會變少；設計包 S03）。
 - `online_series`：每分鐘的上線數（設計包 §24 #5「伺服器每分鐘彙總一次上線數，不從 report 推算」），最近 24 小時；保存在記憶體中，**Kairos 重新啟動後從頭累積**。`change_1h`：與 1 小時前的差（還沒有 1 小時前的資料時為 `null`）。
-- `longest_offline`：離線最久的 5 台；`top_cpu`、`top_memory`：線上主機中使用率最高的 10 台（最近一次 report）。
+- `longest_offline`：離線最久的 5 台；`top_cpu`、`top_memory`：線上主機中使用率最高的 10 台（最近一次 report）。`top_disk`（0.8.0〔草稿〕，S03 區塊 F「磁碟」）：依每台主機使用率最高的掛載點排序的前 10 台；每個項目（含其他清單）另帶 `disk`。
 - `health`：第 5.5 節的整體狀態與非正常的項目（總覽的健康條）。
 
 ### 5.5 `GET /api/v1/system/health`
@@ -438,8 +463,14 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `listeners` | agent 連線埠與主控台的實際監聽位址 | — |
 | `file_descriptors` | `RLIMIT_NOFILE` 的 soft limit（只在 Linux）、需要量、建議值（第 2 節） | 警告：soft limit 低於需要量 |
 | `auth` | 是否啟用 mTLS、`auth.allow_unauthenticated` | 嚴重：未啟用 mTLS 而監聽對外位址（`KRS-W0302`） |
+| `issuing_ca`（0.8；有註冊服務時） | `pki_mode`、`expiry_warning_days`、`active[]`（啟用中的簽發 CA：`subject`、`not_after`、`days_left`、`status`）、`signing_queue_stale`（離線簽發時超過 24 小時的待簽發筆數）、`signing_queue_oldest` | 警告：即將到期（`KRS-W1304`）、離線簽發且有超過 24 小時的待簽發；嚴重：已到期或線上簽發但私鑰無法使用（`KRS-E1303`） |
+| `enroll`（0.8；有註冊服務時） | `mode`、`state`、`listening`、`listen_addr`、`not_listening_reason`、`expired_renew_grace_days`、`blocked_sources`、`impact`（`N`、`M`、`L`、`R`、`T`，第 11.4 節） | 嚴重：模式不是關閉卻沒有在監聽（`KRS-E2001`）；警告：關閉且 N＋M＞0（`KRS-W2009`）、僅續簽但寬限期為 0 天（`KRS-W2011`）、僅續簽但仍有有效 token、封鎖中的來源 ≥ 1（`KRS-W3005`）（設計包 S20「註冊端點」） |
+| `alerts`（0.8） | `enabled`；啟用時同 `GET /api/v1/alerts/summary` 的 `engine`（`running`、`last_tick_at`、`warmup`、`last_error`…） | 嚴重：告警引擎沒有在執行（最近 60 秒沒有完成判定）。`alerts.enabled = false` 時為正常（「已停用」） |
+| `metrics`（0.8） | `on_console`、`token`（是否設定 `observability.metrics_token_file`）、`listen`、`proxied_rejected`（這次啟動後曾拒絕經反向代理轉送的請求，`KRS-W0304`） | —（摘要為設計包 S20「/metrics 端點」列的寫法） |
 
-〔之後〕CRL 自動更新（#6）、註冊端點（#16）、授權（#13）、告警引擎（#9）、時鐘（NTP）在對應功能實作時加入。
+**細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
+
+〔之後〕CRL 自動更新（#6）、授權（#13）、時鐘（NTP）、目錄服務的最近一次連線結果在對應功能實作時加入。
 
 ### 5.6 `KRS-W4202`：容量上限刪除最舊的資料
 
@@ -486,6 +517,57 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 
 - 由狀態表的變化累積（與 SSE 的 `host.*` 同一個來源），新到舊，每台主機最多 50 筆、最多 2 萬台（超過時捨棄最久沒有變化的主機）。**只在記憶體中**：`since` 為 Kairos 這次啟動的時間，重新啟動後從頭記錄（`persisted: false`）。
 - `reason` 為第 5.2 節的 `offline_reason`（新名稱；這個端點 0.7 才新增，不帶 `*_legacy`）。每次連線的建立時間、來源連接埠、持續時間與協定錯誤碼的完整、持久的連線紀錄（設計包 §24 #2）屬於之後的版本。
+
+### 5.9 資產（0.8.0〔草稿〕）
+
+[`METRICS.md`](../crates/kairos-proto/METRICS.md) 第 6、9.3、10.2 節。權限 `hosts:read`（群組範圍外的主機回 404 `host_not_found`，與其他主機端點相同；不新增權限，D2）。只接受 `GET`。查詢資產不寫稽核紀錄。
+
+`GET /api/v1/hosts/{agent_id}/inventory`（不接受查詢參數）：
+
+```json
+{ "server_time": "…", "data": {
+  "agent_id": "6f1c…", "supported": true, "source": "inventory",
+  "digest": "sha256:…", "collected_at": "2026-10-20T02:00:00.120Z", "received_at": "…", "changed_at": "…",
+  "boot_time": "2026-10-02T08:11:04.000Z",
+  "inventory": { "os": { "family": "linux", "name": "Ubuntu", "version": "24.04", "long_version": "Linux (Ubuntu 24.04)", "kernel": "6.8.0-45-generic", "arch": "x86_64" },
+                 "cpu": { … }, "memory": { … }, "system": { … }, "disks": [ … ], "network_interfaces": [ … ] }
+} }
+```
+
+- `inventory`：Pulse 回報的資產與上一次合併後的結果（省略的欄位保留舊值、`disks` 與 `network_interfaces` 整個取代；不含 `boot_time`）。欄位見 METRICS.md 第 6.1 節。
+- `source`：`inventory`（Pulse 回報）、`hello`（還沒有資產，`inventory` 只有 hello 的 `os`：Pulse 0.2.0～0.7.0，或 0.8.0 尚未送出）、`null`（都沒有：v1 的 Pulse，`inventory` 為 `null`）。
+- `supported`：這台主機最近一次連線是否協商了 `inventory`（Kairos 重新啟動後尚未連線時，以是否有資產判斷）。主控台據此區分「Pulse 版本不回報此資訊」與「尚未收到回報」。
+- `changed_at`：內容（摘要）最後一次改變的時間；`collected_at`：最後一次收集的時間（`inventory` 的 `ts`，不合理時為收到的時間）。
+- `last_rejection`：這次啟動後最近一次被拒的資產（`KRS-W2108`）`{at, reason, product_code}`；沒有時 `null`（同第 5.2 節的 `inventory_rejection`）。
+
+`GET /api/v1/hosts/{agent_id}/inventory/changes?limit=50&before=<id>`：
+
+```json
+{ "server_time": "…", "data": { "agent_id": "6f1c…", "next": "118", "items": [
+  { "id": 120, "changed_at": "…", "changes": [ { "path": "memory.total", "before": 8589934592, "after": 17179869184 } ] },
+  { "id": 119, "changed_at": "…", "changes": [ { "path": "network_interfaces[eth1]", "before": null, "after": { "name": "eth1", … } } ] }
+] } }
+```
+
+- 新到舊；`limit` 1～200（預設 50），`before` 為上一頁的 `next`（其他值 400）。路徑的寫法見 METRICS.md 第 9.3 節。第一次收到資產不算變更。
+- **IPv6 暫時位址**：介面位址的比較中，IPv6 的非 link-local 位址只比較所在的 /64 前綴，同一個前綴內的隱私位址輪換不寫入歷史（目前的資產仍是實際的位址）。換網段、IPv4、link-local 的變化照常記錄。
+- 保留 400 天（`storage.rollup_1h_retention_days`），每台主機最多 1,000 筆。
+
+### 5.10 行程排行（0.8.0〔草稿〕）
+
+`GET /api/v1/hosts/{agent_id}/processes?at=2026-10-20T03:00:00Z`（`at` 省略為現在）：時間不晚於 `at` 的最近一筆快照（METRICS.md 第 5、9.4 節）。權限 `hosts:read`，同第 5.9 節。
+
+```json
+{ "server_time": "…", "data": {
+  "agent_id": "6f1c…", "at": "…", "sampled_at": "2026-10-20T02:59:05.210Z", "supported": true,
+  "top_cpu": [ { "pid": 2211, "name": "postgres", "cpu_usage": 9.41, "memory": 4294967296 } ],
+  "top_memory": [ { "pid": 1873, "name": "java", "cpu_usage": 3.2, "memory": 8589934592 } ]
+} }
+```
+
+- `cpu_usage` 為占整台主機的百分比；`memory` 為常駐記憶體 bytes。Pulse 設定 `processes.command` 時另有 `command`，**原樣回傳**（可能含敏感資訊，Kairos 不遮罩）。
+- 超出保留期限（同原始資料，預設 7 天；回應的 `retention_days` 為 `storage.raw_retention_days`）或沒有資料時 `sampled_at` 為 `null`、清單為空陣列。`supported` 同第 5.9 節（`processes`）。
+- `at` 不是 RFC 3339 時 400。
 
 ## 6. 即時變更推送（SSE）
 
@@ -714,7 +796,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
-| `GET /api/v1/enroll/requests` | `read` | 列表。`view`：`pending`（預設）／`closed`（最近結束，30 天）；篩選 `token`、`kind`（`enroll`、`grace_renewal`、`renewal`）、`flag`（`none`、`any` 或旗標名稱）、`subnet`、`q`（申請編號〔含不含連字號、不分大小寫〕、主機名稱、IP、`agent_id` 前綴）；排序 `created_at`（預設）、`hostname`、`source_ip`；游標分頁 |
+| `GET /api/v1/enroll/requests` | `read` | 列表。`view`：`pending`（預設）／`closed`（最近結束，30 天）；`state`（0.8，只用於 `pending`）：`pending_approval`（待核准，主控台側邊導覽的計數泡泡以 `limit=1` 的 `page.total` 取得）或 `approved`（已核准、待簽發）；篩選 `token`、`kind`（`enroll`、`grace_renewal`、`renewal`）、`flag`（`none`、`any` 或旗標名稱）、`subnet`、`q`（申請編號〔含不含連字號、不分大小寫〕、主機名稱、IP、`agent_id` 前綴）；排序 `created_at`（預設）、`hostname`、`source_ip`；游標分頁 |
 | `GET /api/v1/enroll/requests/{request_id}` | `read` | 詳情：申請編號、公鑰指紋前 8 碼、CSR 摘要、主機資訊、來源 IP 歷史、旗標說明、撤回資訊 |
 | `POST /api/v1/enroll/requests/approve` | `EnrollDecide` | 核准（L1，含批次）：`request_ids`（1～1,000）、`cert_lifetime_days`（選填） |
 | `POST /api/v1/enroll/requests/reject` | `EnrollDecide` | 拒絕（L2）：`request_ids`（1～1,000）、`expected_count`、`reason_code`（`unknown_host`／`source_mismatch`／`duplicate`／`other`）、`reason`（必填，顯示給 agent 端，`PLS-E3302`） |
@@ -738,7 +820,22 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | `GET /api/v1/pki/certificates` | `read` | 列表：`state`（`valid`、`expiring`、`revoked`、`revocation_pending`、`expired_in_grace`、`expired_beyond_grace`）、`expires_within`、`agent_id`、`q`（序號、主機名稱、`agent_id` 前綴）；每筆含 `hostname`、`group`（第 11.8 節）；游標分頁 |
 | `GET /api/v1/pki/certificates/{serial}` | `read` | 詳情（不含私鑰；`cert_pem` 可下載） |
 | `POST /api/v1/pki/certificates/revoke` | `CertRevoke` | 撤銷（L2）：`serials`（1～1,000）、`expected_count`、`reason`（`keyCompromise`／`cessationOfOperation`／`superseded`／`unspecified`）、`comment`（必填）。回各筆結果與預計收錄的 CRL 版本；線上模式數秒內生效，離線模式為「撤銷待生效」 |
-| `PUT /api/v1/pki/policy` | `CertPolicyWrite` | 憑證政策（S14）：`cert_lifetime_days`、`renew_before_days`、`renew_requires_approval`、`expired_renew_grace_days`、`revoke_on_self_decommission`；縮短寬限期使 K＞0 台立即無法續簽時為 L2（`impact_token`，同第 11.4 節） |
+| `GET /api/v1/pki/policy/impact?expired_renew_grace_days=N` | `read` | （0.8）把過期寬限期改為 N 天的影響（設計包 S14「儲存過期寬限期時的確認」、D11），格式見下方「會讓主機無法續簽的設定變更」 |
+| `PUT /api/v1/pki/policy` | `CertPolicyWrite` | 憑證政策（S14）：`cert_lifetime_days`、`renew_before_days`、`renew_requires_approval`、`expired_renew_grace_days`、`revoke_on_self_decommission`、`reason`、`impact_token`。**縮短寬限期時 `impact_token` 必填**（0.8 起實際檢查；缺少時 400 `confirmation_required`、與目前的數字不符時 409 `impact_changed`，兩者都附新的數字）；使 K＞0 台立即無法續簽時為 L2，`reason` 必填。稽核紀錄的 `details` 帶 `level`、`reason`、`impact` |
+
+**會讓主機無法續簽的設定變更**（0.8；`PUT /api/v1/pki/policy` 縮短寬限期、`POST /api/v1/settings/reset` 改用設定檔的值而關閉註冊端點或縮短寬限期）：影響查詢的回應 `data`：
+
+```json
+{ "required": true, "count": 2, "level": "L2", "confirm_text": "停止續簽 2 台", "impact_token": "…",
+  "mode": null,
+  "grace": { "from_days": 90, "to_days": 30, "K": 2,
+             "earliest": [ { "agent_id": "…", "hostname": "plc-gw-07", "not_after": "…", "grace_ends_at": "…" } ] } }
+```
+
+- `required`：這項變更是否需要 `impact_token`（關閉註冊端點或縮短寬限期時為 `true`；其他變更為 `false`，送出時不檢查）。
+- `grace.K`：目前在寬限期內、以新的寬限期計算已經結束、沒有個別延長（「允許再次自動續簽」）的主機；`earliest` 依原本寬限期的結束排序，最多 10 台。
+- `mode`（改用設定檔的值使模式由開放或僅續簽變為關閉時）：`from`、`to`、`N`、`M`、`L`、`R`、`T`（同第 11.4 節）。同時關閉與縮短時 `count` 為 N＋M（寬限期內的主機已包含在 N 中）。
+- `level`：`count`＞0 時為 `L2`，`confirm_text` 為「停止續簽 {count} 台」（與第 11.4 節相同的字串）；否則 `L1`。`impact_token` 是數字的雜湊，5 分鐘有效。
 | `POST /api/v1/pki/grace-overrides` | `GraceOverride` | 允許再次自動續簽（L1，原因必填）：`agent_ids`、`until`（最長 90 天）、`reason`、`also_set_renew_only`（布林，模式為關閉時一併改為僅續簽） |
 | `GET /api/v1/pki/ca` | `read` | 信任錨與簽發 CA（狀態、到期、私鑰位置、簽發張數、還在使用舊 CA 的主機數） |
 | `GET /api/v1/pki/crl` | `read` | 各 CA 目前的 CRL（版本、`this_update`、`next_update`、撤銷筆數、載入時間）與版本歷史 |
@@ -773,15 +870,18 @@ kairos enroll mode [open | renew_only | closed] [--auto-pause on|off] [--auto-pa
 kairos pki certificates list [--state <狀態>] [--expires-within <時間>] [--json]
 kairos pki certificates import <目錄>
 kairos pki revoke <主機名稱 | agent_id | 序號>... --reason <原因> [--yes --expect-count <N>] [--json]
-kairos pki gencrl [--install-timer]
+kairos pki init --name <名稱或 IP>... --root-dir <目錄> [--organization <組織>] [--server-days <N>] [--json]（0.8.0）
+kairos pki gencrl（線上模式；0.8.0）
 kairos pki issuing-ca new | install <cert.pem> | activate <ca_id> | retire <ca_id> [--compromised] [--confirm <字串>]
 kairos pki queue export [--out <檔案>] | import <檔案> | import --pem-dir <目錄>
-kairos pki revocations export [--out <檔案>]
+kairos pki revocations export --ca-cert <CA 憑證> [--out <檔案>]（0.8.0）
 kairos pki crl upload <檔案> [--confirm <字串>]
 
 # 在離線的 CA 主機上（不讀 Kairos 的設定與資料庫）：
 kairos pki sign-bundle --in <檔案> --ca-cert <檔案> --ca-key <檔案> --out <檔案>
-kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --out <檔案>
+kairos pki gencrl [--revocations <檔案>] --ca-cert <檔案> --ca-key <檔案> --out <檔案> [--days <N>]（0.8.0）
+kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <檔案> (--csr <檔案> | --new-key <檔案>)
+                [--name <名稱>]... [--agent-id <agent_id>] [--days <N>] --out <檔案>（0.8.0）
 ```
 
 | 命令 | 危險等級 | 輸出與規則 |
@@ -795,7 +895,9 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 | `enroll mode` | L1／L2 | 不帶模式時只顯示目前狀態與來源。切換到 `closed` 且 N＋M＞0 時為 L2：互動輸入「停止續簽 {N＋M} 台」，非互動需 `--yes --expect-count <N＋M>` 與 `--reason`；數字在確認後改變時中止並重新顯示（同 `impact_changed`）。被環境變數覆寫時結束代碼 3 並寫出變數名稱 |
 | `pki revoke` | L2 | 沿用 `cli-style.md` §5.4 的範例 |
 | `pki issuing-ca retire`、`pki crl upload`（筆數較少） | L3 | 非互動需 `--confirm "重建 CA"`／`--confirm "上傳較舊的 CRL"`，`--yes` 不足以略過 |
-| `pki sign-bundle`、`pki gencrl --revocations` | — | 在 CA 主機執行；私鑰檔權限過寬時拒絕（結束代碼 4）；輸出檔已存在時不覆寫（結束代碼 11） |
+| `pki sign-bundle`、`pki sign`、`pki gencrl --ca-key` | — | 在 CA 主機執行；私鑰檔權限過寬時拒絕（結束代碼 4，`sign`／`gencrl` 為 `KRS-E1307`）；輸出檔已存在時不覆寫（結束代碼 11）；`sign`／`gencrl` 先在私鑰所在目錄的 `kairos-ca.log` 附加一筆紀錄，寫不進去時不簽發（PKI.md 第 15 節） |
+| `pki init` | — | 只能執行一次：資料庫已有簽發 CA 或要寫出的檔案已存在時結束代碼 11；成功時寫稽核 `pki.init`，並提醒把根 CA 私鑰移到離線保存（`KRS-W1306`） |
+| `pki gencrl`（線上） | — | 與主控台 S15「立即產生 CRL」相同（`PkiManager::regenerate_crl`）；寫稽核 `crl.generate`；離線模式結束代碼 2 |
 
 - **結束代碼**（`cli-style.md` §8）：0 完成；1 資料庫錯誤或批次中有失敗；2 用法錯誤（含非互動缺少 `--yes`／`--expect-count`／`--confirm`）；3 設定錯誤（含被環境變數覆寫）；4 憑證錯誤（CA 憑證或私鑰有問題、匯入的憑證檢查不通過）；6 被拒絕（對象的狀態不允許，例如核准已結束的申請）；10 權限不足；11 衝突（資料庫被 `kairos reports import` 獨占、輸出檔已存在）。
 - **`--json` 的 `schema`**：`kairos.enroll-token.<動作>/v1`、`kairos.enroll.<動作>/v1`、`kairos.pki.<動作>/v1`。
@@ -806,7 +908,8 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/settings` | `read` | 每個設定鍵的 `value`、`source`（`env`／`console`／`file`／`default`）、`env_var`、`updated_by`、`updated_at`（主控台修改時）、`overridden[]`（較低優先層中與生效值不同的值：`source`、`value`）、`console_editable`、`pending_restart`（本版一律 `null`）。與 `kairos config show --effective --json` 相同 |
-| `POST /api/v1/settings/reset` | `enroll.*` 需 `EnrollModeWrite`，`pki.policy.*` 需 `CertPolicyWrite` | 本文 `keys`（設定鍵陣列）：「改用設定檔的值」＝刪除 `settings` 的鍵（L1，寫入稽核）；被環境變數覆寫時 409 `locked_by_environment`。回 `results[]`（`key`、`was_console`） |
+| `GET /api/v1/settings/reset/impact?keys=a,b` | `read` | （0.8）改用設定檔的值的影響：刪除這些鍵之後若註冊端點變為關閉或寬限期縮短，回傳數字與 `impact_token`（格式同第 11.5 節「會讓主機無法續簽的設定變更」）；其他鍵 `required: false` |
+| `POST /api/v1/settings/reset` | `enroll.*` 需 `EnrollModeWrite`，`pki.policy.*` 需 `CertPolicyWrite` | 本文 `keys`（設定鍵陣列）、`reason`、`impact_token`：「改用設定檔的值」＝刪除 `settings` 的鍵（L1，寫入稽核）；被環境變數覆寫時 409 `locked_by_environment`。**0.8 起**刪除後會關閉註冊端點或縮短寬限期時 `impact_token` 必填（400 `confirmation_required`／409 `impact_changed`，附新的數字），使主機無法續簽時為 L2、`reason` 必填（`kairos config reset` 同樣為 L2：互動輸入「停止續簽 N 台」，非互動 `--yes --expect-count <N> --reason`）。回 `results[]`（`key`、`was_console`） |
 
 - 優先順序：環境變數 ＞ 主控台（資料庫 `settings`）＞ `kairos.toml` ＞ 內建預設。可從主控台修改的鍵：`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`、`pki.policy.*`。
 - `GET /api/v1/enroll/mode` 另帶 `downloads`（`available`、`reason`、`alternative`）：本版下載端點回 404，主控台據此隱藏一行指令與下載連結（設計包 INTEGRATION §27.4 #3）；token 建立回應的 `downloads`、token 列表的 `meta.downloads` 相同。同一個回應另有 `stats`（啟動以來的請求、429、封鎖、時鐘被拒、握手前關閉、簽發的計數；S20 的資料來源，系統健康的整合之後再做）。
@@ -821,7 +924,7 @@ kairos pki gencrl --revocations <檔案> --ca-cert <檔案> --ca-key <檔案> --
 
 ### 11.9 CLI 與第 11.6 節的差異
 
-- `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes]`。
+- `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes] [--reason <原因>] [--expect-count <N>]`（0.8 起刪除後會關閉註冊端點或縮短寬限期、使主機無法續簽時為 L2，同 `enroll mode closed`）。
 - `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
 - 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
 
@@ -1010,6 +1113,7 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
   - 新的斷點原因：`missing_hmac`（起點之後沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被重新計算）、`hmac_boundary_mismatch`（起點被移動）、`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與起點記錄的 `key_id` 不同；不會以新的金鑰「接續」簽下去）。都是 `KRS-E6201`。
   - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
   - **自我驗證**：每 `audit.verify_interval_hours` 小時（預設 24，第一次在啟動後 1 分鐘）重新計算整條鏈與 HMAC，寫一筆 `audit.verify`（執行者 `system`，`details.via = "self_check"`），並發布內部事件；失敗時記 `ERROR`（`audit.chain_broken`）且告警引擎開系統規則「稽核日誌完整性」（`sys.audit_integrity`，緊急，`KRS-E6201`），下一次驗證通過時恢復。
+  - **列表的 `meta.integrity`**（0.8；`audit:read` 的第一頁，只看自己操作的身分為 `null`）：`hmac_since_id`（目前的 HMAC 起點，尚未開始為 `null`）與 `last_verify`（最近一筆 `audit.verify`：`at`、`actor`、`result`、`self_check`、`checked`、`broken`、`hmac_since_id`），主控台 S18 頁首「完整性：✓ 已驗證至 …（雜湊鏈連續；HMAC 自第 N 筆起）」的來源。`audit.verify` 的 `details` 0.8 起另帶 `hmac`（狀態）與 `hmac_since_id`。
   - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；重播先前抄下的 head 也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
 
 | 方法與路徑 | 權限 | 說明 |

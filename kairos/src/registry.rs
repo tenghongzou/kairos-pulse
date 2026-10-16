@@ -139,6 +139,13 @@ pub struct LiveAgent {
     pub last_report: Option<Arc<LastReport>>,
     /// 最近一次連線是否協商了 durable（尚未連線時為 `None`）
     pub durable: Option<bool>,
+    /// 最近一次連線是否協商了 `inventory`、`processes`（尚未連線時為 `None`）
+    pub inventory: Option<bool>,
+    pub processes: Option<bool>,
+    /// 這次啟動後最近一次保存的資產摘要
+    pub assets: Option<Arc<AssetSummary>>,
+    /// 這次啟動後最近一次資產被拒（`KRS-W2108`）的時間與原因
+    pub inventory_rejected: Option<(DateTime<Utc>, Arc<str>)>,
     pub backfill: Option<Backfill>,
     pub offline_reason: Option<OfflineReason>,
     /// 離線多久了（線上時為 `None`；由主機清冊載回的主機以載回的時間起算）
@@ -217,6 +224,180 @@ pub struct LastReport {
     /// v2 的指標 report 中的指標數（v1 不輸出）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<usize>,
+    /// 0.8.0 起的指標（METRICS.md 第 11.1 節：告警與主控台的「目前數值」）；舊版 Pulse 沒有的欄位不輸出
+    #[serde(flatten, default)]
+    pub detail: ReportDetail,
+}
+
+/// 最近一次 report 中 F4 指標的摘要（[`LastReport::detail`]）。計數器另保存原始累計值，下一筆 report
+/// 到達時以 [`kairos_proto::counter_rate`] 算出速率（[`Registry::set_last_report`]）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReportDetail {
+    /// `system.uptime`（秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<u64>,
+    /// `system.memory.available`（bytes）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_available: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_1m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_5m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_15m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<u64>,
+    /// 每個掛載點
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filesystems: Vec<FsLast>,
+    /// 每個介面
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<IoLast>,
+    /// 每個磁碟 I/O 裝置
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<IoLast>,
+}
+
+/// 一個掛載點的容量（bytes）與使用率
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FsLast {
+    pub mountpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fstype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<u64>,
+    /// 使用率（%）：Pulse 送的 `system.filesystem.usage`，沒有時為推算值（`estimated`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<f64>,
+    /// `usage` 是由 total 與 available 推算的（0.2.0～0.7.0 的 Pulse；METRICS.md 第 9.2 節）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+}
+
+/// 一個介面或磁碟裝置的計數器（累計 bytes）與每秒速率（bytes/s）：網路為接收／傳送，磁碟為讀取／寫入
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IoLast {
+    pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_rate: Option<f64>,
+}
+
+impl ReportDetail {
+    /// 使用率最高的掛載點
+    pub fn top_filesystem(&self) -> Option<&FsLast> {
+        self.filesystems
+            .iter()
+            .filter(|f| f.usage.is_some())
+            .max_by(|a, b| {
+                a.usage
+                    .partial_cmp(&b.usage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// 置換空間使用率（%）；總量為 0 時沒有值
+    pub fn swap_percent(&self) -> Option<f64> {
+        match (self.swap_used, self.swap_total) {
+            (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
+            _ => None,
+        }
+    }
+}
+
+/// 以上一筆 report 算出計數器的速率（取樣時間為 `ts`，RFC 3339；無法解析時不計算）
+fn carry_rates(prev: &LastReport, new: &mut LastReport) {
+    let parse = |ts: &str| {
+        DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|t| t.timestamp_millis())
+    };
+    let (Some(p_ts), Some(n_ts)) = (parse(&prev.ts), parse(&new.ts)) else {
+        return;
+    };
+    let p_up = prev.detail.uptime_secs;
+    let n_up = new.detail.uptime_secs;
+    let rate = |p: Option<u64>, n: Option<u64>| -> Option<f64> {
+        kairos_proto::counter_rate(
+            kairos_proto::CounterSample {
+                value: p?,
+                ts_ms: p_ts,
+                uptime_secs: p_up,
+            },
+            kairos_proto::CounterSample {
+                value: n?,
+                ts_ms: n_ts,
+                uptime_secs: n_up,
+            },
+        )
+    };
+    let fill = |prev: &[IoLast], new: &mut [IoLast]| {
+        for io in new.iter_mut() {
+            if let Some(p) = prev.iter().find(|p| p.device == io.device) {
+                io.rx_rate = rate(p.rx, io.rx);
+                io.tx_rate = rate(p.tx, io.tx);
+            }
+        }
+    };
+    fill(&prev.detail.network, &mut new.detail.network);
+    fill(&prev.detail.disks, &mut new.detail.disks);
+}
+
+/// `new` 是否代表重新開機：兩筆都有 uptime、`new` 的取樣時間較晚且 uptime 變小。回傳 (之前, 之後)
+fn rebooted(prev: &LastReport, new: &LastReport) -> Option<(u64, u64)> {
+    let parse = |ts: &str| DateTime::parse_from_rfc3339(ts).ok();
+    let (p, n) = (prev.detail.uptime_secs?, new.detail.uptime_secs?);
+    let later = matches!((parse(&prev.ts), parse(&new.ts)), (Some(a), Some(b)) if b > a);
+    (later && n < p).then_some((p, n))
+}
+
+/// 以新的 report 取代 last_report：以上一筆算出計數器的速率，並判斷是否重新開機（回傳要發布的事件）
+fn replace_last_report(
+    agent_id: &str,
+    state: &mut AgentState,
+    mut report: LastReport,
+) -> Option<EventKind> {
+    let mut reboot = None;
+    if let Some(prev) = &state.last_report {
+        carry_rates(prev, &mut report);
+        if let Some((before, now)) = rebooted(prev, &report) {
+            let boot_time = DateTime::parse_from_rfc3339(&report.ts).ok().map(|t| {
+                fmt_time(
+                    t.with_timezone(&Utc)
+                        - chrono::Duration::seconds(i64::try_from(now).unwrap_or(0)),
+                )
+            });
+            reboot = Some(EventKind::HostRebooted {
+                agent_id: agent_id.to_string(),
+                hostname: state.hostname.to_string(),
+                uptime_secs: now,
+                previous_uptime_secs: before,
+                boot_time,
+            });
+        }
+    }
+    state.last_report = Some(Arc::new(report));
+    reboot
+}
+
+/// 主機資產的摘要（`inventory` 保存後；告警的每核心負載）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssetSummary {
+    pub logical_cores: Option<u32>,
+    pub os_family: Option<String>,
 }
 
 #[derive(Debug)]
@@ -246,6 +427,13 @@ pub struct AgentState {
     offline_key: Option<OfflineKey>,
     /// 連線是否協商了 durable（[`Registry::set_durable`]；由清冊載回、尚未連線時為 `None`）
     pub durable: Option<bool>,
+    /// 連線是否協商了 `inventory`、`processes`（[`Registry::set_features`]）
+    pub inventory: Option<bool>,
+    pub processes: Option<bool>,
+    /// 最近一次保存的資產摘要（[`Registry::set_assets`]）
+    pub assets: Option<Arc<AssetSummary>>,
+    /// 最近一次資產被拒（`KRS-W2108`）的時間與原因（[`Registry::set_inventory_rejected`]）
+    pub inventory_rejected: Option<(DateTime<Utc>, Arc<str>)>,
     /// 最近一次收到補送的資料（[`Registry::note_backfill`]）
     pub backfill: Option<Backfill>,
     /// 最近一次離線的原因（線上時保留上一次的值，供詳情顯示）
@@ -574,12 +762,16 @@ impl Registry {
         let mut previous_fingerprint = None;
         let mut was_online = false;
         let mut previous_reason = None;
+        let mut previous_assets = None;
+        let mut previous_rejected = None;
         let mut superseded_peer = None;
         let (kind, last_report, key) = match inner.remove(&info.agent_id) {
             None => (RegisterKind::New, None, Arc::<str>::from(info.agent_id)),
             Some(mut prev) => {
                 was_online = prev.online;
                 previous_reason = prev.offline_reason;
+                previous_assets = prev.assets.take();
+                previous_rejected = prev.inventory_rejected.take();
                 if let (Some(old), Some(new)) = (fingerprint(&prev.host), fingerprint(&info.host))
                     && old != new
                 {
@@ -630,6 +822,10 @@ impl Registry {
                 connected: true,
                 offline_key: None,
                 durable: None,
+                inventory: None,
+                processes: None,
+                assets: previous_assets,
+                inventory_rejected: previous_rejected,
                 backfill: None,
                 offline_reason: previous_reason,
                 kick_reason: None,
@@ -706,6 +902,10 @@ impl Registry {
                     connected: false,
                     offline_key: Some(key),
                     durable: None,
+                    inventory: None,
+                    processes: None,
+                    assets: None,
+                    inventory_rejected: None,
                     backfill: None,
                     offline_reason: None,
                     kick_reason: None,
@@ -770,6 +970,39 @@ impl Registry {
             && state.conn_id == conn_id
         {
             state.durable = Some(durable);
+        }
+    }
+
+    /// hello 通過後記錄這條連線是否協商了 `inventory`、`processes`（METRICS.md）；conn_id 不符時不更新
+    pub fn set_features(&self, agent_id: &str, conn_id: u64, inventory: bool, processes: bool) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+        {
+            state.inventory = Some(inventory);
+            state.processes = Some(processes);
+        }
+    }
+
+    /// 資產保存後記錄摘要（告警的每核心負載）；conn_id 不符時不更新
+    pub fn set_assets(&self, agent_id: &str, conn_id: u64, assets: AssetSummary) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+        {
+            state.assets = Some(Arc::new(assets));
+            // 之後的資產已保存：不再顯示「最近一次被拒」
+            state.inventory_rejected = None;
+        }
+    }
+
+    /// 資產被拒（`KRS-W2108`）：記下時間與原因（主控台 S05 的提示）；conn_id 不符時不更新
+    pub fn set_inventory_rejected(&self, agent_id: &str, conn_id: u64, reason: &str) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.agents.get_mut(agent_id)
+            && state.conn_id == conn_id
+        {
+            state.inventory_rejected = Some((Utc::now(), Arc::from(reason)));
         }
     }
 
@@ -841,6 +1074,10 @@ impl Registry {
             offline_after: s.offline_after,
             last_report: s.last_report.clone(),
             durable: s.durable,
+            inventory: s.inventory,
+            processes: s.processes,
+            assets: s.assets.clone(),
+            inventory_rejected: s.inventory_rejected.clone(),
             backfill: s.backfill,
             offline_reason: s.offline_reason,
             offline_for: if s.online {
@@ -887,12 +1124,18 @@ impl Registry {
     /// `reports-YYYY-MM-DD.jsonl` 一致。conn_id 不符時不更新並回傳 `false`。
     pub fn set_last_report(&self, agent_id: &str, conn_id: u64, report: LastReport) -> bool {
         let mut inner = self.lock();
-        match inner.agents.get_mut(agent_id) {
-            Some(state) if state.conn_id == conn_id => {
-                state.last_report = Some(Arc::new(report));
-                true
-            }
-            _ => false,
+        let reboot = match inner.agents.get_mut(agent_id) {
+            Some(state) if state.conn_id == conn_id => replace_last_report(agent_id, state, report),
+            _ => return false,
+        };
+        drop(inner);
+        self.publish_reboot(reboot);
+        true
+    }
+
+    fn publish_reboot(&self, reboot: Option<EventKind>) {
+        if let Some(kind) = reboot {
+            self.bus.publish(kind);
         }
     }
 
@@ -916,7 +1159,9 @@ impl Registry {
                     )
                 });
                 if !older {
-                    state.last_report = Some(Arc::new(report));
+                    let reboot = replace_last_report(agent_id, state, report);
+                    drop(inner);
+                    self.publish_reboot(reboot);
                 }
                 !older
             }
@@ -1151,6 +1396,7 @@ mod tests {
             total_memory: Some(100),
             used_memory: Some(50),
             metrics: None,
+            detail: Default::default(),
         }
     }
 
@@ -1879,5 +2125,83 @@ mod tests {
         assert!(!snap.agents[1].online);
         assert_eq!(snap.agents[0].offline_after_ms, 5000);
         assert_eq!(snap.agents[0].hostname, "host-a");
+    }
+
+    #[test]
+    fn counter_rates_and_reboots_are_derived_from_the_previous_report() {
+        let r = Registry::new();
+        let bus = r.bus();
+        let t0 = Instant::now();
+        let _a = r.register(1, hello("a", "p"), t0, Utc::now()).unwrap();
+        // 上線事件之後才訂閱
+        let mut events = bus.subscribe();
+        let at = |seq, ts: &str, rx: u64, uptime: u64| LastReport {
+            ts: ts.into(),
+            detail: ReportDetail {
+                uptime_secs: Some(uptime),
+                network: vec![IoLast {
+                    device: "eth0".into(),
+                    rx: Some(rx),
+                    tx: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..report(seq)
+        };
+        let rx_rate = || r.live_get("a").unwrap().last_report.unwrap().detail.network[0].rx_rate;
+        assert!(r.set_last_report("a", 1, at(1, "2026-10-08T00:00:00Z", 1000, 100)));
+        assert_eq!(rx_rate(), None);
+        assert!(r.set_last_report("a", 1, at(2, "2026-10-08T00:00:05Z", 6000, 105)));
+        assert_eq!(rx_rate(), Some(1000.0));
+        assert!(events.try_recv().is_err(), "沒有重新開機");
+        // uptime 變小：重新開機（沒有速率），發布事件
+        assert!(r.set_last_report_unless_older("a", 1, at(3, "2026-10-08T00:00:10Z", 7000, 3)));
+        assert_eq!(rx_rate(), None);
+        let ev = events.try_recv().unwrap();
+        match &ev.kind {
+            EventKind::HostRebooted {
+                agent_id,
+                uptime_secs,
+                previous_uptime_secs,
+                boot_time,
+                ..
+            } => {
+                assert_eq!(agent_id, "a");
+                assert_eq!((*uptime_secs, *previous_uptime_secs), (3, 105));
+                assert_eq!(boot_time.as_deref(), Some("2026-10-08T00:00:07.000Z"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // 補送的舊資料不取代、也不判斷重新開機
+        assert!(!r.set_last_report_unless_older("a", 1, at(4, "2026-10-08T00:00:01Z", 1, 1)));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn report_detail_is_kept_in_the_agents_snapshot_format() {
+        let d = ReportDetail {
+            uptime_secs: Some(5),
+            filesystems: vec![FsLast {
+                mountpoint: "/".into(),
+                usage: Some(75.0),
+                estimated: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let lr = LastReport {
+            detail: d,
+            ..report(1)
+        };
+        let v = serde_json::to_value(&lr).unwrap();
+        assert_eq!(v["uptime_secs"], 5);
+        assert_eq!(v["filesystems"][0]["estimated"], true);
+        // 沒有 F4 指標時與 0.7 的格式相同
+        let old = serde_json::to_value(report(1)).unwrap();
+        assert!(old.get("filesystems").is_none() && old.get("uptime_secs").is_none());
+        let back: LastReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back, lr);
+        assert_eq!(back.detail.top_filesystem().unwrap().mountpoint, "/");
     }
 }

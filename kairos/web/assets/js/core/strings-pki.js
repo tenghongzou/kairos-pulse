@@ -28,8 +28,10 @@ export const PKI_STRINGS = {
   'pki.mode.paused.title': '新註冊已自動暫停',
   'pki.mode.paused.body': '目前沒有有效 token，新註冊已自動暫停。建立 token 後會自動恢復。',
   'pki.mode.renewOnly.title': '註冊端點目前為僅續簽',
-  'pki.mode.renewOnly.body': '以 token 送出的註冊申請會被拒絕（agent 端 PLS-E2008）。安裝字串與指令的「複製」已停用，token 仍可建立；需要開放時請管理員到系統設定修改。',
+  'pki.mode.renewOnly.body': '以 token 送出的註冊申請會被拒絕（agent 端 PLS-E2008）。安裝字串與指令的「複製」已停用，token 仍可建立。',
+  'pki.mode.renewOnly.askAdmin': '需要開放時，請管理員到系統設定開放。',
   'pki.mode.closed.title': '註冊端點已關閉',
+  'pki.mode.toSettings': '前往系統設定',
   'pki.mode.closed.body': 'agent 無法送出註冊申請（agent 端 PLS-E2007），過期續簽也已停止。安裝字串與指令的「複製」已停用，token 仍可建立。',
   'pki.mode.notListening.title': '註冊端點沒有在監聽',
 
@@ -186,6 +188,8 @@ export const PKI_STRINGS = {
   'enroll.col.result': '結果',
   'enroll.col.by': '執行者／原因',
   'enroll.who': '{host}（{code}）',
+  // 結果訊息的括號內（screens.md S13：「（HMI-L3-062，申請編號 Q8WM-4TZA）」，不重複括號）
+  'enroll.whoInline': '{host}，申請編號 {code}',
   'enroll.hostA11y': '{host}（申請編號 {code}）',
   'enroll.selectAllClean': '全選無異常的申請',
   'enroll.selectRow': '選取 {host}（申請編號 {code}）',

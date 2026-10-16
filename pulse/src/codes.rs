@@ -48,6 +48,12 @@ events! {
     AGENT_FATAL = "agent.fatal", Some(1020);
     /// 系統資訊取樣逾時（`PLS-W8005`）
     SAMPLE_TIMEOUT = "sample.timeout", Some(1030);
+    /// 採集範圍摘要：超過每類上限而略過的掛載點、磁碟 I/O 裝置、網路介面（`pulse/log-ux.md`
+    /// §4 的 `sysinfo.snapshot`，1010；METRICS.md 第 4.3 節）
+    SYSINFO_SNAPSHOT = "sysinfo.snapshot", Some(1010);
+    /// 部分系統資訊因權限或平台限制無法取得（`PLS-I8009`；METRICS.md 第 4.5 節）。
+    /// Windows 事件識別碼待設計組分配
+    SYSINFO_LIMITED = "sysinfo.limited", None;
     // ---- 2xxx 連線 ----
     /// 收到 hello_ack，已註冊
     CONN_REGISTERED = "conn.registered", Some(2000);
@@ -83,6 +89,9 @@ events! {
     REPORT_SKIPPED = "report.skipped", Some(2401);
     /// 無法解析的行、重複 hello_ack 等（`PLS-W2107`）
     SERVER_UNEXPECTED = "server.unexpected", Some(2402);
+    /// Kairos 拒收或暫時無法保存資產資訊（`PLS-W2108`；METRICS.md 第 6.3 節）。
+    /// Windows 事件識別碼待設計組分配
+    INVENTORY_REJECTED = "inventory.rejected", None;
     // ---- 3xxx 身分與憑證 ----
     /// 用戶端憑證即將到期（`PLS-W1110`）
     CERT_EXPIRING = "cert.expiring", Some(3000);
@@ -193,6 +202,8 @@ pub const E_LINE_TOO_LONG: &str = "PLS-E2103";
 pub const E_HELLO_BAD_REQUEST: &str = "PLS-E2104";
 pub const W_INVALID_REPORT: &str = "PLS-W2105";
 pub const W_SERVER_UNEXPECTED: &str = "PLS-W2107";
+/// 資產資訊被伺服器拒絕（設計包 `decisions/INTEGRATION.md` §30.3；METRICS.md 第 6.3 節）
+pub const W_INVENTORY_REJECTED: &str = "PLS-W2108";
 pub const E_PER_IP_LIMIT: &str = "PLS-E2201";
 pub const W_REPORT_RATE: &str = "PLS-W2203";
 pub const W_SUPERSEDED: &str = "PLS-W3101";
@@ -208,11 +219,17 @@ pub const E_SERVICE_NOT_INSTALLED: &str = "PLS-E8002";
 pub const E_SERVICE_NOT_RUNNING: &str = "PLS-E8003";
 pub const W_STATUS_STALE: &str = "PLS-W8004";
 pub const W_SAMPLE_TIMEOUT: &str = "PLS-W8005";
+/// 部分系統資訊無法取得（設計包 §30.3；`8006`～`8008` 為安裝前檢查）
+pub const I_SYSINFO_LIMITED: &str = "PLS-I8009";
 pub const W_SYSTEM32_WORKDIR: &str = "PLS-W8101";
 pub const W_AGENT_ID_PERMS: &str = "PLS-W8201";
 pub const W_KEY_PERMS: &str = "PLS-W8202";
 pub const E_NEED_ADMIN: &str = "PLS-E8203";
 pub const E_STATUS_UNWRITABLE: &str = "PLS-E8204";
+/// Windows 服務無法安裝、移除或啟動（`pulse service install|uninstall`；設計包 §30.3，子類別 81）
+pub const E_SERVICE_INSTALL: &str = "PLS-E8105";
+/// `pulse service run` 不是由服務控制管理員啟動，或無法切換到工作目錄（設計包 §30.3，子類別 81）
+pub const E_SERVICE_RUN: &str = "PLS-E8106";
 pub const W_CLOCK_SKEW: &str = "PLS-W8301";
 pub const E_CLOCK_SKEW: &str = "PLS-E8302";
 pub const E_CERT_NOT_YET_VALID: &str = "PLS-E8304";
@@ -292,6 +309,7 @@ const ALL_CODES: &[&str] = &[
     E_HELLO_BAD_REQUEST,
     W_INVALID_REPORT,
     W_SERVER_UNEXPECTED,
+    W_INVENTORY_REJECTED,
     E_PER_IP_LIMIT,
     W_REPORT_RATE,
     W_SUPERSEDED,
@@ -307,11 +325,14 @@ const ALL_CODES: &[&str] = &[
     E_SERVICE_NOT_RUNNING,
     W_STATUS_STALE,
     W_SAMPLE_TIMEOUT,
+    I_SYSINFO_LIMITED,
     W_SYSTEM32_WORKDIR,
     W_AGENT_ID_PERMS,
     W_KEY_PERMS,
     E_NEED_ADMIN,
     E_STATUS_UNWRITABLE,
+    E_SERVICE_INSTALL,
+    E_SERVICE_RUN,
     W_CLOCK_SKEW,
     E_CLOCK_SKEW,
     E_CERT_NOT_YET_VALID,
@@ -391,6 +412,7 @@ pub fn title(code: &str) -> Option<&'static str> {
         E_HELLO_BAD_REQUEST => "無法註冊：Kairos 認為註冊資料不合法",
         W_INVALID_REPORT => "Kairos 拒收回報資料",
         W_SERVER_UNEXPECTED => "Kairos 的回應無法解析或不合預期",
+        W_INVENTORY_REJECTED => "資產資訊被伺服器拒絕",
         E_PER_IP_LIMIT => "無法連線：同一 IP 的連線數超過 Kairos 的上限",
         W_REPORT_RATE => "回報速率超過 Kairos 的上限",
         W_SUPERSEDED => "連線被同一 agent_id 的新連線取代",
@@ -406,11 +428,14 @@ pub fn title(code: &str) -> Option<&'static str> {
         E_SERVICE_NOT_RUNNING => "Pulse 服務未執行",
         W_STATUS_STALE => "狀態檔過時，Pulse 可能卡住",
         W_SAMPLE_TIMEOUT => "系統資訊取樣逾時",
+        I_SYSINFO_LIMITED => "部分系統資訊無法取得",
         W_SYSTEM32_WORKDIR => "Windows 服務的工作目錄是 System32",
         W_AGENT_ID_PERMS => "agent.id 權限過寬",
         W_KEY_PERMS => "私鑰檔案權限過寬",
         E_NEED_ADMIN => "需要系統管理員權限",
         E_STATUS_UNWRITABLE => "無法寫入狀態檔",
+        E_SERVICE_INSTALL => "無法安裝或移除 Windows 服務",
+        E_SERVICE_RUN => "服務進入點無法執行",
         W_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 30 秒",
         E_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 5 分鐘",
         E_CERT_NOT_YET_VALID => "用戶端憑證尚未生效（本機時鐘可能落後）",

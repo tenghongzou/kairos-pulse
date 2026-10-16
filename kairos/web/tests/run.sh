@@ -86,6 +86,8 @@ TMP="$(mktemp -d -t kairos-web-XXXXXX)"
 KAIROS_PID=""
 PKI_PID=""
 cleanup() {
+    # 保留原本的結束代碼（測試失敗時 run.sh 必須以非 0 結束，不被清理動作蓋掉）
+    local rc=$?
     for pid in "$KAIROS_PID" "$PKI_PID"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
@@ -93,6 +95,7 @@ cleanup() {
         fi
     done
     if [ "${KEEP:-0}" = "1" ]; then echo "保留暫存目錄：$TMP"; else rm -rf "$TMP"; fi
+    exit "$rc"
 }
 trap cleanup EXIT
 
@@ -167,3 +170,4 @@ curl -sk "https://127.0.0.1:$CONSOLE_PORT/healthz" >/dev/null || { cat "$TMP/kai
 mkdir -p "$OUT_DIR"
 export KAIROS_URL="https://localhost:$CONSOLE_PORT" AGENT_PORT PW NEWBIE_PW OUT_DIR PW_DIR KAIROS_LOG="$TMP/kairos.out"
 NODE_PATH="$PW_DIR/node_modules" "$NODE" "$HERE/e2e.mjs"
+# set -e：e2e.mjs 非 0 時 run.sh 立即以同樣的代碼結束（cleanup 保留它）

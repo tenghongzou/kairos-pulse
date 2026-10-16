@@ -29,6 +29,8 @@ pub(crate) struct Fixture {
     pub console: Console,
     pub registry: Arc<Registry>,
     pub sink: ReportSink,
+    /// 資產的寫入佇列（SQLite 後端）
+    pub assets: Option<crate::store::AssetSink>,
     pub token: String,
     pub shutdown: Arc<Shutdown>,
     writer: tokio::task::JoinHandle<()>,
@@ -53,6 +55,7 @@ impl Fixture {
             crate::alerts::AlertService::join(t, Duration::from_secs(10)).await;
         }
         drop(self.sink);
+        drop(self.assets);
         let _ = tokio::time::timeout(Duration::from_secs(10), self.writer).await;
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -153,6 +156,7 @@ pub(crate) async fn fixture_opts(
             crls: Vec::new(),
             issuing_cas: None,
             issuing_crl: None,
+            retired_cas: None,
         })
         .unwrap(),
     ));
@@ -224,6 +228,7 @@ pub(crate) async fn fixture_opts(
         console,
         registry,
         sink: storage.reports,
+        assets: storage.assets,
         token,
         shutdown,
         writer,
@@ -840,6 +845,19 @@ async fn hosts_metrics_overview_and_health_over_https() {
     assert_eq!(item("report_writes")["status"], "ok");
     assert_eq!(item("delivery")["values"]["durable"], 1);
     assert!(item("tls")["values"]["expiries"].as_array().unwrap().len() == 1);
+    // 0.8：/metrics 端點與告警引擎併入（設計包 §29.6）；沒有註冊服務時不列簽發 CA 與註冊端點
+    assert_eq!(item("metrics")["status"], "ok");
+    assert_eq!(item("metrics")["summary"], "只接受本機（loopback）");
+    assert_eq!(item("metrics")["values"]["token"], false);
+    // 0.4 的 read 範圍 token 沒有 alerts:read（告警是 0.6 才有）：只有狀態，細節省略
+    assert_eq!(item("alerts")["status"], "ok");
+    assert_eq!(item("alerts")["restricted"], true);
+    assert_eq!(item("alerts")["summary"], "");
+    assert!(
+        !items
+            .iter()
+            .any(|i| i["id"] == "enroll" || i["id"] == "issuing_ca")
+    );
     assert_eq!(v["data"]["service"]["version"], env!("CARGO_PKG_VERSION"));
 
     // /me
@@ -1291,5 +1309,263 @@ async fn facets_connections_and_certificate_summary() {
     .unwrap();
     let v = get(&f, &format!("/api/v1/hosts/{A}")).await.json();
     assert_eq!(v["data"]["certificate"]["state"], "revoked");
+    f.stop().await;
+}
+
+/// F4（METRICS.md 第 10 節）：計數器的速率與 `transform`、推算的使用率、資產與變更歷史、行程快照、
+/// 主機清單的資產欄位與篩選、總覽的磁碟排行
+#[tokio::test]
+async fn rates_estimates_inventory_and_processes() {
+    let f = fixture("f4", |_| {}).await;
+    let now = Utc::now();
+    let _a = f
+        .registry
+        .register(41, hello(A, "web-01", "10.30.3.27:1"), Instant::now(), now)
+        .unwrap();
+    let store = |record| {
+        let registry = f.registry.clone();
+        let sink = f.sink.clone();
+        async move {
+            let revived = std::sync::atomic::AtomicBool::new(false);
+            let outcome = crate::connection::store_report(
+                &registry,
+                &sink,
+                41,
+                record,
+                Duration::from_secs(5),
+                &revived,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                crate::connection::StoreOutcome::Stored(_)
+            ));
+        }
+    };
+    let processes: kairos_proto::ProcessList = serde_json::from_value(serde_json::json!({
+        "top_cpu": [{"pid": 2211, "name": "postgres", "cpu_usage": 9.41, "memory": 4294967296_u64}],
+        "top_memory": [{"pid": 1873, "name": "java", "cpu_usage": 3.2, "memory": 8589934592_u64}]
+    }))
+    .unwrap();
+    for (i, secs) in [120, 60, 0].iter().enumerate() {
+        let at = now - chrono::Duration::seconds(*secs);
+        let mut r = pulse_like(A, i as u64 + 1, at, 10.0);
+        // 時間取 recv_at（非 durable）；ts 欄位一致
+        r.ts = crate::storage::fmt_time(at);
+        if i == 1 {
+            r = r.with_processes(Some(processes.clone()));
+        }
+        store(r).await;
+    }
+    // 計數器：預設為每秒速率（pulse_like 每筆 +1500 bytes、間隔 60 秒 → 25 B/s）
+    let v = get(
+        &f,
+        &format!("/api/v1/hosts/{A}/metrics/system.network.received?range=1h&label.device=eth0"),
+    )
+    .await
+    .json();
+    let d = &v["data"];
+    assert_eq!(d["kind"], "counter");
+    assert_eq!(d["transform"], "rate");
+    let s = &d["series"][0];
+    assert_eq!(s["unit"], "By/s");
+    assert_eq!(s["derived"], "rate");
+    let points = s["points"].as_array().unwrap();
+    assert_eq!(points.len(), 2, "{points:?}");
+    assert!((points[0]["avg"].as_f64().unwrap() - 25.0).abs() < 0.01);
+    // 5 分鐘解析度（尚未寫出彙總的部分由原始資料算）也是速率
+    let v = get(
+        &f,
+        &format!("/api/v1/hosts/{A}/metrics/system.network.received?range=1h&resolution=5m&label.device=eth0"),
+    )
+    .await
+    .json();
+    let count: u64 = v["data"]["series"][0]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(count, 2);
+    // transform=none：原始累計值（只有原始資料）
+    let v = get(
+        &f,
+        &format!("/api/v1/hosts/{A}/metrics/system.network.received?range=1h&transform=none&label.device=eth0"),
+    )
+    .await
+    .json();
+    assert_eq!(v["data"]["series"][0]["unit"], "By");
+    assert!(v["data"]["series"][0].get("derived").is_none());
+    assert_eq!(
+        v["data"]["series"][0]["points"].as_array().unwrap().len(),
+        3
+    );
+    for q in ["transform=none&resolution=5m", "transform=delta"] {
+        let r = get(
+            &f,
+            &format!("/api/v1/hosts/{A}/metrics/system.network.received?range=1h&{q}"),
+        )
+        .await;
+        assert_eq!(r.status, 400, "{q}");
+        assert_eq!(r.json()["error"]["code"], "invalid_parameter");
+    }
+    // 量測值忽略 transform；序列只列出這台主機的
+    let v = get(
+        &f,
+        &format!("/api/v1/hosts/{A}/metrics/system.cpu.usage?range=1h&transform=none"),
+    )
+    .await
+    .json();
+    assert_eq!(v["data"]["kind"], "gauge");
+    assert_eq!(v["data"]["series"].as_array().unwrap().len(), 1);
+    // 推算的使用率（pulse_like 沒有 usage）：每個掛載點一條、標示推算
+    let v = get(
+        &f,
+        &format!("/api/v1/hosts/{A}/metrics/system.filesystem.usage?range=1h&label.mountpoint=%2F"),
+    )
+    .await
+    .json();
+    let s = &v["data"]["series"][0];
+    assert_eq!(s["derived"], "estimated");
+    assert_eq!(s["unit"], "%");
+    let p = &s["points"][0];
+    assert_eq!(p["estimated"], true);
+    let expected = (502_468_108_288.0 - (211_312_345_088.0 - 512.0)) / 502_468_108_288.0 * 100.0;
+    assert!((p["avg"].as_f64().unwrap() - expected).abs() < 0.01, "{p}");
+    // 指標清單：kind、standard、推算的使用率
+    let v = get(&f, &format!("/api/v1/hosts/{A}/metrics")).await.json();
+    let list = v["data"]["metrics"].as_array().unwrap();
+    let rx = list
+        .iter()
+        .find(|m| m["name"] == "system.network.received")
+        .unwrap();
+    assert_eq!(
+        (rx["kind"].as_str(), rx["standard"].as_bool()),
+        (Some("counter"), Some(true))
+    );
+    assert!(list.iter().any(|m| m["name"] == "system.filesystem.usage"
+        && m["derived"] == "estimated"
+        && m["labels"]["mountpoint"] == "/data"));
+
+    // 資產：還沒有 inventory 時以 hello 的 os 代替
+    let v = get(&f, &format!("/api/v1/hosts/{A}/inventory"))
+        .await
+        .json();
+    assert_eq!(v["data"]["source"], "hello");
+    assert_eq!(v["data"]["inventory"]["os"]["name"], "Ubuntu");
+    assert_eq!(v["data"]["supported"], false);
+    let assets = f.assets.clone().unwrap();
+    let write = |ms: i64, inv: serde_json::Value| crate::store::AssetWrite {
+        agent_id: A.into(),
+        hostname: "web-01".into(),
+        peer: "10.30.3.27:1".into(),
+        collected_ms: ms,
+        received_ms: ms,
+        inventory: serde_json::from_value(inv).unwrap(),
+    };
+    let t = now.timestamp_millis();
+    assets
+        .write(
+            write(
+                t - 1000,
+                serde_json::json!({
+                    "os": {"family": "linux", "name": "Ubuntu", "long_version": "Linux (Ubuntu 24.04)"},
+                    "boot_time": "2026-10-02T08:11:04Z",
+                    "cpu": {"model": "Xeon", "logical_cores": 8},
+                    "memory": {"total": 8_589_934_592_u64},
+                    "system": {"vendor": "QEMU", "product": "Standard PC", "serial": "SN-1"},
+                    "disks": [{"mountpoint": "/", "total": 100, "kind": "hdd"}]
+                }),
+            ),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assets
+        .write(
+            write(
+                t,
+                serde_json::json!({"memory": {"total": 17_179_869_184_u64}}),
+            ),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let v = get(&f, &format!("/api/v1/hosts/{A}/inventory"))
+        .await
+        .json();
+    let d = &v["data"];
+    assert_eq!(d["source"], "inventory");
+    assert_eq!(d["inventory"]["system"]["serial"], "SN-1");
+    assert_eq!(d["inventory"]["memory"]["total"], 17_179_869_184_u64);
+    assert_eq!(d["boot_time"], "2026-10-02T08:11:04.000Z");
+    assert!(d["digest"].as_str().unwrap().starts_with("sha256:"));
+    let v = get(&f, &format!("/api/v1/hosts/{A}/inventory/changes?limit=1"))
+        .await
+        .json();
+    let items = v["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["changes"][0]["path"], "memory.total");
+    assert_eq!(v["data"]["next"], Value::Null);
+    for q in ["limit=0", "limit=201", "before=x", "foo=1"] {
+        let r = get(&f, &format!("/api/v1/hosts/{A}/inventory/changes?{q}")).await;
+        assert_eq!(r.status, 400, "{q}");
+    }
+    // 行程快照：最新一筆；at 早於第一筆時沒有資料
+    let v = get(&f, &format!("/api/v1/hosts/{A}/processes"))
+        .await
+        .json();
+    assert_eq!(v["data"]["top_cpu"][0]["name"], "postgres");
+    assert_eq!(v["data"]["top_memory"][0]["pid"], 1873);
+    assert!(v["data"]["sampled_at"].is_string());
+    let v = get(
+        &f,
+        &format!("/api/v1/hosts/{A}/processes?at=2020-01-01T00:00:00Z"),
+    )
+    .await
+    .json();
+    assert_eq!(v["data"]["sampled_at"], Value::Null);
+    assert_eq!(v["data"]["top_cpu"], serde_json::json!([]));
+    let r = get(&f, &format!("/api/v1/hosts/{A}/processes?at=yesterday")).await;
+    assert_eq!(r.status, 400);
+    for sub in ["inventory", "inventory/changes", "processes"] {
+        let r = get(&f, &format!("/api/v1/hosts/{C}/{sub}")).await;
+        assert_eq!(r.status, 404, "{sub}");
+        assert_eq!(r.json()["error"]["code"], "host_not_found");
+    }
+
+    // 主機清單：資產摘要（不含序號）、作業系統家族的篩選、依磁碟排序；詳情含序號
+    f.console.ctx.hosts.invalidate().await;
+    let v = get(&f, "/api/v1/hosts?os_family=linux&sort=-disk")
+        .await
+        .json();
+    let h = &v["data"][0];
+    assert_eq!(h["agent_id"], A);
+    assert_eq!(h["inventory"]["cpu_logical_cores"], 8);
+    assert!(h["inventory"].get("serial").is_none(), "{h}");
+    assert_eq!(h["os_family"], "linux");
+    assert_eq!(h["last_report"]["disk"]["estimated"], true);
+    assert!(h["uptime_secs"].is_null() || h["uptime_secs"].is_i64());
+    assert_eq!(
+        get(&f, "/api/v1/hosts?os_family=windows").await.json()["page"]["total"],
+        0
+    );
+    assert_eq!(get(&f, "/api/v1/hosts?os_family=mac").await.status, 400);
+    assert_eq!(get(&f, "/api/v1/hosts?sort=uptime").await.status, 200);
+    let v = get(&f, &format!("/api/v1/hosts/{A}")).await.json();
+    assert_eq!(v["data"]["inventory"]["serial"], "SN-1");
+    assert_eq!(
+        v["data"]["last_report"]["filesystems"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(v["data"]["last_report"]["network"][0]["device"], "eth0");
+    let v = get(&f, "/api/v1/hosts/facets").await.json();
+    assert_eq!(v["data"]["os_family"]["values"][0]["value"], "linux");
+    let v = get(&f, "/api/v1/overview").await.json();
+    assert_eq!(v["data"]["top_disk"][0]["agent_id"], A);
+    assert_eq!(v["data"]["top_disk"][0]["disk"]["estimated"], true);
     f.stop().await;
 }

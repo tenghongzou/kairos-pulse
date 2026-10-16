@@ -8,7 +8,7 @@
 //!   紀錄屬於之後的版本），回 `supported: false` 並說明原因，不提供不準確的數字。
 
 use chrono::FixedOffset;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -25,9 +25,138 @@ pub const MAX_DAYS: u32 = 31;
 type Series = Vec<(i64, f64)>;
 
 fn series_ids(conn: &Connection, name: &str) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT series_id FROM series WHERE name = ?1 AND labels = ''")?;
+    let mut stmt = conn
+        .prepare("SELECT series_id FROM series WHERE name = ?1 AND labels = '' AND derived = 0")?;
     let rows = stmt.query_map([name], |r| r.get(0))?;
     rows.collect()
+}
+
+/// 這台主機某個名稱的序列（有 label 的指標，例如每個掛載點）：(series_id, label 的值, derived)
+fn labeled_series(
+    conn: &Connection,
+    host_id: i64,
+    name: &str,
+    label: &str,
+) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.series_id, s.labels, s.derived FROM series s JOIN host_series h USING (series_id)
+         WHERE h.host_id = ?1 AND s.name = ?2",
+    )?;
+    let rows = stmt.query_map(params![host_id, name], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, labels, derived) = row?;
+        let map: BTreeMap<String, String> = serde_json::from_str(&labels).unwrap_or_default();
+        if let Some(v) = map.get(label) {
+            out.push((id, v.clone(), derived));
+        }
+    }
+    Ok(out)
+}
+
+/// 一台主機在試算期間的資料：每個對象（磁碟為掛載點、網路為介面；其他為一個）一條等間隔的序列
+fn host_data(
+    conn: &Connection,
+    table: &str,
+    host_id: i64,
+    metric: &str,
+    params_v: &Value,
+    from: i64,
+    std_ids: &(Vec<i64>, Vec<i64>),
+) -> rusqlite::Result<Vec<Series>> {
+    use super::rules::metric as m;
+    let ratio = |a: BTreeMap<i64, f64>, b: &BTreeMap<i64, f64>, scale: f64| -> Series {
+        a.iter()
+            .filter_map(|(t, u)| {
+                b.get(t)
+                    .filter(|tot| **tot > 0.0)
+                    .map(|tot| (*t, u / tot * scale))
+            })
+            .collect()
+    };
+    let in_scope = |key: &str, name: &str| {
+        super::rules::globs(params_v, key)
+            .is_none_or(|g| g.iter().any(|p| super::rules::glob_match(p, name)))
+    };
+    Ok(match metric {
+        m::MEMORY | m::SWAP => {
+            let a = load_series(conn, table, host_id, &std_ids.0, from)?;
+            let b = load_series(conn, table, host_id, &std_ids.1, from)?;
+            vec![ratio(a, &b, 100.0)]
+        }
+        m::LOAD => {
+            let cores: Option<i64> = conn
+                .query_row(
+                    "SELECT cpu_logical_cores FROM host_inventory WHERE host_id = ?1",
+                    [host_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            match cores.filter(|c| *c > 0) {
+                Some(c) => vec![
+                    load_series(conn, table, host_id, &std_ids.0, from)?
+                        .into_iter()
+                        .map(|(t, v)| (t, v / c as f64))
+                        .collect(),
+                ],
+                None => Vec::new(),
+            }
+        }
+        m::DISK => {
+            // 每個掛載點：Pulse 送的使用率優先，沒有時用推算值（0.2.0～0.7.0 的 Pulse）
+            let mut by_mount: BTreeMap<String, BTreeMap<i64, f64>> = BTreeMap::new();
+            let mut list = labeled_series(
+                conn,
+                host_id,
+                kairos_proto::METRIC_FILESYSTEM_USAGE,
+                "mountpoint",
+            )?;
+            list.sort_by_key(|(_, _, derived)| std::cmp::Reverse(*derived));
+            for (id, mount, _) in list {
+                if !in_scope("mountpoints", &mount) {
+                    continue;
+                }
+                let data = load_series(conn, table, host_id, &[id], from)?;
+                by_mount.entry(mount).or_default().extend(data);
+            }
+            by_mount
+                .into_values()
+                .map(|d| d.into_iter().collect())
+                .collect()
+        }
+        m::NETWORK_RX | m::NETWORK_TX => {
+            let name = if metric == m::NETWORK_RX {
+                kairos_proto::METRIC_NETWORK_RECEIVED
+            } else {
+                kairos_proto::METRIC_NETWORK_TRANSMITTED
+            };
+            let mut out = Vec::new();
+            for (id, dev, derived) in labeled_series(conn, host_id, name, "device")? {
+                if derived != crate::store::derive::DERIVED_RATE || !in_scope("devices", &dev) {
+                    continue;
+                }
+                out.push(
+                    load_series(conn, table, host_id, &[id], from)?
+                        .into_iter()
+                        .map(|(t, v)| (t, v * 8.0 / 1_000_000.0))
+                        .collect(),
+                );
+            }
+            out
+        }
+        _ => vec![
+            load_series(conn, table, host_id, &std_ids.0, from)?
+                .into_iter()
+                .collect(),
+        ],
+    })
 }
 
 fn load_series(
@@ -197,17 +326,34 @@ pub fn preview(
         ("rollup_5m", 300)
     };
     let from = now_ms / 1000 - i64::from(days) * 86_400;
-    let (num, den) = if metric == "memory" {
-        (
+    use super::rules::metric as m;
+    let std_ids = match metric {
+        m::MEMORY => (
             series_ids(conn, crate::protocol::METRIC_MEMORY_USED)?,
             series_ids(conn, crate::protocol::METRIC_MEMORY_TOTAL)?,
-        )
-    } else {
-        (
+        ),
+        m::SWAP => (
+            series_ids(conn, kairos_proto::METRIC_SWAP_USED)?,
+            series_ids(conn, kairos_proto::METRIC_SWAP_TOTAL)?,
+        ),
+        m::LOAD => (
+            series_ids(conn, kairos_proto::METRIC_CPU_LOAD_5M)?,
+            Vec::new(),
+        ),
+        _ => (
             series_ids(conn, crate::protocol::METRIC_CPU_USAGE)?,
             Vec::new(),
-        )
+        ),
     };
+    let mut without_metric = 0u64;
+    // 沒有回報的原因（設計包 §30.5 #5）：舊版 Pulse、Windows（負載）、沒有資料
+    let mut not_reported: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut swap_zero = 0u64;
+    let mut items_in_scope = 0u64;
+    let mut info_stmt = conn.prepare(
+        "SELECT h.agent_version, h.os, i.os_family, i.cpu_logical_cores FROM hosts h
+         LEFT JOIN host_inventory i ON i.host_id = h.host_id WHERE h.host_id = ?1",
+    )?;
     let mut fires = 0u64;
     let mut quick = 0u64;
     let mut involved = 0u64;
@@ -217,48 +363,68 @@ pub fn preview(
     let mut alt: BTreeMap<i64, u64> = BTreeMap::new();
     let candidates = [for_secs * 3 / 2, for_secs * 2, for_secs.max(900)];
     for (host_id, agent, name) in &hosts {
-        let a = load_series(conn, table, *host_id, &num, from)?;
-        let data: Series = if metric == "memory" {
-            let b = load_series(conn, table, *host_id, &den, from)?;
-            a.iter()
-                .filter_map(|(t, u)| {
-                    b.get(t)
-                        .filter(|tot| **tot > 0.0)
-                        .map(|tot| (*t, u / tot * 100.0))
-                })
-                .collect()
-        } else {
-            a.into_iter().collect()
-        };
-        if let Some((t, _)) = data.first() {
-            oldest = Some(oldest.map_or(*t, |o: i64| o.min(*t)));
+        let all = host_data(conn, table, *host_id, metric, p, from, &std_ids)?;
+        if matches!(metric, m::DISK | m::NETWORK_RX | m::NETWORK_TX) {
+            items_in_scope += all.len() as u64;
         }
-        let r = replay(&data, step, op, threshold, for_secs, clear, clear_for);
-        if !r.fires.is_empty() {
+        if all.iter().all(|d| d.is_empty()) {
+            // 這台主機沒有回報這個指標（舊版 Pulse、Windows 的負載、沒有資產的主機）
+            without_metric += 1;
+            let (version, os, family, cores): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+            ) = info_stmt.query_row([host_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            let windows = family.as_deref() == Some("windows")
+                || os.is_some_and(|o| o.to_lowercase().contains("windows"));
+            let old = version
+                .as_deref()
+                .is_some_and(|v| crate::api::hosts::version_before(v, (0, 8)));
+            let reason = match metric {
+                m::LOAD if windows => "windows",
+                m::SWAP | m::LOAD if old => "old_pulse",
+                m::LOAD if cores.is_none() => "no_inventory",
+                _ => "no_data",
+            };
+            *not_reported.entry(reason).or_default() += 1;
+        } else if metric == m::SWAP && all.iter().all(|d| d.iter().all(|(_, v)| v.is_nan())) {
+            swap_zero += 1;
+        }
+        let mut host_fires = 0;
+        for data in &all {
+            if let Some((t, _)) = data.first() {
+                oldest = Some(oldest.map_or(*t, |o: i64| o.min(*t)));
+            }
+            let r = replay(data, step, op, threshold, for_secs, clear, clear_for);
+            host_fires += r.fires.len();
+            for (at, dur) in &r.fires {
+                fires += 1;
+                if dur.is_some_and(|d| d <= 600) {
+                    quick += 1;
+                }
+                let day = chrono::DateTime::from_timestamp(*at, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&offset)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                *per_day.entry(day).or_default() += 1;
+            }
+            for c in candidates {
+                if c > for_secs {
+                    *alt.entry(c).or_default() +=
+                        replay(data, step, op, threshold, c, clear, clear_for)
+                            .fires
+                            .len() as u64;
+                }
+            }
+        }
+        if host_fires > 0 {
             involved += 1;
             if examples.len() < 5 {
-                examples
-                    .push(json!({ "agent_id": agent, "hostname": name, "fires": r.fires.len() }));
-            }
-        }
-        for (at, dur) in &r.fires {
-            fires += 1;
-            if dur.is_some_and(|d| d <= 600) {
-                quick += 1;
-            }
-            let day = chrono::DateTime::from_timestamp(*at, 0)
-                .unwrap_or_default()
-                .with_timezone(&offset)
-                .format("%Y-%m-%d")
-                .to_string();
-            *per_day.entry(day).or_default() += 1;
-        }
-        for c in candidates {
-            if c > for_secs {
-                *alt.entry(c).or_default() +=
-                    replay(&data, step, op, threshold, c, clear, clear_for)
-                        .fires
-                        .len() as u64;
+                examples.push(json!({ "agent_id": agent, "hostname": name, "fires": host_fires }));
             }
         }
     }
@@ -300,6 +466,10 @@ pub fn preview(
         "resolution_secs": step,
         "approximate": true,
         "hosts_in_scope": hosts.len(),
+        "hosts_without_metric": without_metric,
+        "not_reported": not_reported,
+        "swap_total_zero": swap_zero,
+        "items_in_scope": matches!(metric, m::DISK | m::NETWORK_RX | m::NETWORK_TX).then_some(items_in_scope),
         "fires": fires,
         "hosts_involved": involved,
         "self_recovered_within_10m": quick,
@@ -351,5 +521,85 @@ mod tests {
         let r = replay(&data(&[5.0, 5.0, 50.0]), 300, "<", 10.0, 300, None, 0);
         assert_eq!(r.fires.len(), 1);
         assert_eq!(r.fires[0].1, Some(600));
+    }
+
+    #[test]
+    fn f4_metrics_replay_per_mountpoint_and_count_hosts_without_the_metric() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::store::sqlite::migrate(&mut conn, crate::store::sqlite::MIGRATIONS).unwrap();
+        let now_ms: i64 = 1_800_000_000_000;
+        let start = now_ms / 1000 - 3600;
+        conn.execute_batch(
+            "INSERT INTO hosts (host_id, agent_id, hostname, agent_version, os, first_seen, last_seen) VALUES
+               (1, 'a', 'linux-08', '0.8.0', NULL, 0, 0),
+               (2, 'b', 'win-08', '0.8.0', '{\"name\":\"Windows\"}', 0, 0),
+               (3, 'c', 'linux-07', '0.7.0', NULL, 0, 0);
+             INSERT INTO host_inventory (host_id, digest, body, collected_at, received_at, changed_at, os_family, cpu_logical_cores)
+               VALUES (1, 'd', '{}', 0, 0, 0, 'linux', 4), (2, 'd', '{}', 0, 0, 0, 'windows', 8);
+             INSERT INTO series (series_id, name, unit, labels, derived) VALUES
+               (10, 'system.filesystem.usage', '%', '{\"mountpoint\":\"/\"}', 0),
+               (11, 'system.filesystem.usage', '%', '{\"mountpoint\":\"/data\"}', 0),
+               (12, 'system.filesystem.usage', '%', '{\"mountpoint\":\"/\"}', 2),
+               (20, 'system.cpu.load_5m', '1', '', 0);
+             INSERT INTO host_series VALUES (1, 10), (1, 11), (3, 12), (1, 20);"
+        )
+        .unwrap();
+        // 主機 1：/ 一直 95%、/data 50%；主機 3（0.7，推算）：/ 一直 96%；負載只有主機 1（8 ÷ 4 = 2 倍）
+        for i in 0..12_i64 {
+            let b = start + i * 300;
+            for (host, series, v) in [(1, 10, 95.0), (1, 11, 50.0), (3, 12, 96.0), (1, 20, 8.0)] {
+                conn.execute(
+                    "INSERT INTO rollup_5m VALUES (?1, ?2, ?3, ?4, ?4, ?4, 1)",
+                    params![host, b, series, v],
+                )
+                .unwrap();
+            }
+        }
+        let rule = |params: Value| {
+            let mut r =
+                super::super::rules::builtin_default(super::super::rules::ids::HOST_OFFLINE)
+                    .unwrap();
+            r.kind = kind::METRIC_THRESHOLD.into();
+            r.params = params;
+            r
+        };
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let disk = preview(
+            &conn,
+            &rule(json!({"metric": "disk", "op": ">", "threshold": 90.0, "for_secs": 600})),
+            1,
+            now_ms,
+            utc,
+        )
+        .unwrap();
+        // 主機 1 的 / 與主機 3 的 /（推算）各觸發一次；/data 不觸發；主機 2 沒有磁碟資料
+        assert_eq!(disk["fires"], 2, "{disk}");
+        assert_eq!(disk["hosts_involved"], 2);
+        assert_eq!(disk["hosts_without_metric"], 1);
+        assert_eq!(disk["items_in_scope"], 3);
+        assert_eq!(disk["not_reported"]["no_data"], 1);
+        // 範圍只限 /data：不觸發
+        let scoped = preview(
+            &conn,
+            &rule(json!({"metric": "disk", "op": ">", "threshold": 90.0, "for_secs": 600, "mountpoints": ["/data*"]})),
+            1,
+            now_ms,
+            utc,
+        )
+        .unwrap();
+        assert_eq!(scoped["fires"], 0, "{scoped}");
+        // 負載：Windows 與舊版 Pulse 分開計數
+        let load = preview(
+            &conn,
+            &rule(json!({"metric": "load", "op": ">", "threshold": 1.5, "for_secs": 600})),
+            1,
+            now_ms,
+            utc,
+        )
+        .unwrap();
+        assert_eq!(load["fires"], 1, "{load}");
+        assert_eq!(load["not_reported"]["windows"], 1);
+        assert_eq!(load["not_reported"]["old_pulse"], 1);
+        assert!(load["items_in_scope"].is_null());
     }
 }

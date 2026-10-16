@@ -18,6 +18,8 @@ export const DEFAULTS = Object.freeze({
   navCollapsed: '0',
   /** 上次選擇的登入方式（local／ldap；不記帳號） */
   loginMethod: '',
+  /** 主機清單的可選欄位（S04「欄位設定」，F4；以逗號分隔的短代碼，例 m,c,u） */
+  hostColumns: '',
 });
 
 const listeners = new Set();

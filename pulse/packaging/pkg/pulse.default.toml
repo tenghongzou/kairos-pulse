@@ -1,0 +1,5 @@
+# Pulse 設定：deb／rpm 套件安裝的初始檔（/opt/pulse/pulse.toml）。
+# 只寫要覆蓋內建預設值的項目；內建預設值與每一項的說明見 /opt/pulse/pulse.example.toml。
+# pulse enroll 會在這裡加上 [server]（Kairos 位址、client_cert、client_key、ca_cert），
+# 註冊端點不在預設位置時另加 [enroll]；原檔備份為 pulse.toml.bak-<時間>。
+# 套件升級不會覆寫這個檔案（deb conffile／rpm %config(noreplace)）。

@@ -123,7 +123,52 @@ pub struct DbHost {
     pub rejection: Option<CertRejection>,
     /// 主機群組（角色指派的範圍；`hosts.host_group`）
     pub host_group: Option<Arc<str>>,
+    /// 開機時間（Unix 秒；`hosts.boot_time`，資產更新）
+    pub boot_time: Option<i64>,
+    /// 資產摘要（`host_inventory`；沒有資產時 `None`）
+    pub inventory: Option<Arc<InventorySummary>>,
+    /// 最近一次因每主機序列數上限而有指標未保存的時間（Unix 毫秒；`KRS-W4104`）
+    pub series_limited_at: Option<i64>,
 }
+
+/// 主機清單（S04）篩選與排序用的資產摘要（`host_inventory` 的冗餘欄位；METRICS.md 第 10.1 節）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InventorySummary {
+    pub os_family: Option<String>,
+    pub cpu_model: Option<String>,
+    pub cpu_logical_cores: Option<i64>,
+    pub memory_total: Option<i64>,
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    /// 只在詳情輸出（清單不輸出，減少大量匯出時的外流面）
+    pub serial: Option<String>,
+}
+
+impl InventorySummary {
+    /// 清單的 `inventory`（不含序號）；`with_serial` 時另加序號（詳情）
+    pub fn json(&self, with_serial: bool) -> Value {
+        let mut v = json!({
+            "os_family": self.os_family,
+            "cpu_model": self.cpu_model,
+            "cpu_logical_cores": self.cpu_logical_cores,
+            "memory_total": self.memory_total,
+            "vendor": self.vendor,
+            "product": self.product,
+        });
+        if with_serial {
+            v["serial"] = json!(self.serial);
+        }
+        v
+    }
+}
+
+/// 清冊查詢另取的欄位：開機時間與資產摘要（以子查詢的別名避免與 `hosts` 的欄位同名）
+const HOST_EXTRA_COLUMNS: &str = "boot_time, i_os_family, i_cpu_model, i_cores, i_memory, \
+     i_vendor, i_product, i_serial, series_limited_at";
+const HOST_EXTRA_JOIN: &str = "LEFT JOIN (SELECT host_id AS i_host, os_family AS i_os_family, \
+     cpu_model AS i_cpu_model, cpu_logical_cores AS i_cores, memory_total AS i_memory, \
+     vendor AS i_vendor, product AS i_product, serial AS i_serial FROM host_inventory) \
+     ON i_host = hosts.host_id";
 
 /// `hosts` 的欄位（[`DbHost`] 的順序；第一欄 host_id 未使用）
 pub const HOST_COLUMNS: &str = "host_id, agent_id, hostname, display_name, agent_version, proto, \
@@ -182,12 +227,29 @@ fn host_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<DbHost> {
         imported: text(17)?.as_deref() == Some(HOST_SOURCE_IMPORT),
         rejection,
         host_group: arc(text(20)?),
+        boot_time: r.get(21)?,
+        inventory: {
+            let s = InventorySummary {
+                os_family: text(22)?,
+                cpu_model: text(23)?,
+                cpu_logical_cores: r.get(24)?,
+                memory_total: r.get(25)?,
+                vendor: text(26)?,
+                product: text(27)?,
+                serial: text(28)?,
+            };
+            // 有資產時 os_family 等至少一欄有值；全部為 NULL 視為沒有資產
+            (s != InventorySummary::default()).then(|| Arc::new(s))
+        },
+        series_limited_at: r.get(29)?,
     })
 }
 
 /// 清冊中所有主機
 pub fn load_hosts(conn: &Connection) -> rusqlite::Result<Vec<DbHost>> {
-    let mut stmt = conn.prepare(&format!("SELECT {HOST_COLUMNS} FROM hosts"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {HOST_COLUMNS}, {HOST_EXTRA_COLUMNS} FROM hosts {HOST_EXTRA_JOIN}"
+    ))?;
     let rows = stmt.query_map([], host_of)?;
     rows.collect()
 }
@@ -195,7 +257,9 @@ pub fn load_hosts(conn: &Connection) -> rusqlite::Result<Vec<DbHost>> {
 /// 清冊中的一台主機
 pub fn load_host(conn: &Connection, agent_id: &str) -> rusqlite::Result<Option<DbHost>> {
     conn.query_row(
-        &format!("SELECT {HOST_COLUMNS} FROM hosts WHERE agent_id = ?1"),
+        &format!(
+            "SELECT {HOST_COLUMNS}, {HOST_EXTRA_COLUMNS} FROM hosts {HOST_EXTRA_JOIN} WHERE agent_id = ?1"
+        ),
         [agent_id],
         host_of,
     )
@@ -232,6 +296,10 @@ pub struct HostView {
     pub rejection: Option<CertRejection>,
     /// 主機群組（角色指派的範圍；`hosts.host_group`）
     pub host_group: Option<Arc<str>>,
+    /// 開機時間（Unix 秒）
+    pub boot_time: Option<i64>,
+    /// 資產摘要
+    pub inventory: Option<Arc<InventorySummary>>,
     /// 排序與搜尋用：顯示名稱（沒有時為主機名稱）的小寫
     name_lower: String,
     hostname_lower: String,
@@ -251,6 +319,50 @@ impl HostView {
 
     pub fn mem_ratio(&self) -> Option<f64> {
         self.mem_ratio
+    }
+
+    /// 使用率最高的掛載點：(掛載點, 使用率 %, 是否為推算值)
+    pub fn top_disk(&self) -> Option<(&str, f64, bool)> {
+        let fs = self.last_report.as_deref()?.detail.top_filesystem()?;
+        Some((fs.mountpoint.as_str(), fs.usage?, fs.estimated))
+    }
+
+    /// 開機後經過的秒數：最後一筆 report 的 `system.uptime`（加上之後經過的時間），或由開機時間算出
+    pub fn uptime_secs(&self, now_ms: i64) -> Option<i64> {
+        if self.status != Status::Online {
+            return None;
+        }
+        let from_report = self.last_report.as_deref().and_then(|r| {
+            let up = i64::try_from(r.detail.uptime_secs?).ok()?;
+            let at = DateTime::parse_from_rfc3339(&r.ts)
+                .ok()
+                .map(|t| t.timestamp_millis())?;
+            Some(up + ((now_ms - at) / 1000).max(0))
+        });
+        from_report.or_else(|| self.boot_time.map(|b| (now_ms / 1000 - b).max(0)))
+    }
+
+    /// 開機時間的估計（Unix 秒）：最後一筆 report 的 `ts − system.uptime`，或資產的開機時間
+    pub fn boot_estimate(&self) -> Option<i64> {
+        let from_report = self.last_report.as_deref().and_then(|r| {
+            let up = i64::try_from(r.detail.uptime_secs?).ok()?;
+            let at = DateTime::parse_from_rfc3339(&r.ts).ok()?.timestamp();
+            Some(at - up)
+        });
+        from_report.or(self.boot_time)
+    }
+
+    /// 作業系統家族：資產優先，沒有時由 hello 的 OS 名稱推斷
+    pub fn os_family(&self) -> Option<String> {
+        if let Some(f) = self.inventory.as_ref().and_then(|i| i.os_family.clone()) {
+            return Some(f);
+        }
+        let name = self.os.as_ref()?.name.as_deref()?.to_lowercase();
+        Some(if name.contains("windows") {
+            "windows".to_string()
+        } else {
+            "linux".to_string()
+        })
     }
 
     /// 列表中的一台主機（`kairos/API.md` 第 5.1 節）
@@ -285,6 +397,10 @@ impl HostView {
             "replaying": self.durable.map(|_| self.replaying),
             "last_report": self.last_report.as_deref().map(report_summary),
             "source": if self.imported { "import" } else { "agent" },
+            "os_family": self.os_family(),
+            "inventory": self.inventory.as_deref().map(|i| i.json(false)),
+            "boot_time": self.boot_time.and_then(|b| DateTime::from_timestamp(b, 0)).map(ts),
+            "uptime_secs": self.uptime_secs(now_ms),
         })
     }
 }
@@ -302,6 +418,11 @@ fn report_summary(r: &LastReport) -> Value {
         "cpu_usage": r.cpu_usage,
         "memory_used_bytes": r.used_memory.map(|m| m.saturating_mul(BYTES_PER_MB)),
         "memory_total_bytes": r.total_memory.map(|m| m.saturating_mul(BYTES_PER_MB)),
+        "disk": r.detail.top_filesystem().map(|f| json!({
+            "mountpoint": f.mountpoint,
+            "usage": f.usage,
+            "estimated": f.estimated,
+        })),
     })
 }
 
@@ -459,6 +580,8 @@ pub fn view_of(
         imported,
         rejection,
         host_group: db.and_then(|d| d.host_group.clone()),
+        boot_time: db.and_then(|d| d.boot_time),
+        inventory: db.and_then(|d| d.inventory.clone()),
         cpu,
         mem_ratio,
     })
@@ -623,6 +746,8 @@ pub struct Filter {
     search: Option<Search>,
     /// `group` 參數（小寫，取「或」）
     groups: Vec<String>,
+    /// `os_family` 參數（`linux`、`windows`；取「或」）
+    os_family: Vec<String>,
     /// 角色指派的範圍：只看得到這些主機群組（小寫）；`None` 為全部
     scope: Option<Vec<String>>,
 }
@@ -690,6 +815,16 @@ impl Filter {
         f.os = q.list("os").iter().map(|t| t.to_lowercase()).collect();
         f.versions = q.list("version");
         f.groups = q.list("group").iter().map(|t| t.to_lowercase()).collect();
+        for v in q.list("os_family") {
+            let v = v.to_lowercase();
+            if !matches!(v.as_str(), "linux" | "windows") {
+                return Err(ApiError::param(
+                    "os_family",
+                    format!("os_family 的值 \"{v}\" 無效（linux、windows）"),
+                ));
+            }
+            f.os_family.push(v);
+        }
         f.durable = q.bool("durable")?;
         for s in q.list("subnet") {
             f.subnets.push(parse_cidr("subnet", &s)?);
@@ -770,6 +905,10 @@ impl Filter {
                 .as_ref()
                 .and_then(|o| o.name.as_deref())
                 .is_some_and(|n| self.os.iter().any(|x| *x == n.to_lowercase()))
+        {
+            return false;
+        }
+        if !self.os_family.is_empty() && !h.os_family().is_some_and(|f| self.os_family.contains(&f))
         {
             return false;
         }
@@ -875,9 +1014,11 @@ enum SortField {
     AgentVersion,
     Cpu,
     Memory,
+    Disk,
+    Uptime,
 }
 
-const SORT_FIELDS: [(&str, SortField); 8] = [
+const SORT_FIELDS: [(&str, SortField); 10] = [
     ("status", SortField::Status),
     ("hostname", SortField::Hostname),
     ("last_seen", SortField::LastSeen),
@@ -886,6 +1027,8 @@ const SORT_FIELDS: [(&str, SortField); 8] = [
     ("agent_version", SortField::AgentVersion),
     ("cpu", SortField::Cpu),
     ("memory", SortField::Memory),
+    ("disk", SortField::Disk),
+    ("uptime", SortField::Uptime),
 ];
 
 /// 排序方式（`sort` 參數）
@@ -942,11 +1085,29 @@ impl Sort {
             },
             SortField::Cpu => opt_f(h.cpu),
             SortField::Memory => opt_f(h.mem_ratio),
+            SortField::Disk => opt_f(h.top_disk().map(|d| d.1)),
+            // 開機時間越早、經過時間越長；不依現在時間排序（游標在換頁之間穩定）
+            SortField::Uptime => match (h.status == Status::Online)
+                .then(|| h.boot_estimate())
+                .flatten()
+            {
+                Some(b) => Key::I(-b),
+                None => Key::N,
+            },
         }
     }
 
     fn cmp(&self, a: (&Key, &str), b: (&Key, &str)) -> Ordering {
         cmp_keys(a.0, b.0, self.desc).then_with(|| a.1.cmp(b.1))
+    }
+}
+
+/// `version`（SemVer）是否早於 `(major, minor)`；無法解析時 `false`
+pub fn version_before(version: &str, (major, minor): (u64, u64)) -> bool {
+    let n = version_numbers(version);
+    match (n.first(), n.get(1)) {
+        (Some(a), Some(b)) => (*a, *b) < (major, minor),
+        _ => false,
     }
 }
 
@@ -1050,7 +1211,8 @@ pub fn query<'a>(
     })
 }
 
-const LIST_PARAMS: [&str; 14] = [
+const LIST_PARAMS: [&str; 15] = [
+    "os_family",
     "status",
     "never_connected",
     "offline_for",
@@ -1147,6 +1309,7 @@ pub async fn facets(
     let mut tag: HashMap<String, (u64, u64)> = HashMap::new();
     let mut group: HashMap<String, (u64, u64)> = HashMap::new();
     let mut reason: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut family: HashMap<String, (u64, u64)> = HashMap::new();
     let mut total = 0u64;
     let mut no_group = (0u64, 0u64);
     let bump = |m: &mut HashMap<String, (u64, u64)>, k: &str, online: bool| {
@@ -1167,6 +1330,9 @@ pub async fn facets(
         if let Some(v) = h.agent_version.as_deref() {
             bump(&mut version, v, online);
         }
+        if let Some(f) = h.os_family() {
+            bump(&mut family, &f, online);
+        }
         for t in h.tags.iter() {
             bump(&mut tag, t, online);
         }
@@ -1186,6 +1352,7 @@ pub async fn facets(
         json!({
             "total": total,
             "os": facet_json(os, false),
+            "os_family": facet_json(family, false),
             "version": facet_json(version, false),
             "tag": facet_json(tag, false),
             "group": facet_json(group, true),
@@ -1351,8 +1518,60 @@ pub async fn detail(
             v["recv_at"] = json!(r.recv_at);
             v["seq"] = json!(r.seq);
             v["metrics"] = json!(r.metrics);
+            let d = &r.detail;
+            v["filesystems"] = json!(
+                d.filesystems
+                    .iter()
+                    .map(|f| json!({
+                        "mountpoint": f.mountpoint,
+                        "fstype": f.fstype,
+                        "total": f.total,
+                        "used": f.used,
+                        "available": f.available,
+                        "usage": f.usage,
+                        "estimated": f.estimated,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            v["swap"] = match (d.swap_total, d.swap_used) {
+                (None, None) => Value::Null,
+                (t, u) => json!({ "total": t, "used": u, "usage": d.swap_percent() }),
+            };
+            v["load"] = if d.load_1m.is_some() || d.load_5m.is_some() || d.load_15m.is_some() {
+                json!({ "1m": d.load_1m, "5m": d.load_5m, "15m": d.load_15m })
+            } else {
+                Value::Null
+            };
+            v["process_count"] = json!(d.process_count);
+            v["memory_available_bytes"] = json!(d.memory_available);
+            v["uptime_secs"] = json!(d.uptime_secs);
+            let io = |list: &[crate::registry::IoLast], a: &str, b: &str| -> Vec<Value> {
+                list.iter()
+                    .map(|n| {
+                        let mut o = json!({ "device": n.device });
+                        o[a] = json!(n.rx_rate);
+                        o[b] = json!(n.tx_rate);
+                        o
+                    })
+                    .collect()
+            };
+            v["network"] = json!(io(&d.network, "rx_bytes_per_sec", "tx_bytes_per_sec"));
+            v["disk_io"] = json!(io(&d.disks, "read_bytes_per_sec", "write_bytes_per_sec"));
             v
         }
+        None => Value::Null,
+    };
+    data["inventory"] = json!(view.inventory.as_deref().map(|i| i.json(true)));
+    // 設計包 §30.5 #7：S05 的 KRS-W2108、KRS-W4104 提示
+    data["inventory_rejection"] = match live.as_ref().and_then(|l| l.inventory_rejected.clone()) {
+        Some((at, reason)) => {
+            json!({ "at": ts(at), "reason": &*reason, "product_code": "KRS-W2108" })
+        }
+        None => Value::Null,
+    };
+    data["series_limited_at"] = json!(db.as_ref().and_then(|d| d.series_limited_at).map(ts_ms));
+    data["features"] = match live.as_ref().filter(|l| l.seen_since_start) {
+        Some(l) => json!({ "inventory": l.inventory, "processes": l.processes }),
         None => Value::Null,
     };
     data["certificate_rejection"] = match &view.rejection {
@@ -1403,6 +1622,9 @@ pub(crate) mod tests {
             imported: false,
             rejection: None,
             host_group: None,
+            boot_time: None,
+            inventory: None,
+            series_limited_at: None,
         }
     }
 
@@ -1427,8 +1649,13 @@ pub(crate) mod tests {
                 total_memory: Some(100),
                 used_memory: Some(25),
                 metrics: Some(17),
+                detail: Default::default(),
             })),
             durable: Some(true),
+            inventory: Some(true),
+            processes: Some(true),
+            assets: None,
+            inventory_rejected: None,
             backfill: None,
             offline_reason: (!online).then_some(OfflineReason::Timeout),
             offline_for: None,

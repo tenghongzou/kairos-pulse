@@ -62,6 +62,7 @@ fn brief(h: &HostView, now_ms: i64) -> Value {
         "offline_reason_legacy": h.offline_reason.map(crate::registry::legacy_offline_reason),
         "cpu_usage": h.cpu(),
         "memory_used_ratio": h.mem_ratio(),
+        "disk": h.top_disk().map(|(m, u, e)| json!({ "mountpoint": m, "usage": u, "estimated": e })),
     })
 }
 
@@ -89,7 +90,7 @@ fn top_by<'a>(
 pub async fn get(
     ctx: &Arc<ApiContext>,
     access: &HostAccess,
-    show_health: bool,
+    health_for: Option<&crate::rbac::Grants>,
     now: DateTime<Utc>,
 ) -> Result<hyper::Response<super::http::ApiBody>, ApiError> {
     let snap = ctx.hosts.snapshot(ctx).await?;
@@ -141,10 +142,17 @@ pub async fn get(
         |h| h.status == Status::Online,
         |h| h.mem_ratio(),
     );
-    let health = if show_health {
-        health::compute(ctx, now).await.ok()
-    } else {
-        None
+    // 每台主機使用率最高的掛載點（METRICS.md 第 10.1 節；S03 區塊 F 的「磁碟」）
+    let top_disk = top_by(
+        &hosts,
+        10,
+        |h| h.status == Status::Online,
+        |h| h.top_disk().map(|d| d.1),
+    );
+    // 有 health:read 時；摘要依權限省略（與 GET /api/v1/system/health 相同）
+    let health = match health_for {
+        Some(g) => health::compute(ctx, now).await.ok().map(|h| h.redact(g)),
+        None => None,
     };
     Ok(ok(
         now,
@@ -159,10 +167,12 @@ pub async fn get(
             "longest_offline": longest.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),
             "top_cpu": top_cpu.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),
             "top_memory": top_mem.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),
+            "top_disk": top_disk.iter().map(|h| brief(h, now_ms)).collect::<Vec<_>>(),
             "health": health.map(|h| json!({
                 "status": h.status,
                 "items": h.items.iter().filter(|i| i.status != Level::Ok).map(|i| json!({
                     "id": i.id, "status": i.status, "product_code": i.product_code, "summary": i.summary,
+                    "restricted": i.restricted,
                 })).collect::<Vec<_>>(),
             })),
         }),

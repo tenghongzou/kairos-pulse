@@ -5,8 +5,8 @@
 ## 1. 版本規則
 
 - Kairos 與 Pulse 各自採用 [SemVer](https://semver.org/lang/zh-TW/) `MAJOR.MINOR.PATCH`，版本號唯一的來源是產品 `Cargo.toml` 的 `[package] version`。
-  - `--version` 與啟動日誌第一行印出 `<名稱> <版本> (<commit>)`，例如 `kairos 0.7.0 (1a2b3c4)`；Pulse 在 hello 的 `agent_version` 只送版本號。
-  - 發佈包檔名為 `<名稱>-<版本>-<commit>-linux-x86_64.tar.gz`，打包腳本會確認 `--version` 的輸出與檔名完全一致。
+  - `--version` 與啟動日誌第一行印出 `<名稱> <版本> (<commit>)`，例如 `kairos 0.8.0 (1a2b3c4)`；Pulse 在 hello 的 `agent_version` 只送版本號。
+  - 發佈檔名為 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`（例如 `kairos-0.8.0-1a2b3c4-linux-x86_64.tar.gz`、`pulse-0.8.0-1a2b3c4-windows-x86_64.msi`），打包腳本會確認 `--version` 的輸出與檔名完全一致（Linux aarch64 以 qemu-aarch64 執行；Windows 執行檔無法在容器內執行，改為確認內嵌的版本字串）。deb／rpm 的套件版本為 `<版本>-1`。
 - **1.0 之前（0.x）**：破壞性變更升 MINOR（0.2.x → 0.3.0），其餘新增與修正升 PATCH。**1.0 之後**依標準 SemVer：破壞性變更升 MAJOR。
 - **破壞性變更**指客戶升級時必須做事、否則會出問題的變更，例如：設定欄位的預設值改變或移除、原本接受的設定被拒絕、協定不相容、結束代碼改變、資料檔或日誌的格式與權限改變、systemd unit 需要更新、需要調整監控門檻。每一項都要寫進 `CHANGELOG.md` 的「破壞性變更與升級步驟」表。
 - 兩個產品通常同時發佈相同的版本號，但可以只發佈其中一個（例如只修 Pulse 時發佈 Pulse 0.4.1，Kairos 維持 0.4.0）；相容性以 `CHANGELOG.md` 的相容矩陣為準，不以版本號是否相同判斷。
@@ -15,14 +15,14 @@
 
 ## 2. 發佈步驟
 
-以下以 Kairos 0.7.0、Pulse 0.7.0 為例。
+以下以 Kairos 0.8.0、Pulse 0.8.0 為例。
 
 ### 2.1 準備發佈 commit
 
-1. 從 `main` 開分支（衝刺的整合分支 `sprintN/integration` 須先合併回 `main`），例如 `release/0.7.0`。
+1. 從 `main` 開分支（衝刺的整合分支 `sprintN/integration` 須先合併回 `main`），例如 `release/0.8.0`。
 2. 確認兩個產品 `Cargo.toml` 的 `version`，執行 `cargo metadata --format-version 1 >/dev/null` 更新 `Cargo.lock`；`git diff Cargo.lock` 只能有 `kairos`、`pulse` 等 workspace 成員的版本變動。
 3. 更新 `CHANGELOG.md`：
-   - 草稿段落 `## [0.7.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.7.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
+   - 草稿段落 `## [0.8.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.8.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
    - 更新「版本相容矩陣」，移除已確定項目的〔草稿〕標記。
 4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。
 5. 合併到整合分支後，記下合併後的 commit（以下稱 `<release-commit>`）；之後的步驟都在這個 commit 上進行。
@@ -33,9 +33,9 @@
 
 ```bash
 git switch --detach <release-commit>
-git tag -a kairos-v0.7.0 -m "Kairos 0.7.0"
-git tag -a pulse-v0.7.0  -m "Pulse 0.7.0"
-git push origin kairos-v0.7.0 pulse-v0.7.0
+git tag -a kairos-v0.8.0 -m "Kairos 0.8.0"
+git tag -a pulse-v0.8.0  -m "Pulse 0.8.0"
+git push origin kairos-v0.8.0 pulse-v0.8.0
 ```
 
 建議以個人的 SSH 金鑰簽署 tag（`git tag -s`，事先 `git config gpg.format ssh`、`git config user.signingkey ~/.ssh/id_ed25519.pub`），**不要**使用下一節的發佈金鑰：發佈金鑰只用來簽 `SHA256SUMS`，保存在離線的位置。tag 一旦推送就不再移動；發現問題時發佈新的 PATCH 版本。
@@ -45,7 +45,7 @@ git push origin kairos-v0.7.0 pulse-v0.7.0
 在乾淨的 checkout 上執行（Windows 請用 Git Bash；需要 Docker、cargo、cargo-deny）：
 
 ```bash
-git switch --detach kairos-v0.7.0          # 與 pulse-v0.7.0 是同一個 commit
+git switch --detach kairos-v0.8.0          # 與 pulse-v0.8.0 是同一個 commit
 SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 ```
 
@@ -56,14 +56,19 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 3. 刪除 `dist/` 中舊的 `kairos-*`、`pulse-*`、`SHA256SUMS*`，打包兩個產品（`kairos/packaging/build-release.sh`、`pulse/packaging/build-release.sh`，共用實作 `packaging/build-release-common.sh`）。
 4. 以 `packaging/sign-release.sh` 簽署合併版 `SHA256SUMS`，並以 `<私鑰>.pub` 驗證剛產生的簽章。
 
-產出（`dist/`）：
+產出（`dist/`；0.8.0〔草稿〕起）：
 
 | 檔案 | 說明 |
 |---|---|
-| `kairos-0.7.0-<commit>-linux-x86_64.tar.gz`、`pulse-0.7.0-<commit>-linux-x86_64.tar.gz` | 發佈包（含 `THIRD-PARTY-LICENSES` 與 `<名稱>.cdx.json`） |
-| `kairos-0.7.0-<commit>-linux-x86_64.cdx.json`、`pulse-…cdx.json` | SBOM（與 tar 內相同），供客戶匯入掃描工具 |
-| `SHA256SUMS` | 以上四個檔案的 SHA-256 |
+| `kairos-<版本>-<commit>-linux-{x86_64,aarch64}.tar.gz`、`pulse-…-linux-{x86_64,aarch64}.tar.gz` | 發佈包（含 `THIRD-PARTY-LICENSES` 與 `<名稱>.cdx.json`） |
+| `kairos-…-linux-{x86_64,aarch64}.{deb,rpm}`、`pulse-…-linux-{x86_64,aarch64}.{deb,rpm}` | 套件（nfpm；`<產品>/packaging/pkg/`） |
+| `pulse-<版本>-<commit>-windows-x86_64.{zip,msi}` | Pulse 的 Windows 發佈檔（MSI：`pulse/packaging/windows/pulse.wxs`，wixl） |
+| `<名稱>-<版本>-<commit>-<os>-<arch>.cdx.json` | 每個平台的 SBOM（與發佈包內相同），供客戶匯入掃描工具 |
+| `pulse-install.sh` | Pulse 的一行安裝腳本（`pulse/packaging/install.sh`） |
+| `SHA256SUMS` | 以上所有檔案的 SHA-256（共 20 個：Kairos 8、Pulse 12） |
 | `SHA256SUMS.sig` | `SHA256SUMS` 的簽章 |
+
+只建置部分目標（例如開發時快速確認）：`TARGETS=x86_64-unknown-linux-musl PACKAGES= sh kairos/packaging/build-release.sh`；正式發佈一律用預設值。容器內 cargo 的平行數預設 2（`BUILD_JOBS`，只影響時間，不影響產物）；完整建置兩個產品、五個目標在 4 vCPU 的建置機上約需〔待量測〕。
 
 ### 2.4 與 CI 的建置比對
 
@@ -77,7 +82,7 @@ diff dist/SHA256SUMS <下載的 artifact>/SHA256SUMS && echo 與 CI 一致
 
 ### 2.5 發佈
 
-把 `dist/` 的六個檔案上傳到發佈處，公告中附上版本、`CHANGELOG.md` 對應的段落與發佈公鑰的指紋。`allowed_signers` 不要和發佈包放在同一個地方（見第 3 節）。
+把 `dist/` 的所有檔案上傳到發佈處，公告中附上版本、`CHANGELOG.md` 對應的段落與發佈公鑰的指紋。`allowed_signers` 不要和發佈包放在同一個地方（見第 3 節）。
 
 ## 3. 發佈金鑰
 
@@ -119,20 +124,26 @@ ssh-keygen -lf /離線媒體/kairos-pulse-release.pub     # 指紋，公告與�
 |---|---|---|
 | Rust 工具鏈與 C 編譯器 | `rust:1.99-alpine@sha256:…`（multi-arch index digest） | `packaging/build-release-common.sh` 的 `IMAGE` |
 | musl-dev、gcc 等 | 隨 image digest 固定（image 內已有） | 同上 |
-| GNU tar | `apk add tar=1.35-r5` | `APK_PACKAGES` |
-| cargo-about、cargo-cyclonedx | `cargo install --locked` 固定版本 | `CARGO_ABOUT_VERSION`、`CARGO_CYCLONEDX_VERSION` |
+| GNU tar | `apk add tar=1.35-r5` | `APK_BASE` |
+| aarch64 交叉編譯：zig、qemu-aarch64 | `apk add zig=0.16.0-r1 qemu-aarch64=11.0.3-r0` | `APK_AARCH64` |
+| Windows：mingw-w64-gcc、msitools（wixl、msibuild）、libfaketime、zip | `apk add mingw-w64-gcc=15.2.0-r0 msitools=0.106-r0 libfaketime=0.9.13-r0 zip=3.0-r13` | `APK_WINDOWS` |
+| cargo-about、cargo-cyclonedx、cargo-zigbuild | `cargo install --locked` 固定版本 | `CARGO_ABOUT_VERSION`、`CARGO_CYCLONEDX_VERSION`、`CARGO_ZIGBUILD_VERSION` |
+| nfpm（deb／rpm） | GitHub 發佈檔，固定版本並核對 SHA-256 | `NFPM_VERSION`、`NFPM_SHA256` |
+| Rust 的交叉編譯目標（`aarch64-unknown-linux-musl`、`x86_64-pc-windows-gnu`） | `rustup target add`（隨 `RUST_TOOLCHAIN` 固定；rustup 以 SHA-256 驗證下載內容） | 容器內 |
 | 依賴 crate | `Cargo.lock`（`--locked`；cargo 以 checksum 驗證下載內容） | repo 根目錄 |
 
-**限制**：Alpine 套件庫只保留每個套件的最新修訂版。`tar=1.35-r5` 被新的修訂版取代後，`apk add` 會失敗（腳本會提示更新），此時需要同時更新 image digest 與套件版本：
+**限制**：Alpine 套件庫只保留每個套件的最新修訂版。任一固定的套件被新的修訂版取代後，`apk add` 會失敗（腳本會提示更新），此時需要同時更新 image digest 與套件版本：
 
 ```bash
 docker pull rust:1.99-alpine
 docker buildx imagetools inspect rust:1.99-alpine        # 取 Digest: 的值（index digest）
 docker run --rm rust:1.99-alpine@sha256:<新 digest> sh -c \
-  'cat /etc/alpine-release; apk update >/dev/null; apk policy tar'
+  'cat /etc/alpine-release; apk update >/dev/null; apk policy tar zig qemu-aarch64 mingw-w64-gcc msitools libfaketime zip'
 ```
 
-更新 `IMAGE`、`APK_PACKAGES` 後執行 `sh packaging/check-reproducible.sh`，並在 CHANGELOG 記錄建置環境的變更。tar 只用來打包，版本改變不影響執行檔；image digest 改變則可能改變執行檔（gcc、musl 版本），同一版本號的重新建置不應更換 image。
+更新 `IMAGE`、`APK_BASE`／`APK_AARCH64`／`APK_WINDOWS` 後執行 `sh packaging/check-reproducible.sh`，並在 CHANGELOG 記錄建置環境的變更。tar、zip、msitools、libfaketime、nfpm 只用來打包，版本改變不影響執行檔（但可能改變套件的位元組，需重新確認可重現）；zig 與 mingw-w64-gcc 是 aarch64、Windows 的 C 編譯器與連結器，版本改變會改變執行檔；image digest 改變則可能改變 x86_64 的執行檔（gcc、musl 版本）。同一版本號的重新建置不應更換這些版本。
+
+更新 nfpm：從 `https://github.com/goreleaser/nfpm/releases` 取新版的 `nfpm_<版本>_Linux_x86_64.tar.gz` 與 `checksums.txt`，核對後更新 `NFPM_VERSION`、`NFPM_SHA256`（版本至少發佈兩週以上）。
 
 更新 Rust 版本時，`rust-toolchain.toml`、`IMAGE` 與 `RUST_TOOLCHAIN` 要一起改。
 
@@ -145,9 +156,13 @@ docker run --rm rust:1.99-alpine@sha256:<新 digest> sh -c \
 - 來源以 `git -c core.autocrlf=false archive` 匯出（LF），與主機的行尾設定無關；容器內路徑固定（`/src`、`/build/target`、`/usr/local/cargo/registry`），執行檔中的路徑字串因此一致。
 - `BUILD_COMMIT` 取自 git；tar 的檔案順序、擁有者、mtime（`SOURCE_DATE_EPOCH` = commit 時間）固定，gzip 不寫入檔名與時間（`-n`）。
 - SBOM 的 timestamp 取自 `SOURCE_DATE_EPOCH`，且沒有隨機的 serialNumber。
+- deb／rpm：nfpm 的 `mtime` 設為 commit 時間（套件內檔案與控制資料的時間）。
+- zip：檔案依名稱排序、mtime 為 commit 時間、`TZ=UTC`（DOS 時間是本地時間）、`-X` 不寫額外的時間欄位。
+- MSI：wixl 與 msibuild 在 libfaketime 下以 commit 時間執行（摘要資訊的建立／儲存時間、OLE 目錄的時間），`NO_FAKE_STAT=1` 讓 CAB 內的檔案時間取自（已固定的）mtime；PackageCode 由「版本＋commit」、ProductCode 由版本推導（不使用 wixl 產生的隨機值）。
+- Windows 執行檔以 `-Wl,--no-insert-timestamp` 連結（PE 標頭的時間戳記為 0），並以 `-C strip=symbols` 去掉符號表（rustc 為 raw-dylib 產生的匯入程式庫在隨機命名的暫存目錄中，目錄名稱會留在 COFF 符號表）。
 
 ## 6. SBOM 與第三方授權
 
-- `THIRD-PARTY-LICENSES`：cargo-about 依 `packaging/about.toml` 與 `packaging/about.hbs` 產生，只列目標平台（x86_64-unknown-linux-musl）實際建置的依賴，保守地包含建置期依賴（例如 ring 的 `cc`），不含 dev 依賴。允許的授權與 `deny.toml` 相同；新依賴帶入其他授權時打包失敗，請經法務審查後同時更新 `deny.toml` 與 `about.toml`。
+- `THIRD-PARTY-LICENSES`：cargo-about 依 `packaging/about.toml` 與 `packaging/about.hbs` 產生，**每個目標各自產生**（建置時把 `targets` 換成該目標；Windows 版另含 `windows-service`、`windows-sys` 等），只列該平台實際建置的依賴，保守地包含建置期依賴（例如 ring 的 `cc`），不含 dev 依賴。允許的授權與 `deny.toml` 相同；新依賴帶入其他授權時打包失敗，請經法務審查後同時更新 `deny.toml` 與 `about.toml`。
 - SBOM：cargo-cyclonedx 產生 CycloneDX 1.5 JSON，不含建置期依賴。比較過 cargo-auditable（把依賴清單嵌入執行檔），兩者都以 `cargo metadata` 取得依賴，準確度相同；選擇 cargo-cyclonedx 是因為它輸出獨立的標準檔案，可直接交給客戶的掃描工具，也不需要改變執行檔的建置方式。
 - **已知限制**：`cargo metadata` 會列入只由弱依賴特性（`dep?/feature`）提到、實際未啟用的可選依賴，SBOM 因此多列 `indexmap`、`hashbrown`、`equivalent`、`toml_writer`（沒有編譯進執行檔）。THIRD-PARTY-LICENSES 不受影響。

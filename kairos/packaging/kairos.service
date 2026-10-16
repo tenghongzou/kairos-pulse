@@ -8,7 +8,9 @@
 #   - 專用使用者 kairos（無登入 shell），程式與設定在 /opt/kairos
 #   - /opt/kairos/data 與 /opt/kairos/logs 已建立且屬於 kairos（ProtectSystem=strict
 #     下只有這兩個目錄可寫；目錄不存在時 unit 會以 226/NAMESPACE 啟動失敗）
-#   - 憑證、私鑰、client CA、CRL 放在 /opt/kairos（kairos 可讀即可，不需可寫）
+#   - 憑證、私鑰、client CA、CRL 放在 /opt/kairos（kairos 可讀即可，不需可寫），或由
+#     kairos pki init 寫在 /opt/kairos/data/pki/（deb／rpm 的預設設定）
+#   - deb／rpm 安裝時以上都由套件的安裝腳本完成，unit 放在 /usr/lib/systemd/system/
 #
 # 修改請用 `systemctl edit kairos` 建立 drop-in，不要直接改這個檔案。
 
@@ -51,6 +53,9 @@ RestartPreventExitStatus=2 3 4
 # 同一個檔案系統的唯讀掛載，變更會立即可見，不影響熱重載。
 ProtectSystem=strict
 ReadWritePaths=/opt/kairos/data /opt/kairos/logs
+# kairos pki init 寫出根 CA 私鑰的位置（移到離線保存之前）：服務本身看不到（同一個帳號也不行）。
+# 目錄不存在時（- 前綴）不影響啟動
+InaccessiblePaths=-/opt/kairos/root-ca
 # 憑證與設定不可放在 /home、/root、/run/user 之下（服務內看不到）
 ProtectHome=yes
 PrivateTmp=yes

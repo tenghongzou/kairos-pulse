@@ -20,7 +20,7 @@ export const ADMIN_NAV = [
   {
     section: 'nav.section.system',
     items: [
-      { path: '/system/health', label: 'nav.health', icon: 'health', perm: 'health:read', match: (p) => p === '/system/health' },
+      { path: '/system/health', label: 'nav.health', icon: 'health', perm: 'health:read', count: 'health', match: (p) => p === '/system/health' },
       { path: '/system/settings', label: 'nav.settings', icon: 'settings', perm: 'settings:read', match: (p) => p === '/system/settings' || p.startsWith('/system/settings/') },
     ],
   },

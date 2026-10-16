@@ -1,16 +1,110 @@
-# Pulse 安裝指南（從發佈包安裝）
+# Pulse 安裝指南
 
-本文件給地端管理者使用：從預編譯的發佈包把 Pulse 安裝成**系統層級 systemd 服務**，連到中央伺服器 Kairos。功能、設定欄位與協定細節請見同目錄的 `README.md` 與 `PROTOCOL.md`。
+本文件給地端管理者使用：把 Pulse 安裝成**系統服務**（Linux 為 systemd、Windows 為服務 `Pulse`），連到中央伺服器 Kairos。功能、設定欄位與協定細節請見同目錄的 `README.md` 與 `PROTOCOL.md`。
+
+- **第 A 節（建議，0.8.0〔草稿〕起）**：Linux 以 deb／rpm 套件或一行安裝腳本安裝，Windows 以 MSI 安裝；都以 Kairos 管理者提供的**安裝字串**（`pulse enroll`）自動取得憑證。
+- **第 0～12 節**：從 tar.gz 發佈包手動安裝（不使用套件管理員、多實例、手動 CSR 等），以及共通的維運、升級與移除。
 
 > 不要用 `systemd-run --user` 或使用者層級的 unit 跑正式服務：沒有開啟 linger 時，最後一個登入 session 結束，user manager 會連同 Pulse 一起被停掉。
 
+## A. 以套件或安裝腳本安裝（0.8.0〔草稿〕）
+
+需要 Kairos 0.5 以上、註冊端點（8444）為「開放」，以及 Kairos 管理者給你的**安裝字串**（`pulse-enroll:v1:…`，含 Kairos 位址、註冊 token 與 CA 指紋；`kairos enroll-token create` 或主控台「註冊與憑證 › 註冊 token」產生）。私鑰在本機產生、不會離開這台主機。
+
+### A.1 一行安裝腳本（Linux）
+
+發佈處的 `pulse-install.sh`（也列在簽過章的 `SHA256SUMS` 中）依序：驗證 `SHA256SUMS` 的簽章 → 依本機架構（x86_64／aarch64）與套件管理員（dpkg／rpm）選出套件、核對 SHA-256 → 安裝 → `pulse enroll` → 啟動服務。
+
+```bash
+# 發佈公鑰 allowed_signers 必須從另一個管道取得（第 2 節），事先放在主機上，例如 /etc/kairos-pulse/allowed_signers。
+# 先核對腳本本身：雜湊取自已驗證的 SHA256SUMS（或供應商另外提供的管道）
+curl -fsSLO https://downloads.example.com/kairos-pulse/0.8.0/pulse-install.sh
+echo "<pulse-install.sh 的 SHA-256>  pulse-install.sh" | sha256sum -c -
+# 安裝字串以環境變數傳入（不留在 shell 歷史）；--dir <目錄> 可改用已下載好的發佈檔（離線環境）
+sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install.sh \
+  --base-url https://downloads.example.com/kairos-pulse/0.8.0 \
+  --allowed-signers /etc/kairos-pulse/allowed_signers
+```
+
+| 結束代碼 | 意義 |
+|---|---|
+| 0 | 已註冊並啟動（`pulse status --brief` 為 `online`） |
+| 7 | 已安裝並送出申請，等待 Kairos 管理者核准（畫面上有**申請編號**，請告訴管理者）；服務已啟動，核准後自動連線 |
+| 2／3 | 用法錯誤（例如沒有 `--allowed-signers`）／不支援的系統（架構、沒有 dpkg 或 rpm、沒有 systemd） |
+| 4 | 簽章或 SHA-256 驗證失敗：**不要安裝**，向供應商確認 |
+| 5／6 | 下載失敗／套件安裝失敗 |
+| 其他 | `pulse enroll` 的結束代碼（`pulse enroll --help`；例如 6 token 無效或被拒） |
+
+- 腳本需要 `curl` 或 `wget`、`sha256sum`、OpenSSH 8.1 以上的 `ssh-keygen`。RHEL／Rocky 8 的 OpenSSH 8.0 沒有 `ssh-keygen -Y verify`：在管理主機驗證後以 `--dir` 安裝，或手動依 A.2 安裝。
+- 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
+- 安裝字串會短暫出現在 `pulse enroll` 的命令列（`ps` 看得到）；token 有使用次數與期限，部署完成後由管理者停用（`kairos enroll-token disable`）。
+
+### A.2 deb／rpm 套件（Linux）
+
+```bash
+# 依第 2 節驗證 SHA256SUMS 的簽章與套件的雜湊後：
+apt install ./pulse-<版本>-<commit>-linux-x86_64.deb     # Debian／Ubuntu（aarch64 為 linux-aarch64）
+dnf install ./pulse-<版本>-<commit>-linux-x86_64.rpm     # RHEL／Rocky／Alma
+sudo pulse enroll --install-string-file - < install-string.txt   # 安裝字串存成檔案（0600）；需人工核准時顯示申請編號；Ctrl+C 不會遺失申請
+sudo systemctl start pulse
+pulse status
+```
+
+- **安裝字串含註冊 token，不要放在命令列**（0.8.0）：`--install-string <字串>` 在 `pulse enroll` 執行期間其他帳號可從 `ps`／`/proc/<pid>/cmdline` 看到，也會留在 shell 歷史。建議存成只有 root 能讀的檔案後 `--install-string-file <檔案>`，或從 stdin 傳入 `--install-string-file -`（例如 `sudo pulse enroll --install-string-file - < install-string.txt`）；`--install-string` 保留相容但不建議。一行安裝腳本與 Ansible role 都經 stdin 傳入。
+- 套件的版面與 tar.gz 相同（`/opt/pulse`），另外安裝 `/usr/lib/systemd/system/pulse.service` 與 `/usr/bin/pulse`。`/opt/pulse/pulse.toml` 是初始設定（只有註解；`pulse enroll` 會加上 `[server]`），升級不覆寫。
+- **套件做的事**（`packaging/pkg/*.sh`）：安裝前建立系統帳號 `pulse`；安裝後建立 `logs/`、`buffer/`（`pulse:pulse` 750）、`identity/`（700），產生 `agent.id`（`root:pulse` 640；已存在時沿用），`systemctl enable pulse`（不啟動）；升級時 `systemctl try-restart pulse`；移除時 `systemctl disable --now pulse`。
+- **移除**：`apt remove pulse`／`dnf remove pulse` 保留身分（`identity/`、`agent.id`）、設定與日誌，重新安裝後沿用（rpm 會把改過的設定改名為 `pulse.toml.rpmsave`，重新安裝後改回 `pulse.toml`）；`apt purge pulse` 另外刪除身分、緩衝、日誌與 `/var/lib/pulse`。**完全移除前先通知 Kairos**（`cd /opt/pulse && ./pulse decommission --initiated-by package_manager`，第 12 節）：套件的移除腳本不會自動執行，避免暫時移除（例如重新安裝）就撤銷憑證。
+- 多實例（第 9 節）不支援套件安裝：以 tar.gz 依第 9 節設定。
+
+### A.3 Windows（MSI）
+
+`pulse-<版本>-<commit>-windows-x86_64.msi`（另有內容相同的 `.zip`）。以系統管理員身分：
+
+```powershell
+# 依第 2 節驗證 SHA256SUMS（Windows 11 內建的 ssh-keygen、Get-FileHash -Algorithm SHA256）後：
+msiexec /i pulse-<版本>-<commit>-windows-x86_64.msi /qn /l*v pulse-install.log
+Get-Content .\install-string.txt | & "C:\Program Files\Pulse\pulse.exe" enroll --install-string-file -
+sc.exe start Pulse            # pulse enroll 成功後會自動重新啟動服務；首次安裝時以這行啟動
+& "C:\Program Files\Pulse\pulse.exe" status
+```
+
+- 安裝到 `C:\Program Files\Pulse\`：`pulse.exe`、文件、初始的 `pulse.toml`（安裝目錄**不**加入 PATH）；註冊服務 **`Pulse`**（自動啟動、LocalSystem，參數 `service run`）。服務的工作目錄是安裝目錄（**不是** `C:\Windows\System32`），`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這裡；本機狀態檔為 `%ProgramData%\Pulse\status.json`。服務第一次啟動時設定「失敗時 10 秒後重新啟動，一天最多 3 次」。
+- 升級：安裝新版 MSI（MajorUpgrade 取代舊版；`pulse.toml` 與執行時產生的檔案保留）。移除：`msiexec /x …` 或「設定 › 應用程式」：停止並刪除服務、刪除安裝的檔案；`pulse.toml`、`agent.id`、`identity\`、`buffer\`、`logs\` 保留。完全移除前先執行 `pulse decommission --initiated-by msi`。
+- 不使用 MSI 時（zip）：解開到任一目錄，以系統管理員執行 `pulse.exe service install --start`（`pulse service --help`）；移除為 `pulse.exe service uninstall`。
+- **0.8.0〔草稿〕的限制**：MSI 與 Windows 服務只在 Linux 上交叉編譯與產生，**尚未在 Windows 實機驗證**；MSI 沒有安裝字串的參數（安裝後另外執行 `pulse enroll`）、移除時不會自動 `pulse decommission`、不寫 Windows 事件記錄、沒有程式碼簽章（Authenticode）。`logs\` 沿用安裝目錄的 ACL（Users 可讀）。
+
+### A.4 Ansible（最小版，0.8.0〔草稿〕）
+
+monorepo 的 `packaging/ansible/`（role `pulse` 與範例 `site-pulse.yml`）做與一行安裝腳本相同的事：在控制機以發佈公鑰驗證 `SHA256SUMS` 的簽章 → 依每台主機的架構與套件格式選出套件、複製並核對 SHA-256 → `apt`／`dnf` 安裝 → `pulse enroll`（已有申請或身分時略過）→ 啟用並啟動服務。
+
+```bash
+# 控制機：~/kairos-pulse-dist/0.8.0 放同一次發佈的 SHA256SUMS、SHA256SUMS.sig 與 pulse 的 deb／rpm；
+# 安裝字串放在 Ansible Vault（group_vars/all/vault.yml 的 pulse_install_string）
+ansible-playbook -i inventory.ini packaging/ansible/site-pulse.yml --ask-vault-pass   -e pulse_dist_dir=$HOME/kairos-pulse-dist/0.8.0 -e pulse_allowed_signers=$HOME/allowed_signers
+```
+
+- 變數：`pulse_dist_dir`、`pulse_allowed_signers`（必填）、`pulse_version`（目錄中有多個版本時）、`pulse_install_string`、`pulse_start`（預設 `true`）。`pulse enroll` 的工作以 `no_log` 執行，安裝字串不會出現在 Ansible 的輸出。
+- 結果：已註冊（0）、等待核准（7，申請編號在主控台「註冊申請」）、已註冊過（11）都視為成功。
+- 只經過 `ansible-playbook --syntax-check` 與套件選擇邏輯的測試（ansible-core 2.21），**尚未對實際主機執行**；沒有 Windows（MSI）的支援。
+
 ## 0. 發佈包內容
 
-發佈包 `pulse-<版本>-<commit>-linux-x86_64.tar.gz` 內含一層 `pulse-<版本>-<commit>-linux-x86_64/` 目錄：
+每個版本的發佈檔（0.8.0〔草稿〕起）：
+
+| 檔案 | 說明 |
+|---|---|
+| `pulse-<版本>-<commit>-linux-<arch>.tar.gz` | 發佈包（`<arch>` 為 `x86_64` 或 `aarch64`；本節以下的內容） |
+| `pulse-<版本>-<commit>-linux-<arch>.deb`、`.rpm` | 套件（第 A.2 節） |
+| `pulse-<版本>-<commit>-windows-x86_64.msi`、`.zip` | Windows（第 A.3 節） |
+| `pulse-<版本>-<commit>-<os>-<arch>.cdx.json` | 各平台的 SBOM |
+| `pulse-install.sh` | 一行安裝腳本（第 A.1 節） |
+| `SHA256SUMS`、`SHA256SUMS.sig` | 與 Kairos 共用的雜湊清單與簽章（第 2 節） |
+
+發佈包 `pulse-<版本>-<commit>-linux-<arch>.tar.gz` 內含一層 `pulse-<版本>-<commit>-linux-<arch>/` 目錄：
 
 | 檔案 | 權限 | 說明 |
 |---|---|---|
-| `pulse` | 755 | 執行檔（x86_64、musl 靜態連結，不依賴系統函式庫） |
+| `pulse` | 755 | 執行檔（x86_64 或 aarch64、musl 靜態連結，不依賴系統函式庫） |
 | `pulse.example.toml` | 644 | **內建預設值的參考**（見第 6 節），不需要複製或修改 |
 | `pulse.service` | 644 | systemd unit 範本（單一實例） |
 | `INSTALL.md` | 644 | 本文件 |
@@ -49,7 +143,7 @@ sudo -i          # 之後的指令都在這個 shell 中執行；本文件的 ~ 
 
 ## 1. 需求
 
-- Linux x86_64、systemd（建議 247 以上）
+- Linux x86_64 或 aarch64（0.8.0〔草稿〕起）、systemd（建議 247 以上）；Windows 見第 A.3 節
 - 能以 TCP 連到 Kairos 的監聽埠
 - 產生私鑰與 CSR 用的 OpenSSL（1.1.1 以上即可；沒有的話見第 5 節的替代做法）
 - 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
@@ -134,7 +228,7 @@ cd /opt/pulse
 chown root:pulse agent.id && chmod 640 agent.id
 
 # 2. 註冊（私鑰在本機產生、不會離開這台主機）
-./pulse enroll --install-string 'pulse-enroll:v1:eyJzIjoia2Fpcm9z…'
+./pulse enroll --install-string-file - < install-string.txt   # 安裝字串（pulse-enroll:v1:…）存成檔案；不建議放在命令列（ps 看得到）
 #   或：./pulse enroll --server kairos.example.gov.tw --token KRT1-7G4Q-M2XD-9PBA-H6WN \
 #              --ca-pin sha256:3f9a1c07b2d48e610a9c55f27d13c8a0e4b729610f3d8ac291e56b04d7afe21b
 ```
@@ -284,6 +378,7 @@ unit 重點（內容見 `pulse.service`）：
 | `RestartPreventExitStatus` | `2 3 4` | 重試也不會成功的錯誤不重啟：2 命令列參數錯誤、3 設定錯誤（`pulse.toml` 語法、型別、範圍錯誤等）、4 憑證錯誤（`ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，SAN 與 agent_id 不符，`agent.id` 無法讀取或內容不合法）。`systemctl status pulse` 顯示 `status=2`／`3`／`4`，原因在 `journalctl -u pulse`，修正後 `systemctl restart pulse` |
 | `NotifyAccess` | `main` | 只用來以 sd_notify 更新 `systemctl status` 的 `Status:` 文字（見 8.1）；不送 `READY=1`，所以 `Type` 仍為 `simple` |
 | `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節）。`-` 表示 `buffer/` 不存在時不影響啟動（Pulse 改為 at-most-once 並記 `ERROR`） |
+| `RuntimeDirectory=pulse`＋`ExecStartPre=-+/usr/bin/install … /sys/class/dmi/id/product_serial /run/pulse/product_serial` | `/run/pulse`（0750，擁有者 `pulse`；`RuntimeDirectoryPreserve=yes`） | 0.8.0 起的主機資產需要系統序號，但 `/sys/class/dmi/id/product_serial` 只有 root 能讀（0400）。前綴 `+` 讓這一行以 root、不受沙箱限制執行，把序號複製成 `pulse` 可讀的檔案；Pulse 本身仍以 `pulse` 執行、沒有任何 capability。前綴 `-` 表示複製失敗（例如沒有 DMI 的虛擬機）不影響啟動，Pulse 不送序號並記一次 `PLS-I8009`。不想送序號時在 `pulse.toml` 設定 `[inventory] hardware_serials = false`（這幾行可保留） |
 
 ### 7.1 為什麼選擇 `StandardOutput=null`
 
@@ -462,6 +557,8 @@ grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart|StateDirectory)=' /etc/syst
 #   ExecStart=/opt/pulse/pulse
 #   StateDirectory=pulse/2          ← 狀態檔 /var/lib/pulse/2/status.json（Pulse 依 STATE_DIRECTORY 自動使用）
 #   ReadWritePaths=/opt/pulse-2/logs -/opt/pulse-2/buffer
+#   （RuntimeDirectory=pulse 與複製序號的 ExecStartPre= 不必改：各實例共用 /run/pulse/product_serial，
+#    RuntimeDirectoryPreserve=yes 讓停止其中一個實例時不會刪除它）
 
 # 3. agent_id（第 5.1 節，在 /opt/pulse-N 執行）
 cd /opt/pulse-$N
@@ -560,6 +657,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chown root:pulse /opt/pulse/agent.id /opt/pulse/client.key
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
+- **升級到 0.8.0〔草稿〕（指標擴充，METRICS.md）**：協定不變，與 Kairos 任意順序升級皆可；建議先升級 Kairos（行程排行與主機資產要 Kairos 0.8.0 以上、SQLite 儲存才會協商）。新版 unit 多了 `RuntimeDirectory=pulse`、`RuntimeDirectoryMode=0750`、`RuntimeDirectoryPreserve=yes` 與複製系統序號的 `ExecStartPre=-+…`，請依步驟 2 換上（多實例依第 9 節步驟 2 重新產生；這幾行各實例相同）。沒有換 unit 時服務照常執行，只是資產不含序號（記一次 `PLS-I8009`）。`buffer.max_mb` 預設由 64 改為 128（每筆緩衝記錄變大），磁碟空間有限時在 `pulse.toml` 明確設定 `[buffer] max_mb = 64`。掛載點與網路介面的上限由 32 改為 16：超過的主機第一次取樣時記一則 `INFO`（`sysinfo.snapshot`），可用 `[collect] interface_exclude` 排除不需要的介面。
 - **升級到 0.4（本機狀態檔與 `pulse status`）**：協定不變，與 Kairos 0.3／0.4 任意順序升級皆可。新版 unit 多了 `StateDirectory=pulse`、`StateDirectoryMode=0755`，請依步驟 2 換上（多實例時依第 9 節步驟 2 重新產生，`StateDirectory=pulse/N`），並讓一般帳號可以執行 `pulse status`：
 
   ```bash
@@ -599,6 +697,8 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
 在 root shell 中執行。有多實例（第 9 節）時，**先移除所有 `pulse-N`，最後才移除 `/opt/pulse` 與使用者**：`pulse-N` 共用 `/opt/pulse/pulse` 與使用者 `pulse`，先刪掉它們會讓殘留的 `pulse-N.service` 以 `Restart=always` 每 10 秒啟動失敗一次。
 
+以套件安裝時見第 A.2 節（先 `pulse decommission`，再 `apt purge pulse`／`dnf remove pulse`）。以下為發佈包（tar.gz）安裝的步驟。
+
 以 `pulse enroll` 註冊的主機，在刪除 `identity/` 之前先通知 Kairos（已註冊時經 8443 除役通知；等待核准中時經 8444 撤回申請；最多 15 秒，失敗時以 `PLS-W3107`／`PLS-W3310` 警告，結束代碼 8，本機照常移除）：
 
 ```bash
@@ -633,6 +733,7 @@ done
 rm -rf /opt/pulse-[0-9]*   # 多實例的工作目錄（含私鑰、agent.id 與日誌）
 rm -rf /opt/pulse          # 含共用執行檔、客戶端私鑰、agent.id 與日誌
 rm -rf /var/lib/pulse      # 本機狀態檔（StateDirectory=，停止服務後不會自動刪除）
+rm -rf /run/pulse          # 複製的系統序號（RuntimeDirectoryPreserve=yes，重新開機前不會自動刪除）
 userdel pulse              # 同名群組 pulse 會一併移除
 
 # 6. 確認沒有殘留

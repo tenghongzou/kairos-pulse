@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.99"
 # 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
@@ -45,8 +45,18 @@ uuid = { version = "1.27", features = ["v4"] }
 ring = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
+# Linux：statvfs（檔案系統的 f_bfree，METRICS.md 的 system.filesystem.used = total − free）。
+# 不是新依賴：tokio、ring、sysinfo 已依賴同一個版本
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # 不是新依賴：只為測試多開 tokio 的 test-util（tokio::time::pause / 自動推進時間）
 tokio = { version = "1.53", features = ["test-util"] }
 # 不是新依賴（rcgen 的依賴）：測試用的假 8444 伺服器以指定的時間簽發憑證
 time = "0.3"
+
+# Windows 服務（商業審計 O4；pulse service install|uninstall|run，src/winsvc.rs）：服務控制管理員的註冊與
+# 服務進入點。MIT／Apache-2.0；依賴的 windows-sys 0.61 已在依賴樹中，另外只多 widestring
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
