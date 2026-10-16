@@ -225,6 +225,10 @@ fn is_ambient_setting(key: &str) -> bool {
             key,
             "NOTIFY_SOCKET"
                 | "JOURNAL_STREAM"
+                // systemd 為每個服務設定、子孫行程會繼承：Pulse 以它與 /proc/self/cgroup 判斷「由 systemd
+                // 啟動」。GitHub Actions 的 runner 本身是 systemd 服務（hosted-compute-agent.service），
+                // 不清掉的話 pulse status 會把 Pulse 當成該服務的一部分
+                | "INVOCATION_ID"
                 | "BUILD_COMMIT"
                 // pulse status 的符號與色彩（cli-style §3、§4）
                 | "PULSE_SYMBOLS"
