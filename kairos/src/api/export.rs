@@ -446,6 +446,12 @@ async fn update(
                 json!(before.headers.iter().map(|(n, _)| n).collect::<Vec<_>>()),
                 json!(after.headers.iter().map(|(n, _)| n).collect::<Vec<_>>()),
             )
+        } else if *k == xs::KEY_OTLP_ENDPOINT {
+            // 網址的查詢字串可能含 API key：稽核只記到路徑
+            (
+                endpoint_for_audit(&before.otlp.endpoint),
+                endpoint_for_audit(&after.otlp.endpoint),
+            )
         } else {
             (before.value_of(k), after.value_of(k))
         };
@@ -549,4 +555,29 @@ async fn test(
             "endpoint": eff.otlp.endpoint,
         }),
     ))
+}
+
+/// 稽核中的 OTLP 端點：查詢字串（可能含 API key）以遮蔽值取代
+fn endpoint_for_audit(url: &str) -> Value {
+    match url.split_once('?') {
+        Some((base, _)) => json!(format!("{base}?{}", crate::alerts::secrets::MASK)),
+        None => json!(url),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_masks_the_endpoint_query_string() {
+        assert_eq!(
+            endpoint_for_audit("https://otlp.example.com/v1/metrics?api-key=s3cret"),
+            json!("https://otlp.example.com/v1/metrics?••••")
+        );
+        assert_eq!(
+            endpoint_for_audit("http://127.0.0.1:4318/v1/metrics"),
+            json!("http://127.0.0.1:4318/v1/metrics")
+        );
+    }
 }
