@@ -107,8 +107,9 @@ poll_target_per_ip_per_sec = 5
 long_poll_secs = 60           # 長輪詢上限（0 = 停用）
 max_long_polls_per_ip = 32
 max_long_polls = 1000
-max_downloads_per_ip = 8      # L11（本版下載端點回 404）
+max_downloads_per_ip = 8      # L11：每個來源與全部的同時下載數
 max_downloads = 64
+download_dir = ""             # 下載端點 /agent/<檔名> 的目錄（pulse-install.sh、套件、SHA256SUMS、SHA256SUMS.sig）；空＝不提供
 batch_sources = []            # 批次部署來源（CIDR）：L2、L3、L4、L11 乘以 batch_source_multiplier
 batch_source_multiplier = 10
 retry_after_max_secs = 600    # 429／503 的 Retry-After 上限（L7 封鎖與 L9 除外）
@@ -175,3 +176,10 @@ enabled = false
 retention_days = 1095         # 保留天數（預設 3 年，獨立於 report 的保留天數），90..=36500
 anchor_log_minutes = 60       # 每隔幾分鐘把鏈尾雜湊寫一行到日誌（audit.chain_anchor；經 syslog 外送），0 不寫，5..=1440
 verify_interval_hours = 24    # 每隔幾小時自我驗證雜湊鏈與 HMAC（失敗：KRS-E6201＋「稽核日誌完整性」緊急事件），1..=168
+
+[privacy]                     # 個資保護（kairos/PRIVACY.md）：保存前轉換，只影響之後收到的資料
+store_peer_ip = "full"        # full（ip:port）| truncate（IPv4 /24、IPv6 /48）| none
+hostname = "keep"             # keep | pseudonymize（data/privacy.key 的 HMAC：host-xxxxxxxxxxxx；kairos hosts pseudonym 查詢）
+process_command = "redact"    # keep | redact（遮蔽命令列中的密碼、token）| drop
+process_user = "keep"         # keep | pseudonymize | drop
+inventory_network = "keep"    # keep | truncate（介面位址 /24、/48，MAC 只留廠商碼）| drop

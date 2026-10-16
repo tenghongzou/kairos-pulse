@@ -445,6 +445,12 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `alerts.retention_days` | `KAIROS__ALERTS__RETENTION_DAYS` | `400` | 已解決的告警事件（含處理紀錄與發送紀錄）保留天數，1～3660 |
 | `alerts.max_events` | `KAIROS__ALERTS__MAX_EVENTS` | `100000` | 告警事件的筆數上限（超過時刪除最舊的已解決事件），1,000～10,000,000 |
 | `alerts.subnet_prefix_v4`、`alerts.subnet_prefix_v6` | `KAIROS__ALERTS__SUBNET_PREFIX_V4`、`…_V6` | `24`、`64` | 網段彙總（網段離線）的遮罩：IPv4 8～32、IPv6 32～128 |
+| `privacy.store_peer_ip` | `KAIROS__PRIVACY__STORE_PEER_IP` | `full` | （0.9.0〔草稿〕）保存的來源位址：`full`（`ip:port`）、`truncate`（IPv4 /24、IPv6 /48，不含埠）、`none`（不保存）。影響清冊、`agents.json`、JSONL、主控台；日誌與稽核不受影響（[PRIVACY.md](PRIVACY.md)） |
+| `privacy.hostname` | `KAIROS__PRIVACY__HOSTNAME` | `keep` | `pseudonymize`：主機名稱與顯示名稱以 `data/privacy.key` 的 HMAC 換成 `host-…`／`name-…`（不可逆；`kairos hosts pseudonym` 查詢）。金鑰無法使用時拒絕啟動（〔暫定〕`KRS-E4005`） |
+| `privacy.process_command` | `KAIROS__PRIVACY__PROCESS_COMMAND` | `redact` | 行程排行的命令列：`keep`、`redact`（遮蔽密碼、token、帶帳密的網址）、`drop` |
+| `privacy.process_user` | `KAIROS__PRIVACY__PROCESS_USER` | `keep` | 行程的執行身分：`keep`、`pseudonymize`、`drop` |
+| `privacy.inventory_network` | `KAIROS__PRIVACY__INVENTORY_NETWORK` | `keep` | 資產的網路介面：`keep`、`truncate`（位址截到 /24、/48，MAC 只留廠商碼）、`drop` |
+| `enroll.download_dir` | `KAIROS__ENROLL__DOWNLOAD_DIR` | `""` | （0.9.0〔草稿〕）8444 的下載端點 `/agent/<檔名>` 提供的目錄（Pulse 的 `pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig`）；空字串＝不提供（ENROLL.md 第 19.4 節第 3 項） |
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
@@ -616,7 +622,22 @@ kairos config show --effective enroll pki.policy   # 生效值與來源（環境
 - 撤銷：Kairos 自己產生簽發 CA 的 CRL（`data/pki/crl/issuing.crl`，每 `pki.crl_refresh_hours` 小時與每次撤銷），8443 立即重新載入。新憑證第一次連線後舊憑證以 `superseded` 撤銷；主機自行除役（`pulse deregister`）時以 `cessationOfOperation` 撤銷。
 - 防護：8444 有連線、來源、token、agent、全域多層速率限制（`[enroll]` 的 L1～L10，`429` 附 `Retry-After`）、無效 token 的來源封鎖（寫入資料庫）、時鐘偏差檢查、待核准佇列上限；8444 在自己的 runtime 上執行，1 萬台規模的註冊尖峰下 report 的 `ack` p99 維持在數十毫秒（PKI.md 第 12 節）。
 - 主控台修改的 `enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*` 存在資料庫、優先於 `kairos.toml`（環境變數最優先）；啟動時以 `INFO` 列出被覆寫的設定檔設定，`kairos config reset <設定鍵>` 改用設定檔的值。
-- 本版的下載端點（`/agent/…`）回 404：Pulse 以安裝套件安裝後執行 `pulse enroll`。
+- 下載端點（0.9.0〔草稿〕）：設定 `enroll.download_dir` 後，8444 的 `/agent/<檔名>` 提供 Pulse 的發佈檔案，主控台的「建立 token」顯示一行安裝指令（`curl --cacert` 下載 `pulse-install.sh`，以 `--base-url https://<註冊端點>/agent --ca-file` 安裝；完整性仍以發佈公鑰驗證）。同時下載數受 `enroll.max_downloads_per_ip`／`max_downloads` 限制（L11，429）。沒有設定時回 404，Pulse 以安裝套件安裝後執行 `pulse enroll`。
+- 手動簽發的既有憑證（0.9.0〔草稿〕）：`kairos pki certificates import <檔案或目錄>` 或主控台「憑證 › 匯入憑證」加入簽發紀錄，之後可以在 S14 撤銷（PKI.md 第 16 節）。
+
+## 個資保護（0.9.0〔草稿〕，商業審計 S6）
+
+個資清單、保存方式的設定、刪除與匯出的流程，以及 DPA 範本骨架見 [PRIVACY.md](PRIVACY.md)。
+
+```bash
+kairos hosts purge <agent_id> --dry-run       # 會刪除的筆數（唯讀，Kairos 執行中也可以）
+kairos hosts purge <agent_id>                 # 刪除這台主機的所有資料（L2；Kairos 停止時。執行中請用主控台）
+kairos hosts export <agent_id> --out ann.json # 個資匯出（資料主體存取請求）
+kairos hosts pseudonym ann-laptop             # privacy.hostname = "pseudonymize" 時的假名
+```
+
+- `[privacy]`：來源位址只存網段或不存、主機名稱假名化、行程命令列遮蔽秘密（預設）、資產的介面位址截斷；在資料進入時一次轉換。
+- 主控台：主機詳情 › 更多 › 匯出個資、刪除主機資料（只有管理員；主機須離線；L2 輸入主機名稱）。刪除會先撤銷這台主機的有效憑證；稽核日誌不刪除（雜湊鏈），另記一筆 `host.purge`。
 
 ## 告警（0.6.0）
 
@@ -988,6 +1009,7 @@ kairos/
 ├── PROTOCOL.md            Pulse ↔ Kairos 協定規格
 ├── STORAGE.md             資料儲存（SQLite）：schema、保留、容量、量測
 ├── API.md                 主控台 API：端點、驗證、SSE、量測
+├── PRIVACY.md             個資保護：個資清單、[privacy]、刪除主機資料、個資匯出、DPA 範本骨架（0.9.0）
 ├── build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
 ├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、kairos-crl.service／kairos-crl.timer（CRL 定期更新範例）、INSTALL.md（安裝指南）
 ├── testdata/              單元測試用的憑證樣本；pki/ 為測試用 CA、代理憑證與 CRL（見其中的 README）；含測試用私鑰，不可部署
@@ -1016,11 +1038,15 @@ kairos/
     ├── store/             report 的儲存後端（STORAGE.md）：mod.rs（ReportStore trait 與 writer task）、
     │                      sqlite.rs（SQLite 後端、主機清冊、保留與容量上限、checkpoint）、codec.rs（緊湊編碼）、
     │                      rollup.rs（5 分鐘／1 小時彙總）、import.rs（匯入舊 JSONL：去重鍵、保留期限、彙總）、
+    │                      purge.rs／sqlite_purge.rs（刪除主機資料，PRIVACY.md 第 4 節）、
     │                      *tests.rs（單元測試與吞吐量量測）
     ├── api/               主控台 API（API.md）：mod.rs（HTTPS 伺服器、路由、專用 runtime）、http.rs（回應與錯誤格式、
     │                      查詢參數）、auth.rs／tokens.rs（API token 的驗證與保存）、db.rs（唯讀連線池）、hosts.rs
     │                      （主機清冊的索引、篩選、排序、游標）、metrics.rs（趨勢）、overview.rs、health.rs、
-    │                      events.rs（SSE）、maint.rs（背景工作）、tests.rs（以 HTTPS 用戶端的整合測試）、bench.rs（量測）
+    │                      events.rs（SSE）、maint.rs（背景工作）、privacy.rs（刪除主機資料、個資匯出）、
+    │                      tests.rs（以 HTTPS 用戶端的整合測試）、bench.rs（量測）
+    ├── privacy.rs         [privacy]：來源位址、主機名稱假名化、行程與資產的遮蔽；個資匯出（PRIVACY.md）
+    ├── privacy_cli.rs     kairos hosts purge|export|pseudonym
     ├── stats.rs           report 寫入結果的統計（啟動以來與每分鐘）
     ├── token_cli.rs       kairos api-token create|list|revoke
     ├── users_cli.rs       kairos users …（使用者、角色指派、工作階段、目錄服務群組對應）
@@ -1094,6 +1120,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_D
 - 現役連線的客戶端憑證在每個重載週期重新檢查，因此撤銷或過期最多延遲 `server.reload_interval_secs` 才生效；握手後、送出 hello 前的連線（最多 `timeouts.hello_secs`）不在週期檢查範圍內，但送出 hello 時會再驗證一次憑證鏈，註冊後也會在下一個週期被檢查
 - 關機時連線最晚到訊號後 2 秒就會被中止；網路極慢的連線可能收不到 `close_notify`（agent 端會視為斷線並重連）。被中止的連線若正在等待 report 寫入，該筆仍會寫入資料檔，但 `agents.json` 中該 agent 的 `last_report` 可能不會更新
 - `kairos.toml` 本身的設定只在啟動時讀取；熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL 檔的內容
-- 註冊通道（0.5.0）尚未實作的部分：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具、下載端點、L11 與系統健康的整合（PKI.md 第 13 節）
+- 註冊通道（0.5.0）尚未實作的部分：離線模式的 CRL 上傳、系統健康的整合（PKI.md 第 13 節；手動憑證的匯入、下載端點與 L11 0.9.0 起已實作）
+- 個資：刪除主機資料不涵蓋日誌、JSONL 鏡像、備份與已送出的通知；假名化不可逆、只影響之後收到的資料（PRIVACY.md 第 2.2、4.4 節）
 - 告警（0.6.0）尚未實作的部分：週期性維護時段、警告的每日彙整、個人勿擾與個人通知、資料磁碟剩餘空間與授權等系統規則、主機離線類規則的歷史試算（ALERTS.md 第 10 節）
 - 主控台 API 為唯讀的第一版：驗證只有 API token（沒有使用者、角色、工作階段），主機狀態只有線上、離線、未知；沒有網頁介面（限制與延後項目見 API.md 第 10 節）

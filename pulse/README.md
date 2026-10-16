@@ -195,7 +195,7 @@ sudo pulse enroll --cancel     # 撤回等待中的申請、刪除本機未使�
 
 寫入一律「暫存檔 → fsync → rename → fsync 目錄」；以 root 執行時新檔案改為 `identity/` 目錄的擁有者（服務帳號）。`pulse enroll` 與服務以 `identity/.lock` 互斥。
 
-**可靠性**：中斷（Ctrl+C、斷電）後重新執行或服務啟動時從 `enrollment.json` 接續，不重送新申請、不產生第二組私鑰；回應遺失後的重送沿用同一個 CSR 與輪詢憑據，Kairos 回傳同一筆申請。429／503 依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 排隊（絕不早於伺服器指定的時間，`PLS-E2202`／`PLS-E3309`），網路錯誤 2 秒起倍增、上限 5 分鐘。Kairos 因時鐘偏差暫不受理（`clock_skew`，`PLS-E8302`）時保留私鑰與 CSR，每 5 分鐘（±20%）以新的 `sent_at` 重送，偵測到本機時間被調整（牆鐘與單調時鐘的差距變動超過 1 秒）時立即重送。
+**可靠性**：中斷（Ctrl+C、斷電）後重新執行或服務啟動時從 `enrollment.json` 接續，不重送新申請、不產生第二組私鑰；回應遺失後的重送沿用同一個 CSR 與輪詢憑據，Kairos 回傳同一筆申請。429／503 依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 排隊（絕不早於伺服器指定的時間，`PLS-E2202`／`PLS-E3309`），網路錯誤 2 秒起倍增、上限 5 分鐘。送出申請之前（`server-info`、`token-check`）收到 429／503 時（0.9 起）也依同一個公式等候後重試：合計不超過 `--wait`（沒有指定時 600 秒），互動時在 stderr 顯示倒數，Ctrl+C 取消（`PLS-E2202`，尚未產生任何檔案）；`--no-wait` 不等候，來源被封鎖（`source_blocked`，`PLS-E3005`）不等候。Kairos 因時鐘偏差暫不受理（`clock_skew`，`PLS-E8302`）時保留私鑰與 CSR，每 5 分鐘（±20%）以新的 `sent_at` 重送，偵測到本機時間被調整（牆鐘與單調時鐘的差距變動超過 1 秒）時立即重送。
 
 **服務**：沒有可用的身分而 `enrollment.json` 有進行中的申請時，服務先完成申請（依 `next_poll_at` 恢復，不立即輪詢）再連線；申請已結束（被拒、逾期、token 無效…）時不連線，`pulse status` 為嚴重，等待新的 `pulse enroll`。沒有 `enrollment.json` 的既有部署（手動憑證、未啟用 mTLS）行為不變。
 

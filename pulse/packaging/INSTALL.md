@@ -36,6 +36,16 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
 | 其他 | `pulse enroll` 的結束代碼（`pulse enroll --help`；例如 6 token 無效或被拒） |
 
 - 腳本需要 `curl` 或 `wget`、`sha256sum`、OpenSSH 8.1 以上的 `ssh-keygen`。RHEL／Rocky 8 的 OpenSSH 8.0 沒有 `ssh-keygen -Y verify`：在管理主機驗證後以 `--dir` 安裝，或手動依 A.2 安裝。
+- **從 Kairos 的註冊端點下載**（Kairos 0.9 起）：Kairos 管理者把同一個發佈版本的 `pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig` 放在 `enroll.download_dir` 後，主控台「建立 token」會顯示一行指令：
+
+  ```bash
+  curl -fsSLO --cacert kairos-ca.pem https://kairos.example.com:8444/agent/pulse-install.sh && \
+    sudo PULSE_INSTALL_STRING='pulse-enroll:v1:…' sh pulse-install.sh \
+      --base-url https://kairos.example.com:8444/agent --ca-file kairos-ca.pem \
+      --allowed-signers /etc/kairos-pulse/allowed_signers
+  ```
+
+  `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。套件的完整性仍以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。根 CA 與發佈公鑰都要從另一個管道取得。
 - 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
 - 安裝字串會短暫出現在 `pulse enroll` 的命令列（`ps` 看得到）；token 有使用次數與期限，部署完成後由管理者停用（`kairos enroll-token disable`）。
 

@@ -44,7 +44,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 | `data/kairos.db-wal`、`kairos.db-shm` | WAL 與共用記憶體檔，SQLite 建立時沿用資料庫檔的權限（`0640`）。Kairos 正常關機時刪除。**備份或搬移時不可只複製 `kairos.db`**（見第 9 節） |
 | `data/agents.json` | 狀態表的即時快照（每 5 秒），與 0.2 相同；重新啟動後含最近 24 小時內出現過的主機（見第 6 節） |
 | `data/reports-YYYY-MM-DD.jsonl`、`.retention-guard.json` | 只在 `backend = "jsonl"` 或 `jsonl_mirror = true` 時寫入 |
-| `data/alerts-secrets.key`、`data/console.key`、`data/audit-hmac.key` | 金鑰檔（各 32 bytes，0600）：通知管道機密、CSRF／TOTP、稽核鏈的 HMAC（0.7）。不在資料庫中，資料庫備份不含；備份與還原見第 9 節 |
+| `data/alerts-secrets.key`、`data/console.key`、`data/audit-hmac.key`、`data/privacy.key` | 金鑰檔（各 32 bytes，0600）：通知管道機密、CSRF／TOTP、稽核鏈的 HMAC（0.7）、主機名稱等的假名化（0.9，只在 `privacy.hostname`／`process_user = "pseudonymize"` 時建立；PRIVACY.md 第 3 節）。不在資料庫中，資料庫備份不含；備份與還原見第 9 節 |
 
 資料目錄所在的檔案系統必須支援共享記憶體與 POSIX 檔案鎖（本機磁碟；**不要放在 NFS／SMB 等網路磁碟**）。無法啟用 WAL 時 Kairos 拒絕啟動。
 
@@ -266,7 +266,7 @@ SQLite 的 `reports.ts` 是**取樣時間**，彙總的桶、依時間的保留�
 - v1 的 hello 沒有主機資訊：`host_fingerprint`、`display_name`、`tags`、`os`、`report_interval_ms` 保留最後已知的值，不會被清空。
 - `identity_verified`：伺服器啟用 mTLS（`auth.client_ca`）時為 1，表示 `agent_id` 與客戶端憑證的 SAN 綁定；未啟用時 `agent_id` 是自行宣告的。
 - **啟動時載回**：上次異常結束時仍標為線上的主機改為離線（保留 `last_seen`）；`last_seen` 在 24 小時內的主機以「離線」狀態放回狀態表（`Registry::restore`，最多 `limits.max_agents` 台，最近出現的優先）。因此重新啟動後 `agents.json` 不再是空的，之後的 hello 記為「重新上線」，「主機指紋與上次不同」的偵測也延續到重新啟動之後。更早的主機只在清冊中。
-- **上限**：`storage.max_hosts`（預設 `max(100000, limits.max_agents)`）。清冊已滿時新主機的 report 回 `storage_unavailable`，同步時不新增（記 `WARN`）。清冊不會自動刪除主機。
+- **上限**：`storage.max_hosts`（預設 `max(100000, limits.max_agents)`）。清冊已滿時新主機的 report 回 `storage_unavailable`，同步時不新增（記 `WARN`）。清冊不會自動刪除主機；0.9 起以「刪除主機資料」刪除一台主機的所有資料（第 16 節）。
 - **`agents.json` 的處置**：保留，格式不變，仍是「目前狀態表」的即時快照；它不再是唯一的狀態來源，只是不再「重新啟動就清空」。需要完整清冊或歷史時用 `kairos hosts list` 或查詢資料庫。
 
 ### 6.1 `kairos hosts list`
@@ -366,7 +366,7 @@ systemctl start kairos
 
 備份檔是完整的 Kairos 資料庫，可以直接啟動；備份之後收到的 report 不在其中。`agents.json` 不需要備份（啟動時由清冊重建）。
 
-**金鑰檔**：`data/alerts-secrets.key`（0.6.0 起；通知管道機密的 AES-256-GCM 金鑰）、`data/console.key`（0.6.0 起；CSRF 與 TOTP 秘密的加密金鑰）、`data/audit-hmac.key`（0.7 起；稽核鏈的 HMAC 金鑰）**不在資料庫備份中**，資料庫只有密文與 HMAC。還原時金鑰與 `kairos.db` 要是同一次備份的組合。
+**金鑰檔**：`data/alerts-secrets.key`（0.6.0 起；通知管道機密的 AES-256-GCM 金鑰）、`data/console.key`（0.6.0 起；CSRF 與 TOTP 秘密的加密金鑰）、`data/audit-hmac.key`（0.7 起；稽核鏈的 HMAC 金鑰）、`data/privacy.key`（0.9 起；假名化的 HMAC 金鑰，遺失後新收到的資料改用新的假名）**不在資料庫備份中**，資料庫只有密文與 HMAC。還原時金鑰與 `kairos.db` 要是同一次備份的組合。
 
 **金鑰檔的加密備份**（0.7；預設不含，需要另外指定 `--include-keys`）：
 
@@ -657,7 +657,18 @@ sudo systemctl start kairos
 - 主控台 API（0.4，`API.md`）以唯讀連線查詢這個 schema；趨勢也可以 SQL 或 `kairos reports export` 取得。
 - `kairos reports export` 不做全域時間範圍的索引（未指定 `--agent` 時掃描整個 `reports` 表）。
 - 彙總的值以 f64 計算，超過 2^53 的整數會失去精度（原始資料保留原值）。
-- 清冊不會自動刪除主機（除役流程屬 F 系列）。
+- 清冊不會自動刪除主機（除役流程屬 F 系列）；刪除一台主機的資料見第 16 節。
 - durable 連線的取樣時間以 Pulse 的時鐘為準（第 5.2 節）；Pulse 時鐘偏差超過 5 分鐘（偏快）或 367 天（偏慢）時改用收到的時間。
 - 原始資料保留天數小於 Pulse 的 `buffer.max_age_hours` 時，原始資料被刪除之後的重送會再寫入一次（第 5.4 節）。
 - `kairos reports import` 需要停止 Kairos（獨占資料庫，第 13.1 節）；不支援壓縮過的 JSONL，也不讀取標準輸入。
+
+## 16. 刪除主機資料（0.9.0〔草稿〕；商業審計 S6）
+
+規格與取捨見 [`PRIVACY.md`](PRIVACY.md) 第 4 節；實作 `store/purge.rs`（計數、逐步刪除）、`store/sqlite_purge.rs`（writer 的快取）。不需要 schema 變更（schema 仍為 v8）。
+
+- **由 writer 執行**：主控台 API 把刪除交給 report 的 writer（與資產共用的佇列，`store::PurgeSink`），writer 在 report 的批次之間每一輪做一步（每一步最多 5,000 列、一個 `BEGIN IMMEDIATE` 交易）。順序：原始 report → 行程快照 → 5 分鐘彙總 → 1 小時彙總 → 資產變更歷史；最後一步在同一個交易中刪除資產、`host_series`、`boots`、`import_keys`、告警事件（含處理紀錄、發送紀錄、CLI 動作）、註冊申請、`enroll_replay`、憑證紀錄、`hosts`，並寫入稽核 `host.purge`。中斷時清冊仍在，重新執行即可接續。
+- **快取**：第一步清除這台主機在 writer 中的快取（`agent_id` → `host_id`、序列、計數器的上一筆、boot）與記憶體中尚未寫出的彙總；刪除開始後 10 分鐘內這台主機的 report、資產與清冊同步一律不寫入（`WriteStatus::Failed`，連線回 `storage_unavailable`），避免狀態表的快照或在途的資料把清冊建立回來。
+- **憑證**：已撤銷、尚未過期的憑證紀錄保留（CRL 需要），尚未撤銷的有效憑證也保留（呼叫端先撤銷）；清冊中已沒有的主機的憑證在過期 1 天後由註冊服務每小時的清除刪除（`purge::delete_orphan_certificates`）。
+- **`kairos hosts purge`**：以 `locking_mode = EXCLUSIVE` 開啟資料庫（與第 13.1 節的匯入相同），Kairos 執行中時 `KRS-E4304`（結束代碼 11）；`--dry-run` 以唯讀連線計數。
+- **不涵蓋**：JSONL 鏡像（第 1 節）、備份（第 9 節）、日誌。
+- 測試：`store::purge::tests`（兩台主機只刪一台、計數與試執行相同、憑證的保留、稽核與完整性驗證、刪除後的寫入被拒、少量額度的多步刪除）、`api::privacy_tests`、`privacy_cli::tests`、端對端 `tests/e2e/tests/privacy.rs`。
