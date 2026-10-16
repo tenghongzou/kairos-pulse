@@ -10,6 +10,7 @@ import { ALERT_STRINGS } from './strings-alerts.js';
 import { PKI_STRINGS } from './strings-pki.js';
 import { ADMIN_STRINGS } from './strings-admin.js';
 import { METRICS_STRINGS } from './strings-metrics.js';
+import { EXPORT_STRINGS } from './strings-export.js';
 
 const M = {
   // ---- 共用 ----
@@ -599,6 +600,9 @@ Object.assign(M, ADMIN_STRINGS);
 
 // 指標擴充（F4：S03、S04、S05、S09）的文字
 Object.assign(M, METRICS_STRINGS);
+
+// 指標轉出（F7：Prometheus exporter、OTLP；S21「整合」）的文字在 strings-export.js
+Object.assign(M, EXPORT_STRINGS);
 
 /** 文字；缺少 key 時回傳 key 本身並記錄錯誤（Playwright 測試檢查主控台沒有錯誤） */
 export function t(key, params) {

@@ -13,6 +13,7 @@
 //   套用註冊端點模式同樣處理。
 // - 分頁：一般、連線與安全、資料保留與儲存、整合（API token 在「整合」）；「主機群組與標籤」沒有後端，隱藏。
 //   維運者只看得到「連線與安全」（唯讀，D16）；稽核員全部唯讀。
+// - 「整合」另有指標轉出（Prometheus exporter、OTLP；admin-export.js，GET／PUT /api/v1/export/settings）。
 // - 隱藏（§28.6）：「整合」的 [log]／[observability] 沒有修改 API，唯讀並標示「在 kairos.toml 修改、需重新啟動」；
 //   需要重新啟動的設定（監聽位址、連線上限…）本版只能在 kairos.toml 修改（沒有寫入 API），一律唯讀。
 
@@ -25,6 +26,7 @@ import { pageHead, card, errorState, errorAlert, field, inlineAlert, skeletonBlo
 import { toast } from '../ui/toast.js';
 import { linkTabs, confirmL1, confirmL2, valueText } from './admin-common.js';
 import { tokensCard } from './admin-tokens.js';
+import { exportCard } from './admin-export.js';
 
 const TABS = ['general', 'security', 'storage', 'integrations'];
 const TAB_SECTIONS = {
@@ -122,6 +124,8 @@ export function render(ctx) {
   const readOnlyAll = !session.can('enroll.mode:write') && !session.can('pki.policy:write');
   // 註冊端點模式卡片的「尚未套用」變更（screens.md S21：離開頁面時的「未儲存變更」提示；main.js 依 isDirty() 詢問）
   let modeDirty = null;
+  // 指標轉出卡片（「整合」）的未儲存變更
+  let exportEl = null;
   const body = h('div', null, skeletonBlock(10));
   mount(
     root,
@@ -150,6 +154,11 @@ export function render(ctx) {
       blocks.push(sectionCard(sec, rows));
     }
     if (section === 'general') blocks.push(card({ title: t('adm.set.section.ldap'), body: h('p', null, t('adm.set.ldapNote'), ' ', session.can('directory:read') ? h('a', { href: '/admin/directory' }, t('adm.set.toDirectory')) : null) }));
+    // 指標轉出（F7：Prometheus exporter、OTLP；admin-export.js）
+    if (section === 'integrations') {
+      exportEl = exportCard();
+      blocks.push(exportEl);
+    }
     if (section === 'integrations' && session.can('api_tokens:read')) blocks.push(tokensCard());
     mount(body, h('div', { class: 'k-stack' }, blocks));
   }
@@ -498,5 +507,5 @@ export function render(ctx) {
   }
 
   load();
-  return { isDirty: () => Boolean(modeDirty && modeDirty()) };
+  return { isDirty: () => Boolean(modeDirty && modeDirty()) || Boolean(exportEl && exportEl.isDirty()) };
 }
