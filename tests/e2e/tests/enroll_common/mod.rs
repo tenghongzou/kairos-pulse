@@ -290,21 +290,23 @@ server_ca_path = "root.pem"
         let doc: Value = serde_json::from_str(p.stdout().trim()).unwrap();
         let cfg = &doc["data"]["config"];
         let s = |k: &str| cfg[k].as_str().unwrap().to_string();
+        // 寫進 TOML 基本字串的路徑：Windows 的反斜線是跳脫字元，改成正斜線
+        let t = |k: &str| s(k).replace('\\', "/");
         let with_cert = base.replace(
             "reload_interval_secs = 1\n",
             &format!(
                 "reload_interval_secs = 1\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
-                s("server.cert_path"),
-                s("server.key_path")
+                t("server.cert_path"),
+                t("server.key_path")
             ),
         );
         std::fs::write(
             dir.join("kairos.toml"),
             format!(
                 "{with_cert}\n[auth]\nclient_ca = \"{}\"\n\n[enroll]\nmode = \"open\"\nlisten = \"127.0.0.1:{}\"\npoll_after_base_secs = 5\n\n[pki]\nmode = \"online\"\nserver_ca_path = \"{}\"\n",
-                s("auth.client_ca"),
+                t("auth.client_ca"),
                 ports[1],
-                s("pki.server_ca_path"),
+                t("pki.server_ca_path"),
             ),
         )
         .unwrap();

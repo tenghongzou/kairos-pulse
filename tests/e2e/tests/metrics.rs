@@ -18,6 +18,20 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// 查詢字串的值做百分比編碼（RFC 3986 的 unreserved 以外都編碼）。網路介面名稱可能有空白與括號，
+/// 例如 Windows 的「Ethernet 3」「vEthernet (nat)」
+fn query_value(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 /// Unix 毫秒 → `YYYY-MM-DDTHH:MM:SS.mmmZ`（同 `durable.rs`）
 fn iso_ms(ms: i64) -> String {
     let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
@@ -132,7 +146,7 @@ fn pulse_08_and_kairos_08_store_metrics_processes_and_inventory() {
     // 網路：預設回傳每秒速率（需要兩筆 report）
     if let Some(net) = net {
         assert_eq!(net["kind"], "counter");
-        let device = net["labels"]["device"].as_str().unwrap().to_string();
+        let device = query_value(net["labels"]["device"].as_str().unwrap());
         assert!(
             poll_until(WAIT, || {
                 let (status, v) = api.get(&format!(
