@@ -1351,9 +1351,18 @@ async fn new_enrollment(
             Ok(c) => c,
             Err(e) => return usage_report(codes::E_BAD_ARG_VALUE, e, Vec::new()),
         };
-    let info = match client.server_info().await {
-        Ok(i) => i,
-        Err(e) => return connect_failure(out, &target, e).await,
+    // 送出申請之前的 429／503：依 Retry-After 等候後重試（0.9 起；之前直接結束）
+    let mut waited = Duration::ZERO;
+    let info = loop {
+        match client.server_info().await {
+            Ok(i) => break i,
+            Err(e) => match pre_submit_wait(out, args, &e, &mut waited, "連線到註冊端點").await
+            {
+                PreSubmit::Retry => {}
+                PreSubmit::Cancelled => return cancelled_wait(),
+                PreSubmit::GiveUp => return connect_failure(out, &target, e).await,
+            },
+        }
     };
     let tls = client
         .tls_version
@@ -1469,14 +1478,24 @@ async fn new_enrollment(
             fix_for(codes::E_CLOCK_SKEW, "")[..1].to_vec(),
         ));
     }
-    // token-check（不消耗次數）：token 有問題時不產生任何檔案
-    let check = client
-        .token_check(&TokenCheckRequest {
-            token: target.token.canonical(),
-            sent_at: Some(ke::format_rfc3339_ms(client.now_ms())),
-            pulse_version: Some(env!("CARGO_PKG_VERSION").into()),
-        })
-        .await;
+    // token-check（不消耗次數）：token 有問題時不產生任何檔案。429／503 時同樣依 Retry-After 等候
+    let check = loop {
+        let r = client
+            .token_check(&TokenCheckRequest {
+                token: target.token.canonical(),
+                sent_at: Some(ke::format_rfc3339_ms(client.now_ms())),
+                pulse_version: Some(env!("CARGO_PKG_VERSION").into()),
+            })
+            .await;
+        match &r {
+            Err(e) => match pre_submit_wait(out, args, e, &mut waited, "檢查 token").await {
+                PreSubmit::Retry => {}
+                PreSubmit::Cancelled => return cancelled_wait(),
+                PreSubmit::GiveUp => break r,
+            },
+            Ok(_) => break r,
+        }
+    };
     if let Err(e) = &check
         && let Some(code) = e.server_code()
         && !code.is_retryable()
@@ -1636,6 +1655,114 @@ impl Exit4 for Report {
 }
 
 /// 8444 連線階段的錯誤
+/// 送出申請之前（`server-info`、`token-check`）遇到 429／503 時，沒有指定 `--wait` 的等候上限（合計）
+pub const PRE_SUBMIT_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// [`pre_submit_wait`] 的結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreSubmit {
+    /// 已等候，重試
+    Retry,
+    /// 不等候（不是 429／503、沒有 `Retry-After`、`--no-wait`、超過上限）：照原本的錯誤處理
+    GiveUp,
+    /// 使用者按了 Ctrl+C
+    Cancelled,
+}
+
+/// 抖動的亂數（測試時固定為 0：等候時間＝`Retry-After`）
+fn wait_rand() -> Box<dyn FnMut() -> f64 + Send> {
+    #[cfg(test)]
+    {
+        Box::new(|| 0.0)
+    }
+    #[cfg(not(test))]
+    {
+        flow::jitter_rand()
+    }
+}
+
+/// 送出申請之前（`server-info`、`token-check`）的 429 `rate_limited`／503 `enroll_busy`：依
+/// `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 等候（絕不早於伺服器指定的時間；ENROLL.md 第 6 節、
+/// 設計包 `enroll-rate-limit.md` §5.2），合計不超過 `--wait`（沒有指定時 [`PRE_SUBMIT_MAX_WAIT`]）。
+/// `source_blocked`（L7 封鎖）不等候（互動式 CLI 顯示錯誤後結束）。等候期間在 stderr 顯示倒數，
+/// 可以 Ctrl+C 中斷。這時還沒有產生任何檔案，所以服務無法接手，只能由 CLI 等候
+async fn pre_submit_wait(
+    out: &Out,
+    args: &EnrollArgs,
+    e: &ApiError,
+    waited: &mut Duration,
+    stage: &str,
+) -> PreSubmit {
+    let ApiError::Server(se) = e else {
+        return PreSubmit::GiveUp;
+    };
+    if !matches!(
+        se.code,
+        ke::EnrollErrorCode::RateLimited | ke::EnrollErrorCode::EnrollBusy
+    ) || args.no_wait
+    {
+        return PreSubmit::GiveUp;
+    }
+    let Some(hint) = se.wait_hint() else {
+        return PreSubmit::GiveUp;
+    };
+    let budget = args.wait.map_or(PRE_SUBMIT_MAX_WAIT, Duration::from_secs);
+    let mut rand = wait_rand();
+    let wait = super::schedule::retry_after_wait(hint, rand(), rand());
+    if *waited + wait > budget {
+        out.line(&format!(
+            "{} {stage}：註冊端點忙碌，需要再等 {} 秒，超過等候上限 {} 秒（--wait），不再重試",
+            out.sym('x'),
+            wait.as_secs(),
+            budget.as_secs()
+        ));
+        return PreSubmit::GiveUp;
+    }
+    *waited += wait;
+    out.line(&format!(
+        "{} {stage}：註冊端點忙碌（{}，HTTP {}），依 Retry-After 在 {} 秒後重試；按 Ctrl+C 取消",
+        out.sym('p'),
+        e.code(),
+        se.status,
+        wait.as_secs_f64().ceil() as u64
+    ));
+    let tty = !out.json && !out.quiet && std::io::stderr().is_terminal();
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        if tty {
+            eprint!("\r  {} 秒後重試…   ", left.as_secs_f64().ceil() as u64);
+            let _ = std::io::stderr().flush();
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                if tty {
+                    eprintln!();
+                }
+                return PreSubmit::Cancelled;
+            }
+            _ = tokio::time::sleep(left.min(Duration::from_secs(1))) => {}
+        }
+    }
+    if tty {
+        eprint!("\r{}\r", " ".repeat(32));
+        let _ = std::io::stderr().flush();
+    }
+    PreSubmit::Retry
+}
+
+/// 等候 429 時按了 Ctrl+C
+fn cancelled_wait() -> Report {
+    usage_report(
+        codes::E_ENROLL_RATE_LIMITED,
+        "已取消等候（註冊端點忙碌，尚未送出註冊申請）。本機尚未產生任何檔案，不需要清理。".into(),
+        vec!["稍後再執行同一個 pulse enroll 命令。".into()],
+    )
+}
+
 async fn connect_failure(out: &Out, target: &Target, e: ApiError) -> Report {
     out.step(1, 'x', &format!("連線到註冊端點 {}", target.enroll_server));
     match &e {
@@ -2485,6 +2612,82 @@ level = \"info\"
         assert!(!base.join("identity/enrollment.json").exists());
         assert!(!base.join("identity/request.key").exists());
         assert!(base.join("agent.id").exists(), "agent_id 保留");
+    }
+
+    #[tokio::test]
+    async fn rate_limits_before_the_request_are_waited_out() {
+        // 0.9：server-info、token-check 收到 429 時依 Retry-After 等候後重試（測試時沒有抖動）
+        use crate::enroll::fake::{FakeKairos, Options, Script};
+        let fake = FakeKairos::start(Options::default()).await;
+        let token = "KRT1-GE8Q-MMGW-WG5P-DP97";
+        {
+            let mut s = fake.lock();
+            s.add_token(token, ke::TokenApproval::Manual, "valid");
+            s.push(
+                "server-info",
+                Script::Error(ke::EnrollErrorCode::RateLimited, Some(1)),
+            );
+            s.push(
+                "token-check",
+                Script::Error(ke::EnrollErrorCode::EnrollBusy, Some(1)),
+            );
+        }
+        let cfg = temp_config(1);
+        let args = EnrollArgs {
+            server: Some("127.0.0.1:1".into()),
+            enroll_server: Some(fake.endpoint.clone()),
+            token: Some(token.into()),
+            ca_pin: Some(fake.ca_pin.clone()),
+            non_interactive: true,
+            no_wait: false,
+            wait: Some(0),
+            json: true,
+            config: Some(cfg.display().to_string()),
+            ..Default::default()
+        };
+        // --wait 0：等候的上限為 0 秒，不重試（與 0.8 相同：PLS-E2202，結束代碼 6）
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!((r.error.unwrap().code, r.exit), ("PLS-E2202", 6));
+        assert_eq!(fake.lock().hits("server-info"), 1);
+        // 上限內：兩次各等 1 秒後送出申請（需核准，等候核准的時間為 0，交給服務）
+        fake.lock().push(
+            "server-info",
+            Script::Error(ke::EnrollErrorCode::RateLimited, Some(1)),
+        );
+        let t0 = std::time::Instant::now();
+        let args = EnrollArgs {
+            wait: Some(4),
+            no_wait: false,
+            ..args
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        assert!(t0.elapsed() >= Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(fake.lock().hits("server-info"), 3);
+        assert_eq!(fake.lock().hits("token-check"), 2);
+        assert_eq!(fake.lock().hits("requests"), 1, "{:?}", r.error);
+        // --no-wait：不等候
+        fake.lock().push(
+            "server-info",
+            Script::Error(ke::EnrollErrorCode::RateLimited, Some(1)),
+        );
+        let args = EnrollArgs {
+            no_wait: true,
+            force: true,
+            ..args
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!(r.error.unwrap().code, "PLS-E2202");
+        // L7 封鎖（source_blocked）：不等候
+        fake.lock().push(
+            "server-info",
+            Script::Error(ke::EnrollErrorCode::SourceBlocked, Some(1)),
+        );
+        let args = EnrollArgs {
+            no_wait: false,
+            ..args
+        };
+        let r = run_async(&args, &quiet_out()).await;
+        assert_eq!(r.error.unwrap().code, "PLS-E3005");
     }
 
     #[tokio::test]
