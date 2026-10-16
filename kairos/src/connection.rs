@@ -139,6 +139,8 @@ pub struct ConnContext {
     pub enroll: Option<Arc<crate::enroll::EnrollService>>,
     /// 資產的寫入佇列（SQLite 時）。有值時宣告 `inventory`、`processes`（METRICS.md 第 7.1 節）
     pub assets: Option<crate::store::AssetSink>,
+    /// 個資政策（`[privacy]`，`kairos/PRIVACY.md`）：保存前轉換主機名稱、來源位址、行程與資產
+    pub privacy: Arc<crate::privacy::PrivacyPolicy>,
 }
 
 /// Kairos 宣告的 feature：[`SERVER_FEATURES`]，儲存後端保存資產與行程時（SQLite）另加 `inventory`、
@@ -788,6 +790,10 @@ struct Conn {
     last_inventory: Option<Instant>,
     /// 資產的寫入佇列（SQLite 時；有值時宣告 `inventory`、`processes`）
     assets: Option<crate::store::AssetSink>,
+    /// 個資政策（`[privacy]`）
+    privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// 要保存的來源位址（`privacy.store_peer_ip`；狀態表、清冊、report、資產）。日誌與限速仍用 `peer`
+    stored_peer: String,
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
@@ -866,6 +872,8 @@ pub async fn handle_connection(
         bus: ctx.registry.bus(),
         last_inventory: None,
         assets: ctx.assets.clone(),
+        privacy: ctx.privacy.clone(),
+        stored_peer: ctx.privacy.peer(peer),
     };
 
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
@@ -1564,6 +1572,9 @@ impl Conn {
             self.enroll.is_some(),
             &client_features,
         );
+        // 個資政策：之後的狀態表、清冊、report、事件都只看到轉換後的主機名稱與顯示名稱
+        let hostname = self.privacy.hostname(&hostname);
+        let host = host.map(|h| Arc::new(self.privacy.host_info((*h).clone())));
         Ok(HelloOutcome::Accepted(Agent {
             agent_id,
             hostname,
@@ -1605,7 +1616,7 @@ impl Conn {
                 agent_version: agent.agent_version.clone(),
                 proto: agent.session.proto,
                 host: agent.host.clone(),
-                peer: self.peer.to_string(),
+                peer: self.stored_peer.clone(),
                 offline_after,
                 client_chain: self.client_chain.clone(),
             },
@@ -1926,13 +1937,16 @@ impl Conn {
             .map(|t| t.timestamp_millis())
             .filter(|t| *t <= received_ms + 300_000 && *t >= received_ms - 86_400_000)
             .unwrap_or(received_ms);
+        // 個資政策：介面位址與 MAC（privacy.inventory_network）在合併與摘要之前轉換
+        let mut inventory = inv.inventory;
+        self.privacy.inventory(&mut inventory);
         let write = crate::store::AssetWrite {
             agent_id: agent.agent_id.clone(),
             hostname: agent.hostname.clone(),
-            peer: self.peer.to_string(),
+            peer: self.stored_peer.clone(),
             collected_ms,
             received_ms,
-            inventory: inv.inventory,
+            inventory,
         };
         match sink.write(write, self.write_timeout).await {
             Ok(outcome) => {
@@ -2161,9 +2175,13 @@ impl Conn {
                         ts.escape_debug()
                     ));
                 }
+                let mut processes = processes;
+                if let Some(list) = processes.as_mut() {
+                    self.privacy.processes(list);
+                }
                 let record = ReportRecord::new(
                     received_at,
-                    self.peer.to_string(),
+                    self.stored_peer.clone(),
                     agent.agent_id.clone(),
                     agent.hostname.clone(),
                     seq,

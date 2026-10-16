@@ -631,9 +631,12 @@ enum Created {
 
 async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, EnrollError> {
     let svc = ctx.svc;
-    let req: EnrollRequest = h::parse_json(body)?;
+    let mut req: EnrollRequest = h::parse_json(body)?;
     // 4. 本文
     let checked: CheckedEnrollRequest = validate_enroll_request(&req).map_err(field_err)?;
+    // 個資政策（privacy.hostname）：申請、清冊與日誌只保存假名（kairos/PRIVACY.md）
+    req.hostname = svc.privacy.hostname(&req.hostname);
+    req.display_name = svc.privacy.display_name(req.display_name.take());
     // 5. 時鐘（不消耗 token、不建立申請、不計入 L5～L7）
     ctx.check_clock(&req.sent_at, checked.sent_at_ms, &checked.agent_id, None)?;
     // 6. token
@@ -1326,9 +1329,11 @@ enum GraceOutcome {
 
 async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, EnrollError> {
     let svc = ctx.svc;
-    let req: GraceRenewRequest = h::parse_json(body)?;
+    let mut req: GraceRenewRequest = h::parse_json(body)?;
     // 4. 本文
     let checked = validate_grace_renew_request(&req).map_err(field_err)?;
+    // 個資政策（privacy.hostname）：簽章不涵蓋主機名稱，驗證後轉換
+    req.hostname = svc.privacy.hostname(&req.hostname);
     // 5. 時鐘
     ctx.check_clock(&req.sent_at, checked.sent_at_ms, &checked.agent_id, None)?;
     // 6. L6r

@@ -217,6 +217,7 @@ pub(crate) async fn fixture_opts(
         alerts: alert_svc.clone(),
         directory,
         obs: Some(Arc::new(obs)),
+        purger: storage.purger.clone(),
     })
     .await
     {

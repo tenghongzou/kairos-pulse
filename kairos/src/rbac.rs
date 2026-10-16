@@ -87,11 +87,15 @@ pub enum Permission {
     ChannelsTest,
     /// 新增、修改、刪除通知管道，以未儲存的設定測試（管道含機密，S11：只有管理員）
     ChannelsWrite,
+    /// 刪除一台主機的所有資料（S05「刪除主機資料」L2；商業審計 S6：只有管理員）
+    HostsPurge,
+    /// 匯出一台主機的個資（資料主體存取請求；商業審計 S6：只有管理員）
+    HostsPersonalData,
 }
 
 impl Permission {
     /// 所有權限（新增變體時同步加入；測試會檢查沒有遺漏與名稱不重複）
-    pub const ALL: [Permission; 35] = [
+    pub const ALL: [Permission; 37] = [
         Permission::HostsRead,
         Permission::HealthRead,
         Permission::EnrollRead,
@@ -127,6 +131,8 @@ impl Permission {
         Permission::ChannelsRead,
         Permission::ChannelsTest,
         Permission::ChannelsWrite,
+        Permission::HostsPurge,
+        Permission::HostsPersonalData,
     ];
 
     /// 對外的名稱（穩定；`<資源>:<動作>`）
@@ -167,6 +173,8 @@ impl Permission {
             Permission::ChannelsRead => "channels:read",
             Permission::ChannelsTest => "channels:test",
             Permission::ChannelsWrite => "channels:write",
+            Permission::HostsPurge => "hosts:purge",
+            Permission::HostsPersonalData => "hosts:personal_data",
         }
     }
 

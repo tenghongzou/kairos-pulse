@@ -719,7 +719,7 @@ mod tests {
         let (out, names, missing) = backup_keys(Some(&cfg), &dest, &src).unwrap();
         assert_eq!(out, dir.join("k.db.keys"));
         assert_eq!(names, ["alerts-secrets.key", "console.key"]);
-        assert_eq!(missing, ["audit-hmac.key"]);
+        assert_eq!(missing, ["audit-hmac.key", "privacy.key"]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

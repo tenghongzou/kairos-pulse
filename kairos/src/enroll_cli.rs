@@ -127,6 +127,8 @@ pub enum Group {
     Enroll,
     Pki,
     Config,
+    /// `kairos hosts purge|export|pseudonym`（[`crate::privacy_cli`]）
+    Hosts,
 }
 
 /// 解析後的命令
@@ -144,8 +146,9 @@ pub struct Cmd {
     pub help: bool,
 }
 
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "--yes",
+    "--dry-run",
     "--all",
     "--closed",
     "--batch",
@@ -187,6 +190,7 @@ impl Cmd {
             Group::Enroll => "enroll",
             Group::Pki => "pki",
             Group::Config => "config",
+            Group::Hosts => "hosts",
         };
         let action = match (self.group, self.sub(0), self.sub(1)) {
             (
@@ -265,6 +269,7 @@ fn usage(group: Group) -> &'static str {
         Group::Enroll => ENROLL_USAGE,
         Group::Pki => PKI_USAGE,
         Group::Config => CONFIG_USAGE,
+        Group::Hosts => crate::privacy_cli::USAGE,
     }
 }
 
@@ -337,6 +342,7 @@ pub fn execute(cmd: &Cmd, env: &mut Env<'_>) -> Output {
         Group::Enroll => enroll_cmd(cmd, env),
         Group::Pki => pki_cmd(cmd, env),
         Group::Config => config_cmd(cmd, env),
+        Group::Hosts => crate::privacy_cli::execute(cmd, env),
     };
     match result {
         Ok(out) => out,

@@ -385,7 +385,7 @@ pub(crate) fn operator() -> String {
 }
 
 /// 以 root 執行而資料目錄屬於其他帳號時拒絕（新建立的資料庫檔會屬於 root，Kairos 之後無法寫入）
-fn refuse_root(data_dir: &Path) -> Option<Failure> {
+pub(crate) fn refuse_root(data_dir: &Path) -> Option<Failure> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

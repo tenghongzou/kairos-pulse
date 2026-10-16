@@ -171,6 +171,8 @@ pub struct EnrollService {
     last_crl_refresh: Mutex<HashMap<i64, i64>>,
     /// 上次記錄 `KRS-W1304` 的時間（每 24 小時最多一次）
     last_expiry_warning: Mutex<i64>,
+    /// 個資政策（`[privacy]`）：註冊申請的主機名稱與顯示名稱
+    pub privacy: Arc<crate::privacy::PrivacyPolicy>,
 }
 
 /// 各層的限流狀態
@@ -333,6 +335,10 @@ impl EnrollService {
             last_minutely: Mutex::new(0),
             last_crl_refresh: Mutex::new(HashMap::new()),
             last_expiry_warning: Mutex::new(0),
+            privacy: Arc::new(crate::privacy::PrivacyPolicy::load(
+                p.config.privacy,
+                &p.data_dir,
+            )),
         });
         // 簽發 CA、信任錨與 CRL：啟動時同步一次（8443 的 TLS 驗證器需要它們）
         svc.sync_pki(now, true);
@@ -883,6 +889,8 @@ impl EnrollService {
                     "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
                     [now - 400 * 86_400_000],
                 )?;
+                // 刪除主機資料時為了 CRL 保留的已撤銷憑證：過期超過 1 天後刪除（PRIVACY.md 第 4 節）
+                crate::store::purge::delete_orphan_certificates(conn, now)?;
                 Ok((expired, purged))
             });
             match result {
