@@ -14,6 +14,7 @@ use std::time::Duration;
 mod accounts;
 mod alerts;
 mod enroll;
+pub mod export;
 
 pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
 
@@ -22,6 +23,7 @@ pub use enroll::{
     CertPolicySettings, EnrollSettings, MAX_CERT_LIFETIME_DAYS, MAX_GRACE_DAYS,
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
 };
+pub use export::{ExportSettings, OtlpSettings, PrometheusExportSettings};
 
 /// 未指定 `--config` 時讀取的設定檔（不存在則略過）
 pub const DEFAULT_CONFIG_FILE: &str = "kairos.toml";
@@ -189,6 +191,8 @@ pub struct AppConfig {
     pub ldap: LdapSettings,
     /// 稽核日誌
     pub audit: AuditSettings,
+    /// 指標轉出：Prometheus exporter、OTLP（`kairos/EXPORT.md`）
+    pub export: ExportSettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,
@@ -1412,6 +1416,7 @@ impl AppConfig {
         self.accounts.validate()?;
         self.ldap.validate()?;
         self.audit.validate()?;
+        self.export.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
         self.log.log_format()?;

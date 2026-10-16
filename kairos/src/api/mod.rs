@@ -15,6 +15,7 @@
 //! | [`hosts`] | 主機清冊：列表、詳情、篩選值（`/hosts/facets`） |
 //! | [`conn_log`] | 每台主機最近的上線與離線紀錄（記憶體中，`/hosts/{agent_id}/connections`） |
 //! | [`metrics`] | 指標趨勢 |
+//! | [`export`] | 指標轉出：Prometheus exporter、OTLP 的設定與狀態（`kairos/EXPORT.md`） |
 //! | [`overview`]、[`health`] | 總覽、系統健康 |
 //! | [`events`] | 即時變更推送（SSE） |
 //! | [`maint`] | 背景工作：每分鐘上線數、token 的最後使用與稽核日誌、被拒的憑證寫入清冊 |
@@ -29,6 +30,7 @@ pub mod conn_log;
 pub mod db;
 pub mod enroll;
 pub mod events;
+pub mod export;
 pub mod health;
 pub mod hosts;
 pub mod http;
@@ -669,6 +671,7 @@ fn known_route(rest: &[&str]) -> bool {
             | ["alert-rules", ..]
             | ["silences", ..]
             | ["channels", ..]
+            | ["export", ..]
     )
 }
 
@@ -797,6 +800,8 @@ async fn route(
         ["alerts", ..] | ["alert-rules", ..] | ["silences", ..] | ["channels", ..] => {
             alerts::handle(ctx, peer, req, p, now).await
         }
+        // 指標轉出（kairos/EXPORT.md）：Prometheus exporter、設定與狀態
+        ["export", ..] => export::handle(ctx, peer, req, p, rest, now).await,
         ["events"] => match p.host_access() {
             Ok(access) => {
                 let last = req

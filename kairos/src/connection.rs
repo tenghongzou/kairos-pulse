@@ -493,6 +493,16 @@ pub(crate) async fn store_report(
     }
     let agent_id = record.agent_id.clone();
     let last = last_report_of(&record);
+    // 指標轉出（Prometheus exporter、OTLP；kairos/EXPORT.md）：啟用時才複製 report 的內容
+    let export = registry
+        .export_hub()
+        .filter(|h| h.wants_samples())
+        .map(|h| {
+            (
+                h,
+                Arc::new(crate::export::ExportSample::from_record(&record)),
+            )
+        });
     let timed_out = || format!("寫入未在 {} 秒內完成", write_timeout.as_secs_f64());
     let deadline = deadline_after(write_timeout);
     // 每筆的結果記入寫入統計（系統健康的「report 寫入」）
@@ -572,6 +582,9 @@ pub(crate) async fn store_report(
                     registry.set_last_report_unless_older(&agent_id, conn_id, last);
                 } else {
                     registry.set_last_report(&agent_id, conn_id, last);
+                }
+                if let Some((hub, sample)) = export {
+                    hub.accept(sample);
                 }
             }
             let touch = registry.touch(&agent_id, conn_id, std::time::Instant::now(), Utc::now());

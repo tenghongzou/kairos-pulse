@@ -175,3 +175,27 @@ enabled = false
 retention_days = 1095         # 保留天數（預設 3 年，獨立於 report 的保留天數），90..=36500
 anchor_log_minutes = 60       # 每隔幾分鐘把鏈尾雜湊寫一行到日誌（audit.chain_anchor；經 syslog 外送），0 不寫，5..=1440
 verify_interval_hours = 24    # 每隔幾小時自我驗證雜湊鏈與 HMAC（失敗：KRS-E6201＋「稽核日誌完整性」緊急事件），1..=168
+
+[export.prometheus]           # Prometheus exporter：GET /api/v1/export/prometheus（主控台的監聽，API token 需要 hosts:read；kairos/EXPORT.md）
+                              # enabled、stale_after_secs、include_processes 也可在主控台（系統設定 → 整合）修改，存在資料庫、優先於這裡
+enabled = false               # false：端點回 404 export_disabled
+stale_after_secs = 300        # 最後一筆 report 超過幾秒就不輸出該主機的指標（只輸出 kairos_host_up），30..=86400
+include_processes = false     # 另外輸出行程排行 kairos_process_*（標籤含 pid 與行程名稱，高基數；預設不輸出）
+processes_top_n = 5           # 行程排行每台主機輸出前幾名（CPU、記憶體各自），1..=10
+
+[export.otlp]                 # OTLP/HTTP（protobuf）推送到 OpenTelemetry collector（kairos/EXPORT.md）
+                              # enabled、endpoint、interval_secs、naming 與 HTTP 標頭也可在主控台修改（標頭以 data/alerts-secrets.key 加密存入資料庫）
+enabled = false
+endpoint = ""                 # 例如 "https://otel-collector.example.com:4318/v1/metrics"；http:// 也接受（標頭以明文傳送）
+headers_file = ""             # 額外的 HTTP 標頭檔（每行「名稱: 值」，例如 Authorization: Bearer …；chown kairos、chmod 600）；機密不寫在本檔
+ca_file = ""                  # 驗證 collector 憑證的私有 CA（PEM，另外加入作業系統的信任清單）；不提供略過驗證
+client_cert = ""              # collector 要求 mTLS 時的用戶端憑證與私鑰（PEM），同時設定或同時留空
+client_key = ""
+interval_secs = 10            # 推送間隔，1..=3600；佇列累積到 max_batch_points 時提早送出
+timeout_secs = 10             # 每個請求的逾時，1..=60
+max_batch_points = 8192       # 每個請求最多幾個資料點（一筆 report 不拆開），100..=100000
+queue_max_points = 500000     # 記憶體佇列上限（資料點，每點約 100～200 bytes），1000..=10000000，不可小於 max_batch_points
+drop_policy = "oldest"        # 佇列已滿時：oldest 丟最舊的、newest 丟新收到的（KRS-W4313）
+max_retries = 5               # 連線失敗、逾時、HTTP 429／502／503／504 時的重試次數（退避 1、2、4… 秒，最多 30 秒），0..=20
+naming = "semconv"            # semconv：對應 OpenTelemetry semantic conventions（system.cpu.utilization…）；kairos：原樣使用 Kairos 的名稱
+resource_attributes = []      # 另外加到每台主機 resource 的屬性，例如 ["deployment.environment=production"]，最多 32 個
