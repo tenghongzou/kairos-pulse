@@ -327,10 +327,40 @@ async fn route(
             h::reject_body(req.headers())?;
             server_info(ctx)
         }
-        Route::Download(_) => {
+        Route::Download(name) => {
             h::reject_body(req.headers())?;
             match ctx.mode(EndpointClass::Download) {
-                ModeDecision::Accept => Err(EnrollError::not_found()),
+                ModeDecision::Accept => {
+                    let Some(dir) = ctx.svc.download_dir() else {
+                        return Err(EnrollError::not_found());
+                    };
+                    // L11：每個來源（批次部署來源乘以倍率）與全部的同時下載數
+                    let ip = conn.peer.ip().to_canonical();
+                    let c = &ctx.svc.config.enroll;
+                    let per_ip =
+                        (f64::from(c.max_downloads_per_ip) * ctx.svc.multiplier(ip)) as usize;
+                    let Some(slot) =
+                        ctx.svc
+                            .download_slots
+                            .take(ip, per_ip.max(1), c.max_downloads as usize)
+                    else {
+                        ctx.svc.stats.limited_enroll.fetch_add(1, Ordering::Relaxed);
+                        return Err(ctx.limited(
+                            EnrollErrorCode::RateLimited,
+                            RateScope::Download,
+                            super::downloads::RETRY_AFTER,
+                        ));
+                    };
+                    let head = req.method() == hyper::Method::HEAD;
+                    let inm = req
+                        .headers()
+                        .get(hyper::header::IF_NONE_MATCH)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    super::downloads::respond(&dir, &name, head, inm.as_deref(), slot)
+                        .await
+                        .ok_or_else(EnrollError::not_found)
+                }
                 _ => Ok(h::text(
                     StatusCode::FORBIDDEN,
                     "Kairos 目前不受理新註冊（註冊端點為僅續簽，或新註冊已自動暫停），因此不提供安裝檔下載。\nKairos is not accepting new enrollments; downloads are unavailable.\n",

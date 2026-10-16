@@ -306,7 +306,7 @@ async fn list_tokens(
         StatusCode::OK,
         now,
         json!({"data": data, "page": {"limit": limit, "total": total, "next_cursor": null},
-            "meta": {"downloads": crate::enroll::downloads_json()}}),
+            "meta": {"downloads": svc.downloads_json()}}),
     ))
 }
 
@@ -479,7 +479,7 @@ async fn create_token(
         }
     }
     data["enroll_mode"] = json!(w.svc.mode_state().as_str());
-    data["downloads"] = crate::enroll::downloads_json();
+    data["downloads"] = w.svc.downloads_json();
     data["auto_pause_cleared"] = json!(was_paused);
     Ok(http::json(StatusCode::CREATED, now, json!({"data": data})))
 }
@@ -980,7 +980,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "listen_addr": listen.addr,
         "not_listening_reason": listen.reason,
         "pki_mode": svc.pki.mode().as_str(),
-        "downloads": crate::enroll::downloads_json(),
+        "downloads": svc.downloads_json(),
         "issuance": match svc.pki.status() {
             IssueStatus::Online { ca_id } => json!({"status": "online", "ca_id": ca_id}),
             IssueStatus::Offline => json!({"status": "offline", "product_code": "KRS-E1302"}),
@@ -989,6 +989,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "sources": eff.sources_json(),
         "stats": {
             "requests": svc.stats.requests.load(std::sync::atomic::Ordering::Relaxed),
+            "downloads_in_progress": svc.download_slots.in_use(),
             "enroll_requests": svc.stats.enroll_requests.load(std::sync::atomic::Ordering::Relaxed),
             "renew_requests": svc.stats.renew_requests.load(std::sync::atomic::Ordering::Relaxed),
             "rate_limited_enroll": svc.stats.limited_enroll.load(std::sync::atomic::Ordering::Relaxed),

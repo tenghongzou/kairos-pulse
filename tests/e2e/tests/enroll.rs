@@ -509,6 +509,142 @@ fn manually_issued_certificate_is_imported_and_revocation_takes_effect() {
     kairos.stop();
 }
 
+/// 8444 的 GET（每次一條連線），回傳 (狀態碼, 標頭（小寫名稱）, 原始本文)
+fn raw_get(env: &Env, path: &str, extra: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = env.tls(env.enroll_port, None);
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{extra}\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("沒有標頭");
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (status, headers, buf[split + 4..].to_vec())
+}
+
+fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn download_endpoint_serves_the_release_files() {
+    // ENROLL.md 第 19.4 節第 3 項：enroll.download_dir 的發佈檔案經 8444 的 /agent/<檔名> 提供；
+    // 路徑穿越與子目錄 404、內容類型、快取標頭、ETag 的 304；主控台的 downloads 顯示可用與 base_url
+    let env = Env::new("enroll-downloads", "download_dir = \"dl\"\n", &[]);
+    let dl = env.dir.join("dl");
+    std::fs::create_dir_all(dl.join("sub")).unwrap();
+    let deb: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dl.join("pulse-install.sh"), "#!/bin/sh\necho e2e\n").unwrap();
+    std::fs::write(dl.join("pulse_0.9.0_amd64.deb"), &deb).unwrap();
+    std::fs::write(dl.join("SHA256SUMS"), "0000  pulse_0.9.0_amd64.deb\n").unwrap();
+    std::fs::write(dl.join("SHA256SUMS.sig"), "-----BEGIN SSH SIGNATURE-----\n").unwrap();
+    std::fs::write(dl.join("sub").join("secret.txt"), "no").unwrap();
+    let mut kairos = env.start();
+    assert!(
+        kairos.output().contains("下載端點 /agent/"),
+        "{}",
+        kairos.dump()
+    );
+
+    let (s, h, body) = raw_get(&env, "/agent/pulse_0.9.0_amd64.deb", "");
+    assert_eq!(s, 200);
+    assert_eq!(body, deb);
+    assert_eq!(
+        header(&h, "content-type"),
+        Some("application/vnd.debian.binary-package")
+    );
+    assert_eq!(header(&h, "content-length"), Some("300000"));
+    assert_eq!(header(&h, "cache-control"), Some("public, max-age=3600"));
+    assert_eq!(header(&h, "x-content-type-options"), Some("nosniff"));
+    let etag = header(&h, "etag").unwrap().to_string();
+    let (s, _, body) = raw_get(
+        &env,
+        "/agent/pulse_0.9.0_amd64.deb",
+        &format!("If-None-Match: {etag}\r\n"),
+    );
+    assert_eq!((s, body.len()), (304, 0));
+    let (s, h, body) = raw_get(&env, "/agent/SHA256SUMS", "");
+    assert_eq!(s, 200);
+    assert_eq!(header(&h, "cache-control"), Some("no-cache"));
+    assert_eq!(
+        header(&h, "content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert!(String::from_utf8_lossy(&body).contains("pulse_0.9.0_amd64.deb"));
+    let (s, h, _) = raw_get(&env, "/agent/pulse-install.sh", "");
+    assert_eq!(s, 200);
+    assert_eq!(
+        header(&h, "content-type"),
+        Some("text/x-shellscript; charset=utf-8")
+    );
+    // 路徑穿越、子目錄、百分比編碼、不存在、隱藏檔：一律 404
+    for p in [
+        "/agent/../kairos.toml",
+        "/agent/sub/secret.txt",
+        "/agent/sub",
+        "/agent/%2e%2e%2fkairos.toml",
+        "/agent/missing.deb",
+        "/agent/.hidden",
+    ] {
+        let (s, _, _) = raw_get(&env, p, "");
+        assert_eq!(s, 404, "{p}");
+    }
+    // 與安裝腳本相同的 curl 參數（--proto =https --tlsv1.2 --cacert）可以下載
+    if std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", "--proto", "=https", "--tlsv1.2", "--cacert"])
+            .arg(env.dir.join("root.pem"))
+            .arg(format!(
+                "https://localhost:{}/agent/pulse-install.sh",
+                env.enroll_port
+            ))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "#!/bin/sh\necho e2e\n"
+        );
+    }
+    // 主控台：downloads 可用（主控台據此顯示一行安裝指令）
+    let token = api_token(&env, "auditor");
+    let (s, v) = env.console("GET", "/api/v1/enroll/mode", &token, None);
+    assert_eq!(s, 200, "{v}");
+    let d = &v["data"]["downloads"];
+    assert_eq!(d["available"], true, "{v}");
+    assert_eq!(
+        d["base_url"],
+        format!("https://127.0.0.1:{}/agent", env.enroll_port)
+    );
+    assert!(
+        d["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pulse_0.9.0_amd64.deb")
+    );
+    // 僅續簽：不提供下載（403）
+    let (code, p) = env.cli(&["enroll", "mode", "renew_only", "--yes"]);
+    assert_eq!(code, 0, "{}", p.dump());
+    let ok = poll_until(WAIT, || raw_get(&env, "/agent/SHA256SUMS", "").0 == 403);
+    assert!(ok, "僅續簽時下載應回 403");
+    kairos.stop();
+}
+
 #[test]
 fn mode_switching_and_rate_limit() {
     let env = Env::new(

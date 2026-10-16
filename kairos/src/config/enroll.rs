@@ -99,9 +99,12 @@ pub struct EnrollSettings {
     pub long_poll_secs: u32,
     pub max_long_polls_per_ip: u32,
     pub max_long_polls: u32,
-    /// L11：下載的同時數（本版下載端點回 404，保留設定鍵）
+    /// L11：下載的同時數（每個來源；批次部署來源乘以倍率）與全部
     pub max_downloads_per_ip: u32,
     pub max_downloads: u32,
+    /// 下載端點 `GET /agent/<檔名>` 提供的目錄（Pulse 的發佈檔案：`pulse-install.sh`、套件、`SHA256SUMS`、
+    /// `SHA256SUMS.sig`）；空字串＝不提供（`/agent/` 回 404）。相對路徑以 Kairos 的工作目錄為準
+    pub download_dir: String,
     /// 批次部署來源（CIDR）：L2、L3、L4、L11 乘以 `batch_source_multiplier`
     #[serde(deserialize_with = "string_or_list")]
     pub batch_sources: Vec<String>,
@@ -161,6 +164,7 @@ impl Default for EnrollSettings {
             max_long_polls: 1000,
             max_downloads_per_ip: 8,
             max_downloads: 64,
+            download_dir: String::new(),
             batch_sources: Vec::new(),
             batch_source_multiplier: 10,
             retry_after_max_secs: 600,
