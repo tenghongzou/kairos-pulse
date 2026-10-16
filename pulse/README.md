@@ -6,7 +6,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 ## 功能特色
 
-- 🖥️ 收集系統資訊：CPU 使用率、記憶體；Kairos 支援協定 v2 時另外回報 27 個標準指標（磁碟用量與使用率、磁碟 I/O、網路流量／封包／錯誤、負載、可用記憶體、置換空間、行程數、開機時間、溫度；0.8.0〔草稿〕起），Kairos 0.8.0 以上另有行程排行（依 CPU、記憶體）與主機資產（OS、CPU、記憶體、廠牌型號序號、BIOS、磁碟、網卡 MAC／IP；見「回報資料格式」）
+- 🖥️ 收集系統資訊：CPU 使用率、記憶體；Kairos 支援協定 v2 時另外回報 27 個標準指標（磁碟用量與使用率、磁碟 I/O、網路流量／封包／錯誤、負載、可用記憶體、置換空間、行程數、開機時間、溫度；0.8.0 起），Kairos 0.8.0 以上另有行程排行（依 CPU、記憶體）與主機資產（OS、CPU、記憶體、廠牌型號序號、BIOS、磁碟、網卡 MAC／IP；見「回報資料格式」）
 - 🔐 單一長 TLS 連線（rustls），NDJSON 協定（一行一則 JSON，v1、v2 自動協商），預設**驗證伺服器憑證**（設定了自訂 CA `ca_cert` 時只信任它，否則使用作業系統信任庫；可明確設定同時信任兩者）
 - 🪪 每台主機有固定的 `agent_id`（UUID v4，存於 `agent.id`），換主機名稱也不影響識別
 - 💓 每 15 秒（`heartbeat.interval`）送出 heartbeat，伺服器據此判斷上線 / 離線
@@ -54,7 +54,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 
 **部署順序**：協定 v2 起不必同時升級，任何順序都能以協定 v1 混用；仍建議先升級全部 Pulse，再升級 Kairos，以避開上表「舊版 Pulse 連新版 Kairos」的風險。新版 Pulse 送出前會替換所有新版 Kairos 禁止的字元，讀取閒置也只依心跳間隔計算，連舊版 Kairos（`timeouts.write_secs` 維持預設 5 秒時）不受影響。各版本組合見 CHANGELOG「版本相容矩陣」。
 
-## 安裝（0.8.0〔草稿〕起：套件、一行安裝腳本、Windows MSI）
+## 安裝（0.8.0 起：套件、一行安裝腳本、Windows MSI）
 
 | 平台 | 方式 | 說明 |
 |---|---|---|
@@ -67,7 +67,7 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 sudo PULSE_INSTALL_STRING='pulse-enroll:v1:…' sh pulse-install.sh   --base-url https://downloads.example.com/kairos-pulse/0.8.0 --allowed-signers /etc/kairos-pulse/allowed_signers
 ```
 
-### Windows 服務（pulse service，0.8.0〔草稿〕）
+### Windows 服務（pulse service，0.8.0）
 
 ```powershell
 pulse service install [--workdir <目錄>] [--start]   # 以系統管理員執行：註冊服務 Pulse（MSI 已註冊時不需要）
@@ -173,7 +173,7 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 - `ca.key` 是整個信任鏈的根，務必離線保存。
 - 由公開 CA 簽發的伺服器憑證不需要設定 `ca_cert`：沒有 `ca_cert` 時 Pulse 預設信任作業系統的信任庫。同時設定了 `ca_cert` 又需要信任公開 CA 時，明確設定 `server.use_system_roots = true`。
 
-## 自動註冊（pulse enroll，0.5.0〔草稿〕）
+## 自動註冊（pulse enroll，0.5.0）
 
 需要 Kairos 0.5 以上、註冊端點（預設 8444）為「開放」。規格：`crates/kairos-proto/ENROLL.md`；安裝步驟：INSTALL 第 5.0 節。
 
@@ -386,7 +386,7 @@ cargo run
 [INFO] 工作目錄：/opt/pulse（設定中的相對路徑都以此為準）；設定檔：已讀取 /opt/pulse/pulse.toml
 ```
 
-> **以 Windows 服務執行時**（0.8.0〔草稿〕起以 `pulse service run` 或 MSI 註冊），服務先把工作目錄切換到 `pulse.exe` 所在目錄（或 `--workdir`），`pulse.toml`、`agent.id` 與 `logs/` 都在那裡。以其他服務包裝工具執行舊的命令列時，預設工作目錄仍是 `C:\Windows\System32`：Pulse 偵測到工作目錄是 `System32` 或 `SysWOW64` 時會記 `WARN`，請改用 `pulse service install`（見「Windows 服務」）。
+> **以 Windows 服務執行時**（0.8.0 起以 `pulse service run` 或 MSI 註冊），服務先把工作目錄切換到 `pulse.exe` 所在目錄（或 `--workdir`），`pulse.toml`、`agent.id` 與 `logs/` 都在那裡。以其他服務包裝工具執行舊的命令列時，預設工作目錄仍是 `C:\Windows\System32`：Pulse 偵測到工作目錄是 `System32` 或 `SysWOW64` 時會記 `WARN`，請改用 `pulse service install`（見「Windows 服務」）。
 
 環境變數的值一律以字串讀入：數值與布林欄位在載入時才轉成對應型別，路徑、`domain`、`address` 等字串欄位保持原樣（例如 `PULSE__AGENT__ID_FILE=0001` 就是 `0001`，不會被改寫成 `1`）。
 
@@ -425,7 +425,7 @@ max_records = 50000            # 待送資料的筆數上限（與 max_mb 先到
 max_age_hours = 168            # 取樣超過這麼久（小時）的資料不再送出
 replay_interval_ms = 1200      # 兩筆 report 之間的最短間隔（毫秒；補送積壓的速率，不超過 report.interval 的 60%）
 
-[collect]                      # 標準指標的採集範圍（0.8.0〔草稿〕起；見「回報資料格式」）
+[collect]                      # 標準指標的採集範圍（0.8.0 起；見「回報資料格式」）
 filesystems = true             # system.filesystem.*（每個掛載點：total、available、used、usage）
 disk_io = true                 # system.disk.*（累計讀寫量；Linux 另有讀寫次數與忙碌時間）
 network = true                 # system.network.*（累計收發位元組、封包、錯誤）
@@ -435,14 +435,14 @@ max_disks = 8                  # 磁碟 I/O 裝置上限（0～8）
 max_interfaces = 16            # 網路介面上限（0～16）
 interface_exclude = []         # 額外排除的介面（glob，* 與 ?，例如 ["tap*", "wg?"]；只能在 pulse.toml 設定）
 
-[processes]                    # 行程數與行程排行（0.8.0〔草稿〕起）
+[processes]                    # 行程數與行程排行（0.8.0 起）
 enabled = true                 # false = 不宣告 processes、不送 system.process.count
 interval = 60                  # 行程排行的間隔（秒，1～3600；實際不小於 report.interval）
 top = 5                        # 依 CPU、依記憶體各取幾個（1～10）
 command = "none"               # 命令列：none（不送）／executable（只送執行檔路徑）／full（含參數，截斷到 1024 bytes）
 include_user = false           # 送使用者名稱：本版尚未實作，設為 true 只記一則 WARN
 
-[inventory]                    # 主機資產（0.8.0〔草稿〕起）
+[inventory]                    # 主機資產（0.8.0 起）
 enabled = true                 # false = 不宣告 inventory、不收集
 interval = 3600                # 重新收集的間隔（秒，300～86400）；內容改變才送，滿 24 小時也送一次
 hardware_serials = true        # 送系統序號（Linux 需要 pulse.service 的 ExecStartPre=，見 INSTALL.md）
@@ -815,7 +815,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 ## 日誌
 
 - 同時輸出到終端（stdout，`log.stdout = false` 可關閉）與 `logs/pulse-YYYY-MM-DD.log`（相對於目前工作目錄）；`log.format = "json"` 時改為 `logs/pulse-YYYY-MM-DD.jsonl`
-- **格式**（〔0.6 草稿〕，審計 O3；設計包 `pulse/log-ux.md` §6）：`text`（預設）為 `2026-10-14T14:22:16.123+08:00 [WARN] buffer.full PLS-W4202 本機緩衝已滿…`（RFC 3339、毫秒、帶時區位移；`log.timezone = "utc"` 時以 `Z` 結尾；0.5 以前行首是不帶時區的本地時間）；`json` 為一行一個 JSON（UTC），固定欄位 `v`、`ts`、`level`、`event`、`code`、`msg`、`agent_id`（啟用 mTLS 時才有值，未啟用時 agent_id 等同身分憑據，與狀態檔相同不寫出）、`instance`（多實例 `pulse-N.service`〔`StateDirectory=pulse/N`〕時為 N，單一實例為 `null`）、`product`、`host`、`run_id`（每次啟動隨機產生）、`seq`（本次行程內遞增）、`target`、`fields`；`legacy` 保留 0.5 以前的格式一個主要版本供過渡。`event`、`code` 取自訊息開頭的「`<event> <code> `」；尚未指定固定事件的行，`event` 為模組路徑（例如 `pulse.network`）
+- **格式**（0.6，審計 O3；設計包 `pulse/log-ux.md` §6）：`text`（預設）為 `2026-10-14T14:22:16.123+08:00 [WARN] buffer.full PLS-W4202 本機緩衝已滿…`（RFC 3339、毫秒、帶時區位移；`log.timezone = "utc"` 時以 `Z` 結尾；0.5 以前行首是不帶時區的本地時間）；`json` 為一行一個 JSON（UTC），固定欄位 `v`、`ts`、`level`、`event`、`code`、`msg`、`agent_id`（啟用 mTLS 時才有值，未啟用時 agent_id 等同身分憑據，與狀態檔相同不寫出）、`instance`（多實例 `pulse-N.service`〔`StateDirectory=pulse/N`〕時為 N，單一實例為 `null`）、`product`、`host`、`run_id`（每次啟動隨機產生）、`seq`（本次行程內遞增）、`target`、`fields`；`legacy` 保留 0.5 以前的格式一個主要版本供過渡。`event`、`code` 取自訊息開頭的「`<event> <code> `」；尚未指定固定事件的行，`event` 為模組路徑（例如 `pulse.network`）
 - **syslog 外送**：`[log.syslog]` 的 `target` 設定時另以 RFC 5424 送到 syslog（`udp://`、`tcp://`、`unix://`；`MSGID` 為錯誤代碼，沒有時為事件名稱；`payload = "json"` 時 `MSG` 為一行 JSON）。在背景執行緒送出，接收端無法連線時丟棄並計數，不影響服務與日誌檔
 - **事件與錯誤代碼**：有固定事件的日誌行，訊息開頭為「`<event> <code> `」（沒有代碼時為 `-`），例如 `[WARN] buffer.full PLS-W4202 本機緩衝已滿…`、`[ERROR] auth.rejected PLS-E1105 連線中斷…`、`[INFO] conn.registered - 已向伺服器註冊…`。事件名稱與代碼固定、不翻譯（設計包 `pulse/log-ux.md` §4、`copywriting.md` §3.3），告警規則與搜尋請比對這兩欄（`json` 格式時為 `event`、`code` 欄位）。哪些代碼已對應、在程式的哪裡、何時觸發，見 `ERROR-CODES.md`；`log-ux.md` 的重試摘要排程、`log.lang` 等其餘改版尚未實作。本機緩衝的事件：`buffer.opened`（啟動時）、`buffer.unavailable`（`PLS-E4004`）、`buffer.write_failed`（`PLS-W4103`）、`buffer.full`（`PLS-W4202`）、`buffer.expired`（`PLS-W4203`）、`buffer.replay_done`（補送完成，附筆數與耗時）；連線恢復時另記 `conn.restored`（中斷時間、重試次數、待補送與丟棄筆數），中斷滿 30 分鐘記一次 `conn.outage`（`ERROR`，同時寫 stderr）
 - **需要人工處理的錯誤另寫一行到 stderr**：伺服器憑證驗證錯誤（不受信任、名稱不符、過期、尚未生效、被撤銷、用途不符、被標記為 CA、其他驗證失敗；第一次發生就記 `ERROR`，原因改變時立即再記）、伺服器送來的致命錯誤與註冊前的錯誤（`certificate_rejected`、`auth_failed`、狀態表已滿等）、協定版本不符、連續被取代、客戶端憑證被伺服器以 TLS alert 拒絕（撤銷、過期等），以及本機客戶端憑證已過期。內容與日誌的 `ERROR` 行相同，節流也相同（同一原因每 10 分鐘最多一行，其餘只在日誌記 `WARN`）；一般連線錯誤（拒絕連線、逾時、連線被重設等）不寫。以 systemd 執行（有 `JOURNAL_STREAM` 環境變數）時行首加上 `<3>`，journal 以 err 等級記錄（`journalctl -u pulse -p err`），訊息中不會出現 `<3>`。stdout 與 stderr 都是終端機（互動執行）時不重複寫。`pulse.service` 設定 `StandardOutput=null`，所以 journal 中只會看到這些行與啟動失敗等 stderr 訊息
@@ -843,7 +843,7 @@ packaging/             發佈包：build-release.sh（打包腳本）、pulse.se
 
   避免故障或惡意的伺服器在短時間內灌爆日誌檔。會結束連線的錯誤（fatal error、註冊前的 error）每次斷線只記一則（見「重連行為」），其頻率由重連退避限制；其中需要人工處理的錯誤另依錯誤碼節流 `ERROR`（每 10 分鐘最多一則，其餘記 `WARN`）。
 
-## 本機指標（Prometheus，0.6.0〔草稿〕）
+## 本機指標（Prometheus，0.6.0）
 
 預設關閉（審計 O3）。兩種提供方式，可同時使用：
 
@@ -866,7 +866,7 @@ textfile 以「寫暫存檔再改名」的方式原子更新，Pulse 正常結�
 
 標籤只用有限集合的值，不含 agent_id 或主機名稱（由 Prometheus 的 `instance` 區分主機）。告警規則範例：`packaging/pulse-alerts.example.yml`。
 
-## 設定檢查與診斷包（0.6.0〔草稿〕）
+## 設定檢查與診斷包（0.6.0）
 
 ```bash
 # 檢查設定（不連線、不影響服務）：語法與範圍、伺服器、信任、用戶端憑證與私鑰（成對、到期、權限）、agent.id、
@@ -889,13 +889,13 @@ sudo pulse diag -c /opt/pulse/pulse.toml --redact strict --since 7d   # 主機�
 - 主機資產的「上次送達的摘要」只存在記憶體中：Pulse 重新啟動後第一次連線一定再送一次（Kairos 以摘要判斷內容未變，不寫變更歷史）。IPv6 的暫時位址（privacy extensions）定期更換時會被視為資產改變而重送。
 - 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 的去重有範圍限制（SQLite 為原始資料保存的期間；`backend = "jsonl"` 為記憶體中的視窗，見 PROTOCOL.md 與 Kairos 的 STORAGE.md），極少數情況下可能重複寫入。`buffer.max_age_hours` 建議不超過 Kairos `storage.raw_retention_days` × 24。
 - 本機緩衝不加鎖：同一個 `buffer.dir` 只能由一個 Pulse 使用。
-- Windows 服務（`pulse service`、MSI，0.8.0〔草稿〕）只經過交叉編譯，未在 Windows 實機驗證。不寫 Windows 事件記錄（需要安裝程式註冊事件來源；事件識別碼已在 `codes.rs` 定案）。`pulse status` 在 Windows 上查詢的服務名稱固定為 `Pulse`，以服務包裝工具註冊成其他名稱時改以狀態檔的 PID 判斷。MSI 沒有安裝字串的參數、移除時不會自動 `pulse decommission`。
+- Windows 服務（`pulse service`、MSI，0.8.0）只經過交叉編譯，未在 Windows 實機驗證。不寫 Windows 事件記錄（需要安裝程式註冊事件來源；事件識別碼已在 `codes.rs` 定案）。`pulse status` 在 Windows 上查詢的服務名稱固定為 `Pulse`，以服務包裝工具註冊成其他名稱時改以狀態檔的 PID 判斷。MSI 沒有安裝字串的參數、移除時不會自動 `pulse decommission`。
 - `pulse status` 尚不支援 `--all`（列出所有實例）與 `--json-lines`；「連線中斷 30 分鐘」的門檻固定。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。
 - 取樣卡住（例如 WMI 無回應）時只在本機記 `WARN` 並略過 report，heartbeat 照常送出；Kairos 目前不會因 `last_report` 停滯而告警（見「回報資料格式」）。
 - 兩台主機共用同一份 `agent.id` 時，Pulse 只能拉長重連間隔（連續被取代時至少 30 秒）並以 `ERROR` 提示，無法自動解決，雙方仍會持續互踢。
 - `hostname` 只供顯示：送出前會把控制字元、格式字元（零寬空格、方向控制等）、U+2028 / U+2029 與不可見碼位（Hangul filler、變體選擇字元、私用區等）替換成 `?`，並截到 255 bytes 以內，伺服器上顯示的名稱可能與實際主機名稱略有不同（識別以 `agent_id` 為準）。
-- 註冊（`pulse enroll`）：沒有實作 `enroll.env` 的自動註冊、MSI 的串接（Linux 的安裝腳本 `pulse-install.sh` 已串接，0.8.0〔草稿〕）、`--progress` 的原地重繪與 `PULSE_LANG`；Windows 的私鑰 ACL、服務重新啟動（`sc.exe`）只經過交叉編譯，沒有在 Windows 上實測。`pulse enroll` 不初始化日誌檔，`admin.dangerous_action` 等事件不會寫進 `logs/`。
+- 註冊（`pulse enroll`）：沒有實作 `enroll.env` 的自動註冊、MSI 的串接（Linux 的安裝腳本 `pulse-install.sh` 已串接，0.8.0）、`--progress` 的原地重繪與 `PULSE_LANG`；Windows 的私鑰 ACL、服務重新啟動（`sc.exe`）只經過交叉編譯，沒有在 Windows 上實測。`pulse enroll` 不初始化日誌檔，`admin.dangerous_action` 等事件不會寫進 `logs/`。
 - 8444 本機時鐘偏差的例外（忽略伺服器憑證有效期間只取 `server_time`）只用於 `pulse enroll` 的錯誤訊息；服務端憑證到期判定仍以 Kairos 的 `CertificateExpired` 為準，沒有以 8444 `server-info` 校正（設計包 §8.1 (d)）。
 - Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
 

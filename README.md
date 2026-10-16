@@ -89,7 +89,7 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 
 `kairos.service`、`pulse.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再重試「重試也不會成功」的錯誤：服務停在 `failed`（`systemctl status` 顯示 `status=2`／`3`／`4`），修正後執行 `systemctl restart`。只判斷「非 0」的腳本不受影響。
 
-發佈檔（需要 Docker；0.8.0〔草稿〕起：Linux x86_64／aarch64 的 tar.gz、deb、rpm，Pulse 另有 Windows x86_64 的 zip、msi 與一行安裝腳本）：
+發佈檔（需要 Docker；0.8.0 起：Linux x86_64／aarch64 的 tar.gz、deb、rpm，Pulse 另有 Windows x86_64 的 zip、msi 與一行安裝腳本）：
 
 ```bash
 sh kairos/packaging/build-release.sh    # dist/kairos-<版本>-<commit>-linux-{x86_64,aarch64}.{tar.gz,deb,rpm,cdx.json}

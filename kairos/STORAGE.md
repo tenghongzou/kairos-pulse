@@ -44,7 +44,7 @@ SqliteStore（store/sqlite.rs）→ <storage.data_dir>/kairos.db（WAL）
 | `data/kairos.db-wal`、`kairos.db-shm` | WAL 與共用記憶體檔，SQLite 建立時沿用資料庫檔的權限（`0640`）。Kairos 正常關機時刪除。**備份或搬移時不可只複製 `kairos.db`**（見第 9 節） |
 | `data/agents.json` | 狀態表的即時快照（每 5 秒），與 0.2 相同；重新啟動後含最近 24 小時內出現過的主機（見第 6 節） |
 | `data/reports-YYYY-MM-DD.jsonl`、`.retention-guard.json` | 只在 `backend = "jsonl"` 或 `jsonl_mirror = true` 時寫入 |
-| `data/alerts-secrets.key`、`data/console.key`、`data/audit-hmac.key` | 金鑰檔（各 32 bytes，0600）：通知管道機密、CSRF／TOTP、稽核鏈的 HMAC（0.7〔草稿〕）。不在資料庫中，資料庫備份不含；備份與還原見第 9 節 |
+| `data/alerts-secrets.key`、`data/console.key`、`data/audit-hmac.key` | 金鑰檔（各 32 bytes，0600）：通知管道機密、CSRF／TOTP、稽核鏈的 HMAC（0.7）。不在資料庫中，資料庫備份不含；備份與還原見第 9 節 |
 
 資料目錄所在的檔案系統必須支援共享記憶體與 POSIX 檔案鎖（本機磁碟；**不要放在 NFS／SMB 等網路磁碟**）。無法啟用 WAL 時 Kairos 拒絕啟動。
 
@@ -170,11 +170,11 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - 檔案存在但 `application_id` 不是 Kairos、又有其他資料表時拒絕使用（例如 `storage.data_dir` 指錯）。
 - 新增欄位或資料表時加一個遷移，不修改既有遷移的內容。**升級 Kairos 前先備份**（第 9 節）：遷移後的資料庫無法給舊版使用。
 - 目前的版本：v1（資料表、索引）、v2（`hosts.source` 與 `import_keys`，匯入工具使用；0.3.0 的開發期間加入，以 v1 建立的測試版資料庫在啟動時自動升級）、v3（0.4：`api_tokens`、`hosts.cert_rejected_at`／`cert_rejection`，主控台 API 使用）。`kairos reports import`、`kairos api-token` 開啟資料庫時同樣會升級 schema；升級到 v3 之後 0.3 的 Kairos 無法開啟（降版請從升級前的備份還原）。
-- v4（0.5.0〔草稿〕，衝刺 4）：註冊通道與 PKI 的資料表 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，以及 `hosts` 的 `lifecycle`、`decommissioned_at`、`decommissioned_by`、`current_serial`、`grace_override_until`、`expired_seen_at`、`last_grace_attempt` 與索引 `hosts_hostname`。完整的 SQL 與保存期限見 [`PKI.md`](PKI.md) 第 7、13 節（`store/sqlite.rs` 的 `SCHEMA_V4`）。升級到 v4 之後 0.4 的 Kairos 無法開啟；`kairos enroll-token`、`kairos enroll`、`kairos pki`、`kairos config` 開啟資料庫時同樣會升級 schema。
-- v5（0.6.0〔草稿〕，衝刺 5）：告警引擎的資料表 `alert_rules`（規則）、`alert_events`（事件，含彙總的 `parent_id`、處理狀態與通知進度 `notify_state`）、`alert_timeline`（處理紀錄）、`alert_silences`（靜音與維護時段）、`alert_channels`（通知管道；`secrets` 為 AES-256-GCM 密文）、`alert_deliveries`（發送紀錄）、`alert_actions`（CLI 交給執行中的 Kairos 處理的動作）與索引；`meta` 另有 `alerts_config_rev`（規則、靜音、管道的版本）與 `alerts_heartbeat`（停機期間的判斷）。完整的 SQL 見 `store/sqlite.rs` 的 `SCHEMA_V5`，欄位說明見 [`ALERTS.md`](ALERTS.md)。升級到 v5 之後 0.5 的 Kairos 無法開啟；`kairos alerts`、`kairos silences`、`kairos alert-rules`、`kairos alert-channels` 開啟資料庫時同樣會升級 schema。
-- v6（0.6.0〔草稿〕，衝刺 5）：使用者、角色指派、工作階段與 TOTP 復原碼（`users`、`role_assignments`、`sessions`、`user_recovery_codes`），`api_tokens` 的 `owner_user_id`、`role`，`audit_events` 的雜湊鏈欄位 `prev_hash`、`hash`（索引 `audit_events_actor`），`hosts.host_group`（角色指派的範圍）。v6 接在 v5（告警）之後，不依賴 v5 的物件；0.5.0（v4）的資料庫在第一次啟動時依序升級 v5 → v6（各自一個交易），既有的 API token 權限不變（凍結在 0.5，沒有告警與使用者等新權限）。完整的說明見 [`API.md`](API.md) 第 12.10 節。升級後 0.5 的 Kairos 無法開啟；`kairos users`、`kairos audit` 開啟資料庫時同樣會升級 schema。密碼只存 Argon2id 雜湊、工作階段只存 SHA-256、TOTP 秘密以 `data/console.key` 加密（金鑰不在資料庫中，`kairos db backup` 不含它）。
-- v7（0.7.0〔草稿〕，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
-- v8（0.8.0〔草稿〕，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v4（0.5.0，衝刺 4）：註冊通道與 PKI 的資料表 `pki_cas`、`enroll_tokens`、`enroll_requests`、`pki_certificates`、`pki_crls`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，以及 `hosts` 的 `lifecycle`、`decommissioned_at`、`decommissioned_by`、`current_serial`、`grace_override_until`、`expired_seen_at`、`last_grace_attempt` 與索引 `hosts_hostname`。完整的 SQL 與保存期限見 [`PKI.md`](PKI.md) 第 7、13 節（`store/sqlite.rs` 的 `SCHEMA_V4`）。升級到 v4 之後 0.4 的 Kairos 無法開啟；`kairos enroll-token`、`kairos enroll`、`kairos pki`、`kairos config` 開啟資料庫時同樣會升級 schema。
+- v5（0.6.0，衝刺 5）：告警引擎的資料表 `alert_rules`（規則）、`alert_events`（事件，含彙總的 `parent_id`、處理狀態與通知進度 `notify_state`）、`alert_timeline`（處理紀錄）、`alert_silences`（靜音與維護時段）、`alert_channels`（通知管道；`secrets` 為 AES-256-GCM 密文）、`alert_deliveries`（發送紀錄）、`alert_actions`（CLI 交給執行中的 Kairos 處理的動作）與索引；`meta` 另有 `alerts_config_rev`（規則、靜音、管道的版本）與 `alerts_heartbeat`（停機期間的判斷）。完整的 SQL 見 `store/sqlite.rs` 的 `SCHEMA_V5`，欄位說明見 [`ALERTS.md`](ALERTS.md)。升級到 v5 之後 0.5 的 Kairos 無法開啟；`kairos alerts`、`kairos silences`、`kairos alert-rules`、`kairos alert-channels` 開啟資料庫時同樣會升級 schema。
+- v6（0.6.0，衝刺 5）：使用者、角色指派、工作階段與 TOTP 復原碼（`users`、`role_assignments`、`sessions`、`user_recovery_codes`），`api_tokens` 的 `owner_user_id`、`role`，`audit_events` 的雜湊鏈欄位 `prev_hash`、`hash`（索引 `audit_events_actor`），`hosts.host_group`（角色指派的範圍）。v6 接在 v5（告警）之後，不依賴 v5 的物件；0.5.0（v4）的資料庫在第一次啟動時依序升級 v5 → v6（各自一個交易），既有的 API token 權限不變（凍結在 0.5，沒有告警與使用者等新權限）。完整的說明見 [`API.md`](API.md) 第 12.10 節。升級後 0.5 的 Kairos 無法開啟；`kairos users`、`kairos audit` 開啟資料庫時同樣會升級 schema。密碼只存 Argon2id 雜湊、工作階段只存 SHA-256、TOTP 秘密以 `data/console.key` 加密（金鑰不在資料庫中，`kairos db backup` 不含它）。
+- v7（0.7.0，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v8（0.8.0，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -366,9 +366,9 @@ systemctl start kairos
 
 備份檔是完整的 Kairos 資料庫，可以直接啟動；備份之後收到的 report 不在其中。`agents.json` 不需要備份（啟動時由清冊重建）。
 
-**金鑰檔**：`data/alerts-secrets.key`（0.6.0 起；通知管道機密的 AES-256-GCM 金鑰）、`data/console.key`（0.6.0 起；CSRF 與 TOTP 秘密的加密金鑰）、`data/audit-hmac.key`（0.7〔草稿〕起；稽核鏈的 HMAC 金鑰）**不在資料庫備份中**，資料庫只有密文與 HMAC。還原時金鑰與 `kairos.db` 要是同一次備份的組合。
+**金鑰檔**：`data/alerts-secrets.key`（0.6.0 起；通知管道機密的 AES-256-GCM 金鑰）、`data/console.key`（0.6.0 起；CSRF 與 TOTP 秘密的加密金鑰）、`data/audit-hmac.key`（0.7 起；稽核鏈的 HMAC 金鑰）**不在資料庫備份中**，資料庫只有密文與 HMAC。還原時金鑰與 `kairos.db` 要是同一次備份的組合。
 
-**金鑰檔的加密備份**（0.7〔草稿〕；預設不含，需要另外指定 `--include-keys`）：
+**金鑰檔的加密備份**（0.7；預設不含，需要另外指定 `--include-keys`）：
 
 ```bash
 sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/kairos-$(date +%F).db \
@@ -404,7 +404,7 @@ systemctl start kairos
 
 ## 10. 容量估算
 
-> **0.8.0〔草稿〕起**（METRICS.md 第 9.6 節；D1）：Pulse 0.8.0 在一般伺服器（2 個掛載點、2 個磁碟 I/O 裝置、2 個介面）約 41 個指標，每筆約 530 bytes、彙總約 47 個序列（計數器只彙總速率），另有行程快照每台每天約 1.4 MB：
+> **0.8.0 起**（METRICS.md 第 9.6 節；D1）：Pulse 0.8.0 在一般伺服器（2 個掛載點、2 個磁碟 I/O 裝置、2 個介面）約 41 個指標，每筆約 530 bytes、彙總約 47 個序列（計數器只彙總速率），另有行程快照每台每天約 1.4 MB：
 >
 > ```text
 > 每台主機每天：原始 17280 × 530 ≈ 9.2 MB；行程快照 1440 × 1 KB ≈ 1.4 MB；
@@ -617,7 +617,7 @@ sudo systemctl start kairos
 - **容量**：總容量上限依寫入順序刪除原始 report（第 8.2 節），匯入的舊資料是最後寫入的，會比較晚被刪；匯入後超過 `storage.max_total_bytes` 時 Kairos 會先刪到較新的即時資料。匯入結束時若已超過上限，摘要中有 `KRS-W4202` 警告：請先調高上限或以 `--since` 縮小範圍。
 - 測試：`store::import::tests`（`schema` 1／2／沒有 `schema`、壞行、重複匯入與同一檔案中的重複、Kairos 已保存的 durable 與鏡像中的行、durable 的取樣時間與去重鍵、保留期限、彙總與 Kairos 尚未寫出的彙總和遲到的檔案、既有主機的資訊、時間範圍與主機上限、試執行與實際的計數相同、獨占鎖、內容雜湊）、`import_cli::tests`（參數、目錄的掃描與符號連結、結束代碼）、端對端 `tests/e2e/tests/import.rs`（Kairos 執行中拒絕、停止後匯入、重新啟動後匯出與清冊）。
 
-## 15. 指標擴充（schema v8；0.8.0〔草稿〕）
+## 15. 指標擴充（schema v8；0.8.0）
 
 規格：[`crates/kairos-proto/METRICS.md`](../crates/kairos-proto/METRICS.md) 第 9 節。實作：`store/sqlite.rs`（寫入與補回）、`store/derive.rs`（速率與推算的純計算）、`store/assets.rs`（資產合併與變更歷史）、`store/sqlite_assets.rs`。
 

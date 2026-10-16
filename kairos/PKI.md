@@ -2,7 +2,7 @@
 
 本文件是 Kairos 端「註冊與憑證」的工程規格：CA 架構、簽發金鑰的保管、憑證格式、撤銷與 CRL、離線簽發模式，以及資料庫 schema v4。8444 註冊通道的線上協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，主控台與 CLI 見 [`API.md`](API.md) 第 11 節。
 
-- 狀態：**0.5.0〔草稿〕，Kairos 端已實作**（分支 `sprint4/kairos-enroll`；實作與規格的差異、量測與延後項目見第 12～14 節）。第 1 節原本標「待使用者確認」的項目已由使用者決定（2026-10-14），標為「已決定（2026-10-14）」。
+- 狀態：**0.5.0，Kairos 端已實作**（分支 `sprint4/kairos-enroll`；實作與規格的差異、量測與延後項目見第 12～14 節）。第 1 節原本標「待使用者確認」的項目已由使用者決定（2026-10-14），標為「已決定（2026-10-14）」。
 - 實作：`kairos/src/pki/`（CSR 檢查、依範本簽發、CRL、簽發 CA 的檔案、離線佇列）、`kairos/src/enroll/`（8444、簽發器、限流、管理操作）、`kairos/src/enroll_cli.rs`（`kairos enroll-token`／`enroll`／`pki`／`config`）、`kairos/src/api/enroll.rs`（管理端點）、`kairos/src/tls.rs`（8443 的驗證器）。
 - 設計依據（設計包，唯讀）：`kairos/screens.md` S02 步驟 3、S12～S15、§24 #6、#7、#13、#20；`pulse/enrollment-ux.md` §1、§8；`design-system/cli-style.md` §11.3；`decisions/INTEGRATION.md` §17。
 - 現況：0.4 沒有內建的 PKI。`packaging/INSTALL.md` 第 6 節以 openssl 在管理主機建立兩個離線 CA（伺服器 CA、代理 CA），手動簽發與撤銷，`kairos-crl.timer` 定期重新產生 CRL；Kairos 只讀取 `auth.client_ca` 與 `auth.crl`。
@@ -18,7 +18,7 @@
 | 5 | 用戶端憑證 365 天（D2）、序號 16 bytes 隨機值、`notBefore` 往前 10 分鐘 | — | 已定（D2） |
 | 6 | **離線簽發模式**（`pki.mode = "offline"`）：不在線上持有任何 CA 私鑰，核准後匯出 CSR 佇列、在 CA 主機簽發、再匯入 | 不是預設 | **已決定（2026-10-14）**：可切換的選項，**不是**高安全場域的預設；需要時由管理者明確設定 |
 | 7 | Kairos 自己產生並載入簽發 CA 的 CRL（每次撤銷與每 24 小時），不再需要 `kairos-crl.timer`（離線模式仍需要） | — | 技術決定 |
-| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **已決定（2026-10-14）**：`pki init` 延後到首次啟動精靈（S02）。**0.8.0〔草稿〕已實作 CLI 版**（第 15 節；商業審計 O5）：根 CA 私鑰以明文 0600 寫在指定目錄、提示移到離線保存，加密匯出仍待精靈 |
+| 8 | 衝刺 4 **不實作** `kairos pki init`（一次建立根 CA 與簽發 CA 並把根 CA 私鑰加密匯出）：先以「Kairos 產生簽發 CA 的金鑰與 CSR → 管理主機以根 CA 簽發 → 匯入」完成，根 CA 從頭到尾不在 Kairos 主機上 | — | **已決定（2026-10-14）**：`pki init` 延後到首次啟動精靈（S02）。**0.8.0 已實作 CLI 版**（第 15 節；商業審計 O5）：根 CA 私鑰以明文 0600 寫在指定目錄、提示移到離線保存，加密匯出仍待精靈 |
 | 9 | 續簽重放快取持久化、除役 10 分鐘視窗以「延後生效的撤銷」實作 | — | 技術決定（ENROLL.md 第 18 節，安全審查的處置） |
 | 10 | 主控台變更的註冊端點模式與憑證政策存在資料庫的 `settings` 表，**優先於 `kairos.toml`**；以 `kairos config show --effective` 查詢實際生效值與每一項的來源 | — | **已決定（2026-10-14）**：設計包 #14 要求寫回 `kairos.toml`，精靈實作時再評估是否統一 |
 | 11 | 註冊 token 的列表與詳情只顯示**前 4 碼**（`KRT1-GE8Q…`），不顯示後 4 碼 | — | **已決定（2026-10-14）**：ENROLL.md 第 18 節第 5 項 |
@@ -447,7 +447,7 @@ KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_
 - **8443 的 features**：Kairos 只在 hello 宣告了 `renew`／`deregister` 時把它們列進 `hello_ack.features`（沒有宣告的 0.4 以前 Pulse 收到的 `hello_ack` 與 0.4 相同）。沒有協商時 `renew_request`／`deregister`（含欄位不合法的）回 `unknown_type`，與 0.4 相同。8444 `server-info` 的 `features` 一律列出 Kairos 支援的全部（`metrics`、`durable`、`renew`、`deregister`）。
 - **測試掛鉤**（debug 建置）：`KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_AUTO_PAUSE_SECS`、`KAIROS_TEST_DROP_ENROLL_RESPONSES`、`KAIROS_TEST_DROP_RENEWAL_RESPONSES`（`src/testhooks.rs`）。端對端情境的對應見 ENROLL.md 第 19.5 節。
 
-## 15. 管理者的 CA 工具（0.8.0〔草稿〕；商業審計 O5）
+## 15. 管理者的 CA 工具（0.8.0；商業審計 O5）
 
 `kairos pki init`、`kairos pki sign`、`kairos pki gencrl`、`kairos pki revocations export`（實作 `kairos/src/pki/ca.rs`、`kairos/src/pki_cli.rs`）取代 INSTALL 舊版以 openssl 手寫 `ca.cnf` 的流程。與 8444 的線上簽發、主控台 S15 共用同一套程式碼與儲存：
 

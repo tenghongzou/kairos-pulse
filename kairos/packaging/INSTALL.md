@@ -2,12 +2,12 @@
 
 本文件給地端管理者使用：把 Kairos 安裝成**系統層級 systemd 服務**。功能、設定欄位與協定細節請見同目錄的 `README.md` 與 `PROTOCOL.md`。
 
-- **第 A 節（建議，0.8.0〔草稿〕起）**：以 deb／rpm 套件安裝，`kairos pki init` 一個指令建立 PKI。從下載到第一台 Pulse 連上約 10 個指令。
+- **第 A 節（建議，0.8.0 起）**：以 deb／rpm 套件安裝，`kairos pki init` 一個指令建立 PKI。從下載到第一台 Pulse 連上約 10 個指令。
 - **第 0～13 節**：從 tar.gz 發佈包手動安裝（不使用套件管理員的環境），以及共通的維運、升級與疑難排解。第 6 節同樣改用 `kairos pki init`；0.7 以前以 openssl 手動管理 PKI 的方式移到附錄 P。
 
 > 不要用 `systemd-run --user` 或使用者層級的 unit 跑正式服務：沒有開啟 linger 時，最後一個登入 session 結束，user manager 會連同 Kairos 一起被停掉。
 
-## A. 以 deb／rpm 套件安裝（0.8.0〔草稿〕）
+## A. 以 deb／rpm 套件安裝（0.8.0）
 
 支援：Debian 12、Ubuntu 22.04／24.04（deb），RHEL／Rocky／Alma 9（rpm）；x86_64 與 aarch64。套件的版面與 tar.gz 相同（`/opt/kairos`），另外安裝 `/usr/lib/systemd/system/kairos.service` 與 `/usr/bin/kairos`。
 
@@ -48,7 +48,7 @@ ufw allow proto tcp from 10.0.0.0/16 to any port 8080,8444
 
 ## 0. 發佈包內容
 
-每個版本的發佈檔（0.8.0〔草稿〕起；`<arch>` 為 `x86_64` 或 `aarch64`）：
+每個版本的發佈檔（0.8.0 起；`<arch>` 為 `x86_64` 或 `aarch64`）：
 
 | 檔案 | 說明 |
 |---|---|
@@ -93,7 +93,7 @@ ufw allow proto tcp from 10.0.0.0/16 to any port 8080,8444
 
 ## 1. 需求
 
-- Linux x86_64 或 aarch64（0.8.0〔草稿〕起）、systemd（建議 247 以上；Ubuntu 22.04／24.04、Debian 12、RHEL 9 皆可）
+- Linux x86_64 或 aarch64（0.8.0 起）、systemd（建議 247 以上；Ubuntu 22.04／24.04、Debian 12、RHEL 9 皆可）
 - 不需要 OpenSSL：PKI 由 `kairos pki init` 建立（第 6 節）。只有沿用附錄 P 的手動 PKI 才需要管理主機上的 OpenSSL 3.0 以上
 - 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
 - 防火牆允許 Pulse 連到監聽埠（本例 TCP 8080）
@@ -166,7 +166,7 @@ install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL
   STORAGE.md API.md PKI.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
-## 6. 建立 PKI（kairos pki init，0.8.0〔草稿〕）
+## 6. 建立 PKI（kairos pki init，0.8.0）
 
 `kairos pki init` 一次建立 Kairos 需要的三樣東西（`PKI.md` 第 15 節），取代 0.7 以前以 openssl 手寫 `ca.cnf` 的流程（舊流程見附錄 P，既有部署照常可用）：
 
@@ -318,11 +318,11 @@ sudo -u kairos /opt/kairos/kairos hosts list --config /opt/kairos/kairos.toml
 Kairos 的日誌同時寫到 stdout 與 `/opt/kairos/logs/kairos-YYYY-MM-DD.log`（UTC 日期分檔，依 `log.retention_days` 清除）。在預設的 unit 下 stdout 進 journal，所以同一份日誌會存兩份：
 
 - 保留預設：可用 `journalctl -u kairos` 查詢，與 systemd 的啟停紀錄放在一起。
-- 只要檔案一份：以 drop-in 設定 `StandardOutput=null`，或在 `kairos.toml` 設定 `log.stdout = false`（0.6〔草稿〕）。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
+- 只要檔案一份：以 drop-in 設定 `StandardOutput=null`，或在 `kairos.toml` 設定 `log.stdout = false`（0.6）。啟動失敗等日誌初始化前的錯誤寫在 stderr，仍會進 journal。
 
-交給 SIEM（0.6〔草稿〕，審計 O3、S7）：`log.format = "json"`（檔名改為 `kairos-YYYY-MM-DD.jsonl`，一行一個 JSON、UTC、固定欄位 `ts`、`level`、`event`、`code`、`msg`、`fields`…），由 Filebeat／Fluent Bit 收集；或設定 `[log.syslog]` 的 `target`（`udp://`、`tcp://`、`unix:///dev/log`）以 RFC 5424 直接送出。`log.format = "legacy"` 保留 0.5 以前的行格式供既有的解析規則過渡（`text` 的行首改為 RFC 3339 帶時區，例如 `2026-10-14T14:22:16.123+08:00 [INFO] …`）。
+交給 SIEM（0.6，審計 O3、S7）：`log.format = "json"`（檔名改為 `kairos-YYYY-MM-DD.jsonl`，一行一個 JSON、UTC、固定欄位 `ts`、`level`、`event`、`code`、`msg`、`fields`…），由 Filebeat／Fluent Bit 收集；或設定 `[log.syslog]` 的 `target`（`udp://`、`tcp://`、`unix:///dev/log`）以 RFC 5424 直接送出。`log.format = "legacy"` 保留 0.5 以前的行格式供既有的解析規則過渡（`text` 的行首改為 RFC 3339 帶時區，例如 `2026-10-14T14:22:16.123+08:00 [INFO] …`）。
 
-### 9.2a 健康檢查、Prometheus 與診斷包（0.6〔草稿〕）
+### 9.2a 健康檢查、Prometheus 與診斷包（0.6）
 
 ```bash
 # 設定檢查（不啟動服務、不連線）：0 通過、8 有警告（--strict）、3 設定錯誤、4 憑證錯誤
@@ -339,9 +339,9 @@ cd /tmp && sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml
 
 - **負載平衡器的探針**：以 `GET /readyz` 判斷（200／503）。主控台不對外開放時，在 `kairos.toml` 設定 `[observability] listen = "<負載平衡器可達的位址>:9464"`（純 HTTP，只有 `/healthz`、`/readyz`、`/metrics` 三個端點，`/metrics` 仍只接受 loopback 或帶 token 的請求）；只負責 8444 的負載平衡器用 `/readyz?scope=enroll`。
 - **Prometheus**：同一台主機時抓 `http://127.0.0.1:9464/metrics`（`observability.listen = "127.0.0.1:9464"`）；從其他主機抓取時設定 `observability.metrics_token_file`（`openssl rand -hex 32 > /opt/kairos/metrics.token && chown root:kairos /opt/kairos/metrics.token && chmod 640 /opt/kairos/metrics.token`），經主控台的 HTTPS 以 bearer token 抓取。設定與建議的告警規則見 `prometheus.example.yml`、`kairos-alerts.example.yml`。
-- **經反向代理（nginx、Apache、HAProxy 等）提供 `/metrics` 時，必須設定 `observability.metrics_token_file`**，並讓 Prometheus 帶 bearer token。代理與 Kairos 在同一台主機時，轉送進來的請求來源都是 `127.0.0.1`，「未設定 token 時只接受 loopback」會變成任何能連到代理的人都能讀取。0.7〔草稿〕起，未設定 token 時帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 或 `Via` 標頭的 `/metrics` 請求一律回 403，並在第一次時記一行 `WARN`（`observability.metrics_proxied`，`KRS-W0304`）；但**不加這些標頭的代理（例如 nginx 只寫 `proxy_pass` 的預設設定）Kairos 無法發現**，所以不能以這個檢查代替 token。
+- **經反向代理（nginx、Apache、HAProxy 等）提供 `/metrics` 時，必須設定 `observability.metrics_token_file`**，並讓 Prometheus 帶 bearer token。代理與 Kairos 在同一台主機時，轉送進來的請求來源都是 `127.0.0.1`，「未設定 token 時只接受 loopback」會變成任何能連到代理的人都能讀取。0.7 起，未設定 token 時帶有 `Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 或 `Via` 標頭的 `/metrics` 請求一律回 403，並在第一次時記一行 `WARN`（`observability.metrics_proxied`，`KRS-W0304`）；但**不加這些標頭的代理（例如 nginx 只寫 `proxy_pass` 的預設設定）Kairos 無法發現**，所以不能以這個檢查代替 token。
 - 另外建議在 Kairos 以外監看 `/healthz`（例如既有的 Zabbix）：Kairos 自己無法通知「自己已經停止」。
-- **稽核鏈尾的外送**（0.7〔草稿〕）：Kairos 每 `audit.anchor_log_minutes` 分鐘（預設 60）寫一行 `audit.chain_anchor`（INFO，含最後一筆稽核紀錄的 id 與雜湊）。設定 `[log.syslog]` 或以日誌收集器把這些行送到**另一台主機**保存，才有資料庫之外的副本（`API.md` 第 12.8 節）。
+- **稽核鏈尾的外送**（0.7）：Kairos 每 `audit.anchor_log_minutes` 分鐘（預設 60）寫一行 `audit.chain_anchor`（INFO，含最後一筆稽核紀錄的 id 與雜湊）。設定 `[log.syslog]` 或以日誌收集器把這些行送到**另一台主機**保存，才有資料庫之外的副本（`API.md` 第 12.8 節）。
 
 ### 9.3 主控台 API
 
@@ -393,7 +393,7 @@ sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name
     --config /opt/kairos/kairos.toml < /root/admin.pw && shred -u /root/admin.pw
   ```
 
-- 登入主控台（0.7.0〔草稿〕起有網頁介面，見 9.5）：以瀏覽器開啟 `https://<Kairos 主機>:9443/`，以 `admin` 與初始密碼登入，畫面會要求先變更密碼。沒有瀏覽器時也可以 curl 確認：
+- 登入主控台（0.7.0 起有網頁介面，見 9.5）：以瀏覽器開啟 `https://<Kairos 主機>:9443/`，以 `admin` 與初始密碼登入，畫面會要求先變更密碼。沒有瀏覽器時也可以 curl 確認：
 
   ```bash
   curl -sk -c cookies.txt -H 'Content-Type: application/json'     -d '{"username":"admin","password":"<初始密碼>"}' https://127.0.0.1:9443/api/v1/auth/login
@@ -405,7 +405,7 @@ sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name
 - 使用 AD／LDAP 時，在 `kairos.toml` 設定 `[ldap]`（`ca_file` 必填；服務帳號密碼放在 `chmod 600` 的 `bind_password_file`），重新啟動後以 `kairos users map-group "<群組 DN>" --role operator` 對應角色（API.md 第 12.7 節）。
 - 主控台金鑰 `data/console.key`（0600）在第一次啟動主控台時建立，用於 CSRF 與 TOTP 秘密的加密；備份資料庫時一併（加密）備份，遺失時已綁定的 TOTP 需以 `kairos users reset-mfa` 重設。
 
-### 9.5 開啟主控台（0.7.0〔草稿〕）
+### 9.5 開啟主控台（0.7.0）
 
 網頁介面與 API 在同一個 HTTPS 監聽上（`console.listen`，預設 `127.0.0.1:9443`），網頁檔已嵌入 `kairos` 執行檔，不需要另外安裝。
 
@@ -458,9 +458,9 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 - **資料目錄中的金鑰檔**（`kairos db backup` 的資料庫備份**不含**，資料庫中只有以它們加密的密文或 HMAC）：
   - `data/alerts-secrets.key`（0.6.0 起）：通知管道機密（SMTP 密碼、Webhook 網址、HMAC 金鑰、LINE token）的 AES-256-GCM 金鑰。
   - `data/console.key`（0.6.0 起）：主控台的 CSRF 與 TOTP 秘密的加密金鑰。
-  - `data/audit-hmac.key`（0.7〔草稿〕起）：稽核雜湊鏈的 HMAC 金鑰（`API.md` 第 12.8 節）。
+  - `data/audit-hmac.key`（0.7 起）：稽核雜湊鏈的 HMAC 金鑰（`API.md` 第 12.8 節）。
 
-  **以 `--include-keys` 一併加密備份**（0.7〔草稿〕；預設不含，需要另外指定）：金鑰檔以備份密碼加密（Argon2id 衍生金鑰＋AES-256-GCM），寫成與資料庫備份並列的 `<備份檔>.keys`（0600）。密碼只能從檔案或 stdin 讀取（不接受命令列上的密碼，避免留在 shell 歷史與行程清單），至少 12 個字元；**請把備份密碼與備份分開保管**（例如密碼管理工具），密碼遺失時無法解開。
+  **以 `--include-keys` 一併加密備份**（0.7；預設不含，需要另外指定）：金鑰檔以備份密碼加密（Argon2id 衍生金鑰＋AES-256-GCM），寫成與資料庫備份並列的 `<備份檔>.keys`（0600）。密碼只能從檔案或 stdin 讀取（不接受命令列上的密碼，避免留在 shell 歷史與行程清單），至少 12 個字元；**請把備份密碼與備份分開保管**（例如密碼管理工具），密碼遺失時無法解開。
 
   ```bash
   # 備份密碼檔：只有 root 可讀（sudo -u kairos 執行時以 stdin 傳入，服務帳號不需要讀取它）
@@ -532,7 +532,7 @@ systemctl list-timers kairos-crl.timer
 
 更新間隔要遠小於 CRL 的有效期間（`ca.cnf` 的 `default_crl_days = 30` 時每週一次，可容許連續失敗 3 次）。排程失敗時 Kairos 會在 `nextUpdate` 前 7 天起記 `WARN`「CRL … 將在 … 後過期」，請以 `systemctl status kairos-crl.service` 檢查。
 
-### 10.4 伺服器憑證到期、增加名稱（kairos pki sign，0.8.0〔草稿〕）
+### 10.4 伺服器憑證到期、增加名稱（kairos pki sign，0.8.0）
 
 伺服器憑證到期前 30 天（`server.cert_expiry_warning_days`）起 Kairos 會記 `WARN`。以離線保存的根 CA 重新簽發（在離線主機執行；`kairos` 執行檔不需要設定與資料庫）：
 
@@ -565,7 +565,7 @@ mv /opt/kairos/data/pki/server.pem.new /opt/kairos/data/pki/server.pem
 
 **從 0.4 升級到 0.5 的順序：先升級 Kairos，再升級 Pulse**：(1) `kairos db backup` → (2) 換上新版 Kairos 並重新啟動（此時註冊通道仍關閉）→ (3) 建立簽發 CA 並在 `kairos.toml` 開啟 `[enroll]`、`[pki]`（第 P.5 節），重新啟動後確認日誌有「註冊端點（8444）已啟動」→ (4) 防火牆開放 8444，只允許要註冊的主機 → (5) 通知 Pulse 端升級（建立 `/opt/pulse/identity`、換上新版 `pulse.service`，Pulse 的 INSTALL 第 10 節）。`storage.backend = "jsonl"` 時沒有註冊服務（不監聽 8444）。完整步驟與版本組合見 `CHANGELOG.md` [0.5.0]。
 
-**從 0.7 升級到 0.8（〔草稿〕）：指標擴充（schema v8）、套件、`kairos pki`、aarch64**。資料庫升級到 schema v8（計數器的速率與推算序列、主機資產、行程快照；第一次啟動時重建 `series`，大型資料庫會多花一些時間）：**升級前以 `kairos db backup` 備份**，升級後 0.7 無法開啟。容量估算由每台約 52 MB 改為約 129 MB：主機多、沿用預設 `storage.max_total_bytes` 的部署依 `STORAGE.md` 第 10 節調高上限或縮短保留天數。協定版本不變，其他設定不需要修改。0.8 新增的 deb／rpm 是另一種安裝方式：既有的 tar.gz 安裝**不要**直接改裝套件（套件的預設設定是全新安裝用的；兩者版面相同，但 `kairos.service` 會從 `/etc/systemd/system` 換到 `/usr/lib/systemd/system`），照下方的步驟換執行檔即可。新版 `kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`（`kairos pki init` 的根 CA 暫存目錄；目錄不存在時沒有影響），手動 PKI 的部署可以沿用舊 unit。**`auth.client_ca`（安全修正）**：0.8 起 8443 一律拒絕經過已退役簽發 CA 的用戶端憑證鏈，`auth.client_ca` 指向根 CA 或代理 CA 的既有部署不需要修改設定也受到保護（`PKI.md` 第 15.4 節第 1 項）。仍**建議**改為 `client_ca = "/opt/kairos/data/pki/issuing-cas.pem"`：以根 CA 當信任錨時，根 CA 底下任何其他 CA 簽出的用戶端憑證都會通過，且不受 Kairos 的 CRL 管理。改之前以 `kairos pki certificates list` 與主控台 S04 確認每台主機都已改用 Kairos 簽發的憑證；仍有手動簽發的憑證時，`auth.client_ca` 只保留那張舊代理 CA（不要放根 CA），等那些主機重新註冊後再改。
+**從 0.7 升級到 0.8：指標擴充（schema v8）、套件、`kairos pki`、aarch64**。資料庫升級到 schema v8（計數器的速率與推算序列、主機資產、行程快照；第一次啟動時重建 `series`，大型資料庫會多花一些時間）：**升級前以 `kairos db backup` 備份**，升級後 0.7 無法開啟。容量估算由每台約 52 MB 改為約 129 MB：主機多、沿用預設 `storage.max_total_bytes` 的部署依 `STORAGE.md` 第 10 節調高上限或縮短保留天數。協定版本不變，其他設定不需要修改。0.8 新增的 deb／rpm 是另一種安裝方式：既有的 tar.gz 安裝**不要**直接改裝套件（套件的預設設定是全新安裝用的；兩者版面相同，但 `kairos.service` 會從 `/etc/systemd/system` 換到 `/usr/lib/systemd/system`），照下方的步驟換執行檔即可。新版 `kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`（`kairos pki init` 的根 CA 暫存目錄；目錄不存在時沒有影響），手動 PKI 的部署可以沿用舊 unit。**`auth.client_ca`（安全修正）**：0.8 起 8443 一律拒絕經過已退役簽發 CA 的用戶端憑證鏈，`auth.client_ca` 指向根 CA 或代理 CA 的既有部署不需要修改設定也受到保護（`PKI.md` 第 15.4 節第 1 項）。仍**建議**改為 `client_ca = "/opt/kairos/data/pki/issuing-cas.pem"`：以根 CA 當信任錨時，根 CA 底下任何其他 CA 簽出的用戶端憑證都會通過，且不受 Kairos 的 CRL 管理。改之前以 `kairos pki certificates list` 與主控台 S04 確認每台主機都已改用 Kairos 簽發的憑證；仍有手動簽發的憑證時，`auth.client_ca` 只保留那張舊代理 CA（不要放根 CA），等那些主機重新註冊後再改。
 
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
@@ -622,7 +622,7 @@ journalctl -u kairos -n 30 --no-pager
 - 重啟後，主機清冊中最近 24 小時內出現過的主機以離線狀態出現在 `agents.json`，線上的 agent 重連後恢復上線（`storage.backend = "jsonl"` 時沒有清冊，`agents.json` 從空開始）。
 - 回滾：`mv /opt/kairos/kairos.prev /opt/kairos/kairos && systemctl restart kairos`。新版升級過 schema 時，舊版會以「資料庫的 schema 版本 … 比本版 Kairos 支援的 … 新」拒絕啟動：停止服務後把升級前的備份還原成 `data/kairos.db`（`STORAGE.md`「備份與還原」）再啟動舊版；備份之後收到的 report 不在其中。
 
-### 11.1 以套件安裝時的升級（0.8.0〔草稿〕起）
+### 11.1 以套件安裝時的升級（0.8.0 起）
 
 ```bash
 # 先驗證新版的 SHA256SUMS 與簽章（第 2 節），備份資料庫，再安裝新版套件

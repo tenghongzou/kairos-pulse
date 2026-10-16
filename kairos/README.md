@@ -12,8 +12,8 @@
 - 依 agent 宣告的心跳間隔計算離線門檻：`max(5 × clamp(heartbeat_interval_ms, 1000, 60000), 5000)` ms（5～300 秒），只有合法訊息才算存活
 - 每秒檢查存活狀態，上線／離線／恢復都會記錄日誌（「標記為離線」與「從狀態表移除」每 10 秒最多各逐一記錄 20／5 個，其餘在時間窗結束後合併成一行摘要）；離線超過 24 小時的 agent 自動從狀態表移除；每 60 秒輸出一行摘要
 - 主控台 API（審計 F1；[API.md](API.md)）：HTTPS（預設只綁 `127.0.0.1:9443`，`console.listen`）的唯讀 `/api/v1`：主機清單（伺服器端篩選、排序、游標分頁、CIDR 搜尋、總數）、主機詳情（含補送狀態、握手時被拒的憑證）、指標趨勢（自動選原始資料或彙總，min／max／avg／count）、總覽 KPI、系統健康（資料庫用量與容量刪除 `KRS-W4202`、寫入統計、補送台數、連線、TLS 到期、檔案描述元）與即時變更推送（SSE）。以 API token 驗證（`kairos api-token create|list|revoke`，資料庫只存 SHA-256），1 萬台主機時列表 p99 約 10 ms
-- 使用者、角色與稽核（審計 F6；0.6.0〔草稿〕，API.md 第 12 節）：本機帳號（Argon2id、密碼政策、連續失敗鎖定、TOTP 兩步驟驗證與復原碼）與 LDAP／AD（bind 驗證、群組對應角色、TLS 一律驗證憑證）；四個內建角色（管理員、維運者、稽核員、唯讀）與主機群組範圍，所有 `/api/v1` 端點依集中定義的權限檢查；主控台的工作階段（`__Host-` cookie、HttpOnly、Secure、SameSite=Strict、CSRF token、閒置與絕對逾時、D25 的兩種結束 API）；稽核事件以 SHA-256 雜湊鏈保存（`kairos audit verify` 指出第一個斷點，`kairos audit export` 匯出 JSONL）。首位管理員以 `kairos users create <帳號> --role admin` 建立（沒有預設帳號與密碼）
-- 主控台網頁介面（審計 F2；0.7.0〔草稿〕，[web/README.md](web/README.md)）：與 API 同一個 HTTPS 監聽（`https://127.0.0.1:9443/`），網頁檔在編譯時嵌入執行檔（不需要另外安裝、沒有 npm 建置步驟）。登入（本機／AD、兩步驟驗證、第一次登入變更密碼）、總覽、主機清單（伺服器端篩選與排序、CIDR 搜尋、即時更新）、主機詳情（趨勢圖、連線紀錄、憑證）、全域搜尋（Ctrl+K）與個人設定；選單與按鈕依角色權限顯示；嚴格的 CSP（不允許 inline script、Trusted Types）、HSTS 等安全標頭
+- 使用者、角色與稽核（審計 F6；0.6.0，API.md 第 12 節）：本機帳號（Argon2id、密碼政策、連續失敗鎖定、TOTP 兩步驟驗證與復原碼）與 LDAP／AD（bind 驗證、群組對應角色、TLS 一律驗證憑證）；四個內建角色（管理員、維運者、稽核員、唯讀）與主機群組範圍，所有 `/api/v1` 端點依集中定義的權限檢查；主控台的工作階段（`__Host-` cookie、HttpOnly、Secure、SameSite=Strict、CSRF token、閒置與絕對逾時、D25 的兩種結束 API）；稽核事件以 SHA-256 雜湊鏈保存（`kairos audit verify` 指出第一個斷點，`kairos audit export` 匯出 JSONL）。首位管理員以 `kairos users create <帳號> --role admin` 建立（沒有預設帳號與密碼）
+- 主控台網頁介面（審計 F2；0.7.0，[web/README.md](web/README.md)）：與 API 同一個 HTTPS 監聽（`https://127.0.0.1:9443/`），網頁檔在編譯時嵌入執行檔（不需要另外安裝、沒有 npm 建置步驟）。登入（本機／AD、兩步驟驗證、第一次登入變更密碼）、總覽、主機清單（伺服器端篩選與排序、CIDR 搜尋、即時更新）、主機詳情（趨勢圖、連線紀錄、憑證）、全域搜尋（Ctrl+K）與個人設定；選單與按鈕依角色權限顯示；嚴格的 CSP（不允許 inline script、Trusted Types）、HSTS 等安全標頭
 - 主機清冊（審計 A6）：所有出現過的主機保存在 SQLite（`hosts`），每 30 秒從狀態表同步、關機時寫入最後狀態；重新啟動時最近 24 小時內出現過的主機以離線狀態放回狀態表（`agents.json` 不再重新啟動就清空）。`kairos hosts list [--offline-for 3d]` 查詢哪些主機已失聯多久
 - 驗證 hello 欄位（`agent_id` 必須是 UUID 文字格式，`hostname`、`agent_version` 有長度與字元限制），並以 `limits.max_agents` 限制狀態表筆數（預設 `max(10000, server.max_connections)`；滿時先淘汰離線最久的 agent，沒有可淘汰者才拒絕新的 `agent_id`），避免狀態表與 `agents.json` 被任意資料灌爆
 - 預設拒絕未認證的對外監聽：監聽非 loopback 位址（例如 `0.0.0.0`）又沒有設定 `auth.client_ca` 時拒絕啟動，除非明確設定 `auth.allow_unauthenticated = true`（見「啟用 mTLS」）
@@ -30,8 +30,8 @@
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
 - 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試
-- 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除；時間為 RFC 3339 帶時區，可改為 JSON（`log.format = "json"`）並外送到 syslog（RFC 5424）〔0.6 草稿〕
-- `/healthz`、`/readyz`（負載平衡器的探針）與 `/metrics`（Prometheus）；`kairos --check-config` 檢查設定、`kairos diag` 產生遮蔽敏感資料的支援診斷包〔0.6 草稿〕
+- 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除；時間為 RFC 3339 帶時區，可改為 JSON（`log.format = "json"`）並外送到 syslog（RFC 5424）（0.6）
+- `/healthz`、`/readyz`（負載平衡器的探針）與 `/metrics`（Prometheus）；`kairos --check-config` 檢查設定、`kairos diag` 產生遮蔽敏感資料的支援診斷包（0.6）
 - 可能被掃描大量觸發的日誌依類別（部分類別再依來源 IP；啟用 mTLS 時 agent 的上線、離線等事件改依 `agent_id`）節流，每 10 秒最多一行並附上略過的則數，未啟用 mTLS 時另列出被略過的 agent_id（見「日誌」的節流說明）
 
 ## 需求
@@ -45,15 +45,15 @@
 
 完整的變更與升級步驟見 monorepo 根目錄的 [CHANGELOG.md](../CHANGELOG.md)（發佈包中與本文件放在同一目錄）；以下是 Kairos 需要先處理的項目。
 
-- **report 預設改寫 SQLite，不再寫 `reports-YYYY-MM-DD.jsonl`**（0.3〔草稿〕）：資料寫入 `data/kairos.db`。直接讀 JSONL 的工具請改用 `kairos reports export`（格式相同），或設定 `storage.jsonl_mirror = true` 同時輸出 JSONL，或暫時設定 `storage.backend = "jsonl"` 維持舊行為（沒有主機清冊與彙總）。既有的 JSONL 檔不會匯入、不會被修改，不開鏡像時也不會再被自動清除。備份改用 `kairos db backup`（執行中不可直接複製 `kairos.db`）。見 STORAGE.md「從 JSONL（0.2）升級」。
+- **report 預設改寫 SQLite，不再寫 `reports-YYYY-MM-DD.jsonl`**（0.3）：資料寫入 `data/kairos.db`。直接讀 JSONL 的工具請改用 `kairos reports export`（格式相同），或設定 `storage.jsonl_mirror = true` 同時輸出 JSONL，或暫時設定 `storage.backend = "jsonl"` 維持舊行為（沒有主機清冊與彙總）。既有的 JSONL 檔不會匯入、不會被修改，不開鏡像時也不會再被自動清除。備份改用 `kairos db backup`（執行中不可直接複製 `kairos.db`）。見 STORAGE.md「從 JSONL（0.2）升級」。
 
 - **未啟用 mTLS 的對外監聽改為拒絕啟動**：舊版在 `server.listen` 為非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca` 時只記一則 `WARN` 就照常啟動；新版會記 `ERROR`「未啟用客戶端憑證驗證（mTLS）卻監聽非 loopback 位址，拒絕啟動」並以結束代碼 3（設定錯誤）結束；新版 `kairos.service` 的 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再反覆重試（沿用舊版 unit 時仍會依 `Restart=on-failure` 每 5 秒重試並失敗，請一併換上新版 unit）。升級前請先啟用 mTLS（見「啟用 mTLS」）；確定只在隔離的測試環境使用時，才在 `kairos.toml` 加上 `[auth]` 的 `allow_unauthenticated = true`（或環境變數 `KAIROS__AUTH__ALLOW_UNAUTHENTICATED=true`）。只監聽 `127.0.0.1`／`::1` 等 loopback 位址的設定不受影響。
 - **啟動失敗的結束代碼依原因區分**（舊版一律為 1）：命令列參數錯誤 2、設定錯誤 3（設定檔無法載入或驗證不通過、上述拒絕啟動）、憑證錯誤 4（伺服器憑證、私鑰、client CA、CRL）、連接埠已被佔用 11。`kairos.service` 新增 `RestartPreventExitStatus=2 3 4`，systemd 不再對這些錯誤無限重試；修正後執行 `systemctl restart kairos`。以結束代碼判斷啟動失敗的腳本請改為「非 0」。背景工作異常（1）、看門狗強制結束（1）、其他啟動失敗（1）、第二次訊號強制結束（130）不變。
 - **啟用 mTLS 時 `server.max_connections_per_ip` 只計算尚未通過 hello 的連線**（行為改變，不需修改設定）：舊版不論是否啟用 mTLS，都計算同一位址的全部連線，同一個 NAT 後第 33 台 agent 起在握手前被斷線（審計 A7）；新版啟用 mTLS 時，連線通過 hello（憑證與 `agent_id` 綁定）後改依憑證身分計數，同一個 NAT 後的 agent 數只受 `server.max_connections` 限制。握手前與握手中的連線仍依位址限制（慢速握手防護）。為了 NAT 而調高 `server.max_connections_per_ip` 的 mTLS 部署可以改回預設；未啟用 mTLS 時行為不變。見「每 IP 上限、NAT 與網段允許清單」。
 
-- **0.6.0〔草稿〕：資料庫升級到 schema v6**（使用者、角色、工作階段、稽核雜湊鏈）。升級前以 `kairos db backup` 備份，升級後 0.5 無法開啟。既有的 API token 保留原本的範圍與權限；`kairos api-token create` 未指定時改為 `--role viewer`（0.5 的預設 `read` 另含註冊、PKI 與設定的讀取，需要時以 `--role auditor` 或 `operator` 建立）。升級後以 `kairos users create <帳號> --role admin` 建立首位管理員才能以帳號登入主控台。見「使用者、角色與稽核」與 CHANGELOG [0.6.0]。
+- **0.6.0：資料庫升級到 schema v6**（使用者、角色、工作階段、稽核雜湊鏈）。升級前以 `kairos db backup` 備份，升級後 0.5 無法開啟。既有的 API token 保留原本的範圍與權限；`kairos api-token create` 未指定時改為 `--role viewer`（0.5 的預設 `read` 另含註冊、PKI 與設定的讀取，需要時以 `--role auditor` 或 `operator` 建立）。升級後以 `kairos users create <帳號> --role admin` 建立首位管理員才能以帳號登入主控台。見「使用者、角色與稽核」與 CHANGELOG [0.6.0]。
 
-- **0.5.0〔草稿〕：資料庫升級到 schema v4**（註冊通道與 PKI）。升級前以 `kairos db backup` 備份，升級後 0.4 無法開啟。沒有 `[enroll]`、`[pki]` 時行為與 0.4 相同（註冊通道關閉、離線簽發），不需要修改設定。見「註冊通道與 PKI」。從 0.4 升級時**先升級 Kairos**、建立簽發 CA、開放 8444，再升級 Pulse（INSTALL 第 11 節、CHANGELOG [0.5.0]）。
+- **0.5.0：資料庫升級到 schema v4**（註冊通道與 PKI）。升級前以 `kairos db backup` 備份，升級後 0.4 無法開啟。沒有 `[enroll]`、`[pki]` 時行為與 0.4 相同（註冊通道關閉、離線簽發），不需要修改設定。見「註冊通道與 PKI」。從 0.4 升級時**先升級 Kairos**、建立簽發 CA、開放 8444，再升級 Pulse（INSTALL 第 11 節、CHANGELOG [0.5.0]）。
 
 ## 升級注意事項（與 Pulse 混用版本）
 
@@ -81,7 +81,7 @@
 
 ## 安裝
 
-**0.8.0〔草稿〕起建議以 deb／rpm 套件安裝**（Debian、Ubuntu、RHEL 系；x86_64、aarch64），PKI 以 `kairos pki init` 一個指令建立，不必再寫 `ca.cnf`：
+**0.8.0 起建議以 deb／rpm 套件安裝**（Debian、Ubuntu、RHEL 系；x86_64、aarch64），PKI 以 `kairos pki init` 一個指令建立，不必再寫 `ca.cnf`：
 
 ```bash
 apt install ./kairos-<版本>-<commit>-linux-x86_64.deb      # 或 dnf install ./….rpm
@@ -99,7 +99,7 @@ systemctl start kairos                                    # 之後把 /opt/kairo
 
 1. 以 `ssh-keygen -Y verify` 驗證 `SHA256SUMS.sig`（發佈公鑰 `allowed_signers` 須從另一個管道取得）、`sha256sum -c --ignore-missing SHA256SUMS` 驗證雜湊後解壓（`tar xzf … --strip-components=1`），`./kairos --version` 確認版本與 commit（輸出 `kairos <版本> (<commit>)`，見「設定」最後的命令列參數）。
 2. 建立系統使用者 `kairos` 與 `/opt/kairos`、`/opt/kairos/data`、`/opt/kairos/logs`。
-3. 以 `kairos pki init` 建立根 CA、伺服器憑證與代理簽發 CA（0.8.0〔草稿〕；0.7 以前以 openssl 手動管理的方式見 INSTALL 附錄 P）。
+3. 以 `kairos pki init` 建立根 CA、伺服器憑證與代理簽發 CA（0.8.0；0.7 以前以 openssl 手動管理的方式見 INSTALL 附錄 P）。
 4. 以 `kairos.example.toml` 建立 `kairos.toml`，填入 `pki init` 印出的路徑（`server.cert_path`、`auth.client_ca`、`pki.server_ca_path` 等），改 `server.listen`。
 5. 安裝 `kairos.service`（`User=kairos`、`WorkingDirectory=/opt/kairos`、`ExecStart=/opt/kairos/kairos --config /opt/kairos/kairos.toml`、`LimitNOFILE=8192`、`Restart=on-failure`、`KillSignal=SIGINT`、`ProtectSystem=strict` 且只開放 `data/`、`logs/` 可寫），`systemctl enable --now kairos`。
 6. 確認 `--version`、`journalctl -u kairos` 與 `data/agents.json`。
@@ -514,7 +514,7 @@ kairos api-token revoke <token_id> --yes --config kairos.toml
 - 主控台在自己的 tokio runtime 上執行、以唯讀連線查詢資料庫，不影響 agent 連線與 report 的 `ack`（API.md 第 9 節）。
 - 握手時被拒的客戶端憑證（已撤銷、已過期）以 SAN 歸屬到主機，主機詳情與列表的離線原因顯示「憑證被拒」；不受信任的 CA 簽發的憑證不歸屬（避免冒用）。
 
-## 主控台網頁介面（0.7.0〔草稿〕）
+## 主控台網頁介面（0.7.0）
 
 架構、慣例與測試見 [web/README.md](web/README.md)；伺服器端的規則（路徑、快取、安全標頭）見 [API.md](API.md) 第 14 節。
 
@@ -526,7 +526,7 @@ kairos api-token revoke <token_id> --yes --config kairos.toml
 - 網頁介面只用同源的 API 與工作階段 cookie（HttpOnly、SameSite=Strict），不在瀏覽器保存 token；顯示偏好（主題、時區）只存在各自的瀏覽器。
 - 0.7.0 的畫面：登入、總覽、主機清單、主機詳情、個人設定；告警、註冊與憑證、使用者、稽核、系統設定的畫面尚未提供，請以 CLI 或 API 操作（沒有畫面的功能不顯示在選單中）。
 
-## 使用者、角色與稽核（0.6.0〔草稿〕）
+## 使用者、角色與稽核（0.6.0）
 
 規格見 [API.md](API.md) 第 12 節。
 
@@ -550,7 +550,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 - **LDAP／AD**：`[ldap]` 設定伺服器、`ca_file`（必填，一律驗證伺服器憑證）、服務帳號（密碼放在 `bind_password_file`）與搜尋基底；群組以 `kairos users map-group` 或 `PUT /api/v1/directory/mappings` 對應角色。
 - **API token**：0.6 起屬於某個角色（`--role`，預設 `viewer`）或某個使用者（`--user`）；升級前建立的 token 保留原本的範圍與權限（凍結在 0.5，不會多出使用者、稽核等新權限）。
 - **稽核**：登入、登出、失敗、鎖定、角色變更、密碼與 MFA、token 建立與撤銷、設定變更、註冊核准與拒絕、簽發與撤銷、被拒絕的請求、系統啟動與關機都寫入 `audit_events`，每筆含前一筆的雜湊；保留 `audit.retention_days`（預設 3 年）。
-## 健康檢查與 Prometheus（0.6.0〔草稿〕）
+## 健康檢查與 Prometheus（0.6.0）
 
 審計 O3；設計包 `kairos/screens.md` S20、§24 #8。三個端點在主控台的監聽上提供（`console.listen`，HTTPS，預設 `127.0.0.1:9443`），也可以另外以純 HTTP 監聽（`observability.listen`，例如 `127.0.0.1:9464`；這個監聽只有這三個端點，在自己的執行緒上執行，與 agent 連線、report 的寫入分開）。
 
@@ -579,7 +579,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 
 計數都是啟動以來的累計值（重新啟動後歸零，Prometheus 的 `rate()`／`increase()` 會自動處理）。抓取的設定與建議的告警規則見 [`packaging/prometheus.example.yml`](packaging/prometheus.example.yml) 與 [`packaging/kairos-alerts.example.yml`](packaging/kairos-alerts.example.yml)。量測：每秒 2,000 筆 report 同時連續抓取 `/metrics`（約 400 次／秒）時，`ack` p99 約 2～4 ms，與不抓取時在同一範圍（CHANGELOG [0.6.0]「量測」）。
 
-## 設定檢查與診斷包（0.6.0〔草稿〕）
+## 設定檢查與診斷包（0.6.0）
 
 ```bash
 # 檢查設定（不啟動服務、不連線）：語法與範圍、監聽位址、TLS 憑證與到期、主控台憑證、資料與日誌目錄、
@@ -595,7 +595,7 @@ sudo /opt/kairos/kairos diag --config /opt/kairos/kairos.toml --redact-hosts --s
 
 一律遮蔽：PEM 私鑰區塊、主控台 API token（只留 `kat_<id>_`）、註冊 token（只留前 4 碼 `KRT1-7G4Q…`）、安裝字串、`Bearer` 後的值、設定與 JSON 中名稱含 `token`／`secret`／`password`／`passphrase` 的值（名稱以 `_file`、`_path`、`_prefix`、`_hint` 等結尾的只是路徑或提示，保留）、密碼雜湊（`$argon2id$…`）、TOTP 的 `otpauth://` 網址、工作階段 cookie（`__Host-kairos_session`）與 `X-CSRF-Token`、網址中的秘密（帳號密碼、查詢字串、Webhook 路徑中的長片段，只保留通訊協定與主機）。私鑰檔、`alerts-secrets.key`、`console.key` 與資料庫的內容一律不收集（資料庫只讀取摘要）。產生前再檢查一次，仍有疑似秘密時不寫出（`KRS-E4301`）。日誌超過上限時只收集較新的部分（`KRS-W4302`，結束代碼 8）。
 
-## 註冊通道與 PKI（0.5.0〔草稿〕）
+## 註冊通道與 PKI（0.5.0）
 
 Pulse 以安裝字串（註冊 token＋CA 指紋＋端點）連到 **8444**（HTTPS）申請用戶端憑證，管理者核准（或 token 設定自動核准）後由 Kairos 簽發，Pulse 換到 8443 連線；之後的輪替經 8443 的 `renew`，過期後在寬限期內（預設 90 天）可回 8444 續簽。協定見 `crates/kairos-proto/ENROLL.md`，CA 架構、離線簽發、資料模型與量測見 [PKI.md](PKI.md)，管理端點見 API.md 第 11 節，安裝步驟見 INSTALL 第 6.5 節。
 
@@ -618,7 +618,7 @@ kairos config show --effective enroll pki.policy   # 生效值與來源（環境
 - 主控台修改的 `enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*` 存在資料庫、優先於 `kairos.toml`（環境變數最優先）；啟動時以 `INFO` 列出被覆寫的設定檔設定，`kairos config reset <設定鍵>` 改用設定檔的值。
 - 本版的下載端點（`/agent/…`）回 404：Pulse 以安裝套件安裝後執行 `pulse enroll`。
 
-## 告警（0.6.0〔草稿〕）
+## 告警（0.6.0）
 
 主機離線、指標門檻、身分衝突、憑證被拒等主機事件，網段與大規模離線的彙總，以及 Kairos 本身的系統事件（CRL、伺服器憑證、回報無法寫入、容量、連線上限、註冊端點…），依四級嚴重度（緊急、嚴重、警告、資訊）通知到 Email（SMTP）與 Webhook（Kairos JSON、Slack 類、Teams、LINE）。規格見 [ALERTS.md](ALERTS.md)，端點見 API.md 第 13 節。
 
@@ -835,7 +835,7 @@ sequenceDiagram
 
 ### `logs/kairos-YYYY-MM-DD.log`
 
-與終端輸出相同，以附加方式寫入，每筆寫入後即 flush。每一行的格式依 `log.format`（〔0.6 草稿〕，審計 O3）：
+與終端輸出相同，以附加方式寫入，每筆寫入後即 flush。每一行的格式依 `log.format`（0.6，審計 O3）：
 
 | `log.format` | 一行的樣子 |
 |---|---|
@@ -1094,6 +1094,6 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_D
 - 現役連線的客戶端憑證在每個重載週期重新檢查，因此撤銷或過期最多延遲 `server.reload_interval_secs` 才生效；握手後、送出 hello 前的連線（最多 `timeouts.hello_secs`）不在週期檢查範圍內，但送出 hello 時會再驗證一次憑證鏈，註冊後也會在下一個週期被檢查
 - 關機時連線最晚到訊號後 2 秒就會被中止；網路極慢的連線可能收不到 `close_notify`（agent 端會視為斷線並重連）。被中止的連線若正在等待 report 寫入，該筆仍會寫入資料檔，但 `agents.json` 中該 agent 的 `last_report` 可能不會更新
 - `kairos.toml` 本身的設定只在啟動時讀取；熱重載只涵蓋憑證、私鑰、客戶端 CA 與 CRL 檔的內容
-- 註冊通道（0.5.0〔草稿〕）尚未實作的部分：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具、下載端點、L11 與系統健康的整合（PKI.md 第 13 節）
-- 告警（0.6.0〔草稿〕）尚未實作的部分：週期性維護時段、警告的每日彙整、個人勿擾與個人通知、資料磁碟剩餘空間與授權等系統規則、主機離線類規則的歷史試算（ALERTS.md 第 10 節）
+- 註冊通道（0.5.0）尚未實作的部分：手動簽發憑證的匯入（`kairos pki certificates import`）、離線模式的 CRL 工具、下載端點、L11 與系統健康的整合（PKI.md 第 13 節）
+- 告警（0.6.0）尚未實作的部分：週期性維護時段、警告的每日彙整、個人勿擾與個人通知、資料磁碟剩餘空間與授權等系統規則、主機離線類規則的歷史試算（ALERTS.md 第 10 節）
 - 主控台 API 為唯讀的第一版：驗證只有 API token（沒有使用者、角色、工作階段），主機狀態只有線上、離線、未知；沒有網頁介面（限制與延後項目見 API.md 第 10 節）

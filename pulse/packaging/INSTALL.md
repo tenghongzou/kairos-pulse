@@ -2,12 +2,12 @@
 
 本文件給地端管理者使用：把 Pulse 安裝成**系統服務**（Linux 為 systemd、Windows 為服務 `Pulse`），連到中央伺服器 Kairos。功能、設定欄位與協定細節請見同目錄的 `README.md` 與 `PROTOCOL.md`。
 
-- **第 A 節（建議，0.8.0〔草稿〕起）**：Linux 以 deb／rpm 套件或一行安裝腳本安裝，Windows 以 MSI 安裝；都以 Kairos 管理者提供的**安裝字串**（`pulse enroll`）自動取得憑證。
+- **第 A 節（建議，0.8.0 起）**：Linux 以 deb／rpm 套件或一行安裝腳本安裝，Windows 以 MSI 安裝；都以 Kairos 管理者提供的**安裝字串**（`pulse enroll`）自動取得憑證。
 - **第 0～12 節**：從 tar.gz 發佈包手動安裝（不使用套件管理員、多實例、手動 CSR 等），以及共通的維運、升級與移除。
 
 > 不要用 `systemd-run --user` 或使用者層級的 unit 跑正式服務：沒有開啟 linger 時，最後一個登入 session 結束，user manager 會連同 Pulse 一起被停掉。
 
-## A. 以套件或安裝腳本安裝（0.8.0〔草稿〕）
+## A. 以套件或安裝腳本安裝（0.8.0）
 
 需要 Kairos 0.5 以上、註冊端點（8444）為「開放」，以及 Kairos 管理者給你的**安裝字串**（`pulse-enroll:v1:…`，含 Kairos 位址、註冊 token 與 CA 指紋；`kairos enroll-token create` 或主控台「註冊與憑證 › 註冊 token」產生）。私鑰在本機產生、不會離開這台主機。
 
@@ -71,9 +71,9 @@ sc.exe start Pulse            # pulse enroll 成功後會自動重新啟動服�
 - 安裝到 `C:\Program Files\Pulse\`：`pulse.exe`、文件、初始的 `pulse.toml`（安裝目錄**不**加入 PATH）；註冊服務 **`Pulse`**（自動啟動、LocalSystem，參數 `service run`）。服務的工作目錄是安裝目錄（**不是** `C:\Windows\System32`），`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這裡；本機狀態檔為 `%ProgramData%\Pulse\status.json`。服務第一次啟動時設定「失敗時 10 秒後重新啟動，一天最多 3 次」。
 - 升級：安裝新版 MSI（MajorUpgrade 取代舊版；`pulse.toml` 與執行時產生的檔案保留）。移除：`msiexec /x …` 或「設定 › 應用程式」：停止並刪除服務、刪除安裝的檔案；`pulse.toml`、`agent.id`、`identity\`、`buffer\`、`logs\` 保留。完全移除前先執行 `pulse decommission --initiated-by msi`。
 - 不使用 MSI 時（zip）：解開到任一目錄，以系統管理員執行 `pulse.exe service install --start`（`pulse service --help`）；移除為 `pulse.exe service uninstall`。
-- **0.8.0〔草稿〕的限制**：MSI 與 Windows 服務只在 Linux 上交叉編譯與產生，**尚未在 Windows 實機驗證**；MSI 沒有安裝字串的參數（安裝後另外執行 `pulse enroll`）、移除時不會自動 `pulse decommission`、不寫 Windows 事件記錄、沒有程式碼簽章（Authenticode）。`logs\` 沿用安裝目錄的 ACL（Users 可讀）。
+- **0.8.0 的限制**：MSI 與 Windows 服務只在 Linux 上交叉編譯與產生，**尚未在 Windows 實機驗證**；MSI 沒有安裝字串的參數（安裝後另外執行 `pulse enroll`）、移除時不會自動 `pulse decommission`、不寫 Windows 事件記錄、沒有程式碼簽章（Authenticode）。`logs\` 沿用安裝目錄的 ACL（Users 可讀）。
 
-### A.4 Ansible（最小版，0.8.0〔草稿〕）
+### A.4 Ansible（最小版，0.8.0）
 
 monorepo 的 `packaging/ansible/`（role `pulse` 與範例 `site-pulse.yml`）做與一行安裝腳本相同的事：在控制機以發佈公鑰驗證 `SHA256SUMS` 的簽章 → 依每台主機的架構與套件格式選出套件、複製並核對 SHA-256 → `apt`／`dnf` 安裝 → `pulse enroll`（已有申請或身分時略過）→ 啟用並啟動服務。
 
@@ -89,7 +89,7 @@ ansible-playbook -i inventory.ini packaging/ansible/site-pulse.yml --ask-vault-p
 
 ## 0. 發佈包內容
 
-每個版本的發佈檔（0.8.0〔草稿〕起）：
+每個版本的發佈檔（0.8.0 起）：
 
 | 檔案 | 說明 |
 |---|---|
@@ -143,7 +143,7 @@ sudo -i          # 之後的指令都在這個 shell 中執行；本文件的 ~ 
 
 ## 1. 需求
 
-- Linux x86_64 或 aarch64（0.8.0〔草稿〕起）、systemd（建議 247 以上）；Windows 見第 A.3 節
+- Linux x86_64 或 aarch64（0.8.0 起）、systemd（建議 247 以上）；Windows 見第 A.3 節
 - 能以 TCP 連到 Kairos 的監聽埠
 - 產生私鑰與 CSR 用的 OpenSSL（1.1.1 以上即可；沒有的話見第 5 節的替代做法）
 - 驗證發佈包簽章用的 OpenSSH 8.1 以上（`ssh -V`；可在管理主機上驗證，見第 2 節）
@@ -215,7 +215,7 @@ install -o root -g root -m 644 pulse.example.toml INSTALL.md README.md PROTOCOL.
 
 ## 5. 產生 agent_id 並申請客戶端憑證
 
-Kairos 0.5〔草稿〕起有兩種方式：**以 `pulse enroll` 自動註冊（第 5.0 節，建議）**，或沿用手動 CSR（第 5.1～5.3 節，Kairos 0.4 以前或沒有開放註冊端點時）。
+Kairos 0.5 起有兩種方式：**以 `pulse enroll` 自動註冊（第 5.0 節，建議）**，或沿用手動 CSR（第 5.1～5.3 節，Kairos 0.4 以前或沒有開放註冊端點時）。
 
 ### 5.0 以 pulse enroll 註冊（Kairos 0.5 以上）
 
@@ -390,7 +390,7 @@ Pulse 把日誌同時寫到 stdout 與 `logs/pulse-YYYY-MM-DD.log`。systemd 預
 
 想改成只用 journal：以 `systemctl edit pulse` 加上 `[Service]`、`StandardOutput=journal`，並視需要把 `log.retention_days` 調小（`logs/` 仍會寫入，Pulse 沒有關閉檔案日誌的設定）。
 
-0.6〔草稿〕重新評估後維持 `StandardOutput=null`（審計 S7）：要把日誌交給 SIEM 時，不需要經過 journal：
+0.6 重新評估後維持 `StandardOutput=null`（審計 S7）：要把日誌交給 SIEM 時，不需要經過 journal：
 
 - **syslog**：`pulse.toml` 設定 `[log.syslog]` 的 `target`（`udp://`、`tcp://` 或 `unix:///dev/log`），以 RFC 5424 直接送出；`payload = "json"` 時 `MSG` 為一行 JSON。在背景送出，接收端無法連線時丟棄並計數，不影響服務。
 - **檔案收集**：`log.format = "json"`（檔名改為 `logs/pulse-YYYY-MM-DD.jsonl`），由 rsyslog `imfile`、Filebeat、Fluent Bit 收集；規則只依 `event`、`code` 欄位判斷。
@@ -657,7 +657,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
   chown root:pulse /opt/pulse/agent.id /opt/pulse/client.key
   chmod 640 /opt/pulse/agent.id /opt/pulse/client.key
   ```
-- **升級到 0.8.0〔草稿〕（指標擴充，METRICS.md）**：協定不變，與 Kairos 任意順序升級皆可；建議先升級 Kairos（行程排行與主機資產要 Kairos 0.8.0 以上、SQLite 儲存才會協商）。新版 unit 多了 `RuntimeDirectory=pulse`、`RuntimeDirectoryMode=0750`、`RuntimeDirectoryPreserve=yes` 與複製系統序號的 `ExecStartPre=-+…`，請依步驟 2 換上（多實例依第 9 節步驟 2 重新產生；這幾行各實例相同）。沒有換 unit 時服務照常執行，只是資產不含序號（記一次 `PLS-I8009`）。`buffer.max_mb` 預設由 64 改為 128（每筆緩衝記錄變大），磁碟空間有限時在 `pulse.toml` 明確設定 `[buffer] max_mb = 64`。掛載點與網路介面的上限由 32 改為 16：超過的主機第一次取樣時記一則 `INFO`（`sysinfo.snapshot`），可用 `[collect] interface_exclude` 排除不需要的介面。
+- **升級到 0.8.0（指標擴充，METRICS.md）**：協定不變，與 Kairos 任意順序升級皆可；建議先升級 Kairos（行程排行與主機資產要 Kairos 0.8.0 以上、SQLite 儲存才會協商）。新版 unit 多了 `RuntimeDirectory=pulse`、`RuntimeDirectoryMode=0750`、`RuntimeDirectoryPreserve=yes` 與複製系統序號的 `ExecStartPre=-+…`，請依步驟 2 換上（多實例依第 9 節步驟 2 重新產生；這幾行各實例相同）。沒有換 unit 時服務照常執行，只是資產不含序號（記一次 `PLS-I8009`）。`buffer.max_mb` 預設由 64 改為 128（每筆緩衝記錄變大），磁碟空間有限時在 `pulse.toml` 明確設定 `[buffer] max_mb = 64`。掛載點與網路介面的上限由 32 改為 16：超過的主機第一次取樣時記一則 `INFO`（`sysinfo.snapshot`），可用 `[collect] interface_exclude` 排除不需要的介面。
 - **升級到 0.4（本機狀態檔與 `pulse status`）**：協定不變，與 Kairos 0.3／0.4 任意順序升級皆可。新版 unit 多了 `StateDirectory=pulse`、`StateDirectoryMode=0755`，請依步驟 2 換上（多實例時依第 9 節步驟 2 重新產生，`StateDirectory=pulse/N`），並讓一般帳號可以執行 `pulse status`：
 
   ```bash
@@ -666,7 +666,7 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 
   沒有換 unit 時服務照常啟動與監控（不會因狀態檔而失敗）：狀態檔改寫在 `/opt/pulse/logs/status.json` 並記一次 `WARN`（`PLS-E8204`），只有 root 能執行 `pulse status`，「設定」列提示更新 unit（第 8.2 節）。換上後重新啟動，`pulse status` 的「設定」列不再有 `PLS-E8204`。另外，0.4 起有固定事件的日誌行以「事件 代碼」開頭（例如 `conn.lost PLS-E2002 …`）：以行首比對日誌文字（例如 `[ERROR] 連線中斷`）的告警規則請在升級前改為比對事件或代碼，或改用包含比對（`ERROR-CODES.md`）。
 - 升級前請看新版發佈包中的 `CHANGELOG.md`「破壞性變更與升級步驟」：例如設定了 `ca_cert` 時預設不再信任作業系統信任庫，伺服器憑證若由公開 CA 簽發，需在 `pulse.toml` 加上 `use_system_roots = true`；預設心跳由 1 秒改為 15 秒，Kairos 的離線判定由 5 秒變成 75 秒，需要舊行為時在 `pulse.toml` 設定 `[heartbeat] interval = 1`。
-- **升級到 0.5.0〔草稿〕**（先確認 Kairos 已是 0.5，見本節開頭）：要使用 `pulse enroll` 時先 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/identity`；多實例同樣對每個 `/opt/pulse-N` 建立 `identity/` 並重新產生 `pulse-N.service`）。沿用手動憑證的部署不需要任何變更：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
+- **升級到 0.5.0**（先確認 Kairos 已是 0.5，見本節開頭）：要使用 `pulse enroll` 時先 `install -d -o pulse -g pulse -m 700 /opt/pulse/identity`，並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/identity`；多實例同樣對每個 `/opt/pulse-N` 建立 `identity/` 並重新產生 `pulse-N.service`）。沿用手動憑證的部署不需要任何變更：沒有 `identity/enrollment.json` 時行為與 0.4 相同。
 - **升級到 0.3.0**：新版預設啟用本機緩衝（第 6.2 節），升級前先建立緩衝目錄並換上新版 unit（`ReadWritePaths=` 多了 `-/opt/pulse/buffer`；多實例時對每個 `/opt/pulse-N` 建立目錄並重新產生 `pulse-N.service`）：
 
   ```bash

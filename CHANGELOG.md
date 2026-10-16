@@ -2,11 +2,11 @@
 
 本檔案記錄 Kairos、Pulse 與共用 crate 值得注意的變更，格式依 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)。
 
-Kairos 與 Pulse 自 0.2.0 起各自採用 [SemVer](https://semver.org/lang/zh-TW/)：`--version` 印出 `<名稱> <版本> (<commit>)`，發佈包為 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`（0.7 以前只有 `linux-x86_64.tar.gz`；0.8.0〔草稿〕起另有 aarch64、deb、rpm 與 Pulse 的 Windows zip／msi）。1.0 之前，破壞性變更升 MINOR（0.2 → 0.3），其餘升 PATCH。0.2.0 之前的建置一律顯示 `0.1.0 (<commit>)`，只能以 commit 區分。版本規則、打 tag 與發佈流程見 [RELEASING.md](RELEASING.md)（只在原始碼 repo 中）。
+Kairos 與 Pulse 自 0.2.0 起各自採用 [SemVer](https://semver.org/lang/zh-TW/)：`--version` 印出 `<名稱> <版本> (<commit>)`，發佈包為 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`（0.7 以前只有 `linux-x86_64.tar.gz`；0.8.0 起另有 aarch64、deb、rpm 與 Pulse 的 Windows zip／msi）。1.0 之前，破壞性變更升 MINOR（0.2 → 0.3），其餘升 PATCH。0.2.0 之前的建置一律顯示 `0.1.0 (<commit>)`，只能以 commit 區分。版本規則、打 tag 與發佈流程見 [RELEASING.md](RELEASING.md)（只在原始碼 repo 中）。
 
 各項後的代號（例如 S1、A11）對應商業審計的項目編號。
 
-## 版本相容矩陣〔草稿〕
+## 版本相容矩陣
 
 Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以 commit 識別的所有建置，各 commit 之間的細節見各產品 README 的「升級注意事項（與 … 混用版本）」。
 
@@ -25,34 +25,34 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | **Kairos 0.2.0**（協定 v1～v2） | **有條件相容，協定 v1**：`hello_ack`、report、錯誤處理與 0.1.0 的 Kairos 相同；JSONL 為 `schema` 1（欄位與舊版相同，只多 `schema`），`agents.json` 的 `proto` 為 1、沒有主機資訊。限制：`44dcee5` 之前的 Pulse 在主機名稱含格式字元（Cf）時、`44dcee5` 在主機名稱含 U+034F、Hangul filler、變體選擇字元或私用區字元時**無法註冊**；舊版 Pulse 的讀取閒置計算方式在心跳較大時可能誤斷線 | **相容（建議組合），協定 v2**：report 為通用指標（JSONL `schema` 2），hello 帶主機資訊（寫入 `agents.json`），`hello_ack` 帶 `server_time`（Pulse 檢查時鐘偏差） |
 
 - 同一個 Kairos 0.2.0 可以同時服務 v1 與 v2 的 Pulse：每個 agent 依自己的連線協商，同一個 `reports-*.jsonl` 中 `schema` 1 與 2 的行並存（讀取工具須依 `schema` 分流，見破壞性變更第 6 項）。
-- 0.3.0〔草稿〕的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
-- 0.5.0〔草稿〕的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
-- 0.6.0〔草稿〕的協定與 8443 的 feature 都與 0.5.0 相同，0.5 與 0.6 的任何組合都能連線；Kairos 的資料庫升級到 schema v6（告警、使用者與稽核），Pulse 只新增可觀測性（日誌格式、syslog、本機指標、`diag`）。
+- 0.3.0 的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
+- 0.5.0 的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
+- 0.6.0 的協定與 8443 的 feature 都與 0.5.0 相同，0.5 與 0.6 的任何組合都能連線；Kairos 的資料庫升級到 schema v6（告警、使用者與稽核），Pulse 只新增可觀測性（日誌格式、syslog、本機指標、`diag`）。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
 
-## 支援期限〔草稿〕
+## 支援期限
 
 > 以下為待使用者決定的草稿，數字皆為建議值，尚未對外承諾。
 
 | 項目 | 建議 |
 |---|---|
-| 支援的版本線 | 最新的 MINOR 版本線（目前 0.2.x）提供錯誤與安全性修正（PATCH） |
+| 支援的版本線 | 最新的 MINOR 版本線（目前 0.8.x）提供錯誤與安全性修正（PATCH） |
 | 前一個版本線 | 新的 MINOR 版本發佈後〔待定：建議 6 個月〕內只提供安全性修正，之後終止支援 |
 | PATCH 版本 | 同一 MINOR 版本線內不含破壞性變更，可直接升級 |
 | Kairos／Pulse 混用 | 保證相鄰兩個 MINOR 版本線可以混用（例如 Kairos 0.3 搭配 Pulse 0.2），以便分批升級〔待定〕 |
 | 終止支援通知 | 至少提前〔待定：建議 3 個月〕在本檔案與發佈公告中通知 |
-| 平台 | Linux x86_64、aarch64（musl 靜態連結；aarch64 自 0.8.0〔草稿〕起）、systemd 247 以上；Pulse 另有 Windows x86_64（0.8.0〔草稿〕起，**未在 Windows 實機驗證前不列入支援**）；macOS 不提供 |
+| 平台 | Linux x86_64、aarch64（musl 靜態連結；aarch64 自 0.8.0 起）、systemd 247 以上；Pulse 另有 Windows x86_64（0.8.0 起，**未在 Windows 實機驗證前不列入支援**）；macOS 不提供 |
 | 1.0 之後 | 另訂長期支援（LTS）政策〔待定〕 |
 
 ## [Unreleased]
 
-（0.6.0〔草稿〕之後的變更記在這裡。）
+（目前沒有 0.8.0 之後的變更。）
 
-## [0.8.0] - 〔草稿：發佈日期待定〕
+## [0.8.0] - 2026-10-16
 
-〔草稿〕**Kairos 0.8.0、Pulse 0.8.0**：衝刺 7 的三條線——**指標擴充**（審計 F4，規格 `crates/kairos-proto/METRICS.md`）、**安裝與平台**（商業審計 O4、O5：`kairos pki`、deb／rpm、aarch64、Pulse 的 Windows 服務與 MSI、一行安裝腳本）與**主控台收尾**（設計包 `decisions/INTEGRATION.md` §29.5 的 #3～#5、§29.6 的「S20 項目併入 `system/health`」、`ia.md` §2／§7 的計數泡泡與全站 Banner、會讓主機無法續簽的設定變更的影響預覽 `impact_token`），另有 mTLS 驗證的安全修正（退役的簽發 CA）。**協定版本不變（v1～v2）**，新增 feature `inventory`、`processes`（雙方都宣告時才使用），0.7 與 0.8 的任何組合都能連線；Kairos 的資料庫升級到 **schema v8**。
+**Kairos 0.8.0、Pulse 0.8.0**：衝刺 7 的三條線——**指標擴充**（審計 F4，規格 `crates/kairos-proto/METRICS.md`）、**安裝與平台**（商業審計 O4、O5：`kairos pki`、deb／rpm、aarch64、Pulse 的 Windows 服務與 MSI、一行安裝腳本）與**主控台收尾**（設計包 `decisions/INTEGRATION.md` §29.5 的 #3～#5、§29.6 的「S20 項目併入 `system/health`」、`ia.md` §2／§7 的計數泡泡與全站 Banner、會讓主機無法續簽的設定變更的影響預覽 `impact_token`），另有 mTLS 驗證的安全修正（退役的簽發 CA）。**協定版本不變（v1～v2）**，新增 feature `inventory`、`processes`（雙方都宣告時才使用），0.7 與 0.8 的任何組合都能連線；Kairos 的資料庫升級到 **schema v8**。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -188,9 +188,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - Windows（只經過 `x86_64-pc-windows-gnu` 的交叉編譯與 clippy）：虛擬服務帳號 `NT SERVICE\Pulse` 下的磁碟 I/O（`IOCTL_DISK_PERFORMANCE`）、行程清單與命令列、SMBIOS 序號、`GetDiskFreeSpaceExW`、登錄的 BIOS 與 `~MHz`。
 - Pulse 的 Windows 服務與 MSI（見上方「Pulse：Windows」）；Ansible role 只經過 syntax-check。
 
-## [0.7.0] - 〔草稿：發佈日期待定〕
+## [0.7.0] - 未單獨發佈（內容隨 0.8.0 發佈）
 
-〔草稿〕**Kairos 0.7.0、Pulse 0.7.0**：衝刺 6 的**主控台網頁介面**（審計 F2：S01、S03～S18、S20、S21、S23）與後端補強——設計包 `decisions/INTEGRATION.md` §28.5 的待辦與 §28.9 #3（金鑰檔的備份）。**協定不變**，Pulse 只有設定檔錯誤代碼的小修正。
+**Kairos 0.7.0、Pulse 0.7.0**：衝刺 6 的**主控台網頁介面**（審計 F2：S01、S03～S18、S20、S21、S23）與後端補強——設計包 `decisions/INTEGRATION.md` §28.5 的待辦與 §28.9 #3（金鑰檔的備份）。**協定不變**，Pulse 只有設定檔錯誤代碼的小修正。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -306,9 +306,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 偏好（主題、時區）沒有伺服器端儲存，只套用在各自的瀏覽器。
 - **支援的瀏覽器：Chromium 系（Chrome、Edge）**（設計包 D44 #2）。Trusted Types 只有 Chromium 支援；Firefox、Safari 可以使用（CSP 的其餘部分照常生效），但未在發佈前驗證，跨瀏覽器與真人螢幕報讀器的驗證屬於之後的版本。
 
-## [0.6.0] - 〔草稿：發佈日期待定〕
+## [0.6.0] - 未單獨發佈（內容隨 0.8.0 發佈）
 
-〔草稿〕**Kairos 0.6.0、Pulse 0.6.0**：衝刺 5 的三條線——**告警引擎**（審計 F3；設計包 `kairos/alerts-ux.md`、`screens.md` S06～S11、§24 #2、#8、#9）、**使用者、角色、工作階段與稽核**（審計 F6、S7 的雜湊鏈部分；`screens.md` S01、S16～S18、S23、§24 #10、#11、D25）、**可觀測性**（審計 O3、O8；`screens.md` S20、§24 #8、`pulse/log-ux.md`、`pulse/cli-spec.md` §6、§8）。版本號已改為 0.6.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。**協定不變**（v1～v2，8443 的 feature 與 0.5 相同），Kairos 與 Pulse 0.5／0.6 的任何組合都能照常連線。Pulse 只有可觀測性的變更。
+**Kairos 0.6.0、Pulse 0.6.0**：衝刺 5 的三條線——**告警引擎**（審計 F3；設計包 `kairos/alerts-ux.md`、`screens.md` S06～S11、§24 #2、#8、#9）、**使用者、角色、工作階段與稽核**（審計 F6、S7 的雜湊鏈部分；`screens.md` S01、S16～S18、S23、§24 #10、#11、D25）、**可觀測性**（審計 O3、O8；`screens.md` S20、§24 #8、`pulse/log-ux.md`、`pulse/cli-spec.md` §6、§8）。**協定不變**（v1～v2，8443 的 feature 與 0.5 相同），Kairos 與 Pulse 0.5／0.6 的任何組合都能照常連線。Pulse 只有可觀測性的變更。
 
 規格：告警 [`kairos/ALERTS.md`](kairos/ALERTS.md)、`kairos/API.md` 第 13 節；使用者與稽核 `kairos/API.md` 第 12 節；健康檢查與 `/metrics` 見 `kairos/README.md`「健康檢查與 Prometheus」；資料表 `kairos/STORAGE.md` 第 3 節。
 
@@ -398,9 +398,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - Kairos 發佈包加入 `prometheus.example.yml` 與 `kairos-alerts.example.yml`；Pulse 發佈包加入 `pulse-alerts.example.yml`。
 - 新依賴：`argon2`、`ldap3`（及其依賴），`cargo deny check` 通過；新的內部 crate `kp-obs`（publish = false）。
 
-## [0.5.0] - 〔草稿：發佈日期待定〕
+## [0.5.0] - 未單獨發佈（內容隨 0.8.0 發佈）
 
-〔草稿〕**Kairos 0.5.0、Pulse 0.5.0**：衝刺 4「註冊通道 8444」。Kairos 新增註冊通道（8444 HTTPS）、自動簽發的 PKI（線上簽發 CA、CRL）與管理 API／CLI；Pulse 新增 `pulse enroll`、`pulse decommission`、過期寬限期續簽與 8443 的自動輪替。**協定版本不變**（仍為 v1～v2），8443 以新的 feature `renew`、`deregister` 協商，只在雙方都宣告時使用：0.4 的 Kairos 與 Pulse 不受影響，兩個產品可以分批升級（建議順序見下）。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.5.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。規格：`crates/kairos-proto/ENROLL.md`（8444）、`crates/kairos-proto/PROTOCOL.md`「憑證輪替與除役」（8443）、`kairos/PKI.md`、`kairos/API.md` 第 11 節。
+**Kairos 0.5.0、Pulse 0.5.0**：衝刺 4「註冊通道 8444」。Kairos 新增註冊通道（8444 HTTPS）、自動簽發的 PKI（線上簽發 CA、CRL）與管理 API／CLI；Pulse 新增 `pulse enroll`、`pulse decommission`、過期寬限期續簽與 8443 的自動輪替。**協定版本不變**（仍為 v1～v2），8443 以新的 feature `renew`、`deregister` 協商，只在雙方都宣告時使用：0.4 的 Kairos 與 Pulse 不受影響，兩個產品可以分批升級（建議順序見下）。規格：`crates/kairos-proto/ENROLL.md`（8444）、`crates/kairos-proto/PROTOCOL.md`「憑證輪替與除役」（8443）、`kairos/PKI.md`、`kairos/API.md` 第 11 節。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -475,9 +475,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - Kairos 發佈包加入 `PKI.md`；Pulse 發佈包的 `pulse.service` 多了 `-/opt/pulse/identity`。
 - 新的依賴：Pulse 直接依賴 `rcgen`（MIT OR Apache-2.0，以 ring 為後端）與 `ring`；Kairos 直接依賴 `rcgen`、`x509-parser`（以 ring 驗證 CSR 與憑證）、`time`。都原本就在依賴樹中，`cargo deny check` 通過。
 
-## [0.4.0] - 〔草稿：發佈日期待定〕
+## [0.4.0] - 未單獨發佈（內容隨 0.8.0 發佈）
 
-〔草稿〕**Kairos 0.4.0、Pulse 0.4.0**：商業審計路線圖「階段 3 MVP 產品面」。Kairos 新增 F1（查詢與管理 API）第一版：HTTPS 的主控台 API（`/api/v1`，唯讀）與 API token，是主控台畫面的前提；Pulse 新增 `pulse status`、所有人可讀的本機狀態檔與日誌的事件代碼。**協定不變**（仍為 v1～v2＋`durable`），兩個產品可以分批、以任何順序升級。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.4.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。API 的規格、端點、驗證、即時推送與量測見 `kairos/API.md`（Kairos 發佈包內的 `API.md`）；Pulse 的錯誤代碼對照見 `pulse/ERROR-CODES.md`（Pulse 發佈包內的 `ERROR-CODES.md`）。
+**Kairos 0.4.0、Pulse 0.4.0**：商業審計路線圖「階段 3 MVP 產品面」。Kairos 新增 F1（查詢與管理 API）第一版：HTTPS 的主控台 API（`/api/v1`，唯讀）與 API token，是主控台畫面的前提；Pulse 新增 `pulse status`、所有人可讀的本機狀態檔與日誌的事件代碼。**協定不變**（仍為 v1～v2＋`durable`），兩個產品可以分批、以任何順序升級。API 的規格、端點、驗證、即時推送與量測見 `kairos/API.md`（Kairos 發佈包內的 `API.md`）；Pulse 的錯誤代碼對照見 `pulse/ERROR-CODES.md`（Pulse 發佈包內的 `ERROR-CODES.md`）。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -569,9 +569,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - Kairos 發佈包另附 `API.md`；Pulse 發佈包另附 `ERROR-CODES.md`，`pulse.service` 新增 `StateDirectory=pulse`、`StateDirectoryMode=0755`。
 - 新增依賴 `hyper`（只啟用 `server`、`http1`）、`hyper-util`（`tokio`）及其依賴 `http`、`http-body`、`httparse`、`httpdate`、`atomic-waker`（皆為 MIT／Apache-2.0）；`ring`、`subtle` 改為 Kairos 的直接依賴（原已在依賴樹中）。`deny.toml`、`packaging/about.toml` 的授權允許清單不需變更。
 
-## [0.3.0] - 〔草稿：發佈日期待定〕
+## [0.3.0] - 未單獨發佈（內容隨 0.8.0 發佈）
 
-〔草稿〕**Kairos 0.3.0、Pulse 0.3.0**：商業審計路線圖「階段 2 資料層」中的 A1（資料庫）、A5（at-least-once 投遞）、A6（持久化主機清冊）、A9（容量）。Kairos 的 report 預設改寫 SQLite，另有主機清冊、5 分鐘／1 小時彙總、分層保留與總容量上限；Pulse 新增本機環狀緩衝，Kairos 停機或網路中斷期間的取樣在恢復後補送，雙方以協定 feature `durable` 協商，Kairos 以唯一索引去重。`kairos/Cargo.toml`、`pulse/Cargo.toml` 的版本已改為 0.3.0；發佈時依 RELEASING.md 填上日期並移除〔草稿〕標記。架構、schema、設定、容量估算、量測與備份見 `kairos/STORAGE.md`（發佈包內的 `STORAGE.md`）；協定見 `crates/kairos-proto/PROTOCOL.md`「durable：at-least-once 投遞」。
+**Kairos 0.3.0、Pulse 0.3.0**：商業審計路線圖「階段 2 資料層」中的 A1（資料庫）、A5（at-least-once 投遞）、A6（持久化主機清冊）、A9（容量）。Kairos 的 report 預設改寫 SQLite，另有主機清冊、5 分鐘／1 小時彙總、分層保留與總容量上限；Pulse 新增本機環狀緩衝，Kairos 停機或網路中斷期間的取樣在恢復後補送，雙方以協定 feature `durable` 協商，Kairos 以唯一索引去重。架構、schema、設定、容量估算、量測與備份見 `kairos/STORAGE.md`（發佈包內的 `STORAGE.md`）；協定見 `crates/kairos-proto/PROTOCOL.md`「durable：at-least-once 投遞」。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 
@@ -676,9 +676,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 新增依賴 `rusqlite`（MIT，只啟用 `bundled`：編譯內附的 SQLite 原始碼，不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝）及其依賴 `libsqlite3-sys`（MIT）、`fallible-iterator`、`fallible-streaming-iterator`（MIT／Apache-2.0）、`pkg-config`、`vcpkg`（建置用，MIT／Apache-2.0）。SQLite 本身是 public domain（不需授權條款），`THIRD-PARTY-LICENSES` 另加註說明。`deny.toml`、`packaging/about.toml` 的授權允許清單不需變更（沒有新的授權種類；未啟用 rusqlite 的 `cache` feature，避免引入 Zlib 授權的 `foldhash`）。
 - Kairos 發佈包新增 `STORAGE.md`；Pulse 發佈包的 `pulse.service` 允許寫入 `buffer/`。
 
-## [0.2.0] - 〔草稿：發佈日期待定〕
+## [0.2.0] - 未單獨發佈（內容隨 0.8.0 發佈）
 
-〔草稿〕**Kairos 0.2.0**、**Pulse 0.2.0**（兩者同時發佈）。`Cargo.toml` 已是 0.2.0，尚未打 tag；發佈時依 RELEASING.md 填入日期並移除〔草稿〕標記。共用 crate（`kairos-proto`、`date-guard`）是內部 crate，維持 0.1.0、不單獨發佈。協定新增 v2，與 v1 自動協商（見上方「版本相容矩陣」）。
+**Kairos 0.2.0**、**Pulse 0.2.0**（兩者同時改版）。共用 crate（`kairos-proto`、`date-guard`）是內部 crate，維持 0.1.0、不單獨發佈。協定新增 v2，與 v1 自動協商（見上方「版本相容矩陣」）。
 
 ### 破壞性變更與升級步驟（升級前必讀）
 

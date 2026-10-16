@@ -1,6 +1,6 @@
 # Pulse 錯誤代碼與日誌事件對照
 
-本文件列出 Pulse 0.4〔草稿〕與 0.5〔草稿〕（註冊通道）已對應到設計包代碼的地方（代碼 → 程式位置 → 觸發條件 → 在哪裡看得到），以及尚未實作的代碼。代碼的唯一來源是設計包 `design-system/copywriting.md` §3.3（Pulse 共 113 個，0.8.0 依 `decisions/INTEGRATION.md` §30.3 新增 4 個）；日誌事件依 `pulse/log-ux.md` §4。發佈包內附本文件，`pulse explain <代碼>` 印出代碼的標題並指向這裡。
+本文件列出 Pulse 0.4 與 0.5（註冊通道）已對應到設計包代碼的地方（代碼 → 程式位置 → 觸發條件 → 在哪裡看得到），以及尚未實作的代碼。代碼的唯一來源是設計包 `design-system/copywriting.md` §3.3（Pulse 共 113 個，0.8.0 依 `decisions/INTEGRATION.md` §30.3 新增 4 個）；日誌事件依 `pulse/log-ux.md` §4。發佈包內附本文件，`pulse explain <代碼>` 印出代碼的標題並指向這裡。
 
 ## 1. 代碼出現在哪裡
 
@@ -31,9 +31,9 @@
 | `PLS-W0302` | `tls.rs` `build`（日誌）；`main.rs` `config_warnings`（狀態） | `accept_invalid_certs = true` | `config.warning`（ERROR 等級，與先前相同）；設定列 ⚠ |
 | `PLS-W0303` | `main.rs` `config_warnings` | 設定了 `server.ca_cert` 又讓 `use_system_roots = true` | 設定列 ⚠ |
 | `PLS-W8101` | `main.rs` `startup_location_messages` | 工作目錄是 `System32`／`SysWOW64` | `config.warning`；設定列 ⚠ |
-| `PLS-E0401` | `diag.rs` `locate`（0.6〔草稿〕） | `pulse check-config`／`pulse diag` 以 `-c` 指定的設定檔不存在 | `check-config` 的「設定檔」列 ✗，結束代碼 3 |
-| `PLS-E4301` | `diag.rs` `run_diag`（0.6〔草稿〕） | 無法寫出診斷包（輸出檔已存在、無法寫入、產生前檢查仍有疑似秘密） | stderr，結束代碼 1 |
-| `PLS-W4302` | `diag.rs` `build`（0.6〔草稿〕） | 診斷包的日誌超過 50 MB 上限，只收集較新的部分 | `pulse diag` 的輸出，結束代碼 8 |
+| `PLS-E0401` | `diag.rs` `locate`（0.6） | `pulse check-config`／`pulse diag` 以 `-c` 指定的設定檔不存在 | `check-config` 的「設定檔」列 ✗，結束代碼 3 |
+| `PLS-E4301` | `diag.rs` `run_diag`（0.6） | 無法寫出診斷包（輸出檔已存在、無法寫入、產生前檢查仍有疑似秘密） | stderr，結束代碼 1 |
+| `PLS-W4302` | `diag.rs` `build`（0.6） | 診斷包的日誌超過 50 MB 上限，只收集較新的部分 | `pulse diag` 的輸出，結束代碼 8 |
 
 ### 2.2 TLS、身分
 
@@ -99,7 +99,7 @@
 | `PLS-W8301` | `network.rs` `ClockSkewLog`；`eval.rs` `clock_row` | 與 Kairos 相差 30 秒～5 分鐘（以 `hello_ack` 的 `server_time` 量測；只在等級改變或偏差再變化超過 1 分鐘時記錄） | `clock.skew`（WARN）；時鐘列 ⚠ |
 | `PLS-E8302` | 同上 | 相差超過 5 分鐘 | `clock.skew`（ERROR，同時寫 stderr）；時鐘列 ✗。回到 30 秒以內時 `clock.skew -`（INFO） |
 
-### 2.6 註冊與憑證更新（0.5〔草稿〕，`crates/kairos-proto/ENROLL.md`）
+### 2.6 註冊與憑證更新（0.5，`crates/kairos-proto/ENROLL.md`）
 
 8444 錯誤碼與 Pulse 代碼的對照以 `kairos-proto` 的 `EnrollErrorCode::pulse_code` 為準（ENROLL.md「錯誤碼」表）；Pulse 依端點再決定處置（`enroll/machine.rs`）。
 
@@ -136,7 +136,7 @@
 | `PLS-E8302` | `enroll/machine.rs` | 註冊或過期續簽時 `clock_skew`：每 5 分鐘重送，偵測到本機時間被調整時立即 | `enroll.clock_rejected`／`cert.grace_renew_blocked`（ERROR）；身分列 ✗「相差…；校正後自動重送」；`clock.source = clock_skew` |
 | `PLS-E1403`（8444） | `enroll/cli.rs` `connect_failure` | 註冊端點的伺服器憑證依本機時間已過期或尚未生效：以「忽略有效期間」再驗證一次、只送 `server-info`，訊息中寫出未驗證的 Kairos 時間 | `clock.source = server_info_unverified`、`valid: false` |
 
-### 2.7 Windows 服務（0.8〔草稿〕；設計包 §30.3 分配到子類別 81，工程暫定的 `8205`／`8206` 已改號）
+### 2.7 Windows 服務（0.8；設計包 §30.3 分配到子類別 81，工程暫定的 `8205`／`8206` 已改號）
 
 | 代碼 | 程式位置 | 觸發條件 | 看得到的地方 |
 |---|---|---|---|
@@ -151,8 +151,8 @@
 | `config.warning` | 1003 | `main.rs`、`tls.rs` | ✓ |
 | `identity.loaded`、`identity.created` | 1004、1005 | `main.rs` | ✓ |
 | `sample.timeout` | 1030 | `system_info.rs`、`inventory.rs` | ✓（0.8.0 起含主機資產的收集逾時） |
-| `sysinfo.snapshot` | 1010 | `system_info.rs` `Extras::log_skipped` | 部分（0.8.0〔草稿〕）：只記超過每類上限而略過的掛載點、磁碟 I/O 裝置、網路介面（`skipped_*`），第一次取樣時一則、之後每 24 小時最多一則；啟動時的完整系統資訊仍是沒有事件的 INFO 行 |
-| `sysinfo.limited`、`inventory.rejected` | 〔待分配〕 | `system_info.rs` `report_limited`、`inventory.rs` | ✓（0.8.0〔草稿〕；設計包沒有，事件名稱與識別碼待設計組確認，見 METRICS.md 第 14 節） |
+| `sysinfo.snapshot` | 1010 | `system_info.rs` `Extras::log_skipped` | 部分（0.8.0）：只記超過每類上限而略過的掛載點、磁碟 I/O 裝置、網路介面（`skipped_*`），第一次取樣時一則、之後每 24 小時最多一則；啟動時的完整系統資訊仍是沒有事件的 INFO 行 |
+| `sysinfo.limited`、`inventory.rejected` | 〔待分配〕 | `system_info.rs` `report_limited`、`inventory.rs` | ✓（0.8.0；設計包沒有，事件名稱與識別碼待設計組確認，見 METRICS.md 第 14 節） |
 | `conn.registered`、`conn.lost`、`conn.restored`、`conn.outage` | 2000、2001、2003、2004 | `network.rs` | ✓（`conn.restored` 附待補送筆數與丟棄筆數） |
 | `tls.server_cert_rejected`、`auth.*`、`conn.superseded`、`proto.incompatible`、`server.full` | 2100～2301 | `network.rs` `disconnect_event` | ✓ |
 | `report.rejected`、`report.skipped`、`server.unexpected` | 2400～2402 | `network.rs` | ✓ |
@@ -163,7 +163,7 @@
 | `status.write_failed`、`status.write_restored` | 5020、5021 | `local_status.rs` | ✓（設計包 §26 補登） |
 | `conn.retry`、`conn.retry_summary` | —、2002 | — | 待辦（§4） |
 | `config.loaded`、`identity.clone_suspected` | 1002、1006 | — | 待辦 |
-| `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | `main.rs` `connection_loop`、`rotation.rs`、`enroll/service.rs` | ✓（0.5〔草稿〕） |
+| `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | `main.rs` `connection_loop`、`rotation.rs`、`enroll/service.rs` | ✓（0.5） |
 | `install.decommission_unreported`、`install.withdrawal_unreported` | 4002、4005 | `decommission.rs`、`enroll/cli.rs` | ✓（`pulse decommission`、`pulse enroll --cancel`；沒有初始化日誌時只寫 stderr） |
 | `enroll.submitted`～`enroll.request_expired`、`enroll.rate_limited`～`enroll.clock_rejected` | 4100～4105、4108～4112 | `enroll/service.rs` `ServiceObserver` | ✓（服務在背景接續申請時；`pulse enroll` 只輸出到終端機） |
 | `admin.dangerous_action` | 4107 | `enroll/cli.rs` | 部分：`pulse enroll` 不初始化日誌檔，事件沒有寫進 `logs/` |
@@ -185,7 +185,7 @@
 
 ### 4.2 日誌格式與其他
 
-- 0.6〔草稿〕已實作 `log-ux.md` §6 的 RFC 3339 帶時區的時間、`log.format = "json"`（`v`、`ts`、`level`、`event`、`code`、`msg`、`agent_id`、`instance`、`run_id`、`seq`，事件專屬欄位在 `fields` 物件中）、`log.timezone` 與 syslog 外送；`text` 仍保留 0.5 的 `[等級] <event> <code> 訊息` 版面（未改為 5 欄寬等級、`event` 補到 18 欄）。§5 的重試摘要（`conn.retry_summary`：1／5／15／30 分、之後每小時）、`log.lang`、`log.stderr`、`log.outage_error_after` 尚未實作；目前仍是每次斷線一行（WARN／節流的 ERROR）。
+- 0.6 已實作 `log-ux.md` §6 的 RFC 3339 帶時區的時間、`log.format = "json"`（`v`、`ts`、`level`、`event`、`code`、`msg`、`agent_id`、`instance`、`run_id`、`seq`，事件專屬欄位在 `fields` 物件中）、`log.timezone` 與 syslog 外送；`text` 仍保留 0.5 的 `[等級] <event> <code> 訊息` 版面（未改為 5 欄寬等級、`event` 補到 18 欄）。§5 的重試摘要（`conn.retry_summary`：1／5／15／30 分、之後每小時）、`log.lang`、`log.stderr`、`log.outage_error_after` 尚未實作；目前仍是每次斷線一行（WARN／節流的 ERROR）。
 - systemd `Status:` 的文字仍是 0.2 的寫法（`無法註冊：certificate_rejected（…）`），尚未改為 `cli-spec.md` §2.2 的「標題（代碼，處理提示）」；`PLS-E4004` 已附在 `已註冊：…` 之後。
 - `clock.skew` 的 `ERROR` 與 `status.write_failed` 的 `ERROR` 目前寫日誌與 stderr；Windows 事件記錄與服務狀態（`log-ux.md` §3）待 Windows 事件記錄實作時一併處理。
 - Windows 事件記錄、服務描述欄位（`local-status.md` §5、§6）。

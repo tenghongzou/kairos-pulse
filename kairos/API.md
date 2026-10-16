@@ -1,8 +1,8 @@
 # Kairos 主控台 API（v1）
 
-本文件是 Kairos 主控台與外部整合使用的查詢與管理 API 的規格（商業審計 F1；設計包 `kairos/screens.md` §24 #1、#3、#4、#5、#19 的後端部分）。0.4.0〔草稿〕起提供第一版：**唯讀**的主機清冊、單台詳情、指標趨勢、總覽 KPI、系統健康與即時變更推送（SSE），以 API token 驗證。0.6.0〔草稿〕起另有使用者、角色（RBAC）、主控台的工作階段與稽核雜湊鏈（設計包 #10、#11、D25；審計 F6），見第 12 節。
+本文件是 Kairos 主控台與外部整合使用的查詢與管理 API 的規格（商業審計 F1；設計包 `kairos/screens.md` §24 #1、#3、#4、#5、#19 的後端部分）。0.4.0 起提供第一版：**唯讀**的主機清冊、單台詳情、指標趨勢、總覽 KPI、系統健康與即時變更推送（SSE），以 API token 驗證。0.6.0 起另有使用者、角色（RBAC）、主控台的工作階段與稽核雜湊鏈（設計包 #10、#11、D25；審計 F6），見第 12 節。
 
-- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0〔草稿〕的使用者、角色與稽核見第 12 節，告警（事件、規則、靜音、通知管道）見第 13 節。
+- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0 的使用者、角色與稽核見第 12 節，告警（事件、規則、靜音、通知管道）見第 13 節。
 - 實作：`kairos/src/api/`（HTTP 伺服器、驗證、各端點）、`kairos/src/token_cli.rs`（`kairos api-token`）。
 - 量測（1 萬台主機的列表、30 天趨勢、與 report 寫入同時進行時的 `ack` 延遲）見第 9 節：列表 p99 約 10 ms、30 天趨勢 p99 約 8～13 ms（目標 200／300 ms）。
 
@@ -18,7 +18,7 @@
 | 伺服器時間 | **每個回應**（含錯誤）的最外層都有 `server_time`：Kairos 產生回應時的系統時間，讓主控台計算相對時間（「3 分鐘前」）時不依賴瀏覽器的時鐘 |
 | 方法 | 查詢端點只有 `GET`（`HEAD` 視同 `GET` 但不回本文），其他方法回 405（`Allow: GET, HEAD`）。0.5.0 起註冊與 PKI 的管理端點另有 `POST`、`PUT`（第 11 節） |
 | 快取 | 所有回應 `Cache-Control: no-store` |
-| CORS | **預設關閉**：不回任何 `Access-Control-*` 標頭，瀏覽器的跨來源請求一律失敗。網頁介面與 API 同源提供（0.7.0〔草稿〕，第 14 節），不需要 CORS |
+| CORS | **預設關閉**：不回任何 `Access-Control-*` 標頭，瀏覽器的跨來源請求一律失敗。網頁介面與 API 同源提供（0.7.0，第 14 節），不需要 CORS |
 | 字元 | 主機名稱等由 agent 提供的字串原樣輸出（JSON 跳脫），顯示時由主控台處理（Pulse 已把不能顯示的字元換成 `?`） |
 
 ### 1.1 成功回應
@@ -123,7 +123,7 @@ GET /api/v1/hosts?status=offline&sort=-last_seen&limit=100&cursor=eyJ2IjoxLC...
 
 ## 4. 驗證：API token
 
-**API token** 給整合（Grafana、腳本）與自動化使用；主控台的網頁介面以帳號登入、使用工作階段的 cookie（0.6.0〔草稿〕，第 12.2、12.3 節）。兩者得到同樣的身分（`Principal`）與權限（第 12.1 節）。
+**API token** 給整合（Grafana、腳本）與自動化使用；主控台的網頁介面以帳號登入、使用工作階段的 cookie（0.6.0，第 12.2、12.3 節）。兩者得到同樣的身分（`Principal`）與權限（第 12.1 節）。
 
 ### 4.1 token
 
@@ -181,7 +181,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - 每個來源第一次被限制時記一行 `WARN`（`警告 KRS-W6011：主控台 API：來自 … 的請求驗證失敗太多次…`；同一來源恢復額度前不再記），不記錄 token 內容。
 - 記憶體中最多追蹤 10,000 個來源，超過時清掉最久沒有失敗的來源。
 
-### 4.4 工作階段與 RBAC（0.6.0〔草稿〕，已實作）
+### 4.4 工作階段與 RBAC（0.6.0，已實作）
 
 - 每個請求先經過 `api::auth::Authenticator::authenticate`（`Authorization` 優先，其次是工作階段的 cookie），得到 `Principal`（`ApiToken` 或 `Session`）與它的權限（`Grants`：全站的一組，加上每個主機群組的一組）。
 - 端點以 `principal.require(Permission::…)` 檢查權限（集中定義在 `kairos/src/rbac.rs`）；主機的讀取另以 `principal.host_access()` 篩選群組範圍（列表、詳情、趨勢、總覽、SSE）。
@@ -199,7 +199,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `GET /api/v1/hosts/{agent_id}/metrics` | S05 趨勢分頁 | 這台主機目前回報的指標（名稱、單位、label 組合） |
 | `GET /api/v1/hosts/facets` | S04 篩選列、S03 群組健康 | 範圍內主機的 OS、agent 版本、標籤、群組、離線原因與各自的台數（0.7.0，第 5.7 節） |
 | `GET /api/v1/hosts/{agent_id}/connections` | S05「連線與憑證」 | 這台主機在 Kairos 這次啟動後的上線與離線紀錄（記憶體中；0.7.0，第 5.8 節） |
-| `GET /api/v1/hosts/{agent_id}/inventory` | S05「資產資訊」 | 主機資產（OS、CPU、記憶體、廠牌型號序號、BIOS、磁碟、網卡；0.8.0〔草稿〕，第 5.9 節） |
+| `GET /api/v1/hosts/{agent_id}/inventory` | S05「資產資訊」 | 主機資產（OS、CPU、記憶體、廠牌型號序號、BIOS、磁碟、網卡；0.8.0，第 5.9 節） |
 | `GET /api/v1/hosts/{agent_id}/inventory/changes` | S05「資產變更歷史」 | 資產變更歷史（第 5.9 節） |
 | `GET /api/v1/hosts/{agent_id}/processes` | S05 行程〔待設計〕 | 行程排行快照（依 CPU、依記憶體；第 5.10 節） |
 | `GET /api/v1/hosts/{agent_id}/metrics/{name}` | S05 趨勢、S03 sparkline | 指標趨勢（第 5.3 節） |
@@ -240,7 +240,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `offline_reason` | `certificate_rejected` | 最後中斷原因（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；第 5.2 節）。0.7 的過渡期另接受舊名稱 `timeout`（＝`idle_timeout`）、`connection_closed`（＝`agent_closed`），0.8 移除 |
 | `tag` | `env:prod,line3` | 標籤（完全相同，不分大小寫） |
 | `os` | `Ubuntu,Windows` | `os.name`（完全相同，不分大小寫） |
-| `os_family` | `linux,windows` | 作業系統家族（0.8.0〔草稿〕）：資產（`inventory.os.family`）優先，沒有資產時由 hello 的 `os.name` 推斷（含 `windows` 為 `windows`，其他為 `linux`）。其他值 400 |
+| `os_family` | `linux,windows` | 作業系統家族（0.8.0）：資產（`inventory.os.family`）優先，沒有資產時由 hello 的 `os.name` 推斷（含 `windows` 為 `windows`，其他為 `linux`）。其他值 400 |
 | `version` | `0.3.0,0.2.0` | `agent_version`（完全相同） |
 | `durable` | `true` | 最近一次連線是否協商了補送（`durable`）；Kairos 重新啟動後尚未連線的主機不知道，兩種值都不符合 |
 | `subnet` | `10.30.3.0/24,2001:db8::/48` | 最後已知 IP 在網段內（CIDR；只寫位址表示單一位址；主機位元必須為 0，否則 400 並建議正確的寫法） |
@@ -256,8 +256,8 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `ip` | 最後已知 IP（數值順序，IPv4 在 IPv6 前；沒有 IP 的在最後） |
 | `agent_version` | 版本（依 SemVer 的數字比較，無法解析的以字串比較） |
 | `cpu`、`memory` | 最近一次 report 的 CPU 使用率、記憶體使用比例（沒有 report 的在最後） |
-| `disk` | 使用率最高的掛載點的使用率（含推算值；0.8.0〔草稿〕） |
-| `uptime` | 開機後經過的時間（只有線上主機；依開機時間排序，換頁時穩定；0.8.0〔草稿〕） |
+| `disk` | 使用率最高的掛載點的使用率（含推算值；0.8.0） |
+| `uptime` | 開機後經過的時間（只有線上主機；依開機時間排序，換頁時穩定；0.8.0） |
 
 **一台主機**（`data[]` 的元素；詳情另有第 5.2 節的欄位）：
 
@@ -291,7 +291,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - `durable`、`replaying`：最近一次連線是否協商了補送、目前是否正在補送（最近 60 秒內收到取樣時間比收到時間早 60 秒以上的 durable report）；Kairos 重新啟動後尚未連線的主機為 `null`。
 - `last_report`：最近一次 report 的摘要（CPU、記憶體）；沒有時為 `null`。
 - `source`：`agent`（由連線建立）或 `import`（由 `kairos reports import` 建立）。
-- 0.8.0〔草稿〕（[`METRICS.md`](../crates/kairos-proto/METRICS.md) 第 10.1 節）：
+- 0.8.0（[`METRICS.md`](../crates/kairos-proto/METRICS.md) 第 10.1 節）：
   - `os_family`：`linux`／`windows`（同 `os_family` 篩選的判斷）；`null` 為不知道。
   - `inventory`：資產摘要 `{os_family, cpu_model, cpu_logical_cores, memory_total, vendor, product}`；沒有資產（Pulse 0.7.0 以前、或還沒收到）時 `null`。**序號不在清單中**（只在詳情；減少大量匯出時的外流面）。
   - `boot_time`：開機時間（資產）；`uptime_secs`：線上主機開機後經過的秒數（最後一筆 report 的 `system.uptime` 加上之後經過的時間，沒有時由 `boot_time` 算出），不在線上時 `null`。
@@ -335,14 +335,14 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 }
 ```
 
-0.8.0〔草稿〕起 `last_report` 另有（舊版 Pulse 沒有的為 `null` 或空陣列）：`filesystems`（每個掛載點 `{mountpoint, fstype, total, used, available, usage, estimated}`）、`swap`（`{total, used, usage}`）、`load`（`{"1m", "5m", "15m"}`，只有 Linux）、`process_count`、`memory_available_bytes`、`uptime_secs`、`network`（每個介面 `{device, rx_bytes_per_sec, tx_bytes_per_sec}`）、`disk_io`（每個裝置 `{device, read_bytes_per_sec, write_bytes_per_sec}`）。速率由最後兩筆 report 算出（`kairos_proto::counter_rate`：重置或重新開機時為 `null`）。`inventory` 為詳情才有序號的資產摘要；`features`：最近一次連線是否協商了 `inventory`、`processes`（Kairos 重新啟動後尚未連線時 `null`）。`inventory_rejection`：這次啟動後最近一次資產被拒（`KRS-W2108`）`{at, reason, product_code}`，之後的資產保存成功時清除；`series_limited_at`：最近一次因每主機序列數上限而有指標未保存的時間（`KRS-W4104`，主機清冊中保存）。兩者供 S05 的 `InlineAlert`（設計包 §30.5 #7）。
+0.8.0 起 `last_report` 另有（舊版 Pulse 沒有的為 `null` 或空陣列）：`filesystems`（每個掛載點 `{mountpoint, fstype, total, used, available, usage, estimated}`）、`swap`（`{total, used, usage}`）、`load`（`{"1m", "5m", "15m"}`，只有 Linux）、`process_count`、`memory_available_bytes`、`uptime_secs`、`network`（每個介面 `{device, rx_bytes_per_sec, tx_bytes_per_sec}`）、`disk_io`（每個裝置 `{device, read_bytes_per_sec, write_bytes_per_sec}`）。速率由最後兩筆 report 算出（`kairos_proto::counter_rate`：重置或重新開機時為 `null`）。`inventory` 為詳情才有序號的資產摘要；`features`：最近一次連線是否協商了 `inventory`、`processes`（Kairos 重新啟動後尚未連線時 `null`）。`inventory_rejection`：這次啟動後最近一次資產被拒（`KRS-W2108`）`{at, reason, product_code}`，之後的資產保存成功時清除；`series_limited_at`：最近一次因每主機序列數上限而有指標未保存的時間（`KRS-W4104`，主機清冊中保存）。兩者供 S05 的 `InlineAlert`（設計包 §30.5 #7）。
 
 - `connection`：目前或最近一次連線的投遞資訊（Kairos 重新啟動後尚未連線時為 `null`）。`last_backfill_*`：最近一次收到補送資料的時間與當時的落後量（收到時間 − 取樣時間）。
 - `certificate_rejection`：**握手時被拒的憑證歸屬**（設計包 §24 #3、`ia.md` §5.2「憑證被拒」）：最近一次以這台主機的憑證（SAN 為 `agent_id`）連線、在 TLS 握手時被拒的時間、原因、序號與來源位址，`count` 為累計次數。`reason`：`revoked`（`KRS-W1105`）、`expired`（`KRS-W1108`）、`revocation_status_unavailable`（`KRS-E1203`，伺服器端的 CRL 問題）。沒有時為 `null`。之後成功上線的主機仍保留紀錄，但不再算作「憑證被拒」的離線原因（`offline_reason` 只在被拒時間晚於 `last_seen` 時為 `certificate_rejected`）。
   - **只歸屬由信任的 CA 簽發的憑證**：已撤銷、無法判定撤銷狀態（兩者都在憑證鏈驗證之後才檢查），以及已過期但以效期的最後一秒重新驗證可以通過的。自簽或不受信任的 CA 簽發的憑證（`KRS-W1109`）**不歸屬**：SAN 由出示者自己決定，否則任何人都能讓別台主機顯示「憑證被拒」，或以大量假的 `agent_id` 填滿紀錄。
   - 記錄在記憶體中（最多 1 萬台），每 10 秒寫入主機清冊（`hosts.cert_rejected_at`、`cert_rejection`），重新啟動後仍在。清冊中沒有的 `agent_id`（例如已清除的主機）只留在記憶體中。
   - 連線中被踢掉（熱重載後重新驗證失敗，例如撤銷後 1 個重載週期內）的離線原因同樣是 `certificate_rejected`。
-- `offline_reason`（第 5.1 節）：`idle_timeout`（超過離線門檻沒有合法訊息）、`agent_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。**0.7〔草稿〕起與 Webhook 的 `offline_reason`、`/metrics` 的 `kairos_agent_disconnects_total{reason}` 是同一組名稱**（[`ALERTS.md`](ALERTS.md) 第 2 節；設計包 §28.5 #4）。
+- `offline_reason`（第 5.1 節）：`idle_timeout`（超過離線門檻沒有合法訊息）、`agent_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。**0.7 起與 Webhook 的 `offline_reason`、`/metrics` 的 `kairos_agent_disconnects_total{reason}` 是同一組名稱**（[`ALERTS.md`](ALERTS.md) 第 2 節；設計包 §28.5 #4）。
   - **過渡期（0.7，破壞性變更）**：0.4～0.6 的名稱是 `timeout`、`connection_closed`。0.7 的回應在 `status_detail` 另帶 `offline_reason_legacy`（舊名稱；其餘三個值兩者相同），SSE 的 `host.offline` 另帶 `reason_legacy`，總覽的離線清單另帶 `offline_reason_legacy`；查詢參數 `offline_reason` 新舊名稱都接受。依舊名稱判斷的整合請改讀 `offline_reason`（新名稱）；`*_legacy` 欄位與舊的查詢值在 0.8 移除。
   - 只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
 - `certificate`（0.7.0）：這台主機最新一張由 Kairos 簽發的憑證的摘要 `{"state", "not_after", "revoked_at"}`，`state` 為 `valid`、`expiring`（30 天內到期）、`expired`、`revoked`；沒有簽發紀錄（手動配置的憑證）時為 `null`。只需要 `hosts:read`（設計包 S05：唯讀角色也看得到「有效，至 2028-01-12」）；序號、指紋與簽發方式需要 `pki:read`，見 `GET /api/v1/pki/certificates?agent_id=`（第 11.5 節）。
@@ -359,7 +359,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 ] } }
 ```
 
-0.8.0〔草稿〕：`kind`（`gauge`／`counter`）、`standard`（是否為標準指標，名稱與單位都相符）。掛載點有總容量與可用空間、但沒有使用率時（Pulse 0.2.0～0.7.0），另列出 `derived: "estimated"` 的使用率（趨勢可以查詢）。
+0.8.0：`kind`（`gauge`／`counter`）、`standard`（是否為標準指標，名稱與單位都相符）。掛載點有總容量與可用空間、但沒有使用率時（Pulse 0.2.0～0.7.0），另列出 `derived: "estimated"` 的使用率（趨勢可以查詢）。
 
 ### 5.3 `GET /api/v1/hosts/{agent_id}/metrics/{name}`
 
@@ -375,7 +375,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `resolution` | `auto`（預設）、`raw`、`5m`、`1h` |
 | `max_points` | 每條序列最多幾個點，10～5000，預設 1000 |
 | `label.<key>` | 只取 label 相符的序列（可重複，例：`label.mountpoint=/`） |
-| `transform` | 計數器（`kind: "counter"`）的呈現（0.8.0〔草稿〕）：`rate`（預設，每秒速率，單位 `<原單位>/s`）、`none`（原始累計值，只有原始資料；`resolution` 為 `5m`／`1h` 時 400 `invalid_parameter`）。量測值忽略。其他值 400 |
+| `transform` | 計數器（`kind: "counter"`）的呈現（0.8.0）：`rate`（預設，每秒速率，單位 `<原單位>/s`）、`none`（原始累計值，只有原始資料；`resolution` 為 `5m`／`1h` 時 400 `invalid_parameter`）。量測值忽略。其他值 400 |
 
 - **解析度（`auto`）**：依序選第一個同時滿足兩個條件的：(1) `from` 在該層的保留期限內（`storage.raw_retention_days`、`rollup_5m_retention_days`、`rollup_1h_retention_days`，與保留清除相同的「今天與前 N 天」）；(2) 預估點數不超過 `max_points`（原始資料以這台主機宣告的 report 間隔估算，沒有宣告時 5 秒）。都不滿足時用 1 小時彙總。預設下：1 小時 → 原始資料（720 點）、24 小時 → 5 分鐘（288 點）、7 天 → 1 小時（168 點）、30 天 → 1 小時（720 點）。設計包 S05「解析度依範圍」。
 - **點數上限**：結果超過 `max_points` 時，把相鄰的點依時間合併成較大的桶（min 取最小、max 取最大、avg 以 count 加權、count 相加），`bucket_secs` 為合併後的桶長。指定 `resolution=raw` 查 7 天也不會回傳 12 萬個點。
@@ -384,9 +384,9 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - **最新的桶**：5 分鐘／1 小時彙總在桶結束約 15 秒後才寫入資料庫（STORAGE.md 第 7 節）；尚未寫入的部分（主機的 `rollup_until` 之後）由原始資料即時計算，趨勢的最右端不會缺。
 - **時間**：durable 的資料以 Pulse 的取樣時間（`ts`）排列，補送的資料會補進過去的空缺（STORAGE.md 第 5.2 節）。
 - 超過所有保留期限的範圍：`from` 調到 1 小時彙總保留的起點，`notes` 寫明（設計包 S05「只保留最近 400 天的 1 小時彙總」）。指定的解析度在查詢範圍的一部分沒有資料（超過該層的保留期限）時，`notes` 寫出該層的保留天數。範圍最長 3,660 天。
-- **計數器（0.8.0〔草稿〕，行為變更）**：網路、磁碟 I/O 等計數器（METRICS.md 第 3 節）預設回傳**每秒速率**（`transform=rate`）：彙總中為 Kairos 寫入時算出的速率序列（`series.derived = 1`），原始資料與尚未彙總的部分以相鄰兩筆即時計算（第一個點以查詢範圍前最近的一筆為起點）。重置、`system.uptime` 變小（重新開機）、時間沒有前進時該段沒有點（缺口，不補 0）。0.7.0 回傳累計值（主控台沒有使用，API 為草稿）；需要累計值時用 `transform=none`。v8 起計數器的累計值不再彙總，v7 以前寫入的累計值彙總保留到保留期限自然刪除。
-- **推算的使用率（0.8.0〔草稿〕）**：`system.filesystem.usage` 在沒有 Pulse 送的值時，以同一個掛載點的 `(total − available) ÷ total × 100` 推算（Pulse 0.2.0～0.7.0；把保留給 root 的空間算成已使用）。序列帶 `derived: "estimated"`（全部為推算值時），每個推算的點帶 `estimated: true`；同一個桶有實際值時以實際值為準。
-- **序列只列出這台主機的**（0.8.0〔草稿〕）：依 `host_series`（STORAGE.md 第 15 節）；0.7.0 會列出所有主機用過的同名序列（其他主機的為空的 `points`）。
+- **計數器（0.8.0，行為變更）**：網路、磁碟 I/O 等計數器（METRICS.md 第 3 節）預設回傳**每秒速率**（`transform=rate`）：彙總中為 Kairos 寫入時算出的速率序列（`series.derived = 1`），原始資料與尚未彙總的部分以相鄰兩筆即時計算（第一個點以查詢範圍前最近的一筆為起點）。重置、`system.uptime` 變小（重新開機）、時間沒有前進時該段沒有點（缺口，不補 0）。0.7.0 回傳累計值（主控台沒有使用，API 為草稿）；需要累計值時用 `transform=none`。v8 起計數器的累計值不再彙總，v7 以前寫入的累計值彙總保留到保留期限自然刪除。
+- **推算的使用率（0.8.0）**：`system.filesystem.usage` 在沒有 Pulse 送的值時，以同一個掛載點的 `(total − available) ÷ total × 100` 推算（Pulse 0.2.0～0.7.0；把保留給 root 的空間算成已使用）。序列帶 `derived: "estimated"`（全部為推算值時），每個推算的點帶 `estimated: true`；同一個桶有實際值時以實際值為準。
+- **序列只列出這台主機的**（0.8.0）：依 `host_series`（STORAGE.md 第 15 節）；0.7.0 會列出所有主機用過的同名序列（其他主機的為空的 `points`）。
 - 每條序列另帶 `kind`，衍生的序列帶 `derived`（`rate`／`estimated`）；`data` 另帶 `kind` 與 `transform`（計數器時）。
 - 404 `metric_not_found`：Kairos 從未收過這個名稱的指標（任何主機）。主機有這個指標、但查詢範圍內沒有資料時回 200、`points` 為空陣列；剛上線、第一筆 report 尚未寫入的主機回 200、`series` 為空陣列。
 
@@ -431,7 +431,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 
 - `total`：清冊中的主機數（以清冊為準，重新啟動後不會變少；設計包 S03）。
 - `online_series`：每分鐘的上線數（設計包 §24 #5「伺服器每分鐘彙總一次上線數，不從 report 推算」），最近 24 小時；保存在記憶體中，**Kairos 重新啟動後從頭累積**。`change_1h`：與 1 小時前的差（還沒有 1 小時前的資料時為 `null`）。
-- `longest_offline`：離線最久的 5 台；`top_cpu`、`top_memory`：線上主機中使用率最高的 10 台（最近一次 report）。`top_disk`（0.8.0〔草稿〕，S03 區塊 F「磁碟」）：依每台主機使用率最高的掛載點排序的前 10 台；每個項目（含其他清單）另帶 `disk`。
+- `longest_offline`：離線最久的 5 台；`top_cpu`、`top_memory`：線上主機中使用率最高的 10 台（最近一次 report）。`top_disk`（0.8.0，S03 區塊 F「磁碟」）：依每台主機使用率最高的掛載點排序的前 10 台；每個項目（含其他清單）另帶 `disk`。
 - `health`：第 5.5 節的整體狀態與非正常的項目（總覽的健康條）。
 
 ### 5.5 `GET /api/v1/system/health`
@@ -518,7 +518,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - 由狀態表的變化累積（與 SSE 的 `host.*` 同一個來源），新到舊，每台主機最多 50 筆、最多 2 萬台（超過時捨棄最久沒有變化的主機）。**只在記憶體中**：`since` 為 Kairos 這次啟動的時間，重新啟動後從頭記錄（`persisted: false`）。
 - `reason` 為第 5.2 節的 `offline_reason`（新名稱；這個端點 0.7 才新增，不帶 `*_legacy`）。每次連線的建立時間、來源連接埠、持續時間與協定錯誤碼的完整、持久的連線紀錄（設計包 §24 #2）屬於之後的版本。
 
-### 5.9 資產（0.8.0〔草稿〕）
+### 5.9 資產（0.8.0）
 
 [`METRICS.md`](../crates/kairos-proto/METRICS.md) 第 6、9.3、10.2 節。權限 `hosts:read`（群組範圍外的主機回 404 `host_not_found`，與其他主機端點相同；不新增權限，D2）。只接受 `GET`。查詢資產不寫稽核紀錄。
 
@@ -553,7 +553,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - **IPv6 暫時位址**：介面位址的比較中，IPv6 的非 link-local 位址只比較所在的 /64 前綴，同一個前綴內的隱私位址輪換不寫入歷史（目前的資產仍是實際的位址）。換網段、IPv4、link-local 的變化照常記錄。
 - 保留 400 天（`storage.rollup_1h_retention_days`），每台主機最多 1,000 筆。
 
-### 5.10 行程排行（0.8.0〔草稿〕）
+### 5.10 行程排行（0.8.0）
 
 `GET /api/v1/hosts/{agent_id}/processes?at=2026-10-20T03:00:00Z`（`at` 省略為現在）：時間不晚於 `at` 的最近一筆快照（METRICS.md 第 5、9.4 節）。權限 `hosts:read`，同第 5.9 節。
 
@@ -686,14 +686,14 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 **本版的限制**
 
 - 只有唯讀端點；主機的顯示名稱、群組、標籤、除役、撤銷等寫入操作屬於之後的版本（需要 RBAC 與稽核雜湊鏈）。
-- 使用者、角色、工作階段、LDAP 與稽核雜湊鏈：0.6.0〔草稿〕，第 12 節（延後項目見第 12.11 節）。
+- 使用者、角色、工作階段、LDAP 與稽核雜湊鏈：0.6.0，第 12 節（延後項目見第 12.11 節）。
 - 主機狀態只有 `online`、`offline`、`unknown`；`critical`、`warning`（告警，F3）、`pending`（註冊，F5）的計數為 `null`。
 - 離線原因只有 Kairos 這次啟動後發生的（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；0.7 起與 Webhook、`/metrics` 相同，舊名稱見第 5.2 節），不寫入清冊，重新啟動後為 `null`；設計包 #2 的完整分類與每台主機的連線紀錄屬於之後的版本。
 - 每分鐘的上線數（總覽的 24 小時 sparkline、「比 1 小時前」）只在記憶體中，重新啟動後從頭累積。
 - SSE 的事件只保留在記憶體中（4,096 則）；重新啟動後一律要求重新抓取。
 - 系統健康的「被拒的連線」是啟動以來的累計，不是設計包 S20 的「過去 1 小時」。
 - 主控台的設定（`[console]`）需要重新啟動才生效（憑證檔的內容會熱重載）。
-- 網頁介面：0.7.0〔草稿〕起由主控台的監聽提供（第 14 節）；0.6 以前只有 API。
+- 網頁介面：0.7.0 起由主控台的監聽提供（第 14 節）；0.6 以前只有 API。
 
 **延後項目**
 
@@ -718,9 +718,9 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 1. **連接埠被佔用的代碼**：設計包 §26.1 #2 核准主控台埠被佔用時為 `KRS-E2001`（結束代碼 11），但目前 agent 連接埠與主控台連接埠的「無法監聽…」訊息都還沒有帶代碼，待補。
 2. **主機詳情是否顯示「支援補送」**（`decisions/INTEGRATION.md` §25.8 #6）：API 已提供 `durable`、`replaying`、`connection.last_backfill_*`，畫面是否呈現由設計決定。
 
-## 11. 衝刺 4：註冊與 PKI 的管理端點（草稿）
+## 11. 衝刺 4：註冊與 PKI 的管理端點
 
-0.5.0〔草稿〕，**已實作**（`kairos/src/api/enroll.rs`、`kairos/src/enroll_cli.rs`；與本節不同之處見第 11.8、11.9 節）。8444 的協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，資料表與簽發流程見 [`PKI.md`](PKI.md)。本節的端點是主控台 S12（註冊 token）、S13（待核准）、S14（憑證）、S15（CA 與 CRL）、S21（註冊端點模式）的後端（設計包 §24 #6、#7、#16 (d)）。實作時同步更新第 1 節（方法）、第 4 節（範圍）、第 5 節（端點一覽）與第 10 節。
+0.5.0，**已實作**（`kairos/src/api/enroll.rs`、`kairos/src/enroll_cli.rs`；與本節不同之處見第 11.8、11.9 節）。8444 的協定見 [`crates/kairos-proto/ENROLL.md`](../crates/kairos-proto/ENROLL.md)，資料表與簽發流程見 [`PKI.md`](PKI.md)。本節的端點是主控台 S12（註冊 token）、S13（待核准）、S14（憑證）、S15（CA 與 CRL）、S21（註冊端點模式）的後端（設計包 §24 #6、#7、#16 (d)）。實作時同步更新第 1 節（方法）、第 4 節（範圍）、第 5 節（端點一覽）與第 10 節。
 
 ### 11.1 寫入權限：範圍與 `Permission`
 
@@ -919,7 +919,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 - 列表（token、申請、憑證）以 `limit`（1～1,000，預設 100）回傳前 N 筆與 `page.total`，`page.next_cursor` 一律為 `null`；游標分頁之後加入。
 - 未實作：`POST /api/v1/pki/crl`（上傳 CRL）、`GET /api/v1/pki/revocations/export`（離線模式的 CRL 工具，PKI.md 第 13 節）。
 - token 的 JSON 有 `hint` 與 `token_hint`（相同的值，只有前 4 碼 `KRT1-XXXX…`）；建立時另有完整的 `token`（只出現這一次）、`install_string`、`ca_pin`、`ca_pin_display`、`agent_endpoint`、`enroll_endpoint`、`enroll_mode`、`auto_pause_cleared`、`downloads`。
-- 憑證（列表與 `GET /api/v1/pki/certificates/{serial}`）另有 `hostname`（主機清冊的主機名稱；主機還沒連上 agent 連接埠時為申請的主機名稱）與 `group`（主機群組，沒有時 `null`），主控台 S14 的「主機」「群組」欄（0.7.0〔草稿〕）。`q` 比對序號（片段，不分大小寫）、`agent_id` 前綴與主機名稱（片段，不分大小寫）。
+- 憑證（列表與 `GET /api/v1/pki/certificates/{serial}`）另有 `hostname`（主機清冊的主機名稱；主機還沒連上 agent 連接埠時為申請的主機名稱）與 `group`（主機群組，沒有時 `null`），主控台 S14 的「主機」「群組」欄（0.7.0）。`q` 比對序號（片段，不分大小寫）、`agent_id` 前綴與主機名稱（片段，不分大小寫）。
 - 拒絕、撤銷的 L2 確認以 `expected_count` 進行；切換到 `closed` 一律需要 `impact_token`（L2 時另需 `reason`）。
 
 ### 11.9 CLI 與第 11.6 節的差異
@@ -928,7 +928,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 - `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
 - 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
 
-## 12. 使用者、角色、工作階段與稽核（0.6.0〔草稿〕）
+## 12. 使用者、角色、工作階段與稽核（0.6.0）
 
 衝刺 5，**已實作**（審計 F6、S7 的雜湊鏈部分；設計包 `kairos/screens.md` S01、S16、S17、S18、S23、§24 #10、#11、`README.md` D25）。程式：`kairos/src/rbac.rs`（權限的集中定義）、`kairos/src/users/`（密碼、TOTP、主控台金鑰、資料表、LDAP）、`kairos/src/audit.rs`（雜湊鏈）、`kairos/src/api/{auth,account,users,audit_log}.rs`、`kairos/src/users_cli.rs`、`kairos/src/audit_cli.rs`。資料庫為 **schema v6**（第 12.10 節）。
 
@@ -1108,7 +1108,7 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
 - 0.5 寫入的紀錄（沒有雜湊）在升級後**第一次**寫入或驗證時依 id 順序補上，並記在 `meta.audit_legacy_sealed`；之後每次寫入只計算它自己那一筆。繞過程式直接插入資料庫、沒有雜湊的紀錄不會被下一次寫入接進鏈中，驗證時以 `missing_hash` 指出。
 - 驗證在同一個讀取交易（同一個快照）中進行，驗證期間的寫入不會造成假的斷點。
 - 被拒絕的寫入請求（`access.denied`）同一個執行者每分鐘最多記 20 筆，超過的筆數併入下一筆的 `details.suppressed_since_last`（避免低權限的身分以大量請求灌爆稽核表）。
-- **HMAC（0.7〔草稿〕，schema v7）**：雜湊鏈本身沒有秘密，能改寫資料庫檔的人可以重新計算整條鏈。0.7 起每筆另有 `hmac = HMAC-SHA256(K, "kairos-audit-record/v1\n" ‖ hash)`（小寫十六進位），`K = HMAC-SHA256(金鑰檔, "kairos-audit-hmac/v1")`；金鑰檔是資料目錄的 `audit-hmac.key`（32 bytes，0600），**與 `console.key` 分開**（交給外部稽核者驗證 HMAC 時不必同時交出 CSRF／TOTP 的金鑰；遺失或輪替 `console.key` 也不影響稽核鏈）。金鑰檔只由 Kairos 服務在啟動時建立，CLI 只讀取。`meta.audit_chain_head` 另帶 `mac`。
+- **HMAC（0.7，schema v7）**：雜湊鏈本身沒有秘密，能改寫資料庫檔的人可以重新計算整條鏈。0.7 起每筆另有 `hmac = HMAC-SHA256(K, "kairos-audit-record/v1\n" ‖ hash)`（小寫十六進位），`K = HMAC-SHA256(金鑰檔, "kairos-audit-hmac/v1")`；金鑰檔是資料目錄的 `audit-hmac.key`（32 bytes，0600），**與 `console.key` 分開**（交給外部稽核者驗證 HMAC 時不必同時交出 CSRF／TOTP 的金鑰；遺失或輪替 `console.key` 也不影響稽核鏈）。金鑰檔只由 Kairos 服務在啟動時建立，CLI 只讀取。`meta.audit_chain_head` 另帶 `mac`。
   - **升級的邊界**：服務第一次以 0.7 啟動、建立金鑰後寫入的第一筆記在 `meta.audit_hmac`（`since_id`、`key_id`）。之前的紀錄（0.6 以前，或服務啟動前由 CLI 寫入的）只有雜湊鏈；`kairos audit verify` 與 API 的 `hmac` 物件寫出邊界（`since_id`、`chain_only` 筆數、`verified` 筆數）。
   - 新的斷點原因：`missing_hmac`（起點之後沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被重新計算）、`hmac_boundary_mismatch`（起點被移動）、`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與起點記錄的 `key_id` 不同；不會以新的金鑰「接續」簽下去）。都是 `KRS-E6201`。
   - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
@@ -1201,9 +1201,9 @@ retention_days = 1095           # 稽核紀錄保留天數，90..=36500（獨立
 | 使用者權限清冊 CSV（S16 稽核員匯出） | `GET /api/v1/users` 的 JSON 已有相同內容 |
 | 個人的 API token（S23「我的 API token」） | 本版由管理員以 `owner` 建立 |
 
-## 13. 衝刺 5：告警（草稿）
+## 13. 衝刺 5：告警
 
-0.6.0〔草稿〕，**已實作**（`kairos/src/api/alerts.rs`；引擎見 [`ALERTS.md`](ALERTS.md)）。設計包 S06～S11、§24 #9。需要告警引擎（`[alerts] enabled = true`、SQLite），沒有啟動時所有端點回 503 `alerts_unavailable`。
+0.6.0，**已實作**（`kairos/src/api/alerts.rs`；引擎見 [`ALERTS.md`](ALERTS.md)）。設計包 S06～S11、§24 #9。需要告警引擎（`[alerts] enabled = true`、SQLite），沒有啟動時所有端點回 503 `alerts_unavailable`。
 
 ### 13.1 權限（集中標記）與角色
 
@@ -1301,13 +1301,13 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 `POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
 
-**限速（0.7〔草稿〕）**：測試通知會真的送到值班群組或信箱。同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含 `POST /api/v1/channels/test` 的未儲存管道）。超過時回 429 `rate_limited`（`KRS-W5111`）、`Retry-After`，`details`：`scope`（`channel`／`user`）、`limit`、`window_secs`；不送出、不寫發送紀錄。計數只在記憶體中（重新啟動後歸零）。
+**限速（0.7）**：測試通知會真的送到值班群組或信箱。同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含 `POST /api/v1/channels/test` 的未儲存管道）。超過時回 429 `rate_limited`（`KRS-W5111`）、`Retry-After`，`details`：`scope`（`channel`／`user`）、`limit`、`window_secs`；不送出、不寫發送紀錄。計數只在記憶體中（重新啟動後歸零）。
 
 ### 13.6 即時推送（SSE）
 
 第 6 節的 `/api/v1/events` 另有 `alert.created`、`alert.updated`、`alert.resolved`（`data` 為事件的摘要，欄位同第 13.2 節但沒有 `details`），編號與重連規則相同。只有內容（數值、台數）改變時不推送，最多每 60 秒寫回一次。
 
-## 14. 網頁介面與安全標頭（0.7.0〔草稿〕）
+## 14. 網頁介面與安全標頭（0.7.0）
 
 主控台的監聽同時提供網頁介面（審計 F2；實作 `kairos/src/api/web.rs`，前端與慣例見 [`web/README.md`](web/README.md)）。網頁的檔案在編譯時嵌入執行檔（`kairos/build.rs`，依路徑排序、內容只取決於檔案本身，不影響可重現性），不讀取檔案系統。
 

@@ -56,7 +56,7 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 3. 刪除 `dist/` 中舊的 `kairos-*`、`pulse-*`、`SHA256SUMS*`，打包兩個產品（`kairos/packaging/build-release.sh`、`pulse/packaging/build-release.sh`，共用實作 `packaging/build-release-common.sh`）。
 4. 以 `packaging/sign-release.sh` 簽署合併版 `SHA256SUMS`，並以 `<私鑰>.pub` 驗證剛產生的簽章。
 
-產出（`dist/`；0.8.0〔草稿〕起）：
+產出（`dist/`；0.8.0 起）：
 
 | 檔案 | 說明 |
 |---|---|

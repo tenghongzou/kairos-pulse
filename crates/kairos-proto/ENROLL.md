@@ -2,7 +2,7 @@
 
 本文件是 Pulse ↔ Kairos **註冊通道**的唯一規格，位於 monorepo 的 `crates/kairos-proto/ENROLL.md`，與 agent 長連線的 [`PROTOCOL.md`](PROTOCOL.md) 並列。兩邊共用的型別與純函式在 `kairos-proto` 的 `enroll` 模組；該模組的單元測試以 `include_str!` 讀入本文件，從「範例」節解析每一則請求與回應、從「錯誤碼」節比對對照表、從「測試向量」節比對簽章內容與雜湊。改協定時改這裡與 `enroll` 模組即可。
 
-- 狀態：**衝刺 4 規格（0.5.0〔草稿〕）**。共用型別已完成；Kairos 端與 Pulse 端尚未實作（分工見第 19 節）。
+- 狀態：**衝刺 4 規格（0.5.0）**。共用型別已完成；Kairos 端與 Pulse 端尚未實作（分工見第 19 節）。
 - Kairos 內部的 PKI、簽發、資料表見 [`kairos/PKI.md`](../../kairos/PKI.md)；主控台的管理端點與 CLI 見 [`kairos/API.md`](../../kairos/API.md) 第 11 節。
 - 設計依據（設計包，唯讀）：`pulse/enrollment-ux.md` §3～§12、`kairos/screens.md` S12～S15 與 §24 #6、#7、#16、#20、#21、#23、`decisions/enroll-rate-limit.md`（D7）、`decisions/enroll-pause.md`（D8、D10、D11）、`decisions/naming.md`、`decisions/INTEGRATION.md` §2、§17、§18、§23、§24、`design-system/copywriting.md` §3.3、§3.4。本文件與設計包不同之處列在第 17 節，**以本文件為準**。
 
