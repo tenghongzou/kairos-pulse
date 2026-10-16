@@ -367,18 +367,23 @@ impl Client {
     }
 
     async fn connect_with(connector: &TlsConnector, addr: SocketAddr) -> Self {
-        let tcp = TcpStream::connect(addr).await.unwrap();
+        Self::try_connect_with(connector, addr).await.unwrap()
+    }
+
+    /// 連線與 TLS 握手；失敗時回傳錯誤（伺服器拒絕超過上限的連線時，Linux 多半是 EOF、
+    /// Windows 則常是 RST（os error 10054），呼叫端重試即可）
+    async fn try_connect_with(connector: &TlsConnector, addr: SocketAddr) -> std::io::Result<Self> {
+        let tcp = TcpStream::connect(addr).await?;
         let tls = connector
             .connect(ServerName::try_from("localhost").unwrap(), tcp)
-            .await
-            .unwrap();
+            .await?;
         let handshake = tls.get_ref().1.handshake_kind();
         let (r, w) = tokio::io::split(tls);
-        Self {
+        Ok(Self {
             lines: BufReader::new(r).lines(),
             writer: w,
             handshake,
-        }
+        })
     }
 
     async fn send_raw(&mut self, bytes: &[u8]) {
@@ -753,11 +758,18 @@ async fn reconnecting_does_not_get_a_fresh_report_allowance() {
     drop(c);
     // 等伺服器端釋放名額（每 IP 上限 1）後重新連線
     let mut c = None;
+    let tls = connector(None);
     for _ in 0..100 {
-        let mut candidate = Client::connect(server.addr).await;
-        candidate.send(&hello(1, ID, 1000)).await;
-        if let Ok(Ok(Some(line))) =
-            tokio::time::timeout(Duration::from_secs(2), candidate.lines.next_line()).await
+        // 名額尚未釋放時伺服器直接關閉連線：握手或寫入失敗都視為這一次不成功，稍後重試
+        if let Ok(mut candidate) = Client::try_connect_with(&tls, server.addr).await
+            && candidate
+                .writer
+                .write_all(format!("{}\n", hello(1, ID, 1000)).as_bytes())
+                .await
+                .is_ok()
+            && candidate.writer.flush().await.is_ok()
+            && let Ok(Ok(Some(line))) =
+                tokio::time::timeout(Duration::from_secs(2), candidate.lines.next_line()).await
             && line.contains("hello_ack")
         {
             c = Some(candidate);

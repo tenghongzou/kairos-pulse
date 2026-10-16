@@ -498,8 +498,16 @@ fn opening_fails_when_the_data_dir_is_unusable_and_writes_report_failure() {
     o.path = not_dir.join(DB_FILE);
     let err = SqliteStore::open(o, noon).unwrap_err();
     assert!(err.to_string().contains("無法建立資料目錄"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
 
+// 只在 Unix 執行：執行中刪除資料目錄需要 Unix 的語意（開啟中的檔案可以刪除）。Windows 上背景
+// checkpoint 連線仍開著資料庫檔，刪除會得到 os error 32；Kairos 伺服器只支援 Linux（CHANGELOG 支援期限）
+#[cfg(unix)]
+#[test]
+fn data_dir_replaced_by_a_file_while_running_fails_the_batch_then_recovers() {
     // 執行中資料目錄被換成檔案：這一批確定未寫入；恢復後繼續
+    let dir = temp_dir("unusable-running");
     let data = dir.join("data");
     let (mut store, _) = open(&data, noon);
     assert_eq!(

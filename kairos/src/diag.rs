@@ -1319,10 +1319,12 @@ mod tests {
 
     fn write_config(dir: &Path, extra: &str) -> PathBuf {
         let p = dir.join("kairos.toml");
+        // TOML 基本字串中的反斜線是跳脫字元：Windows 路徑一律改成正斜線
+        let manifest = MANIFEST.replace('\\', "/");
         std::fs::write(
             &p,
             format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert_path = \"{MANIFEST}/testdata/pki/server.crt\"\nkey_path = \"{MANIFEST}/testdata/pki/server.key\"\n\n[storage]\ndata_dir = \"{}\"\n\n[console]\nenabled = false\n{extra}",
+                "[server]\nlisten = \"127.0.0.1:0\"\ncert_path = \"{manifest}/testdata/pki/server.crt\"\nkey_path = \"{manifest}/testdata/pki/server.key\"\n\n[storage]\ndata_dir = \"{}\"\n\n[console]\nenabled = false\n{extra}",
                 dir.join("data").display().to_string().replace('\\', "/")
             ),
         )

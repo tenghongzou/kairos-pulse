@@ -280,6 +280,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         log_anchor(&db).await;
+        drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

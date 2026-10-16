@@ -1337,6 +1337,7 @@ mod tests {
             !raw.contains("correct horse") && !raw.contains(&pw),
             "稽核不應含密碼"
         );
+        drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

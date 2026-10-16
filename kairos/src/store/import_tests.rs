@@ -361,6 +361,7 @@ fn durable_lines_use_the_sample_time_and_keep_the_dedup_key() {
     }
     let (mut store, _) = SqliteStore::open(opts(&dir), clock).unwrap();
     assert_eq!(store.write_batch(&[r]), [WriteStatus::Duplicate]);
+    drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

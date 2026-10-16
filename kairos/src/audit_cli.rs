@@ -605,6 +605,7 @@ mod tests {
         };
         assert_eq!(execute(&ex, Utc::now(), tz, false).exit, EXIT_CONFLICT);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
+        drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

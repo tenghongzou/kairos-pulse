@@ -499,10 +499,10 @@ async fn manual_enrollment_is_approved_and_delivered_with_the_pinned_ca() {
     assert_eq!(cert.dns_sans, vec![a.id.clone()]);
     assert_eq!(cert.spki_der, a.key.subject_public_key_info());
     assert_eq!(cert.serial, v["certificate"]["serial"].as_str().unwrap());
-    // ca_pem 是被釘選的根 CA
+    // ca_pem 是被釘選的根 CA（Kairos 以 LF 重新編碼；rcgen 的 pem() 在 Windows 上用 CRLF，比較前統一換行）
     assert_eq!(
         v["certificate"]["ca_pem"].as_str().unwrap().trim(),
-        env.root.pem.trim()
+        env.root.pem.replace("\r\n", "\n").trim()
     );
     // 憑證由 Kairos 的簽發 CA 簽發；8443 的 mTLS 綁定接受
     let der = pem_decode_all(v["certificate"]["client_cert_pem"].as_str().unwrap(), None)

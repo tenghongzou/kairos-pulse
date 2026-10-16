@@ -1387,6 +1387,7 @@ mod tests {
         let c = counts(&conn).unwrap();
         assert_eq!(c["active"], 4);
         assert_eq!(c["active_by_severity"]["critical"], 2);
+        drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1454,6 +1455,7 @@ mod tests {
         assert!(left.contains(&"E-open".to_string()));
         assert_eq!(left.len(), 5);
         assert!(left.contains(&"E-new-9".to_string()), "{left:?}");
+        drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1469,6 +1471,7 @@ mod tests {
         finish_action(&conn, id, 6, &json!({"ok": true})).unwrap();
         assert!(pending_actions(&conn).unwrap().is_empty());
         assert_eq!(action_result(&conn, id).unwrap(), Some(json!({"ok": true})));
+        drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
