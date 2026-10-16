@@ -905,6 +905,27 @@ pub async fn handle_connection(
             .await?;
             return Ok(());
         }
+        // 外部 CA 簽發、匯入簽發紀錄後在 Kairos 撤銷的憑證：Kairos 不產生它們的 CRL，hello 時拒絕
+        if let Some(serial) = conn.client_serial()
+            && svc.is_revoked_external(&serial)
+        {
+            throttled!(
+                ctx.throttle,
+                (Category::CertificateRevoked, peer.ip()),
+                warn,
+                "[#{}] 警告 KRS-W1105：agent {} 的憑證 {} 已在 Kairos 撤銷（外部 CA 簽發、匯入的憑證），拒絕 hello",
+                conn_id,
+                agent.agent_id,
+                serial
+            );
+            conn.reply(ServerMsg::error(
+                Some(agent.hello_seq),
+                ErrorCode::CertificateRejected,
+                MSG_CERTIFICATE_REJECTED,
+            ))
+            .await?;
+            return Ok(());
+        }
         if let Some(serial) = conn.client_serial() {
             crate::enroll::agent::on_hello(&svc, &agent.agent_id, &serial);
         }

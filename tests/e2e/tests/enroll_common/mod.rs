@@ -96,6 +96,22 @@ impl Pki {
             .pem()
     }
 
+    /// 以根 CA 直接簽發用戶端憑證（手動簽發的既有部署：INSTALL 舊版以 openssl 的 client_ext 範本）
+    pub fn sign_client(&self, agent_id: &str, key: &KeyPair) -> String {
+        let mut p = CertificateParams::new(vec![agent_id.to_string()]).unwrap();
+        p.distinguished_name = DistinguishedName::new();
+        p.distinguished_name.push(DnType::CommonName, agent_id);
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.is_ca = IsCa::ExplicitNoCa;
+        let now = now_ms() / 1000;
+        p.not_before = t(now - 3600);
+        p.not_after = t(now + 365 * 86_400);
+        p.signed_by(key, &Issuer::from_params(&self.params, &self.key))
+            .unwrap()
+            .pem()
+    }
+
     pub fn roots(&self) -> rustls::RootCertStore {
         let mut roots = rustls::RootCertStore::empty();
         for c in CertificateDer::pem_slice_iter(self.pem.as_bytes()) {

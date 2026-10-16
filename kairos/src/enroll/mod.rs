@@ -173,6 +173,9 @@ pub struct EnrollService {
     last_expiry_warning: Mutex<i64>,
     /// 個資政策（`[privacy]`）：註冊申請的主機名稱與顯示名稱
     pub privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// 已撤銷（生效）、由外部 CA 簽發而匯入的憑證序號（Kairos 不產生它們的 CRL：8443 在 hello 時拒絕；
+    /// 每 [`TICK`] 由資料庫更新）
+    revoked_external: RwLock<HashSet<String>>,
 }
 
 /// 各層的限流狀態
@@ -339,7 +342,9 @@ impl EnrollService {
                 p.config.privacy,
                 &p.data_dir,
             )),
+            revoked_external: RwLock::new(HashSet::new()),
         });
+        svc.refresh_revoked_external(now);
         // 簽發 CA、信任錨與 CRL：啟動時同步一次（8443 的 TLS 驗證器需要它們）
         svc.sync_pki(now, true);
         svc.evaluate_pause(now);
@@ -479,6 +484,38 @@ impl EnrollService {
     }
 
     // ---- 除役 ----
+
+    /// 這張（外部 CA 簽發、匯入的）憑證是否已撤銷：8443 在 hello 時拒絕（PKI.md 第 16 節）
+    pub fn is_revoked_external(&self, serial: &str) -> bool {
+        self.revoked_external
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(serial)
+    }
+
+    /// 從資料庫更新 [`EnrollService::is_revoked_external`] 的清單（撤銷已生效、憑證過期未超過 1 天）
+    fn refresh_revoked_external(&self, now: i64) {
+        let r = self.db.read_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT serial FROM pki_certificates WHERE ca_id IS NULL AND revoked_at IS NOT NULL
+                 AND revoke_effective_at <= ?1 AND not_after > ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![now, now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS],
+                |r| r.get::<_, String>(0),
+            )?;
+            Ok(rows.collect::<rusqlite::Result<HashSet<String>>>()?)
+        });
+        match r {
+            Ok(set) => {
+                *self
+                    .revoked_external
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = set;
+            }
+            Err(e) => debug!("無法讀取匯入憑證的撤銷清單（沿用目前的清單）：{e}"),
+        }
+    }
 
     pub fn is_decommissioned(&self, agent_id: &str) -> bool {
         self.decommissioned
@@ -918,6 +955,7 @@ impl EnrollService {
                 this.evaluate_pause(now);
                 this.issue_pending(now);
                 this.sync_pki(now, false);
+                this.refresh_revoked_external(now);
                 this.notify_external_changes();
                 this.periodic(now);
             })

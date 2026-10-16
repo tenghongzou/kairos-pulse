@@ -1562,7 +1562,10 @@ fn grace_in_tx(
     }
     // 13. 寬限期
     let grace_days = eff.policy.expired_renew_grace_days;
-    let grace_end = old.not_after_ms + i64::from(grace_days) * 86_400_000;
+    let grace_ms = crate::testhooks::grace_secs()
+        .filter(|_| grace_days > 0)
+        .map_or(i64::from(grace_days) * 86_400_000, |s| s * 1000);
+    let grace_end = old.not_after_ms + grace_ms;
     let overridden = host
         .as_ref()
         .and_then(|h| h.grace_override_until)
