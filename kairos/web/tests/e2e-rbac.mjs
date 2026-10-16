@@ -19,6 +19,8 @@ const PAGES = [
   // [路徑, 頁面標題（可見時）, 可見的角色]
   ['/', '總覽', ['admin', 'operator', 'auditor', 'viewer']],
   ['/hosts', '主機', ['admin', 'operator', 'auditor', 'viewer']],
+  // S05 概覽：頁首的「更多」（匯出個資、刪除主機資料）只有管理員
+  ['/hosts/11111111-1111-4111-8111-000000000001', 'web-01', ['admin', 'operator', 'auditor', 'viewer']],
   // F4：主機詳情的行程與資產資訊（hosts:read；METRICS.md 第 10 節）
   ['/hosts/11111111-1111-4111-8111-000000000001/processes', 'web-01', ['admin', 'operator', 'auditor', 'viewer']],
   ['/hosts/11111111-1111-4111-8111-000000000001/inventory', 'web-01', ['admin', 'operator', 'auditor', 'viewer']],
@@ -78,6 +80,9 @@ const WRITES = [
   ['POST', '/api/v1/pki/crl/regenerate', 'pki.certificates:revoke'],
   ['POST', '/api/v1/pki/grace-overrides', 'pki.grace:override'],
   ['POST', '/api/v1/pki/signing-queue/import', 'pki.queue:manage'],
+  ['POST', '/api/v1/pki/certificates/import', 'pki.queue:manage'],
+  // 個資（S6）：刪除主機資料只有管理員
+  ['POST', `/api/v1/hosts/${NOBODY}/purge`, 'hosts:purge'],
   ['PUT', '/api/v1/pki/policy', 'pki.policy:write'],
   ['POST', '/api/v1/users', 'users:write'],
   ['PUT', `/api/v1/users/${NOBODY}`, 'users:write'],
@@ -124,7 +129,7 @@ const BUTTON_PERMS = [
   [/^\/certificates\/ca/, /^立即更新 CRL/, 'pki.certificates:revoke'],
   [/^\/certificates/, /^允許再次自動續簽/, 'pki.grace:override'],
   [/^\/certificates/, /^建立限定這些主機的 token/, 'enroll.tokens:write'],
-  [/^\/certificates/, /^(匯出 CSR 佇列|匯入簽發結果)/, 'pki.queue:manage'],
+  [/^\/certificates/, /^(匯出 CSR 佇列|匯入簽發結果|匯入憑證)/, 'pki.queue:manage'],
   // S16 使用者與角色
   [/^\/admin\/(users|roles)/, /^(新增使用者|建立使用者|編輯|停用帳號|啟用帳號|解除鎖定|重設|刪除使用者|移除)/, 'users:write'],
   [/^\/admin\/users/, /^結束所有工作階段/, 'sessions:revoke'],
@@ -147,6 +152,7 @@ const EXPECTED = [
   ['/admin/users', /^新增使用者/, 'users:write'],
   ['/system/settings/security', /^套用模式/, 'enroll.mode:write'],
   ['/system/settings/integrations', /^建立 API token/, 'api_tokens:write'],
+  ['/hosts/11111111-1111-4111-8111-000000000001', /^更多$/, 'hosts:purge'],
 ];
 
 /** 主要內容中看得到的按鈕名稱（含 role="switch" 的開關）；enabled＝可以按的（aria-disabled／disabled 的不算） */

@@ -521,8 +521,42 @@ export function render(ctx) {
     }
   }
 
+  // 手動簽發（外部 CA）的既有憑證匯入簽發紀錄（POST /api/v1/pki/certificates/import；PKI.md 第 16 節）
+  async function importCertificates() {
+    const f = textareaField({ label: t('cert.import.pem'), name: 'pem', rows: 8, mono: true, required: true });
+    const r = await actionDialog({
+      title: t('cert.import.title'),
+      size: 'md',
+      confirmText: t('cert.import.submit'),
+      content: [h('p', null, t('cert.import.body')), f.el],
+      collect: () => {
+        const v = f.input.value.trim();
+        if (!v.includes('BEGIN CERTIFICATE')) {
+          f.el.setError(t('cert.import.empty'));
+          f.input.focus();
+          return null;
+        }
+        f.el.setError('');
+        return { pem: v };
+      },
+      submit: (v) => api('/api/v1/pki/certificates/import', { method: 'POST', body: { certificates: v.pem } }),
+      errorTitle: t('cert.import.failed'),
+    });
+    if (!r || r === true) return;
+    const s = r.summary || {};
+    const bad = (r.results || []).filter((x) => x.result === 'rejected');
+    const text = t('cert.import.done', { ok: fmt.num(s.imported || 0), already: fmt.num(s.already_imported || 0), rejected: fmt.num(s.rejected || 0) });
+    showResult(bad.length ? `${text}：${bad.slice(0, 3).map((x) => t('cert.import.rejected', { source: x.source, reason: x.reason })).join('、')}` : text);
+    toast({ kind: bad.length ? 'warning' : 'success', title: text });
+    reload({ keepResult: true });
+    loadKpis();
+  }
+
   // ---- 載入 ----
-  mount(root, pageHead({ title: t('cert.title') }), kpis, alerts, filterbar, result, bulkbar, listBox);
+  const importBtn = session.can('pki.queue:manage')
+    ? h('button', { type: 'button', class: 'ds-button ds-button--secondary', id: 'cert-import', on: { click: () => importCertificates() } }, icon('upload'), t('cert.import'))
+    : null;
+  mount(root, pageHead({ title: t('cert.title'), actions: importBtn }), kpis, alerts, filterbar, result, bulkbar, listBox);
 
   async function loadKpis() {
     mount(kpis, ['valid', 'expiring', 'revoked', 'revocation_pending', 'crl'].map((k) => kpiSkeleton(t(`cert.kpi.${k}`))));

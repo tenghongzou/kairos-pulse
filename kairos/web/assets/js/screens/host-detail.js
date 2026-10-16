@@ -4,7 +4,7 @@
 // 資產資訊 /hosts/:id/inventory、連線與憑證 /hosts/:id/connection。0.8.0〔草稿〕（F4，設計包 §30）起有行程與
 // 資產資訊（host-processes.js、host-inventory.js），趨勢分為六個指標群組（host-metrics.js）。
 // 隱藏（沒有後端或沒有畫面）：事件（S06／S07 之後）、稽核紀錄（S18 之後）、
-// 編輯顯示名稱、進入維護、除役、撤銷憑證、刪除資料（主機的寫入操作）。
+// 編輯顯示名稱、進入維護、除役、撤銷憑證。0.9 起頁首的「更多」有匯出個資與刪除主機資料（管理員；host-privacy.js）。
 // 斷線紀錄：GET /hosts/{id}/connections（Kairos 這次啟動後的上線與離線，記憶體中）＋24 小時上線時間軸
 // （由回報資料的空缺推算）。憑證：詳情的 certificate 摘要；有 pki:read 時另列序號、指紋與簽發方式。
 
@@ -20,6 +20,7 @@ import { hostName, reasonText, osText, memRatio, isOldPulse, osFamily, oldPulseC
 import { metricsTab } from './host-metrics.js';
 import { processesTab } from './host-processes.js';
 import { inventoryTab } from './host-inventory.js';
+import { hostActions } from './host-privacy.js';
 
 const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection'];
 
@@ -449,6 +450,7 @@ export function render(ctx) {
         pageHead({
           title: name,
           crumbs: [{ text: t('nav.hosts'), href: '/hosts' }, hst.group ? { text: hst.group, href: `/hosts${qs({ group: hst.group })}` } : null, { text: name }].filter(Boolean),
+          actions: hostActions(hst),
         }),
       );
       mount(head, summary(hst));

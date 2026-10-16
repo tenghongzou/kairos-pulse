@@ -19,6 +19,13 @@ printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n
 openssl x509 -req -in "$K2/server.csr" -CA "$K2/root.pem" -CAkey "$K2/root.key" -set_serial 0x1001 -days 365 \
     -sha384 -extfile "$K2/server.ext" -out "$K2/server.pem" 2>/dev/null
 chmod 600 "$K2/root.key" "$K2/server.key"
+# 手動簽發的既有用戶端憑證（根 CA＝auth.client_ca 直接簽發；S14「匯入憑證」的測試，e2e-privacy.mjs）
+MANUAL_ID="7f3c0e4a-1b2c-4d3e-9f00-0000000000b1"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$K2/manual.key" 2>/dev/null
+openssl req -new -key "$K2/manual.key" -subj "/CN=$MANUAL_ID" -out "$K2/manual.csr" 2>/dev/null
+printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=DNS:%s\n' "$MANUAL_ID" >"$K2/manual.ext"
+openssl x509 -req -in "$K2/manual.csr" -CA "$K2/root.pem" -CAkey "$K2/root.key" -set_serial 0x3001 -days 365 \
+    -sha384 -extfile "$K2/manual.ext" -out "$K2/manual.pem" 2>/dev/null
 
 CFG2="$K2/kairos.toml"
 cat >"$CFG2" <<CONF
@@ -46,6 +53,8 @@ listen = "127.0.0.1:$PKI_CONSOLE_PORT"
 mode = "open"
 listen = "127.0.0.1:$PKI_ENROLL_PORT"
 poll_after_base_secs = 5
+# 下載端點：目錄一開始不存在（S12 顯示「不提供下載」）；e2e-privacy.mjs 建立目錄與檔案後顯示一行安裝指令
+download_dir = "$K2/dl"
 
 [pki]
 mode = "online"
@@ -75,4 +84,4 @@ for _ in $(seq 1 100); do
 done
 curl -sk "https://127.0.0.1:$PKI_CONSOLE_PORT/healthz" >/dev/null || { cat "$K2/kairos.out" >&2; exit 1; }
 
-export KAIROS_PKI_URL="https://localhost:$PKI_CONSOLE_PORT" PKI_ENROLL_PORT PKI_DIR="$K2" PKI_LOG="$K2/kairos.out" PULSE_BIN
+export KAIROS_PKI_URL="https://localhost:$PKI_CONSOLE_PORT" PKI_ENROLL_PORT PKI_DIR="$K2" PKI_LOG="$K2/kairos.out" PULSE_BIN MANUAL_ID
