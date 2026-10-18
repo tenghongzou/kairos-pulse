@@ -298,6 +298,12 @@ pub fn peer_ip(peer: &str) -> Option<IpAddr> {
         .map(|a| a.ip().to_canonical())
         .ok()
         .or_else(|| peer.parse::<IpAddr>().ok().map(|ip| ip.to_canonical()))
+        // privacy.store_peer_ip = "truncate"：網段（`10.0.3.0/24`）以網段的位址代表
+        .or_else(|| {
+            peer.split_once('/')
+                .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
+                .map(|ip| ip.to_canonical())
+        })
 }
 
 #[cfg(test)]

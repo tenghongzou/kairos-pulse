@@ -27,6 +27,8 @@ mod monitor;
 mod per_ip;
 mod pki;
 mod pki_cli;
+mod privacy;
+mod privacy_cli;
 mod probe;
 mod protocol;
 mod rate;
@@ -834,7 +836,22 @@ async fn run(
         inventory,
         restored,
         assets,
+        purger,
     } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
+    // 個資政策（[privacy]，kairos/PRIVACY.md）：要求假名化時金鑰檔一定要可用，否則不啟動
+    let privacy = Arc::new(
+        privacy::PrivacyPolicy::for_service(config.privacy, &paths.data_dir).map_err(|e| {
+            error!(
+                event = "privacy.key_unavailable", code = privacy::CODE_KEY_UNAVAILABLE;
+                "錯誤 {}：{e}",
+                privacy::CODE_KEY_UNAVAILABLE
+            );
+            e
+        })?,
+    );
+    if let Some(d) = config.privacy.describe() {
+        info!("個資保護（[privacy]）：{d}");
+    }
 
     let listener = TcpListener::bind(&config.server.listen)
         .await
@@ -1028,6 +1045,7 @@ async fn run(
         report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
         enroll: enroll_service.clone(),
         assets,
+        privacy: privacy.clone(),
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
@@ -1159,6 +1177,7 @@ async fn run(
                 alerts: alert_service.clone(),
                 directory: None,
                 obs: Some(obs.clone()),
+                purger: purger.clone(),
             })
             .await;
             match started {

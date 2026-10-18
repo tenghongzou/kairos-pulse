@@ -2,7 +2,7 @@
 
 本文件是 Kairos 主控台與外部整合使用的查詢與管理 API 的規格（商業審計 F1；設計包 `kairos/screens.md` §24 #1、#3、#4、#5、#19 的後端部分）。0.4.0 起提供第一版：**唯讀**的主機清冊、單台詳情、指標趨勢、總覽 KPI、系統健康與即時變更推送（SSE），以 API token 驗證。0.6.0 起另有使用者、角色（RBAC）、主控台的工作階段與稽核雜湊鏈（設計包 #10、#11、D25；審計 F6），見第 12 節。
 
-- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0 的使用者、角色與稽核見第 12 節，告警（事件、規則、靜音、通知管道）見第 13 節。
+- 設定見第 2 節，驗證見第 4 節，端點一覽見第 5 節；0.5.0 的註冊與 PKI 管理端點見第 11 節，0.6.0 的使用者、角色與稽核見第 12 節，告警（事件、規則、靜音、通知管道）見第 13 節，0.9.0〔草稿〕的個資（刪除主機資料、個資匯出）、手動憑證匯入與下載端點見第 15 節，指標轉出（Prometheus exporter、OTLP）見第 16 節。
 - 實作：`kairos/src/api/`（HTTP 伺服器、驗證、各端點）、`kairos/src/token_cli.rs`（`kairos api-token`）。
 - 量測（1 萬台主機的列表、30 天趨勢、與 report 寫入同時進行時的 `ack` 延遲）見第 9 節：列表 p99 約 10 ms、30 天趨勢 p99 約 8～13 ms（目標 200／300 ms）。
 
@@ -844,6 +844,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | `GET /api/v1/pki/signing-queue` | `read` | 已核准、待簽發的申請（離線模式） |
 | `GET /api/v1/pki/signing-queue/export` | `PkiQueue` | `kairos-csr-queue/v1` 檔案（`PKI.md` 第 6 節） |
 | `POST /api/v1/pki/signing-queue/import` | `PkiQueue` | 匯入 `kairos-signed-certs/v1`；逐張結果（`issued`／`rejected` 與原因） |
+| `POST /api/v1/pki/certificates/import` | `PkiQueue` | （0.9.0〔草稿〕）手動簽發（外部 CA）的既有憑證匯入簽發紀錄，見第 15.1 節 |
 | `GET /api/v1/pki/revocations/export` | `PkiQueue` | `kairos-revocations/v1`（離線產生 CRL 用） |
 
 簽發 CA 的建立、安裝、啟用與退役（L3）本衝刺只提供 CLI（第 11.6 節），API 之後再加。`GET /api/v1/pki/ca` 的每個簽發 CA 另有 `expiry_warning`（剩餘天數低於門檻時為 `KRS-W1304`），頂層 `expiry_warning_days` 為門檻；`signing-queue/import` 不通過的項目附 `product_code: KRS-E1305`。
@@ -868,7 +869,7 @@ kairos enroll mode [open | renew_only | closed] [--auto-pause on|off] [--auto-pa
                    [--reason <原因>] [--yes] [--expect-count <N>] [--json]
 
 kairos pki certificates list [--state <狀態>] [--expires-within <時間>] [--json]
-kairos pki certificates import <目錄>
+kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id>] [--json]（0.9.0〔草稿〕）
 kairos pki revoke <主機名稱 | agent_id | 序號>... --reason <原因> [--yes --expect-count <N>] [--json]
 kairos pki init --name <名稱或 IP>... --root-dir <目錄> [--organization <組織>] [--server-days <N>] [--json]（0.8.0）
 kairos pki gencrl（線上模式；0.8.0）
@@ -912,7 +913,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `POST /api/v1/settings/reset` | `enroll.*` 需 `EnrollModeWrite`，`pki.policy.*` 需 `CertPolicyWrite` | 本文 `keys`（設定鍵陣列）、`reason`、`impact_token`：「改用設定檔的值」＝刪除 `settings` 的鍵（L1，寫入稽核）；被環境變數覆寫時 409 `locked_by_environment`。**0.8 起**刪除後會關閉註冊端點或縮短寬限期時 `impact_token` 必填（400 `confirmation_required`／409 `impact_changed`，附新的數字），使主機無法續簽時為 L2、`reason` 必填（`kairos config reset` 同樣為 L2：互動輸入「停止續簽 N 台」，非互動 `--yes --expect-count <N> --reason`）。回 `results[]`（`key`、`was_console`） |
 
 - 優先順序：環境變數 ＞ 主控台（資料庫 `settings`）＞ `kairos.toml` ＞ 內建預設。可從主控台修改的鍵：`enroll.mode`、`enroll.auto_pause_enabled`、`enroll.auto_pause_after_hours`、`pki.policy.*`。
-- `GET /api/v1/enroll/mode` 另帶 `downloads`（`available`、`reason`、`alternative`）：本版下載端點回 404，主控台據此隱藏一行指令與下載連結（設計包 INTEGRATION §27.4 #3）；token 建立回應的 `downloads`、token 列表的 `meta.downloads` 相同。同一個回應另有 `stats`（啟動以來的請求、429、封鎖、時鐘被拒、握手前關閉、簽發的計數；S20 的資料來源，系統健康的整合之後再做）。
+- `GET /api/v1/enroll/mode` 另帶 `downloads`（`available`、`reason`、`alternative`；0.9 起另有 `base_url`、`install_script`、`files`，第 15.2 節）：下載端點不可用時主控台隱藏一行指令與下載連結（設計包 INTEGRATION §27.4 #3）；token 建立回應的 `downloads`、token 列表的 `meta.downloads` 相同。同一個回應另有 `stats`（啟動以來的請求、429、封鎖、時鐘被拒、握手前關閉、簽發的計數；S20 的資料來源，系統健康的整合之後再做）。
 
 ### 11.8 實作與本節的差異
 
@@ -926,7 +927,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 
 - `kairos config show --effective [<設定鍵或前綴>...] [--source env|console|file|default] [--json]`（設計包 `cli-style.md` §11.7）與 `kairos config reset <設定鍵>... [--yes] [--reason <原因>] [--expect-count <N>]`（0.8 起刪除後會關閉註冊端點或縮短寬限期、使主機無法續簽時為 L2，同 `enroll mode closed`）。
 - `kairos pki issuing-ca list`；`issuing-ca new` 預設把 CSR 寫在 `data/pki/issuing-<ca_id>.csr`（`--out` 可另外指定）；第一個簽發 CA 在 `install` 時自動啟用。
-- 未實作：`kairos pki certificates import`、`kairos pki gencrl`、`kairos pki revocations export`、`kairos pki crl upload`。
+- 未實作：`kairos pki crl upload`（`kairos pki gencrl`、`kairos pki revocations export` 0.8.0 起、`kairos pki certificates import` 0.9.0 起已實作）。
 
 ## 12. 使用者、角色、工作階段與稽核（0.6.0）
 
@@ -975,7 +976,9 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `channels:read` | ✓ | ✓ | | | 通知管道的清單與狀態（S11；機密只有遮蔽值） |
 | `channels:test` | ✓ | ✓ | | | 寄送測試通知 |
 | `channels:write` | ✓ | | | | 新增、修改、刪除通知管道（含機密） |
-| `export:write` | ✓ | | | | 指標轉出的設定與測試連線（S21「整合」；OTLP 標頭含機密；0.9.0，第 15 節） |
+| `export:write` | ✓ | | | | 指標轉出的設定與測試連線（S21「整合」；OTLP 標頭含機密；0.9.0，第 16 節） |
+| `hosts:purge` | ✓ | | | | 刪除主機資料（0.9.0；第 15 節） |
+| `hosts:personal_data` | ✓ | | | | 匯出主機的個資（0.9.0；第 15 節） |
 
 個人設定（`/api/v1/me/…`：自己的工作階段、密碼、TOTP）不需要權限，只需要以帳號登入的工作階段。
 
@@ -1326,7 +1329,62 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 - 網頁介面以工作階段的 cookie 驗證（第 12.3 節），寫入帶 `X-CSRF-Token`；不在瀏覽器的 storage 保存 token。
 - 網頁的請求不計入 `kairos_api_requests_total`（只計 API）。
 
-## 15. 指標轉出（0.9.0〔草稿〕）
+## 15. 個資：刪除主機資料與個資匯出（0.9.0〔草稿〕；商業審計 S6）
+
+完整的說明（個資清單、`[privacy]`、刪除的流程與保留的資料、DPA 骨架）見 [`PRIVACY.md`](PRIVACY.md)。
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `GET /api/v1/hosts/{agent_id}/purge` | `hosts:purge` | 影響預覽（下方）。這台主機在任何資料表都沒有可刪除的資料時 404 `host_not_found` |
+| `POST /api/v1/hosts/{agent_id}/purge` | `hosts:purge` | 刪除（L2）：本文 `confirm`（必須等於預覽的 `confirm_text`，即清冊中的主機名稱；沒有清冊列時為 `agent_id`）、`impact_token`、`reason`（選填，最多 500 字）。主機仍連線中 409 `host_online`；`confirm` 不符 400 `confirmation_required`（`details.confirm_text`）；`impact_token` 不符或逾時 409 `impact_changed`（`details` 為新的預覽）；刪除沒有完成 503 `storage_unavailable`。三者的 `product_code` 為〔暫定〕`KRS-E4205` |
+| `GET /api/v1/hosts/{agent_id}/personal-data` | `hosts:personal_data` | 個資匯出（資料主體存取請求）：`data` 為 `kairos.host.personal-data/v1` 的文件（PRIVACY.md 第 5 節）；每次記稽核 `host.personal_data.export` |
+
+兩個權限只有管理員有（`ia.md` §4.2「刪除主機資料只限管理員」）；群組範圍的指派看不到範圍外的主機（404）。方法不符 405。
+
+**影響預覽**（`GET …/purge` 的 `data`）：
+
+```json
+{ "agent_id": "…", "hostname": "ann-laptop", "display_name": null, "online": false, "blocked": null,
+  "level": "L2", "confirm_text": "ann-laptop", "impact_token": "…",
+  "counts": { "reports": 120960, "process_snapshots": 10080, "rollup_5m": 13248, "rollup_1h": 9600,
+              "rollup_pending": 0, "inventory": 1, "inventory_changes": 3, "host_series": 41, "boots": 4,
+              "import_keys": 0, "alert_events": 2, "alert_timeline": 7, "alert_deliveries": 3,
+              "enroll_requests": 1, "certificates": 0, "certificates_kept": 1, "certificates_active": 1,
+              "hosts": 1, "total": 153950 },
+  "revoke": { "certificates": 1, "reason": "cessationOfOperation" },
+  "kept": { "audit_log": true, "certificates_for_crl": 1, "logs": true, "backups": true } }
+```
+
+- `online = true` 時 `blocked` 為 `{code: "host_online", product_code, message}`，主控台說明並停止。
+- `impact_token` 由主機、會撤銷的憑證、告警事件與註冊申請的數字算出（原始 report 的筆數會因保留清除改變，不列入），5 分鐘的時間窗，前一個時間窗也接受（同第 11.5 節）。
+- `POST` 成功時 `data`：`agent_id`、`deleted`（同 `counts` 的欄位，為實際刪除的列數；`certificates_kept` 為保留的已撤銷憑證紀錄）、`revoked_serials`（刪除前撤銷的序號）、`kept`。
+
+**刪除的順序**：從狀態表移除 → 撤銷尚未撤銷的有效憑證（每張稽核 `cert.revoke`）→ 告警引擎忘記這台主機的進行中事件 → report 的 writer 逐步刪除（每一步最多 5,000 列；最後一步刪除清冊並寫稽核 `host.purge`，`code` 為〔暫定〕`KRS-I4204`）。等待上限 120 秒，逾時時 writer 仍會做完。稽核日誌不刪除（PRIVACY.md 第 4.2 節）。
+
+**CLI**（PRIVACY.md 第 4.1 節）：
+
+```
+kairos hosts purge <agent_id> --dry-run [--json]
+kairos hosts purge <agent_id> [--reason <原因>] [--yes --confirm <主機名稱>] [--json]   # Kairos 停止時
+kairos hosts export <agent_id> [--out <檔案>] [--json]
+kairos hosts pseudonym <名稱>... [--kind host|name|user] [--json]
+```
+
+`--json` 的 `schema` 為 `kairos.hosts.<動作>/v1`。結束代碼：0 完成、1 找不到資料或資料庫錯誤、2 用法錯誤（含非互動缺少 `--yes --confirm`、確認字串不符）、3 設定錯誤、10 權限不足、11 資料庫使用中（Kairos 執行中，`KRS-E4304`）。
+
+### 15.1 手動簽發憑證的匯入（PKI.md 第 16 節）
+
+| 方法與路徑 | 權限 | 說明 |
+|---|---|---|
+| `POST /api/v1/pki/certificates/import` | `pki.queue:manage` | 本文 `certificates`（PEM 字串，可含多張；或 PEM 字串的陣列，1～1,000 個）、`agent_id`（選填，必須與憑證相符）。回 `results[]`（`source`、`result`：`imported`／`already_imported`／`rejected`、`serial`、`agent_id`、`issuer`、`not_after`、`expired`、`ca_id`、`new_host`；`rejected` 另有 `reason` 與 `product_code: KRS-E1305`）與 `summary` |
+
+CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id>] [--json]`（目錄只讀 `.pem`、`.crt`、`.cer`、`.der`，不進入子目錄、不跟隨符號連結；有未通過的憑證時結束代碼 4）。
+
+### 15.2 下載端點（ENROLL.md 第 19.4 節第 3 項）
+
+`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`）、`reason`、`product_code`（設定了目錄但不完整時為〔暫定〕`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令。`stats.downloads_in_progress` 為目前的下載數。
+
+## 16. 指標轉出（0.9.0〔草稿〕）
 
 商業審計 F7；完整規格、名稱對應、取捨與量測見 [EXPORT.md](EXPORT.md)。
 

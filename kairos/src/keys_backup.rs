@@ -2,7 +2,7 @@
 //! 設計包 `decisions/INTEGRATION.md` §28.5 #8、§28.9 #3）。
 //!
 //! 備份的金鑰檔（存在的才備份）：`alerts-secrets.key`（通知管道的機密）、`console.key`（TOTP 秘密、
-//! CSRF、復原碼）、`audit-hmac.key`（稽核鏈的 HMAC）。預設**不**備份；需要另外指定，並以使用者提供的
+//! CSRF、復原碼）、`audit-hmac.key`（稽核鏈的 HMAC）、`privacy.key`（主機名稱等的假名化，0.9 起）。預設**不**備份；需要另外指定，並以使用者提供的
 //! 備份密碼加密，寫成與資料庫備份檔並列的 `<備份檔>.keys`（0600）。這樣資料庫備份檔本身仍不含任何
 //! 金鑰，可以分開保存（例如金鑰備份放在另一個保管位置）。
 //!
@@ -39,10 +39,11 @@ pub const FORMAT: &str = "kairos.keys-backup/v1";
 /// 金鑰備份檔的副檔名（接在資料庫備份檔的路徑後面）
 pub const SUFFIX: &str = ".keys";
 /// 備份的金鑰檔（資料目錄下）
-pub const KEY_FILES: [&str; 3] = [
+pub const KEY_FILES: [&str; 4] = [
     crate::alerts::secrets::KEY_FILE,
     crate::users::secrets::KEY_FILE,
     crate::audit::KEY_FILE,
+    crate::privacy::KEY_FILE,
 ];
 /// 備份密碼的最短長度（字元）
 pub const MIN_PASSWORD_CHARS: usize = 12;
@@ -602,7 +603,10 @@ mod tests {
         std::fs::write(dir.join("console.key"), [5u8; 32]).unwrap();
         let (files, missing) = read_keys(&dir).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(missing, vec!["alerts-secrets.key", "audit-hmac.key"]);
+        assert_eq!(
+            missing,
+            vec!["alerts-secrets.key", "audit-hmac.key", "privacy.key"]
+        );
         std::fs::write(dir.join("audit-hmac.key"), b"short").unwrap();
         assert!(read_keys(&dir).is_err());
         assert_eq!(

@@ -145,6 +145,7 @@ pub const LIST_SEPARATOR: &str = ",";
 
 pub const USAGE: &str = "用法: kairos [--config <path>]\n       \
 kairos hosts list [選項]（主機清冊；kairos hosts --help 顯示說明）\n       \
+kairos hosts purge|export|pseudonym <…>（刪除主機資料、匯出個資、查詢假名；kairos/PRIVACY.md）\n       \
 kairos reports export [選項]（匯出 report；kairos reports --help 顯示說明）\n       \
 kairos reports import [選項] <檔案或目錄>...（匯入 0.2.x 的 JSONL；kairos reports import --help 顯示說明）\n       \
 kairos db backup <備份檔>（線上備份；kairos db --help 顯示說明）\n       \
@@ -193,6 +194,8 @@ pub struct AppConfig {
     pub audit: AuditSettings,
     /// 指標轉出：Prometheus exporter、OTLP（`kairos/EXPORT.md`）
     pub export: ExportSettings,
+    /// 個資保護（商業審計 S6；`kairos/PRIVACY.md`）
+    pub privacy: crate::privacy::PrivacySettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,

@@ -327,10 +327,40 @@ async fn route(
             h::reject_body(req.headers())?;
             server_info(ctx)
         }
-        Route::Download(_) => {
+        Route::Download(name) => {
             h::reject_body(req.headers())?;
             match ctx.mode(EndpointClass::Download) {
-                ModeDecision::Accept => Err(EnrollError::not_found()),
+                ModeDecision::Accept => {
+                    let Some(dir) = ctx.svc.download_dir() else {
+                        return Err(EnrollError::not_found());
+                    };
+                    // L11：每個來源（批次部署來源乘以倍率）與全部的同時下載數
+                    let ip = conn.peer.ip().to_canonical();
+                    let c = &ctx.svc.config.enroll;
+                    let per_ip =
+                        (f64::from(c.max_downloads_per_ip) * ctx.svc.multiplier(ip)) as usize;
+                    let Some(slot) =
+                        ctx.svc
+                            .download_slots
+                            .take(ip, per_ip.max(1), c.max_downloads as usize)
+                    else {
+                        ctx.svc.stats.limited_enroll.fetch_add(1, Ordering::Relaxed);
+                        return Err(ctx.limited(
+                            EnrollErrorCode::RateLimited,
+                            RateScope::Download,
+                            super::downloads::RETRY_AFTER,
+                        ));
+                    };
+                    let head = req.method() == hyper::Method::HEAD;
+                    let inm = req
+                        .headers()
+                        .get(hyper::header::IF_NONE_MATCH)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    super::downloads::respond(&dir, &name, head, inm.as_deref(), slot)
+                        .await
+                        .ok_or_else(EnrollError::not_found)
+                }
                 _ => Ok(h::text(
                     StatusCode::FORBIDDEN,
                     "Kairos 目前不受理新註冊（註冊端點為僅續簽，或新註冊已自動暫停），因此不提供安裝檔下載。\nKairos is not accepting new enrollments; downloads are unavailable.\n",
@@ -631,9 +661,12 @@ enum Created {
 
 async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, EnrollError> {
     let svc = ctx.svc;
-    let req: EnrollRequest = h::parse_json(body)?;
+    let mut req: EnrollRequest = h::parse_json(body)?;
     // 4. 本文
     let checked: CheckedEnrollRequest = validate_enroll_request(&req).map_err(field_err)?;
+    // 個資政策（privacy.hostname）：申請、清冊與日誌只保存假名（kairos/PRIVACY.md）
+    req.hostname = svc.privacy.hostname(&req.hostname);
+    req.display_name = svc.privacy.display_name(req.display_name.take());
     // 5. 時鐘（不消耗 token、不建立申請、不計入 L5～L7）
     ctx.check_clock(&req.sent_at, checked.sent_at_ms, &checked.agent_id, None)?;
     // 6. token
@@ -1326,9 +1359,11 @@ enum GraceOutcome {
 
 async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, EnrollError> {
     let svc = ctx.svc;
-    let req: GraceRenewRequest = h::parse_json(body)?;
+    let mut req: GraceRenewRequest = h::parse_json(body)?;
     // 4. 本文
     let checked = validate_grace_renew_request(&req).map_err(field_err)?;
+    // 個資政策（privacy.hostname）：簽章不涵蓋主機名稱，驗證後轉換
+    req.hostname = svc.privacy.hostname(&req.hostname);
     // 5. 時鐘
     ctx.check_clock(&req.sent_at, checked.sent_at_ms, &checked.agent_id, None)?;
     // 6. L6r
@@ -1557,7 +1592,10 @@ fn grace_in_tx(
     }
     // 13. 寬限期
     let grace_days = eff.policy.expired_renew_grace_days;
-    let grace_end = old.not_after_ms + i64::from(grace_days) * 86_400_000;
+    let grace_ms = crate::testhooks::grace_secs()
+        .filter(|_| grace_days > 0)
+        .map_or(i64::from(grace_days) * 86_400_000, |s| s * 1000);
+    let grace_end = old.not_after_ms + grace_ms;
     let overridden = host
         .as_ref()
         .and_then(|h| h.grace_override_until)

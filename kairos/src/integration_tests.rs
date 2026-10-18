@@ -68,6 +68,8 @@ struct Options {
     throttle_interval: Duration,
     /// 以 SQLite 後端保存（`<dir>/kairos.db`；宣告 `inventory`、`processes`）。預設為 JSONL
     sqlite: bool,
+    /// 個資政策（`[privacy]`）
+    privacy: Arc<crate::privacy::PrivacyPolicy>,
 }
 
 impl Default for Options {
@@ -83,6 +85,7 @@ impl Default for Options {
             reports: None,
             throttle_interval: crate::throttle::DEFAULT_INTERVAL,
             sqlite: false,
+            privacy: crate::privacy::PrivacyPolicy::shared_default(),
         }
     }
 }
@@ -169,6 +172,7 @@ impl Server {
             report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
             enroll: None,
             assets,
+            privacy: opts.privacy.clone(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1970,6 +1974,71 @@ async fn metrics_spec_examples_get_the_documented_responses() {
     let last = live.last_report.unwrap();
     assert_eq!(last.detail.filesystems.len(), 2);
     assert_eq!(last.detail.uptime_secs, Some(1_532_941));
+}
+
+#[tokio::test]
+async fn privacy_policy_is_applied_before_anything_is_stored() {
+    use crate::privacy::*;
+    let key = || PseudonymKey::from_bytes(&[9u8; 32]);
+    let settings = PrivacySettings {
+        store_peer_ip: PeerIpMode::Truncate,
+        hostname: HostnameMode::Pseudonymize,
+        process_command: ProcessCommandMode::Redact,
+        process_user: ProcessUserMode::Drop,
+        inventory_network: InventoryNetworkMode::Truncate,
+    };
+    let server = Server::start(Options {
+        privacy: Arc::new(PrivacyPolicy::new(settings, Some(key()))),
+        ..sqlite_server_options()
+    })
+    .await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "processes", "inventory"]).to_string())
+        .await;
+    assert_eq!(c.recv().await["type"], "hello_ack");
+    let mut r: Value = serde_json::from_str(&metrics_report(2, 1.0)).unwrap();
+    r["processes"] = json!({"top_cpu": [{"pid": 7, "name": "mysql", "cpu_usage": 1.0, "memory": 5,
+        "user": "ann", "command": "mysql -uroot -pS3cret"}]});
+    c.send(&r.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    let inv = json!({"type": "inventory", "seq": 3, "ts": "2026-10-09T00:00:00.000Z", "inventory": {
+        "network_interfaces": [{"name": "eth0", "mac": "52:54:00:12:34:56",
+            "addresses": ["192.168.10.21/24", "fe80::5054:ff:fe12:3456/64"], "mtu": 1500}]}});
+    c.send(&inv.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+    let db = server.db();
+    let (hostname, peer): (String, String) = db
+        .query_row("SELECT hostname, peer FROM hosts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(hostname, key().pseudonym("host", "web-01"));
+    assert_eq!(peer, "127.0.0.0/24");
+    let body: Vec<u8> = db
+        .query_row("SELECT body FROM process_snapshots", [], |r| r.get(0))
+        .unwrap();
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(!text.contains("S3cret") && !text.contains("ann"), "{text}");
+    assert!(text.contains("-p[已遮蔽]"), "{text}");
+    let inv: String = db
+        .query_row("SELECT body FROM host_inventory", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        inv.contains("192.168.10.0/24") && inv.contains("52:54:00:00:00:00"),
+        "{inv}"
+    );
+    assert!(
+        !inv.contains("192.168.10.21") && !inv.contains("12:34:56"),
+        "{inv}"
+    );
+    // 狀態表（agents.json、主控台）也只看到假名與網段
+    let live = server.registry.live_get(ID).unwrap();
+    assert_eq!(&*live.hostname, key().pseudonym("host", "web-01"));
+    assert_eq!(&*live.peer, "127.0.0.0/24");
+    assert_eq!(
+        live.host.as_ref().and_then(|h| h.display_name.clone()),
+        Some(key().pseudonym("name", "Web 01"))
+    );
 }
 
 #[tokio::test]

@@ -326,6 +326,326 @@ fn grace_renewal_replay_survives_restart_and_clock_skew_is_rejected() {
     kairos.stop();
 }
 
+/// 過期續簽的請求（以舊憑證的私鑰簽章，新的 CSR 為 `new`）
+fn grace_request(
+    old: &Agent,
+    old_der: &[u8],
+    new: &Agent,
+    sent_at: i64,
+    endpoint: &str,
+) -> GraceRenewRequest {
+    let sent = format_rfc3339_ms(sent_at);
+    let input = grace_renew_signing_input(&old.id, FP, &new.csr, &sent, endpoint).unwrap();
+    GraceRenewRequest {
+        agent_id: old.id.clone(),
+        csr: b64url_encode(&new.csr),
+        poll_secret: new.poll_secret.clone(),
+        sent_at: sent,
+        host_fingerprint: FP.into(),
+        expired_certificate: b64url_encode(old_der),
+        signature: sign_ecdsa_p256_sha256(&old.key.serialize_der(), &input).unwrap(),
+        signature_alg: SignatureAlg::EcdsaP256Sha256,
+        hostname: "e2e-host".into(),
+        pulse_version: "0.9.0".into(),
+    }
+}
+
+fn der_of(pem: &str) -> Vec<u8> {
+    CertificateDer::from_pem_slice(pem.as_bytes())
+        .unwrap()
+        .to_vec()
+}
+
+fn not_after_ms(v: &Value) -> i64 {
+    kairos_proto::enroll::parse_rfc3339_ms(v["certificate"]["not_after"].as_str().unwrap()).unwrap()
+}
+
+fn sleep_until(ms: i64) {
+    let wait = ms - now_ms();
+    if wait > 0 {
+        std::thread::sleep(Duration::from_millis(wait as u64));
+    }
+}
+
+fn api_token(env: &Env, role: &str) -> String {
+    let (code, p) = env.cli(&[
+        "api-token",
+        "create",
+        "--name",
+        role,
+        "--role",
+        role,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{}", p.dump());
+    serde_json::from_str::<Value>(p.stdout().trim()).unwrap()["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn grace_period_is_enforced_and_an_override_extends_it() {
+    // ENROLL.md 第 19.3 節 #14：憑證 4 秒效期、寬限期 6 秒（測試掛鉤，debug 建置才生效）。
+    // 過期後、寬限期內續簽成功；超過寬限期 renew_grace_exceeded（附 grace_ended_at）；
+    // 管理者「允許再次自動續簽」（POST /api/v1/pki/grace-overrides）之後成功
+    let env = Env::new(
+        "enroll-grace-14",
+        "",
+        &[
+            ("KAIROS_TEST_CERT_LIFETIME_SECS", "4"),
+            ("KAIROS_TEST_GRACE_SECS", "6"),
+        ],
+    );
+    let mut kairos = env.start();
+    let auto = env.token("auto");
+    let endpoint = format!("localhost:{}", env.enroll_port);
+    let a = agent("5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+    let (s, v) = env.post("/v1/enroll/requests", &enroll_request(&a, &auto, now_ms()));
+    assert_eq!((s, v["state"].as_str()), (200, Some("issued")), "{v}");
+    let first = der_of(&cert_of(&v));
+    // 1. 過期後、寬限期內：成功
+    sleep_until(not_after_ms(&v) + 500);
+    let b = agent(&a.id);
+    let (s, v) = env.post(
+        "/v1/enroll/renewals",
+        &grace_request(&a, &first, &b, now_ms(), &endpoint),
+    );
+    assert_eq!((s, v["state"].as_str()), (200, Some("issued")), "{v}");
+    let second = der_of(&cert_of(&v));
+    // 2. 第二張過期且超過寬限期（4 秒效期 + 6 秒寬限）：renew_grace_exceeded
+    sleep_until(not_after_ms(&v) + 6_000 + 1_000);
+    let c = agent(&a.id);
+    let (s, v) = env.post(
+        "/v1/enroll/renewals",
+        &grace_request(&b, &second, &c, now_ms(), &endpoint),
+    );
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("renew_grace_exceeded")),
+        "{v}"
+    );
+    assert!(v["error"]["grace_ended_at"].is_string(), "{v}");
+    // 3. 允許再次自動續簽（GraceOverride；L1，原因必填）後同一台主機可以續簽
+    let admin = api_token(&env, "admin");
+    let until = format_rfc3339_ms(now_ms() + 3_600_000);
+    let (s, v) = env.console(
+        "POST",
+        "/api/v1/pki/grace-overrides",
+        &admin,
+        Some(&json!({"agent_ids": [a.id], "until": until, "reason": "e2e：產線停機超過寬限期"})),
+    );
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = env.post(
+        "/v1/enroll/renewals",
+        &grace_request(&b, &second, &c, now_ms() + 1, &endpoint),
+    );
+    assert_eq!((s, v["state"].as_str()), (200, Some("issued")), "{v}");
+    assert_eq!(
+        env.certificates_of(&a.id).len(),
+        3,
+        "{:?}",
+        env.certificates_of(&a.id)
+    );
+    kairos.stop();
+}
+
+#[test]
+fn manually_issued_certificate_is_imported_and_revocation_takes_effect() {
+    // PKI.md 第 16 節：根 CA（auth.client_ca）直接簽發的既有憑證（手動 PKI 的部署）可以連線；
+    // kairos pki certificates import 匯入簽發紀錄後出現在清冊；在 Kairos 撤銷後，下一次 hello 被拒
+    let env = Env::new("enroll-import", "", &[]);
+    let mut kairos = env.start();
+    let a = agent("6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
+    let pem = env.pki.sign_client(&a.id, &a.key);
+    std::fs::create_dir_all(env.dir.join("manual")).unwrap();
+    std::fs::write(env.dir.join("manual").join("host.pem"), &pem).unwrap();
+    // 匯入前：以 auth.client_ca 驗證，可以連線
+    let mut c = Agent8443::connect(&env, &pem, &a.key.serialize_pem());
+    assert_eq!(c.hello(&a.id, None)["type"], "hello_ack");
+    drop(c);
+    let (code, p) = env.cli(&["pki", "certificates", "import", "manual", "--json"]);
+    assert_eq!(code, 0, "{}", p.dump());
+    let v: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    assert_eq!(v["schema"], "kairos.pki.certificates.import/v1");
+    let r = &v["data"]["results"][0];
+    assert_eq!(r["result"], "imported", "{v}");
+    assert_eq!(r["agent_id"], a.id.as_str());
+    let serial = r["serial"].as_str().unwrap().to_string();
+    let certs = env.certificates_of(&a.id);
+    assert!(
+        certs.iter().any(|c| c["serial"] == serial.as_str()),
+        "{certs:?}"
+    );
+    // 同一張再匯入：already_imported（API）
+    let token = api_token(&env, "operator");
+    let (s, v) = env.console(
+        "POST",
+        "/api/v1/pki/certificates/import",
+        &token,
+        Some(&json!({"certificates": pem})),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["results"][0]["result"], "already_imported", "{v}");
+    // 撤銷（CLI，L2）→ 2 秒內生效：hello 以 certificate_rejected 拒絕
+    let (code, p) = env.cli(&[
+        "pki",
+        "revoke",
+        &serial,
+        "--reason",
+        "keyCompromise",
+        "--comment",
+        "e2e",
+        "--yes",
+        "--expect-count",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{}", p.dump());
+    let rejected = poll_until(WAIT, || {
+        let mut c = Agent8443::connect(&env, &pem, &a.key.serialize_pem());
+        c.hello(&a.id, None)["code"] == "certificate_rejected"
+    });
+    assert!(rejected, "撤銷後應拒絕 hello");
+    assert!(kairos.output().contains("KRS-W1105"), "{}", kairos.dump());
+    kairos.stop();
+}
+
+/// 8444 的 GET（每次一條連線），回傳 (狀態碼, 標頭（小寫名稱）, 原始本文)
+fn raw_get(env: &Env, path: &str, extra: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = env.tls(env.enroll_port, None);
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{extra}\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("沒有標頭");
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (status, headers, buf[split + 4..].to_vec())
+}
+
+fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn download_endpoint_serves_the_release_files() {
+    // ENROLL.md 第 19.4 節第 3 項：enroll.download_dir 的發佈檔案經 8444 的 /agent/<檔名> 提供；
+    // 路徑穿越與子目錄 404、內容類型、快取標頭、ETag 的 304；主控台的 downloads 顯示可用與 base_url
+    let env = Env::new("enroll-downloads", "download_dir = \"dl\"\n", &[]);
+    let dl = env.dir.join("dl");
+    std::fs::create_dir_all(dl.join("sub")).unwrap();
+    let deb: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dl.join("pulse-install.sh"), "#!/bin/sh\necho e2e\n").unwrap();
+    std::fs::write(dl.join("pulse_0.9.0_amd64.deb"), &deb).unwrap();
+    std::fs::write(dl.join("SHA256SUMS"), "0000  pulse_0.9.0_amd64.deb\n").unwrap();
+    std::fs::write(dl.join("SHA256SUMS.sig"), "-----BEGIN SSH SIGNATURE-----\n").unwrap();
+    std::fs::write(dl.join("sub").join("secret.txt"), "no").unwrap();
+    let mut kairos = env.start();
+    assert!(
+        kairos.output().contains("下載端點 /agent/"),
+        "{}",
+        kairos.dump()
+    );
+
+    let (s, h, body) = raw_get(&env, "/agent/pulse_0.9.0_amd64.deb", "");
+    assert_eq!(s, 200);
+    assert_eq!(body, deb);
+    assert_eq!(
+        header(&h, "content-type"),
+        Some("application/vnd.debian.binary-package")
+    );
+    assert_eq!(header(&h, "content-length"), Some("300000"));
+    assert_eq!(header(&h, "cache-control"), Some("public, max-age=3600"));
+    assert_eq!(header(&h, "x-content-type-options"), Some("nosniff"));
+    let etag = header(&h, "etag").unwrap().to_string();
+    let (s, _, body) = raw_get(
+        &env,
+        "/agent/pulse_0.9.0_amd64.deb",
+        &format!("If-None-Match: {etag}\r\n"),
+    );
+    assert_eq!((s, body.len()), (304, 0));
+    let (s, h, body) = raw_get(&env, "/agent/SHA256SUMS", "");
+    assert_eq!(s, 200);
+    assert_eq!(header(&h, "cache-control"), Some("no-cache"));
+    assert_eq!(
+        header(&h, "content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert!(String::from_utf8_lossy(&body).contains("pulse_0.9.0_amd64.deb"));
+    let (s, h, _) = raw_get(&env, "/agent/pulse-install.sh", "");
+    assert_eq!(s, 200);
+    assert_eq!(
+        header(&h, "content-type"),
+        Some("text/x-shellscript; charset=utf-8")
+    );
+    // 路徑穿越、子目錄、百分比編碼、不存在、隱藏檔：一律 404
+    for p in [
+        "/agent/../kairos.toml",
+        "/agent/sub/secret.txt",
+        "/agent/sub",
+        "/agent/%2e%2e%2fkairos.toml",
+        "/agent/missing.deb",
+        "/agent/.hidden",
+    ] {
+        let (s, _, _) = raw_get(&env, p, "");
+        assert_eq!(s, 404, "{p}");
+    }
+    // 與安裝腳本相同的 curl 參數（--proto =https --tlsv1.2 --cacert）可以下載
+    if std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", "--proto", "=https", "--tlsv1.2", "--cacert"])
+            .arg(env.dir.join("root.pem"))
+            .arg(format!(
+                "https://localhost:{}/agent/pulse-install.sh",
+                env.enroll_port
+            ))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "#!/bin/sh\necho e2e\n"
+        );
+    }
+    // 主控台：downloads 可用（主控台據此顯示一行安裝指令）
+    let token = api_token(&env, "auditor");
+    let (s, v) = env.console("GET", "/api/v1/enroll/mode", &token, None);
+    assert_eq!(s, 200, "{v}");
+    let d = &v["data"]["downloads"];
+    assert_eq!(d["available"], true, "{v}");
+    assert_eq!(
+        d["base_url"],
+        format!("https://127.0.0.1:{}/agent", env.enroll_port)
+    );
+    assert!(
+        d["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pulse_0.9.0_amd64.deb")
+    );
+    // 僅續簽：不提供下載（403）
+    let (code, p) = env.cli(&["enroll", "mode", "renew_only", "--yes"]);
+    assert_eq!(code, 0, "{}", p.dump());
+    let ok = poll_until(WAIT, || raw_get(&env, "/agent/SHA256SUMS", "").0 == 403);
+    assert!(ok, "僅續簽時下載應回 403");
+    kairos.stop();
+}
+
 #[test]
 fn mode_switching_and_rate_limit() {
     let env = Env::new(

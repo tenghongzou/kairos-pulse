@@ -178,7 +178,7 @@ preflight PF09 與 MSI 精靈的 token 頁使用；**不消耗使用次數、不
 
 **回應 200**：`EnrollResult`（第 6.5 節）。`state` 為 `issued`（自動核准且已簽發）或 `pending_approval`。
 
-**Pulse 的處理**：429／503 依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 排隊重送（絕不早於伺服器指定的時間；`PLS-E2202`、`PLS-E3005`、`PLS-E3309`），網路錯誤 2 秒起倍增、上限 5 分鐘；**重送時沿用同一把私鑰、同一個 CSR、同一個 `poll_secret`**，只更新 `sent_at`。所以回應遺失也不會產生第二筆申請（第 7 步）。`token_*` 與 `enroll_not_accepted` 停止重試（結束代碼 6）。
+**Pulse 的處理**：429／503 依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 排隊重送（絕不早於伺服器指定的時間；`PLS-E2202`、`PLS-E3005`、`PLS-E3309`），網路錯誤 2 秒起倍增、上限 5 分鐘。送出申請之前（`server-info`、`token-check`）的 429 `rate_limited`／503 `enroll_busy` 由 `pulse enroll` 依同一個公式等候後重試（0.9.0 起；合計不超過 `--wait`，沒有指定時 600 秒，顯示倒數、可以 Ctrl+C 取消；`--no-wait` 與 `source_blocked` 不等候）；**重送時沿用同一把私鑰、同一個 CSR、同一個 `poll_secret`**，只更新 `sent_at`。所以回應遺失也不會產生第二筆申請（第 7 步）。`token_*` 與 `enroll_not_accepted` 停止重試（結束代碼 6）。
 
 ### 6.4 `GET /v1/enroll/requests/{request_id}`：輪詢與取回憑證
 
@@ -604,7 +604,7 @@ HANDOFF §4 末的三項，以及本規格另外發現的項目：
 |---|---|---|
 | 1 | 線上簽發（預設）或離線簽發；根 CA 與簽發 CA 的演算法 | **已決定（2026-10-14）**：預設線上簽發（簽發 CA 私鑰 0600，根 CA 離線）；離線簽發是可切換的選項；新安裝根 CA 用 P-384，既有 RSA 根 CA 照用（`kairos/PKI.md` 第 1 節） |
 | 2 | 主控台修改模式等設定的保存位置（寫回 `kairos.toml` 或資料庫） | **已決定（2026-10-14）**：存 SQLite 的 `settings` 表、優先於 `kairos.toml`；`kairos config show --effective` 列出每項的實際生效值與來源（`kairos/PKI.md` 第 8 節） |
-| 3 | 下載端點（`/agent/install.sh`、套件）的檔案來源與簽章 | 本衝刺先回 404；安裝腳本與套件就緒後以 `enroll.download_dir` 提供，套件簽章沿用發佈包的簽章流程 |
+| 3 | 下載端點（`/agent/install.sh`、套件）的檔案來源與簽章 | **0.9.0 已實作**：以 `enroll.download_dir` 提供（`/agent/pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig`），簽章沿用發佈包的簽章流程（`kairos/PKI.md` 第 17 節） |
 | 4 | token 列表顯示前 4＋後 4 碼（第 18 節第 5 項） | **已決定（2026-10-14）**：只顯示前 4 碼；需設計包負責人更新 `cli-style.md` §10 |
 | 5 | 線上簽發金鑰權限過寬、簽發 CA 即將到期等新情況的產品代碼 | 本規格暫沿用 `KRS-E1302`／`KRS-W1301` 並在訊息寫出原因；請設計包負責人決定是否分配新號碼 |
 | 6 | `renew_only` 是否也接受 `token-check`（只查詢，不建立） | 維持設計包：不接受（`enroll_not_accepted`），以免透露 token 的存在 |
@@ -625,7 +625,7 @@ HANDOFF §4 末的三項，以及本規格另外發現的項目：
 | 8、9 | `enroll_pulse.rs` `rate_limit_is_waited_out_and_renew_only_refuses_new_enrollments`；`enroll.rs` `mode_switching_and_rate_limit` | 自動暫停由 Kairos 的單元測試 `mode_switching_and_auto_pause` 涵蓋 |
 | 11、12 | `enroll_pulse.rs` `expired_certificate_is_renewed_in_the_grace_period` | `KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_DROP_RENEWAL_RESPONSES`、Pulse 的 `PULSE_TEST_GRACE_DELAY_SECS` |
 | 13 | `enroll.rs` `grace_renewal_replay_survives_restart_and_clock_skew_is_rejected` | 原樣重送同一個請求（實際的 Pulse 不會這麼做） |
-| 14 | — | 未做端對端（Kairos 的單元測試 `grace_period_exceeded_and_override` 涵蓋） |
+| 14 | `enroll.rs` `grace_period_is_enforced_and_an_override_extends_it`（0.9.0） | 測試掛鉤 `KAIROS_TEST_CERT_LIFETIME_SECS`、`KAIROS_TEST_GRACE_SECS`：寬限期內成功、超過後 `renew_grace_exceeded`、允許再次自動續簽後成功 |
 | 15、17 | `enroll_pulse.rs` `revoked_host_is_disconnected_and_can_enroll_again_with_force` | |
 | 16 | `enroll_pulse.rs` `offline_signing_export_sign_import_then_the_service_connects` | 簽發 CA 由測試以根 CA 簽發，`auth.client_ca` 為根 CA 加上簽發 CA |
 | 18 | `enroll_pulse.rs` `rotation_over_8443_supersedes_the_old_certificate`；`enroll.rs` | 同一 CSR 重送同一張由 `enroll.rs` 涵蓋 |

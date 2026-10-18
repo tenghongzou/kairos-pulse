@@ -63,7 +63,8 @@ web/
 │                           admin-common（共用呈現）；文字在 core/strings-admin.js
 ├── tests/                  Playwright＋axe 的端對端測試（不嵌入、不在 cargo test 中；第 7 節）；
 │                           告警在 e2e-alerts.mjs、註冊與憑證在 e2e-pki.mjs（第二個 Kairos：pki-env.sh）、管理在 e2e-admin.mjs、
-│                           權限的整體檢查在 e2e-rbac.mjs、指標擴充（F4）在 e2e-metrics.mjs、指標轉出（F7）在 e2e-export.mjs
+│                           權限的整體檢查在 e2e-rbac.mjs、指標擴充（F4）在 e2e-metrics.mjs、指標轉出（F7）在 e2e-export.mjs、
+│                           個資保護（S6）在 e2e-privacy.mjs
 └── tools/sync-design.mjs   從設計包複製 tokens.css、產生 error-codes.js（開發時執行）
 ```
 
@@ -211,6 +212,8 @@ registerProvider({
 22. 全站 Banner 與計數泡泡（0.8，`e2e-admin.mjs`、`e2e-pki.mjs`）：以攔截的健康 API 模擬 CRL 已過期與伺服器憑證即將到期，嚴重的 Banner 不可關閉、警告的「24 小時內不再顯示」、系統健康的計數泡泡與可存取名稱、狀態燈與 S20 的整體狀態一致（淺色、深色 axe）；待核准的計數與 API 相同、拒絕後立即更新。S21「改用內建預設值」會關閉註冊端點時的影響預覽與 `impact_token`（缺少 400、過期 409）、縮短寬限期的 API 檢查。
 23. WCAG A 級（`e2e-wcag.mjs`）：告警事件的 `j`／`k` 在焦點位於表格外與搜尋欄時不攔截、表格內在事件間移動；以 `page.clock` 快轉瀏覽器時間，閒置逾時前 2 分鐘出現提醒（焦點在「繼續使用」、`aria-live`、axe），對話框內的 Tab 不延長、Enter 延長，再次接近到期不理會則以 `session_expired` 回登入頁。
 24. 指標擴充（F4，`e2e-metrics.mjs`；假 agent `web-01` 模擬 Pulse 0.8.0：新指標、行程排行、資產）：概覽的目前數值（置換空間、負載與每核心、使用率最高的掛載點與「將滿」、「＋N 個掛載點」的 `aria-expanded`、運作時間、行程數）；趨勢的六個指標群組（`?metric=`、超過 3 個掛載點的小倍數、「裝置（掛載點）」選單與「全部（小倍數）」、忙碌時間比例、網路錯誤數、負載的「邏輯處理器 N 個」參考線、鍵盤 End 鍵與 `aria-live`、表格檢視）；行程（兩張表的 `aria-sort`、命令列截斷與敏感資訊提示、較早一筆、超出保留期限、回到最新）；資產資訊（序號只在詳情、磁碟、網路介面、首次收到）；舊版 Pulse 與 Windows 的空狀態；S04 的磁碟欄與排序、作業系統（家族）篩選、欄位設定（storage 的值很短）；S03 的磁碟排行；S09 的 7 個指標、單位、掛載點範圍、預覽的「沒有回報」；S08 範本；深色主題 axe。
+25. 指標轉出（F7，`e2e-export.mjs`）：S21「整合」的指標轉出卡片——管理員啟用 Prometheus exporter（L1 確認、來源變為主控台）→ 以工作階段抓取 `/api/v1/export/prometheus`（假 agent `web-01` 的指標）；設定 OTLP 端點與標頭（只顯示遮蔽值）→ 測試連線 → 測試內的假 collector 收到帶標頭的 protobuf → 停用；稽核員唯讀、直接呼叫寫入 API 403；每個狀態 axe（含深色）。
+26. 個資保護（S6，`e2e-privacy.mjs`；放在最後，會刪除主機）：S05 頁首「更多」只有管理員看得到；仍連線中的主機說明無法刪除；匯出個資（下載的 JSON 為 `kairos.host.personal-data/v1`）；刪除主機資料的影響預覽與 L2（輸入主機名稱才能按）、刪除後回到主機清單、詳情 404（axe）。第二個 Kairos：`enroll.download_dir` 的檔案齊全後「建立 token」顯示一行安裝指令；S14「匯入憑證」貼上 `pki-env.sh` 以根 CA 直接簽發的憑證後清單出現這台主機（axe）。
 
 每個主要畫面在淺色與深色主題各跑一次 axe（目標 0 違規），截圖在 `OUT_DIR`。
 

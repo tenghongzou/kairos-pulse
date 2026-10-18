@@ -135,6 +135,7 @@ pub async fn handle(
         ("PUT", ["enroll", "mode"]) => set_mode(&w, b(), now).await,
         ("GET" | "HEAD", ["pki", "certificates"]) => list_certs(&svc, &query, now).await,
         ("POST", ["pki", "certificates", "revoke"]) => revoke(&w, b(), now).await,
+        ("POST", ["pki", "certificates", "import"]) => import_certificates(&w, b(), now).await,
         ("GET" | "HEAD", ["pki", "certificates", serial]) => get_cert(&svc, serial, now).await,
         ("GET" | "HEAD", ["pki", "policy", "impact"]) => policy_impact(&svc, &query, now).await,
         ("PUT", ["pki", "policy"]) => set_policy(&w, b(), now).await,
@@ -169,7 +170,9 @@ fn write_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("PUT", ["pki", "policy"]) => Permission::CertPolicyWrite,
         ("POST", ["pki", "grace-overrides"]) => Permission::GraceOverride,
         ("GET" | "HEAD", ["pki", "signing-queue", "export"])
-        | ("POST", ["pki", "signing-queue", "import"]) => Permission::PkiQueue,
+        | ("POST", ["pki", "signing-queue", "import"] | ["pki", "certificates", "import"]) => {
+            Permission::PkiQueue
+        }
         _ => return None,
     })
 }
@@ -303,7 +306,7 @@ async fn list_tokens(
         StatusCode::OK,
         now,
         json!({"data": data, "page": {"limit": limit, "total": total, "next_cursor": null},
-            "meta": {"downloads": crate::enroll::downloads_json()}}),
+            "meta": {"downloads": svc.downloads_json()}}),
     ))
 }
 
@@ -476,7 +479,7 @@ async fn create_token(
         }
     }
     data["enroll_mode"] = json!(w.svc.mode_state().as_str());
-    data["downloads"] = crate::enroll::downloads_json();
+    data["downloads"] = w.svc.downloads_json();
     data["auto_pause_cleared"] = json!(was_paused);
     Ok(http::json(StatusCode::CREATED, now, json!({"data": data})))
 }
@@ -977,7 +980,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "listen_addr": listen.addr,
         "not_listening_reason": listen.reason,
         "pki_mode": svc.pki.mode().as_str(),
-        "downloads": crate::enroll::downloads_json(),
+        "downloads": svc.downloads_json(),
         "issuance": match svc.pki.status() {
             IssueStatus::Online { ca_id } => json!({"status": "online", "ca_id": ca_id}),
             IssueStatus::Offline => json!({"status": "offline", "product_code": "KRS-E1302"}),
@@ -986,6 +989,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "sources": eff.sources_json(),
         "stats": {
             "requests": svc.stats.requests.load(std::sync::atomic::Ordering::Relaxed),
+            "downloads_in_progress": svc.download_slots.in_use(),
             "enroll_requests": svc.stats.enroll_requests.load(std::sync::atomic::Ordering::Relaxed),
             "renew_requests": svc.stats.renew_requests.load(std::sync::atomic::Ordering::Relaxed),
             "rate_limited_enroll": svc.stats.limited_enroll.load(std::sync::atomic::Ordering::Relaxed),
@@ -1646,6 +1650,80 @@ async fn export_queue(
         .await
         .map_err(db_error)?;
     Ok(http::ok(now, v))
+}
+
+/// `POST /api/v1/pki/certificates/import`：手動簽發（外部 CA）的既有憑證匯入簽發紀錄（PKI.md 第 16 節）。
+/// 本文 `{"certificates": "<PEM，可含多張>" | ["<PEM>", …], "agent_id": "<選填，必須相符>"}`
+async fn import_certificates(
+    w: &Writer<'_>,
+    b: Value,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    w.principal.require(Permission::PkiQueue)?;
+    let pems: Vec<String> = match &b["certificates"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(list) => list
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ApiError::param("certificates", "certificates 必須是 PEM 字串或字串的陣列")
+            })?,
+        _ => {
+            return Err(ApiError::param(
+                "certificates",
+                "certificates 必須是 PEM 字串或字串的陣列",
+            ));
+        }
+    };
+    if pems.is_empty() || pems.len() > 1000 {
+        return Err(ApiError::param("certificates", "一次 1～1000 個 PEM"));
+    }
+    let expected = str_field(&b, "agent_id").map(str::to_string);
+    let client_ca = w.svc.config.auth.client_ca_path().map(str::to_string);
+    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
+    let now_ms = now.timestamp_millis();
+    let results = w
+        .svc
+        .db
+        .write(move |conn| {
+            let anchors = crate::pki::queue::anchors(conn, client_ca.as_deref());
+            let mut out = Vec::new();
+            for (i, pem) in pems.iter().enumerate() {
+                match crate::pki::queue::certificates_in(pem.as_bytes()) {
+                    Ok(ders) => {
+                        for (j, der) in ders.iter().enumerate() {
+                            let r = crate::pki::queue::import_existing(
+                                conn,
+                                der,
+                                &anchors,
+                                expected.as_deref(),
+                                &actor,
+                                Some(&ip),
+                                now_ms,
+                            );
+                            out.push(crate::pki::queue::existing_json(
+                                &format!("{}#{}", i + 1, j + 1),
+                                &r,
+                            ));
+                        }
+                    }
+                    Err(e) => out.push(crate::pki::queue::existing_json(
+                        &format!("{}", i + 1),
+                        &Err(e),
+                    )),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(db_error)?;
+    // 匯入已撤銷的紀錄不會發生；新的清冊列由主控台下一次查詢讀到
+    w.svc.wake();
+    Ok(http::ok(
+        now,
+        json!({"results": results, "summary": summary(&results)}),
+    ))
 }
 
 async fn import_queue(

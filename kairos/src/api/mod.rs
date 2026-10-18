@@ -16,6 +16,7 @@
 //! | [`conn_log`] | 每台主機最近的上線與離線紀錄（記憶體中，`/hosts/{agent_id}/connections`） |
 //! | [`metrics`] | 指標趨勢 |
 //! | [`export`] | 指標轉出：Prometheus exporter、OTLP 的設定與狀態（`kairos/EXPORT.md`） |
+//! | [`privacy`] | 刪除主機資料、個資匯出（商業審計 S6） |
 //! | [`overview`]、[`health`] | 總覽、系統健康 |
 //! | [`events`] | 即時變更推送（SSE） |
 //! | [`maint`] | 背景工作：每分鐘上線數、token 的最後使用與稽核日誌、被拒的憑證寫入清冊 |
@@ -37,6 +38,7 @@ pub mod http;
 mod maint;
 pub mod metrics;
 pub mod overview;
+pub mod privacy;
 pub mod tokens;
 pub mod users;
 pub mod web;
@@ -47,6 +49,8 @@ mod alerts_tests;
 mod auth_tests;
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod privacy_tests;
 #[cfg(test)]
 mod probe_tests;
 #[cfg(test)]
@@ -134,6 +138,10 @@ pub struct ApiContext {
     pub obs: Option<Arc<crate::probe::ObsContext>>,
     /// 每台主機最近的上線與離線紀錄（記憶體中；`/api/v1/hosts/{agent_id}/connections`）
     pub conn_log: Arc<conn_log::ConnLog>,
+    /// 個資政策（`[privacy]`；被拒憑證的來源位址、個資匯出的說明）
+    pub privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// 刪除主機資料（交給 report 的 writer；`POST /api/v1/hosts/{agent_id}/purge`）
+    pub purger: Option<crate::store::PurgeSink>,
 }
 
 /// 被拒絕（403）的寫入請求寫入稽核的節流：同一個執行者每分鐘最多 20 筆，超過的計數併入下一筆
@@ -193,6 +201,8 @@ pub struct StartParams {
     /// 測試用：以替代的目錄服務取代 `[ldap]` 的連線
     pub directory: Option<Arc<dyn crate::users::ldap::Directory>>,
     pub obs: Option<Arc<crate::probe::ObsContext>>,
+    /// 刪除主機資料的佇列（SQLite 時；沒有時 `POST /api/v1/hosts/{agent_id}/purge` 回 503）
+    pub purger: Option<crate::store::PurgeSink>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -384,6 +394,11 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
         alerts: p.alerts.clone(),
         obs: p.obs.clone().filter(|_| p.config.observability.on_console),
         conn_log: Arc::new(conn_log::ConnLog::default()),
+        privacy: Arc::new(crate::privacy::PrivacyPolicy::load(
+            p.config.privacy,
+            &p.data_dir,
+        )),
+        purger: p.purger.clone(),
     });
     ctx.hosts.load_known(known);
 
@@ -655,6 +670,7 @@ fn known_route(rest: &[&str]) -> bool {
             | ["hosts", _, "inventory"]
             | ["hosts", _, "inventory", "changes"]
             | ["hosts", _, "processes"]
+            | ["hosts", _, "purge" | "personal-data"]
             | ["overview"]
             | ["system", "health"]
             | ["events"]
@@ -730,10 +746,11 @@ async fn route(
         return (Err(ApiError::not_found()), None);
     }
     // 唯讀的端點：方法與本文在驗證之前檢查（與 0.4 相同）
-    let read_only = matches!(
-        rest,
-        ["hosts", ..] | ["overview"] | ["system", "health"] | ["events"]
-    );
+    let read_only = !privacy::is_route(rest)
+        && matches!(
+            rest,
+            ["hosts", ..] | ["overview"] | ["system", "health"] | ["events"]
+        );
     if read_only {
         if method != Method::GET && method != Method::HEAD {
             return (
@@ -796,6 +813,8 @@ async fn route(
             users::handle(ctx, p, peer, rest, req, now).await
         }
         ["audit", sub @ ..] => audit_log::handle(ctx, p, peer, sub, &method, &query, now).await,
+        // 個資：刪除主機資料與個資匯出（商業審計 S6；含寫入）
+        _ if privacy::is_route(rest) => privacy::handle(ctx, peer, req, p, rest, now).await,
         // 告警（API.md 第 13 節；含寫入）：權限依 alerts::route 的表
         ["alerts", ..] | ["alert-rules", ..] | ["silences", ..] | ["channels", ..] => {
             alerts::handle(ctx, peer, req, p, now).await

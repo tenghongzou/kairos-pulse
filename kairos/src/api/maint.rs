@@ -168,6 +168,7 @@ pub(super) async fn persist_rejections(ctx: &Arc<ApiContext>) {
         return;
     }
     let deltas: Vec<(String, u64)> = dirty.iter().map(|(id, _, d)| (id.clone(), *d)).collect();
+    let privacy = ctx.privacy.clone();
     let result = ctx
         .writer
         .write(move |conn| {
@@ -187,7 +188,7 @@ pub(super) async fn persist_rejections(ctx: &Arc<ApiContext>) {
                         r.at.timestamp_millis(),
                         r.reason.as_str(),
                         r.serial,
-                        r.peer.map(|p| p.to_string()),
+                        r.peer.and_then(|p| privacy.ip(p)),
                         i64::try_from(*delta).unwrap_or(i64::MAX),
                     ])?;
                     if n == 0 {

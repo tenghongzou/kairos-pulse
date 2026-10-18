@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -428,11 +428,7 @@ fn report_summary(r: &LastReport) -> Value {
 
 /// peer（`ip:port`）中的 IP
 pub fn ip_of(peer: &str) -> Option<IpAddr> {
-    peer.parse::<SocketAddr>()
-        .map(|a| a.ip())
-        .or_else(|_| peer.parse::<IpAddr>())
-        .ok()
-        .map(|ip| ip.to_canonical())
+    crate::bus::peer_ip(peer)
 }
 
 /// 合併時需要的環境

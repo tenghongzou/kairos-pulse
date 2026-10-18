@@ -11,10 +11,13 @@
 #        --base-url https://downloads.example.com/pulse/0.8.0 --allowed-signers /etc/kairos-pulse/allowed_signers
 #
 # 用法：
-#   sh pulse-install.sh (--base-url <URL> | --dir <目錄>) --allowed-signers <檔案>
+#   sh pulse-install.sh (--base-url <URL> [--ca-file <檔案>] | --dir <目錄>) --allowed-signers <檔案>
 #                       [--install-string-file <檔案>] [--version <版本>] [--no-enroll] [--no-start]
 #
-#   --base-url <URL>          發佈處（含 SHA256SUMS、SHA256SUMS.sig 與套件的目錄）
+#   --base-url <URL>          發佈處（含 SHA256SUMS、SHA256SUMS.sig 與套件的目錄）；也可以是 Kairos 註冊端點的
+#                             下載端點 https://<註冊端點>:8444/agent（Kairos 0.9 起，enroll.download_dir）
+#   --ca-file <檔案>          以這個 CA 驗證 --base-url 的 HTTPS 伺服器憑證（Kairos 的下載端點使用 Kairos 的根 CA，
+#                             不在系統的信任清單中）。完整性仍以發佈公鑰驗證，不依賴 HTTPS
 #   --dir <目錄>              離線安裝：已下載好的發佈檔案所在的目錄
 #   --allowed-signers <檔案>  發佈公鑰（必須從另一個管道取得，INSTALL.md 第 2 節）；
 #                             也可用環境變數 PULSE_ALLOWED_SIGNERS
@@ -50,6 +53,7 @@ say() {
 BASE_URL=""
 DIR=""
 SIGNERS=${PULSE_ALLOWED_SIGNERS:-}
+CA_FILE=""
 INSTALL_STRING=${PULSE_INSTALL_STRING:-}
 VERSION=""
 ENROLL=1
@@ -59,6 +63,7 @@ while [ $# -gt 0 ]; do
     --base-url) BASE_URL=${2:?--base-url 需要 URL}; shift 2 ;;
     --dir) DIR=${2:?--dir 需要目錄}; shift 2 ;;
     --allowed-signers) SIGNERS=${2:?--allowed-signers 需要檔案}; shift 2 ;;
+    --ca-file) CA_FILE=${2:?--ca-file 需要檔案}; shift 2 ;;
     --install-string) INSTALL_STRING=${2:?--install-string 需要安裝字串}; shift 2 ;;
     --install-string-file)
         f=${2:?--install-string-file 需要檔案}
@@ -69,7 +74,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION=${2:?--version 需要版本}; shift 2 ;;
     --no-enroll) ENROLL=0; shift ;;
     --no-start) START=0; shift ;;
-    -h | --help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,36p' "$0"; exit 0 ;;
     *) die 2 "未知的參數「$1」（--help 查看用法）" ;;
     esac
 done
@@ -77,6 +82,7 @@ done
 [ "$(id -u)" = 0 ] || die 2 "需要 root（以 sudo 執行）"
 [ -n "$BASE_URL" ] || [ -n "$DIR" ] || die 2 "需要 --base-url 或 --dir"
 [ -z "$BASE_URL" ] || [ -z "$DIR" ] || die 2 "--base-url 與 --dir 只能擇一"
+[ -z "$CA_FILE" ] || [ -r "$CA_FILE" ] || die 2 "無法讀取 --ca-file $CA_FILE"
 [ -n "$SIGNERS" ] || die 2 "需要 --allowed-signers（發佈公鑰；從供應商另外提供的管道取得，不要和套件從同一處下載）"
 [ -f "$SIGNERS" ] || die 2 "找不到 $SIGNERS"
 if [ "$ENROLL" = 1 ] && [ -z "$INSTALL_STRING" ]; then
@@ -113,9 +119,18 @@ fetch() {
         [ -f "$DIR/$1" ] || die 5 "$DIR 中沒有 $1"
         cp "$DIR/$1" "$WORK/$1"
     elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto '=https' --tlsv1.2 -o "$WORK/$1" "$BASE_URL/$1" || die 5 "無法下載 $BASE_URL/$1"
+        if [ -n "$CA_FILE" ]; then
+            curl -fsSL --proto '=https' --tlsv1.2 --cacert "$CA_FILE" -o "$WORK/$1" "$BASE_URL/$1" ||
+                die 5 "無法下載 $BASE_URL/$1"
+        else
+            curl -fsSL --proto '=https' --tlsv1.2 -o "$WORK/$1" "$BASE_URL/$1" || die 5 "無法下載 $BASE_URL/$1"
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$WORK/$1" "$BASE_URL/$1" || die 5 "無法下載 $BASE_URL/$1"
+        if [ -n "$CA_FILE" ]; then
+            wget -q --ca-certificate="$CA_FILE" -O "$WORK/$1" "$BASE_URL/$1" || die 5 "無法下載 $BASE_URL/$1"
+        else
+            wget -q -O "$WORK/$1" "$BASE_URL/$1" || die 5 "無法下載 $BASE_URL/$1"
+        fi
     else
         die 3 "需要 curl 或 wget"
     fi

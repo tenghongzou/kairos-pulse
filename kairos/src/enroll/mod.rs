@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod db;
+pub mod downloads;
 pub mod handlers;
 pub mod http;
 pub mod limits;
@@ -61,19 +62,6 @@ pub const CLOSED_KEEP_MS: i64 = 30 * 86_400_000;
 pub const DEREGISTER_WINDOW_MS: i64 = 10 * 60_000;
 /// 時鐘被拒的主機在 token 的部署進度中保留 15 分鐘（API.md 第 11.2 節）
 pub const CLOCK_REJECTED_KEEP_MS: i64 = 15 * 60_000;
-
-/// 下載端點（`/agent/<檔名>`）本版回 404（ENROLL.md 第 19.4 節第 3 項）；主控台據此隱藏一行指令與下載連結
-/// （設計包 INTEGRATION §27.4 #3）
-pub const DOWNLOADS_AVAILABLE: bool = false;
-
-/// 下載端點的狀態（主控台 API 的 `downloads`）
-pub fn downloads_json() -> serde_json::Value {
-    json!({
-        "available": DOWNLOADS_AVAILABLE,
-        "reason": "本版的註冊端點不提供安裝腳本與套件的下載（/agent/ 回 404）",
-        "alternative": "以安裝套件（MSI、deb、rpm）安裝 Pulse 後執行 pulse enroll --install-string <安裝字串>",
-    })
-}
 
 /// 現在時間（Unix 毫秒）；測試可替換
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -171,6 +159,13 @@ pub struct EnrollService {
     last_crl_refresh: Mutex<HashMap<i64, i64>>,
     /// 上次記錄 `KRS-W1304` 的時間（每 24 小時最多一次）
     last_expiry_warning: Mutex<i64>,
+    /// 個資政策（`[privacy]`）：註冊申請的主機名稱與顯示名稱
+    pub privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// 下載端點的同時數（L11）
+    pub download_slots: Arc<downloads::Slots>,
+    /// 已撤銷（生效）、由外部 CA 簽發而匯入的憑證序號（Kairos 不產生它們的 CRL：8443 在 hello 時拒絕；
+    /// 每 [`TICK`] 由資料庫更新）
+    revoked_external: RwLock<HashSet<String>>,
 }
 
 /// 各層的限流狀態
@@ -333,7 +328,30 @@ impl EnrollService {
             last_minutely: Mutex::new(0),
             last_crl_refresh: Mutex::new(HashMap::new()),
             last_expiry_warning: Mutex::new(0),
+            privacy: Arc::new(crate::privacy::PrivacyPolicy::load(
+                p.config.privacy,
+                &p.data_dir,
+            )),
+            revoked_external: RwLock::new(HashSet::new()),
+            download_slots: Arc::new(downloads::Slots::default()),
         });
+        svc.refresh_revoked_external(now);
+        if let Some(dir) = svc.download_dir() {
+            let st = downloads::status(Some(&dir));
+            if st.available {
+                info!(
+                    "下載端點 /agent/：{}（{} 個檔案）",
+                    dir.display(),
+                    st.files.len()
+                );
+            } else {
+                warn!(
+                    "警告 {}：{}",
+                    downloads::CODE_INCOMPLETE,
+                    st.reason.unwrap_or_default()
+                );
+            }
+        }
         // 簽發 CA、信任錨與 CRL：啟動時同步一次（8443 的 TLS 驗證器需要它們）
         svc.sync_pki(now, true);
         svc.evaluate_pause(now);
@@ -473,6 +491,64 @@ impl EnrollService {
     }
 
     // ---- 除役 ----
+
+    /// 下載端點的目錄（`enroll.download_dir`；未設定時 `None`）
+    pub fn download_dir(&self) -> Option<PathBuf> {
+        let d = self.config.enroll.download_dir.trim();
+        (!d.is_empty()).then(|| PathBuf::from(d))
+    }
+
+    /// 註冊端點對外的位址（`enroll.advertise`，否則實際監聽的位址）
+    pub fn enroll_endpoint(&self) -> String {
+        let adv = self.config.enroll.advertise.trim();
+        if !adv.is_empty() {
+            return adv.to_string();
+        }
+        server::Listener::local_addr(self)
+            .unwrap_or_else(|| self.config.enroll.listen_addr(&self.config.server.listen))
+    }
+
+    /// 主控台 API 的 `downloads`（設計包 INTEGRATION §27.4 #3：不可用時主控台隱藏一行指令與下載連結）
+    pub fn downloads_json(&self) -> serde_json::Value {
+        let endpoint = kairos_proto::enroll::normalize_endpoint(&self.enroll_endpoint())
+            .unwrap_or_else(|_| self.enroll_endpoint());
+        downloads::status_json(
+            self.download_dir().as_deref(),
+            &format!("https://{endpoint}/agent"),
+        )
+    }
+
+    /// 這張（外部 CA 簽發、匯入的）憑證是否已撤銷：8443 在 hello 時拒絕（PKI.md 第 16 節）
+    pub fn is_revoked_external(&self, serial: &str) -> bool {
+        self.revoked_external
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(serial)
+    }
+
+    /// 從資料庫更新 [`EnrollService::is_revoked_external`] 的清單（撤銷已生效、憑證過期未超過 1 天）
+    fn refresh_revoked_external(&self, now: i64) {
+        let r = self.db.read_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT serial FROM pki_certificates WHERE ca_id IS NULL AND revoked_at IS NOT NULL
+                 AND revoke_effective_at <= ?1 AND not_after > ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![now, now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS],
+                |r| r.get::<_, String>(0),
+            )?;
+            Ok(rows.collect::<rusqlite::Result<HashSet<String>>>()?)
+        });
+        match r {
+            Ok(set) => {
+                *self
+                    .revoked_external
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = set;
+            }
+            Err(e) => debug!("無法讀取匯入憑證的撤銷清單（沿用目前的清單）：{e}"),
+        }
+    }
 
     pub fn is_decommissioned(&self, agent_id: &str) -> bool {
         self.decommissioned
@@ -883,6 +959,8 @@ impl EnrollService {
                     "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
                     [now - 400 * 86_400_000],
                 )?;
+                // 刪除主機資料時為了 CRL 保留的已撤銷憑證：過期超過 1 天後刪除（PRIVACY.md 第 4 節）
+                crate::store::purge::delete_orphan_certificates(conn, now)?;
                 Ok((expired, purged))
             });
             match result {
@@ -910,6 +988,7 @@ impl EnrollService {
                 this.evaluate_pause(now);
                 this.issue_pending(now);
                 this.sync_pki(now, false);
+                this.refresh_revoked_external(now);
                 this.notify_external_changes();
                 this.periodic(now);
             })

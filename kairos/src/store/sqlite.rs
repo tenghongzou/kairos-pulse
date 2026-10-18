@@ -43,6 +43,8 @@ use crate::throttled;
 
 #[path = "sqlite_assets.rs"]
 mod sqlite_assets;
+#[path = "sqlite_purge.rs"]
+mod sqlite_purge;
 
 /// 資料庫檔名（放在 `storage.data_dir`）
 pub const DB_FILE: &str = "kairos.db";
@@ -934,7 +936,7 @@ fn prepare_files(path: &Path) -> Result<(), Error> {
 /// 這裡會在 `busy` 之後回 [`ErrorKind::ResourceBusy`]；取得之後，匯入期間 Kairos 也無法啟動、
 /// `hosts list` 等唯讀查詢會等待後失敗，不會有第二個寫入者。exclusive 模式下 WAL 不使用共享記憶體
 /// （`-shm`），關閉時 checkpoint 並刪除 `-wal`。
-pub(super) fn open_exclusive(opts: &SqliteOptions, busy: Duration) -> Result<Connection, Error> {
+pub(crate) fn open_exclusive(opts: &SqliteOptions, busy: Duration) -> Result<Connection, Error> {
     prepare_files(&opts.path)?;
     let path = opts.path.display().to_string();
     let conn = Connection::open_with_flags(
@@ -1595,6 +1597,9 @@ pub struct SqliteStore {
     pending_inventory: VecDeque<InventoryRow>,
     /// 每台主機上次記錄「序列數已達上限」的時間（`KRS-W4104`）
     series_cap_logged: HashMap<String, Instant>,
+    /// 正在刪除或剛刪除資料的主機（`agent_id` → 開始的時間）：這段期間不寫入它的 report、資產與清冊，
+    /// 避免刪除後又被建立回來（[`sqlite_purge::PURGE_HOLD`]）
+    purging: HashMap<String, Instant>,
     /// 測試用的失敗注入
     pub(crate) fail_next: Option<FailPoint>,
 }
@@ -1636,6 +1641,7 @@ impl SqliteStore {
             rollup_stale: false,
             pending_inventory: VecDeque::new(),
             series_cap_logged: HashMap::new(),
+            purging: HashMap::new(),
             fail_next: None,
         };
         store.ensure_ready().map_err(Error::other)?;
@@ -1787,6 +1793,10 @@ impl SqliteStore {
                 .map_err(before)?;
             let mut record_samples: Vec<Sample> = Vec::new();
             'records: for (i, r) in records.iter().enumerate() {
+                // 正在刪除資料的主機（reject_purging 已標為失敗）
+                if !matches!(statuses[i], WriteStatus::Written) {
+                    continue;
+                }
                 let recv_ms = r.recv_at.timestamp_millis();
                 // 取樣時間：durable report 為 client 的 ts（補送的歷史資料），否則為收到的時間
                 let ts = sample_time_ms(r);
@@ -2000,6 +2010,7 @@ impl SqliteStore {
             return vec![WriteStatus::Failed(reason); records.len()];
         }
         let mut statuses = vec![WriteStatus::Written; records.len()];
+        self.reject_purging(records, &mut statuses);
         let mut samples = Vec::new();
         let mut capped = Vec::new();
         let result = self.insert_batch(records, &mut statuses, &mut samples, &mut capped);
@@ -2585,7 +2596,11 @@ impl SqliteStore {
     fn sync(&mut self, snapshot: &RegistrySnapshot) -> rusqlite::Result<usize> {
         let mut rows = VecDeque::new();
         let mut new_hosts = 0;
+        self.expire_purging();
         for agent in &snapshot.agents {
+            if self.purging.contains_key(agent.agent_id.as_str()) {
+                continue;
+            }
             let row = InventoryRow::of(agent, self.opts.mtls);
             let entry = self.caches.hosts.get(agent.agent_id.as_str());
             let unchanged = entry.and_then(|e| e.synced).is_some_and(|(hash, seen)| {
@@ -2950,7 +2965,14 @@ impl ReportStore for SqliteStore {
         &mut self,
         write: &crate::store::AssetWrite,
     ) -> Result<crate::store::AssetOutcome, String> {
+        if self.purging.contains_key(&write.agent_id) {
+            return Err(sqlite_purge::PURGING.to_string());
+        }
         self.store_assets(write)
+    }
+
+    fn purge_step(&mut self, job: &mut crate::store::purge::PurgeJob) -> Result<bool, String> {
+        self.purge(job)
     }
 
     fn sync_inventory(&mut self, snapshot: &RegistrySnapshot) {

@@ -86,6 +86,7 @@ pub const PKI_USAGE: &str = "kairos pki — 簽發 CA、憑證與 CRL（kairos/P
   kairos pki issuing-ca activate <ca_id>
   kairos pki issuing-ca retire <ca_id> --confirm \"重建 CA\" [--compromised]
   kairos pki certificates list [--state <狀態>] [--expires-within <時間>]
+  kairos pki certificates import <憑證檔或目錄>... [--agent-id <agent_id>]（手動簽發的既有憑證匯入簽發紀錄）
   kairos pki revoke <序號 | agent_id>... --reason <原因> --comment <說明> [--yes --expect-count <N>]
   kairos pki queue export [--out <檔案>]
   kairos pki queue import <檔案>
@@ -127,6 +128,8 @@ pub enum Group {
     Enroll,
     Pki,
     Config,
+    /// `kairos hosts purge|export|pseudonym`（[`crate::privacy_cli`]）
+    Hosts,
 }
 
 /// 解析後的命令
@@ -144,8 +147,9 @@ pub struct Cmd {
     pub help: bool,
 }
 
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "--yes",
+    "--dry-run",
     "--all",
     "--closed",
     "--batch",
@@ -187,6 +191,7 @@ impl Cmd {
             Group::Enroll => "enroll",
             Group::Pki => "pki",
             Group::Config => "config",
+            Group::Hosts => "hosts",
         };
         let action = match (self.group, self.sub(0), self.sub(1)) {
             (
@@ -265,6 +270,7 @@ fn usage(group: Group) -> &'static str {
         Group::Enroll => ENROLL_USAGE,
         Group::Pki => PKI_USAGE,
         Group::Config => CONFIG_USAGE,
+        Group::Hosts => crate::privacy_cli::USAGE,
     }
 }
 
@@ -337,6 +343,7 @@ pub fn execute(cmd: &Cmd, env: &mut Env<'_>) -> Output {
         Group::Enroll => enroll_cmd(cmd, env),
         Group::Pki => pki_cmd(cmd, env),
         Group::Config => config_cmd(cmd, env),
+        Group::Hosts => crate::privacy_cli::execute(cmd, env),
     };
     match result {
         Ok(out) => out,
@@ -1556,6 +1563,129 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     exit: 0,
                 }),
             }
+        }
+        (Some("certificates"), Some("import")) => {
+            // 手動簽發（外部 CA）的既有憑證匯入簽發紀錄（PKI.md 第 16 節）
+            let paths = &cmd.args[2..];
+            if paths.is_empty() {
+                return Err(usage_err("需要憑證檔或目錄（PEM，可含多張；或 DER）"));
+            }
+            let config = load_config(cmd.config_path.as_deref())?;
+            let mut files: Vec<PathBuf> = Vec::new();
+            for p in paths {
+                let path = PathBuf::from(p);
+                let meta =
+                    std::fs::symlink_metadata(&path).map_err(|e| usage_err(format!("{p}：{e}")))?;
+                if meta.is_dir() {
+                    let mut found: Vec<PathBuf> = std::fs::read_dir(&path)
+                        .map_err(|e| usage_err(format!("{p}：{e}")))?
+                        .filter_map(Result::ok)
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                        .map(|e| e.path())
+                        .filter(|f| {
+                            f.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                                matches!(
+                                    x.to_ascii_lowercase().as_str(),
+                                    "pem" | "crt" | "cer" | "der"
+                                )
+                            })
+                        })
+                        .collect();
+                    found.sort();
+                    files.extend(found);
+                } else if meta.is_file() {
+                    files.push(path);
+                } else {
+                    return Err(usage_err(format!(
+                        "{p} 不是一般檔案或目錄（不跟隨符號連結）"
+                    )));
+                }
+            }
+            let mut conn = db(cmd)?;
+            let anchors = crate::pki::queue::anchors(&conn, config.auth.client_ca_path());
+            let expected = cmd.opt("--agent-id");
+            let by = operator();
+            let mut results: Vec<(String, Result<crate::pki::queue::ExistingImport, String>)> =
+                Vec::new();
+            for f in &files {
+                let label = f.display().to_string();
+                match std::fs::read(f)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| crate::pki::queue::certificates_in(&b))
+                {
+                    Ok(ders) => {
+                        let many = ders.len() > 1;
+                        for (i, der) in ders.iter().enumerate() {
+                            let l = if many {
+                                format!("{label}#{}", i + 1)
+                            } else {
+                                label.clone()
+                            };
+                            results.push((
+                                l,
+                                crate::pki::queue::import_existing(
+                                    &mut conn, der, &anchors, expected, &by, None, now_ms,
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) => results.push((label, Err(e))),
+                }
+            }
+            if results.is_empty() {
+                return Err(usage_err("目錄中沒有 .pem、.crt、.cer、.der 檔"));
+            }
+            let failed = results.iter().any(|(_, r)| r.is_err());
+            if cmd.json {
+                let mut o = ok_json(
+                    cmd,
+                    env.now,
+                    json!({"results": results.iter().map(|(s, r)| crate::pki::queue::existing_json(s, r)).collect::<Vec<_>>()}),
+                );
+                o.exit = if failed { EXIT_CERT } else { 0 };
+                return Ok(o);
+            }
+            let mut text = String::new();
+            for (s, r) in &results {
+                match r {
+                    Ok(crate::pki::queue::ExistingImport::Imported {
+                        serial,
+                        agent_id,
+                        not_after_ms,
+                        expired,
+                        new_host,
+                        ..
+                    }) => text.push_str(&format!(
+                        "{} {s}：已匯入（序號 {serial}，agent_id {agent_id}，到期 {}{}{}）
+",
+                        mark(env),
+                        human_time(*not_after_ms, env.tz),
+                        if *expired { "，已過期" } else { "" },
+                        if *new_host {
+                            "，清冊新增這台主機"
+                        } else {
+                            ""
+                        },
+                    )),
+                    Ok(crate::pki::queue::ExistingImport::Already { serial, .. }) => {
+                        text.push_str(&format!(
+                            "{} {s}：先前已匯入（序號 {serial}）
+",
+                            mark(env)
+                        ))
+                    }
+                    Err(e) => text.push_str(&format!(
+                        "{} {s}：錯誤 KRS-E1305：不通過：{e}
+",
+                        if env.unicode { "✗" } else { "[FAIL]" }
+                    )),
+                }
+            }
+            Ok(Output {
+                stdout: text,
+                exit: if failed { EXIT_CERT } else { 0 },
+                ..Default::default()
+            })
         }
         (Some("queue"), Some("import")) => {
             let path = cmd

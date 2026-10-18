@@ -22,6 +22,7 @@ pub const HOSTS_USAGE: &str = "kairos hosts list — 列出主機清冊（SQLite
 
 用法：
   kairos hosts list [選項]
+  kairos hosts purge|export|pseudonym …（刪除主機資料、匯出個資、查詢假名；kairos hosts purge --help）
 
 選項：
   --offline-for <時間>  只列出失聯（離線或狀態未知）至少這麼久的主機，例如 90m、12h、3d、2w
@@ -50,6 +51,8 @@ pub const JSON_SCHEMA: &str = "kairos.hosts.list/v1";
 pub enum HostsCommand {
     Help,
     List(ListOptions),
+    /// `purge`、`export`、`pseudonym`（[`crate::privacy_cli`]）
+    Privacy(crate::enroll_cli::Cmd),
 }
 
 /// `kairos hosts list` 的選項
@@ -93,12 +96,21 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
 pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<HostsCommand, String> {
     let mut args = args.peekable();
     match args.next() {
-        None => return Err("kairos hosts 需要子命令（目前只有 list）".to_string()),
+        None => {
+            return Err("kairos hosts 需要子命令（list、purge、export、pseudonym）".to_string());
+        }
         Some(a) if a == "-h" || a == "--help" => return Ok(HostsCommand::Help),
         Some(a) if a == "list" => {}
+        Some(a) if a == "purge" || a == "export" || a == "pseudonym" => {
+            return crate::enroll_cli::parse_args(
+                crate::enroll_cli::Group::Hosts,
+                std::iter::once(a).chain(args),
+            )
+            .map(HostsCommand::Privacy);
+        }
         Some(a) => {
             return Err(format!(
-                "無法辨識的子命令: {}（目前只有 list）",
+                "無法辨識的子命令: {}（list、purge、export、pseudonym）",
                 a.to_string_lossy()
             ));
         }
@@ -358,7 +370,11 @@ pub fn render_human(
             status_label(l.status, unicode).to_string(),
             name,
             agent_id,
-            r.peer.as_deref().map(ip_of).unwrap_or_else(|| "-".into()),
+            r.peer
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(ip_of)
+                .unwrap_or_else(|| "-".into()),
             relative(now, r.last_seen),
         ];
         if opts.wide {
@@ -465,7 +481,7 @@ pub fn render_json(rows: &[HostRow], now: DateTime<Utc>, opts: &ListOptions) -> 
             last_seen: fmt_time(r.last_seen),
             silent_secs: (now - r.last_seen).num_seconds().max(0),
             first_seen: fmt_time(r.first_seen),
-            ip: r.peer.as_deref().map(ip_of),
+            ip: r.peer.as_deref().filter(|p| !p.is_empty()).map(ip_of),
             peer: r.peer.as_deref(),
             agent_version: r.agent_version.as_deref(),
             proto: r.proto,
@@ -615,6 +631,7 @@ pub fn run(cmd: HostsCommand) -> u8 {
             return 0;
         }
         HostsCommand::List(opts) => opts,
+        HostsCommand::Privacy(cmd) => return crate::enroll_cli::run(cmd),
     };
     let now = Utc::now();
     let unicode = !opts.json && use_unicode(opts.ascii);

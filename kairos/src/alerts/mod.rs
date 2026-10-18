@@ -889,6 +889,17 @@ impl AlertService {
         r
     }
 
+    /// 刪除主機資料之前：引擎忘記這台主機的進行中事件（之後不再寫入它們；資料表中的列由刪除工作刪除）。
+    /// 回傳忘記的事件數
+    pub async fn forget_host(&self, agent_id: &str) -> usize {
+        let mut engine = self.engine.lock().await;
+        let n = engine.forget_agent(agent_id);
+        let out = engine.take_output();
+        drop(engine);
+        self.flush(out).await;
+        n
+    }
+
     /// 規則的快照
     pub async fn rules(&self) -> Vec<model::Rule> {
         self.engine.lock().await.rules().to_vec()

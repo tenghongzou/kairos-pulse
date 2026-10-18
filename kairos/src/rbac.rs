@@ -89,11 +89,15 @@ pub enum Permission {
     ChannelsWrite,
     /// 指標轉出（Prometheus exporter、OTLP）的設定與測試連線（S21「整合」；OTLP 標頭含機密：只有管理員）
     ExportWrite,
+    /// 刪除一台主機的所有資料（S05「刪除主機資料」L2；商業審計 S6：只有管理員）
+    HostsPurge,
+    /// 匯出一台主機的個資（資料主體存取請求；商業審計 S6：只有管理員）
+    HostsPersonalData,
 }
 
 impl Permission {
     /// 所有權限（新增變體時同步加入；測試會檢查沒有遺漏與名稱不重複）
-    pub const ALL: [Permission; 36] = [
+    pub const ALL: [Permission; 38] = [
         Permission::HostsRead,
         Permission::HealthRead,
         Permission::EnrollRead,
@@ -130,6 +134,8 @@ impl Permission {
         Permission::ChannelsTest,
         Permission::ChannelsWrite,
         Permission::ExportWrite,
+        Permission::HostsPurge,
+        Permission::HostsPersonalData,
     ];
 
     /// 對外的名稱（穩定；`<資源>:<動作>`）
@@ -171,6 +177,8 @@ impl Permission {
             Permission::ChannelsTest => "channels:test",
             Permission::ChannelsWrite => "channels:write",
             Permission::ExportWrite => "export:write",
+            Permission::HostsPurge => "hosts:purge",
+            Permission::HostsPersonalData => "hosts:personal_data",
         }
     }
 
