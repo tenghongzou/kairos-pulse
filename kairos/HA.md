@@ -691,7 +691,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
   - **降版安全**：舊版 Pulse 忽略不認得的鍵，降版後照常連 `address`，不會因為設定檔中的陣列而無法啟動。
   - `pulse enroll` 改寫設定檔的工具（`enroll/toml_edit.rs`）只會寫單值，`address` 維持單值就不必改它。
   - 與 Kairos 的 `ldap.fallback_urls` 同樣的命名慣例。
-- **環境變數**：`PULSE_SERVER_FALLBACK_ADDRESSES` 以逗號分隔（Pulse 的環境變數目前不支援陣列，這個鍵是第一個例外，實作時一併定義規則：逗號分隔、去除前後空白、空字串表示沒有）。
+- **環境變數**：`PULSE__SERVER__FALLBACK_ADDRESSES`（與 Pulse 其他環境變數相同的雙底線寫法）以逗號分隔（Pulse 的環境變數目前不支援陣列，這個鍵是第一個例外：逗號分隔、去除前後空白、空字串表示沒有）。
 - **驗證**：每個項目依 ENROLL.md 第 14.6 節的端點正規寫法解析（IPv6 必須加 `[]`）；不合法時 `PLS-E0201`（既有代碼，設定值不合法）。`srv` 必須是 `_服務._tcp.網域` 的形式。
 - **`server.domain` 不變**：所有候選位址都以同一個名稱驗證伺服器憑證，見第 8.5 節。
 
@@ -731,8 +731,8 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
 
 ### 8.6 註冊通道（8444）的位址
 
-- `enroll.address` 為空字串（預設）時，註冊端點跟著候選清單走：每個候選位址的主機加上 `enroll.port`。新註冊、輪詢與過期續簽在一個候選位址失敗時改試下一個。
-- `enroll.address` 有設定時只用它（與現在相同）。
+- **0.9.0 的實作：8444 不跟著候選清單走**，仍只用 `enroll.address`（空字串時為 `server.address` 的主機）＋`enroll.port`；叢集部署請把 `enroll.address` 設為負載平衡器或虛擬 IP 的名稱。
+- 0.10.0 預定：`enroll.address` 為空字串（預設）時，註冊端點跟著候選清單走：每個候選位址的主機加上 `enroll.port`。新註冊、輪詢與過期續簽在一個候選位址失敗時改試下一個。`enroll.address` 有設定時只用它（與現在相同）。
 - **安裝字串不變**（`pulse-enroll:v1:`，`s` 與 `e` 都是單一端點；ENROLL.md 第 14.7 節不允許未知欄位）。叢集部署的安裝字串一律使用服務名稱（LB 或虛擬 IP）。多位址在註冊後以設定檔或環境變數加入；若之後要讓安裝字串攜帶多個位址，需要 `pulse-enroll:v2:`（第 21 節 #10）。
 
 ### 8.7 狀態與可觀測性
@@ -1184,10 +1184,10 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 
 ### 18.1 feature `cluster`
 
-- Pulse 支援本節的功能時在 `hello.features` 宣告 `cluster`。Kairos 在**叢集模式下且 client 也宣告時**才在 `hello_ack.features` 列出（沿用 `renew` 的先例：沒有宣告的 client 收到的 `hello_ack` 與 0.8 完全相同）。
+- Pulse 支援本節的功能時在 `hello.features` 宣告 `cluster`（Pulse 0.9 一律宣告）。Kairos 在 **client 也宣告時**就在 `hello_ack.features` 列出——**單機的 Kairos 0.9 也宣告**（帶節點名稱、關機時排空），不限叢集模式（沿用 `renew` 的先例：沒有宣告的 client 收到的 `hello_ack` 與 0.8 完全相同）。
 - 協商了 `cluster` 時，`hello_ack` 另帶：
-  - `server_node`（string，`cluster.node_id`，1～63 bytes）；
-  - `cluster_id`（string，UUID）。
+  - `server_node`（string，`cluster.node_id`，1～63 bytes；單機時預設為主機名稱的第一段）；
+  - `cluster_id`（string，UUID；只在叢集模式送，單機的 Kairos 不送）。
 
   Pulse 寫入狀態檔與日誌，用來診斷「連上哪個節點」與「是不是同一個叢集」。型別不符時視為沒有。
 - 協商了 `cluster` 時，Kairos 可以送 `drain`（第 18.2 節）。
@@ -1219,6 +1219,8 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 
 記 `KRS-I8407`（暫定）。
 
+**0.9.0 的實作（單機）**：還沒有 `kairos cluster drain`；Kairos 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reason`＝`node_draining`，`reconnect_within_ms`＝`max(10000, 線上連線數 × 5)`）再 `close_notify`，其他連線照舊直接關閉，關機日誌記 `KRS-I8407`。
+
 **沒有協商 `cluster` 時**，Kairos 不送 `drain`。舊版 Pulse 收到不認得的 `type` 只會記 DEBUG 並忽略（第 2.4 節），所以即使誤送也不會壞，但規格上不送。
 
 ### 18.3 不變的部分
@@ -1226,7 +1228,7 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 - 協定版本 v1～v2、`hello`、`report`、`ack`、`error` 的格式與錯誤碼都不變。**不新增錯誤碼**：資料庫無法寫入沿用 `storage_unavailable`，跨節點踢除沿用 `superseded`。
 - 「伺服器回應延遲最多 8 秒」的預算不變（PostgreSQL 的 `statement_timeout` 與 `timeouts.write_secs` 相同）。
 - `hello_ack.offline_after_ms` 的計算不變。
-- 8444 的協定（ENROLL.md）不變；`server-info` 的 `features` 會包含 `cluster`（與 `hello_ack.features` 同一份）。
+- 8444 的協定（ENROLL.md）不變。`server-info` 的 `features` **0.9.0 暫不加入** `cluster`（8444 還不跟著候選清單走，第 8.6 節）；0.10.0 再與 `hello_ack.features` 對齊。
 
 ## 19. 暫定錯誤代碼
 
@@ -1280,7 +1282,7 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 | **L1b PostgreSQL 後端** | `postgres::*` 實作；schema v9（兩種後端）；第 5.4 節的並行改寫；稽核鏈（第 12 節）；leader 版彙總與速率（第 7.3、7.4 節）；容量計算；PostgreSQL 的測試與量測（第 7.6 節的目標） | 新 `store/postgres/`、`store/rollup_pg.rs` | 4～4.5 人週（可兩人分：報告路徑與彙總一人，領域 store 一人） | L1a 的介面定稿 |
 | **L2 叢集協調（階段 A）** | `[cluster]` 設定；`cluster_nodes` 心跳；租約與 fencing；`LeaderJobs` 監督器；備援的生命週期（不監聽、接手、失去租約時結束）；`cluster_revs` 與 `LISTEN/NOTIFY`；金鑰指紋與停用自動建立；設定雜湊；`/readyz` 與 scope；系統健康 `cluster`；`/metrics`；日誌的 `node`；PROXY protocol v2；告警的換手判斷（第 13.2 節） | 新 `cluster/`、`main.rs`、`probe.rs`、`api/health.rs`、`alerts/mod.rs`、`users/secrets.rs`、`alerts/secrets.rs`、`audit.rs`、`per_ip.rs` | 3 人週 | L1a（介面）；可先以 PostgreSQL 直接開發租約 |
 | **L3 遷移與維運** | `kairos db migrate`（兩個方向、驗證、`--reports-since`）；`kairos cluster init／status／keys／drain／step-down／forget`；`kairos.keys-backup/v2`；`--check-config` 的 PostgreSQL 與叢集檢查；`kairos diag` 收集叢集資訊；`packaging/`：設定範例、systemd（`Restart=always`、結束代碼 75）、HAProxy 與 keepalived 範例、INSTALL 的 HA 章節與階段 0 附錄；CHANGELOG 與相容矩陣 | `store/migrate.rs`（新）、`cluster_cli.rs`（新）、`keys_backup.rs`、`config.rs`、`diag.rs`、`packaging/` | 2 人週 | L1b 的 schema、L2 的 CLI 介面 |
-| **L4 Pulse 多位址** | `server.fallback_addresses`、候選清單與輪替（第 8.2、8.3 節）、每 IP 的連線時限、註冊端點跟著候選清單、狀態檔與 `pulse status`、`diag`、本機指標；feature `cluster`（`server_node`、`cluster_id`、`drain` 的處理）與 `kairos-proto` 的型別 | `pulse/src/network.rs`（`Dialer`）、`config_manager.rs`、`enroll/`、`status_file.rs`、`status_cmd/`、`diag.rs`、`metrics.rs`、`crates/kairos-proto` | 2 人週 | 無（**可以立即開始**）；Kairos 端的 `drain` 在 L2 或 L5 |
+| **L4 Pulse 多位址** | `server.fallback_addresses`、候選清單與輪替（第 8.2、8.3 節）、每 IP 的連線時限、註冊端點跟著候選清單（0.10.0，第 8.6 節）、狀態檔與 `pulse status`、`diag`、本機指標；feature `cluster`（`server_node`、`cluster_id`、`drain` 的處理）與 `kairos-proto` 的型別 | `pulse/src/network.rs`（`Dialer`）、`config_manager.rs`、`enroll/`、`status_file.rs`、`status_cmd/`、`diag.rs`、`metrics.rs`、`crates/kairos-proto` | 2 人週 | 無（**可以立即開始**）；Kairos 端的 `drain` 在 L2 或 L5 |
 | **L4s Pulse SRV**（選用） | `server.srv`、`hickory-resolver`、RFC 2782 排序與快取 | `pulse/src/network.rs` | 0.5～1 人週 | L4 |
 | **L5 多主動（階段 B1）** | `host_presence` 與跨節點踢除（第 6.5 節）；`ClusterView`；`cluster_events`（SSE、匯流排到 leader）；清冊同步改為依節點；告警的主機狀態改讀 `ClusterView`；`/readyz?scope=enroll|console` 只給 leader；排空的 Kairos 端；`decommissioned` 重讀 | `registry.rs`、`connection.rs`、`monitor.rs`、`api/hosts.rs`、`api/events.rs`、`api/overview.rs`、`alerts/mod.rs`、`enroll/mod.rs`、`cluster/` | 3.5～4 人週 | L1b、L2 |
 | **L6 HA 端對端與故障注入** | `tests/e2e` 的叢集情境：PostgreSQL＋2～3 個 Kairos＋HAProxy 的容器組合（在 kp-build 執行）；第 17 節 F1～F17 的自動化（殺行程、凍結、`iptables` 隔離資料庫、PostgreSQL 切換）；驗證「補送不缺號、不重複」、稽核鏈連續、告警不重複開事件、通知最多重送一則 | `tests/e2e/` | 1.5 人週 | L1b、L2（階段 A）；L5（階段 B） |

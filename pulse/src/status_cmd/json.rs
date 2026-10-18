@@ -69,6 +69,12 @@ struct Connection<'a> {
     proto: Option<u32>,
     features: &'a [String],
     last_error: Option<&'a str>,
+    /// 多個伺服器位址（`kairos/HA.md` 第 8.7 節）：連上的節點、候選位址的數量與索引、
+    /// 所有位址都失敗時每個位址最後的錯誤
+    server_node: Option<&'a str>,
+    candidates: Option<u32>,
+    candidate_index: Option<u32>,
+    candidate_errors: &'a [sf::CandidateError],
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +201,10 @@ pub fn document(input: &JsonInput) -> String {
             proto: c.proto,
             features: &c.features,
             last_error: c.last_error.as_deref(),
+            server_node: c.server_node.as_deref(),
+            candidates: c.candidates,
+            candidate_index: c.candidate_index,
+            candidate_errors: &c.candidate_errors,
         }
     });
     let reporting = file.map(|f| {

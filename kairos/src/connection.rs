@@ -48,8 +48,9 @@ use crate::tls::{
     MSG_CERTIFICATE_REJECTED, RevocationFailure, TlsState, revocation_failure, verify_chain,
 };
 use kairos_proto::{
-    FEATURE_INVENTORY, FEATURE_PROCESSES, INVENTORY_MIN_INTERVAL_MS, InventoryReport,
-    validate_inventory, validate_process_list,
+    DRAIN_REASON_NODE_DRAINING, FEATURE_CLUSTER, FEATURE_INVENTORY, FEATURE_PROCESSES,
+    INVENTORY_MIN_INTERVAL_MS, InventoryReport, drain_reconnect_within_ms, validate_inventory,
+    validate_process_list,
 };
 
 /// 送出 close_notify 後，讀取並丟棄對方剩餘資料的最長時間（平常；關機期間另有更短的上限）。
@@ -141,6 +142,36 @@ pub struct ConnContext {
     pub assets: Option<crate::store::AssetSink>,
     /// 個資政策（`[privacy]`，`kairos/PRIVACY.md`）：保存前轉換主機名稱、來源位址、行程與資產
     pub privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// feature `cluster`：節點名稱與關機時送出的 `drain` 計數
+    pub cluster: ClusterContext,
+}
+
+/// feature `cluster`（PROTOCOL.md「叢集與排空」）的伺服器端狀態
+#[derive(Debug)]
+pub struct ClusterContext {
+    /// `hello_ack.server_node`（`cluster.node_id`，預設由主機名稱導出）
+    pub node_id: Arc<str>,
+    /// 關機時送出 `drain` 的連線數（關機日誌 `KRS-I8407`）
+    pub drains_sent: std::sync::atomic::AtomicU64,
+    /// 關機時的 `reconnect_within_ms`（第一條送 `drain` 的連線依線上數計算一次，其他連線沿用）
+    drain_window: std::sync::OnceLock<u32>,
+}
+
+impl ClusterContext {
+    pub fn new(node_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            drains_sent: std::sync::atomic::AtomicU64::new(0),
+            drain_window: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 關機排空的分散時間：`max(10000, 線上連線數 × 5)` ms（只計算一次）
+    pub fn drain_window(&self, registry: &Registry) -> u32 {
+        *self
+            .drain_window
+            .get_or_init(|| drain_reconnect_within_ms(registry.counts().0))
+    }
 }
 
 /// Kairos 宣告的 feature：[`SERVER_FEATURES`]，儲存後端保存資產與行程時（SQLite）另加 `inventory`、
@@ -654,6 +685,8 @@ struct Agent {
     deregister: bool,
     /// hello 的 `intent` 為 `deregister`
     intent_deregister: bool,
+    /// 雙方都宣告 `cluster`（v2）：`hello_ack` 帶 `server_node`，關機時送 `drain`
+    cluster: bool,
 }
 
 /// 從 hello 取出、交給 [`Conn::accept_hello`] 的欄位
@@ -807,6 +840,8 @@ struct Conn {
     privacy: Arc<crate::privacy::PrivacyPolicy>,
     /// 要保存的來源位址（`privacy.store_peer_ip`；狀態表、清冊、report、資產）。日誌與限速仍用 `peer`
     stored_peer: String,
+    /// `hello_ack.server_node`（協商了 `cluster` 時）
+    node_id: Arc<str>,
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
@@ -887,6 +922,7 @@ pub async fn handle_connection(
         assets: ctx.assets.clone(),
         privacy: ctx.privacy.clone(),
         stored_peer: ctx.privacy.peer(peer),
+        node_id: ctx.cluster.node_id.clone(),
     };
 
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
@@ -1033,6 +1069,9 @@ impl Conn {
             if agent.deregister {
                 f.push(FEATURE_DEREGISTER.to_string());
             }
+            if agent.cluster {
+                f.push(FEATURE_CLUSTER.to_string());
+            }
             (Some(f), Some(fmt_time(Utc::now())))
         } else {
             // v1：hello_ack 與 v1 Kairos 完全相同
@@ -1061,8 +1100,42 @@ impl Conn {
             server_time,
             expired_renew_grace_days: renew.expired_renew_grace_days,
             renew_now: renew.renew_now,
+            // 叢集模式（cluster_id）留待之後的版本；單機的 Kairos 只帶節點名稱
+            server_node: agent.cluster.then(|| self.node_id.to_string()),
+            cluster_id: None,
         };
         self.send(&msg).await
+    }
+
+    /// 優雅關機：協商了 `cluster` 的連線先送 `drain`（PROTOCOL.md「叢集與排空」），讓 agent 在
+    /// `reconnect_within_ms` 內分散改連其他節點；之後照常送 close_notify。寫出不超過連線收尾期限，
+    /// 失敗時直接關閉（agent 視為一般斷線）。回傳是否送出
+    async fn send_drain_for_shutdown(&mut self, reconnect_within_ms: u32) -> bool {
+        let remaining = match self.shutdown.started_at() {
+            Some(t0) => {
+                (t0 + CONNECTIONS_DEADLINE).saturating_duration_since(std::time::Instant::now())
+            }
+            None => self.write_timeout,
+        };
+        let limit = self.write_timeout.min(remaining);
+        if limit.is_zero() {
+            return false;
+        }
+        let msg = ServerMsg::drain(DRAIN_REASON_NODE_DRAINING, reconnect_within_ms);
+        let Ok(line) = msg.to_line() else {
+            return false;
+        };
+        match timeout(limit, self.framed.send(line)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                debug!("[#{}] {} 送出 drain 失敗：{}", self.conn_id, self.peer, e);
+                false
+            }
+            Err(_) => {
+                debug!("[#{}] {} 送出 drain 逾時", self.conn_id, self.peer);
+                false
+            }
+        }
     }
 
     /// `renew_request`：正常輪替（PROTOCOL.md「憑證輪替與除役」）。錯誤都不是 fatal
@@ -1621,6 +1694,7 @@ impl Conn {
             renew,
             deregister,
             intent_deregister: ext.intent.as_deref() == Some(INTENT_DEREGISTER),
+            cluster: session.is_v2() && client_features.iter().any(|f| f == FEATURE_CLUSTER),
         }))
     }
 
@@ -1760,6 +1834,16 @@ impl Conn {
             tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => {
+                    if agent.cluster
+                        && self
+                            .send_drain_for_shutdown(ctx.cluster.drain_window(&ctx.registry))
+                            .await
+                    {
+                        ctx.cluster
+                            .drains_sent
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        debug!("[#{}] 已對 agent {} 送出 drain", self.conn_id, agent.agent_id);
+                    }
                     self.close_for_shutdown().await?;
                     return Ok(());
                 }

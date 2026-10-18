@@ -207,3 +207,6 @@ hostname = "keep"             # keep | pseudonymize（data/privacy.key 的 HMAC�
 process_command = "redact"    # keep | redact（遮蔽命令列中的密碼、token）| drop
 process_user = "keep"         # keep | pseudonymize | drop
 inventory_network = "keep"    # keep | truncate（介面位址 /24、/48，MAC 只留廠商碼）| drop
+
+[cluster]                     # 叢集的節點設定（kairos/HA.md）；0.9.0 只有 node_id，叢集模式之後的版本才提供
+node_id = ""                  # 節點名稱（Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）

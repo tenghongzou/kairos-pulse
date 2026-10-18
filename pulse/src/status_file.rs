@@ -158,8 +158,18 @@ pub struct Connection {
     /// `connecting`（啟動後尚未有結果）、`registered`、`reconnecting`（一般網路錯誤）、
     /// `rejected`（需要人工處理的錯誤，會持續重試）
     pub state: String,
-    /// `host:port`
+    /// `host:port`：已註冊時為實際連上的候選位址，啟動後尚未連上時為 `server.address:server.port`
     pub server: String,
+    /// 目前（或最後）連上的 Kairos 節點（`hello_ack.server_node`，協商了 feature `cluster` 時；
+    /// `kairos/HA.md` 第 8.7 節）；沒有時為 `null`
+    pub server_node: Option<String>,
+    /// 候選位址的數量（`server.address` 加 `server.fallback_addresses`）
+    pub candidates: Option<u32>,
+    /// 目前連上的是第幾個候選位址（從 0 起）；未連線時保留上次的值
+    pub candidate_index: Option<u32>,
+    /// 所有候選位址都無法連線時，每個位址最後的錯誤（依嘗試的順序；其他時候為空，不輸出）
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidate_errors: Vec<CandidateError>,
     /// 例如 `TLSv1.3`；未連線時為 `null`
     pub tls_version: Option<String>,
     pub mtls: bool,
@@ -181,6 +191,17 @@ pub struct Connection {
     pub last_outage_until: Option<String>,
     /// 最近一次需要人工處理的拒絕（成功註冊後清除）；之後即使只剩一般網路錯誤也保留
     pub last_rejection: Option<Rejection>,
+}
+
+/// 一個候選位址最後的錯誤（[`Connection::candidate_errors`]）
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CandidateError {
+    /// `host:port`
+    pub server: String,
+    pub code: Option<String>,
+    /// 已清理的單行文字
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

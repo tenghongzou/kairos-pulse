@@ -13,12 +13,14 @@ use std::time::Duration;
 
 mod accounts;
 mod alerts;
+mod cluster;
 mod enroll;
 pub mod export;
 
 pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
 
 pub use accounts::{AccountSettings, AuditSettings, LdapSettings};
+pub use cluster::ClusterSettings;
 pub use enroll::{
     CertPolicySettings, EnrollSettings, MAX_CERT_LIFETIME_DAYS, MAX_GRACE_DAYS,
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
@@ -196,6 +198,8 @@ pub struct AppConfig {
     pub export: ExportSettings,
     /// 個資保護（商業審計 S6；`kairos/PRIVACY.md`）
     pub privacy: crate::privacy::PrivacySettings,
+    /// 叢集的節點設定（0.9.0 只有 `node_id`，`kairos/HA.md` 第 15.1 節）
+    pub cluster: ClusterSettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,
@@ -1420,6 +1424,7 @@ impl AppConfig {
         self.ldap.validate()?;
         self.audit.validate()?;
         self.export.validate()?;
+        self.cluster.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
         self.log.log_format()?;

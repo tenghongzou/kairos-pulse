@@ -71,6 +71,7 @@ sequenceDiagram
 | `processes` | report 另帶行程排行 `processes`（依 CPU、依記憶體各前 N 個；需同時協商 `metrics`，見 [`METRICS.md`](METRICS.md)「行程」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `processes.enabled`（預設啟用）時宣告 |
 | `config` | 〔草稿，0.9.0 規格，尚未實作〕集中設定：Kairos 在 `hello_ack`／心跳的 `ack` 以 `pending.config_rev` 提示，Pulse 以 `config_get` 取得白名單內的設定、以 `config_status` 回報實際生效值與差異（見 [`REMOTE.md`](REMOTE.md) 第 2、3 節）。Kairos 以 SQLite 儲存、mTLS 且 client 也宣告時列出；Pulse 在 `remote_config.enabled`（預設啟用）時宣告 |
 | `upgrade` | 〔草稿，0.9.0 規格，尚未實作〕遠端升級：`upgrade_get`／`upgrade_offer` 提議官方簽章的發佈包，`upgrade_chunk_get`／`upgrade_chunk` 經這條連線分段下載，`upgrade_status` 回報結果（見 [`REMOTE.md`](REMOTE.md) 第 2、4 節）。條件同 `config`；Pulse 在 `upgrade.enabled` 且本機準備就緒（信任錨、輔助程式）時宣告 |
+| `cluster` | 叢集連線：`hello_ack` 另帶 `server_node`（回應的節點名稱）與選用的 `cluster_id`，Kairos 可以送排空訊息 `drain` 要求 agent 改連其他節點（見「叢集與排空」）。〔0.9.0〕Kairos 只在 **client 也宣告時**才列出（同 `renew`）；Pulse 一律宣告（一次性連線除外） |
 
 日後新增功能（例如指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。註冊通道（8444 HTTPS）是另一份規格 [`ENROLL.md`](ENROLL.md)；8443 上與註冊有關的 `renew`、`deregister` 定義在本文件「憑證輪替與除役」（原為 ENROLL.md 第 13 節的草稿）。
 
@@ -89,6 +90,8 @@ sequenceDiagram
 | 0.4.0 以前（不宣告 `renew`／`deregister`） | 0.5.0 起 | 與 0.4.0 完全相同：Kairos 只在 client 宣告時才在 `hello_ack` 列出 `renew`、`deregister` 並帶 `expired_renew_grace_days`／`renew_now`，因此舊版 Pulse 收到的 `hello_ack` 不變 |
 | 0.5.0 起（宣告 `renew`） | 0.4.0 以前 | 舊版 Kairos 不列出 `renew`：Pulse 不送 `renew_request`，憑證到期前沒有自動輪替（維持 0.4 的行為：手動換憑證，或過期後經 8444 續簽）。除役通知的連線在 `hello_ack` 沒有 `deregister` 時直接關閉，不送 `deregister` |
 | 0.5.0 起（宣告 `renew`） | 0.5.0 起，`storage.backend = "jsonl"`（沒有註冊服務） | 同上：Kairos 不列出 `renew`、`deregister` |
+| 0.8.0 以前（不宣告 `cluster`） | 0.9.0 起 | 與 0.8.0 完全相同：Kairos 只在 client 宣告時才列出 `cluster`、帶 `server_node`，也只對協商了 `cluster` 的連線送 `drain`（其他連線在關機時照舊直接關閉） |
+| 0.9.0 起（宣告 `cluster`） | 0.8.0 以前 | 舊版 Kairos 不列出 `cluster`：沒有 `server_node`、不會收到 `drain`。Pulse 的多個伺服器位址（`server.fallback_addresses`）不依賴這個 feature，照常運作 |
 | 只支援 v2 的 client（`proto` 2，沒有範圍） | v1（舊版） | 舊版回 `unsupported_version`（`supported proto: 1`） |
 | 新版（1～2） | 未來只支援 v3 以上的伺服器 | `unsupported_version`，`proto_min`／`proto_max` 標示伺服器的範圍；Pulse 退避後重試，日誌提示更新 |
 
@@ -121,11 +124,12 @@ sequenceDiagram
 
 | type | 欄位 |
 |---|---|
-| `hello_ack` | `seq`、`proto`、`offline_after_ms`；v2 另有 `features`（字串陣列）、`server_time`（伺服器送出時的時間，RFC 3339 UTC 毫秒，例如 `2026-10-08T03:15:40.012Z`，供 client 檢查時鐘偏差）；協商了 `renew` 時另有 `expired_renew_grace_days`（u32）與選用的 `renew_now`（布林），型別不符時視為沒有 |
+| `hello_ack` | `seq`、`proto`、`offline_after_ms`；v2 另有 `features`（字串陣列）、`server_time`（伺服器送出時的時間，RFC 3339 UTC 毫秒，例如 `2026-10-08T03:15:40.012Z`，供 client 檢查時鐘偏差）；協商了 `renew` 時另有 `expired_renew_grace_days`（u32）與選用的 `renew_now`（布林）；協商了 `cluster` 時另有 `server_node`（string）與選用的 `cluster_id`（UUID）。這些欄位型別不符時都視為沒有 |
 | `ack` | `seq` |
 | `error` | `seq`（可為 `null`）、`code`、`message`、`fatal`；`unsupported_version` 另有 `proto_min`、`proto_max`（新版 Kairos 起） |
 | `renew_result` | 回應 `renew_request`：`seq`、`request_id`、`state`（`issued`）、`certificate`、`policy`、`server_time` |
 | `deregister_ack` | 回應 `deregister`：`seq`、`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned` |
+| `drain` | 協商了 `cluster` 時：`seq`（一律 `null`）、`reason`、`reconnect_within_ms`（見「叢集與排空」）。不回應任何訊息 |
 
 `fatal` 為 `true` 時，伺服器送出該錯誤後會關閉連線。
 
@@ -317,6 +321,50 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 - `deregister_ack`：`seq`、`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned`（重送時為 `true`，冪等）。
 - **10 分鐘視窗**（ENROLL.md 第 18 節第 1 項）：依政策（`pki.policy.revoke_on_self_decommission`）撤銷這條連線的憑證，撤銷在除役後 10 分鐘生效。這段期間清冊已是「已除役」，該 `agent_id` 的 `hello` 只要不是 `intent: "deregister"` 一律以 fatal 的 `certificate_rejected` 關閉；`intent: "deregister"` 只回 `already_decommissioned: true`。所有狀態都在資料庫，Kairos 重新啟動不會延長或縮短視窗。
 
+## 叢集與排空（feature `cluster`）
+
+〔0.9.0〕Kairos 的高可用部署（`kairos/HA.md`）有多個節點；agent 可能經 L4 負載平衡器、虛擬 IP，或 Pulse 自己的多個伺服器位址（`server.fallback_addresses`）連到其中任何一個。feature `cluster` 讓 agent 知道自己連到哪個節點，並讓節點在排空或關機時要求 agent 有秩序地改連其他節點。只在協商結果為 v2、雙方都宣告時使用；訊息內容的型別：`kairos-proto` 的 `cluster` 模組與 `ServerMsg::Drain`。
+
+### 節點資訊
+
+協商了 `cluster` 時 `hello_ack` 另帶：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `server_node` | string | 回應的節點名稱（Kairos 的 `cluster.node_id`，預設為主機名稱的第一段，轉成小寫）。1～63 bytes，只有小寫英文字母、數字與 `-`，不以 `-` 開頭或結尾 |
+| `cluster_id` | string | 選用。叢集的 UUID（Kairos 以叢集模式執行時才送；單機的 Kairos 不送） |
+
+型別或格式不符時視為沒有，不影響整則 `hello_ack`。Pulse 把 `server_node` 寫進日誌與狀態檔（`pulse status`），用來診斷「連到哪個節點」；`cluster_id` 在同一個 Pulse 行程內改變時記 `WARN`（候選位址可能指到了另一套獨立的 Kairos，durable 的去重在不同的資料庫之間無效）。
+
+### 排空訊息 `drain`（Kairos → Pulse）
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `type` | `"drain"` | |
+| `seq` | `null` | 不回應任何訊息 |
+| `reason` | string | `node_draining`（維運排空或節點關機）、`rebalance`（之後的負載重新分配，目前不送）。client 不認得的值一律當成排空 |
+| `reconnect_within_ms` | u32 | client 在 `[0, reconnect_within_ms]` 之間隨機選一個延遲後重連。1000～300000，超出範圍時 client 夾在範圍內，缺漏或型別不符時為 10000。Kairos 送 `max(10000, 連線數 × 5)`，避免所有 agent 同時湧向其他節點 |
+
+**Pulse 收到後**：
+
+1. 停止送出新的 report（取樣照常寫進本機緩衝，協商了 `durable` 時之後補送；沒有協商時這段期間的取樣不送出）；
+2. 等待在途的 report 收到回應（最多 8 秒；沒有回應的 report 在協商了 `durable` 時於下一條連線重送）；
+3. 送出 TLS close_notify 並關閉連線；
+4. 依延遲重連，從候選位址清單中**目前位址的下一個**開始（只有一個位址時就是同一個，由負載平衡器導向其他節點）。
+
+這次斷線不算連線失敗、不增加退避；「連續被 `superseded`」的次數與其他原因的斷線一樣歸零。Pulse 記 `PLS-I8407`（暫定，資訊）。
+
+**Kairos 端**：只對協商了 `cluster` 的連線送 `drain`。0.9.0 在**優雅關機**時先對這些連線送 `drain`（`reason` 為 `node_draining`），再送出 close_notify 關閉；其他連線照舊直接關閉（舊版 Pulse 依退避重連）。由維運命令排空節點（`kairos cluster drain`）留待叢集模式實作。舊版 Pulse 收到不認得的 `type` 只會忽略（記 DEBUG），所以即使誤送也不會壞，但規格上沒有協商時不送。
+
+### 多個伺服器位址（client 端）
+
+協定本身不變；以下是 Pulse 0.9.0 起的連線行為，與 `cluster` 是否協商無關：
+
+- 候選位址＝`server.address:server.port`，接著 `server.fallback_addresses`（依設定順序，重複的只留第一個）。所有位址都以同一個 `server.domain` 驗證伺服器憑證，因此每個節點的伺服器憑證都必須含這個名稱。
+- **一輪**＝從第一個候選位址開始依序嘗試。收到 `hello_ack` 之前的任何失敗（DNS、TCP、逾時、TLS、收到 `error` 或斷線）都**立即**改試下一個（兩次嘗試之間只隔 0～500 ms 的隨機延遲），不增加退避；整輪都失敗後才依「重連」的指數退避等待，下一輪再從第一個開始。
+- 連上之後不主動切回第一優先；斷線後下一輪自然從第一個開始。被 `superseded` 時不改試其他位址（身分衝突，換節點也一樣）。
+- 重送的 durable report 內容不變（`boot_id`、`report_seq` 與連到哪個節點無關）；所有候選位址必須屬於共用同一個資料庫的同一個叢集，去重才是全叢集的。
+
 ## 逾時與離線判定
 
 Kairos 的 TLS 握手、等待 `hello`、寫出逾時可在設定檔 `[timeouts]` 調整，下表為預設值。
@@ -347,6 +395,7 @@ Kairos 的 TLS 握手、等待 `hello`、寫出逾時可在設定檔 `[timeouts]
 - **連續被 `superseded`**：第一次因 `superseded` 斷線視同一般斷線（連線維持 30 秒以上照常重置退避）。連續第 2 次起，不論連線維持多久都**不重置退避**，且重連延遲**至少 30 秒**（這是「`retry.max_delay` 為延遲上限」的唯一例外）：兩台主機共用同一份 `agent.id` 時，雙方各自維持 30 秒以上再被對方踢掉，若重置或延遲太短就會永久快速互踢。此時 Pulse 以 `ERROR` 記錄並提示可能有多台主機共用 `agent.id`（`ERROR` 每 10 分鐘最多一則，其餘次數記 `WARN`）。因其他原因斷線時，連續次數歸零。
 - 沒有協商 `durable` 時（任一端為 0.2.0 以前的版本，或 Pulse 停用了本機緩衝），`report` 採 at-most-once：送不出去就丟棄，不會重送舊資料。Pulse 同一時間只有一筆 `report` 在途：送出後到收到伺服器對它（或之後訊息）的回應（`ack` 或帶 `seq` 的 `error`，含 `storage_unavailable`）之前，新的取樣直接丟棄；斷線時清除。伺服器寫檔緩慢時不會在伺服器端無限積壓。
 - 協商了 `durable` 時採 at-least-once：重連後先依序補送積壓的資料（含斷線前已送出、尚未收到 `ack` 的），再送新的取樣（見「durable：at-least-once 投遞」）。
+- 設定了多個伺服器位址時，上面的退避以「一輪」為單位：同一輪中收到 `hello_ack` 之前失敗就立即改試下一個位址，整輪都失敗才退避（見「叢集與排空」的「多個伺服器位址」）。因 `drain` 斷線時不退避，改依 `reconnect_within_ms` 的隨機延遲重連。
 
 ## 範例
 
@@ -409,6 +458,18 @@ P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["der
 K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","deregister"],"server_time":"2026-10-14T03:00:00.008Z"}
 P {"type":"deregister","seq":2,"ts":"2026-10-14T03:00:00.010Z","request_id":"6c0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","reason":"uninstall_purge","initiated_by":"msi","host_fingerprint":"sha256:355cf5ed40956a057645145cccf74f594102726167e94e3511aae182acc4ec43","hostname":"web-01","pulse_version":"0.5.0","sent_at":"2026-10-14T03:00:00.010Z"}
 K {"type":"deregister_ack","seq":2,"request_id":"6c0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","state":"decommissioned","decommissioned_at":"2026-10-14T03:00:00.015Z","certificate_revoked":true,"already_decommissioned":false}
+```
+
+### 叢集
+
+0.9.0 的 Pulse 與 0.9.0 的 Kairos：hello 宣告 `cluster`，hello_ack 列出並帶 `server_node`（單機的 Kairos 不帶 `cluster_id`；叢集模式的 hello_ack 另帶 `cluster_id`）；Kairos 關機時送 `drain`：
+
+```
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","cluster"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.9.0","heartbeat_interval_ms":15000,"ts":"2026-10-19T02:00:00.001Z"}
+K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","cluster"],"server_time":"2026-10-19T02:00:00.009Z","server_node":"kairos-a","cluster_id":"3f6c2b1a-9d4e-4f8a-b7c6-1e2d3c4b5a69"}
+P {"type":"heartbeat","seq":2,"ts":"2026-10-19T02:00:15.002Z"}
+K {"type":"ack","seq":2}
+K {"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":10000}
 ```
 
 ### 錯誤

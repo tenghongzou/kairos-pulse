@@ -530,6 +530,21 @@ pub enum ServerMsg {
             skip_serializing_if = "Option::is_none"
         )]
         renew_now: Option<bool>,
+        /// 回應的 Kairos 節點名稱（雙方協商了 `cluster` 時才送，1～63 bytes 的 `[a-z0-9-]`）。
+        /// 不是字串或不合規定時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "crate::cluster::de_lenient_server_node",
+            skip_serializing_if = "Option::is_none"
+        )]
+        server_node: Option<String>,
+        /// 叢集的 UUID（協商了 `cluster`、且 Kairos 以叢集模式執行時才送；選用）。不是 UUID 時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "crate::cluster::de_lenient_cluster_id",
+            skip_serializing_if = "Option::is_none"
+        )]
+        cluster_id: Option<String>,
     },
     Ack {
         seq: u64,
@@ -564,6 +579,22 @@ pub enum ServerMsg {
     RenewResult(Box<RenewResult>),
     /// 除役通知的回應（feature `deregister`）
     DeregisterAck(Box<DeregisterAck>),
+    /// 排空（feature `cluster`）：要求 client 在 `[0, reconnect_within_ms]` 的隨機延遲後改連其他節點。
+    /// 不回應任何訊息（`seq` 一律為 `null`）。解析時欄位缺漏或型別不符不讓整則失敗
+    Drain {
+        #[serde(default)]
+        seq: Option<u64>,
+        /// `node_draining`、`rebalance`；client 不認得的值一律當成排空處理
+        #[serde(default)]
+        reason: String,
+        /// 不是合法 u32 時視為沒有（client 改用預設值）
+        #[serde(
+            default,
+            deserialize_with = "de_lenient_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
+        reconnect_within_ms: Option<u32>,
+    },
 }
 
 /// 寬鬆的 u32：不是合法 u32 的值（字串、負數、小數、null 等）視為 `None`
@@ -584,12 +615,13 @@ fn fatal_by_default() -> bool {
 }
 
 /// [`ServerMsg`] 的所有 `type` 值；不在其中的視為未知類型（見 [`parse_server_msg`]）
-pub const SERVER_MSG_TYPES: [&str; 5] = [
+pub const SERVER_MSG_TYPES: [&str; 6] = [
     "hello_ack",
     "ack",
     "error",
     "renew_result",
     "deregister_ack",
+    "drain",
 ];
 
 /// 規格定義的錯誤碼（只能用這些）
@@ -693,6 +725,15 @@ impl ServerMsg {
             fatal,
             proto_min: None,
             proto_max: None,
+        }
+    }
+
+    /// 排空訊息（feature `cluster`）
+    pub fn drain(reason: impl Into<String>, reconnect_within_ms: u32) -> Self {
+        ServerMsg::Drain {
+            seq: None,
+            reason: reason.into(),
+            reconnect_within_ms: Some(reconnect_within_ms),
         }
     }
 
@@ -878,6 +919,8 @@ mod tests {
                 server_time: None,
                 expired_renew_grace_days: None,
                 renew_now: None,
+                server_node: None,
+                cluster_id: None,
             },
             server_vector("hello_ack"),
         );
@@ -1136,6 +1179,8 @@ mod tests {
                 server_time: None,
                 expired_renew_grace_days: None,
                 renew_now: None,
+                server_node: None,
+                cluster_id: None,
             }
         );
     }
@@ -1282,6 +1327,8 @@ mod tests {
                 server_time: None,
                 expired_renew_grace_days: None,
                 renew_now: None,
+                server_node: None,
+                cluster_id: None,
             },
             ServerMsg::Ack { seq: 1 },
             ServerMsg::error(None, ErrorCode::BadRequest, "x"),
@@ -1295,6 +1342,7 @@ mod tests {
                 "deregister_ack",
             ))
             .unwrap(),
+            ServerMsg::drain(crate::DRAIN_REASON_NODE_DRAINING, 10_000),
         ];
         let kinds: Vec<String> = samples
             .iter()
@@ -1408,6 +1456,8 @@ mod tests {
                 server_time: Some("2026-10-08T03:15:40.012Z".into()),
                 expired_renew_grace_days: None,
                 renew_now: None,
+                server_node: None,
+                cluster_id: None,
             }
         );
         let body = report_body(client_vector_in(Ver::V2, "report"));
@@ -1720,6 +1770,8 @@ mod tests {
                 server_time: None,
                 expired_renew_grace_days: None,
                 renew_now: None,
+                server_node: None,
+                cluster_id: None,
             }
         );
         // 新 Pulse 在 v1 連線送出的 report 就是 v1 向量，舊 Kairos 可解析

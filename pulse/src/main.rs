@@ -15,6 +15,7 @@ mod metrics;
 mod network;
 mod protocol;
 mod rotation;
+mod server_addr;
 mod service_status;
 mod shutdown;
 mod spool;
@@ -303,6 +304,10 @@ fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Track
         Some(config.agent.display_name.trim().to_string()).filter(|n| !n.is_empty()),
     );
     file.config.warnings = config_warnings(config);
+    // 候選位址的數量（server.address 加 server.fallback_addresses；kairos/HA.md 第 8.7 節）
+    let candidates = config.server.candidates().len();
+    file.connection.candidates = u32::try_from(candidates).ok();
+    metrics::global().set_candidate_count(candidates);
     file.identity.agent_id_file =
         Some(base.join(config.agent.id_file.trim()).display().to_string());
     let buffer = local_status::BufferSettings {

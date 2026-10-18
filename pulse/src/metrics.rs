@@ -43,6 +43,12 @@ pub struct Metrics {
     pub rejected: Counter,
     pub dropped_disconnected: Counter,
     pub registrations: Counter,
+    /// 同一輪中改試下一個候選位址的次數（`server.fallback_addresses`）
+    pub failovers: Counter,
+    /// 收到 Kairos 的排空（`drain`）而改連的次數
+    pub drains: Counter,
+    /// 候選位址的數量與目前（最後）連上的是第幾個
+    candidate: Mutex<(usize, usize)>,
     /// 斷線（連線失敗）依錯誤代碼（無法歸類為 `unknown`）
     disconnects: Mutex<BTreeMap<String, u64>>,
     pub sample_duration: Histogram,
@@ -60,6 +66,9 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| Metrics {
     rejected: Counter::new(),
     dropped_disconnected: Counter::new(),
     registrations: Counter::new(),
+    failovers: Counter::new(),
+    drains: Counter::new(),
+    candidate: Mutex::new((1, 0)),
     disconnects: Mutex::new(BTreeMap::new()),
     sample_duration: Histogram::new(SAMPLE_BUCKETS),
     sample_timeouts: Counter::new(),
@@ -106,6 +115,16 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// 候選位址的數量與目前連上的是第幾個（從 0 起）
+    pub fn set_candidate(&self, count: usize, index: usize) {
+        *self.candidate.lock().unwrap_or_else(|e| e.into_inner()) = (count, index);
+    }
+
+    /// 只設定候選位址的數量（啟動時）
+    pub fn set_candidate_count(&self, count: usize) {
+        self.candidate.lock().unwrap_or_else(|e| e.into_inner()).0 = count;
     }
 
     /// 一次斷線（連線失敗）
@@ -183,6 +202,27 @@ pub fn render(status: Option<&StatusFile>) -> String {
         "pulse_registrations_total",
         "收到 hello_ack、完成註冊的次數",
         m.registrations.get(),
+    );
+    let (candidates, candidate_index) = *m.candidate.lock().unwrap_or_else(|e| e.into_inner());
+    e.gauge(
+        "pulse_server_candidates",
+        "伺服器候選位址的數量（server.address 加 server.fallback_addresses）",
+        candidates as f64,
+    );
+    e.gauge(
+        "pulse_server_candidate_index",
+        "目前（或最後一次）連上的是第幾個候選位址（從 0 起；0 為 server.address）",
+        candidate_index as f64,
+    );
+    e.counter(
+        "pulse_connect_failovers_total",
+        "同一輪中某個候選位址無法連線、改試下一個的次數",
+        m.failovers.get(),
+    );
+    e.counter(
+        "pulse_drains_total",
+        "收到 Kairos 的排空（drain）而改連其他節點的次數",
+        m.drains.get(),
     );
     let disconnects = m.disconnects();
     let d: Vec<(&str, u64)> = disconnects.iter().map(|(k, v)| (k.as_str(), *v)).collect();

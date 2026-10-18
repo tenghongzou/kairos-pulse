@@ -776,6 +776,7 @@ mod tests {
         ServerConfig {
             address: "127.0.0.1".into(),
             port: 1,
+            fallback_addresses: Vec::new(),
             domain: "localhost".into(),
             accept_invalid_certs: false,
             ca_cert: if ca.is_empty() {

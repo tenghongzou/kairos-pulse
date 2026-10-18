@@ -46,6 +46,8 @@ pub enum DisconnectReason {
     ServerShutdown,
     /// report 寫入結果未知，Kairos 關閉了連線
     WriteUnknown,
+    /// 服務這台主機的叢集節點失聯（`kairos/HA.md` 第 6.6 節；0.9.0 只定義名稱，叢集模式才會產生）
+    ServerLost,
 }
 
 impl DisconnectReason {
@@ -59,6 +61,7 @@ impl DisconnectReason {
             DisconnectReason::Superseded => "superseded",
             DisconnectReason::ServerShutdown => "server_shutdown",
             DisconnectReason::WriteUnknown => "write_unknown",
+            DisconnectReason::ServerLost => "server_lost",
         }
     }
 
@@ -73,6 +76,7 @@ impl DisconnectReason {
             DisconnectReason::Superseded => "被同一 agent_id 的新連線取代",
             DisconnectReason::ServerShutdown => "Kairos 關機",
             DisconnectReason::WriteUnknown => "寫入結果未知",
+            DisconnectReason::ServerLost => "叢集節點失聯",
         }
     }
 
@@ -87,6 +91,7 @@ impl DisconnectReason {
             DisconnectReason::Superseded,
             DisconnectReason::ServerShutdown,
             DisconnectReason::WriteUnknown,
+            DisconnectReason::ServerLost,
         ]
         .into_iter()
         .find(|r| r.as_str() == s)
@@ -100,6 +105,7 @@ impl DisconnectReason {
             OfflineReason::ServerShutdown => DisconnectReason::ServerShutdown,
             OfflineReason::CertificateRejected => DisconnectReason::CertificateRejected,
             OfflineReason::WriteUnknown => DisconnectReason::WriteUnknown,
+            OfflineReason::ServerLost => DisconnectReason::ServerLost,
         }
     }
 }

@@ -750,12 +750,13 @@ pub struct Filter {
 
 /// `offline_reason` 參數接受的值（0.7 的名稱；舊名稱 `timeout`、`connection_closed` 在過渡期也接受，
 /// 見 [`crate::registry::normalize_offline_reason`]）
-const OFFLINE_REASONS: [&str; 5] = [
+const OFFLINE_REASONS: [&str; 6] = [
     "idle_timeout",
     "agent_closed",
     "server_shutdown",
     "certificate_rejected",
     "write_unknown",
+    "server_lost",
 ];
 
 fn parse_cidr(param: &str, text: &str) -> Result<Cidr, ApiError> {

@@ -42,7 +42,7 @@
 | `channel_secrets` | 告警服務（0.7；管道的機密變成無法解開或恢復時） | `channel_id`、`name`、`available` |
 | `audit_integrity` | 稽核的定期自我驗證（0.7；每次驗證） | `ok`、`reason`、`id`（斷點）、`summary` |
 
-**斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增）。**0.7 起主機 API、SSE 與 `/metrics` 都使用這組名稱**（過渡期主機 API 另帶舊名稱的 `offline_reason_legacy`，`API.md` 第 5.2 節）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
+**斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增）、`server_lost`（服務這台主機的叢集節點失聯；0.9 定義名稱，叢集模式才會產生，`kairos/HA.md` 第 6.6 節；依一般的主機離線寬限判斷，Pulse 改連其他節點後重新上線）。接收端應忽略不認得的值。**0.7 起主機 API、SSE 與 `/metrics` 都使用這組名稱**（過渡期主機 API 另帶舊名稱的 `offline_reason_legacy`，`API.md` 第 5.2 節）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
 
 `storage_unavailable`、寫入結果未知、retention 暫停、連線上限、CRL／伺服器憑證／簽發 CA 即將到期、註冊端點的過載／封鎖／限流／時鐘偏差／自動暫停，由系統檢查讀取各元件的計數與狀態，以 `condition` 發布（第 5.3 節）。`/healthz`、`/metrics`、JSON 日誌屬於另一條線（`sprint5/obs`），可以直接訂閱匯流排。
 

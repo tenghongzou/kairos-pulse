@@ -39,6 +39,8 @@ Pulse 在本機收集系統資訊（CPU、記憶體），透過**一條長期維
 | Pulse 0.8.0 連 Kairos 0.2.0～0.7.0 | v2＋`metrics`：19 個新的標準指標照送（舊版 Kairos 只檢查格式、原樣保存，升級後就能在趨勢中看到）；舊版 Kairos 不宣告 `processes`、`inventory`，Pulse 不送行程排行與資產 |
 | Pulse 0.8.0 連 Kairos 0.8.0（`storage.backend = "jsonl"`） | 同上：JSONL 後端不宣告 `processes`、`inventory` |
 | Pulse 0.2.0～0.7.0 連 Kairos 0.8.0 | 與以前相同（8 個指標）；Kairos 以磁碟總容量與可用空間推算使用率 |
+| Pulse 0.9.0 連 Kairos 0.8.0（以前） | Pulse 宣告 feature `cluster`，舊版 Kairos 不列出：沒有節點名稱、不會收到排空（`drain`）。`server.fallback_addresses` 不依賴 Kairos 的版本，照常運作 |
+| Pulse 0.8.0（以前）連 Kairos 0.9.0 | 與 0.8 相同：Kairos 只在 hello 宣告 `cluster` 時才帶 `server_node`、才送 `drain`；Kairos 關機時照舊直接關閉連線 |
 
 更早的版本之間混用時可能出現下列問題：
 
@@ -392,8 +394,9 @@ cargo run
 
 ```toml
 [server]
-address = "127.0.0.1"          # 伺服器位址
+address = "127.0.0.1"          # 伺服器位址（第一優先）
 port = 8080                    # 伺服器連接埠
+fallback_addresses = []        # 主位址連不上時依序改試的其他 Kairos 節點（"主機" 或 "主機:埠"，最多 16 個；見「多個伺服器位址與排空」）
 domain = "localhost"           # TLS SNI / 憑證名稱驗證用的名稱（DNS 名稱或 IP；須與伺服器憑證 SAN 相符）
 accept_invalid_certs = false   # 是否略過伺服器憑證驗證（預設 false）
 ca_cert = ""                   # 信任的 CA / 自簽憑證 PEM（可含多張）；空字串 = 只用作業系統信任庫
@@ -649,6 +652,7 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
 - **啟動與第一次重連的隨機延遲**：啟動時先等 0～`min(heartbeat.interval, 5)` 秒（均勻分佈，以 `INFO` 記錄「x 秒後開始連線」）才第一次連線；斷線後的第一次重連（連續失敗第 1 次）在上述退避之外另加 0～`min(heartbeat.interval, 5)` 秒。Kairos 重新啟動時所有 agent 同時斷線，只靠初始退避（2 秒 ±20%）會在約 1 秒內一起湧入；加上分散後攤在約 1.6～7.4 秒（預設值）。上限取心跳間隔，分散不超過一個心跳週期，不影響伺服器的離線判定；以 5 秒封頂，避免心跳間隔很長時拖慢啟動與恢復。之後的重試已由指數退避與抖動錯開，不再另加。
 - **不限重試次數**，程式不會因伺服器暫時不在而結束。
 - 每次斷線只記**一則**日誌，內容包含斷線原因、處置提示（若有）、本次連線維持多久與退避是否重置，以及下次重連的等待時間。連續失敗未達 `retry.max_retries` 次時以 `WARN` 記錄，達到後改用 `ERROR`，但同樣節流：伺服器長時間停機時每次重試都會失敗，`ERROR` 每 10 分鐘最多一則，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次連線失敗已改記 WARN」（連線穩定 30 秒以上、退避重置後重新起算）；這類一般連線錯誤不寫 stderr；伺服器送來的 fatal error、註冊前收到的 error 與協定版本不符以 `ERROR` 記錄（`superseded` 例外，見下）。這些錯誤每次重連都會重複，因此依錯誤碼節流：同一錯誤碼每 10 分鐘最多一則 `ERROR`，期間其他次數改記 `WARN`，下一則 `ERROR` 會註明「上次以 ERROR 記錄後，另有 n 次相同原因的斷線已改記 WARN」；錯誤碼改變時立即以 `ERROR` 記錄。
+- **設定了多個伺服器位址**（`server.fallback_addresses`）時，上面的退避以「一輪」為單位：收到 `hello_ack` 之前失敗就立即改試下一個位址，整輪都失敗才退避；Kairos 排空（`drain`）造成的斷線不退避。見下一節。
 - **連線需在註冊（收到 `hello_ack`）後穩定維持 30 秒以上**，斷線時才會把退避與連續失敗次數歸零。註冊後不到 30 秒就斷仍算一次失敗，延遲繼續加倍。
 - **被 `superseded`（同一 `agent_id` 的新連線取代）**：
   - 第一次被取代視同一般斷線：連線已維持 30 秒以上就照常重置退避，記 `WARN`。
@@ -662,6 +666,29 @@ Report 為 **at-most-once**：斷線期間的取樣、上一筆 report 尚未收
   [WARN] 連線中斷（連續第 2 次失敗）：伺服器關閉了連線（註冊後僅維持 3.1 秒，未滿 30 秒，退避不重置）；4.4 秒後重連
   [WARN] 連線中斷（連續第 1 次失敗）：…（連線已維持 32 秒，退避已重置）；2.0 秒後重連
   ```
+
+## 多個伺服器位址與排空（0.9.0）
+
+Kairos 的高可用部署（`kairos/HA.md`）有多個節點。**前面有 L4 負載平衡器或虛擬 IP（keepalived）時 Pulse 不需要任何修改**：`server.address` 指向負載平衡器或虛擬 IP 的名稱即可。沒有負載平衡器、或負載平衡器本身也要備援（例如兩個機房各一個）時，設定 `server.fallback_addresses`：
+
+```toml
+[server]
+address = "kairos-a.example.com"                         # 第一優先
+port = 8443
+domain = "kairos.example.com"                            # 所有位址共用的憑證驗證名稱（不變）
+fallback_addresses = ["kairos-b.example.com", "10.0.20.11:8443"]
+```
+
+- **格式**：每一項為「主機」或「主機:埠」，省略埠時用 `server.port`；IPv6 必須加方括號（`"[2001:db8::10]"`、`"[2001:db8::10]:8443"`）。最多 16 個，重複的只留第一個。不合法時無法啟動（`PLS-E0201`，`pulse check-config` 也會檢查）。環境變數為 `PULSE__SERVER__FALLBACK_ADDRESSES`，以逗號分隔（去除前後空白，空字串表示沒有）。
+- **新的鍵、不改 `address`**：舊版 Pulse 忽略不認得的鍵，降版後照常連 `address`；`pulse enroll` 改寫設定檔時也只寫 `address`。**安裝字串不變**：叢集部署的安裝字串一律使用服務名稱（負載平衡器或虛擬 IP），多位址在註冊後以 `pulse.toml` 或環境變數加入。
+- **憑證**：所有位址都以同一個 `server.domain` 驗證伺服器憑證（與實際連上的位址無關），因此**每個節點的伺服器憑證都必須含這個名稱**；某個節點的憑證不含時，該節點記 `PLS-E1402` 並改試下一個。
+- **選擇與退避**：每一輪從第一個位址（`address`）開始依序嘗試。收到 `hello_ack` 之前的任何失敗（DNS、TCP 被拒、逾時、TLS 握手失敗、收到錯誤或斷線）都**立即**改試下一個（兩次之間只隔 0～500 ms 的隨機延遲），不增加退避，記 `PLS-W2301`（暫定；每輪第一次失敗時判斷，`WARN` 每 10 分鐘最多一則，其餘記 `DEBUG`）。整輪都失敗才依 `[retry]` 退避，記 `PLS-E2302`（暫定），日誌列出每個位址最後的錯誤；某個位址的錯誤需要人工處理（例如伺服器憑證不符、用戶端憑證被拒）時改以該錯誤的代碼記錄。名稱解析出多個 IP 時依序嘗試，每個 IP 最多 3 秒，整個位址最多 5 秒。
+- **連上之後不主動切回第一優先**；斷線後的下一輪自然從第一個開始（避免第一優先節點反覆故障時來回切換）。被 `superseded` 時不改試其他位址（身分衝突，換節點也一樣）。
+- **排空（feature `cluster`）**：Pulse 0.9.0 一律宣告 `cluster`；Kairos 0.9.0 列出時，`hello_ack` 帶回應的節點名稱（`server_node`），Kairos 優雅關機時先送 `drain`。Pulse 收到後停止送出新的 report（取樣照常寫進本機緩衝）、等在途的 report 收到回應（最多 8 秒）後關閉連線，在 `[0, reconnect_within_ms]` 的隨機延遲後從**目前位址的下一個**開始重連。這次斷線不算失敗、不增加退避，記 `PLS-I8407`（暫定，`INFO`）。
+- **補送與去重**：重送的 durable report 內容不變（`boot_id`、`report_seq` 與連到哪個節點無關），斷線時在途的 report（最多 4 筆）在下一條連線（可能是另一個節點）重送。**所有位址必須屬於共用同一個資料庫的同一個叢集**，去重才是全叢集的；指到另一套獨立的 Kairos 時，換節點時在途的那幾筆可能兩邊各寫一次。`hello_ack` 的 `cluster_id`（叢集模式的 Kairos 才送）在同一個 Pulse 行程內改變時記 `WARN`。
+- **憑證更新**：8443 的正常輪替（`renew_request`）在任何節點都能完成；以新憑證確認的一次性連線、除役通知與過期憑證的報到都從最近一次連上的位址開始依序嘗試。8444（註冊、輪詢、過期續簽）仍只用 `enroll.address`（空字串時為 `server.address` 的主機），見「目前限制」。
+- **狀態**：`pulse status` 顯示「已註冊到 kairos-b.example.com:8443（節點 kairos-b，第 2 個候選位址）」；所有位址都失敗時的說明列出每個位址最後的錯誤。`status.json` 的 `connection.server` 為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`。`pulse check-config` 的「伺服器」列出備用位址；`pulse diag` 的 `candidates.json` 逐一測試名稱解析與 TCP 連線。本機指標見「本機指標」。
+- DNS SRV（`server.srv`）是 HA 規格中階段 B 的選用功能，**這個版本沒有實作**。
 
 ## 本機緩衝（at-least-once）
 
@@ -858,7 +885,7 @@ textfile 以「寫暫存檔再改名」的方式原子更新，Pulse 正常結�
 
 | 類別 | metric |
 |---|---|
-| 連線 | `pulse_connected`、`pulse_connection_state{state}`（`connecting`／`registered`／`reconnecting`／`rejected`）、`pulse_connection_consecutive_failures`、`pulse_registrations_total`、`pulse_disconnects_total{code}`（錯誤代碼，無法歸類為 `unknown`） |
+| 連線 | `pulse_connected`、`pulse_connection_state{state}`（`connecting`／`registered`／`reconnecting`／`rejected`）、`pulse_connection_consecutive_failures`、`pulse_registrations_total`、`pulse_disconnects_total{code}`（錯誤代碼，無法歸類為 `unknown`）；0.9.0 起另有 `pulse_server_candidates`（候選位址數）、`pulse_server_candidate_index`（目前連上的是第幾個，從 0 起）、`pulse_connect_failovers_total`（改試下一個位址的次數）、`pulse_drains_total`（因排空改連的次數）。不以位址當標籤 |
 | report | `pulse_reports_sampled_total`、`pulse_reports_sent_total`（含補送）、`pulse_reports_acked_total`、`pulse_reports_rejected_total`、`pulse_reports_dropped_total{reason}`、`pulse_report_ack_duration_seconds`（直方圖：送出到收到回應） |
 | 取樣 | `pulse_sample_duration_seconds`（直方圖）、`pulse_sample_timeouts_total`（`PLS-W8005`） |
 | 本機緩衝（補送佇列） | `pulse_delivery_durable`、`pulse_buffer_enabled`、`pulse_buffer_available`、`pulse_buffer_pending_records`、`pulse_buffer_pending_bytes`、`pulse_buffer_max_bytes`、`pulse_buffer_max_records`、`pulse_buffer_usage_ratio`、`pulse_buffer_oldest_sample_timestamp_seconds`、`pulse_buffer_replaying`、`pulse_buffer_dropped_total{reason}`（`full`／`expired`／`rejected`）、`pulse_buffer_write_failures_total` |
@@ -889,6 +916,7 @@ sudo pulse diag -c /opt/pulse/pulse.toml --redact strict --since 7d   # 主機�
 - 主機資產的「上次送達的摘要」只存在記憶體中：Pulse 重新啟動後第一次連線一定再送一次（Kairos 以摘要判斷內容未變，不寫變更歷史）。IPv6 的暫時位址（privacy extensions）定期更換時會被視為資產改變而重送。
 - 連上 Kairos 0.2.0 以前的版本，或 `buffer.enabled = false` 時，斷線期間、上一筆 report 尚未收到回應時，或伺服器無法保存（`storage_unavailable`）的 report 不會補送（at-most-once）。協商了 `durable` 時為 at-least-once，但本機緩衝滿了（丟最舊）、超過 `max_age_hours`、斷電前最近約 10 秒還沒 fsync 的取樣仍可能遺失；Kairos 的去重有範圍限制（SQLite 為原始資料保存的期間；`backend = "jsonl"` 為記憶體中的視窗，見 PROTOCOL.md 與 Kairos 的 STORAGE.md），極少數情況下可能重複寫入。`buffer.max_age_hours` 建議不超過 Kairos `storage.raw_retention_days` × 24。
 - 本機緩衝不加鎖：同一個 `buffer.dir` 只能由一個 Pulse 使用。
+- 多個伺服器位址（0.9.0）：8444 的註冊、輪詢與過期續簽不跟著候選位址走，只用 `enroll.address`（空字串時為 `server.address` 的主機）；叢集部署請把 `enroll.address` 設為負載平衡器或虛擬 IP 的名稱。沒有實作 DNS SRV（`server.srv`）。0.9.0 的 Kairos 還沒有共用資料庫的叢集模式，備用位址指到另一個各自有資料庫的 Kairos 時，換節點時在途的 report 可能兩邊各寫一次。
 - Windows 服務（`pulse service`、MSI，0.8.0）只經過交叉編譯，未在 Windows 實機驗證。不寫 Windows 事件記錄（需要安裝程式註冊事件來源；事件識別碼已在 `codes.rs` 定案）。`pulse status` 在 Windows 上查詢的服務名稱固定為 `Pulse`，以服務包裝工具註冊成其他名稱時改以狀態檔的 PID 判斷。MSI 沒有安裝字串的參數、移除時不會自動 `pulse decommission`。
 - `pulse status` 尚不支援 `--all`（列出所有實例）與 `--json-lines`；「連線中斷 30 分鐘」的門檻固定。
 - 系統資訊收集任務異常時直接結束程式（不在程式內自動重啟），需搭配服務管理員。

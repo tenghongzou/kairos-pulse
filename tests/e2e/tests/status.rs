@@ -105,7 +105,7 @@ fn status_follows_kairos_outage_and_pulse_exit() {
     assert_eq!(conn["proto"], 2, "{doc:#}");
     assert_eq!(
         conn["features"],
-        serde_json::json!(["metrics", "durable", "inventory", "processes"]),
+        serde_json::json!(["metrics", "durable", "inventory", "processes", "cluster"]),
         "{doc:#}"
     );
     assert!(

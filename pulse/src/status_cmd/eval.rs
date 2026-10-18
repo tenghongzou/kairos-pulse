@@ -239,6 +239,25 @@ fn clock_valid(file: &StatusFile, now: DateTime<Utc>, now_mono: Option<u64>) -> 
     }
 }
 
+/// 已註冊時的節點與候選位址：「（節點 kairos-b，第 2 個候選位址）」。沒有節點名稱且只有一個候選位址時
+/// 為空字串（與 0.8 相同；`kairos/HA.md` 第 8.7 節）
+fn cluster_note(c: &crate::status_file::Connection) -> String {
+    let mut parts = Vec::new();
+    if let Some(node) = c.server_node.as_deref().filter(|n| !n.is_empty()) {
+        parts.push(format!("節點 {node}"));
+    }
+    if let (Some(total), Some(index)) = (c.candidates, c.candidate_index)
+        && total > 1
+    {
+        parts.push(format!("第 {} 個候選位址", index.saturating_add(1)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("（{}）", parts.join("，"))
+    }
+}
+
 /// 連線列的簡短原因：「kairos…:8443 拒絕連線」
 fn reason_phrase(code: Option<&str>, server: &str, host: &str, last_error: &str) -> String {
     match code {
@@ -248,6 +267,8 @@ fn reason_phrase(code: Option<&str>, server: &str, host: &str, last_error: &str)
         Some(codes::E_SERVER_SILENT) => format!("{server} 沒有回應"),
         Some(codes::E_PER_IP_LIMIT) => format!("{server} 在加密連線建立前中斷"),
         Some(codes::W_SUPERSEDED) => "被同一 agent_id 的新連線取代".to_string(),
+        Some(codes::E_ALL_CANDIDATES_FAILED) => "所有候選位址都無法連線".to_string(),
+        Some(codes::I_DRAIN) => "Kairos 節點正在排空，改連其他節點".to_string(),
         _ if last_error.is_empty() => format!("無法連線到 {server}"),
         _ => last_error.to_string(),
     }
@@ -555,12 +576,16 @@ pub fn evaluate(input: &Input) -> Report {
                     } else {
                         format!("（{}）", tls.join("，"))
                     };
+                    let node = cluster_note(c);
                     rows.push(
                         Row::new(
                             "connection",
                             "連線",
                             Outcome::Ok,
-                            format!("已註冊到 {server}{tls}，已連線 {}", fmt::duration(outage)),
+                            format!(
+                                "已註冊到 {server}{node}{tls}，已連線 {}",
+                                fmt::duration(outage)
+                            ),
                         )
                         .summary("已註冊"),
                     );

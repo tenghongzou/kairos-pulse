@@ -568,7 +568,7 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
         .collect();
     e.counter_by(
         "kairos_agent_disconnects_total",
-        "agent 離線的次數，依原因（idle_timeout：超過離線門檻；agent_closed：agent 關閉連線或網路中斷；server_shutdown：Kairos 關機；certificate_rejected：連線中重新驗證憑證被拒；write_unknown：report 寫入結果未知而關閉連線；與 Webhook 的 offline_reason 相同）。由內部事件匯流排計數，與告警引擎同一個來源",
+        "agent 離線的次數，依原因（idle_timeout：超過離線門檻；agent_closed：agent 關閉連線或網路中斷；server_shutdown：Kairos 關機；certificate_rejected：連線中重新驗證憑證被拒；write_unknown：report 寫入結果未知而關閉連線；server_lost：服務的叢集節點失聯（0.9.0 只定義，叢集模式才會產生）；與 Webhook 的 offline_reason 相同）。由內部事件匯流排計數，與告警引擎同一個來源",
         "reason",
         &disconnects,
     );
