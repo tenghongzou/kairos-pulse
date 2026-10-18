@@ -27,6 +27,7 @@
 | 13 | 資料庫備份 | 同 1～9 | `kairos db backup` 的檔案、`.keys` | 管理者自行處理 | — | 不涵蓋（第 4.4 節） |
 | 14 | 使用者帳號 | 帳號、姓名、Email、登入紀錄 | `users`、`sessions`、`role_assignments` | 帳號刪除時刪除 | — | 不涵蓋（`kairos users delete`） |
 | 15 | Pulse 主機上的檔案 | 本機的狀態檔、日誌、緩衝中的 report | `/var/lib/pulse`、`/opt/pulse/logs`、緩衝目錄 | Pulse 的 `log.retention_days`、`buffer.max_age_hours` | — | 不涵蓋（在主機上 `apt purge pulse` 或安裝腳本 `--uninstall --purge`） |
+| 16 | 指標轉出（0.9.0，[EXPORT.md](EXPORT.md)） | 同 1、3、4（主機名稱、顯示名稱、標籤、指標、行程排行的名稱） | Prometheus exporter 的輸出、OTLP 推送到 collector 的資料；Kairos 只在記憶體中保留每台主機最新的一筆與 OTLP 佇列，設定存在 `settings` 表（不含主機資料） | 外部系統依其政策；記憶體中的資料在重新啟動時消失 | 轉出的是轉換後的值（第 2.1 節） | 記憶體中的最新值與佇列中尚未送出的資料一併丟棄；已送出到 Prometheus／collector 的資料不涵蓋（第 4.4 節） |
 
 ## 2. 保存方式的設定（`[privacy]`）
 
@@ -41,7 +42,7 @@ inventory_network = "keep"      # keep | truncate（介面位址截到 /24、/48
 
 ### 2.1 在哪裡轉換
 
-轉換在資料**進入** Kairos 時一次做完：8443 的連線（hello 的主機名稱與顯示名稱、連線的來源位址、report 的行程排行、`inventory` 的網路介面）與 8444 的註冊申請（主機名稱、顯示名稱）。之後的狀態表、`agents.json`、主機清冊、report、資產、告警、JSONL 鏡像、主控台 API 與匯出看到的都是轉換後的值，不需要各自處理，也不會漏掉新的輸出管道。
+轉換在資料**進入** Kairos 時一次做完：8443 的連線（hello 的主機名稱與顯示名稱、連線的來源位址、report 的行程排行、`inventory` 的網路介面）與 8444 的註冊申請（主機名稱、顯示名稱）。之後的狀態表、`agents.json`、主機清冊、report、資產、告警、JSONL 鏡像、主控台 API、匯出與指標轉出（Prometheus exporter、OTLP；EXPORT.md 第 2.7 節）看到的都是轉換後的值，不需要各自處理，也不會漏掉新的輸出管道。
 
 - `truncate` 的位址（`10.0.3.0/24`）在主控台與 `kairos hosts list` 原樣顯示；IP 篩選（`ip=` 的 CIDR）與「同網段」的判斷以網段的位址計算。`none` 時顯示「—」。
 - `process_command = "redact"` 的規則與診斷包的遮蔽相同（`kp-obs` 的 `redact`：`token=…`、Bearer、API／註冊 token、帶帳號密碼或查詢字串的網址），另外遮蔽 `--password x`、`--password=x`、`-password x`（名稱含 password、secret、token 等的參數）與 `mysql -pSECRET` 的寫法。`-p` 開頭的單一破折號參數一律遮蔽，`-pidfile` 這類參數也會被遮蔽（寧可多遮）。Pulse 預設不送命令列（`processes.command = "executable"`），這個設定只影響管理者在 Pulse 開啟完整命令列的主機。
@@ -100,7 +101,7 @@ inventory_network = "keep"      # keep | truncate（介面位址截到 /24、/48
 執行中的刪除由 Kairos 自己完成：
 
 1. 主機必須**離線**（連線中時 409 `host_online`，〔暫定〕`KRS-E4205`）。請先在主機上停止並移除 Pulse，或撤銷憑證讓它斷線。
-2. 從狀態表移除（之後的 `agents.json`、清冊同步、主控台都看不到它）。
+2. 從狀態表移除（之後的 `agents.json`、清冊同步、主控台都看不到它），並丟棄指標轉出在記憶體中的資料（Prometheus exporter 的最新值、OTLP 佇列中尚未送出的這台主機的資料；EXPORT.md）。
 3. 撤銷這台主機尚未撤銷、尚未過期的憑證（`cessationOfOperation`，立即生效；每張一筆稽核 `cert.revoke`）。執行中的 Kairos 數秒內重新產生 CRL；外部 CA 簽發、匯入的憑證由 Kairos 在 hello 時拒絕（PKI.md 第 16 節）。
 4. 告警引擎忘記這台主機的進行中事件（之後不再寫入它們）。
 5. report 的 writer 逐步刪除（每一步最多 5,000 列、一個交易，與 report 的寫入交錯，不會長時間擋住其他主機）：原始 report、行程快照、彙總、資產變更歷史；最後一步在同一個交易中刪除資產、序列、去重鍵、告警事件與處理紀錄與發送紀錄、註冊申請、續簽的重放快取、憑證紀錄、主機清冊，並寫入稽核 `host.purge`。
@@ -130,6 +131,7 @@ CLI 需要停止 Kairos 的原因：執行中的 Kairos 在記憶體中有這台
 | JSONL 鏡像（`storage.jsonl_mirror = true`）的 `reports-*.jsonl` | 依 `storage.retention_days`；檔案是唯讀的歷史紀錄，Kairos 不改寫 |
 | 資料庫備份（`kairos db backup`） | 依備份的保存政策；還原舊的備份會把已刪除的主機帶回來，還原後請再執行一次刪除 |
 | 已送出的通知（Email、Webhook、LINE、Teams） | 在接收端處理 |
+| 已轉出的指標（Prometheus 已抓取的序列、已推送到 OTLP collector 的資料） | 在 Prometheus／collector 端處理（依其保存期限，或以其刪除 API，例如 Prometheus 的 `delete_series`）；Kairos 停止輸出這台主機 |
 | 匯出、診斷包、個資匯出的檔案 | 由取得的人處理 |
 | Pulse 主機上的資料 | 在主機上完全移除 Pulse（第 1 節 #15） |
 
@@ -152,6 +154,7 @@ CLI 需要停止 Kairos 的原因：執行中的 Kairos 在記憶體中有這台
 | `privacy` | 目前的 `[privacy]` 設定（讓收到的人知道名稱與位址是否已假名化） |
 
 - 時間為 RFC 3339（UTC）；資料庫中的二進位欄位（雜湊、DER、壓縮的 report）不輸出。
+- 指標轉出（EXPORT.md）不在資料庫保存主機的資料（只有 `settings` 表中的轉出設定），因此個資匯出沒有對應的欄位。
 - 每次匯出記一筆稽核 `host.personal_data.export`。匯出的檔案含個資，請以安全的管道交給請求人並刪除副本。
 - 請求人是「使用這台電腦的人」而不是主機本身時，請由貴單位確認身分與權限後再提供（Kairos 不判斷）。
 

@@ -635,6 +635,28 @@ fn latest_sample_ignores_older_backfill() {
     assert_eq!(hub.queue_points(), 0, "OTLP 未啟用時不進佇列");
 }
 
+#[test]
+fn forget_drops_the_latest_sample_and_queued_points_of_one_host() {
+    // 刪除主機資料（kairos/PRIVACY.md 第 4 節）：最新值與 OTLP 佇列中這台主機的資料都丟掉，其他主機不受影響
+    let mut c = otlp_config("http://127.0.0.1:9/v1/metrics", |_| {});
+    c.export.prometheus.enabled = true;
+    let hub = ExportHub::new(eff_of(&c), None, None);
+    hub.accept(sample(A, "web-01", 1_000, 1.0, 1));
+    hub.accept(sample(B, "web-02", 1_000, 1.0, 1));
+    hub.accept(sample(A, "web-01", 2_000, 1.0, 1));
+    let per = sample(A, "web-01", 0, 0.0, 0).points();
+    assert_eq!(hub.queue_points(), 3 * per);
+    assert_eq!(hub.forget(A), 2 * per);
+    assert!(!hub.latest().contains_key(A));
+    assert!(hub.latest().contains_key(B));
+    assert_eq!(hub.queue_points(), per);
+    let rest = hub.take_batch(usize::MAX);
+    assert_eq!(rest.len(), 1);
+    assert_eq!(&*rest[0].agent_id, B);
+    // 不認得的主機：沒有影響
+    assert_eq!(hub.forget("nobody"), 0);
+}
+
 // ---- 主控台的端點 ----
 
 fn token(f: &crate::api::tests::Fixture, grant: TokenGrant, name: &str) -> String {

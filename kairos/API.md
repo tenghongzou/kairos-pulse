@@ -1359,7 +1359,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 - `impact_token` 由主機、會撤銷的憑證、告警事件與註冊申請的數字算出（原始 report 的筆數會因保留清除改變，不列入），5 分鐘的時間窗，前一個時間窗也接受（同第 11.5 節）。
 - `POST` 成功時 `data`：`agent_id`、`deleted`（同 `counts` 的欄位，為實際刪除的列數；`certificates_kept` 為保留的已撤銷憑證紀錄）、`revoked_serials`（刪除前撤銷的序號）、`kept`。
 
-**刪除的順序**：從狀態表移除 → 撤銷尚未撤銷的有效憑證（每張稽核 `cert.revoke`）→ 告警引擎忘記這台主機的進行中事件 → report 的 writer 逐步刪除（每一步最多 5,000 列；最後一步刪除清冊並寫稽核 `host.purge`，`code` 為〔暫定〕`KRS-I4204`）。等待上限 120 秒，逾時時 writer 仍會做完。稽核日誌不刪除（PRIVACY.md 第 4.2 節）。
+**刪除的順序**：從狀態表移除（同時丟棄指標轉出在記憶體中的最新值與 OTLP 佇列中這台主機的資料，第 16 節）→ 撤銷尚未撤銷的有效憑證（每張稽核 `cert.revoke`）→ 告警引擎忘記這台主機的進行中事件 → report 的 writer 逐步刪除（每一步最多 5,000 列；最後一步刪除清冊並寫稽核 `host.purge`，`code` 為〔暫定〕`KRS-I4204`）。等待上限 120 秒，逾時時 writer 仍會做完。稽核日誌不刪除（PRIVACY.md 第 4.2 節）。
 
 **CLI**（PRIVACY.md 第 4.1 節）：
 

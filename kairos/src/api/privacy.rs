@@ -233,6 +233,10 @@ async fn purge_host(
     if ctx.registry.forget(agent_id).is_err() {
         return Err(host_online());
     }
+    // 指標轉出（kairos/EXPORT.md）：Prometheus exporter 的最新值與 OTLP 佇列中尚未送出的資料一併丟棄
+    if let Some(hub) = ctx.registry.export_hub() {
+        hub.forget(agent_id);
+    }
     let actor = principal.actor();
     let ip = peer.ip().to_canonical().to_string();
     // 2. 撤銷尚未撤銷的有效憑證

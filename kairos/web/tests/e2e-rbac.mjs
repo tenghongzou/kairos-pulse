@@ -81,6 +81,9 @@ const WRITES = [
   ['POST', '/api/v1/pki/grace-overrides', 'pki.grace:override'],
   ['POST', '/api/v1/pki/signing-queue/import', 'pki.queue:manage'],
   ['POST', '/api/v1/pki/certificates/import', 'pki.queue:manage'],
+  // 指標轉出（F7）：設定與測試連線只有管理員
+  ['PUT', '/api/v1/export/settings', 'export:write'],
+  ['POST', '/api/v1/export/otlp/test', 'export:write'],
   // 個資（S6）：刪除主機資料只有管理員
   ['POST', `/api/v1/hosts/${NOBODY}/purge`, 'hosts:purge'],
   ['PUT', '/api/v1/pki/policy', 'pki.policy:write'],

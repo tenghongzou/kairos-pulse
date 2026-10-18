@@ -42,6 +42,19 @@ async fn purge_and_personal_data_over_https() {
             now,
         )
         .unwrap();
+    // 指標轉出（Prometheus exporter、OTLP 都啟用；不啟動推送工作，資料留在佇列）：刪除後記憶體中不留這台主機的資料
+    let hub = {
+        let mut c = crate::config::AppConfig::default();
+        c.export.prometheus.enabled = true;
+        c.export.otlp.enabled = true;
+        c.export.otlp.endpoint = "http://127.0.0.1:9/v1/metrics".into();
+        crate::export::ExportHub::new(
+            crate::export::settings::effective(&c, &[], None),
+            None,
+            None,
+        )
+    };
+    f.registry.set_export_hub(hub.clone());
     for i in 1..=2u64 {
         let revived = std::sync::atomic::AtomicBool::new(false);
         let outcome = crate::connection::store_report(
@@ -74,6 +87,8 @@ async fn purge_and_personal_data_over_https() {
         )
         .unwrap();
     let path = format!("/api/v1/hosts/{H}/purge");
+    assert!(hub.latest().contains_key(H));
+    assert!(hub.queue_points() > 0);
 
     // 只有管理員：維運者 403（權限名稱）
     let r = call(addr, "GET", &path, Some(&operator), None).await;
@@ -144,6 +159,11 @@ async fn purge_and_personal_data_over_https() {
     assert_eq!(d["revoked_serials"], json!(["C0FFEE01"]));
     assert_eq!(d["kept"]["certificates_for_crl"], 1);
     assert!(f.registry.live_get(H).is_none());
+    assert!(
+        !hub.latest().contains_key(H),
+        "Prometheus exporter 的最新值應已丟棄"
+    );
+    assert_eq!(hub.queue_points(), 0, "OTLP 佇列中這台主機的資料應已丟棄");
     let conn = f.admin();
     let one = |sql: &str| -> i64 { conn.query_row(sql, [H], |r| r.get(0)).unwrap() };
     assert_eq!(one("SELECT COUNT(*) FROM hosts WHERE agent_id = ?1"), 0);

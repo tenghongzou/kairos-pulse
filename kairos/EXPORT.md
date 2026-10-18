@@ -133,6 +133,10 @@ scrape_configs:
 - 以 `params: {group: [...]}` 依主機群組分成多個 job（或多台 Prometheus 分擔），每次抓取只產生該群組的輸出；
 - 輸出在主控台的 blocking 執行緒上產生，不佔用 API 的工作執行緒；Kairos 不快取輸出（每次抓取都是當下的狀態）。
 
+### 2.7 個資保護（`[privacy]`）
+
+`[privacy]`（[PRIVACY.md](PRIVACY.md)）在資料進入 Kairos 時就轉換，指標轉出讀到的狀態表、主機清冊與 report 都已是轉換後的值：`hostname = "pseudonymize"` 時 Prometheus 的 `hostname` 標籤、`kairos_host_info` 的 `display_name` 與 OTLP 的 `host.name`、`kairos.host.display_name` 都是假名；行程排行的命令列與執行身分依 `process_command`、`process_user`；來源位址不轉出。刪除主機資料（PRIVACY.md 第 4 節）時，記憶體中的最新值與 OTLP 佇列中尚未送出的資料一併丟棄，之後的抓取不再輸出這台主機；已被 Prometheus 抓取或已推送到 collector 的資料需在該系統處理。指標轉出只把設定存在 `settings` 表，沒有其他持久的主機資料。
+
 ## 3. OTLP 推送
 
 ### 3.1 設定

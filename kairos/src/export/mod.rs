@@ -358,10 +358,15 @@ impl ExportHub {
         lock(&self.latest).clone()
     }
 
-    /// 主機的資料被刪除時（之後的抓取不再輸出）
-    #[allow(dead_code)]
-    pub fn forget(&self, agent_id: &str) {
+    /// 主機的資料被刪除時（`kairos/PRIVACY.md` 第 4 節）：丟掉記憶體中的最新值（之後的抓取不再輸出）
+    /// 與 OTLP 佇列中尚未送出的這台主機的資料。回傳從佇列移除的資料點數
+    pub fn forget(&self, agent_id: &str) -> usize {
         lock(&self.latest).remove(agent_id);
+        let mut q = lock(&self.queue);
+        let before = q.points;
+        q.items.retain(|s| &*s.agent_id != agent_id);
+        q.points = q.items.iter().map(|s| s.points()).sum();
+        before - q.points
     }
 }
 

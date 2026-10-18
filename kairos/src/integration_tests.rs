@@ -2042,6 +2042,100 @@ async fn privacy_policy_is_applied_before_anything_is_stored() {
 }
 
 #[tokio::test]
+async fn exported_metrics_only_carry_privacy_transformed_values() {
+    // 指標轉出（kairos/EXPORT.md）× 個資保護（kairos/PRIVACY.md）：[privacy] 在資料進入時轉換，
+    // Prometheus exporter 的輸出與 OTLP 的 payload 都只看到假名、網段與遮蔽後的命令列
+    use crate::export::{ExportHub, otlp, prom, settings};
+    use crate::privacy::*;
+    let key = || PseudonymKey::from_bytes(&[7u8; 32]);
+    let settings_ = PrivacySettings {
+        store_peer_ip: PeerIpMode::Truncate,
+        hostname: HostnameMode::Pseudonymize,
+        process_command: ProcessCommandMode::Redact,
+        process_user: ProcessUserMode::Drop,
+        inventory_network: InventoryNetworkMode::Truncate,
+    };
+    let server = Server::start(Options {
+        privacy: Arc::new(PrivacyPolicy::new(settings_, Some(key()))),
+        ..sqlite_server_options()
+    })
+    .await;
+    let mut cfg = crate::config::AppConfig::default();
+    cfg.export.prometheus.enabled = true;
+    cfg.export.prometheus.include_processes = true;
+    cfg.export.otlp.enabled = true;
+    cfg.export.otlp.endpoint = "http://127.0.0.1:9/v1/metrics".into();
+    let eff = settings::effective(&cfg, &[], None);
+    let hub = ExportHub::new(eff.clone(), None, None);
+    server.registry.set_export_hub(hub.clone());
+
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "processes", "inventory"]).to_string())
+        .await;
+    assert_eq!(c.recv().await["type"], "hello_ack");
+    let mut r: Value = serde_json::from_str(&metrics_report(2, 1.0)).unwrap();
+    r["processes"] = json!({"top_cpu": [{"pid": 7, "name": "mysql", "cpu_usage": 1.0, "memory": 5,
+        "user": "annx9user", "command": "mysql -uroot -pS3cret"}]});
+    c.send(&r.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+
+    let pseudonym = key().pseudonym("host", "web-01");
+    // 原始的主機名稱、顯示名稱、完整的來源位址、執行身分與密碼都不能出現
+    let forbidden = ["web-01", "Web 01", "127.0.0.1", "annx9user", "S3cret"];
+    let check = |what: &str, text: &str| {
+        for f in forbidden {
+            assert!(!text.contains(f), "{what} 含有 {f:?}：{text}");
+        }
+    };
+
+    // Prometheus exporter：主機列取自狀態表（與主控台的主機索引同源）＋ hub 的最新值
+    let sample = hub.latest().get(ID).cloned().expect("hub 應有最新值");
+    assert_eq!(&*sample.hostname, pseudonym);
+    let live = server.registry.live_get(ID).unwrap();
+    let row = prom::HostRow {
+        agent_id: live.agent_id.clone(),
+        hostname: live.hostname.clone(),
+        display_name: live
+            .host
+            .as_ref()
+            .and_then(|h| h.display_name.clone())
+            .map(Arc::from),
+        group: None,
+        up: true,
+        agent_version: Some(live.agent_version.clone()),
+        os_family: None,
+        tags: Arc::from(Vec::<String>::new()),
+        sample: Some(sample),
+    };
+    let rendered = prom::render(
+        &[row],
+        &prom::Options {
+            now_ms: Utc::now().timestamp_millis(),
+            stale_after_ms: i64::MAX / 2,
+            include_processes: true,
+            processes_top_n: 5,
+            openmetrics: false,
+        },
+    );
+    assert!(
+        rendered.body.contains(&format!("hostname=\"{pseudonym}\"")),
+        "{}",
+        rendered.body
+    );
+    check("Prometheus 輸出", &rendered.body);
+
+    // OTLP：resource 屬性取自主機清冊（SQLite）
+    let meta = otlp::load_host_meta(&server.dir.join(crate::store::sqlite::DB_FILE));
+    let batch = hub.take_batch(usize::MAX);
+    assert_eq!(batch.len(), 1);
+    let (body, points) = otlp::encode(&batch, &meta, &eff);
+    assert!(points > 0);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains(&pseudonym), "OTLP 應帶假名");
+    check("OTLP payload", &text);
+}
+
+#[tokio::test]
 async fn processes_are_validated_only_when_negotiated() {
     let server = Server::start(sqlite_server_options()).await;
     let mut c = Client::connect(server.addr).await;
