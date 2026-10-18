@@ -48,7 +48,28 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（目前沒有 0.8.0 之後的變更。）
+下一版為 **0.9.0**（版本號尚未變更）。
+
+### 新增：Pulse 的多個伺服器位址與協定 feature `cluster`（HA 規格 `kairos/HA.md` L4）
+
+**協定版本不變（v1～v2）、錯誤碼不變**；新增 feature `cluster`（雙方都宣告時才使用），0.8 與 0.9 的任何組合都能連線。
+
+- **Pulse `server.fallback_addresses`**：主位址連不上時依序改試的其他 Kairos 節點（"主機" 或 "主機:埠"，IPv6 加方括號，最多 16 個；環境變數 `PULSE__SERVER__FALLBACK_ADDRESSES` 以逗號分隔）。新的鍵、`address` 維持單值，降版安全；安裝字串不變。一輪從主位址開始依序嘗試，收到 `hello_ack` 之前失敗就立即改試下一個（`PLS-W2301`，暫定，不增加退避），整輪都失敗才依 `[retry]` 退避（`PLS-E2302`，暫定，列出每個位址最後的錯誤）；連上後不主動切回主位址。名稱解析出多個 IP 時依序嘗試，每個最多 3 秒（整個位址仍是 5 秒）。所有位址都以同一個 `server.domain` 驗證伺服器憑證。一次性連線（`pulse enroll` 的確認、輪替後的確認、除役通知、過期憑證的報到）從最近一次連上的位址開始依序嘗試。
+- **feature `cluster`**（PROTOCOL.md「叢集與排空」）：Pulse 0.9 一律宣告；Kairos 只在 client 也宣告時才在 `hello_ack` 列出並帶 `server_node`（新設定 `[cluster] node_id`，預設為主機名稱的第一段）。`cluster_id` 留給叢集模式，單機的 Kairos 不送。新增排空訊息 `drain`（Kairos → Pulse）：Kairos 0.9 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reconnect_within_ms` = `max(10000, 線上連線數 × 5)`）再 `close_notify`，記 `KRS-I8407`（暫定）；Pulse 收到後停送新的 report、等在途的回應（最多 8 秒）後關閉，在隨機延遲後改連下一個候選位址，不算連線失敗（`PLS-I8407`，暫定）。
+- **狀態與可觀測性**：`status.json`／`pulse status --json` 的 `connection.server` 改為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`（只新增欄位，schema 不變）；`pulse status` 顯示「已註冊到 <位址>（節點 <名稱>，第 N 個候選位址）」。本機指標新增 `pulse_server_candidates`、`pulse_server_candidate_index`、`pulse_connect_failovers_total`、`pulse_drains_total`。`pulse check-config` 列出備用位址，`pulse diag` 新增 `candidates.json`（每個位址的名稱解析與 TCP 連線）。
+- **Kairos 離線原因 `server_lost`**：服務這台主機的叢集節點失聯（叢集模式由 leader 標記）。0.9.0 只定義名稱：主機 API 的 `offline_reason` 篩選、`/metrics` 的 `kairos_agent_disconnects_total{reason}`（多一個值為 0 的序列）與 Webhook 的固定代碼；單機的 Kairos 不會產生。接收端應忽略不認得的值。
+
+### 相容性
+
+| Pulse ＼ Kairos | Kairos 0.8（以前） | Kairos 0.9 |
+|---|---|---|
+| **Pulse 0.8（以前）** | 不變 | 與 0.8 相同：不宣告 `cluster` 的 client 收到的 `hello_ack` 不變，也不會收到 `drain`（Kairos 關機時照舊直接關閉連線） |
+| **Pulse 0.9** | 舊版 Kairos 不列出 `cluster`：沒有節點名稱、不會收到 `drain`；`fallback_addresses` 照常運作 | 協商 `cluster`：節點名稱、關機排空 |
+
+- 降版到 0.8 的 Pulse 會忽略 `server.fallback_addresses`，只連 `server.address`。
+- **注意**：所有候選位址必須屬於共用同一個資料庫的同一個叢集，durable 的去重才是全叢集的。0.9.0 還沒有共用資料庫的叢集模式（PostgreSQL、租約為 0.10.0），把備用位址指到另一個各自有 SQLite 的 Kairos 時，換節點時在途的 report（最多 4 筆）可能兩邊各寫一次。
+- 8444（註冊、輪詢、過期續簽）不跟著候選位址走，仍只用 `enroll.address`（空字串時為 `server.address` 的主機）；叢集部署請設為負載平衡器或虛擬 IP 的名稱。DNS SRV（`server.srv`）未實作（HA 規格的階段 B 選用）。
+- 暫定代碼 `PLS-W2301`、`PLS-E2302`、`PLS-I8407`、`KRS-I8407` 待設計包正式分配（`pulse/ERROR-CODES.md` 第 2.8 節）。
 
 ## [0.8.0] - 2026-10-16
 

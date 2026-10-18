@@ -237,7 +237,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `status` | `offline,unknown` | 主機狀態 token（六種之一，否則 400） |
 | `never_connected` | `true` | 從未連線（`unknown` 的一種） |
 | `offline_for` | `3d` | 失聯（不是 `online`）且 `last_seen` 至少在這麼久之前（`90m`、`12h`、`3d`、`2w`；設計包「失聯超過 N」、`kairos hosts list --offline-for`） |
-| `offline_reason` | `certificate_rejected` | 最後中斷原因（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`；第 5.2 節）。0.7 的過渡期另接受舊名稱 `timeout`（＝`idle_timeout`）、`connection_closed`（＝`agent_closed`），0.8 移除 |
+| `offline_reason` | `certificate_rejected` | 最後中斷原因（`idle_timeout`、`agent_closed`、`server_shutdown`、`certificate_rejected`、`write_unknown`、`server_lost`；第 5.2 節）。0.7 的過渡期另接受舊名稱 `timeout`（＝`idle_timeout`）、`connection_closed`（＝`agent_closed`），0.8 移除 |
 | `tag` | `env:prod,line3` | 標籤（完全相同，不分大小寫） |
 | `os` | `Ubuntu,Windows` | `os.name`（完全相同，不分大小寫） |
 | `os_family` | `linux,windows` | 作業系統家族（0.8.0）：資產（`inventory.os.family`）優先，沒有資產時由 hello 的 `os.name` 推斷（含 `windows` 為 `windows`，其他為 `linux`）。其他值 400 |
@@ -342,7 +342,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
   - **只歸屬由信任的 CA 簽發的憑證**：已撤銷、無法判定撤銷狀態（兩者都在憑證鏈驗證之後才檢查），以及已過期但以效期的最後一秒重新驗證可以通過的。自簽或不受信任的 CA 簽發的憑證（`KRS-W1109`）**不歸屬**：SAN 由出示者自己決定，否則任何人都能讓別台主機顯示「憑證被拒」，或以大量假的 `agent_id` 填滿紀錄。
   - 記錄在記憶體中（最多 1 萬台），每 10 秒寫入主機清冊（`hosts.cert_rejected_at`、`cert_rejection`），重新啟動後仍在。清冊中沒有的 `agent_id`（例如已清除的主機）只留在記憶體中。
   - 連線中被踢掉（熱重載後重新驗證失敗，例如撤銷後 1 個重載週期內）的離線原因同樣是 `certificate_rejected`。
-- `offline_reason`（第 5.1 節）：`idle_timeout`（超過離線門檻沒有合法訊息）、`agent_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）。**0.7 起與 Webhook 的 `offline_reason`、`/metrics` 的 `kairos_agent_disconnects_total{reason}` 是同一組名稱**（[`ALERTS.md`](ALERTS.md) 第 2 節；設計包 §28.5 #4）。
+- `offline_reason`（第 5.1 節）：`idle_timeout`（超過離線門檻沒有合法訊息）、`agent_closed`（連線關閉：agent 關閉、網路中斷或伺服器關閉連線）、`server_shutdown`（Kairos 關機）、`certificate_rejected`（見上）、`write_unknown`（0.6.0：report 寫入結果未知，Kairos 關閉了連線）、`server_lost`（0.9.0 定義：服務這台主機的叢集節點失聯，由叢集模式的 leader 標記，`kairos/HA.md` 第 6.6 節；單機的 Kairos 不會產生，篩選參數已接受）。接收端應忽略不認得的值。**0.7 起與 Webhook 的 `offline_reason`、`/metrics` 的 `kairos_agent_disconnects_total{reason}` 是同一組名稱**（[`ALERTS.md`](ALERTS.md) 第 2 節；設計包 §28.5 #4）。
   - **過渡期（0.7，破壞性變更）**：0.4～0.6 的名稱是 `timeout`、`connection_closed`。0.7 的回應在 `status_detail` 另帶 `offline_reason_legacy`（舊名稱；其餘三個值兩者相同），SSE 的 `host.offline` 另帶 `reason_legacy`，總覽的離線清單另帶 `offline_reason_legacy`；查詢參數 `offline_reason` 新舊名稱都接受。依舊名稱判斷的整合請改讀 `offline_reason`（新名稱）；`*_legacy` 欄位與舊的查詢值在 0.8 移除。
   - 只有 Kairos 這次啟動後發生的才知道，其餘為 `null`。設計包 §24 #2 的完整分類（`auth_failed`、`superseded`、寫入結果未知等）與每台主機的連線紀錄屬於之後的版本。
 - `certificate`（0.7.0）：這台主機最新一張由 Kairos 簽發的憑證的摘要 `{"state", "not_after", "revoked_at"}`，`state` 為 `valid`、`expiring`（30 天內到期）、`expired`、`revoked`；沒有簽發紀錄（手動配置的憑證）時為 `null`。只需要 `hosts:read`（設計包 S05：唯讀角色也看得到「有效，至 2028-01-12」）；序號、指紋與簽發方式需要 `pki:read`，見 `GET /api/v1/pki/certificates?agent_id=`（第 11.5 節）。

@@ -66,6 +66,8 @@
 | 新版 Pulse 連新版 Kairos | v2：report 為通用指標，JSONL 為 `schema` 2 |
 | Pulse 0.4（以前）連 Kairos 0.5 | 與 0.4 相同：`renew`、`deregister` 只在 hello 宣告時才列進 `hello_ack`（並帶 `expired_renew_grace_days`）；沒有宣告的 client 送 `renew_request`／`deregister` 照舊回 `unknown_type` |
 | Pulse 0.5 連 Kairos 0.5 | 以 `pulse enroll` 註冊的主機宣告 `renew`（自動輪替）、`pulse decommission` 的連線宣告 `deregister`（PROTOCOL.md「憑證輪替與除役」）；手動憑證的主機與 0.4 相同 |
+| Pulse 0.8（以前）連 Kairos 0.9 | 與 0.8 相同：`cluster` 只在 hello 宣告時才列進 `hello_ack`（並帶 `server_node`），也只對這些連線送 `drain` |
+| Pulse 0.9 連 Kairos 0.9 | Pulse 宣告 `cluster`：`hello_ack` 帶節點名稱（`cluster.node_id`），Kairos 優雅關機時先送 `drain`，Pulse 在隨機延遲後改連下一個候選位址（PROTOCOL.md「叢集與排空」） |
 
 讀取 JSONL 的工具請依每行的 `schema` 判斷格式（見「資料輸出」）；同一個檔案中可能同時有兩種格式的行。
 
@@ -445,6 +447,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `alerts.retention_days` | `KAIROS__ALERTS__RETENTION_DAYS` | `400` | 已解決的告警事件（含處理紀錄與發送紀錄）保留天數，1～3660 |
 | `alerts.max_events` | `KAIROS__ALERTS__MAX_EVENTS` | `100000` | 告警事件的筆數上限（超過時刪除最舊的已解決事件），1,000～10,000,000 |
 | `alerts.subnet_prefix_v4`、`alerts.subnet_prefix_v6` | `KAIROS__ALERTS__SUBNET_PREFIX_V4`、`…_V6` | `24`、`64` | 網段彙總（網段離線）的遮罩：IPv4 8～32、IPv6 32～128 |
+| `cluster.node_id` | `KAIROS__CLUSTER__NODE_ID` | `""`（主機名稱的第一段，轉成小寫，其他字元改為 `-`） | 節點名稱（0.9.0）：協商了 feature `cluster` 的 Pulse 在 `hello_ack.server_node` 收到它，`pulse status` 顯示連到哪個節點。1～63 個字元的 `[a-z0-9-]`，不以 `-` 開頭或結尾，不合法時拒絕啟動。叢集模式（`kairos/HA.md`）的其他設定在之後的版本才提供 |
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
@@ -567,7 +570,7 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 | 類別 | metric |
 |---|---|
 | 服務 | `kairos_build_info{version,commit}`、`kairos_start_time_seconds`、`kairos_shutting_down`、`kairos_ready` |
-| 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`idle_timeout`／`agent_closed`／`server_shutdown`／`certificate_rejected`／`write_unknown`，與告警 Webhook、主機 API 的 `offline_reason` 相同；0.7 起主機 API 也改用這組名稱，過渡期另帶 `offline_reason_legacy`，API.md 第 5.2 節）、`kairos_agent_superseded_total`、`kairos_agent_auth_failures_total`（KRS-W1102）、`kairos_host_events_lagged_total`。上線、離線、被取代、身分驗證失敗與淘汰由內部事件匯流排計數（與告警引擎同一個來源，不重複） |
+| 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`idle_timeout`／`agent_closed`／`server_shutdown`／`certificate_rejected`／`write_unknown`／`server_lost`〔0.9 定義，叢集模式才會產生〕，與告警 Webhook、主機 API 的 `offline_reason` 相同；0.7 起主機 API 也改用這組名稱，過渡期另帶 `offline_reason_legacy`，API.md 第 5.2 節）、`kairos_agent_superseded_total`、`kairos_agent_auth_failures_total`（KRS-W1102）、`kairos_host_events_lagged_total`。上線、離線、被取代、身分驗證失敗與淘汰由內部事件匯流排計數（與告警引擎同一個來源，不重複） |
 | 告警 | `kairos_alerts_engine_enabled`、`kairos_alerts_engine_up`、`kairos_alerts_engine_last_tick_timestamp_seconds`、`kairos_alerts_engine_tick_duration_seconds`、`kairos_alerts_engine_warmup`、`kairos_alerts_open{severity,state}`（`state`：`firing`／`acknowledged`／`recovered`）、`kairos_alerts_fired_total{severity}`、`kairos_alerts_resolved_total{severity}`、`kairos_alerts_events_lagged_total`、`kairos_alert_channels{state}`（`ok`／`failed`／`disabled`）、`kairos_alert_notification_sends_total{kind,result}`（`kind`：`email`／`webhook`；`result`：`ok`／`error`；不含測試通知）、`kairos_alert_notifications_total{kind,state}`（`sent`／`failed`／`dropped`） |
 | 被拒的連線 | `kairos_connections_rejected_total{reason}`（`per_ip` KRS-W2201／`rate`／`handshake_limit` KRS-W2204）、`kairos_accept_pauses_total`、`kairos_accept_paused_seconds_total`、`kairos_accept_paused`、`kairos_report_rate_limited_total{scope}`（`identity`：mTLS 的憑證身分；`ip`：來源 IP） |
 | report 寫入 | `kairos_reports_received_total`、`kairos_reports_total{result}`（`written`／`duplicate`／`storage_unavailable`／`unknown`／`rate_limited`）、`kairos_report_write_queue_depth`、`kairos_report_write_queue_capacity`、`kairos_report_ack_duration_seconds`（直方圖：放入寫入佇列到寫入完成）、`kairos_storage_unavailable` |
@@ -890,7 +893,7 @@ writer 每批寫入前都會檢查目前的 `reports-YYYY-MM-DD.jsonl` 路徑是
 在主控台按 Ctrl+C（或 Ctrl+Break、關閉主控台視窗、系統關機；非 Windows 為 SIGINT／SIGTERM）時，Kairos 依序：
 
 1. 停止接受新連線並關閉監聽 socket
-2. 對每條連線送出 `close_notify` 後結束（送出後最多再讀取丟棄對方資料 200 ms），連線上的 agent 照常標記為離線；最晚到**訊號後 2.0 秒**，逾時的連線直接中止並標記為離線（收尾期限已過時不再送 `close_notify`，直接釋放連線）
+2. 對每條連線送出 `close_notify` 後結束（送出後最多再讀取丟棄對方資料 200 ms），連線上的 agent 照常標記為離線；最晚到**訊號後 2.0 秒**，逾時的連線直接中止並標記為離線（收尾期限已過時不再送 `close_notify`，直接釋放連線）。0.9.0 起，協商了 feature `cluster` 的連線（Pulse 0.9 以上）在 `close_notify` 之前先收到排空訊息 `drain`（`reconnect_within_ms` 為 `max(10000, 線上連線數 × 5)`），Pulse 在這段時間內的隨機延遲後改連下一個候選位址（設定了 `server.fallback_addresses` 時）或重連同一個位址，避免所有 agent 同時湧入；關機日誌另記一行 `資訊 KRS-I8407（暫定）：已對 N 條協商了 cluster 的連線送出 drain`。其他連線與 0.8 相同
 3. 把寫檔佇列中剩餘的 report 寫完並 flush、逐筆回覆結果（連線已關閉的回覆直接忽略；被中止的連線已送出的 report 仍會寫入，只是 agent 收不到 `ack`），最晚到訊號後 2.5 秒
 4. 寫出最後一次 `agents.json`（此時所有 agent 都是 `online: false`），最晚到訊號後 3.0 秒
 5. 以結束代碼 0 結束，最後一行日誌附上關機總耗時

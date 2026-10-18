@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（93 個，含 0.8.0 新增的 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔指標擴充〕與 2.7 的 `PLS-E8105`、`PLS-E8106`〔Windows 服務〕，設計包 §30.3 正式分配）
+## 2. 已對應的代碼（96 個，含 0.8.0 新增的 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔指標擴充〕與 2.7 的 `PLS-E8105`、`PLS-E8106`〔Windows 服務〕，設計包 §30.3 正式分配；以及 0.9.0 的 3 個**暫定**代碼：2.8 的 `PLS-W2301`、`PLS-E2302`、`PLS-I8407`〔多伺服器位址與排空，`kairos/HA.md` 第 19 節，待設計包正式分配〕）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -143,6 +143,18 @@
 | `PLS-E8105` | `winsvc.rs` `install`、`uninstall` | 服務控制管理員回報錯誤：沒有系統管理員權限、服務 `Pulse` 已存在（install）或不存在（uninstall）、無法啟動（`--start`） | stderr，`pulse service` 結束代碼 1 |
 | `PLS-E8106` | `winsvc.rs` `run_service` | `pulse service run` 不是由服務控制管理員啟動（在主控台執行），或無法切換到 `--workdir` | stderr，結束代碼 2／1 |
 
+### 2.8 多個伺服器位址與排空（0.9.0；**暫定代碼**）
+
+`kairos/HA.md` 第 19 節的暫定號碼（子類別 23「多伺服器位址與叢集連線」、84「叢集與高可用」），正式分配由設計包負責（HA.md 第 22 節）。號碼改變時只需要改 `codes.rs` 的常數與本表。
+
+| 代碼 | 程式位置 | 觸發條件 | 看得到的地方 |
+|---|---|---|---|
+| `PLS-W2301`（暫定） | `network.rs` `run_with` | 設定了 `server.fallback_addresses`，某個候選位址在收到 `hello_ack` 之前失敗，已立即改試下一個（不增加退避）。每輪第一次失敗時判斷：`WARN` 每 10 分鐘最多一則，其餘記 `DEBUG` | `conn.failover`；本機指標 `pulse_connect_failovers_total` |
+| `PLS-E2302`（暫定） | `network.rs` `run_with` | 所有候選位址都無法連線（一般網路錯誤），依退避重試；日誌與 `status.json` 的 `connection.candidate_errors` 列出每個位址最後的錯誤。某個位址的錯誤需要人工處理（伺服器憑證不符、用戶端憑證被拒、伺服器的致命錯誤等）時改記該錯誤的代碼 | `conn.lost`；連線列 ○「所有候選位址都無法連線」（滿 30 分鐘 ✗），說明列出各位址 |
+| `PLS-I8407`（暫定，鏡像 `KRS-I8407`） | `network.rs` `run_with`、`local_status.rs` `drained` | 協商了 feature `cluster`，Kairos 送 `drain`（節點排空或關機）：等在途的回應（最多 8 秒）後關閉，在 `reconnect_within_ms` 內的隨機延遲後改連下一個候選位址；不算連線失敗、不增加退避 | `conn.drain`（`INFO`）；連線列 ○「Kairos 節點正在排空，改連其他節點」，不列為問題；本機指標 `pulse_drains_total` |
+
+設定值不合法（`fallback_addresses` 超過 16 個、IPv6 沒有方括號、連接埠不合法等）沿用 `PLS-E0201`。
+
 ## 3. 日誌事件（`log-ux.md` §4）
 
 | 事件 | 事件識別碼 | 程式位置 | 已實作 |
@@ -154,6 +166,7 @@
 | `sysinfo.snapshot` | 1010 | `system_info.rs` `Extras::log_skipped` | 部分（0.8.0）：只記超過每類上限而略過的掛載點、磁碟 I/O 裝置、網路介面（`skipped_*`），第一次取樣時一則、之後每 24 小時最多一則；啟動時的完整系統資訊仍是沒有事件的 INFO 行 |
 | `sysinfo.limited`、`inventory.rejected` | 〔待分配〕 | `system_info.rs` `report_limited`、`inventory.rs` | ✓（0.8.0；設計包沒有，事件名稱與識別碼待設計組確認，見 METRICS.md 第 14 節） |
 | `conn.registered`、`conn.lost`、`conn.restored`、`conn.outage` | 2000、2001、2003、2004 | `network.rs` | ✓（`conn.restored` 附待補送筆數與丟棄筆數） |
+| `conn.failover`、`conn.drain` | 〔待分配〕 | `network.rs` `run_with` | ✓（0.9.0；`PLS-W2301`、`PLS-I8407`，事件名稱與識別碼待設計組確認，`kairos/HA.md` 第 22 節） |
 | `tls.server_cert_rejected`、`auth.*`、`conn.superseded`、`proto.incompatible`、`server.full` | 2100～2301 | `network.rs` `disconnect_event` | ✓ |
 | `report.rejected`、`report.skipped`、`server.unexpected` | 2400～2402 | `network.rs` | ✓ |
 | `cert.expiring`、`cert.expired` | 3000、3003 | `tls.rs` | ✓ |
