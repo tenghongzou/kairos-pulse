@@ -13,7 +13,7 @@
 
 協定的線上格式仍以 [`crates/kairos-proto/PROTOCOL.md`](../crates/kairos-proto/PROTOCOL.md) 為準；本文件第 18 節的協定增補是草稿，實作時再併入 PROTOCOL.md。儲存的現況見 [`STORAGE.md`](STORAGE.md)，PKI 見 [`PKI.md`](PKI.md)，主控台 API 見 [`API.md`](API.md)，告警見 [`ALERTS.md`](ALERTS.md)。
 
-- 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
+- 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）。**L4 已實作**（`sprint8/pulse-multiaddr`，已併入整合分支）；與本文件原規劃不同之處已在第 8.6、18.1～18.3 節標明「0.9.0 的實作」；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
 - 商業審計 A2 的原文：「沒有 HA：Kairos 是單一行程，狀態放在記憶體，資料目錄假設只有一個寫入者。Pulse 只能設定一個伺服器位址。修正方向：讓 Kairos 只負責連線（無狀態），狀態與資料移到外部資料庫，前面放 L4 LB；Pulse 支援多個位址或 DNS SRV。6～10 人週。」
 - 設計依據（設計包，唯讀）：`decisions/INTEGRATION.md` §26～§30 的代碼分配慣例、`design-system/copywriting.md` §3（代碼格式與號段）、`kairos/screens.md` S20（系統健康）。設計包需要配合的事項列在第 22 節，**本線沒有修改 `design/`**。
 - 埠號寫法：本文件沿用文件慣例，以 8443 表示 agent 連線埠（`server.listen`）、8444 表示註冊通道（`enroll.listen`）、9443 表示主控台（`console.listen`）。注意 Kairos 程式內 `server.listen` 的預設值是 `127.0.0.1:8080`（`config.rs`），Pulse `server.port` 的預設值也是 8080。
