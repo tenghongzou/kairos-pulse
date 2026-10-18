@@ -449,6 +449,15 @@ impl Proc {
             .unwrap_or_else(|| panic!("{} 被訊號終止：{status:?}\n{}", self.name, self.dump()))
     }
 
+    /// 強制終止（模擬行程當掉或主機斷電：不走優雅關機，連線直接被作業系統重設）
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        if let Ok(status) = self.child.wait() {
+            self.status = Some(status);
+        }
+        self.join_readers();
+    }
+
     /// 優雅結束並回傳結束代碼與從送出訊號到結束的時間
     pub fn stop(&mut self) -> (i32, Duration) {
         let started = Instant::now();
