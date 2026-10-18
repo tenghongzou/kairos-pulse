@@ -175,3 +175,6 @@ enabled = false
 retention_days = 1095         # 保留天數（預設 3 年，獨立於 report 的保留天數），90..=36500
 anchor_log_minutes = 60       # 每隔幾分鐘把鏈尾雜湊寫一行到日誌（audit.chain_anchor；經 syslog 外送），0 不寫，5..=1440
 verify_interval_hours = 24    # 每隔幾小時自我驗證雜湊鏈與 HMAC（失敗：KRS-E6201＋「稽核日誌完整性」緊急事件），1..=168
+
+[cluster]                     # 叢集的節點設定（kairos/HA.md）；0.9.0 只有 node_id，叢集模式之後的版本才提供
+node_id = ""                  # 節點名稱（Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）

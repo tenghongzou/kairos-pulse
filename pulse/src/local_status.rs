@@ -127,6 +127,21 @@ pub struct Registered {
     pub durable: bool,
     /// hello_ack 的 `server_time`（v2）
     pub server_time: Option<DateTime<Utc>>,
+    /// 實際連上的候選位址（`host:port`）
+    pub server: String,
+    /// hello_ack 的 `server_node`（協商了 feature `cluster` 時）
+    pub server_node: Option<String>,
+    /// 候選位址的數量與目前連上的是第幾個（從 0 起）
+    pub candidates: usize,
+    pub candidate_index: usize,
+}
+
+/// 所有候選位址都無法連線時，一個位址最後的錯誤
+#[derive(Debug, Clone)]
+pub struct CandidateError {
+    pub server: String,
+    pub code: Option<&'static str>,
+    pub message: String,
 }
 
 /// 斷線時的資訊
@@ -140,6 +155,8 @@ pub struct Disconnected {
     pub attention: bool,
     pub consecutive_failures: u64,
     pub retry_in: Duration,
+    /// 有多個候選位址且全部都失敗時，每個位址最後的錯誤（其他時候為空）
+    pub candidate_errors: Vec<CandidateError>,
 }
 
 /// 中斷後恢復時的摘要（`conn.restored`）
@@ -263,6 +280,14 @@ impl State {
             c.last_outage_until = Some(ts(now));
         }
         c.state = "registered".into();
+        if !info.server.is_empty() {
+            c.server = info.server;
+        }
+        c.server_node = info.server_node;
+        c.candidates = u32::try_from(info.candidates).ok();
+        c.candidate_index = u32::try_from(info.candidate_index).ok();
+        c.candidate_errors.clear();
+        crate::metrics::global().set_candidate(info.candidates, info.candidate_index);
         c.tls_version = info.tls_version;
         c.server_verified = info.server_verified;
         c.proto = Some(info.proto);
@@ -315,6 +340,15 @@ impl State {
             .map(|r| ts(now + r));
         c.last_error_code = d.code.map(str::to_string);
         c.last_error = Some(d.message.clone());
+        c.candidate_errors = d
+            .candidate_errors
+            .into_iter()
+            .map(|e| sf::CandidateError {
+                server: e.server,
+                code: e.code.map(str::to_string),
+                message: e.message,
+            })
+            .collect();
         if d.attention {
             let same = c
                 .last_rejection
@@ -330,6 +364,29 @@ impl State {
         }
         self.connected_durable = None;
         self.retry = None;
+    }
+
+    /// Kairos 要求改連其他節點（`drain`，PLS-I8407）：中斷開始，但不算連線失敗（連續失敗次數不變）
+    pub fn drained(&mut self, retry_in: Duration) {
+        crate::metrics::global().connection_reset();
+        let now = Utc::now();
+        if self.outage_started.is_none() {
+            self.outage_started = Some((Instant::now(), now));
+        }
+        let since = self.outage_started.map(|(_, t)| t).unwrap_or(now);
+        let c = &mut self.file.connection;
+        c.state = "reconnecting".into();
+        c.tls_version = None;
+        c.since = Some(ts(since));
+        c.next_retry_at = chrono::Duration::from_std(retry_in)
+            .ok()
+            .map(|r| ts(now + r));
+        c.last_error_code = Some(codes::I_DRAIN.to_string());
+        c.last_error = Some("Kairos 節點正在排空，改連其他節點".to_string());
+        c.candidate_errors.clear();
+        self.connected_durable = None;
+        self.retry = None;
+        self.changed = true;
     }
 
     /// 中斷已達 `after` 且這次中斷還沒有記錄過時回傳 `true`（每次中斷只回傳一次）
@@ -985,6 +1042,7 @@ mod tests {
                 attention: false,
                 consecutive_failures: 3,
                 retry_in: Duration::from_secs(52),
+                candidate_errors: Vec::new(),
             })
         });
         let f = t.snapshot();
@@ -1002,6 +1060,7 @@ mod tests {
                 attention: true,
                 consecutive_failures: 4,
                 retry_in: Duration::from_secs(2),
+                candidate_errors: Vec::new(),
             })
         });
         t.update(|s| {
@@ -1011,6 +1070,7 @@ mod tests {
                 attention: false,
                 consecutive_failures: 5,
                 retry_in: Duration::from_secs(2),
+                candidate_errors: Vec::new(),
             })
         });
         let f = t.snapshot();
@@ -1033,6 +1093,10 @@ mod tests {
                 features: vec!["metrics".into(), "durable".into()],
                 durable: true,
                 server_time: Some(Utc::now() - chrono::Duration::milliseconds(1500)),
+                server: String::new(),
+                server_node: None,
+                candidates: 1,
+                candidate_index: 0,
             })
         });
         assert_eq!(restored.unwrap().attempts, 5);
@@ -1059,6 +1123,7 @@ mod tests {
             attention: false,
             consecutive_failures: 1,
             retry_in: Duration::ZERO,
+            candidate_errors: Vec::new(),
         };
         t.update(|s| s.disconnected(lost()));
         assert!(t.update(|s| s.outage_reached(Duration::ZERO)));
@@ -1071,6 +1136,10 @@ mod tests {
                 features: vec![],
                 durable: false,
                 server_time: None,
+                server: String::new(),
+                server_node: None,
+                candidates: 1,
+                candidate_index: 0,
             })
         });
         assert!(!t.update(|s| s.outage_reached(Duration::ZERO)), "已恢復");
@@ -1187,6 +1256,7 @@ mod tests {
                 attention: true,
                 consecutive_failures: 2,
                 retry_in: Duration::from_secs(30),
+                candidate_errors: Vec::new(),
             })
         });
         t.write().unwrap();

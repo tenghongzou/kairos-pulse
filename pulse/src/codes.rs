@@ -63,6 +63,11 @@ events! {
     CONN_RESTORED = "conn.restored", Some(2003);
     /// 中斷超過 30 分鐘
     CONN_OUTAGE = "conn.outage", Some(2004);
+    /// 候選位址無法連線，改試下一個（`PLS-W2301`，暫定；`kairos/HA.md` 第 8.3 節）。
+    /// Windows 事件識別碼待設計組分配
+    CONN_FAILOVER = "conn.failover", None;
+    /// Kairos 要求改連其他節點（`drain`，`PLS-I8407`，暫定）。Windows 事件識別碼待設計組分配
+    CONN_DRAIN = "conn.drain", None;
     /// 伺服器憑證驗證失敗（`PLS-E1401`～`PLS-E1405`）
     TLS_SERVER_CERT_REJECTED = "tls.server_cert_rejected", Some(2100);
     /// `PLS-E1101`
@@ -205,6 +210,12 @@ pub const W_SERVER_UNEXPECTED: &str = "PLS-W2107";
 /// 資產資訊被伺服器拒絕（設計包 `decisions/INTEGRATION.md` §30.3；METRICS.md 第 6.3 節）
 pub const W_INVENTORY_REJECTED: &str = "PLS-W2108";
 pub const E_PER_IP_LIMIT: &str = "PLS-E2201";
+/// 目前的伺服器位址無法連線，已改試下一個候選位址（暫定，`kairos/HA.md` 第 19 節）
+pub const W_CANDIDATE_FAILED: &str = "PLS-W2301";
+/// 所有候選位址都無法連線，依退避重試（暫定，`kairos/HA.md` 第 19 節）
+pub const E_ALL_CANDIDATES_FAILED: &str = "PLS-E2302";
+/// Kairos 節點排空，依指定的延遲改連其他節點（暫定，鏡像 `KRS-I8407`；`kairos/HA.md` 第 18.2 節）
+pub const I_DRAIN: &str = "PLS-I8407";
 pub const W_REPORT_RATE: &str = "PLS-W2203";
 pub const W_SUPERSEDED: &str = "PLS-W3101";
 pub const E_AGENT_ID_CONFLICT: &str = "PLS-E3102";
@@ -311,6 +322,9 @@ const ALL_CODES: &[&str] = &[
     W_SERVER_UNEXPECTED,
     W_INVENTORY_REJECTED,
     E_PER_IP_LIMIT,
+    W_CANDIDATE_FAILED,
+    E_ALL_CANDIDATES_FAILED,
+    I_DRAIN,
     W_REPORT_RATE,
     W_SUPERSEDED,
     E_AGENT_ID_CONFLICT,
@@ -414,6 +428,9 @@ pub fn title(code: &str) -> Option<&'static str> {
         W_SERVER_UNEXPECTED => "Kairos 的回應無法解析或不合預期",
         W_INVENTORY_REJECTED => "資產資訊被伺服器拒絕",
         E_PER_IP_LIMIT => "無法連線：同一 IP 的連線數超過 Kairos 的上限",
+        W_CANDIDATE_FAILED => "伺服器位址無法連線，已改試下一個候選位址",
+        E_ALL_CANDIDATES_FAILED => "無法連線到 Kairos（所有候選位址都無法連線）",
+        I_DRAIN => "Kairos 節點正在排空，改連其他節點",
         W_REPORT_RATE => "回報速率超過 Kairos 的上限",
         W_SUPERSEDED => "連線被同一 agent_id 的新連線取代",
         E_AGENT_ID_CONFLICT => "agent_id 衝突：多台主機使用同一個 agent_id",

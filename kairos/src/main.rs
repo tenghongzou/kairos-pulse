@@ -1011,6 +1011,11 @@ async fn run(
         ));
     }
 
+    // feature cluster 的 hello_ack.server_node（PROTOCOL.md「叢集與排空」）
+    let node_id = config
+        .cluster
+        .effective_node_id(&kp_obs::logfmt::hostname());
+    debug!("節點名稱（hello_ack.server_node）：{node_id}");
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),
         reports,
@@ -1024,6 +1029,7 @@ async fn run(
         report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
         enroll: enroll_service.clone(),
         assets,
+        cluster: connection::ClusterContext::new(node_id),
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
@@ -1249,6 +1255,16 @@ async fn run(
         feed.send_replace(Some(Arc::new(registry.snapshot(chrono::Utc::now()))));
     }
     // 釋放最後一個 report sender，writer 取完佇列、寫入並逐筆回覆後結束
+    let drains = ctx
+        .cluster
+        .drains_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if drains > 0 {
+        info!(
+            "資訊 KRS-I8407（暫定）：已對 {drains} 條協商了 cluster 的連線送出 drain（排空），這些 agent 會在 {:.0} 秒內分散改連其他節點",
+            f64::from(ctx.cluster.drain_window(&registry)) / 1000.0
+        );
+    }
     let pending = ctx.reports.pending();
     drop(ctx);
     info!("寫入剩餘 {} 筆 report", pending);

@@ -58,6 +58,10 @@ pub enum OfflineReason {
     CertificateRejected,
     /// report 的寫入結果未知，Kairos 關閉了連線（設計包 §24 #2）
     WriteUnknown,
+    /// 服務這台主機的叢集節點失聯（`kairos/HA.md` 第 6.6 節、第 21 節 #11）。由叢集的 leader 標記，
+    /// 0.9.0 還沒有叢集模式，只先定義名稱（主機 API 的篩選、`/metrics` 與 Webhook 的固定代碼）
+    #[allow(dead_code)]
+    ServerLost,
 }
 
 impl OfflineReason {
@@ -70,6 +74,7 @@ impl OfflineReason {
             OfflineReason::ServerShutdown => "server_shutdown",
             OfflineReason::CertificateRejected => "certificate_rejected",
             OfflineReason::WriteUnknown => "write_unknown",
+            OfflineReason::ServerLost => "server_lost",
         }
     }
 }

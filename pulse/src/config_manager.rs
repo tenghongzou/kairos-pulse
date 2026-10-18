@@ -51,6 +51,10 @@ pub const PROCESS_COMMAND_MODES: [&str; 3] = ["none", "executable", "full"];
 pub struct ServerConfig {
     pub address: String,
     pub port: u16,
+    /// 主位址連不上時依序改試的其他位址（`主機` 或 `主機:埠`；`kairos/HA.md` 第 8 節）。
+    /// 環境變數以逗號分隔，見 [`crate::server_addr::de_address_list`]
+    #[serde(default, deserialize_with = "crate::server_addr::de_address_list")]
+    pub fallback_addresses: Vec<String>,
     /// TLS 用的主機名稱（SNI / 憑證驗證）
     pub domain: String,
     /// 是否略過 TLS 憑證驗證（僅供開發測試，正式環境應為 false）
@@ -68,6 +72,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// 候選位址：`address:port`，接著 `fallback_addresses`（重複的只留第一個；`kairos/HA.md` 第 8.2 節）
+    pub fn candidates(&self) -> Vec<crate::server_addr::Candidate> {
+        crate::server_addr::candidates(self.address.trim(), self.port, &self.fallback_addresses)
+    }
+
     /// 實際是否信任作業系統信任庫（S5）：
     ///
     /// - 明確設定 `use_system_roots` 時以設定為準；
@@ -433,6 +442,8 @@ impl AppConfig {
             ));
         }
         range("server.port", u64::from(self.server.port), 1, 65535)?;
+        crate::server_addr::validate_fallback(&self.server.fallback_addresses, self.server.port)
+            .map_err(ConfigError::Message)?;
         if self.server.domain.trim().is_empty() {
             return Err(ConfigError::Message(
                 "server.domain 不可為空字串（TLS 以此驗證伺服器憑證的名稱）".to_string(),
@@ -812,6 +823,87 @@ mod tests {
     fn invalid_values_rejected() {
         assert!(build_err(&[("PULSE__HEARTBEAT__INTERVAL", "0")]).contains("heartbeat.interval"));
         assert!(build_err(&[("PULSE__RETRY__MAX_DELAY", "1")]).contains("max_delay"));
+    }
+
+    #[test]
+    fn fallback_addresses_from_file_defaults_and_env() {
+        let cfg = AppConfig::build(None, Some(Map::new())).unwrap();
+        assert!(cfg.server.fallback_addresses.is_empty());
+        assert_eq!(cfg.server.candidates().len(), 1);
+        // 環境變數：逗號分隔，去除空白，空字串表示沒有
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[
+                ("PULSE__SERVER__PORT", "8443"),
+                (
+                    "PULSE__SERVER__FALLBACK_ADDRESSES",
+                    " kairos-b.example.com , 10.0.20.11:9443 ,",
+                ),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.fallback_addresses,
+            ["kairos-b.example.com", "10.0.20.11:9443"]
+        );
+        let shown: Vec<String> = cfg
+            .server
+            .candidates()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "127.0.0.1:8443",
+                "kairos-b.example.com:8443",
+                "10.0.20.11:9443"
+            ]
+        );
+        let cfg = AppConfig::build(
+            None,
+            Some(env(&[("PULSE__SERVER__FALLBACK_ADDRESSES", "")])),
+        )
+        .unwrap();
+        assert!(cfg.server.fallback_addresses.is_empty());
+        // 設定檔的陣列
+        let dir = std::env::temp_dir().join(format!("pulse-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pulse.toml");
+        std::fs::write(
+            &file,
+            "[server]
+fallback_addresses = [\"[2001:db8::10]\", \"kairos-c:9000\"]
+",
+        )
+        .unwrap();
+        let cfg = AppConfig::build(Some(&file), Some(Map::new())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            cfg.server.fallback_addresses,
+            ["[2001:db8::10]", "kairos-c:9000"]
+        );
+        assert_eq!(
+            cfg.server.candidates()[1].to_string(),
+            "[2001:db8::10]:8080"
+        );
+    }
+
+    #[test]
+    fn invalid_fallback_addresses_are_config_errors() {
+        // PLS-E0201：IPv6 沒有方括號、連接埠不合法、超過 16 個
+        for bad in [
+            "2001:db8::10",
+            "host:0",
+            "bad_host",
+            "a.example.com,b:70000",
+        ] {
+            let err = build_err(&[("PULSE__SERVER__FALLBACK_ADDRESSES", bad)]);
+            assert!(err.contains("server.fallback_addresses"), "{bad}: {err}");
+        }
+        let many: Vec<String> = (0..17).map(|i| format!("h{i}.example.com")).collect();
+        let err = build_err(&[("PULSE__SERVER__FALLBACK_ADDRESSES", many.join(",").as_str())]);
+        assert!(err.contains("最多 16 個"), "{err}");
     }
 
     #[test]

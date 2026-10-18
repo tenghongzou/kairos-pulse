@@ -169,6 +169,7 @@ impl Server {
             report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
             enroll: None,
             assets,
+            cluster: crate::connection::ClusterContext::new("kairos-test"),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -683,6 +684,66 @@ async fn shutdown_sends_close_notify_to_all_connections() {
     server.shutdown.trigger();
     registered.expect_clean_close().await;
     waiting.expect_clean_close().await;
+}
+
+#[tokio::test]
+async fn cluster_feature_is_listed_only_when_the_client_declares_it() {
+    // PROTOCOL.md「叢集與排空」：0.8 以前的 Pulse（不宣告 cluster）收到的 hello_ack 不變
+    let server = Server::start(Options::default()).await;
+    let mut old = Client::connect(server.addr).await;
+    old.send(&hello_v2(1, ID, &["metrics", "durable"]).to_string())
+        .await;
+    let ack = old.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    assert!(ack.get("server_node").is_none(), "{ack}");
+    assert!(ack.get("cluster_id").is_none(), "{ack}");
+
+    let mut new = Client::connect(server.addr).await;
+    new.send(&hello_v2(1, OTHER_ID, &["metrics", "durable", "cluster"]).to_string())
+        .await;
+    let ack = new.recv().await;
+    assert_eq!(
+        ack["features"],
+        json!(["metrics", "durable", "cluster"]),
+        "{ack}"
+    );
+    assert_eq!(ack["server_node"], "kairos-test", "{ack}");
+    // 單機的 Kairos 沒有 cluster_id
+    assert!(ack.get("cluster_id").is_none(), "{ack}");
+
+    // 協商為 v1 時不使用 features（宣告了也一樣）
+    let mut v1 = Client::connect(server.addr).await;
+    let mut h = hello_v2(1, "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee", &["cluster"]);
+    h["proto_max"] = json!(1);
+    v1.send(&h.to_string()).await;
+    let ack = v1.recv().await;
+    assert_eq!(
+        ack,
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+}
+
+#[tokio::test]
+async fn shutdown_drains_only_connections_that_negotiated_cluster() {
+    let server = Server::start(Options::default()).await;
+    let mut old = Client::connect(server.addr).await;
+    old.send(&hello_v2(1, ID, &["metrics", "durable"]).to_string())
+        .await;
+    assert_eq!(old.recv().await["type"], "hello_ack");
+    let mut new = Client::connect(server.addr).await;
+    new.send(&hello_v2(1, OTHER_ID, &["metrics", "durable", "cluster"]).to_string())
+        .await;
+    assert_eq!(new.recv().await["type"], "hello_ack");
+    server.shutdown.trigger();
+    // 協商了 cluster：先收到 drain（seq 為 null，分散時間至少 10 秒），再收到 close_notify
+    let drain = new.recv().await;
+    assert_eq!(
+        drain,
+        json!({"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":10000})
+    );
+    new.expect_clean_close().await;
+    // 沒有協商的連線與 0.8 相同：直接 close_notify
+    old.expect_clean_close().await;
 }
 
 #[tokio::test]
