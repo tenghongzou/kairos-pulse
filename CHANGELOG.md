@@ -28,6 +28,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 0.3.0 的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
 - 0.5.0 的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
 - 0.6.0 的協定與 8443 的 feature 都與 0.5.0 相同，0.5 與 0.6 的任何組合都能連線；Kairos 的資料庫升級到 schema v6（告警、使用者與稽核），Pulse 只新增可觀測性（日誌格式、syslog、本機指標、`diag`）。
+- 〔草稿〕0.9.0 的協定、8443 的 feature、8444 的 API 與 Kairos 的 schema（v8）都與 0.8.0 相同，0.8 與 0.9 的任何組合都能連線（各組合見 [0.9.0] 的「相容性」）。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
@@ -48,9 +49,29 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-下一版預定為 **Kairos 0.9.0**（Cargo 版本號尚未更改）。
+## [0.9.0] - 〔草稿：發佈日期待定〕
 
-### 新增：指標轉出（商業審計 F7；`kairos/EXPORT.md`）
+**Kairos 0.9.0、Pulse 0.9.0〔草稿〕**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），另有高可用（審計 A2，`kairos/HA.md`）與集中設定／遠端升級（F8，`crates/kairos-proto/REMOTE.md`）的規格。**協定版本不變（v1～v2），feature 與 8444 的 API 不變**，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫**仍為 schema v8**。
+
+0.9.0 的範圍（2026-10-19 使用者決定，HA.md 第 21 節、REMOTE.md 第 14 節全部採建議）另包含 **F8 MVP**（REMOTE.md D15）與 HA 的 **L1a 儲存抽象**、**L4 Pulse 多位址**，實作會在之後的分支加入（本草稿尚未包含）；PostgreSQL 後端與叢集協調延到 0.10.0。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **行程排行的命令列預設遮蔽秘密**（`privacy.process_command` 預設 `redact`，行為變更）：Pulse 開啟完整命令列（`processes.command = "full"`）的主機，命令列中的密碼、token、帶帳號密碼的網址在保存前遮蔽（與診斷包相同的規則，另加 `--password x`、`-pSECRET`；`-p` 開頭的單一破折號參數一律遮蔽）。主控台、API、匯出、指標轉出都只看到遮蔽後的值 | 在 Pulse 開啟完整命令列、需要原樣檢視命令列的部署（Pulse 預設只送執行檔，不受影響） | 需要原樣保存時在 `kairos.toml` 設定 `[privacy] process_command = "keep"` |
+| 2 | Pulse | **`pulse enroll` 在送出申請之前收到 429／503 時等候後重試**（依 `Retry-After`，合計不超過 `--wait`，沒有指定時 600 秒）：0.8 直接結束（結束代碼 6） | 依結束代碼 6 立即自行重試的部署腳本 | 腳本不需要自行重試；需要立即失敗時加 `--no-wait` 或較短的 `--wait <秒>` |
+
+**升級步驟**：資料庫 schema 不變（v8），不需要遷移；仍建議先 `kairos db backup <檔案> --include-keys --password-stdin < <密碼檔>`（0.9 起一併備份 `data/privacy.key`）→ 換上 Kairos 0.9.0（tar.gz 照 INSTALL 第 11 節換執行檔；deb／rpm 直接升級）→ 換上 Pulse 0.9.0。指標轉出與 `[privacy]` 的假名化、網段預設都不啟用；需要時依 EXPORT.md、PRIVACY.md 設定。
+
+### 相容性
+
+- 協定（v1～v2）、8443 的 feature、8444 的 API、schema（v8）都不變；0.8 與 0.9 的 Kairos／Pulse 任意組合都能連線。
+- 新權限 `export:write`、`hosts:purge`、`hosts:personal_data` 只給內建的管理員（`Permission::ALL` 為 38 個）；0.4／0.5 的舊範圍 token 不會取得（權限凍結）。維運者看不到 S21「整合」分頁（維持 D16）。
+- 預設值下的行為與 0.8 相同，唯一的差異是 `process_command = "redact"`（破壞性變更第 1 項）；Prometheus exporter 與 OTLP 推送預設停用。
+- 指標轉出的設定存在既有的 `settings` 表，不新增資料表；`[privacy]` 在資料進入時轉換，主控台、API、匯出與指標轉出都只看到轉換後的值。
+
+### Kairos：指標轉出（F7；`kairos/EXPORT.md`）
 
 - **Prometheus exporter**：`GET /api/v1/export/prometheus`（主控台的監聽，HTTPS）以 Prometheus text 0.0.4 或 OpenMetrics 1.0（依 `Accept`）輸出所有可見主機的最新指標。以 API token 驗證、權限 `hosts:read`（viewer 角色即可；群組範圍的使用者只看得到自己的群組，另可 `?group=` 分群抓取）。每個序列帶 `agent_id`、`hostname`、`host_group`；另有 `kairos_host_up`、`kairos_host_info`（顯示名稱、版本、作業系統、標籤）、`kairos_host_last_sample_timestamp_seconds`、`kairos_exporter_hosts`。離線或最後一筆超過 `stale_after_secs`（預設 300）的主機不輸出指標；行程排行預設不輸出（`include_processes`）。預設**停用**（`[export.prometheus] enabled`，未啟用時 `404 export_disabled`）。
 - **OTLP/HTTP 推送**：`[export.otlp]` 把每一筆保存成功的 report 以 protobuf 推送到 OpenTelemetry collector：批次（`max_batch_points`）、有上限的佇列與丟棄策略（`queue_max_points`、`drop_policy`）、重試（429／502／503／504 與連線失敗，指數退避、`Retry-After`）、TLS（作業系統的 CA＋`ca_file`、可帶用戶端憑證）、自訂標頭（`headers_file` 或主控台輸入，加密保存）、resource 屬性（`host.name`、`host.id`、`host.arch`、`os.type`、`kairos.host.*`、`resource_attributes`）。名稱預設對應 OpenTelemetry semantic conventions（`naming = "semconv"`：`system.cpu.utilization`、`system.memory.usage{system.memory.state}`、`system.network.io{network.io.direction}`…），可改回 Kairos 的名稱。不支援 gRPC 與 gzip。預設停用。
@@ -58,47 +79,58 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **主控台**：S21「系統設定 → 整合」新增「指標轉出」卡片：Prometheus 的最近一次抓取、OTLP 的佇列／送出／丟棄／最近一次成功與錯誤；管理員可修改啟用、過期門檻、行程排行、OTLP 的啟用／端點／間隔／名稱／標頭（值只能更換不能檢視）與測試連線。設定存在資料庫 `settings` 表、優先於 `kairos.toml`，環境變數鎖定（`409 locked_by_environment`），寫入稽核（`export.change`、`export.otlp_test`）。
 - **API**：`GET`／`PUT /api/v1/export/settings`、`POST /api/v1/export/otlp/test`（API.md 第 16 節）；新權限 **`export:write`**（只有管理員；0.4／0.5 的舊範圍 token 沒有）。
 - **`/metrics`**：`kairos_export_prometheus_enabled`、`kairos_export_prometheus_scrapes_total`、`kairos_export_otlp_enabled`、`kairos_export_otlp_queue_points`、`kairos_export_otlp_sent_points_total`、`kairos_export_otlp_requests_total{result}`、`kairos_export_otlp_dropped_points_total{reason}`、`kairos_export_otlp_last_success_timestamp_seconds`。
-- **錯誤代碼（暫定，待設計包分配）**：`KRS-E4311` OTLP 推送失敗、`KRS-E4312` collector 拒絕資料、`KRS-W4313` OTLP 佇列已滿而丟棄、`KRS-E4314` 指標轉出的設定無效、`KRS-E4315` Prometheus exporter 未啟用。
 - **依賴**：沒有新增 crate（OTLP 的 protobuf 為手寫編碼，HTTP 用戶端沿用 hyper 與 tokio-rustls）；資料庫 schema 不變（v8）。
 - **量測**（`export_bench`，10,000 台、每台 43 個指標）：Prometheus 輸出 359 ms、56.9 MB；保存最新值約 7 KB／台；OTLP 編碼約 83 萬點／秒（EXPORT.md 第 5 節）。
-**Kairos 0.9.0〔草稿〕、Pulse 0.9.0〔草稿〕**（衝刺 8 的個資保護線；Cargo 的版本號尚未改）：個資保護（商業審計 S6，規格 `kairos/PRIVACY.md`）——保存方式的設定 `[privacy]`、刪除一台主機的所有資料、資料主體存取請求（個資匯出）與 DPA 範本骨架；衝刺 4 延後的小項——手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試。**協定版本與 schema 都不變**（v1～v2、schema v8）。
 
-### 新功能
+### Kairos：個資保護（S6；`kairos/PRIVACY.md`）
 
 - **`[privacy]`**（Kairos）：`store_peer_ip`（`full`／`truncate`：IPv4 /24、IPv6 /48／`none`）、`hostname`（`keep`／`pseudonymize`：以 `data/privacy.key` 的 HMAC 換成 `host-xxxxxxxxxxxx`，顯示名稱 `name-…`；不可逆）、`process_command`（`keep`／`redact`／`drop`）、`process_user`（`keep`／`pseudonymize`／`drop`）、`inventory_network`（`keep`／`truncate`：位址 /24、/48、MAC 只留廠商碼／`drop`）。在 8443 的連線與 8444 的註冊申請進入時一次轉換，狀態表、`agents.json`、清冊、report、資產、告警、JSONL 鏡像、主控台與匯出都只看到轉換後的值；日誌、稽核日誌與註冊申請的來源 IP 不受影響（PRIVACY.md 第 2.3 節）。要求假名化而金鑰無法建立或讀取時 Kairos 不啟動。
 - **刪除主機資料**：主控台「主機詳情 › 更多 › 刪除主機資料」（只有管理員，新權限 `hosts:purge`；主機須離線；影響預覽＋L2 輸入主機名稱）、`GET/POST /api/v1/hosts/{agent_id}/purge`（`impact_token`）、`kairos hosts purge <agent_id> [--dry-run]`（實際刪除需停止 Kairos，執行中以 `KRS-E4304` 拒絕）。刪除 report、行程快照、彙總、資產與變更歷史、告警事件（含處理與發送紀錄）、註冊申請、憑證紀錄與清冊；先以 `cessationOfOperation` 撤銷這台主機的有效憑證，已撤銷未過期的憑證紀錄保留到過期後 1 天（CRL 需要）；**稽核日誌不刪除**（雜湊鏈），另記一筆 `host.purge`。執行中由 report 的 writer 逐步刪除（每一步 5,000 列，與 report 交錯），刪除後 10 分鐘內拒絕該主機的寫入，避免被建立回來。
 - **個資匯出**（資料主體存取請求）：`GET /api/v1/hosts/{agent_id}/personal-data`（新權限 `hosts:personal_data`，只有管理員）、`kairos hosts export <agent_id> [--out]`、主控台「更多 › 匯出個資（JSON）」，`kairos.host.personal-data/v1`：清冊、資產、行程快照摘要、report 的筆數與範圍、告警事件、註冊申請、憑證紀錄、相關的稽核紀錄；每次記稽核。
 - **`kairos hosts pseudonym <名稱>…`**：以金鑰算出假名（「`ann-laptop` 在 Kairos 中叫什麼」）。
+- **與指標轉出的串接**：刪除主機資料時一併丟棄 Prometheus exporter 在記憶體中的最新值與 OTLP 佇列中這台主機尚未送出的資料（之後的抓取不再輸出）；轉出的主機名稱、顯示名稱與行程排行都是 `[privacy]` 轉換後的值（EXPORT.md 第 2.7 節、PRIVACY.md 第 1 節 #16）。已被 Prometheus 抓取或已推送到 collector 的資料需在該系統處理。
+
+### Kairos：註冊與憑證（衝刺 4 延後的小項）
+
 - **手動簽發憑證的匯入**（PKI.md 第 16 節）：`kairos pki certificates import <檔案或目錄>… [--agent-id]`、`POST /api/v1/pki/certificates/import`（`pki.queue:manage`）、主控台「憑證 › 匯入憑證」。外部 CA（含既有的 RSA 根 CA）或 Kairos 簽發 CA 直接簽發的既有用戶端憑證加入簽發紀錄，檢查不通過以 `KRS-E1305` 列出原因；清冊沒有的主機新增最小的一列。外部 CA 簽發的憑證在 Kairos 撤銷後，8443 在 hello 時拒絕（`KRS-W1105`）。
 - **8444 的下載端點** `/agent/<檔名>`（PKI.md 第 17 節）：`enroll.download_dir` 提供 Pulse 的發佈檔案（只有一般檔案、檔名白名單、不跟隨符號連結；內容類型、`nosniff`、`Content-Disposition`；`SHA256SUMS*` 與 `pulse-install.sh` 為 `no-cache`，其他 1 小時；`ETag`／304；串流）。L11 同時下載數（429，`Retry-After: 15`）。主控台的 `downloads` 回報實際狀態，「建立 token」在可用時顯示一行安裝指令。
-- **`pulse-install.sh --ca-file <根 CA>`**：以 Kairos 的根 CA 驗證下載端點的 HTTPS（完整性仍以發佈公鑰驗證）。
+
+### Pulse
+
 - **`pulse enroll`**：送出申請之前（`server-info`、`token-check`）收到 429／503 時依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 等候後重試（合計不超過 `--wait`，沒有指定時 600 秒；互動時顯示倒數，Ctrl+C 取消）。0.8 直接結束（結束代碼 6）。
+- **`pulse-install.sh --ca-file <根 CA>`**：以 Kairos 的根 CA 驗證下載端點的 HTTPS（完整性仍以發佈公鑰驗證）。
 
-### 變更
+### 其他變更
 
-- `privacy.process_command` 預設 `redact`：Pulse 開啟完整命令列（`processes.command = "full"`）的主機，命令列中的密碼、token、帶帳號密碼的網址在保存前遮蔽（與診斷包相同的規則，另加 `--password x`、`-pSECRET`）。需要原樣保存時設為 `keep`。
 - `kairos db backup --include-keys` 一併加密備份 `data/privacy.key`。
 - 主控台 API 的 `downloads` 另有 `base_url`、`install_script`、`files`、`product_code`；模式的 `stats` 另有 `downloads_in_progress`。
 - 註冊服務每小時另外刪除「清冊中已沒有的主機」過期超過 1 天的憑證紀錄。
 - 測試掛鉤 `KAIROS_TEST_GRACE_SECS`（debug 建置）：過期寬限期以秒計。
 
-### 相容性
+### 規格（尚未實作）
 
-- 協定、8444 的 API、schema（v8）都不變；0.8 與 0.9 的 Kairos／Pulse 任意組合都能連線。與 `sprint8/export` 線整合時若該線升 schema v9，這條線不需要配合（沒有 schema 變更）。
-- 新權限 `hosts:purge`、`hosts:personal_data` 只給內建的管理員；0.4／0.5 的舊範圍 token 不會取得（權限凍結）。
-- 預設值下的行為與 0.8 相同，唯一的差異是 `process_command = "redact"`（見「變更」）。
+- **`kairos/HA.md`**（審計 A2，高可用）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址等分層設計與量測計畫；第 21 節的 20 項待決已決定（2026-10-19，採建議）。0.9.0 實作 L1a 儲存抽象與 L4 Pulse 多位址，PostgreSQL 後端與叢集協調在 0.10.0。STORAGE.md 的「限制與後續」連到 HA.md。
+- **`crates/kairos-proto/REMOTE.md`**（F8，集中設定與 agent 遠端升級）：第 14 節 D1～D18 已決定（2026-10-19，採建議）；0.9.0 實作 MVP（D15）。PROTOCOL.md 的 features 表加入 `config`、`upgrade` 兩列（草稿，指向 REMOTE.md）。
 
-### 〔暫定〕產品代碼（待設計包分配）
+### 〔暫定〕產品代碼（待設計包 `decisions/INTEGRATION.md` §31 分配）
 
 | 代碼 | 何時 |
 |---|---|
+| `KRS-E4311` | OTLP 推送失敗（連線、逾時、重試用完） |
+| `KRS-E4312` | OTLP collector 拒絕資料 |
+| `KRS-W4313` | OTLP 佇列已滿而丟棄資料點（`drop_policy`） |
+| `KRS-E4314` | 指標轉出的設定無效（`400 invalid_parameter`） |
+| `KRS-E4315` | Prometheus exporter 未啟用（`404 export_disabled`） |
 | `KRS-I4204` | 已刪除主機資料（日誌、稽核 `host.purge`） |
 | `KRS-E4205` | 無法刪除主機資料：仍連線中（409 `host_online`）、刪除沒有完成、找不到資料 |
 | `KRS-E4005` | 要求假名化但 `data/privacy.key` 無法使用，Kairos 不啟動 |
 | `KRS-W2012` | `enroll.download_dir` 不完整（缺 `pulse-install.sh`、`SHA256SUMS` 或 `SHA256SUMS.sig`） |
 
+HA.md 與 REMOTE.md 的暫定代碼都用了子類別 84，§31 會重新分配。
+
 ### 已知限制
 
+- OTLP 只支援 HTTP＋protobuf（不做 gRPC、不壓縮）；主機指標名稱沿用 OpenTelemetry 的名稱，不加 `kairos_` 前綴（只有 `kairos_host_*`、`kairos_exporter_*` 與行程排行帶前綴）。
 - 假名化不可逆（沒有「顯示原名」）；改變 `[privacy]` 只影響之後收到的資料（PRIVACY.md 第 2.2 節）。
 - 刪除主機資料不涵蓋日誌、JSONL 鏡像、備份與已送出的通知；`kairos hosts purge` 需要停止 Kairos。
 - 外部 CA 簽發、匯入的憑證撤銷後，已連線中的主機在下一次重新連線時才被拒。
@@ -106,10 +138,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 測試
 
+- 指標轉出：`export::tests`（假的 collector：semconv 名稱與 resource、標頭、重試與 `Retry-After`、TLS 驗證、佇列上限與丟棄策略、回填不覆蓋最新值、刪除主機時丟棄、主控台端點與權限）、`export::prom::tests`（OTel → Prometheus 名稱、text 0.0.4 與 OpenMetrics 以 `kp_obs::prom::parse` 嚴格解析）、`export::settings::tests`（環境變數 ＞ 主控台 ＞ 設定檔 ＞ 預設、標頭加密）、`config::export::tests`；端對端 `tests/e2e/tests/export.rs`（實際的 Kairos 與 Pulse、Prometheus 抓取、OTLP 推送到假 collector、Pulse 結束後 `kairos_host_up` 為 0）；主控台 `e2e-export.mjs`。
 - 單元：`privacy::tests`（位址截斷、假名、命令列遮蔽、行程與資產的轉換、金鑰檔）、`store::purge::tests`、`privacy_cli::tests`、`pki::queue::import_tests`、`enroll::downloads::tests`、Pulse 的 `rate_limits_before_the_request_are_waited_out`。
 - 整合：`integration_tests::privacy_policy_is_applied_before_anything_is_stored`、`api::privacy_tests::purge_and_personal_data_over_https`。
 - 端對端（`tests/e2e`）：`privacy.rs`（假名與網段、主控台與 CLI 的刪除、個資匯出）、`enroll.rs` 的 `grace_period_is_enforced_and_an_override_extends_it`（ENROLL.md 第 19.3 節 #14）、`manually_issued_certificate_is_imported_and_revocation_takes_effect`、`download_endpoint_serves_the_release_files`。
 - 主控台（Playwright＋axe）：`e2e-privacy.mjs`（S05 的權限、仍連線中、匯出、L2 刪除；S12 一行指令；S14 匯入），`e2e-rbac.mjs` 加入新按鈕與端點。
+- 個資保護 × 指標轉出（整合）：`integration_tests::exported_metrics_only_carry_privacy_transformed_values`（假名化、網段、命令列遮蔽下的 Prometheus 輸出與 OTLP payload 不含原始主機名稱、顯示名稱、完整來源位址、執行身分與密碼）、`api::privacy_tests::purge_and_personal_data_over_https`（刪除後 hub 的最新值與 OTLP 佇列清空）、`e2e-rbac.mjs` 的指標轉出寫入端點 403。
 
 ## [0.8.0] - 2026-10-16
 

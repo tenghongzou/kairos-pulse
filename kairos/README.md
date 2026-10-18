@@ -1028,6 +1028,7 @@ kairos/
 ├── API.md                 主控台 API：端點、驗證、SSE、量測
 ├── EXPORT.md              指標轉出：Prometheus exporter、OTLP、Grafana
 ├── PRIVACY.md             個資保護：個資清單、[privacy]、刪除主機資料、個資匯出、DPA 範本骨架（0.9.0）
+├── HA.md                  高可用規格（審計 A2）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址（0.9.0 起分階段實作）
 ├── build.rs               建置時決定 --version 顯示的 commit（BUILD_COMMIT 或 git）
 ├── packaging/             發佈包：build-release.sh（打包腳本）、kairos.service（systemd unit）、kairos-crl.service／kairos-crl.timer（CRL 定期更新範例）、INSTALL.md（安裝指南）、Prometheus 範例與 Grafana 儀表板（grafana-kairos-hosts.json）
 ├── testdata/              單元測試用的憑證樣本；pki/ 為測試用 CA、代理憑證與 CRL（見其中的 README）；含測試用私鑰，不可部署

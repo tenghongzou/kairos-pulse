@@ -9,11 +9,11 @@
 - Pulse 的多伺服器位址與 DNS SRV
 - 主控台、PKI、機密與稽核雜湊鏈在多節點下的處理
 - 升級路徑與故障情境
-- 暫定錯誤代碼、實作分工與待決事項
+- 暫定錯誤代碼、實作分工與已決定事項（第 21 節）
 
 協定的線上格式仍以 [`crates/kairos-proto/PROTOCOL.md`](../crates/kairos-proto/PROTOCOL.md) 為準；本文件第 18 節的協定增補是草稿，實作時再併入 PROTOCOL.md。儲存的現況見 [`STORAGE.md`](STORAGE.md)，PKI 見 [`PKI.md`](PKI.md)，主控台 API 見 [`API.md`](API.md)，告警見 [`ALERTS.md`](ALERTS.md)。
 
-- 狀態：**衝刺 8 規格草稿（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出）**。只有文件，沒有程式碼變更。第 21 節的項目尚待使用者決定；本文件其餘的規則先依各項的「建議」撰寫，決定不同時再修改。
+- 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
 - 商業審計 A2 的原文：「沒有 HA：Kairos 是單一行程，狀態放在記憶體，資料目錄假設只有一個寫入者。Pulse 只能設定一個伺服器位址。修正方向：讓 Kairos 只負責連線（無狀態），狀態與資料移到外部資料庫，前面放 L4 LB；Pulse 支援多個位址或 DNS SRV。6～10 人週。」
 - 設計依據（設計包，唯讀）：`decisions/INTEGRATION.md` §26～§30 的代碼分配慣例、`design-system/copywriting.md` §3（代碼格式與號段）、`kairos/screens.md` S20（系統健康）。設計包需要配合的事項列在第 22 節，**本線沒有修改 `design/`**。
 - 埠號寫法：本文件沿用文件慣例，以 8443 表示 agent 連線埠（`server.listen`）、8444 表示註冊通道（`enroll.listen`）、9443 表示主控台（`console.listen`）。注意 Kairos 程式內 `server.listen` 的預設值是 `127.0.0.1:8080`（`config.rs`），Pulse `server.port` 的預設值也是 8080。
@@ -48,7 +48,7 @@
 - **時序資料庫**（TimescaleDB、ClickHouse 等）：PostgreSQL 後端先以一般資料表實作；分區與時序擴充是之後的效能工作（第 7.6 節）。
 - **JSONL 後端的叢集**：`storage.backend = "jsonl"` 只支援單機。
 - **把 SQLite 檔放在共用儲存上讓多個節點同時使用**：WAL 需要共享記憶體與 POSIX 鎖，Kairos 已拒絕在網路磁碟上啟動（STORAGE.md 第 2 節），本規格不改變。
-- **授權（license）閘**：HA 是商業功能，但授權機制尚未實作（審計 B 系列），本規格不設計授權檢查，只在第 21 節列為待決。
+- **授權（license）閘**：HA 是商業功能，但授權機制尚未實作（審計 B 系列），本規格不設計授權檢查，只在第 21 節列出（#14，已決定：等授權機制完成後再加）。
 - **Kairos 完全無狀態**：審計的修正方向是「讓 Kairos 只負責連線（無狀態）」。本規格把**持久狀態**全部移到資料庫，但每條 agent 連線的工作階段（協商結果、在途的 report、速率限制的桶）仍在服務它的節點的記憶體中；節點失效時這些狀態由 Pulse 重連與補送重建，不需要跨節點複製。
 
 ## 2. 現況盤點：單機假設
@@ -230,7 +230,7 @@ PROXY protocol 的規則（實作線 L2）：
 
 - **叢集只支援 PostgreSQL**；**單機的預設仍是 SQLite**。兩種後端共用同一套 schema 版本號（v9 起）與同一套功能，以 `storage.backend = "postgres"` 選擇。
 - 最低版本 **PostgreSQL 14**（RHEL 9、Ubuntu 22.04 的系統套件即為 13～14 以上；14 起 `pg_stat_*` 與 `idle_session_timeout` 等維運功能較完整）。只用社群版的功能：`ON CONFLICT`、`RETURNING`、`FOR UPDATE`、`LISTEN/NOTIFY`、部分索引、`jsonb`。**不依賴任何擴充**（TimescaleDB、pg_partman 等）。
-- **驅動**：`postgres`（同步 API，內部是 `tokio-postgres`）加 `tokio-postgres-rustls`（rustls＋ring，與既有的加密後端相同），授權都是 MIT 或 Apache-2.0，`deny.toml` 的允許清單不需變更。選同步 API 的原因：現有的 store 層全部是在 blocking 執行緒上呼叫的同步函式（`ReportStore` 等），改用同步驅動可以保留這個結構。不選 `sqlx`：依賴多、巨集需要編譯期資料庫或離線快取，而且一樣要逐一處理並行控制。連線池以自行實作的小型池（每節點預設 16 條，`storage.postgres.pool_size`）取代 r2d2 等新依賴（待決，第 21 節 #4）。
+- **驅動**：`postgres`（同步 API，內部是 `tokio-postgres`）加 `tokio-postgres-rustls`（rustls＋ring，與既有的加密後端相同），授權都是 MIT 或 Apache-2.0，`deny.toml` 的允許清單不需變更。選同步 API 的原因：現有的 store 層全部是在 blocking 執行緒上呼叫的同步函式（`ReportStore` 等），改用同步驅動可以保留這個結構。不選 `sqlx`：依賴多、巨集需要編譯期資料庫或離線快取，而且一樣要逐一處理並行控制。連線池以自行實作的小型池（每節點預設 16 條，`storage.postgres.pool_size`）取代 r2d2 等新依賴（第 21 節 #4，已決定採 (a)）。
 
 ### 4.3 Kairos 對 PostgreSQL 的要求
 
@@ -1309,30 +1309,32 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 3. **單一寫入者的工作**遍布告警、註冊、PKI、稽核與儲存五個子系統；
 4. 審計估算時（0.1）還沒有告警、PKI、使用者與稽核鏈。
 
-## 21. 待使用者決定
+## 21. 已決定（2026-10-19，採建議）
 
-| # | 項目 | 選項 | 建議 |
-|---|---|---|---|
-| 1 | 叢集使用的資料庫 | (a) PostgreSQL；(b) 只提供 SQLite＋作業層冷備援（階段 0），不做產品內的 HA；(c) SQLite＋LiteFS | **(a)**。(b) 無法達成「已 `ack` 不遺失＋自動切換」，(c) 依賴 Consul 與維護活躍度下降的專案 |
-| 2 | 階段 A 的備援節點是否監聽 | (a) 不監聽，`/readyz` 503；(b) 監聽但拒絕連線；(c) 唯讀主控台 | **(a)**。最簡單，不會有兩個節點同時接受 agent 連線 |
-| 3 | PostgreSQL 的最低版本 | 13／14／15 | **14**（目前主流 LTS 發行版都能取得；13 已於 2025-11 結束社群支援） |
-| 4 | PostgreSQL 驅動與連線池 | (a) `postgres`＋`tokio-postgres-rustls`＋自行實作的小型池；(b) 同 (a)＋`r2d2-postgres`；(c) `sqlx` | **(a)**，依賴最少，保留同步的 store 結構 |
-| 5 | 已 `ack` 的資料的 RPO | (a) 沒有同步複寫時只警告（`KRS-W4403`）；(b) 拒絕啟動（可以設定略過） | **(a)**。與 SQLite `synchronous = normal` 的取捨一致，由客戶決定 |
-| 6 | 簽發 CA 私鑰的分發 | (a) 每個節點放同一組；(b) 只有 leader 持有，其他節點轉送簽發；(c) 以 KEK 加密存在資料庫 | **(a)**，(c) 列為之後的強化 |
-| 7 | 對稱金鑰的分發 | (a) `kairos cluster keys export/import`（加密檔）；(b) 存在資料庫、以外部 KEK 加密 | **(a)**，沿用 0.7 的加密備份格式 |
-| 8 | Pulse 多位址的設定形式 | (a) 新鍵 `server.fallback_addresses`；(b) `server.address` 接受陣列 | **(a)**：降版安全，`pulse enroll` 的改寫工具不需要支援陣列 |
-| 9 | DNS SRV | (a) 第一版就做；(b) 先做 `fallback_addresses`，SRV 列為階段 B 的選用；(c) 不做 | **(b)**：SRV 需要新的 DNS 依賴，地端客戶多半沒有可自行管理 SRV 的 DNS |
-| 10 | 安裝字串是否支援多位址 | (a) 不改（`pulse-enroll:v1:`，用服務名稱）；(b) 新增 `pulse-enroll:v2:` 帶多個 `s` | **(a)** |
-| 11 | 節點失聯時主機的離線原因 | (a) 新增 `server_lost`；(b) 沿用 `idle_timeout` | **(a)**。主控台、Webhook、`/metrics` 的 `offline_reason` 多一個值，接收端應忽略不認得的值（設計包待辦） |
-| 12 | SSE 在階段 A 換手後 | (a) `resync`，原因新增 `failover`；(b) 沿用 `restarted` | **(a)**，主控台的處理相同，只是文案不同 |
-| 13 | 階段 B 的主控台與 8444 | (a) B1：只由 leader 服務；(b) 直接做 B2（多主動） | **(a)**，B2 視實際需求再做 |
-| 14 | HA 是否需要授權閘 | (a) 等授權機制完成後再加；(b) 現在就以設定旗標隱藏 | **(a)**（商業審計：HA 是收費功能，但授權尚未實作） |
-| 15 | PostgreSQL 後端的彙總 | (a) leader 從原始資料產生；(b) 各節點的記憶體桶加上可交換的合併 | **(a)**。(b) 在節點當掉時無法判斷哪些值已計入 |
-| 16 | `storage.max_total_bytes` 在 PostgreSQL 上 | (a) 以 Kairos 資料表的大小計算，行為與 SQLite 相同；(b) 停用，交給 DBA | **(a)**，預設值不變 |
-| 17 | 叢集是否支援 JSONL 後端與鏡像 | 支援／不支援 | **不支援** |
-| 18 | schema 改變時的升級 | (a) 全部停止後升級（停機約數分鐘）；(b) 之後設計 expand／contract 的線上遷移 | **(a)**，(b) 另立規格 |
-| 19 | 失去租約的節點 | (a) 結束行程，由 systemd 重新啟動（階段 A）；(b) 留在行程內降級 | 階段 A **(a)**；階段 B 降為 member（連線不受影響） |
-| 20 | 版本號 | (a) 階段 A 以 0.9.0 發佈（標示 HA 預覽）；(b) 等階段 B 完成後以 1.0 發佈 | **(a)**，讓單機客戶先取得 schema v9 與 PostgreSQL 後端 |
+使用者於 2026-10-19 決定全部採用「建議」欄的選項（各項結論見最右欄）。規格內容沒有因此修改。
+
+| # | 項目 | 選項 | 建議 | 結論（2026-10-19） |
+|---|---|---|---|---|
+| 1 | 叢集使用的資料庫 | (a) PostgreSQL；(b) 只提供 SQLite＋作業層冷備援（階段 0），不做產品內的 HA；(c) SQLite＋LiteFS | **(a)**。(b) 無法達成「已 `ack` 不遺失＋自動切換」，(c) 依賴 Consul 與維護活躍度下降的專案 | 採建議：(a) |
+| 2 | 階段 A 的備援節點是否監聽 | (a) 不監聽，`/readyz` 503；(b) 監聽但拒絕連線；(c) 唯讀主控台 | **(a)**。最簡單，不會有兩個節點同時接受 agent 連線 | 採建議：(a) |
+| 3 | PostgreSQL 的最低版本 | 13／14／15 | **14**（目前主流 LTS 發行版都能取得；13 已於 2025-11 結束社群支援） | 採建議：14 |
+| 4 | PostgreSQL 驅動與連線池 | (a) `postgres`＋`tokio-postgres-rustls`＋自行實作的小型池；(b) 同 (a)＋`r2d2-postgres`；(c) `sqlx` | **(a)**，依賴最少，保留同步的 store 結構 | 採建議：(a) |
+| 5 | 已 `ack` 的資料的 RPO | (a) 沒有同步複寫時只警告（`KRS-W4403`）；(b) 拒絕啟動（可以設定略過） | **(a)**。與 SQLite `synchronous = normal` 的取捨一致，由客戶決定 | 採建議：(a) |
+| 6 | 簽發 CA 私鑰的分發 | (a) 每個節點放同一組；(b) 只有 leader 持有，其他節點轉送簽發；(c) 以 KEK 加密存在資料庫 | **(a)**，(c) 列為之後的強化 | 採建議：(a) |
+| 7 | 對稱金鑰的分發 | (a) `kairos cluster keys export/import`（加密檔）；(b) 存在資料庫、以外部 KEK 加密 | **(a)**，沿用 0.7 的加密備份格式 | 採建議：(a) |
+| 8 | Pulse 多位址的設定形式 | (a) 新鍵 `server.fallback_addresses`；(b) `server.address` 接受陣列 | **(a)**：降版安全，`pulse enroll` 的改寫工具不需要支援陣列 | 採建議：(a) |
+| 9 | DNS SRV | (a) 第一版就做；(b) 先做 `fallback_addresses`，SRV 列為階段 B 的選用；(c) 不做 | **(b)**：SRV 需要新的 DNS 依賴，地端客戶多半沒有可自行管理 SRV 的 DNS | 採建議：(b) |
+| 10 | 安裝字串是否支援多位址 | (a) 不改（`pulse-enroll:v1:`，用服務名稱）；(b) 新增 `pulse-enroll:v2:` 帶多個 `s` | **(a)** | 採建議：(a) |
+| 11 | 節點失聯時主機的離線原因 | (a) 新增 `server_lost`；(b) 沿用 `idle_timeout` | **(a)**。主控台、Webhook、`/metrics` 的 `offline_reason` 多一個值，接收端應忽略不認得的值（設計包待辦） | 採建議：(a) |
+| 12 | SSE 在階段 A 換手後 | (a) `resync`，原因新增 `failover`；(b) 沿用 `restarted` | **(a)**，主控台的處理相同，只是文案不同 | 採建議：(a) |
+| 13 | 階段 B 的主控台與 8444 | (a) B1：只由 leader 服務；(b) 直接做 B2（多主動） | **(a)**，B2 視實際需求再做 | 採建議：(a) |
+| 14 | HA 是否需要授權閘 | (a) 等授權機制完成後再加；(b) 現在就以設定旗標隱藏 | **(a)**（商業審計：HA 是收費功能，但授權尚未實作） | 採建議：(a) |
+| 15 | PostgreSQL 後端的彙總 | (a) leader 從原始資料產生；(b) 各節點的記憶體桶加上可交換的合併 | **(a)**。(b) 在節點當掉時無法判斷哪些值已計入 | 採建議：(a) |
+| 16 | `storage.max_total_bytes` 在 PostgreSQL 上 | (a) 以 Kairos 資料表的大小計算，行為與 SQLite 相同；(b) 停用，交給 DBA | **(a)**，預設值不變 | 採建議：(a) |
+| 17 | 叢集是否支援 JSONL 後端與鏡像 | 支援／不支援 | **不支援** | 採建議：**不支援** |
+| 18 | schema 改變時的升級 | (a) 全部停止後升級（停機約數分鐘）；(b) 之後設計 expand／contract 的線上遷移 | **(a)**，(b) 另立規格 | 採建議：(a) |
+| 19 | 失去租約的節點 | (a) 結束行程，由 systemd 重新啟動（階段 A）；(b) 留在行程內降級 | 階段 A **(a)**；階段 B 降為 member（連線不受影響） | 採建議：階段 A **(a)**；階段 B 降為 member |
+| 20 | 版本號 | (a) 階段 A 以 0.9.0 發佈（標示 HA 預覽）；(b) 等階段 B 完成後以 1.0 發佈 | **(a)**，讓單機客戶先取得 schema v9 與 PostgreSQL 後端 | 採建議 **(a)** 的方向（以 0.9.x 線逐步發佈、不等 1.0）；依同日的範圍決定，0.9.0 只含 L1a 與 L4，PostgreSQL 後端（schema v9）與叢集協調（階段 A，標示 HA 預覽）在 **0.10.0** |
 
 ## 22. 設計包待辦（本線沒有修改 `design/`）
 
