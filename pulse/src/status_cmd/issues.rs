@@ -433,6 +433,10 @@ pub fn connection(ctx: &Ctx, c: &Connection, error: bool, outage: Duration) -> O
             .detail("outage_ms", json!(outage.as_millis() as u64))
     };
     let code = code?;
+    if code == codes::I_DRAIN {
+        // 排空不是問題：服務已依 Kairos 的要求改連其他節點
+        return None;
+    }
     let base = Issue::new(&code, severity);
     Some(match code.as_str() {
         codes::E_CONN_REFUSED => network(
@@ -467,6 +471,32 @@ pub fn connection(ctx: &Ctx, c: &Connection, error: bool, outage: Duration) -> O
             .step(step_cmd("確認名稱解析：", cmd))
             .detail("address", json!(ctx.server))
             .detail("outage_ms", json!(outage.as_millis() as u64))
+        }
+        codes::E_ALL_CANDIDATES_FAILED => {
+            let mut issue = base.cause(format!(
+                "{} 個候選位址（server.address 與 server.fallback_addresses）都無法連線，已持續 {dur}。",
+                c.candidate_errors.len().max(2)
+            ));
+            for e in &c.candidate_errors {
+                issue = issue.cause(format!(
+                    "{}：{}{}",
+                    e.server,
+                    e.message.trim_end_matches('。'),
+                    e.code
+                        .as_deref()
+                        .map(|c| format!("（{c}）"))
+                        .unwrap_or_default()
+                ));
+            }
+            network(issue).detail(
+                "candidates",
+                json!(
+                    c.candidate_errors
+                        .iter()
+                        .map(|e| json!({"server": e.server, "code": e.code, "message": e.message}))
+                        .collect::<Vec<_>>()
+                ),
+            )
         }
         codes::E_SERVER_SILENT => network(
             base.cause(format!(
