@@ -1738,7 +1738,8 @@ async fn pre_submit_wait(
             let _ = std::io::stderr().flush();
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            // 無法註冊 Ctrl+C 的處理時（Err）停用這個分支，照常等候
+            Ok(()) = tokio::signal::ctrl_c() => {
                 if tty {
                     eprintln!();
                 }

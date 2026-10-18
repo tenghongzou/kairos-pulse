@@ -600,11 +600,14 @@ fn download_endpoint_serves_the_release_files() {
         let (s, _, _) = raw_get(&env, p, "");
         assert_eq!(s, 404, "{p}");
     }
-    // 與安裝腳本相同的 curl 參數（--proto =https --tlsv1.2 --cacert）可以下載
-    if std::process::Command::new("curl")
-        .arg("--version")
-        .output()
-        .is_ok()
+    // 與安裝腳本相同的 curl 參數（--proto =https --tlsv1.2 --cacert）可以下載。
+    // 安裝腳本只在 Unix 執行；Windows 內建的 curl（Schannel）對自建 CA 會做撤銷檢查而失敗
+    // （CERT_TRUST_REVOCATION_STATUS_UNKNOWN）
+    if cfg!(unix)
+        && std::process::Command::new("curl")
+            .arg("--version")
+            .output()
+            .is_ok()
     {
         let out = std::process::Command::new("curl")
             .args(["-fsSL", "--proto", "=https", "--tlsv1.2", "--cacert"])
