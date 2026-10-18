@@ -69,6 +69,8 @@ sequenceDiagram
 | `deregister` | 除役通知（`hello.intent` 為 `deregister` 的連線上送 `deregister`，回 `deregister_ack`）。Kairos 0.5.0 起同 `renew` 的條件列出；Pulse 0.5.0 起只在除役通知的連線（`pulse decommission`）宣告 |
 | `inventory` | 主機資產：連線後與資產改變時送 `inventory` 訊息（作業系統、CPU、記憶體、廠牌型號序號、磁碟、網卡），回 `ack`（見 [`METRICS.md`](METRICS.md)「資產」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `inventory.enabled`（預設啟用）時宣告 |
 | `processes` | report 另帶行程排行 `processes`（依 CPU、依記憶體各前 N 個；需同時協商 `metrics`，見 [`METRICS.md`](METRICS.md)「行程」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `processes.enabled`（預設啟用）時宣告 |
+| `config` | 〔草稿，0.9.0 規格，尚未實作〕集中設定：Kairos 在 `hello_ack`／心跳的 `ack` 以 `pending.config_rev` 提示，Pulse 以 `config_get` 取得白名單內的設定、以 `config_status` 回報實際生效值與差異（見 [`REMOTE.md`](REMOTE.md) 第 2、3 節）。Kairos 以 SQLite 儲存、mTLS 且 client 也宣告時列出；Pulse 在 `remote_config.enabled`（預設啟用）時宣告 |
+| `upgrade` | 〔草稿，0.9.0 規格，尚未實作〕遠端升級：`upgrade_get`／`upgrade_offer` 提議官方簽章的發佈包，`upgrade_chunk_get`／`upgrade_chunk` 經這條連線分段下載，`upgrade_status` 回報結果（見 [`REMOTE.md`](REMOTE.md) 第 2、4 節）。條件同 `config`；Pulse 在 `upgrade.enabled` 且本機準備就緒（信任錨、輔助程式）時宣告 |
 
 日後新增功能（例如指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。註冊通道（8444 HTTPS）是另一份規格 [`ENROLL.md`](ENROLL.md)；8443 上與註冊有關的 `renew`、`deregister` 定義在本文件「憑證輪替與除役」（原為 ENROLL.md 第 13 節的草稿）。
 
