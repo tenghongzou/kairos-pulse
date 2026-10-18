@@ -87,11 +87,13 @@ pub enum Permission {
     ChannelsTest,
     /// 新增、修改、刪除通知管道，以未儲存的設定測試（管道含機密，S11：只有管理員）
     ChannelsWrite,
+    /// 指標轉出（Prometheus exporter、OTLP）的設定與測試連線（S21「整合」；OTLP 標頭含機密：只有管理員）
+    ExportWrite,
 }
 
 impl Permission {
     /// 所有權限（新增變體時同步加入；測試會檢查沒有遺漏與名稱不重複）
-    pub const ALL: [Permission; 35] = [
+    pub const ALL: [Permission; 36] = [
         Permission::HostsRead,
         Permission::HealthRead,
         Permission::EnrollRead,
@@ -127,6 +129,7 @@ impl Permission {
         Permission::ChannelsRead,
         Permission::ChannelsTest,
         Permission::ChannelsWrite,
+        Permission::ExportWrite,
     ];
 
     /// 對外的名稱（穩定；`<資源>:<動作>`）
@@ -167,6 +170,7 @@ impl Permission {
             Permission::ChannelsRead => "channels:read",
             Permission::ChannelsTest => "channels:test",
             Permission::ChannelsWrite => "channels:write",
+            Permission::ExportWrite => "export:write",
         }
     }
 

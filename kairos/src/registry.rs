@@ -651,6 +651,8 @@ pub struct Registry {
     events: broadcast::Sender<HostChange>,
     /// Kairos 內部的事件匯流排（[`crate::bus`]）：上線、離線、被取代也發布到這裡
     bus: Arc<EventBus>,
+    /// 指標轉出（[`crate::export`]）：啟動時設定一次；連線保存 report 後交給它
+    export: std::sync::OnceLock<Arc<crate::export::ExportHub>>,
 }
 
 impl Default for Registry {
@@ -671,7 +673,18 @@ impl Registry {
             max_agents: max_agents.max(1),
             events: broadcast::channel(HOST_CHANGE_CAPACITY).0,
             bus: EventBus::new(),
+            export: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 設定指標轉出（啟動時一次；之後的呼叫忽略）
+    pub fn set_export_hub(&self, hub: Arc<crate::export::ExportHub>) {
+        let _ = self.export.set(hub);
+    }
+
+    /// 指標轉出（沒有設定時為 `None`，例如部分測試）
+    pub fn export_hub(&self) -> Option<Arc<crate::export::ExportHub>> {
+        self.export.get().cloned()
     }
 
     /// 事件匯流排（狀態表建立時一併建立；其他元件經由狀態表取得同一個匯流排）

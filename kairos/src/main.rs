@@ -13,6 +13,7 @@ mod diag;
 mod enroll;
 mod enroll_cli;
 mod expiry;
+mod export;
 mod export_cli;
 mod fsperm;
 mod hosts_cli;
@@ -863,6 +864,9 @@ async fn run(
             n
         );
     }
+    // 指標轉出（Prometheus exporter、OTLP；kairos/EXPORT.md）：連線保存 report 後經由狀態表交給它
+    let (export_hub, export_task) = export::start(&config, &paths.data_dir, shutdown.clone());
+    registry.set_export_hub(export_hub);
     let writer = supervise(
         "report 寫入工作",
         tokio::spawn(writer_task),
@@ -1243,6 +1247,8 @@ async fn run(
     if let Some((_, thread)) = alerts {
         alerts::AlertService::join(thread, Duration::from_secs(3)).await;
     }
+    // OTLP：佇列中剩下的資料最後再送一次（最多約 2 秒）
+    let _ = tokio::time::timeout(Duration::from_secs(3), export_task).await;
 
     // 最後一份狀態（所有 agent 已標為離線）交給 writer，結束前寫入主機清冊
     if let Some(feed) = &inventory {

@@ -940,6 +940,9 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
         );
     }
 
+    // ---- 指標轉出（kairos/EXPORT.md） ----
+    crate::export::render_self_metrics(ctx.registry.export_hub().as_deref(), &mut e);
+
     // ---- 行程 ----
     if let Some((rss, fds, cpu)) = process_stats() {
         e.gauge(

@@ -1,0 +1,56 @@
+# Prometheus 抓取 Kairos 的範例（併入 prometheus.yml 的 scrape_configs；說明見 kairos/EXPORT.md 第 2 節）。
+#
+# 事前準備：
+#   1. Kairos：主控台「系統設定 → 整合 → 指標轉出」勾選「提供 Prometheus 端點」，
+#      或 kairos.toml 的 [export.prometheus] enabled = true。
+#   2. 建立唯讀的 API token（只需要 hosts:read；群組範圍的 token 只會抓到該群組的主機）：
+#        kairos api-token create --name prometheus --role viewer --expires-in 365d --config /opt/kairos/kairos.toml
+#      把印出的 token 存成 /etc/prometheus/kairos.token（chown prometheus、chmod 600）。
+#   3. 主控台的憑證若不是公開 CA 簽發，把簽發它的 CA 複製到 /etc/prometheus/kairos-console-ca.pem。
+
+scrape_configs:
+  # 所有主機的最新指標（Kairos 轉出；每台主機的序列都帶 agent_id、hostname、host_group）
+  - job_name: kairos-hosts
+    scheme: https
+    metrics_path: /api/v1/export/prometheus
+    # Pulse 預設每 5 秒一筆 report；30～60 秒抓一次即可。數千台主機時一次輸出數 MB（EXPORT.md 第 5 節），
+    # scrape_timeout 留足時間，或依群組分成多個 job（下面的 kairos-hosts-line3）
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/kairos.token
+    tls_config:
+      ca_file: /etc/prometheus/kairos-console-ca.pem
+      # 憑證的 SAN 與 targets 的主機名稱不同時指定
+      # server_name: monitor.example.com
+    static_configs:
+      - targets: ['kairos.example.com:9443']
+    # 序列的 instance 是 Kairos 本身；依主機查詢請用 hostname 或 agent_id 標籤
+
+  # 依主機群組分開抓取（大量主機時分散到多個 job 或多台 Prometheus）
+  # - job_name: kairos-hosts-line3
+  #   scheme: https
+  #   metrics_path: /api/v1/export/prometheus
+  #   params:
+  #     group: ['line3']
+  #   authorization:
+  #     type: Bearer
+  #     credentials_file: /etc/prometheus/kairos.token
+  #   tls_config:
+  #     ca_file: /etc/prometheus/kairos-console-ca.pem
+  #   static_configs:
+  #     - targets: ['kairos.example.com:9443']
+
+  # Kairos 自身的狀態（連線數、寫入、告警引擎、OTLP 推送；README「健康檢查與 Prometheus」）。
+  # /metrics 預設只接受 loopback；遠端抓取時設定 observability.metrics_token_file，或 observability.listen
+  # - job_name: kairos-self
+  #   scheme: https
+  #   metrics_path: /metrics
+  #   authorization:
+  #     type: Bearer
+  #     credentials_file: /etc/prometheus/kairos-metrics.token
+  #   tls_config:
+  #     ca_file: /etc/prometheus/kairos-console-ca.pem
+  #   static_configs:
+  #     - targets: ['kairos.example.com:9443']

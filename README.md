@@ -65,6 +65,7 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 | `tests/users.rs` | 使用者與稽核（0.6.0）：沒有預設帳號，首位管理員以實際的 `kairos users create --role admin` 建立 → 以一次性密碼登入（必須先變更密碼；cookie 的 HttpOnly、Secure、SameSite=Strict 與 CSRF）→ 建立其他使用者；`kairos audit verify` 驗證雜湊鏈，啟動、登入、密碼變更、關機都在鏈中，日誌與輸出不含密碼 |
 | `tests/alerts.rs` | 三條線的整合（0.6.0，兩端的日誌都是 `log.format = "json"`）：首位管理員 → 建立維運者與唯讀 → 管理員新增 Webhook 管道（測試內的本機 HTTP 接收器；維運者 403）並綁到主機離線規則 → Pulse 停止 → Webhook 收到簽章的 `kairos.alert.v1` → 唯讀確認 403、沒有 CSRF token 403 → 維運者以工作階段確認 → `/metrics` 有告警、通知與主機的計數 → `kairos audit verify` 通過，告警操作與被拒的請求在鏈中；兩端的每一行輸出都是 v1 的 JSON 日誌，日誌不含機密與密碼 |
 | `tests/import.rs` | `kairos reports import`：Kairos 執行中拒絕（檔案鎖跨行程；主控台的寫入連線不得放掉這把鎖）、停止後匯入、重新啟動後匯出與清冊 |
+| `tests/export.rs` | 指標轉出（0.9.0，`kairos/EXPORT.md`）：`[export.prometheus]`、`[export.otlp]` 啟用的 Kairos 與 Pulse → 連線保存的 report 出現在 `GET /api/v1/export/prometheus`（`kairos api-token create` 的唯讀 token）→ OTLP/HTTP 推送到測試內的假 collector（`headers_file` 的標頭、semconv 名稱、`resource_attributes`）→ Pulse 結束後 `kairos_host_up` 為 0、不再輸出指標 → `/metrics` 有推送的計數 → 正常關機、日誌沒有 OTLP 錯誤 |
 
 - 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。
 - 每個測試使用自己的暫存目錄（`<系統暫存目錄>/kp-e2e-*`）與隨機埠，可平行執行；每個等待都有逾時（30 秒）。測試失敗時保留暫存目錄（路徑印在輸出中）並附上兩端的 stdout／stderr。

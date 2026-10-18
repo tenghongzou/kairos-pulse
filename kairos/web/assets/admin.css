@@ -19,3 +19,7 @@ a.k-status-light:hover .k-status-light__text { text-decoration: underline; }
 
 /* S18「前往第 N 筆」：斷點那一列 */
 .ds-table tr.is-highlight { background: var(--ds-color-bg-selected); }
+
+/* S21「整合」：指標轉出的 OTLP 標頭（名稱、值、移除；窄螢幕換行） */
+.k-header-row { display: flex; flex-wrap: wrap; gap: var(--ds-space-300); align-items: flex-end; }
+.k-header-row > .ds-field { flex: 1 1 12rem; min-width: 0; margin: 0; }
