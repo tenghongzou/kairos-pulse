@@ -20,20 +20,26 @@
 //!   主機資產（feature `inventory`，[`Inventory`]、[`ClientMsg::Inventory`]）
 //! - 叢集連線（feature `cluster`，PROTOCOL.md「叢集與排空」）：`hello_ack.server_node`／`cluster_id`
 //!   與排空訊息 [`ServerMsg::Drain`]
+//! - 遠端管理（feature `config`、`upgrade`，PROTOCOL.md「遠端管理」、[`REMOTE.md`](../REMOTE.md)）：
+//!   [`mgmt`] 模組（新訊息、hello 的 `install`、`pending`、驗證、協商、設定白名單 [`mgmt::settings`]）與
+//!   [`release`] 模組（SSHSIG 簽章驗證、`allowed_signers`、`SHA256SUMS`、發佈檔名、發佈清單、版本比較）
 //!
 //! 本 crate 只有純函式與資料型別，不做 I/O、不記日誌，也不依賴 tokio；NDJSON 的分行 codec
 //! 與日誌的措辭留在各產品。
 
 #![forbid(unsafe_code)]
 
+mod b64;
 mod cluster;
 pub mod enroll;
 mod inventory;
 pub mod lifecycle;
 mod messages;
 mod metrics;
+pub mod mgmt;
 mod negotiate;
 mod processes;
+pub mod release;
 mod validate;
 
 #[cfg(test)]
@@ -75,6 +81,11 @@ pub use metrics::{
     METRIC_TEMPERATURE, METRIC_UPTIME, Metric, MetricKind, STANDARD_METRICS, StandardMetric,
     counter_rate, filesystem_usage, is_valid_label_key, is_valid_metric_name, is_valid_unit,
     standard_metric, validate_metric, validate_metrics,
+};
+pub use mgmt::{
+    ConfigGet, ConfigStatus, FEATURE_CONFIG, FEATURE_UPGRADE, InstallInfo, MGMT_FEATURES,
+    MgmtSession, Pending, RemoteConfig, UpgradeChunk, UpgradeChunkGet, UpgradeGet, UpgradeOffer,
+    UpgradeStatus,
 };
 pub use negotiate::{
     FEATURE_DURABLE, FEATURE_METRICS, ProtoRange, ProtoRangeError, SERVER_FEATURES,

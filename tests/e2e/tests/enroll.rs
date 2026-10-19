@@ -506,7 +506,8 @@ fn manually_issued_certificate_is_imported_and_revocation_takes_effect() {
         c.hello(&a.id, None)["code"] == "certificate_rejected"
     });
     assert!(rejected, "撤銷後應拒絕 hello");
-    assert!(kairos.output().contains("KRS-W1105"), "{}", kairos.dump());
+    // 日誌由背景的寫出執行緒送到 stdout，可能比回應晚一點出現：等到出現為止，不是立即檢查
+    kairos.wait_for("KRS-W1105", WAIT);
     kairos.stop();
 }
 

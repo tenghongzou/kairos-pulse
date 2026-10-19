@@ -10,6 +10,9 @@
 #   EXTRA_SRC        其他放進發佈包根目錄的檔案（相對於產品目錄，以空白分隔，可為空）
 #   DEFAULT_TARGETS  預設建置的目標（Rust target，以空白分隔；可用環境變數 TARGETS 覆寫）
 #   EXTRA_DIST       （可為空）直接放到輸出目錄的檔案，格式「<相對於產品目錄的來源>:<輸出檔名>」
+#   RELEASE_META     （可為空）發佈清單的手動欄位（相對於產品目錄，例如 packaging/release-meta.toml）：
+#                    設定時以 packaging/release-manifest.sh 產生 <名稱>-<版本>-<commit>-release.json
+#                    （REMOTE.md 第 4.1.3 節）放到輸出目錄並列進 SHA256SUMS；-dirty 的建置不產生
 #
 # 在 docker 的 rust alpine image（以 @sha256 digest 固定）內建置 release 執行檔並打包。每個目標的產出
 # （<基本名稱> = <名稱>-<版本>-<commit>[-dirty]-<os>-<arch>）：
@@ -160,6 +163,7 @@ fi
 for e in ${EXTRA_DIST:-}; do
     [ -f "$PKG_SUBDIR/${e%%:*}" ] || die "缺少 $PKG_SUBDIR/${e%%:*}"
 done
+[ -z "${RELEASE_META:-}" ] || [ -f "$PKG_SUBDIR/$RELEASE_META" ] || die "缺少 $PKG_SUBDIR/$RELEASE_META"
 
 # ---- 版本與 commit ---------------------------------------------------------
 # 版本取自產品 Cargo.toml [package] 的 version（第一個 version 欄位）；--version 也是這個值
@@ -189,6 +193,20 @@ fi
 # 所有檔案的時間戳記固定為該 commit 的時間，同一份原始碼重複打包時內容一致
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD)
 BUILD_COMMIT="$COMMIT$DIRTY"
+
+# 發佈清單（REMOTE.md 第 4.1.3 節）：在主機上以 git 歷史產生（unit 的歷來雜湊），由容器寫進輸出目錄
+MANIFEST_FILE=""
+MANIFEST_JSON=""
+if [ -n "${RELEASE_META:-}" ]; then
+    if [ -n "$DIRTY" ]; then
+        echo "注意：-dirty 的建置不產生發佈清單" >&2
+    else
+        MANIFEST_FILE="$NAME-$VERSION-$COMMIT-release.json"
+        MANIFEST_JSON=$(sh packaging/release-manifest.sh "$NAME" "$VERSION" "$COMMIT" \
+            "$SOURCE_DATE_EPOCH" "$PKG_SUBDIR/$RELEASE_META" "$PKG_SUBDIR/$UNIT_SRC" HEAD) ||
+            die "無法產生發佈清單（$PKG_SUBDIR/$RELEASE_META）"
+    fi
+fi
 
 # ---- 輸出目錄與 docker volume ----------------------------------------------
 DIST_DIR=${DIST_DIR:-$REPO/dist}
@@ -490,6 +508,13 @@ for e in $EXTRA_DIST; do
     NEW_FILES="$NEW_FILES ${e#*:}"
 done
 
+# 發佈清單（主機上產生的一行 JSON）
+if [ -n "$MANIFEST_FILE" ]; then
+    printf "%s\n" "$MANIFEST_JSON" > "/out/$MANIFEST_FILE"
+    chmod 644 "/out/$MANIFEST_FILE"
+    NEW_FILES="$NEW_FILES $MANIFEST_FILE"
+fi
+
 # 合併版 SHA256SUMS：去掉本次產出檔案的舊列與已不存在的檔案，加上新列，依檔名排序
 cd /out
 : > SHA256SUMS.new
@@ -564,6 +589,8 @@ git -c core.autocrlf=false archive --format=tar "$TREEISH" |
     -e NFPM_SHA256="$NFPM_SHA256" \
     -e EXTRA_SRC="${EXTRA_SRC:-}" \
     -e EXTRA_DIST="${EXTRA_DIST:-}" \
+    -e MANIFEST_FILE="$MANIFEST_FILE" \
+    -e MANIFEST_JSON="$MANIFEST_JSON" \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e HOST_UID="$HOST_UID" \
     -e HOST_GID="$HOST_GID" \

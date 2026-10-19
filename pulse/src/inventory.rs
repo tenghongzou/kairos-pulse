@@ -328,7 +328,7 @@ impl InventoryConn {
     ) -> Option<InventoryReply> {
         let f = self.in_flight.clone()?;
         let reply = match parse_server_msg(line).ok()? {
-            ServerMsg::Ack { seq } if seq == f.seq => InventoryReply::Acked,
+            ServerMsg::Ack { seq, .. } if seq == f.seq => InventoryReply::Acked,
             ServerMsg::Error {
                 seq: Some(seq),
                 code,

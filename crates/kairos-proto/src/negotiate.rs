@@ -105,6 +105,7 @@ pub fn unsupported_version_error(seq: Option<u64>, server: ProtoRange) -> Server
             fatal,
             proto_min: Some(server.min),
             proto_max: Some(server.max),
+            retry_after_ms: None,
         },
         other => other,
     }

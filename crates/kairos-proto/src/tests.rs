@@ -49,6 +49,8 @@ pub(crate) enum Ver {
     Deregister,
     /// 叢集連線與排空（feature `cluster`）
     Cluster,
+    /// 遠端管理（feature `config`、`upgrade`）
+    Mgmt,
     Errors,
 }
 
@@ -61,6 +63,7 @@ impl Ver {
             Ver::Renew => "輪替",
             Ver::Deregister => "除役",
             Ver::Cluster => "叢集",
+            Ver::Mgmt => "遠端管理",
             Ver::Errors => "錯誤",
         }
     }
@@ -139,6 +142,8 @@ fn spec_vectors_are_found() {
     assert_eq!(vectors(Ver::Deregister, 'K').len(), 2);
     assert_eq!(vectors(Ver::Cluster, 'P').len(), 2);
     assert_eq!(vectors(Ver::Cluster, 'K').len(), 3);
+    assert_eq!(vectors(Ver::Mgmt, 'P').len(), 8);
+    assert_eq!(vectors(Ver::Mgmt, 'K').len(), 10);
     assert_eq!(vectors(Ver::Errors, 'P').len(), 0);
     assert_eq!(vectors(Ver::Errors, 'K').len(), 5);
 }
@@ -152,6 +157,7 @@ fn every_client_vector_round_trips() {
         Ver::Renew,
         Ver::Deregister,
         Ver::Cluster,
+        Ver::Mgmt,
     ] {
         for line in vectors(ver, 'P') {
             let msg = parse_client_msg(line).unwrap();
@@ -171,6 +177,7 @@ fn every_server_vector_round_trips() {
         Ver::Renew,
         Ver::Deregister,
         Ver::Cluster,
+        Ver::Mgmt,
         Ver::Errors,
     ] {
         for line in vectors(ver, 'K') {
@@ -278,6 +285,7 @@ fn spec_limits_match_constants() {
         .iter()
         .chain(LIFECYCLE_FEATURES.iter())
         .chain([FEATURE_CLUSTER].iter())
+        .chain(MGMT_FEATURES.iter())
     {
         has(format!("| `{feature}` |"));
     }
@@ -299,6 +307,41 @@ fn spec_limits_match_constants() {
     for kind in SERVER_MSG_TYPES {
         has(format!("| `{kind}` |"));
     }
+    // feature config、upgrade
+    use crate::mgmt::*;
+    has(format!(
+        "各 1～{MAX_INSTALL_FIELD_BYTES} bytes 的小寫英文字母、數字或 `_`"
+    ));
+    has(format!("各最多 {MAX_STATUS_ITEMS} 項"));
+    has(format!("`message` ≤ {MAX_STATUS_MESSAGE_BYTES} bytes"));
+    has(format!("每段最多 {MAX_CHUNK_BYTES} bytes"));
+    has(format!("`length`（1～{MAX_CHUNK_BYTES}）"));
+    has(format!("最多 **{MAX_CHUNKS_IN_FLIGHT} 段**在途"));
+    has(format!("連續 {MAX_DOWNLOAD_HASH_MISMATCHES} 次不符時放棄"));
+    has(format!("（預設 {DEFAULT_MAX_CONCURRENT_DOWNLOADS} 台）"));
+    has(format!(
+        "健康確認期限（{MIN_HEALTH_TIMEOUT_SECS}～{MAX_HEALTH_TIMEOUT_SECS}）"
+    ));
+    has(format!("（≤ {} KiB）", MAX_MANIFEST_BYTES / 1024));
+    has(format!("全文（≤ {} KiB）", MAX_SHA256SUMS_BYTES / 1024));
+    has(format!("全文（≤ {} KiB，", MAX_SIGNATURE_BYTES / 1024));
+    has(format!("0～{MAX_UPGRADE_DETAIL_BYTES} bytes"));
+    has(format!("≤ {MAX_ARTIFACT_URL_BYTES} bytes）"));
+    has(format!("1～{} MiB", MAX_ARTIFACT_BYTES / 1024 / 1024));
+    for state in CONFIG_STATES.iter().chain(UPGRADE_STATES.iter()) {
+        has(format!("`{state}`"));
+    }
+    for t in MGMT_CLIENT_MSG_TYPES {
+        has(format!("| `{t}` |"));
+    }
+    has(format!(
+        "namespace 為 `{}`",
+        crate::release::RELEASE_NAMESPACE
+    ));
+    has(format!(
+        "principal 為 `{}`",
+        crate::release::RELEASE_PRINCIPAL
+    ));
 }
 
 #[test]

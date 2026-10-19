@@ -231,7 +231,10 @@ enum Incoming {
 fn is_lifecycle_type(kind: &str) -> bool {
     // inventory（feature `inventory`，crates/kairos-proto/METRICS.md）：協商了時格式錯誤回 bad_request，
     // 沒有協商時與舊版相同，回 unknown_type
+    // 遠端管理（feature config／upgrade，crates/kairos-proto/PROTOCOL.md「遠端管理」）：本版不列出這兩個
+    // feature，與舊版相同一律回 unknown_type
     matches!(kind, "renew_request" | "deregister" | "inventory")
+        || kairos_proto::mgmt::MGMT_CLIENT_MSG_TYPES.contains(&kind)
 }
 
 /// 8443 的註冊 feature（`renew`、`deregister`）是否使用：協商為 v2、Kairos 有註冊服務、client 也宣告，
@@ -269,6 +272,14 @@ fn classify(frame: Frame) -> Incoming {
                     },
                     ClientMsg::Inventory(_) => Incoming::InvalidLifecycle {
                         kind: "inventory".into(),
+                        message,
+                    },
+                    ClientMsg::ConfigGet(_)
+                    | ClientMsg::ConfigStatus(_)
+                    | ClientMsg::UpgradeGet(_)
+                    | ClientMsg::UpgradeChunkGet(_)
+                    | ClientMsg::UpgradeStatus(_) => Incoming::InvalidLifecycle {
+                        kind: kairos_proto::message_type(&line).unwrap_or_default(),
                         message,
                     },
                     _ => Incoming::BadRequest {
@@ -1103,6 +1114,8 @@ impl Conn {
             // 叢集模式（cluster_id）留待之後的版本；單機的 Kairos 只帶節點名稱
             server_node: agent.cluster.then(|| self.node_id.to_string()),
             cluster_id: None,
+            // 遠端管理（feature config／upgrade，K1／K2 實作）：本版不列出，因此不帶 pending
+            pending: None,
         };
         self.send(&msg).await
     }
@@ -1580,7 +1593,12 @@ impl Conn {
                     ClientMsg::Unknown
                     | ClientMsg::RenewRequest(_)
                     | ClientMsg::Deregister(_)
-                    | ClientMsg::Inventory(_),
+                    | ClientMsg::Inventory(_)
+                    | ClientMsg::ConfigGet(_)
+                    | ClientMsg::ConfigStatus(_)
+                    | ClientMsg::UpgradeGet(_)
+                    | ClientMsg::UpgradeChunkGet(_)
+                    | ClientMsg::UpgradeStatus(_),
                 )
                 | Incoming::InvalidLifecycle { .. } => self.reply_unknown_type().await?,
             };
@@ -2089,7 +2107,7 @@ impl Conn {
                         "與上次相同"
                     }
                 );
-                Ok(Handled::alive(self.reply(ServerMsg::Ack { seq }).await?))
+                Ok(Handled::alive(self.reply(ServerMsg::ack(seq)).await?))
             }
             Err(reason) => {
                 debug!(
@@ -2154,10 +2172,18 @@ impl Conn {
             }
             // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限。沒有協商 renew 的 renew_request、
             // 一般連線上的 deregister、沒有協商 inventory 的 inventory 與舊版相同，視為不認得的 type
+            // 遠端管理的訊息（feature config／upgrade）：本版不列出這兩個 feature，同樣視為不認得的 type
             ClientMsg::Unknown
             | ClientMsg::RenewRequest(_)
             | ClientMsg::Deregister(_)
-            | ClientMsg::Inventory(_) => Ok(Handled::not_alive(self.reply_unknown_type().await?)),
+            | ClientMsg::Inventory(_)
+            | ClientMsg::ConfigGet(_)
+            | ClientMsg::ConfigStatus(_)
+            | ClientMsg::UpgradeGet(_)
+            | ClientMsg::UpgradeChunkGet(_)
+            | ClientMsg::UpgradeStatus(_) => {
+                Ok(Handled::not_alive(self.reply_unknown_type().await?))
+            }
             ClientMsg::Hello { seq, .. } => {
                 self.bad_requests = 0;
                 if !self.touch(ctx, agent) {
@@ -2185,7 +2211,7 @@ impl Conn {
                     "[#{}] agent {} heartbeat seq={}",
                     self.conn_id, agent.agent_id, seq
                 );
-                Ok(Handled::alive(self.reply(ServerMsg::Ack { seq }).await?))
+                Ok(Handled::alive(self.reply(ServerMsg::ack(seq)).await?))
             }
             ClientMsg::Report { seq, ts, body } => {
                 // 依協商的格式取出內容；格式不符（欄位缺漏、型別錯誤）與 v1 的解析失敗相同：
@@ -2336,7 +2362,7 @@ impl Conn {
                             "[#{}] agent {} report seq={} {}",
                             self.conn_id, agent.agent_id, seq, summary
                         );
-                        Ok(Handled::alive(self.reply(ServerMsg::Ack { seq }).await?))
+                        Ok(Handled::alive(self.reply(ServerMsg::ack(seq)).await?))
                     }
                     StoreOutcome::Unavailable(reason) => {
                         // writer 已記錄 error；每個連線、每筆 report 都可能遇到，這裡只記 debug 避免洗版

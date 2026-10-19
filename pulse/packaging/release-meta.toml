@@ -1,0 +1,20 @@
+# 發佈清單 pulse-<版本>-<commit>-release.json 中手動維護的欄位（crates/kairos-proto/REMOTE.md 第 4.1.3 節；
+# 由 packaging/release-manifest.sh 讀取：每行「鍵 = 值」，不支援多行或表格）。
+# 其他欄位（版本、commit、日期、systemd unit 的雜湊）由打包腳本產生。發佈前依 CHANGELOG.md 的
+# 「版本相容矩陣」與「破壞性變更與升級步驟」確認（RELEASING.md 第 2.1 節）。
+
+# 這版 Pulse 需要的最低 Kairos：Kairos 低於它時不能建立推送（KRS-W8415）。
+# 0.5.0 起的 pulse enroll 需要 Kairos 0.5（CHANGELOG「版本相容矩陣」）
+min_kairos = "0.5.0"
+
+# 能「遠端」升級到這版的最低 Pulse：需要新的 systemd unit、資料格式轉換時提高；低於它的主機需手動升級。
+# 0.9.0 是第一個有遠端升級的版本（REMOTE.md 第 4.10 節：0.8 → 0.9 必須手動升級一次）
+min_upgrade_from = "0.9.0"
+
+# 這版支援的遠端管理 feature（PROTOCOL.md「遠端管理」）。Pulse 實作並宣告 config／upgrade 後
+# （REMOTE.md 第 13 節 P1、P2）改為 ["config", "upgrade"]
+remote_features = []
+
+# 有破壞性變更（CHANGELOG「破壞性變更與升級步驟」有 Pulse 的項目）：主控台在建立推送時要求勾選
+# 「已閱讀升級步驟」。0.9.0：pulse enroll 在送出申請前收到 429／503 時等候後重試（第 2 項）
+breaking = true
