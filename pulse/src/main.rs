@@ -877,11 +877,20 @@ fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgm
         .as_deref()
         .and_then(|p| AppConfig::load_file_only(p).ok())
         .is_none_or(|c| c.upgrade.enabled);
+    let enabled = config.upgrade.enabled && file_enabled;
     let detection = remote::install::detect(
-        config.upgrade.enabled && file_enabled,
+        enabled,
         &config.upgrade.allowed_signers_path(),
         &remote::install::Probe::system(),
     );
+    // 每次連線前重新偵測（放好信任錨、啟用 pulse-upgrade.path 後不必重新啟動）。設定只在啟動時讀取，
+    // 以 OnceLock 交給函式指標
+    static DETECT_INPUT: std::sync::OnceLock<(bool, PathBuf)> = std::sync::OnceLock::new();
+    let _ = DETECT_INPUT.set((enabled, config.upgrade.allowed_signers_path()));
+    fn redetect() -> remote::install::Detection {
+        let (enabled, anchor) = DETECT_INPUT.get().cloned().unwrap_or_default();
+        remote::install::detect(enabled, &anchor, &remote::install::Probe::system())
+    }
     info!(
         "遠端管理：集中設定{}；遠端升級 install.method={} install.upgrade={}",
         if config.remote_config.enabled {
@@ -902,6 +911,7 @@ fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgm
         health_timeout_secs: config.upgrade.health_timeout_secs,
         require_root_owner: true,
         free_space: remote::upgrade::free_space,
+        redetect: Some(redetect),
     });
     remote::RemoteMgmt::new(central, agent)
 }

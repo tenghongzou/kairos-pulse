@@ -1508,6 +1508,10 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // v2 的欄位（features、主機資訊）舊版 Kairos 會忽略
     let seq = conn.next_seq();
     // 遠端管理（REMOTE.md 第 2.1 節）：install 不論是否宣告都送；config／upgrade 依本機狀態宣告
+    // （安裝方式與遠端升級的就緒狀態每次連線前重新偵測）
+    if let Some(m) = &settings.mgmt {
+        m.upgrade.refresh_detection();
+    }
     let mgmt_features: Vec<&'static str> = settings
         .mgmt
         .as_ref()

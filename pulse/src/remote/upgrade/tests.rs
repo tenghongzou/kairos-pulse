@@ -51,6 +51,7 @@ fn env(dir: &Path, version: &str) -> UpgradeEnv {
         health_timeout_secs: 0,
         require_root_owner: false,
         free_space: |_| None,
+        redetect: None,
     }
 }
 
@@ -650,6 +651,32 @@ fn reoffer_of_the_same_target_reuses_the_staged_files() {
     assert_eq!(got, [(new_id, "accepted"), (new_id, "staged")]);
     assert!(dir.join("state/upgrade").join(new_id).join(FILE).is_file());
     assert_eq!(agent.poll(&mut cs, Instant::now()), None, "不需要重新下載");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn readiness_is_detected_again_before_each_connection() {
+    let dir = tmp("redetect");
+    let mut e = env(&dir, "0.9.0");
+    e.detection.upgrade = mgmt::INSTALL_UPGRADE_NO_HELPER;
+    fn now_ready() -> Detection {
+        Detection {
+            method: mgmt::INSTALL_METHOD_DEB,
+            upgrade: mgmt::INSTALL_UPGRADE_READY,
+            reason: None,
+            trust_anchor: PathBuf::new(),
+            fingerprints: Vec::new(),
+        }
+    }
+    e.redetect = Some(now_ready);
+    let agent = UpgradeAgent::new(e);
+    assert_eq!(agent.install_info().upgrade.as_deref(), Some("no_helper"));
+    agent.refresh_detection();
+    let info = agent.install_info();
+    assert_eq!(
+        (info.method.as_deref(), info.upgrade.as_deref()),
+        (Some("deb"), Some("ready"))
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

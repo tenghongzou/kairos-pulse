@@ -85,6 +85,9 @@ pub struct UpgradeEnv {
     pub require_root_owner: bool,
     /// 目錄所在檔案系統的可用空間（bytes）；取不到時 `None`（不檢查）
     pub free_space: fn(&Path) -> Option<u64>,
+    /// 每次連線前重新偵測 `install`（放好信任錨、啟用 `pulse-upgrade.path` 後不必重新啟動 Pulse）；
+    /// `None` 時沿用啟動時的結果（測試）
+    pub redetect: Option<fn() -> Detection>,
 }
 
 /// 檔案系統的可用空間（Unix：`statvfs` 的 `f_bavail × f_frsize`）
@@ -434,6 +437,30 @@ impl UpgradeAgent {
                 inner.state_error = Some(e);
             }
         }
+    }
+
+    /// 連線前重新偵測安裝方式與遠端升級的就緒狀態（[`UpgradeEnv::redetect`]）；改變時記一則 INFO
+    pub fn refresh_detection(&self) {
+        let Some(detect) = self.lock().env.redetect else {
+            return;
+        };
+        let d = detect();
+        let mut inner = self.lock();
+        let old = &inner.env.detection;
+        if (old.method, old.upgrade) != (d.method, d.upgrade) {
+            log::info!(
+                "遠端升級的本機狀態改變：install.method {} → {}，install.upgrade {} → {}{}",
+                old.method,
+                d.method,
+                old.upgrade,
+                d.upgrade,
+                d.reason
+                    .as_deref()
+                    .map(|r| format!("（{r}）"))
+                    .unwrap_or_default()
+            );
+        }
+        inner.env.detection = d;
     }
 
     /// hello 的 `install`（`method`、`upgrade`；`config` 由集中設定補上）
