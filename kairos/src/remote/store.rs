@@ -169,6 +169,8 @@ pub struct RolloutRow {
     pub soak_until: Option<i64>,
     pub awaiting_continue: bool,
     pub pause_reason: Option<String>,
+    /// 自動暫停的原因（`failure_ratio`／`rollback_failed`／`signature_failed`；手動暫停為 `None`）
+    pub pause_cause: Option<String>,
     pub cancel_reason: Option<String>,
     pub created_at: i64,
     pub created_by: String,
@@ -253,6 +255,9 @@ pub struct HostTransition {
     pub finished_at: Option<Option<i64>>,
     pub acknowledged: Option<(i64, String)>,
 }
+
+/// 回滾失敗、尚未標記處理的主機：(agent_id, hostname, rollout_id, detail)
+pub type RollbackFailure = (String, String, String, Option<String>);
 
 /// 遠端管理的資料庫操作
 pub trait RemoteStore {
@@ -442,6 +447,9 @@ pub trait RemoteStore {
 
     /// 進行中推送的主機中已提議、尚未替換的 (agent_id, upgrade_id)（啟動時載入）
     fn active_offers(&self) -> StoreResult<Vec<(String, String)>>;
+
+    /// 回滾失敗、尚未標記為已處理的主機：(agent_id, hostname, rollout_id, detail)
+    fn unacknowledged_rollback_failures(&self) -> StoreResult<Vec<RollbackFailure>>;
 
     /// 使用中（草稿、進行中、暫停）的推送中以這個版本為目標的數量
     fn rollouts_using_release(&self, release_id: i64) -> StoreResult<i64>;

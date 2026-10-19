@@ -149,6 +149,8 @@ struct State {
     downloads: HashMap<String, Instant>,
     /// 狀態改變、尚未送出 `rollout.progress` 的推送
     dirty_rollouts: HashSet<String>,
+    /// 已發布給告警引擎、仍有效的系統檢查（規則, 對象）；`None` 為尚未調和過
+    alert_keys: Option<HashSet<(&'static str, String)>>,
 }
 
 /// [`RemoteService::start`] 的參數
@@ -475,8 +477,98 @@ impl RemoteService {
                 warn!("升級推送：推送引擎這一輪失敗（稍後重試）：{e}");
             }
             self.flush_progress().await;
+            self.reconcile_alerts().await;
         }
         debug!("遠端管理的背景工作結束");
+    }
+
+    /// 告警的系統規則（REMOTE.md 第 4.7.4 節）：依資料庫的狀態調和「升級推送已暫停」（自動暫停的推送）、
+    /// 「發佈簽章驗證失敗」（因簽章失敗而暫停的推送的目標版本）、「升級回滾失敗」（未標記處理的主機），
+    /// 只發布改變的部分（第一次全部發布：Kairos 重新啟動後重建告警引擎的狀態）
+    pub(crate) async fn reconcile_alerts(&self) {
+        use crate::alerts::rules::ids;
+        let rows = self
+            .db
+            .read(|s| {
+                Ok((
+                    s.list_rollouts(Some(rollout::ROLLOUT_PAUSED))?,
+                    s.unacknowledged_rollback_failures()?,
+                ))
+            })
+            .await;
+        let (paused, failures) = match rows {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("升級推送：無法讀取告警的狀態：{e}");
+                return;
+            }
+        };
+        let mut want: HashMap<(&'static str, String), (String, serde_json::Value)> = HashMap::new();
+        for r in paused.iter().filter(|r| r.pause_cause.is_some()) {
+            let cause = r.pause_cause.clone().unwrap_or_default();
+            want.insert(
+                (ids::ROLLOUT_PAUSED, r.id.clone()),
+                (
+                    format!("推送「{}」已自動暫停：{}", r.name, r.pause_reason.as_deref().unwrap_or("")),
+                    serde_json::json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "reason": r.pause_reason, "cause": cause}),
+                ),
+            );
+            if cause == "signature_failed" {
+                want.insert(
+                    (ids::RELEASE_SIGNATURE_FAILED, r.target_version.clone()),
+                    (
+                        format!(
+                            "Pulse {} 發佈包的簽章驗證失敗，使用這個版本的推送已暫停",
+                            r.target_version
+                        ),
+                        serde_json::json!({"target_version": r.target_version, "rollout_id": r.id}),
+                    ),
+                );
+            }
+        }
+        for (agent, host, rid, detail) in failures {
+            want.insert(
+                (ids::UPGRADE_ROLLBACK_FAILED, agent.clone()),
+                (
+                    format!("升級回滾失敗：{host} 需要人工處理"),
+                    serde_json::json!({"agent_id": agent, "hostname": host, "rollout_id": rid, "detail": detail}),
+                ),
+            );
+        }
+        let (added, removed) = {
+            let mut st = self.lock();
+            let first = st.alert_keys.is_none();
+            let old = st.alert_keys.take().unwrap_or_default();
+            let now: HashSet<(&'static str, String)> = want.keys().cloned().collect();
+            let added: Vec<_> = now
+                .iter()
+                .filter(|k| first || !old.contains(*k))
+                .cloned()
+                .collect();
+            let removed: Vec<_> = old.difference(&now).cloned().collect();
+            st.alert_keys = Some(now);
+            (added, removed)
+        };
+        let bus = self.registry.bus();
+        for key in added {
+            let (title, details) = want.remove(&key).unwrap_or_default();
+            bus.publish(crate::bus::EventKind::RemoteCondition {
+                rule: key.0,
+                subject: key.1,
+                active: true,
+                title,
+                details,
+            });
+        }
+        for key in removed {
+            bus.publish(crate::bus::EventKind::RemoteCondition {
+                rule: key.0,
+                subject: key.1,
+                active: false,
+                title: String::new(),
+                details: serde_json::Value::Null,
+            });
+        }
     }
 
     /// 刪除超過 `rollout_retention_days` 的已結束推送

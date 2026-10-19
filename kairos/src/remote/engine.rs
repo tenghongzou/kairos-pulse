@@ -182,6 +182,11 @@ fn pause_in_tx(
     }
     r.state = ROLLOUT_PAUSED.into();
     r.pause_reason = Some(reason.to_string());
+    r.pause_cause = auto
+        .as_ref()
+        .and_then(|d| d.get("cause"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     r.updated_at = now;
     s.update_rollout_state(r)?;
     let (action, code) = if auto.is_some() {
@@ -327,6 +332,7 @@ impl RemoteService {
                 soak_until: None,
                 awaiting_continue: false,
                 pause_reason: None,
+                pause_cause: None,
                 cancel_reason: None,
                 created_at: now,
                 created_by: who.actor.clone(),
@@ -553,6 +559,7 @@ impl RemoteService {
                             return Err(invalid_state(&r, "繼續（只有暫停中的推送可以繼續）").into());
                         }
                         let was = r.pause_reason.take();
+                        r.pause_cause = None;
                         r.state = ROLLOUT_RUNNING.into();
                         r.updated_at = now;
                         s.update_rollout_state(&r)?;

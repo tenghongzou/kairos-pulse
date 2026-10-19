@@ -1512,7 +1512,7 @@ done
 - 只對**連線中且協商了 `upgrade`** 的主機提議，同時最多 `max_in_progress` 台；Kairos 啟動後 1 分鐘內不提議新的主機。連線中但沒有協商 `upgrade` 的主機標為 `skipped`（`not_ready`）。
 - 逾時：提議後超過 `apply_window`（提議時起 24 小時；0.9 沒有維護時段）再 1 小時仍未開始替換 → `expired`（`not_started`）；`applying` 之後超過 `health_timeout_secs + 30 分鐘` 沒有回報**且離線** → `unknown`（`no_report_after_apply`，計入失敗）。最後一次離線的原因是 Kairos 這端（`server_shutdown`、叢集的 `server_lost`）時，期限從 Kairos 這次啟動時重新起算，不算主機卡住。離線超過 `offline_grace_hours` 的 `pending` 主機 → `skipped_offline`（推送結束前重新連線時回到 `pending`）。
 - 失敗比例 = (`failed` + `rolled_back` + `rollback_failed` + `unknown`) ÷ 這批已結束且計入的主機（`declined`、`skipped`、`expired` 不計），**持續檢查**，超過上限即自動暫停。一批全部結束後開始觀察（`soak_until`），期滿後若 `manual_continue` 則等待 `continue`（`next_action.code = waiting_continue`），否則開始下一批；最後一批結束時 `completed`（稽核 `rollout.complete`，各狀態的台數）。
-- **自動暫停**（`rollout.auto_pause`，執行者 `system`，`KRS-W8414`，WARN）：失敗比例超過上限、任何一台 `rollback_failed`（另記稽核 `host.upgrade.rollback_failed`，`KRS-E8408`）、任何一台回報簽章失敗 `PLS-E8401`（另記稽核 `host.upgrade.signature_failed`，`KRS-E8401`；同一版本的其他推送也暫停）。`rolled_back` 記稽核 `host.upgrade.rolled_back`（`KRS-W8407`）。一般的結果只記在主機表，不逐台寫稽核（D17）。
+- **自動暫停**（`rollout.auto_pause`，執行者 `system`，`KRS-W8414`，WARN）：失敗比例超過上限、任何一台 `rollback_failed`（另記稽核 `host.upgrade.rollback_failed`，`KRS-E8408`）、任何一台回報簽章失敗 `PLS-E8401`（另記稽核 `host.upgrade.signature_failed`，`KRS-E8401`；同一版本的其他推送也暫停）。`rolled_back` 記稽核 `host.upgrade.rolled_back`（`KRS-W8407`）。一般的結果只記在主機表，不逐台寫稽核（D17）。三種情況另開告警的系統規則（`sys.rollout_paused`、`sys.upgrade_rollback_failed`、`sys.release_signature_failed`，`kairos/ALERTS.md`），推送繼續或取消、標記為已處理時恢復。
 - 回報 `succeeded` 而這條連線 hello 的 `agent_version` 不是目標版本 → `failed`（`version_mismatch`，`KRS-W8402`）。
 - 已結束或取消超過 `[remote] rollout_retention_days`（預設 400）的推送每小時刪除。
 

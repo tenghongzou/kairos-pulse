@@ -717,6 +717,32 @@ impl Engine {
                 details: json!({ "since": since, "reason": reason, "id": id }),
             });
         }
+        for ((rule, subject), (since, title, details)) in &self.remote_conditions {
+            let (severity, code) = match *rule {
+                ids::UPGRADE_ROLLBACK_FAILED => (Severity::Critical, "KRS-E8408"),
+                ids::RELEASE_SIGNATURE_FAILED => (Severity::Critical, "KRS-E8401"),
+                _ if matches!(
+                    details.get("cause").and_then(Value::as_str),
+                    Some("rollback_failed" | "signature_failed")
+                ) =>
+                {
+                    (Severity::Critical, "KRS-W8414")
+                }
+                _ => (Severity::Warning, "KRS-W8414"),
+            };
+            let mut d = details.clone();
+            if let Value::Object(m) = &mut d {
+                m.insert("since".into(), json!(since));
+            }
+            out.push(SystemCondition {
+                rule_id: rule,
+                subject: subject.clone(),
+                severity,
+                title: title.clone(),
+                code: Some(code),
+                details: d,
+            });
+        }
         let window = self
             .rule(ids::REGISTRY_CAPACITY)
             .map_or(3600, |r| r.param_u64("window_secs", 3600)) as i64
@@ -787,6 +813,9 @@ impl Engine {
             ids::TLS_RELOAD_FAILED,
             ids::CHANNEL_FAILED,
             ids::AUDIT_INTEGRITY,
+            ids::ROLLOUT_PAUSED,
+            ids::UPGRADE_ROLLBACK_FAILED,
+            ids::RELEASE_SIGNATURE_FAILED,
         ];
         // 同一規則、同一對象取最嚴重的一項
         let mut by_rule: HashMap<&'static str, HashMap<String, SystemCondition>> = HashMap::new();

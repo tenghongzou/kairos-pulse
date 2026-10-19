@@ -112,6 +112,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **Pulse 版本庫**（K2）：`POST /api/v1/releases` 匯入一次發佈的 `SHA256SUMS`、`.sig` 與發佈清單，以 `[remote] allowed_signers` 驗證（`release::verify_bundle`；沒有設定時只檢查簽章本身與雜湊並警告），`PUT …/artifacts/{filename}` 上傳發佈檔（必須列在 `SHA256SUMS` 中且雜湊相符；以 SHA-256 命名存入 `data/releases/`，0700）。失敗為 `KRS-E8413`；使用中的版本不能刪（409 `release_in_use`）。
 - **升級推送**（K2）：建立（預覽資格分類：已是目標版本、Pulse 太舊、本機停用、缺少信任錨或輔助程式、不支援的平台、沒有發佈檔、`min_upgrade_from`、降版、沒有回滾檔…）→ 送出（L2「升級 N 台」；降版 L3＋原因）→ 立即開始。最多兩批（預設 canary 1%、至多 10 台、觀察 60 分鐘、任何失敗都暫停、人工繼續；其餘 5%），只對連線中且協商了 `upgrade` 的主機提議、同時最多 `max_in_progress` 台；逾時（`expired`、替換後失聯的 `unknown`；Kairos 這端的關機或 `server_lost` 不算主機卡住）、離線寬限（`skipped_offline`）、失敗比例與回滾失敗、簽章失敗時自動暫停（`KRS-W8414`）；暫停、繼續、繼續下一批、取消、重試、回滾失敗標記為已處理。deb／rpm 的提議另附主機目前版本的回滾檔（版本庫有時）。0.9 只支援 Linux 的 tar／deb／rpm。
 - **主控台 API**（API.md 第 17 節）：`/api/v1/config/…`、`/releases/…`、`/rollouts/…`、`/hosts/{agent_id}/config`、`/hosts/{agent_id}/upgrade`；主機清單另有 `install`、`config_state` 欄位與 `config_state`、`remote_upgrade` 篩選；SSE `config.host`、`rollout.progress`。新權限 **`config:read`／`config:write`、`releases:read`／`releases:write`、`rollouts:read`／`rollouts:write`／`rollouts:pause`**（`Permission::ALL` 為 45 個；維運者可修改集中設定與暫停推送，建立與執行推送、版本庫的寫入只限管理員）；0.4／0.5 的舊範圍 token 不會取得。稽核類別 `config`、`release`、`rollout` 與 `host.upgrade.*`（一般的升級結果不逐台寫稽核，REMOTE.md D17）。
+- **告警**：新的系統規則 `sys.rollout_paused`「升級推送已暫停」（`KRS-W8414`）、`sys.upgrade_rollback_failed`「升級回滾失敗」（`KRS-E8408`）、`sys.release_signature_failed`「發佈簽章驗證失敗」（`KRS-E8401`），推送繼續或取消、回滾失敗標記為已處理時恢復。
 - **`[remote]`**：`config_enabled`、`upgrade_enabled`、`releases_dir`、`allowed_signers`、`extra_principals`、`max_concurrent_downloads`、`max_release_bytes`、`rollout_retention_days`（`kairos.example.toml`；修改後需重新啟動，`allowed_signers` 的內容在每次匯入時讀取）。
 - **資料庫 schema v9**（STORAGE.md 第 18 節）：`config_profiles`、`config_profile_revisions`、`config_assignments`、`host_config`、`releases`、`release_artifacts`、`rollouts`、`rollout_hosts`，`hosts.install_method`／`install_upgrade`／`install_config`。刪除主機資料一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management`。`kairos db backup` 不含版本庫的發佈檔。
 - **依賴**：沒有新增 crate；`Cargo.lock` 不變。
@@ -190,7 +191,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 刪除主機資料不涵蓋日誌、JSONL 鏡像、備份與已送出的通知；`kairos hosts purge` 需要停止 Kairos。
 - 外部 CA 簽發、匯入的憑證撤銷後，已連線中的主機在下一次重新連線時才被拒。
 - 刪除主機資料沒有雙人覆核（設計包的選項，之後與其他雙人覆核一起做）。
-- 遠端管理（F8 MVP）：Windows 的遠端升級、維護時段（推送的 `schedule`／`windows`）、雙人覆核（`rollouts:approve`、`KRS-E6106`）、外部 URL 的版本庫、自訂批次（多於兩批）在 0.10.0；`kairos releases` 的 CLI、SSE `rollout.host`、升級相關的告警系統規則與升級中的離線告警抑制尚未提供（REMOTE.md 第 13.1 節）。降版推送的 L3 確認不要求重新驗證密碼（設計包 §31.12 #7）。
+- 遠端管理（F8 MVP）：Windows 的遠端升級、維護時段（推送的 `schedule`／`windows`）、雙人覆核（`rollouts:approve`、`KRS-E6106`）、外部 URL 的版本庫、自訂批次（多於兩批）在 0.10.0；`kairos releases` 的 CLI、SSE `rollout.host`與升級中主機的離線告警抑制尚未提供（REMOTE.md 第 13.1 節）。降版推送的 L3 確認不要求重新驗證密碼（設計包 §31.12 #7）。
 
 ### 測試
 

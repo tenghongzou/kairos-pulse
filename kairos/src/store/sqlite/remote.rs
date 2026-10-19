@@ -8,7 +8,7 @@ use super::conn::{AsConn, forward};
 use crate::remote::store::{
     ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate, HostConfigRow,
     HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow, RemoteStore,
-    RolloutHostRow, RolloutRow, UpgradeHost,
+    RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
 };
 
 /// schema v9（0.9.0〔草稿〕）：集中設定與 Pulse 遠端升級（商業審計 F8；`crates/kairos-proto/REMOTE.md`
@@ -130,6 +130,7 @@ CREATE TABLE rollouts (
     soak_until        INTEGER,
     awaiting_continue INTEGER NOT NULL DEFAULT 0,
     pause_reason      TEXT,
+    pause_cause       TEXT,
     cancel_reason     TEXT,
     created_at        INTEGER NOT NULL,
     created_by        TEXT NOT NULL,
@@ -224,6 +225,7 @@ impl<C: AsConn> RemoteStore for C {
         fn update_rollout_host(&self, rollout_id: &str, host_id: i64, t: &HostTransition, now_ms: i64) -> () => update_rollout_host;
         fn hosts_in_active_rollouts(&self) -> Vec<(String, String)> => hosts_in_active_rollouts;
         fn active_offers(&self) -> Vec<(String, String)> => active_offers;
+        fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
         fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
     }
 }
@@ -793,7 +795,7 @@ pub fn upgrade_host(conn: &Connection, agent_id: &str) -> rusqlite::Result<Optio
 const ROLLOUT_COLUMNS: &str = "r.rollout_id, r.name, r.release_id, r.target_version, r.selector, r.waves, \
      r.schedule, r.options, r.state, r.current_wave, r.wave_started_at, r.soak_until, \
      r.awaiting_continue, r.pause_reason, r.cancel_reason, r.created_at, r.created_by, r.started_at, \
-     r.completed_at, r.updated_at";
+     r.completed_at, r.updated_at, r.pause_cause";
 
 fn rollout_of(r: &Row<'_>) -> rusqlite::Result<RolloutRow> {
     Ok(RolloutRow {
@@ -811,6 +813,7 @@ fn rollout_of(r: &Row<'_>) -> rusqlite::Result<RolloutRow> {
         soak_until: r.get(11)?,
         awaiting_continue: r.get::<_, i64>(12)? != 0,
         pause_reason: r.get(13)?,
+        pause_cause: r.get(20)?,
         cancel_reason: r.get(14)?,
         created_at: r.get(15)?,
         created_by: r.get(16)?,
@@ -901,6 +904,7 @@ pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Resu
     conn.execute(
         "UPDATE rollouts SET state = ?2, current_wave = ?3, wave_started_at = ?4, soak_until = ?5,
             awaiting_continue = ?6, pause_reason = ?7, cancel_reason = ?8, started_at = ?9,
+            pause_cause = ?12,
             completed_at = ?10, updated_at = ?11
          WHERE rollout_id = ?1",
         params![
@@ -914,7 +918,8 @@ pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Resu
             r.cancel_reason,
             r.started_at,
             r.completed_at,
-            r.updated_at
+            r.updated_at,
+            r.pause_cause
         ],
     )?;
     Ok(())
@@ -1130,6 +1135,18 @@ pub fn active_offers(conn: &Connection) -> rusqlite::Result<Vec<(String, String)
          WHERE r.state = 'running' AND rh.state IN ('offered', 'accepted', 'staged')",
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+pub fn unacknowledged_rollback_failures(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<RollbackFailure>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, h.hostname, rh.rollout_id, rh.detail FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     rows.collect()
 }
 

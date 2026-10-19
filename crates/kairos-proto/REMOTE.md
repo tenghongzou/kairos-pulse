@@ -1058,7 +1058,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - 推送引擎每 5 秒（狀態改變時立即）每個推送一個交易：逾時（提議後 24＋1 小時仍未開始 → `expired`；`applying` 後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線 → `unknown`）、離線寬限（`skipped_offline`，重新連線時回到 `pending`）、失敗比例（持續檢查）、觀察期、人工繼續、完成。只對**連線中且協商了 `upgrade`** 的主機提議；連線中但沒有協商的主機記為 `skipped`（`not_ready`）。
 - **`server_lost`**：`applying` 的逾時判斷中，最後一次離線的原因是 Kairos 這端（`server_shutdown`、叢集的 `server_lost`）時，期限從 Kairos 這次啟動時重新起算，不把主機標為 `unknown`（主機連不上是因為 Kairos 的節點失聯或停機，不是卡在替換中）；`server_lost` 已在 0.9.0 的 `offline_reason` 列舉中（單機的 Kairos 不會產生）。Kairos 啟動後 1 分鐘內不提議新的主機（第 4.7.4 節第 5 項）。
 - 暫停時提議中、尚未替換的主機回到 `pending` 並在恢復時換新的 `upgrade_id`（Pulse 對舊的 id 收到 `upgrade_unavailable`，同一目標版本的暫存檔可以沿用）；取消時改為 `cancelled`；替換中的照常完成。重試同樣換新的 `upgrade_id`（`attempts` 加 1），`rollback_failed` 需要先 `acknowledge`。
-- 自動暫停：失敗比例、`rollback_failed`、簽章失敗（`PLS-E8401`；同一版本的其他推送也暫停），記 `rollout.auto_pause`（`KRS-W8414`）。**系統規則「升級推送已暫停」「升級回滾失敗」「發佈簽章驗證失敗」（告警事件）尚未接上告警引擎**：0.9 以稽核、WARN／ERROR 日誌（`rollout.auto_pause`、`rollout.rollback_failed`、`rollout.signature_failed`）與主控台的推送狀態呈現。
+- 自動暫停：失敗比例、`rollback_failed`、簽章失敗（`PLS-E8401`；同一版本的其他推送也暫停），記 `rollout.auto_pause`（`KRS-W8414`）。系統規則（`kairos/ALERTS.md`）：`sys.rollout_paused`「升級推送已暫停」（`KRS-W8414`，警告；原因為回滾失敗或簽章失敗時為嚴重）、`sys.upgrade_rollback_failed`「升級回滾失敗」（`KRS-E8408`，嚴重，對象為主機）、`sys.release_signature_failed`「發佈簽章驗證失敗」（`KRS-E8401`，嚴重，對象為目標版本）。遠端管理服務每一輪依資料庫調和（自動暫停的推送記 `rollouts.pause_cause`，手動暫停不開事件），以內部事件 `RemoteCondition` 發布改變的部分；推送繼續或取消、回滾失敗標記為已處理（或重試）時恢復，Kairos 重新啟動後重新發布。
 - 推送中主機的離線告警抑制（第 4.7.5 節）尚未實作。
 
 **版本庫**
@@ -1080,7 +1080,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
 | SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪）；`rollout.host` 未提供 |
 | CLI | `kairos releases import／list／delete` | 未提供（以 API） |
-| 告警 | 系統規則與離線告警抑制 | 未接上（見上） |
+| 告警 | 系統規則與離線告警抑制 | 三條系統規則已接上；升級中主機的離線告警抑制（第 4.7.5 節）未提供 |
 | `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選 |
 | 刪除主機資料 | — | 一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management` |
 

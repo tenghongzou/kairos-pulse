@@ -1114,10 +1114,50 @@ async fn rollback_failure_pauses_and_needs_acknowledgement_before_retry() {
         .await
         .unwrap_err();
     assert_eq!(e.code, "invalid_state");
+    // 告警的系統規則：自動暫停（回滾失敗，嚴重）與回滾失敗的主機
+    let mut bus = fx.registry.bus().subscribe();
+    fx.svc.reconcile_alerts().await;
+    let mut active = Vec::new();
+    while let Ok(ev) = bus.try_recv() {
+        if let crate::bus::EventKind::RemoteCondition {
+            rule,
+            subject,
+            active: a,
+            details,
+            ..
+        } = &ev.kind
+        {
+            assert!(*a);
+            active.push((*rule, subject.clone(), details.clone()));
+        }
+    }
+    active.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(active.len(), 2, "{active:?}");
+    assert_eq!(
+        (active[0].0, active[0].1.as_str()),
+        ("sys.rollout_paused", id.as_str())
+    );
+    assert_eq!(active[0].2["cause"], "rollback_failed");
+    assert_eq!(
+        (active[1].0, active[1].1.as_str()),
+        ("sys.upgrade_rollback_failed", A)
+    );
+    // 沒有改變：不重複發布
+    fx.svc.reconcile_alerts().await;
+    assert!(bus.try_recv().is_err());
     fx.svc
         .acknowledge_host(&who(), id.clone(), A.into(), Some("已在現場修復".into()))
         .await
         .unwrap();
+    fx.svc.resume_rollout(&who(), id.clone()).await.unwrap();
+    fx.svc.reconcile_alerts().await;
+    let mut cleared = 0;
+    while let Ok(ev) = bus.try_recv() {
+        if let crate::bus::EventKind::RemoteCondition { active: false, .. } = &ev.kind {
+            cleared += 1;
+        }
+    }
+    assert_eq!(cleared, 2, "標記處理、推送繼續後恢復");
     fx.svc
         .retry_host(&who(), id.clone(), A.into())
         .await
