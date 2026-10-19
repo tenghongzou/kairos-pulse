@@ -1124,7 +1124,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 15. **輔助程式寫 Pulse 可寫的目錄**（`result.json`）時，暫存檔以 `O_EXCL`＋`O_NOFOLLOW` 新建後改名，不會被服務帳號預先放好的符號連結導向其他檔案；刪除暫存與 `request.json` 不跟隨符號連結。
 16. **安裝方式與就緒狀態在每次連線前重新偵測**（放好信任錨、啟用 `pulse-upgrade.path` 後不必重新啟動 Pulse；`upgrade.enabled` 與信任錨的路徑只在啟動時讀取）；Windows 以「執行檔在 `%ProgramFiles%\Pulse`」判斷 `msi`（否則 `zip`），`install.upgrade` 一律 `unsupported`（0.10.0 改以登錄的 UpgradeCode 判斷）。
 17. **`pulse upgrade rollback --yes`** 只對 tar 安裝動作（換回 `pulse.prev`、`systemctl restart`）；deb／rpm 顯示套件管理員的回滾方式。
-18. `upgrade.trust_anchor_unavailable`（`PLS-E8403`）在啟動時記一則 `ERROR`，不另寫 stderr（大多數從 0.8 手動升級、還沒放信任錨的主機都會有，避免 journal 告警）。
+18. **`[remote_config]`、`[upgrade]` 以 `pulse.toml` 的值為準**（與輔助程式一致：信任錨的路徑、`extra_principals`、`allow_downgrade`、`health_timeout_secs`），`PULSE__REMOTE_CONFIG__ENABLED`、`PULSE__UPGRADE__ENABLED` 只能關閉（`pulse.toml` 與環境變數都不為 `false` 才算開啟），其他 `PULSE__UPGRADE__*` 不影響遠端升級。
+19. `upgrade.trust_anchor_unavailable`（`PLS-E8403`）在啟動時記一則 `ERROR`，不另寫 stderr（大多數從 0.8 手動升級、還沒放信任錨的主機都會有，避免 journal 告警）。
 
 ### 17.3 與規格的差異
 

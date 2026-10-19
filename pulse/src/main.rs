@@ -866,34 +866,39 @@ fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgm
         .map(|d| d.join(config_manager::LOCAL_CONFIG_FILE))
         .filter(|p| p.is_file());
     let state_dir = remote::state_dir();
+    // [remote_config]、[upgrade] 只能在 pulse.toml 設定（REMOTE.md 第 5.6 節）：特權輔助程式只讀 pulse.toml，
+    // Pulse 也以 pulse.toml 的值為準（信任錨、principal、降版、健康確認期限與輔助程式一致），
+    // PULSE__* 環境變數只能把 enabled 關閉
+    let file_only = local_file
+        .as_deref()
+        .and_then(|p| AppConfig::load_file_only(p).ok())
+        .unwrap_or_else(AppConfig::embedded_defaults);
+    let mut local = config.clone();
+    local.remote_config.enabled &= file_only.remote_config.enabled;
     let sources = remote::config::LocalSources::load(local_file.as_deref(), None);
     let central = remote::config::CentralConfig::new(
-        config.clone(),
+        local,
         sources,
         Some(state_dir.join(remote::config::CACHE_RELATIVE)),
     );
-    // upgrade.enabled：pulse.toml 與環境變數都不為 false 才算開啟（輔助程式只讀 pulse.toml）
-    let file_enabled = local_file
-        .as_deref()
-        .and_then(|p| AppConfig::load_file_only(p).ok())
-        .is_none_or(|c| c.upgrade.enabled);
-    let enabled = config.upgrade.enabled && file_enabled;
+    let upgrade = &file_only.upgrade;
+    let enabled = config.upgrade.enabled && upgrade.enabled;
     let detection = remote::install::detect(
         enabled,
-        &config.upgrade.allowed_signers_path(),
+        &upgrade.allowed_signers_path(),
         &remote::install::Probe::system(),
     );
     // 每次連線前重新偵測（放好信任錨、啟用 pulse-upgrade.path 後不必重新啟動）。設定只在啟動時讀取，
     // 以 OnceLock 交給函式指標
     static DETECT_INPUT: std::sync::OnceLock<(bool, PathBuf)> = std::sync::OnceLock::new();
-    let _ = DETECT_INPUT.set((enabled, config.upgrade.allowed_signers_path()));
+    let _ = DETECT_INPUT.set((enabled, upgrade.allowed_signers_path()));
     fn redetect() -> remote::install::Detection {
         let (enabled, anchor) = DETECT_INPUT.get().cloned().unwrap_or_default();
         remote::install::detect(enabled, &anchor, &remote::install::Probe::system())
     }
     info!(
         "遠端管理：集中設定{}；遠端升級 install.method={} install.upgrade={}",
-        if config.remote_config.enabled {
+        if central.enabled() {
             "啟用"
         } else {
             "本機停用"
@@ -906,9 +911,9 @@ fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgm
         detection,
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        extra_principals: config.upgrade.extra_principals.clone(),
-        allow_downgrade: config.upgrade.allow_downgrade,
-        health_timeout_secs: config.upgrade.health_timeout_secs,
+        extra_principals: upgrade.extra_principals.clone(),
+        allow_downgrade: upgrade.allow_downgrade,
+        health_timeout_secs: upgrade.health_timeout_secs,
         require_root_owner: true,
         free_space: remote::upgrade::free_space,
         redetect: Some(redetect),

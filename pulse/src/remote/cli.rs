@@ -324,13 +324,14 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
             return 3;
         }
     };
-    let file_enabled = file
+    // 與服務相同：[upgrade] 以 pulse.toml 為準，環境變數只能關閉
+    let file_only = file
         .as_deref()
         .and_then(|p| AppConfig::load_file_only(p).ok())
-        .is_none_or(|c| c.upgrade.enabled);
-    let anchor = local.upgrade.allowed_signers_path();
+        .unwrap_or_else(AppConfig::embedded_defaults);
+    let anchor = file_only.upgrade.allowed_signers_path();
     let d = super::install::detect(
-        local.upgrade.enabled && file_enabled,
+        local.upgrade.enabled && file_only.upgrade.enabled,
         &anchor,
         &super::install::Probe::system(),
     );
