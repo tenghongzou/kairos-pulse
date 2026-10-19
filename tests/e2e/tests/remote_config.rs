@@ -1,6 +1,6 @@
 //! 端對端：集中設定（feature `config`；crates/kairos-proto/REMOTE.md 第 3 節、PROTOCOL.md「遠端管理」）的
-//! Pulse 端。Kairos 端（K1）由另一條開發線實作，這裡以測試內的假 Kairos（rustls、mTLS 埠的行為只做到
-//! 集中設定需要的部分）驗證**實際的 pulse 執行檔**：
+//! Pulse 端。這裡以測試內的假 Kairos（rustls、mTLS 埠的行為只做到集中設定需要的部分，可以模擬停機與
+//! 不支援 `config` 的舊版 Kairos）驗證**實際的 pulse 執行檔**；與實際的 Kairos 互通見 `remote_interop.rs`：
 //!
 //! - hello 帶 `install`、宣告 `config`；`pending.config_rev` → `config_get` → `config` → `config_status`
 //!   （`applied`、本機覆蓋的鍵列在 `overridden`、`PLS-I0503`）

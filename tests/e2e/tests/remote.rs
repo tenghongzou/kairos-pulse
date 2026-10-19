@@ -2,7 +2,8 @@
 //!
 //! 實際的 Kairos 執行檔（SQLite、mTLS、`[remote] allowed_signers` 為 `kairos-proto` 的測試向量金鑰），
 //! 以主控台 API 建立設定檔與指派、匯入測試向量的發佈（`ssh-keygen -Y sign` 產生的真實簽章）並上傳發佈檔、
-//! 建立並送出推送；Pulse 端以 [`RawClient`] 模擬 0.9.0 的 Pulse（P1／P2 在另一條線）：協商 `config`、
+//! 建立並送出推送；Pulse 端以 [`RawClient`] 模擬 0.9.0 的 Pulse（升級流程需要 root 與 systemd，實際的 Pulse
+//! 無法在這裡替換自己；實際兩端的集中設定互通見 `remote_interop.rs`）：協商 `config`、
 //! `upgrade`，依 `pending` 取得設定、提議並經 8443 分段下載，回報升級的各個狀態，替換後以新版本重新連線
 //! 回報成功，推送完成。
 
