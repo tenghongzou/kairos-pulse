@@ -486,6 +486,37 @@ fn crash_protection_rolls_back_after_two_starts_in_the_confirmation_period() {
 }
 
 #[test]
+fn restart_before_confirmation_is_confirmed_by_the_next_hello_ack_and_kairos_downtime_does_not_roll_back()
+ {
+    let dir = tmp("restart-confirm");
+    let c = central(&dir, defaults(), LocalSources::default());
+    assert!(
+        c.apply(&remote(1, json!({"log": {"level": "warn"}})))
+            .accepted_message
+    );
+    drop(c);
+    // 重新啟動（確認前）：Kairos 停機，連線一直失敗也不回復
+    let c = central(&dir, defaults(), LocalSources::default());
+    assert!(c.confirming());
+    for _ in 0..5 {
+        assert!(!c.on_connect_failed());
+    }
+    assert_eq!(c.effective().log.level, "warn");
+    // 連上後確認，pending_apply 清除：之後再重新啟動兩次也不會回復
+    c.on_registered(true, Some(&pending(1)));
+    assert!(!c.confirming());
+    let cache = CacheFile::load(&dir.join(CACHE_RELATIVE)).unwrap().unwrap();
+    assert_eq!(cache.pending_apply, None);
+    assert_eq!(cache.last_known_good.unwrap().rev, 1);
+    drop(c);
+    drop(central(&dir, defaults(), LocalSources::default()));
+    let c = central(&dir, defaults(), LocalSources::default());
+    assert_eq!(c.effective().log.level, "warn");
+    assert_eq!(c.applied_rev(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn disabled_locally_reports_once_and_ignores_the_cache() {
     let dir = tmp("disabled");
     let c = central(&dir, defaults(), LocalSources::default());

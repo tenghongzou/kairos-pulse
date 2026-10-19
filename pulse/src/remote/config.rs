@@ -450,6 +450,9 @@ struct Confirm {
     /// 需要一次成功的 `hello_ack`（需要重新連線的鍵，或即時套用後斷線了）
     needs_hello_ack: bool,
     failures: u32,
+    /// 套用時是連線中的（在連線上收到 `config`）：確認前連續無法完成 `hello_ack` 才回復。重新啟動後
+    /// 接續的確認期（`pending_apply` 還在）不計：Kairos 可能剛好停機，崩潰由 `starts` 判斷
+    count_failures: bool,
 }
 
 /// [`CentralConfig::apply`] 的結果
@@ -614,6 +617,19 @@ impl CentralConfig {
             }
             if rolled_back_now || reenabled || inner.cache.pending_apply.is_some() {
                 Self::persist(&mut inner);
+            }
+            // 套用後尚未確認就重新啟動：第一次成功的 hello_ack 確認這一版（之後清除 pending_apply）
+            if inner.enabled
+                && let Some(p) = inner.cache.pending_apply
+                && inner.cache.applied.as_ref().is_some_and(|a| a.rev == p.rev)
+            {
+                inner.confirm = Some(Confirm {
+                    rev: p.rev,
+                    until: Instant::now(),
+                    needs_hello_ack: true,
+                    failures: 0,
+                    count_failures: false,
+                });
             }
             if let Some(a) = &inner.cache.applied
                 && inner.using_remote
@@ -1091,6 +1107,7 @@ impl CentralConfig {
                 until: Instant::now() + MIN_CONFIRM.max(hb.saturating_mul(3)),
                 needs_hello_ack: reconnect,
                 failures: 0,
+                count_failures: true,
             })
         };
         let ignored = inner.merged.ignored.clone();
@@ -1151,7 +1168,7 @@ impl CentralConfig {
     /// （生效的設定改變，呼叫端重建取樣與連線）
     pub fn on_connect_failed(&self) -> bool {
         let mut inner = self.lock();
-        let Some(c) = inner.confirm.as_mut() else {
+        let Some(c) = inner.confirm.as_mut().filter(|c| c.count_failures) else {
             return false;
         };
         c.needs_hello_ack = true;
