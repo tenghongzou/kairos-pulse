@@ -61,6 +61,8 @@ const RESULT_POLL: Duration = Duration::from_secs(5);
 const WINDOW_RECHECK: Duration = Duration::from_secs(60);
 /// 交付前向 Kairos 再確認提議（`upgrade_get`）被拒（推送已暫停或取消）後，同一條連線上多久再確認一次
 const RECONFIRM_RETRY: Duration = Duration::from_secs(600);
+/// 時段內但集中設定還在確認期時，多久再檢查一次
+const RECONFIRM_POLL: Duration = Duration::from_secs(5);
 /// `upgrade.download_failed` 的節流視窗（log-ux.md §4.6：10 分鐘）
 const DOWNLOAD_LOG_WINDOW: Duration = Duration::from_secs(600);
 /// 驗證過的發佈的簽章資料（回滾檔的信任來源）
@@ -593,13 +595,25 @@ impl UpgradeAgent {
             }
             cs.resync = false;
         }
+        let (id, filename, offset, length) = Self::next_chunk(&inner, cs)?;
+        cs.chunks.push((filename.clone(), offset, length));
+        drop(inner);
+        Some(Out::Chunk {
+            upgrade_id: id,
+            filename,
+            offset,
+            length,
+        })
+    }
+
+    /// 下載中的下一段請求（升級 ID、檔名、offset、length）；這個檔案的段落都已在途或下載完成時 `None`
+    fn next_chunk(inner: &Inner, cs: &ConnState) -> Option<(String, String, u64, u32)> {
         let c = inner.file.current.as_ref()?;
         if c.phase != Phase::Downloading {
             return None;
         }
-        let id = c.upgrade_id.clone();
-        let dir = Self::staging_dir(&inner, &id);
-        let file = c.files.iter().find(|f| !f.done)?.clone();
+        let dir = Self::staging_dir(inner, &c.upgrade_id);
+        let file = c.files.iter().find(|f| !f.done)?;
         let on_disk =
             std::fs::metadata(dir.join(format!("{}.part", file.name))).map_or(0, |m| m.len());
         let next = cs
@@ -614,18 +628,17 @@ impl UpgradeAgent {
         }
         let length = u32::try_from((file.size - next).min(u64::from(MAX_CHUNK_BYTES)))
             .unwrap_or(MAX_CHUNK_BYTES);
-        cs.chunks.push((file.name.clone(), next, length));
-        drop(inner);
-        Some(Out::Chunk {
-            upgrade_id: id,
-            filename: file.name,
-            offset: next,
-            length,
-        })
+        Some((c.upgrade_id.clone(), file.name.clone(), next, length))
     }
 
-    /// 下一次需要 [`UpgradeAgent::poll`]／[`UpgradeAgent::tick`] 的時間
-    pub fn next_wake(&self, cs: &ConnState, now: Instant) -> Option<Instant> {
+    /// 下一次需要 [`UpgradeAgent::poll`]／[`UpgradeAgent::tick`] 的時間（只在真的有事要做時是「現在」，
+    /// 避免連線迴圈空轉）。`config_confirming`：集中設定的確認期內（不交付）
+    pub fn next_wake(
+        &self,
+        cs: &ConnState,
+        now: Instant,
+        config_confirming: bool,
+    ) -> Option<Instant> {
         if !cs.negotiated {
             return None;
         }
@@ -646,15 +659,28 @@ impl UpgradeAgent {
         if let Some(c) = &inner.file.current {
             match c.phase {
                 Phase::Downloading => {
-                    if cs.chunks.len() < MAX_CHUNKS_IN_FLIGHT
-                        && !(cs.resync && !cs.chunks.is_empty())
-                    {
-                        at(cs.retry_until.unwrap_or(now));
+                    let blocked = cs.chunks.len() >= MAX_CHUNKS_IN_FLIGHT
+                        || (cs.resync && !cs.chunks.is_empty());
+                    let next = if cs.resync && cs.chunks.is_empty() {
+                        // 重新同步：從檔案長度重新請求
+                        let fresh = ConnState {
+                            negotiated: true,
+                            ..Default::default()
+                        };
+                        Self::next_chunk(&inner, &fresh)
+                    } else {
+                        Self::next_chunk(&inner, cs)
+                    };
+                    if !blocked && next.is_some() {
+                        at(cs.retry_until.unwrap_or(now).max(now));
                     }
                 }
                 Phase::Staged if c.offer.apply_window.contains(now_ms()) && !cs.reconfirmed => {
-                    // 時段內：再確認被拒後到 reconfirm_after 再試；在途時等回應
-                    if cs.get_in_flight.is_none() {
+                    if config_confirming {
+                        // 集中設定的確認期內不交付：定期再看
+                        at(now + RECONFIRM_POLL);
+                    } else if cs.get_in_flight.is_none() {
+                        // 時段內：再確認被拒後到 reconfirm_after 再試；在途時等回應
                         at(cs.reconfirm_after.unwrap_or(now).max(now));
                     }
                 }
@@ -670,7 +696,7 @@ impl UpgradeAgent {
                     at(now + target.min(WINDOW_RECHECK));
                 }
                 Phase::Handoff => {
-                    at(cs.handoff_since.map_or(now, |s| s + HANDOFF_ACK_WAIT));
+                    at(cs.handoff_since.unwrap_or(now) + HANDOFF_ACK_WAIT);
                 }
                 Phase::Applying => at(cs.next_result_poll.unwrap_or(now)),
             }
@@ -712,10 +738,8 @@ impl UpgradeAgent {
                 }
             }
             Phase::Handoff => {
-                if cs
-                    .handoff_since
-                    .is_some_and(|s| now >= s + HANDOFF_ACK_WAIT)
-                {
+                let since = *cs.handoff_since.get_or_insert(now);
+                if now >= since + HANDOFF_ACK_WAIT {
                     Self::write_request(&mut inner);
                     cs.next_result_poll = Some(now + RESULT_POLL);
                 }

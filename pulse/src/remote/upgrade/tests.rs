@@ -154,6 +154,11 @@ fn download_verify_stage_handoff_and_report_after_restart() {
     };
     assert_eq!((filename.as_str(), offset, length), (FILE, 0, 54));
     assert_eq!(agent.poll(&mut cs, Instant::now()), None, "檔案只剩這一段");
+    assert_eq!(
+        agent.next_wake(&cs, Instant::now(), false),
+        None,
+        "等回應時不空轉"
+    );
     agent.on_chunk(&mut cs, &chunk(0, TAR, true), (filename, offset, length));
     // 第一次驗證通過 → staged（附進度 100%）
     let sent = ack_all(&agent, &mut cs);
@@ -546,7 +551,7 @@ fn staged_upgrade_waits_for_the_window_and_the_config_confirmation_then_expires(
         Some("staged"),
         "時段還沒開始"
     );
-    let wake = agent.next_wake(&cs, Instant::now()).unwrap();
+    let wake = agent.next_wake(&cs, Instant::now(), false).unwrap();
     assert!(wake <= Instant::now() + Duration::from_secs(61));
     // 時段開始但集中設定還在確認期：不交付
     {
@@ -559,6 +564,11 @@ fn staged_upgrade_waits_for_the_window_and_the_config_confirmation_then_expires(
     }
     agent.tick(&mut cs, Instant::now(), true);
     assert_eq!(agent.view().phase.as_deref(), Some("staged"));
+    let now = Instant::now();
+    assert!(
+        agent.next_wake(&cs, now, true).unwrap() >= now + Duration::from_secs(5),
+        "確認期內不空轉"
+    );
     // 時段已過：expired，刪除暫存
     {
         let mut inner = agent.lock();
@@ -695,6 +705,6 @@ fn install_info_and_status_text_limits() {
     // 沒有協商 upgrade 的連線：什麼都不做
     let mut cs = agent.on_registered(false, Some(&pending(ID)));
     assert_eq!(agent.poll(&mut cs, Instant::now()), None);
-    assert_eq!(agent.next_wake(&cs, Instant::now()), None);
+    assert_eq!(agent.next_wake(&cs, Instant::now(), false), None);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -81,7 +81,7 @@ impl MgmtConn {
         let now = Instant::now();
         let mut t: Option<Instant> = None;
         let mut at = |x: Instant| t = Some(t.map_or(x, |y| y.min(x)));
-        if (self.send_status || self.fetch) && !self.fetch_in_flight && self.session.config {
+        if self.session.config && (self.send_status || (self.fetch && !self.fetch_in_flight)) {
             at(now);
         }
         if self.session.config
@@ -89,7 +89,11 @@ impl MgmtConn {
         {
             at(d);
         }
-        if let Some(u) = self.mgmt.upgrade.next_wake(&self.upgrade, now) {
+        if let Some(u) =
+            self.mgmt
+                .upgrade
+                .next_wake(&self.upgrade, now, self.mgmt.config.confirming())
+        {
             at(u);
         }
         t
