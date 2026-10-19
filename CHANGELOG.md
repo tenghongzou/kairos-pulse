@@ -115,6 +115,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **`pulse enroll`**：送出申請之前（`server-info`、`token-check`）收到 429／503 時依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 等候後重試（合計不超過 `--wait`，沒有指定時 600 秒；互動時顯示倒數，Ctrl+C 取消）。0.8 直接結束（結束代碼 6）。
 - **`pulse-install.sh --ca-file <根 CA>`**：以 Kairos 的根 CA 驗證下載端點的 HTTPS（完整性仍以發佈公鑰驗證）。
 
+### 主控台（設計包 `decisions/INTEGRATION.md` §31）
+
+- 主機的最後中斷原因新增 `server_lost`「Kairos 節點失聯」（0.9.0 的單機 Kairos 不會產生）；不認得的 `offline_reason` 一律顯示「其他原因」，原始值在技術細節。Webhook 等接收端也應忽略不認得的值。
+- SSE `resync` 依原因顯示 Banner（重新啟動、切換節點〔0.10〕、離線太久），主機清單、總覽與告警事件自動重新載入。
+- S21 指標轉出卡片、S05 刪除主機資料與假名化說明、S12 下載目錄不完整（只對管理員）、S14 匯入憑證的文案依 §31 定案；`error-codes.js` 依設計包重新產生（Kairos 152 個代碼）。
+
 ### 其他變更
 
 - `kairos db backup --include-keys` 一併加密備份 `data/privacy.key`。
