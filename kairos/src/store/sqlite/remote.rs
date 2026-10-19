@@ -572,14 +572,15 @@ pub fn record_config_status(
     conn: &Connection,
     r: &ConfigReport,
 ) -> rusqlite::Result<(Option<String>, usize)> {
-    let before: Option<(i64, Option<String>, Option<String>)> = conn
+    let before: Option<(i64, i64, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT applied_rev, state, overridden FROM host_config WHERE agent_id = ?1",
+            "SELECT applied_rev, desired_rev, state, overridden FROM host_config WHERE agent_id = ?1",
             [&r.agent_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let (applied_rev, prev_state, prev_overridden) = before.unwrap_or((0, None, None));
+    let (applied_rev, desired_rev, prev_state, prev_overridden) =
+        before.unwrap_or((0, 0, None, None));
     let prev_count = prev_overridden
         .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
         .map_or(0, |v| v.len());
@@ -587,7 +588,9 @@ pub fn record_config_status(
         "INSERT INTO host_config (agent_id) VALUES (?1) ON CONFLICT (agent_id) DO NOTHING",
         [&r.agent_id],
     )?;
-    if r.rev < applied_rev {
+    // 比已記錄的舊、又不是目前的期望版本：晚到的回報，不倒退版本。期望設定回到第 0 版（刪除所有指派）時
+    // Pulse 回報的 rev 0 比已記錄的小，但就是目前的期望版本，照常記錄
+    if r.rev < applied_rev && r.rev != desired_rev {
         conn.execute(
             "UPDATE host_config SET effective = ?2, overridden = ?3, reported_at = ?4
              WHERE agent_id = ?1",

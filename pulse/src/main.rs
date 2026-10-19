@@ -1164,6 +1164,8 @@ async fn collect_live(
                 system_info::CollectOptions::from_config(&c),
             )
         };
+        // 狀態檔的 report_interval_ms 跟著實際的取樣間隔（啟動時已寫入本機設定的值）
+        local_status::record(|s| s.set_report_interval(interval));
         let collect = system_info::collect_periodically(interval, opts.clone(), tx.clone());
         tokio::pin!(collect);
         let restart = async {

@@ -148,7 +148,8 @@ impl RemoteService {
         ))
     }
 
-    /// `config_status`：記錄實際生效的值、本機覆蓋、忽略與錯誤（`rev` 比已記錄的舊時不倒退版本）
+    /// `config_status`：記錄實際生效的值、本機覆蓋、忽略與錯誤（`rev` 比已記錄的舊、又不是目前的期望版本時
+    /// 不倒退版本）
     pub async fn record_config_status(
         &self,
         agent_id: &str,

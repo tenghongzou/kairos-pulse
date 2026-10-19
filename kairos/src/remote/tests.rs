@@ -464,6 +464,22 @@ async fn config_status_does_not_move_the_applied_revision_backwards() {
         (row.applied_rev, row.state.as_deref()),
         (6, Some("rejected"))
     );
+    // 期望設定回到第 0 版（沒有任何設定）：rev 0 是目前的期望版本，雖然比已記錄的小也照常記錄
+    assert_eq!(fx.svc.desired_rev(A), 0);
+    fx.svc
+        .record_config_status(A, "web-01", &status(0, 5, "applied"))
+        .await
+        .unwrap();
+    let row = fx
+        .svc
+        .db
+        .read(|s| Ok(s.host_config(A)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (row.applied_rev, row.state.as_deref()),
+        (0, Some("applied"))
+    );
 }
 
 #[tokio::test]

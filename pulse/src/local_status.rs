@@ -419,6 +419,16 @@ impl State {
         self.changed = true;
     }
 
+    /// 取樣間隔（`report_interval_ms`）：集中設定即時改變 `report.interval` 時更新，`pulse status` 依它判斷
+    /// 回報是否停滯
+    pub fn set_report_interval(&mut self, interval: Duration) {
+        let ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        if self.file.report_interval_ms != ms {
+            self.file.report_interval_ms = ms;
+            self.changed = true;
+        }
+    }
+
     /// 以新的設定重建本機緩衝之前（集中設定改變了 `buffer.enabled`）：清除停用與錯誤的狀態
     pub fn buffer_reset(&mut self) {
         self.buffer_disabled = false;
@@ -1056,6 +1066,20 @@ mod tests {
             ),
             BufferSettings::default(),
         )
+    }
+
+    #[test]
+    fn report_interval_follows_live_changes() {
+        // 集中設定即時改變 report.interval：狀態檔的 report_interval_ms 跟著改（pulse status 依它判斷停滯）
+        let dir = temp_dir();
+        let t = tracker(&dir);
+        assert_eq!(t.snapshot().report_interval_ms, 5000);
+        t.update(|s| s.set_report_interval(Duration::from_secs(5)));
+        assert!(!t.lock().changed, "相同的值不算變化");
+        t.update(|s| s.set_report_interval(Duration::from_secs(30)));
+        assert!(t.lock().changed);
+        assert_eq!(t.snapshot().report_interval_ms, 30_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_dir() -> PathBuf {
