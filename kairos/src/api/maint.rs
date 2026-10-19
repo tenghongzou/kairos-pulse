@@ -19,6 +19,7 @@ use super::hosts::Status;
 use super::http::ts_ms;
 use super::overview;
 use super::tokens::{self, LOGGED_CREATED, LOGGED_REVOKED};
+use crate::store::prelude::*;
 
 const TICK: Duration = Duration::from_secs(1);
 const MINUTE_EVERY: u64 = 60;
@@ -61,7 +62,7 @@ async fn purge_sessions(ctx: &Arc<ApiContext>) {
     let now_ms = Utc::now().timestamp_millis();
     if let Err(e) = ctx
         .admin
-        .write(move |c| Ok(crate::users::store::purge_sessions(c, now_ms)?))
+        .write(move |c| Ok(c.purge_sessions(now_ms)?))
         .await
     {
         warn!("無法清除過期的工作階段紀錄（稍後重試）: {e}");

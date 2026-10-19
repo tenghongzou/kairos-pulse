@@ -31,23 +31,22 @@ const PW: &str = "correct horse battery";
 fn add_user(f: &Fixture, name: &str, roles: &[&str], must_change: bool) -> i64 {
     let conn = f.admin();
     let h = password::hash(PW, CHEAP).unwrap();
-    let id = us::create_user(
-        &conn,
-        &us::NewUser {
-            username: name,
-            source: us::SOURCE_LOCAL,
-            password_hash: Some(&h),
-            must_change_password: must_change,
-            ..us::NewUser::default()
-        },
-        "test",
-        Utc::now().timestamp_millis(),
-    )
-    .unwrap()
-    .unwrap();
+    let id = conn
+        .create_user(
+            &us::NewUser {
+                username: name,
+                source: us::SOURCE_LOCAL,
+                password_hash: Some(&h),
+                must_change_password: must_change,
+                ..us::NewUser::default()
+            },
+            "test",
+            Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .unwrap();
     for r in roles {
-        us::add_assignment(
-            &conn,
+        conn.add_assignment(
             us::SUBJECT_USER,
             &id.to_string(),
             &Assignment::parse(r).unwrap(),
@@ -314,8 +313,8 @@ async fn failed_logins_lock_without_revealing_whether_the_account_exists() {
     assert_eq!(r.json()["error"]["code"], "account_locked");
     // 管理員解除後可以登入
     let conn = f.admin();
-    let id = us::find_user(&conn, "alice").unwrap().unwrap().user_id;
-    us::unlock(&conn, id).unwrap();
+    let id = conn.find_user("alice").unwrap().unwrap().user_id;
+    conn.unlock(id).unwrap();
     assert_eq!(try_login(&f, "alice", PW).await.status, 200);
     // 同一來源失敗太多次（共 10 次）：來源被限速，正確的密碼也一樣
     for i in 0..4 {
@@ -1875,7 +1874,7 @@ async fn concurrent_guesses_are_bounded_by_the_source_budget() {
     assert!(statuses.contains(&429), "{statuses:?}");
     // 帳號在第 5 次失敗時已鎖定
     let conn = f.admin();
-    let u = us::find_user(&conn, "target").unwrap().unwrap();
+    let u = conn.find_user("target").unwrap().unwrap();
     assert!(u.locked(Utc::now().timestamp_millis()), "{u:?}");
     f.stop().await;
 }
@@ -1926,8 +1925,7 @@ async fn permissions_are_recomputed_for_long_lived_streams() {
     );
     // 降為群組範圍
     let conn = f.admin();
-    us::replace_assignments(
-        &conn,
+    conn.replace_assignments(
         us::SUBJECT_USER,
         &id.to_string(),
         &[Assignment::parse("viewer@group:Line3").unwrap()],
@@ -1940,13 +1938,13 @@ async fn permissions_are_recomputed_for_long_lived_streams() {
         Some(crate::rbac::HostAccess::Groups(vec!["line3".into()]))
     );
     // 移除所有角色、或結束工作階段：沒有主機的讀取權限
-    us::replace_assignments(&conn, us::SUBJECT_USER, &id.to_string(), &[], "t", 0).unwrap();
+    conn.replace_assignments(us::SUBJECT_USER, &id.to_string(), &[], "t", 0)
+        .unwrap();
     assert_eq!(
         auth.revalidate(&p, Utc::now()).await,
         Some(crate::rbac::HostAccess::None)
     );
-    us::replace_assignments(
-        &conn,
+    conn.replace_assignments(
         us::SUBJECT_USER,
         &id.to_string(),
         &[Assignment::parse("viewer").unwrap()],
@@ -1954,7 +1952,8 @@ async fn permissions_are_recomputed_for_long_lived_streams() {
         0,
     )
     .unwrap();
-    us::end_user_sessions(&conn, id, None, "test", "t", Utc::now().timestamp_millis()).unwrap();
+    conn.end_user_sessions(id, None, "test", "t", Utc::now().timestamp_millis())
+        .unwrap();
     assert_eq!(
         auth.revalidate(&p, Utc::now()).await,
         Some(crate::rbac::HostAccess::None)

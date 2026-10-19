@@ -16,6 +16,7 @@ use crate::config::{AppConfig, StorageBackend, take_config_arg};
 use crate::hosts_cli::{ascii_json, display_width, parse_duration, use_unicode};
 use crate::rbac::{LegacyScope, Role};
 use crate::storage::fmt_time;
+use crate::store::prelude::*;
 use crate::store::sqlite::{DB_FILE, SqliteOptions, open_admin};
 
 /// `kairos api-token --help`
@@ -664,32 +665,30 @@ pub fn execute(
                 GrantSpec::Legacy(s) => TokenGrant::Legacy(*s),
                 GrantSpec::Role(r) => TokenGrant::Role(*r),
                 GrantSpec::DefaultViewer => TokenGrant::Role(Role::Viewer),
-                GrantSpec::User { username, role } => {
-                    match crate::users::store::find_user(&conn, username) {
-                        Ok(Some(u)) if u.active() => TokenGrant::User {
-                            user_id: u.user_id,
-                            username: u.username,
-                            role: *role,
-                        },
-                        Ok(Some(_)) => {
-                            return fail(Failure::new(
-                                format!("使用者 {username} 已停用"),
-                                "停用的使用者不能擁有新的 API token",
-                                vec!["先以 kairos users enable 啟用，或改用 --role。".to_string()],
-                                EXIT_USAGE,
-                            ));
-                        }
-                        Ok(None) => {
-                            return fail(Failure::new(
-                                format!("找不到使用者 {username}"),
-                                "--user 必須是既有的帳號",
-                                vec!["以 kairos users list 確認帳號。".to_string()],
-                                EXIT_USAGE,
-                            ));
-                        }
-                        Err(e) => return fail(db_failure(e)),
+                GrantSpec::User { username, role } => match conn.find_user(username) {
+                    Ok(Some(u)) if u.active() => TokenGrant::User {
+                        user_id: u.user_id,
+                        username: u.username,
+                        role: *role,
+                    },
+                    Ok(Some(_)) => {
+                        return fail(Failure::new(
+                            format!("使用者 {username} 已停用"),
+                            "停用的使用者不能擁有新的 API token",
+                            vec!["先以 kairos users enable 啟用，或改用 --role。".to_string()],
+                            EXIT_USAGE,
+                        ));
                     }
-                }
+                    Ok(None) => {
+                        return fail(Failure::new(
+                            format!("找不到使用者 {username}"),
+                            "--user 必須是既有的帳號",
+                            vec!["以 kairos users list 確認帳號。".to_string()],
+                            EXIT_USAGE,
+                        ));
+                    }
+                    Err(e) => return fail(db_failure(e)),
+                },
             };
             let NewToken { token, row } =
                 match tokens::create_with(&conn, name, &grant, expires_at, Some(&by), None, now_ms)

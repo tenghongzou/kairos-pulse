@@ -75,8 +75,9 @@ impl Tx for Transaction<'_> {
 /// 把領域 trait 的方法轉呼叫到 SQLite 實作的函式：`fn 名稱(&self, 參數: 型別, …) -> 回傳 => 函式;`。
 /// 函式的第一個參數是 `&Connection`，回傳 `rusqlite::Result<回傳>`
 macro_rules! forward {
-    ($( fn $name:ident(&self $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty => $path:path; )*) => {
+    ($( $(#[$m:meta])* fn $name:ident(&self $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty => $path:path; )*) => {
         $(
+            $(#[$m])*
             fn $name(&self $(, $arg: $ty)*) -> $crate::store::db::StoreResult<$ret> {
                 Ok($path($crate::store::sqlite::conn::AsConn::conn(self) $(, $arg)*)?)
             }

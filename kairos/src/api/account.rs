@@ -33,6 +33,7 @@ use super::http::{
     ts_ms,
 };
 use crate::audit::Event;
+use crate::store::prelude::*;
 use crate::store::sqlite::conn::in_write_tx;
 use crate::users::ldap::DirError;
 use crate::users::password::{self, HashParams};
@@ -342,18 +343,21 @@ async fn login_local(
     now_ms: i64,
 ) -> Result<Primary, ApiError> {
     let name = username.to_string();
-    let (user, hash) =
-        ctx.pool
-            .read("使用者", move |c| {
-                let u = us::find_user(c, &name).map_err(super::db::query_failed("使用者"))?;
-                let h = match &u {
-                    Some(u) => us::password_hash(c, u.user_id)
-                        .map_err(super::db::query_failed("使用者"))?,
-                    None => None,
-                };
-                Ok((u, h))
-            })
-            .await?;
+    let (user, hash) = ctx
+        .pool
+        .read("使用者", move |c| {
+            let u = c
+                .find_user(&name)
+                .map_err(super::db::query_failed("使用者"))?;
+            let h = match &u {
+                Some(u) => c
+                    .password_hash(u.user_id)
+                    .map_err(super::db::query_failed("使用者"))?,
+                None => None,
+            };
+            Ok((u, h))
+        })
+        .await?;
     let lock_key = format!("local:{}", username.to_lowercase());
     if let Some(until) = locked_until(ctx, user.as_ref(), &lock_key, now_ms) {
         return Err(account_locked(until, now_ms));
@@ -409,7 +413,7 @@ async fn login_local(
                 // 只在密碼沒有同時被變更時取代（不讓舊密碼覆蓋剛變更的密碼）
                 let _ = ctx2
                     .admin
-                    .write(move |c| Ok(us::rehash_password(c, uid, &old, &phc)?))
+                    .write(move |c| Ok(c.rehash_password(uid, &old, &phc)?))
                     .await;
             }
         });
@@ -458,7 +462,7 @@ async fn login_failure(
             // 計數寫不進去時不能當作沒失敗（否則資料庫忙碌時可以不受鎖定限制地猜密碼）
             match ctx
                 .admin
-                .write(move |c| Ok(us::login_failed(c, uid, threshold, lock_ms, now_ms)?))
+                .write(move |c| Ok(c.login_failed(uid, threshold, lock_ms, now_ms)?))
                 .await
             {
                 Ok(l) => l,
@@ -530,7 +534,8 @@ async fn login_ldap(
     let existing = ctx
         .pool
         .read("使用者", move |c| {
-            us::find_user(c, &name).map_err(super::db::query_failed("使用者"))
+            c.find_user(&name)
+                .map_err(super::db::query_failed("使用者"))
         })
         .await?
         .filter(|u| u.source == SOURCE_LDAP);
@@ -559,8 +564,7 @@ async fn login_ldap(
             let id = ctx
                 .admin
                 .write(move |c| {
-                    Ok(us::upsert_ldap_user(
-                        c,
+                    Ok(c.upsert_ldap_user(
                         &dname,
                         &dn,
                         display.as_deref(),
@@ -574,7 +578,7 @@ async fn login_ldap(
                 Some(id) => {
                     ctx.pool
                         .read("使用者", move |c| {
-                            us::get_user(c, id).map_err(super::db::query_failed("使用者"))
+                            c.get_user(id).map_err(super::db::query_failed("使用者"))
                         })
                         .await?
                 }
@@ -741,8 +745,10 @@ async fn login_mfa_charged(
     let (user, state) = ctx
         .pool
         .read("使用者", move |c| {
-            let u = us::get_user(c, uid).map_err(super::db::query_failed("使用者"))?;
-            let s = us::totp_state(c, uid).map_err(super::db::query_failed("使用者"))?;
+            let u = c.get_user(uid).map_err(super::db::query_failed("使用者"))?;
+            let s = c
+                .totp_state(uid)
+                .map_err(super::db::query_failed("使用者"))?;
             Ok((u, s))
         })
         .await?;
@@ -774,7 +780,7 @@ async fn login_mfa_charged(
             match secret.and_then(|s| totp::verify(&s, &trimmed, now_ms / 1000, last)) {
                 Some(step) => ctx
                     .admin
-                    .write(move |c| Ok(us::use_totp_step(c, uid, step)?))
+                    .write(move |c| Ok(c.use_totp_step(uid, step)?))
                     .await
                     .map_err(storage_error)?,
                 None => false,
@@ -783,7 +789,7 @@ async fn login_mfa_charged(
             let h = key.recovery_hash(uid, &norm);
             used_recovery = true;
             ctx.admin
-                .write(move |c| Ok(us::use_recovery_code(c, uid, &h, now_ms)?))
+                .write(move |c| Ok(c.use_recovery_code(uid, &h, now_ms)?))
                 .await
                 .map_err(storage_error)?
         } else {
@@ -870,14 +876,13 @@ async fn create_session(
         .write(move |c| {
             in_write_tx(c, |c| {
                 // 雜湊與等待期間帳號可能已被鎖定、停用或刪除：在建立工作階段的交易中再確認一次
-                match us::get_user(c, uid)? {
+                match c.get_user(uid)? {
                     Some(u) if !u.active() => return Ok(Err(None)),
                     Some(u) if u.locked(now_ms) => return Ok(Err(u.locked_until)),
                     None => return Ok(Err(None)),
                     Some(_) => {}
                 }
-                us::create_session(
-                    c,
+                c.create_session(
                     &NewSession {
                         session_hash: &hash,
                         public_id: &pid,
@@ -891,9 +896,9 @@ async fn create_session(
                     },
                     now_ms,
                 )?;
-                us::login_succeeded(c, uid, &ipt, now_ms)?;
+                c.login_succeeded(uid, &ipt, now_ms)?;
                 ev.append(c, now_ms)?;
-                Ok(Ok(us::get_user(c, uid)?))
+                Ok(Ok(c.get_user(uid)?))
             })
         })
         .await
@@ -948,7 +953,7 @@ pub async fn logout(
     ctx.admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                if us::end_session(c, &hash, "logout", &actor, now_ms)? {
+                if c.end_session(&hash, "logout", &actor, now_ms)? {
                     ev.append(c, now_ms)?;
                 }
                 Ok(())
@@ -1016,7 +1021,8 @@ async fn my_sessions(
     let list = ctx
         .pool
         .read("工作階段", move |c| {
-            us::user_sessions(c, uid, true, now_ms).map_err(super::db::query_failed("工作階段"))
+            c.user_sessions(uid, true, now_ms)
+                .map_err(super::db::query_failed("工作階段"))
         })
         .await?;
     Ok(http::ok(
@@ -1050,8 +1056,7 @@ async fn revoke_others(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                let n =
-                    us::end_user_sessions(c, uid, Some(&hash), "revoked_by_user", &actor, now_ms)?;
+                let n = c.end_user_sessions(uid, Some(&hash), "revoked_by_user", &actor, now_ms)?;
                 ev.details = Some(json!({ "ended": n, "kept_current": true }));
                 ev.append(c, now_ms)?;
                 Ok(n)
@@ -1090,7 +1095,7 @@ async fn revoke_one(
         .write(move |c| {
             in_write_tx(c, |c| {
                 let ended =
-                    us::end_session_by_public_id(c, uid, &sid, "revoked_by_user", &actor, now_ms)?;
+                    c.end_session_by_public_id(uid, &sid, "revoked_by_user", &actor, now_ms)?;
                 if ended {
                     ev.append(c, now_ms)?;
                 }
@@ -1126,8 +1131,10 @@ async fn verify_current_password(
     let (user, hash) = ctx
         .pool
         .read("使用者", move |c| {
-            let u = us::get_user(c, uid).map_err(super::db::query_failed("使用者"))?;
-            let h = us::password_hash(c, uid).map_err(super::db::query_failed("使用者"))?;
+            let u = c.get_user(uid).map_err(super::db::query_failed("使用者"))?;
+            let h = c
+                .password_hash(uid)
+                .map_err(super::db::query_failed("使用者"))?;
             Ok((u, h))
         })
         .await?;
@@ -1226,9 +1233,9 @@ async fn change_password(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                us::set_password(c, uid, &phc, false, now_ms)?;
+                c.set_password(uid, &phc, false, now_ms)?;
                 let n =
-                    us::end_user_sessions(c, uid, Some(&hash), "password_changed", &actor, now_ms)?;
+                    c.end_user_sessions(uid, Some(&hash), "password_changed", &actor, now_ms)?;
                 ev.details = Some(json!({ "other_sessions_ended": n }));
                 ev.append(c, now_ms)?;
                 Ok(n)
@@ -1253,7 +1260,7 @@ async fn second_factor_ok(
     let state = ctx
         .pool
         .read("使用者", move |c| {
-            us::totp_state(c, uid).map_err(super::db::query_failed("使用者"))
+            c.totp_state(uid).map_err(super::db::query_failed("使用者"))
         })
         .await?;
     let trimmed = code.trim().replace([' ', '-'], "");
@@ -1266,7 +1273,7 @@ async fn second_factor_ok(
         match secret.and_then(|s| totp::verify(&s, &trimmed, now_ms / 1000, last)) {
             Some(step) => ctx
                 .admin
-                .write(move |c| Ok(us::use_totp_step(c, uid, step)?))
+                .write(move |c| Ok(c.use_totp_step(uid, step)?))
                 .await
                 .map_err(storage_error),
             None => Ok(false),
@@ -1274,7 +1281,7 @@ async fn second_factor_ok(
     } else if let Some(norm) = totp::normalize_recovery(code) {
         let h = key.recovery_hash(uid, &norm);
         ctx.admin
-            .write(move |c| Ok(us::use_recovery_code(c, uid, &h, now_ms)?))
+            .write(move |c| Ok(c.use_recovery_code(uid, &h, now_ms)?))
             .await
             .map_err(storage_error)
     } else {
@@ -1313,7 +1320,7 @@ async fn totp_action(
                 .seal(&secret, uid.to_string().as_bytes())
                 .map_err(|_| ApiError::internal())?;
             ctx.admin
-                .write(move |c| Ok(us::set_totp_pending(c, uid, &sealed)?))
+                .write(move |c| Ok(c.set_totp_pending(uid, &sealed)?))
                 .await
                 .map_err(storage_error)?;
             let b32 = totp::base32(&secret);
@@ -1332,7 +1339,7 @@ async fn totp_action(
             let state = ctx
                 .pool
                 .read("使用者", move |c| {
-                    us::totp_state(c, uid).map_err(super::db::query_failed("使用者"))
+                    c.totp_state(uid).map_err(super::db::query_failed("使用者"))
                 })
                 .await?;
             let pending = state
@@ -1360,7 +1367,7 @@ async fn totp_action(
                 .admin
                 .write(move |c| {
                     in_write_tx(c, |c| {
-                        let ok = us::enable_totp(c, uid, step, &hashes, now_ms)?;
+                        let ok = c.enable_totp(uid, step, &hashes, now_ms)?;
                         if ok {
                             ev.append(c, now_ms)?;
                         }
@@ -1402,7 +1409,7 @@ async fn totp_action(
                 .admin
                 .write(move |c| {
                     in_write_tx(c, |c| {
-                        let was = us::clear_totp(c, uid, now_ms)?;
+                        let was = c.clear_totp(uid, now_ms)?;
                         if was {
                             ev.append(c, now_ms)?;
                         }
