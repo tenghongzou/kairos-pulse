@@ -419,6 +419,13 @@ impl State {
         self.changed = true;
     }
 
+    /// 以新的設定重建本機緩衝之前（集中設定改變了 `buffer.enabled`）：清除停用與錯誤的狀態
+    pub fn buffer_reset(&mut self) {
+        self.buffer_disabled = false;
+        self.buffer_error = None;
+        self.changed = true;
+    }
+
     /// 記下 agent_id 與主機名稱。未啟用 mTLS 時 agent_id 就是身分憑據（README「agent.id」），
     /// 而狀態檔所有人可讀：不寫入狀態檔，其他欄位中出現的 agent_id 也換成 `<agent_id>`
     /// （呼叫前須已呼叫 [`State::set_client_cert`]）
@@ -714,6 +721,12 @@ impl Tracker {
     pub fn set_spool(&self, spool: Arc<SharedSpool>) {
         *self.spool.lock().unwrap_or_else(|e| e.into_inner()) = Some(spool);
         self.update(State::buffer_changed);
+    }
+
+    /// 不再使用目前的本機緩衝（重建取樣與連線之前）
+    pub fn clear_spool(&self) {
+        *self.spool.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.update(State::buffer_reset);
     }
 
     /// 狀態檔的 `management`（遠端管理）由 `f` 產生

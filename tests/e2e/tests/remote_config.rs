@@ -31,7 +31,8 @@ struct Behavior {
 }
 
 struct Shared {
-    behavior: Behavior,
+    /// 可在測試中途更換（新的設定版本由下一次心跳的 `pending` 帶出）
+    behavior: Mutex<Behavior>,
     /// 收到的訊息（收到的時間、內容）
     log: Mutex<Vec<(Instant, Value)>>,
     streams: Mutex<Vec<TcpStream>>,
@@ -114,9 +115,10 @@ fn serve(stream: TcpStream, cfg: Arc<rustls::ServerConfig>, shared: Arc<Shared>)
     let conn = rustls::ServerConnection::new(cfg).unwrap();
     let mut tls = rustls::StreamOwned::new(conn, stream);
     let mut buf = Vec::new();
-    let config = shared.behavior.features.contains(&"config");
-    let pending = json!({"config_rev": shared.behavior.rev});
     while let Some(line) = read_line(&mut tls, &mut buf) {
+        let behavior = shared.behavior.lock().unwrap().clone();
+        let config = behavior.features.contains(&"config");
+        let pending = json!({"config_rev": behavior.rev});
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -128,7 +130,7 @@ fn serve(stream: TcpStream, cfg: Arc<rustls::ServerConfig>, shared: Arc<Shared>)
         let reply = match v["type"].as_str().unwrap_or("") {
             "hello" => {
                 let mut ack = json!({"type":"hello_ack","seq":seq,"proto":2,"offline_after_ms":5000,
-                    "features":shared.behavior.features,"server_time":now_ts()});
+                    "features":behavior.features,"server_time":now_ts()});
                 if config {
                     ack["pending"] = pending.clone();
                 }
@@ -138,8 +140,8 @@ fn serve(stream: TcpStream, cfg: Arc<rustls::ServerConfig>, shared: Arc<Shared>)
             "config_get" => serde_json::to_value(kairos_proto::ServerMsg::Config(Box::new(
                 kairos_proto::RemoteConfig::new(
                     seq.as_u64().unwrap(),
-                    shared.behavior.rev,
-                    shared.behavior.settings.as_object().unwrap().clone(),
+                    behavior.rev,
+                    behavior.settings.as_object().unwrap().clone(),
                     None,
                     now_ts(),
                 ),
@@ -165,7 +167,7 @@ impl FakeKairos {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let shared = Arc::new(Shared {
-            behavior,
+            behavior: Mutex::new(behavior),
             log: Mutex::new(Vec::new()),
             streams: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
@@ -200,6 +202,11 @@ impl FakeKairos {
             .filter(|(_, v)| v["type"] == kind)
             .cloned()
             .collect()
+    }
+
+    /// 更換行為（新的設定版本）
+    fn set(&self, behavior: Behavior) {
+        *self.shared.behavior.lock().unwrap() = behavior;
     }
 
     /// 停機：不再接受連線，已建立的連線一併關閉
@@ -392,5 +399,90 @@ fn kairos_without_config_does_not_use_the_cache() {
         "沒有協商 config 時不送遠端管理的訊息"
     );
     assert!(state.join("remote/config.json").is_file(), "快取保留");
+    p.stop();
+}
+
+#[test]
+fn reconnect_keys_rebuild_sampling_buffer_and_connection() {
+    let root = TestDir::new("remote-config-rebuild");
+    let port = free_port();
+    let pulse = Pulse::new(&root, "pulse", port, GOOD);
+    // 本機沒有 [heartbeat]、[report]：下發的值生效
+    let toml_path = pulse.dir.join("pulse.toml");
+    let toml = std::fs::read_to_string(&toml_path)
+        .unwrap()
+        .replace("[heartbeat]\ninterval = 1\n", "")
+        .replace("[report]\ninterval = 1\n", "");
+    std::fs::write(&toml_path, toml).unwrap();
+    let state = pulse.dir.join("state");
+    let envs = [("STATE_DIRECTORY", state.to_str().unwrap())];
+    let rebuilt = |rev: u64, settings: Value| Behavior {
+        features: vec!["metrics", "durable", "config"],
+        rev,
+        settings,
+    };
+    // 第 8 版：heartbeat.interval = 2、buffer.enabled = false（都需要重新連線）
+    let kairos = FakeKairos::start(
+        port,
+        rebuilt(
+            8,
+            json!({"heartbeat": {"interval": 2}, "buffer": {"enabled": false}, "report": {"interval": 1}}),
+        ),
+    );
+    let mut p = pulse.start(&envs);
+    assert!(
+        poll_until(WAIT, || kairos.of("hello").len() >= 2),
+        "{}",
+        p.dump()
+    );
+    let hellos = kairos.of("hello");
+    let first = &hellos[0].1;
+    let second = &hellos[1].1;
+    let features = |h: &Value| -> Vec<String> {
+        h["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(first["heartbeat_interval_ms"], 15000);
+    assert!(features(first).contains(&"durable".to_string()));
+    assert_eq!(
+        second["heartbeat_interval_ms"], 2000,
+        "重新連線後以新的心跳間隔宣告：{second}"
+    );
+    assert!(
+        !features(second).contains(&"durable".to_string()),
+        "停用本機緩衝後不宣告 durable：{second}"
+    );
+    p.wait_for("以新的集中設定重建", WAIT);
+    // 重新連線後只回報、不重複取得
+    assert!(
+        poll_until(WAIT, || kairos.of("config_status").len() >= 3),
+        "{}",
+        p.dump()
+    );
+    assert_eq!(kairos.of("config_get").len(), 1);
+    // 第 9 版：重新啟用本機緩衝 → 再重建一次（同一個緩衝目錄關閉後重新開啟）
+    kairos.set(rebuilt(9, json!({"heartbeat": {"interval": 2}, "buffer": {"enabled": true}, "report": {"interval": 1}})));
+    assert!(
+        poll_until(WAIT, || kairos.of("hello").len() >= 3),
+        "{}",
+        p.dump()
+    );
+    let third = kairos.of("hello")[2].1.clone();
+    assert!(features(&third).contains(&"durable".to_string()), "{third}");
+    // durable 的 report 照常送達（boot_id 為重新開啟緩衝後的）
+    let after = kairos.of("hello")[2].0;
+    assert!(
+        poll_until(WAIT, || kairos
+            .of("report")
+            .iter()
+            .any(|(t, r)| *t > after && r["boot_id"].is_string())),
+        "{}",
+        p.dump()
+    );
+    assert_eq!(p.count("agent.fatal"), 0, "{}", p.dump());
     p.stop();
 }

@@ -942,6 +942,8 @@ async fn pipeline(
     background_pending: Option<Box<enroll::store::EnrollmentFile>>,
     start_in_grace: bool,
 ) -> Result<LoopEnd, Failure> {
+    // 重建時（集中設定改變了需要重新連線的鍵）：狀態檔不再顯示上一輪的本機緩衝
+    tracker.clear_spool();
     // 本機緩衝（A5）：開啟失敗時不中止監控，改為 at-most-once（不宣告 durable）並記 ERROR
     let shared_spool = if config.buffer.enabled {
         let settings = spool_settings(&config.buffer);
@@ -1096,32 +1098,42 @@ async fn pipeline(
         background_pending,
         start_in_grace,
     );
-    let result = tokio::select! {
-        res = net => res,
-        res = ingest_done => Err(match res {
+    // (結果, 收集 task 已結束, 緩衝寫入 task 已結束)
+    let (result, collector_done, ingest_finished) = tokio::select! {
+        res = net => (res, false, false),
+        res = ingest_done => (Err(match res {
             Ok(()) => "本機緩衝寫入任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("本機緩衝寫入任務發生 panic：{e}"),
             Err(e) => format!("本機緩衝寫入任務異常結束：{e}"),
         }
-        .into()),
+        .into()), false, true),
         // 收集 task 正常情況下不會結束；結束或 panic 時讓整個程式以非 0 結束，交由服務管理員重啟
-        res = &mut collector => Err(match res {
+        res = &mut collector => (Err(match res {
             Ok(()) => "系統資訊收集任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("系統資訊收集任務發生 panic：{e}"),
             Err(e) => format!("系統資訊收集任務異常結束：{e}"),
         }
-        .into()),
+        .into()), true, false),
     };
-    // 重建或結束：停止這一輪的工作
+    // 重建或結束：停止這一輪的工作，並等它們真的停下來——重建時會以同一個目錄重新開啟本機緩衝
+    // （緩衝不加鎖），舊的寫入 task 不能在新的緩衝開啟後還寫進同一個目錄
     collector.abort();
-    if let Some(task) = &ingest {
+    if !collector_done {
+        let _ = collector.await;
+    }
+    if let Some(task) = ingest {
         task.abort();
+        if !ingest_finished {
+            let _ = task.await;
+        }
     }
     if let Some(task) = spool_limits {
         task.abort();
+        let _ = task.await;
     }
     for task in inventory_tasks {
         task.abort();
+        let _ = task.await;
     }
     // 結束（或異常結束、重建）前 fsync 本機緩衝並記下送達位置，下次開啟從這裡接著送
     if let Some(shared) = &shared_spool {
