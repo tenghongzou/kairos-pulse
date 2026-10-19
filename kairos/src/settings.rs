@@ -378,7 +378,8 @@ fn flatten_values(prefix: &str, value: &Value, out: &mut BTreeMap<String, Value>
     }
 }
 
-/// 主控台覆寫的設定（`settings` 表）。SQLite 的實作在 `store/sqlite/enroll.rs`
+/// 主控台覆寫的設定（`settings` 表）與 `meta` 表的鍵值。SQLite 的實作在 `store/sqlite/enroll.rs`（`settings`）
+/// 與 `store/sqlite/alerts.rs`（`meta`）
 pub trait SettingsStore {
     /// `settings` 表的所有值：(鍵, JSON 值, 更新時間, 更新者)
     fn load_settings(&self) -> StoreResult<Vec<(String, Value, i64, String)>>;
@@ -388,6 +389,12 @@ pub trait SettingsStore {
 
     /// 刪除 `settings` 的鍵（改用設定檔的值）；回傳是否存在
     fn delete_setting(&self, key: &str) -> StoreResult<bool>;
+
+    /// `meta` 表的一個鍵（沒有時為 `None`）
+    fn get_meta(&self, key: &str) -> StoreResult<Option<String>>;
+
+    /// 寫入 `meta` 表的一個鍵
+    fn put_meta(&self, key: &str, value: &str) -> StoreResult<()>;
 }
 
 #[cfg(test)]

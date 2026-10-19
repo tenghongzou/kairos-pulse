@@ -65,6 +65,8 @@ impl<C: AsConn> SettingsStore for C {
         fn load_settings(&self) -> Vec<(String, Value, i64, String)> => load_settings;
         fn set_setting(&self, key: &str, value: &Value, by: &str, now_ms: i64) -> () => set_setting;
         fn delete_setting(&self, key: &str) -> bool => delete_setting;
+        fn get_meta(&self, key: &str) -> Option<String> => super::alerts::get_meta;
+        fn put_meta(&self, key: &str, value: &str) -> () => super::alerts::put_meta;
     }
 }
 

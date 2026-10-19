@@ -22,6 +22,7 @@
 
 use std::fmt;
 
+pub use crate::alerts::store::AlertStore;
 pub use crate::audit::AuditLog;
 pub use crate::enroll::store::EnrollStore;
 pub use crate::pki::store::PkiStore;
@@ -32,8 +33,8 @@ pub use crate::users::store::UserStore;
 #[allow(unused_imports)]
 pub mod prelude {
     pub use super::{
-        AuditLog, DbHandle, EnrollStore, PkiStore, SettingsStore, Store, StoreError, StoreResult,
-        Tx, TxMode, UserStore,
+        AlertStore, AuditLog, DbHandle, EnrollStore, PkiStore, SettingsStore, Store, StoreError,
+        StoreResult, Tx, TxMode, UserStore,
     };
 }
 
@@ -110,7 +111,9 @@ pub enum TxMode {
 }
 
 /// 一條連線或一個交易能做的所有領域操作
-pub trait Store: SettingsStore + AuditLog + UserStore + PkiStore + EnrollStore {
+pub trait Store:
+    SettingsStore + AuditLog + UserStore + PkiStore + EnrollStore + AlertStore
+{
     /// 開始一個交易。連線上已有交易時失敗（與 SQLite 的巢狀 `BEGIN` 相同）
     fn begin(&self, mode: TxMode) -> StoreResult<Box<dyn Tx + '_>>;
 

@@ -513,8 +513,8 @@ async fn list_alerts(c: &Ctx<'_>, q: &Query) -> Result<Response<ApiBody>, ApiErr
         .svc
         .db
         .read(move |conn| {
-            let (e, t) = store::list_events(conn, &filter)?;
-            Ok((e, t, store::counts(conn)?))
+            let (e, t) = conn.list_events(&filter)?;
+            Ok((e, t, conn.counts()?))
         })
         .await
         .map_err(db_error)?;
@@ -550,12 +550,7 @@ async fn summary(c: &Ctx<'_>) -> Result<Response<ApiBody>, ApiError> {
     let (counts, silences) = c
         .svc
         .db
-        .read(move |conn| {
-            Ok((
-                store::counts(conn)?,
-                store::list_silences(conn, "active", now, 1000)?,
-            ))
-        })
+        .read(move |conn| Ok((conn.counts()?, conn.list_silences("active", now, 1000)?)))
         .await
         .map_err(db_error)?;
     // 「目前有 2 個靜音規則生效，影響 301 台主機」：以主機為範圍的靜音涵蓋的主機（聯集）
@@ -580,18 +575,18 @@ async fn get_alert(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiError>
         .svc
         .db
         .read(move |conn| {
-            let Some(ev) = store::get_event(conn, &id)? else {
+            let Some(ev) = conn.get_event(&id)? else {
                 return Ok(None);
             };
-            let timeline = store::timeline(conn, &id, 500)?;
-            let (children, total) = store::children(conn, &id, 100)?;
+            let timeline = conn.timeline(&id, 500)?;
+            let (children, total) = conn.children(&id, 100)?;
             let parent = match &ev.parent_id {
-                Some(p) => store::get_event(conn, p)?,
+                Some(p) => conn.get_event(p)?,
                 None => None,
             };
-            let deliveries = store::deliveries_of_event(conn, &id, 100)?;
-            let channels = store::load_channels(conn, None)?;
-            let rule = store::get_rule(conn, &ev.rule_id)?;
+            let deliveries = conn.deliveries_of_event(&id, 100)?;
+            let channels = conn.load_channels(None)?;
+            let rule = conn.get_rule(&ev.rule_id)?;
             Ok(Some((
                 ev, timeline, children, total, parent, deliveries, channels, rule,
             )))
@@ -687,7 +682,7 @@ async fn alert_action(
     let ev = c
         .svc
         .db
-        .read(move |conn| Ok(store::get_event(conn, &id2)?))
+        .read(move |conn| Ok(conn.get_event(&id2)?))
         .await
         .map_err(db_error)?;
     Ok(http::ok(
@@ -709,20 +704,17 @@ async fn comment_resolved(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Value, 
         .svc
         .db
         .write(move |conn| {
-            if store::get_event(conn, &id)?.is_none() {
+            if conn.get_event(&id)?.is_none() {
                 return Ok(false);
             }
             let tx = conn.transaction()?;
-            store::insert_timeline(
-                &tx,
-                &[crate::alerts::engine::Timeline {
-                    event_id: id.clone(),
-                    at: now,
-                    actor,
-                    action: "commented",
-                    details: json!({ "text": text }),
-                }],
-            )?;
+            tx.insert_timeline(&[crate::alerts::engine::Timeline {
+                event_id: id.clone(),
+                at: now,
+                actor,
+                action: "commented",
+                details: json!({ "text": text }),
+            }])?;
             tx.commit()?;
             Ok(true)
         })
@@ -833,7 +825,7 @@ async fn list_rules(c: &Ctx<'_>, q: &Query) -> Result<Response<ApiBody>, ApiErro
     let (rules, stats) = c
         .svc
         .db
-        .read(move |conn| Ok((store::load_rules(conn)?, store::rule_stats(conn, since)?)))
+        .read(move |conn| Ok((conn.load_rules()?, conn.rule_stats(since)?)))
         .await
         .map_err(db_error)?;
     let kinds = q.list("kind");
@@ -861,12 +853,7 @@ async fn get_rule(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiError> 
     let (r, stats) = c
         .svc
         .db
-        .read(move |conn| {
-            Ok((
-                store::get_rule(conn, &id2)?,
-                store::rule_stats(conn, since)?,
-            ))
-        })
+        .read(move |conn| Ok((conn.get_rule(&id2)?, conn.rule_stats(since)?)))
         .await
         .map_err(db_error)?;
     let r = r.ok_or_else(|| {
@@ -994,7 +981,8 @@ async fn channel_ids(c: &Ctx<'_>) -> Result<Vec<String>, ApiError> {
     c.svc
         .db
         .read(|conn| {
-            Ok(store::load_channels(conn, None)?
+            Ok(conn
+                .load_channels(None)?
                 .into_iter()
                 .map(|ch| ch.channel_id)
                 .collect())
@@ -1050,7 +1038,7 @@ async fn create_rule(c: &Ctx<'_>, body: &Value) -> Result<Response<ApiBody>, Api
     let r2 = rule.clone();
     c.svc
         .db
-        .write(move |conn| Ok(store::save_rule(conn, &r2)?))
+        .write(move |conn| Ok(conn.save_rule(&r2)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -1068,7 +1056,7 @@ async fn load_rule(c: &Ctx<'_>, id: &str) -> Result<Rule, ApiError> {
     let id2 = id.to_string();
     c.svc
         .db
-        .read(move |conn| Ok(store::get_rule(conn, &id2)?))
+        .read(move |conn| Ok(conn.get_rule(&id2)?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -1151,7 +1139,7 @@ async fn update_rule(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Response<Api
     let r2 = rule.clone();
     c.svc
         .db
-        .write(move |conn| Ok(store::save_rule(conn, &r2)?))
+        .write(move |conn| Ok(conn.save_rule(&r2)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -1196,7 +1184,7 @@ async fn enable_rule(
     let r2 = rule.clone();
     c.svc
         .db
-        .write(move |conn| Ok(store::save_rule(conn, &r2)?))
+        .write(move |conn| Ok(conn.save_rule(&r2)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -1226,7 +1214,7 @@ async fn delete_rule(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiErro
     let id2 = id.to_string();
     c.svc
         .db
-        .write(move |conn| Ok(store::delete_rule(conn, &id2)?))
+        .write(move |conn| Ok(conn.delete_rule(&id2)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -1354,7 +1342,7 @@ async fn from_event(
     let ev = c
         .svc
         .db
-        .read(move |conn| Ok(store::get_event(conn, &id2)?))
+        .read(move |conn| Ok(conn.get_event(&id2)?))
         .await
         .map_err(db_error)?;
     ev.map(Some)
@@ -1375,7 +1363,7 @@ async fn list_silences(c: &Ctx<'_>, q: &Query) -> Result<Response<ApiBody>, ApiE
     let list = c
         .svc
         .db
-        .read(move |conn| Ok(store::list_silences(conn, &status, now, limit)?))
+        .read(move |conn| Ok(conn.list_silences(&status, now, limit)?))
         .await
         .map_err(db_error)?;
     let mut data = Vec::new();
@@ -1391,7 +1379,7 @@ async fn get_silence(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiErro
     let s = c
         .svc
         .db
-        .read(move |conn| Ok(store::get_silence(conn, &id2)?))
+        .read(move |conn| Ok(conn.get_silence(&id2)?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -1473,7 +1461,7 @@ async fn save_silence(
             let s = c
                 .svc
                 .db
-                .read(move |conn| Ok(store::get_silence(conn, &id2)?))
+                .read(move |conn| Ok(conn.get_silence(&id2)?))
                 .await
                 .map_err(db_error)?
                 .ok_or_else(|| {
@@ -1521,7 +1509,7 @@ async fn save_silence(
     let s2 = silence.clone();
     c.svc
         .db
-        .write(move |conn| Ok(store::save_silence(conn, &s2)?))
+        .write(move |conn| Ok(conn.save_silence(&s2)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -1560,7 +1548,7 @@ async fn end_silence(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Response<Api
     let mut s = c
         .svc
         .db
-        .read(move |conn| Ok(store::get_silence(conn, &id2)?))
+        .read(move |conn| Ok(conn.get_silence(&id2)?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -1585,7 +1573,7 @@ async fn end_silence(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Response<Api
     let s2 = s.clone();
     c.svc
         .db
-        .write(move |conn| Ok(store::save_silence(conn, &s2)?))
+        .write(move |conn| Ok(conn.save_silence(&s2)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -1848,12 +1836,7 @@ async fn list_channels(c: &Ctx<'_>) -> Result<Response<ApiBody>, ApiError> {
     let (channels, rules) = c
         .svc
         .db
-        .read(move |conn| {
-            Ok((
-                store::load_channels(conn, Some(sb.as_ref()))?,
-                store::load_rules(conn)?,
-            ))
-        })
+        .read(move |conn| Ok((conn.load_channels(Some(sb.as_ref()))?, conn.load_rules()?)))
         .await
         .map_err(db_error)?;
     let data: Vec<Value> = channels
@@ -1878,7 +1861,7 @@ async fn load_channel(c: &Ctx<'_>, id: &str) -> Result<Channel, ApiError> {
     let (sb, id2) = (c.svc.secrets.clone(), id.to_string());
     c.svc
         .db
-        .read(move |conn| Ok(store::get_channel(conn, &id2, Some(sb.as_ref()))?))
+        .read(move |conn| Ok(conn.get_channel(&id2, Some(sb.as_ref()))?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -1898,8 +1881,8 @@ async fn get_channel(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiErro
         .db
         .read(move |conn| {
             Ok((
-                store::deliveries_of_channel(conn, &id2, 20)?,
-                store::rules_using_channel(conn, &id2)?,
+                conn.deliveries_of_channel(&id2, 20)?,
+                conn.rules_using_channel(&id2)?,
             ))
         })
         .await
@@ -2017,7 +2000,7 @@ async fn save_channel(
     let ch2 = ch.clone();
     c.svc
         .db
-        .write(move |conn| Ok(store::save_channel(conn, &ch2, sealed)?))
+        .write(move |conn| Ok(conn.save_channel(&ch2, sealed)?))
         .await
         .map_err(db_error)?;
     c.svc.request_reload();
@@ -2052,7 +2035,7 @@ async fn delete_channel(
     let using = c
         .svc
         .db
-        .read(move |conn| Ok(store::rules_using_channel(conn, &id2)?))
+        .read(move |conn| Ok(conn.rules_using_channel(&id2)?))
         .await
         .map_err(db_error)?;
     // L2：輸入管道名稱確認；有規則使用時需指定替代管道或確認「這些規則將沒有通知對象」
@@ -2104,7 +2087,7 @@ async fn delete_channel(
         .db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            for mut r in store::load_rules(&tx)? {
+            for mut r in tx.load_rules()? {
                 let before = (r.channels.clone(), r.notify.escalate_channels.clone());
                 for list in [&mut r.channels, &mut r.notify.escalate_channels] {
                     let had = list.iter().any(|c| c == &id3);
@@ -2119,10 +2102,10 @@ async fn delete_channel(
                 if (r.channels.clone(), r.notify.escalate_channels.clone()) != before {
                     r.updated_at = now;
                     r.updated_by = actor.clone();
-                    store::save_rule(&tx, &r)?;
+                    tx.save_rule(&r)?;
                 }
             }
-            store::delete_channel(&tx, &id3)?;
+            tx.delete_channel(&id3)?;
             tx.commit()?;
             Ok(())
         })
@@ -2236,39 +2219,33 @@ async fn test_channel(
             .db
             .write(move |conn| {
                 let tx = conn.transaction()?;
-                let ids = store::insert_deliveries(
-                    &tx,
-                    &[crate::alerts::engine::NewDelivery {
+                let ids = tx.insert_deliveries(&[crate::alerts::engine::NewDelivery {
+                    event_id: None,
+                    channel_id: cid.clone(),
+                    kind: "test",
+                    urgent: false,
+                    payload: json!({ "kind": "test" }),
+                    group: None,
+                    created_at: now,
+                }])?;
+                for i in ids {
+                    tx.update_delivery(&store::Delivery {
+                        id: i,
                         event_id: None,
                         channel_id: cid.clone(),
-                        kind: "test",
+                        kind: "test".into(),
+                        state: if ok { "sent".into() } else { "failed".into() },
                         urgent: false,
-                        payload: json!({ "kind": "test" }),
-                        group: None,
+                        payload: Value::Null,
+                        attempts: 1,
                         created_at: now,
-                    }],
-                )?;
-                for i in ids {
-                    store::update_delivery(
-                        &tx,
-                        &store::Delivery {
-                            id: i,
-                            event_id: None,
-                            channel_id: cid.clone(),
-                            kind: "test".into(),
-                            state: if ok { "sent".into() } else { "failed".into() },
-                            urgent: false,
-                            payload: Value::Null,
-                            attempts: 1,
-                            created_at: now,
-                            next_attempt_at: now,
-                            sent_at: ok.then_some(now),
-                            batch_id: None,
-                            response_code: rc.map(i64::from),
-                            error_code: code.map(str::to_string),
-                            error: (!ok).then_some(msg.clone()),
-                        },
-                    )?;
+                        next_attempt_at: now,
+                        sent_at: ok.then_some(now),
+                        batch_id: None,
+                        response_code: rc.map(i64::from),
+                        error_code: code.map(str::to_string),
+                        error: (!ok).then_some(msg.clone()),
+                    })?;
                 }
                 tx.commit()?;
                 Ok(())

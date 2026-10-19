@@ -41,6 +41,7 @@ use crate::storage::{Clock, RecordBody, ReportRecord, WriteStatus};
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
 
+pub(crate) mod alerts;
 pub(crate) mod audit;
 pub(crate) mod conn;
 pub(crate) mod enroll;

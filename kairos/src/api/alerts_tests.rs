@@ -605,19 +605,18 @@ async fn alerts_end_to_end_over_https() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
 
     // CLI 的動作（kairos alerts comment）：由執行中的 Kairos 處理，同樣寫入稽核雜湊鏈
-    let qid = crate::alerts::store::enqueue_action(
-        &f.admin(),
-        chrono::Utc::now().timestamp_millis(),
-        "ops",
-        &event_id,
-        "comment",
-        &json!({ "text": "由 CLI 加註" }),
-    )
-    .unwrap();
+    let qid = f
+        .admin()
+        .enqueue_action(
+            chrono::Utc::now().timestamp_millis(),
+            "ops",
+            &event_id,
+            "comment",
+            &json!({ "text": "由 CLI 加註" }),
+        )
+        .unwrap();
     wait_for("CLI 的動作被處理", Duration::from_secs(30), || {
-        crate::alerts::store::action_result(&f.admin(), qid)
-            .unwrap()
-            .is_some()
+        f.admin().action_result(qid).unwrap().is_some()
     })
     .await;
     let (actor, result): (String, String) = f
@@ -629,9 +628,7 @@ async fn alerts_end_to_end_over_https() {
         )
         .unwrap();
     // 事件已解決（不在引擎中）：CLI 的註解失敗，稽核記錄失敗的結果
-    let processed = crate::alerts::store::action_result(&f.admin(), qid)
-        .unwrap()
-        .unwrap();
+    let processed = f.admin().action_result(qid).unwrap().unwrap();
     let expected = if processed["ok"] == true {
         "ok"
     } else {
@@ -736,7 +733,7 @@ async fn undecryptable_channel_secrets_and_test_rate_limit() {
             rusqlite::params![cid, blob],
         )
         .unwrap();
-        crate::alerts::store::bump_config_rev(&conn).unwrap();
+        conn.bump_config_rev().unwrap();
     }
     f.alerts.as_ref().unwrap().request_reload();
     // API：狀態為 secrets_unavailable，錯誤代碼 KRS-E5110（派送端重新載入之後）

@@ -10,6 +10,7 @@ use crate::pki::store::*;
 
 impl<C: AsConn> PkiStore for C {
     forward! {
+        fn revoked_serials(&self) -> std::collections::HashSet<String> => revoked_serials;
         fn insert_pending_ca(&self, subject_of: &dyn Fn(i64) -> String, spki_sha256: &[u8], key_file: &dyn Fn(i64) -> String, now_ms: i64) -> i64 => insert_pending_ca;
         fn next_ca_id(&self) -> i64 => next_ca_id;
         fn list_cas(&self) -> Vec<CaRow> => list_cas;
@@ -443,4 +444,12 @@ pub fn issued_count_by_ca(conn: &Connection, ca_id: i64) -> rusqlite::Result<i64
         [ca_id],
         |r| r.get(0),
     )
+}
+
+/// 已撤銷的所有序號（原本在 `alerts/mod.rs`）
+pub fn revoked_serials(conn: &Connection) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut stmt =
+        conn.prepare("SELECT serial FROM pki_certificates WHERE revoked_at IS NOT NULL")?;
+    stmt.query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<String>>>()
 }

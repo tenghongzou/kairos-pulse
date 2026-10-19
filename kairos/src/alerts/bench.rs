@@ -23,6 +23,7 @@ use crate::alerts::notify::fake::FakeHttp;
 use crate::api::tests::{fixture, hello};
 use crate::registry::LastReport;
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 use crate::store::sqlite::SqliteOptions;
 use crate::store::tests::pulse_like;
 
@@ -177,11 +178,11 @@ async fn alerts_bench_acks_under_load() {
             updated_by: "bench".into(),
         };
         let sealed = sb.seal(&ch.secrets).unwrap();
-        super::store::save_channel(&conn, &ch, Some(sealed)).unwrap();
-        super::store::ensure_builtin_rules(&conn, real_clock()).unwrap();
-        for mut r in super::store::load_rules(&conn).unwrap() {
+        conn.save_channel(&ch, Some(sealed)).unwrap();
+        conn.ensure_builtin_rules(real_clock()).unwrap();
+        for mut r in conn.load_rules().unwrap() {
             r.channels = vec!["c-bench".into()];
-            super::store::save_rule(&conn, &r).unwrap();
+            conn.save_rule(&r).unwrap();
         }
         let mut cpu = super::rules::builtin_default(super::rules::ids::HOST_OFFLINE).unwrap();
         cpu.rule_id = "r-bench-cpu".into();
@@ -191,7 +192,7 @@ async fn alerts_bench_acks_under_load() {
         cpu.severity = crate::alerts::model::Severity::Warning;
         cpu.params = json!({ "metric": "cpu", "op": ">", "threshold": 50.0, "for_secs": 0 });
         cpu.channels = vec!["c-bench".into()];
-        super::store::save_rule(&conn, &cpu).unwrap();
+        conn.save_rule(&cpu).unwrap();
     }
     let (svc, thread) = AlertService::start(StartParams {
         config: Arc::new(f.config.clone()),

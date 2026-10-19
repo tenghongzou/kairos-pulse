@@ -10,8 +10,9 @@ use super::{DispatchConfig, Dispatcher, Pump, render, transport};
 use crate::alerts::engine::NewDelivery;
 use crate::alerts::model::{Channel, ChannelKind, Severity};
 use crate::alerts::secrets::SecretBox;
-use crate::alerts::store::{self, Delivery};
+use crate::alerts::store::Delivery;
 use crate::enroll::db::EnrollDb;
+use crate::store::prelude::*;
 
 static NOW: AtomicI64 = AtomicI64::new(1_760_000_000_000);
 
@@ -64,7 +65,7 @@ async fn setup(tag: &str, ch: &Channel) -> (std::path::PathBuf, Arc<Dispatcher>,
     let sb = Arc::new(SecretBox::from_key(&[7u8; 32]).unwrap());
     let sealed = sb.seal(&ch.secrets).unwrap();
     let ch2 = ch.clone();
-    db.write(move |conn| Ok(store::save_channel(conn, &ch2, Some(sealed))?))
+    db.write(move |conn| Ok(conn.save_channel(&ch2, Some(sealed))?))
         .await
         .unwrap();
     let d = Dispatcher::new(
@@ -107,7 +108,7 @@ async fn enqueue(d: &Dispatcher, db: &Arc<EnrollDb>, cid: &str, title: &str, urg
     let ids = db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            let ids = store::insert_deliveries(&tx, &[n2])?;
+            let ids = tx.insert_deliveries(&[n2])?;
             tx.commit()?;
             Ok(ids)
         })

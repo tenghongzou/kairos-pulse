@@ -94,6 +94,9 @@ pub struct CrlRow {
 /// [`PkiStore::record_crl`] 推進，兩者必須在同一個 [`TxMode::Immediate`](crate::store::db::TxMode::Immediate)
 /// 的交易中（SQLite 以全域寫入鎖序列化；PostgreSQL 後端改以 `SELECT … FOR UPDATE` 加上 leader 的 fencing）
 pub trait PkiStore {
+    /// 已撤銷的所有序號（告警判定用）
+    fn revoked_serials(&self) -> StoreResult<std::collections::HashSet<String>>;
+
     /// 新增一筆 `pending` 的簽發 CA，回傳 `ca_id`；私鑰檔名由 `key_file(ca_id)` 決定
     fn insert_pending_ca(
         &self,

@@ -25,9 +25,10 @@ use tokio::sync::{Notify, mpsc};
 
 use super::model::{Channel, ChannelKind, Severity};
 use super::secrets::SecretBox;
-use super::store::{self, Delivery};
+use super::store::Delivery;
 use crate::enroll::db::EnrollDb;
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 use render::View;
 use transport::Outcome;
 
@@ -128,7 +129,7 @@ pub struct Pump {
 impl Pump {
     /// 讀取資料庫中待送的通知
     pub async fn new(d: Arc<Dispatcher>, clock: fn() -> i64) -> Self {
-        let queue = match d.db.read(|conn| Ok(store::pending_deliveries(conn)?)).await {
+        let queue = match d.db.read(|conn| Ok(conn.pending_deliveries()?)).await {
             Ok(q) => q,
             Err(e) => {
                 log::warn!(event = "alerts.delivery.load_failed"; "告警：無法讀取待送的通知：{e}");
@@ -299,7 +300,7 @@ impl Dispatcher {
         let secrets = self.secrets.clone();
         let loaded = self
             .db
-            .read(move |conn| Ok(store::load_channels(conn, Some(secrets.as_ref()))?))
+            .read(move |conn| Ok(conn.load_channels(Some(secrets.as_ref()))?))
             .await;
         match loaded {
             Ok(list) => {
@@ -560,7 +561,7 @@ impl Dispatcher {
         let status = channel.clone();
         if let Err(e) = self
             .db
-            .write(move |conn| Ok(store::update_channel_status(conn, &status)?))
+            .write(move |conn| Ok(conn.update_channel_status(&status)?))
             .await
         {
             log::warn!(event = "alerts.channel.status_write_failed"; "告警：無法寫入通知管道的狀態：{e}");
@@ -578,22 +579,19 @@ impl Dispatcher {
             .write(move |conn| {
                 let tx = conn.transaction()?;
                 for d in &changed {
-                    store::update_delivery(&tx, d)?;
+                    tx.update_delivery(d)?;
                 }
                 let mut new_ids = Vec::new();
                 if let Some((cid, payload, now)) = &extra {
-                    new_ids = store::insert_deliveries(
-                        &tx,
-                        &[super::engine::NewDelivery {
-                            event_id: None,
-                            channel_id: cid.clone(),
-                            kind: "channel_recovered",
-                            urgent: false,
-                            payload: payload.clone(),
-                            group: None,
-                            created_at: *now,
-                        }],
-                    )?;
+                    new_ids = tx.insert_deliveries(&[super::engine::NewDelivery {
+                        event_id: None,
+                        channel_id: cid.clone(),
+                        kind: "channel_recovered",
+                        urgent: false,
+                        payload: payload.clone(),
+                        group: None,
+                        created_at: *now,
+                    }])?;
                 }
                 tx.commit()?;
                 Ok((new_ids, extra))
@@ -667,7 +665,7 @@ mod tests {
             enabled: true,
             config: json!({"allow_http": true}),
             secrets: json!({}),
-            state: store::STATE_SECRETS_UNAVAILABLE.into(),
+            state: super::super::store::STATE_SECRETS_UNAVAILABLE.into(),
             consecutive_failures: 0,
             failed_since: None,
             last_attempt_at: None,

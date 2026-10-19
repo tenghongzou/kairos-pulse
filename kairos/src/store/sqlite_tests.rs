@@ -5,6 +5,7 @@ use super::*;
 use crate::protocol::Metric;
 use crate::registry::{AgentSnapshot, next_conn_id};
 use crate::storage::DedupKey;
+use crate::store::prelude::*;
 use chrono::TimeZone;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -1618,12 +1619,9 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
         assert!(has(&conn, t), "{t}");
     }
     // 系統預設規則可以寫入；重複執行不重複（INSERT OR IGNORE）
-    let n = crate::alerts::store::ensure_builtin_rules(&conn, 1).unwrap();
+    let n = conn.ensure_builtin_rules(1).unwrap();
     assert_eq!(n, crate::alerts::rules::builtins().len());
-    assert_eq!(
-        crate::alerts::store::ensure_builtin_rules(&conn, 2).unwrap(),
-        0
-    );
+    assert_eq!(conn.ensure_builtin_rules(2).unwrap(), 0);
     // 再執行一次升級：不變
     assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 8);
     drop(conn);
