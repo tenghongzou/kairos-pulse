@@ -16,11 +16,11 @@ import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
 import { pageHead, card, dl, emptyState, errorState, inlineAlert, statusBadge, copyButton, skeletonBlock, codeTag } from '../ui/components.js';
 import { sparkline } from '../ui/chart.js';
-import { hostName, reasonText, osText, memRatio, isOldPulse, osFamily, oldPulseCell } from './host-common.js';
+import { hostName, reasonText, reasonDetail, osText, memRatio, isOldPulse, osFamily, oldPulseCell } from './host-common.js';
 import { metricsTab } from './host-metrics.js';
 import { processesTab } from './host-processes.js';
 import { inventoryTab } from './host-inventory.js';
-import { hostActions } from './host-privacy.js';
+import { hostActions, pseudonymNote } from './host-privacy.js';
 
 const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection'];
 
@@ -86,7 +86,7 @@ function overviewTab(hst, el) {
   const d = hst.status_detail || {};
   const reason = d.offline_reason;
   const statusRows = [
-    hst.status === 'offline' ? [t('host.lastReason'), reason ? [reasonText(reason), ' ', codeTag(reason)] : t('host.reasonUnknown')] : null,
+    hst.status === 'offline' ? [t('host.lastReason'), reason ? reasonDetail(reason) : t('host.reasonUnknown')] : null,
     [t('host.lastSeen'), [fmt.timeEl(hst.last_seen), h('span', { class: 'k-sub' }, `${fmt.dateTime(hst.last_seen)} ${fmt.tzLabel()}`)]],
     [t('host.firstSeen'), `${fmt.dateTime(hst.first_seen)} ${fmt.tzLabel()}`],
     [t('host.threshold'), hst.offline_after_ms ? t('host.thresholdValue', { s: fmt.num(Math.round(hst.offline_after_ms / 1000)) }) : '—'],
@@ -406,7 +406,7 @@ function connectionTab(hst, el) {
                   null,
                   h('td', null, fmt.dateTime(e.at)),
                   h('td', null, e.event === 'online' ? statusBadge('online', t('host.evOnline')) : statusBadge('offline', t('host.evOffline'))),
-                  h('td', null, e.reason ? [reasonText(e.reason), ' ', codeTag(e.reason)] : '—'),
+                  h('td', null, e.reason ? reasonDetail(e.reason) : '—'),
                   h('td', null, e.ip ? h('span', { class: 'mono' }, e.ip) : '—'),
                 ),
               ),
@@ -450,6 +450,7 @@ export function render(ctx) {
         pageHead({
           title: name,
           crumbs: [{ text: t('nav.hosts'), href: '/hosts' }, hst.group ? { text: hst.group, href: `/hosts${qs({ group: hst.group })}` } : null, { text: name }].filter(Boolean),
+          meta: pseudonymNote(hst),
           actions: hostActions(hst),
         }),
       );

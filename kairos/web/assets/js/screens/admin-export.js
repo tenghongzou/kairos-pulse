@@ -4,15 +4,19 @@
 //   kairos.toml ＞ 內建預設）；環境變數設定的鍵唯讀並寫出變數名稱（與 S21 其他設定相同的規則）。
 // - 修改（export:write，只有管理員）：PUT /api/v1/export/settings 只送出有變更的鍵；L1 確認列出變更、原因選填。
 //   「改用設定檔的值」送 null。OTLP 的 HTTP 標頭是機密：只顯示名稱與遮蔽值，只能更換或清除。
-// - 測試連線：POST /api/v1/export/otlp/test（以已儲存的設定送出空的 OTLP 請求），結果放在 aria-live 區域。
-// - 狀態：Prometheus 最近一次抓取；OTLP 的佇列、送出、丟棄、最近一次成功與錯誤（代碼為暫定的 KRS-E4311～E4315）。
+// - 測試連線：POST /api/v1/export/otlp/test（以已儲存的設定送出空的 OTLP 請求），結果就地放在按鈕下方的
+//   aria-live 區域；有未儲存的變更時按鈕旁寫「測試的是已儲存的設定」（設計包 S21「0.9 規格」）。
+// - 狀態：Prometheus 最近一次抓取；OTLP 的佇列、送出、丟棄、最近一次成功與錯誤（代碼 KRS-E4311～E4315，「查看」三段式）。
+// - 兩者都停用（以目前勾選的開關為準）時只顯示說明與兩個開關，不顯示統計與其他欄位（D52 預設停用）。
+// - 保存標頭時 503 secrets_unavailable（alerts-secrets.key 無法使用）：標頭欄位停用並說明。GET 沒有這項資訊，
+//   因此只在第一次被拒之後才停用（之後重畫仍維持）。
 
 import { h, uid, mount } from '../core/dom.js';
 import { t } from '../core/strings.js';
 import { api } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as fmt from '../core/format.js';
-import { card, errorState, errorAlert, field, input, inlineAlert, skeletonBlock, neutralBadge, statusBadge, codeTag, dl, setBusy } from '../ui/components.js';
+import { card, errorState, errorAlert, field, input, inlineAlert, skeletonBlock, neutralBadge, statusBadge, codeTag, codeDetails, dl, setBusy } from '../ui/components.js';
 import { toast } from '../ui/toast.js';
 import { confirmL1, valueText } from './admin-common.js';
 
@@ -48,6 +52,8 @@ export function exportCard() {
   const el = card({ title: t('exp.title'), body });
   let dirty = () => false;
   el.isDirty = () => dirty();
+  // 保存標頭時曾被 503 secrets_unavailable 拒絕（金鑰檔無法使用）：之後重畫時標頭欄位仍停用
+  let secretsDown = false;
 
   async function load() {
     let d;
@@ -78,7 +84,9 @@ export function exportCard() {
       const src = srcLine(k);
       describe(box, src.id);
       fields.push({ key: k, get: () => box.checked, initial: Boolean(checked), el: box });
-      return h('div', { class: 'k-stack k-stack--sm' }, h('label', { class: 'ds-checkbox' }, box, label), src.node);
+      const wrap = h('div', { class: 'k-stack k-stack--sm' }, h('label', { class: 'ds-checkbox' }, box, label), src.node);
+      wrap.box = box;
+      return wrap;
     };
     const textField = (k, name, label, value, hint, { numeric = false, mono = false, maxlength } = {}) => {
       const inp = input({ name, value: value == null ? '' : String(value), mono, inputmode: numeric ? 'numeric' : undefined, maxlength, autocomplete: 'off', cls: numeric ? 'ds-input--num' : null });
@@ -94,19 +102,26 @@ export function exportCard() {
     // ---- Prometheus ----
     const p = d.prometheus;
     const ps = p.status || {};
-    const promSection = h(
-      'section',
-      { class: 'k-stack', 'aria-labelledby': 'exp-prom-title' },
-      h('h3', { class: 'k-section-title', id: 'exp-prom-title' }, t('exp.prom.title'), ' ', p.enabled ? statusBadge('online', t('exp.enabled')) : statusBadge('offline', t('exp.disabled'))),
+    const promToggle = checkbox(K.promEnabled, 'prometheus_enabled', t('exp.prom.enabled'), p.enabled);
+    // 開關以外的內容（統計與其他欄位）：兩者都停用時隱藏
+    const promDetail = h(
+      'div',
+      { class: 'k-stack' },
       dl([
         [t('exp.prom.endpoint'), h('span', null, codeTag(`GET ${p.path}`), h('span', { class: 'k-block caption' }, t('exp.prom.endpointHint')))],
         [t('exp.prom.lastLabel'), ps.last_scrape_at ? t('exp.prom.last', { t: `${fmt.dateTime(ps.last_scrape_at)} ${fmt.tzLabel()}`, hosts: fmt.num(ps.last_hosts), series: fmt.num(ps.last_series), size: fmt.bytes(ps.last_bytes), ms: fmt.num(ps.last_duration_ms) }) : t('exp.prom.never')],
         [t('exp.prom.scrapesLabel'), t('exp.prom.scrapes', { n: fmt.num(ps.scrapes || 0) })],
       ]),
-      checkbox(K.promEnabled, 'prometheus_enabled', t('exp.prom.enabled'), p.enabled),
       textField(K.promStale, 'stale_after_secs', t('exp.prom.stale'), p.stale_after_secs, t('exp.prom.staleHint'), { numeric: true, maxlength: 5 }),
       checkbox(K.promProcesses, 'include_processes', t('exp.prom.processes'), p.include_processes),
       h('p', { class: 'caption' }, t('exp.prom.processesHint')),
+    );
+    const promSection = h(
+      'section',
+      { class: 'k-stack', 'aria-labelledby': 'exp-prom-title' },
+      h('h3', { class: 'k-section-title', id: 'exp-prom-title' }, t('exp.prom.title'), ' ', p.enabled ? statusBadge('online', t('exp.enabled')) : statusBadge('offline', t('exp.disabled'))),
+      promToggle,
+      promDetail,
     );
 
     // ---- OTLP ----
@@ -147,8 +162,10 @@ export function exportCard() {
       headerRows.appendChild(wrap);
       refresh();
     };
-    const headersLocked = locked(K.otlpHeaders);
+    const headersLocked = locked(K.otlpHeaders) || secretsDown;
     const hs = byKey.get(K.otlpHeaders);
+    const secretsNote = inlineAlert({ kind: 'warning', title: t('exp.otlp.secretsDown') });
+    secretsNote.hidden = !secretsDown;
     const hdrSrc = srcLine(K.otlpHeaders);
     const addBtn = h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => addRow() } }, t('exp.otlp.headerAdd'));
     const editor = h('div', { class: 'k-stack k-stack--sm', hidden: true }, headerRows, addBtn);
@@ -163,6 +180,17 @@ export function exportCard() {
       });
       return h('label', { class: 'ds-radio' }, r, label);
     };
+    // 不更換／更換／清除（可修改時）；金鑰檔無法使用時隱藏，只留說明
+    const headerControls =
+      canWrite && !locked(K.otlpHeaders)
+        ? h(
+            'div',
+            { class: 'k-stack k-stack--sm', hidden: secretsDown },
+            h('div', { class: 'ds-radio-group' }, modeRadio('keep', t('exp.otlp.headersKeep')), modeRadio('replace', t('exp.otlp.headersReplace')), hs && hs.source === 'console' ? modeRadio('clear', t('exp.otlp.headersClear')) : null),
+            h('p', { class: 'caption' }, t('exp.otlp.headersHint')),
+            editor,
+          )
+        : null;
     const headerFieldset = h(
       'fieldset',
       { 'aria-describedby': hdrSrc.id },
@@ -174,42 +202,71 @@ export function exportCard() {
         o.headers_source && o.headers_source !== 'none' ? h('span', { class: 'k-block caption' }, t(`exp.otlp.headersFrom.${o.headers_source}`)) : null,
       ),
       hdrSrc.node,
-      canWrite && !headersLocked
-        ? [
-            h('div', { class: 'ds-radio-group' }, modeRadio('keep', t('exp.otlp.headersKeep')), modeRadio('replace', t('exp.otlp.headersReplace')), hs && hs.source === 'console' ? modeRadio('clear', t('exp.otlp.headersClear')) : null),
-            h('p', { class: 'caption' }, t('exp.otlp.headersHint')),
-            editor,
-          ]
-        : null,
+      secretsNote,
+      headerControls,
     );
 
+    /** 保存標頭被 503 secrets_unavailable 拒絕：標頭欄位停用並說明（其他變更仍可儲存） */
+    function blockHeaders() {
+      secretsDown = true;
+      headerMode = 'keep';
+      for (const r of headerFieldset.querySelectorAll('input')) r.disabled = true;
+      if (headerControls) headerControls.hidden = true;
+      secretsNote.hidden = false;
+      refresh();
+    }
+
     const testOut = h('div', { 'aria-live': 'polite' });
+    // 按鈕旁的可見說明：沒有已儲存的端點時「先儲存端點再測試」；有未儲存的變更時「測試的是已儲存的設定」
+    const testNote = h('span', { class: 'caption', id: uid('exp-test-note') });
     const testBtn = canWrite
-      ? h('button', { type: 'button', class: 'ds-button ds-button--secondary', disabled: !o.endpoint, title: o.endpoint ? t('exp.otlp.testHint') : t('exp.otlp.testNeedSave') }, t('exp.otlp.test'))
+      ? h('button', { type: 'button', class: 'ds-button ds-button--secondary', disabled: !o.endpoint, 'aria-describedby': testNote.id }, t('exp.otlp.test'))
       : null;
     if (testBtn) testBtn.addEventListener('click', () => runTest(testBtn, testOut));
+    const lastErrText = lastErr ? { productCode: lastErr.code, message: lastErr.message } : null;
 
-    const otlpSection = h(
-      'section',
-      { class: 'k-stack', 'aria-labelledby': 'exp-otlp-title' },
-      h('h3', { class: 'k-section-title', id: 'exp-otlp-title' }, t('exp.otlp.title'), ' ', stateBadge(os.state)),
+    const otlpToggle = checkbox(K.otlpEnabled, 'otlp_enabled', t('exp.otlp.enabled'), o.enabled);
+    const otlpDetail = h(
+      'div',
+      { class: 'k-stack' },
       dl([
         [t('exp.otlp.queue'), t('exp.otlp.queueValue', { n: fmt.num(os.queue_points || 0), max: fmt.num(o.queue_max_points) })],
         [t('exp.otlp.sent'), t('exp.otlp.sentValue', { n: fmt.num(os.sent_points || 0), ok: fmt.num(os.requests_ok || 0), failed: fmt.num(os.requests_failed || 0) })],
         [t('exp.otlp.dropped'), t('exp.otlp.droppedValue', { full: fmt.num(os.dropped_points.queue_full), failed: fmt.num(os.dropped_points.failed), rejected: fmt.num(os.dropped_points.rejected) })],
         [t('exp.otlp.lastSuccess'), os.last_success_at ? `${fmt.dateTime(os.last_success_at)} ${fmt.tzLabel()}` : '—'],
-        lastErr ? [t('exp.otlp.lastError'), h('span', null, codeTag(lastErr.code), ' ', `${fmt.dateTime(lastErr.at)} ${fmt.tzLabel()}`, h('span', { class: 'k-block k-break' }, lastErr.message))] : null,
+        lastErr
+          ? [
+              t('exp.otlp.lastError'),
+              h('span', null, codeTag(lastErr.code), ' ', `${fmt.dateTime(lastErr.at)} ${fmt.tzLabel()}`, h('span', { class: 'k-block k-break' }, lastErr.message), codeDetails(lastErrText)),
+            ]
+          : null,
       ]),
       os.state === 'failing' && lastErr ? inlineAlert({ kind: 'warning', title: t('exp.otlp.state.failing'), body: lastErr.message, code: lastErr.code }) : null,
-      checkbox(K.otlpEnabled, 'otlp_enabled', t('exp.otlp.enabled'), o.enabled),
       textField(K.otlpEndpoint, 'endpoint', t('exp.otlp.endpoint'), o.endpoint, t('exp.otlp.endpointHint'), { mono: true, maxlength: 2048 }),
       textField(K.otlpInterval, 'interval_secs', t('exp.otlp.interval'), o.interval_secs, t('exp.otlp.intervalHint'), { numeric: true, maxlength: 4 }),
       fNaming,
       headerFieldset,
       h('p', { class: 'caption' }, t('exp.otlp.fileOnly'), ' ', codeTag('kairos.toml [export.otlp]')),
-      testBtn ? h('div', { class: 'ds-button-row' }, testBtn) : null,
+      testBtn ? h('div', { class: 'ds-button-row' }, testBtn, testNote) : null,
       testOut,
     );
+    const otlpSection = h(
+      'section',
+      { class: 'k-stack', 'aria-labelledby': 'exp-otlp-title' },
+      h('h3', { class: 'k-section-title', id: 'exp-otlp-title' }, t('exp.otlp.title'), ' ', stateBadge(os.state)),
+      otlpToggle,
+      otlpDetail,
+    );
+
+    // 兩者都停用（目前勾選的開關）：只顯示說明與兩個開關（設計包 S21「0.9 規格」，D52）
+    function syncVisibility() {
+      const any = promToggle.box.checked || otlpToggle.box.checked;
+      promDetail.hidden = !any;
+      otlpDetail.hidden = !any;
+    }
+    promToggle.box.addEventListener('change', syncVisibility);
+    otlpToggle.box.addEventListener('change', syncVisibility);
+    syncVisibility();
 
     // ---- 儲存 ----
     const pending = h('span', { class: 'caption', 'aria-live': 'polite' });
@@ -230,6 +287,7 @@ export function exportCard() {
     function refresh() {
       if (!saveBtn) return;
       const ch = Object.keys(changes()).length > 0;
+      testNote.textContent = !o.endpoint ? t('exp.otlp.testNeedSave') : ch ? t('exp.otlp.testSaved') : '';
       if (ch) {
         saveBtn.removeAttribute('aria-disabled');
         saveBtn.removeAttribute('title');
@@ -303,7 +361,17 @@ export function exportCard() {
             draw(res);
             return true;
           } catch (err) {
-            const a = errorAlert(err, { title: t('exp.saveFailed') });
+            // 金鑰檔無法使用（503 secrets_unavailable）：伺服器附的 KRS-E4314 三段式說的是「設定值不合法」，
+            // 改寫成標頭無法保存的說明；卡片上的標頭欄位停用
+            const secrets = err && err.code === 'secrets_unavailable' && K.otlpHeaders in ch;
+            const a = secrets
+              ? inlineAlert({ kind: 'error', title: t('exp.saveFailed'), body: t('exp.otlp.secretsDown') })
+              : errorAlert(err, { title: t('exp.saveFailed') });
+            if (secrets) {
+              a.setAttribute('role', 'alert');
+              a.setAttribute('tabindex', '-1');
+              blockHeaders();
+            }
             mount(errBox, a);
             a.focus();
             return false;
@@ -337,8 +405,9 @@ export function exportCard() {
     mount(out);
     try {
       const r = await api('/api/v1/export/otlp/test', { method: 'POST' });
-      if (r.ok) mount(out, inlineAlert({ kind: 'success', title: t('exp.otlp.testOk', { msg: r.message, ms: fmt.num(r.elapsed_ms) }) }));
-      else mount(out, inlineAlert({ kind: 'error', title: t('exp.otlp.testFailed'), body: r.message, code: r.code || undefined }));
+      if (r.ok) mount(out, inlineAlert({ kind: 'success', title: t('exp.otlp.testOk', { status: r.status == null ? '—' : r.status, ms: fmt.num(r.elapsed_ms) }) }));
+      // 失敗：三段式（KRS-E4311 無法連線／逾時、KRS-E4312 被拒）；collector 的回應放在技術細節
+      else mount(out, errorAlert({ productCode: r.code || null, status: r.status || null, message: r.message }, { title: t('exp.otlp.testFailed') }));
     } catch (err) {
       mount(out, errorAlert(err, { title: t('exp.otlp.testFailed') }));
     } finally {

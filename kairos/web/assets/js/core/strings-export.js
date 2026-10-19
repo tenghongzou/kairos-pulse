@@ -2,7 +2,7 @@
 // strings.js 以 Object.assign 併入同一張表（t()、has() 相同）。
 
 export const EXPORT_STRINGS = {
-  'perm.export:write': '指標轉出的設定',
+  'perm.export:write': '修改指標轉出',
   'adm.audit.action.export.change': '變更指標轉出的設定',
   'adm.audit.action.export.otlp_test': '測試 OTLP 連線',
 
@@ -72,10 +72,11 @@ export const EXPORT_STRINGS = {
   'exp.otlp.lastSuccess': '最近一次成功',
   'exp.otlp.lastError': '最近一次錯誤',
   'exp.otlp.test': '測試連線',
-  'exp.otlp.testHint': '以已儲存的設定送出一個空的 OTLP 請求（不寫入資料）。',
-  'exp.otlp.testOk': '連線成功：{msg}（{ms} ms）',
+  'exp.otlp.testOk': 'collector 已接受（HTTP {status}，{ms} ms）',
   'exp.otlp.testFailed': '連線失敗',
   'exp.otlp.testNeedSave': '先儲存端點再測試',
+  'exp.otlp.testSaved': '測試的是已儲存的設定',
+  'exp.otlp.secretsDown': '無法保存標頭：資料目錄的 alerts-secrets.key 無法使用，請先還原金鑰檔（kairos db restore-keys）',
 
   'exp.src.env': '由環境變數 {v} 設定，無法在此修改',
   'exp.src.console': '主控台的值（{by}，{at}）',

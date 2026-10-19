@@ -379,7 +379,14 @@ export function render(ctx) {
   load();
   // 即時更新：狀態變化後重新抓取（最多每 5 秒一次）；另外每 30 秒更新一次
   const unsub = sse.subscribe((ev) => {
-    if (!ev.type.startsWith('host.') && !ev.type.startsWith('alert.') && ev.type !== 'resync') return;
+    if (ev.type === 'resync') {
+      // 立即重新抓取（screens.md §0.2）；完成後外框的 Banner 在 3 秒後移除
+      if (pending) clearTimeout(pending);
+      pending = null;
+      Promise.resolve(load()).catch(() => {}).finally(() => sse.resyncSettled());
+      return;
+    }
+    if (!ev.type.startsWith('host.') && !ev.type.startsWith('alert.')) return;
     if (pending) return;
     pending = setTimeout(() => {
       pending = null;

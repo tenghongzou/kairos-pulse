@@ -4,7 +4,8 @@
 //   不寫入網址、localStorage、sessionStorage、主控台日誌；對話框關閉後連同 DOM 一起丟棄。之後只顯示前 4 碼（hint）。
 // - 安裝指令：註冊端點不提供下載時（`downloads.available = false`，INTEGRATION §27.4 #3）隱藏 Linux 一行指令、
 //   MSI 下載與「下載指令檔」，改顯示「以安裝套件安裝後執行 pulse enroll --install-string …」。0.9 起設定了
-//   enroll.download_dir 時另顯示一行指令（curl 下載 pulse-install.sh，以 --base-url 指向 8444 的下載端點）。
+//   enroll.download_dir 時另顯示一行指令（curl 下載 pulse-install.sh，以 --base-url 指向 8444 的下載端點）；
+//   設定了但缺檔（downloads.product_code = KRS-W2012）時的警告只對管理員顯示（維運者無法處理下載目錄）。
 // - 註冊端點不是開放（僅續簽、關閉）時，安裝字串與指令的「複製」停用，token 仍可建立（S12 模式提示）。
 // - 權限：建立、停用需要 enroll.tokens:write；自動核准需要 enroll.tokens:auto_approve（維運者看到停用的選項與原因）。
 // - 0.7.0 隱藏：「時鐘偏差暫不受理」與「排隊中」的主機清單（只有計數，沒有清單 API）、「已簽發未上線」的主機清單、
@@ -208,6 +209,7 @@ function showCreated(data, onCreated) {
   const cmd = install ? `pulse enroll --install-string '${install}'` : '';
   // 下載端點可用時（enroll.download_dir；API 的 downloads.base_url）另顯示一行安裝指令
   const dlBase = data.downloads && data.downloads.available ? data.downloads.base_url : null;
+  const downloadsIncomplete = Boolean(data.downloads && !data.downloads.available && data.downloads.product_code === 'KRS-W2012');
   const oneLiner =
     install && dlBase
       ? `curl -fsSLO --cacert kairos-ca.pem ${dlBase}/pulse-install.sh && sudo PULSE_INSTALL_STRING='${install}' sh pulse-install.sh --base-url ${dlBase} --ca-file kairos-ca.pem --allowed-signers /etc/kairos-pulse/allowed_signers`
@@ -240,6 +242,10 @@ function showCreated(data, onCreated) {
           h('p', { class: 'ds-field__hint' }, t('token.done.commandDownloadHint')),
           codeBlock(oneLiner, { labelledby: 'tk-one-l', copy: blocked ? null : () => oneLiner, copyLabel: t('token.done.copyCommand'), id: 'tk-oneliner' }),
         )
+      : null,
+    // 設定了下載目錄但缺檔（KRS-W2012）：只對管理員（enroll.mode:write，S21 註冊端點的設定）顯示；維運者只看到 pulse enroll
+    !oneLiner && downloadsIncomplete && session.can('enroll.mode:write')
+      ? inlineAlert({ kind: 'warning', title: t('token.done.downloadsIncomplete'), body: t('token.done.downloadsIncompleteBody'), code: 'KRS-W2012' })
       : null,
     install
       ? h(

@@ -13,7 +13,7 @@ import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
 import { pageHead, card, emptyState, errorState, inlineAlert, field, button, setBusy, dl, codeTag, skeletonBlock, errorAlert } from '../ui/components.js';
 import { toast } from '../ui/toast.js';
-import { reasonText } from './host-common.js';
+import { reasonText, reasonDetail } from './host-common.js';
 import {
   sevBadge, stateText, attentionTag, flags, durationSecs, kindLabel, rootCauseLabel, timelineText,
   ackDialog, assignDialog, resolveDialog, snooze, unavailableNotice, who,
@@ -49,7 +49,7 @@ function interpretation(e) {
     rows.push([t('alerts.ev.host'), hostLink(e.agent_id, d.hostname)]);
     if (d.ip) rows.push([t('alerts.ev.ipSubnet'), h('span', { class: 'mono' }, [d.ip, d.subnet].filter(Boolean).join(' · '))]);
     if (d.offline_reason) {
-      rows.push([t('host.lastReason'), [reasonText(d.offline_reason), ' ', codeTag(d.offline_reason)]]);
+      rows.push([t('host.lastReason'), reasonDetail(d.offline_reason)]);
       if (has(`reason.${d.offline_reason}.next`)) rows.push([t('alerts.ev.advice'), t(`reason.${d.offline_reason}.next`)]);
     }
     if (d.offline_after_ms) rows.push([t('host.threshold'), t('alerts.ev.threshold', { s: Math.round(d.offline_after_ms / 1000) })]);

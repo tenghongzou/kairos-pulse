@@ -38,6 +38,11 @@ function ms(v) {
   return v ? Date.parse(v) : null;
 }
 
+/** 外部 CA 簽發、匯入的憑證（ca_id 為 null；不在 Kairos 的 CRL 中，撤銷在下一次重新連線時才生效，PKI.md 第 16 節） */
+function isExternal(c) {
+  return c.issued_via === 'import' && c.ca_id == null;
+}
+
 /** 主機的名稱（沒有時 agent_id 前 8 碼） */
 function hostText(c) {
   return c.hostname || shortId(c.agent_id);
@@ -293,7 +298,7 @@ export function render(ctx) {
       phrase,
       size: 'lg',
       errorTitle: t('cert.revoke.failed'),
-      content: [targets, reason.el, comment.el],
+      content: [targets, list.some(isExternal) ? inlineAlert({ kind: 'info', body: t('cert.import.externalNote') }) : null, reason.el, comment.el].filter(Boolean),
       collect() {
         const text = comment.input.value.trim();
         comment.el.setError(text ? '' : t('cert.revoke.commentRequired'));
@@ -528,7 +533,8 @@ export function render(ctx) {
       title: t('cert.import.title'),
       size: 'md',
       confirmText: t('cert.import.submit'),
-      content: [h('p', null, t('cert.import.body')), f.el],
+      // 底部固定說明（設計包 S14「0.9 規格」）：外部 CA 簽發的憑證撤銷後，下一次重新連線時才被拒絕
+      content: [h('p', null, t('cert.import.body')), f.el, inlineAlert({ kind: 'info', body: t('cert.import.externalNote') })],
       collect: () => {
         const v = f.input.value.trim();
         if (!v.includes('BEGIN CERTIFICATE')) {

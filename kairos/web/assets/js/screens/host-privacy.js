@@ -2,14 +2,16 @@
 // §0.3 L2「刪除主機資料」；API GET/POST /api/v1/hosts/{id}/purge、GET /api/v1/hosts/{id}/personal-data）。
 //
 // - 只有管理員（hosts:purge、hosts:personal_data）；沒有權限時不顯示按鈕（screens.md §0.2）。
-// - 刪除：先取影響預覽（各資料的筆數、會撤銷的憑證、保留的稽核日誌與 CRL 所需的憑證紀錄），主機仍連線中時
-//   說明並停止；否則 L2 DangerConfirmDialog（輸入主機名稱）＋選填原因。送出時帶 impact_token，數字已改變
-//   （409 impact_changed）時在對話框內說明，請重新開啟。
+// - 刪除：先取影響預覽（各資料的筆數，0 筆照常列出；會撤銷的憑證、保留的稽核日誌與 CRL 所需的憑證紀錄），
+//   主機仍連線中時說明並停止（有 pki.certificates:revoke 時附「撤銷憑證…」捷徑）；否則 L2 DangerConfirmDialog
+//   （輸入主機名稱）＋選填原因。送出時帶 impact_token，數字已改變（409 impact_changed）時在對話框內說明，
+//   請重新開啟；刪除沒有完成（503）時說明重新執行即可接續完成。
+// - 假名化的主機（privacy.hostname = "pseudonymize"）：pseudonymNote() 放在 S05 頁首名稱旁。
 // - 匯出：下載 JSON（kairos.host.personal-data/v1），檔名含 agent_id；內容含個資，提示妥善保管。
 
 import { h, icon } from '../core/dom.js';
 import { t } from '../core/strings.js';
-import { api } from '../core/api.js';
+import { api, qs } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as fmt from '../core/format.js';
 import { navigate } from '../core/router.js';
@@ -44,6 +46,21 @@ export function hostActions(hst) {
   return b;
 }
 
+// 假名的格式（kairos/PRIVACY.md 第 3 節）：`host-` ＋ RFC 4648 base32 小寫的前 12 個字元。
+// 主機 API 沒有「已假名化」的欄位，以主機名稱的格式判斷（隨機名稱剛好符合的機率可忽略）
+const PSEUDONYM = /^host-[a-z2-7]{12}$/;
+
+/** S05 頁首名稱旁：假名化主機的可見說明與查詢指令（不是假名時 null；不提供「顯示原名」，D53） */
+export function pseudonymNote(hst) {
+  if (!hst || !PSEUDONYM.test(hst.hostname || '')) return null;
+  return h(
+    'span',
+    { class: 'k-pseudonym' },
+    icon('info'),
+    h('span', null, t('privacy.pseudonym'), ' ', h('code', { class: 'k-code-tag' }, t('privacy.pseudonymCmd')), t('privacy.pseudonymEnd')),
+  );
+}
+
 async function exportPersonalData(hst) {
   try {
     const doc = await api(`/api/v1/hosts/${encodeURIComponent(hst.agent_id)}/personal-data`);
@@ -57,14 +74,16 @@ async function exportPersonalData(hst) {
 /** 影響預覽的內容（各資料的筆數與保留的項目） */
 function impactBody(p) {
   const c = p.counts || {};
+  // 0 筆的列照常顯示「0 筆」（讓人知道每一類都檢查過；設計包 S05「0.9 規格」）
+  const n = (v) => t('privacy.countValue', { n: fmt.num(v || 0) });
   const rows = [
-    [t('privacy.count.reports'), fmt.num(c.reports || 0)],
-    [t('privacy.count.rollups'), fmt.num((c.rollup_5m || 0) + (c.rollup_1h || 0))],
-    [t('privacy.count.processes'), fmt.num(c.process_snapshots || 0)],
-    [t('privacy.count.inventory'), fmt.num((c.inventory || 0) + (c.inventory_changes || 0))],
-    [t('privacy.count.alerts'), fmt.num(c.alert_events || 0)],
-    [t('privacy.count.requests'), fmt.num(c.enroll_requests || 0)],
-    [t('privacy.count.certificates'), fmt.num(c.certificates || 0)],
+    [t('privacy.count.reports'), n(c.reports)],
+    [t('privacy.count.rollups'), n((c.rollup_5m || 0) + (c.rollup_1h || 0))],
+    [t('privacy.count.processes'), n(c.process_snapshots)],
+    [t('privacy.count.inventory'), n((c.inventory || 0) + (c.inventory_changes || 0))],
+    [t('privacy.count.alerts'), n(c.alert_events)],
+    [t('privacy.count.requests'), n(c.enroll_requests)],
+    [t('privacy.count.certificates'), n(c.certificates)],
   ];
   return h(
     'div',
@@ -93,16 +112,20 @@ async function purgeHost(hst) {
   }
   const name = p.display_name || p.hostname || hst.agent_id;
   if (p.online) {
-    // 仍連線中：說明並停止（不提供確認按鈕）
+    // 仍連線中：說明並停止（只有「關閉」；有撤銷權限時附「撤銷憑證…」捷徑，到憑證清單篩選這台主機）
     const close = h('button', { type: 'button', class: 'ds-button ds-button--primary' }, t('common.close'));
+    const revoke = session.can('pki.certificates:revoke')
+      ? h('a', { class: 'ds-button ds-button--secondary ds-button--sm', href: `/certificates${qs({ q: hst.agent_id })}` }, icon('shield-x'), t('privacy.onlineRevoke'))
+      : null;
     const d = openDialog({
       title: t('privacy.onlineTitle', { name }),
       size: 'sm',
-      body: inlineAlert({ kind: 'warning', title: t('privacy.onlineLead'), code: p.blocked && p.blocked.product_code, body: t('privacy.onlineBody') }),
+      body: inlineAlert({ kind: 'warning', title: t('privacy.onlineLead'), code: p.blocked && p.blocked.product_code, body: t('privacy.onlineBody'), actions: revoke }),
       actions: [close],
       initialFocus: close,
     });
     close.addEventListener('click', () => d.close());
+    if (revoke) revoke.addEventListener('click', () => d.close());
     return;
   }
   let done = null;
@@ -121,8 +144,26 @@ async function purgeHost(hst) {
         });
         return true;
       } catch (e) {
-        const title = e.code === 'impact_changed' ? t('privacy.impactChanged') : e.code === 'host_online' ? t('privacy.onlineLead') : t('privacy.purgeFailed');
-        const a = errorAlert(e, { title });
+        let a;
+        if (e.status === 503) {
+          // 刪除沒有完成（KRS-E4205）：代碼總表的範例是「仍連線中」，這裡改寫成接續完成的說明；伺服器訊息放技術細節
+          const tech = [`HTTP ${e.status}`, e.code, e.message].filter(Boolean).join(' · ');
+          a = inlineAlert({
+            kind: 'error',
+            title: t('privacy.purgeFailed'),
+            code: e.productCode || 'KRS-E4205',
+            body: [
+              h('p', null, t('privacy.purgeIncomplete')),
+              h('details', { class: 'k-details' }, h('summary', null, t('err.label.technical')), h('p', { class: 'k-code-line' }, tech)),
+            ],
+          });
+          a.setAttribute('tabindex', '-1');
+        } else if (e.code === 'host_online') {
+          a = inlineAlert({ kind: 'error', title: t('privacy.onlineLead'), body: t('privacy.onlineBody'), code: e.productCode || undefined });
+          a.setAttribute('tabindex', '-1');
+        } else {
+          a = errorAlert(e, { title: e.code === 'impact_changed' ? t('privacy.impactChanged') : t('privacy.purgeFailed') });
+        }
         errBox.replaceChildren(a);
         a.focus();
         return false;

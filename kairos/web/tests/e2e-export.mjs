@@ -43,7 +43,11 @@ export function registerExport({ test, newPage, login, waitTitle, axe, shot, URL
     await waitTitle(page, '系統設定');
     const card = page.locator('section', { has: page.getByRole('heading', { name: '指標轉出', exact: true }) });
     await card.getByRole('heading', { name: /Prometheus exporter/ }).waitFor();
-    await card.getByText('GET /api/v1/export/prometheus').waitFor();
+    // 兩者都停用：只有說明與兩個開關（設計包 S21「0.9 規格」），不顯示端點、統計與其他欄位
+    await card.getByLabel('提供 Prometheus 端點').waitFor();
+    await card.getByLabel('推送到 OpenTelemetry collector').waitFor();
+    assert.equal(await card.getByText('GET /api/v1/export/prometheus').isVisible(), false, '兩者都停用時不顯示端點');
+    assert.equal(await card.getByLabel('過期門檻（秒）').isVisible(), false, '兩者都停用時不顯示其他欄位');
     await axe(page, 'F7 系統設定：指標轉出（未啟用）');
     // 未啟用：404 export_disabled
     const disabled = await page.evaluate(async () => {
@@ -57,6 +61,8 @@ export function registerExport({ test, newPage, login, waitTitle, axe, shot, URL
     assert.equal(await save.getAttribute('aria-disabled'), 'true');
     await card.getByLabel('提供 Prometheus 端點').check();
     await card.getByText('尚未儲存').waitFor();
+    // 勾選開關後才顯示端點與其他欄位
+    await card.getByText('GET /api/v1/export/prometheus').waitFor();
     // 不合法的過期門檻：欄位錯誤，不送出
     const stale = card.getByLabel('過期門檻（秒）');
     await stale.fill('5');
@@ -112,9 +118,10 @@ export function registerExport({ test, newPage, login, waitTitle, axe, shot, URL
       await waitTitle(page, '系統設定');
       const card = page.locator('section', { has: page.getByRole('heading', { name: '指標轉出', exact: true }) });
       await card.getByRole('heading', { name: /OTLP 推送/ }).waitFor();
-      // 測試連線在沒有端點時不可用
-      assert.ok(await card.getByRole('button', { name: '測試連線' }).isDisabled());
       await card.getByLabel('推送到 OpenTelemetry collector').check();
+      // 測試連線在沒有已儲存的端點時不可用，按鈕旁寫出原因（可見文字）
+      assert.ok(await card.getByRole('button', { name: '測試連線' }).isDisabled());
+      await card.getByText('先儲存端點再測試').waitFor();
       const save = card.getByRole('button', { name: '儲存變更…' });
       // 啟用卻沒有端點：欄位錯誤
       await save.click();
@@ -135,9 +142,15 @@ export function registerExport({ test, newPage, login, waitTitle, axe, shot, URL
       await card.getByText('Authorization: ••••').waitFor();
       const html = await page.evaluate(() => document.documentElement.outerHTML + Array.from(document.querySelectorAll('input')).map((i) => i.value).join(' '));
       assert.ok(!html.includes('e2e-otlp-7f3a91'), '標頭的值不應留在畫面上');
-      // 測試連線
+      // 有未儲存的變更時：按鈕旁說明「測試的是已儲存的設定」；改回原值後消失
+      const interval = card.getByLabel('推送間隔（秒）');
+      await interval.fill('3');
+      await card.getByText('測試的是已儲存的設定').waitFor();
+      await interval.fill('2');
+      await card.getByText('測試的是已儲存的設定').waitFor({ state: 'detached' });
+      // 測試連線：結果就地顯示在按鈕下方
       await card.getByRole('button', { name: '測試連線' }).click();
-      await card.getByText(/連線成功：HTTP 200/).waitFor();
+      await card.getByText(/collector 已接受（HTTP 200，/).waitFor();
       // 推送：collector 收到帶標頭、非空的 protobuf（含 semconv 的名稱與 web-01 的 host.name）
       const req = await until(() => col.requests.find((r) => r.body.length > 0 && r.body.includes('web-01')), 20000, 'collector 收到 report');
       assert.equal(req.url, '/v1/metrics');

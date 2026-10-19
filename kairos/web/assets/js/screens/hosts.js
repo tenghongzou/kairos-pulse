@@ -21,11 +21,11 @@ import * as fmt from '../core/format.js';
 import { replaceQuery } from '../core/router.js';
 import { pageHead, emptyState, field } from '../ui/components.js';
 import { createTable } from '../ui/table.js';
-import { hostNameCell, statusCell, osText, memRatio, offlineFor, reasonText, isOldPulse, F4_VERSION } from './host-common.js';
+import { hostNameCell, statusCell, osText, memRatio, offlineFor, reasonFacet, isOldPulse, F4_VERSION } from './host-common.js';
 
 const STATUSES = ['critical', 'offline', 'warning', 'unknown', 'pending', 'online'];
 const SELECTS = [
-  { key: 'offline_reason', label: 'hosts.filter.reason', facet: 'offline_reason', fmt: (v) => reasonText(v) },
+  { key: 'offline_reason', label: 'hosts.filter.reason', facet: 'offline_reason', fmt: (v) => reasonFacet(v) },
   { key: 'group', label: 'hosts.filter.group', facet: 'group' },
   { key: 'tag', label: 'hosts.filter.tag', facet: 'tag' },
   { key: 'os_family', label: 'hosts.filter.osFamily', facet: 'os_family', fmt: (v) => t(`hosts.osFamily.${v}`) },
@@ -421,8 +421,8 @@ export function render(ctx) {
   }
   const unsub = sse.subscribe((ev) => {
     if (ev.type === 'resync') {
-      changed.add('*');
-      renderChangeBar();
+      // 重新抓取清單與計數（篩選與搜尋保留；screens.md §0.2）；完成後外框的 Banner 在 3 秒後移除
+      Promise.all([reload(), loadFacets()]).finally(() => sse.resyncSettled());
       return;
     }
     if (!ev.type.startsWith('host.') || !ev.data) return;

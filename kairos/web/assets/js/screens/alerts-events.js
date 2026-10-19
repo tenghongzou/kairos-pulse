@@ -582,8 +582,14 @@ export function render(ctx) {
   // ---- 即時更新 ----
   const unsub = sse.subscribe((ev) => {
     if (ev.type === 'resync') {
-      changed.add('*');
-      renderChangeBar();
+      // 重新抓取清單與計數（screens.md §0.2）；正在勾選事件（批次操作）時不打斷，改為「更新列表」提示
+      if (selected.size) {
+        changed.add('*');
+        renderChangeBar();
+        sse.resyncSettled();
+      } else {
+        reload().finally(() => sse.resyncSettled());
+      }
       return;
     }
     if (!ev.type.startsWith('alert.') || !ev.data || !ev.data.event_id) return;

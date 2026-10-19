@@ -47,6 +47,8 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
       const blocked = page.locator('dialog[open]');
       await blocked.getByText('這台主機目前仍連線中').waitFor();
       assert.equal(await blocked.getByRole('button', { name: '刪除主機資料' }).count(), 0);
+      // 有撤銷權限（管理員）：附「撤銷憑證…」捷徑（到憑證清單篩選這台主機）
+      assert.match(await blocked.getByRole('link', { name: '撤銷憑證…' }).getAttribute('href'), new RegExp(`^/certificates\\?q=${ONLINE_ID}$`));
       await axe(page, 'S05 刪除主機資料（仍連線中）');
       await blocked.getByRole('button', { name: '關閉' }).last().click();
 
@@ -67,6 +69,8 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
       const dlg = page.locator('dialog[open]');
       await dlg.getByText('刪除後無法復原。').waitFor();
       await dlg.getByText('稽核日誌不刪除', { exact: false }).waitFor();
+      // 每一類都列出筆數（0 筆的列照常顯示）
+      assert.equal(await dlg.getByText(/^[\d,]+ 筆$/).count(), 7);
       const ok = dlg.getByRole('button', { name: '刪除主機資料', exact: true });
       assert.equal(await ok.isDisabled(), true);
       await dlg.locator('input[name="confirm"]').fill('privacy');
@@ -124,6 +128,8 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
     const imp = page.locator('dialog[open]');
     await imp.getByRole('button', { name: '匯入', exact: true }).click();
     await imp.getByText('請貼上至少一張 PEM 憑證').waitFor();
+    // 底部固定說明：外部 CA 簽發的憑證撤銷後，下一次重新連線時才被拒絕
+    await imp.getByText('在這裡撤銷後，已連線中的主機在下一次重新連線時才會被拒絕', { exact: false }).waitFor();
     await imp.locator('textarea[name="pem"]').fill(readFileSync(join(PKI_DIR, 'manual.pem'), 'utf8'));
     await axe(page, 'S14 匯入憑證');
     await imp.getByRole('button', { name: '匯入', exact: true }).click();

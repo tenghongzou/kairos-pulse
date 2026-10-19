@@ -151,6 +151,9 @@ kbd {
 .k-page-title { font: var(--ds-text-heading-1); }
 .k-page-head__meta { color: var(--ds-color-text-muted); font: var(--ds-text-caption); }
 .k-page-head__actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: var(--ds-space-200); align-items: center; }
+/* S05 假名化主機的說明（名稱旁的可見文字，不放 Tooltip；S6） */
+.k-pseudonym { display: inline-flex; align-items: flex-start; gap: var(--ds-space-100); max-width: 48rem; color: var(--ds-color-text-secondary); }
+.k-pseudonym .ds-icon { flex: none; margin-top: 0.15em; }
 .k-screen-id { font: var(--ds-text-caption); color: var(--ds-color-text-muted); border: var(--ds-border-width) solid var(--ds-color-border-default); border-radius: var(--ds-radius-sm); padding: 0 var(--ds-space-100); }
 .k-section-title { font: var(--ds-text-heading-2); margin: var(--ds-space-600) 0 var(--ds-space-300); }
 
