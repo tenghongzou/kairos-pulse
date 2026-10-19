@@ -372,7 +372,7 @@ pub fn step(
     if let Some(r) = &job.reason {
         details["reason"] = json!(r);
     }
-    crate::audit::append(
+    crate::store::sqlite::audit::append(
         &tx,
         now_ms,
         &crate::audit::Audit {
@@ -446,7 +446,7 @@ pub fn revoke_active_certificates(
             actor,
             Some("刪除主機資料"),
         )? {
-            crate::audit::append(
+            crate::store::sqlite::audit::append(
                 &tx,
                 now_ms,
                 &crate::audit::Audit {

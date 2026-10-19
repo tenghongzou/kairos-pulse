@@ -67,6 +67,12 @@ impl From<rusqlite::Error> for OpError {
     }
 }
 
+impl From<crate::store::db::StoreError> for OpError {
+    fn from(e: crate::store::db::StoreError) -> Self {
+        OpError::db(e)
+    }
+}
+
 /// 建立 token 的輸入（API 的本文、CLI 的選項）
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenInput {

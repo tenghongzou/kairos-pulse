@@ -15,6 +15,7 @@ use crate::audit::{self, AuditFilter, CODE_CHAIN_BROKEN, Event};
 use crate::config::take_config_arg;
 use crate::hosts_cli::{ascii_json, parse_duration, use_unicode};
 use crate::storage::fmt_time;
+use crate::store::prelude::*;
 use crate::token_cli::{Failure, db_failure, human_time, open, operator, table, zone_label};
 
 /// `kairos audit --help`
@@ -243,7 +244,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
     match &cmd.action {
         AuditAction::Help => unreachable!(),
         AuditAction::List { limit } => {
-            let (rows, total) = match audit::query(&conn, &f, *limit) {
+            let (rows, total) = match conn.audit_query(&f, *limit) {
                 Ok(r) => r,
                 Err(e) => return fail(db_failure(e)),
             };
@@ -313,10 +314,10 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
             }
         }
         AuditAction::Verify => {
-            if let Err(e) = audit::seal_legacy(&conn) {
+            if let Err(e) = conn.audit_seal_legacy() {
                 return fail(db_failure(e));
             }
-            let report = match audit::verify(&conn) {
+            let report = match conn.audit_verify() {
                 Ok(r) => r,
                 Err(e) => return fail(db_failure(e)),
             };
@@ -410,7 +411,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                     after_id: Some(after),
                     ..f.clone()
                 };
-                let rows = match audit::export_batch(&conn, &batch, 5000) {
+                let rows = match conn.audit_export_batch(&batch, 5000) {
                     Ok(r) => r,
                     Err(e) => return fail(db_failure(e)),
                 };
@@ -432,7 +433,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 "type": "chain", "generated_at": fmt_time(now), "count": count,
                 "first_id": first.as_ref().map(|x| x.0), "first_prev_hash": first.and_then(|x| x.1),
                 "last_id": last.as_ref().map(|x| x.0), "last_hash": last.and_then(|x| x.1),
-                "hmac_since": audit::hmac_since(&conn).ok().flatten().map(|s| s.0),
+                "hmac_since": conn.audit_hmac_since().ok().flatten().map(|s| s.0),
             }).to_string());
             text.push('\n');
             note(
@@ -555,8 +556,7 @@ mod tests {
         .unwrap();
         let conn = open(Some(&cfg), true).unwrap().unwrap();
         for i in 0..3 {
-            audit::append(
-                &conn,
+            conn.audit_append(
                 i,
                 &audit::Audit {
                     actor: "system",

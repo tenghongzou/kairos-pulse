@@ -41,6 +41,9 @@ use crate::storage::{Clock, RecordBody, ReportRecord, WriteStatus};
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
 
+pub(crate) mod audit;
+pub(crate) mod conn;
+
 #[path = "sqlite_assets.rs"]
 mod sqlite_assets;
 #[path = "sqlite_purge.rs"]

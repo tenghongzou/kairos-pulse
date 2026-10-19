@@ -9,6 +9,7 @@ use super::tests::{Sse, call, fixture_alerts, hello};
 use super::tokens::{self, TokenGrant};
 use crate::alerts::notify::fake::FakeHttp;
 use crate::rbac::Role;
+use crate::store::prelude::*;
 
 const H: &str = "7e2f0a11-0000-4000-8000-0000000000a1";
 
@@ -682,7 +683,7 @@ async fn alerts_end_to_end_over_https() {
         assert!(actor.starts_with("token:"), "{actor}");
         assert_eq!(result, "ok");
         assert_eq!(hash.map(|h| h.len()), Some(64));
-        let v = crate::audit::verify(&conn).unwrap();
+        let v = conn.audit_verify().unwrap();
         assert!(v.ok(), "{v:?}");
     }
     f.stop().await;

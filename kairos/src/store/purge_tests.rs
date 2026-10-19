@@ -7,6 +7,7 @@ use crate::protocol::Metric;
 use crate::registry::next_conn_id;
 use crate::storage::{RecordBody, ReportRecord, WriteStatus};
 use crate::store::ReportStore;
+use crate::store::prelude::*;
 use crate::store::sqlite::{DB_FILE, SqliteOptions, SqliteStore};
 use chrono::{DateTime, TimeZone, Utc};
 use std::path::{Path, PathBuf};
@@ -302,7 +303,7 @@ fn purging_one_host_deletes_its_rows_keeps_the_other_and_audits() {
         ),
         1
     );
-    assert!(crate::audit::verify(&conn).unwrap().ok());
+    assert!(conn.audit_verify().unwrap().ok());
     // 刪除後：這台主機的 report 與資產暫時被拒，不會被建立回來；另一台照常
     let st = store.write_batch(&[record(A, 9, noon()), record(B, 9, noon())]);
     assert!(matches!(st[0], WriteStatus::Failed(_)), "{st:?}");

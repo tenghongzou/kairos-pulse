@@ -6,6 +6,7 @@
 use super::tests::{Fixture, Resp, fixture, fixture_with, send_raw};
 use super::*;
 use crate::rbac::Assignment;
+use crate::store::prelude::*;
 use crate::users::ldap::{DirError, Directory, DirectoryUser};
 use crate::users::password::{self, HashParams};
 use crate::users::store as us;
@@ -832,7 +833,7 @@ async fn legacy_tokens_keep_their_permissions_after_the_v6_upgrade() {
         }
     }
     // 升級前的稽核紀錄被補上雜湊，鏈完整
-    let r = crate::audit::verify(&conn).unwrap();
+    let r = conn.audit_verify().unwrap();
     assert!(
         r.ok()
             || r.broken
@@ -840,8 +841,8 @@ async fn legacy_tokens_keep_their_permissions_after_the_v6_upgrade() {
                 .is_some_and(|b| b.reason == "missing_hash"),
         "{r:?}"
     );
-    crate::audit::seal_legacy(&conn).unwrap();
-    assert!(crate::audit::verify(&conn).unwrap().ok());
+    conn.audit_seal_legacy().unwrap();
+    assert!(conn.audit_verify().unwrap().ok());
     f.stop().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1053,7 +1054,7 @@ async fn ending_sessions_d25() {
     ] {
         assert!(actions.contains(&a.to_string()), "{a} {actions:?}");
     }
-    assert!(crate::audit::verify(&f.admin()).unwrap().ok());
+    assert!(f.admin().audit_verify().unwrap().ok());
     f.stop().await;
 }
 

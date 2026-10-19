@@ -24,6 +24,7 @@ use super::auth::{Permission, Principal};
 use super::db::query_failed;
 use super::http::{self, ApiBody, ApiError, Query, ts};
 use crate::audit::{self, AuditFilter, CODE_CHAIN_BROKEN, Event};
+use crate::store::prelude::*;
 
 /// 鏈的一端：(id, 雜湊)
 type ChainEnd = (i64, Option<String>);
@@ -136,7 +137,7 @@ async fn list(
     let (rows, total) = ctx
         .pool
         .read("稽核日誌", move |c| {
-            audit::query(c, &f2, limit).map_err(query_failed("稽核日誌"))
+            c.audit_query(&f2, limit).map_err(query_failed("稽核日誌"))
         })
         .await?;
     // 頁首「完整性」（設計包 S18 0.7）：最近一次驗證（自我驗證或手動）與 HMAC 的起點；只看自己操作的身分沒有
@@ -222,7 +223,8 @@ async fn export(
             batch.after_id = Some(after);
             let rows = match pool
                 .read("稽核日誌", move |c| {
-                    audit::export_batch(c, &batch, EXPORT_BATCH).map_err(query_failed("稽核日誌"))
+                    c.audit_export_batch(&batch, EXPORT_BATCH)
+                        .map_err(query_failed("稽核日誌"))
                 })
                 .await
             {
@@ -295,13 +297,13 @@ async fn export(
 }
 
 /// 最近一次完整性驗證（`audit.verify` 紀錄）與目前的 HMAC 起點（`meta.audit_hmac`）
-fn integrity_of(c: &rusqlite::Connection) -> rusqlite::Result<Value> {
-    let since = audit::hmac_since(c)?.map(|(id, _)| id);
+fn integrity_of(c: &dyn Store) -> StoreResult<Value> {
+    let since = c.audit_hmac_since()?.map(|(id, _)| id);
     let f = AuditFilter {
         action: Some("audit.verify".into()),
         ..AuditFilter::default()
     };
-    let (rows, _) = audit::query(c, &f, 1)?;
+    let (rows, _) = c.audit_query(&f, 1)?;
     Ok(json!({
         "hmac_since_id": since,
         "last_verify": rows.first().map(|r| {
@@ -334,13 +336,13 @@ async fn verify(
     let now_ms = now.timestamp_millis();
     // 升級前（沒有雜湊）的紀錄先補上（只有第一次），再以唯讀連線驗證
     ctx.admin
-        .write(audit::seal_legacy)
+        .write(|c| c.audit_seal_legacy())
         .await
         .map_err(storage_error)?;
     let report = ctx
         .pool
         .read("稽核日誌", |c| {
-            audit::verify(c).map_err(query_failed("稽核日誌"))
+            c.audit_verify().map_err(query_failed("稽核日誌"))
         })
         .await?;
     if let Some(b) = &report.broken {

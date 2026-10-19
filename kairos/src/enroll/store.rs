@@ -920,7 +920,7 @@ pub use crate::audit::Audit;
 
 /// 寫入一筆稽核事件（接上雜湊鏈，[`crate::audit::append`]）
 pub fn audit(conn: &Connection, at_ms: i64, a: &Audit<'_>) -> rusqlite::Result<()> {
-    crate::audit::append(conn, at_ms, a).map(|_| ())
+    crate::store::sqlite::audit::append(conn, at_ms, a).map(|_| ())
 }
 
 /// 最近的稽核事件（測試與 CLI）：(時間, 執行者, 動作, 對象, 結果, 代碼)
@@ -948,7 +948,7 @@ pub fn recent_audit(
 
 /// 依保留期限清除稽核事件（保留雜湊鏈的錨點，[`crate::audit::purge`]）
 pub fn purge_audit(conn: &Connection, before_ms: i64, now_ms: i64) -> rusqlite::Result<usize> {
-    crate::audit::purge(conn, before_ms, now_ms)
+    crate::store::sqlite::audit::purge(conn, before_ms, now_ms)
 }
 
 // ---------------------------------------------------------------------------

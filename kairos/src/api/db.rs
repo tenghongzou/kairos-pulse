@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use super::http::ApiError;
+use crate::store::db::StoreResult;
 use crate::store::sqlite::{
     SqliteOptions, file_identity, open_existing_read_write, open_read_only,
 };
@@ -109,7 +110,7 @@ impl ReadPool {
 }
 
 /// 查詢失敗時記錄並轉成 `storage_unavailable`（KRS-E4003）
-pub fn query_failed(what: &'static str) -> impl Fn(rusqlite::Error) -> ApiError {
+pub fn query_failed<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> ApiError {
     move |e| {
         warn!("主控台 API 查詢失敗（{what}）: {e}");
         ApiError::storage(what)
@@ -144,7 +145,7 @@ impl WriteConn {
     pub async fn write<R, F>(self: &Arc<Self>, f: F) -> Result<R, String>
     where
         R: Send + 'static,
-        F: FnOnce(&Connection) -> rusqlite::Result<R> + Send + 'static,
+        F: FnOnce(&Connection) -> StoreResult<R> + Send + 'static,
     {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {

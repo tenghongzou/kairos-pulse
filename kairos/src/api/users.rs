@@ -19,8 +19,9 @@ use super::auth::Principal;
 use super::db::query_failed;
 use super::http::{self, ApiBody, ApiError, Query, read_json, str_field, ts_ms};
 use super::tokens::{self, Revoked, TokenGrant};
-use crate::audit::{Event, in_write_tx};
+use crate::audit::Event;
 use crate::rbac::{Assignment, Permission as P, Role};
+use crate::store::sqlite::conn::in_write_tx;
 use crate::users::password::{self, HashParams};
 use crate::users::store::{
     self as us, NewUser, SOURCE_LOCAL, SUBJECT_LDAP_GROUP, SUBJECT_USER, UserRow,
@@ -459,7 +460,7 @@ async fn update_profile(
             in_write_tx(c, |c| {
                 us::set_profile(c, uid, display.as_deref(), email.as_deref(), now_ms)?;
                 ev.append(c, now_ms)?;
-                us::get_user(c, uid)
+                Ok(us::get_user(c, uid)?)
             })
         })
         .await
@@ -1102,7 +1103,9 @@ async fn create_token(
                 Some(&ipt),
                 now_ms,
             )
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
+            .map_err(|e| {
+                crate::store::db::StoreError::new(crate::store::db::StoreErrorKind::Other, e)
+            })
         })
         .await
         .map_err(storage_error)?;
@@ -1129,7 +1132,14 @@ async fn revoke_token(
     let r = ctx
         .admin
         .write(move |c| {
-            tokens::revoke_with(c, &tid, Some(&actor), Some(&ipt), reason.as_deref(), now_ms)
+            Ok(tokens::revoke_with(
+                c,
+                &tid,
+                Some(&actor),
+                Some(&ipt),
+                reason.as_deref(),
+                now_ms,
+            )?)
         })
         .await
         .map_err(storage_error)?;

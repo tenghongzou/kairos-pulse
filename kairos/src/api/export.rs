@@ -480,7 +480,7 @@ async fn update(
                 }
             }
             event.append(&tx, now_ms)?;
-            tx.commit()
+            Ok(tx.commit()?)
         })
         .await
         .map_err(|e| {

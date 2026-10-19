@@ -111,6 +111,12 @@ impl From<rusqlite::Error> for IssueError {
     }
 }
 
+impl From<crate::store::db::StoreError> for IssueError {
+    fn from(e: crate::store::db::StoreError) -> Self {
+        IssueError::Db(e.into())
+    }
+}
+
 /// 簽發器與信任錨、CRL 的檔案
 pub struct PkiManager {
     data_dir: PathBuf,

@@ -41,6 +41,13 @@ impl From<rusqlite::Error> for DbError {
     }
 }
 
+impl From<crate::store::db::StoreError> for DbError {
+    /// 與 rusqlite 的錯誤相同：訊息以 `sqlite:` 開頭（寫入失敗時重新開啟連線）
+    fn from(e: crate::store::db::StoreError) -> Self {
+        DbError(format!("sqlite: {e}"))
+    }
+}
+
 /// 寫入連線與開啟時的檔案身分
 type WriterSlot = Option<(Connection, Option<(u64, u64)>)>;
 

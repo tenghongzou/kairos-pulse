@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::enroll_cli::{
     Cmd, EXIT_CONFLICT, EXIT_GENERAL, EXIT_USAGE, Env, load_config, mark, ok_json, usage_err,
 };
+use crate::store::prelude::*;
 use crate::store::purge::{self, CODE_PURGE_FAILED, PurgeCounts, PurgeJob};
 use crate::store::sqlite::{DB_FILE, SqliteOptions};
 use crate::token_cli::{Failure, Output, db_failure, operator};
@@ -241,8 +242,7 @@ fn export_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         .map_err(db_failure)?
         .ok_or_else(|| not_found(&agent_id))?;
     let actor = operator();
-    crate::audit::append(
-        &conn,
+    conn.audit_append(
         now_ms,
         &crate::audit::Audit {
             actor: &actor,

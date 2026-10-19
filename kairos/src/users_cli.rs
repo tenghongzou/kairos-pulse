@@ -12,11 +12,12 @@ use std::ffi::OsString;
 use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::PathBuf;
 
-use crate::audit::{Event, in_write_tx};
+use crate::audit::Event;
 use crate::config::{AppConfig, take_config_arg};
 use crate::hosts_cli::{ascii_json, use_unicode};
 use crate::rbac::{Assignment, Role};
 use crate::storage::fmt_time;
+use crate::store::sqlite::conn::in_write_tx;
 use crate::token_cli::{Failure, db_failure, human_time, open, operator, table, zone_label};
 use crate::users::password::{self, HashParams};
 use crate::users::store::{
@@ -529,7 +530,7 @@ pub fn execute(
                         "via": "cli",
                     }),
                 )?;
-                us::get_user(c, uid)
+                Ok(us::get_user(c, uid)?)
             });
             let u = match r {
                 Ok(Some(u)) => u,
@@ -1120,6 +1121,7 @@ pub fn run(cmd: UsersCommand) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::prelude::*;
 
     fn os(list: &[&str]) -> impl Iterator<Item = OsString> {
         list.iter()
@@ -1323,7 +1325,7 @@ mod tests {
             out.stdout
         );
         let conn = open(Some(&cfg), false).unwrap().unwrap();
-        let r = crate::audit::verify(&conn).unwrap();
+        let r = conn.audit_verify().unwrap();
         assert!(r.ok(), "{r:?}");
         assert!(r.checked >= 6);
         let raw: String = conn

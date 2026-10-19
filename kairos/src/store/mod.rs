@@ -12,11 +12,14 @@
 
 pub mod assets;
 pub mod codec;
+pub mod db;
 pub mod derive;
 pub mod import;
 pub mod purge;
 pub mod rollup;
 pub mod sqlite;
+
+pub use db::prelude;
 
 use log::{error, info};
 use std::future::Future;

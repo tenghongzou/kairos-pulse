@@ -633,7 +633,7 @@ impl Authenticator {
             let writer = self.writer.clone();
             tokio::spawn(async move {
                 let _ = writer
-                    .write(move |conn| us::touch_session(conn, &hash, now_ms))
+                    .write(move |conn| Ok(us::touch_session(conn, &hash, now_ms)?))
                     .await;
             });
         }

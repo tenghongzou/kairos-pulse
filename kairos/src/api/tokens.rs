@@ -268,16 +268,16 @@ pub fn create_with(
         }
     };
     let by = created_by.unwrap_or("（未知）");
-    crate::audit::in_write_tx(conn, |conn| {
+    crate::store::sqlite::audit::in_write_tx(conn, |conn| {
         conn.execute(
             "INSERT INTO api_tokens (token_id, name, secret_hash, scope, created_at, created_by, expires_at,
                 role, owner_user_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![token_id, name, &hash[..], scope, now_ms, created_by, expires_at, role, owner],
         )?;
-        crate::audit::append(
-            conn,
-            now_ms,
+        crate::store::sqlite::audit::append(
+        &conn,
+        now_ms,
             &crate::audit::Audit {
                 actor: by,
                 actor_ip: ip,
@@ -367,15 +367,15 @@ pub fn revoke_with(
     reason: Option<&str>,
     now_ms: i64,
 ) -> rusqlite::Result<Revoked> {
-    crate::audit::in_write_tx(conn, |conn| {
+    crate::store::sqlite::audit::in_write_tx(conn, |conn| {
         let changed = conn.execute(
             "UPDATE api_tokens SET revoked_at = ?2, revoked_by = ?3, revoke_reason = ?4
              WHERE token_id = ?1 AND revoked_at IS NULL",
             params![token_id, now_ms, by, reason],
         )?;
         if changed > 0 {
-            crate::audit::append(
-                conn,
+            crate::store::sqlite::audit::append(
+                &conn,
                 now_ms,
                 &crate::audit::Audit {
                     actor: by.unwrap_or("（未知）"),
