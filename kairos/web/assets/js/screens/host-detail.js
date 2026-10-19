@@ -5,6 +5,7 @@
 // 資產資訊（host-processes.js、host-inventory.js），趨勢分為六個指標群組（host-metrics.js）。
 // 隱藏（沒有後端或沒有畫面）：事件（S06／S07 之後）、稽核紀錄（S18 之後）、
 // 編輯顯示名稱、進入維護、除役、撤銷憑證。0.9 起頁首的「更多」有匯出個資與刪除主機資料（管理員；host-privacy.js）。
+// 0.9（F8）：「設定」分頁 /hosts/:id/config（config:read）、概覽的「集中設定」摘要列與「升級」卡片（host-remote.js）。
 // 斷線紀錄：GET /hosts/{id}/connections（Kairos 這次啟動後的上線與離線，記憶體中）＋24 小時上線時間軸
 // （由回報資料的空缺推算）。憑證：詳情的 certificate 摘要；有 pki:read 時另列序號、指紋與簽發方式。
 
@@ -21,8 +22,10 @@ import { metricsTab } from './host-metrics.js';
 import { processesTab } from './host-processes.js';
 import { inventoryTab } from './host-inventory.js';
 import { hostActions, pseudonymNote } from './host-privacy.js';
+import { configSummaryRow, upgradeCard, configTab } from './host-remote.js';
+import { forbidden } from './errors.js';
 
-const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection'];
+const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection', 'config'];
 
 function tabs(id, active) {
   const items = [
@@ -31,7 +34,9 @@ function tabs(id, active) {
     ['processes', `/hosts/${id}/processes`, t('host.tab.processes')],
     ['inventory', `/hosts/${id}/inventory`, t('host.tab.inventory')],
     ['connection', `/hosts/${id}/connection`, t('host.tab.connection')],
-  ];
+    // F8：集中設定（config:read 才顯示分頁；ia.md §3）
+    session.can('config:read') ? ['config', `/hosts/${id}/config`, t('host.tab.config')] : null,
+  ].filter(Boolean);
   return h(
     'nav',
     { class: 'ds-tabs', 'aria-label': t('host.tabs') },
@@ -93,6 +98,7 @@ function overviewTab(hst, el) {
     [t('host.interval'), hst.report_interval_ms ? t('host.intervalValue', { s: fmt.num(Math.round(hst.report_interval_ms / 1000)) }) : '—'],
     [t('host.delivery'), hst.durable == null ? t('host.deliveryUnknown') : hst.durable ? (hst.replaying ? t('host.replaying') : t('host.durable')) : t('host.notDurable')],
     hst.source === 'import' ? [t('host.source'), t('host.sourceImport')] : null,
+    configSummaryRow(hst),
   ];
   const suggestion = hst.status === 'offline' && reason && has(`reason.${reason}.next`) ? inlineAlert({ kind: 'info', title: t('host.nextStep'), body: t(`reason.${reason}.next`) }) : null;
   const neverConnected =
@@ -123,6 +129,7 @@ function overviewTab(hst, el) {
         body: h('div', { class: 'k-grid k-grid--1-1' }, h('div', null, h('p', { class: 'strong' }, t('col.cpu')), sparkCpu), h('div', null, h('p', { class: 'strong' }, t('col.memory')), sparkMem)),
       }),
       card({ title: t('host.uptime24h'), body: uptime }),
+      upgradeCard(hst),
     ),
   );
   // 最近 1 小時
@@ -427,6 +434,11 @@ export function render(ctx) {
     ctx.app.notFound();
     return {};
   }
+  if (tab === 'config' && !session.can('config:read')) {
+    forbidden(root, { perm: 'config:read' });
+    ctx.setTitle(t('error.403.title'));
+    return {};
+  }
   const head = h('div');
   const tabBody = h('div');
   mount(root, 
@@ -461,6 +473,7 @@ export function render(ctx) {
       else if (tab === 'metrics') cleanup = metricsTab(hst, tabBody, ctx);
       else if (tab === 'processes') cleanup = processesTab(hst, tabBody, ctx);
       else if (tab === 'inventory') cleanup = inventoryTab(hst, tabBody);
+      else if (tab === 'config') cleanup = configTab(hst, tabBody);
       else connectionTab(hst, tabBody);
       ctx.focusTitle();
     } catch (e) {

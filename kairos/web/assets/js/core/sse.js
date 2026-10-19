@@ -57,7 +57,8 @@ function dispatch(type, ev) {
   }
 }
 
-const TYPES = ['ready', 'resync', 'host.added', 'host.online', 'host.offline', 'alert.created', 'alert.updated', 'alert.resolved'];
+// 0.9：遠端管理的 config.host（需要 config:read）、rollout.progress（需要 rollouts:read；API.md 第 17.5 節）
+const TYPES = ['ready', 'resync', 'host.added', 'host.online', 'host.offline', 'alert.created', 'alert.updated', 'alert.resolved', 'config.host', 'rollout.progress'];
 
 function open() {
   if (es || !enabled || handlers.size === 0) return;

@@ -10,6 +10,9 @@
 // - 0.8.0〔草稿〕（F4，設計包 §30 D49）：預設顯示「磁碟」（使用率最高的掛載點）；可選欄位（CPU 型號、邏輯處理器、
 //   記憶體總量、廠牌與型號、運作時間）由「欄位設定」開啟，只存在這個瀏覽器；「作業系統」篩選依家族
 //   （os_family）。序號不提供欄位（D47）。
+// - 0.9.0〔草稿〕（F8，設計包 S04「0.9 規格」）：「設定狀態」（config_state，需要 config:read）與「遠端升級」
+//   （remote_upgrade：install.upgrade，沒有 install 的主機為 none，需要 rollouts:read）篩選；選項固定（不在 facets 中），
+//   沒有權限時不顯示，網址中的條件也忽略。
 
 import { h, icon, announce, mount } from '../core/dom.js';
 import * as prefs from '../core/prefs.js';
@@ -22,6 +25,8 @@ import { replaceQuery } from '../core/router.js';
 import { pageHead, emptyState, field } from '../ui/components.js';
 import { createTable } from '../ui/table.js';
 import { hostNameCell, statusCell, osText, memRatio, offlineFor, reasonFacet, isOldPulse, F4_VERSION } from './host-common.js';
+import * as session from '../core/session.js';
+import { CONFIG_STATES, UPGRADE_STATES, configStateLabel, upgradeLabel } from './pulse-common.js';
 
 const STATUSES = ['critical', 'offline', 'warning', 'unknown', 'pending', 'online'];
 const SELECTS = [
@@ -30,7 +35,11 @@ const SELECTS = [
   { key: 'tag', label: 'hosts.filter.tag', facet: 'tag' },
   { key: 'os_family', label: 'hosts.filter.osFamily', facet: 'os_family', fmt: (v) => t(`hosts.osFamily.${v}`) },
   { key: 'version', label: 'hosts.filter.version', facet: 'version' },
+  // F8：固定的選項（static），依權限顯示
+  { key: 'config_state', label: 'hosts.filter.configState', fixed: CONFIG_STATES, perm: 'config:read', fmt: (v) => configStateLabel(v) },
+  { key: 'remote_upgrade', label: 'hosts.filter.remoteUpgrade', fixed: UPGRADE_STATES, perm: 'rollouts:read', fmt: (v) => upgradeLabel(v) },
 ];
+const selectAllowed = (s) => !s.perm || session.can(s.perm);
 const PAGE = 100;
 
 function parseState(q) {
@@ -44,6 +53,8 @@ function parseState(q) {
     tag: q.get('tag') || '',
     os_family: q.get('os_family') || '',
     version: q.get('version') || '',
+    config_state: session.can('config:read') ? q.get('config_state') || '' : '',
+    remote_upgrade: session.can('rollouts:read') ? q.get('remote_upgrade') || '' : '',
     sort: { key: sortRaw.replace(/^-/, ''), desc: sortRaw.startsWith('-') },
   };
 }
@@ -57,6 +68,8 @@ function apiParams(st, cursor) {
     tag: st.tag,
     os_family: st.os_family,
     version: st.version,
+    config_state: st.config_state,
+    remote_upgrade: st.remote_upgrade,
     sort: `${st.sort.desc ? '-' : ''}${st.sort.key}`,
     limit: PAGE,
     cursor,
@@ -150,8 +163,8 @@ export function render(ctx) {
   const selectsRow = h('div', { class: 'k-filter-selects' });
   function renderSelects() {
     mount(selectsRow, 
-      ...SELECTS.map((s) => {
-        const values = (facets && facets[s.facet] && facets[s.facet].values) || [];
+      ...SELECTS.filter(selectAllowed).map((s) => {
+        const values = s.fixed ? s.fixed.map((v) => ({ value: v })) : (facets && facets[s.facet] && facets[s.facet].values) || [];
         if (!values.length && !st[s.key]) return null;
         const sel = h(
           'select',
@@ -166,7 +179,7 @@ export function render(ctx) {
             },
           },
           h('option', { value: '' }, t('hosts.filter.all')),
-          values.map((v) => h('option', { value: v.value, selected: st[s.key] === v.value }, `${s.fmt ? s.fmt(v.value) : v.value}（${fmt.num(v.count)}）`)),
+          values.map((v) => h('option', { value: v.value, selected: st[s.key] === v.value }, v.count == null ? s.fmt(v.value) : `${s.fmt ? s.fmt(v.value) : v.value}（${fmt.num(v.count)}）`)),
           st[s.key] && !values.some((v) => v.value === st[s.key]) ? h('option', { value: st[s.key], selected: true }, st[s.key]) : null,
         );
         return h('label', { class: 'k-labelled-select' }, t(s.label), sel);

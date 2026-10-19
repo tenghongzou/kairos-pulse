@@ -15,7 +15,9 @@ import { forbidden, notFound } from './screens/errors.js';
 import { errorState } from './ui/components.js';
 import './screens/alerts-boot.js';
 import './screens/enroll-boot.js';
+import './screens/pulse-boot.js';
 import { ADMIN_ROUTES } from './routes-admin.js';
+import { PULSE_ROUTES } from './routes-pulse.js';
 
 /**
  * 路由表。欄位：
@@ -46,8 +48,8 @@ const ROUTES = [
   { path: '/certificates/ca', perm: 'pki:read', title: 'ca.title', load: () => import('./screens/pki-ca.js') },
   { path: '/certificates/:serial?', perm: 'pki:read', title: 'cert.title', load: () => import('./screens/pki-certs.js') },
 ];
-// 稽核、管理、系統（S16～S18、S20、S21）：routes-admin.js（allow：需要任一權限時）
-ROUTES.push(...ADMIN_ROUTES);
+// Pulse 管理（F8：S24～S26）：routes-pulse.js；稽核、管理、系統（S16～S18、S20、S21）：routes-admin.js（allow：需要任一權限時）
+ROUTES.push(...PULSE_ROUTES, ...ADMIN_ROUTES);
 
 const appRoot = document.getElementById('app');
 let current = null;
