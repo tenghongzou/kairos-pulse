@@ -317,6 +317,59 @@ impl MetricsConfig {
     }
 }
 
+/// `[remote_config]`：集中設定的本機開關（`crates/kairos-proto/REMOTE.md` 第 5.6 節；只能在本機設定）
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct RemoteConfigConfig {
+    /// 接受 Kairos 下發的設定（宣告 feature `config`）。`false` 時只用本機設定，遠端快取保留不用
+    pub enabled: bool,
+}
+
+/// `[upgrade]`：遠端升級的本機開關與信任錨（REMOTE.md 第 5.6 節；只能在本機設定，特權輔助程式只讀
+/// `pulse.toml`）
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct UpgradeConfig {
+    /// 接受 Kairos 推送的升級。`pulse.toml` 與環境變數都不為 `false` 才算開啟（環境變數只能關閉）
+    pub enabled: bool,
+    /// 信任錨（`ssh-keygen` 的 `allowed_signers`）；空字串 = 預設位置
+    /// （[`UpgradeConfig::allowed_signers_path`]）
+    pub allowed_signers: String,
+    /// 除 `release@kairos-pulse` 外另外接受的 principal（客戶以自己的金鑰重新簽署，REMOTE.md D14）
+    pub extra_principals: Vec<String>,
+    /// 接受遠端降版（推送也必須允許）；自動回滾不受影響
+    pub allow_downgrade: bool,
+    /// 允許從外部 URL 下載的前綴（0.10.0 起使用；0.9.0 只從 Kairos 下載）
+    pub url_allowlist: Vec<String>,
+    /// 外部 URL 的 CA（PEM，0.10.0 起使用）；空字串 = 作業系統信任庫
+    pub external_ca: String,
+    /// 健康確認期限（秒；0 = 依 Kairos 的值，非 0 時取兩者較大，120～3600）
+    pub health_timeout_secs: u32,
+}
+
+/// 預設的信任錨位置：Linux `/etc/kairos-pulse/allowed_signers`、Windows `%ProgramData%\Pulsellowed_signers`
+pub fn default_allowed_signers_path() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let base = std::env::var_os("ProgramData")
+            .filter(|v| !v.is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from(r"C:\ProgramData"),
+                std::path::PathBuf::from,
+            );
+        base.join("Pulse").join("allowed_signers")
+    } else {
+        std::path::PathBuf::from("/etc/kairos-pulse/allowed_signers")
+    }
+}
+
+impl UpgradeConfig {
+    /// 實際使用的信任錨路徑（`allowed_signers` 為空字串時為預設位置）
+    pub fn allowed_signers_path(&self) -> std::path::PathBuf {
+        match self.allowed_signers.trim() {
+            "" => default_allowed_signers_path(),
+            p => std::path::PathBuf::from(p),
+        }
+    }
+}
+
 /// 解析日誌級別（不分大小寫）；未知值回傳 `None`。
 fn parse_level(level: &str) -> Option<LevelFilter> {
     match level.trim().to_ascii_lowercase().as_str() {
@@ -345,6 +398,10 @@ pub struct AppConfig {
     pub status: StatusConfig,
     pub log: LogConfig,
     pub metrics: MetricsConfig,
+    /// 集中設定的本機開關（REMOTE.md 第 5.6 節）
+    pub remote_config: RemoteConfigConfig,
+    /// 遠端升級的本機開關與信任錨（REMOTE.md 第 5.6 節）
+    pub upgrade: UpgradeConfig,
     /// 載入時目前工作目錄下是否有 `pulse.toml`（啟動時記錄，方便確認設定來源）
     #[serde(skip)]
     pub local_file_found: bool,
@@ -376,7 +433,32 @@ impl AppConfig {
     /// 測試用：只用嵌入的預設值（不讀 pulse.toml 與行程環境變數）。
     #[cfg(test)]
     pub fn default_for_tests() -> Self {
+        Self::embedded_defaults()
+    }
+
+    /// 只用嵌入的預設值（不讀 pulse.toml 與行程環境變數）：集中設定的「內建預設」層
+    /// （REMOTE.md 第 3.3 節）
+    pub fn embedded_defaults() -> Self {
         Self::build(None, Some(Map::new())).expect("嵌入的預設設定必須合法")
+    }
+
+    /// 只讀嵌入的預設值與指定的設定檔，不讀環境變數：特權輔助程式（`pulse upgrade apply`）只信任
+    /// root 擁有的 `pulse.toml`（REMOTE.md 第 4.4.1 節第 3 步、第 5.6 節）
+    pub fn load_file_only(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let found = path.is_file();
+        let mut config = Self::build(Some(path), Some(Map::new()))?;
+        config.local_file_found = found;
+        Ok(config)
+    }
+
+    /// `PULSE__*` 環境變數的來源（`env_override` 為 `Some` 時改用給定的鍵值，供測試使用）。
+    /// 集中設定判斷「本機明確寫出的鍵」時也用同一個來源（`remote::config`）
+    pub(crate) fn env_source(env_override: Option<Map<String, String>>) -> Environment {
+        Environment::with_prefix("PULSE")
+            .prefix_separator("__")
+            .separator("__")
+            .try_parsing(false)
+            .source(env_override)
     }
 
     /// 實際使用的補送間隔（毫秒）：`buffer.replay_interval_ms`，但不超過 `report.interval` 的
@@ -413,11 +495,7 @@ impl AppConfig {
         if let Some(path) = local_file {
             builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(false));
         }
-        let env = Environment::with_prefix("PULSE")
-            .prefix_separator("__")
-            .separator("__")
-            .try_parsing(false)
-            .source(env_override);
+        let env = Self::env_source(env_override);
 
         let mut config: Self = builder.add_source(env).build()?.try_deserialize()?;
         config.log.level = config.log.level.trim().to_ascii_lowercase();
@@ -425,8 +503,9 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// 檢查數值是否在合理範圍，避免執行期才出現 panic 或異常行為。
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// 檢查數值是否在合理範圍，避免執行期才出現 panic 或異常行為。集中設定合併後也以同樣的規則
+    /// 檢查一次（REMOTE.md 第 3.5 節第 1 步）
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         fn range(name: &str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
             if (min..=max).contains(&value) {
                 Ok(())
@@ -671,6 +750,35 @@ impl AppConfig {
             return Err(ConfigError::Message(format!(
                 "log.level「{}」不是有效的日誌級別（可用：trace / debug / info / warn / error，不分大小寫）",
                 self.log.level
+            )));
+        }
+        let h = self.upgrade.health_timeout_secs;
+        if h != 0
+            && !(kairos_proto::mgmt::MIN_HEALTH_TIMEOUT_SECS
+                ..=kairos_proto::mgmt::MAX_HEALTH_TIMEOUT_SECS)
+                .contains(&h)
+        {
+            return Err(ConfigError::Message(format!(
+                "upgrade.health_timeout_secs 必須是 0（依 Kairos 的值）或 {} 到 {} 之間（目前為 {h}）",
+                kairos_proto::mgmt::MIN_HEALTH_TIMEOUT_SECS,
+                kairos_proto::mgmt::MAX_HEALTH_TIMEOUT_SECS
+            )));
+        }
+        if let Some(bad) = self.upgrade.extra_principals.iter().find(|p| {
+            p.is_empty()
+                || p.len() > 256
+                || p.chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == ',')
+        }) {
+            return Err(ConfigError::Message(format!(
+                "upgrade.extra_principals 的每一項必須是 1～256 bytes、不含空白與逗號的名稱（目前有 {bad:?}）"
+            )));
+        }
+        if let Some(bad) = self.upgrade.url_allowlist.iter().find(|u| {
+            !u.starts_with("https://") || u.len() > kairos_proto::mgmt::MAX_ARTIFACT_URL_BYTES
+        }) {
+            return Err(ConfigError::Message(format!(
+                "upgrade.url_allowlist 的每一項必須以 https:// 開頭（目前有 {bad:?}）"
             )));
         }
         Ok(())

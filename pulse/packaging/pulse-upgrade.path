@@ -1,0 +1,21 @@
+# Pulse 遠端升級的請求監看（crates/kairos-proto/REMOTE.md 第 4.4.1 節）
+#
+# Pulse（服務帳號 pulse）下載並驗證 Kairos 推送的官方簽章發佈包後，在升級時段內寫入
+# /var/lib/pulse/upgrade/request.json；這個 path unit 看到檔案出現就啟動 root 的 pulse-upgrade.service
+# （重新驗證、替換、重新啟動、健康確認、失敗時回滾）。啟用後 hello 的 install.upgrade 才是 ready。
+#
+# 套件（deb／rpm）會安裝並啟用；tar 安裝依 INSTALL.md 第 10 節手動安裝：
+#   install -m 644 pulse-upgrade.path pulse-upgrade.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now pulse-upgrade.path
+# 不要遠端升級時停用即可：systemctl disable --now pulse-upgrade.path（或 pulse.toml 的 [upgrade] enabled = false）
+
+[Unit]
+Description=Pulse remote upgrade request watcher
+Documentation=file:/opt/pulse/INSTALL.md
+
+[Path]
+PathExists=/var/lib/pulse/upgrade/request.json
+Unit=pulse-upgrade.service
+
+[Install]
+WantedBy=paths.target

@@ -132,6 +132,17 @@ pub struct StatusFile {
     pub reporting: Reporting,
     pub identity: Identity,
     pub clock: Clock,
+    /// 遠端管理（集中設定、遠端升級；REMOTE.md 第 10.3 節）。0.9.0 以前的狀態檔沒有
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management: Option<Management>,
+}
+
+/// 遠端管理的摘要（`pulse status` 的「設定」列與「升級」列）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Management {
+    pub config: Option<crate::remote::config::ConfigView>,
+    pub upgrade: Option<crate::remote::upgrade::UpgradeView>,
 }
 
 /// 服務管理員的提示（Pulse 自己偵測到的）

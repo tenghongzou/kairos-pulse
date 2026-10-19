@@ -40,6 +40,9 @@ struct Data<'a> {
     status_file: StatusFileInfo<'a>,
     checks: Vec<Check<'a>>,
     issues: Vec<IssueJson>,
+    /// 遠端管理（集中設定、遠端升級；REMOTE.md 第 10.3 節）：0.9.0 以前的狀態檔沒有時不輸出
+    #[serde(skip_serializing_if = "Option::is_none")]
+    management: Option<&'a sf::Management>,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,6 +308,7 @@ pub fn document(input: &JsonInput) -> String {
         },
         checks,
         issues: report.issues.iter().map(IssueJson::from).collect(),
+        management: file.and_then(|f| f.management.as_ref()),
     };
     to_ascii_json(&Doc {
         schema: SCHEMA,

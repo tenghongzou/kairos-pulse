@@ -165,6 +165,41 @@ events! {
     STATUS_WRITE_FAILED = "status.write_failed", Some(5020);
     /// 恢復寫入本機狀態檔（只在之前記過 `status.write_failed` 時）
     STATUS_WRITE_RESTORED = "status.write_restored", Some(5021);
+    // ---- 6xxx 遠端管理（log-ux.md §4.6；REMOTE.md 第 10.4 節） ----
+    /// 已套用集中設定的新版本
+    CONFIG_APPLIED = "config.applied", Some(6000);
+    /// `PLS-W0501`：下發的設定驗證失敗，整份拒絕
+    CONFIG_REJECTED = "config.rejected", Some(6001);
+    /// `PLS-W0504`：套用後確認失敗，已回復上一份可用的設定
+    CONFIG_ROLLED_BACK = "config.rolled_back", Some(6002);
+    /// `PLS-I0503`：部分鍵被本機設定覆蓋（覆蓋的鍵改變時記一次）
+    CONFIG_OVERRIDDEN = "config.overridden", Some(6003);
+    /// `PLS-E0506`：遠端設定的快取損毀或無法寫入，改用本機設定
+    CONFIG_CACHE_UNAVAILABLE = "config.cache_unavailable", Some(6004);
+    /// `PLS-I0505`：本機停用集中設定（啟動時一則）
+    CONFIG_DISABLED = "config.disabled", Some(6005);
+    /// 收到升級提議
+    UPGRADE_OFFERED = "upgrade.offered", Some(6100);
+    /// 不接受提議（`PLS-I8409`、`PLS-W8410`、`PLS-W8411`、`PLS-W8412`）
+    UPGRADE_DECLINED = "upgrade.declined", Some(6101);
+    /// 下載與第一次驗證完成，已暫存
+    UPGRADE_DOWNLOADED = "upgrade.downloaded", Some(6102);
+    /// `PLS-W8404`：下載失敗，續傳重試中
+    UPGRADE_DOWNLOAD_FAILED = "upgrade.download_failed", Some(6103);
+    /// `PLS-E8401`／`PLS-E8402`：驗證失敗
+    UPGRADE_VERIFY_FAILED = "upgrade.verify_failed", Some(6104);
+    /// 已交給輔助程式開始替換
+    UPGRADE_APPLYING = "upgrade.applying", Some(6105);
+    /// `PLS-I8416`：升級完成
+    UPGRADE_COMPLETED = "upgrade.completed", Some(6106);
+    /// `PLS-E8405`／`PLS-E8406`：預檢或替換失敗
+    UPGRADE_FAILED = "upgrade.failed", Some(6107);
+    /// `PLS-W8407`：健康確認失敗，已自動回滾
+    UPGRADE_ROLLED_BACK = "upgrade.rolled_back", Some(6108);
+    /// `PLS-E8408`：回滾也失敗，需要人工處理
+    UPGRADE_ROLLBACK_FAILED = "upgrade.rollback_failed", Some(6109);
+    /// `PLS-E8403`：信任錨無法使用，遠端升級停用
+    UPGRADE_TRUST_ANCHOR_UNAVAILABLE = "upgrade.trust_anchor_unavailable", Some(6110);
 }
 
 /// 日誌訊息的開頭：「`<event> <code> `」，沒有代碼時為「`<event> - `」
@@ -278,6 +313,43 @@ pub const E_LICENSE_EXHAUSTED: &str = "PLS-E7101";
 pub const E_CONFIG_NOT_FOUND: &str = "PLS-E0401";
 pub const E_DIAG_FAILED: &str = "PLS-E4301";
 pub const W_DIAG_TRUNCATED: &str = "PLS-W4302";
+// ---- 遠端管理（衝刺 9，REMOTE.md 第 11 節；設計包 decisions/INTEGRATION.md §31.3） ----
+/// 下發的設定驗證失敗，整份拒絕，沿用上一版
+pub const W_REMOTE_CONFIG_REJECTED: &str = "PLS-W0501";
+/// 下發的設定有部分鍵被本機設定覆蓋
+pub const I_REMOTE_CONFIG_OVERRIDDEN: &str = "PLS-I0503";
+/// 套用後確認失敗，已回復上一份可用的設定
+pub const W_REMOTE_CONFIG_ROLLED_BACK: &str = "PLS-W0504";
+/// 集中設定在本機停用
+pub const I_REMOTE_CONFIG_DISABLED: &str = "PLS-I0505";
+/// 遠端設定快取損毀或無法寫入，改用本機設定
+pub const E_REMOTE_CONFIG_CACHE: &str = "PLS-E0506";
+/// 發佈包的簽章驗證失敗
+pub const E_UPGRADE_SIGNATURE: &str = "PLS-E8401";
+/// 發佈包的雜湊、檔名、平台或版本不符
+pub const E_UPGRADE_INTEGRITY: &str = "PLS-E8402";
+/// 找不到或無法使用信任錨（遠端升級停用）
+pub const E_UPGRADE_TRUST_ANCHOR: &str = "PLS-E8403";
+/// 下載失敗，重試中
+pub const W_UPGRADE_DOWNLOAD: &str = "PLS-W8404";
+/// 新版預檢失敗，沒有變更
+pub const E_UPGRADE_PRECHECK: &str = "PLS-E8405";
+/// 替換失敗（已復原或沒有回滾檔）
+pub const E_UPGRADE_REPLACE: &str = "PLS-E8406";
+/// 健康確認失敗，已自動回滾
+pub const W_UPGRADE_ROLLED_BACK: &str = "PLS-W8407";
+/// 回滾失敗，需要人工處理
+pub const E_UPGRADE_ROLLBACK_FAILED: &str = "PLS-E8408";
+/// 遠端升級在本機停用
+pub const I_UPGRADE_DISABLED: &str = "PLS-I8409";
+/// 拒絕降版
+pub const W_UPGRADE_DOWNGRADE: &str = "PLS-W8410";
+/// 不支援的安裝方式或條件
+pub const W_UPGRADE_UNSUPPORTED: &str = "PLS-W8411";
+/// 磁碟空間不足，無法暫存發佈包
+pub const W_UPGRADE_SPACE: &str = "PLS-W8412";
+/// 升級完成
+pub const I_UPGRADE_COMPLETED: &str = "PLS-I8416";
 
 /// 程式中有常數的代碼（[`title`] 認得的代碼）；不認得時 `None`
 pub fn known(code: &str) -> Option<&'static str> {
@@ -383,6 +455,24 @@ const ALL_CODES: &[&str] = &[
     E_CONFIG_NOT_FOUND,
     E_DIAG_FAILED,
     W_DIAG_TRUNCATED,
+    W_REMOTE_CONFIG_REJECTED,
+    I_REMOTE_CONFIG_OVERRIDDEN,
+    W_REMOTE_CONFIG_ROLLED_BACK,
+    I_REMOTE_CONFIG_DISABLED,
+    E_REMOTE_CONFIG_CACHE,
+    E_UPGRADE_SIGNATURE,
+    E_UPGRADE_INTEGRITY,
+    E_UPGRADE_TRUST_ANCHOR,
+    W_UPGRADE_DOWNLOAD,
+    E_UPGRADE_PRECHECK,
+    E_UPGRADE_REPLACE,
+    W_UPGRADE_ROLLED_BACK,
+    E_UPGRADE_ROLLBACK_FAILED,
+    I_UPGRADE_DISABLED,
+    W_UPGRADE_DOWNGRADE,
+    W_UPGRADE_UNSUPPORTED,
+    W_UPGRADE_SPACE,
+    I_UPGRADE_COMPLETED,
 ];
 
 /// 代碼的標題（`copywriting.md` §4.2 的範例標題；沒有範例的依 §3.3「情況」欄改寫）。
@@ -486,6 +576,24 @@ pub fn title(code: &str) -> Option<&'static str> {
         E_PENDING_QUEUE_FULL => "Kairos 的待核准佇列已滿",
         W_WITHDRAW_UNREPORTED => "無法向 Kairos 撤回註冊申請",
         E_LICENSE_EXHAUSTED => "授權節點數已滿",
+        W_REMOTE_CONFIG_REJECTED => "集中設定被拒，沿用上一版",
+        I_REMOTE_CONFIG_OVERRIDDEN => "部分集中設定由本機設定覆蓋",
+        W_REMOTE_CONFIG_ROLLED_BACK => "套用集中設定後失去連線，已回復上一版",
+        I_REMOTE_CONFIG_DISABLED => "集中設定在這台主機上停用",
+        E_REMOTE_CONFIG_CACHE => "遠端設定的快取無法使用，改用本機設定",
+        E_UPGRADE_SIGNATURE => "升級中止：發佈包的簽章驗證失敗",
+        E_UPGRADE_INTEGRITY => "發佈包與提議不符",
+        E_UPGRADE_TRUST_ANCHOR => "遠端升級已停用：信任錨無法使用",
+        W_UPGRADE_DOWNLOAD => "下載 Pulse 發佈包失敗，重試中",
+        E_UPGRADE_PRECHECK => "新版預檢失敗，沒有變更",
+        E_UPGRADE_REPLACE => "替換失敗，已復原",
+        W_UPGRADE_ROLLED_BACK => "升級後沒有恢復正常，已自動回滾",
+        E_UPGRADE_ROLLBACK_FAILED => "升級回滾失敗，需要人工處理",
+        I_UPGRADE_DISABLED => "遠端升級在這台主機上停用",
+        W_UPGRADE_DOWNGRADE => "不接受降版",
+        W_UPGRADE_UNSUPPORTED => "無法遠端升級：不支援的安裝方式或條件",
+        W_UPGRADE_SPACE => "磁碟空間不足，無法暫存 Pulse 發佈包",
+        I_UPGRADE_COMPLETED => "已升級到新版 Pulse",
         _ => return None,
     })
 }
@@ -547,6 +655,37 @@ mod tests {
         // INTEGRATION §31.6：多個伺服器位址與排空
         assert_eq!(CONN_FAILOVER.win_event_id, Some(2005));
         assert_eq!(CONN_DRAIN.win_event_id, Some(2007));
+        // log-ux.md §4.6：遠端管理 6000～6005、6100～6110
+        let remote: Vec<(&str, u16)> = ALL
+            .iter()
+            .filter(|e| {
+                e.name.starts_with("config.") && e.name != "config.warning"
+                    || e.name.starts_with("upgrade.")
+            })
+            .map(|e| (e.name, e.win_event_id.unwrap()))
+            .collect();
+        assert_eq!(
+            remote,
+            [
+                ("config.applied", 6000),
+                ("config.rejected", 6001),
+                ("config.rolled_back", 6002),
+                ("config.overridden", 6003),
+                ("config.cache_unavailable", 6004),
+                ("config.disabled", 6005),
+                ("upgrade.offered", 6100),
+                ("upgrade.declined", 6101),
+                ("upgrade.downloaded", 6102),
+                ("upgrade.download_failed", 6103),
+                ("upgrade.verify_failed", 6104),
+                ("upgrade.applying", 6105),
+                ("upgrade.completed", 6106),
+                ("upgrade.failed", 6107),
+                ("upgrade.rolled_back", 6108),
+                ("upgrade.rollback_failed", 6109),
+                ("upgrade.trust_anchor_unavailable", 6110),
+            ]
+        );
     }
 
     #[test]

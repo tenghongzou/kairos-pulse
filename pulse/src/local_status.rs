@@ -656,6 +656,17 @@ pub struct Tracker {
     spool: Mutex<Option<Arc<SharedSpool>>>,
     buffer: BufferSettings,
     writes: Mutex<WriteState>,
+    /// 遠端管理的摘要（寫出時呼叫；沒有時狀態檔不含 `management`）
+    management: Mutex<Option<ManagementSource>>,
+}
+
+/// 產生狀態檔 `management` 的函式
+pub struct ManagementSource(pub Box<dyn Fn() -> sf::Management + Send + Sync>);
+
+impl std::fmt::Debug for ManagementSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManagementSource")
+    }
 }
 
 impl Tracker {
@@ -673,6 +684,7 @@ impl Tracker {
             spool: Mutex::new(None),
             buffer,
             writes: Mutex::new(WriteState::default()),
+            management: Mutex::new(None),
         }
     }
 
@@ -704,22 +716,40 @@ impl Tracker {
         self.update(State::buffer_changed);
     }
 
+    /// 狀態檔的 `management`（遠端管理）由 `f` 產生
+    pub fn set_management(&self, f: ManagementSource) {
+        *self.management.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    fn management(&self) -> Option<sf::Management> {
+        self.management
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|f| (f.0)())
+    }
+
     /// 目前的內容，但不清除「有變化」的標記（`/metrics` 讀取，不影響狀態檔的寫出時機）
     pub fn peek(&self) -> StatusFile {
         let spool = self.spool.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let management = self.management();
         let mut state = self.lock();
         let changed = state.changed;
-        let file = state.snapshot(spool.as_deref(), &self.buffer);
+        let mut file = state.snapshot(spool.as_deref(), &self.buffer);
         state.changed = changed;
+        file.management = management;
         file
     }
 
     /// 目前的內容
     pub fn snapshot(&self) -> StatusFile {
         let spool = self.spool.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let management = self.management();
         let mut state = self.lock();
         state.changed = false;
-        state.snapshot(spool.as_deref(), &self.buffer)
+        let mut file = state.snapshot(spool.as_deref(), &self.buffer);
+        file.management = management;
+        file
     }
 
     /// 寫出一次；回傳寫入結果。已寫出結束前的最後一份時不再寫

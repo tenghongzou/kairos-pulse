@@ -33,7 +33,7 @@ pub const CHECK_USAGE: &str = "\
 pulse check-config — 檢查設定（不連線、不影響服務）
 
 用法：
-  pulse check-config [--strict] [--json] [-c <pulse.toml>]
+  pulse check-config [--strict] [--json] [--with-remote] [-c <pulse.toml>]
   pulse --check-config [...]               （相容寫法）
 
 選項：
@@ -41,6 +41,7 @@ pulse check-config — 檢查設定（不連線、不影響服務）
                        相對路徑與服務相同，以設定檔所在的目錄解析
       --strict         有警告時以結束代碼 8 結束
       --json           輸出 JSON（schema pulse.check-config/v1）
+      --with-remote    連同集中設定的快取（狀態目錄的 remote/config.json）合併後再檢查一次
 
 結束代碼：
   0 通過（有警告時仍為 0）  8 有警告（--strict）  3 設定錯誤  4 憑證或私鑰錯誤  2 用法錯誤";
@@ -69,6 +70,8 @@ pub struct CheckArgs {
     pub config: Option<String>,
     pub strict: bool,
     pub json: bool,
+    /// 連同遠端設定的快取一起檢查（特權輔助程式的預檢；REMOTE.md 第 10.2 節）
+    pub with_remote: bool,
 }
 
 /// `diag` 的參數
@@ -129,6 +132,7 @@ pub fn parse_check(args: &[String]) -> Result<CheckArgs, UsageError> {
         match args[i].as_str() {
             "--strict" => out.strict = true,
             "--json" => out.json = true,
+            "--with-remote" => out.with_remote = true,
             "-c" | "--config" => {
                 out.config = Some(value(args, &mut i, "--config", CHECK_USAGE)?.to_string())
             }
@@ -622,13 +626,71 @@ pub fn check(config_arg: Option<&str>) -> Report {
 
 /// `pulse check-config`
 pub fn run_check(args: CheckArgs) -> u8 {
-    let report = check(args.config.as_deref());
+    let mut report = check(args.config.as_deref());
+    if args.with_remote {
+        remote_check(&mut report);
+    }
     if args.json {
         println!("{}", report.to_json(args.strict));
     } else {
         print!("{}", report.render_text());
     }
     kp_obs::check::exit_code(&report.checks, args.strict)
+}
+
+/// `--with-remote`：遠端設定快取與目前的本機設定合併後，是否仍通過設定檢查
+fn remote_check(report: &mut Report) {
+    let Some(local) = report.config.clone() else {
+        return;
+    };
+    let sources = crate::remote::config::LocalSources::load(report.config_file.as_deref(), None);
+    let cache = crate::remote::state_dir().join(crate::remote::config::CACHE_RELATIVE);
+    let check = match crate::remote::config::effective_from_cache(&local, &sources, &cache) {
+        Ok((_, None)) => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Ok,
+            if local.remote_config.enabled {
+                "沒有下發的設定"
+            } else {
+                "本機停用（remote_config.enabled = false）"
+            },
+        ),
+        Ok((m, Some(a))) if m.errors.is_empty() => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Ok,
+            format!(
+                "第 {} 版與本機設定合併後合法（{} 個鍵由本機覆蓋）",
+                a.rev,
+                m.overridden.len()
+            ),
+        ),
+        Ok((m, Some(a))) => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Error,
+            format!("第 {} 版與本機設定合併後不合法", a.rev),
+        )
+        .code(codes::W_REMOTE_CONFIG_REJECTED)
+        .detail(format!(
+            "原因：{}",
+            m.errors
+                .iter()
+                .map(|e| format!("{}：{}", e.key, e.message))
+                .collect::<Vec<_>>()
+                .join("；")
+        )),
+        Err(e) => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Warning,
+            "遠端設定的快取無法使用（Pulse 會忽略它、改用本機設定）",
+        )
+        .code(codes::E_REMOTE_CONFIG_CACHE)
+        .detail(format!("原因：{}：{e}", cache.display())),
+    };
+    report.checks.push(check);
 }
 
 // ---- 診斷包 -----------------------------------------------------------------------------------
