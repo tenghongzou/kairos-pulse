@@ -13,6 +13,7 @@
 # 用法：
 #   sh pulse-install.sh (--base-url <URL> [--ca-file <檔案>] | --dir <目錄>) --allowed-signers <檔案>
 #                       [--install-string-file <檔案>] [--version <版本>] [--no-enroll] [--no-start]
+#                       [--no-remote-upgrade] [--no-remote-config]
 #
 #   --base-url <URL>          發佈處（含 SHA256SUMS、SHA256SUMS.sig 與套件的目錄）；也可以是 Kairos 註冊端點的
 #                             下載端點 https://<註冊端點>:8444/agent（Kairos 0.9 起，enroll.download_dir）
@@ -20,13 +21,16 @@
 #                             不在系統的信任清單中）。完整性仍以發佈公鑰驗證，不依賴 HTTPS
 #   --dir <目錄>              離線安裝：已下載好的發佈檔案所在的目錄
 #   --allowed-signers <檔案>  發佈公鑰（必須從另一個管道取得，INSTALL.md 第 2 節）；
-#                             也可用環境變數 PULSE_ALLOWED_SIGNERS
+#                             也可用環境變數 PULSE_ALLOWED_SIGNERS。0.9.0 起另外複製到
+#                             /etc/kairos-pulse/allowed_signers（root 644），作為遠端升級的信任錨
 #   --install-string-file <檔案>  從檔案讀取 Kairos 管理者提供的安裝字串（建議；或用環境變數
 #                             PULSE_INSTALL_STRING）。沒有安裝字串時只安裝、不註冊
 #   --install-string <字串>   同上，但不建議：命令列參數會留在 shell 歷史，執行期間其他帳號也能從 ps 看到
 #   --version <版本>          要安裝的版本（目錄中有多個版本時必填）
 #   --no-enroll               只安裝套件，不執行 pulse enroll
 #   --no-start                不啟動服務
+#   --no-remote-upgrade       不接受 Kairos 推送的升級（pulse.toml 寫入 [upgrade] enabled = false）
+#   --no-remote-config        不接受 Kairos 下發的設定（pulse.toml 寫入 [remote_config] enabled = false）
 #
 # 結束代碼：0 已註冊並啟動（或 --no-enroll 時已安裝）；7 已安裝、等待 Kairos 核准（服務在背景接續）；
 #   2 用法錯誤；3 不支援的系統；4 簽章或雜湊驗證失敗；5 下載失敗；6 安裝失敗；
@@ -58,6 +62,8 @@ INSTALL_STRING=${PULSE_INSTALL_STRING:-}
 VERSION=""
 ENROLL=1
 START=1
+REMOTE_UPGRADE=1
+REMOTE_CONFIG=1
 while [ $# -gt 0 ]; do
     case "$1" in
     --base-url) BASE_URL=${2:?--base-url 需要 URL}; shift 2 ;;
@@ -74,7 +80,9 @@ while [ $# -gt 0 ]; do
     --version) VERSION=${2:?--version 需要版本}; shift 2 ;;
     --no-enroll) ENROLL=0; shift ;;
     --no-start) START=0; shift ;;
-    -h | --help) sed -n '2,36p' "$0"; exit 0 ;;
+    --no-remote-upgrade) REMOTE_UPGRADE=0; shift ;;
+    --no-remote-config) REMOTE_CONFIG=0; shift ;;
+    -h | --help) sed -n '2,41p' "$0"; exit 0 ;;
     *) die 2 "未知的參數「$1」（--help 查看用法）" ;;
     esac
 done
@@ -179,6 +187,26 @@ else
     fi
 fi
 /opt/pulse/pulse --version >&2
+
+# 4b. 遠端管理（crates/kairos-proto/REMOTE.md 第 4.2.1、5.6 節）：信任錨放在預設位置（root 擁有、
+#     其他人不可寫）；退出選項寫進 pulse.toml（只能在本機改，輔助程式也只讀 pulse.toml）
+ANCHOR=/etc/kairos-pulse/allowed_signers
+if [ "$(readlink -f "$SIGNERS")" != "$ANCHOR" ]; then
+    install -d -o root -g root -m 755 /etc/kairos-pulse
+    install -o root -g root -m 644 "$SIGNERS" "$ANCHOR"
+    say "已放置遠端升級的信任錨 $ANCHOR"
+fi
+add_section() {
+    # $1 = 區段名稱；已有該區段時不重複加入（請手動編輯）
+    if grep -q "^\[$1\]" /opt/pulse/pulse.toml 2>/dev/null; then
+        echo "注意：/opt/pulse/pulse.toml 已有 [$1]，請手動設定 enabled = false" >&2
+    else
+        printf '\n[%s]\nenabled = false\n' "$1" >> /opt/pulse/pulse.toml
+        say "已在 /opt/pulse/pulse.toml 停用 [$1]"
+    fi
+}
+[ "$REMOTE_UPGRADE" = 1 ] || add_section upgrade
+[ "$REMOTE_CONFIG" = 1 ] || add_section remote_config
 
 # 5. 註冊（私鑰在本機產生，不會離開這台主機）；需人工核准時不等待，服務在背景接續
 code=0

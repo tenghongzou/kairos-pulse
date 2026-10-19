@@ -26,6 +26,8 @@ pub const USAGE: &str = "\
   diag               產生支援診斷包（自動遮蔽私鑰、token 等敏感資料；pulse diag --help）
   explain <代碼>     說明錯誤代碼，例如 pulse explain PLS-E2003
   service            Windows 服務的安裝、移除與服務進入點（pulse service --help）
+  config show        顯示可由 Kairos 集中管理的設定與來源（pulse config --help）
+  upgrade            遠端升級的本機狀態與手動回滾（Linux；pulse upgrade --help）
 
 選項：
   --print-agent-id   印出本機 agent_id（agent.id 不存在時先產生）後結束，不連線
@@ -134,6 +136,14 @@ pub enum Command {
     Service(crate::winsvc::ServiceArgs),
     /// `pulse service --help`
     ServiceHelp,
+    /// `pulse config show`（集中設定）
+    Config(crate::remote::cli::ConfigShowArgs),
+    /// `pulse config --help`
+    ConfigHelp,
+    /// `pulse upgrade status|apply|rollback`（遠端升級）
+    Upgrade(crate::remote::cli::UpgradeArgs),
+    /// `pulse upgrade --help`
+    UpgradeHelp,
 }
 
 /// 參數錯誤：訊息與要附上的用法
@@ -207,6 +217,18 @@ where
             return Ok(match crate::enroll::cli::parse_decommission(&args[1..])? {
                 Some(a) => Command::Decommission(a),
                 None => Command::DecommissionHelp,
+            });
+        }
+        Some("config") => {
+            return Ok(match crate::remote::cli::parse_config(&args[1..])? {
+                Some(a) => Command::Config(a),
+                None => Command::ConfigHelp,
+            });
+        }
+        Some("upgrade") => {
+            return Ok(match crate::remote::cli::parse_upgrade(&args[1..])? {
+                Some(a) => Command::Upgrade(a),
+                None => Command::UpgradeHelp,
             });
         }
         _ => {}

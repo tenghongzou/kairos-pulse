@@ -473,6 +473,14 @@ impl Spool {
     }
 
     /// 本次程序的 `boot_id`
+    /// 集中設定改變了 `buffer.max_mb`、`max_records`、`max_age_hours`：之後寫入時依新的上限丟掉最舊的資料
+    /// （`PLS-W4202`），過期的判斷也改用新的保留時間（REMOTE.md 第 3.1 節）。目錄不變
+    pub fn set_limits(&mut self, max_bytes: u64, max_records: usize, max_age: Duration) {
+        self.settings.max_bytes = max_bytes;
+        self.settings.max_records = max_records;
+        self.settings.max_age = max_age;
+    }
+
     pub fn boot_id(&self) -> &str {
         &self.boot_id
     }

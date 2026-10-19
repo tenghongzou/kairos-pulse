@@ -32,6 +32,13 @@ contents:
   - src: "@STAGE@/pulse.service"
     dst: /usr/lib/systemd/system/pulse.service
     file_info: {mode: 0644, owner: root, group: root}
+  # 遠端升級的輔助程式（crates/kairos-proto/REMOTE.md 第 4.4.1 節）：postinstall 啟用 pulse-upgrade.path
+  - src: "@STAGE@/pulse-upgrade.path"
+    dst: /usr/lib/systemd/system/pulse-upgrade.path
+    file_info: {mode: 0644, owner: root, group: root}
+  - src: "@STAGE@/pulse-upgrade.service"
+    dst: /usr/lib/systemd/system/pulse-upgrade.service
+    file_info: {mode: 0644, owner: root, group: root}
   - src: /opt/pulse/pulse
     dst: /usr/bin/pulse
     type: symlink

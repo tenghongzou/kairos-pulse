@@ -1,6 +1,6 @@
 # 遠端管理：集中設定與 agent 遠端升級（F8）
 
-〔衝刺 8 規格。第 14 節 D1～D18 已決定（2026-10-19，採建議）：Kairos 0.9.0／Pulse 0.9.0 實作 MVP（D15：集中設定＋Linux 升級＋兩批推送＋最小主控台），其餘延到 0.10.0。**S1（共用 crate）已實作**（衝刺 9）：第 2 節已搬入 [`PROTOCOL.md`](PROTOCOL.md)「遠端管理」並以它為準，`kairos-proto` 的 `mgmt`、`release` 模組；**K1／K2（Kairos）已實作**（衝刺 9，實作附註與差異見第 13.1 節），Kairos 0.9.0 在 mTLS、SQLite 的連線上宣告 `config`、`upgrade`；P1／P2（Pulse）另一條線實作中〕
+〔衝刺 8 規格。第 14 節 D1～D18 已決定（2026-10-19，採建議）：Kairos 0.9.0／Pulse 0.9.0 實作 MVP（D15：集中設定＋Linux 升級＋兩批推送＋最小主控台），其餘延到 0.10.0。**S1（共用 crate）已實作**（衝刺 9）：第 2 節已搬入 [`PROTOCOL.md`](PROTOCOL.md)「遠端管理」並以它為準，`kairos-proto` 的 `mgmt`、`release` 模組。**K1／K2（Kairos 端）與 P1／P2（Pulse 端）都已實作**（衝刺 9）：Kairos 0.9.0 在 mTLS、SQLite 的連線上宣告 `config`、`upgrade`（實作附註與差異見第 13.1 節）；Pulse 0.9.0 帶 `install`、宣告 `config`／`upgrade`（實作附註與差異見第 17 節）；兩端都是 0.9.0 時協商這兩個 feature〕
 
 本文件是商業審計 F8「agent 遠端升級與集中設定」的工程規格：8443 上的兩個新 feature `config`、`upgrade`（協定版本維持 v2），Kairos 端的設定檔、發佈版本庫與分批推送，Pulse 端的設定合併、升級狀態機與特權輔助程式，安全模型、資料表（schema v9 草案）、主控台 API 草案、畫面需求、錯誤代碼（暫定）、測試策略與實作分工。
 
@@ -696,7 +696,7 @@ health_timeout_secs = 0
 
 ## 6. Kairos 端儲存（schema v9 草案）
 
-> schema 號碼待整合時與 A2 HA、匯出、隱私線協調（本文件開頭）。以下 SQL 為草案，實作時以 `store/sqlite.rs` 的 `SCHEMA_V9`（或順延的號碼）為準。
+> schema 號碼：整合後為 **v9**（其他線沒有用到新的 schema 版本；K1／K2 實作，[`kairos/STORAGE.md`](../../kairos/STORAGE.md) 第 18 節）。以下 SQL 為草案，以 `store/sqlite/` 的 `SCHEMA_V9` 與第 13.1 節的差異為準。
 
 ```sql
 -- 集中設定
@@ -1132,3 +1132,69 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `kairos/STORAGE.md` | schema 版本（第 3.2 節）、新資料表、`data/releases/` 與備份 |
 | `kairos/README.md`、`kairos.example.toml` | `[remote]` |
 | `CHANGELOG.md` | [0.9.0]：功能、相容性（第 2.6 節）、升級步驟（0.8 → 0.9 必須手動一次，第 4.10 節）、新代碼、尚未實機驗證（Windows） |
+
+## 17. P1／P2 實作附註（Pulse 端，衝刺 9）
+
+〔衝刺 9，已與 K1／K2（第 13.1 節）一起整合。範圍依 D15：集中設定（P1）與 Linux 的遠端升級（P2）；Windows（P3）、外部 URL、維護時段與雙人覆核延到 0.10.0。設定說明見 `pulse/README.md`「集中設定與遠端升級」、`pulse/packaging/INSTALL.md` 第 10.1 節，代碼見 `pulse/ERROR-CODES.md` 2.9〕
+
+### 17.1 程式位置
+
+| 規格 | 程式（`pulse/src/`） |
+|---|---|
+| 第 5.6 節的本機開關 | `config_manager.rs` 的 `[remote_config]`、`[upgrade]`（`config.toml` 有說明） |
+| 第 2.1、4.3、4.4.5 節的 `install` 與安裝方式偵測、第 4.2.1 節的信任錨檢查 | `remote/install.rs` |
+| 第 3.3～3.7 節（合併、驗證、套用、快取、確認期、回復） | `remote/config.rs`（`CentralConfig`；合併以 `mgmt::settings::check_remote`／`merge_key`，重新連線以 `needs_reconnect`） |
+| 每條連線上的訊息（`pending`、`config_get`／`config_status`、`upgrade_*`） | `remote/conn.rs`（`MgmtConn`），由 `network.rs` 的兩個連線迴圈呼叫 |
+| 第 4.6 節的 Pulse 端狀態機（評估、下載、驗證、暫存、交付、回報） | `remote/upgrade/mod.rs`（`UpgradeAgent`；`<狀態目錄>/upgrade/state.json`） |
+| 第 4.4.1～4.5 節的輔助程式 | `remote/upgrade/helper.rs`（`pulse upgrade apply`；`pulse/packaging/pulse-upgrade.path`、`pulse-upgrade.service`） |
+| `request.json`、`result.json` 與不信任的檔案的讀取 | `remote/upgrade/files.rs` |
+| 第 10.2、10.3 節的命令與 `pulse status` | `remote/cli.rs`、`status_cmd/eval.rs`（「設定」列與「升級」列）、`status_file.rs` 的 `management` |
+| 即時的鍵的套用與重建 | `main.rs` 的 `pipeline`、`collect_live`、`spawn_live_logging`；`inventory.rs` 的 `InventoryAgent::update`、`spool.rs` 的 `set_limits`、`backoff.rs` 的 `set_limits` |
+
+### 17.2 規格未明定、由實作決定的行為
+
+1. **`config_status.effective`** 列出白名單的**每一個**鍵（不只下發的鍵），兩層物件。
+2. **`rolled_back`** 的 `rev`／`hash` 為**失敗的那一版**（快取記下它的雜湊），`errors` 為空、`code` 為 `PLS-W0504`；收到 `ack` 後之後的連線回報目前套用的版本（`applied`）。
+3. **快取無法寫入**時不套用新的版本，回報 `state: rejected`、`code: PLS-E0506`、`errors` 為空（第 3.7 節「改用本機設定」）。快取損毀時忽略並記 `config.cache_unavailable`。快取另存 `skip_rev`（回復過的版本）、`rolled_back`（待回報）、`disabled_reported`（停用的通知已送出）。
+4. **確認期**：即時套用的版本在 `max(3 × heartbeat.interval, 60 秒)` 內沒有斷線即確認；需要重新連線的版本（或即時套用後斷線了）以下一次成功的 `hello_ack` 確認。「確認前連續 3 次無法完成 `hello_ack`」只計**在連線上收到 `config` 而套用**的版本；重新啟動後接續的確認期（`pending_apply` 還在）以第一次成功的 `hello_ack` 確認、不因連線失敗而回復（Kairos 可能剛好停機），崩潰由 `pending_apply.starts`（連續 2 次）判斷。
+5. **`pending.config_rev = 0`** 而本機有下發的設定時，不送 `config_get`，就地回到本機與內建預設，回報 `applied`、`rev: 0`、`hash: ""`。
+6. **連上不支援 `config` 的 Kairos** 時改用本機設定（不刪快取）；之後連回支援的 Kairos 時恢復快取的版本。兩者之間的切換若改變了需要重新連線的鍵，會再重連一次。
+7. **即時的鍵**：`log.level` 立即；`report.interval`、`collect.*`、`processes.interval`／`top`／`command` 以新的設定重新開始取樣（下一筆在一個新的間隔之後）；`inventory.*` 的間隔與序號、位址的開關在下一次收集；`buffer.max_*` 在下一次寫入；`retry.*`、`buffer.replay_interval_ms` 與 hello 的 `report_interval_ms` 在下一次連線（含退避的計算）。需要重新連線的鍵在 `config_status` 收到 `ack`（或結果不明）後結束連線，連線迴圈以生效的設定**重建**取樣、本機緩衝（關閉後重新開啟，積壓保留）與連線；重連前另加 0～`min(heartbeat.interval, 5)` 秒的隨機延遲（大量主機同時套用時分散）。
+8. **升級提議的評估順序**：格式（不合法 → `declined`、`PLS-E8402`）→ 本機狀態 → 進行中的升級（已交付時 `declined`、`detail: upgrade_in_progress`、`code: null`；同一個目標版本且已暫存時沿用暫存，回報新 ID 的 `accepted`〔`detail: reused_staged`〕與 `staged`）→ 來源 → 平台 → 暫存空間 → 信任錨與簽章（**下載前**先驗證簽章、清單與發佈檔在 `SHA256SUMS` 中的雜湊；失敗時直接回報 `failed`，沒有 `accepted`）→ 版本政策。全部通過才 `accepted` 並開始下載；下載完成後以實際的 SHA-256 再檢查一次才 `staged`。
+9. **進度**：`state: accepted` 附 `progress`（25%、50%、75%），`staged` 附 100%；Kairos 以 (`upgrade_id`, `state`) 去重時，`accepted` 的進度更新應只更新 `bytes_done`／`bytes_total`。
+10. **交付前再確認**：已暫存的升級進入 `apply_window` 時，先對同一個 `upgrade_id` 再送一次 `upgrade_get`；收到內容相同的提議（時段與 `health_timeout_secs` 可更新）才交付，收到 `upgrade_unavailable`（推送已暫停或取消）時不替換、保留暫存，10 分鐘後（或下一條連線）再確認。避免 Kairos 取消推送後，主機仍從先前暫存的檔案替換。
+11. **交付**：先送 `applying`，收到 `ack`（最多等 15 秒）才寫 `request.json`；寫入失敗時 `failed`（`PLS-E8406`）。替換中 Pulse 每 5 秒輪詢 `result.json`（預檢失敗時 Pulse 沒有被重新啟動）。
+12. **健康確認**（第 4.5.1 節）：服務 `ActiveState=active`；`NRestarts` **任何增加**即判定失敗（比「1 分鐘內崩潰 3 次」嚴格：`Restart=always` 下第一次崩潰就是失敗）；狀態檔的 `pid` 等於 `MainPID`、`version` 等於期望的版本、`running`；`connection.state = "registered"`；`reporting.last_ack_at` 不早於重新啟動的時間；符合後再穩定 60 秒（期間不符時重新起算）。結束代碼 2／3／4 立即回滾。輔助程式的狀態檔位置為 `pulse.toml` 的 `status.file`（相對路徑以安裝目錄解析），沒有設定時為 `<狀態目錄>/status.json`。
+13. **預檢**的解開方式：tar 以 `tar -xzf … --no-same-owner`、deb 以 `dpkg-deb -x`、rpm 以 `rpm2cpio | cpio -idm`（第 5.5 節的固定外部程式另外加上這三個）；以 `pulse` 帳號（`getpwnam`、`setuid`／`setgid`，清空環境變數、只給 `PATH` 與 `STATE_DIRECTORY`）執行 `--version` 與 `check-config --json --with-remote`。
+14. **`pulse-upgrade.service` 的 `TimeoutStartSec`** 為 2.5 小時（健康確認最長 1 小時，回滾後再確認 `max(期限, 300 秒)`，另有套件資料庫最多 10 分鐘的重試）；被 systemd 中止時，`request.json` 仍在，`pulse-upgrade.path` 再次觸發並依步驟接續。
+15. **輔助程式寫 Pulse 可寫的目錄**（`result.json`）時，暫存檔以 `O_EXCL`＋`O_NOFOLLOW` 新建後改名，不會被服務帳號預先放好的符號連結導向其他檔案；刪除暫存與 `request.json` 不跟隨符號連結。
+16. **安裝方式與就緒狀態在每次連線前重新偵測**（放好信任錨、啟用 `pulse-upgrade.path` 後不必重新啟動 Pulse；`upgrade.enabled` 與信任錨的路徑只在啟動時讀取）；Windows 以「執行檔在 `%ProgramFiles%\Pulse`」判斷 `msi`（否則 `zip`），`install.upgrade` 一律 `unsupported`（0.10.0 改以登錄的 UpgradeCode 判斷）。
+17. **`pulse upgrade rollback --yes`** 只對 tar 安裝動作（換回 `pulse.prev`、`systemctl restart`）；deb／rpm 顯示套件管理員的回滾方式。
+18. **`[remote_config]`、`[upgrade]` 以 `pulse.toml` 的值為準**（與輔助程式一致：信任錨的路徑、`extra_principals`、`allow_downgrade`、`health_timeout_secs`），`PULSE__REMOTE_CONFIG__ENABLED`、`PULSE__UPGRADE__ENABLED` 只能關閉（`pulse.toml` 與環境變數都不為 `false` 才算開啟），其他 `PULSE__UPGRADE__*` 不影響遠端升級。
+19. `upgrade.trust_anchor_unavailable`（`PLS-E8403`）在啟動時記一則 `ERROR`，不另寫 stderr（大多數從 0.8 手動升級、還沒放信任錨的主機都會有，避免 journal 告警）。
+
+### 17.3 與規格的差異
+
+| # | 規格 | 實作 | 理由 |
+|---|---|---|---|
+| 1 | 第 4.4.2 節：deb／rpm 以提議的 `rollback_artifact` 回滾 | 回滾檔沒有簽章可驗證（`SHA256SUMS` 屬於另一次發佈，提議中沒有）。Pulse 只在本機保存過**它所屬發佈的、驗證過的** `SHA256SUMS`（`<狀態目錄>/upgrade/releases/<版本>/`，每次驗證通過的發佈都會保存，只留目前與目標版本）時才下載並交給輔助程式，輔助程式以信任錨重新驗證後才 `dpkg -i`／`rpm -U --oldpackage`；否則改以替換前保留的 `pulse.prev` 回復執行檔，`detail` 附 `binary_restored_package_db_shows_<版本>` | 否則被入侵的 Kairos 可以讓健康確認失敗（不 `ack` report），讓主機以 root 安裝它提供的任意套件，違反第 1 節原則 2。代價：從 0.9.0 手動安裝後的第一次遠端升級沒有可用的回滾檔（之後的升級就有）；建議 0.10.0 在 `upgrade_offer` 加入選用的 `rollback_bundle`（回滾檔所屬發佈的 `sha256sums`、`signature`），見第 17.5 節 |
+| 2 | 第 4.1.2 節：外部 URL（`source: "url"`）以本機白名單下載 | 0.9.0 一律 `declined`（`PLS-W8411`、`detail: url_not_allowed`）；`url_allowlist`、`external_ca` 已可設定與驗證格式，0.10.0 起使用 | D15 |
+| 3 | 第 4.4.1 節：`TimeoutStartSec` 為健康確認上限加 15 分鐘 | 2.5 小時 | 17.2 #14 |
+| 4 | 第 5.5 節：外部程式只有 `systemctl`、`dpkg`、`rpm`、`msiexec`、`sc` | 另有預檢用的 `tar`、`dpkg-deb`、`rpm2cpio`、`cpio`（固定路徑、參數由程式組成） | 第 4.4.1 節步驟 4 的預檢需要解開發佈檔 |
+| 5 | 第 10.2 節：`pulse config show` 不加 `--effective` 時「列出設定」 | 只列出白名單的鍵（本機與內建預設，`--effective` 另合併快取）；完整設定請看 `pulse check-config`／`pulse diag` | 指令的目的在集中設定 |
+
+### 17.4 與 Kairos 端（K1／K2）的對接
+
+- **`config`** 的 `seq` 必須等於 `config_get` 的 `seq`；`hash` 與 `settings` 不符的 `config` 會被當作沒有收到（Pulse 記 `WARN`，不回 `config_status`，下一次心跳的 `pending` 會再觸發 `config_get`）。Kairos 也可以對 `config_rev = 0` 回 `config`（`settings: {}`），Pulse 兩種都能處理。
+- **`config_status`** 在每條新連線的 `hello_ack` 之後一定送一次（含本機從未套用過時的 `rev: 0`、`hash: ""`、`state: applied`）；停用的主機只送一次 `state: disabled`（之後不宣告 `config`，`install.config` 為 `disabled`）。
+- **同一個 `upgrade_id` 的 `upgrade_get` 可能出現多次**：交付前的再確認（17.2 #10）。推送仍在進行時請回同一份提議（`apply_window` 可以更新）；已暫停或取消時回 `upgrade_unavailable`。
+- **`pending.upgrade_id`**：Pulse 對已處理過的 ID（進行中、已結束、這條連線上 `upgrade_unavailable` 的）不再送 `upgrade_get`；已暫存的升級不需要 Kairos 一直帶著它的 ID。
+- **段落**：Pulse 依序請求、最多 2 段在途，`length` 為 1～32768；回應的 `data` 可以比 `length` 短（不是最後一段時 Pulse 從檔案長度重新請求），最後一段須 `eof: true`。`rate_limited` 請帶 `retry_after_ms`（沒有時 Pulse 等 30 秒）。
+- **`upgrade_status`** 的 `accepted` 會帶進度重送多次（17.2 #9）；`applying` 之後的終止狀態由替換後的 Pulse（新版或回滾後的舊版）在重新連線後送出，可能晚於 `health_timeout_secs`（替換＋健康確認＋穩定 60 秒）。`detail` 可能是 `reused_staged`、`unit_not_updated`、`binary_restored_package_db_shows_<版本>`、`url_not_allowed`、`upgrade_in_progress`、`min_upgrade_from: <版本>`、`downgrade_not_allowed`、`insufficient_space: …` 等。
+- **`bad_request` 的 `seq` 為 `null`** 時 Pulse 無法對應到哪一則請求：之後的回應抵達時，比它早送出而沒有回應的請求視為結果不明（設定的請求下一條連線重送；升級狀態最多重送 3 次後放棄）。
+- **`install.method`** 只會是 `tar`、`deb`、`rpm`、`unknown`（Linux）或 `msi`、`zip`（Windows，0.9.0 的 `install.upgrade` 一律 `unsupported`）。
+
+### 17.5 待決（附建議）
+
+1. **回滾檔的信任**（17.3 #1）：建議 0.10.0 在 `upgrade_offer` 加選用欄位 `rollback_bundle: {sha256sums, signature}`（Kairos 版本庫有該版本時附上；舊版 Pulse 忽略），Pulse 與輔助程式以信任錨驗證後即可使用，第一次遠端升級也能以套件回滾。
+2. **系統層驗證**（第 12.3 節）：建議在 kp-build 以 systemd 容器（Debian 12、Rocky 9）執行一次 deb／rpm／tar 的實際升級與回滾（`pulse-upgrade.path` 觸發、`dpkg -i`、重新開機後接續）後再發佈 0.9.0；目前以假的 systemd 與套件管理員驗證。

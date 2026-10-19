@@ -53,6 +53,8 @@ use crate::protocol::{
     clock_skew_warning, hello_features, now_ts, parse_server_msg, report_message,
     sanitize_cpu_usage,
 };
+use crate::remote::RemoteMgmt;
+use crate::remote::conn::MgmtConn;
 use crate::rotation::{HelloAckExtra, Rotation, RotationLine};
 use crate::server_addr::Candidate;
 use crate::service_status;
@@ -287,6 +289,9 @@ pub struct Settings {
     pub processes_feature: bool,
     /// `inventory.enabled` 時的資產收集與送出紀錄：hello 宣告 `inventory`（`None` 時不宣告）
     pub inventory: Option<Arc<InventoryAgent>>,
+    /// 遠端管理（集中設定、遠端升級；`crates/kairos-proto/REMOTE.md`）：hello 帶 `install`、宣告
+    /// `config`／`upgrade`。`None` 時（測試、一次性連線）不帶也不宣告
+    pub mgmt: Option<Arc<RemoteMgmt>>,
 }
 
 impl Settings {
@@ -319,7 +324,18 @@ impl Settings {
             grace_on_expiry: false,
             processes_feature: config.processes.enabled,
             inventory: None,
+            mgmt: None,
         }
+    }
+
+    /// 遠端管理的集中設定改變了即時的鍵（`retry.*`、`buffer.replay_interval_ms`、`report.interval`）：
+    /// 下一次連線（含退避）起使用新的值（REMOTE.md 第 3.1 節「即時（下一次斷線）」）
+    fn refresh_live(&mut self, config: &AppConfig) {
+        self.max_retries = config.retry.max_retries;
+        self.initial_delay = Duration::from_secs(config.retry.initial_delay);
+        self.max_delay = Duration::from_secs(config.retry.max_delay);
+        self.replay_interval = Duration::from_millis(config.effective_replay_interval_ms());
+        self.host.report_interval_ms = Some(config.report.interval.saturating_mul(1000));
     }
 
     /// 候選位址的數量
@@ -384,6 +400,8 @@ enum SessionError {
         /// 已夾在 1000～300000 的 `reconnect_within_ms`
         reconnect_within_ms: u32,
     },
+    /// 集中設定改變了需要重新連線的鍵（REMOTE.md 第 3.1 節）：結束連線，以新的設定重建取樣與連線
+    Reconfigure,
 }
 
 impl SessionError {
@@ -472,6 +490,7 @@ impl fmt::Display for SessionError {
             Self::Shutdown => write!(f, "收到結束要求"),
             Self::Renewed => write!(f, "已取得新的用戶端憑證，以新憑證重新連線"),
             Self::Drained { .. } => write!(f, "Kairos 要求改連其他節點（drain）"),
+            Self::Reconfigure => write!(f, "集中設定改變了需要重新連線的設定，以新的設定重新連線"),
         }
     }
 }
@@ -606,6 +625,8 @@ pub enum RunExit {
     CertExpired,
     /// 經 8443 取得新憑證（`client.next.pem`）：以新憑證確認後取代
     Renewed,
+    /// 集中設定改變了需要重新連線的鍵（或確認失敗回復了上一版）：以新的設定重建取樣與連線
+    Reconfigure,
 }
 
 /// 連線主迴圈：無限重連，直到 `shutdown` 被觸發才返回。
@@ -650,6 +671,9 @@ async fn run_with<D: Dialer>(
     spool: Option<&Arc<SharedSpool>>,
     shutdown: &CancellationToken,
 ) -> RunExit {
+    // 集中設定的即時鍵（重連退避、補送間隔、report 間隔）在每一輪開始時更新
+    let mut live = settings.clone();
+    let settings = &mut live;
     let mut backoff = Backoff::new(settings.initial_delay, settings.max_delay);
     let mut throttles = ServerLogThrottles::default();
     // 連續因 superseded 而斷線的次數（其他原因斷線即歸零）
@@ -690,6 +714,11 @@ async fn run_with<D: Dialer>(
     }
 
     loop {
+        if let Some(m) = settings.mgmt.clone() {
+            let effective = m.config.effective();
+            settings.refresh_live(&effective);
+            backoff.set_limits(settings.initial_delay, settings.max_delay);
+        }
         // ---- 一輪：從 next_start 開始依序嘗試每個候選位址 ----
         let start = std::mem::take(&mut next_start);
         let mut attempts: Vec<AttemptError> = Vec::new();
@@ -729,11 +758,32 @@ async fn run_with<D: Dialer>(
                     log::info!("已取得新的用戶端憑證，結束目前的連線，改以新憑證連線");
                     return RunExit::Renewed;
                 }
+                Err(SessionError::Reconfigure) => {
+                    if let Some(m) = &settings.mgmt {
+                        m.config.on_disconnected();
+                    }
+                    if let Some(rot) = &settings.rotation {
+                        rot.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .on_disconnect();
+                    }
+                    return RunExit::Reconfigure;
+                }
                 Err(e) => e,
             };
             if let Some(at) = registered_at {
+                if let Some(m) = &settings.mgmt {
+                    m.config.on_disconnected();
+                }
                 ended = Some((index, err, at));
                 break;
+            }
+            // 收到 hello_ack 之前失敗：集中設定的確認期內連續 3 次時回復上一份可用的設定
+            if let Some(m) = &settings.mgmt
+                && m.config.on_connect_failed()
+            {
+                log::info!("已回復上一份可用的集中設定，以回復後的設定重新連線（{err}）");
+                return RunExit::Reconfigure;
             }
             let cert_requested = dialer.client_cert_was_requested();
             if k + 1 < n {
@@ -1384,7 +1434,7 @@ async fn session<D: Dialer>(
         Err(SessionError::Shutdown) => {
             conn.close_gracefully().await;
         }
-        Err(SessionError::Drained { .. }) => conn.close_quietly().await,
+        Err(SessionError::Drained { .. } | SessionError::Reconfigure) => conn.close_quietly().await,
         _ => {}
     }
     result
@@ -1457,6 +1507,20 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // 版本協商（A3）：proto 送 1（v1 Kairos 只接受 1），另以 proto_min／proto_max 宣告支援 1～2；
     // v2 的欄位（features、主機資訊）舊版 Kairos 會忽略
     let seq = conn.next_seq();
+    // 遠端管理（REMOTE.md 第 2.1 節）：install 不論是否宣告都送；config／upgrade 依本機狀態宣告
+    // （安裝方式與遠端升級的就緒狀態每次連線前重新偵測）
+    if let Some(m) = &settings.mgmt {
+        m.upgrade.refresh_detection();
+    }
+    let mgmt_features: Vec<&'static str> = settings
+        .mgmt
+        .as_ref()
+        .map(|m| m.features())
+        .unwrap_or_default();
+    let mut host = settings.host.clone();
+    if let Some(m) = &settings.mgmt {
+        host.install = Some(m.install_info());
+    }
     conn.send(&ClientMsg::Hello {
         seq,
         proto: Proto::Version(SUPPORTED_PROTO.min),
@@ -1480,10 +1544,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     f.extend(settings.extra_features.iter().cloned());
                     // 叢集連線（節點名稱與排空）：服務的主連線一律宣告（PROTOCOL.md「叢集與排空」）
                     f.push(kairos_proto::FEATURE_CLUSTER.to_string());
+                    f.extend(mgmt_features.iter().map(|m| m.to_string()));
                     f
                 }),
             },
-            settings.host.clone(),
+            host,
         )),
     })
     .await?;
@@ -1538,6 +1603,13 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .on_hello_ack(negotiated, &ack.extra, offset);
     }
+    // 遠端管理（feature config／upgrade）：v2 且雙方都宣告
+    let mgmt_session =
+        kairos_proto::MgmtSession::new(session.proto, &mgmt_features, &ack.server_features);
+    let mut mgmt = settings
+        .mgmt
+        .clone()
+        .map(|m| MgmtConn::start(m, mgmt_session, ack.pending.as_ref()));
     let (level, msg) = registered_log(settings, &ack, tls_info);
     log::log!(level, "{}{msg}", codes::tag(codes::CONN_REGISTERED, None));
     if let Some((level, msg)) = ack
@@ -1566,6 +1638,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     (session.processes, kairos_proto::FEATURE_PROCESSES),
                     (renew_negotiated, kairos_proto::FEATURE_RENEW),
                     (cluster, kairos_proto::FEATURE_CLUSTER),
+                    (mgmt_session.config, kairos_proto::FEATURE_CONFIG),
+                    (mgmt_session.upgrade, kairos_proto::FEATURE_UPGRADE),
                 ]
                 .into_iter()
                 .filter(|(on, _)| *on)
@@ -1620,12 +1694,16 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         _ => None,
     };
 
+    if mgmt.as_ref().is_some_and(MgmtConn::wants_reconnect) {
+        return Err(SessionError::Reconfigure);
+    }
+
     // 本機緩衝（A5）：協商了 durable 時改走 at-least-once 的迴圈；沒有協商（舊版 Kairos）時，
     // 這條連線期間的新取樣照舊即時送出（at-most-once），緩衝中的積壓保留到連上支援 durable 的 Kairos
     if let Some(shared) = spool {
         if session.durable {
             return serve_durable(
-                conn, settings, session, cluster, shared, inventory, throttles,
+                conn, settings, session, cluster, shared, inventory, mgmt, throttles,
             )
             .await;
         }
@@ -1675,6 +1753,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 let snap = inventory.as_mut().and_then(|i| i.on_snapshot(Instant::now()));
                 send_inventory(conn, inventory.as_mut(), snap, None).await?;
             }
+            _ = sleep_until_opt(mgmt.as_ref().and_then(MgmtConn::next_wake)) => {
+                send_mgmt(conn, mgmt.as_mut(), None).await?;
+            }
             Some(sample) = reports.recv() => {
                 if let Some(pending) = pending_report {
                     // 伺服器寫檔緩慢時不再堆送：report 為 at-most-once，這次取樣直接丟棄
@@ -1721,10 +1802,16 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     })
                     .await);
                 }
-                let outcome = match inventory_line(&mut inventory, &line, conn.seq) {
+                let outcome = match mgmt_line(&mut mgmt, &line, conn.seq) {
                     Some(answered) => LineOutcome::valid(answered),
-                    None => handle_server_line(&line, conn.seq, throttles)?,
+                    None => match inventory_line(&mut inventory, &line, conn.seq) {
+                        Some(answered) => LineOutcome::valid(answered),
+                        None => handle_server_line(&line, conn.seq, throttles)?,
+                    },
                 };
+                if mgmt.as_ref().is_some_and(MgmtConn::wants_reconnect) {
+                    return Err(SessionError::Reconfigure);
+                }
                 // 只有合法的協定訊息才算「伺服器還活著」（與 Kairos 的閒置判定一致）；
                 // 無法解析的行不重置閒置計時，持續送垃圾的伺服器仍會被判定為閒置
                 if outcome.valid {
@@ -2010,6 +2097,7 @@ impl Delivery {
 /// 協商了 durable 的連線主迴圈：依序送出緩衝中的記錄（先補送積壓、再送新的取樣），
 /// 同一時間最多 [`DURABLE_IN_FLIGHT`] 筆在途，兩筆之間至少間隔 `buffer.replay_interval_ms`；
 /// 收到 ack 才從緩衝移除。heartbeat、讀取閒置與伺服器訊息的處理與 at-most-once 的迴圈相同
+#[allow(clippy::too_many_arguments)]
 async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Connection<S>,
     settings: &Settings,
@@ -2017,6 +2105,7 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
     cluster: bool,
     shared: &Arc<SharedSpool>,
     mut inventory: Option<InventoryConn>,
+    mut mgmt: Option<MgmtConn>,
     throttles: &mut ServerLogThrottles,
 ) -> Result<Infallible> {
     let read_idle = settings.read_idle_timeout();
@@ -2073,6 +2162,9 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                 let snap = inventory.as_mut().and_then(|i| i.on_snapshot(Instant::now()));
                 send_inventory(conn, inventory.as_mut(), snap, Some(&mut delivery)).await?;
             }
+            _ = sleep_until_opt(mgmt.as_ref().and_then(MgmtConn::next_wake)) => {
+                send_mgmt(conn, mgmt.as_mut(), Some(&mut delivery)).await?;
+            }
             // 收集 task 寫入了新的取樣：重新計算下一筆的送出時間
             _ = shared.notify.notified() => {}
             _ = sleep_until_opt(next_send) => {
@@ -2112,12 +2204,18 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                     })
                     .await);
                 }
-                let outcome = match inventory_line(&mut inventory, &line, conn.seq) {
+                let outcome = match mgmt_line(&mut mgmt, &line, conn.seq) {
                     Some(answered) => LineOutcome::valid(answered),
-                    None => handle_server_line_in(&line, conn.seq, throttles, true)?,
+                    None => match inventory_line(&mut inventory, &line, conn.seq) {
+                        Some(answered) => LineOutcome::valid(answered),
+                        None => handle_server_line_in(&line, conn.seq, throttles, true)?,
+                    },
                 };
                 if outcome.valid {
                     idle.as_mut().reset(after(read_idle));
+                }
+                if mgmt.as_ref().is_some_and(MgmtConn::wants_reconnect) {
+                    return Err(SessionError::Reconfigure);
                 }
                 // inventory 的回應也要從在途清單移除（緩衝記錄編號為 None，不影響緩衝）
                 if let Some((seq, reply)) = durable_reply(&line) {
@@ -2190,6 +2288,38 @@ fn inventory_line(
     };
     inv.on_line(line, answered, Instant::now())
         .map(|_| answered)
+}
+
+/// 送出遠端管理排定的訊息（`config_status`、`config_get`、`upgrade_*`）。durable 連線另記入在途清單，
+/// 讓回應的順序對得上
+async fn send_mgmt<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    mgmt: Option<&mut MgmtConn>,
+    mut delivery: Option<&mut Delivery>,
+) -> Result<()> {
+    let Some(m) = mgmt else {
+        return Ok(());
+    };
+    while let Some(msg) = m.pop(conn.seq.saturating_add(1)) {
+        let seq = conn.next_seq();
+        conn.send(&msg).await?;
+        if let Some(d) = delivery.as_deref_mut() {
+            d.sent(seq, None);
+        }
+        log::debug!("已送出遠端管理的訊息（seq={seq}）");
+    }
+    if m.wants_reconnect() {
+        return Err(SessionError::Reconfigure);
+    }
+    Ok(())
+}
+
+/// 一行伺服器訊息若是遠端管理請求的回應，交給 [`MgmtConn::on_line`] 處理並回傳它回應的 seq；
+/// 其他訊息回傳 `None`（照一般的方式處理）
+fn mgmt_line(mgmt: &mut Option<MgmtConn>, line: &str, last_sent_seq: u64) -> Option<Option<u64>> {
+    mgmt.as_mut()?
+        .on_line(line, last_sent_seq)
+        .map(|h| h.answered)
 }
 
 /// 正常輪替的時點檢查間隔（連線建立後立即檢查一次）
@@ -2597,6 +2727,8 @@ struct HelloAckInfo {
     server_node: Option<String>,
     /// 叢集的 UUID（協商了 `cluster`、Kairos 以叢集模式執行時）
     cluster_id: Option<String>,
+    /// 遠端管理的 `pending`（協商了 `config` 或 `upgrade` 時；v2）
+    pending: Option<kairos_proto::Pending>,
 }
 
 /// 等待 hello_ack（整體 5 s）。
@@ -2639,8 +2771,7 @@ fn handle_pre_ack_line(
             renew_now,
             server_node,
             cluster_id,
-            // 遠端管理（feature config／upgrade）：P1／P2 實作時使用；目前不宣告，Kairos 不會送
-            pending: _,
+            pending,
         }) => {
             if !(SUPPORTED_PROTO.min..=SUPPORTED_PROTO.max).contains(&proto) {
                 return Err(SessionError::ProtoMismatch(proto));
@@ -2673,6 +2804,7 @@ fn handle_pre_ack_line(
                 },
                 server_node: server_node.filter(|_| session.is_v2()),
                 cluster_id: cluster_id.filter(|_| session.is_v2()),
+                pending: pending.filter(|_| session.is_v2()),
             }))
         }
         // 會結束連線，頻率受退避限制，不需節流；日誌由重連迴圈統一記錄一次
@@ -2699,7 +2831,7 @@ fn handle_pre_ack_line(
             );
             Ok(None)
         }
-        // 遠端管理（feature config／upgrade）：本版不宣告，與舊版收到不認得的 type 相同
+        // 遠端管理（feature config／upgrade）：都是回應 Pulse 的請求，註冊前不會出現
         Ok(ServerMsg::Config(_) | ServerMsg::UpgradeOffer(_) | ServerMsg::UpgradeChunk(_)) => {
             throttled!(
                 throttles.unknown_type,
@@ -2851,7 +2983,7 @@ fn handle_server_line_in(
             );
             Ok(LineOutcome::valid(None))
         }
-        // 遠端管理（feature config／upgrade）：本版不宣告（P1／P2 實作），與舊版收到不認得的 type 相同
+        // 遠端管理（feature config／upgrade）：協商了的連線上由 MgmtConn 先處理；到這裡的是沒有協商的連線
         Ok(ServerMsg::Config(_) | ServerMsg::UpgradeOffer(_) | ServerMsg::UpgradeChunk(_)) => {
             throttled!(
                 throttles.unknown_type,
@@ -3086,6 +3218,9 @@ mod tests {
     use tokio::io::{DuplexStream, duplex};
     use tokio_rustls::rustls::{AlertDescription, Error as TlsError};
 
+    // 遠端管理（feature config、upgrade）的連線整合測試：src/network/tests/mgmt.rs
+    mod mgmt;
+
     fn settings(hb: u64) -> Settings {
         Settings {
             address: "127.0.0.1".into(),
@@ -3110,6 +3245,7 @@ mod tests {
             grace_on_expiry: false,
             processes_feature: false,
             inventory: None,
+            mgmt: None,
         }
     }
 
@@ -3703,6 +3839,7 @@ mod tests {
         // F4：原本「已建立 TLS 加密連線」INFO 的資訊改附在註冊成功的 INFO
         let s = settings(1);
         let ack = |offline_after_ms, proto| HelloAckInfo {
+            pending: None,
             offline_after_ms,
             session: Session::new(proto, CLIENT_FEATURES, CLIENT_FEATURES),
             server_time: None,

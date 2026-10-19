@@ -224,3 +224,42 @@ listen = ""
 # "/var/lib/node_exporter/textfile_collector/pulse.prom"；以寫暫存檔再改名的方式原子更新）
 textfile = ""
 textfile_interval = 15   # textfile 的更新間隔（秒，5～3600）
+
+[remote_config]
+# 集中設定（Kairos 0.9.0 以上、SQLite 儲存、mTLS 時協商 feature「config」；crates/kairos-proto/REMOTE.md 第 3 節）：
+# 接受 Kairos 下發的部分設定——心跳與回報間隔、重連退避、[collect] 的採集範圍、[processes]／[inventory]／[buffer]
+# 的開關與上限、log.level、log.retention_days。連線位址、憑證、身分、路徑、syslog 與本區段、[upgrade]
+# 永遠只能在本機設定，Kairos 送來也會被忽略。
+# 合併順序（後者優先）：內建預設值 < Kairos 下發 < pulse.toml < PULSE__* 環境變數——本機明確寫出的鍵
+# 永遠優先，主控台會顯示為「本機覆蓋」（PLS-I0503）；要交給 Kairos 管理的鍵請從 pulse.toml 移除。
+# 例外：collect.interface_exclude 與本機的清單取聯集；processes.command、inventory.hardware_serials、
+# inventory.network_addresses 只接受比本機（或內建預設）更保守的值（不能由中央重新開啟採集）。
+# 下發的值不合法時整份拒絕、沿用上一版（PLS-W0501）；套用後若連線一直無法恢復則自動回復上一份可用的設定
+# （PLS-W0504）。套用的設定快取在狀態目錄的 remote/config.json（Linux 為 /var/lib/pulse，Windows 為
+# %ProgramData%\Pulse），Kairos 停機或重新啟動 Pulse 後沿用；連上不支援集中設定的 Kairos 時不使用快取。
+# false = 不宣告 config、只用本機設定（快取保留不用；停用後第一次連線會通知 Kairos 一次，PLS-I0505）
+enabled = true
+
+[upgrade]
+# 遠端升級（Kairos 0.9.0 以上、SQLite 儲存、mTLS 時協商 feature「upgrade」；REMOTE.md 第 4 節）：
+# 接受 Kairos 推送的「官方簽章」Pulse 發佈包，下載後以本機的信任錨驗證簽章與雜湊，再交給 root 的
+# pulse-upgrade.service 重新驗證、替換、重新啟動與健康確認，失敗時自動回滾。0.9.0 只支援 Linux 的
+# tar／deb／rpm 安裝（systemd，單一實例）；Windows、外部 URL 下載在 0.10.0。
+# 本區段只能寫在 pulse.toml（輔助程式只讀 pulse.toml）；PULSE__UPGRADE__* 環境變數只能用來關閉。
+# false = 不宣告 upgrade（PLS-I8409）
+enabled = true
+# 信任錨：ssh-keygen 的 allowed_signers 格式，必須由 root 擁有、其他人不可寫；找不到或權限過寬時
+# 遠端升級停用（PLS-E8403）。只接受 ssh-ed25519 金鑰與 namespaces="kairos-pulse-release"、valid-after、
+# valid-before 選項。空字串 = 預設位置：Linux /etc/kairos-pulse/allowed_signers，
+# Windows %ProgramData%\Pulse\allowed_signers
+allowed_signers = ""
+# 除 release@kairos-pulse 之外另外接受的 principal（以自己的金鑰重新簽署 SHA256SUMS 時，例如 ["release@example.gov.tw"]）
+extra_principals = []
+# 接受遠端降版（推送也必須允許，PLS-W8410）。升級失敗時的自動回滾不受這個設定影響
+allow_downgrade = false
+# 允許從外部 URL 下載的前綴（https://…/）；0.10.0 起使用，0.9.0 一律只從 Kairos 下載
+url_allowlist = []
+# 外部 URL 的 CA（PEM）；0.10.0 起使用。空字串 = 作業系統信任庫
+external_ca = ""
+# 替換後的健康確認期限（秒）：0 = 依 Kairos 推送的值（預設 600）；非 0 時取兩者較大（120～3600）
+health_timeout_secs = 0
