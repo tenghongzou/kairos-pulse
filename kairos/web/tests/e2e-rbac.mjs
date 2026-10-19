@@ -33,6 +33,13 @@ const PAGES = [
   ['/enrollment/tokens', '註冊 token', ['admin', 'operator', 'auditor']],
   ['/certificates', '憑證', ['admin', 'operator', 'auditor']],
   ['/certificates/ca', 'CA 與撤銷清單', ['admin', 'operator', 'auditor']],
+  // Pulse 管理（F8，0.9）：唯讀看不到；建立推送只限管理員（rollouts:write）；主機詳情的「設定」分頁需要 config:read
+  ['/pulse/config', '集中設定', ['admin', 'operator', 'auditor']],
+  ['/pulse/config/assignments', '集中設定', ['admin', 'operator', 'auditor']],
+  ['/pulse/rollouts', '升級推送', ['admin', 'operator', 'auditor']],
+  ['/pulse/rollouts/new', '建立推送', ['admin']],
+  ['/pulse/releases', 'Pulse 版本庫', ['admin', 'operator', 'auditor']],
+  ['/hosts/11111111-1111-4111-8111-000000000001/config', 'web-01', ['admin', 'operator', 'auditor']],
   ['/audit', '稽核日誌', ['admin', 'operator', 'auditor']],
   ['/admin/users', '使用者與角色', ['admin', 'auditor']],
   ['/admin/roles', '', ['admin', 'auditor']],
@@ -44,17 +51,18 @@ const PAGES = [
   ['/account', '個人設定', ['admin', 'operator', 'auditor', 'viewer']],
 ];
 
-const ALL_NAV = ['總覽', '主機', '告警事件', '告警規則', '靜音與維護', '通知管道', '待核准', '註冊 token', '憑證', 'CA 與撤銷清單', '稽核日誌', '使用者與角色', '目錄服務', '系統健康', '系統設定'];
+const PULSE_NAV = ['集中設定', '升級推送', 'Pulse 版本庫'];
+const ALL_NAV = ['總覽', '主機', '告警事件', '告警規則', '靜音與維護', '通知管道', '待核准', '註冊 token', '憑證', 'CA 與撤銷清單', ...PULSE_NAV, '稽核日誌', '使用者與角色', '目錄服務', '系統健康', '系統設定'];
 const NAV = {
   admin: ALL_NAV,
-  operator: ['總覽', '主機', '告警事件', '告警規則', '靜音與維護', '通知管道', '待核准', '註冊 token', '憑證', 'CA 與撤銷清單', '稽核日誌', '系統健康', '系統設定'],
-  auditor: ['總覽', '主機', '告警事件', '告警規則', '靜音與維護', '待核准', '註冊 token', '憑證', 'CA 與撤銷清單', '稽核日誌', '使用者與角色', '目錄服務', '系統健康', '系統設定'],
+  operator: ['總覽', '主機', '告警事件', '告警規則', '靜音與維護', '通知管道', '待核准', '註冊 token', '憑證', 'CA 與撤銷清單', ...PULSE_NAV, '稽核日誌', '系統健康', '系統設定'],
+  auditor: ['總覽', '主機', '告警事件', '告警規則', '靜音與維護', '待核准', '註冊 token', '憑證', 'CA 與撤銷清單', ...PULSE_NAV, '稽核日誌', '使用者與角色', '目錄服務', '系統健康', '系統設定'],
   viewer: ['總覽', '主機', '告警事件', '靜音與維護', '系統健康'],
 };
 const SECTIONS = {
-  admin: ['監控', '註冊與憑證', '稽核與報表', '管理', '系統'],
-  operator: ['監控', '註冊與憑證', '稽核與報表', '系統'],
-  auditor: ['監控', '註冊與憑證', '稽核與報表', '管理', '系統'],
+  admin: ['監控', '註冊與憑證', 'Pulse 管理', '稽核與報表', '管理', '系統'],
+  operator: ['監控', '註冊與憑證', 'Pulse 管理', '稽核與報表', '系統'],
+  auditor: ['監控', '註冊與憑證', 'Pulse 管理', '稽核與報表', '管理', '系統'],
   viewer: ['監控', '系統'],
 };
 
@@ -97,6 +105,18 @@ const WRITES = [
   ['POST', `/api/v1/api-tokens/${NOBODY}/revoke`, 'api_tokens:write'],
   ['PUT', '/api/v1/directory/mappings', 'directory:write'],
   ['POST', '/api/v1/directory/test', 'directory:write'],
+  // 遠端管理（F8）：集中設定開放維運者；版本庫、建立與執行推送只限管理員；暫停推送維運者也可以
+  ['POST', '/api/v1/config/profiles', 'config:write'],
+  ['PUT', '/api/v1/config/profiles/999999', 'config:write'],
+  ['DELETE', '/api/v1/config/profiles/999999', 'config:write'],
+  ['POST', '/api/v1/config/assignments', 'config:write'],
+  ['DELETE', '/api/v1/config/assignments/999999', 'config:write'],
+  ['POST', '/api/v1/releases', 'releases:write'],
+  ['DELETE', '/api/v1/releases/0.0.1', 'releases:write'],
+  ['POST', '/api/v1/rollouts', 'rollouts:write'],
+  ['POST', `/api/v1/rollouts/r-${NOBODY}/submit`, 'rollouts:write'],
+  ['POST', `/api/v1/rollouts/r-${NOBODY}/cancel`, 'rollouts:write'],
+  ['POST', `/api/v1/rollouts/r-${NOBODY}/pause`, 'rollouts:pause'],
 ];
 
 // 清單頁 → 第一筆的詳情頁（也掃描寫入按鈕）：[清單路徑, 詳情連結的選擇器]
@@ -106,10 +126,13 @@ const DETAILS = [
   ['/alerts/channels', 'tbody tr a[href^="/alerts/channels/"]'],
   ['/enrollment/tokens', 'tbody tr a[href^="/enrollment/tokens/"]'],
   ['/admin/users', 'tbody tr a[href^="/admin/users/"]'],
+  ['/pulse/config', 'tbody tr a[href^="/pulse/config/"]'],
+  ['/pulse/rollouts', 'tbody tr a[href^="/pulse/rollouts/"]'],
+  ['/pulse/releases', 'tbody tr a[href^="/pulse/releases/"]'],
 ];
 
 // 寫入按鈕的名稱（開頭的動詞；ds-button、連結樣式的按鈕、開關）
-const WRITE_VERBS = /^(新增|建立|核准|拒絕|撤銷|停用|啟用|刪除|儲存|套用|確認|指派|解決|暫停通知|立即更新|匯入|匯出 CSR|允許再次|寄送測試|結束所有|重設|解除鎖定|編輯|改用|複製$|移除|更換|臨時靜音|排定維護|提前結束|取消排程|以帳號測試)/;
+const WRITE_VERBS = /^(新增|建立|核准|拒絕|撤銷|停用|啟用|刪除|儲存|套用|確認|指派|解決|暫停通知|立即更新|匯入|匯出 CSR|允許再次|寄送測試|結束所有|重設|解除鎖定|編輯|改用|複製$|移除|更換|臨時靜音|排定維護|提前結束|取消排程|以帳號測試|解除指派|回復到|上傳|送出推送|暫停…|繼續…|取消推送|標記為已處理)/;
 
 // 寫入按鈕 → 需要的權限：[頁面路徑的正規式, 按鈕名稱的正規式, 權限]（ia.md §4.2；權限名稱見 API.md 第 12.1 節）
 const BUTTON_PERMS = [
@@ -144,6 +167,12 @@ const BUTTON_PERMS = [
   [/^\/system\/settings/, /^改用(設定檔的值|內建預設值)：enroll\./, 'enroll.mode:write'],
   [/^\/system\/settings/, /^改用(設定檔的值|內建預設值)：pki\./, 'pki.policy:write'],
   [/^\/system\/settings/, /^(建立 API token|撤銷)/, 'api_tokens:write'],
+  // Pulse 管理（F8）：S24 集中設定（config:write，維運者可寫）、S25 版本庫（releases:write）、S26 推送（rollouts:write／pause）
+  [/^\/pulse\/config/, /^(新增設定檔|新增指派|指派$|解除指派|儲存$|刪除設定檔|移除|回復到)/, 'config:write'],
+  [/^\/pulse\/releases/, /^(匯入版本|上傳發佈檔|刪除版本)/, 'releases:write'],
+  [/^\/pulse\/rollouts/, /^(建立推送|送出推送|繼續…|取消推送)/, 'rollouts:write'],
+  [/^\/pulse\/rollouts\//, /^暫停…/, 'rollouts:pause'],
+  [/^\/hosts\//, /^標記為已處理/, 'rollouts:write'],
 ];
 
 // 有權限的角色一定看得到的寫入按鈕：[頁面, 按鈕名稱的正規式, 權限]
@@ -156,6 +185,10 @@ const EXPECTED = [
   ['/system/settings/security', /^套用模式/, 'enroll.mode:write'],
   ['/system/settings/integrations', /^建立 API token/, 'api_tokens:write'],
   ['/hosts/11111111-1111-4111-8111-000000000001', /^更多$/, 'hosts:purge'],
+  ['/pulse/config', /^新增設定檔/, 'config:write'],
+  ['/pulse/config/assignments', /^新增指派/, 'config:write'],
+  ['/pulse/releases', /^匯入版本/, 'releases:write'],
+  ['/pulse/rollouts', /^建立推送/, 'rollouts:write'],
 ];
 
 /** 主要內容中看得到的按鈕名稱（含 role="switch" 的開關）；enabled＝可以按的（aria-disabled／disabled 的不算） */

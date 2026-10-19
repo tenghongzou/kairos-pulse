@@ -125,3 +125,54 @@ export function qs(params) {
   const s = sp.toString();
   return s ? `?${s}` : '';
 }
+
+/**
+ * 上傳檔案（PUT，本文為檔案內容 `application/octet-stream`；Pulse 版本庫的發佈檔，API.md 第 17.2 節）。
+ * 以 XMLHttpRequest 送出才能回報上傳進度（fetch 沒有上傳進度）；瀏覽器依 Blob 的大小帶 Content-Length（不是 chunked）。
+ * @param {string} path
+ * @param {Blob} file
+ * @param {object} opts  onProgress(loaded, total)、signal（AbortSignal）
+ * @returns {Promise<any>}  回應的 data；錯誤時丟出 ApiError
+ */
+export function upload(path, file, { onProgress, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', path);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('Accept', 'application/json');
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.withCredentials = true;
+    if (onProgress) xhr.upload.addEventListener('progress', (ev) => onProgress(ev.loaded, ev.lengthComputable ? ev.total : file.size));
+    if (signal) signal.addEventListener('abort', () => xhr.abort());
+    xhr.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    xhr.addEventListener('error', () => {
+      connectivity(false);
+      reject(new ApiError({ code: 'network', message: 'upload failed' }));
+    });
+    xhr.addEventListener('load', () => {
+      connectivity(xhr.status !== 502 && xhr.status !== 504);
+      let json = null;
+      try {
+        json = JSON.parse(xhr.responseText);
+      } catch {
+        json = null;
+      }
+      if (json && json.server_time) syncServerTime(json.server_time);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(json ? json.data : null);
+        return;
+      }
+      const e = (json && json.error) || {};
+      const err = new ApiError({
+        status: xhr.status,
+        code: e.code || 'internal',
+        productCode: e.product_code || null,
+        message: e.message || xhr.statusText,
+        details: e.details || null,
+      });
+      if (err.status === 401 && err.code === 'unauthorized' && hooks.onUnauthorized) hooks.onUnauthorized(err);
+      reject(err);
+    });
+    xhr.send(file);
+  });
+}

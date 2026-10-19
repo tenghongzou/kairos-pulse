@@ -12,6 +12,7 @@ import { ADMIN_STRINGS } from './strings-admin.js';
 import { METRICS_STRINGS } from './strings-metrics.js';
 import { EXPORT_STRINGS } from './strings-export.js';
 import { PRIVACY_STRINGS } from './strings-privacy.js';
+import { REMOTE_STRINGS } from './strings-remote.js';
 
 const M = {
   // ---- 共用 ----
@@ -618,6 +619,8 @@ Object.assign(M, METRICS_STRINGS);
 Object.assign(M, EXPORT_STRINGS);
 // 個資保護（S6：S05 的匯出個資與刪除主機資料、S12 的一行安裝指令、S14 的匯入憑證）
 Object.assign(M, PRIVACY_STRINGS);
+// 遠端管理（F8：Pulse 管理的 S24～S26、S04 的篩選、S05 的設定分頁與升級卡片）
+Object.assign(M, REMOTE_STRINGS);
 
 /** 文字；缺少 key 時回傳 key 本身並記錄錯誤（Playwright 測試檢查主控台沒有錯誤） */
 export function t(key, params) {

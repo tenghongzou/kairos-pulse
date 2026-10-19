@@ -5,6 +5,7 @@
 // 區塊標題也不顯示。只列出**已實作**的畫面：沒有畫面的功能不顯示停用中的假選單
 // （decisions/INTEGRATION.md §28.6「隱藏」的原則）。新增畫面時在這裡加一項，並在 routes.js 加路由。
 import { ADMIN_NAV } from './nav-admin.js';
+import { PULSE_NAV } from './nav-pulse.js';
 
 export const NAV = [
   {
@@ -31,5 +32,5 @@ export const NAV = [
     ],
   },
 ];
-// 稽核、管理、系統（S16～S18、S20、S21）：nav-admin.js
-NAV.push(...ADMIN_NAV);
+// Pulse 管理（F8：S24～S26）：nav-pulse.js；稽核、管理、系統（S16～S18、S20、S21）：nav-admin.js
+NAV.push(...PULSE_NAV, ...ADMIN_NAV);

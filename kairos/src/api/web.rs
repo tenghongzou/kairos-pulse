@@ -183,13 +183,15 @@ fn asset_response(
 }
 
 /// 網頁介面的路由的第一段（設計包 `ia.md` §3 網站地圖；`/` 為總覽）。其他路徑回 404（本文仍是 index.html）
-pub const SPA_ROOTS: [&str; 15] = [
+pub const SPA_ROOTS: [&str; 16] = [
     "login",
     "hosts",
     "account",
     "alerts",
     "enrollment",
     "certificates",
+    // 遠端管理（F8，0.9.0）：S24 集中設定、S25 Pulse 版本庫、S26 升級推送
+    "pulse",
     "audit",
     "reports",
     "admin",
@@ -317,6 +319,10 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         // 路由的參數可以含 `.`（帳號 alice.w）
         let (r, html) = serve(&Method::GET, "/admin/users/alice.w", &h);
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(html);
+        // 遠端管理（F8）：版本詳情的版本號含 `.`
+        let (r, html) = serve(&Method::GET, "/pulse/releases/0.9.1", &h);
         assert_eq!(r.status(), StatusCode::OK);
         assert!(html);
         let (r, _) = serve(&Method::GET, "/assets/nope.js", &h);

@@ -144,6 +144,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 主機的最後中斷原因新增 `server_lost`「Kairos 節點失聯」（0.9.0 的單機 Kairos 不會產生）；不認得的 `offline_reason` 一律顯示「其他原因」，原始值在技術細節。Webhook 等接收端也應忽略不認得的值。
 - SSE `resync` 依原因顯示 Banner（重新啟動、切換節點〔0.10〕、離線太久），主機清單、總覽與告警事件自動重新載入。
 - S21 指標轉出卡片、S05 刪除主機資料與假名化說明、S12 下載目錄不完整（只對管理員）、S14 匯入憑證的文案依 §31 定案；`error-codes.js` 依設計包重新產生（Kairos 152 個代碼）。
+- **Pulse 管理**（F8 W1；設計包 S24～S26）：側邊導覽新增「Pulse 管理」區塊——**集中設定**（同步狀態、依 `config/schema` 產生的設定檔表單、影響預覽與 1,000 台以上的確認、指派與衝突、版本歷史與回復）、**升級推送**（單頁的建立推送與資格預覽、L2「升級 N 台」／降版 L3 送出、詳情的批次與主機表、暫停／繼續／取消／重試；計數泡泡＝已暫停的推送＋未處理的回滾失敗）、**Pulse 版本庫**（匯入時驗證簽章並逐檔上傳、詳情、刪除 L2）。主機清單新增「設定狀態」「遠端升級」篩選；主機詳情新增「設定」分頁與「升級」卡片（回滾失敗的「標記為已處理…」）。功能關閉（503 `remote_unavailable`）時顯示說明；權限依 7 個新權限隱藏操作。雙人覆核、維護時段、外部 URL、Windows 推送在 0.10，主控台不顯示。
 
 ### 共用 crate：遠端管理的協定與信任鏈（F8 S1；PROTOCOL.md「遠端管理」、`crates/kairos-proto/REMOTE.md`）
 
@@ -165,7 +166,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 ### 規格（尚未實作）
 
 - **`kairos/HA.md`**（審計 A2，高可用）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址等分層設計與量測計畫；第 21 節的 20 項待決已決定（2026-10-19，採建議）。0.9.0 實作 L1a 儲存抽象與 L4 Pulse 多位址（L4 已包含於本草稿，見上方），PostgreSQL 後端與叢集協調在 0.10.0。STORAGE.md 的「限制與後續」連到 HA.md。
-- **`crates/kairos-proto/REMOTE.md`**（F8，集中設定與 agent 遠端升級）：第 14 節 D1～D18 已決定（2026-10-19，採建議）；0.9.0 實作 MVP（D15）。協定部分（第 2 節）已搬入 PROTOCOL.md，共用型別已實作（見上方「共用 crate：遠端管理的協定與信任鏈」）；Kairos 的行為（K1、K2，實作附註與差異見 REMOTE.md 第 13.1 節）與 Pulse 的行為（P1、P2，見 REMOTE.md 第 17 節）都已實作（見上方）；主控台畫面（W1）在另一條開發線，尚未包含。
+- **`crates/kairos-proto/REMOTE.md`**（F8，集中設定與 agent 遠端升級）：第 14 節 D1～D18 已決定（2026-10-19，採建議）；0.9.0 實作 MVP（D15）。協定部分（第 2 節）已搬入 PROTOCOL.md，共用型別已實作（見上方「共用 crate：遠端管理的協定與信任鏈」）；Kairos 的行為（K1、K2，實作附註與差異見 REMOTE.md 第 13.1 節）與 Pulse 的行為（P1、P2，見 REMOTE.md 第 17 節）都已實作（見上方）；主控台畫面（W1）也已實作（見上方「主控台」）。
 
 ### 新的產品代碼（設計包 `decisions/INTEGRATION.md` §31.3 正式分配）
 
@@ -207,7 +208,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 遠端升級（Pulse 0.9.0）只支援 Linux；Windows 的 MSI／zip、外部 URL 下載、推送的維護時段與雙人覆核在 0.10.0。0.8 → 0.9 必須手動升級一次。
 - 遠端升級的系統層驗證（REMOTE.md 第 12.3 節：systemd 容器中實際安裝 deb／rpm、`pulse-upgrade.path` 觸發、重新開機後接續）尚未執行；輔助程式以假的 systemd 與套件管理員驗證（`remote::upgrade::helper::tests`），集中設定以實際的 Kairos 與 Pulse 互通驗證（`tests/e2e/tests/remote_interop.rs`），升級流程的兩端分別以假 client（`remote.rs`）與假 Kairos（`network::tests::mgmt`）驗證，沒有實際兩端互通的升級測試。
 - 刪除主機資料沒有雙人覆核（設計包的選項，之後與其他雙人覆核一起做）。
-- 遠端管理（F8 MVP）：Windows 的遠端升級、維護時段（推送的 `schedule`／`windows`）、雙人覆核（`rollouts:approve`、`KRS-E6106`）、外部 URL 的版本庫、自訂批次（多於兩批）在 0.10.0；`kairos releases` 的 CLI、SSE `rollout.host`與升級中主機的離線告警抑制尚未提供（REMOTE.md 第 13.1 節）。降版推送的 L3 確認不要求重新驗證密碼（設計包 §31.12 #7）。
+- 遠端管理（F8 MVP）：Windows 的遠端升級、維護時段（推送的 `schedule`／`windows`）、雙人覆核（`rollouts:approve`、`KRS-E6106`）、外部 URL 的版本庫、自訂批次（多於兩批）在 0.10.0；`kairos releases` 的 CLI、SSE `rollout.host`與升級中主機的離線告警抑制尚未提供（REMOTE.md 第 13.1 節）。降版推送的 L3 確認不要求重新驗證密碼（設計包 §31.12 #7）。主控台尚未提供：S20 系統健康的「遠端管理」列、S04 agent 版本欄的「低於建議版本」、全域搜尋的推送與設定檔。
 
 ### 測試
 
@@ -216,6 +217,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 整合：`integration_tests::privacy_policy_is_applied_before_anything_is_stored`、`api::privacy_tests::purge_and_personal_data_over_https`。
 - 端對端（`tests/e2e`）：`privacy.rs`（假名與網段、主控台與 CLI 的刪除、個資匯出）、`enroll.rs` 的 `grace_period_is_enforced_and_an_override_extends_it`（ENROLL.md 第 19.3 節 #14）、`manually_issued_certificate_is_imported_and_revocation_takes_effect`、`download_endpoint_serves_the_release_files`。
 - 主控台（Playwright＋axe）：`e2e-privacy.mjs`（S05 的權限、仍連線中、匯出、L2 刪除；S12 一行指令；S14 匯入），`e2e-rbac.mjs` 加入新按鈕與端點。
+- 主控台的 Pulse 管理：`e2e-remote.mjs`（版本庫的匯入與簽章錯誤、推送的 L2 送出與暫停／繼續／取消、集中設定的設定檔／指派／版本與回復、主機頁的篩選與「設定」「升級」、稽核員與唯讀的權限、功能關閉）；`e2e-rbac.mjs` 加入「Pulse 管理」的頁面、按鈕與 11 個寫入端點。
 - Pulse 多位址與 `cluster`：Pulse 的候選清單、輪替與 `drain` 處理、`status`／`check-config`／`diag` 的顯示，Kairos 的 `hello_ack.server_node`、關機排空與 `[cluster] node_id`，`kairos-proto` 的 `cluster` 型別與測試向量；端對端：兩個 Kairos 的換節點與排空。
 - 端對端測試的連接埠（`tests/e2e`）：`free_port()` 原本綁定 0 後立即釋放、等 Kairos 之後再綁定，作業系統分配的臨時埠可能在空檔被同時執行的其他測試的連線搶走（偶發 `Address already in use`）。改為從臨時埠範圍之外挑選、同一個測試行程內不重複，並以綁定但不監聽的 socket 佔住到 Kairos 啟動前一刻；Kairos 仍因連接埠被佔用而結束（結束代碼 11）時，等到可以綁定後以相同設定重新啟動（最多 3 次，`start_kairos`）。另修正 `manually_issued_certificate_is_imported_and_revocation_takes_effect` 在回應之後才檢查日誌的競態（改為等待 `KRS-W1105` 出現）。
 - 遠端管理的共用型別（`kairos-proto`）：PROTOCOL.md「範例／遠端管理」的 18 則測試向量（含真實的 `SHA256SUMS`、簽章、清單與分段資料，`upgrade_offer` 的向量以測試的 `allowed_signers` 驗證到底）、`mgmt::tests`（協商、`pending` 的容錯、`install`、各訊息的限制、正規化 JSON、白名單與 REMOTE.md 第 3.1 節一致、合併與隱私規則）、`release::tests`（`ssh-keygen` 產生的正確簽章、錯誤 namespace、錯誤金鑰、`hashalg=sha256`、被修改的 `SHA256SUMS`、`valid-after`／`valid-before`、`cert-authority` 與 RSA 等被拒絕的行、客戶重新簽署的 principal、`SHA256SUMS`、檔名、清單、SemVer 先後順序、降版政策）。
