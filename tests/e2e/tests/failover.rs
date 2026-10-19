@@ -153,8 +153,11 @@ fn killing_the_primary_fails_over_and_keeps_durable_data() {
         p.dump(),
         kb.dump()
     );
+    // 換節點很快、停機期間沒有取樣也沒有在途的 report 時沒有積壓（「連線已恢復…backlog=0」），也就不會有
+    // 「已補送完」；沒有缺漏與重複由最後的 assert_no_gaps_or_duplicates 檢查
     assert!(
-        poll_until(WAIT, || p.count("已補送完本機緩衝中的積壓") >= 1),
+        poll_until(WAIT, || p.count("已補送完本機緩衝中的積壓") >= 1
+            || p.count("開始補送  delivery=durable backlog=0 ") >= 1),
         "{}",
         p.dump()
     );
