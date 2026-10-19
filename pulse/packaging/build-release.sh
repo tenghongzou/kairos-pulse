@@ -19,8 +19,9 @@ NAME=pulse                           # 執行檔名稱（Cargo 的 bin 名稱）
 EXAMPLE_SRC=config.toml              # 產品目錄中的預設設定（編譯時嵌入，放進發佈包作為範例）
 EXAMPLE_DST=pulse.example.toml       # 放進發佈包時的檔名
 UNIT_SRC=packaging/pulse.service     # systemd unit 範本（Linux）
-# 其他放進發佈包根目錄的檔案：錯誤代碼對照（pulse explain 指向它）、Prometheus 告警規則範例
-EXTRA_SRC="ERROR-CODES.md packaging/pulse-alerts.example.yml"
+# 其他放進發佈包根目錄的檔案：錯誤代碼對照（pulse explain 指向它）、Prometheus 告警規則範例、
+# 遠端升級的輔助程式 unit（tar 安裝依 INSTALL.md 第 10 節手動安裝；deb／rpm 另外裝到 /usr/lib/systemd/system）
+EXTRA_SRC="ERROR-CODES.md packaging/pulse-alerts.example.yml packaging/pulse-upgrade.path packaging/pulse-upgrade.service"
 # 預設建置的目標：Linux x86_64、aarch64（musl 靜態連結）與 Windows x86_64（含 MSI）
 DEFAULT_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu"
 # 直接放到輸出目錄的檔案（來源:輸出檔名）：一行安裝腳本
