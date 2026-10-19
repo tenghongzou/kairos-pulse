@@ -5,7 +5,7 @@
 //!
 //! - **領域 store**（trait，以「一個交易能完成的業務操作」或一個查詢為單位）：
 //!   [`SettingsStore`]、[`AuditLog`]、[`UserStore`]、[`PkiStore`]、[`EnrollStore`]、[`AlertStore`]、
-//!   [`HostStore`]、[`ApiQueries`]、[`AdminStore`]。trait 定義在各領域的模組（例如 `alerts/store.rs`），
+//!   [`HostStore`]、[`ApiQueries`]、[`AdminStore`]、[`RemoteStore`]。trait 定義在各領域的模組（例如 `alerts/store.rs`），
 //!   這裡只組合成 [`Store`]。report 的寫入路徑另有 [`super::ReportStore`]（單一 writer），不在這裡。
 //! - **[`Store`]**：一條連線或一個交易能做的所有領域操作，加上開始交易（[`Store::begin`]）。
 //!   呼叫端拿到的是 `&dyn Store`（連線池的 closure 參數、CLI 開啟的 [`DbHandle`]）。
@@ -30,6 +30,7 @@ pub use crate::api::tokens::TokenStore;
 pub use crate::audit::AuditLog;
 pub use crate::enroll::store::EnrollStore;
 pub use crate::pki::store::PkiStore;
+pub use crate::remote::store::RemoteStore;
 pub use crate::settings::SettingsStore;
 pub use crate::users::store::UserStore;
 
@@ -38,8 +39,8 @@ pub use crate::users::store::UserStore;
 pub mod prelude {
     pub use super::{
         AdminStore, AlertStore, ApiQueries, AuditLog, DbHandle, EnrollStore, HostStore, PkiStore,
-        SettingsStore, Store, StoreError, StoreResult, TokenStore, Tx, TxMode, UserStore,
-        in_write_tx,
+        RemoteStore, SettingsStore, Store, StoreError, StoreResult, TokenStore, Tx, TxMode,
+        UserStore, in_write_tx,
     };
 }
 
@@ -145,6 +146,7 @@ pub trait Store:
     + HostStore
     + ApiQueries
     + AdminStore
+    + RemoteStore
 {
     /// 開始一個交易。連線上已有交易時失敗（與 SQLite 的巢狀 `BEGIN` 相同）
     fn begin(&self, mode: TxMode) -> StoreResult<Box<dyn Tx + '_>>;

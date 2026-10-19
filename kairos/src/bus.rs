@@ -206,6 +206,15 @@ pub enum EventKind {
         id: Option<i64>,
         summary: String,
     },
+    /// 遠端管理的系統檢查（升級推送已暫停、回滾失敗、發佈簽章驗證失敗；REMOTE.md 第 4.7.4 節）。
+    /// `rule` 為系統規則的 ID，`active = false` 時恢復。由遠端管理服務每一輪依資料庫的狀態調和後發布
+    RemoteCondition {
+        rule: &'static str,
+        subject: String,
+        active: bool,
+        title: String,
+        details: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -225,6 +234,7 @@ impl EventKind {
             EventKind::Lifecycle { .. } => "lifecycle",
             EventKind::ChannelSecrets { .. } => "channel_secrets",
             EventKind::AuditIntegrity { .. } => "audit_integrity",
+            EventKind::RemoteCondition { .. } => "remote_condition",
         }
     }
 }

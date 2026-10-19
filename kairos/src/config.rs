@@ -16,6 +16,7 @@ mod alerts;
 mod cluster;
 mod enroll;
 pub mod export;
+mod remote;
 
 pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
 
@@ -26,6 +27,7 @@ pub use enroll::{
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
 };
 pub use export::{ExportSettings, OtlpSettings, PrometheusExportSettings};
+pub use remote::RemoteSettings;
 
 /// 未指定 `--config` 時讀取的設定檔（不存在則略過）
 pub const DEFAULT_CONFIG_FILE: &str = "kairos.toml";
@@ -200,6 +202,8 @@ pub struct AppConfig {
     pub privacy: crate::privacy::PrivacySettings,
     /// 叢集的節點設定（0.9.0 只有 `node_id`，`kairos/HA.md` 第 15.1 節）
     pub cluster: ClusterSettings,
+    /// 集中設定與 Pulse 遠端升級（`crates/kairos-proto/REMOTE.md` 第 7 節）
+    pub remote: RemoteSettings,
     /// 每個設定鍵的來源（設定檔或環境變數；`kairos config show --effective`、主控台的鎖定判斷）
     #[serde(skip)]
     pub provenance: Provenance,
@@ -1425,6 +1429,7 @@ impl AppConfig {
         self.audit.validate()?;
         self.export.validate()?;
         self.cluster.validate()?;
+        self.remote.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
         self.log.log_format()?;

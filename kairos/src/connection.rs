@@ -144,6 +144,8 @@ pub struct ConnContext {
     pub privacy: Arc<crate::privacy::PrivacyPolicy>,
     /// feature `cluster`：節點名稱與關機時送出的 `drain` 計數
     pub cluster: ClusterContext,
+    /// 遠端管理（feature `config`／`upgrade`，SQLite 時；`crates/kairos-proto/REMOTE.md`）
+    pub remote: Option<Arc<crate::remote::RemoteService>>,
 }
 
 /// feature `cluster`（PROTOCOL.md「叢集與排空」）的伺服器端狀態
@@ -231,8 +233,8 @@ enum Incoming {
 fn is_lifecycle_type(kind: &str) -> bool {
     // inventory（feature `inventory`，crates/kairos-proto/METRICS.md）：協商了時格式錯誤回 bad_request，
     // 沒有協商時與舊版相同，回 unknown_type
-    // 遠端管理（feature config／upgrade，crates/kairos-proto/PROTOCOL.md「遠端管理」）：本版不列出這兩個
-    // feature，與舊版相同一律回 unknown_type
+    // 遠端管理（feature config／upgrade，crates/kairos-proto/PROTOCOL.md「遠端管理」）：協商了對應的
+    // feature 時格式錯誤回 bad_request，沒有協商時與 0.8 相同回 unknown_type
     matches!(kind, "renew_request" | "deregister" | "inventory")
         || kairos_proto::mgmt::MGMT_CLIENT_MSG_TYPES.contains(&kind)
 }
@@ -698,6 +700,8 @@ struct Agent {
     intent_deregister: bool,
     /// 雙方都宣告 `cluster`（v2）：`hello_ack` 帶 `server_node`，關機時送 `drain`
     cluster: bool,
+    /// 遠端管理 feature 的協商結果（`config`、`upgrade`；`hello_ack` 與心跳的 `ack` 帶 `pending`）
+    mgmt: kairos_proto::mgmt::MgmtSession,
 }
 
 /// 從 hello 取出、交給 [`Conn::accept_hello`] 的欄位
@@ -784,6 +788,21 @@ enum HelloOutcome {
     Closed,
 }
 
+/// 連線結束時從遠端管理的連線表移除（含 panic 與被中止；conn_id 不符時表示已被新連線取代，不移除）
+struct MgmtGuard {
+    remote: Option<Arc<crate::remote::RemoteService>>,
+    agent_id: String,
+    conn_id: u64,
+}
+
+impl Drop for MgmtGuard {
+    fn drop(&mut self) {
+        if let Some(svc) = &self.remote {
+            svc.detach(&self.agent_id, self.conn_id);
+        }
+    }
+}
+
 /// 確保連線結束時（含 panic 與被中止）以 conn_id 標記離線（R2-K20）
 struct DisconnectGuard {
     registry: Arc<Registry>,
@@ -853,6 +872,8 @@ struct Conn {
     stored_peer: String,
     /// `hello_ack.server_node`（協商了 `cluster` 時）
     node_id: Arc<str>,
+    /// 遠端管理（SQLite 時）
+    remote: Option<Arc<crate::remote::RemoteService>>,
 }
 
 /// 處理一條連線。握手失敗會在這裡（節流後）記錄並回傳 `Ok`；其他錯誤只影響此連線，由呼叫端記錄。
@@ -934,6 +955,7 @@ pub async fn handle_connection(
         privacy: ctx.privacy.clone(),
         stored_peer: ctx.privacy.peer(peer),
         node_id: ctx.cluster.node_id.clone(),
+        remote: ctx.remote.clone(),
     };
 
     let Some(agent) = conn.await_hello(ctx.timeouts.hello()).await? else {
@@ -995,6 +1017,12 @@ pub async fn handle_connection(
 
     // 註冊後不論結果如何（含 panic、被中止）都要以 conn_id 比對並標記離線
     let guard = DisconnectGuard::new(ctx.registry.clone(), agent.agent_id.clone(), conn_id);
+    // 遠端管理：連線結束時（含 panic、被中止）不再視為可以提議升級
+    let _mgmt_guard = MgmtGuard {
+        remote: ctx.remote.clone().filter(|_| agent.mgmt.any()),
+        agent_id: agent.agent_id.clone(),
+        conn_id,
+    };
     let result = conn.run_registered(&ctx, &agent).await;
     if guard.disconnect() {
         throttled!(
@@ -1083,6 +1111,12 @@ impl Conn {
             if agent.cluster {
                 f.push(FEATURE_CLUSTER.to_string());
             }
+            if agent.mgmt.config {
+                f.push(kairos_proto::mgmt::FEATURE_CONFIG.to_string());
+            }
+            if agent.mgmt.upgrade {
+                f.push(kairos_proto::mgmt::FEATURE_UPGRADE.to_string());
+            }
             (Some(f), Some(fmt_time(Utc::now())))
         } else {
             // v1：hello_ack 與 v1 Kairos 完全相同
@@ -1114,10 +1148,20 @@ impl Conn {
             // 叢集模式（cluster_id）留待之後的版本；單機的 Kairos 只帶節點名稱
             server_node: agent.cluster.then(|| self.node_id.to_string()),
             cluster_id: None,
-            // 遠端管理（feature config／upgrade，K1／K2 實作）：本版不列出，因此不帶 pending
-            pending: None,
+            // 遠端管理：協商了 config 或 upgrade 時帶 pending（PROTOCOL.md「遠端管理」）
+            pending: self.pending_for(agent),
         };
         self.send(&msg).await
+    }
+
+    /// `hello_ack` 與回應 `heartbeat` 的 `ack` 的 `pending`（沒有協商遠端管理時 `None`）
+    fn pending_for(&self, agent: &Agent) -> Option<kairos_proto::mgmt::Pending> {
+        if !agent.mgmt.any() {
+            return None;
+        }
+        self.remote
+            .as_ref()
+            .and_then(|svc| svc.pending(agent.mgmt, &agent.agent_id))
     }
 
     /// 優雅關機：協商了 `cluster` 的連線先送 `drain`（PROTOCOL.md「叢集與排空」），讓 agent 在
@@ -1697,6 +1741,20 @@ impl Conn {
             self.enroll.is_some(),
             &client_features,
         );
+        // 遠端管理（PROTOCOL.md「遠端管理」）：v2、雙方都宣告、mTLS、SQLite 與 [remote] 的開關
+        let mgmt = match &self.remote {
+            Some(svc) => {
+                let policy = kairos_proto::mgmt::ServerMgmtPolicy {
+                    config_enabled: svc.settings.config_enabled,
+                    upgrade_enabled: svc.settings.upgrade_enabled,
+                    sqlite: true,
+                    mtls: authenticated,
+                };
+                let ours = policy.features_to_list(session.proto, &client_features);
+                kairos_proto::mgmt::MgmtSession::new(session.proto, &ours, &client_features)
+            }
+            None => kairos_proto::mgmt::MgmtSession::NONE,
+        };
         // 個資政策：之後的狀態表、清冊、report、事件都只看到轉換後的主機名稱與顯示名稱
         let hostname = self.privacy.hostname(&hostname);
         let host = host.map(|h| Arc::new(self.privacy.host_info((*h).clone())));
@@ -1713,6 +1771,7 @@ impl Conn {
             deregister,
             intent_deregister: ext.intent.as_deref() == Some(INTENT_DEREGISTER),
             cluster: session.is_v2() && client_features.iter().any(|f| f == FEATURE_CLUSTER),
+            mgmt,
         }))
     }
 
@@ -1842,6 +1901,7 @@ impl Conn {
             );
         }
 
+        self.attach_mgmt(agent).await;
         self.send_hello_ack(agent, offline_ms).await?;
 
         let mut kick: oneshot::Receiver<KickReason> = registration.kick;
@@ -2128,6 +2188,292 @@ impl Conn {
         }
     }
 
+    /// hello 通過、送出 `hello_ack` 之前：協商了遠端管理時登記這條連線，協商了 `config` 時以 hello 的標籤
+    /// 重新計算期望設定（`pending.config_rev`）。資料庫失敗時沿用記憶體中的值，不影響連線
+    async fn attach_mgmt(&mut self, agent: &Agent) {
+        let Some(svc) = self.remote.clone().filter(|_| agent.mgmt.any()) else {
+            return;
+        };
+        let host = agent.host.as_deref();
+        let install = host.and_then(|h| h.install.as_ref());
+        svc.attach(
+            &agent.agent_id,
+            crate::remote::AgentSession {
+                conn_id: self.conn_id,
+                agent_version: agent.agent_version.clone(),
+                install_method: install.and_then(|i| i.method.clone()),
+                install_upgrade: install.and_then(|i| i.upgrade.clone()),
+                arch: host
+                    .and_then(|h| h.os.as_ref())
+                    .and_then(|o| o.arch.clone()),
+                config: agent.mgmt.config,
+                upgrade: agent.mgmt.upgrade,
+            },
+        );
+        if agent.mgmt.config {
+            let tags = host.and_then(|h| h.tags.clone()).unwrap_or_default();
+            if let Err(e) = svc
+                .on_hello_config(
+                    &agent.agent_id,
+                    tags,
+                    &agent.agent_version,
+                    install.and_then(|i| i.config.clone()),
+                )
+                .await
+            {
+                throttled!(
+                    self.throttle,
+                    Category::StorageWrite,
+                    warn,
+                    "[#{}] 集中設定：無法計算 {} 的期望設定（沿用目前的值）：{}",
+                    self.conn_id,
+                    agent.agent_id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// 遠端管理的訊息無法讀寫資料庫：非 fatal 的 `storage_unavailable`，Pulse 稍後重送
+    async fn reply_mgmt_storage(
+        &mut self,
+        seq: u64,
+        what: &str,
+        e: impl std::fmt::Display,
+    ) -> Result<Handled, Error> {
+        throttled!(
+            self.throttle,
+            Category::StorageWrite,
+            warn,
+            "[#{}] {}失敗，回 storage_unavailable：{}",
+            self.conn_id,
+            what,
+            e
+        );
+        let flow = self
+            .reply(ServerMsg::error(
+                Some(seq),
+                ErrorCode::StorageUnavailable,
+                "storage temporarily unavailable; retry later",
+            ))
+            .await?;
+        Ok(Handled::alive(flow))
+    }
+
+    /// `config_get` → `config`（PROTOCOL.md「集中設定的訊息」）
+    async fn handle_config_get(
+        &mut self,
+        agent: &Agent,
+        g: kairos_proto::mgmt::ConfigGet,
+    ) -> Result<Handled, Error> {
+        self.bad_requests = 0;
+        let Some(svc) = self.remote.clone() else {
+            return Ok(Handled::not_alive(self.reply_unknown_type().await?));
+        };
+        match svc
+            .config_for(&agent.agent_id, &agent.agent_version, g.seq)
+            .await
+        {
+            Ok(cfg) => {
+                debug!(
+                    "[#{}] agent {} config_get（本機第 {} 版）→ 第 {} 版",
+                    self.conn_id, agent.agent_id, g.have_rev, cfg.rev
+                );
+                Ok(Handled::alive(
+                    self.reply(ServerMsg::Config(Box::new(cfg))).await?,
+                ))
+            }
+            Err(e) => {
+                self.reply_mgmt_storage(g.seq, "集中設定：讀取期望設定", e)
+                    .await
+            }
+        }
+    }
+
+    /// `config_status` → `ack`
+    async fn handle_config_status(
+        &mut self,
+        agent: &Agent,
+        st: kairos_proto::mgmt::ConfigStatus,
+    ) -> Result<Handled, Error> {
+        self.bad_requests = 0;
+        let Some(svc) = self.remote.clone() else {
+            return Ok(Handled::not_alive(self.reply_unknown_type().await?));
+        };
+        match svc
+            .record_config_status(&agent.agent_id, &agent.hostname, &st)
+            .await
+        {
+            Ok(()) => Ok(Handled::alive(self.reply(ServerMsg::ack(st.seq)).await?)),
+            Err(e) => {
+                self.reply_mgmt_storage(st.seq, "集中設定：保存 config_status", e)
+                    .await
+            }
+        }
+    }
+
+    /// `upgrade_get` → `upgrade_offer`；這台主機目前沒有這個提議時 `upgrade_unavailable`
+    async fn handle_upgrade_get(
+        &mut self,
+        agent: &Agent,
+        g: kairos_proto::mgmt::UpgradeGet,
+    ) -> Result<Handled, Error> {
+        self.bad_requests = 0;
+        let Some(svc) = self.remote.clone() else {
+            return Ok(Handled::not_alive(self.reply_unknown_type().await?));
+        };
+        let id = g.upgrade_id.to_ascii_lowercase();
+        match svc.build_offer(&agent.agent_id, &id, g.seq).await {
+            Ok(Some(offer)) => {
+                debug!(
+                    "[#{}] agent {} upgrade_get {} → {} {}",
+                    self.conn_id, agent.agent_id, id, offer.action, offer.target.version
+                );
+                Ok(Handled::alive(
+                    self.reply(ServerMsg::UpgradeOffer(Box::new(offer))).await?,
+                ))
+            }
+            Ok(None) => {
+                debug!(
+                    "[#{}] agent {} upgrade_get {}：沒有這個提議",
+                    self.conn_id, agent.agent_id, id
+                );
+                let flow = self
+                    .reply(ServerMsg::error(
+                        Some(g.seq),
+                        ErrorCode::UpgradeUnavailable,
+                        "no such upgrade for this host (cancelled, paused or finished)",
+                    ))
+                    .await?;
+                Ok(Handled::alive(flow))
+            }
+            Err(e) => {
+                self.reply_mgmt_storage(g.seq, "升級推送：組出 upgrade_offer", e)
+                    .await
+            }
+        }
+    }
+
+    /// `upgrade_chunk_get` → `upgrade_chunk`（下載名額已滿時非 fatal 的 `rate_limited`，另帶 `retry_after_ms`）
+    async fn handle_upgrade_chunk_get(
+        &mut self,
+        agent: &Agent,
+        g: kairos_proto::mgmt::UpgradeChunkGet,
+    ) -> Result<Handled, Error> {
+        self.bad_requests = 0;
+        let Some(svc) = self.remote.clone() else {
+            return Ok(Handled::not_alive(self.reply_unknown_type().await?));
+        };
+        let id = g.upgrade_id.to_ascii_lowercase();
+        let unavailable =
+            |m: &str| ServerMsg::error(Some(g.seq), ErrorCode::UpgradeUnavailable, m.to_string());
+        let file = match svc.offered_file(&agent.agent_id, &id, &g.filename).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                let flow = self
+                    .reply(unavailable("file is not part of the current upgrade offer"))
+                    .await?;
+                return Ok(Handled::alive(flow));
+            }
+            Err(e) => {
+                return self
+                    .reply_mgmt_storage(g.seq, "升級推送：查詢提議的檔案", e)
+                    .await;
+            }
+        };
+        if !svc.acquire_download(&agent.agent_id) {
+            throttled!(
+                self.throttle,
+                Category::StorageWrite,
+                info,
+                "升級推送：同時下載的主機已達 remote.max_concurrent_downloads（{}），{} 稍後再試",
+                svc.settings.max_concurrent_downloads,
+                agent.agent_id
+            );
+            let flow = self
+                .reply(ServerMsg::rate_limited(
+                    Some(g.seq),
+                    "too many concurrent downloads; retry later",
+                    crate::remote::DOWNLOAD_RETRY_AFTER_MS,
+                ))
+                .await?;
+            return Ok(Handled::alive(flow));
+        }
+        let (path, size) = file;
+        let (offset, length) = (g.offset, g.length);
+        let read = tokio::task::spawn_blocking(move || {
+            crate::remote::releases::read_chunk(&path, offset, length, size)
+        })
+        .await
+        .map_err(Error::other)?;
+        match read {
+            Ok((data, eof)) => {
+                let msg = kairos_proto::mgmt::UpgradeChunk::new(
+                    g.seq, id, g.filename, offset, &data, eof,
+                );
+                Ok(Handled::alive(
+                    self.reply(ServerMsg::UpgradeChunk(Box::new(msg))).await?,
+                ))
+            }
+            Err(e) => {
+                throttled!(
+                    self.throttle,
+                    Category::StorageWrite,
+                    warn,
+                    "升級推送：版本庫的 {} 無法讀取（檔案遺失或被修改，請重新匯入）：{}",
+                    g.filename,
+                    e
+                );
+                let flow = self
+                    .reply(unavailable("release file is not available"))
+                    .await?;
+                Ok(Handled::alive(flow))
+            }
+        }
+    }
+
+    /// `upgrade_status` → `ack`（以 (`upgrade_id`, `state`) 去重；不認得的 upgrade_id 也回 `ack`）
+    async fn handle_upgrade_status(
+        &mut self,
+        agent: &Agent,
+        st: kairos_proto::mgmt::UpgradeStatus,
+    ) -> Result<Handled, Error> {
+        self.bad_requests = 0;
+        let Some(svc) = self.remote.clone() else {
+            return Ok(Handled::not_alive(self.reply_unknown_type().await?));
+        };
+        let seq = st.seq;
+        let staged = st.state == kairos_proto::mgmt::UPGRADE_STATE_STAGED;
+        let mut st = st;
+        st.upgrade_id = st.upgrade_id.to_ascii_lowercase();
+        debug!(
+            "[#{}] agent {} upgrade_status {} {}{}",
+            self.conn_id,
+            agent.agent_id,
+            st.upgrade_id,
+            st.state,
+            st.code
+                .as_deref()
+                .map(|c| format!("（{c}）"))
+                .unwrap_or_default()
+        );
+        match svc
+            .apply_upgrade_status(&agent.agent_id, &agent.agent_version, st)
+            .await
+        {
+            Ok(()) => {
+                if staged {
+                    svc.on_staged(&agent.agent_id);
+                }
+                Ok(Handled::alive(self.reply(ServerMsg::ack(seq)).await?))
+            }
+            Err(e) => {
+                self.reply_mgmt_storage(seq, "升級推送：保存 upgrade_status", e)
+                    .await
+            }
+        }
+    }
+
     async fn handle_registered(
         &mut self,
         ctx: &ConnContext,
@@ -2152,6 +2498,10 @@ impl Conn {
                     // 協商了 inventory：格式錯誤（型別、ts）與其他訊息相同，bad_request（seq 為 null）
                     self.reply_bad_request(None, format!("invalid inventory: {message}"))
                         .await?
+                } else if agent.mgmt.accepts_client_type(&kind) {
+                    // 協商了 config／upgrade：欄位缺漏、型別錯誤或不符限制 → bad_request（seq 為 null）
+                    self.reply_bad_request(None, format!("invalid {kind}: {message}"))
+                        .await?
                 } else {
                     self.reply_unknown_type().await?
                 };
@@ -2170,9 +2520,22 @@ impl Conn {
             ClientMsg::Inventory(inv) if agent.session.inventory => {
                 self.handle_inventory(ctx, agent, *inv, received_at).await
             }
+            ClientMsg::ConfigGet(g) if agent.mgmt.config => self.handle_config_get(agent, *g).await,
+            ClientMsg::ConfigStatus(st) if agent.mgmt.config => {
+                self.handle_config_status(agent, *st).await
+            }
+            ClientMsg::UpgradeGet(g) if agent.mgmt.upgrade => {
+                self.handle_upgrade_get(agent, *g).await
+            }
+            ClientMsg::UpgradeChunkGet(g) if agent.mgmt.upgrade => {
+                self.handle_upgrade_chunk_get(agent, *g).await
+            }
+            ClientMsg::UpgradeStatus(st) if agent.mgmt.upgrade => {
+                self.handle_upgrade_status(agent, *st).await
+            }
             // 未知 type 不是合法訊息：不重置計數，也不延後閒置期限。沒有協商 renew 的 renew_request、
             // 一般連線上的 deregister、沒有協商 inventory 的 inventory 與舊版相同，視為不認得的 type
-            // 遠端管理的訊息（feature config／upgrade）：本版不列出這兩個 feature，同樣視為不認得的 type
+            // 沒有協商 config／upgrade 的遠端管理訊息：與 0.8 相同，視為不認得的 type
             ClientMsg::Unknown
             | ClientMsg::RenewRequest(_)
             | ClientMsg::Deregister(_)
@@ -2211,7 +2574,11 @@ impl Conn {
                     "[#{}] agent {} heartbeat seq={}",
                     self.conn_id, agent.agent_id, seq
                 );
-                Ok(Handled::alive(self.reply(ServerMsg::ack(seq)).await?))
+                let ack = match self.pending_for(agent) {
+                    Some(p) => ServerMsg::heartbeat_ack(seq, Some(p)),
+                    None => ServerMsg::ack(seq),
+                };
+                Ok(Handled::alive(self.reply(ack).await?))
             }
             ClientMsg::Report { seq, ts, body } => {
                 // 依協商的格式取出內容；格式不符（欄位缺漏、型別錯誤）與 v1 的解析失敗相同：

@@ -1119,6 +1119,46 @@ pub fn api_raw(port: u16, request: &str) -> (u16, String, String) {
     (status, head.to_string(), body.to_string())
 }
 
+/// 送出帶本文的請求到主控台（`content_type` 為 `None` 時不帶本文）；回傳狀態碼與 JSON 本文
+pub fn api_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<(&str, &[u8])>,
+) -> (u16, serde_json::Value) {
+    use std::io::{Read as _, Write as _};
+    let mut s = api_connect(port);
+    let mut req =
+        format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n")
+            .into_bytes();
+    if let Some((ct, data)) = body {
+        req.extend_from_slice(
+            format!("Content-Type: {ct}\r\nContent-Length: {}\r\n", data.len()).as_bytes(),
+        );
+    }
+    req.extend_from_slice(b"\r\n");
+    if let Some((_, data)) = body {
+        req.extend_from_slice(data);
+    }
+    s.write_all(&req).unwrap();
+    s.flush().unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("回應沒有標頭：{text}"));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let json =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("回應不是 JSON（{e}）：{text}"));
+    (status, json)
+}
+
 /// 主控台 API 的用戶端（每個請求一條 HTTP/1.0 連線）
 pub struct Api {
     pub port: u16,

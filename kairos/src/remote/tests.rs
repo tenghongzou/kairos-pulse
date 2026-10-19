@@ -1,0 +1,1272 @@
+//! 遠端管理的服務層測試（暫存的 SQLite 資料庫、假的時鐘）：集中設定、版本庫、推送引擎與 8443 的處理
+
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
+
+use super::ops::{Actor, ProfileInput};
+use super::rollout::RolloutSpec;
+use super::test_sign::{TestSigner, release};
+use super::*;
+
+const A: &str = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
+const B: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const C: &str = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const D: &str = "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+const T0: i64 = 1_800_000_000_000;
+
+struct Fx {
+    dir: PathBuf,
+    svc: Arc<RemoteService>,
+    now: Arc<AtomicI64>,
+    registry: Arc<crate::registry::Registry>,
+}
+
+impl Fx {
+    async fn new(tag: &str, tweak: impl FnOnce(&mut RemoteSettings, &std::path::Path)) -> Fx {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-remote-{tag}-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::store::sqlite::DB_FILE);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        crate::store::sqlite::migrate(&mut conn, crate::store::sqlite::MIGRATIONS).unwrap();
+        drop(conn);
+        let mut settings = RemoteSettings::default();
+        tweak(&mut settings, &dir);
+        let now = Arc::new(AtomicI64::new(T0));
+        let n = now.clone();
+        let registry = Arc::new(crate::registry::Registry::new());
+        let svc = RemoteService::open(StartParams {
+            settings,
+            data_dir: dir.clone(),
+            db_path: path,
+            registry: registry.clone(),
+            shutdown: Arc::new(crate::shutdown::Shutdown::new()),
+            clock: Arc::new(move || n.load(Ordering::SeqCst)),
+        })
+        .await
+        .unwrap();
+        Fx {
+            dir,
+            svc,
+            now,
+            registry,
+        }
+    }
+
+    fn set_now(&self, t: i64) {
+        self.now.store(t, Ordering::SeqCst);
+    }
+
+    /// 以 SQL 執行（準備資料或檢查結果）
+    async fn sql<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> R + Send + 'static,
+    ) -> R {
+        self.svc
+            .db
+            .write(move |s| Ok(f(s.test_sqlite())))
+            .await
+            .unwrap()
+    }
+
+    async fn add_host(
+        &self,
+        id: &str,
+        version: &str,
+        group: &str,
+        tags: &[&str],
+        method: &str,
+        upgrade: &str,
+    ) {
+        let (id, version, group, method, upgrade) = (
+            id.to_string(),
+            version.to_string(),
+            group.to_string(),
+            method.to_string(),
+            upgrade.to_string(),
+        );
+        let tags = serde_json::to_string(tags).unwrap();
+        self.sql(move |c| {
+            c.execute(
+                "INSERT INTO hosts (agent_id, hostname, agent_version, host_group, tags, os, install_method,
+                    install_upgrade, install_config, first_seen, last_seen, online)
+                 VALUES (?1, ?1, ?2, ?3, ?4, '{\"name\":\"Ubuntu\",\"arch\":\"x86_64\"}', ?5, ?6, 'enabled', 0, 0, 1)",
+                rusqlite::params![id, version, group, tags, method, upgrade],
+            )
+            .unwrap();
+        })
+        .await;
+    }
+
+    /// 主機上線、協商了 config 與 upgrade（狀態表與遠端管理的連線表）
+    fn connect(&self, id: &str, version: &str, method: &str) {
+        let conn_id = crate::registry::next_conn_id();
+        self.registry
+            .register(
+                conn_id,
+                crate::registry::HelloInfo {
+                    agent_id: id.to_string(),
+                    hostname: id.to_string(),
+                    agent_version: version.to_string(),
+                    proto: 2,
+                    host: None,
+                    peer: "127.0.0.1:1".into(),
+                    offline_after: Duration::from_secs(75),
+                    client_chain: None,
+                },
+                Instant::now(),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        self.svc.attach(
+            id,
+            AgentSession {
+                conn_id,
+                agent_version: version.to_string(),
+                install_method: Some(method.to_string()),
+                install_upgrade: Some("ready".into()),
+                arch: Some("x86_64".into()),
+                config: true,
+                upgrade: true,
+            },
+        );
+    }
+
+    async fn audit_actions(&self) -> Vec<String> {
+        self.sql(|c| {
+            let mut st = c
+                .prepare("SELECT action FROM audit_events ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .await
+    }
+
+    async fn host_state(&self, rollout: &str, agent: &str) -> super::store::RolloutHostRow {
+        let (r, a) = (rollout.to_string(), agent.to_string());
+        self.svc
+            .db
+            .read(move |s| Ok(s.rollout_host(&r, &a)?.unwrap()))
+            .await
+            .unwrap()
+    }
+}
+
+impl Drop for Fx {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn who() -> Actor {
+    Actor {
+        actor: "user:admin".into(),
+        ip: Some("127.0.0.1".into()),
+    }
+}
+
+fn profile(name: &str, settings: Value) -> ProfileInput {
+    ProfileInput {
+        name: Some(name.into()),
+        description: Some("測試".into()),
+        settings: Some(settings),
+        reason: None,
+        impact_token: None,
+    }
+}
+
+#[tokio::test]
+async fn profiles_and_assignments_update_only_hosts_whose_settings_change() {
+    let fx = Fx::new("cfg", |_, _| {}).await;
+    fx.add_host(A, "0.9.0", "Web", &["env:prod"], "tar", "ready")
+        .await;
+    fx.add_host(B, "0.9.0", "DB", &[], "deb", "ready").await;
+    fx.add_host(C, "0.8.0", "Web", &[], "tar", "ready").await;
+    let p1 = fx
+        .svc
+        .create_profile(&who(), profile("全站", json!({"report": {"interval": 10}})))
+        .await
+        .unwrap();
+    let p1 = p1["id"].as_i64().unwrap();
+    assert_eq!(fx.svc.desired_rev(A), 0, "沒有指派");
+    // 同名（不分大小寫）
+    let e = fx
+        .svc
+        .create_profile(&who(), profile("全站", json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "profile_exists");
+    let e = fx
+        .svc
+        .create_profile(
+            &who(),
+            profile("壞", json!({"server": {"address": "evil"}})),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (e.code, e.product_code),
+        ("config_invalid", Some(CODE_CONFIG_INVALID))
+    );
+    assert_eq!(e.details.as_ref().unwrap()["reason"], "unknown_key");
+
+    let a1 = fx
+        .svc
+        .create_assignment(&who(), p1, desired::Selector::Global, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(a1["priority"], 0);
+    let rev_global = fx.svc.desired_rev(A);
+    assert!(rev_global > 0);
+    assert_eq!(fx.svc.desired_rev(B), rev_global);
+    assert_eq!(fx.svc.desired_rev(C), rev_global);
+    // global 最多一筆
+    let p_other = fx
+        .svc
+        .create_profile(&who(), profile("其他", json!({"log": {"level": "warn"}})))
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let e = fx
+        .svc
+        .create_assignment(&who(), p_other, desired::Selector::Global, None, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "global_exists");
+
+    // 只有 A 的設定改變
+    let p2 = fx
+        .svc
+        .create_profile(
+            &who(),
+            profile("web-01 除錯", json!({"log": {"level": "debug"}})),
+        )
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    fx.svc
+        .create_assignment(
+            &who(),
+            p2,
+            desired::Selector::Host(A.into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rev_a = fx.svc.desired_rev(A);
+    assert!(rev_a > rev_global);
+    assert_eq!(
+        fx.svc.desired_rev(B),
+        rev_global,
+        "B 不受影響、不會重新套用"
+    );
+
+    // config：合併、雜湊、來源、依版本過濾
+    let cfg = fx.svc.config_for(A, "0.9.0", 7).await.unwrap();
+    assert_eq!((cfg.seq, cfg.rev), (7, rev_a as u64));
+    assert_eq!(
+        Value::Object(cfg.settings.clone()),
+        json!({"report": {"interval": 10}, "log": {"level": "debug"}})
+    );
+    assert!(kairos_proto::mgmt::validate_remote_config(&cfg).is_ok());
+    assert_eq!(cfg.sources.as_ref().unwrap()["log.level"], "web-01 除錯");
+    let old = fx.svc.config_for(C, "0.8.0", 1).await.unwrap();
+    assert!(old.settings.is_empty(), "0.8 不認得任何鍵");
+    let none = fx.svc.config_for(D, "0.9.0", 1).await.unwrap();
+    assert_eq!((none.rev, none.settings.len()), (0, 0));
+
+    // 相同優先序、相同的鍵、同一台主機 → 409
+    let p3 = fx
+        .svc
+        .create_profile(
+            &who(),
+            profile("web 警告", json!({"log": {"level": "warn"}})),
+        )
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let e = fx
+        .svc
+        .create_assignment(
+            &who(),
+            p3,
+            desired::Selector::Group("web".into()),
+            Some(1000),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "assignment_conflict");
+    assert_eq!(e.details.as_ref().unwrap()["keys"], json!(["log.level"]));
+    // 不同優先序可以
+    fx.svc
+        .create_assignment(
+            &who(),
+            p3,
+            desired::Selector::Group("web".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.svc.config_for(A, "0.9.0", 1).await.unwrap().settings["log"]["level"],
+        "debug",
+        "host 優先於 group"
+    );
+
+    // 修改設定檔：所有指派到的主機重新計算
+    let before_b = fx.svc.desired_rev(B);
+    fx.svc
+        .update_profile(
+            &who(),
+            p1,
+            ProfileInput {
+                name: None,
+                description: None,
+                settings: Some(json!({"report": {"interval": 20}})),
+                reason: Some("降低頻率".into()),
+                impact_token: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(fx.svc.desired_rev(B) > before_b);
+    // 回復第 1 版
+    let v = fx
+        .svc
+        .update_profile(
+            &who(),
+            p1,
+            ProfileInput {
+                name: None,
+                description: None,
+                settings: None,
+                reason: None,
+                impact_token: None,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["revision"], 3);
+    assert_eq!(v["settings"], json!({"report": {"interval": 10}}));
+
+    // 有指派的設定檔不能刪
+    let e = fx.svc.delete_profile(&who(), p1, None).await.unwrap_err();
+    assert_eq!(e.code, "profile_in_use");
+    let assignment = a1["id"].as_i64().unwrap();
+    fx.svc
+        .delete_assignment(&who(), assignment, None)
+        .await
+        .unwrap();
+    assert_eq!(fx.svc.desired_rev(B), 0, "沒有任何設定時 desired_rev = 0");
+    fx.svc.delete_profile(&who(), p1, None).await.unwrap();
+
+    let actions = fx.audit_actions().await;
+    for a in [
+        "config.profile.create",
+        "config.assign",
+        "config.profile.update",
+        "config.profile.revert",
+        "config.unassign",
+        "config.profile.delete",
+    ] {
+        assert!(actions.iter().any(|x| x == a), "{a}: {actions:?}");
+    }
+    // 重新載入服務：記憶體中的 desired_rev 由資料庫載回
+    let rows = fx.svc.db.read(|s| Ok(s.desired_all()?)).await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|(a, rev, _)| a == A && *rev == fx.svc.desired_rev(A))
+    );
+}
+
+#[tokio::test]
+async fn config_status_does_not_move_the_applied_revision_backwards() {
+    let fx = Fx::new("status", |_, _| {}).await;
+    let status = |rev: u64, interval: u64, state: &str| kairos_proto::mgmt::ConfigStatus {
+        seq: 1,
+        ts: "2026-11-20T02:00:00.000Z".into(),
+        rev,
+        hash: format!("sha256:{}", "a".repeat(64)),
+        state: state.into(),
+        effective: json!({"report": {"interval": interval}})
+            .as_object()
+            .unwrap()
+            .clone(),
+        overridden: vec![],
+        ignored: vec![],
+        errors: vec![],
+        code: None,
+    };
+    let mut rx = fx.svc.subscribe();
+    fx.svc
+        .record_config_status(A, "web-01", &status(5, 10, "applied"))
+        .await
+        .unwrap();
+    let ev = rx.try_recv().expect("config.host");
+    assert_eq!(ev.kind, "config.host");
+    assert_eq!(
+        (
+            ev.data["agent_id"].as_str(),
+            ev.data["applied_rev"].as_u64()
+        ),
+        (Some(A), Some(5))
+    );
+    fx.svc
+        .record_config_status(A, "web-01", &status(3, 7, "rejected"))
+        .await
+        .unwrap();
+    let row = fx
+        .svc
+        .db
+        .read(|s| Ok(s.host_config(A)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (row.applied_rev, row.state.as_deref()),
+        (5, Some("applied"))
+    );
+    assert_eq!(
+        row.effective.as_deref(),
+        Some(r#"{"report":{"interval":7}}"#)
+    );
+    fx.svc
+        .record_config_status(A, "web-01", &status(6, 7, "rejected"))
+        .await
+        .unwrap();
+    let row = fx
+        .svc
+        .db
+        .read(|s| Ok(s.host_config(A)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (row.applied_rev, row.state.as_deref()),
+        (6, Some("rejected"))
+    );
+}
+
+#[tokio::test]
+async fn large_changes_need_an_impact_token() {
+    let fx = Fx::new("impact", |_, _| {}).await;
+    fx.sql(|c| {
+        let tx = c.unchecked_transaction().unwrap();
+        for i in 0..1000 {
+            tx.execute(
+                "INSERT INTO hosts (agent_id, hostname, agent_version, first_seen, last_seen)
+                 VALUES (?1, 'h', '0.9.0', 0, 0)",
+                [format!("{i:08x}-0000-4000-8000-000000000000")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    })
+    .await;
+    let p = fx
+        .svc
+        .create_profile(&who(), profile("p", json!({"log": {"level": "debug"}})))
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let e = fx
+        .svc
+        .create_assignment(&who(), p, desired::Selector::Global, None, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "confirmation_required");
+    let d = e.details.unwrap();
+    assert_eq!(d["affected_hosts"], 1000);
+    let token = d["impact_token"].as_str().unwrap().to_string();
+    let e = fx
+        .svc
+        .create_assignment(
+            &who(),
+            p,
+            desired::Selector::Global,
+            None,
+            None,
+            Some("wrong".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "impact_changed");
+    fx.svc
+        .create_assignment(
+            &who(),
+            p,
+            desired::Selector::Global,
+            None,
+            None,
+            Some(token),
+        )
+        .await
+        .unwrap();
+    // 預覽
+    let v = fx
+        .svc
+        .preview_change(ops::PreviewChange::Profile {
+            id: p,
+            settings: json!({"log": {"level": "warn"}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(v["affected_hosts"], 1000);
+    assert_eq!(v["by_change"]["log.level"], 1000);
+    assert_eq!(v["confirm_required"], true);
+}
+
+#[tokio::test]
+async fn expired_assignments_are_removed_by_the_system() {
+    let fx = Fx::new("expire", |_, _| {}).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    let p = fx
+        .svc
+        .create_profile(
+            &who(),
+            profile("暫時除錯", json!({"log": {"level": "debug"}})),
+        )
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let e = fx
+        .svc
+        .create_assignment(
+            &who(),
+            p,
+            desired::Selector::Host(A.into()),
+            None,
+            Some(T0 - 1),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_parameter");
+    fx.svc
+        .create_assignment(
+            &who(),
+            p,
+            desired::Selector::Host(A.into()),
+            None,
+            Some(T0 + 60_000),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(fx.svc.desired_rev(A) > 0);
+    fx.svc.expire_assignments().await.unwrap();
+    assert!(fx.svc.desired_rev(A) > 0, "還沒到期");
+    fx.set_now(T0 + 60_000);
+    fx.svc.expire_assignments().await.unwrap();
+    assert_eq!(fx.svc.desired_rev(A), 0);
+    assert!(
+        fx.audit_actions()
+            .await
+            .iter()
+            .any(|a| a == "config.assign_expired")
+    );
+}
+
+#[tokio::test]
+async fn hello_recomputes_with_the_tags_from_hello() {
+    let fx = Fx::new("hello", |_, _| {}).await;
+    let p = fx
+        .svc
+        .create_profile(&who(), profile("prod", json!({"report": {"interval": 5}})))
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    fx.svc
+        .create_assignment(
+            &who(),
+            p,
+            desired::Selector::Tag("env:prod".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // D 不在清冊（第一次連線、report 尚未寫入）
+    assert_eq!(fx.svc.desired_rev(D), 0);
+    let rev = fx
+        .svc
+        .on_hello_config(D, vec!["env:prod".into()], "0.9.0", Some("enabled".into()))
+        .await
+        .unwrap();
+    assert!(rev > 0);
+    assert_eq!(fx.svc.desired_rev(D), rev);
+    // 同樣的標籤：不寫入、同一版
+    assert_eq!(
+        fx.svc
+            .on_hello_config(D, vec!["env:prod".into()], "0.9.0", None)
+            .await
+            .unwrap(),
+        rev
+    );
+    // 標籤移除：沒有設定
+    assert_eq!(
+        fx.svc
+            .on_hello_config(D, vec![], "0.9.0", None)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+fn trust_settings(signer: &TestSigner) -> impl FnOnce(&mut RemoteSettings, &std::path::Path) + '_ {
+    move |s, dir| {
+        std::fs::write(dir.join("allowed_signers"), signer.allowed_signers()).unwrap();
+        s.allowed_signers = "allowed_signers".into();
+    }
+}
+
+/// 匯入一次測試發佈並上傳所有發佈檔
+async fn import(fx: &Fx, r: &super::test_sign::TestRelease) {
+    fx.svc
+        .import_release(
+            &who(),
+            r.sha256sums.clone(),
+            r.signature.clone(),
+            Some(r.manifest.clone()),
+        )
+        .await
+        .unwrap();
+    for (name, data) in &r.files {
+        let mut up = releases::Upload::create(&fx.svc.releases_dir, 1 << 20).unwrap();
+        up.write(data).unwrap();
+        let (sha, size) = up.finish().unwrap();
+        fx.svc
+            .store_artifact(&who(), r.version.clone(), name.clone(), up, sha, size)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn releases_are_verified_stored_and_protected_while_in_use() {
+    let signer = TestSigner::new(3);
+    let fx = Fx::new("rel", trust_settings(&signer)).await;
+    let r = release(&signer, "0.9.2", "abcdef1");
+    // 另一把金鑰簽的：簽章失敗，稽核 release.import_failed
+    let other = TestSigner::new(4);
+    let e = fx
+        .svc
+        .import_release(
+            &who(),
+            r.sha256sums.clone(),
+            other.sign(r.sha256sums.as_bytes()),
+            Some(r.manifest.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (e.code, e.product_code),
+        ("release_signature_invalid", Some(CODE_IMPORT_FAILED))
+    );
+    assert!(
+        fx.audit_actions()
+            .await
+            .iter()
+            .any(|a| a == "release.import_failed")
+    );
+
+    let v = fx
+        .svc
+        .import_release(
+            &who(),
+            r.sha256sums.clone(),
+            r.signature.clone(),
+            Some(r.manifest.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["version"], "0.9.2");
+    assert_eq!(v["verified"], true);
+    assert_eq!(v["artifacts"].as_array().unwrap().len(), 3);
+    assert_eq!(v["artifacts"][0]["stored"], false);
+    let e = fx
+        .svc
+        .import_release(
+            &who(),
+            r.sha256sums.clone(),
+            r.signature.clone(),
+            Some(r.manifest.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "release_exists");
+
+    // 上傳：雜湊不符、不在 SHA256SUMS
+    let up_with = |data: &[u8]| {
+        let mut up = releases::Upload::create(&fx.svc.releases_dir, 1 << 20).unwrap();
+        up.write(data).unwrap();
+        let (sha, size) = up.finish().unwrap();
+        (up, sha, size)
+    };
+    let (name, data) = r.files[0].clone();
+    let (up, sha, size) = up_with(b"tampered");
+    let e = fx
+        .svc
+        .store_artifact(&who(), "0.9.2".into(), name.clone(), up, sha, size)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "artifact_hash_mismatch");
+    let (up, sha, size) = up_with(&data);
+    let e = fx
+        .svc
+        .store_artifact(
+            &who(),
+            "0.9.2".into(),
+            "pulse-0.9.2-abcdef1-windows-x86_64.msi".into(),
+            up,
+            sha,
+            size,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "artifact_not_listed");
+    let (up, sha, size) = up_with(&data);
+    let a = fx
+        .svc
+        .store_artifact(&who(), "0.9.2".into(), name.clone(), up, sha.clone(), size)
+        .await
+        .unwrap();
+    assert_eq!(
+        (a["stored"].as_bool(), a["size"].as_i64()),
+        (Some(true), Some(data.len() as i64))
+    );
+    let path = releases::artifact_path(&fx.svc.releases_dir, &sha);
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+
+    // 推送使用中：不能刪
+    let spec = RolloutSpec::parse(
+        &json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}}),
+    )
+    .unwrap();
+    fx.svc.create_rollout(&who(), spec).await.unwrap();
+    let e = fx
+        .svc
+        .delete_release(&who(), "0.9.2".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "release_in_use");
+    assert_eq!(e.details.unwrap()["in_use_by_rollouts"], 1);
+    // 沒有設定信任錨時只檢查格式與簽章本身
+    let fx2 = Fx::new("rel2", |_, _| {}).await;
+    let v = fx2
+        .svc
+        .import_release(
+            &who(),
+            r.sha256sums.clone(),
+            other.sign(r.sha256sums.as_bytes()),
+            Some(r.manifest.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["verified"], false);
+    // 清單被改：雜湊不符
+    let r3 = release(&signer, "0.9.3", "abcdef2");
+    let e = fx
+        .svc
+        .import_release(
+            &who(),
+            r3.sha256sums.clone(),
+            r3.signature.clone(),
+            Some(r3.manifest.replace("false", "true")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "release_invalid");
+}
+
+#[tokio::test]
+async fn rollout_offers_downloads_statuses_pauses_and_retries() {
+    let signer = TestSigner::new(5);
+    let fx = Fx::new("rollout", trust_settings(&signer)).await;
+    let r090 = release(&signer, "0.9.0", "1111111");
+    let r092 = release(&signer, "0.9.2", "2222222");
+    import(&fx, &r090).await;
+    import(&fx, &r092).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.add_host(B, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(C, "0.9.0", "Web", &[], "tar", "disabled").await;
+    fx.connect(A, "0.9.0", "tar");
+    fx.connect(B, "0.9.0", "deb");
+    let spec = RolloutSpec::parse(&json!({
+        "name": "0.9.2 web",
+        "target_version": "0.9.2",
+        "selector": {"groups": ["web"]},
+        "waves": [{"size": 1, "soak_minutes": 0, "max_failure_ratio": 0, "manual_continue": true}, {"size": "rest", "max_failure_ratio": 0.05}],
+        "options": {"canary_agent_ids": [A]},
+    }))
+    .unwrap();
+    let preview = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(preview["eligible"], 2);
+    assert_eq!(preview["skipped"]["disabled"], 1);
+    assert_eq!(preview["waves"], json!([1, 1]));
+    assert_eq!(preview["confirm_text"], "升級 2 台");
+    let created = fx.svc.create_rollout(&who(), spec.clone()).await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert!(
+        id.starts_with("r-20270115-") || id.starts_with("r-"),
+        "{id}"
+    );
+    assert_eq!(created["state"], "draft");
+    let e = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "confirmation_required");
+    assert_eq!(e.details.unwrap()["confirm_text"], "升級 2 台");
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 2 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running");
+    assert_eq!(fx.host_state(&id, C).await.state, "skipped");
+    // 另一個推送不能涵蓋同樣的主機
+    let e = fx.svc.create_rollout(&who(), spec).await.unwrap_err();
+    assert_eq!(e.code, "rollout_overlap");
+
+    // Kairos 剛啟動：1 分鐘內不提議
+    fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(A), None);
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up_a = fx.svc.offer_of(A).expect("canary offered");
+    assert_eq!(fx.svc.offer_of(B), None, "第二批還沒開始");
+    let offer = fx.svc.build_offer(A, &up_a, 9).await.unwrap().unwrap();
+    assert_eq!(offer.seq, 9);
+    assert_eq!(offer.action, "upgrade");
+    assert_eq!(offer.target.version, "0.9.2");
+    assert!(offer.artifact.filename.ends_with("linux-x86_64.tar.gz"));
+    assert!(offer.rollback_artifact.is_none(), "tar 不需要回滾檔");
+    assert_eq!(offer.manifest.as_ref().unwrap().content, r092.manifest);
+    // 下載：只有提議中的檔案
+    assert!(
+        fx.svc
+            .offered_file(A, &up_a, &r092.files[1].0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (path, size) = fx
+        .svc
+        .offered_file(A, &up_a, &offer.artifact.filename)
+        .await
+        .unwrap()
+        .unwrap();
+    let (chunk, eof) = releases::read_chunk(&path, 0, 32768, size).unwrap();
+    assert_eq!((chunk.len(), eof), (32768, false));
+    let (rest, eof) = releases::read_chunk(&path, 32768, 32768, size).unwrap();
+    assert!(eof);
+    let mut all = chunk;
+    all.extend(rest);
+    assert_eq!(
+        kairos_proto::release::sha256_hex(&all),
+        offer.artifact.sha256
+    );
+    // 其他主機不能下載
+    assert!(
+        fx.svc
+            .offered_file(B, &up_a, &offer.artifact.filename)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let status = |id: &str, state: &str, code: Option<&str>| kairos_proto::mgmt::UpgradeStatus {
+        seq: 1,
+        ts: "2026-11-20T02:00:00.000Z".into(),
+        upgrade_id: id.to_string(),
+        state: state.into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.2".into(),
+        code: code.map(str::to_string),
+        detail: String::new(),
+        progress: None,
+    };
+    for s in ["accepted", "staged", "applying"] {
+        fx.svc
+            .apply_upgrade_status(A, "0.9.0", status(&up_a, s, None))
+            .await
+            .unwrap();
+        assert_eq!(fx.host_state(&id, A).await.state, s);
+    }
+    assert_eq!(fx.svc.offer_of(A), None, "交給輔助程式後不再提議");
+    // 晚到的較早狀態不覆蓋
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", status(&up_a, "accepted", None))
+        .await
+        .unwrap();
+    assert_eq!(fx.host_state(&id, A).await.state, "applying");
+    fx.svc
+        .apply_upgrade_status(A, "0.9.2", status(&up_a, "succeeded", Some("PLS-I8416")))
+        .await
+        .unwrap();
+    assert_eq!(fx.host_state(&id, A).await.state, "succeeded");
+    // canary 結束 → 觀察（0 分鐘）→ 等待人工繼續
+    fx.svc.tick().await.unwrap();
+    fx.svc.tick().await.unwrap();
+    let r = fx
+        .svc
+        .db
+        .read({
+            let id = id.clone();
+            move |s| Ok(s.get_rollout(&id)?.unwrap())
+        })
+        .await
+        .unwrap();
+    assert!(r.awaiting_continue, "{r:?}");
+    assert_eq!(fx.svc.offer_of(B), None);
+    fx.svc.continue_rollout(&who(), id.clone()).await.unwrap();
+    fx.svc.tick().await.unwrap();
+    let up_b = fx.svc.offer_of(B).expect("second wave offered");
+    let offer_b = fx.svc.build_offer(B, &up_b, 1).await.unwrap().unwrap();
+    assert!(offer_b.artifact.filename.ends_with(".deb"));
+    let rb = offer_b
+        .rollback_artifact
+        .as_ref()
+        .expect("deb 的回滾檔：目前版本 0.9.0");
+    assert!(rb.filename.starts_with("pulse-0.9.0-1111111-"));
+    assert!(
+        fx.svc
+            .offered_file(B, &up_b, &rb.filename)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // 簽章失敗：稽核、暫停推送
+    fx.svc
+        .apply_upgrade_status(B, "0.9.0", status(&up_b, "failed", Some("PLS-E8401")))
+        .await
+        .unwrap();
+    let r = fx
+        .svc
+        .db
+        .read({
+            let id = id.clone();
+            move |s| Ok(s.get_rollout(&id)?.unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.state, "paused");
+    assert!(r.pause_reason.unwrap().contains("PLS-E8401"));
+    let actions = fx.audit_actions().await;
+    assert!(actions.iter().any(|a| a == "host.upgrade.signature_failed"));
+    assert!(actions.iter().any(|a| a == "rollout.auto_pause"));
+    // 重試（新的 upgrade_id）並繼續
+    fx.svc
+        .retry_host(&who(), id.clone(), B.into())
+        .await
+        .unwrap();
+    let retried = fx.host_state(&id, B).await;
+    assert_eq!((retried.state.as_str(), retried.attempts), ("pending", 1));
+    assert_ne!(retried.upgrade_id, up_b);
+    fx.svc.resume_rollout(&who(), id.clone()).await.unwrap();
+    fx.svc.tick().await.unwrap();
+    let up_b2 = fx.svc.offer_of(B).unwrap();
+    assert_eq!(up_b2, retried.upgrade_id);
+    // 舊的 upgrade_id：不再提議
+    assert!(fx.svc.build_offer(B, &up_b, 1).await.unwrap().is_none());
+    // 回報成功但版本不是目標 → 失敗（KRS-W8402）→ 下一輪失敗比例超過上限而暫停
+    fx.svc
+        .apply_upgrade_status(B, "0.9.0", status(&up_b2, "succeeded", None))
+        .await
+        .unwrap();
+    let h = fx.host_state(&id, B).await;
+    assert_eq!(
+        (h.state.as_str(), h.reason.as_deref(), h.code.as_deref()),
+        (
+            "failed",
+            Some("version_mismatch"),
+            Some(CODE_VERSION_MISMATCH)
+        )
+    );
+    fx.svc.tick().await.unwrap();
+    let r = fx
+        .svc
+        .db
+        .read({
+            let id = id.clone();
+            move |s| Ok(s.get_rollout(&id)?.unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.state, "paused");
+    // 取消
+    let v = fx
+        .svc
+        .cancel_rollout(&who(), id.clone(), "測試結束".into())
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "cancelled");
+    let e = fx
+        .svc
+        .cancel_rollout(&who(), id.clone(), "x".into())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state");
+    for a in [
+        "rollout.create",
+        "rollout.submit",
+        "rollout.start",
+        "rollout.resume",
+        "rollout.update",
+        "rollout.cancel",
+    ] {
+        assert!(fx.audit_actions().await.iter().any(|x| x == a), "{a}");
+    }
+}
+
+#[tokio::test]
+async fn rollback_failure_pauses_and_needs_acknowledgement_before_retry() {
+    let signer = TestSigner::new(6);
+    let fx = Fx::new("rbf", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}, "waves": [{"size": "rest"}]})).unwrap();
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    fx.set_now(T0 + 61_000);
+    let mut rx = fx.svc.subscribe();
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).unwrap();
+    fx.svc.flush_progress().await;
+    let ev = rx.try_recv().expect("rollout.progress");
+    assert_eq!(ev.kind, "rollout.progress");
+    assert_eq!(ev.data["rollout_id"], id.as_str());
+    assert_eq!(ev.data["progress"]["offered"], 1);
+    let st = kairos_proto::mgmt::UpgradeStatus {
+        seq: 1,
+        ts: "2026-11-20T02:00:00.000Z".into(),
+        upgrade_id: up.clone(),
+        state: "rollback_failed".into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.2".into(),
+        code: Some("PLS-E8408".into()),
+        detail: "pulse.service failed".into(),
+        progress: None,
+    };
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", st.clone())
+        .await
+        .unwrap();
+    // 重送（at-least-once）：去重
+    fx.svc.apply_upgrade_status(A, "0.9.0", st).await.unwrap();
+    let r = fx
+        .svc
+        .db
+        .read({
+            let id = id.clone();
+            move |s| Ok(s.get_rollout(&id)?.unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.state, "paused");
+    assert_eq!(
+        fx.audit_actions()
+            .await
+            .iter()
+            .filter(|a| *a == "host.upgrade.rollback_failed")
+            .count(),
+        1
+    );
+    let e = fx
+        .svc
+        .retry_host(&who(), id.clone(), A.into())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state");
+    // 告警的系統規則：自動暫停（回滾失敗，嚴重）與回滾失敗的主機
+    let mut bus = fx.registry.bus().subscribe();
+    fx.svc.reconcile_alerts().await;
+    let mut active = Vec::new();
+    while let Ok(ev) = bus.try_recv() {
+        if let crate::bus::EventKind::RemoteCondition {
+            rule,
+            subject,
+            active: a,
+            details,
+            ..
+        } = &ev.kind
+        {
+            assert!(*a);
+            active.push((*rule, subject.clone(), details.clone()));
+        }
+    }
+    active.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(active.len(), 2, "{active:?}");
+    assert_eq!(
+        (active[0].0, active[0].1.as_str()),
+        ("sys.rollout_paused", id.as_str())
+    );
+    assert_eq!(active[0].2["cause"], "rollback_failed");
+    assert_eq!(
+        (active[1].0, active[1].1.as_str()),
+        ("sys.upgrade_rollback_failed", A)
+    );
+    // 沒有改變：不重複發布
+    fx.svc.reconcile_alerts().await;
+    assert!(bus.try_recv().is_err());
+    fx.svc
+        .acknowledge_host(&who(), id.clone(), A.into(), Some("已在現場修復".into()))
+        .await
+        .unwrap();
+    fx.svc.resume_rollout(&who(), id.clone()).await.unwrap();
+    fx.svc.reconcile_alerts().await;
+    let mut cleared = 0;
+    while let Ok(ev) = bus.try_recv() {
+        if let crate::bus::EventKind::RemoteCondition { active: false, .. } = &ev.kind {
+            cleared += 1;
+        }
+    }
+    assert_eq!(cleared, 2, "標記處理、推送繼續後恢復");
+    fx.svc
+        .retry_host(&who(), id.clone(), A.into())
+        .await
+        .unwrap();
+    assert_eq!(fx.host_state(&id, A).await.state, "pending");
+}
+
+#[tokio::test]
+async fn download_slots_are_limited_and_released_when_idle_or_staged() {
+    let fx = Fx::new("dl", |s, _| s.max_concurrent_downloads = 1).await;
+    assert!(fx.svc.acquire_download(A));
+    assert!(fx.svc.acquire_download(A), "同一台繼續下載");
+    assert!(!fx.svc.acquire_download(B), "名額已滿 → rate_limited");
+    assert_eq!(fx.svc.downloads_in_progress(), 1);
+    fx.svc.on_staged(A);
+    assert!(fx.svc.acquire_download(B));
+}
+
+#[test]
+fn pulse_codes_map_to_mirrored_kairos_codes() {
+    assert_eq!(mirror_code("PLS-W0501"), Some("KRS-W0501"));
+    assert_eq!(mirror_code("PLS-E8402"), Some("KRS-W8402"));
+    assert_eq!(mirror_code("PLS-E8403"), None);
+    assert_eq!(mirror_code("KRS-W8402"), None);
+}
+
+#[tokio::test]
+async fn pending_carries_config_rev_and_upgrade_id_by_session() {
+    let fx = Fx::new("pending", |_, _| {}).await;
+    fx.svc.apply_desired(&[(A.to_string(), 42)]);
+    fx.svc
+        .set_offer(A, Some("9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70"));
+    let both = kairos_proto::mgmt::MgmtSession {
+        config: true,
+        upgrade: true,
+    };
+    let p = fx.svc.pending(both, A).unwrap();
+    assert_eq!(p.config_rev, Some(42));
+    assert_eq!(
+        p.upgrade_id.as_deref(),
+        Some("9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70")
+    );
+    let cfg_only = kairos_proto::mgmt::MgmtSession {
+        config: true,
+        upgrade: false,
+    };
+    assert_eq!(fx.svc.pending(cfg_only, A).unwrap().upgrade_id, None);
+    assert!(
+        fx.svc
+            .pending(kairos_proto::mgmt::MgmtSession::NONE, A)
+            .is_none()
+    );
+    assert_eq!(fx.svc.pending(both, B).unwrap().config_rev, Some(0));
+}
+
+#[tokio::test]
+async fn cancel_withdraws_offers_but_records_an_apply_that_already_started() {
+    let signer = TestSigner::new(13);
+    let fx = Fx::new("cancel", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}, "waves": [{"size": "rest"}]})).unwrap();
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).unwrap();
+    fx.svc
+        .cancel_rollout(&who(), id.clone(), "改期".into())
+        .await
+        .unwrap();
+    assert_eq!(fx.svc.offer_of(A), None, "取消後不再提議");
+    assert!(fx.svc.build_offer(A, &up, 1).await.unwrap().is_none());
+    assert_eq!(fx.host_state(&id, A).await.state, "cancelled");
+    // Pulse 其實已經交給輔助程式：照實記錄
+    let st = |state: &str| kairos_proto::mgmt::UpgradeStatus {
+        seq: 1,
+        ts: "2026-11-20T02:00:00.000Z".into(),
+        upgrade_id: up.clone(),
+        state: state.into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.2".into(),
+        code: None,
+        detail: String::new(),
+        progress: None,
+    };
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", st("staged"))
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.host_state(&id, A).await.state,
+        "cancelled",
+        "取消後的下載進度不改變"
+    );
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", st("applying"))
+        .await
+        .unwrap();
+    fx.svc
+        .apply_upgrade_status(A, "0.9.2", st("succeeded"))
+        .await
+        .unwrap();
+    assert_eq!(fx.host_state(&id, A).await.state, "succeeded");
+}

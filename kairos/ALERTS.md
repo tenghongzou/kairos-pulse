@@ -135,6 +135,9 @@ subnet_prefix_v6 = 64
 | `sys.unauthenticated` | 未認證連線已允許 | 未啟用 mTLS 卻監聽對外位址；每日提醒一次、**不可靜音** | 嚴重 | `KRS-W0302` | TLS 設定 |
 | `sys.channel_failed` | 通知管道失敗 | 同一管道連續 3 次發送失敗（每個管道一則）；改送其他所有健康的管道。0.7：機密無法解開（`secrets_unavailable`）時不必等到發送失敗，立即成立 | 嚴重 | `KRS-E5107`；機密無法解開 `KRS-E5110` | 派送 |
 | `sys.audit_integrity` | 稽核日誌完整性（0.7） | 定期自我驗證（`audit.verify_interval_hours`，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復 | 緊急 | `KRS-E6201` | 匯流排（`audit_integrity`） |
+| `sys.rollout_paused` | 升級推送已暫停（0.9） | 升級推送因失敗比例超過上限、主機回滾失敗或發佈簽章驗證失敗而自動暫停（手動暫停不開）；推送繼續或取消時恢復（REMOTE.md 第 4.7.4 節） | 警告（回滾失敗、簽章失敗為嚴重） | `KRS-W8414` | 匯流排（`remote_condition`，遠端管理服務每 5 秒調和） |
+| `sys.upgrade_rollback_failed` | 升級回滾失敗（0.9） | 主機升級後回滾也失敗，需要人工處理；對象為主機；標記為已處理或重試時恢復 | 嚴重 | `KRS-E8408` | 匯流排（`remote_condition`） |
+| `sys.release_signature_failed` | 發佈簽章驗證失敗（0.9） | 主機驗證發佈包的簽章失敗（`PLS-E8401`），使用同一版本的推送已暫停；對象為目標版本；推送繼續或取消時恢復 | 嚴重 | `KRS-E8401` | 匯流排（`remote_condition`） |
 | `sys.restarted`、`sys.downtime` | 第 5.2 節 | | 資訊（非預期：嚴重）、嚴重 | — | 心跳 |
 
 **使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。

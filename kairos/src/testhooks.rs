@@ -10,6 +10,7 @@
 //! | `KAIROS_TEST_DROP_ENROLL_RESPONSES` | 8444 的前 N 個成功的 `POST /v1/enroll/requests`：照常處理（寫入資料庫），但不送出回應、直接關閉連線（ENROLL.md 第 19.3 節 #7「回應遺失」） |
 //! | `KAIROS_TEST_DROP_RENEWAL_RESPONSES` | 同上，對象為 `POST /v1/enroll/renewals`（第 19.3 節 #12） |
 //! | `KAIROS_TEST_GRACE_SECS` | 過期寬限期的秒數（取代憑證政策的 `expired_renew_grace_days`；政策為 0 天時仍為 0，第 19.3 節 #14） |
+//! | `KAIROS_TEST_REMOTE_START_GRACE_MS` | 升級推送在 Kairos 啟動後不提議新主機的時間（毫秒；取代 1 分鐘，REMOTE.md 第 4.7.4 節第 5 項） |
 
 #[cfg(debug_assertions)]
 fn read(name: &str) -> Option<i64> {
@@ -62,6 +63,19 @@ pub fn drop_enroll_response(method: &str, path: &str, status: u16) -> bool {
     {
         let _ = (method, path, status);
         false
+    }
+}
+
+/// `KAIROS_TEST_REMOTE_START_GRACE_MS`
+pub fn remote_start_grace_ms() -> Option<i64> {
+    #[cfg(debug_assertions)]
+    {
+        static V: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| read("KAIROS_TEST_REMOTE_START_GRACE_MS"))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
     }
 }
 

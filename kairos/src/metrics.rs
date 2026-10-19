@@ -221,7 +221,8 @@ impl Metrics {
             | EventKind::Condition { .. }
             | EventKind::Lifecycle { .. }
             | EventKind::ChannelSecrets { .. }
-            | EventKind::AuditIntegrity { .. } => {}
+            | EventKind::AuditIntegrity { .. }
+            | EventKind::RemoteCondition { .. } => {}
         }
     }
 

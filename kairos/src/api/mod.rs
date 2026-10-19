@@ -17,6 +17,7 @@
 //! | [`metrics`] | 指標趨勢 |
 //! | [`export`] | 指標轉出：Prometheus exporter、OTLP 的設定與狀態（`kairos/EXPORT.md`） |
 //! | [`privacy`] | 刪除主機資料、個資匯出（商業審計 S6） |
+//! | [`remote`] | 遠端管理：集中設定、Pulse 版本庫、升級推送（商業審計 F8） |
 //! | [`overview`]、[`health`] | 總覽、系統健康 |
 //! | [`events`] | 即時變更推送（SSE） |
 //! | [`maint`] | 背景工作：每分鐘上線數、token 的最後使用與稽核日誌、被拒的憑證寫入清冊 |
@@ -39,6 +40,7 @@ mod maint;
 pub mod metrics;
 pub mod overview;
 pub mod privacy;
+pub mod remote;
 pub mod tokens;
 pub mod users;
 pub mod web;
@@ -53,6 +55,8 @@ mod bench;
 mod privacy_tests;
 #[cfg(test)]
 mod probe_tests;
+#[cfg(test)]
+mod remote_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -142,6 +146,8 @@ pub struct ApiContext {
     pub privacy: Arc<crate::privacy::PrivacyPolicy>,
     /// 刪除主機資料（交給 report 的 writer；`POST /api/v1/hosts/{agent_id}/purge`）
     pub purger: Option<crate::store::PurgeSink>,
+    /// 遠端管理（集中設定、版本庫、升級推送；SQLite 時）
+    pub remote: Option<Arc<crate::remote::RemoteService>>,
 }
 
 /// 被拒絕（403）的寫入請求寫入稽核的節流：同一個執行者每分鐘最多 20 筆，超過的計數併入下一筆
@@ -203,6 +209,8 @@ pub struct StartParams {
     pub obs: Option<Arc<crate::probe::ObsContext>>,
     /// 刪除主機資料的佇列（SQLite 時；沒有時 `POST /api/v1/hosts/{agent_id}/purge` 回 503）
     pub purger: Option<crate::store::PurgeSink>,
+    /// 遠端管理（SQLite 時；沒有時 `/api/v1/config`、`/releases`、`/rollouts` 回 503 `remote_unavailable`）
+    pub remote: Option<Arc<crate::remote::RemoteService>>,
 }
 
 /// 啟動失敗的種類（決定結束代碼）
@@ -392,6 +400,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
             &p.data_dir,
         )),
         purger: p.purger.clone(),
+        remote: p.remote.clone(),
     });
     ctx.hosts.load_known(known);
 
@@ -408,6 +417,14 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
     // 告警的變化 → SSE（`alert.created`、`alert.updated`、`alert.resolved`）
     if let Some(svc) = &p.alerts {
         runtime.spawn(events::alert_pump(
+            svc.subscribe(),
+            ctx.events.clone(),
+            p.shutdown.clone(),
+        ));
+    }
+    // 遠端管理的變化 → SSE（`config.host`、`rollout.progress`）
+    if let Some(svc) = &p.remote {
+        runtime.spawn(events::remote_pump(
             svc.subscribe(),
             ctx.events.clone(),
             p.shutdown.clone(),
@@ -664,6 +681,10 @@ fn known_route(rest: &[&str]) -> bool {
             | ["hosts", _, "inventory", "changes"]
             | ["hosts", _, "processes"]
             | ["hosts", _, "purge" | "personal-data"]
+            | ["hosts", _, "config" | "upgrade"]
+            | ["config", ..]
+            | ["releases", ..]
+            | ["rollouts", ..]
             | ["overview"]
             | ["system", "health"]
             | ["events"]
@@ -814,6 +835,8 @@ async fn route(
         }
         // 指標轉出（kairos/EXPORT.md）：Prometheus exporter、設定與狀態
         ["export", ..] => export::handle(ctx, peer, req, p, rest, now).await,
+        // 遠端管理（API.md 第 17 節；含寫入與發佈檔上傳）：集中設定、版本庫、升級推送
+        _ if remote::is_route(rest) => remote::handle(ctx, peer, req, p, rest, now).await,
         ["events"] => match p.host_access() {
             Ok(access) => {
                 let last = req

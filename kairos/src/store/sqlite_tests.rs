@@ -1585,11 +1585,11 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(migrate(&mut conn, &MIGRATIONS[..5]).unwrap(), 5);
     assert!(has(&conn, "alert_events"));
     assert!(!has(&conn, "users"));
-    // 再升級到 v8（整合後的線性順序 v4 → v5 → v6 → v7 → v8）：使用者的資料表建立
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 8);
+    // 再升級到最新版（整合後的線性順序 v4 → v5 → v6 → v7 → v8 → v9）：使用者的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 9);
     assert_eq!(
         MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7, 8]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
     for t in [
         "users",
@@ -1623,7 +1623,7 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(n, crate::alerts::rules::builtins().len());
     assert_eq!(conn.ensure_builtin_rules(2).unwrap(), 0);
     // 再執行一次升級：不變
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 8);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 9);
     drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1685,7 +1685,10 @@ fn v7_database_upgrades_to_v8_keeping_series_ids_and_data() {
         .unwrap();
     }
     let (mut store, _) = open(&dir, noon);
-    assert_eq!(count(&mut store, "PRAGMA user_version"), 8);
+    assert_eq!(
+        count(&mut store, "PRAGMA user_version"),
+        i64::from(SCHEMA_VERSION)
+    );
     // 序列編號不變、derived 為 0；host_series 由彙總補上
     assert_eq!(
         count(

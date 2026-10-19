@@ -643,6 +643,75 @@ async fn every_role_is_denied_what_it_lacks() {
         ("POST", "/api/v1/channels/test", Some(json!({})), &["ad"]),
         ("PUT", "/api/v1/channels/c-1", Some(json!({})), &["ad"]),
         ("DELETE", "/api/v1/channels/c-1", Some(json!({})), &["ad"]),
+        // 遠端管理（REMOTE.md 第 5.2 節；允許的請求為 400／404／415，不改變狀態）
+        ("GET", "/api/v1/config/schema", None, &["ad", "op", "au"]),
+        ("GET", "/api/v1/config/profiles", None, &["ad", "op", "au"]),
+        ("GET", "/api/v1/config/status", None, &["ad", "op", "au"]),
+        (
+            "POST",
+            "/api/v1/config/preview",
+            Some(json!({})),
+            &["ad", "op", "au"],
+        ),
+        (
+            "POST",
+            "/api/v1/config/profiles",
+            Some(json!({})),
+            &["ad", "op"],
+        ),
+        (
+            "DELETE",
+            "/api/v1/config/assignments/999",
+            Some(json!({})),
+            &["ad", "op"],
+        ),
+        (
+            "GET",
+            "/api/v1/hosts/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/config",
+            None,
+            &["ad", "op", "au"],
+        ),
+        ("GET", "/api/v1/releases", None, &["ad", "op", "au"]),
+        ("POST", "/api/v1/releases", Some(json!({})), &["ad"]),
+        ("DELETE", "/api/v1/releases/0.9.9", Some(json!({})), &["ad"]),
+        (
+            "PUT",
+            "/api/v1/releases/0.9.9/artifacts/x",
+            Some(json!({})),
+            &["ad"],
+        ),
+        ("GET", "/api/v1/rollouts", None, &["ad", "op", "au"]),
+        (
+            "POST",
+            "/api/v1/rollouts/preview",
+            Some(json!({})),
+            &["ad", "op", "au"],
+        ),
+        ("POST", "/api/v1/rollouts", Some(json!({})), &["ad"]),
+        (
+            "POST",
+            "/api/v1/rollouts/r-x/pause",
+            Some(json!({"reason": "x"})),
+            &["ad", "op"],
+        ),
+        (
+            "POST",
+            "/api/v1/rollouts/r-x/submit",
+            Some(json!({})),
+            &["ad"],
+        ),
+        (
+            "POST",
+            "/api/v1/rollouts/r-x/hosts/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/retry",
+            Some(json!({})),
+            &["ad"],
+        ),
+        (
+            "GET",
+            "/api/v1/hosts/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/upgrade",
+            None,
+            &["ad", "op", "au"],
+        ),
     ];
     for (method, path, body, allowed) in &cases {
         for (name, s) in &sessions {

@@ -1326,3 +1326,62 @@ fn reboot_is_recorded_as_information_without_notification() {
     assert!(rec.title.contains("重新開機"), "{}", rec.title);
     assert!(out.deliveries.is_empty());
 }
+
+/// 遠端管理的系統檢查（REMOTE.md 第 4.7.4 節）：「升級推送已暫停」「升級回滾失敗」「發佈簽章驗證失敗」
+#[test]
+fn remote_conditions_open_system_events_until_cleared() {
+    let mut e = engine();
+    let at = |t: i64| chrono::DateTime::from_timestamp_millis(t).unwrap();
+    let cond =
+        |seq: u64, t: i64, rule: &'static str, subject: &str, active: bool, cause: &str| BusEvent {
+            seq,
+            at: at(t),
+            kind: EventKind::RemoteCondition {
+                rule,
+                subject: subject.into(),
+                active,
+                title: format!("{rule} {subject}"),
+                details: json!({"cause": cause}),
+            },
+        };
+    e.on_bus(&cond(
+        1,
+        T0,
+        ids::ROLLOUT_PAUSED,
+        "r-1",
+        true,
+        "failure_ratio",
+    ));
+    e.on_bus(&cond(2, T0, ids::UPGRADE_ROLLBACK_FAILED, "a1", true, ""));
+    e.tick(world(T0, vec![]));
+    let paused = by_rule(&e, ids::ROLLOUT_PAUSED);
+    assert_eq!(paused.len(), 1);
+    assert_eq!(
+        (paused[0].severity, paused[0].code.as_deref()),
+        (Severity::Warning, Some("KRS-W8414"))
+    );
+    let rb = by_rule(&e, ids::UPGRADE_ROLLBACK_FAILED);
+    assert_eq!(
+        (rb[0].severity, rb[0].code.as_deref()),
+        (Severity::Critical, Some("KRS-E8408"))
+    );
+    e.on_bus(&cond(3, T0 + MIN, ids::ROLLOUT_PAUSED, "r-1", false, ""));
+    e.on_bus(&cond(
+        4,
+        T0 + MIN,
+        ids::UPGRADE_ROLLBACK_FAILED,
+        "a1",
+        false,
+        "",
+    ));
+    e.tick(world(T0 + MIN, vec![]));
+    for rule in [ids::ROLLOUT_PAUSED, ids::UPGRADE_ROLLBACK_FAILED] {
+        assert!(
+            by_rule(&e, rule)
+                .iter()
+                .all(|x| x.state != super::model::EventState::Firing),
+            "{rule}"
+        );
+    }
+    assert!(rules::builtin_default(ids::RELEASE_SIGNATURE_FAILED).is_some());
+}

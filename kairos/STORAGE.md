@@ -175,6 +175,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v6（0.6.0，衝刺 5）：使用者、角色指派、工作階段與 TOTP 復原碼（`users`、`role_assignments`、`sessions`、`user_recovery_codes`），`api_tokens` 的 `owner_user_id`、`role`，`audit_events` 的雜湊鏈欄位 `prev_hash`、`hash`（索引 `audit_events_actor`），`hosts.host_group`（角色指派的範圍）。v6 接在 v5（告警）之後，不依賴 v5 的物件；0.5.0（v4）的資料庫在第一次啟動時依序升級 v5 → v6（各自一個交易），既有的 API token 權限不變（凍結在 0.5，沒有告警與使用者等新權限）。完整的說明見 [`API.md`](API.md) 第 12.10 節。升級後 0.5 的 Kairos 無法開啟；`kairos users`、`kairos audit` 開啟資料庫時同樣會升級 schema。密碼只存 Argon2id 雜湊、工作階段只存 SHA-256、TOTP 秘密以 `data/console.key` 加密（金鑰不在資料庫中，`kairos db backup` 不含它）。
 - v7（0.7.0，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v8（0.8.0，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v9（0.9.0，衝刺 9，商業審計 F8）：集中設定與 Pulse 遠端升級（第 18 節）。`config_profiles`、`config_profile_revisions`、`config_assignments`、`host_config`、`releases`、`release_artifacts`、`rollouts`、`rollout_hosts` 與索引；`hosts.install_method`、`install_upgrade`、`install_config`；`meta.config_rev`。SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V9`（新的資料表依 L1a 的做法放在領域的檔案中，`MIGRATIONS` 仍在 `store/sqlite.rs`）。升級後 0.8 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -664,7 +665,7 @@ sudo systemctl start kairos
 
 ## 16. 刪除主機資料（0.9.0〔草稿〕；商業審計 S6）
 
-規格與取捨見 [`PRIVACY.md`](PRIVACY.md) 第 4 節；實作 `store/purge.rs`（計數、逐步刪除）、`store/sqlite_purge.rs`（writer 的快取）。不需要 schema 變更（schema 仍為 v8）。
+規格與取捨見 [`PRIVACY.md`](PRIVACY.md) 第 4 節；實作 `store/purge.rs`（計數、逐步刪除）、`store/sqlite_purge.rs`（writer 的快取）。不需要 schema 變更（0.9.0 的 v9 另有集中設定與推送的紀錄，最後一步一併刪除，見第 18 節）。
 
 - **由 writer 執行**：主控台 API 把刪除交給 report 的 writer（與資產共用的佇列，`store::PurgeSink`），writer 在 report 的批次之間每一輪做一步（每一步最多 5,000 列、一個 `BEGIN IMMEDIATE` 交易）。順序：原始 report → 行程快照 → 5 分鐘彙總 → 1 小時彙總 → 資產變更歷史；最後一步在同一個交易中刪除資產、`host_series`、`boots`、`import_keys`、告警事件（含處理紀錄、發送紀錄、CLI 動作）、註冊申請、`enroll_replay`、憑證紀錄、`hosts`，並寫入稽核 `host.purge`。中斷時清冊仍在，重新執行即可接續。
 - **快取**：第一步清除這台主機在 writer 中的快取（`agent_id` → `host_id`、序列、計數器的上一筆、boot）與記憶體中尚未寫出的彙總；刪除開始後 10 分鐘內這台主機的 report、資產與清冊同步一律不寫入（`WriteStatus::Failed`，連線回 `storage_unavailable`），避免狀態表的快照或在途的資料把清冊建立回來。
@@ -675,20 +676,22 @@ sudo systemctl start kairos
 
 ## 17. 儲存層的結構（0.9.0〔草稿〕；HA L1a）
 
-0.9.0 把「各模組直接用 rusqlite」改為領域 store 介面（[`HA.md`](HA.md) 第 5 節的 L1a），為之後的 PostgreSQL 後端（L1b，0.10.0）準備。**純重構**：schema（仍為 v8）、SQL、交易邊界、錯誤訊息與代碼、API 回應、CLI 輸出都沒有改變；report 的寫入路徑（第 1、4 節）完全沒有動。
+0.9.0 把「各模組直接用 rusqlite」改為領域 store 介面（[`HA.md`](HA.md) 第 5 節的 L1a），為之後的 PostgreSQL 後端（L1b，0.10.0）準備。**純重構**：schema（L1a 本身沒有改變 schema；之後 F8 的 v9 依同樣的結構加入 `RemoteStore`，第 18 節）、SQL、交易邊界、錯誤訊息與代碼、API 回應、CLI 輸出都沒有改變；report 的寫入路徑（第 1、4 節）完全沒有動。
 
 ```text
 呼叫端（api/、enroll/、alerts/、pki/、*_cli.rs、audit_monitor、probe、diag、export）
   │ &dyn Store（連線池的 closure）或 DbHandle（CLI）；只呼叫領域方法，不寫 SQL
   ▼
 store/db.rs：trait Store ＝ SettingsStore ＋ AuditLog ＋ UserStore ＋ TokenStore ＋ PkiStore
-             ＋ EnrollStore ＋ AlertStore ＋ HostStore ＋ ApiQueries ＋ AdminStore，加上 begin(TxMode)
+             ＋ EnrollStore ＋ AlertStore ＋ HostStore ＋ ApiQueries ＋ AdminStore ＋ RemoteStore，
+             加上 begin(TxMode)
              trait Tx：交易中的 Store（commit；沒有 commit 就 drop 時回復）
              StoreError（訊息與後端相同）、StoreErrorKind、in_write_tx
   ▼
 store/sqlite/conn.rs：rusqlite::Connection 與 Transaction 實作 Store／Tx（AsConn＋blanket impl；
                       forward! 巨集把每個領域方法轉呼叫到下列檔案中原本的函式）
 store/sqlite/{audit,users,tokens,pki,enroll,alerts,hosts,api,admin}.rs：原封不動搬來的 SQL
+                      store/sqlite/remote.rs：F8 的資料表（schema v9）與 SQL
 ```
 
 - **領域介面與位置**：
@@ -705,6 +708,7 @@ store/sqlite/{audit,users,tokens,pki,enroll,alerts,hosts,api,admin}.rs：原封�
   | `HostStore` | `store/hosts.rs` | 清冊與 report／彙總的讀取、資產、資料庫大小、備份、匯出、刪除主機資料 |
   | `ApiQueries` | `store/api.rs` | 主控台畫面的跨表查詢（主機清單與詳情、憑證所屬主機） |
   | `AdminStore` | `store/admin.rs` | 個資匯出、診斷包的摘要 |
+  | `RemoteStore` | `remote/store.rs` | 集中設定、Pulse 版本庫、升級推送（0.9.0 F8，schema v9，第 18 節） |
 
   report 的寫入仍是 `ReportStore`（單一 writer，`SqliteStore`）。
 - **交易**：`Store::begin(TxMode::Deferred)` 與 `TxMode::Immediate` 送出與原本相同的 `BEGIN DEFERRED`／`BEGIN IMMEDIATE`（以 `rusqlite::Transaction::new_unchecked` 實作，不需要 `&mut`）。原本依賴 SQLite 全域寫入鎖的操作（HA.md 第 2.2 節 D1～D9）都還在 `TxMode::Immediate` 的交易中，各 trait 的說明寫明了交易要求（例如 `EnrollStore` 的 D2～D4、`PkiStore` 的 D5、`AlertStore` 的 D6、D7、`AuditLog` 的 D1）。`store::db::in_write_tx` 取代原本 `audit::in_write_tx`（已在交易中時沿用，否則開 `BEGIN IMMEDIATE`）。
@@ -733,3 +737,27 @@ store/sqlite/{audit,users,tokens,pki,enroll,alerts,hosts,api,admin}.rs：原封�
 
   兩種情境都全部寫入（重送的 9,600 筆皆為 `Duplicate`），沒有 `storage_unavailable` 與結果不明。差異在兩次量測之間的波動範圍內：report 的寫入路徑（`SqliteStore`）沒有經過新的介面，重構不影響它。
 
+## 18. 集中設定與 Pulse 遠端升級（schema v9；0.9.0〔草稿〕；商業審計 F8）
+
+規格見 [`crates/kairos-proto/REMOTE.md`](../crates/kairos-proto/REMOTE.md) 第 6 節（草案）；實作的 SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V9`，領域介面 `RemoteStore`（`remote/store.rs`，已加入 `Store`），API 見 [`API.md`](API.md) 第 17 節。v9 只新增資料表與 `hosts` 的欄位，不修改既有的唯一鍵。
+
+| 資料表 | 內容 | 主鍵 |
+|---|---|---|
+| `config_profiles` | 設定檔：`name`（不分大小寫唯一）、`description`、`settings`（兩層 JSON，正規化）、`revision`、建立與修改的時間與執行者 | `profile_id` |
+| `config_profile_revisions` | 每一版的 `settings`、`description`、`changed_at`、`changed_by`、`reason`（全部保留） | (`profile_id`, `revision`) |
+| `config_assignments` | 指派：`profile_id`、`selector_kind`（`global`／`group`／`tag`／`host`）、`selector_value`（group 小寫、host 為小寫的 agent_id）、`priority`、`expires_at`；(`selector_kind`, `selector_value`, `profile_id`) 唯一 | `assignment_id` |
+| `host_config` | 每台主機：期望設定（`desired_rev`、`desired_hash`、`desired`、`sources`）、Pulse 最近一次 `config_status`（`applied_rev`、`applied_hash`、`state`、`effective`、`overridden`、`ignored`、`errors`、`code`、`reported_at`）、最近一次 hello 的 `tags`、`agent_version`、`install_config`；索引 `host_config_state` | `agent_id` |
+| `releases` | Pulse 發佈版本：`version`（(`product`, `version`) 唯一，`product` 只能是 `pulse`）、`commit_id`、`source`（0.9 只有 `hosted`）、`sha256sums`、`signature`、`signer_fingerprint`／`signer_principal`（匯入時以 `[remote] allowed_signers` 驗證；沒有設定時 NULL）、`manifest_name`、`manifest`、匯入的時間與執行者 | `release_id` |
+| `release_artifacts` | 每個發佈檔：`filename`、`os`、`arch`、`format`、`sha256`、`size_bytes`、`stored`（檔案在 `<releases_dir>/<sha256>`）、`stored_at` | (`release_id`, `filename`) |
+| `rollouts` | 推送：`rollout_id`（`r-YYYYMMDD-NNNN`）、`name`、`release_id`、`selector`／`waves`／`schedule`／`options`（JSON）、`state`、`current_wave`、`wave_started_at`、`soak_until`、`awaiting_continue`、`pause_reason`、`pause_cause`（自動暫停的原因，告警用）、`cancel_reason`、建立、開始、完成與更新的時間（`approved_*` 保留給 0.10 的雙人覆核）；索引 `rollouts_state` | `rollout_id` |
+| `rollout_hosts` | 推送中的每台主機：`upgrade_id`（唯一）、`wave`（`skipped` 為 -1）、`ordinal`、`state`、`reason`、`from_version`、`to_version`、`attempts`、`bytes_done`／`bytes_total`、`code`、`detail`、`offered_at`、`applying_at`、`finished_at`、`updated_at`、`acknowledged_at`／`_by`；索引 `rollout_hosts_host`、`rollout_hosts_state` | (`rollout_id`, `host_id`) |
+
+- `hosts` 新增 `install_method`、`install_upgrade`、`install_config`（hello 的 `install`，由清冊同步寫入，與 `os` 相同以 `coalesce` 保留上一次的值）。
+- `meta.config_rev`：全域單調遞增的設定版本（任何設定檔、指派改變時加 1）。
+- **與 REMOTE.md 第 6 節草案的差異**：`rollouts` 另有 `target_version`、`pause_cause`，`release_id` 不設外鍵（rusqlite 內附的 SQLite 預設開啟外鍵檢查，刪除版本後已結束的推送仍要能顯示目標）；`host_config` 以 `agent_id` 為鍵、另記最近一次 hello 的標籤與版本（主機可能在 report 寫入清冊之前就送出 `config_get`；清冊每 30 秒才同步一次，期望設定以 hello 的標籤計算）；主鍵欄位沿用既有的命名（`profile_id`、`assignment_id`、`release_id`）；`releases` 另有 `signer_principal`、`manifest_name`；`release_artifacts` 另有 `stored_at`；`rollout_hosts` 另有 `acknowledged_at`／`_by`（回滾失敗標記為已處理）。
+- **寫入**：遠端管理有自己的資料庫連線（與註冊服務相同的做法：一條寫入連線、busy 等待 2 秒、兩個寫入交易之間至少間隔 2 毫秒，加上數條唯讀連線），每個操作一個 `BEGIN IMMEDIATE` 交易、稽核在同一個交易中。8443 上的 `config_status`、`upgrade_status` 各一個短交易；`config_get`、`upgrade_get`、`upgrade_chunk_get` 只讀（發佈檔的內容從檔案讀，不在資料庫中）。心跳的 `pending` 不查資料庫（記憶體中的 `desired_rev` 與提議中的 `upgrade_id`，啟動時載入）。
+- **重新計算**：一次設定變更在同一個交易中對所有主機計算合併後的設定與雜湊，只寫入雜湊改變的主機（REMOTE.md 第 3.4.4 節）。
+- **保存期限**：設定檔的版本全部保留；已完成或取消的推送在 `[remote] rollout_retention_days`（預設 400 天）後刪除（含主機表），每小時檢查一次。
+- **刪除主機資料**（第 16 節）一併刪除 `host_config` 與 `rollout_hosts` 中這台主機的紀錄（`remote_management` 筆數）；個資匯出另有 `remote_management`（`host_config` 與推送中的紀錄）。以 `host:<agent_id>` 選擇器的指派不刪除（它是設定，不是主機的資料）。
+- **備份**：`kairos db backup` 包含這些資料表，但**不含版本庫的發佈檔**（`<資料目錄>/releases/`，`[remote] releases_dir`）：可以從發佈處重新取得並以 `PUT …/artifacts/{filename}` 重新上傳。還原後 `stored = 1` 而檔案不存在的發佈檔，提議時 `upgrade_chunk_get` 回 `upgrade_unavailable`（日誌「版本庫的 … 無法讀取」），請重新上傳。
+- 升級到 v9 之後 0.8 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。

@@ -1,6 +1,6 @@
 # 遠端管理：集中設定與 agent 遠端升級（F8）
 
-〔衝刺 8 規格。第 14 節 D1～D18 已決定（2026-10-19，採建議）：Kairos 0.9.0／Pulse 0.9.0 實作 MVP（D15：集中設定＋Linux 升級＋兩批推送＋最小主控台），其餘延到 0.10.0。**S1（共用 crate）已實作**（衝刺 9）：第 2 節已搬入 [`PROTOCOL.md`](PROTOCOL.md)「遠端管理」並以它為準，`kairos-proto` 的 `mgmt`、`release` 模組；K1／K2／P1／P2 尚未實作，兩端目前都不宣告 `config`、`upgrade`〕
+〔衝刺 8 規格。第 14 節 D1～D18 已決定（2026-10-19，採建議）：Kairos 0.9.0／Pulse 0.9.0 實作 MVP（D15：集中設定＋Linux 升級＋兩批推送＋最小主控台），其餘延到 0.10.0。**S1（共用 crate）已實作**（衝刺 9）：第 2 節已搬入 [`PROTOCOL.md`](PROTOCOL.md)「遠端管理」並以它為準，`kairos-proto` 的 `mgmt`、`release` 模組；**K1／K2（Kairos）已實作**（衝刺 9，實作附註與差異見第 13.1 節），Kairos 0.9.0 在 mTLS、SQLite 的連線上宣告 `config`、`upgrade`；P1／P2（Pulse）另一條線實作中〕
 
 本文件是商業審計 F8「agent 遠端升級與集中設定」的工程規格：8443 上的兩個新 feature `config`、`upgrade`（協定版本維持 v2），Kairos 端的設定檔、發佈版本庫與分批推送，Pulse 端的設定合併、升級狀態機與特權輔助程式，安全模型、資料表（schema v9 草案）、主控台 API 草案、畫面需求、錯誤代碼（暫定）、測試策略與實作分工。
 
@@ -1037,6 +1037,52 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 - 可並行：S1 完成後，K1／K2／P1／P2 四條線並行；W1 以 API 草案與假資料同時開始；R1 隨時可做；T1 在 K2、P2 可用後開始。以 4～5 人計約 4 週。
 - **與審計的 4～6 人週的差異**：審計的估計沒有計入特權分離的輔助程式、套件安裝的回滾、Windows 的升級程序、分批推送引擎與主控台。若要壓在 6～8 人週，建議第一版（0.9.0）只做 **MVP**：集中設定（K1、P1）、Linux tar／deb／rpm 的升級與回滾（P2）、推送只有「canary＋其餘」兩批、沒有時段與雙人覆核、主控台只有版本庫與推送詳情的最小畫面；Windows（P3）、時段、雙人覆核、外部 URL 放到 0.10.0（第 14 節 D15）。
+
+### 13.1 K1／K2 實作附註（Kairos 0.9.0，衝刺 9）
+
+實作在 `kairos/src/remote/`（`RemoteService`：記憶體中的 `pending`、連線表、下載名額與推送引擎）、`kairos/src/api/remote.rs`（主控台端點，[`kairos/API.md`](../../kairos/API.md) 第 17 節）、`kairos/src/store/sqlite/remote.rs`（schema v9，[`kairos/STORAGE.md`](../../kairos/STORAGE.md) 第 18 節）與 `connection.rs`（8443）。協定、白名單、簽章與清單的驗證全部使用 `kairos-proto` 的 `mgmt`、`release`，沒有另寫一份。
+
+**8443**
+
+- 協商：`ServerMgmtPolicy`（`[remote] config_enabled`／`upgrade_enabled`、SQLite、這條連線以 mTLS 證明了 `agent_id`）＋`MgmtSession`；只在 client 也宣告時列出。沒有協商時新訊息一律 `unknown_type`（格式錯誤也是）；協商了時格式錯誤為 `bad_request`（`seq: null`）。
+- `pending`：`hello_ack` 與回應 `heartbeat` 的 `ack`（`ServerMsg::heartbeat_ack`；其他 `ack` 一律 `ServerMsg::ack()`）。`config_rev`／`upgrade_id` 取自記憶體（啟動時由 `host_config`、進行中的推送載入，變更時更新），心跳不查資料庫。
+- hello（協商了 `config`）時以 hello 的 `tags`、`agent_version`、`install.config` 與清冊的群組重新計算這台主機的期望設定，只有雜湊或 hello 的資訊改變時才寫入；hello 的資訊另存在 `host_config`，之後的設定變更以它計算（清冊每 30 秒才同步）。
+- `config_get` → `config`：`rev` 為 `desired_rev`，`settings` 依 `agent_version` 過濾（`filter_for_version`），`hash` 以送出的 `settings` 計算；沒有設定時 `rev: 0`、空的 `settings`。`config_status` → `ack`，依「`rev` 比已記錄的舊時只更新 `effective`／`overridden`」寫入；`rejected`、`rolled_back` 記 WARN（`KRS-W0501`／`KRS-W0504`），停用與本機覆蓋記 INFO（`KRS-I0505`／`KRS-I0503`）。
+- `upgrade_get`：只有目前提議給這台主機（`offered`／`accepted`／`staged`、推送 `running`）的 `upgrade_id` 才回 `upgrade_offer`，否則 `upgrade_unavailable`。發佈檔依 hello 的 `install.method` 與 `os.arch` 選擇（`release::artifact_kind`）；deb／rpm 另附**主機目前版本**的同格式檔案為 `rollback_artifact`（版本庫有時）。`apply_window`：提議時起 24 小時（0.9 沒有維護時段）。組出的提議先以 `validate_upgrade_offer` 檢查。
+- `upgrade_chunk_get`：`filename` 只能是這次提議的檔案（其他 `upgrade_unavailable`）；下載名額（`max_concurrent_downloads`，同一台主機延續名額，10 分鐘沒有請求或回報 `staged`／結束時釋出）不足時 `rate_limited`＋`retry_after_ms: 15000`；從 `<releases_dir>/<sha256>` 讀取（blocking 執行緒），檔案遺失或比記錄的短時 `upgrade_unavailable` 並記 WARN。Kairos **不在提供時重新驗證**檔案內容（被竄改的檔案由 Pulse 的雜湊與簽章檢查發現，第 12.2 節第 5 項）。
+- `upgrade_status`：以 (`upgrade_id`, `state`) 去重；晚到的較早狀態（例如 `applying` 之後的 `accepted`）與已結束的主機的回報只記錄不改變；不認得的 `upgrade_id` 也回 `ack`。`succeeded` 以這條連線 hello 的 `agent_version` 交叉確認（不符 → `failed`／`version_mismatch`／`KRS-W8402`）。資料庫失敗時 `storage_unavailable`（`config_get`、`config_status`、`upgrade_get`、`upgrade_chunk_get`、`upgrade_status` 都是）。
+
+**推送**（第 4.7 節的 MVP）
+
+- 最多兩批（`waves` 的最後一批為 `"rest"`；預設範本為 canary 1%（至多 10 台）、觀察 60 分鐘、上限 0、人工繼續，其餘 5%），送出後立即開始（`draft` → `running`；`scheduled`、`pending_approval` 保留給 0.10）。對象在**送出時**固定（第 4.7.2 節寫「開始時」，建立草稿時只預覽），不符資格的記為 `skipped`（`wave = -1`）。
+- 推送引擎每 5 秒（狀態改變時立即）每個推送一個交易：逾時（提議後 24＋1 小時仍未開始 → `expired`；`applying` 後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線 → `unknown`）、離線寬限（`skipped_offline`，重新連線時回到 `pending`）、失敗比例（持續檢查）、觀察期、人工繼續、完成。只對**連線中且協商了 `upgrade`** 的主機提議；連線中但沒有協商的主機記為 `skipped`（`not_ready`）。
+- **`server_lost`**：`applying` 的逾時判斷中，最後一次離線的原因是 Kairos 這端（`server_shutdown`、叢集的 `server_lost`）時，期限從 Kairos 這次啟動時重新起算，不把主機標為 `unknown`（主機連不上是因為 Kairos 的節點失聯或停機，不是卡在替換中）；`server_lost` 已在 0.9.0 的 `offline_reason` 列舉中（單機的 Kairos 不會產生）。Kairos 啟動後 1 分鐘內不提議新的主機（第 4.7.4 節第 5 項）。
+- 暫停時提議中、尚未替換的主機回到 `pending` 並在恢復時換新的 `upgrade_id`（Pulse 對舊的 id 收到 `upgrade_unavailable`，同一目標版本的暫存檔可以沿用）；取消時改為 `cancelled`；替換中的照常完成。重試同樣換新的 `upgrade_id`（`attempts` 加 1），`rollback_failed` 需要先 `acknowledge`。
+- 自動暫停：失敗比例、`rollback_failed`、簽章失敗（`PLS-E8401`；同一版本的其他推送也暫停），記 `rollout.auto_pause`（`KRS-W8414`）。系統規則（`kairos/ALERTS.md`）：`sys.rollout_paused`「升級推送已暫停」（`KRS-W8414`，警告；原因為回滾失敗或簽章失敗時為嚴重）、`sys.upgrade_rollback_failed`「升級回滾失敗」（`KRS-E8408`，嚴重，對象為主機）、`sys.release_signature_failed`「發佈簽章驗證失敗」（`KRS-E8401`，嚴重，對象為目標版本）。遠端管理服務每一輪依資料庫調和（自動暫停的推送記 `rollouts.pause_cause`，手動暫停不開事件），以內部事件 `RemoteCondition` 發布改變的部分；推送繼續或取消、回滾失敗標記為已處理（或重試）時恢復，Kairos 重新啟動後重新發布。
+- 推送中主機的離線告警抑制（第 4.7.5 節）尚未實作。
+
+**版本庫**
+
+- 匯入：`POST /api/v1/releases`（`SHA256SUMS`、`.sig`、清單全文）建立版本，之後逐一 `PUT …/artifacts/{filename}` 上傳（串流寫入暫存檔並計算 SHA-256，符合 `SHA256SUMS` 才改名為 `<sha256>`）。有 `[remote] allowed_signers` 時以 `release::verify_bundle` 驗證；沒有設定時只確認簽章本身（`SshSignature::verify_message`）與雜湊，`signer_fingerprint` 為 NULL（主控台警告）。`allowed_signers` 在每次匯入時讀取（修改後不需重新啟動）。
+- `kairos releases import|list|delete` 的 CLI 與外部 URL（`source: external`）尚未提供（後者為 0.10）。
+
+**集中設定**
+
+- `meta.config_rev` 與「只有雜湊改變的主機才更新 `desired_rev`」照第 3.4.4 節；沒有任何設定時 `desired_rev = 0`。`global` 最多一筆；相同優先序的衝突在儲存指派**與修改設定檔**時檢查（409）；之後主機的標籤或群組改變造成的重疊以指派編號（後建立的為準）決定。
+- 影響 1,000 台以上的變更（修改、回復設定檔，新增、刪除指派）需要 `impact_token`。
+
+**與規格的差異**（其餘照第 2～8 節）
+
+| 項目 | 規格 | 實作 |
+|---|---|---|
+| `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
+| 對象固定的時間 | 推送開始時（第 4.7.2 節） | 送出時（0.9 送出即開始，兩者相同） |
+| `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
+| SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪）；`rollout.host` 未提供 |
+| CLI | `kairos releases import／list／delete` | 未提供（以 API） |
+| 告警 | 系統規則與離線告警抑制 | 三條系統規則已接上；升級中主機的離線告警抑制（第 4.7.5 節）未提供 |
+| `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選 |
+| 刪除主機資料 | — | 一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management` |
 
 ## 14. 已決定（2026-10-19，採建議）
 

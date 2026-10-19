@@ -276,6 +276,9 @@ pub struct Engine {
     pub(super) tls_failed: Option<(i64, bool, String)>,
     /// 稽核日誌的自我驗證失敗：(時間, 原因, 斷點的 id, 說明)
     pub(super) audit_failed: Option<(i64, String, Option<i64>, String)>,
+    /// 遠端管理的系統檢查：(規則, 對象) → (開始時間, 標題, 細節)
+    pub(super) remote_conditions:
+        std::collections::BTreeMap<(&'static str, String), (i64, String, Value)>,
     pub(super) flaps: HashMap<String, VecDeque<i64>>,
     pub(super) warmup: Warmup,
     pub(super) seq_by_day: HashMap<String, u64>,
@@ -313,6 +316,7 @@ impl Engine {
             evictions: VecDeque::new(),
             tls_failed: None,
             audit_failed: None,
+            remote_conditions: std::collections::BTreeMap::new(),
             flaps: HashMap::new(),
             warmup,
             seq_by_day: loaded.seq_by_day,
@@ -1245,6 +1249,22 @@ impl Engine {
                     self.tls_failed = None;
                 } else if self.tls_failed.is_none() {
                     self.tls_failed = Some((at, *crl, message.clone().unwrap_or_default()));
+                }
+            }
+            EventKind::RemoteCondition {
+                rule,
+                subject,
+                active,
+                title,
+                details,
+            } => {
+                let key = (*rule, subject.clone());
+                if *active {
+                    let since = self.remote_conditions.get(&key).map_or(at, |c| c.0);
+                    self.remote_conditions
+                        .insert(key, (since, title.clone(), details.clone()));
+                } else {
+                    self.remote_conditions.remove(&key);
                 }
             }
             EventKind::AuditIntegrity {
