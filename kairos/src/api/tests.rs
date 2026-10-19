@@ -531,6 +531,7 @@ pub(crate) fn hello(id: &str, name: &str, peer: &str) -> HelloInfo {
                 kernel: None,
                 arch: Some("x86_64".into()),
             }),
+            install: None,
         })),
         peer: peer.into(),
         offline_after: Duration::from_secs(75),

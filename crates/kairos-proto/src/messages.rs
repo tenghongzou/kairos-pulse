@@ -16,6 +16,10 @@ use std::io::{Error, ErrorKind};
 use crate::inventory::InventoryReport;
 use crate::lifecycle::{Deregister, DeregisterAck, RenewRequest, RenewResult};
 use crate::metrics::Metric;
+use crate::mgmt::{
+    ConfigGet, ConfigStatus, InstallInfo, Pending, RemoteConfig, UpgradeChunk, UpgradeChunkGet,
+    UpgradeGet, UpgradeOffer, UpgradeStatus,
+};
 use crate::processes::ProcessList;
 
 /// 日誌中顯示無效 `proto` 原始值的長度上限（字元）
@@ -141,6 +145,10 @@ pub struct HostInfo {
     pub report_interval_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<OsInfo>,
+    /// 安裝方式與遠端管理的本機狀態（0.9.0 起，feature `config`／`upgrade`；不論是否宣告都送）。
+    /// 限制見 [`validate_install`](crate::mgmt::validate_install)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallInfo>,
 }
 
 /// 把 v2 欄位的各部分合併序列化到外層物件（搭配 `#[serde(flatten)]`）
@@ -185,7 +193,7 @@ fn to_part<T: Serialize>(part: &Result<T, String>) -> Result<Value, String> {
 pub struct HelloExt {
     /// `proto_min`、`proto_max`、`features`
     pub offer: Result<ProtoOffer, String>,
-    /// `host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`
+    /// `host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`、`install`
     pub host: Result<HostInfo, String>,
     /// `intent`（PROTOCOL.md「憑證輪替與除役」）：目前只定義
     /// [`INTENT_DEREGISTER`](crate::INTENT_DEREGISTER)。不是字串時視為沒有；`None` 時不輸出
@@ -495,6 +503,16 @@ pub enum ClientMsg {
     Deregister(Box<Deregister>),
     /// 主機資產（feature `inventory`，METRICS.md）。沒有協商時伺服器視同不認得的 `type`
     Inventory(Box<InventoryReport>),
+    /// 取得下發的設定（feature `config`）。沒有協商時伺服器視同不認得的 `type`
+    ConfigGet(Box<ConfigGet>),
+    /// 回報設定的實際生效值（feature `config`）
+    ConfigStatus(Box<ConfigStatus>),
+    /// 取得升級提議（feature `upgrade`）
+    UpgradeGet(Box<UpgradeGet>),
+    /// 分段下載發佈檔（feature `upgrade`）
+    UpgradeChunkGet(Box<UpgradeChunkGet>),
+    /// 回報升級狀態（feature `upgrade`）
+    UpgradeStatus(Box<UpgradeStatus>),
     /// 不認得的 `type`；`serde(other)` 只能用於 unit 變體，因此拿不到 seq。
     /// 只出現在解析結果中，不能序列化。
     #[serde(other, skip_serializing)]
@@ -545,9 +563,24 @@ pub enum ServerMsg {
             skip_serializing_if = "Option::is_none"
         )]
         cluster_id: Option<String>,
+        /// 有新的設定或升級（協商了 `config` 或 `upgrade` 時才送，[`Pending`]）。不是物件時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "crate::mgmt::de_lenient_pending",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pending: Option<Pending>,
     },
     Ack {
         seq: u64,
+        /// 回應 `heartbeat` 的 `ack` 在協商了 `config` 或 `upgrade` 時另帶（回應其他訊息的不帶）。
+        /// 不是物件時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "crate::mgmt::de_lenient_pending",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pending: Option<Pending>,
     },
     /// 伺服器一律送出完整的四個欄位。解析時容忍欄位缺漏、不整則忽略：缺 `seq` → null、
     /// 缺 `code` / `message` → 空字串、缺 `fatal` → 視為 fatal（保守處理：結束連線並退避重連）。
@@ -574,6 +607,13 @@ pub enum ServerMsg {
             skip_serializing_if = "Option::is_none"
         )]
         proto_max: Option<u32>,
+        /// `rate_limited`（`upgrade_chunk_get` 超過下載併發）時：建議等待的毫秒數。不是合法 u32 時視為沒有
+        #[serde(
+            default,
+            deserialize_with = "de_lenient_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
+        retry_after_ms: Option<u32>,
     },
     /// 正常輪替的結果（feature `renew`）
     RenewResult(Box<RenewResult>),
@@ -595,6 +635,12 @@ pub enum ServerMsg {
         )]
         reconnect_within_ms: Option<u32>,
     },
+    /// 下發的設定（feature `config`），回應 `config_get`
+    Config(Box<RemoteConfig>),
+    /// 升級提議（feature `upgrade`），回應 `upgrade_get`
+    UpgradeOffer(Box<UpgradeOffer>),
+    /// 發佈檔的一段（feature `upgrade`），回應 `upgrade_chunk_get`
+    UpgradeChunk(Box<UpgradeChunk>),
 }
 
 /// 寬鬆的 u32：不是合法 u32 的值（字串、負數、小數、null 等）視為 `None`
@@ -615,13 +661,16 @@ fn fatal_by_default() -> bool {
 }
 
 /// [`ServerMsg`] 的所有 `type` 值；不在其中的視為未知類型（見 [`parse_server_msg`]）
-pub const SERVER_MSG_TYPES: [&str; 6] = [
+pub const SERVER_MSG_TYPES: [&str; 9] = [
     "hello_ack",
     "ack",
     "error",
     "renew_result",
     "deregister_ack",
     "drain",
+    "config",
+    "upgrade_offer",
+    "upgrade_chunk",
 ];
 
 /// 規格定義的錯誤碼（只能用這些）
@@ -645,13 +694,17 @@ pub enum ErrorCode {
     RenewRequiresApproval,
     /// `renew_request`：CSR 不符規定
     InvalidCsr,
-    /// `renew_request`：同一個 `agent_id` 每小時超過 10 次
+    /// `renew_request`：同一個 `agent_id` 每小時超過 10 次；`upgrade_chunk_get`：超過下載併發
+    /// （另帶 `retry_after_ms`）
     RateLimited,
+    /// `upgrade_get`／`upgrade_chunk_get`：沒有這個升級、推送已暫停或取消、主機已不在推送中、
+    /// 檔案不在提議中或已從版本庫刪除（feature `upgrade`）
+    UpgradeUnavailable,
 }
 
 impl ErrorCode {
     /// 所有錯誤碼（順序同 PROTOCOL.md 的錯誤碼表以外無特別意義）
-    pub const ALL: [ErrorCode; 14] = [
+    pub const ALL: [ErrorCode; 15] = [
         ErrorCode::UnsupportedVersion,
         ErrorCode::HelloRequired,
         ErrorCode::TooLong,
@@ -666,6 +719,7 @@ impl ErrorCode {
         ErrorCode::RenewRequiresApproval,
         ErrorCode::InvalidCsr,
         ErrorCode::RateLimited,
+        ErrorCode::UpgradeUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -684,6 +738,7 @@ impl ErrorCode {
             ErrorCode::RenewRequiresApproval => "renew_requires_approval",
             ErrorCode::InvalidCsr => "invalid_csr",
             ErrorCode::RateLimited => "rate_limited",
+            ErrorCode::UpgradeUnavailable => "upgrade_unavailable",
         }
     }
 
@@ -725,6 +780,42 @@ impl ServerMsg {
             fatal,
             proto_min: None,
             proto_max: None,
+            retry_after_ms: None,
+        }
+    }
+
+    /// `ack`（不帶 `pending`）
+    pub fn ack(seq: u64) -> Self {
+        ServerMsg::Ack { seq, pending: None }
+    }
+
+    /// 回應 `heartbeat` 的 `ack`：協商了 `config` 或 `upgrade` 時帶 `pending`
+    /// （[`Pending::for_session`](crate::mgmt::Pending::for_session) 的結果）
+    pub fn heartbeat_ack(seq: u64, pending: Option<Pending>) -> Self {
+        ServerMsg::Ack { seq, pending }
+    }
+
+    /// 非 fatal 的 `rate_limited`，另帶 `retry_after_ms`（`upgrade_chunk_get` 超過下載併發）
+    pub fn rate_limited(seq: Option<u64>, message: impl Into<String>, retry_after_ms: u32) -> Self {
+        match Self::error(seq, ErrorCode::RateLimited, message) {
+            ServerMsg::Error {
+                seq,
+                code,
+                message,
+                fatal,
+                proto_min,
+                proto_max,
+                ..
+            } => ServerMsg::Error {
+                seq,
+                code,
+                message,
+                fatal,
+                proto_min,
+                proto_max,
+                retry_after_ms: Some(retry_after_ms),
+            },
+            other => other,
         }
     }
 
@@ -921,11 +1012,12 @@ mod tests {
                 renew_now: None,
                 server_node: None,
                 cluster_id: None,
+                pending: None,
             },
             server_vector("hello_ack"),
         );
-        assert_server_msg(&ServerMsg::Ack { seq: 2 }, ack_vector(2));
-        assert_server_msg(&ServerMsg::Ack { seq: 6 }, ack_vector(6));
+        assert_server_msg(&ServerMsg::ack(2), ack_vector(2));
+        assert_server_msg(&ServerMsg::ack(6), ack_vector(6));
         assert_server_msg(
             &unsupported_version_error(Some(1), SUPPORTED_PROTO),
             server_error_vector("unsupported_version"),
@@ -1110,7 +1202,7 @@ mod tests {
             assert!(!ServerMsg::error(None, code, "").is_fatal());
         }
         assert!(ServerMsg::error_with_fatal(None, ErrorCode::BadRequest, "", true).is_fatal());
-        assert!(!ServerMsg::Ack { seq: 1 }.is_fatal());
+        assert!(!ServerMsg::ack(1).is_fatal());
     }
 
     #[test]
@@ -1181,6 +1273,7 @@ mod tests {
                 renew_now: None,
                 server_node: None,
                 cluster_id: None,
+                pending: None,
             }
         );
     }
@@ -1188,9 +1281,9 @@ mod tests {
     #[test]
     fn deserialize_acks() {
         let msg: ServerMsg = serde_json::from_str(ack_vector(2)).unwrap();
-        assert_eq!(msg, ServerMsg::Ack { seq: 2 });
+        assert_eq!(msg, ServerMsg::ack(2));
         let msg: ServerMsg = serde_json::from_str(ack_vector(6)).unwrap();
-        assert_eq!(msg, ServerMsg::Ack { seq: 6 });
+        assert_eq!(msg, ServerMsg::ack(6));
     }
 
     #[test]
@@ -1206,6 +1299,7 @@ mod tests {
                 fatal: true,
                 proto_min: Some(1),
                 proto_max: Some(2),
+                retry_after_ms: None,
             }
         );
 
@@ -1219,6 +1313,7 @@ mod tests {
                 fatal: false,
                 proto_min: None,
                 proto_max: None,
+                retry_after_ms: None,
             }
         );
     }
@@ -1237,6 +1332,7 @@ mod tests {
                 fatal: true,
                 proto_min: None,
                 proto_max: None,
+                retry_after_ms: None,
             }
         );
         let msg: ServerMsg = serde_json::from_str(r#"{"type":"error"}"#).unwrap();
@@ -1249,6 +1345,7 @@ mod tests {
                 fatal: true,
                 proto_min: None,
                 proto_max: None,
+                retry_after_ms: None,
             }
         );
         // 明確給 fatal:false 時照給的值
@@ -1266,7 +1363,7 @@ mod tests {
     fn server_msg_unknown_fields_are_ignored() {
         let msg: ServerMsg =
             serde_json::from_str(r#"{"type":"ack","seq":3,"future_field":"x"}"#).unwrap();
-        assert_eq!(msg, ServerMsg::Ack { seq: 3 });
+        assert_eq!(msg, ServerMsg::ack(3));
     }
 
     // ---- 合併後新增的測試 ----
@@ -1274,10 +1371,7 @@ mod tests {
     #[test]
     fn parse_server_msg_separates_unknown_types_from_invalid_lines() {
         // A14：未知類型與壞掉的訊息分開
-        assert_eq!(
-            parse_server_msg(ack_vector(2)).unwrap(),
-            ServerMsg::Ack { seq: 2 }
-        );
+        assert_eq!(parse_server_msg(ack_vector(2)).unwrap(), ServerMsg::ack(2));
         for (line, kind) in [
             (r#"{"type":"future_msg"}"#, "future_msg"),
             (r#"{"type":"command","seq":3,"args":[1]}"#, "command"),
@@ -1329,8 +1423,9 @@ mod tests {
                 renew_now: None,
                 server_node: None,
                 cluster_id: None,
+                pending: None,
             },
-            ServerMsg::Ack { seq: 1 },
+            ServerMsg::ack(1),
             ServerMsg::error(None, ErrorCode::BadRequest, "x"),
             parse_server_msg(crate::tests::server_vector_in(
                 crate::tests::Ver::Renew,
@@ -1343,6 +1438,21 @@ mod tests {
             ))
             .unwrap(),
             ServerMsg::drain(crate::DRAIN_REASON_NODE_DRAINING, 10_000),
+            parse_server_msg(crate::tests::server_vector_in(
+                crate::tests::Ver::Mgmt,
+                "config",
+            ))
+            .unwrap(),
+            parse_server_msg(crate::tests::server_vector_in(
+                crate::tests::Ver::Mgmt,
+                "upgrade_offer",
+            ))
+            .unwrap(),
+            parse_server_msg(crate::tests::server_vector_in(
+                crate::tests::Ver::Mgmt,
+                "upgrade_chunk",
+            ))
+            .unwrap(),
         ];
         let kinds: Vec<String> = samples
             .iter()
@@ -1458,6 +1568,7 @@ mod tests {
                 renew_now: None,
                 server_node: None,
                 cluster_id: None,
+                pending: None,
             }
         );
         let body = report_body(client_vector_in(Ver::V2, "report"));
@@ -1772,6 +1883,7 @@ mod tests {
                 renew_now: None,
                 server_node: None,
                 cluster_id: None,
+                pending: None,
             }
         );
         // 新 Pulse 在 v1 連線送出的 report 就是 v1 向量，舊 Kairos 可解析

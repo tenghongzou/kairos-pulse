@@ -25,6 +25,8 @@ pub fn collect(display_name: &str, tags: &[String], report_interval: Duration) -
         tags: (!tags.is_empty()).then(|| tags.to_vec()),
         report_interval_ms: u64::try_from(report_interval.as_millis()).ok(),
         os: (!os.is_empty()).then_some(os),
+        // 遠端管理（REMOTE.md 第 2.1 節）的安裝資訊由 P2（Pulse 升級）實作時填入
+        install: None,
     }
 }
 

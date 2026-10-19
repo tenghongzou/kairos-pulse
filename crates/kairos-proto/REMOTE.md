@@ -1,6 +1,6 @@
 # 遠端管理：集中設定與 agent 遠端升級（F8）
 
-〔衝刺 8 規格，尚未實作。第 14 節 D1～D18 已決定（2026-10-19，採建議）：Kairos 0.9.0／Pulse 0.9.0 實作 MVP（D15：集中設定＋Linux 升級＋兩批推送＋最小主控台），其餘延到 0.10.0〕
+〔衝刺 8 規格。第 14 節 D1～D18 已決定（2026-10-19，採建議）：Kairos 0.9.0／Pulse 0.9.0 實作 MVP（D15：集中設定＋Linux 升級＋兩批推送＋最小主控台），其餘延到 0.10.0。**S1（共用 crate）已實作**（衝刺 9）：第 2 節已搬入 [`PROTOCOL.md`](PROTOCOL.md)「遠端管理」並以它為準，`kairos-proto` 的 `mgmt`、`release` 模組；K1／K2／P1／P2 尚未實作，兩端目前都不宣告 `config`、`upgrade`〕
 
 本文件是商業審計 F8「agent 遠端升級與集中設定」的工程規格：8443 上的兩個新 feature `config`、`upgrade`（協定版本維持 v2），Kairos 端的設定檔、發佈版本庫與分批推送，Pulse 端的設定合併、升級狀態機與特權輔助程式，安全模型、資料表（schema v9 草案）、主控台 API 草案、畫面需求、錯誤代碼（暫定）、測試策略與實作分工。
 
@@ -56,6 +56,8 @@ flowchart LR
 5. **升級與設定都可回復**：設定保留上一份可用的版本（last-known-good），升級保留上一版的執行檔或套件；兩者都有自動回復與回報。
 
 ## 2. 協定：feature `config`、`upgrade`
+
+> 〔S1 已搬入 [`PROTOCOL.md`](PROTOCOL.md)「遠端管理（feature `config`、`upgrade`）」，以該節與 `kairos-proto` 的測試向量為準；本節保留作為設計背景。與本節的差異：`config_status` 的 `overridden` 只列本機值與下發值不同的鍵；`errors[].reason` 定為 `type_mismatch`、`out_of_range`、`invalid_value`、`conflict`；`upgrade_status` 的 `from_version`／`to_version`／`detail` 可以是空字串；第 2.7 節的範例雜湊與簽章在 PROTOCOL.md 換成真實的測試向量〕
 
 兩個 feature 都只在協商結果為 v2、雙方都宣告、這條連線以用戶端憑證（mTLS）證明身分、且 Kairos 以 SQLite 儲存時使用（與 `renew` 的條件相同：Kairos 只在 client 也宣告時才在 `hello_ack` 列出）。沒有協商時，下列新的 `type` 一律視為不認得（`unknown_type`），與 0.8 相同。**協定版本不升**：新訊息、新欄位只在協商了對應 feature 的連線上出現，舊端不會收到。
 

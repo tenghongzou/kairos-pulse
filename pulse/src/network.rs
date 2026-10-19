@@ -1781,7 +1781,7 @@ enum Reply {
 /// 一行伺服器訊息中的回應：`ack` 與非 fatal 的 `error`，回傳 (回應的 seq, 意義)；其他訊息為 `None`
 fn durable_reply(line: &str) -> Option<(Option<u64>, Reply)> {
     match parse_server_msg(line).ok()? {
-        ServerMsg::Ack { seq } => Some((Some(seq), Reply::Ack)),
+        ServerMsg::Ack { seq, .. } => Some((Some(seq), Reply::Ack)),
         ServerMsg::Error {
             seq,
             code,
@@ -2182,7 +2182,7 @@ fn inventory_line(
 ) -> Option<Option<u64>> {
     let inv = inventory.as_mut()?;
     let answered = match parse_server_msg(line) {
-        Ok(ServerMsg::Ack { seq }) => answered_seq(Some(seq), last_sent_seq),
+        Ok(ServerMsg::Ack { seq, .. }) => answered_seq(Some(seq), last_sent_seq),
         Ok(ServerMsg::Error {
             seq, fatal: false, ..
         }) => answered_seq(seq, last_sent_seq),
@@ -2639,6 +2639,8 @@ fn handle_pre_ack_line(
             renew_now,
             server_node,
             cluster_id,
+            // 遠端管理（feature config／upgrade）：P1／P2 實作時使用；目前不宣告，Kairos 不會送
+            pending: _,
         }) => {
             if !(SUPPORTED_PROTO.min..=SUPPORTED_PROTO.max).contains(&proto) {
                 return Err(SessionError::ProtoMismatch(proto));
@@ -2680,7 +2682,7 @@ fn handle_pre_ack_line(
             fatal,
             ..
         }) => Err(SessionError::server(&code, &message, fatal)),
-        Ok(ServerMsg::Ack { seq }) => {
+        Ok(ServerMsg::Ack { seq, .. }) => {
             throttled!(
                 throttles.unexpected_ack,
                 debug,
@@ -2694,6 +2696,15 @@ fn handle_pre_ack_line(
                 throttles.unknown_type,
                 debug,
                 "尚未收到 hello_ack 前收到 renew_result／deregister_ack／drain，忽略"
+            );
+            Ok(None)
+        }
+        // 遠端管理（feature config／upgrade）：本版不宣告，與舊版收到不認得的 type 相同
+        Ok(ServerMsg::Config(_) | ServerMsg::UpgradeOffer(_) | ServerMsg::UpgradeChunk(_)) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "尚未收到 hello_ack 前收到遠端管理的訊息，忽略"
             );
             Ok(None)
         }
@@ -2753,7 +2764,7 @@ fn handle_server_line_in(
     durable: bool,
 ) -> Result<LineOutcome> {
     match parse_server_msg(line) {
-        Ok(ServerMsg::Ack { seq }) => {
+        Ok(ServerMsg::Ack { seq, .. }) => {
             let answered = answered_seq(Some(seq), last_sent_seq);
             if answered.is_none() {
                 throttled!(
@@ -2839,6 +2850,15 @@ fn handle_server_line_in(
                 "收到不屬於這條連線的 renew_result／deregister_ack，忽略"
             );
             Ok(LineOutcome::valid(None))
+        }
+        // 遠端管理（feature config／upgrade）：本版不宣告（P1／P2 實作），與舊版收到不認得的 type 相同
+        Ok(ServerMsg::Config(_) | ServerMsg::UpgradeOffer(_) | ServerMsg::UpgradeChunk(_)) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "收到遠端管理的訊息，但這條連線沒有協商 config／upgrade，忽略"
+            );
+            Ok(LineOutcome::IGNORED)
         }
         Err(e) => {
             log_unparsable(throttles, line, &e);
