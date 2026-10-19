@@ -13,7 +13,7 @@
 
 協定的線上格式仍以 [`crates/kairos-proto/PROTOCOL.md`](../crates/kairos-proto/PROTOCOL.md) 為準；本文件第 18 節的協定增補是草稿，實作時再併入 PROTOCOL.md。儲存的現況見 [`STORAGE.md`](STORAGE.md)，PKI 見 [`PKI.md`](PKI.md)，主控台 API 見 [`API.md`](API.md)，告警見 [`ALERTS.md`](ALERTS.md)。
 
-- 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）。**L4 已實作**（`sprint8/pulse-multiaddr`，已併入整合分支）；與本文件原規劃不同之處已在第 8.6、18.1～18.3 節標明「0.9.0 的實作」；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
+- 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）。**L4 已實作**（`sprint8/pulse-multiaddr`，已併入整合分支）；**L1a 已實作**（`sprint9/store-abstraction`，第 5.1、5.2 節標明與原規劃的差異）；與本文件原規劃不同之處已在第 8.6、18.1～18.3 節標明「0.9.0 的實作」；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
 - 商業審計 A2 的原文：「沒有 HA：Kairos 是單一行程，狀態放在記憶體，資料目錄假設只有一個寫入者。Pulse 只能設定一個伺服器位址。修正方向：讓 Kairos 只負責連線（無狀態），狀態與資料移到外部資料庫，前面放 L4 LB；Pulse 支援多個位址或 DNS SRV。6～10 人週。」
 - 設計依據（設計包，唯讀）：`decisions/INTEGRATION.md` §26～§30 的代碼分配慣例、`design-system/copywriting.md` §3（代碼格式與號段）、`kairos/screens.md` S20（系統健康）。設計包需要配合的事項列在第 22 節，**本線沒有修改 `design/`**。
 - 埠號寫法：本文件沿用文件慣例，以 8443 表示 agent 連線埠（`server.listen`）、8444 表示註冊通道（`enroll.listen`）、9443 表示主控台（`console.listen`）。注意 Kairos 程式內 `server.listen` 的預設值是 `127.0.0.1:8080`（`config.rs`），Pulse `server.port` 的預設值也是 8080。
@@ -249,6 +249,8 @@ PROXY protocol 的規則（實作線 L2）：
 
 ### 5.1 現況
 
+> **L1a 已實作（0.9.0〔草稿〕，分支 `sprint9/store-abstraction`）**：本節描述的是 0.8.0 的狀態。重構後的結構見 [STORAGE.md](STORAGE.md) 第 17 節；與第 5.2 節的差異列在第 5.2 節末。
+
 - **只有 report 路徑有抽象**：`trait ReportStore`（`write_batch`、`sync_inventory`、`maintain`、`close`、`write_assets`；同步 API、一批一個交易），由單一 writer task 驅動（STORAGE.md 第 1 節）。
 - **其他模組直接用 rusqlite**：函式簽章是 `&rusqlite::Connection` 或 `Transaction`。SQL 呼叫點約 381 處，分布如下：
 
@@ -293,6 +295,16 @@ PROXY protocol 的規則（實作線 L2）：
   1. 先把既有的 SQL 原封不動搬進 `sqlite::*`，跑完整的測試確認行為不變（純重構）。
   2. 再寫 `postgres::*`。
 - **測試**：領域介面的測試以參數化執行兩個後端（`#[cfg(feature = "pg-tests")]` 加環境變數 `KAIROS_TEST_PG_URL`），在 kp-build 上以容器啟動 PostgreSQL 執行。沒有設定時只跑 SQLite。
+
+
+**L1a 的實作與本節的差異**（0.9.0〔草稿〕；細節見 STORAGE.md 第 17 節）：
+
+- **領域介面**：`SettingsStore`（`settings` 與 `meta`）、`AuditLog`、`UserStore`、`TokenStore`（新：`api_tokens`）、`PkiStore`、`EnrollStore`、`AlertStore`、`HostStore`、`ApiQueries`、`AdminStore`（新：個資匯出、診斷），組合成 `trait Store`。`ClusterStore` 留給 L2。trait 定義在各領域的模組（`audit.rs`、`users/store.rs`、`pki/store.rs`、`enroll/store.rs`、`alerts/store.rs`、`settings.rs`、`api/tokens.rs`、`store/{hosts,api,admin}.rs`），SQLite 實作在 `store/sqlite/*.rs`。
+- **`Tx`**：不是「`execute`／`query_row`／`query_map` 的通用介面」，而是**交易中的 `Store`**（`Store::begin(TxMode::Deferred | Immediate) -> Box<dyn Tx>`、`Tx::commit`、drop 時回復）。呼叫端只呼叫領域方法，不寫 SQL，因此沒有共用 SQL 常數的層；L1b 若需要，可以在 `postgres::*` 內部自己包一層。
+- **粒度**：L1a 是純重構，領域方法多數是「原本的一個函式」（一條或數條 SQL），交易邊界仍由呼叫端以 `begin` 決定，與 0.8.0 完全相同（第 2.2 節 D1～D9 的交易一律是 `TxMode::Immediate`）。第 5.4 節需要改寫成單一業務操作的地方（例如 token 扣次數、重放快取、簽發搶占）在 L1b 實作 PostgreSQL 時再合併成較粗的方法；各 trait 的說明列出了這些操作目前的呼叫順序與交易要求。
+- **連線**：呼叫端拿到的是 `&dyn Store`（連線池的 closure）或 `DbHandle`（`Box<dyn Store + Send>`，CLI 由 `store::open_read`／`open_admin`／`open_exclusive` 開啟）。CLI 仍以 SQLite 的 `SqliteOptions` 開啟；依 `storage.backend` 選擇後端留給 L1b。
+- **錯誤**：`StoreError`（顯示的文字與 rusqlite 相同，另有 `StoreErrorKind`：`Busy`、`Constraint`、`NotFound`、`Full`、`Other`），L1b 的重試（`40001`、`40P01`）依種類判斷。
+- **沒有改的**：report 的寫入路徑（`ReportStore`／`SqliteStore`）、migration、匯入（`store/import.rs`）與刪除主機資料的逐步刪除（`store/purge.rs`）仍是 SQLite 專用的程式，位於 `store/` 內。
 
 ### 5.3 SQL 方言的差異（實作清單）
 

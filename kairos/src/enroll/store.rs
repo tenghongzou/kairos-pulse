@@ -1,9 +1,10 @@
-//! 註冊相關資料表的讀寫（schema v4，`kairos/PKI.md` 第 7 節）：`enroll_tokens`、`enroll_requests`、
-//! `enroll_replay`、`enroll_blocks`、`enroll_relaxations`、`settings`、`audit_events`，以及 `hosts` 中與
-//! 註冊有關的欄位。
+//! 註冊相關資料表（schema v4，`kairos/PKI.md` 第 7 節）的型別與領域介面 [`EnrollStore`]：`enroll_tokens`、
+//! `enroll_requests`、`enroll_replay`、`enroll_blocks`、`enroll_relaxations`，以及 `hosts` 中與註冊有關的欄位
+//! （`settings` 在 [`crate::settings::SettingsStore`]，`audit_events` 在 [`crate::audit::AuditLog`]）。
+//! SQLite 的實作在 `store/sqlite/enroll.rs`。
 //!
-//! 所有函式都是同步的；常駐行程在 blocking 執行緒上呼叫，CLI 直接呼叫。需要原子性的多步操作由呼叫端包在
-//! 交易中（`rusqlite::Transaction` 會 deref 成 `Connection`）。
+//! 所有方法都是同步的；常駐行程在 blocking 執行緒上呼叫，CLI 直接呼叫。需要原子性的多步操作由呼叫端以
+//! [`crate::store::db::Store::begin`] 包在交易中。
 // 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
