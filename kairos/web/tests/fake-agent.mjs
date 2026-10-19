@@ -2,6 +2,8 @@
 // 送出 v2 hello（metrics、durable）、補送過去 2 小時的回報（每 4 分鐘一筆），之後每 5 秒一筆。
 // f4: true 時模擬 Pulse 0.8.0（crates/kairos-proto/METRICS.md）：另宣告 inventory、processes，hello_ack 後送出資產，
 // 回報帶新的標準指標（負載、置換空間、掛載點的使用率、磁碟讀寫、網路封包、行程數、運作時間），每 4 筆附上行程排行。
+// agentVersion／install 指定時模擬 Pulse 0.9（遠端管理，F8）：hello 帶 install（安裝方式與遠端升級、集中設定的本機狀態）。
+// 未啟用 mTLS 的連線不協商 config／upgrade（API.md 第 17 節），資格與狀態只依 hello 的版本與 install。
 // （Kairos 依序確認每一筆 durable 回報；補送量太大時即時的回報會排在後面，測試期間看不到最近的資料）
 // 只用 Node.js 內建模組；Kairos 以 loopback、未啟用 mTLS 的設定執行（tests/run.sh）。
 
@@ -9,8 +11,10 @@ import tls from 'node:tls';
 import { randomUUID } from 'node:crypto';
 
 export class FakeAgent {
-  constructor({ port, agentId, hostname, tags = [], os = { name: 'Ubuntu', version: '24.04', arch: 'x86_64' }, backfillMinutes = 120, f4 = false }) {
+  constructor({ port, agentId, hostname, tags = [], os = { name: 'Ubuntu', version: '24.04', arch: 'x86_64' }, backfillMinutes = 120, f4 = false, agentVersion = null, install = null }) {
     this.f4 = f4;
+    this.agentVersion = agentVersion;
+    this.install = install;
     this.bootMs = Date.now() - 3 * 86400000;
     this.port = port;
     this.agentId = agentId;
@@ -140,7 +144,8 @@ export class FakeAgent {
           features: this.f4 ? ['metrics', 'durable', 'inventory', 'processes'] : ['metrics', 'durable'],
           agent_id: this.agentId,
           hostname: this.hostname,
-          agent_version: this.f4 ? '0.8.0' : '0.6.0',
+          agent_version: this.agentVersion || (this.f4 ? '0.8.0' : '0.6.0'),
+          install: this.install || undefined,
           heartbeat_interval_ms: 5000,
           ts: new Date().toISOString(),
           tags: this.tags.length ? this.tags : undefined,
