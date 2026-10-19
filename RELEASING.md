@@ -24,6 +24,7 @@
 3. 更新 `CHANGELOG.md`：
    - 草稿段落 `## [0.9.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.9.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
    - 更新「版本相容矩陣」，移除已確定項目的〔草稿〕標記。
+   - 確認發佈清單的手動欄位 `pulse/packaging/release-meta.toml`（0.9.0 起）：`min_kairos` 與相容矩陣一致、`min_upgrade_from`（需要新的 systemd unit 或資料轉換時提高）、`remote_features`（這版實際宣告的遠端管理 feature）、`breaking`（「破壞性變更與升級步驟」有 Pulse 的項目時為 `true`）。
 4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。
 5. 合併到整合分支後，記下合併後的 commit（以下稱 `<release-commit>`）；之後的步驟都在這個 commit 上進行。
 
@@ -65,7 +66,8 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 | `pulse-<版本>-<commit>-windows-x86_64.{zip,msi}` | Pulse 的 Windows 發佈檔（MSI：`pulse/packaging/windows/pulse.wxs`，wixl） |
 | `<名稱>-<版本>-<commit>-<os>-<arch>.cdx.json` | 每個平台的 SBOM（與發佈包內相同），供客戶匯入掃描工具 |
 | `pulse-install.sh` | Pulse 的一行安裝腳本（`pulse/packaging/install.sh`） |
-| `SHA256SUMS` | 以上所有檔案的 SHA-256（共 20 個：Kairos 8、Pulse 12） |
+| `pulse-<版本>-<commit>-release.json` | 發佈清單（0.9.0 起；遠端升級用，`crates/kairos-proto/REMOTE.md` 第 4.1.3 節）：`packaging/release-manifest.sh` 依 `pulse/packaging/release-meta.toml` 與 git 歷史（`pulse.service` 的歷來雜湊）產生；`-dirty` 的建置不產生 |
+| `SHA256SUMS` | 以上所有檔案的 SHA-256（共 21 個：Kairos 8、Pulse 13；清單因此受同一個簽章保護） |
 | `SHA256SUMS.sig` | `SHA256SUMS` 的簽章 |
 
 只建置部分目標（例如開發時快速確認）：`TARGETS=x86_64-unknown-linux-musl PACKAGES= sh kairos/packaging/build-release.sh`；正式發佈一律用預設值。容器內 cargo 的平行數預設 2（`BUILD_JOBS`，只影響時間，不影響產物）；完整建置兩個產品、五個目標在 4 vCPU 的建置機上約需〔待量測〕。
@@ -156,6 +158,7 @@ docker run --rm rust:1.99-alpine@sha256:<新 digest> sh -c \
 - 來源以 `git -c core.autocrlf=false archive` 匯出（LF），與主機的行尾設定無關；容器內路徑固定（`/src`、`/build/target`、`/usr/local/cargo/registry`），執行檔中的路徑字串因此一致。
 - `BUILD_COMMIT` 取自 git；tar 的檔案順序、擁有者、mtime（`SOURCE_DATE_EPOCH` = commit 時間）固定，gzip 不寫入檔名與時間（`-n`）。
 - SBOM 的 timestamp 取自 `SOURCE_DATE_EPOCH`，且沒有隨機的 serialNumber。
+- 發佈清單：`released_at` 為 `SOURCE_DATE_EPOCH` 的 UTC 日期，unit 的雜湊取自 git 物件（repo 中儲存的 LF 版本），只由 commit 決定。
 - deb／rpm：nfpm 的 `mtime` 設為 commit 時間（套件內檔案與控制資料的時間）。
 - zip：檔案依名稱排序、mtime 為 commit 時間、`TZ=UTC`（DOS 時間是本地時間）、`-X` 不寫額外的時間欄位。
 - MSI：wixl 與 msibuild 在 libfaketime 下以 commit 時間執行（摘要資訊的建立／儲存時間、OLE 目錄的時間），`NO_FAKE_STAT=1` 讓 CAB 內的檔案時間取自（已固定的）mtime；PackageCode 由「版本＋commit」、ProductCode 由版本推導（不使用 wixl 產生的隨機值）。

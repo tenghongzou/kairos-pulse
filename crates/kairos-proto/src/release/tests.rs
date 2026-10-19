@@ -742,3 +742,29 @@ fn version_policy() {
     );
     assert_eq!(DowngradeNotAllowed.detail(), "downgrade_not_allowed");
 }
+
+#[test]
+fn pulse_release_meta_produces_a_valid_manifest() {
+    // packaging/release-manifest.sh 讀取的手動欄位（每行「鍵 = 值」）：組成清單後必須通過 ReleaseManifest 的檢查
+    const META: &str = include_str!("../../../../pulse/packaging/release-meta.toml");
+    let value = |key: &str| -> String {
+        META.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                (k.trim() == key).then(|| v.split('#').next().unwrap().trim().to_string())
+            })
+            .unwrap_or_else(|| panic!("release-meta.toml 缺少 {key}"))
+    };
+    let manifest = format!(
+        r#"{{"schema":"{MANIFEST_SCHEMA}","product":"pulse","version":"0.9.0","commit":"1a2b3c4","released_at":"2026-11-18","min_kairos":{},"min_upgrade_from":{},"remote_features":{},"unit":{{"sha256":"{}","previous_sha256":[]}},"breaking":{}}}"#,
+        value("min_kairos"),
+        value("min_upgrade_from"),
+        value("remote_features").replace(' ', ""),
+        "0".repeat(64),
+        value("breaking"),
+    );
+    let m = ReleaseManifest::parse(&manifest).unwrap_or_else(|e| panic!("{e}: {manifest}"));
+    assert!(Version::parse(&m.min_upgrade_from).unwrap() >= Version::parse("0.9.0").unwrap());
+}
