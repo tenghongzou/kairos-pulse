@@ -179,7 +179,18 @@ fn download_verify_stage_handoff_and_report_after_restart() {
             .is_file(),
         "驗證過的發佈紀錄"
     );
-    // 進入時段：送 applying，收到 ack 後寫 request.json
+    // 進入時段：先向 Kairos 再確認提議，再送 applying，收到 ack 後寫 request.json
+    agent.tick(&mut cs, Instant::now(), false);
+    assert_eq!(
+        agent.view().phase.as_deref(),
+        Some("staged"),
+        "再確認前不交付"
+    );
+    assert_eq!(
+        agent.poll(&mut cs, Instant::now()),
+        Some(Out::Get(ID.into()))
+    );
+    agent.on_offer(&mut cs, offer((-60, 3600)));
     agent.tick(&mut cs, Instant::now(), false);
     let sent = ack_all(&agent, &mut cs);
     assert_eq!(sent[0].state, UPGRADE_STATE_APPLYING);
@@ -250,6 +261,9 @@ fn result_is_picked_up_while_still_running() {
     ack_all(&agent, &mut cs);
     // 交付：applying 沒有收到 ack，15 秒後仍寫 request.json
     let t0 = Instant::now();
+    agent.tick(&mut cs, t0, false);
+    assert_eq!(agent.poll(&mut cs, t0), Some(Out::Get(ID.into())));
+    agent.on_offer(&mut cs, offer((-60, 3600)));
     agent.tick(&mut cs, t0, false);
     assert!(matches!(agent.poll(&mut cs, t0), Some(Out::Status(_))));
     agent.tick(&mut cs, t0 + Duration::from_secs(16), false);
@@ -557,6 +571,48 @@ fn staged_upgrade_waits_for_the_window_and_the_config_confirmation_then_expires(
     let sent = ack_all(&agent, &mut cs);
     assert_eq!(sent[0].state, UPGRADE_STATE_EXPIRED);
     assert!(!dir.join("state/upgrade").join(ID).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cancelled_rollout_is_not_applied_from_a_stale_staged_download() {
+    let dir = tmp("cancelled");
+    let agent = UpgradeAgent::new(env(&dir, "0.9.0"));
+    let mut cs = accept(&agent, offer((-60, 3600)));
+    ack_all(&agent, &mut cs);
+    let Some(Out::Chunk {
+        filename,
+        offset,
+        length,
+        ..
+    }) = agent.poll(&mut cs, Instant::now())
+    else {
+        panic!();
+    };
+    agent.on_chunk(&mut cs, &chunk(0, TAR, true), (filename, offset, length));
+    ack_all(&agent, &mut cs);
+    // 時段內再確認：Kairos 回 upgrade_unavailable（推送已取消）→ 不交付、保留暫存
+    let now = Instant::now();
+    agent.tick(&mut cs, now, false);
+    let out = agent.poll(&mut cs, now).unwrap();
+    assert_eq!(out, Out::Get(ID.into()));
+    agent.on_error(&mut cs, &out, "upgrade_unavailable", None);
+    agent.tick(&mut cs, now, false);
+    assert_eq!(agent.poll(&mut cs, now), None, "10 分鐘內不再確認");
+    assert_eq!(agent.view().phase.as_deref(), Some("staged"));
+    assert!(dir.join("state/upgrade").join(ID).join(FILE).is_file());
+    // 10 分鐘後再確認一次；提議內容被換掉時不採用
+    agent.tick(&mut cs, now + Duration::from_secs(601), false);
+    assert_eq!(
+        agent.poll(&mut cs, now + Duration::from_secs(601)),
+        Some(Out::Get(ID.into()))
+    );
+    let mut changed = offer((-60, 3600));
+    changed.target.version = "0.9.2".into();
+    agent.on_offer(&mut cs, changed);
+    agent.tick(&mut cs, now + Duration::from_secs(602), false);
+    assert_eq!(agent.view().phase.as_deref(), Some("staged"));
+    assert!(!dir.join("state/upgrade/request.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -59,6 +59,8 @@ const HANDOFF_ACK_WAIT: Duration = Duration::from_secs(15);
 const RESULT_POLL: Duration = Duration::from_secs(5);
 /// 等待 `apply_window.not_before` 時，最多隔這麼久再檢查一次（時鐘調整）
 const WINDOW_RECHECK: Duration = Duration::from_secs(60);
+/// 交付前向 Kairos 再確認提議（`upgrade_get`）被拒（推送已暫停或取消）後，同一條連線上多久再確認一次
+const RECONFIRM_RETRY: Duration = Duration::from_secs(600);
 /// `upgrade.download_failed` 的節流視窗（log-ux.md §4.6：10 分鐘）
 const DOWNLOAD_LOG_WINDOW: Duration = Duration::from_secs(600);
 /// 驗證過的發佈的簽章資料（回滾檔的信任來源）
@@ -279,6 +281,10 @@ pub struct ConnState {
     next_result_poll: Option<Instant>,
     /// 這條連線收到 `upgrade_unavailable` 的 `upgrade_get`（不再重複要求）
     unavailable: Vec<String>,
+    /// 交付前已在這條連線上向 Kairos 再確認過提議（推送仍在進行）
+    reconfirmed: bool,
+    /// 再確認被拒（推送已暫停或取消）：到這個時間前不再確認、不交付
+    reconfirm_after: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +625,12 @@ impl UpgradeAgent {
                         at(cs.retry_until.unwrap_or(now));
                     }
                 }
+                Phase::Staged if c.offer.apply_window.contains(now_ms()) && !cs.reconfirmed => {
+                    // 時段內：再確認被拒後到 reconfirm_after 再試；在途時等回應
+                    if cs.get_in_flight.is_none() {
+                        at(cs.reconfirm_after.unwrap_or(now).max(now));
+                    }
+                }
                 Phase::Staged => {
                     let w = &c.offer.apply_window;
                     let ms = now_ms();
@@ -660,8 +672,16 @@ impl UpgradeAgent {
                     );
                     Self::finish(&mut inner, UPGRADE_STATE_EXPIRED, None, String::new(), true);
                 } else if c.offer.apply_window.contains(ms) && !config_confirming {
-                    Self::start_handoff(&mut inner);
-                    cs.handoff_since = Some(now);
+                    if cs.reconfirmed {
+                        Self::start_handoff(&mut inner);
+                        cs.handoff_since = Some(now);
+                    } else if cs.reconfirm_after.is_none_or(|t| now >= t)
+                        && cs.get_in_flight.is_none()
+                    {
+                        // 交付前向 Kairos 再確認：暫存之後推送可能已暫停或取消（upgrade_unavailable）
+                        cs.reconfirm_after = Some(now + RECONFIRM_RETRY);
+                        cs.get_queue = Some(c.upgrade_id.clone());
+                    }
                 }
             }
             Phase::Handoff => {
@@ -856,6 +876,41 @@ impl UpgradeAgent {
             .iter()
             .any(|h| h.upgrade_id.eq_ignore_ascii_case(&offer.upgrade_id))
         {
+            return;
+        }
+        // 交付前的再確認：同一個升級的提議仍在（時段可能已更新），目標與檔案必須相同
+        let local_timeout = inner.env.health_timeout_secs;
+        let mut matched = None;
+        if let Some(c) = inner.file.current.as_mut()
+            && c.upgrade_id.eq_ignore_ascii_case(&offer.upgrade_id)
+        {
+            let same = c.offer.target == offer.target
+                && c.offer.artifact.sha256 == offer.artifact.sha256
+                && c.offer.sha256sums == offer.sha256sums
+                && c.offer.signature == offer.signature
+                && mgmt::validate_upgrade_offer(&offer).is_ok();
+            if same {
+                c.offer.apply_window = offer.apply_window.clone();
+                c.offer.health_timeout_secs = offer.health_timeout_secs;
+                c.health_timeout_secs =
+                    mgmt::effective_health_timeout_secs(offer.health_timeout_secs, local_timeout);
+            }
+            matched = Some((same, c.phase == Phase::Staged));
+        }
+        if let Some((same, staged)) = matched {
+            if same {
+                if staged {
+                    cs.reconfirmed = true;
+                    cs.reconfirm_after = None;
+                }
+                Self::persist(&mut inner);
+            } else {
+                log::warn!(
+                    "{}同一個升級 {} 的提議內容改變了，忽略",
+                    codes::tag(codes::SERVER_UNEXPECTED, Some(codes::W_SERVER_UNEXPECTED)),
+                    offer.upgrade_id
+                );
+            }
             return;
         }
         log::info!(
@@ -1631,8 +1686,20 @@ impl UpgradeAgent {
             Out::Get(id) => {
                 cs.get_in_flight = None;
                 if code == "upgrade_unavailable" {
-                    log::debug!("升級 {id} 已無法取得（upgrade_unavailable）");
-                    cs.unavailable.push(id.clone());
+                    let staged = inner
+                        .file
+                        .current
+                        .as_ref()
+                        .is_some_and(|c| c.upgrade_id.eq_ignore_ascii_case(id));
+                    if staged {
+                        // 交付前的再確認被拒：推送已暫停或取消，先不替換（保留暫存，之後再確認或等同一版的新提議）
+                        log::info!(
+                            "升級 {id} 的推送已暫停或取消（upgrade_unavailable），暫不替換；保留已暫存的檔案"
+                        );
+                    } else {
+                        log::debug!("升級 {id} 已無法取得（upgrade_unavailable）");
+                        cs.unavailable.push(id.clone());
+                    }
                 }
             }
             Out::Chunk {

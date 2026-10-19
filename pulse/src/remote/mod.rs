@@ -53,7 +53,10 @@ pub fn write_atomic(path: &Path, content: &[u8], mode: u32, dir_mode: u32) -> io
     tmp_name.push(format!(".tmp-{}", std::process::id()));
     let tmp = dir.join(tmp_name);
     let result = (|| {
-        let mut f = open_new_file(&tmp, mode)?;
+        // 暫存檔一律新建（O_EXCL、不跟隨符號連結）：特權輔助程式也用這個函式寫 Pulse 可寫的目錄
+        // （result.json），不能讓服務帳號預先放好的符號連結把 root 的寫入導到別的檔案
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = open_exclusive(&tmp, mode)?;
         f.write_all(content)?;
         f.sync_all()?;
         drop(f);
@@ -100,6 +103,24 @@ pub fn open_new_file(path: &Path, mode: u32) -> io::Result<std::fs::File> {
     }
     #[cfg(not(unix))]
     let _ = mode;
+    let f = o.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(f)
+}
+
+/// 新建檔案（已存在時失敗；Unix 上不跟隨符號連結），權限為 `mode`
+fn open_exclusive(path: &Path, mode: u32) -> io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(mode).custom_flags(libc::O_NOFOLLOW);
+    }
     let f = o.open(path)?;
     #[cfg(unix)]
     {
@@ -183,6 +204,23 @@ mod tests {
         }
         assert!(read_small(&path, 2).is_err());
         assert_eq!(read_small(&path, 3).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_a_planted_temp_symlink() {
+        // 服務帳號預先在可寫的目錄放好暫存檔名的符號連結：寫入不可以經由它改到別的檔案
+        let dir = std::env::temp_dir().join(format!("pulse-remote-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let tmp = dir.join(format!(".result.json.tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        write_atomic(&dir.join("result.json"), b"data", 0o644, 0o750).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(dir.join("result.json")).unwrap(), b"data");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
