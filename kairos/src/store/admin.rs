@@ -1,5 +1,7 @@
 //! 維運工作（個人資料匯出與刪除前的盤點、診斷包、健康檢查）的資料庫操作（`AdminStore`）。
 //! SQLite 的實作在 `store/sqlite/admin.rs`。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 #[allow(unused_imports)]
 use super::db::StoreResult;

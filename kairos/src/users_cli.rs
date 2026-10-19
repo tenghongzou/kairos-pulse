@@ -529,7 +529,7 @@ pub fn execute(
                         "via": "cli",
                     }),
                 )?;
-                Ok(c.get_user(uid)?)
+                c.get_user(uid)
             });
             let u = match r {
                 Ok(Some(u)) => u,

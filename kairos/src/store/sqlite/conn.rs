@@ -39,13 +39,6 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-impl StoreError {
-    /// SQLite 後端原本的錯誤（其他後端或不是由 rusqlite 產生的錯誤為 `None`）
-    pub(crate) fn as_sqlite(&self) -> Option<&rusqlite::Error> {
-        self.source_ref().downcast_ref::<rusqlite::Error>()
-    }
-}
-
 /// 開始交易：與 `Connection::transaction_with_behavior` 送出的 SQL 相同（`BEGIN DEFERRED`／`BEGIN IMMEDIATE`），
 /// 只是不需要 `&mut`（巢狀時由 SQLite 回錯誤）
 pub(crate) fn begin(conn: &Connection, mode: TxMode) -> rusqlite::Result<Transaction<'_>> {

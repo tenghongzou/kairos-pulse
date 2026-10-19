@@ -75,13 +75,9 @@ impl StoreError {
         }
     }
 
+    #[allow(dead_code)] // L1b：PostgreSQL 後端依種類（序列化失敗、忙碌）重試或回 503
     pub fn kind(&self) -> StoreErrorKind {
         self.kind
-    }
-
-    /// 後端原本的錯誤（SQLite 後端為 `rusqlite::Error`；只給 `store` 模組內部使用）
-    pub(crate) fn source_ref(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-        self.source.as_ref()
     }
 }
 

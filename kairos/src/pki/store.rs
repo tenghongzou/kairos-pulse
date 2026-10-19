@@ -1,6 +1,8 @@
 //! `pki_cas`、`pki_certificates`、`pki_crls` 的讀寫（schema v4，`kairos/PKI.md` 第 7 節）。
 //!
 //! 所有函式都是同步的，呼叫端在 blocking 執行緒（或 CLI）上使用；寫入多筆的操作由呼叫端包在交易中。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use super::issue::{Reason, RevokedEntry};
 use crate::store::db::StoreResult;

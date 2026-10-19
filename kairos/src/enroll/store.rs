@@ -4,6 +4,8 @@
 //!
 //! 所有函式都是同步的；常駐行程在 blocking 執行緒上呼叫，CLI 直接呼叫。需要原子性的多步操作由呼叫端包在
 //! 交易中（`rusqlite::Transaction` 會 deref 成 `Connection`）。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use crate::store::db::StoreResult;
 use kairos_proto::enroll::{ApprovalDetail, RequestKind, RequestState, TokenApproval};

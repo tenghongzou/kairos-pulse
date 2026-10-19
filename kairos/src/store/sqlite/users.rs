@@ -1,5 +1,7 @@
 //! 使用者、角色指派與工作階段的 SQLite 實作（[`crate::users::store`] 的 [`UserStore`]）。SQL 原封不動自
 //! `users/store.rs` 搬來。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use crate::rbac::{Assignment, Grants, Role, Scope};
 use rusqlite::{Connection, OptionalExtension, params};

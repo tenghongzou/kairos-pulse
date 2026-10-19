@@ -1,4 +1,6 @@
 //! 稽核雜湊鏈的 SQLite 實作（[`crate::audit`] 的 [`AuditLog`]）。SQL 原封不動自 `audit.rs` 搬來。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -19,14 +21,11 @@ pub fn key_for(conn: &Connection) -> Option<Arc<AuditKey>> {
 impl<C: AsConn> AuditLog for C {
     forward! {
         fn audit_append(&self, at_ms: i64, a: &Audit<'_>) -> i64 => append;
-        fn audit_append_with_key(&self, at_ms: i64, a: &Audit<'_>, key: Option<&AuditKey>) -> i64 => append_with_key;
         fn audit_hmac_since(&self) -> Option<(i64, String)> => hmac_since;
-        fn audit_anchor(&self) -> Option<(i64, String)> => anchor;
         fn audit_tail(&self) -> Option<(i64, Option<String>, Option<String>)> => tail;
         fn audit_seal_legacy(&self) -> usize => seal_legacy;
         fn audit_purge(&self, before_ms: i64, now_ms: i64) -> usize => purge;
         fn audit_verify(&self) -> VerifyReport => verify;
-        fn audit_verify_with_key(&self, key: Option<&AuditKey>) -> VerifyReport => verify_with_key;
         fn audit_query(&self, f: &AuditFilter, limit: usize) -> (Vec<AuditRow>, u64) => query;
         fn audit_export_batch(&self, f: &AuditFilter, limit: usize) -> Vec<AuditRow> => export_batch;
     }

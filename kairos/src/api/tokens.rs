@@ -12,6 +12,8 @@
 //!
 //! token 為 `kat_<token_id>_<secret>`：`token_id` 是 16 個十六進位字元（8 bytes 隨機值），公開、
 //! 用於查詢與撤銷；`secret` 是 32 bytes 隨機值的 base64url（43 個字元），資料庫只保存它的 SHA-256。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use crate::store::db::in_write_tx;
 use crate::store::prelude::*;

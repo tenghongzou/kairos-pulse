@@ -1,5 +1,7 @@
 //! 告警的 SQLite 實作（[`crate::alerts::store`] 的 [`AlertStore`]），以及 `meta` 表的通用讀寫
 //! （[`crate::settings::SettingsStore::get_meta`]）。SQL 原封不動自 `alerts/store.rs` 搬來。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use crate::alerts::InvHost;
 use crate::alerts::engine::{NewDelivery, Timeline};
@@ -23,6 +25,7 @@ impl<C: AsConn> AlertStore for C {
         fn alert_inventory(&self) -> Vec<InvHost> => alert_inventory;
         fn active_hosts_seen_since(&self, since_ms: i64) -> std::collections::HashSet<String> => active_hosts_seen_since;
         fn config_rev(&self) -> i64 => config_rev;
+        #[cfg(test)]
         fn bump_config_rev(&self) -> () => bump_config_rev;
         fn ensure_builtin_rules(&self, now_ms: i64) -> usize => ensure_builtin_rules;
         fn load_rules(&self) -> Vec<Rule> => load_rules;
@@ -1533,11 +1536,11 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
         // 保留 400 天：刪除 450 天前結案的 10 個與其處理紀錄
-        let (p, more) = purge(&mut conn, now, 400, 1_000_000, 1000).unwrap();
+        let (p, more) = purge(&conn, now, 400, 1_000_000, 1000).unwrap();
         assert_eq!((p.events, p.timeline), (10, 1));
         assert!(!more);
         // 筆數上限 5：刪除最舊的已解決事件，進行中的不刪
-        let (p, _) = purge(&mut conn, now, 400, 5, 1000).unwrap();
+        let (p, _) = purge(&conn, now, 400, 5, 1000).unwrap();
         assert_eq!(p.events, 6);
         let left: Vec<String> = {
             let mut stmt = conn

@@ -453,12 +453,12 @@ mod import_tests {
 
     #[test]
     fn existing_certificates_are_checked_and_imported_once() {
-        let (dir, mut conn) = db();
+        let (dir, conn) = db();
         let anchors = vec![der(CA)];
         let now = 1_791_000_000_000;
         // 指定的 agent_id 不符、不是信任錨直接簽發、CA 憑證：拒絕，不寫入
         let e = import_existing(
-            &mut conn,
+            &conn,
             &der(GOOD_CERT),
             &anchors,
             Some("11111111-2222-4333-8444-555555555555"),
@@ -467,9 +467,9 @@ mod import_tests {
             now,
         );
         assert!(e.unwrap_err().contains("不是指定的"));
-        let e = import_existing(&mut conn, &der(GOOD_CERT), &[], None, "root", None, now);
+        let e = import_existing(&conn, &der(GOOD_CERT), &[], None, "root", None, now);
         assert!(e.unwrap_err().contains("信任錨"));
-        let e = import_existing(&mut conn, &der(CA), &anchors, None, "root", None, now);
+        let e = import_existing(&conn, &der(CA), &anchors, None, "root", None, now);
         assert!(e.unwrap_err().contains("CA"));
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pki_certificates", [], |r| r
@@ -479,7 +479,7 @@ mod import_tests {
         );
         // 匯入：清冊新增最小的一列（主機名稱暫為 agent_id）、稽核 cert.import
         let r = import_existing(
-            &mut conn,
+            &conn,
             &der(GOOD_CERT),
             &anchors,
             Some(GOOD_ID),
@@ -529,15 +529,7 @@ mod import_tests {
             1
         );
         // 同一張再匯入：already；JSON 的形式
-        let again = import_existing(
-            &mut conn,
-            &der(GOOD_CERT),
-            &anchors,
-            None,
-            "root",
-            None,
-            now,
-        );
+        let again = import_existing(&conn, &der(GOOD_CERT), &anchors, None, "root", None, now);
         assert_eq!(
             again,
             Ok(ExistingImport::Already {
@@ -552,16 +544,8 @@ mod import_tests {
             "KRS-E1305"
         );
         // 第二台主機（另一張憑證）
-        let r2 = import_existing(
-            &mut conn,
-            &der(REVOKED_CERT),
-            &anchors,
-            None,
-            "root",
-            None,
-            now,
-        )
-        .unwrap();
+        let r2 =
+            import_existing(&conn, &der(REVOKED_CERT), &anchors, None, "root", None, now).unwrap();
         assert!(matches!(
             r2,
             ExistingImport::Imported { new_host: true, .. }

@@ -140,7 +140,7 @@ impl Bench {
     fn token(&self, approval: TokenApproval) -> String {
         let data = PathBuf::from(&self.config.storage.data_dir);
         let opts = crate::store::sqlite::SqliteOptions::from_config(&self.config, &data);
-        let mut conn =
+        let conn =
             crate::store::sqlite::open_existing_read_write(&opts.path, Duration::from_secs(5))
                 .unwrap();
         let input = TokenInput {
@@ -151,16 +151,10 @@ impl Bench {
             allowed_cidrs: Some(vec!["127.0.0.0/8".into()]),
             ..TokenInput::default()
         };
-        ops::create_token(
-            &mut conn,
-            &input,
-            "bench",
-            None,
-            Utc::now().timestamp_millis(),
-        )
-        .unwrap()
-        .token
-        .canonical()
+        ops::create_token(&conn, &input, "bench", None, Utc::now().timestamp_millis())
+            .unwrap()
+            .token
+            .canonical()
     }
 
     async fn stop(mut self) {

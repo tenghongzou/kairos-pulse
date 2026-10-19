@@ -58,11 +58,7 @@ pub async fn run(ctx: Arc<ApiContext>) {
 
 async fn purge_sessions(ctx: &Arc<ApiContext>) {
     let now_ms = Utc::now().timestamp_millis();
-    if let Err(e) = ctx
-        .admin
-        .write(move |c| Ok(c.purge_sessions(now_ms)?))
-        .await
-    {
+    if let Err(e) = ctx.admin.write(move |c| c.purge_sessions(now_ms)).await {
         warn!("無法清除過期的工作階段紀錄（稍後重試）: {e}");
     }
 }
@@ -89,7 +85,7 @@ async fn flush_last_used(ctx: &Arc<ApiContext>) {
     let to_write = items.clone();
     if let Err(e) = ctx
         .writer
-        .write(move |conn| Ok(conn.store_api_token_last_used(&to_write)?))
+        .write(move |conn| conn.store_api_token_last_used(&to_write))
         .await
     {
         warn!("無法寫回 API token 的最後使用時間（稍後重試）: {e}");

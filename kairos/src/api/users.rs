@@ -465,7 +465,7 @@ async fn update_profile(
             in_write_tx(c, |c| {
                 c.set_profile(uid, display.as_deref(), email.as_deref(), now_ms)?;
                 ev.append(c, now_ms)?;
-                Ok(c.get_user(uid)?)
+                c.get_user(uid)
             })
         })
         .await
@@ -1137,14 +1137,7 @@ async fn revoke_token(
     let r = ctx
         .admin
         .write(move |c| {
-            Ok(tokens::revoke_with(
-                c,
-                &tid,
-                Some(&actor),
-                Some(&ipt),
-                reason.as_deref(),
-                now_ms,
-            )?)
+            tokens::revoke_with(c, &tid, Some(&actor), Some(&ipt), reason.as_deref(), now_ms)
         })
         .await
         .map_err(storage_error)?;

@@ -1,5 +1,7 @@
 //! PKI（簽發 CA、憑證、撤銷、CRL）的 SQLite 實作（[`crate::pki::store`] 的 [`PkiStore`]）。SQL 原封不動自
 //! `pki/store.rs` 搬來。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use crate::pki::issue::{Reason, RevokedEntry};
 use rusqlite::{Connection, OptionalExtension, Row, params};

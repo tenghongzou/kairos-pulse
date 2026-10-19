@@ -34,8 +34,9 @@ impl std::fmt::Display for DbError {
     }
 }
 
+/// 測試輔助：測試以 SQL（[`crate::store::db::Store::test_sqlite`]）準備資料時的錯誤
+#[cfg(test)]
 impl From<rusqlite::Error> for DbError {
-    /// 訊息以 `sqlite:` 開頭：寫入失敗時重新開啟連線
     fn from(e: rusqlite::Error) -> Self {
         DbError(format!("sqlite: {e}"))
     }

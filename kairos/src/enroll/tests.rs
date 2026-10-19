@@ -272,7 +272,7 @@ impl Env {
     }
 
     fn token(&self, approval: TokenApproval, max_uses: i64) -> String {
-        let mut conn = self.conn();
+        let conn = self.conn();
         let input = TokenInput {
             name: "test".into(),
             group: "g".into(),
@@ -281,7 +281,7 @@ impl Env {
             allowed_cidrs: (approval == TokenApproval::Auto).then(|| vec!["127.0.0.0/8".into()]),
             ..TokenInput::default()
         };
-        ops::create_token(&mut conn, &input, "tester", None, self.now())
+        ops::create_token(&conn, &input, "tester", None, self.now())
             .unwrap()
             .token
             .canonical()
@@ -473,9 +473,9 @@ async fn manual_enrollment_is_approved_and_delivered_with_the_pinned_ca() {
     let (s, v) = env.poll(&other, &r.request_id).await;
     assert_eq!((s, code(&v)), (404, "request_not_found"));
     // 核准（CLI 的方式：只寫資料庫）→ 常駐行程在 2 秒內簽發；長輪詢立即取得
-    let mut conn = env.conn();
+    let conn = env.conn();
     ops::approve(
-        &mut conn,
+        &conn,
         std::slice::from_ref(&r.request_id),
         "admin.chen",
         None,
@@ -696,9 +696,9 @@ async fn grace_period_exceeded_and_override() {
     assert_eq!((s, code(&v)), (403, "renew_grace_exceeded"), "{v}");
     assert!(v["error"]["grace_ended_at"].is_string());
     // 允許再次自動續簽
-    let mut conn = env.conn();
+    let conn = env.conn();
     ops::grace_override(
-        &mut conn,
+        &conn,
         std::slice::from_ref(&a.id),
         env.now() + 7 * DAY,
         "admin",
@@ -903,10 +903,10 @@ async fn mode_switching_and_auto_pause() {
     assert!(audit.iter().any(|a| a.2 == "mode.auto_resume"));
 
     // 僅續簽：新註冊 403，server-info 照常
-    let mut conn = env.conn();
+    let conn = env.conn();
     let impact = ops::impact(&conn, 90, env.now()).unwrap();
     ops::set_mode(
-        &mut conn,
+        &conn,
         Some(EnrollMode::RenewOnly),
         None,
         None,
@@ -926,7 +926,7 @@ async fn mode_switching_and_auto_pause() {
     assert_eq!((s, code(&v)), (403, "enroll_not_accepted"), "{v}");
     // 關閉：不監聽（連線被拒）
     ops::set_mode(
-        &mut conn,
+        &conn,
         Some(EnrollMode::Closed),
         None,
         None,
@@ -954,7 +954,7 @@ async fn mode_switching_and_auto_pause() {
     assert!(!svc.listen.lock().unwrap().listening);
     // 改回開放：重新監聽（連接埠由作業系統重新分配）
     ops::set_mode(
-        &mut conn,
+        &conn,
         Some(EnrollMode::Open),
         None,
         None,
@@ -988,9 +988,9 @@ async fn revocation_regenerates_the_crl_and_blocks_grace_renewal() {
     let data = PathBuf::from(&env.config.storage.data_dir);
     let crl_path = crate::pki::issuing_crl_path(&data);
     let before = std::fs::read_to_string(&crl_path).unwrap();
-    let mut conn = env.conn();
+    let conn = env.conn();
     ops::revoke(
-        &mut conn,
+        &conn,
         std::slice::from_ref(&serial),
         crate::pki::issue::Reason::KeyCompromise,
         "測試",

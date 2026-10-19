@@ -1,5 +1,7 @@
 //! 註冊通道的 SQLite 實作（[`crate::enroll::store`] 的 [`EnrollStore`]），以及 `settings` 表
 //! （[`crate::settings::SettingsStore`]）。SQL 原封不動自 `enroll/store.rs` 搬來。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use kairos_proto::enroll::TokenApproval;
 use rusqlite::{Connection, OptionalExtension, Row, params};

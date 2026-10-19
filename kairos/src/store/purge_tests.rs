@@ -323,11 +323,11 @@ fn small_budgets_take_several_steps_and_the_result_is_the_same() {
     populate(&mut store, &dir);
     store.close();
     drop(store);
-    let mut conn = rusqlite::Connection::open(dir.join(DB_FILE)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(DB_FILE)).unwrap();
     let now = noon().timestamp_millis();
     let mut job = PurgeJob::new(A, "root", None, None);
     let mut steps = 0;
-    while !step(&mut conn, &mut job, 2, now).unwrap() {
+    while !step(&conn, &mut job, 2, now).unwrap() {
         steps += 1;
     }
     assert!(steps >= 6, "{steps}");

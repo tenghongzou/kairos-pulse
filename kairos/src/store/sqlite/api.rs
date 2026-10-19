@@ -1,4 +1,6 @@
 //! [`crate::store::api`] 的 SQLite 實作（[`ApiQueries`]）。SQL 原封不動自呼叫端搬來。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 #[allow(unused_imports)]
 use rusqlite::{Connection, OptionalExtension, params};

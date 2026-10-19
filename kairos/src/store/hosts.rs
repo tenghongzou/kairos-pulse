@@ -1,6 +1,8 @@
 //! 主機清冊、report 與彙總的讀取、資產、資料庫本身（容量、備份）的領域介面（`kairos/HA.md` 第 5.2 節的
 //! `HostStore`）。report 的寫入仍由 [`super::ReportStore`] 的單一 writer 進行，這裡只有讀取與管理用的操作。
 //! SQLite 的實作在 `store/sqlite/hosts.rs`。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 #[allow(unused_imports)]
 use super::db::StoreResult;

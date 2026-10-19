@@ -44,6 +44,8 @@
 //!   `KRS-E6201`）；雜湊鏈本身仍會先完整檢查。金鑰不符時不以新的金鑰繼續簽（不「接續」鏈）。
 //! - 已知限制：能同時寫入資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人可以把鏈「降級」成 0.7
 //!   之前的樣子；由外送的鏈尾雜湊（含 HMAC 起點）在外部發現。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -461,20 +463,8 @@ pub trait AuditLog {
         self.audit_append(at_ms, a).map(|_| ())
     }
 
-    /// [`AuditLog::audit_append`]，指定 HMAC 的金鑰（`None`：不加 HMAC；已開始 HMAC 時這一筆在驗證時為
-    /// `missing_hmac`）
-    fn audit_append_with_key(
-        &self,
-        at_ms: i64,
-        a: &Audit<'_>,
-        key: Option<&AuditKey>,
-    ) -> StoreResult<i64>;
-
     /// `meta.audit_hmac`：(since_id, key_id)
     fn audit_hmac_since(&self) -> StoreResult<Option<(i64, String)>>;
-
-    /// 被清除的最後一筆（沒有清除過時為 `None`）：(id, hash)
-    fn audit_anchor(&self) -> StoreResult<Option<(i64, String)>>;
 
     /// 鏈尾（最新一筆）：(id, hash, hmac)；沒有紀錄時為 `None`
     #[allow(clippy::type_complexity)]
@@ -490,9 +480,6 @@ pub trait AuditLog {
     /// 從頭到尾重新計算雜湊鏈，回報第一個斷點（不修改任何資料；在同一個讀取快照中進行）。HMAC 的金鑰
     /// 依資料庫所在的資料目錄取得
     fn audit_verify(&self) -> StoreResult<VerifyReport>;
-
-    /// [`AuditLog::audit_verify`]，指定 HMAC 的金鑰
-    fn audit_verify_with_key(&self, key: Option<&AuditKey>) -> StoreResult<VerifyReport>;
 
     /// 新到舊的 `limit` 筆，以及符合條件的總數
     fn audit_query(&self, f: &AuditFilter, limit: usize) -> StoreResult<(Vec<AuditRow>, u64)>;

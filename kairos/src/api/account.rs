@@ -412,7 +412,7 @@ async fn login_local(
                 // 只在密碼沒有同時被變更時取代（不讓舊密碼覆蓋剛變更的密碼）
                 let _ = ctx2
                     .admin
-                    .write(move |c| Ok(c.rehash_password(uid, &old, &phc)?))
+                    .write(move |c| c.rehash_password(uid, &old, &phc))
                     .await;
             }
         });
@@ -461,7 +461,7 @@ async fn login_failure(
             // 計數寫不進去時不能當作沒失敗（否則資料庫忙碌時可以不受鎖定限制地猜密碼）
             match ctx
                 .admin
-                .write(move |c| Ok(c.login_failed(uid, threshold, lock_ms, now_ms)?))
+                .write(move |c| c.login_failed(uid, threshold, lock_ms, now_ms))
                 .await
             {
                 Ok(l) => l,
@@ -563,13 +563,7 @@ async fn login_ldap(
             let id = ctx
                 .admin
                 .write(move |c| {
-                    Ok(c.upsert_ldap_user(
-                        &dname,
-                        &dn,
-                        display.as_deref(),
-                        email.as_deref(),
-                        now_ms,
-                    )?)
+                    c.upsert_ldap_user(&dname, &dn, display.as_deref(), email.as_deref(), now_ms)
                 })
                 .await
                 .map_err(storage_error)?;
@@ -779,7 +773,7 @@ async fn login_mfa_charged(
             match secret.and_then(|s| totp::verify(&s, &trimmed, now_ms / 1000, last)) {
                 Some(step) => ctx
                     .admin
-                    .write(move |c| Ok(c.use_totp_step(uid, step)?))
+                    .write(move |c| c.use_totp_step(uid, step))
                     .await
                     .map_err(storage_error)?,
                 None => false,
@@ -788,7 +782,7 @@ async fn login_mfa_charged(
             let h = key.recovery_hash(uid, &norm);
             used_recovery = true;
             ctx.admin
-                .write(move |c| Ok(c.use_recovery_code(uid, &h, now_ms)?))
+                .write(move |c| c.use_recovery_code(uid, &h, now_ms))
                 .await
                 .map_err(storage_error)?
         } else {
@@ -1272,7 +1266,7 @@ async fn second_factor_ok(
         match secret.and_then(|s| totp::verify(&s, &trimmed, now_ms / 1000, last)) {
             Some(step) => ctx
                 .admin
-                .write(move |c| Ok(c.use_totp_step(uid, step)?))
+                .write(move |c| c.use_totp_step(uid, step))
                 .await
                 .map_err(storage_error),
             None => Ok(false),
@@ -1280,7 +1274,7 @@ async fn second_factor_ok(
     } else if let Some(norm) = totp::normalize_recovery(code) {
         let h = key.recovery_hash(uid, &norm);
         ctx.admin
-            .write(move |c| Ok(c.use_recovery_code(uid, &h, now_ms)?))
+            .write(move |c| c.use_recovery_code(uid, &h, now_ms))
             .await
             .map_err(storage_error)
     } else {
@@ -1319,7 +1313,7 @@ async fn totp_action(
                 .seal(&secret, uid.to_string().as_bytes())
                 .map_err(|_| ApiError::internal())?;
             ctx.admin
-                .write(move |c| Ok(c.set_totp_pending(uid, &sealed)?))
+                .write(move |c| c.set_totp_pending(uid, &sealed))
                 .await
                 .map_err(storage_error)?;
             let b32 = totp::base32(&secret);

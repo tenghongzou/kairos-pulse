@@ -105,12 +105,6 @@ impl From<DbError> for IssueError {
     }
 }
 
-impl From<rusqlite::Error> for IssueError {
-    fn from(e: rusqlite::Error) -> Self {
-        IssueError::Db(e.into())
-    }
-}
-
 impl From<crate::store::db::StoreError> for IssueError {
     fn from(e: crate::store::db::StoreError) -> Self {
         IssueError::Db(e.into())

@@ -3,6 +3,8 @@
 //!
 //! 只有主控台可修改的項目（[`CONSOLE_KEYS`]）有資料庫的覆寫層；其他設定只來自設定檔與環境變數。
 //! 被環境變數覆寫的項目無法從主控台修改（`409 locked_by_environment`，CLI 結束代碼 3）。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use kairos_proto::enroll::EnrollMode;
 use serde_json::{Value, json};

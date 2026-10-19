@@ -1,6 +1,8 @@
 //! `users`、`user_recovery_codes`、`role_assignments`、`sessions` 的讀寫（schema v6）。
 //!
 //! 都是同步的資料庫操作，主控台與 CLI 共用；稽核由呼叫端在同一個交易中寫入。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use crate::api::http::ts_ms;
 use crate::rbac::{Assignment, Grants};

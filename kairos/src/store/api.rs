@@ -1,5 +1,7 @@
 //! 主控台 API 與 CLI 的跨領域查詢（`kairos/HA.md` 第 5.2 節的 `ApiQueries`）：只讀、把數張表 JOIN 起來
 //! 給畫面使用的查詢。SQLite 的實作在 `store/sqlite/api.rs`。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 #[allow(unused_imports)]
 use super::db::StoreResult;

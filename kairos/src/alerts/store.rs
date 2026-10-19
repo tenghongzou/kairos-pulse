@@ -1,6 +1,8 @@
 //! 告警的資料表（schema v5，`store/sqlite.rs` 的 `SCHEMA_V5`）：規則、事件、處理紀錄、靜音、通知管道、
 //! 發送紀錄、CLI 的動作佇列，以及保留期限與筆數上限的清除。所有函式都是同步的，由呼叫端在 blocking
 //! 執行緒上執行（`EnrollDb`）。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use super::engine::{NewDelivery, Timeline};
 use super::model::{Channel, Event, Rule, Silence};
@@ -125,8 +127,9 @@ pub struct Purged {
 ///
 /// `kairos/HA.md` 第 5.4 節：
 ///
-/// - D6 設定版本：[`AlertStore::bump_config_rev`] 先讀再加一，必須在寫入規則、靜音或管道的同一個交易中
-///   （SQLite 以寫入鎖序列化；PostgreSQL 後端改為 `cluster_revs` 的原子遞增）；
+/// - D6 設定版本：寫入規則、靜音或管道的方法（[`AlertStore::save_rule`]、[`AlertStore::save_silence`]、
+///   [`AlertStore::save_channel`] 等）在同一個語句序列中先讀再加一（SQLite 以寫入鎖序列化；PostgreSQL 後端
+///   改為 `cluster_revs` 的原子遞增）；
 /// - D7 事件流水號：告警引擎啟動時以 [`AlertStore::load_seq`] 讀出各日的最大流水號，之後在記憶體中遞增
 ///   （只有一個引擎寫入；PostgreSQL 後端另以 `alert_event_seq` 防止換手時撞號）；
 /// - 事件、時間軸與發送紀錄的寫入（[`AlertStore::upsert_events`]、[`AlertStore::insert_timeline`]、
@@ -144,7 +147,8 @@ pub trait AlertStore {
     /// 設定的版本（不存在時 0）
     fn config_rev(&self) -> StoreResult<i64>;
 
-    /// 設定已修改：版本加一
+    /// 設定已修改：版本加一（寫入規則、靜音、管道的方法已自行呼叫；測試用）
+    #[cfg(test)]
     fn bump_config_rev(&self) -> StoreResult<()>;
 
     /// 補齊系統預設規則（已存在的不覆寫）；回傳新增的筆數
@@ -278,16 +282,19 @@ pub trait AlertStore {
     ) -> StoreResult<Vec<(i64, f64)>>;
 
     /// 規則試算：使用中的主機 (host_id, agent_id, tags 的 JSON, 來源位址, 顯示名稱或主機名稱)；無法讀取的列略過
+    #[allow(clippy::type_complexity)]
     fn backtest_hosts(
         &self,
     ) -> StoreResult<Vec<(i64, String, Option<String>, Option<String>, String)>>;
 
     /// 規則試算：主機的 (Pulse 版本, hello 的 os, 資產的作業系統家族, CPU 邏輯處理器數)
+    #[allow(clippy::type_complexity)]
     fn backtest_host_info(
         &self,
         host_id: i64,
     ) -> StoreResult<(Option<String>, Option<String>, Option<String>, Option<i64>)>;
 
     /// 告警範圍的台數用：使用中的主機 (agent_id, tags 的 JSON, 來源位址)
+    #[allow(clippy::type_complexity)]
     fn active_host_scope_rows(&self) -> StoreResult<Vec<(String, Option<String>, Option<String>)>>;
 }

@@ -240,7 +240,7 @@ async fn purge_host(
     let (a, act, ipc) = (agent_id.to_string(), actor.clone(), ip.clone());
     let revoked = ctx
         .admin
-        .write(move |conn| Ok(conn.revoke_active_certificates(&a, &act, Some(&ipc), now_ms)?))
+        .write(move |conn| conn.revoke_active_certificates(&a, &act, Some(&ipc), now_ms))
         .await
         .map_err(|e| {
             warn!("刪除主機資料：無法撤銷 {agent_id} 的憑證：{e}");
