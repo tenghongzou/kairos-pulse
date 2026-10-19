@@ -257,7 +257,7 @@ fn ok_json(cmd: &Cmd, now: DateTime<Utc>, data: Value) -> Output {
     }
 }
 
-fn db(cmd: &Cmd) -> Result<rusqlite::Connection, Failure> {
+fn db(cmd: &Cmd) -> Result<DbHandle, Failure> {
     match open(cmd.config_path.as_deref(), true)? {
         Some(c) => Ok(c),
         None => Err(db_failure("資料庫不存在")),
@@ -627,7 +627,7 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let list = conn
                 .list_silences(&status, now_ms, 1000)
                 .map_err(db_failure)?;
-            let hosts = host_facts(&conn)?;
+            let hosts = host_facts(&*conn)?;
             if cmd.json {
                 return Ok(ok_json(
                     cmd,
@@ -751,7 +751,7 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 ),
                 None => None,
             };
-            let hosts = host_facts(&conn)?;
+            let hosts = host_facts(&*conn)?;
             let scope_n = scope::normalize(input.scope.as_ref().unwrap_or(&Scope::default()))
                 .map_err(|(_, m)| usage_err(m))?;
             let matching = count_matching(&hosts, &scope_n);
@@ -1045,13 +1045,9 @@ fn channels_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             // 只顯示狀態與遮蔽值；機密只解開來判斷能否使用（金鑰檔遺失或不成對時為
             // secrets_unavailable，KRS-E5110），不輸出。金鑰檔無法讀取（權限）時不判斷
             let checker = conn
-                .path()
-                .filter(|p| !p.is_empty())
-                .and_then(|p| {
-                    std::path::Path::new(p)
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                })
+                .database_dir()
+                .ok()
+                .flatten()
                 .and_then(|dir| crate::alerts::secrets::SecretBox::for_check(&dir).ok());
             let list = conn.load_channels(checker.as_ref()).map_err(db_failure)?;
             if cmd.json {
@@ -1315,6 +1311,7 @@ mod tests {
         assert!(out.stdout.contains("還沒有通知管道"));
         // 稽核紀錄
         let n: i64 = conn
+            .test_sqlite()
             .query_row(
                 "SELECT count(*) FROM audit_events WHERE category = 'alerts'",
                 [],

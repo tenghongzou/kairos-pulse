@@ -847,22 +847,17 @@ fn database_summary(config: &AppConfig) -> Result<Value, String> {
         Path::new(&config.storage.data_dir),
     )
     .path;
-    let conn = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| format!("無法開啟 {}：{e}", path.display()))?;
-    let _ = conn.busy_timeout(Duration::from_secs(2));
-    let stats = crate::api::health::read_db_stats(&conn).map_err(|e| e.to_string())?;
-    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).ok();
+    let conn = crate::store::open_for_diag(&path)?;
+    let stats = crate::api::health::read_db_stats(conn.as_ref()).map_err(|e| e.to_string())?;
+    let (schema_version, hosts, hosts_online) = conn.diag_counts().map_err(|e| e.to_string())?;
     Ok(json!({
         "path": path.display().to_string(),
         "used_bytes": stats.used_bytes,
         "page_size": stats.page_size,
         "max_total_bytes": config.storage.max_total_bytes,
-        "schema_version": conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).ok(),
-        "hosts": count("SELECT COUNT(*) FROM hosts"),
-        "hosts_online": count("SELECT COUNT(*) FROM hosts WHERE online = 1"),
+        "schema_version": schema_version,
+        "hosts": hosts,
+        "hosts_online": hosts_online,
         "capacity_event": stats.capacity.as_ref().map(|c| json!({
             "active": c.ended_at.is_none(),
             "started_at": crate::api::http::ts_ms(c.started_at),

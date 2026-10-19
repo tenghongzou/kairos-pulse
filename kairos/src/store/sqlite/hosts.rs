@@ -30,6 +30,11 @@ impl<C: AsConn> HostStore for C {
         fn store_cert_rejections(&self, rows: &[(String, i64, String, Option<String>, Option<String>, i64)]) -> Vec<usize> => store_cert_rejections;
         fn host_names(&self, agent_id: &str) -> Option<(String, Option<String>)> => host_names;
         fn purge_plan(&self, agent_id: &str, now_ms: i64) -> crate::store::purge::PurgeCounts => crate::store::purge::plan;
+        fn list_hosts(&self) -> Vec<crate::store::sqlite::HostRow> => crate::store::sqlite::list_hosts;
+        fn export_reports(&self, since_ms: i64, agent_id: Option<&str>, out: &mut dyn FnMut(&crate::storage::ReportRecord) -> Result<(), std::io::Error>) -> u64 => crate::store::sqlite::export_reports;
+        fn backup_to(&self, dest: &std::path::Path) -> () => crate::store::sqlite::backup_to;
+        fn purge_run_to_end(&self, job: &mut crate::store::purge::PurgeJob, now_ms: i64) -> () => crate::store::purge::run_to_end;
+        fn host_meta_rows(&self) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> => host_meta_rows;
     }
 }
 
@@ -346,4 +351,35 @@ pub fn host_names(
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .optional()
+}
+
+/// 主機屬性（原本在 `export/otlp.rs` 的 `load_host_meta`）
+#[allow(clippy::type_complexity)]
+pub fn host_meta_rows(
+    conn: &Connection,
+) -> rusqlite::Result<
+    Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>,
+> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, h.display_name, h.host_group, h.tags, h.os, i.os_family
+         FROM hosts h LEFT JOIN host_inventory i ON i.host_id = h.host_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    rows.collect()
 }

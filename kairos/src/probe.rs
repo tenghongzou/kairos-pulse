@@ -216,7 +216,6 @@ impl DbProbe {
     }
 
     fn probe_now(&self) -> DbSnapshot {
-        use rusqlite::{Connection, OpenFlags};
         let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
         let mut wal = self.path.as_os_str().to_os_string();
         wal.push("-wal");
@@ -225,29 +224,20 @@ impl DbProbe {
             wal_bytes: size(std::path::Path::new(&wal)),
             ..DbSnapshot::default()
         };
-        let conn = match Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                snap.writable = Err(format!("無法開啟資料庫：{e}"));
-                return snap;
-            }
-        };
-        let _ = conn.busy_timeout(DB_BUSY_TIMEOUT);
         // 不取得寫入鎖（BEGIN IMMEDIATE 會與 writer 搶鎖，writer 的忙碌等待以毫秒為單位，量測到 ack 的 p99 上升）：
         // 讀一次 schema（WAL 的讀者不擋 writer）後確認連線不是唯讀開啟（檔案或目錄沒有寫入權限、
         // 唯讀掛載時 SQLite 會退為唯讀）。實際的寫入失敗另由 /readyz 的 storage 反映
-        snap.writable = conn
-            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
-            .map_err(|e| format!("無法讀取資料庫：{e}"))
-            .and_then(|_| match conn.is_readonly(rusqlite::MAIN_DB) {
-                Ok(false) => Ok(()),
-                Ok(true) => Err("資料庫只能以唯讀開啟（權限或唯讀掛載）".to_string()),
-                Err(e) => Err(format!("無法確認資料庫是否可寫：{e}")),
-            });
-        if let Ok(stats) = crate::api::health::read_db_stats(&conn) {
+        let conn = match crate::store::open_for_probe(&self.path, DB_BUSY_TIMEOUT) {
+            Ok((c, writable)) => {
+                snap.writable = writable;
+                c
+            }
+            Err(e) => {
+                snap.writable = Err(e);
+                return snap;
+            }
+        };
+        if let Ok(stats) = crate::api::health::read_db_stats(conn.as_ref()) {
             snap.used_bytes = Some(stats.used_bytes);
             snap.capacity_deleting = stats
                 .capacity

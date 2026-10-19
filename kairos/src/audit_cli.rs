@@ -15,7 +15,6 @@ use crate::audit::{self, AuditFilter, CODE_CHAIN_BROKEN, Event};
 use crate::config::take_config_arg;
 use crate::hosts_cli::{ascii_json, parse_duration, use_unicode};
 use crate::storage::fmt_time;
-use crate::store::prelude::*;
 use crate::token_cli::{Failure, db_failure, human_time, open, operator, table, zone_label};
 
 /// `kairos audit --help`
@@ -238,7 +237,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 code,
                 details: Some(details),
             }
-            .append(&conn, now_ms);
+            .append(&*conn, now_ms);
         };
     let f = filter_of(cmd, now);
     match &cmd.action {
@@ -590,7 +589,8 @@ mod tests {
         }
         assert_eq!(lines.last().unwrap()["last_hash"], prev.as_str());
         // 竄改第 2 筆：結束代碼 9、KRS-E6201
-        conn.execute("UPDATE audit_events SET actor = 'mallory' WHERE id = 2", [])
+        conn.test_sqlite()
+            .execute("UPDATE audit_events SET actor = 'mallory' WHERE id = 2", [])
             .unwrap();
         let out = execute(&cmd, Utc::now(), tz, false);
         assert_eq!(out.exit, EXIT_BROKEN);

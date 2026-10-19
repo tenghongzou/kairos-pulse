@@ -105,6 +105,28 @@ impl std::error::Error for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+impl From<std::io::Error> for StoreError {
+    /// 檔案與資料庫開啟的錯誤（訊息不變）
+    fn from(e: std::io::Error) -> Self {
+        let kind = match e.kind() {
+            std::io::ErrorKind::ResourceBusy => StoreErrorKind::Busy,
+            std::io::ErrorKind::NotFound => StoreErrorKind::NotFound,
+            std::io::ErrorKind::StorageFull => StoreErrorKind::Full,
+            _ => StoreErrorKind::Other,
+        };
+        StoreError::new(kind, e)
+    }
+}
+
+impl StoreError {
+    /// 來源是 I/O 錯誤時的種類（例如匯出時輸出被關閉的 `BrokenPipe`）
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        self.source
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+    }
+}
+
 /// 交易的種類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxMode {

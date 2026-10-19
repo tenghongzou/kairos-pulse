@@ -18,7 +18,6 @@ use crate::enroll_cli::{
 };
 use crate::pki::ca::{self, CaKey, InitError, InitPlan, ServerName};
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode};
-use crate::store::prelude::*;
 use crate::token_cli::{Failure, Output, db_failure, human_time, operator};
 
 /// 根 CA 私鑰仍在伺服器上（`pki init` 之後提醒移到離線保存）
@@ -122,7 +121,7 @@ pub fn init(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         data_dir: PathBuf::from(&config.storage.data_dir),
         server_days: int_opt(cmd, "--server-days")?.unwrap_or(ca::SERVER_DAYS),
     };
-    let o = ca::init(&conn, &plan, now_ms).map_err(|e| match e {
+    let o = ca::init(&*conn, &plan, now_ms).map_err(|e| match e {
         InitError::Conflict(m) => Failure::new(
             "PKI 已經初始化過",
             m,
@@ -465,10 +464,10 @@ fn gencrl_online(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             "離線簽發模式（pki.mode = \"offline\"）：Kairos 沒有 CA 私鑰。在 CA 主機以 kairos pki gencrl --ca-cert … --ca-key … --revocations … 產生",
         ));
     }
-    let mut conn = db(cmd)?;
+    let conn = db(cmd)?;
     let data_dir = PathBuf::from(&config.storage.data_dir);
     let mgr = crate::enroll::pki_mgr::PkiManager::new(&data_dir, config.pki.effective_mode());
-    mgr.sync_cas(&conn)
+    mgr.sync_cas(&*conn)
         .map_err(|e| db_failure(format!("{e:?}")))?;
     let ids = mgr.issuer_ids();
     if ids.is_empty() {
@@ -489,13 +488,13 @@ fn gencrl_online(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     let actor = operator();
     let mut made = Vec::new();
     for id in ids {
-        match mgr.regenerate_crl(&mut conn, id, validity, "manual", Some(&actor), now_ms) {
+        match mgr.regenerate_crl(&*conn, id, validity, "manual", Some(&actor), now_ms) {
             Ok(Some(n)) => made.push((id, n)),
             Ok(None) => {}
             Err(e) => return Err(general("CRL 產生失敗", format!("簽發 CA {id}：{e:?}"))),
         }
     }
-    mgr.write_crl_file(&conn)
+    mgr.write_crl_file(&*conn)
         .map_err(|e| db_failure(format!("{e:?}")))?;
     let _ = conn.audit(now_ms,
         &store::Audit {
@@ -548,7 +547,7 @@ pub fn revocations_export(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failur
         .1;
     let info = parse_cert(&der).map_err(usage_err)?;
     let conn = db(cmd)?;
-    let v = ca::export_revocations(&conn, &info, now_ms).map_err(db_failure)?;
+    let v = ca::export_revocations(&*conn, &info, now_ms).map_err(db_failure)?;
     let n = v["revoked"].as_array().map_or(0, Vec::len);
     let text = serde_json::to_string_pretty(&v).unwrap_or_default() + "\n";
     match cmd.opt("--out") {

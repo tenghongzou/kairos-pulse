@@ -11,6 +11,8 @@ use crate::store::admin::*;
 impl<C: AsConn> AdminStore for C {
     forward! {
         fn personal_data(&self, agent_id: &str, settings: &PrivacySettings, now_ms: i64) -> Option<serde_json::Value> => personal_data;
+        fn diag_counts(&self) -> (Option<i64>, Option<i64>, Option<i64>) => diag_counts;
+        fn database_dir(&self) -> Option<std::path::PathBuf> => database_dir;
     }
 }
 
@@ -204,4 +206,24 @@ pub fn personal_data(
         "certificates": certificates,
         "audit_events": audit,
     })))
+}
+
+/// 診斷包的資料庫摘要（原本在 `diag.rs` 的 `database_summary`）
+pub fn diag_counts(conn: &Connection) -> rusqlite::Result<(Option<i64>, Option<i64>, Option<i64>)> {
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).ok();
+    Ok((
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .ok(),
+        count("SELECT COUNT(*) FROM hosts"),
+        count("SELECT COUNT(*) FROM hosts WHERE online = 1"),
+    ))
+}
+
+/// 資料庫檔所在的目錄（原本在 `alerts_cli.rs`）
+pub fn database_dir(conn: &Connection) -> rusqlite::Result<Option<std::path::PathBuf>> {
+    Ok(conn.path().filter(|p| !p.is_empty()).and_then(|p| {
+        std::path::Path::new(p)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    }))
 }

@@ -18,4 +18,10 @@ pub trait AdminStore {
         settings: &crate::privacy::PrivacySettings,
         now_ms: i64,
     ) -> StoreResult<Option<serde_json::Value>>;
+
+    /// 診斷包的資料庫摘要：(schema 版本, 主機數, 線上主機數)；各項讀不到時為 `None`
+    fn diag_counts(&self) -> StoreResult<(Option<i64>, Option<i64>, Option<i64>)>;
+
+    /// 資料庫檔所在的目錄（SQLite；記憶體中的資料庫為 `None`）。金鑰檔與資料庫放在同一個資料目錄時用來找金鑰
+    fn database_dir(&self) -> StoreResult<Option<std::path::PathBuf>>;
 }

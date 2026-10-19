@@ -49,6 +49,20 @@ pub fn open_read(path: &Path) -> Result<db::DbHandle, Error> {
     Ok(Box::new(sqlite::open_read_only(path)?))
 }
 
+/// 診斷包的唯讀連線（[`sqlite::open_for_diag`]）
+pub fn open_for_diag(path: &Path) -> Result<db::DbHandle, String> {
+    Ok(Box::new(sqlite::open_for_diag(path)?))
+}
+
+/// 健康檢查的讀寫連線與「可寫」的檢查結果（[`sqlite::open_for_probe`]；不取得寫入鎖）
+pub fn open_for_probe(
+    path: &Path,
+    busy: Duration,
+) -> Result<(db::DbHandle, Result<(), String>), String> {
+    let (conn, writable) = sqlite::open_for_probe(path, busy)?;
+    Ok((Box::new(conn), writable))
+}
+
 /// 主控台 API 唯讀連線池的連線：[`open_read`] 再設定為只讀（`query_only`）並加大快取
 pub fn open_console_read(path: &Path) -> Result<db::DbHandle, Error> {
     Ok(Box::new(sqlite::open_console_reader(path)?))

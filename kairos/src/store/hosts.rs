@@ -98,4 +98,39 @@ pub trait HostStore {
 
     /// 刪除主機資料的影響（試執行；`kairos/PRIVACY.md` 第 4 節）
     fn purge_plan(&self, agent_id: &str, now_ms: i64) -> StoreResult<super::purge::PurgeCounts>;
+
+    /// 主機清冊（`kairos hosts list`）
+    fn list_hosts(&self) -> StoreResult<Vec<crate::store::sqlite::HostRow>>;
+
+    /// 匯出 report（`kairos reports export`）：`since_ms` 之後（可限定一台主機）依時間逐筆交給 `out`；回傳筆數
+    fn export_reports(
+        &self,
+        since_ms: i64,
+        agent_id: Option<&str>,
+        out: &mut dyn FnMut(&crate::storage::ReportRecord) -> Result<(), std::io::Error>,
+    ) -> StoreResult<u64>;
+
+    /// 線上備份到 `dest`（`kairos db backup`；新檔，權限 0640）
+    fn backup_to(&self, dest: &std::path::Path) -> StoreResult<()>;
+
+    /// 刪除主機資料：一步一步執行到完成（`kairos hosts purge`，Kairos 停止時以獨占連線執行）
+    fn purge_run_to_end(
+        &self,
+        job: &mut crate::store::purge::PurgeJob,
+        now_ms: i64,
+    ) -> StoreResult<()>;
+
+    /// 指標轉出（OTLP）resource 的主機屬性：(agent_id, 顯示名稱, 群組, tags 的 JSON, hello 的 os, 資產的作業系統家族)
+    fn host_meta_rows(
+        &self,
+    ) -> StoreResult<
+        Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    >;
 }

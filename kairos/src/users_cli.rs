@@ -17,7 +17,7 @@ use crate::config::{AppConfig, take_config_arg};
 use crate::hosts_cli::{ascii_json, use_unicode};
 use crate::rbac::{Assignment, Role};
 use crate::storage::fmt_time;
-use crate::store::db::in_write_tx;
+use crate::store::db::{StoreErrorKind, in_write_tx};
 use crate::store::prelude::*;
 use crate::token_cli::{Failure, db_failure, human_time, open, operator, table, zone_label};
 use crate::users::password::{self, HashParams};
@@ -499,7 +499,7 @@ pub fn execute(
                 Ok(h) => h,
                 Err(e) => return fail(db_failure(e)),
             };
-            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 let Some(uid) = c.create_user(
                     &NewUser {
                         username,
@@ -693,7 +693,7 @@ pub fn execute(
             {
                 return fail(f);
             }
-            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 if !grant
                     && a.role == Role::Admin
                     && a.scope == crate::rbac::Scope::Global
@@ -846,7 +846,7 @@ pub fn execute(
                 None
             };
             let uid = u.user_id;
-            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 if matches!(action, UsersAction::Disable(_) | UsersAction::Delete(_))
                     && c.active_global_admins()? == vec![uid]
                 {
@@ -875,7 +875,9 @@ pub fn execute(
                         ("session.revoke_all", true, n)
                     }
                     _ => {
-                        let (_, _, h) = new_pw.as_ref().ok_or(rusqlite::Error::InvalidQuery)?;
+                        let (_, _, h) = new_pw.as_ref().ok_or_else(|| {
+                            StoreError::new(StoreErrorKind::Other, "Query is not read-only")
+                        })?;
                         c.set_password(uid, h, true, now_ms)?;
                         (
                             "password.reset",
@@ -1018,7 +1020,7 @@ pub fn execute(
                     EXIT_USAGE,
                 ));
             }
-            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 let changed = if map {
                     c.add_assignment(SUBJECT_LDAP_GROUP, &key, a, &by, now_ms)?
                 } else {
@@ -1328,6 +1330,7 @@ mod tests {
         assert!(r.ok(), "{r:?}");
         assert!(r.checked >= 6);
         let raw: String = conn
+            .test_sqlite()
             .query_row(
                 "SELECT group_concat(coalesce(details, ''), ' ') FROM audit_events",
                 [],

@@ -256,7 +256,7 @@ impl PurgeJob {
 
 /// 做一步（一個交易）。`budget`：大量資料表每一步最多刪除的列數。回傳是否已完成
 pub fn step(
-    conn: &mut Connection,
+    conn: &Connection,
     job: &mut PurgeJob,
     budget: i64,
     now_ms: i64,
@@ -265,7 +265,7 @@ pub fn step(
         job.host_id = host_id_of(conn, &job.agent_id)?;
         job.started = true;
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let mut left = budget.max(1);
     while job.stage != Stage::Finish && job.stage != Stage::Done {
         let Some(h) = job.host_id else {
@@ -397,7 +397,7 @@ pub const CODE_PURGED: &str = "KRS-I4204";
 pub const CODE_PURGE_FAILED: &str = "KRS-E4205";
 
 /// 一次做完（`kairos hosts purge`：Kairos 停止、已取得獨占鎖）
-pub fn run_to_end(conn: &mut Connection, job: &mut PurgeJob, now_ms: i64) -> rusqlite::Result<()> {
+pub fn run_to_end(conn: &Connection, job: &mut PurgeJob, now_ms: i64) -> rusqlite::Result<()> {
     while !step(conn, job, 20_000, now_ms)? {}
     Ok(())
 }

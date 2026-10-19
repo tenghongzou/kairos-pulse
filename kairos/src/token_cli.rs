@@ -16,8 +16,8 @@ use crate::config::{AppConfig, StorageBackend, take_config_arg};
 use crate::hosts_cli::{ascii_json, display_width, parse_duration, use_unicode};
 use crate::rbac::{LegacyScope, Role};
 use crate::storage::fmt_time;
-use crate::store::prelude::*;
-use crate::store::sqlite::{DB_FILE, SqliteOptions, open_admin};
+use crate::store::db::DbHandle;
+use crate::store::sqlite::{DB_FILE, SqliteOptions};
 
 /// `kairos api-token --help`
 pub const TOKEN_USAGE: &str = "kairos api-token — 主控台 API（kairos/API.md）的 token
@@ -426,10 +426,7 @@ pub(crate) fn refuse_root(data_dir: &Path) -> Option<Failure> {
 }
 
 /// 載入設定並開啟資料庫（`create` 時必要時建立）；資料庫不存在且 `create` 為 `false` 時回 `Ok(None)`
-pub(crate) fn open(
-    config_path: Option<&Path>,
-    create: bool,
-) -> Result<Option<rusqlite::Connection>, Failure> {
+pub(crate) fn open(config_path: Option<&Path>, create: bool) -> Result<Option<DbHandle>, Failure> {
     let config = AppConfig::load(config_path).map_err(|e| Failure {
         code: Some(crate::diag::config_load_code(&e, config_path)),
         ..Failure::new(
@@ -455,7 +452,7 @@ pub(crate) fn open(
         return Err(f);
     }
     let opts = SqliteOptions::from_config(&config, &data_dir);
-    open_admin(&opts, std::time::Duration::from_secs(5))
+    crate::store::open_admin(&opts, std::time::Duration::from_secs(5))
         .map(Some)
         .map_err(|e| {
             let (fix, exit) = match e.kind() {
@@ -690,12 +687,18 @@ pub fn execute(
                     Err(e) => return fail(db_failure(e)),
                 },
             };
-            let NewToken { token, row } =
-                match tokens::create_with(&conn, name, &grant, expires_at, Some(&by), None, now_ms)
-                {
-                    Ok(t) => t,
-                    Err(e) => return fail(db_failure(e)),
-                };
+            let NewToken { token, row } = match tokens::create_with(
+                &*conn,
+                name,
+                &grant,
+                expires_at,
+                Some(&by),
+                None,
+                now_ms,
+            ) {
+                Ok(t) => t,
+                Err(e) => return fail(db_failure(e)),
+            };
             if cmd.json {
                 let mut data = row_json(&row, now_ms);
                 data["token"] = json!(token);
@@ -905,11 +908,11 @@ pub fn execute(
                 }
             }
             let by = operator();
-            let result = match tokens::revoke(&conn, token_id, Some(&by), reason.as_deref(), now_ms)
-            {
-                Ok(r) => r,
-                Err(e) => return fail(db_failure(e)),
-            };
+            let result =
+                match tokens::revoke(&*conn, token_id, Some(&by), reason.as_deref(), now_ms) {
+                    Ok(r) => r,
+                    Err(e) => return fail(db_failure(e)),
+                };
             let (row, already) = match result {
                 Revoked::Now(r) => (r, false),
                 Revoked::Already(r) => (r, true),
