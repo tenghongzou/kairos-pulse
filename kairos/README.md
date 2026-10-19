@@ -659,6 +659,16 @@ kairos hosts pseudonym ann-laptop             # privacy.hostname = "pseudonymize
 - `[privacy]`：來源位址只存網段或不存、主機名稱假名化、行程命令列遮蔽秘密（預設）、資產的介面位址截斷；在資料進入時一次轉換。
 - 主控台：主機詳情 › 更多 › 匯出個資、刪除主機資料（只有管理員；主機須離線；L2 輸入主機名稱）。刪除會先撤銷這台主機的有效憑證；稽核日誌不刪除（雜湊鏈），另記一筆 `host.purge`。
 
+## 集中設定與 Pulse 遠端升級（0.9.0〔草稿〕；商業審計 F8）
+
+Kairos 下發 Pulse 的部分設定（白名單：回報與心跳間隔、採集、行程、資產、緩衝、日誌層級…；伺服器位址、憑證、信任設定永遠只在本機改），並推送**官方簽章**的 Pulse 發佈包分批升級（canary＋其餘、失敗比例自動暫停）。規格見 [`crates/kairos-proto/REMOTE.md`](../crates/kairos-proto/REMOTE.md)，端點見 API.md 第 17 節，資料表見 STORAGE.md 第 18 節。
+
+- 條件：SQLite 儲存、agent 連線埠啟用 **mTLS**、Pulse 0.9.0 以上（0.8 → 0.9 必須手動升級一次）。`[remote] config_enabled`／`upgrade_enabled` 預設啟用。
+- **集中設定**（S24）：設定檔（每一版保留、可回復）指派給全站、主機群組、標籤或單台，依優先序合併；本機的 `pulse.toml` 與環境變數永遠優先（回報為「本機覆蓋」）。Pulse 在下一次心跳（預設 15 秒內）取得新的設定並回報實際生效的值。
+- **Pulse 版本庫**（S25）：上傳同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-<版本>-<commit>-release.json` 與需要的發佈檔（tar.gz、deb、rpm）。設定 `[remote] allowed_signers`（與客戶驗證發佈包用的同一份公鑰）後，匯入時就驗證簽章；信任仍由每台 Pulse 以本機的 `allowed_signers` 決定，Kairos 被入侵也不能讓主機安裝非官方的程式。
+- **升級推送**（S26）：選擇主機（全站、群組、標籤、指定主機）→ 預覽資格分類 → 送出（L2「升級 N 台」）。發佈包經 8443 的同一條 mTLS 連線分段下載（不需要新的防火牆規則），同時下載數受 `max_concurrent_downloads` 限制。0.9 只有 Linux（Windows、維護時段、雙人覆核、外部 URL 在 0.10）。
+- 權限：`config:read`／`write`（維運者可修改設定）、`releases:read`／`write`、`rollouts:read`／`write`（建立與執行只限管理員）、`rollouts:pause`（維運者可以暫停）。
+
 ## 告警（0.6.0）
 
 主機離線、指標門檻、身分衝突、憑證被拒等主機事件，網段與大規模離線的彙總，以及 Kairos 本身的系統事件（CRL、伺服器憑證、回報無法寫入、容量、連線上限、註冊端點…），依四級嚴重度（緊急、嚴重、警告、資訊）通知到 Email（SMTP）與 Webhook（Kairos JSON、Slack 類、Teams、LINE）。規格見 [ALERTS.md](ALERTS.md)，端點見 API.md 第 13 節。
@@ -1071,6 +1081,11 @@ kairos/
     │                      標頭加密）、prom.rs（Prometheus text／OpenMetrics）、otlp.rs（名稱對應、編碼、推送）、proto.rs
     │                      （protobuf 編碼器）、tests.rs（假的 collector）、bench.rs（量測）；api/export.rs 為端點
     ├── privacy.rs         [privacy]：來源位址、主機名稱假名化、行程與資產的遮蔽；個資匯出（PRIVACY.md）
+    ├── remote/            集中設定與 Pulse 遠端升級（REMOTE.md、API.md 第 17 節）：mod.rs（RemoteService：記憶體中的
+    │                      pending、連線、下載名額、背景工作）、store.rs（RemoteStore）、desired.rs（選擇器、合併、版本、
+    │                      衝突、白名單）、ops.rs（設定檔、指派、版本庫的寫入）、releases.rs（匯入與驗證、發佈檔）、
+    │                      rollout.rs（推送的內容、資格、推送引擎的純函式）、engine.rs（推送的操作、引擎、提議與回報）、
+    │                      agent.rs（8443 的 config_get／config_status）；api/remote.rs 為端點、store/sqlite/remote.rs 為 SQL
     ├── privacy_cli.rs     kairos hosts purge|export|pseudonym
     ├── stats.rs           report 寫入結果的統計（啟動以來與每分鐘）
     ├── token_cli.rs       kairos api-token create|list|revoke
