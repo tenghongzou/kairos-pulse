@@ -26,9 +26,9 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use super::ops::{self, TokenInput};
 use super::{Running, StartParams, store};
 use crate::config::{AppConfig, PkiMode};
-use crate::pki::store as ps;
 use crate::pki::x509::{parse_cert, pem_decode_all};
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 
 const DAY: i64 = 86_400_000;
 
@@ -1016,7 +1016,7 @@ async fn revocation_regenerates_the_crl_and_blocks_grace_renewal() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(listed, "撤銷的序號應在 2 秒內進入 CRL");
-    let c = ps::get_cert(&conn, &serial).unwrap().unwrap();
+    let c = conn.get_cert(&serial).unwrap().unwrap();
     assert!(c.crl_number.is_some());
     // 撤銷後不能再以過期續簽換憑證
     let old = c.cert_der;
@@ -1055,7 +1055,7 @@ async fn retired_issuing_ca_blocks_grace_renewal_even_if_client_ca_lists_it() {
         .remove(0)
         .1;
     let conn = env.conn();
-    let first = ps::list_cas(&conn).unwrap().remove(0);
+    let first = conn.list_cas().unwrap().remove(0);
     // auth.client_ca 另列出第一個簽發 CA（以前手動設定 PKI 的部署可能如此）
     let mut client_ca = env.root.pem.clone();
     client_ca.push_str(&crate::pki::x509::pem_encode(
@@ -1068,8 +1068,8 @@ async fn retired_issuing_ca_blocks_grace_renewal_even_if_client_ca_lists_it() {
     let (_, n) = crate::pki::manage::create(&conn, &data, "Test", env.now()).unwrap();
     let cert = env.root.sign_issuing(&n.csr_pem);
     let second = crate::pki::manage::install(&conn, &data, &cert, env.now()).unwrap();
-    ps::activate_ca(&conn, second.ca_id).unwrap();
-    ps::retire_ca(&conn, first.ca_id, env.now()).unwrap();
+    conn.activate_ca(second.ca_id).unwrap();
+    conn.retire_ca(first.ca_id, env.now()).unwrap();
     env.svc().wake();
     let mut synced = false;
     for _ in 0..100 {

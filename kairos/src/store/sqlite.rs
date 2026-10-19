@@ -43,6 +43,7 @@ use crate::throttled;
 
 pub(crate) mod audit;
 pub(crate) mod conn;
+pub(crate) mod pki;
 pub(crate) mod users;
 
 #[path = "sqlite_assets.rs"]

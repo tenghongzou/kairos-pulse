@@ -47,6 +47,7 @@ use crate::config::{AppConfig, PkiMode};
 use crate::per_ip::Allowlist;
 use crate::settings::{self, Effective};
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 use db::{DbError, EnrollDb};
 use limits::{Block, Gcra, InvalidClass, InvalidPolicy, InvalidTracker, Keyed, Slots};
 use pki_mgr::{IssueStatus, PkiManager};
@@ -738,12 +739,12 @@ impl EnrollService {
             let mut changed = self.pki.sync_cas(conn)?;
             // 需要重新產生 CRL 的 CA：有已生效但未收錄的撤銷、沒有 CRL、nextUpdate 在 7 天內，
             // 或超過 crl_refresh_hours 沒有更新
-            let pending: HashSet<i64> =
-                crate::pki::store::ca_ids_with_pending_revocations(conn, now)?
-                    .into_iter()
-                    .collect();
+            let pending: HashSet<i64> = conn
+                .ca_ids_with_pending_revocations(now)?
+                .into_iter()
+                .collect();
             for ca_id in self.pki.issuer_ids() {
-                let latest = crate::pki::store::latest_crl(conn, ca_id)?;
+                let latest = conn.latest_crl(ca_id)?;
                 let due = match &latest {
                     None => true,
                     Some(c) => {
@@ -807,7 +808,8 @@ impl EnrollService {
 
     /// 啟用中的簽發 CA 剩餘時間少於門檻時記 `KRS-W1304`（每 24 小時最多一次）；回傳 (ca_id, 到期時間)
     fn check_issuing_ca_expiry(&self, conn: &Connection, now: i64) -> Option<(i64, i64)> {
-        let ca = crate::pki::store::list_cas(conn)
+        let ca = conn
+            .list_cas()
             .ok()?
             .into_iter()
             .find(|c| c.state == crate::pki::store::CA_ACTIVE)?;

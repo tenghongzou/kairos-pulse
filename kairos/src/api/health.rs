@@ -19,6 +19,7 @@ use crate::enroll::pki_mgr::IssueStatus;
 use crate::expiry::ExpiryKind;
 use crate::rbac::{Grants, Permission};
 use crate::registry::LiveAgent;
+use crate::store::prelude::*;
 use crate::store::sqlite::{CapacityEvent, META_CAPACITY_EVENT, META_RETENTION_LAST, RetentionRun};
 use kairos_proto::enroll::EnrollMode;
 
@@ -502,7 +503,7 @@ async fn issuing_ca(ctx: &ApiContext, now_ms: i64) -> Option<Item> {
     let read = svc
         .db
         .read(move |conn| {
-            let cas = crate::pki::store::list_cas(conn)?;
+            let cas = conn.list_cas()?;
             let threshold = s2.issuing_ca_warning_ms(conn, now_ms);
             let (stale, oldest): (i64, Option<i64>) = conn.query_row(
                 "SELECT count(*), min(decided_at) FROM enroll_requests WHERE state = 'approved' AND decided_at < ?1",

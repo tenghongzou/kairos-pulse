@@ -23,6 +23,7 @@ use crate::enroll::{EnrollService, handlers};
 use crate::pki::issue::Reason;
 use crate::pki::store as ps;
 use crate::settings;
+use crate::store::prelude::*;
 
 /// 寫入本文的上限
 pub const MAX_BODY: usize = 1024 * 1024;
@@ -1240,12 +1241,7 @@ async fn list_certs(
     let limit = limit_of(q)?;
     let (rows, hosts) = svc
         .db
-        .read(|conn| {
-            Ok((
-                ps::list_certs(conn, 1_000_000, None)?,
-                cert_hosts(conn, None)?,
-            ))
-        })
+        .read(|conn| Ok((conn.list_certs(1_000_000, None)?, cert_hosts(conn, None)?)))
         .await
         .map_err(db_error)?;
     let now_ms = now.timestamp_millis();
@@ -1295,7 +1291,7 @@ async fn get_cert(
     let (c, hosts) = svc
         .db
         .read(move |conn| {
-            let c = ps::get_cert(conn, &s)?;
+            let c = conn.get_cert(&s)?;
             let hosts = cert_hosts(conn, Some(&s))?;
             Ok(c.map(|c| (c, hosts)))
         })
@@ -1521,10 +1517,10 @@ async fn get_ca(
     let (cas, threshold) = svc
         .db
         .read(move |conn| {
-            let cas = ps::list_cas(conn)?;
+            let cas = conn.list_cas()?;
             let mut out = Vec::new();
             for c in cas {
-                let n = ps::issued_count_by_ca(conn, c.ca_id)?;
+                let n = conn.issued_count_by_ca(c.ca_id)?;
                 out.push((c, n));
             }
             Ok((out, s2.issuing_ca_warning_ms(conn, now_ms)))
@@ -1562,8 +1558,8 @@ async fn get_crl(
         .db
         .read(|conn| {
             let mut out = Vec::new();
-            for ca in ps::trust_anchor_cas(conn)? {
-                let history = ps::crl_history(conn, ca.ca_id, 100)?;
+            for ca in conn.trust_anchor_cas()? {
+                let history = conn.crl_history(ca.ca_id, 100)?;
                 out.push(json!({
                     "ca_id": ca.ca_id,
                     "current": history.first().map(|c| json!({

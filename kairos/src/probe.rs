@@ -38,6 +38,7 @@ use crate::registry::Registry;
 use crate::shutdown::Shutdown;
 use crate::stats::WriteStats;
 use crate::storage::QueueProbe;
+use crate::store::prelude::*;
 use crate::tls::TlsState;
 
 /// 資料庫檢查結果的快取時間
@@ -755,7 +756,7 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
     if let Some(svc) = &ctx.enroll {
         let cas = svc
             .db
-            .read(|conn| Ok(crate::pki::store::list_cas(conn)?))
+            .read(|conn| Ok(conn.list_cas()?))
             .await
             .unwrap_or_default();
         let mut n = 0;

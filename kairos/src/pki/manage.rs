@@ -13,8 +13,9 @@ use std::path::Path;
 use super::issue::{
     IssuingCa, MIN_ISSUING_CA_REMAINING_MS, NewIssuingCa, check_issuing_ca, new_issuing_ca,
 };
-use super::store::{self as ps, CA_PENDING, CA_RETIRED};
+use super::store::{CA_PENDING, CA_RETIRED};
 use super::x509::{parse_cert, pem_decode_all};
+use crate::store::prelude::*;
 
 /// 建立新的簽發 CA：寫入私鑰與 `pending` 的資料列，回傳 `ca_id` 與 CSR
 pub fn create(
@@ -23,7 +24,7 @@ pub fn create(
     organization: &str,
     now_ms: i64,
 ) -> Result<(i64, NewIssuingCa), String> {
-    let next = ps::next_ca_id(conn).map_err(|e| e.to_string())?;
+    let next = conn.next_ca_id().map_err(|e| e.to_string())?;
     let n = new_issuing_ca(organization, next)?;
     super::ensure_pki_dir(data_dir)
         .map_err(|e| format!("無法建立 {}：{e}", super::pki_dir(data_dir).display()))?;
@@ -33,11 +34,10 @@ pub fn create(
         .map_err(|e| format!("無法寫入私鑰 {}：{e}", key_path.display()))?;
     let spki_sha = kairos_proto::enroll::sha256(&n.spki_der);
     let subject = n.subject.clone();
-    let id = ps::insert_pending_ca(
-        conn,
-        |_| subject.clone(),
+    let id = conn.insert_pending_ca(
+        &|_| subject.clone(),
         &spki_sha,
-        |_| key_file.clone(),
+        &|_| key_file.clone(),
         now_ms,
     );
     match id {
@@ -84,7 +84,8 @@ pub fn install(
     };
     let info = parse_cert(&der)?;
     let spki_sha = kairos_proto::enroll::sha256(&info.spki_der);
-    let ca = ps::find_ca_by_spki(conn, &spki_sha)
+    let ca = conn
+        .find_ca_by_spki(&spki_sha)
         .map_err(|e| e.to_string())?
         .ok_or("這張憑證的公鑰不屬於任何以 kairos pki issuing-ca new 建立的簽發 CA")?;
     if ca.state == CA_RETIRED {
@@ -107,15 +108,15 @@ pub fn install(
     let key_pem = std::fs::read_to_string(data_dir.join(&key_file))
         .map_err(|e| format!("無法讀取私鑰 {key_file}：{e}"))?;
     IssuingCa::load(ca.ca_id, &der, &key_pem)?;
-    let activated = ps::install_ca(
-        conn,
-        ca.ca_id,
-        &info.subject_text,
-        &der,
-        info.not_before_ms,
-        info.not_after_ms,
-    )
-    .map_err(|e| e.to_string())?;
+    let activated = conn
+        .install_ca(
+            ca.ca_id,
+            &info.subject_text,
+            &der,
+            info.not_before_ms,
+            info.not_after_ms,
+        )
+        .map_err(|e| e.to_string())?;
     Ok(Installed {
         ca_id: ca.ca_id,
         issuer: info.issuer_text,

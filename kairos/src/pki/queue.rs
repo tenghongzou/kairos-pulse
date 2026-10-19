@@ -12,10 +12,11 @@ use serde_json::{Value, json};
 
 use super::csr::check_csr;
 use super::issue::{IssuingCa, random_serial};
-use super::store::{self as ps, CertRow};
+use super::store::CertRow;
 use super::x509::{parse_cert, verify_cert_signature};
 use crate::enroll::pki_mgr::issued_via;
 use crate::enroll::store::{self as es, Audit, DbState};
+use crate::store::prelude::*;
 
 pub const QUEUE_SCHEMA: &str = "kairos-csr-queue/v1";
 pub const SIGNED_SCHEMA: &str = "kairos-signed-certs/v1";
@@ -168,11 +169,12 @@ pub fn import_one(
     if info.is_ca {
         return Err("不能是 CA 憑證".into());
     }
-    if ps::serial_exists(&tx, &info.serial).map_err(|e| e.to_string())? {
+    if tx.serial_exists(&info.serial).map_err(|e| e.to_string())? {
         return Err(format!("序號 {} 已使用過", info.serial));
     }
     let anchor_spki = parse_cert(anchor)?.spki_der;
-    let ca_id = ps::find_ca_by_spki(&tx, &kairos_proto::enroll::sha256(&anchor_spki))
+    let ca_id = tx
+        .find_ca_by_spki(&kairos_proto::enroll::sha256(&anchor_spki))
         .map_err(|e| e.to_string())?
         .map(|c| c.ca_id);
     let cert = CertRow {
@@ -189,8 +191,10 @@ pub fn import_one(
         approved_by: req.decided_by.clone(),
         ..CertRow::default()
     };
-    let e = |e: rusqlite::Error| e.to_string();
-    ps::insert_cert(&tx, &cert).map_err(e)?;
+    fn e(e: impl std::fmt::Display) -> String {
+        e.to_string()
+    }
+    tx.insert_cert(&cert).map_err(e)?;
     es::mark_issued(&tx, &req.request_id, &cert.serial, by, now_ms).map_err(e)?;
     es::upsert_host_on_issue(
         &tx,
@@ -224,7 +228,8 @@ pub fn import_one(
 
 /// 目前的信任錨（DER）：`auth.client_ca` 的檔案與 Kairos 的簽發 CA
 pub fn anchors(conn: &Connection, client_ca: Option<&str>) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = ps::trust_anchor_cas(conn)
+    let mut out: Vec<Vec<u8>> = conn
+        .trust_anchor_cas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|c| c.cert_der)
@@ -302,11 +307,13 @@ pub fn import_existing(
         .iter()
         .find(|a| verify_cert_signature(der, a))
         .ok_or("憑證不是由目前的信任錨直接簽發（auth.client_ca 或 Kairos 的簽發 CA）")?;
-    let e = |e: rusqlite::Error| e.to_string();
+    fn e(e: impl std::fmt::Display) -> String {
+        e.to_string()
+    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(e)?;
-    if let Some(existing) = ps::get_cert(&tx, &info.serial).map_err(e)? {
+    if let Some(existing) = tx.get_cert(&info.serial).map_err(e)? {
         if existing.cert_der == der {
             return Ok(ExistingImport::Already {
                 serial: existing.serial,
@@ -316,7 +323,8 @@ pub fn import_existing(
         return Err(format!("序號 {} 已被另一張憑證使用", info.serial));
     }
     let anchor_spki = parse_cert(anchor)?.spki_der;
-    let ca_id = ps::find_ca_by_spki(&tx, &kairos_proto::enroll::sha256(&anchor_spki))
+    let ca_id = tx
+        .find_ca_by_spki(&kairos_proto::enroll::sha256(&anchor_spki))
         .map_err(e)?
         .map(|c| c.ca_id);
     let cert = CertRow {
@@ -332,7 +340,7 @@ pub fn import_existing(
         approved_by: Some(by.to_string()),
         ..CertRow::default()
     };
-    ps::insert_cert(&tx, &cert).map_err(e)?;
+    tx.insert_cert(&cert).map_err(e)?;
     // 清冊：沒有這台主機時新增；現有的最新憑證比這張早到期時改以這張為最新
     let current: Option<(Option<String>, Option<i64>)> = tx
         .query_row(
@@ -525,7 +533,7 @@ mod import_tests {
             (hostname.as_str(), current.as_str(), source.as_str()),
             (GOOD_ID, serial.as_str(), "cert_import")
         );
-        let c = ps::get_cert(&conn, &serial).unwrap().unwrap();
+        let c = conn.get_cert(&serial).unwrap().unwrap();
         assert_eq!(
             (c.issued_via.as_str(), c.approved_by.as_deref()),
             ("import", Some("root"))

@@ -23,6 +23,7 @@ use crate::pki::store::{self as ps, CA_ACTIVE, CA_RETIRED, CA_TRUSTED, CertRow};
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode};
 use crate::pki::{self, csr::check_csr};
 use crate::settings::Effective;
+use crate::store::prelude::*;
 
 /// 線上簽發的狀態
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +204,7 @@ impl PkiManager {
     /// 由資料庫同步簽發 CA：載入私鑰（線上模式）、更新簽發狀態；信任錨或已退役的簽發 CA 有變化時重寫
     /// `pki/issuing-cas.pem`／`pki/issuing-cas-retired.pem` 並回傳 `true`（呼叫端重建 8443 的 TLS 設定）
     pub fn sync_cas(&self, conn: &Connection) -> Result<bool, DbError> {
-        let cas = ps::list_cas(conn)?;
+        let cas = conn.list_cas()?;
         let retired_changed = self.sync_retired(&cas);
         Ok(self.sync_active(&cas)? | retired_changed)
     }
@@ -391,7 +392,7 @@ impl PkiManager {
             let cert = req
                 .issued_serial
                 .as_deref()
-                .map(|s| ps::get_cert(&tx, s))
+                .map(|s| tx.get_cert(s))
                 .transpose()?
                 .flatten();
             return Ok(match cert {
@@ -415,7 +416,7 @@ impl PkiManager {
         for _ in 0..5 {
             let serial = random_serial().map_err(IssueError::Failed)?;
             let hex = crate::pki::x509::serial_hex(&serial);
-            if ps::serial_exists(&tx, &hex)? {
+            if tx.serial_exists(&hex)? {
                 continue;
             }
             issued = Some(
@@ -446,7 +447,7 @@ impl PkiManager {
             approved_by: Some(by.clone()),
             ..CertRow::default()
         };
-        ps::insert_cert(&tx, &cert)?;
+        tx.insert_cert(&cert)?;
         es::mark_issued(&tx, request_id, &cert.serial, &by, now_ms)?;
         es::upsert_host_on_issue(
             &tx,
@@ -500,11 +501,11 @@ impl PkiManager {
             return Ok(None);
         };
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(ca) = ps::get_ca(&tx, ca_id)? else {
+        let Some(ca) = tx.get_ca(ca_id)? else {
             return Ok(None);
         };
         let number = ca.next_crl_number.max(1);
-        let revoked = ps::revocations_for_crl(&tx, ca_id, now_ms)?;
+        let revoked = tx.revocations_for_crl(ca_id, now_ms)?;
         let next_update = (now_ms + validity_ms).min(issuer.info.not_after_ms);
         let der = issuer
             .sign_crl(
@@ -514,8 +515,7 @@ impl PkiManager {
                 &revoked,
             )
             .map_err(IssueError::Failed)?;
-        ps::record_crl(
-            &tx,
+        tx.record_crl(
             ca_id,
             number,
             now_ms,
@@ -532,8 +532,8 @@ impl PkiManager {
     /// 把各信任錨目前的 CRL 寫入 `pki/crl/issuing.crl`；內容有變化時回傳 `true`
     pub fn write_crl_file(&self, conn: &Connection) -> Result<bool, DbError> {
         let mut pem = String::new();
-        for ca in ps::trust_anchor_cas(conn)? {
-            if let Some(crl) = ps::latest_crl(conn, ca.ca_id)? {
+        for ca in conn.trust_anchor_cas()? {
+            if let Some(crl) = conn.latest_crl(ca.ca_id)? {
                 pem.push_str(&pem_encode("X509 CRL", &crl.der));
             }
         }

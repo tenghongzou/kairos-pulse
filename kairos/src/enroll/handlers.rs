@@ -45,8 +45,9 @@ use super::{EnrollService, ModeState};
 use crate::api::http::ApiBody;
 use crate::per_ip::source_key;
 use crate::pki::csr::check_csr;
-use crate::pki::store::{self as ps, CertRow};
+use crate::pki::store::CertRow;
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode, verify_cert_signature};
+use crate::store::prelude::*;
 
 /// 每個請求的處理上限（長輪詢另加 `wait` 秒）
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -618,7 +619,7 @@ async fn load_request(
                 return Ok(None);
             };
             let cert = match &r.issued_serial {
-                Some(s) => ps::get_cert(conn, s)?,
+                Some(s) => conn.get_cert(s)?,
                 None => None,
             };
             Ok(Some((r, cert)))
@@ -679,7 +680,7 @@ async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>,
             let t = store::token_by_hash(conn, &hash)?;
             let existing = store::request_by_csr(conn, &agent_id, &csr_sha)?;
             let cert = match existing.as_ref().and_then(|r| r.issued_serial.clone()) {
-                Some(s) => ps::get_cert(conn, &s)?,
+                Some(s) => conn.get_cert(&s)?,
                 None => None,
             };
             Ok((t, existing.map(|r| (r, cert))))
@@ -915,7 +916,7 @@ fn pre_assess(
     now: i64,
 ) -> Result<Result<Pre, EnrollError>, DbError> {
     // 公鑰不得是這個 agent_id 先前任何一張憑證的公鑰
-    if ps::spki_used_by_agent(conn, &checked.agent_id, &csr.spki_sha256)? {
+    if conn.spki_used_by_agent(&checked.agent_id, &csr.spki_sha256)? {
         let mut e = EnrollError::new(
             EnrollErrorCode::InvalidCsr,
             "csr public key was already used by a previous certificate of this agent_id",
@@ -925,7 +926,7 @@ fn pre_assess(
     }
     // 異常旗標（S13）
     let host = store::host_enroll(conn, &checked.agent_id)?;
-    let certs = ps::certs_of_agent(conn, &checked.agent_id)?;
+    let certs = conn.certs_of_agent(&checked.agent_id)?;
     // 已有有效憑證：Kairos 簽發的憑證未撤銷、未過期；或清冊中有這台主機、使用手動簽發的憑證
     // （Kairos 不知道它的效期，視為有效）
     let has_valid_cert = certs
@@ -1007,7 +1008,7 @@ fn create_in_tx(
     // 冪等（並行的重送）
     if let Some(r) = store::request_by_csr(&tx, &checked.agent_id, &csr.csr_sha256)? {
         let cert = match &r.issued_serial {
-            Some(s) => ps::get_cert(&tx, s)?,
+            Some(s) => tx.get_cert(s)?,
             None => None,
         };
         return Ok(Ok(Created::Existing(Box::new((r, cert)))));
@@ -1527,12 +1528,12 @@ fn grace_in_tx(
     // 9. 冪等：同一 agent_id＋同一 CSR
     let csr_sha = sha256(&checked.csr_der);
     let host = store::host_enroll(&tx, agent)?;
-    let old_cert = ps::get_cert(&tx, &old.serial)?;
+    let old_cert = tx.get_cert(&old.serial)?;
     if let Some(r) = store::request_by_csr(&tx, agent, &csr_sha)? {
         match r.state {
             DbState::Issued => {
                 let cert = match &r.issued_serial {
-                    Some(s) => ps::get_cert(&tx, s)?,
+                    Some(s) => tx.get_cert(s)?,
                     None => None,
                 };
                 let latest = cert.as_ref().is_some_and(|c| {
@@ -1626,7 +1627,7 @@ fn grace_in_tx(
             return Ok(GraceOutcome::Error(e, false));
         }
     };
-    if csr.spki_der == old.spki_der || ps::spki_used_by_agent(&tx, agent, &csr.spki_sha256)? {
+    if csr.spki_der == old.spki_der || tx.spki_used_by_agent(agent, &csr.spki_sha256)? {
         store::set_last_grace_attempt(&tx, agent, &attempt("invalid_csr"))?;
         tx.commit()?;
         let mut e = EnrollError::new(

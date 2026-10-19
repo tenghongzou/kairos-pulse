@@ -23,6 +23,7 @@ use crate::pki::issue::Reason;
 use crate::pki::store as ps;
 use crate::settings;
 use crate::storage::fmt_time;
+use crate::store::prelude::*;
 use crate::token_cli::{
     Failure, Output, db_failure, human_time, human_time_zoned, open, operator, relative, table,
     zone_label,
@@ -1187,7 +1188,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("revocations"), Some("export")) => crate::pki_cli::revocations_export(cmd, env),
         (Some("issuing-ca"), Some("list")) => {
             let conn = db(cmd)?;
-            let cas = ps::list_cas(&conn).map_err(db_failure)?;
+            let cas = conn.list_cas().map_err(db_failure)?;
             let data: Vec<Value> = cas.iter().map(|c| json!({
                 "ca_id": c.ca_id, "subject": c.subject, "state": c.state,
                 "not_after": c.not_after.map(crate::api::http::ts_ms), "key_file": c.key_file,
@@ -1319,7 +1320,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| usage_err("需要 ca_id"))?;
             let conn = db(cmd)?;
-            let ca = ps::get_ca(&conn, id).map_err(db_failure)?.ok_or_else(|| {
+            let ca = conn.get_ca(id).map_err(db_failure)?.ok_or_else(|| {
                 Failure::new(format!("找不到簽發 CA {id}"), "", Vec::new(), EXIT_GENERAL)
             })?;
             if action == "activate" {
@@ -1331,7 +1332,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                         EXIT_REJECTED,
                     ));
                 }
-                ps::activate_ca(&conn, id).map_err(db_failure)?;
+                conn.activate_ca(id).map_err(db_failure)?;
             } else {
                 if cmd.opt("--confirm") != Some("重建 CA") {
                     return Err(usage_err(
@@ -1346,7 +1347,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                         EXIT_REJECTED,
                     ));
                 }
-                ps::retire_ca(&conn, id, now_ms).map_err(db_failure)?;
+                conn.retire_ca(id, now_ms).map_err(db_failure)?;
             }
             let _ = store::audit(
                 &conn,
@@ -1393,7 +1394,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let grace = settings::effective(&config, &overrides)
                 .policy
                 .expired_renew_grace_days;
-            let rows = ps::list_certs(&conn, 1_000_000, None).map_err(db_failure)?;
+            let rows = conn.list_certs(1_000_000, None).map_err(db_failure)?;
             let within = cmd
                 .opt("--expires-within")
                 .map(|v| {
@@ -1453,7 +1454,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 if kairos_proto::is_uuid_text(target) {
                     let id = target.to_ascii_lowercase();
                     serials.extend(
-                        ps::certs_of_agent(&conn, &id)
+                        conn.certs_of_agent(&id)
                             .map_err(db_failure)?
                             .into_iter()
                             .filter(|c| c.revoked_at.is_none() && c.not_after > now_ms)

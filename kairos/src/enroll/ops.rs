@@ -12,8 +12,9 @@ use serde_json::{Value, json};
 use super::store::{self, Audit, DbKind, DbState, RequestRow, TokenRow, TokenState};
 use crate::per_ip::cidr::Cidr;
 use crate::pki::issue::Reason;
-use crate::pki::store::{self as ps, Revoke};
+use crate::pki::store::Revoke;
 use crate::settings;
+use crate::store::prelude::*;
 
 /// token 預設有效期間（7 天）與上限（90 天）
 pub const DEFAULT_TOKEN_EXPIRY_MS: i64 = 7 * 86_400_000;
@@ -465,7 +466,7 @@ pub fn revoke(
     for serial in serials {
         let serial = serial.trim().to_ascii_uppercase();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = match ps::revoke(&tx, &serial, now_ms, now_ms, reason, by, Some(comment))? {
+        let result = match tx.revoke(&serial, now_ms, now_ms, reason, by, Some(comment))? {
             Revoke::Now(c) => RevokeResult::Revoked { ca_id: c.ca_id },
             Revoke::Already(_) => RevokeResult::Already,
             Revoke::NotFound => RevokeResult::NotFound,

@@ -422,7 +422,8 @@ pub fn revoke_active_certificates(
     now_ms: i64,
 ) -> rusqlite::Result<Vec<String>> {
     use crate::pki::issue::Reason;
-    use crate::pki::store::{self as ps, Revoke};
+    use crate::pki::store::Revoke;
+    use crate::store::sqlite::pki as ps;
     let serials: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT serial FROM pki_certificates

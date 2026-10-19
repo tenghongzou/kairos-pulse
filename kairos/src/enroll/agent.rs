@@ -18,8 +18,9 @@ use super::pki_mgr::{IssueError, IssueOutcome};
 use super::store::{self, Audit, DbKind, DbState, RequestRow};
 use crate::pki::csr::check_csr;
 use crate::pki::issue::Reason;
-use crate::pki::store::{self as ps, CertRow, Revoke};
+use crate::pki::store::{CertRow, Revoke};
 use crate::pki::x509::pem_encode;
+use crate::store::prelude::*;
 
 /// 8443 上的錯誤（`error` 訊息的 `code` 與 `message`；都不是 fatal）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,14 +82,14 @@ pub fn hello_ack_renew(svc: &EnrollService, client_cert: Option<&[u8]>) -> Hello
     {
         let active_subject = svc
             .db
-            .read_blocking(|conn| Ok(ps::get_ca(conn, ca_id)?.and_then(|c| c.cert_der)))
+            .read_blocking(|conn| Ok(conn.get_ca(ca_id)?.and_then(|c| c.cert_der)))
             .ok()
             .flatten()
             .and_then(|der| crate::pki::x509::parse_cert(&der).ok())
             .map(|i| i.subject_raw);
         let issued_by_kairos = svc
             .db
-            .read_blocking(|conn| Ok(ps::get_cert(conn, &info.serial)?.is_some()))
+            .read_blocking(|conn| Ok(conn.get_cert(&info.serial)?.is_some()))
             .unwrap_or(false);
         if issued_by_kairos && active_subject.is_some_and(|s| s != info.issuer_raw) {
             m.renew_now = Some(true);
@@ -111,14 +112,14 @@ pub fn on_hello(svc: &Arc<EnrollService>, agent_id: &str, serial: &str) {
         let revoke_old = svc.effective().policy.revoke_superseded;
         let result = svc.db.write_blocking(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if ps::get_cert(&tx, &serial)?.is_none() || !ps::mark_first_used(&tx, &serial, now)? {
+            if tx.get_cert(&serial)?.is_none() || !tx.mark_first_used(&serial, now)? {
                 return Ok(Vec::new());
             }
             let mut revoked = Vec::new();
             if revoke_old {
-                for old in ps::older_unrevoked(&tx, &agent, &serial)? {
+                for old in tx.older_unrevoked(&agent, &serial)? {
                     if let Revoke::Now(_) =
-                        ps::revoke(&tx, &old, now, now, Reason::Superseded, "system", Some("新憑證已開始使用"))?
+                        tx.revoke(&old, now, now, Reason::Superseded, "system", Some("新憑證已開始使用"))?
                     {
                         store::audit(
                             &tx,
@@ -197,7 +198,7 @@ pub async fn renew(
             if let Some(r) = store::request_by_csr(&tx, &agent, &csr.csr_sha256)? {
                 return Ok(Ok(r));
             }
-            if ps::spki_used_by_agent(&tx, &agent, &csr.spki_sha256)? {
+            if tx.spki_used_by_agent(&agent, &csr.spki_sha256)? {
                 return Ok(Err(AgentError::new(
                     ErrorCode::InvalidCsr,
                     "the new key must differ from previous keys of this agent_id",
@@ -284,7 +285,7 @@ pub async fn renew(
         DbState::Issued => {
             let serial = created.issued_serial.clone().unwrap_or_default();
             svc.db
-                .read(move |conn| Ok(ps::get_cert(conn, &serial)?))
+                .read(move |conn| Ok(conn.get_cert(&serial)?))
                 .await
                 .map_err(|_| storage())?
         }
@@ -363,8 +364,7 @@ pub async fn deregister(
             let at = host.and_then(|h| h.decommissioned_at).unwrap_or(now);
             let mut revoked = false;
             if revoke && let Some(serial) = &serial {
-                match ps::revoke(
-                    &tx,
+                match tx.revoke(
                     serial,
                     now,
                     now + super::DEREGISTER_WINDOW_MS,
