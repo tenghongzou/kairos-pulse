@@ -4,8 +4,8 @@
 //! 有 label 的序列分開；點數超過上限時把相鄰的點合併成較大的桶。彙總表中尚未寫出的最新部分
 //! （主機的 `rollup_until` 之後）由原始資料即時計算。所有查詢在同一個讀取交易中（一致的快照）。
 
+use crate::store::prelude::*;
 use chrono::{DateTime, Days, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -196,24 +196,15 @@ struct Group {
 
 /// 原始資料的一筆 report：取樣時間與（序列 → 值）
 fn read_reports(
-    conn: &Connection,
+    conn: &dyn Store,
     host_id: i64,
     from_ms: i64,
     to_ms: i64,
     legacy: [Option<i64>; 3],
     mut f: impl FnMut(i64, &HashMap<i64, serde_json::Number>),
-) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT ts, format, body FROM reports WHERE host_id = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts",
-    )?;
-    let mut rows = stmt.query(params![host_id, from_ms, to_ms])?;
+) -> StoreResult<()> {
     let mut values: HashMap<i64, serde_json::Number> = HashMap::new();
-    while let Some(r) = rows.next()? {
-        let t: i64 = r.get(0)?;
-        let format: i64 = r.get(1)?;
-        let rusqlite::types::ValueRef::Blob(body) = r.get_ref(2)? else {
-            continue;
-        };
+    conn.for_each_report(host_id, from_ms, to_ms, &mut |t, format, body| {
         values.clear();
         match format {
             FORMAT_LEGACY => {
@@ -233,11 +224,10 @@ fn read_reports(
             FORMAT_METRICS => {
                 values.extend(codec::decode_metrics(body).unwrap_or_default());
             }
-            _ => continue,
+            _ => return,
         }
         f(t, &values);
-    }
-    Ok(())
+    })
 }
 
 /// 合併成 `bucket_secs` 的桶
@@ -260,54 +250,15 @@ fn regroup(points: &[Point], bucket_secs: i64) -> Vec<Point> {
     out
 }
 
-/// 這台主機這個名稱的序列：(series_id, unit, labels, derived)。v8 起以 `host_series` 只列出這台主機
-/// 用過的序列；沒有對應時（例如 v7 升級時只出現在原始資料、尚未彙總的序列）改列出這個名稱的所有序列
-fn host_series_of(
-    conn: &Connection,
-    host_id: i64,
-    name: &str,
-) -> rusqlite::Result<Vec<(i64, String, String, i64)>> {
-    let collect = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<Vec<_>> {
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(p, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-        rows.collect()
-    };
-    let list = collect(
-        "SELECT s.series_id, s.unit, s.labels, s.derived FROM series s
-         JOIN host_series h USING (series_id) WHERE h.host_id = ?1 AND s.name = ?2",
-        &[&host_id, &name],
-    )?;
-    if !list.is_empty() {
-        return Ok(list);
-    }
-    collect(
-        "SELECT series_id, unit, labels, derived FROM series WHERE name = ?1",
-        &[&name],
-    )
-}
-
-fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, ApiError> {
+fn run_query(conn: &dyn Store, q: &TrendQuery) -> Result<Option<TrendResult>, ApiError> {
     let failed = query_failed("指標趨勢");
     // 一致的快照：rollup_until、彙總與原始資料在同一個讀取交易中
-    let tx = conn.unchecked_transaction().map_err(&failed)?;
-    let Some((host_id, rollup_until, interval)) = tx
-        .query_row(
-            "SELECT host_id, rollup_until, report_interval_ms FROM hosts WHERE agent_id = ?1",
-            [&q.agent_id],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(&failed)?
+    let tx = conn.begin(TxMode::Deferred).map_err(&failed)?;
+    let Some((host_id, rollup_until, interval)) = tx.trend_host(&q.agent_id).map_err(&failed)?
     else {
         return Ok(None);
     };
-    let mut series = host_series_of(&tx, host_id, &q.name).map_err(&failed)?;
+    let mut series = tx.host_series(host_id, &q.name).map_err(&failed)?;
     if series.is_empty() {
         return Err(ApiError::new(
             hyper::StatusCode::NOT_FOUND,
@@ -386,8 +337,12 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
     }
     // 推算的使用率：原始資料中以同一組 label 的 total、available 計算（彙總中已有推算序列）
     if q.name == METRIC_FILESYSTEM_USAGE {
-        let totals = host_series_of(&tx, host_id, METRIC_FILESYSTEM_TOTAL).map_err(&failed)?;
-        let avails = host_series_of(&tx, host_id, METRIC_FILESYSTEM_AVAILABLE).map_err(&failed)?;
+        let totals = tx
+            .host_series(host_id, METRIC_FILESYSTEM_TOTAL)
+            .map_err(&failed)?;
+        let avails = tx
+            .host_series(host_id, METRIC_FILESYSTEM_AVAILABLE)
+            .map_err(&failed)?;
         for (tid, tunit, labels, tder) in &totals {
             if *tder != 0 || tunit != "By" {
                 continue;
@@ -429,24 +384,11 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
         (METRIC_MEMORY_USED, "By"),
     ]) {
         if name == q.name {
-            *slot = tx
-                .query_row(
-                    "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = '' AND derived = 0",
-                    params![name, unit],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(&failed)?;
+            *slot = tx.standard_series_id(name, unit).map_err(&failed)?;
         }
     }
     let uptime_id: Option<i64> = if groups.iter().any(|g| g.counter.is_some()) {
-        tx.query_row(
-            "SELECT series_id FROM series WHERE name = ?1 AND unit = 's' AND labels = '' AND derived = 0",
-            [METRIC_UPTIME],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(&failed)?
+        tx.uptime_series_id(METRIC_UPTIME).map_err(&failed)?
     } else {
         None
     };
@@ -466,7 +408,7 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
     };
 
     // 原始資料：每條輸出序列在 [from, to) 的 (時間, 值, 是否推算)
-    let read_raw_points = |from: i64, to: i64| -> rusqlite::Result<Vec<Vec<(i64, f64, bool)>>> {
+    let read_raw_points = |from: i64, to: i64| -> StoreResult<Vec<Vec<(i64, f64, bool)>>> {
         let mut out: Vec<Vec<(i64, f64, bool)>> = groups.iter().map(|_| Vec::new()).collect();
         // 計數器的上一筆：from 之前最近的一筆 report
         let mut prev: Vec<Option<CounterSample>> = groups.iter().map(|_| None).collect();
@@ -516,18 +458,12 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
             }
         };
         if need_prev {
-            let seed: Option<i64> = tx
-                .query_row(
-                    "SELECT ts FROM reports WHERE host_id = ?1 AND ts < ?2 ORDER BY ts DESC LIMIT 1",
-                    params![host_id, from],
-                    |r| r.get(0),
-                )
-                .optional()?;
+            let seed: Option<i64> = tx.report_ts_before(host_id, from)?;
             if let Some(t) = seed {
-                read_reports(&tx, host_id, t, t + 1, legacy, |t, v| step(t, v, false))?;
+                read_reports(&*tx, host_id, t, t + 1, legacy, |t, v| step(t, v, false))?;
             }
         }
-        read_reports(&tx, host_id, from, to, legacy, |t, v| step(t, v, true))?;
+        read_reports(&*tx, host_id, from, to, legacy, |t, v| step(t, v, true))?;
         Ok(out)
     };
 
@@ -568,31 +504,19 @@ fn run_query(conn: &Connection, q: &TrendQuery) -> Result<Option<TrendResult>, A
                 }
             };
             let from_bucket = bucket_start(q.from_ms, secs);
-            {
-                let mut stmt = tx
-                    .prepare(&format!(
-                        "SELECT bucket, series_id, vmin, vmax, vsum, cnt FROM {table}
-                         WHERE host_id = ?1 AND bucket >= ?2 AND bucket < ?3"
-                    ))
-                    .map_err(&failed)?;
-                let mut rows = stmt
-                    .query(params![host_id, from_bucket, q.to_ms.div_euclid(1000)])
-                    .map_err(&failed)?;
-                while let Some(r) = rows.next().map_err(&failed)? {
-                    let id: i64 = r.get(1).map_err(&failed)?;
-                    let Some(&(i, est)) = by_id.get(&id) else {
-                        continue;
-                    };
-                    let agg = Agg {
-                        min: r.get(2).map_err(&failed)?,
-                        max: r.get(3).map_err(&failed)?,
-                        sum: r.get(4).map_err(&failed)?,
-                        count: u64::try_from(r.get::<_, i64>(5).map_err(&failed)?).unwrap_or(0),
-                    };
-                    let bucket: i64 = r.get(0).map_err(&failed)?;
-                    put(buckets[i].entry(bucket).or_default(), agg, est);
-                }
-            }
+            tx.for_each_rollup(
+                table,
+                host_id,
+                from_bucket,
+                q.to_ms.div_euclid(1000),
+                &|id| by_id.contains_key(&id),
+                &mut |bucket, id, agg| {
+                    if let Some(&(i, est)) = by_id.get(&id) {
+                        put(buckets[i].entry(bucket).or_default(), agg, est);
+                    }
+                },
+            )
+            .map_err(&failed)?;
             // 尚未寫出彙總的最新部分：由原始資料計算
             let tail_from = (from_bucket * 1000).max(rollup_until);
             if q.to_ms > tail_from {
@@ -906,31 +830,12 @@ pub async fn trend(
 type Available = (Vec<Value>, Option<i64>);
 
 /// 這台主機目前回報的指標：最近一次原始 report 中的序列；沒有原始資料時取最近 7 天的 1 小時彙總
-fn available(
-    conn: &Connection,
-    agent_id: &str,
-    now_ms: i64,
-) -> Result<Option<Available>, ApiError> {
+fn available(conn: &dyn Store, agent_id: &str, now_ms: i64) -> Result<Option<Available>, ApiError> {
     let failed = query_failed("指標清單");
-    let Some(host_id) = conn
-        .query_row(
-            "SELECT host_id FROM hosts WHERE agent_id = ?1",
-            [agent_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(&failed)?
-    else {
+    let Some(host_id) = conn.host_id_of(agent_id).map_err(&failed)? else {
         return Ok(None);
     };
-    let latest: Option<(i64, i64, Vec<u8>)> = conn
-        .query_row(
-            "SELECT ts, format, body FROM reports WHERE host_id = ?1 ORDER BY ts DESC LIMIT 1",
-            [host_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()
-        .map_err(&failed)?;
+    let latest: Option<(i64, i64, Vec<u8>)> = conn.latest_report(host_id).map_err(&failed)?;
     let (as_of, ids): (Option<i64>, Vec<i64>) = match latest {
         Some((t, FORMAT_LEGACY, _)) => {
             let mut ids = Vec::new();
@@ -939,15 +844,7 @@ fn available(
                 (METRIC_MEMORY_TOTAL, "By"),
                 (METRIC_MEMORY_USED, "By"),
             ] {
-                if let Some(id) = conn
-                    .query_row(
-                        "SELECT series_id FROM series WHERE name = ?1 AND unit = ?2 AND labels = '' AND derived = 0",
-                        params![name, unit],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(&failed)?
-                {
+                if let Some(id) = conn.standard_series_id(name, unit).map_err(&failed)? {
                     ids.push(id);
                 }
             }
@@ -961,38 +858,15 @@ fn available(
                 .map(|(id, _)| id)
                 .collect(),
         ),
-        None => {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT DISTINCT series_id FROM rollup_1h WHERE host_id = ?1 AND bucket >= ?2",
-                )
-                .map_err(&failed)?;
-            let rows = stmt
-                .query_map(params![host_id, now_ms / 1000 - 7 * 86_400], |r| r.get(0))
-                .map_err(&failed)?;
-            (
-                None,
-                rows.collect::<rusqlite::Result<_>>().map_err(&failed)?,
-            )
-        }
+        None => (
+            None,
+            conn.recent_rollup_series(host_id, now_ms / 1000 - 7 * 86_400)
+                .map_err(&failed)?,
+        ),
     };
     let mut out: Vec<(String, String, String, Option<&'static str>)> = Vec::new();
-    let mut stmt = conn
-        .prepare("SELECT name, unit, labels, derived FROM series WHERE series_id = ?1")
-        .map_err(&failed)?;
     for id in ids {
-        if let Some((name, unit, labels, derived)) = stmt
-            .query_row([id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })
-            .optional()
-            .map_err(&failed)?
-        {
+        if let Some((name, unit, labels, derived)) = conn.series_info(id).map_err(&failed)? {
             match derived {
                 // 彙總中的速率序列代表原本的計數器（v8 起計數器只彙總速率）
                 DERIVED_RATE => {

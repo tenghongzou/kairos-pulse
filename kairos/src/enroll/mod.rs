@@ -33,7 +33,6 @@ mod tests;
 
 use kairos_proto::enroll::EnrollMode;
 use log::{debug, error, info, warn};
-use rusqlite::Connection;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -47,6 +46,7 @@ use crate::config::{AppConfig, PkiMode};
 use crate::per_ip::Allowlist;
 use crate::settings::{self, Effective};
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 use db::{DbError, EnrollDb};
 use limits::{Block, Gcra, InvalidClass, InvalidPolicy, InvalidTracker, Keyed, Slots};
 use pki_mgr::{IssueStatus, PkiManager};
@@ -266,13 +266,9 @@ impl EnrollService {
         let now = (p.clock)();
         let (overrides, blocks, decommissioned, rows) = db
             .write_blocking(|conn| {
-                let rows = store::load_settings(conn)?;
-                let blocks = store::load_blocks(conn)?;
-                let mut stmt =
-                    conn.prepare("SELECT agent_id FROM hosts WHERE lifecycle = 'decommissioned'")?;
-                let decom: HashSet<String> = stmt
-                    .query_map([], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
+                let rows = conn.load_settings()?;
+                let blocks = conn.load_blocks()?;
+                let decom: HashSet<String> = conn.decommissioned_agents()?;
                 Ok((settings::overrides_from(&rows), blocks, decom, rows))
             })
             .map_err(|e| format!("無法讀取註冊設定：{e}"))?;
@@ -529,15 +525,10 @@ impl EnrollService {
     /// 從資料庫更新 [`EnrollService::is_revoked_external`] 的清單（撤銷已生效、憑證過期未超過 1 天）
     fn refresh_revoked_external(&self, now: i64) {
         let r = self.db.read_blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT serial FROM pki_certificates WHERE ca_id IS NULL AND revoked_at IS NOT NULL
-                 AND revoke_effective_at <= ?1 AND not_after > ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![now, now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS],
-                |r| r.get::<_, String>(0),
-            )?;
-            Ok(rows.collect::<rusqlite::Result<HashSet<String>>>()?)
+            Ok(conn.revoked_external_serials(
+                now,
+                now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS,
+            )?)
         });
         match r {
             Ok(set) => {
@@ -618,10 +609,8 @@ impl EnrollService {
             let result = self
                 .db
                 .write(move |conn| {
-                    store::upsert_block(conn, &row)?;
-                    store::audit(
-                        conn,
-                        now,
+                    conn.upsert_block(&row)?;
+                    conn.audit(now,
                         &Audit {
                             actor: "system",
                             actor_ip: Some(&audit_source),
@@ -645,8 +634,8 @@ impl EnrollService {
     // ---- 背景工作 ----
 
     /// 重新讀取 `settings` 表；模式或政策改變時記錄
-    fn refresh_settings(&self, conn: &Connection) -> Result<(), DbError> {
-        let rows = store::load_settings(conn)?;
+    fn refresh_settings(&self, conn: &dyn Store) -> Result<(), DbError> {
+        let rows = conn.load_settings()?;
         let eff = settings::effective(&self.config, &settings::overrides_from(&rows));
         let mut cur = self.effective.write().unwrap_or_else(|e| e.into_inner());
         if cur.mode != eff.mode {
@@ -675,8 +664,9 @@ impl EnrollService {
     fn evaluate_pause(&self, now: i64) {
         let eff = self.effective();
         let computed = self.db.read_blocking(|conn| {
-            let (active, last_end) = store::token_validity(conn, now)?;
-            let open_since = store::load_settings(conn)?
+            let (active, last_end) = conn.token_validity(now)?;
+            let open_since = conn
+                .load_settings()?
                 .into_iter()
                 .find(|(k, ..)| k == settings::KEY_OPEN_SINCE)
                 .and_then(|(_, v, ..)| v.as_i64());
@@ -714,8 +704,7 @@ impl EnrollService {
         };
         info!("{text}");
         let _ = self.db.write_blocking(|conn| {
-            store::audit(
-                conn,
+            conn.audit(
                 now,
                 &Audit {
                     actor: "system",
@@ -738,12 +727,12 @@ impl EnrollService {
             let mut changed = self.pki.sync_cas(conn)?;
             // 需要重新產生 CRL 的 CA：有已生效但未收錄的撤銷、沒有 CRL、nextUpdate 在 7 天內，
             // 或超過 crl_refresh_hours 沒有更新
-            let pending: HashSet<i64> =
-                crate::pki::store::ca_ids_with_pending_revocations(conn, now)?
-                    .into_iter()
-                    .collect();
+            let pending: HashSet<i64> = conn
+                .ca_ids_with_pending_revocations(now)?
+                .into_iter()
+                .collect();
             for ca_id in self.pki.issuer_ids() {
-                let latest = crate::pki::store::latest_crl(conn, ca_id)?;
+                let latest = conn.latest_crl(ca_id)?;
                 let due = match &latest {
                     None => true,
                     Some(c) => {
@@ -787,12 +776,13 @@ impl EnrollService {
     }
 
     /// `KRS-W1304` 的門檻（毫秒）：設定值，或「政策有效天數（含有效 token 覆寫中最長者）＋過期寬限期」
-    pub fn issuing_ca_warning_ms(&self, conn: &Connection, now: i64) -> i64 {
+    pub fn issuing_ca_warning_ms(&self, conn: &dyn Store, now: i64) -> i64 {
         if let Some(d) = self.config.pki.issuing_ca_warning_days {
             return i64::from(d) * 86_400_000;
         }
         let eff = self.effective();
-        let longest_token = store::list_tokens(conn)
+        let longest_token = conn
+            .list_tokens()
             .map(|ts| {
                 ts.iter()
                     .filter(|t| t.state(now) == store::TokenState::Active)
@@ -806,8 +796,9 @@ impl EnrollService {
     }
 
     /// 啟用中的簽發 CA 剩餘時間少於門檻時記 `KRS-W1304`（每 24 小時最多一次）；回傳 (ca_id, 到期時間)
-    fn check_issuing_ca_expiry(&self, conn: &Connection, now: i64) -> Option<(i64, i64)> {
-        let ca = crate::pki::store::list_cas(conn)
+    fn check_issuing_ca_expiry(&self, conn: &dyn Store, now: i64) -> Option<(i64, i64)> {
+        let ca = conn
+            .list_cas()
             .ok()?
             .into_iter()
             .find(|c| c.state == crate::pki::store::CA_ACTIVE)?;
@@ -881,7 +872,7 @@ impl EnrollService {
         let states = self.db.read_blocking(move |conn| {
             let mut out = HashMap::new();
             for id in ids {
-                if let Some(r) = store::get_request(conn, &id)? {
+                if let Some(r) = conn.get_request(&id)? {
                     out.insert(id, r.state.as_str().to_string());
                 }
             }
@@ -927,9 +918,9 @@ impl EnrollService {
                 .retain(|_, (_, exp)| *exp > now);
             let mut batch = self.config.enroll.batch_sources.clone();
             let extra = self.db.write_blocking(|conn| {
-                store::replay_purge(conn, now)?;
-                let mut v = store::active_relaxations(conn, now)?;
-                v.extend(store::batch_token_cidrs(conn, now)?);
+                conn.replay_purge(now)?;
+                let mut v = conn.active_relaxations(now)?;
+                v.extend(conn.batch_token_cidrs(now)?);
                 Ok(v)
             });
             if let Ok(extra) = extra {
@@ -951,16 +942,13 @@ impl EnrollService {
             drop(last_hour);
             let audit_keep_ms = i64::from(self.config.audit.retention_days) * 86_400_000;
             let result = self.db.write_blocking(move |conn| {
-                let (expired, purged) = store::expire_and_purge(conn, now, CLOSED_KEEP_MS)?;
-                store::purge_blocks(conn, now)?;
-                store::purge_relaxations(conn, now)?;
-                store::purge_audit(conn, now - audit_keep_ms, now)?;
-                conn.execute(
-                    "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
-                    [now - 400 * 86_400_000],
-                )?;
+                let (expired, purged) = conn.expire_and_purge(now, CLOSED_KEEP_MS)?;
+                conn.purge_blocks(now)?;
+                conn.purge_relaxations(now)?;
+                conn.audit_purge(now - audit_keep_ms, now)?;
+                conn.purge_old_tokens(now - 400 * 86_400_000)?;
                 // 刪除主機資料時為了 CRL 保留的已撤銷憑證：過期超過 1 天後刪除（PRIVACY.md 第 4 節）
-                crate::store::purge::delete_orphan_certificates(conn, now)?;
+                conn.delete_orphan_certificates(now)?;
                 Ok((expired, purged))
             });
             match result {

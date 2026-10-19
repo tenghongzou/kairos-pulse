@@ -15,7 +15,8 @@ use std::time::Duration;
 use crate::enroll_cli::{
     Cmd, EXIT_CONFLICT, EXIT_GENERAL, EXIT_USAGE, Env, load_config, mark, ok_json, usage_err,
 };
-use crate::store::purge::{self, CODE_PURGE_FAILED, PurgeCounts, PurgeJob};
+use crate::store::db::DbHandle;
+use crate::store::purge::{CODE_PURGE_FAILED, PurgeCounts, PurgeJob};
 use crate::store::sqlite::{DB_FILE, SqliteOptions};
 use crate::token_cli::{Failure, Output, db_failure, operator};
 
@@ -81,8 +82,8 @@ fn data_dir(cmd: &Cmd) -> Result<(crate::config::AppConfig, PathBuf), Failure> {
     Ok((config, dir))
 }
 
-fn open_read_only(dir: &Path) -> Result<rusqlite::Connection, Failure> {
-    crate::store::sqlite::open_read_only(&dir.join(DB_FILE)).map_err(db_failure)
+fn open_read_only(dir: &Path) -> Result<DbHandle, Failure> {
+    crate::store::open_read(&dir.join(DB_FILE)).map_err(db_failure)
 }
 
 fn counts_text(c: &PurgeCounts) -> String {
@@ -99,7 +100,7 @@ fn purge_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     let now_ms = env.now.timestamp_millis();
     if cmd.flag("--dry-run") {
         let conn = open_read_only(&dir)?;
-        let c = purge::plan(&conn, &agent_id, now_ms).map_err(db_failure)?;
+        let c = conn.purge_plan(&agent_id, now_ms).map_err(db_failure)?;
         if c.total() == 0 {
             return Err(not_found(&agent_id));
         }
@@ -128,7 +129,7 @@ fn purge_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         return Err(f);
     }
     let opts = SqliteOptions::from_config(&config, &dir);
-    let mut conn = crate::store::sqlite::open_exclusive(&opts, Duration::from_secs(2)).map_err(|e| {
+    let conn = crate::store::open_exclusive(&opts, Duration::from_secs(2)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::ResourceBusy {
             Failure {
                 code: Some("KRS-E4304"),
@@ -146,17 +147,11 @@ fn purge_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             db_failure(e)
         }
     })?;
-    let c = purge::plan(&conn, &agent_id, now_ms).map_err(db_failure)?;
+    let c = conn.purge_plan(&agent_id, now_ms).map_err(db_failure)?;
     if c.total() == 0 {
         return Err(not_found(&agent_id));
     }
-    let hostname: Option<String> = conn
-        .query_row(
-            "SELECT hostname FROM hosts WHERE agent_id = ?1",
-            [&agent_id],
-            |r| r.get(0),
-        )
-        .ok();
+    let hostname: Option<String> = conn.host_names(&agent_id).ok().flatten().map(|(h, _)| h);
     let want = hostname.clone().unwrap_or_else(|| agent_id.clone());
     if cmd.flag("--yes") {
         if cmd.opt("--confirm").map(str::trim) != Some(want.as_str()) {
@@ -185,19 +180,21 @@ fn purge_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         }
     }
     let actor = operator();
-    let revoked = purge::revoke_active_certificates(&conn, &agent_id, &actor, None, now_ms)
+    let revoked = conn
+        .revoke_active_certificates(&agent_id, &actor, None, now_ms)
         .map_err(db_failure)?;
     let mut job = PurgeJob::new(&agent_id, &actor, None, cmd.opt("--reason"));
     job.revoked = revoked.clone();
-    purge::run_to_end(&mut conn, &mut job, now_ms).map_err(|e| Failure {
-        code: Some(CODE_PURGE_FAILED),
-        ..Failure::new(
-            "刪除沒有完成",
-            format!("資料庫錯誤：{e}"),
-            vec!["已刪除的部分不會復原；修正後重新執行同一個命令即可接續完成。".into()],
-            EXIT_GENERAL,
-        )
-    })?;
+    conn.purge_run_to_end(&mut job, now_ms)
+        .map_err(|e| Failure {
+            code: Some(CODE_PURGE_FAILED),
+            ..Failure::new(
+                "刪除沒有完成",
+                format!("資料庫錯誤：{e}"),
+                vec!["已刪除的部分不會復原；修正後重新執行同一個命令即可接續完成。".into()],
+                EXIT_GENERAL,
+            )
+        })?;
     drop(conn);
     let d = &job.counts;
     if cmd.json {
@@ -237,12 +234,12 @@ fn export_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         None => return Err(not_found(&agent_id)),
     };
     let now_ms = env.now.timestamp_millis();
-    let doc = crate::privacy::personal_data(&conn, &agent_id, &config.privacy, now_ms)
+    let doc = conn
+        .personal_data(&agent_id, &config.privacy, now_ms)
         .map_err(db_failure)?
         .ok_or_else(|| not_found(&agent_id))?;
     let actor = operator();
-    crate::audit::append(
-        &conn,
+    conn.audit_append(
         now_ms,
         &crate::audit::Audit {
             actor: &actor,
@@ -446,7 +443,7 @@ mod tests {
         assert_eq!(o.exit, EXIT_GENERAL);
         let conn = open_read_only(&dir.join("data")).unwrap();
         let n: i64 = conn
-            .query_row(
+            .test_sqlite().query_row(
                 "SELECT COUNT(*) FROM audit_events WHERE object = ?1 AND action IN ('host.purge', 'host.personal_data.export')",
                 [A],
                 |r| r.get(0),

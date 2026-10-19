@@ -672,3 +672,64 @@ sudo systemctl start kairos
 - **`kairos hosts purge`**：以 `locking_mode = EXCLUSIVE` 開啟資料庫（與第 13.1 節的匯入相同），Kairos 執行中時 `KRS-E4304`（結束代碼 11）；`--dry-run` 以唯讀連線計數。
 - **不涵蓋**：JSONL 鏡像（第 1 節）、備份（第 9 節）、日誌。
 - 測試：`store::purge::tests`（兩台主機只刪一台、計數與試執行相同、憑證的保留、稽核與完整性驗證、刪除後的寫入被拒、少量額度的多步刪除）、`api::privacy_tests`、`privacy_cli::tests`、端對端 `tests/e2e/tests/privacy.rs`。
+
+## 17. 儲存層的結構（0.9.0〔草稿〕；HA L1a）
+
+0.9.0 把「各模組直接用 rusqlite」改為領域 store 介面（[`HA.md`](HA.md) 第 5 節的 L1a），為之後的 PostgreSQL 後端（L1b，0.10.0）準備。**純重構**：schema（仍為 v8）、SQL、交易邊界、錯誤訊息與代碼、API 回應、CLI 輸出都沒有改變；report 的寫入路徑（第 1、4 節）完全沒有動。
+
+```text
+呼叫端（api/、enroll/、alerts/、pki/、*_cli.rs、audit_monitor、probe、diag、export）
+  │ &dyn Store（連線池的 closure）或 DbHandle（CLI）；只呼叫領域方法，不寫 SQL
+  ▼
+store/db.rs：trait Store ＝ SettingsStore ＋ AuditLog ＋ UserStore ＋ TokenStore ＋ PkiStore
+             ＋ EnrollStore ＋ AlertStore ＋ HostStore ＋ ApiQueries ＋ AdminStore，加上 begin(TxMode)
+             trait Tx：交易中的 Store（commit；沒有 commit 就 drop 時回復）
+             StoreError（訊息與後端相同）、StoreErrorKind、in_write_tx
+  ▼
+store/sqlite/conn.rs：rusqlite::Connection 與 Transaction 實作 Store／Tx（AsConn＋blanket impl；
+                      forward! 巨集把每個領域方法轉呼叫到下列檔案中原本的函式）
+store/sqlite/{audit,users,tokens,pki,enroll,alerts,hosts,api,admin}.rs：原封不動搬來的 SQL
+```
+
+- **領域介面與位置**：
+
+  | trait | 定義 | 內容 |
+  |---|---|---|
+  | `SettingsStore` | `settings.rs` | `settings` 表、`meta` 的鍵值 |
+  | `AuditLog` | `audit.rs` | 稽核雜湊鏈的寫入、驗證、查詢、匯出、清除 |
+  | `UserStore` | `users/store.rs` | 帳號、角色指派、工作階段、TOTP |
+  | `TokenStore` | `api/tokens.rs` | `api_tokens` |
+  | `PkiStore` | `pki/store.rs` | 簽發 CA、憑證、撤銷、CRL |
+  | `EnrollStore` | `enroll/store.rs` | 註冊 token、申請、重放快取、封鎖、清冊中的註冊欄位 |
+  | `AlertStore` | `alerts/store.rs` | 規則、事件、靜音、管道、發送紀錄、動作佇列、規則試算的查詢 |
+  | `HostStore` | `store/hosts.rs` | 清冊與 report／彙總的讀取、資產、資料庫大小、備份、匯出、刪除主機資料 |
+  | `ApiQueries` | `store/api.rs` | 主控台畫面的跨表查詢（主機清單與詳情、憑證所屬主機） |
+  | `AdminStore` | `store/admin.rs` | 個資匯出、診斷包的摘要 |
+
+  report 的寫入仍是 `ReportStore`（單一 writer，`SqliteStore`）。
+- **交易**：`Store::begin(TxMode::Deferred)` 與 `TxMode::Immediate` 送出與原本相同的 `BEGIN DEFERRED`／`BEGIN IMMEDIATE`（以 `rusqlite::Transaction::new_unchecked` 實作，不需要 `&mut`）。原本依賴 SQLite 全域寫入鎖的操作（HA.md 第 2.2 節 D1～D9）都還在 `TxMode::Immediate` 的交易中，各 trait 的說明寫明了交易要求（例如 `EnrollStore` 的 D2～D4、`PkiStore` 的 D5、`AlertStore` 的 D6、D7、`AuditLog` 的 D1）。`store::db::in_write_tx` 取代原本 `audit::in_write_tx`（已在交易中時沿用，否則開 `BEGIN IMMEDIATE`）。
+- **連線**：主控台的唯讀池與低頻寫入（`api/db.rs`）、註冊服務的連線（`enroll/db.rs`）改持有 `DbHandle`（`Box<dyn Store + Send>`），由 `store::open_read`、`open_console_read`、`open_write` 開啟（開啟方式與 PRAGMA 與原本相同，仍只經由 SQLite 開啟資料庫檔，第 1 節）。CLI 以 `store::open_admin`、`open_exclusive`、`open_read`、`open_for_diag`、`open_for_probe` 開啟。
+- **錯誤**：`StoreError` 包著後端原本的錯誤，`Display` 不變，所以日誌、`storage_unavailable` 的訊息與 CLI 的輸出都與 0.8.0 相同；`io_kind()` 讓 `kairos reports export` 仍能把輸出被關閉（`BrokenPipe`）視為正常結束。
+- **仍直接使用 rusqlite 的地方**（都在 `store/` 內，或只在測試中）：
+
+  | 位置 | 原因 |
+  |---|---|
+  | `store/sqlite.rs`（`SqliteStore`、migration、開啟、`list_hosts`、`export_reports`、`backup_to`） | report 的寫入路徑與 schema 本身是 SQLite 後端；L1b 另寫 `postgres::*` |
+  | `store/sqlite/*.rs` | SQLite 實作（搬來的 SQL） |
+  | `store/import.rs` | `kairos reports import` 以獨占連線、`BEGIN IMMEDIATE` 分批寫入，與 writer 的內部結構（序列、彙總）綁在一起；叢集不支援 JSONL（HA.md 第 21 節 #17），L3 的 `kairos db migrate` 另寫 |
+  | `store/purge.rs`、`store/sqlite_purge.rs` | 刪除主機資料的逐步刪除由 writer 執行，與 writer 的快取綁在一起；呼叫端經由 `HostStore::purge_plan`／`purge_run_to_end` 與 `PkiStore::revoke_active_certificates` 使用 |
+  | 測試（`*_tests.rs`、`tests.rs`、`bench.rs`、各模組的 `mod tests`） | 以 SQL 準備資料或檢查結果；經由連線池時使用 `Store::test_sqlite()`（只在 `cfg(test)`） |
+
+- **量測**：重構前後以第 11 節的 `sqlite_throughput` 比較（同一台 kp-build、同一天），見下表。
+
+  kp-build 2026-10-19，重構前（`78c6abb`）與重構後依序各跑兩次（release；另一條建置線同時在這台機器上編譯，數字有雜訊）：
+
+  | 情境 | 版本 | p50 | p99 | p99.9 | 最大 |
+  |---|---|---|---|---|---|
+  | 每秒 2,000 筆 × 30 秒 | 重構前 #1／#2 | 0.81／0.80 ms | 2.8／2.8 ms | 9.9／10.0 ms | 20.1／20.7 ms |
+  | | 重構後 #1／#2 | 0.81／0.81 ms | 3.2／3.0 ms | 11.7／9.7 ms | 21.4／21.2 ms |
+  | 補送 8,000 筆／秒 × 60 秒（durable、2% 重送、清冊同步） | 重構前 #1／#2 | 1.84／1.92 ms | 55.3／55.8 ms | 99.9／107.6 ms | 125.1／127.9 ms |
+  | | 重構後 #1／#2 | 1.87／1.90 ms | 54.6／50.9 ms | 99.6／98.8 ms | 125.6／125.9 ms |
+
+  兩種情境都全部寫入（重送的 9,600 筆皆為 `Duplicate`），沒有 `storage_unavailable` 與結果不明。差異在兩次量測之間的波動範圍內：report 的寫入路徑（`SqliteStore`）沒有經過新的介面，重構不影響它。
+

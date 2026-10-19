@@ -41,6 +41,17 @@ use crate::storage::{Clock, RecordBody, ReportRecord, WriteStatus};
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
 
+pub(crate) mod admin;
+pub(crate) mod alerts;
+pub(crate) mod api;
+pub(crate) mod audit;
+pub(crate) mod conn;
+pub(crate) mod enroll;
+pub(crate) mod hosts;
+pub(crate) mod pki;
+pub(crate) mod tokens;
+pub(crate) mod users;
+
 #[path = "sqlite_assets.rs"]
 mod sqlite_assets;
 #[path = "sqlite_purge.rs"]
@@ -3074,6 +3085,49 @@ pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         Duration::from_secs(5),
     )
+}
+
+/// 診斷包的唯讀連線（原本在 `diag.rs`）：不經過 [`open_existing`] 的檢查，busy 最多等 2 秒。錯誤訊息為
+/// 「無法開啟 <路徑>：<原因>」
+pub fn open_for_diag(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("無法開啟 {}：{e}", path.display()))?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    Ok(conn)
+}
+
+/// 健康檢查的讀寫連線（原本在 `probe.rs`）：開啟後讀一次 schema（不取得寫入鎖），再確認連線不是唯讀開啟。
+/// 回傳連線與「可寫」的檢查結果；無法開啟時回傳「無法開啟資料庫：<原因>」
+pub fn open_for_probe(
+    path: &Path,
+    busy: Duration,
+) -> Result<(Connection, Result<(), String>), String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("無法開啟資料庫：{e}"))?;
+    let _ = conn.busy_timeout(busy);
+    let writable = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("無法讀取資料庫：{e}"))
+        .and_then(|_| match conn.is_readonly(rusqlite::MAIN_DB) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("資料庫只能以唯讀開啟（權限或唯讀掛載）".to_string()),
+            Err(e) => Err(format!("無法確認資料庫是否可寫：{e}")),
+        });
+    Ok((conn, writable))
+}
+
+/// 主控台 API 唯讀連線池的連線（原本在 `api/db.rs`）：[`open_read_only`] 後設定 `query_only` 與 16 MB 快取
+pub fn open_console_reader(path: &Path) -> Result<Connection, Error> {
+    let conn = open_read_only(path)?;
+    conn.execute_batch("PRAGMA query_only = 1; PRAGMA cache_size = -16384;")
+        .map_err(|e| db_error("無法設定唯讀連線", e))?;
+    Ok(conn)
 }
 
 /// 在 Kairos 行程內開啟既有資料庫的讀寫連線（主控台 API 的低頻寫入）：只經由 SQLite 開啟，

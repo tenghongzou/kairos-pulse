@@ -16,7 +16,8 @@ use crate::config::{AppConfig, StorageBackend, take_config_arg};
 use crate::hosts_cli::{ascii_json, display_width, parse_duration, use_unicode};
 use crate::rbac::{LegacyScope, Role};
 use crate::storage::fmt_time;
-use crate::store::sqlite::{DB_FILE, SqliteOptions, open_admin};
+use crate::store::db::DbHandle;
+use crate::store::sqlite::{DB_FILE, SqliteOptions};
 
 /// `kairos api-token --help`
 pub const TOKEN_USAGE: &str = "kairos api-token — 主控台 API（kairos/API.md）的 token
@@ -425,10 +426,7 @@ pub(crate) fn refuse_root(data_dir: &Path) -> Option<Failure> {
 }
 
 /// 載入設定並開啟資料庫（`create` 時必要時建立）；資料庫不存在且 `create` 為 `false` 時回 `Ok(None)`
-pub(crate) fn open(
-    config_path: Option<&Path>,
-    create: bool,
-) -> Result<Option<rusqlite::Connection>, Failure> {
+pub(crate) fn open(config_path: Option<&Path>, create: bool) -> Result<Option<DbHandle>, Failure> {
     let config = AppConfig::load(config_path).map_err(|e| Failure {
         code: Some(crate::diag::config_load_code(&e, config_path)),
         ..Failure::new(
@@ -454,7 +452,7 @@ pub(crate) fn open(
         return Err(f);
     }
     let opts = SqliteOptions::from_config(&config, &data_dir);
-    open_admin(&opts, std::time::Duration::from_secs(5))
+    crate::store::open_admin(&opts, std::time::Duration::from_secs(5))
         .map(Some)
         .map_err(|e| {
             let (fix, exit) = match e.kind() {
@@ -664,39 +662,43 @@ pub fn execute(
                 GrantSpec::Legacy(s) => TokenGrant::Legacy(*s),
                 GrantSpec::Role(r) => TokenGrant::Role(*r),
                 GrantSpec::DefaultViewer => TokenGrant::Role(Role::Viewer),
-                GrantSpec::User { username, role } => {
-                    match crate::users::store::find_user(&conn, username) {
-                        Ok(Some(u)) if u.active() => TokenGrant::User {
-                            user_id: u.user_id,
-                            username: u.username,
-                            role: *role,
-                        },
-                        Ok(Some(_)) => {
-                            return fail(Failure::new(
-                                format!("使用者 {username} 已停用"),
-                                "停用的使用者不能擁有新的 API token",
-                                vec!["先以 kairos users enable 啟用，或改用 --role。".to_string()],
-                                EXIT_USAGE,
-                            ));
-                        }
-                        Ok(None) => {
-                            return fail(Failure::new(
-                                format!("找不到使用者 {username}"),
-                                "--user 必須是既有的帳號",
-                                vec!["以 kairos users list 確認帳號。".to_string()],
-                                EXIT_USAGE,
-                            ));
-                        }
-                        Err(e) => return fail(db_failure(e)),
+                GrantSpec::User { username, role } => match conn.find_user(username) {
+                    Ok(Some(u)) if u.active() => TokenGrant::User {
+                        user_id: u.user_id,
+                        username: u.username,
+                        role: *role,
+                    },
+                    Ok(Some(_)) => {
+                        return fail(Failure::new(
+                            format!("使用者 {username} 已停用"),
+                            "停用的使用者不能擁有新的 API token",
+                            vec!["先以 kairos users enable 啟用，或改用 --role。".to_string()],
+                            EXIT_USAGE,
+                        ));
                     }
-                }
-            };
-            let NewToken { token, row } =
-                match tokens::create_with(&conn, name, &grant, expires_at, Some(&by), None, now_ms)
-                {
-                    Ok(t) => t,
+                    Ok(None) => {
+                        return fail(Failure::new(
+                            format!("找不到使用者 {username}"),
+                            "--user 必須是既有的帳號",
+                            vec!["以 kairos users list 確認帳號。".to_string()],
+                            EXIT_USAGE,
+                        ));
+                    }
                     Err(e) => return fail(db_failure(e)),
-                };
+                },
+            };
+            let NewToken { token, row } = match tokens::create_with(
+                &*conn,
+                name,
+                &grant,
+                expires_at,
+                Some(&by),
+                None,
+                now_ms,
+            ) {
+                Ok(t) => t,
+                Err(e) => return fail(db_failure(e)),
+            };
             if cmd.json {
                 let mut data = row_json(&row, now_ms);
                 data["token"] = json!(token);
@@ -757,7 +759,7 @@ pub fn execute(
         }
         TokenAction::List { all } => {
             let rows = match open(cmd.config_path.as_deref(), false) {
-                Ok(Some(conn)) => match tokens::list(&conn) {
+                Ok(Some(conn)) => match conn.list_api_tokens() {
                     Ok(rows) => rows,
                     Err(e) => return fail(db_failure(e)),
                 },
@@ -874,7 +876,7 @@ pub fn execute(
                 }
                 Err(f) => return fail(f),
             };
-            let row = match tokens::get(&conn, token_id) {
+            let row = match conn.get_api_token(token_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     return fail(Failure::new(
@@ -906,11 +908,11 @@ pub fn execute(
                 }
             }
             let by = operator();
-            let result = match tokens::revoke(&conn, token_id, Some(&by), reason.as_deref(), now_ms)
-            {
-                Ok(r) => r,
-                Err(e) => return fail(db_failure(e)),
-            };
+            let result =
+                match tokens::revoke(&*conn, token_id, Some(&by), reason.as_deref(), now_ms) {
+                    Ok(r) => r,
+                    Err(e) => return fail(db_failure(e)),
+                };
             let (row, already) = match result {
                 Revoked::Now(r) => (r, false),
                 Revoked::Already(r) => (r, true),

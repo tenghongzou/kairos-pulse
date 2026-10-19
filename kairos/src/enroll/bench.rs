@@ -21,9 +21,9 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
+use super::StartParams;
 use super::ops::{self, TokenInput};
 use super::tests::{Agent, agent, root};
-use super::{StartParams, store};
 use crate::config::{AppConfig, PkiMode};
 use crate::pki::x509::pem_decode_all;
 use crate::shutdown::Shutdown;
@@ -140,7 +140,7 @@ impl Bench {
     fn token(&self, approval: TokenApproval) -> String {
         let data = PathBuf::from(&self.config.storage.data_dir);
         let opts = crate::store::sqlite::SqliteOptions::from_config(&self.config, &data);
-        let mut conn =
+        let conn =
             crate::store::sqlite::open_existing_read_write(&opts.path, Duration::from_secs(5))
                 .unwrap();
         let input = TokenInput {
@@ -151,16 +151,10 @@ impl Bench {
             allowed_cidrs: Some(vec!["127.0.0.0/8".into()]),
             ..TokenInput::default()
         };
-        ops::create_token(
-            &mut conn,
-            &input,
-            "bench",
-            None,
-            Utc::now().timestamp_millis(),
-        )
-        .unwrap()
-        .token
-        .canonical()
+        ops::create_token(&conn, &input, "bench", None, Utc::now().timestamp_millis())
+            .unwrap()
+            .token
+            .canonical()
     }
 
     async fn stop(mut self) {
@@ -446,10 +440,11 @@ async fn enroll_bench_10k() {
         .db
         .read(|c| {
             Ok((
-                store::pending_count(c)?,
-                c.query_row("SELECT count(*) FROM pki_certificates", [], |r| {
-                    r.get::<_, i64>(0)
-                })?,
+                c.pending_count()?,
+                c.test_sqlite()
+                    .query_row("SELECT count(*) FROM pki_certificates", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
             ))
         })
         .await

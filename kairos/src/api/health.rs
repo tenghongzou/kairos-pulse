@@ -19,6 +19,7 @@ use crate::enroll::pki_mgr::IssueStatus;
 use crate::expiry::ExpiryKind;
 use crate::rbac::{Grants, Permission};
 use crate::registry::LiveAgent;
+use crate::store::prelude::*;
 use crate::store::sqlite::{CapacityEvent, META_CAPACITY_EVENT, META_RETENTION_LAST, RetentionRun};
 use kairos_proto::enroll::EnrollMode;
 
@@ -103,15 +104,9 @@ pub(crate) struct DbStats {
     pub(crate) guard: Option<date_guard::GuardState>,
 }
 
-pub(crate) fn read_db_stats(conn: &rusqlite::Connection) -> rusqlite::Result<DbStats> {
-    let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0));
-    let page_size = pragma("page_size")?;
-    let pages = pragma("page_count")? - pragma("freelist_count")?;
-    let meta = |key: &str| -> rusqlite::Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-            .optional()
-    };
+pub(crate) fn read_db_stats(conn: &dyn Store) -> StoreResult<DbStats> {
+    let (page_size, pages) = conn.db_page_stats()?;
+    let meta = |key: &str| conn.get_meta(key);
     Ok(DbStats {
         used_bytes: u64::try_from(pages.max(0) * page_size).unwrap_or(0),
         page_size: u64::try_from(page_size).unwrap_or(0),
@@ -502,13 +497,10 @@ async fn issuing_ca(ctx: &ApiContext, now_ms: i64) -> Option<Item> {
     let read = svc
         .db
         .read(move |conn| {
-            let cas = crate::pki::store::list_cas(conn)?;
+            let cas = conn.list_cas()?;
             let threshold = s2.issuing_ca_warning_ms(conn, now_ms);
-            let (stale, oldest): (i64, Option<i64>) = conn.query_row(
-                "SELECT count(*), min(decided_at) FROM enroll_requests WHERE state = 'approved' AND decided_at < ?1",
-                [now_ms - 24 * 3_600_000],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let (stale, oldest): (i64, Option<i64>) =
+                conn.stale_approvals(now_ms - 24 * 3_600_000)?;
             Ok((cas, threshold, stale, oldest))
         })
         .await;

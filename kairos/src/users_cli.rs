@@ -12,11 +12,13 @@ use std::ffi::OsString;
 use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::PathBuf;
 
-use crate::audit::{Event, in_write_tx};
+use crate::audit::Event;
 use crate::config::{AppConfig, take_config_arg};
 use crate::hosts_cli::{ascii_json, use_unicode};
 use crate::rbac::{Assignment, Role};
 use crate::storage::fmt_time;
+use crate::store::db::{StoreErrorKind, in_write_tx};
+use crate::store::prelude::*;
 use crate::token_cli::{Failure, db_failure, human_time, open, operator, table, zone_label};
 use crate::users::password::{self, HashParams};
 use crate::users::store::{
@@ -421,7 +423,7 @@ pub fn execute(
     let by = operator();
     let now_ms = now.timestamp_millis();
     let find = |name: &str| -> Result<UserRow, Failure> {
-        us::find_user(&conn, name)
+        conn.find_user(name)
             .map_err(db_failure)?
             .ok_or_else(|| not_found(name))
     };
@@ -440,20 +442,19 @@ pub fn execute(
             )),
         }
     };
-    let audit =
-        |conn: &rusqlite::Connection, action: &'static str, object: &str, details: Value| {
-            Event {
-                actor: by.clone(),
-                actor_ip: None,
-                category: "user",
-                action,
-                object: Some(object.to_string()),
-                result: "ok",
-                code: None,
-                details: Some(details),
-            }
-            .append(conn, now_ms)
-        };
+    let audit = |conn: &dyn Store, action: &'static str, object: &str, details: Value| {
+        Event {
+            actor: by.clone(),
+            actor_ip: None,
+            category: "user",
+            action,
+            object: Some(object.to_string()),
+            result: "ok",
+            code: None,
+            details: Some(details),
+        }
+        .append(conn, now_ms)
+    };
     let acc = &config.accounts;
     match &cmd.action {
         UsersAction::Help => unreachable!(),
@@ -498,9 +499,8 @@ pub fn execute(
                 Ok(h) => h,
                 Err(e) => return fail(db_failure(e)),
             };
-            let r = in_write_tx(&conn, |c| {
-                let Some(uid) = us::create_user(
-                    c,
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
+                let Some(uid) = c.create_user(
                     &NewUser {
                         username,
                         display_name: display_name.as_deref(),
@@ -517,7 +517,7 @@ pub fn execute(
                     return Ok(None);
                 };
                 for a in roles {
-                    us::add_assignment(c, SUBJECT_USER, &uid.to_string(), a, &by, now_ms)?;
+                    c.add_assignment(SUBJECT_USER, &uid.to_string(), a, &by, now_ms)?;
                 }
                 audit(
                     c,
@@ -529,7 +529,7 @@ pub fn execute(
                         "via": "cli",
                     }),
                 )?;
-                us::get_user(c, uid)
+                c.get_user(uid)
             });
             let u = match r {
                 Ok(Some(u)) => u,
@@ -572,13 +572,13 @@ pub fn execute(
             }
         }
         UsersAction::List { all } => {
-            let users = match us::list_users(&conn) {
+            let users = match conn.list_users() {
                 Ok(u) => u,
                 Err(e) => return fail(db_failure(e)),
             };
             let mut rows = Vec::new();
             for u in users.into_iter().filter(|u| *all || u.active()) {
-                let roles = us::user_assignments(&conn, u.user_id).unwrap_or_default();
+                let roles = conn.user_assignments(u.user_id).unwrap_or_default();
                 rows.push((u, roles));
             }
             if cmd.json {
@@ -635,8 +635,10 @@ pub fn execute(
                 Ok(u) => u,
                 Err(f) => return fail(f),
             };
-            let roles = us::user_assignments(&conn, u.user_id).unwrap_or_default();
-            let sessions = us::user_sessions(&conn, u.user_id, true, now_ms).unwrap_or_default();
+            let roles = conn.user_assignments(u.user_id).unwrap_or_default();
+            let sessions = conn
+                .user_sessions(u.user_id, true, now_ms)
+                .unwrap_or_default();
             if cmd.json {
                 let mut v = user_json(&u, &roles, now_ms);
                 v["sessions"] = json!(
@@ -691,18 +693,18 @@ pub fn execute(
             {
                 return fail(f);
             }
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 if !grant
                     && a.role == Role::Admin
                     && a.scope == crate::rbac::Scope::Global
-                    && us::active_global_admins(c)? == vec![u.user_id]
+                    && c.active_global_admins()? == vec![u.user_id]
                 {
                     return Ok(Err(()));
                 }
                 let changed = if grant {
-                    us::add_assignment(c, SUBJECT_USER, &u.user_id.to_string(), a, &by, now_ms)?
+                    c.add_assignment(SUBJECT_USER, &u.user_id.to_string(), a, &by, now_ms)?
                 } else {
-                    us::remove_assignment(c, SUBJECT_USER, &u.user_id.to_string(), a)?
+                    c.remove_assignment(SUBJECT_USER, &u.user_id.to_string(), a)?
                 };
                 if changed {
                     let key = if grant { "added" } else { "removed" };
@@ -844,44 +846,43 @@ pub fn execute(
                 None
             };
             let uid = u.user_id;
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 if matches!(action, UsersAction::Disable(_) | UsersAction::Delete(_))
-                    && us::active_global_admins(c)? == vec![uid]
+                    && c.active_global_admins()? == vec![uid]
                 {
                     return Ok(Err(()));
                 }
                 let (act, changed, ended): (&'static str, bool, usize) = match action {
                     UsersAction::Disable(_) => {
-                        let ch = us::set_state(c, uid, false, &by, cmd.reason.as_deref(), now_ms)?;
+                        let ch = c.set_state(uid, false, &by, cmd.reason.as_deref(), now_ms)?;
                         (
                             "user.disable",
                             ch,
-                            us::end_user_sessions(c, uid, None, "user_disabled", &by, now_ms)?,
+                            c.end_user_sessions(uid, None, "user_disabled", &by, now_ms)?,
                         )
                     }
-                    UsersAction::Enable(_) => (
-                        "user.enable",
-                        us::set_state(c, uid, true, &by, None, now_ms)?,
-                        0,
-                    ),
-                    UsersAction::Delete(_) => {
-                        let n = us::user_sessions(c, uid, true, now_ms)?.len();
-                        ("user.delete", us::delete_user(c, uid, &by, now_ms)?, n)
+                    UsersAction::Enable(_) => {
+                        ("user.enable", c.set_state(uid, true, &by, None, now_ms)?, 0)
                     }
-                    UsersAction::Unlock(_) => ("user.unlock", us::unlock(c, uid)?, 0),
-                    UsersAction::ResetMfa(_) => ("mfa.reset", us::clear_totp(c, uid, now_ms)?, 0),
+                    UsersAction::Delete(_) => {
+                        let n = c.user_sessions(uid, true, now_ms)?.len();
+                        ("user.delete", c.delete_user(uid, &by, now_ms)?, n)
+                    }
+                    UsersAction::Unlock(_) => ("user.unlock", c.unlock(uid)?, 0),
+                    UsersAction::ResetMfa(_) => ("mfa.reset", c.clear_totp(uid, now_ms)?, 0),
                     UsersAction::EndSessions(_) => {
-                        let n =
-                            us::end_user_sessions(c, uid, None, "revoked_by_admin", &by, now_ms)?;
+                        let n = c.end_user_sessions(uid, None, "revoked_by_admin", &by, now_ms)?;
                         ("session.revoke_all", true, n)
                     }
                     _ => {
-                        let (_, _, h) = new_pw.as_ref().ok_or(rusqlite::Error::InvalidQuery)?;
-                        us::set_password(c, uid, h, true, now_ms)?;
+                        let (_, _, h) = new_pw.as_ref().ok_or_else(|| {
+                            StoreError::new(StoreErrorKind::Other, "Query is not read-only")
+                        })?;
+                        c.set_password(uid, h, true, now_ms)?;
                         (
                             "password.reset",
                             true,
-                            us::end_user_sessions(c, uid, None, "password_reset", &by, now_ms)?,
+                            c.end_user_sessions(uid, None, "password_reset", &by, now_ms)?,
                         )
                     }
                 };
@@ -950,7 +951,9 @@ pub fn execute(
                 Ok(u) => u,
                 Err(f) => return fail(f),
             };
-            let list = us::user_sessions(&conn, u.user_id, true, now_ms).unwrap_or_default();
+            let list = conn
+                .user_sessions(u.user_id, true, now_ms)
+                .unwrap_or_default();
             if cmd.json {
                 return ok_json(
                     json!({ "username": u.username, "sessions": list.iter().map(|s| s.json(now_ms, false)).collect::<Vec<_>>() }),
@@ -985,7 +988,7 @@ pub fn execute(
             }
         }
         UsersAction::Groups => {
-            let list = us::ldap_mappings(&conn).unwrap_or_default();
+            let list = conn.ldap_mappings().unwrap_or_default();
             if cmd.json {
                 return ok_json(
                     json!({ "mappings": list.iter().map(|(g, a)| { let mut j = a.json(); j["group_dn"] = json!(g); j }).collect::<Vec<_>>() }),
@@ -1017,11 +1020,11 @@ pub fn execute(
                     EXIT_USAGE,
                 ));
             }
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&*conn, |c| -> StoreResult<_> {
                 let changed = if map {
-                    us::add_assignment(c, SUBJECT_LDAP_GROUP, &key, a, &by, now_ms)?
+                    c.add_assignment(SUBJECT_LDAP_GROUP, &key, a, &by, now_ms)?
                 } else {
-                    us::remove_assignment(c, SUBJECT_LDAP_GROUP, &key, a)?
+                    c.remove_assignment(SUBJECT_LDAP_GROUP, &key, a)?
                 };
                 if changed {
                     let k = if map { "added" } else { "removed" };
@@ -1323,10 +1326,11 @@ mod tests {
             out.stdout
         );
         let conn = open(Some(&cfg), false).unwrap().unwrap();
-        let r = crate::audit::verify(&conn).unwrap();
+        let r = conn.audit_verify().unwrap();
         assert!(r.ok(), "{r:?}");
         assert!(r.checked >= 6);
         let raw: String = conn
+            .test_sqlite()
             .query_row(
                 "SELECT group_concat(coalesce(details, ''), ' ') FROM audit_events",
                 [],

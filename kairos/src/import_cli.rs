@@ -1223,8 +1223,9 @@ mod tests {
             ..ImportOptions::default()
         };
         let count = || -> i64 {
-            crate::store::sqlite::open_read_only(&data.join(DB_FILE))
+            crate::store::open_read(&data.join(DB_FILE))
                 .unwrap()
+                .test_sqlite()
                 .query_row("SELECT count(*) FROM reports", [], |r| r.get(0))
                 .unwrap()
         };

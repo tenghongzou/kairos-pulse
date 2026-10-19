@@ -31,7 +31,6 @@ use rcgen::{
     PKCS_RSA_SHA256, PKCS_RSA_SHA384, PKCS_RSA_SHA512, PublicKeyData, SanType, SerialNumber,
     SubjectPublicKeyInfo,
 };
-use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::net::IpAddr;
@@ -45,8 +44,9 @@ use super::issue::{
     Issued, NOT_BEFORE_BACKDATE_MS, Reason, RevokedEntry, client_params, crl_der, random_serial,
     to_time,
 };
-use super::store::{self as ps, CRL_KEEP_EXPIRED_MS};
+use super::store::CRL_KEEP_EXPIRED_MS;
 use super::x509::{CertInfo, parse_cert, pem_decode_all, pem_encode};
+use crate::store::prelude::*;
 
 pub const DAY_MS: i64 = 86_400_000;
 /// 根 CA 的有效天數（設計包 S02「根 CA 10 年」）
@@ -550,8 +550,10 @@ pub fn next_offline_crl_number(journal: &Path, issuer_spki_sha256: &str, now_ms:
 // ---------------------------------------------------------------------------
 
 /// 匯出資料庫中「由 `ca` 簽發、撤銷已生效、憑證過期未超過 1 天」的撤銷（第 6 節離線模式的 CRL 來源）
-pub fn export_revocations(conn: &Connection, ca: &CertInfo, now_ms: i64) -> Result<Value, String> {
-    let rows = ps::list_certs(conn, 10_000_000, None).map_err(|e| e.to_string())?;
+pub fn export_revocations(conn: &dyn Store, ca: &CertInfo, now_ms: i64) -> Result<Value, String> {
+    let rows = conn
+        .list_certs(10_000_000, None)
+        .map_err(|e| e.to_string())?;
     let mut revoked: Vec<Value> = Vec::new();
     for c in rows {
         let (Some(at), true) = (c.revoked_at, c.revoked_effective(now_ms)) else {
@@ -673,7 +675,7 @@ pub enum InitError {
 /// - `<root_dir>/root-ca.key`（0600，目錄 0700）、`<root_dir>/root-ca.pem`
 /// - `data/pki/root-ca.pem`（`pki.server_ca_path`）、`data/pki/server.pem`、`data/pki/server.key`（0600）
 /// - `data/pki/issuing-1.key`、`pki_cas` 的第一筆（`active`）、`data/pki/issuing-cas.pem`（`auth.client_ca`）
-pub fn init(conn: &Connection, plan: &InitPlan, now_ms: i64) -> Result<InitOutcome, InitError> {
+pub fn init(conn: &dyn Store, plan: &InitPlan, now_ms: i64) -> Result<InitOutcome, InitError> {
     if plan.names.is_empty() {
         return Err(InitError::Usage(
             "至少需要一個 --name（Pulse 連線時使用的伺服器名稱或 IP）".into(),
@@ -685,7 +687,8 @@ pub fn init(conn: &Connection, plan: &InitPlan, now_ms: i64) -> Result<InitOutco
         ));
     }
     let failed = |e: String| InitError::Failed(e);
-    if !ps::list_cas(conn)
+    if !conn
+        .list_cas()
         .map_err(|e| failed(e.to_string()))?
         .is_empty()
     {
@@ -823,6 +826,7 @@ mod tests {
     use super::*;
     use crate::pki::issue::IssuingCa;
     use crate::pki::x509::verify_cert_signature;
+    use rusqlite::Connection;
 
     const NOW: i64 = 1_760_000_000_000;
     const ID: &str = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";
@@ -1133,9 +1137,9 @@ mod tests {
         let o = init(&conn, &plan, NOW).unwrap();
         assert_eq!(o.ca_id, 1);
         assert!(o.pin.starts_with("sha256:"));
-        let cas = ps::list_cas(&conn).unwrap();
+        let cas = conn.list_cas().unwrap();
         assert_eq!(cas.len(), 1);
-        assert_eq!(cas[0].state, ps::CA_ACTIVE);
+        assert_eq!(cas[0].state, crate::pki::store::CA_ACTIVE);
         // 簽發 CA 鏈到根 CA；伺服器憑證鏈到根 CA
         let root_der = pem_decode_all(&std::fs::read_to_string(&o.server_ca).unwrap(), None)
             .unwrap()
@@ -1235,14 +1239,10 @@ mod tests {
             NOW,
         )
         .unwrap();
-        ps::activate_ca(&conn, installed.ca_id).unwrap();
-        ps::retire_ca(&conn, o.ca_id, NOW).unwrap();
+        conn.activate_ca(installed.ca_id).unwrap();
+        conn.retire_ca(o.ca_id, NOW).unwrap();
         assert!(mgr.sync_cas(&conn).unwrap(), "退役後要求重建 TLS 設定");
-        let first_der = ps::get_ca(&conn, o.ca_id)
-            .unwrap()
-            .unwrap()
-            .cert_der
-            .unwrap();
+        let first_der = conn.get_ca(o.ca_id).unwrap().unwrap().cert_der.unwrap();
         let listed =
             pem_decode_all(&std::fs::read_to_string(&retired_path).unwrap(), None).unwrap();
         assert_eq!(listed.len(), 1);

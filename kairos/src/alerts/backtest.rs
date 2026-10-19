@@ -7,8 +7,8 @@
 //! - **主機離線、長期失聯、回報延遲、身分衝突**：Kairos 沒有保存每次斷線的歷史（設計包 §24 #2 的連線
 //!   紀錄屬於之後的版本），回 `supported: false` 並說明原因，不提供不準確的數字。
 
+use crate::store::prelude::*;
 use chrono::FixedOffset;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -24,34 +24,20 @@ pub const MAX_DAYS: u32 = 31;
 /// 一台主機的一個桶：(桶的開始秒, 值)
 type Series = Vec<(i64, f64)>;
 
-fn series_ids(conn: &Connection, name: &str) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn
-        .prepare("SELECT series_id FROM series WHERE name = ?1 AND labels = '' AND derived = 0")?;
-    let rows = stmt.query_map([name], |r| r.get(0))?;
-    rows.collect()
+fn series_ids(conn: &dyn Store, name: &str) -> StoreResult<Vec<i64>> {
+    conn.plain_series_ids(name)
 }
 
 /// 這台主機某個名稱的序列（有 label 的指標，例如每個掛載點）：(series_id, label 的值, derived)
 fn labeled_series(
-    conn: &Connection,
+    conn: &dyn Store,
     host_id: i64,
     name: &str,
     label: &str,
-) -> rusqlite::Result<Vec<(i64, String, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.series_id, s.labels, s.derived FROM series s JOIN host_series h USING (series_id)
-         WHERE h.host_id = ?1 AND s.name = ?2",
-    )?;
-    let rows = stmt.query_map(params![host_id, name], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
+) -> StoreResult<Vec<(i64, String, i64)>> {
+    let rows = conn.host_series_by_name(host_id, name)?;
     let mut out = Vec::new();
-    for row in rows {
-        let (id, labels, derived) = row?;
+    for (id, labels, derived) in rows {
         let map: BTreeMap<String, String> = serde_json::from_str(&labels).unwrap_or_default();
         if let Some(v) = map.get(label) {
             out.push((id, v.clone(), derived));
@@ -62,14 +48,14 @@ fn labeled_series(
 
 /// 一台主機在試算期間的資料：每個對象（磁碟為掛載點、網路為介面；其他為一個）一條等間隔的序列
 fn host_data(
-    conn: &Connection,
+    conn: &dyn Store,
     table: &str,
     host_id: i64,
     metric: &str,
     params_v: &Value,
     from: i64,
     std_ids: &(Vec<i64>, Vec<i64>),
-) -> rusqlite::Result<Vec<Series>> {
+) -> StoreResult<Vec<Series>> {
     use super::rules::metric as m;
     let ratio = |a: BTreeMap<i64, f64>, b: &BTreeMap<i64, f64>, scale: f64| -> Series {
         a.iter()
@@ -91,14 +77,7 @@ fn host_data(
             vec![ratio(a, &b, 100.0)]
         }
         m::LOAD => {
-            let cores: Option<i64> = conn
-                .query_row(
-                    "SELECT cpu_logical_cores FROM host_inventory WHERE host_id = ?1",
-                    [host_id],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
+            let cores: Option<i64> = conn.host_logical_cores(host_id)?;
             match cores.filter(|c| *c > 0) {
                 Some(c) => vec![
                     load_series(conn, table, host_id, &std_ids.0, from)?
@@ -160,22 +139,15 @@ fn host_data(
 }
 
 fn load_series(
-    conn: &Connection,
+    conn: &dyn Store,
     table: &str,
     host_id: i64,
     series: &[i64],
     from_secs: i64,
-) -> rusqlite::Result<BTreeMap<i64, f64>> {
+) -> StoreResult<BTreeMap<i64, f64>> {
     let mut out = BTreeMap::new();
     for s in series {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT bucket, vsum / cnt FROM {table} WHERE host_id = ?1 AND bucket >= ?2 AND series_id = ?3 AND cnt > 0"
-        ))?;
-        let rows = stmt.query_map(params![host_id, from_secs, s], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-        })?;
-        for row in rows {
-            let (b, v) = row?;
+        for (b, v) in conn.rollup_means(table, host_id, *s, from_secs)? {
             out.insert(b, v);
         }
     }
@@ -263,12 +235,12 @@ pub fn replay(
 
 /// 試算一條規則（`rule` 已驗證）。`hosts` 為清冊的（host_id, 比對資訊）
 pub fn preview(
-    conn: &Connection,
+    conn: &dyn Store,
     rule: &Rule,
     days: u32,
     now_ms: i64,
     offset: FixedOffset,
-) -> rusqlite::Result<Value> {
+) -> StoreResult<Value> {
     let days = days.clamp(1, MAX_DAYS);
     if rule.kind != kind::METRIC_THRESHOLD {
         return Ok(json!({
@@ -285,26 +257,9 @@ pub fn preview(
     let clear_for = p.get("clear_for_secs").and_then(Value::as_i64).unwrap_or(0);
     let scope = Compiled::new(&rule.scope);
     // 範圍內的主機
-    let mut stmt = conn.prepare(
-        "SELECT host_id, agent_id, tags, peer, hostname, display_name FROM hosts WHERE lifecycle = 'active'",
-    )?;
-    type Row5 = (i64, String, Option<String>, Option<String>, String);
-    let hosts: Vec<(i64, String, String)> = stmt
-        .query_map([], |r| -> rusqlite::Result<Row5> {
-            let tags: Option<String> = r.get(2)?;
-            let peer: Option<String> = r.get(3)?;
-            let name: String = r
-                .get::<_, Option<String>>(5)?
-                .unwrap_or(r.get::<_, String>(4)?);
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                tags,
-                peer,
-                name,
-            ))
-        })?
-        .filter_map(Result::ok)
+    let hosts: Vec<(i64, String, String)> = conn
+        .backtest_hosts()?
+        .into_iter()
         .filter(|(_, agent, tags, peer, _)| {
             scope.matches(&HostFacts {
                 agent_id: agent.clone(),
@@ -350,10 +305,6 @@ pub fn preview(
     let mut not_reported: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut swap_zero = 0u64;
     let mut items_in_scope = 0u64;
-    let mut info_stmt = conn.prepare(
-        "SELECT h.agent_version, h.os, i.os_family, i.cpu_logical_cores FROM hosts h
-         LEFT JOIN host_inventory i ON i.host_id = h.host_id WHERE h.host_id = ?1",
-    )?;
     let mut fires = 0u64;
     let mut quick = 0u64;
     let mut involved = 0u64;
@@ -375,9 +326,7 @@ pub fn preview(
                 Option<String>,
                 Option<String>,
                 Option<i64>,
-            ) = info_stmt.query_row([host_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?;
+            ) = conn.backtest_host_info(*host_id)?;
             let windows = family.as_deref() == Some("windows")
                 || os.is_some_and(|o| o.to_lowercase().contains("windows"));
             let old = version
@@ -485,6 +434,7 @@ pub fn preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{Connection, params};
 
     fn data(values: &[f64]) -> Series {
         values

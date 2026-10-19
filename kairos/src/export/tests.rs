@@ -22,6 +22,7 @@ use crate::api::tokens::{self, TokenGrant};
 use crate::config::AppConfig;
 use crate::rbac::{Assignment, Role};
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const A: &str = "5e0c9a10-0000-4000-8000-0000000000e1";
@@ -1058,20 +1059,19 @@ async fn export_endpoints_over_https() {
 fn group_token(f: &crate::api::tests::Fixture, a: Assignment) -> String {
     let conn = f.admin();
     let now = chrono::Utc::now().timestamp_millis();
-    let user_id = crate::users::store::create_user(
-        &conn,
-        &crate::users::store::NewUser {
-            username: "scoped",
-            source: crate::users::store::SOURCE_LOCAL,
-            ..crate::users::store::NewUser::default()
-        },
-        "test",
-        now,
-    )
-    .unwrap()
-    .unwrap();
-    crate::users::store::add_assignment(
-        &conn,
+    let user_id = conn
+        .create_user(
+            &crate::users::store::NewUser {
+                username: "scoped",
+                source: crate::users::store::SOURCE_LOCAL,
+                ..crate::users::store::NewUser::default()
+            },
+            "test",
+            now,
+        )
+        .unwrap()
+        .unwrap();
+    conn.add_assignment(
         crate::users::store::SUBJECT_USER,
         &user_id.to_string(),
         &a,

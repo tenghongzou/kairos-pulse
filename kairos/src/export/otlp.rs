@@ -248,28 +248,10 @@ pub struct HostMeta {
 /// 讀取主機清冊（失敗時回傳空的，只記 DEBUG：resource 少了群組等屬性，指標照送）
 pub fn load_host_meta(db: &Path) -> HashMap<String, HostMeta> {
     let read = || -> Result<HashMap<String, HostMeta>, String> {
-        let conn = crate::store::sqlite::open_read_only(db).map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT h.agent_id, h.display_name, h.host_group, h.tags, h.os, i.os_family
-                 FROM hosts h LEFT JOIN host_inventory i ON i.host_id = h.host_id",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
+        let conn = crate::store::open_read(db).map_err(|e| e.to_string())?;
+        let rows = conn.host_meta_rows().map_err(|e| e.to_string())?;
         let mut out = HashMap::new();
-        for row in rows {
-            let (id, display, group, tags, os, family) = row.map_err(|e| e.to_string())?;
+        for (id, display, group, tags, os, family) in rows {
             let tags: Vec<String> = tags
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default();

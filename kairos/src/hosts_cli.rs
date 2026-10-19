@@ -15,7 +15,8 @@ use std::time::Duration;
 use crate::config::{AppConfig, StorageBackend, take_config_arg};
 use crate::storage::fmt_time;
 use crate::store::INVENTORY_SYNC_INTERVAL;
-use crate::store::sqlite::{DB_FILE, HostRow, list_hosts, open_read_only};
+use crate::store::db::DbHandle;
+use crate::store::sqlite::{DB_FILE, HostRow};
 
 /// `kairos hosts --help`
 pub const HOSTS_USAGE: &str = "kairos hosts list — 列出主機清冊（SQLite）
@@ -559,7 +560,7 @@ pub fn open_db(
     config_path: Option<&Path>,
     code: &'static str,
     title: &str,
-) -> Result<rusqlite::Connection, CliError> {
+) -> Result<DbHandle, CliError> {
     let config = AppConfig::load(config_path).map_err(|e| CliError {
         code: crate::diag::config_load_code(&e, config_path),
         title: "設定檔無法載入".to_string(),
@@ -605,7 +606,7 @@ pub fn open_db(
             exit,
         }
     };
-    open_read_only(&path).map_err(failed)
+    crate::store::open_read(&path).map_err(failed)
 }
 
 /// 主機清單的查詢失敗
@@ -614,7 +615,7 @@ const LIST_ERROR: (&str, &str) = ("KRS-E4003", "無法載入主機清單");
 /// 載入設定、開啟資料庫並讀出清冊
 fn load_rows(config_path: Option<&Path>) -> Result<Vec<HostRow>, CliError> {
     let conn = open_db(config_path, LIST_ERROR.0, LIST_ERROR.1)?;
-    list_hosts(&conn).map_err(|e| CliError {
+    conn.list_hosts().map_err(|e| CliError {
         code: LIST_ERROR.0,
         title: LIST_ERROR.1.to_string(),
         cause: e.to_string(),

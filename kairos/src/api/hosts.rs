@@ -6,9 +6,9 @@
 //! 1 萬台時重建約數毫秒、篩選與排序約 1～2 毫秒（第 9 節），不在每個請求都查詢資料庫，也不會長時間
 //! 持有狀態表的鎖。單台詳情則每次讀取最新的清冊列與狀態。
 
+use crate::store::prelude::*;
 use chrono::{DateTime, Utc};
 use hyper::{Response, StatusCode};
-use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -25,8 +25,7 @@ use crate::per_ip::cidr::Cidr;
 use crate::protocol::HostInfo;
 use crate::rbac::HostAccess;
 use crate::registry::{LastReport, LiveAgent};
-use crate::store::sqlite::HOST_SOURCE_IMPORT;
-use crate::tls::{CertRejection, RejectionReason};
+use crate::tls::CertRejection;
 
 /// 狀態表與清冊合併的索引最多這麼舊
 pub const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
@@ -162,20 +161,6 @@ impl InventorySummary {
     }
 }
 
-/// 清冊查詢另取的欄位：開機時間與資產摘要（以子查詢的別名避免與 `hosts` 的欄位同名）
-const HOST_EXTRA_COLUMNS: &str = "boot_time, i_os_family, i_cpu_model, i_cores, i_memory, \
-     i_vendor, i_product, i_serial, series_limited_at";
-const HOST_EXTRA_JOIN: &str = "LEFT JOIN (SELECT host_id AS i_host, os_family AS i_os_family, \
-     cpu_model AS i_cpu_model, cpu_logical_cores AS i_cores, memory_total AS i_memory, \
-     vendor AS i_vendor, product AS i_product, serial AS i_serial FROM host_inventory) \
-     ON i_host = hosts.host_id";
-
-/// `hosts` 的欄位（[`DbHost`] 的順序；第一欄 host_id 未使用）
-pub const HOST_COLUMNS: &str = "host_id, agent_id, hostname, display_name, agent_version, proto, \
-     host_fingerprint, tags, os, report_interval_ms, peer, identity_verified, first_seen, \
-     connected_at, last_seen, offline_after_ms, last_report, source, cert_rejected_at, \
-     cert_rejection, host_group";
-
 /// 清冊中保存的被拒憑證（`hosts.cert_rejection`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRejection {
@@ -183,87 +168,6 @@ pub struct StoredRejection {
     pub serial: Option<String>,
     pub peer: Option<String>,
     pub count: u64,
-}
-
-fn host_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<DbHost> {
-    let text = |i: usize| r.get::<_, Option<String>>(i);
-    let arc = |s: Option<String>| s.map(Arc::<str>::from);
-    let tags: Vec<String> = text(7)?
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let rejection = match (r.get::<_, Option<i64>>(18)?, text(19)?) {
-        (Some(at), Some(json)) => serde_json::from_str::<StoredRejection>(&json)
-            .ok()
-            .map(|s| CertRejection {
-                at: DateTime::from_timestamp_millis(at).unwrap_or_default(),
-                reason: RejectionReason::parse(&s.reason).unwrap_or(RejectionReason::Other),
-                serial: s.serial,
-                peer: s.peer.and_then(|p| p.parse().ok()),
-                count: s.count,
-            }),
-        _ => None,
-    };
-    Ok(DbHost {
-        agent_id: Arc::from(r.get::<_, String>(1)?),
-        hostname: Arc::from(r.get::<_, String>(2)?),
-        display_name: arc(text(3)?),
-        agent_version: arc(text(4)?),
-        proto: r.get(5)?,
-        host_fingerprint: arc(text(6)?),
-        tags: tags.into(),
-        os: text(8)?
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .map(Arc::new),
-        report_interval_ms: r.get(9)?,
-        peer: arc(text(10)?),
-        identity_verified: r.get(11)?,
-        first_seen: r.get(12)?,
-        connected_at: r.get(13)?,
-        last_seen: r.get(14)?,
-        offline_after_ms: r.get(15)?,
-        last_report: text(16)?
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .map(Arc::new),
-        imported: text(17)?.as_deref() == Some(HOST_SOURCE_IMPORT),
-        rejection,
-        host_group: arc(text(20)?),
-        boot_time: r.get(21)?,
-        inventory: {
-            let s = InventorySummary {
-                os_family: text(22)?,
-                cpu_model: text(23)?,
-                cpu_logical_cores: r.get(24)?,
-                memory_total: r.get(25)?,
-                vendor: text(26)?,
-                product: text(27)?,
-                serial: text(28)?,
-            };
-            // 有資產時 os_family 等至少一欄有值；全部為 NULL 視為沒有資產
-            (s != InventorySummary::default()).then(|| Arc::new(s))
-        },
-        series_limited_at: r.get(29)?,
-    })
-}
-
-/// 清冊中所有主機
-pub fn load_hosts(conn: &Connection) -> rusqlite::Result<Vec<DbHost>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {HOST_COLUMNS}, {HOST_EXTRA_COLUMNS} FROM hosts {HOST_EXTRA_JOIN}"
-    ))?;
-    let rows = stmt.query_map([], host_of)?;
-    rows.collect()
-}
-
-/// 清冊中的一台主機
-pub fn load_host(conn: &Connection, agent_id: &str) -> rusqlite::Result<Option<DbHost>> {
-    conn.query_row(
-        &format!(
-            "SELECT {HOST_COLUMNS}, {HOST_EXTRA_COLUMNS} FROM hosts {HOST_EXTRA_JOIN} WHERE agent_id = ?1"
-        ),
-        [agent_id],
-        host_of,
-    )
-    .optional()
 }
 
 /// 列表與詳情共用的一台主機
@@ -650,11 +554,7 @@ impl HostIndex {
     /// 例如由 `kairos reports import` 或第一筆 report 建立、尚未在狀態表中的主機）
     async fn db_hosts(&self, ctx: &ApiContext) -> Result<Arc<Vec<DbHost>>, ApiError> {
         let mut guard = self.db.lock().await;
-        let max_id = |conn: &Connection| -> rusqlite::Result<i64> {
-            conn.query_row("SELECT coalesce(max(host_id), 0) FROM hosts", [], |r| {
-                r.get(0)
-            })
-        };
+        let max_id = |conn: &dyn Store| conn.max_host_id();
         if let Some((at, cached_max, hosts)) = guard.as_ref()
             && at.elapsed() < DB_CACHE_MAX_AGE
         {
@@ -672,7 +572,7 @@ impl HostIndex {
             .pool
             .read("主機清單", move |conn| {
                 let max = max_id(conn).map_err(query_failed("主機清單"))?;
-                let hosts = load_hosts(conn).map_err(query_failed("主機清單"))?;
+                let hosts = conn.load_hosts().map_err(query_failed("主機清單"))?;
                 Ok((max, hosts))
             })
             .await?;
@@ -1373,13 +1273,7 @@ pub async fn connections(
     let exists_group: Option<Option<String>> = ctx
         .pool
         .read("主機詳情", move |conn| {
-            conn.query_row(
-                "SELECT host_group FROM hosts WHERE agent_id = ?1",
-                [&q],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(query_failed("主機詳情"))
+            conn.host_group_of(&q).map_err(query_failed("主機詳情"))
         })
         .await?;
     let known = exists_group.is_some() || ctx.registry.live_get(&id).is_some();
@@ -1401,15 +1295,8 @@ pub async fn connections(
 }
 
 /// 這台主機最新一張憑證的摘要（不含序號與指紋：那些需要 `pki:read`，見 `/api/v1/pki/certificates`）
-fn certificate_summary(conn: &Connection, agent_id: &str, now_ms: i64) -> rusqlite::Result<Value> {
-    let row = conn
-        .query_row(
-            "SELECT not_after, revoked_at FROM pki_certificates WHERE agent_id = ?1 \
-             ORDER BY issued_at DESC LIMIT 1",
-            [agent_id],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
-        )
-        .optional()?;
+fn certificate_summary(conn: &dyn Store, agent_id: &str, now_ms: i64) -> StoreResult<Value> {
+    let row = conn.latest_cert_of(agent_id)?;
     Ok(match row {
         None => Value::Null,
         Some((not_after, revoked_at)) => {
@@ -1451,14 +1338,9 @@ pub async fn check_access(
     let group: Option<String> = ctx
         .pool
         .read("主機詳情", move |conn| {
-            conn.query_row(
-                "SELECT host_group FROM hosts WHERE agent_id = ?1",
-                [&q],
-                |r| r.get(0),
-            )
-            .optional()
-            .map(Option::flatten)
-            .map_err(query_failed("主機詳情"))
+            conn.host_group_of(&q)
+                .map(Option::flatten)
+                .map_err(query_failed("主機詳情"))
         })
         .await?;
     if access.allows(group.as_deref()) {
@@ -1481,7 +1363,7 @@ pub async fn detail(
     let (db, certificate) = ctx
         .pool
         .read("主機詳情", move |conn| {
-            let host = load_host(conn, &id).map_err(query_failed("主機詳情"))?;
+            let host = conn.load_host(&id).map_err(query_failed("主機詳情"))?;
             let cert = certificate_summary(conn, &id, now_ms).map_err(query_failed("主機詳情"))?;
             Ok((host, cert))
         })
@@ -1592,6 +1474,7 @@ pub async fn detail(
 pub(crate) mod tests {
     use super::*;
     use crate::registry::OfflineReason;
+    use crate::tls::RejectionReason;
 
     pub fn db_host(id: &str, name: &str, peer: &str, last_seen: i64) -> DbHost {
         DbHost {

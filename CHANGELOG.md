@@ -127,6 +127,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 主控台 API 的 `downloads` 另有 `base_url`、`install_script`、`files`、`product_code`；模式的 `stats` 另有 `downloads_in_progress`。
 - 註冊服務每小時另外刪除「清冊中已沒有的主機」過期超過 1 天的憑證紀錄。
 - 測試掛鉤 `KAIROS_TEST_GRACE_SECS`（debug 建置）：過期寬限期以秒計。
+- 內部重構（HA L1a，無行為變更）：Kairos 的儲存層改為領域 store 介面（`Store`／`Tx`），SQL 原封不動搬進 `store/sqlite/`，主控台、註冊、告警、PKI 與所有 CLI 不再直接使用 rusqlite（`kairos/STORAGE.md` 第 17 節）；schema、API 回應、錯誤代碼與 report 的寫入效能不變。
 
 ### 規格（尚未實作）
 

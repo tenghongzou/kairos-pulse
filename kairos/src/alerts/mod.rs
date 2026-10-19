@@ -51,6 +51,7 @@ use crate::per_ip::PerIpLimiter;
 use crate::registry::Registry;
 use crate::shutdown::Shutdown;
 use crate::stats::WriteStats;
+use crate::store::prelude::*;
 use crate::tls::TlsState;
 use engine::{
     ActionError, Change, Engine, EngineConfig, HostView, Loaded, Output, Rejection, Warmup, World,
@@ -92,17 +93,17 @@ pub struct StartParams {
 
 /// 清冊中的一台主機（每 30 秒讀一次）
 #[derive(Debug, Clone)]
-struct InvHost {
-    agent_id: String,
-    hostname: String,
-    display_name: Option<String>,
-    tags: Vec<String>,
-    peer: Option<String>,
-    decommissioned: bool,
-    last_seen: i64,
-    connected_at: Option<i64>,
-    offline_after_ms: Option<i64>,
-    report_interval_ms: Option<i64>,
+pub struct InvHost {
+    pub agent_id: String,
+    pub hostname: String,
+    pub display_name: Option<String>,
+    pub tags: Vec<String>,
+    pub peer: Option<String>,
+    pub decommissioned: bool,
+    pub last_seen: i64,
+    pub connected_at: Option<i64>,
+    pub offline_after_ms: Option<i64>,
+    pub report_interval_ms: Option<i64>,
 }
 
 /// 告警服務：引擎、派送與 API 的入口
@@ -155,46 +156,16 @@ fn db_err(e: DbError) -> String {
     e.to_string()
 }
 
-fn read_inventory(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<InvHost>> {
-    let mut stmt = conn.prepare(
-        "SELECT agent_id, hostname, display_name, tags, peer, lifecycle, last_seen, connected_at,
-                offline_after_ms, report_interval_ms FROM hosts",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let tags: Option<String> = r.get(3)?;
-        Ok(InvHost {
-            agent_id: r.get(0)?,
-            hostname: r.get(1)?,
-            display_name: r.get(2)?,
-            tags: tags
-                .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.to_lowercase())
-                .collect(),
-            peer: r.get(4)?,
-            decommissioned: r.get::<_, String>(5)? != "active",
-            last_seen: r.get(6)?,
-            connected_at: r.get(7)?,
-            offline_after_ms: r.get(8)?,
-            report_interval_ms: r.get(9)?,
-        })
-    })?;
-    rows.collect()
-}
-
-fn read_db_facts(conn: &rusqlite::Connection) -> rusqlite::Result<(DbFacts, HashSet<String>)> {
-    let capacity = store::get_meta(conn, crate::store::sqlite::META_CAPACITY_EVENT)?
+fn read_db_facts(conn: &dyn Store) -> StoreResult<(DbFacts, HashSet<String>)> {
+    let capacity = conn
+        .get_meta(crate::store::sqlite::META_CAPACITY_EVENT)?
         .and_then(|s| serde_json::from_str(&s).ok());
-    let guard: Option<date_guard::GuardState> =
-        store::get_meta(conn, "retention_guard")?.and_then(|s| serde_json::from_str(&s).ok());
+    let guard: Option<date_guard::GuardState> = conn
+        .get_meta("retention_guard")?
+        .and_then(|s| serde_json::from_str(&s).ok());
     let guard_paused =
         guard.is_some_and(|g| g.jump_since_unix.is_some() || g.rollback_since_unix.is_some());
-    let mut stmt =
-        conn.prepare("SELECT serial FROM pki_certificates WHERE revoked_at IS NOT NULL")?;
-    let revoked = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<HashSet<String>>>()?;
+    let revoked = conn.revoked_serials()?;
     Ok((
         DbFacts {
             capacity,
@@ -230,34 +201,29 @@ impl AlertService {
         let sb = secrets.clone();
         let (loaded, previous, expected) = db
             .write(move |conn| {
-                store::ensure_builtin_rules(conn, now)?;
-                let previous = parse_heartbeat(store::get_meta(conn, store::META_HEARTBEAT)?);
+                conn.ensure_builtin_rules(now)?;
+                let previous = parse_heartbeat(conn.get_meta(store::META_HEARTBEAT)?);
                 let mut loaded = Loaded {
-                    rules: store::load_rules(conn)?,
-                    silences: store::load_silences(conn, now - 86_400_000)?,
-                    channels: store::load_channels(conn, Some(sb.as_ref()))?,
-                    open_events: store::load_open_events(conn)?,
-                    suppressed: store::load_suppressed(conn, now - 30 * 86_400_000)?,
-                    seq_by_day: store::load_seq(conn, &days)?,
+                    rules: conn.load_rules()?,
+                    silences: conn.load_silences(now - 86_400_000)?,
+                    channels: conn.load_channels(Some(sb.as_ref()))?,
+                    open_events: conn.load_open_events()?,
+                    suppressed: conn.load_suppressed(now - 30 * 86_400_000)?,
+                    seq_by_day: conn.load_seq(&days)?,
                 };
                 loaded.silences.sort_by_key(|s| s.starts_at);
                 // 重新啟動前「在線上」的主機：清冊的 last_seen 在上次心跳前 2 分鐘之內
                 let expected: HashSet<String> = match previous {
                     Some((at, _)) => {
-                        let mut stmt = conn.prepare(
-                            "SELECT agent_id FROM hosts WHERE lifecycle = 'active' AND last_seen >= ?1",
-                        )?;
-                        stmt.query_map([at - engine::PREVIOUS_ONLINE_SLACK_MS], |r| r.get::<_, String>(0))?
-                            .collect::<rusqlite::Result<_>>()?
+                        conn.active_hosts_seen_since(at - engine::PREVIOUS_ONLINE_SLACK_MS)?
                     }
                     None => HashSet::new(),
                 };
-                store::put_meta(
-                    conn,
+                conn.put_meta(
                     store::META_HEARTBEAT,
                     &json!({ "at": now, "clean": false }).to_string(),
                 )?;
-                let rev = store::config_rev(conn)?;
+                let rev = conn.config_rev()?;
                 Ok(((loaded, rev), previous, expected))
             })
             .await
@@ -423,7 +389,7 @@ impl AlertService {
         let text = json!({ "at": now, "clean": clean }).to_string();
         if let Err(e) = self
             .db
-            .write(move |conn| Ok(store::put_meta(conn, store::META_HEARTBEAT, &text)?))
+            .write(move |conn| Ok(conn.put_meta(store::META_HEARTBEAT, &text)?))
             .await
         {
             log::debug!("告警引擎的心跳無法寫入：{e}");
@@ -434,7 +400,7 @@ impl AlertService {
     async fn refresh_inventory(&self) {
         let r = self
             .db
-            .read(|conn| Ok((read_inventory(conn)?, read_db_facts(conn)?)))
+            .read(|conn| Ok((conn.alert_inventory()?, read_db_facts(conn)?)))
             .await;
         match r {
             Ok((inv, (facts, revoked))) => {
@@ -627,7 +593,7 @@ impl AlertService {
     /// 設定（規則、靜音、管道）有變更時重新載入
     async fn maybe_reload(&self) {
         let forced = self.reload.swap(false, Ordering::SeqCst);
-        let rev = match self.db.read(|conn| Ok(store::config_rev(conn)?)).await {
+        let rev = match self.db.read(|conn| Ok(conn.config_rev()?)).await {
             Ok(r) => r,
             Err(e) => {
                 self.note_error(format!("無法讀取告警設定的版本：{e}"));
@@ -640,12 +606,7 @@ impl AlertService {
         let now = (self.clock)();
         let loaded = self
             .db
-            .read(move |conn| {
-                Ok((
-                    store::load_rules(conn)?,
-                    store::load_silences(conn, now - 86_400_000)?,
-                ))
-            })
+            .read(move |conn| Ok((conn.load_rules()?, conn.load_silences(now - 86_400_000)?)))
             .await;
         match loaded {
             Ok((rules, silences)) => {
@@ -707,9 +668,9 @@ impl AlertService {
             let r = self
                 .db
                 .write(move |conn| {
-                    let tx = conn.transaction()?;
-                    store::upsert_events(&tx, &ev2)?;
-                    store::insert_timeline(&tx, &tl2)?;
+                    let tx = conn.begin(TxMode::Deferred)?;
+                    tx.upsert_events(&ev2)?;
+                    tx.insert_timeline(&tl2)?;
                     tx.commit()?;
                     Ok(())
                 })
@@ -731,9 +692,9 @@ impl AlertService {
         let result = self
             .db
             .write(move |conn| {
-                let tx = conn.transaction()?;
-                let ids = store::insert_deliveries(&tx, &deliveries)?;
-                store::mark_silences_notified(&tx, &silences)?;
+                let tx = conn.begin(TxMode::Deferred)?;
+                let ids = tx.insert_deliveries(&deliveries)?;
+                tx.mark_silences_notified(&silences)?;
                 tx.commit()?;
                 Ok(ids)
             })
@@ -779,7 +740,7 @@ impl AlertService {
 
     /// CLI 交給執行中的 Kairos 的動作
     async fn process_actions(&self) {
-        let actions = match self.db.read(|conn| Ok(store::pending_actions(conn)?)).await {
+        let actions = match self.db.read(|conn| Ok(conn.pending_actions()?)).await {
             Ok(a) if !a.is_empty() => a,
             _ => return,
         };
@@ -804,11 +765,10 @@ impl AlertService {
             .db
             .write(move |conn| {
                 for (a, r) in &results {
-                    store::finish_action(conn, a.id, now, r)?;
+                    conn.finish_action(a.id, now, r)?;
                     // 稽核雜湊鏈：與主控台 API 的確認、解決、註解相同的紀錄（執行者為 CLI 的作業系統帳號）
                     let ok = r["ok"] == true;
-                    crate::enroll::store::audit(
-                        conn,
+                    conn.audit(
                         now,
                         &crate::enroll::store::Audit {
                             actor: &a.actor,
@@ -837,7 +797,7 @@ impl AlertService {
         loop {
             let r = self
                 .db
-                .write(move |conn| Ok(store::purge(conn, now, days, max, 2000)?))
+                .write(move |conn| Ok(conn.purge_alerts(now, days, max, 2000)?))
                 .await;
             match r {
                 Ok((p, more)) => {

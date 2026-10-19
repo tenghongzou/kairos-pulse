@@ -25,24 +25,10 @@ pub const CODE_ANCHOR: &str = "KRS-I6202";
 /// 第一次外送與驗證：啟動後多久（啟動時的寫入先完成）
 pub const FIRST_RUN: Duration = Duration::from_secs(60);
 
-/// 鏈尾：(id, hash, hmac)
-type Tail = (i64, Option<String>, Option<String>);
-
-/// 鏈尾；沒有紀錄時為 `None`
-fn tail(conn: &rusqlite::Connection) -> rusqlite::Result<Option<Tail>> {
-    use rusqlite::OptionalExtension;
-    conn.query_row(
-        "SELECT id, hash, hmac FROM audit_events ORDER BY id DESC LIMIT 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-    .optional()
-}
-
 /// 寫一行鏈尾的固定事件
 pub async fn log_anchor(db: &Arc<EnrollDb>) {
     let r = db
-        .read(|conn| Ok((tail(conn)?, audit::hmac_since(conn)?)))
+        .read(|conn| Ok((conn.audit_tail()?, conn.audit_hmac_since()?)))
         .await;
     match r {
         Ok((Some((id, hash, mac)), since)) => {
@@ -70,11 +56,11 @@ pub async fn log_anchor(db: &Arc<EnrollDb>) {
 /// 驗證一次並發布結果；回傳是否完整（無法讀取資料庫時為 `None`，不發布）
 pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
     // 升級前（沒有雜湊）的紀錄先補上（只有第一次），再以唯讀連線驗證
-    if let Err(e) = db.write(|c| Ok(audit::seal_legacy(c)?)).await {
+    if let Err(e) = db.write(|c| Ok(c.audit_seal_legacy()?)).await {
         log::warn!(event = "audit.verify_failed"; "稽核日誌的自我驗證無法執行：{e}");
         return None;
     }
-    let report = match db.read(|c| Ok(audit::verify(c)?)).await {
+    let report = match db.read(|c| Ok(c.audit_verify()?)).await {
         Ok(r) => r,
         Err(DbError(e)) => {
             log::warn!(event = "audit.verify_failed"; "稽核日誌的自我驗證無法執行：{e}");
@@ -117,8 +103,7 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
     let now = chrono::Utc::now().timestamp_millis();
     let r = db
         .write(move |conn| {
-            audit::append(
-                conn,
+            conn.audit_append(
                 now,
                 &audit::Audit {
                     actor: "system",
@@ -224,7 +209,7 @@ mod tests {
         audit::ensure_key(&dir).unwrap();
         db.write(|c| {
             for i in 0..5 {
-                audit::append(c, i, &ev("user.create"))?;
+                c.audit_append(i, &ev("user.create"))?;
             }
             Ok(())
         })
@@ -242,13 +227,14 @@ mod tests {
         }
         // 繞過程式修改一筆並重新計算之後的雜湊鏈（沒有 HMAC 金鑰）：HMAC 不符
         db.write(|c| {
-            c.execute("UPDATE audit_events SET object = 'eve' WHERE id = 2", [])?;
+            c.test_sqlite()
+                .execute("UPDATE audit_events SET object = 'eve' WHERE id = 2", [])?;
             let rows: Vec<audit::AuditRow> =
-                audit::export_batch(c, &audit::AuditFilter::default(), 100)?;
+                c.audit_export_batch(&audit::AuditFilter::default(), 100)?;
             let mut prev = audit::GENESIS.to_string();
             for r in rows {
                 let h = audit::compute_hash(&prev, &r);
-                c.execute(
+                c.test_sqlite().execute(
                     "UPDATE audit_events SET prev_hash = ?2, hash = ?3 WHERE id = ?1",
                     rusqlite::params![r.id, prev, h],
                 )?;
@@ -270,7 +256,7 @@ mod tests {
         // 每次自我驗證都寫入稽核（執行者 system）
         let n: i64 = db
             .read(|c| {
-                Ok(c.query_row(
+                Ok(c.test_sqlite().query_row(
                     "SELECT count(*) FROM audit_events WHERE action = 'audit.verify' AND actor = 'system'",
                     [],
                     |r| r.get(0),

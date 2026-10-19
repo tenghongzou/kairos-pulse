@@ -8,7 +8,6 @@
 use chrono::{DateTime, Utc};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
-use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,8 +18,10 @@ use super::auth::Principal;
 use super::db::query_failed;
 use super::http::{self, ApiBody, ApiError, Query, read_json, str_field, ts_ms};
 use super::tokens::{self, Revoked, TokenGrant};
-use crate::audit::{Event, in_write_tx};
+use crate::audit::Event;
 use crate::rbac::{Assignment, Permission as P, Role};
+use crate::store::db::in_write_tx;
+use crate::store::prelude::*;
 use crate::users::password::{self, HashParams};
 use crate::users::store::{
     self as us, NewUser, SOURCE_LOCAL, SUBJECT_LDAP_GROUP, SUBJECT_USER, UserRow,
@@ -67,8 +68,8 @@ fn refused(r: Refused, name: &str) -> ApiError {
 }
 
 /// 失去全站管理員之後，還有沒有其他啟用中的全站管理員
-fn leaves_no_admin(conn: &Connection, uid: i64) -> rusqlite::Result<bool> {
-    let admins = us::active_global_admins(conn)?;
+fn leaves_no_admin(conn: &dyn Store, uid: i64) -> StoreResult<bool> {
+    let admins = conn.active_global_admins()?;
     Ok(admins.contains(&uid) && admins.len() == 1)
 }
 
@@ -212,7 +213,7 @@ async fn find(ctx: &Arc<ApiContext>, name: &str) -> Result<UserRow, ApiError> {
     let n = name.to_string();
     ctx.pool
         .read("使用者", move |c| {
-            us::find_user(c, &n).map_err(query_failed("使用者"))
+            c.find_user(&n).map_err(query_failed("使用者"))
         })
         .await?
         .ok_or_else(|| user_not_found(name))
@@ -228,11 +229,14 @@ async fn list_users(
     let rows = ctx
         .pool
         .read("使用者", move |c| {
-            let users = us::list_users(c).map_err(query_failed("使用者"))?;
+            let users = c.list_users().map_err(query_failed("使用者"))?;
             let mut out = Vec::new();
             for u in users {
-                let roles = us::user_assignments(c, u.user_id).map_err(query_failed("使用者"))?;
-                let sessions = us::user_sessions(c, u.user_id, true, now_ms)
+                let roles = c
+                    .user_assignments(u.user_id)
+                    .map_err(query_failed("使用者"))?;
+                let sessions = c
+                    .user_sessions(u.user_id, true, now_ms)
                     .map_err(query_failed("使用者"))?
                     .len();
                 out.push((u, roles, sessions));
@@ -278,9 +282,12 @@ async fn get_user(
     let (roles, sessions, tokens_owned) = ctx
         .pool
         .read("使用者", move |c| {
-            let r = us::user_assignments(c, uid).map_err(query_failed("使用者"))?;
-            let s = us::user_sessions(c, uid, true, now_ms).map_err(query_failed("使用者"))?;
-            let t = tokens::list(c)
+            let r = c.user_assignments(uid).map_err(query_failed("使用者"))?;
+            let s = c
+                .user_sessions(uid, true, now_ms)
+                .map_err(query_failed("使用者"))?;
+            let t = c
+                .list_api_tokens()
                 .map_err(query_failed("使用者"))?
                 .into_iter()
                 .filter(|t| t.owner_user_id == Some(uid))
@@ -365,8 +372,7 @@ async fn create_user(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                let Some(uid) = us::create_user(
-                    c,
+                let Some(uid) = c.create_user(
                     &NewUser {
                         username: &name,
                         display_name: display.as_deref(),
@@ -384,10 +390,10 @@ async fn create_user(
                     return Ok(Err(Refused::Exists));
                 };
                 for a in &roles2 {
-                    us::add_assignment(c, SUBJECT_USER, &uid.to_string(), a, &actor, now_ms)?;
+                    c.add_assignment(SUBJECT_USER, &uid.to_string(), a, &actor, now_ms)?;
                 }
                 ev.append(c, now_ms)?;
-                Ok(Ok(us::get_user(c, uid)?))
+                Ok(Ok(c.get_user(uid)?))
             })
         })
         .await
@@ -457,9 +463,9 @@ async fn update_profile(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                us::set_profile(c, uid, display.as_deref(), email.as_deref(), now_ms)?;
+                c.set_profile(uid, display.as_deref(), email.as_deref(), now_ms)?;
                 ev.append(c, now_ms)?;
-                us::get_user(c, uid)
+                c.get_user(uid)
             })
         })
         .await
@@ -496,12 +502,12 @@ async fn set_roles(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                let before = us::user_assignments(c, uid)?;
+                let before = c.user_assignments(uid)?;
                 if is_global_admin(&before) && !is_global_admin(&new) && leaves_no_admin(c, uid)? {
                     return Ok(Err(Refused::LastAdmin));
                 }
                 let (added, removed) =
-                    us::replace_assignments(c, SUBJECT_USER, &uid.to_string(), &new, &actor, now_ms)?;
+                    c.replace_assignments(SUBJECT_USER, &uid.to_string(), &new, &actor, now_ms)?;
                 if !added.is_empty() || !removed.is_empty() {
                     let gain = crate::rbac::Grants::from_assignments(&new).global;
                     let had = crate::rbac::Grants::from_assignments(&before).global;
@@ -588,17 +594,16 @@ async fn state_action(
                 }
                 let (changed, sessions) = match act.as_str() {
                     "disable" => {
-                        let ch = us::set_state(c, uid, false, &actor, reason.as_deref(), now_ms)?;
-                        let n =
-                            us::end_user_sessions(c, uid, None, "user_disabled", &actor, now_ms)?;
+                        let ch = c.set_state(uid, false, &actor, reason.as_deref(), now_ms)?;
+                        let n = c.end_user_sessions(uid, None, "user_disabled", &actor, now_ms)?;
                         (ch, n)
                     }
-                    "enable" => (us::set_state(c, uid, true, &actor, None, now_ms)?, 0),
+                    "enable" => (c.set_state(uid, true, &actor, None, now_ms)?, 0),
                     "delete" => {
-                        let n = us::user_sessions(c, uid, true, now_ms)?.len();
-                        (us::delete_user(c, uid, &actor, now_ms)?, n)
+                        let n = c.user_sessions(uid, true, now_ms)?.len();
+                        (c.delete_user(uid, &actor, now_ms)?, n)
                     }
-                    _ => (us::unlock(c, uid)?, 0),
+                    _ => (c.unlock(uid)?, 0),
                 };
                 if changed {
                     ev.details = Some(json!({ "reason": reason, "sessions_ended": sessions }));
@@ -651,8 +656,8 @@ async fn reset_password(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                us::set_password(c, uid, &phc, true, now_ms)?;
-                let n = us::end_user_sessions(c, uid, None, "password_reset", &actor, now_ms)?;
+                c.set_password(uid, &phc, true, now_ms)?;
+                let n = c.end_user_sessions(uid, None, "password_reset", &actor, now_ms)?;
                 ev.details = Some(json!({ "sessions_ended": n, "password": if generated { "generated" } else { "provided" } }));
                 ev.append(c, now_ms)?;
                 Ok(n)
@@ -692,7 +697,7 @@ async fn reset_mfa(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                let was = us::clear_totp(c, uid, now_ms)?;
+                let was = c.clear_totp(uid, now_ms)?;
                 if was {
                     ev.append(c, now_ms)?;
                 }
@@ -717,7 +722,8 @@ async fn user_sessions(
     let list = ctx
         .pool
         .read("工作階段", move |c| {
-            us::user_sessions(c, uid, true, now_ms).map_err(query_failed("工作階段"))
+            c.user_sessions(uid, true, now_ms)
+                .map_err(query_failed("工作階段"))
         })
         .await?;
     Ok(http::ok(
@@ -757,7 +763,7 @@ async fn revoke_all(
         .admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                let n = us::end_user_sessions(c, uid, None, "revoked_by_admin", &actor, now_ms)?;
+                let n = c.end_user_sessions(uid, None, "revoked_by_admin", &actor, now_ms)?;
                 ev.details = Some(json!({ "ended": n, "reason": reason }));
                 ev.append(c, now_ms)?;
                 Ok(n)
@@ -773,7 +779,7 @@ async fn roles(ctx: &Arc<ApiContext>, now: DateTime<Utc>) -> Result<Response<Api
     let counts = ctx
         .pool
         .read("角色", |c| {
-            us::role_member_counts(c).map_err(query_failed("角色"))
+            c.role_member_counts().map_err(query_failed("角色"))
         })
         .await?;
     let roles: Vec<Value> = Role::ALL
@@ -807,7 +813,7 @@ async fn directory(
     let mappings = ctx
         .pool
         .read("目錄服務", |c| {
-            us::ldap_mappings(c).map_err(query_failed("目錄服務"))
+            c.ldap_mappings().map_err(query_failed("目錄服務"))
         })
         .await?;
     Ok(http::ok(
@@ -876,7 +882,7 @@ async fn set_mappings(
     ctx.admin
         .write(move |c| {
             in_write_tx(c, |c| {
-                let old = us::ldap_mappings(c)?;
+                let old = c.ldap_mappings()?;
                 let removed: Vec<String> = old
                     .iter()
                     .filter(|o| !new.contains(o))
@@ -888,10 +894,10 @@ async fn set_mappings(
                     .map(|(g, a)| format!("{g} → {}", a.as_text()))
                     .collect();
                 for (g, a) in old.iter().filter(|o| !new.contains(o)) {
-                    us::remove_assignment(c, SUBJECT_LDAP_GROUP, g, a)?;
+                    c.remove_assignment(SUBJECT_LDAP_GROUP, g, a)?;
                 }
                 for (g, a) in new.iter().filter(|x| !old.contains(x)) {
-                    us::add_assignment(c, SUBJECT_LDAP_GROUP, g, a, &actor, now_ms)?;
+                    c.add_assignment(SUBJECT_LDAP_GROUP, g, a, &actor, now_ms)?;
                 }
                 if !added.is_empty() || !removed.is_empty() {
                     ev.details = Some(json!({ "added": added, "removed": removed }));
@@ -949,7 +955,7 @@ async fn directory_test(
                 .pool
                 .read("目錄服務", move |c| {
                     // 個人指派只在帳號已存在時才有；這裡只看群組對應
-                    us::grants_for(c, -1, &groups).map_err(query_failed("目錄服務"))
+                    c.grants_for(-1, &groups).map_err(query_failed("目錄服務"))
                 })
                 .await?;
             (
@@ -1021,7 +1027,7 @@ async fn list_tokens(
     let rows = ctx
         .pool
         .read("API token", |c| {
-            tokens::list(c).map_err(query_failed("API token"))
+            c.list_api_tokens().map_err(query_failed("API token"))
         })
         .await?;
     let data: Vec<Value> = rows
@@ -1102,7 +1108,9 @@ async fn create_token(
                 Some(&ipt),
                 now_ms,
             )
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
+            .map_err(|e| {
+                crate::store::db::StoreError::new(crate::store::db::StoreErrorKind::Other, e)
+            })
         })
         .await
         .map_err(storage_error)?;

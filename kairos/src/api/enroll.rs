@@ -290,7 +290,7 @@ async fn list_tokens(
     let now_ms = now.timestamp_millis();
     let rows = svc
         .db
-        .read(|conn| Ok(store::list_tokens(conn)?))
+        .read(|conn| Ok(conn.list_tokens()?))
         .await
         .map_err(db_error)?;
     let filtered: Vec<_> = rows
@@ -329,7 +329,7 @@ async fn get_token(
     let tid = id.to_string();
     let t = svc
         .db
-        .read(move |conn| Ok(store::get_token(conn, &tid)?))
+        .read(move |conn| Ok(conn.get_token(&tid)?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -563,7 +563,7 @@ async fn list_requests(
     };
     let rows = svc
         .db
-        .read(move |conn| Ok(store::list_requests(conn, &filter)?))
+        .read(move |conn| Ok(conn.list_requests(&filter)?))
         .await
         .map_err(db_error)?;
     let flag = q.get("flag").map(str::to_string);
@@ -771,7 +771,7 @@ async fn list_settings(
 ) -> Result<Response<ApiBody>, ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::load_settings(conn)?))
+        .read(|conn| Ok(conn.load_settings()?))
         .await
         .map_err(db_error)?;
     let list: Vec<Value> = settings::effective_view(&svc.config, &rows)
@@ -847,7 +847,7 @@ async fn reset_effective(
 ) -> Result<(settings::Effective, settings::Effective), ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::load_settings(conn)?))
+        .read(|conn| Ok(conn.load_settings()?))
         .await
         .map_err(db_error)?;
     let overrides = settings::overrides_from(&rows);
@@ -1173,29 +1173,6 @@ fn cert_state(c: &ps::CertRow, grace_days: u32, now_ms: i64) -> &'static str {
 /// `host_group`；主機還沒連線過（清冊沒有這台）時用申請的主機名稱
 type CertHost = (Option<String>, Option<String>);
 
-fn cert_hosts(
-    conn: &rusqlite::Connection,
-    serial: Option<&str>,
-) -> rusqlite::Result<std::collections::HashMap<String, CertHost>> {
-    let mut stmt = conn.prepare(
-        "SELECT c.serial, coalesce(h.hostname, r.hostname), h.host_group
-         FROM pki_certificates c
-         LEFT JOIN hosts h ON h.agent_id = c.agent_id
-         LEFT JOIN enroll_requests r ON r.request_id = c.request_id
-         WHERE ?1 IS NULL OR c.serial = ?1",
-    )?;
-    let rows = stmt.query_map([serial], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            (
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ),
-        ))
-    })?;
-    rows.collect()
-}
-
 fn cert_json(
     c: &ps::CertRow,
     host: Option<&CertHost>,
@@ -1240,12 +1217,7 @@ async fn list_certs(
     let limit = limit_of(q)?;
     let (rows, hosts) = svc
         .db
-        .read(|conn| {
-            Ok((
-                ps::list_certs(conn, 1_000_000, None)?,
-                cert_hosts(conn, None)?,
-            ))
-        })
+        .read(|conn| Ok((conn.list_certs(1_000_000, None)?, conn.cert_hosts(None)?)))
         .await
         .map_err(db_error)?;
     let now_ms = now.timestamp_millis();
@@ -1295,8 +1267,8 @@ async fn get_cert(
     let (c, hosts) = svc
         .db
         .read(move |conn| {
-            let c = ps::get_cert(conn, &s)?;
-            let hosts = cert_hosts(conn, Some(&s))?;
+            let c = conn.get_cert(&s)?;
+            let hosts = conn.cert_hosts(Some(&s))?;
             Ok(c.map(|c| (c, hosts)))
         })
         .await
@@ -1521,10 +1493,10 @@ async fn get_ca(
     let (cas, threshold) = svc
         .db
         .read(move |conn| {
-            let cas = ps::list_cas(conn)?;
+            let cas = conn.list_cas()?;
             let mut out = Vec::new();
             for c in cas {
-                let n = ps::issued_count_by_ca(conn, c.ca_id)?;
+                let n = conn.issued_count_by_ca(c.ca_id)?;
                 out.push((c, n));
             }
             Ok((out, s2.issuing_ca_warning_ms(conn, now_ms)))
@@ -1562,8 +1534,8 @@ async fn get_crl(
         .db
         .read(|conn| {
             let mut out = Vec::new();
-            for ca in ps::trust_anchor_cas(conn)? {
-                let history = ps::crl_history(conn, ca.ca_id, 100)?;
+            for ca in conn.trust_anchor_cas()? {
+                let history = conn.crl_history(ca.ca_id, 100)?;
                 out.push(json!({
                     "ca_id": ca.ca_id,
                     "current": history.first().map(|c| json!({
@@ -1626,7 +1598,7 @@ async fn signing_queue(
 ) -> Result<Response<ApiBody>, ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::approved_requests(conn, 100_000)?))
+        .read(|conn| Ok(conn.approved_requests(100_000)?))
         .await
         .map_err(db_error)?;
     Ok(http::ok(

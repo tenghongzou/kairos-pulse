@@ -7,27 +7,27 @@
 //!   序號未使用、`notAfter` 在未來、EKU `clientAuth`。通過的申請改為 `issued`；不通過的列出原因。
 
 use kairos_proto::enroll::{b64url_decode, b64url_encode, format_rfc3339_ms};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
 use super::csr::check_csr;
 use super::issue::{IssuingCa, random_serial};
-use super::store::{self as ps, CertRow};
+use super::store::CertRow;
 use super::x509::{parse_cert, verify_cert_signature};
 use crate::enroll::pki_mgr::issued_via;
-use crate::enroll::store::{self as es, Audit, DbState};
+use crate::enroll::store::{Audit, DbState};
+use crate::store::prelude::*;
 
 pub const QUEUE_SCHEMA: &str = "kairos-csr-queue/v1";
 pub const SIGNED_SCHEMA: &str = "kairos-signed-certs/v1";
 
 /// 匯出待簽發的申請
 pub fn export(
-    conn: &Connection,
+    conn: &dyn Store,
     instance: &str,
     default_days: u32,
     now_ms: i64,
 ) -> Result<Value, String> {
-    let rows = es::approved_requests(conn, 100_000).map_err(|e| e.to_string())?;
+    let rows = conn.approved_requests(100_000).map_err(|e| e.to_string())?;
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -97,7 +97,7 @@ pub struct Imported {
 
 /// 匯入簽好的憑證。`anchors` 為目前的信任錨（`auth.client_ca` 與簽發 CA 的 DER）
 pub fn import(
-    conn: &mut Connection,
+    conn: &dyn Store,
     signed: &Value,
     anchors: &[Vec<u8>],
     by: &str,
@@ -125,7 +125,7 @@ pub fn import(
 
 /// 匯入一張憑證（PEM 目錄的匯入也使用）
 pub fn import_one(
-    conn: &mut Connection,
+    conn: &dyn Store,
     request_id: &str,
     der: &[u8],
     anchors: &[Vec<u8>],
@@ -133,10 +133,9 @@ pub fn import_one(
     now_ms: i64,
 ) -> Result<String, String> {
     let info = parse_cert(der)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
-    let req = es::get_request(&tx, request_id)
+    let tx = conn.begin(TxMode::Immediate).map_err(|e| e.to_string())?;
+    let req = tx
+        .get_request(request_id)
         .map_err(|e| e.to_string())?
         .ok_or("找不到這筆申請")?;
     if req.state != DbState::Approved {
@@ -168,11 +167,12 @@ pub fn import_one(
     if info.is_ca {
         return Err("不能是 CA 憑證".into());
     }
-    if ps::serial_exists(&tx, &info.serial).map_err(|e| e.to_string())? {
+    if tx.serial_exists(&info.serial).map_err(|e| e.to_string())? {
         return Err(format!("序號 {} 已使用過", info.serial));
     }
     let anchor_spki = parse_cert(anchor)?.spki_der;
-    let ca_id = ps::find_ca_by_spki(&tx, &kairos_proto::enroll::sha256(&anchor_spki))
+    let ca_id = tx
+        .find_ca_by_spki(&kairos_proto::enroll::sha256(&anchor_spki))
         .map_err(|e| e.to_string())?
         .map(|c| c.ca_id);
     let cert = CertRow {
@@ -189,11 +189,13 @@ pub fn import_one(
         approved_by: req.decided_by.clone(),
         ..CertRow::default()
     };
-    let e = |e: rusqlite::Error| e.to_string();
-    ps::insert_cert(&tx, &cert).map_err(e)?;
-    es::mark_issued(&tx, &req.request_id, &cert.serial, by, now_ms).map_err(e)?;
-    es::upsert_host_on_issue(
-        &tx,
+    fn e(e: impl std::fmt::Display) -> String {
+        e.to_string()
+    }
+    tx.insert_cert(&cert).map_err(e)?;
+    tx.mark_issued(&req.request_id, &cert.serial, by, now_ms)
+        .map_err(e)?;
+    tx.upsert_host_on_issue(
         &req.agent_id,
         &req.hostname,
         req.host_fingerprint.as_deref(),
@@ -204,8 +206,7 @@ pub fn import_one(
         now_ms,
     )
     .map_err(e)?;
-    es::audit(
-        &tx,
+    tx.audit(
         now_ms,
         &Audit {
             actor: by,
@@ -223,8 +224,9 @@ pub fn import_one(
 }
 
 /// 目前的信任錨（DER）：`auth.client_ca` 的檔案與 Kairos 的簽發 CA
-pub fn anchors(conn: &Connection, client_ca: Option<&str>) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = ps::trust_anchor_cas(conn)
+pub fn anchors(conn: &dyn Store, client_ca: Option<&str>) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = conn
+        .trust_anchor_cas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|c| c.cert_der)
@@ -265,7 +267,7 @@ pub enum ExistingImport {
 /// 不是 CA、有 EKU 時必須含 `clientAuth`、SAN 恰好一個 DNS 名稱且是 UUID（`agent_id`）、CN 有的話等於它、
 /// 序號沒有被另一張憑證使用。清冊中沒有這台主機時新增最小的一列（主機名稱暫為 `agent_id`，第一次連線後更新）
 pub fn import_existing(
-    conn: &mut Connection,
+    conn: &dyn Store,
     der: &[u8],
     anchors: &[Vec<u8>],
     expected_agent: Option<&str>,
@@ -302,11 +304,11 @@ pub fn import_existing(
         .iter()
         .find(|a| verify_cert_signature(der, a))
         .ok_or("憑證不是由目前的信任錨直接簽發（auth.client_ca 或 Kairos 的簽發 CA）")?;
-    let e = |e: rusqlite::Error| e.to_string();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(e)?;
-    if let Some(existing) = ps::get_cert(&tx, &info.serial).map_err(e)? {
+    fn e(e: impl std::fmt::Display) -> String {
+        e.to_string()
+    }
+    let tx = conn.begin(TxMode::Immediate).map_err(e)?;
+    if let Some(existing) = tx.get_cert(&info.serial).map_err(e)? {
         if existing.cert_der == der {
             return Ok(ExistingImport::Already {
                 serial: existing.serial,
@@ -316,7 +318,8 @@ pub fn import_existing(
         return Err(format!("序號 {} 已被另一張憑證使用", info.serial));
     }
     let anchor_spki = parse_cert(anchor)?.spki_der;
-    let ca_id = ps::find_ca_by_spki(&tx, &kairos_proto::enroll::sha256(&anchor_spki))
+    let ca_id = tx
+        .find_ca_by_spki(&kairos_proto::enroll::sha256(&anchor_spki))
         .map_err(e)?
         .map(|c| c.ca_id);
     let cert = CertRow {
@@ -332,39 +335,24 @@ pub fn import_existing(
         approved_by: Some(by.to_string()),
         ..CertRow::default()
     };
-    ps::insert_cert(&tx, &cert).map_err(e)?;
+    tx.insert_cert(&cert).map_err(e)?;
     // 清冊：沒有這台主機時新增；現有的最新憑證比這張早到期時改以這張為最新
-    let current: Option<(Option<String>, Option<i64>)> = tx
-        .query_row(
-            "SELECT h.current_serial, c.not_after FROM hosts h
-             LEFT JOIN pki_certificates c ON c.serial = h.current_serial WHERE h.agent_id = ?1",
-            [&agent_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(e)?;
+    let current: Option<(Option<String>, Option<i64>)> =
+        tx.host_current_cert(&agent_id).map_err(e)?;
     let new_host = current.is_none();
     match current {
         None => {
-            tx.execute(
-                "INSERT INTO hosts (agent_id, hostname, online, first_seen, last_seen, source, current_serial, lifecycle)
-                 VALUES (?1, ?1, 0, ?2, ?2, 'cert_import', ?3, 'active')",
-                params![agent_id, now_ms, cert.serial],
-            )
-            .map_err(e)?;
+            tx.insert_imported_host(&agent_id, now_ms, &cert.serial)
+                .map_err(e)?;
         }
         Some((serial, not_after)) => {
             if serial.is_none() || not_after.is_none_or(|t| t < cert.not_after) {
-                tx.execute(
-                    "UPDATE hosts SET current_serial = ?2 WHERE agent_id = ?1",
-                    params![agent_id, cert.serial],
-                )
-                .map_err(e)?;
+                tx.set_host_current_serial(&agent_id, &cert.serial)
+                    .map_err(e)?;
             }
         }
     }
-    es::audit(
-        &tx,
+    tx.audit(
         now_ms,
         &Audit {
             actor: by,
@@ -442,6 +430,7 @@ pub fn existing_json(source: &str, r: &Result<ExistingImport, String>) -> Value 
 mod import_tests {
     use super::*;
     use crate::test_pki::{CA, GOOD_CERT, GOOD_ID, REVOKED_CERT};
+    use rusqlite::Connection;
 
     fn db() -> (std::path::PathBuf, Connection) {
         let dir = std::env::temp_dir().join(format!(
@@ -464,12 +453,12 @@ mod import_tests {
 
     #[test]
     fn existing_certificates_are_checked_and_imported_once() {
-        let (dir, mut conn) = db();
+        let (dir, conn) = db();
         let anchors = vec![der(CA)];
         let now = 1_791_000_000_000;
         // 指定的 agent_id 不符、不是信任錨直接簽發、CA 憑證：拒絕，不寫入
         let e = import_existing(
-            &mut conn,
+            &conn,
             &der(GOOD_CERT),
             &anchors,
             Some("11111111-2222-4333-8444-555555555555"),
@@ -478,9 +467,9 @@ mod import_tests {
             now,
         );
         assert!(e.unwrap_err().contains("不是指定的"));
-        let e = import_existing(&mut conn, &der(GOOD_CERT), &[], None, "root", None, now);
+        let e = import_existing(&conn, &der(GOOD_CERT), &[], None, "root", None, now);
         assert!(e.unwrap_err().contains("信任錨"));
-        let e = import_existing(&mut conn, &der(CA), &anchors, None, "root", None, now);
+        let e = import_existing(&conn, &der(CA), &anchors, None, "root", None, now);
         assert!(e.unwrap_err().contains("CA"));
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pki_certificates", [], |r| r
@@ -490,7 +479,7 @@ mod import_tests {
         );
         // 匯入：清冊新增最小的一列（主機名稱暫為 agent_id）、稽核 cert.import
         let r = import_existing(
-            &mut conn,
+            &conn,
             &der(GOOD_CERT),
             &anchors,
             Some(GOOD_ID),
@@ -525,7 +514,7 @@ mod import_tests {
             (hostname.as_str(), current.as_str(), source.as_str()),
             (GOOD_ID, serial.as_str(), "cert_import")
         );
-        let c = ps::get_cert(&conn, &serial).unwrap().unwrap();
+        let c = conn.get_cert(&serial).unwrap().unwrap();
         assert_eq!(
             (c.issued_via.as_str(), c.approved_by.as_deref()),
             ("import", Some("root"))
@@ -540,15 +529,7 @@ mod import_tests {
             1
         );
         // 同一張再匯入：already；JSON 的形式
-        let again = import_existing(
-            &mut conn,
-            &der(GOOD_CERT),
-            &anchors,
-            None,
-            "root",
-            None,
-            now,
-        );
+        let again = import_existing(&conn, &der(GOOD_CERT), &anchors, None, "root", None, now);
         assert_eq!(
             again,
             Ok(ExistingImport::Already {
@@ -563,16 +544,8 @@ mod import_tests {
             "KRS-E1305"
         );
         // 第二台主機（另一張憑證）
-        let r2 = import_existing(
-            &mut conn,
-            &der(REVOKED_CERT),
-            &anchors,
-            None,
-            "root",
-            None,
-            now,
-        )
-        .unwrap();
+        let r2 =
+            import_existing(&conn, &der(REVOKED_CERT), &anchors, None, "root", None, now).unwrap();
         assert!(matches!(
             r2,
             ExistingImport::Imported { new_host: true, .. }

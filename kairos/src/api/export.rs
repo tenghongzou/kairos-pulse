@@ -23,6 +23,7 @@ use super::http::{self, ApiBody, ApiError, Query};
 use super::{ApiContext, account};
 use crate::export::settings::{self as xs, CONSOLE_KEYS, KEY_OTLP_HEADERS};
 use crate::export::{CODE_EXPORT_CONFIG, CODE_EXPORT_DISABLED, ExportHub, lock, prom};
+use crate::store::prelude::*;
 
 /// `PUT /api/v1/export/settings` 的本文上限
 const MAX_BODY: usize = 64 * 1024;
@@ -470,16 +471,16 @@ async fn update(
     };
     ctx.admin
         .write(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = c.begin(TxMode::Deferred)?;
             for (k, v) in &writes {
                 match v {
-                    Some(v) => crate::enroll::store::set_setting(&tx, k, v, &actor, now_ms)?,
+                    Some(v) => tx.set_setting(k, v, &actor, now_ms)?,
                     None => {
-                        crate::enroll::store::delete_setting(&tx, k)?;
+                        tx.delete_setting(k)?;
                     }
                 }
             }
-            event.append(&tx, now_ms)?;
+            event.append(&*tx, now_ms)?;
             tx.commit()
         })
         .await
@@ -505,7 +506,7 @@ async fn update(
 async fn current_rows(ctx: &Arc<ApiContext>) -> Result<Vec<xs::Row>, ApiError> {
     ctx.pool
         .read("設定", |conn| {
-            crate::enroll::store::load_settings(conn)
+            conn.load_settings()
                 .map(|rows| {
                     rows.into_iter()
                         .filter(|(k, ..)| CONSOLE_KEYS.contains(&k.as_str()))

@@ -601,8 +601,7 @@ async fn system_audit(
     let r = svc
         .db
         .write(move |conn| {
-            crate::audit::append(
-                conn,
+            conn.audit_append(
                 now,
                 &crate::audit::Audit {
                     actor: "system",
