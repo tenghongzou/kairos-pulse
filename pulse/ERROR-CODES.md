@@ -15,7 +15,7 @@
 
 日誌中的事件與代碼固定不翻譯，規則與搜尋請比對這兩欄（例如 `grep ' buffer.full PLS-W4202 '`），不要比對訊息文字。
 
-## 2. 已對應的代碼（96 個，含 0.8.0 新增的 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔指標擴充〕與 2.7 的 `PLS-E8105`、`PLS-E8106`〔Windows 服務〕，設計包 §30.3 正式分配；以及 0.9.0 的 3 個：2.8 的 `PLS-W2301`、`PLS-E2302`、`PLS-I8507`〔多伺服器位址與排空，設計包 §31.3 正式分配；`PLS-I8507` 原暫定為 `PLS-I8407`〕）
+## 2. 已對應的代碼（96 個，含 0.8.0 新增的 4 個：2.3 的 `PLS-W2108`、2.4 的 `PLS-I8009`〔指標擴充〕與 2.7 的 `PLS-E8105`、`PLS-E8106`〔Windows 服務〕，設計包 §30.3 正式分配；以及 0.9.0 的 21 個：2.8 的 `PLS-W2301`、`PLS-E2302`、`PLS-I8507`〔多伺服器位址與排空，設計包 §31.3 正式分配；`PLS-I8507` 原暫定為 `PLS-I8407`〕與 2.9 的 18 個〔集中設定、遠端升級，設計包 §31.3 正式分配〕）
 
 程式位置為 `pulse/src/` 下的檔案與函式。「狀態」指 `pulse status` 的檢查列（服務、連線、回報、身分、設定、時鐘）。
 
@@ -155,6 +155,31 @@
 
 設定值不合法（`fallback_addresses` 超過 16 個、IPv6 沒有方括號、連接埠不合法等）沿用 `PLS-E0201`。
 
+### 2.9 集中設定與遠端升級（0.9.0）
+
+設計包 `decisions/INTEGRATION.md` §31.3（2026-10-19）正式分配：子類別 05「集中設定」、84「遠端升級」（`crates/kairos-proto/REMOTE.md` 第 11 節）。程式位置為 `pulse/src/remote/` 下的檔案。`upgrade_status` 與 `config_status` 的 `code` 欄位也送出這些代碼，Kairos 端記錄的是鏡像的 `KRS-` 代碼。
+
+| 代碼 | 程式位置 | 觸發條件 | 看得到的地方 |
+|---|---|---|---|
+| `PLS-W0501`（鏡像 `KRS-W0501`） | `config.rs` `apply_settings` | 下發的設定有任何白名單鍵的型別、範圍不合法或互相矛盾（含與本機的值合併後），整份拒絕、沿用上一版 | `config.rejected`；`config_status` 的 `state: rejected`、`errors`；「設定」列「集中設定：第 N 版被拒」 |
+| `PLS-I0503`（鏡像 `KRS-I0503`） | `config.rs` `log_overridden` | 下發的鍵被 `pulse.toml` 或環境變數覆蓋（本機值與下發值不同） | `config.overridden`（覆蓋的鍵集合改變時一則）；`config_status` 的 `overridden` |
+| `PLS-W0504`（鏡像 `KRS-W0504`） | `config.rs` `on_connect_failed`、`CentralConfig::new` | 套用後確認前連續 3 次無法完成註冊，或連續兩次在確認前重新啟動：已回復上一份可用的設定 | `config.rolled_back`；`config_status` 的 `state: rolled_back` |
+| `PLS-I0505`（鏡像 `KRS-I0505`） | `config.rs` `CentralConfig::new` | `[remote_config] enabled = false` | `config.disabled`（啟動時一則）；停用後第一次連線的 `config_status` |
+| `PLS-E0506` | `config.rs` `CacheFile::load`、`persist` | 遠端設定的快取（`<狀態目錄>/remote/config.json`）損毀或無法寫入：改用本機設定；無法寫入時新的版本不套用（`rejected`） | `config.cache_unavailable`（ERROR）；`pulse check-config --with-remote` 的警告 |
+| `PLS-E8401`（鏡像 `KRS-E8401`） | `upgrade/mod.rs` `verify_failed`；`upgrade/helper.rs` | 發佈包的簽章驗證失敗（簽署者不在信任錨中、簽章無效、namespace 不符、`SHA256SUMS` 被竄改）：不替換、刪除暫存、不重試同一個提議 | `upgrade.verify_failed`（ERROR，同時寫 stderr）；`upgrade_status` 的 `failed` |
+| `PLS-E8402`（鏡像 `KRS-W8402`） | 同上 | 發佈檔的雜湊、檔名、平台或版本與簽署的 `SHA256SUMS`、清單、提議不符；下載後 SHA-256 連續 3 次不符；提議的格式不合法（`declined`）；輔助程式複製時遇到符號連結、硬連結或超大檔案 | `upgrade.verify_failed`；`upgrade_status` 的 `failed`（格式不合法為 `declined`） |
+| `PLS-E8403` | `install.rs` `load_trust_anchor`；`upgrade/mod.rs` | 信任錨 `allowed_signers` 不存在、不是一般檔案、不是 root 擁有、群組或其他人可寫，或沒有可用於 `kairos-pulse-release` 的 `ssh-ed25519` 金鑰：遠端升級停用（`install.upgrade = "no_trust_anchor"`） | `upgrade.trust_anchor_unavailable`（啟動時一則 ERROR）；`pulse upgrade status` |
+| `PLS-W8404`（鏡像 `KRS-W8404`） | `upgrade/mod.rs` `log_download` | 下載中斷、段落不符、暫存檔無法寫入、Kairos 回應錯誤：續傳重試中 | `upgrade.download_failed`（節流 10 分鐘） |
+| `PLS-E8405`（鏡像 `KRS-E8405`） | `upgrade/helper.rs` `prepare` | 新版預檢失敗：無法解開、`pulse --version` 不是目標版本、`pulse check-config --with-remote` 結束代碼不是 0／8、`pulse.toml` 無法載入；沒有變更 | `upgrade.failed`；`upgrade_status` 的 `failed` |
+| `PLS-E8406`（鏡像 `KRS-E8406`） | `upgrade/helper.rs` `replace`；`upgrade/mod.rs` `write_request` | 替換失敗（檔案操作、`dpkg`／`rpm` 失敗或鎖住超過 10 分鐘、`request.json` 無法寫入）：已換回原本的執行檔 | `upgrade.failed`；`journalctl -u pulse-upgrade` |
+| `PLS-W8407`（鏡像 `KRS-W8407`） | `upgrade/helper.rs` `confirm_rollback` | 健康確認失敗（逾時、崩潰重啟、結束代碼 2／3／4），已自動回滾且舊版恢復 | `upgrade.rolled_back`；「升級」列 ⚠「已回滾到 X」 |
+| `PLS-E8408`（鏡像 `KRS-E8408`） | `upgrade/helper.rs` `rollback_failed` | 回滾後舊版也不健康，或無法換回：保留所有暫存與紀錄，不再動作 | `upgrade.rollback_failed`（ERROR，同時寫 stderr）；「升級」列 ✗，`pulse status` 結束代碼 9 |
+| `PLS-I8409`（鏡像 `KRS-I8409`） | `upgrade/mod.rs` `decline`；`helper.rs` | `[upgrade] enabled = false`（`pulse.toml` 或環境變數；輔助程式只看 `pulse.toml`） | `upgrade.declined`（INFO） |
+| `PLS-W8410`（鏡像 `KRS-W8410`） | `upgrade/mod.rs`；`helper.rs` | 目標版本低於目前版本，而推送或本機的 `allow_downgrade` 不允許 | `upgrade.declined` |
+| `PLS-W8411`（鏡像 `KRS-W8411`） | `upgrade/mod.rs` `on_offer`；`cli.rs` | 不支援的安裝方式或條件：缺少輔助程式、多實例、容器、未知安裝方式、外部 URL（`url_not_allowed`，0.10.0）、低於清單的 `min_upgrade_from`、沒有清單 | `upgrade.declined`；`pulse upgrade status` |
+| `PLS-W8412`（鏡像 `KRS-W8412`） | `upgrade/mod.rs` `on_offer` | 狀態目錄所在的檔案系統可用空間小於 `3 × 發佈檔大小 + 64 MiB`，或暫存目錄無法建立 | `upgrade.declined` |
+| `PLS-I8416`（鏡像 `KRS-I8416`） | `upgrade/helper.rs` `after_replace`；`upgrade/mod.rs` `poll_result` | 健康確認通過，已升級 | `upgrade.completed`；「升級」列「已升級到 X」 |
+
 ## 3. 日誌事件（`log-ux.md` §4）
 
 | 事件 | 事件識別碼 | 程式位置 | 已實作 |
@@ -174,6 +199,8 @@
 | `log.retention_paused` | 5001 | `log_files.rs` | ✓ |
 | `buffer.opened`、`buffer.unavailable`、`buffer.write_failed`、`buffer.full`、`buffer.expired`、`buffer.replay_done` | 5010～5015 | `main.rs`、`spool.rs`、`network.rs` | ✓ |
 | `status.write_failed`、`status.write_restored` | 5020、5021 | `local_status.rs` | ✓（設計包 §26 補登） |
+| `config.applied`、`config.rejected`、`config.rolled_back`、`config.overridden`、`config.cache_unavailable`、`config.disabled` | 6000～6005 | `remote/config.rs` | ✓（0.9.0；設計包 `pulse/log-ux.md` §4.6） |
+| `upgrade.offered`～`upgrade.trust_anchor_unavailable` | 6100～6110 | `remote/upgrade/mod.rs`（Pulse 端）；輔助程式 `pulse upgrade apply` 只寫 stderr（journal）與 `/var/lib/pulse-upgrade/<id>/upgrade.log`，不使用事件識別碼 | ✓（0.9.0；`upgrade.completed`、`upgrade.rolled_back`、`upgrade.rollback_failed`、`upgrade.failed` 由替換後的 Pulse 讀 `result.json` 時記錄） |
 | `conn.retry`、`conn.retry_summary` | —、2002 | — | 待辦（§4） |
 | `config.loaded`、`identity.clone_suspected` | 1002、1006 | — | 待辦 |
 | `cert.renewed`、`cert.renew_failed`、`cert.renew_started`、`cert.grace_*` | 3001～3007 | `main.rs` `connection_loop`、`rotation.rs`、`enroll/service.rs` | ✓（0.5） |

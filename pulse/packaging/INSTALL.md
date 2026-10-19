@@ -47,6 +47,7 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
 
   `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。套件的完整性仍以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。根 CA 與發佈公鑰都要從另一個管道取得。
 - 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
+- **遠端管理（0.9.0）**：腳本另外把 `--allowed-signers` 的檔案複製到 `/etc/kairos-pulse/allowed_signers`（root 644），作為遠端升級的信任錨（已經放在那裡時不動）。不接受 Kairos 推送的升級：`--no-remote-upgrade`；不接受下發的設定：`--no-remote-config`（兩者都寫進 `/opt/pulse/pulse.toml`，見第 10.1 節）。
 - 安裝字串會短暫出現在 `pulse enroll` 的命令列（`ps` 看得到）；token 有使用次數與期限，部署完成後由管理者停用（`kairos enroll-token disable`）。
 
 ### A.2 deb／rpm 套件（Linux）
@@ -62,7 +63,7 @@ pulse status
 
 - **安裝字串含註冊 token，不要放在命令列**（0.8.0）：`--install-string <字串>` 在 `pulse enroll` 執行期間其他帳號可從 `ps`／`/proc/<pid>/cmdline` 看到，也會留在 shell 歷史。建議存成只有 root 能讀的檔案後 `--install-string-file <檔案>`，或從 stdin 傳入 `--install-string-file -`（例如 `sudo pulse enroll --install-string-file - < install-string.txt`）；`--install-string` 保留相容但不建議。一行安裝腳本與 Ansible role 都經 stdin 傳入。
 - 套件的版面與 tar.gz 相同（`/opt/pulse`），另外安裝 `/usr/lib/systemd/system/pulse.service` 與 `/usr/bin/pulse`。`/opt/pulse/pulse.toml` 是初始設定（只有註解；`pulse enroll` 會加上 `[server]`），升級不覆寫。
-- **套件做的事**（`packaging/pkg/*.sh`）：安裝前建立系統帳號 `pulse`；安裝後建立 `logs/`、`buffer/`（`pulse:pulse` 750）、`identity/`（700），產生 `agent.id`（`root:pulse` 640；已存在時沿用），`systemctl enable pulse`（不啟動）；升級時 `systemctl try-restart pulse`；移除時 `systemctl disable --now pulse`。
+- **套件做的事**（`packaging/pkg/*.sh`）：安裝前建立系統帳號 `pulse`；安裝後建立 `logs/`、`buffer/`（`pulse:pulse` 750）、`identity/`（700），產生 `agent.id`（`root:pulse` 640；已存在時沿用），`systemctl enable pulse`（不啟動）；升級時 `systemctl try-restart pulse`；移除時 `systemctl disable --now pulse`。0.9.0 起另外安裝 `/usr/lib/systemd/system/pulse-upgrade.path`／`pulse-upgrade.service` 並啟用 `pulse-upgrade.path`（遠端升級的輔助程式，第 10.1 節），寫入 `/opt/pulse/.install-method`（`deb`／`rpm`，供遠端升級選擇發佈檔）；移除時一併停用 `pulse-upgrade.path`。
 - **移除**：`apt remove pulse`／`dnf remove pulse` 保留身分（`identity/`、`agent.id`）、設定與日誌，重新安裝後沿用（rpm 會把改過的設定改名為 `pulse.toml.rpmsave`，重新安裝後改回 `pulse.toml`）；`apt purge pulse` 另外刪除身分、緩衝、日誌與 `/var/lib/pulse`。**完全移除前先通知 Kairos**（`cd /opt/pulse && ./pulse decommission --initiated-by package_manager`，第 12 節）：套件的移除腳本不會自動執行，避免暫時移除（例如重新安裝）就撤銷憑證。
 - 多實例（第 9 節）不支援套件安裝：以 tar.gz 依第 9 節設定。
 
@@ -703,6 +704,27 @@ tail -n 20 /opt/pulse/logs/pulse-$(date -u +%F).log
 - 從沒有 `NotifyAccess=main` 的舊版 unit 升級時，步驟 2 的 `diff` 會列出這一行；請換上新版 unit（多實例時重新產生每個 `pulse-N.service`），否則 `systemctl status` 不會顯示 `Status:` 行（見 8.1）。
 - 從 0.1.x 升級時：全部 Pulse 都升級並重新註冊後，再通知 Kairos 管理者升級 Kairos。從 0.2 升級到 0.3 時則先確認 Kairos 已是 0.3。
 - 回滾：`mv /opt/pulse/pulse.prev /opt/pulse/pulse && systemctl restart pulse`。
+- **升級到 0.9.0（集中設定與遠端升級）**：協定不變，與 Kairos 任意順序升級皆可（兩個功能都要 Kairos 0.9.0 以上、SQLite 儲存、mTLS 才會協商）。**遠端升級需要每台主機先手動升級一次到 0.9.0**，並放好信任錨與輔助程式（第 10.1 節）；之後的版本才能由 Kairos 推送。集中設定預設啟用：大多數主機的 `pulse.toml` 只有 `[server]`，Kairos 下發的鍵就會生效；本機明確寫出的鍵優先。
+
+### 10.1 遠端升級的準備（0.9.0，Linux）
+
+Kairos 0.9.0 可以推送**官方簽章**的新版 Pulse（`crates/kairos-proto/REMOTE.md` 第 4 節）。Pulse 只負責下載與第一次驗證；替換、重新啟動、健康確認與回滾由 root 的 `pulse-upgrade.service` 以目前已安裝的執行檔執行，它重新驗證所有檔案、不連網路。需要：
+
+1. **信任錨**：發佈公鑰（第 2 節的 `allowed_signers`，從另一個管道取得）放在 `/etc/kairos-pulse/allowed_signers`，root 擁有、其他人不可寫（例如 `install -d -m 755 /etc/kairos-pulse && install -o root -g root -m 644 allowed_signers /etc/kairos-pulse/allowed_signers`）。只接受 `ssh-ed25519` 金鑰與 `namespaces="kairos-pulse-release"`、`valid-after`、`valid-before` 選項（`cert-authority` 等其他選項的那一行整行拒絕）。放在其他位置時在 `pulse.toml` 設定 `[upgrade] allowed_signers = "<路徑>"`。一行安裝腳本會自動放置（A.1）。金鑰輪替：過渡期間同時列出新舊兩把（可用 `valid-before` 讓舊金鑰自動失效）；輪替只能在本機做（組態管理工具），遠端升級與集中設定都不能修改信任錨。
+2. **輔助程式**：套件（A.2）會安裝並啟用。tar 安裝：
+
+   ```bash
+   install -o root -g root -m 644 pkg-new/pulse-upgrade.path pkg-new/pulse-upgrade.service /etc/systemd/system/
+   systemctl daemon-reload
+   systemctl enable --now pulse-upgrade.path
+   ```
+
+   `pulse-upgrade.path` 監看 `/var/lib/pulse/upgrade/request.json`（Pulse 在升級時段內寫入），檔案出現時啟動 `pulse-upgrade.service`（`Type=oneshot`、root、`RestrictAddressFamilies=AF_UNIX`，工作目錄 `/var/lib/pulse-upgrade` 為 0700）。
+3. **確認**：Pulse 每次連線前重新偵測（不必重新啟動；`[upgrade]` 的設定改變時才需要重新啟動）。`pulse upgrade status` 應顯示「遠端升級：就緒」與信任錨的金鑰指紋；不是時顯示原因（`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`：多實例、容器、不是 `/opt/pulse` 的 tar 安裝）。
+
+升級時：tar 安裝替換 `/opt/pulse/pulse`（舊版保留為 `pulse.prev`），`/etc/systemd/system/pulse.service` 是歷來的官方版本（沒有被修改過）時一併換新並 `daemon-reload`，改過的不動（結果的 `detail` 註明 `unit_not_updated`，服務照常執行）；deb／rpm 以 `dpkg -i --force-confold`／`rpm -U` 安裝（`pulse.toml` 不覆寫）。替換後在健康確認期限內（預設 600 秒）確認新版已連上 Kairos 並有 report 被確認，再穩定 60 秒才算成功；否則自動回滾。紀錄：`journalctl -u pulse-upgrade`、`/var/lib/pulse-upgrade/<upgrade_id>/upgrade.log`（`pulse diag` 收集）。回滾失敗（`PLS-E8408`）時所有暫存都保留，請依紀錄手動處理：tar 安裝 `sudo pulse upgrade rollback --yes`（換回 `pulse.prev`）；deb／rpm 以舊版套件 `dpkg -i`／`rpm -U --oldpackage` 重新安裝。
+
+不要遠端升級：`pulse.toml` 寫入 `[upgrade] enabled = false`（或 `systemctl disable --now pulse-upgrade.path`）。不要集中設定：`[remote_config] enabled = false`。這兩個區段只能寫在 `pulse.toml`（輔助程式只讀它；環境變數只能關閉、不能開啟）。
 
 ## 11. 憑證更新與 agent_id 重新產生
 
@@ -742,7 +764,9 @@ for u in $(systemctl list-unit-files 'pulse-*.service' --no-legend | awk '{print
   rm -rf "/etc/systemd/system/$u.d"      # systemctl edit 建立的 drop-in
 done
 
-# 3. 停用並移除第一個實例
+# 3. 停用並移除第一個實例（與遠端升級的輔助程式，0.9.0）
+systemctl disable --now pulse-upgrade.path 2>/dev/null
+rm -f /etc/systemd/system/pulse-upgrade.path /etc/systemd/system/pulse-upgrade.service
 systemctl disable --now pulse
 rm -f /etc/systemd/system/pulse.service
 rm -rf /etc/systemd/system/pulse.service.d
@@ -757,7 +781,9 @@ for id in $(cat /opt/pulse/agent.id /opt/pulse-[0-9]*/agent.id 2>/dev/null); do
 done
 rm -rf /opt/pulse-[0-9]*   # 多實例的工作目錄（含私鑰、agent.id 與日誌）
 rm -rf /opt/pulse          # 含共用執行檔、客戶端私鑰、agent.id 與日誌
-rm -rf /var/lib/pulse      # 本機狀態檔（StateDirectory=，停止服務後不會自動刪除）
+rm -rf /var/lib/pulse      # 本機狀態檔、遠端設定快取與升級暫存（StateDirectory=，停止服務後不會自動刪除）
+rm -rf /var/lib/pulse-upgrade   # 遠端升級輔助程式的紀錄（0.9.0）
+rm -f /etc/kairos-pulse/allowed_signers   # 遠端升級的信任錨（沒有其他產品使用時）
 rm -rf /run/pulse          # 複製的系統序號（RuntimeDirectoryPreserve=yes，重新開機前不會自動刪除）
 userdel pulse              # 同名群組 pulse 會一併移除
 
