@@ -61,6 +61,13 @@ impl<C: AsConn> AlertStore for C {
         fn finish_action(&self, id: i64, now_ms: i64, result: &Value) -> () => finish_action;
         fn action_result(&self, id: i64) -> Option<Value> => action_result;
         fn purge_alerts(&self, now_ms: i64, retention_days: u32, max_events: u64, batch: i64) -> (Purged, bool) => purge;
+        fn plain_series_ids(&self, name: &str) -> Vec<i64> => plain_series_ids;
+        fn host_series_by_name(&self, host_id: i64, name: &str) -> Vec<(i64, String, i64)> => host_series_by_name;
+        fn host_logical_cores(&self, host_id: i64) -> Option<i64> => host_logical_cores;
+        fn rollup_means(&self, table: &str, host_id: i64, series_id: i64, from_secs: i64) -> Vec<(i64, f64)> => rollup_means;
+        fn backtest_hosts(&self) -> Vec<(i64, String, Option<String>, Option<String>, String)> => backtest_hosts;
+        fn backtest_host_info(&self, host_id: i64) -> (Option<String>, Option<String>, Option<String>, Option<i64>) => backtest_host_info;
+        fn active_host_scope_rows(&self) -> Vec<(String, Option<String>, Option<String>)> => active_host_scope_rows;
     }
 }
 
@@ -1189,6 +1196,118 @@ pub fn active_hosts_seen_since(
         conn.prepare("SELECT agent_id FROM hosts WHERE lifecycle = 'active' AND last_seen >= ?1")?;
     stmt.query_map([since_ms], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()
+}
+
+/// 沒有 label 的序列（原本在 `alerts/backtest.rs` 的 `series_ids`）
+pub fn plain_series_ids(conn: &Connection, name: &str) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn
+        .prepare("SELECT series_id FROM series WHERE name = ?1 AND labels = '' AND derived = 0")?;
+    let rows = stmt.query_map([name], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// 這台主機某個名稱的序列（原本在 `alerts/backtest.rs` 的 `labeled_series`）
+pub fn host_series_by_name(
+    conn: &Connection,
+    host_id: i64,
+    name: &str,
+) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.series_id, s.labels, s.derived FROM series s JOIN host_series h USING (series_id)
+         WHERE h.host_id = ?1 AND s.name = ?2",
+    )?;
+    let rows = stmt.query_map(params![host_id, name], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// 資產中的 CPU 邏輯處理器數（原本在 `alerts/backtest.rs`）
+pub fn host_logical_cores(conn: &Connection, host_id: i64) -> rusqlite::Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT cpu_logical_cores FROM host_inventory WHERE host_id = ?1",
+            [host_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// 一條序列每個桶的平均值（原本在 `alerts/backtest.rs` 的 `load_series`）。`table` 只能是 `rollup_5m` 或 `rollup_1h`
+pub fn rollup_means(
+    conn: &Connection,
+    table: &str,
+    host_id: i64,
+    series_id: i64,
+    from_secs: i64,
+) -> rusqlite::Result<Vec<(i64, f64)>> {
+    debug_assert!(table == "rollup_5m" || table == "rollup_1h");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT bucket, vsum / cnt FROM {table} WHERE host_id = ?1 AND bucket >= ?2 AND series_id = ?3 AND cnt > 0"
+    ))?;
+    let rows = stmt.query_map(params![host_id, from_secs, series_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+    })?;
+    rows.collect()
+}
+
+/// 使用中的主機（原本在 `alerts/backtest.rs` 的 `preview`）
+#[allow(clippy::type_complexity)]
+pub fn backtest_hosts(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(i64, String, Option<String>, Option<String>, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT host_id, agent_id, tags, peer, hostname, display_name FROM hosts WHERE lifecycle = 'active'",
+    )?;
+    type Row5 = (i64, String, Option<String>, Option<String>, String);
+    let rows = stmt
+        .query_map([], |r| -> rusqlite::Result<Row5> {
+            let tags: Option<String> = r.get(2)?;
+            let peer: Option<String> = r.get(3)?;
+            let name: String = r
+                .get::<_, Option<String>>(5)?
+                .unwrap_or(r.get::<_, String>(4)?);
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                tags,
+                peer,
+                name,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+/// 主機的版本與作業系統（原本在 `alerts/backtest.rs` 的 `preview`）
+#[allow(clippy::type_complexity)]
+pub fn backtest_host_info(
+    conn: &Connection,
+    host_id: i64,
+) -> rusqlite::Result<(Option<String>, Option<String>, Option<String>, Option<i64>)> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_version, h.os, i.os_family, i.cpu_logical_cores FROM hosts h
+         LEFT JOIN host_inventory i ON i.host_id = h.host_id WHERE h.host_id = ?1",
+    )?;
+    stmt.query_row([host_id], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
+}
+
+/// 使用中的主機（原本在 `alerts_cli.rs` 的 `host_facts`）
+pub fn active_host_scope_rows(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, Option<String>, Option<String>)>> {
+    let mut stmt =
+        conn.prepare("SELECT agent_id, tags, peer FROM hosts WHERE lifecycle = 'active'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
 }
 
 #[cfg(test)]

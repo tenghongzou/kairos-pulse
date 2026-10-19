@@ -756,7 +756,7 @@ pub fn execute(
         }
         TokenAction::List { all } => {
             let rows = match open(cmd.config_path.as_deref(), false) {
-                Ok(Some(conn)) => match tokens::list(&conn) {
+                Ok(Some(conn)) => match conn.list_api_tokens() {
                     Ok(rows) => rows,
                     Err(e) => return fail(db_failure(e)),
                 },
@@ -873,7 +873,7 @@ pub fn execute(
                 }
                 Err(f) => return fail(f),
             };
-            let row = match tokens::get(&conn, token_id) {
+            let row = match conn.get_api_token(token_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     return fail(Failure::new(

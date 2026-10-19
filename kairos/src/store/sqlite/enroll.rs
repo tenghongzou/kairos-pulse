@@ -57,6 +57,13 @@ impl<C: AsConn> EnrollStore for C {
         fn decommission_host(&self, agent_id: &str, hostname: &str, by: &str, now_ms: i64) -> bool => decommission_host;
         fn set_grace_override(&self, agent_id: &str, until_ms: Option<i64>) -> bool => set_grace_override;
         fn set_last_grace_attempt(&self, agent_id: &str, attempt: &Value) -> () => set_last_grace_attempt;
+        fn decommissioned_agents(&self) -> std::collections::HashSet<String> => decommissioned_agents;
+        fn purge_old_tokens(&self, before_ms: i64) -> usize => purge_old_tokens;
+        fn impact_hosts(&self) -> Vec<(i64, Option<i64>, bool, i64)> => impact_hosts;
+        fn pending_enroll_count(&self) -> i64 => pending_enroll_count;
+        fn expired_cert_hosts(&self, now_ms: i64) -> Vec<(String, String, i64, Option<i64>)> => expired_cert_hosts;
+        fn token_progress_counts(&self, token_id: &str) -> Vec<(String, i64, Option<i64>)> => token_progress_counts;
+        fn stale_approvals(&self, before_ms: i64) -> (i64, Option<i64>) => stale_approvals;
     }
 }
 
@@ -877,4 +884,98 @@ pub fn set_last_grace_attempt(
         params![agent_id, attempt.to_string()],
     )?;
     Ok(())
+}
+
+/// 已除役的主機（原本在 `enroll/mod.rs`）
+pub fn decommissioned_agents(
+    conn: &Connection,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT agent_id FROM hosts WHERE lifecycle = 'decommissioned'")?;
+    stmt.query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()
+}
+
+/// 刪除停用或到期很久的 token（原本在 `enroll/mod.rs`）
+pub fn purge_old_tokens(conn: &Connection, before_ms: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
+        [before_ms],
+    )
+}
+
+/// 影響數字的主機（原本在 `enroll/ops.rs` 的 `impact`）
+pub fn impact_hosts(conn: &Connection) -> rusqlite::Result<Vec<(i64, Option<i64>, bool, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.not_after, h.grace_override_until, h.online, h.last_seen
+         FROM hosts h JOIN pki_certificates c ON c.serial = h.current_serial
+         WHERE h.lifecycle = 'active' AND c.revoked_at IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, i64>(2)? != 0,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// 待處理的新註冊申請數（原本在 `enroll/ops.rs` 的 `impact`）
+pub fn pending_enroll_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT count(*) FROM enroll_requests WHERE kind = 'enroll' AND state IN ('pending_approval', 'approved')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// 憑證已過期的主機（原本在 `enroll/ops.rs` 的 `grace_impact`）
+pub fn expired_cert_hosts(
+    conn: &Connection,
+    now_ms: i64,
+) -> rusqlite::Result<Vec<(String, String, i64, Option<i64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, COALESCE(NULLIF(h.display_name, ''), h.hostname), c.not_after, h.grace_override_until
+         FROM hosts h JOIN pki_certificates c ON c.serial = h.current_serial
+         WHERE h.lifecycle = 'active' AND c.revoked_at IS NULL AND c.not_after <= ?1",
+    )?;
+    let rows = stmt.query_map([now_ms], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// token 的部署進度（原本在 `enroll/ops.rs` 的 `token_progress`）
+pub fn token_progress_counts(
+    conn: &Connection,
+    token_id: &str,
+) -> rusqlite::Result<Vec<(String, i64, Option<i64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.state, count(*), sum(CASE WHEN h.connected_at IS NOT NULL AND h.connected_at >= r.decided_at THEN 1 ELSE 0 END)
+         FROM enroll_requests r LEFT JOIN hosts h ON h.agent_id = r.agent_id
+         WHERE r.token_id = ?1 GROUP BY r.state",
+    )?;
+    let rows = stmt.query_map([token_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// 久未簽發的已核准申請（原本在 `api/health.rs`）
+pub fn stale_approvals(conn: &Connection, before_ms: i64) -> rusqlite::Result<(i64, Option<i64>)> {
+    conn.query_row(
+        "SELECT count(*), min(decided_at) FROM enroll_requests WHERE state = 'approved' AND decided_at < ?1",
+        [before_ms],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
 }

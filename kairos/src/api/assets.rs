@@ -8,8 +8,8 @@
 //! 權限沿用 `hosts:read`（群組範圍外的主機回 404，由呼叫端以 `hosts::check_access` 檢查）。查詢資產與
 //! 行程不寫稽核紀錄（與趨勢查詢相同；METRICS.md 第 8 節）。
 
+use crate::store::prelude::*;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -25,13 +25,8 @@ pub const MAX_CHANGES_LIMIT: usize = 200;
 /// 清冊中的主機編號、hello 的 `os`、開機時間
 type HostRow = (i64, Option<String>, Option<i64>);
 
-fn host_row(conn: &Connection, agent_id: &str) -> rusqlite::Result<Option<HostRow>> {
-    conn.query_row(
-        "SELECT host_id, os, boot_time FROM hosts WHERE agent_id = ?1",
-        [agent_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-    .optional()
+fn host_row(conn: &dyn Store, agent_id: &str) -> StoreResult<Option<HostRow>> {
+    conn.host_basics(agent_id)
 }
 
 /// `GET /api/v1/hosts/{agent_id}/inventory`
@@ -49,15 +44,7 @@ pub async fn inventory(
             let failed = query_failed("主機資產");
             let host = host_row(conn, &id).map_err(&failed)?;
             let inv = match &host {
-                Some((host_id, _, _)) => conn
-                    .query_row(
-                        "SELECT digest, body, collected_at, received_at, changed_at
-                         FROM host_inventory WHERE host_id = ?1",
-                        [host_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                    )
-                    .optional()
-                    .map_err(&failed)?,
+                Some((host_id, _, _)) => conn.host_inventory(*host_id).map_err(&failed)?,
                 None => None,
             };
             Ok((host, inv))
@@ -152,19 +139,9 @@ pub async fn changes(
             let Some((host_id, _, _)) = host_row(conn, &id).map_err(&failed)? else {
                 return Ok(None);
             };
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, changed_at, changes FROM inventory_changes
-                     WHERE host_id = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3",
-                )
-                .map_err(&failed)?;
-            let rows = stmt
-                .query_map(params![host_id, before, limit as i64 + 1], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .map_err(&failed)?;
             Ok(Some(
-                rows.collect::<rusqlite::Result<_>>().map_err(&failed)?,
+                conn.inventory_changes(host_id, before, limit as i64 + 1)
+                    .map_err(&failed)?,
             ))
         })
         .await?;
@@ -219,15 +196,9 @@ pub async fn processes(
             let Some((host_id, _, _)) = host_row(conn, &id).map_err(&failed)? else {
                 return Ok(None);
             };
-            conn.query_row(
-                "SELECT ts, body FROM process_snapshots WHERE host_id = ?1 AND ts <= ?2
-                 ORDER BY ts DESC LIMIT 1",
-                params![host_id, at_ms],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map(Some)
-            .map_err(&failed)
+            conn.process_snapshot_at(host_id, at_ms)
+                .map(Some)
+                .map_err(&failed)
         })
         .await?;
     let live = ctx.registry.live_get(&agent_id);

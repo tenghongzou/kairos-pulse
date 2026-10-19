@@ -7,7 +7,6 @@
 //! 3. `install`：檢查憑證與私鑰成對、擴充欄位、有效期間（至少剩 2 年），狀態改為 `trusted`；
 //!    沒有啟用中的 CA 時同時啟用（第一個簽發 CA）。
 
-use rusqlite::Connection;
 use std::path::Path;
 
 use super::issue::{
@@ -19,7 +18,7 @@ use crate::store::prelude::*;
 
 /// 建立新的簽發 CA：寫入私鑰與 `pending` 的資料列，回傳 `ca_id` 與 CSR
 pub fn create(
-    conn: &Connection,
+    conn: &dyn Store,
     data_dir: &Path,
     organization: &str,
     now_ms: i64,
@@ -46,11 +45,8 @@ pub fn create(
             // 並行建立時編號不同：私鑰檔名依資料庫的編號重新命名
             let to = data_dir.join(super::key_file_name(id));
             std::fs::rename(&key_path, &to).map_err(|e| e.to_string())?;
-            conn.execute(
-                "UPDATE pki_cas SET key_file = ?2 WHERE ca_id = ?1",
-                rusqlite::params![id, super::key_file_name(id)],
-            )
-            .map_err(|e| e.to_string())?;
+            conn.set_ca_key_file(id, &super::key_file_name(id))
+                .map_err(|e| e.to_string())?;
             Ok((id, n))
         }
         Err(e) => {
@@ -73,7 +69,7 @@ pub struct Installed {
 
 /// 安裝根 CA 簽發的簽發 CA 憑證（PEM；檔案中第一張憑證）
 pub fn install(
-    conn: &Connection,
+    conn: &dyn Store,
     data_dir: &Path,
     cert_pem: &str,
     now_ms: i64,

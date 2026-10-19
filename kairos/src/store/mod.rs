@@ -10,10 +10,13 @@
 //! 仍是 [`crate::storage`] 中原本的 async writer，也用來輸出 JSONL 鏡像。日後改用時序資料庫時，
 //! 實作 [`ReportStore`] 即可，連線端不需修改。架構、schema 與設定見 `kairos/STORAGE.md`。
 
+pub mod admin;
+pub mod api;
 pub mod assets;
 pub mod codec;
 pub mod db;
 pub mod derive;
+pub mod hosts;
 pub mod import;
 pub mod purge;
 pub mod rollup;
@@ -39,6 +42,33 @@ use crate::storage::{
 };
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
+
+/// 開啟既有資料庫的唯讀連線（不建立檔案、不升級 schema；Kairos 執行中也可以開啟）。CLI、主控台與註冊服務
+/// 的唯讀查詢使用；目前一律是 SQLite（[`sqlite::open_read_only`]）
+pub fn open_read(path: &Path) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_read_only(path)?))
+}
+
+/// 主控台 API 唯讀連線池的連線：[`open_read`] 再設定為只讀（`query_only`）並加大快取
+pub fn open_console_read(path: &Path) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_console_reader(path)?))
+}
+
+/// Kairos 行程內開啟既有資料庫的讀寫連線（主控台、註冊服務、告警的寫入；不以 `std::fs` 開關資料庫檔，
+/// 見 [`sqlite::open_existing_read_write`]）
+pub fn open_write(path: &Path, busy: Duration) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_existing_read_write(path, busy)?))
+}
+
+/// CLI 的讀寫連線（必要時建立資料庫並升級 schema；[`sqlite::open_admin`]）
+pub fn open_admin(opts: &sqlite::SqliteOptions, busy: Duration) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_admin(opts, busy)?))
+}
+
+/// CLI 的獨占連線（Kairos 執行中時失敗；[`sqlite::open_exclusive`]）
+pub fn open_exclusive(opts: &sqlite::SqliteOptions, busy: Duration) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_exclusive(opts, busy)?))
+}
 
 /// writer 一批最多取出的筆數（一個交易）
 pub const BATCH_LIMIT: usize = 1024;

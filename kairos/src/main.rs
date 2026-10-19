@@ -72,7 +72,6 @@ use crate::per_ip::{ConnectionSlot, PerIpLimiter, PerIpPolicy, Rejected};
 use crate::rate::ReportLimiter;
 use crate::registry::{Registry, next_conn_id};
 use crate::shutdown::{CONNECTIONS_DEADLINE, MONITOR_DEADLINE, Shutdown, WRITER_DEADLINE};
-use crate::store::prelude::*;
 use crate::throttle::{Category, LogThrottle};
 use crate::tls::{TlsPaths, TlsState};
 

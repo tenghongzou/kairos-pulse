@@ -13,8 +13,9 @@
 //! token 為 `kat_<token_id>_<secret>`：`token_id` 是 16 個十六進位字元（8 bytes 隨機值），公開、
 //! 用於查詢與撤銷；`secret` 是 32 bytes 隨機值的 base64url（43 個字元），資料庫只保存它的 SHA-256。
 
+use crate::store::db::in_write_tx;
+use crate::store::prelude::*;
 use ring::rand::{SecureRandom, SystemRandom};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
 use super::http::{b64url_decode, b64url_encode};
@@ -186,29 +187,6 @@ impl TokenRow {
     }
 }
 
-const COLUMNS: &str = "token_id, name, scope, created_at, created_by, expires_at, revoked_at, \
-                       revoked_by, revoke_reason, last_used_at, last_used_ip, role, owner_user_id, \
-                       (SELECT username FROM users WHERE users.user_id = api_tokens.owner_user_id)";
-
-fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRow> {
-    Ok(TokenRow {
-        token_id: r.get(0)?,
-        name: r.get(1)?,
-        scope: r.get(2)?,
-        role: r.get(11)?,
-        owner_user_id: r.get(12)?,
-        owner_username: r.get(13)?,
-        created_at: r.get(3)?,
-        created_by: r.get(4)?,
-        expires_at: r.get(5)?,
-        revoked_at: r.get(6)?,
-        revoked_by: r.get(7)?,
-        revoke_reason: r.get(8)?,
-        last_used_at: r.get(9)?,
-        last_used_ip: r.get(10)?,
-    })
-}
-
 /// 名稱的檢查：1～64 個字元、不含控制字元
 pub fn validate_name(name: &str) -> Result<(), String> {
     let n = name.chars().count();
@@ -234,7 +212,7 @@ pub struct NewToken {
 /// 建立 token（0.4／0.5 的範圍；測試用）
 #[cfg(test)]
 pub fn create(
-    conn: &Connection,
+    conn: &dyn Store,
     name: &str,
     scope: &str,
     expires_at: Option<i64>,
@@ -249,7 +227,7 @@ pub fn create(
 
 /// 建立 token，並在同一個交易中寫入稽核
 pub fn create_with(
-    conn: &Connection,
+    conn: &dyn Store,
     name: &str,
     grant: &TokenGrant,
     expires_at: Option<i64>,
@@ -268,16 +246,20 @@ pub fn create_with(
         }
     };
     let by = created_by.unwrap_or("（未知）");
-    crate::store::sqlite::audit::in_write_tx(conn, |conn| {
-        conn.execute(
-            "INSERT INTO api_tokens (token_id, name, secret_hash, scope, created_at, created_by, expires_at,
-                role, owner_user_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![token_id, name, &hash[..], scope, now_ms, created_by, expires_at, role, owner],
+    in_write_tx(conn, |conn| {
+        conn.insert_api_token(
+            &token_id,
+            name,
+            &hash[..],
+            &scope,
+            now_ms,
+            created_by,
+            expires_at,
+            role,
+            owner,
         )?;
-        crate::store::sqlite::audit::append(
-        &conn,
-        now_ms,
+        conn.audit_append(
+            now_ms,
             &crate::audit::Audit {
                 actor: by,
                 actor_ip: ip,
@@ -293,7 +275,7 @@ pub fn create_with(
                 ..Default::default()
             },
         )?;
-        Ok(())
+        Ok::<(), StoreError>(())
     })
     .map_err(|e| format!("無法寫入 api_tokens: {e}"))?;
     Ok(NewToken {
@@ -320,24 +302,6 @@ pub fn create_with(
     })
 }
 
-/// 所有 token（依建立時間）
-pub fn list(conn: &Connection) -> rusqlite::Result<Vec<TokenRow>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM api_tokens ORDER BY created_at, token_id"
-    ))?;
-    let rows = stmt.query_map([], row_of)?;
-    rows.collect()
-}
-
-pub fn get(conn: &Connection, token_id: &str) -> rusqlite::Result<Option<TokenRow>> {
-    conn.query_row(
-        &format!("SELECT {COLUMNS} FROM api_tokens WHERE token_id = ?1"),
-        [token_id],
-        row_of,
-    )
-    .optional()
-}
-
 /// 撤銷的結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Revoked {
@@ -349,33 +313,28 @@ pub enum Revoked {
 }
 
 pub fn revoke(
-    conn: &Connection,
+    conn: &dyn Store,
     token_id: &str,
     by: Option<&str>,
     reason: Option<&str>,
     now_ms: i64,
-) -> rusqlite::Result<Revoked> {
+) -> StoreResult<Revoked> {
     revoke_with(conn, token_id, by, None, reason, now_ms)
 }
 
 /// 撤銷，並在同一個交易中寫入稽核（重複撤銷不寫入）
 pub fn revoke_with(
-    conn: &Connection,
+    conn: &dyn Store,
     token_id: &str,
     by: Option<&str>,
     ip: Option<&str>,
     reason: Option<&str>,
     now_ms: i64,
-) -> rusqlite::Result<Revoked> {
-    crate::store::sqlite::audit::in_write_tx(conn, |conn| {
-        let changed = conn.execute(
-            "UPDATE api_tokens SET revoked_at = ?2, revoked_by = ?3, revoke_reason = ?4
-             WHERE token_id = ?1 AND revoked_at IS NULL",
-            params![token_id, now_ms, by, reason],
-        )?;
+) -> StoreResult<Revoked> {
+    in_write_tx(conn, |conn| {
+        let changed = conn.revoke_api_token(token_id, now_ms, by, reason)?;
         if changed > 0 {
-            crate::store::sqlite::audit::append(
-                &conn,
+            conn.audit_append(
                 now_ms,
                 &crate::audit::Audit {
                     actor: by.unwrap_or("（未知）"),
@@ -389,7 +348,7 @@ pub fn revoke_with(
                 },
             )?;
         }
-        Ok(match (changed, get(conn, token_id)?) {
+        Ok(match (changed, conn.get_api_token(token_id)?) {
             (_, None) => Revoked::NotFound,
             (0, Some(row)) => Revoked::Already(row),
             (_, Some(row)) => Revoked::Now(row),
@@ -409,67 +368,55 @@ pub struct StoredToken {
     pub owner_user_id: Option<i64>,
 }
 
-pub fn lookup(conn: &Connection, token_id: &str) -> rusqlite::Result<Option<StoredToken>> {
-    conn.query_row(
-        "SELECT secret_hash, name, scope, expires_at, revoked_at, role, owner_user_id
-         FROM api_tokens WHERE token_id = ?1",
-        [token_id],
-        |r| {
-            Ok(StoredToken {
-                secret_hash: r.get(0)?,
-                name: r.get(1)?,
-                scope: r.get(2)?,
-                expires_at: r.get(3)?,
-                revoked_at: r.get(4)?,
-                role: r.get(5)?,
-                owner_user_id: r.get(6)?,
-            })
-        },
-    )
-    .optional()
-}
+/// API token 的儲存（`api_tokens`）。SQLite 的實作在 `store/sqlite/tokens.rs`
+pub trait TokenStore {
+    /// 新增一個 token（呼叫端在同一個交易中寫入稽核）
+    fn insert_api_token(
+        &self,
+        token_id: &str,
+        name: &str,
+        secret_hash: &[u8],
+        scope: &str,
+        now_ms: i64,
+        created_by: Option<&str>,
+        expires_at: Option<i64>,
+        role: Option<&str>,
+        owner_user_id: Option<i64>,
+    ) -> StoreResult<()>;
 
-/// 建立或撤銷尚未寫入 Kairos 日誌的 token：(列, 目前的 logged 旗標)
-pub fn pending_audit(conn: &Connection) -> rusqlite::Result<Vec<(TokenRow, i64)>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS}, logged FROM api_tokens
-         WHERE (logged & 1) = 0 OR (revoked_at IS NOT NULL AND (logged & 2) = 0)
-         ORDER BY created_at LIMIT 100"
-    ))?;
-    let rows = stmt.query_map([], |r| Ok((row_of(r)?, r.get::<_, i64>(14)?)))?;
-    rows.collect()
-}
+    /// 所有 token（依建立時間）
+    fn list_api_tokens(&self) -> StoreResult<Vec<TokenRow>>;
 
-pub fn mark_logged(conn: &Connection, token_id: &str, flags: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE api_tokens SET logged = logged | ?2 WHERE token_id = ?1",
-        params![token_id, flags],
-    )
-    .map(|_| ())
-}
+    /// 一個 token
+    fn get_api_token(&self, token_id: &str) -> StoreResult<Option<TokenRow>>;
 
-/// 寫回最後使用的時間與來源（不會讓時間倒退）
-pub fn store_last_used(
-    conn: &Connection,
-    entries: &[(String, i64, String)],
-) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "UPDATE api_tokens SET last_used_at = ?2, last_used_ip = ?3
-             WHERE token_id = ?1 AND (last_used_at IS NULL OR last_used_at < ?2)",
-        )?;
-        for (id, at, ip) in entries {
-            stmt.execute(params![id, at, ip])?;
-        }
-    }
-    tx.commit()
+    /// 撤銷尚未撤銷的 token；回傳變更的筆數（0：已撤銷或不存在）。呼叫端在同一個交易中寫入稽核
+    fn revoke_api_token(
+        &self,
+        token_id: &str,
+        now_ms: i64,
+        by: Option<&str>,
+        reason: Option<&str>,
+    ) -> StoreResult<usize>;
+
+    /// 驗證用：token_id 對應的雜湊與狀態
+    fn lookup_api_token(&self, token_id: &str) -> StoreResult<Option<StoredToken>>;
+
+    /// 建立或撤銷尚未寫入 Kairos 日誌的 token：(列, 目前的 logged 旗標)
+    fn api_tokens_pending_audit(&self) -> StoreResult<Vec<(TokenRow, i64)>>;
+
+    /// 記下已寫入日誌的旗標
+    fn mark_api_token_logged(&self, token_id: &str, flags: i64) -> StoreResult<()>;
+
+    /// 寫回最後使用的時間與來源（不會讓時間倒退；一個交易）
+    fn store_api_token_last_used(&self, entries: &[(String, i64, String)]) -> StoreResult<()>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::sqlite::MIGRATIONS;
+    use rusqlite::Connection;
 
     fn db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -523,7 +470,7 @@ mod tests {
         .unwrap();
         let parsed = parse_token(&t.token).unwrap();
         assert_eq!(parsed.token_id, t.row.token_id);
-        let stored = lookup(&conn, parsed.token_id).unwrap().unwrap();
+        let stored = conn.lookup_api_token(parsed.token_id).unwrap().unwrap();
         // 只保存雜湊：資料庫中沒有秘密本身
         assert_eq!(stored.secret_hash, hash_secret(parsed.secret).to_vec());
         let raw: Vec<u8> = conn
@@ -536,9 +483,9 @@ mod tests {
         assert_eq!(stored.scope, "read");
         assert_eq!(t.row.state(1_000), TokenState::Active);
         assert_eq!(t.row.state(5_000), TokenState::Expired);
-        assert!(lookup(&conn, "0000000000000000").unwrap().is_none());
+        assert!(conn.lookup_api_token("0000000000000000").unwrap().is_none());
 
-        let rows = list(&conn).unwrap();
+        let rows = conn.list_api_tokens().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].created_by.as_deref(), Some("ops"));
 
@@ -560,16 +507,19 @@ mod tests {
         );
 
         // 稽核：建立與撤銷各記一次
-        let pending = pending_audit(&conn).unwrap();
+        let pending = conn.api_tokens_pending_audit().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].1, 0);
-        mark_logged(&conn, &t.row.token_id, LOGGED_CREATED | LOGGED_REVOKED).unwrap();
-        assert!(pending_audit(&conn).unwrap().is_empty());
+        conn.mark_api_token_logged(&t.row.token_id, LOGGED_CREATED | LOGGED_REVOKED)
+            .unwrap();
+        assert!(conn.api_tokens_pending_audit().unwrap().is_empty());
 
         // 最後使用：不倒退
-        store_last_used(&conn, &[(t.row.token_id.clone(), 9_000, "10.0.0.1".into())]).unwrap();
-        store_last_used(&conn, &[(t.row.token_id.clone(), 8_000, "10.0.0.2".into())]).unwrap();
-        let row = get(&conn, &t.row.token_id).unwrap().unwrap();
+        conn.store_api_token_last_used(&[(t.row.token_id.clone(), 9_000, "10.0.0.1".into())])
+            .unwrap();
+        conn.store_api_token_last_used(&[(t.row.token_id.clone(), 8_000, "10.0.0.2".into())])
+            .unwrap();
+        let row = conn.get_api_token(&t.row.token_id).unwrap().unwrap();
         assert_eq!(row.last_used_at, Some(9_000));
         assert_eq!(row.last_used_ip.as_deref(), Some("10.0.0.1"));
 

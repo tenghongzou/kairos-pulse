@@ -31,7 +31,6 @@ use rcgen::{
     PKCS_RSA_SHA256, PKCS_RSA_SHA384, PKCS_RSA_SHA512, PublicKeyData, SanType, SerialNumber,
     SubjectPublicKeyInfo,
 };
-use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::net::IpAddr;
@@ -551,7 +550,7 @@ pub fn next_offline_crl_number(journal: &Path, issuer_spki_sha256: &str, now_ms:
 // ---------------------------------------------------------------------------
 
 /// 匯出資料庫中「由 `ca` 簽發、撤銷已生效、憑證過期未超過 1 天」的撤銷（第 6 節離線模式的 CRL 來源）
-pub fn export_revocations(conn: &Connection, ca: &CertInfo, now_ms: i64) -> Result<Value, String> {
+pub fn export_revocations(conn: &dyn Store, ca: &CertInfo, now_ms: i64) -> Result<Value, String> {
     let rows = conn
         .list_certs(10_000_000, None)
         .map_err(|e| e.to_string())?;
@@ -676,7 +675,7 @@ pub enum InitError {
 /// - `<root_dir>/root-ca.key`（0600，目錄 0700）、`<root_dir>/root-ca.pem`
 /// - `data/pki/root-ca.pem`（`pki.server_ca_path`）、`data/pki/server.pem`、`data/pki/server.key`（0600）
 /// - `data/pki/issuing-1.key`、`pki_cas` 的第一筆（`active`）、`data/pki/issuing-cas.pem`（`auth.client_ca`）
-pub fn init(conn: &Connection, plan: &InitPlan, now_ms: i64) -> Result<InitOutcome, InitError> {
+pub fn init(conn: &dyn Store, plan: &InitPlan, now_ms: i64) -> Result<InitOutcome, InitError> {
     if plan.names.is_empty() {
         return Err(InitError::Usage(
             "至少需要一個 --name（Pulse 連線時使用的伺服器名稱或 IP）".into(),
@@ -827,6 +826,7 @@ mod tests {
     use super::*;
     use crate::pki::issue::IssuingCa;
     use crate::pki::x509::verify_cert_signature;
+    use rusqlite::Connection;
 
     const NOW: i64 = 1_760_000_000_000;
     const ID: &str = "6f1c0e4a-1b2c-4d3e-9f00-112233445566";

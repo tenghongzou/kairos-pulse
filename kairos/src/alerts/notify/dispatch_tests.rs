@@ -107,7 +107,7 @@ async fn enqueue(d: &Dispatcher, db: &Arc<EnrollDb>, cid: &str, title: &str, urg
     let n2 = nd.clone();
     let ids = db
         .write(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.begin(TxMode::Deferred)?;
             let ids = tx.insert_deliveries(&[n2])?;
             tx.commit()?;
             Ok(ids)
@@ -136,7 +136,7 @@ async fn enqueue(d: &Dispatcher, db: &Arc<EnrollDb>, cid: &str, title: &str, urg
 
 async fn delivery(db: &Arc<EnrollDb>, id: i64) -> Delivery {
     db.read(move |conn| {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.test_sqlite().prepare(
             "SELECT id, event_id, channel_id, kind, state, urgent, payload, attempts, created_at, next_attempt_at, sent_at, batch_id, response_code, error_code, error FROM alert_deliveries WHERE id = ?1",
         )?;
         Ok(stmt.query_row([id], |r| {

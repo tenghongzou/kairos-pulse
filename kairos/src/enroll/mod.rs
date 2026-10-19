@@ -33,7 +33,6 @@ mod tests;
 
 use kairos_proto::enroll::EnrollMode;
 use log::{debug, error, info, warn};
-use rusqlite::Connection;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -269,11 +268,7 @@ impl EnrollService {
             .write_blocking(|conn| {
                 let rows = conn.load_settings()?;
                 let blocks = conn.load_blocks()?;
-                let mut stmt =
-                    conn.prepare("SELECT agent_id FROM hosts WHERE lifecycle = 'decommissioned'")?;
-                let decom: HashSet<String> = stmt
-                    .query_map([], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
+                let decom: HashSet<String> = conn.decommissioned_agents()?;
                 Ok((settings::overrides_from(&rows), blocks, decom, rows))
             })
             .map_err(|e| format!("無法讀取註冊設定：{e}"))?;
@@ -530,15 +525,10 @@ impl EnrollService {
     /// 從資料庫更新 [`EnrollService::is_revoked_external`] 的清單（撤銷已生效、憑證過期未超過 1 天）
     fn refresh_revoked_external(&self, now: i64) {
         let r = self.db.read_blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT serial FROM pki_certificates WHERE ca_id IS NULL AND revoked_at IS NOT NULL
-                 AND revoke_effective_at <= ?1 AND not_after > ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![now, now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS],
-                |r| r.get::<_, String>(0),
-            )?;
-            Ok(rows.collect::<rusqlite::Result<HashSet<String>>>()?)
+            Ok(conn.revoked_external_serials(
+                now,
+                now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS,
+            )?)
         });
         match r {
             Ok(set) => {
@@ -644,7 +634,7 @@ impl EnrollService {
     // ---- 背景工作 ----
 
     /// 重新讀取 `settings` 表；模式或政策改變時記錄
-    fn refresh_settings(&self, conn: &Connection) -> Result<(), DbError> {
+    fn refresh_settings(&self, conn: &dyn Store) -> Result<(), DbError> {
         let rows = conn.load_settings()?;
         let eff = settings::effective(&self.config, &settings::overrides_from(&rows));
         let mut cur = self.effective.write().unwrap_or_else(|e| e.into_inner());
@@ -786,7 +776,7 @@ impl EnrollService {
     }
 
     /// `KRS-W1304` 的門檻（毫秒）：設定值，或「政策有效天數（含有效 token 覆寫中最長者）＋過期寬限期」
-    pub fn issuing_ca_warning_ms(&self, conn: &Connection, now: i64) -> i64 {
+    pub fn issuing_ca_warning_ms(&self, conn: &dyn Store, now: i64) -> i64 {
         if let Some(d) = self.config.pki.issuing_ca_warning_days {
             return i64::from(d) * 86_400_000;
         }
@@ -806,7 +796,7 @@ impl EnrollService {
     }
 
     /// 啟用中的簽發 CA 剩餘時間少於門檻時記 `KRS-W1304`（每 24 小時最多一次）；回傳 (ca_id, 到期時間)
-    fn check_issuing_ca_expiry(&self, conn: &Connection, now: i64) -> Option<(i64, i64)> {
+    fn check_issuing_ca_expiry(&self, conn: &dyn Store, now: i64) -> Option<(i64, i64)> {
         let ca = conn
             .list_cas()
             .ok()?
@@ -956,12 +946,9 @@ impl EnrollService {
                 conn.purge_blocks(now)?;
                 conn.purge_relaxations(now)?;
                 conn.audit_purge(now - audit_keep_ms, now)?;
-                conn.execute(
-                    "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
-                    [now - 400 * 86_400_000],
-                )?;
+                conn.purge_old_tokens(now - 400 * 86_400_000)?;
                 // 刪除主機資料時為了 CRL 保留的已撤銷憑證：過期超過 1 天後刪除（PRIVACY.md 第 4 節）
-                crate::store::purge::delete_orphan_certificates(conn, now)?;
+                conn.delete_orphan_certificates(now)?;
                 Ok((expired, purged))
             });
             match result {

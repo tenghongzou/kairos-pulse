@@ -9,7 +9,6 @@
 //!   `hosts`（`current_serial`）、`audit_events`。交易失敗時憑證視同未簽發。
 
 use log::{error, info};
-use rusqlite::{Connection, TransactionBehavior};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -203,7 +202,7 @@ impl PkiManager {
 
     /// 由資料庫同步簽發 CA：載入私鑰（線上模式）、更新簽發狀態；信任錨或已退役的簽發 CA 有變化時重寫
     /// `pki/issuing-cas.pem`／`pki/issuing-cas-retired.pem` 並回傳 `true`（呼叫端重建 8443 的 TLS 設定）
-    pub fn sync_cas(&self, conn: &Connection) -> Result<bool, DbError> {
+    pub fn sync_cas(&self, conn: &dyn Store) -> Result<bool, DbError> {
         let cas = conn.list_cas()?;
         let retired_changed = self.sync_retired(&cas);
         Ok(self.sync_active(&cas)? | retired_changed)
@@ -377,14 +376,14 @@ impl PkiManager {
     /// （`auto`、`system`）；已由管理者核准的申請沿用核准者
     pub fn issue(
         &self,
-        conn: &mut Connection,
+        conn: &dyn Store,
         request_id: &str,
         decided_by: &str,
         eff: &Effective,
         now_ms: i64,
     ) -> Result<IssueOutcome, IssueError> {
         let issuer = self.active_issuer()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn.begin(TxMode::Immediate)?;
         let Some(req) = tx.get_request(request_id)? else {
             return Ok(IssueOutcome::NotFound);
         };
@@ -488,7 +487,7 @@ impl PkiManager {
     /// 重新產生一個簽發 CA 的 CRL（需持有私鑰）；回傳新的 CRL 版本
     pub fn regenerate_crl(
         &self,
-        conn: &mut Connection,
+        conn: &dyn Store,
         ca_id: i64,
         validity_ms: i64,
         source: &str,
@@ -498,7 +497,7 @@ impl PkiManager {
         let Some(issuer) = self.issuer(ca_id) else {
             return Ok(None);
         };
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn.begin(TxMode::Immediate)?;
         let Some(ca) = tx.get_ca(ca_id)? else {
             return Ok(None);
         };
@@ -528,7 +527,7 @@ impl PkiManager {
     }
 
     /// 把各信任錨目前的 CRL 寫入 `pki/crl/issuing.crl`；內容有變化時回傳 `true`
-    pub fn write_crl_file(&self, conn: &Connection) -> Result<bool, DbError> {
+    pub fn write_crl_file(&self, conn: &dyn Store) -> Result<bool, DbError> {
         let mut pem = String::new();
         for ca in conn.trust_anchor_cas()? {
             if let Some(crl) = conn.latest_crl(ca.ca_id)? {
@@ -576,7 +575,7 @@ pub type IssuedBatch = (Vec<RequestRow>, Vec<(String, String)>);
 /// 回傳 (簽發的 request_id, 失敗的 (request_id, 原因))
 pub fn issue_approved(
     mgr: &PkiManager,
-    conn: &mut Connection,
+    conn: &dyn Store,
     eff: &Effective,
     now_ms: i64,
     limit: usize,

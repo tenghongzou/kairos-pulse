@@ -24,11 +24,10 @@ use subtle::ConstantTimeEq;
 
 use super::db::{ReadPool, WriteConn, query_failed};
 use super::http::{ApiError, CODE_RATE_LIMITED, ts_ms};
-use super::tokens::{self, StoredToken, hash_secret, parse_token};
+use super::tokens::{StoredToken, hash_secret, parse_token};
 use crate::config::AppConfig;
 pub use crate::rbac::Permission;
 use crate::rbac::{Assignment, Grants, HostAccess, LegacyScope, PermSet, Role};
-use crate::store::prelude::*;
 use crate::users::secrets::ConsoleKey;
 use crate::users::store as us;
 
@@ -519,7 +518,9 @@ impl Authenticator {
         let (stored, owner) = self
             .pool
             .read("API token", move |conn| {
-                let stored = tokens::lookup(conn, &id).map_err(query_failed("API token"))?;
+                let stored = conn
+                    .lookup_api_token(&id)
+                    .map_err(query_failed("API token"))?;
                 let owner = match stored.as_ref().and_then(|s| s.owner_user_id) {
                     Some(uid) => match conn.get_user(uid).map_err(query_failed("API token"))? {
                         Some(u) if u.active() => {
@@ -681,8 +682,9 @@ impl Authenticator {
                 let id = token_id.clone();
                 self.pool
                     .read("API token", move |conn| {
-                        let Some(s) =
-                            tokens::lookup(conn, &id).map_err(query_failed("API token"))?
+                        let Some(s) = conn
+                            .lookup_api_token(&id)
+                            .map_err(query_failed("API token"))?
                         else {
                             return Ok(Grants::default());
                         };

@@ -257,4 +257,37 @@ pub trait AlertStore {
         max_events: u64,
         batch: i64,
     ) -> StoreResult<(Purged, bool)>;
+
+    /// 規則試算：沒有 label、不是推算值、名稱為 `name` 的序列
+    fn plain_series_ids(&self, name: &str) -> StoreResult<Vec<i64>>;
+
+    /// 規則試算：這台主機用過的、名稱為 `name` 的序列：(series_id, labels 的 JSON, derived)
+    fn host_series_by_name(&self, host_id: i64, name: &str)
+    -> StoreResult<Vec<(i64, String, i64)>>;
+
+    /// 主機資產中的 CPU 邏輯處理器數（沒有資產或沒有值時 `None`）
+    fn host_logical_cores(&self, host_id: i64) -> StoreResult<Option<i64>>;
+
+    /// 規則試算：彙總表（`rollup_5m` 或 `rollup_1h`）中一條序列從 `from_secs` 起每個桶的平均值 (桶, 平均)
+    fn rollup_means(
+        &self,
+        table: &str,
+        host_id: i64,
+        series_id: i64,
+        from_secs: i64,
+    ) -> StoreResult<Vec<(i64, f64)>>;
+
+    /// 規則試算：使用中的主機 (host_id, agent_id, tags 的 JSON, 來源位址, 顯示名稱或主機名稱)；無法讀取的列略過
+    fn backtest_hosts(
+        &self,
+    ) -> StoreResult<Vec<(i64, String, Option<String>, Option<String>, String)>>;
+
+    /// 規則試算：主機的 (Pulse 版本, hello 的 os, 資產的作業系統家族, CPU 邏輯處理器數)
+    fn backtest_host_info(
+        &self,
+        host_id: i64,
+    ) -> StoreResult<(Option<String>, Option<String>, Option<String>, Option<i64>)>;
+
+    /// 告警範圍的台數用：使用中的主機 (agent_id, tags 的 JSON, 來源位址)
+    fn active_host_scope_rows(&self) -> StoreResult<Vec<(String, Option<String>, Option<String>)>>;
 }

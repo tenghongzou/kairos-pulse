@@ -333,14 +333,7 @@ pub async fn start(p: StartParams) -> Result<Console, StartError> {
     let pool = ReadPool::new(db_path.clone());
     let known: Vec<String> = pool
         .read("主機清單", |conn| {
-            let mut stmt = conn
-                .prepare("SELECT agent_id FROM hosts")
-                .map_err(db::query_failed("主機清單"))?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(db::query_failed("主機清單"))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(db::query_failed("主機清單"))
+            conn.all_agent_ids().map_err(db::query_failed("主機清單"))
         })
         .await
         .map_err(|e| StartError::Other(Error::other(e.message)))?;

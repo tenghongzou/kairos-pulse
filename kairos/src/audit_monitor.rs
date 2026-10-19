@@ -19,7 +19,6 @@ use crate::bus::{EventBus, EventKind};
 use crate::config::AuditSettings;
 use crate::enroll::db::{DbError, EnrollDb};
 use crate::shutdown::Shutdown;
-use crate::store::prelude::*;
 
 /// 定期外送的鏈尾雜湊（子類別 62「稽核日誌」；設計包 `decisions/INTEGRATION.md` §29.3 正式分配）
 pub const CODE_ANCHOR: &str = "KRS-I6202";
@@ -228,13 +227,14 @@ mod tests {
         }
         // 繞過程式修改一筆並重新計算之後的雜湊鏈（沒有 HMAC 金鑰）：HMAC 不符
         db.write(|c| {
-            c.execute("UPDATE audit_events SET object = 'eve' WHERE id = 2", [])?;
+            c.test_sqlite()
+                .execute("UPDATE audit_events SET object = 'eve' WHERE id = 2", [])?;
             let rows: Vec<audit::AuditRow> =
                 c.audit_export_batch(&audit::AuditFilter::default(), 100)?;
             let mut prev = audit::GENESIS.to_string();
             for r in rows {
                 let h = audit::compute_hash(&prev, &r);
-                c.execute(
+                c.test_sqlite().execute(
                     "UPDATE audit_events SET prev_hash = ?2, hash = ?3 WHERE id = ?1",
                     rusqlite::params![r.id, prev, h],
                 )?;
@@ -256,7 +256,7 @@ mod tests {
         // 每次自我驗證都寫入稽核（執行者 system）
         let n: i64 = db
             .read(|c| {
-                Ok(c.query_row(
+                Ok(c.test_sqlite().query_row(
                     "SELECT count(*) FROM audit_events WHERE action = 'audit.verify' AND actor = 'system'",
                     [],
                     |r| r.get(0),

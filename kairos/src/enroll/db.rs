@@ -1,19 +1,19 @@
 //! 註冊服務的資料庫連線：一條寫入連線（交易依序進行）與數條唯讀連線（輪詢、token 查詢）。
 //!
-//! - 只經由 SQLite 開啟既有的資料庫（[`open_existing_read_write`]、[`open_read_only`]），不以 `std::fs`
+//! - 只經由 SQLite 開啟既有的資料庫（[`crate::store::open_write`]、[`crate::store::open_read`]），不以 `std::fs`
 //!   開關資料庫檔（同一行程內會放掉 report writer 的 fcntl 鎖，見 `kairos/API.md` 第 7 節）。
 //! - 寫入的 busy 等待上限 [`WRITE_BUSY`]：report 的 writer 每批只持有寫入鎖數毫秒，2 秒足以排到；
 //!   等不到時回 `storage_unavailable`（503），Pulse 依退避重試。
 //! - 所有操作都在 blocking 執行緒上進行（`spawn_blocking`），不佔用 async worker。
 
 use log::warn;
-use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use crate::store::sqlite::{file_identity, open_existing_read_write, open_read_only};
+use crate::store::db::{DbHandle, Store};
+use crate::store::sqlite::file_identity;
 
 /// 寫入連線的 busy 等待上限
 pub const WRITE_BUSY: Duration = Duration::from_secs(2);
@@ -49,10 +49,10 @@ impl From<crate::store::db::StoreError> for DbError {
 }
 
 /// 寫入連線與開啟時的檔案身分
-type WriterSlot = Option<(Connection, Option<(u64, u64)>)>;
+type WriterSlot = Option<(DbHandle, Option<(u64, u64)>)>;
 
 struct Reader {
-    conn: Connection,
+    conn: DbHandle,
     file: Option<(u64, u64)>,
 }
 
@@ -77,7 +77,7 @@ impl EnrollDb {
     /// 以寫入連線執行 `f`（目前的執行緒；呼叫端必須已在 blocking 執行緒上）。失敗時關閉連線，下次重新開啟
     pub fn write_blocking<R>(
         &self,
-        f: impl FnOnce(&mut Connection) -> Result<R, DbError>,
+        f: impl FnOnce(&dyn Store) -> Result<R, DbError>,
     ) -> Result<R, DbError> {
         let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let current = file_identity(&self.path);
@@ -86,14 +86,14 @@ impl EnrollDb {
             *guard = None;
         }
         if guard.is_none() {
-            let conn = open_existing_read_write(&self.path, WRITE_BUSY)
+            let conn = crate::store::open_write(&self.path, WRITE_BUSY)
                 .map_err(|e| DbError(e.to_string()))?;
             *guard = Some((conn, current));
         }
         let (conn, _) = guard
             .as_mut()
             .ok_or_else(|| DbError("資料庫未開啟".into()))?;
-        let result = f(conn);
+        let result = f(conn.as_ref());
         if let Err(e) = &result
             && e.0.starts_with("sqlite:")
         {
@@ -107,7 +107,7 @@ impl EnrollDb {
     /// 以唯讀連線執行 `f`（目前的執行緒）
     pub fn read_blocking<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, DbError>,
+        f: impl FnOnce(&dyn Store) -> Result<R, DbError>,
     ) -> Result<R, DbError> {
         let current = file_identity(&self.path);
         let reader = {
@@ -124,14 +124,15 @@ impl EnrollDb {
         let reader = match reader {
             Some(r) => r,
             None => {
-                let conn = open_read_only(&self.path).map_err(|e| DbError(e.to_string()))?;
+                let conn =
+                    crate::store::open_read(&self.path).map_err(|e| DbError(e.to_string()))?;
                 Reader {
                     conn,
                     file: current,
                 }
             }
         };
-        let result = f(&reader.conn);
+        let result = f(reader.conn.as_ref());
         let mut idle = self.readers.lock().unwrap_or_else(|e| e.into_inner());
         if idle.len() < MAX_READERS {
             idle.push(reader);
@@ -143,7 +144,7 @@ impl EnrollDb {
     pub async fn write<R, F>(self: &Arc<Self>, f: F) -> Result<R, DbError>
     where
         R: Send + 'static,
-        F: FnOnce(&mut Connection) -> Result<R, DbError> + Send + 'static,
+        F: FnOnce(&dyn Store) -> Result<R, DbError> + Send + 'static,
     {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.write_blocking(f))
@@ -158,7 +159,7 @@ impl EnrollDb {
     pub async fn read<R, F>(self: &Arc<Self>, f: F) -> Result<R, DbError>
     where
         R: Send + 'static,
-        F: FnOnce(&Connection) -> Result<R, DbError> + Send + 'static,
+        F: FnOnce(&dyn Store) -> Result<R, DbError> + Send + 'static,
     {
         let _permit = self
             .read_permits

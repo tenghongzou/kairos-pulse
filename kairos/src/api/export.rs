@@ -471,7 +471,7 @@ async fn update(
     };
     ctx.admin
         .write(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = c.begin(TxMode::Deferred)?;
             for (k, v) in &writes {
                 match v {
                     Some(v) => tx.set_setting(k, v, &actor, now_ms)?,
@@ -480,7 +480,7 @@ async fn update(
                     }
                 }
             }
-            event.append(&tx, now_ms)?;
+            event.append(&*tx, now_ms)?;
             Ok(tx.commit()?)
         })
         .await

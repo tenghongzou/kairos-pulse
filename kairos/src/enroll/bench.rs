@@ -27,7 +27,6 @@ use super::tests::{Agent, agent, root};
 use crate::config::{AppConfig, PkiMode};
 use crate::pki::x509::pem_decode_all;
 use crate::shutdown::Shutdown;
-use crate::store::prelude::*;
 use crate::store::tests::pulse_like;
 use kairos_proto::enroll::{EnrollMode, TokenApproval};
 
@@ -448,9 +447,10 @@ async fn enroll_bench_10k() {
         .read(|c| {
             Ok((
                 c.pending_count()?,
-                c.query_row("SELECT count(*) FROM pki_certificates", [], |r| {
-                    r.get::<_, i64>(0)
-                })?,
+                c.test_sqlite()
+                    .query_row("SELECT count(*) FROM pki_certificates", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
             ))
         })
         .await

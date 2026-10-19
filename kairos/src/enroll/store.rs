@@ -476,4 +476,30 @@ pub trait EnrollStore {
 
     /// 過期續簽的最後一次嘗試（S14「最後嘗試」）
     fn set_last_grace_attempt(&self, agent_id: &str, attempt: &Value) -> StoreResult<()>;
+
+    /// 已除役的主機（`hosts.lifecycle = 'decommissioned'`）的 agent_id
+    fn decommissioned_agents(&self) -> StoreResult<std::collections::HashSet<String>>;
+
+    /// 刪除停用或到期早於 `before_ms` 的註冊 token；回傳刪除的筆數
+    fn purge_old_tokens(&self, before_ms: i64) -> StoreResult<usize>;
+
+    /// 影響數字的來源（`enroll::ops::impact`）：有 Kairos 簽發的最新憑證、未撤銷的啟用中主機的
+    /// (憑證到期, 寬限期延長到, 是否線上, 最後出現)
+    fn impact_hosts(&self) -> StoreResult<Vec<(i64, Option<i64>, bool, i64)>>;
+
+    /// 待核准與已核准待簽發的新註冊申請數
+    fn pending_enroll_count(&self) -> StoreResult<i64>;
+
+    /// 憑證已過期（`not_after <= now_ms`）、未撤銷的啟用中主機：(agent_id, 名稱, 憑證到期, 寬限期延長到)
+    fn expired_cert_hosts(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<(String, String, i64, Option<i64>)>>;
+
+    /// token 的部署進度：各狀態的 (狀態, 筆數, 簽發後已連線的主機數)
+    fn token_progress_counts(&self, token_id: &str)
+    -> StoreResult<Vec<(String, i64, Option<i64>)>>;
+
+    /// 已核准超過 `before_ms` 仍未簽發的申請：(筆數, 最早的核准時間)
+    fn stale_approvals(&self, before_ms: i64) -> StoreResult<(i64, Option<i64>)>;
 }

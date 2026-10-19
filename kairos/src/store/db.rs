@@ -22,7 +22,11 @@
 
 use std::fmt;
 
+pub use super::admin::AdminStore;
+pub use super::api::ApiQueries;
+pub use super::hosts::HostStore;
 pub use crate::alerts::store::AlertStore;
+pub use crate::api::tokens::TokenStore;
 pub use crate::audit::AuditLog;
 pub use crate::enroll::store::EnrollStore;
 pub use crate::pki::store::PkiStore;
@@ -33,8 +37,9 @@ pub use crate::users::store::UserStore;
 #[allow(unused_imports)]
 pub mod prelude {
     pub use super::{
-        AlertStore, AuditLog, DbHandle, EnrollStore, PkiStore, SettingsStore, Store, StoreError,
-        StoreResult, Tx, TxMode, UserStore,
+        AdminStore, AlertStore, ApiQueries, AuditLog, DbHandle, EnrollStore, HostStore, PkiStore,
+        SettingsStore, Store, StoreError, StoreResult, TokenStore, Tx, TxMode, UserStore,
+        in_write_tx,
     };
 }
 
@@ -112,13 +117,26 @@ pub enum TxMode {
 
 /// 一條連線或一個交易能做的所有領域操作
 pub trait Store:
-    SettingsStore + AuditLog + UserStore + PkiStore + EnrollStore + AlertStore
+    SettingsStore
+    + AuditLog
+    + UserStore
+    + TokenStore
+    + PkiStore
+    + EnrollStore
+    + AlertStore
+    + HostStore
+    + ApiQueries
+    + AdminStore
 {
     /// 開始一個交易。連線上已有交易時失敗（與 SQLite 的巢狀 `BEGIN` 相同）
     fn begin(&self, mode: TxMode) -> StoreResult<Box<dyn Tx + '_>>;
 
     /// 目前不在交易中（自動提交模式）
     fn is_autocommit(&self) -> bool;
+
+    /// 測試輔助：底層的 SQLite 連線（測試以 SQL 準備資料或檢查結果；正式程式不使用）
+    #[cfg(test)]
+    fn test_sqlite(&self) -> &rusqlite::Connection;
 }
 
 /// 交易中的 [`Store`]。沒有 [`Tx::commit`] 就被 drop 時回復
@@ -129,3 +147,18 @@ pub trait Tx: Store {
 
 /// CLI 與一次性工作開啟的一條連線（[`super::open_admin`]、[`super::open_read`]）
 pub type DbHandle = Box<dyn Store + Send>;
+
+/// 在序列化的寫入交易中執行 `f`：已在交易中時直接執行（沿用呼叫端的交易），否則開一個
+/// [`TxMode::Immediate`] 的交易，`f` 成功才提交（失敗時回復）。稽核與其他寫入要在同一個交易中完成時使用
+pub fn in_write_tx<R, E: From<StoreError>>(
+    s: &dyn Store,
+    f: impl FnOnce(&dyn Store) -> Result<R, E>,
+) -> Result<R, E> {
+    if !s.is_autocommit() {
+        return f(s);
+    }
+    let tx = s.begin(TxMode::Immediate)?;
+    let r = f(&*tx)?;
+    tx.commit()?;
+    Ok(r)
+}

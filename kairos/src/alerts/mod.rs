@@ -668,7 +668,7 @@ impl AlertService {
             let r = self
                 .db
                 .write(move |conn| {
-                    let tx = conn.transaction()?;
+                    let tx = conn.begin(TxMode::Deferred)?;
                     tx.upsert_events(&ev2)?;
                     tx.insert_timeline(&tl2)?;
                     tx.commit()?;
@@ -692,7 +692,7 @@ impl AlertService {
         let result = self
             .db
             .write(move |conn| {
-                let tx = conn.transaction()?;
+                let tx = conn.begin(TxMode::Deferred)?;
                 let ids = tx.insert_deliveries(&deliveries)?;
                 tx.mark_silences_notified(&silences)?;
                 tx.commit()?;

@@ -41,11 +41,15 @@ use crate::storage::{Clock, RecordBody, ReportRecord, WriteStatus};
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
 
+pub(crate) mod admin;
 pub(crate) mod alerts;
+pub(crate) mod api;
 pub(crate) mod audit;
 pub(crate) mod conn;
 pub(crate) mod enroll;
+pub(crate) mod hosts;
 pub(crate) mod pki;
+pub(crate) mod tokens;
 pub(crate) mod users;
 
 #[path = "sqlite_assets.rs"]
@@ -3081,6 +3085,14 @@ pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         Duration::from_secs(5),
     )
+}
+
+/// 主控台 API 唯讀連線池的連線（原本在 `api/db.rs`）：[`open_read_only`] 後設定 `query_only` 與 16 MB 快取
+pub fn open_console_reader(path: &Path) -> Result<Connection, Error> {
+    let conn = open_read_only(path)?;
+    conn.execute_batch("PRAGMA query_only = 1; PRAGMA cache_size = -16384;")
+        .map_err(|e| db_error("無法設定唯讀連線", e))?;
+    Ok(conn)
 }
 
 /// 在 Kairos 行程內開啟既有資料庫的讀寫連線（主控台 API 的低頻寫入）：只經由 SQLite 開啟，

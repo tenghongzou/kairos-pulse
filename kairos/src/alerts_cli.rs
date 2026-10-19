@@ -593,28 +593,21 @@ fn alerts_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
 // ---------------------------------------------------------------------------
 
 /// 清冊中使用中的主機（範圍的台數）
-fn host_facts(conn: &rusqlite::Connection) -> Result<Vec<HostFacts>, Failure> {
-    let mut stmt = conn
-        .prepare("SELECT agent_id, tags, peer FROM hosts WHERE lifecycle = 'active'")
-        .map_err(db_failure)?;
-    let rows = stmt
-        .query_map([], |r| {
-            let tags: Option<String> = r.get(1)?;
-            let peer: Option<String> = r.get(2)?;
-            Ok(HostFacts {
-                agent_id: r.get(0)?,
-                tags: tags
-                    .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|t| t.to_lowercase())
-                    .collect(),
-                ip: peer.as_deref().and_then(crate::bus::peer_ip),
-            })
+fn host_facts(conn: &dyn Store) -> Result<Vec<HostFacts>, Failure> {
+    let rows = conn.active_host_scope_rows().map_err(db_failure)?;
+    Ok(rows
+        .into_iter()
+        .map(|(agent_id, tags, peer)| HostFacts {
+            agent_id,
+            tags: tags
+                .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.to_lowercase())
+                .collect(),
+            ip: peer.as_deref().and_then(crate::bus::peer_ip),
         })
-        .map_err(db_failure)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(db_failure)
+        .collect())
 }
 
 fn count_matching(hosts: &[HostFacts], s: &Scope) -> usize {

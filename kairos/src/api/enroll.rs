@@ -23,7 +23,6 @@ use crate::enroll::{EnrollService, handlers};
 use crate::pki::issue::Reason;
 use crate::pki::store as ps;
 use crate::settings;
-use crate::store::prelude::*;
 
 /// 寫入本文的上限
 pub const MAX_BODY: usize = 1024 * 1024;
@@ -1174,29 +1173,6 @@ fn cert_state(c: &ps::CertRow, grace_days: u32, now_ms: i64) -> &'static str {
 /// `host_group`；主機還沒連線過（清冊沒有這台）時用申請的主機名稱
 type CertHost = (Option<String>, Option<String>);
 
-fn cert_hosts(
-    conn: &rusqlite::Connection,
-    serial: Option<&str>,
-) -> rusqlite::Result<std::collections::HashMap<String, CertHost>> {
-    let mut stmt = conn.prepare(
-        "SELECT c.serial, coalesce(h.hostname, r.hostname), h.host_group
-         FROM pki_certificates c
-         LEFT JOIN hosts h ON h.agent_id = c.agent_id
-         LEFT JOIN enroll_requests r ON r.request_id = c.request_id
-         WHERE ?1 IS NULL OR c.serial = ?1",
-    )?;
-    let rows = stmt.query_map([serial], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            (
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ),
-        ))
-    })?;
-    rows.collect()
-}
-
 fn cert_json(
     c: &ps::CertRow,
     host: Option<&CertHost>,
@@ -1241,7 +1217,7 @@ async fn list_certs(
     let limit = limit_of(q)?;
     let (rows, hosts) = svc
         .db
-        .read(|conn| Ok((conn.list_certs(1_000_000, None)?, cert_hosts(conn, None)?)))
+        .read(|conn| Ok((conn.list_certs(1_000_000, None)?, conn.cert_hosts(None)?)))
         .await
         .map_err(db_error)?;
     let now_ms = now.timestamp_millis();
@@ -1292,7 +1268,7 @@ async fn get_cert(
         .db
         .read(move |conn| {
             let c = conn.get_cert(&s)?;
-            let hosts = cert_hosts(conn, Some(&s))?;
+            let hosts = conn.cert_hosts(Some(&s))?;
             Ok(c.map(|c| (c, hosts)))
         })
         .await

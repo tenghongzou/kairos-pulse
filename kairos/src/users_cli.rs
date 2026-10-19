@@ -17,8 +17,8 @@ use crate::config::{AppConfig, take_config_arg};
 use crate::hosts_cli::{ascii_json, use_unicode};
 use crate::rbac::{Assignment, Role};
 use crate::storage::fmt_time;
+use crate::store::db::in_write_tx;
 use crate::store::prelude::*;
-use crate::store::sqlite::conn::in_write_tx;
 use crate::token_cli::{Failure, db_failure, human_time, open, operator, table, zone_label};
 use crate::users::password::{self, HashParams};
 use crate::users::store::{
@@ -442,20 +442,19 @@ pub fn execute(
             )),
         }
     };
-    let audit =
-        |conn: &rusqlite::Connection, action: &'static str, object: &str, details: Value| {
-            Event {
-                actor: by.clone(),
-                actor_ip: None,
-                category: "user",
-                action,
-                object: Some(object.to_string()),
-                result: "ok",
-                code: None,
-                details: Some(details),
-            }
-            .append(conn, now_ms)
-        };
+    let audit = |conn: &dyn Store, action: &'static str, object: &str, details: Value| {
+        Event {
+            actor: by.clone(),
+            actor_ip: None,
+            category: "user",
+            action,
+            object: Some(object.to_string()),
+            result: "ok",
+            code: None,
+            details: Some(details),
+        }
+        .append(conn, now_ms)
+    };
     let acc = &config.accounts;
     match &cmd.action {
         UsersAction::Help => unreachable!(),
@@ -500,7 +499,7 @@ pub fn execute(
                 Ok(h) => h,
                 Err(e) => return fail(db_failure(e)),
             };
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
                 let Some(uid) = c.create_user(
                     &NewUser {
                         username,
@@ -694,7 +693,7 @@ pub fn execute(
             {
                 return fail(f);
             }
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
                 if !grant
                     && a.role == Role::Admin
                     && a.scope == crate::rbac::Scope::Global
@@ -847,7 +846,7 @@ pub fn execute(
                 None
             };
             let uid = u.user_id;
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
                 if matches!(action, UsersAction::Disable(_) | UsersAction::Delete(_))
                     && c.active_global_admins()? == vec![uid]
                 {
@@ -1019,7 +1018,7 @@ pub fn execute(
                     EXIT_USAGE,
                 ));
             }
-            let r = in_write_tx(&conn, |c| {
+            let r = in_write_tx(&conn, |c| -> StoreResult<_> {
                 let changed = if map {
                     c.add_assignment(SUBJECT_LDAP_GROUP, &key, a, &by, now_ms)?
                 } else {

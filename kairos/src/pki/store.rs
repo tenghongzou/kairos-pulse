@@ -194,4 +194,38 @@ pub trait PkiStore {
 
     /// 依簽發 CA 統計簽發張數
     fn issued_count_by_ca(&self, ca_id: i64) -> StoreResult<i64>;
+
+    /// 外部簽發（`ca_id IS NULL`）、撤銷已生效、憑證過期不早於 `expired_after_ms` 的序號
+    fn revoked_external_serials(
+        &self,
+        now_ms: i64,
+        expired_after_ms: i64,
+    ) -> StoreResult<std::collections::HashSet<String>>;
+
+    /// 刪除主機資料時為了 CRL 保留的已撤銷憑證：過期超過 1 天、主機已不在清冊的刪除（`kairos/PRIVACY.md` 第 4 節）
+    fn delete_orphan_certificates(&self, now_ms: i64) -> StoreResult<usize>;
+
+    /// 刪除主機資料前撤銷這台主機尚未撤銷、尚未過期的憑證（每張一筆稽核，一個交易）；回傳撤銷的序號
+    fn revoke_active_certificates(
+        &self,
+        agent_id: &str,
+        actor: &str,
+        actor_ip: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<Vec<String>>;
+
+    /// 更改簽發 CA 的私鑰檔名（並行建立時編號不同，私鑰檔依資料庫的編號重新命名）
+    fn set_ca_key_file(&self, ca_id: i64, key_file: &str) -> StoreResult<()>;
+
+    /// 清冊中這台主機的最新憑證：(序號, 到期)；清冊沒有這台主機時為 `None`
+    fn host_current_cert(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<(Option<String>, Option<i64>)>>;
+
+    /// 匯入既有憑證時清冊沒有這台主機：新增（`source = 'cert_import'`，主機名稱暫用 agent_id）
+    fn insert_imported_host(&self, agent_id: &str, now_ms: i64, serial: &str) -> StoreResult<()>;
+
+    /// 把清冊中這台主機的最新憑證改為 `serial`
+    fn set_host_current_serial(&self, agent_id: &str, serial: &str) -> StoreResult<()>;
 }

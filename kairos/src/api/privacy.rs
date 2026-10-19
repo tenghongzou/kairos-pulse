@@ -22,7 +22,6 @@ use std::time::Duration;
 use super::ApiContext;
 use super::auth::{Permission, Principal};
 use super::http::{self, ApiBody, ApiError, str_field};
-use crate::store::prelude::*;
 use crate::store::purge::{
     self, CODE_PURGE_FAILED, CODE_PURGED, PurgeCounts, PurgeJob, verify_impact_token,
 };
@@ -143,14 +142,11 @@ async fn preview(
     let (counts, names) = ctx
         .pool
         .read("刪除主機資料的影響", move |conn| {
-            let counts = purge::plan(conn, &id, now_ms)
+            let counts = conn
+                .purge_plan(&id, now_ms)
                 .map_err(super::db::query_failed("刪除主機資料的影響"))?;
-            let names: Option<(String, Option<String>)> =
-                rusqlite::OptionalExtension::optional(conn.query_row(
-                    "SELECT hostname, display_name FROM hosts WHERE agent_id = ?1",
-                    [&id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                ))
+            let names: Option<(String, Option<String>)> = conn
+                .host_names(&id)
                 .map_err(super::db::query_failed("刪除主機資料的影響"))?;
             Ok((counts, names))
         })
@@ -244,15 +240,7 @@ async fn purge_host(
     let (a, act, ipc) = (agent_id.to_string(), actor.clone(), ip.clone());
     let revoked = ctx
         .admin
-        .write(move |conn| {
-            Ok(purge::revoke_active_certificates(
-                conn,
-                &a,
-                &act,
-                Some(&ipc),
-                now_ms,
-            )?)
-        })
+        .write(move |conn| Ok(conn.revoke_active_certificates(&a, &act, Some(&ipc), now_ms)?))
         .await
         .map_err(|e| {
             warn!("刪除主機資料：無法撤銷 {agent_id} 的憑證：{e}");
@@ -343,7 +331,7 @@ async fn export(
     let doc = ctx
         .pool
         .read("個資匯出", move |conn| {
-            crate::privacy::personal_data(conn, &id, &settings, now_ms)
+            conn.personal_data(&id, &settings, now_ms)
                 .map_err(super::db::query_failed("個資匯出"))
         })
         .await?

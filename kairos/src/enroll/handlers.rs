@@ -28,7 +28,6 @@ use kairos_proto::enroll::{
 };
 use log::{debug, info, warn};
 use ring::rand::{SecureRandom, SystemRandom};
-use rusqlite::TransactionBehavior;
 use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -905,7 +904,7 @@ struct Pre {
 #[allow(clippy::too_many_arguments)]
 fn pre_assess(
     svc: &EnrollService,
-    conn: &rusqlite::Connection,
+    conn: &dyn Store,
     req: &EnrollRequest,
     checked: &CheckedEnrollRequest,
     csr: &crate::pki::csr::CheckedCsr,
@@ -994,7 +993,7 @@ fn pre_assess(
 #[allow(clippy::too_many_arguments)]
 fn create_in_tx(
     svc: &EnrollService,
-    conn: &mut rusqlite::Connection,
+    conn: &dyn Store,
     req: &EnrollRequest,
     checked: &CheckedEnrollRequest,
     csr: &crate::pki::csr::CheckedCsr,
@@ -1004,7 +1003,7 @@ fn create_in_tx(
     poll_hash: [u8; 32],
     now: i64,
 ) -> Result<Result<Created, EnrollError>, DbError> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     // 冪等（並行的重送）
     if let Some(r) = tx.request_by_csr(&checked.agent_id, &csr.csr_sha256)? {
         let cert = match &r.issued_serial {
@@ -1473,7 +1472,7 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
 #[allow(clippy::too_many_arguments)]
 fn grace_in_tx(
     svc: &EnrollService,
-    conn: &mut rusqlite::Connection,
+    conn: &dyn Store,
     req: &GraceRenewRequest,
     checked: &kairos_proto::enroll::CheckedGraceRenewRequest,
     old: &crate::pki::x509::CertInfo,
@@ -1482,7 +1481,7 @@ fn grace_in_tx(
     source_ip: &str,
     now: i64,
 ) -> Result<GraceOutcome, DbError> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     let agent = &checked.agent_id;
     let attempt =
         |code: &str| json!({"at": format_rfc3339_ms(now), "result": code, "ip": source_ip});
@@ -1510,7 +1509,7 @@ fn grace_in_tx(
         ));
     }
     tx.replay_insert(&key, agent, now, kairos_proto::enroll::REPLAY_CACHE_TTL_MS)?;
-    let fail = |tx: rusqlite::Transaction<'_>,
+    let fail = |tx: Box<dyn Tx + '_>,
                 code: EnrollErrorCode,
                 message: &str|
      -> Result<GraceOutcome, DbError> {
@@ -1864,7 +1863,7 @@ async fn withdraw(
     let outcome = svc
         .db
         .write(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.begin(TxMode::Immediate)?;
             let Some(cur) = tx.get_request(&id)? else {
                 return Ok(Err(EnrollError::request_not_found()));
             };

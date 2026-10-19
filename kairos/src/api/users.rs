@@ -20,8 +20,8 @@ use super::http::{self, ApiBody, ApiError, Query, read_json, str_field, ts_ms};
 use super::tokens::{self, Revoked, TokenGrant};
 use crate::audit::Event;
 use crate::rbac::{Assignment, Permission as P, Role};
+use crate::store::db::in_write_tx;
 use crate::store::prelude::*;
-use crate::store::sqlite::conn::in_write_tx;
 use crate::users::password::{self, HashParams};
 use crate::users::store::{
     self as us, NewUser, SOURCE_LOCAL, SUBJECT_LDAP_GROUP, SUBJECT_USER, UserRow,
@@ -286,7 +286,8 @@ async fn get_user(
             let s = c
                 .user_sessions(uid, true, now_ms)
                 .map_err(query_failed("使用者"))?;
-            let t = tokens::list(c)
+            let t = c
+                .list_api_tokens()
                 .map_err(query_failed("使用者"))?
                 .into_iter()
                 .filter(|t| t.owner_user_id == Some(uid))
@@ -1026,7 +1027,7 @@ async fn list_tokens(
     let rows = ctx
         .pool
         .read("API token", |c| {
-            tokens::list(c).map_err(query_failed("API token"))
+            c.list_api_tokens().map_err(query_failed("API token"))
         })
         .await?;
     let data: Vec<Value> = rows

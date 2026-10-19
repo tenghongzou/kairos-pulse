@@ -35,6 +35,13 @@ impl<C: AsConn> PkiStore for C {
         fn mark_first_used(&self, serial: &str, now_ms: i64) -> bool => mark_first_used;
         fn older_unrevoked(&self, agent_id: &str, serial: &str) -> Vec<String> => older_unrevoked;
         fn issued_count_by_ca(&self, ca_id: i64) -> i64 => issued_count_by_ca;
+        fn revoked_external_serials(&self, now_ms: i64, expired_after_ms: i64) -> std::collections::HashSet<String> => revoked_external_serials;
+        fn delete_orphan_certificates(&self, now_ms: i64) -> usize => crate::store::purge::delete_orphan_certificates;
+        fn revoke_active_certificates(&self, agent_id: &str, actor: &str, actor_ip: Option<&str>, now_ms: i64) -> Vec<String> => crate::store::purge::revoke_active_certificates;
+        fn set_ca_key_file(&self, ca_id: i64, key_file: &str) -> () => set_ca_key_file;
+        fn host_current_cert(&self, agent_id: &str) -> Option<(Option<String>, Option<i64>)> => host_current_cert;
+        fn insert_imported_host(&self, agent_id: &str, now_ms: i64, serial: &str) -> () => insert_imported_host;
+        fn set_host_current_serial(&self, agent_id: &str, serial: &str) -> () => set_host_current_serial;
     }
 }
 
@@ -452,4 +459,69 @@ pub fn revoked_serials(conn: &Connection) -> rusqlite::Result<std::collections::
         conn.prepare("SELECT serial FROM pki_certificates WHERE revoked_at IS NOT NULL")?;
     stmt.query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<String>>>()
+}
+
+/// 外部簽發、撤銷已生效的序號（原本在 `enroll/mod.rs`）
+pub fn revoked_external_serials(
+    conn: &Connection,
+    now_ms: i64,
+    expired_after_ms: i64,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT serial FROM pki_certificates WHERE ca_id IS NULL AND revoked_at IS NOT NULL
+         AND revoke_effective_at <= ?1 AND not_after > ?2",
+    )?;
+    let rows = stmt.query_map(params![now_ms, expired_after_ms], |r| r.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<std::collections::HashSet<String>>>()
+}
+
+/// 更改簽發 CA 的私鑰檔名（原本在 `pki/manage.rs`）
+pub fn set_ca_key_file(conn: &Connection, ca_id: i64, key_file: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE pki_cas SET key_file = ?2 WHERE ca_id = ?1",
+        rusqlite::params![ca_id, key_file],
+    )?;
+    Ok(())
+}
+
+/// 清冊中這台主機的最新憑證（原本在 `pki/queue.rs` 的 `import_existing`）
+pub fn host_current_cert(
+    conn: &Connection,
+    agent_id: &str,
+) -> rusqlite::Result<Option<(Option<String>, Option<i64>)>> {
+    conn.query_row(
+        "SELECT h.current_serial, c.not_after FROM hosts h
+         LEFT JOIN pki_certificates c ON c.serial = h.current_serial WHERE h.agent_id = ?1",
+        [agent_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+/// 匯入既有憑證時新增清冊（原本在 `pki/queue.rs`）
+pub fn insert_imported_host(
+    conn: &Connection,
+    agent_id: &str,
+    now_ms: i64,
+    serial: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO hosts (agent_id, hostname, online, first_seen, last_seen, source, current_serial, lifecycle)
+         VALUES (?1, ?1, 0, ?2, ?2, 'cert_import', ?3, 'active')",
+        params![agent_id, now_ms, serial],
+    )?;
+    Ok(())
+}
+
+/// 改清冊的最新憑證（原本在 `pki/queue.rs`）
+pub fn set_host_current_serial(
+    conn: &Connection,
+    agent_id: &str,
+    serial: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE hosts SET current_serial = ?2 WHERE agent_id = ?1",
+        params![agent_id, serial],
+    )?;
+    Ok(())
 }

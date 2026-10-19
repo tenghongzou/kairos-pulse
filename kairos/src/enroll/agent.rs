@@ -8,7 +8,6 @@ use kairos_proto::enroll::{IssuedCertificate, b64url_decode, format_rfc3339_ms};
 use kairos_proto::lifecycle::{DEREGISTER_STATE_DECOMMISSIONED, RENEW_STATE_ISSUED};
 use kairos_proto::{Deregister, DeregisterAck, ErrorCode, RenewRequest, RenewResult, ServerMsg};
 use log::{info, warn};
-use rusqlite::TransactionBehavior;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,7 +110,7 @@ pub fn on_hello(svc: &Arc<EnrollService>, agent_id: &str, serial: &str) {
         let now = svc.now_ms();
         let revoke_old = svc.effective().policy.revoke_superseded;
         let result = svc.db.write_blocking(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.begin(TxMode::Immediate)?;
             if tx.get_cert(&serial)?.is_none() || !tx.mark_first_used(&serial, now)? {
                 return Ok(Vec::new());
             }
@@ -191,7 +190,7 @@ pub async fn renew(
     let created = svc
         .db
         .write(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.begin(TxMode::Immediate)?;
             // 冪等：同一 agent_id＋同一 CSR 只簽發一張
             if let Some(r) = tx.request_by_csr(&agent, &csr.csr_sha256)? {
                 return Ok(Ok(r));
@@ -349,7 +348,7 @@ pub async fn deregister(
     let (already, revoked, at) = svc
         .db
         .write(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.begin(TxMode::Immediate)?;
             let hostname = if m.hostname.is_empty() {
                 agent.clone()
             } else {

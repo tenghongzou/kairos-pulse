@@ -64,6 +64,11 @@ impl<C: AsConn> Store for C {
     fn is_autocommit(&self) -> bool {
         self.conn().is_autocommit()
     }
+
+    #[cfg(test)]
+    fn test_sqlite(&self) -> &Connection {
+        self.conn()
+    }
 }
 
 impl Tx for Transaction<'_> {
@@ -85,19 +90,3 @@ macro_rules! forward {
     };
 }
 pub(crate) use forward;
-
-/// 過渡用（L1a 搬移期間）：在序列化的寫入交易中執行 `f`。已在交易中時直接執行，否則開一個
-/// `BEGIN IMMEDIATE` 的交易，`f` 成功才提交（失敗時回復）。與原本的 `audit::in_write_tx` 相同，只是
-/// 錯誤型別是 [`StoreError`]
-pub(crate) fn in_write_tx<R>(
-    conn: &Connection,
-    f: impl FnOnce(&Connection) -> StoreResult<R>,
-) -> StoreResult<R> {
-    if !conn.is_autocommit() {
-        return f(conn);
-    }
-    let tx = begin(conn, TxMode::Immediate)?;
-    let r = f(&tx)?;
-    tx.commit()?;
-    Ok(r)
-}

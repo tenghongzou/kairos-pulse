@@ -7,7 +7,6 @@
 //!   busy 時最多等待 [`WRITE_BUSY`]，不會讓 report 的 writer 等待太久。
 
 use log::warn;
-use rusqlite::Connection;
 use std::io::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,10 +14,8 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use super::http::ApiError;
-use crate::store::db::StoreResult;
-use crate::store::sqlite::{
-    SqliteOptions, file_identity, open_existing_read_write, open_read_only,
-};
+use crate::store::db::{DbHandle, Store, StoreResult};
+use crate::store::sqlite::{SqliteOptions, file_identity};
 
 /// 同時進行的查詢上限
 pub const MAX_READERS: usize = 4;
@@ -28,7 +25,7 @@ pub const WRITE_BUSY: Duration = Duration::from_millis(250);
 
 /// 一條唯讀連線與它開啟的檔案身分
 struct Reader {
-    conn: Connection,
+    conn: DbHandle,
     file: Option<(u64, u64)>,
 }
 
@@ -57,9 +54,7 @@ impl ReadPool {
             }
         }
         drop(idle);
-        let conn = open_read_only(&self.path)?;
-        conn.execute_batch("PRAGMA query_only = 1; PRAGMA cache_size = -16384;")
-            .map_err(|e| crate::store::sqlite::db_error("無法設定唯讀連線", e))?;
+        let conn = crate::store::open_console_read(&self.path)?;
         Ok(Reader {
             conn,
             file: current,
@@ -77,7 +72,7 @@ impl ReadPool {
     pub async fn read<R, F>(self: &Arc<Self>, what: &'static str, f: F) -> Result<R, ApiError>
     where
         R: Send + 'static,
-        F: FnOnce(&Connection) -> Result<R, ApiError> + Send + 'static,
+        F: FnOnce(&dyn Store) -> Result<R, ApiError> + Send + 'static,
     {
         let _permit = self
             .permits
@@ -94,7 +89,7 @@ impl ReadPool {
                     return Err(ApiError::storage(what));
                 }
             };
-            let result = f(&reader.conn);
+            let result = f(reader.conn.as_ref());
             pool.put_back(reader);
             result
         })
@@ -118,11 +113,11 @@ pub fn query_failed<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> A
 }
 
 /// 低頻寫入用的連線（只由背景工作使用）。只經由 SQLite 開啟既有的資料庫
-/// （[`open_existing_read_write`]：在 Kairos 行程內以 `std::fs` 開關資料庫檔會放掉 writer 的鎖）
+/// （[`crate::store::open_write`]：在 Kairos 行程內以 `std::fs` 開關資料庫檔會放掉 writer 的鎖）
 pub struct WriteConn {
     opts: SqliteOptions,
     busy: Duration,
-    conn: Mutex<Option<Connection>>,
+    conn: Mutex<Option<DbHandle>>,
 }
 
 /// 使用者管理、登入、稽核等互動寫入的 busy 等待上限（比背景工作長：使用者正在等結果）
@@ -145,19 +140,19 @@ impl WriteConn {
     pub async fn write<R, F>(self: &Arc<Self>, f: F) -> Result<R, String>
     where
         R: Send + 'static,
-        F: FnOnce(&Connection) -> StoreResult<R> + Send + 'static,
+        F: FnOnce(&dyn Store) -> StoreResult<R> + Send + 'static,
     {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut guard = this.conn.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_none() {
                 *guard = Some(
-                    open_existing_read_write(&this.opts.path, this.busy)
+                    crate::store::open_write(&this.opts.path, this.busy)
                         .map_err(|e| e.to_string())?,
                 );
             }
             let conn = guard.as_ref().ok_or("資料庫未開啟")?;
-            match f(conn) {
+            match f(conn.as_ref()) {
                 Ok(r) => Ok(r),
                 Err(e) => {
                     *guard = None;

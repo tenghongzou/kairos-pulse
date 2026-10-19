@@ -577,7 +577,7 @@ impl Dispatcher {
         let result = self
             .db
             .write(move |conn| {
-                let tx = conn.transaction()?;
+                let tx = conn.begin(TxMode::Deferred)?;
                 for d in &changed {
                     tx.update_delivery(d)?;
                 }

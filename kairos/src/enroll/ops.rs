@@ -6,7 +6,6 @@
 use kairos_proto::enroll::{EnrollMode, EnrollToken, RequestCode, TokenApproval};
 use kairos_proto::{HostInfo, is_forbidden_display_char, is_uuid_text, validate_host_info};
 use ring::rand::{SecureRandom, SystemRandom};
-use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Value, json};
 
 use super::store::{self, Audit, DbKind, DbState, RequestRow, TokenRow, TokenState};
@@ -59,12 +58,6 @@ impl OpError {
 
     pub fn db(e: impl std::fmt::Display) -> Self {
         Self::new("storage_unavailable", format!("資料庫無法讀寫：{e}"))
-    }
-}
-
-impl From<rusqlite::Error> for OpError {
-    fn from(e: rusqlite::Error) -> Self {
-        OpError::db(e)
     }
 }
 
@@ -215,7 +208,7 @@ pub fn token_display(token: &EnrollToken) -> String {
 
 /// 建立註冊 token（寫入稽核）
 pub fn create_token(
-    conn: &mut Connection,
+    conn: &dyn Store,
     input: &TokenInput,
     by: &str,
     actor_ip: Option<&str>,
@@ -247,7 +240,7 @@ pub fn create_token(
         disable_reason: None,
         last_used_at: None,
     };
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     tx.insert_token(&row)?;
     tx.audit(
         now_ms,
@@ -277,14 +270,14 @@ pub fn create_token(
 
 /// 停用 token（冪等；已簽發的憑證不受影響）
 pub fn disable_token(
-    conn: &mut Connection,
+    conn: &dyn Store,
     token_id: &str,
     by: &str,
     actor_ip: Option<&str>,
     reason: Option<&str>,
     now_ms: i64,
 ) -> Result<(TokenRow, bool), OpError> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     let Some((row, already)) = tx.disable_token(token_id, by, reason, now_ms)? else {
         return Err(OpError::new(
             "token_not_found",
@@ -337,7 +330,7 @@ impl Decision {
 
 /// 核准（不簽發）。`lifetime_days` 覆寫這次簽發的有效天數
 pub fn approve(
-    conn: &mut Connection,
+    conn: &dyn Store,
     ids: &[String],
     by: &str,
     actor_ip: Option<&str>,
@@ -346,7 +339,7 @@ pub fn approve(
 ) -> Result<Vec<(String, Decision)>, OpError> {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn.begin(TxMode::Immediate)?;
         let decision = match tx.get_request(id)? {
             None => Decision::NotFound,
             Some(r) if r.state == DbState::Withdrawn => Decision::Withdrawn,
@@ -383,7 +376,7 @@ pub fn approve(
 
 /// 拒絕（L2；`reason` 會在 Pulse 端顯示）
 pub fn reject(
-    conn: &mut Connection,
+    conn: &dyn Store,
     ids: &[String],
     by: &str,
     actor_ip: Option<&str>,
@@ -405,7 +398,7 @@ pub fn reject(
     }
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn.begin(TxMode::Immediate)?;
         let decision = match tx.get_request(id)? {
             None => Decision::NotFound,
             Some(r) if r.state == DbState::Withdrawn => Decision::Withdrawn,
@@ -450,7 +443,7 @@ pub enum RevokeResult {
 
 /// 撤銷憑證（立即寫入；常駐行程在 2 秒內重新產生 CRL 並斷開仍在線的連線）
 pub fn revoke(
-    conn: &mut Connection,
+    conn: &dyn Store,
     serials: &[String],
     reason: Reason,
     comment: &str,
@@ -461,7 +454,7 @@ pub fn revoke(
     let mut out = Vec::with_capacity(serials.len());
     for serial in serials {
         let serial = serial.trim().to_ascii_uppercase();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn.begin(TxMode::Immediate)?;
         let result = match tx.revoke(&serial, now_ms, now_ms, reason, by, Some(comment))? {
             Revoke::Now(c) => RevokeResult::Revoked { ca_id: c.ca_id },
             Revoke::Already(_) => RevokeResult::Already,
@@ -549,24 +542,11 @@ impl Impact {
 }
 
 /// 計算影響數字（只計 Kairos 簽發紀錄中有最新憑證的主機；手動簽發且未匯入的不在內）
-pub fn impact(conn: &Connection, grace_days: u32, now_ms: i64) -> Result<Impact, OpError> {
+pub fn impact(conn: &dyn Store, grace_days: u32, now_ms: i64) -> Result<Impact, OpError> {
     let grace_ms = i64::from(grace_days) * 86_400_000;
-    let mut stmt = conn.prepare(
-        "SELECT c.not_after, h.grace_override_until, h.online, h.last_seen
-         FROM hosts h JOIN pki_certificates c ON c.serial = h.current_serial
-         WHERE h.lifecycle = 'active' AND c.revoked_at IS NULL",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, Option<i64>>(1)?,
-            r.get::<_, i64>(2)? != 0,
-            r.get::<_, i64>(3)?,
-        ))
-    })?;
+    let rows = conn.impact_hosts()?;
     let (mut n, mut m, mut l) = (0, 0, 0);
-    for row in rows {
-        let (not_after, override_until, online, last_seen) = row?;
+    for (not_after, override_until, online, last_seen) in rows {
         if not_after <= now_ms {
             let in_grace =
                 now_ms < not_after + grace_ms || override_until.is_some_and(|u| u > now_ms);
@@ -579,11 +559,7 @@ pub fn impact(conn: &Connection, grace_days: u32, now_ms: i64) -> Result<Impact,
             l += 1;
         }
     }
-    let r: i64 = conn.query_row(
-        "SELECT count(*) FROM enroll_requests WHERE kind = 'enroll' AND state IN ('pending_approval', 'approved')",
-        [],
-        |r| r.get(0),
-    )?;
+    let r: i64 = conn.pending_enroll_count()?;
     let t = conn
         .list_tokens()?
         .iter()
@@ -611,7 +587,7 @@ pub struct GraceImpact {
 
 /// 計算把寬限期由 `from_days` 改為 `to_days` 的影響（不是縮短時 K＝0）
 pub fn grace_impact(
-    conn: &Connection,
+    conn: &dyn Store,
     from_days: u32,
     to_days: u32,
     now_ms: i64,
@@ -629,22 +605,9 @@ pub fn grace_impact(
         i64::from(from_days) * 86_400_000,
         i64::from(to_days) * 86_400_000,
     );
-    let mut stmt = conn.prepare(
-        "SELECT h.agent_id, COALESCE(NULLIF(h.display_name, ''), h.hostname), c.not_after, h.grace_override_until
-         FROM hosts h JOIN pki_certificates c ON c.serial = h.current_serial
-         WHERE h.lifecycle = 'active' AND c.revoked_at IS NULL AND c.not_after <= ?1",
-    )?;
-    let rows = stmt.query_map([now_ms], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<i64>>(3)?,
-        ))
-    })?;
+    let rows = conn.expired_cert_hosts(now_ms)?;
     let mut hit = Vec::new();
-    for row in rows {
-        let (agent_id, name, not_after, override_until) = row?;
+    for (agent_id, name, not_after, override_until) in rows {
         if override_until.is_some_and(|u| u > now_ms) {
             continue;
         }
@@ -769,7 +732,7 @@ impl Confirmed<'_> {
 
 /// 由目前與變更後的生效值計算影響（關閉註冊端點、縮短寬限期；其他變更沒有影響）
 pub fn change_impact(
-    conn: &Connection,
+    conn: &dyn Store,
     before: &settings::Effective,
     after: &settings::Effective,
     now_ms: i64,
@@ -794,7 +757,7 @@ pub fn change_impact(
 /// 修改模式與自動暫停（寫入 `settings` 與稽核）。`expected` 為 L2 時確認過的影響數字
 #[allow(clippy::too_many_arguments)]
 pub fn set_mode(
-    conn: &mut Connection,
+    conn: &dyn Store,
     mode: Option<EnrollMode>,
     auto_pause_enabled: Option<bool>,
     auto_pause_after_hours: Option<u32>,
@@ -805,7 +768,7 @@ pub fn set_mode(
     level: &str,
     now_ms: i64,
 ) -> Result<(), OpError> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     let current = settings::overrides_from(&tx.load_settings()?);
     let mut changes = serde_json::Map::new();
     if let Some(m) = mode {
@@ -853,7 +816,7 @@ pub fn set_mode(
 
 /// 修改憑證政策（`settings` 表）
 pub fn set_policy(
-    conn: &mut Connection,
+    conn: &dyn Store,
     values: &[(&'static str, Value)],
     by: &str,
     actor_ip: Option<&str>,
@@ -863,7 +826,7 @@ pub fn set_policy(
     for (k, v) in values {
         settings::validate_override(k, v).map_err(|e| OpError::invalid("policy", e))?;
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     for (k, v) in values {
         tx.set_setting(k, v, by, now_ms)?;
     }
@@ -895,7 +858,7 @@ pub fn set_policy(
 
 /// 改用設定檔的值：刪除 `settings` 中的鍵（L1、稽核）。回傳 (鍵, 先前是否由主控台管理)
 pub fn reset_settings(
-    conn: &mut Connection,
+    conn: &dyn Store,
     keys: &[String],
     by: &str,
     actor_ip: Option<&str>,
@@ -913,7 +876,7 @@ pub fn reset_settings(
             ));
         }
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     let mut out = Vec::new();
     for k in keys {
         let existed = tx.delete_setting(k)?;
@@ -945,7 +908,7 @@ pub fn reset_settings(
 
 /// 允許再次自動續簽（S14，D12）
 pub fn grace_override(
-    conn: &mut Connection,
+    conn: &dyn Store,
     agent_ids: &[String],
     until_ms: i64,
     by: &str,
@@ -959,7 +922,7 @@ pub fn grace_override(
     if reason.trim().is_empty() {
         return Err(OpError::invalid("reason", "reason 必填"));
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.begin(TxMode::Immediate)?;
     let mut out = Vec::new();
     for id in agent_ids {
         let id = id.to_ascii_lowercase();
@@ -994,7 +957,7 @@ pub enum Resolved {
     Ambiguous(Vec<RequestRow>),
 }
 
-pub fn resolve_request(conn: &Connection, input: &str) -> Result<Resolved, OpError> {
+pub fn resolve_request(conn: &dyn Store, input: &str) -> Result<Resolved, OpError> {
     let input = input.trim();
     if is_uuid_text(input) {
         return Ok(match conn.get_request(&input.to_ascii_lowercase())? {
@@ -1092,22 +1055,10 @@ pub fn token_json(t: &TokenRow, now_ms: i64) -> Value {
 }
 
 /// 部署進度（漏斗；`queued`、`clock_rejected` 由常駐行程的記憶體提供）
-pub fn token_progress(conn: &Connection, token_id: &str) -> Result<Value, OpError> {
-    let mut stmt = conn.prepare(
-        "SELECT r.state, count(*), sum(CASE WHEN h.connected_at IS NOT NULL AND h.connected_at >= r.decided_at THEN 1 ELSE 0 END)
-         FROM enroll_requests r LEFT JOIN hosts h ON h.agent_id = r.agent_id
-         WHERE r.token_id = ?1 GROUP BY r.state",
-    )?;
+pub fn token_progress(conn: &dyn Store, token_id: &str) -> Result<Value, OpError> {
     let mut counts = std::collections::HashMap::new();
     let mut online = 0i64;
-    for row in stmt.query_map([token_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, Option<i64>>(2)?,
-        ))
-    })? {
-        let (state, n, on) = row?;
+    for (state, n, on) in conn.token_progress_counts(token_id)? {
         if state == "issued" {
             online = on.unwrap_or(0);
         }
@@ -1137,6 +1088,7 @@ pub fn parse_kind(s: &str) -> Option<DbKind> {
 mod impact_tests {
     use super::*;
     use crate::store::sqlite::{MIGRATIONS, migrate};
+    use rusqlite::Connection;
 
     const DAY: i64 = 86_400_000;
     const NOW: i64 = 1_000 * DAY;

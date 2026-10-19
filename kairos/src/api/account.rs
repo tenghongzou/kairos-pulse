@@ -33,8 +33,7 @@ use super::http::{
     ts_ms,
 };
 use crate::audit::Event;
-use crate::store::prelude::*;
-use crate::store::sqlite::conn::in_write_tx;
+use crate::store::db::in_write_tx;
 use crate::users::ldap::DirError;
 use crate::users::password::{self, HashParams};
 use crate::users::store::{self as us, NewSession, SOURCE_LDAP, SOURCE_LOCAL, UserRow};

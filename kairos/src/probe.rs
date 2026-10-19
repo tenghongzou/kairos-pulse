@@ -38,7 +38,6 @@ use crate::registry::Registry;
 use crate::shutdown::Shutdown;
 use crate::stats::WriteStats;
 use crate::storage::QueueProbe;
-use crate::store::prelude::*;
 use crate::tls::TlsState;
 
 /// 資料庫檢查結果的快取時間

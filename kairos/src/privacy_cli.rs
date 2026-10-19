@@ -238,7 +238,8 @@ fn export_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         None => return Err(not_found(&agent_id)),
     };
     let now_ms = env.now.timestamp_millis();
-    let doc = crate::privacy::personal_data(&conn, &agent_id, &config.privacy, now_ms)
+    let doc = conn
+        .personal_data(&agent_id, &config.privacy, now_ms)
         .map_err(db_failure)?
         .ok_or_else(|| not_found(&agent_id))?;
     let actor = operator();

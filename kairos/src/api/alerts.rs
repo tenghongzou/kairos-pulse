@@ -707,7 +707,7 @@ async fn comment_resolved(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Value, 
             if conn.get_event(&id)?.is_none() {
                 return Ok(false);
             }
-            let tx = conn.transaction()?;
+            let tx = conn.begin(TxMode::Deferred)?;
             tx.insert_timeline(&[crate::alerts::engine::Timeline {
                 event_id: id.clone(),
                 at: now,
@@ -2086,7 +2086,7 @@ async fn delete_channel(
     c.svc
         .db
         .write(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.begin(TxMode::Deferred)?;
             for mut r in tx.load_rules()? {
                 let before = (r.channels.clone(), r.notify.escalate_channels.clone());
                 for list in [&mut r.channels, &mut r.notify.escalate_channels] {
@@ -2218,7 +2218,7 @@ async fn test_channel(
             .svc
             .db
             .write(move |conn| {
-                let tx = conn.transaction()?;
+                let tx = conn.begin(TxMode::Deferred)?;
                 let ids = tx.insert_deliveries(&[crate::alerts::engine::NewDelivery {
                     event_id: None,
                     channel_id: cid.clone(),

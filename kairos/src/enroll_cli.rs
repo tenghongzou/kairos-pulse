@@ -693,7 +693,7 @@ fn token_state_label(s: store::TokenState) -> &'static str {
 // enroll
 // ---------------------------------------------------------------------------
 
-fn resolve_all(conn: &rusqlite::Connection, inputs: &[String]) -> Result<Vec<String>, Failure> {
+fn resolve_all(conn: &dyn Store, inputs: &[String]) -> Result<Vec<String>, Failure> {
     let mut out = Vec::new();
     for i in inputs {
         match ops::resolve_request(conn, i).map_err(op_failure)? {
