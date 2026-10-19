@@ -267,8 +267,8 @@ impl EnrollService {
         let now = (p.clock)();
         let (overrides, blocks, decommissioned, rows) = db
             .write_blocking(|conn| {
-                let rows = store::load_settings(conn)?;
-                let blocks = store::load_blocks(conn)?;
+                let rows = conn.load_settings()?;
+                let blocks = conn.load_blocks()?;
                 let mut stmt =
                     conn.prepare("SELECT agent_id FROM hosts WHERE lifecycle = 'decommissioned'")?;
                 let decom: HashSet<String> = stmt
@@ -619,10 +619,8 @@ impl EnrollService {
             let result = self
                 .db
                 .write(move |conn| {
-                    store::upsert_block(conn, &row)?;
-                    store::audit(
-                        conn,
-                        now,
+                    conn.upsert_block(&row)?;
+                    conn.audit(now,
                         &Audit {
                             actor: "system",
                             actor_ip: Some(&audit_source),
@@ -647,7 +645,7 @@ impl EnrollService {
 
     /// 重新讀取 `settings` 表；模式或政策改變時記錄
     fn refresh_settings(&self, conn: &Connection) -> Result<(), DbError> {
-        let rows = store::load_settings(conn)?;
+        let rows = conn.load_settings()?;
         let eff = settings::effective(&self.config, &settings::overrides_from(&rows));
         let mut cur = self.effective.write().unwrap_or_else(|e| e.into_inner());
         if cur.mode != eff.mode {
@@ -676,8 +674,9 @@ impl EnrollService {
     fn evaluate_pause(&self, now: i64) {
         let eff = self.effective();
         let computed = self.db.read_blocking(|conn| {
-            let (active, last_end) = store::token_validity(conn, now)?;
-            let open_since = store::load_settings(conn)?
+            let (active, last_end) = conn.token_validity(now)?;
+            let open_since = conn
+                .load_settings()?
                 .into_iter()
                 .find(|(k, ..)| k == settings::KEY_OPEN_SINCE)
                 .and_then(|(_, v, ..)| v.as_i64());
@@ -715,8 +714,7 @@ impl EnrollService {
         };
         info!("{text}");
         let _ = self.db.write_blocking(|conn| {
-            store::audit(
-                conn,
+            conn.audit(
                 now,
                 &Audit {
                     actor: "system",
@@ -793,7 +791,8 @@ impl EnrollService {
             return i64::from(d) * 86_400_000;
         }
         let eff = self.effective();
-        let longest_token = store::list_tokens(conn)
+        let longest_token = conn
+            .list_tokens()
             .map(|ts| {
                 ts.iter()
                     .filter(|t| t.state(now) == store::TokenState::Active)
@@ -883,7 +882,7 @@ impl EnrollService {
         let states = self.db.read_blocking(move |conn| {
             let mut out = HashMap::new();
             for id in ids {
-                if let Some(r) = store::get_request(conn, &id)? {
+                if let Some(r) = conn.get_request(&id)? {
                     out.insert(id, r.state.as_str().to_string());
                 }
             }
@@ -929,9 +928,9 @@ impl EnrollService {
                 .retain(|_, (_, exp)| *exp > now);
             let mut batch = self.config.enroll.batch_sources.clone();
             let extra = self.db.write_blocking(|conn| {
-                store::replay_purge(conn, now)?;
-                let mut v = store::active_relaxations(conn, now)?;
-                v.extend(store::batch_token_cidrs(conn, now)?);
+                conn.replay_purge(now)?;
+                let mut v = conn.active_relaxations(now)?;
+                v.extend(conn.batch_token_cidrs(now)?);
                 Ok(v)
             });
             if let Ok(extra) = extra {
@@ -953,10 +952,10 @@ impl EnrollService {
             drop(last_hour);
             let audit_keep_ms = i64::from(self.config.audit.retention_days) * 86_400_000;
             let result = self.db.write_blocking(move |conn| {
-                let (expired, purged) = store::expire_and_purge(conn, now, CLOSED_KEEP_MS)?;
-                store::purge_blocks(conn, now)?;
-                store::purge_relaxations(conn, now)?;
-                store::purge_audit(conn, now - audit_keep_ms, now)?;
+                let (expired, purged) = conn.expire_and_purge(now, CLOSED_KEEP_MS)?;
+                conn.purge_blocks(now)?;
+                conn.purge_relaxations(now)?;
+                conn.audit_purge(now - audit_keep_ms, now)?;
                 conn.execute(
                     "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
                     [now - 400 * 86_400_000],

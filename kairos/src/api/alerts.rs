@@ -26,7 +26,8 @@ use crate::alerts::ops::{self, SilenceInput};
 use crate::alerts::rules::{self, CODE_RULE_INVALID, kind};
 use crate::alerts::secrets::{masked, scrub};
 use crate::alerts::{AlertService, backtest, scope, store};
-use crate::enroll::store::{Audit, audit};
+use crate::enroll::store::Audit;
+use crate::store::prelude::*;
 
 /// 本文的上限
 pub const MAX_BODY: usize = 256 * 1024;
@@ -305,8 +306,7 @@ impl Ctx<'_> {
             .svc
             .db
             .write(move |conn| {
-                Ok(audit(
-                    conn,
+                Ok(conn.audit(
                     now,
                     &Audit {
                         actor: &actor,

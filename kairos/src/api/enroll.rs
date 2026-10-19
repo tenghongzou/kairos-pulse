@@ -291,7 +291,7 @@ async fn list_tokens(
     let now_ms = now.timestamp_millis();
     let rows = svc
         .db
-        .read(|conn| Ok(store::list_tokens(conn)?))
+        .read(|conn| Ok(conn.list_tokens()?))
         .await
         .map_err(db_error)?;
     let filtered: Vec<_> = rows
@@ -330,7 +330,7 @@ async fn get_token(
     let tid = id.to_string();
     let t = svc
         .db
-        .read(move |conn| Ok(store::get_token(conn, &tid)?))
+        .read(move |conn| Ok(conn.get_token(&tid)?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -564,7 +564,7 @@ async fn list_requests(
     };
     let rows = svc
         .db
-        .read(move |conn| Ok(store::list_requests(conn, &filter)?))
+        .read(move |conn| Ok(conn.list_requests(&filter)?))
         .await
         .map_err(db_error)?;
     let flag = q.get("flag").map(str::to_string);
@@ -772,7 +772,7 @@ async fn list_settings(
 ) -> Result<Response<ApiBody>, ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::load_settings(conn)?))
+        .read(|conn| Ok(conn.load_settings()?))
         .await
         .map_err(db_error)?;
     let list: Vec<Value> = settings::effective_view(&svc.config, &rows)
@@ -848,7 +848,7 @@ async fn reset_effective(
 ) -> Result<(settings::Effective, settings::Effective), ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::load_settings(conn)?))
+        .read(|conn| Ok(conn.load_settings()?))
         .await
         .map_err(db_error)?;
     let overrides = settings::overrides_from(&rows);
@@ -1622,7 +1622,7 @@ async fn signing_queue(
 ) -> Result<Response<ApiBody>, ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::approved_requests(conn, 100_000)?))
+        .read(|conn| Ok(conn.approved_requests(100_000)?))
         .await
         .map_err(db_error)?;
     Ok(http::ok(

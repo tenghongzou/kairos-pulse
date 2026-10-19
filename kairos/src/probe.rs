@@ -871,11 +871,7 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
             "目前被封鎖的來源數",
             svc.limits.l7.blocked_count(now_ms) as f64,
         );
-        if let Ok(n) = svc
-            .db
-            .read(|conn| Ok(crate::enroll::store::pending_count(conn)?))
-            .await
-        {
+        if let Ok(n) = svc.db.read(|conn| Ok(conn.pending_count()?)).await {
             e.gauge(
                 "kairos_enroll_pending_requests",
                 "待核准的申請數（註冊佇列）",

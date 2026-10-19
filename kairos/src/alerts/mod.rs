@@ -51,6 +51,7 @@ use crate::per_ip::PerIpLimiter;
 use crate::registry::Registry;
 use crate::shutdown::Shutdown;
 use crate::stats::WriteStats;
+use crate::store::prelude::*;
 use crate::tls::TlsState;
 use engine::{
     ActionError, Change, Engine, EngineConfig, HostView, Loaded, Output, Rejection, Warmup, World,
@@ -807,8 +808,7 @@ impl AlertService {
                     store::finish_action(conn, a.id, now, r)?;
                     // 稽核雜湊鏈：與主控台 API 的確認、解決、註解相同的紀錄（執行者為 CLI 的作業系統帳號）
                     let ok = r["ok"] == true;
-                    crate::enroll::store::audit(
-                        conn,
+                    conn.audit(
                         now,
                         &crate::enroll::store::Audit {
                             actor: &a.actor,

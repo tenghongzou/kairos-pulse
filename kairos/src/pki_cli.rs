@@ -18,6 +18,7 @@ use crate::enroll_cli::{
 };
 use crate::pki::ca::{self, CaKey, InitError, InitPlan, ServerName};
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode};
+use crate::store::prelude::*;
 use crate::token_cli::{Failure, Output, db_failure, human_time, operator};
 
 /// 根 CA 私鑰仍在伺服器上（`pki init` 之後提醒移到離線保存）
@@ -132,8 +133,7 @@ pub fn init(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         InitError::Failed(m) => general("PKI 初始化失敗", m),
     })?;
     let san: Vec<String> = plan.names.iter().map(ServerName::text).collect();
-    let _ = store::audit(
-        &conn,
+    let _ = conn.audit(
         now_ms,
         &store::Audit {
             actor: &operator(),
@@ -497,9 +497,7 @@ fn gencrl_online(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     }
     mgr.write_crl_file(&conn)
         .map_err(|e| db_failure(format!("{e:?}")))?;
-    let _ = store::audit(
-        &conn,
-        now_ms,
+    let _ = conn.audit(now_ms,
         &store::Audit {
             actor: &actor,
             category: "pki",

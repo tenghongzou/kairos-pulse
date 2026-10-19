@@ -19,6 +19,7 @@ use crate::config::export::{
     validate_endpoint, validate_header,
 };
 use crate::config::{AppConfig, OtlpSettings, PrometheusExportSettings, SettingSource};
+use crate::store::prelude::*;
 
 pub const KEY_PROM_ENABLED: &str = "export.prometheus.enabled";
 pub const KEY_PROM_STALE: &str = "export.prometheus.stale_after_secs";
@@ -218,7 +219,7 @@ fn unseal_headers(secrets: &SecretBox, v: &Value) -> Result<Vec<(String, String)
 pub fn load_rows(db: &Path) -> Vec<Row> {
     let read = || -> Result<Vec<Row>, String> {
         let conn = crate::store::sqlite::open_read_only(db).map_err(|e| e.to_string())?;
-        crate::enroll::store::load_settings(&conn).map_err(|e| e.to_string())
+        conn.load_settings().map_err(|e| e.to_string())
     };
     match read() {
         Ok(rows) => rows

@@ -24,7 +24,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use super::ops::{self, TokenInput};
-use super::{Running, StartParams, store};
+use super::{Running, StartParams};
 use crate::config::{AppConfig, PkiMode};
 use crate::pki::x509::{parse_cert, pem_decode_all};
 use crate::shutdown::Shutdown;
@@ -519,7 +519,7 @@ async fn manual_enrollment_is_approved_and_delivered_with_the_pinned_ca() {
     assert_eq!(s, 200);
     assert_eq!(v2["certificate"]["serial"], v["certificate"]["serial"]);
     // 清冊：current_serial
-    let host = store::host_enroll(&env.conn(), &a.id).unwrap().unwrap();
+    let host = env.conn().host_enroll(&a.id).unwrap().unwrap();
     assert_eq!(host.current_serial.as_deref(), Some(cert.serial.as_str()));
 }
 
@@ -898,7 +898,7 @@ async fn mode_switching_and_auto_pause() {
         .post("/v1/enroll/token-check", &json!({"token": token}))
         .await;
     assert_eq!(s, 200);
-    let audit = store::recent_audit(&env.conn(), 50).unwrap();
+    let audit = env.conn().recent_audit(50).unwrap();
     assert!(audit.iter().any(|a| a.2 == "mode.auto_pause"));
     assert!(audit.iter().any(|a| a.2 == "mode.auto_resume"));
 

@@ -15,7 +15,7 @@ use super::issue::{IssuingCa, random_serial};
 use super::store::CertRow;
 use super::x509::{parse_cert, verify_cert_signature};
 use crate::enroll::pki_mgr::issued_via;
-use crate::enroll::store::{self as es, Audit, DbState};
+use crate::enroll::store::{Audit, DbState};
 use crate::store::prelude::*;
 
 pub const QUEUE_SCHEMA: &str = "kairos-csr-queue/v1";
@@ -28,7 +28,7 @@ pub fn export(
     default_days: u32,
     now_ms: i64,
 ) -> Result<Value, String> {
-    let rows = es::approved_requests(conn, 100_000).map_err(|e| e.to_string())?;
+    let rows = conn.approved_requests(100_000).map_err(|e| e.to_string())?;
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -137,7 +137,8 @@ pub fn import_one(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
-    let req = es::get_request(&tx, request_id)
+    let req = tx
+        .get_request(request_id)
         .map_err(|e| e.to_string())?
         .ok_or("找不到這筆申請")?;
     if req.state != DbState::Approved {
@@ -195,9 +196,9 @@ pub fn import_one(
         e.to_string()
     }
     tx.insert_cert(&cert).map_err(e)?;
-    es::mark_issued(&tx, &req.request_id, &cert.serial, by, now_ms).map_err(e)?;
-    es::upsert_host_on_issue(
-        &tx,
+    tx.mark_issued(&req.request_id, &cert.serial, by, now_ms)
+        .map_err(e)?;
+    tx.upsert_host_on_issue(
         &req.agent_id,
         &req.hostname,
         req.host_fingerprint.as_deref(),
@@ -208,8 +209,7 @@ pub fn import_one(
         now_ms,
     )
     .map_err(e)?;
-    es::audit(
-        &tx,
+    tx.audit(
         now_ms,
         &Audit {
             actor: by,
@@ -371,8 +371,7 @@ pub fn import_existing(
             }
         }
     }
-    es::audit(
-        &tx,
+    tx.audit(
         now_ms,
         &Audit {
             actor: by,

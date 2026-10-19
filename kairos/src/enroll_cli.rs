@@ -540,7 +540,7 @@ fn token_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 cmd.opt("--state").unwrap_or("active").to_string()
             };
             let conn = db(cmd)?;
-            let rows = store::list_tokens(&conn).map_err(db_failure)?;
+            let rows = conn.list_tokens().map_err(db_failure)?;
             let shown: Vec<_> = rows
                 .iter()
                 .filter(|t| state == "all" || t.state(now_ms).as_str() == state)
@@ -589,16 +589,14 @@ fn token_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         Some("show") => {
             let id = cmd.sub(1).ok_or_else(|| usage_err("需要 token_id"))?;
             let conn = db(cmd)?;
-            let t = store::get_token(&conn, id)
-                .map_err(db_failure)?
-                .ok_or_else(|| {
-                    Failure::new(
-                        format!("找不到註冊 token {id}"),
-                        "資料庫中沒有這個 token_id",
-                        Vec::new(),
-                        EXIT_GENERAL,
-                    )
-                })?;
+            let t = conn.get_token(id).map_err(db_failure)?.ok_or_else(|| {
+                Failure::new(
+                    format!("找不到註冊 token {id}"),
+                    "資料庫中沒有這個 token_id",
+                    Vec::new(),
+                    EXIT_GENERAL,
+                )
+            })?;
             let mut v = ops::token_json(&t, now_ms);
             v["progress"] = ops::token_progress(&conn, id).map_err(op_failure)?;
             if cmd.json {
@@ -740,7 +738,8 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 limit: 100_000,
             };
             let flag = cmd.opt("--flag");
-            let rows: Vec<_> = store::list_requests(&conn, &filter)
+            let rows: Vec<_> = conn
+                .list_requests(&filter)
                 .map_err(db_failure)?
                 .into_iter()
                 .filter(|r| match flag {
@@ -808,7 +807,8 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 .ok_or_else(|| usage_err("需要 request_id 或申請編號"))?;
             let conn = db(cmd)?;
             let id = resolve_all(&conn, &[input.to_string()])?.remove(0);
-            let r = store::get_request(&conn, &id)
+            let r = conn
+                .get_request(&id)
                 .map_err(db_failure)?
                 .ok_or_else(|| db_failure("申請已不存在"))?;
             let v = ops::request_json(&r);
@@ -852,7 +852,7 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     limit: 100_000,
                 };
                 ids.extend(
-                    store::list_requests(&conn, &filter)
+                    conn.list_requests(&filter)
                         .map_err(db_failure)?
                         .into_iter()
                         .filter(|r| r.flags.is_empty())
@@ -978,7 +978,7 @@ fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     let now_ms = env.now.timestamp_millis();
     let config = load_config(cmd.config_path.as_deref())?;
     let mut conn = db(cmd)?;
-    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
     let eff = settings::effective(&config, &overrides);
     let mode =
         match cmd.sub(1) {
@@ -1112,7 +1112,7 @@ fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         now_ms,
     )
     .map_err(op_failure)?;
-    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
     let eff = settings::effective(&config, &overrides);
     if cmd.json {
         return Ok(ok_json(cmd, env.now, show(&eff)));
@@ -1234,8 +1234,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 crate::pki::pki_dir(&data_dir).join(format!("issuing-{id}.csr"))
             });
             write_new_file(&csr_path.to_string_lossy(), n.csr_pem.as_bytes())?;
-            let _ = store::audit(
-                &conn,
+            let _ = conn.audit(
                 now_ms,
                 &store::Audit {
                     actor: &operator(),
@@ -1271,8 +1270,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let data_dir = PathBuf::from(&config.storage.data_dir);
             let r =
                 crate::pki::manage::install(&conn, &data_dir, &pem, now_ms).map_err(cert_fail)?;
-            let _ = store::audit(
-                &conn,
+            let _ = conn.audit(
                 now_ms,
                 &store::Audit {
                     actor: &operator(),
@@ -1349,8 +1347,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 }
                 conn.retire_ca(id, now_ms).map_err(db_failure)?;
             }
-            let _ = store::audit(
-                &conn,
+            let _ = conn.audit(
                 now_ms,
                 &store::Audit {
                     actor: &operator(),
@@ -1389,8 +1386,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("certificates"), Some("list")) => {
             let config = load_config(cmd.config_path.as_deref())?;
             let conn = db(cmd)?;
-            let overrides =
-                settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+            let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
             let grace = settings::effective(&config, &overrides)
                 .policy
                 .expired_renew_grace_days;
@@ -1531,8 +1527,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("queue"), Some("export")) => {
             let config = load_config(cmd.config_path.as_deref())?;
             let conn = db(cmd)?;
-            let overrides =
-                settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+            let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
             let days = settings::effective(&config, &overrides)
                 .policy
                 .cert_lifetime_days;
@@ -1861,7 +1856,7 @@ fn config_show(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     }
     let config = load_config(cmd.config_path.as_deref())?;
     let rows = match open(cmd.config_path.as_deref(), false) {
-        Ok(Some(conn)) => store::load_settings(&conn).map_err(db_failure)?,
+        Ok(Some(conn)) => conn.load_settings().map_err(db_failure)?,
         Ok(None) => Vec::new(),
         Err(f) => return Err(f),
     };
@@ -1969,7 +1964,7 @@ fn config_reset(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     let mut conn = db(cmd)?;
     // 改回設定檔的值可能等於關閉註冊端點或縮短寬限期：與 enroll mode closed、主控台相同的 L2
     // （設計包 screens.md §0.3；API POST /api/v1/settings/reset 的 impact_token）
-    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
     let before = settings::effective(&config, &overrides);
     let mut rest = overrides.clone();
     for k in &keys {

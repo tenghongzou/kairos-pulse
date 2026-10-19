@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::EnrollService;
 use super::pki_mgr::{IssueError, IssueOutcome};
-use super::store::{self, Audit, DbKind, DbState, RequestRow};
+use super::store::{Audit, DbKind, DbState, RequestRow};
 use crate::pki::csr::check_csr;
 use crate::pki::issue::Reason;
 use crate::pki::store::{CertRow, Revoke};
@@ -121,9 +121,7 @@ pub fn on_hello(svc: &Arc<EnrollService>, agent_id: &str, serial: &str) {
                     if let Revoke::Now(_) =
                         tx.revoke(&old, now, now, Reason::Superseded, "system", Some("新憑證已開始使用"))?
                     {
-                        store::audit(
-                            &tx,
-                            now,
+                        tx.audit(now,
                             &Audit {
                                 actor: "system",
                                 category: "pki",
@@ -195,7 +193,7 @@ pub async fn renew(
         .write(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // 冪等：同一 agent_id＋同一 CSR 只簽發一張
-            if let Some(r) = store::request_by_csr(&tx, &agent, &csr.csr_sha256)? {
+            if let Some(r) = tx.request_by_csr(&agent, &csr.csr_sha256)? {
                 return Ok(Ok(r));
             }
             if tx.spki_used_by_agent(&agent, &csr.spki_sha256)? {
@@ -204,7 +202,7 @@ pub async fn renew(
                     "the new key must differ from previous keys of this agent_id",
                 )));
             }
-            let host = store::host_enroll(&tx, &agent)?;
+            let host = tx.host_enroll(&agent)?;
             let needs_approval = eff.policy.renew_requires_approval;
             let id = if kairos_proto::is_uuid_text(&request_id) {
                 request_id.to_ascii_lowercase()
@@ -214,7 +212,7 @@ pub async fn renew(
                     "request_id must be a UUID",
                 )));
             };
-            if store::get_request(&tx, &id)?.is_some() {
+            if tx.get_request(&id)?.is_some() {
                 return Ok(Err(AgentError::new(
                     ErrorCode::BadRequest,
                     "request_id is already used by a different CSR",
@@ -262,10 +260,8 @@ pub async fn renew(
                 withdraw_ip: None,
                 closed_at: None,
             };
-            store::insert_request(&tx, &row)?;
-            store::audit(
-                &tx,
-                now,
+            tx.insert_request(&row)?;
+            tx.audit(now,
                 &Audit {
                     actor: &format!("host:{}", &agent[..8]),
                     category: "pki",
@@ -359,8 +355,8 @@ pub async fn deregister(
             } else {
                 m.hostname.clone()
             };
-            let already = store::decommission_host(&tx, &agent, &hostname, "self", now)?;
-            let host = store::host_enroll(&tx, &agent)?;
+            let already = tx.decommission_host(&agent, &hostname, "self", now)?;
+            let host = tx.host_enroll(&agent)?;
             let at = host.and_then(|h| h.decommissioned_at).unwrap_or(now);
             let mut revoked = false;
             if revoke && let Some(serial) = &serial {
@@ -376,8 +372,7 @@ pub async fn deregister(
                     Revoke::NotFound => {}
                 }
             }
-            store::audit(
-                &tx,
+            tx.audit(
                 now,
                 &Audit {
                     actor: &format!("host:{}", &agent[..8]),

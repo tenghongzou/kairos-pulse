@@ -248,9 +248,8 @@ pub fn create_token(
         last_used_at: None,
     };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    store::insert_token(&tx, &row)?;
-    store::audit(
-        &tx,
+    tx.insert_token(&row)?;
+    tx.audit(
         now_ms,
         &Audit {
             actor: by,
@@ -286,15 +285,14 @@ pub fn disable_token(
     now_ms: i64,
 ) -> Result<(TokenRow, bool), OpError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some((row, already)) = store::disable_token(&tx, token_id, by, reason, now_ms)? else {
+    let Some((row, already)) = tx.disable_token(token_id, by, reason, now_ms)? else {
         return Err(OpError::new(
             "token_not_found",
             format!("找不到註冊 token {token_id}"),
         ));
     };
     if !already {
-        store::audit(
-            &tx,
+        tx.audit(
             now_ms,
             &Audit {
                 actor: by,
@@ -349,17 +347,16 @@ pub fn approve(
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let decision = match store::get_request(&tx, id)? {
+        let decision = match tx.get_request(id)? {
             None => Decision::NotFound,
             Some(r) if r.state == DbState::Withdrawn => Decision::Withdrawn,
             Some(r) if r.state != DbState::PendingApproval => Decision::AlreadyDecided(r.state),
             Some(_) => {
-                store::approve(&tx, id, by, lifetime_days, now_ms)?;
+                tx.approve(id, by, lifetime_days, now_ms)?;
                 Decision::Approved
             }
         };
-        store::audit(
-            &tx,
+        tx.audit(
             now_ms,
             &Audit {
                 actor: by,
@@ -409,17 +406,16 @@ pub fn reject(
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let decision = match store::get_request(&tx, id)? {
+        let decision = match tx.get_request(id)? {
             None => Decision::NotFound,
             Some(r) if r.state == DbState::Withdrawn => Decision::Withdrawn,
             Some(r) if !r.state.is_pending() => Decision::AlreadyDecided(r.state),
             Some(_) => {
-                store::reject(&tx, id, by, code, reason, now_ms)?;
+                tx.reject(id, by, code, reason, now_ms)?;
                 Decision::Rejected
             }
         };
-        store::audit(
-            &tx,
+        tx.audit(
             now_ms,
             &Audit {
                 actor: by,
@@ -471,8 +467,7 @@ pub fn revoke(
             Revoke::Already(_) => RevokeResult::Already,
             Revoke::NotFound => RevokeResult::NotFound,
         };
-        store::audit(
-            &tx,
+        tx.audit(
             now_ms,
             &Audit {
                 actor: by,
@@ -589,7 +584,8 @@ pub fn impact(conn: &Connection, grace_days: u32, now_ms: i64) -> Result<Impact,
         [],
         |r| r.get(0),
     )?;
-    let t = store::list_tokens(conn)?
+    let t = conn
+        .list_tokens()?
         .iter()
         .filter(|t| t.state(now_ms) == TokenState::Active)
         .count() as i64;
@@ -810,18 +806,18 @@ pub fn set_mode(
     now_ms: i64,
 ) -> Result<(), OpError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = settings::overrides_from(&store::load_settings(&tx)?);
+    let current = settings::overrides_from(&tx.load_settings()?);
     let mut changes = serde_json::Map::new();
     if let Some(m) = mode {
         let before = current.get(settings::KEY_MODE).cloned();
-        store::set_setting(&tx, settings::KEY_MODE, &json!(m.as_str()), by, now_ms)?;
+        tx.set_setting(settings::KEY_MODE, &json!(m.as_str()), by, now_ms)?;
         if m == EnrollMode::Open && before.as_ref().and_then(|v| v.as_str()) != Some("open") {
-            store::set_setting(&tx, settings::KEY_OPEN_SINCE, &json!(now_ms), by, now_ms)?;
+            tx.set_setting(settings::KEY_OPEN_SINCE, &json!(now_ms), by, now_ms)?;
         }
         changes.insert("mode".into(), json!({"from": before, "to": m.as_str()}));
     }
     if let Some(v) = auto_pause_enabled {
-        store::set_setting(&tx, settings::KEY_AUTO_PAUSE_ENABLED, &json!(v), by, now_ms)?;
+        tx.set_setting(settings::KEY_AUTO_PAUSE_ENABLED, &json!(v), by, now_ms)?;
         changes.insert("auto_pause_enabled".into(), json!(v));
     }
     if let Some(h) = auto_pause_after_hours {
@@ -831,18 +827,10 @@ pub fn set_mode(
                 "auto_pause_after_hours 必須介於 1..=168",
             ));
         }
-        store::set_setting(
-            &tx,
-            settings::KEY_AUTO_PAUSE_AFTER_HOURS,
-            &json!(h),
-            by,
-            now_ms,
-        )?;
+        tx.set_setting(settings::KEY_AUTO_PAUSE_AFTER_HOURS, &json!(h), by, now_ms)?;
         changes.insert("auto_pause_after_hours".into(), json!(h));
     }
-    store::audit(
-        &tx,
-        now_ms,
+    tx.audit(now_ms,
         &Audit {
             actor: by,
             actor_ip,
@@ -877,10 +865,9 @@ pub fn set_policy(
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (k, v) in values {
-        store::set_setting(&tx, k, v, by, now_ms)?;
+        tx.set_setting(k, v, by, now_ms)?;
     }
-    store::audit(
-        &tx,
+    tx.audit(
         now_ms,
         &Audit {
             actor: by,
@@ -929,9 +916,8 @@ pub fn reset_settings(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut out = Vec::new();
     for k in keys {
-        let existed = store::delete_setting(&tx, k)?;
-        store::audit(
-            &tx,
+        let existed = tx.delete_setting(k)?;
+        tx.audit(
             now_ms,
             &Audit {
                 actor: by,
@@ -977,9 +963,8 @@ pub fn grace_override(
     let mut out = Vec::new();
     for id in agent_ids {
         let id = id.to_ascii_lowercase();
-        let found = store::set_grace_override(&tx, &id, Some(until_ms))?;
-        store::audit(
-            &tx,
+        let found = tx.set_grace_override(&id, Some(until_ms))?;
+        tx.audit(
             now_ms,
             &Audit {
                 actor: by,
@@ -1012,17 +997,15 @@ pub enum Resolved {
 pub fn resolve_request(conn: &Connection, input: &str) -> Result<Resolved, OpError> {
     let input = input.trim();
     if is_uuid_text(input) {
-        return Ok(
-            match store::get_request(conn, &input.to_ascii_lowercase())? {
-                Some(r) => Resolved::One(Box::new(r)),
-                None => Resolved::NotFound,
-            },
-        );
+        return Ok(match conn.get_request(&input.to_ascii_lowercase())? {
+            Some(r) => Resolved::One(Box::new(r)),
+            None => Resolved::NotFound,
+        });
     }
     let Some(code) = RequestCode::parse(input) else {
         return Ok(Resolved::NotFound);
     };
-    let mut rows = store::requests_by_code(conn, &code.compact())?;
+    let mut rows = conn.requests_by_code(&code.compact())?;
     // 有待核准的申請時只看待核准的
     if rows.iter().any(|r| r.state.is_pending()) {
         rows.retain(|r| r.state.is_pending());

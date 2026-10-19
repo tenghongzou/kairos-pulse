@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::db::DbError;
-use super::store::{self as es, Audit, DbKind, DbState, RequestRow};
+use super::store::{Audit, DbKind, DbState, RequestRow};
 use crate::config::PkiMode;
 use crate::pki::issue::{IssuingCa, random_serial};
 use crate::pki::store::{self as ps, CA_ACTIVE, CA_RETIRED, CA_TRUSTED, CertRow};
@@ -385,7 +385,7 @@ impl PkiManager {
     ) -> Result<IssueOutcome, IssueError> {
         let issuer = self.active_issuer()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(req) = es::get_request(&tx, request_id)? else {
+        let Some(req) = tx.get_request(request_id)? else {
             return Ok(IssueOutcome::NotFound);
         };
         if req.state == DbState::Issued {
@@ -406,7 +406,7 @@ impl PkiManager {
         let checked = match check_csr(&req.csr_der, &req.agent_id) {
             Ok(c) => c,
             Err(e) => {
-                es::set_issue_error(&tx, request_id, &e)?;
+                tx.set_issue_error(request_id, &e)?;
                 tx.commit()?;
                 return Err(IssueError::Failed(e));
             }
@@ -448,9 +448,8 @@ impl PkiManager {
             ..CertRow::default()
         };
         tx.insert_cert(&cert)?;
-        es::mark_issued(&tx, request_id, &cert.serial, &by, now_ms)?;
-        es::upsert_host_on_issue(
-            &tx,
+        tx.mark_issued(request_id, &cert.serial, &by, now_ms)?;
+        tx.upsert_host_on_issue(
             &req.agent_id,
             &req.hostname,
             req.host_fingerprint.as_deref(),
@@ -463,9 +462,8 @@ impl PkiManager {
             &cert.serial,
             now_ms,
         )?;
-        es::set_host_group_from_token(&tx, &req.agent_id, req.token_id.as_deref())?;
-        es::audit(
-            &tx,
+        tx.set_host_group_from_token(&req.agent_id, req.token_id.as_deref())?;
+        tx.audit(
             now_ms,
             &Audit {
                 actor: &by,
@@ -586,7 +584,7 @@ pub fn issue_approved(
     if mgr.active_issuer().is_err() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let pending = es::approved_requests(conn, limit)?;
+    let pending = conn.approved_requests(limit)?;
     let mut issued = Vec::new();
     let mut failed = Vec::new();
     for req in pending {

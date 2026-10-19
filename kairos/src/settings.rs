@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::config::{AppConfig, CertPolicySettings, SettingSource};
+use crate::store::db::StoreResult;
 
 pub const KEY_MODE: &str = "enroll.mode";
 pub const KEY_AUTO_PAUSE_ENABLED: &str = "enroll.auto_pause_enabled";
@@ -375,6 +376,18 @@ fn flatten_values(prefix: &str, value: &Value, out: &mut BTreeMap<String, Value>
             out.insert(prefix.to_string(), v.clone());
         }
     }
+}
+
+/// 主控台覆寫的設定（`settings` 表）。SQLite 的實作在 `store/sqlite/enroll.rs`
+pub trait SettingsStore {
+    /// `settings` 表的所有值：(鍵, JSON 值, 更新時間, 更新者)
+    fn load_settings(&self) -> StoreResult<Vec<(String, Value, i64, String)>>;
+
+    /// 寫入（覆寫）一個鍵
+    fn set_setting(&self, key: &str, value: &Value, by: &str, now_ms: i64) -> StoreResult<()>;
+
+    /// 刪除 `settings` 的鍵（改用設定檔的值）；回傳是否存在
+    fn delete_setting(&self, key: &str) -> StoreResult<bool>;
 }
 
 #[cfg(test)]

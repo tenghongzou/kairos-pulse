@@ -40,7 +40,7 @@ use super::db::DbError;
 use super::http::{self as h, EnrollError};
 use super::limits::InvalidClass;
 use super::pki_mgr::{IssueError, IssueOutcome};
-use super::store::{self, Audit, DbKind, DbState, RequestRow, TokenRow, TokenState};
+use super::store::{Audit, DbKind, DbState, RequestRow, TokenRow, TokenState};
 use super::{EnrollService, ModeState};
 use crate::api::http::ApiBody;
 use crate::per_ip::source_key;
@@ -236,7 +236,7 @@ impl Ctx<'_> {
         let pending = self
             .svc
             .db
-            .read(move |conn| Ok(store::pending_count_from(conn, &ip)?))
+            .read(move |conn| Ok(conn.pending_count_from(&ip)?))
             .await
             .unwrap_or(0)
             .max(0) as u64;
@@ -520,7 +520,7 @@ async fn token_check(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
     let row = ctx
         .svc
         .db
-        .read(move |conn| Ok(store::token_by_hash(conn, &hash)?))
+        .read(move |conn| Ok(conn.token_by_hash(&hash)?))
         .await
         .map_err(db_err)?;
     let Some(t) = row.filter(|t| t.disabled_at.is_none()) else {
@@ -615,7 +615,7 @@ async fn load_request(
     let id = request_id.to_string();
     svc.db
         .read(move |conn| {
-            let Some(r) = store::get_request(conn, &id)? else {
+            let Some(r) = conn.get_request(&id)? else {
                 return Ok(None);
             };
             let cert = match &r.issued_serial {
@@ -677,8 +677,8 @@ async fn create_request(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>,
     let (token, existing) = svc
         .db
         .read(move |conn| {
-            let t = store::token_by_hash(conn, &hash)?;
-            let existing = store::request_by_csr(conn, &agent_id, &csr_sha)?;
+            let t = conn.token_by_hash(&hash)?;
+            let existing = conn.request_by_csr(&agent_id, &csr_sha)?;
             let cert = match existing.as_ref().and_then(|r| r.issued_serial.clone()) {
                 Some(s) => conn.get_cert(&s)?,
                 None => None,
@@ -925,7 +925,7 @@ fn pre_assess(
         return Ok(Err(e));
     }
     // 異常旗標（S13）
-    let host = store::host_enroll(conn, &checked.agent_id)?;
+    let host = conn.host_enroll(&checked.agent_id)?;
     let certs = conn.certs_of_agent(&checked.agent_id)?;
     // 已有有效憑證：Kairos 簽發的憑證未撤銷、未過期；或清冊中有這台主機、使用手動簽發的憑證
     // （Kairos 不知道它的效期，視為有效）
@@ -939,7 +939,7 @@ fn pre_assess(
     if in_cidrs == Some(false) {
         flags.push("source_outside_cidrs".to_string());
     }
-    if store::hostname_in_use(conn, &req.hostname, &checked.agent_id)? {
+    if conn.hostname_in_use(&req.hostname, &checked.agent_id)? {
         flags.push("duplicate_hostname".to_string());
     }
     if has_valid_cert {
@@ -947,7 +947,7 @@ fn pre_assess(
     }
     if !batch_source
         && in_cidrs != Some(true)
-        && store::recent_count_from(conn, source_ip, now - BURST_WINDOW_MS)? + 1 >= BURST_COUNT
+        && conn.recent_count_from(source_ip, now - BURST_WINDOW_MS)? + 1 >= BURST_COUNT
     {
         flags.push("burst_from_ip".to_string());
     }
@@ -969,7 +969,7 @@ fn pre_assess(
     // 12. L9 待核准佇列（結果會是待核准、或已核准待簽發時）
     let online = matches!(svc.pki.status(), super::pki_mgr::IssueStatus::Online { .. });
     let will_be_pending = !auto || !online;
-    if will_be_pending && store::pending_count(conn)? >= i64::from(svc.config.enroll.max_pending) {
+    if will_be_pending && conn.pending_count()? >= i64::from(svc.config.enroll.max_pending) {
         let mut e = EnrollError::limited(
             EnrollErrorCode::PendingQueueFull,
             RateScope::Global,
@@ -1006,14 +1006,14 @@ fn create_in_tx(
 ) -> Result<Result<Created, EnrollError>, DbError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // 冪等（並行的重送）
-    if let Some(r) = store::request_by_csr(&tx, &checked.agent_id, &csr.csr_sha256)? {
+    if let Some(r) = tx.request_by_csr(&checked.agent_id, &csr.csr_sha256)? {
         let cert = match &r.issued_serial {
             Some(s) => tx.get_cert(s)?,
             None => None,
         };
         return Ok(Ok(Created::Existing(Box::new((r, cert)))));
     }
-    let Some(token) = store::get_token(&tx, token_id)? else {
+    let Some(token) = tx.get_token(token_id)? else {
         return Ok(Err(EnrollError::new(
             EnrollErrorCode::TokenInvalid,
             "enrollment token is not valid",
@@ -1086,11 +1086,10 @@ fn create_in_tx(
         withdraw_ip: None,
         closed_at: None,
     };
-    store::insert_request(&tx, &row)?;
-    store::consume_token(&tx, &token.token_id, now)?;
-    let replaced = store::replace_pending_for_agent(&tx, &row.agent_id, &request_id, now)?;
-    store::audit(
-        &tx,
+    tx.insert_request(&row)?;
+    tx.consume_token(&token.token_id, now)?;
+    let replaced = tx.replace_pending_for_agent(&row.agent_id, &request_id, now)?;
+    tx.audit(
         now,
         &Audit {
             actor: &format!("host:{}", &row.agent_id[..8]),
@@ -1231,7 +1230,7 @@ async fn poll(
         let now = svc.now_ms();
         let _ = svc
             .db
-            .write(move |conn| Ok(store::mark_delivered(conn, &id, now)?))
+            .write(move |conn| Ok(conn.mark_delivered(&id, now)?))
             .await;
     }
     let mut result = result_of(svc, &r, cert.as_ref(), None, None, svc.now_ms())?;
@@ -1411,7 +1410,7 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
     let agent_id = checked.agent_id.clone();
     let host = svc
         .db
-        .read(move |conn| Ok(store::host_enroll(conn, &agent_id)?))
+        .read(move |conn| Ok(conn.host_enroll(&agent_id)?))
         .await
         .map_err(db_err)?;
     let fp_ok = host
@@ -1488,8 +1487,8 @@ fn grace_in_tx(
     let attempt =
         |code: &str| json!({"at": format_rfc3339_ms(now), "result": code, "ip": source_ip});
     // 8. 重放快取：通過身分驗證的請求一律寫入（不論後面的結果）
-    if store::replay_seen(&tx, &key, now)? {
-        store::set_last_grace_attempt(&tx, agent, &attempt("replayed_request"))?;
+    if tx.replay_seen(&key, now)? {
+        tx.set_last_grace_attempt(agent, &attempt("replayed_request"))?;
         tx.commit()?;
         return Ok(GraceOutcome::Error(
             EnrollError::new(
@@ -1499,7 +1498,7 @@ fn grace_in_tx(
             true,
         ));
     }
-    if store::replay_count(&tx, now)? >= MAX_REPLAY_ENTRIES {
+    if tx.replay_count(now)? >= MAX_REPLAY_ENTRIES {
         return Ok(GraceOutcome::Error(
             EnrollError::limited(
                 EnrollErrorCode::EnrollBusy,
@@ -1510,26 +1509,20 @@ fn grace_in_tx(
             false,
         ));
     }
-    store::replay_insert(
-        &tx,
-        &key,
-        agent,
-        now,
-        kairos_proto::enroll::REPLAY_CACHE_TTL_MS,
-    )?;
+    tx.replay_insert(&key, agent, now, kairos_proto::enroll::REPLAY_CACHE_TTL_MS)?;
     let fail = |tx: rusqlite::Transaction<'_>,
                 code: EnrollErrorCode,
                 message: &str|
      -> Result<GraceOutcome, DbError> {
-        store::set_last_grace_attempt(&tx, agent, &attempt(code.as_str()))?;
+        tx.set_last_grace_attempt(agent, &attempt(code.as_str()))?;
         tx.commit()?;
         Ok(GraceOutcome::Error(EnrollError::new(code, message), false))
     };
     // 9. 冪等：同一 agent_id＋同一 CSR
     let csr_sha = sha256(&checked.csr_der);
-    let host = store::host_enroll(&tx, agent)?;
+    let host = tx.host_enroll(agent)?;
     let old_cert = tx.get_cert(&old.serial)?;
-    if let Some(r) = store::request_by_csr(&tx, agent, &csr_sha)? {
+    if let Some(r) = tx.request_by_csr(agent, &csr_sha)? {
         match r.state {
             DbState::Issued => {
                 let cert = match &r.issued_serial {
@@ -1544,14 +1537,14 @@ fn grace_in_tx(
                             .is_some_and(|s| s == c.serial)
                 });
                 if latest {
-                    store::set_last_grace_attempt(&tx, agent, &attempt("issued"))?;
+                    tx.set_last_grace_attempt(agent, &attempt("issued"))?;
                     tx.commit()?;
                     return Ok(GraceOutcome::Respond(Box::new((r, cert))));
                 }
             }
             s if s.is_pending() => {
-                store::update_poll_secret(&tx, &r.request_id, &sha256(&checked.poll_secret))?;
-                let r = store::get_request(&tx, &r.request_id)?.unwrap_or(r);
+                tx.update_poll_secret(&r.request_id, &sha256(&checked.poll_secret))?;
+                let r = tx.get_request(&r.request_id)?.unwrap_or(r);
                 tx.commit()?;
                 return Ok(GraceOutcome::Respond(Box::new((r, None))));
             }
@@ -1607,7 +1600,7 @@ fn grace_in_tx(
                 "警告 KRS-W2011：註冊端點為僅續簽，但過期寬限期政策為 0 天，過期續簽一律被拒（agent_id {agent}）"
             );
         }
-        store::set_last_grace_attempt(&tx, agent, &attempt("renew_grace_exceeded"))?;
+        tx.set_last_grace_attempt(agent, &attempt("renew_grace_exceeded"))?;
         tx.commit()?;
         let mut e = EnrollError::new(
             EnrollErrorCode::RenewGraceExceeded,
@@ -1620,7 +1613,7 @@ fn grace_in_tx(
     let csr = match check_csr(&checked.csr_der, agent) {
         Ok(c) => c,
         Err(m) => {
-            store::set_last_grace_attempt(&tx, agent, &attempt("invalid_csr"))?;
+            tx.set_last_grace_attempt(agent, &attempt("invalid_csr"))?;
             tx.commit()?;
             let mut e = EnrollError::new(EnrollErrorCode::InvalidCsr, m);
             e.body.field = Some("csr".into());
@@ -1628,7 +1621,7 @@ fn grace_in_tx(
         }
     };
     if csr.spki_der == old.spki_der || tx.spki_used_by_agent(agent, &csr.spki_sha256)? {
-        store::set_last_grace_attempt(&tx, agent, &attempt("invalid_csr"))?;
+        tx.set_last_grace_attempt(agent, &attempt("invalid_csr"))?;
         tx.commit()?;
         let mut e = EnrollError::new(
             EnrollErrorCode::InvalidCsr,
@@ -1654,7 +1647,7 @@ fn grace_in_tx(
     }
     // 16. 政策要求人工核准 → 待核准（L9）；否則簽發
     let needs_approval = eff.policy.renew_requires_approval;
-    if needs_approval && store::pending_count(&tx)? >= i64::from(svc.config.enroll.max_pending) {
+    if needs_approval && tx.pending_count()? >= i64::from(svc.config.enroll.max_pending) {
         tx.commit()?;
         let mut e = EnrollError::limited(
             EnrollErrorCode::PendingQueueFull,
@@ -1709,9 +1702,8 @@ fn grace_in_tx(
         withdraw_ip: None,
         closed_at: None,
     };
-    store::insert_request(&tx, &row)?;
-    store::set_last_grace_attempt(
-        &tx,
+    tx.insert_request(&row)?;
+    tx.set_last_grace_attempt(
         agent,
         &attempt(if needs_approval {
             "pending_approval"
@@ -1719,9 +1711,7 @@ fn grace_in_tx(
             "issued"
         }),
     )?;
-    store::audit(
-        &tx,
-        now,
+    tx.audit(now,
         &Audit {
             actor: &format!("host:{}", &agent[..8]),
             actor_ip: Some(source_ip),
@@ -1840,8 +1830,7 @@ async fn withdraw(
         let _ = svc
             .db
             .write(move |conn| {
-                store::audit(
-                    conn,
+                conn.audit(
                     now,
                     &Audit {
                         actor: "system",
@@ -1876,25 +1865,23 @@ async fn withdraw(
         .db
         .write(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let Some(cur) = store::get_request(&tx, &id)? else {
+            let Some(cur) = tx.get_request(&id)? else {
                 return Ok(Err(EnrollError::request_not_found()));
             };
             let result = match cur.state {
                 s if s.is_pending() => {
-                    store::withdraw(&tx, &id, &reason, &by, &ip, now)?;
-                    Ok((store::get_request(&tx, &id)?.unwrap_or(cur), false))
+                    tx.withdraw(&id, &reason, &by, &ip, now)?;
+                    Ok((tx.get_request(&id)?.unwrap_or(cur), false))
                 }
                 DbState::Withdrawn => Ok((cur, true)),
                 DbState::Issued => {
                     // 撤回前剛被核准：不變更，加註並寫稽核（設計包 S05、#21 (e)）
-                    store::add_flag(&tx, &id, "removed_before_pickup")?;
+                    tx.add_flag(&id, "removed_before_pickup")?;
                     Err(not_pending(DbState::Issued))
                 }
                 s => Err(not_pending(s)),
             };
-            store::audit(
-                &tx,
-                now,
+            tx.audit(now,
                 &Audit {
                     actor: "system",
                     actor_ip: Some(&ip),

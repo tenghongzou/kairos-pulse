@@ -24,6 +24,7 @@ use crate::alerts::store;
 use crate::config::take_config_arg;
 use crate::hosts_cli::{ascii_json, parse_duration, use_unicode};
 use crate::storage::fmt_time;
+use crate::store::prelude::*;
 use crate::token_cli::{
     Failure, Output, db_failure, human_time, open, operator, relative, table, zone_label,
 };
@@ -807,9 +808,7 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 }
             }
             store::save_silence(&conn, &silence).map_err(db_failure)?;
-            let _ = crate::enroll::store::audit(
-                &conn,
-                now_ms,
+            let _ = conn.audit(now_ms,
                 &crate::enroll::store::Audit {
                     actor: &operator(),
                     actor_ip: None,
@@ -872,8 +871,7 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 s.updated_at = now_ms;
                 s.updated_by = by.clone();
                 store::save_silence(&conn, &s).map_err(db_failure)?;
-                let _ = crate::enroll::store::audit(
-                    &conn,
+                let _ = conn.audit(
                     now_ms,
                     &crate::enroll::store::Audit {
                         actor: &by,
@@ -1009,8 +1007,7 @@ fn rules_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 r.updated_at = now_ms;
                 r.updated_by = operator();
                 store::save_rule(&conn, &r).map_err(db_failure)?;
-                let _ = crate::enroll::store::audit(
-                    &conn,
+                let _ = conn.audit(
                     now_ms,
                     &crate::enroll::store::Audit {
                         actor: &operator(),

@@ -456,6 +456,11 @@ pub trait AuditLog {
     /// 寫入一筆稽核事件並接上雜湊鏈（資料目錄有金鑰檔時另加 HMAC）；回傳 id
     fn audit_append(&self, at_ms: i64, a: &Audit<'_>) -> StoreResult<i64>;
 
+    /// [`AuditLog::audit_append`]，不需要 id
+    fn audit(&self, at_ms: i64, a: &Audit<'_>) -> StoreResult<()> {
+        self.audit_append(at_ms, a).map(|_| ())
+    }
+
     /// [`AuditLog::audit_append`]，指定 HMAC 的金鑰（`None`：不加 HMAC；已開始 HMAC 時這一筆在驗證時為
     /// `missing_hmac`）
     fn audit_append_with_key(
