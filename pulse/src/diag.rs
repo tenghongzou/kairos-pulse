@@ -971,6 +971,70 @@ pub fn build(args: &DiagArgs, now: DateTime<Utc>) -> (Bundle, Report) {
         b.section("service", "skipped", "不是以 systemd 執行");
     }
 
+    // 遠端管理（REMOTE.md 第 4.4.1 節第 7 步、第 10.4 節）：集中設定的快取、遠端升級的狀態與結果、
+    // 輔助程式最近一次的紀錄（/var/lib/pulse-upgrade 只有 root 讀得到）。內容不含秘密，照常遮蔽
+    let state = crate::remote::state_dir();
+    let mut remote_files = 0;
+    for (src, dst) in [
+        (
+            state.join(crate::remote::config::CACHE_RELATIVE),
+            "remote/config.json",
+        ),
+        (
+            state.join("upgrade/state.json"),
+            "remote/upgrade-state.json",
+        ),
+        (
+            state.join("upgrade/result.json"),
+            "remote/upgrade-result.json",
+        ),
+        (
+            state.join("upgrade/request.json"),
+            "remote/upgrade-request.json",
+        ),
+    ] {
+        if let Ok((text, _)) = bundle::read_tail(&src, 256 * 1024) {
+            b.text(dst, &text);
+            remote_files += 1;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(crate::remote::upgrade::helper::WORK_ROOT) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().to_string();
+            for name in ["upgrade.log", "state.json"] {
+                if let Ok((text, _)) = bundle::read_tail(&entry.path().join(name), 1024 * 1024) {
+                    b.text(&format!("remote/pulse-upgrade/{id}/{name}"), &text);
+                    remote_files += 1;
+                }
+            }
+        }
+    }
+    if cfg!(target_os = "linux") && Path::new("/run/systemd/system").exists() {
+        b.text(
+            "service/journal-pulse-upgrade.txt",
+            &bundle::command_output(
+                "journalctl",
+                &[
+                    "-u",
+                    "pulse-upgrade",
+                    "-n",
+                    "200",
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                ],
+                t,
+            ),
+        );
+    }
+    b.section(
+        "remote",
+        if remote_files > 0 { "ok" } else { "skipped" },
+        format!(
+            "遠端管理：{remote_files} 個檔案（集中設定的快取、遠端升級的狀態與輔助程式的紀錄）"
+        ),
+    );
+
     // 檔案清單（不含內容）
     let mut paths = vec![report.base.join(crate::log_files::LOG_DIR)];
     if let Some(f) = &report.config_file {
