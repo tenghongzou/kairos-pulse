@@ -49,6 +49,7 @@ pub(crate) mod conn;
 pub(crate) mod enroll;
 pub(crate) mod hosts;
 pub(crate) mod pki;
+pub(crate) mod remote;
 pub(crate) mod tokens;
 pub(crate) mod users;
 
@@ -733,10 +734,15 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: SCHEMA_V8,
     },
+    // v9（0.9.0）：集中設定與 Pulse 遠端升級（SQL 在 store/sqlite/remote.rs）
+    Migration {
+        version: 9,
+        sql: remote::SCHEMA_V9,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";
@@ -2669,8 +2675,10 @@ impl SqliteStore {
             let mut stmt = tx.prepare(
                 "INSERT INTO hosts (agent_id, hostname, agent_version, proto, host_fingerprint,
                     display_name, tags, os, report_interval_ms, peer, identity_verified, online,
-                    first_seen, connected_at, last_seen, offline_after_ms, last_report)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    first_seen, connected_at, last_seen, offline_after_ms, last_report,
+                    install_method, install_upgrade, install_config)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    ?18, ?19, ?20)
                  ON CONFLICT (agent_id) DO UPDATE SET
                     hostname = excluded.hostname,
                     agent_version = excluded.agent_version,
@@ -2686,7 +2694,10 @@ impl SqliteStore {
                     connected_at = excluded.connected_at,
                     last_seen = max(hosts.last_seen, excluded.last_seen),
                     offline_after_ms = excluded.offline_after_ms,
-                    last_report = coalesce(excluded.last_report, hosts.last_report)
+                    last_report = coalesce(excluded.last_report, hosts.last_report),
+                    install_method = coalesce(excluded.install_method, hosts.install_method),
+                    install_upgrade = coalesce(excluded.install_upgrade, hosts.install_upgrade),
+                    install_config = coalesce(excluded.install_config, hosts.install_config)
                  RETURNING host_id, rollup_until",
             )?;
             for row in rows {
@@ -2709,6 +2720,9 @@ impl SqliteStore {
                         row.last_seen,
                         row.offline_after_ms,
                         row.last_report,
+                        row.install_method,
+                        row.install_upgrade,
+                        row.install_config,
                     ],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
@@ -2842,6 +2856,10 @@ struct InventoryRow {
     last_seen: i64,
     offline_after_ms: i64,
     last_report: Option<String>,
+    /// hello 的 `install`（0.9.0 起的 Pulse；REMOTE.md 第 2.1 節）
+    install_method: Option<String>,
+    install_upgrade: Option<String>,
+    install_config: Option<String>,
     /// 除了 last_seen 與 last_report（隨每次 heartbeat、report 改變）之外所有欄位的雜湊
     hash: u64,
 }
@@ -2884,6 +2902,15 @@ impl InventoryRow {
                 .last_report
                 .as_ref()
                 .and_then(|r| serde_json::to_string(r).ok()),
+            install_method: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.method.clone()),
+            install_upgrade: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.upgrade.clone()),
+            install_config: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.config.clone()),
             hash: 0,
         };
         let mut h = DefaultHasher::new();
@@ -2903,6 +2930,12 @@ impl InventoryRow {
         )
             .hash(&mut h);
         row.offline_after_ms.hash(&mut h);
+        (
+            &row.install_method,
+            &row.install_upgrade,
+            &row.install_config,
+        )
+            .hash(&mut h);
         row.hash = h.finish();
         row
     }

@@ -11,6 +11,7 @@
 //! | 序列、去重鍵 | `host_series`、`boots`、`import_keys` |
 //! | 告警事件（含處理紀錄、發送紀錄、CLI 動作） | `alert_events`、`alert_timeline`、`alert_deliveries`、`alert_actions` |
 //! | 註冊申請、續簽的重放快取 | `enroll_requests`、`enroll_replay` |
+//! | 集中設定與升級推送的紀錄（0.9.0） | `host_config`、`rollout_hosts` |
 //! | 憑證的簽發紀錄 | `pki_certificates`（**已撤銷且尚未過期**的保留到過期後 1 天：CRL 需要它們，刪掉會讓撤銷失效；尚未撤銷的有效憑證由呼叫端先撤銷，[`revoke_active_certificates`]） |
 //! | 主機清冊 | `hosts`（最後一步） |
 //!
@@ -53,6 +54,9 @@ pub struct PurgeCounts {
     pub certificates_kept: u64,
     /// 尚未撤銷、尚未過期的憑證（刪除前先以 `cessationOfOperation` 撤銷；試執行時的預估）
     pub certificates_active: u64,
+    /// 集中設定的狀態與升級推送中這台主機的紀錄（`host_config`、`rollout_hosts`；0.9.0）
+    #[serde(default)]
+    pub remote_management: u64,
     pub hosts: u64,
 }
 
@@ -73,6 +77,7 @@ impl PurgeCounts {
             + self.alert_deliveries
             + self.enroll_requests
             + self.certificates
+            + self.remote_management
             + self.hosts
     }
 
@@ -98,6 +103,7 @@ impl PurgeCounts {
             ("通知發送紀錄", self.alert_deliveries),
             ("註冊申請", self.enroll_requests),
             ("憑證紀錄", self.certificates),
+            ("集中設定與升級紀錄", self.remote_management),
             ("主機清冊", self.hosts),
         ]
     }
@@ -165,7 +171,17 @@ pub fn plan(conn: &Connection, agent_id: &str, now_ms: i64) -> rusqlite::Result<
             "SELECT COUNT(*) FROM import_keys WHERE host_id = ?1",
             [h],
         )?;
+        c.remote_management += count(
+            conn,
+            "SELECT COUNT(*) FROM rollout_hosts WHERE host_id = ?1",
+            [h],
+        )?;
     }
+    c.remote_management += count(
+        conn,
+        "SELECT COUNT(*) FROM host_config WHERE agent_id = ?1",
+        [agent_id],
+    )?;
     c.alert_events = count(
         conn,
         "SELECT COUNT(*) FROM alert_events WHERE agent_id = ?1",
@@ -325,7 +341,10 @@ pub fn step(
         c.host_series += tx.execute("DELETE FROM host_series WHERE host_id = ?1", [h])? as u64;
         c.boots += tx.execute("DELETE FROM boots WHERE host_id = ?1", [h])? as u64;
         c.import_keys += tx.execute("DELETE FROM import_keys WHERE host_id = ?1", [h])? as u64;
+        c.remote_management +=
+            tx.execute("DELETE FROM rollout_hosts WHERE host_id = ?1", [h])? as u64;
     }
+    c.remote_management += tx.execute("DELETE FROM host_config WHERE agent_id = ?1", [a])? as u64;
     let events = "SELECT event_id FROM alert_events WHERE agent_id = ?1";
     c.alert_timeline += tx.execute(
         &format!("DELETE FROM alert_timeline WHERE event_id IN ({events})"),

@@ -35,6 +35,7 @@ mod rate;
 mod rbac;
 mod registry;
 mod reload;
+mod remote;
 mod retention;
 mod settings;
 mod shutdown;
@@ -1031,6 +1032,51 @@ async fn run(
         ));
     }
 
+    // 遠端管理（集中設定、Pulse 遠端升級；crates/kairos-proto/REMOTE.md）：需要 SQLite
+    let remote = match config.storage.backend {
+        StorageBackend::Jsonl => None,
+        StorageBackend::Sqlite => {
+            match remote::RemoteService::open(remote::StartParams {
+                settings: config.remote.clone(),
+                data_dir: paths.data_dir.clone(),
+                db_path: enroll::db_path(&config, &paths.data_dir),
+                registry: registry.clone(),
+                shutdown: shutdown.clone(),
+                clock: enroll::system_clock(),
+            })
+            .await
+            {
+                Ok(svc) => {
+                    svc.spawn_engine();
+                    info!(
+                        "遠端管理：集中設定{}、遠端升級{}（需要 mTLS 與 Pulse 0.9.0 以上；版本庫 {}{}）",
+                        if config.remote.config_enabled {
+                            "啟用"
+                        } else {
+                            "停用（remote.config_enabled = false）"
+                        },
+                        if config.remote.upgrade_enabled {
+                            "啟用"
+                        } else {
+                            "停用（remote.upgrade_enabled = false）"
+                        },
+                        svc.releases_dir.display(),
+                        if config.remote.allowed_signers.trim().is_empty() {
+                            "；remote.allowed_signers 未設定，匯入發佈版本時不驗證簽署者"
+                        } else {
+                            ""
+                        }
+                    );
+                    Some(svc)
+                }
+                Err(e) => {
+                    error!("遠端管理無法啟動（不宣告 config、upgrade；既有主機照常連線）：{e}");
+                    None
+                }
+            }
+        }
+    };
+
     // feature cluster 的 hello_ack.server_node（PROTOCOL.md「叢集與排空」）
     let node_id = config
         .cluster
@@ -1051,6 +1097,7 @@ async fn run(
         assets,
         privacy: privacy.clone(),
         cluster: connection::ClusterContext::new(node_id),
+        remote: remote.clone(),
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
@@ -1183,6 +1230,7 @@ async fn run(
                 directory: None,
                 obs: Some(obs.clone()),
                 purger: purger.clone(),
+                remote: remote.clone(),
             })
             .await;
             match started {

@@ -53,11 +53,14 @@ pub fn cert_hosts(
 
 /// 清冊查詢另取的欄位：開機時間與資產摘要（以子查詢的別名避免與 `hosts` 的欄位同名）
 const HOST_EXTRA_COLUMNS: &str = "boot_time, i_os_family, i_cpu_model, i_cores, i_memory, \
-     i_vendor, i_product, i_serial, series_limited_at";
+     i_vendor, i_product, i_serial, series_limited_at, install_method, install_upgrade, \
+     install_config, hc_desired_rev, hc_applied_rev, hc_state, hc_overridden";
 const HOST_EXTRA_JOIN: &str = "LEFT JOIN (SELECT host_id AS i_host, os_family AS i_os_family, \
      cpu_model AS i_cpu_model, cpu_logical_cores AS i_cores, memory_total AS i_memory, \
      vendor AS i_vendor, product AS i_product, serial AS i_serial FROM host_inventory) \
-     ON i_host = hosts.host_id";
+     ON i_host = hosts.host_id \
+     LEFT JOIN (SELECT agent_id AS hc_agent, desired_rev AS hc_desired_rev, applied_rev AS hc_applied_rev, \
+     state AS hc_state, overridden AS hc_overridden FROM host_config) ON hc_agent = hosts.agent_id";
 
 /// `hosts` 的欄位（[`DbHost`] 的順序；第一欄 host_id 未使用）
 pub const HOST_COLUMNS: &str = "host_id, agent_id, hostname, display_name, agent_version, proto, \
@@ -122,6 +125,23 @@ fn host_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<DbHost> {
             (s != InventorySummary::default()).then(|| Arc::new(s))
         },
         series_limited_at: r.get(29)?,
+        install: {
+            let i = kairos_proto::InstallInfo {
+                method: text(30)?,
+                upgrade: text(31)?,
+                config: text(32)?,
+            };
+            (i != kairos_proto::InstallInfo::default()).then(|| Arc::new(i))
+        },
+        config: match r.get::<_, Option<i64>>(33)? {
+            Some(desired_rev) => Some(Arc::new(crate::remote::desired::ConfigStateInput {
+                desired_rev,
+                applied_rev: r.get::<_, Option<i64>>(34)?.unwrap_or(0),
+                state: text(35)?,
+                overridden: crate::remote::desired::has_overridden(text(36)?.as_deref()),
+            })),
+            None => None,
+        },
     })
 }
 

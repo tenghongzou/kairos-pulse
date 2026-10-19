@@ -192,6 +192,20 @@ pub fn personal_data(
     }
     audit.sort_by_key(|a| a["id"].as_i64().unwrap_or_default());
     audit.dedup_by_key(|a| a["id"].as_i64().unwrap_or_default());
+    // 集中設定的狀態與升級推送的紀錄（0.9.0）
+    let remote = json!({
+        "host_config": rows_json(conn, "SELECT * FROM host_config WHERE agent_id = ?1", [agent_id])?
+            .into_iter()
+            .next(),
+        "rollout_hosts": match host_id {
+            Some(h) => rows_json(
+                conn,
+                "SELECT * FROM rollout_hosts WHERE host_id = ?1 ORDER BY updated_at",
+                [h],
+            )?,
+            None => Vec::new(),
+        },
+    });
     Ok(Some(json!({
         "schema": EXPORT_SCHEMA,
         "generated_at": crate::api::http::ts_ms(now_ms),
@@ -206,6 +220,7 @@ pub fn personal_data(
         "alerts": alerts,
         "enroll_requests": requests,
         "certificates": certificates,
+        "remote_management": remote,
         "audit_events": audit,
     })))
 }

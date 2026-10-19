@@ -210,3 +210,13 @@ inventory_network = "keep"    # keep | truncate（介面位址 /24、/48，MAC �
 
 [cluster]                     # 叢集的節點設定（kairos/HA.md）；0.9.0 只有 node_id，叢集模式之後的版本才提供
 node_id = ""                  # 節點名稱（Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）
+
+[remote]                      # 集中設定與 Pulse 遠端升級（crates/kairos-proto/REMOTE.md；需要 SQLite 與 mTLS，Pulse 0.9.0 以上）；改變後需重新啟動
+config_enabled = true         # 宣告 feature config（集中設定）
+upgrade_enabled = true        # 宣告 feature upgrade（遠端升級）
+releases_dir = "releases"     # Pulse 版本庫的發佈檔（相對路徑以資料目錄解析；0700）；kairos db backup 不含它
+allowed_signers = ""          # 匯入發佈版本時驗證簽章的信任錨（ssh-keygen 的 allowed_signers 格式，相對路徑以資料目錄解析）；空＝只檢查格式與雜湊（主控台警告），每台 Pulse 仍以本機的信任錨驗證
+extra_principals = []         # 除 release@kairos-pulse 外另外接受的 principal（以自己的金鑰重新簽署時）
+max_concurrent_downloads = 100 # 同時經 8443 下載發佈檔的主機數，1..=10000；超過時回 rate_limited（retry_after_ms）
+max_release_bytes = 134217728 # 單一發佈檔的上限（bytes），1 MiB～128 MiB
+rollout_retention_days = 400  # 已完成或取消的推送保留天數，1..=3650

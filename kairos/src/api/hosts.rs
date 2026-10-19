@@ -128,6 +128,10 @@ pub struct DbHost {
     pub inventory: Option<Arc<InventorySummary>>,
     /// 最近一次因每主機序列數上限而有指標未保存的時間（Unix 毫秒；`KRS-W4104`）
     pub series_limited_at: Option<i64>,
+    /// hello 的 `install`（清冊同步；0.9.0 起的 Pulse）
+    pub install: Option<Arc<kairos_proto::InstallInfo>>,
+    /// 集中設定的狀態（`host_config`；沒有這台的紀錄時 `None`）
+    pub config: Option<Arc<crate::remote::desired::ConfigStateInput>>,
 }
 
 /// 主機清單（S04）篩選與排序用的資產摘要（`host_inventory` 的冗餘欄位；METRICS.md 第 10.1 節）
@@ -204,6 +208,10 @@ pub struct HostView {
     pub boot_time: Option<i64>,
     /// 資產摘要
     pub inventory: Option<Arc<InventorySummary>>,
+    /// hello 的 `install`（連線中以這次的 hello 為準）
+    pub install: Option<Arc<kairos_proto::InstallInfo>>,
+    /// 集中設定的狀態（[`crate::remote::desired::config_state`]）
+    pub config_state: &'static str,
     /// 排序與搜尋用：顯示名稱（沒有時為主機名稱）的小寫
     name_lower: String,
     hostname_lower: String,
@@ -291,6 +299,9 @@ impl HostView {
             "os": self.os.as_deref().map(os_json),
             "tags": &*self.tags,
             "group": self.host_group.as_deref(),
+            // 遠端管理（0.9.0；API.md 第 17 節）：安裝方式與本機狀態、集中設定的狀態
+            "install": self.install.as_deref().map(|i| json!({"method": i.method, "upgrade": i.upgrade, "config": i.config})),
+            "config_state": self.config_state,
             "first_seen": ts_ms(self.first_seen),
             "last_seen": ts_ms(self.last_seen),
             "offline_for_secs": offline_for,
@@ -420,6 +431,19 @@ pub fn view_of(
             _ => None,
         });
     let name = display_name.as_deref().unwrap_or(&hostname).to_lowercase();
+    let install = host
+        .and_then(|h| h.install.clone())
+        .map(Arc::new)
+        .or(db.and_then(|d| d.install.clone()));
+    let version: Option<Arc<str>> = live
+        .map(|l| l.agent_version.clone())
+        .filter(|v| !v.is_empty())
+        .or(db.and_then(|d| d.agent_version.clone()));
+    let config_state = crate::remote::desired::config_state(
+        version.as_deref(),
+        install.as_ref().and_then(|i| i.config.as_deref()),
+        db.and_then(|d| d.config.as_deref()),
+    );
     Some(HostView {
         hostname_lower: hostname.to_lowercase(),
         name_lower: name,
@@ -432,10 +456,7 @@ pub fn view_of(
         offline_reason,
         ip: peer.as_deref().and_then(ip_of),
         peer,
-        agent_version: live
-            .map(|l| l.agent_version.clone())
-            .filter(|v| !v.is_empty())
-            .or(db.and_then(|d| d.agent_version.clone())),
+        agent_version: version,
         proto: live
             .map(|l| i64::from(l.proto))
             .or(db.and_then(|d| d.proto)),
@@ -482,6 +503,8 @@ pub fn view_of(
         host_group: db.and_then(|d| d.host_group.clone()),
         boot_time: db.and_then(|d| d.boot_time),
         inventory: db.and_then(|d| d.inventory.clone()),
+        install,
+        config_state,
         cpu,
         mem_ratio,
     })
@@ -646,6 +669,10 @@ pub struct Filter {
     os_family: Vec<String>,
     /// 角色指派的範圍：只看得到這些主機群組（小寫）；`None` 為全部
     scope: Option<Vec<String>>,
+    /// `config_state` 參數（集中設定的狀態；取「或」）
+    config_state: Vec<String>,
+    /// `remote_upgrade` 參數（`install.upgrade` 的值，沒有 `install` 的主機為 `none`；取「或」）
+    remote_upgrade: Vec<String>,
 }
 
 /// `offline_reason` 參數接受的值（0.7 的名稱；舊名稱 `timeout`、`connection_closed` 在過渡期也接受，
@@ -721,6 +748,29 @@ impl Filter {
                 ));
             }
             f.os_family.push(v);
+        }
+        for v in q.list("config_state") {
+            if !crate::remote::desired::CONFIG_STATES.contains(&v.as_str()) {
+                return Err(ApiError::param(
+                    "config_state",
+                    format!(
+                        "config_state 的值 \"{v}\" 無效（{}）",
+                        crate::remote::desired::CONFIG_STATES.join("、")
+                    ),
+                ));
+            }
+            f.config_state.push(v);
+        }
+        for v in q.list("remote_upgrade") {
+            if v != "none" && !kairos_proto::mgmt::is_install_token(&v) {
+                return Err(ApiError::param(
+                    "remote_upgrade",
+                    format!(
+                        "remote_upgrade 的值 \"{v}\" 無效（ready、disabled、no_trust_anchor、no_helper、unsupported、none）"
+                    ),
+                ));
+            }
+            f.remote_upgrade.push(v);
         }
         f.durable = q.bool("durable")?;
         for s in q.list("subnet") {
@@ -821,6 +871,19 @@ impl Filter {
             && h.durable != Some(d)
         {
             return false;
+        }
+        if !self.config_state.is_empty() && !self.config_state.iter().any(|s| s == h.config_state) {
+            return false;
+        }
+        if !self.remote_upgrade.is_empty() {
+            let v = h
+                .install
+                .as_ref()
+                .and_then(|i| i.upgrade.as_deref())
+                .unwrap_or("none");
+            if !self.remote_upgrade.iter().any(|x| x == v) {
+                return false;
+            }
         }
         if !self.subnets.is_empty()
             && !h
@@ -1108,7 +1171,9 @@ pub fn query<'a>(
     })
 }
 
-const LIST_PARAMS: [&str; 15] = [
+const LIST_PARAMS: [&str; 17] = [
+    "config_state",
+    "remote_upgrade",
     "os_family",
     "status",
     "never_connected",
@@ -1505,6 +1570,8 @@ pub(crate) mod tests {
             boot_time: None,
             inventory: None,
             series_limited_at: None,
+            install: None,
+            config: None,
         }
     }
 

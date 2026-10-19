@@ -93,11 +93,25 @@ pub enum Permission {
     HostsPurge,
     /// 匯出一台主機的個資（資料主體存取請求；商業審計 S6：只有管理員）
     HostsPersonalData,
+    /// 集中設定：設定檔、指派、每台主機的設定狀態與差異（S24、S05「設定」；`crates/kairos-proto/REMOTE.md` 第 5.2 節）
+    ConfigRead,
+    /// 建立、修改、刪除設定檔，指派、解除指派（REMOTE.md D9：管理員＋維運者）
+    ConfigWrite,
+    /// Pulse 版本庫（S25）
+    ReleasesRead,
+    /// 匯入、刪除發佈版本（只有管理員）
+    ReleasesWrite,
+    /// 升級推送的清單、詳情、每台主機的升級狀態（S26、S05「升級」）
+    RolloutsRead,
+    /// 建立、修改草稿、送出、繼續、取消推送，重試主機（REMOTE.md D8：只有管理員）
+    RolloutsWrite,
+    /// 暫停推送（緊急煞車：維運者也能停，不能啟動）
+    RolloutsPause,
 }
 
 impl Permission {
     /// 所有權限（新增變體時同步加入；測試會檢查沒有遺漏與名稱不重複）
-    pub const ALL: [Permission; 38] = [
+    pub const ALL: [Permission; 45] = [
         Permission::HostsRead,
         Permission::HealthRead,
         Permission::EnrollRead,
@@ -136,6 +150,13 @@ impl Permission {
         Permission::ExportWrite,
         Permission::HostsPurge,
         Permission::HostsPersonalData,
+        Permission::ConfigRead,
+        Permission::ConfigWrite,
+        Permission::ReleasesRead,
+        Permission::ReleasesWrite,
+        Permission::RolloutsRead,
+        Permission::RolloutsWrite,
+        Permission::RolloutsPause,
     ];
 
     /// 對外的名稱（穩定；`<資源>:<動作>`）
@@ -179,6 +200,13 @@ impl Permission {
             Permission::ExportWrite => "export:write",
             Permission::HostsPurge => "hosts:purge",
             Permission::HostsPersonalData => "hosts:personal_data",
+            Permission::ConfigRead => "config:read",
+            Permission::ConfigWrite => "config:write",
+            Permission::ReleasesRead => "releases:read",
+            Permission::ReleasesWrite => "releases:write",
+            Permission::RolloutsRead => "rollouts:read",
+            Permission::RolloutsWrite => "rollouts:write",
+            Permission::RolloutsPause => "rollouts:pause",
         }
     }
 
@@ -321,6 +349,12 @@ impl Role {
                 SilencesWrite,
                 ChannelsRead,
                 ChannelsTest,
+                // 遠端管理（REMOTE.md 第 5.2 節）：集中設定可讀寫（D9）；版本庫與推送唯讀，可暫停推送（D8）
+                ConfigRead,
+                ConfigWrite,
+                ReleasesRead,
+                RolloutsRead,
+                RolloutsPause,
             ]),
             // 稽核員：所有監控與設定唯讀、使用者與權限清冊、目錄服務（遮蔽 bind 密碼）、稽核日誌與匯出
             Role::Auditor => PermSet::of(&[
@@ -338,6 +372,10 @@ impl Role {
                 AlertsRead,
                 AlertRulesRead,
                 SilencesRead,
+                // 遠端管理：唯讀
+                ConfigRead,
+                ReleasesRead,
+                RolloutsRead,
             ]),
             // 唯讀：總覽、主機、系統健康（摘要）、告警事件與靜音（唯讀）；看不到稽核、使用者、PKI 細節、
             // 告警規則（S08 為「—」）與通知管道
@@ -704,6 +742,7 @@ mod tests {
                         | SessionsRevoke
                         | AlertRulesAdmin
                         | ChannelsTest
+                        | RolloutsPause
                 );
             if write {
                 assert!(!aud.contains(p), "稽核員不應有 {p:?}");
@@ -758,6 +797,44 @@ mod tests {
         let g = Grants::from_assignments(&[Assignment::parse("operator@group:a").unwrap()]);
         for (p, ..) in matrix {
             assert!(!g.has(p), "{p:?}");
+        }
+    }
+
+    /// 遠端管理的權限表（REMOTE.md 第 5.2 節；設計包 §31.4）
+    #[test]
+    fn remote_management_permissions_follow_the_design_matrix() {
+        use Permission::*;
+        // (權限, 管理員, 維運者, 稽核員, 唯讀)
+        let matrix = [
+            (ConfigRead, true, true, true, false),
+            (ConfigWrite, true, true, false, false),
+            (ReleasesRead, true, true, true, false),
+            (ReleasesWrite, true, false, false, false),
+            (RolloutsRead, true, true, true, false),
+            (RolloutsWrite, true, false, false, false),
+            (RolloutsPause, true, true, false, false),
+        ];
+        for (p, admin, op, aud, view) in matrix {
+            assert_eq!(Role::Admin.permissions().contains(p), admin, "admin {p:?}");
+            assert_eq!(
+                Role::Operator.permissions().contains(p),
+                op,
+                "operator {p:?}"
+            );
+            assert_eq!(
+                Role::Auditor.permissions().contains(p),
+                aud,
+                "auditor {p:?}"
+            );
+            assert_eq!(Role::Viewer.permissions().contains(p), view, "viewer {p:?}");
+        }
+        // 只由全站範圍授予；0.4／0.5 的舊範圍 token 不會取得
+        let g = Grants::from_assignments(&[Assignment::parse("admin@group:a").unwrap()]);
+        for (p, ..) in matrix {
+            assert!(!g.has(p), "{p:?}");
+            for l in [LegacyScope::Read, LegacyScope::Operate, LegacyScope::Admin] {
+                assert!(!l.permissions().contains(p), "{l:?} {p:?}");
+            }
         }
     }
 
