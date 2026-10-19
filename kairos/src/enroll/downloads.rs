@@ -37,7 +37,7 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(15);
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
 /// 讀檔的區塊大小
 const CHUNK: usize = 64 * 1024;
-/// 下載目錄不完整（〔暫定〕代碼，待設計包分配）
+/// 下載目錄不完整的代碼
 pub const CODE_INCOMPLETE: &str = "KRS-W2012";
 
 /// 副檔名 → `Content-Type`

@@ -1,6 +1,6 @@
 // 自動產生，請勿手動修改：node kairos/web/tools/sync-design.mjs
-// 來源：設計包 prototype/kairos/error-codes.js（copywriting.md §3.3 錯誤代碼總表、§4.2 三段式範例；產生於 2026-10-15）
-// 只含 Kairos（KRS-）的 108 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
+// 來源：設計包 prototype/kairos/error-codes.js（copywriting.md §3.3 錯誤代碼總表、§4.2 三段式範例；產生於 2026-10-19）
+// 只含 Kairos（KRS-）的 152 個代碼；三段式為 title（發生什麼）、reason（原因）、fix（處理方式）
 export const ERROR_CODES = {
  "KRS-E0101": {
   "level": "E",
@@ -78,6 +78,41 @@ export const ERROR_CODES = {
   "title": "無法讀取設定檔 /opt/kairos/kairos.toml",
   "reason": "執行 Kairos 的帳號 `kairos` 沒有讀取權限（目前為 `root:root 0600`）。",
   "fix": "`sudo chown root:kairos /opt/kairos/kairos.toml && sudo chmod 640 /opt/kairos/kairos.toml`，再執行 `sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml` 確認。"
+ },
+ "KRS-W0501": {
+  "level": "W",
+  "text": "下發的集中設定驗證失敗（型別、範圍、未知或不在白名單的鍵、隱私敏感的鍵比本機寬鬆），Pulse **整份拒絕**、沿用上一份可用的設定，並以 `config_status` 回報第一個錯誤的鍵與原因；Kairos 在 S24、S05「設定」分頁顯示被拒的版本（範例 113）。F8，0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": "his-ws-12 拒絕了第 43 版的集中設定（沿用第 42 版）",
+  "reason": "設定檔「一般工作站」第 43 版的 `report.interval` 為 0，超出允許的範圍（1～3600 秒）。Pulse 整份拒絕這一版，繼續使用上一份可用的設定（第 42 版），監控照常。",
+  "fix": "在「Pulse 管理 › 集中設定」修正設定檔的值後儲存，主機會在下一次心跳取得新的版本。若只有少數主機拒絕，檢查這些主機的 Pulse 版本是否支援這個鍵。"
+ },
+ "KRS-E0502": {
+  "level": "E",
+  "text": "設定檔（profile）的內容不合法，無法儲存（主控台 API 400 `config_invalid`，`details.key`、`reason`）：值超出範圍、型別不符、鍵不在白名單、隱私敏感的鍵不是更保守的值；S24 在欄位旁就地顯示。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-I0503": {
+  "level": "I",
+  "text": "下發的設定有部分鍵被本機設定（`pulse.toml` 或環境變數）覆蓋：本機優先（REMOTE.md D1），其餘鍵照常套用；Kairos 計入「本機覆蓋」。資訊，不是錯誤。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W0504": {
+  "level": "W",
+  "text": "套用集中設定後的確認期內 Pulse 失去連線或反覆重啟（例如新的回報設定讓連線失敗），已自動回復上一份可用的設定（last-known-good）並回報。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-I0505": {
+  "level": "I",
+  "text": "這台主機在本機停用了集中設定（`remote_config.enabled = false`，或安裝時 `--no-remote-config`／`REMOTECONFIG=0`）：Pulse 不宣告 `config`，只用本機設定；Kairos 計入「停用」。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
  },
  "KRS-W1001": {
   "level": "W",
@@ -275,6 +310,13 @@ export const ERROR_CODES = {
   "reason": "過期寬限期為 0 天時，憑證過期的主機一律不能自動續簽；「僅續簽」又不受理新註冊，所以註冊端點不會受理任何請求，等同關閉，但 Kairos 仍在監聽 8444。",
   "fix": "需要過期續簽時，到「憑證 › 憑證政策」把過期寬限期設為 1 天以上（預設 90 天）；不需要時，到「系統設定 › 連線與安全」改為「關閉」以停止監聽 8444。"
  },
+ "KRS-W2012": {
+  "level": "W",
+  "text": "設定了下載目錄（`enroll.download_dir`）但不完整：缺少 `pulse-install.sh`、`SHA256SUMS` 或 `SHA256SUMS.sig`。Kairos 照常啟動，主控台的 `downloads.available` 為 `false`、`product_code` 為此碼，S12 不顯示一行安裝指令（只對管理員顯示這則警告）；啟動時記一次。沒有設定下載目錄不是錯誤。S6 線（8444 下載端點），0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
  "KRS-W2101": {
   "level": "W",
   "text": "協定版本不相容（`unsupported_version`）",
@@ -351,6 +393,13 @@ export const ERROR_CODES = {
   "title": "註冊端點整體負載已達上限，新的註冊請求暫緩",
   "reason": "過去 1 分鐘有 1,830 次新連線或申請，超過全域上限（每秒 200 次新連線、每秒 50 筆申請）。可能是多個場域同時部署，也可能是分散式的掃描。",
   "fix": "若是已排程的大量部署，暫時調高 `enroll.max_new_connections_per_sec`／`enroll.max_requests_per_sec`；否則檢查系統健康的來源分布。8443 上已註冊主機的連線不受影響。"
+ },
+ "KRS-W2206": {
+  "level": "W",
+  "text": "PROXY protocol 標頭不合法，連線已關閉：`proxy_protocol_from` 內的負載平衡器沒有送 PROXY v2 標頭，或不在 `proxy_protocol_from` 的來源送了標頭；節流記錄。與每 IP 上限（`2201`）同屬依來源位址判斷的連線限制。HA，0.10。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": null,
+  "reason": null,
+  "fix": null
  },
  "KRS-W3002": {
   "level": "W",
@@ -443,6 +492,13 @@ export const ERROR_CODES = {
   "reason": null,
   "fix": null
  },
+ "KRS-E4005": {
+  "level": "E",
+  "text": "要求假名化（`privacy.hostname` 或 `privacy.process_user` 為 `pseudonymize`），但資料目錄的 `privacy.key` 無法建立或讀取（權限、磁碟、長度不對）：Kairos **拒絕啟動**，不退回保存原本的名稱（範例 106）。金鑰隨 `kairos db backup --include-keys` 加密備份；換新金鑰會讓所有假名改變。S6，0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": "Kairos 無法啟動：假名化金鑰無法使用",
+  "reason": "設定要求把主機名稱假名化（`privacy.hostname = \"pseudonymize\"`），但 `/var/lib/kairos/privacy.key` 無法讀取（權限不足）。Kairos 不會改為保存原本的主機名稱，因此不啟動。",
+  "fix": "（擇一）\n1. 修正檔案權限：`sudo chown kairos:kairos /var/lib/kairos/privacy.key && sudo chmod 600 /var/lib/kairos/privacy.key`，再啟動 Kairos。\n2. 檔案遺失時從備份還原：`kairos db restore-keys <備份檔>.keys`。**不要**直接刪除後讓 Kairos 建立新的金鑰：所有主機的假名都會改變，舊的告警與註冊申請中仍是舊假名。\n3. 不再需要假名化時，把 `privacy.hostname` 改回 `keep`。"
+ },
  "KRS-E4101": {
   "level": "E",
   "text": "回報無法寫入（`storage_unavailable`：`report could not be stored`）。雙方協商了 `durable`（Kairos 與 Pulse 都是 0.3 以上、Pulse 啟用本機緩衝）時，Pulse 保留這些資料並在恢復後補送；任一端是舊版（或停用本機緩衝）時這段資料遺失。2026-10-13 補充",
@@ -477,6 +533,20 @@ export const ERROR_CODES = {
   "title": "資料庫已達容量上限，正在提早刪除最舊的資料",
   "reason": "資料庫用量達 `storage.max_total_bytes`（64 GiB，約 68.7 GB），Kairos 依序刪除最舊的原始 report（原始資料刪光後才刪 5 分鐘、1 小時彙總），刪到上限的 95% 以下為止。依目前 1,918 台、每 5 秒回報估算，預設保留期（原始 7 天、5 分鐘彙總 31 天、1 小時彙總 400 天）需要約 99.8 GB，因此原始資料實際只能保留約 3 天。新的回報照常保存。",
   "fix": "1. 在「系統設定 › 資料保留與儲存」依預估把 `storage.max_total_bytes` 調到至少 100 GB（不超過資料磁碟的剩餘空間，並預留 128 MiB 給 WAL 與日誌）後重新啟動 Kairos；或縮短保留天數。\n2. 不需要這麼長的保留期時可以忽略：刪除分批進行，不影響新的回報。"
+ },
+ "KRS-I4204": {
+  "level": "I",
+  "text": "已刪除一台主機的資料（主控台「刪除主機資料」或 `kairos hosts purge`）：日誌 `INFO` 與稽核 `host.purge` 的 `code`；稽核紀錄只有 `agent_id`、筆數與撤銷的序號，不含主機名稱與位址。畫面不顯示此碼（只顯示成功訊息）。S6，0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E4205": {
+  "level": "E",
+  "text": "無法刪除主機資料：主機仍連線中（409 `host_online`，請先移除 Pulse 或撤銷憑證讓它斷線）、刪除沒有完成（503；已刪除的部分不會復原，重新執行即可接續）、CLI 找不到這個 `agent_id` 的資料（結束代碼 1）；「原因」寫出是哪一種（範例 105）。Kairos 執行中時 `kairos hosts purge` 仍以 `4304` 拒絕。S6，0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": "無法刪除 his-ws-12 的資料：主機仍連線中",
+  "reason": "這台主機目前仍與 Kairos 連線。為了避免刪除後又被正在送來的資料建立回來，Kairos 只刪除離線主機的資料。",
+  "fix": "1. 在主機上停止並完全移除 Pulse（Linux：`sudo pulse-install.sh --uninstall --purge`；Windows：解除安裝時選「完全移除」），或在主控台撤銷這台主機的憑證讓它斷線。\n2. 主機顯示為離線後，再執行一次「刪除主機資料」。"
  },
  "KRS-E4301": {
   "level": "E",
@@ -526,6 +596,76 @@ export const ERROR_CODES = {
   "title": "無法還原金鑰檔：備份密碼錯誤或檔案已被修改",
   "reason": "以提供的備份密碼無法解開 `/var/backups/kairos/kairos-2026-10-15.db.keys`。密碼錯誤與檔案被修改、截斷在加密上無法區分。資料目錄沒有寫入任何金鑰檔。",
   "fix": "1. 確認使用的是建立這份備份時的備份密碼（密碼檔的第一行；注意編輯器加上的 BOM 或結尾空白）。\n2. 確認檔案是 `kairos db backup --include-keys` 產生的 `<備份檔>.keys`，大小與備份時相同、傳輸時沒有被轉換換行。\n3. 密碼確實遺失時無法解開：通知管道的機密要在「通知管道」重新輸入、所有人的兩步驟驗證要重設（`kairos users reset-mfa`）、稽核日誌的 HMAC 無法驗證（`KRS-E6201`，以外送的鏈尾雜湊確認之前的紀錄）。"
+ },
+ "KRS-E4311": {
+  "level": "E",
+  "text": "OTLP 推送失敗，已丟棄一批資料點：無法連線、逾時、TLS 錯誤、HTTP 429／502／503／504，重試 `export.otlp.max_retries` 次（退避最多 30 秒，`Retry-After` 最多 300 秒）仍失敗；第一次失敗記 `WARN`，之後連續的失敗只記 `DEBUG`，恢復時記 `INFO`（範例 103）。S21「整合」的最近一次錯誤與「測試連線」結果也用此碼。F7，0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": "OTLP 推送失敗，已丟棄 8,192 個資料點",
+  "reason": "Kairos 無法把指標送到 `https://otel-collector.example.com:4318/v1/metrics`：連線逾時（10 秒）。重試 5 次（退避 1、2、4、8、16 秒）仍失敗，這一批已丟棄；之後收到的指標仍在佇列中，等 collector 恢復後送出。",
+  "fix": "1. 在「系統設定 › 整合 › 指標轉出」按「測試連線」，確認 Kairos 連得到 collector。\n2. 檢查 collector 是否在執行、防火牆是否允許 Kairos 連到 4318、端點網址的路徑是否為 `/v1/metrics`。\n3. collector 使用私有 CA 時，在 `kairos.toml` 設定 `export.otlp.ca_file`。"
+ },
+ "KRS-E4312": {
+  "level": "E",
+  "text": "OTLP collector 拒絕了資料：HTTP 4xx（401／403 驗證、400 格式、413 太大；429 除外）不重試、直接丟棄，或 2xx 但 `partial_success.rejected_data_points` 不為 0（被拒的點計入「collector 拒絕」）；「原因」附 collector 回應的訊息（標頭值已遮蔽，範例 104）。F7，0.9。2026-10-19 分配",
+  "title": "collector 拒絕了指標資料（HTTP 401）",
+  "reason": "collector 回應 401 Unauthorized，這一批資料不重試、已丟棄。通常是 HTTP 標頭中的驗證資訊（例如 `Authorization`）錯誤、過期或沒有設定。",
+  "fix": "在「系統設定 › 整合 › 指標轉出」更換 HTTP 標頭（或更新 `export.otlp.headers_file` 指向的檔案後重新啟動 Kairos），再按「測試連線」。若 collector 回應 413（內容太大），調小 `export.otlp.max_batch_points`。"
+ },
+ "KRS-W4313": {
+  "level": "W",
+  "text": "OTLP 佇列已滿（`export.otlp.queue_max_points`，預設 500,000 點），依 `drop_policy` 丟掉最舊（預設）或新收到的資料點；每分鐘最多記一行 `WARN`。collector 恢復後其餘資料照常送出。F7，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E4314": {
+  "level": "E",
+  "text": "指標轉出的設定無效：不合法的值或未知的欄位、啟用 OTLP 卻沒有端點（主控台 API 400 `invalid_parameter`，`details.parameter` 為設定鍵）；啟動時 `headers_file` 無法讀取、主控台保存的標頭無法解開（`alerts-secrets.key` 遺失）也記此碼（`WARN`，S21 卡片的 `problems`）。F7，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E4315": {
+  "level": "E",
+  "text": "Prometheus 端點未啟用（`GET /api/v1/export/prometheus` 回 404 `export_disabled`）：在 S21「整合」勾選「提供 Prometheus 端點」或設定 `[export.prometheus] enabled = true`（預設停用，D52）。Prometheus 端看到目標 down。F7，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E4401": {
+  "level": "E",
+  "text": "無法連線到 PostgreSQL（`storage.backend = \"postgres\"`）：啟動時拒絕啟動（結束代碼 3）；執行中 report 回 `storage_unavailable`、`/readyz` 503，持續重試（範例 107）。子類別 44（外部資料庫與資料遷移）。HA，0.10。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": "無法連線到 PostgreSQL（db.example.com:5432）",
+  "reason": "Kairos 設定為使用 PostgreSQL（`storage.backend = \"postgres\"`），但連線被拒絕。執行中發生時，agent 的回報會暫時被拒絕（`storage_unavailable`；支援補送的 Pulse 會保留資料、恢復後補送），這個節點的 `/readyz` 回 503。",
+  "fix": "1. 確認 PostgreSQL 在執行，且這台 Kairos 主機能連到 `db.example.com:5432`（防火牆、`pg_hba.conf`）。\n2. 檢查 `storage.postgres` 的主機、資料庫名稱、帳號與密碼檔。\n3. 使用 TLS 時確認 CA 檔與伺服器憑證的名稱相符。"
+ },
+ "KRS-E4402": {
+  "level": "E",
+  "text": "PostgreSQL 不符合要求：版本低於 14、編碼不是 UTF8、權限不足、TLS 設定不安全、schema 被其他程式使用；「原因」寫出是哪一項與實際值，拒絕啟動。HA，0.10。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W4403": {
+  "level": "W",
+  "text": "PostgreSQL 沒有同步複寫（`synchronous_commit` 不是 `on`，或沒有同步備庫）：主庫故障時可能遺失已確認（已 `ack`）的資料。只警告、照常運作（HA.md 第 21 節 #5）；系統規則「資料庫沒有同步複寫」為規劃提醒（範例 108）。HA，0.10。2026-10-19 分配",
+  "title": "資料庫沒有同步複寫：主庫故障時可能遺失已確認的資料",
+  "reason": "PostgreSQL 的 `synchronous_commit` 不是 `on`（或沒有同步備庫）。Kairos 已向 agent 確認收到的回報，在主庫故障、切換到備庫時可能有最後幾秒沒有複寫過去。這是部署上的取捨，Kairos 照常運作。",
+  "fix": "需要「已確認的資料不遺失」時，請 DBA 設定同步備庫（`synchronous_standby_names`）並把 `synchronous_commit` 設為 `on`；接受這個風險時可以停用系統規則「資料庫沒有同步複寫」。"
+ },
+ "KRS-E4404": {
+  "level": "E",
+  "text": "資料搬移（`kairos db migrate`，SQLite ⇄ PostgreSQL）失敗或搬移後的驗證不一致；目的端不可使用，來源不變，修正後以 `--restart` 重新執行。HA，0.10。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E4405": {
+  "level": "E",
+  "text": "資料庫的 schema 版本比這個 Kairos 新（叢集中已有較新的節點升級了資料庫，或以舊版執行檔開啟新版資料庫）：拒絕啟動，請把這個節點升級到相同版本。HA，0.10（單機的降版檢查若在 0.9 先給代碼，也用此碼）。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
  },
  "KRS-E5001": {
   "level": "E",
@@ -702,6 +842,13 @@ export const ERROR_CODES = {
   "reason": "這個請求沒有帶目前工作階段的安全檢查值，或來自其他網站。常見情況是你在另一個分頁重新登入過，這個分頁還是舊的工作階段資料。",
   "fix": "1. 重新整理頁面後再做一次。\n2. 經反向代理使用主控台時仍一直出現：請管理員確認代理保留原本的 `Host` 標頭，且沒有移除 `Origin`。"
  },
+ "KRS-E6106": {
+  "level": "E",
+  "text": "不能核准自己建立的升級推送（雙人覆核，`[remote] rollout_approval = \"required\"`；主控台 API 403 `self_approval`）；核准需要另一位有 `rollouts:approve` 的使用者以帳號登入的工作階段（API token 不能核准）。F8，**0.10**（0.9 沒有雙人覆核）。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
  "KRS-W6011": {
   "level": "W",
   "text": "同一來源驗證失敗太多次，暫時拒絕該來源的**所有** API 請求（HTTP 429 `rate_limited`，附 `Retry-After`，不再檢查 token）：依來源 IP 計算（IPv6 以 /64 合併），可連續失敗 10 次、之後每 6 秒恢復 1 次，最多約 1 分鐘；成功的請求、完全沒有出示憑據的請求（0.7 起）不扣額度。同一 NAT 或代理後的其他用戶端會被連帶限制。每個來源第一次被限制時 Kairos 記一行 `WARN`（不記 token 內容）。與註冊端點的速率限制（`2202`）無關。2026-10-13 分配",
@@ -757,5 +904,166 @@ export const ERROR_CODES = {
   "title": "3 台主機的註冊因時鐘偏差暫不受理",
   "reason": "這些主機送出註冊申請（或過期續簽）時附上的時間，與 Kairos 相差超過 5 分鐘（例如 plc-hmi-07 比 Kairos 慢 7 分 42 秒）。時間差這麼大時，Kairos 簽發的憑證在主機上會被當成「尚未生效」，所以先暫不受理。Kairos 沒有消耗 token 的使用次數、沒有建立待核准申請，也不計入失敗封鎖；這不是 token 或註冊端點的問題。",
   "fix": "1. 請現場修正這些主機的時間同步：Windows 以系統管理員身分執行 `net start w32time` 與 `w32tm /resync`；Linux 執行 `sudo timedatectl set-ntp true`。\n2. 修正後 Pulse 會在 5 分鐘內自動重新送出，不需要新的 token，也不需要重新安裝。\n3. 同一個網段有多台主機偏差時，檢查該網段使用的 NTP 伺服器，或防火牆是否阻擋 UDP 123。"
+ },
+ "KRS-W8305": {
+  "level": "W",
+  "text": "Kairos 節點的時鐘與 PostgreSQL 相差超過 2 秒：主節點租約以資料庫時間判斷、不受影響，但節點寫入的時間戳記（`last_seen`、`received_at`）會偏差；系統規則「節點與資料庫的時差過大」（警告）。HA，0.10。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E8401": {
+  "level": "E",
+  "text": "Pulse 發佈包的簽章驗證失敗：簽署者不在本機信任錨（`allowed_signers`）中、簽章無效或 namespace 不符。Pulse 不替換、刪除暫存並回報；Kairos 記稽核 `host.upgrade.signature_failed`，**整個推送與同一版本的其他推送自動暫停**（可能是版本庫被竄改，範例 114）。子類別 84（遠端升級）。F8，0.9。2026-10-19 分配（工程暫定同號，`decisions/INTEGRATION.md` §31）",
+  "title": "his-ws-12 回報 Pulse 0.9.1 的簽章驗證失敗，推送已暫停",
+  "reason": "`SHA256SUMS` 的簽章不是由這台主機信任錨（`/etc/kairos-pulse/allowed_signers`）中的金鑰簽署。Pulse 沒有替換任何檔案，已刪除下載的暫存。這可能表示 Kairos 的版本庫被竄改，Kairos 已暫停這個推送與同一版本的其他推送。",
+  "fix": "1. 不要繼續這個推送。比對 Kairos 版本庫中 0.9.1 的簽署金鑰指紋與官方公告的指紋。\n2. 指紋不符時視為資安事件：保全 Kairos 的 `data/releases/`，刪除這個版本後從官方來源重新匯入。\n3. 指紋相符（例如貴單位以自己的金鑰重新簽署）時，在主機的 `allowed_signers` 加入該公鑰並在 `upgrade.extra_principals` 列出 principal。"
+ },
+ "KRS-W8402": {
+  "level": "W",
+  "text": "發佈包的雜湊、檔名、平台或版本與 `SHA256SUMS`／提議不符（下載 3 次仍不符時放棄），或升級後執行的版本與目標不符。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W8404": {
+  "level": "W",
+  "text": "發佈包下載失敗（中斷、`upgrade_chunk_get` 錯誤、外部 URL 無法連線），續傳重試中。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E8405": {
+  "level": "E",
+  "text": "新版的預檢失敗（無法執行、版本與目標不符、目前的設定無法通過新版的 `check-config`），沒有做任何變更。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E8406": {
+  "level": "E",
+  "text": "替換失敗（檔案操作、`dpkg`／`rpm`、`msiexec` 回報錯誤），已復原到原版本；或提議沒有回滾檔（允許無法自動回滾的主機）而健康確認失敗（`detail: no_rollback_artifact`，不做回復動作）。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W8407": {
+  "level": "W",
+  "text": "新版在健康確認期限（預設 600 秒）內沒有變健康（沒有連上 Kairos、崩潰重啟、以結束代碼 2／3／4 停止），已自動回滾到原版本且原版本恢復健康（範例 115）。計入推送的失敗比例。F8，0.9。2026-10-19 分配",
+  "title": "升級到 0.9.1 後沒有恢復正常，已自動回滾到 0.9.0",
+  "reason": "plc-gw-07 換成 0.9.1 並重新啟動後，600 秒內沒有連上 Kairos（健康確認的條件之一）。輔助程式已把 Pulse 換回 0.9.0，0.9.0 已恢復連線與回報。",
+  "fix": "在推送詳情查看這台主機的升級紀錄與 Pulse 日誌（`journalctl -u pulse-upgrade`、`pulse diag`），找出新版無法連線的原因（例如新版的設定檢查更嚴格）。修正後可按「重試」。同一批有多台回滾時，推送會依失敗比例自動暫停。"
+ },
+ "KRS-E8408": {
+  "level": "E",
+  "text": "回滾後原版本也不健康：**不再嘗試任何動作**，保留所有暫存與紀錄，需要現場人工處理（Pulse 記 `ERROR` 並寫 stderr／journal；`pulse status` 結束代碼 9）。推送自動暫停；系統規則「升級回滾失敗」（嚴重）；在 S05 標記為已處理前不能再被提議（範例 116）。F8，0.9。2026-10-19 分配",
+  "title": "升級回滾失敗，lab-pc-02 需要人工處理",
+  "reason": "lab-pc-02 升級到 0.9.1 後不健康，回滾到 0.9.0 後也沒有恢復。為了避免讓情況更糟，Pulse 與輔助程式不再嘗試任何動作，所有暫存與紀錄都保留在主機上。",
+  "fix": "1. 到主機上執行 `sudo pulse upgrade status` 與 `journalctl -u pulse -u pulse-upgrade`，查看兩次失敗的原因。\n2. 依原因修正後以套件管理員重新安裝可用的版本（例如 `sudo apt install ./pulse-0.9.0-….deb`），確認 `pulse status` 正常。\n3. 回到主控台，在這台主機的「升級」卡片按「標記為已處理」；在那之前這台主機不會被任何推送提議。"
+ },
+ "KRS-I8409": {
+  "level": "I",
+  "text": "遠端升級在這台主機本機停用（`upgrade.enabled = false`，或安裝時 `--no-remote-upgrade`／`REMOTEUPGRADE=0`）：推送略過這台主機。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W8410": {
+  "level": "W",
+  "text": "拒絕降版：目標版本低於主機目前版本，而推送沒有允許降版或主機本機 `upgrade.allow_downgrade = false`（預設）。自動回滾不受此限制。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W8411": {
+  "level": "W",
+  "text": "不支援這台主機的安裝方式或條件：多實例、無法判斷安裝方式、缺少輔助程式（`pulse-upgrade.path`／unit 未安裝或未更新）、外部 URL 不在本機白名單；0.9 的 Windows 主機也用此碼（0.10 起支援）（範例 117）。F8，0.9。2026-10-19 分配",
+  "title": "his-db-01 無法遠端升級：缺少升級輔助程式",
+  "reason": "這台主機以 tar 安裝，沒有安裝負責替換執行檔的 `pulse-upgrade.path`／`pulse-upgrade.service`（0.9.0 的新元件）。Pulse 以一般帳號執行，無法自己替換自己，因此略過這次推送。",
+  "fix": "依安裝說明在這台主機安裝兩個 systemd unit（`sudo systemctl enable --now pulse-upgrade.path`），或改以 deb／rpm 套件重新安裝 0.9.0（套件會自動安裝並啟用）。之後的推送就會包含這台主機。"
+ },
+ "KRS-W8412": {
+  "level": "W",
+  "text": "磁碟空間不足，無法暫存發佈包（需要約 3 倍發佈檔大小＋64 MiB），拒絕這次提議。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E8413": {
+  "level": "E",
+  "text": "匯入發佈版本失敗：`SHA256SUMS.sig` 的簽章無效或簽署者不受信任、發佈清單格式錯誤、上傳的檔案不在 `SHA256SUMS` 中或雜湊不符（主控台 API 400 `release_signature_invalid`、`artifact_not_listed`、`artifact_hash_mismatch`；稽核 `release.import_failed`，範例 118）。F8，0.9。2026-10-19 分配",
+  "title": "無法匯入 Pulse 0.9.1：pulse-0.9.1-…-amd64.deb 的雜湊與 SHA256SUMS 不符",
+  "reason": "上傳的檔案內容與 `SHA256SUMS` 記錄的 SHA-256 不同，可能是下載不完整或檔案被修改。這個檔案沒有加入版本庫；同一版本中已通過驗證的其他檔案保留。",
+  "fix": "從官方來源重新下載這個檔案後再上傳；若重新下載仍不符，不要使用這個版本並通報。"
+ },
+ "KRS-W8414": {
+  "level": "W",
+  "text": "升級推送已自動暫停：批次的失敗比例超過上限、有主機回滾失敗、有主機回報簽章驗證失敗、有主機替換後超過期限沒有回報；系統規則「升級推送已暫停」（警告，回滾失敗與簽章失敗造成的為嚴重，範例 119）。F8，0.9。2026-10-19 分配",
+  "title": "推送「B廠 0.9.1」已自動暫停：失敗比例 8% 超過上限 5%",
+  "reason": "第 2 批已結束的 25 台中有 2 台升級失敗或回滾，超過這一批的失敗上限（5%）。為了避免問題擴大，Kairos 暫停提議新的主機；已開始替換的主機照常完成。",
+  "fix": "1. 在推送詳情篩選「已回滾」「失敗」的主機，查看代碼與時間，找出共同原因（例如同一種安裝方式、同一個群組）。\n2. 原因是個別主機時，排除這些主機後按「繼續」；原因是新版本身時，取消推送並等待修正版。"
+ },
+ "KRS-W8415": {
+  "level": "W",
+  "text": "目標版本與目前的 Kairos 不相容（發佈清單的 `min_kairos` 高於目前版本；主控台 API 400 `incompatible_release`）：不能建立推送，請先升級 Kairos。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-I8416": {
+  "level": "I",
+  "text": "升級完成：新版健康確認通過（`succeeded`）。資訊；每台的結果記在推送詳情，不逐台寫稽核。F8，0.9。2026-10-19 分配",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-I8501": {
+  "level": "I",
+  "text": "本節點取得主節點租約（階段 A：開始監聽與服務）；換手時另記上一個主節點，並記一則資訊事件「叢集的主節點已由 kairos-a 切換到 kairos-b」（上一個主節點不是正常交出時為警告）。子類別 85（叢集與高可用）。HA，0.10。2026-10-19 分配（**工程暫定為 `KRS-I8401`，改到子類別 85**，`decisions/INTEGRATION.md` §31）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W8502": {
+  "level": "W",
+  "text": "本節點失去主節點租約（續約失敗或已被其他節點取得），停止單一寫入者的工作；階段 A 結束行程，由 systemd 重新啟動為備援節點。HA，0.10。2026-10-19 分配（工程暫定為 `KRS-W8402`）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E8503": {
+  "level": "E",
+  "text": "叢集的協調異常：沒有任何節點持有主節點租約超過 60 秒（告警、彙總、保留清除、CRL 暫停；取代換手情境下的「停機 N 分鐘」），或 `cluster.node_id` 與另一個執行中的節點重複（拒絕啟動）。HA，0.10。2026-10-19 分配（工程暫定為 `KRS-E8403`）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-E8504": {
+  "level": "E",
+  "text": "本節點的金鑰與叢集不一致或缺少（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`、簽發 CA 私鑰）：不進入就緒、不參與主節點選舉、不自動建立金鑰（範例 109）。HA，0.10。2026-10-19 分配（工程暫定為 `KRS-E8404`）",
+  "title": "kairos-b 的金鑰與叢集不一致，這個節點不會接手",
+  "reason": "kairos-b 資料目錄中的 `console.key` 與叢集記錄的指紋不同。叢集中的每個節點都必須持有同一組金鑰，否則接手後工作階段、兩步驟驗證、通知機密與稽核 HMAC 都會失效。kairos-b 不進入就緒、不參與主節點的選舉，也不會自己建立新的金鑰。",
+  "fix": "在 kairos-a 執行 `kairos cluster keys export --out cluster-keys.enc --password-file <檔案>`，把檔案複製到 kairos-b 後執行 `kairos cluster keys import cluster-keys.enc --password-file <檔案>`，再重新啟動 kairos-b。"
+ },
+ "KRS-W8505": {
+  "level": "W",
+  "text": "Kairos 節點的設定不一致：需要一致的設定（雜湊）與其他節點不同。HA，0.10。2026-10-19 分配（工程暫定為 `KRS-W8405`）",
+  "title": null,
+  "reason": null,
+  "fix": null
+ },
+ "KRS-W8506": {
+  "level": "W",
+  "text": "Kairos 節點失聯（心跳逾時）：主節點把它服務的主機標為離線（`offline_reason = server_lost`），這些主機的 Pulse 會改連其他節點（範例 110）。HA，0.10。2026-10-19 分配（工程暫定為 `KRS-W8406`）",
+  "title": "Kairos 節點 kairos-a 失聯，它服務的 1,204 台主機正在改連其他節點",
+  "reason": "kairos-a 已 20 秒沒有更新心跳（行程停止、主機斷電或與資料庫的網路中斷）。主節點已把連在 kairos-a 的主機標為離線（「Kairos 節點失聯」），這些主機的 Pulse 會在數十秒內改連其他節點並重新上線；主機離線告警有 3 分鐘寬限，正常不會觸發。",
+  "fix": "1. 檢查 kairos-a 的服務狀態（`systemctl status kairos`）與日誌。\n2. 確認 kairos-a 能連到資料庫。\n3. 計畫性停機請改用「排空」，讓 agent 分批改連、不出現失聯。"
+ },
+ "KRS-I8507": {
+  "level": "I",
+  "text": "Kairos 節點正在排空（`kairos cluster drain`、S20「叢集」的「排空」）：Kairos 要求協商了 feature `cluster` 的 agent 在指定時間內改連其他節點；Pulse 收到 `drain` 後停止送出新的 report、等在途回應、關閉連線並依隨機延遲改連下一個候選位址，**不算失敗、不增加退避**。0.9 的 L4 已實作：Pulse 端的處理，以及 Kairos 關機時對協商了 `cluster` 的連線送 `drain`（關機日誌）；`kairos cluster drain` 在 0.10。2026-10-19 分配（工程暫定為 `KRS-I8407`／`PLS-I8407`，已寫進 `sprint8/pulse-multiaddr`，合併前改號）",
+  "title": null,
+  "reason": null,
+  "fix": null
  }
 };

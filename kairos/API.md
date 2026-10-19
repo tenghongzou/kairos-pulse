@@ -1336,7 +1336,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/hosts/{agent_id}/purge` | `hosts:purge` | 影響預覽（下方）。這台主機在任何資料表都沒有可刪除的資料時 404 `host_not_found` |
-| `POST /api/v1/hosts/{agent_id}/purge` | `hosts:purge` | 刪除（L2）：本文 `confirm`（必須等於預覽的 `confirm_text`，即清冊中的主機名稱；沒有清冊列時為 `agent_id`）、`impact_token`、`reason`（選填，最多 500 字）。主機仍連線中 409 `host_online`；`confirm` 不符 400 `confirmation_required`（`details.confirm_text`）；`impact_token` 不符或逾時 409 `impact_changed`（`details` 為新的預覽）；刪除沒有完成 503 `storage_unavailable`。三者的 `product_code` 為〔暫定〕`KRS-E4205` |
+| `POST /api/v1/hosts/{agent_id}/purge` | `hosts:purge` | 刪除（L2）：本文 `confirm`（必須等於預覽的 `confirm_text`，即清冊中的主機名稱；沒有清冊列時為 `agent_id`）、`impact_token`、`reason`（選填，最多 500 字）。主機仍連線中 409 `host_online`；`confirm` 不符 400 `confirmation_required`（`details.confirm_text`）；`impact_token` 不符或逾時 409 `impact_changed`（`details` 為新的預覽）；刪除沒有完成 503 `storage_unavailable`。三者的 `product_code` 為`KRS-E4205` |
 | `GET /api/v1/hosts/{agent_id}/personal-data` | `hosts:personal_data` | 個資匯出（資料主體存取請求）：`data` 為 `kairos.host.personal-data/v1` 的文件（PRIVACY.md 第 5 節）；每次記稽核 `host.personal_data.export` |
 
 兩個權限只有管理員有（`ia.md` §4.2「刪除主機資料只限管理員」）；群組範圍的指派看不到範圍外的主機（404）。方法不符 405。
@@ -1359,7 +1359,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 - `impact_token` 由主機、會撤銷的憑證、告警事件與註冊申請的數字算出（原始 report 的筆數會因保留清除改變，不列入），5 分鐘的時間窗，前一個時間窗也接受（同第 11.5 節）。
 - `POST` 成功時 `data`：`agent_id`、`deleted`（同 `counts` 的欄位，為實際刪除的列數；`certificates_kept` 為保留的已撤銷憑證紀錄）、`revoked_serials`（刪除前撤銷的序號）、`kept`。
 
-**刪除的順序**：從狀態表移除（同時丟棄指標轉出在記憶體中的最新值與 OTLP 佇列中這台主機的資料，第 16 節）→ 撤銷尚未撤銷的有效憑證（每張稽核 `cert.revoke`）→ 告警引擎忘記這台主機的進行中事件 → report 的 writer 逐步刪除（每一步最多 5,000 列；最後一步刪除清冊並寫稽核 `host.purge`，`code` 為〔暫定〕`KRS-I4204`）。等待上限 120 秒，逾時時 writer 仍會做完。稽核日誌不刪除（PRIVACY.md 第 4.2 節）。
+**刪除的順序**：從狀態表移除（同時丟棄指標轉出在記憶體中的最新值與 OTLP 佇列中這台主機的資料，第 16 節）→ 撤銷尚未撤銷的有效憑證（每張稽核 `cert.revoke`）→ 告警引擎忘記這台主機的進行中事件 → report 的 writer 逐步刪除（每一步最多 5,000 列；最後一步刪除清冊並寫稽核 `host.purge`，`code` 為`KRS-I4204`）。等待上限 120 秒，逾時時 writer 仍會做完。稽核日誌不刪除（PRIVACY.md 第 4.2 節）。
 
 **CLI**（PRIVACY.md 第 4.1 節）：
 
@@ -1382,7 +1382,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 
 ### 15.2 下載端點（ENROLL.md 第 19.4 節第 3 項）
 
-`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`）、`reason`、`product_code`（設定了目錄但不完整時為〔暫定〕`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令。`stats.downloads_in_progress` 為目前的下載數。
+`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`）、`reason`、`product_code`（設定了目錄但不完整時為`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令。`stats.downloads_in_progress` 為目前的下載數。
 
 ## 16. 指標轉出（0.9.0〔草稿〕）
 
@@ -1390,9 +1390,9 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
-| `GET /api/v1/export/prometheus[?group=…]` | `hosts:read`（依主機群組篩選） | 所有可見主機的最新指標，Prometheus text 0.0.4；`Accept: application/openmetrics-text` 時為 OpenMetrics 1.0。未啟用時 `404 export_disabled`（`KRS-E4315`，暫定）。回應不是 JSON（錯誤仍是第 1.2 節的 JSON） |
+| `GET /api/v1/export/prometheus[?group=…]` | `hosts:read`（依主機群組篩選） | 所有可見主機的最新指標，Prometheus text 0.0.4；`Accept: application/openmetrics-text` 時為 OpenMetrics 1.0。未啟用時 `404 export_disabled`（`KRS-E4315`）。回應不是 JSON（錯誤仍是第 1.2 節的 JSON） |
 | `GET /api/v1/export/settings` | `settings:read` | 生效的設定、每個主控台可修改的鍵的來源與鎖定、Prometheus 抓取與 OTLP 推送的狀態 |
-| `PUT /api/v1/export/settings` | `export:write` | 修改 `prometheus.{enabled,stale_after_secs,include_processes}`、`otlp.{enabled,endpoint,interval_secs,naming,headers}`；`null` 為改用設定檔的值；`reason` 選填。不合法 `400 invalid_parameter`（`KRS-E4314`，暫定）、環境變數鎖定 `409 locked_by_environment`；寫入稽核（`settings`／`export.change`，標頭只記名稱） |
+| `PUT /api/v1/export/settings` | `export:write` | 修改 `prometheus.{enabled,stale_after_secs,include_processes}`、`otlp.{enabled,endpoint,interval_secs,naming,headers}`；`null` 為改用設定檔的值；`reason` 選填。不合法 `400 invalid_parameter`（`KRS-E4314`）、環境變數鎖定 `409 locked_by_environment`；寫入稽核（`settings`／`export.change`，標頭只記名稱） |
 | `POST /api/v1/export/otlp/test` | `export:write` | 以已儲存的設定送出空的 OTLP 請求，回 `{ok, status, code, message, elapsed_ms, endpoint}`；寫入稽核（`export.otlp_test`） |
 
 - 指標轉出的鍵存在同一張 `settings` 表，但不列入第 11.7 節的 `GET /api/v1/settings`／`POST /api/v1/settings/reset`（那裡只有設定檔與環境變數的值）。

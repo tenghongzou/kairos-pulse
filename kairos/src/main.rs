@@ -1286,7 +1286,7 @@ async fn run(
         .load(std::sync::atomic::Ordering::Relaxed);
     if drains > 0 {
         info!(
-            "資訊 KRS-I8407（暫定）：已對 {drains} 條協商了 cluster 的連線送出 drain（排空），這些 agent 會在 {:.0} 秒內分散改連其他節點",
+            "資訊 KRS-I8507：已對 {drains} 條協商了 cluster 的連線送出 drain（排空），這些 agent 會在 {:.0} 秒內分散改連其他節點",
             f64::from(ctx.cluster.drain_window(&registry)) / 1000.0
         );
     }

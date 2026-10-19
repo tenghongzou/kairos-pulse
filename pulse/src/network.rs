@@ -22,7 +22,7 @@
 //! 依序嘗試，收到 hello_ack 之前失敗就立即改試下一個（`PLS-W2301`，不增加退避），整輪都失敗才退避
 //! （`PLS-E2302`）。連上後不主動切回主位址。協商了 feature `cluster` 時，Kairos 送 `drain` 要求改連
 //! 其他節點：停止送出新的 report、等在途的回應（最多 8 秒）後關閉，依 `reconnect_within_ms` 的隨機
-//! 延遲從下一個候選位址重連，不算失敗（`PLS-I8407`）。
+//! 延遲從下一個候選位址重連，不算失敗（`PLS-I8507`）。
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -6298,7 +6298,7 @@ mod tests {
             times[1] - times[0] <= Duration::from_millis(1000),
             "{times:?}"
         );
-        let drain = with_code(&logs, "conn.drain PLS-I8407 ");
+        let drain = with_code(&logs, "conn.drain PLS-I8507 ");
         assert_eq!(drain.len(), 1, "{logs:?}");
         assert_eq!(drain[0].0, log::Level::Info);
         assert!(

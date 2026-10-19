@@ -2,7 +2,7 @@
 
 本文件說明 Kairos 與 Pulse 處理哪些個人資料、存在哪裡、保存多久，以及 0.9.0 起可以調整的保存方式（`[privacy]`）、刪除一台主機的所有資料（`kairos hosts purge`、主控台「刪除主機資料」）與資料主體存取請求（個資匯出）。最後附上資料處理協議（DPA）的範本骨架。
 
-- 狀態：**0.9.0〔草稿〕，已實作**（分支 `sprint8/privacy`）。設計包（`design/`）尚未定案的項目列在第 9 節；新的產品代碼為〔暫定〕（第 8 節）。
+- 狀態：**0.9.0〔草稿〕，已實作**（分支 `sprint8/privacy`）。第 9 節的待決事項已決定（2026-10-19，採建議；設計包 §31 D53）；產品代碼已由設計包正式分配（第 8 節，號碼不變）。
 - 實作：`kairos/src/privacy.rs`（設定、假名化、遮蔽、個資匯出）、`kairos/src/store/purge.rs`（刪除主機資料）、`kairos/src/api/privacy.rs`（主控台 API）、`kairos/src/privacy_cli.rs`（CLI）、`kairos/web/assets/js/screens/host-privacy.js`（主控台）。
 - **本文件不是法律意見。** 「個資」「資料主體」「刪除權」等用語以 GDPR 與我國個人資料保護法（以下簡稱個資法）的一般理解撰寫；實際的適用、法律依據與 DPA 條文請由貴單位的法務或個資保護長審閱。
 
@@ -71,7 +71,7 @@ inventory_network = "keep"      # keep | truncate（介面位址截到 /24、/48
 
 `privacy.hostname = "pseudonymize"`：假名 ＝ `host-` ＋ base32（HMAC-SHA256（金鑰, `host` ‖ 0x00 ‖ 小寫的主機名稱））的前 12 個字元（60 位元）。顯示名稱為 `name-…`、行程的使用者為 `user-…`（不同的前綴，同一個字串得到不同的假名）。
 
-- **金鑰**：`data/privacy.key`（32 bytes，0600），Kairos 在需要時（設定了 `pseudonymize`）第一次啟動建立；金鑰無法建立或讀取時 Kairos **拒絕啟動**（〔暫定〕`KRS-E4005`）——管理者要求假名化，不能退回保存原值。金鑰不在資料庫中，`kairos db backup --include-keys` 會一併加密備份（STORAGE.md 第 9 節）。
+- **金鑰**：`data/privacy.key`（32 bytes，0600），Kairos 在需要時（設定了 `pseudonymize`）第一次啟動建立；金鑰無法建立或讀取時 Kairos **拒絕啟動**（`KRS-E4005`）——管理者要求假名化，不能退回保存原值。金鑰不在資料庫中，`kairos db backup --include-keys` 會一併加密備份（STORAGE.md 第 9 節）。
 - **一致**：同一個名稱在任何主機、任何時間都得到同一個假名，主控台的搜尋、告警、註冊申請的「主機名稱重複」判斷照常運作。
 - **查詢**：`kairos hosts pseudonym <主機名稱>...`（`--kind host|name|user`）以金鑰算出假名，回答「`ann-laptop` 在 Kairos 中叫什麼」。
 
@@ -100,14 +100,14 @@ inventory_network = "keep"      # keep | truncate（介面位址截到 /24、/48
 
 執行中的刪除由 Kairos 自己完成：
 
-1. 主機必須**離線**（連線中時 409 `host_online`，〔暫定〕`KRS-E4205`）。請先在主機上停止並移除 Pulse，或撤銷憑證讓它斷線。
+1. 主機必須**離線**（連線中時 409 `host_online`，`KRS-E4205`）。請先在主機上停止並移除 Pulse，或撤銷憑證讓它斷線。
 2. 從狀態表移除（之後的 `agents.json`、清冊同步、主控台都看不到它），並丟棄指標轉出在記憶體中的資料（Prometheus exporter 的最新值、OTLP 佇列中尚未送出的這台主機的資料；EXPORT.md）。
 3. 撤銷這台主機尚未撤銷、尚未過期的憑證（`cessationOfOperation`，立即生效；每張一筆稽核 `cert.revoke`）。執行中的 Kairos 數秒內重新產生 CRL；外部 CA 簽發、匯入的憑證由 Kairos 在 hello 時拒絕（PKI.md 第 16 節）。
 4. 告警引擎忘記這台主機的進行中事件（之後不再寫入它們）。
 5. report 的 writer 逐步刪除（每一步最多 5,000 列、一個交易，與 report 的寫入交錯，不會長時間擋住其他主機）：原始 report、行程快照、彙總、資產變更歷史；最後一步在同一個交易中刪除資產、序列、去重鍵、告警事件與處理紀錄與發送紀錄、註冊申請、續簽的重放快取、憑證紀錄、主機清冊，並寫入稽核 `host.purge`。
 6. 刪除開始後 10 分鐘內，這台主機的 report、資產與清冊同步一律不寫入（避免在途的資料把它建立回來；連線回 `storage_unavailable`）。
 
-中途失敗（磁碟、關機）時已刪除的部分不會復原，清冊仍在；重新執行同一個操作即可接續完成。刪除完成後記一行 `INFO`「資訊 KRS-I4204：已刪除主機 … 的資料」（〔暫定〕代碼）。
+中途失敗（磁碟、關機）時已刪除的部分不會復原，清冊仍在；重新執行同一個操作即可接續完成。刪除完成後記一行 `INFO`「資訊 KRS-I4204：已刪除主機 … 的資料」。
 
 CLI 需要停止 Kairos 的原因：執行中的 Kairos 在記憶體中有這台主機的快取、尚未寫出的彙總與狀態表，另一個行程直接刪除時，Kairos 之後的寫入會把資料（甚至清冊）寫回去。與 `kairos reports import` 相同，以 SQLite 的獨占鎖確保 Kairos 沒有在執行。
 
@@ -185,13 +185,14 @@ CLI 需要停止 Kairos 的原因：執行中的 Kairos 在記憶體中有這台
 10. **契約結束**：〔刪除或返還〕資料庫與備份；以「刪除主機資料」或整個資料目錄的刪除完成，並〔出具刪除證明〕；稽核日誌依第 4.2 節的保存期限處理〔或約定提前刪除整個資料庫〕。
 11. **稽核權**：控制者〔每年〕可要求提供 `kairos audit verify` 的結果、設定（`kairos config show --effective`）與保存期限的證明。
 
-## 8. 產品代碼（〔暫定〕，待設計包分配）
+## 8. 產品代碼（設計包 `decisions/INTEGRATION.md` §31.3 正式分配）
 
 | 代碼 | 等級 | 何時 |
 |---|---|---|
 | `KRS-I4204` | 資訊 | 已刪除主機資料（日誌、稽核 `host.purge` 的 `code`） |
 | `KRS-E4205` | 錯誤 | 無法刪除主機資料：主機仍連線中（409 `host_online`）、刪除沒有完成（503）、找不到資料（CLI） |
 | `KRS-E4005` | 錯誤 | 要求假名化（`pseudonymize`）但 `data/privacy.key` 無法建立或讀取，Kairos 不啟動 |
+| `KRS-W2012` | 警告 | `enroll.download_dir` 不完整（缺 `pulse-install.sh`、`SHA256SUMS` 或 `SHA256SUMS.sig`），S12 不顯示一行安裝指令（只對管理員顯示） |
 
 既有代碼：Kairos 執行中時 `kairos hosts purge` 以 `KRS-E4304`（資料庫正在使用中）拒絕。號碼依設計包 `copywriting.md` §3.2 的子類別（40 資料目錄、42 保留與清除）選用尚未被 Kairos 與 Pulse 佔用的號碼。
 

@@ -352,7 +352,7 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 3. 送出 TLS close_notify 並關閉連線；
 4. 依延遲重連，從候選位址清單中**目前位址的下一個**開始（只有一個位址時就是同一個，由負載平衡器導向其他節點）。
 
-這次斷線不算連線失敗、不增加退避；「連續被 `superseded`」的次數與其他原因的斷線一樣歸零。Pulse 記 `PLS-I8407`（暫定，資訊）。
+這次斷線不算連線失敗、不增加退避；「連續被 `superseded`」的次數與其他原因的斷線一樣歸零。Pulse 記 `PLS-I8507`（資訊）。
 
 **Kairos 端**：只對協商了 `cluster` 的連線送 `drain`。0.9.0 在**優雅關機**時先對這些連線送 `drain`（`reason` 為 `node_draining`），再送出 close_notify 關閉；其他連線照舊直接關閉（舊版 Pulse 依退避重連）。由維運命令排空節點（`kairos cluster drain`）留待叢集模式實作。舊版 Pulse 收到不認得的 `type` 只會忽略（記 DEBUG），所以即使誤送也不會壞，但規格上沒有協商時不送。
 

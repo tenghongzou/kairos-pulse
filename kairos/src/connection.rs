@@ -151,7 +151,7 @@ pub struct ConnContext {
 pub struct ClusterContext {
     /// `hello_ack.server_node`（`cluster.node_id`，預設由主機名稱導出）
     pub node_id: Arc<str>,
-    /// 關機時送出 `drain` 的連線數（關機日誌 `KRS-I8407`）
+    /// 關機時送出 `drain` 的連線數（關機日誌 `KRS-I8507`）
     pub drains_sent: std::sync::atomic::AtomicU64,
     /// 關機時的 `reconnect_within_ms`（第一條送 `drain` 的連線依線上數計算一次，其他連線沿用）
     drain_window: std::sync::OnceLock<u32>,

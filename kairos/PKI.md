@@ -553,4 +553,4 @@ kairos pki certificates import host-07.pem --agent-id 6f1c0e4a-1b2c-4d3e-9f00-11
 - 內容類型依副檔名（`.sh`、`.deb`、`.rpm`、`.msi`、`.zip`、`.tar.gz`、`SHA256SUMS`、`.sig`…），`X-Content-Type-Options: nosniff`、`Content-Disposition: attachment`；`SHA256SUMS`、`SHA256SUMS.sig`、`pulse-install.sh` 為 `Cache-Control: no-cache`，其他 `public, max-age=3600`；`ETag`、`Last-Modified`，`If-None-Match` 相符時 304；`HEAD` 只回標頭；以串流送出。
 - L11：每個來源同時 `enroll.max_downloads_per_ip`（批次部署來源乘以倍率）、全部 `enroll.max_downloads` 個，超過 429（`scope: download`，`Retry-After: 15`）。註冊端點為僅續簽或自動暫停時 403。
 - **完整性不依賴 Kairos**：`pulse-install.sh` 以另外取得的發佈公鑰驗證 `SHA256SUMS.sig`，再以 `SHA256SUMS` 驗證套件。8444 的伺服器憑證由 Kairos 的根 CA 簽發，安裝腳本以 `--ca-file <根 CA>` 驗證 HTTPS（`pulse/packaging/INSTALL.md`）。
-- 主控台 API 的 `downloads.available` 在目錄有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 時為 `true`，S12 據此顯示一行安裝指令；設定了目錄但不完整時啟動記〔暫定〕`KRS-W2012`。
+- 主控台 API 的 `downloads.available` 在目錄有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 時為 `true`，S12 據此顯示一行安裝指令；設定了目錄但不完整時啟動記`KRS-W2012`。

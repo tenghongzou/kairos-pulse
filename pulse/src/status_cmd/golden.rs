@@ -1157,7 +1157,7 @@ fn registered_to_a_fallback_node_shows_node_and_candidate() {
     let rows = render::rows(&report, &unicode());
     assert!(
         rows.contains(
-            "已註冊到 kairos-b.example.gov.tw:8443（節點 kairos-b，第 2 個候選位址）（TLS 1.3，mTLS），已連線"
+            "已註冊到 kairos-b.example.gov.tw:8443（Kairos 節點 kairos-b；第 2 個位址，共 2 個）（TLS 1.3，mTLS），已連線"
         ),
         "{rows}"
     );
@@ -1166,7 +1166,7 @@ fn registered_to_a_fallback_node_shows_node_and_candidate() {
     f.connection.candidate_index = Some(0);
     let rows = render::rows(&eval::evaluate(&input(f)), &unicode());
     assert!(
-        rows.contains("已註冊到 kairos-b.example.gov.tw:8443（節點 kairos-b）（TLS 1.3"),
+        rows.contains("已註冊到 kairos-b.example.gov.tw:8443（Kairos 節點 kairos-b）（TLS 1.3"),
         "{rows}"
     );
 }
@@ -1232,14 +1232,14 @@ fn all_candidates_failing_lists_each_address() {
 fn drain_is_not_reported_as_a_problem() {
     let mut f = offline_file();
     f.connection.consecutive_failures = 0;
-    f.connection.last_error_code = Some("PLS-I8407".into());
+    f.connection.last_error_code = Some("PLS-I8507".into());
     f.connection.last_error = Some("Kairos 節點正在排空，改連其他節點".into());
     let report = eval::evaluate(&input(f));
     let rows = render::rows(&report, &unicode());
     assert!(
-        rows.contains("重新連線中：Kairos 節點正在排空，改連其他節點（PLS-I8407）"),
+        rows.contains("重新連線中：Kairos 節點正在排空，改連其他節點（PLS-I8507）"),
         "{rows}"
     );
     let issues = render::issues(&report, &unicode(), false, false);
-    assert!(!issues.contains("PLS-I8407"), "{issues}");
+    assert!(!issues.contains("PLS-I8507"), "{issues}");
 }

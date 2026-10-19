@@ -391,7 +391,7 @@ pub fn step(
     Ok(true)
 }
 
-/// 已刪除主機資料（日誌與稽核；〔暫定〕代碼，待設計包分配）
+/// 已刪除主機資料（日誌與稽核）
 pub const CODE_PURGED: &str = "KRS-I4204";
 /// 無法刪除主機資料（主機仍連線中、找不到資料、刪除失敗；〔暫定〕）
 pub const CODE_PURGE_FAILED: &str = "KRS-E4205";

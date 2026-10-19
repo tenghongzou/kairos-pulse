@@ -1,6 +1,6 @@
 # 指標轉出：Prometheus exporter、OTLP、Grafana（商業審計 F7）
 
-狀態：0.9.0〔草稿〕已實作（衝刺 8，分支 `sprint8/export`）。錯誤代碼 `KRS-E4311`～`KRS-E4315` 為**暫定**，待設計包分配（第 8 節）。
+狀態：0.9.0〔草稿〕已實作（衝刺 8，分支 `sprint8/export`）。錯誤代碼 `KRS-E4311`～`KRS-E4315` 已由設計包正式分配（`decisions/INTEGRATION.md` §31.3，號碼不變）；第 8 節的四項設計包待辦已在 §31 定案（D52）。
 
 Kairos 收到的主機指標（Pulse 的 report，`crates/kairos-proto/METRICS.md`）可以轉出到既有的監控系統：
 
@@ -349,7 +349,9 @@ service:
 
 ## 8. 待決事項與需要設計包配合的項目
 
-1. **錯誤代碼**（暫定，子類別 43「匯出、匯入與備份」的空號）：`KRS-E4311` OTLP 推送失敗（無法連線、逾時、TLS、5xx／429，重試用完時丟棄）、`KRS-E4312` collector 拒絕資料（4xx、`partial_success`）、`KRS-W4313` OTLP 佇列已滿而丟棄、`KRS-E4314` 指標轉出的設定無效、`KRS-E4315` Prometheus exporter 未啟用。需要寫入 `copywriting.md` §3.3 並重新產生 `error-codes.js`（目前主控台以 API 的訊息顯示）。
+> 設計包 `decisions/INTEGRATION.md` §31（2026-10-19，D52）已處理以下四項：代碼照原號正式分配、`export:write`（中文「修改指標轉出」）加入權限表、S21 卡片的線框與文案（`screens.md` S21「0.9 規格」）、稽核動作加入 S18。以下保留原始內容供對照。
+
+1. **錯誤代碼**（子類別 43「匯出、匯入與備份」的空號）：`KRS-E4311` OTLP 推送失敗（無法連線、逾時、TLS、5xx／429，重試用完時丟棄）、`KRS-E4312` collector 拒絕資料（4xx、`partial_success`）、`KRS-W4313` OTLP 佇列已滿而丟棄、`KRS-E4314` 指標轉出的設定無效、`KRS-E4315` Prometheus exporter 未啟用。需要寫入 `copywriting.md` §3.3 並重新產生 `error-codes.js`（目前主控台以 API 的訊息顯示）。
 2. **權限**：新權限 `export:write`（只有管理員）需要加入 `ia.md` §4.2 的權限矩陣與 S16 的權限表。
 3. **S21「整合」**：設計包的線框沒有「指標轉出」卡片；本版依 S21 既有的來源標示、L1 確認、機密欄位（S11 的「只能更換不能檢視」）實作，需要設計組補線框與文案審閱。
 4. **稽核動作**：`export.change`、`export.otlp_test`（`settings` 類別）需要加入 S18 的動作清單。

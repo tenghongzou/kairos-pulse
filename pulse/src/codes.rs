@@ -63,11 +63,10 @@ events! {
     CONN_RESTORED = "conn.restored", Some(2003);
     /// 中斷超過 30 分鐘
     CONN_OUTAGE = "conn.outage", Some(2004);
-    /// 候選位址無法連線，改試下一個（`PLS-W2301`，暫定；`kairos/HA.md` 第 8.3 節）。
-    /// Windows 事件識別碼待設計組分配
-    CONN_FAILOVER = "conn.failover", None;
-    /// Kairos 要求改連其他節點（`drain`，`PLS-I8407`，暫定）。Windows 事件識別碼待設計組分配
-    CONN_DRAIN = "conn.drain", None;
+    /// 候選位址無法連線，改試下一個（`PLS-W2301`；`kairos/HA.md` 第 8.3 節；`log-ux.md` §4.2）
+    CONN_FAILOVER = "conn.failover", Some(2005);
+    /// Kairos 要求改連其他節點（`drain`，`PLS-I8507`；`log-ux.md` §4.2）
+    CONN_DRAIN = "conn.drain", Some(2007);
     /// 伺服器憑證驗證失敗（`PLS-E1401`～`PLS-E1405`）
     TLS_SERVER_CERT_REJECTED = "tls.server_cert_rejected", Some(2100);
     /// `PLS-E1101`
@@ -210,12 +209,12 @@ pub const W_SERVER_UNEXPECTED: &str = "PLS-W2107";
 /// 資產資訊被伺服器拒絕（設計包 `decisions/INTEGRATION.md` §30.3；METRICS.md 第 6.3 節）
 pub const W_INVENTORY_REJECTED: &str = "PLS-W2108";
 pub const E_PER_IP_LIMIT: &str = "PLS-E2201";
-/// 目前的伺服器位址無法連線，已改試下一個候選位址（暫定，`kairos/HA.md` 第 19 節）
+/// 目前的伺服器位址無法連線，已改試下一個候選位址（設計包 `decisions/INTEGRATION.md` §31.3；`kairos/HA.md` 第 19 節）
 pub const W_CANDIDATE_FAILED: &str = "PLS-W2301";
-/// 所有候選位址都無法連線，依退避重試（暫定，`kairos/HA.md` 第 19 節）
+/// 所有候選位址都無法連線，依退避重試（設計包 §31.3；`kairos/HA.md` 第 19 節）
 pub const E_ALL_CANDIDATES_FAILED: &str = "PLS-E2302";
-/// Kairos 節點排空，依指定的延遲改連其他節點（暫定，鏡像 `KRS-I8407`；`kairos/HA.md` 第 18.2 節）
-pub const I_DRAIN: &str = "PLS-I8407";
+/// Kairos 節點排空，依指定的延遲改連其他節點（鏡像 `KRS-I8507`；設計包 §31.3 由暫定的 `PLS-I8407` 改號；`kairos/HA.md` 第 18.2 節）
+pub const I_DRAIN: &str = "PLS-I8507";
 pub const W_REPORT_RATE: &str = "PLS-W2203";
 pub const W_SUPERSEDED: &str = "PLS-W3101";
 pub const E_AGENT_ID_CONFLICT: &str = "PLS-E3102";
@@ -545,6 +544,9 @@ mod tests {
         assert_eq!(STATUS_WRITE_FAILED.win_event_id, Some(5020));
         assert_eq!(STATUS_WRITE_RESTORED.win_event_id, Some(5021));
         assert_eq!(CLOCK_SKEW.win_event_id, Some(5000));
+        // INTEGRATION §31.6：多個伺服器位址與排空
+        assert_eq!(CONN_FAILOVER.win_event_id, Some(2005));
+        assert_eq!(CONN_DRAIN.win_event_id, Some(2007));
     }
 
     #[test]

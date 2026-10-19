@@ -682,12 +682,12 @@ fallback_addresses = ["kairos-b.example.com", "10.0.20.11:8443"]
 - **格式**：每一項為「主機」或「主機:埠」，省略埠時用 `server.port`；IPv6 必須加方括號（`"[2001:db8::10]"`、`"[2001:db8::10]:8443"`）。最多 16 個，重複的只留第一個。不合法時無法啟動（`PLS-E0201`，`pulse check-config` 也會檢查）。環境變數為 `PULSE__SERVER__FALLBACK_ADDRESSES`，以逗號分隔（去除前後空白，空字串表示沒有）。
 - **新的鍵、不改 `address`**：舊版 Pulse 忽略不認得的鍵，降版後照常連 `address`；`pulse enroll` 改寫設定檔時也只寫 `address`。**安裝字串不變**：叢集部署的安裝字串一律使用服務名稱（負載平衡器或虛擬 IP），多位址在註冊後以 `pulse.toml` 或環境變數加入。
 - **憑證**：所有位址都以同一個 `server.domain` 驗證伺服器憑證（與實際連上的位址無關），因此**每個節點的伺服器憑證都必須含這個名稱**；某個節點的憑證不含時，該節點記 `PLS-E1402` 並改試下一個。
-- **選擇與退避**：每一輪從第一個位址（`address`）開始依序嘗試。收到 `hello_ack` 之前的任何失敗（DNS、TCP 被拒、逾時、TLS 握手失敗、收到錯誤或斷線）都**立即**改試下一個（兩次之間只隔 0～500 ms 的隨機延遲），不增加退避，記 `PLS-W2301`（暫定；每輪第一次失敗時判斷，`WARN` 每 10 分鐘最多一則，其餘記 `DEBUG`）。整輪都失敗才依 `[retry]` 退避，記 `PLS-E2302`（暫定），日誌列出每個位址最後的錯誤；某個位址的錯誤需要人工處理（例如伺服器憑證不符、用戶端憑證被拒）時改以該錯誤的代碼記錄。名稱解析出多個 IP 時依序嘗試，每個 IP 最多 3 秒，整個位址最多 5 秒。
+- **選擇與退避**：每一輪從第一個位址（`address`）開始依序嘗試。收到 `hello_ack` 之前的任何失敗（DNS、TCP 被拒、逾時、TLS 握手失敗、收到錯誤或斷線）都**立即**改試下一個（兩次之間只隔 0～500 ms 的隨機延遲），不增加退避，記 `PLS-W2301`（每輪第一次失敗時判斷，`WARN` 每 10 分鐘最多一則，其餘記 `DEBUG`）。整輪都失敗才依 `[retry]` 退避，記 `PLS-E2302`，日誌列出每個位址最後的錯誤；某個位址的錯誤需要人工處理（例如伺服器憑證不符、用戶端憑證被拒）時改以該錯誤的代碼記錄。名稱解析出多個 IP 時依序嘗試，每個 IP 最多 3 秒，整個位址最多 5 秒。
 - **連上之後不主動切回第一優先**；斷線後的下一輪自然從第一個開始（避免第一優先節點反覆故障時來回切換）。被 `superseded` 時不改試其他位址（身分衝突，換節點也一樣）。
-- **排空（feature `cluster`）**：Pulse 0.9.0 一律宣告 `cluster`；Kairos 0.9.0 列出時，`hello_ack` 帶回應的節點名稱（`server_node`），Kairos 優雅關機時先送 `drain`。Pulse 收到後停止送出新的 report（取樣照常寫進本機緩衝）、等在途的 report 收到回應（最多 8 秒）後關閉連線，在 `[0, reconnect_within_ms]` 的隨機延遲後從**目前位址的下一個**開始重連。這次斷線不算失敗、不增加退避，記 `PLS-I8407`（暫定，`INFO`）。
+- **排空（feature `cluster`）**：Pulse 0.9.0 一律宣告 `cluster`；Kairos 0.9.0 列出時，`hello_ack` 帶回應的節點名稱（`server_node`），Kairos 優雅關機時先送 `drain`。Pulse 收到後停止送出新的 report（取樣照常寫進本機緩衝）、等在途的 report 收到回應（最多 8 秒）後關閉連線，在 `[0, reconnect_within_ms]` 的隨機延遲後從**目前位址的下一個**開始重連。這次斷線不算失敗、不增加退避，記 `PLS-I8507`（`INFO`）。
 - **補送與去重**：重送的 durable report 內容不變（`boot_id`、`report_seq` 與連到哪個節點無關），斷線時在途的 report（最多 4 筆）在下一條連線（可能是另一個節點）重送。**所有位址必須屬於共用同一個資料庫的同一個叢集**，去重才是全叢集的；指到另一套獨立的 Kairos 時，換節點時在途的那幾筆可能兩邊各寫一次。`hello_ack` 的 `cluster_id`（叢集模式的 Kairos 才送）在同一個 Pulse 行程內改變時記 `WARN`。
 - **憑證更新**：8443 的正常輪替（`renew_request`）在任何節點都能完成；以新憑證確認的一次性連線、除役通知與過期憑證的報到都從最近一次連上的位址開始依序嘗試。8444（註冊、輪詢、過期續簽）仍只用 `enroll.address`（空字串時為 `server.address` 的主機），見「目前限制」。
-- **狀態**：`pulse status` 顯示「已註冊到 kairos-b.example.com:8443（節點 kairos-b，第 2 個候選位址）」；所有位址都失敗時的說明列出每個位址最後的錯誤。`status.json` 的 `connection.server` 為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`。`pulse check-config` 的「伺服器」列出備用位址；`pulse diag` 的 `candidates.json` 逐一測試名稱解析與 TCP 連線。本機指標見「本機指標」。
+- **狀態**：`pulse status` 顯示「已註冊到 kairos-b.example.com:8443（Kairos 節點 kairos-b；第 2 個位址，共 3 個）」；所有位址都失敗時的說明列出每個位址最後的錯誤。`status.json` 的 `connection.server` 為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`。`pulse check-config` 的「伺服器」列出備用位址；`pulse diag` 的 `candidates.json` 逐一檢查名稱解析與 TCP 連線。本機指標見「本機指標」。
 - DNS SRV（`server.srv`）是 HA 規格中階段 B 的選用功能，**這個版本沒有實作**。
 
 ## 本機緩衝（at-least-once）

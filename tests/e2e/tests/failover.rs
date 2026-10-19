@@ -192,14 +192,14 @@ fn graceful_shutdown_drains_agents_to_the_next_node() {
     let (code, _) = ka.stop();
     assert_eq!(code, 0, "{}", ka.dump());
     assert!(
-        ka.stdout().contains("KRS-I8407")
+        ka.stdout().contains("KRS-I8507")
             && ka
                 .stdout()
                 .contains("已對 1 條協商了 cluster 的連線送出 drain"),
         "{}",
         ka.dump()
     );
-    p.wait_for("conn.drain PLS-I8407", WAIT);
+    p.wait_for("conn.drain PLS-I8507", WAIT);
     // 依 reconnect_within_ms（10 秒內的隨機延遲）改連下一個候選位址
     p.wait_for_count(PULSE_REGISTERED, 2, WAIT);
     let s = wait_registered_to(&pulse, &fallback);

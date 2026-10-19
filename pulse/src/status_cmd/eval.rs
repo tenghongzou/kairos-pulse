@@ -239,22 +239,26 @@ fn clock_valid(file: &StatusFile, now: DateTime<Utc>, now_mono: Option<u64>) -> 
     }
 }
 
-/// 已註冊時的節點與候選位址：「（節點 kairos-b，第 2 個候選位址）」。沒有節點名稱且只有一個候選位址時
-/// 為空字串（與 0.8 相同；`kairos/HA.md` 第 8.7 節）
+/// 已註冊時的節點與候選位址：「（Kairos 節點 kairos-b；第 2 個位址，共 3 個）」（設計包
+/// `decisions/INTEGRATION.md` §31.6）。只有節點名稱時「（Kairos 節點 kairos-b）」；沒有節點名稱且只有一個
+/// 候選位址時為空字串（與 0.8 相同）
 fn cluster_note(c: &crate::status_file::Connection) -> String {
     let mut parts = Vec::new();
     if let Some(node) = c.server_node.as_deref().filter(|n| !n.is_empty()) {
-        parts.push(format!("節點 {node}"));
+        parts.push(format!("Kairos 節點 {node}"));
     }
     if let (Some(total), Some(index)) = (c.candidates, c.candidate_index)
         && total > 1
     {
-        parts.push(format!("第 {} 個候選位址", index.saturating_add(1)));
+        parts.push(format!(
+            "第 {} 個位址，共 {total} 個",
+            index.saturating_add(1)
+        ));
     }
     if parts.is_empty() {
         String::new()
     } else {
-        format!("（{}）", parts.join("，"))
+        format!("（{}）", parts.join("；"))
     }
 }
 

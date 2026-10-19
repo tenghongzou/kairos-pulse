@@ -100,9 +100,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### Pulse 的多個伺服器位址與協定 feature `cluster`（HA L4；`kairos/HA.md` 第 8 節、PROTOCOL.md「叢集與排空」）
 
-- **Pulse `server.fallback_addresses`**：主位址連不上時依序改試的其他 Kairos 節點（"主機" 或 "主機:埠"，IPv6 加方括號，最多 16 個；環境變數 `PULSE__SERVER__FALLBACK_ADDRESSES` 以逗號分隔）。新的鍵、`address` 維持單值，降版安全；安裝字串不變。一輪從主位址開始依序嘗試，收到 `hello_ack` 之前失敗就立即改試下一個（`PLS-W2301`，暫定，不增加退避），整輪都失敗才依 `[retry]` 退避（`PLS-E2302`，暫定，列出每個位址最後的錯誤）；連上後不主動切回主位址。名稱解析出多個 IP 時依序嘗試，每個最多 3 秒（整個位址仍是 5 秒）。所有位址都以同一個 `server.domain` 驗證伺服器憑證。一次性連線（`pulse enroll` 的確認、輪替後的確認、除役通知、過期憑證的報到）從最近一次連上的位址開始依序嘗試。
-- **feature `cluster`**（PROTOCOL.md「叢集與排空」）：Pulse 0.9 一律宣告；Kairos 只在 client 也宣告時才在 `hello_ack` 列出並帶 `server_node`（新設定 `[cluster] node_id`，預設為主機名稱的第一段）。`cluster_id` 留給叢集模式，單機的 Kairos 不送。新增排空訊息 `drain`（Kairos → Pulse）：Kairos 0.9 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reconnect_within_ms` = `max(10000, 線上連線數 × 5)`）再 `close_notify`，記 `KRS-I8407`（暫定）；Pulse 收到後停送新的 report、等在途的回應（最多 8 秒）後關閉，在隨機延遲後改連下一個候選位址，不算連線失敗（`PLS-I8407`，暫定）。
-- **狀態與可觀測性**：`status.json`／`pulse status --json` 的 `connection.server` 改為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`（只新增欄位，schema 不變）；`pulse status` 顯示「已註冊到 <位址>（節點 <名稱>，第 N 個候選位址）」。本機指標新增 `pulse_server_candidates`、`pulse_server_candidate_index`、`pulse_connect_failovers_total`、`pulse_drains_total`。`pulse check-config` 列出備用位址，`pulse diag` 新增 `candidates.json`（每個位址的名稱解析與 TCP 連線）。
+- **Pulse `server.fallback_addresses`**：主位址連不上時依序改試的其他 Kairos 節點（"主機" 或 "主機:埠"，IPv6 加方括號，最多 16 個；環境變數 `PULSE__SERVER__FALLBACK_ADDRESSES` 以逗號分隔）。新的鍵、`address` 維持單值，降版安全；安裝字串不變。一輪從主位址開始依序嘗試，收到 `hello_ack` 之前失敗就立即改試下一個（`PLS-W2301`，不增加退避），整輪都失敗才依 `[retry]` 退避（`PLS-E2302`，列出每個位址最後的錯誤）；連上後不主動切回主位址。名稱解析出多個 IP 時依序嘗試，每個最多 3 秒（整個位址仍是 5 秒）。所有位址都以同一個 `server.domain` 驗證伺服器憑證。一次性連線（`pulse enroll` 的確認、輪替後的確認、除役通知、過期憑證的報到）從最近一次連上的位址開始依序嘗試。
+- **feature `cluster`**（PROTOCOL.md「叢集與排空」）：Pulse 0.9 一律宣告；Kairos 只在 client 也宣告時才在 `hello_ack` 列出並帶 `server_node`（新設定 `[cluster] node_id`，預設為主機名稱的第一段）。`cluster_id` 留給叢集模式，單機的 Kairos 不送。新增排空訊息 `drain`（Kairos → Pulse）：Kairos 0.9 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reconnect_within_ms` = `max(10000, 線上連線數 × 5)`）再 `close_notify`，記 `KRS-I8507`；Pulse 收到後停送新的 report、等在途的回應（最多 8 秒）後關閉，在隨機延遲後改連下一個候選位址，不算連線失敗（`PLS-I8507`）。
+- **狀態與可觀測性**：`status.json`／`pulse status --json` 的 `connection.server` 改為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`（只新增欄位，schema 不變）；`pulse status` 顯示「已註冊到 <位址>（Kairos 節點 <名稱>；第 N 個位址，共 M 個）」。本機指標新增 `pulse_server_candidates`、`pulse_server_candidate_index`、`pulse_connect_failovers_total`、`pulse_drains_total`。`pulse check-config` 列出備用位址，`pulse diag` 新增 `candidates.json`（每個位址的名稱解析與 TCP 連線）。
 - **Kairos 離線原因 `server_lost`**：服務這台主機的叢集節點失聯（叢集模式由 leader 標記）。0.9.0 只定義名稱：主機 API 的 `offline_reason` 篩選、`/metrics` 的 `kairos_agent_disconnects_total{reason}`（多一個值為 0 的序列）與 Webhook 的固定代碼；單機的 Kairos 不會產生。接收端應忽略不認得的值。
 
 ### Kairos：註冊與憑證（衝刺 4 延後的小項）
@@ -127,7 +127,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **`kairos/HA.md`**（審計 A2，高可用）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址等分層設計與量測計畫；第 21 節的 20 項待決已決定（2026-10-19，採建議）。0.9.0 實作 L1a 儲存抽象與 L4 Pulse 多位址（L4 已包含於本草稿，見上方），PostgreSQL 後端與叢集協調在 0.10.0。STORAGE.md 的「限制與後續」連到 HA.md。
 - **`crates/kairos-proto/REMOTE.md`**（F8，集中設定與 agent 遠端升級）：第 14 節 D1～D18 已決定（2026-10-19，採建議）；0.9.0 實作 MVP（D15）。PROTOCOL.md 的 features 表加入 `config`、`upgrade` 兩列（草稿，指向 REMOTE.md）。
 
-### 〔暫定〕產品代碼（待設計包 `decisions/INTEGRATION.md` §31 分配）
+### 新的產品代碼（設計包 `decisions/INTEGRATION.md` §31.3 正式分配）
 
 | 代碼 | 何時 |
 |---|---|
@@ -141,11 +141,11 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | `KRS-E4005` | 要求假名化但 `data/privacy.key` 無法使用，Kairos 不啟動 |
 | `PLS-W2301` | 連不上這個候選位址，改試下一個（不增加退避） |
 | `PLS-E2302` | 所有候選位址都連不上，依 `[retry]` 退避（列出每個位址最後的錯誤） |
-| `PLS-I8407` | 收到 `drain`，改連下一個候選位址 |
-| `KRS-I8407` | 關機時對協商了 `cluster` 的連線送出 `drain`（關機日誌） |
+| `PLS-I8507` | 收到 `drain`，改連下一個候選位址 |
+| `KRS-I8507` | 關機時對協商了 `cluster` 的連線送出 `drain`（關機日誌） |
 | `KRS-W2012` | `enroll.download_dir` 不完整（缺 `pulse-install.sh`、`SHA256SUMS` 或 `SHA256SUMS.sig`） |
 
-HA.md 與 REMOTE.md 的暫定代碼都用了子類別 84，§31 會重新分配。
+新增子類別 23「多伺服器位址與叢集連線」、85「叢集與高可用」（另有 F8 與 0.10 用的 05、44、84）；HA 與 F8 原本都暫定使用子類別 84，§31 把 84 給 F8 遠端升級、叢集改為 85（同尾號），因此排空的代碼由工程暫定的 `KRS-I8407`／`PLS-I8407` 改為 **`KRS-I8507`／`PLS-I8507`**；其餘號碼與工程暫定的相同。Pulse 日誌事件 `conn.failover`、`conn.drain` 的 Windows 事件識別碼為 2005、2007。代碼總數 221 → 287（Kairos 152、Pulse 135，含 0.10 與 F8 的已分配代碼）。
 
 ### 已知限制
 

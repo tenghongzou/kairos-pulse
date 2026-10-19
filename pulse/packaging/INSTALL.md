@@ -362,11 +362,11 @@ install -o root -g pulse -m 644 client.pem /opt/pulse/client.pem
 ### 6.3 多個 Kairos 節點（0.9.0）
 
 - **有負載平衡器（TCP 透傳）或 keepalived 虛擬 IP**：`server.address` 填它的名稱即可，不需要 `fallback_addresses`。負載平衡器不可終結 TLS（8443、8444 都是 mTLS）。
-- **沒有負載平衡器**：`server.address` 填第一優先的節點，`server.fallback_addresses` 依序列出其他節點（"主機" 或 "主機:埠"，IPv6 加方括號，最多 16 個）。收到 `hello_ack` 前失敗就立即改試下一個（`PLS-W2301`，暫定），全部失敗才退避（`PLS-E2302`，暫定）；連上後不主動切回第一優先。也可以用 `systemctl edit pulse` 加 `Environment=PULSE__SERVER__FALLBACK_ADDRESSES=kairos-b.example.com,10.0.20.11:8443`（逗號分隔）。
+- **沒有負載平衡器**：`server.address` 填第一優先的節點，`server.fallback_addresses` 依序列出其他節點（"主機" 或 "主機:埠"，IPv6 加方括號，最多 16 個）。收到 `hello_ack` 前失敗就立即改試下一個（`PLS-W2301`），全部失敗才退避（`PLS-E2302`）；連上後不主動切回第一優先。也可以用 `systemctl edit pulse` 加 `Environment=PULSE__SERVER__FALLBACK_ADDRESSES=kairos-b.example.com,10.0.20.11:8443`（逗號分隔）。
 - **伺服器憑證**：所有位址都以同一個 `server.domain` 驗證，**每個節點的伺服器憑證都必須含這個名稱**（建議所有節點用同一張憑證，SAN＝服務名稱＋各節點名稱）。
 - **同一個叢集**：所有位址必須屬於共用同一個資料庫的同一個 Kairos 叢集；指到另一套獨立的 Kairos 時，換節點時在途的少數 report 可能重複寫入。
 - **註冊端點**：8444 不跟著備用位址走。叢集部署的安裝字串一律使用服務名稱，並把 `[enroll] address` 設為負載平衡器或虛擬 IP 的名稱（空字串時為 `server.address` 的主機）。
-- **確認**：`./pulse check-config` 的「伺服器」列出備用位址；`./pulse status` 顯示「已註冊到 <位址>（節點 <名稱>，第 N 個候選位址）」；`./pulse diag` 的 `candidates.json` 逐一測試每個位址的名稱解析與 TCP 連線。Kairos 節點優雅關機時會送排空（`drain`），Pulse 在隨機延遲後改連下一個位址，日誌記 `conn.drain PLS-I8407`，不算連線失敗。
+- **確認**：`./pulse check-config` 的「伺服器」列出備用位址；`./pulse status` 顯示「已註冊到 <位址>（Kairos 節點 <名稱>；第 N 個位址，共 M 個）」；`./pulse diag` 的 `candidates.json` 逐一測試每個位址的名稱解析與 TCP 連線。Kairos 節點優雅關機時會送排空（`drain`），Pulse 在隨機延遲後改連下一個位址，日誌記 `conn.drain PLS-I8507`，不算連線失敗。
 
 ### 6.2 本機緩衝（磁碟用量）
 

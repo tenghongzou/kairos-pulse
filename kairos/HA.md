@@ -9,7 +9,7 @@
 - Pulse 的多伺服器位址與 DNS SRV
 - 主控台、PKI、機密與稽核雜湊鏈在多節點下的處理
 - 升級路徑與故障情境
-- 暫定錯誤代碼、實作分工與已決定事項（第 21 節）
+- 錯誤代碼（設計包 §31 正式分配）、實作分工與已決定事項（第 21 節）
 
 協定的線上格式仍以 [`crates/kairos-proto/PROTOCOL.md`](../crates/kairos-proto/PROTOCOL.md) 為準；本文件第 18 節的協定增補是草稿，實作時再併入 PROTOCOL.md。儲存的現況見 [`STORAGE.md`](STORAGE.md)，PKI 見 [`PKI.md`](PKI.md)，主控台 API 見 [`API.md`](API.md)，告警見 [`ALERTS.md`](ALERTS.md)。
 
@@ -26,7 +26,7 @@
 | 資料庫 | **PostgreSQL 14 以上**（社群版功能即可）。SQLite 維持為單機的預設後端，不移除；SQLite＋Litestream／LiteFS 不作為產品支援的 HA 方案（第 4 節） |
 | 協調 | 不引入 etcd、Consul 等新元件：資料庫中的租約列（`cluster_leases`）加 fencing epoch。PostgreSQL 的 `LISTEN/NOTIFY` 只用來縮短延遲，正確性一律靠輪詢資料庫的版本號 |
 | Pulse | **不改也能用**：前面放 L4 負載平衡器或 VRRP 虛擬 IP，Pulse 照舊只設一個位址。另外新增 `server.fallback_addresses`（多個位址，依序改試）與選用的 DNS SRV；新增 feature `cluster`（`hello_ack.server_node` 與排空訊息 `drain`），**協定版本不變** |
-| 機密 | 所有節點必須持有同一組金鑰（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、簽發 CA 私鑰）。叢集模式下**不再自動產生金鑰**，啟動時比對資料庫中記錄的指紋，不符合時不進入就緒 |
+| 機密 | 所有節點必須持有同一組金鑰（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`、簽發 CA 私鑰）。叢集模式下**不再自動產生金鑰**，啟動時比對資料庫中記錄的指紋，不符合時不進入就緒 |
 | 稽核鏈 | 在 PostgreSQL 上以 `meta.audit_chain_head` 的列鎖（`SELECT … FOR UPDATE`）序列化所有寫入者（各節點與 CLI），`id` 在持鎖期間指定，鏈的順序等於 commit 的順序 |
 | 升級 | 0.8（單機 SQLite）→ 0.9（單機，schema v9）→ 停機以 `kairos db migrate` 搬到 PostgreSQL → 啟動第一個節點 → 複製金鑰與設定、啟動第二個節點 → 設定 LB 或 VIP |
 | 估工 | 階段 A 約 11～13 人週，階段 B 另加 4～6 人週（含 Pulse 多位址與 SRV）。比審計估的 6～10 人週多，原因見第 20.3 節 |
@@ -162,7 +162,7 @@
 - **只有持有 leader 租約的節點是主動節點**：它監聽 8443、8444、9443，執行全部的工作，與 0.8 的單一行程完全相同（記憶體中的狀態表、事件匯流排、告警引擎、SSE 都不需要跨節點）。
 - **備援節點**連著資料庫、寫心跳、每 2 秒嘗試取得租約，**不監聽** agent、註冊與主控台的連接埠（只監聽 `observability.listen`，`/readyz` 回 503 `standby`）。理由：不監聽就不會有「兩個節點都接受 agent 連線」的情況，階段 A 不需要處理 M1、M5～M13。
 - **接手**：主動節點失效 → 租約在 `cluster.lease_ttl_secs`（預設 15 秒）後到期 → 備援節點取得租約、epoch 加一 → 依 0.8 的啟動流程載入狀態（第 6.6 節，只把失聯節點的主機標為離線）→ 開始監聽 → LB 的健康檢查轉向它，或 keepalived 把虛擬 IP 移過來 → Pulse 重連。
-- **失去租約的主動節點**（續約失敗超過 `lease_ttl_secs − 5` 秒，或發現租約已被別人取得）立即停止接受連線，並**以結束代碼 75 結束行程**（`KRS-W8402`）。由 systemd 的 `Restart=always` 重新啟動，重新以備援身分加入。不嘗試「降級但保留行程」：記憶體中的狀態表、告警引擎與快取全部重來，最簡單也最不容易出錯。
+- **失去租約的主動節點**（續約失敗超過 `lease_ttl_secs − 5` 秒，或發現租約已被別人取得）立即停止接受連線，並**以結束代碼 75 結束行程**（`KRS-W8502`）。由 systemd 的 `Restart=always` 重新啟動，重新以備援身分加入。不嘗試「降級但保留行程」：記憶體中的狀態表、告警引擎與快取全部重來，最簡單也最不容易出錯。
 - **預期的切換時間**（預設參數）：
 
   | 階段 | 時間 |
@@ -211,7 +211,7 @@ PROXY protocol 的規則（實作線 L2）：
 - 不在清單內的來源**不得**帶標頭，帶了就關閉連線。
 - 只接受 v2（二進位）、`PROXY` 命令、TCP over IPv4／IPv6；`LOCAL` 命令（LB 的健康檢查）視為 LB 自己的連線。
 - 標頭在 TLS 握手之前讀取，讀取時限沿用 TLS 握手的時限。
-- 不合法時記 `KRS-W2206`（暫定，節流）。
+- 不合法時記 `KRS-W2206`（節流）。
 
 ## 4. 資料庫方案比較與建議
 
@@ -463,8 +463,8 @@ sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --con
 ### 6.1 節點與心跳
 
 - 每個節點啟動時以 `cluster.node_id` 寫入 `cluster_nodes`（UPSERT），之後每 `cluster.heartbeat_secs`（預設 5 秒）更新 `heartbeat_at`（資料庫時間）、`role` 與 `info`。
-- `node_id` 在叢集內必須唯一。啟動時發現同名節點的心跳在 `3 × heartbeat_secs` 內、且 `started_at` 不同時拒絕啟動（`KRS-E8403`，視為設定錯誤：兩台機器用了同一個 `node_id`）。
-- leader 把心跳超過 `cluster.node_lost_secs`（預設 20 秒）的節點標為失聯（`role` 改 `stopped`、記 `KRS-W8406`），並處理它的連線（第 6.6 節）。
+- `node_id` 在叢集內必須唯一。啟動時發現同名節點的心跳在 `3 × heartbeat_secs` 內、且 `started_at` 不同時拒絕啟動（`KRS-E8503`，視為設定錯誤：兩台機器用了同一個 `node_id`）。
+- leader 把心跳超過 `cluster.node_lost_secs`（預設 20 秒）的節點標為失聯（`role` 改 `stopped`、記 `KRS-W8506`），並處理它的連線（第 6.6 節）。
 - 正常關機時，節點先把 `role` 改為 `stopped`、交還租約（若持有），再結束。
 
 ### 6.2 leader 租約與 fencing
@@ -492,7 +492,7 @@ RETURNING holder, epoch, expires_at;
   - 階段 A：結束行程（第 3.2 節）；
   - 階段 B：停止單一寫入者的工作，回到 member。
   
-  記 `KRS-W8402`。資料庫切換（PostgreSQL 主庫故障）通常需要 10～30 秒，比預設的 TTL 長時，請把 `lease_ttl_secs` 調到大於資料庫的切換時間，否則每次資料庫切換都會造成一次 leader 換手。
+  記 `KRS-W8502`。資料庫切換（PostgreSQL 主庫故障）通常需要 10～30 秒，比預設的 TTL 長時，請把 `lease_ttl_secs` 調到大於資料庫的切換時間，否則每次資料庫切換都會造成一次 leader 換手。
 - **fencing**：每個 leader 專屬工作的寫入交易，第一個敘述都是：
 
   ```sql
@@ -699,7 +699,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
 
 每一輪連線開始時組出候選清單：
 
-1. `srv` 有設定時：查詢 SRV 紀錄，依 RFC 2782 排序（priority 由小到大，同一個 priority 內依 weight 加權隨機）。查詢失敗或沒有紀錄時記 `PLS-E2303`（暫定，每 10 分鐘最多一次），略過這一步。SRV 的 TTL 只用在快取（最多 300 秒）。
+1. `srv` 有設定時：查詢 SRV 紀錄，依 RFC 2782 排序（priority 由小到大，同一個 priority 內依 weight 加權隨機）。查詢失敗或沒有紀錄時記 `PLS-W2303`（每 10 分鐘最多一次），略過這一步。SRV 的 TTL 只用在快取（最多 300 秒）。
 2. `address:port`。
 3. `fallback_addresses`，依設定順序。
 
@@ -708,7 +708,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
 ### 8.3 選擇與退避
 
 - **一輪**＝從候選清單的第一個開始依序嘗試。
-  - 失敗時（DNS、TCP 被拒、逾時、TLS 握手失敗、收到 `hello_ack` 之前斷線或收到錯誤）**立即**改試下一個，兩次嘗試之間只隔 0～500 ms 的隨機延遲。不增加退避，記 `PLS-W2301`（暫定，每輪第一次失敗時記一次，節流 10 分鐘）。
+  - 失敗時（DNS、TCP 被拒、逾時、TLS 握手失敗、收到 `hello_ack` 之前斷線或收到錯誤）**立即**改試下一個，兩次嘗試之間只隔 0～500 ms 的隨機延遲。不增加退避，記 `PLS-W2301`（每輪第一次失敗時記一次，節流 10 分鐘）。
   - 整輪都失敗後才依既有的指數退避（`retry.initial_delay` 加倍到 `retry.max_delay`）等待，下一輪再從第一個開始。
 - **伺服器憑證不受信任**（`PLS-E1401`～`E1405`）時同樣改試下一個，但整輪結束時以 `ERROR` 記錄。這通常是部署錯誤（某個節點的憑證不含 `server.domain`），而不是節點故障。
 - **連上之後**：退避的重置規則不變（穩定 30 秒）。**不主動切回第一優先**：斷線後下一輪自然從第一個開始。理由：主動切回會在第一優先節點反覆故障時造成來回切換，而階段 A 的備援節點不監聽，切回也沒有意義。
@@ -741,7 +741,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
   - `server_node`：`hello_ack.server_node`，沒有時為 `null`；
   - `candidates`：候選位址的數量；
   - `candidate_index`：目前連上的是第幾個，從 0 起。
-- `pulse status` 顯示「已連線：kairos-b.example.com:8443（節點 kairos-b，第 2 個候選位址）」。所有候選位址都失敗時，列出每個位址最後的錯誤（設計包待辦）。
+- `pulse status` 顯示「已連線：kairos-b.example.com:8443（Kairos 節點 kairos-b；第 2 個位址，共 3 個）」。所有候選位址都失敗時，列出每個位址最後的錯誤（設計包待辦）。
 - `pulse diag` 的設定檢查列出 `fallback_addresses` 與 `srv`，並逐一測試解析與 TCP 連線。遮蔽規則把這兩個鍵加入主機遮蔽名單（與 `server.address` 相同）。
 - 本機指標：新增 `pulse_server_candidates`、`pulse_server_candidate_index`、`pulse_connect_failovers_total`（換位址的次數）。不以位址當 label。
 
@@ -821,6 +821,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
 | `data/alerts-secrets.key` | 通知管道機密（AES-256-GCM） | 所有節點同一把 |
 | `data/console.key` | CSRF、TOTP 秘密加密、復原碼 HMAC | 所有節點同一把 |
 | `data/audit-hmac.key` | 稽核鏈的 HMAC | 所有節點同一把 |
+| `data/privacy.key` | `[privacy]` 的假名化（主機名稱、顯示名稱、執行身分的 HMAC；`kairos/PRIVACY.md` 第 3 節） | 所有節點同一把（不同時同一台主機在不同節點會得到不同的假名）；`kairos cluster keys export／import` 一併處理，缺少或不符時同樣記 `KRS-E8504`（設計包 §31.8 HA #3） |
 | `data/pki/issuing-<ca_id>.key` | 簽發 CA 私鑰（線上簽發） | 所有節點都有啟用中（`active`）與 `trusted` 狀態的每一把 |
 | 伺服器憑證與私鑰（`server.cert_path`、`console.cert_path`） | TLS | 各節點各自一份，SAN 規則見第 8.5 節（建議同一張） |
 | `observability.metrics_token_file` | `/metrics` 的 token | 建議一致（Prometheus 設定較簡單），不檢查 |
@@ -832,7 +833,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
   - 對稱金鑰：`HMAC-SHA256(金鑰, "kairos-key-fingerprint/v1\n" ‖ 檔名)` 的前 16 bytes；
   - 簽發 CA 私鑰：公鑰的 SPKI SHA-256，與 `pki_cas` 中的憑證比對。
 - 每個節點啟動時計算自己的指紋並與資料庫比對：
-  - **缺少或不符**時記 `KRS-E8404`，`/readyz` 回 503（`keys` 檢查失敗），**不接受連線、不參與 leader 選舉**；
+  - **缺少或不符**時記 `KRS-E8504`，`/readyz` 回 503（`keys` 檢查失敗），**不接受連線、不參與 leader 選舉**；
   - 行程照常執行（`/healthz` 200），讓維運者看得到原因。
 - **叢集模式下停用所有金鑰的自動建立**：`SecretBox::open`、`ConsoleKey::load_or_create`、`audit::ensure_key` 在 `cluster.enabled = true` 時只讀取、不建立。只有 `kairos cluster init`（第一個節點）會在金鑰不存在時建立。理由：0.8 在金鑰遺失時自動建立新金鑰，在單機上只是「舊的密文解不開」；在叢集中會讓節點之間在無聲無息中分岔，而且新金鑰寫入的資料其他節點讀不了。
 
@@ -842,7 +843,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
   - 階段 A 的備援節點接手時必須能簽發；
   - 8444 的自動核准與過期續簽、8443 的 `renew_request` 都是同步簽發，受 5 秒處理時限約束，轉送到 leader 會增加延遲與失敗模式；
   - 金鑰的保護等級不變（每個節點都是 0600、擁有者 `kairos`、PKI.md 第 3 節的權限檢查照舊），只是份數變多。
-- `kairos pki issuing-ca new` 在任一節點執行，產生的私鑰檔要以 `kairos cluster keys export`／`import` 分發到其他節點，之後才能 `install` 與 `activate`。`activate` 前檢查所有線上節點都回報有這把金鑰（`cluster_nodes.info` 中的金鑰指紋清單）；不齊時拒絕並列出缺少的節點（`KRS-E8404`），可以 `--force` 略過（例如節點已確定要移除）。
+- `kairos pki issuing-ca new` 在任一節點執行，產生的私鑰檔要以 `kairos cluster keys export`／`import` 分發到其他節點，之後才能 `install` 與 `activate`。`activate` 前檢查所有線上節點都回報有這把金鑰（`cluster_nodes.info` 中的金鑰指紋清單）；不齊時拒絕並列出缺少的節點（`KRS-E8504`），可以 `--force` 略過（例如節點已確定要移除）。
 - 離線簽發模式（`pki.mode = "offline"`）不受影響：沒有線上私鑰。
 - 之後可考慮的替代方案（不在本規格）：
   - 私鑰以 KEK 加密存在資料庫，KEK 由 systemd `LoadCredentialEncrypted=` 或 TPM 提供；
@@ -853,7 +854,7 @@ srv = ""                               # 例 "_kairos-agent._tcp.example.com"
 - CRL 只由 leader 產生（D5），寫入 `pki_crls` 並遞增 `cluster_revs.pki`。
 - **每個節點**的 `sync_pki`（每 2 秒，或收到 `NOTIFY` 時）從資料庫讀出目前的信任錨與 CRL，內容不同時寫出本機的 `data/pki/issuing-cas.pem`、`crl/issuing.crl`、`issuing-cas-retired.pem`，並觸發本機的 TLS 重載（既有的 `reload::trigger()`）。重載後照常重新驗證所有現役連線，被撤銷的連線收到 `certificate_rejected`。
 - 撤銷生效到所有節點拒絕的延遲：leader 產生 CRL（≤ 2 秒）＋各節點寫出並重載（≤ 2 秒），合計約 4 秒（0.8 單機約 2 秒）。
-- CRL 過期的保護不變：fail closed（`KRS-E1203`）。leader 長時間不存在時 CRL 不會更新，`nextUpdate` 剩 7 天起照常 `KRS-W1201`；系統健康的 `cluster` 項目另外顯示「沒有 leader」（`KRS-E8403`）。
+- CRL 過期的保護不變：fail closed（`KRS-E1203`）。leader 長時間不存在時 CRL 不會更新，`nextUpdate` 剩 7 天起照常 `KRS-W1201`；系統健康的 `cluster` 項目另外顯示「沒有 leader」（`KRS-E8503`）。
 
 ### 11.4 金鑰的分發工具
 
@@ -918,8 +919,8 @@ audit_append(tx, event):                                 -- 與被記錄的變�
   | 情況 | 處理 |
   |---|---|
   | 上一個 leader 是自己、或沒有叢集（單機） | 與 0.8 相同：「Kairos 已重新啟動」，停機超過 5 分鐘另開「停機 N 分鐘」 |
-  | 上一個 leader 是另一個節點，且心跳在 `lease_ttl_secs + 60 秒` 內 | **換手**：記一則資訊事件「叢集的 leader 已由 kairos-a 切換到 kairos-b」（`KRS-I8401`）。上一個 leader 不是 `clean` 時為警告。不開「停機」事件 |
-  | 上一個 leader 是另一個節點，且心跳更舊 | 「叢集沒有 leader 達 N 分鐘」：嚴重，直接為已恢復、需要確認（取代「停機 N 分鐘」；`KRS-E8403`）。期間 agent 連線仍可能正常（階段 B），但告警、彙總、CRL 暫停 |
+  | 上一個 leader 是另一個節點，且心跳在 `lease_ttl_secs + 60 秒` 內 | **換手**：記一則資訊事件「叢集的 leader 已由 kairos-a 切換到 kairos-b」（`KRS-I8501`）。上一個 leader 不是 `clean` 時為警告。不開「停機」事件 |
+  | 上一個 leader 是另一個節點，且心跳更舊 | 「叢集沒有 leader 達 N 分鐘」：嚴重，直接為已恢復、需要確認（取代「停機 N 分鐘」；`KRS-E8503`）。期間 agent 連線仍可能正常（階段 B），但告警、彙總、CRL 暫停 |
 - **暖機期**：
   - **階段 A 的換手**：所有 agent 都要重連，等同重新啟動，**照常套用暖機期**（`alerts.warmup_secs`）。
   - **階段 B 的換手**：agent 連線不受影響，**不套用暖機期**（`expected` 主機清單取自 `host_presence`，而不是上一次的心跳）。
@@ -941,9 +942,9 @@ audit_append(tx, event):                                 -- 與被記錄的變�
 
   | 規則 | 嚴重度 | 代碼 |
   |---|---|---|
-  | `sys.cluster_node_lost` 叢集節點失聯 | 警告 | `KRS-W8406` |
-  | `sys.cluster_keys_mismatch` 節點的金鑰與叢集不一致 | 嚴重 | `KRS-E8404` |
-  | `sys.cluster_config_drift` 節點的設定不一致 | 警告 | `KRS-W8405` |
+  | `sys.cluster_node_lost` 叢集節點失聯 | 警告 | `KRS-W8506` |
+  | `sys.cluster_keys_mismatch` 節點的金鑰與叢集不一致 | 嚴重 | `KRS-E8504` |
+  | `sys.cluster_config_drift` 節點的設定不一致 | 警告 | `KRS-W8505` |
   | `sys.db_async_replication` 資料庫沒有同步複寫 | 規劃提醒 | `KRS-W4403` |
   | `sys.cluster_clock_skew` 節點與資料庫的時差過大 | 警告 | `KRS-W8305` |
 
@@ -985,15 +986,15 @@ audit_append(tx, event):                                 -- 與被記錄的變�
 
   | 狀態 | 條件 |
   |---|---|
-  | 警告 | 有節點失聯（`KRS-W8406`）、設定不一致（`KRS-W8405`）、沒有同步複寫（`KRS-W4403`）、時差過大（`KRS-W8305`）、只有一個節點（沒有備援） |
-  | 嚴重 | 沒有 leader（`KRS-E8403`）、有節點的金鑰不一致（`KRS-E8404`） |
+  | 警告 | 有節點失聯（`KRS-W8506`）、設定不一致（`KRS-W8505`）、沒有同步複寫（`KRS-W4403`）、時差過大（`KRS-W8305`）、只有一個節點（沒有備援） |
+  | 嚴重 | 沒有 leader（`KRS-E8503`）、有節點的金鑰不一致（`KRS-E8504`） |
 
 其他項目（`connections`、`report_writes`、`tls`、`listeners`、`file_descriptors`）是**回應請求的節點**的值，`values` 另帶 `node_id`。B1 的主控台在 leader 上，這些值是 leader 自己的；其他節點的值由 `nodes[].info` 摘要提供。
 
 ### 14.3 `GET /api/v1/cluster` 與 CLI
 
 - **`GET /api/v1/cluster`**（`settings:read`）：同上的 `values`，另加每個節點的監聽位址與最近的錯誤。
-- **`POST /api/v1/cluster/nodes/{node_id}/drain`**、**`POST /api/v1/cluster/step-down`**：需要新權限 `cluster:write`（只有管理員），寫稽核（類別 `cluster`）。
+- **`POST /api/v1/cluster/nodes/{node_id}/drain`**、**`POST /api/v1/cluster/step-down`**：需要新權限 `cluster:write`（只有管理員），寫稽核（類別 `cluster`，動作 `cluster.drain`、`cluster.step_down`；設計包 §31.4）。
 - **CLI**：
 
   | 命令 | 用途 |
@@ -1026,7 +1027,7 @@ Prometheus 以 `instance` 區分節點；`kairos_agents_online` 等既有的計�
 ### 14.5 日誌
 
 - 每一行加 `node`（文字格式在主機名稱之後；JSON 格式為 `node_id` 欄位），只在叢集模式下輸出。
-- 新事件：`cluster.leader_acquired`（`KRS-I8401`）、`cluster.leader_lost`（`KRS-W8402`）、`cluster.node_lost`（`KRS-W8406`）、`cluster.kick`、`cluster.drain`。
+- 新事件：`cluster.leader_acquired`（`KRS-I8501`）、`cluster.leader_lost`（`KRS-W8502`）、`cluster.node_lost`（`KRS-W8506`）、`cluster.kick`、`cluster.drain`。
 
 ## 15. 設定
 
@@ -1077,7 +1078,7 @@ proxy_protocol_from = []        # 信任的 LB 位址（CIDR）；來自這些�
   - 所有 `*.listen`、`observability.listen`；
   - `storage.data_dir`、`log.*`；
   - 各憑證與私鑰的路徑（`*.cert_path`、`*.key_path`、`storage.postgres.ca_file`、`password_file`）。
-- 節點啟動時計算其餘設定的正規化雜湊（`config_hash`），寫入 `cluster_nodes`。與 leader 不同時記 `KRS-W8405`（警告，不拒絕；滾動修改設定的期間本來就會不一致），系統健康顯示哪些節點不同。
+- 節點啟動時計算其餘設定的正規化雜湊（`config_hash`），寫入 `cluster_nodes`。與 leader 不同時記 `KRS-W8505`（警告，不拒絕；滾動修改設定的期間本來就會不一致），系統健康顯示哪些節點不同。
 - `kairos config show --effective` 多一欄顯示這個鍵是否屬於節點本機。
 
 ## 16. 升級路徑、備份與還原
@@ -1170,9 +1171,9 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 | F8 | 節點之間的網路中斷，但都連得到資料庫 | 沒有影響（資料庫是唯一的仲裁者） | 沒有影響 | — |
 | F9 | 腦裂嘗試：舊 leader 暫停（GC、虛擬機凍結）超過 TTL 後恢復 | 舊 leader 恢復後的第一個 leader 專屬交易因 fencing 失敗，隨即自我降級並結束。凍結前已接受、尚未關閉的 agent 連線寫入的 report 照常保存（durable 去重），不影響正確性 | 舊 leader 的 leader 專屬交易失敗並降級；它的 agent 連線不受影響 | 不重複、不覆寫 |
 | F10 | 節點的時鐘偏差 | 租約用資料庫的時間，不受影響；偏差超過 2 秒記 `KRS-W8305`。資料的 `last_seen`、`received_at` 用節點時間，偏差會反映在主控台上 | 同左；`host_presence.last_seen` 由各節點寫入，偏差大時離線判斷可能提早或延後（leader 判斷節點失聯用的是資料庫時間） | — |
-| F11 | 新節點的金鑰不一致或缺少 | 該節點 `/readyz` 503（`keys: mismatch`）、不參與選舉、記 `KRS-E8404`；系統健康嚴重 | 同左，不接受連線 | 不產生無法解開的資料 |
-| F12 | 節點的設定不一致 | 記 `KRS-W8405`；照常運作 | 同左 | — |
-| F13 | 兩台主機誤用同一個 `node_id` | 後啟動的拒絕啟動（`KRS-E8403`） | 同左 | — |
+| F11 | 新節點的金鑰不一致或缺少 | 該節點 `/readyz` 503（`keys: mismatch`）、不參與選舉、記 `KRS-E8504`；系統健康嚴重 | 同左，不接受連線 | 不產生無法解開的資料 |
+| F12 | 節點的設定不一致 | 記 `KRS-W8505`；照常運作 | 同左 | — |
+| F13 | 兩台主機誤用同一個 `node_id` | 後啟動的拒絕啟動（`KRS-E8503`） | 同左 | — |
 | F14 | 滾動升級、排空（drain） | 排空備援：沒有影響。排空 leader：先 step-down，備援接手（等同 F1，但沒有等待 TTL，約 5～10 秒） | 被排空的節點停止接受新連線、`/readyz` 503，對協商了 `cluster` 的 Pulse 分批送 `drain`（第 18.2 節），其他 Pulse 在 60 秒內分批關閉連線 | 不遺失 |
 | F15 | 在任一節點上執行 CLI（`kairos enroll approve`、`alerts ack` 等） | CLI 直接連資料庫，與節點的角色無關；`alerts ack` 等經 `alert_actions` 交給 leader | 同左 | 稽核鏈經 head 列鎖序列化 |
 | F16 | 所有節點都停止 | Pulse 緩衝資料；恢復後補送 | 同左 | 在緩衝範圍內不遺失 |
@@ -1208,7 +1209,7 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 3. 送出 TLS close_notify 並關閉連線；
 4. 依延遲重連，從候選清單中**目前位址的下一個**開始（只有一個位址時就是同一個，由 LB 導向其他節點）。
 
-這次斷線不算失敗、不增加退避、不重置「連續被 `superseded`」以外的計數，記 `PLS-I8407`（暫定，資訊）。
+這次斷線不算失敗、不增加退避、不重置「連續被 `superseded`」以外的計數，記 `PLS-I8507`（資訊）。
 
 **Kairos 端**：
 
@@ -1217,9 +1218,9 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 3. 對已連線的 agent 分批送 `drain`：協商了 `cluster` 的送 `drain`，其他的直接關閉連線（原因 `server_shutdown`，舊版 Pulse 依退避重連，最初的延遲約 2 秒加上隨機分散）；
 4. 所有連線都關閉後節點回報 `drained`，可以安全停止。
 
-記 `KRS-I8407`（暫定）。
+記 `KRS-I8507`。
 
-**0.9.0 的實作（單機）**：還沒有 `kairos cluster drain`；Kairos 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reason`＝`node_draining`，`reconnect_within_ms`＝`max(10000, 線上連線數 × 5)`）再 `close_notify`，其他連線照舊直接關閉，關機日誌記 `KRS-I8407`。
+**0.9.0 的實作（單機）**：還沒有 `kairos cluster drain`；Kairos 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reason`＝`node_draining`，`reconnect_within_ms`＝`max(10000, 線上連線數 × 5)`）再 `close_notify`，其他連線照舊直接關閉，關機日誌記 `KRS-I8507`。
 
 **沒有協商 `cluster` 時**，Kairos 不送 `drain`。舊版 Pulse 收到不認得的 `type` 只會記 DEBUG 並忽略（第 2.4 節），所以即使誤送也不會壞，但規格上不送。
 
@@ -1230,37 +1231,37 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 - `hello_ack.offline_after_ms` 的計算不變。
 - 8444 的協定（ENROLL.md）不變。`server-info` 的 `features` **0.9.0 暫不加入** `cluster`（8444 還不跟著候選清單走，第 8.6 節）；0.10.0 再與 `hello_ack.features` 對齊。
 
-## 19. 暫定錯誤代碼
+## 19. 錯誤代碼
 
-依 `copywriting.md` §3.1 的格式（數字本身唯一、鏡像同號）。下表的號碼都是**暫定**，正式分配由設計包負責（第 22 節）。
+依 `copywriting.md` §3.1 的格式（數字本身唯一、鏡像同號）。**設計包 `decisions/INTEGRATION.md` §31.3（2026-10-19）已正式分配**：子類別 84 給 F8 遠端升級，本文件原暫定的 84xx 改為 **85xx（同尾號）**；`PLS-E2303` 改為 `PLS-W2303`（號碼不變）；其餘照原號。下表已是正式代碼。0.9.0 實作的只有 `PLS-W2301`、`PLS-E2302` 與 `KRS-I8507`／`PLS-I8507`（L4），其餘在 0.10.0。
 
 選號時核對過 `copywriting.md` §3.3 的總表（2026-10-16，0.8.0）：子類別 23、44、84 完全沒有使用；2206、8305 未使用。衝刺 8 的其他規格線（`sprint8/export`、`sprint8/privacy`、`sprint8/remote-mgmt-spec`）在核對時尚未新增代碼，**合併前需要再核對一次**。
 
-新增子類別（建議寫入 §3.2）：
+新增子類別（已寫入 `copywriting.md` §3.2）：
 
 - **23**：多伺服器位址與叢集連線（類別 2 連線與協定）；
 - **44**：外部資料庫與資料遷移（類別 4 儲存與資料）；
-- **84**：叢集與高可用（類別 8 平台與服務）。
+- **85**：叢集與高可用（類別 8 平台與服務；原暫定 84，84 已分配給 F8 遠端升級）。
 
 | 號碼 | Kairos | Pulse | 兩端 | 情況 | 處理方式（摘要） |
 |---|---|---|---|---|---|
 | 2206 | `KRS-W2206` | | | PROXY protocol 標頭不合法：信任的 LB 位址沒有送標頭，或不在 `proxy_protocol_from` 的來源送了標頭；連線已關閉（節流記錄） | 檢查 LB 的 `send-proxy-v2` 與 `proxy_protocol_from` |
 | 2301 | | `PLS-W2301` | | 目前的伺服器位址無法連線，已改試下一個候選位址 | 檢查該節點或位址；其他位址可用時服務不中斷 |
 | 2302 | | `PLS-E2302` | | 所有候選位址（含 SRV 解析出的位址）都無法連線，依退避重試；每個位址最後的錯誤列在詳細資訊中 | 依各位址的錯誤處理（`PLS-E2002`～`E2004` 等） |
-| 2303 | | `PLS-E2303` | | DNS SRV 查詢失敗或沒有紀錄，改用 `server.address` 與 `fallback_addresses` | 檢查 DNS 的 SRV 紀錄或 `server.srv` 的拼寫 |
+| 2303 | | `PLS-W2303` | | DNS SRV 查詢失敗或沒有紀錄，改用 `server.address` 與 `fallback_addresses` | 檢查 DNS 的 SRV 紀錄或 `server.srv` 的拼寫 |
 | 4401 | `KRS-E4401` | | | 無法連線到 PostgreSQL（啟動時：拒絕啟動，結束代碼 3；執行中：report 回 `storage_unavailable`、`/readyz` 503，持續重試） | 檢查網路、`storage.postgres`、密碼檔、TLS |
 | 4402 | `KRS-E4402` | | | PostgreSQL 不符合要求：版本低於 14、編碼不是 UTF8、權限不足、TLS 設定不安全、schema 被其他程式使用 | 依訊息修正資料庫或設定 |
 | 4403 | `KRS-W4403` | | | PostgreSQL 沒有同步複寫（`synchronous_commit` 不是 on，或沒有同步備庫）：主庫故障時可能遺失已確認的資料 | 設定同步備庫，或接受這個風險 |
 | 4404 | `KRS-E4404` | | | 資料搬移（`kairos db migrate`）失敗或驗證不一致；目的端不可使用 | 依訊息修正後以 `--restart` 重新執行 |
 | 4405 | `KRS-E4405` | | | 資料庫的 schema 比這個 Kairos 新（叢集中已有較新的版本升級了資料庫）：拒絕啟動 | 把這個節點升級到相同的版本 |
 | 8305 | `KRS-W8305` | | | 節點的時鐘與資料庫的時鐘相差超過 2 秒 | 設定 NTP（chrony）；租約不受影響，但時間戳記會偏差 |
-| 8401 | `KRS-I8401` | | | 本節點取得 leader 租約（階段 A：開始接受連線）；換手時另記上一個 leader | 資訊 |
-| 8402 | `KRS-W8402` | | | 本節點失去 leader 租約（續約失敗或已被其他節點取得），停止單一寫入者的工作（階段 A：結束行程，由 systemd 重新啟動為備援） | 檢查與資料庫的連線；頻繁發生時調高 `lease_ttl_secs` |
-| 8403 | `KRS-E8403` | | | 叢集的協調異常：沒有任何節點持有 leader 租約超過 60 秒（告警、彙總、保留、CRL 暫停）；或 `node_id` 與另一個執行中的節點重複（拒絕啟動） | 依訊息：恢復資料庫連線、啟動節點，或修正 `node_id` |
-| 8404 | `KRS-E8404` | | | 本節點的金鑰與叢集不一致或缺少（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、簽發 CA 私鑰）：不進入就緒、不參與 leader 選舉、不自動建立金鑰 | 以 `kairos cluster keys import` 匯入叢集的金鑰 |
-| 8405 | `KRS-W8405` | | | 叢集節點的設定不一致（需要一致的設定雜湊不同） | 比對 `kairos config show --effective`，統一設定 |
-| 8406 | `KRS-W8406` | | | 叢集節點失聯（心跳逾時）；它服務的主機已標為離線（`server_lost`），等待重連到其他節點 | 檢查該節點 |
-| 8407 | `KRS-I8407` | `PLS-I8407` | 鏡像 | 節點正在排空：Kairos 要求已連線的 agent 改連其他節點；Pulse 收到後依指定的延遲重連（不算失敗） | 資訊 |
+| 8501 | `KRS-I8501` | | | 本節點取得 leader 租約（階段 A：開始接受連線）；換手時另記上一個 leader | 資訊 |
+| 8502 | `KRS-W8502` | | | 本節點失去 leader 租約（續約失敗或已被其他節點取得），停止單一寫入者的工作（階段 A：結束行程，由 systemd 重新啟動為備援） | 檢查與資料庫的連線；頻繁發生時調高 `lease_ttl_secs` |
+| 8503 | `KRS-E8503` | | | 叢集的協調異常：沒有任何節點持有 leader 租約超過 60 秒（告警、彙總、保留、CRL 暫停）；或 `node_id` 與另一個執行中的節點重複（拒絕啟動） | 依訊息：恢復資料庫連線、啟動節點，或修正 `node_id` |
+| 8504 | `KRS-E8504` | | | 本節點的金鑰與叢集不一致或缺少（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`、簽發 CA 私鑰）：不進入就緒、不參與 leader 選舉、不自動建立金鑰 | 以 `kairos cluster keys import` 匯入叢集的金鑰 |
+| 8505 | `KRS-W8505` | | | 叢集節點的設定不一致（需要一致的設定雜湊不同） | 比對 `kairos config show --effective`，統一設定 |
+| 8506 | `KRS-W8506` | | | 叢集節點失聯（心跳逾時）；它服務的主機已標為離線（`server_lost`），等待重連到其他節點 | 檢查該節點 |
+| 8507 | `KRS-I8507` | `PLS-I8507` | 鏡像 | 節點正在排空：Kairos 要求已連線的 agent 改連其他節點；Pulse 收到後依指定的延遲重連（不算失敗） | 資訊 |
 
 **沿用的既有代碼**：
 
@@ -1340,10 +1341,12 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 
 ## 22. 設計包待辦（本線沒有修改 `design/`）
 
+> 設計包 `decisions/INTEGRATION.md` §31（2026-10-19）已處理本節：代碼正式分配（子類別改 85，第 19 節）、`server_lost`、SSE `resync`、Pulse 的 `pulse status` 寫法與日誌事件（2005～2008）定案，叢集畫面與 S20 `cluster` 項目先給設計、標 0.10；`naming.md` 留到 0.10。以下保留原始清單供對照。
+
 1. **`copywriting.md` §3.2、§3.3**：
    - 新增子類別 23、44、84；
    - 正式分配第 19 節的 18 個代碼（Kairos 14、Pulse 4，其中 `8407` 為鏡像）；
-   - 補 §4.2 的三段式範例（至少 `KRS-E4401`、`KRS-W4403`、`KRS-E8404`、`KRS-W8406`、`PLS-W2301`、`PLS-E2302`）；
+   - 補 §4.2 的三段式範例（至少 `KRS-E4401`、`KRS-W4403`、`KRS-E8504`、`KRS-W8506`、`PLS-W2301`、`PLS-E2302`）；
    - `prototype/kairos/error-codes.js` 以 `tools/sync-error-codes.js` 重新產生。
 2. **`kairos/screens.md` S20（系統健康）**：新增 `cluster` 項目的呈現（節點表、leader、資料庫的同步複寫、時差），以及「回應的節點」標示。
 3. **新畫面或 S21 的分頁「叢集」**：
@@ -1360,7 +1363,7 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 8. **Pulse**：
    - `pulse status` 的「已連線」列顯示節點與候選位址；
    - 所有位址都失敗時的詳細資訊排版（`pulse/` 的 status 規格）；
-   - `PLS-I8407` 的日誌文案。
+   - `PLS-I8507` 的日誌文案。
 9. **`naming.md`**：`node_id`、`cluster_id` 的命名規則與顯示方式；「leader」「備援」「排空」的台灣用語（建議：leader＝「主節點」、standby＝「備援節點」、drain＝「排空」）。
 
 ## 23. 測試計畫（摘要）

@@ -29,7 +29,7 @@ use std::path::Path;
 /// 假名化的金鑰檔（32 bytes，0600；在資料目錄中，不在資料庫中）
 pub const KEY_FILE: &str = "privacy.key";
 
-/// 要求假名化但金鑰檔無法建立或讀取（Kairos 不啟動；〔暫定〕代碼，待設計包分配）
+/// 要求假名化但金鑰檔無法建立或讀取（Kairos 不啟動）
 pub const CODE_KEY_UNAVAILABLE: &str = "KRS-E4005";
 
 /// 假名的雜湊長度（base32 字元；60 位元，1 萬台主機的碰撞機率約 4×10⁻¹¹）

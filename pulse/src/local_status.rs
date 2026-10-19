@@ -366,7 +366,7 @@ impl State {
         self.retry = None;
     }
 
-    /// Kairos 要求改連其他節點（`drain`，PLS-I8407）：中斷開始，但不算連線失敗（連續失敗次數不變）
+    /// Kairos 要求改連其他節點（`drain`，PLS-I8507）：中斷開始，但不算連線失敗（連續失敗次數不變）
     pub fn drained(&mut self, retry_in: Duration) {
         crate::metrics::global().connection_reset();
         let now = Utc::now();

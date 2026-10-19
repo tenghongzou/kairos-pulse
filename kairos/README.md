@@ -455,7 +455,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `export.otlp.headers_file`、`ca_file`、`client_cert`、`client_key` | `KAIROS__EXPORT__OTLP__HEADERS_FILE` 等 | `""` | 自訂 HTTP 標頭檔（`名稱: 值`；主控台輸入的標頭優先）、私有 CA、mTLS 的用戶端憑證 |
 | `export.otlp.timeout_secs`、`max_batch_points`、`queue_max_points`、`drop_policy`、`max_retries`、`resource_attributes` | `KAIROS__EXPORT__OTLP__…` | `10`、`8192`、`500000`、`oldest`、`5`、`[]` | 逾時、批次、佇列上限與丟棄策略（`KRS-W4313`）、重試次數、額外的 resource 屬性（`名稱=值`） |
 | `privacy.store_peer_ip` | `KAIROS__PRIVACY__STORE_PEER_IP` | `full` | （0.9.0〔草稿〕）保存的來源位址：`full`（`ip:port`）、`truncate`（IPv4 /24、IPv6 /48，不含埠）、`none`（不保存）。影響清冊、`agents.json`、JSONL、主控台；日誌與稽核不受影響（[PRIVACY.md](PRIVACY.md)） |
-| `privacy.hostname` | `KAIROS__PRIVACY__HOSTNAME` | `keep` | `pseudonymize`：主機名稱與顯示名稱以 `data/privacy.key` 的 HMAC 換成 `host-…`／`name-…`（不可逆；`kairos hosts pseudonym` 查詢）。金鑰無法使用時拒絕啟動（〔暫定〕`KRS-E4005`） |
+| `privacy.hostname` | `KAIROS__PRIVACY__HOSTNAME` | `keep` | `pseudonymize`：主機名稱與顯示名稱以 `data/privacy.key` 的 HMAC 換成 `host-…`／`name-…`（不可逆；`kairos hosts pseudonym` 查詢）。金鑰無法使用時拒絕啟動（`KRS-E4005`） |
 | `privacy.process_command` | `KAIROS__PRIVACY__PROCESS_COMMAND` | `redact` | 行程排行的命令列：`keep`、`redact`（遮蔽密碼、token、帶帳密的網址）、`drop` |
 | `privacy.process_user` | `KAIROS__PRIVACY__PROCESS_USER` | `keep` | 行程的執行身分：`keep`、`pseudonymize`、`drop` |
 | `privacy.inventory_network` | `KAIROS__PRIVACY__INVENTORY_NETWORK` | `keep` | 資產的網路介面：`keep`、`truncate`（位址截到 /24、/48，MAC 只留廠商碼）、`drop` |
@@ -931,7 +931,7 @@ writer 每批寫入前都會檢查目前的 `reports-YYYY-MM-DD.jsonl` 路徑是
 在主控台按 Ctrl+C（或 Ctrl+Break、關閉主控台視窗、系統關機；非 Windows 為 SIGINT／SIGTERM）時，Kairos 依序：
 
 1. 停止接受新連線並關閉監聽 socket
-2. 對每條連線送出 `close_notify` 後結束（送出後最多再讀取丟棄對方資料 200 ms），連線上的 agent 照常標記為離線；最晚到**訊號後 2.0 秒**，逾時的連線直接中止並標記為離線（收尾期限已過時不再送 `close_notify`，直接釋放連線）。0.9.0 起，協商了 feature `cluster` 的連線（Pulse 0.9 以上）在 `close_notify` 之前先收到排空訊息 `drain`（`reconnect_within_ms` 為 `max(10000, 線上連線數 × 5)`），Pulse 在這段時間內的隨機延遲後改連下一個候選位址（設定了 `server.fallback_addresses` 時）或重連同一個位址，避免所有 agent 同時湧入；關機日誌另記一行 `資訊 KRS-I8407（暫定）：已對 N 條協商了 cluster 的連線送出 drain`。其他連線與 0.8 相同
+2. 對每條連線送出 `close_notify` 後結束（送出後最多再讀取丟棄對方資料 200 ms），連線上的 agent 照常標記為離線；最晚到**訊號後 2.0 秒**，逾時的連線直接中止並標記為離線（收尾期限已過時不再送 `close_notify`，直接釋放連線）。0.9.0 起，協商了 feature `cluster` 的連線（Pulse 0.9 以上）在 `close_notify` 之前先收到排空訊息 `drain`（`reconnect_within_ms` 為 `max(10000, 線上連線數 × 5)`），Pulse 在這段時間內的隨機延遲後改連下一個候選位址（設定了 `server.fallback_addresses` 時）或重連同一個位址，避免所有 agent 同時湧入；關機日誌另記一行 `資訊 KRS-I8507：已對 N 條協商了 cluster 的連線送出 drain`。其他連線與 0.8 相同
 3. 把寫檔佇列中剩餘的 report 寫完並 flush、逐筆回覆結果（連線已關閉的回覆直接忽略；被中止的連線已送出的 report 仍會寫入，只是 agent 收不到 `ack`），最晚到訊號後 2.5 秒
 4. 寫出最後一次 `agents.json`（此時所有 agent 都是 `online: false`），最晚到訊號後 3.0 秒
 5. 以結束代碼 0 結束，最後一行日誌附上關機總耗時

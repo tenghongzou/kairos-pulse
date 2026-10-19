@@ -21,7 +21,7 @@
 ### 與其他開發線的協調
 
 - **schema 號碼**：本文件的資料表寫成 **schema v9 草案**。衝刺 8 另有 A2 HA（`kairos/HA.md`）、匯出、隱私三條線，可能也要新的 schema 版本。整合時由先合併的一方取 v9，另一方順延；本文件的遷移只**新增資料表與欄位**、不修改既有資料表的唯一鍵，不依賴其他線的物件，可依 v5／v6 的前例（`kairos/STORAGE.md` 第 3.2 節：版本號不必連續）接在任何一方之後。HA 若改用外部資料庫，本文件的資料表一併遷移，沒有只能在 SQLite 上成立的假設（除了「單一寫入者」的推送引擎，見第 4.7.6 節）。
-- **錯誤代碼**：本文件暫定使用**新的子類別 05（集中設定）與 84（遠端升級）**，以及 61 的 `6106`（第 11 節）。其他線若也需要新子類別，整合前在設計包一次分配，避免撞號。
+- **錯誤代碼**：本文件使用**新的子類別 05（集中設定）與 84（遠端升級）**（設計包 §31.3 已正式分配，號碼不變；HA 原暫定的 84xx 改為 85xx），以及 61 的 `6106`（第 11 節）。其他線若也需要新子類別，整合前在設計包一次分配，避免撞號。
 - **隱私線**：`processes.command`、`inventory.hardware_serials`、`inventory.network_addresses` 屬於隱私敏感的採集設定，第 3.1 節規定「下發只能更保守」；隱私線若改變這幾個設定的語意或預設值，第 3.1 節的表要同步。
 
 ## 1. 總覽
@@ -516,7 +516,7 @@ stateDiagram-v2
 - 狀態持久化在 `<狀態目錄>/upgrade/state.json`（Pulse 寫）與 `/var/lib/pulse-upgrade/<id>/state.json`（輔助程式寫；Windows 同一個目錄）。Pulse 重新啟動後依狀態檔接續：下載中 → 續傳；已暫存 → 等待時段；替換中以後 → 讀 `result.json`、回報。
 - 同一時間只處理一個升級。升級進行中收到新的 `config` 時先套用設定（不影響升級）；升級的「交付」等到設定的確認期結束。
 - 暫存需要的空間：`3 × artifact.size + 64 MiB`（發佈檔、回滾檔、解開的執行檔），不足時 `declined`（`PLS-W8412`）。
-- 日誌事件（名稱暫定，識別碼待設計包分配，第 15 節）：`upgrade.offered`、`upgrade.declined`、`upgrade.downloaded`、`upgrade.verify_failed`、`upgrade.applying`、`upgrade.completed`、`upgrade.rolled_back`、`upgrade.rollback_failed`。
+- 日誌事件（識別碼依設計包 `pulse/log-ux.md` §4.6：集中設定 6000～6005、遠端升級 6100～6110，第 15 節）：`upgrade.offered`、`upgrade.declined`、`upgrade.downloaded`、`upgrade.verify_failed`、`upgrade.applying`、`upgrade.completed`、`upgrade.rolled_back`、`upgrade.rollback_failed`。
 
 ### 4.7 分批推送（rollout）
 
@@ -952,9 +952,9 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 `config.applied`、`config.rejected`、`config.rolled_back`、`config.overridden`、`upgrade.offered`、`upgrade.declined`、`upgrade.downloaded`、`upgrade.verify_failed`、`upgrade.applying`、`upgrade.completed`、`upgrade.rolled_back`、`upgrade.rollback_failed`。名稱與識別碼待設計包（`pulse/log-ux.md` §4）分配；建議 6000～6019（設定）、6100～6129（升級）。輔助程式的日誌寫 journal（Linux）與 `<暫存>/upgrade.log`，`pulse diag` 收集。
 
-## 11. 錯誤代碼（暫定）
+## 11. 錯誤代碼
 
-> 全部**暫定**，待設計包 `copywriting.md` §3.3 分配。需要新增兩個子類別：**05 集中設定**（類別 0「啟動、設定、命令列」目前只用到 00～04）、**84 遠端升級**（類別 8「平台與服務」目前只用到 80～83）。已核對 `copywriting.md` §3.3 總表、`pulse/ERROR-CODES.md` 與 `kairos/web/assets/js/core/error-codes.js`，05xx、84xx、`6106` 都沒有使用。
+> 設計包 `decisions/INTEGRATION.md` §31.3（2026-10-19）已正式分配，**號碼全部不變**（`KRS-E6106` 為 0.10，雙人覆核）；原文：全部暫定，待設計包 `copywriting.md` §3.3 分配。需要新增兩個子類別：**05 集中設定**（類別 0「啟動、設定、命令列」目前只用到 00～04）、**84 遠端升級**（類別 8「平台與服務」目前只用到 80～83）。已核對 `copywriting.md` §3.3 總表、`pulse/ERROR-CODES.md` 與 `kairos/web/assets/js/core/error-codes.js`，05xx、84xx、`6106` 都沒有使用。
 
 | 號碼 | Kairos | Pulse | 兩端 | 情況 |
 |---|---|---|---|---|
