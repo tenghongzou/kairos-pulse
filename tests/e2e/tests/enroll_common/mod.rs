@@ -10,7 +10,7 @@ use kairos_proto::enroll::{
     EnrollRequest, GraceRenewRequest, ServerVerification, b64url_encode, format_rfc3339_ms,
 };
 use kairos_proto::{ClientMsg, Deregister};
-use kp_e2e::{Proc, TestDir, WAIT, free_port, poll_until, run_to_exit};
+use kp_e2e::{Proc, TestDir, WAIT, free_port, poll_until, run_to_exit, start_kairos};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -132,15 +132,9 @@ pub struct Env {
     pub envs: Vec<(String, String)>,
 }
 
+/// `n` 個不同的連接埠（[`free_port`] 在同一個測試行程內不會發出重複的埠；佔住到 [`Env::start`]）
 pub fn distinct_ports(n: usize) -> Vec<u16> {
-    let mut v: Vec<u16> = Vec::new();
-    while v.len() < n {
-        let p = free_port();
-        if !v.contains(&p) {
-            v.push(p);
-        }
-    }
-    v
+    (0..n).map(|_| free_port()).collect()
 }
 
 impl Env {
@@ -359,10 +353,13 @@ server_ca_path = "root.pem"
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let mut p = Proc::spawn("kairos", &self.dir, &["--config", "kairos.toml"], &envs);
-        p.wait_for(ENROLL_STARTED, WAIT);
-        p.wait_for(kp_e2e::KAIROS_STARTED, WAIT);
-        p
+        // 連接埠被佔用時重新啟動（kp_e2e::start_kairos）
+        start_kairos(
+            &self.dir,
+            &envs,
+            &[self.agent_port, self.enroll_port, self.console_port],
+            &[ENROLL_STARTED, kp_e2e::KAIROS_STARTED],
+        )
     }
 
     pub fn token(&self, approval: &str) -> String {
