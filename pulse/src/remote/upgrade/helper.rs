@@ -120,8 +120,11 @@ pub enum Cmd {
     RpmExtract { package: PathBuf, dir: PathBuf },
     /// `dpkg -i --force-confold <套件>`（`DEBIAN_FRONTEND=noninteractive`）
     DpkgInstall { package: PathBuf },
-    /// `rpm -U [--oldpackage] <套件>`
-    RpmInstall { package: PathBuf, oldpackage: bool },
+    /// `rpm -U --oldpackage --replacepkgs <套件>`：與 `dpkg -i` 一樣允許降版與重新安裝同一版。版本政策已由
+    /// 輔助程式依**實際的執行檔**判斷（REMOTE.md 第 4.8 節）；套件資料庫可能與執行檔不符（沒有回滾檔時
+    /// 以 `pulse.prev` 回滾，資料庫仍是失敗的那一版），不加這兩個選項的話，之後重試同一版或推送比它低的
+    /// 版本都會被 rpm 拒絕（「already installed」「newer … is already installed」）
+    RpmInstall { package: PathBuf },
     /// 以服務帳號執行解開的執行檔（`--version`、`check-config …`），工作目錄為安裝目錄
     RunAsService {
         program: PathBuf,
@@ -226,6 +229,9 @@ struct HelperState {
     unit_replaced: bool,
     /// 附在結果 `detail` 的說明（例如 `unit_not_updated`）
     notes: Vec<String>,
+    /// 回滾的原因（健康確認沒有通過的項目）：回滾中重新開機後接續時沿用，結果的 `detail` 才不會只剩 `resumed`
+    #[serde(default)]
+    rollback_reason: String,
     /// 最後的結果（`Done` 時）
     result: Option<UpgradeResult>,
 }
@@ -377,7 +383,12 @@ impl Helper<'_> {
                 }
                 Step::RollingBack => {
                     self.log.line("INFO", "接續上次中斷的回滾");
-                    return self.confirm_rollback(s, "resumed".to_string());
+                    let reason = if s.rollback_reason.is_empty() {
+                        "resumed".to_string()
+                    } else {
+                        format!("{}; resumed", s.rollback_reason)
+                    };
+                    return self.confirm_rollback(s, reason);
                 }
                 Step::Verified => {}
             }
@@ -696,6 +707,7 @@ impl Helper<'_> {
             health_timeout_secs: p.health_timeout.as_secs(),
             unit_replaced: false,
             notes: Vec::new(),
+            rollback_reason: String::new(),
             result: None,
         };
         self.save(&state);
@@ -712,7 +724,6 @@ impl Helper<'_> {
             }),
             _ => self.package(&Cmd::RpmInstall {
                 package: p.artifact.clone(),
-                oldpackage: false,
             }),
         };
         if let Err(e) = replaced {
@@ -858,6 +869,22 @@ impl Helper<'_> {
         let rollback_pkg = self.work.join("rollback.pkg");
         let restored: Result<(), String> = match self.req.method.as_str() {
             "deb" | "rpm" if rollback_pkg.is_file() => {
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "以回滾檔 {} 經套件管理員裝回 {}（{}）",
+                        self.req
+                            .rollback_artifact
+                            .as_deref()
+                            .unwrap_or("rollback.pkg"),
+                        self.req.from_version,
+                        if self.req.method == "deb" {
+                            "dpkg -i"
+                        } else {
+                            "rpm -U --oldpackage --replacepkgs"
+                        }
+                    ),
+                );
                 let cmd = if self.req.method == "deb" {
                     Cmd::DpkgInstall {
                         package: rollback_pkg.clone(),
@@ -865,7 +892,6 @@ impl Helper<'_> {
                 } else {
                     Cmd::RpmInstall {
                         package: rollback_pkg.clone(),
-                        oldpackage: true,
                     }
                 };
                 self.package(&cmd)
@@ -877,6 +903,19 @@ impl Helper<'_> {
                         self.req.target.version
                     ));
                 }
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "以替換前保留的 {} 換回 {}{}",
+                        prev.display(),
+                        self.req.from_version,
+                        if m == "tar" {
+                            ""
+                        } else {
+                            "（沒有可驗證的回滾檔，套件資料庫仍顯示新版）"
+                        }
+                    ),
+                );
                 let r = restore_executable(&prev, &current)
                     .map_err(|e| format!("無法換回 pulse.prev：{e}"));
                 if r.is_ok() && state.unit_replaced {
@@ -892,6 +931,7 @@ impl Helper<'_> {
             return self.rollback_failed(state, format!("{reason}; rollback: {e}"));
         }
         state.step = Step::RollingBack;
+        state.rollback_reason = reason.clone();
         state.n_restarts_before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
         state.restarted_unix = self.sys.now_unix();
         let timeout = Duration::from_secs(state.health_timeout_secs).max(MIN_ROLLBACK_TIMEOUT);
@@ -1252,46 +1292,12 @@ impl System for RealSystem {
                 c.arg("-x").arg(package).arg(dir);
                 run_command(c)
             }
-            Cmd::RpmExtract { package, dir } => {
-                let rpm2cpio =
-                    Command::new(first_existing(&["/usr/bin/rpm2cpio", "/bin/rpm2cpio"]))
-                        .arg(package)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn();
-                let mut child = match rpm2cpio {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Output {
-                            status: None,
-                            stdout: String::new(),
-                            stderr: e.to_string(),
-                        };
-                    }
-                };
-                let Some(stdout) = child.stdout.take() else {
-                    return Output::default();
-                };
-                let mut c = Command::new(first_existing(&["/usr/bin/cpio", "/bin/cpio"]));
-                c.args(["-idm", "--quiet", "--no-absolute-filenames"])
-                    .current_dir(dir)
-                    .stdin(stdout);
-                let o = c.output();
-                let _ = child.wait();
-                match o {
-                    Ok(o) => Output {
-                        status: o.status.code(),
-                        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-                    },
-                    Err(e) => Output {
-                        status: None,
-                        stdout: String::new(),
-                        stderr: e.to_string(),
-                    },
-                }
-            }
+            Cmd::RpmExtract { package, dir } => rpm_extract(
+                Path::new(first_existing(&["/usr/bin/rpm2cpio", "/bin/rpm2cpio"])),
+                package,
+                Path::new(first_existing(&["/usr/bin/cpio", "/bin/cpio"])),
+                dir,
+            ),
             Cmd::DpkgInstall { package } => {
                 let mut c = Command::new(first_existing(&["/usr/bin/dpkg", "/bin/dpkg"]));
                 c.env("DEBIAN_FRONTEND", "noninteractive")
@@ -1299,18 +1305,10 @@ impl System for RealSystem {
                     .arg(package);
                 run_command(c)
             }
-            Cmd::RpmInstall {
+            Cmd::RpmInstall { package } => run_command(rpm_install_command(
+                Path::new(first_existing(&["/usr/bin/rpm", "/bin/rpm"])),
                 package,
-                oldpackage,
-            } => {
-                let mut c = Command::new(first_existing(&["/usr/bin/rpm", "/bin/rpm"]));
-                c.arg("-U");
-                if *oldpackage {
-                    c.arg("--oldpackage");
-                }
-                c.arg(package);
-                run_command(c)
-            }
+            )),
             Cmd::RunAsService {
                 program,
                 args,
@@ -1342,6 +1340,83 @@ impl System for RealSystem {
                 run_command(c)
             }
         }
+    }
+}
+
+/// `rpm -U --oldpackage --replacepkgs <套件>`（[`Cmd::RpmInstall`]）
+fn rpm_install_command(rpm: &Path, package: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(rpm);
+    c.args(["-U", "--oldpackage", "--replacepkgs"]).arg(package);
+    c
+}
+
+/// `rpm2cpio <套件> | cpio -idm`（在 `dir` 中）：兩者都成功才算成功。
+///
+/// cpio 無法執行（例如沒有安裝：Rocky／RHEL 9 的最小安裝沒有 cpio）時，cpio 的 `Command` 仍握著管線的
+/// 讀取端，若在它被釋放前等待 rpm2cpio，rpm2cpio 寫滿管線（64 KiB）後就永遠卡住，輔助程式要到
+/// `TimeoutStartSec`（2.5 小時）才被 systemd 結束（tests/systemd 實測）。因此先釋放 cpio 的 `Command`、
+/// cpio 失敗時結束 rpm2cpio，再等待它
+fn rpm_extract(rpm2cpio: &Path, package: &Path, cpio: &Path, dir: &Path) -> Output {
+    use std::process::{Command, Stdio};
+    let spawned = Command::new(rpm2cpio)
+        .arg(package)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            return Output {
+                status: None,
+                stdout: String::new(),
+                stderr: format!("{}: {e}", rpm2cpio.display()),
+            };
+        }
+    };
+    let Some(pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Output::default();
+    };
+    let extracted = {
+        let mut c = Command::new(cpio);
+        c.args(["-idm", "--quiet", "--no-absolute-filenames"])
+            .current_dir(dir)
+            .stdin(pipe);
+        c.output()
+        // c（與管線的讀取端）在這裡釋放
+    };
+    let cpio_ok = matches!(&extracted, Ok(o) if o.status.success());
+    if !cpio_ok {
+        let _ = child.kill();
+    }
+    let rpm2cpio_err = child
+        .stderr
+        .take()
+        .map(|mut e| {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut e, &mut s);
+            s
+        })
+        .unwrap_or_default();
+    let rpm2cpio_status = child.wait().ok().and_then(|s| s.code());
+    match extracted {
+        Ok(o) if o.status.success() && rpm2cpio_status != Some(0) => Output {
+            status: rpm2cpio_status.or(Some(1)),
+            stdout: String::new(),
+            stderr: format!("rpm2cpio: {}", rpm2cpio_err.trim()),
+        },
+        Ok(o) => Output {
+            status: o.status.code(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        },
+        Err(e) => Output {
+            status: None,
+            stdout: String::new(),
+            stderr: format!("{}: {e}", cpio.display()),
+        },
     }
 }
 

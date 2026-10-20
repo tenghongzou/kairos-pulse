@@ -493,6 +493,17 @@ impl AppConfig {
         let mut builder =
             Config::builder().add_source(File::from_str(EMBEDDED_CONFIG, FileFormat::Toml));
         if let Some(path) = local_file {
+            // config 的 required(false) 會把「存在但讀不到」（權限、I/O 錯誤）也當成不存在而只用內建預設值：
+            // 服務帳號讀不到 pulse.toml 時 Pulse 會改連 127.0.0.1、不用 mTLS，而不是以設定錯誤結束
+            // （PLS-E0402，main.rs）。只有不存在時才略過
+            if let Err(e) = std::fs::File::open(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(ConfigError::Message(format!(
+                    "無法讀取 {}：{e}",
+                    path.display()
+                )));
+            }
             builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(false));
         }
         let env = Self::env_source(env_override);
@@ -1433,6 +1444,37 @@ fallback_addresses = [\"[2001:db8::10]\", \"kairos-c:9000\"]
         .unwrap_err()
         .to_string();
         assert!(err.contains("最多 32 個"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 存在但讀不到的 pulse.toml 是設定錯誤（main.rs 以 PLS-E0402、結束代碼 3 結束），不是「沒有設定檔」：
+    /// 不可悄悄改用內建預設值（服務帳號讀不到 root:root 640 的 pulse.toml 時曾改連 127.0.0.1、不用 mTLS）。
+    /// 不存在時照舊只用預設值
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_pulse_toml_is_an_error_not_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join("pulse-config-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pulse.toml");
+        assert!(AppConfig::build(Some(file.as_path()), Some(Map::new())).is_ok());
+        std::fs::write(&file, "[server]\naddress = \"kairos.example\"\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            // root 不受檔案權限限制（CI 與 kp-build 以一般帳號執行）
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let err = AppConfig::build(Some(file.as_path()), Some(Map::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("無法讀取"), "{err}");
+        assert!(AppConfig::load_file(&file).is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = AppConfig::build(Some(file.as_path()), Some(Map::new())).unwrap();
+        assert_eq!(cfg.server.address, "kairos.example");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

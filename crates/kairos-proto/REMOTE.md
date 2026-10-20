@@ -1012,6 +1012,21 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 在 kp-build 以 systemd 容器（Debian 12、Ubuntu 24.04、Rocky 9；`--privileged` 或 `systemd` 支援的映像檔）：安裝 `test.1` 的 deb／rpm → 推送 `test.2` → 確認 `pulse-upgrade.path` 觸發、`dpkg -i`／`rpm -U` 成功、`systemctl status pulse` 為新版 → 推送會崩潰的 `test.3` → 確認以 `rollback_artifact` 回到 `test.2`；tar 安裝（含 unit 未修改／已修改兩種情況）同樣執行一次。另測：套件資料庫被鎖住時的重試、重新開機（容器重啟）後接續。
 
+**實作與實測結果（2026-10-21，衝刺 9）**：可重跑的腳本在 `tests/systemd/`（`run.sh`、`build.sh`、說明 `README.md`；不在 CI 必跑的範圍）。在 kp-build（Ubuntu 24.04、docker 29、cgroup v2）以 HEAD 打包 0.9.0 與只改版本號的 `0.9.1-test.1`～`test.4`（`test.2`、`test.4` 在沒有參數啟動時立刻以結束代碼 1 結束），全部以測試時臨時產生的 ed25519 金鑰簽章；實際的 Kairos（`kairos pki init`、mTLS、線上簽發、`[remote]`）與三台以 systemd 為 PID 1 的容器（`--privileged --cgroupns=private`）：Debian 12（`pulse-install.sh` → deb）、Rocky 9（`pulse-install.sh` → rpm）、Ubuntu 24.04（INSTALL 的 tar 安裝與第 10.1 節）。容器中 Pulse 依第 4.4.5 節回報 `unsupported`，測試映像每次開機在 Pulse 啟動前刪除 `/.dockerenv`（`--cgroupns=private` 下 `/proc/1/cgroup` 為 `0::/init.scope`）。推送為單一批次、`health_timeout_secs = 120`，依序：
+
+| 情境 | 推送 | 結果（三台） |
+|---|---|---|
+| b0 第一次遠端升級就失敗 | 0.9.0 → test.2 | `rolled_back`（`PLS-W8407`，`crash_restart (NRestarts 0 → 1)`）：本機沒有 0.9.0 的已驗證發佈，三台都以 `pulse.prev` 換回；deb／rpm 的套件資料庫仍是 test.2（`binary_restored_package_db_shows_0.9.1-test.2`，第 17.3 節第 1 項） |
+| a 成功升級 | 0.9.0 → test.1 | `succeeded`（`PLS-I8416`），下載＋替換＋健康確認約 75 秒；`--version`、`dpkg-query`／`rpm -q`（`0.9.1~test.1-1`）、Kairos 的 `agent_version` 一致；tar 的 `pulse.prev` 為 0.9.0；推送 `completed` |
+| b 失敗回滾 | test.1 → test.2 | 約 10 秒內偵測到崩潰、`rolled_back`（`PLS-W8407`）；deb／rpm 以提議的 `rollback_artifact` 經 `dpkg -i`／`rpm -U --oldpackage --replacepkgs` 裝回 test.1（第 17.3 節第 1 項的已驗證紀錄），套件資料庫也回到 test.1 |
+| c 健康確認期間重新開機 | test.1 → test.3 | 輔助程式在 `replaced` 時 `docker restart`（`STOPSIGNAL SIGRTMIN+3`，正常關機）；開機後 `pulse-upgrade.path` 再次觸發、「接續上次中斷的升級」→ `succeeded` |
+| c2 回滾確認期間重新開機 | test.3 → test.4 | `rolling_back` 時重新開機；開機後接續回滾確認 → `rolled_back`、回到 test.3 |
+| d 簽章錯誤 | — ／ test.9 | Kairos 匯入以不信任的金鑰簽的發佈被拒（400 `release_signature_invalid`、`KRS-E8413`）；Kairos 信任但 Pulse 不信任的金鑰：第一台在下載前驗證失敗（`failed`、`PLS-E8401`、`upgrade.verify_failed`），推送立即自動暫停（`KRS-W8414`），其餘主機不再提議，版本不變 |
+
+實測發現並修正：`pulse enroll` 改寫套件的 `pulse.toml`（`root:pulse 640`）時變成 `root:root`，服務帳號讀不到設定；讀不到的 `pulse.toml` 被當成不存在、改用內建預設值（現在以 `PLS-E0402` 結束）；Rocky 9 沒有 `cpio` 時輔助程式解開 rpm 卡到 `TimeoutStartSec`（rpm 另宣告相依 `cpio`）；rpm 在套件資料庫比目標新或同版時拒絕安裝（改為 `--oldpackage --replacepkgs`）；tar 主機在其他目錄執行 `pulse upgrade status`／`rollback` 時判斷為 `unknown`；回滾確認期間重新開機後 `detail` 只剩 `resumed`；段落請求超過 Kairos 每條連線的訊息速率（Kairos 每台主機都記 WARN）。詳見第 17.6 節。
+
+沒有實測（原因見 `tests/systemd/README.md`「沒有涵蓋」）：套件資料庫被鎖住時的重試（時序不易穩定重現，以單元測試的假套件管理員涵蓋）、tar 安裝替換已修改／未修改的 `pulse.service`（同一個 commit 的新舊 unit 相同，輔助程式不替換）、斷電（`docker kill`）而非正常關機的重新開機、aarch64、Debian 11／RHEL 8。
+
 ### 12.4 Windows（實機，手動清單）
 
 沒有 Windows CI；在 Windows Server 2022 與 Windows 11 的 VM 上依清單手動驗證：MSI 安裝 `test.1` → 推送 `test.2`（MajorUpgrade、服務重新啟動、升級程序脫離服務）→ 推送 `test.3` 回滾（`AllowDowngrades`）→ zip 安裝的替換與回滾 → 升級中重新開機 → `allowed_signers` ACL 過寬時拒絕。結果記在 CHANGELOG「尚未實機驗證」一節，未通過前 Windows 的遠端升級標示為預覽。
@@ -1169,13 +1184,16 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 10. **交付前再確認**：已暫存的升級進入 `apply_window` 時，先對同一個 `upgrade_id` 再送一次 `upgrade_get`；收到內容相同的提議（時段與 `health_timeout_secs` 可更新）才交付，收到 `upgrade_unavailable`（推送已暫停或取消）時不替換、保留暫存，10 分鐘後（或下一條連線）再確認。避免 Kairos 取消推送後，主機仍從先前暫存的檔案替換。
 11. **交付**：先送 `applying`，收到 `ack`（最多等 15 秒）才寫 `request.json`；寫入失敗時 `failed`（`PLS-E8406`）。替換中 Pulse 每 5 秒輪詢 `result.json`（預檢失敗時 Pulse 沒有被重新啟動）。
 12. **健康確認**（第 4.5.1 節）：服務 `ActiveState=active`；`NRestarts` **任何增加**即判定失敗（比「1 分鐘內崩潰 3 次」嚴格：`Restart=always` 下第一次崩潰就是失敗）；狀態檔的 `pid` 等於 `MainPID`、`version` 等於期望的版本、`running`；`connection.state = "registered"`；`reporting.last_ack_at` 不早於重新啟動的時間；符合後再穩定 60 秒（期間不符時重新起算）。結束代碼 2／3／4 立即回滾。輔助程式的狀態檔位置為 `pulse.toml` 的 `status.file`（相對路徑以安裝目錄解析），沒有設定時為 `<狀態目錄>/status.json`。
-13. **預檢**的解開方式：tar 以 `tar -xzf … --no-same-owner`、deb 以 `dpkg-deb -x`、rpm 以 `rpm2cpio | cpio -idm`（第 5.5 節的固定外部程式另外加上這三個）；以 `pulse` 帳號（`getpwnam`、`setuid`／`setgid`，清空環境變數、只給 `PATH` 與 `STATE_DIRECTORY`）執行 `--version` 與 `check-config --json --with-remote`。
+13. **預檢**的解開方式：tar 以 `tar -xzf … --no-same-owner`、deb 以 `dpkg-deb -x`、rpm 以 `rpm2cpio | cpio -idm`（第 5.5 節的固定外部程式另外加上這三個；`cpio` 不屬於 rpm，Pulse 的 rpm 宣告相依 `cpio`，cpio 無法執行時立即以 `PLS-E8405` 失敗）；以 `pulse` 帳號（`getpwnam`、`setuid`／`setgid`，清空環境變數、只給 `PATH` 與 `STATE_DIRECTORY`）執行 `--version` 與 `check-config --json --with-remote`。
 14. **`pulse-upgrade.service` 的 `TimeoutStartSec`** 為 2.5 小時（健康確認最長 1 小時，回滾後再確認 `max(期限, 300 秒)`，另有套件資料庫最多 10 分鐘的重試）；被 systemd 中止時，`request.json` 仍在，`pulse-upgrade.path` 再次觸發並依步驟接續。
 15. **輔助程式寫 Pulse 可寫的目錄**（`result.json`）時，暫存檔以 `O_EXCL`＋`O_NOFOLLOW` 新建後改名，不會被服務帳號預先放好的符號連結導向其他檔案；刪除暫存與 `request.json` 不跟隨符號連結。
 16. **安裝方式與就緒狀態在每次連線前重新偵測**（放好信任錨、啟用 `pulse-upgrade.path` 後不必重新啟動 Pulse；`upgrade.enabled` 與信任錨的路徑只在啟動時讀取）；Windows 以「執行檔在 `%ProgramFiles%\Pulse`」判斷 `msi`（否則 `zip`），`install.upgrade` 一律 `unsupported`（0.10.0 改以登錄的 UpgradeCode 判斷）。
-17. **`pulse upgrade rollback --yes`** 只對 tar 安裝動作（換回 `pulse.prev`、`systemctl restart`）；deb／rpm 顯示套件管理員的回滾方式。
+17. **`pulse upgrade rollback --yes`** 只對 tar 安裝動作（換回 `pulse.prev`、`systemctl restart`）；deb／rpm 顯示套件管理員的回滾方式。`pulse upgrade status` 與 `rollback` 以執行檔所在的目錄代替目前目錄判斷安裝方式（服務的工作目錄固定是 `/opt/pulse`，管理者可能在任何目錄執行 `sudo /opt/pulse/pulse upgrade …`）。
 18. **`[remote_config]`、`[upgrade]` 以 `pulse.toml` 的值為準**（與輔助程式一致：信任錨的路徑、`extra_principals`、`allow_downgrade`、`health_timeout_secs`），`PULSE__REMOTE_CONFIG__ENABLED`、`PULSE__UPGRADE__ENABLED` 只能關閉（`pulse.toml` 與環境變數都不為 `false` 才算開啟），其他 `PULSE__UPGRADE__*` 不影響遠端升級。
 19. `upgrade.trust_anchor_unavailable`（`PLS-E8403`）在啟動時記一則 `ERROR`，不另寫 stderr（大多數從 0.8 手動升級、還沒放信任錨的主機都會有，避免 journal 告警）。
+20. **rpm 的替換與回滾**一律 `rpm -U --oldpackage --replacepkgs`（與 `dpkg -i` 一樣允許降版與重新安裝同一版）：版本政策已依實際的執行檔判斷，套件資料庫可能因第 17.3 節第 1 項的 `pulse.prev` 回復而比執行檔新。
+21. **段落請求**之間至少隔 60 ms（約每秒 16 則），不超過 Kairos 每條連線的訊息速率（可連續 50 則、之後每秒 20 則），保留約每秒 4 則給心跳、report 與補送；10 MB 約 20 秒。
+22. **回滾的原因**記在輔助程式的狀態檔（`rollback_reason`）：回滾確認期間重新開機後接續時，結果的 `detail` 為「<原因>; resumed」。
 
 ### 17.3 與規格的差異
 
@@ -1186,6 +1204,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 3 | 第 4.4.1 節：`TimeoutStartSec` 為健康確認上限加 15 分鐘 | 2.5 小時 | 17.2 #14 |
 | 4 | 第 5.5 節：外部程式只有 `systemctl`、`dpkg`、`rpm`、`msiexec`、`sc` | 另有預檢用的 `tar`、`dpkg-deb`、`rpm2cpio`、`cpio`（固定路徑、參數由程式組成） | 第 4.4.1 節步驟 4 的預檢需要解開發佈檔 |
 | 5 | 第 10.2 節：`pulse config show` 不加 `--effective` 時「列出設定」 | 只列出白名單的鍵（本機與內建預設，`--effective` 另合併快取）；完整設定請看 `pulse check-config`／`pulse diag` | 指令的目的在集中設定 |
+| 6 | 第 4.4.1、4.4.2 節：rpm 以 `rpm -U`，回滾以 `rpm -U --oldpackage` | 兩者都是 `rpm -U --oldpackage --replacepkgs` | 17.2 #20：沒有可驗證的回滾檔而以 `pulse.prev` 回復後，套件資料庫是失敗的那一版，重試同一版或推送比它低的修正版時 `rpm -U` 會拒絕（第 12.3 節實測） |
 
 ### 17.4 與 Kairos 端（K1／K2）的對接
 
@@ -1193,7 +1212,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - **`config_status`** 在每條新連線的 `hello_ack` 之後一定送一次（含本機從未套用過時的 `rev: 0`、`hash: ""`、`state: applied`）；停用的主機只送一次 `state: disabled`（之後不宣告 `config`，`install.config` 為 `disabled`）。
 - **同一個 `upgrade_id` 的 `upgrade_get` 可能出現多次**：交付前的再確認（17.2 #10）。推送仍在進行時請回同一份提議（`apply_window` 可以更新）；已暫停或取消時回 `upgrade_unavailable`。
 - **`pending.upgrade_id`**：Pulse 對已處理過的 ID（進行中、已結束、這條連線上 `upgrade_unavailable` 的）不再送 `upgrade_get`；已暫存的升級不需要 Kairos 一直帶著它的 ID。
-- **段落**：Pulse 依序請求、最多 2 段在途，`length` 為 1～32768；回應的 `data` 可以比 `length` 短（不是最後一段時 Pulse 從檔案長度重新請求），最後一段須 `eof: true`。`rate_limited` 請帶 `retry_after_ms`（沒有時 Pulse 等 30 秒）。
+- **段落**：Pulse 依序請求、最多 2 段在途、請求之間至少隔 60 ms（17.2 #21），`length` 為 1～32768；回應的 `data` 可以比 `length` 短（不是最後一段時 Pulse 從檔案長度重新請求），最後一段須 `eof: true`。`rate_limited` 請帶 `retry_after_ms`（沒有時 Pulse 等 30 秒）。
 - **`upgrade_status`** 的 `accepted` 會帶進度重送多次（17.2 #9）；`applying` 之後的終止狀態由替換後的 Pulse（新版或回滾後的舊版）在重新連線後送出，可能晚於 `health_timeout_secs`（替換＋健康確認＋穩定 60 秒）。`detail` 可能是 `reused_staged`、`unit_not_updated`、`binary_restored_package_db_shows_<版本>`、`url_not_allowed`、`upgrade_in_progress`、`min_upgrade_from: <版本>`、`downgrade_not_allowed`、`insufficient_space: …` 等。
 - **`bad_request` 的 `seq` 為 `null`** 時 Pulse 無法對應到哪一則請求：之後的回應抵達時，比它早送出而沒有回應的請求視為結果不明（設定的請求下一條連線重送；升級狀態最多重送 3 次後放棄）。
 - **`install.method`** 只會是 `tar`、`deb`、`rpm`、`unknown`（Linux）或 `msi`、`zip`（Windows，0.9.0 的 `install.upgrade` 一律 `unsupported`）。
@@ -1201,4 +1220,19 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 ### 17.5 待決（附建議）
 
 1. **回滾檔的信任**（17.3 #1）：建議 0.10.0 在 `upgrade_offer` 加選用欄位 `rollback_bundle: {sha256sums, signature}`（Kairos 版本庫有該版本時附上；舊版 Pulse 忽略），Pulse 與輔助程式以信任錨驗證後即可使用，第一次遠端升級也能以套件回滾。
-2. **系統層驗證**（第 12.3 節）：建議在 kp-build 以 systemd 容器（Debian 12、Rocky 9）執行一次 deb／rpm／tar 的實際升級與回滾（`pulse-upgrade.path` 觸發、`dpkg -i`、重新開機後接續）後再發佈 0.9.0；目前以假的 systemd 與套件管理員驗證。
+2. ~~**系統層驗證**（第 12.3 節）~~：已完成（2026-10-21，`tests/systemd/`，結果見第 12.3 節與第 17.6 節）。建議發佈前與修改遠端升級、打包、unit 時在 kp-build 重跑一次 `sh tests/systemd/run.sh`。
+3. **套件資料庫與執行檔不一致**（17.3 #1 的代價，第 12.3 節 b0 實測）：第一次遠端升級失敗而以 `pulse.prev` 回復的 deb／rpm 主機，`dpkg -l`／`rpm -q` 顯示失敗的版本，直到下一次成功的遠端升級或手動重新安裝。0.10.0 的 `rollback_bundle`（第 1 項）可以消除；在那之前主控台的主機詳情可依 `detail` 的 `binary_restored_package_db_shows_<版本>` 提示。
+
+### 17.6 系統層實測發現的問題（第 12.3 節，衝刺 9 修正）
+
+| # | 現象（實測） | 原因 | 修正 |
+|---|---|---|---|
+| 1 | Debian 12／Rocky 9 以 `pulse-install.sh` 安裝後一直「127.0.0.1:8080 拒絕連線」、「mTLS 未啟用」 | `pulse enroll` 以 root 改寫套件的 `/opt/pulse/pulse.toml`（`root:pulse 640`）時，暫存檔以 `root:root` 建立、只沿用權限，服務帳號讀不到設定 | `pulse.toml` 與備份都沿用原檔的擁有者、群組與權限（`enroll::toml_edit`） |
+| 2 | 同上，而且沒有任何設定錯誤 | config 的 `required(false)` 把「存在但讀不到」當成不存在，Pulse 以內建預設值啟動；main.rs 為此準備的 `PLS-E0402` 永遠走不到 | `AppConfig` 只在 NotFound 時略過設定檔，其他讀取錯誤是設定錯誤（服務以結束代碼 3 停止，不重啟） |
+| 3 | Rocky 9：`pulse-upgrade.service` 停在「已重新驗證」，Pulse 停在 `applying` | 系統沒有 `cpio`；cpio 無法啟動時程式仍握著管線的讀取端並等待 rpm2cpio，rpm2cpio 寫滿管線後永遠卡住（到 `TimeoutStartSec` 2.5 小時） | 先釋放管線、cpio 失敗時結束 rpm2cpio（立即 `PLS-E8405`）；rpm 宣告相依 `cpio` |
+| 4 | Rocky 9：「package pulse-0.9.1~test.3-1 is already installed」「… which is newer … is already installed」 | `rpm -U` 不允許重新安裝同一版與降版；`pulse.prev` 回復後套件資料庫比執行檔新 | `rpm -U --oldpackage --replacepkgs`（17.2 #20） |
+| 5 | tar 主機：`sudo /opt/pulse/pulse upgrade status` 顯示「安裝方式：unknown、不支援」，`upgrade rollback --yes` 拒絕執行 | tar 的判斷需要目前目錄是 `/opt/pulse` | 命令列以執行檔所在的目錄判斷（17.2 #17） |
+| 6 | 回滾確認期間重新開機後回報 `rolled_back`，`detail` 只有 `resumed` | 接續時沒有原本的原因 | 狀態檔另存 `rollback_reason`（17.2 #22） |
+| 7 | 每台主機下載時 Kairos 記 WARN「送出訊息超過每秒 20 則（可連續 50 則），延後處理」 | 區域網路上 2 段在途的段落請求遠超過每條連線的訊息速率 | 段落請求之間至少隔 60 ms（17.2 #21） |
+
+另外為了維運，輔助程式在回滾前記下回滾的方式（「以回滾檔 … 經套件管理員裝回」或「以替換前保留的 /opt/pulse/pulse.prev 換回」）。

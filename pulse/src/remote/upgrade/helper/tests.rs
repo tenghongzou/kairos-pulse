@@ -736,3 +736,100 @@ fn units_point_at_the_request_file() {
     assert!(service.lines().any(|l| l == "StateDirectory=pulse-upgrade"));
     assert!(service.lines().any(|l| l == "Type=oneshot"));
 }
+
+/// `rpm2cpio | cpio`：cpio 無法執行（Rocky 9 的最小安裝沒有 cpio）時立即回報失敗，不會因 rpm2cpio 寫滿管線而
+/// 卡住（tests/systemd 實測：輔助程式卡到 TimeoutStartSec）。以 `cat` 輸出大於管線緩衝的資料代替 rpm2cpio
+#[cfg(unix)]
+#[test]
+fn rpm_extract_does_not_hang_when_cpio_cannot_run() {
+    let dir = std::env::temp_dir().join(format!("pulse-helper-rpm-extract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.rpm");
+    std::fs::write(&big, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    let cat = Path::new(first_existing(&["/usr/bin/cat", "/bin/cat"]));
+    let run = |rpm2cpio: PathBuf, cpio: PathBuf| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (big, dir) = (big.clone(), dir.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(rpm_extract(&rpm2cpio, &big, &cpio, &dir));
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("rpm_extract 卡住（管線寫滿）")
+    };
+    let o = run(cat.to_path_buf(), dir.join("no-such-cpio"));
+    assert_eq!(o.status, None, "{o:?}");
+    assert!(o.stderr.contains("no-such-cpio"), "{o:?}");
+    // cpio 一開始就失敗（結束代碼 1）
+    let falsy = PathBuf::from(first_existing(&["/usr/bin/false", "/bin/false"]));
+    let o = run(cat.to_path_buf(), falsy.clone());
+    assert_eq!(o.status, Some(1), "{o:?}");
+    // rpm2cpio 失敗、cpio 成功：仍是失敗
+    let truthy = PathBuf::from(first_existing(&["/usr/bin/true", "/bin/true"]));
+    let o = run(falsy, truthy);
+    assert!(!o.ok(), "{o:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// rpm 的替換與回滾都允許降版與重新安裝同一版（與 dpkg -i 相同）：沒有回滾檔時以 pulse.prev 回滾後，
+/// 套件資料庫仍是失敗的那一版，重試同一版或推送較低的版本不能被 rpm 拒絕（版本政策依實際的執行檔判斷）
+#[test]
+fn rpm_install_allows_reinstall_and_older_package_database_versions() {
+    let c = rpm_install_command(Path::new("/usr/bin/rpm"), Path::new("/w/pulse.rpm"));
+    let args: Vec<_> = c
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        ["-U", "--oldpackage", "--replacepkgs", "/w/pulse.rpm"]
+    );
+}
+
+/// 回滾確認期間重新開機：開機後接續回滾確認，結果的 detail 仍是原本的失敗原因（tests/systemd 實測時只剩
+/// `resumed`，Kairos 與主控台看不出為什麼回滾）
+#[test]
+fn resuming_a_rollback_after_a_reboot_keeps_the_original_reason() {
+    let env = setup("resume-rollback", "tar");
+    let request = std::fs::read(&env.paths.request).unwrap();
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(r.detail.starts_with("crash_restart"), "{}", r.detail);
+    // 模擬在回滾確認中途重新開機：狀態改回 rolling_back、放回 request.json
+    let state_path = env.paths.work_root.join(ID).join("state.json");
+    let mut s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(
+        s["rollback_reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("crash_restart")),
+        "{s}"
+    );
+    s["step"] = "rolling_back".into();
+    s["result"] = serde_json::Value::Null;
+    s["deadline_unix"] = (chrono::Utc::now().timestamp() + 600).into();
+    s["n_restarts_before"] = 0.into();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(
+        r.detail.starts_with("crash_restart") && r.detail.contains("resumed"),
+        "{}",
+        r.detail
+    );
+    assert!(fake.calls().is_empty(), "沒有重新替換：{:?}", fake.calls());
+    // 0.9.0 的狀態檔沒有這個欄位：照舊只回報 resumed
+    s.as_object_mut().unwrap().remove("rollback_reason");
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.detail.as_str()),
+        ("rolled_back", "resumed")
+    );
+    let _ = std::fs::remove_dir_all(&env.root);
+}
