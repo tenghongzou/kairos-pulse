@@ -481,6 +481,31 @@ async fn releases_and_rollouts_over_https() {
         (200, Some("paused"))
     );
     assert_eq!(body(&r)["data"]["pause_cause"], "manual");
+    // 清單的 meta：需要人處理的數量（不受 state 篩選影響）
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/rollouts?state=running",
+        Some(&auditor),
+        None,
+    )
+    .await;
+    let list = body(&r);
+    assert_eq!(list["data"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        list["meta"],
+        json!({"paused": 1, "rollback_failed_unacknowledged": 0})
+    );
+    f.admin()
+        .execute("UPDATE rollout_hosts SET state = 'rollback_failed'", [])
+        .unwrap();
+    let r = call(addr, "GET", "/api/v1/rollouts", Some(&auditor), None).await;
+    let list = body(&r);
+    assert_eq!(list["meta"]["rollback_failed_unacknowledged"], 1);
+    assert_eq!(list["data"][0]["rollback_failed_unacknowledged"], 1);
+    f.admin()
+        .execute("UPDATE rollout_hosts SET state = 'pending'", [])
+        .unwrap();
     let r = call(
         addr,
         "POST",

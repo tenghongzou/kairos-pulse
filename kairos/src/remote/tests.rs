@@ -1436,3 +1436,88 @@ async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
         .unwrap();
     assert_eq!(v["state"], "running");
 }
+
+#[tokio::test]
+async fn pause_cause_and_open_rollback_failures_are_in_the_rollout_json() {
+    let signer = TestSigner::new(23);
+    let fx = Fx::new("cause", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}, "waves": [{"size": "rest"}]})).unwrap();
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["pause_cause"], Value::Null);
+    assert_eq!(v["rollback_failed_unacknowledged"], 0);
+    // 主控台暫停：manual
+    let v = fx
+        .svc
+        .pause_rollout(&who(), id.clone(), "先停".into())
+        .await
+        .unwrap();
+    assert_eq!(v["pause_cause"], "manual");
+    assert_eq!(v["next_action"]["cause"], "manual");
+    let v = fx.svc.resume_rollout(&who(), id.clone()).await.unwrap();
+    assert_eq!(v["pause_cause"], Value::Null);
+    // 回滾失敗：自動暫停（rollback_failed），SSE 的 rollout.progress 也帶 pause_cause
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).unwrap();
+    fx.svc.flush_progress().await;
+    let mut rx = fx.svc.subscribe();
+    fx.svc
+        .apply_upgrade_status(
+            A,
+            "0.9.0",
+            kairos_proto::mgmt::UpgradeStatus {
+                seq: 1,
+                ts: "2026-11-20T02:00:00.000Z".into(),
+                upgrade_id: up,
+                state: "rollback_failed".into(),
+                from_version: "0.9.0".into(),
+                to_version: "0.9.2".into(),
+                code: Some("PLS-E8408".into()),
+                detail: "x".into(),
+                progress: None,
+            },
+        )
+        .await
+        .unwrap();
+    fx.svc.flush_progress().await;
+    let ev = rx.try_recv().expect("rollout.progress");
+    assert_eq!(ev.data["pause_cause"], "rollback_failed");
+    assert_eq!(ev.data["next_action"]["cause"], "rollback_failed");
+    let (r, hosts) = {
+        let id = id.clone();
+        fx.svc
+            .db
+            .read(move |s| Ok((s.get_rollout(&id)?.unwrap(), s.rollout_hosts(&id)?)))
+            .await
+            .unwrap()
+    };
+    let v = rollout_json(&r, &hosts, T0, false);
+    assert_eq!(v["pause_cause"], "rollback_failed");
+    assert_eq!(v["rollback_failed_unacknowledged"], 1);
+    fx.svc
+        .acknowledge_host(&who(), id.clone(), A.into(), None)
+        .await
+        .unwrap();
+    let hosts = {
+        let id = id.clone();
+        fx.svc
+            .db
+            .read(move |s| Ok(s.rollout_hosts(&id)?))
+            .await
+            .unwrap()
+    };
+    let v = rollout_json(&r, &hosts, T0, false);
+    assert_eq!(v["rollback_failed_unacknowledged"], 0, "已標記為已處理");
+    assert_eq!(v["progress"]["rollback_failed"], 1, "progress 仍含已處理的");
+}

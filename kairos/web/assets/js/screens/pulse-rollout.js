@@ -272,8 +272,8 @@ export function render(ctx) {
     if (r.state === 'running' && na.code === 'soaking') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.soaking', { m: fmt.num(na.minutes || 0), t: fmt.dateTime(na.until, { seconds: false }) }) }));
     if (r.state === 'running' && na.code === 'waiting_continue') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.awaiting') }));
     if (r.state === 'cancelled' && r.cancel_reason) out.push(h('p', { class: 'caption' }, t('rm.det.cancelReason', { r: r.cancel_reason })));
-    // 回滾失敗（最上方，嚴重）
-    if (r.progress && r.progress.rollback_failed) {
+    // 回滾失敗（最上方，嚴重）：只有尚未標記為已處理的主機（rollback_failed_unacknowledged）
+    if (r.rollback_failed_unacknowledged > 0) {
       try {
         const list = (await api(`/api/v1/rollouts/${encodeURIComponent(id)}/hosts${qs({ state: 'rollback_failed', limit: 100 })}`)) || [];
         const open = list.filter((x) => !x.acknowledged_at);

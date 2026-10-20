@@ -272,6 +272,7 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await o.ctx.close();
 
     // 自動暫停（攔截詳情：pause_cause = failure_ratio）：「已自動暫停：…」並附 KRS-W8414；
+    // 計數泡泡以清單的 meta 計算（攔截：已暫停 1＋回滾失敗未處理 2 → 3）
     const ap = await newPage();
     await ap.page.route(`**/api/v1/rollouts/${rolloutId}`, async (route) => {
       const r = await route.fetch();
@@ -280,10 +281,19 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
       body.data.pause_reason = '第 1 批的失敗比例 100%（1／1）超過上限 0%';
       return route.fulfill({ response: r, json: body });
     });
+    await ap.page.route('**/api/v1/rollouts', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const r = await route.fetch();
+      const body = await r.json();
+      body.meta = { ...body.meta, rollback_failed_unacknowledged: 2 };
+      return route.fulfill({ response: r, json: body });
+    });
     await login(ap.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
     await waitTitle(ap.page, 'E2E 0.9.1');
     const autoAlert = ap.page.locator('.ds-alert', { hasText: '已自動暫停：第 1 批的失敗比例 100%（1／1）超過上限 0%' });
     await autoAlert.getByText('KRS-W8414').waitFor();
+    const apBadge = ap.page.locator('.ds-sidenav__link', { hasText: '升級推送' }).locator('.ds-sidenav__count');
+    await until(async () => (await apBadge.count()) && (await apBadge.textContent()).trim() === '3', 15000, '計數泡泡 3');
     await axe(ap.page, 'F8 S26 已自動暫停');
     await ap.ctx.close();
 

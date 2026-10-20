@@ -134,6 +134,8 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         "waves_total": waves.len(),
         "progress": rollout::progress(hosts),
         "hosts_total": hosts.iter().filter(|h| h.state != HOST_SKIPPED).count(),
+        // 回滾失敗、尚未標記為已處理的主機（progress.rollback_failed 含已處理的）
+        "rollback_failed_unacknowledged": hosts.iter().filter(|h| h.state == HOST_ROLLBACK_FAILED && h.acknowledged_at.is_none()).count(),
         "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now_ms),
         "pause_reason": r.pause_reason,
         "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),

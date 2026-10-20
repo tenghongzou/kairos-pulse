@@ -1131,7 +1131,7 @@ async fn rollouts(
                 ));
             }
             let now_ms = now.timestamp_millis();
-            let data = ctx
+            let (data, meta) = ctx
                 .pool
                 .read("升級推送", move |s| {
                     let list = s
@@ -1142,10 +1142,26 @@ async fn rollouts(
                         let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;
                         out.push(crate::remote::rollout_json(r, &hosts, now_ms, false));
                     }
-                    Ok(out)
+                    // 需要人處理的數量（SideNav 的計數泡泡；不受 state 篩選影響）
+                    let paused = s
+                        .list_rollouts(Some(rollout::ROLLOUT_PAUSED))
+                        .map_err(query_failed("升級推送"))?
+                        .len();
+                    let failures = s
+                        .unacknowledged_rollback_failures()
+                        .map_err(query_failed("升級推送"))?
+                        .len();
+                    Ok((
+                        out,
+                        json!({"paused": paused, "rollback_failed_unacknowledged": failures}),
+                    ))
                 })
                 .await?;
-            Ok(http::ok(now, data))
+            Ok(http::json(
+                StatusCode::OK,
+                now,
+                json!({"data": data, "meta": meta}),
+            ))
         }
         ("POST", []) => {
             p.require(Permission::RolloutsWrite)?;
