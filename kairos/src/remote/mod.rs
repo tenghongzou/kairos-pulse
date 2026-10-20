@@ -280,7 +280,8 @@ impl RemoteService {
         self.lock().dirty_rollouts.insert(rollout_id.to_string());
     }
 
-    /// 送出改變過的推送的 `rollout.progress`（`rollout_id`、`state`、`current_wave`、各狀態的台數、`next_action`）
+    /// 送出改變過的推送的 `rollout.progress`（`rollout_id`、`state`、`current_wave`、各狀態的台數、`pause_cause`、
+    /// `next_action`）
     pub(crate) async fn flush_progress(&self) {
         let ids: Vec<String> = std::mem::take(&mut self.lock().dirty_rollouts)
             .into_iter()
@@ -301,7 +302,8 @@ impl RemoteService {
                             "state": r.state,
                             "current_wave": r.current_wave,
                             "progress": rollout::progress(&hosts),
-                            "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), now),
+                            "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
+                            "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now),
                         }));
                     }
                 }
@@ -513,7 +515,7 @@ impl RemoteService {
                     serde_json::json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "reason": r.pause_reason, "cause": cause}),
                 ),
             );
-            if cause == "signature_failed" {
+            if cause == rollout::PAUSE_SIGNATURE_FAILED {
                 want.insert(
                     (ids::RELEASE_SIGNATURE_FAILED, r.target_version.clone()),
                     (

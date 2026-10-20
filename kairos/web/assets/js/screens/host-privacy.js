@@ -46,13 +46,10 @@ export function hostActions(hst) {
   return b;
 }
 
-// 假名的格式（kairos/PRIVACY.md 第 3 節）：`host-` ＋ RFC 4648 base32 小寫的前 12 個字元。
-// 主機 API 沒有「已假名化」的欄位，以主機名稱的格式判斷（隨機名稱剛好符合的機率可忽略）
-const PSEUDONYM = /^host-[a-z2-7]{12}$/;
-
-/** S05 頁首名稱旁：假名化主機的可見說明與查詢指令（不是假名時 null；不提供「顯示原名」，D53） */
+/** S05 頁首名稱旁：假名化主機（主機 API 的 pseudonymized，PRIVACY.md 第 3 節）的可見說明與查詢指令
+ *  （不是假名時 null；不提供「顯示原名」，D53） */
 export function pseudonymNote(hst) {
-  if (!hst || !PSEUDONYM.test(hst.hostname || '')) return null;
+  if (!hst || hst.pseudonymized !== true) return null;
   return h(
     'span',
     { class: 'k-pseudonym' },

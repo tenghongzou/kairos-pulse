@@ -1286,3 +1286,238 @@ async fn cancel_withdraws_offers_but_records_an_apply_that_already_started() {
         .unwrap();
     assert_eq!(fx.host_state(&id, A).await.state, "succeeded");
 }
+
+/// 主機上線但沒有協商遠端管理（例如沒有 mTLS）：只在狀態表，hello 帶 `install`
+fn connect_hello_only(fx: &Fx, id: &str, version: &str, method: &str, upgrade: &str) {
+    fx.registry
+        .register(
+            crate::registry::next_conn_id(),
+            crate::registry::HelloInfo {
+                agent_id: id.to_string(),
+                hostname: id.to_string(),
+                agent_version: version.to_string(),
+                proto: 2,
+                host: Some(Arc::new(kairos_proto::HostInfo {
+                    os: Some(kairos_proto::OsInfo {
+                        name: Some("Ubuntu".into()),
+                        arch: Some("x86_64".into()),
+                        ..Default::default()
+                    }),
+                    install: Some(kairos_proto::mgmt::InstallInfo {
+                        method: Some(method.into()),
+                        upgrade: Some(upgrade.into()),
+                        config: Some("enabled".into()),
+                    }),
+                    tags: Some(vec!["site:b".into()]),
+                    ..Default::default()
+                })),
+                peer: "127.0.0.1:1".into(),
+                offline_after: Duration::from_secs(75),
+                client_chain: None,
+            },
+            Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn preview_and_submit_use_the_live_hello_instead_of_the_inventory() {
+    let signer = TestSigner::new(21);
+    let fx = Fx::new("livehello", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    // 清冊還是舊的資料（每 30 秒才同步）：0.8.0、沒有 install、沒有標籤
+    fx.add_host(A, "0.8.0", "Web", &[], "tar", "ready").await;
+    fx.sql(|c| {
+        c.execute(
+            "UPDATE hosts SET install_method = NULL, install_upgrade = NULL, os = NULL",
+            [],
+        )
+        .unwrap();
+    })
+    .await;
+    let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"tags": ["site:b"]}, "waves": [{"size": "rest"}]})).unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(p["matched"], 0, "清冊沒有標籤：比對不到");
+    // 剛連線、hello 已升到 0.9.0（tar、就緒、標籤 site:b），沒有協商 upgrade：資格依 hello
+    connect_hello_only(&fx, A, "0.9.0", "tar", "ready");
+    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(
+        (p["matched"].as_i64(), p["eligible"].as_i64()),
+        (Some(1), Some(1)),
+        "{p}"
+    );
+    assert_eq!(p["confirm_text"], "升級 1 台");
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    let h = fx.host_state(&id, A).await;
+    assert_eq!(
+        (h.state.as_str(), h.from_version.as_deref()),
+        ("pending", Some("0.9.0"))
+    );
+    // 單台主機的 hello（`/hosts/{id}/upgrade` 使用）
+    let l = fx.svc.live_hello(A).unwrap();
+    assert_eq!(
+        (l.agent_version.as_str(), l.install_upgrade.as_deref()),
+        ("0.9.0", Some("ready"))
+    );
+    assert!(fx.svc.live_hello(B).is_none());
+    // 協商了遠端管理的連線優先（發提議時使用的資訊）
+    fx.connect(A, "0.9.1", "deb");
+    let l = fx.svc.live_hello(A).unwrap();
+    assert_eq!(
+        (l.agent_version.as_str(), l.install_method.as_deref()),
+        ("0.9.1", Some("deb"))
+    );
+}
+
+#[tokio::test]
+async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
+    let signer = TestSigner::new(22);
+    let fx = Fx::new("norb", trust_settings(&signer)).await;
+    // 版本庫只有目標版本：deb 主機（0.9.0）沒有回滾檔
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(B, "0.9.0", "Web", &[], "tar", "ready").await;
+    let body = |allow: bool| json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "waves": [{"size": "rest"}], "options": {"allow_no_rollback": allow}});
+    let p = fx
+        .svc
+        .preview_rollout(RolloutSpec::parse(&body(false)).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["skipped"]["no_rollback"].as_i64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(p["confirm_text"], "升級 1 台");
+    let spec = RolloutSpec::parse(&body(true)).unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
+        (Some(2), Some(1))
+    );
+    assert_eq!(p["confirm_text"], "升級 2 台（無法自動回滾 1 台）");
+    assert_eq!(p["confirm_level"], "L2");
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 只接受設計包的字串：「升級 N 台」、半形括號、台數不符都不行
+    for wrong in [
+        "升級 2 台",
+        "升級 2 台(無法自動回滾 1 台)",
+        "升級 2 台（無法自動回滾 2 台）",
+    ] {
+        let e = fx
+            .svc
+            .submit_rollout(&who(), id.clone(), Some(wrong.into()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "confirmation_required", "{wrong}");
+        let d = e.details.unwrap();
+        assert_eq!(d["confirm_text"], "升級 2 台（無法自動回滾 1 台）");
+        assert_eq!(d["no_rollback"], 1);
+    }
+    let v = fx
+        .svc
+        .submit_rollout(
+            &who(),
+            id.clone(),
+            Some("升級 2 台（無法自動回滾 1 台）".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running");
+}
+
+#[tokio::test]
+async fn pause_cause_and_open_rollback_failures_are_in_the_rollout_json() {
+    let signer = TestSigner::new(23);
+    let fx = Fx::new("cause", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}, "waves": [{"size": "rest"}]})).unwrap();
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["pause_cause"], Value::Null);
+    assert_eq!(v["rollback_failed_unacknowledged"], 0);
+    // 主控台暫停：manual
+    let v = fx
+        .svc
+        .pause_rollout(&who(), id.clone(), "先停".into())
+        .await
+        .unwrap();
+    assert_eq!(v["pause_cause"], "manual");
+    assert_eq!(v["next_action"]["cause"], "manual");
+    let v = fx.svc.resume_rollout(&who(), id.clone()).await.unwrap();
+    assert_eq!(v["pause_cause"], Value::Null);
+    // 回滾失敗：自動暫停（rollback_failed），SSE 的 rollout.progress 也帶 pause_cause
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).unwrap();
+    fx.svc.flush_progress().await;
+    let mut rx = fx.svc.subscribe();
+    fx.svc
+        .apply_upgrade_status(
+            A,
+            "0.9.0",
+            kairos_proto::mgmt::UpgradeStatus {
+                seq: 1,
+                ts: "2026-11-20T02:00:00.000Z".into(),
+                upgrade_id: up,
+                state: "rollback_failed".into(),
+                from_version: "0.9.0".into(),
+                to_version: "0.9.2".into(),
+                code: Some("PLS-E8408".into()),
+                detail: "x".into(),
+                progress: None,
+            },
+        )
+        .await
+        .unwrap();
+    fx.svc.flush_progress().await;
+    let ev = rx.try_recv().expect("rollout.progress");
+    assert_eq!(ev.data["pause_cause"], "rollback_failed");
+    assert_eq!(ev.data["next_action"]["cause"], "rollback_failed");
+    let (r, hosts) = {
+        let id = id.clone();
+        fx.svc
+            .db
+            .read(move |s| Ok((s.get_rollout(&id)?.unwrap(), s.rollout_hosts(&id)?)))
+            .await
+            .unwrap()
+    };
+    let v = rollout_json(&r, &hosts, T0, false);
+    assert_eq!(v["pause_cause"], "rollback_failed");
+    assert_eq!(v["rollback_failed_unacknowledged"], 1);
+    fx.svc
+        .acknowledge_host(&who(), id.clone(), A.into(), None)
+        .await
+        .unwrap();
+    let hosts = {
+        let id = id.clone();
+        fx.svc
+            .db
+            .read(move |s| Ok(s.rollout_hosts(&id)?))
+            .await
+            .unwrap()
+    };
+    let v = rollout_json(&r, &hosts, T0, false);
+    assert_eq!(v["rollback_failed_unacknowledged"], 0, "已標記為已處理");
+    assert_eq!(v["progress"]["rollback_failed"], 1, "progress 仍含已處理的");
+}

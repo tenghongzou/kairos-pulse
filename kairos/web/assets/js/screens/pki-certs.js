@@ -13,7 +13,7 @@ import { api, qs } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as fmt from '../core/format.js';
 import { replaceQuery } from '../core/router.js';
-import { pageHead, emptyState, errorState, field, inlineAlert, dl, skeletonBlock, button, kpiTile, kpiSkeleton, statusBadge } from '../ui/components.js';
+import { pageHead, emptyState, errorState, errorAlert, codeDetails, setBusy, field, inlineAlert, dl, skeletonBlock, button, kpiTile, kpiSkeleton, statusBadge } from '../ui/components.js';
 import { openDialog } from '../ui/dialog.js';
 import { openMenu } from '../ui/menu.js';
 import { toast } from '../ui/toast.js';
@@ -526,36 +526,75 @@ export function render(ctx) {
     }
   }
 
-  // 手動簽發（外部 CA）的既有憑證匯入簽發紀錄（POST /api/v1/pki/certificates/import；PKI.md 第 16 節）
-  async function importCertificates() {
+  // 手動簽發（外部 CA）的既有憑證匯入簽發紀錄（POST /api/v1/pki/certificates/import；PKI.md 第 16 節）。
+  // 設計包 S14「0.9 規格」：結果留在對話框內、不關閉——摘要一行（role="status"），未通過的逐張列出並可展開
+  // KRS-E1305 的三段式；全部未通過時摘要改為 InlineAlert（error）「無法匯入」。全部通過時清空欄位，可以繼續貼上。
+  function importCertificates() {
     const f = textareaField({ label: t('cert.import.pem'), name: 'pem', rows: 8, mono: true, required: true });
-    const r = await actionDialog({
+    const resultBox = h('div', { class: 'k-stack--sm', id: 'cert-import-result' });
+    const errBox = h('div');
+    const ok = h('button', { type: 'button', class: 'ds-button ds-button--primary' }, t('cert.import.submit'));
+    const close = h('button', { type: 'button', class: 'ds-button ds-button--secondary' }, t('common.close'));
+    const d = openDialog({
       title: t('cert.import.title'),
       size: 'md',
-      confirmText: t('cert.import.submit'),
       // 底部固定說明（設計包 S14「0.9 規格」）：外部 CA 簽發的憑證撤銷後，下一次重新連線時才被拒絕
-      content: [h('p', null, t('cert.import.body')), f.el, inlineAlert({ kind: 'info', body: t('cert.import.externalNote') })],
-      collect: () => {
-        const v = f.input.value.trim();
-        if (!v.includes('BEGIN CERTIFICATE')) {
-          f.el.setError(t('cert.import.empty'));
-          f.input.focus();
-          return null;
-        }
-        f.el.setError('');
-        return { pem: v };
-      },
-      submit: (v) => api('/api/v1/pki/certificates/import', { method: 'POST', body: { certificates: v.pem } }),
-      errorTitle: t('cert.import.failed'),
+      body: h('div', { class: 'k-stack--sm' }, h('p', null, t('cert.import.body')), f.el, errBox, resultBox, inlineAlert({ kind: 'info', body: t('cert.import.externalNote') })),
+      actions: [close, ok],
+      initialFocus: f.input,
     });
-    if (!r || r === true) return;
-    const s = r.summary || {};
-    const bad = (r.results || []).filter((x) => x.result === 'rejected');
-    const text = t('cert.import.done', { ok: fmt.num(s.imported || 0), already: fmt.num(s.already_imported || 0), rejected: fmt.num(s.rejected || 0) });
-    showResult(bad.length ? `${text}：${bad.slice(0, 3).map((x) => t('cert.import.rejected', { source: x.source, reason: x.reason })).join('、')}` : text);
-    toast({ kind: bad.length ? 'warning' : 'success', title: text });
-    reload({ keepResult: true });
-    loadKpis();
+    close.addEventListener('click', () => d.close());
+    ok.addEventListener('click', async () => {
+      const v = f.input.value.trim();
+      if (!v.includes('BEGIN CERTIFICATE')) {
+        f.el.setError(t('cert.import.empty'));
+        f.input.focus();
+        return;
+      }
+      f.el.setError('');
+      mount(errBox);
+      setBusy(ok, true, t('common.working'));
+      let r;
+      try {
+        r = await api('/api/v1/pki/certificates/import', { method: 'POST', body: { certificates: v } });
+      } catch (err) {
+        setBusy(ok, false, t('common.working'));
+        const box = errorAlert(err, { title: t('cert.import.failed') });
+        mount(errBox, box);
+        box.focus();
+        return;
+      }
+      setBusy(ok, false, t('common.working'));
+      const sm = r.summary || {};
+      const bad = (r.results || []).filter((x) => x.result === 'rejected');
+      const text = t('cert.import.done', { ok: fmt.num(sm.imported || 0), already: fmt.num(sm.already_imported || 0), rejected: fmt.num(sm.rejected || 0) });
+      const list = bad.length
+        ? h(
+            'ul',
+            { class: 'k-plain-list' },
+            bad.map((x) =>
+              h(
+                'li',
+                null,
+                h('p', null, t('cert.import.rejected', { source: x.source, reason: x.reason })),
+                codeDetails({ productCode: 'KRS-E1305' }, { title: t('cert.import.rejectedTitle', { source: x.source }), reason: x.reason }),
+              ),
+            ),
+          )
+        : null;
+      const allFailed = bad.length > 0 && !(sm.imported || 0) && !(sm.already_imported || 0);
+      mount(
+        resultBox,
+        allFailed
+          ? inlineAlert({ kind: 'error', title: t('cert.import.failed'), body: [h('p', { role: 'status' }, text), list] })
+          : h('div', { class: 'k-stack--sm' }, h('p', { role: 'status', class: 'strong' }, text), list),
+      );
+      if (!bad.length) f.input.value = '';
+      if ((sm.imported || 0) > 0) {
+        reload({ keepResult: true });
+        loadKpis();
+      }
+    });
   }
 
   // ---- 載入 ----

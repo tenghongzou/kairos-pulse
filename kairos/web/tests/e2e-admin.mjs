@@ -427,7 +427,10 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     // 系統健康
     await page.goto(`${URL0}/system/health`);
     await waitTitle(page, '系統健康');
-    for (const id of ['database', 'connections', 'tls', 'alerts', 'metrics']) await page.locator(`[data-item="${id}"]`).waitFor();
+    for (const id of ['database', 'connections', 'tls', 'alerts', 'metrics', 'remote']) await page.locator(`[data-item="${id}"]`).waitFor();
+    // 「遠端管理」列（0.9）：版本庫還是空的，信任錨未設定只註明、不是警告
+    assert.equal(await page.locator('[data-item="remote"]').getAttribute('data-status'), 'ok');
+    await page.locator('[data-item="remote"]').getByText(/進行中的推送 0 個 · 版本庫 0 個版本 · 信任錨未設定/).waitFor();
     assert.equal(await page.getByRole('button', { name: '下載診斷包' }).count(), 0);
     assert.equal(await page.locator('[data-item="directory"]').count(), 0);
     await page.getByText('如何產生診斷包').click();

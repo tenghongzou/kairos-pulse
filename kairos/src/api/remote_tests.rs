@@ -1,6 +1,7 @@
 //! 遠端管理端點（[`super::remote`]）的整合測試：實際的 HTTPS 主控台＋SQLite＋遠端管理服務。
 //! 集中設定（設定檔、版本、指派、衝突、預覽、同步狀態、主機的設定）、版本庫（匯入、上傳、刪除）、
-//! 推送（預覽、建立、送出的 L2 確認、主機表分頁、暫停與繼續的權限、取消）、`[remote]` 停用時的 503。
+//! 推送（預覽、建立、送出的 L2 確認、主機表分頁、暫停與繼續的權限、`pause_cause`、清單的 meta、取消）、系統健康的
+//! `remote` 項目、`[remote]` 停用時的 503。
 
 use serde_json::{Value, json};
 
@@ -296,6 +297,24 @@ async fn remote_unavailable_when_disabled() {
         assert_eq!(r.status, 503, "{path}");
         assert_eq!(body(&r)["error"]["code"], "remote_unavailable");
     }
+    // 系統健康：停用是正常狀態
+    let r = call(f.addr(), "GET", "/api/v1/system/health", Some(&admin), None).await;
+    let it = body(&r)["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "remote")
+        .cloned()
+        .unwrap();
+    assert_eq!(it["status"], "ok");
+    assert_eq!(
+        (
+            it["values"]["config_enabled"].as_bool(),
+            it["values"]["upgrade_enabled"].as_bool()
+        ),
+        (Some(false), Some(false))
+    );
+    assert!(it["summary"].as_str().unwrap().starts_with("已停用"));
     f.stop().await;
 }
 
@@ -480,6 +499,79 @@ async fn releases_and_rollouts_over_https() {
         (r.status, body(&r)["data"]["state"].as_str()),
         (200, Some("paused"))
     );
+    assert_eq!(body(&r)["data"]["pause_cause"], "manual");
+    // 清單的 meta：需要人處理的數量（不受 state 篩選影響）
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/rollouts?state=running",
+        Some(&auditor),
+        None,
+    )
+    .await;
+    let list = body(&r);
+    assert_eq!(list["data"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        list["meta"],
+        json!({"paused": 1, "rollback_failed_unacknowledged": 0})
+    );
+    // 系統健康的「遠端管理」：主控台暫停不算異常
+    let viewer = token(&f, Role::Viewer);
+    let remote_item = |r: &Resp| {
+        body(r)["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "remote")
+            .cloned()
+            .expect("remote 項目")
+    };
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(it["status"], "ok", "{it}");
+    assert_eq!(
+        (
+            it["values"]["upgrade_enabled"].as_bool(),
+            it["values"]["allowed_signers_configured"].as_bool(),
+            it["values"]["rollouts_paused"].as_i64(),
+            it["values"]["rollouts_auto_paused"].as_i64(),
+            it["values"]["releases"].as_i64(),
+        ),
+        (Some(true), Some(true), Some(1), Some(0), Some(1))
+    );
+    assert_eq!(it["values"]["paused"][0]["cause"], "manual");
+    assert!(
+        it["summary"].as_str().unwrap().contains("已暫停 1 個"),
+        "{it}"
+    );
+    // 回滾失敗（以 SQL 模擬）：嚴重、KRS-E8408；清單的每筆與 meta 都有未處理的台數；唯讀看不到細節
+    f.admin()
+        .execute("UPDATE rollout_hosts SET state = 'rollback_failed'", [])
+        .unwrap();
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(
+        (it["status"].as_str(), it["product_code"].as_str()),
+        (Some("critical"), Some("KRS-E8408"))
+    );
+    assert_eq!(body(&r)["data"]["status"], "critical");
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&viewer), None).await;
+    let it = remote_item(&r);
+    assert_eq!(
+        (
+            it["restricted"].as_bool(),
+            it["values"].is_null(),
+            it["status"].as_str()
+        ),
+        (Some(true), true, Some("critical"))
+    );
+    let r = call(addr, "GET", "/api/v1/rollouts", Some(&auditor), None).await;
+    let list = body(&r);
+    assert_eq!(list["meta"]["rollback_failed_unacknowledged"], 1);
+    assert_eq!(list["data"][0]["rollback_failed_unacknowledged"], 1);
+    f.admin()
+        .execute("UPDATE rollout_hosts SET state = 'pending'", [])
+        .unwrap();
     let r = call(
         addr,
         "POST",

@@ -715,6 +715,8 @@ async fn export_endpoints_over_https() {
     let d = r.json()["data"].clone();
     assert_eq!(d["prometheus"]["enabled"], false);
     assert_eq!(d["otlp"]["status"]["state"], "disabled");
+    // SQLite：機密的金鑰檔可以使用（主控台不必等保存標頭被 503 拒絕才知道）
+    assert_eq!(d["otlp"]["secrets_available"], true);
     let naming = d["settings"]
         .as_array()
         .unwrap()

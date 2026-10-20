@@ -3,7 +3,8 @@
 // - 頁首：名稱、目標、建立者；動作依狀態與權限——暫停…（rollouts:pause，管理員與維運者；L1、原因必填）、
 //   繼續…（rollouts:write；暫停中為 resume，觀察期滿等待繼續時為 continue；L1）、取消推送…（rollouts:write；L1、原因必填）。
 //   草稿另有「送出推送…」（L2／L3，與建立推送相同的對話框）。
-// - 已暫停：InlineAlert 寫出原因（pause_reason）與「查看失敗的主機」「繼續…」；觀察中與等待繼續的說明。
+// - 已暫停：InlineAlert 寫出原因（pause_reason）與「查看失敗的主機」「繼續…」；自動暫停（pause_cause 不是 manual）
+//   標題為「已自動暫停：…」並附 KRS-W8414，主控台暫停不附代碼。觀察中與等待繼續的說明。
 // - 回滾失敗的主機：嚴重的 InlineAlert 列在最上方（連到主機詳情，在「升級」卡片標記為已處理）。
 // - 批次：先行批次與其餘的台數、各狀態的台數、失敗比例與上限、觀察時間、目前的批次。
 // - 主機表：GET /rollouts/{id}/hosts（伺服器端分頁「載入更多」；批次、狀態、搜尋篩選；「失敗的主機」一次選取 4 種失敗狀態）；
@@ -240,6 +241,7 @@ export function render(ctx) {
     const out = [];
     if (r.state === 'draft') out.push(inlineAlert({ kind: 'info', body: t('rm.det.draftNote') }));
     if (r.state === 'paused') {
+      const auto = Boolean(r.pause_cause) && r.pause_cause !== 'manual';
       const acts = [
         btn(t('rm.det.showFailed'), () => {
           stateSel.value = FAILED.join(',');
@@ -252,7 +254,15 @@ export function render(ctx) {
       out.push(
         inlineAlert({
           kind: 'warning',
-          title: r.pause_reason ? t('rm.det.pausedTitle', { reason: r.pause_reason }) : t('rm.det.pausedTitleNoReason'),
+          // 自動暫停（pause_cause 不是 manual：失敗比例、回滾失敗、簽章失敗）才附 KRS-W8414
+          title: auto
+            ? r.pause_reason
+              ? t('rm.det.autoPausedTitle', { reason: r.pause_reason })
+              : t('rm.det.autoPausedTitleNoReason')
+            : r.pause_reason
+              ? t('rm.det.pausedTitle', { reason: r.pause_reason })
+              : t('rm.det.pausedTitleNoReason'),
+          code: auto ? 'KRS-W8414' : null,
           body: t('rm.det.pausedBody'),
           actions: acts,
         }),
@@ -262,8 +272,8 @@ export function render(ctx) {
     if (r.state === 'running' && na.code === 'soaking') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.soaking', { m: fmt.num(na.minutes || 0), t: fmt.dateTime(na.until, { seconds: false }) }) }));
     if (r.state === 'running' && na.code === 'waiting_continue') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.awaiting') }));
     if (r.state === 'cancelled' && r.cancel_reason) out.push(h('p', { class: 'caption' }, t('rm.det.cancelReason', { r: r.cancel_reason })));
-    // 回滾失敗（最上方，嚴重）
-    if (r.progress && r.progress.rollback_failed) {
+    // 回滾失敗（最上方，嚴重）：只有尚未標記為已處理的主機（rollback_failed_unacknowledged）
+    if (r.rollback_failed_unacknowledged > 0) {
       try {
         const list = (await api(`/api/v1/rollouts/${encodeURIComponent(id)}/hosts${qs({ state: 'rollback_failed', limit: 100 })}`)) || [];
         const open = list.filter((x) => !x.acknowledged_at);

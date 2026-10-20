@@ -66,6 +66,7 @@ export const PRIVACY_STRINGS = {
   'cert.import.failed': '無法匯入',
   'cert.import.empty': '請貼上至少一張 PEM 憑證',
   'cert.import.rejected': '{source}：未通過（KRS-E1305）：{reason}',
+  'cert.import.rejectedTitle': '無法匯入憑證：{source} 未通過檢查',
   // 匯入對話框底部的固定說明；同一句也放在外部 CA 簽發（issued_via = import、ca_id 為 null）的憑證的撤銷對話框
   'cert.import.externalNote':
     '外部 CA 簽發的憑證不在 Kairos 的撤銷清單中：在這裡撤銷後，已連線中的主機在下一次重新連線時才會被拒絕。需要立即中斷時，以 kairos pki revocations export 匯出撤銷清單，到 CA 主機產生 CRL 後部署（auth.crl）。',

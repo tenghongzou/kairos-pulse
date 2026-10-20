@@ -7,8 +7,11 @@
 //   正確的發佈（本檔以 Node.js 的 Ed25519 產生與 ssh-keygen -Y sign 相同格式的 SHA256SUMS.sig）→ 逐檔上傳
 //   （✓ 雜湊相符、不在 SHA256SUMS 中的檔案就地錯誤）→ 清單與詳情（已上傳／待上傳）；推送使用中時刪除為 aria-disabled，
 //   取消推送後以 L2（輸入版本號）刪除。
-// - S26：建立推送的單頁表單與資格預覽（可升級 1 台、Pulse 太舊的主機分列）→ L2 輸入「升級 1 台」送出 → 詳情；
-//   維運者只有「暫停…」（L1、原因必填）→ 計數泡泡 → 管理員「繼續…」→「取消推送…」。
+// - S26：建立推送的單頁表單與資格預覽（資格依連線中主機的 hello，不等清冊同步；可升級 1 台、Pulse 太舊的主機分列）
+//   → 無法自動回滾的 L2 字串（攔截預覽）→ L2 輸入「升級 1 台」送出 → 詳情；維運者只有「暫停…」（L1、原因必填；
+//   主控台暫停不附 KRS-W8414）→ 計數泡泡；自動暫停的標題與 KRS-W8414、計數泡泡依清單的 meta（攔截 API）→
+//   管理員「繼續…」→「取消推送…」。
+// - S20「遠端管理」列（信任錨未設定的警告與捷徑；唯讀不顯示）。
 // - S24（維運者，config:write）：新增設定檔（依 schema 產生的欄位、範圍錯誤、隱私敏感的選項）→ 指派全站（影響預覽）→
 //   修改產生第 2 版 → 版本歷史 → 回復到第 1 版 → 刪除被指派擋下 → S05「設定」分頁 → 解除指派 → 刪除；稽核員唯讀。
 // - S04 的「設定狀態」「遠端升級」篩選；S05 的「升級」卡片（攔截 API 模擬回滾失敗與「標記為已處理…」）。
@@ -165,7 +168,24 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await axe(page, 'F8 S25 版本詳情');
     await page.emulateMedia({ colorScheme: 'dark' });
     await axe(page, 'F8 S25 版本詳情（深色）');
+    await page.emulateMedia({ colorScheme: 'light' });
+    // S20「遠端管理」列：版本庫有發佈版本、信任錨未設定 → 警告，附前往版本庫的捷徑
+    await page.goto(`${URL0}/system/health`);
+    await waitTitle(page, '系統健康');
+    const remoteRow = page.locator('[data-item="remote"]');
+    await remoteRow.getByText('遠端管理', { exact: true }).waitFor();
+    assert.equal(await remoteRow.getAttribute('data-status'), 'warning');
+    await remoteRow.getByText(/信任錨未設定：匯入的發佈版本無法驗證簽章/).waitFor();
+    await remoteRow.getByRole('link', { name: '前往 Pulse 版本庫' }).waitFor();
+    await axe(page, 'F8 S20 遠端管理列');
     await ctx.close();
+    // 唯讀（沒有 rollouts:read）：不顯示「遠端管理」列
+    const v = await newPage();
+    await login(v.page, 'viewer', PW, '/system/health');
+    await waitTitle(v.page, '系統健康');
+    await v.page.locator('[data-item="database"]').waitFor();
+    assert.equal(await v.page.locator('[data-item="remote"]').count(), 0);
+    await v.ctx.close();
   });
 
   test('F8 S26 升級推送：資格預覽 → L2 送出 → 維運者暫停（計數泡泡）→ 管理員繼續、取消 → 刪除版本（L2）', async () => {
@@ -173,11 +193,10 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await login(page, 'admin', PW, '/pulse/rollouts');
     await waitTitle(page, '升級推送');
     await page.getByText('還沒有升級推送').waitFor();
-    // 推送的資格依清冊（每 30 秒與連線狀態同步，API.md 第 17.3 節）：等 pulse-09 的 install 寫入清冊
-    await until(async () => {
-      const r = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
-      return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === 'ready';
-    }, 45000, 'pulse-09 的 install 同步到清冊');
+    // 推送的資格以連線中主機的 hello 為準（API.md 第 17.3 節）：不必等清冊每 30 秒的同步
+    const upg = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
+    assert.equal(upg.status, 200);
+    assert.equal(upg.json.data.install.upgrade, 'ready');
     await axe(page, 'F8 S26 推送（空）');
     await page.getByRole('link', { name: '建立推送' }).first().click();
     await waitTitle(page, '建立推送');
@@ -197,6 +216,26 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await page.getByRole('button', { name: '送出推送…' }).click();
     await page.getByText('請輸入 0～10,080 的整數').waitFor();
     await soak.fill('60');
+    // 允許無法自動回滾的主機時的 L2 字串（設計包 S26）：攔截一次預覽模擬 1 台無法自動回滾，對話框照字串顯示後取消
+    await page.route(
+      '**/api/v1/rollouts/preview',
+      async (route) => {
+        const r = await route.fetch();
+        const body = await r.json();
+        body.data.no_rollback = 1;
+        body.data.confirm_text = `升級 ${body.data.eligible} 台（無法自動回滾 1 台）`;
+        return route.fulfill({ response: r, json: body });
+      },
+      { times: 1 },
+    );
+    await page.getByRole('button', { name: '送出推送…' }).click();
+    const nrb = page.getByRole('dialog');
+    await nrb.getByText('輸入「升級 1 台（無法自動回滾 1 台）」以確認').waitFor();
+    await nrb.getByText('其中 1 台無法自動回滾，升級失敗時需要到現場處理。').waitFor();
+    assert.ok(await nrb.getByRole('button', { name: '升級 1 台（無法自動回滾 1 台）' }).isDisabled());
+    await axe(page, 'F8 S26 送出確認（無法自動回滾，L2）');
+    await nrb.getByRole('button', { name: '取消' }).click();
+    await nrb.waitFor({ state: 'detached' });
     await page.getByRole('button', { name: '送出推送…' }).click();
     const dlg = page.getByRole('dialog');
     await dlg.getByText('輸入「升級 1 台」以確認').waitFor();
@@ -234,6 +273,8 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await pd.getByRole('button', { name: '暫停推送' }).click();
     await o.page.getByText('已暫停推送').first().waitFor();
     await o.page.getByText('已暫停：E2E：現場回報異常，先停').waitFor();
+    // 主控台暫停（pause_cause: manual）不附 KRS-W8414
+    assert.equal(await o.page.locator('.ds-alert', { hasText: '已暫停：E2E：現場回報異常，先停' }).getByText('KRS-W8414').count(), 0);
     // 計數泡泡（已暫停的推送）
     const badge = o.page.locator('.ds-sidenav__link', { hasText: '升級推送' }).locator('.ds-sidenav__count');
     await badge.waitFor({ timeout: 15000 });
@@ -246,6 +287,32 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(await o.page.getByRole('link', { name: '建立推送' }).count(), 0, '維運者沒有建立推送');
     await axe(o.page, 'F8 S26 推送清單（維運者）');
     await o.ctx.close();
+
+    // 自動暫停（攔截詳情：pause_cause = failure_ratio）：「已自動暫停：…」並附 KRS-W8414；
+    // 計數泡泡以清單的 meta 計算（攔截：已暫停 1＋回滾失敗未處理 2 → 3）
+    const ap = await newPage();
+    await ap.page.route(`**/api/v1/rollouts/${rolloutId}`, async (route) => {
+      const r = await route.fetch();
+      const body = await r.json();
+      body.data.pause_cause = 'failure_ratio';
+      body.data.pause_reason = '第 1 批的失敗比例 100%（1／1）超過上限 0%';
+      return route.fulfill({ response: r, json: body });
+    });
+    await ap.page.route('**/api/v1/rollouts', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const r = await route.fetch();
+      const body = await r.json();
+      body.meta = { ...body.meta, rollback_failed_unacknowledged: 2 };
+      return route.fulfill({ response: r, json: body });
+    });
+    await login(ap.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(ap.page, 'E2E 0.9.1');
+    const autoAlert = ap.page.locator('.ds-alert', { hasText: '已自動暫停：第 1 批的失敗比例 100%（1／1）超過上限 0%' });
+    await autoAlert.getByText('KRS-W8414').waitFor();
+    const apBadge = ap.page.locator('.ds-sidenav__link', { hasText: '升級推送' }).locator('.ds-sidenav__count');
+    await until(async () => (await apBadge.count()) && (await apBadge.textContent()).trim() === '3', 15000, '計數泡泡 3');
+    await axe(ap.page, 'F8 S26 已自動暫停');
+    await ap.ctx.close();
 
     // 管理員：繼續 → 取消
     const a = await newPage();

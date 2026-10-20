@@ -554,6 +554,8 @@ export const REMOTE_STRINGS = {
   'rm.det.draftNote': '這是尚未送出的草稿：送出時才固定對象並開始升級。',
   'rm.det.pausedTitle': '已暫停：{reason}',
   'rm.det.pausedTitleNoReason': '已暫停',
+  'rm.det.autoPausedTitle': '已自動暫停：{reason}',
+  'rm.det.autoPausedTitleNoReason': '已自動暫停',
   'rm.det.pausedBody': '提議中、尚未替換的主機已停止；查看失敗的主機後「繼續」或「取消推送」。',
   'rm.det.showFailed': '查看失敗的主機',
   'rm.det.cancelReason': '取消原因：{r}',

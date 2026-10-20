@@ -74,6 +74,7 @@ inventory_network = "keep"      # keep | truncate（介面位址截到 /24、/48
 - **金鑰**：`data/privacy.key`（32 bytes，0600），Kairos 在需要時（設定了 `pseudonymize`）第一次啟動建立；金鑰無法建立或讀取時 Kairos **拒絕啟動**（`KRS-E4005`）——管理者要求假名化，不能退回保存原值。金鑰不在資料庫中，`kairos db backup --include-keys` 會一併加密備份（STORAGE.md 第 9 節）。
 - **一致**：同一個名稱在任何主機、任何時間都得到同一個假名，主控台的搜尋、告警、註冊申請的「主機名稱重複」判斷照常運作。
 - **查詢**：`kairos hosts pseudonym <主機名稱>...`（`--kind host|name|user`）以金鑰算出假名，回答「`ann-laptop` 在 Kairos 中叫什麼」。
+- **主機 API**：`pseudonymized`（API.md 第 5.1 節）依格式（`host-` ＋ 12 個 base32 小寫字元）判斷主機名稱是否為假名，主控台 S05 據此顯示說明。不留原值所以只能依格式：改回 `keep` 之後先前假名化的主機仍為 `true`。
 
 | 方式 | 說明 | 取捨 |
 |---|---|---|

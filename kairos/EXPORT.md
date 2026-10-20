@@ -291,7 +291,7 @@ service:
 ```
 
 - `otlp.headers`：陣列為「整組取代」（可為空陣列＝不帶標頭），`null` 為刪除主控台的值（改用 `headers_file`）；最多 16 個，不可自訂 `Host`、`Content-Type`、`Content-Length`、`Transfer-Encoding`、`Connection`、`User-Agent`。
-- 錯誤：不合法的值、未知的欄位、啟用 OTLP 卻沒有端點 → `400 invalid_parameter`（`KRS-E4314`，`details.parameter` 為設定鍵）；鍵由環境變數設定 → `409 locked_by_environment`（`details.variable`；標頭看 `KAIROS__EXPORT__OTLP__HEADERS_FILE`）；`alerts-secrets.key` 無法使用時不能保存標頭 → `503 secrets_unavailable`。
+- 錯誤：不合法的值、未知的欄位、啟用 OTLP 卻沒有端點 → `400 invalid_parameter`（`KRS-E4314`，`details.parameter` 為設定鍵）；鍵由環境變數設定 → `409 locked_by_environment`（`details.variable`；標頭看 `KAIROS__EXPORT__OTLP__HEADERS_FILE`）；`alerts-secrets.key` 無法使用時不能保存標頭 → `503 secrets_unavailable`（`GET` 的 `otlp.secrets_available` 為 `false` 時就是這種情況，主控台據此一開始就停用標頭欄位）。
 - 回應與 `GET` 相同：
 
 ```json

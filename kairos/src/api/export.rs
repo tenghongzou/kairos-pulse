@@ -257,6 +257,8 @@ pub fn view(ctx: &ApiContext, hub: &ExportHub) -> Value {
             "max_retries": o.max_retries,
             "headers": xs::masked_headers(&eff.headers),
             "headers_source": eff.headers_from.as_str(),
+            // 機密的金鑰檔（alerts-secrets.key）可以使用：false 時不能保存或更換標頭（PUT 回 503 secrets_unavailable）
+            "secrets_available": hub.secrets.is_some(),
             "ca_file": o.ca_file,
             "client_certificate": !o.client_cert.trim().is_empty(),
             "resource_attributes": o.resource_attributes,
