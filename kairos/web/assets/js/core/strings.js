@@ -309,6 +309,7 @@ const M = {
   'health.enroll': '註冊端點',
   'health.alerts': '告警引擎',
   'health.metrics': '/metrics 端點',
+  'health.remote': '遠端管理',
   'health.item': '{label}：{summary}',
 
   // ---- 總覽（S03） ----

@@ -3,6 +3,7 @@
 // - 只讀一支 API：GET /api/v1/system/health（每 30 秒更新）。0.8 起簽發 CA、註冊端點、告警引擎、/metrics 端點也由
 //   後端併入（INTEGRATION §29.6）：頁首「整體」與頂列系統狀態燈都依 API 的 status，兩處一致；沒有對應權限的
 //   項目只有狀態與代碼（restricted），不顯示數值。
+// - 0.9 的「遠端管理」列（remote）：需要 rollouts:read，沒有權限時不顯示；異常時附前往推送或版本庫的捷徑。
 // - 「下載診斷包」沒有 API：改為「如何產生診斷包」與可複製的 kairos diag 指令；「目錄服務」列隱藏（§28.6）。
 // - 唯讀（沒有 settings:read）只看整體狀態與各項 StatusBadge，不看數值細節（S20 權限差異）。
 // - 健康 API 本身無回應：整頁 Banner「無法取得健康狀態」，與「全部正常」在視覺上完全不同。
@@ -31,6 +32,13 @@ function shortcut(it) {
   if (it.id === 'enroll' && session.can('settings:read')) return h('a', { href: '/system/settings/security' }, t('adm.health.toEnrollMode'));
   if ((it.id === 'issuing_ca' || it.id === 'tls') && session.can('pki:read') && it.status !== 'ok') return h('a', { href: '/certificates/ca' }, t('adm.health.toCa'));
   if (it.id === 'alerts' && session.can('alerts:read') && it.status !== 'ok') return h('a', { href: '/alerts/events' }, t('adm.health.toAlerts'));
+  // 遠端管理：回滾失敗 → 推送清單；自動暫停 → 已暫停的推送；信任錨未設定 → 版本庫（S25 有設定說明）
+  if (it.id === 'remote' && it.status !== 'ok' && it.values) {
+    const v = it.values;
+    if (v.rollback_failed_unacknowledged > 0) return h('a', { href: '/pulse/rollouts' }, t('adm.health.toRollouts'));
+    if (v.rollouts_auto_paused > 0) return h('a', { href: '/pulse/rollouts?state=paused' }, t('adm.health.toPausedRollouts'));
+    if (v.upgrade_enabled && !v.allowed_signers_configured && session.can('releases:read')) return h('a', { href: '/pulse/releases' }, t('adm.health.toReleases'));
+  }
   return null;
 }
 
@@ -79,7 +87,8 @@ export function render(ctx) {
       return;
     }
     if (my !== seq || disposed) return;
-    const items = [...(hd.items || [])];
+    // 「遠端管理」列需要 rollouts:read，沒有權限時不顯示（screens.md S20「0.9 規格」）
+    const items = (hd.items || []).filter((i) => i.id !== 'remote' || session.can('rollouts:read'));
     const order = { critical: 0, warning: 1, ok: 2 };
     items.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
     const bad = items.filter((i) => i.status !== 'ok');

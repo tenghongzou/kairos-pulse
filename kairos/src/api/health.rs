@@ -2,7 +2,7 @@
 //!
 //! 每個檢查項目一列：狀態（`ok`／`warning`／`critical`）、對應的產品代碼、摘要與數值；整體取最嚴重者。
 //!
-//! 0.8 起簽發 CA、註冊端點、告警引擎、`/metrics` 端點也在這裡（設計包 INTEGRATION §29.6「S20 項目併入
+//! 0.8 起簽發 CA、註冊端點、告警引擎、`/metrics` 端點也在這裡（0.9 另有遠端管理 `remote`）（設計包 INTEGRATION §29.6「S20 項目併入
 //! `system/health`」）：**整體狀態對所有人相同**，但這幾項的摘要與數值只給有對應讀取權限的身分
 //! （[`Item::detail`]；沒有權限時 `restricted: true`、`summary` 為空字串、`values` 為 `null`，狀態與代碼照常）。
 
@@ -758,6 +758,142 @@ fn metrics_endpoint(ctx: &ApiContext) -> Item {
     .needs(Permission::SettingsRead)
 }
 
+/// 遠端管理（S20「遠端管理」列；設計包 screens.md S20「0.9 規格」、REMOTE.md R10）：集中設定與遠端升級是否
+/// 啟用、信任錨、推送的暫停與回滾失敗。數值需要 `rollouts:read`。嚴重度：回滾失敗未處理（`KRS-E8408`）＞
+/// 自動暫停的推送（`KRS-W8414`）＞ 信任錨未設定（遠端升級啟用、版本庫有發佈版本時；版本庫是空的只註明）；
+/// 主控台暫停的推送不算異常
+async fn remote(ctx: &ApiContext) -> Item {
+    let Some(svc) = ctx.remote.as_ref() else {
+        return Item::new(
+            "remote",
+            Level::Ok,
+            "未提供（需要 SQLite 儲存）",
+            json!({"available": false, "config_enabled": false, "upgrade_enabled": false}),
+        )
+        .needs(Permission::RolloutsRead);
+    };
+    let st = &svc.settings;
+    let trust = !st.allowed_signers.trim().is_empty();
+    let mut values = json!({
+        "available": true,
+        "config_enabled": st.config_enabled,
+        "upgrade_enabled": st.upgrade_enabled,
+        "allowed_signers_configured": trust,
+    });
+    if !st.config_enabled && !st.upgrade_enabled {
+        return Item::new(
+            "remote",
+            Level::Ok,
+            "已停用（remote.config_enabled、remote.upgrade_enabled = false）",
+            values,
+        )
+        .needs(Permission::RolloutsRead);
+    }
+    if !st.upgrade_enabled {
+        return Item::new(
+            "remote",
+            Level::Ok,
+            "集中設定啟用 · 遠端升級已停用（remote.upgrade_enabled = false）",
+            values,
+        )
+        .needs(Permission::RolloutsRead);
+    }
+    use crate::remote::rollout;
+    let counts = svc
+        .db
+        .read(|s| {
+            Ok((
+                s.list_rollouts(Some(rollout::ROLLOUT_RUNNING))?.len(),
+                s.list_rollouts(Some(rollout::ROLLOUT_PAUSED))?,
+                s.list_releases()?.len(),
+                s.unacknowledged_rollback_failures()?.len(),
+            ))
+        })
+        .await;
+    let (running, paused, releases, failures) = match counts {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("系統健康：無法讀取推送的狀態：{e}");
+            values["error"] = json!("無法讀取推送的狀態");
+            return Item::new("remote", Level::Warning, "無法讀取推送的狀態", values)
+                .needs(Permission::RolloutsRead);
+        }
+    };
+    let auto: Vec<_> = paused.iter().filter(|r| r.pause_cause.is_some()).collect();
+    values["rollouts_running"] = json!(running);
+    values["rollouts_paused"] = json!(paused.len());
+    values["rollouts_auto_paused"] = json!(auto.len());
+    values["paused"] = json!(
+        paused
+            .iter()
+            .take(10)
+            .map(|r| json!({
+                "id": r.id,
+                "name": r.name,
+                "reason": r.pause_reason,
+                "cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
+            }))
+            .collect::<Vec<_>>()
+    );
+    values["releases"] = json!(releases);
+    values["rollback_failed_unacknowledged"] = json!(failures);
+    values["downloads_in_progress"] = json!(svc.downloads_in_progress());
+    values["max_concurrent_downloads"] = json!(st.max_concurrent_downloads);
+    let config_note = if st.config_enabled {
+        ""
+    } else {
+        " · 集中設定已停用"
+    };
+    let (status, code, summary) = if failures > 0 {
+        (
+            Level::Critical,
+            Some(crate::remote::CODE_ROLLBACK_FAILED),
+            format!("{failures} 台主機升級回滾失敗，需要人工處理"),
+        )
+    } else if let Some(r) = auto.first() {
+        let more = if auto.len() > 1 {
+            format!(" 等 {} 個", auto.len())
+        } else {
+            String::new()
+        };
+        (
+            Level::Warning,
+            Some(crate::remote::CODE_ROLLOUT_PAUSED),
+            format!(
+                "推送已自動暫停：{}{more}（{}）",
+                r.name,
+                r.pause_reason.as_deref().unwrap_or("—")
+            ),
+        )
+    } else if !trust && releases > 0 {
+        (
+            Level::Warning,
+            None,
+            "信任錨未設定：匯入的發佈版本無法驗證簽章（不影響 Pulse 端的驗證）".to_string(),
+        )
+    } else {
+        let paused_note = if paused.is_empty() {
+            String::new()
+        } else {
+            format!(" · 已暫停 {} 個", paused.len())
+        };
+        // 版本庫還是空的：信任錨未設定只註明（還沒有使用遠端升級，不列為警告）
+        let trust_note = if trust { "" } else { " · 信任錨未設定" };
+        (
+            Level::Ok,
+            None,
+            format!(
+                "進行中的推送 {running} 個{paused_note} · 版本庫 {releases} 個版本{trust_note}{config_note}"
+            ),
+        )
+    };
+    let item = Item::new("remote", status, summary, values).needs(Permission::RolloutsRead);
+    match code {
+        Some(c) => item.code(c),
+        None => item,
+    }
+}
+
 /// 系統健康
 pub async fn compute(ctx: &Arc<ApiContext>, now: DateTime<Utc>) -> Result<Health, ApiError> {
     let db = ctx
@@ -787,6 +923,7 @@ pub async fn compute(ctx: &Arc<ApiContext>, now: DateTime<Utc>) -> Result<Health
     }
     items.push(alerts(ctx).await);
     items.push(metrics_endpoint(ctx));
+    items.push(remote(ctx).await);
     let status = items.iter().map(|i| i.status).max().unwrap_or(Level::Ok);
     Ok(Health {
         status,

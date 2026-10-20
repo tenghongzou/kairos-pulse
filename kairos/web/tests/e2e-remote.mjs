@@ -168,7 +168,24 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await axe(page, 'F8 S25 版本詳情');
     await page.emulateMedia({ colorScheme: 'dark' });
     await axe(page, 'F8 S25 版本詳情（深色）');
+    await page.emulateMedia({ colorScheme: 'light' });
+    // S20「遠端管理」列：版本庫有發佈版本、信任錨未設定 → 警告，附前往版本庫的捷徑
+    await page.goto(`${URL0}/system/health`);
+    await waitTitle(page, '系統健康');
+    const remoteRow = page.locator('[data-item="remote"]');
+    await remoteRow.getByText('遠端管理', { exact: true }).waitFor();
+    assert.equal(await remoteRow.getAttribute('data-status'), 'warning');
+    await remoteRow.getByText(/信任錨未設定：匯入的發佈版本無法驗證簽章/).waitFor();
+    await remoteRow.getByRole('link', { name: '前往 Pulse 版本庫' }).waitFor();
+    await axe(page, 'F8 S20 遠端管理列');
     await ctx.close();
+    // 唯讀（沒有 rollouts:read）：不顯示「遠端管理」列
+    const v = await newPage();
+    await login(v.page, 'viewer', PW, '/system/health');
+    await waitTitle(v.page, '系統健康');
+    await v.page.locator('[data-item="database"]').waitFor();
+    assert.equal(await v.page.locator('[data-item="remote"]').count(), 0);
+    await v.ctx.close();
   });
 
   test('F8 S26 升級推送：資格預覽 → L2 送出 → 維運者暫停（計數泡泡）→ 管理員繼續、取消 → 刪除版本（L2）', async () => {
