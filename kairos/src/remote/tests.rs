@@ -1286,3 +1286,63 @@ async fn cancel_withdraws_offers_but_records_an_apply_that_already_started() {
         .unwrap();
     assert_eq!(fx.host_state(&id, A).await.state, "succeeded");
 }
+
+#[tokio::test]
+async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
+    let signer = TestSigner::new(22);
+    let fx = Fx::new("norb", trust_settings(&signer)).await;
+    // 版本庫只有目標版本：deb 主機（0.9.0）沒有回滾檔
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(B, "0.9.0", "Web", &[], "tar", "ready").await;
+    let body = |allow: bool| json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "waves": [{"size": "rest"}], "options": {"allow_no_rollback": allow}});
+    let p = fx
+        .svc
+        .preview_rollout(RolloutSpec::parse(&body(false)).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["skipped"]["no_rollback"].as_i64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(p["confirm_text"], "升級 1 台");
+    let spec = RolloutSpec::parse(&body(true)).unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
+        (Some(2), Some(1))
+    );
+    assert_eq!(p["confirm_text"], "升級 2 台（無法自動回滾 1 台）");
+    assert_eq!(p["confirm_level"], "L2");
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 只接受設計包的字串：「升級 N 台」、半形括號、台數不符都不行
+    for wrong in [
+        "升級 2 台",
+        "升級 2 台(無法自動回滾 1 台)",
+        "升級 2 台（無法自動回滾 2 台）",
+    ] {
+        let e = fx
+            .svc
+            .submit_rollout(&who(), id.clone(), Some(wrong.into()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "confirmation_required", "{wrong}");
+        let d = e.details.unwrap();
+        assert_eq!(d["confirm_text"], "升級 2 台（無法自動回滾 1 台）");
+        assert_eq!(d["no_rollback"], 1);
+    }
+    let v = fx
+        .svc
+        .submit_rollout(
+            &who(),
+            id.clone(),
+            Some("升級 2 台（無法自動回滾 1 台）".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running");
+}

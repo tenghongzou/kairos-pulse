@@ -200,6 +200,26 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await page.getByRole('button', { name: '送出推送…' }).click();
     await page.getByText('請輸入 0～10,080 的整數').waitFor();
     await soak.fill('60');
+    // 允許無法自動回滾的主機時的 L2 字串（設計包 S26）：攔截一次預覽模擬 1 台無法自動回滾，對話框照字串顯示後取消
+    await page.route(
+      '**/api/v1/rollouts/preview',
+      async (route) => {
+        const r = await route.fetch();
+        const body = await r.json();
+        body.data.no_rollback = 1;
+        body.data.confirm_text = `升級 ${body.data.eligible} 台（無法自動回滾 1 台）`;
+        return route.fulfill({ response: r, json: body });
+      },
+      { times: 1 },
+    );
+    await page.getByRole('button', { name: '送出推送…' }).click();
+    const nrb = page.getByRole('dialog');
+    await nrb.getByText('輸入「升級 1 台（無法自動回滾 1 台）」以確認').waitFor();
+    await nrb.getByText('其中 1 台無法自動回滾，升級失敗時需要到現場處理。').waitFor();
+    assert.ok(await nrb.getByRole('button', { name: '升級 1 台（無法自動回滾 1 台）' }).isDisabled());
+    await axe(page, 'F8 S26 送出確認（無法自動回滾，L2）');
+    await nrb.getByRole('button', { name: '取消' }).click();
+    await nrb.waitFor({ state: 'detached' });
     await page.getByRole('button', { name: '送出推送…' }).click();
     const dlg = page.getByRole('dialog');
     await dlg.getByText('輸入「升級 1 台」以確認').waitFor();

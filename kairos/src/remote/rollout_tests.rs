@@ -510,8 +510,14 @@ fn next_action_codes_and_confirm_text() {
         next_action(ROLLOUT_RUNNING, None, false, None, None, 0)["code"],
         "upgrading"
     );
-    assert_eq!(confirm_text(312, false), "升級 312 台");
-    assert_eq!(confirm_text(3, true), "降版 3 台");
+    assert_eq!(confirm_text(312, false, 0), "升級 312 台");
+    assert_eq!(confirm_text(3, true, 0), "降版 3 台");
+    // 允許無法自動回滾的主機（設計包 S26 的字串，全形括號）；降版優先
+    assert_eq!(
+        confirm_text(312, false, 12),
+        "升級 312 台（無法自動回滾 12 台）"
+    );
+    assert_eq!(confirm_text(3, true, 2), "降版 3 台");
     let p = progress(&[rh(1, 0, 0, HOST_SUCCEEDED), rh(2, 0, 0, HOST_SUCCEEDED)]);
     assert_eq!(p["succeeded"], 2);
     assert_eq!(p["pending"], 0);

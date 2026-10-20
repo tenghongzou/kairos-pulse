@@ -1046,10 +1046,13 @@ pub fn next_action(
     }
 }
 
-/// 送出前的確認字串（L2：「升級 N 台」；降版 L3：「降版 N 台」）
-pub fn confirm_text(eligible: usize, downgrade: bool) -> String {
+/// 送出前的確認字串（設計包 screens.md §0.3、S26）：L2「升級 N 台」；允許無法自動回滾的主機且有這類主機時
+/// L2「升級 N 台（無法自動回滾 M 台）」（全形括號）；降版 L3「降版 N 台」（優先）
+pub fn confirm_text(eligible: usize, downgrade: bool, no_rollback: usize) -> String {
     if downgrade {
         format!("降版 {eligible} 台")
+    } else if no_rollback > 0 {
+        format!("升級 {eligible} 台（無法自動回滾 {no_rollback} 台）")
     } else {
         format!("升級 {eligible} 台")
     }

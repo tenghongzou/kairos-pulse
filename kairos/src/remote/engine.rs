@@ -291,7 +291,11 @@ impl RemoteService {
                     .is_some_and(|m| !m.supports_remote_upgrade())
                     || ctx.manifest.is_none()
             );
-            v["confirm_text"] = json!(rollout::confirm_text(p.eligible, p.downgrade > 0));
+            v["confirm_text"] = json!(rollout::confirm_text(
+                p.eligible,
+                p.downgrade > 0,
+                p.no_rollback
+            ));
             v["confirm_level"] = json!(if p.downgrade > 0 { "L3" } else { "L2" });
             v["waves_spec"] = spec.waves_json();
             Ok(v)
@@ -401,7 +405,8 @@ impl RemoteService {
     }
 
     /// `POST /api/v1/rollouts/{id}/submit`：固定推送的對象並立即開始（0.9 沒有覆核與排程）。
-    /// L2：`confirm` 為「升級 N 台」；降版 L3：「降版 N 台」且 `reason` 必填（0.9 不要求重新驗證密碼）
+    /// L2：`confirm` 為「升級 N 台」，有無法自動回滾的主機（`allow_no_rollback`）時為「升級 N 台（無法自動回滾
+    /// M 台）」（只接受這個字串）；降版 L3：「降版 N 台」且 `reason` 必填（0.9 不要求重新驗證密碼）
     pub async fn submit_rollout(
         &self,
         who: &Actor,
@@ -434,14 +439,14 @@ impl RemoteService {
                         .into());
                 }
                 let downgrade = p.downgrade > 0;
-                let expected = rollout::confirm_text(p.eligible, downgrade);
+                let expected = rollout::confirm_text(p.eligible, downgrade, p.no_rollback);
                 if confirm.as_deref().map(str::trim) != Some(expected.as_str()) {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "confirmation_required",
                         format!("送出推送需要在 confirm 輸入「{expected}」（{}）", if downgrade { "L3" } else { "L2" }),
                     )
-                    .with_details(json!({"confirm_text": expected, "confirm_level": if downgrade { "L3" } else { "L2" }, "eligible": p.eligible, "downgrade": p.downgrade}))
+                    .with_details(json!({"confirm_text": expected, "confirm_level": if downgrade { "L3" } else { "L2" }, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback}))
                     .into());
                 }
                 if downgrade && reason.is_none() {
