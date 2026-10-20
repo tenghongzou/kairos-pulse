@@ -1,0 +1,14 @@
+# 只用於 tests/systemd：Pulse 在容器中回報 install.upgrade = "unsupported"（REMOTE.md 第 4.4.5 節，
+# 偵測 /.dockerenv 與 /proc/1/cgroup）。測試主機以 systemd 為 PID 1、模擬一台實體主機，所以每次開機
+# 在 Pulse 啟動前刪除 /.dockerenv（/proc/1/cgroup 在 --cgroupns=private 下為「0::/」，不含容器的字樣）。
+[Unit]
+Description=kp systemd test: remove /.dockerenv (test hosts only)
+DefaultDependencies=no
+Before=sysinit.target pulse.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/rm -f /.dockerenv
+
+[Install]
+WantedBy=sysinit.target
