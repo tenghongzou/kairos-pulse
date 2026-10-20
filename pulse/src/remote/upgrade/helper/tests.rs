@@ -770,3 +770,18 @@ fn rpm_extract_does_not_hang_when_cpio_cannot_run() {
     assert!(!o.ok(), "{o:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// rpm 的替換與回滾都允許降版與重新安裝同一版（與 dpkg -i 相同）：沒有回滾檔時以 pulse.prev 回滾後，
+/// 套件資料庫仍是失敗的那一版，重試同一版或推送較低的版本不能被 rpm 拒絕（版本政策依實際的執行檔判斷）
+#[test]
+fn rpm_install_allows_reinstall_and_older_package_database_versions() {
+    let c = rpm_install_command(Path::new("/usr/bin/rpm"), Path::new("/w/pulse.rpm"));
+    let args: Vec<_> = c
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        ["-U", "--oldpackage", "--replacepkgs", "/w/pulse.rpm"]
+    );
+}

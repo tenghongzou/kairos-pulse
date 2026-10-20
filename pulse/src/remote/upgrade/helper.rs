@@ -120,8 +120,11 @@ pub enum Cmd {
     RpmExtract { package: PathBuf, dir: PathBuf },
     /// `dpkg -i --force-confold <套件>`（`DEBIAN_FRONTEND=noninteractive`）
     DpkgInstall { package: PathBuf },
-    /// `rpm -U [--oldpackage] <套件>`
-    RpmInstall { package: PathBuf, oldpackage: bool },
+    /// `rpm -U --oldpackage --replacepkgs <套件>`：與 `dpkg -i` 一樣允許降版與重新安裝同一版。版本政策已由
+    /// 輔助程式依**實際的執行檔**判斷（REMOTE.md 第 4.8 節）；套件資料庫可能與執行檔不符（沒有回滾檔時
+    /// 以 `pulse.prev` 回滾，資料庫仍是失敗的那一版），不加這兩個選項的話，之後重試同一版或推送比它低的
+    /// 版本都會被 rpm 拒絕（「already installed」「newer … is already installed」）
+    RpmInstall { package: PathBuf },
     /// 以服務帳號執行解開的執行檔（`--version`、`check-config …`），工作目錄為安裝目錄
     RunAsService {
         program: PathBuf,
@@ -712,7 +715,6 @@ impl Helper<'_> {
             }),
             _ => self.package(&Cmd::RpmInstall {
                 package: p.artifact.clone(),
-                oldpackage: false,
             }),
         };
         if let Err(e) = replaced {
@@ -865,7 +867,6 @@ impl Helper<'_> {
                 } else {
                     Cmd::RpmInstall {
                         package: rollback_pkg.clone(),
-                        oldpackage: true,
                     }
                 };
                 self.package(&cmd)
@@ -1265,18 +1266,10 @@ impl System for RealSystem {
                     .arg(package);
                 run_command(c)
             }
-            Cmd::RpmInstall {
+            Cmd::RpmInstall { package } => run_command(rpm_install_command(
+                Path::new(first_existing(&["/usr/bin/rpm", "/bin/rpm"])),
                 package,
-                oldpackage,
-            } => {
-                let mut c = Command::new(first_existing(&["/usr/bin/rpm", "/bin/rpm"]));
-                c.arg("-U");
-                if *oldpackage {
-                    c.arg("--oldpackage");
-                }
-                c.arg(package);
-                run_command(c)
-            }
+            )),
             Cmd::RunAsService {
                 program,
                 args,
@@ -1309,6 +1302,13 @@ impl System for RealSystem {
             }
         }
     }
+}
+
+/// `rpm -U --oldpackage --replacepkgs <套件>`（[`Cmd::RpmInstall`]）
+fn rpm_install_command(rpm: &Path, package: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(rpm);
+    c.args(["-U", "--oldpackage", "--replacepkgs"]).arg(package);
+    c
 }
 
 /// `rpm2cpio <套件> | cpio -idm`（在 `dir` 中）：兩者都成功才算成功。
