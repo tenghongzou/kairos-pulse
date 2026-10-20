@@ -62,6 +62,22 @@ impl Probe {
         }
     }
 
+    /// 命令列（`pulse upgrade status`、`pulse upgrade rollback`）：以執行檔所在的目錄代替目前目錄。
+    /// 服務的工作目錄固定是 `/opt/pulse`（unit 的 `WorkingDirectory=`），管理者則可能在任何目錄執行
+    /// `sudo /opt/pulse/pulse upgrade …`；以目前目錄判斷的話 tar 安裝會被當成 `unknown`（顯示「不支援」、
+    /// 拒絕手動回滾）
+    pub fn for_cli() -> Self {
+        Self::system().with_cwd_from_exe()
+    }
+
+    /// 工作目錄改為執行檔所在的目錄（沒有執行檔路徑時不變）
+    pub fn with_cwd_from_exe(mut self) -> Self {
+        if let Some(dir) = self.exe.as_deref().and_then(Path::parent) {
+            self.cwd = Some(dir.to_path_buf());
+        }
+        self
+    }
+
     fn path(&self, absolute: &str) -> PathBuf {
         self.root.join(absolute.trim_start_matches('/'))
     }
@@ -397,6 +413,30 @@ mod tests {
         );
         write(&root, "opt/pulse/.install-method", "garbage\n");
         assert_eq!(detect_method(&p), INSTALL_METHOD_DEB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 命令列在任何目錄執行（例如 `sudo /opt/pulse/pulse upgrade rollback --yes` 從家目錄）都要判斷為 tar：
+    /// 以執行檔所在的目錄代替目前目錄（tests/systemd 實測發現 tar 主機的 `pulse upgrade status` 顯示 unknown）
+    #[test]
+    fn cli_probe_uses_the_executable_directory_as_working_directory() {
+        if cfg!(windows) {
+            return;
+        }
+        let root = tmp("cli-cwd");
+        let mut p = probe(&root);
+        p.cwd = Some(PathBuf::from("/"));
+        assert_eq!(detect_method(&p), INSTALL_METHOD_UNKNOWN);
+        let p = p.with_cwd_from_exe();
+        assert_eq!(p.cwd.as_deref(), Some(root.join("opt/pulse").as_path()));
+        assert_eq!(detect_method(&p), INSTALL_METHOD_TAR);
+        // 其他位置的執行檔仍是 unknown
+        let mut q = probe(&root);
+        q.exe = Some(root.join("usr/local/bin/pulse"));
+        assert_eq!(
+            detect_method(&q.with_cwd_from_exe()),
+            INSTALL_METHOD_UNKNOWN
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

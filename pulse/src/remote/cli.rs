@@ -333,7 +333,7 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
     let d = super::install::detect(
         local.upgrade.enabled && file_only.upgrade.enabled,
         &anchor,
-        &super::install::Probe::system(),
+        &super::install::Probe::for_cli(),
     );
     let state = super::upgrade::read_state(&super::state_dir());
     let (current, last) = match &state {
@@ -417,7 +417,7 @@ fn rollback(yes: bool, config: Option<&str>) -> u8 {
         }
     };
     let _ = local;
-    let method = super::install::detect_method(&super::install::Probe::system());
+    let method = super::install::detect_method(&super::install::Probe::for_cli());
     match method {
         "deb" => {
             println!(
