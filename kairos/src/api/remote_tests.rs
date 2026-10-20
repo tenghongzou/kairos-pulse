@@ -480,6 +480,7 @@ async fn releases_and_rollouts_over_https() {
         (r.status, body(&r)["data"]["state"].as_str()),
         (200, Some("paused"))
     );
+    assert_eq!(body(&r)["data"]["pause_cause"], "manual");
     let r = call(
         addr,
         "POST",

@@ -470,19 +470,44 @@ fn failure_ratio_pauses_and_waves_advance_through_soak_and_continue() {
 #[test]
 fn next_action_codes_and_confirm_text() {
     assert_eq!(
-        next_action(ROLLOUT_RUNNING, None, true, None, 0)["code"],
+        next_action(ROLLOUT_RUNNING, None, true, None, None, 0)["code"],
         "waiting_continue"
     );
     assert_eq!(
-        next_action(ROLLOUT_RUNNING, Some(120_000), false, None, 0)["minutes"],
+        next_action(ROLLOUT_RUNNING, Some(120_000), false, None, None, 0)["minutes"],
         2
     );
     assert_eq!(
-        next_action(ROLLOUT_PAUSED, None, false, Some("x"), 0)["reason"],
+        next_action(ROLLOUT_PAUSED, None, false, Some("x"), None, 0)["reason"],
         "x"
     );
+    // 暫停的原因分類：資料表沒有記錄（主控台暫停）時為 manual；不是暫停中時沒有
     assert_eq!(
-        next_action(ROLLOUT_RUNNING, None, false, None, 0)["code"],
+        next_action(ROLLOUT_PAUSED, None, false, Some("x"), None, 0)["cause"],
+        "manual"
+    );
+    assert_eq!(
+        next_action(
+            ROLLOUT_PAUSED,
+            None,
+            false,
+            Some("x"),
+            Some(PAUSE_FAILURE_RATIO),
+            0
+        )["cause"],
+        "failure_ratio"
+    );
+    assert_eq!(pause_cause(ROLLOUT_PAUSED, None), Some(PAUSE_MANUAL));
+    assert_eq!(
+        pause_cause(ROLLOUT_PAUSED, Some(PAUSE_ROLLBACK_FAILED)),
+        Some("rollback_failed")
+    );
+    assert_eq!(
+        pause_cause(ROLLOUT_RUNNING, Some(PAUSE_SIGNATURE_FAILED)),
+        None
+    );
+    assert_eq!(
+        next_action(ROLLOUT_RUNNING, None, false, None, None, 0)["code"],
         "upgrading"
     );
     assert_eq!(confirm_text(312, false), "升級 312 台");

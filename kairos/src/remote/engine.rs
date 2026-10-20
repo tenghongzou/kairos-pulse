@@ -134,8 +134,9 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         "waves_total": waves.len(),
         "progress": rollout::progress(hosts),
         "hosts_total": hosts.iter().filter(|h| h.state != HOST_SKIPPED).count(),
-        "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), now_ms),
+        "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now_ms),
         "pause_reason": r.pause_reason,
+        "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
         "cancel_reason": r.cancel_reason,
         "awaiting_continue": r.awaiting_continue,
         "soak_until": ts(r.soak_until),
@@ -865,7 +866,7 @@ impl RemoteService {
                             ratio * 100.0,
                             max * 100.0
                         );
-                        let details = json!({"cause": "failure_ratio", "wave": r.current_wave, "failures": failures, "finished": finished, "ratio": ratio, "max_failure_ratio": max});
+                        let details = json!({"cause": rollout::PAUSE_FAILURE_RATIO, "wave": r.current_wave, "failures": failures, "finished": finished, "ratio": ratio, "max_failure_ratio": max});
                         let mut c = pause_in_tx(s, &mut r, &reason, &Actor::system(), Some(details), now)?;
                         set.retain(|(a, _)| !c.contains(a));
                         cleared.append(&mut c);
@@ -1140,7 +1141,7 @@ impl RemoteService {
                         if st.code.as_deref() == Some("PLS-E8401") {
                             events.push(("host.upgrade.signature_failed", Some(CODE_SIGNATURE_FAILED)));
                             log::error!(event = "rollout.signature_failed", code = CODE_SIGNATURE_FAILED; "錯誤 {CODE_SIGNATURE_FAILED}：{agent} 驗證 Pulse {} 發佈包的簽章失敗（版本庫或傳輸可能被竄改，或信任錨與發佈不符）：{}", r.target_version, st.detail);
-                            pause = Some((format!("{agent} 回報發佈包的簽章驗證失敗（PLS-E8401）"), json!({"cause": "signature_failed", "agent_id": agent, "detail": st.detail}), true));
+                            pause = Some((format!("{agent} 回報發佈包的簽章驗證失敗（PLS-E8401）"), json!({"cause": rollout::PAUSE_SIGNATURE_FAILED, "agent_id": agent, "detail": st.detail}), true));
                         }
                     }
                     HOST_ROLLED_BACK => {
@@ -1152,7 +1153,7 @@ impl RemoteService {
                         t.finished_at = Some(Some(now));
                         events.push(("host.upgrade.rollback_failed", Some(CODE_ROLLBACK_FAILED)));
                         log::error!(event = "rollout.rollback_failed", code = CODE_ROLLBACK_FAILED; "錯誤 {CODE_ROLLBACK_FAILED}：{agent} 升級回滾失敗，需要人工處理：{}", st.detail);
-                        pause = Some((format!("{agent} 回滾失敗，需要人工處理"), json!({"cause": "rollback_failed", "agent_id": agent}), false));
+                        pause = Some((format!("{agent} 回滾失敗，需要人工處理"), json!({"cause": rollout::PAUSE_ROLLBACK_FAILED, "agent_id": agent}), false));
                     }
                     HOST_EXPIRED => t.finished_at = Some(Some(now)),
                     _ => {}

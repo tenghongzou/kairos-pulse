@@ -1003,17 +1003,35 @@ pub fn progress(hosts: &[RolloutHostRow]) -> BTreeMap<String, usize> {
     m
 }
 
-/// 推送清單的 `next_action`（固定代碼＋參數，主控台組文案；設計包 §31.8 F8 #4）
+/// 暫停的原因分類（API 的 `pause_cause`）：主控台暫停為 [`PAUSE_MANUAL`]
+pub const PAUSE_MANUAL: &str = "manual";
+/// 自動暫停：批次的失敗比例超過上限
+pub const PAUSE_FAILURE_RATIO: &str = "failure_ratio";
+/// 自動暫停：主機回報回滾失敗
+pub const PAUSE_ROLLBACK_FAILED: &str = "rollback_failed";
+/// 自動暫停：主機回報發佈包的簽章驗證失敗（同一版本的其他推送一起暫停）
+pub const PAUSE_SIGNATURE_FAILED: &str = "signature_failed";
+
+/// API 的 `pause_cause`：暫停中才有值；資料表的 `pause_cause` 為 NULL（主控台或 API 暫停）時為 `manual`
+pub fn pause_cause<'a>(state: &str, cause: Option<&'a str>) -> Option<&'a str> {
+    (state == ROLLOUT_PAUSED).then(|| cause.unwrap_or(PAUSE_MANUAL))
+}
+
+/// 推送清單的 `next_action`（固定代碼＋參數，主控台組文案；設計包 §31.8 F8 #4）。暫停中另附 `cause`
+/// （[`pause_cause`]）
 pub fn next_action(
     state: &str,
     soak_until: Option<i64>,
     awaiting_continue: bool,
     pause_reason: Option<&str>,
+    cause: Option<&str>,
     now_ms: i64,
 ) -> Value {
     match state {
         ROLLOUT_DRAFT => json!({"code": "draft"}),
-        ROLLOUT_PAUSED => json!({"code": "paused", "reason": pause_reason}),
+        ROLLOUT_PAUSED => {
+            json!({"code": "paused", "reason": pause_reason, "cause": pause_cause(state, cause)})
+        }
         ROLLOUT_COMPLETED => json!({"code": "completed"}),
         ROLLOUT_CANCELLED => json!({"code": "cancelled"}),
         _ if awaiting_continue => json!({"code": "waiting_continue"}),
