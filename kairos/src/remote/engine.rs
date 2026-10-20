@@ -265,14 +265,14 @@ impl RemoteService {
         spec: RolloutSpec,
         rollout_id: Option<String>,
     ) -> Result<Value, ApiError> {
-        let sessions = self.sessions_snapshot();
+        let live = self.live_hellos();
         self.in_tx(move |s| {
             let (_, ctx) = release_context(s, &spec.target_version)?;
             let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
             let id = rollout_id.unwrap_or_else(|| "preview".to_string());
             let (p, _, _) = rollout::plan(
                 &id,
-                &with_sessions(s.upgrade_hosts()?, &sessions),
+                &with_live(s.upgrade_hosts()?, &live),
                 &spec.selector,
                 &spec.waves,
                 &spec.options,
@@ -308,14 +308,14 @@ impl RemoteService {
     pub async fn create_rollout(&self, who: &Actor, spec: RolloutSpec) -> Result<Value, ApiError> {
         let now = self.now_ms();
         let who = who.clone();
-        let sessions = self.sessions_snapshot();
+        let live = self.live_hellos();
         self.in_tx(move |s| {
             let (release_id, ctx) = release_context(s, &spec.target_version)?;
             if let Some(min) = incompatible(&ctx) {
                 return Err(incompatible_error(&spec.target_version, &min).into());
             }
             let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
-            let (p, _, _) = rollout::plan("draft", &with_sessions(s.upgrade_hosts()?, &sessions), &spec.selector, &spec.waves, &spec.options, &ctx, &busy);
+            let (p, _, _) = rollout::plan("draft", &with_live(s.upgrade_hosts()?, &live), &spec.selector, &spec.waves, &spec.options, &ctx, &busy);
             if p.overlap_count > 0 {
                 return Err(overlap_error(&p).into());
             }
@@ -416,7 +416,7 @@ impl RemoteService {
     ) -> Result<Value, ApiError> {
         let now = self.now_ms();
         let who = who.clone();
-        let sessions = self.sessions_snapshot();
+        let live = self.live_hellos();
         let v = self
             .in_tx(move |s| {
                 let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
@@ -429,7 +429,7 @@ impl RemoteService {
                     return Err(incompatible_error(&r.target_version, &min).into());
                 }
                 let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
-                let (p, classified, assigned) = rollout::plan(&r.id, &with_sessions(s.upgrade_hosts()?, &sessions), &selector, &waves, &options, &ctx, &busy);
+                let (p, classified, assigned) = rollout::plan(&r.id, &with_live(s.upgrade_hosts()?, &live), &selector, &waves, &options, &ctx, &busy);
                 if p.overlap_count > 0 {
                     return Err(overlap_error(&p).into());
                 }
@@ -1233,22 +1233,109 @@ impl RemoteService {
     }
 }
 
-/// 連線中的主機以 hello 的資訊為準（清冊每 30 秒才同步一次 `install` 與版本）
-fn with_sessions(
+/// 連線中主機最近一次 hello 的資訊（推送的資格以它為準：清冊每 30 秒才同步一次 `install`、版本與標籤）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveHello {
+    pub agent_version: String,
+    pub install_method: Option<String>,
+    pub install_upgrade: Option<String>,
+    pub install_config: Option<String>,
+    /// hello 的 `os`（JSON；資格分類只用 `arch`）
+    pub os: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl LiveHello {
+    fn of(l: &crate::registry::LiveAgent) -> LiveHello {
+        let host = l.host.as_deref();
+        let install = host.and_then(|h| h.install.as_ref());
+        LiveHello {
+            agent_version: l.agent_version.to_string(),
+            install_method: install.and_then(|i| i.method.clone()),
+            install_upgrade: install.and_then(|i| i.upgrade.clone()),
+            install_config: install.and_then(|i| i.config.clone()),
+            os: host
+                .and_then(|h| h.os.as_ref())
+                .and_then(|o| serde_json::to_string(o).ok()),
+            tags: host.and_then(|h| h.tags.clone()),
+        }
+    }
+
+    /// 協商了遠端管理的連線（發提議時使用的資訊）優先
+    fn overlay(&mut self, s: &super::AgentSession) {
+        self.agent_version = s.agent_version.clone();
+        if s.install_method.is_some() {
+            self.install_method = s.install_method.clone();
+        }
+        if s.install_upgrade.is_some() {
+            self.install_upgrade = s.install_upgrade.clone();
+        }
+        if let Some(arch) = &s.arch {
+            let mut os: serde_json::Map<String, Value> = self
+                .os
+                .as_deref()
+                .and_then(|t| serde_json::from_str(t).ok())
+                .unwrap_or_default();
+            os.insert("arch".into(), json!(arch));
+            self.os = Some(Value::Object(os).to_string());
+        }
+    }
+}
+
+impl RemoteService {
+    /// 連線中的主機（狀態表）的 hello，再以協商了遠端管理的連線（[`super::AgentSession`]，發提議時使用）覆蓋：
+    /// 預覽、建立與送出都以這份為準，與發提議時一致，主機連線後不必等清冊同步
+    pub(crate) fn live_hellos(&self) -> HashMap<String, LiveHello> {
+        let mut out: HashMap<String, LiveHello> = self
+            .registry
+            .live_view()
+            .iter()
+            .filter(|l| l.online)
+            .map(|l| (l.agent_id.to_string(), LiveHello::of(l)))
+            .collect();
+        for (a, s) in self.sessions_snapshot() {
+            out.entry(a).or_default().overlay(&s);
+        }
+        out
+    }
+
+    /// 一台主機的 [`RemoteService::live_hellos`]（離線時 `None`）
+    pub fn live_hello(&self, agent_id: &str) -> Option<LiveHello> {
+        let mut h = self
+            .registry
+            .live_get(agent_id)
+            .filter(|l| l.online)
+            .map(|l| LiveHello::of(&l));
+        if let Some(s) = self.session(agent_id) {
+            h.get_or_insert_with(LiveHello::default).overlay(&s);
+        }
+        h
+    }
+}
+
+/// 清冊中的主機以連線中的 hello（[`RemoteService::live_hellos`]）覆蓋；hello 沒有帶的欄位沿用清冊。
+/// 清冊還沒有的主機（連線後尚未寫入過任何資料）不在推送的對象中（沒有 `host_id`）
+pub(crate) fn with_live(
     mut hosts: Vec<super::store::UpgradeHost>,
-    sessions: &HashMap<String, super::AgentSession>,
+    live: &HashMap<String, LiveHello>,
 ) -> Vec<super::store::UpgradeHost> {
     for h in hosts.iter_mut() {
-        if let Some(s) = sessions.get(&h.agent_id) {
-            h.agent_version = Some(s.agent_version.clone());
-            if s.install_method.is_some() {
-                h.install_method = s.install_method.clone();
+        if let Some(l) = live.get(&h.agent_id) {
+            h.agent_version = Some(l.agent_version.clone());
+            if l.install_method.is_some() {
+                h.install_method = l.install_method.clone();
             }
-            if s.install_upgrade.is_some() {
-                h.install_upgrade = s.install_upgrade.clone();
+            if l.install_upgrade.is_some() {
+                h.install_upgrade = l.install_upgrade.clone();
             }
-            if let Some(arch) = &s.arch {
-                h.os = Some(json!({"arch": arch}).to_string());
+            if l.install_config.is_some() {
+                h.install_config = l.install_config.clone();
+            }
+            if l.os.is_some() {
+                h.os = l.os.clone();
+            }
+            if let Some(tags) = &l.tags {
+                h.tags = tags.clone();
             }
             h.online = true;
         }

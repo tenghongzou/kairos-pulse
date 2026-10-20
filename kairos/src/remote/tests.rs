@@ -1287,6 +1287,96 @@ async fn cancel_withdraws_offers_but_records_an_apply_that_already_started() {
     assert_eq!(fx.host_state(&id, A).await.state, "succeeded");
 }
 
+/// 主機上線但沒有協商遠端管理（例如沒有 mTLS）：只在狀態表，hello 帶 `install`
+fn connect_hello_only(fx: &Fx, id: &str, version: &str, method: &str, upgrade: &str) {
+    fx.registry
+        .register(
+            crate::registry::next_conn_id(),
+            crate::registry::HelloInfo {
+                agent_id: id.to_string(),
+                hostname: id.to_string(),
+                agent_version: version.to_string(),
+                proto: 2,
+                host: Some(Arc::new(kairos_proto::HostInfo {
+                    os: Some(kairos_proto::OsInfo {
+                        name: Some("Ubuntu".into()),
+                        arch: Some("x86_64".into()),
+                        ..Default::default()
+                    }),
+                    install: Some(kairos_proto::mgmt::InstallInfo {
+                        method: Some(method.into()),
+                        upgrade: Some(upgrade.into()),
+                        config: Some("enabled".into()),
+                    }),
+                    tags: Some(vec!["site:b".into()]),
+                    ..Default::default()
+                })),
+                peer: "127.0.0.1:1".into(),
+                offline_after: Duration::from_secs(75),
+                client_chain: None,
+            },
+            Instant::now(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn preview_and_submit_use_the_live_hello_instead_of_the_inventory() {
+    let signer = TestSigner::new(21);
+    let fx = Fx::new("livehello", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    // 清冊還是舊的資料（每 30 秒才同步）：0.8.0、沒有 install、沒有標籤
+    fx.add_host(A, "0.8.0", "Web", &[], "tar", "ready").await;
+    fx.sql(|c| {
+        c.execute(
+            "UPDATE hosts SET install_method = NULL, install_upgrade = NULL, os = NULL",
+            [],
+        )
+        .unwrap();
+    })
+    .await;
+    let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"tags": ["site:b"]}, "waves": [{"size": "rest"}]})).unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(p["matched"], 0, "清冊沒有標籤：比對不到");
+    // 剛連線、hello 已升到 0.9.0（tar、就緒、標籤 site:b），沒有協商 upgrade：資格依 hello
+    connect_hello_only(&fx, A, "0.9.0", "tar", "ready");
+    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(
+        (p["matched"].as_i64(), p["eligible"].as_i64()),
+        (Some(1), Some(1)),
+        "{p}"
+    );
+    assert_eq!(p["confirm_text"], "升級 1 台");
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    let h = fx.host_state(&id, A).await;
+    assert_eq!(
+        (h.state.as_str(), h.from_version.as_deref()),
+        ("pending", Some("0.9.0"))
+    );
+    // 單台主機的 hello（`/hosts/{id}/upgrade` 使用）
+    let l = fx.svc.live_hello(A).unwrap();
+    assert_eq!(
+        (l.agent_version.as_str(), l.install_upgrade.as_deref()),
+        ("0.9.0", Some("ready"))
+    );
+    assert!(fx.svc.live_hello(B).is_none());
+    // 協商了遠端管理的連線優先（發提議時使用的資訊）
+    fx.connect(A, "0.9.1", "deb");
+    let l = fx.svc.live_hello(A).unwrap();
+    assert_eq!(
+        (l.agent_version.as_str(), l.install_method.as_deref()),
+        ("0.9.1", Some("deb"))
+    );
+}
+
 #[tokio::test]
 async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
     let signer = TestSigner::new(22);

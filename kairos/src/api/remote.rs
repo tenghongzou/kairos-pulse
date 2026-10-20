@@ -769,6 +769,22 @@ async fn host_upgrade(
         .await?;
     let mut data = data;
     if let Some(svc) = &ctx.remote {
+        // 連線中：版本與 install 以 hello 為準（與推送的資格分類相同；清冊每 30 秒才同步）
+        if let Some(l) = svc.live_hello(&agent_id) {
+            data["agent_version"] = json!(l.agent_version);
+            for (k, v) in [
+                ("method", &l.install_method),
+                ("upgrade", &l.install_upgrade),
+                ("config", &l.install_config),
+            ] {
+                if v.is_some() {
+                    data["install"][k] = json!(v);
+                }
+            }
+            if let Some(arch) = rollout::arch_of(l.os.as_deref()) {
+                data["arch"] = json!(arch);
+            }
+        }
         data["upgrade_negotiated"] = json!(svc.session(&agent_id).is_some_and(|s| s.upgrade));
         data["offered_upgrade_id"] = json!(svc.offer_of(&agent_id));
     }

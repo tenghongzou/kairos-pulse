@@ -176,11 +176,10 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await login(page, 'admin', PW, '/pulse/rollouts');
     await waitTitle(page, '升級推送');
     await page.getByText('還沒有升級推送').waitFor();
-    // 推送的資格依清冊（每 30 秒與連線狀態同步，API.md 第 17.3 節）：等 pulse-09 的 install 寫入清冊
-    await until(async () => {
-      const r = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
-      return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === 'ready';
-    }, 45000, 'pulse-09 的 install 同步到清冊');
+    // 推送的資格以連線中主機的 hello 為準（API.md 第 17.3 節）：不必等清冊每 30 秒的同步
+    const upg = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
+    assert.equal(upg.status, 200);
+    assert.equal(upg.json.data.install.upgrade, 'ready');
     await axe(page, 'F8 S26 推送（空）');
     await page.getByRole('link', { name: '建立推送' }).first().click();
     await waitTitle(page, '建立推送');
