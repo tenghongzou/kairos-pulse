@@ -736,3 +736,37 @@ fn units_point_at_the_request_file() {
     assert!(service.lines().any(|l| l == "StateDirectory=pulse-upgrade"));
     assert!(service.lines().any(|l| l == "Type=oneshot"));
 }
+
+/// `rpm2cpio | cpio`：cpio 無法執行（Rocky 9 的最小安裝沒有 cpio）時立即回報失敗，不會因 rpm2cpio 寫滿管線而
+/// 卡住（tests/systemd 實測：輔助程式卡到 TimeoutStartSec）。以 `cat` 輸出大於管線緩衝的資料代替 rpm2cpio
+#[cfg(unix)]
+#[test]
+fn rpm_extract_does_not_hang_when_cpio_cannot_run() {
+    let dir = std::env::temp_dir().join(format!("pulse-helper-rpm-extract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.rpm");
+    std::fs::write(&big, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    let cat = Path::new(first_existing(&["/usr/bin/cat", "/bin/cat"]));
+    let run = |rpm2cpio: PathBuf, cpio: PathBuf| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (big, dir) = (big.clone(), dir.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(rpm_extract(&rpm2cpio, &big, &cpio, &dir));
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("rpm_extract 卡住（管線寫滿）")
+    };
+    let o = run(cat.to_path_buf(), dir.join("no-such-cpio"));
+    assert_eq!(o.status, None, "{o:?}");
+    assert!(o.stderr.contains("no-such-cpio"), "{o:?}");
+    // cpio 一開始就失敗（結束代碼 1）
+    let falsy = PathBuf::from(first_existing(&["/usr/bin/false", "/bin/false"]));
+    let o = run(cat.to_path_buf(), falsy.clone());
+    assert_eq!(o.status, Some(1), "{o:?}");
+    // rpm2cpio 失敗、cpio 成功：仍是失敗
+    let truthy = PathBuf::from(first_existing(&["/usr/bin/true", "/bin/true"]));
+    let o = run(falsy, truthy);
+    assert!(!o.ok(), "{o:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

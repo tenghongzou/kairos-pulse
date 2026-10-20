@@ -1252,46 +1252,12 @@ impl System for RealSystem {
                 c.arg("-x").arg(package).arg(dir);
                 run_command(c)
             }
-            Cmd::RpmExtract { package, dir } => {
-                let rpm2cpio =
-                    Command::new(first_existing(&["/usr/bin/rpm2cpio", "/bin/rpm2cpio"]))
-                        .arg(package)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn();
-                let mut child = match rpm2cpio {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Output {
-                            status: None,
-                            stdout: String::new(),
-                            stderr: e.to_string(),
-                        };
-                    }
-                };
-                let Some(stdout) = child.stdout.take() else {
-                    return Output::default();
-                };
-                let mut c = Command::new(first_existing(&["/usr/bin/cpio", "/bin/cpio"]));
-                c.args(["-idm", "--quiet", "--no-absolute-filenames"])
-                    .current_dir(dir)
-                    .stdin(stdout);
-                let o = c.output();
-                let _ = child.wait();
-                match o {
-                    Ok(o) => Output {
-                        status: o.status.code(),
-                        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-                    },
-                    Err(e) => Output {
-                        status: None,
-                        stdout: String::new(),
-                        stderr: e.to_string(),
-                    },
-                }
-            }
+            Cmd::RpmExtract { package, dir } => rpm_extract(
+                Path::new(first_existing(&["/usr/bin/rpm2cpio", "/bin/rpm2cpio"])),
+                package,
+                Path::new(first_existing(&["/usr/bin/cpio", "/bin/cpio"])),
+                dir,
+            ),
             Cmd::DpkgInstall { package } => {
                 let mut c = Command::new(first_existing(&["/usr/bin/dpkg", "/bin/dpkg"]));
                 c.env("DEBIAN_FRONTEND", "noninteractive")
@@ -1342,6 +1308,76 @@ impl System for RealSystem {
                 run_command(c)
             }
         }
+    }
+}
+
+/// `rpm2cpio <套件> | cpio -idm`（在 `dir` 中）：兩者都成功才算成功。
+///
+/// cpio 無法執行（例如沒有安裝：Rocky／RHEL 9 的最小安裝沒有 cpio）時，cpio 的 `Command` 仍握著管線的
+/// 讀取端，若在它被釋放前等待 rpm2cpio，rpm2cpio 寫滿管線（64 KiB）後就永遠卡住，輔助程式要到
+/// `TimeoutStartSec`（2.5 小時）才被 systemd 結束（tests/systemd 實測）。因此先釋放 cpio 的 `Command`、
+/// cpio 失敗時結束 rpm2cpio，再等待它
+fn rpm_extract(rpm2cpio: &Path, package: &Path, cpio: &Path, dir: &Path) -> Output {
+    use std::process::{Command, Stdio};
+    let spawned = Command::new(rpm2cpio)
+        .arg(package)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            return Output {
+                status: None,
+                stdout: String::new(),
+                stderr: format!("{}: {e}", rpm2cpio.display()),
+            };
+        }
+    };
+    let Some(pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Output::default();
+    };
+    let extracted = {
+        let mut c = Command::new(cpio);
+        c.args(["-idm", "--quiet", "--no-absolute-filenames"])
+            .current_dir(dir)
+            .stdin(pipe);
+        c.output()
+        // c（與管線的讀取端）在這裡釋放
+    };
+    let cpio_ok = matches!(&extracted, Ok(o) if o.status.success());
+    if !cpio_ok {
+        let _ = child.kill();
+    }
+    let rpm2cpio_err = child
+        .stderr
+        .take()
+        .map(|mut e| {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut e, &mut s);
+            s
+        })
+        .unwrap_or_default();
+    let rpm2cpio_status = child.wait().ok().and_then(|s| s.code());
+    match extracted {
+        Ok(o) if o.status.success() && rpm2cpio_status != Some(0) => Output {
+            status: rpm2cpio_status.or(Some(1)),
+            stdout: String::new(),
+            stderr: format!("rpm2cpio: {}", rpm2cpio_err.trim()),
+        },
+        Ok(o) => Output {
+            status: o.status.code(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        },
+        Err(e) => Output {
+            status: None,
+            stdout: String::new(),
+            stderr: format!("{}: {e}", cpio.display()),
+        },
     }
 }
 
