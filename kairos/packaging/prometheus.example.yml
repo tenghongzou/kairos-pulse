@@ -2,6 +2,7 @@
 # Pulse README「本機指標」）。只列出 scrape_configs 與 rule_files，其餘沿用既有的 prometheus.yml。
 #
 # 告警規則：kairos-alerts.example.yml（Kairos）與 pulse 發佈包的 pulse-alerts.example.yml（Pulse）。
+# 本檔是 Kairos、Pulse 自身的狀態；所有主機的指標經 Kairos 轉出（0.9.0）見 prometheus-export.example.yml 與 EXPORT.md。
 
 rule_files:
   - /etc/prometheus/rules/kairos-alerts.yml

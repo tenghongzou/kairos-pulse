@@ -128,6 +128,7 @@ pub fn validate_enroll_request(req: &EnrollRequest) -> Result<CheckedEnrollReque
         tags: req.tags.clone(),
         report_interval_ms: None,
         os: req.os.clone(),
+        install: None,
     };
     validate_host_info(&host).map_err(|e| {
         let field = if e.starts_with("host_fingerprint") {

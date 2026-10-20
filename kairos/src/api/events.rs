@@ -294,6 +294,46 @@ fn is_alert_event(kind: &str) -> bool {
     kind.starts_with("alert.")
 }
 
+/// 串流的身分擁有的全站權限（告警與遠端管理的事件依權限送出）
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamPerms {
+    alerts: bool,
+    config: bool,
+    rollouts: bool,
+}
+
+impl StreamPerms {
+    fn of(g: &crate::rbac::Grants) -> Self {
+        Self {
+            alerts: g.has(Permission::AlertsRead),
+            config: g.has(Permission::ConfigRead),
+            rollouts: g.has(Permission::RolloutsRead),
+        }
+    }
+}
+
+/// 遠端管理的變化 → 事件（`config.host`、`rollout.progress`；REMOTE.md 第 8.4 節）
+pub async fn remote_pump(
+    mut rx: broadcast::Receiver<crate::remote::RemoteEvent>,
+    hub: Arc<EventHub>,
+    shutdown: Arc<Shutdown>,
+) {
+    loop {
+        let change = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            c = rx.recv() => c,
+        };
+        match change {
+            Ok(c) => {
+                hub.publish(c.kind, c.data);
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => hub.resync_all("overflow"),
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// 事件屬於哪一台主機
 fn event_agent(data: &str) -> Option<String> {
     serde_json::from_str::<Value>(data)
@@ -344,14 +384,21 @@ pub async fn stream(
     let ctx_for_auth = ctx.clone();
     let mut allowed = visible_hosts(&ctx, &access).await;
     // 告警的事件（`alert.*`）只送給全站範圍有 `alerts:read` 的身分（0.4／0.5 的 token 沒有；心跳時重新計算）
-    let mut alerts_ok = principal.grants.has(Permission::AlertsRead);
+    let mut alerts_ok = StreamPerms::of(&principal.grants);
     tokio::spawn(async move {
         let mut last_sent = last;
         let mut overflow = false;
         let visible =
-            |allowed: &Option<HashSet<String>>, alerts_ok: bool, kind: &str, data: &str| {
+            |allowed: &Option<HashSet<String>>, perms: StreamPerms, kind: &str, data: &str| {
                 if is_alert_event(kind) {
-                    return alerts_ok;
+                    return perms.alerts;
+                }
+                // 遠端管理：`config.host` 另需看得到那台主機（下方的範圍判斷）；`rollout.*` 不屬於單一主機
+                if kind.starts_with("config.") && !perms.config {
+                    return false;
+                }
+                if kind.starts_with("rollout.") {
+                    return perms.rollouts;
                 }
                 allowed
                     .as_ref()
@@ -406,7 +453,7 @@ pub async fn stream(
                             return;
                         }
                         access = a;
-                        alerts_ok = g.has(Permission::AlertsRead);
+                        alerts_ok = StreamPerms::of(&g);
                     }
                     allowed = visible_hosts(&ctx_for_auth, &access).await;
                     Some(Bytes::from(format!(": heartbeat {}\n\n", ts(now))))

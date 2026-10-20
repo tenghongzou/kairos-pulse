@@ -4,7 +4,8 @@
 // 資產資訊 /hosts/:id/inventory、連線與憑證 /hosts/:id/connection。0.8.0〔草稿〕（F4，設計包 §30）起有行程與
 // 資產資訊（host-processes.js、host-inventory.js），趨勢分為六個指標群組（host-metrics.js）。
 // 隱藏（沒有後端或沒有畫面）：事件（S06／S07 之後）、稽核紀錄（S18 之後）、
-// 編輯顯示名稱、進入維護、除役、撤銷憑證、刪除資料（主機的寫入操作）。
+// 編輯顯示名稱、進入維護、除役、撤銷憑證。0.9 起頁首的「更多」有匯出個資與刪除主機資料（管理員；host-privacy.js）。
+// 0.9（F8）：「設定」分頁 /hosts/:id/config（config:read）、概覽的「集中設定」摘要列與「升級」卡片（host-remote.js）。
 // 斷線紀錄：GET /hosts/{id}/connections（Kairos 這次啟動後的上線與離線，記憶體中）＋24 小時上線時間軸
 // （由回報資料的空缺推算）。憑證：詳情的 certificate 摘要；有 pki:read 時另列序號、指紋與簽發方式。
 
@@ -16,12 +17,15 @@ import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
 import { pageHead, card, dl, emptyState, errorState, inlineAlert, statusBadge, copyButton, skeletonBlock, codeTag } from '../ui/components.js';
 import { sparkline } from '../ui/chart.js';
-import { hostName, reasonText, osText, memRatio, isOldPulse, osFamily, oldPulseCell } from './host-common.js';
+import { hostName, reasonText, reasonDetail, osText, memRatio, isOldPulse, osFamily, oldPulseCell } from './host-common.js';
 import { metricsTab } from './host-metrics.js';
 import { processesTab } from './host-processes.js';
 import { inventoryTab } from './host-inventory.js';
+import { hostActions, pseudonymNote } from './host-privacy.js';
+import { configSummaryRow, upgradeCard, configTab } from './host-remote.js';
+import { forbidden } from './errors.js';
 
-const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection'];
+const TABS = ['overview', 'metrics', 'processes', 'inventory', 'connection', 'config'];
 
 function tabs(id, active) {
   const items = [
@@ -30,7 +34,9 @@ function tabs(id, active) {
     ['processes', `/hosts/${id}/processes`, t('host.tab.processes')],
     ['inventory', `/hosts/${id}/inventory`, t('host.tab.inventory')],
     ['connection', `/hosts/${id}/connection`, t('host.tab.connection')],
-  ];
+    // F8：集中設定（config:read 才顯示分頁；ia.md §3）
+    session.can('config:read') ? ['config', `/hosts/${id}/config`, t('host.tab.config')] : null,
+  ].filter(Boolean);
   return h(
     'nav',
     { class: 'ds-tabs', 'aria-label': t('host.tabs') },
@@ -85,13 +91,14 @@ function overviewTab(hst, el) {
   const d = hst.status_detail || {};
   const reason = d.offline_reason;
   const statusRows = [
-    hst.status === 'offline' ? [t('host.lastReason'), reason ? [reasonText(reason), ' ', codeTag(reason)] : t('host.reasonUnknown')] : null,
+    hst.status === 'offline' ? [t('host.lastReason'), reason ? reasonDetail(reason) : t('host.reasonUnknown')] : null,
     [t('host.lastSeen'), [fmt.timeEl(hst.last_seen), h('span', { class: 'k-sub' }, `${fmt.dateTime(hst.last_seen)} ${fmt.tzLabel()}`)]],
     [t('host.firstSeen'), `${fmt.dateTime(hst.first_seen)} ${fmt.tzLabel()}`],
     [t('host.threshold'), hst.offline_after_ms ? t('host.thresholdValue', { s: fmt.num(Math.round(hst.offline_after_ms / 1000)) }) : '—'],
     [t('host.interval'), hst.report_interval_ms ? t('host.intervalValue', { s: fmt.num(Math.round(hst.report_interval_ms / 1000)) }) : '—'],
     [t('host.delivery'), hst.durable == null ? t('host.deliveryUnknown') : hst.durable ? (hst.replaying ? t('host.replaying') : t('host.durable')) : t('host.notDurable')],
     hst.source === 'import' ? [t('host.source'), t('host.sourceImport')] : null,
+    configSummaryRow(hst),
   ];
   const suggestion = hst.status === 'offline' && reason && has(`reason.${reason}.next`) ? inlineAlert({ kind: 'info', title: t('host.nextStep'), body: t(`reason.${reason}.next`) }) : null;
   const neverConnected =
@@ -122,6 +129,7 @@ function overviewTab(hst, el) {
         body: h('div', { class: 'k-grid k-grid--1-1' }, h('div', null, h('p', { class: 'strong' }, t('col.cpu')), sparkCpu), h('div', null, h('p', { class: 'strong' }, t('col.memory')), sparkMem)),
       }),
       card({ title: t('host.uptime24h'), body: uptime }),
+      upgradeCard(hst),
     ),
   );
   // 最近 1 小時
@@ -405,7 +413,7 @@ function connectionTab(hst, el) {
                   null,
                   h('td', null, fmt.dateTime(e.at)),
                   h('td', null, e.event === 'online' ? statusBadge('online', t('host.evOnline')) : statusBadge('offline', t('host.evOffline'))),
-                  h('td', null, e.reason ? [reasonText(e.reason), ' ', codeTag(e.reason)] : '—'),
+                  h('td', null, e.reason ? reasonDetail(e.reason) : '—'),
                   h('td', null, e.ip ? h('span', { class: 'mono' }, e.ip) : '—'),
                 ),
               ),
@@ -424,6 +432,11 @@ export function render(ctx) {
   const root = ctx.root;
   if (!tab) {
     ctx.app.notFound();
+    return {};
+  }
+  if (tab === 'config' && !session.can('config:read')) {
+    forbidden(root, { perm: 'config:read' });
+    ctx.setTitle(t('error.403.title'));
     return {};
   }
   const head = h('div');
@@ -449,6 +462,8 @@ export function render(ctx) {
         pageHead({
           title: name,
           crumbs: [{ text: t('nav.hosts'), href: '/hosts' }, hst.group ? { text: hst.group, href: `/hosts${qs({ group: hst.group })}` } : null, { text: name }].filter(Boolean),
+          meta: pseudonymNote(hst),
+          actions: hostActions(hst),
         }),
       );
       mount(head, summary(hst));
@@ -458,6 +473,7 @@ export function render(ctx) {
       else if (tab === 'metrics') cleanup = metricsTab(hst, tabBody, ctx);
       else if (tab === 'processes') cleanup = processesTab(hst, tabBody, ctx);
       else if (tab === 'inventory') cleanup = inventoryTab(hst, tabBody);
+      else if (tab === 'config') cleanup = configTab(hst, tabBody);
       else connectionTab(hst, tabBody);
       ctx.focusTitle();
     } catch (e) {

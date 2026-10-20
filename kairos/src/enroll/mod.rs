@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod db;
+pub mod downloads;
 pub mod handlers;
 pub mod http;
 pub mod limits;
@@ -32,7 +33,6 @@ mod tests;
 
 use kairos_proto::enroll::EnrollMode;
 use log::{debug, error, info, warn};
-use rusqlite::Connection;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -46,6 +46,7 @@ use crate::config::{AppConfig, PkiMode};
 use crate::per_ip::Allowlist;
 use crate::settings::{self, Effective};
 use crate::shutdown::Shutdown;
+use crate::store::prelude::*;
 use db::{DbError, EnrollDb};
 use limits::{Block, Gcra, InvalidClass, InvalidPolicy, InvalidTracker, Keyed, Slots};
 use pki_mgr::{IssueStatus, PkiManager};
@@ -61,19 +62,6 @@ pub const CLOSED_KEEP_MS: i64 = 30 * 86_400_000;
 pub const DEREGISTER_WINDOW_MS: i64 = 10 * 60_000;
 /// 時鐘被拒的主機在 token 的部署進度中保留 15 分鐘（API.md 第 11.2 節）
 pub const CLOCK_REJECTED_KEEP_MS: i64 = 15 * 60_000;
-
-/// 下載端點（`/agent/<檔名>`）本版回 404（ENROLL.md 第 19.4 節第 3 項）；主控台據此隱藏一行指令與下載連結
-/// （設計包 INTEGRATION §27.4 #3）
-pub const DOWNLOADS_AVAILABLE: bool = false;
-
-/// 下載端點的狀態（主控台 API 的 `downloads`）
-pub fn downloads_json() -> serde_json::Value {
-    json!({
-        "available": DOWNLOADS_AVAILABLE,
-        "reason": "本版的註冊端點不提供安裝腳本與套件的下載（/agent/ 回 404）",
-        "alternative": "以安裝套件（MSI、deb、rpm）安裝 Pulse 後執行 pulse enroll --install-string <安裝字串>",
-    })
-}
 
 /// 現在時間（Unix 毫秒）；測試可替換
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -171,6 +159,13 @@ pub struct EnrollService {
     last_crl_refresh: Mutex<HashMap<i64, i64>>,
     /// 上次記錄 `KRS-W1304` 的時間（每 24 小時最多一次）
     last_expiry_warning: Mutex<i64>,
+    /// 個資政策（`[privacy]`）：註冊申請的主機名稱與顯示名稱
+    pub privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// 下載端點的同時數（L11）
+    pub download_slots: Arc<downloads::Slots>,
+    /// 已撤銷（生效）、由外部 CA 簽發而匯入的憑證序號（Kairos 不產生它們的 CRL：8443 在 hello 時拒絕；
+    /// 每 [`TICK`] 由資料庫更新）
+    revoked_external: RwLock<HashSet<String>>,
 }
 
 /// 各層的限流狀態
@@ -271,13 +266,9 @@ impl EnrollService {
         let now = (p.clock)();
         let (overrides, blocks, decommissioned, rows) = db
             .write_blocking(|conn| {
-                let rows = store::load_settings(conn)?;
-                let blocks = store::load_blocks(conn)?;
-                let mut stmt =
-                    conn.prepare("SELECT agent_id FROM hosts WHERE lifecycle = 'decommissioned'")?;
-                let decom: HashSet<String> = stmt
-                    .query_map([], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
+                let rows = conn.load_settings()?;
+                let blocks = conn.load_blocks()?;
+                let decom: HashSet<String> = conn.decommissioned_agents()?;
                 Ok((settings::overrides_from(&rows), blocks, decom, rows))
             })
             .map_err(|e| format!("無法讀取註冊設定：{e}"))?;
@@ -333,7 +324,30 @@ impl EnrollService {
             last_minutely: Mutex::new(0),
             last_crl_refresh: Mutex::new(HashMap::new()),
             last_expiry_warning: Mutex::new(0),
+            privacy: Arc::new(crate::privacy::PrivacyPolicy::load(
+                p.config.privacy,
+                &p.data_dir,
+            )),
+            revoked_external: RwLock::new(HashSet::new()),
+            download_slots: Arc::new(downloads::Slots::default()),
         });
+        svc.refresh_revoked_external(now);
+        if let Some(dir) = svc.download_dir() {
+            let st = downloads::status(Some(&dir));
+            if st.available {
+                info!(
+                    "下載端點 /agent/：{}（{} 個檔案）",
+                    dir.display(),
+                    st.files.len()
+                );
+            } else {
+                warn!(
+                    "警告 {}：{}",
+                    downloads::CODE_INCOMPLETE,
+                    st.reason.unwrap_or_default()
+                );
+            }
+        }
         // 簽發 CA、信任錨與 CRL：啟動時同步一次（8443 的 TLS 驗證器需要它們）
         svc.sync_pki(now, true);
         svc.evaluate_pause(now);
@@ -474,6 +488,59 @@ impl EnrollService {
 
     // ---- 除役 ----
 
+    /// 下載端點的目錄（`enroll.download_dir`；未設定時 `None`）
+    pub fn download_dir(&self) -> Option<PathBuf> {
+        let d = self.config.enroll.download_dir.trim();
+        (!d.is_empty()).then(|| PathBuf::from(d))
+    }
+
+    /// 註冊端點對外的位址（`enroll.advertise`，否則實際監聽的位址）
+    pub fn enroll_endpoint(&self) -> String {
+        let adv = self.config.enroll.advertise.trim();
+        if !adv.is_empty() {
+            return adv.to_string();
+        }
+        server::Listener::local_addr(self)
+            .unwrap_or_else(|| self.config.enroll.listen_addr(&self.config.server.listen))
+    }
+
+    /// 主控台 API 的 `downloads`（設計包 INTEGRATION §27.4 #3：不可用時主控台隱藏一行指令與下載連結）
+    pub fn downloads_json(&self) -> serde_json::Value {
+        let endpoint = kairos_proto::enroll::normalize_endpoint(&self.enroll_endpoint())
+            .unwrap_or_else(|_| self.enroll_endpoint());
+        downloads::status_json(
+            self.download_dir().as_deref(),
+            &format!("https://{endpoint}/agent"),
+        )
+    }
+
+    /// 這張（外部 CA 簽發、匯入的）憑證是否已撤銷：8443 在 hello 時拒絕（PKI.md 第 16 節）
+    pub fn is_revoked_external(&self, serial: &str) -> bool {
+        self.revoked_external
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(serial)
+    }
+
+    /// 從資料庫更新 [`EnrollService::is_revoked_external`] 的清單（撤銷已生效、憑證過期未超過 1 天）
+    fn refresh_revoked_external(&self, now: i64) {
+        let r = self.db.read_blocking(move |conn| {
+            Ok(conn.revoked_external_serials(
+                now,
+                now - crate::store::purge::CRL_KEEP_AFTER_EXPIRY_MS,
+            )?)
+        });
+        match r {
+            Ok(set) => {
+                *self
+                    .revoked_external
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = set;
+            }
+            Err(e) => debug!("無法讀取匯入憑證的撤銷清單（沿用目前的清單）：{e}"),
+        }
+    }
+
     pub fn is_decommissioned(&self, agent_id: &str) -> bool {
         self.decommissioned
             .read()
@@ -542,10 +609,8 @@ impl EnrollService {
             let result = self
                 .db
                 .write(move |conn| {
-                    store::upsert_block(conn, &row)?;
-                    store::audit(
-                        conn,
-                        now,
+                    conn.upsert_block(&row)?;
+                    conn.audit(now,
                         &Audit {
                             actor: "system",
                             actor_ip: Some(&audit_source),
@@ -569,8 +634,8 @@ impl EnrollService {
     // ---- 背景工作 ----
 
     /// 重新讀取 `settings` 表；模式或政策改變時記錄
-    fn refresh_settings(&self, conn: &Connection) -> Result<(), DbError> {
-        let rows = store::load_settings(conn)?;
+    fn refresh_settings(&self, conn: &dyn Store) -> Result<(), DbError> {
+        let rows = conn.load_settings()?;
         let eff = settings::effective(&self.config, &settings::overrides_from(&rows));
         let mut cur = self.effective.write().unwrap_or_else(|e| e.into_inner());
         if cur.mode != eff.mode {
@@ -599,8 +664,9 @@ impl EnrollService {
     fn evaluate_pause(&self, now: i64) {
         let eff = self.effective();
         let computed = self.db.read_blocking(|conn| {
-            let (active, last_end) = store::token_validity(conn, now)?;
-            let open_since = store::load_settings(conn)?
+            let (active, last_end) = conn.token_validity(now)?;
+            let open_since = conn
+                .load_settings()?
                 .into_iter()
                 .find(|(k, ..)| k == settings::KEY_OPEN_SINCE)
                 .and_then(|(_, v, ..)| v.as_i64());
@@ -638,8 +704,7 @@ impl EnrollService {
         };
         info!("{text}");
         let _ = self.db.write_blocking(|conn| {
-            store::audit(
-                conn,
+            conn.audit(
                 now,
                 &Audit {
                     actor: "system",
@@ -662,12 +727,12 @@ impl EnrollService {
             let mut changed = self.pki.sync_cas(conn)?;
             // 需要重新產生 CRL 的 CA：有已生效但未收錄的撤銷、沒有 CRL、nextUpdate 在 7 天內，
             // 或超過 crl_refresh_hours 沒有更新
-            let pending: HashSet<i64> =
-                crate::pki::store::ca_ids_with_pending_revocations(conn, now)?
-                    .into_iter()
-                    .collect();
+            let pending: HashSet<i64> = conn
+                .ca_ids_with_pending_revocations(now)?
+                .into_iter()
+                .collect();
             for ca_id in self.pki.issuer_ids() {
-                let latest = crate::pki::store::latest_crl(conn, ca_id)?;
+                let latest = conn.latest_crl(ca_id)?;
                 let due = match &latest {
                     None => true,
                     Some(c) => {
@@ -711,12 +776,13 @@ impl EnrollService {
     }
 
     /// `KRS-W1304` 的門檻（毫秒）：設定值，或「政策有效天數（含有效 token 覆寫中最長者）＋過期寬限期」
-    pub fn issuing_ca_warning_ms(&self, conn: &Connection, now: i64) -> i64 {
+    pub fn issuing_ca_warning_ms(&self, conn: &dyn Store, now: i64) -> i64 {
         if let Some(d) = self.config.pki.issuing_ca_warning_days {
             return i64::from(d) * 86_400_000;
         }
         let eff = self.effective();
-        let longest_token = store::list_tokens(conn)
+        let longest_token = conn
+            .list_tokens()
             .map(|ts| {
                 ts.iter()
                     .filter(|t| t.state(now) == store::TokenState::Active)
@@ -730,8 +796,9 @@ impl EnrollService {
     }
 
     /// 啟用中的簽發 CA 剩餘時間少於門檻時記 `KRS-W1304`（每 24 小時最多一次）；回傳 (ca_id, 到期時間)
-    fn check_issuing_ca_expiry(&self, conn: &Connection, now: i64) -> Option<(i64, i64)> {
-        let ca = crate::pki::store::list_cas(conn)
+    fn check_issuing_ca_expiry(&self, conn: &dyn Store, now: i64) -> Option<(i64, i64)> {
+        let ca = conn
+            .list_cas()
             .ok()?
             .into_iter()
             .find(|c| c.state == crate::pki::store::CA_ACTIVE)?;
@@ -805,7 +872,7 @@ impl EnrollService {
         let states = self.db.read_blocking(move |conn| {
             let mut out = HashMap::new();
             for id in ids {
-                if let Some(r) = store::get_request(conn, &id)? {
+                if let Some(r) = conn.get_request(&id)? {
                     out.insert(id, r.state.as_str().to_string());
                 }
             }
@@ -851,9 +918,9 @@ impl EnrollService {
                 .retain(|_, (_, exp)| *exp > now);
             let mut batch = self.config.enroll.batch_sources.clone();
             let extra = self.db.write_blocking(|conn| {
-                store::replay_purge(conn, now)?;
-                let mut v = store::active_relaxations(conn, now)?;
-                v.extend(store::batch_token_cidrs(conn, now)?);
+                conn.replay_purge(now)?;
+                let mut v = conn.active_relaxations(now)?;
+                v.extend(conn.batch_token_cidrs(now)?);
                 Ok(v)
             });
             if let Ok(extra) = extra {
@@ -875,14 +942,13 @@ impl EnrollService {
             drop(last_hour);
             let audit_keep_ms = i64::from(self.config.audit.retention_days) * 86_400_000;
             let result = self.db.write_blocking(move |conn| {
-                let (expired, purged) = store::expire_and_purge(conn, now, CLOSED_KEEP_MS)?;
-                store::purge_blocks(conn, now)?;
-                store::purge_relaxations(conn, now)?;
-                store::purge_audit(conn, now - audit_keep_ms, now)?;
-                conn.execute(
-                    "DELETE FROM enroll_tokens WHERE coalesce(disabled_at, expires_at) < ?1",
-                    [now - 400 * 86_400_000],
-                )?;
+                let (expired, purged) = conn.expire_and_purge(now, CLOSED_KEEP_MS)?;
+                conn.purge_blocks(now)?;
+                conn.purge_relaxations(now)?;
+                conn.audit_purge(now - audit_keep_ms, now)?;
+                conn.purge_old_tokens(now - 400 * 86_400_000)?;
+                // 刪除主機資料時為了 CRL 保留的已撤銷憑證：過期超過 1 天後刪除（PRIVACY.md 第 4 節）
+                conn.delete_orphan_certificates(now)?;
                 Ok((expired, purged))
             });
             match result {
@@ -910,6 +976,7 @@ impl EnrollService {
                 this.evaluate_pause(now);
                 this.issue_pending(now);
                 this.sync_pki(now, false);
+                this.refresh_revoked_external(now);
                 this.notify_external_changes();
                 this.periodic(now);
             })

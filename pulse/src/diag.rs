@@ -33,7 +33,7 @@ pub const CHECK_USAGE: &str = "\
 pulse check-config — 檢查設定（不連線、不影響服務）
 
 用法：
-  pulse check-config [--strict] [--json] [-c <pulse.toml>]
+  pulse check-config [--strict] [--json] [--with-remote] [-c <pulse.toml>]
   pulse --check-config [...]               （相容寫法）
 
 選項：
@@ -41,6 +41,7 @@ pulse check-config — 檢查設定（不連線、不影響服務）
                        相對路徑與服務相同，以設定檔所在的目錄解析
       --strict         有警告時以結束代碼 8 結束
       --json           輸出 JSON（schema pulse.check-config/v1）
+      --with-remote    連同集中設定的快取（狀態目錄的 remote/config.json）合併後再檢查一次
 
 結束代碼：
   0 通過（有警告時仍為 0）  8 有警告（--strict）  3 設定錯誤  4 憑證或私鑰錯誤  2 用法錯誤";
@@ -69,6 +70,8 @@ pub struct CheckArgs {
     pub config: Option<String>,
     pub strict: bool,
     pub json: bool,
+    /// 連同遠端設定的快取一起檢查（特權輔助程式的預檢；REMOTE.md 第 10.2 節）
+    pub with_remote: bool,
 }
 
 /// `diag` 的參數
@@ -129,6 +132,7 @@ pub fn parse_check(args: &[String]) -> Result<CheckArgs, UsageError> {
         match args[i].as_str() {
             "--strict" => out.strict = true,
             "--json" => out.json = true,
+            "--with-remote" => out.with_remote = true,
             "-c" | "--config" => {
                 out.config = Some(value(args, &mut i, "--config", CHECK_USAGE)?.to_string())
             }
@@ -374,14 +378,20 @@ pub fn check(config_arg: Option<&str>) -> Report {
     let c = &config;
     let a = &resolved;
 
+    let candidates = c.server.candidates();
+    let fallback = if candidates.len() > 1 {
+        let rest: Vec<String> = candidates[1..].iter().map(ToString::to_string).collect();
+        format!("；備用位址：{}", rest.join("、"))
+    } else {
+        String::new()
+    };
     checks.push(Check::new(
         "server",
         "伺服器",
         Outcome::Ok,
         format!(
-            "{}:{}（domain = {}）",
-            c.server.address.trim(),
-            c.server.port,
+            "{}（domain = {}）{fallback}",
+            candidates[0],
             c.server.domain.trim()
         ),
     ));
@@ -616,13 +626,71 @@ pub fn check(config_arg: Option<&str>) -> Report {
 
 /// `pulse check-config`
 pub fn run_check(args: CheckArgs) -> u8 {
-    let report = check(args.config.as_deref());
+    let mut report = check(args.config.as_deref());
+    if args.with_remote {
+        remote_check(&mut report);
+    }
     if args.json {
         println!("{}", report.to_json(args.strict));
     } else {
         print!("{}", report.render_text());
     }
     kp_obs::check::exit_code(&report.checks, args.strict)
+}
+
+/// `--with-remote`：遠端設定快取與目前的本機設定合併後，是否仍通過設定檢查
+fn remote_check(report: &mut Report) {
+    let Some(local) = report.config.clone() else {
+        return;
+    };
+    let sources = crate::remote::config::LocalSources::load(report.config_file.as_deref(), None);
+    let cache = crate::remote::state_dir().join(crate::remote::config::CACHE_RELATIVE);
+    let check = match crate::remote::config::effective_from_cache(&local, &sources, &cache) {
+        Ok((_, None)) => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Ok,
+            if local.remote_config.enabled {
+                "沒有下發的設定"
+            } else {
+                "本機停用（remote_config.enabled = false）"
+            },
+        ),
+        Ok((m, Some(a))) if m.errors.is_empty() => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Ok,
+            format!(
+                "第 {} 版與本機設定合併後合法（{} 個鍵由本機覆蓋）",
+                a.rev,
+                m.overridden.len()
+            ),
+        ),
+        Ok((m, Some(a))) => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Error,
+            format!("第 {} 版與本機設定合併後不合法", a.rev),
+        )
+        .code(codes::W_REMOTE_CONFIG_REJECTED)
+        .detail(format!(
+            "原因：{}",
+            m.errors
+                .iter()
+                .map(|e| format!("{}：{}", e.key, e.message))
+                .collect::<Vec<_>>()
+                .join("；")
+        )),
+        Err(e) => Check::new(
+            "remote_config",
+            "集中設定",
+            Outcome::Warning,
+            "遠端設定的快取無法使用（Pulse 會忽略它、改用本機設定）",
+        )
+        .code(codes::E_REMOTE_CONFIG_CACHE)
+        .detail(format!("原因：{}：{e}", cache.display())),
+    };
+    report.checks.push(check);
 }
 
 // ---- 診斷包 -----------------------------------------------------------------------------------
@@ -656,6 +724,38 @@ fn enrollment_summary(path: &Path) -> Option<String> {
         }
     }
     serde_json::to_string_pretty(&Value::Object(out)).ok()
+}
+
+/// 每個候選位址（`server.address` 加 `server.fallback_addresses`）：名稱解析的結果與 TCP 連線
+/// （每個位址最多 3 秒；只建立 TCP 連線，不做 TLS 握手、不送任何資料）
+fn probe_candidates(c: &AppConfig) -> Vec<Value> {
+    use std::net::ToSocketAddrs;
+    c.server
+        .candidates()
+        .into_iter()
+        .map(|t| {
+            let resolved: Result<Vec<std::net::SocketAddr>, String> = (t.host.as_str(), t.port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+                .map_err(|e| e.to_string());
+            let (addresses, tcp) = match resolved {
+                Ok(addrs) if addrs.is_empty() => (Vec::new(), "名稱解析沒有結果".to_string()),
+                Ok(addrs) => {
+                    let tcp = addrs
+                        .iter()
+                        .map(|a| std::net::TcpStream::connect_timeout(a, Duration::from_secs(3)))
+                        .find_map(Result::ok)
+                        .map_or_else(
+                            || "無法連線（所有解析出的位址都失敗）".to_string(),
+                            |_| "ok".to_string(),
+                        );
+                    (addrs.iter().map(|a| a.ip().to_string()).collect(), tcp)
+                }
+                Err(e) => (Vec::new(), format!("名稱解析失敗：{e}")),
+            };
+            json!({"server": t.to_string(), "addresses": addresses, "tcp": tcp})
+        })
+        .collect()
 }
 
 /// 本機指標：HTTP 或 textfile（都沒有時為 `None`）
@@ -697,6 +797,8 @@ pub fn build(args: &DiagArgs, now: DateTime<Utc>) -> (Bundle, Report) {
         let mut names = vec![host.clone()];
         if let Some(c) = &report.config {
             names.push(c.server.address.trim().to_string());
+            // 備用位址（server.fallback_addresses）與主位址相同，換成代號
+            names.extend(c.server.candidates().into_iter().skip(1).map(|t| t.host));
             names.push(c.server.domain.trim().to_string());
             names.push(c.enroll.address.trim().to_string());
             names.push(c.agent.display_name.trim().to_string());
@@ -769,6 +871,22 @@ pub fn build(args: &DiagArgs, now: DateTime<Utc>) -> (Bundle, Report) {
         if let Some(s) = enrollment_summary(&enrollment) {
             b.text("enrollment-summary.json", &s);
         }
+        // 每個候選位址的名稱解析與 TCP 連線（kairos/HA.md 第 8.7 節）
+        let probes = probe_candidates(c);
+        let failed = probes.iter().filter(|p| p["tcp"] != "ok").count();
+        b.text(
+            "candidates.json",
+            &serde_json::to_string_pretty(&probes).unwrap_or_default(),
+        );
+        b.section(
+            "candidates",
+            if failed == 0 { "ok" } else { "warning" },
+            format!(
+                "伺服器候選位址 {} 個，TCP 可連線 {} 個",
+                probes.len(),
+                probes.len() - failed
+            ),
+        );
         match metrics_snapshot(c) {
             Some(Ok(text)) => {
                 b.text("metrics.prom", &text);
@@ -852,6 +970,70 @@ pub fn build(args: &DiagArgs, now: DateTime<Utc>) -> (Bundle, Report) {
     } else {
         b.section("service", "skipped", "不是以 systemd 執行");
     }
+
+    // 遠端管理（REMOTE.md 第 4.4.1 節第 7 步、第 10.4 節）：集中設定的快取、遠端升級的狀態與結果、
+    // 輔助程式最近一次的紀錄（/var/lib/pulse-upgrade 只有 root 讀得到）。內容不含秘密，照常遮蔽
+    let state = crate::remote::state_dir();
+    let mut remote_files = 0;
+    for (src, dst) in [
+        (
+            state.join(crate::remote::config::CACHE_RELATIVE),
+            "remote/config.json",
+        ),
+        (
+            state.join("upgrade/state.json"),
+            "remote/upgrade-state.json",
+        ),
+        (
+            state.join("upgrade/result.json"),
+            "remote/upgrade-result.json",
+        ),
+        (
+            state.join("upgrade/request.json"),
+            "remote/upgrade-request.json",
+        ),
+    ] {
+        if let Ok((text, _)) = bundle::read_tail(&src, 256 * 1024) {
+            b.text(dst, &text);
+            remote_files += 1;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(crate::remote::upgrade::helper::WORK_ROOT) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().to_string();
+            for name in ["upgrade.log", "state.json"] {
+                if let Ok((text, _)) = bundle::read_tail(&entry.path().join(name), 1024 * 1024) {
+                    b.text(&format!("remote/pulse-upgrade/{id}/{name}"), &text);
+                    remote_files += 1;
+                }
+            }
+        }
+    }
+    if cfg!(target_os = "linux") && Path::new("/run/systemd/system").exists() {
+        b.text(
+            "service/journal-pulse-upgrade.txt",
+            &bundle::command_output(
+                "journalctl",
+                &[
+                    "-u",
+                    "pulse-upgrade",
+                    "-n",
+                    "200",
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                ],
+                t,
+            ),
+        );
+    }
+    b.section(
+        "remote",
+        if remote_files > 0 { "ok" } else { "skipped" },
+        format!(
+            "遠端管理：{remote_files} 個檔案（集中設定的快取、遠端升級的狀態與輔助程式的紀錄）"
+        ),
+    );
 
     // 檔案清單（不含內容）
     let mut paths = vec![report.base.join(crate::log_files::LOG_DIR)];
@@ -1051,6 +1233,25 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn candidates_are_probed_with_tcp_only() {
+        // 一個在監聽、一個已關閉（Windows 對已關閉的 loopback 埠約 2 秒後才回報拒絕，仍在 3 秒內）
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let mut c = AppConfig::default_for_tests();
+        c.server.address = "127.0.0.1".into();
+        c.server.port = open.local_addr().unwrap().port();
+        c.server.fallback_addresses = vec![format!("127.0.0.1:{closed_port}")];
+        let probes = probe_candidates(&c);
+        assert_eq!(probes.len(), 2, "{probes:?}");
+        assert_eq!(probes[0]["tcp"], "ok", "{probes:?}");
+        assert_eq!(probes[0]["addresses"], json!(["127.0.0.1"]));
+        assert_ne!(probes[1]["tcp"], "ok", "{probes:?}");
+        assert_eq!(probes[1]["server"], format!("127.0.0.1:{closed_port}"));
     }
 
     #[test]

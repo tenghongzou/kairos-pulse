@@ -9,20 +9,20 @@
 //!   `hosts`（`current_serial`）、`audit_events`。交易失敗時憑證視同未簽發。
 
 use log::{error, info};
-use rusqlite::{Connection, TransactionBehavior};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::db::DbError;
-use super::store::{self as es, Audit, DbKind, DbState, RequestRow};
+use super::store::{Audit, DbKind, DbState, RequestRow};
 use crate::config::PkiMode;
 use crate::pki::issue::{IssuingCa, random_serial};
 use crate::pki::store::{self as ps, CA_ACTIVE, CA_RETIRED, CA_TRUSTED, CertRow};
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode};
 use crate::pki::{self, csr::check_csr};
 use crate::settings::Effective;
+use crate::store::prelude::*;
 
 /// 線上簽發的狀態
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,8 +105,8 @@ impl From<DbError> for IssueError {
     }
 }
 
-impl From<rusqlite::Error> for IssueError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::store::db::StoreError> for IssueError {
+    fn from(e: crate::store::db::StoreError) -> Self {
         IssueError::Db(e.into())
     }
 }
@@ -196,8 +196,8 @@ impl PkiManager {
 
     /// 由資料庫同步簽發 CA：載入私鑰（線上模式）、更新簽發狀態；信任錨或已退役的簽發 CA 有變化時重寫
     /// `pki/issuing-cas.pem`／`pki/issuing-cas-retired.pem` 並回傳 `true`（呼叫端重建 8443 的 TLS 設定）
-    pub fn sync_cas(&self, conn: &Connection) -> Result<bool, DbError> {
-        let cas = ps::list_cas(conn)?;
+    pub fn sync_cas(&self, conn: &dyn Store) -> Result<bool, DbError> {
+        let cas = conn.list_cas()?;
         let retired_changed = self.sync_retired(&cas);
         Ok(self.sync_active(&cas)? | retired_changed)
     }
@@ -370,22 +370,22 @@ impl PkiManager {
     /// （`auto`、`system`）；已由管理者核准的申請沿用核准者
     pub fn issue(
         &self,
-        conn: &mut Connection,
+        conn: &dyn Store,
         request_id: &str,
         decided_by: &str,
         eff: &Effective,
         now_ms: i64,
     ) -> Result<IssueOutcome, IssueError> {
         let issuer = self.active_issuer()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(req) = es::get_request(&tx, request_id)? else {
+        let tx = conn.begin(TxMode::Immediate)?;
+        let Some(req) = tx.get_request(request_id)? else {
             return Ok(IssueOutcome::NotFound);
         };
         if req.state == DbState::Issued {
             let cert = req
                 .issued_serial
                 .as_deref()
-                .map(|s| ps::get_cert(&tx, s))
+                .map(|s| tx.get_cert(s))
                 .transpose()?
                 .flatten();
             return Ok(match cert {
@@ -399,7 +399,7 @@ impl PkiManager {
         let checked = match check_csr(&req.csr_der, &req.agent_id) {
             Ok(c) => c,
             Err(e) => {
-                es::set_issue_error(&tx, request_id, &e)?;
+                tx.set_issue_error(request_id, &e)?;
                 tx.commit()?;
                 return Err(IssueError::Failed(e));
             }
@@ -409,7 +409,7 @@ impl PkiManager {
         for _ in 0..5 {
             let serial = random_serial().map_err(IssueError::Failed)?;
             let hex = crate::pki::x509::serial_hex(&serial);
-            if ps::serial_exists(&tx, &hex)? {
+            if tx.serial_exists(&hex)? {
                 continue;
             }
             issued = Some(
@@ -440,10 +440,9 @@ impl PkiManager {
             approved_by: Some(by.clone()),
             ..CertRow::default()
         };
-        ps::insert_cert(&tx, &cert)?;
-        es::mark_issued(&tx, request_id, &cert.serial, &by, now_ms)?;
-        es::upsert_host_on_issue(
-            &tx,
+        tx.insert_cert(&cert)?;
+        tx.mark_issued(request_id, &cert.serial, &by, now_ms)?;
+        tx.upsert_host_on_issue(
             &req.agent_id,
             &req.hostname,
             req.host_fingerprint.as_deref(),
@@ -456,9 +455,8 @@ impl PkiManager {
             &cert.serial,
             now_ms,
         )?;
-        es::set_host_group_from_token(&tx, &req.agent_id, req.token_id.as_deref())?;
-        es::audit(
-            &tx,
+        tx.set_host_group_from_token(&req.agent_id, req.token_id.as_deref())?;
+        tx.audit(
             now_ms,
             &Audit {
                 actor: &by,
@@ -483,7 +481,7 @@ impl PkiManager {
     /// 重新產生一個簽發 CA 的 CRL（需持有私鑰）；回傳新的 CRL 版本
     pub fn regenerate_crl(
         &self,
-        conn: &mut Connection,
+        conn: &dyn Store,
         ca_id: i64,
         validity_ms: i64,
         source: &str,
@@ -493,12 +491,12 @@ impl PkiManager {
         let Some(issuer) = self.issuer(ca_id) else {
             return Ok(None);
         };
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(ca) = ps::get_ca(&tx, ca_id)? else {
+        let tx = conn.begin(TxMode::Immediate)?;
+        let Some(ca) = tx.get_ca(ca_id)? else {
             return Ok(None);
         };
         let number = ca.next_crl_number.max(1);
-        let revoked = ps::revocations_for_crl(&tx, ca_id, now_ms)?;
+        let revoked = tx.revocations_for_crl(ca_id, now_ms)?;
         let next_update = (now_ms + validity_ms).min(issuer.info.not_after_ms);
         let der = issuer
             .sign_crl(
@@ -508,8 +506,7 @@ impl PkiManager {
                 &revoked,
             )
             .map_err(IssueError::Failed)?;
-        ps::record_crl(
-            &tx,
+        tx.record_crl(
             ca_id,
             number,
             now_ms,
@@ -524,10 +521,10 @@ impl PkiManager {
     }
 
     /// 把各信任錨目前的 CRL 寫入 `pki/crl/issuing.crl`；內容有變化時回傳 `true`
-    pub fn write_crl_file(&self, conn: &Connection) -> Result<bool, DbError> {
+    pub fn write_crl_file(&self, conn: &dyn Store) -> Result<bool, DbError> {
         let mut pem = String::new();
-        for ca in ps::trust_anchor_cas(conn)? {
-            if let Some(crl) = ps::latest_crl(conn, ca.ca_id)? {
+        for ca in conn.trust_anchor_cas()? {
+            if let Some(crl) = conn.latest_crl(ca.ca_id)? {
                 pem.push_str(&pem_encode("X509 CRL", &crl.der));
             }
         }
@@ -572,7 +569,7 @@ pub type IssuedBatch = (Vec<RequestRow>, Vec<(String, String)>);
 /// 回傳 (簽發的 request_id, 失敗的 (request_id, 原因))
 pub fn issue_approved(
     mgr: &PkiManager,
-    conn: &mut Connection,
+    conn: &dyn Store,
     eff: &Effective,
     now_ms: i64,
     limit: usize,
@@ -580,7 +577,7 @@ pub fn issue_approved(
     if mgr.active_issuer().is_err() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let pending = es::approved_requests(conn, limit)?;
+    let pending = conn.approved_requests(limit)?;
     let mut issued = Vec::new();
     let mut failed = Vec::new();
     for req in pending {

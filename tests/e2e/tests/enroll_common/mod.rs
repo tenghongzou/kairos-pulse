@@ -10,7 +10,7 @@ use kairos_proto::enroll::{
     EnrollRequest, GraceRenewRequest, ServerVerification, b64url_encode, format_rfc3339_ms,
 };
 use kairos_proto::{ClientMsg, Deregister};
-use kp_e2e::{Proc, TestDir, WAIT, free_port, poll_until, run_to_exit};
+use kp_e2e::{Proc, TestDir, WAIT, free_port, poll_until, run_to_exit, start_kairos};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -96,6 +96,22 @@ impl Pki {
             .pem()
     }
 
+    /// 以根 CA 直接簽發用戶端憑證（手動簽發的既有部署：INSTALL 舊版以 openssl 的 client_ext 範本）
+    pub fn sign_client(&self, agent_id: &str, key: &KeyPair) -> String {
+        let mut p = CertificateParams::new(vec![agent_id.to_string()]).unwrap();
+        p.distinguished_name = DistinguishedName::new();
+        p.distinguished_name.push(DnType::CommonName, agent_id);
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.is_ca = IsCa::ExplicitNoCa;
+        let now = now_ms() / 1000;
+        p.not_before = t(now - 3600);
+        p.not_after = t(now + 365 * 86_400);
+        p.signed_by(key, &Issuer::from_params(&self.params, &self.key))
+            .unwrap()
+            .pem()
+    }
+
     pub fn roots(&self) -> rustls::RootCertStore {
         let mut roots = rustls::RootCertStore::empty();
         for c in CertificateDer::pem_slice_iter(self.pem.as_bytes()) {
@@ -116,15 +132,9 @@ pub struct Env {
     pub envs: Vec<(String, String)>,
 }
 
+/// `n` 個不同的連接埠（[`free_port`] 在同一個測試行程內不會發出重複的埠；佔住到 [`Env::start`]）
 pub fn distinct_ports(n: usize) -> Vec<u16> {
-    let mut v: Vec<u16> = Vec::new();
-    while v.len() < n {
-        let p = free_port();
-        if !v.contains(&p) {
-            v.push(p);
-        }
-    }
-    v
+    (0..n).map(|_| free_port()).collect()
 }
 
 impl Env {
@@ -343,10 +353,13 @@ server_ca_path = "root.pem"
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let mut p = Proc::spawn("kairos", &self.dir, &["--config", "kairos.toml"], &envs);
-        p.wait_for(ENROLL_STARTED, WAIT);
-        p.wait_for(kp_e2e::KAIROS_STARTED, WAIT);
-        p
+        // 連接埠被佔用時重新啟動（kp_e2e::start_kairos）
+        start_kairos(
+            &self.dir,
+            &envs,
+            &[self.agent_port, self.enroll_port, self.console_port],
+            &[ENROLL_STARTED, kp_e2e::KAIROS_STARTED],
+        )
     }
 
     pub fn token(&self, approval: &str) -> String {

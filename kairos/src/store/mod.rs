@@ -10,12 +10,19 @@
 //! 仍是 [`crate::storage`] 中原本的 async writer，也用來輸出 JSONL 鏡像。日後改用時序資料庫時，
 //! 實作 [`ReportStore`] 即可，連線端不需修改。架構、schema 與設定見 `kairos/STORAGE.md`。
 
+pub mod admin;
+pub mod api;
 pub mod assets;
 pub mod codec;
+pub mod db;
 pub mod derive;
+pub mod hosts;
 pub mod import;
+pub mod purge;
 pub mod rollup;
 pub mod sqlite;
+
+pub use db::prelude;
 
 use log::{error, info};
 use std::future::Future;
@@ -35,6 +42,47 @@ use crate::storage::{
 };
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
+
+/// 開啟既有資料庫的唯讀連線（不建立檔案、不升級 schema；Kairos 執行中也可以開啟）。CLI、主控台與註冊服務
+/// 的唯讀查詢使用；目前一律是 SQLite（[`sqlite::open_read_only`]）
+pub fn open_read(path: &Path) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_read_only(path)?))
+}
+
+/// 診斷包的唯讀連線（[`sqlite::open_for_diag`]）
+pub fn open_for_diag(path: &Path) -> Result<db::DbHandle, String> {
+    Ok(Box::new(sqlite::open_for_diag(path)?))
+}
+
+/// 健康檢查的讀寫連線與「可寫」的檢查結果（[`sqlite::open_for_probe`]；不取得寫入鎖）
+pub fn open_for_probe(
+    path: &Path,
+    busy: Duration,
+) -> Result<(db::DbHandle, Result<(), String>), String> {
+    let (conn, writable) = sqlite::open_for_probe(path, busy)?;
+    Ok((Box::new(conn), writable))
+}
+
+/// 主控台 API 唯讀連線池的連線：[`open_read`] 再設定為只讀（`query_only`）並加大快取
+pub fn open_console_read(path: &Path) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_console_reader(path)?))
+}
+
+/// Kairos 行程內開啟既有資料庫的讀寫連線（主控台、註冊服務、告警的寫入；不以 `std::fs` 開關資料庫檔，
+/// 見 [`sqlite::open_existing_read_write`]）
+pub fn open_write(path: &Path, busy: Duration) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_existing_read_write(path, busy)?))
+}
+
+/// CLI 的讀寫連線（必要時建立資料庫並升級 schema；[`sqlite::open_admin`]）
+pub fn open_admin(opts: &sqlite::SqliteOptions, busy: Duration) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_admin(opts, busy)?))
+}
+
+/// CLI 的獨占連線（Kairos 執行中時失敗；[`sqlite::open_exclusive`]）
+pub fn open_exclusive(opts: &sqlite::SqliteOptions, busy: Duration) -> Result<db::DbHandle, Error> {
+    Ok(Box::new(sqlite::open_exclusive(opts, busy)?))
+}
 
 /// writer 一批最多取出的筆數（一個交易）
 pub const BATCH_LIMIT: usize = 1024;
@@ -101,6 +149,12 @@ pub trait ReportStore: Send + 'static {
         let _ = write;
         Err("這個儲存後端不保存主機資產".to_string())
     }
+
+    /// 刪除一台主機的資料：做一步（一個短交易），回傳是否完成（[`purge`]；`kairos/PRIVACY.md` 第 4 節）
+    fn purge_step(&mut self, job: &mut purge::PurgeJob) -> Result<bool, String> {
+        let _ = job;
+        Err("這個儲存後端不支援刪除主機資料".to_string())
+    }
 }
 
 /// 資產寫入佇列的容量（`inventory` 每條連線最多每 60 秒一則）
@@ -141,26 +195,80 @@ pub struct AssetRequest {
     pub reply: oneshot::Sender<Result<AssetOutcome, String>>,
 }
 
+/// 送往 writer 的一則刪除主機資料的要求（主控台 API；[`purge`]）
+#[derive(Debug)]
+pub struct PurgeRequest {
+    pub job: purge::PurgeJob,
+    pub reply: oneshot::Sender<Result<purge::PurgeCounts, String>>,
+}
+
+/// writer 除了 report 之外處理的工作（與 report 交錯，report 優先）
+#[derive(Debug)]
+pub enum WriterJob {
+    Asset(Box<AssetRequest>),
+    Purge(Box<PurgeRequest>),
+}
+
 /// 資產寫入佇列的送出端（只有 SQLite 後端有；JSONL 時 Kairos 不宣告 `inventory`）
 #[derive(Debug, Clone)]
 pub struct AssetSink {
-    tx: mpsc::Sender<AssetRequest>,
+    tx: mpsc::Sender<WriterJob>,
 }
 
-/// 建立資產寫入佇列
-pub fn asset_channel(capacity: usize) -> (AssetSink, mpsc::Receiver<AssetRequest>) {
+/// 刪除主機資料的送出端（與資產共用 writer 的佇列；只有 SQLite 後端有）
+#[derive(Debug, Clone)]
+pub struct PurgeSink {
+    tx: mpsc::Sender<WriterJob>,
+}
+
+/// 建立資產寫入佇列（刪除主機資料也經由同一個佇列：[`AssetSink::purge_sink`]）
+pub fn asset_channel(capacity: usize) -> (AssetSink, mpsc::Receiver<WriterJob>) {
     let (tx, rx) = mpsc::channel(capacity);
     (AssetSink { tx }, rx)
 }
 
+impl PurgeSink {
+    /// 交給 writer 逐步刪除並等待完成（最多 `limit`）。逾時時 writer 仍會做完（重新查詢即可確認）
+    pub async fn purge(
+        &self,
+        job: purge::PurgeJob,
+        limit: Duration,
+    ) -> Result<purge::PurgeCounts, String> {
+        let (reply, result) = oneshot::channel();
+        let work = async {
+            self.tx
+                .send(WriterJob::Purge(Box::new(PurgeRequest { job, reply })))
+                .await
+                .map_err(|_| "寫入工作已停止".to_string())?;
+            result
+                .await
+                .map_err(|_| "寫入工作未回覆即結束（可能正在關機；重新執行可接續）".to_string())?
+        };
+        match tokio::time::timeout(limit, work).await {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "刪除未在 {} 秒內完成（仍在背景進行）",
+                limit.as_secs()
+            )),
+        }
+    }
+}
+
 impl AssetSink {
+    /// 共用同一個 writer 佇列的刪除主機資料送出端
+    pub fn purge_sink(&self) -> PurgeSink {
+        PurgeSink {
+            tx: self.tx.clone(),
+        }
+    }
+
     /// 放入佇列並等待結果，整段最多 `limit`。逾時或 writer 已停止時回傳原因（連線回
     /// `storage_unavailable`）：資產是狀態而非時序，重送不會造成重複
     pub async fn write(&self, write: AssetWrite, limit: Duration) -> Result<AssetOutcome, String> {
         let (reply, result) = oneshot::channel();
         let job = async {
             self.tx
-                .send(AssetRequest { write, reply })
+                .send(WriterJob::Asset(Box::new(AssetRequest { write, reply })))
                 .await
                 .map_err(|_| "資產的寫入工作已停止".to_string())?;
             result
@@ -174,8 +282,8 @@ impl AssetSink {
     }
 }
 
-/// 取出下一則資產寫入；沒有佇列（或已關閉）時永遠等待
-async fn next_asset(rx: &mut Option<mpsc::Receiver<AssetRequest>>) -> Option<AssetRequest> {
+/// 取出下一則資產寫入或刪除要求；沒有佇列（或已關閉）時永遠等待
+async fn next_asset(rx: &mut Option<mpsc::Receiver<WriterJob>>) -> Option<WriterJob> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
@@ -226,7 +334,7 @@ pub async fn run_store_writer<S: ReportStore>(
 pub async fn run_store_writer_with_assets<S: ReportStore>(
     store: S,
     mut rx: mpsc::Receiver<WriteRequest>,
-    mut assets: Option<mpsc::Receiver<AssetRequest>>,
+    mut assets: Option<mpsc::Receiver<WriterJob>>,
     inventory: watch::Receiver<Option<Arc<RegistrySnapshot>>>,
     mirror: Option<ReportSink>,
 ) {
@@ -237,6 +345,8 @@ pub async fn run_store_writer_with_assets<S: ReportStore>(
     let mut last_maintenance = Instant::now();
     let mut last_sync = Instant::now();
     let throttle = LogThrottle::default();
+    // 刪除主機資料的要求：依序處理，每一輪做一步（與 report 的批次、維護工作交錯）
+    let mut purges: std::collections::VecDeque<PurgeRequest> = std::collections::VecDeque::new();
 
     loop {
         tokio::select! {
@@ -279,12 +389,13 @@ pub async fn run_store_writer_with_assets<S: ReportStore>(
                 }
             }
             req = next_asset(&mut assets) => match req {
-                Some(req) => {
-                    let AssetRequest { write, reply } = req;
+                Some(WriterJob::Asset(req)) => {
+                    let AssetRequest { write, reply } = *req;
                     let (s, result) = on_blocking(store, move |s| s.write_assets(&write)).await;
                     store = s;
                     let _ = reply.send(result);
                 }
+                Some(WriterJob::Purge(req)) => purges.push_back(*req),
                 // 所有送出端都已釋放：不再等待這個佇列
                 None => assets = None,
             },
@@ -307,6 +418,25 @@ pub async fn run_store_writer_with_assets<S: ReportStore>(
             })
             .await;
             store = s;
+        }
+
+        if let Some(mut req) = purges.pop_front() {
+            let (s, (req_back, result)) = on_blocking(store, move |s| {
+                let r = s.purge_step(&mut req.job);
+                (req, r)
+            })
+            .await;
+            store = s;
+            req = req_back;
+            match result {
+                Ok(false) => purges.push_front(req),
+                Ok(true) => {
+                    let _ = req.reply.send(Ok(req.job.counts.clone()));
+                }
+                Err(e) => {
+                    let _ = req.reply.send(Err(e));
+                }
+            }
         }
     }
 
@@ -334,6 +464,8 @@ pub struct Storage {
     pub restored: Vec<RestoredAgent>,
     /// 資產的寫入佇列（SQLite 時才有；有值時 Kairos 宣告 `inventory`、`processes`，METRICS.md 第 7.1 節）
     pub assets: Option<AssetSink>,
+    /// 刪除主機資料（SQLite 時才有；主控台 API 的 `POST /api/v1/hosts/{agent_id}/purge`）
+    pub purger: Option<PurgeSink>,
 }
 
 /// 依 `storage.backend` 啟動 report 的儲存。開啟失敗（資料目錄無法寫入、資料庫損毀或版本較新）
@@ -358,6 +490,7 @@ pub async fn start(config: &AppConfig, data_dir: &Path, clock: Clock) -> Result<
                 inventory: None,
                 restored: Vec::new(),
                 assets: None,
+                purger: None,
             })
         }
         StorageBackend::Sqlite => {
@@ -402,6 +535,7 @@ pub async fn start(config: &AppConfig, data_dir: &Path, clock: Clock) -> Result<
                 writer: Box::pin(writer),
                 inventory: Some(Arc::new(feed)),
                 restored,
+                purger: Some(assets.purge_sink()),
                 assets: Some(assets),
             })
         }

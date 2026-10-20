@@ -323,7 +323,7 @@ Pulse 一律經由 `sysinfo`（第 4.1 節）；下表列出 `sysinfo` 0.39 實�
 | 主機指紋 | 不變 | PROTOCOL.md「主機指紋」：只送雜湊。資產的序號與 MAC 是另外的、可關閉的欄位，不影響指紋的設計 |
 
 - `pulse diag --redact strict`（Pulse CLI 規格）遮罩 IP 與主機名稱時，資產中的 IP、MAC、序號也一併遮罩。
-- Kairos 的「刪除主機資料」（S6）一併刪除該主機的資產、資產變更歷史與行程快照（第 9 節的資料表都以 `host_id` 串接刪除）。
+- Kairos 的「刪除主機資料」（S6，0.9.0）一併刪除該主機的資產、資產變更歷史與行程快照（第 9 節的資料表都以 `host_id` 串接刪除；`kairos/PRIVACY.md` 第 4 節）。Kairos 另可依 `[privacy]` 遮蔽命令列中的秘密（預設）、捨棄或假名化行程的使用者、截斷資產的介面位址與 MAC（PRIVACY.md 第 2 節）。
 - 稽核：查詢資產與行程不寫稽核紀錄（屬一般的 `hosts:read` 讀取），與趨勢查詢相同。
 
 ## 9. Kairos 端：儲存（schema v8 草案）

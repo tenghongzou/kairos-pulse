@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::config::take_config_arg;
 use crate::hosts_cli::{CliError, EXIT_GENERAL, open_db, parse_duration, use_unicode};
-use crate::store::sqlite::{backup_to, export_reports};
+use crate::store::db::StoreError;
 
 /// `kairos reports --help`
 pub const REPORTS_USAGE: &str = "kairos reports export — 以 JSON Lines 匯出 SQLite 中的原始 report
@@ -367,7 +367,7 @@ pub fn run_db(cmd: DbCommand) -> u8 {
         None => None,
     };
     let result = open_db(config_path.as_deref(), code, title).and_then(|conn| {
-        backup_to(&conn, &dest).map_err(|e| CliError {
+        conn.backup_to(&dest).map_err(|e| CliError {
             code,
             title: title.to_string(),
             cause: e.to_string(),
@@ -529,24 +529,24 @@ pub fn run(cmd: ReportsCommand) -> u8 {
         let stdout = std::io::stdout().lock();
         let mut out = BufWriter::new(stdout);
         let mut line = Vec::with_capacity(1024);
-        let exported = export_reports(
-            &conn,
-            since.timestamp_millis(),
-            opts.agent_id.as_deref(),
-            |record| {
-                line.clear();
-                serde_json::to_writer(&mut line, record).map_err(std::io::Error::other)?;
-                line.push(b'\n');
-                out.write_all(&line)
-            },
-        )
-        .and_then(|n| out.flush().map(|_| n));
+        let exported = conn
+            .export_reports(
+                since.timestamp_millis(),
+                opts.agent_id.as_deref(),
+                &mut |record| {
+                    line.clear();
+                    serde_json::to_writer(&mut line, record).map_err(std::io::Error::other)?;
+                    line.push(b'\n');
+                    out.write_all(&line)
+                },
+            )
+            .and_then(|n| out.flush().map(|_| n).map_err(StoreError::from));
         exported.map_err(|e| CliError {
             code,
             title: title.to_string(),
             cause: e.to_string(),
             fix: vec!["確認 storage.data_dir 指向 Kairos 的資料目錄；資料庫損毀時請從備份還原（kairos/STORAGE.md「備份與還原」）。".to_string()],
-            exit: if e.kind() == ErrorKind::BrokenPipe { 0 } else { EXIT_GENERAL },
+            exit: if e.io_kind() == Some(ErrorKind::BrokenPipe) { 0 } else { EXIT_GENERAL },
         })
     });
     match result {
@@ -719,7 +719,7 @@ mod tests {
         let (out, names, missing) = backup_keys(Some(&cfg), &dest, &src).unwrap();
         assert_eq!(out, dir.join("k.db.keys"));
         assert_eq!(names, ["alerts-secrets.key", "console.key"]);
-        assert_eq!(missing, ["audit-hmac.key"]);
+        assert_eq!(missing, ["audit-hmac.key", "privacy.key"]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

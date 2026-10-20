@@ -1,0 +1,48 @@
+/* 遠端管理（F8：S24 集中設定、S25 Pulse 版本庫、S26 升級推送、S05 的設定與升級）的版面補充。只引用設計 token（--ds-*）。 */
+
+/* S26 進度：堆疊長條（輔助）＋可見的數字 */
+.k-ro-progress { display: flex; flex-direction: column; gap: var(--ds-space-100); min-width: 12rem; }
+.k-ro-bar { display: flex; height: 8px; border-radius: var(--ds-radius-full); background: var(--ds-color-bg-subtle); overflow: hidden; }
+.k-ro-bar__seg { height: 100%; }
+.k-ro-bar__seg.is-ok { background: var(--ds-status-online-solid); }
+.k-ro-bar__seg.is-fail { background: var(--ds-status-critical-solid); }
+.k-ro-bar__seg.is-run { background: var(--ds-status-info-solid); }
+.k-ro-progress__text { font-variant-numeric: tabular-nums; }
+@media (forced-colors: active) {
+  .k-ro-bar__seg { background: Highlight; }
+}
+
+/* S24 同步狀態列：每個數字連到主機清單 */
+.k-sync-line { display: flex; flex-wrap: wrap; gap: var(--ds-space-200) var(--ds-space-400); align-items: baseline; margin: 0; }
+.k-sync-line a { font-variant-numeric: tabular-nums; }
+
+/* S24 設定檔編輯：每個鍵一列（欄位、說明、移除） */
+.k-cfg-rows { display: flex; flex-direction: column; gap: var(--ds-space-300); margin: 0 0 var(--ds-space-400); padding: 0; list-style: none; }
+.k-cfg-row { display: flex; flex-wrap: wrap; gap: var(--ds-space-200) var(--ds-space-400); align-items: flex-end; padding-bottom: var(--ds-space-300); border-bottom: var(--ds-border-width) solid var(--ds-color-border-subtle); }
+.k-cfg-row > .ds-field { flex: 1 1 18rem; min-width: 0; margin: 0; }
+.k-cfg-row .ds-input, .k-cfg-row .ds-select { max-width: 24rem; }
+.k-cfg-add { display: flex; flex-wrap: wrap; gap: var(--ds-space-300); align-items: flex-end; }
+.k-cfg-add > .ds-field { flex: 0 1 24rem; margin: 0; }
+.k-impact-line { margin: 0; }
+
+/* S26 建立推送：表單分區 */
+.k-ro-form { display: flex; flex-direction: column; gap: var(--ds-space-500); }
+.k-ro-form .ds-input--num, .k-ro-form .k-input--num { max-width: 10rem; }
+.k-ro-skip { margin: 0; padding-left: var(--ds-space-500); }
+.k-ro-skip li { margin: var(--ds-space-100) 0; }
+.k-ro-waves { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--ds-space-300); }
+.k-ro-waves li { display: grid; grid-template-columns: 2.5rem 1fr; gap: var(--ds-space-300); align-items: start; }
+.k-ro-wave__n { font: var(--ds-text-label); display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: var(--ds-radius-full); background: var(--ds-color-bg-subtle); }
+.k-ro-waves li.is-current .k-ro-wave__n { background: var(--ds-color-accent-subtle); color: var(--ds-color-text-primary); }
+
+/* S25 匯入：每個檔案一列（檔名、進度、結果） */
+.k-imp-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--ds-space-200); }
+.k-imp-files li { display: grid; grid-template-columns: minmax(0, 1fr) minmax(8rem, 12rem); gap: var(--ds-space-200) var(--ds-space-400); align-items: center; }
+.k-imp-files .k-imp-name { overflow-wrap: anywhere; }
+.k-imp-files .k-imp-result { grid-column: 1 / -1; margin: 0; }
+@media (max-width: 600px) {
+  .k-imp-files li { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* S24 版本歷史：時間軸（.k-timeline li 是兩欄的格線）內的變更清單恢復為一般的清單項目 */
+.k-timeline .k-rev-changes li { display: list-item; padding: 0; border: 0; }

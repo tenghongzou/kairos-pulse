@@ -1142,3 +1142,104 @@ fn grace_blocked_shows_expiry_and_remaining_grace() {
         report.brief
     );
 }
+
+// ---- 多個伺服器位址（kairos/HA.md 第 8.7 節） ----
+
+#[test]
+fn registered_to_a_fallback_node_shows_node_and_candidate() {
+    let mut f = base_file();
+    f.connection.server = "kairos-b.example.gov.tw:8443".into();
+    f.connection.server_node = Some("kairos-b".into());
+    f.connection.candidates = Some(2);
+    f.connection.candidate_index = Some(1);
+    f.connection.features.push("cluster".into());
+    let report = eval::evaluate(&input(f.clone()));
+    let rows = render::rows(&report, &unicode());
+    assert!(
+        rows.contains(
+            "已註冊到 kairos-b.example.gov.tw:8443（Kairos 節點 kairos-b；第 2 個位址，共 2 個）（TLS 1.3，mTLS），已連線"
+        ),
+        "{rows}"
+    );
+    // 只有一個候選位址、沒有節點名稱：與 0.8 相同（online 測試）；只有節點名稱時只顯示節點
+    f.connection.candidates = Some(1);
+    f.connection.candidate_index = Some(0);
+    let rows = render::rows(&eval::evaluate(&input(f)), &unicode());
+    assert!(
+        rows.contains("已註冊到 kairos-b.example.gov.tw:8443（Kairos 節點 kairos-b）（TLS 1.3"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn all_candidates_failing_lists_each_address() {
+    let mut f = offline_file();
+    f.connection.last_error_code = Some("PLS-E2302".into());
+    f.connection.last_error = Some("TCP 連線失敗：Connection refused (os error 111)".into());
+    f.connection.candidates = Some(2);
+    f.connection.candidate_index = Some(0);
+    f.connection.candidate_errors = vec![
+        sf::CandidateError {
+            server: SRV.into(),
+            code: Some("PLS-E2003".into()),
+            message: "TCP 連線失敗：Connection refused (os error 111)".into(),
+        },
+        sf::CandidateError {
+            server: "kairos-b.example.gov.tw:8443".into(),
+            code: Some("PLS-E2004".into()),
+            message: "TCP 連線逾時（5 秒）".into(),
+        },
+    ];
+    let inp = input(f);
+    let report = eval::evaluate(&inp);
+    let rows = render::rows(&report, &unicode());
+    assert!(
+        rows.contains("重新連線中：所有候選位址都無法連線（PLS-E2302）"),
+        "{rows}"
+    );
+    let issues = render::issues(&report, &unicode(), false, false);
+    assert!(
+        issues.contains("PLS-E2302：無法連線到 Kairos（所有候選位址都無法連線）")
+            && issues.contains("2 個候選位址（server.address 與 server.fallback_addresses）都無法連線")
+            && issues.contains("kairos.example.gov.tw:8443：TCP 連線失敗：Connection refused (os error 111)（PLS-E2003）")
+            && issues.contains("kairos-b.example.gov.tw:8443：TCP 連線逾時（5 秒）（PLS-E2004）"),
+        "{issues}"
+    );
+    // --json：connection 帶候選位址的欄位與各位址的錯誤
+    let text = super::json::document(&super::json::JsonInput {
+        report: &report,
+        file: &inp.file,
+        status_path: &inp.status_path,
+        service_manager: Some("systemd"),
+        service_unit: Some("pulse.service"),
+        config_file: None,
+        exit_code: report.status.exit_code(),
+        generated_at: inp.now,
+    });
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let c = &v["data"]["connection"];
+    assert_eq!(c["candidates"], 2);
+    assert_eq!(c["candidate_index"], 0);
+    assert!(c["server_node"].is_null());
+    assert_eq!(c["candidate_errors"][1]["code"], "PLS-E2004");
+    assert_eq!(
+        c["candidate_errors"][1]["server"],
+        "kairos-b.example.gov.tw:8443"
+    );
+}
+
+#[test]
+fn drain_is_not_reported_as_a_problem() {
+    let mut f = offline_file();
+    f.connection.consecutive_failures = 0;
+    f.connection.last_error_code = Some("PLS-I8507".into());
+    f.connection.last_error = Some("Kairos 節點正在排空，改連其他節點".into());
+    let report = eval::evaluate(&input(f));
+    let rows = render::rows(&report, &unicode());
+    assert!(
+        rows.contains("重新連線中：Kairos 節點正在排空，改連其他節點（PLS-I8507）"),
+        "{rows}"
+    );
+    let issues = render::issues(&report, &unicode(), false, false);
+    assert!(!issues.contains("PLS-I8507"), "{issues}");
+}

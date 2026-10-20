@@ -66,11 +66,14 @@ ufw allow proto tcp from 10.0.0.0/16 to any port 8080,8444
 | `kairos.service` | 644 | systemd unit 範本 |
 | `kairos-crl.service`、`kairos-crl.timer` | 644 | 手動 PKI（附錄 P）的 CRL 定期重新產生與部署的 systemd 範例（第 10.3 節） |
 | `prometheus.example.yml`、`kairos-alerts.example.yml` | 644 | Prometheus 抓取設定與告警規則範例（第 9.2a 節，0.6.0） |
+| `prometheus-export.example.yml`、`grafana-kairos-hosts.json` | 644 | 所有主機指標的 Prometheus 抓取範例與 Grafana 儀表板（`EXPORT.md`，0.9.0） |
 | `INSTALL.md` | 644 | 本文件 |
 | `README.md`、`PROTOCOL.md` | 644 | 說明文件與協定規格 |
 | `STORAGE.md` | 644 | 資料儲存（SQLite）：schema、保留與容量上限、容量估算、備份與還原 |
 | `API.md` | 644 | 主控台 API（HTTPS，`/api/v1`）：端點、驗證（API token）、即時推送、量測 |
+| `EXPORT.md` | 644 | 指標轉出：Prometheus exporter、OTLP 推送、Grafana（0.9.0） |
 | `PKI.md` | 644 | 註冊通道的 CA 架構、線上／離線簽發、簽發 CA 的輪替、CRL、資料模型與量測（0.5.0）；`kairos pki init／sign／gencrl`（第 15 節，0.8.0） |
+| `PRIVACY.md` | 644 | 個資清單、`[privacy]`、刪除主機資料、個資匯出與 DPA 範本骨架（0.9.0） |
 | `CHANGELOG.md` | 644 | 變更紀錄；升級前請先看「破壞性變更與升級步驟」 |
 | `THIRD-PARTY-LICENSES` | 644 | 執行檔內含的第三方套件清單與授權全文（建置時由 `cargo about` 依 `Cargo.lock` 產生） |
 | `kairos.cdx.json` | 644 | SBOM（CycloneDX 1.5 JSON，建置時由 `cargo cyclonedx` 產生）；發佈處另附一份同內容的 `kairos-<版本>-<commit>-linux-x86_64.cdx.json`，可直接匯入 Dependency-Track 等工具 |
@@ -163,7 +166,7 @@ install -d -o kairos -g kairos -m 750 /opt/kairos/data /opt/kairos/logs
 cd ~/kairos-dist/pkg
 install -o root -g root -m 755 kairos /opt/kairos/kairos
 install -o root -g root -m 644 kairos.example.toml INSTALL.md README.md PROTOCOL.md \
-  STORAGE.md API.md PKI.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
+  STORAGE.md API.md PKI.md PRIVACY.md CHANGELOG.md THIRD-PARTY-LICENSES /opt/kairos/
 ```
 
 ## 6. 建立 PKI（kairos pki init，0.8.0）

@@ -6,14 +6,14 @@
 //! 1 萬台時重建約數毫秒、篩選與排序約 1～2 毫秒（第 9 節），不在每個請求都查詢資料庫，也不會長時間
 //! 持有狀態表的鎖。單台詳情則每次讀取最新的清冊列與狀態。
 
+use crate::store::prelude::*;
 use chrono::{DateTime, Utc};
 use hyper::{Response, StatusCode};
-use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,7 @@ use crate::per_ip::cidr::Cidr;
 use crate::protocol::HostInfo;
 use crate::rbac::HostAccess;
 use crate::registry::{LastReport, LiveAgent};
-use crate::store::sqlite::HOST_SOURCE_IMPORT;
-use crate::tls::{CertRejection, RejectionReason};
+use crate::tls::CertRejection;
 
 /// 狀態表與清冊合併的索引最多這麼舊
 pub const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
@@ -129,6 +128,10 @@ pub struct DbHost {
     pub inventory: Option<Arc<InventorySummary>>,
     /// 最近一次因每主機序列數上限而有指標未保存的時間（Unix 毫秒；`KRS-W4104`）
     pub series_limited_at: Option<i64>,
+    /// hello 的 `install`（清冊同步；0.9.0 起的 Pulse）
+    pub install: Option<Arc<kairos_proto::InstallInfo>>,
+    /// 集中設定的狀態（`host_config`；沒有這台的紀錄時 `None`）
+    pub config: Option<Arc<crate::remote::desired::ConfigStateInput>>,
 }
 
 /// 主機清單（S04）篩選與排序用的資產摘要（`host_inventory` 的冗餘欄位；METRICS.md 第 10.1 節）
@@ -162,20 +165,6 @@ impl InventorySummary {
     }
 }
 
-/// 清冊查詢另取的欄位：開機時間與資產摘要（以子查詢的別名避免與 `hosts` 的欄位同名）
-const HOST_EXTRA_COLUMNS: &str = "boot_time, i_os_family, i_cpu_model, i_cores, i_memory, \
-     i_vendor, i_product, i_serial, series_limited_at";
-const HOST_EXTRA_JOIN: &str = "LEFT JOIN (SELECT host_id AS i_host, os_family AS i_os_family, \
-     cpu_model AS i_cpu_model, cpu_logical_cores AS i_cores, memory_total AS i_memory, \
-     vendor AS i_vendor, product AS i_product, serial AS i_serial FROM host_inventory) \
-     ON i_host = hosts.host_id";
-
-/// `hosts` 的欄位（[`DbHost`] 的順序；第一欄 host_id 未使用）
-pub const HOST_COLUMNS: &str = "host_id, agent_id, hostname, display_name, agent_version, proto, \
-     host_fingerprint, tags, os, report_interval_ms, peer, identity_verified, first_seen, \
-     connected_at, last_seen, offline_after_ms, last_report, source, cert_rejected_at, \
-     cert_rejection, host_group";
-
 /// 清冊中保存的被拒憑證（`hosts.cert_rejection`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRejection {
@@ -183,87 +172,6 @@ pub struct StoredRejection {
     pub serial: Option<String>,
     pub peer: Option<String>,
     pub count: u64,
-}
-
-fn host_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<DbHost> {
-    let text = |i: usize| r.get::<_, Option<String>>(i);
-    let arc = |s: Option<String>| s.map(Arc::<str>::from);
-    let tags: Vec<String> = text(7)?
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let rejection = match (r.get::<_, Option<i64>>(18)?, text(19)?) {
-        (Some(at), Some(json)) => serde_json::from_str::<StoredRejection>(&json)
-            .ok()
-            .map(|s| CertRejection {
-                at: DateTime::from_timestamp_millis(at).unwrap_or_default(),
-                reason: RejectionReason::parse(&s.reason).unwrap_or(RejectionReason::Other),
-                serial: s.serial,
-                peer: s.peer.and_then(|p| p.parse().ok()),
-                count: s.count,
-            }),
-        _ => None,
-    };
-    Ok(DbHost {
-        agent_id: Arc::from(r.get::<_, String>(1)?),
-        hostname: Arc::from(r.get::<_, String>(2)?),
-        display_name: arc(text(3)?),
-        agent_version: arc(text(4)?),
-        proto: r.get(5)?,
-        host_fingerprint: arc(text(6)?),
-        tags: tags.into(),
-        os: text(8)?
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .map(Arc::new),
-        report_interval_ms: r.get(9)?,
-        peer: arc(text(10)?),
-        identity_verified: r.get(11)?,
-        first_seen: r.get(12)?,
-        connected_at: r.get(13)?,
-        last_seen: r.get(14)?,
-        offline_after_ms: r.get(15)?,
-        last_report: text(16)?
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .map(Arc::new),
-        imported: text(17)?.as_deref() == Some(HOST_SOURCE_IMPORT),
-        rejection,
-        host_group: arc(text(20)?),
-        boot_time: r.get(21)?,
-        inventory: {
-            let s = InventorySummary {
-                os_family: text(22)?,
-                cpu_model: text(23)?,
-                cpu_logical_cores: r.get(24)?,
-                memory_total: r.get(25)?,
-                vendor: text(26)?,
-                product: text(27)?,
-                serial: text(28)?,
-            };
-            // 有資產時 os_family 等至少一欄有值；全部為 NULL 視為沒有資產
-            (s != InventorySummary::default()).then(|| Arc::new(s))
-        },
-        series_limited_at: r.get(29)?,
-    })
-}
-
-/// 清冊中所有主機
-pub fn load_hosts(conn: &Connection) -> rusqlite::Result<Vec<DbHost>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {HOST_COLUMNS}, {HOST_EXTRA_COLUMNS} FROM hosts {HOST_EXTRA_JOIN}"
-    ))?;
-    let rows = stmt.query_map([], host_of)?;
-    rows.collect()
-}
-
-/// 清冊中的一台主機
-pub fn load_host(conn: &Connection, agent_id: &str) -> rusqlite::Result<Option<DbHost>> {
-    conn.query_row(
-        &format!(
-            "SELECT {HOST_COLUMNS}, {HOST_EXTRA_COLUMNS} FROM hosts {HOST_EXTRA_JOIN} WHERE agent_id = ?1"
-        ),
-        [agent_id],
-        host_of,
-    )
-    .optional()
 }
 
 /// 列表與詳情共用的一台主機
@@ -300,6 +208,10 @@ pub struct HostView {
     pub boot_time: Option<i64>,
     /// 資產摘要
     pub inventory: Option<Arc<InventorySummary>>,
+    /// hello 的 `install`（連線中以這次的 hello 為準）
+    pub install: Option<Arc<kairos_proto::InstallInfo>>,
+    /// 集中設定的狀態（[`crate::remote::desired::config_state`]）
+    pub config_state: &'static str,
     /// 排序與搜尋用：顯示名稱（沒有時為主機名稱）的小寫
     name_lower: String,
     hostname_lower: String,
@@ -387,6 +299,9 @@ impl HostView {
             "os": self.os.as_deref().map(os_json),
             "tags": &*self.tags,
             "group": self.host_group.as_deref(),
+            // 遠端管理（0.9.0；API.md 第 17 節）：安裝方式與本機狀態、集中設定的狀態
+            "install": self.install.as_deref().map(|i| json!({"method": i.method, "upgrade": i.upgrade, "config": i.config})),
+            "config_state": self.config_state,
             "first_seen": ts_ms(self.first_seen),
             "last_seen": ts_ms(self.last_seen),
             "offline_for_secs": offline_for,
@@ -428,11 +343,7 @@ fn report_summary(r: &LastReport) -> Value {
 
 /// peer（`ip:port`）中的 IP
 pub fn ip_of(peer: &str) -> Option<IpAddr> {
-    peer.parse::<SocketAddr>()
-        .map(|a| a.ip())
-        .or_else(|_| peer.parse::<IpAddr>())
-        .ok()
-        .map(|ip| ip.to_canonical())
+    crate::bus::peer_ip(peer)
 }
 
 /// 合併時需要的環境
@@ -520,6 +431,19 @@ pub fn view_of(
             _ => None,
         });
     let name = display_name.as_deref().unwrap_or(&hostname).to_lowercase();
+    let install = host
+        .and_then(|h| h.install.clone())
+        .map(Arc::new)
+        .or(db.and_then(|d| d.install.clone()));
+    let version: Option<Arc<str>> = live
+        .map(|l| l.agent_version.clone())
+        .filter(|v| !v.is_empty())
+        .or(db.and_then(|d| d.agent_version.clone()));
+    let config_state = crate::remote::desired::config_state(
+        version.as_deref(),
+        install.as_ref().and_then(|i| i.config.as_deref()),
+        db.and_then(|d| d.config.as_deref()),
+    );
     Some(HostView {
         hostname_lower: hostname.to_lowercase(),
         name_lower: name,
@@ -532,10 +456,7 @@ pub fn view_of(
         offline_reason,
         ip: peer.as_deref().and_then(ip_of),
         peer,
-        agent_version: live
-            .map(|l| l.agent_version.clone())
-            .filter(|v| !v.is_empty())
-            .or(db.and_then(|d| d.agent_version.clone())),
+        agent_version: version,
         proto: live
             .map(|l| i64::from(l.proto))
             .or(db.and_then(|d| d.proto)),
@@ -582,6 +503,8 @@ pub fn view_of(
         host_group: db.and_then(|d| d.host_group.clone()),
         boot_time: db.and_then(|d| d.boot_time),
         inventory: db.and_then(|d| d.inventory.clone()),
+        install,
+        config_state,
         cpu,
         mem_ratio,
     })
@@ -654,11 +577,7 @@ impl HostIndex {
     /// 例如由 `kairos reports import` 或第一筆 report 建立、尚未在狀態表中的主機）
     async fn db_hosts(&self, ctx: &ApiContext) -> Result<Arc<Vec<DbHost>>, ApiError> {
         let mut guard = self.db.lock().await;
-        let max_id = |conn: &Connection| -> rusqlite::Result<i64> {
-            conn.query_row("SELECT coalesce(max(host_id), 0) FROM hosts", [], |r| {
-                r.get(0)
-            })
-        };
+        let max_id = |conn: &dyn Store| conn.max_host_id();
         if let Some((at, cached_max, hosts)) = guard.as_ref()
             && at.elapsed() < DB_CACHE_MAX_AGE
         {
@@ -676,7 +595,7 @@ impl HostIndex {
             .pool
             .read("主機清單", move |conn| {
                 let max = max_id(conn).map_err(query_failed("主機清單"))?;
-                let hosts = load_hosts(conn).map_err(query_failed("主機清單"))?;
+                let hosts = conn.load_hosts().map_err(query_failed("主機清單"))?;
                 Ok((max, hosts))
             })
             .await?;
@@ -750,16 +669,21 @@ pub struct Filter {
     os_family: Vec<String>,
     /// 角色指派的範圍：只看得到這些主機群組（小寫）；`None` 為全部
     scope: Option<Vec<String>>,
+    /// `config_state` 參數（集中設定的狀態；取「或」）
+    config_state: Vec<String>,
+    /// `remote_upgrade` 參數（`install.upgrade` 的值，沒有 `install` 的主機為 `none`；取「或」）
+    remote_upgrade: Vec<String>,
 }
 
 /// `offline_reason` 參數接受的值（0.7 的名稱；舊名稱 `timeout`、`connection_closed` 在過渡期也接受，
 /// 見 [`crate::registry::normalize_offline_reason`]）
-const OFFLINE_REASONS: [&str; 5] = [
+const OFFLINE_REASONS: [&str; 6] = [
     "idle_timeout",
     "agent_closed",
     "server_shutdown",
     "certificate_rejected",
     "write_unknown",
+    "server_lost",
 ];
 
 fn parse_cidr(param: &str, text: &str) -> Result<Cidr, ApiError> {
@@ -824,6 +748,29 @@ impl Filter {
                 ));
             }
             f.os_family.push(v);
+        }
+        for v in q.list("config_state") {
+            if !crate::remote::desired::CONFIG_STATES.contains(&v.as_str()) {
+                return Err(ApiError::param(
+                    "config_state",
+                    format!(
+                        "config_state 的值 \"{v}\" 無效（{}）",
+                        crate::remote::desired::CONFIG_STATES.join("、")
+                    ),
+                ));
+            }
+            f.config_state.push(v);
+        }
+        for v in q.list("remote_upgrade") {
+            if v != "none" && !kairos_proto::mgmt::is_install_token(&v) {
+                return Err(ApiError::param(
+                    "remote_upgrade",
+                    format!(
+                        "remote_upgrade 的值 \"{v}\" 無效（ready、disabled、no_trust_anchor、no_helper、unsupported、none）"
+                    ),
+                ));
+            }
+            f.remote_upgrade.push(v);
         }
         f.durable = q.bool("durable")?;
         for s in q.list("subnet") {
@@ -924,6 +871,19 @@ impl Filter {
             && h.durable != Some(d)
         {
             return false;
+        }
+        if !self.config_state.is_empty() && !self.config_state.iter().any(|s| s == h.config_state) {
+            return false;
+        }
+        if !self.remote_upgrade.is_empty() {
+            let v = h
+                .install
+                .as_ref()
+                .and_then(|i| i.upgrade.as_deref())
+                .unwrap_or("none");
+            if !self.remote_upgrade.iter().any(|x| x == v) {
+                return false;
+            }
         }
         if !self.subnets.is_empty()
             && !h
@@ -1211,7 +1171,9 @@ pub fn query<'a>(
     })
 }
 
-const LIST_PARAMS: [&str; 15] = [
+const LIST_PARAMS: [&str; 17] = [
+    "config_state",
+    "remote_upgrade",
     "os_family",
     "status",
     "never_connected",
@@ -1376,13 +1338,7 @@ pub async fn connections(
     let exists_group: Option<Option<String>> = ctx
         .pool
         .read("主機詳情", move |conn| {
-            conn.query_row(
-                "SELECT host_group FROM hosts WHERE agent_id = ?1",
-                [&q],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(query_failed("主機詳情"))
+            conn.host_group_of(&q).map_err(query_failed("主機詳情"))
         })
         .await?;
     let known = exists_group.is_some() || ctx.registry.live_get(&id).is_some();
@@ -1404,15 +1360,8 @@ pub async fn connections(
 }
 
 /// 這台主機最新一張憑證的摘要（不含序號與指紋：那些需要 `pki:read`，見 `/api/v1/pki/certificates`）
-fn certificate_summary(conn: &Connection, agent_id: &str, now_ms: i64) -> rusqlite::Result<Value> {
-    let row = conn
-        .query_row(
-            "SELECT not_after, revoked_at FROM pki_certificates WHERE agent_id = ?1 \
-             ORDER BY issued_at DESC LIMIT 1",
-            [agent_id],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
-        )
-        .optional()?;
+fn certificate_summary(conn: &dyn Store, agent_id: &str, now_ms: i64) -> StoreResult<Value> {
+    let row = conn.latest_cert_of(agent_id)?;
     Ok(match row {
         None => Value::Null,
         Some((not_after, revoked_at)) => {
@@ -1454,14 +1403,9 @@ pub async fn check_access(
     let group: Option<String> = ctx
         .pool
         .read("主機詳情", move |conn| {
-            conn.query_row(
-                "SELECT host_group FROM hosts WHERE agent_id = ?1",
-                [&q],
-                |r| r.get(0),
-            )
-            .optional()
-            .map(Option::flatten)
-            .map_err(query_failed("主機詳情"))
+            conn.host_group_of(&q)
+                .map(Option::flatten)
+                .map_err(query_failed("主機詳情"))
         })
         .await?;
     if access.allows(group.as_deref()) {
@@ -1484,7 +1428,7 @@ pub async fn detail(
     let (db, certificate) = ctx
         .pool
         .read("主機詳情", move |conn| {
-            let host = load_host(conn, &id).map_err(query_failed("主機詳情"))?;
+            let host = conn.load_host(&id).map_err(query_failed("主機詳情"))?;
             let cert = certificate_summary(conn, &id, now_ms).map_err(query_failed("主機詳情"))?;
             Ok((host, cert))
         })
@@ -1595,6 +1539,7 @@ pub async fn detail(
 pub(crate) mod tests {
     use super::*;
     use crate::registry::OfflineReason;
+    use crate::tls::RejectionReason;
 
     pub fn db_host(id: &str, name: &str, peer: &str, last_seen: i64) -> DbHost {
         DbHost {
@@ -1625,6 +1570,8 @@ pub(crate) mod tests {
             boot_time: None,
             inventory: None,
             series_limited_at: None,
+            install: None,
+            config: None,
         }
     }
 

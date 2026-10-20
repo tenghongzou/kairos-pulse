@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "kairos"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "chrono",
@@ -725,6 +725,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
+ "socket2",
  "time",
 ]
 
@@ -1026,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "pulse"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "config",

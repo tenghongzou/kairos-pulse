@@ -5,8 +5,8 @@
 ## 1. 版本規則
 
 - Kairos 與 Pulse 各自採用 [SemVer](https://semver.org/lang/zh-TW/) `MAJOR.MINOR.PATCH`，版本號唯一的來源是產品 `Cargo.toml` 的 `[package] version`。
-  - `--version` 與啟動日誌第一行印出 `<名稱> <版本> (<commit>)`，例如 `kairos 0.8.0 (1a2b3c4)`；Pulse 在 hello 的 `agent_version` 只送版本號。
-  - 發佈檔名為 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`（例如 `kairos-0.8.0-1a2b3c4-linux-x86_64.tar.gz`、`pulse-0.8.0-1a2b3c4-windows-x86_64.msi`），打包腳本會確認 `--version` 的輸出與檔名完全一致（Linux aarch64 以 qemu-aarch64 執行；Windows 執行檔無法在容器內執行，改為確認內嵌的版本字串）。deb／rpm 的套件版本為 `<版本>-1`。
+  - `--version` 與啟動日誌第一行印出 `<名稱> <版本> (<commit>)`，例如 `kairos 0.9.0 (1a2b3c4)`；Pulse 在 hello 的 `agent_version` 只送版本號。
+  - 發佈檔名為 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`（例如 `kairos-0.9.0-1a2b3c4-linux-x86_64.tar.gz`、`pulse-0.9.0-1a2b3c4-windows-x86_64.msi`），打包腳本會確認 `--version` 的輸出與檔名完全一致（Linux aarch64 以 qemu-aarch64 執行；Windows 執行檔無法在容器內執行，改為確認內嵌的版本字串）。deb／rpm 的套件版本為 `<版本>-1`。
 - **1.0 之前（0.x）**：破壞性變更升 MINOR（0.2.x → 0.3.0），其餘新增與修正升 PATCH。**1.0 之後**依標準 SemVer：破壞性變更升 MAJOR。
 - **破壞性變更**指客戶升級時必須做事、否則會出問題的變更，例如：設定欄位的預設值改變或移除、原本接受的設定被拒絕、協定不相容、結束代碼改變、資料檔或日誌的格式與權限改變、systemd unit 需要更新、需要調整監控門檻。每一項都要寫進 `CHANGELOG.md` 的「破壞性變更與升級步驟」表。
 - 兩個產品通常同時發佈相同的版本號，但可以只發佈其中一個（例如只修 Pulse 時發佈 Pulse 0.4.1，Kairos 維持 0.4.0）；相容性以 `CHANGELOG.md` 的相容矩陣為準，不以版本號是否相同判斷。
@@ -15,15 +15,16 @@
 
 ## 2. 發佈步驟
 
-以下以 Kairos 0.8.0、Pulse 0.8.0 為例。
+以下以 Kairos 0.9.0、Pulse 0.9.0 為例。
 
 ### 2.1 準備發佈 commit
 
-1. 從 `main` 開分支（衝刺的整合分支 `sprintN/integration` 須先合併回 `main`），例如 `release/0.8.0`。
+1. 從 `main` 開分支（衝刺的整合分支 `sprintN/integration` 須先合併回 `main`），例如 `release/0.9.0`。
 2. 確認兩個產品 `Cargo.toml` 的 `version`，執行 `cargo metadata --format-version 1 >/dev/null` 更新 `Cargo.lock`；`git diff Cargo.lock` 只能有 `kairos`、`pulse` 等 workspace 成員的版本變動。
 3. 更新 `CHANGELOG.md`：
-   - 草稿段落 `## [0.8.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.8.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
+   - 草稿段落 `## [0.9.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.9.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
    - 更新「版本相容矩陣」，移除已確定項目的〔草稿〕標記。
+   - 確認發佈清單的手動欄位 `pulse/packaging/release-meta.toml`（0.9.0 起）：`min_kairos` 與相容矩陣一致、`min_upgrade_from`（需要新的 systemd unit 或資料轉換時提高）、`remote_features`（這版實際宣告的遠端管理 feature）、`breaking`（「破壞性變更與升級步驟」有 Pulse 的項目時為 `true`）。
 4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。
 5. 合併到整合分支後，記下合併後的 commit（以下稱 `<release-commit>`）；之後的步驟都在這個 commit 上進行。
 
@@ -33,9 +34,9 @@
 
 ```bash
 git switch --detach <release-commit>
-git tag -a kairos-v0.8.0 -m "Kairos 0.8.0"
-git tag -a pulse-v0.8.0  -m "Pulse 0.8.0"
-git push origin kairos-v0.8.0 pulse-v0.8.0
+git tag -a kairos-v0.9.0 -m "Kairos 0.9.0"
+git tag -a pulse-v0.9.0  -m "Pulse 0.9.0"
+git push origin kairos-v0.9.0 pulse-v0.9.0
 ```
 
 建議以個人的 SSH 金鑰簽署 tag（`git tag -s`，事先 `git config gpg.format ssh`、`git config user.signingkey ~/.ssh/id_ed25519.pub`），**不要**使用下一節的發佈金鑰：發佈金鑰只用來簽 `SHA256SUMS`，保存在離線的位置。tag 一旦推送就不再移動；發現問題時發佈新的 PATCH 版本。
@@ -45,7 +46,7 @@ git push origin kairos-v0.8.0 pulse-v0.8.0
 在乾淨的 checkout 上執行（Windows 請用 Git Bash；需要 Docker、cargo、cargo-deny）：
 
 ```bash
-git switch --detach kairos-v0.8.0          # 與 pulse-v0.8.0 是同一個 commit
+git switch --detach kairos-v0.9.0          # 與 pulse-v0.9.0 是同一個 commit
 SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 ```
 
@@ -65,7 +66,8 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 | `pulse-<版本>-<commit>-windows-x86_64.{zip,msi}` | Pulse 的 Windows 發佈檔（MSI：`pulse/packaging/windows/pulse.wxs`，wixl） |
 | `<名稱>-<版本>-<commit>-<os>-<arch>.cdx.json` | 每個平台的 SBOM（與發佈包內相同），供客戶匯入掃描工具 |
 | `pulse-install.sh` | Pulse 的一行安裝腳本（`pulse/packaging/install.sh`） |
-| `SHA256SUMS` | 以上所有檔案的 SHA-256（共 20 個：Kairos 8、Pulse 12） |
+| `pulse-<版本>-<commit>-release.json` | 發佈清單（0.9.0 起；遠端升級用，`crates/kairos-proto/REMOTE.md` 第 4.1.3 節）：`packaging/release-manifest.sh` 依 `pulse/packaging/release-meta.toml` 與 git 歷史（`pulse.service` 的歷來雜湊）產生；`-dirty` 的建置不產生 |
+| `SHA256SUMS` | 以上所有檔案的 SHA-256（共 21 個：Kairos 8、Pulse 13；清單因此受同一個簽章保護） |
 | `SHA256SUMS.sig` | `SHA256SUMS` 的簽章 |
 
 只建置部分目標（例如開發時快速確認）：`TARGETS=x86_64-unknown-linux-musl PACKAGES= sh kairos/packaging/build-release.sh`；正式發佈一律用預設值。容器內 cargo 的平行數預設 2（`BUILD_JOBS`，只影響時間，不影響產物）；完整建置兩個產品、五個目標在 4 vCPU 的建置機上約需〔待量測〕。
@@ -156,6 +158,7 @@ docker run --rm rust:1.99-alpine@sha256:<新 digest> sh -c \
 - 來源以 `git -c core.autocrlf=false archive` 匯出（LF），與主機的行尾設定無關；容器內路徑固定（`/src`、`/build/target`、`/usr/local/cargo/registry`），執行檔中的路徑字串因此一致。
 - `BUILD_COMMIT` 取自 git；tar 的檔案順序、擁有者、mtime（`SOURCE_DATE_EPOCH` = commit 時間）固定，gzip 不寫入檔名與時間（`-n`）。
 - SBOM 的 timestamp 取自 `SOURCE_DATE_EPOCH`，且沒有隨機的 serialNumber。
+- 發佈清單：`released_at` 為 `SOURCE_DATE_EPOCH` 的 UTC 日期，unit 的雜湊取自 git 物件（repo 中儲存的 LF 版本），只由 commit 決定。
 - deb／rpm：nfpm 的 `mtime` 設為 commit 時間（套件內檔案與控制資料的時間）。
 - zip：檔案依名稱排序、mtime 為 commit 時間、`TZ=UTC`（DOS 時間是本地時間）、`-X` 不寫額外的時間欄位。
 - MSI：wixl 與 msibuild 在 libfaketime 下以 commit 時間執行（摘要資訊的建立／儲存時間、OLE 目錄的時間），`NO_FAKE_STAT=1` 讓 CAB 內的檔案時間取自（已固定的）mtime；PackageCode 由「版本＋commit」、ProductCode 由版本推導（不使用 wixl 產生的隨機值）。

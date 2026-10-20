@@ -7,6 +7,8 @@
 // - 全站 Banner（design-system README §6.13）：只用於「全體主機受影響」的項目——CRL 與伺服器憑證即將到期或已過期、
 //   回報持續無法寫入、以未驗證的方式接受 agent 連線、告警引擎沒有在執行（通知送不出去）。嚴重不可關閉；
 //   警告可「24 小時內不再顯示」（只記在這個瀏覽器，同一個問題升級為嚴重時照常顯示）。
+// - SSE resync 的 Banner（screens.md §0.2）：依原因選文案（restarted／failover／too_old；未知比照 restarted），
+//   畫面重新抓取完成後 3 秒移除。
 
 import { h, icon, isTyping, mount } from '../core/dom.js';
 import { t, healthItemText } from '../core/strings.js';
@@ -14,6 +16,7 @@ import { codeTag } from './components.js';
 import * as session from '../core/session.js';
 import * as prefs from '../core/prefs.js';
 import { api, isOnline } from '../core/api.js';
+import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
 import { NAV } from './nav.js';
 import { openMenu } from './menu.js';
@@ -284,6 +287,39 @@ export function setOffline(offline) {
   for (const el of document.querySelectorAll('.k-data-time')) el.classList.add('is-stale');
 }
 
+// ---- SSE resync 的 Banner（screens.md §0.2）----
+// 收到 resync 時顯示（info，role="status"，焦點不移動）；畫面重新抓取完成（sse.resyncSettled）後 3 秒移除。
+// 沒有清單要重新抓取的畫面不會通知完成，以 RESYNC_FALLBACK_MS 為上限。
+const RESYNC_LINGER_MS = 3000;
+const RESYNC_FALLBACK_MS = 8000;
+let resyncTimer = null;
+
+function resyncText(reason) {
+  const key = ['restarted', 'failover', 'too_old', 'overflow'].includes(reason) ? reason : 'restarted';
+  return t(`shell.resync.${key}`);
+}
+
+function clearResync(delay) {
+  clearTimeout(resyncTimer);
+  resyncTimer = setTimeout(() => {
+    resyncTimer = null;
+    if (shell) mount(shell.resyncBanner);
+  }, delay);
+}
+
+sse.onResync((reason) => {
+  if (!shell) return;
+  mount(
+    shell.resyncBanner,
+    h('div', { class: 'ds-banner ds-banner--info', role: 'status', dataset: { banner: 'resync' } }, icon('info'), h('div', { class: 'ds-banner__body' }, resyncText(reason))),
+  );
+  clearResync(RESYNC_FALLBACK_MS);
+});
+
+sse.onResyncSettled(() => {
+  if (shell && shell.resyncBanner.firstChild) clearResync(RESYNC_LINGER_MS);
+});
+
 function onKey(ev) {
   if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'k' || ev.key === 'K')) {
     ev.preventDefault();
@@ -344,7 +380,8 @@ export function mountShell(root, { onLogout }) {
   // 全站 Banner：系統層級（健康 API）在上、連線中斷在下（各自更新，互不覆蓋）
   const sysBanner = h('div', { class: 'k-banner-stack' });
   const offlineBanner = h('div', { class: 'k-banner-stack' });
-  const banner = h('div', { id: 'banner-region' }, sysBanner, offlineBanner);
+  const resyncBanner = h('div', { class: 'k-banner-stack' });
+  const banner = h('div', { id: 'banner-region' }, sysBanner, offlineBanner, resyncBanner);
   mount(root, 
     h('a', { class: 'k-skip', href: '#main', on: { click: (ev) => { ev.preventDefault(); const t1 = document.getElementById('page-title'); if (t1) t1.focus(); } } }, t('shell.skip')),
     h(
@@ -360,7 +397,7 @@ export function mountShell(root, { onLogout }) {
     banner,
     h('div', { class: 'k-shell' }, nav, h('div', { class: 'k-nav-scrim', on: { click: () => setNavOpen(false) } }), h('main', { class: 'k-main', id: 'main' }, content)),
   );
-  shell = { root, nav, content, banner, sysBanner, offlineBanner, burger, light, userBtn };
+  shell = { root, nav, content, banner, sysBanner, offlineBanner, resyncBanner, burger, light, userBtn };
   renderNav();
   renderUser();
   refreshHealth();

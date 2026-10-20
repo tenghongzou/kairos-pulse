@@ -17,12 +17,19 @@
 //! 協商了 `durable` 時為 at-least-once（A5，[`serve_durable`]）：取樣先寫進本機緩衝（`spool`），
 //! 連線 task 依序送出、收到 ack 才刪除；同一時間最多 [`DURABLE_IN_FLIGHT`] 筆在途，
 //! 兩筆之間至少間隔 `buffer.replay_interval_ms`（低於 Kairos 的 report 速率限制）。
+//!
+//! 多個伺服器位址（`server.fallback_addresses`，`kairos/HA.md` 第 8 節）：一輪從第一個候選位址開始
+//! 依序嘗試，收到 hello_ack 之前失敗就立即改試下一個（`PLS-W2301`，不增加退避），整輪都失敗才退避
+//! （`PLS-E2302`）。連上後不主動切回主位址。協商了 feature `cluster` 時，Kairos 送 `drain` 要求改連
+//! 其他節點：停止送出新的 report、等在途的回應（最多 8 秒）後關閉，依 `reconnect_within_ms` 的隨機
+//! 延遲從下一個候選位址重連，不算失敗（`PLS-I8507`）。
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -46,14 +53,21 @@ use crate::protocol::{
     clock_skew_warning, hello_features, now_ts, parse_server_msg, report_message,
     sanitize_cpu_usage,
 };
+use crate::remote::RemoteMgmt;
+use crate::remote::conn::MgmtConn;
 use crate::rotation::{HelloAckExtra, Rotation, RotationLine};
+use crate::server_addr::Candidate;
 use crate::service_status;
 use crate::spool::{EntryInfo, SharedSpool, Spool, SpoolRecord};
 use crate::system_info::{self, Sample};
 use crate::tls::{self, TlsSetup};
 
-/// TCP 連線逾時。
+/// TCP 連線逾時（一個候選位址的總時限，含名稱解析）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 名稱解析出多個位址時，每個位址的 TCP 連線時限（最後一個位址用剩下的時間）
+const PER_ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 同一輪中改試下一個候選位址前的隨機延遲上限（`kairos/HA.md` 第 8.3 節）
+const FAILOVER_SPREAD: Duration = Duration::from_millis(500);
 /// TLS 握手逾時。
 const TLS_TIMEOUT: Duration = Duration::from_secs(10);
 /// 送出 hello 後等待 hello_ack 的逾時。
@@ -146,6 +160,8 @@ struct ServerLogThrottles {
     clock_skew: ClockSkewLog,
     /// report 超過單行上限而捨去部分內容（METRICS.md 第 4.4 節：每 10 分鐘最多一則 WARN）
     report_trimmed: LogThrottle,
+    /// 上一次 hello_ack 的 `cluster_id`（feature `cluster`；改變時記 WARN）
+    last_cluster_id: Option<String>,
 }
 
 impl Default for ServerLogThrottles {
@@ -163,6 +179,7 @@ impl Default for ServerLogThrottles {
             spool_expired: LogThrottle::new(STORAGE_UNAVAILABLE_LOG_WINDOW),
             clock_skew: ClockSkewLog::default(),
             report_trimmed: LogThrottle::new(REPORT_TRIMMED_LOG_WINDOW),
+            last_cluster_id: None,
         }
     }
 }
@@ -235,8 +252,13 @@ fn log_retries_exhausted(check: Option<u64>, msg: &str) {
 /// 連線 task 所需的設定（啟動時由 `AppConfig` 建立）。
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// 第一優先的伺服器位址（`server.address`；= `candidates[0]`）
     pub address: String,
     pub port: u16,
+    /// 候選位址：`server.address:server.port`，接著 `server.fallback_addresses`（至少一個）
+    pub candidates: Vec<Candidate>,
+    /// 最近一次註冊成功的候選位址（一次性連線與過期憑證的報到從這裡開始試）
+    pub last_connected: Arc<AtomicUsize>,
     /// TLS 名稱驗證用的名稱（僅用於日誌與錯誤提示；實際值在 `TlsSetup::server_name`）
     pub domain: String,
     pub agent_id: String,
@@ -267,6 +289,9 @@ pub struct Settings {
     pub processes_feature: bool,
     /// `inventory.enabled` 時的資產收集與送出紀錄：hello 宣告 `inventory`（`None` 時不宣告）
     pub inventory: Option<Arc<InventoryAgent>>,
+    /// 遠端管理（集中設定、遠端升級；`crates/kairos-proto/REMOTE.md`）：hello 帶 `install`、宣告
+    /// `config`／`upgrade`。`None` 時（測試、一次性連線）不帶也不宣告
+    pub mgmt: Option<Arc<RemoteMgmt>>,
 }
 
 impl Settings {
@@ -274,6 +299,8 @@ impl Settings {
         Self {
             address: config.server.address.clone(),
             port: config.server.port,
+            candidates: config.server.candidates(),
+            last_connected: Arc::new(AtomicUsize::new(0)),
             domain: config.server.domain.trim().to_string(),
             agent_id,
             hostname,
@@ -297,7 +324,31 @@ impl Settings {
             grace_on_expiry: false,
             processes_feature: config.processes.enabled,
             inventory: None,
+            mgmt: None,
         }
+    }
+
+    /// 遠端管理的集中設定改變了即時的鍵（`retry.*`、`buffer.replay_interval_ms`、`report.interval`）：
+    /// 下一次連線（含退避）起使用新的值（REMOTE.md 第 3.1 節「即時（下一次斷線）」）
+    fn refresh_live(&mut self, config: &AppConfig) {
+        self.max_retries = config.retry.max_retries;
+        self.initial_delay = Duration::from_secs(config.retry.initial_delay);
+        self.max_delay = Duration::from_secs(config.retry.max_delay);
+        self.replay_interval = Duration::from_millis(config.effective_replay_interval_ms());
+        self.host.report_interval_ms = Some(config.report.interval.saturating_mul(1000));
+    }
+
+    /// 候選位址的數量
+    fn candidate_count(&self) -> usize {
+        self.candidates.len().max(1)
+    }
+
+    /// 第 `index` 個候選位址（沒有候選清單時為 `address:port`）
+    fn candidate(&self, index: usize) -> Candidate {
+        self.candidates
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| Candidate::new(self.address.trim(), self.port))
     }
 
     /// 讀取閒置逾時：`max(2 × hb, hb + 10 秒)`，`hb = heartbeat.interval`。
@@ -344,6 +395,13 @@ enum SessionError {
     Shutdown,
     /// 經 8443 取得新的用戶端憑證（`renew_result`）：以新憑證重新連線
     Renewed,
+    /// Kairos 要求改連其他節點（feature `cluster` 的 `drain`）：不算失敗，依延遲改連下一個候選位址
+    Drained {
+        /// 已夾在 1000～300000 的 `reconnect_within_ms`
+        reconnect_within_ms: u32,
+    },
+    /// 集中設定改變了需要重新連線的鍵（REMOTE.md 第 3.1 節）：結束連線，以新的設定重建取樣與連線
+    Reconfigure,
 }
 
 impl SessionError {
@@ -431,6 +489,8 @@ impl fmt::Display for SessionError {
             }
             Self::Shutdown => write!(f, "收到結束要求"),
             Self::Renewed => write!(f, "已取得新的用戶端憑證，以新憑證重新連線"),
+            Self::Drained { .. } => write!(f, "Kairos 要求改連其他節點（drain）"),
+            Self::Reconfigure => write!(f, "集中設定改變了需要重新連線的設定，以新的設定重新連線"),
         }
     }
 }
@@ -442,8 +502,8 @@ type Result<T> = std::result::Result<T, SessionError>;
 trait Dialer {
     type Stream: AsyncRead + AsyncWrite + Unpin;
 
-    /// 建立一條連線（含 TLS 握手），並回傳這條連線的 TLS 資訊（註冊成功時寫進日誌）。
-    async fn dial(&self) -> Result<(Self::Stream, TlsInfo)>;
+    /// 連到候選位址 `target`（含 TLS 握手），並回傳這條連線的 TLS 資訊（註冊成功時寫進日誌）。
+    async fn dial(&self, target: &Candidate) -> Result<(Self::Stream, TlsInfo)>;
 
     /// 最近一次 `dial` 的握手中，伺服器是否要求了客戶端憑證（用於錯誤提示）。
     fn client_cert_was_requested(&self) -> bool;
@@ -458,9 +518,9 @@ struct TlsDialer<'a> {
 impl Dialer for TlsDialer<'_> {
     type Stream = TlsStream<TcpStream>;
 
-    async fn dial(&self) -> Result<(Self::Stream, TlsInfo)> {
+    async fn dial(&self, target: &Candidate) -> Result<(Self::Stream, TlsInfo)> {
         self.tls.reset_client_cert_request();
-        connect(self.settings, self.tls).await
+        connect_to(self.settings, self.tls, target).await
     }
 
     fn client_cert_was_requested(&self) -> bool {
@@ -510,6 +570,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         pending > 0 && pending < self.last_line_len
     }
 
+    /// 排空後關閉：送出 TLS close_notify（最多等 `CLOSE_NOTIFY_TIMEOUT`），失敗只記 DEBUG
+    /// （Kairos 關機時送出 drain 後隨即關閉連線，這時送 close_notify 可能失敗，不是異常）
+    async fn close_quietly(&mut self) {
+        if self.has_partial_write() {
+            return;
+        }
+        match time::timeout(CLOSE_NOTIFY_TIMEOUT, self.framed.get_mut().shutdown()).await {
+            Ok(Ok(())) => log::debug!("排空：已送出 TLS close_notify"),
+            Ok(Err(e)) => log::debug!("排空：送出 TLS close_notify 失敗：{}", io_error_text(&e)),
+            Err(_) => log::debug!("排空：送出 TLS close_notify 逾時"),
+        }
+    }
+
     /// 正常關閉：送出 TLS close_notify（最多等 `CLOSE_NOTIFY_TIMEOUT`）。回傳是否成功送出。
     ///
     /// 只關閉底層串流，不 flush `Framed` 的寫入緩衝，以免把被中斷的訊息補送給伺服器。
@@ -552,6 +625,8 @@ pub enum RunExit {
     CertExpired,
     /// 經 8443 取得新憑證（`client.next.pem`）：以新憑證確認後取代
     Renewed,
+    /// 集中設定改變了需要重新連線的鍵（或確認失敗回復了上一版）：以新的設定重建取樣與連線
+    Reconfigure,
 }
 
 /// 連線主迴圈：無限重連，直到 `shutdown` 被觸發才返回。
@@ -571,6 +646,23 @@ pub async fn run(
     run_with(&settings, &dialer, reports, spool.as_ref(), &shutdown).await
 }
 
+/// 一輪中某個候選位址在收到 hello_ack 之前失敗的紀錄
+struct AttemptError {
+    index: usize,
+    err: SessionError,
+    /// 這次握手中伺服器是否要求了客戶端憑證
+    cert_requested: bool,
+}
+
+/// 一輪都失敗時，作為這一輪結果的錯誤：需要人工處理的錯誤（伺服器憑證不符、客戶端憑證被拒、
+/// 伺服器的致命錯誤等）優先，因為它們不會自行恢復；其餘取最後一個
+fn round_error(errors: &[AttemptError], has_client_cert: bool) -> usize {
+    errors
+        .iter()
+        .position(|a| attention_key(&a.err, has_client_cert).is_some())
+        .unwrap_or(errors.len().saturating_sub(1))
+}
+
 /// [`run`] 的實作，連線方式由 `dialer` 提供。
 async fn run_with<D: Dialer>(
     settings: &Settings,
@@ -579,6 +671,9 @@ async fn run_with<D: Dialer>(
     spool: Option<&Arc<SharedSpool>>,
     shutdown: &CancellationToken,
 ) -> RunExit {
+    // 集中設定的即時鍵（重連退避、補送間隔、report 間隔）在每一輪開始時更新
+    let mut live = settings.clone();
+    let settings = &mut live;
     let mut backoff = Backoff::new(settings.initial_delay, settings.max_delay);
     let mut throttles = ServerLogThrottles::default();
     // 連續因 superseded 而斷線的次數（其他原因斷線即歸零）
@@ -590,7 +685,12 @@ async fn run_with<D: Dialer>(
     // 連續失敗達 max_retries 後一般連線錯誤的 error 日誌節流；連線穩定（退避重置）時重新起算，
     // 下一次中斷達到 max_retries 時立即以 error 記錄
     let mut retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
+    // 改試下一個候選位址（PLS-W2301）的 WARN 節流：每輪第一次失敗時判斷一次，每 10 分鐘最多一則
+    let mut failover_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
     let has_client_cert = settings.client_cert.is_some();
+    let n = settings.candidate_count();
+    // 下一輪從第幾個候選位址開始（平常是第一個；drain 後是目前位址的下一個）
+    let mut next_start = 0usize;
 
     // systemctl status 從啟動起就有 Status: 行（否則第一次註冊或斷線前都是空的）
     service_status::set_status(STARTING_STATUS);
@@ -614,33 +714,184 @@ async fn run_with<D: Dialer>(
     }
 
     loop {
-        let mut registered_at = None;
-        let err = match session(
-            settings,
-            dialer,
-            reports,
-            spool,
-            &mut registered_at,
-            &mut throttles,
-            shutdown,
-        )
-        .await
-        {
-            Ok(never) => match never {},
-            Err(SessionError::Shutdown) => {
-                log::debug!("連線任務已停止");
-                return RunExit::Stopped;
+        if let Some(m) = settings.mgmt.clone() {
+            let effective = m.config.effective();
+            settings.refresh_live(&effective);
+            backoff.set_limits(settings.initial_delay, settings.max_delay);
+        }
+        // ---- 一輪：從 next_start 開始依序嘗試每個候選位址 ----
+        let start = std::mem::take(&mut next_start);
+        let mut attempts: Vec<AttemptError> = Vec::new();
+        // 註冊後才結束的連線：(候選位址, 錯誤, 註冊時間)
+        let mut ended: Option<(usize, SessionError, Instant)> = None;
+        for k in 0..n {
+            let index = (start + k) % n;
+            if k > 0 {
+                let pause = crate::backoff::random_spread(FAILOVER_SPREAD);
+                tokio::select! {
+                    _ = time::sleep(pause) => {}
+                    _ = shutdown.cancelled() => {
+                        log::debug!("改試下一個候選位址前收到結束要求，連線任務已停止");
+                        return RunExit::Stopped;
+                    }
+                }
             }
-            Err(SessionError::Renewed) => {
-                log::info!("已取得新的用戶端憑證，結束目前的連線，改以新憑證連線");
-                return RunExit::Renewed;
+            let mut registered_at = None;
+            let err = match session(
+                settings,
+                index,
+                dialer,
+                reports,
+                spool,
+                &mut registered_at,
+                &mut throttles,
+                shutdown,
+            )
+            .await
+            {
+                Ok(never) => match never {},
+                Err(SessionError::Shutdown) => {
+                    log::debug!("連線任務已停止");
+                    return RunExit::Stopped;
+                }
+                Err(SessionError::Renewed) => {
+                    log::info!("已取得新的用戶端憑證，結束目前的連線，改以新憑證連線");
+                    return RunExit::Renewed;
+                }
+                Err(SessionError::Reconfigure) => {
+                    if let Some(m) = &settings.mgmt {
+                        m.config.on_disconnected();
+                    }
+                    if let Some(rot) = &settings.rotation {
+                        rot.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .on_disconnect();
+                    }
+                    return RunExit::Reconfigure;
+                }
+                Err(e) => e,
+            };
+            if let Some(at) = registered_at {
+                if let Some(m) = &settings.mgmt {
+                    m.config.on_disconnected();
+                }
+                ended = Some((index, err, at));
+                break;
             }
-            Err(e) => e,
-        };
+            // 收到 hello_ack 之前失敗：集中設定的確認期內連續 3 次時回復上一份可用的設定
+            if let Some(m) = &settings.mgmt
+                && m.config.on_connect_failed()
+            {
+                log::info!("已回復上一份可用的集中設定，以回復後的設定重新連線（{err}）");
+                return RunExit::Reconfigure;
+            }
+            let cert_requested = dialer.client_cert_was_requested();
+            if k + 1 < n {
+                // 收到 hello_ack 之前失敗：立即改試下一個，不增加退避（kairos/HA.md 第 8.3 節）
+                crate::metrics::global().failovers.inc();
+                let level = if k == 0 && failover_log.check(Instant::now()).is_some() {
+                    log::Level::Warn
+                } else {
+                    log::Level::Debug
+                };
+                log::log!(
+                    level,
+                    "{}{} 無法連線：{err}；改試下一個候選位址 {}（共 {n} 個）",
+                    codes::tag(codes::CONN_FAILOVER, Some(codes::W_CANDIDATE_FAILED)),
+                    settings.candidate(index),
+                    settings.candidate((index + 1) % n)
+                );
+            }
+            attempts.push(AttemptError {
+                index,
+                err,
+                cert_requested,
+            });
+        }
         if let Some(rot) = &settings.rotation {
             rot.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .on_disconnect();
+        }
+
+        // ---- 排空（drain）：不算失敗、不增加退避，依延遲改連下一個候選位址 ----
+        if let Some((
+            index,
+            SessionError::Drained {
+                reconnect_within_ms,
+            },
+            at,
+        )) = &ended
+        {
+            superseded_streak = 0;
+            if at.elapsed() >= STABLE_CONNECTION {
+                backoff.reset();
+                retries_exhausted_log = LogThrottle::new(ATTENTION_LOG_WINDOW);
+            }
+            next_start = (index + 1) % n;
+            let delay = crate::backoff::random_spread(Duration::from_millis(u64::from(
+                *reconnect_within_ms,
+            )));
+            crate::metrics::global().drains.inc();
+            log::info!(
+                "{}Kairos 節點 {} 正在排空，要求改連其他節點：{:.1} 秒後改連 {}（在 0～{:.0} 秒間隨機選擇，不算連線失敗）",
+                codes::tag(codes::CONN_DRAIN, Some(codes::I_DRAIN)),
+                settings.candidate(*index),
+                delay.as_secs_f64(),
+                settings.candidate(next_start),
+                f64::from(*reconnect_within_ms) / 1000.0
+            );
+            local_status::record(|s| s.drained(delay));
+            service_status::set_status("重新連線中（Kairos 節點排空）");
+            tokio::select! {
+                _ = time::sleep(delay) => {}
+                _ = shutdown.cancelled() => {
+                    log::debug!("排空後的等待中收到結束要求，連線任務已停止");
+                    return RunExit::Stopped;
+                }
+            }
+            continue;
+        }
+
+        // 這一輪的結果：註冊後斷線的那條連線，或所有候選位址都失敗時最有代表性的錯誤
+        let (index, err, registered_at, cert_requested, all_failed) = match ended {
+            Some((index, err, at)) => (
+                index,
+                err,
+                Some(at),
+                dialer.client_cert_was_requested(),
+                false,
+            ),
+            None => {
+                let pick = round_error(&attempts, has_client_cert);
+                let a = attempts.remove(pick);
+                (a.index, a.err, None, a.cert_requested, true)
+            }
+        };
+        let multi = n > 1;
+        // 各候選位址最後的錯誤（所有位址都失敗時；含作為結果的那一個），依嘗試的順序
+        let mut candidate_errors: Vec<local_status::CandidateError> = Vec::new();
+        if all_failed && multi {
+            let mut all: Vec<(usize, String, Option<&'static str>)> = attempts
+                .iter()
+                .map(|a| {
+                    (
+                        a.index,
+                        a.err.to_string(),
+                        error_code(&a.err, 0, has_client_cert),
+                    )
+                })
+                .collect();
+            all.push((index, err.to_string(), error_code(&err, 0, has_client_cert)));
+            all.sort_by_key(|(i, ..)| (i + n - start) % n);
+            candidate_errors = all
+                .into_iter()
+                .map(|(i, message, code)| local_status::CandidateError {
+                    server: settings.candidate(i).to_string(),
+                    code,
+                    message,
+                })
+                .collect();
         }
 
         let superseded = err.server_code() == Some("superseded");
@@ -652,14 +903,7 @@ async fn run_with<D: Dialer>(
 
         // 每次斷線只記一則日誌：錯誤本身 + 處置提示 + 退避狀態
         let hint = server_error_hint(settings, &err, superseded_streak)
-            .or_else(|| {
-                connection_hint(
-                    &err,
-                    settings,
-                    dialer.client_cert_was_requested(),
-                    registered_at.is_some(),
-                )
-            })
+            .or_else(|| connection_hint(&err, settings, cert_requested, registered_at.is_some()))
             .map(|hint| format!("（{hint}）"))
             .unwrap_or_default();
         // 只有註冊後穩定維持 STABLE_CONNECTION 以上才重置退避；
@@ -702,24 +946,54 @@ async fn run_with<D: Dialer>(
             floor_note = "（連續被取代時延遲至少 30 秒，不受 retry.max_delay 限制）";
         }
         let failures = backoff.failures();
-        let code = error_code(&err, superseded_streak, has_client_cert).or_else(|| {
+        let own_code = error_code(&err, superseded_streak, has_client_cert).or_else(|| {
             // 握手完成前、伺服器也還沒要求客戶端憑證就被關閉：多半是每 IP 連線上限（審計 A7）
             matches!(&err, SessionError::Tls(e) if closed_before_handshake(e))
                 .then_some(codes::E_PER_IP_LIMIT)
-                .filter(|_| !dialer.client_cert_was_requested())
+                .filter(|_| !cert_requested)
         });
-        let msg = format!(
-            "{}連線中斷（連續第 {failures} 次失敗）：{err}{hint}{uptime_note}；{:.1} 秒後重連{floor_note}",
-            codes::tag(disconnect_event(code), code),
-            delay.as_secs_f64()
-        );
+        let attention = repeated_superseded || attention_key(&err, has_client_cert).is_some();
+        // 多個候選位址都失敗：一般網路錯誤以 PLS-E2302 呈現；需要人工處理的錯誤保留原本的代碼
+        let code = if all_failed && multi && !attention {
+            Some(codes::E_ALL_CANDIDATES_FAILED)
+        } else {
+            own_code
+        };
+        let msg = if !multi {
+            format!(
+                "{}連線中斷（連續第 {failures} 次失敗）：{err}{hint}{uptime_note}；{:.1} 秒後重連{floor_note}",
+                codes::tag(disconnect_event(code), code),
+                delay.as_secs_f64()
+            )
+        } else if all_failed {
+            let each: Vec<String> = candidate_errors
+                .iter()
+                .map(|c| format!("{}：{}", c.server, c.message))
+                .collect();
+            format!(
+                "{}連線中斷（連續第 {failures} 次失敗，{n} 個候選位址都無法連線）：{err}{hint}；各位址最後的錯誤：{}；{:.1} 秒後從 {} 重新嘗試{floor_note}",
+                codes::tag(disconnect_event(code), code),
+                each.join("；"),
+                delay.as_secs_f64(),
+                settings.candidate(0)
+            )
+        } else {
+            format!(
+                "{}連線中斷（連續第 {failures} 次失敗）：{}：{err}{hint}{uptime_note}；{:.1} 秒後從 {} 重新連線{floor_note}",
+                codes::tag(disconnect_event(code), code),
+                settings.candidate(index),
+                delay.as_secs_f64(),
+                settings.candidate(0)
+            )
+        };
         local_status::record(|s| {
             s.disconnected(Disconnected {
                 code,
                 message: err.to_string(),
-                attention: repeated_superseded || attention_key(&err, has_client_cert).is_some(),
+                attention,
                 consecutive_failures: u64::from(failures),
                 retry_in: delay,
+                candidate_errors,
             });
         });
         if repeated_superseded {
@@ -747,12 +1021,15 @@ async fn run_with<D: Dialer>(
         if local_status::tracker()
             .is_some_and(|t| t.update(|s| s.outage_reached(OUTAGE_ERROR_AFTER)))
         {
+            let target = if multi {
+                format!("{} 等 {n} 個候選位址", settings.candidate(0))
+            } else {
+                format!("{}:{}", settings.address, settings.port)
+            };
             let msg = format!(
-                "{}已中斷 {} 分鐘，超過告警門檻：請確認 Kairos 狀態，或檢查本機到 {}:{} 的網路（服務會持續重連）",
+                "{}已中斷 {} 分鐘，超過告警門檻：請確認 Kairos 狀態，或檢查本機到 {target} 的網路（服務會持續重連）",
                 codes::tag(codes::CONN_OUTAGE, code),
                 OUTAGE_ERROR_AFTER.as_secs() / 60,
-                settings.address,
-                settings.port
             );
             log::error!("{msg}");
             service_status::attention(&msg);
@@ -760,7 +1037,7 @@ async fn run_with<D: Dialer>(
 
         // Kairos 確認用戶端憑證已過期：改走 8444 過期續簽（設計包 enrollment-ux.md §8.1 (b)）
         if settings.grace_on_expiry
-            && code == Some(codes::E_CLIENT_CERT_EXPIRED)
+            && own_code == Some(codes::E_CLIENT_CERT_EXPIRED)
             && client_cert_alert(&err, has_client_cert)
                 == Some(tokio_rustls::rustls::AlertDescription::CertificateExpired)
         {
@@ -1120,13 +1397,8 @@ fn disconnect_status(err: &SessionError, superseded_streak: u32, has_client_cert
 
 /// 註冊成功後的 systemd 狀態文字：「已註冊：<伺服器位址>:<連接埠>」（IPv6 位址加上方括號），
 /// 有提醒時接在「；」之後（例如「；無法開啟本機緩衝（PLS-E4004，…）」）。
-fn registered_status(settings: &Settings) -> String {
-    let address = settings.address.trim();
-    let base = if address.contains(':') && !address.starts_with('[') {
-        format!("已註冊：[{address}]:{}", settings.port)
-    } else {
-        format!("已註冊：{address}:{}", settings.port)
-    };
+fn registered_status(settings: &Settings, server: &str) -> String {
+    let base = format!("已註冊：{server}");
     match &settings.status_note {
         Some(note) => format!("{base}；{note}"),
         None => base,
@@ -1136,8 +1408,10 @@ fn registered_status(settings: &Settings) -> String {
 /// 建立一條連線並服務到它結束為止；只會以錯誤返回。
 ///
 /// 收到結束要求時：尚未建立連線則直接返回；已建立則先送 close_notify。
+#[allow(clippy::too_many_arguments)]
 async fn session<D: Dialer>(
     settings: &Settings,
+    index: usize,
     dialer: &D,
     reports: &mut mpsc::Receiver<Sample>,
     spool: Option<&Arc<SharedSpool>>,
@@ -1145,29 +1419,85 @@ async fn session<D: Dialer>(
     throttles: &mut ServerLogThrottles,
     shutdown: &CancellationToken,
 ) -> Result<Infallible> {
+    let target = settings.candidate(index);
     let (stream, tls_info) = tokio::select! {
-        res = dialer.dial() => res?,
+        res = dialer.dial(&target) => res?,
         _ = shutdown.cancelled() => return Err(SessionError::Shutdown),
     };
     let mut conn = Connection::new(stream);
 
     let result = tokio::select! {
-        res = serve(&mut conn, settings, Some(&tls_info), reports, spool, registered_at, throttles) => res,
+        res = serve(&mut conn, settings, Some(&tls_info), index, reports, spool, registered_at, throttles) => res,
         _ = shutdown.cancelled() => Err(SessionError::Shutdown),
     };
-    if matches!(result, Err(SessionError::Shutdown)) {
-        conn.close_gracefully().await;
+    match result {
+        Err(SessionError::Shutdown) => {
+            conn.close_gracefully().await;
+        }
+        Err(SessionError::Drained { .. } | SessionError::Reconfigure) => conn.close_quietly().await,
+        _ => {}
     }
     result
+}
+
+/// 一行伺服器訊息是否為排空（`drain`）；是的話回傳夾在範圍內的 `reconnect_within_ms`
+fn drain_request(line: &str) -> Option<u32> {
+    match parse_server_msg(line) {
+        Ok(ServerMsg::Drain {
+            reconnect_within_ms,
+            ..
+        }) => Some(kairos_proto::effective_drain_reconnect_ms(
+            reconnect_within_ms,
+        )),
+        _ => None,
+    }
+}
+
+/// 收到 `drain` 之後：不再送出新的 report，等在途的 report 都收到回應（最多
+/// [`kairos_proto::DRAIN_IN_FLIGHT_WAIT_MS`]），伺服器先關閉連線也一樣結束。`on_line` 處理一行伺服器訊息，
+/// 回傳是否已沒有在途的 report；伺服器送來致命錯誤時回傳該錯誤（不算排空）
+async fn drain_wait<S, F>(
+    conn: &mut Connection<S>,
+    reconnect_within_ms: u32,
+    mut done: bool,
+    mut on_line: F,
+) -> SessionError
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut(&str, u64) -> Result<bool>,
+{
+    let deadline = after(Duration::from_millis(kairos_proto::DRAIN_IN_FLIGHT_WAIT_MS));
+    while !done {
+        match time::timeout_at(deadline, conn.framed.next()).await {
+            Err(_) => {
+                log::debug!(
+                    "排空：在途的 report 未在 {} 秒內全部收到回應，直接關閉（協商了 durable 時下一條連線重送）",
+                    kairos_proto::DRAIN_IN_FLIGHT_WAIT_MS / 1000
+                );
+                break;
+            }
+            // 伺服器已關閉連線（Kairos 關機時送出 drain 後隨即關閉）
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(line))) => match on_line(&line, conn.seq) {
+                Ok(d) => done = d,
+                Err(e) => return e,
+            },
+        }
+    }
+    SessionError::Drained {
+        reconnect_within_ms,
+    }
 }
 
 /// 在已建立的連線上：hello / hello_ack，之後進入主迴圈。
 ///
 /// `tls_info` 為這條連線的 TLS 資訊，註冊成功時附在日誌中（測試中直接使用記憶體內串流時為 `None`）。
+#[allow(clippy::too_many_arguments)]
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Connection<S>,
     settings: &Settings,
     tls_info: Option<&TlsInfo>,
+    index: usize,
     reports: &mut mpsc::Receiver<Sample>,
     spool: Option<&Arc<SharedSpool>>,
     registered_at: &mut Option<Instant>,
@@ -1177,6 +1507,20 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // 版本協商（A3）：proto 送 1（v1 Kairos 只接受 1），另以 proto_min／proto_max 宣告支援 1～2；
     // v2 的欄位（features、主機資訊）舊版 Kairos 會忽略
     let seq = conn.next_seq();
+    // 遠端管理（REMOTE.md 第 2.1 節）：install 不論是否宣告都送；config／upgrade 依本機狀態宣告
+    // （安裝方式與遠端升級的就緒狀態每次連線前重新偵測）
+    if let Some(m) = &settings.mgmt {
+        m.upgrade.refresh_detection();
+    }
+    let mgmt_features: Vec<&'static str> = settings
+        .mgmt
+        .as_ref()
+        .map(|m| m.features())
+        .unwrap_or_default();
+    let mut host = settings.host.clone();
+    if let Some(m) = &settings.mgmt {
+        host.install = Some(m.install_info());
+    }
     conn.send(&ClientMsg::Hello {
         seq,
         proto: Proto::Version(SUPPORTED_PROTO.min),
@@ -1198,10 +1542,13 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         processes: settings.processes_feature,
                     });
                     f.extend(settings.extra_features.iter().cloned());
+                    // 叢集連線（節點名稱與排空）：服務的主連線一律宣告（PROTOCOL.md「叢集與排空」）
+                    f.push(kairos_proto::FEATURE_CLUSTER.to_string());
+                    f.extend(mgmt_features.iter().map(|m| m.to_string()));
                     f
                 }),
             },
-            settings.host.clone(),
+            host,
         )),
     })
     .await?;
@@ -1217,6 +1564,24 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     session.inventory &= settings.inventory.is_some();
     session.processes &= settings.processes_feature;
     *registered_at = Some(Instant::now());
+    settings.last_connected.store(index, Ordering::Relaxed);
+    let target = settings.candidate(index).to_string();
+    // 叢集連線（feature cluster）：v2 且伺服器也宣告；協商了才處理 drain
+    let cluster = session.is_v2()
+        && ack
+            .server_features
+            .iter()
+            .any(|f| f == kairos_proto::FEATURE_CLUSTER);
+    if let Some(id) = ack.cluster_id.as_deref() {
+        if let Some(prev) = throttles.last_cluster_id.as_deref()
+            && prev != id
+        {
+            log::warn!(
+                "Kairos 的 cluster_id 與上次連線不同（{prev} → {id}，目前連到 {target}）：候選位址可能指到了另一套獨立的 Kairos，斷線補送的資料在不同的資料庫之間無法去重（請確認 server.address 與 server.fallback_addresses 都屬於同一個叢集）"
+            );
+        }
+        throttles.last_cluster_id = Some(id.to_string());
+    }
     // 正常輪替（feature renew）：v2 且雙方都宣告
     let renew_negotiated = session.is_v2()
         && settings
@@ -1238,6 +1603,13 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .on_hello_ack(negotiated, &ack.extra, offset);
     }
+    // 遠端管理（feature config／upgrade）：v2 且雙方都宣告
+    let mgmt_session =
+        kairos_proto::MgmtSession::new(session.proto, &mgmt_features, &ack.server_features);
+    let mut mgmt = settings
+        .mgmt
+        .clone()
+        .map(|m| MgmtConn::start(m, mgmt_session, ack.pending.as_ref()));
     let (level, msg) = registered_log(settings, &ack, tls_info);
     log::log!(level, "{}{msg}", codes::tag(codes::CONN_REGISTERED, None));
     if let Some((level, msg)) = ack
@@ -1251,7 +1623,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             service_status::attention(&msg);
         }
     }
-    service_status::set_status(&registered_status(settings));
+    service_status::set_status(&registered_status(settings, &target));
     let durable_session = session.durable && spool.is_some();
     let restored = local_status::tracker().and_then(|t| {
         t.update(|s| {
@@ -1265,6 +1637,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     (session.inventory, kairos_proto::FEATURE_INVENTORY),
                     (session.processes, kairos_proto::FEATURE_PROCESSES),
                     (renew_negotiated, kairos_proto::FEATURE_RENEW),
+                    (cluster, kairos_proto::FEATURE_CLUSTER),
+                    (mgmt_session.config, kairos_proto::FEATURE_CONFIG),
+                    (mgmt_session.upgrade, kairos_proto::FEATURE_UPGRADE),
                 ]
                 .into_iter()
                 .filter(|(on, _)| *on)
@@ -1276,6 +1651,10 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     .as_deref()
                     .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                     .map(|t| t.with_timezone(&chrono::Utc)),
+                server: target.clone(),
+                server_node: ack.server_node.clone(),
+                candidates: settings.candidate_count(),
+                candidate_index: index,
             })
         })
     });
@@ -1315,11 +1694,18 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         _ => None,
     };
 
+    if mgmt.as_ref().is_some_and(MgmtConn::wants_reconnect) {
+        return Err(SessionError::Reconfigure);
+    }
+
     // 本機緩衝（A5）：協商了 durable 時改走 at-least-once 的迴圈；沒有協商（舊版 Kairos）時，
     // 這條連線期間的新取樣照舊即時送出（at-most-once），緩衝中的積壓保留到連上支援 durable 的 Kairos
     if let Some(shared) = spool {
         if session.durable {
-            return serve_durable(conn, settings, session, shared, inventory, throttles).await;
+            return serve_durable(
+                conn, settings, session, cluster, shared, inventory, mgmt, throttles,
+            )
+            .await;
         }
         let backlog = shared.lock().len();
         if backlog > 0 {
@@ -1367,6 +1753,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 let snap = inventory.as_mut().and_then(|i| i.on_snapshot(Instant::now()));
                 send_inventory(conn, inventory.as_mut(), snap, None).await?;
             }
+            _ = sleep_until_opt(mgmt.as_ref().and_then(MgmtConn::next_wake)) => {
+                send_mgmt(conn, mgmt.as_mut(), None).await?;
+            }
             Some(sample) = reports.recv() => {
                 if let Some(pending) = pending_report {
                     // 伺服器寫檔緩慢時不再堆送：report 為 at-most-once，這次取樣直接丟棄
@@ -1401,10 +1790,28 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     idle.as_mut().reset(after(read_idle));
                     continue;
                 }
-                let outcome = match inventory_line(&mut inventory, &line, conn.seq) {
+                if cluster && let Some(ms) = drain_request(&line) {
+                    let pending = pending_report;
+                    return Err(drain_wait(conn, ms, pending.is_none(), |line, last| {
+                        let outcome = handle_server_line(line, last, throttles)?;
+                        Ok(match (pending, outcome.answered) {
+                            (Some(p), Some(a)) => a >= p,
+                            (None, _) => true,
+                            _ => false,
+                        })
+                    })
+                    .await);
+                }
+                let outcome = match mgmt_line(&mut mgmt, &line, conn.seq) {
                     Some(answered) => LineOutcome::valid(answered),
-                    None => handle_server_line(&line, conn.seq, throttles)?,
+                    None => match inventory_line(&mut inventory, &line, conn.seq) {
+                        Some(answered) => LineOutcome::valid(answered),
+                        None => handle_server_line(&line, conn.seq, throttles)?,
+                    },
                 };
+                if mgmt.as_ref().is_some_and(MgmtConn::wants_reconnect) {
+                    return Err(SessionError::Reconfigure);
+                }
                 // 只有合法的協定訊息才算「伺服器還活著」（與 Kairos 的閒置判定一致）；
                 // 無法解析的行不重置閒置計時，持續送垃圾的伺服器仍會被判定為閒置
                 if outcome.valid {
@@ -1461,7 +1868,7 @@ enum Reply {
 /// 一行伺服器訊息中的回應：`ack` 與非 fatal 的 `error`，回傳 (回應的 seq, 意義)；其他訊息為 `None`
 fn durable_reply(line: &str) -> Option<(Option<u64>, Reply)> {
     match parse_server_msg(line).ok()? {
-        ServerMsg::Ack { seq } => Some((Some(seq), Reply::Ack)),
+        ServerMsg::Ack { seq, .. } => Some((Some(seq), Reply::Ack)),
         ServerMsg::Error {
             seq,
             code,
@@ -1690,12 +2097,15 @@ impl Delivery {
 /// 協商了 durable 的連線主迴圈：依序送出緩衝中的記錄（先補送積壓、再送新的取樣），
 /// 同一時間最多 [`DURABLE_IN_FLIGHT`] 筆在途，兩筆之間至少間隔 `buffer.replay_interval_ms`；
 /// 收到 ack 才從緩衝移除。heartbeat、讀取閒置與伺服器訊息的處理與 at-most-once 的迴圈相同
+#[allow(clippy::too_many_arguments)]
 async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Connection<S>,
     settings: &Settings,
     session: Session,
+    cluster: bool,
     shared: &Arc<SharedSpool>,
     mut inventory: Option<InventoryConn>,
+    mut mgmt: Option<MgmtConn>,
     throttles: &mut ServerLogThrottles,
 ) -> Result<Infallible> {
     let read_idle = settings.read_idle_timeout();
@@ -1752,6 +2162,9 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                 let snap = inventory.as_mut().and_then(|i| i.on_snapshot(Instant::now()));
                 send_inventory(conn, inventory.as_mut(), snap, Some(&mut delivery)).await?;
             }
+            _ = sleep_until_opt(mgmt.as_ref().and_then(MgmtConn::next_wake)) => {
+                send_mgmt(conn, mgmt.as_mut(), Some(&mut delivery)).await?;
+            }
             // 收集 task 寫入了新的取樣：重新計算下一筆的送出時間
             _ = shared.notify.notified() => {}
             _ = sleep_until_opt(next_send) => {
@@ -1779,12 +2192,30 @@ async fn serve_durable<S: AsyncRead + AsyncWrite + Unpin>(
                     idle.as_mut().reset(after(read_idle));
                     continue;
                 }
-                let outcome = match inventory_line(&mut inventory, &line, conn.seq) {
+                if cluster && let Some(ms) = drain_request(&line) {
+                    // 停止送出新的 report（取樣照常寫進本機緩衝），等在途的回應後關閉
+                    let idle_now = delivery.in_flight == 0;
+                    return Err(drain_wait(conn, ms, idle_now, |line, last| {
+                        handle_server_line_in(line, last, throttles, true)?;
+                        if let Some((seq, reply)) = durable_reply(line) {
+                            delivery.on_reply(seq, last, reply, &mut shared.lock(), throttles);
+                        }
+                        Ok(delivery.in_flight == 0)
+                    })
+                    .await);
+                }
+                let outcome = match mgmt_line(&mut mgmt, &line, conn.seq) {
                     Some(answered) => LineOutcome::valid(answered),
-                    None => handle_server_line_in(&line, conn.seq, throttles, true)?,
+                    None => match inventory_line(&mut inventory, &line, conn.seq) {
+                        Some(answered) => LineOutcome::valid(answered),
+                        None => handle_server_line_in(&line, conn.seq, throttles, true)?,
+                    },
                 };
                 if outcome.valid {
                     idle.as_mut().reset(after(read_idle));
+                }
+                if mgmt.as_ref().is_some_and(MgmtConn::wants_reconnect) {
+                    return Err(SessionError::Reconfigure);
                 }
                 // inventory 的回應也要從在途清單移除（緩衝記錄編號為 None，不影響緩衝）
                 if let Some((seq, reply)) = durable_reply(&line) {
@@ -1849,7 +2280,7 @@ fn inventory_line(
 ) -> Option<Option<u64>> {
     let inv = inventory.as_mut()?;
     let answered = match parse_server_msg(line) {
-        Ok(ServerMsg::Ack { seq }) => answered_seq(Some(seq), last_sent_seq),
+        Ok(ServerMsg::Ack { seq, .. }) => answered_seq(Some(seq), last_sent_seq),
         Ok(ServerMsg::Error {
             seq, fatal: false, ..
         }) => answered_seq(seq, last_sent_seq),
@@ -1857,6 +2288,38 @@ fn inventory_line(
     };
     inv.on_line(line, answered, Instant::now())
         .map(|_| answered)
+}
+
+/// 送出遠端管理排定的訊息（`config_status`、`config_get`、`upgrade_*`）。durable 連線另記入在途清單，
+/// 讓回應的順序對得上
+async fn send_mgmt<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut Connection<S>,
+    mgmt: Option<&mut MgmtConn>,
+    mut delivery: Option<&mut Delivery>,
+) -> Result<()> {
+    let Some(m) = mgmt else {
+        return Ok(());
+    };
+    while let Some(msg) = m.pop(conn.seq.saturating_add(1)) {
+        let seq = conn.next_seq();
+        conn.send(&msg).await?;
+        if let Some(d) = delivery.as_deref_mut() {
+            d.sent(seq, None);
+        }
+        log::debug!("已送出遠端管理的訊息（seq={seq}）");
+    }
+    if m.wants_reconnect() {
+        return Err(SessionError::Reconfigure);
+    }
+    Ok(())
+}
+
+/// 一行伺服器訊息若是遠端管理請求的回應，交給 [`MgmtConn::on_line`] 處理並回傳它回應的 seq；
+/// 其他訊息回傳 `None`（照一般的方式處理）
+fn mgmt_line(mgmt: &mut Option<MgmtConn>, line: &str, last_sent_seq: u64) -> Option<Option<u64>> {
+    mgmt.as_mut()?
+        .on_line(line, last_sent_seq)
+        .map(|h| h.answered)
 }
 
 /// 正常輪替的時點檢查間隔（連線建立後立即檢查一次）
@@ -1960,19 +2423,15 @@ impl OneShotError {
 /// 憑證已過期、8444 無法連線時對 8443 出示目前的（過期）憑證「報到」一次（設計包 §8：讓 Kairos 知道
 /// 主機已回到網路）。結果不影響流程，只記 DEBUG
 pub async fn check_in(settings: &Settings, tls: &TlsSetup) {
-    match connect(settings, tls).await {
-        Ok((mut stream, _)) => {
+    match connect_any(settings, tls).await {
+        Ok((mut stream, info)) => {
             let mut buf = [0u8; 1];
             let _ = time::timeout(
                 Duration::from_secs(2),
                 tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
             )
             .await;
-            log::debug!(
-                "已對 {}:{} 出示過期憑證報到",
-                settings.address,
-                settings.port
-            );
+            log::debug!("已對 {} 出示過期憑證報到", info.target);
         }
         Err(e) => log::debug!("對 8443 報到：{e}"),
     }
@@ -1995,7 +2454,7 @@ pub async fn one_shot(
     intent: Option<&str>,
 ) -> std::result::Result<OneShot, OneShotError> {
     let has_client_cert = tls.has_client_cert();
-    let (stream, _) = connect(settings, tls)
+    let (stream, _) = connect_any(settings, tls)
         .await
         .map_err(|e| OneShotError::from_session(&e, has_client_cert))?;
     let mut conn = Connection::new(stream);
@@ -2087,6 +2546,8 @@ impl OneShot {
 /// 一條已完成握手的 TLS 連線的資訊（寫進日誌用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TlsInfo {
+    /// 連上的候選位址（`主機:埠`）
+    target: String,
     /// 協商出的 TLS 版本（例如 `TLSv1_3`）
     version: String,
     /// 是否驗證了伺服器憑證（`accept_invalid_certs = true` 時為 false）
@@ -2102,19 +2563,81 @@ impl TlsInfo {
             "；⚠️ 未驗證伺服器憑證（accept_invalid_certs = true），無法確認對方身分"
         };
         format!(
-            "{}:{}，domain={}，{}{note}",
-            settings.address, settings.port, settings.domain, self.version
+            "{}，domain={}，{}{note}",
+            self.target, settings.domain, self.version
         )
     }
 }
 
-/// TCP 連線 + TLS 握手，各自有逾時。
-async fn connect(settings: &Settings, tls: &TlsSetup) -> Result<(TlsStream<TcpStream>, TlsInfo)> {
-    let target = (settings.address.as_str(), settings.port);
-    let tcp = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
-        .await
-        .map_err(|_| SessionError::ConnectTimeout)?
-        .map_err(SessionError::Connect)?;
+/// 一次性連線（`pulse enroll` 的確認、輪替後的確認、除役通知、過期憑證的報到）：從最近一次註冊成功的
+/// 候選位址開始依序嘗試，第一個成功的就用；都失敗時回傳最後一個錯誤
+async fn connect_any(
+    settings: &Settings,
+    tls: &TlsSetup,
+) -> Result<(TlsStream<TcpStream>, TlsInfo)> {
+    let n = settings.candidate_count();
+    let start = settings.last_connected.load(Ordering::Relaxed) % n;
+    let mut last = None;
+    for k in 0..n {
+        let target = settings.candidate((start + k) % n);
+        match connect_to(settings, tls, &target).await {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                if k + 1 < n {
+                    log::debug!("{target} 無法連線：{e}；改試下一個候選位址");
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or(SessionError::ConnectTimeout))
+}
+
+/// TCP 連線：名稱解析出多個位址時依序嘗試，每個位址最多 [`PER_ADDRESS_CONNECT_TIMEOUT`]（最後一個用剩下的
+/// 時間），整個候選位址最多 [`CONNECT_TIMEOUT`]（`kairos/HA.md` 第 8.2 節；只有一個位址時與 0.8 相同）
+async fn tcp_connect(target: &Candidate) -> Result<TcpStream> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let addrs: Vec<std::net::SocketAddr> = time::timeout_at(
+        deadline,
+        tokio::net::lookup_host((target.host.as_str(), target.port)),
+    )
+    .await
+    .map_err(|_| SessionError::ConnectTimeout)?
+    .map_err(SessionError::Connect)?
+    .collect();
+    if addrs.is_empty() {
+        return Err(SessionError::Connect(io::Error::new(
+            io::ErrorKind::NotFound,
+            "failed to lookup address information: no addresses",
+        )));
+    }
+    let mut last = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let limit = if i + 1 == addrs.len() {
+            remaining
+        } else {
+            remaining.min(PER_ADDRESS_CONNECT_TIMEOUT)
+        };
+        match time::timeout(limit, TcpStream::connect(addr)).await {
+            Ok(Ok(tcp)) => return Ok(tcp),
+            Ok(Err(e)) => last = Some(SessionError::Connect(e)),
+            Err(_) => last = Some(SessionError::ConnectTimeout),
+        }
+    }
+    Err(last.unwrap_or(SessionError::ConnectTimeout))
+}
+
+/// 連到候選位址 `target`：TCP 連線 + TLS 握手，各自有逾時。TLS 一律以 `server.domain` 驗證伺服器憑證
+async fn connect_to(
+    settings: &Settings,
+    tls: &TlsSetup,
+    target: &Candidate,
+) -> Result<(TlsStream<TcpStream>, TlsInfo)> {
+    let tcp = tcp_connect(target).await?;
     // 心跳是小封包，關閉 Nagle 以降低延遲
     if let Err(e) = tcp.set_nodelay(true) {
         log::debug!("無法設定 TCP_NODELAY：{e}");
@@ -2129,6 +2652,7 @@ async fn connect(settings: &Settings, tls: &TlsSetup) -> Result<(TlsStream<TcpSt
     .map_err(SessionError::Tls)?;
     let (_, state) = stream.get_ref();
     let info = TlsInfo {
+        target: target.to_string(),
         version: state
             .protocol_version()
             .map_or_else(|| "未知版本".to_string(), |v| format!("{v:?}")),
@@ -2165,8 +2689,13 @@ fn registered_log(
     ack: &HelloAckInfo,
     tls_info: Option<&TlsInfo>,
 ) -> (log::Level, String) {
+    let node = ack
+        .server_node
+        .as_deref()
+        .map(|n| format!("，節點 {n}"))
+        .unwrap_or_default();
     let base = format!(
-        "已向伺服器註冊（agent_id={}，伺服器離線判定 {} ms，協定 v{}",
+        "已向伺服器註冊（agent_id={}，伺服器離線判定 {} ms，協定 v{}{node}",
         settings.agent_id, ack.offline_after_ms, ack.session.proto
     );
     match tls_info {
@@ -2194,6 +2723,12 @@ struct HelloAckInfo {
     server_features: Vec<String>,
     /// 協商了 `renew` 時的欄位（`expired_renew_grace_days`、`renew_now`）
     extra: HelloAckExtra,
+    /// 回應的 Kairos 節點（協商了 `cluster` 時的 `server_node`）
+    server_node: Option<String>,
+    /// 叢集的 UUID（協商了 `cluster`、Kairos 以叢集模式執行時）
+    cluster_id: Option<String>,
+    /// 遠端管理的 `pending`（協商了 `config` 或 `upgrade` 時；v2）
+    pending: Option<kairos_proto::Pending>,
 }
 
 /// 等待 hello_ack（整體 5 s）。
@@ -2234,6 +2769,9 @@ fn handle_pre_ack_line(
             server_time,
             expired_renew_grace_days,
             renew_now,
+            server_node,
+            cluster_id,
+            pending,
         }) => {
             if !(SUPPORTED_PROTO.min..=SUPPORTED_PROTO.max).contains(&proto) {
                 return Err(SessionError::ProtoMismatch(proto));
@@ -2264,6 +2802,9 @@ fn handle_pre_ack_line(
                 } else {
                     HelloAckExtra::default()
                 },
+                server_node: server_node.filter(|_| session.is_v2()),
+                cluster_id: cluster_id.filter(|_| session.is_v2()),
+                pending: pending.filter(|_| session.is_v2()),
             }))
         }
         // 會結束連線，頻率受退避限制，不需節流；日誌由重連迴圈統一記錄一次
@@ -2273,7 +2814,7 @@ fn handle_pre_ack_line(
             fatal,
             ..
         }) => Err(SessionError::server(&code, &message, fatal)),
-        Ok(ServerMsg::Ack { seq }) => {
+        Ok(ServerMsg::Ack { seq, .. }) => {
             throttled!(
                 throttles.unexpected_ack,
                 debug,
@@ -2281,12 +2822,21 @@ fn handle_pre_ack_line(
             );
             Ok(None)
         }
-        // 只在協商了 renew／deregister 之後才會出現（一次性連線與輪替另行處理）
-        Ok(ServerMsg::RenewResult(_) | ServerMsg::DeregisterAck(_)) => {
+        // 只在協商了 renew／deregister／cluster 之後才會出現（一次性連線與輪替另行處理）
+        Ok(ServerMsg::RenewResult(_) | ServerMsg::DeregisterAck(_) | ServerMsg::Drain { .. }) => {
             throttled!(
                 throttles.unknown_type,
                 debug,
-                "尚未收到 hello_ack 前收到 renew_result／deregister_ack，忽略"
+                "尚未收到 hello_ack 前收到 renew_result／deregister_ack／drain，忽略"
+            );
+            Ok(None)
+        }
+        // 遠端管理（feature config／upgrade）：都是回應 Pulse 的請求，註冊前不會出現
+        Ok(ServerMsg::Config(_) | ServerMsg::UpgradeOffer(_) | ServerMsg::UpgradeChunk(_)) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "尚未收到 hello_ack 前收到遠端管理的訊息，忽略"
             );
             Ok(None)
         }
@@ -2346,7 +2896,7 @@ fn handle_server_line_in(
     durable: bool,
 ) -> Result<LineOutcome> {
     match parse_server_msg(line) {
-        Ok(ServerMsg::Ack { seq }) => {
+        Ok(ServerMsg::Ack { seq, .. }) => {
             let answered = answered_seq(Some(seq), last_sent_seq);
             if answered.is_none() {
                 throttled!(
@@ -2415,6 +2965,15 @@ fn handle_server_line_in(
             );
             Ok(LineOutcome::valid(answered_seq(seq, last_sent_seq)))
         }
+        // 協商了 cluster 的 drain 由連線迴圈先處理；到這裡的是沒有協商的連線（規格上不會送）
+        Ok(ServerMsg::Drain { .. }) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "收到 drain，但這條連線沒有協商 cluster，忽略"
+            );
+            Ok(LineOutcome::valid(None))
+        }
         // 正常輪替的結果由 rotation_line 先處理；到這裡的是不屬於目前申請（或沒有啟用輪替）的回應
         Ok(ServerMsg::RenewResult(_) | ServerMsg::DeregisterAck(_)) => {
             throttled!(
@@ -2423,6 +2982,15 @@ fn handle_server_line_in(
                 "收到不屬於這條連線的 renew_result／deregister_ack，忽略"
             );
             Ok(LineOutcome::valid(None))
+        }
+        // 遠端管理（feature config／upgrade）：協商了的連線上由 MgmtConn 先處理；到這裡的是沒有協商的連線
+        Ok(ServerMsg::Config(_) | ServerMsg::UpgradeOffer(_) | ServerMsg::UpgradeChunk(_)) => {
+            throttled!(
+                throttles.unknown_type,
+                debug,
+                "收到遠端管理的訊息，但這條連線沒有協商 config／upgrade，忽略"
+            );
+            Ok(LineOutcome::IGNORED)
         }
         Err(e) => {
             log_unparsable(throttles, line, &e);
@@ -2650,10 +3218,15 @@ mod tests {
     use tokio::io::{DuplexStream, duplex};
     use tokio_rustls::rustls::{AlertDescription, Error as TlsError};
 
+    // 遠端管理（feature config、upgrade）的連線整合測試：src/network/tests/mgmt.rs
+    mod mgmt;
+
     fn settings(hb: u64) -> Settings {
         Settings {
             address: "127.0.0.1".into(),
             port: 1,
+            candidates: vec![Candidate::new("127.0.0.1", 1)],
+            last_connected: Arc::new(AtomicUsize::new(0)),
             domain: "localhost".into(),
             agent_id: "a".into(),
             hostname: "h".into(),
@@ -2672,16 +3245,17 @@ mod tests {
             grace_on_expiry: false,
             processes_feature: false,
             inventory: None,
+            mgmt: None,
         }
     }
 
     #[test]
     fn registered_status_appends_the_buffer_note() {
         let mut s = settings(1);
-        assert_eq!(registered_status(&s), "已註冊：127.0.0.1:1");
+        assert_eq!(registered_status(&s, "127.0.0.1:1"), "已註冊：127.0.0.1:1");
         s.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
         assert_eq!(
-            registered_status(&s),
+            registered_status(&s, "127.0.0.1:1"),
             "已註冊：127.0.0.1:1；無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）"
         );
     }
@@ -3167,9 +3741,11 @@ mod tests {
         });
         let mut s = settings(1);
         s.port = port;
+        s.candidates = vec![Candidate::new("127.0.0.1", port)];
         let tls = tls::build(&crate::config_manager::ServerConfig {
             address: "127.0.0.1".into(),
             port,
+            fallback_addresses: Vec::new(),
             domain: "localhost".into(),
             accept_invalid_certs: true,
             ca_cert: String::new(),
@@ -3178,7 +3754,7 @@ mod tests {
             client_key: String::new(),
         })
         .unwrap();
-        let err = connect(&s, &tls).await.unwrap_err();
+        let err = connect_any(&s, &tls).await.unwrap_err();
         assert!(matches!(err, SessionError::Tls(_)), "{err:?}");
         let hint = connection_hint(&err, &s, tls.client_cert_was_requested(), false).unwrap();
         assert!(hint.contains("每 IP 連線上限"), "{err}: {hint}");
@@ -3232,6 +3808,7 @@ mod tests {
 
     fn tls_info(verified: bool) -> TlsInfo {
         TlsInfo {
+            target: "127.0.0.1:1".into(),
             version: "TLSv1_3".into(),
             verified,
         }
@@ -3262,11 +3839,14 @@ mod tests {
         // F4：原本「已建立 TLS 加密連線」INFO 的資訊改附在註冊成功的 INFO
         let s = settings(1);
         let ack = |offline_after_ms, proto| HelloAckInfo {
+            pending: None,
             offline_after_ms,
             session: Session::new(proto, CLIENT_FEATURES, CLIENT_FEATURES),
             server_time: None,
             server_features: Vec::new(),
             extra: HelloAckExtra::default(),
+            server_node: None,
+            cluster_id: None,
         };
         let (level, msg) = registered_log(&s, &ack(5000, 2), Some(&tls_info(true)));
         assert_eq!(level, log::Level::Info);
@@ -3447,6 +4027,7 @@ mod tests {
             &mut conn,
             s,
             None,
+            0,
             rx,
             None,
             &mut registered_at,
@@ -3747,6 +4328,7 @@ mod tests {
             &mut conn,
             s,
             None,
+            0,
             &mut rx,
             Some(shared),
             &mut registered_at,
@@ -3779,7 +4361,10 @@ mod tests {
         assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
         let (hello, got) = srv.await.unwrap();
         // 啟用本機緩衝時宣告 durable
-        assert_eq!(hello["features"], serde_json::json!(["metrics", "durable"]));
+        assert_eq!(
+            hello["features"],
+            serde_json::json!(["metrics", "durable", "cluster"])
+        );
         let seqs: Vec<u64> = got
             .iter()
             .map(|(r, _)| r["report_seq"].as_u64().unwrap())
@@ -3961,7 +4546,7 @@ mod tests {
         let (err, _) = serve_with_reports(client, &settings(60), &mut rx).await;
         assert!(matches!(err, SessionError::ClosedByServer), "{err:?}");
         let (hello, report) = srv.await.unwrap();
-        assert_eq!(hello["features"], serde_json::json!(["metrics"]));
+        assert_eq!(hello["features"], serde_json::json!(["metrics", "cluster"]));
         assert!(
             report.get("boot_id").is_none() && report.get("report_seq").is_none(),
             "{report}"
@@ -4021,18 +4606,53 @@ mod tests {
     struct FakeDialer {
         servers: mpsc::UnboundedSender<DuplexStream>,
         dial_times: RefCell<Vec<Instant>>,
+        /// 每次 dial 的候選位址（`host:port`）
+        dial_targets: RefCell<Vec<String>>,
+        /// 拒絕連線的候選位址（`host:port`）與剩下要拒絕的次數
+        refused: RefCell<Vec<(String, usize)>>,
+    }
+
+    impl FakeDialer {
+        fn new(servers: mpsc::UnboundedSender<DuplexStream>) -> Self {
+            Self {
+                servers,
+                dial_times: RefCell::new(Vec::new()),
+                dial_targets: RefCell::new(Vec::new()),
+                refused: RefCell::new(Vec::new()),
+            }
+        }
     }
 
     impl Dialer for FakeDialer {
         type Stream = DuplexStream;
 
-        async fn dial(&self) -> Result<(DuplexStream, TlsInfo)> {
+        async fn dial(&self, target: &Candidate) -> Result<(DuplexStream, TlsInfo)> {
             self.dial_times.borrow_mut().push(Instant::now());
+            self.dial_targets.borrow_mut().push(target.to_string());
+            let key = target.to_string();
+            let refuse = {
+                let mut refused = self.refused.borrow_mut();
+                match refused.iter_mut().find(|(t, _)| *t == key) {
+                    Some((_, left)) if *left > 0 => {
+                        *left -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if refuse {
+                return Err(SessionError::Connect(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "Connection refused",
+                )));
+            }
             let (client, server) = duplex(64 * 1024);
             self.servers
                 .send(server)
                 .map_err(|_| SessionError::Connect(io::Error::other("測試伺服器已結束")))?;
-            Ok((client, tls_info(true)))
+            let mut info = tls_info(true);
+            info.target = key;
+            Ok((client, info))
         }
 
         fn client_cert_was_requested(&self) -> bool {
@@ -4052,6 +4672,22 @@ mod tests {
         F: Fn(usize, ServerSide) -> Fut + 'static,
         Fut: std::future::Future<Output = ()> + 'static,
     {
+        let ((times, _), logs) = run_script_targets(s, Vec::new(), sessions, script);
+        (times, logs)
+    }
+
+    /// 同 [`run_script`]，另可指定拒絕連線的候選位址與次數；回傳每次 dial 的時間與候選位址
+    #[allow(clippy::type_complexity)]
+    fn run_script_targets<F, Fut>(
+        s: Settings,
+        refused: Vec<(String, usize)>,
+        sessions: usize,
+        script: F,
+    ) -> ((Vec<Duration>, Vec<String>), Vec<(log::Level, String)>)
+    where
+        F: Fn(usize, ServerSide) -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -4060,10 +4696,8 @@ mod tests {
         crate::test_log::capture(|| {
             rt.block_on(async move {
                 let (tx, mut rx) = mpsc::unbounded_channel();
-                let dialer = FakeDialer {
-                    servers: tx,
-                    dial_times: RefCell::new(Vec::new()),
-                };
+                let dialer = FakeDialer::new(tx);
+                *dialer.refused.borrow_mut() = refused;
                 let shutdown = CancellationToken::new();
                 let token = shutdown.clone();
                 let local = tokio::task::LocalSet::new();
@@ -4084,7 +4718,8 @@ mod tests {
                     .run_until(run_with(&s, &dialer, &mut reports, None, &shutdown))
                     .await;
                 let times = dialer.dial_times.borrow();
-                times.iter().map(|t| *t - start).collect()
+                let targets = dialer.dial_targets.borrow().clone();
+                (times.iter().map(|t| *t - start).collect(), targets)
             })
         })
     }
@@ -4381,10 +5016,7 @@ mod tests {
             let mut s = settings(15);
             s.connect_spread = Duration::from_secs(3600);
             let (tx, _rx) = mpsc::unbounded_channel();
-            let dialer = FakeDialer {
-                servers: tx,
-                dial_times: RefCell::new(Vec::new()),
-            };
+            let dialer = FakeDialer::new(tx);
             let shutdown = CancellationToken::new();
             shutdown.cancel();
             let (_report_tx, mut reports) = mpsc::channel::<Sample>(1);
@@ -5068,12 +5700,15 @@ mod tests {
             );
         }
         // 註冊成功
-        let mut s = settings(1);
-        s.address = "kairos.example.com".into();
-        s.port = 8443;
-        assert_eq!(registered_status(&s), "已註冊：kairos.example.com:8443");
-        s.address = "::1".into();
-        assert_eq!(registered_status(&s), "已註冊：[::1]:8443");
+        let s = settings(1);
+        assert_eq!(
+            registered_status(&s, &Candidate::new("kairos.example.com", 8443).to_string()),
+            "已註冊：kairos.example.com:8443"
+        );
+        assert_eq!(
+            registered_status(&s, &Candidate::new("::1", 8443).to_string()),
+            "已註冊：[::1]:8443"
+        );
     }
 
     #[test]
@@ -5463,7 +6098,7 @@ mod tests {
         let (hello, got) = f4_exchange(&s, &["metrics", "inventory", "processes"], window).await;
         assert_eq!(
             hello["features"],
-            serde_json::json!(["metrics", "inventory", "processes"])
+            serde_json::json!(["metrics", "inventory", "processes", "cluster"])
         );
         let inv = of_type(&got, "inventory");
         assert_eq!(inv.len(), 1, "連線後送一次：{got:?}");
@@ -5500,7 +6135,7 @@ mod tests {
         // Pulse 端關閉（processes.enabled／inventory.enabled = false）：不宣告、也不送
         let s = f4_settings(false, false);
         let (hello, got) = f4_exchange(&s, &["metrics", "inventory", "processes"], window).await;
-        assert_eq!(hello["features"], serde_json::json!(["metrics"]));
+        assert_eq!(hello["features"], serde_json::json!(["metrics", "cluster"]));
         assert!(of_type(&got, "inventory").is_empty());
         assert!(of_type(&got, "report")[0].get("processes").is_none());
     }
@@ -5556,7 +6191,7 @@ mod tests {
         assert_eq!(hello["proto"], 1);
         assert_eq!(hello["proto_min"], 1);
         assert_eq!(hello["proto_max"], 2);
-        assert_eq!(hello["features"], serde_json::json!(["metrics"]));
+        assert_eq!(hello["features"], serde_json::json!(["metrics", "cluster"]));
         assert_eq!(hello["display_name"], "Web 01");
         assert_eq!(hello["report_interval_ms"], 5000);
         // 沒有值的主機資訊欄位不送
@@ -5622,5 +6257,313 @@ mod tests {
                 .await;
         assert!(matches!(err, SessionError::ProtoMismatch(3)), "{err:?}");
         assert!(report.is_none());
+    }
+    // ---- 多個伺服器位址與排空（kairos/HA.md 第 8 節、PROTOCOL.md「叢集與排空」） ----
+
+    fn two_candidates(hb: u64) -> Settings {
+        let mut s = settings(hb);
+        s.candidates = vec![
+            Candidate::new("127.0.0.1", 1),
+            Candidate::new("kairos-b.example.com", 2),
+        ];
+        s
+    }
+
+    fn with_code<'a>(
+        logs: &'a [(log::Level, String)],
+        prefix: &str,
+    ) -> Vec<&'a (log::Level, String)> {
+        logs.iter().filter(|(_, m)| m.starts_with(prefix)).collect()
+    }
+
+    #[test]
+    fn failure_before_hello_ack_fails_over_immediately() {
+        // 主位址拒絕連線：0～500 ms 內改試備用位址，不增加退避；連上後斷線，下一輪從主位址開始
+        let s = two_candidates(1);
+        let ((times, targets), logs) = run_script_targets(
+            s,
+            vec![("127.0.0.1:1".into(), usize::MAX)],
+            1,
+            |_, mut f| async move {
+                accept_hello(&mut f).await;
+                // 註冊後立即斷線（未滿 30 秒，退避不重置）
+            },
+        );
+        assert_eq!(
+            targets,
+            [
+                "127.0.0.1:1",
+                "kairos-b.example.com:2",
+                "127.0.0.1:1",
+                "kairos-b.example.com:2"
+            ],
+            "{logs:?}"
+        );
+        assert!(times[1] - times[0] <= FAILOVER_SPREAD, "{times:?}");
+        // 註冊後斷線才退避（initial_delay 2 秒 ±20%）
+        let backoff = times[2] - times[1];
+        assert!(
+            backoff >= Duration::from_millis(1600) && backoff <= Duration::from_millis(2400),
+            "{times:?}"
+        );
+        assert!(times[3] - times[2] <= FAILOVER_SPREAD, "{times:?}");
+        // PLS-W2301：第一輪記 WARN，10 分鐘內的下一輪只記 DEBUG
+        let failover = with_code(&logs, "conn.failover PLS-W2301 ");
+        assert_eq!(failover.len(), 2, "{logs:?}");
+        assert_eq!(failover[0].0, log::Level::Warn);
+        assert_eq!(failover[1].0, log::Level::Debug);
+        assert!(
+            failover[0].1.contains("127.0.0.1:1 無法連線")
+                && failover[0]
+                    .1
+                    .contains("改試下一個候選位址 kairos-b.example.com:2"),
+            "{}",
+            failover[0].1
+        );
+        // 註冊成功的日誌帶實際連上的位址；斷線的日誌帶斷線的位址
+        assert!(
+            logs.iter().any(|(_, m)| m.starts_with("conn.registered")
+                && m.contains("kairos-b.example.com:2，domain=localhost")),
+            "{logs:?}"
+        );
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].1
+                .contains("：kairos-b.example.com:2：伺服器關閉了連線")
+                && d[0].1.contains("秒後從 127.0.0.1:1 重新連線"),
+            "{}",
+            d[0].1
+        );
+    }
+
+    #[test]
+    fn all_candidates_failing_backs_off_and_reports_each_error() {
+        // 一輪都失敗才退避（PLS-E2302），日誌列出每個位址最後的錯誤
+        let s = two_candidates(1);
+        let ((times, targets), logs) = run_script_targets(
+            s,
+            vec![
+                ("127.0.0.1:1".into(), 2),
+                ("kairos-b.example.com:2".into(), 2),
+            ],
+            0,
+            |_, _| async {},
+        );
+        assert_eq!(
+            targets,
+            [
+                "127.0.0.1:1",
+                "kairos-b.example.com:2",
+                "127.0.0.1:1",
+                "kairos-b.example.com:2",
+                "127.0.0.1:1"
+            ]
+        );
+        // 第 1 輪後退避 2 秒 ±20%，第 2 輪後 4 秒 ±20%
+        let first = times[2] - times[1];
+        let second = times[4] - times[3];
+        assert!(
+            first >= Duration::from_millis(1600) && first <= Duration::from_millis(2400),
+            "{times:?}"
+        );
+        assert!(
+            second >= Duration::from_millis(3200) && second <= Duration::from_millis(4800),
+            "{times:?}"
+        );
+        let all_failed = with_code(&logs, "conn.lost PLS-E2302 ");
+        assert_eq!(all_failed.len(), 2, "{logs:?}");
+        let msg = &all_failed[0].1;
+        assert!(
+            msg.contains("連續第 1 次失敗，2 個候選位址都無法連線")
+                && msg.contains("各位址最後的錯誤：127.0.0.1:1：TCP 連線失敗：Connection refused；kairos-b.example.com:2：TCP 連線失敗：Connection refused")
+                && msg.contains("秒後從 127.0.0.1:1 重新嘗試"),
+            "{msg}"
+        );
+        // 只有一個候選位址時與 0.8 相同：沒有 PLS-W2301／PLS-E2302
+        let ((targets, _), logs) = {
+            let ((t, g), l) = run_script_targets(
+                settings(1),
+                vec![("127.0.0.1:1".into(), 1)],
+                0,
+                |_, _| async {},
+            );
+            ((g, t), l)
+        };
+        assert_eq!(targets, ["127.0.0.1:1", "127.0.0.1:1"]);
+        assert!(with_code(&logs, "conn.failover").is_empty(), "{logs:?}");
+        assert!(
+            with_code(&logs, "conn.lost PLS-E2003 ").len() == 1,
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn server_cert_problem_on_one_candidate_is_reported_over_network_errors() {
+        // 一輪都失敗時，需要人工處理的錯誤（這裡以伺服器致命錯誤 auth_failed 為例）優先於一般網路錯誤
+        let errors = vec![
+            AttemptError {
+                index: 0,
+                err: SessionError::server("auth_failed", "agent_id does not match", true),
+                cert_requested: false,
+            },
+            AttemptError {
+                index: 1,
+                err: SessionError::ConnectTimeout,
+                cert_requested: false,
+            },
+        ];
+        assert_eq!(round_error(&errors, true), 0);
+        let errors = vec![
+            AttemptError {
+                index: 0,
+                err: SessionError::ConnectTimeout,
+                cert_requested: false,
+            },
+            AttemptError {
+                index: 1,
+                err: SessionError::ClosedByServer,
+                cert_requested: false,
+            },
+        ];
+        assert_eq!(round_error(&errors, true), 1);
+    }
+
+    #[test]
+    fn drain_reconnects_to_the_next_candidate_without_backoff() {
+        let s = two_candidates(1);
+        let ((times, targets), logs) = run_script_targets(
+            s,
+            Vec::new(),
+            1,
+            |_, mut f| async move {
+                accept_hello_v2(&mut f, &["metrics", "cluster"]).await;
+                reply(
+                &mut f,
+                serde_json::json!({"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":1000}),
+            )
+            .await;
+                // Kairos 關機時送出 drain 後隨即關閉連線
+            },
+        );
+        assert_eq!(
+            targets,
+            ["127.0.0.1:1", "kairos-b.example.com:2"],
+            "{logs:?}"
+        );
+        assert!(
+            times[1] - times[0] <= Duration::from_millis(1000),
+            "{times:?}"
+        );
+        let drain = with_code(&logs, "conn.drain PLS-I8507 ");
+        assert_eq!(drain.len(), 1, "{logs:?}");
+        assert_eq!(drain[0].0, log::Level::Info);
+        assert!(
+            drain[0].1.contains("改連 kairos-b.example.com:2"),
+            "{}",
+            drain[0].1
+        );
+        // 不算連線失敗：沒有「連線中斷」的日誌
+        assert!(disconnect_logs(&logs).is_empty(), "{logs:?}");
+    }
+
+    #[test]
+    fn drain_without_cluster_negotiated_is_ignored() {
+        // 伺服器沒有宣告 cluster：drain 不處理，連線維持到伺服器關閉
+        let ((_, targets), logs) = run_script_targets(
+            settings(1),
+            Vec::new(),
+            1,
+            |_, mut f| async move {
+                accept_hello_v2(&mut f, &["metrics"]).await;
+                reply(
+                &mut f,
+                serde_json::json!({"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":1000}),
+            )
+            .await;
+                ack_for(&mut f, Duration::from_secs(3)).await;
+            },
+        );
+        assert_eq!(targets.len(), 2);
+        assert!(with_code(&logs, "conn.drain").is_empty(), "{logs:?}");
+        let d = disconnect_logs(&logs);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].1.contains("伺服器關閉了連線"), "{}", d[0].1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_drain_waits_for_in_flight_acks_and_keeps_the_rest() {
+        // 收到 drain：不再送出新的 report，在途的收到 ack 後關閉；沒有送出的留在緩衝中
+        let (_dir, shared) = test_spool("drain", 6);
+        let (client, server) = duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut f = server_side(server);
+            let hello = accept_hello_v2(&mut f, &["metrics", "durable", "cluster"]).await;
+            let first = next_report(&mut f).await.unwrap();
+            let second = next_report(&mut f).await.unwrap();
+            reply(
+                &mut f,
+                serde_json::json!({"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":5000}),
+            )
+            .await;
+            reply(&mut f, ack_of(&first)).await;
+            reply(&mut f, ack_of(&second)).await;
+            // 之後不會再收到 report：客戶端送出 close_notify 後關閉
+            let rest = next_report(&mut f).await;
+            (hello, rest)
+        });
+        let err = serve_spool(client, &settings(60), &shared).await;
+        assert!(
+            matches!(
+                err,
+                SessionError::Drained {
+                    reconnect_within_ms: 5000
+                }
+            ),
+            "{err:?}"
+        );
+        let (hello, rest) = srv.await.unwrap();
+        assert!(
+            hello["features"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("cluster")),
+            "{hello}"
+        );
+        assert!(rest.is_none(), "{rest:?}");
+        // 6 筆中送出 2 筆並收到 ack；其餘 4 筆留在緩衝，連到下一個節點後補送
+        assert_eq!(shared.lock().len(), 4);
+    }
+
+    #[test]
+    fn hello_ack_cluster_fields_are_kept_only_for_v2() {
+        let mut t = ServerLogThrottles::default();
+        let line = r#"{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":5000,"features":["cluster"],"server_node":"kairos-b","cluster_id":"3f6c2b1a-9d4e-4f8a-b7c6-1e2d3c4b5a69"}"#;
+        let ack = handle_pre_ack_line(line, 1, &mut t).unwrap().unwrap();
+        assert_eq!(ack.server_node.as_deref(), Some("kairos-b"));
+        assert_eq!(
+            ack.cluster_id.as_deref(),
+            Some("3f6c2b1a-9d4e-4f8a-b7c6-1e2d3c4b5a69")
+        );
+        let (_, msg) = registered_log(&settings(1), &ack, None);
+        assert!(msg.contains("協定 v2，節點 kairos-b"), "{msg}");
+        // v1 的 hello_ack 帶了也不採用
+        let line = r#"{"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000,"server_node":"kairos-b"}"#;
+        let ack = handle_pre_ack_line(line, 1, &mut t).unwrap().unwrap();
+        assert_eq!(ack.server_node, None);
+        // 註冊前收到 drain：忽略
+        let drain =
+            r#"{"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":1000}"#;
+        assert!(handle_pre_ack_line(drain, 1, &mut t).unwrap().is_none());
+        assert_eq!(drain_request(drain), Some(1000));
+        assert_eq!(
+            drain_request(r#"{"type":"drain","reconnect_within_ms":1}"#),
+            Some(kairos_proto::MIN_DRAIN_RECONNECT_MS)
+        );
+        assert_eq!(
+            drain_request(r#"{"type":"drain"}"#),
+            Some(kairos_proto::DEFAULT_DRAIN_RECONNECT_MS)
+        );
+        assert_eq!(drain_request(r#"{"type":"ack","seq":1}"#), None);
     }
 }

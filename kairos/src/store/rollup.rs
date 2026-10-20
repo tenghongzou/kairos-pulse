@@ -185,6 +185,14 @@ impl Rollup {
         }
     }
 
+    /// 捨棄一台主機尚未寫出的桶（刪除主機資料，`kairos/PRIVACY.md` 第 4 節）；回傳捨棄的列數
+    pub fn remove_host(&mut self, host_id: i64) -> usize {
+        let before = self.open.len();
+        self.open.retain(|&(_, h, _), _| h != host_id);
+        self.touched.retain(|&(_, h), _| h != host_id);
+        before - self.open.len()
+    }
+
     /// 清空（資料庫被換掉時，host_id 與 series_id 都不再有效；或改由原始資料重建）
     pub fn clear(&mut self) {
         self.open.clear();
@@ -302,6 +310,19 @@ mod tests {
             vec![old / 1000 + 300, old / 1000 + 600]
         );
         assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn removing_a_host_drops_only_its_buckets() {
+        let mut r = Rollup::default();
+        r.add(1, 1, T0, 1.0, T0);
+        r.add(1, 2, T0, 1.0, T0);
+        r.add(2, 1, T0, 1.0, T0);
+        assert_eq!(r.remove_host(1), 2);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.remove_host(1), 0);
+        let rows = r.take_ready(T0 + 3_600_000, 100);
+        assert!(rows.iter().all(|row| row.host_id == 2) && rows.len() == 1);
     }
 
     #[test]

@@ -217,8 +217,8 @@ pub fn cert_pem(der: &[u8]) -> String {
     out
 }
 
-/// 標準 base64（含 `=`；PEM 用）
-fn base64_std(data: &[u8]) -> String {
+/// 標準 base64（含 `=`；PEM 用；遠端升級的測試另用來產生 SSHSIG）
+pub(crate) fn base64_std(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

@@ -7,11 +7,15 @@
 //   並先以 GET /api/v1/me 確認身分：401 → 回登入頁；權限改變 → 外框重畫（session.onChange）。
 // - 伺服器每 15 秒的心跳也會重新計算權限，沒有讀取主機的權限時關閉串流（API.md 第 12.3 節）。
 // - 狀態（connected）供頁首的「與 Kairos 伺服器的連線中斷」橫幅使用。
+// - resync（screens.md §0.2）：onResync(fn) 收到原因（restarted／failover／too_old／其他）供外框顯示 Banner；
+//   畫面重新抓取完清單後呼叫 resyncSettled()，外框在 3 秒後移除 Banner。onResync 不算訂閱者（不會開啟串流）。
 
 import * as session from './session.js';
 
 const handlers = new Set();
 const stateListeners = new Set();
+const resyncListeners = new Set();
+const settleListeners = new Set();
 let es = null;
 let lastEventId = null;
 let retryTimer = null;
@@ -34,6 +38,16 @@ function dispatch(type, ev) {
     data = null;
   }
   if (ev.lastEventId) lastEventId = ev.lastEventId;
+  if (type === 'resync') {
+    const reason = (data && data.reason) || null;
+    for (const fn of resyncListeners) {
+      try {
+        fn(reason);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  }
   for (const fn of handlers) {
     try {
       fn({ type, id: ev.lastEventId || null, data });
@@ -43,7 +57,8 @@ function dispatch(type, ev) {
   }
 }
 
-const TYPES = ['ready', 'resync', 'host.added', 'host.online', 'host.offline', 'alert.created', 'alert.updated', 'alert.resolved'];
+// 0.9：遠端管理的 config.host（需要 config:read）、rollout.progress（需要 rollouts:read；API.md 第 17.5 節）
+const TYPES = ['ready', 'resync', 'host.added', 'host.online', 'host.offline', 'alert.created', 'alert.updated', 'alert.resolved', 'config.host', 'rollout.progress'];
 
 function open() {
   if (es || !enabled || handlers.size === 0) return;
@@ -100,6 +115,23 @@ export function subscribe(fn) {
 export function onState(fn) {
   stateListeners.add(fn);
   return () => stateListeners.delete(fn);
+}
+
+/** 收到 resync（參數為原因）；回傳取消的函式。不會開啟串流 */
+export function onResync(fn) {
+  resyncListeners.add(fn);
+  return () => resyncListeners.delete(fn);
+}
+
+/** 畫面因 resync 重新抓取完成（外框據此在 3 秒後移除 Banner） */
+export function resyncSettled() {
+  for (const fn of settleListeners) fn();
+}
+
+/** resyncSettled() 的通知；回傳取消的函式 */
+export function onResyncSettled(fn) {
+  settleListeners.add(fn);
+  return () => settleListeners.delete(fn);
 }
 
 export function isConnected() {

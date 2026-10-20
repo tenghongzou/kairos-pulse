@@ -6,8 +6,8 @@
 set -e
 case "${1:-}" in
     purge)
-        rm -rf /opt/pulse/identity /opt/pulse/buffer /opt/pulse/logs /var/lib/pulse
-        rm -f /opt/pulse/agent.id /opt/pulse/pulse.toml.bak-*
+        rm -rf /opt/pulse/identity /opt/pulse/buffer /opt/pulse/logs /var/lib/pulse /var/lib/pulse-upgrade
+        rm -f /opt/pulse/agent.id /opt/pulse/pulse.toml.bak-* /opt/pulse/.install-method /opt/pulse/pulse.prev
         rmdir /opt/pulse 2>/dev/null || true
         ;;
     remove | 0)

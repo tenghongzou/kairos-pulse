@@ -47,6 +47,10 @@ pub(crate) enum Ver {
     Renew,
     /// 除役通知（feature `deregister`）
     Deregister,
+    /// 叢集連線與排空（feature `cluster`）
+    Cluster,
+    /// 遠端管理（feature `config`、`upgrade`）
+    Mgmt,
     Errors,
 }
 
@@ -58,6 +62,8 @@ impl Ver {
             Ver::Durable => "durable",
             Ver::Renew => "輪替",
             Ver::Deregister => "除役",
+            Ver::Cluster => "叢集",
+            Ver::Mgmt => "遠端管理",
             Ver::Errors => "錯誤",
         }
     }
@@ -134,13 +140,25 @@ fn spec_vectors_are_found() {
     assert_eq!(vectors(Ver::Renew, 'K').len(), 2);
     assert_eq!(vectors(Ver::Deregister, 'P').len(), 2);
     assert_eq!(vectors(Ver::Deregister, 'K').len(), 2);
+    assert_eq!(vectors(Ver::Cluster, 'P').len(), 2);
+    assert_eq!(vectors(Ver::Cluster, 'K').len(), 3);
+    assert_eq!(vectors(Ver::Mgmt, 'P').len(), 8);
+    assert_eq!(vectors(Ver::Mgmt, 'K').len(), 10);
     assert_eq!(vectors(Ver::Errors, 'P').len(), 0);
     assert_eq!(vectors(Ver::Errors, 'K').len(), 5);
 }
 
 #[test]
 fn every_client_vector_round_trips() {
-    for ver in [Ver::V1, Ver::V2, Ver::Durable, Ver::Renew, Ver::Deregister] {
+    for ver in [
+        Ver::V1,
+        Ver::V2,
+        Ver::Durable,
+        Ver::Renew,
+        Ver::Deregister,
+        Ver::Cluster,
+        Ver::Mgmt,
+    ] {
         for line in vectors(ver, 'P') {
             let msg = parse_client_msg(line).unwrap();
             assert_ne!(msg, ClientMsg::Unknown, "{line}");
@@ -158,6 +176,8 @@ fn every_server_vector_round_trips() {
         Ver::Durable,
         Ver::Renew,
         Ver::Deregister,
+        Ver::Cluster,
+        Ver::Mgmt,
         Ver::Errors,
     ] {
         for line in vectors(ver, 'K') {
@@ -261,13 +281,67 @@ fn spec_limits_match_constants() {
         "每條連線最多 {MAX_DURABLE_IN_FLIGHT} 筆 report 在途"
     ));
     // features 表與 SERVER_FEATURES、LIFECYCLE_FEATURES 一致
-    for feature in SERVER_FEATURES.iter().chain(LIFECYCLE_FEATURES.iter()) {
+    for feature in SERVER_FEATURES
+        .iter()
+        .chain(LIFECYCLE_FEATURES.iter())
+        .chain([FEATURE_CLUSTER].iter())
+        .chain(MGMT_FEATURES.iter())
+    {
         has(format!("| `{feature}` |"));
     }
+    // feature cluster
+    has(format!(
+        "{MIN_DRAIN_RECONNECT_MS}～{MAX_DRAIN_RECONNECT_MS}，超出範圍時 client 夾在範圍內，缺漏或型別不符時為 {DEFAULT_DRAIN_RECONNECT_MS}"
+    ));
+    has(format!(
+        "Kairos 送 `max({DEFAULT_DRAIN_RECONNECT_MS}, 連線數 × {DRAIN_MS_PER_CONNECTION})`"
+    ));
+    has(format!(
+        "1～{MAX_SERVER_NODE_BYTES} bytes，只有小寫英文字母"
+    ));
+    has(format!(
+        "最多 {} 秒；沒有回應的 report",
+        DRAIN_IN_FLIGHT_WAIT_MS / 1000
+    ));
     // 訊息表列出所有 server 訊息類型
     for kind in SERVER_MSG_TYPES {
         has(format!("| `{kind}` |"));
     }
+    // feature config、upgrade
+    use crate::mgmt::*;
+    has(format!(
+        "各 1～{MAX_INSTALL_FIELD_BYTES} bytes 的小寫英文字母、數字或 `_`"
+    ));
+    has(format!("各最多 {MAX_STATUS_ITEMS} 項"));
+    has(format!("`message` ≤ {MAX_STATUS_MESSAGE_BYTES} bytes"));
+    has(format!("每段最多 {MAX_CHUNK_BYTES} bytes"));
+    has(format!("`length`（1～{MAX_CHUNK_BYTES}）"));
+    has(format!("最多 **{MAX_CHUNKS_IN_FLIGHT} 段**在途"));
+    has(format!("連續 {MAX_DOWNLOAD_HASH_MISMATCHES} 次不符時放棄"));
+    has(format!("（預設 {DEFAULT_MAX_CONCURRENT_DOWNLOADS} 台）"));
+    has(format!(
+        "健康確認期限（{MIN_HEALTH_TIMEOUT_SECS}～{MAX_HEALTH_TIMEOUT_SECS}）"
+    ));
+    has(format!("（≤ {} KiB）", MAX_MANIFEST_BYTES / 1024));
+    has(format!("全文（≤ {} KiB）", MAX_SHA256SUMS_BYTES / 1024));
+    has(format!("全文（≤ {} KiB，", MAX_SIGNATURE_BYTES / 1024));
+    has(format!("0～{MAX_UPGRADE_DETAIL_BYTES} bytes"));
+    has(format!("≤ {MAX_ARTIFACT_URL_BYTES} bytes）"));
+    has(format!("1～{} MiB", MAX_ARTIFACT_BYTES / 1024 / 1024));
+    for state in CONFIG_STATES.iter().chain(UPGRADE_STATES.iter()) {
+        has(format!("`{state}`"));
+    }
+    for t in MGMT_CLIENT_MSG_TYPES {
+        has(format!("| `{t}` |"));
+    }
+    has(format!(
+        "namespace 為 `{}`",
+        crate::release::RELEASE_NAMESPACE
+    ));
+    has(format!(
+        "principal 為 `{}`",
+        crate::release::RELEASE_PRINCIPAL
+    ));
 }
 
 #[test]
@@ -488,4 +562,125 @@ fn new_error_codes_are_not_fatal() {
         serde_json::from_str::<Value>(&built.to_line().unwrap()).unwrap(),
         serde_json::from_str::<Value>(v).unwrap()
     );
+}
+
+// ---- 叢集連線與排空（feature cluster） ----
+
+#[test]
+fn cluster_vectors_parse_into_the_shared_types() {
+    use crate::{DRAIN_REASON_NODE_DRAINING, FEATURE_CLUSTER};
+    let ClientMsg::Hello { ext, .. } =
+        parse_client_msg(client_vector_in(Ver::Cluster, "hello")).unwrap()
+    else {
+        panic!("應解析為 hello");
+    };
+    assert!(
+        ext.offer
+            .as_ref()
+            .unwrap()
+            .features
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|f| f == FEATURE_CLUSTER)
+    );
+    match parse_server_msg(server_vector_in(Ver::Cluster, "hello_ack")).unwrap() {
+        ServerMsg::HelloAck {
+            server_node,
+            cluster_id,
+            features: Some(f),
+            ..
+        } => {
+            assert_eq!(server_node.as_deref(), Some("kairos-a"));
+            assert_eq!(
+                cluster_id.as_deref(),
+                Some("3f6c2b1a-9d4e-4f8a-b7c6-1e2d3c4b5a69")
+            );
+            assert!(f.iter().any(|f| f == FEATURE_CLUSTER));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        parse_server_msg(server_vector_in(Ver::Cluster, "drain")).unwrap(),
+        ServerMsg::drain(DRAIN_REASON_NODE_DRAINING, 10_000)
+    );
+    // 舊版的向量沒有新欄位，hello_ack 不帶 server_node
+    for ver in [Ver::V1, Ver::V2, Ver::Durable, Ver::Renew, Ver::Deregister] {
+        for line in vectors(ver, 'K') {
+            for new_field in ["server_node", "cluster_id", "\"drain\""] {
+                assert!(!line.contains(new_field), "{line}");
+            }
+        }
+    }
+}
+
+#[test]
+fn lenient_cluster_fields() {
+    // hello_ack 的 server_node／cluster_id 型別或格式不符：視為沒有，整則仍可解析
+    let long = format!("\"{}\"", "a".repeat(64));
+    for (node, id) in [
+        ("7", "\"x\""),
+        ("\"Kairos A\"", "12"),
+        ("\"-a\"", "null"),
+        (long.as_str(), "\"3f6c2b1a\""),
+    ] {
+        let line = format!(
+            r#"{{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["cluster"],"server_node":{node},"cluster_id":{id}}}"#
+        );
+        match parse_server_msg(&line).unwrap() {
+            ServerMsg::HelloAck {
+                server_node: None,
+                cluster_id: None,
+                ..
+            } => {}
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+    // cluster_id 轉成小寫
+    let line = r#"{"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"cluster_id":"3F6C2B1A-9D4E-4F8A-B7C6-1E2D3C4B5A69"}"#;
+    let ServerMsg::HelloAck { cluster_id, .. } = parse_server_msg(line).unwrap() else {
+        panic!("應解析為 hello_ack");
+    };
+    assert_eq!(
+        cluster_id.as_deref(),
+        Some("3f6c2b1a-9d4e-4f8a-b7c6-1e2d3c4b5a69")
+    );
+    // drain 的欄位缺漏或型別不符：整則仍可解析，reconnect_within_ms 視為沒有
+    for line in [
+        r#"{"type":"drain"}"#,
+        r#"{"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":"10000"}"#,
+        r#"{"type":"drain","reconnect_within_ms":-1}"#,
+    ] {
+        match parse_server_msg(line).unwrap() {
+            ServerMsg::Drain {
+                reconnect_within_ms: None,
+                ..
+            } => {}
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+    // Kairos 送出的 drain：seq 一律為 null
+    let v: Value =
+        serde_json::from_str(&ServerMsg::drain("node_draining", 12_345).to_line().unwrap())
+            .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":12345})
+    );
+}
+
+#[test]
+fn old_pulse_treats_drain_as_an_unknown_type() {
+    // 0.8 的 Pulse 不認得 drain：parse_server_msg 依 0.8 的類型清單分類為「未知類型」（只記 DEBUG）
+    const TYPES_0_8: [&str; 5] = [
+        "hello_ack",
+        "ack",
+        "error",
+        "renew_result",
+        "deregister_ack",
+    ];
+    let drain = server_vector_in(Ver::Cluster, "drain");
+    let kind = crate::message_type(drain).unwrap();
+    assert!(!TYPES_0_8.contains(&kind.as_str()));
+    assert!(crate::SERVER_MSG_TYPES.contains(&kind.as_str()));
 }

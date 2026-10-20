@@ -3,12 +3,15 @@
 //!
 //! 只有主控台可修改的項目（[`CONSOLE_KEYS`]）有資料庫的覆寫層；其他設定只來自設定檔與環境變數。
 //! 被環境變數覆寫的項目無法從主控台修改（`409 locked_by_environment`，CLI 結束代碼 3）。
+// 查詢結果以 tuple 回傳（沿用原本查詢的形狀），方法參數與原本的函式相同
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 use kairos_proto::enroll::EnrollMode;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::config::{AppConfig, CertPolicySettings, SettingSource};
+use crate::store::db::StoreResult;
 
 pub const KEY_MODE: &str = "enroll.mode";
 pub const KEY_AUTO_PAUSE_ENABLED: &str = "enroll.auto_pause_enabled";
@@ -375,6 +378,25 @@ fn flatten_values(prefix: &str, value: &Value, out: &mut BTreeMap<String, Value>
             out.insert(prefix.to_string(), v.clone());
         }
     }
+}
+
+/// 主控台覆寫的設定（`settings` 表）與 `meta` 表的鍵值。SQLite 的實作在 `store/sqlite/enroll.rs`（`settings`）
+/// 與 `store/sqlite/alerts.rs`（`meta`）
+pub trait SettingsStore {
+    /// `settings` 表的所有值：(鍵, JSON 值, 更新時間, 更新者)
+    fn load_settings(&self) -> StoreResult<Vec<(String, Value, i64, String)>>;
+
+    /// 寫入（覆寫）一個鍵
+    fn set_setting(&self, key: &str, value: &Value, by: &str, now_ms: i64) -> StoreResult<()>;
+
+    /// 刪除 `settings` 的鍵（改用設定檔的值）；回傳是否存在
+    fn delete_setting(&self, key: &str) -> StoreResult<bool>;
+
+    /// `meta` 表的一個鍵（沒有時為 `None`）
+    fn get_meta(&self, key: &str) -> StoreResult<Option<String>>;
+
+    /// 寫入 `meta` 表的一個鍵
+    fn put_meta(&self, key: &str, value: &str) -> StoreResult<()>;
 }
 
 #[cfg(test)]

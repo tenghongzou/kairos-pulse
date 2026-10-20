@@ -276,6 +276,9 @@ pub struct Engine {
     pub(super) tls_failed: Option<(i64, bool, String)>,
     /// 稽核日誌的自我驗證失敗：(時間, 原因, 斷點的 id, 說明)
     pub(super) audit_failed: Option<(i64, String, Option<i64>, String)>,
+    /// 遠端管理的系統檢查：(規則, 對象) → (開始時間, 標題, 細節)
+    pub(super) remote_conditions:
+        std::collections::BTreeMap<(&'static str, String), (i64, String, Value)>,
     pub(super) flaps: HashMap<String, VecDeque<i64>>,
     pub(super) warmup: Warmup,
     pub(super) seq_by_day: HashMap<String, u64>,
@@ -313,6 +316,7 @@ impl Engine {
             evictions: VecDeque::new(),
             tls_failed: None,
             audit_failed: None,
+            remote_conditions: std::collections::BTreeMap::new(),
             flaps: HashMap::new(),
             warmup,
             seq_by_day: loaded.seq_by_day,
@@ -489,6 +493,40 @@ impl Engine {
             action,
             details,
         });
+    }
+
+    /// 刪除主機資料（`kairos/PRIVACY.md` 第 4 節）：忘記這台主機的進行中事件與判斷狀態，也丟棄尚未
+    /// 寫出的輸出，之後不會再寫入這些事件（資料表中的列由刪除工作刪除）。回傳忘記的事件數
+    pub fn forget_agent(&mut self, agent_id: &str) -> usize {
+        let ids: Vec<String> = self
+            .events
+            .values()
+            .filter(|e| e.agent_id.as_deref() == Some(agent_id))
+            .map(|e| e.event_id.clone())
+            .collect();
+        for id in &ids {
+            if let Some(ev) = self.events.remove(id) {
+                self.unindex(&ev);
+                self.children.remove(id);
+            }
+            self.dirty.remove(id);
+        }
+        let gone = |id: &str| ids.iter().any(|x| x == id);
+        self.out.timeline.retain(|t| !gone(&t.event_id));
+        self.out
+            .deliveries
+            .retain(|d| d.event_id.as_deref().is_none_or(|e| !gone(e)));
+        self.out.events.retain(|e| !gone(&e.event_id));
+        self.out
+            .changes
+            .retain(|c| c.event["event_id"].as_str().is_none_or(|e| !gone(e)));
+        // 以主機為對象的去重鍵（`規則|agent_id`）上的連續成立、抖動、抑制；被取代與身分驗證失敗的紀錄
+        self.streaks.retain(|k, _| !k.contains(agent_id));
+        self.flaps.retain(|k, _| !k.contains(agent_id));
+        self.suppressed.retain(|k, _| !k.contains(agent_id));
+        self.superseded.remove(agent_id);
+        self.auth_failed.remove(agent_id);
+        ids.len()
     }
 
     /// 取出輸出（有變化的事件、處理紀錄、通知、SSE）；已解決的事件之後從記憶體移除
@@ -1211,6 +1249,22 @@ impl Engine {
                     self.tls_failed = None;
                 } else if self.tls_failed.is_none() {
                     self.tls_failed = Some((at, *crl, message.clone().unwrap_or_default()));
+                }
+            }
+            EventKind::RemoteCondition {
+                rule,
+                subject,
+                active,
+                title,
+                details,
+            } => {
+                let key = (*rule, subject.clone());
+                if *active {
+                    let since = self.remote_conditions.get(&key).map_or(at, |c| c.0);
+                    self.remote_conditions
+                        .insert(key, (since, title.clone(), details.clone()));
+                } else {
+                    self.remote_conditions.remove(&key);
                 }
             }
             EventKind::AuditIntegrity {

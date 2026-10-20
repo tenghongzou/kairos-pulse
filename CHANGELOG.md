@@ -28,6 +28,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 0.3.0 的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
 - 0.5.0 的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
 - 0.6.0 的協定與 8443 的 feature 都與 0.5.0 相同，0.5 與 0.6 的任何組合都能連線；Kairos 的資料庫升級到 schema v6（告警、使用者與稽核），Pulse 只新增可觀測性（日誌格式、syslog、本機指標、`diag`）。
+- 〔草稿〕0.9.0 的協定版本與 8444 的 API 都與 0.8.0 相同，8443 另以 feature `cluster`（節點名稱與關機排空）、`config`、`upgrade`（集中設定與遠端升級）協商（雙方都宣告時才使用），0.8 與 0.9 的任何組合都能連線（各組合見 [0.9.0] 的「相容性」）；Kairos 的資料庫升級到 schema v9（遠端管理的資料表）。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
@@ -48,7 +49,182 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-（目前沒有 0.8.0 之後的變更。）
+## [0.9.0] - 〔草稿：發佈日期待定〕
+
+**Kairos 0.9.0、Pulse 0.9.0〔草稿〕**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。
+
+0.9.0 的範圍（2026-10-19 使用者決定，HA.md 第 21 節、REMOTE.md 第 14 節全部採建議）另包含 **F8 MVP**（REMOTE.md D15；Kairos 端 K1 設定檔與指派、K2 版本庫與推送，以及 Pulse 端 P1 集中設定、P2 Linux 遠端升級都已包含，Kairos 0.9 × Pulse 0.9 在 mTLS 連線上協商 `config`／`upgrade`）與 HA 的 **L1a 儲存抽象**（已包含）、**L4 Pulse 多位址**（已包含）；PostgreSQL 後端與叢集協調延到 0.10.0。
+
+### 破壞性變更與升級步驟（升級前必讀）
+
+| # | 產品 | 變更 | 誰會受影響 | 升級步驟 |
+|---|---|---|---|---|
+| 1 | Kairos | **行程排行的命令列預設遮蔽秘密**（`privacy.process_command` 預設 `redact`，行為變更）：Pulse 開啟完整命令列（`processes.command = "full"`）的主機，命令列中的密碼、token、帶帳號密碼的網址在保存前遮蔽（與診斷包相同的規則，另加 `--password x`、`-pSECRET`；`-p` 開頭的單一破折號參數一律遮蔽）。主控台、API、匯出、指標轉出都只看到遮蔽後的值 | 在 Pulse 開啟完整命令列、需要原樣檢視命令列的部署（Pulse 預設只送執行檔，不受影響） | 需要原樣保存時在 `kairos.toml` 設定 `[privacy] process_command = "keep"` |
+| 2 | Pulse | **`pulse enroll` 在送出申請之前收到 429／503 時等候後重試**（依 `Retry-After`，合計不超過 `--wait`，沒有指定時 600 秒）：0.8 直接結束（結束代碼 6） | 依結束代碼 6 立即自行重試的部署腳本 | 腳本不需要自行重試；需要立即失敗時加 `--no-wait` 或較短的 `--wait <秒>` |
+
+**升級步驟**：Kairos 第一次啟動時把資料庫升級到 **schema v9**（只新增資料表與 `hosts` 的欄位，一個交易；升級後 0.8 的 Kairos 無法開啟，降版從備份還原），請先 `kairos db backup <檔案> --include-keys --password-stdin < <密碼檔>`（0.9 起一併備份 `data/privacy.key`）→ 換上 Kairos 0.9.0（tar.gz 照 INSTALL 第 11 節換執行檔；deb／rpm 直接升級）→ 換上 Pulse 0.9.0。指標轉出與 `[privacy]` 的假名化、網段預設都不啟用；需要時依 EXPORT.md、PRIVACY.md 設定。
+
+**遠端升級的第一次導入**（REMOTE.md 第 4.10 節）：遠端升級需要主機上已有 0.9.0 的 Pulse、輔助程式 `pulse-upgrade.path` 與信任錨 `/etc/kairos-pulse/allowed_signers`，因此**每台主機都要手動升級一次到 0.9.0**（套件：`apt install ./pulse-0.9.0-….deb`／`dnf install` 會安裝並啟用 `pulse-upgrade.path`；一行安裝腳本另外放置信任錨；tar：依 INSTALL.md 第 10.1 節安裝兩個 unit 與信任錨），之後的版本才能由 Kairos 推送。不要遠端升級或集中設定的主機在 `pulse.toml` 設定 `[upgrade] enabled = false`、`[remote_config] enabled = false`（或安裝腳本的 `--no-remote-upgrade`、`--no-remote-config`）；Kairos 端可用 `[remote] config_enabled`／`upgrade_enabled` 整體停用。
+
+### 相容性
+
+- 協定（v1～v2）、8444 的 API 都不變；schema 升級到 v9。8443 新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），0.8 與 0.9 的 Kairos／Pulse 任意組合都能連線（下表）。`config`／`upgrade` 另需要 Kairos 以 SQLite 儲存、agent 連線埠啟用 mTLS；沒有宣告的 client（Pulse 0.8 以前）收到的 `hello_ack`、`ack` 與 0.8 完全相同（沒有 `pending`），新的 `type` 照舊回 `unknown_type`。**遠端升級需要主機上已經有 0.9.0 的 Pulse、輔助程式與信任錨，0.8 → 0.9 必須手動升級一次**（REMOTE.md 第 4.10 節）。
+- 降版到 0.8 的 Pulse 會忽略 `server.fallback_addresses`，只連 `server.address`。
+- **注意**：所有候選位址必須屬於共用同一個資料庫的同一個叢集，durable 的去重才是全叢集的。0.9.0 還沒有共用資料庫的叢集模式（PostgreSQL、租約為 0.10.0），把備用位址指到另一個各自有 SQLite 的 Kairos 時，換節點時在途的 report（最多 4 筆）可能兩邊各寫一次。
+- 8444（註冊、輪詢、過期續簽）不跟著候選位址走，仍只用 `enroll.address`（空字串時為 `server.address` 的主機）；叢集部署請設為負載平衡器或虛擬 IP 的名稱。DNS SRV（`server.srv`）未實作（HA 規格的階段 B 選用）。
+- 新權限 `export:write`、`hosts:purge`、`hosts:personal_data` 只給內建的管理員；F8 的 `config:read`／`write`、`releases:read`／`write`、`rollouts:read`／`write`／`pause` 依 REMOTE.md 第 5.2 節（`Permission::ALL` 為 45 個）；0.4／0.5 的舊範圍 token 不會取得（權限凍結）。維運者看不到 S21「整合」分頁（維持 D16）。
+- 預設值下的行為與 0.8 相同，唯一的差異是 `process_command = "redact"`（破壞性變更第 1 項）；Prometheus exporter 與 OTLP 推送預設停用；feature `cluster` 只在 Kairos 0.9 × Pulse 0.9 時使用（節點名稱、Kairos 優雅關機時的 `drain`）。
+- 指標轉出的設定存在既有的 `settings` 表，不新增資料表；`[privacy]` 在資料進入時轉換，主控台、API、匯出與指標轉出都只看到轉換後的值。
+
+| Pulse ＼ Kairos | Kairos 0.8（以前） | Kairos 0.9 |
+|---|---|---|
+| **Pulse 0.8（以前）** | 不變 | 與 0.8 相同：不宣告 `cluster` 的 client 收到的 `hello_ack` 不變，也不會收到 `drain`（Kairos 關機時照舊直接關閉連線） |
+| **Pulse 0.9** | 舊版 Kairos 不列出 `cluster`、`config`、`upgrade`：沒有節點名稱、不會收到 `drain`、只用本機設定、不會被升級；`fallback_addresses` 照常運作 | 協商 `cluster`：節點名稱、關機排空；mTLS 時另協商 `config`、`upgrade`（集中設定、遠端升級） |
+
+### Kairos：指標轉出（F7；`kairos/EXPORT.md`）
+
+- **Prometheus exporter**：`GET /api/v1/export/prometheus`（主控台的監聽，HTTPS）以 Prometheus text 0.0.4 或 OpenMetrics 1.0（依 `Accept`）輸出所有可見主機的最新指標。以 API token 驗證、權限 `hosts:read`（viewer 角色即可；群組範圍的使用者只看得到自己的群組，另可 `?group=` 分群抓取）。每個序列帶 `agent_id`、`hostname`、`host_group`；另有 `kairos_host_up`、`kairos_host_info`（顯示名稱、版本、作業系統、標籤）、`kairos_host_last_sample_timestamp_seconds`、`kairos_exporter_hosts`。離線或最後一筆超過 `stale_after_secs`（預設 300）的主機不輸出指標；行程排行預設不輸出（`include_processes`）。預設**停用**（`[export.prometheus] enabled`，未啟用時 `404 export_disabled`）。
+- **OTLP/HTTP 推送**：`[export.otlp]` 把每一筆保存成功的 report 以 protobuf 推送到 OpenTelemetry collector：批次（`max_batch_points`）、有上限的佇列與丟棄策略（`queue_max_points`、`drop_policy`）、重試（429／502／503／504 與連線失敗，指數退避、`Retry-After`）、TLS（作業系統的 CA＋`ca_file`、可帶用戶端憑證）、自訂標頭（`headers_file` 或主控台輸入，加密保存）、resource 屬性（`host.name`、`host.id`、`host.arch`、`os.type`、`kairos.host.*`、`resource_attributes`）。名稱預設對應 OpenTelemetry semantic conventions（`naming = "semconv"`：`system.cpu.utilization`、`system.memory.usage{system.memory.state}`、`system.network.io{network.io.direction}`…），可改回 Kairos 的名稱。不支援 gRPC 與 gzip。預設停用。
+- **Grafana**：儀表板 `kairos/packaging/grafana-kairos-hosts.json`（Prometheus 資料來源；群組與主機變數、CPU、記憶體、負載、磁碟、網路、運作時間、主機清單）與抓取範例 `kairos/packaging/prometheus-export.example.yml`，兩者與 `EXPORT.md` 一起放進發佈包。
+- **主控台**：S21「系統設定 → 整合」新增「指標轉出」卡片：Prometheus 的最近一次抓取、OTLP 的佇列／送出／丟棄／最近一次成功與錯誤；管理員可修改啟用、過期門檻、行程排行、OTLP 的啟用／端點／間隔／名稱／標頭（值只能更換不能檢視）與測試連線。設定存在資料庫 `settings` 表、優先於 `kairos.toml`，環境變數鎖定（`409 locked_by_environment`），寫入稽核（`export.change`、`export.otlp_test`）。
+- **API**：`GET`／`PUT /api/v1/export/settings`、`POST /api/v1/export/otlp/test`（API.md 第 16 節）；新權限 **`export:write`**（只有管理員；0.4／0.5 的舊範圍 token 沒有）。
+- **`/metrics`**：`kairos_export_prometheus_enabled`、`kairos_export_prometheus_scrapes_total`、`kairos_export_otlp_enabled`、`kairos_export_otlp_queue_points`、`kairos_export_otlp_sent_points_total`、`kairos_export_otlp_requests_total{result}`、`kairos_export_otlp_dropped_points_total{reason}`、`kairos_export_otlp_last_success_timestamp_seconds`。
+- **依賴**：沒有新增 crate（OTLP 的 protobuf 為手寫編碼，HTTP 用戶端沿用 hyper 與 tokio-rustls）；指標轉出本身不變更資料庫 schema。
+- **量測**（`export_bench`，10,000 台、每台 43 個指標）：Prometheus 輸出 359 ms、56.9 MB；保存最新值約 7 KB／台；OTLP 編碼約 83 萬點／秒（EXPORT.md 第 5 節）。
+
+### Kairos：個資保護（S6；`kairos/PRIVACY.md`）
+
+- **`[privacy]`**（Kairos）：`store_peer_ip`（`full`／`truncate`：IPv4 /24、IPv6 /48／`none`）、`hostname`（`keep`／`pseudonymize`：以 `data/privacy.key` 的 HMAC 換成 `host-xxxxxxxxxxxx`，顯示名稱 `name-…`；不可逆）、`process_command`（`keep`／`redact`／`drop`）、`process_user`（`keep`／`pseudonymize`／`drop`）、`inventory_network`（`keep`／`truncate`：位址 /24、/48、MAC 只留廠商碼／`drop`）。在 8443 的連線與 8444 的註冊申請進入時一次轉換，狀態表、`agents.json`、清冊、report、資產、告警、JSONL 鏡像、主控台與匯出都只看到轉換後的值；日誌、稽核日誌與註冊申請的來源 IP 不受影響（PRIVACY.md 第 2.3 節）。要求假名化而金鑰無法建立或讀取時 Kairos 不啟動。
+- **刪除主機資料**：主控台「主機詳情 › 更多 › 刪除主機資料」（只有管理員，新權限 `hosts:purge`；主機須離線；影響預覽＋L2 輸入主機名稱）、`GET/POST /api/v1/hosts/{agent_id}/purge`（`impact_token`）、`kairos hosts purge <agent_id> [--dry-run]`（實際刪除需停止 Kairos，執行中以 `KRS-E4304` 拒絕）。刪除 report、行程快照、彙總、資產與變更歷史、告警事件（含處理與發送紀錄）、註冊申請、憑證紀錄與清冊；先以 `cessationOfOperation` 撤銷這台主機的有效憑證，已撤銷未過期的憑證紀錄保留到過期後 1 天（CRL 需要）；**稽核日誌不刪除**（雜湊鏈），另記一筆 `host.purge`。執行中由 report 的 writer 逐步刪除（每一步 5,000 列，與 report 交錯），刪除後 10 分鐘內拒絕該主機的寫入，避免被建立回來。
+- **個資匯出**（資料主體存取請求）：`GET /api/v1/hosts/{agent_id}/personal-data`（新權限 `hosts:personal_data`，只有管理員）、`kairos hosts export <agent_id> [--out]`、主控台「更多 › 匯出個資（JSON）」，`kairos.host.personal-data/v1`：清冊、資產、行程快照摘要、report 的筆數與範圍、告警事件、註冊申請、憑證紀錄、相關的稽核紀錄；每次記稽核。
+- **`kairos hosts pseudonym <名稱>…`**：以金鑰算出假名（「`ann-laptop` 在 Kairos 中叫什麼」）。
+- **與指標轉出的串接**：刪除主機資料時一併丟棄 Prometheus exporter 在記憶體中的最新值與 OTLP 佇列中這台主機尚未送出的資料（之後的抓取不再輸出）；轉出的主機名稱、顯示名稱與行程排行都是 `[privacy]` 轉換後的值（EXPORT.md 第 2.7 節、PRIVACY.md 第 1 節 #16）。已被 Prometheus 抓取或已推送到 collector 的資料需在該系統處理。
+
+### Pulse 的多個伺服器位址與協定 feature `cluster`（HA L4；`kairos/HA.md` 第 8 節、PROTOCOL.md「叢集與排空」）
+
+- **Pulse `server.fallback_addresses`**：主位址連不上時依序改試的其他 Kairos 節點（"主機" 或 "主機:埠"，IPv6 加方括號，最多 16 個；環境變數 `PULSE__SERVER__FALLBACK_ADDRESSES` 以逗號分隔）。新的鍵、`address` 維持單值，降版安全；安裝字串不變。一輪從主位址開始依序嘗試，收到 `hello_ack` 之前失敗就立即改試下一個（`PLS-W2301`，不增加退避），整輪都失敗才依 `[retry]` 退避（`PLS-E2302`，列出每個位址最後的錯誤）；連上後不主動切回主位址。名稱解析出多個 IP 時依序嘗試，每個最多 3 秒（整個位址仍是 5 秒）。所有位址都以同一個 `server.domain` 驗證伺服器憑證。一次性連線（`pulse enroll` 的確認、輪替後的確認、除役通知、過期憑證的報到）從最近一次連上的位址開始依序嘗試。
+- **feature `cluster`**（PROTOCOL.md「叢集與排空」）：Pulse 0.9 一律宣告；Kairos 只在 client 也宣告時才在 `hello_ack` 列出並帶 `server_node`（新設定 `[cluster] node_id`，預設為主機名稱的第一段）。`cluster_id` 留給叢集模式，單機的 Kairos 不送。新增排空訊息 `drain`（Kairos → Pulse）：Kairos 0.9 在**優雅關機**時先對協商了 `cluster` 的連線送 `drain`（`reconnect_within_ms` = `max(10000, 線上連線數 × 5)`）再 `close_notify`，記 `KRS-I8507`；Pulse 收到後停送新的 report、等在途的回應（最多 8 秒）後關閉，在隨機延遲後改連下一個候選位址，不算連線失敗（`PLS-I8507`）。
+- **狀態與可觀測性**：`status.json`／`pulse status --json` 的 `connection.server` 改為實際連上的位址，另有 `server_node`、`candidates`、`candidate_index`、`candidate_errors`（只新增欄位，schema 不變）；`pulse status` 顯示「已註冊到 <位址>（Kairos 節點 <名稱>；第 N 個位址，共 M 個）」。本機指標新增 `pulse_server_candidates`、`pulse_server_candidate_index`、`pulse_connect_failovers_total`、`pulse_drains_total`。`pulse check-config` 列出備用位址，`pulse diag` 新增 `candidates.json`（每個位址的名稱解析與 TCP 連線）。
+- **Kairos 離線原因 `server_lost`**：服務這台主機的叢集節點失聯（叢集模式由 leader 標記）。0.9.0 只定義名稱：主機 API 的 `offline_reason` 篩選、`/metrics` 的 `kairos_agent_disconnects_total{reason}`（多一個值為 0 的序列）與 Webhook 的固定代碼；單機的 Kairos 不會產生。接收端應忽略不認得的值。
+
+### Kairos：集中設定與 Pulse 遠端升級（F8 K1／K2；`crates/kairos-proto/REMOTE.md`、API.md 第 17 節）
+
+- **8443 的 feature `config`、`upgrade`**：Kairos 0.9 在 SQLite 儲存、**mTLS** 的連線上，client（Pulse 0.9.0 以上）也宣告時列出（`[remote] config_enabled`／`upgrade_enabled`，預設啟用）。`hello_ack` 與回應心跳的 `ack` 帶 `pending`（`config_rev`、提議中的 `upgrade_id`；心跳不查資料庫）；處理 `config_get` → `config`、`config_status` → `ack`、`upgrade_get` → `upgrade_offer`（不是這台主機目前的提議時 `upgrade_unavailable`）、`upgrade_chunk_get` → `upgrade_chunk`（32 KiB 一段；同時下載的主機超過 `max_concurrent_downloads` 時非 fatal 的 `rate_limited`＋`retry_after_ms`）、`upgrade_status` → `ack`（以 (`upgrade_id`, `state`) 去重；`succeeded` 以 hello 的 `agent_version` 交叉確認，不符為 `KRS-W8402`）。沒有協商時這些 `type` 照舊回 `unknown_type`，與 0.8 相同。
+- **集中設定**（K1）：設定檔（白名單 28 個鍵，`KRS-E0502`；每一版保留、可回復）、指派（`global`／`group:`／`tag:`／`host:`，預設優先序 0／100／200／1000、可設到期時間）、依優先序合併、`meta.config_rev` 與「只有期望設定的雜湊改變的主機才更新 `desired_rev`」、相同優先序的衝突在儲存時拒絕（409 `assignment_conflict`）、影響 1,000 台以上的變更需要 `impact_token`；依主機的 `agent_version` 只送該版本認得的鍵。Pulse 的 `config_status` 記錄實際生效的值、本機覆蓋、忽略與錯誤（`KRS-W0501`、`KRS-I0503`、`KRS-W0504`、`KRS-I0505` 的日誌）。
+- **Pulse 版本庫**（K2）：`POST /api/v1/releases` 匯入一次發佈的 `SHA256SUMS`、`.sig` 與發佈清單，以 `[remote] allowed_signers` 驗證（`release::verify_bundle`；沒有設定時只檢查簽章本身與雜湊並警告），`PUT …/artifacts/{filename}` 上傳發佈檔（必須列在 `SHA256SUMS` 中且雜湊相符；以 SHA-256 命名存入 `data/releases/`，0700）。失敗為 `KRS-E8413`；使用中的版本不能刪（409 `release_in_use`）。
+- **升級推送**（K2）：建立（預覽資格分類：已是目標版本、Pulse 太舊、本機停用、缺少信任錨或輔助程式、不支援的平台、沒有發佈檔、`min_upgrade_from`、降版、沒有回滾檔…）→ 送出（L2「升級 N 台」；降版 L3＋原因）→ 立即開始。最多兩批（預設 canary 1%、至多 10 台、觀察 60 分鐘、任何失敗都暫停、人工繼續；其餘 5%），只對連線中且協商了 `upgrade` 的主機提議、同時最多 `max_in_progress` 台；逾時（`expired`、替換後失聯的 `unknown`；Kairos 這端的關機或 `server_lost` 不算主機卡住）、離線寬限（`skipped_offline`）、失敗比例與回滾失敗、簽章失敗時自動暫停（`KRS-W8414`）；暫停、繼續、繼續下一批、取消、重試、回滾失敗標記為已處理。deb／rpm 的提議另附主機目前版本的回滾檔（版本庫有時）。0.9 只支援 Linux 的 tar／deb／rpm。
+- **主控台 API**（API.md 第 17 節）：`/api/v1/config/…`、`/releases/…`、`/rollouts/…`、`/hosts/{agent_id}/config`、`/hosts/{agent_id}/upgrade`；主機清單另有 `install`、`config_state` 欄位與 `config_state`、`remote_upgrade` 篩選；SSE `config.host`、`rollout.progress`。新權限 **`config:read`／`config:write`、`releases:read`／`releases:write`、`rollouts:read`／`rollouts:write`／`rollouts:pause`**（`Permission::ALL` 為 45 個；維運者可修改集中設定與暫停推送，建立與執行推送、版本庫的寫入只限管理員）；0.4／0.5 的舊範圍 token 不會取得。稽核類別 `config`、`release`、`rollout` 與 `host.upgrade.*`（一般的升級結果不逐台寫稽核，REMOTE.md D17）。
+- **告警**：新的系統規則 `sys.rollout_paused`「升級推送已暫停」（`KRS-W8414`）、`sys.upgrade_rollback_failed`「升級回滾失敗」（`KRS-E8408`）、`sys.release_signature_failed`「發佈簽章驗證失敗」（`KRS-E8401`），推送繼續或取消、回滾失敗標記為已處理時恢復。
+- **`[remote]`**：`config_enabled`、`upgrade_enabled`、`releases_dir`、`allowed_signers`、`extra_principals`、`max_concurrent_downloads`、`max_release_bytes`、`rollout_retention_days`（`kairos.example.toml`；修改後需重新啟動，`allowed_signers` 的內容在每次匯入時讀取）。
+- **資料庫 schema v9**（STORAGE.md 第 18 節）：`config_profiles`、`config_profile_revisions`、`config_assignments`、`host_config`、`releases`、`release_artifacts`、`rollouts`、`rollout_hosts`，`hosts.install_method`／`install_upgrade`／`install_config`。刪除主機資料一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management`。`kairos db backup` 不含版本庫的發佈檔。
+- **依賴**：沒有新增 crate；`Cargo.lock` 不變。
+
+### Pulse：集中設定與遠端升級（F8 P1／P2；`crates/kairos-proto/REMOTE.md` 第 3、4 節、PROTOCOL.md「遠端管理」）
+
+- **hello 的 `install`**（不論是否宣告都送）：安裝方式（`/opt/pulse/.install-method` → dpkg → rpm → `/opt/pulse` 的 tar → `unknown`；Windows 為 `msi`／`zip`）、遠端升級的本機狀態（`ready`／`disabled`／`no_trust_anchor`／`no_helper`／`unsupported`）、集中設定的本機狀態。Pulse 0.9.0 宣告 `config`（`[remote_config] enabled`，停用後第一次連線也宣告一次以送出 `state: disabled`）與 `upgrade`（`install.upgrade` 為 `ready` 時）；`release-meta.toml` 的 `remote_features` 改為 `["config", "upgrade"]`。
+- **集中設定**：`pending.config_rev` 與已套用的版本不同時 `config_get`，以 `kairos_proto::mgmt::settings` 的 `check_remote`／`merge_key` 合併（內建預設 < 下發 < `pulse.toml` < 環境變數；`collect.interface_exclude` 取聯集；隱私敏感的鍵只接受更保守的值），合併後以 `AppConfig::validate` 檢查，不合法整份拒絕（`PLS-W0501`）。即時的鍵就地生效（`log.level`、取樣間隔與採集範圍、資產、緩衝上限；`retry.*` 與補送間隔在下一次連線），需要重新連線的鍵在送出 `config_status` 後重建取樣、本機緩衝與連線。快取 `<狀態目錄>/remote/config.json`（0750／0640、寫暫存檔再改名、雜湊一致性；損毀或無法寫入時 `PLS-E0506`），Kairos 停機或重新啟動後沿用；確認期與 last-known-good 回復（`PLS-W0504`）、崩潰保護；連上不支援 `config` 的 Kairos 時快取保留不用。`config_status` 在每條新連線的 `hello_ack` 之後與每次處理 `config` 之後送出（`effective` 為白名單的每個鍵，`overridden`／`ignored`／`errors` 依 PROTOCOL.md）。
+- **遠端升級（Linux tar／deb／rpm）**：`pending.upgrade_id` → `upgrade_get` → 提議的本機檢查（停用、外部 URL、平台與格式、`staging_space_needed`）→ 本機信任錨驗證（`verify_bundle`、`check_artifact`）與版本政策（`check_version_policy`）→ 經 8443 分段下載（2 段在途、斷線與重新啟動後續傳、`rate_limited` 依 `retry_after_ms` 等待、3 次雜湊不符放棄）→ 暫存 → 進入 `apply_window` 時先向 Kairos 再確認提議（推送已暫停或取消時不替換）→ 送 `applying`、寫 `request.json`。`upgrade_status` 先放進 `<狀態目錄>/upgrade/state.json` 的 outbox，收到 `ack` 才移除（at-least-once）；替換後的 Pulse 讀 `result.json` 回報 `succeeded`／`failed`／`rolled_back`／`rollback_failed`。
+- **特權輔助程式** `pulse upgrade apply`（`pulse-upgrade.path`／`pulse-upgrade.service`，root、不連網路）：複製暫存（`O_NOFOLLOW`、`st_nlink == 1`、大小上限）後只對複本操作，以 root 擁有的 `pulse.toml` 重新驗證，預檢新版（以 `pulse` 帳號執行 `--version` 與 `check-config --json --with-remote`），保留 `pulse.prev` 後替換（tar 改名並在 unit 沒被改過時換新；`dpkg -i --force-confold`；`rpm -U`；被鎖住時每 30 秒重試、最多 10 分鐘），`systemctl restart`，健康確認（`effective_health_timeout_secs`、`NRestarts`、狀態檔的 PID 與版本、已註冊且有 report 被確認、穩定 60 秒），失敗自動回滾（`PLS-W8407`；回滾也失敗 `PLS-E8408`，保留所有暫存），重新開機後依 `/var/lib/pulse-upgrade/<id>/state.json` 接續。
+- **套件與安裝**：deb／rpm 安裝並啟用 `pulse-upgrade.path`、寫入 `/opt/pulse/.install-method`，移除時停用；tar 發佈包附兩個 unit（INSTALL.md 第 10.1 節）。`pulse-install.sh` 把 `--allowed-signers` 另外放到 `/etc/kairos-pulse/allowed_signers`，新增 `--no-remote-upgrade`、`--no-remote-config`。
+- **新設定與命令**：`[remote_config] enabled`；`[upgrade] enabled`、`allowed_signers`、`extra_principals`、`allow_downgrade`、`url_allowlist`、`external_ca`（後兩者 0.10.0 起使用）、`health_timeout_secs`。`pulse config show [--effective] [--sources] [--json]`、`pulse upgrade status [--json]`、`pulse upgrade rollback --yes`、`pulse upgrade apply --request <檔案>`（內部）、`pulse check-config --with-remote`。`pulse status` 的「設定」列附集中設定的狀態，有進行中的升級或最近 24 小時的結果時另有「升級」列（回滾失敗時結束代碼 9）；`status.json` 與 `--json` 新增 `management`（只新增欄位）。日誌事件 `config.*`（6000～6005）、`upgrade.*`（6100～6110）。
+- **與規格的差異**：外部 URL（`source: "url"`）在 0.10.0，0.9.0 一律 `declined`（`PLS-W8411`，`url_not_allowed`）；deb／rpm 的回滾檔只在本機保存過它所屬發佈的驗證紀錄時使用（每次驗證通過的發佈都會保存），否則以 `pulse.prev` 回復（套件資料庫仍為新版，`detail` 註明）；`pulse-upgrade.service` 的 `TimeoutStartSec` 為 2.5 小時（健康確認最長 1 小時，回滾後再確認一次）。詳見 REMOTE.md 第 17 節。
+
+### Kairos：註冊與憑證（衝刺 4 延後的小項）
+
+- **手動簽發憑證的匯入**（PKI.md 第 16 節）：`kairos pki certificates import <檔案或目錄>… [--agent-id]`、`POST /api/v1/pki/certificates/import`（`pki.queue:manage`）、主控台「憑證 › 匯入憑證」。外部 CA（含既有的 RSA 根 CA）或 Kairos 簽發 CA 直接簽發的既有用戶端憑證加入簽發紀錄，檢查不通過以 `KRS-E1305` 列出原因；清冊沒有的主機新增最小的一列。外部 CA 簽發的憑證在 Kairos 撤銷後，8443 在 hello 時拒絕（`KRS-W1105`）。
+- **8444 的下載端點** `/agent/<檔名>`（PKI.md 第 17 節）：`enroll.download_dir` 提供 Pulse 的發佈檔案（只有一般檔案、檔名白名單、不跟隨符號連結；內容類型、`nosniff`、`Content-Disposition`；`SHA256SUMS*` 與 `pulse-install.sh` 為 `no-cache`，其他 1 小時；`ETag`／304；串流）。L11 同時下載數（429，`Retry-After: 15`）。主控台的 `downloads` 回報實際狀態，「建立 token」在可用時顯示一行安裝指令。
+
+### Pulse
+
+- **`pulse enroll`**：送出申請之前（`server-info`、`token-check`）收到 429／503 時依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 等候後重試（合計不超過 `--wait`，沒有指定時 600 秒；互動時顯示倒數，Ctrl+C 取消）。0.8 直接結束（結束代碼 6）。
+- **`pulse-install.sh --ca-file <根 CA>`**：以 Kairos 的根 CA 驗證下載端點的 HTTPS（完整性仍以發佈公鑰驗證）。
+
+### 主控台（設計包 `decisions/INTEGRATION.md` §31）
+
+- 主機的最後中斷原因新增 `server_lost`「Kairos 節點失聯」（0.9.0 的單機 Kairos 不會產生）；不認得的 `offline_reason` 一律顯示「其他原因」，原始值在技術細節。Webhook 等接收端也應忽略不認得的值。
+- SSE `resync` 依原因顯示 Banner（重新啟動、切換節點〔0.10〕、離線太久），主機清單、總覽與告警事件自動重新載入。
+- S21 指標轉出卡片、S05 刪除主機資料與假名化說明、S12 下載目錄不完整（只對管理員）、S14 匯入憑證的文案依 §31 定案；`error-codes.js` 依設計包重新產生（Kairos 152 個代碼）。
+- **Pulse 管理**（F8 W1；設計包 S24～S26）：側邊導覽新增「Pulse 管理」區塊——**集中設定**（同步狀態、依 `config/schema` 產生的設定檔表單、影響預覽與 1,000 台以上的確認、指派與衝突、版本歷史與回復）、**升級推送**（單頁的建立推送與資格預覽、L2「升級 N 台」／降版 L3 送出、詳情的批次與主機表、暫停／繼續／取消／重試；計數泡泡＝已暫停的推送＋未處理的回滾失敗）、**Pulse 版本庫**（匯入時驗證簽章並逐檔上傳、詳情、刪除 L2）。主機清單新增「設定狀態」「遠端升級」篩選；主機詳情新增「設定」分頁與「升級」卡片（回滾失敗的「標記為已處理…」）。功能關閉（503 `remote_unavailable`）時顯示說明；權限依 7 個新權限隱藏操作。雙人覆核、維護時段、外部 URL、Windows 推送在 0.10，主控台不顯示。
+
+### 共用 crate：遠端管理的協定與信任鏈（F8 S1；PROTOCOL.md「遠端管理」、`crates/kairos-proto/REMOTE.md`）
+
+- **協定**：REMOTE.md 第 2 節搬入 PROTOCOL.md「遠端管理（feature `config`、`upgrade`）」，範例改為 `kairos-proto` 的測試向量。新訊息 `config_get`／`config`／`config_status`、`upgrade_get`／`upgrade_offer`／`upgrade_chunk_get`／`upgrade_chunk`／`upgrade_status`，hello 的選用物件 `install`（`method`、`upgrade`、`config`），`hello_ack` 與回應心跳的 `ack` 的 `pending`（`config_rev`、`upgrade_id`），新錯誤碼 `upgrade_unavailable`，`rate_limited` 另帶 `retry_after_ms`。兩個 feature 都是雙方宣告才使用：Kairos 0.9.0（K1／K2，見上方「Kairos：集中設定與 Pulse 遠端升級」）與 Pulse 0.9.0（P1／P2，見上方「Pulse：集中設定與遠端升級」）都已實作並宣告；任一端是 0.8 以前時不協商，線上行為與 0.8 相同（Kairos 對這些 `type` 照舊回 `unknown_type`，Pulse 不會送出）。
+- **`kairos-proto::mgmt`**：上述訊息的型別與驗證、協商（`MgmtSession`、`ServerMgmtPolicy`、`client_mgmt_features`）、`Pending::for_session`、設定的正規化 JSON 與雜湊（`canonical_json`、`settings_hash`）。**設定白名單** `mgmt::settings`：28 個可下發的鍵的型別、範圍、套用方式（即時／重新連線）、最低 Pulse 版本、隱私規則（`processes.command` 與資產序號、網路位址只能下發更保守的值）與合併方式（`collect.interface_exclude` 取聯集），以及兩端共用的 `validate_profile`（Kairos `KRS-E0502`）、`check_remote`／`merge_key`／`needs_reconnect`（Pulse）、`overlay`／`filter_for_version`（Kairos）。
+- **`kairos-proto::release`**：`ssh-keygen -Y sign` 簽章（SSHSIG）的驗證與 `allowed_signers` 的解析（只接受 `ssh-ed25519`、`namespaces`／`valid-after`／`valid-before`，其他選項與 `cert-authority` 整行拒絕），以 ring 的 Ed25519／SHA-512 實作、**不呼叫系統的 `ssh-keygen`**；`SHA256SUMS` 的解析與比對、發佈檔名 `<名稱>-<版本>-<commit>-<os>-<arch>.<格式>`、發佈清單 `pulse-<版本>-<commit>-release.json` 的型別（`min_kairos`、`min_upgrade_from`、`remote_features`、`unit`、`breaking`）、SemVer 比較、REMOTE.md 第 4.2.2 節的驗證流程（`verify_bundle`、`check_artifact`，簽章 8401／其他 8402）與降版政策（`check_version_policy`）。測試向量 `crates/kairos-proto/testdata/release` 是以 OpenSSH 9.6 的 `ssh-keygen -Y sign -n kairos-pulse-release` 產生的真實簽章（與 RELEASING.md 第 3 節相同的參數）。
+- **發佈清單**（REMOTE.md R1 的清單部分）：Pulse 的打包另產生 `pulse-<版本>-<commit>-release.json`（`packaging/release-manifest.sh`，手動欄位在 `pulse/packaging/release-meta.toml`，unit 的雜湊取自 git 歷史），列在 `SHA256SUMS` 中、受同一個簽章保護；發佈檔由 20 個變為 21 個。`-dirty` 的建置不產生。`remote_features` 為 `["config", "upgrade"]`（P1／P2 已實作）。
+- **依賴**：沒有新增 crate（base64 為 crate 內的實作，Ed25519 與 SHA-512 用既有的 ring）；`Cargo.lock` 不變。
+- S1 階段 Kairos 與 Pulse 只做了編譯所需的調整（Kairos 一律回 `unknown_type`、`hello_ack` 不帶 `pending`；Pulse 忽略新的 server 訊息）；兩端的行為已分別由 K1／K2 與 P1／P2 取代。
+
+### 其他變更
+
+- `kairos db backup --include-keys` 一併加密備份 `data/privacy.key`。
+- 主控台 API 的 `downloads` 另有 `base_url`、`install_script`、`files`、`product_code`；模式的 `stats` 另有 `downloads_in_progress`。
+- 註冊服務每小時另外刪除「清冊中已沒有的主機」過期超過 1 天的憑證紀錄。
+- 測試掛鉤 `KAIROS_TEST_GRACE_SECS`（debug 建置）：過期寬限期以秒計；`KAIROS_TEST_REMOTE_START_GRACE_MS`：升級推送在啟動後不提議新主機的時間。
+- 內部重構（HA L1a，無行為變更）：Kairos 的儲存層改為領域 store 介面（`Store`／`Tx`），SQL 原封不動搬進 `store/sqlite/`，主控台、註冊、告警、PKI 與所有 CLI 不再直接使用 rusqlite（`kairos/STORAGE.md` 第 17 節）；schema、API 回應、錯誤代碼與 report 的寫入效能不變。
+
+### 規格（尚未實作）
+
+- **`kairos/HA.md`**（審計 A2，高可用）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址等分層設計與量測計畫；第 21 節的 20 項待決已決定（2026-10-19，採建議）。0.9.0 實作 L1a 儲存抽象與 L4 Pulse 多位址（L4 已包含於本草稿，見上方），PostgreSQL 後端與叢集協調在 0.10.0。STORAGE.md 的「限制與後續」連到 HA.md。
+- **`crates/kairos-proto/REMOTE.md`**（F8，集中設定與 agent 遠端升級）：第 14 節 D1～D18 已決定（2026-10-19，採建議）；0.9.0 實作 MVP（D15）。協定部分（第 2 節）已搬入 PROTOCOL.md，共用型別已實作（見上方「共用 crate：遠端管理的協定與信任鏈」）；Kairos 的行為（K1、K2，實作附註與差異見 REMOTE.md 第 13.1 節）與 Pulse 的行為（P1、P2，見 REMOTE.md 第 17 節）都已實作（見上方）；主控台畫面（W1）也已實作（見上方「主控台」）。
+
+### 新的產品代碼（設計包 `decisions/INTEGRATION.md` §31.3 正式分配）
+
+| 代碼 | 何時 |
+|---|---|
+| `KRS-E4311` | OTLP 推送失敗（連線、逾時、重試用完） |
+| `KRS-E4312` | OTLP collector 拒絕資料 |
+| `KRS-W4313` | OTLP 佇列已滿而丟棄資料點（`drop_policy`） |
+| `KRS-E4314` | 指標轉出的設定無效（`400 invalid_parameter`） |
+| `KRS-E4315` | Prometheus exporter 未啟用（`404 export_disabled`） |
+| `KRS-I4204` | 已刪除主機資料（日誌、稽核 `host.purge`） |
+| `KRS-E4205` | 無法刪除主機資料：仍連線中（409 `host_online`）、刪除沒有完成、找不到資料 |
+| `KRS-E4005` | 要求假名化但 `data/privacy.key` 無法使用，Kairos 不啟動 |
+| `PLS-W2301` | 連不上這個候選位址，改試下一個（不增加退避） |
+| `PLS-E2302` | 所有候選位址都連不上，依 `[retry]` 退避（列出每個位址最後的錯誤） |
+| `PLS-I8507` | 收到 `drain`，改連下一個候選位址 |
+| `KRS-I8507` | 關機時對協商了 `cluster` 的連線送出 `drain`（關機日誌） |
+| `KRS-W2012` | `enroll.download_dir` 不完整（缺 `pulse-install.sh`、`SHA256SUMS` 或 `SHA256SUMS.sig`） |
+| `KRS-E0502` | 設定檔的內容不合法（400 `config_invalid`） |
+| `KRS-W0501`、`KRS-I0503`、`KRS-W0504`、`KRS-I0505` | Pulse 回報下發的設定被拒、有鍵被本機覆蓋、套用後已回復、集中設定在主機上停用（鏡像 `PLS-*`；日誌） |
+| `KRS-E8401` | Pulse 回報發佈包的簽章驗證失敗（稽核 `host.upgrade.signature_failed`，推送自動暫停） |
+| `KRS-W8402` | 回報升級成功但版本不是目標版本（主機標為失敗） |
+| `KRS-W8407`、`KRS-E8408` | 主機已自動回滾、回滾失敗需要人工處理（稽核；回滾失敗時推送自動暫停） |
+| `KRS-E8413` | 匯入發佈版本失敗（簽章、雜湊、清單、檔案不在 `SHA256SUMS` 中；400 `release_signature_invalid`／`release_invalid`／`artifact_*`） |
+| `KRS-W8414` | 推送已自動暫停（失敗比例、回滾失敗、簽章失敗） |
+| `KRS-W8415` | 目標版本與目前的 Kairos 不相容（`min_kairos`；400 `incompatible_release`） |
+| `KRS-I8416` | 主機已升級完成（日誌） |
+| `PLS-W0501`、`PLS-I0503`、`PLS-W0504`、`PLS-I0505`、`PLS-E0506` | 集中設定：整份拒絕、本機覆蓋、確認失敗已回復、本機停用、快取無法使用（`pulse/ERROR-CODES.md` 2.9） |
+| `PLS-E8401`～`PLS-W8412`、`PLS-I8416` | 遠端升級：簽章、雜湊與平台、信任錨、下載重試、預檢、替換、已回滾、回滾失敗、本機停用、拒絕降版、不支援、空間不足、升級完成（`pulse/ERROR-CODES.md` 2.9；Kairos 端的鏡像代碼見上方 `KRS-*`） |
+
+新增子類別 23「多伺服器位址與叢集連線」、85「叢集與高可用」（另有 F8 與 0.10 用的 05、44、84）；HA 與 F8 原本都暫定使用子類別 84，§31 把 84 給 F8 遠端升級、叢集改為 85（同尾號），因此排空的代碼由工程暫定的 `KRS-I8407`／`PLS-I8407` 改為 **`KRS-I8507`／`PLS-I8507`**；其餘號碼與工程暫定的相同。Pulse 日誌事件 `conn.failover`、`conn.drain` 的 Windows 事件識別碼為 2005、2007。代碼總數 221 → 287（Kairos 152、Pulse 135，含 0.10 與 F8 的已分配代碼）。
+
+### 已知限制
+
+- OTLP 只支援 HTTP＋protobuf（不做 gRPC、不壓縮）；主機指標名稱沿用 OpenTelemetry 的名稱，不加 `kairos_` 前綴（只有 `kairos_host_*`、`kairos_exporter_*` 與行程排行帶前綴）。
+- 假名化不可逆（沒有「顯示原名」）；改變 `[privacy]` 只影響之後收到的資料（PRIVACY.md 第 2.2 節）。
+- 刪除主機資料不涵蓋日誌、JSONL 鏡像、備份與已送出的通知；`kairos hosts purge` 需要停止 Kairos。
+- 外部 CA 簽發、匯入的憑證撤銷後，已連線中的主機在下一次重新連線時才被拒。
+- 遠端升級（Pulse 0.9.0）只支援 Linux；Windows 的 MSI／zip、外部 URL 下載、推送的維護時段與雙人覆核在 0.10.0。0.8 → 0.9 必須手動升級一次。
+- 遠端升級的系統層驗證（REMOTE.md 第 12.3 節：systemd 容器中實際安裝 deb／rpm、`pulse-upgrade.path` 觸發、重新開機後接續）尚未執行；輔助程式以假的 systemd 與套件管理員驗證（`remote::upgrade::helper::tests`），集中設定以實際的 Kairos 與 Pulse 互通驗證（`tests/e2e/tests/remote_interop.rs`），升級流程的兩端分別以假 client（`remote.rs`）與假 Kairos（`network::tests::mgmt`）驗證，沒有實際兩端互通的升級測試。
+- 刪除主機資料沒有雙人覆核（設計包的選項，之後與其他雙人覆核一起做）。
+- 遠端管理（F8 MVP）：Windows 的遠端升級、維護時段（推送的 `schedule`／`windows`）、雙人覆核（`rollouts:approve`、`KRS-E6106`）、外部 URL 的版本庫、自訂批次（多於兩批）在 0.10.0；`kairos releases` 的 CLI、SSE `rollout.host`與升級中主機的離線告警抑制尚未提供（REMOTE.md 第 13.1 節）。降版推送的 L3 確認不要求重新驗證密碼（設計包 §31.12 #7）。主控台尚未提供：S20 系統健康的「遠端管理」列、S04 agent 版本欄的「低於建議版本」、全域搜尋的推送與設定檔。
+
+### 測試
+
+- 指標轉出：`export::tests`（假的 collector：semconv 名稱與 resource、標頭、重試與 `Retry-After`、TLS 驗證、佇列上限與丟棄策略、回填不覆蓋最新值、刪除主機時丟棄、主控台端點與權限）、`export::prom::tests`（OTel → Prometheus 名稱、text 0.0.4 與 OpenMetrics 以 `kp_obs::prom::parse` 嚴格解析）、`export::settings::tests`（環境變數 ＞ 主控台 ＞ 設定檔 ＞ 預設、標頭加密）、`config::export::tests`；端對端 `tests/e2e/tests/export.rs`（實際的 Kairos 與 Pulse、Prometheus 抓取、OTLP 推送到假 collector、Pulse 結束後 `kairos_host_up` 為 0）；主控台 `e2e-export.mjs`。
+- 單元：`privacy::tests`（位址截斷、假名、命令列遮蔽、行程與資產的轉換、金鑰檔）、`store::purge::tests`、`privacy_cli::tests`、`pki::queue::import_tests`、`enroll::downloads::tests`、Pulse 的 `rate_limits_before_the_request_are_waited_out`。
+- 整合：`integration_tests::privacy_policy_is_applied_before_anything_is_stored`、`api::privacy_tests::purge_and_personal_data_over_https`。
+- 端對端（`tests/e2e`）：`privacy.rs`（假名與網段、主控台與 CLI 的刪除、個資匯出）、`enroll.rs` 的 `grace_period_is_enforced_and_an_override_extends_it`（ENROLL.md 第 19.3 節 #14）、`manually_issued_certificate_is_imported_and_revocation_takes_effect`、`download_endpoint_serves_the_release_files`。
+- 主控台（Playwright＋axe）：`e2e-privacy.mjs`（S05 的權限、仍連線中、匯出、L2 刪除；S12 一行指令；S14 匯入），`e2e-rbac.mjs` 加入新按鈕與端點。
+- 主控台的 Pulse 管理：`e2e-remote.mjs`（版本庫的匯入與簽章錯誤、推送的 L2 送出與暫停／繼續／取消、集中設定的設定檔／指派／版本與回復、主機頁的篩選與「設定」「升級」、稽核員與唯讀的權限、功能關閉）；`e2e-rbac.mjs` 加入「Pulse 管理」的頁面、按鈕與 11 個寫入端點。
+- Pulse 多位址與 `cluster`：Pulse 的候選清單、輪替與 `drain` 處理、`status`／`check-config`／`diag` 的顯示，Kairos 的 `hello_ack.server_node`、關機排空與 `[cluster] node_id`，`kairos-proto` 的 `cluster` 型別與測試向量；端對端：兩個 Kairos 的換節點與排空。
+- 端對端測試的連接埠（`tests/e2e`）：`free_port()` 原本綁定 0 後立即釋放、等 Kairos 之後再綁定，作業系統分配的臨時埠可能在空檔被同時執行的其他測試的連線搶走（偶發 `Address already in use`）。改為從臨時埠範圍之外挑選、同一個測試行程內不重複，並以綁定但不監聽的 socket 佔住到 Kairos 啟動前一刻；Kairos 仍因連接埠被佔用而結束（結束代碼 11）時，等到可以綁定後以相同設定重新啟動（最多 3 次，`start_kairos`）。另修正 `manually_issued_certificate_is_imported_and_revocation_takes_effect` 在回應之後才檢查日誌的競態（改為等待 `KRS-W1105` 出現）。
+- 遠端管理的共用型別（`kairos-proto`）：PROTOCOL.md「範例／遠端管理」的 18 則測試向量（含真實的 `SHA256SUMS`、簽章、清單與分段資料，`upgrade_offer` 的向量以測試的 `allowed_signers` 驗證到底）、`mgmt::tests`（協商、`pending` 的容錯、`install`、各訊息的限制、正規化 JSON、白名單與 REMOTE.md 第 3.1 節一致、合併與隱私規則）、`release::tests`（`ssh-keygen` 產生的正確簽章、錯誤 namespace、錯誤金鑰、`hashalg=sha256`、被修改的 `SHA256SUMS`、`valid-after`／`valid-before`、`cert-authority` 與 RSA 等被拒絕的行、客戶重新簽署的 principal、`SHA256SUMS`、檔名、清單、SemVer 先後順序、降版政策）。
+- 遠端管理（Kairos K1／K2）：`remote::desired::tests`（選擇器、依優先序合併與來源、到期、相同優先序的衝突、設定檔的檢查與正規化、影響與 `impact_token`、設定狀態的分類、白名單）、`remote::releases::tests`（`ssh-keygen` 的測試向量、另一把金鑰、錯誤 namespace、被修改的 `SHA256SUMS` 與清單、上傳的雜湊與改名、分段讀取）、`remote::rollout::tests`（推送內容的檢查、資格分類、分批與 canary、推送引擎：提議上限與啟動後 1 分鐘、逾時、`server_lost`、離線寬限、失敗比例、觀察期與人工繼續、完成）、`remote::tests`（暫存資料庫與假的時鐘：只有雜湊改變的主機更新 `desired_rev`、`config_status` 不倒退、影響 1,000 台的 `impact_token`、到期指派、hello 的標籤、版本庫的驗證與使用中、推送的提議／下載／回報／自動暫停／重試／取消、回滾失敗與標記、下載名額、SSE 事件；測試用的簽章以 ring 產生 SSHSIG）、`integration_tests` 的 `mgmt_features_need_mtls_sqlite_and_the_client_declaring_them`、`central_config_round_trip_over_mtls`、`remote_upgrade_offer_download_and_status_over_mtls`（真實的 TLS 連線，提議以 Pulse 端的 `verify_bundle` 驗證到底）、`api::remote_tests`（端點、權限、L2 確認、主機清單的篩選）、`auth_tests::every_role_is_denied_what_it_lacks` 加入 F8 的端點、`rbac::tests::remote_management_permissions_follow_the_design_matrix`；端對端 `tests/e2e/tests/remote.rs`（實際的 Kairos 執行檔、測試向量的發佈，以假 client 模擬 Pulse 0.9.0 走完集中設定與升級推送；測試掛鉤 `KAIROS_TEST_REMOTE_START_GRACE_MS`）。
+- 集中設定與遠端升級（Pulse P1／P2）：`remote::config::tests`（合併順序、聯集與隱私規則、只能在本機改的鍵、整份拒絕與鍵之間的矛盾、快取的寫入與重新啟動、雜湊不符與快取竄改、確認期與 3 次失敗回復、崩潰保護、重新啟動後接續確認、本機停用只通知一次、舊版 Kairos 不使用快取、`config_rev = 0`、快取無法寫入）、`remote::install::tests`（安裝方式偵測的順序、遠端升級就緒的每個條件、信任錨的擁有者／權限／符號連結／大小）、`remote::upgrade::tests`（以 `kairos-proto/testdata/release` 的真實簽章模擬提議：下載、驗證、暫存、交付前再確認、交付、重新啟動後回報；本機政策的每種拒絕；簽章、清單、雜湊與平台錯誤；3 次雜湊不符；`rate_limited`、續傳與取消；時段與確認期；同一版的新提議沿用暫存；推送取消時不從暫存替換）、`remote::upgrade::helper::tests`（以臨時金鑰簽署的發佈、假的 systemd 與套件管理員：tar 替換與 unit 判斷、崩潰／逾時／結束代碼 3 回滾、回滾失敗、預檢失敗、重新驗證拒絕換掉的檔案與連結、降版與停用、無效的請求、deb 鎖住重試與兩種回滾、rpm、重新開機後接續、unit 檔指向的路徑）、`network::tests::mgmt`（記憶體內的假 Kairos：hello 的 `install` 與 features、集中設定與升級的完整流程、需要重新連線的鍵、舊版 Kairos、durable 連線上回應順序的對應），每一則送出的訊息都以 `kairos-proto` 的 Kairos 端驗證檢查；端對端 `tests/e2e/tests/remote_config.rs`（實際的 pulse 執行檔與測試內的假 Kairos：即時套用、快取、恢復後不重複取得、舊版 Kairos）。
+- 集中設定的兩端互通（K1 × P1）：端對端 `tests/e2e/tests/remote_interop.rs`（實際的 Kairos 與實際的 Pulse，SQLite、mTLS）：hello 協商 `config` 並記錄 `install`；以主控台 API 建立設定檔並指派給主機 → Pulse 取得、即時套用（`report_interval_ms`，連線不中斷）並回報，本機 `pulse.toml` 的鍵列為 `overridden`（Kairos 顯示 `overridden`）；修改設定檔後套用新版、`pulse config show --effective` 讀快取；刪除指派後回到第 0 版與內建預設。
+- 個資保護 × 指標轉出（整合）：`integration_tests::exported_metrics_only_carry_privacy_transformed_values`（假名化、網段、命令列遮蔽下的 Prometheus 輸出與 OTLP payload 不含原始主機名稱、顯示名稱、完整來源位址、執行身分與密碼）、`api::privacy_tests::purge_and_personal_data_over_https`（刪除後 hub 的最新值與 OTLP 佇列清空）、`e2e-rbac.mjs` 的指標轉出寫入端點 403。
 
 ## [0.8.0] - 2026-10-16
 

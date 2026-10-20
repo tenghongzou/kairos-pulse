@@ -362,7 +362,7 @@ revoke_superseded = true           # 新憑證第一次 hello 後以 superseded 
    - **維持離線**：`pki.mode = "offline"`，註冊與核准在線上完成，簽發用第 6 節的匯出／匯入（代理 CA 私鑰不離開管理主機）。
    - **改為線上**：`kairos pki issuing-ca new` → 在管理主機以**代理 CA** 簽發（代理 CA 在此扮演根 CA）→ `install`、`activate`；`pki.mode = "online"`。舊的手動憑證繼續有效（代理 CA 仍在 `auth.client_ca`），到期前由 8443 的 `renew` 換成線上簽發的憑證。
 4. 設定 `[enroll]`（`mode = "open"` 或 `renew_only`），開放 8444 的防火牆。
-5. 手動簽發的既有憑證可以 `kairos pki certificates import <目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；本版尚未實作，第 13 節）；不匯入也能連線。
+5. 手動簽發的既有憑證可以 `kairos pki certificates import <檔案或目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；0.9.0 起，第 16 節）；不匯入也能連線。
 
 ## 10. 簽發流程（Kairos 內部）
 
@@ -439,7 +439,7 @@ KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_
 | 8 | 列表的游標分頁 | 註冊與憑證的管理端點以 `limit`（1～1,000）回傳前 N 筆與總數，`next_cursor` 一律為 `null`（之後加入） |
 | 9 | 8443 的 `renew`／`deregister` 訊息 | 0.5.0 整合時已移入 `kairos-proto`（PROTOCOL.md「憑證輪替與除役」），兩個產品使用共用型別（第 14 節） |
 
-**延後**：`kairos pki certificates import`（手動憑證匯入簽發紀錄）、離線模式的 CRL 上傳（`kairos pki crl upload` 與 `POST /api/v1/pki/crl`；0.8.0 起 `kairos pki revocations export`、`kairos pki gencrl --revocations` 已實作，產生的 CRL 以 `auth.crl` 部署，第 15 節）、`GET /api/v1/pki/revocations/export`、下載端點（`/agent/`，回 404；主控台 API 的 `downloads.available = false`）、暫時放寬的管理（`enroll_relaxations` 只有讀取）、解除 L7 封鎖的端點、L11、S20 系統健康的「註冊端點」區塊（計數先放在 `GET /api/v1/enroll/mode` 的 `stats`）、`KRS-W2009`、`KRS-W1115` 的彙總事件。
+**延後**：離線模式的 CRL 上傳（`kairos pki crl upload` 與 `POST /api/v1/pki/crl`；0.8.0 起 `kairos pki revocations export`、`kairos pki gencrl --revocations` 已實作，產生的 CRL 以 `auth.crl` 部署，第 15 節）、`GET /api/v1/pki/revocations/export`、暫時放寬的管理（`enroll_relaxations` 只有讀取）、解除 L7 封鎖的端點、S20 系統健康的「註冊端點」區塊（計數先放在 `GET /api/v1/enroll/mode` 的 `stats`）、`KRS-W2009`、`KRS-W1115` 的彙總事件。
 
 ## 14. 與 Pulse 端合併（已完成，0.5.0 整合）
 
@@ -528,3 +528,29 @@ server_ca_path = "data/pki/root-ca.pem"
 |---|---|---|
 | `KRS-W1306` | 警告 | `pki init` 完成時：根 CA 私鑰仍在這台伺服器上 |
 | `KRS-E1307` | 錯誤 | `pki sign`、離線 `pki gencrl`：CA 憑證或私鑰無法使用（權限過寬、不成對、不是 CA、沒有 `keyCertSign`／`cRLSign`、已過期、格式不支援） |
+
+## 16. 手動簽發憑證的匯入（0.9.0〔草稿〕）
+
+既有部署以外部 CA（INSTALL 舊版的 openssl、組織的 CA，或 `kairos pki sign --profile client`）直接簽發的用戶端憑證，可以匯入簽發紀錄（`pki_certificates`，`issued_via = import`），之後出現在 S14 的清單、可以撤銷，過期續簽以它判斷「最新的憑證」（第 13 節第 4 項）。實作 `pki/queue.rs` 的 `import_existing`；不需要 schema 變更。
+
+```bash
+kairos pki certificates import /etc/kairos/manual-certs/ --config /opt/kairos/kairos.toml
+kairos pki certificates import host-07.pem --agent-id 6f1c0e4a-1b2c-4d3e-9f00-112233445566 --json
+```
+
+- 也可以用 `POST /api/v1/pki/certificates/import`（`pki.queue:manage`，API.md 第 15.1 節）或主控台「憑證 › 匯入憑證」（貼上 PEM）。Kairos 執行中也可以（短交易，與 `kairos enroll approve` 相同）。
+- **檢查**（不通過時以 `KRS-E1305` 列出原因，其他憑證照常匯入）：由目前的信任錨（`auth.client_ca` 檔案中的 CA 或 Kairos 的簽發 CA）**直接**簽發（與過期續簽相同：Pulse 只送出用戶端憑證）；不是 CA；有 EKU 時必須含 `clientAuth`；SAN 恰好一個 DNS 名稱且是 UUID（`agent_id`），CN 有的話等於它；序號沒有被另一張憑證使用（同一張再匯入為 `already_imported`）。已過期的憑證也可以匯入（標示 `expired`）。
+- **與線上簽發、RSA 根 CA 的關係**：檔案可以是 PEM（可含多張）或單張 DER。外部 CA 可以是 RSA（第 1 節第 4 項：既有的 RSA 根 CA 照用）；簽發者是 Kairos 的簽發 CA 時記下 `ca_id`，否則 `ca_id` 為 NULL。
+- **清冊**：沒有這台主機時新增最小的一列（主機名稱暫為 `agent_id`、`source = 'cert_import'`、離線），主機第一次連線後由清冊同步更新；有的話在這張比現有的最新憑證晚到期時更新 `current_serial`。
+- **撤銷**：在 S14、`kairos pki revoke` 照常撤銷。由 Kairos 的簽發 CA 簽發的憑證進入 Kairos 產生的 CRL；**外部 CA 簽發的憑證不在 Kairos 的 CRL 中**，因此註冊服務每 2 秒從資料庫更新「已撤銷的外部憑證」清單，8443 在 hello 時以 `certificate_rejected` 拒絕（`KRS-W1105`）。已經連線中的主機在下一次重新連線時被拒；需要立即中斷或讓外部 CA 的 CRL 也生效時，以 `kairos pki revocations export --ca-cert <外部 CA>` 匯出撤銷清單，在 CA 主機產生 CRL 後以 `auth.crl` 部署（第 15.3 節）。
+- 測試：`pki::queue::import_tests`、端對端 `tests/e2e/tests/enroll.rs` 的 `manually_issued_certificate_is_imported_and_revocation_takes_effect`。
+
+## 17. 下載端點（0.9.0〔草稿〕）
+
+`enroll.download_dir` 設定後，8444 的 `GET /agent/<檔名>` 從這個目錄提供 Pulse 的發佈檔案（ENROLL.md 第 19.4 節第 3 項，實作 `enroll/downloads.rs`）：
+
+- 只提供目錄中的一般檔案：檔名白名單沿用 `parse_route`（英數字與 `. _ -`、不以 `.` 開頭，沒有 `/`、`..`、百分比編碼），不跟隨符號連結、不進入子目錄，大小上限 1 GiB；不符合的一律 404。
+- 內容類型依副檔名（`.sh`、`.deb`、`.rpm`、`.msi`、`.zip`、`.tar.gz`、`SHA256SUMS`、`.sig`…），`X-Content-Type-Options: nosniff`、`Content-Disposition: attachment`；`SHA256SUMS`、`SHA256SUMS.sig`、`pulse-install.sh` 為 `Cache-Control: no-cache`，其他 `public, max-age=3600`；`ETag`、`Last-Modified`，`If-None-Match` 相符時 304；`HEAD` 只回標頭；以串流送出。
+- L11：每個來源同時 `enroll.max_downloads_per_ip`（批次部署來源乘以倍率）、全部 `enroll.max_downloads` 個，超過 429（`scope: download`，`Retry-After: 15`）。註冊端點為僅續簽或自動暫停時 403。
+- **完整性不依賴 Kairos**：`pulse-install.sh` 以另外取得的發佈公鑰驗證 `SHA256SUMS.sig`，再以 `SHA256SUMS` 驗證套件。8444 的伺服器憑證由 Kairos 的根 CA 簽發，安裝腳本以 `--ca-file <根 CA>` 驗證 HTTPS（`pulse/packaging/INSTALL.md`）。
+- 主控台 API 的 `downloads.available` 在目錄有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 時為 `true`，S12 據此顯示一行安裝指令；設定了目錄但不完整時啟動記`KRS-W2012`。

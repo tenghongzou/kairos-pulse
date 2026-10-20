@@ -38,6 +38,11 @@ function ms(v) {
   return v ? Date.parse(v) : null;
 }
 
+/** 外部 CA 簽發、匯入的憑證（ca_id 為 null；不在 Kairos 的 CRL 中，撤銷在下一次重新連線時才生效，PKI.md 第 16 節） */
+function isExternal(c) {
+  return c.issued_via === 'import' && c.ca_id == null;
+}
+
 /** 主機的名稱（沒有時 agent_id 前 8 碼） */
 function hostText(c) {
   return c.hostname || shortId(c.agent_id);
@@ -293,7 +298,7 @@ export function render(ctx) {
       phrase,
       size: 'lg',
       errorTitle: t('cert.revoke.failed'),
-      content: [targets, reason.el, comment.el],
+      content: [targets, list.some(isExternal) ? inlineAlert({ kind: 'info', body: t('cert.import.externalNote') }) : null, reason.el, comment.el].filter(Boolean),
       collect() {
         const text = comment.input.value.trim();
         comment.el.setError(text ? '' : t('cert.revoke.commentRequired'));
@@ -521,8 +526,43 @@ export function render(ctx) {
     }
   }
 
+  // 手動簽發（外部 CA）的既有憑證匯入簽發紀錄（POST /api/v1/pki/certificates/import；PKI.md 第 16 節）
+  async function importCertificates() {
+    const f = textareaField({ label: t('cert.import.pem'), name: 'pem', rows: 8, mono: true, required: true });
+    const r = await actionDialog({
+      title: t('cert.import.title'),
+      size: 'md',
+      confirmText: t('cert.import.submit'),
+      // 底部固定說明（設計包 S14「0.9 規格」）：外部 CA 簽發的憑證撤銷後，下一次重新連線時才被拒絕
+      content: [h('p', null, t('cert.import.body')), f.el, inlineAlert({ kind: 'info', body: t('cert.import.externalNote') })],
+      collect: () => {
+        const v = f.input.value.trim();
+        if (!v.includes('BEGIN CERTIFICATE')) {
+          f.el.setError(t('cert.import.empty'));
+          f.input.focus();
+          return null;
+        }
+        f.el.setError('');
+        return { pem: v };
+      },
+      submit: (v) => api('/api/v1/pki/certificates/import', { method: 'POST', body: { certificates: v.pem } }),
+      errorTitle: t('cert.import.failed'),
+    });
+    if (!r || r === true) return;
+    const s = r.summary || {};
+    const bad = (r.results || []).filter((x) => x.result === 'rejected');
+    const text = t('cert.import.done', { ok: fmt.num(s.imported || 0), already: fmt.num(s.already_imported || 0), rejected: fmt.num(s.rejected || 0) });
+    showResult(bad.length ? `${text}：${bad.slice(0, 3).map((x) => t('cert.import.rejected', { source: x.source, reason: x.reason })).join('、')}` : text);
+    toast({ kind: bad.length ? 'warning' : 'success', title: text });
+    reload({ keepResult: true });
+    loadKpis();
+  }
+
   // ---- 載入 ----
-  mount(root, pageHead({ title: t('cert.title') }), kpis, alerts, filterbar, result, bulkbar, listBox);
+  const importBtn = session.can('pki.queue:manage')
+    ? h('button', { type: 'button', class: 'ds-button ds-button--secondary', id: 'cert-import', on: { click: () => importCertificates() } }, icon('upload'), t('cert.import'))
+    : null;
+  mount(root, pageHead({ title: t('cert.title'), actions: importBtn }), kpis, alerts, filterbar, result, bulkbar, listBox);
 
   async function loadKpis() {
     mount(kpis, ['valid', 'expiring', 'revoked', 'revocation_pending', 'crl'].map((k) => kpiSkeleton(t(`cert.kpi.${k}`))));

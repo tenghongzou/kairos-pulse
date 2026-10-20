@@ -271,6 +271,9 @@ pub fn validate_host_info(host: &HostInfo) -> Result<(), String> {
             }
         }
     }
+    if let Some(install) = &host.install {
+        crate::mgmt::validate_install(install)?;
+    }
     Ok(())
 }
 
@@ -291,6 +294,9 @@ pub fn validate_durable_seq(seq: &DurableSeq) -> Result<(), String> {
 ///   agents.json；R2-K8）。不要求 RFC 3339：規格只把 `ts` 定義為參考用字串，伺服器不解析它。
 /// - report 至少要符合一種格式（v1 三欄位或 v2 的 `metrics`）的型別；兩者都不符時回傳 v1 格式的
 ///   錯誤說明（與 v1 Kairos 相同）。連線實際使用哪一種格式由協商結果決定，在註冊後檢查。
+/// - 遠端管理的訊息（`config_status`、`upgrade_get`、`upgrade_chunk_get`、`upgrade_status`）另依
+///   [`mgmt`](crate::mgmt) 的限制檢查。沒有協商對應 feature 時，伺服器把違反限制的這些訊息也當成
+///   不認得的 `type`（與 `renew_request` 相同）。
 pub fn validate_client_msg(msg: &ClientMsg) -> Result<(), String> {
     let ts = match msg {
         ClientMsg::Hello { ts, .. } | ClientMsg::Heartbeat { ts, .. } => ts,
@@ -303,6 +309,23 @@ pub fn validate_client_msg(msg: &ClientMsg) -> Result<(), String> {
         ClientMsg::RenewRequest(r) => &r.ts,
         ClientMsg::Deregister(d) => &d.ts,
         ClientMsg::Inventory(i) => &i.ts,
+        ClientMsg::ConfigGet(g) => &g.ts,
+        ClientMsg::ConfigStatus(s) => {
+            crate::mgmt::validate_config_status(s)?;
+            &s.ts
+        }
+        ClientMsg::UpgradeGet(g) => {
+            crate::mgmt::validate_upgrade_get(g)?;
+            &g.ts
+        }
+        ClientMsg::UpgradeChunkGet(g) => {
+            crate::mgmt::validate_upgrade_chunk_get(g)?;
+            &g.ts
+        }
+        ClientMsg::UpgradeStatus(s) => {
+            crate::mgmt::validate_upgrade_status(s)?;
+            &s.ts
+        }
         ClientMsg::Unknown => return Ok(()),
     };
     if ts.len() > MAX_TS_BYTES {

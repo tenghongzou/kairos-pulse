@@ -23,6 +23,7 @@ use crate::pki::issue::Reason;
 use crate::pki::store as ps;
 use crate::settings;
 use crate::storage::fmt_time;
+use crate::store::prelude::*;
 use crate::token_cli::{
     Failure, Output, db_failure, human_time, human_time_zoned, open, operator, relative, table,
     zone_label,
@@ -86,6 +87,7 @@ pub const PKI_USAGE: &str = "kairos pki — 簽發 CA、憑證與 CRL（kairos/P
   kairos pki issuing-ca activate <ca_id>
   kairos pki issuing-ca retire <ca_id> --confirm \"重建 CA\" [--compromised]
   kairos pki certificates list [--state <狀態>] [--expires-within <時間>]
+  kairos pki certificates import <憑證檔或目錄>... [--agent-id <agent_id>]（手動簽發的既有憑證匯入簽發紀錄）
   kairos pki revoke <序號 | agent_id>... --reason <原因> --comment <說明> [--yes --expect-count <N>]
   kairos pki queue export [--out <檔案>]
   kairos pki queue import <檔案>
@@ -127,6 +129,8 @@ pub enum Group {
     Enroll,
     Pki,
     Config,
+    /// `kairos hosts purge|export|pseudonym`（[`crate::privacy_cli`]）
+    Hosts,
 }
 
 /// 解析後的命令
@@ -144,8 +148,9 @@ pub struct Cmd {
     pub help: bool,
 }
 
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "--yes",
+    "--dry-run",
     "--all",
     "--closed",
     "--batch",
@@ -187,6 +192,7 @@ impl Cmd {
             Group::Enroll => "enroll",
             Group::Pki => "pki",
             Group::Config => "config",
+            Group::Hosts => "hosts",
         };
         let action = match (self.group, self.sub(0), self.sub(1)) {
             (
@@ -265,6 +271,7 @@ fn usage(group: Group) -> &'static str {
         Group::Enroll => ENROLL_USAGE,
         Group::Pki => PKI_USAGE,
         Group::Config => CONFIG_USAGE,
+        Group::Hosts => crate::privacy_cli::USAGE,
     }
 }
 
@@ -299,7 +306,7 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<AppConfig, Failure> {
     })
 }
 
-pub(crate) fn db(cmd: &Cmd) -> Result<rusqlite::Connection, Failure> {
+pub(crate) fn db(cmd: &Cmd) -> Result<DbHandle, Failure> {
     match open(cmd.config_path.as_deref(), true)? {
         Some(c) => Ok(c),
         None => Err(db_failure("資料庫不存在")),
@@ -337,6 +344,7 @@ pub fn execute(cmd: &Cmd, env: &mut Env<'_>) -> Output {
         Group::Enroll => enroll_cmd(cmd, env),
         Group::Pki => pki_cmd(cmd, env),
         Group::Config => config_cmd(cmd, env),
+        Group::Hosts => crate::privacy_cli::execute(cmd, env),
     };
     match result {
         Ok(out) => out,
@@ -484,9 +492,9 @@ fn token_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 cert_lifetime_days: int_opt(cmd, "--cert-days")?,
             };
             let config = load_config(cmd.config_path.as_deref())?;
-            let mut conn = db(cmd)?;
-            let created = ops::create_token(&mut conn, &input, &operator(), None, now_ms)
-                .map_err(op_failure)?;
+            let conn = db(cmd)?;
+            let created =
+                ops::create_token(&*conn, &input, &operator(), None, now_ms).map_err(op_failure)?;
             let token = created.token.canonical();
             let (install, pin) = install_info(&config, &token, created.row.tags.clone());
             if cmd.json {
@@ -532,7 +540,7 @@ fn token_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 cmd.opt("--state").unwrap_or("active").to_string()
             };
             let conn = db(cmd)?;
-            let rows = store::list_tokens(&conn).map_err(db_failure)?;
+            let rows = conn.list_tokens().map_err(db_failure)?;
             let shown: Vec<_> = rows
                 .iter()
                 .filter(|t| state == "all" || t.state(now_ms).as_str() == state)
@@ -581,18 +589,16 @@ fn token_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         Some("show") => {
             let id = cmd.sub(1).ok_or_else(|| usage_err("需要 token_id"))?;
             let conn = db(cmd)?;
-            let t = store::get_token(&conn, id)
-                .map_err(db_failure)?
-                .ok_or_else(|| {
-                    Failure::new(
-                        format!("找不到註冊 token {id}"),
-                        "資料庫中沒有這個 token_id",
-                        Vec::new(),
-                        EXIT_GENERAL,
-                    )
-                })?;
+            let t = conn.get_token(id).map_err(db_failure)?.ok_or_else(|| {
+                Failure::new(
+                    format!("找不到註冊 token {id}"),
+                    "資料庫中沒有這個 token_id",
+                    Vec::new(),
+                    EXIT_GENERAL,
+                )
+            })?;
             let mut v = ops::token_json(&t, now_ms);
-            v["progress"] = ops::token_progress(&conn, id).map_err(op_failure)?;
+            v["progress"] = ops::token_progress(&*conn, id).map_err(op_failure)?;
             if cmd.json {
                 return Ok(ok_json(cmd, env.now, v));
             }
@@ -637,16 +643,10 @@ fn token_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     ));
                 }
             }
-            let mut conn = db(cmd)?;
-            let (row, already) = ops::disable_token(
-                &mut conn,
-                id,
-                &operator(),
-                None,
-                cmd.opt("--reason"),
-                now_ms,
-            )
-            .map_err(op_failure)?;
+            let conn = db(cmd)?;
+            let (row, already) =
+                ops::disable_token(&*conn, id, &operator(), None, cmd.opt("--reason"), now_ms)
+                    .map_err(op_failure)?;
             if cmd.json {
                 let mut v = ops::token_json(&row, now_ms);
                 v["already_disabled"] = json!(already);
@@ -687,7 +687,7 @@ fn token_state_label(s: store::TokenState) -> &'static str {
 // enroll
 // ---------------------------------------------------------------------------
 
-fn resolve_all(conn: &rusqlite::Connection, inputs: &[String]) -> Result<Vec<String>, Failure> {
+fn resolve_all(conn: &dyn Store, inputs: &[String]) -> Result<Vec<String>, Failure> {
     let mut out = Vec::new();
     for i in inputs {
         match ops::resolve_request(conn, i).map_err(op_failure)? {
@@ -732,7 +732,8 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 limit: 100_000,
             };
             let flag = cmd.opt("--flag");
-            let rows: Vec<_> = store::list_requests(&conn, &filter)
+            let rows: Vec<_> = conn
+                .list_requests(&filter)
                 .map_err(db_failure)?
                 .into_iter()
                 .filter(|r| match flag {
@@ -799,8 +800,9 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 .sub(1)
                 .ok_or_else(|| usage_err("需要 request_id 或申請編號"))?;
             let conn = db(cmd)?;
-            let id = resolve_all(&conn, &[input.to_string()])?.remove(0);
-            let r = store::get_request(&conn, &id)
+            let id = resolve_all(&*conn, &[input.to_string()])?.remove(0);
+            let r = conn
+                .get_request(&id)
                 .map_err(db_failure)?
                 .ok_or_else(|| db_failure("申請已不存在"))?;
             let v = ops::request_json(&r);
@@ -830,8 +832,8 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             })
         }
         Some("approve") => {
-            let mut conn = db(cmd)?;
-            let mut ids = resolve_all(&conn, &cmd.args[1..])?;
+            let conn = db(cmd)?;
+            let mut ids = resolve_all(&*conn, &cmd.args[1..])?;
             if cmd.flag("--all-clean") {
                 let token = cmd
                     .opt("--token")
@@ -844,7 +846,7 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     limit: 100_000,
                 };
                 ids.extend(
-                    store::list_requests(&conn, &filter)
+                    conn.list_requests(&filter)
                         .map_err(db_failure)?
                         .into_iter()
                         .filter(|r| r.flags.is_empty())
@@ -875,7 +877,7 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 }
             }
             let lifetime = int_opt(cmd, "--cert-days")?;
-            let results = ops::approve(&mut conn, &ids, &operator(), None, lifetime, now_ms)
+            let results = ops::approve(&*conn, &ids, &operator(), None, lifetime, now_ms)
                 .map_err(op_failure)?;
             decisions_output(cmd, env, "核准", results)
         }
@@ -883,8 +885,8 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let reason = cmd
                 .opt("--reason")
                 .ok_or_else(|| usage_err("--reason 必填"))?;
-            let mut conn = db(cmd)?;
-            let ids = resolve_all(&conn, &cmd.args[1..])?;
+            let conn = db(cmd)?;
+            let ids = resolve_all(&*conn, &cmd.args[1..])?;
             if ids.is_empty() {
                 return Err(usage_err("需要至少一筆申請"));
             }
@@ -916,7 +918,7 @@ fn enroll_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 }
             }
             let code = cmd.opt("--reason-code").unwrap_or("other");
-            let results = ops::reject(&mut conn, &ids, &operator(), None, code, reason, now_ms)
+            let results = ops::reject(&*conn, &ids, &operator(), None, code, reason, now_ms)
                 .map_err(op_failure)?;
             decisions_output(cmd, env, "拒絕", results)
         }
@@ -969,8 +971,8 @@ fn decisions_output(
 fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     let now_ms = env.now.timestamp_millis();
     let config = load_config(cmd.config_path.as_deref())?;
-    let mut conn = db(cmd)?;
-    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let conn = db(cmd)?;
+    let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
     let eff = settings::effective(&config, &overrides);
     let mode =
         match cmd.sub(1) {
@@ -1040,7 +1042,7 @@ fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         }
     }
     let impact =
-        ops::impact(&conn, eff.policy.expired_renew_grace_days, now_ms).map_err(op_failure)?;
+        ops::impact(&*conn, eff.policy.expired_renew_grace_days, now_ms).map_err(op_failure)?;
     let target = mode.unwrap_or(eff.mode);
     let (level, confirm_text) = impact.level(target);
     if level == "L2" {
@@ -1092,7 +1094,7 @@ fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         }
     }
     ops::set_mode(
-        &mut conn,
+        &*conn,
         mode,
         auto,
         hours,
@@ -1104,7 +1106,7 @@ fn mode_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         now_ms,
     )
     .map_err(op_failure)?;
-    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
     let eff = settings::effective(&config, &overrides);
     if cmd.json {
         return Ok(ok_json(cmd, env.now, show(&eff)));
@@ -1180,7 +1182,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("revocations"), Some("export")) => crate::pki_cli::revocations_export(cmd, env),
         (Some("issuing-ca"), Some("list")) => {
             let conn = db(cmd)?;
-            let cas = ps::list_cas(&conn).map_err(db_failure)?;
+            let cas = conn.list_cas().map_err(db_failure)?;
             let data: Vec<Value> = cas.iter().map(|c| json!({
                 "ca_id": c.ca_id, "subject": c.subject, "state": c.state,
                 "not_after": c.not_after.map(crate::api::http::ts_ms), "key_file": c.key_file,
@@ -1214,7 +1216,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let conn = db(cmd)?;
             let data_dir = PathBuf::from(&config.storage.data_dir);
             let (id, n) = crate::pki::manage::create(
-                &conn,
+                &*conn,
                 &data_dir,
                 config.pki.organization.trim(),
                 now_ms,
@@ -1226,8 +1228,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 crate::pki::pki_dir(&data_dir).join(format!("issuing-{id}.csr"))
             });
             write_new_file(&csr_path.to_string_lossy(), n.csr_pem.as_bytes())?;
-            let _ = store::audit(
-                &conn,
+            let _ = conn.audit(
                 now_ms,
                 &store::Audit {
                     actor: &operator(),
@@ -1262,9 +1263,8 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let conn = db(cmd)?;
             let data_dir = PathBuf::from(&config.storage.data_dir);
             let r =
-                crate::pki::manage::install(&conn, &data_dir, &pem, now_ms).map_err(cert_fail)?;
-            let _ = store::audit(
-                &conn,
+                crate::pki::manage::install(&*conn, &data_dir, &pem, now_ms).map_err(cert_fail)?;
+            let _ = conn.audit(
                 now_ms,
                 &store::Audit {
                     actor: &operator(),
@@ -1312,7 +1312,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| usage_err("需要 ca_id"))?;
             let conn = db(cmd)?;
-            let ca = ps::get_ca(&conn, id).map_err(db_failure)?.ok_or_else(|| {
+            let ca = conn.get_ca(id).map_err(db_failure)?.ok_or_else(|| {
                 Failure::new(format!("找不到簽發 CA {id}"), "", Vec::new(), EXIT_GENERAL)
             })?;
             if action == "activate" {
@@ -1324,7 +1324,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                         EXIT_REJECTED,
                     ));
                 }
-                ps::activate_ca(&conn, id).map_err(db_failure)?;
+                conn.activate_ca(id).map_err(db_failure)?;
             } else {
                 if cmd.opt("--confirm") != Some("重建 CA") {
                     return Err(usage_err(
@@ -1339,10 +1339,9 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                         EXIT_REJECTED,
                     ));
                 }
-                ps::retire_ca(&conn, id, now_ms).map_err(db_failure)?;
+                conn.retire_ca(id, now_ms).map_err(db_failure)?;
             }
-            let _ = store::audit(
-                &conn,
+            let _ = conn.audit(
                 now_ms,
                 &store::Audit {
                     actor: &operator(),
@@ -1381,12 +1380,11 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("certificates"), Some("list")) => {
             let config = load_config(cmd.config_path.as_deref())?;
             let conn = db(cmd)?;
-            let overrides =
-                settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+            let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
             let grace = settings::effective(&config, &overrides)
                 .policy
                 .expired_renew_grace_days;
-            let rows = ps::list_certs(&conn, 1_000_000, None).map_err(db_failure)?;
+            let rows = conn.list_certs(1_000_000, None).map_err(db_failure)?;
             let within = cmd
                 .opt("--expires-within")
                 .map(|v| {
@@ -1440,13 +1438,13 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("revoke"), _) => {
             let reason = cmd.opt("--reason").and_then(Reason::parse).ok_or_else(|| usage_err("--reason 必須是 keyCompromise、cessationOfOperation、superseded 或 unspecified"))?;
             let comment = cmd.opt("--comment").unwrap_or("").to_string();
-            let mut conn = db(cmd)?;
+            let conn = db(cmd)?;
             let mut serials = Vec::new();
             for target in &cmd.args[1..] {
                 if kairos_proto::is_uuid_text(target) {
                     let id = target.to_ascii_lowercase();
                     serials.extend(
-                        ps::certs_of_agent(&conn, &id)
+                        conn.certs_of_agent(&id)
                             .map_err(db_failure)?
                             .into_iter()
                             .filter(|c| c.revoked_at.is_none() && c.not_after > now_ms)
@@ -1491,7 +1489,7 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 return Err(usage_err("--comment 必填（寫入稽核）"));
             }
             let results = ops::revoke(
-                &mut conn,
+                &*conn,
                 &serials,
                 reason,
                 &comment,
@@ -1523,12 +1521,12 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         (Some("queue"), Some("export")) => {
             let config = load_config(cmd.config_path.as_deref())?;
             let conn = db(cmd)?;
-            let overrides =
-                settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+            let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
             let days = settings::effective(&config, &overrides)
                 .policy
                 .cert_lifetime_days;
-            let v = crate::pki::queue::export(&conn, "kairos", days, now_ms).map_err(db_failure)?;
+            let v =
+                crate::pki::queue::export(&*conn, "kairos", days, now_ms).map_err(db_failure)?;
             let text = serde_json::to_string_pretty(&v).unwrap_or_default() + "\n";
             let n = v["items"].as_array().map_or(0, Vec::len);
             match cmd.opt("--out") {
@@ -1557,6 +1555,129 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 }),
             }
         }
+        (Some("certificates"), Some("import")) => {
+            // 手動簽發（外部 CA）的既有憑證匯入簽發紀錄（PKI.md 第 16 節）
+            let paths = &cmd.args[2..];
+            if paths.is_empty() {
+                return Err(usage_err("需要憑證檔或目錄（PEM，可含多張；或 DER）"));
+            }
+            let config = load_config(cmd.config_path.as_deref())?;
+            let mut files: Vec<PathBuf> = Vec::new();
+            for p in paths {
+                let path = PathBuf::from(p);
+                let meta =
+                    std::fs::symlink_metadata(&path).map_err(|e| usage_err(format!("{p}：{e}")))?;
+                if meta.is_dir() {
+                    let mut found: Vec<PathBuf> = std::fs::read_dir(&path)
+                        .map_err(|e| usage_err(format!("{p}：{e}")))?
+                        .filter_map(Result::ok)
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                        .map(|e| e.path())
+                        .filter(|f| {
+                            f.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                                matches!(
+                                    x.to_ascii_lowercase().as_str(),
+                                    "pem" | "crt" | "cer" | "der"
+                                )
+                            })
+                        })
+                        .collect();
+                    found.sort();
+                    files.extend(found);
+                } else if meta.is_file() {
+                    files.push(path);
+                } else {
+                    return Err(usage_err(format!(
+                        "{p} 不是一般檔案或目錄（不跟隨符號連結）"
+                    )));
+                }
+            }
+            let conn = db(cmd)?;
+            let anchors = crate::pki::queue::anchors(&*conn, config.auth.client_ca_path());
+            let expected = cmd.opt("--agent-id");
+            let by = operator();
+            let mut results: Vec<(String, Result<crate::pki::queue::ExistingImport, String>)> =
+                Vec::new();
+            for f in &files {
+                let label = f.display().to_string();
+                match std::fs::read(f)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| crate::pki::queue::certificates_in(&b))
+                {
+                    Ok(ders) => {
+                        let many = ders.len() > 1;
+                        for (i, der) in ders.iter().enumerate() {
+                            let l = if many {
+                                format!("{label}#{}", i + 1)
+                            } else {
+                                label.clone()
+                            };
+                            results.push((
+                                l,
+                                crate::pki::queue::import_existing(
+                                    &*conn, der, &anchors, expected, &by, None, now_ms,
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) => results.push((label, Err(e))),
+                }
+            }
+            if results.is_empty() {
+                return Err(usage_err("目錄中沒有 .pem、.crt、.cer、.der 檔"));
+            }
+            let failed = results.iter().any(|(_, r)| r.is_err());
+            if cmd.json {
+                let mut o = ok_json(
+                    cmd,
+                    env.now,
+                    json!({"results": results.iter().map(|(s, r)| crate::pki::queue::existing_json(s, r)).collect::<Vec<_>>()}),
+                );
+                o.exit = if failed { EXIT_CERT } else { 0 };
+                return Ok(o);
+            }
+            let mut text = String::new();
+            for (s, r) in &results {
+                match r {
+                    Ok(crate::pki::queue::ExistingImport::Imported {
+                        serial,
+                        agent_id,
+                        not_after_ms,
+                        expired,
+                        new_host,
+                        ..
+                    }) => text.push_str(&format!(
+                        "{} {s}：已匯入（序號 {serial}，agent_id {agent_id}，到期 {}{}{}）
+",
+                        mark(env),
+                        human_time(*not_after_ms, env.tz),
+                        if *expired { "，已過期" } else { "" },
+                        if *new_host {
+                            "，清冊新增這台主機"
+                        } else {
+                            ""
+                        },
+                    )),
+                    Ok(crate::pki::queue::ExistingImport::Already { serial, .. }) => {
+                        text.push_str(&format!(
+                            "{} {s}：先前已匯入（序號 {serial}）
+",
+                            mark(env)
+                        ))
+                    }
+                    Err(e) => text.push_str(&format!(
+                        "{} {s}：錯誤 KRS-E1305：不通過：{e}
+",
+                        if env.unicode { "✗" } else { "[FAIL]" }
+                    )),
+                }
+            }
+            Ok(Output {
+                stdout: text,
+                exit: if failed { EXIT_CERT } else { 0 },
+                ..Default::default()
+            })
+        }
         (Some("queue"), Some("import")) => {
             let path = cmd
                 .sub(2)
@@ -1564,9 +1685,9 @@ fn pki_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let config = load_config(cmd.config_path.as_deref())?;
             let v: Value = serde_json::from_str(&read_file(path)?)
                 .map_err(|e| usage_err(format!("{path} 不是 JSON：{e}")))?;
-            let mut conn = db(cmd)?;
-            let anchors = crate::pki::queue::anchors(&conn, config.auth.client_ca_path());
-            let results = crate::pki::queue::import(&mut conn, &v, &anchors, &operator(), now_ms)
+            let conn = db(cmd)?;
+            let anchors = crate::pki::queue::anchors(&*conn, config.auth.client_ca_path());
+            let results = crate::pki::queue::import(&*conn, &v, &anchors, &operator(), now_ms)
                 .map_err(usage_err)?;
             let failed = results.iter().any(|r| r.result.is_err());
             if cmd.json {
@@ -1730,7 +1851,7 @@ fn config_show(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     }
     let config = load_config(cmd.config_path.as_deref())?;
     let rows = match open(cmd.config_path.as_deref(), false) {
-        Ok(Some(conn)) => store::load_settings(&conn).map_err(db_failure)?,
+        Ok(Some(conn)) => conn.load_settings().map_err(db_failure)?,
         Ok(None) => Vec::new(),
         Err(f) => return Err(f),
     };
@@ -1835,17 +1956,17 @@ fn config_reset(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     }
     let now_ms = env.now.timestamp_millis();
     let config = load_config(cmd.config_path.as_deref())?;
-    let mut conn = db(cmd)?;
+    let conn = db(cmd)?;
     // 改回設定檔的值可能等於關閉註冊端點或縮短寬限期：與 enroll mode closed、主控台相同的 L2
     // （設計包 screens.md §0.3；API POST /api/v1/settings/reset 的 impact_token）
-    let overrides = settings::overrides_from(&store::load_settings(&conn).map_err(db_failure)?);
+    let overrides = settings::overrides_from(&conn.load_settings().map_err(db_failure)?);
     let before = settings::effective(&config, &overrides);
     let mut rest = overrides.clone();
     for k in &keys {
         rest.remove(k);
     }
     let after = settings::effective(&config, &rest);
-    let impact = ops::change_impact(&conn, &before, &after, now_ms).map_err(op_failure)?;
+    let impact = ops::change_impact(&*conn, &before, &after, now_ms).map_err(op_failure)?;
     let (level, confirm_text) = impact.level();
     if level == "L2" {
         let n = impact.count();
@@ -1914,15 +2035,8 @@ fn config_reset(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
         reason: cmd.opt("--reason"),
         impact: &impact,
     });
-    let results = ops::reset_settings(
-        &mut conn,
-        &keys,
-        &operator(),
-        None,
-        confirmed.as_ref(),
-        now_ms,
-    )
-    .map_err(op_failure)?;
+    let results = ops::reset_settings(&*conn, &keys, &operator(), None, confirmed.as_ref(), now_ms)
+        .map_err(op_failure)?;
     if cmd.json {
         return Ok(Output {
             stdout: ascii_json(&json!({

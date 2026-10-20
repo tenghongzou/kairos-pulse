@@ -61,6 +61,18 @@ impl Backoff {
         }
     }
 
+    /// 改變初始延遲與上限（集中設定下發的 `retry.*`，下一次斷線起生效）；連續失敗次數不變，
+    /// 目前的基準延遲夾在新的範圍內
+    pub fn set_limits(&mut self, initial: Duration, max: Duration) {
+        let max = max.max(initial);
+        if (initial, max) == (self.initial, self.max) {
+            return;
+        }
+        self.initial = initial;
+        self.max = max;
+        self.current = self.current.clamp(initial, max);
+    }
+
     /// 重置退避（連線穩定維持一段時間後呼叫）。
     pub fn reset(&mut self) {
         self.current = self.initial;

@@ -46,6 +46,8 @@ pub enum DisconnectReason {
     ServerShutdown,
     /// report 寫入結果未知，Kairos 關閉了連線
     WriteUnknown,
+    /// 服務這台主機的叢集節點失聯（`kairos/HA.md` 第 6.6 節；0.9.0 只定義名稱，叢集模式才會產生）
+    ServerLost,
 }
 
 impl DisconnectReason {
@@ -59,6 +61,7 @@ impl DisconnectReason {
             DisconnectReason::Superseded => "superseded",
             DisconnectReason::ServerShutdown => "server_shutdown",
             DisconnectReason::WriteUnknown => "write_unknown",
+            DisconnectReason::ServerLost => "server_lost",
         }
     }
 
@@ -73,6 +76,7 @@ impl DisconnectReason {
             DisconnectReason::Superseded => "被同一 agent_id 的新連線取代",
             DisconnectReason::ServerShutdown => "Kairos 關機",
             DisconnectReason::WriteUnknown => "寫入結果未知",
+            DisconnectReason::ServerLost => "叢集節點失聯",
         }
     }
 
@@ -87,6 +91,7 @@ impl DisconnectReason {
             DisconnectReason::Superseded,
             DisconnectReason::ServerShutdown,
             DisconnectReason::WriteUnknown,
+            DisconnectReason::ServerLost,
         ]
         .into_iter()
         .find(|r| r.as_str() == s)
@@ -100,6 +105,7 @@ impl DisconnectReason {
             OfflineReason::ServerShutdown => DisconnectReason::ServerShutdown,
             OfflineReason::CertificateRejected => DisconnectReason::CertificateRejected,
             OfflineReason::WriteUnknown => DisconnectReason::WriteUnknown,
+            OfflineReason::ServerLost => DisconnectReason::ServerLost,
         }
     }
 }
@@ -200,6 +206,15 @@ pub enum EventKind {
         id: Option<i64>,
         summary: String,
     },
+    /// 遠端管理的系統檢查（升級推送已暫停、回滾失敗、發佈簽章驗證失敗；REMOTE.md 第 4.7.4 節）。
+    /// `rule` 為系統規則的 ID，`active = false` 時恢復。由遠端管理服務每一輪依資料庫的狀態調和後發布
+    RemoteCondition {
+        rule: &'static str,
+        subject: String,
+        active: bool,
+        title: String,
+        details: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -219,6 +234,7 @@ impl EventKind {
             EventKind::Lifecycle { .. } => "lifecycle",
             EventKind::ChannelSecrets { .. } => "channel_secrets",
             EventKind::AuditIntegrity { .. } => "audit_integrity",
+            EventKind::RemoteCondition { .. } => "remote_condition",
         }
     }
 }
@@ -298,6 +314,12 @@ pub fn peer_ip(peer: &str) -> Option<IpAddr> {
         .map(|a| a.ip().to_canonical())
         .ok()
         .or_else(|| peer.parse::<IpAddr>().ok().map(|ip| ip.to_canonical()))
+        // privacy.store_peer_ip = "truncate"：網段（`10.0.3.0/24`）以網段的位址代表
+        .or_else(|| {
+            peer.split_once('/')
+                .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
+                .map(|ip| ip.to_canonical())
+        })
 }
 
 #[cfg(test)]

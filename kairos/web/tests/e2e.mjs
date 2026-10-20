@@ -13,6 +13,9 @@ import { registerAdmin } from './e2e-admin.mjs';
 import { registerRbac } from './e2e-rbac.mjs';
 import { registerWcag } from './e2e-wcag.mjs';
 import { registerMetrics } from './e2e-metrics.mjs';
+import { registerExport } from './e2e-export.mjs';
+import { registerPrivacy } from './e2e-privacy.mjs';
+import { registerRemote } from './e2e-remote.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -535,6 +538,13 @@ registerWcag({ test, newPage, login, waitTitle, axe, URL0, PW });
 
 // 指標擴充（F4：S03、S04、S05、S09）：e2e-metrics.mjs
 registerMetrics({ test, newPage, login, waitTitle, axe, shot, URL0, PW });
+
+// 指標轉出（F7：Prometheus exporter、OTLP；S21「整合」）：e2e-export.mjs
+registerExport({ test, newPage, login, waitTitle, axe, shot, URL0, PW });
+// 遠端管理（F8：S24 集中設定、S25 Pulse 版本庫、S26 升級推送、S04／S05 的整合）
+registerRemote({ test, newPage, login, waitTitle, axe, shot, FakeAgent, URL0, PW });
+// 個資保護（S6：S05 的匯出個資與刪除主機資料、S12 的一行安裝指令、S14 的匯入憑證）：e2e-privacy.mjs（放在最後：會刪除主機）
+registerPrivacy({ test, newPage, login, waitTitle, axe, shot, FakeAgent, URL0, PW });
 
 // 結束代碼的自我檢查（README 第 7 節）：SELFTEST=fail 加入一個必定失敗的測試、SELFTEST=axe 加入一個有 axe 違規
 // （沒有替代文字的圖片）的畫面。兩者都必須讓 run.sh 以非 0 結束；搭配 ONLY=自我檢查 只跑這一個。

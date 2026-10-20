@@ -24,7 +24,7 @@ use subtle::ConstantTimeEq;
 
 use super::db::{ReadPool, WriteConn, query_failed};
 use super::http::{ApiError, CODE_RATE_LIMITED, ts_ms};
-use super::tokens::{self, StoredToken, hash_secret, parse_token};
+use super::tokens::{StoredToken, hash_secret, parse_token};
 use crate::config::AppConfig;
 pub use crate::rbac::Permission;
 use crate::rbac::{Assignment, Grants, HostAccess, LegacyScope, PermSet, Role};
@@ -518,18 +518,19 @@ impl Authenticator {
         let (stored, owner) = self
             .pool
             .read("API token", move |conn| {
-                let stored = tokens::lookup(conn, &id).map_err(query_failed("API token"))?;
+                let stored = conn
+                    .lookup_api_token(&id)
+                    .map_err(query_failed("API token"))?;
                 let owner = match stored.as_ref().and_then(|s| s.owner_user_id) {
-                    Some(uid) => {
-                        match us::get_user(conn, uid).map_err(query_failed("API token"))? {
-                            Some(u) if u.active() => {
-                                let (g, _) = us::grants_for(conn, uid, &[])
-                                    .map_err(query_failed("API token"))?;
-                                Some((u, g))
-                            }
-                            _ => None,
+                    Some(uid) => match conn.get_user(uid).map_err(query_failed("API token"))? {
+                        Some(u) if u.active() => {
+                            let (g, _) = conn
+                                .grants_for(uid, &[])
+                                .map_err(query_failed("API token"))?;
+                            Some((u, g))
                         }
-                    }
+                        _ => None,
+                    },
                     None => None,
                 };
                 Ok((stored, owner))
@@ -579,13 +580,15 @@ impl Authenticator {
         let found: Option<SessionLookup> = self
             .pool
             .read("工作階段", move |conn| {
-                let Some(session) =
-                    us::session_by_hash(conn, &hash).map_err(query_failed("工作階段"))?
+                let Some(session) = conn
+                    .session_by_hash(&hash)
+                    .map_err(query_failed("工作階段"))?
                 else {
                     return Ok(None);
                 };
-                let Some(user) =
-                    us::get_user(conn, session.user_id).map_err(query_failed("工作階段"))?
+                let Some(user) = conn
+                    .get_user(session.user_id)
+                    .map_err(query_failed("工作階段"))?
                 else {
                     return Ok(None);
                 };
@@ -594,7 +597,8 @@ impl Authenticator {
                 } else {
                     Vec::new()
                 };
-                let (grants, assignments) = us::grants_for(conn, user.user_id, &groups)
+                let (grants, assignments) = conn
+                    .grants_for(user.user_id, &groups)
                     .map_err(query_failed("工作階段"))?;
                 Ok(Some(SessionLookup {
                     session,
@@ -633,7 +637,7 @@ impl Authenticator {
             let writer = self.writer.clone();
             tokio::spawn(async move {
                 let _ = writer
-                    .write(move |conn| us::touch_session(conn, &hash, now_ms))
+                    .write(move |conn| conn.touch_session(&hash, now_ms))
                     .await;
             });
         }
@@ -678,8 +682,9 @@ impl Authenticator {
                 let id = token_id.clone();
                 self.pool
                     .read("API token", move |conn| {
-                        let Some(s) =
-                            tokens::lookup(conn, &id).map_err(query_failed("API token"))?
+                        let Some(s) = conn
+                            .lookup_api_token(&id)
+                            .map_err(query_failed("API token"))?
                         else {
                             return Ok(Grants::default());
                         };
@@ -688,9 +693,10 @@ impl Authenticator {
                         }
                         let owner = match s.owner_user_id {
                             Some(uid) => {
-                                match us::get_user(conn, uid).map_err(query_failed("API token"))? {
+                                match conn.get_user(uid).map_err(query_failed("API token"))? {
                                     Some(u) if u.active() => {
-                                        let (g, _) = us::grants_for(conn, uid, &[])
+                                        let (g, _) = conn
+                                            .grants_for(uid, &[])
                                             .map_err(query_failed("API token"))?;
                                         Some((u, g))
                                     }
@@ -711,9 +717,10 @@ impl Authenticator {
                 let (hash, uid) = (*session_hash, *user_id);
                 self.pool
                     .read("工作階段", move |conn| {
-                        let s =
-                            us::session_by_hash(conn, &hash).map_err(query_failed("工作階段"))?;
-                        let u = us::get_user(conn, uid).map_err(query_failed("工作階段"))?;
+                        let s = conn
+                            .session_by_hash(&hash)
+                            .map_err(query_failed("工作階段"))?;
+                        let u = conn.get_user(uid).map_err(query_failed("工作階段"))?;
                         // SSE 本身不更新最後活動時間：閒置逾時以最後一個一般請求計算
                         match (s, u) {
                             (Some(s), Some(u))
@@ -726,7 +733,7 @@ impl Authenticator {
                                 } else {
                                     Vec::new()
                                 };
-                                us::grants_for(conn, uid, &groups)
+                                conn.grants_for(uid, &groups)
                                     .map(|(g, _)| g)
                                     .map_err(query_failed("工作階段"))
                             }

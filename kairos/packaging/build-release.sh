@@ -18,8 +18,8 @@ EXAMPLE_SRC=kairos.example.toml      # 產品目錄中的範例設定
 EXAMPLE_DST=kairos.example.toml      # 放進發佈包時的檔名
 UNIT_SRC=packaging/kairos.service    # systemd unit 範本
 # 其他放進發佈包根目錄的檔案（以空白分隔，路徑不可含空白）：CRL 定期更新的 unit 範例、
-# 資料儲存、主控台 API 與 PKI 的說明、Prometheus 的抓取設定與告警規則範例
-EXTRA_SRC="packaging/kairos-crl.service packaging/kairos-crl.timer STORAGE.md API.md PKI.md packaging/prometheus.example.yml packaging/kairos-alerts.example.yml"
+# 資料儲存、主控台 API、PKI、指標轉出與個資保護的說明、Prometheus 的抓取設定與告警規則範例、指標轉出的抓取範例與 Grafana 儀表板
+EXTRA_SRC="packaging/kairos-crl.service packaging/kairos-crl.timer STORAGE.md API.md PKI.md EXPORT.md PRIVACY.md packaging/prometheus.example.yml packaging/kairos-alerts.example.yml packaging/prometheus-export.example.yml packaging/grafana-kairos-hosts.json"
 # 預設建置的目標：Linux x86_64、aarch64（musl 靜態連結）
 DEFAULT_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
 EXTRA_DIST=""

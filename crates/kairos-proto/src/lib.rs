@@ -18,19 +18,28 @@
 //! - 指標擴充（商業審計 F4，[`METRICS.md`](../METRICS.md)）：F4 新增的標準指標與計數器速率
 //!   （[`STANDARD_METRICS`]、[`counter_rate`]）、行程排行（feature `processes`，[`ProcessList`]）與
 //!   主機資產（feature `inventory`，[`Inventory`]、[`ClientMsg::Inventory`]）
+//! - 叢集連線（feature `cluster`，PROTOCOL.md「叢集與排空」）：`hello_ack.server_node`／`cluster_id`
+//!   與排空訊息 [`ServerMsg::Drain`]
+//! - 遠端管理（feature `config`、`upgrade`，PROTOCOL.md「遠端管理」、[`REMOTE.md`](../REMOTE.md)）：
+//!   [`mgmt`] 模組（新訊息、hello 的 `install`、`pending`、驗證、協商、設定白名單 [`mgmt::settings`]）與
+//!   [`release`] 模組（SSHSIG 簽章驗證、`allowed_signers`、`SHA256SUMS`、發佈檔名、發佈清單、版本比較）
 //!
 //! 本 crate 只有純函式與資料型別，不做 I/O、不記日誌，也不依賴 tokio；NDJSON 的分行 codec
 //! 與日誌的措辭留在各產品。
 
 #![forbid(unsafe_code)]
 
+mod b64;
+mod cluster;
 pub mod enroll;
 mod inventory;
 pub mod lifecycle;
 mod messages;
 mod metrics;
+pub mod mgmt;
 mod negotiate;
 mod processes;
+pub mod release;
 mod validate;
 
 #[cfg(test)]
@@ -39,6 +48,12 @@ mod metrics_spec_tests;
 #[cfg(test)]
 mod tests;
 
+pub use cluster::{
+    DEFAULT_DRAIN_RECONNECT_MS, DRAIN_IN_FLIGHT_WAIT_MS, DRAIN_MS_PER_CONNECTION,
+    DRAIN_REASON_NODE_DRAINING, DRAIN_REASON_REBALANCE, FEATURE_CLUSTER, MAX_DRAIN_RECONNECT_MS,
+    MAX_SERVER_NODE_BYTES, MIN_DRAIN_RECONNECT_MS, drain_reconnect_within_ms,
+    effective_drain_reconnect_ms, is_server_node, node_name_from_hostname,
+};
 pub use inventory::{
     CpuInventory, DISK_KINDS, DiskInventory, FEATURE_INVENTORY, INVENTORY_MIN_INTERVAL_MS,
     InterfaceInventory, Inventory, InventoryReport, MAX_INTERFACE_ADDRESSES, MAX_INVENTORY_DISKS,
@@ -66,6 +81,11 @@ pub use metrics::{
     METRIC_TEMPERATURE, METRIC_UPTIME, Metric, MetricKind, STANDARD_METRICS, StandardMetric,
     counter_rate, filesystem_usage, is_valid_label_key, is_valid_metric_name, is_valid_unit,
     standard_metric, validate_metric, validate_metrics,
+};
+pub use mgmt::{
+    ConfigGet, ConfigStatus, FEATURE_CONFIG, FEATURE_UPGRADE, InstallInfo, MGMT_FEATURES,
+    MgmtSession, Pending, RemoteConfig, UpgradeChunk, UpgradeChunkGet, UpgradeGet, UpgradeOffer,
+    UpgradeStatus,
 };
 pub use negotiate::{
     FEATURE_DURABLE, FEATURE_METRICS, ProtoRange, ProtoRangeError, SERVER_FEATURES,

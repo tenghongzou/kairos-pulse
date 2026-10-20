@@ -22,12 +22,13 @@ use crate::tls::RejectionReason;
 
 /// 斷線（離線）原因的標籤值，順序與 [`offline_index`] 相同。與事件匯流排、告警與 Webhook 的
 /// `offline_reason` 固定代碼相同（[`DisconnectReason::as_str`]；設計包 `decisions/INTEGRATION.md` §28.5 #4）
-pub const OFFLINE_REASONS: [&str; 5] = [
+pub const OFFLINE_REASONS: [&str; 6] = [
     "idle_timeout",
     "agent_closed",
     "server_shutdown",
     "certificate_rejected",
     "write_unknown",
+    "server_lost",
 ];
 
 /// 匯流排的斷線原因 → 標籤（被取代、身分驗證失敗不是離線，回 `None`）
@@ -38,6 +39,7 @@ fn offline_index(r: DisconnectReason) -> Option<usize> {
         DisconnectReason::ServerShutdown => 2,
         DisconnectReason::CertificateRejected | DisconnectReason::RevocationUnavailable => 3,
         DisconnectReason::WriteUnknown => 4,
+        DisconnectReason::ServerLost => 5,
         DisconnectReason::AuthFailed | DisconnectReason::Superseded => return None,
     })
 }
@@ -219,7 +221,8 @@ impl Metrics {
             | EventKind::Condition { .. }
             | EventKind::Lifecycle { .. }
             | EventKind::ChannelSecrets { .. }
-            | EventKind::AuditIntegrity { .. } => {}
+            | EventKind::AuditIntegrity { .. }
+            | EventKind::RemoteCondition { .. } => {}
         }
     }
 
@@ -430,6 +433,7 @@ mod tests {
             DisconnectReason::ServerShutdown,
             DisconnectReason::CertificateRejected,
             DisconnectReason::WriteUnknown,
+            DisconnectReason::ServerLost,
         ] {
             assert_eq!(OFFLINE_REASONS[offline_index(r).unwrap()], r.as_str());
         }

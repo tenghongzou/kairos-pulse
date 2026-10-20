@@ -41,8 +41,22 @@ use crate::storage::{Clock, RecordBody, ReportRecord, WriteStatus};
 use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
 
+pub(crate) mod admin;
+pub(crate) mod alerts;
+pub(crate) mod api;
+pub(crate) mod audit;
+pub(crate) mod conn;
+pub(crate) mod enroll;
+pub(crate) mod hosts;
+pub(crate) mod pki;
+pub(crate) mod remote;
+pub(crate) mod tokens;
+pub(crate) mod users;
+
 #[path = "sqlite_assets.rs"]
 mod sqlite_assets;
+#[path = "sqlite_purge.rs"]
+mod sqlite_purge;
 
 /// 資料庫檔名（放在 `storage.data_dir`）
 pub const DB_FILE: &str = "kairos.db";
@@ -720,10 +734,15 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: SCHEMA_V8,
     },
+    // v9（0.9.0）：集中設定與 Pulse 遠端升級（SQL 在 store/sqlite/remote.rs）
+    Migration {
+        version: 9,
+        sql: remote::SCHEMA_V9,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";
@@ -934,7 +953,7 @@ fn prepare_files(path: &Path) -> Result<(), Error> {
 /// 這裡會在 `busy` 之後回 [`ErrorKind::ResourceBusy`]；取得之後，匯入期間 Kairos 也無法啟動、
 /// `hosts list` 等唯讀查詢會等待後失敗，不會有第二個寫入者。exclusive 模式下 WAL 不使用共享記憶體
 /// （`-shm`），關閉時 checkpoint 並刪除 `-wal`。
-pub(super) fn open_exclusive(opts: &SqliteOptions, busy: Duration) -> Result<Connection, Error> {
+pub(crate) fn open_exclusive(opts: &SqliteOptions, busy: Duration) -> Result<Connection, Error> {
     prepare_files(&opts.path)?;
     let path = opts.path.display().to_string();
     let conn = Connection::open_with_flags(
@@ -1595,6 +1614,9 @@ pub struct SqliteStore {
     pending_inventory: VecDeque<InventoryRow>,
     /// 每台主機上次記錄「序列數已達上限」的時間（`KRS-W4104`）
     series_cap_logged: HashMap<String, Instant>,
+    /// 正在刪除或剛刪除資料的主機（`agent_id` → 開始的時間）：這段期間不寫入它的 report、資產與清冊，
+    /// 避免刪除後又被建立回來（[`sqlite_purge::PURGE_HOLD`]）
+    purging: HashMap<String, Instant>,
     /// 測試用的失敗注入
     pub(crate) fail_next: Option<FailPoint>,
 }
@@ -1636,6 +1658,7 @@ impl SqliteStore {
             rollup_stale: false,
             pending_inventory: VecDeque::new(),
             series_cap_logged: HashMap::new(),
+            purging: HashMap::new(),
             fail_next: None,
         };
         store.ensure_ready().map_err(Error::other)?;
@@ -1787,6 +1810,10 @@ impl SqliteStore {
                 .map_err(before)?;
             let mut record_samples: Vec<Sample> = Vec::new();
             'records: for (i, r) in records.iter().enumerate() {
+                // 正在刪除資料的主機（reject_purging 已標為失敗）
+                if !matches!(statuses[i], WriteStatus::Written) {
+                    continue;
+                }
                 let recv_ms = r.recv_at.timestamp_millis();
                 // 取樣時間：durable report 為 client 的 ts（補送的歷史資料），否則為收到的時間
                 let ts = sample_time_ms(r);
@@ -2000,6 +2027,7 @@ impl SqliteStore {
             return vec![WriteStatus::Failed(reason); records.len()];
         }
         let mut statuses = vec![WriteStatus::Written; records.len()];
+        self.reject_purging(records, &mut statuses);
         let mut samples = Vec::new();
         let mut capped = Vec::new();
         let result = self.insert_batch(records, &mut statuses, &mut samples, &mut capped);
@@ -2585,7 +2613,11 @@ impl SqliteStore {
     fn sync(&mut self, snapshot: &RegistrySnapshot) -> rusqlite::Result<usize> {
         let mut rows = VecDeque::new();
         let mut new_hosts = 0;
+        self.expire_purging();
         for agent in &snapshot.agents {
+            if self.purging.contains_key(agent.agent_id.as_str()) {
+                continue;
+            }
             let row = InventoryRow::of(agent, self.opts.mtls);
             let entry = self.caches.hosts.get(agent.agent_id.as_str());
             let unchanged = entry.and_then(|e| e.synced).is_some_and(|(hash, seen)| {
@@ -2643,8 +2675,10 @@ impl SqliteStore {
             let mut stmt = tx.prepare(
                 "INSERT INTO hosts (agent_id, hostname, agent_version, proto, host_fingerprint,
                     display_name, tags, os, report_interval_ms, peer, identity_verified, online,
-                    first_seen, connected_at, last_seen, offline_after_ms, last_report)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    first_seen, connected_at, last_seen, offline_after_ms, last_report,
+                    install_method, install_upgrade, install_config)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    ?18, ?19, ?20)
                  ON CONFLICT (agent_id) DO UPDATE SET
                     hostname = excluded.hostname,
                     agent_version = excluded.agent_version,
@@ -2660,7 +2694,10 @@ impl SqliteStore {
                     connected_at = excluded.connected_at,
                     last_seen = max(hosts.last_seen, excluded.last_seen),
                     offline_after_ms = excluded.offline_after_ms,
-                    last_report = coalesce(excluded.last_report, hosts.last_report)
+                    last_report = coalesce(excluded.last_report, hosts.last_report),
+                    install_method = coalesce(excluded.install_method, hosts.install_method),
+                    install_upgrade = coalesce(excluded.install_upgrade, hosts.install_upgrade),
+                    install_config = coalesce(excluded.install_config, hosts.install_config)
                  RETURNING host_id, rollup_until",
             )?;
             for row in rows {
@@ -2683,6 +2720,9 @@ impl SqliteStore {
                         row.last_seen,
                         row.offline_after_ms,
                         row.last_report,
+                        row.install_method,
+                        row.install_upgrade,
+                        row.install_config,
                     ],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
@@ -2816,6 +2856,10 @@ struct InventoryRow {
     last_seen: i64,
     offline_after_ms: i64,
     last_report: Option<String>,
+    /// hello 的 `install`（0.9.0 起的 Pulse；REMOTE.md 第 2.1 節）
+    install_method: Option<String>,
+    install_upgrade: Option<String>,
+    install_config: Option<String>,
     /// 除了 last_seen 與 last_report（隨每次 heartbeat、report 改變）之外所有欄位的雜湊
     hash: u64,
 }
@@ -2858,6 +2902,15 @@ impl InventoryRow {
                 .last_report
                 .as_ref()
                 .and_then(|r| serde_json::to_string(r).ok()),
+            install_method: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.method.clone()),
+            install_upgrade: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.upgrade.clone()),
+            install_config: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.config.clone()),
             hash: 0,
         };
         let mut h = DefaultHasher::new();
@@ -2877,6 +2930,12 @@ impl InventoryRow {
         )
             .hash(&mut h);
         row.offline_after_ms.hash(&mut h);
+        (
+            &row.install_method,
+            &row.install_upgrade,
+            &row.install_config,
+        )
+            .hash(&mut h);
         row.hash = h.finish();
         row
     }
@@ -2950,7 +3009,14 @@ impl ReportStore for SqliteStore {
         &mut self,
         write: &crate::store::AssetWrite,
     ) -> Result<crate::store::AssetOutcome, String> {
+        if self.purging.contains_key(&write.agent_id) {
+            return Err(sqlite_purge::PURGING.to_string());
+        }
         self.store_assets(write)
+    }
+
+    fn purge_step(&mut self, job: &mut crate::store::purge::PurgeJob) -> Result<bool, String> {
+        self.purge(job)
     }
 
     fn sync_inventory(&mut self, snapshot: &RegistrySnapshot) {
@@ -3052,6 +3118,49 @@ pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         Duration::from_secs(5),
     )
+}
+
+/// 診斷包的唯讀連線（原本在 `diag.rs`）：不經過 [`open_existing`] 的檢查，busy 最多等 2 秒。錯誤訊息為
+/// 「無法開啟 <路徑>：<原因>」
+pub fn open_for_diag(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("無法開啟 {}：{e}", path.display()))?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    Ok(conn)
+}
+
+/// 健康檢查的讀寫連線（原本在 `probe.rs`）：開啟後讀一次 schema（不取得寫入鎖），再確認連線不是唯讀開啟。
+/// 回傳連線與「可寫」的檢查結果；無法開啟時回傳「無法開啟資料庫：<原因>」
+pub fn open_for_probe(
+    path: &Path,
+    busy: Duration,
+) -> Result<(Connection, Result<(), String>), String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("無法開啟資料庫：{e}"))?;
+    let _ = conn.busy_timeout(busy);
+    let writable = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("無法讀取資料庫：{e}"))
+        .and_then(|_| match conn.is_readonly(rusqlite::MAIN_DB) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("資料庫只能以唯讀開啟（權限或唯讀掛載）".to_string()),
+            Err(e) => Err(format!("無法確認資料庫是否可寫：{e}")),
+        });
+    Ok((conn, writable))
+}
+
+/// 主控台 API 唯讀連線池的連線（原本在 `api/db.rs`）：[`open_read_only`] 後設定 `query_only` 與 16 MB 快取
+pub fn open_console_reader(path: &Path) -> Result<Connection, Error> {
+    let conn = open_read_only(path)?;
+    conn.execute_batch("PRAGMA query_only = 1; PRAGMA cache_size = -16384;")
+        .map_err(|e| db_error("無法設定唯讀連線", e))?;
+    Ok(conn)
 }
 
 /// 在 Kairos 行程內開啟既有資料庫的讀寫連線（主控台 API 的低頻寫入）：只經由 SQLite 開啟，

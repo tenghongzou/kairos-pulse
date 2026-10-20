@@ -3,12 +3,36 @@
 import { h } from '../core/dom.js';
 import { t, has } from '../core/strings.js';
 import * as fmt from '../core/format.js';
-import { statusBadge } from '../ui/components.js';
+import { statusBadge, codeTag } from '../ui/components.js';
 
-/** 離線原因的中文（協定代碼以等寬字附在後面；ia.md §8） */
+/** 認得的離線原因（strings.js 有中文） */
+function knownReason(code) {
+  return Boolean(code) && has(`reason.${code}`);
+}
+
+/**
+ * 離線原因的中文（協定代碼以等寬字附在後面；ia.md §8）。不認得的值（較新版 Kairos 的列舉）一律「其他原因」，
+ * 不因新值而報錯（設計包 §31.6、S05「server_lost」）
+ */
 export function reasonText(code) {
   if (!code) return null;
-  return has(`reason.${code}`) ? t(`reason.${code}`) : code;
+  return knownReason(code) ? t(`reason.${code}`) : t('reason.other');
+}
+
+/** 詳情與紀錄中的離線原因：中文＋協定代碼；不認得的值為「其他原因」，原始值放在「技術細節」 */
+export function reasonDetail(code) {
+  if (!code) return null;
+  if (knownReason(code)) return [t(`reason.${code}`), ' ', codeTag(code)];
+  return [
+    t('reason.other'),
+    h('details', { class: 'k-details' }, h('summary', null, t('err.label.technical')), h('p', { class: 'k-code-line' }, `offline_reason = ${code}`)),
+  ];
+}
+
+/** 篩選選項的文字：不認得的值寫出原始值，避免多個「其他原因」無法分辨 */
+export function reasonFacet(code) {
+  if (!code) return null;
+  return knownReason(code) ? t(`reason.${code}`) : t('reason.otherFacet', { code });
 }
 
 /** 顯示名稱（沒有時為主機名稱） */

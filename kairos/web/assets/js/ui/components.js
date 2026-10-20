@@ -226,6 +226,15 @@ export function errorAlert(err, { title } = {}) {
   );
 }
 
+/**
+ * 收合的三段式（狀態列中的「最近一次錯誤」）：<details>，summary 為「查看」之類的可見文字，
+ * 展開後是標題、原因、處理方式、代碼與技術細節。err 與 errorAlert 相同（可只有 productCode、message）。
+ */
+export function codeDetails(err, { summary, title } = {}) {
+  const d = describe(err, { title });
+  return h('details', { class: 'k-details' }, h('summary', null, summary || t('err.label.view')), h('p', { class: 'strong' }, d.title), threePart(d));
+}
+
 /** 表單欄位（§6.2）：標籤在上、說明、錯誤以 aria-describedby 關聯 */
 export function field({ label, input, hint, error, required, id }) {
   const fid = id || input.id || uid('f');

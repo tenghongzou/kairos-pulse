@@ -69,6 +69,9 @@ sequenceDiagram
 | `deregister` | 除役通知（`hello.intent` 為 `deregister` 的連線上送 `deregister`，回 `deregister_ack`）。Kairos 0.5.0 起同 `renew` 的條件列出；Pulse 0.5.0 起只在除役通知的連線（`pulse decommission`）宣告 |
 | `inventory` | 主機資產：連線後與資產改變時送 `inventory` 訊息（作業系統、CPU、記憶體、廠牌型號序號、磁碟、網卡），回 `ack`（見 [`METRICS.md`](METRICS.md)「資產」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `inventory.enabled`（預設啟用）時宣告 |
 | `processes` | report 另帶行程排行 `processes`（依 CPU、依記憶體各前 N 個；需同時協商 `metrics`，見 [`METRICS.md`](METRICS.md)「行程」）。〔0.8.0 規格〕Kairos 以 SQLite 儲存時宣告；Pulse 在 `processes.enabled`（預設啟用）時宣告 |
+| `config` | 集中設定：Kairos 在 `hello_ack`／心跳的 `ack` 以 `pending.config_rev` 提示，Pulse 以 `config_get` 取得白名單內的設定、以 `config_status` 回報實際生效值與差異（見「遠端管理」與 [`REMOTE.md`](REMOTE.md) 第 3 節）。〔0.9.0：協定與共用型別在 `kairos-proto` 的 `mgmt` 模組；**Kairos 已實作**（K1，REMOTE.md 第 13.1 節）、**Pulse 已實作**（P1，REMOTE.md 第 17 節）〕Kairos 以 SQLite 儲存、mTLS、`[remote] config_enabled` 且 client 也宣告時列出；Pulse 在 `remote_config.enabled`（預設啟用）時宣告 |
+| `upgrade` | 遠端升級：`upgrade_get`／`upgrade_offer` 提議官方簽章的發佈包，`upgrade_chunk_get`／`upgrade_chunk` 經這條連線分段下載，`upgrade_status` 回報結果（見「遠端管理」與 [`REMOTE.md`](REMOTE.md) 第 4 節）。〔0.9.0：協定、簽章驗證與發佈清單的共用實作在 `kairos-proto` 的 `mgmt`、`release` 模組；**Kairos 已實作**（K2，REMOTE.md 第 13.1 節）、**Pulse 已實作**（P2，Linux；REMOTE.md 第 17 節）〕條件同 `config`（Kairos 另看 `[remote] upgrade_enabled`）；Pulse 在 `upgrade.enabled` 且本機準備就緒（`install.upgrade` 為 `ready`：信任錨、輔助程式）時宣告 |
+| `cluster` | 叢集連線：`hello_ack` 另帶 `server_node`（回應的節點名稱）與選用的 `cluster_id`，Kairos 可以送排空訊息 `drain` 要求 agent 改連其他節點（見「叢集與排空」）。〔0.9.0〕Kairos 只在 **client 也宣告時**才列出（同 `renew`）；Pulse 一律宣告（一次性連線除外） |
 
 日後新增功能（例如指令下發）時加入新的 feature 名稱，不必提升版本號；只有不相容的格式變更才需要 v3。註冊通道（8444 HTTPS）是另一份規格 [`ENROLL.md`](ENROLL.md)；8443 上與註冊有關的 `renew`、`deregister` 定義在本文件「憑證輪替與除役」（原為 ENROLL.md 第 13 節的草稿）。
 
@@ -87,6 +90,12 @@ sequenceDiagram
 | 0.4.0 以前（不宣告 `renew`／`deregister`） | 0.5.0 起 | 與 0.4.0 完全相同：Kairos 只在 client 宣告時才在 `hello_ack` 列出 `renew`、`deregister` 並帶 `expired_renew_grace_days`／`renew_now`，因此舊版 Pulse 收到的 `hello_ack` 不變 |
 | 0.5.0 起（宣告 `renew`） | 0.4.0 以前 | 舊版 Kairos 不列出 `renew`：Pulse 不送 `renew_request`，憑證到期前沒有自動輪替（維持 0.4 的行為：手動換憑證，或過期後經 8444 續簽）。除役通知的連線在 `hello_ack` 沒有 `deregister` 時直接關閉，不送 `deregister` |
 | 0.5.0 起（宣告 `renew`） | 0.5.0 起，`storage.backend = "jsonl"`（沒有註冊服務） | 同上：Kairos 不列出 `renew`、`deregister` |
+| 0.8.0 以前（不宣告 `cluster`） | 0.9.0 起 | 與 0.8.0 完全相同：Kairos 只在 client 宣告時才列出 `cluster`、帶 `server_node`，也只對協商了 `cluster` 的連線送 `drain`（其他連線在關機時照舊直接關閉） |
+| 0.9.0 起（宣告 `cluster`） | 0.8.0 以前 | 舊版 Kairos 不列出 `cluster`：沒有 `server_node`、不會收到 `drain`。Pulse 的多個伺服器位址（`server.fallback_addresses`）不依賴這個 feature，照常運作 |
+| 0.8.0 以前（不宣告 `config`／`upgrade`、沒有 `install`） | 0.9.0 起 | 與 0.8.0 完全相同：Kairos 只在 client 宣告時才列出 `config`、`upgrade`，也只在協商了其中之一時帶 `pending`。主控台顯示「不支援集中設定與遠端升級（需要 Pulse 0.9.0 以上）」；0.8 → 0.9 必須手動升級一次 |
+| 0.9.0 起（宣告 `config`／`upgrade`） | 0.8.0 以前，或 0.9.0 但 `storage.backend = "jsonl"`、沒有 mTLS | Kairos 不列出兩個 feature、忽略 `install`：Pulse 只用本機設定（遠端設定的快取保留不用），不會升級 |
+| 0.9.0 起，`remote_config.enabled = false` | 0.9.0 起 | 只協商 `upgrade`（若準備就緒）；`install.config` 為 `disabled` |
+| 0.9.0 起，`install.upgrade` 不是 `ready` | 0.9.0 起 | 只協商 `config`；主控台依 `install.upgrade` 顯示原因 |
 | 只支援 v2 的 client（`proto` 2，沒有範圍） | v1（舊版） | 舊版回 `unsupported_version`（`supported proto: 1`） |
 | 新版（1～2） | 未來只支援 v3 以上的伺服器 | `unsupported_version`，`proto_min`／`proto_max` 標示伺服器的範圍；Pulse 退避後重試，日誌提示更新 |
 
@@ -106,12 +115,14 @@ sequenceDiagram
 
 | type | 其他欄位 |
 |---|---|
-| `hello` | `proto`、`agent_id`、`hostname`（僅供顯示）、`agent_version`、`heartbeat_interval_ms`；v2 起另有選用的 `proto_min`、`proto_max`、`features`、`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os` |
+| `hello` | `proto`、`agent_id`、`hostname`（僅供顯示）、`agent_version`、`heartbeat_interval_ms`；v2 起另有選用的 `proto_min`、`proto_max`、`features`、`host_fingerprint`、`display_name`、`tags`、`report_interval_ms`、`os`、`install`（0.9.0 起） |
 | `heartbeat` | 無 |
 | `report` | v1：`cpu_usage`（%）、`total_memory`（MB）、`used_memory`（MB）。v2 且協商了 `metrics`：`metrics`（陣列，見「report（通用指標）」），不送三欄位。協商了 `durable`：另有 `boot_id`、`report_seq`（見「durable：at-least-once 投遞」）。協商了 `processes`：另有選用的 `processes`（見 [`METRICS.md`](METRICS.md)「行程」） |
 | `renew_request` | 協商了 `renew` 時：`request_id`、`csr`、`sent_at`（見「憑證輪替與除役」） |
 | `deregister` | 協商了 `deregister` 且 hello 帶 `intent: "deregister"` 時：`request_id`、`agent_id`、`reason`、`initiated_by`、`host_fingerprint`（選用）、`hostname`、`pulse_version`、`sent_at` |
 | `inventory` | 協商了 `inventory` 時：`inventory`（物件，見 [`METRICS.md`](METRICS.md)「資產」），回 `ack`。沒有協商時伺服器視為不認得的 `type`（`unknown_type`） |
+| `config_get`、`config_status` | 協商了 `config` 時（見「遠端管理」）。沒有協商時伺服器視為不認得的 `type`（欄位不合法時也是） |
+| `upgrade_get`、`upgrade_chunk_get`、`upgrade_status` | 協商了 `upgrade` 時（見「遠端管理」）。沒有協商時同上 |
 
 `hello` 另有選用的 `intent`（字串，目前只定義 `deregister`，見「憑證輪替與除役」）；不是字串時視為沒有。
 
@@ -119,11 +130,15 @@ sequenceDiagram
 
 | type | 欄位 |
 |---|---|
-| `hello_ack` | `seq`、`proto`、`offline_after_ms`；v2 另有 `features`（字串陣列）、`server_time`（伺服器送出時的時間，RFC 3339 UTC 毫秒，例如 `2026-10-08T03:15:40.012Z`，供 client 檢查時鐘偏差）；協商了 `renew` 時另有 `expired_renew_grace_days`（u32）與選用的 `renew_now`（布林），型別不符時視為沒有 |
-| `ack` | `seq` |
-| `error` | `seq`（可為 `null`）、`code`、`message`、`fatal`；`unsupported_version` 另有 `proto_min`、`proto_max`（新版 Kairos 起） |
+| `hello_ack` | `seq`、`proto`、`offline_after_ms`；v2 另有 `features`（字串陣列）、`server_time`（伺服器送出時的時間，RFC 3339 UTC 毫秒，例如 `2026-10-08T03:15:40.012Z`，供 client 檢查時鐘偏差）；協商了 `renew` 時另有 `expired_renew_grace_days`（u32）與選用的 `renew_now`（布林）；協商了 `cluster` 時另有 `server_node`（string）與選用的 `cluster_id`（UUID）；協商了 `config` 或 `upgrade` 時另有 `pending`（物件，見「遠端管理」）。這些欄位型別不符時都視為沒有 |
+| `ack` | `seq`；回應 `heartbeat` 的 `ack` 在協商了 `config` 或 `upgrade` 時另有 `pending`（回應其他訊息的不帶） |
+| `error` | `seq`（可為 `null`）、`code`、`message`、`fatal`；`unsupported_version` 另有 `proto_min`、`proto_max`（新版 Kairos 起）；回應 `upgrade_chunk_get` 的 `rate_limited` 另有 `retry_after_ms`（u32） |
 | `renew_result` | 回應 `renew_request`：`seq`、`request_id`、`state`（`issued`）、`certificate`、`policy`、`server_time` |
 | `deregister_ack` | 回應 `deregister`：`seq`、`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned` |
+| `drain` | 協商了 `cluster` 時：`seq`（一律 `null`）、`reason`、`reconnect_within_ms`（見「叢集與排空」）。不回應任何訊息 |
+| `config` | 協商了 `config` 時回應 `config_get`：`seq`、`rev`、`hash`、`settings`、`sources`（選用）、`issued_at`（見「遠端管理」） |
+| `upgrade_offer` | 協商了 `upgrade` 時回應 `upgrade_get`（見「遠端管理」） |
+| `upgrade_chunk` | 協商了 `upgrade` 時回應 `upgrade_chunk_get`：`seq`、`upgrade_id`、`filename`、`offset`、`data`、`eof` |
 
 `fatal` 為 `true` 時，伺服器送出該錯誤後會關閉連線。
 
@@ -150,8 +165,9 @@ Pulse 解析 `error` 時容忍欄位缺漏，不會整則忽略：缺 `seq` 視�
 | `tags` | v2 起，選用。字串陣列，最多 32 個，每個 1～64 bytes，字元限制同 `hostname`，不得重複（區分大小寫） | `bad_request` |
 | `report_interval_ms` | v2 起，選用。client 的 report 間隔（毫秒），整數 1000～86400000，供伺服器判定回報延遲 | `bad_request` |
 | `os` | v2 起，選用。物件，欄位 `name`（作業系統名稱）、`version`（作業系統版本）、`kernel`（核心版本）、`arch`（CPU 架構）都可省略，各 1～128 bytes，字元限制同 `hostname`；其他欄位忽略 | `bad_request` |
+| `install` | v2 起，選用（0.9.0 起的 Pulse）。物件，欄位 `method`、`upgrade`、`config` 都可省略，各 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值不是錯誤，其他欄位忽略（見「遠端管理」） | `bad_request` |
 
-Pulse 端的 `heartbeat.interval` 設定上限為 60 秒，與上表一致。v2 的選用欄位為 `null` 時視同省略。協商結果為 v1 時，`host_fingerprint` 到 `os` 的欄位一律忽略（型別錯誤也不檢查）。
+Pulse 端的 `heartbeat.interval` 設定上限為 60 秒，與上表一致。v2 的選用欄位為 `null` 時視同省略。協商結果為 v1 時，`host_fingerprint` 到 `install` 的欄位一律忽略（型別錯誤也不檢查）。
 
 ### 主機指紋
 
@@ -260,13 +276,14 @@ report 另帶兩個欄位：
 | `superseded` | 同一個 `agent_id` 建立了新連線，舊連線被關閉 | 是 |
 | `auth_failed` | 伺服器啟用 mTLS 時，`hello` 的 `agent_id` 與客戶端憑證不符（`message` 為 `agent_id does not match client certificate`），或憑證含多個 DNS SAN（`message` 為 `client certificate must contain exactly one DNS SAN`）（見「身分驗證」） | 是 |
 | `certificate_rejected` | 伺服器啟用 mTLS 時，收到 `hello` 時重新驗證不通過，或連線期間伺服器重新驗證時發現（見「身分驗證」）。客戶端憑證已被撤銷、過期或不再受信任時 `message` 為 `client certificate has been revoked or is no longer trusted`；伺服器無法判定撤銷狀態（CRL 已過期、或缺少某一層 CA 的 CRL）時 `message` 為 `revocation status unavailable`，屬伺服器端問題，客戶端不需重新簽發憑證 | 是 |
-| `storage_unavailable` | 伺服器沒有保存這筆 `report`；伺服器只在**確定未寫入**時回此錯誤，這筆資料未保存（協商了 `durable` 時 client 稍後重送）。`message` 為 `report could not be stored`（寫入失敗，例如磁碟已滿、資料目錄無法寫入、等待寫入逾時且已取消、當天的資料檔已達伺服器的每日大小上限，或伺服器的主機清冊已滿）或 `report rate limit exceeded`（同一來源的 `report` 送得太快，見「逾時與離線判定」的速率限制）。`inventory` 也以此錯誤表示未保存（`message` 同上，或 `inventory rate limit exceeded`：同一條連線兩則 `inventory` 間隔不到 60 秒；client 稍後重送） | 否 |
+| `storage_unavailable` | 伺服器沒有保存這筆 `report`；伺服器只在**確定未寫入**時回此錯誤，這筆資料未保存（協商了 `durable` 時 client 稍後重送）。`message` 為 `report could not be stored`（寫入失敗，例如磁碟已滿、資料目錄無法寫入、等待寫入逾時且已取消、當天的資料檔已達伺服器的每日大小上限，或伺服器的主機清冊已滿）或 `report rate limit exceeded`（同一來源的 `report` 送得太快，見「逾時與離線判定」的速率限制）。`inventory` 也以此錯誤表示未保存（`message` 同上，或 `inventory rate limit exceeded`：同一條連線兩則 `inventory` 間隔不到 60 秒；client 稍後重送）。`config_get`、`config_status`、`upgrade_status` 無法讀寫資料庫時也回此錯誤（Pulse 稍後重送） | 否 |
 | `bad_request` | 該行不是合法 UTF-8、不是合法 JSON（含超出 f64 範圍的數字）、欄位缺漏或型別錯誤（含 v2 report 的 `metrics`、durable report 的 `boot_id`／`report_seq`）、`hello` 欄位不合限制（含 v2 的版本範圍、features 與主機資訊）、`ts` 超過 64 bytes 或含禁止的字元；另外，伺服器狀態表已滿而無法登記新的 `agent_id` 時，以 fatal 的 `bad_request` 回應 `hello`（`message` 為 `server agent registry is full`） | 否（連續達上限、或狀態表已滿時是） |
 | `unknown_type` | 不認得的 `type` | 否（連續達上限時是） |
 | `already_registered` | 同一連線送了第二次 `hello` | 否 |
 | `renew_requires_approval` | `renew_request`：政策要求人工核准，申請已進入待核准佇列（類型「憑證更新」）；核准後以**同一個 CSR** 重送即得到 `renew_result` | 否 |
 | `invalid_csr` | `renew_request`：`csr` 不是合法的 base64url DER、CSR 不符 ENROLL.md 第 15.1 節（SAN 與這條連線的 `agent_id` 不符、不是 P-256、簽章無效、公鑰與這台主機用過的相同），或同一個 CSR 的申請已被拒絕或逾期 | 否 |
-| `rate_limited` | `renew_request`：同一個 `agent_id` 每小時超過 10 次 | 否 |
+| `rate_limited` | `renew_request`：同一個 `agent_id` 每小時超過 10 次。`upgrade_chunk_get`：同時下載的主機數超過 Kairos 的上限（`[remote] max_concurrent_downloads`），另帶 `retry_after_ms`（u32），client 依此等待（加 ±20% 抖動）後續傳 | 否 |
+| `upgrade_unavailable` | `upgrade_get`、`upgrade_chunk_get`：沒有這個 `upgrade_id`、推送已暫停或取消、這台主機已不在推送中、檔案不在提議中或已從版本庫刪除。Pulse 停止這次升級，刪除暫存（`staged` 之前）或保留到下一個提議（`staged`，同一個目標版本時沿用） | 否 |
 | `invalid_report` | v1 格式：`cpu_usage` 不是有限值或不在 0～100 之間，或 `used_memory` 大於 `total_memory`（Pulse 送出前會先把 `cpu_usage` 夾在 0～100）。v2 的 `metrics`：不符「report（通用指標）」的限制。協商了 `processes` 的 report：`processes` 不符 METRICS.md 的限制；協商了 `inventory` 的 `inventory`：內容不符 METRICS.md 的限制。這筆資料不會保存 | 否 |
 
 **連續無效訊息上限**：同一連線連續 5 則無效訊息（`bad_request` 與 `unknown_type` 合計，中間沒有合法訊息）時，第 5 則改為 fatal 並關閉連線。註冊前與註冊後都適用；`hello` 欄位不合限制也計入。
@@ -315,6 +332,149 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 - `deregister_ack`：`seq`、`request_id`、`agent_id`、`state`（`decommissioned`）、`decommissioned_at`、`certificate_revoked`、`already_decommissioned`（重送時為 `true`，冪等）。
 - **10 分鐘視窗**（ENROLL.md 第 18 節第 1 項）：依政策（`pki.policy.revoke_on_self_decommission`）撤銷這條連線的憑證，撤銷在除役後 10 分鐘生效。這段期間清冊已是「已除役」，該 `agent_id` 的 `hello` 只要不是 `intent: "deregister"` 一律以 fatal 的 `certificate_rejected` 關閉；`intent: "deregister"` 只回 `already_decommissioned: true`。所有狀態都在資料庫，Kairos 重新啟動不會延長或縮短視窗。
 
+## 叢集與排空（feature `cluster`）
+
+〔0.9.0〕Kairos 的高可用部署（`kairos/HA.md`）有多個節點；agent 可能經 L4 負載平衡器、虛擬 IP，或 Pulse 自己的多個伺服器位址（`server.fallback_addresses`）連到其中任何一個。feature `cluster` 讓 agent 知道自己連到哪個節點，並讓節點在排空或關機時要求 agent 有秩序地改連其他節點。只在協商結果為 v2、雙方都宣告時使用；訊息內容的型別：`kairos-proto` 的 `cluster` 模組與 `ServerMsg::Drain`。
+
+### 節點資訊
+
+協商了 `cluster` 時 `hello_ack` 另帶：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `server_node` | string | 回應的節點名稱（Kairos 的 `cluster.node_id`，預設為主機名稱的第一段，轉成小寫）。1～63 bytes，只有小寫英文字母、數字與 `-`，不以 `-` 開頭或結尾 |
+| `cluster_id` | string | 選用。叢集的 UUID（Kairos 以叢集模式執行時才送；單機的 Kairos 不送） |
+
+型別或格式不符時視為沒有，不影響整則 `hello_ack`。Pulse 把 `server_node` 寫進日誌與狀態檔（`pulse status`），用來診斷「連到哪個節點」；`cluster_id` 在同一個 Pulse 行程內改變時記 `WARN`（候選位址可能指到了另一套獨立的 Kairos，durable 的去重在不同的資料庫之間無效）。
+
+### 排空訊息 `drain`（Kairos → Pulse）
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `type` | `"drain"` | |
+| `seq` | `null` | 不回應任何訊息 |
+| `reason` | string | `node_draining`（維運排空或節點關機）、`rebalance`（之後的負載重新分配，目前不送）。client 不認得的值一律當成排空 |
+| `reconnect_within_ms` | u32 | client 在 `[0, reconnect_within_ms]` 之間隨機選一個延遲後重連。1000～300000，超出範圍時 client 夾在範圍內，缺漏或型別不符時為 10000。Kairos 送 `max(10000, 連線數 × 5)`，避免所有 agent 同時湧向其他節點 |
+
+**Pulse 收到後**：
+
+1. 停止送出新的 report（取樣照常寫進本機緩衝，協商了 `durable` 時之後補送；沒有協商時這段期間的取樣不送出）；
+2. 等待在途的 report 收到回應（最多 8 秒；沒有回應的 report 在協商了 `durable` 時於下一條連線重送）；
+3. 送出 TLS close_notify 並關閉連線；
+4. 依延遲重連，從候選位址清單中**目前位址的下一個**開始（只有一個位址時就是同一個，由負載平衡器導向其他節點）。
+
+這次斷線不算連線失敗、不增加退避；「連續被 `superseded`」的次數與其他原因的斷線一樣歸零。Pulse 記 `PLS-I8507`（資訊）。
+
+**Kairos 端**：只對協商了 `cluster` 的連線送 `drain`。0.9.0 在**優雅關機**時先對這些連線送 `drain`（`reason` 為 `node_draining`），再送出 close_notify 關閉；其他連線照舊直接關閉（舊版 Pulse 依退避重連）。由維運命令排空節點（`kairos cluster drain`）留待叢集模式實作。舊版 Pulse 收到不認得的 `type` 只會忽略（記 DEBUG），所以即使誤送也不會壞，但規格上沒有協商時不送。
+
+### 多個伺服器位址（client 端）
+
+協定本身不變；以下是 Pulse 0.9.0 起的連線行為，與 `cluster` 是否協商無關：
+
+- 候選位址＝`server.address:server.port`，接著 `server.fallback_addresses`（依設定順序，重複的只留第一個）。所有位址都以同一個 `server.domain` 驗證伺服器憑證，因此每個節點的伺服器憑證都必須含這個名稱。
+- **一輪**＝從第一個候選位址開始依序嘗試。收到 `hello_ack` 之前的任何失敗（DNS、TCP、逾時、TLS、收到 `error` 或斷線）都**立即**改試下一個（兩次嘗試之間只隔 0～500 ms 的隨機延遲），不增加退避；整輪都失敗後才依「重連」的指數退避等待，下一輪再從第一個開始。
+- 連上之後不主動切回第一優先；斷線後下一輪自然從第一個開始。被 `superseded` 時不改試其他位址（身分衝突，換節點也一樣）。
+- 重送的 durable report 內容不變（`boot_id`、`report_seq` 與連到哪個節點無關）；所有候選位址必須屬於共用同一個資料庫的同一個叢集，去重才是全叢集的。
+
+## 遠端管理（feature `config`、`upgrade`）
+
+〔0.9.0；原為 [`REMOTE.md`](REMOTE.md) 第 2 節的草稿，該文件仍是集中設定、遠端升級、安全模型與兩端行為的工程規格〕Kairos 下發 Pulse 的部分設定（集中設定）與推送官方簽章的 Pulse 發佈包（遠端升級）。沿用「Pulse 送、Kairos 回」的一問一答：Kairos 只在 `hello_ack` 與回應 `heartbeat` 的 `ack` 中以 `pending` 提示，不新增伺服器主動送出的訊息，「伺服器回應延遲最多 8 秒」的推論不變。訊息內容的型別、驗證與設定白名單：`kairos-proto` 的 `mgmt` 模組；發佈包的簽章、雜湊、檔名與清單：`release` 模組。
+
+**協商**：兩個 feature 都只在協商結果為 v2、雙方都宣告、這條連線以用戶端憑證（mTLS）證明身分、且 Kairos 以 SQLite 儲存時使用；Kairos 只在 client 也宣告時才在 `hello_ack` 列出（同 `renew`），另依 `[remote] config_enabled`／`upgrade_enabled`（預設都啟用）。沒有協商時，`config_get`、`config_status`、`upgrade_get`、`upgrade_chunk_get`、`upgrade_status` 一律視為不認得的 `type`（`unknown_type`，欄位不合法時也是），與 0.8 相同；新欄位與新訊息只在協商了對應 feature 的連線上出現，協定版本不升。
+
+### hello 的 `install`
+
+0.9.0 起的 Pulse 在 hello 另帶選用的 `install` 物件（v2 選用欄位，不論是否宣告 `config`／`upgrade` 都送），讓主控台區分「Pulse 太舊」「本機停用」「缺少輔助程式」等原因。限制見「`hello` 欄位限制」；協商結果為 v1 時忽略。
+
+| 欄位 | 說明 |
+|---|---|
+| `method` | 安裝方式：`tar`、`deb`、`rpm`、`msi`、`zip`、`unknown`（偵測方式見 REMOTE.md 第 4.3 節） |
+| `upgrade` | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）。不是 `ready` 時 Pulse **不宣告** `upgrade` |
+| `config` | 集中設定的本機狀態：`enabled`、`disabled` |
+
+### `pending`
+
+協商了 `config` 或 `upgrade` 的連線上，Kairos 在 `hello_ack` 與**回應 `heartbeat` 的 `ack`** 另帶 `pending` 物件（回應 `report` 等其他訊息的 `ack` 不帶）：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `config_rev` | u64 | 協商了 `config` 時才有：這台主機目前應套用的設定版本；`0` 表示沒有任何下發設定（Pulse 以空的 `settings` 處理：回到本機與內建預設） |
+| `upgrade_id` | string | 協商了 `upgrade` 且有提議給這台主機時才有：推送中這台主機的升級 ID（UUID） |
+
+- Pulse 收到的 `config_rev` 與本機已套用的版本不同時送 `config_get`；收到不認得的 `upgrade_id`（與正在處理、或已完成的不同）時送 `upgrade_get`。延遲上限為一個心跳間隔。
+- `pending` 不是物件、或欄位型別不符（`upgrade_id` 不是 UUID）時 Pulse 視為沒有該欄位（與 `renew_now` 相同的容錯）。
+
+### 集中設定的訊息
+
+| 訊息 | 方向 | 欄位 |
+|---|---|---|
+| `config_get` | P → K | `seq`、`ts`、`have_rev`（u64，本機已套用的版本，沒有時 `0`） |
+| `config` | K → P | `seq`（回應的 `config_get`）、`rev`（u64）、`hash`、`settings`（物件）、`sources`（物件，鍵為設定鍵、值為設定檔名稱，供本機顯示來源；選用）、`issued_at`（RFC 3339 UTC 毫秒） |
+| `config_status` | P → K | `seq`、`ts`、`rev`、`hash`、`state`、`effective`、`overridden`、`ignored`、`errors`、`code`（見下表），回 `ack`（只有 `seq`） |
+
+- `settings`：兩層物件 `{"<區段>": {"<鍵>": <值>}}`，區段與鍵與 `pulse.toml` 相同（例如 `{"report":{"interval":10},"log":{"level":"debug"}}`），巢狀區段以 `.` 表示；值的型別與 `pulse.toml` 相同（整數、布林、字串、字串陣列）。只能出現白名單中的鍵（REMOTE.md 第 3.1 節，`mgmt::settings::SETTINGS`），Kairos 依主機回報的 `agent_version` 只送該版本認得的鍵。單行上限照舊適用（白名單全部填滿約 2 KB）。
+- `hash`：`sha256:` 加 64 個小寫十六進位字元，為 `settings` **正規化 JSON** 的 SHA-256。正規化 JSON：物件的鍵依字典序（UTF-8 位元組順序）排列、沒有任何空白、數字與字串照 serde_json 的輸出（字串只跳脫 `"`、`\` 與控制字元）。Pulse 收到 `hash` 與 `settings` 不符的 `config` 時當作沒有收到。
+
+`config_status` 的欄位：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `rev`、`hash` | u64、string | 這次處理的版本；`state` 為 `disabled` 時為本機最後一次套用的版本（沒有時 `0`、`""`） |
+| `state` | string | `applied`（已套用；含部分鍵被本機覆蓋或忽略）、`rejected`（驗證失敗，整份不套用，沿用上一版）、`rolled_back`（套用後健康確認失敗，已回復上一版）、`disabled`（本機停用集中設定；只在停用後的第一次連線送一次，之後不宣告 `config`） |
+| `effective` | object | 白名單中每個鍵**實際生效的值**（合併後，與 `settings` 同一種兩層格式） |
+| `overridden` | array | 被本機覆蓋的鍵：`{"key":"report.interval","remote":10,"local":5,"source":"pulse.toml"}`；`source` 為 `pulse.toml` 或 `env`。本機值與下發值相同時不列 |
+| `ignored` | array | 沒有套用、但不影響其他鍵的項目：`{"key":"…","reason":"unknown_key"\|"unsupported_platform"\|"not_more_restrictive"}`。只能在本機設定的鍵與值（例如 `processes.command = "full"`）為 `unknown_key` |
+| `errors` | array | `state` 為 `rejected`／`rolled_back` 時的原因：`{"key":"report.interval","reason":"out_of_range","message":"…"}`（`reason` 為 `type_mismatch`、`out_of_range`、`invalid_value`、`conflict`；`message` ≤ 256 bytes，字元限制同 `hostname`） |
+| `code` | string 或 `null` | 對應的 Pulse 代碼（例如 `PLS-W0501`），沒有時 `null` |
+
+- Pulse 在**每條新連線的 `hello_ack` 之後**送一次，以及每次處理 `config` 之後送一次；未收到 `ack` 就斷線時，重連後再送（內容以當時的狀態為準）。
+- `overridden`、`ignored`、`errors` 各最多 64 項；超過時截斷，最後一項為 `{"key":"*","reason":"truncated"}`。違反這些限制時 Kairos 回 `bad_request`。
+- Kairos 以「(主機, `rev`, `state`) 最新的一則」更新紀錄；`rev` 比已記錄的舊時只更新 `effective`／`overridden`，不倒退版本。
+
+### 遠端升級的訊息
+
+| 訊息 | 方向 | 欄位 |
+|---|---|---|
+| `upgrade_get` | P → K | `seq`、`ts`、`upgrade_id` |
+| `upgrade_offer` | K → P | `seq`、`upgrade_id`、`rollout_id`、`action`（`upgrade`／`downgrade`）、`target`（`version`、`commit`）、`artifact`、`rollback_artifact`（選用）、`manifest`、`sha256sums`、`signature`、`apply_window`、`health_timeout_secs`、`allow_downgrade` |
+| `upgrade_chunk_get` | P → K | `seq`、`ts`、`upgrade_id`、`filename`、`offset`（u64）、`length`（1～32768） |
+| `upgrade_chunk` | K → P | `seq`、`upgrade_id`、`filename`、`offset`、`data`（標準 base64，含補位）、`eof`（布林：這段之後沒有資料） |
+| `upgrade_status` | P → K | `seq`、`ts`、`upgrade_id`、`state`、`from_version`、`to_version`、`code`、`detail`、`progress`（選用），回 `ack` |
+
+`upgrade_offer` 的欄位：
+
+| 欄位 | 說明 |
+|---|---|
+| `artifact` | `filename`（發佈檔名 `pulse-<版本>-<commit>-<os>-<arch>.<格式>`）、`size`（bytes，1～128 MiB）、`sha256`（64 個小寫十六進位）、`source`（`kairos`：以 `upgrade_chunk_get` 從這條連線下載；`url`：從 `url` 下載，0.10.0）、`url`（`source` 為 `url` 時，`https://` 開頭、≤ 2048 bytes） |
+| `rollback_artifact` | deb／rpm／msi 的主機才有：**目前版本**、同格式同平台的發佈檔（欄位同 `artifact`），自動回滾時使用；版本庫沒有時省略 |
+| `manifest` | 發佈清單的檔名與內容：`{"filename":"pulse-0.9.1-…-release.json","content":"<JSON 字串>"}`（≤ 8 KiB）。0.9.0 以前的發佈沒有清單，此欄為 `null`，只能作為降版或回滾目標 |
+| `sha256sums` | 該次發佈的 `SHA256SUMS` 全文（≤ 16 KiB） |
+| `signature` | `SHA256SUMS.sig` 全文（≤ 4 KiB，`-----BEGIN SSH SIGNATURE-----` 格式） |
+| `apply_window` | `not_before`、`not_after`（RFC 3339）：Pulse 只在這段期間**開始替換**；下載與驗證可以提早。超過 `not_after` 仍未開始時放棄（`state: expired`） |
+| `health_timeout_secs` | 替換後的健康確認期限（120～3600） |
+| `allow_downgrade` | 推送是否允許降版；Pulse 只在這個值**與**本機 `upgrade.allow_downgrade` 都為 `true` 時接受低於目前版本的目標 |
+
+Pulse 收到提議後以**本機信任錨**驗證（REMOTE.md 第 4.2.2 節，`release` 模組）：`allowed_signers` 只接受 `ssh-ed25519` 與 `namespaces=`（必須列出 `kairos-pulse-release`）、`valid-after=`、`valid-before=` 選項，principal 為 `release@kairos-pulse` 或本機 `upgrade.extra_principals`；SSHSIG 的 namespace 為 `kairos-pulse-release`、雜湊演算法 `sha512`；清單與發佈檔都列在 `SHA256SUMS` 中且雜湊相符；檔名的版本、commit 與清單、`target` 一致，平台與格式與本機相符；版本政策與清單的 `min_upgrade_from`。簽章失敗為 `PLS-E8401`，其他為 `PLS-E8402`。
+
+下載（`source: "kairos"`）：
+
+- 每段最多 32768 bytes（base64 後約 43.7 KB，加上 JSON 不超過單行上限）。`filename` 只能是這次提議的 `artifact`、`rollback_artifact` 之一，否則 `upgrade_unavailable`。
+- Pulse 同一時間最多 **2 段**在途（另計，不占 durable report 的在途筆數）；依 `offset` 順序寫入暫存檔，斷線後從已寫入的長度續傳。全部收到後以 `artifact.sha256` 檢查，不符時刪除重來（連續 3 次不符時放棄，`PLS-E8402`）。
+- 段落請求計入每條連線的訊息速率限制。Kairos 以 `[remote] max_concurrent_downloads`（預設 100 台）限制同時下載的主機數；超過時回非 fatal 的 `rate_limited`，另帶 `retry_after_ms`。一台主機超過 10 分鐘沒有請求下一段時釋出名額。
+
+`upgrade_status` 的欄位：
+
+| 欄位 | 說明 |
+|---|---|
+| `state` | `accepted`（收到提議、開始下載）、`declined`（拒絕：本機停用、降版、不支援、空間不足、`min_upgrade_from` 不符）、`staged`（下載並驗證完成，等待時段）、`expired`（超過 `apply_window.not_after` 未開始）、`applying`（已交給輔助程式）、`succeeded`、`failed`（替換前或替換中失敗，沒有變更、或已復原）、`rolled_back`（健康確認失敗，已回到原版本）、`rollback_failed`（回滾也失敗，需要人工處理） |
+| `from_version`、`to_version` | 替換前與目標版本（0～64 bytes，字元限制同 `hostname`） |
+| `code` | Pulse 代碼或 `null` |
+| `detail` | 0～512 bytes，字元限制同 `hostname`（例如套件管理員的最後一行錯誤） |
+| `progress` | 選用：`{"bytes":1048576,"total":10485760}`；`accepted` 之後每完成 25% 送一次 |
+
+- `applying` 之後的狀態（`succeeded`、`rolled_back`、`rollback_failed`、`failed`）由**替換後的 Pulse**（新版，或回滾後的原版）在重新連線、`hello_ack` 之後送出：結果先寫在本機的狀態檔，收到 `ack` 才標為已回報（at-least-once）。Kairos 以 (`upgrade_id`, `state`) 去重，並以 hello 的 `agent_version` 交叉確認（收到 `succeeded` 而版本不是目標版本時記 `KRS-W8402`）。
+- `upgrade_get`、`upgrade_chunk_get`、`upgrade_status` 的 `upgrade_id` 不是 UUID、`state` 不在上表、文字超過限制時 Kairos 回 `bad_request`。
+
 ## 逾時與離線判定
 
 Kairos 的 TLS 握手、等待 `hello`、寫出逾時可在設定檔 `[timeouts]` 調整，下表為預設值。
@@ -345,6 +505,7 @@ Kairos 的 TLS 握手、等待 `hello`、寫出逾時可在設定檔 `[timeouts]
 - **連續被 `superseded`**：第一次因 `superseded` 斷線視同一般斷線（連線維持 30 秒以上照常重置退避）。連續第 2 次起，不論連線維持多久都**不重置退避**，且重連延遲**至少 30 秒**（這是「`retry.max_delay` 為延遲上限」的唯一例外）：兩台主機共用同一份 `agent.id` 時，雙方各自維持 30 秒以上再被對方踢掉，若重置或延遲太短就會永久快速互踢。此時 Pulse 以 `ERROR` 記錄並提示可能有多台主機共用 `agent.id`（`ERROR` 每 10 分鐘最多一則，其餘次數記 `WARN`）。因其他原因斷線時，連續次數歸零。
 - 沒有協商 `durable` 時（任一端為 0.2.0 以前的版本，或 Pulse 停用了本機緩衝），`report` 採 at-most-once：送不出去就丟棄，不會重送舊資料。Pulse 同一時間只有一筆 `report` 在途：送出後到收到伺服器對它（或之後訊息）的回應（`ack` 或帶 `seq` 的 `error`，含 `storage_unavailable`）之前，新的取樣直接丟棄；斷線時清除。伺服器寫檔緩慢時不會在伺服器端無限積壓。
 - 協商了 `durable` 時採 at-least-once：重連後先依序補送積壓的資料（含斷線前已送出、尚未收到 `ack` 的），再送新的取樣（見「durable：at-least-once 投遞」）。
+- 設定了多個伺服器位址時，上面的退避以「一輪」為單位：同一輪中收到 `hello_ack` 之前失敗就立即改試下一個位址，整輪都失敗才退避（見「叢集與排空」的「多個伺服器位址」）。因 `drain` 斷線時不退避，改依 `reconnect_within_ms` 的隨機延遲重連。
 
 ## 範例
 
@@ -407,6 +568,43 @@ P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["der
 K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","deregister"],"server_time":"2026-10-14T03:00:00.008Z"}
 P {"type":"deregister","seq":2,"ts":"2026-10-14T03:00:00.010Z","request_id":"6c0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","reason":"uninstall_purge","initiated_by":"msi","host_fingerprint":"sha256:355cf5ed40956a057645145cccf74f594102726167e94e3511aae182acc4ec43","hostname":"web-01","pulse_version":"0.5.0","sent_at":"2026-10-14T03:00:00.010Z"}
 K {"type":"deregister_ack","seq":2,"request_id":"6c0e9c1a-8d27-4f63-a1e4-7c9d2b6f3e81","agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","state":"decommissioned","decommissioned_at":"2026-10-14T03:00:00.015Z","certificate_revoked":true,"already_decommissioned":false}
+```
+
+### 叢集
+
+0.9.0 的 Pulse 與 0.9.0 的 Kairos：hello 宣告 `cluster`，hello_ack 列出並帶 `server_node`（單機的 Kairos 不帶 `cluster_id`；叢集模式的 hello_ack 另帶 `cluster_id`）；Kairos 關機時送 `drain`：
+
+```
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","cluster"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.9.0","heartbeat_interval_ms":15000,"ts":"2026-10-19T02:00:00.001Z"}
+K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","cluster"],"server_time":"2026-10-19T02:00:00.009Z","server_node":"kairos-a","cluster_id":"3f6c2b1a-9d4e-4f8a-b7c6-1e2d3c4b5a69"}
+P {"type":"heartbeat","seq":2,"ts":"2026-10-19T02:00:15.002Z"}
+K {"type":"ack","seq":2}
+K {"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":10000}
+```
+
+### 遠端管理
+
+0.9.0 的 Pulse（tar 安裝、準備就緒）與 0.9.0 的 Kairos：hello 宣告 `config`、`upgrade` 並帶 `install`，hello_ack 帶 `pending`；取得並回報設定（`hash` 是 `settings` 正規化 JSON 的實際雜湊）；心跳的 `ack` 提示升級，取得提議（`sha256sums`、`signature`、`manifest` 是 `kairos-proto/testdata/release` 中以 `ssh-keygen -Y sign` 產生的真實測試向量，以測試金鑰簽署）、分段下載、回報狀態；最後兩則是下載併發超過上限與推送已取消時的錯誤：
+
+```
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","renew","inventory","processes","config","upgrade"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.9.0","heartbeat_interval_ms":15000,"ts":"2026-11-20T02:00:00.001Z","os":{"name":"Ubuntu","version":"24.04","arch":"x86_64"},"install":{"method":"tar","upgrade":"ready","config":"enabled"}}
+K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","renew","inventory","processes","config","upgrade"],"server_time":"2026-11-20T02:00:00.009Z","expired_renew_grace_days":90,"pending":{"config_rev":42}}
+P {"type":"config_get","seq":2,"ts":"2026-11-20T02:00:00.020Z","have_rev":37}
+K {"type":"config","seq":2,"rev":42,"hash":"sha256:68123d3318acb4f58391d094f1df791c233209e5b619b77b249059c3e1e05fd1","settings":{"report":{"interval":10},"log":{"level":"debug"},"processes":{"top":10}},"sources":{"report.interval":"正式環境 Linux","log.level":"web-01 除錯","processes.top":"正式環境 Linux"},"issued_at":"2026-11-20T02:00:00.025Z"}
+P {"type":"config_status","seq":3,"ts":"2026-11-20T02:00:00.140Z","rev":42,"hash":"sha256:68123d3318acb4f58391d094f1df791c233209e5b619b77b249059c3e1e05fd1","state":"applied","effective":{"report":{"interval":5},"log":{"level":"debug"},"processes":{"top":10}},"overridden":[{"key":"report.interval","remote":10,"local":5,"source":"pulse.toml"}],"ignored":[],"errors":[],"code":"PLS-I0503"}
+K {"type":"ack","seq":3}
+P {"type":"heartbeat","seq":4,"ts":"2026-11-20T02:00:15.002Z"}
+K {"type":"ack","seq":4,"pending":{"config_rev":42,"upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70"}}
+P {"type":"upgrade_get","seq":5,"ts":"2026-11-20T02:00:15.010Z","upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70"}
+K {"type":"upgrade_offer","seq":5,"upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70","rollout_id":"r-20261120-0001","action":"upgrade","target":{"version":"0.9.1","commit":"5e6f7a8"},"artifact":{"filename":"pulse-0.9.1-5e6f7a8-linux-x86_64.tar.gz","size":54,"sha256":"7316ae7e8e9cba500abf443d5559acc9cb5f59b30f9917cf494ec15c7d391634","source":"kairos"},"manifest":{"filename":"pulse-0.9.1-5e6f7a8-release.json","content":"{\"schema\":\"kairos-pulse.release/v1\",\"product\":\"pulse\",\"version\":\"0.9.1\",\"commit\":\"5e6f7a8\",\"released_at\":\"2026-11-18\",\"min_kairos\":\"0.5.0\",\"min_upgrade_from\":\"0.9.0\",\"remote_features\":[\"config\",\"upgrade\"],\"unit\":{\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"previous_sha256\":[\"2222222222222222222222222222222222222222222222222222222222222222\"]},\"breaking\":false}\n"},"sha256sums":"a13150fd321e47d0185375b08ea5f5352630234eae50b8f5cf8b4030ad698d20  pulse-0.9.1-5e6f7a8-linux-x86_64.deb\n7316ae7e8e9cba500abf443d5559acc9cb5f59b30f9917cf494ec15c7d391634  pulse-0.9.1-5e6f7a8-linux-x86_64.tar.gz\nc0ca452da673446c2d501e414254c143b19f1a4cb8ad52c9555a3b73214bc5fd  pulse-0.9.1-5e6f7a8-release.json\n","signature":"-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAglvGKPBvvvP3WlBBnio+5ypW7+M\nBBHkqe+l/j1JMB/LkAAAAUa2Fpcm9zLXB1bHNlLXJlbGVhc2UAAAAAAAAABnNoYTUxMgAA\nAFMAAAALc3NoLWVkMjU1MTkAAABAbEbE59WaG132LoCWEqVXyGUI9MuzakoKovbgISw5Di\nmsmIO3+pB6KzzHJvFHOmZS9G+ZhLEU4PI9Inn5PIPuCw==\n-----END SSH SIGNATURE-----\n","apply_window":{"not_before":"2026-11-20T17:00:00.000Z","not_after":"2026-11-20T21:00:00.000Z"},"health_timeout_secs":600,"allow_downgrade":false}
+P {"type":"upgrade_status","seq":6,"ts":"2026-11-20T02:00:15.100Z","upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70","state":"accepted","from_version":"0.9.0","to_version":"0.9.1","code":null,"detail":""}
+K {"type":"ack","seq":6}
+P {"type":"upgrade_chunk_get","seq":7,"ts":"2026-11-20T02:00:15.120Z","upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70","filename":"pulse-0.9.1-5e6f7a8-linux-x86_64.tar.gz","offset":0,"length":32768}
+K {"type":"upgrade_chunk","seq":7,"upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70","filename":"pulse-0.9.1-5e6f7a8-linux-x86_64.tar.gz","offset":0,"data":"S2Fpcm9zL1B1bHNlIHRlc3QgYXJ0aWZhY3QgMC45LjEgKG5vdCBhIHJlYWwgYXJjaGl2ZSkK","eof":true}
+P {"type":"upgrade_status","seq":8,"ts":"2026-11-20T02:00:15.300Z","upgrade_id":"9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70","state":"staged","from_version":"0.9.0","to_version":"0.9.1","code":null,"detail":"","progress":{"bytes":54,"total":54}}
+K {"type":"ack","seq":8}
+K {"type":"error","seq":9,"code":"rate_limited","message":"too many concurrent downloads; retry later","fatal":false,"retry_after_ms":30000}
+K {"type":"error","seq":10,"code":"upgrade_unavailable","message":"the rollout was cancelled","fatal":false}
 ```
 
 ### 錯誤

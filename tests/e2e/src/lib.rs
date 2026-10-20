@@ -11,12 +11,26 @@
 //! - [`RawClient`]：以 mTLS 連上 Kairos、逐行收送 JSON 的假 client（模擬只支援協定 v1 的舊版 Pulse）。
 //! - [`Api`]、[`ApiStream`]：主控台 API（`kairos/API.md`）的 HTTPS 用戶端與 SSE 串流。
 //!
-//! 不連外部網路、不新增外部套件（只用標準函式庫與 workspace 已使用的 `serde_json`、`rustls`）。
+//! 不連外部網路、不新增外部套件（只用標準函式庫與 workspace 已使用的 `serde_json`、`rustls`、`socket2`）。
+//!
+//! **連接埠**（[`free_port`]）：測試的各個 Kairos 都以隨機埠在 127.0.0.1 上監聽。舊的做法是綁定 0 由
+//! 作業系統分配後立即釋放，等子行程之後再綁定；作業系統分配的是臨時埠（ephemeral）範圍，同時跑的其他測試
+//! 的 TCP 連線（Pulse 的重連、主控台 API 的用戶端）也從這個範圍取本機埠，中間的空檔可能被搶走，Kairos 就以
+//! `Address already in use`（結束代碼 11）啟動失敗。現在改為：
+//!
+//! 1. 從臨時埠範圍**之外**挑選（[`port_range`]；Linux 依 `ip_local_port_range` 計算，其他平台用
+//!    20000～32767，低於 Windows／macOS 的 49152），一般的 outgoing 連線不會用到；
+//! 2. 同一個測試行程內不重複發出同一個埠，並以**綁定但不監聽**的 socket 佔住，直到 Kairos 要啟動的
+//!    那一刻才釋放（[`release_port`]；佔住期間連線會被拒絕，與沒有人監聽時相同）；
+//! 3. 啟動 Kairos 時若仍因連接埠被佔用而結束（結束代碼 11，例如另一個測試行程剛好挑到同一個埠），
+//!    等到這些埠可以綁定後重新啟動，最多重試 [`START_RETRIES`] 次（[`start_kairos`]）。
 
-use std::net::TcpListener;
+use std::collections::BTreeMap;
+use std::net::{SocketAddr, TcpListener};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -134,12 +148,92 @@ fn is_per_package_cargo_var(key: &str) -> bool {
         )
 }
 
-/// 127.0.0.1 上目前沒有被使用的 TCP 連接埠（綁定 0 由作業系統分配後立即釋放）
+/// 各平台預設的臨時埠範圍之下（Linux 預設 32768～60999，Windows 與 macOS 49152～65535）
+const DEFAULT_PORT_RANGE: Range<u16> = 20000..32768;
+
+/// [`free_port`] 挑選連接埠的範圍：作業系統分配給 outgoing 連線的臨時埠範圍之外。
+/// Linux 讀 `/proc/sys/net/ipv4/ip_local_port_range`：與預設範圍重疊時，改用它之下（至少 1000 個埠）
+/// 或之上的範圍
+pub fn port_range() -> Range<u16> {
+    static RANGE: OnceLock<Range<u16>> = OnceLock::new();
+    RANGE
+        .get_or_init(|| {
+            let ephemeral = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+                .ok()
+                .and_then(|s| {
+                    let mut it = s.split_whitespace().map(|n| n.parse::<u16>().ok());
+                    Some((it.next()??, it.next()??))
+                });
+            let d = DEFAULT_PORT_RANGE;
+            match ephemeral {
+                None => d,
+                Some((lo, hi)) if hi < d.start || lo >= d.end => d,
+                Some((lo, _)) if lo >= 11_000 => 10_000..lo,
+                Some((_, hi)) if hi < 64_535 => hi + 1..65_535,
+                Some(_) => d,
+            }
+        })
+        .clone()
+}
+
+/// [`free_port`] 發出過的連接埠；值為仍佔住該埠的 socket（[`release_port`] 後為 `None`）。
+/// 同一個測試行程內一個埠只發出一次
+type Reserved = Mutex<BTreeMap<u16, Option<socket2::Socket>>>;
+
+fn reserved() -> &'static Reserved {
+    static RESERVED: OnceLock<Reserved> = OnceLock::new();
+    RESERVED.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// 綁定 127.0.0.1:`port` 但不監聽（不設 `SO_REUSEADDR`：其他 socket 無法再綁定這個埠，
+/// 連到它的連線被拒絕，與沒有人監聽時相同）
+fn hold_port(port: u16) -> Option<socket2::Socket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).ok()?;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    socket.bind(&addr.into()).ok()?;
+    Some(socket)
+}
+
+/// 127.0.0.1 上給測試用的 TCP 連接埠（見模組說明「連接埠」）：從 [`port_range`] 挑選、同一個測試行程內
+/// 不重複，並佔住到 [`release_port`]（[`Kairos::start`] 與 [`start_kairos`] 會先釋放自己的埠）。
+/// 要讓其他程式在這個埠監聽時先呼叫 [`release_port`]
 pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("無法取得空閒的連接埠")
-        .port()
+    static NEXT: OnceLock<AtomicU32> = OnceLock::new();
+    let range = port_range();
+    let len = u32::from(range.end - range.start);
+    // 起點依行程 ID 與時間打散，降低兩個同時執行的測試行程挑到同一段的機會
+    let next = NEXT.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        AtomicU32::new((std::process::id() ^ nanos).wrapping_mul(2_654_435_761))
+    });
+    let mut ports = reserved().lock().unwrap();
+    for _ in 0..len {
+        let port = range.start + (next.fetch_add(1, Ordering::Relaxed) % len) as u16;
+        if ports.contains_key(&port) {
+            continue;
+        }
+        if let Some(socket) = hold_port(port) {
+            ports.insert(port, Some(socket));
+            return port;
+        }
+    }
+    panic!("{range:?} 範圍內沒有空閒的連接埠");
+}
+
+/// 釋放 [`free_port`] 佔住的連接埠（之後仍不會再發出給其他測試）。重複呼叫或不是 [`free_port`]
+/// 發出的埠都沒有作用
+pub fn release_port(port: u16) {
+    if let Some(slot) = reserved().lock().unwrap().get_mut(&port) {
+        slot.take();
+    }
+}
+
+/// 127.0.0.1:`port` 目前可以綁定（沒有其他 socket 佔用）
+pub fn port_is_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 /// 每隔 50 ms 檢查一次 `cond`，直到成立或超過 `timeout`（回傳是否成立）
@@ -409,6 +503,32 @@ impl Proc {
         self.wait_for_count(pattern, 1, timeout);
     }
 
+    /// 等到 `patterns` 的每一個都出現在 stdout（不論順序）時回傳 `Ok`；行程在那之前結束時回傳
+    /// `Err(結束代碼)`（被訊號終止時為 -1），不 panic；逾時 panic 並附上日誌
+    pub fn wait_ready_or_exit(&mut self, patterns: &[&str], timeout: Duration) -> Result<(), i32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if patterns.iter().all(|p| self.count(p) > 0) {
+                return Ok(());
+            }
+            if !self.is_running() {
+                self.join_readers();
+                if patterns.iter().all(|p| self.count(p) > 0) {
+                    return Ok(());
+                }
+                return Err(self.status.and_then(|s| s.code()).unwrap_or(-1));
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "等待 {} 的 {patterns:?} 逾時（{timeout:?}）\n{}",
+                    self.name,
+                    self.dump()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// 要求行程優雅結束：Unix 送 SIGTERM，Windows 送 Ctrl+Break（兩個程式都會攔截並走正常關機流程）
     pub fn interrupt(&mut self) {
         if !self.is_running() {
@@ -447,6 +567,15 @@ impl Proc {
         status
             .code()
             .unwrap_or_else(|| panic!("{} 被訊號終止：{status:?}\n{}", self.name, self.dump()))
+    }
+
+    /// 強制終止（模擬行程當掉或主機斷電：不走優雅關機，連線直接被作業系統重設）
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        if let Ok(status) = self.child.wait() {
+            self.status = Some(status);
+        }
+        self.join_readers();
     }
 
     /// 優雅結束並回傳結束代碼與從送出訊號到結束的時間
@@ -618,6 +747,47 @@ pub const PULSE_REGISTERED: &str = "已向伺服器註冊";
 /// Pulse 優雅結束的日誌
 pub const PULSE_STOPPED: &str = "Pulse 已結束";
 
+/// Kairos 監聽失敗、連接埠被佔用時的結束代碼（`cli-style.md` §8）
+pub const EXIT_PORT_CONFLICT: i32 = 11;
+
+/// [`start_kairos`] 在連接埠被佔用時最多重新啟動幾次
+pub const START_RETRIES: u32 = 3;
+
+/// 以 `dir/kairos.toml` 啟動 Kairos 伺服器，等到 `ready` 的每一行日誌都出現。
+///
+/// 啟動前釋放 `ports`（[`free_port`] 為這個 Kairos 佔住的埠）。Kairos 若因連接埠被其他程式佔用而結束
+/// （結束代碼 [`EXIT_PORT_CONFLICT`]），等到 `ports` 都能綁定後（最多 [`WAIT`]）以同樣的設定重新啟動，
+/// 最多 [`START_RETRIES`] 次；設定與連接埠不變，測試先前寫好的 Pulse 設定仍然有效。
+/// 8444 的監聽被佔用時 Kairos 自己每 2 秒重試（`KRS-E2001`），不會結束，等待 `ready` 即可
+pub fn start_kairos(dir: &Path, envs: &[(&str, &str)], ports: &[u16], ready: &[&str]) -> Proc {
+    for port in ports {
+        release_port(*port);
+    }
+    let mut attempt = 0;
+    loop {
+        let mut p = Proc::spawn("kairos", dir, &["--config", "kairos.toml"], envs);
+        match p.wait_ready_or_exit(ready, WAIT) {
+            Ok(()) => return p,
+            Err(EXIT_PORT_CONFLICT) if attempt < START_RETRIES => {
+                attempt += 1;
+                eprintln!(
+                    "kairos 因連接埠被佔用而結束（{ports:?}），等到可以綁定後重新啟動（第 {attempt} 次）"
+                );
+                let freed = poll_until(WAIT, || ports.iter().all(|port| port_is_free(*port)));
+                assert!(
+                    freed,
+                    "連接埠 {ports:?} 在 {WAIT:?} 內一直被佔用\n{}",
+                    p.dump()
+                );
+            }
+            Err(code) => panic!(
+                "kairos 在出現 {ready:?} 之前就結束了（結束代碼 {code}）\n{}",
+                p.dump()
+            ),
+        }
+    }
+}
+
 /// 在暫存目錄中準備好的 Kairos（mTLS + CRL、熱重載每秒檢查一次；主控台 API 在另一個隨機埠）
 pub struct Kairos {
     pub dir: PathBuf,
@@ -635,11 +805,9 @@ impl Kairos {
     /// 同 [`Kairos::new`]，但放在 `root/<name>`（同一個測試準備多份設定時使用）
     pub fn named(root: &TestDir, name: &str, crl: &str) -> Self {
         let dir = root.sub(name);
+        // free_port 在同一個測試行程內不會發出重複的埠
         let port = free_port();
-        // 兩次 free_port 理論上可能拿到同一個埠（之前的監聽已關閉），主控台埠另外確認不同
-        let console_port = std::iter::repeat_with(free_port)
-            .find(|p| *p != port)
-            .unwrap();
+        let console_port = free_port();
         std::fs::copy(pulse_testdata("server.pem"), dir.join("server.pem")).unwrap();
         std::fs::copy(pulse_testdata("server.key"), dir.join("server.key")).unwrap();
         std::fs::write(dir.join("client-ca.pem"), test_pki::CA).unwrap();
@@ -715,11 +883,22 @@ listen = "127.0.0.1:{console_port}"
         }
     }
 
-    /// 啟動並等到開始監聽
+    /// 啟動並等到開始監聽（連接埠被佔用時重新啟動，見 [`start_kairos`]）
     pub fn start(&self) -> Proc {
-        let mut p = Proc::spawn("kairos", &self.dir, &["--config", "kairos.toml"], &[]);
-        p.wait_for(KAIROS_STARTED, WAIT);
-        p
+        start_kairos(&self.dir, &[], &self.ports(), &[KAIROS_STARTED])
+    }
+
+    /// 這個 Kairos 的連接埠（8443 與主控台）
+    pub fn ports(&self) -> [u16; 2] {
+        [self.port, self.console_port]
+    }
+
+    /// 釋放 harness 為這個 Kairos 佔住的連接埠：不經 [`Kairos::start`] 啟動伺服器（例如檢查結束代碼），
+    /// 或測試要自己佔用這些埠時呼叫
+    pub fn release_ports(&self) {
+        for port in self.ports() {
+            release_port(port);
+        }
     }
 
     /// 以原子改名換掉 CRL（Kairos 在下一個重載週期套用，並重新驗證現役連線）
@@ -938,6 +1117,46 @@ pub fn api_raw(port: u16, request: &str) -> (u16, String, String) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     (status, head.to_string(), body.to_string())
+}
+
+/// 送出帶本文的請求到主控台（`content_type` 為 `None` 時不帶本文）；回傳狀態碼與 JSON 本文
+pub fn api_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<(&str, &[u8])>,
+) -> (u16, serde_json::Value) {
+    use std::io::{Read as _, Write as _};
+    let mut s = api_connect(port);
+    let mut req =
+        format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n")
+            .into_bytes();
+    if let Some((ct, data)) = body {
+        req.extend_from_slice(
+            format!("Content-Type: {ct}\r\nContent-Length: {}\r\n", data.len()).as_bytes(),
+        );
+    }
+    req.extend_from_slice(b"\r\n");
+    if let Some((_, data)) = body {
+        req.extend_from_slice(data);
+    }
+    s.write_all(&req).unwrap();
+    s.flush().unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("回應沒有標頭：{text}"));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let json =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("回應不是 JSON（{e}）：{text}"));
+    (status, json)
 }
 
 /// 主控台 API 的用戶端（每個請求一條 HTTP/1.0 連線）

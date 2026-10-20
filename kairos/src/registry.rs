@@ -58,6 +58,10 @@ pub enum OfflineReason {
     CertificateRejected,
     /// report 的寫入結果未知，Kairos 關閉了連線（設計包 §24 #2）
     WriteUnknown,
+    /// 服務這台主機的叢集節點失聯（`kairos/HA.md` 第 6.6 節、第 21 節 #11）。由叢集的 leader 標記，
+    /// 0.9.0 還沒有叢集模式，只先定義名稱（主機 API 的篩選、`/metrics` 與 Webhook 的固定代碼）
+    #[allow(dead_code)]
+    ServerLost,
 }
 
 impl OfflineReason {
@@ -70,6 +74,7 @@ impl OfflineReason {
             OfflineReason::ServerShutdown => "server_shutdown",
             OfflineReason::CertificateRejected => "certificate_rejected",
             OfflineReason::WriteUnknown => "write_unknown",
+            OfflineReason::ServerLost => "server_lost",
         }
     }
 }
@@ -651,6 +656,8 @@ pub struct Registry {
     events: broadcast::Sender<HostChange>,
     /// Kairos 內部的事件匯流排（[`crate::bus`]）：上線、離線、被取代也發布到這裡
     bus: Arc<EventBus>,
+    /// 指標轉出（[`crate::export`]）：啟動時設定一次；連線保存 report 後交給它
+    export: std::sync::OnceLock<Arc<crate::export::ExportHub>>,
 }
 
 impl Default for Registry {
@@ -671,7 +678,18 @@ impl Registry {
             max_agents: max_agents.max(1),
             events: broadcast::channel(HOST_CHANGE_CAPACITY).0,
             bus: EventBus::new(),
+            export: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 設定指標轉出（啟動時一次；之後的呼叫忽略）
+    pub fn set_export_hub(&self, hub: Arc<crate::export::ExportHub>) {
+        let _ = self.export.set(hub);
+    }
+
+    /// 指標轉出（沒有設定時為 `None`，例如部分測試）
+    pub fn export_hub(&self) -> Option<Arc<crate::export::ExportHub>> {
+        self.export.get().cloned()
     }
 
     /// 事件匯流排（狀態表建立時一併建立；其他元件經由狀態表取得同一個匯流排）
@@ -1046,6 +1064,21 @@ impl Registry {
             .agents
             .get_key_value(agent_id)
             .map(|(id, s)| Self::live_of(id, s, now))
+    }
+
+    /// 刪除主機資料（`kairos/PRIVACY.md` 第 4 節）：從狀態表移除，之後不再出現在 `agents.json`、清冊同步
+    /// 與主控台。連線仍在時不移除、回 `Err(())`；不在狀態表時回 `Ok(false)`
+    pub fn forget(&self, agent_id: &str) -> Result<bool, ()> {
+        let mut inner = self.lock();
+        if inner.connected.contains(agent_id) {
+            return Err(());
+        }
+        Ok(inner.remove(agent_id).is_some())
+    }
+
+    /// 這台 agent 的連線是否仍在
+    pub fn is_connected(&self, agent_id: &str) -> bool {
+        self.lock().connected.contains(agent_id)
     }
 
     /// 狀態表中的筆數與連線工作仍在的 agent 數

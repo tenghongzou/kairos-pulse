@@ -48,11 +48,13 @@ pub struct ConnLog {
 impl ConnLog {
     /// 記錄一次狀態變化
     pub fn record(&self, change: &HostChange) {
+        // privacy.store_peer_ip = "truncate" 時是網段（`10.0.3.0/24`），原樣顯示；"none" 時為空
         let ip = change
             .peer
             .parse::<std::net::SocketAddr>()
             .map(|a| a.ip().to_canonical().to_string())
-            .ok();
+            .ok()
+            .or_else(|| (!change.peer.is_empty()).then(|| change.peer.to_string()));
         let entry = Entry {
             at: change.at,
             online: matches!(change.kind, HostChangeKind::Online),
@@ -78,6 +80,12 @@ impl ConnLog {
             list.pop_front();
         }
         list.push_back(entry);
+    }
+
+    /// 刪除主機資料：忘記這台主機的紀錄
+    pub fn forget(&self, agent_id: &str) {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        m.remove(agent_id);
     }
 
     /// 一台主機的紀錄（新到舊）

@@ -237,13 +237,13 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 code,
                 details: Some(details),
             }
-            .append(&conn, now_ms);
+            .append(&*conn, now_ms);
         };
     let f = filter_of(cmd, now);
     match &cmd.action {
         AuditAction::Help => unreachable!(),
         AuditAction::List { limit } => {
-            let (rows, total) = match audit::query(&conn, &f, *limit) {
+            let (rows, total) = match conn.audit_query(&f, *limit) {
                 Ok(r) => r,
                 Err(e) => return fail(db_failure(e)),
             };
@@ -313,10 +313,10 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
             }
         }
         AuditAction::Verify => {
-            if let Err(e) = audit::seal_legacy(&conn) {
+            if let Err(e) = conn.audit_seal_legacy() {
                 return fail(db_failure(e));
             }
-            let report = match audit::verify(&conn) {
+            let report = match conn.audit_verify() {
                 Ok(r) => r,
                 Err(e) => return fail(db_failure(e)),
             };
@@ -410,7 +410,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                     after_id: Some(after),
                     ..f.clone()
                 };
-                let rows = match audit::export_batch(&conn, &batch, 5000) {
+                let rows = match conn.audit_export_batch(&batch, 5000) {
                     Ok(r) => r,
                     Err(e) => return fail(db_failure(e)),
                 };
@@ -432,7 +432,7 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 "type": "chain", "generated_at": fmt_time(now), "count": count,
                 "first_id": first.as_ref().map(|x| x.0), "first_prev_hash": first.and_then(|x| x.1),
                 "last_id": last.as_ref().map(|x| x.0), "last_hash": last.and_then(|x| x.1),
-                "hmac_since": audit::hmac_since(&conn).ok().flatten().map(|s| s.0),
+                "hmac_since": conn.audit_hmac_since().ok().flatten().map(|s| s.0),
             }).to_string());
             text.push('\n');
             note(
@@ -555,8 +555,7 @@ mod tests {
         .unwrap();
         let conn = open(Some(&cfg), true).unwrap().unwrap();
         for i in 0..3 {
-            audit::append(
-                &conn,
+            conn.audit_append(
                 i,
                 &audit::Audit {
                     actor: "system",
@@ -590,7 +589,8 @@ mod tests {
         }
         assert_eq!(lines.last().unwrap()["last_hash"], prev.as_str());
         // 竄改第 2 筆：結束代碼 9、KRS-E6201
-        conn.execute("UPDATE audit_events SET actor = 'mallory' WHERE id = 2", [])
+        conn.test_sqlite()
+            .execute("UPDATE audit_events SET actor = 'mallory' WHERE id = 2", [])
             .unwrap();
         let out = execute(&cmd, Utc::now(), tz, false);
         assert_eq!(out.exit, EXIT_BROKEN);

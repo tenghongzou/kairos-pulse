@@ -127,6 +127,21 @@ pub struct Registered {
     pub durable: bool,
     /// hello_ack 的 `server_time`（v2）
     pub server_time: Option<DateTime<Utc>>,
+    /// 實際連上的候選位址（`host:port`）
+    pub server: String,
+    /// hello_ack 的 `server_node`（協商了 feature `cluster` 時）
+    pub server_node: Option<String>,
+    /// 候選位址的數量與目前連上的是第幾個（從 0 起）
+    pub candidates: usize,
+    pub candidate_index: usize,
+}
+
+/// 所有候選位址都無法連線時，一個位址最後的錯誤
+#[derive(Debug, Clone)]
+pub struct CandidateError {
+    pub server: String,
+    pub code: Option<&'static str>,
+    pub message: String,
 }
 
 /// 斷線時的資訊
@@ -140,6 +155,8 @@ pub struct Disconnected {
     pub attention: bool,
     pub consecutive_failures: u64,
     pub retry_in: Duration,
+    /// 有多個候選位址且全部都失敗時，每個位址最後的錯誤（其他時候為空）
+    pub candidate_errors: Vec<CandidateError>,
 }
 
 /// 中斷後恢復時的摘要（`conn.restored`）
@@ -263,6 +280,14 @@ impl State {
             c.last_outage_until = Some(ts(now));
         }
         c.state = "registered".into();
+        if !info.server.is_empty() {
+            c.server = info.server;
+        }
+        c.server_node = info.server_node;
+        c.candidates = u32::try_from(info.candidates).ok();
+        c.candidate_index = u32::try_from(info.candidate_index).ok();
+        c.candidate_errors.clear();
+        crate::metrics::global().set_candidate(info.candidates, info.candidate_index);
         c.tls_version = info.tls_version;
         c.server_verified = info.server_verified;
         c.proto = Some(info.proto);
@@ -315,6 +340,15 @@ impl State {
             .map(|r| ts(now + r));
         c.last_error_code = d.code.map(str::to_string);
         c.last_error = Some(d.message.clone());
+        c.candidate_errors = d
+            .candidate_errors
+            .into_iter()
+            .map(|e| sf::CandidateError {
+                server: e.server,
+                code: e.code.map(str::to_string),
+                message: e.message,
+            })
+            .collect();
         if d.attention {
             let same = c
                 .last_rejection
@@ -330,6 +364,29 @@ impl State {
         }
         self.connected_durable = None;
         self.retry = None;
+    }
+
+    /// Kairos 要求改連其他節點（`drain`，PLS-I8507）：中斷開始，但不算連線失敗（連續失敗次數不變）
+    pub fn drained(&mut self, retry_in: Duration) {
+        crate::metrics::global().connection_reset();
+        let now = Utc::now();
+        if self.outage_started.is_none() {
+            self.outage_started = Some((Instant::now(), now));
+        }
+        let since = self.outage_started.map(|(_, t)| t).unwrap_or(now);
+        let c = &mut self.file.connection;
+        c.state = "reconnecting".into();
+        c.tls_version = None;
+        c.since = Some(ts(since));
+        c.next_retry_at = chrono::Duration::from_std(retry_in)
+            .ok()
+            .map(|r| ts(now + r));
+        c.last_error_code = Some(codes::I_DRAIN.to_string());
+        c.last_error = Some("Kairos 節點正在排空，改連其他節點".to_string());
+        c.candidate_errors.clear();
+        self.connected_durable = None;
+        self.retry = None;
+        self.changed = true;
     }
 
     /// 中斷已達 `after` 且這次中斷還沒有記錄過時回傳 `true`（每次中斷只回傳一次）
@@ -359,6 +416,23 @@ impl State {
 
     /// 本機緩衝有需要立即反映的變化（丟棄資料、寫入失敗、補送完成）
     pub fn buffer_changed(&mut self) {
+        self.changed = true;
+    }
+
+    /// 取樣間隔（`report_interval_ms`）：集中設定即時改變 `report.interval` 時更新，`pulse status` 依它判斷
+    /// 回報是否停滯
+    pub fn set_report_interval(&mut self, interval: Duration) {
+        let ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        if self.file.report_interval_ms != ms {
+            self.file.report_interval_ms = ms;
+            self.changed = true;
+        }
+    }
+
+    /// 以新的設定重建本機緩衝之前（集中設定改變了 `buffer.enabled`）：清除停用與錯誤的狀態
+    pub fn buffer_reset(&mut self) {
+        self.buffer_disabled = false;
+        self.buffer_error = None;
         self.changed = true;
     }
 
@@ -599,6 +673,17 @@ pub struct Tracker {
     spool: Mutex<Option<Arc<SharedSpool>>>,
     buffer: BufferSettings,
     writes: Mutex<WriteState>,
+    /// 遠端管理的摘要（寫出時呼叫；沒有時狀態檔不含 `management`）
+    management: Mutex<Option<ManagementSource>>,
+}
+
+/// 產生狀態檔 `management` 的函式
+pub struct ManagementSource(pub Box<dyn Fn() -> sf::Management + Send + Sync>);
+
+impl std::fmt::Debug for ManagementSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManagementSource")
+    }
 }
 
 impl Tracker {
@@ -616,6 +701,7 @@ impl Tracker {
             spool: Mutex::new(None),
             buffer,
             writes: Mutex::new(WriteState::default()),
+            management: Mutex::new(None),
         }
     }
 
@@ -647,22 +733,46 @@ impl Tracker {
         self.update(State::buffer_changed);
     }
 
+    /// 不再使用目前的本機緩衝（重建取樣與連線之前）
+    pub fn clear_spool(&self) {
+        *self.spool.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.update(State::buffer_reset);
+    }
+
+    /// 狀態檔的 `management`（遠端管理）由 `f` 產生
+    pub fn set_management(&self, f: ManagementSource) {
+        *self.management.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    fn management(&self) -> Option<sf::Management> {
+        self.management
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|f| (f.0)())
+    }
+
     /// 目前的內容，但不清除「有變化」的標記（`/metrics` 讀取，不影響狀態檔的寫出時機）
     pub fn peek(&self) -> StatusFile {
         let spool = self.spool.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let management = self.management();
         let mut state = self.lock();
         let changed = state.changed;
-        let file = state.snapshot(spool.as_deref(), &self.buffer);
+        let mut file = state.snapshot(spool.as_deref(), &self.buffer);
         state.changed = changed;
+        file.management = management;
         file
     }
 
     /// 目前的內容
     pub fn snapshot(&self) -> StatusFile {
         let spool = self.spool.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let management = self.management();
         let mut state = self.lock();
         state.changed = false;
-        state.snapshot(spool.as_deref(), &self.buffer)
+        let mut file = state.snapshot(spool.as_deref(), &self.buffer);
+        file.management = management;
+        file
     }
 
     /// 寫出一次；回傳寫入結果。已寫出結束前的最後一份時不再寫
@@ -958,6 +1068,20 @@ mod tests {
         )
     }
 
+    #[test]
+    fn report_interval_follows_live_changes() {
+        // 集中設定即時改變 report.interval：狀態檔的 report_interval_ms 跟著改（pulse status 依它判斷停滯）
+        let dir = temp_dir();
+        let t = tracker(&dir);
+        assert_eq!(t.snapshot().report_interval_ms, 5000);
+        t.update(|s| s.set_report_interval(Duration::from_secs(5)));
+        assert!(!t.lock().changed, "相同的值不算變化");
+        t.update(|s| s.set_report_interval(Duration::from_secs(30)));
+        assert!(t.lock().changed);
+        assert_eq!(t.snapshot().report_interval_ms, 30_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "pulse-local-status-{}",
@@ -985,6 +1109,7 @@ mod tests {
                 attention: false,
                 consecutive_failures: 3,
                 retry_in: Duration::from_secs(52),
+                candidate_errors: Vec::new(),
             })
         });
         let f = t.snapshot();
@@ -1002,6 +1127,7 @@ mod tests {
                 attention: true,
                 consecutive_failures: 4,
                 retry_in: Duration::from_secs(2),
+                candidate_errors: Vec::new(),
             })
         });
         t.update(|s| {
@@ -1011,6 +1137,7 @@ mod tests {
                 attention: false,
                 consecutive_failures: 5,
                 retry_in: Duration::from_secs(2),
+                candidate_errors: Vec::new(),
             })
         });
         let f = t.snapshot();
@@ -1033,6 +1160,10 @@ mod tests {
                 features: vec!["metrics".into(), "durable".into()],
                 durable: true,
                 server_time: Some(Utc::now() - chrono::Duration::milliseconds(1500)),
+                server: String::new(),
+                server_node: None,
+                candidates: 1,
+                candidate_index: 0,
             })
         });
         assert_eq!(restored.unwrap().attempts, 5);
@@ -1059,6 +1190,7 @@ mod tests {
             attention: false,
             consecutive_failures: 1,
             retry_in: Duration::ZERO,
+            candidate_errors: Vec::new(),
         };
         t.update(|s| s.disconnected(lost()));
         assert!(t.update(|s| s.outage_reached(Duration::ZERO)));
@@ -1071,6 +1203,10 @@ mod tests {
                 features: vec![],
                 durable: false,
                 server_time: None,
+                server: String::new(),
+                server_node: None,
+                candidates: 1,
+                candidate_index: 0,
             })
         });
         assert!(!t.update(|s| s.outage_reached(Duration::ZERO)), "已恢復");
@@ -1187,6 +1323,7 @@ mod tests {
                 attention: true,
                 consecutive_failures: 2,
                 retry_in: Duration::from_secs(30),
+                candidate_errors: Vec::new(),
             })
         });
         t.write().unwrap();

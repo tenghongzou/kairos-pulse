@@ -103,9 +103,18 @@ fn status_follows_kairos_outage_and_pulse_exit() {
     );
     assert_eq!(conn["mtls"], true, "{doc:#}");
     assert_eq!(conn["proto"], 2, "{doc:#}");
+    // 實際的 Kairos 0.9 在 mTLS、SQLite 時也列出 config（集中設定）；upgrade 要 Pulse 本機就緒（輔助程式與
+    // 信任錨），測試環境沒有，Pulse 不宣告
     assert_eq!(
         conn["features"],
-        serde_json::json!(["metrics", "durable", "inventory", "processes"]),
+        serde_json::json!([
+            "metrics",
+            "durable",
+            "inventory",
+            "processes",
+            "cluster",
+            "config"
+        ]),
         "{doc:#}"
     );
     assert!(

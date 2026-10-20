@@ -10,6 +10,9 @@ import { ALERT_STRINGS } from './strings-alerts.js';
 import { PKI_STRINGS } from './strings-pki.js';
 import { ADMIN_STRINGS } from './strings-admin.js';
 import { METRICS_STRINGS } from './strings-metrics.js';
+import { EXPORT_STRINGS } from './strings-export.js';
+import { PRIVACY_STRINGS } from './strings-privacy.js';
+import { REMOTE_STRINGS } from './strings-remote.js';
 
 const M = {
   // ---- 共用 ----
@@ -106,6 +109,12 @@ const M = {
   'banner.toCa': '前往 CA 與撤銷清單',
   'banner.dismiss': '24 小時內不再顯示',
   'shell.offline': '與 Kairos 伺服器的連線中斷，正在重新連線… 畫面上的資料停在 {time}。',
+  // SSE resync 的 Banner（screens.md §0.2，D54）：依原因選文案；未知的原因比照 restarted
+  'shell.resync.restarted': 'Kairos 已重新啟動，正在重新載入畫面上的資料…',
+  'shell.resync.failover': 'Kairos 已切換到另一個伺服器節點，正在重新載入畫面上的資料…',
+  'shell.resync.too_old': '離線太久，正在重新載入畫面上的資料…',
+  // overflow（連線太慢、事件來不及送出；API.md 第 6 節）：不是重新啟動，不用 restarted 的文案
+  'shell.resync.overflow': '正在重新載入畫面上的資料…',
   'nav.section.monitoring': '監控',
   'nav.overview': '總覽',
   'nav.hosts': '主機',
@@ -120,6 +129,7 @@ const M = {
   'err.label.fix': '處理方式',
   'err.label.code': '代碼',
   'err.label.technical': '技術細節',
+  'err.label.view': '查看',
   'err.unexpected.title': 'Kairos 回應了未預期的錯誤',
   'err.unexpected.reason': 'Kairos 無法完成這個請求，詳細原因記在伺服器的日誌中。',
   'err.unexpected.fix': '重試一次；仍然失敗時請聯絡 Kairos 管理者，並提供畫面上的時間與技術細節。',
@@ -213,6 +223,11 @@ const M = {
   'reason.auth_failed': '身分不符',
   'reason.superseded': '被新連線取代',
   'reason.write_unknown': '寫入結果未知',
+  // 0.9 起列舉多了 server_lost（叢集模式才會出現，0.10）；不認得的值一律「其他原因」，原始值放技術細節（§31.6）
+  'reason.server_lost': 'Kairos 節點失聯',
+  'reason.other': '其他原因',
+  'reason.otherFacet': '其他原因（{code}）',
+  'reason.server_lost.next': '通常在 1 分鐘內自動改連其他節點並重新上線，無需處理；持續離線時前往「系統健康」的「叢集」分頁。',
   'reason.timeout.next': '主機可能當機、網路中斷或 Pulse 卡住：檢查網路連通與主機狀態，在主機上執行 pulse status。',
   'reason.connection_closed.next': '主機可能正在關機、Pulse 服務被停止或網路中斷：確認是否為計畫性作業，再檢查網路連通。',
   'reason.idle_timeout.next': '主機可能當機、網路中斷或 Pulse 卡住：檢查網路連通與主機狀態，在主機上執行 pulse status。',
@@ -599,6 +614,13 @@ Object.assign(M, ADMIN_STRINGS);
 
 // 指標擴充（F4：S03、S04、S05、S09）的文字
 Object.assign(M, METRICS_STRINGS);
+
+// 指標轉出（F7：Prometheus exporter、OTLP；S21「整合」）的文字在 strings-export.js
+Object.assign(M, EXPORT_STRINGS);
+// 個資保護（S6：S05 的匯出個資與刪除主機資料、S12 的一行安裝指令、S14 的匯入憑證）
+Object.assign(M, PRIVACY_STRINGS);
+// 遠端管理（F8：Pulse 管理的 S24～S26、S04 的篩選、S05 的設定分頁與升級卡片）
+Object.assign(M, REMOTE_STRINGS);
 
 /** 文字；缺少 key 時回傳 key 本身並記錄錯誤（Playwright 測試檢查主控台沒有錯誤） */
 export function t(key, params) {

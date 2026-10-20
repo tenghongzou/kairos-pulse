@@ -76,9 +76,9 @@ impl Memory {
 
 /// 資產的收集與跨連線的送出紀錄（`inventory.enabled = true` 時建立一個）
 pub struct InventoryAgent {
-    /// `inventory.interval`
-    pub interval: Duration,
-    opts: InventoryOptions,
+    /// `inventory.interval`（集中設定可在執行期改變，[`InventoryAgent::update`]）
+    interval: Mutex<Duration>,
+    opts: Mutex<InventoryOptions>,
     collect: CollectFn,
     request: Notify,
     latest: watch::Sender<Option<Arc<Snapshot>>>,
@@ -88,8 +88,8 @@ pub struct InventoryAgent {
 impl std::fmt::Debug for InventoryAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InventoryAgent")
-            .field("interval", &self.interval)
-            .field("opts", &self.opts)
+            .field("interval", &self.interval())
+            .field("opts", &self.options())
             .finish_non_exhaustive()
     }
 }
@@ -105,8 +105,8 @@ impl InventoryAgent {
         collect: CollectFn,
     ) -> Arc<Self> {
         Arc::new(Self {
-            interval,
-            opts,
+            interval: Mutex::new(interval),
+            opts: Mutex::new(opts),
             collect,
             request: Notify::new(),
             latest: watch::channel(None).0,
@@ -122,7 +122,47 @@ impl InventoryAgent {
 
     /// 重送前的延遲：5 分鐘，不超過 `inventory.interval`
     fn retry_delay(&self) -> Duration {
-        RETRY_AFTER_STORAGE.min(self.interval)
+        RETRY_AFTER_STORAGE.min(self.interval())
+    }
+
+    /// `inventory.interval`
+    pub fn interval(&self) -> Duration {
+        *self
+            .interval
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn options(&self) -> InventoryOptions {
+        self.opts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 集中設定改變了 `inventory.interval`、`hardware_serials`、`network_addresses` 或
+    /// `collect.interface_exclude`：下一次收集起生效（REMOTE.md 第 3.1 節「即時」）。回傳是否有改變
+    pub fn update(&self, interval: Duration, opts: InventoryOptions) -> bool {
+        let mut changed = false;
+        {
+            let mut i = self
+                .interval
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *i != interval {
+                *i = interval;
+                changed = true;
+            }
+        }
+        let mut o = self
+            .opts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *o != opts {
+            *o = opts;
+            changed = true;
+        }
+        changed
     }
 }
 
@@ -139,7 +179,7 @@ pub async fn run_worker(agent: Arc<InventoryAgent>) {
             stuck = None;
         }
         let collect = agent.collect;
-        let opts = agent.opts.clone();
+        let opts = agent.options();
         let mut task = tokio::task::spawn_blocking(move || collect(&opts));
         let (inventory, limited) = match tokio::time::timeout(COLLECT_TIMEOUT, &mut task).await {
             Ok(Ok(v)) => v,
@@ -266,7 +306,7 @@ impl InventoryConn {
     pub fn on_wake(&mut self, now: Instant) -> Option<Arc<Snapshot>> {
         if now >= self.next_collect {
             self.agent.request.notify_one();
-            self.next_collect = now + self.agent.interval;
+            self.next_collect = now + self.agent.interval();
         }
         if let Some(f) = &self.in_flight
             && now >= f.sent_at + REPLY_TIMEOUT
@@ -328,7 +368,7 @@ impl InventoryConn {
     ) -> Option<InventoryReply> {
         let f = self.in_flight.clone()?;
         let reply = match parse_server_msg(line).ok()? {
-            ServerMsg::Ack { seq } if seq == f.seq => InventoryReply::Acked,
+            ServerMsg::Ack { seq, .. } if seq == f.seq => InventoryReply::Acked,
             ServerMsg::Error {
                 seq: Some(seq),
                 code,

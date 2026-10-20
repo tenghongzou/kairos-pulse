@@ -239,6 +239,29 @@ fn clock_valid(file: &StatusFile, now: DateTime<Utc>, now_mono: Option<u64>) -> 
     }
 }
 
+/// 已註冊時的節點與候選位址：「（Kairos 節點 kairos-b；第 2 個位址，共 3 個）」（設計包
+/// `decisions/INTEGRATION.md` §31.6）。只有節點名稱時「（Kairos 節點 kairos-b）」；沒有節點名稱且只有一個
+/// 候選位址時為空字串（與 0.8 相同）
+fn cluster_note(c: &crate::status_file::Connection) -> String {
+    let mut parts = Vec::new();
+    if let Some(node) = c.server_node.as_deref().filter(|n| !n.is_empty()) {
+        parts.push(format!("Kairos 節點 {node}"));
+    }
+    if let (Some(total), Some(index)) = (c.candidates, c.candidate_index)
+        && total > 1
+    {
+        parts.push(format!(
+            "第 {} 個位址，共 {total} 個",
+            index.saturating_add(1)
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("（{}）", parts.join("；"))
+    }
+}
+
 /// 連線列的簡短原因：「kairos…:8443 拒絕連線」
 fn reason_phrase(code: Option<&str>, server: &str, host: &str, last_error: &str) -> String {
     match code {
@@ -248,6 +271,8 @@ fn reason_phrase(code: Option<&str>, server: &str, host: &str, last_error: &str)
         Some(codes::E_SERVER_SILENT) => format!("{server} 沒有回應"),
         Some(codes::E_PER_IP_LIMIT) => format!("{server} 在加密連線建立前中斷"),
         Some(codes::W_SUPERSEDED) => "被同一 agent_id 的新連線取代".to_string(),
+        Some(codes::E_ALL_CANDIDATES_FAILED) => "所有候選位址都無法連線".to_string(),
+        Some(codes::I_DRAIN) => "Kairos 節點正在排空，改連其他節點".to_string(),
         _ if last_error.is_empty() => format!("無法連線到 {server}"),
         _ => last_error.to_string(),
     }
@@ -555,12 +580,16 @@ pub fn evaluate(input: &Input) -> Report {
                     } else {
                         format!("（{}）", tls.join("，"))
                     };
+                    let node = cluster_note(c);
                     rows.push(
                         Row::new(
                             "connection",
                             "連線",
                             Outcome::Ok,
-                            format!("已註冊到 {server}{tls}，已連線 {}", fmt::duration(outage)),
+                            format!(
+                                "已註冊到 {server}{node}{tls}，已連線 {}",
+                                fmt::duration(outage)
+                            ),
                         )
                         .summary("已註冊"),
                     );
@@ -743,6 +772,18 @@ pub fn evaluate(input: &Input) -> Report {
 
     // 設定（照常：直接讀設定檔）
     rows.push(config_row(input, file, agent_running, &ctx, &mut issues));
+    // 遠端管理（REMOTE.md 第 10.3 節）：「設定」列加上集中設定的狀態；有進行中的升級或最近 24 小時有結果時
+    // 另有「升級」列（回滾失敗時為錯誤，結束代碼 9）
+    if let Some(m) = file.and_then(|f| f.management.as_ref()) {
+        if let (Some(c), Some(row)) = (&m.config, rows.last_mut()) {
+            row.lines.push(management_config_line(c));
+        }
+        if let Some(u) = &m.upgrade
+            && let Some(row) = upgrade_row(u, now)
+        {
+            rows.push(row);
+        }
+    }
 
     // 時鐘
     let issues_before = issues.len();
@@ -1541,6 +1582,121 @@ fn identity_row(
 }
 
 /// 「設定」列：`pulse status` 讀到的設定檔是否有誤，以及執行中的 Pulse 回報的設定警告
+/// 「設定」列的集中設定狀態
+fn management_config_line(c: &crate::remote::config::ConfigView) -> String {
+    use kairos_proto::mgmt::{CONFIG_STATE_REJECTED, CONFIG_STATE_ROLLED_BACK};
+    let mut line = if c.local == kairos_proto::mgmt::INSTALL_CONFIG_DISABLED {
+        format!("集中設定：本機停用（{}）", codes::I_REMOTE_CONFIG_DISABLED)
+    } else if c.state == CONFIG_STATE_REJECTED {
+        format!(
+            "集中設定：第 {} 版被拒（{}）",
+            c.rev,
+            c.code.as_deref().unwrap_or(codes::W_REMOTE_CONFIG_REJECTED)
+        )
+    } else if c.state == CONFIG_STATE_ROLLED_BACK {
+        format!(
+            "集中設定：第 {} 版已回復上一版（{}）",
+            c.rev,
+            codes::W_REMOTE_CONFIG_ROLLED_BACK
+        )
+    } else if c.usage == "in_use" {
+        if c.overridden.is_empty() {
+            format!("集中設定：已同步（第 {} 版）", c.rev)
+        } else {
+            format!(
+                "集中設定：已同步（第 {} 版，{} 個鍵被本機覆蓋）",
+                c.rev,
+                c.overridden.len()
+            )
+        }
+    } else {
+        "集中設定：未使用（沒有下發的設定，或 Kairos 不支援）".to_string()
+    };
+    if c.cache_error.is_some() {
+        line.push_str(&format!(
+            "；快取無法使用（{}）",
+            codes::E_REMOTE_CONFIG_CACHE
+        ));
+    }
+    line
+}
+
+/// 「升級」列：有進行中的升級，或最近 24 小時有結果時（回滾失敗一律顯示）
+fn upgrade_row(u: &crate::remote::upgrade::UpgradeView, now: DateTime<Utc>) -> Option<Row> {
+    use kairos_proto::mgmt::{
+        UPGRADE_STATE_FAILED, UPGRADE_STATE_ROLLBACK_FAILED, UPGRADE_STATE_ROLLED_BACK,
+        UPGRADE_STATE_SUCCEEDED,
+    };
+    if let Some(phase) = &u.phase {
+        let to = u.to_version.as_deref().unwrap_or("?");
+        let line = match phase.as_str() {
+            "downloading" => {
+                let pct = match (u.bytes, u.total) {
+                    (Some(b), Some(t)) if t > 0 => b.saturating_mul(100) / t,
+                    _ => 0,
+                };
+                format!("下載中 {pct}%（{to}）")
+            }
+            "staged" => format!(
+                "等待升級時段 {}（{to}）",
+                u.not_before.as_deref().unwrap_or("?")
+            ),
+            _ => format!("替換中（{to}）"),
+        };
+        return Some(Row::new("upgrade", "升級", Outcome::Ok, line.clone()).summary(line));
+    }
+    let last = u.last.as_ref()?;
+    let recent = sf::parse_ts(&last.at).is_some_and(|t| now - t <= chrono::TimeDelta::hours(24));
+    let (result, line) = match last.state.as_str() {
+        UPGRADE_STATE_ROLLBACK_FAILED => (
+            Outcome::Error,
+            format!(
+                "回滾失敗，需要人工處理（{}）",
+                codes::E_UPGRADE_ROLLBACK_FAILED
+            ),
+        ),
+        _ if !recent => return None,
+        UPGRADE_STATE_SUCCEEDED => (
+            Outcome::Ok,
+            format!(
+                "已升級到 {}（{}）",
+                last.to_version,
+                codes::I_UPGRADE_COMPLETED
+            ),
+        ),
+        UPGRADE_STATE_ROLLED_BACK => (
+            Outcome::Warning,
+            format!(
+                "已回滾到 {}（{}）",
+                last.from_version,
+                codes::W_UPGRADE_ROLLED_BACK
+            ),
+        ),
+        UPGRADE_STATE_FAILED => (
+            Outcome::Warning,
+            format!(
+                "升級到 {} 失敗（{}）",
+                last.to_version,
+                last.code.as_deref().unwrap_or("-")
+            ),
+        ),
+        // declined、expired：不需要處理，不顯示
+        _ => return None,
+    };
+    let code = match result {
+        Outcome::Error => Some(codes::E_UPGRADE_ROLLBACK_FAILED),
+        Outcome::Warning if last.state == UPGRADE_STATE_ROLLED_BACK => {
+            Some(codes::W_UPGRADE_ROLLED_BACK)
+        }
+        _ => None,
+    };
+    let mut row = Row::new("upgrade", "升級", result, line.clone()).summary(line);
+    if let Some(c) = code {
+        row = row.code(c);
+    }
+    Some(row)
+}
+
 fn config_row(
     input: &Input,
     file: Option<&StatusFile>,

@@ -9,7 +9,6 @@
 
 use chrono::Utc;
 use log::{info, warn};
-use rusqlite::params;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
@@ -18,7 +17,7 @@ use super::ApiContext;
 use super::hosts::Status;
 use super::http::ts_ms;
 use super::overview;
-use super::tokens::{self, LOGGED_CREATED, LOGGED_REVOKED};
+use super::tokens::{LOGGED_CREATED, LOGGED_REVOKED};
 
 const TICK: Duration = Duration::from_secs(1);
 const MINUTE_EVERY: u64 = 60;
@@ -59,11 +58,7 @@ pub async fn run(ctx: Arc<ApiContext>) {
 
 async fn purge_sessions(ctx: &Arc<ApiContext>) {
     let now_ms = Utc::now().timestamp_millis();
-    if let Err(e) = ctx
-        .admin
-        .write(move |c| crate::users::store::purge_sessions(c, now_ms))
-        .await
-    {
+    if let Err(e) = ctx.admin.write(move |c| c.purge_sessions(now_ms)).await {
         warn!("無法清除過期的工作階段紀錄（稍後重試）: {e}");
     }
 }
@@ -90,7 +85,7 @@ async fn flush_last_used(ctx: &Arc<ApiContext>) {
     let to_write = items.clone();
     if let Err(e) = ctx
         .writer
-        .write(move |conn| tokens::store_last_used(conn, &to_write))
+        .write(move |conn| conn.store_api_token_last_used(&to_write))
         .await
     {
         warn!("無法寫回 API token 的最後使用時間（稍後重試）: {e}");
@@ -103,7 +98,7 @@ pub(super) async fn audit_tokens(ctx: &Arc<ApiContext>) {
     let result = ctx
         .writer
         .write(|conn| {
-            let pending = tokens::pending_audit(conn)?;
+            let pending = conn.api_tokens_pending_audit()?;
             for (row, logged) in &pending {
                 let mut flags = 0;
                 if logged & LOGGED_CREATED == 0 {
@@ -112,7 +107,7 @@ pub(super) async fn audit_tokens(ctx: &Arc<ApiContext>) {
                 if row.revoked_at.is_some() && logged & LOGGED_REVOKED == 0 {
                     flags |= LOGGED_REVOKED;
                 }
-                tokens::mark_logged(conn, &row.token_id, flags)?;
+                conn.mark_api_token_logged(&row.token_id, flags)?;
             }
             Ok(pending)
         })
@@ -168,35 +163,32 @@ pub(super) async fn persist_rejections(ctx: &Arc<ApiContext>) {
         return;
     }
     let deltas: Vec<(String, u64)> = dirty.iter().map(|(id, _, d)| (id.clone(), *d)).collect();
+    let privacy = ctx.privacy.clone();
     let result = ctx
         .writer
         .write(move |conn| {
-            let tx = conn.unchecked_transaction()?;
+            let rows: Vec<_> = dirty
+                .iter()
+                .map(|(id, r, delta)| {
+                    (
+                        id.clone(),
+                        r.at.timestamp_millis(),
+                        r.reason.as_str().to_string(),
+                        r.serial.clone(),
+                        r.peer.and_then(|p| privacy.ip(p)),
+                        i64::try_from(*delta).unwrap_or(i64::MAX),
+                    )
+                })
+                .collect();
+            let changed = conn.store_cert_rejections(&rows)?;
             let mut missing = Vec::new();
             let mut updated = 0;
-            {
-                let mut stmt = tx.prepare(
-                    "UPDATE hosts SET cert_rejected_at = ?2,
-                        cert_rejection = json_object('reason', ?3, 'serial', ?4, 'peer', ?5,
-                            'count', coalesce(json_extract(cert_rejection, '$.count'), 0) + ?6)
-                     WHERE agent_id = ?1 AND (cert_rejected_at IS NULL OR cert_rejected_at <= ?2)",
-                )?;
-                for (id, r, delta) in &dirty {
-                    let n = stmt.execute(params![
-                        id,
-                        r.at.timestamp_millis(),
-                        r.reason.as_str(),
-                        r.serial,
-                        r.peer.map(|p| p.to_string()),
-                        i64::try_from(*delta).unwrap_or(i64::MAX),
-                    ])?;
-                    if n == 0 {
-                        missing.push((id.clone(), *delta));
-                    }
-                    updated += n;
+            for ((id, _, delta), n) in dirty.iter().zip(changed) {
+                if n == 0 {
+                    missing.push((id.clone(), *delta));
                 }
+                updated += n;
             }
-            tx.commit()?;
             Ok((updated, missing))
         })
         .await;

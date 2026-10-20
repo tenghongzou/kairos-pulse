@@ -13,6 +13,7 @@ mod diag;
 mod enroll;
 mod enroll_cli;
 mod expiry;
+mod export;
 mod export_cli;
 mod fsperm;
 mod hosts_cli;
@@ -26,12 +27,15 @@ mod monitor;
 mod per_ip;
 mod pki;
 mod pki_cli;
+mod privacy;
+mod privacy_cli;
 mod probe;
 mod protocol;
 mod rate;
 mod rbac;
 mod registry;
 mod reload;
+mod remote;
 mod retention;
 mod settings;
 mod shutdown;
@@ -598,8 +602,7 @@ async fn system_audit(
     let r = svc
         .db
         .write(move |conn| {
-            crate::audit::append(
-                conn,
+            conn.audit_append(
                 now,
                 &crate::audit::Audit {
                     actor: "system",
@@ -833,7 +836,22 @@ async fn run(
         inventory,
         restored,
         assets,
+        purger,
     } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
+    // 個資政策（[privacy]，kairos/PRIVACY.md）：要求假名化時金鑰檔一定要可用，否則不啟動
+    let privacy = Arc::new(
+        privacy::PrivacyPolicy::for_service(config.privacy, &paths.data_dir).map_err(|e| {
+            error!(
+                event = "privacy.key_unavailable", code = privacy::CODE_KEY_UNAVAILABLE;
+                "錯誤 {}：{e}",
+                privacy::CODE_KEY_UNAVAILABLE
+            );
+            e
+        })?,
+    );
+    if let Some(d) = config.privacy.describe() {
+        info!("個資保護（[privacy]）：{d}");
+    }
 
     let listener = TcpListener::bind(&config.server.listen)
         .await
@@ -863,6 +881,9 @@ async fn run(
             n
         );
     }
+    // 指標轉出（Prometheus exporter、OTLP；kairos/EXPORT.md）：連線保存 report 後經由狀態表交給它
+    let (export_hub, export_task) = export::start(&config, &paths.data_dir, shutdown.clone());
+    registry.set_export_hub(export_hub);
     let writer = supervise(
         "report 寫入工作",
         tokio::spawn(writer_task),
@@ -1011,6 +1032,56 @@ async fn run(
         ));
     }
 
+    // 遠端管理（集中設定、Pulse 遠端升級；crates/kairos-proto/REMOTE.md）：需要 SQLite
+    let remote = match config.storage.backend {
+        StorageBackend::Jsonl => None,
+        StorageBackend::Sqlite => {
+            match remote::RemoteService::open(remote::StartParams {
+                settings: config.remote.clone(),
+                data_dir: paths.data_dir.clone(),
+                db_path: enroll::db_path(&config, &paths.data_dir),
+                registry: registry.clone(),
+                shutdown: shutdown.clone(),
+                clock: enroll::system_clock(),
+            })
+            .await
+            {
+                Ok(svc) => {
+                    svc.spawn_engine();
+                    info!(
+                        "遠端管理：集中設定{}、遠端升級{}（需要 mTLS 與 Pulse 0.9.0 以上；版本庫 {}{}）",
+                        if config.remote.config_enabled {
+                            "啟用"
+                        } else {
+                            "停用（remote.config_enabled = false）"
+                        },
+                        if config.remote.upgrade_enabled {
+                            "啟用"
+                        } else {
+                            "停用（remote.upgrade_enabled = false）"
+                        },
+                        svc.releases_dir.display(),
+                        if config.remote.allowed_signers.trim().is_empty() {
+                            "；remote.allowed_signers 未設定，匯入發佈版本時不驗證簽署者"
+                        } else {
+                            ""
+                        }
+                    );
+                    Some(svc)
+                }
+                Err(e) => {
+                    error!("遠端管理無法啟動（不宣告 config、upgrade；既有主機照常連線）：{e}");
+                    None
+                }
+            }
+        }
+    };
+
+    // feature cluster 的 hello_ack.server_node（PROTOCOL.md「叢集與排空」）
+    let node_id = config
+        .cluster
+        .effective_node_id(&kp_obs::logfmt::hostname());
+    debug!("節點名稱（hello_ack.server_node）：{node_id}");
     let ctx = Arc::new(ConnContext {
         registry: registry.clone(),
         reports,
@@ -1024,6 +1095,9 @@ async fn run(
         report_limiter: Arc::new(ReportLimiter::with_policy(per_ip_policy.clone())),
         enroll: enroll_service.clone(),
         assets,
+        privacy: privacy.clone(),
+        cluster: connection::ClusterContext::new(node_id),
+        remote: remote.clone(),
     });
     let per_ip = PerIpLimiter::with_policy(per_ip_policy);
 
@@ -1155,6 +1229,8 @@ async fn run(
                 alerts: alert_service.clone(),
                 directory: None,
                 obs: Some(obs.clone()),
+                purger: purger.clone(),
+                remote: remote.clone(),
             })
             .await;
             match started {
@@ -1243,12 +1319,24 @@ async fn run(
     if let Some((_, thread)) = alerts {
         alerts::AlertService::join(thread, Duration::from_secs(3)).await;
     }
+    // OTLP：佇列中剩下的資料最後再送一次（最多約 2 秒）
+    let _ = tokio::time::timeout(Duration::from_secs(3), export_task).await;
 
     // 最後一份狀態（所有 agent 已標為離線）交給 writer，結束前寫入主機清冊
     if let Some(feed) = &inventory {
         feed.send_replace(Some(Arc::new(registry.snapshot(chrono::Utc::now()))));
     }
     // 釋放最後一個 report sender，writer 取完佇列、寫入並逐筆回覆後結束
+    let drains = ctx
+        .cluster
+        .drains_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if drains > 0 {
+        info!(
+            "資訊 KRS-I8507：已對 {drains} 條協商了 cluster 的連線送出 drain（排空），這些 agent 會在 {:.0} 秒內分散改連其他節點",
+            f64::from(ctx.cluster.drain_window(&registry)) / 1000.0
+        );
+    }
     let pending = ctx.reports.pending();
     drop(ctx);
     info!("寫入剩餘 {} 筆 report", pending);

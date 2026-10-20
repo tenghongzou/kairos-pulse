@@ -38,6 +38,8 @@ fn expect_exit(
 }
 
 fn kairos_exit(k: &Kairos, args: &[&str], envs: &[(&str, &str)], code: i32, needle: &str) {
+    // 不經 Kairos::start 啟動：先釋放 harness 為它佔住的連接埠
+    k.release_ports();
     expect_exit("kairos", &k.dir, args, envs, code, needle);
 }
 
@@ -181,8 +183,10 @@ fn certificate_errors_exit_4() {
 fn port_in_use_exits_11() {
     let root = TestDir::new("codes-11");
     let k = Kairos::new(&root, test_pki::CRL_EMPTY);
-    let _occupied = std::net::TcpListener::bind(("127.0.0.1", k.port)).unwrap();
-    kairos_exit(&k, &CONFIG, &[], 11, "無法監聽");
+    // 8443 的埠維持由 harness 佔住（綁定、不設 SO_REUSEADDR），Kairos 綁定時一定衝突；不先釋放再
+    // 自己綁定，避免釋放與綁定之間被其他程式搶走。只釋放主控台的埠
+    kp_e2e::release_port(k.console_port);
+    expect_exit("kairos", &k.dir, &CONFIG, &[], 11, "無法監聽");
 }
 
 #[test]

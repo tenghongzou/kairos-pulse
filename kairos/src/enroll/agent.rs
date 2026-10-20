@@ -8,18 +8,18 @@ use kairos_proto::enroll::{IssuedCertificate, b64url_decode, format_rfc3339_ms};
 use kairos_proto::lifecycle::{DEREGISTER_STATE_DECOMMISSIONED, RENEW_STATE_ISSUED};
 use kairos_proto::{Deregister, DeregisterAck, ErrorCode, RenewRequest, RenewResult, ServerMsg};
 use log::{info, warn};
-use rusqlite::TransactionBehavior;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::EnrollService;
 use super::pki_mgr::{IssueError, IssueOutcome};
-use super::store::{self, Audit, DbKind, DbState, RequestRow};
+use super::store::{Audit, DbKind, DbState, RequestRow};
 use crate::pki::csr::check_csr;
 use crate::pki::issue::Reason;
-use crate::pki::store::{self as ps, CertRow, Revoke};
+use crate::pki::store::{CertRow, Revoke};
 use crate::pki::x509::pem_encode;
+use crate::store::prelude::*;
 
 /// 8443 上的錯誤（`error` 訊息的 `code` 與 `message`；都不是 fatal）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,14 +81,14 @@ pub fn hello_ack_renew(svc: &EnrollService, client_cert: Option<&[u8]>) -> Hello
     {
         let active_subject = svc
             .db
-            .read_blocking(|conn| Ok(ps::get_ca(conn, ca_id)?.and_then(|c| c.cert_der)))
+            .read_blocking(|conn| Ok(conn.get_ca(ca_id)?.and_then(|c| c.cert_der)))
             .ok()
             .flatten()
             .and_then(|der| crate::pki::x509::parse_cert(&der).ok())
             .map(|i| i.subject_raw);
         let issued_by_kairos = svc
             .db
-            .read_blocking(|conn| Ok(ps::get_cert(conn, &info.serial)?.is_some()))
+            .read_blocking(|conn| Ok(conn.get_cert(&info.serial)?.is_some()))
             .unwrap_or(false);
         if issued_by_kairos && active_subject.is_some_and(|s| s != info.issuer_raw) {
             m.renew_now = Some(true);
@@ -110,19 +110,17 @@ pub fn on_hello(svc: &Arc<EnrollService>, agent_id: &str, serial: &str) {
         let now = svc.now_ms();
         let revoke_old = svc.effective().policy.revoke_superseded;
         let result = svc.db.write_blocking(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if ps::get_cert(&tx, &serial)?.is_none() || !ps::mark_first_used(&tx, &serial, now)? {
+            let tx = conn.begin(TxMode::Immediate)?;
+            if tx.get_cert(&serial)?.is_none() || !tx.mark_first_used(&serial, now)? {
                 return Ok(Vec::new());
             }
             let mut revoked = Vec::new();
             if revoke_old {
-                for old in ps::older_unrevoked(&tx, &agent, &serial)? {
+                for old in tx.older_unrevoked(&agent, &serial)? {
                     if let Revoke::Now(_) =
-                        ps::revoke(&tx, &old, now, now, Reason::Superseded, "system", Some("新憑證已開始使用"))?
+                        tx.revoke(&old, now, now, Reason::Superseded, "system", Some("新憑證已開始使用"))?
                     {
-                        store::audit(
-                            &tx,
-                            now,
+                        tx.audit(now,
                             &Audit {
                                 actor: "system",
                                 category: "pki",
@@ -192,18 +190,18 @@ pub async fn renew(
     let created = svc
         .db
         .write(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.begin(TxMode::Immediate)?;
             // 冪等：同一 agent_id＋同一 CSR 只簽發一張
-            if let Some(r) = store::request_by_csr(&tx, &agent, &csr.csr_sha256)? {
+            if let Some(r) = tx.request_by_csr(&agent, &csr.csr_sha256)? {
                 return Ok(Ok(r));
             }
-            if ps::spki_used_by_agent(&tx, &agent, &csr.spki_sha256)? {
+            if tx.spki_used_by_agent(&agent, &csr.spki_sha256)? {
                 return Ok(Err(AgentError::new(
                     ErrorCode::InvalidCsr,
                     "the new key must differ from previous keys of this agent_id",
                 )));
             }
-            let host = store::host_enroll(&tx, &agent)?;
+            let host = tx.host_enroll(&agent)?;
             let needs_approval = eff.policy.renew_requires_approval;
             let id = if kairos_proto::is_uuid_text(&request_id) {
                 request_id.to_ascii_lowercase()
@@ -213,7 +211,7 @@ pub async fn renew(
                     "request_id must be a UUID",
                 )));
             };
-            if store::get_request(&tx, &id)?.is_some() {
+            if tx.get_request(&id)?.is_some() {
                 return Ok(Err(AgentError::new(
                     ErrorCode::BadRequest,
                     "request_id is already used by a different CSR",
@@ -261,10 +259,8 @@ pub async fn renew(
                 withdraw_ip: None,
                 closed_at: None,
             };
-            store::insert_request(&tx, &row)?;
-            store::audit(
-                &tx,
-                now,
+            tx.insert_request(&row)?;
+            tx.audit(now,
                 &Audit {
                     actor: &format!("host:{}", &agent[..8]),
                     category: "pki",
@@ -284,7 +280,7 @@ pub async fn renew(
         DbState::Issued => {
             let serial = created.issued_serial.clone().unwrap_or_default();
             svc.db
-                .read(move |conn| Ok(ps::get_cert(conn, &serial)?))
+                .read(move |conn| Ok(conn.get_cert(&serial)?))
                 .await
                 .map_err(|_| storage())?
         }
@@ -352,19 +348,18 @@ pub async fn deregister(
     let (already, revoked, at) = svc
         .db
         .write(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.begin(TxMode::Immediate)?;
             let hostname = if m.hostname.is_empty() {
                 agent.clone()
             } else {
                 m.hostname.clone()
             };
-            let already = store::decommission_host(&tx, &agent, &hostname, "self", now)?;
-            let host = store::host_enroll(&tx, &agent)?;
+            let already = tx.decommission_host(&agent, &hostname, "self", now)?;
+            let host = tx.host_enroll(&agent)?;
             let at = host.and_then(|h| h.decommissioned_at).unwrap_or(now);
             let mut revoked = false;
             if revoke && let Some(serial) = &serial {
-                match ps::revoke(
-                    &tx,
+                match tx.revoke(
                     serial,
                     now,
                     now + super::DEREGISTER_WINDOW_MS,
@@ -376,8 +371,7 @@ pub async fn deregister(
                     Revoke::NotFound => {}
                 }
             }
-            store::audit(
-                &tx,
+            tx.audit(
                 now,
                 &Audit {
                     actor: &format!("host:{}", &agent[..8]),

@@ -38,6 +38,9 @@ pub(crate) struct Fixture {
     /// 告警服務（`fixture_with(.., true)` 時）
     pub alerts: Option<Arc<crate::alerts::AlertService>>,
     alerts_thread: Option<std::thread::JoinHandle<()>>,
+    /// 遠端管理（推送引擎不自動執行：測試以 `tick()` 推進）
+    #[allow(dead_code)]
+    pub remote: Option<Arc<crate::remote::RemoteService>>,
 }
 
 impl Fixture {
@@ -203,6 +206,16 @@ pub(crate) async fn fixture_opts(
     .unwrap();
     obs.agent_listening
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    let remote = crate::remote::RemoteService::open(crate::remote::StartParams {
+        settings: config.remote.clone(),
+        data_dir: paths.data_dir.clone(),
+        db_path: SqliteOptions::from_config(&config, &paths.data_dir).path,
+        registry: registry.clone(),
+        shutdown: shutdown.clone(),
+        clock: crate::enroll::system_clock(),
+    })
+    .await
+    .ok();
     let console = match start(StartParams {
         config: Arc::new(config.clone()),
         config_file: None,
@@ -217,6 +230,8 @@ pub(crate) async fn fixture_opts(
         alerts: alert_svc.clone(),
         directory,
         obs: Some(Arc::new(obs)),
+        purger: storage.purger.clone(),
+        remote: remote.clone(),
     })
     .await
     {
@@ -235,6 +250,7 @@ pub(crate) async fn fixture_opts(
         config,
         alerts: alert_svc,
         alerts_thread,
+        remote,
     }
 }
 
@@ -530,6 +546,7 @@ pub(crate) fn hello(id: &str, name: &str, peer: &str) -> HelloInfo {
                 kernel: None,
                 arch: Some("x86_64".into()),
             }),
+            install: None,
         })),
         peer: peer.into(),
         offline_after: Duration::from_secs(75),

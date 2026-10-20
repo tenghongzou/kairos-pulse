@@ -97,7 +97,8 @@ jobs:
         run: >-
           shellcheck -x -P SCRIPTDIR
           packaging/build-release-common.sh packaging/release.sh packaging/sign-release.sh
-          packaging/check-reproducible.sh kairos/packaging/build-release.sh pulse/packaging/build-release.sh
+          packaging/check-reproducible.sh packaging/release-manifest.sh
+          kairos/packaging/build-release.sh pulse/packaging/build-release.sh
           pulse/packaging/install.sh kairos/packaging/pkg/*.sh pulse/packaging/pkg/*.sh
 
       # 檢查已由 check、deny job 完成；release.sh 會確認工作目錄乾淨、清除 dist/ 後打包兩個產品，

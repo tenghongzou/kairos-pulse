@@ -14,7 +14,9 @@ mod log_throttle;
 mod metrics;
 mod network;
 mod protocol;
+mod remote;
 mod rotation;
+mod server_addr;
 mod service_status;
 mod shutdown;
 mod spool;
@@ -142,31 +144,71 @@ fn setup_logger(config: &config_manager::LogConfig) -> Result<(), String> {
     log_files::set_sink(sink.clone());
 
     fern::Dispatch::new()
-        .level(config.level_filter())
+        // 等級由 log 的 max_level 控制（集中設定可即時改變 log.level，REMOTE.md 第 3.1 節）
+        .level(LevelFilter::Trace)
         // 第三方套件的除錯訊息太多，只保留警告以上
         .level_for("config", LevelFilter::Warn)
         .level_for("rustls", LevelFilter::Warn)
         .chain(fern::Output::call(move |record| sink.log(record)))
         .apply()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    log::set_max_level(config.level_filter());
+    Ok(())
 }
 
-/// 每小時清除一次過期日誌檔（啟動時的清除已在 `main` 完成）。`retention_days == 0` 時不啟動。
+/// 每小時清除一次過期日誌檔（啟動時的清除已在 `main` 完成），並套用集中設定即時改變的 `log.level`、
+/// `log.retention_days`（REMOTE.md 第 3.1 節：日誌等級立即生效，保留天數在下一次清除生效）。
 ///
-/// 清除前的時鐘跳躍保護狀態保存在 `retention` 中，跨次延續。
-fn spawn_log_cleanup(retention: log_files::LogRetention, retention_days: u32) {
-    if retention_days == 0 {
-        return;
-    }
+/// 清除前的時鐘跳躍保護狀態保存在 `retention` 中，跨次延續；保留天數改變時以新的天數重新開啟。
+fn spawn_live_logging(
+    mut live: tokio::sync::watch::Receiver<Arc<AppConfig>>,
+    retention: log_files::LogRetention,
+    retention_days: u32,
+) {
     let retention = Arc::new(Mutex::new(retention));
     tokio::spawn(async move {
+        let mut days = retention_days;
+        let mut level = live.borrow().log.level_filter();
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + LOG_CLEANUP_INTERVAL,
             LOG_CLEANUP_INTERVAL,
         );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut live_open = true;
         loop {
-            ticker.tick().await;
+            let run_now = tokio::select! {
+                _ = ticker.tick() => days > 0,
+                changed = live.changed(), if live_open => {
+                    if changed.is_err() {
+                        live_open = false;
+                        continue;
+                    }
+                    let (new_level, new_days) = {
+                        let c = live.borrow_and_update();
+                        (c.log.level_filter(), c.log.retention_days)
+                    };
+                    if new_level != level {
+                        log::set_max_level(new_level);
+                        info!("日誌等級改為 {new_level}（集中設定）");
+                        level = new_level;
+                    }
+                    if new_days == days {
+                        continue;
+                    }
+                    info!("日誌保留天數改為 {new_days}（集中設定；0 = 永久保留）");
+                    days = new_days;
+                    let r = retention.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        *r.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            log_files::LogRetention::open(Path::new(log_files::LOG_DIR), new_days);
+                    })
+                    .await;
+                    days > 0
+                }
+            };
+            if !run_now {
+                continue;
+            }
             let retention = retention.clone();
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 // 上一次清除 panic 時鎖會被標記為 poisoned；狀態本身仍可用，繼續使用
@@ -303,6 +345,10 @@ fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Track
         Some(config.agent.display_name.trim().to_string()).filter(|n| !n.is_empty()),
     );
     file.config.warnings = config_warnings(config);
+    // 候選位址的數量（server.address 加 server.fallback_addresses；kairos/HA.md 第 8.7 節）
+    let candidates = config.server.candidates().len();
+    file.connection.candidates = u32::try_from(candidates).ok();
+    metrics::global().set_candidate_count(candidates);
     file.identity.agent_id_file =
         Some(base.join(config.agent.id_file.trim()).display().to_string());
     let buffer = local_status::BufferSettings {
@@ -373,6 +419,17 @@ fn main() -> ExitCode {
         }
         // pulse service install|uninstall|run（Windows 服務；其他平台以用法錯誤結束）
         cli::Command::Service(args) => return ExitCode::from(winsvc::run(args)),
+        // pulse config show／pulse upgrade …（遠端管理；REMOTE.md 第 10.2 節）
+        cli::Command::ConfigHelp => {
+            println!("{}", remote::cli::CONFIG_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        cli::Command::Config(args) => return ExitCode::from(remote::cli::run_config(args)),
+        cli::Command::UpgradeHelp => {
+            println!("{}", remote::cli::UPGRADE_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        cli::Command::Upgrade(args) => return ExitCode::from(remote::cli::run_upgrade(args)),
         _ => {}
     }
     // 不讀取設定：設定有誤時也能確認版本
@@ -423,7 +480,7 @@ fn run_agent(print_id: bool, external_stop: Option<CancellationToken>) -> u8 {
         eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
         return EXIT_GENERAL;
     }
-    // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_log_cleanup）
+    // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_live_logging）
     retention.run();
 
     // 自建 runtime（而非 #[tokio::main]），以便結束時用 shutdown_timeout：
@@ -753,18 +810,154 @@ async fn run(
         sink.meta.set_agent_id(Some(agent_id.clone()));
     }
 
-    spawn_log_cleanup(retention, config.log.retention_days);
     spawn_client_cert_recheck(tls.clone());
 
+    // 遠端管理（集中設定、遠端升級；crates/kairos-proto/REMOTE.md）：以快取的集中設定與本機設定合併出
+    // 生效的設定；之後的即時變更由各工作就地套用，需要重新連線的變更重建取樣、本機緩衝與連線
+    let mgmt = remote_setup(&config, cwd.as_deref());
+    config = (*mgmt.config.effective()).clone();
+    log::set_max_level(config.log.level_filter());
+    spawn_live_logging(
+        mgmt.config.subscribe(),
+        retention,
+        config.log.retention_days,
+    );
+
+    let mut tls = tls;
+    // 狀態檔的「遠端管理」（pulse status 的「設定」「升級」列）
+    {
+        let mgmt = mgmt.clone();
+        tracker.set_management(local_status::ManagementSource(Box::new(move || {
+            status_file::Management {
+                config: Some(mgmt.config.view()),
+                upgrade: Some(mgmt.upgrade.view()),
+            }
+        })));
+    }
+    loop {
+        let end = pipeline(
+            &mut config,
+            &mgmt,
+            &agent_id,
+            &hostname,
+            &base,
+            &paths,
+            &mut tls,
+            &tracker,
+            &shutdown,
+            background_pending.take(),
+            std::mem::take(&mut start_in_grace),
+        )
+        .await?;
+        match end {
+            LoopEnd::Stopped => return Ok(()),
+            LoopEnd::Reconfigure => {
+                config = (*mgmt.config.effective()).clone();
+                info!("以新的集中設定重建取樣、本機緩衝與連線");
+            }
+        }
+    }
+}
+
+/// 建立遠端管理的狀態：集中設定（快取在狀態目錄的 `remote/config.json`）與遠端升級（安裝方式偵測、
+/// `upgrade/state.json`）
+fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgmt> {
+    let local_file = cwd
+        .map(|d| d.join(config_manager::LOCAL_CONFIG_FILE))
+        .filter(|p| p.is_file());
+    let state_dir = remote::state_dir();
+    // [remote_config]、[upgrade] 只能在 pulse.toml 設定（REMOTE.md 第 5.6 節）：特權輔助程式只讀 pulse.toml，
+    // Pulse 也以 pulse.toml 的值為準（信任錨、principal、降版、健康確認期限與輔助程式一致），
+    // PULSE__* 環境變數只能把 enabled 關閉
+    let file_only = local_file
+        .as_deref()
+        .and_then(|p| AppConfig::load_file_only(p).ok())
+        .unwrap_or_else(AppConfig::embedded_defaults);
+    let mut local = config.clone();
+    local.remote_config.enabled &= file_only.remote_config.enabled;
+    let sources = remote::config::LocalSources::load(local_file.as_deref(), None);
+    let central = remote::config::CentralConfig::new(
+        local,
+        sources,
+        Some(state_dir.join(remote::config::CACHE_RELATIVE)),
+    );
+    let upgrade = &file_only.upgrade;
+    let enabled = config.upgrade.enabled && upgrade.enabled;
+    let detection = remote::install::detect(
+        enabled,
+        &upgrade.allowed_signers_path(),
+        &remote::install::Probe::system(),
+    );
+    // 每次連線前重新偵測（放好信任錨、啟用 pulse-upgrade.path 後不必重新啟動）。設定只在啟動時讀取，
+    // 以 OnceLock 交給函式指標
+    static DETECT_INPUT: std::sync::OnceLock<(bool, PathBuf)> = std::sync::OnceLock::new();
+    let _ = DETECT_INPUT.set((enabled, upgrade.allowed_signers_path()));
+    fn redetect() -> remote::install::Detection {
+        let (enabled, anchor) = DETECT_INPUT.get().cloned().unwrap_or_default();
+        remote::install::detect(enabled, &anchor, &remote::install::Probe::system())
+    }
+    info!(
+        "遠端管理：集中設定{}；遠端升級 install.method={} install.upgrade={}",
+        if central.enabled() {
+            "啟用"
+        } else {
+            "本機停用"
+        },
+        detection.method,
+        detection.upgrade
+    );
+    let agent = remote::upgrade::UpgradeAgent::new(remote::upgrade::UpgradeEnv {
+        state_dir,
+        detection,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        extra_principals: upgrade.extra_principals.clone(),
+        allow_downgrade: upgrade.allow_downgrade,
+        health_timeout_secs: upgrade.health_timeout_secs,
+        require_root_owner: true,
+        free_space: remote::upgrade::free_space,
+        redetect: Some(redetect),
+    });
+    remote::RemoteMgmt::new(central, agent)
+}
+
+/// [`connection_loop`]／[`pipeline`] 結束的原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopEnd {
+    /// `shutdown` 被觸發
+    Stopped,
+    /// 集中設定改變了需要重新連線的鍵：以新的設定重建取樣、本機緩衝與連線
+    Reconfigure,
+}
+
+/// 取樣（收集 task、本機緩衝、資產）與連線：以 `config`（生效的設定）建立，執行到結束要求或需要以新的
+/// 集中設定重建為止。即時的鍵（`report.interval`、`collect.*`、`processes.*`、`inventory.*` 的間隔與
+/// 選項、`buffer.max_*`）由這裡的工作訂閱生效的設定就地套用（REMOTE.md 第 3.1 節）
+#[allow(clippy::too_many_arguments)]
+async fn pipeline(
+    config: &mut AppConfig,
+    mgmt: &Arc<remote::RemoteMgmt>,
+    agent_id: &str,
+    hostname: &str,
+    base: &Path,
+    paths: &enroll::store::IdentityPaths,
+    tls: &mut tls::TlsSetup,
+    tracker: &Arc<local_status::Tracker>,
+    shutdown: &CancellationToken,
+    background_pending: Option<Box<enroll::store::EnrollmentFile>>,
+    start_in_grace: bool,
+) -> Result<LoopEnd, Failure> {
+    // 重建時（集中設定改變了需要重新連線的鍵）：狀態檔不再顯示上一輪的本機緩衝
+    tracker.clear_spool();
     // 本機緩衝（A5）：開啟失敗時不中止監控，改為 at-most-once（不宣告 durable）並記 ERROR
     let shared_spool = if config.buffer.enabled {
         let settings = spool_settings(&config.buffer);
         let dir = settings.dir.clone();
-        match blocking_or_shutdown(&shutdown, move || spool::Spool::open(settings))
+        match blocking_or_shutdown(shutdown, move || spool::Spool::open(settings))
             .await
             .map_err(|e| format!("啟動失敗：{e}"))?
         {
-            None => return Ok(()),
+            None => return Ok(LoopEnd::Stopped),
             Some(Ok(opened)) => {
                 let stats = opened.stats();
                 info!(
@@ -814,28 +1007,33 @@ async fn run(
         None
     };
 
-    // 系統資訊收集 task →（啟用本機緩衝時經緩衝寫入 task）→ 連線 task
+    // 系統資訊收集 task →（啟用本機緩衝時經緩衝寫入 task）→ 連線 task。收集 task 依集中設定即時改變的
+    // report.interval／collect.*／processes.* 重新開始取樣
     let (report_tx, mut report_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
     let (mut collector, mut ingest) = match &shared_spool {
         Some(shared) => {
             let (sample_tx, sample_rx) = mpsc::channel(SPOOL_QUEUE_CAPACITY);
-            let collector = tokio::spawn(system_info::collect_periodically(
-                Duration::from_secs(config.report.interval),
-                system_info::CollectOptions::from_config(&config),
-                sample_tx,
-            ));
+            let collector = tokio::spawn(collect_live(mgmt.config.subscribe(), sample_tx));
             let ingest = tokio::spawn(spool::ingest(sample_rx, shared.clone(), report_tx));
             (collector, Some(ingest))
         }
         None => (
-            tokio::spawn(system_info::collect_periodically(
-                Duration::from_secs(config.report.interval),
-                system_info::CollectOptions::from_config(&config),
-                report_tx,
-            )),
+            tokio::spawn(collect_live(mgmt.config.subscribe(), report_tx)),
             None,
         ),
     };
+    // 本機緩衝的上限（buffer.max_mb／max_records／max_age_hours）即時生效
+    let spool_limits = shared_spool.clone().map(|shared| {
+        let mut live = mgmt.config.subscribe();
+        tokio::spawn(async move {
+            while live.changed().await.is_ok() {
+                let s = spool_settings(&live.borrow_and_update().buffer);
+                shared
+                    .lock()
+                    .set_limits(s.max_bytes, s.max_records, s.max_age);
+            }
+        })
+    });
     let ingest_done = async {
         match ingest.as_mut() {
             Some(task) => task.await,
@@ -843,22 +1041,36 @@ async fn run(
         }
     };
 
-    let mut settings = network::Settings::new(&config, agent_id.clone(), hostname.clone());
+    let mut settings = network::Settings::new(config, agent_id.to_string(), hostname.to_string());
+    settings.mgmt = Some(mgmt.clone());
     if config.buffer.enabled && shared_spool.is_none() {
         // copywriting §4.2 範例 71：systemd Status 與服務描述也要看得到 PLS-E4004
         settings.status_note = Some("無法開啟本機緩衝（PLS-E4004，斷線期間的資料不會補送）".into());
     }
-    // 主機資產（F4，feature inventory）：連線協商後才收集（背景的 blocking 執行緒）
+    // 主機資產（F4，feature inventory）：連線協商後才收集（背景的 blocking 執行緒）；間隔與選項即時生效
+    let mut inventory_tasks = Vec::new();
     if config.inventory.enabled {
+        let options = |c: &AppConfig| system_info::inventory::InventoryOptions {
+            hardware_serials: c.inventory.hardware_serials,
+            network_addresses: c.inventory.network_addresses,
+            interface_exclude: c.collect.interface_exclude.clone(),
+        };
         let agent = inventory::InventoryAgent::new(
             Duration::from_secs(config.inventory.interval),
-            system_info::inventory::InventoryOptions {
-                hardware_serials: config.inventory.hardware_serials,
-                network_addresses: config.inventory.network_addresses,
-                interface_exclude: config.collect.interface_exclude.clone(),
-            },
+            options(config),
         );
-        tokio::spawn(inventory::run_worker(agent.clone()));
+        inventory_tasks.push(tokio::spawn(inventory::run_worker(agent.clone())));
+        let mut live = mgmt.config.subscribe();
+        let live_agent = agent.clone();
+        inventory_tasks.push(tokio::spawn(async move {
+            while live.changed().await.is_ok() {
+                let (interval, opts) = {
+                    let c = live.borrow_and_update();
+                    (Duration::from_secs(c.inventory.interval), options(&c))
+                };
+                live_agent.update(interval, opts);
+            }
+        }));
         settings.inventory = Some(agent);
     }
     if config.processes.enabled && config.processes.include_user {
@@ -868,52 +1080,122 @@ async fn run(
         );
     }
     // 身分由 pulse enroll 管理（identity/client.pem）：宣告 renew、過期時改走 8444 過期續簽
-    let managed = enroll::service::identity_managed(&config, &base, &paths);
+    let managed = enroll::service::identity_managed(config, base, paths);
     if managed {
         settings.extra_features = vec![kairos_proto::FEATURE_RENEW.to_string()];
         settings.rotation = Some(Arc::new(Mutex::new(rotation::Rotation::new(
             paths.clone(),
-            &agent_id,
+            agent_id,
             config.identity.renew_before_days,
         ))));
         settings.grace_on_expiry = true;
     }
     let net = connection_loop(
-        &mut config,
-        &base,
-        &paths,
+        config,
+        mgmt,
+        base,
+        paths,
         settings,
         tls,
         &mut report_rx,
         shared_spool.clone(),
-        &shutdown,
+        shutdown,
         background_pending,
         start_in_grace,
     );
-    let result = tokio::select! {
-        res = net => res,
-        res = ingest_done => Err(match res {
+    // (結果, 收集 task 已結束, 緩衝寫入 task 已結束)
+    let (result, collector_done, ingest_finished) = tokio::select! {
+        res = net => (res, false, false),
+        res = ingest_done => (Err(match res {
             Ok(()) => "本機緩衝寫入任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("本機緩衝寫入任務發生 panic：{e}"),
             Err(e) => format!("本機緩衝寫入任務異常結束：{e}"),
         }
-        .into()),
+        .into()), false, true),
         // 收集 task 正常情況下不會結束；結束或 panic 時讓整個程式以非 0 結束，交由服務管理員重啟
-        res = &mut collector => Err(match res {
+        res = &mut collector => (Err(match res {
             Ok(()) => "系統資訊收集任務意外結束".to_string(),
             Err(e) if e.is_panic() => format!("系統資訊收集任務發生 panic：{e}"),
             Err(e) => format!("系統資訊收集任務異常結束：{e}"),
         }
-        .into()),
+        .into()), true, false),
     };
-    // 結束（或異常結束）前 fsync 本機緩衝並記下送達位置，下次啟動從這裡接著送
+    // 重建或結束：停止這一輪的工作，並等它們真的停下來——重建時會以同一個目錄重新開啟本機緩衝
+    // （緩衝不加鎖），舊的寫入 task 不能在新的緩衝開啟後還寫進同一個目錄
+    collector.abort();
+    if !collector_done {
+        let _ = collector.await;
+    }
+    if let Some(task) = ingest {
+        task.abort();
+        if !ingest_finished {
+            let _ = task.await;
+        }
+    }
+    if let Some(task) = spool_limits {
+        task.abort();
+        let _ = task.await;
+    }
+    for task in inventory_tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    // 結束（或異常結束、重建）前 fsync 本機緩衝並記下送達位置，下次開啟從這裡接著送
     if let Some(shared) = &shared_spool {
         let closed = shared.lock().close();
         if let Err(e) = closed {
-            warn!("結束時無法同步本機緩衝：{e}");
+            warn!("無法同步本機緩衝：{e}");
         }
     }
     result
+}
+
+/// 系統資訊收集 task：集中設定改變了取樣間隔或採集範圍（`report.interval`、`collect.*`、`processes.*`）時，
+/// 以新的設定重新開始取樣（REMOTE.md 第 3.1 節「即時」；重新開始後的第一筆在一個間隔之後）
+async fn collect_live(
+    mut live: tokio::sync::watch::Receiver<Arc<AppConfig>>,
+    tx: mpsc::Sender<system_info::Sample>,
+) {
+    loop {
+        let (interval, opts) = {
+            let c = live.borrow_and_update();
+            (
+                Duration::from_secs(c.report.interval),
+                system_info::CollectOptions::from_config(&c),
+            )
+        };
+        // 狀態檔的 report_interval_ms 跟著實際的取樣間隔（啟動時已寫入本機設定的值）
+        local_status::record(|s| s.set_report_interval(interval));
+        let collect = system_info::collect_periodically(interval, opts.clone(), tx.clone());
+        tokio::pin!(collect);
+        let restart = async {
+            loop {
+                if live.changed().await.is_err() {
+                    return std::future::pending::<()>().await;
+                }
+                let c = live.borrow_and_update();
+                if Duration::from_secs(c.report.interval) != interval
+                    || system_info::CollectOptions::from_config(&c) != opts
+                {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            () = &mut collect => return,
+            () = restart => {
+                info!("取樣設定改變（集中設定），以新的設定重新開始取樣");
+            }
+        }
+    }
+}
+
+/// 重新讀取設定（`pulse enroll` 寫入了 pulse.toml）並與集中設定合併；有誤時以設定錯誤結束（結束代碼 3）
+fn reload_effective(mgmt: &remote::RemoteMgmt) -> Result<AppConfig, Failure> {
+    let local = reload_config()?;
+    let file = Path::new(config_manager::LOCAL_CONFIG_FILE);
+    let sources = remote::config::LocalSources::load(file.is_file().then_some(file), None);
+    Ok((*mgmt.config.replace_local(local, sources)).clone())
 }
 
 /// 重新讀取設定（`pulse enroll` 寫入了 pulse.toml）；有誤時以設定錯誤結束（結束代碼 3）
@@ -939,17 +1221,17 @@ fn rebuild_tls(config: &AppConfig) -> Result<tls::TlsSetup, Failure> {
 #[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     config: &mut AppConfig,
+    mgmt: &remote::RemoteMgmt,
     base: &Path,
     paths: &enroll::store::IdentityPaths,
     settings: network::Settings,
-    tls: tls::TlsSetup,
+    tls: &mut tls::TlsSetup,
     reports: &mut mpsc::Receiver<system_info::Sample>,
     spool: Option<Arc<spool::SharedSpool>>,
     shutdown: &CancellationToken,
     background_pending: Option<Box<enroll::store::EnrollmentFile>>,
     start_in_grace: bool,
-) -> Result<(), Failure> {
-    let mut tls = tls;
+) -> Result<LoopEnd, Failure> {
     let mut grace_now = start_in_grace;
     let reload = Arc::new(tokio::sync::Notify::new());
     // 目前的身分仍可用、但有進行中的申請（pulse enroll --force 等）：在背景接續，取得後重新連線
@@ -968,7 +1250,7 @@ async fn connection_loop(
     let info = enroll::flow::RequestInfo::new(&settings.hostname, &settings.host);
     loop {
         if shutdown.is_cancelled() {
-            return Ok(());
+            return Ok(LoopEnd::Stopped);
         }
         if grace_now {
             grace_now = false;
@@ -987,9 +1269,9 @@ async fn connection_loop(
             )
             .await;
             match end {
-                enroll::service::End::Shutdown => return Ok(()),
+                enroll::service::End::Shutdown => return Ok(LoopEnd::Stopped),
                 enroll::service::End::Installed => {
-                    tls = rebuild_tls(config)?;
+                    *tls = rebuild_tls(config)?;
                     info!(
                         "{}已透過過期續簽取得新憑證  via=grace",
                         codes::tag(codes::CERT_RENEWED, None)
@@ -999,7 +1281,7 @@ async fn connection_loop(
                     // 依 Kairos 的時間仍有效：稍候以目前的憑證再連線
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = shutdown.cancelled() => return Ok(LoopEnd::Stopped),
                     }
                 }
                 enroll::service::End::Stopped | enroll::service::End::Changed => {
@@ -1008,10 +1290,10 @@ async fn connection_loop(
                     if enroll::service::idle(paths, &file, shutdown).await
                         == enroll::service::End::Shutdown
                     {
-                        return Ok(());
+                        return Ok(LoopEnd::Stopped);
                     }
-                    *config = reload_config()?;
-                    tls = rebuild_tls(config)?;
+                    *config = reload_effective(mgmt)?;
+                    *tls = rebuild_tls(config)?;
                 }
             }
             continue;
@@ -1032,12 +1314,13 @@ async fn connection_loop(
         let exit = network::run(settings.clone(), tls.clone(), reports, spool.clone(), stop).await;
         linker.abort();
         match exit {
-            network::RunExit::Stopped if shutdown.is_cancelled() => return Ok(()),
+            network::RunExit::Stopped if shutdown.is_cancelled() => return Ok(LoopEnd::Stopped),
             network::RunExit::Stopped => {
                 // 背景申請取得了新憑證：重新讀設定並以新憑證連線
-                *config = reload_config()?;
-                tls = rebuild_tls(config)?;
+                *config = reload_effective(mgmt)?;
+                *tls = rebuild_tls(config)?;
             }
+            network::RunExit::Reconfigure => return Ok(LoopEnd::Reconfigure),
             network::RunExit::CertExpired => grace_now = true,
             network::RunExit::Renewed => {
                 // 以新憑證另建連線送 hello，成功後才取代 client.pem／client.key（設計包 §5.6）
@@ -1066,7 +1349,7 @@ async fn connection_loop(
                                     "{}已更新用戶端憑證（新序號 {serial}）  via=rotation",
                                     codes::tag(codes::CERT_RENEWED, None)
                                 );
-                                tls = rebuild_tls(config)?;
+                                *tls = rebuild_tls(config)?;
                             }
                             Err(e) => warn!("無法以新憑證取代 client.pem：{e}；繼續使用目前的憑證"),
                         }

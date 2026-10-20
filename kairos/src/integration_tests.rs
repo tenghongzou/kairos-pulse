@@ -68,6 +68,11 @@ struct Options {
     throttle_interval: Duration,
     /// 以 SQLite 後端保存（`<dir>/kairos.db`；宣告 `inventory`、`processes`）。預設為 JSONL
     sqlite: bool,
+    /// 個資政策（`[privacy]`）
+    privacy: Arc<crate::privacy::PrivacyPolicy>,
+    /// 遠端管理（feature `config`／`upgrade`；需要 `sqlite` 與 mTLS）。`Some` 時以這份 `[remote]` 啟動服務
+    /// （推送引擎不自動執行：測試以 `tick()` 推進）
+    remote: Option<crate::config::RemoteSettings>,
 }
 
 impl Default for Options {
@@ -83,6 +88,8 @@ impl Default for Options {
             reports: None,
             throttle_interval: crate::throttle::DEFAULT_INTERVAL,
             sqlite: false,
+            privacy: crate::privacy::PrivacyPolicy::shared_default(),
+            remote: None,
         }
     }
 }
@@ -96,6 +103,10 @@ struct Server {
     throttle: Arc<LogThrottle>,
     per_ip: Arc<PerIpLimiter>,
     accept: JoinHandle<()>,
+    /// 遠端管理（`Options::remote` 時）
+    remote: Option<Arc<crate::remote::RemoteService>>,
+    /// 遠端管理的時鐘相對於實際時間的位移（毫秒；跳過啟動後 1 分鐘不提議的保護）
+    clock_offset: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Server {
@@ -158,7 +169,30 @@ impl Server {
             max_per_allowlisted_ip: opts.max_connections_per_allowlisted_ip,
             mtls: opts.mtls_crls.is_some(),
         };
+        let clock_offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let remote = match &opts.remote {
+            Some(settings) if opts.sqlite => {
+                let off = clock_offset.clone();
+                Some(
+                    crate::remote::RemoteService::open(crate::remote::StartParams {
+                        settings: settings.clone(),
+                        data_dir: dir.clone(),
+                        db_path: dir.join(crate::store::sqlite::DB_FILE),
+                        registry: registry.clone(),
+                        shutdown: shutdown.clone(),
+                        clock: Arc::new(move || {
+                            Utc::now().timestamp_millis()
+                                + off.load(std::sync::atomic::Ordering::SeqCst)
+                        }),
+                    })
+                    .await
+                    .unwrap(),
+                )
+            }
+            _ => None,
+        };
         let ctx = Arc::new(ConnContext {
+            remote: remote.clone(),
             registry: registry.clone(),
             reports,
             timeouts: opts.timeouts,
@@ -169,6 +203,8 @@ impl Server {
             report_limiter: Arc::new(ReportLimiter::with_policy(policy.clone())),
             enroll: None,
             assets,
+            privacy: opts.privacy.clone(),
+            cluster: crate::connection::ClusterContext::new("kairos-test"),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -193,6 +229,8 @@ impl Server {
             throttle,
             per_ip,
             accept,
+            remote,
+            clock_offset,
         }
     }
 
@@ -683,6 +721,66 @@ async fn shutdown_sends_close_notify_to_all_connections() {
     server.shutdown.trigger();
     registered.expect_clean_close().await;
     waiting.expect_clean_close().await;
+}
+
+#[tokio::test]
+async fn cluster_feature_is_listed_only_when_the_client_declares_it() {
+    // PROTOCOL.md「叢集與排空」：0.8 以前的 Pulse（不宣告 cluster）收到的 hello_ack 不變
+    let server = Server::start(Options::default()).await;
+    let mut old = Client::connect(server.addr).await;
+    old.send(&hello_v2(1, ID, &["metrics", "durable"]).to_string())
+        .await;
+    let ack = old.recv().await;
+    assert_eq!(ack["features"], json!(["metrics", "durable"]), "{ack}");
+    assert!(ack.get("server_node").is_none(), "{ack}");
+    assert!(ack.get("cluster_id").is_none(), "{ack}");
+
+    let mut new = Client::connect(server.addr).await;
+    new.send(&hello_v2(1, OTHER_ID, &["metrics", "durable", "cluster"]).to_string())
+        .await;
+    let ack = new.recv().await;
+    assert_eq!(
+        ack["features"],
+        json!(["metrics", "durable", "cluster"]),
+        "{ack}"
+    );
+    assert_eq!(ack["server_node"], "kairos-test", "{ack}");
+    // 單機的 Kairos 沒有 cluster_id
+    assert!(ack.get("cluster_id").is_none(), "{ack}");
+
+    // 協商為 v1 時不使用 features（宣告了也一樣）
+    let mut v1 = Client::connect(server.addr).await;
+    let mut h = hello_v2(1, "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee", &["cluster"]);
+    h["proto_max"] = json!(1);
+    v1.send(&h.to_string()).await;
+    let ack = v1.recv().await;
+    assert_eq!(
+        ack,
+        json!({"type":"hello_ack","seq":1,"proto":1,"offline_after_ms":5000})
+    );
+}
+
+#[tokio::test]
+async fn shutdown_drains_only_connections_that_negotiated_cluster() {
+    let server = Server::start(Options::default()).await;
+    let mut old = Client::connect(server.addr).await;
+    old.send(&hello_v2(1, ID, &["metrics", "durable"]).to_string())
+        .await;
+    assert_eq!(old.recv().await["type"], "hello_ack");
+    let mut new = Client::connect(server.addr).await;
+    new.send(&hello_v2(1, OTHER_ID, &["metrics", "durable", "cluster"]).to_string())
+        .await;
+    assert_eq!(new.recv().await["type"], "hello_ack");
+    server.shutdown.trigger();
+    // 協商了 cluster：先收到 drain（seq 為 null，分散時間至少 10 秒），再收到 close_notify
+    let drain = new.recv().await;
+    assert_eq!(
+        drain,
+        json!({"type":"drain","seq":null,"reason":"node_draining","reconnect_within_ms":10000})
+    );
+    new.expect_clean_close().await;
+    // 沒有協商的連線與 0.8 相同：直接 close_notify
+    old.expect_clean_close().await;
 }
 
 #[tokio::test]
@@ -1973,6 +2071,165 @@ async fn metrics_spec_examples_get_the_documented_responses() {
 }
 
 #[tokio::test]
+async fn privacy_policy_is_applied_before_anything_is_stored() {
+    use crate::privacy::*;
+    let key = || PseudonymKey::from_bytes(&[9u8; 32]);
+    let settings = PrivacySettings {
+        store_peer_ip: PeerIpMode::Truncate,
+        hostname: HostnameMode::Pseudonymize,
+        process_command: ProcessCommandMode::Redact,
+        process_user: ProcessUserMode::Drop,
+        inventory_network: InventoryNetworkMode::Truncate,
+    };
+    let server = Server::start(Options {
+        privacy: Arc::new(PrivacyPolicy::new(settings, Some(key()))),
+        ..sqlite_server_options()
+    })
+    .await;
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "processes", "inventory"]).to_string())
+        .await;
+    assert_eq!(c.recv().await["type"], "hello_ack");
+    let mut r: Value = serde_json::from_str(&metrics_report(2, 1.0)).unwrap();
+    r["processes"] = json!({"top_cpu": [{"pid": 7, "name": "mysql", "cpu_usage": 1.0, "memory": 5,
+        "user": "ann", "command": "mysql -uroot -pS3cret"}]});
+    c.send(&r.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+    let inv = json!({"type": "inventory", "seq": 3, "ts": "2026-10-09T00:00:00.000Z", "inventory": {
+        "network_interfaces": [{"name": "eth0", "mac": "52:54:00:12:34:56",
+            "addresses": ["192.168.10.21/24", "fe80::5054:ff:fe12:3456/64"], "mtu": 1500}]}});
+    c.send(&inv.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":3}));
+    let db = server.db();
+    let (hostname, peer): (String, String) = db
+        .query_row("SELECT hostname, peer FROM hosts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(hostname, key().pseudonym("host", "web-01"));
+    assert_eq!(peer, "127.0.0.0/24");
+    let body: Vec<u8> = db
+        .query_row("SELECT body FROM process_snapshots", [], |r| r.get(0))
+        .unwrap();
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(!text.contains("S3cret") && !text.contains("ann"), "{text}");
+    assert!(text.contains("-p[已遮蔽]"), "{text}");
+    let inv: String = db
+        .query_row("SELECT body FROM host_inventory", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        inv.contains("192.168.10.0/24") && inv.contains("52:54:00:00:00:00"),
+        "{inv}"
+    );
+    assert!(
+        !inv.contains("192.168.10.21") && !inv.contains("12:34:56"),
+        "{inv}"
+    );
+    // 狀態表（agents.json、主控台）也只看到假名與網段
+    let live = server.registry.live_get(ID).unwrap();
+    assert_eq!(&*live.hostname, key().pseudonym("host", "web-01"));
+    assert_eq!(&*live.peer, "127.0.0.0/24");
+    assert_eq!(
+        live.host.as_ref().and_then(|h| h.display_name.clone()),
+        Some(key().pseudonym("name", "Web 01"))
+    );
+}
+
+#[tokio::test]
+async fn exported_metrics_only_carry_privacy_transformed_values() {
+    // 指標轉出（kairos/EXPORT.md）× 個資保護（kairos/PRIVACY.md）：[privacy] 在資料進入時轉換，
+    // Prometheus exporter 的輸出與 OTLP 的 payload 都只看到假名、網段與遮蔽後的命令列
+    use crate::export::{ExportHub, otlp, prom, settings};
+    use crate::privacy::*;
+    let key = || PseudonymKey::from_bytes(&[7u8; 32]);
+    let settings_ = PrivacySettings {
+        store_peer_ip: PeerIpMode::Truncate,
+        hostname: HostnameMode::Pseudonymize,
+        process_command: ProcessCommandMode::Redact,
+        process_user: ProcessUserMode::Drop,
+        inventory_network: InventoryNetworkMode::Truncate,
+    };
+    let server = Server::start(Options {
+        privacy: Arc::new(PrivacyPolicy::new(settings_, Some(key()))),
+        ..sqlite_server_options()
+    })
+    .await;
+    let mut cfg = crate::config::AppConfig::default();
+    cfg.export.prometheus.enabled = true;
+    cfg.export.prometheus.include_processes = true;
+    cfg.export.otlp.enabled = true;
+    cfg.export.otlp.endpoint = "http://127.0.0.1:9/v1/metrics".into();
+    let eff = settings::effective(&cfg, &[], None);
+    let hub = ExportHub::new(eff.clone(), None, None);
+    server.registry.set_export_hub(hub.clone());
+
+    let mut c = Client::connect(server.addr).await;
+    c.send(&hello_v2(1, ID, &["metrics", "processes", "inventory"]).to_string())
+        .await;
+    assert_eq!(c.recv().await["type"], "hello_ack");
+    let mut r: Value = serde_json::from_str(&metrics_report(2, 1.0)).unwrap();
+    r["processes"] = json!({"top_cpu": [{"pid": 7, "name": "mysql", "cpu_usage": 1.0, "memory": 5,
+        "user": "annx9user", "command": "mysql -uroot -pS3cret"}]});
+    c.send(&r.to_string()).await;
+    assert_eq!(c.recv().await, json!({"type":"ack","seq":2}));
+
+    let pseudonym = key().pseudonym("host", "web-01");
+    // 原始的主機名稱、顯示名稱、完整的來源位址、執行身分與密碼都不能出現
+    let forbidden = ["web-01", "Web 01", "127.0.0.1", "annx9user", "S3cret"];
+    let check = |what: &str, text: &str| {
+        for f in forbidden {
+            assert!(!text.contains(f), "{what} 含有 {f:?}：{text}");
+        }
+    };
+
+    // Prometheus exporter：主機列取自狀態表（與主控台的主機索引同源）＋ hub 的最新值
+    let sample = hub.latest().get(ID).cloned().expect("hub 應有最新值");
+    assert_eq!(&*sample.hostname, pseudonym);
+    let live = server.registry.live_get(ID).unwrap();
+    let row = prom::HostRow {
+        agent_id: live.agent_id.clone(),
+        hostname: live.hostname.clone(),
+        display_name: live
+            .host
+            .as_ref()
+            .and_then(|h| h.display_name.clone())
+            .map(Arc::from),
+        group: None,
+        up: true,
+        agent_version: Some(live.agent_version.clone()),
+        os_family: None,
+        tags: Arc::from(Vec::<String>::new()),
+        sample: Some(sample),
+    };
+    let rendered = prom::render(
+        &[row],
+        &prom::Options {
+            now_ms: Utc::now().timestamp_millis(),
+            stale_after_ms: i64::MAX / 2,
+            include_processes: true,
+            processes_top_n: 5,
+            openmetrics: false,
+        },
+    );
+    assert!(
+        rendered.body.contains(&format!("hostname=\"{pseudonym}\"")),
+        "{}",
+        rendered.body
+    );
+    check("Prometheus 輸出", &rendered.body);
+
+    // OTLP：resource 屬性取自主機清冊（SQLite）
+    let meta = otlp::load_host_meta(&server.dir.join(crate::store::sqlite::DB_FILE));
+    let batch = hub.take_batch(usize::MAX);
+    assert_eq!(batch.len(), 1);
+    let (body, points) = otlp::encode(&batch, &meta, &eff);
+    assert!(points > 0);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains(&pseudonym), "OTLP 應帶假名");
+    check("OTLP payload", &text);
+}
+
+#[tokio::test]
 async fn processes_are_validated_only_when_negotiated() {
     let server = Server::start(sqlite_server_options()).await;
     let mut c = Client::connect(server.addr).await;
@@ -2083,4 +2340,392 @@ async fn old_pulse_metrics_get_estimated_usage_on_the_new_server() {
         server.count("SELECT count(*) FROM series WHERE derived = 1"),
         1
     );
+}
+
+// ---- 遠端管理（feature config／upgrade；PROTOCOL.md「遠端管理」） ----
+
+/// 0.9.0 的 Pulse：宣告 config、upgrade 並帶 install
+fn hello_mgmt(seq: u64, agent_id: &str, version: &str, features: &[&str]) -> String {
+    let mut h = hello_v2(seq, agent_id, features);
+    h["agent_version"] = json!(version);
+    h["install"] = json!({"method": "tar", "upgrade": "ready", "config": "enabled"});
+    h.to_string()
+}
+
+fn remote_server_options() -> Options {
+    Options {
+        sqlite: true,
+        mtls_crls: Some(vec![test_pki::CRL_EMPTY]),
+        remote: Some(crate::config::RemoteSettings::default()),
+        ..Options::default()
+    }
+}
+
+fn ts_now() -> &'static str {
+    "2026-11-20T02:00:00.000Z"
+}
+
+#[tokio::test]
+async fn mgmt_features_need_mtls_sqlite_and_the_client_declaring_them() {
+    // 沒有宣告：hello_ack 與 0.8 相同，訊息一律 unknown_type
+    let server = Server::start(remote_server_options()).await;
+    let good = connector(Some((test_pki::GOOD_CERT, test_pki::GOOD_KEY)));
+    let mut c = Client::connect_with(&good, server.addr).await;
+    c.send(&hello_mgmt(1, test_pki::GOOD_ID, "0.9.0", &["metrics"]))
+        .await;
+    let ack = c.recv().await;
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    assert!(
+        !ack["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "config" || f == "upgrade")
+    );
+    assert!(ack.get("pending").is_none(), "{ack}");
+    c.send(&json!({"type": "config_get", "seq": 2, "ts": ts_now(), "have_rev": 0}).to_string())
+        .await;
+    c.expect_error("unknown_type", false).await;
+    c.send(&heartbeat(3)).await;
+    let hb = c.recv().await;
+    assert_eq!(hb, json!({"type": "ack", "seq": 3}));
+    drop(c);
+    // 沒有 mTLS：不列出（agent_id 是自行宣告的）
+    let plain = Server::start(Options {
+        sqlite: true,
+        remote: Some(crate::config::RemoteSettings::default()),
+        ..Options::default()
+    })
+    .await;
+    let mut c = Client::connect(plain.addr).await;
+    c.send(&hello_mgmt(
+        1,
+        ID,
+        "0.9.0",
+        &["metrics", "config", "upgrade"],
+    ))
+    .await;
+    let ack = c.recv().await;
+    assert!(
+        !ack["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "config" || f == "upgrade"),
+        "{ack}"
+    );
+    // [remote] 停用 upgrade：只列出 config
+    let cfg_only = Server::start(Options {
+        remote: Some(crate::config::RemoteSettings {
+            upgrade_enabled: false,
+            ..Default::default()
+        }),
+        ..remote_server_options()
+    })
+    .await;
+    let mut c = Client::connect_with(&good, cfg_only.addr).await;
+    c.send(&hello_mgmt(
+        1,
+        test_pki::GOOD_ID,
+        "0.9.0",
+        &["metrics", "config", "upgrade"],
+    ))
+    .await;
+    let ack = c.recv().await;
+    let f = ack["features"].as_array().unwrap();
+    assert!(
+        f.iter().any(|x| x == "config") && !f.iter().any(|x| x == "upgrade"),
+        "{ack}"
+    );
+    assert_eq!(ack["pending"], json!({"config_rev": 0}));
+    c.send(&json!({"type": "upgrade_get", "seq": 2, "ts": ts_now(), "upgrade_id": "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70"}).to_string()).await;
+    c.expect_error("unknown_type", false).await;
+}
+
+#[tokio::test]
+async fn central_config_round_trip_over_mtls() {
+    let server = Server::start(remote_server_options()).await;
+    let svc = server.remote.clone().unwrap();
+    let who = crate::remote::ops::Actor {
+        actor: "user:admin".into(),
+        ip: None,
+    };
+    let good = connector(Some((test_pki::GOOD_CERT, test_pki::GOOD_KEY)));
+    let mut c = Client::connect_with(&good, server.addr).await;
+    c.send(&hello_mgmt(
+        1,
+        test_pki::GOOD_ID,
+        "0.9.0",
+        &["metrics", "config", "upgrade"],
+    ))
+    .await;
+    let ack = c.recv().await;
+    let f = ack["features"].as_array().unwrap();
+    assert!(
+        f.iter().any(|x| x == "config") && f.iter().any(|x| x == "upgrade"),
+        "{ack}"
+    );
+    assert_eq!(ack["pending"], json!({"config_rev": 0}));
+    // 協商了：欄位缺漏為 bad_request（seq 為 null）
+    c.send(&json!({"type": "config_get", "seq": 2, "ts": ts_now()}).to_string())
+        .await;
+    let e = c.expect_error("bad_request", false).await;
+    assert_eq!(e["seq"], Value::Null);
+    // 標籤 env:prod 的設定檔
+    let p = svc
+        .create_profile(
+            &who,
+            crate::remote::ops::ProfileInput {
+                name: Some("正式環境".into()),
+                description: None,
+                settings: Some(json!({"report": {"interval": 10}, "log": {"level": "debug"}})),
+                reason: None,
+                impact_token: None,
+            },
+        )
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    svc.create_assignment(
+        &who,
+        p,
+        crate::remote::desired::Selector::Tag("env:prod".into()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    // 下一次心跳的 ack 帶出新的版本
+    c.send(&heartbeat(3)).await;
+    let hb = c.recv().await;
+    let rev = hb["pending"]["config_rev"].as_u64().unwrap();
+    assert!(rev > 0, "{hb}");
+    c.send(&json!({"type": "config_get", "seq": 4, "ts": ts_now(), "have_rev": 0}).to_string())
+        .await;
+    let cfg = c.recv().await;
+    assert_eq!(cfg["type"], "config", "{cfg}");
+    assert_eq!(
+        (cfg["seq"].as_u64(), cfg["rev"].as_u64()),
+        (Some(4), Some(rev))
+    );
+    assert_eq!(
+        cfg["settings"],
+        json!({"log": {"level": "debug"}, "report": {"interval": 10}})
+    );
+    assert_eq!(cfg["sources"]["report.interval"], "正式環境");
+    let parsed: kairos_proto::mgmt::RemoteConfig = serde_json::from_value(cfg.clone()).unwrap();
+    assert!(kairos_proto::mgmt::validate_remote_config(&parsed).is_ok());
+    // config_status → ack；記錄本機覆蓋
+    c.send(&json!({
+        "type": "config_status", "seq": 5, "ts": ts_now(), "rev": rev, "hash": cfg["hash"],
+        "state": "applied", "effective": {"report": {"interval": 5}, "log": {"level": "debug"}},
+        "overridden": [{"key": "report.interval", "remote": 10, "local": 5, "source": "pulse.toml"}],
+        "ignored": [], "errors": [], "code": "PLS-I0503"
+    }).to_string()).await;
+    assert_eq!(c.recv().await, json!({"type": "ack", "seq": 5}));
+    let row = svc
+        .db
+        .read(|s| Ok(s.host_config(test_pki::GOOD_ID)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (row.applied_rev, row.state.as_deref(), row.code.as_deref()),
+        (rev as i64, Some("applied"), Some("PLS-I0503"))
+    );
+    assert!(row.overridden.unwrap().contains("report.interval"));
+    // 不合規定的 config_status：bad_request
+    c.send(&json!({"type": "config_status", "seq": 6, "ts": ts_now(), "rev": 1, "hash": "nope", "state": "applied"}).to_string()).await;
+    c.expect_error("bad_request", false).await;
+}
+
+#[tokio::test]
+async fn remote_upgrade_offer_download_and_status_over_mtls() {
+    use crate::remote::test_sign::{TestSigner, release};
+    let signer = TestSigner::new(9);
+    let mut opts = remote_server_options();
+    let hint = std::env::temp_dir().join(format!(
+        "kairos-it-signers-{}-{}",
+        std::process::id(),
+        next_conn_id()
+    ));
+    std::fs::create_dir_all(&hint).unwrap();
+    let signers = hint.join("allowed_signers");
+    std::fs::write(&signers, signer.allowed_signers()).unwrap();
+    opts.remote = Some(crate::config::RemoteSettings {
+        allowed_signers: signers.to_string_lossy().into_owned(),
+        ..Default::default()
+    });
+    let server = Server::start(opts).await;
+    let svc = server.remote.clone().unwrap();
+    let who = crate::remote::ops::Actor {
+        actor: "user:admin".into(),
+        ip: None,
+    };
+    let rel = release(&signer, "0.9.2", "2222222");
+    svc.import_release(
+        &who,
+        rel.sha256sums.clone(),
+        rel.signature.clone(),
+        Some(rel.manifest.clone()),
+    )
+    .await
+    .unwrap();
+    let (tar_name, tar) = rel
+        .files
+        .iter()
+        .find(|(n, _)| n.ends_with(".tar.gz"))
+        .unwrap()
+        .clone();
+    let mut up = crate::remote::releases::Upload::create(&svc.releases_dir, 1 << 20).unwrap();
+    up.write(&tar).unwrap();
+    let (sha, size) = up.finish().unwrap();
+    svc.store_artifact(
+        &who,
+        "0.9.2".into(),
+        tar_name.clone(),
+        up,
+        sha.clone(),
+        size,
+    )
+    .await
+    .unwrap();
+
+    let good = connector(Some((test_pki::GOOD_CERT, test_pki::GOOD_KEY)));
+    let mut c = Client::connect_with(&good, server.addr).await;
+    c.send(&hello_mgmt(
+        1,
+        test_pki::GOOD_ID,
+        "0.9.0",
+        &["metrics", "config", "upgrade"],
+    ))
+    .await;
+    assert_eq!(c.recv().await["type"], "hello_ack");
+    // report：主機寫入清冊（推送的對象）
+    c.send(&metrics_report(2, 1.0)).await;
+    assert_eq!(c.recv().await["type"], "ack");
+    let spec = crate::remote::rollout::RolloutSpec::parse(&json!({
+        "name": "it", "target_version": "0.9.2", "selector": {"agent_ids": [test_pki::GOOD_ID]}, "waves": [{"size": "rest"}]
+    }))
+    .unwrap();
+    let id = svc.create_rollout(&who, spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    svc.submit_rollout(&who, id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    server
+        .clock_offset
+        .store(120_000, std::sync::atomic::Ordering::SeqCst);
+    svc.tick().await.unwrap();
+    c.send(&heartbeat(3)).await;
+    let hb = c.recv().await;
+    let upgrade_id = hb["pending"]["upgrade_id"]
+        .as_str()
+        .expect("pending.upgrade_id")
+        .to_string();
+    // 不認得的 upgrade_id：upgrade_unavailable（非 fatal）
+    c.send(&json!({"type": "upgrade_get", "seq": 4, "ts": ts_now(), "upgrade_id": "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70"}).to_string()).await;
+    let e = c.expect_error("upgrade_unavailable", false).await;
+    assert_eq!(e["seq"], 4);
+    c.send(
+        &json!({"type": "upgrade_get", "seq": 5, "ts": ts_now(), "upgrade_id": upgrade_id})
+            .to_string(),
+    )
+    .await;
+    let offer = c.recv().await;
+    assert_eq!(offer["type"], "upgrade_offer", "{offer}");
+    assert_eq!(offer["seq"], 5);
+    assert_eq!(offer["artifact"]["filename"], tar_name);
+    assert_eq!(offer["artifact"]["sha256"], sha);
+    assert_eq!(offer["artifact"]["source"], "kairos");
+    assert_eq!(offer["sha256sums"], rel.sha256sums);
+    let parsed: kairos_proto::mgmt::UpgradeOffer = serde_json::from_value(offer.clone()).unwrap();
+    assert!(kairos_proto::mgmt::validate_upgrade_offer(&parsed).is_ok());
+    // Pulse 端以本機信任錨的驗證會通過
+    let signers = kairos_proto::release::AllowedSigners::parse(&signer.allowed_signers());
+    let verified = kairos_proto::release::verify_bundle(
+        &kairos_proto::release::ReleaseBundle {
+            sha256sums: &parsed.sha256sums,
+            signature: &parsed.signature,
+            manifest: parsed
+                .manifest
+                .as_ref()
+                .map(|m| (m.filename.as_str(), m.content.as_str())),
+        },
+        &kairos_proto::release::TrustPolicy {
+            signers: &signers,
+            extra_principals: &[],
+            now_unix: Utc::now().timestamp(),
+        },
+    )
+    .unwrap();
+    assert!(
+        verified
+            .check_artifact(
+                &parsed.artifact.filename,
+                &parsed.artifact.sha256,
+                &Default::default()
+            )
+            .is_ok()
+    );
+    c.send(&json!({"type": "upgrade_status", "seq": 6, "ts": ts_now(), "upgrade_id": upgrade_id, "state": "accepted", "from_version": "0.9.0", "to_version": "0.9.2", "code": null, "detail": ""}).to_string()).await;
+    assert_eq!(c.recv().await, json!({"type": "ack", "seq": 6}));
+    // 分段下載
+    let mut data = Vec::new();
+    let mut seq = 7;
+    loop {
+        c.send(&json!({"type": "upgrade_chunk_get", "seq": seq, "ts": ts_now(), "upgrade_id": upgrade_id, "filename": tar_name, "offset": data.len(), "length": 32768}).to_string()).await;
+        let chunk = c.recv().await;
+        assert_eq!(chunk["type"], "upgrade_chunk", "{chunk}");
+        assert_eq!(chunk["offset"], data.len());
+        let m: kairos_proto::mgmt::UpgradeChunk = serde_json::from_value(chunk.clone()).unwrap();
+        data.extend(m.decode_data().unwrap());
+        seq += 1;
+        if m.eof {
+            break;
+        }
+    }
+    assert_eq!(data, tar);
+    // 不在提議中的檔案
+    c.send(&json!({"type": "upgrade_chunk_get", "seq": seq, "ts": ts_now(), "upgrade_id": upgrade_id, "filename": "pulse-0.9.2-2222222-linux-x86_64.deb", "offset": 0, "length": 100}).to_string()).await;
+    c.expect_error("upgrade_unavailable", false).await;
+    // length 超過上限：bad_request
+    c.send(&json!({"type": "upgrade_chunk_get", "seq": seq + 1, "ts": ts_now(), "upgrade_id": upgrade_id, "filename": tar_name, "offset": 0, "length": 40000}).to_string()).await;
+    c.expect_error("bad_request", false).await;
+    for (i, state) in ["staged", "applying"].iter().enumerate() {
+        c.send(&json!({"type": "upgrade_status", "seq": 100 + i, "ts": ts_now(), "upgrade_id": upgrade_id, "state": state, "from_version": "0.9.0", "to_version": "0.9.2", "code": null, "detail": ""}).to_string()).await;
+        assert_eq!(c.recv().await["type"], "ack");
+    }
+    drop(c);
+    // 替換後的新版 Pulse 重新連線並回報成功
+    let mut c = Client::connect_with(&good, server.addr).await;
+    c.send(&hello_mgmt(
+        1,
+        test_pki::GOOD_ID,
+        "0.9.2",
+        &["metrics", "config", "upgrade"],
+    ))
+    .await;
+    let ack = c.recv().await;
+    assert!(ack["pending"].get("upgrade_id").is_none(), "{ack}");
+    c.send(&json!({"type": "upgrade_status", "seq": 2, "ts": ts_now(), "upgrade_id": upgrade_id, "state": "succeeded", "from_version": "0.9.0", "to_version": "0.9.2", "code": "PLS-I8416", "detail": ""}).to_string()).await;
+    assert_eq!(c.recv().await["type"], "ack");
+    let rid = id.clone();
+    let h = svc
+        .db
+        .read(move |s| Ok(s.rollout_host(&rid, test_pki::GOOD_ID)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(h.state, "succeeded");
+    svc.tick().await.unwrap();
+    let r = svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&id)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(r.state, "completed");
+    let _ = std::fs::remove_dir_all(&hint);
 }

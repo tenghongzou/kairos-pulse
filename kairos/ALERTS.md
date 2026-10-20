@@ -42,7 +42,7 @@
 | `channel_secrets` | 告警服務（0.7；管道的機密變成無法解開或恢復時） | `channel_id`、`name`、`available` |
 | `audit_integrity` | 稽核的定期自我驗證（0.7；每次驗證） | `ok`、`reason`、`id`（斷點）、`summary` |
 
-**斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增）。**0.7 起主機 API、SSE 與 `/metrics` 都使用這組名稱**（過渡期主機 API 另帶舊名稱的 `offline_reason_legacy`，`API.md` 第 5.2 節）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
+**斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增）、`server_lost`（服務這台主機的叢集節點失聯；0.9 定義名稱，叢集模式才會產生，`kairos/HA.md` 第 6.6 節；依一般的主機離線寬限判斷，Pulse 改連其他節點後重新上線）。接收端應忽略不認得的值。**0.7 起主機 API、SSE 與 `/metrics` 都使用這組名稱**（過渡期主機 API 另帶舊名稱的 `offline_reason_legacy`，`API.md` 第 5.2 節）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
 
 `storage_unavailable`、寫入結果未知、retention 暫停、連線上限、CRL／伺服器憑證／簽發 CA 即將到期、註冊端點的過載／封鎖／限流／時鐘偏差／自動暫停，由系統檢查讀取各元件的計數與狀態，以 `condition` 發布（第 5.3 節）。`/healthz`、`/metrics`、JSON 日誌屬於另一條線（`sprint5/obs`），可以直接訂閱匯流排。
 
@@ -135,6 +135,9 @@ subnet_prefix_v6 = 64
 | `sys.unauthenticated` | 未認證連線已允許 | 未啟用 mTLS 卻監聽對外位址；每日提醒一次、**不可靜音** | 嚴重 | `KRS-W0302` | TLS 設定 |
 | `sys.channel_failed` | 通知管道失敗 | 同一管道連續 3 次發送失敗（每個管道一則）；改送其他所有健康的管道。0.7：機密無法解開（`secrets_unavailable`）時不必等到發送失敗，立即成立 | 嚴重 | `KRS-E5107`；機密無法解開 `KRS-E5110` | 派送 |
 | `sys.audit_integrity` | 稽核日誌完整性（0.7） | 定期自我驗證（`audit.verify_interval_hours`，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復 | 緊急 | `KRS-E6201` | 匯流排（`audit_integrity`） |
+| `sys.rollout_paused` | 升級推送已暫停（0.9） | 升級推送因失敗比例超過上限、主機回滾失敗或發佈簽章驗證失敗而自動暫停（手動暫停不開）；推送繼續或取消時恢復（REMOTE.md 第 4.7.4 節） | 警告（回滾失敗、簽章失敗為嚴重） | `KRS-W8414` | 匯流排（`remote_condition`，遠端管理服務每 5 秒調和） |
+| `sys.upgrade_rollback_failed` | 升級回滾失敗（0.9） | 主機升級後回滾也失敗，需要人工處理；對象為主機；標記為已處理或重試時恢復 | 嚴重 | `KRS-E8408` | 匯流排（`remote_condition`） |
+| `sys.release_signature_failed` | 發佈簽章驗證失敗（0.9） | 主機驗證發佈包的簽章失敗（`PLS-E8401`），使用同一版本的推送已暫停；對象為目標版本；推送繼續或取消時恢復 | 嚴重 | `KRS-E8401` | 匯流排（`remote_condition`） |
 | `sys.restarted`、`sys.downtime` | 第 5.2 節 | | 資訊（非預期：嚴重）、嚴重 | — | 心跳 |
 
 **使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。

@@ -24,6 +24,7 @@ use crate::alerts::store;
 use crate::config::take_config_arg;
 use crate::hosts_cli::{ascii_json, parse_duration, use_unicode};
 use crate::storage::fmt_time;
+use crate::store::prelude::*;
 use crate::token_cli::{
     Failure, Output, db_failure, human_time, open, operator, relative, table, zone_label,
 };
@@ -256,7 +257,7 @@ fn ok_json(cmd: &Cmd, now: DateTime<Utc>, data: Value) -> Output {
     }
 }
 
-fn db(cmd: &Cmd) -> Result<rusqlite::Connection, Failure> {
+fn db(cmd: &Cmd) -> Result<DbHandle, Failure> {
     match open(cmd.config_path.as_deref(), true)? {
         Some(c) => Ok(c),
         None => Err(db_failure("資料庫不存在")),
@@ -362,7 +363,7 @@ fn alerts_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 limit,
                 ..Default::default()
             };
-            let (events, total) = store::list_events(&conn, &filter).map_err(db_failure)?;
+            let (events, total) = conn.list_events(&filter).map_err(db_failure)?;
             if cmd.json {
                 return Ok(ok_json(
                     cmd,
@@ -416,18 +417,16 @@ fn alerts_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 return Err(usage_err("kairos alerts show 需要一個事件編號"));
             };
             let conn = db(cmd)?;
-            let ev = store::get_event(&conn, id)
-                .map_err(db_failure)?
-                .ok_or_else(|| {
-                    Failure::new(
-                        "找不到事件",
-                        format!("沒有事件 {id}（可能已依保留期限清除）"),
-                        Vec::new(),
-                        EXIT_GENERAL,
-                    )
-                })?;
-            let timeline = store::timeline(&conn, id, 200).map_err(db_failure)?;
-            let (children, total) = store::children(&conn, id, 20).map_err(db_failure)?;
+            let ev = conn.get_event(id).map_err(db_failure)?.ok_or_else(|| {
+                Failure::new(
+                    "找不到事件",
+                    format!("沒有事件 {id}（可能已依保留期限清除）"),
+                    Vec::new(),
+                    EXIT_GENERAL,
+                )
+            })?;
+            let timeline = conn.timeline(id, 200).map_err(db_failure)?;
+            let (children, total) = conn.children(id, 20).map_err(db_failure)?;
             if cmd.json {
                 let mut data = ops::event_json(&ev);
                 data["timeline"] = json!(timeline);
@@ -514,7 +513,8 @@ fn alerts_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             let actor = operator();
             let mut queued = Vec::new();
             for id in &ids {
-                let qid = store::enqueue_action(&conn, now_ms, &actor, id, a, &params)
+                let qid = conn
+                    .enqueue_action(now_ms, &actor, id, a, &params)
                     .map_err(db_failure)?;
                 queued.push((id.clone(), qid));
             }
@@ -524,10 +524,7 @@ fn alerts_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             loop {
                 results.clear();
                 for (id, qid) in &queued {
-                    results.push((
-                        id.clone(),
-                        store::action_result(&conn, *qid).map_err(db_failure)?,
-                    ));
+                    results.push((id.clone(), conn.action_result(*qid).map_err(db_failure)?));
                 }
                 if results.iter().all(|(_, r)| r.is_some()) || std::time::Instant::now() >= deadline
                 {
@@ -596,28 +593,21 @@ fn alerts_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
 // ---------------------------------------------------------------------------
 
 /// 清冊中使用中的主機（範圍的台數）
-fn host_facts(conn: &rusqlite::Connection) -> Result<Vec<HostFacts>, Failure> {
-    let mut stmt = conn
-        .prepare("SELECT agent_id, tags, peer FROM hosts WHERE lifecycle = 'active'")
-        .map_err(db_failure)?;
-    let rows = stmt
-        .query_map([], |r| {
-            let tags: Option<String> = r.get(1)?;
-            let peer: Option<String> = r.get(2)?;
-            Ok(HostFacts {
-                agent_id: r.get(0)?,
-                tags: tags
-                    .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|t| t.to_lowercase())
-                    .collect(),
-                ip: peer.as_deref().and_then(crate::bus::peer_ip),
-            })
+fn host_facts(conn: &dyn Store) -> Result<Vec<HostFacts>, Failure> {
+    let rows = conn.active_host_scope_rows().map_err(db_failure)?;
+    Ok(rows
+        .into_iter()
+        .map(|(agent_id, tags, peer)| HostFacts {
+            agent_id,
+            tags: tags
+                .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.to_lowercase())
+                .collect(),
+            ip: peer.as_deref().and_then(crate::bus::peer_ip),
         })
-        .map_err(db_failure)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(db_failure)
+        .collect())
 }
 
 fn count_matching(hosts: &[HostFacts], s: &Scope) -> usize {
@@ -634,8 +624,10 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 return Err(usage_err("--status 必須是 active、upcoming、ended 或 all"));
             }
             let conn = db(cmd)?;
-            let list = store::list_silences(&conn, &status, now_ms, 1000).map_err(db_failure)?;
-            let hosts = host_facts(&conn)?;
+            let list = conn
+                .list_silences(&status, now_ms, 1000)
+                .map_err(db_failure)?;
+            let hosts = host_facts(&*conn)?;
             if cmd.json {
                 return Ok(ok_json(
                     cmd,
@@ -750,16 +742,16 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 from_event: cmd.opt("--from-event").map(str::to_string),
             };
             let conn = db(cmd)?;
-            let rules = store::load_rules(&conn).map_err(db_failure)?;
+            let rules = conn.load_rules().map_err(db_failure)?;
             let from = match &input.from_event {
                 Some(id) => Some(
-                    store::get_event(&conn, id)
+                    conn.get_event(id)
                         .map_err(db_failure)?
                         .ok_or_else(|| usage_err(format!("沒有事件 {id}")))?,
                 ),
                 None => None,
             };
-            let hosts = host_facts(&conn)?;
+            let hosts = host_facts(&*conn)?;
             let scope_n = scope::normalize(input.scope.as_ref().unwrap_or(&Scope::default()))
                 .map_err(|(_, m)| usage_err(m))?;
             let matching = count_matching(&hosts, &scope_n);
@@ -806,10 +798,8 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                     }
                 }
             }
-            store::save_silence(&conn, &silence).map_err(db_failure)?;
-            let _ = crate::enroll::store::audit(
-                &conn,
-                now_ms,
+            conn.save_silence(&silence).map_err(db_failure)?;
+            let _ = conn.audit(now_ms,
                 &crate::enroll::store::Audit {
                     actor: &operator(),
                     actor_ip: None,
@@ -854,16 +844,14 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 return Err(usage_err("kairos silences end 需要一個 silence_id"));
             };
             let conn = db(cmd)?;
-            let mut s = store::get_silence(&conn, id)
-                .map_err(db_failure)?
-                .ok_or_else(|| {
-                    Failure::new(
-                        "找不到靜音",
-                        format!("沒有 {id}"),
-                        vec!["kairos silences list 可查。".into()],
-                        EXIT_GENERAL,
-                    )
-                })?;
+            let mut s = conn.get_silence(id).map_err(db_failure)?.ok_or_else(|| {
+                Failure::new(
+                    "找不到靜音",
+                    format!("沒有 {id}"),
+                    vec!["kairos silences list 可查。".into()],
+                    EXIT_GENERAL,
+                )
+            })?;
             if s.status(now_ms) != "ended" {
                 let by = operator();
                 s.ended_at = Some(now_ms);
@@ -871,9 +859,8 @@ fn silences_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 s.end_reason = cmd.opt("--reason").map(str::to_string);
                 s.updated_at = now_ms;
                 s.updated_by = by.clone();
-                store::save_silence(&conn, &s).map_err(db_failure)?;
-                let _ = crate::enroll::store::audit(
-                    &conn,
+                conn.save_silence(&s).map_err(db_failure)?;
+                let _ = conn.audit(
                     now_ms,
                     &crate::enroll::store::Audit {
                         actor: &by,
@@ -915,8 +902,10 @@ fn rules_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
     match cmd.sub() {
         Some("list") => {
             let conn = db(cmd)?;
-            let rules = store::load_rules(&conn).map_err(db_failure)?;
-            let stats = store::rule_stats(&conn, now_ms - 7 * 86_400_000).map_err(db_failure)?;
+            let rules = conn.load_rules().map_err(db_failure)?;
+            let stats = conn
+                .rule_stats(now_ms - 7 * 86_400_000)
+                .map_err(db_failure)?;
             if cmd.json {
                 return Ok(ok_json(cmd, env.now, json!(rules.iter().map(|r| json!({
                     "rule_id": r.rule_id, "builtin": r.builtin, "kind": r.kind, "category": r.category,
@@ -969,16 +958,14 @@ fn rules_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 )));
             };
             let conn = db(cmd)?;
-            let mut r = store::get_rule(&conn, id)
-                .map_err(db_failure)?
-                .ok_or_else(|| {
-                    Failure::new(
-                        "找不到規則",
-                        format!("沒有規則 {id}"),
-                        vec!["kairos alert-rules list 可查。".into()],
-                        EXIT_GENERAL,
-                    )
-                })?;
+            let mut r = conn.get_rule(id).map_err(db_failure)?.ok_or_else(|| {
+                Failure::new(
+                    "找不到規則",
+                    format!("沒有規則 {id}"),
+                    vec!["kairos alert-rules list 可查。".into()],
+                    EXIT_GENERAL,
+                )
+            })?;
             let on = a == "enable";
             let reason = cmd.opt("--reason").map(str::to_string);
             if !on && r.builtin {
@@ -1008,9 +995,8 @@ fn rules_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
                 r.disabled_reason = if on { None } else { reason.clone() };
                 r.updated_at = now_ms;
                 r.updated_by = operator();
-                store::save_rule(&conn, &r).map_err(db_failure)?;
-                let _ = crate::enroll::store::audit(
-                    &conn,
+                conn.save_rule(&r).map_err(db_failure)?;
+                let _ = conn.audit(
                     now_ms,
                     &crate::enroll::store::Audit {
                         actor: &operator(),
@@ -1059,15 +1045,11 @@ fn channels_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             // 只顯示狀態與遮蔽值；機密只解開來判斷能否使用（金鑰檔遺失或不成對時為
             // secrets_unavailable，KRS-E5110），不輸出。金鑰檔無法讀取（權限）時不判斷
             let checker = conn
-                .path()
-                .filter(|p| !p.is_empty())
-                .and_then(|p| {
-                    std::path::Path::new(p)
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                })
+                .database_dir()
+                .ok()
+                .flatten()
                 .and_then(|dir| crate::alerts::secrets::SecretBox::for_check(&dir).ok());
-            let list = store::load_channels(&conn, checker.as_ref()).map_err(db_failure)?;
+            let list = conn.load_channels(checker.as_ref()).map_err(db_failure)?;
             if cmd.json {
                 return Ok(ok_json(cmd, env.now, json!(list.iter().map(|c| json!({
                     "channel_id": c.channel_id, "name": c.name, "kind": c.kind, "enabled": c.enabled,
@@ -1239,7 +1221,7 @@ mod tests {
         let conn = crate::token_cli::open(Some(&dir.join("kairos.toml")), false)
             .unwrap()
             .unwrap();
-        store::ensure_builtin_rules(&conn, 0).unwrap();
+        conn.ensure_builtin_rules(0).unwrap();
         // 超過上限：只選 CRL 即將到期（系統＋緊急）時最長 4 小時
         let out = run_in(
             &dir,
@@ -1314,7 +1296,7 @@ mod tests {
         // 確認：Kairos 沒有執行 → 排入佇列（結束代碼 7）
         let out = run_in(&dir, Group::Alerts, &["ack", "E-20261014-0001"]);
         assert_eq!(out.exit, EXIT_WAITING, "{}", out.stderr);
-        assert_eq!(store::pending_actions(&conn).unwrap().len(), 1);
+        assert_eq!(conn.pending_actions().unwrap().len(), 1);
         assert_eq!(
             run_in(
                 &dir,
@@ -1329,6 +1311,7 @@ mod tests {
         assert!(out.stdout.contains("還沒有通知管道"));
         // 稽核紀錄
         let n: i64 = conn
+            .test_sqlite()
             .query_row(
                 "SELECT count(*) FROM audit_events WHERE category = 'alerts'",
                 [],

@@ -74,6 +74,12 @@ pub mod ids {
     pub const AUDIT_INTEGRITY: &str = "sys.audit_integrity";
     /// 主機重新開機（0.8〔草稿〕；METRICS.md 第 11.2 節、D5：資訊等級、不通知、預設啟用）
     pub const HOST_REBOOTED: &str = "sys.host_rebooted";
+    /// 升級推送已自動暫停（0.9；REMOTE.md 第 4.7.4 節、設計包 §31.5）
+    pub const ROLLOUT_PAUSED: &str = "sys.rollout_paused";
+    /// 升級回滾失敗，需要人工處理（0.9）
+    pub const UPGRADE_ROLLBACK_FAILED: &str = "sys.upgrade_rollback_failed";
+    /// 發佈簽章驗證失敗（0.9）
+    pub const RELEASE_SIGNATURE_FAILED: &str = "sys.release_signature_failed";
 }
 
 /// 指標門檻（`metric_threshold`）的指標（METRICS.md 第 11.1 節）
@@ -488,6 +494,27 @@ pub fn builtins() -> Vec<Rule> {
             Emergency,
             json!({"code": "KRS-E6201"}),
             "定期自我驗證（audit.verify_interval_hours，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復。",
+        ),
+        sys(
+            ids::ROLLOUT_PAUSED,
+            "升級推送已暫停",
+            Warning,
+            json!({"code": "KRS-W8414"}),
+            "升級推送因失敗比例超過上限、主機回滾失敗或發佈簽章驗證失敗而自動暫停（手動暫停不開事件）；推送繼續或取消時恢復。原因為回滾失敗或簽章失敗時為嚴重。",
+        ),
+        sys(
+            ids::UPGRADE_ROLLBACK_FAILED,
+            "升級回滾失敗",
+            Critical,
+            json!({"code": "KRS-E8408"}),
+            "主機升級後健康確認失敗、回滾也失敗，需要現場人工處理；在推送的主機表或主機詳情標記為已處理（或重試）時恢復。",
+        ),
+        sys(
+            ids::RELEASE_SIGNATURE_FAILED,
+            "發佈簽章驗證失敗",
+            Critical,
+            json!({"code": "KRS-E8401"}),
+            "主機以本機信任錨驗證 Pulse 發佈包的簽章失敗：版本庫或傳輸可能被竄改，或信任錨與發佈不符。使用同一版本的推送全部暫停；推送繼續或取消時恢復。",
         ),
     ]
 }

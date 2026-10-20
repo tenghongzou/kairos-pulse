@@ -135,6 +135,7 @@ pub async fn handle(
         ("PUT", ["enroll", "mode"]) => set_mode(&w, b(), now).await,
         ("GET" | "HEAD", ["pki", "certificates"]) => list_certs(&svc, &query, now).await,
         ("POST", ["pki", "certificates", "revoke"]) => revoke(&w, b(), now).await,
+        ("POST", ["pki", "certificates", "import"]) => import_certificates(&w, b(), now).await,
         ("GET" | "HEAD", ["pki", "certificates", serial]) => get_cert(&svc, serial, now).await,
         ("GET" | "HEAD", ["pki", "policy", "impact"]) => policy_impact(&svc, &query, now).await,
         ("PUT", ["pki", "policy"]) => set_policy(&w, b(), now).await,
@@ -169,7 +170,9 @@ fn write_permission(method: &str, rest: &[&str]) -> Option<Permission> {
         ("PUT", ["pki", "policy"]) => Permission::CertPolicyWrite,
         ("POST", ["pki", "grace-overrides"]) => Permission::GraceOverride,
         ("GET" | "HEAD", ["pki", "signing-queue", "export"])
-        | ("POST", ["pki", "signing-queue", "import"]) => Permission::PkiQueue,
+        | ("POST", ["pki", "signing-queue", "import"] | ["pki", "certificates", "import"]) => {
+            Permission::PkiQueue
+        }
         _ => return None,
     })
 }
@@ -287,7 +290,7 @@ async fn list_tokens(
     let now_ms = now.timestamp_millis();
     let rows = svc
         .db
-        .read(|conn| Ok(store::list_tokens(conn)?))
+        .read(|conn| Ok(conn.list_tokens()?))
         .await
         .map_err(db_error)?;
     let filtered: Vec<_> = rows
@@ -303,7 +306,7 @@ async fn list_tokens(
         StatusCode::OK,
         now,
         json!({"data": data, "page": {"limit": limit, "total": total, "next_cursor": null},
-            "meta": {"downloads": crate::enroll::downloads_json()}}),
+            "meta": {"downloads": svc.downloads_json()}}),
     ))
 }
 
@@ -326,7 +329,7 @@ async fn get_token(
     let tid = id.to_string();
     let t = svc
         .db
-        .read(move |conn| Ok(store::get_token(conn, &tid)?))
+        .read(move |conn| Ok(conn.get_token(&tid)?))
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -476,7 +479,7 @@ async fn create_token(
         }
     }
     data["enroll_mode"] = json!(w.svc.mode_state().as_str());
-    data["downloads"] = crate::enroll::downloads_json();
+    data["downloads"] = w.svc.downloads_json();
     data["auto_pause_cleared"] = json!(was_paused);
     Ok(http::json(StatusCode::CREATED, now, json!({"data": data})))
 }
@@ -560,7 +563,7 @@ async fn list_requests(
     };
     let rows = svc
         .db
-        .read(move |conn| Ok(store::list_requests(conn, &filter)?))
+        .read(move |conn| Ok(conn.list_requests(&filter)?))
         .await
         .map_err(db_error)?;
     let flag = q.get("flag").map(str::to_string);
@@ -768,7 +771,7 @@ async fn list_settings(
 ) -> Result<Response<ApiBody>, ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::load_settings(conn)?))
+        .read(|conn| Ok(conn.load_settings()?))
         .await
         .map_err(db_error)?;
     let list: Vec<Value> = settings::effective_view(&svc.config, &rows)
@@ -844,7 +847,7 @@ async fn reset_effective(
 ) -> Result<(settings::Effective, settings::Effective), ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::load_settings(conn)?))
+        .read(|conn| Ok(conn.load_settings()?))
         .await
         .map_err(db_error)?;
     let overrides = settings::overrides_from(&rows);
@@ -977,7 +980,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "listen_addr": listen.addr,
         "not_listening_reason": listen.reason,
         "pki_mode": svc.pki.mode().as_str(),
-        "downloads": crate::enroll::downloads_json(),
+        "downloads": svc.downloads_json(),
         "issuance": match svc.pki.status() {
             IssueStatus::Online { ca_id } => json!({"status": "online", "ca_id": ca_id}),
             IssueStatus::Offline => json!({"status": "offline", "product_code": "KRS-E1302"}),
@@ -986,6 +989,7 @@ fn mode_view(svc: &EnrollService) -> Value {
         "sources": eff.sources_json(),
         "stats": {
             "requests": svc.stats.requests.load(std::sync::atomic::Ordering::Relaxed),
+            "downloads_in_progress": svc.download_slots.in_use(),
             "enroll_requests": svc.stats.enroll_requests.load(std::sync::atomic::Ordering::Relaxed),
             "renew_requests": svc.stats.renew_requests.load(std::sync::atomic::Ordering::Relaxed),
             "rate_limited_enroll": svc.stats.limited_enroll.load(std::sync::atomic::Ordering::Relaxed),
@@ -1169,29 +1173,6 @@ fn cert_state(c: &ps::CertRow, grace_days: u32, now_ms: i64) -> &'static str {
 /// `host_group`；主機還沒連線過（清冊沒有這台）時用申請的主機名稱
 type CertHost = (Option<String>, Option<String>);
 
-fn cert_hosts(
-    conn: &rusqlite::Connection,
-    serial: Option<&str>,
-) -> rusqlite::Result<std::collections::HashMap<String, CertHost>> {
-    let mut stmt = conn.prepare(
-        "SELECT c.serial, coalesce(h.hostname, r.hostname), h.host_group
-         FROM pki_certificates c
-         LEFT JOIN hosts h ON h.agent_id = c.agent_id
-         LEFT JOIN enroll_requests r ON r.request_id = c.request_id
-         WHERE ?1 IS NULL OR c.serial = ?1",
-    )?;
-    let rows = stmt.query_map([serial], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            (
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ),
-        ))
-    })?;
-    rows.collect()
-}
-
 fn cert_json(
     c: &ps::CertRow,
     host: Option<&CertHost>,
@@ -1236,12 +1217,7 @@ async fn list_certs(
     let limit = limit_of(q)?;
     let (rows, hosts) = svc
         .db
-        .read(|conn| {
-            Ok((
-                ps::list_certs(conn, 1_000_000, None)?,
-                cert_hosts(conn, None)?,
-            ))
-        })
+        .read(|conn| Ok((conn.list_certs(1_000_000, None)?, conn.cert_hosts(None)?)))
         .await
         .map_err(db_error)?;
     let now_ms = now.timestamp_millis();
@@ -1291,8 +1267,8 @@ async fn get_cert(
     let (c, hosts) = svc
         .db
         .read(move |conn| {
-            let c = ps::get_cert(conn, &s)?;
-            let hosts = cert_hosts(conn, Some(&s))?;
+            let c = conn.get_cert(&s)?;
+            let hosts = conn.cert_hosts(Some(&s))?;
             Ok(c.map(|c| (c, hosts)))
         })
         .await
@@ -1517,10 +1493,10 @@ async fn get_ca(
     let (cas, threshold) = svc
         .db
         .read(move |conn| {
-            let cas = ps::list_cas(conn)?;
+            let cas = conn.list_cas()?;
             let mut out = Vec::new();
             for c in cas {
-                let n = ps::issued_count_by_ca(conn, c.ca_id)?;
+                let n = conn.issued_count_by_ca(c.ca_id)?;
                 out.push((c, n));
             }
             Ok((out, s2.issuing_ca_warning_ms(conn, now_ms)))
@@ -1558,8 +1534,8 @@ async fn get_crl(
         .db
         .read(|conn| {
             let mut out = Vec::new();
-            for ca in ps::trust_anchor_cas(conn)? {
-                let history = ps::crl_history(conn, ca.ca_id, 100)?;
+            for ca in conn.trust_anchor_cas()? {
+                let history = conn.crl_history(ca.ca_id, 100)?;
                 out.push(json!({
                     "ca_id": ca.ca_id,
                     "current": history.first().map(|c| json!({
@@ -1622,7 +1598,7 @@ async fn signing_queue(
 ) -> Result<Response<ApiBody>, ApiError> {
     let rows = svc
         .db
-        .read(|conn| Ok(store::approved_requests(conn, 100_000)?))
+        .read(|conn| Ok(conn.approved_requests(100_000)?))
         .await
         .map_err(db_error)?;
     Ok(http::ok(
@@ -1646,6 +1622,80 @@ async fn export_queue(
         .await
         .map_err(db_error)?;
     Ok(http::ok(now, v))
+}
+
+/// `POST /api/v1/pki/certificates/import`：手動簽發（外部 CA）的既有憑證匯入簽發紀錄（PKI.md 第 16 節）。
+/// 本文 `{"certificates": "<PEM，可含多張>" | ["<PEM>", …], "agent_id": "<選填，必須相符>"}`
+async fn import_certificates(
+    w: &Writer<'_>,
+    b: Value,
+    now: DateTime<Utc>,
+) -> Result<Response<ApiBody>, ApiError> {
+    w.principal.require(Permission::PkiQueue)?;
+    let pems: Vec<String> = match &b["certificates"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(list) => list
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ApiError::param("certificates", "certificates 必須是 PEM 字串或字串的陣列")
+            })?,
+        _ => {
+            return Err(ApiError::param(
+                "certificates",
+                "certificates 必須是 PEM 字串或字串的陣列",
+            ));
+        }
+    };
+    if pems.is_empty() || pems.len() > 1000 {
+        return Err(ApiError::param("certificates", "一次 1～1000 個 PEM"));
+    }
+    let expected = str_field(&b, "agent_id").map(str::to_string);
+    let client_ca = w.svc.config.auth.client_ca_path().map(str::to_string);
+    let (actor, ip) = (w.actor.to_string(), w.ip.to_string());
+    let now_ms = now.timestamp_millis();
+    let results = w
+        .svc
+        .db
+        .write(move |conn| {
+            let anchors = crate::pki::queue::anchors(conn, client_ca.as_deref());
+            let mut out = Vec::new();
+            for (i, pem) in pems.iter().enumerate() {
+                match crate::pki::queue::certificates_in(pem.as_bytes()) {
+                    Ok(ders) => {
+                        for (j, der) in ders.iter().enumerate() {
+                            let r = crate::pki::queue::import_existing(
+                                conn,
+                                der,
+                                &anchors,
+                                expected.as_deref(),
+                                &actor,
+                                Some(&ip),
+                                now_ms,
+                            );
+                            out.push(crate::pki::queue::existing_json(
+                                &format!("{}#{}", i + 1, j + 1),
+                                &r,
+                            ));
+                        }
+                    }
+                    Err(e) => out.push(crate::pki::queue::existing_json(
+                        &format!("{}", i + 1),
+                        &Err(e),
+                    )),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(db_error)?;
+    // 匯入已撤銷的紀錄不會發生；新的清冊列由主控台下一次查詢讀到
+    w.svc.wake();
+    Ok(http::ok(
+        now,
+        json!({"results": results, "summary": summary(&results)}),
+    ))
 }
 
 async fn import_queue(
