@@ -860,6 +860,22 @@ impl Helper<'_> {
         let rollback_pkg = self.work.join("rollback.pkg");
         let restored: Result<(), String> = match self.req.method.as_str() {
             "deb" | "rpm" if rollback_pkg.is_file() => {
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "以回滾檔 {} 經套件管理員裝回 {}（{}）",
+                        self.req
+                            .rollback_artifact
+                            .as_deref()
+                            .unwrap_or("rollback.pkg"),
+                        self.req.from_version,
+                        if self.req.method == "deb" {
+                            "dpkg -i"
+                        } else {
+                            "rpm -U --oldpackage --replacepkgs"
+                        }
+                    ),
+                );
                 let cmd = if self.req.method == "deb" {
                     Cmd::DpkgInstall {
                         package: rollback_pkg.clone(),
@@ -878,6 +894,19 @@ impl Helper<'_> {
                         self.req.target.version
                     ));
                 }
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "以替換前保留的 {} 換回 {}{}",
+                        prev.display(),
+                        self.req.from_version,
+                        if m == "tar" {
+                            ""
+                        } else {
+                            "（沒有可驗證的回滾檔，套件資料庫仍顯示新版）"
+                        }
+                    ),
+                );
                 let r = restore_executable(&prev, &current)
                     .map_err(|e| format!("無法換回 pulse.prev：{e}"));
                 if r.is_ok() && state.unit_replaced {
