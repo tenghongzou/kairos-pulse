@@ -2,7 +2,8 @@
 //
 // 涵蓋：管理員啟用 Prometheus exporter（L1 確認、來源變為主控台）→ 以工作階段抓取 /api/v1/export/prometheus
 // （假 agent web-01 的 system_cpu_usage_percent）；設定 OTLP 端點與標頭（只顯示遮蔽值）→ 測試連線 → 假的 collector
-// （本檔的 HTTP 伺服器）收到帶標頭的 protobuf；停用 OTLP；稽核員唯讀；每個狀態 axe 0 違規（含深色）。
+// （本檔的 HTTP 伺服器）收到帶標頭的 protobuf；停用 OTLP；金鑰檔無法使用（otlp.secrets_available: false，攔截 API）
+// 時標頭欄位一開始就停用；稽核員唯讀；每個狀態 axe 0 違規（含深色）。
 
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -177,6 +178,26 @@ export function registerExport({ test, newPage, login, waitTitle, axe, shot, URL
       col.server.close();
       await ctx.close();
     }
+  });
+
+  test('F7 S21 整合：金鑰檔無法使用（secrets_available: false）時一開始就停用標頭欄位', async () => {
+    const { ctx, page } = await newPage();
+    // 攔截 GET：伺服器回報 alerts-secrets.key 無法使用（OTLP 啟用時才顯示標頭欄位）
+    await page.route('**/api/v1/export/settings', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const r = await route.fetch();
+      const body = await r.json();
+      body.data.otlp.enabled = true;
+      body.data.otlp.secrets_available = false;
+      return route.fulfill({ response: r, json: body });
+    });
+    await login(page, 'admin', PW, '/system/settings/integrations');
+    await waitTitle(page, '系統設定');
+    const card = page.locator('section', { has: page.getByRole('heading', { name: '指標轉出', exact: true }) });
+    await card.getByText('無法保存標頭：資料目錄的 alerts-secrets.key 無法使用', { exact: false }).waitFor();
+    assert.equal(await card.getByLabel('更換標頭…').isVisible(), false, '不必先被 503 拒絕就隱藏「更換標頭…」');
+    await axe(page, 'F7 指標轉出：金鑰檔無法使用');
+    await ctx.close();
   });
 
   test('F7 S21 整合：稽核員唯讀（沒有儲存與測試按鈕）；唯讀角色抓取 Prometheus 端點', async () => {

@@ -8,8 +8,8 @@
 //   aria-live 區域；有未儲存的變更時按鈕旁寫「測試的是已儲存的設定」（設計包 S21「0.9 規格」）。
 // - 狀態：Prometheus 最近一次抓取；OTLP 的佇列、送出、丟棄、最近一次成功與錯誤（代碼 KRS-E4311～E4315，「查看」三段式）。
 // - 兩者都停用（以目前勾選的開關為準）時只顯示說明與兩個開關，不顯示統計與其他欄位（D52 預設停用）。
-// - 保存標頭時 503 secrets_unavailable（alerts-secrets.key 無法使用）：標頭欄位停用並說明。GET 沒有這項資訊，
-//   因此只在第一次被拒之後才停用（之後重畫仍維持）。
+// - 機密的金鑰檔（alerts-secrets.key）無法使用：GET 的 otlp.secrets_available 為 false 時一開始就停用標頭欄位並說明；
+//   保存時仍被 503 secrets_unavailable 拒絕（讀取之後才失效）也一樣停用（之後重畫仍維持）。
 
 import { h, uid, mount } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -52,7 +52,7 @@ export function exportCard() {
   const el = card({ title: t('exp.title'), body });
   let dirty = () => false;
   el.isDirty = () => dirty();
-  // 保存標頭時曾被 503 secrets_unavailable 拒絕（金鑰檔無法使用）：之後重畫時標頭欄位仍停用
+  // 金鑰檔無法使用（GET 的 secrets_available: false，或保存標頭時被 503 secrets_unavailable 拒絕）：之後重畫時標頭欄位仍停用
   let secretsDown = false;
 
   async function load() {
@@ -162,6 +162,8 @@ export function exportCard() {
       headerRows.appendChild(wrap);
       refresh();
     };
+    // 伺服器回報金鑰檔無法使用（secrets_available: false）：不必等保存被拒
+    if (o.secrets_available === false) secretsDown = true;
     const headersLocked = locked(K.otlpHeaders) || secretsDown;
     const hs = byKey.get(K.otlpHeaders);
     const secretsNote = inlineAlert({ kind: 'warning', title: t('exp.otlp.secretsDown') });
