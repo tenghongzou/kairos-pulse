@@ -28,7 +28,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 0.3.0 的協定版本與 0.2.0 相同（v1～v2），另以 feature `durable` 協商 at-least-once 投遞：Kairos 0.3.0 與 Pulse 0.3.0（啟用本機緩衝，預設）都宣告時才啟用，其他組合與上表的 0.2.0 相同（at-most-once）。Kairos 0.3.0 另改為 SQLite 儲存，讀取資料的工具受影響。各組合見 [0.3.0] 的「相容性」。
 - 0.5.0 的協定版本仍為 v1～v2：8443 另以 feature `renew`、`deregister` 協商憑證輪替與除役（只在雙方都宣告時使用），註冊是另一個通道（8444 HTTPS，`crates/kairos-proto/ENROLL.md`）。0.4 與 0.5 的任何組合都能以 8443 照常連線；各組合見 [0.5.0] 的「相容性」。
 - 0.6.0 的協定與 8443 的 feature 都與 0.5.0 相同，0.5 與 0.6 的任何組合都能連線；Kairos 的資料庫升級到 schema v6（告警、使用者與稽核），Pulse 只新增可觀測性（日誌格式、syslog、本機指標、`diag`）。
-- 〔草稿〕0.9.0 的協定版本與 8444 的 API 都與 0.8.0 相同，8443 另以 feature `cluster`（節點名稱與關機排空）、`config`、`upgrade`（集中設定與遠端升級）協商（雙方都宣告時才使用），0.8 與 0.9 的任何組合都能連線（各組合見 [0.9.0] 的「相容性」）；Kairos 的資料庫升級到 schema v9（遠端管理的資料表）。
+- 0.9.0 的協定版本與 8444 的 API 都與 0.8.0 相同，8443 另以 feature `cluster`（節點名稱與關機排空）、`config`、`upgrade`（集中設定與遠端升級）協商（雙方都宣告時才使用），0.8 與 0.9 的任何組合都能連線（各組合見 [0.9.0] 的「相容性」）；Kairos 的資料庫升級到 schema v9（遠端管理的資料表）。
 - 0.1.0 與 0.2.0 的任何組合都有共同的協定版本，不會出現 `unsupported_version`；它只會在日後某一端不再支援 v1（例如只支援 v3 以上）時出現。
 - **升級順序**：協定上任何順序都可以，混用期間自動以 v1 通訊，不必同時升級。仍**建議先升級 Pulse、再升級 Kairos**，原因是上表「Kairos 0.2.0 × Pulse 0.1.0」的限制（舊版 Pulse 的主機名稱與讀取閒置問題）只在先升級 Kairos 時出現；反過來的組合只有第 3 項的離線判定時間改變。資料格式則在 Kairos 升級的那一刻改變（JSONL 開始有 `schema`），與 Pulse 的升級順序無關。從 0.2.0 升級到 0.3.0 時沒有這些限制，**建議先升級 Kairos、再升級 Pulse**（Pulse 升級後的第一次斷線就能補送），步驟見 [0.3.0]。
 - 驗證方式：`kairos-proto` 以凍結的 v1 型別定義驗證舊端忽略 v2 欄位；Kairos 整合測試以 v1／v2 client 涵蓋各種協商結果；Pulse 單元測試以記憶體內的 v1／v2 伺服器驗證 report 格式的選擇；端對端測試（`tests/e2e`）以實際的執行檔驗證 0.2.0 × 0.2.0（v2），並以送出 0.1.0 Pulse 訊息的假 client 驗證 0.2.0 的 Kairos × 0.1.0 的 Pulse（v1）。沒有以 0.1.0 的執行檔實測。
@@ -49,9 +49,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-## [0.9.0] - 〔草稿：發佈日期待定〕
+## [0.9.0] - 2026-10-21
 
-**Kairos 0.9.0、Pulse 0.9.0〔草稿〕**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。
+**Kairos 0.9.0、Pulse 0.9.0**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。
 
 0.9.0 的範圍（2026-10-19 使用者決定，HA.md 第 21 節、REMOTE.md 第 14 節全部採建議）另包含 **F8 MVP**（REMOTE.md D15；Kairos 端 K1 設定檔與指派、K2 版本庫與推送，以及 Pulse 端 P1 集中設定、P2 Linux 遠端升級都已包含，Kairos 0.9 × Pulse 0.9 在 mTLS 連線上協商 `config`／`upgrade`）與 HA 的 **L1a 儲存抽象**（已包含）、**L4 Pulse 多位址**（已包含）；PostgreSQL 後端與叢集協調延到 0.10.0。
 
@@ -172,7 +172,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 規格（尚未實作）
 
-- **`kairos/HA.md`**（審計 A2，高可用）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址等分層設計與量測計畫；第 21 節的 20 項待決已決定（2026-10-19，採建議）。0.9.0 實作 L1a 儲存抽象與 L4 Pulse 多位址（L4 已包含於本草稿，見上方），PostgreSQL 後端與叢集協調在 0.10.0。STORAGE.md 的「限制與後續」連到 HA.md。
+- **`kairos/HA.md`**（審計 A2，高可用）：儲存抽象、PostgreSQL 後端、叢集協調、Pulse 多位址等分層設計與量測計畫；第 21 節的 20 項待決已決定（2026-10-19，採建議）。0.9.0 實作 L1a 儲存抽象與 L4 Pulse 多位址（L4 已包含於本版，見上方），PostgreSQL 後端與叢集協調在 0.10.0。STORAGE.md 的「限制與後續」連到 HA.md。
 - **`crates/kairos-proto/REMOTE.md`**（F8，集中設定與 agent 遠端升級）：第 14 節 D1～D18 已決定（2026-10-19，採建議）；0.9.0 實作 MVP（D15）。協定部分（第 2 節）已搬入 PROTOCOL.md，共用型別已實作（見上方「共用 crate：遠端管理的協定與信任鏈」）；Kairos 的行為（K1、K2，實作附註與差異見 REMOTE.md 第 13.1 節）與 Pulse 的行為（P1、P2，見 REMOTE.md 第 17 節）都已實作（見上方）；主控台畫面（W1）也已實作（見上方「主控台」）。
 
 ### 新的產品代碼（設計包 `decisions/INTEGRATION.md` §31.3 正式分配）
