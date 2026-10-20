@@ -448,13 +448,21 @@ fn hash_mismatch_redownloads_then_gives_up_after_three_times() {
     ack_all(&agent, &mut cs);
     let mut bad = TAR.to_vec();
     bad[0] ^= 1;
+    let mut t = Instant::now();
     for attempt in 1..=3 {
+        if attempt > 1 {
+            // 段落請求之間至少隔 CHUNK_REQUEST_INTERVAL（不超過 Kairos 每條連線的訊息速率）
+            assert_eq!(agent.poll(&mut cs, t), None, "attempt {attempt}");
+            let next = t + CHUNK_REQUEST_INTERVAL;
+            assert_eq!(agent.next_wake(&cs, t, false), Some(next));
+            t = next;
+        }
         let Some(Out::Chunk {
             filename,
             offset,
             length,
             ..
-        }) = agent.poll(&mut cs, Instant::now())
+        }) = agent.poll(&mut cs, t)
         else {
             panic!("attempt {attempt}: expected a chunk request");
         };

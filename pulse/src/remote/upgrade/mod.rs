@@ -65,6 +65,11 @@ const RECONFIRM_RETRY: Duration = Duration::from_secs(600);
 const RECONFIRM_POLL: Duration = Duration::from_secs(5);
 /// `upgrade.download_failed` 的節流視窗（log-ux.md §4.6：10 分鐘）
 const DOWNLOAD_LOG_WINDOW: Duration = Duration::from_secs(600);
+/// 段落請求的最短間隔（約每秒 16 則）：段落請求計入 Kairos 每條連線的訊息速率（可連續 50 則、之後每秒
+/// 20 則，REMOTE.md 第 2.4.2 節），區域網路上 2 段在途就會超過，Kairos 每台主機下載時都記 WARN「送出訊息
+/// 超過每秒 20 則」並延後處理同一條連線上的心跳與 report（tests/systemd 實測）。保留約每秒 4 則給其他訊息；
+/// 10 MB 約 20 秒，與規格估計的 20～40 秒相同
+const CHUNK_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
 /// 驗證過的發佈的簽章資料（回滾檔的信任來源）
 const RELEASES_DIR: &str = "releases";
 
@@ -277,6 +282,8 @@ pub struct ConnState {
     resync: bool,
     /// `rate_limited` 後等到這個時間
     retry_until: Option<Instant>,
+    /// 下一則段落請求最早的時間（[`CHUNK_REQUEST_INTERVAL`]）
+    next_chunk_at: Option<Instant>,
     /// 這條連線已送出（等待 `ack`）的狀態
     status_in_flight: Vec<(String, String, Option<UpgradeProgress>)>,
     /// `storage_unavailable` 後到這個時間才重送狀態
@@ -585,7 +592,10 @@ impl UpgradeAgent {
             return Some(Out::Get(id));
         }
         // 3. 段落請求
-        if cs.retry_until.is_some_and(|t| now < t) || cs.chunks.len() >= MAX_CHUNKS_IN_FLIGHT {
+        if cs.retry_until.is_some_and(|t| now < t)
+            || cs.next_chunk_at.is_some_and(|t| now < t)
+            || cs.chunks.len() >= MAX_CHUNKS_IN_FLIGHT
+        {
             return None;
         }
         cs.retry_until = None;
@@ -597,6 +607,7 @@ impl UpgradeAgent {
         }
         let (id, filename, offset, length) = Self::next_chunk(&inner, cs)?;
         cs.chunks.push((filename.clone(), offset, length));
+        cs.next_chunk_at = Some(now + CHUNK_REQUEST_INTERVAL);
         drop(inner);
         Some(Out::Chunk {
             upgrade_id: id,
@@ -672,7 +683,11 @@ impl UpgradeAgent {
                         Self::next_chunk(&inner, cs)
                     };
                     if !blocked && next.is_some() {
-                        at(cs.retry_until.unwrap_or(now).max(now));
+                        at(cs
+                            .retry_until
+                            .unwrap_or(now)
+                            .max(cs.next_chunk_at.unwrap_or(now))
+                            .max(now));
                     }
                 }
                 Phase::Staged if c.offer.apply_window.contains(now_ms()) && !cs.reconfirmed => {
