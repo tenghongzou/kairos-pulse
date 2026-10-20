@@ -267,6 +267,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 {
   "agent_id": "6f1c0e4a-1b2c-4d3e-9f00-112233445566",
   "hostname": "hmi-line3-07",
+  "pseudonymized": false,
   "display_name": null,
   "status": "offline",
   "status_detail": { "offline_reason": "idle_timeout", "offline_reason_legacy": "timeout", "never_connected": false, "starting": false, "long_offline": false },
@@ -301,6 +302,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - 0.9.0（第 17 節）：
   - `install`：hello 的 `install`（`{method, upgrade, config}`；連線中以這次的 hello 為準）；Pulse 0.8 以前為 `null`（主控台顯示「需要 Pulse 0.9.0 以上」）。
   - `config_state`：集中設定的狀態（第 17.1 節的分類；S04「設定狀態」篩選）。
+  - `pseudonymized`：主機名稱是假名（`host-` ＋ 12 個 base32 小寫字元，`privacy.hostname = "pseudonymize"`，[`PRIVACY.md`](PRIVACY.md) 第 3 節；S05 頁首的說明）。假名化不留原值，只能依格式判斷：`privacy.hostname` 改回 `keep` 之後先前假名化的主機仍為 `true`；主機名稱原本就是這個格式時也是 `true`。
 
 **`meta`**：
 
@@ -472,8 +474,9 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `enroll`（0.8；有註冊服務時） | `mode`、`state`、`listening`、`listen_addr`、`not_listening_reason`、`expired_renew_grace_days`、`blocked_sources`、`impact`（`N`、`M`、`L`、`R`、`T`，第 11.4 節） | 嚴重：模式不是關閉卻沒有在監聽（`KRS-E2001`）；警告：關閉且 N＋M＞0（`KRS-W2009`）、僅續簽但寬限期為 0 天（`KRS-W2011`）、僅續簽但仍有有效 token、封鎖中的來源 ≥ 1（`KRS-W3005`）（設計包 S20「註冊端點」） |
 | `alerts`（0.8） | `enabled`；啟用時同 `GET /api/v1/alerts/summary` 的 `engine`（`running`、`last_tick_at`、`warmup`、`last_error`…） | 嚴重：告警引擎沒有在執行（最近 60 秒沒有完成判定）。`alerts.enabled = false` 時為正常（「已停用」） |
 | `metrics`（0.8） | `on_console`、`token`（是否設定 `observability.metrics_token_file`）、`listen`、`proxied_rejected`（這次啟動後曾拒絕經反向代理轉送的請求，`KRS-W0304`） | —（摘要為設計包 S20「/metrics 端點」列的寫法） |
+| `remote`（0.9；第 17 節） | `available`（`false`：不是 SQLite 儲存）、`config_enabled`、`upgrade_enabled`、`allowed_signers_configured`；遠端升級啟用時另有 `rollouts_running`、`rollouts_paused`、`rollouts_auto_paused`、`paused[]`（前 10 個：`id`、`name`、`reason`、`cause`＝第 17.3 節的 `pause_cause`）、`releases`（版本庫的版本數）、`rollback_failed_unacknowledged`、`downloads_in_progress`、`max_concurrent_downloads` | 嚴重：有回滾失敗且尚未標記為已處理的主機（`KRS-E8408`）；警告：有自動暫停的推送（`KRS-W8414`；主控台暫停的不算）、遠端升級啟用且版本庫有發佈版本但沒有設定 `[remote] allowed_signers`（匯入時無法驗證簽章；版本庫是空的時只在摘要註明）。兩者都停用時為正常（「已停用」）（設計包 S20「遠端管理」列） |
 
-**細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
+**細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）、`remote`（`rollouts:read`，0.9）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
 
 〔之後〕CRL 自動更新（#6）、授權（#13）、時鐘（NTP）、目錄服務的最近一次連線結果在對應功能實作時加入。
 
@@ -1407,7 +1410,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/export/prometheus[?group=…]` | `hosts:read`（依主機群組篩選） | 所有可見主機的最新指標，Prometheus text 0.0.4；`Accept: application/openmetrics-text` 時為 OpenMetrics 1.0。未啟用時 `404 export_disabled`（`KRS-E4315`）。回應不是 JSON（錯誤仍是第 1.2 節的 JSON） |
-| `GET /api/v1/export/settings` | `settings:read` | 生效的設定、每個主控台可修改的鍵的來源與鎖定、Prometheus 抓取與 OTLP 推送的狀態 |
+| `GET /api/v1/export/settings` | `settings:read` | 生效的設定、每個主控台可修改的鍵的來源與鎖定、Prometheus 抓取與 OTLP 推送的狀態；`otlp.secrets_available`（0.9.0〔草稿〕）：機密的金鑰檔 `alerts-secrets.key` 可以使用（`false` 時不能保存或更換標頭，`PUT` 會回 503 `secrets_unavailable`；主控台一開始就停用標頭欄位） |
 | `PUT /api/v1/export/settings` | `export:write` | 修改 `prometheus.{enabled,stale_after_secs,include_processes}`、`otlp.{enabled,endpoint,interval_secs,naming,headers}`；`null` 為改用設定檔的值；`reason` 選填。不合法 `400 invalid_parameter`（`KRS-E4314`）、環境變數鎖定 `409 locked_by_environment`；寫入稽核（`settings`／`export.change`，標頭只記名稱） |
 | `POST /api/v1/export/otlp/test` | `export:write` | 以已儲存的設定送出空的 OTLP 請求，回 `{ok, status, code, message, elapsed_ms, endpoint}`；寫入稽核（`export.otlp_test`） |
 
@@ -1486,16 +1489,16 @@ done
 | `waves` | 1～2 批，最後一批的 `size` 必須是 `"rest"`；每批 `size`（台數，或 `"N%"`：可升級主機的百分比、至少 1 台）、`max_hosts`（百分比時的上限）、`soak_minutes`（這批全部結束後的觀察時間，0～10080）、`max_failure_ratio`（0～1，超過即自動暫停）、`manual_continue`（觀察期滿後要人工 `continue`）。省略時為預設範本：canary `1%`（至多 10 台）、觀察 60 分鐘、上限 0（任何失敗都暫停）、人工繼續；其餘上限 5% |
 | `options` | `max_in_progress`（同時在下載到確認之間的主機數，預設 50、1～1000）、`health_timeout_secs`（預設 600、120～3600）、`allow_downgrade`（降版；Pulse 本機也要允許）、`allow_no_rollback`（允許沒有回滾檔的 deb／rpm 主機）、`canary_agent_ids[]`（指定第一批的主機，需要兩批）、`offline_grace_hours`（離線多久標為 `skipped_offline`，預設 24） |
 
-**資格分類**（REMOTE.md 第 4.7.2 節；`skipped` 的 `reason`）：`already`、`unsupported_version`（低於 0.9.0 或沒有 `install`）、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`、`not_ready`（依 `install.upgrade`）、`unsupported_platform`、`no_artifact`、`min_upgrade_from`、`no_manifest`（升級的目標沒有清單）、`downgrade_not_allowed`、`no_rollback`、`decommissioned`。連線中的主機以 hello 的版本與 `install` 為準（清冊每 30 秒才同步）。已在另一個未結束的推送中的主機：建立與送出時 409 `rollout_overlap`（`details.count`、`agent_ids`、`hosts[]` 前 100 台）。順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)`。
+**資格分類**（REMOTE.md 第 4.7.2 節；`skipped` 的 `reason`）：`already`、`unsupported_version`（低於 0.9.0 或沒有 `install`）、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`、`not_ready`（依 `install.upgrade`）、`unsupported_platform`、`no_artifact`、`min_upgrade_from`、`no_manifest`（升級的目標沒有清單）、`downgrade_not_allowed`、`no_rollback`、`decommissioned`。連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤為準，協商了 `upgrade` 的連線再以發提議時使用的資訊覆蓋：預覽、建立、送出與發提議一致，主機連線後不必等清冊每 30 秒的同步（0.9.0〔草稿〕起；之前只有協商了遠端管理的連線如此）。清冊還沒有的主機（連線後尚未寫入過任何資料）不在對象中。已在另一個未結束的推送中的主機：建立與送出時 409 `rollout_overlap`（`details.count`、`agent_ids`、`hosts[]` 前 100 台）。順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)`。
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
-| `POST /api/v1/rollouts/preview` | `rollouts:read` | 回 `matched`、`eligible`、`downgrade`、`no_rollback`、`skipped`（原因 → 台數）、`samples`（原因 → 前 100 台的 `agent_id`、`hostname`）、`overlap`（`count`、`hosts[]`）、`waves`（每批的台數）、`incompatible`（`min_kairos` 高於目前的 Kairos 時 `{min_kairos, code: "KRS-W8415"}`）、`breaking`、`remote_features`、`loses_remote_management`（目標沒有 `upgrade` feature 或沒有清單）、`confirm_text`（「升級 N 台」，降版時「降版 N 台」）、`confirm_level`（`L2`／`L3`）、`waves_spec` |
-| `GET /api/v1/rollouts` | `rollouts:read` | 篩選 `state`（`draft`、`running`、`paused`、`completed`、`cancelled`）。`data[]`：`id`（`r-YYYYMMDD-NNNN`）、`name`、`target_version`、`state`、`current_wave`（0 起算）、`waves_total`、`progress`（每個主機狀態的台數，鍵為下表的 15 個狀態）、`hosts_total`（不含 `skipped`）、`next_action`、`pause_reason`、`cancel_reason`、`awaiting_continue`、`soak_until`、`created_*`、`started_at`、`completed_at`、`updated_at` |
+| `POST /api/v1/rollouts/preview` | `rollouts:read` | 回 `matched`、`eligible`、`downgrade`、`no_rollback`、`skipped`（原因 → 台數）、`samples`（原因 → 前 100 台的 `agent_id`、`hostname`）、`overlap`（`count`、`hosts[]`）、`waves`（每批的台數）、`incompatible`（`min_kairos` 高於目前的 Kairos 時 `{min_kairos, code: "KRS-W8415"}`）、`breaking`、`remote_features`、`loses_remote_management`（目標沒有 `upgrade` feature 或沒有清單）、`confirm_text`（「升級 N 台」；有無法自動回滾的主機〔`allow_no_rollback`〕時「升級 N 台（無法自動回滾 M 台）」，全形括號；降版時「降版 N 台」）、`confirm_level`（`L2`／`L3`）、`waves_spec` |
+| `GET /api/v1/rollouts` | `rollouts:read` | 篩選 `state`（`draft`、`running`、`paused`、`completed`、`cancelled`）。`data[]`：`id`（`r-YYYYMMDD-NNNN`）、`name`、`target_version`、`state`、`current_wave`（0 起算）、`waves_total`、`progress`（每個主機狀態的台數，鍵為下表的 15 個狀態）、`hosts_total`（不含 `skipped`）、`rollback_failed_unacknowledged`（回滾失敗且尚未標記為已處理的台數；`progress.rollback_failed` 含已處理的）、`next_action`、`pause_reason`、`pause_cause`（暫停中才有值：`manual`〔主控台或 API 暫停〕、`failure_ratio`、`rollback_failed`、`signature_failed`〔三者為自動暫停，`KRS-W8414`〕；其他狀態為 `null`；讀取端應忽略不認得的值）、`cancel_reason`、`awaiting_continue`、`soak_until`、`created_*`、`started_at`、`completed_at`、`updated_at`。`meta`（不受 `state` 篩選影響）：`paused`（暫停中的推送數）、`rollback_failed_unacknowledged`（全部推送中回滾失敗且尚未標記為已處理的主機數）；主控台側邊導覽「升級推送」的計數泡泡＝兩者相加 |
 | `POST /api/v1/rollouts` | `rollouts:write` | 建立草稿（`draft`）；對象在送出時才固定。`min_kairos` 不符 400 `incompatible_release`（`KRS-W8415`）。回 201：推送（另有 `selector`、`options`、`waves`、`schedule`）與 `preview`。稽核 `rollout.create` |
 | `GET /api/v1/rollouts/{id}` | `rollouts:read` | 同清單的欄位，另有 `selector`、`options`、`schedule`（0.9 為 `{}`）、`waves[]`（每批的設定、`index`、`hosts`、`progress`、`failure_ratio`、`current`）；草稿另有即時的 `preview`。沒有時 404 `rollout_not_found` |
 | `PUT /api/v1/rollouts/{id}` | `rollouts:write` | 修改草稿的內容（其他狀態 409 `invalid_state`）。稽核 `rollout.update` |
-| `POST /api/v1/rollouts/{id}/submit` | `rollouts:write` | 送出並立即開始：L2 `confirm` 為預覽的 `confirm_text`（「升級 N 台」；不符時 400 `confirmation_required`，`details.confirm_text`、`confirm_level`、`eligible`）；包含降版時為 L3（「降版 N 台」）且 `reason` 必填（0.9 不要求重新驗證密碼，設計包 §31.12 #7）。沒有可升級的主機 409 `no_eligible_hosts`。固定對象寫入主機表（不符資格的記為 `skipped`），狀態 `running`。稽核 `rollout.submit`、`rollout.start` |
+| `POST /api/v1/rollouts/{id}/submit` | `rollouts:write` | 送出並立即開始：L2 `confirm` 為預覽的 `confirm_text`（「升級 N 台」；有無法自動回滾的主機時只接受「升級 N 台（無法自動回滾 M 台）」，設計包 S26；不符時 400 `confirmation_required`，`details.confirm_text`、`confirm_level`、`eligible`、`downgrade`、`no_rollback`）；包含降版時為 L3（「降版 N 台」）且 `reason` 必填（0.9 不要求重新驗證密碼，設計包 §31.12 #7）。沒有可升級的主機 409 `no_eligible_hosts`。固定對象寫入主機表（不符資格的記為 `skipped`），狀態 `running`。稽核 `rollout.submit`、`rollout.start` |
 | `POST /api/v1/rollouts/{id}/pause` | `rollouts:pause` | `reason` 必填。只有 `running` 可以暫停。提議中、尚未替換的主機（`offered`／`accepted`／`staged`）回到 `pending`，恢復時以新的 `upgrade_id` 重新提議（Pulse 對舊的 id 收到 `upgrade_unavailable`）；替換中的照常完成。稽核 `rollout.pause` |
 | `POST /api/v1/rollouts/{id}/resume` | `rollouts:write` | 暫停中 → `running`。稽核 `rollout.resume` |
 | `POST /api/v1/rollouts/{id}/continue` | `rollouts:write` | 觀察期滿、`manual_continue` 的批次開始下一批（`awaiting_continue` 不是 `true` 時 409 `invalid_state`）。稽核 `rollout.resume`（`details.continue`） |
@@ -1503,7 +1506,7 @@ done
 | `GET /api/v1/rollouts/{id}/hosts` | `rollouts:read` | 分頁（`limit` 1～1000、`cursor`，第 3 節）；篩選 `wave`、`state`（可重複或逗號分隔）、`reason`、`code`、`q`（主機名稱或 agent_id 片段）。`data[]`：`agent_id`、`hostname`、`upgrade_id`、`wave`（`skipped` 為 -1）、`ordinal`、`state`、`reason`、`from_version`、`to_version`、`attempts`、`progress`（`bytes`、`total`）、`code`（Pulse 回報的代碼）、`detail`、`offered_at`、`applying_at`、`finished_at`、`updated_at`、`acknowledged_at`、`acknowledged_by` |
 | `POST /api/v1/rollouts/{id}/hosts/{agent_id}/retry` | `rollouts:write` | 對 `failed`、`rolled_back`、`expired`、`skipped_offline`、`declined`、`unknown`（以及已標記處理的 `rollback_failed`）的主機以新的 `upgrade_id` 重新提議（`attempts` 加 1）；推送須為 `running` 或 `paused`。稽核 `rollout.update`（`details.retry`） |
 | `POST /api/v1/rollouts/{id}/hosts/{agent_id}/acknowledge` | `rollouts:write` | 回滾失敗已人工處理（`note` 選填；S05「標記為已處理」）。稽核 `host.upgrade.acknowledge` |
-| `GET /api/v1/hosts/{agent_id}/upgrade` | `rollouts:read` | `agent_version`、`install`、`arch`、`rollback_failed`（有未處理的回滾失敗）、`upgrades[]`（最近 10 次，欄位同主機表另加 `rollout_id`）、`upgrade_negotiated`、`offered_upgrade_id` |
+| `GET /api/v1/hosts/{agent_id}/upgrade` | `rollouts:read` | `agent_version`、`install`、`arch`（連線中以 hello 為準，與資格分類相同）、`rollback_failed`（有未處理的回滾失敗）、`upgrades[]`（最近 10 次，欄位同主機表另加 `rollout_id`）、`upgrade_negotiated`、`offered_upgrade_id` |
 
 **主機的狀態**：`pending` → `offered`（推送引擎提議，下一次心跳帶 `pending.upgrade_id`）→ `accepted` → `staged` → `applying` → `succeeded`／`failed`／`rolled_back`／`rollback_failed`；另有 `declined`（`reason` 為 Pulse 的 `detail` 或代碼）、`expired`、`skipped`、`skipped_offline`、`unknown`、`cancelled`。
 
@@ -1516,7 +1519,7 @@ done
 - 回報 `succeeded` 而這條連線 hello 的 `agent_version` 不是目標版本 → `failed`（`version_mismatch`，`KRS-W8402`）。
 - 已結束或取消超過 `[remote] rollout_retention_days`（預設 400）的推送每小時刪除。
 
-`next_action`（設計包 §31.8 F8 #4：固定代碼＋參數，主控台組文案）：`{"code":"draft"}`、`{"code":"upgrading"}`、`{"code":"soaking","minutes":23,"until":"…"}`、`{"code":"waiting_continue"}`、`{"code":"paused","reason":"…"}`、`{"code":"completed"}`、`{"code":"cancelled"}`。
+`next_action`（設計包 §31.8 F8 #4：固定代碼＋參數，主控台組文案）：`{"code":"draft"}`、`{"code":"upgrading"}`、`{"code":"soaking","minutes":23,"until":"…"}`、`{"code":"waiting_continue"}`、`{"code":"paused","reason":"…","cause":"failure_ratio"}`（`cause` 同 `pause_cause`）、`{"code":"completed"}`、`{"code":"cancelled"}`。
 
 ### 17.4 錯誤碼
 
@@ -1541,5 +1544,5 @@ done
 ### 17.5 即時推送（SSE，`GET /api/v1/events`）
 
 - `config.host`（需要 `config:read`，且看得到那台主機）：Pulse 送出 `config_status` 後，`{agent_id, state, applied_rev, code, overridden}`（`overridden` 為本機覆蓋的鍵數）。
-- `rollout.progress`（需要 `rollouts:read`）：推送的狀態或主機改變後，每個推送每 5 秒最多一則（推送引擎每一輪送出），`{rollout_id, state, current_wave, progress, next_action}`（欄位同第 17.3 節的清單）。
+- `rollout.progress`（需要 `rollouts:read`）：推送的狀態或主機改變後，每個推送每 5 秒最多一則（推送引擎每一輪送出），`{rollout_id, state, current_wave, progress, pause_cause, next_action}`（欄位同第 17.3 節的清單）。
 - `rollout.host`（只送給正在看某個推送詳情的連線，REMOTE.md 第 8.4 節）在 0.9 尚未提供：推送詳情收到 `rollout.progress` 後重新載入主機表。
