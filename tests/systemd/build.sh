@@ -158,5 +158,5 @@ sh "$REPO/packaging/sign-release.sh" sign "$WORK/dist/0.9.1-test.9" "$KEYS/evil-
 
 say "完成"
 for d in "$WORK"/dist/*/; do
-    echo "  $(basename "$d")：$(cd "$d" && ls | tr '\n' ' ')" >&2
+    echo "  $(basename "$d")：$(cd "$d" && printf '%s ' *)" >&2
 done

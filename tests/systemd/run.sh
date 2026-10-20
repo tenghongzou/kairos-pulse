@@ -172,6 +172,7 @@ collect_logs() {
 }
 
 pkg_version() {
+    # shellcheck disable=SC2016 # ${Version} 是 dpkg-query 的格式，不是 shell 變數
     case "$1" in
     deb) hx deb dpkg-query -W -f='${Version}' pulse 2>&1 ;;
     rpm) hx rpm rpm -q --qf '%{VERSION}-%{RELEASE}' pulse 2>&1 ;;
@@ -181,6 +182,7 @@ pkg_version() {
 
 # rollout <名稱> <版本>：建立並送出推送（單一批次、失敗不暫停），stdout 為推送 ID
 rollout() {
+    # shellcheck disable=SC2086 # AGENTS 刻意以空白分隔
     ids=$(printf '%s\n' $AGENTS | jq -R . | jq -s -c .)
     spec=$(jq -n -c --arg n "$1" --arg v "$2" --argjson ids "$ids" --argjson t "$HEALTH_TIMEOUT" \
         '{name: $n, target_version: $v, selector: {agent_ids: $ids},
@@ -331,8 +333,11 @@ scenario_reboot() {
     done
     for p in $pids; do wait "$p" || true; done
     for h in $HOSTS; do
-        grep -qx "$h" "$WORK/rebooted" 2>/dev/null && pass "c/$h：已在健康確認期間重新開機" ||
+        if grep -qx "$h" "$WORK/rebooted" 2>/dev/null; then
+            pass "c/$h：已在健康確認期間重新開機"
+        else
             fail "c/$h：沒有在健康確認期間重新開機"
+        fi
     done
     wait_rollout "$id" 1200 || fail "c：推送沒有在 1200 秒內結束"
     collect_logs c
@@ -354,8 +359,11 @@ scenario_reboot_rollback() {
     done
     for p in $pids; do wait "$p" || true; done
     for h in $HOSTS; do
-        grep -qx "$h" "$WORK/rebooted" 2>/dev/null && pass "c2/$h：已在回滾確認期間重新開機" ||
+        if grep -qx "$h" "$WORK/rebooted" 2>/dev/null; then
+            pass "c2/$h：已在回滾確認期間重新開機"
+        else
             fail "c2/$h：沒有在回滾確認期間重新開機"
+        fi
     done
     wait_rollout "$id" 1200 || fail "c2：推送沒有在 1200 秒內結束"
     collect_logs c2
