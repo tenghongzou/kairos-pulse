@@ -4,7 +4,8 @@
 //   離線後 L2：輸入主機名稱才能按，axe 0 違規）→ 回到主機清單、主機已不存在。
 // - S05 假名化的主機（主機 API 的 pseudonymized）：頁首的說明；一般主機名稱沒有。
 // - S12（第二個 Kairos，pki-env.sh）：設定了 enroll.download_dir 且檔案齊全時，建立 token 後顯示一行安裝指令。
-// - S14（第二個 Kairos）：匯入手動簽發的憑證（根 CA 直接簽發，pki-env.sh 的 manual.pem）→ 清單出現這台主機。
+// - S14（第二個 Kairos）：匯入手動簽發的憑證（根 CA 直接簽發，pki-env.sh 的 manual.pem）→ 結果留在對話框內
+//   （再匯入同一張為「先前已匯入」、伺服器憑證全部未通過為 InlineAlert 與 KRS-E1305 三段式）→ 清單出現這台主機。
 
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -157,7 +158,23 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
     await imp.locator('textarea[name="pem"]').fill(readFileSync(join(PKI_DIR, 'manual.pem'), 'utf8'));
     await axe(page, 'S14 匯入憑證');
     await imp.getByRole('button', { name: '匯入', exact: true }).click();
-    await page.getByText('匯入 1 張、先前已匯入 0 張、未通過 0 張').first().waitFor();
+    // 結果留在對話框內（設計包 S14「0.9 規格」）：摘要為 role="status"，全部通過時清空欄位
+    await imp.getByRole('status').filter({ hasText: '匯入 1 張、先前已匯入 0 張、未通過 0 張' }).waitFor();
+    assert.equal(await imp.locator('textarea[name="pem"]').inputValue(), '');
+    // 再匯入同一張：先前已匯入
+    await imp.locator('textarea[name="pem"]').fill(readFileSync(join(PKI_DIR, 'manual.pem'), 'utf8'));
+    await imp.getByRole('button', { name: '匯入', exact: true }).click();
+    await imp.getByRole('status').filter({ hasText: '匯入 0 張、先前已匯入 1 張、未通過 0 張' }).waitFor();
+    // 全部未通過（伺服器憑證：SAN 不是 agent_id）：InlineAlert「無法匯入」、逐張列出並可展開 KRS-E1305
+    await imp.locator('textarea[name="pem"]').fill(readFileSync(join(PKI_DIR, 'server.pem'), 'utf8'));
+    await imp.getByRole('button', { name: '匯入', exact: true }).click();
+    const failed = imp.locator('.ds-alert--error', { hasText: '無法匯入' });
+    await failed.getByText('匯入 0 張、先前已匯入 0 張、未通過 1 張').waitFor();
+    await failed.getByText(/：未通過（KRS-E1305）：/).waitFor();
+    await failed.locator('details summary').first().click();
+    await failed.getByText('無法匯入憑證：', { exact: false }).first().waitFor();
+    await axe(page, 'S14 匯入憑證（結果）');
+    await imp.getByRole('button', { name: '關閉', exact: true }).last().click();
     await page.goto(`${PKI_BASE}/certificates?q=${MANUAL_ID.slice(0, 8)}`);
     await page.locator('tbody tr[data-key]', { hasText: MANUAL_ID.slice(0, 8) }).first().waitFor();
     await ctx.close();
