@@ -229,6 +229,9 @@ struct HelperState {
     unit_replaced: bool,
     /// 附在結果 `detail` 的說明（例如 `unit_not_updated`）
     notes: Vec<String>,
+    /// 回滾的原因（健康確認沒有通過的項目）：回滾中重新開機後接續時沿用，結果的 `detail` 才不會只剩 `resumed`
+    #[serde(default)]
+    rollback_reason: String,
     /// 最後的結果（`Done` 時）
     result: Option<UpgradeResult>,
 }
@@ -380,7 +383,12 @@ impl Helper<'_> {
                 }
                 Step::RollingBack => {
                     self.log.line("INFO", "接續上次中斷的回滾");
-                    return self.confirm_rollback(s, "resumed".to_string());
+                    let reason = if s.rollback_reason.is_empty() {
+                        "resumed".to_string()
+                    } else {
+                        format!("{}; resumed", s.rollback_reason)
+                    };
+                    return self.confirm_rollback(s, reason);
                 }
                 Step::Verified => {}
             }
@@ -699,6 +707,7 @@ impl Helper<'_> {
             health_timeout_secs: p.health_timeout.as_secs(),
             unit_replaced: false,
             notes: Vec::new(),
+            rollback_reason: String::new(),
             result: None,
         };
         self.save(&state);
@@ -922,6 +931,7 @@ impl Helper<'_> {
             return self.rollback_failed(state, format!("{reason}; rollback: {e}"));
         }
         state.step = Step::RollingBack;
+        state.rollback_reason = reason.clone();
         state.n_restarts_before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
         state.restarted_unix = self.sys.now_unix();
         let timeout = Duration::from_secs(state.health_timeout_secs).max(MIN_ROLLBACK_TIMEOUT);

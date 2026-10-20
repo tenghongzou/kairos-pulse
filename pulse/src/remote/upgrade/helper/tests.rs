@@ -785,3 +785,51 @@ fn rpm_install_allows_reinstall_and_older_package_database_versions() {
         ["-U", "--oldpackage", "--replacepkgs", "/w/pulse.rpm"]
     );
 }
+
+/// 回滾確認期間重新開機：開機後接續回滾確認，結果的 detail 仍是原本的失敗原因（tests/systemd 實測時只剩
+/// `resumed`，Kairos 與主控台看不出為什麼回滾）
+#[test]
+fn resuming_a_rollback_after_a_reboot_keeps_the_original_reason() {
+    let env = setup("resume-rollback", "tar");
+    let request = std::fs::read(&env.paths.request).unwrap();
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(r.detail.starts_with("crash_restart"), "{}", r.detail);
+    // 模擬在回滾確認中途重新開機：狀態改回 rolling_back、放回 request.json
+    let state_path = env.paths.work_root.join(ID).join("state.json");
+    let mut s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(
+        s["rollback_reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("crash_restart")),
+        "{s}"
+    );
+    s["step"] = "rolling_back".into();
+    s["result"] = serde_json::Value::Null;
+    s["deadline_unix"] = (chrono::Utc::now().timestamp() + 600).into();
+    s["n_restarts_before"] = 0.into();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(
+        r.detail.starts_with("crash_restart") && r.detail.contains("resumed"),
+        "{}",
+        r.detail
+    );
+    assert!(fake.calls().is_empty(), "沒有重新替換：{:?}", fake.calls());
+    // 0.9.0 的狀態檔沒有這個欄位：照舊只回報 resumed
+    s.as_object_mut().unwrap().remove("rollback_reason");
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.detail.as_str()),
+        ("rolled_back", "resumed")
+    );
+    let _ = std::fs::remove_dir_all(&env.root);
+}
