@@ -35,6 +35,18 @@ pub const CODE_KEY_UNAVAILABLE: &str = "KRS-E4005";
 /// 假名的雜湊長度（base32 字元；60 位元，1 萬台主機的碰撞機率約 4×10⁻¹¹）
 const PSEUDONYM_CHARS: usize = 12;
 
+/// 主機名稱是否為假名（`host-` ＋ 12 個 RFC 4648 base32 小寫字元；主機 API 的 `pseudonymized`）。
+/// 假名化不留原值，只能依格式判斷：`privacy.hostname` 改回 `keep` 之後，先前假名化的主機仍是假名；
+/// 原本就叫這個格式的主機名稱也會被判為假名（隨機名稱剛好符合的機率可忽略）
+pub fn is_host_pseudonym(name: &str) -> bool {
+    name.strip_prefix("host-").is_some_and(|rest| {
+        rest.len() == PSEUDONYM_CHARS
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+    })
+}
+
 /// `privacy.store_peer_ip`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,7 +187,7 @@ impl PseudonymKey {
         &self.key_id
     }
 
-    /// `kind`（`host`、`name`、`user`）＋原值的假名，例 `host-k3m9x2q7v4ab`。比對不分大小寫
+    /// `kind`（`host`、`name`、`user`）＋原值的假名，例 `host-k3m7x2q7v4ab`。比對不分大小寫
     pub fn pseudonym(&self, kind: &str, value: &str) -> String {
         let mut ctx = hmac::Context::with_key(&self.mac);
         ctx.update(kind.as_bytes());
@@ -558,6 +570,23 @@ mod tests {
         assert_eq!(p(PeerIpMode::Truncate).peer(v6), "2001:db8:1::/48");
         assert_eq!(p(PeerIpMode::Truncate).peer(mapped), "192.168.1.0/24");
         assert_eq!(p(PeerIpMode::None).peer(addr), "");
+    }
+
+    #[test]
+    fn host_pseudonyms_are_recognized_by_format() {
+        let a = key().pseudonym("host", "his-db-01");
+        assert!(is_host_pseudonym(&a), "{a}");
+        for not in [
+            "his-db-01",
+            "host-abc",
+            "host-ABCDEFGHIJKL",
+            "host-abcdefghijk1",
+            "host-abcdefghijklm",
+            "name-abcdefghijkl",
+            "",
+        ] {
+            assert!(!is_host_pseudonym(not), "{not}");
+        }
     }
 
     #[test]

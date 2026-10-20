@@ -283,6 +283,8 @@ impl HostView {
         json!({
             "agent_id": &*self.agent_id,
             "hostname": &*self.hostname,
+            // 主機名稱為假名（privacy.hostname = "pseudonymize"；PRIVACY.md 第 3 節）
+            "pseudonymized": crate::privacy::is_host_pseudonym(&self.hostname),
             "display_name": self.display_name.as_deref(),
             "status": self.status.as_str(),
             "status_detail": {
@@ -1682,6 +1684,12 @@ pub(crate) mod tests {
         assert_eq!(s["last_report"]["memory_used_bytes"], 25 * 1024 * 1024);
         assert_eq!(s["tags"][0], "env:prod");
         assert_eq!(s["os"]["name"], "Ubuntu");
+        assert_eq!(s["pseudonymized"], false);
+        // 假名化的主機名稱（privacy.hostname = "pseudonymize"）
+        let mut p = d.clone();
+        p.hostname = "host-k3m7x2q7v4ab".into();
+        let v = view_of(Some(&p), None, None, &long).unwrap();
+        assert_eq!(v.summary(now_ms)["pseudonymized"], true);
         // 這次啟動後離線：帶原因
         let l = live(&id(1), false, now - chrono::Duration::seconds(90));
         let v = view_of(Some(&d), Some(&l), None, &short).unwrap();

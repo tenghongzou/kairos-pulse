@@ -2,6 +2,7 @@
 //
 // - S05「更多」：唯讀、維運者看不到；管理員匯出個資（下載 JSON）、刪除主機資料（仍連線中時說明並停止；
 //   離線後 L2：輸入主機名稱才能按，axe 0 違規）→ 回到主機清單、主機已不存在。
+// - S05 假名化的主機（主機 API 的 pseudonymized）：頁首的說明；一般主機名稱沒有。
 // - S12（第二個 Kairos，pki-env.sh）：設定了 enroll.download_dir 且檔案齊全時，建立 token 後顯示一行安裝指令。
 // - S14（第二個 Kairos）：匯入手動簽發的憑證（根 CA 直接簽發，pki-env.sh 的 manual.pem）→ 清單出現這台主機。
 
@@ -88,6 +89,29 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
       await ctx.close();
     } finally {
       online.close();
+    }
+  });
+
+  test('S05 假名化的主機：依主機 API 的 pseudonymized 顯示說明', async () => {
+    const PSEUDO_ID = '11111111-1111-4111-8111-0000000000ab';
+    const PSEUDO = 'host-k3m7x2q7v4ab';
+    const ag = await connectAgent(PSEUDO_ID, PSEUDO);
+    try {
+      const { ctx, page } = await newPage();
+      await login(page, 'viewer', PW, `/hosts/${PSEUDO_ID}`);
+      await waitTitle(page, PSEUDO);
+      const api = (id) => page.evaluate(async (x) => (await (await fetch(`/api/v1/hosts/${x}`)).json()).data, id);
+      assert.equal((await api(PSEUDO_ID)).pseudonymized, true);
+      await page.getByText('主機名稱已假名化（無法還原）', { exact: false }).waitFor();
+      await axe(page, 'S05 假名化的主機');
+      // 一般的主機名稱：沒有說明
+      await page.goto(`${URL0}/hosts/${ONLINE_ID}`);
+      await waitTitle(page, 'privacy-online');
+      assert.equal((await api(ONLINE_ID)).pseudonymized, false);
+      assert.equal(await page.getByText('主機名稱已假名化', { exact: false }).count(), 0);
+      await ctx.close();
+    } finally {
+      ag.close();
     }
   });
 
