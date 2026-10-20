@@ -2,7 +2,7 @@
 //!
 //! 規則：在 `[table]` 區段內找到 `key = …` 的行就整行取代；區段內沒有這個鍵時加在區段的最後一個
 //! 非空白行之後；沒有這個區段時附加在檔案結尾。寫入前把原檔備份為 `pulse.toml.bak-<時間>`，
-//! 以暫存檔＋rename 原子取代（權限沿用原檔）。不支援 inline table 與多行字串中的同名鍵（Pulse 的設定沒有）。
+//! 以暫存檔＋rename 原子取代（擁有者與權限沿用原檔，備份也相同）。不支援 inline table 與多行字串中的同名鍵（Pulse 的設定沒有）。
 
 use std::path::{Path, PathBuf};
 
@@ -112,6 +112,9 @@ pub fn apply(path: &Path, changes: &[(&str, &str, Value)]) -> std::io::Result<Op
     if original.as_deref() == Some(text.as_str()) {
         return Ok(None);
     }
+    // 暫存檔與備份的擁有者與權限都與原檔相同：套件安裝的 pulse.toml 是 root:pulse 640，root 執行
+    // pulse enroll 時新建的檔案預設為 root:root，只沿用權限的話服務帳號就讀不到設定。先以 0600 建立再設定
+    let meta = std::fs::metadata(path).ok();
     let backup = match &original {
         Some(o) => {
             let name = format!(
@@ -121,7 +124,7 @@ pub fn apply(path: &Path, changes: &[(&str, &str, Value)]) -> std::io::Result<Op
                 chrono::Local::now().format("%Y%m%d-%H%M%S")
             );
             let b = path.with_file_name(name);
-            std::fs::write(&b, o)?;
+            write_like(&b, o.as_bytes(), meta.as_ref())?;
             Some(b)
         }
         None => None,
@@ -131,15 +134,46 @@ pub fn apply(path: &Path, changes: &[(&str, &str, Value)]) -> std::io::Result<Op
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let tmp = dir.join(format!(".pulse.toml.{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, text.as_bytes())?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) =
+        write_like(&tmp, text.as_bytes(), meta.as_ref()).and_then(|()| std::fs::rename(&tmp, path))
+    {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(backup)
+}
+
+/// 寫入檔案（已存在時取代內容）；`like` 為 `Some` 時擁有者與權限設成與它相同（Unix 上先以 0600 建立），
+/// `None` 時為新檔案的預設權限
+fn write_like(
+    path: &Path,
+    content: &[u8],
+    like: Option<&std::fs::Metadata>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if like.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path)?;
+    f.write_all(content)?;
+    f.sync_all()?;
+    drop(f);
+    if let Some(m) = like {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let cur = std::fs::metadata(path)?;
+            if (cur.uid(), cur.gid()) != (m.uid(), m.gid()) {
+                std::os::unix::fs::chown(path, Some(m.uid()), Some(m.gid()))?;
+            }
+        }
+        std::fs::set_permissions(path, m.permissions())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -204,6 +238,45 @@ mod tests {
             apply(&p, &[("server", "port", Value::Int(9443))]).unwrap(),
             None
         );
+    }
+
+    /// 改寫後的檔案與備份的權限、擁有者與原檔相同（套件的 pulse.toml 為 root:pulse 640；root 改寫時若只
+    /// 沿用權限、不沿用群組，服務帳號就讀不到設定）。擁有者不同的情況需要 root，由 tests/systemd 實測
+    #[cfg(unix)]
+    #[test]
+    fn apply_keeps_owner_and_mode_of_the_original() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir()
+            .join("pulse-toml-edit")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("pulse.toml");
+        std::fs::write(&p, "[server]\nport = 8443\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&p).unwrap();
+        let backup = apply(&p, &[("server", "address", Value::Str("k".into()))])
+            .unwrap()
+            .unwrap();
+        for f in [&p, &backup] {
+            let m = std::fs::metadata(f).unwrap();
+            assert_eq!(m.mode() & 0o7777, 0o640, "{}", f.display());
+            assert_eq!((m.uid(), m.gid()), (before.uid(), before.gid()));
+        }
+        // 原檔 0600 時備份也不會因 umask 變成其他人可讀
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let backup = apply(&p, &[("server", "port", Value::Int(1))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::metadata(&backup).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o7777, 0o600);
+        // 暫存檔沒有留下
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 測試用：極簡的 `[table] key = value` 讀取
