@@ -49,6 +49,13 @@ scripts:
   postinstall: "@PKGDIR@/postinstall.sh"
   preremove: "@PKGDIR@/preremove.sh"
   postremove: "@PKGDIR@/postremove.sh"
+# 遠端升級的輔助程式解開新版套件做預檢（crates/kairos-proto/REMOTE.md 第 17.2 節第 13 項）：rpm 以
+# rpm2cpio（rpm 套件內附）＋cpio，Rocky／RHEL 9 的最小安裝沒有 cpio（tests/systemd 實測）。deb 的 dpkg-deb
+# 屬於 dpkg，不需另外宣告
+overrides:
+  rpm:
+    depends:
+      - cpio
 deb:
   compression: gzip
 rpm:
