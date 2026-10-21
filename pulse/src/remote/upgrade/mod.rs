@@ -16,7 +16,7 @@
 
 pub mod files;
 pub mod helper;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub mod testsign;
 
 use std::path::{Path, PathBuf};

@@ -364,6 +364,7 @@ mod tests {
         std::fs::write(p, content).unwrap();
     }
 
+    #[cfg(unix)]
     const SIGNERS: &str =
         include_str!("../../../crates/kairos-proto/testdata/release/allowed_signers");
 

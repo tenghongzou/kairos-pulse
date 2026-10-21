@@ -121,6 +121,8 @@ fn open_exclusive(path: &Path, mode: u32) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(mode).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let f = o.open(path)?;
     #[cfg(unix)]
     {

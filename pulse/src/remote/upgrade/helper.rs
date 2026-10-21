@@ -45,11 +45,12 @@ use crate::config_manager::AppConfig;
 /// 輔助程式的工作目錄（root 專用）
 pub const WORK_ROOT: &str = "/var/lib/pulse-upgrade";
 /// 預設的 `request.json`（`pulse-upgrade.path` 的 `PathExists=`、`pulse-upgrade.service` 的 `--request`）
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub const DEFAULT_REQUEST: &str = "/var/lib/pulse/upgrade/request.json";
 /// tar 安裝的 systemd unit
 pub const UNIT_PATH: &str = "/etc/systemd/system/pulse.service";
 /// 服務帳號
+#[cfg_attr(not(unix), allow(dead_code))]
 pub const SERVICE_USER: &str = "pulse";
 /// 符合健康條件後還要穩定多久
 pub const STABLE_FOR: Duration = Duration::from_secs(60);

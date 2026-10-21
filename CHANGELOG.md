@@ -164,6 +164,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 其他變更
 
+- **安全性**：`rustls-webpki` 升級到 0.103.16（RUSTSEC-2026-0382：可能接受含已外洩 emSign 中繼憑證的憑證路徑），Kairos 與 Pulse 都受影響。
 - `kairos db backup --include-keys` 一併加密備份 `data/privacy.key`。
 - 主控台 API 的 `downloads` 另有 `base_url`、`install_script`、`files`、`product_code`；模式的 `stats` 另有 `downloads_in_progress`。
 - 註冊服務每小時另外刪除「清冊中已沒有的主機」過期超過 1 天的憑證紀錄。
