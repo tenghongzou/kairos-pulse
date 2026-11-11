@@ -95,14 +95,19 @@ fn example_offer(seq: u64) -> serde_json::Value {
     v
 }
 
+/// 等流程完成的上限。流程中有寫檔與 fsync（快取、暫存、狀態檔），慢的機器上（CI 的 Windows runner）
+/// 固定 1.5～3 秒的視窗會在流程完成前結束；改為等到 `done` 成立，這個上限只防止卡住
+const FLOW_LIMIT: Duration = Duration::from_secs(30);
+
 /// Kairos 端的回應規則：hello_ack 帶 `features` 與 `pending`，之後依訊息類型回應（config 依 `config`），
-/// 收集 `window` 內收到的訊息
+/// 收集收到的訊息：最長 `window`；`done` 成立後再收 [`SETTLE`]（多送的訊息仍會被收到）就結束
 async fn fake_kairos(
     server: DuplexStream,
     features: &'static [&'static str],
     pending: serde_json::Value,
     config: serde_json::Value,
     window: Duration,
+    done: fn(&[serde_json::Value]) -> bool,
 ) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut f = server_side(server);
     let line = f.next().await.unwrap().unwrap();
@@ -114,7 +119,8 @@ async fn fake_kairos(
     }
     f.send(ack.to_string()).await.unwrap();
     let mut got = Vec::new();
-    let deadline = Instant::now() + window;
+    let mut deadline = Instant::now() + window;
+    let mut settled = false;
     while let Ok(Some(Ok(line))) = time::timeout_at(deadline, f.next()).await {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         // Kairos 端的驗證（協商了 config／upgrade 時的新訊息）
@@ -167,8 +173,24 @@ async fn fake_kairos(
             break;
         }
         got.push(v);
+        if !settled && done(&got) {
+            settled = true;
+            deadline = deadline.min(Instant::now() + SETTLE);
+        }
     }
     (hello, got)
+}
+
+/// 已回報 `upgrade_status` 的 `staged`
+fn staged(got: &[serde_json::Value]) -> bool {
+    got.iter()
+        .any(|v| v["type"] == "upgrade_status" && v["state"] == "staged")
+}
+
+/// 已回報第 42 版的 `config_status`
+fn config_42(got: &[serde_json::Value]) -> bool {
+    got.iter()
+        .any(|v| v["type"] == "config_status" && v["rev"] == 42)
 }
 
 fn of<'a>(got: &'a [serde_json::Value], t: &str) -> Vec<&'a serde_json::Value> {
@@ -185,7 +207,8 @@ async fn hello_declares_config_and_upgrade_and_pending_drives_both_flows() {
         &["metrics", "config", "upgrade"],
         json!({"config_rev": 42, "upgrade_id": UPGRADE_ID}),
         json!({"log": {"level": "debug"}, "processes": {"top": 10}}),
-        Duration::from_millis(1500),
+        FLOW_LIMIT,
+        |got| config_42(got) && staged(got),
     ));
     let (tx, mut rx) = mpsc::channel::<Sample>(1);
     let (err, registered) = serve_with_reports(client, &s, &mut rx).await;
@@ -249,7 +272,8 @@ async fn reconnect_keys_end_the_session_after_the_status() {
         &["metrics", "config"],
         json!({"config_rev": 42}),
         json!({"heartbeat": {"interval": 30}}),
-        Duration::from_millis(1500),
+        FLOW_LIMIT,
+        config_42,
     ));
     let (_tx, mut rx) = mpsc::channel::<Sample>(1);
     let (err, registered) = serve_with_reports(client, &s, &mut rx).await;
@@ -278,7 +302,9 @@ async fn old_kairos_gets_install_but_no_management_messages() {
         &["metrics"],
         serde_json::Value::Null,
         json!({}),
+        // 驗證「不送」：固定的視窗
         Duration::from_millis(600),
+        |_| false,
     ));
     let (_tx, mut rx) = mpsc::channel::<Sample>(1);
     let _ = serve_with_reports(client, &s, &mut rx).await;
@@ -311,7 +337,8 @@ async fn durable_session_keeps_report_acks_and_management_replies_in_order() {
         &["metrics", "durable", "config", "upgrade"],
         json!({"config_rev": 42, "upgrade_id": UPGRADE_ID}),
         json!({"report": {"interval": 10}}),
-        Duration::from_millis(3000),
+        FLOW_LIMIT,
+        |got| of(got, "report").len() >= 3 && config_42(got) && staged(got),
     ));
     let serve = tokio::spawn({
         let s = s.clone();
@@ -319,9 +346,10 @@ async fn durable_session_keeps_report_acks_and_management_replies_in_order() {
         async move { serve_spool(client, &s, &shared).await }
     });
     let (_, got) = srv.await.unwrap();
-    serve.abort();
     // 積壓的 3 筆 report 都送達（遠端管理的回應插在中間也不會被誤當成 report 的 ack）
     assert_eq!(of(&got, "report").len(), 3, "{got:?}");
+    // Kairos 端結束後連線關閉，Pulse 端處理完已收到的 ack 才結束
+    let _ = time::timeout(FLOW_LIMIT, serve).await;
     assert!(shared.lock().is_empty());
     assert_eq!(mgmt.config.applied_rev(), 42);
     assert_eq!(mgmt.config.effective().report.interval, 10);

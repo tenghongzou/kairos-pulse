@@ -6052,11 +6052,16 @@ mod tests {
         s
     }
 
-    /// 以 `server_features` 回覆 hello_ack，對每則訊息回 ack；收集約 `window` 內收到的訊息
+    /// 條件成立後再收集的時間：流程之外多送的訊息仍會被收到
+    const SETTLE: Duration = Duration::from_millis(300);
+
+    /// 以 `server_features` 回覆 hello_ack，對每則訊息回 ack；收集收到的訊息：最長 `window`，
+    /// `expect` 的每一種訊息都收到後再收 [`SETTLE`] 就結束（固定的短視窗在慢的機器上會在 report 送達前結束）
     async fn f4_exchange(
         s: &Settings,
         server_features: &'static [&'static str],
         window: Duration,
+        expect: &'static [&'static str],
     ) -> (serde_json::Value, Vec<serde_json::Value>) {
         if let Some(agent) = &s.inventory {
             tokio::spawn(crate::inventory::run_worker(agent.clone()));
@@ -6065,14 +6070,19 @@ mod tests {
         let srv = tokio::spawn(async move {
             let mut f = server_side(server);
             let hello = accept_hello_v2(&mut f, server_features).await;
-            let mut got = Vec::new();
-            let deadline = Instant::now() + window;
+            let mut got: Vec<serde_json::Value> = Vec::new();
+            let mut deadline = Instant::now() + window;
+            let mut settled = false;
             while let Ok(Some(Ok(line))) = time::timeout_at(deadline, f.next()).await {
                 let v: serde_json::Value = serde_json::from_str(&line).unwrap();
                 f.send(format!(r#"{{"type":"ack","seq":{}}}"#, v["seq"]))
                     .await
                     .unwrap();
                 got.push(v);
+                if !settled && expect.iter().all(|t| got.iter().any(|v| v["type"] == *t)) {
+                    settled = true;
+                    deadline = deadline.min(Instant::now() + SETTLE);
+                }
             }
             (hello, got)
         });
@@ -6092,10 +6102,13 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_and_processes_are_sent_only_when_both_sides_declare_them() {
-        let window = Duration::from_millis(800);
+        let window = Duration::from_secs(30);
+        const BOTH: &[&str] = &["inventory", "report"];
+        const REPORT: &[&str] = &["report"];
         // 0.8.0 × 0.8.0（SQLite）：全部功能
         let s = f4_settings(true, true);
-        let (hello, got) = f4_exchange(&s, &["metrics", "inventory", "processes"], window).await;
+        let (hello, got) =
+            f4_exchange(&s, &["metrics", "inventory", "processes"], window, BOTH).await;
         assert_eq!(
             hello["features"],
             serde_json::json!(["metrics", "inventory", "processes", "cluster"])
@@ -6112,7 +6125,7 @@ mod tests {
         assert_eq!(reports[0]["processes"]["top_cpu"][0]["name"], "postgres");
 
         // 舊版 Kairos（0.2.0～0.7.0，不宣告）：新指標照送，processes 與 inventory 不送
-        let (_, got) = f4_exchange(&s, &["metrics"], window).await;
+        let (_, got) = f4_exchange(&s, &["metrics"], window, REPORT).await;
         assert!(of_type(&got, "inventory").is_empty(), "{got:?}");
         let reports = of_type(&got, "report");
         assert!(reports[0].get("processes").is_none(), "{got:?}");
@@ -6125,16 +6138,17 @@ mod tests {
         );
 
         // 只宣告其中一個
-        let (_, got) = f4_exchange(&s, &["metrics", "processes"], window).await;
+        let (_, got) = f4_exchange(&s, &["metrics", "processes"], window, REPORT).await;
         assert!(of_type(&got, "inventory").is_empty());
         assert!(of_type(&got, "report")[0].get("processes").is_some());
-        let (_, got) = f4_exchange(&s, &["metrics", "inventory"], window).await;
+        let (_, got) = f4_exchange(&s, &["metrics", "inventory"], window, BOTH).await;
         assert_eq!(of_type(&got, "inventory").len(), 1);
         assert!(of_type(&got, "report")[0].get("processes").is_none());
 
         // Pulse 端關閉（processes.enabled／inventory.enabled = false）：不宣告、也不送
         let s = f4_settings(false, false);
-        let (hello, got) = f4_exchange(&s, &["metrics", "inventory", "processes"], window).await;
+        let (hello, got) =
+            f4_exchange(&s, &["metrics", "inventory", "processes"], window, REPORT).await;
         assert_eq!(hello["features"], serde_json::json!(["metrics", "cluster"]));
         assert!(of_type(&got, "inventory").is_empty());
         assert!(of_type(&got, "report")[0].get("processes").is_none());
@@ -6153,7 +6167,8 @@ mod tests {
             let mut f = server_side(server);
             accept_hello_v2(&mut f, &["metrics", "durable", "inventory", "processes"]).await;
             let mut got = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(4);
+            // 收到第 3 筆 report 與 inventory 就結束；期限只防止卡住
+            let deadline = Instant::now() + Duration::from_secs(30);
             while let Ok(Some(Ok(line))) = time::timeout_at(deadline, f.next()).await {
                 let v: serde_json::Value = serde_json::from_str(&line).unwrap();
                 f.send(format!(r#"{{"type":"ack","seq":{}}}"#, v["seq"]))
