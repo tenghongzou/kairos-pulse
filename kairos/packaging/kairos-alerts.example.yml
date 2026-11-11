@@ -208,3 +208,35 @@ groups:
         annotations:
           summary: "日誌外送到 syslog 失敗，訊息被丟棄（{{ $labels.instance }}）"
           description: "日誌檔不受影響；確認 log.syslog.target 的接收端。"
+
+      # ---- 叢集模式（cluster.enabled = true；kairos/HA.md 第 14.4 節）----
+      # 每個節點（含備援）都要被 Prometheus 抓取：備援節點只在 observability.listen 上提供 /metrics。
+      # 單機部署時 kairos_cluster_enabled 為 0，下面三條規則不會觸發。
+      - alert: KairosClusterNoLeader
+        expr: sum(kairos_cluster_role{role="leader"}) == 0 and max(kairos_cluster_enabled) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          code: KRS-E8503
+          summary: "Kairos 叢集沒有任何節點持有 leader 租約"
+          description: "沒有主動節點：agent 無法連線，告警、彙總、保留與 CRL 暫停。以 kairos cluster status 與各節點的 /readyz 確認資料庫連線與金鑰狀態。"
+
+      - alert: KairosClusterNodeLost
+        expr: kairos_cluster_nodes{state="lost"} > 0 and kairos_cluster_enabled == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W8506
+          summary: "Kairos 叢集有 {{ $value }} 個節點失聯（{{ $labels.instance }} 回報）"
+          description: "失聯的節點無法接手；節點已確定移除時以 kairos cluster forget <node_id> 刪除紀錄。"
+
+      - alert: KairosClusterLeaseRenewalErrors
+        expr: increase(kairos_cluster_lease_renewals_total{result="error"}[5m]) > 3 and kairos_cluster_enabled == 1
+        labels:
+          severity: warning
+        annotations:
+          code: KRS-W8502
+          summary: "Kairos 節點 {{ $labels.instance }} 續約 leader 租約時反覆發生資料庫錯誤"
+          description: "持續超過 cluster.lease_ttl_secs − 5 秒時主動節點會以結束代碼 75 結束。檢查與 PostgreSQL 的連線；資料庫切換較慢時調高 cluster.lease_ttl_secs。"

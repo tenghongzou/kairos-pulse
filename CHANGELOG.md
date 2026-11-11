@@ -49,7 +49,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-> 以下是 **0.10.0 的草稿**（版本號尚未更新，整合時統一調整）。0.10.0 的範圍是 HA 的 L1b（PostgreSQL 後端）與 L2（叢集協調，階段 A）；這裡只有 L1b（分支 `sprint10/pg-backend`）。
+> 以下是 **0.10.0 的草稿**（版本號尚未更新，整合時統一調整）。0.10.0 的範圍是 HA 的 L1b（PostgreSQL 後端，分支 `sprint10/pg-backend`）與 L2（叢集協調，階段 A：主動／備援，分支 `sprint10/cluster`）。**叢集模式是 HA 預覽**：資料庫切換、網路分割等故障情境還沒有全部實測（`kairos/HA.md` 第 17.1 節）。
 
 ### Kairos：PostgreSQL 儲存後端（HA L1b；`kairos/HA.md` 第 4、5、7、12 節、`kairos/STORAGE.md` 第 19 節）
 
@@ -62,13 +62,30 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **可觀測性**：`/readyz` 的 `database` 檢查連線池、主庫與 schema；`/metrics` 新增 `kairos_db_pool_connections{state}`、`kairos_db_pool_size`、`kairos_db_pool_errors_total{kind}`、`kairos_db_transaction_retries_total{reason}`、`kairos_db_clock_skew_seconds`、`kairos_db_synchronous_replication`；系統健康的 `database` 項目新增 `values.backend` 與 `values.postgres`（SQLite 時 `backend` 為 `sqlite`、`postgres` 為 `null`）。
 - **容量上限**（`storage.max_total_bytes`）在 PostgreSQL 上以資料表與索引的大小計算，刪除改為估計制（PostgreSQL 刪除後檔案不會變小；STORAGE.md 第 19.5 節）。
 - **不支援的命令**：`kairos db backup`（改用 `pg_dump` 等工具，或 `kairos db migrate --to sqlite:<檔案>`）與 `kairos reports import`（先匯入 SQLite 再搬移）在 PostgreSQL 後端以 `KRS-E4406`〔暫定〕拒絕。
-- **限制**：這一版沒有叢集協調，**同一個資料庫與 schema 同時只能有一個 Kairos 使用**；HA.md 第 5.5 節的叢集資料表尚未建立。與 HA.md 規格不同之處列在 HA.md 第 5.7 節。
+- **限制**：沒有啟用叢集模式（下一節）時，**同一個資料庫與 schema 同時只能有一個 Kairos 使用**——第二個 Kairos 會拒絕啟動（`KRS-E4402`）。與 HA.md 規格不同之處列在 HA.md 第 5.7 節。
 - **效能**（kp-build 上的小規模對照，STORAGE.md 第 19.8 節）：穩定狀態每秒 8,000 筆的 p99 約 85 ms（SQLite 約 12 ms）；1 萬台全新的主機同時出現時前 15 秒左右的寫入會超過 5 秒（回 `storage_unavailable`，Pulse 重送），每秒 8,000 筆的補送尖峰在該環境撐不住。HA.md 第 7.6 節的目標尚未在正式環境驗證。
 - 安裝與搬移步驟：`kairos/packaging/INSTALL.md` 附錄 D。
 
+### Kairos：叢集模式（高可用，階段 A：主動／備援；HA L2；`kairos/HA.md` 第 3.2、6、11、13～17 節）〔HA 預覽〕
+
+- **`[cluster] enabled = true`**（需要 `storage.backend = "postgres"`）：兩個以上的 Kairos 共用一個 PostgreSQL，以資料庫中的租約（`cluster_leases`）選出唯一的**主動節點（leader）**。只有它監聽 agent（8443）、註冊（8444）與主控台（9443）並執行所有背景工作；其餘是**備援節點**：連著資料庫、寫心跳、每 2 秒嘗試取得租約，只監聽 `observability.listen`（`/healthz` 200、`/readyz` 503）。不需要 etcd 等額外元件；租約的時間一律用資料庫的時鐘。
+- **容錯移轉**：主動節點失效後，租約在 `cluster.lease_ttl_secs`（預設 15 秒）到期，備援在 2 秒內取得租約，依單機的啟動流程載入狀態並開始監聽；Pulse 經虛擬 IP、L4 負載平衡器或 `server.fallback_addresses` 重連，停機期間的取樣由本機緩衝補送（不遺失、不重複）。在 kp-build 上的端對端測試（兩個 Kairos＋Pulse＋PostgreSQL，SIGKILL 主動節點）連跑 8 次（PostgreSQL 14 與 17）：備援在 12.4～12.5 秒取得租約、12.8～12.9 秒開始監聽，Pulse 在 13～15 秒重新註冊；`step-down` 後約 2.3 秒換手；凍結超過租約時間的舊主動節點恢復後 0.02 秒內結束。正常關機與 `kairos cluster step-down` 會交還租約，接手不必等租約到期。
+- **不會有兩個節點同時寫入（fencing）**：主動節點的每個可寫交易與自動提交的寫入敘述都先以 `FOR SHARE` 確認租約仍是自己的；舊的主動節點（暫停後恢復、與資料庫的網路中斷後恢復）的寫入會失敗，而接手的節點要等舊節點進行中的交易結束才取得租約。**失去租約的節點立即以結束代碼 75 結束**（`KRS-W8502`：續約回報租約已不屬於自己、超過 `lease_ttl_secs − 5` 秒沒有續約成功、或任何寫入的 fencing 檢查失敗），由 systemd 的 `Restart=on-failure` 重新啟動為備援。
+- **金鑰**：叢集模式下**不再自動建立金鑰檔**（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`）。`kairos cluster init` 在第一個節點建立金鑰與 `cluster_id`，並把金鑰指紋寫入資料庫；其他節點以 `kairos cluster keys export`／`import`（密碼加密，格式 `kairos.keys-backup/v2`，含簽發 CA 私鑰）取得同一組金鑰。金鑰缺少或不符的節點記 `KRS-E8504`、`/readyz` 回 503（`keys: mismatch`）、不參與 leader 選舉；修正後不需要重新啟動。
+- **`kairos cluster`**（新）：`status [--json]`（節點、leader、金鑰與設定的一致性；`kairos.cluster.status/v1`）、`init`、`keys export|import`、`drain <node_id>`、`step-down`、`forget <node_id>`。
+- **啟動保護**：沒有啟用叢集模式的 Kairos 連到已有另一個 Kairos（單機或叢集的節點）在使用的 schema 時拒絕啟動（`KRS-E4402`，結束代碼 3）；叢集的節點同樣不能加入正被單機模式使用的 schema。
+- **可觀測性**：`/readyz` 的 `checks` 新增 `cluster`（`leader`／`standby`／`draining`／`lost`；單機為 `disabled`）、`keys`、`schema`，並支援 `?scope=agent|enroll|console|leader`（keepalived 的 `track_script` 用 `scope=leader`）；`/metrics` 新增 `kairos_cluster_enabled`、`kairos_cluster_role{role}`、`kairos_cluster_lease_epoch`、`kairos_cluster_lease_renewals_total{result}`、`kairos_cluster_leader_changes_total`、`kairos_cluster_nodes{state}`、`kairos_cluster_keys_ok`；系統健康新增 `cluster` 項目（沒有 leader、金鑰不一致為嚴重；節點失聯、設定不一致、沒有同步複寫、時差、只有一個節點為警告），另有 `GET /api/v1/cluster`（`settings:read`）；JSON 格式的日誌每行多一個 `node_id`。
+- **其他**：節點的設定雜湊不同時記 `KRS-W8505`（只警告）；心跳逾時的節點由 leader 標為失聯（`KRS-W8506`）；`node_id` 與另一台主機上執行中的節點重複時拒絕啟動（`KRS-E8503`）；協商了 `cluster` 的 Pulse 在 `hello_ack` 收到 `cluster_id`；主控台的 SSE 在接手後以 `resync("failover")` 重新載入；告警在換手時記「叢集的 leader 已由 A 切換到 B」（`KRS-I8501`），不開「停機」事件；`--check-config` 檢查叢集是否已建立、金鑰是否一致、`cluster.service_name` 是否在伺服器憑證的 SAN 中。
+- **schema v10**（SQLite 與 PostgreSQL）：新增叢集的資料表（`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures`）與三個欄位（`enroll_requests.issuing_node`、`issuing_at`、`alert_deliveries.claim_epoch`）；這一版只使用 `cluster_nodes` 與 `cluster_leases`，其餘先建立、保持空白。PostgreSQL 後端同時補上 schema 的升級路徑（v9 → v10，由第一個以新版啟動的節點執行）。
+- **還沒有做的**（HA.md 第 6.8 節）：階段 B（多主動連線層）、PROXY protocol v2（經 L4 負載平衡器時每 IP 限制看到的是負載平衡器的位址）、主控台的叢集畫面與排空／交還的 API、叢集相關的系統告警規則、遠端升級版本庫的跨節點同步（每個節點要各自匯入相同的發佈版本）。
+- 部署步驟：`kairos/packaging/INSTALL.md` 附錄 H。
+
 ### 相容性
 
-- 預設值（`storage.backend = "sqlite"`）下的行為、資料庫與 schema 版本（v9）都不變；沒有破壞性變更。
+- **資料庫升級到 schema v10**（SQLite 與 PostgreSQL 都是；第一次以 0.10.0 啟動時自動套用，只新增空的資料表與三個可為 NULL 的欄位）。升級後 0.9 無法開啟（降版從升級前的備份還原），與歷次 schema 升級相同。除此之外，預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`）下的行為不變。
+- `/readyz` 的 `checks` 多了 `cluster`、`keys`、`schema` 三個欄位（單機為 `disabled`、`ok`、`ok`）；`/metrics` 多了 `kairos_cluster_enabled`（單機為 0）。
+- `kairos db restore-keys` 另外接受 `kairos.keys-backup/v2`（`kairos cluster keys export` 的輸出）。
+- PostgreSQL 後端：同一個 schema 上的第二個 Kairos（沒有啟用叢集模式）現在會拒絕啟動（`KRS-E4402`）；PostgreSQL 連線加上 TCP keepalive 的探測間隔（10 秒 × 3 次）與 `tcp_user_timeout`（30 秒）。
 - 系統健康 `GET /api/v1/system/health` 的 `database` 項目多了 `values.backend`、`values.postgres` 兩個欄位（新增欄位，既有欄位不變）。
 - `storage.jsonl_mirror` 的錯誤訊息文字改為「只在 backend = "sqlite" 或 "postgres" 時有效」。
 
@@ -77,11 +94,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - 新依賴：`postgres` 0.19、`tokio-postgres-rustls` 0.14（MIT／Apache-2.0；`deny.toml` 的授權允許清單不需變更，加密後端仍只有 ring）。`tokio` 升級到 1.53.3（RUSTSEC-2026-0386）、`rusqlite` 升級到 0.41（內附 SQLite 3.54，RUSTSEC-2026-0459）。
 - 量測 `sqlite_throughput` 改名為 `store_throughput`，以 `KP_BENCH_BACKEND=postgres` 量測 PostgreSQL 後端。
 - 儲存層的測試改為同一個測試本體在 SQLite 與 PostgreSQL 各跑一次（`KAIROS_TEST_PG_URL` 指定資料庫；沒有設定時明確略過，`KAIROS_TEST_PG_REQUIRED=1` 時不可略過）；CI 的 Linux job 以 PostgreSQL 14 執行整套測試，另有 `postgres-compat` job 以 PostgreSQL 17 執行儲存層與 PostgreSQL 的端對端測試。Windows job 不執行 PostgreSQL 的測試。
+- 叢集的測試：租約在假時鐘下的取得、續約、到期與交還（兩個後端）、fencing 擋下舊 leader 的每一種寫入、接手等待舊 leader 進行中的交易、多個節點同時搶租約只有一個成功、協調執行緒的接手與自我降級、schema v9 → v10 的升級（`kairos/src/cluster/`、`store/backend_tests/cluster.rs`）；端對端測試 `tests/e2e/tests/cluster.rs`：兩個實際的 Kairos＋Pulse＋PostgreSQL 的容錯移轉（SIGKILL 主動節點、`step-down`）後 durable 的資料不缺號、不重複，以及啟動保護。CI 的 `postgres-compat` job 另以 PostgreSQL 17 執行。
 - 端對端測試 `tests/e2e/tests/postgres.rs`：實際的 Kairos＋Pulse 跑在 PostgreSQL 後端上（補送不重複不缺號、重新啟動後載回主機、稽核鏈驗證、`db migrate` 搬回 SQLite 後內容相同）。
 
 ### 新的產品代碼
 
-`kairos/HA.md` 第 19 節已由設計包正式分配、這一版開始使用的代碼：`KRS-E4401`（無法連線到 PostgreSQL）、`KRS-E4402`（PostgreSQL 不符合要求）、`KRS-W4403`（沒有同步複寫）、`KRS-E4404`（資料搬移失敗或驗證不一致）、`KRS-E4405`（schema 比這個 Kairos 新）、`KRS-W8305`（時差超過 2 秒）。
+`kairos/HA.md` 第 19 節已由設計包正式分配、這一版開始使用的代碼：`KRS-E4401`（無法連線到 PostgreSQL）、`KRS-E4402`（PostgreSQL 不符合要求；也用於「schema 已有另一個 Kairos 在使用」）、`KRS-W4403`（沒有同步複寫）、`KRS-E4404`（資料搬移失敗或驗證不一致）、`KRS-E4405`（schema 比這個 Kairos 新）、`KRS-W8305`（時差超過 2 秒），以及叢集的 `KRS-I8501`（取得 leader 租約）、`KRS-W8502`（失去 leader 租約，結束代碼 75）、`KRS-E8503`（沒有 leader，或 `node_id` 重複）、`KRS-E8504`（金鑰與叢集不一致或缺少）、`KRS-W8505`（節點的設定不一致）、`KRS-W8506`（節點失聯）；`KRS-I8507`（排空）另用於 `kairos cluster drain`。叢集協調沒有新增暫定代碼；`KRS-W2206`（PROXY protocol）尚未使用。
 
 | 代碼 | 意義 | 狀態 |
 |---|---|---|

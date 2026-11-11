@@ -29,7 +29,7 @@
 - 使用 rustls（`ring` 加密後端），支援 TLS 1.2 與 TLS 1.3；私鑰支援 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
-- 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試
+- 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試。叢集模式（0.10.0〔草稿〕）另有 **75**：主動節點失去 leader 租約（`KRS-W8502`），由 `Restart=on-failure` 重新啟動為備援節點
 - 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除；時間為 RFC 3339 帶時區，可改為 JSON（`log.format = "json"`）並外送到 syslog（RFC 5424）（0.6）
 - 指標轉出（審計 F7；0.9.0〔草稿〕，[EXPORT.md](EXPORT.md)）：所有主機的最新指標以 Prometheus text／OpenMetrics 提供（`GET /api/v1/export/prometheus`，唯讀角色的 API token、依主機群組篩選），或以 OTLP/HTTP（protobuf）推送到 OpenTelemetry collector（批次、重試、有上限的佇列、OpenTelemetry semantic conventions 的名稱與 `host.*` 屬性）；附 Grafana 儀表板（`packaging/grafana-kairos-hosts.json`）。主控台「系統設定 → 整合」可修改與查看狀態；沒有新增依賴
 - `/healthz`、`/readyz`（負載平衡器的探針）與 `/metrics`（Prometheus）；`kairos --check-config` 檢查設定、`kairos diag` 產生遮蔽敏感資料的支援診斷包（0.6）
@@ -470,7 +470,14 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `privacy.process_user` | `KAIROS__PRIVACY__PROCESS_USER` | `keep` | 行程的執行身分：`keep`、`pseudonymize`、`drop` |
 | `privacy.inventory_network` | `KAIROS__PRIVACY__INVENTORY_NETWORK` | `keep` | 資產的網路介面：`keep`、`truncate`（位址截到 /24、/48，MAC 只留廠商碼）、`drop` |
 | `enroll.download_dir` | `KAIROS__ENROLL__DOWNLOAD_DIR` | `""` | （0.9.0〔草稿〕）8444 的下載端點 `/agent/<檔名>` 提供的目錄（Pulse 的 `pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig`）；空字串＝不提供（ENROLL.md 第 19.4 節第 3 項） |
-| `cluster.node_id` | `KAIROS__CLUSTER__NODE_ID` | `""`（主機名稱的第一段，轉成小寫，其他字元改為 `-`） | 節點名稱（0.9.0）：協商了 feature `cluster` 的 Pulse 在 `hello_ack.server_node` 收到它，`pulse status` 顯示連到哪個節點。1～63 個字元的 `[a-z0-9-]`，不以 `-` 開頭或結尾，不合法時拒絕啟動。叢集模式（`kairos/HA.md`）的其他設定在之後的版本才提供 |
+| `cluster.node_id` | `KAIROS__CLUSTER__NODE_ID` | `""`（主機名稱的第一段，轉成小寫，其他字元改為 `-`） | 節點名稱（0.9.0）：協商了 feature `cluster` 的 Pulse 在 `hello_ack.server_node` 收到它，`pulse status` 顯示連到哪個節點。1～63 個字元的 `[a-z0-9-]`，不以 `-` 開頭或結尾，不合法時拒絕啟動。叢集模式下是節點在叢集中的名稱，必須唯一（兩台主機重複時後啟動的拒絕啟動，`KRS-E8503`） |
+| `cluster.enabled` | `KAIROS__CLUSTER__ENABLED` | `false` | （0.10.0〔草稿〕）叢集模式（高可用，階段 A：主動／備援；見「叢集模式」與 INSTALL 附錄 H）。需要 `storage.backend = "postgres"`，且不可同時設定 `storage.jsonl_mirror = true`（否則 `KRS-E0202`，結束代碼 3）。啟用後不自動建立金鑰檔：先在第一個節點執行 `kairos cluster init` |
+| `cluster.mode` | `KAIROS__CLUSTER__MODE` | `active_passive` | `active_passive`（主動／備援）。`active_active`（多主動連線層）尚未實作，`enabled = true` 時拒絕啟動 |
+| `cluster.service_name` | `KAIROS__CLUSTER__SERVICE_NAME` | `""` | 選用：服務名稱（例 `kairos.example.com`，Pulse 的 `server.domain`）；`kairos --check-config` 檢查伺服器憑證的 SAN 含這個名稱（不含時警告） |
+| `cluster.advertise` | `KAIROS__CLUSTER__ADVERTISE` | `""` | 選用：顯示用的位址（`kairos cluster status`、系統健康、`GET /api/v1/cluster`），最多 255 個字元；不影響監聽 |
+| `cluster.lease_ttl_secs` | `KAIROS__CLUSTER__LEASE_TTL_SECS` | `15` | leader 租約的存活時間（秒），5～120。主動節點失效後，備援最慢在這個時間加 2 秒取得租約；主動節點超過「這個時間 − 5 秒」沒有續約成功就以結束代碼 75 結束（`KRS-W8502`）。應大於資料庫自動切換所需的時間 |
+| `cluster.heartbeat_secs` | `KAIROS__CLUSTER__HEARTBEAT_SECS` | `5` | 節點心跳的間隔（秒），1～30 |
+| `cluster.node_lost_secs` | `KAIROS__CLUSTER__NODE_LOST_SECS` | `20` | 心跳超過這個時間的節點視為失聯（`KRS-W8506`）；至少是 `heartbeat_secs` 的 3 倍，最多 3600 |
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
@@ -585,6 +592,27 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 - **Grafana**：Prometheus 資料來源＋匯入 [`packaging/grafana-kairos-hosts.json`](packaging/grafana-kairos-hosts.json)。
 - 主控台可修改的鍵（啟用、過期門檻、行程排行、OTLP 的啟用／端點／間隔／名稱／標頭）存在資料庫、優先於 `kairos.toml`；環境變數最優先且主控台不能修改。只有管理員（新權限 `export:write`）能修改。
 
+## 叢集模式（高可用；0.10.0〔草稿〕）
+
+階段 A（主動／備援）：兩個以上的 Kairos 共用一個 PostgreSQL（`storage.backend = "postgres"`），以資料庫中的 leader 租約選出唯一的**主動節點**；它監聽 agent、註冊與主控台的連接埠並執行所有背景工作，其餘**備援節點**只連著資料庫、只監聽 `observability.listen`。主動節點失效時租約在 `cluster.lease_ttl_secs`（預設 15 秒）後到期，備援在 2 秒內取得並開始服務；失去租約的主動節點以結束代碼 75 結束，由 systemd 重新啟動為備援。規格見 [`HA.md`](HA.md)，部署步驟（含 keepalived、HAProxy、Pulse 的 `server.fallback_addresses`）見 [`packaging/INSTALL.md`](packaging/INSTALL.md) 附錄 H，資料表見 STORAGE.md 第 20 節。
+
+```bash
+kairos cluster status [--json]                  # 節點、leader 租約與金鑰狀態（0 正常、9 沒有 leader 或金鑰不一致）
+kairos cluster init                             # 第一個節點：建立金鑰與 cluster_id，把金鑰指紋寫入資料庫
+kairos cluster keys export <檔案> --password-stdin    # 在已有金鑰的節點匯出（以密碼加密；或 --password-file <檔案>）
+kairos cluster keys import <檔案> --password-stdin    # 在新節點匯入（--overwrite 取代不同的既有金鑰）
+kairos cluster drain <node_id>                  # 節點不再參與選舉；它是 leader 時正常關機並交還租約
+kairos cluster step-down                        # 讓 leader 的租約立即到期，其他節點在約 2 秒內接手
+kairos cluster forget <node_id>                 # 刪除已停止（或失聯）節點的紀錄
+```
+
+- 這些命令直接讀寫資料庫，不需要 Kairos 在本機執行，在任何一個節點執行都可以；都接受 `--config <path>`。結束代碼：0 完成、1 資料庫或檔案錯誤、2 用法錯誤、3 設定錯誤（沒有啟用叢集模式、不是 PostgreSQL）、9 `status` 有嚴重問題或匯入後金鑰仍不一致、10 權限不足、11 輸出檔已存在、金鑰衝突或節點仍在執行。
+- **叢集模式下不自動建立金鑰檔**（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`）。金鑰缺少或與叢集記錄的不同的節點不參與選舉（`/readyz` 的 `keys: mismatch`、`KRS-E8504`），行程不結束，匯入後自動繼續。
+- **啟動保護**：沒有啟用叢集模式的 Kairos 連到已有另一個 Kairos（單機或叢集節點）在使用的 PostgreSQL schema 時拒絕啟動（`KRS-E4402`，結束代碼 3），反之亦然。
+- 連不上 PostgreSQL 時，單機模式在啟動時以結束代碼 3 結束；叢集模式的節點不結束、持續重試。
+- 狀態：`kairos cluster status`、系統健康的 `cluster` 項目、`GET /api/v1/cluster`（API.md 第 5.11 節）、`/readyz` 與 `kairos_cluster_*` 指標（下一節）。JSON 格式的日誌（`log.format = "json"`）在叢集模式多一個 `node_id` 欄位。
+- **這一版沒有**：多主動（階段 B）、PROXY protocol v2（經 L4 負載平衡器時來源位址是負載平衡器的位址）、主控台的叢集畫面、`POST` 的排空／交還 API、叢集專用的系統告警規則、遠端升級版本庫的跨節點同步（每個節點要各自匯入相同的發佈版本）。
+
 ## 健康檢查與 Prometheus（0.6.0）
 
 審計 O3；設計包 `kairos/screens.md` S20、§24 #8。三個端點在主控台的監聽上提供（`console.listen`，HTTPS，預設 `127.0.0.1:9443`），也可以另外以純 HTTP 監聽（`observability.listen`，例如 `127.0.0.1:9464`；這個監聽只有這三個端點，在自己的執行緒上執行，與 agent 連線、report 的寫入分開）。
@@ -592,16 +620,35 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 | 端點 | 認證 | 回應 |
 |---|---|---|
 | `/healthz` | 不需要 | 存活：`200 {"status":"ok"}`；關機中 `503 {"status":"shutting_down"}` |
-| `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用 |
+| `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用。0.10.0〔草稿〕起 `checks` 另有 `cluster`、`keys`、`schema`，`scope` 另有 `agent`、`console`、`leader`（見下方「叢集模式的 `/readyz`」） |
 | `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403），且請求帶有反向代理的轉送標頭（`Forwarded`、`X-Forwarded-For`／`-Host`／`-Proto`、`X-Real-IP`、`Via`）時一律 403（0.7；第一次記 `WARN``KRS-W0304`）。**經反向代理提供 `/metrics` 時必須設定 token**：代理轉送的請求來源都是 loopback，而不加轉送標頭的代理（例如 nginx 的預設）Kairos 無法發現 | Prometheus 文字格式（0.0.4） |
 
 負載平衡器（L4 或 HTTP 探針）建議以 `/readyz` 判斷：主控台的監聽要開放給負載平衡器時，改用 `observability.listen` 綁在負載平衡器可達的位址（`/metrics` 仍只接受 loopback 或帶 token 的請求）。
+
+**叢集模式的 `/readyz`**（0.10.0〔草稿〕；`[cluster] enabled = true`，[`HA.md`](HA.md) 第 14.1 節、INSTALL 附錄 H）。`checks` 新增三項（單機時也輸出，值固定為 `disabled`／`ok`／`ok`，不影響就緒的判斷）：
+
+| 檢查 | 值 |
+|---|---|
+| `cluster` | `leader`（本節點持有 leader 租約，是主動節點）、`standby`（備援）、`draining`（被 `kairos cluster drain` 排空，不參與選舉）、`lost`（連不上資料庫，或租約狀態不明）；單機為 `disabled` |
+| `keys` | `ok`、`mismatch`（本節點的金鑰缺少或與叢集記錄的不同，或還沒有執行 `kairos cluster init`；不參與選舉，`KRS-E8504`） |
+| `schema` | `ok`、`newer`（資料庫的 schema 比這個節點新，`KRS-E4405`）、`older` |
+
+| `scope` | 200 的條件 | 用途 |
+|---|---|---|
+| （無）、`agent` | 原有的條件，加上叢集模式時本節點是 leader 且 `keys`、`schema` 都是 `ok` | 負載平衡器的 agent 連線埠後端 |
+| `enroll` | 同上，另外要求註冊端點在監聽 | 8444 的後端 |
+| `console` | 與預設相同（階段 A 只有 leader 服務主控台） | 9443 的後端 |
+| `leader` | 只問「本節點是不是 leader」（且不在關機中），不看監聽與儲存的狀態；單機時恆為 200 | keepalived 的 `track_script` |
+
+- **備援節點**不監聽 agent、註冊與主控台的連接埠，三個端點只在 `observability.listen` 上提供（沒有設定時備援節點沒有探針）：`/healthz` 200、`/readyz` **一律 503**（不論 `scope`；本文只有 `shutdown`、`agent_listener`、`cluster`、`keys`、`schema`）、`/metrics` 只有 `kairos_build_info`、`kairos_start_time_seconds`、`kairos_ready`（0）與 `kairos_cluster_*`。取得租約後同一個位址改由完整的端點服務。
+- 不認得的 `scope` 視為預設。本文同樣只有狀態字，不含節點名稱與位址。
 
 `/metrics` 的內容（標籤只用有限集合的值，不以 agent_id 或 IP 當標籤）：
 
 | 類別 | metric |
 |---|---|
 | 服務 | `kairos_build_info{version,commit}`、`kairos_start_time_seconds`、`kairos_shutting_down`、`kairos_ready` |
+| 叢集（0.10.0〔草稿〕） | `kairos_cluster_enabled`（0／1；單機為 0，以下各項只在叢集模式輸出）、`kairos_cluster_role{role}`（`leader`／`standby`／`draining`，本節點目前的角色為 1）、`kairos_cluster_lease_epoch`（目前看到的 leader epoch，每次換手加一）、`kairos_cluster_lease_renewals_total{result}`（續約或嘗試取得租約：`ok`／`lost` 租約已被其他節點取得或到期／`error` 資料庫錯誤）、`kairos_cluster_leader_changes_total`（本節點看到的換手次數）、`kairos_cluster_nodes{state}`（`alive`／`lost`；`lost` 含已失聯但還沒有 `kairos cluster forget` 的節點）、`kairos_cluster_keys_ok`（本節點的金鑰與叢集一致；0 時不參與選舉，`KRS-E8504`）。每個節點各自輸出，Prometheus 以 `instance` 區分；`kairos_agents_online` 等既有的指標只有主動節點有 |
 | 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`idle_timeout`／`agent_closed`／`server_shutdown`／`certificate_rejected`／`write_unknown`／`server_lost`〔0.9 定義，叢集模式才會產生〕，與告警 Webhook、主機 API 的 `offline_reason` 相同；0.7 起主機 API 也改用這組名稱，過渡期另帶 `offline_reason_legacy`，API.md 第 5.2 節）、`kairos_agent_superseded_total`、`kairos_agent_auth_failures_total`（KRS-W1102）、`kairos_host_events_lagged_total`。上線、離線、被取代、身分驗證失敗與淘汰由內部事件匯流排計數（與告警引擎同一個來源，不重複） |
 | 告警 | `kairos_alerts_engine_enabled`、`kairos_alerts_engine_up`、`kairos_alerts_engine_last_tick_timestamp_seconds`、`kairos_alerts_engine_tick_duration_seconds`、`kairos_alerts_engine_warmup`、`kairos_alerts_open{severity,state}`（`state`：`firing`／`acknowledged`／`recovered`）、`kairos_alerts_fired_total{severity}`、`kairos_alerts_resolved_total{severity}`、`kairos_alerts_events_lagged_total`、`kairos_alert_channels{state}`（`ok`／`failed`／`disabled`）、`kairos_alert_notification_sends_total{kind,result}`（`kind`：`email`／`webhook`；`result`：`ok`／`error`；不含測試通知）、`kairos_alert_notifications_total{kind,state}`（`sent`／`failed`／`dropped`） |
 | 被拒的連線 | `kairos_connections_rejected_total{reason}`（`per_ip` KRS-W2201／`rate`／`handshake_limit` KRS-W2204）、`kairos_accept_pauses_total`、`kairos_accept_paused_seconds_total`、`kairos_accept_paused`、`kairos_report_rate_limited_total{scope}`（`identity`：mTLS 的憑證身分；`ip`：來源 IP） |
