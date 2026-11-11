@@ -14,6 +14,7 @@
 協定的線上格式仍以 [`crates/kairos-proto/PROTOCOL.md`](../crates/kairos-proto/PROTOCOL.md) 為準；本文件第 18 節的協定增補是草稿，實作時再併入 PROTOCOL.md。儲存的現況見 [`STORAGE.md`](STORAGE.md)，PKI 見 [`PKI.md`](PKI.md)，主控台 API 見 [`API.md`](API.md)，告警見 [`ALERTS.md`](ALERTS.md)。
 
 - 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）。**L4 已實作**（`sprint8/pulse-multiaddr`，已併入整合分支）；**L1a 已實作**（`sprint9/store-abstraction`，第 5.1、5.2 節標明與原規劃的差異）；與本文件原規劃不同之處已在第 8.6、18.1～18.3 節標明「0.9.0 的實作」；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
+- **0.10.0〔草稿〕的進度**：**L1b PostgreSQL 後端已實作**（分支 `sprint10/pg-backend`；`storage.backend = "postgres"`、`[storage.postgres]`、`kairos db migrate`、`--check-config`／`/readyz`／`/metrics`／系統健康的資料庫檢查），細節見 [STORAGE.md](STORAGE.md) 第 19 節；與本文件不同之處列在第 5.7 節。**L2 叢集協調（階段 A：主動／備援）已實作**（分支 `sprint10/cluster`，標示 HA 預覽）：`[cluster] enabled`、節點心跳、leader 租約與 fencing、備援的熱待命與接手、失去租約時以結束代碼 75 結束、金鑰指紋與 `kairos cluster` 子命令、schema v10（第 5.5 節的叢集資料表）、`/readyz`／`/metrics`／系統健康的叢集狀態；實作的做法、leader 專屬工作的盤點與本文件不同之處列在**第 6.8 節**，第 17 節的故障情境中實際驗證過的與未驗證的列在**第 17.1 節**。階段 B（多主動連線層：第 6.5、6.7 節、跨節點 `superseded`、DNS SRV）與 PROXY protocol v2（第 3.4 節）**尚未實作**。
 - 商業審計 A2 的原文：「沒有 HA：Kairos 是單一行程，狀態放在記憶體，資料目錄假設只有一個寫入者。Pulse 只能設定一個伺服器位址。修正方向：讓 Kairos 只負責連線（無狀態），狀態與資料移到外部資料庫，前面放 L4 LB；Pulse 支援多個位址或 DNS SRV。6～10 人週。」
 - 設計依據（設計包，唯讀）：`decisions/INTEGRATION.md` §26～§30 的代碼分配慣例、`design-system/copywriting.md` §3（代碼格式與號段）、`kairos/screens.md` S20（系統健康）。設計包需要配合的事項列在第 22 節，**本線沒有修改 `design/`**。
 - 埠號寫法：本文件沿用文件慣例，以 8443 表示 agent 連線埠（`server.listen`）、8444 表示註冊通道（`enroll.listen`）、9443 表示主控台（`console.listen`）。注意 Kairos 程式內 `server.listen` 的預設值是 `127.0.0.1:8080`（`config.rs`），Pulse `server.port` 的預設值也是 8080。
@@ -350,6 +351,8 @@ PROXY protocol 的規則（實作線 L2）：
 
 ### 5.5 schema v9
 
+> **實作時改為 schema v10**（0.9.0 的 v9 已用於遠端管理的資料表）：下面的資料表與欄位由 L2 在 0.10.0 以 v10 新增到兩個後端（差異見第 6.8 節 #2、STORAGE.md 第 20 節）；PostgreSQL 後端同時補上從 v9 升級的路徑。本節的「v9」請讀作「v10」。
+
 v9 同時套用到 SQLite 與 PostgreSQL，兩者的資料表與欄位一致（型別依第 5.3 節對應）。單機的 SQLite 也建立這些資料表，只是叢集用的表保持空白；這樣「SQLite → PostgreSQL」的搬移是一對一的複製。
 
 ```sql
@@ -469,6 +472,35 @@ sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --con
   任何一項不一致都以 `KRS-E4404` 結束（結束代碼 1），目的端保留供檢查，不會被當成可用的資料庫：遷移完成前 `meta.schema_version` 不寫入，Kairos 會拒絕使用。
 - **時間估算**（實作線 L3 需在 kp-build 量測後補上）：以每秒 10 萬列估算，1,000 台主機、原始資料 7 天（約 1.2 億列）約 20 分鐘；`--reports-since 1d` 約 3 分鐘。
 - **輸出**：依 `cli-style.md`，每張表一行進度，最後是摘要；`--json` 的 `schema` 為 `kairos.db.migrate/v1`。
+
+### 5.7 L1b 的實作與本文件的差異（0.10.0〔草稿〕，分支 `sprint10/pg-backend`）
+
+細節見 [STORAGE.md](STORAGE.md) 第 19 節。規格已決定的事（驅動 `postgres`＋`tokio-postgres-rustls`、自行實作的連線池、最低版本 14、READ COMMITTED、第 5.3 節的方言對應、`kairos db migrate`）照規格實作；下列各項與本文件不同，原則是「規格沒寫或無法照做時採最保守的做法」：
+
+| # | 本文件 | 實作 | 理由 |
+|---|---|---|---|
+| 1 | 第 5.5 節：v9 含叢集資料表（`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures`）與 `enroll_requests.issuing_node`／`issuing_at`、`alert_deliveries.claim_epoch` | **沒有建立**。PostgreSQL 的 schema 與 0.9.0 實際發佈的 SQLite v9（遠端管理的資料表）一對一 | 0.9.0 的 v9 已用於 F8；叢集資料表要以下一個 schema 版本在兩個後端同時新增，由 L2 決定欄位的最終形狀。`kairos db migrate` 依 `schema::TABLES` 逐表複製，新增資料表時加進清單即可 |
+| 2 | 第 5.4 節：D2～D8 逐項改寫成條件式 UPDATE、`ON CONFLICT … RETURNING` 或列鎖；鎖的順序 | `TxMode::Immediate` 的交易在 `BEGIN` 後取得交易層級的 advisory lock，全部排成一列（等同 `BEGIN IMMEDIATE`，跨節點成立）。D2（token 扣次數）、D6（設定版本）另外改成原子敘述；D3、D4、D5、D7、D8 維持「交易內先檢查再寫入」，由這個鎖保護 | 領域介面是 L1a 的「一個函式一條或數條 SQL、交易邊界在呼叫端」，逐項改寫需要改 trait 的簽章與呼叫端（`consume_token` 要回傳是否扣到、`replay_insert` 要回傳是否新插入、簽發要有搶占的方法），會與並行的 F8 線衝突。全域鎖在正確性上是這些改寫的上位集合；這些交易的量很小。之後要讓它們並行時再逐項改寫 |
+| 3 | 第 5.4 節：`40P01`／`40001` 時領域 store 自動重試整個交易最多 3 次 | 只有 report 的批次自動重試；領域 store 回暫時性錯誤（`StoreErrorKind::Busy` → API 503、Pulse 重試） | 交易邊界在呼叫端（`Store::begin` … `Tx::commit`），儲存層無法重放呼叫端的邏輯。有全域鎖時這些交易之間不會死結 |
+| 4 | 第 12.1 節：`SELECT value FROM meta WHERE key = 'audit_chain_head' FOR UPDATE` 序列化稽核寫入者 | 專用的交易層級 advisory lock；`id` 在持鎖期間指定為 `max(id) + 1` | 空資料庫時 head 列不存在，列鎖鎖不到東西（要另外處理第一筆的競爭）；advisory lock 沒有這個邊界情況。鏈的順序＝commit 的順序、`id` 連續、雜湊與 HMAC 與 SQLite 相同這幾個性質都成立 |
+| 5 | 第 7.3、7.4 節：PostgreSQL 後端由 leader 從原始資料產生彙總與速率 | 沿用 SQLite 的記憶體桶與寫入時計算速率 | 第 20.3 節允許的順序：只有一個 writer（單一節點、階段 A）時記憶體桶的不變式成立；leader 版屬於階段 B（M17、M18），需要租約與 fencing |
+| 6 | 第 7.5 節：保留與容量只由 leader 執行，容量規則與 STORAGE.md 第 8 節相同 | 由（唯一的）writer 執行；容量上限改為估計制（STORAGE.md 第 19.5 節） | PostgreSQL 刪除後檔案不會變小，照「刪到量測值低於 95%」會把資料刪光 |
+| 7 | 第 5.6 節：`COPY … FROM STDIN (FORMAT binary)`；來源是 PostgreSQL 時以 `cluster_nodes` 的心跳判斷是否所有節點都已停止 | 多列 `INSERT … SELECT FROM unnest(…)`；以「服務執行中」的 session advisory lock 判斷（Kairos 的寫入連線持有共享鎖，`db migrate` 取互斥鎖） | COPY 的二進位格式要自己實作；`cluster_nodes` 還不存在。advisory lock 在連線中斷時立即釋放，不會有「心跳還沒過期」的誤判 |
+| 8 | 第 5.6 節：驗證「在目的端執行完整的稽核鏈驗證」 | 目的端的驗證結果必須與來源**相同** | 來源的鏈原本就有斷點時（例如從 0.5 升級上來的未封存紀錄被改動過），搬移不應該永遠無法完成；輸出會註明 |
+| 9 | 第 15.1 節：`sslmode = "verify-full"`（預設） | 未設定時：loopback 與 Unix socket 為 `disable`，其他為 `verify-full`（第 4.3 節的「非 loopback 或 Unix socket 時預設 verify-full」） | 第 4.3 節與第 15.1 節的寫法不一致，採第 4.3 節 |
+| 10 | 第 16.3 節：`kairos db backup` 在 PostgreSQL 後端時拒絕 | 以暫定代碼 `KRS-E4406` 拒絕；`kairos reports import` 相同 | 第 19 節沒有分配這個情況的代碼 |
+| 11 | 第 5.2 節：測試以 `#[cfg(feature = "pg-tests")]` 加 `KAIROS_TEST_PG_URL` | 沒有 feature：測試一律編譯，執行時依 `KAIROS_TEST_PG_URL` 決定執行或明確略過；`KAIROS_TEST_PG_REQUIRED=1` 時不可略過 | 用 feature 會讓 CI 的 clippy／test 要多一組組合，而且沒開 feature 時看不出測試被跳過 |
+
+**給 L2（叢集協調）的接點**：
+
+- **連線**：`store::postgres::pool::active()` 是這個行程的連線池；`PgPool::get(Access, busy)` 取用池中的連線，`PgPool::dedicated(busy)` 建立不佔池的專用連線（租約續約、`LISTEN` 應該用它：池中的連線歸還後會被其他工作使用）。時間一律可以用資料庫的 `clock_timestamp()`；`pool::server_info` 已讀取時差。
+- **鎖**：`conn::LockKind`（`Write`、`Migrate`、`Audit`、`Service`）與 `PgPool::lock_key` 是 advisory lock 的鍵空間，新增種類時往後加。`Service` 的共享鎖目前由 writer 連線持有；多節點時每個節點都持有共享鎖，`db migrate`／離線 CLI 的互斥判斷不需要修改。
+- **fencing**：leader 專屬的寫入交易可以在取得 `Write` 鎖之後、第一個敘述加上第 6.2 節的 `SELECT … FROM cluster_leases … FOR SHARE`；`PgConn::begin_tx` 是加入點（單機時為空操作）。
+- **schema**：叢集資料表加在 `store/postgres/schema.rs`（新的版本常數與升級步驟；`ensure_schema` 目前只會在空的 schema 上建立 v9，還沒有「從 v9 升級」的路徑，L2 新增 v10 時要補上，並以既有的 `LockKind::Migrate` 序列化）與 SQLite 的 `MIGRATIONS`，同時把新資料表加進 `schema::TABLES`／`IDENTITY_COLUMNS`。
+- **領域介面**：`ClusterStore` 尚未定義；新增時依 L1a 的做法加入 `Store` 的 supertrait，並在 `store/sqlite/`、`store/postgres/` 各實作一份（`pg_domain!`）。
+- **需要改成只由 leader 執行的工作**（第 6.3 節）目前都在 `report::PgStore::maintain`（彙總寫出、保留、容量）與各服務的背景工作中，沒有任何租約檢查。
+- **啟動時把主機標為離線**（M2）：`PgStore::open` 與 SQLite 相同，執行 `UPDATE hosts SET online = 0 WHERE online = 1`；多節點時要改成第 6.6 節的規則。
+- **節點本機的檔案**：金鑰、PKI 快取、遠端升級的版本庫（`<data_dir>/releases/`）仍在資料目錄；版本庫的發佈檔在多節點下要另外處理（本文件沒有涵蓋）。
 
 ## 6. 叢集協調
 
@@ -616,6 +648,72 @@ RETURNING conn_epoch, (SELECT conn_node FROM prev), (SELECT conn_epoch FROM prev
 - leader 每秒讀取 `id > 上次` 的事件，交給告警引擎的 `on_bus`；SSE 的 `EventHub` 也從這裡取得主機事件。
 - `cluster_events.id` 是全叢集遞增的序列，因此 SSE 的事件編號在階段 B 改為 `c<cluster_id 前 8 碼>-<id>`。換節點（B2）或 leader 換手（B1）後，只要事件還在保留範圍內就能接續，不必 `resync`。
 - 各節點的本機系統檢查（連線數接近上限、每 IP 上限、寫入失敗、伺服器憑證即將到期）以 `bus.condition` 發布，`subject` 帶 `node_id`。leader 的告警引擎依「檢查項目＋節點」開事件；事件的對象顯示節點名稱（設計包待辦）。
+
+### 6.8 L2（階段 A）的實作與本文件的差異（0.10.0〔草稿〕，分支 `sprint10/cluster`）
+
+階段 A（主動／備援）已實作：`[cluster] enabled = true`、節點註冊與心跳、leader 租約與 fencing、備援節點的熱待命與接手、失去租約時結束行程、金鑰指紋與停用自動建立、`kairos cluster` 子命令、`/readyz`／`/metrics`／系統健康／`GET /api/v1/cluster`、schema v10。程式在 `kairos/src/cluster/`（`store`、`lease`、`keys`、`confhash`、`runtime`）、`cluster_cli.rs`、`store/{sqlite,postgres}/cluster.rs`；fencing 在 `store/postgres/{conn,pool}.rs`。
+
+**實作的做法（規格沒有寫到、或需要說明的地方）**：
+
+- **備援階段在 `main::run` 的最前面**：叢集模式的行程先啟動協調執行緒（`kairos-cluster`，一條不佔連線池的專用連線）與備援的探針監聽，**等到取得租約才開啟儲存、啟動各服務與監聽**（與單機相同的啟動流程）。因此第 6.3 節的 leader 專屬工作不需要逐一加租約檢查：它們只存在於 leader 的行程中（盤點見下表），沒有另外實作 `LeaderJobs` 監督器。
+- **失去租約一律結束行程**（結束代碼 75，`KRS-W8502`）。三個來源：續約回報「租約已不屬於自己」、超過 `lease_ttl_secs − 5` 秒沒有續約成功、任何寫入的 fencing 檢查失敗。「超過時限」由另一條只看單調時鐘的看門狗執行緒（`kairos-lease-watchdog`）判斷，協調執行緒卡在沒有回應的資料庫呼叫上時也會結束。結束是立即的（不走優雅關機）：連線由作業系統關閉，在途的 report 沒有 `ack`，Pulse 重送後由唯一索引去重。
+- **fencing 涵蓋 leader 行程的所有寫入**，不只第 6.3 節的工作：連線池設定了 fencing 之後，每個可寫的交易（`TxMode::Immediate` 與 `Deferred`，含 report 的批次與維護）在 `BEGIN`（與寫入鎖）之後的第一個敘述確認租約；**自動提交的單一 `INSERT`／`UPDATE`／`DELETE`** 自動包成「`BEGIN`；確認租約；敘述；`COMMIT`」。唯讀連線、`REPEATABLE READ` 的唯讀快照與協調自己的連線不檢查。CLI 與單機的行程沒有設定 fencing（空操作）。理由：階段 A 沿用記憶體中的彙總桶（第 5.7 節 #5），舊 leader 的 report 寫入若不擋下，會破壞「只有一個 writer」的前提。
+- **fencing 檢查是一個敘述**：`SELECT 1 / count(*) FROM (SELECT 1 FROM cluster_leases WHERE name = 'leader' AND holder = … AND epoch = … AND expires_at > now FOR SHARE) f`。租約列不符合時除以零（SQLSTATE 22012），轉成 `KRS-W8502` 的錯誤並觸發結束行程；符合時持有租約列的 `FOR SHARE` 到交易結束，接手的 `UPDATE` 會等它（第 6.2 節的保證）。不需要 PL/pgSQL。
+- **啟動保護**（第 4.3 節沒有寫）：新的 advisory lock 種類 `Mode`。沒有啟用叢集模式的 Kairos 以**互斥**鎖持有（writer 的專用連線），叢集的節點（含備援）以**共享**鎖持有（協調連線與 writer 連線）。同一個 schema 上，第二個單機模式的 Kairos、或與叢集節點混用時，後啟動的拒絕啟動（`KRS-E4402`，結束代碼 3）。CLI 不受影響。
+- **連不上資料庫**：單機模式照第 19 節（`KRS-E4401`，結束代碼 3，systemd 不重試）。**叢集模式的節點不結束**：備援階段持續重試（`/readyz` 的 `cluster` 為 `lost`，每分鐘記一次 `KRS-E4401`），資料庫恢復後繼續——否則第 17 節 F6（資料庫完全停止後恢復）之後不會有任何節點回來：leader 以 75 結束、被重新啟動時資料庫還沒好，就會以 3 結束而不再重試。
+- **`LISTEN/NOTIFY`** 只有一個頻道 `kairos_cluster`：正常關機交還租約時通知，備援立即嘗試取得（不等 2 秒的輪詢）。遺失只會讓延遲回到 2 秒。
+- **連線的存活偵測**：所有 PostgreSQL 連線加上 `keepalives_interval = 10 秒`、`keepalives_retries = 3`、`tcp_user_timeout = 30 秒`（Linux）；協調連線的 `statement_timeout`／`lock_timeout` 是「自我降級時限的一半」（最多 5 秒）。
+
+**leader 專屬工作的盤點**（以程式中實際的背景工作為準；全部只在取得租約之後才啟動，寫入都經過 fencing）：
+
+| 工作 | 位置 | 寫入的方式 |
+|---|---|---|
+| report 寫入、彙總寫出、保留期限、容量上限、清冊同步、資產、刪除主機資料 | `store::run_writer`、`PgStore::{write_batch,maintain,sync_inventory,write_assets,purge_step}` | writer 的交易與自動提交的敘述 |
+| 啟動時把線上主機標為離線 | `PgStore::open` | 自動提交的 `UPDATE`（接手時所有線上主機都屬於上一個 leader，見下表 #7） |
+| 告警引擎的判定、通知派送、`alert_actions`、告警清除、`alerts_heartbeat` | `alerts/mod.rs`、`alerts/notify/mod.rs` | 交易與自動提交 |
+| 註冊服務：`issue_pending`、CRL 產生與待生效撤銷、自動暫停、`expire_and_purge`、封鎖／放寬／重放快取／舊 token／孤兒憑證的清除、稽核的保留清除 | `enroll/mod.rs` `EnrollService::run` | 同上 |
+| 稽核的自我驗證與鏈尾外送 | `audit_monitor.rs` | 稽核寫入（自己開交易） |
+| 主控台的工作階段清除、token 最後使用時間與稽核旗標、被拒憑證寫入清冊 | `api/maint.rs` | 同上 |
+| 遠端管理：推送引擎、到期指派、舊推送的清除 | `remote/mod.rs`、`remote/engine.rs` | `TxMode::Immediate` 與自動提交 |
+| 遠端管理：升級中離線抑制的調和（`RemoteService::reconcile_alerts`；另一條線 `sprint10/f8-rest` 新增的 `RemoteStore::applying_hosts()`） | `remote/mod.rs` | 只讀資料庫、發布到行程內的匯流排；只在 leader 的行程中執行 |
+| 系統事件的稽核（`system.start`、`system.shutdown`） | `main.rs` | 稽核寫入 |
+| 節點心跳、失聯節點的標記（`KRS-W8506`） | `cluster/runtime.rs` | 協調連線（不經 fencing；每個敘述都帶 `started_at` 或 epoch 的條件） |
+
+不寫資料庫的背景工作（TLS 重載、到期預警、日誌清除、`agents.json`、指標轉出、探針）不受影響。
+
+**與本文件不同之處**：
+
+| # | 本文件 | 實作 | 理由 |
+|---|---|---|---|
+| 1 | 第 6.2 節：取得與續約是同一個敘述；持有者相同時 epoch 不變 | **取得**與**續約**分開。取得（備援每 2 秒）：沒有人持有、已到期、或持有者就是自己（同一個節點重新啟動）時成功，**epoch 一律加一**。續約（leader 每 TTL/3）：只有「持有者與 epoch 都相同、且尚未到期」才成功，否則視為失去租約 | 嚴格的續約讓 `kairos cluster step-down`（把到期時間改為現在）有確定的結果：leader 不會把租約續回來。每次啟動一個新的 epoch，同一個 `node_id` 的舊行程（例如還沒結束）也會被 fencing 擋下 |
+| 2 | 第 5.5 節：schema v9 含叢集資料表 | **schema v10**（0.9.0 的 v9 已用於遠端管理）。資料表與欄位照第 5.5 節；沒有建立 `enroll_requests_issued_csr`（既有的 `enroll_requests_csr` 已是 `(agent_id, csr_sha256)` 的唯一索引）與 `host_presence` 的兩個序列（階段 B 再加）。階段 A 實際讀寫的只有 `cluster_nodes`、`cluster_leases` 與 `meta` 的 `cluster_id`、`cluster_keys`；其餘資料表與欄位先建立、保持空白 | 見 STORAGE.md 第 20 節 |
+| 3 | 第 6.1 節：`role` 的值；失聯的節點改為 `stopped` | 另有 `lost`（由 leader 標記的失聯節點）；`stopped` 只表示正常關機 | 系統健康與 `kairos cluster status` 要分辨「正常停止」與「失聯」 |
+| 4 | 第 6.1 節：同名節點的心跳在 `3 × heartbeat_secs` 內且 `started_at` 不同時拒絕啟動 | 另外要求**主機名稱不同**才拒絕（`KRS-E8503`）。同一台主機上的同名節點視為重新啟動，直接接手那一列；被取代的舊行程在下一次心跳發現後結束 | 節點當掉後 5 秒被 systemd 重新啟動時，舊的心跳還在 15 秒內，照原規則會以設定錯誤（代碼 3）結束而不再重試 |
+| 5 | 第 6.3 節：`LeaderJobs` 監督器，取得租約時啟動、失去時取消 | 沒有監督器：服務只在取得租約之後啟動，失去租約時整個行程結束 | 第 3.2 節已決定階段 A 不做「降級但保留行程」 |
+| 6 | 第 6.4 節：`cluster_revs` 與 `NOTIFY kairos_rev`；`alerts_config_rev` 搬到 `cluster_revs` | `cluster_revs` 只建立資料表，沒有使用；`alerts_config_rev` 仍在 `meta`（L1b 已改為原子遞增） | 階段 A 只有主動節點執行服務，既有的「每 2 秒輪詢資料庫」已能讓 CLI 的變更生效；跨節點的版本通知是階段 B 的需求 |
+| 7 | 第 6.5、6.6 節：階段 A 由主動節點寫入 `host_presence`；接手時只把失聯節點的主機標為離線，原因 `server_lost` | 沒有寫入 `host_presence`。接手的節點在開啟儲存時把所有仍標為線上的主機改為離線（與單機啟動相同，經過 fencing） | 階段 A 只有一個節點服務連線，接手時所有線上主機都屬於上一個 leader；備援節點不開啟儲存，所以「任何節點重新啟動都把其他節點的主機標為離線」（M2）不會發生。`hosts` 沒有保存離線原因的欄位，`server_lost` 留到階段 B 與 `host_presence` 一起做 |
+| 8 | 第 11.1 節：金鑰缺少或不符時「行程照常執行，`/readyz` 503」 | 相同；另外，**還沒有執行 `kairos cluster init`**（資料庫中沒有指紋）也視為不符：節點等待，`init` 之後 5 秒內自動繼續，不需要重新啟動 | 規格沒有寫到這個情況 |
+| 9 | 第 11.2 節：`issuing-ca activate` 前檢查所有線上節點都有這把金鑰 | 沒有做。節點啟動時與之後每 60 秒檢查「`active`／`trusted` 的簽發 CA 都有私鑰」；缺少時該節點 `keys: mismatch`、不參與選舉，`kairos cluster status` 與系統健康顯示 | `activate` 的 CLI 屬於另一個模組；先以節點端的檢查確保不會有「接手後無法簽發」的 leader |
+| 10 | 第 13.3 節：`alert_deliveries.claim_epoch`、Webhook 的 `delivery_id`、Email 的 `X-Kairos-Delivery-Id` | 欄位已建立，沒有寫入；通知的格式不變 | 通知已是 at-least-once（新 leader 載入待送的通知後送出）；`delivery_id` 是設計包待辦（第 22 節 #6） |
+| 11 | 第 13.4 節：新的系統規則（`sys.cluster_node_lost` 等） | 沒有新增規則。節點失聯、金鑰不一致、設定不一致、沒有同步複寫、時差顯示在系統健康的 `cluster` 項目、`kairos cluster status` 與日誌 | 規則的名稱與文案是設計包待辦（第 22 節 #5） |
+| 12 | 第 14.3 節：`POST /api/v1/cluster/nodes/{node_id}/drain`、`POST /api/v1/cluster/step-down` 與權限 `cluster:write` | 沒有做；只有 `GET /api/v1/cluster`（`settings:read`）。排空與交還用 `kairos cluster drain`／`step-down`（寫稽核，類別 `cluster`） | 主控台還沒有叢集畫面的設計（第 22 節 #3），新權限要與畫面一起定 |
+| 13 | 第 14.1 節：`database` 檢查改為連線池的 `SELECT 1` | 沿用 L1b 的檢查（可寫、schema 可用） | L1b 已實作，功能相同 |
+| 14 | 第 14.5 節：文字格式的日誌在主機名稱之後加 `node` | 只有 JSON 格式加 `node_id` 欄位（叢集模式才輸出）；文字格式不變 | 文字格式沒有主機名稱欄位 |
+| 15 | 第 15.2 節：`kairos config show --effective` 顯示鍵是否屬於節點本機 | 沒有做。節點本機的鍵定義在 `cluster/confhash.rs`：`cluster.node_id`、`cluster.advertise`、`*.listen`、`storage.data_dir`、`log.*`、`auth.client_ca`、`auth.crl*`，以及以 `_file`、`_path`、`_dir` 結尾的鍵 | 範圍 |
+| 16 | 第 18.2 節：`kairos cluster drain` 之後節點回報 `drained` | 排空**備援**：角色改為 `draining`，不再參與選舉，重新啟動後恢復。排空 **leader**：正常關機（對協商了 `cluster` 的 Pulse 送 `drain`）、交還租約，以結束代碼 0 結束——systemd 的 `Restart=on-failure` 不會重新啟動它 | 階段 A 的 leader 不能「停止服務但保留行程」 |
+| 17 | 第 3.2 節：systemd `Restart=always` | 維持既有的 `Restart=on-failure`（結束代碼 75 會被重新啟動；正常結束不會） | 見 #16 |
+| 18 | 第 3.4 節：PROXY protocol v2（`KRS-W2206`） | **沒有做** | 不在這次的範圍；經 L4 LB 時每 IP 限制與來源位址的問題仍在（請把 LB 的位址加入允許清單，或用虛擬 IP／`fallback_addresses`） |
+| 19 | 第 3.1、16.1 節：INSTALL 的階段 0 附錄、HAProxy 與 keepalived 的範例設定檔 | INSTALL 附錄 H 有 keepalived 與 HAProxy 的設定片段；沒有獨立的範例檔，也沒有階段 0 的附錄 | 範圍 |
+| 20 | 第 8.6 節：0.10.0 的 Pulse 註冊端點跟著候選清單走 | 沒有做（Pulse 沒有改動） | 不在這條線的範圍 |
+
+**沒有新增錯誤代碼**：全部使用第 19 節已分配的 85xx、44xx 與 `KRS-E0202`。啟動保護用 `KRS-E4402`（「schema 被其他程式使用」）。
+
+**已知的限制**：
+
+- **遠端升級的版本庫**（`<data_dir>/releases/`）仍是節點本機的檔案：接手的節點沒有上一個 leader 匯入的發佈檔，進行中的升級推送會下載失敗。目前的做法是在每個節點匯入相同的發佈版本（第 21 節之後的待決事項）。
+- **`for` 期間的計時、通知的速率限制**在 leader 的記憶體中，換手後重新計算（第 13.1、13.3 節已說明）。
+- **主控台的工作階段**在資料庫中，換手後仍有效；SSE 以 `resync("failover")` 重新載入。
+- 備援節點的 `/metrics` 只有版本與 `kairos_cluster_*`。
 
 ## 7. report 寫入、去重與彙總
 
@@ -1190,6 +1288,32 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 | F15 | 在任一節點上執行 CLI（`kairos enroll approve`、`alerts ack` 等） | CLI 直接連資料庫，與節點的角色無關；`alerts ack` 等經 `alert_actions` 交給 leader | 同左 | 稽核鏈經 head 列鎖序列化 |
 | F16 | 所有節點都停止 | Pulse 緩衝資料；恢復後補送 | 同左 | 在緩衝範圍內不遺失 |
 | F17 | 同一個 agent 在兩個節點上同時連線（例如 LB 換手後舊 TCP 尚未斷） | 不會發生（只有一個節點監聽） | 後到的 hello 踢掉先到的（第 6.5 節） | 不重複 |
+
+### 17.1 階段 A 的實測結果（0.10.0〔草稿〕，分支 `sprint10/cluster`）
+
+環境：kp-build（4 vCPU、4 GB RAM，與另一條開發線共用），PostgreSQL 14 與 17 跑在同一台機器的容器中（記憶體上限 512 MB、沒有備庫），兩個 Kairos、Pulse 都在同一台主機的 loopback 上，預設參數（`lease_ttl_secs = 15`、`heartbeat_secs = 5`）。**沒有 L4 負載平衡器、沒有虛擬 IP、沒有真正的網路**：Pulse 以 `server.fallback_addresses` 找到接手的節點。下表的「已驗證」指有自動化測試在這個環境通過；「未驗證」的情境只有設計與程式上的推論，**上線前必須在實際的拓撲上演練**。
+
+| # | 情境 | 狀態 | 依據與結果 |
+|---|---|---|---|
+| F1 | 主動節點行程當掉 | **已驗證** | `tests/e2e/tests/cluster.rs` `leader_failover_keeps_durable_data`：SIGKILL 主動節點 → 備援取得租約 → 開始監聽 → Pulse 經 `fallback_addresses` 重連；之後再以 `step-down` 換回。連跑 8 次（PostgreSQL 14 七次、17 一次）都通過：從終止到備援**取得租約 12.35～12.50 秒**、**開始監聽 12.76～12.92 秒**，Pulse 重新註冊 13.3～14.7 秒；durable 的 report 不缺號、不重複，稽核鏈驗證通過。（測試固定在主動節點啟動後的同一個時間點終止它，所以範圍很窄；依終止時距離上一次續約多久，理論上是 10～17 秒加上載入時間。） |
+| F2 | 主動節點主機斷電、網路線被拔 | **未驗證** | 與 F1 的差別只在 Pulse 要等讀取閒置逾時（30 秒）才發現；Kairos 端的行為相同。凍結的測試（F9）涵蓋了「連線沒有被重設」時 Pulse 的重連：Pulse 在凍結後 22.1～22.8 秒重新註冊到接手的節點（7 次）。 |
+| F3 | 主動節點與資料庫之間的網路中斷 | **部分驗證** | 單元測試 `leader_demotes_itself_when_the_database_stops_answering`：續約一直得不到回應時（以鎖住租約列模擬），leader 在自我降級的時限內回報失去租約，早於租約到期。真正的網路中斷（封包被丟棄、TCP 不重設）**未驗證**；這種情況下協調連線靠 `statement_timeout`、TCP keepalive 與 `tcp_user_timeout`（30 秒）脫身，而看門狗執行緒不依賴資料庫呼叫是否返回 |
+| F4 | 備援節點當掉 | **部分驗證** | 單元測試涵蓋「心跳逾時的節點被 leader 標為失聯」；端對端沒有專門的測試（F1 的測試中，被終止的舊主動節點在 `kairos cluster status` 顯示為失聯） |
+| F5 | PostgreSQL 主庫故障、自動切換到備庫 | **未驗證** | 沒有同步備庫與自動切換的環境。預期：切換時間超過 `lease_ttl_secs − 5` 秒時 leader 以 75 結束，切換完成後由某個節點重新取得租約；非同步複寫時可能遺失主庫上最後幾個已 `ack` 的交易，也可能遺失最後一次的租約更新（新主庫上的租約比實際舊，接手會提早——fencing 仍以新主庫上的 epoch 為準） |
+| F6 | PostgreSQL 完全停止後恢復 | **已驗證**（一次，PostgreSQL 17） | `tests/e2e/tests/cluster.rs` `database_outage_makes_nodes_wait_and_recover`（預設不執行：會 `docker stop`／`start` 測試用的資料庫容器）：資料庫停止後主動節點在 6.0 秒以代碼 75 結束（上限是 `lease_ttl_secs − 5` 秒加上續約間隔）；備援與被重新啟動的節點都不結束（`/readyz` 的 `cluster: lost`、`KRS-E4401`）；資料庫恢復後 1.1 秒有一個節點取得租約並開始監聽（租約還沒到期時由原本的持有者直接取回），Pulse 在 2.6 秒重新註冊，資料不缺號、不重複。與本文件第 19 節「啟動時連不上資料庫以代碼 3 結束」不同（第 6.8 節），列為待決 |
+| F7 | LB 或虛擬 IP 的主機故障 | **未驗證** | 沒有 LB／keepalived 的環境。Pulse 以 `fallback_addresses` 直接連到節點的路徑由 F1 的測試涵蓋 |
+| F8 | 節點之間的網路中斷，但都連得到資料庫 | **未驗證**（設計上無影響） | 節點之間沒有任何直接的連線，所有協調都經過資料庫 |
+| F9 | 腦裂嘗試：舊 leader 暫停超過 TTL 後恢復 | **已驗證** | 單元測試：fencing 擋下舊 leader 的每一種寫入（序列化的交易、一般的交易、自動提交的敘述、稽核）、接手的 `UPDATE` 等待舊 leader 進行中的交易結束。端對端 `a_frozen_leader_is_fenced_and_drain_hands_over`：SIGSTOP 主動節點 → 備援接手 → SIGCONT 後舊節點以結束代碼 75 結束，沒有新增任何稽核紀錄，durable 的資料不缺號、不重複。7 次：凍結後備援在 12.2～12.5 秒取得租約；舊節點恢復後 **0.02 秒**內結束。 |
+| F10 | 節點的時鐘偏差 | **部分驗證** | 租約的取得、續約與 fencing 都以資料庫的時間計算（單元測試以可控的資料庫時間驗證到期與接手）；自我降級用本機的單調時鐘。實際把節點的系統時鐘調偏的情境**未驗證** |
+| F11 | 新節點的金鑰不一致或缺少 | **已驗證** | 端對端：還沒匯入金鑰的節點 `/readyz` 503（`keys: mismatch`）、記 `KRS-E8504`、不建立金鑰、不取得租約；`kairos cluster keys import` 之後 5 秒內成為備援 |
+| F12 | 節點的設定不一致 | **已驗證** | 端對端：設定不同的節點記 `KRS-W8505`，`kairos cluster status` 的 `config_drift` 為 `true`，照常運作 |
+| F13 | 兩台主機誤用同一個 `node_id` | **未驗證** | 需要兩台主機名稱不同的主機（第 6.8 節 #4）。同一台主機上的同名節點視為重新啟動 |
+| F14 | 滾動升級、排空 | **已驗證**（排空與交還）；滾動升級**未驗證** | 端對端：`kairos cluster step-down` 後 leader 以 75 結束、另一個節點接手（2.3～2.4 秒開始監聽，8 次）；`kairos cluster drain` 備援後不再參與選舉；排空 leader 後正常結束（代碼 0）、交還租約。混用兩個版本的滾動升級沒有測試 |
+| F15 | 在任一節點上執行 CLI | **已驗證** | 端對端：兩個節點的目錄都執行過 `reports export`、`audit verify`、`cluster status`／`step-down`／`drain`／`forget`；稽核鏈在兩個節點與 CLI 交錯寫入後驗證通過 |
+| F16 | 所有節點都停止 | **部分驗證** | 端對端的收尾：全部停止後 `kairos cluster status` 回報沒有 leader（結束代碼 9）。「全部停止後再啟動、Pulse 補送」由 `tests/postgres.rs` 的單一節點重新啟動涵蓋 |
+| F17 | 同一個 agent 在兩個節點上同時連線 | 不適用（階段 B） | 階段 A 只有一個節點監聽 |
+
+另外**沒有驗證**的：同步備庫切換時的行為（F5）、兩個以上備援節點同時搶租約的端對端情境（單元測試以 6 條連線同時搶租約驗證了「恰好一個成功」）、大量主機（1,000 台以上）下的接手時間（清冊載入的時間隨主機數增加，STORAGE.md 第 11.2 節）、Windows 上的 Kairos（只做了 `x86_64-pc-windows-gnu` 的編譯檢查）、PgBouncer 之後的連線（只支援 session pooling）。第 23 節的「1,000 台模擬 agent、F1 換手 10 次」與「換手時間的分布（F1、F2 各 20 次）」沒有做：這裡的數字是一台 Pulse、7～8 次的範圍。
 
 ## 18. 協定的增補（草稿，協定版本不變）
 

@@ -288,6 +288,19 @@ pub struct Engine {
     pub(super) active_silences: HashSet<String>,
     pub(super) out: Output,
     pub(super) dirty: HashSet<String>,
+    /// 叢集模式：這次啟動是從另一個節點接手 leader（[`Engine::set_handover`]）
+    pub(super) handover: Option<Handover>,
+}
+
+/// 叢集的 leader 換手（`kairos/HA.md` 第 13.2 節）：上一個心跳是另一個節點寫的
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handover {
+    /// 上一個 leader
+    pub from: String,
+    /// 這個節點
+    pub to: String,
+    /// 上一個 leader 的心跳還很新（`lease_ttl_secs + 60 秒` 內）：正常的換手，不是「沒有 leader」
+    pub recent: bool,
 }
 
 /// 去重鍵：`規則 ID|對象`
@@ -325,6 +338,7 @@ impl Engine {
             active_silences: HashSet::new(),
             out: Output::default(),
             dirty: HashSet::new(),
+            handover: None,
         };
         e.set_channels(loaded.channels);
         e.set_silences(loaded.silences);
@@ -1475,7 +1489,16 @@ impl Engine {
     // 啟動時的系統事件
     // ------------------------------------------------------------------
 
-    /// Kairos 啟動：記錄「已重新啟動」（上次沒有正常關機時為嚴重）與停機期間（§3.3 B 第 4 點）
+    /// 叢集模式：啟動前設定「這次是從另一個節點接手」（[`Engine::record_startup`] 據此改寫事件）
+    pub fn set_handover(&mut self, handover: Option<Handover>) {
+        self.handover = handover;
+    }
+
+    /// Kairos 啟動：記錄「已重新啟動」（上次沒有正常關機時為嚴重）與停機期間（§3.3 B 第 4 點）。
+    ///
+    /// 叢集模式下從另一個節點接手時（`kairos/HA.md` 第 13.2 節）：「已重新啟動」改為「叢集的 leader 已由
+    /// A 切換到 B」（`KRS-I8501`；上一個 leader 沒有正常交還時為警告），不開「停機」；上一個 leader 的心跳
+    /// 太舊時「停機 N 分鐘」改為「叢集沒有 leader 達 N 分鐘」（`KRS-E8503`）
     pub fn record_startup(
         &mut self,
         previous: Option<(i64, bool)>,
@@ -1483,17 +1506,34 @@ impl Engine {
         in_maintenance: bool,
         now: i64,
     ) {
+        let handover = self.handover.clone();
         if let Some(rule) = self.rule(ids::RESTARTED).filter(|r| r.enabled).cloned() {
             let unclean = previous.is_some_and(|(_, clean)| !clean);
-            let severity = if unclean {
-                Severity::Critical
-            } else {
-                Severity::Info
-            };
-            let title = if unclean {
-                "Kairos 已重新啟動（上次沒有正常關機）".to_string()
-            } else {
-                "Kairos 已重新啟動".to_string()
+            let (severity, title, code) = match (&handover, unclean) {
+                (Some(h), unclean) => (
+                    if unclean {
+                        Severity::Warning
+                    } else {
+                        Severity::Info
+                    },
+                    format!(
+                        "叢集的 leader 已由 {} 切換到 {}{}",
+                        h.from,
+                        h.to,
+                        if unclean {
+                            "（上一個 leader 沒有正常交還）"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Some(crate::cluster::CODE_LEADER_ACQUIRED.to_string()),
+                ),
+                (None, true) => (
+                    Severity::Critical,
+                    "Kairos 已重新啟動（上次沒有正常關機）".to_string(),
+                    None,
+                ),
+                (None, false) => (Severity::Info, "Kairos 已重新啟動".to_string(), None),
             };
             let mut r = rule.clone();
             r.severity = severity;
@@ -1503,12 +1543,14 @@ impl Engine {
                 Signal {
                     severity,
                     title,
-                    code: None,
+                    code,
                     agent_id: None,
                     details: json!({
                         "previous_heartbeat_at": previous.map(|p| p.0),
                         "clean_shutdown": previous.map(|p| p.1),
                         "version": crate::VERSION,
+                        "previous_leader": handover.as_ref().map(|h| h.from.clone()),
+                        "leader": handover.as_ref().map(|h| h.to.clone()),
                     }),
                     episode: None,
                     parent: None,
@@ -1526,15 +1568,24 @@ impl Engine {
         {
             let down = now - last;
             let min = rule.param_u64("min_secs", 300) as i64 * 1000;
-            if down > min && !in_maintenance {
+            // 正常的 leader 換手（上一個 leader 的心跳還很新）不算停機
+            let handed_over = handover.as_ref().is_some_and(|h| h.recent);
+            if down > min && !in_maintenance && !handed_over {
                 let minutes = down / 60_000;
+                let (title, code) = match &handover {
+                    Some(_) => (
+                        format!("叢集沒有 leader 達 {minutes} 分鐘，期間資料未收集"),
+                        Some(crate::cluster::CODE_COORDINATION.to_string()),
+                    ),
+                    None => (format!("Kairos 停機 {minutes} 分鐘，期間資料未收集"), None),
+                };
                 let id = self.open(
                     &rule,
                     &format!("down:{last}"),
                     Signal {
                         severity: rule.severity,
-                        title: format!("Kairos 停機 {minutes} 分鐘，期間資料未收集"),
-                        code: None,
+                        title,
+                        code,
                         agent_id: None,
                         details: json!({ "from": last, "to": now, "minutes": minutes }),
                         episode: Some(last),

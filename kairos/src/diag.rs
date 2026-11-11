@@ -373,20 +373,19 @@ pub fn check(path: Option<&Path>) -> CheckReport {
     checks.push(listen);
 
     // agent 連線埠的 TLS
-    let pki_files = (c.storage.backend == StorageBackend::Sqlite
-        && c.auth.client_ca_path().is_some())
-    .then(|| {
-        let d = Path::new(&c.storage.data_dir);
-        (
-            crate::pki::issuing_cas_path(d)
-                .to_string_lossy()
-                .into_owned(),
-            crate::pki::issuing_crl_path(d)
-                .to_string_lossy()
-                .into_owned(),
-        )
-    })
-    .filter(|(a, _)| Path::new(a).is_file());
+    let pki_files = (c.storage.backend.is_database() && c.auth.client_ca_path().is_some())
+        .then(|| {
+            let d = Path::new(&c.storage.data_dir);
+            (
+                crate::pki::issuing_cas_path(d)
+                    .to_string_lossy()
+                    .into_owned(),
+                crate::pki::issuing_crl_path(d)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .filter(|(a, _)| Path::new(a).is_file());
     let paths = crate::tls::TlsPaths {
         cert: c.server.cert_path.clone(),
         key: c.server.key_path.clone(),
@@ -397,14 +396,13 @@ pub fn check(path: Option<&Path>) -> CheckReport {
             .as_ref()
             .map(|(_, b)| b.clone())
             .filter(|p| Path::new(p).is_file()),
-        retired_cas: (c.storage.backend == StorageBackend::Sqlite
-            && c.auth.client_ca_path().is_some())
-        .then(|| {
-            crate::pki::retired_cas_path(Path::new(&c.storage.data_dir))
-                .to_string_lossy()
-                .into_owned()
-        })
-        .filter(|p| Path::new(p).is_file()),
+        retired_cas: (c.storage.backend.is_database() && c.auth.client_ca_path().is_some())
+            .then(|| {
+                crate::pki::retired_cas_path(Path::new(&c.storage.data_dir))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|p| Path::new(p).is_file()),
     };
     match crate::tls::build(&paths) {
         Ok(material) => {
@@ -508,6 +506,7 @@ pub fn check(path: Option<&Path>) -> CheckReport {
             match c.storage.backend {
                 StorageBackend::Sqlite => "SQLite",
                 StorageBackend::Jsonl => "JSONL",
+                StorageBackend::Postgres => "PostgreSQL",
             }
         ),
     );
@@ -535,6 +534,12 @@ pub fn check(path: Option<&Path>) -> CheckReport {
         ));
     }
     checks.push(storage);
+    if c.storage.backend == StorageBackend::Postgres {
+        checks.push(postgres_check(c));
+    }
+    if c.cluster.enabled {
+        checks.push(cluster_check(c));
+    }
 
     // 日誌
     let logs = Path::new(crate::logger::LOG_DIR);
@@ -840,6 +845,232 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
+/// `--check-config` 的 PostgreSQL 檢查（`kairos/HA.md` 第 4.3、16.1 節）：實際連線，檢查版本、編碼、
+/// 是否為主庫、schema 的狀態；同步複寫、時差、連線數、未加密只警告。不建立也不修改任何東西
+fn postgres_check(c: &AppConfig) -> Check {
+    use crate::store::postgres::{self, SchemaState, pool};
+    let p = &c.storage.postgres;
+    let target = format!(
+        "{}；sslmode {}；連線池 {} 條",
+        p.display_target(),
+        p.effective_sslmode().as_str(),
+        p.pool_size
+    );
+    let fail = |code: &'static str, why: String, fix: &str| {
+        let mut check =
+            Check::new("database", "PostgreSQL", Outcome::Error, target.clone()).code(code);
+        check.details.push(why);
+        check.details.push(fix.to_string());
+        check
+    };
+    let pg = pool::active().unwrap_or_else(|| pool::PgPool::new(p.clone()));
+    let (info, warnings) = match postgres::check_server(&pg) {
+        Ok(v) => v,
+        Err(e) => {
+            let text = e.to_string();
+            return if text.contains(pool::CODE_PG_REQUIREMENTS) {
+                fail(
+                    pool::CODE_PG_REQUIREMENTS,
+                    text,
+                    "依訊息修正資料庫或 [storage.postgres] 的設定（需要 PostgreSQL 14 以上、UTF8 編碼、連到主庫）。",
+                )
+            } else {
+                fail(
+                    pool::CODE_PG_UNREACHABLE,
+                    text,
+                    "檢查網路與防火牆、storage.postgres 的 host／port／dbname／user、password_file 的內容與權限，以及 TLS（sslmode、ca_file）。",
+                )
+            };
+        }
+    };
+    let state = postgres::open_read(&pg)
+        .map_err(|e| e.to_string())
+        .and_then(|conn| postgres::schema_state(&conn).map_err(|e| e.to_string()));
+    let mut check = Check::new(
+        "database",
+        "PostgreSQL",
+        Outcome::Ok,
+        format!("{target}；PostgreSQL {}", info.version),
+    );
+    match state {
+        Ok(SchemaState::Empty) => check.summary.push_str("；schema 尚未建立，啟動時建立"),
+        Ok(SchemaState::Version(n)) if n == crate::store::sqlite::SCHEMA_VERSION => {
+            check.summary.push_str(&format!("；schema v{n}"));
+        }
+        Ok(SchemaState::Version(n)) if n > crate::store::sqlite::SCHEMA_VERSION => {
+            return fail(
+                pool::CODE_PG_SCHEMA_NEWER,
+                format!(
+                    "資料庫的 schema 版本 {n} 比本版 Kairos 支援的 {} 新。",
+                    crate::store::sqlite::SCHEMA_VERSION
+                ),
+                "把這個節點升級到與其他節點相同的版本。",
+            );
+        }
+        Ok(SchemaState::Migrating) => {
+            return fail(
+                postgres::CODE_MIGRATE_FAILED,
+                "資料搬移（kairos db migrate）尚未完成或驗證失敗，這個 schema 不可使用。"
+                    .to_string(),
+                "以 kairos db migrate --to postgres --restart 重新執行。",
+            );
+        }
+        Ok(other) => {
+            return fail(
+                pool::CODE_PG_REQUIREMENTS,
+                format!("storage.postgres.schema 不可使用：{other:?}"),
+                "指定一個 Kairos 專用的 schema（空的，或由 Kairos 建立）。",
+            );
+        }
+        Err(e) => {
+            return fail(
+                pool::CODE_PG_REQUIREMENTS,
+                format!("無法讀取 schema 的狀態：{e}"),
+                "確認帳號可以讀取系統目錄，並對 storage.postgres.schema 有 USAGE 與 CREATE 權限。",
+            );
+        }
+    }
+    if !warnings.is_empty() {
+        check.result = Outcome::Warning;
+        if warnings
+            .iter()
+            .any(|w| w.starts_with(pool::CODE_PG_NO_SYNC_REPLICATION))
+        {
+            check.code = Some(pool::CODE_PG_NO_SYNC_REPLICATION);
+        }
+        check.details.extend(warnings);
+    }
+    if let Some(w) = password_file_warning(&p.password_file) {
+        check.result = check.result.max(Outcome::Warning);
+        check.details.push(w);
+    }
+    check
+}
+
+/// `[cluster] enabled = true` 的檢查（`kairos/HA.md` 第 11.1、15 節）：叢集是否已建立（`kairos cluster init`）、
+/// 這個節點的金鑰是否與叢集一致（`KRS-E8504`）、`cluster.service_name` 是否在伺服器憑證的 SAN 中。
+/// 只讀取，不建立也不修改任何東西；連不上資料庫時不重複回報（由 PostgreSQL 的檢查項目回報）
+fn cluster_check(c: &AppConfig) -> Check {
+    use crate::cluster::keys::LocalKeys;
+    use crate::store::postgres::{self, SchemaState, pool};
+    use crate::store::prelude::*;
+    let node_id = c.cluster.effective_node_id(&kp_obs::logfmt::hostname());
+    let mut check = Check::new(
+        "cluster",
+        "叢集",
+        Outcome::Ok,
+        format!(
+            "節點 {node_id}；{}；租約 {} 秒、心跳 {} 秒",
+            c.cluster.mode, c.cluster.lease_ttl_secs, c.cluster.heartbeat_secs
+        ),
+    );
+    // 伺服器憑證的 SAN（Pulse 一律以 server.domain 驗證，所有節點的憑證都要含服務名稱；HA.md 第 8.5 節）
+    let service = c.cluster.service_name.trim();
+    if !service.is_empty() {
+        let sans = std::fs::read_to_string(&c.server.cert_path)
+            .map_err(|e| e.to_string())
+            .and_then(|pem| crate::pki::x509::pem_decode_all(&pem, Some("CERTIFICATE")))
+            .and_then(|certs| {
+                certs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "憑證檔中沒有憑證".to_string())
+            })
+            .and_then(|(_, der)| crate::pki::x509::parse_cert(&der))
+            .map(|info| info.dns_sans);
+        // 憑證本身的問題由 TLS 的檢查項目回報
+        if let Ok(sans) = sans {
+            {
+                let wanted = service.to_ascii_lowercase();
+                let covered = sans.iter().any(|san| {
+                    let san = san.to_ascii_lowercase();
+                    san == wanted
+                        || san.strip_prefix("*.").is_some_and(|rest| {
+                            wanted.split_once('.').is_some_and(|(_, r)| r == rest)
+                        })
+                });
+                if covered {
+                    check.summary.push_str(&format!("；伺服器憑證含 {service}"));
+                } else {
+                    check.result = check.result.max(Outcome::Warning);
+                    check.details.push(format!(
+                        "伺服器憑證（server.cert_path）的 SAN 沒有 cluster.service_name「{service}」（憑證的 DNS SAN：{}）。Pulse 以 server.domain 驗證伺服器憑證，叢集中每個節點的憑證都要含服務名稱；請重新簽發含這個 SAN 的憑證。",
+                        if sans.is_empty() { "沒有".to_string() } else { sans.join("、") }
+                    ));
+                }
+            }
+        }
+    }
+    let pg = pool::active().unwrap_or_else(|| pool::PgPool::new(c.storage.postgres.clone()));
+    let Ok(conn) = postgres::open_read(&pg) else {
+        return check;
+    };
+    match postgres::schema_state(&conn) {
+        Ok(SchemaState::Version(n)) if n == crate::store::sqlite::SCHEMA_VERSION => {}
+        _ => {
+            check.result = check.result.max(Outcome::Warning);
+            check.details.push(
+                "資料庫的 schema 還沒有建立（或尚未升級到這個版本）：在第一個節點執行 kairos cluster init 建立叢集後再啟動。".to_string(),
+            );
+            return check;
+        }
+    }
+    let (Ok(cluster_id), Ok(meta), Ok(cas)) = (
+        conn.get_meta(crate::cluster::META_CLUSTER_ID),
+        conn.get_meta(crate::cluster::META_CLUSTER_KEYS),
+        conn.list_cas(),
+    ) else {
+        return check;
+    };
+    let Some(cluster_id) = cluster_id else {
+        check.result = check.result.max(Outcome::Warning);
+        check.details.push(
+            "叢集尚未建立：在第一個節點執行 kairos cluster init（建立金鑰、cluster_id 並記錄金鑰指紋）；在那之前節點不參與 leader 選舉。".to_string(),
+        );
+        return check;
+    };
+    check
+        .summary
+        .push_str(&format!("；cluster_id {cluster_id}"));
+    let problems = LocalKeys::read(Path::new(&c.storage.data_dir)).compare(meta.as_deref(), &cas);
+    if problems.is_empty() {
+        check.summary.push_str("；金鑰與叢集一致");
+    } else {
+        check.result = Outcome::Error;
+        check.code = Some(crate::cluster::CODE_KEYS);
+        check.details.push(format!(
+            "這個節點的金鑰與叢集不一致或缺少：{}。節點不會進入就緒，也不參與 leader 選舉。",
+            problems.join("；")
+        ));
+        check.details.push(
+            "從已在叢集中的節點執行 kairos cluster keys export，再在這個節點執行 kairos cluster keys import。".to_string(),
+        );
+    }
+    check
+}
+
+/// 密碼檔可以被服務帳號以外的人讀取時的警告（Unix）
+fn password_file_warning(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        (mode & 0o077 != 0).then(|| {
+            format!(
+                "storage.postgres.password_file {path} 的權限是 {mode:04o}，其他帳號可以讀取；請改為 0600（chmod 600）並把擁有者設為服務帳號。"
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// 資料庫的離線摘要（唯讀開啟）
 fn database_summary(config: &AppConfig) -> Result<Value, String> {
     let path = crate::store::sqlite::SqliteOptions::from_config(
@@ -851,7 +1082,8 @@ fn database_summary(config: &AppConfig) -> Result<Value, String> {
     let stats = crate::api::health::read_db_stats(conn.as_ref()).map_err(|e| e.to_string())?;
     let (schema_version, hosts, hosts_online) = conn.diag_counts().map_err(|e| e.to_string())?;
     Ok(json!({
-        "path": path.display().to_string(),
+        "backend": config.storage.backend.as_str(),
+        "path": crate::store::database_label(&path),
         "used_bytes": stats.used_bytes,
         "page_size": stats.page_size,
         "max_total_bytes": config.storage.max_total_bytes,
@@ -966,7 +1198,7 @@ pub fn build(args: &DiagArgs, now: DateTime<Utc>) -> (Bundle, CheckReport) {
 
     // 資料庫與狀態表
     if let Some(c) = &report.config {
-        if c.storage.backend == StorageBackend::Sqlite {
+        if c.storage.backend.is_database() {
             match database_summary(c) {
                 Ok(v) => {
                     b.text(

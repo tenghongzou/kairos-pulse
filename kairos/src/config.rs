@@ -13,9 +13,10 @@ use std::time::Duration;
 
 mod accounts;
 mod alerts;
-mod cluster;
+pub mod cluster;
 mod enroll;
 pub mod export;
+mod postgres;
 mod remote;
 
 pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
@@ -27,6 +28,7 @@ pub use enroll::{
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
 };
 pub use export::{ExportSettings, OtlpSettings, PrometheusExportSettings};
+pub use postgres::{PgSslMode, PostgresSettings};
 pub use remote::RemoteSettings;
 
 /// 未指定 `--config` 時讀取的設定檔（不存在則略過）
@@ -163,7 +165,8 @@ kairos alert-channels list（通知管道）\n       \
 kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
 kairos config show --effective（實際生效的設定與來源）\n       \
 kairos users create|list|show|grant|revoke-role|disable|enable|delete|reset-password|reset-mfa|unlock|sessions|end-sessions|map-group [選項]（使用者與角色）\n       \
-kairos audit list|verify|export [選項]（稽核日誌）\n\n\
+kairos audit list|verify|export [選項]（稽核日誌）\n       \
+kairos cluster status|init|keys|drain|step-down|forget [選項]（叢集；kairos cluster --help 顯示說明）\n\n\
 kairos --check-config [--config <path>] [--strict] [--json]（檢查設定後結束）\n       \
 kairos diag [選項]（產生支援診斷包；kairos diag --help 顯示說明）\n\n\
 選項:\n  \
@@ -479,6 +482,23 @@ pub enum StorageBackend {
     Sqlite,
     /// 舊版的按日 JSONL（`reports-YYYY-MM-DD.jsonl`）；沒有主機清冊與彙總，只供相容與回復
     Jsonl,
+    /// PostgreSQL（`[storage.postgres]`；`kairos/HA.md` 第 4、5 節）：功能與 SQLite 相同，資料放在外部資料庫
+    Postgres,
+}
+
+impl StorageBackend {
+    /// 是資料庫後端（SQLite 或 PostgreSQL）：有主機清冊、彙總、主控台、註冊、告警等需要資料庫的功能
+    pub fn is_database(self) -> bool {
+        matches!(self, StorageBackend::Sqlite | StorageBackend::Postgres)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageBackend::Sqlite => "sqlite",
+            StorageBackend::Jsonl => "jsonl",
+            StorageBackend::Postgres => "postgres",
+        }
+    }
 }
 
 /// SQLite 的 `PRAGMA synchronous`（`storage.sqlite_synchronous`）
@@ -525,6 +545,8 @@ pub struct StorageSettings {
     /// 每台主機最多幾個指標序列（含 Kairos 算出的速率與推算序列）。超過時新序列的指標不保存
     /// （`KRS-W4104`），其餘照存並回 `ack`（METRICS.md 第 9.1 節）
     pub max_series_per_host: usize,
+    /// `backend = "postgres"` 時的連線設定
+    pub postgres: PostgresSettings,
 }
 
 impl Default for StorageSettings {
@@ -542,6 +564,7 @@ impl Default for StorageSettings {
             sqlite_synchronous: SqliteSynchronous::Normal,
             max_hosts: None,
             max_series_per_host: DEFAULT_MAX_SERIES_PER_HOST,
+            postgres: PostgresSettings::default(),
         }
     }
 }
@@ -837,6 +860,8 @@ pub enum CliAction {
     Users(crate::users_cli::UsersCommand),
     /// `kairos audit ...`（稽核日誌的查詢、驗證與匯出，見 [`crate::audit_cli`]）
     Audit(crate::audit_cli::AuditCommand),
+    /// `kairos cluster ...`（叢集的維運命令，見 [`crate::cluster_cli`]）
+    Cluster(crate::cluster_cli::ClusterCommand),
     /// `kairos diag ...`（支援診斷包，見 [`crate::diag`]）
     Diag(crate::diag::DiagArgs),
     /// `kairos --check-config`／`kairos check-config`（檢查設定後結束，見 [`crate::diag`]）
@@ -910,6 +935,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "audit") {
         iter.next();
         return crate::audit_cli::parse_args(iter).map(CliAction::Audit);
+    }
+    if iter.peek().is_some_and(|a| a == "cluster") {
+        iter.next();
+        return crate::cluster_cli::parse_args(iter).map(CliAction::Cluster);
     }
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();
@@ -1120,8 +1149,7 @@ impl AppConfig {
     pub fn total_limit_below_estimate(&self) -> Option<(u64, u64)> {
         let max = self.storage.max_total_bytes;
         let estimate = self.estimated_sqlite_bytes(self.server.max_connections as u64);
-        (self.storage.backend == StorageBackend::Sqlite && max > 0 && estimate > max)
-            .then_some((max, estimate))
+        (self.storage.backend.is_database() && max > 0 && estimate > max).then_some((max, estimate))
     }
 
     /// 到期預警的門檻（O1）
@@ -1233,6 +1261,15 @@ impl AppConfig {
         };
 
         settings.validate()?;
+        // 這個行程使用的資料庫後端（`storage.backend = "postgres"` 時建立連線池，不連線）。單元測試中
+        // 不設定：測試各自載入不同的設定，行程層級的後端會互相干擾
+        #[cfg(not(test))]
+        crate::store::postgres::pool::configure(&settings);
+        // 叢集模式：這個行程（服務與所有子命令）不自動建立金鑰檔（kairos/HA.md 第 11.1 節）
+        #[cfg(not(test))]
+        if settings.cluster.enabled {
+            crate::cluster::keys::disable_autocreate();
+        }
         Ok(settings)
     }
 
@@ -1417,8 +1454,11 @@ impl AppConfig {
         }
         if self.storage.jsonl_mirror && self.storage.backend == StorageBackend::Jsonl {
             return invalid(
-                "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
+                "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 或 \"postgres\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
             );
+        }
+        if self.storage.backend == StorageBackend::Postgres {
+            self.storage.postgres.validate()?;
         }
         self.validate_console()?;
         self.enroll.validate()?;
@@ -1429,6 +1469,17 @@ impl AppConfig {
         self.audit.validate()?;
         self.export.validate()?;
         self.cluster.validate()?;
+        // 叢集模式只支援 PostgreSQL，且不支援 JSONL 鏡像（kairos/HA.md 第 15.1 節、第 21 節 #17）
+        if self.cluster.enabled && self.storage.backend != StorageBackend::Postgres {
+            return invalid(
+                "錯誤 KRS-E0202：設定互相矛盾：cluster.enabled = true 需要 storage.backend = \"postgres\"（叢集的節點共用一個 PostgreSQL；SQLite 與 JSONL 只支援單機）",
+            );
+        }
+        if self.cluster.enabled && self.storage.jsonl_mirror {
+            return invalid(
+                "錯誤 KRS-E0202：設定互相矛盾：叢集模式（cluster.enabled = true）不支援 storage.jsonl_mirror = true（JSONL 鏡像是節點本機的檔案）",
+            );
+        }
         self.remote.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;
@@ -1490,7 +1541,7 @@ impl AppConfig {
 
     /// 8444 是否可能監聽（模式可在執行中切換，與目前的模式無關）：需要 SQLite、mTLS 與 `pki.server_ca_path`
     pub fn enroll_possible(&self) -> bool {
-        self.storage.backend == StorageBackend::Sqlite
+        self.storage.backend.is_database()
             && self.auth.client_ca_path().is_some()
             && self.pki.server_ca().is_some()
     }
@@ -1914,7 +1965,34 @@ mod tests {
         assert_eq!(c.max_hosts(), 20000);
         assert!(c.validate().is_ok());
         // 不認得的值是錯誤
-        assert!(from_env(&[("KAIROS__STORAGE__BACKEND", "postgres")]).is_err());
+        assert!(from_env(&[("KAIROS__STORAGE__BACKEND", "mysql")]).is_err());
+        // PostgreSQL 後端（0.10.0）：連線設定在 [storage.postgres]，只在選用時檢查
+        let c = from_env(&[
+            ("KAIROS__STORAGE__BACKEND", "postgres"),
+            ("KAIROS__STORAGE__POSTGRES__HOST", "db.example.com"),
+            ("KAIROS__STORAGE__POSTGRES__SCHEMA", "kairos_a"),
+        ])
+        .unwrap();
+        assert_eq!(c.storage.backend, StorageBackend::Postgres);
+        assert!(c.storage.backend.is_database() && !c.storage.writes_jsonl());
+        assert_eq!(c.storage.postgres.host, "db.example.com");
+        assert_eq!(
+            c.storage.postgres.effective_sslmode(),
+            PgSslMode::VerifyFull
+        );
+        assert!(
+            c.validate().is_ok() && c.enroll_possible() == AppConfig::default().enroll_possible()
+        );
+        let bad = from_env(&[
+            ("KAIROS__STORAGE__BACKEND", "postgres"),
+            ("KAIROS__STORAGE__POSTGRES__SCHEMA", "Bad-Name"),
+        ])
+        .unwrap();
+        let e = bad.validate().unwrap_err().to_string();
+        assert!(e.contains("storage.postgres.schema"), "{e}");
+        // 沒有選用 PostgreSQL 時不檢查 [storage.postgres]
+        let unused = from_env(&[("KAIROS__STORAGE__POSTGRES__SCHEMA", "Bad-Name")]).unwrap();
+        assert!(unused.validate().is_ok());
         assert!(from_env(&[("KAIROS__STORAGE__SQLITE_SYNCHRONOUS", "off")]).is_err());
 
         let c: AppConfig = Config::builder()

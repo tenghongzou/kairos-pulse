@@ -6,6 +6,8 @@ mod audit_cli;
 mod audit_monitor;
 mod auth;
 mod bus;
+mod cluster;
+mod cluster_cli;
 mod config;
 mod connection;
 mod dedup;
@@ -23,6 +25,7 @@ mod integration_tests;
 mod keys_backup;
 mod logger;
 mod metrics;
+mod migrate_cli;
 mod monitor;
 mod per_ip;
 mod pki;
@@ -452,6 +455,23 @@ fn listen_error(e: Error) -> Error {
     }
 }
 
+/// 儲存啟動失敗：PostgreSQL 無法連線或不符合要求（`KRS-E4401`、`E4402`、`E4404`、`E4405`；
+/// `kairos/HA.md` 第 19 節）標記為設定錯誤（[`EXIT_CONFIG`]）；其他原因不標記
+fn storage_start_error(e: Error) -> Error {
+    let text = e.to_string();
+    let pg = [
+        store::postgres::pool::CODE_PG_UNREACHABLE,
+        store::postgres::pool::CODE_PG_REQUIREMENTS,
+        store::postgres::pool::CODE_PG_SCHEMA_NEWER,
+        store::postgres::CODE_MIGRATE_FAILED,
+    ];
+    if pg.iter().any(|code| text.contains(code)) {
+        config_error(e)
+    } else {
+        e
+    }
+}
+
 /// 錯誤上標記的結束代碼（未標記時為 `None`）
 fn classified_code(e: &Error) -> Option<u8> {
     e.get_ref()
@@ -491,6 +511,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Alerts(cmd)) => return ExitCode::from(alerts_cli::run(cmd)),
         Ok(CliAction::Users(cmd)) => return ExitCode::from(users_cli::run(cmd)),
         Ok(CliAction::Audit(cmd)) => return ExitCode::from(audit_cli::run(cmd)),
+        Ok(CliAction::Cluster(cmd)) => return ExitCode::from(cluster_cli::run(cmd)),
         Ok(CliAction::Diag(args)) => return ExitCode::from(diag::run(args)),
         Ok(CliAction::CheckConfig(args)) => return ExitCode::from(diag::run_check(args)),
         Err(e) => {
@@ -515,6 +536,7 @@ fn main() -> ExitCode {
                 Some(a) if a == "alert-channels" => alerts_cli::CHANNELS_USAGE,
                 Some(a) if a == "users" => users_cli::USERS_USAGE,
                 Some(a) if a == "audit" => audit_cli::AUDIT_USAGE,
+                Some(a) if a == "cluster" => cluster_cli::CLUSTER_USAGE,
                 Some(a) if a == "diag" => diag::DIAG_USAGE,
                 Some(a) if a == "check-config" => diag::CHECK_USAGE,
                 _ if std::env::args_os().any(|a| a == "--check-config") => diag::CHECK_USAGE,
@@ -761,7 +783,7 @@ async fn run(
 
     // 載入 TLS 設定；設定 auth.client_ca 時啟用 mTLS。先取指紋再建立，之間的變更會在下一次重載偵測到。
     // Kairos 簽發 CA 的信任錨與 CRL（kairos/PKI.md 第 2、10 節）：SQLite 且啟用 mTLS 時才可能存在
-    let pki_files = (config.storage.backend == StorageBackend::Sqlite
+    let pki_files = (config.storage.backend.is_database()
         && config.auth.client_ca_path().is_some())
     .then(|| {
         let data_dir = Path::new(&config.storage.data_dir);
@@ -830,6 +852,32 @@ async fn run(
             warn!("{}", message);
         }
     }
+    // 關機訊號：第一次記下 T0 並取消，第二次直接結束行程（叢集模式的備援階段也要能關機）
+    let shutdown = opts.shutdown.clone();
+    if opts.install_signal_handlers {
+        tokio::spawn(shutdown::watch(shutdown::Signals::new()?, shutdown.clone()));
+    }
+
+    // 叢集模式（kairos/HA.md 階段 A）：取得 leader 租約之前是備援節點，只連著資料庫、不開啟儲存、不監聽。
+    // 取得租約後才繼續下面與單機相同的啟動流程；失去租約時行程以結束代碼 75 結束
+    let cluster_handle = if config.cluster.enabled {
+        match cluster_wait_for_leadership(&config, &paths.data_dir, &shutdown).await? {
+            Some(handle) => Some(handle),
+            None => {
+                info!("Kairos 已結束（備援節點，沒有取得過 leader 租約）");
+                return Ok(None);
+            }
+        }
+    } else {
+        // 啟動保護：沒有啟用叢集模式的 Kairos 不與其他 Kairos 共用同一個 PostgreSQL schema
+        if config.storage.backend == StorageBackend::Postgres
+            && let Some(pool) = store::postgres::pool::active()
+        {
+            pool.set_service_mode(Some(store::postgres::pool::ServiceMode::Solo));
+        }
+        None
+    };
+
     let store::Storage {
         reports,
         writer: writer_task,
@@ -837,7 +885,9 @@ async fn run(
         restored,
         assets,
         purger,
-    } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
+    } = store::start(&config, &paths.data_dir, chrono::Utc::now)
+        .await
+        .map_err(storage_start_error)?;
     // 個資政策（[privacy]，kairos/PRIVACY.md）：要求假名化時金鑰檔一定要可用，否則不啟動
     let privacy = Arc::new(
         privacy::PrivacyPolicy::for_service(config.privacy, &paths.data_dir).map_err(|e| {
@@ -866,13 +916,12 @@ async fn run(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| config.server.listen.clone());
 
-    // 關機訊號：第一次記下 T0 並取消，第二次直接結束行程
-    let shutdown = opts.shutdown.clone();
-    if opts.install_signal_handlers {
-        tokio::spawn(shutdown::watch(shutdown::Signals::new()?, shutdown.clone()));
-    }
-
     let registry = Arc::new(Registry::with_max_agents(config.max_agents()));
+    if let Some(handle) = &cluster_handle {
+        // 節點心跳的 info：本節點的線上連線數
+        let registry = registry.clone();
+        handle.state.set_connections(move || registry.counts().0);
+    }
     // 主機清冊中最近 24 小時出現過的主機以離線狀態放回狀態表（A6）
     if !restored.is_empty() {
         let n = registry.restore(restored, Instant::now(), chrono::Utc::now());
@@ -981,7 +1030,7 @@ async fn run(
         );
     }
     // 稽核雜湊鏈的 HMAC 金鑰（data/audit-hmac.key）：只由服務建立，之後的稽核紀錄都帶 HMAC
-    if config.storage.backend == StorageBackend::Sqlite
+    if config.storage.backend.is_database()
         && let Err(e) = audit::ensure_key(&paths.data_dir)
     {
         error!(
@@ -992,7 +1041,7 @@ async fn run(
     }
     let enroll = match config.storage.backend {
         StorageBackend::Jsonl => None,
-        StorageBackend::Sqlite => {
+        StorageBackend::Sqlite | StorageBackend::Postgres => {
             let mut other_listens = vec![
                 listener
                     .local_addr()
@@ -1035,7 +1084,7 @@ async fn run(
     // 遠端管理（集中設定、Pulse 遠端升級；crates/kairos-proto/REMOTE.md）：需要 SQLite
     let remote = match config.storage.backend {
         StorageBackend::Jsonl => None,
-        StorageBackend::Sqlite => {
+        StorageBackend::Sqlite | StorageBackend::Postgres => {
             match remote::RemoteService::open(remote::StartParams {
                 settings: config.remote.clone(),
                 data_dir: paths.data_dir.clone(),
@@ -1114,7 +1163,7 @@ async fn run(
             );
             None
         }
-        (true, StorageBackend::Sqlite) => {
+        (true, StorageBackend::Sqlite | StorageBackend::Postgres) => {
             match alerts::AlertService::start(alerts::StartParams {
                 config: Arc::new(config.clone()),
                 data_dir: paths.data_dir.clone(),
@@ -1151,7 +1200,7 @@ async fn run(
             tls: tls_state.clone(),
             enroll: enroll_service.clone(),
             shutdown: shutdown.clone(),
-            db_path: (config.storage.backend == StorageBackend::Sqlite)
+            db_path: (config.storage.backend.is_database())
                 .then(|| store::sqlite::SqliteOptions::from_config(&config, &paths.data_dir).path),
             alerts: alert_service.clone(),
         })
@@ -1209,7 +1258,7 @@ async fn run(
             );
             None
         }
-        (true, StorageBackend::Sqlite) => {
+        (true, StorageBackend::Sqlite | StorageBackend::Postgres) => {
             let agent_addr = listener
                 .local_addr()
                 .map_err(|e| Error::new(e.kind(), format!("無法取得監聽位址: {e}")))?;
@@ -1363,11 +1412,100 @@ async fn run(
         );
     }
 
+    // 叢集：所有寫入都結束之後交還 leader 租約、把節點標為 stopped（備援節點不必等租約到期就能接手）
+    if let Some(handle) = cluster_handle {
+        handle.stop().await;
+    }
+
     info!(
         "Kairos 已結束（關機耗時 {:.2} 秒）",
         t0.elapsed().as_secs_f64()
     );
     Ok(shutdown.fatal_reason().map(str::to_string))
+}
+
+/// 叢集模式的備援階段：註冊節點、啟動協調執行緒與備援的探針監聽，等到本節點取得 leader 租約。
+/// 回傳 `Ok(None)`：還沒取得租約就收到關機訊號。啟動檢查失敗（資料庫不符合要求、schema 較新、
+/// `node_id` 重複、schema 正被單機模式的 Kairos 使用）時回設定錯誤。
+///
+/// 連不上資料庫**不是**錯誤：備援節點持續重試（`/readyz` 的 `cluster` 為 `lost`），資料庫恢復後繼續
+/// （`kairos/HA.md` 第 17 節 F6：所有節點都在等待）
+async fn cluster_wait_for_leadership(
+    config: &AppConfig,
+    data_dir: &Path,
+    shutdown: &Arc<Shutdown>,
+) -> Result<Option<cluster::runtime::ClusterHandle>, Error> {
+    let pool = store::postgres::pool::active().unwrap_or_else(|| {
+        store::postgres::pool::PgPool::with_data_dir(
+            config.storage.postgres.clone(),
+            Some(data_dir.to_path_buf()),
+        )
+    });
+    let hostname = kp_obs::logfmt::hostname();
+    let node_id = config.cluster.effective_node_id(&hostname);
+    let state = Arc::new(cluster::ClusterState::new(
+        node_id.clone(),
+        config.cluster.clone(),
+        cluster::confhash::config_hash(config),
+    ));
+    cluster::set_global(state.clone());
+    // 日誌（JSON 格式）每一行加上 node_id（kairos/HA.md 第 14.5 節）
+    if let Some(sink) = logger::sink() {
+        sink.meta.set_node_id(Some(node_id.clone()));
+    }
+
+    // 備援節點只監聽 observability.listen（/healthz 200、/readyz 503、/metrics）
+    let standby_probe = match config.observability.listen.trim() {
+        "" => None,
+        addr => {
+            let standby =
+                Arc::new(probe::StandbyProbe::new(state.clone(), config).map_err(config_error)?);
+            let server =
+                probe::start_standby_listener(standby.clone(), addr).map_err(listen_error)?;
+            info!(
+                "健康檢查與 Prometheus 端點（備援節點）：http://{}/healthz、/readyz、/metrics",
+                server.local_addr
+            );
+            Some((standby, server))
+        }
+    };
+    info!(
+        "叢集模式（cluster.enabled = true，{}）：節點 {node_id}，租約 {} 秒、心跳 {} 秒；等待取得 leader 租約（備援節點不監聽 agent、註冊與主控台的連接埠）",
+        config.cluster.mode, config.cluster.lease_ttl_secs, config.cluster.heartbeat_secs
+    );
+    let mut handle = cluster::runtime::start(cluster::runtime::StartParams {
+        state,
+        pool,
+        data_dir: data_dir.to_path_buf(),
+        hostname,
+        shutdown: shutdown.clone(),
+        on_lost: cluster::runtime::exit_on_lost(node_id),
+    })?;
+    let grant = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(None),
+        g = handle.wait_leader() => g,
+    };
+    // 備援的探針讓出連接埠，稍後由完整的探針在同一個位址監聽
+    if let Some((standby, server)) = standby_probe {
+        standby.stop.cancel();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || server.join()),
+        )
+        .await;
+    }
+    match grant {
+        Ok(Some(_)) => Ok(Some(handle)),
+        Ok(None) => {
+            handle.stop().await;
+            Ok(None)
+        }
+        Err(e) => {
+            handle.stop().await;
+            Err(config_error(e))
+        }
+    }
 }
 
 #[cfg(test)]

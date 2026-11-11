@@ -205,6 +205,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `GET /api/v1/hosts/{agent_id}/metrics/{name}` | S05 趨勢、S03 sparkline | 指標趨勢（第 5.3 節） |
 | `GET /api/v1/overview` | S03 總覽 | 各狀態台數、上線數 24 小時、離線最久、資源使用前 10（第 5.4 節） |
 | `GET /api/v1/system/health` | S20 系統健康、S03 健康條 | 檢查項目與數值（第 5.5 節） |
+| `GET /api/v1/cluster` | 〔待設計〕 | 叢集的節點、leader 租約與金鑰狀態（0.10.0〔草稿〕，第 5.11 節；需要 `settings:read`） |
 | `GET /api/v1/events` | S04「有 12 台狀態變化」、S03 自動更新、S06 | 即時變更推送（SSE，第 6 節；告警的 `alert.*` 見第 13.6 節） |
 | `/api/v1/alerts…`、`/alert-rules…`、`/silences…`、`/channels…` | S06～S11 | 告警（第 13 節） |
 
@@ -475,8 +476,9 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `alerts`（0.8） | `enabled`；啟用時同 `GET /api/v1/alerts/summary` 的 `engine`（`running`、`last_tick_at`、`warmup`、`last_error`…） | 嚴重：告警引擎沒有在執行（最近 60 秒沒有完成判定）。`alerts.enabled = false` 時為正常（「已停用」） |
 | `metrics`（0.8） | `on_console`、`token`（是否設定 `observability.metrics_token_file`）、`listen`、`proxied_rejected`（這次啟動後曾拒絕經反向代理轉送的請求，`KRS-W0304`） | —（摘要為設計包 S20「/metrics 端點」列的寫法） |
 | `remote`（0.9；第 17 節） | `available`（`false`：不是 SQLite 儲存）、`config_enabled`、`upgrade_enabled`、`allowed_signers_configured`；遠端升級啟用時另有 `rollouts_running`、`rollouts_paused`、`rollouts_auto_paused`、`paused[]`（前 10 個：`id`、`name`、`reason`、`cause`＝第 17.3 節的 `pause_cause`）、`releases`（版本庫的版本數）、`rollback_failed_unacknowledged`、`downloads_in_progress`、`max_concurrent_downloads` | 嚴重：有回滾失敗且尚未標記為已處理的主機（`KRS-E8408`）；警告：有自動暫停的推送（`KRS-W8414`；主控台暫停的不算）、遠端升級啟用且版本庫有發佈版本但沒有設定 `[remote] allowed_signers`（匯入時無法驗證簽章；版本庫是空的時只在摘要註明）。兩者都停用時為正常（「已停用」）（設計包 S20「遠端管理」列） |
+| `cluster`（0.10.0〔草稿〕；**只在叢集模式** `cluster.enabled = true` 時出現） | 同 `GET /api/v1/cluster` 的 `data`（第 5.11 節）：`enabled`、`mode`、`cluster_id`、`node_id`、`leader`、`last_leader`、`nodes[]`、`database`。摘要為「leader kairos-a（epoch 3）；2 個節點在執行」加上各個問題 | 嚴重：沒有任何節點持有 leader 租約（`KRS-E8503`）、有節點的金鑰與叢集不一致或缺少、或還沒有執行 `kairos cluster init`（`KRS-E8504`）。警告：有節點失聯（`KRS-W8506`）、有節點需要一致的設定與 leader 不同（`KRS-W8505`）、只有一個節點在執行（沒有備援）、資料庫沒有同步複寫（`KRS-W4403`）、這個節點與資料庫的時差超過 2 秒（`KRS-W8305`）、無法讀取叢集的狀態。`product_code` 取最嚴重的那一個問題的代碼 |
 
-**細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）、`remote`（`rollouts:read`，0.9）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
+**細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）、`remote`（`rollouts:read`，0.9）、`cluster`（`settings:read`，0.10）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
 
 〔之後〕CRL 自動更新（#6）、授權（#13）、時鐘（NTP）、目錄服務的最近一次連線結果在對應功能實作時加入。
 
@@ -577,6 +579,51 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 - 超出保留期限（同原始資料，預設 7 天；回應的 `retention_days` 為 `storage.raw_retention_days`）或沒有資料時 `sampled_at` 為 `null`、清單為空陣列。`supported` 同第 5.9 節（`processes`）。
 - `at` 不是 RFC 3339 時 400。
 
+### 5.11 `GET /api/v1/cluster`（0.10.0〔草稿〕）
+
+叢集模式（`[cluster] enabled = true`，階段 A：主動／備援；[`HA.md`](HA.md) 第 14.3 節、INSTALL 附錄 H）的節點、leader 租約與金鑰狀態。權限 `settings:read`；不接受任何查詢參數。資料與 `kairos cluster status --json` 的 `data` 相同，另加 `node_id` 與 `database`；系統健康的 `cluster` 項目（第 5.5 節）的 `values` 也是它。
+
+```json
+{ "server_time": "…", "data": {
+  "enabled": true, "mode": "active_passive",
+  "cluster_id": "0b6f0a52-3c1e-4d7a-9a51-6f1d2c3b4a59",
+  "node_id": "kairos-a",
+  "leader": { "node_id": "kairos-a", "epoch": 3, "since": "2026-11-11T02:14:07.120Z", "expires_in_ms": 11840 },
+  "last_leader": null,
+  "nodes": [
+    { "node_id": "kairos-a", "hostname": "kairos-a.example.com", "role": "leader", "version": "kairos 0.10.0",
+      "schema_version": 10, "advertise": "10.0.20.11:8443", "started_at": "2026-11-11T02:14:05.002Z",
+      "heartbeat_age_ms": 812, "connections": 843, "config_drift": false, "keys_ok": true, "key_problems": [] },
+    { "node_id": "kairos-b", "hostname": "kairos-b.example.com", "role": "standby", "version": "kairos 0.10.0",
+      "schema_version": 10, "advertise": "10.0.20.12:8443", "started_at": "2026-11-11T02:20:41.377Z",
+      "heartbeat_age_ms": 2140, "connections": 0, "config_drift": false, "keys_ok": true, "key_problems": [] }
+  ],
+  "database": { "target": "…", "sslmode": "verify-full", "server_version": "…", "synchronous_replication": true,
+                "clock_skew_ms": 12, "pool": { "size": 16, "idle": 5, "busy": 1, "exhausted": 0 } }
+} }
+```
+
+| 欄位 | 說明 |
+|---|---|
+| `enabled`、`mode` | `cluster.enabled`、`cluster.mode`（這一版只有 `active_passive`） |
+| `cluster_id` | 叢集的 UUID（`kairos cluster init` 產生）；還沒有執行 `init` 時為 `null` |
+| `node_id` | **回應這個請求的節點**（階段 A 就是主動節點）；沒有啟用叢集模式時為 `null` |
+| `leader` | 目前有效的租約：持有者 `node_id`、`epoch`（每次取得加一）、`since`（取得的時間）、`expires_in_ms`（距離到期，以資料庫的時鐘計算；leader 每 `lease_ttl_secs / 3` 秒續約）。沒有有效的租約時為 `null` |
+| `last_leader` | 租約已到期時的上一個持有者：`node_id`、`epoch`、`expired_ms_ago`；有 `leader` 或還沒有節點取得過租約時為 `null` |
+| `nodes[]` | 資料庫中每個節點一筆（含已停止的），依 `node_id` 排序 |
+| `nodes[].role` | `leader`、`standby`、`draining`（被 `kairos cluster drain` 排空，不參與選舉）、`stopped`（正常關機）、`lost`（心跳超過 `cluster.node_lost_secs`；由 leader 標記，或讀取時依 `heartbeat_age_ms` 判斷） |
+| `nodes[].hostname`、`version`、`schema_version`、`advertise`、`started_at` | 節點啟動時登記的主機名稱、Kairos 版本、它支援的 schema 版本、`cluster.advertise`（沒有設定時 `null`）、這次啟動的時間 |
+| `nodes[].heartbeat_age_ms` | 距離最近一次心跳的毫秒數（資料庫的時鐘） |
+| `nodes[].connections` | 節點最近一次心跳回報的 agent 連線數（備援為 0）；沒有回報時 `null` |
+| `nodes[].config_drift` | 需要一致的設定與 leader 不同（`KRS-W8505`）；沒有 leader 時為 `false` |
+| `nodes[].keys_ok`、`key_problems[]` | 節點的金鑰與叢集一致（自己回報一致，且指紋與 leader 相同）；`false` 時該節點不參與選舉（`KRS-E8504`），`key_problems` 是它回報的原因（文字，例如缺少哪一個金鑰檔） |
+| `database` | 回應的節點看到的 PostgreSQL：`target`、`sslmode`、`server_version`、`synchronous_replication`、`clock_skew_ms`、`pool`（與第 5.5 節 `database` 項目的 `values.postgres` 相同）；不是 PostgreSQL 後端時為 `null` |
+
+- **沒有啟用叢集模式**時仍回 200：`enabled` 為 `false`、`cluster_id`／`node_id`／`leader`／`last_leader` 為 `null`、`nodes` 為空陣列。
+- 階段 A 只有主動節點監聽主控台，所以這個端點一律由 leader 回應；所有節點都不是 leader 時主控台連不上，改用 `kairos cluster status`（直接讀資料庫，在任何一個節點執行都可以）。
+- **只有讀取**：沒有 `POST` 的排空與交還端點，也沒有 `cluster:write` 權限（HA.md 第 14.3 節的規格尚未實作）。排空、交還、移除節點用 `kairos cluster drain <node_id>`、`step-down`、`forget <node_id>`（寫入稽核紀錄，類別 `cluster`，動作 `cluster.drain`、`cluster.step_down`、`cluster.forget`；`kairos cluster init` 為 `cluster.init`）。
+- 與 HA.md 第 14.3 節的差異：沒有「每個節點的監聽位址與最近的錯誤」，只有 `advertise` 與 `key_problems`。主控台還沒有叢集的畫面。
+
 ## 6. 即時變更推送（SSE）
 
 ```
@@ -607,11 +654,11 @@ data: {"agent_id":"6f1c…","hostname":"hmi-line3-07","display_name":null,"statu
 | `host.online` | 上線、重新上線、離線後恢復 | `agent_id`、`hostname`、`display_name`、`status`、`at`、`ip` |
 | `host.offline` | 離線 | 同上，另有 `reason`（第 5.2 節的 `offline_reason`） |
 | `alert.created`、`alert.updated`、`alert.resolved` | 告警事件的變化（0.6.0，第 13.6 節；只送給有 `alerts:read` 的身分） | 事件的摘要 |
-| `resync` | 要求重新抓取列表（見下） | `reason`：`restarted`（Kairos 重新啟動過）、`too_old`（`Last-Event-ID` 已不在保留範圍）、`overflow`（連線太慢、事件來不及送出） |
+| `resync` | 要求重新抓取列表（見下） | `reason`：`restarted`（Kairos 重新啟動過）、`failover`（0.10.0〔草稿〕，叢集模式：`Last-Event-ID` 屬於上一個主動節點，這個節點是從**另一個節點**接手的；用戶端的處理與 `restarted` 相同，可以另外顯示「伺服器已切換」）、`too_old`（`Last-Event-ID` 已不在保留範圍）、`overflow`（連線太慢、事件來不及送出） |
 | 心跳 | 每 15 秒一行註解（`: heartbeat <時間>`） | 讓代理伺服器與用戶端偵測斷線；不是事件，不改變 `Last-Event-ID` |
 
 - **事件編號**：`<epoch>-<序號>`。epoch 是這次啟動的識別碼（啟動時間的 base36），序號從 1 起遞增。
-- **重連的語意**：Kairos 在記憶體中保留最近 **4,096 則**事件。帶 `Last-Event-ID` 重連時，若 epoch 相同且之後的事件都還在保留範圍內，先補送遺漏的事件（`ready.resumed: true`），之後繼續即時推送；否則先送 `resync`（`resumed: false`），用戶端應**重新抓取列表**（`GET /api/v1/hosts`，以回應的 `meta.last_event_id` 作為新的起點），再繼續套用之後的事件。Kairos 重新啟動後一律 `resync`。
+- **重連的語意**：Kairos 在記憶體中保留最近 **4,096 則**事件。帶 `Last-Event-ID` 重連時，若 epoch 相同且之後的事件都還在保留範圍內，先補送遺漏的事件（`ready.resumed: true`），之後繼續即時推送；否則先送 `resync`（`resumed: false`），用戶端應**重新抓取列表**（`GET /api/v1/hosts`，以回應的 `meta.last_event_id` 作為新的起點），再繼續套用之後的事件。Kairos 重新啟動後一律 `resync`；叢集模式下主動節點換手後也是（事件保留在主動節點的記憶體中，不跨節點；原因為 `failover`，同一個節點重新取得租約時為 `restarted`）。
 - **建議用法**：先開 SSE 收到 `ready`，再取列表；之後只套用編號大於列表 `meta.last_event_id` 的事件（同一台主機的事件依編號順序套用即可，狀態以最後一則為準）。
 - **事件只是提示**：狀態可能在事件之後又改變，需要精確值時以列表或詳情為準；設計包 S04「有 12 台狀態變化 · 更新列表」即依事件計數、由使用者決定何時重新抓取。
 - **連線數上限**：`console.max_streams`（預設 16）；超過時回 503 `too_many_streams`（`Retry-After: 10`）。每條 SSE 也算在 `console.max_connections` 內。用戶端送出的速度跟不上（伺服器端緩衝超過 256 則）時，送出 `resync` 後從最新的事件繼續。
@@ -1337,7 +1384,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 | 路徑 | 回應 |
 |---|---|
 | `/api/…` | 本文件的 API |
-| `/healthz`、`/readyz`、`/metrics` | 健康檢查（README「健康檢查與 Prometheus」）；`observability.on_console = false` 時為 JSON 的 404 |
+| `/healthz`、`/readyz`、`/metrics` | 健康檢查（README「健康檢查與 Prometheus」；0.10.0〔草稿〕起 `/readyz` 的 `checks` 另有 `cluster`、`keys`、`schema`，`scope` 參數有 `agent`／`enroll`／`console`／`leader`）；`observability.on_console = false` 時為 JSON 的 404。叢集模式的備援節點不監聽主控台，這三個端點只在 `observability.listen` 上提供 |
 | `/assets/<檔案>` | 嵌入的檔案，`ETag`（內容的 SHA-256 前 16 bytes）、`Cache-Control: no-cache`，`If-None-Match` 相符時 304；不存在時 404 |
 | 最後一段含 `.` 的其他路徑 | 404（純文字）；第一段是主控台的路由、`.` 在第二段以後的參數時例外（`/admin/users/alice.w` 回 `index.html`） |
 | 其他路徑（`/`、`/login`、`/hosts/<agent_id>/metrics`…） | 單頁應用的 `index.html`，`Cache-Control: no-store`；畫面由瀏覽器端依網址決定（不需要驗證：資料一律經由需要驗證的 API）。第一段不是主控台的路由（`login`、`hosts`、`account`、`alerts`、`enrollment`、`certificates`、`audit`、`reports`、`admin`、`system`、`setup`、`error`、`docs`、`help`、`t`；設計包 `ia.md` §3）時本文同樣是 `index.html`（瀏覽器顯示 404 頁），但狀態碼為 **404**：例如 Pulse 的 `--enroll-server` 誤設為主控台的連接埠時，`/v1/enroll/server-info` 得到 404 而判定為不支援自動註冊（`PLS-E2106`） |

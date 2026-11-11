@@ -106,6 +106,8 @@ pub struct LogMeta {
     agent_id: RwLock<Option<String>>,
     /// Pulse 的多實例編號（`pulse-N.service`；單一實例時為 `None`，JSON 為 `null`）
     instance: RwLock<Option<u32>>,
+    /// Kairos 的叢集節點名稱（只在叢集模式設定；設定後 JSON 每行多一個 `node_id`，否則不輸出這個欄位）
+    node_id: RwLock<Option<String>>,
 }
 
 impl LogMeta {
@@ -118,7 +120,20 @@ impl LogMeta {
             seq: AtomicU64::new(0),
             agent_id: RwLock::new(None),
             instance: RwLock::new(None),
+            node_id: RwLock::new(None),
         }
+    }
+
+    /// 設定 JSON 的 `node_id`（Kairos 的叢集模式；`kairos/HA.md` 第 14.5 節）
+    pub fn set_node_id(&self, id: Option<String>) {
+        *self.node_id.write().unwrap_or_else(|e| e.into_inner()) = id;
+    }
+
+    pub fn node_id(&self) -> Option<String> {
+        self.node_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 設定 JSON 的 `instance`（Pulse 的多實例 N；設計包 `log-ux.md` §6.2）
@@ -621,9 +636,17 @@ pub fn format_json(line: &Line, meta: &LogMeta, now: DateTime<Utc>) -> String {
     }
     let _ = write!(
         out,
-        ",\"product\":{},\"host\":{},\"run_id\":{},\"seq\":{},\"target\":{},\"fields\":{{",
+        ",\"product\":{},\"host\":{}",
         json_str(meta.product),
         json_str(&meta.host),
+    );
+    // 叢集節點名稱：只在設定了的時候輸出（單機的輸出不變）
+    if let Some(node) = meta.node_id() {
+        let _ = write!(out, ",\"node_id\":{}", json_str(&node));
+    }
+    let _ = write!(
+        out,
+        ",\"run_id\":{},\"seq\":{},\"target\":{},\"fields\":{{",
         json_str(&meta.run_id),
         meta.next_seq(),
         json_str(&line.target),

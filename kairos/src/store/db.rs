@@ -28,6 +28,7 @@ pub use super::hosts::HostStore;
 pub use crate::alerts::store::AlertStore;
 pub use crate::api::tokens::TokenStore;
 pub use crate::audit::AuditLog;
+pub use crate::cluster::store::ClusterStore;
 pub use crate::enroll::store::EnrollStore;
 pub use crate::pki::store::PkiStore;
 pub use crate::remote::store::RemoteStore;
@@ -38,9 +39,9 @@ pub use crate::users::store::UserStore;
 #[allow(unused_imports)]
 pub mod prelude {
     pub use super::{
-        AdminStore, AlertStore, ApiQueries, AuditLog, DbHandle, EnrollStore, HostStore, PkiStore,
-        RemoteStore, SettingsStore, Store, StoreError, StoreResult, TokenStore, Tx, TxMode,
-        UserStore, in_write_tx,
+        AdminStore, AlertStore, ApiQueries, AuditLog, ClusterStore, DbHandle, EnrollStore,
+        HostStore, PkiStore, RemoteStore, SettingsStore, Store, StoreError, StoreResult,
+        TokenStore, Tx, TxMode, UserStore, in_write_tx,
     };
 }
 
@@ -147,6 +148,7 @@ pub trait Store:
     + ApiQueries
     + AdminStore
     + RemoteStore
+    + ClusterStore
 {
     /// 開始一個交易。連線上已有交易時失敗（與 SQLite 的巢狀 `BEGIN` 相同）
     fn begin(&self, mode: TxMode) -> StoreResult<Box<dyn Tx + '_>>;

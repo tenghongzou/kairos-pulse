@@ -804,6 +804,18 @@ fn run_inner(
         fix: vec!["修正設定檔後再執行，或以 --config 指定 Kairos 使用的設定檔。".to_string()],
         exit: EXIT_CONFIG,
     })?;
+    if config.storage.backend == StorageBackend::Postgres {
+        return Err(Failure {
+            code: crate::store::postgres::CODE_PG_UNSUPPORTED,
+            ..failure(
+                "storage.backend 為 \"postgres\"：kairos reports import 只能匯入到 SQLite。".to_string(),
+                vec![
+                    "先以 storage.backend = \"sqlite\" 匯入到 SQLite，再以 kairos db migrate --to postgres 搬到 PostgreSQL。".to_string(),
+                ],
+                EXIT_CONFIG,
+            )
+        });
+    }
     if config.storage.backend != StorageBackend::Sqlite {
         return Err(failure(
             "storage.backend 為 \"jsonl\"，沒有 SQLite 資料庫。".to_string(),

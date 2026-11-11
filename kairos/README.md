@@ -29,7 +29,7 @@
 - 使用 rustls（`ring` 加密後端），支援 TLS 1.2 與 TLS 1.3；私鑰支援 PKCS#8、PKCS#1（RSA）與 SEC1（EC）格式
 - 握手、等待 hello、寫出、讀取閒置皆有逾時；關閉連線時送出 `close_notify`
 - 單一連線出錯或接受連線失敗時，伺服器會記錄錯誤並繼續運作；report 寫入、監控、TLS 重載等背景工作異常結束時，記錄 `ERROR` 並走正常關機流程，以結束代碼 1 結束（交由服務管理員重新啟動）
-- 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試
+- 啟動失敗依原因以不同的結束代碼結束（依設計包 `cli-style.md` §8 的結束代碼表，完整對照見 monorepo 根目錄 README「結束代碼」）：命令列參數錯誤 **2**；設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽非 loopback 位址）**3**；憑證錯誤（伺服器憑證、私鑰、`auth.client_ca`、`auth.crl` 無法讀取、格式錯誤或不成對）**4**；連接埠已被佔用 **11**；其他啟動失敗 1。`kairos.service` 以 `RestartPreventExitStatus=2 3 4` 讓 systemd 不再對重試也不會成功的錯誤反覆重試。叢集模式（0.10.0〔草稿〕）另有 **75**：主動節點失去 leader 租約（`KRS-W8502`），由 `Restart=on-failure` 重新啟動為備援節點
 - 日誌同時輸出到終端與 `logs/kairos-YYYY-MM-DD.log`（UTC 日期），依 `log.retention_days` 自動清除；時間為 RFC 3339 帶時區，可改為 JSON（`log.format = "json"`）並外送到 syslog（RFC 5424）（0.6）
 - 指標轉出（審計 F7；0.9.0〔草稿〕，[EXPORT.md](EXPORT.md)）：所有主機的最新指標以 Prometheus text／OpenMetrics 提供（`GET /api/v1/export/prometheus`，唯讀角色的 API token、依主機群組篩選），或以 OTLP/HTTP（protobuf）推送到 OpenTelemetry collector（批次、重試、有上限的佇列、OpenTelemetry semantic conventions 的名稱與 `host.*` 屬性）；附 Grafana 儀表板（`packaging/grafana-kairos-hosts.json`）。主控台「系統設定 → 整合」可修改與查看狀態；沒有新增依賴
 - `/healthz`、`/readyz`（負載平衡器的探針）與 `/metrics`（Prometheus）；`kairos --check-config` 檢查設定、`kairos diag` 產生遮蔽敏感資料的支援診斷包（0.6）
@@ -408,8 +408,8 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `timeouts.hello_secs` | `KAIROS__TIMEOUTS__HELLO_SECS` | `5` | 握手後等待 hello 的時間（秒），逾時直接關閉，1～3600 |
 | `timeouts.write_secs` | `KAIROS__TIMEOUTS__WRITE_SECS` | `5` | 每則訊息寫出、以及等待 report 寫入資料檔的逾時（秒），**1～6**：伺服器的回應延遲必須不超過 8 秒，Pulse 的讀取閒置只在心跳間隔上預留 10 秒餘裕（見「協定概述」） |
 | `storage.data_dir` | `KAIROS__STORAGE__DATA_DIR` | `data` | 資料輸出目錄（SQLite 的 `kairos.db` 與 `agents.json`；寫 JSONL 時另有 `reports-*.jsonl`）。須為本機磁碟（不要用 NFS／SMB） |
-| `storage.backend` | `KAIROS__STORAGE__BACKEND` | `sqlite` | report 的儲存：`sqlite`（原始資料、彙總、主機清冊，見 STORAGE.md）或 `jsonl`（舊版的按日 JSONL，沒有主機清冊與彙總；durable 的去重只在記憶體中，範圍有限） |
-| `storage.jsonl_mirror` | `KAIROS__STORAGE__JSONL_MIRROR` | `false` | `backend = "sqlite"` 時另外輸出 JSONL 鏡像（格式與 `backend = "jsonl"` 相同，盡力而為，不影響 `ack`）；`backend = "jsonl"` 時設為 `true` 是設定錯誤 |
+| `storage.backend` | `KAIROS__STORAGE__BACKEND` | `sqlite` | report 的儲存：`sqlite`（原始資料、彙總、主機清冊，見 STORAGE.md）、`postgres`（0.10.0：外部的 PostgreSQL 14 以上，功能與 `sqlite` 相同，連線設定在 `storage.postgres.*`；STORAGE.md 第 19 節、INSTALL.md 附錄 D）或 `jsonl`（舊版的按日 JSONL，沒有主機清冊與彙總；durable 的去重只在記憶體中，範圍有限） |
+| `storage.jsonl_mirror` | `KAIROS__STORAGE__JSONL_MIRROR` | `false` | `backend = "sqlite"`／`"postgres"` 時另外輸出 JSONL 鏡像（格式與 `backend = "jsonl"` 相同，盡力而為，不影響 `ack`）；`backend = "jsonl"` 時設為 `true` 是設定錯誤 |
 | `storage.raw_retention_days` | `KAIROS__STORAGE__RAW_RETENTION_DAYS` | `7` | SQLite 原始 report 保留天數（今天與前 N 天，UTC），`0` = 不依時間刪除，上限 3650 |
 | `storage.rollup_5m_retention_days` | `KAIROS__STORAGE__ROLLUP_5M_RETENTION_DAYS` | `31` | 5 分鐘彙總（min／max／sum／count）保留天數，`0` = 不依時間刪除 |
 | `storage.rollup_1h_retention_days` | `KAIROS__STORAGE__ROLLUP_1H_RETENTION_DAYS` | `400` | 1 小時彙總保留天數，`0` = 不依時間刪除 |
@@ -418,6 +418,16 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `storage.max_hosts` | `KAIROS__STORAGE__MAX_HOSTS` | 未設定時為 `max(100000, limits.max_agents)` | 主機清冊最多幾台，明確設定時必須介於 `limits.max_agents`～1000000；已滿時新主機的 report 回 `storage_unavailable` |
 | `storage.retention_days` | `KAIROS__STORAGE__RETENTION_DAYS` | `30` | JSONL（`backend = "jsonl"` 或鏡像）的 `reports-YYYY-MM-DD.jsonl` 保留天數（今天與前 N 天保留），`0` = 永久保留，上限 3650 |
 | `storage.max_daily_bytes` | `KAIROS__STORAGE__MAX_DAILY_BYTES` | `0` | 每個 `reports-YYYY-MM-DD.jsonl` 的大小上限（bytes），`0` = 不限制。合適的上限取決於部署規模，請自行設定。只寫入放得下的完整紀錄；放不下的 report 不寫入：`backend = "jsonl"` 時回 `storage_unavailable`（`report could not be stored`，確定未保存），鏡像時只是不寫入鏡像（SQLite 照常寫入、照常 `ack`），並記 `ERROR`（節流）。換日後寫入新檔即恢復。寫 JSONL 且設定值小於「`server.max_connections` 條連線 × 每秒 1 則 × 約 250 bytes × 86400 秒」的估算量時，啟動時記 `WARN` |
+| `storage.postgres.host` | `KAIROS__STORAGE__POSTGRES__HOST` | `127.0.0.1` | 只在 `backend = "postgres"` 時使用（以下同）。PostgreSQL 的主機名稱、IP，或 Unix socket 的目錄（以 `/` 開頭；只有 Unix） |
+| `storage.postgres.port` | `KAIROS__STORAGE__POSTGRES__PORT` | `5432` | 連接埠 |
+| `storage.postgres.dbname` | `KAIROS__STORAGE__POSTGRES__DBNAME` | `kairos` | 資料庫（必須是 `UTF8` 編碼） |
+| `storage.postgres.user` | `KAIROS__STORAGE__POSTGRES__USER` | `kairos` | 帳號：需要能建立 `schema`，或對既有的 schema 有 `CREATE`、`USAGE` 權限 |
+| `storage.postgres.password_file` | `KAIROS__STORAGE__POSTGRES__PASSWORD_FILE` | 空 | 密碼檔（去掉結尾的換行；建議 0600）。密碼只從檔案讀取、每次建立連線時重新讀，不接受寫在設定檔或環境變數中；空字串 = 不送密碼（peer／trust 驗證） |
+| `storage.postgres.schema` | `KAIROS__STORAGE__POSTGRES__SCHEMA` | `kairos` | Kairos 專用的 schema（不存在時建立）：小寫英文字母或 `_` 開頭，只含小寫英文字母、數字與 `_`，最多 63 個字元 |
+| `storage.postgres.sslmode` | `KAIROS__STORAGE__POSTGRES__SSLMODE` | 未設定 | `verify-full`（加密並驗證伺服器憑證與主機名稱）、`require`（只加密，記 `WARN`）、`disable`（不加密；非本機時記 `WARN`）。未設定時：`host` 是 loopback 或 Unix socket 為 `disable`，其他為 `verify-full` |
+| `storage.postgres.ca_file` | `KAIROS__STORAGE__POSTGRES__CA_FILE` | 空 | `verify-full` 時驗證伺服器憑證的 CA（PEM，可含多張）；空字串 = 作業系統的信任清單 |
+| `storage.postgres.pool_size` | `KAIROS__STORAGE__POSTGRES__POOL_SIZE` | `16` | 連線池的連線數上限（2..=128）。另有 report 寫入等專用連線；資料庫的 `max_connections` 至少要 `pool_size` ＋ 4 |
+| `storage.postgres.connect_timeout_secs` | `KAIROS__STORAGE__POSTGRES__CONNECT_TIMEOUT_SECS` | `5` | 建立連線、以及連線池已滿時等待連線的上限（1..=120 秒） |
 | `auth.client_ca` | `KAIROS__AUTH__CLIENT_CA` | `""` | 非空時啟用 mTLS：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 `agent_id` 與憑證綁定（見「啟用 mTLS」） |
 | `auth.crl` | `KAIROS__AUTH__CRL`（逗號分隔） | `[]` | CRL 檔路徑清單（PEM 或 DER）；只在設定 `auth.client_ca` 時有效（見「撤銷客戶端憑證」） |
 | `auth.allow_multiple_dns_sans` | `KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS` | `false` | 是否接受含多個 DNS SAN 的客戶端憑證；`false` 時憑證必須恰好有一個 DNS SAN |
@@ -436,7 +446,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `observability.listen` | `KAIROS__OBSERVABILITY__LISTEN` | 空字串 | 另外以純 HTTP 監聽 `/healthz`、`/readyz`、`/metrics`（例如 `127.0.0.1:9464`）；空字串＝只在主控台的監聽上提供。不可與其他監聽位址相同（`KRS-E0202`） |
 | `observability.on_console` | `KAIROS__OBSERVABILITY__ON_CONSOLE` | `true` | 主控台的監聽（`console.listen`，HTTPS）也提供這三個端點 |
 | `observability.metrics_token_file` | `KAIROS__OBSERVABILITY__METRICS_TOKEN_FILE` | 空字串 | `/metrics` 的 bearer token 檔（一行，至少 16 個字元）；設定時任何來源都要帶 `Authorization: Bearer <token>`，未設定時只接受 loopback 來源。啟動時讀取，更換 token 後需重新啟動；檔案讀不到或內容不合格式時拒絕啟動（結束代碼 3） |
-| `console.enabled` | `KAIROS__CONSOLE__ENABLED` | `true` | 主控台 API（[API.md](API.md)）；`false` 時不監聽。需要 `storage.backend = "sqlite"`（`jsonl` 時不啟動並記 `WARN`） |
+| `console.enabled` | `KAIROS__CONSOLE__ENABLED` | `true` | 主控台 API（[API.md](API.md)）；`false` 時不監聽。需要 `storage.backend = "sqlite"` 或 `"postgres"`（`jsonl` 時不啟動並記 `WARN`） |
 | `console.listen` | `KAIROS__CONSOLE__LISTEN` | `127.0.0.1:9443` | 主控台的 HTTPS 監聽位址；預設只綁 loopback，開放給管理網段時改成 `0.0.0.0:9443` 並以防火牆限制來源。與 `server.listen` 的位址相同時拒絕啟動（`KRS-E0202`，結束代碼 3），連接埠被佔用時結束代碼 11 |
 | `console.cert_path`、`console.key_path` | `KAIROS__CONSOLE__CERT_PATH`、`KAIROS__CONSOLE__KEY_PATH` | `""` | 主控台的伺服器憑證與私鑰；都留空時沿用 `server.cert_path`／`key_path`，必須同時設定或同時留空。內容變更時依 `server.reload_interval_secs` 熱重載 |
 | `console.max_connections` | `KAIROS__CONSOLE__MAX_CONNECTIONS` | `64` | 主控台的同時連線上限（含 SSE），1～4096；計入檔案描述元的需要量 |
@@ -460,7 +470,14 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `privacy.process_user` | `KAIROS__PRIVACY__PROCESS_USER` | `keep` | 行程的執行身分：`keep`、`pseudonymize`、`drop` |
 | `privacy.inventory_network` | `KAIROS__PRIVACY__INVENTORY_NETWORK` | `keep` | 資產的網路介面：`keep`、`truncate`（位址截到 /24、/48，MAC 只留廠商碼）、`drop` |
 | `enroll.download_dir` | `KAIROS__ENROLL__DOWNLOAD_DIR` | `""` | （0.9.0〔草稿〕）8444 的下載端點 `/agent/<檔名>` 提供的目錄（Pulse 的 `pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig`）；空字串＝不提供（ENROLL.md 第 19.4 節第 3 項） |
-| `cluster.node_id` | `KAIROS__CLUSTER__NODE_ID` | `""`（主機名稱的第一段，轉成小寫，其他字元改為 `-`） | 節點名稱（0.9.0）：協商了 feature `cluster` 的 Pulse 在 `hello_ack.server_node` 收到它，`pulse status` 顯示連到哪個節點。1～63 個字元的 `[a-z0-9-]`，不以 `-` 開頭或結尾，不合法時拒絕啟動。叢集模式（`kairos/HA.md`）的其他設定在之後的版本才提供 |
+| `cluster.node_id` | `KAIROS__CLUSTER__NODE_ID` | `""`（主機名稱的第一段，轉成小寫，其他字元改為 `-`） | 節點名稱（0.9.0）：協商了 feature `cluster` 的 Pulse 在 `hello_ack.server_node` 收到它，`pulse status` 顯示連到哪個節點。1～63 個字元的 `[a-z0-9-]`，不以 `-` 開頭或結尾，不合法時拒絕啟動。叢集模式下是節點在叢集中的名稱，必須唯一（兩台主機重複時後啟動的拒絕啟動，`KRS-E8503`） |
+| `cluster.enabled` | `KAIROS__CLUSTER__ENABLED` | `false` | （0.10.0〔草稿〕）叢集模式（高可用，階段 A：主動／備援；見「叢集模式」與 INSTALL 附錄 H）。需要 `storage.backend = "postgres"`，且不可同時設定 `storage.jsonl_mirror = true`（否則 `KRS-E0202`，結束代碼 3）。啟用後不自動建立金鑰檔：先在第一個節點執行 `kairos cluster init` |
+| `cluster.mode` | `KAIROS__CLUSTER__MODE` | `active_passive` | `active_passive`（主動／備援）。`active_active`（多主動連線層）尚未實作，`enabled = true` 時拒絕啟動 |
+| `cluster.service_name` | `KAIROS__CLUSTER__SERVICE_NAME` | `""` | 選用：服務名稱（例 `kairos.example.com`，Pulse 的 `server.domain`）；`kairos --check-config` 檢查伺服器憑證的 SAN 含這個名稱（不含時警告） |
+| `cluster.advertise` | `KAIROS__CLUSTER__ADVERTISE` | `""` | 選用：顯示用的位址（`kairos cluster status`、系統健康、`GET /api/v1/cluster`），最多 255 個字元；不影響監聽 |
+| `cluster.lease_ttl_secs` | `KAIROS__CLUSTER__LEASE_TTL_SECS` | `15` | leader 租約的存活時間（秒），5～120。主動節點失效後，備援最慢在這個時間加 2 秒取得租約；主動節點超過「這個時間 − 5 秒」沒有續約成功就以結束代碼 75 結束（`KRS-W8502`）。應大於資料庫自動切換所需的時間 |
+| `cluster.heartbeat_secs` | `KAIROS__CLUSTER__HEARTBEAT_SECS` | `5` | 節點心跳的間隔（秒），1～30 |
+| `cluster.node_lost_secs` | `KAIROS__CLUSTER__NODE_LOST_SECS` | `20` | 心跳超過這個時間的節點視為失聯（`KRS-W8506`）；至少是 `heartbeat_secs` 的 3 倍，最多 3600 |
 
 - 所有相對路徑都以**目前工作目錄**解析。
 - 讀取閒置逾時不在設定檔中，而是依 agent 宣告的心跳間隔計算（見下節）。
@@ -575,6 +592,27 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 - **Grafana**：Prometheus 資料來源＋匯入 [`packaging/grafana-kairos-hosts.json`](packaging/grafana-kairos-hosts.json)。
 - 主控台可修改的鍵（啟用、過期門檻、行程排行、OTLP 的啟用／端點／間隔／名稱／標頭）存在資料庫、優先於 `kairos.toml`；環境變數最優先且主控台不能修改。只有管理員（新權限 `export:write`）能修改。
 
+## 叢集模式（高可用；0.10.0〔草稿〕）
+
+階段 A（主動／備援）：兩個以上的 Kairos 共用一個 PostgreSQL（`storage.backend = "postgres"`），以資料庫中的 leader 租約選出唯一的**主動節點**；它監聽 agent、註冊與主控台的連接埠並執行所有背景工作，其餘**備援節點**只連著資料庫、只監聽 `observability.listen`。主動節點失效時租約在 `cluster.lease_ttl_secs`（預設 15 秒）後到期，備援在 2 秒內取得並開始服務；失去租約的主動節點以結束代碼 75 結束，由 systemd 重新啟動為備援。規格見 [`HA.md`](HA.md)，部署步驟（含 keepalived、HAProxy、Pulse 的 `server.fallback_addresses`）見 [`packaging/INSTALL.md`](packaging/INSTALL.md) 附錄 H，資料表見 STORAGE.md 第 20 節。
+
+```bash
+kairos cluster status [--json]                  # 節點、leader 租約與金鑰狀態（0 正常、9 沒有 leader 或金鑰不一致）
+kairos cluster init                             # 第一個節點：建立金鑰與 cluster_id，把金鑰指紋寫入資料庫
+kairos cluster keys export <檔案> --password-stdin    # 在已有金鑰的節點匯出（以密碼加密；或 --password-file <檔案>）
+kairos cluster keys import <檔案> --password-stdin    # 在新節點匯入（--overwrite 取代不同的既有金鑰）
+kairos cluster drain <node_id>                  # 節點不再參與選舉；它是 leader 時正常關機並交還租約
+kairos cluster step-down                        # 讓 leader 的租約立即到期，其他節點在約 2 秒內接手
+kairos cluster forget <node_id>                 # 刪除已停止（或失聯）節點的紀錄
+```
+
+- 這些命令直接讀寫資料庫，不需要 Kairos 在本機執行，在任何一個節點執行都可以；都接受 `--config <path>`。結束代碼：0 完成、1 資料庫或檔案錯誤、2 用法錯誤、3 設定錯誤（沒有啟用叢集模式、不是 PostgreSQL）、9 `status` 有嚴重問題或匯入後金鑰仍不一致、10 權限不足、11 輸出檔已存在、金鑰衝突或節點仍在執行。
+- **叢集模式下不自動建立金鑰檔**（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`）。金鑰缺少或與叢集記錄的不同的節點不參與選舉（`/readyz` 的 `keys: mismatch`、`KRS-E8504`），行程不結束，匯入後自動繼續。
+- **啟動保護**：沒有啟用叢集模式的 Kairos 連到已有另一個 Kairos（單機或叢集節點）在使用的 PostgreSQL schema 時拒絕啟動（`KRS-E4402`，結束代碼 3），反之亦然。
+- 連不上 PostgreSQL 時，單機模式在啟動時以結束代碼 3 結束；叢集模式的節點不結束、持續重試。
+- 狀態：`kairos cluster status`、系統健康的 `cluster` 項目、`GET /api/v1/cluster`（API.md 第 5.11 節）、`/readyz` 與 `kairos_cluster_*` 指標（下一節）。JSON 格式的日誌（`log.format = "json"`）在叢集模式多一個 `node_id` 欄位。
+- **這一版沒有**：多主動（階段 B）、PROXY protocol v2（經 L4 負載平衡器時來源位址是負載平衡器的位址）、主控台的叢集畫面、`POST` 的排空／交還 API、叢集專用的系統告警規則、遠端升級版本庫的跨節點同步（每個節點要各自匯入相同的發佈版本）。
+
 ## 健康檢查與 Prometheus（0.6.0）
 
 審計 O3；設計包 `kairos/screens.md` S20、§24 #8。三個端點在主控台的監聽上提供（`console.listen`，HTTPS，預設 `127.0.0.1:9443`），也可以另外以純 HTTP 監聽（`observability.listen`，例如 `127.0.0.1:9464`；這個監聽只有這三個端點，在自己的執行緒上執行，與 agent 連線、report 的寫入分開）。
@@ -582,16 +620,35 @@ kairos audit export --out audit-2026-10.jsonl --from 2026-10-01T00:00:00Z --conf
 | 端點 | 認證 | 回應 |
 |---|---|---|
 | `/healthz` | 不需要 | 存活：`200 {"status":"ok"}`；關機中 `503 {"status":"shutting_down"}` |
-| `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用 |
+| `/readyz` | 不需要 | 就緒：agent 連線埠在監聽、資料庫可寫（每 5 秒檢查一次能否以讀寫模式開啟；不取得寫入鎖，避免與 writer 搶鎖）、最近 1 分鐘的 report 不是全部 `storage_unavailable`、不在關機中時 `200`，否則 `503`。本文只有各項的狀態字（`{"status":"ready","checks":{"agent_listener":"ok","database":"ok","storage":"ok","enroll":"closed",…}}`），不含版本、路徑、數量與位址。`/readyz?scope=enroll` 另外要求註冊端點（8444）在模式不是關閉時有在監聽，給只負責 8444 的負載平衡器使用。0.10.0〔草稿〕起 `checks` 另有 `cluster`、`keys`、`schema`，`scope` 另有 `agent`、`console`、`leader`（見下方「叢集模式的 `/readyz`」） |
 | `/metrics` | 設定 `observability.metrics_token_file` 時必須帶 `Authorization: Bearer <token>`（不符回 401）；未設定時只接受 loopback 來源（其他回 403），且請求帶有反向代理的轉送標頭（`Forwarded`、`X-Forwarded-For`／`-Host`／`-Proto`、`X-Real-IP`、`Via`）時一律 403（0.7；第一次記 `WARN``KRS-W0304`）。**經反向代理提供 `/metrics` 時必須設定 token**：代理轉送的請求來源都是 loopback，而不加轉送標頭的代理（例如 nginx 的預設）Kairos 無法發現 | Prometheus 文字格式（0.0.4） |
 
 負載平衡器（L4 或 HTTP 探針）建議以 `/readyz` 判斷：主控台的監聽要開放給負載平衡器時，改用 `observability.listen` 綁在負載平衡器可達的位址（`/metrics` 仍只接受 loopback 或帶 token 的請求）。
+
+**叢集模式的 `/readyz`**（0.10.0〔草稿〕；`[cluster] enabled = true`，[`HA.md`](HA.md) 第 14.1 節、INSTALL 附錄 H）。`checks` 新增三項（單機時也輸出，值固定為 `disabled`／`ok`／`ok`，不影響就緒的判斷）：
+
+| 檢查 | 值 |
+|---|---|
+| `cluster` | `leader`（本節點持有 leader 租約，是主動節點）、`standby`（備援）、`draining`（被 `kairos cluster drain` 排空，不參與選舉）、`lost`（連不上資料庫，或租約狀態不明）；單機為 `disabled` |
+| `keys` | `ok`、`mismatch`（本節點的金鑰缺少或與叢集記錄的不同，或還沒有執行 `kairos cluster init`；不參與選舉，`KRS-E8504`） |
+| `schema` | `ok`、`newer`（資料庫的 schema 比這個節點新，`KRS-E4405`）、`older` |
+
+| `scope` | 200 的條件 | 用途 |
+|---|---|---|
+| （無）、`agent` | 原有的條件，加上叢集模式時本節點是 leader 且 `keys`、`schema` 都是 `ok` | 負載平衡器的 agent 連線埠後端 |
+| `enroll` | 同上，另外要求註冊端點在監聽 | 8444 的後端 |
+| `console` | 與預設相同（階段 A 只有 leader 服務主控台） | 9443 的後端 |
+| `leader` | 只問「本節點是不是 leader」（且不在關機中），不看監聽與儲存的狀態；單機時恆為 200 | keepalived 的 `track_script` |
+
+- **備援節點**不監聽 agent、註冊與主控台的連接埠，三個端點只在 `observability.listen` 上提供（沒有設定時備援節點沒有探針）：`/healthz` 200、`/readyz` **一律 503**（不論 `scope`；本文只有 `shutdown`、`agent_listener`、`cluster`、`keys`、`schema`）、`/metrics` 只有 `kairos_build_info`、`kairos_start_time_seconds`、`kairos_ready`（0）與 `kairos_cluster_*`。取得租約後同一個位址改由完整的端點服務。
+- 不認得的 `scope` 視為預設。本文同樣只有狀態字，不含節點名稱與位址。
 
 `/metrics` 的內容（標籤只用有限集合的值，不以 agent_id 或 IP 當標籤）：
 
 | 類別 | metric |
 |---|---|
 | 服務 | `kairos_build_info{version,commit}`、`kairos_start_time_seconds`、`kairos_shutting_down`、`kairos_ready` |
+| 叢集（0.10.0〔草稿〕） | `kairos_cluster_enabled`（0／1；單機為 0，以下各項只在叢集模式輸出）、`kairos_cluster_role{role}`（`leader`／`standby`／`draining`，本節點目前的角色為 1）、`kairos_cluster_lease_epoch`（目前看到的 leader epoch，每次換手加一）、`kairos_cluster_lease_renewals_total{result}`（續約或嘗試取得租約：`ok`／`lost` 租約已被其他節點取得或到期／`error` 資料庫錯誤）、`kairos_cluster_leader_changes_total`（本節點看到的換手次數）、`kairos_cluster_nodes{state}`（`alive`／`lost`；`lost` 含已失聯但還沒有 `kairos cluster forget` 的節點）、`kairos_cluster_keys_ok`（本節點的金鑰與叢集一致；0 時不參與選舉，`KRS-E8504`）。每個節點各自輸出，Prometheus 以 `instance` 區分；`kairos_agents_online` 等既有的指標只有主動節點有 |
 | 連線與狀態表 | `kairos_agent_connections`、`kairos_agent_connections_max`、`kairos_agents_online`、`kairos_registry_entries`、`kairos_registry_max_entries`、`kairos_registry_evictions_total`、`kairos_registry_full_rejections_total`、`kairos_agent_online_total`、`kairos_agent_disconnects_total{reason}`（`idle_timeout`／`agent_closed`／`server_shutdown`／`certificate_rejected`／`write_unknown`／`server_lost`〔0.9 定義，叢集模式才會產生〕，與告警 Webhook、主機 API 的 `offline_reason` 相同；0.7 起主機 API 也改用這組名稱，過渡期另帶 `offline_reason_legacy`，API.md 第 5.2 節）、`kairos_agent_superseded_total`、`kairos_agent_auth_failures_total`（KRS-W1102）、`kairos_host_events_lagged_total`。上線、離線、被取代、身分驗證失敗與淘汰由內部事件匯流排計數（與告警引擎同一個來源，不重複） |
 | 告警 | `kairos_alerts_engine_enabled`、`kairos_alerts_engine_up`、`kairos_alerts_engine_last_tick_timestamp_seconds`、`kairos_alerts_engine_tick_duration_seconds`、`kairos_alerts_engine_warmup`、`kairos_alerts_open{severity,state}`（`state`：`firing`／`acknowledged`／`recovered`）、`kairos_alerts_fired_total{severity}`、`kairos_alerts_resolved_total{severity}`、`kairos_alerts_events_lagged_total`、`kairos_alert_channels{state}`（`ok`／`failed`／`disabled`）、`kairos_alert_notification_sends_total{kind,result}`（`kind`：`email`／`webhook`；`result`：`ok`／`error`；不含測試通知）、`kairos_alert_notifications_total{kind,state}`（`sent`／`failed`／`dropped`） |
 | 被拒的連線 | `kairos_connections_rejected_total{reason}`（`per_ip` KRS-W2201／`rate`／`handshake_limit` KRS-W2204）、`kairos_accept_pauses_total`、`kairos_accept_paused_seconds_total`、`kairos_accept_paused`、`kairos_report_rate_limited_total{scope}`（`identity`：mTLS 的憑證身分；`ip`：來源 IP） |
@@ -1138,7 +1195,7 @@ cargo fmt --check
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.99 cargo test -p kairos --locked
 ```
 
-協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。SQLite 儲存的測試在 `src/store/`：schema 建立與遷移（依序套用、失敗時整版不生效、拒絕較新或不是 Kairos 的資料庫）、緊湊編碼的往返、一批一個交易、commit 前失敗／磁碟已滿／結果未知的回報、去重（重複的回 `Duplicate`、同一批與跨重新開啟、結果不明後的重送只算一次）、取樣時間（durable 的 `ts` 與範圍）、遲到資料併入已寫出的彙總（不覆蓋、當掉後不重複）、補送中的桶延後寫出、資料庫或資料目錄被刪除時重建、主機清冊的同步（只寫有變化的、分批寫入、關機時寫完）與重新啟動後載回、彙總的寫出與當掉後補回（不重複計算）、保留期限（含時鐘跳躍保護）、總容量上限的刪除順序、趨勢查詢走索引（`EXPLAIN QUERY PLAN`）、匯出與線上備份、舊 JSONL 的匯入（`schema` 1／2／沒有 `schema`、壞行、重複匯入、與 Kairos 已保存的資料去重、保留期限、彙總不重複不漏算、獨占鎖；目錄掃描不跟隨符號連結）；writer 的 commit 後才回覆、group commit、取消的要求不寫入、JSONL 鏡像與關機前的清冊同步。吞吐量量測為 ignored 測試（`cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput`、匯入速度為 `import_throughput`，見 STORAGE.md「量測」）。主控台 API 的測試在 `src/api/`：回應與錯誤格式、查詢參數、base64url、token 的格式與雜湊（不保存秘密）、驗證失敗的速率限制、主機狀態的合併（清冊與即時狀態、暖機期、從未連線、離線原因）、篩選（含 CIDR）、排序與游標分頁（1,050 台走完不重複不遺漏、換排序時拒絕舊游標）、趨勢的解析度選擇與合併、SSE 的 `Last-Event-ID` 補送與重新同步、被拒憑證的歸屬（不歸屬不受信任的 CA）；`src/api/tests.rs` 以實際的 HTTPS 伺服器與 TLS 用戶端測試各端點、驗證、撤銷立即生效、SSE 與連線數上限、被拒的憑證寫入清冊；量測為 `api_bench_queries`、`api_bench_acks_under_load`（API.md 第 9 節）。端對端測試 `tests/e2e/tests/api.rs` 以實際的 Kairos 與 Pulse 經 API 查到主機、指標與 SSE 事件。測試數量以 `cargo test` 的輸出為準。
+協定本身的測試在與 Pulse 共用的 `crates/kairos-proto`（在 monorepo 根目錄執行 `cargo test -p kairos-proto`，`cargo test --workspace` 也會包含）：協定測試向量（直接從 `crates/kairos-proto/PROTOCOL.md` 的「範例」節解析，v1 與 v2 各一組）、版本協商與相容矩陣（以凍結的 v1 型別定義驗證舊版兩端忽略 v2 欄位）、v2 hello 欄位與通用指標的限制、規格中的上限與標準指標表與常數一致、錯誤碼表的 fatal 欄、訊息與 hello 欄位驗證邊界（UUID、大小寫正規化、長度、控制與格式字元、`ts` 長度、`proto` 與心跳的寬鬆解析與夾值）、`cpu_usage` 轉成 f32 後與直接反序列化的結果一致；日期保護的核心規則則在共用的 `crates/date-guard`。本產品的單元測試涵蓋 NDJSON codec（CRLF、非 UTF-8、單行上限含 `\r` 的邊界）、註冊表的取代、離線判定、24 小時清除與筆數上限淘汰、report 的保存與回覆（寫入後才成功、寫檔失敗與逾時回 `storage_unavailable`、寫出中途失敗時只對確定未寫入者回 `storage_unavailable`、逾時取消後不寫入、被取代不寫檔、失敗時不更新 `last_report`）、report 速率限制、按日分檔（日期→檔名、嚴格的檔名解析、保留天數邊界、跨日批次拆分、清除只碰符合的檔案、時鐘跳躍時不刪檔、跳躍保護狀態檔的保存與跨重啟讀回）、補換行與資料目錄重建、關機時佇列寫完、關機期限與讀取丟棄上限、背景工作異常時關機、mTLS 的 SAN 綁定（含多個 DNS SAN）、CRL 載入（PEM／DER／壞檔）與撤銷判定、憑證過期判定、mTLS 時停用 session resumption、熱重載的變更偵測與失敗時保留舊設定、現役連線重新驗證（以 `testdata/` 的憑證樣本）、每 IP 連線上限與每來源新連線速率（IPv6 /64）、握手中上限、CIDR 與網段允許清單的解析（含錯誤輸入與 IPv4-mapped IPv6）、允許清單的實際上限與啟動警告條件、兩階段計數（mTLS 時 hello 後改依憑證身分）、被拒連線的計數、跨連線的 report 限速與訊息速率、每日檔案大小上限、日期保護的逐步推進、回撥與跨重啟情境、狀態檔的隨機暫存檔名、日誌清除工作、看門狗不等待卡住的日誌、日誌檔名與保留、日誌節流（含依來源與總量上限），設定載入、環境變數（字串不轉型）與上限檢查，以及未啟用 mTLS 時的監聽位址檢查（loopback 判斷、拒絕啟動）、非 UTF-8 的命令列參數、report 檔被刪除或替換時重新開檔（含 Linux 的 `NotADirectory` 與 Unix 的 inode 比對）、資料檔與日誌檔的權限（Unix）、私鑰權限檢查、憑證 notAfter 與 CRL nextUpdate 的 DER 解析（含截斷與異常輸入）、到期預警的門檻與提醒間隔。`src/integration_tests.rs` 另以真實 TLS 連線測試 `handle_connection` 與 accept 迴圈（v1 client 的 v1 連線與 v2 欄位被忽略、v2 協商與指標 report 寫成 `schema` 2、未協商 `metrics` 時沿用三欄位、版本範圍沒有交集時的 `unsupported_version`、v2 hello 欄位的 `bad_request`、主機指紋改變的日誌、hello 狀態機、fatal 後關閉、`superseded`、連續無效訊息上限、單行上限、寬鬆的 hello 解析、hello 與閒置逾時、`close_notify`、狀態表已滿、report 速率限制、mTLS 的 SAN 綁定與停用 session resumption、hello 時與握手時的撤銷檢查、寫入結果未知時不回應、每 IP 連線上限、允許清單、mTLS 下同一 NAT 後 40 台依憑證身分連線與握手前的每 IP 保護、全域上限的暫停計時），mTLS 用的測試 CA、客戶端憑證與 CRL 放在 `src/test_pki.rs`，NAT 情境的 40 個身分在 `testdata/pki/nat-clients.bundle`。SQLite 儲存的測試在 `src/store/`：schema 建立與遷移（依序套用、失敗時整版不生效、拒絕較新或不是 Kairos 的資料庫）、緊湊編碼的往返、一批一個交易、commit 前失敗／磁碟已滿／結果未知的回報、去重（重複的回 `Duplicate`、同一批與跨重新開啟、結果不明後的重送只算一次）、取樣時間（durable 的 `ts` 與範圍）、遲到資料併入已寫出的彙總（不覆蓋、當掉後不重複）、補送中的桶延後寫出、資料庫或資料目錄被刪除時重建、主機清冊的同步（只寫有變化的、分批寫入、關機時寫完）與重新啟動後載回、彙總的寫出與當掉後補回（不重複計算）、保留期限（含時鐘跳躍保護）、總容量上限的刪除順序、趨勢查詢走索引（`EXPLAIN QUERY PLAN`）、匯出與線上備份、舊 JSONL 的匯入（`schema` 1／2／沒有 `schema`、壞行、重複匯入、與 Kairos 已保存的資料去重、保留期限、彙總不重複不漏算、獨占鎖；目錄掃描不跟隨符號連結）；writer 的 commit 後才回覆、group commit、取消的要求不寫入、JSONL 鏡像與關機前的清冊同步。吞吐量量測為 ignored 測試（`cargo test -p kairos --release -- --ignored --nocapture store_throughput`、匯入速度為 `import_throughput`，見 STORAGE.md「量測」）。主控台 API 的測試在 `src/api/`：回應與錯誤格式、查詢參數、base64url、token 的格式與雜湊（不保存秘密）、驗證失敗的速率限制、主機狀態的合併（清冊與即時狀態、暖機期、從未連線、離線原因）、篩選（含 CIDR）、排序與游標分頁（1,050 台走完不重複不遺漏、換排序時拒絕舊游標）、趨勢的解析度選擇與合併、SSE 的 `Last-Event-ID` 補送與重新同步、被拒憑證的歸屬（不歸屬不受信任的 CA）；`src/api/tests.rs` 以實際的 HTTPS 伺服器與 TLS 用戶端測試各端點、驗證、撤銷立即生效、SSE 與連線數上限、被拒的憑證寫入清冊；量測為 `api_bench_queries`、`api_bench_acks_under_load`（API.md 第 9 節）。端對端測試 `tests/e2e/tests/api.rs` 以實際的 Kairos 與 Pulse 經 API 查到主機、指標與 SSE 事件。測試數量以 `cargo test` 的輸出為準。
 
 > [!WARNING]
 > `src/test_pki.rs` 與 `testdata/`（例如 `testdata/pki/server.key`）中的私鑰**只供測試使用**，已公開在 repo 中，絕對不可用於任何部署環境。正式環境的憑證與私鑰請依「私有 CA」與「啟用 mTLS」重新產生。

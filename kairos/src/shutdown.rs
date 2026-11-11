@@ -181,7 +181,7 @@ fn try_log_within(wait: Duration, log: impl FnOnce() + Send + 'static) -> bool {
 }
 
 /// 嘗試記錄最後一行 ERROR（最多等 [`FINAL_LOG_WAIT`]）後立即以 `code` 結束行程
-fn log_and_exit(code: i32, message: String) -> ! {
+pub(crate) fn log_and_exit(code: i32, message: String) -> ! {
     try_log_within(FINAL_LOG_WAIT, move || {
         error!("{}", message);
         log::logger().flush();

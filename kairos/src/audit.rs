@@ -154,6 +154,8 @@ impl AuditKey {
             crate::users::secrets::restrict_0600(&data_dir.join(KEY_FILE));
             return Ok(k);
         }
+        // 叢集模式下不自動建立（kairos/HA.md 第 11.1 節）
+        crate::cluster::keys::check_autocreate(&data_dir.join(KEY_FILE))?;
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
         SystemRandom::new()
             .fill(&mut key[..])

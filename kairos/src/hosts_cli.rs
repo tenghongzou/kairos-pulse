@@ -12,7 +12,7 @@ use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::{AppConfig, StorageBackend, take_config_arg};
+use crate::config::{AppConfig, take_config_arg};
 use crate::storage::fmt_time;
 use crate::store::INVENTORY_SYNC_INTERVAL;
 use crate::store::db::DbHandle;
@@ -568,7 +568,7 @@ pub fn open_db(
         fix: vec!["修正設定檔後再執行，或以 --config 指定 Kairos 使用的設定檔。".to_string()],
         exit: EXIT_CONFIG,
     })?;
-    if config.storage.backend != StorageBackend::Sqlite {
+    if !config.storage.backend.is_database() {
         return Err(CliError {
             code,
             title: title.to_string(),

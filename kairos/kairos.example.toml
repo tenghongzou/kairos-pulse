@@ -16,17 +16,29 @@ write_secs = 5                # 寫出訊息與等待 report 寫檔的上限，1
 
 [storage]
 data_dir = "data"
-backend = "sqlite"            # report 的儲存：sqlite（<data_dir>/kairos.db：原始資料、彙總與主機清冊）或 jsonl（舊版的按日 JSONL，沒有主機清冊與彙總）；說明見 STORAGE.md
-jsonl_mirror = false          # backend = "sqlite" 時另外輸出 JSONL 鏡像 reports-YYYY-MM-DD.jsonl（盡力而為，不影響 ack）
+backend = "sqlite"            # report 的儲存：sqlite（預設；<data_dir>/kairos.db：原始資料、彙總與主機清冊）、postgres（外部的 PostgreSQL 14 以上，功能與 sqlite 相同，連線設定在 [storage.postgres]；STORAGE.md 第 19 節）或 jsonl（舊版的按日 JSONL，沒有主機清冊與彙總）
+jsonl_mirror = false          # backend = "sqlite"／"postgres" 時另外輸出 JSONL 鏡像 reports-YYYY-MM-DD.jsonl（盡力而為，不影響 ack）
 raw_retention_days = 7        # SQLite 原始 report 保留天數（今天與前 N 天，UTC），0 = 不依時間刪除，上限 3650
 rollup_5m_retention_days = 31 # 5 分鐘彙總（min/max/sum/count）保留天數，0 = 不依時間刪除
 rollup_1h_retention_days = 400 # 1 小時彙總保留天數，0 = 不依時間刪除
-max_total_bytes = 68719476736 # SQLite 資料庫的總容量上限（bytes，預設 64 GiB；0 = 不限制，否則至少 64 MiB）；超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總。小於估算量時啟動會記 WARN
+max_total_bytes = 68719476736 # 資料庫的總容量上限（SQLite：資料庫檔的使用量；PostgreSQL：Kairos 的資料表與索引的大小，不含 WAL，規則見 STORAGE.md 第 19.5 節）（bytes，預設 64 GiB；0 = 不限制，否則至少 64 MiB）；超過時依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總。小於估算量時啟動會記 WARN
 sqlite_synchronous = "normal" # normal：commit 寫入作業系統即 ack（與 JSONL 相同，斷電可能遺失最後幾個交易）；full：每次 commit 都 fsync
 # max_hosts = 100000          # 主機清冊最多幾台（limits.max_agents..=1000000）；未設定時為 max(100000, limits.max_agents)
 max_series_per_host = 2048    # 每台主機最多幾個指標序列（64～65536；含速率與推算序列）；超過時新序列的指標不保存（KRS-W4104），其他照存
 retention_days = 30           # JSONL（backend = "jsonl" 或鏡像）reports-YYYY-MM-DD.jsonl 保留天數（今天與前 N 天），0 = 永久保留，上限 3650
 max_daily_bytes = 0           # 每個 reports-YYYY-MM-DD.jsonl 的大小上限（bytes），0 = 不限制；backend = "jsonl" 時達到後當天的 report 回 storage_unavailable（鏡像只是不再寫入鏡像）。寫 JSONL 且設定值小於 max_connections × 每秒 1 則 × 約 250 bytes × 86400 時，啟動會記 WARN
+
+# [storage.postgres]          # backend = "postgres" 時的連線設定（0.10.0；kairos/HA.md 第 4.3 節、STORAGE.md 第 19 節）。資料目錄仍然需要：金鑰檔、PKI 快取、agents.json 與日誌留在本機
+# host = "db.example.com"     # 主機名稱、IP，或 Unix socket 的目錄（以 / 開頭，例如 /var/run/postgresql）
+# port = 5432
+# dbname = "kairos"           # 資料庫必須是 UTF8 編碼；需要 PostgreSQL 14 以上，不需要任何擴充
+# user = "kairos"             # 需要能在 dbname 中建立 schema，或對既有的 schema 有 CREATE 與 USAGE 權限
+# password_file = "/etc/kairos/pg.password"  # 密碼只從檔案讀取（內容去掉結尾的換行；建議 0600、擁有者為服務帳號），不接受寫在設定檔中；空字串 = 不送密碼（peer／trust 驗證）
+# schema = "kairos"           # Kairos 專用的 schema（不存在時建立）；小寫英文字母、數字與 _，同一個資料庫可以用不同的 schema 放多套 Kairos
+# sslmode = "verify-full"     # verify-full：加密並驗證伺服器憑證與主機名稱；require：只加密不驗證（WARN）；disable：不加密（非本機時 WARN）。未設定時：host 是 loopback 或 Unix socket 為 disable，其他為 verify-full
+# ca_file = "/etc/kairos/pg-ca.pem"  # verify-full 時驗證伺服器憑證的 CA（PEM）；空字串 = 作業系統的信任清單
+# pool_size = 16              # 連線池的連線數上限（2..=128）；另有 report 寫入等專用連線，資料庫的 max_connections 至少要 pool_size + 4
+# connect_timeout_secs = 5    # 建立連線與等待連線池的上限（1..=120）
 
 [auth]
 client_ca = ""                # 非空：要求客戶端憑證（mTLS），以此 PEM（可含多張 CA）驗證，並強制 agent_id 綁定
@@ -60,7 +72,7 @@ on_console = true             # 主控台的監聽（console.listen，HTTPS）�
 metrics_token_file = ""       # /metrics 的 bearer token 檔（一行，至少 16 個字元，例如 openssl rand -hex 32 > metrics.token）；
                               # 未設定時 /metrics 只接受 loopback 來源。/healthz、/readyz 不需要認證，只回傳狀態字
 
-[console]                     # 主控台 API（HTTPS，/api/v1，見 API.md）；需要 storage.backend = "sqlite"
+[console]                     # 主控台 API（HTTPS，/api/v1，見 API.md）；需要 storage.backend = "sqlite" 或 "postgres"
 enabled = true                # false：不監聽主控台連接埠
 listen = "127.0.0.1:9443"     # 預設只綁 loopback；開放給管理網段時改成 0.0.0.0:9443，並以防火牆只允許管理網段。不可與 server.listen 相同（KRS-E0202）
 cert_path = ""                # 主控台的伺服器憑證；空字串時沿用 server.cert_path（瀏覽器要信任時建議另設 SAN 為主控台網址的憑證）
@@ -134,7 +146,7 @@ expired_renew_grace_days = 90 # 過期寬限期（0 = 不接受過期續簽）
 revoke_on_self_decommission = true
 revoke_superseded = true      # 新憑證第一次連線後以 superseded 撤銷舊憑證
 
-[alerts]                      # 告警引擎（kairos/ALERTS.md）；需要 storage.backend = "sqlite"。規則、靜音與通知管道存在資料庫，以主控台 API 或 kairos alerts／silences／alert-rules 管理
+[alerts]                      # 告警引擎（kairos/ALERTS.md）；需要 storage.backend = "sqlite" 或 "postgres"。規則、靜音與通知管道存在資料庫，以主控台 API 或 kairos alerts／silences／alert-rules 管理
                               # 通知管道的機密以 data/alerts-secrets.key 加密（kairos db backup 不含；備份與還原時一起複製，INSTALL 第 10.2 節）
 enabled = true                # false：不啟動告警引擎（告警端點回 503 alerts_unavailable）
 console_url = ""              # 通知中的事件連結，例如 "https://monitor.example.com"；空字串時通知不附連結
@@ -208,8 +220,15 @@ process_command = "redact"    # keep | redact（遮蔽命令列中的密碼、to
 process_user = "keep"         # keep | pseudonymize | drop
 inventory_network = "keep"    # keep | truncate（介面位址 /24、/48，MAC 只留廠商碼）| drop
 
-[cluster]                     # 叢集的節點設定（kairos/HA.md）；0.9.0 只有 node_id，叢集模式之後的版本才提供
-node_id = ""                  # 節點名稱（Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）
+[cluster]                     # 叢集（高可用，kairos/HA.md；0.10.0 的階段 A：主動／備援）：兩個以上的 Kairos 共用一個 PostgreSQL，以資料庫中的租約選出唯一的主動節點（leader），其餘是不監聽的備援；部署步驟見 INSTALL 附錄 H
+enabled = false               # true：叢集模式。需要 storage.backend = "postgres"，不支援 storage.jsonl_mirror（KRS-E0202）；啟動前先在第一個節點執行 kairos cluster init，其他節點以 kairos cluster keys import 匯入金鑰。false 時（單機）這個 Kairos 不與其他 Kairos 共用資料庫
+mode = "active_passive"       # active_passive（主動／備援）；active_active（多主動連線層）尚未實作
+node_id = ""                  # 節點名稱（叢集內必須唯一；Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）
+service_name = ""             # 選用：服務名稱（例 kairos.example.com，Pulse 的 server.domain）；--check-config 檢查伺服器憑證的 SAN 含這個名稱
+advertise = ""                # 選用：顯示用的位址（kairos cluster status、系統健康）
+lease_ttl_secs = 15           # leader 租約的存活時間，5..=120。主動節點失效後，備援最慢在這個時間加 2 秒取得租約；leader 超過「這個時間 − 5 秒」沒有續約成功就結束（結束代碼 75，由 systemd 重新啟動為備援）。應大於資料庫自動切換所需的時間
+heartbeat_secs = 5            # 節點心跳的間隔，1..=30
+node_lost_secs = 20           # 心跳超過這個時間的節點視為失聯（KRS-W8506）；至少是 heartbeat_secs 的 3 倍
 
 [remote]                      # 集中設定與 Pulse 遠端升級（crates/kairos-proto/REMOTE.md；需要 SQLite 與 mTLS，Pulse 0.9.0 以上）；改變後需重新啟動
 config_enabled = true         # 宣告 feature config（集中設定）

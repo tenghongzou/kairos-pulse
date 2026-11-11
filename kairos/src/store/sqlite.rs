@@ -45,6 +45,7 @@ pub(crate) mod admin;
 pub(crate) mod alerts;
 pub(crate) mod api;
 pub(crate) mod audit;
+pub(crate) mod cluster;
 pub(crate) mod conn;
 pub(crate) mod enroll;
 pub(crate) mod hosts;
@@ -739,10 +740,15 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: remote::SCHEMA_V9,
     },
+    // v10（0.10.0）：叢集協調的資料表（SQL 在 store/sqlite/cluster.rs；獨立的一步，可重新編號）
+    Migration {
+        version: 10,
+        sql: cluster::SCHEMA_V10,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";
@@ -800,9 +806,9 @@ pub const HOST_SOURCE_IMPORT: &str = "import";
 pub const MAX_SERIES: usize = 1_000_000;
 
 /// 每次維護步驟最多刪除的列數（每步一個交易）
-const DELETE_BATCH_ROWS: i64 = 5_000;
+pub(crate) const DELETE_BATCH_ROWS: i64 = 5_000;
 /// 每次寫出彙總最多約這麼多列（只在主機邊界切開）
-const ROLLUP_CHUNK_ROWS: usize = 5_000;
+pub(crate) const ROLLUP_CHUNK_ROWS: usize = 5_000;
 /// 背景 checkpoint 的間隔（寫入的連線不自動 checkpoint，見 [`Checkpointer`]）
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
 /// WAL 中的頁數超過這個值（約 16 MiB）時，由寫入的連線在兩批之間補做一次 checkpoint，
@@ -813,26 +819,26 @@ const WAL_FALLBACK_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 /// 檢查總容量的間隔（超過上限、正在刪除時每一步都檢查）
 const CAPACITY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// 依保留期限刪除的間隔（啟動後立即執行一次）
-const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// 超過容量上限後刪到上限的這個比例以下才停止，避免在上限附近每幾秒刪一次
-const CAPACITY_LOW_WATERMARK_PERCENT: u64 = 95;
+pub(crate) const CAPACITY_LOW_WATERMARK_PERCENT: u64 = 95;
 /// 主機清冊的 `last_seen` 最多這麼久寫入一次（其他欄位改變時立即寫入）
-const LAST_SEEN_WRITE_INTERVAL_MS: i64 = 60_000;
+pub(crate) const LAST_SEEN_WRITE_INTERVAL_MS: i64 = 60_000;
 /// 主機清冊同步每個交易最多寫入的列數：重新啟動後第一次同步約有主機數那麼多列（1 萬台時 1 萬列），
 /// 分成多個短交易，在 report 的批次之間逐步寫入，不會一次擋住寫入（量測見 STORAGE.md「量測」）
 pub(crate) const INVENTORY_CHUNK_ROWS: usize = 500;
 /// 日期保護（DateGuard）狀態在 `meta` 表中的鍵
-const META_RETENTION_GUARD: &str = "retention_guard";
+pub(crate) const META_RETENTION_GUARD: &str = "retention_guard";
 /// 日誌中稱呼 SQLite 中的資料的名稱（DateGuard 的事件訊息）
 const GUARD_LABEL: &str = " SQLite 資料";
 
 /// 每台主機的序列數已達上限（METRICS.md 第 9.1、14 節；設計包 `copywriting.md` 範例 97，2026-10-15 正式分配）
 pub const CODE_SERIES_CAPPED: &str = "KRS-W4104";
 /// 同一台主機「序列數已達上限」的日誌間隔
-const SERIES_CAP_LOG_INTERVAL: Duration = Duration::from_secs(3600);
+pub(crate) const SERIES_CAP_LOG_INTERVAL: Duration = Duration::from_secs(3600);
 
-const HOSTS_FULL: &str = "主機清冊已達上限（storage.max_hosts），不接受新主機的 report";
-const SERIES_FULL: &str = "指標序列數已達上限，不接受含新序列的 report";
+pub(crate) const HOSTS_FULL: &str = "主機清冊已達上限（storage.max_hosts），不接受新主機的 report";
+pub(crate) const SERIES_FULL: &str = "指標序列數已達上限，不接受含新序列的 report";
 
 /// [`SqliteStore`] 的設定（取自 `[storage]`）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1511,7 +1517,7 @@ impl Caches {
     }
 }
 
-fn push_series_key(key: &mut String, name: &str, unit: &str, labels: &str) {
+pub(crate) fn push_series_key(key: &mut String, name: &str, unit: &str, labels: &str) {
     key.push_str(name);
     key.push('\u{1f}');
     key.push_str(unit);
@@ -1519,7 +1525,7 @@ fn push_series_key(key: &mut String, name: &str, unit: &str, labels: &str) {
     key.push_str(labels);
 }
 
-fn series_key_derived(name: &str, unit: &str, labels: &str, derived: i64) -> String {
+pub(crate) fn series_key_derived(name: &str, unit: &str, labels: &str, derived: i64) -> String {
     let mut key = String::with_capacity(name.len() + unit.len() + labels.len() + 4);
     push_series_key(&mut key, name, unit, labels);
     if derived != derive::DERIVED_NONE {
@@ -2839,39 +2845,39 @@ fn delete_oldest_rollup_day(conn: &mut Connection, table: &str) -> rusqlite::Res
 
 /// 要寫入清冊的一列（由狀態表的快照轉換）
 #[derive(Debug)]
-struct InventoryRow {
-    agent_id: String,
-    hostname: String,
-    agent_version: String,
-    proto: u32,
-    host_fingerprint: Option<String>,
-    display_name: Option<String>,
-    tags: Option<String>,
-    os: Option<String>,
-    report_interval_ms: Option<i64>,
-    peer: String,
-    identity_verified: bool,
-    online: bool,
-    connected_at: Option<i64>,
-    last_seen: i64,
-    offline_after_ms: i64,
-    last_report: Option<String>,
+pub(crate) struct InventoryRow {
+    pub(crate) agent_id: String,
+    pub(crate) hostname: String,
+    pub(crate) agent_version: String,
+    pub(crate) proto: u32,
+    pub(crate) host_fingerprint: Option<String>,
+    pub(crate) display_name: Option<String>,
+    pub(crate) tags: Option<String>,
+    pub(crate) os: Option<String>,
+    pub(crate) report_interval_ms: Option<i64>,
+    pub(crate) peer: String,
+    pub(crate) identity_verified: bool,
+    pub(crate) online: bool,
+    pub(crate) connected_at: Option<i64>,
+    pub(crate) last_seen: i64,
+    pub(crate) offline_after_ms: i64,
+    pub(crate) last_report: Option<String>,
     /// hello 的 `install`（0.9.0 起的 Pulse；REMOTE.md 第 2.1 節）
-    install_method: Option<String>,
-    install_upgrade: Option<String>,
-    install_config: Option<String>,
+    pub(crate) install_method: Option<String>,
+    pub(crate) install_upgrade: Option<String>,
+    pub(crate) install_config: Option<String>,
     /// 除了 last_seen 與 last_report（隨每次 heartbeat、report 改變）之外所有欄位的雜湊
-    hash: u64,
+    pub(crate) hash: u64,
 }
 
-fn parse_ms(t: &str) -> Option<i64> {
+pub(crate) fn parse_ms(t: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(t)
         .ok()
         .map(|t| t.timestamp_millis())
 }
 
 impl InventoryRow {
-    fn of(a: &AgentSnapshot, mtls: bool) -> Self {
+    pub(crate) fn of(a: &AgentSnapshot, mtls: bool) -> Self {
         let host = a.host.as_ref();
         let json = |v: Option<String>| v.filter(|s| !s.is_empty() && s != "null");
         let mut row = Self {

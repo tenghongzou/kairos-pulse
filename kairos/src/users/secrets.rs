@@ -75,6 +75,8 @@ impl ConsoleKey {
                 Self::from_bytes(&key)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
+                // 叢集模式下不自動建立（kairos/HA.md 第 11.1 節）
+                crate::cluster::keys::check_autocreate(&path)?;
                 let mut key = [0u8; 32];
                 SystemRandom::new()
                     .fill(&mut key)

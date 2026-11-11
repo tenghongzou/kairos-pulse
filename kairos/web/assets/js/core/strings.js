@@ -310,6 +310,8 @@ const M = {
   'health.alerts': '告警引擎',
   'health.metrics': '/metrics 端點',
   'health.remote': '遠端管理',
+  // 叢集模式才有這一項（kairos/HA.md 第 14.2 節）；摘要與數值由 API 提供，畫面沿用通用的檢查項目列
+  'health.cluster': '叢集',
   'health.item': '{label}：{summary}',
 
   // ---- 總覽（S03） ----

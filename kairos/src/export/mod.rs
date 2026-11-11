@@ -380,7 +380,7 @@ pub fn start(
     data_dir: &Path,
     shutdown: Arc<Shutdown>,
 ) -> (Arc<ExportHub>, tokio::task::JoinHandle<()>) {
-    let sqlite = config.storage.backend == crate::config::StorageBackend::Sqlite;
+    let sqlite = config.storage.backend.is_database();
     let db_path =
         sqlite.then(|| crate::store::sqlite::SqliteOptions::from_config(config, data_dir).path);
     let secrets = if sqlite {

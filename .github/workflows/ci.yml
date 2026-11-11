@@ -48,18 +48,86 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # PostgreSQL 後端的測試（kairos/HA.md 第 5.2、23 節）：只在 Linux 上以容器啟動 PostgreSQL 14（Kairos 支援的
+      # 最低主版本；映像檔固定到主版本）。Windows 的 runner 不能執行 Linux 容器，那裡的 PostgreSQL 測試會
+      # 「明確略過」（測試在 stderr 印出原因）；較新的主版本由下面的 postgres-compat job 驗證。
+      # 以 docker run 而不是 services：services 無法只套用在 matrix 中的一個作業系統
+      - name: Start PostgreSQL 14
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run -d --name kairos-test-pg             -e POSTGRES_USER=kairos -e POSTGRES_PASSWORD=kairos -e POSTGRES_DB=kairos             -p 127.0.0.1:55432:5432 postgres:14-alpine
+          for i in $(seq 1 60); do
+            if docker exec kairos-test-pg pg_isready -U kairos -d kairos >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec kairos-test-pg psql -U kairos -d kairos -Atc 'select version()'
+          # 設定後 PostgreSQL 的測試不可略過：連不上就失敗（KAIROS_TEST_PG_REQUIRED）
+          echo "KAIROS_TEST_PG_URL=postgres://kairos:kairos@127.0.0.1:55432/kairos" >> "$GITHUB_ENV"
+          echo "KAIROS_TEST_PG_REQUIRED=1" >> "$GITHUB_ENV"
+
       - name: cargo test
         run: cargo test --workspace --locked --exclude kp-e2e --no-fail-fast
 
       # 端對端測試（審計 Q1，tests/e2e）：以實際的 kairos、pulse 執行檔在 127.0.0.1 上以 mTLS 互連，
       # 不連外部網路。先在這一步建置執行檔（--locked），測試內的 cargo build 因此不需重新建置。
-      # 每個等待都有逾時，整套約 10 秒；這裡的 timeout 只防止 runner 異常時卡住整個 job
+      # 每個等待都有逾時；Linux 上另含叢集的容錯移轉測試（tests/cluster.rs：兩個 Kairos＋Pulse＋PostgreSQL，
+      # 要等 leader 租約到期，約 1～2 分鐘）。這裡的 timeout 只防止 runner 異常時卡住整個 job
       - name: Build binaries for end-to-end tests
         run: cargo build -p kairos -p pulse --bins --locked
 
       - name: End-to-end tests
         run: cargo test -p kp-e2e --locked --no-fail-fast
-        timeout-minutes: 10
+        timeout-minutes: 15
+
+  # PostgreSQL 後端在較新的主版本上的相容性：只跑儲存層的測試（兩個後端共用的測試本體）與 PostgreSQL 的
+  # 端對端測試。最低主版本 14 已在 check job 的 Linux 上跑過整套測試
+  postgres-compat:
+    name: store tests (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: kairos
+          POSTGRES_PASSWORD: kairos
+          POSTGRES_DB: kairos
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U kairos -d kairos"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      KAIROS_TEST_PG_URL: postgres://kairos:kairos@127.0.0.1:55432/kairos
+      KAIROS_TEST_PG_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Store tests (SQLite and PostgreSQL)
+        run: cargo test -p kairos --locked --no-fail-fast store::
+
+      - name: Build binaries for end-to-end tests
+        run: cargo build -p kairos -p pulse --bins --locked
+
+      # tests/postgres.rs（單一節點）與 tests/cluster.rs（叢集：租約、fencing、容錯移轉）
+      - name: End-to-end tests on PostgreSQL
+        run: cargo test -p kp-e2e --locked --no-fail-fast --test postgres --test cluster
+        timeout-minutes: 15
 
   deny:
     name: cargo deny
@@ -81,10 +149,10 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-  # 審計 D3 後半：打包前必須通過上面兩個 job（Linux／Windows 的 fmt、clippy、test 與 cargo deny）
+  # 審計 D3 後半：打包前必須通過上面的 job（Linux／Windows 的 fmt、clippy、test、PostgreSQL 相容性與 cargo deny）
   package:
     name: package (linux x86_64/aarch64, windows x86_64)
-    needs: [check, deny]
+    needs: [check, deny, postgres-compat]
     runs-on: ubuntu-latest
     steps:
       # 完整歷史與 tag：短 commit 的長度與 HEAD 上的 <名稱>-v* tag 檢查都和本機一致

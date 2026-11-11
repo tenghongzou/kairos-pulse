@@ -1057,6 +1057,69 @@ fn startup_records_restart_and_unplanned_downtime() {
 }
 
 #[test]
+fn cluster_handover_replaces_restart_and_downtime_events() {
+    use super::engine::Handover;
+    // HA.md 第 13.2 節：上一個 leader 是另一個節點、心跳還很新 → 「leader 已切換」，不開停機事件
+    let mut e = engine();
+    e.set_handover(Some(Handover {
+        from: "kairos-a".into(),
+        to: "kairos-b".into(),
+        recent: true,
+    }));
+    e.record_startup(Some((T0 - 6 * MIN, false)), false, false, T0);
+    let out = e.take_output();
+    let switched = out
+        .events
+        .iter()
+        .find(|x| x.rule_id == ids::RESTARTED)
+        .unwrap();
+    assert!(
+        switched
+            .title
+            .contains("叢集的 leader 已由 kairos-a 切換到 kairos-b"),
+        "{}",
+        switched.title
+    );
+    // 上一個 leader 沒有正常交還：警告（不是「上次沒有正常關機」的嚴重）
+    assert_eq!(switched.severity, Severity::Warning);
+    assert!(!out.events.iter().any(|x| x.rule_id == ids::DOWNTIME));
+
+    // 正常交還：資訊，直接結案
+    let mut e = engine();
+    e.set_handover(Some(Handover {
+        from: "kairos-a".into(),
+        to: "kairos-b".into(),
+        recent: true,
+    }));
+    e.record_startup(Some((T0 - 1000, true)), false, false, T0);
+    let out = e.take_output();
+    assert!(out.events.iter().any(|x| x.rule_id == ids::RESTARTED
+        && x.severity == Severity::Info
+        && x.state == EventState::Resolved
+        && x.title == "叢集的 leader 已由 kairos-a 切換到 kairos-b"));
+
+    // 上一個 leader 的心跳太舊：「叢集沒有 leader 達 N 分鐘」取代「停機 N 分鐘」
+    let mut e = engine();
+    e.set_handover(Some(Handover {
+        from: "kairos-a".into(),
+        to: "kairos-b".into(),
+        recent: false,
+    }));
+    e.record_startup(Some((T0 - 23 * MIN, false)), false, false, T0);
+    let out = e.take_output();
+    let down = out
+        .events
+        .iter()
+        .find(|x| x.rule_id == ids::DOWNTIME)
+        .unwrap();
+    assert!(
+        down.title.contains("叢集沒有 leader 達 23 分鐘"),
+        "{}",
+        down.title
+    );
+}
+
+#[test]
 fn report_stale_is_suppressed_while_writes_fail() {
     let mut e = engine();
     let mut a = host("a", "10.0.0.1");

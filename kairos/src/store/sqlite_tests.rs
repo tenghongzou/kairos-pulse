@@ -1585,11 +1585,11 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(migrate(&mut conn, &MIGRATIONS[..5]).unwrap(), 5);
     assert!(has(&conn, "alert_events"));
     assert!(!has(&conn, "users"));
-    // 再升級到最新版（整合後的線性順序 v4 → v5 → v6 → v7 → v8 → v9）：使用者的資料表建立
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 9);
+    // 再升級到最新版（整合後的線性順序 v4 → v5 → v6 → v7 → v8 → v9 → v10）：使用者的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 10);
     assert_eq!(
         MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     );
     for t in [
         "users",
@@ -1623,7 +1623,7 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(n, crate::alerts::rules::builtins().len());
     assert_eq!(conn.ensure_builtin_rules(2).unwrap(), 0);
     // 再執行一次升級：不變
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 9);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 10);
     drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1979,4 +1979,46 @@ fn assets_are_merged_and_changes_recorded() {
     assert!(store.write_assets(&other).is_err());
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 兩個後端共用的測試（`store/backend_tests.rs`）需要的內部狀態
+impl crate::store::backend_tests::TestStore for SqliteStore {
+    fn set_fail(&mut self, f: FailPoint) {
+        self.fail_next = Some(f);
+    }
+    fn rollup_len(&self) -> usize {
+        self.rollup.len()
+    }
+    fn rollup_clear(&mut self) {
+        self.rollup.clear();
+    }
+    fn rollup_take_count(&mut self) -> i64 {
+        self.rollup
+            .take_ready(i64::MAX, usize::MAX)
+            .iter()
+            .map(|r| r.agg.count as i64)
+            .sum()
+    }
+    fn defer_capacity(&mut self) {
+        self.capacity.next_check = Some(Instant::now() + Duration::from_secs(3600));
+    }
+    fn reset_capacity(&mut self) {
+        self.capacity = Capacity::default();
+    }
+    fn reset_retention(&mut self) {
+        self.next_retention = None;
+    }
+    fn set_max_total_bytes(&mut self, n: u64) {
+        self.opts.max_total_bytes = n;
+    }
+    fn set_max_hosts(&mut self, n: usize) {
+        self.opts.max_hosts = n;
+    }
+    fn used(&mut self) -> u64 {
+        self.ensure_ready().unwrap();
+        self.used_bytes().unwrap()
+    }
+    fn sync_now(&mut self, snapshot: &RegistrySnapshot) -> usize {
+        self.sync(snapshot).unwrap()
+    }
 }

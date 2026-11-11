@@ -1,5 +1,7 @@
 # Kairos 資料儲存（SQLite）
 
+> 0.10.0〔草稿〕起另有 **PostgreSQL 後端**（`storage.backend = "postgres"`）：功能與本文件描述的 SQLite 後端相同，設定、schema 的對應、並行控制、搬移（`kairos db migrate`）與兩者的差異集中在第 19 節。除了第 19 節，本文件描述的都是預設的 SQLite 後端。
+
 本文件說明 Kairos 0.3 起的 report 儲存、主機清冊、彙總、保留期限與容量上限（商業審計 A1、A6、A9），at-least-once（A5，協定 feature `durable`）的去重與補送資料的處理，以及匯入 0.2.x 的 JSONL（`kairos reports import`，第 13.1 節）。設定的完整清單見 [README.md](README.md)「設定」。
 
 ## 1. 架構
@@ -176,6 +178,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v7（0.7.0，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v8（0.8.0，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v9（0.9.0，衝刺 9，商業審計 F8）：集中設定與 Pulse 遠端升級（第 18 節）。`config_profiles`、`config_profile_revisions`、`config_assignments`、`host_config`、`releases`、`release_artifacts`、`rollouts`、`rollout_hosts` 與索引；`hosts.install_method`、`install_upgrade`、`install_config`；`meta.config_rev`。SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V9`（新的資料表依 L1a 的做法放在領域的檔案中，`MIGRATIONS` 仍在 `store/sqlite.rs`）。升級後 0.8 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v10（0.10.0〔草稿〕，衝刺 10，HA L2）：叢集協調的資料表（第 20 節）。`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures` 與索引；`enroll_requests.issuing_node`、`issuing_at`；`alert_deliveries.claim_epoch`。SQL 在 `store/sqlite/cluster.rs` 的 `SCHEMA_V10`。叢集模式只支援 PostgreSQL，SQLite 上這些資料表保持空白（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製）。升級後 0.9 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -440,10 +443,10 @@ systemctl start kairos
 
 ## 11. 量測
 
-`kairos/src/store/tests.rs` 的 `sqlite_throughput`（`#[ignore]`）：以實際的 writer 與 SQLite，每 10 ms 送出一批，每筆從放入佇列到收到結果計時。
+`kairos/src/store/tests.rs` 的 `store_throughput`（`#[ignore]`；0.9 以前名為 `sqlite_throughput`）：以實際的 writer 與 SQLite，每 10 ms 送出一批，每筆從放入佇列到收到結果計時。
 
 ```bash
-cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput
+cargo test -p kairos --release -- --ignored --nocapture store_throughput
 # 可調：KP_BENCH_RATE（筆／秒，預設 2000）、KP_BENCH_SECS（預設 30）、KP_BENCH_HOSTS（預設 10000）、
 #       KP_BENCH_SYNC=full、KP_BENCH_DIR（保留資料庫供檢查）
 # 補送尖峰：KP_BENCH_DURABLE=1（帶去重鍵、取樣時間從 KP_BENCH_BACKFILL_HOURS=72 小時前起）、
@@ -654,7 +657,7 @@ sudo systemctl start kairos
 
 ## 14. 限制與後續
 
-- 單一寫入者：同一個資料目錄只能有一個 Kairos（A2 的 HA 需要外部資料庫；規格草稿見 [`HA.md`](HA.md)：PostgreSQL 後端、主動／備援與多主動連線層、schema v9）。
+- 單一寫入者：同一個資料目錄只能有一個 Kairos（A2 的 HA 需要外部資料庫：0.10.0〔草稿〕的 PostgreSQL 後端與叢集模式——主動／備援——見第 19、20 節；規格見 [`HA.md`](HA.md)，多主動連線層尚未實作）。
 - 主控台 API（0.4，`API.md`）以唯讀連線查詢這個 schema；趨勢也可以 SQL 或 `kairos reports export` 取得。
 - `kairos reports export` 不做全域時間範圍的索引（未指定 `--agent` 時掃描整個 `reports` 表）。
 - 彙總的值以 f64 計算，超過 2^53 的整數會失去精度（原始資料保留原值）。
@@ -761,3 +764,270 @@ store/sqlite/{audit,users,tokens,pki,enroll,alerts,hosts,api,admin}.rs：原封�
 - **刪除主機資料**（第 16 節）一併刪除 `host_config` 與 `rollout_hosts` 中這台主機的紀錄（`remote_management` 筆數）；個資匯出另有 `remote_management`（`host_config` 與推送中的紀錄）。以 `host:<agent_id>` 選擇器的指派不刪除（它是設定，不是主機的資料）。
 - **備份**：`kairos db backup` 包含這些資料表，但**不含版本庫的發佈檔**（`<資料目錄>/releases/`，`[remote] releases_dir`）：可以從發佈處重新取得並以 `PUT …/artifacts/{filename}` 重新上傳。還原後 `stored = 1` 而檔案不存在的發佈檔，提議時 `upgrade_chunk_get` 回 `upgrade_unavailable`（日誌「版本庫的 … 無法讀取」），請重新上傳。
 - 升級到 v9 之後 0.8 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+
+## 19. PostgreSQL 後端（schema v9 起；0.10.0〔草稿〕；HA L1b）
+
+`storage.backend = "postgres"` 時，Kairos 把 SQLite 後端保存的所有資料（原始 report、彙總、主機清冊、資產、告警、使用者與工作階段、稽核雜湊鏈、註冊與 PKI、設定、指標轉出設定、遠端管理）改放在外部的 PostgreSQL。功能、API、CLI 與 `kairos.db` 相同；規格見 [`HA.md`](HA.md) 第 4、5、7、12 節。**SQLite 仍是預設值**，沒有設定 `backend = "postgres"` 的部署行為不變。本節只談儲存後端：沒有啟用叢集模式（`cluster.enabled = false`）時，**同一個資料庫與 schema 同時只能有一個 Kairos 使用**（第 19.7 節；啟動時檢查）。多個 Kairos 共用一個資料庫的叢集協調（租約、leader、fencing；HA.md 第 6 節）與它的資料表（schema v10）見第 20 節。
+
+### 19.1 設定與需求
+
+```toml
+[storage]
+backend = "postgres"
+
+[storage.postgres]
+host = "db.example.com"         # 或 Unix socket 的目錄（/var/run/postgresql）
+port = 5432
+dbname = "kairos"
+user = "kairos"
+password_file = "/etc/kairos/pg.password"   # 0600；不接受寫在設定檔中的密碼
+schema = "kairos"
+sslmode = "verify-full"         # 未設定時：loopback 與 Unix socket 為 disable，其他為 verify-full
+ca_file = "/etc/kairos/pg-ca.pem"
+pool_size = 16
+connect_timeout_secs = 5
+```
+
+| 項目 | 要求 | 不符合時 |
+|---|---|---|
+| 版本 | PostgreSQL 14 以上；只用社群版的功能，不需要任何擴充 | 拒絕啟動，`KRS-E4402` |
+| 編碼 | `UTF8` | 拒絕啟動，`KRS-E4402` |
+| 角色 | 連到**主庫**（`pg_is_in_recovery()` 為 false） | 拒絕啟動，`KRS-E4402` |
+| 權限 | 能在資料庫中建立 `schema`（或對既有的 schema 有 `CREATE`、`USAGE`）；schema 必須是 Kairos 專用的 | 拒絕啟動，`KRS-E4402` |
+| 連不上 | — | 啟動時拒絕啟動（`KRS-E4401`，結束代碼 3）；執行中 report 回 `storage_unavailable`、`/readyz` 503，恢復後自動重新連線 |
+| 同步複寫 | `synchronous_commit` 為 `on`／`remote_write`／`remote_apply` 且 `synchronous_standby_names` 非空 | 照常啟動；啟動時與之後每小時記一次 `KRS-W4403`（主庫故障時可能遺失最後幾個已 `ack` 的交易） |
+| TLS | 非本機時預設 `verify-full`（`ca_file`，未設定時為作業系統的信任清單） | `require`（不驗證憑證）與非本機的 `disable` 照常啟動並記 `WARN` |
+| 連線數 | 資料庫的 `max_connections` ≥ `pool_size` ＋ 4 | `WARN` |
+| 時鐘 | 與資料庫的時差不超過 2 秒 | `KRS-W8305`（`WARN`） |
+| 連線池中介 | PgBouncer 只支援 session pooling（交易層級與 session 層級的 advisory lock 需要固定的連線） | 偵測不到 |
+
+- **密碼**只從 `password_file` 讀取，每次建立連線時重新讀（輪替密碼不必重新啟動）；不寫入日誌，`kairos diag` 與 `--check-config` 的輸出也沒有。
+- **`kairos --check-config`** 會實際連線並回報版本、schema 的狀態與上表的警告（項目 `database`）；不建立也不修改任何東西。
+- **資料目錄仍然需要**（`storage.data_dir`）：金鑰檔（`audit-hmac.key`、`alerts-secrets.key`、`console.key`、`privacy.key`）、簽發 CA 的私鑰與 PKI 快取、遠端升級的版本庫、`agents.json` 與 JSONL 鏡像都留在本機。備份與還原時金鑰與資料庫要是同一個時間點的組合（第 9 節）。
+- **連線**：連線池（`pool_size`，預設 16）供主控台、註冊、告警、遠端管理與 CLI 使用，用完即歸還；report 的寫入另有一條專用連線（`statement_timeout` 為 `timeouts.write_secs`）。
+
+### 19.2 schema
+
+與 SQLite 的 schema 一對一（`store/postgres/schema.rs`；目前是 v10：`SCHEMA_V9` 加上 `UPGRADES` 的升級步驟）：資料表、欄位、索引名稱相同，第一次啟動（或任何會建立資料庫的 CLI）時在空的 schema 上以一個交易建立目前的版本。對應規則（HA.md 第 5.3 節）：
+
+| SQLite | PostgreSQL |
+|---|---|
+| `INTEGER`（含 0/1 旗標） | `BIGINT` |
+| `REAL`、`BLOB` | `DOUBLE PRECISION`、`BYTEA` |
+| `TEXT` | `TEXT COLLATE "C"`（位元組順序，與 SQLite 的 BINARY 相同；排序與分頁的結果一致） |
+| `INTEGER PRIMARY KEY`（rowid 別名） | `BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY` |
+| `WITHOUT ROWID` | 刪除 |
+| 無型別的 `meta.value` | `TEXT`（數值以文字保存） |
+| 無型別的 `reports.agent_ts` | 拆成 `agent_ts_ms BIGINT` 與 `agent_ts_text TEXT`（最多一個非 NULL） |
+| `COLLATE NOCASE`（`users.username`、`config_profiles.name`） | 唯一索引 `lower(欄位)`，比對一律 `lower()` |
+| `PRAGMA user_version`、`application_id` | `meta` 的 `schema_version`、`application`（值 `KRS1`） |
+| 外鍵（rusqlite 內附的 SQLite 預設開啟） | 相同的外鍵 |
+
+- **HA.md 第 5.5 節列的叢集資料表與欄位**（`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures`、`enroll_requests.issuing_node`、`alert_deliveries.claim_epoch`）**不在 v9**：0.9.0 實際發佈的 v9 是遠端管理的資料表（第 18 節），叢集的資料表在 **v10** 新增（兩個後端同時，第 20 節）。
+- schema 的版本比程式新時拒絕啟動（`KRS-E4405`）；不是 Kairos 建立的 schema（有資料表但沒有 `meta.application = KRS1`）拒絕使用（`KRS-E4402`）；`kairos db migrate` 尚未完成的 schema 拒絕使用（`KRS-E4404`）。
+- PostgreSQL 後端從 v9 開始（`BASE_VERSION`），沒有 v1～v8 的升級步驟（舊資料以 `kairos db migrate` 從 SQLite 搬入）。v9 之後的版本有升級路徑：`UPGRADES` 列出每一版的 SQL，既有的 v9 schema 在啟動（或 CLI 開啟資料庫）時自動升級到 v10（第 20.3 節）。
+
+### 19.3 並行控制
+
+PostgreSQL 的交易一律是 READ COMMITTED。SQLite 靠全域寫入鎖序列化的地方（HA.md 第 2.2 節 D1～D9）這樣處理：
+
+- **序列化的寫入交易**（呼叫端以 `TxMode::Immediate` 開始的交易：註冊、簽發、告警、使用者、設定、遠端管理的每個業務操作）在 `BEGIN` 之後取得一個交易層級的 advisory lock（`pg_advisory_xact_lock`，鍵由「KRS1」與 schema 名稱導出），彼此排成一列，語意與 `BEGIN IMMEDIATE` 相同，跨行程、跨節點都成立。等待超過連線的 busy 時間（主控台背景寫入 250 ms、互動寫入與註冊 2 秒、CLI 5 秒）回暫時性錯誤（API 503、report `storage_unavailable`），與 SQLite 的 busy 相同。
+  - 這比 HA.md 第 5.4 節逐項改寫成條件式 UPDATE 或列鎖保守：正確性不依賴每個操作各自的寫法，代價是這些交易不能並行（它們的量很小：管理操作、每秒最多數十筆註冊）。能寫成單一原子敘述的操作仍然改寫了（token 扣次數 D2、設定版本 D6、TOTP 重設等），作為沒有鎖時的保險。
+- **稽核雜湊鏈**（HA.md 第 12 節）：寫入前取得另一個 advisory lock，`id` 在持鎖期間指定為 `max(id) + 1`，鎖持有到交易結束，所以鏈的順序等於 commit 的順序、`id` 連續沒有空號（回復的交易不佔用 `id`）。雜湊與 HMAC 的計算與 SQLite 完全相同，搬移後可以直接驗證。驗證在 `REPEATABLE READ` 的唯讀交易中進行。
+  - 與 HA.md 第 12.1 節的差別：以 advisory lock 取代 `meta.audit_chain_head` 的列鎖（`SELECT … FOR UPDATE`）；鏈尾仍記在 `meta.audit_chain_head`，內容與 SQLite 相同。
+- **report 的寫入**不經過上面的鎖：每批一個交易，`reports` 以一個多列的 `INSERT … ON CONFLICT (boot_ref, report_seq) WHERE boot_ref IS NOT NULL DO NOTHING RETURNING` 寫入並取回哪幾列真的寫入，其餘為 `Duplicate`；主機、序列與 boot 以 `ON CONFLICT DO NOTHING` 建立。
+- **錯誤分類**（HA.md 第 7.1 節）：commit 之前的錯誤為 `Failed`；死結（`40P01`）與序列化失敗（`40001`）整批自動重試最多 3 次（`kairos_db_transaction_retries_total`）；commit 時連線中斷為 `Unknown`（不回應並關閉連線，Pulse 重送後由唯一索引去重）；磁碟已滿（`53100`）為 `Failed`。領域 store 的交易邊界在呼叫端，無法在儲存層自動重試整個交易：遇到 `40P01`／`40001`／鎖等待逾時回暫時性錯誤，由呼叫端（API 503、Pulse 重試）處理。
+- **「服務執行中」的鎖**：Kairos 的寫入連線持有一個 session 層級的共享 advisory lock。需要獨占資料庫的 CLI（`kairos hosts purge` 的離線模式、`kairos db migrate`）取互斥鎖，取不到時回 `KRS-E4304`，與 SQLite 以資料庫檔的 EXCLUSIVE 鎖判斷相同。
+
+### 19.4 彙總與計數器速率
+
+與 SQLite 後端相同：單一 writer 的記憶體桶（第 7 節）、寫入時以記憶體中的上一筆計算速率（第 15.1 節），重新啟動後由原始資料補回。兩個後端對同一組輸入產生相同的 `rollup_5m`、`rollup_1h`（共用的測試確認）。
+
+HA.md 第 7.3、7.4 節的「leader 從原始資料產生彙總」是為了多個節點同時寫入（階段 B）設計的；只有一個 writer 時記憶體桶的不變式成立，這一版沒有實作 leader 版（HA.md 第 20.3 節允許的順序），留給階段 B。
+
+### 19.5 保留期限與容量上限
+
+- **保留期限**：規則與第 8.1 節相同（每步 5,000 列一個交易）。
+- **容量上限**（`storage.max_total_bytes`）：使用量是這個 schema 中所有資料表（含索引與 TOAST）的 `pg_total_relation_size` 加總，每 60 秒量一次，不含 WAL。PostgreSQL 刪除列之後檔案不會變小（空間由 autovacuum 回收後重複使用），照 SQLite「刪到量測值低於上限的 95%」的規則會把資料刪光，所以改為**估計制**：
+  1. 使用量超過門檻時開始一輪刪除。門檻是 `max(上限, 上一輪結束時的使用量 ＋ 上限的 1%)`（上一輪的使用量記在 `meta.capacity_high_water`，重新啟動後不會重複刪除）。
+  2. 這一輪要釋放的量是「使用量 − 上限的 95%」；以「資料表大小 ÷ 列數」估計每列的大小（先 `ANALYZE`，每列至少算 64 bytes），依序刪除最舊的原始 report、5 分鐘彙總、1 小時彙總，逐批扣抵，扣完就停。
+  3. 一輪結束後在交易外對被刪的資料表執行 `VACUUM (ANALYZE)`，讓空間可以重複使用。
+  - 限制：索引膨脹會讓它比必要更早刪除；`capacity_event.used_bytes` 與 `kairos_database_used_bytes` 是資料表檔案的大小，刪除後不會下降。大量刪除後可以在離峰時段執行 `VACUUM FULL` 或 `pg_repack` 真正縮小檔案。
+- **日期保護**（DateGuard）與 `meta` 的 `capacity_event`、`retention_last` 與 SQLite 相同。
+
+### 19.6 `kairos db migrate`：SQLite 與 PostgreSQL 互搬
+
+```bash
+sudo systemctl stop kairos
+# SQLite → PostgreSQL：設定檔的 storage.backend 仍是 "sqlite"，[storage.postgres] 填目的資料庫
+sudo -u kairos kairos db migrate --to postgres --config /opt/kairos/kairos.toml [--reports-since 2d] [--dry-run]
+# 成功後把 storage.backend 改成 "postgres"，執行 kairos --check-config，再啟動
+
+# PostgreSQL → SQLite（回到單機，或匯出成可攜的快照）：storage.backend 是 "postgres"
+sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --config /opt/kairos/kairos.toml
+```
+
+- **來源**是設定中目前的後端，**目的**由 `--to` 指定，必須是空的（PostgreSQL：schema 不存在或沒有資料表；SQLite：檔案不存在）。不做合併。來源不會被修改。
+- **一致性**：來源或目的是 SQLite 時以獨占鎖開啟；是 PostgreSQL 時取得「服務執行中」的互斥鎖（第 19.3 節），PostgreSQL 來源另以 `REPEATABLE READ` 的快照讀取。Kairos 執行中時回 `KRS-E4304`。
+- **方式**：依資料表的相依順序複製，保留所有主鍵值，每張表一個交易；複製後以 `setval` 對齊 PostgreSQL 的 IDENTITY 序列。寫入 PostgreSQL 時每批 2,000 列一個多列 `INSERT … SELECT FROM unnest(…)`（HA.md 第 5.6 節寫的是 `COPY … (FORMAT binary)`；多列 INSERT 不需要自己實作 COPY 的二進位格式，速度見第 19.8 節）。
+- **`--reports-since <期間>`**：只複製取樣時間在範圍內的原始 report 與行程快照；彙總、清冊、告警、稽核等一律全部複製。
+- **驗證**（不可略過）：每張表的列數；`reports` 的 id 範圍與抽樣 1,000 列的內容；稽核鏈在目的端的驗證結果（雜湊鏈與 HMAC，使用資料目錄的 `audit-hmac.key`）必須與來源**相同**。任何一項不一致以 `KRS-E4404` 結束（結束代碼 1）。
+  - 來源的鏈原本就有斷點時，搬移不會因此失敗（目的端有相同的斷點），輸出會註明。
+- **未完成的目的端不可使用**：PostgreSQL 在驗證通過後才寫入 `meta.schema_version`（之前只有 `meta.migration_in_progress`，Kairos 以 `KRS-E4404` 拒絕啟動）；SQLite 先寫到 `<檔案>.partial`，驗證通過後才改名。重新執行需要 `--restart`（先清空目的端）。
+- `--dry-run` 只列出每張表的列數；`--json` 的 `schema` 為 `kairos.db.migrate/v1`。
+
+### 19.7 與 SQLite 後端不同的地方
+
+| 項目 | PostgreSQL 後端 |
+|---|---|
+| `kairos db backup` | 不支援（`KRS-E4406`〔暫定〕）：改用 `pg_dump`、pgBackRest 或 `pg_basebackup` 加 WAL 歸檔；需要可攜的 SQLite 快照時用 `kairos db migrate --to sqlite:<檔案>`。`db restore-keys` 不受影響（金鑰不在資料庫中，請另外備份資料目錄的金鑰檔） |
+| `kairos reports import` | 不支援（`KRS-E4406`〔暫定〕）：先匯入到 SQLite，再 `kairos db migrate --to postgres` |
+| `/metrics` | `kairos_database_file_bytes`、`kairos_database_wal_bytes` 為 0；`kairos_database_used_bytes` 是資料表與索引的大小。另有 `kairos_db_pool_connections{state}`、`kairos_db_pool_size`、`kairos_db_pool_errors_total{kind}`、`kairos_db_transaction_retries_total{reason}`、`kairos_db_clock_skew_seconds`、`kairos_db_synchronous_replication` |
+| `/readyz` 的 `database` | 連線池能取得連線、連到的是可寫的主庫、schema 可用（5 秒快取） |
+| 系統健康的 `database` 項目 | `values.backend` 為 `postgres`，另有 `values.postgres`（`target`、`sslmode`、`server_version`、`synchronous_replication`、`clock_skew_ms`、`pool`）；`file_bytes`、`wal_bytes` 為 0，`page_size` 是 PostgreSQL 的區塊大小 |
+| 容量上限 | 估計制（第 19.5 節） |
+| 資料庫檔被刪除或替換時自動重建 | 不適用；連線中斷時自動重新連線，期間 report 回 `storage_unavailable` |
+| 同時使用同一個資料庫的 Kairos | 沒有啟用叢集模式時**只能有一個**：report 的彙總（記憶體桶）、告警引擎、保留清除與啟動時把主機標為離線都假設只有一個行程（HA.md 第 2 節）。啟動時以 advisory lock 檢查（`LockKind::Mode`，第 20.5 節）：第二個 Kairos 拒絕啟動（`KRS-E4402`，結束代碼 3）。多個 Kairos 共用資料庫要啟用叢集模式（`cluster.enabled = true`，第 20 節；任何時間只有持有 leader 租約的節點執行這些工作） |
+
+### 19.8 量測
+
+`store_throughput`（第 11 節；`KP_BENCH_BACKEND=postgres` 加 `KAIROS_TEST_PG_URL`）在 kp-build（4 vCPU、4 GB RAM、與另一條開發線共用）2026-11-11 的結果。PostgreSQL 14 跑在同一台機器的容器中（記憶體上限 512 MB、預設參數 `shared_buffers = 128MB`、`synchronous_commit = on`、沒有備庫，經 docker 的埠轉送連線）；這是**小規模、資源受限的對照**，不是 HA.md 第 7.6 節的目標環境，該節的目標（叢集每秒 2,000 筆時 p99 < 50 ms、每秒 8,000 筆的補送尖峰 5 分鐘沒有 `storage_unavailable`）**在這個環境沒有達到**（見下），需要在正式規格的硬體與獨立的資料庫主機上重新量測。
+
+每筆 17 個指標；延遲是從放入佇列到收到結果。
+
+| 情境 | 後端 | 筆數 | p50 | p99 | 最大 | 超過 5 秒的筆數 |
+|---|---|---|---|---|---|---|
+| 每秒 2,000 筆、100 台主機、30 秒 | PostgreSQL | 60,000 | 4.1 ms | 41 ms | 238 ms | 0 |
+| 每秒 8,000 筆、100 台主機、30 秒 | PostgreSQL | 240,000 | 5.5 ms | 85 ms | 311 ms | 0 |
+| 同上 | SQLite | 240,000 | 1.3 ms | 12 ms | 23 ms | 0 |
+| 每秒 2,000 筆、**1 萬台全新的主機**、120 秒 | PostgreSQL | 240,000 | 4.4 ms | 6.1 秒 | 6.7 秒 | 8,172（3.4%） |
+| 同上 | SQLite | 240,000 | 0.88 ms | 3.8 ms | 39 ms | 0 |
+| 每秒 2,000 筆、1 萬台全新的主機、30 秒 | PostgreSQL | 60,000 | 452 ms | 7.8 秒 | 7.9 秒 | 14,596（24%） |
+| 同上 | SQLite | 60,000 | 0.81 ms | 9.9 ms | 31 ms | 0 |
+
+補送尖峰（第 11.1 節的情境：1 萬台、每筆帶去重鍵、取樣時間從 72 小時前起、2% 重送、同時第一次清冊同步；`KP_BENCH_TIMEOUT=1` 與連線相同地在 5 秒取消）60 秒：
+
+| 速率 | 後端 | 寫入 | 重複 | `storage_unavailable`（5 秒內未開始寫入） | 逾時（已開始寫入、6 秒內沒有結果） |
+|---|---|---|---|---|---|
+| 每秒 8,000 筆 | SQLite（沒有模擬逾時） | 480,000 | 9,600 | 0（p99 48 ms、最大 143 ms） | 0 |
+| 每秒 8,000 筆 | PostgreSQL | 355,650 | 6,990 | 126,836（26%） | 6,119 |
+| 每秒 4,000 筆 | PostgreSQL | 217,578 | 4,296 | 22,869（9.5%） | 2,943 |
+
+- **穩定狀態**（主機都已在清冊中）PostgreSQL 的延遲是 SQLite 的 3～7 倍，每秒 8,000 筆仍在 100 ms 內（p99），沒有逾時。
+- **大量新主機同時出現**是瓶頸：每台主機第一次出現時要寫入它用到的序列（`host_series`，每台 18 列，帶外鍵檢查），慢查詢日誌顯示每批（約 1,000 台、1.8 萬列）這個敘述約 1 秒。1 萬台全新的主機在 5 秒內全部出現時，前 15 秒左右的 report 會等 5 秒以上（連線回 `storage_unavailable`，Pulse 0.3 以上重送，不遺失）；之後回到穩定狀態。主機已在清冊中時（一般的重新啟動、`kairos db migrate` 之後）沒有這個階段。實作時已把這裡的逐筆往返改成每個交易一個敘述（改之前同一個情境 30 秒內 p50 為 37 秒）；再進一步要調整 `host_series` 的寫法或外鍵，尚未做。
+- **補送尖峰**在這個環境撐不住每秒 8,000 筆：除了上面的啟動階段，寫入一旦落後，記憶體中的桶因為「15 秒沒有新值」被寫出，之後同一個桶的資料走遲到路徑（逐批 upsert 彙總表），讓寫入更慢。SQLite 在同一台機器上沒有落後，所以沒有進入這個狀態。這是 HA.md 第 7.3 節提到「補送尖峰時 upsert 太多」的情況，需要在正式環境量測後決定是否調整寫出規則。
+- **大小**：`reports`（含索引與 TOAST）每筆約 305～375 bytes，SQLite 約 204～215 bytes（PostgreSQL 的列標頭與索引較大）；容量估算（第 10 節）在 PostgreSQL 上請乘以約 1.6。
+- **沒有量測的**：`kairos db migrate` 的速度（HA.md 第 5.6 節的時間估算）、同步備庫下的延遲、1 萬台以上的規模、長時間（含 5 分鐘彙總寫出與保留清除）的行為、PostgreSQL 17 的效能（只跑過功能測試）。
+
+### 19.9 測試
+
+- 儲存層的測試以同一個測試本體在兩個後端各跑一次（`store/backend_tests.rs`，測試名稱以 `_sqlite`、`_postgres` 結尾）。PostgreSQL 的測試由環境變數指定資料庫：
+
+  ```bash
+  docker run -d --name kairos-test-pg -e POSTGRES_USER=kairos -e POSTGRES_PASSWORD=kairos -e POSTGRES_DB=kairos \
+    -p 127.0.0.1:55432:5432 postgres:14-alpine
+  KAIROS_TEST_PG_URL=postgres://kairos:kairos@127.0.0.1:55432/kairos cargo test -p kairos store::
+  KAIROS_TEST_PG_URL=… cargo test -p kp-e2e --test postgres      # 實際的 Kairos＋Pulse 跑在 PostgreSQL 上
+  ```
+
+  共用的測試本體 25 個（report 路徑 14 個、領域 store 11 個）：PostgreSQL 的版本除了在 PostgreSQL 上執行，還在 SQLite 上再跑一次，兩邊每個步驟的結果必須完全相同；另有 PostgreSQL 專屬的 9 個（連線池、唯讀連線、服務鎖、schema 檢查、8 條連線並行寫稽核鏈、並行的原子更新）與 `db migrate` 的 3 個。每個測試使用自己的 schema，結束時刪除。沒有設定 `KAIROS_TEST_PG_URL` 時這些測試**明確略過**（在 stderr 印出「略過：未設定 KAIROS_TEST_PG_URL…」），不算驗證過；設定 `KAIROS_TEST_PG_REQUIRED=1` 時沒有可用的資料庫就失敗（CI 的 Linux job 與 `postgres-compat` job 如此設定，分別以 PostgreSQL 14 與 17 執行）。
+
+## 20. 叢集協調的資料表（schema v10；0.10.0〔草稿〕；HA L2）
+
+叢集模式（`[cluster] enabled = true`，階段 A：主動／備援）讓多個 Kairos 共用一個 PostgreSQL，以資料庫中的租約選出唯一的主動節點（leader）。規格見 [`HA.md`](HA.md) 第 5.5、6 節，實作與規格的差異見 HA.md 第 6.8 節；部署步驟見 INSTALL 附錄 H。SQL 在 `store/sqlite/cluster.rs` 與 `store/postgres/schema.rs` 的 `SCHEMA_V10`，領域介面 `ClusterStore`（`cluster/store.rs`，兩個後端都實作）。
+
+v10 是**獨立的一步**：只新增資料表與三個可為 NULL 的欄位，不修改既有的資料與唯一鍵。**叢集模式只支援 PostgreSQL**；SQLite 也建立同樣的資料表（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製），單機時保持空白。
+
+### 20.1 資料表
+
+時間欄位都是 Unix 毫秒；`cluster_nodes` 與 `cluster_leases` 的時間一律取**資料庫的時鐘**（租約的判斷不受節點時鐘偏差影響）。型別依第 19.2 節的對應規則（下表寫 SQLite 的型別）。
+
+| 資料表 | 內容 | 主鍵 | 階段 A |
+|---|---|---|---|
+| `cluster_nodes` | 每個節點一列：`hostname`、`version`、`schema_version`、`role`（`standby`／`leader`／`draining`／`stopped`＝正常關機／`lost`＝心跳逾時，由 leader 標記）、`config_hash`（需要一致的設定的雜湊，與 leader 不同時 `KRS-W8505`）、`keys_hash`（金鑰指紋的雜湊）、`advertise`（顯示用的位址）、`started_at`（這次啟動的時間，用來分辨同名節點的不同行程）、`heartbeat_at`（每 `cluster.heartbeat_secs` 秒更新）、`info`（JSON 摘要：`pid`、`connections`、`keys_ok`、`key_problems`、`schema`、`epoch`） | `node_id` | **使用** |
+| `cluster_leases` | 租約：`holder`（持有者的 `node_id`）、`epoch`（每次取得加一，fencing 用）、`acquired_at`、`expires_at`。目前只有一列 `name = 'leader'` | `name` | **使用** |
+| `cluster_revs` | 跨節點的變更版本（`name`、`rev`） | `name` | 空白（`alerts_config_rev` 等仍在 `meta`） |
+| `host_presence` | agent 連線的歸屬與線上狀態：`conn_node`、`conn_epoch`、`online`、`connected_at`、`last_seen`、`offline_reason`、`peer`、`rev`；索引 `host_presence_rev`、`host_presence_node`（只含線上的列） | `host_id` | 空白（線上狀態仍在主動節點的記憶體與 `hosts`） |
+| `cluster_events` | 跨節點事件：`at`、`node_id`、`kind`、`target`、`payload` | `id` | 空白 |
+| `alert_event_seq` | 告警事件編號的每日序號（`day`、`seq`） | `day` | 空白 |
+| `login_challenges` | MFA 挑戰：`user_id`、`created_at`、`expires_at`、`attempts` | `challenge_hash` | 空白（仍在主動節點的記憶體） |
+| `enroll_nonces` | 撤回註冊申請的 nonce：`request_id`、`expires_at` | `nonce_hash` | 空白（同上） |
+| `auth_failures` | 驗證失敗的速率限制：`tokens`、`updated_at` | `source` | 空白（同上） |
+
+新增的三個欄位（都可為 NULL，階段 A **不寫入**）：
+
+| 欄位 | 用途（階段 B） |
+|---|---|
+| `enroll_requests.issuing_node`、`enroll_requests.issuing_at` | 多個節點同時簽發時的搶占：哪個節點、何時開始簽發 |
+| `alert_deliveries.claim_epoch` | 通知由哪個 leader epoch 認領（換手時不重複發送） |
+
+- **階段 A 實際讀寫的只有 `cluster_nodes`、`cluster_leases`**，以及 `meta` 的兩個鍵（第 20.2 節）。其餘資料表與欄位依規格先建立、保持空白，階段 B（多主動）才寫入；先建立是為了之後不必再為它們升級一次 schema。
+- 與 HA.md 第 5.5 節的差異：沒有建立 `enroll_requests_issued_csr`（既有的 `enroll_requests_csr` 已是 (`agent_id`, `csr_sha256`) 的唯一索引）與 `host_presence` 的兩個序列（`conn_epoch_seq`、`presence_rev_seq`；階段 B 再加）。規格把這些資料表列為 v9，實際是 v10（0.9.0 的 v9 已用於遠端管理）。
+- **節點的紀錄不會自動刪除**：停止或失聯的節點留在 `cluster_nodes`（`stopped`／`lost`），以 `kairos cluster forget <node_id>` 刪除。
+- 這些資料表都很小（每個節點一列、一列租約），不計入容量估算；`cluster_nodes` 與 `cluster_leases` 的寫入量是每個節點每 `heartbeat_secs` 秒一次心跳，加上 leader 每 `lease_ttl_secs / 3` 秒一次續約。
+
+### 20.2 `meta` 的鍵
+
+| 鍵 | 內容 |
+|---|---|
+| `cluster_id` | 叢集的 UUID（v4）。`kairos cluster init` 第一次執行時產生，之後不變；叢集模式下經 `hello_ack.cluster_id` 送給協商了 `cluster` 的 Pulse |
+| `cluster_keys` | JSON `{"v":1,"keys":{"<檔名>":"<指紋>",…}}`：`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key` 的指紋（`HMAC-SHA256(金鑰, "kairos-key-fingerprint/v1\n" ‖ 檔名)` 的前 16 bytes，hex；不能用來還原金鑰）。`kairos cluster init` 寫入，每個節點啟動時與之後定期比對自己的金鑰，不符時不參與 leader 選舉（`KRS-E8504`） |
+
+- 簽發 CA 私鑰的指紋不在 `cluster_keys`：節點以私鑰的公鑰雜湊與 `pki_cas.spki_sha256` 比對（`active`／`trusted` 的簽發 CA 都要有私鑰）。
+- **資料庫中仍然沒有任何金鑰**（第 3.2 節）：金鑰檔在每個節點的資料目錄，以 `kairos cluster keys export`／`import` 分發與備份（格式 `kairos.keys-backup/v2`，含簽發 CA 私鑰）。
+- 單機（沒有執行過 `kairos cluster init`）時這兩個鍵不存在。
+
+### 20.3 升級與降版
+
+- **SQLite**：`MIGRATIONS` 的第 10 步（`store/sqlite.rs`；SQL 在 `store/sqlite/cluster.rs`），與之前的版本相同——啟動或任何開啟資料庫的 CLI 依 `PRAGMA user_version` 套用，一個交易。
+- **PostgreSQL**：`store/postgres/schema.rs` 的 `UPGRADES`（目前只有 `(10, SCHEMA_V10)`）。`ensure_schema` 發現 schema 是 v9（`BASE_VERSION`）以上、低於程式的版本時，在一個交易中取得 advisory lock `LockKind::Migrate`、重新讀取版本（等待期間可能已由另一個節點升級）、依序套用比目前版本新的步驟，最後寫入 `meta.schema_version` 與 `meta.schema_upgraded_by`（執行升級的 Kairos 版本）。同時啟動的多個節點只有一個執行升級，其他等待後直接使用。空的 schema 則是建立 v9 之後接著套用同樣的步驟。
+  - 觸發的時機：第一個以新版啟動的節點（叢集模式：協調執行緒在備援階段就執行），或任何以可寫方式開啟資料庫的 CLI（例如 `kairos cluster init`）。`kairos --check-config` 只讀取，不升級。
+  - 低於 v9 的 PostgreSQL schema 不存在（後端從 v9 開始）；遇到時回 `KRS-E4402`。
+- **降版**：升級到 v10 之後，0.9 的 Kairos（以及 0.10.0 草稿中 schema v9 的建置）無法開啟——SQLite 回「資料庫的 schema 版本 10 比本版 Kairos 支援的 9 新」，PostgreSQL 回 `KRS-E4405`，都不做任何變更。沒有降版的遷移：請從升級前的備份還原（SQLite：第 9 節；PostgreSQL：`pg_dump` 等的備份）。**升級前先備份**。
+- **叢集中的版本升級**：schema 不變的版本可以滾動升級；schema 改變的版本要先停止所有節點，升級所有節點的執行檔，再啟動第一個節點（由它升級 schema）。版本較舊的節點看到較新的 schema 時拒絕啟動（`KRS-E4405`）。步驟見 INSTALL 第 H.5 節。
+
+### 20.4 fencing：租約對寫入的意義
+
+階段 A 沿用記憶體中的彙總桶、告警引擎與單一 writer（第 7 節、第 19.4 節），前提是「同一時間只有一個行程寫入」。這個前提由租約加上 fencing 保證：
+
+- **只有 leader 的行程開啟儲存**。備援節點只有一條協調用的連線（心跳、嘗試取得租約），不啟動 writer、告警、註冊、主控台與保留清除，所以不寫入第 20.1 節以外的任何資料表。
+- **leader 行程的每個寫入都先確認租約**。取得租約後連線池設定 fencing（`PgPool::set_fence`，持有者與 epoch）；之後：
+  - 每個可寫的交易（`TxMode::Immediate` 與 `Deferred`，含 report 的批次寫入與維護）在 `BEGIN`（與寫入鎖）之後的第一個敘述確認租約；
+  - 自動提交的單一 `INSERT`／`UPDATE`／`DELETE` 自動包成「`BEGIN`；確認租約；敘述；`COMMIT`」；
+  - 唯讀連線、`REPEATABLE READ` 的唯讀快照與協調自己的連線不檢查。
+- **檢查是一個敘述**：`SELECT 1 / count(*) FROM (SELECT 1 FROM cluster_leases WHERE name = 'leader' AND holder = … AND epoch = … AND expires_at > now FOR SHARE)`。租約列符合時取得它的 `FOR SHARE` 列鎖並持有到交易結束——其他節點接手的 `UPDATE` 會等這個交易結束，所以「確認之後、commit 之前租約被搶走」不會發生。不符合時除以零（SQLSTATE 22012），交易失敗，轉成 `KRS-W8502` 並立即以結束代碼 75 結束行程。不需要 PL/pgSQL 或任何擴充。
+- **結果**：暫停（虛擬機凍結、長時間的 GC 或 I/O）超過租約時間後恢復的舊 leader，第一個寫入就失敗並結束，不會覆寫新 leader 的資料；在途的 report 沒有收到 `ack`，Pulse 重送後由唯一索引去重（第 5.1 節）。
+- **成本**：每個寫入交易多一個以主鍵讀取一列的敘述（多一次往返）。HA.md 第 7.6 節的效能目標尚未在叢集模式下量測。
+- 單機模式與所有 CLI 的行程沒有設定 fencing（空操作），行為與第 19 節相同。CLI 的寫入（`kairos enroll approve`、`kairos alerts ack` 等）靠第 19.3 節的寫入鎖與稽核鏈的鎖保持正確，與節點的角色無關。
+
+### 20.5 啟動保護：`LockKind::Mode`
+
+第 19.3 節的「服務執行中」鎖（`LockKind::Service`）之外，另有一個 session 層級的 advisory lock 表示「這個 schema 由誰服務」：
+
+| 行程 | 取鎖的方式 | 連線 |
+|---|---|---|
+| 沒有啟用叢集模式的 Kairos（`ServiceMode::Solo`） | **互斥** | writer 的專用連線 |
+| 叢集模式的節點，含備援（`ServiceMode::Cluster`） | **共享** | 協調連線與 writer 的連線 |
+| CLI | 不取 | — |
+
+- 同一個 schema 上，單機模式的 Kairos 同時只能有一個，也不能與叢集的節點並存；叢集的節點彼此可以並存（由 leader 租約決定誰服務）。
+- 取不到時拒絕啟動：`KRS-E4402`（「已有另一個 Kairos 正在使用」或「正被一個沒有啟用叢集模式的 Kairos 使用」），結束代碼 3，systemd 不重試。
+- 鎖隨連線結束自動釋放（行程當掉也是），不會留下需要手動清除的狀態。
+- PgBouncer 的 transaction pooling 會讓這個鎖失效，與第 19.1 節相同只支援 session pooling。
+
+### 20.6 `kairos db migrate` 與備份
+
+- `kairos db migrate` **一併複製**第 20.1 節的資料表（`store/postgres/schema.rs` 的 `TABLES`；彼此沒有相依，`cluster_events.id` 的 IDENTITY 以 `setval` 對齊）與 `meta` 的 `cluster_id`、`cluster_keys`。來源與目的都必須是目前的 schema 版本（v10）；較舊的來源先以相同版本的 Kairos 開啟一次完成升級。
+- 搬移需要停止**所有**節點（取得「服務執行中」的互斥鎖，否則 `KRS-E4304`）。搬到 SQLite（回到單機）之後，`cluster_nodes` 與 `cluster_leases` 留著原本的列但不再使用；把 `cluster.enabled` 改回 `false` 後啟動。
+- PostgreSQL 的備份（`pg_dump` 等）自然包含這些資料表。還原到另一組主機時，舊節點的列以 `kairos cluster forget` 刪除；`cluster_leases` 中過期的租約不需要處理（到期後任何節點都能取得）。金鑰另以 `kairos cluster keys export` 備份，還原時與資料庫要是同一個時間點的組合（第 9 節）。
+
+### 20.7 連不上資料庫時
+
+| 模式 | 啟動時連不上 | 執行中中斷 |
+|---|---|---|
+| 單機（第 19 節） | 拒絕啟動，`KRS-E4401`，結束代碼 3（systemd 不重試） | 不結束：report 回 `storage_unavailable`、`/readyz` 503，恢復後自動重新連線 |
+| 叢集的備援節點 | **不結束**：持續重試，`/readyz` 的 `cluster` 為 `lost`，每分鐘記一次 `KRS-E4401` | 同左 |
+| 叢集的主動節點 | （還沒有取得租約，同備援） | 超過 `lease_ttl_secs − 5` 秒沒有續約成功就以結束代碼 75 結束（`KRS-W8502`），重新啟動為備援後持續重試 |
+
+- 所有 PostgreSQL 連線都設定了 TCP keepalive（間隔 10 秒、3 次）與 `tcp_user_timeout = 30 秒`（Linux）；協調連線的 `statement_timeout`／`lock_timeout` 是自我降級時限的一半（最多 5 秒）。另有一條只看單調時鐘的看門狗執行緒，協調執行緒卡在沒有回應的資料庫呼叫上時也會結束行程。
+- 協調連線另以 `LISTEN kairos_cluster` 接收「租約已交還」的通知（正常關機時），備援立即嘗試取得；通知遺失只會讓延遲回到 2 秒的輪詢。

@@ -116,6 +116,24 @@ pub(crate) fn read_db_stats(conn: &dyn Store) -> StoreResult<DbStats> {
     })
 }
 
+/// PostgreSQL 後端的狀態（`storage.backend = "postgres"` 時；否則為 `null`）：伺服器版本、同步複寫、時差
+/// 與連線池。伺服器的狀態由健康檢查（`/readyz`、`/metrics`）定期更新，尚未讀到時相關欄位為 `null`
+fn postgres_values() -> serde_json::Value {
+    let Some(pool) = crate::store::postgres::pool::active() else {
+        return serde_json::Value::Null;
+    };
+    let s = pool.stats();
+    let server = pool.last_server();
+    json!({
+        "target": pool.settings().display_target(),
+        "sslmode": pool.settings().effective_sslmode().as_str(),
+        "server_version": server.as_ref().map(|i| i.version.clone()),
+        "synchronous_replication": server.as_ref().map(|i| i.synchronous_replication()),
+        "clock_skew_ms": server.as_ref().map(|i| i.clock_skew_ms),
+        "pool": { "size": s.size, "idle": s.idle, "busy": s.busy, "exhausted": s.exhausted },
+    })
+}
+
 /// 以 GB（10^9）表示，一位小數
 pub fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
@@ -190,6 +208,8 @@ fn database(ctx: &ApiContext, db: &DbStats, live: &[LiveAgent], now_ms: i64) -> 
         status,
         summary,
         json!({
+            "backend": ctx.config.storage.backend.as_str(),
+            "postgres": postgres_values(),
             "used_bytes": db.used_bytes,
             "file_bytes": file,
             "wal_bytes": wal,
@@ -894,6 +914,117 @@ async fn remote(ctx: &ApiContext) -> Item {
     }
 }
 
+/// 叢集的狀態（`GET /api/v1/cluster` 與系統健康的 `cluster` 項目共用；`kairos/HA.md` 第 14.2、14.3 節）：
+/// `enabled`、`mode`、`cluster_id`、`leader`、`nodes[]`、`database`，以及回應這個請求的節點 `node_id`。
+/// 沒有啟用叢集模式時 `enabled` 為 `false`、沒有節點
+pub async fn cluster_status(ctx: &Arc<ApiContext>) -> Result<Value, ApiError> {
+    use crate::cluster::store::LEASE_LEADER;
+    let state = crate::cluster::global();
+    let (cluster_id, lease, nodes) = if state.is_some() {
+        ctx.pool
+            .read("叢集狀態", |conn| {
+                Ok((
+                    conn.get_meta(crate::cluster::META_CLUSTER_ID)
+                        .map_err(query_failed("叢集狀態"))?,
+                    conn.cluster_lease(LEASE_LEADER, None)
+                        .map_err(query_failed("叢集狀態"))?,
+                    conn.cluster_nodes(None).map_err(query_failed("叢集狀態"))?,
+                ))
+            })
+            .await?
+    } else {
+        (None, None, Vec::new())
+    };
+    let mut values = crate::cluster_cli::status_value(
+        &ctx.config,
+        cluster_id.as_deref(),
+        lease.as_ref(),
+        &nodes,
+    );
+    values["node_id"] = json!(state.as_ref().map(|s| s.node_id.clone()));
+    values["database"] = postgres_values();
+    Ok(values)
+}
+
+/// 系統健康的 `cluster` 項目（只在叢集模式）：沒有 leader、金鑰不一致為嚴重；節點失聯、設定不一致、
+/// 沒有同步複寫、時差過大、只有一個節點為警告
+async fn cluster(ctx: &Arc<ApiContext>) -> Option<Item> {
+    crate::cluster::global()?;
+    let values = match cluster_status(ctx).await {
+        Ok(v) => v,
+        Err(_) => {
+            return Some(
+                Item::new("cluster", Level::Warning, "無法讀取叢集的狀態", Value::Null)
+                    .needs(Permission::SettingsRead),
+            );
+        }
+    };
+    let mut problems = crate::cluster_cli::status_problems(&ctx.config, &values);
+    if let Some(server) = crate::store::postgres::pool::active().and_then(|p| p.last_server()) {
+        if !server.synchronous_replication() {
+            problems.push((
+                false,
+                format!(
+                    "{}：資料庫沒有同步複寫",
+                    crate::store::postgres::pool::CODE_PG_NO_SYNC_REPLICATION
+                ),
+            ));
+        }
+        if server.clock_skew_ms.abs() > crate::store::postgres::pool::CLOCK_SKEW_WARN_MS {
+            problems.push((
+                false,
+                format!(
+                    "{}：這個節點與資料庫的時差 {} 毫秒",
+                    crate::store::postgres::pool::CODE_PG_CLOCK_SKEW,
+                    server.clock_skew_ms
+                ),
+            ));
+        }
+    }
+    let level = if problems.iter().any(|(c, _)| *c) {
+        Level::Critical
+    } else if problems.is_empty() {
+        Level::Ok
+    } else {
+        Level::Warning
+    };
+    let running = values["nodes"].as_array().map_or(0, |n| {
+        n.iter()
+            .filter(|n| !matches!(n["role"].as_str(), Some("stopped" | "lost")))
+            .count()
+    });
+    let mut summary = match values["leader"]["node_id"].as_str() {
+        Some(leader) => format!(
+            "leader {leader}（epoch {}）；{running} 個節點在執行",
+            values["leader"]["epoch"]
+        ),
+        None => format!("沒有 leader；{running} 個節點在執行"),
+    };
+    // 最嚴重的問題排在前面，代碼取第一個
+    problems.sort_by_key(|(critical, _)| !*critical);
+    let code = problems.first().and_then(|(_, m)| {
+        [
+            crate::cluster::CODE_COORDINATION,
+            crate::cluster::CODE_KEYS,
+            crate::cluster::CODE_NODE_LOST,
+            crate::cluster::CODE_CONFIG_DRIFT,
+            crate::store::postgres::pool::CODE_PG_NO_SYNC_REPLICATION,
+            crate::store::postgres::pool::CODE_PG_CLOCK_SKEW,
+        ]
+        .into_iter()
+        .find(|c| m.starts_with(c))
+    });
+    for (_, m) in &problems {
+        summary.push('；');
+        summary.push_str(m);
+    }
+    let mut item = Item::new("cluster", level, summary, values).needs(Permission::SettingsRead);
+    if let Some(code) = code {
+        item = item.code(code);
+    }
+    Some(item)
+}
+
 /// 系統健康
 pub async fn compute(ctx: &Arc<ApiContext>, now: DateTime<Utc>) -> Result<Health, ApiError> {
     let db = ctx
@@ -924,6 +1055,9 @@ pub async fn compute(ctx: &Arc<ApiContext>, now: DateTime<Utc>) -> Result<Health
     items.push(alerts(ctx).await);
     items.push(metrics_endpoint(ctx));
     items.push(remote(ctx).await);
+    if let Some(i) = cluster(ctx).await {
+        items.push(i);
+    }
     let status = items.iter().map(|i| i.status).max().unwrap_or(Level::Ok);
     Ok(Health {
         status,

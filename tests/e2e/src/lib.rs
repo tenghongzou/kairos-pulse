@@ -569,6 +569,24 @@ impl Proc {
             .unwrap_or_else(|| panic!("{} 被訊號終止：{status:?}\n{}", self.name, self.dump()))
     }
 
+    /// 凍結行程（SIGSTOP；模擬虛擬機凍結或長時間的停頓：行程還在、連線沒有斷，但完全不執行）。只在 Linux
+    #[cfg(target_os = "linux")]
+    pub fn freeze(&mut self) {
+        let pid = i32::try_from(self.child.id()).expect("pid 超出範圍");
+        // SAFETY: kill(2) 只送出訊號，不涉及記憶體；pid 是仍未回收（未 wait）的子行程
+        let rc = unsafe { unix::kill(pid, unix::SIGSTOP) };
+        assert_eq!(rc, 0, "無法送出 SIGSTOP 給 {}", self.name);
+    }
+
+    /// 讓 [`Proc::freeze`] 凍結的行程繼續執行（SIGCONT）。只在 Linux
+    #[cfg(target_os = "linux")]
+    pub fn thaw(&mut self) {
+        let pid = i32::try_from(self.child.id()).expect("pid 超出範圍");
+        // SAFETY: 同 freeze
+        let rc = unsafe { unix::kill(pid, unix::SIGCONT) };
+        assert_eq!(rc, 0, "無法送出 SIGCONT 給 {}", self.name);
+    }
+
     /// 強制終止（模擬行程當掉或主機斷電：不走優雅關機，連線直接被作業系統重設）
     pub fn kill(&mut self) {
         let _ = self.child.kill();
@@ -616,6 +634,11 @@ pub fn run_to_exit(name: &str, cwd: &Path, args: &[&str], envs: &[(&str, &str)])
 #[cfg(unix)]
 mod unix {
     pub const SIGTERM: i32 = 15;
+    /// Linux（x86_64、aarch64）的訊號編號
+    #[cfg(target_os = "linux")]
+    pub const SIGCONT: i32 = 18;
+    #[cfg(target_os = "linux")]
+    pub const SIGSTOP: i32 = 19;
     unsafe extern "C" {
         pub fn kill(pid: i32, sig: i32) -> i32;
     }

@@ -4,6 +4,7 @@
 
 - **第 A 節（建議，0.8.0 起）**：以 deb／rpm 套件安裝，`kairos pki init` 一個指令建立 PKI。從下載到第一台 Pulse 連上約 10 個指令。
 - **第 0～13 節**：從 tar.gz 發佈包手動安裝（不使用套件管理員的環境），以及共通的維運、升級與疑難排解。第 6 節同樣改用 `kairos pki init`；0.7 以前以 openssl 手動管理 PKI 的方式移到附錄 P。
+- **附錄**：附錄 D（以 PostgreSQL 作為儲存後端，0.10.0）、附錄 H（叢集部署：高可用，主動／備援，0.10.0）、附錄 P（以 openssl 手動管理 PKI）。
 
 > 不要用 `systemd-run --user` 或使用者層級的 unit 跑正式服務：沒有開啟 linger 時，最後一個登入 session 結束，user manager 會連同 Kairos 一起被停掉。
 
@@ -447,6 +448,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 ### 10.2 備份
 
 - `/opt/kairos/kairos.toml`、憑證與 CRL
+- `storage.backend = "postgres"`（0.10.0）時資料庫以 PostgreSQL 的工具備份，`kairos db backup` 不適用，見附錄 D.4。以下是預設的 SQLite。
 - SQLite 資料庫：以線上備份產生一致的快照，**不要在執行中直接複製 `data/kairos.db`**（最新的交易可能還在 `kairos.db-wal` 中）。例如每天一次：
 
   ```bash
@@ -677,6 +679,368 @@ userdel kairos
 | 匯入期間 Kairos 啟動失敗（`database is locked`） | `kairos reports import` 正獨占資料庫。匯入結束後 systemd 會依 `Restart=on-failure` 自動重新啟動；匯入時請先停止服務 |
 | `kairos reports import` 以 root 執行時以結束代碼 10 拒絕 | 匯入會建立或寫入 `kairos.db`，請以服務帳號執行：`sudo -u kairos /opt/kairos/kairos reports import …` |
 | 其他錯誤訊息 | 見 `README.md`「疑難排解」 |
+
+## 附錄 D：以 PostgreSQL 作為儲存後端（0.10.0）
+
+預設的儲存是資料目錄中的 SQLite（`data/kairos.db`），單機部署不需要這個附錄。要把資料放在外部的 PostgreSQL（已有 DBA 與備份工具的環境，或為之後的高可用部署做準備）時依下列步驟；細節與限制見 `STORAGE.md` 第 19 節、`HA.md` 第 4.3 節。
+
+> 這個附錄只有儲存後端：沒有啟用叢集模式（`cluster.enabled = false`，預設）時，**同一個資料庫與 schema 同時只能有一個 Kairos 使用**——第二個 Kairos 連到已有 Kairos 在使用的 schema 時拒絕啟動（`KRS-E4402`，結束代碼 3）。要讓兩個以上的 Kairos 共用資料庫（高可用，主動／備援），先完成這個附錄，再依附錄 H 設定叢集模式。
+
+### D.1 準備資料庫
+
+需要 PostgreSQL 14 以上、`UTF8` 編碼，不需要任何擴充。在資料庫主機上（以 `postgres` 身分）：
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE ROLE kairos LOGIN PASSWORD '請換成隨機產生的密碼';
+CREATE DATABASE kairos OWNER kairos ENCODING 'UTF8' TEMPLATE template0;
+SQL
+```
+
+- Kairos 在資料庫中建立自己的 schema（預設 `kairos`）。不想讓 `kairos` 帳號擁有整個資料庫時，由 DBA 先建立 schema 並授權：`CREATE SCHEMA kairos AUTHORIZATION kairos;`。
+- `pg_hba.conf` 允許 Kairos 主機以 `scram-sha-256` 連線；不在同一台主機時啟用 TLS（`ssl = on`），並把簽發資料庫伺服器憑證的 CA 複製到 Kairos 主機。
+- `max_connections` 至少為 `storage.postgres.pool_size` ＋ 4（預設 20）。
+- 已確認（`ack`）的資料在主庫故障時不遺失需要同步複寫：`synchronous_commit = on` 且 `synchronous_standby_names` 非空。沒有同步備庫時 Kairos 照常啟動，但每小時記一次 `KRS-W4403`。
+- 連線池中介（PgBouncer）只能用 session pooling。
+
+### D.2 設定 Kairos
+
+```bash
+# 密碼檔：只有服務帳號可讀
+sudo install -d -o root -g kairos -m 750 /etc/kairos
+sudo install -o kairos -g kairos -m 600 /dev/null /etc/kairos/pg.password
+echo '上面設定的密碼' | sudo tee /etc/kairos/pg.password >/dev/null
+sudo install -o root -g kairos -m 640 pg-ca.pem /etc/kairos/pg-ca.pem      # 資料庫伺服器憑證的 CA
+```
+
+`/opt/kairos/kairos.toml`：
+
+```toml
+[storage]
+data_dir = "data"               # 仍然需要：金鑰檔、PKI 快取、agents.json 留在本機
+backend = "postgres"
+
+[storage.postgres]
+host = "db.example.com"
+port = 5432
+dbname = "kairos"
+user = "kairos"
+password_file = "/etc/kairos/pg.password"
+schema = "kairos"
+sslmode = "verify-full"         # 資料庫在本機（127.0.0.1 或 Unix socket）時可省略，預設為 disable
+ca_file = "/etc/kairos/pg-ca.pem"
+```
+
+檢查（會實際連線；不建立也不修改任何東西）後啟動：
+
+```bash
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+sudo systemctl start kairos
+```
+
+- `--check-config` 的 `database` 項目回報 PostgreSQL 的版本與 schema 的狀態；連不上為 `KRS-E4401`，不符合需求（版本、編碼、連到備庫、schema 不是 Kairos 的）為 `KRS-E4402`。
+- 第一次啟動時建立 schema（0.10.0 為 v10）；既有的 v9 schema 由第一個以新版啟動的 Kairos（或開啟資料庫的 CLI）自動升級到 v10（`STORAGE.md` 第 20 節）。啟動時連不上資料庫，Kairos 以結束代碼 3 結束（`KRS-E4401`；systemd 不自動重試，修正後 `systemctl start kairos`；叢集模式的節點不結束、持續重試，見附錄 H）。執行中資料庫中斷時 Kairos 不會結束：report 回 `storage_unavailable`（Pulse 0.3 以上把取樣留在本機緩衝，恢復後補送）、`/readyz` 回 503，資料庫恢復後自動重新連線。
+- 隨附的 systemd unit 不限制對外連線的位址（`RestrictAddressFamilies` 已包含 `AF_INET`、`AF_INET6`、`AF_UNIX`），不需要修改；自行加了 `IPAddressDeny` 的部署要允許資料庫的位址。
+
+### D.3 從既有的 SQLite 搬到 PostgreSQL
+
+```bash
+sudo systemctl stop kairos
+sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/pre-pg.db --include-keys --password-stdin \
+  --config /opt/kairos/kairos.toml < backup.pass
+# kairos.toml：加入 [storage.postgres]，storage.backend 先維持 "sqlite"
+sudo -u kairos /opt/kairos/kairos db migrate --to postgres --config /opt/kairos/kairos.toml
+# 驗證通過後：把 storage.backend 改成 "postgres"
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+sudo systemctl start kairos
+```
+
+- 搬移會驗證每張表的列數、抽樣比對 report 的內容並驗證稽核鏈；任何一項不一致以 `KRS-E4404` 結束，PostgreSQL 端不可使用（以 `--restart` 重新執行）。SQLite 資料庫不會被修改，可以照常以 `backend = "sqlite"` 啟動。
+- 原始 report 很多時以 `--reports-since 2d` 只搬最近的原始資料（彙總、清冊、告警、稽核一律全部搬），縮短停機時間；`--dry-run` 先看每張表的列數。
+- 停機期間 Pulse 0.3 以上把取樣存在本機緩衝，恢復後補送。
+- **回到 SQLite**：停止 Kairos，`kairos db migrate --to sqlite:/opt/kairos/data/kairos.db`（檔案不可已存在），把 `storage.backend` 改回 `"sqlite"` 後啟動。
+
+### D.4 備份與還原
+
+- **資料庫**以 PostgreSQL 的工具備份：`pg_dump -Fc -n kairos kairos`（邏輯備份，中小型）、pgBackRest 或 `pg_basebackup` 加 WAL 歸檔（實體備份與 PITR，建議）。`kairos db backup` 在這個後端不支援（`KRS-E4406`）；需要可攜的 SQLite 快照時停止 Kairos 後執行 `kairos db migrate --to sqlite:<檔案>`。
+- **金鑰檔不在資料庫中**：`data/audit-hmac.key`、`data/alerts-secrets.key`、`data/console.key`、`data/privacy.key` 與 `data/pki/` 的簽發 CA 私鑰要另外備份（複製檔案並保持 0600，或在改用 PostgreSQL 之前以 `kairos db backup --include-keys` 產生加密的金鑰備份），還原時與資料庫要是同一個時間點的組合。
+- **還原**：停止 Kairos → 以 PostgreSQL 的工具還原資料庫 → 確認資料目錄的金鑰檔是對應的那一組 → 啟動，執行 `kairos audit verify`。還原到較早的時間點時，那之後 Pulse 已收到 `ack` 的資料不會補送。
+- 大量刪除（保留清除、容量上限）之後空間由 autovacuum 回收重複使用，檔案不會自動變小；需要時在離峰時段執行 `VACUUM FULL` 或 `pg_repack`。
+
+## 附錄 H：叢集部署（高可用，主動／備援；0.10.0）
+
+兩個以上的 Kairos 共用一個 PostgreSQL，以資料庫中的 leader 租約選出**唯一的主動節點**；其餘是備援節點，主動節點失效時自動接手。單機部署不需要這個附錄。規格與實作的差異見 `HA.md`（第 3.2、6、11、14～17 節與第 6.8 節），資料表見 `STORAGE.md` 第 20 節。
+
+> **0.10.0 的叢集模式是預覽（階段 A：主動／備援）**。Kairos 只處理自己的容錯移轉；**資料庫本身的高可用由您負責**（主庫＋同步備庫與自動切換，例如 Patroni 或 repmgr），建議同步複寫（第 D.1 節）。資料庫完全停止時沒有任何節點能服務。
+
+| 項目 | 行為 |
+|---|---|
+| 主動節點（leader） | 持有 leader 租約；監聽 agent 連線埠（`server.listen`，以下以 8443 為例）、註冊端點（8444）、主控台（9443），執行所有背景工作（告警、彙總、保留清除、CRL、遠端管理）。與單機的 Kairos 相同 |
+| 備援節點（standby） | 只連著資料庫、寫心跳、每 2 秒嘗試取得租約。**不監聽** 8443、8444、9443，只監聽 `observability.listen`：`/healthz` 200、`/readyz` 503、`/metrics` 只有版本與 `kairos_cluster_*` |
+| 接手 | 主動節點失效 → 租約在 `cluster.lease_ttl_secs`（預設 15 秒）後到期 → 備援在 2 秒內取得 → 依一般的啟動流程載入狀態並開始監聽。主動節點正常關機時交還租約，備援不必等 15 秒 |
+| 失去租約的主動節點 | 立即以**結束代碼 75** 結束（`KRS-W8502`），由 systemd 重新啟動為備援 |
+
+**這一版沒有的**（請在規劃時列入考量）：
+
+- **多主動（階段 B，`mode = "active_active"`）**：設定驗證會拒絕。任何時間只有一個節點服務連線，叢集不增加容量。
+- **PROXY protocol v2**：經 L4 負載平衡器時，Kairos 看到的來源位址是負載平衡器的位址（每 IP 上限、註冊的來源位址、稽核的 `actor_ip`、主機的 `peer` 都是它）。請把負載平衡器的位址加入 `server.per_ip_allowlist`，或改用虛擬 IP／`fallback_addresses`（第 H.3 節）。
+- **主控台的叢集畫面、`POST` 的排空／交還 API**：叢集的狀態看 `kairos cluster status`、系統健康的 `cluster` 項目與 `GET /api/v1/cluster`；排空與交還只有 CLI。
+- **叢集專用的系統告警規則**：節點失聯、金鑰不一致等不會產生 Kairos 的告警事件；請以 Prometheus 規則（`kairos-alerts.example.yml` 最後「叢集模式」的三條規則）或外部監控補上。
+- **遠端升級版本庫的跨節點同步**：`<資料目錄>/releases/` 是節點本機的檔案，**每個節點要各自匯入相同的 Pulse 發佈版本**；否則接手的節點沒有發佈檔，進行中的升級推送會下載失敗。
+- 換手後告警規則的 `for` 計時與通知的速率限制重新計算（它們在主動節點的記憶體中）；主控台的工作階段在資料庫中，換手後仍有效。
+
+**前置條件**：
+
+- 已依附錄 D 準備好 PostgreSQL，且每個節點都連得到（`storage.backend = "postgres"`）。從單機的 SQLite 升級時先依第 D.3 節搬移資料。
+- 每個節點是一台獨立的主機，安裝**相同版本**的 Kairos（第 A 節或第 3～8 節），各有**自己的資料目錄**（`storage.data_dir`，本機磁碟；不要共用或放在網路磁碟上）。
+- 每個節點的**伺服器憑證都含服務名稱的 SAN**（Pulse 的 `server.domain`，例如 `kairos.example.com`）：Pulse 不論連到哪個節點都以同一個名稱驗證。伺服器憑證、私鑰與設定檔指到的其他憑證檔（`auth.client_ca`、`pki.server_ca_path` 等）是節點本機的檔案，每個節點都要放好；可以共用同一張伺服器憑證，或各自簽發（第 10.4 節 `kairos pki sign`，`--name` 列出服務名稱與該節點自己的名稱）。
+- 不可設定 `storage.jsonl_mirror = true`（`KRS-E0202`）。
+- 節點的時鐘以 NTP 同步（租約用資料庫的時間，不受節點時鐘影響；時差超過 2 秒記 `KRS-W8305`）。
+
+隨附的 systemd unit（`kairos.service`）**不需要修改**：`Restart=on-failure` 會重新啟動結束代碼 75 的行程（`RestartPreventExitStatus=2 3 4` 不含 75），`RestartSec=5`。
+
+### H.1 第一個節點
+
+`/opt/kairos/kairos.toml`（在附錄 D 的設定之外加入）：
+
+```toml
+[cluster]
+enabled = true
+mode = "active_passive"
+node_id = "kairos-a"                    # 叢集內唯一；1～63 個字元的 [a-z0-9-]。留空時用主機名稱的第一段
+service_name = "kairos.example.com"     # 選用：--check-config 檢查伺服器憑證的 SAN 含這個名稱
+advertise = "10.0.20.11:8443"           # 選用：只用於顯示（kairos cluster status、系統健康）
+lease_ttl_secs = 15                     # 5..=120；應大於資料庫自動切換所需的時間
+heartbeat_secs = 5                      # 1..=30
+node_lost_secs = 20                     # 至少是 heartbeat_secs 的 3 倍
+
+[observability]
+listen = "127.0.0.1:9464"               # 備援節點唯一的監聽。負載平衡器要從外部做健康檢查時改綁它可達的位址（第 H.3 節）
+```
+
+```bash
+# 1. 檢查設定（會實際連到資料庫）。叢集建立之前，「叢集」項目會有一則「尚未建立」的警告，屬於預期
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+
+# 2. 建立叢集：金鑰不存在時建立、產生 cluster_id、把金鑰指紋寫入資料庫（只在第一個節點執行）
+sudo -u kairos /opt/kairos/kairos cluster init --config /opt/kairos/kairos.toml
+
+# 3. 啟動：取得 leader 租約（日誌有 KRS-I8501），開始監聽
+sudo systemctl start kairos
+
+# 4. 確認
+sudo -u kairos /opt/kairos/kairos cluster status --config /opt/kairos/kairos.toml
+curl -s http://127.0.0.1:9464/readyz        # 200；checks 的 cluster 為 leader、keys 與 schema 為 ok
+```
+
+- **叢集模式下 Kairos 不自動建立金鑰**（`alerts-secrets.key`、`console.key`、`audit-hmac.key`、`privacy.key`）：必須先執行 `kairos cluster init`。還沒有執行就啟動的節點不會結束，而是等待（`/readyz` 503、`keys: mismatch`、`KRS-E8504`），`init` 之後 5 秒內自動繼續。從既有的單機升級時，資料目錄中原有的金鑰會被沿用（`init` 只建立缺少的）。
+- `kairos cluster init` 可以重複執行：已建立過時只重新記錄這個節點的金鑰指紋（輪替金鑰之後使用）。這個節點的金鑰與叢集記錄的不同時拒絕（結束代碼 11）——那是要加入叢集的節點，請改用第 H.2 節的匯入。
+- `kairos cluster status` 這時顯示一個 leader，並提示「只有一個節點在執行（沒有備援）」。結束代碼：0 正常、9 有嚴重問題（沒有 leader、金鑰不一致）；`--json` 的 `schema` 為 `kairos.cluster.status/v1`。
+- `kairos cluster` 的所有子命令都直接讀寫資料庫，不需要 Kairos 在本機執行，也與節點的角色無關（在任何一個節點執行都可以）。
+
+### H.2 加入第二個節點
+
+```bash
+# 1. 新節點：安裝相同版本的 Kairos；複製第一個節點的 kairos.toml，只改節點本機的鍵
+#    （cluster.node_id = "kairos-b"、cluster.advertise、各 listen、憑證與密碼檔的路徑）；放好伺服器憑證、私鑰、pg.password、pg-ca.pem
+
+# 2. 已有金鑰的節點（kairos-a）：匯出所有需要一致的金鑰（四把金鑰檔與簽發 CA 私鑰），以密碼加密（至少 12 個字元）
+sudo -u kairos /opt/kairos/kairos cluster keys export /opt/kairos/data/cluster.keys --password-stdin \
+  --config /opt/kairos/kairos.toml < keys.pass
+
+# 3. 以安全的方式把 cluster.keys 帶到新節點（密碼另外傳遞），在新節點匯入
+sudo -u kairos /opt/kairos/kairos cluster keys import /opt/kairos/data/cluster.keys --password-stdin \
+  --config /opt/kairos/kairos.toml < keys.pass          # 應顯示「這個節點的金鑰與叢集一致」
+shred -u /opt/kairos/data/cluster.keys keys.pass        # 兩個節點上的匯出檔都刪除
+
+# 4. 檢查設定後啟動
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml    # 「叢集」項目：金鑰與叢集一致
+sudo systemctl start kairos
+
+# 5. 確認：一個 leader、一個 standby，「設定」與「金鑰」兩欄都是「一致」
+sudo -u kairos /opt/kairos/kairos cluster status --config /opt/kairos/kairos.toml
+curl -s http://127.0.0.1:9464/readyz        # 503（備援節點一律 503）；cluster 為 standby、keys 為 ok
+```
+
+- 匯出檔的格式是 `kairos.keys-backup/v2`（Argon2id＋AES-256-GCM），權限 0600，**不覆寫既有檔案**（已存在時結束代碼 11）。這個檔案加上密碼就等於所有金鑰。`--password-file <檔案>` 可以取代 `--password-stdin`。`kairos db restore-keys` 也接受這個格式。
+- `keys import`：已存在且內容相同的金鑰不變；不同時拒絕（結束代碼 11），確認這個節點不屬於另一個叢集後加 `--overwrite`（舊檔改名保留）。匯入後立即與資料庫中的指紋比對，仍不一致時結束代碼 9。
+- **不要在第二個節點執行 `kairos cluster init`**。
+- 金鑰缺少或不符的節點：`/readyz` 503（`keys: mismatch`）、記 `KRS-E8504`、**不參與選舉**，但行程不結束；匯入正確的金鑰後 5 秒內自動繼續，不需要重新啟動。
+- 除了節點本機的鍵（`cluster.node_id`、`cluster.advertise`、所有 `*.listen`、`storage.data_dir`、`log.*`、`auth.client_ca`、`auth.crl*`，以及以 `_file`、`_path`、`_dir` 結尾的鍵），**所有節點的設定必須相同**。與 leader 不同時只警告（`KRS-W8505`，`kairos cluster status` 的「設定」欄顯示「不一致」），不拒絕啟動。
+- 兩台不同的主機誤用同一個 `node_id` 時，後啟動的拒絕啟動（`KRS-E8503`）。
+- 之後建立或啟用新的簽發 CA 時，要重新匯出並匯入到其他節點：缺少簽發 CA 私鑰的節點同樣是 `keys: mismatch`、不參與選舉（每 60 秒檢查一次）。
+- 第三個以上的節點步驟相同。
+
+### H.3 入口：讓 Pulse 與管理者連到主動節點
+
+備援節點不監聽，所以入口只要能把連線送到「目前在監聽的那個節點」。三種作法擇一（可以並用）：
+
+**(a) keepalived 的 VRRP 虛擬 IP**（沒有負載平衡器的環境建議）：虛擬 IP 永遠跟著主動節點。兩個節點的 `/etc/keepalived/keepalived.conf` 相同（`interface` 依主機調整）：
+
+```text
+vrrp_script kairos_leader {
+    script "/usr/bin/curl -fs -o /dev/null http://127.0.0.1:9464/readyz?scope=leader"
+    interval 2
+    fall 2
+    rise 2
+}
+
+vrrp_instance kairos {
+    state BACKUP
+    nopreempt
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    virtual_ipaddress {
+        10.0.20.10/24
+    }
+    track_script {
+        kairos_leader
+    }
+}
+```
+
+- `/readyz?scope=leader` 只在本節點是 leader 時回 200；檢查失敗的節點進入 FAULT 狀態、不持有虛擬 IP。
+- 把服務名稱（`kairos.example.com`）的 DNS 指到虛擬 IP；`server.listen`、`enroll.listen`、`console.listen` 綁 `0.0.0.0`（或設定 `net.ipv4.ip_nonlocal_bind`），虛擬 IP 移過來時才收得到連線。
+- 來源位址不變（沒有 PROXY protocol 的問題）。
+
+**(b) HAProxy（L4，TCP 透傳）**：8443、8444 是 mTLS，**負載平衡器不可終結 TLS**。健康檢查送到每個節點的 `observability.listen`（純 HTTP），所以這個監聽要綁在 HAProxy 連得到的位址（例如 `listen = "10.0.20.11:9464"`；`/metrics` 仍只接受 loopback 或帶 token 的請求）：
+
+```text
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client  150s
+    timeout server  150s
+    default-server check port 9464 inter 2s rise 2 fall 2
+
+listen kairos_agent
+    bind :8443
+    option httpchk GET /readyz?scope=agent
+    http-check expect status 200
+    server kairos-a 10.0.20.11:8443
+    server kairos-b 10.0.20.12:8443
+
+listen kairos_enroll
+    bind :8444
+    option httpchk GET /readyz?scope=enroll
+    http-check expect status 200
+    server kairos-a 10.0.20.11:8444
+    server kairos-b 10.0.20.12:8444
+
+listen kairos_console
+    bind :9443
+    option httpchk GET /readyz?scope=console
+    http-check expect status 200
+    server kairos-a 10.0.20.11:9443
+    server kairos-b 10.0.20.12:9443
+```
+
+- 閒置逾時至少 120 秒（Pulse 的心跳預設 15 秒）。
+- 這一版沒有 PROXY protocol：**不要**加 `send-proxy-v2`（Kairos 會把標頭當成不合法的 TLS 而關閉連線）。請把 HAProxy 的位址加入 `server.per_ip_allowlist`，並接受註冊的來源位址、稽核的 `actor_ip` 都是 HAProxy 的位址。
+- HAProxy 本身也要高可用（通常是兩台 HAProxy 加上 (a) 的虛擬 IP）。
+
+**(c) Pulse 的 `server.fallback_addresses`**（不需要虛擬 IP 與負載平衡器；Pulse 0.9 以上）：Pulse 的 `config.toml` 列出所有節點，連不上時依序改試：
+
+```toml
+[server]
+address = "kairos-a.example.com"
+port = 8443
+fallback_addresses = ["kairos-b.example.com"]      # "主機" 或 "主機:埠"；最多 16 個
+domain = "kairos.example.com"                      # 所有節點的伺服器憑證都要含這個名稱
+```
+
+- 備援節點不監聽，Pulse 連到它會立即被拒並改試下一個；全部失敗才依退避重試。連上後不主動切回主位址。`pulse status` 顯示連到哪個節點（`cluster.node_id`）。
+- 所有位址必須屬於**同一個叢集**（共用同一個資料庫），否則斷線補送的資料可能重複。
+- 這只處理 agent 連線：註冊端點（8444）與主控台（9443）仍需要 (a) 或 (b)，或由管理者直接連到主動節點。
+
+### H.4 驗證容錯移轉
+
+上線前至少做一次：
+
+```bash
+# 作法一：讓 leader 的租約立即到期（不必等 15 秒）。在任何一個節點執行
+sudo -u kairos /opt/kairos/kairos cluster step-down --config /opt/kairos/kairos.toml
+# 作法二：模擬主機故障。把主動節點的主機關機（或中斷它的網路），讓租約自然到期
+
+# 觀察
+watch -n1 'sudo -u kairos /opt/kairos/kairos cluster status --config /opt/kairos/kairos.toml'
+journalctl -u kairos -f        # 新的主動節點：KRS-I8501「…上一個 leader 是 …」；舊的：KRS-W8502、結束代碼 75
+```
+
+| 情境 | 預期 |
+|---|---|
+| `kairos cluster step-down`、主動節點正常關機（`systemctl stop`） | 另一個節點在約 2 秒內取得租約，數秒內開始監聽（合計通常在 10 秒內）。`step-down` 之後原本的 leader 以結束代碼 75 結束，5 秒後由 systemd 重新啟動為備援 |
+| 主動節點的行程當掉或被強制終止，主機還在 | systemd 在 5 秒後（`RestartSec=5`）重新啟動它；租約還沒到期、持有者是它自己，所以**同一個節點**直接取回租約（epoch 加一）並重新開始監聽，通常不會換到另一個節點。它在租約到期前沒有回來時（例如一直啟動失敗），才由備援接手：租約到期 ≤ 15 秒＋取得 ≤ 2 秒＋載入與監聽約 2～5 秒 |
+| 主動節點的主機斷電或網路中斷 | 備援在租約到期後接手（同上，約 20 秒內開始監聽）；Pulse 要等讀取閒置逾時（預設 30 秒）才發現斷線，加上入口轉向與重連（退避 2 秒起），合計約 45～60 秒 |
+| 主動節點連不上資料庫（其他節點正常） | 超過 `lease_ttl_secs − 5` 秒（預設 10 秒）沒有續約成功就以結束代碼 75 結束；備援在租約到期後接手 |
+
+確認項目：
+
+- `kairos cluster status` 的 leader 換成另一個節點、epoch 加一。
+- Pulse 重新連上（`pulse status` 的節點名稱改變）；換手期間的取樣由 Pulse 的本機緩衝保存，連上後補送，不遺失也不重複。
+- 主控台的即時推送收到 `resync`（原因 `failover`）後重新載入，工作階段不必重新登入。
+- 原本的主動節點回到 `standby`。
+- `sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml` 通過（兩個節點寫的是同一條稽核鏈）。
+
+### H.5 日常維運
+
+**排空（計畫性維護）**：
+
+```bash
+sudo -u kairos /opt/kairos/kairos cluster drain kairos-b --config /opt/kairos/kairos.toml
+```
+
+- 排空**備援**：角色改為 `draining`，不再參與選舉；在下一次心跳（`heartbeat_secs` 秒內）生效，重新啟動後恢復。
+- 排空 **leader**：正常關機（對 Pulse 0.9 以上送 `drain`，分散重連）、交還租約，由備援接手。行程以結束代碼 0 結束，**systemd 不會自動重新啟動**；維護完成後 `systemctl start kairos`。
+- 排空與 `step-down`、`forget` 都寫入稽核紀錄（類別 `cluster`）。
+
+**升級**：
+
+- **schema 不變的版本**可以滾動升級，叢集允許暫時混用兩個版本：
+  1. 升級備援節點（停止 → 換上新版 → 啟動，第 11 節；以套件升級時 `systemctl try-restart` 會自動重新啟動），確認它回到 `standby`；
+  2. 在主動節點 `systemctl stop kairos`（正常關機會交還租約），升級好的節點接手；
+  3. 升級原本的主動節點並啟動，它成為備援。
+- **schema 改變的版本**（CHANGELOG 會註明；例如 PostgreSQL 後端的 v9 → v10）：**停止所有節點 → 升級所有節點的執行檔 → 啟動第一個節點**（它在啟動時升級 schema）**→ 啟動其餘節點**。版本較舊的節點看到較新的 schema 時拒絕啟動（`KRS-E4405`）。升級前先備份資料庫。
+
+**移除節點**：停止該節點（`systemctl stop kairos`，並 `systemctl disable kairos` 避免它再啟動），之後在任何一個節點執行：
+
+```bash
+sudo -u kairos /opt/kairos/kairos cluster forget kairos-b --config /opt/kairos/kairos.toml
+```
+
+仍在執行（還有心跳）的節點不能 `forget`（結束代碼 11）。不 `forget` 也不影響運作，只是 `kairos cluster status` 會一直列出這個 `stopped`／`lost` 的節點。
+
+**備份與還原**：
+
+- **資料庫**：`pg_dump -Fc -n kairos kairos`，或 pgBackRest／`pg_basebackup` 加 WAL 歸檔（第 D.4 節）。
+- **金鑰**：不在資料庫中。以 `kairos cluster keys export` 產生加密的備份，與資料庫備份分開保存；輪替金鑰或新增簽發 CA 之後重新匯出。金鑰與資料庫要是同一個時間點的組合。
+- **還原**：停止所有節點 → 還原資料庫 → 以 `kairos cluster keys import` 確認各節點的金鑰與資料庫記錄的指紋一致 → 啟動第一個節點，再啟動其餘節點 → `kairos audit verify`。
+- 每個節點的設定檔、伺服器憑證與私鑰依第 10.2 節另外備份。
+
+**回到單機**：停止所有節點，在要保留的節點把 `cluster.enabled` 改回 `false` 後啟動（繼續使用 PostgreSQL）；要回到 SQLite 時另依第 D.3 節 `kairos db migrate --to sqlite:<檔案>`。其他節點不可再指向同一個 schema。
+
+### H.6 疑難排解
+
+| 現象 | 原因與處理 |
+|---|---|
+| `KRS-E8504`；`/readyz` 503、`keys: mismatch`；`kairos cluster status` 的「金鑰」欄為「不一致」 | 這個節點的金鑰缺少或與叢集記錄的不同，或簽發 CA 的私鑰不在這個節點，或還沒有執行 `kairos cluster init`。節點不參與選舉但不結束。在已有金鑰的節點 `kairos cluster keys export`，在這個節點 `kairos cluster keys import`（第 H.2 節）；修正後 5 秒內自動繼續 |
+| `KRS-W8502`，行程以**結束代碼 75** 結束後又被重新啟動 | 主動節點失去 leader 租約：超過 `lease_ttl_secs − 5` 秒沒有續約成功（與資料庫的連線中斷或太慢）、租約已被其他節點取得、或有人執行了 `kairos cluster step-down`。這是設計上的行為，systemd 會把它重新啟動為備援。**頻繁發生**時檢查節點與資料庫之間的網路與資料庫的負載；資料庫自動切換需要的時間比租約長時調高 `cluster.lease_ttl_secs`（所有節點一起改） |
+| `KRS-E8503`「已超過 … 秒沒有任何節點持有 leader 租約」；`kairos cluster status` 結束代碼 9 | 沒有節點能成為 leader，agent 無法連線。逐一檢查各節點：服務是否在執行、`/readyz` 的 `cluster`（`lost`＝連不上資料庫）、`keys`、`schema`，以及是否所有節點都被排空（`draining`；重新啟動後恢復） |
+| `KRS-E8503`「cluster.node_id … 已被另一個執行中的節點使用」，拒絕啟動 | 兩台主機用了同一個 `node_id`。修改後啟動的那個節點的 `cluster.node_id` |
+| `KRS-W8505`；「設定」欄為「不一致」 | 這個節點需要一致的設定與 leader 不同。比對兩個節點的 `kairos.toml`，統一後重新啟動；滾動修改設定的期間出現是正常的 |
+| `KRS-W8506`「叢集節點 … 失聯」 | 該節點超過 `node_lost_secs` 沒有心跳（當機、網路中斷、連不上資料庫）。檢查該節點；已經不用的節點以 `kairos cluster forget` 移除 |
+| `KRS-E4402`「已有另一個 Kairos 正在使用」或「正被一個沒有啟用叢集模式的 Kairos 使用」，結束代碼 3 | **啟動保護**：沒有啟用叢集模式的 Kairos 不能與其他 Kairos（單機或叢集節點）共用同一個 schema，反之亦然。確認 `storage.postgres` 沒有指錯資料庫；要共用時每個節點都設定 `cluster.enabled = true`。systemd 不重試，修正後 `systemctl start kairos` |
+| `KRS-E0202`，拒絕啟動 | `cluster.enabled = true` 但 `storage.backend` 不是 `"postgres"`，或同時設定了 `storage.jsonl_mirror = true` |
+| `cluster.mode = "active_active" … 尚未實作`，拒絕啟動 | 這一版只有 `"active_passive"` |
+| 節點啟動後一直是備援、`/readyz` 的 `cluster` 為 `lost`，每分鐘一次 `KRS-E4401` | 連不上 PostgreSQL。叢集模式的節點**不結束**、持續重試（單機模式則是結束代碼 3），資料庫恢復後自動繼續。檢查網路、`storage.postgres`、密碼檔與 TLS |
+| `KRS-E4405`，拒絕啟動 | 資料庫的 schema 比這個節點的版本新（其他節點已升級）。把這個節點升級到相同的版本（第 H.5 節） |
+| 備援節點的 `/readyz` 連不上（connection refused） | 沒有設定 `observability.listen`：備援節點不監聽主控台，探針只在這個監聽上提供 |
+| 備援節點的 `/metrics` 只有幾個指標 | 預期的行為：只有版本與 `kairos_cluster_*`；完整的指標在取得租約之後才有 |
+| 主動節點被 `kairos cluster drain` 之後沒有回來 | 排空的 leader 以結束代碼 0 結束，systemd 不會重新啟動；`systemctl start kairos` |
+| 換手後 Pulse 的升級推送下載失敗 | 接手的節點沒有匯入那個發佈版本（版本庫是節點本機的檔案）。在每個節點匯入相同的發佈版本 |
+| 經 HAProxy 時 agent 被 `KRS-W2201`（每 IP 上限）拒絕 | 所有連線的來源都是 HAProxy 的位址。把它加入 `server.per_ip_allowlist` |
 
 ## 附錄 P：以 openssl 手動管理 PKI（0.7 以前的部署）
 

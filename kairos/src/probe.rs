@@ -147,16 +147,21 @@ impl ObsContext {
 
     /// `/metrics` 是否允許這個請求（不含轉送標頭的檢查，見 [`handle`]）
     pub fn metrics_allowed(&self, peer: SocketAddr, authorization: Option<&str>) -> bool {
-        match &self.metrics_token {
-            Some(token) => authorization
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .is_some_and(|given| {
-                    use subtle::ConstantTimeEq;
-                    given.trim().len() == token.len()
-                        && bool::from(given.trim().as_bytes().ct_eq(token.as_bytes()))
-                }),
-            None => crate::config::is_loopback(peer.ip()),
-        }
+        metrics_allowed(self.metrics_token.as_deref(), peer, authorization)
+    }
+}
+
+/// `/metrics` 的存取規則：有 token 時比對 bearer token，沒有時只接受 loopback 來源
+fn metrics_allowed(token: Option<&str>, peer: SocketAddr, authorization: Option<&str>) -> bool {
+    match token {
+        Some(token) => authorization
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|given| {
+                use subtle::ConstantTimeEq;
+                given.trim().len() == token.len()
+                    && bool::from(given.trim().as_bytes().ct_eq(token.as_bytes()))
+            }),
+        None => crate::config::is_loopback(peer.ip()),
     }
 }
 
@@ -278,12 +283,76 @@ fn enroll_state(ctx: &ObsContext) -> &'static str {
     }
 }
 
+/// `/readyz?scope=` 的範圍（`kairos/HA.md` 第 14.1 節）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// 預設與 `scope=agent`：可以服務 agent 連線（8443 的後端）
+    #[default]
+    Agent,
+    /// `scope=enroll`：另外要求註冊端點（8444）在監聽
+    Enroll,
+    /// `scope=console`：主控台（9443）的後端；階段 A 與預設相同（只有 leader 服務）
+    Console,
+    /// `scope=leader`：本節點是 leader（keepalived 的 `track_script`）；單機時恆為 leader
+    Leader,
+}
+
+impl Scope {
+    /// 從 query string 取得；沒有或不認得時為預設
+    pub fn from_query(query: Option<&str>) -> Self {
+        let value = query
+            .into_iter()
+            .flat_map(|q| q.split('&'))
+            .find_map(|p| p.strip_prefix("scope="));
+        match value {
+            Some("enroll") => Scope::Enroll,
+            Some("console") => Scope::Console,
+            Some("leader") => Scope::Leader,
+            _ => Scope::Agent,
+        }
+    }
+}
+
+/// 叢集的三個檢查（`cluster`、`keys`、`schema`）與「叢集允許這個節點服務」；單機時為
+/// `disabled`／`ok`／`ok` 與 `true`
+fn cluster_checks() -> (&'static str, &'static str, &'static str, bool) {
+    match crate::cluster::global() {
+        None => ("disabled", "ok", "ok", true),
+        Some(c) => (
+            c.check_word(),
+            c.keys_word(),
+            c.schema_word(),
+            c.is_leader() && c.keys_ok() && c.schema() == crate::cluster::SchemaCheck::Ok,
+        ),
+    }
+}
+
 /// `/readyz` 的結果：(是否就緒, 本文)
 pub async fn readiness(
     ctx: &Arc<ObsContext>,
     db: Option<&DbSnapshot>,
     enroll_required: bool,
 ) -> (bool, Value) {
+    readiness_scoped(
+        ctx,
+        db,
+        if enroll_required {
+            Scope::Enroll
+        } else {
+            Scope::Agent
+        },
+    )
+    .await
+}
+
+/// [`readiness`]，依 `scope` 判斷
+pub async fn readiness_scoped(
+    ctx: &Arc<ObsContext>,
+    db: Option<&DbSnapshot>,
+    scope: Scope,
+) -> (bool, Value) {
+    let enroll_required = scope == Scope::Enroll;
+    let (cluster, keys, schema, cluster_ready) = cluster_checks();
     let shutting_down = ctx.shutdown.started_at().is_some();
     let listening = ctx.agent_listening.load(Ordering::Relaxed);
     let database = match db {
@@ -297,9 +366,14 @@ pub async fn readiness(
         "ok"
     };
     let enroll = enroll_state(ctx);
-    let mut ready = !shutting_down && listening && database != "unwritable" && storage == "ok";
+    let mut ready =
+        !shutting_down && listening && database != "unwritable" && storage == "ok" && cluster_ready;
     if enroll_required {
         ready &= enroll == "ok";
+    }
+    if scope == Scope::Leader {
+        // 只問「這個節點是不是 leader」：不看監聽與儲存的狀態
+        ready = !shutting_down && cluster_ready;
     }
     let body = json!({
         "status": if ready { "ready" } else { "not_ready" },
@@ -309,6 +383,9 @@ pub async fn readiness(
             "database": database,
             "storage": storage,
             "enroll": enroll,
+            "cluster": cluster,
+            "keys": keys,
+            "schema": schema,
         },
     });
     (ready, body)
@@ -512,6 +589,17 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
         b(ready),
     );
 
+    // ---- 叢集（kairos/HA.md 第 14.4 節） ----
+    let cluster = crate::cluster::global();
+    e.gauge(
+        "kairos_cluster_enabled",
+        "是否啟用叢集模式（cluster.enabled；1 是）",
+        b(cluster.is_some()),
+    );
+    if let Some(cluster) = &cluster {
+        cluster.render_metrics(&mut e);
+    }
+
     // ---- 連線與狀態表 ----
     let (agents, connected) = ctx.registry.sizes();
     let (online, _) = ctx.registry.counts();
@@ -685,6 +773,47 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
             "WAL 檔的大小",
             d.wal_bytes as f64,
         );
+        if let Some(pool) = crate::store::postgres::pool::active() {
+            let s = pool.stats();
+            e.gauge_by(
+                "kairos_db_pool_connections",
+                "PostgreSQL 連線池的連線數（idle 閒置、busy 使用中）",
+                "state",
+                &[("idle", s.idle as f64), ("busy", s.busy as f64)],
+            );
+            e.gauge(
+                "kairos_db_pool_size",
+                "PostgreSQL 連線池的上限（storage.postgres.pool_size）",
+                s.size as f64,
+            );
+            e.counter_by(
+                "kairos_db_pool_errors_total",
+                "PostgreSQL 連線池的錯誤（connect 建立連線失敗、exhausted 等不到連線）",
+                "kind",
+                &[("connect", s.connect_errors), ("exhausted", s.exhausted)],
+            );
+            e.counter_by(
+                "kairos_db_transaction_retries_total",
+                "因死結（40P01）或序列化失敗（40001）自動重試的交易數",
+                "reason",
+                &[
+                    ("40P01", s.retries_deadlock),
+                    ("40001", s.retries_serialization),
+                ],
+            );
+            if let Some(server) = pool.last_server() {
+                e.gauge(
+                    "kairos_db_clock_skew_seconds",
+                    "這個節點的時鐘減資料庫的時鐘（秒；超過 2 秒時 KRS-W8305）",
+                    server.clock_skew_ms as f64 / 1000.0,
+                );
+                e.gauge(
+                    "kairos_db_synchronous_replication",
+                    "PostgreSQL 是否有同步複寫（1 是；0 時 KRS-W4403）",
+                    b(server.synchronous_replication()),
+                );
+            }
+        }
         e.gauge(
             "kairos_database_max_bytes",
             "總容量上限（storage.max_total_bytes；0 不限制）",
@@ -1019,9 +1148,8 @@ pub async fn handle(
             }
         }
         "/readyz" => {
-            let enroll_required = query.is_some_and(|q| q.split('&').any(|p| p == "scope=enroll"));
             let db = ctx_db(ctx).await;
-            let (ready, body) = readiness(ctx, db.as_ref(), enroll_required).await;
+            let (ready, body) = readiness_scoped(ctx, db.as_ref(), Scope::from_query(query)).await;
             m.probe(1, if ready { 0 } else { 1 });
             json_response(
                 if ready {
@@ -1083,8 +1211,161 @@ impl ProbeServer {
     }
 }
 
+/// 備援節點（還沒有取得 leader 租約）的探針：`/healthz` 200、`/readyz` 503（`cluster`、`keys`、`schema`
+/// 的狀態字）、`/metrics` 只有版本與叢集的指標。取得租約後由 `main::run` 停止它，改由完整的 [`ObsContext`]
+/// 在同一個位址服務
+pub struct StandbyProbe {
+    pub cluster: Arc<crate::cluster::ClusterState>,
+    pub metrics_token: Option<String>,
+    pub stop: tokio_util::sync::CancellationToken,
+    pub started: DateTime<Utc>,
+}
+
+impl StandbyProbe {
+    pub fn new(
+        cluster: Arc<crate::cluster::ClusterState>,
+        config: &AppConfig,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            cluster,
+            metrics_token: config.observability.metrics_token()?,
+            stop: tokio_util::sync::CancellationToken::new(),
+            started: Utc::now(),
+        })
+    }
+
+    /// `/readyz` 的本文（備援節點一律未就緒）
+    pub fn readiness(&self) -> Value {
+        json!({
+            "status": "not_ready",
+            "checks": {
+                "shutdown": "ok",
+                "agent_listener": "not_listening",
+                "cluster": self.cluster.check_word(),
+                "keys": self.cluster.keys_word(),
+                "schema": self.cluster.schema_word(),
+            },
+        })
+    }
+
+    /// `/metrics` 的內容
+    pub fn render(&self) -> String {
+        let mut e = Exposition::new();
+        e.family(
+            "kairos_build_info",
+            Kind::Gauge,
+            "Kairos 的版本與建置的 commit（值固定為 1）",
+        )
+        .sample(
+            "kairos_build_info",
+            &[
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("commit", env!("KAIROS_BUILD_COMMIT")),
+            ],
+            1.0,
+        );
+        e.gauge(
+            "kairos_start_time_seconds",
+            "啟動時間（Unix 秒）",
+            self.started.timestamp() as f64,
+        );
+        e.gauge("kairos_ready", "與 /readyz 相同的就緒判斷（1 就緒）", 0.0);
+        e.gauge(
+            "kairos_cluster_enabled",
+            "是否啟用叢集模式（cluster.enabled；1 是）",
+            1.0,
+        );
+        self.cluster.render_metrics(&mut e);
+        e.finish()
+    }
+
+    fn handle(
+        &self,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+        peer: SocketAddr,
+    ) -> Response<ApiBody> {
+        if method != Method::GET && method != Method::HEAD {
+            let mut r = json_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                &json!({"status": "method_not_allowed"}),
+            );
+            r.headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+            return r;
+        }
+        let mut resp = match path {
+            "/healthz" => json_response(StatusCode::OK, &json!({"status": "ok"})),
+            "/readyz" => json_response(StatusCode::SERVICE_UNAVAILABLE, &self.readiness()),
+            _ => {
+                let authorization = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                let proxied = self.metrics_token.is_none() && is_proxied(headers);
+                if proxied || !metrics_allowed(self.metrics_token.as_deref(), peer, authorization) {
+                    let (status, reason) = if self.metrics_token.is_some() {
+                        (StatusCode::UNAUTHORIZED, "unauthorized")
+                    } else {
+                        (StatusCode::FORBIDDEN, "forbidden")
+                    };
+                    json_response(status, &json!({"status": reason}))
+                } else {
+                    text_response(StatusCode::OK, kp_obs::prom::CONTENT_TYPE, self.render())
+                }
+            }
+        };
+        if method == Method::HEAD {
+            *resp.body_mut() = ApiBody::Full(None);
+        }
+        resp
+    }
+}
+
+/// 探針監聽服務的對象：完整的服務，或備援節點
+#[derive(Clone)]
+enum ProbeTarget {
+    Full(Arc<ObsContext>),
+    Standby(Arc<StandbyProbe>),
+}
+
+impl ProbeTarget {
+    async fn cancelled(&self) {
+        match self {
+            ProbeTarget::Full(ctx) => ctx.shutdown.cancelled().await,
+            ProbeTarget::Standby(s) => s.stop.cancelled().await,
+        }
+    }
+
+    async fn handle(
+        &self,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        headers: &HeaderMap,
+        peer: SocketAddr,
+    ) -> Response<ApiBody> {
+        match self {
+            ProbeTarget::Full(ctx) => handle(ctx, method, path, query, headers, peer).await,
+            ProbeTarget::Standby(s) => s.handle(method, path, headers, peer),
+        }
+    }
+}
+
 /// 監聽 `addr` 並在背景服務；監聽失敗時回錯誤（啟動失敗，連接埠被佔用為衝突）
 pub fn start_listener(ctx: Arc<ObsContext>, addr: &str) -> Result<ProbeServer, Error> {
+    start_target(ProbeTarget::Full(ctx), addr)
+}
+
+/// 備援節點的探針監聽（[`StandbyProbe`]）；`standby.stop` 取消時停止並釋放連接埠
+pub fn start_standby_listener(
+    standby: Arc<StandbyProbe>,
+    addr: &str,
+) -> Result<ProbeServer, Error> {
+    start_target(ProbeTarget::Standby(standby), addr)
+}
+
+fn start_target(ctx: ProbeTarget, addr: &str) -> Result<ProbeServer, Error> {
     let listener = std::net::TcpListener::bind(addr.trim())
         .and_then(|l| l.set_nonblocking(true).map(|_| l))
         .map_err(|e| {
@@ -1116,10 +1397,10 @@ pub fn start_listener(ctx: Arc<ObsContext>, addr: &str) -> Result<ProbeServer, E
     })
 }
 
-async fn serve(listener: tokio::net::TcpListener, ctx: Arc<ObsContext>) {
+async fn serve(listener: tokio::net::TcpListener, ctx: ProbeTarget) {
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_PROBE_CONNECTIONS));
     let mut conns = tokio::task::JoinSet::new();
-    let shutdown = ctx.shutdown.clone();
+    let shutdown = ctx.clone();
     loop {
         while conns.try_join_next().is_some() {}
         let permit = tokio::select! {
@@ -1146,15 +1427,8 @@ async fn serve(listener: tokio::net::TcpListener, ctx: Arc<ObsContext>) {
                 async move {
                     let path = req.uri().path().to_string();
                     let resp = if is_probe_path(&path) {
-                        handle(
-                            &ctx,
-                            req.method(),
-                            &path,
-                            req.uri().query(),
-                            req.headers(),
-                            peer,
-                        )
-                        .await
+                        ctx.handle(req.method(), &path, req.uri().query(), req.headers(), peer)
+                            .await
                     } else {
                         json_response(StatusCode::NOT_FOUND, &json!({"status": "not_found"}))
                     };

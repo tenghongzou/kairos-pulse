@@ -1145,9 +1145,12 @@ impl Conn {
             server_time,
             expired_renew_grace_days: renew.expired_renew_grace_days,
             renew_now: renew.renew_now,
-            // 叢集模式（cluster_id）留待之後的版本；單機的 Kairos 只帶節點名稱
+            // 叢集模式另帶 cluster_id（kairos cluster init 產生的 UUID）；單機的 Kairos 只帶節點名稱
             server_node: agent.cluster.then(|| self.node_id.to_string()),
-            cluster_id: None,
+            cluster_id: agent
+                .cluster
+                .then(|| crate::cluster::global().and_then(|c| c.cluster_id()))
+                .flatten(),
             // 遠端管理：協商了 config 或 upgrade 時帶 pending（PROTOCOL.md「遠端管理」）
             pending: self.pending_for(agent),
         };
