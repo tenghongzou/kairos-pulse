@@ -196,15 +196,17 @@ fn alerts(db: &TestDb) -> String {
     s.upsert_events(&[e, acked]).unwrap();
     log!(out, "event", s.get_event("AL-20261009-0001").unwrap());
     assert_eq!(s.get_event("nope").unwrap(), None);
-    log!(
-        out,
-        "open",
-        s.load_open_events()
+    log!(out, "open", {
+        // 查詢沒有指定順序（SQLite 依索引、PostgreSQL 依 event_id）：比較內容
+        let mut ids: Vec<String> = s
+            .load_open_events()
             .unwrap()
             .iter()
             .map(|e| e.event_id.clone())
-            .collect::<Vec<_>>()
-    );
+            .collect();
+        ids.sort();
+        ids
+    });
     log!(
         out,
         "seq",
@@ -472,15 +474,17 @@ fn alerts(db: &TestDb) -> String {
     s.save_silence(&ended).unwrap();
     log!(out, "silence", s.get_silence("s-ended").unwrap());
     for status in ["active", "scheduled", "expired", "all"] {
-        log!(
-            out,
-            status,
-            s.list_silences(status, T0 + 1000, 10)
+        log!(out, status, {
+            // 依 starts_at 排序，相同時的先後沒有規定：比較內容
+            let mut ids: Vec<String> = s
+                .list_silences(status, T0 + 1000, 10)
                 .unwrap()
                 .iter()
                 .map(|x| x.silence_id.clone())
-                .collect::<Vec<_>>()
-        );
+                .collect();
+            ids.sort();
+            ids
+        });
     }
     log!(
         out,
@@ -674,7 +678,15 @@ fn hosts_and_api_queries(db: &TestDb) -> String {
         assert!(!rows.is_empty());
         log!(out, table, rows);
     }
-    log!(out, "recent series", s.recent_rollup_series(a, 0).unwrap());
+    // 序列編號是內部的（兩個後端建立衍生序列的先後不同）：以序列的內容比較
+    let mut recent: Vec<String> = s
+        .recent_rollup_series(a, 0)
+        .unwrap()
+        .into_iter()
+        .map(|id| format!("{:?}", s.series_info(id).unwrap()))
+        .collect();
+    recent.sort();
+    log!(out, "recent series", recent);
     log!(out, "group", s.host_group_of(A).unwrap());
     assert_eq!(s.host_group_of("nobody").unwrap(), None);
     log!(out, "basics", s.host_basics(A).unwrap());
@@ -747,7 +759,12 @@ fn hosts_and_api_queries(db: &TestDb) -> String {
     log!(
         out,
         "by name",
-        s.host_series_by_name(a, "system.filesystem.usage").unwrap()
+        // 序列編號是內部的（兩個後端建立衍生序列的先後不同）
+        s.host_series_by_name(a, "system.filesystem.usage")
+            .unwrap()
+            .into_iter()
+            .map(|(_, labels, derived)| (labels, derived))
+            .collect::<Vec<_>>()
     );
     log!(out, "cores", s.host_logical_cores(a).unwrap());
     log!(out, "means", s.rollup_means("rollup_5m", a, 1, 0).unwrap());
@@ -783,7 +800,12 @@ fn hosts_and_api_queries(db: &TestDb) -> String {
     log!(
         out,
         "rejection row",
-        db.text("SELECT cert_rejection FROM hosts WHERE cert_rejection IS NOT NULL")
+        // JSON 文字的鍵順序與空白兩個後端不同（PostgreSQL 由 jsonb 產生）：比較解析後的內容
+        serde_json::from_str::<serde_json::Value>(
+            &db.text("SELECT cert_rejection FROM hosts WHERE cert_rejection IS NOT NULL")
+                .unwrap_or_default()
+        )
+        .ok()
     );
     // 管理
     let counts = log!(out, "diag", w.diag_counts().unwrap());

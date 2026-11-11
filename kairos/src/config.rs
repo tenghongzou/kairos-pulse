@@ -1942,7 +1942,34 @@ mod tests {
         assert_eq!(c.max_hosts(), 20000);
         assert!(c.validate().is_ok());
         // 不認得的值是錯誤
-        assert!(from_env(&[("KAIROS__STORAGE__BACKEND", "postgres")]).is_err());
+        assert!(from_env(&[("KAIROS__STORAGE__BACKEND", "mysql")]).is_err());
+        // PostgreSQL 後端（0.10.0）：連線設定在 [storage.postgres]，只在選用時檢查
+        let c = from_env(&[
+            ("KAIROS__STORAGE__BACKEND", "postgres"),
+            ("KAIROS__STORAGE__POSTGRES__HOST", "db.example.com"),
+            ("KAIROS__STORAGE__POSTGRES__SCHEMA", "kairos_a"),
+        ])
+        .unwrap();
+        assert_eq!(c.storage.backend, StorageBackend::Postgres);
+        assert!(c.storage.backend.is_database() && !c.storage.writes_jsonl());
+        assert_eq!(c.storage.postgres.host, "db.example.com");
+        assert_eq!(
+            c.storage.postgres.effective_sslmode(),
+            PgSslMode::VerifyFull
+        );
+        assert!(
+            c.validate().is_ok() && c.enroll_possible() == AppConfig::default().enroll_possible()
+        );
+        let bad = from_env(&[
+            ("KAIROS__STORAGE__BACKEND", "postgres"),
+            ("KAIROS__STORAGE__POSTGRES__SCHEMA", "Bad-Name"),
+        ])
+        .unwrap();
+        let e = bad.validate().unwrap_err().to_string();
+        assert!(e.contains("storage.postgres.schema"), "{e}");
+        // 沒有選用 PostgreSQL 時不檢查 [storage.postgres]
+        let unused = from_env(&[("KAIROS__STORAGE__POSTGRES__SCHEMA", "Bad-Name")]).unwrap();
+        assert!(unused.validate().is_ok());
         assert!(from_env(&[("KAIROS__STORAGE__SQLITE_SYNCHRONOUS", "off")]).is_err());
 
         let c: AppConfig = Config::builder()

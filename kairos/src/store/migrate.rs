@@ -376,9 +376,16 @@ fn sample_points(min: i64, max: i64) -> Vec<i64> {
         return Vec::new();
     }
     let span = max - min;
-    let n = SAMPLE_ROWS.min(span + 1);
+    let n = SAMPLE_ROWS.min(span.saturating_add(1)).max(1);
+    if n == 1 {
+        return vec![min];
+    }
+    // 第一個起點是 min、最後一個是 max，其餘平均分布
     (0..n)
-        .map(|i| min + (i128::from(span) * i128::from(i) / i128::from(n.max(1))) as i64)
+        .map(|i| {
+            let offset = i128::from(span) * i128::from(i) / i128::from(n - 1);
+            min + i64::try_from(offset).unwrap_or(span)
+        })
         .collect()
 }
 
@@ -970,7 +977,7 @@ mod tests {
         assert_eq!(p.len(), 1000);
         assert_eq!(p[0], 1);
         assert!(p.windows(2).all(|w| w[0] < w[1]));
-        assert!(*p.last().unwrap() <= 1_000_000);
+        assert_eq!(*p.last().unwrap(), 1_000_000);
     }
 
     #[test]

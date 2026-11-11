@@ -317,11 +317,9 @@ fn kairos_and_pulse_run_on_the_postgres_backend() {
     std::fs::create_dir_all(single.dir.join("data")).unwrap();
     std::fs::copy(&export, single.dir.join("data").join("kairos.db")).unwrap();
     // 稽核 HMAC 的金鑰跟著資料目錄
-    for name in ["audit-hmac.key"] {
-        let from = kairos.dir.join("data").join(name);
-        if from.is_file() {
-            std::fs::copy(&from, single.dir.join("data").join(name)).unwrap();
-        }
+    let key = kairos.dir.join("data").join("audit-hmac.key");
+    if key.is_file() {
+        std::fs::copy(&key, single.dir.join("data").join("audit-hmac.key")).unwrap();
     }
     let migrated = single.reports();
     assert_eq!(

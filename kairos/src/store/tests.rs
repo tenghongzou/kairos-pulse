@@ -381,7 +381,7 @@ pub(crate) fn pulse_like(agent: &str, seq: u64, at: DateTime<Utc>, cpu: f64) -> 
 /// 每 5 秒一筆）持續 `KP_BENCH_SECS` 秒（預設 30），每筆從放入佇列到收到結果的延遲；結束時印出
 /// p50／p99／最大延遲、超過 `timeouts.write_secs`（5 秒，連線會回 `storage_unavailable`）的筆數、
 /// 資料庫大小與每筆平均大小。在 kp-build 上執行：
-/// `cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput`
+/// `cargo test -p kairos --release -- --ignored --nocapture store_throughput`
 ///
 /// - `KP_BENCH_DURABLE=1`：模擬 1 萬台同時恢復連線的補送尖峰：每筆帶去重鍵，取樣時間從
 ///   `KP_BENCH_BACKFILL_HOURS`（預設 72）小時前起、每台每筆前進 5 秒（彙總的桶都是已結束的舊桶）；
@@ -394,7 +394,7 @@ pub(crate) fn pulse_like(agent: &str, seq: u64, at: DateTime<Utc>, cpu: f64) -> 
 ///   收到 `storage_unavailable` 會退避），用來確認寫入跟不上時的回應時間上限
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "吞吐量量測，手動執行"]
-async fn sqlite_throughput() {
+async fn store_throughput() {
     let rate: u64 = std::env::var("KP_BENCH_RATE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -426,6 +426,22 @@ async fn sqlite_throughput() {
     config.storage.max_total_bytes = 0;
     if std::env::var("KP_BENCH_SYNC").is_ok_and(|v| v == "full") {
         config.storage.sqlite_synchronous = crate::config::SqliteSynchronous::Full;
+    }
+    // `KP_BENCH_BACKEND=postgres`：改用 PostgreSQL 後端（連線取自 `KAIROS_TEST_PG_URL`，使用自己的 schema，
+    // 結束時刪除；`KP_BENCH_DIR` 有設定時保留 schema 供檢查）
+    let postgres_backend = std::env::var("KP_BENCH_BACKEND").is_ok_and(|v| v == "postgres");
+    if postgres_backend {
+        let url = std::env::var(backend_tests::ENV_URL)
+            .expect("KP_BENCH_BACKEND=postgres 需要 KAIROS_TEST_PG_URL");
+        let (mut settings, password) = backend_tests::parse_url(&url).expect("KAIROS_TEST_PG_URL");
+        if !password.is_empty() {
+            let file = dir.join("pg.password");
+            std::fs::write(&file, &password).unwrap();
+            settings.password_file = file.display().to_string();
+        }
+        settings.schema = format!("bench_{}_{}", std::process::id(), next_conn_id());
+        config.storage.backend = StorageBackend::Postgres;
+        config.storage.postgres = settings;
     }
     let storage = start(&config, &dir, Utc::now).await.unwrap();
     let feed = storage.inventory.clone().unwrap();
@@ -531,25 +547,54 @@ async fn sqlite_throughput() {
     writer.await.unwrap();
     lat.sort();
     let pct = |p: f64| lat[((lat.len() as f64 * p) as usize).min(lat.len() - 1)];
-    let db = dir.join(sqlite::DB_FILE);
-    let conn = sqlite::open_read_only(&db).unwrap();
-    let q = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
-    let pages = q("PRAGMA page_count") - q("PRAGMA freelist_count");
-    let bytes = pages * q("PRAGMA page_size");
-    let rows = q("SELECT count(*) FROM reports");
-    let rollups = q("SELECT count(*) FROM rollup_5m") + q("SELECT count(*) FROM rollup_1h");
-    let raw_bytes: i64 = conn
-        .query_row(
-            "SELECT sum(pgsize) FROM dbstat WHERE name IN ('reports', 'reports_host_ts')",
-            [],
-            |r| r.get(0),
+    let (bytes, rows, rollups, raw_bytes): (i64, i64, i64, i64) = if postgres_backend {
+        // PostgreSQL：資料表與索引的大小（不含 WAL）；reports 的原始大小含它的索引與 TOAST
+        let pool = postgres::pool::PgPool::new(config.storage.postgres.clone());
+        let conn = postgres::open_read(&pool).unwrap();
+        let q = |sql: &str| conn.query_row(sql, (), |r| r.get::<_, i64>(0)).unwrap();
+        let out = (
+            q(
+                "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = current_schema() AND c.relkind = 'r'",
+            ),
+            q("SELECT count(*) FROM reports"),
+            q("SELECT count(*) FROM rollup_5m") + q("SELECT count(*) FROM rollup_1h"),
+            q("SELECT pg_total_relation_size('reports')::bigint"),
+        );
+        drop(conn);
+        if std::env::var("KP_BENCH_DIR").is_err() {
+            let admin = postgres::open_write(&pool, Duration::from_secs(5)).unwrap();
+            admin
+                .execute_batch(&format!("DROP SCHEMA {} CASCADE", pool.schema()))
+                .unwrap();
+        }
+        out
+    } else {
+        let db = dir.join(sqlite::DB_FILE);
+        let conn = sqlite::open_read_only(&db).unwrap();
+        let q = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        let pages = q("PRAGMA page_count") - q("PRAGMA freelist_count");
+        let raw_bytes: i64 = conn
+            .query_row(
+                "SELECT sum(pgsize) FROM dbstat WHERE name IN ('reports', 'reports_host_ts')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        (
+            pages * q("PRAGMA page_size"),
+            q("SELECT count(*) FROM reports"),
+            q("SELECT count(*) FROM rollup_5m") + q("SELECT count(*) FROM rollup_1h"),
+            raw_bytes,
         )
-        .unwrap_or(0);
+    };
     println!(
-        "BENCH rate={rate}/s secs={secs} hosts={hosts} durable={durable} backfill_hours={backfill_hours} dup_percent={dup_percent} inventory={inventory}\n\
+        "BENCH backend={} rate={rate}/s secs={secs} hosts={hosts} durable={durable} backfill_hours={backfill_hours} dup_percent={dup_percent} inventory={inventory}\n\
          BENCH sent={total} elapsed={:.1}s failed={failed} duplicates={duplicates} over_write_timeout_5s={over_timeout} timeout_emulated={emulate_timeout} storage_unavailable={unavailable} unknown={unknown}\n\
          BENCH latency p50={:?} p99={:?} p999={:?} max={:?}\n\
          BENCH db_bytes={bytes} wal_bytes_at_end={wal_bytes} reports={rows} rollup_rows={rollups} bytes_per_report_total={:.0} bytes_per_report_raw_table_and_index={}",
+        config.storage.backend.as_str(),
         elapsed.as_secs_f64(),
         pct(0.50),
         pct(0.99),
@@ -584,7 +629,7 @@ async fn sqlite_throughput() {
     }
 }
 
-/// [`sqlite_throughput`] 的 `KP_BENCH_TIMEOUT=1`：逾時取消的回 `Failed(BENCH_TIMED_OUT)`
+/// [`store_throughput`] 的 `KP_BENCH_TIMEOUT=1`：逾時取消的回 `Failed(BENCH_TIMED_OUT)`
 const BENCH_TIMED_OUT: &str = "bench: timed out";
 
 /// 與 `connection::store_report` 相同的等待方式（逾時 5 秒、已認領時再等 1 秒）

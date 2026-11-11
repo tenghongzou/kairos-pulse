@@ -206,7 +206,8 @@ mod tests {
     fn invalid_values_are_rejected() {
         let ok = PostgresSettings::default();
         assert!(ok.validate().is_ok());
-        let cases: Vec<(&str, Box<dyn Fn(&mut PostgresSettings)>)> = vec![
+        type Change = Box<dyn Fn(&mut PostgresSettings)>;
+        let cases: Vec<(&str, Change)> = vec![
             ("host", Box::new(|p| p.host = " ".into())),
             ("port", Box::new(|p| p.port = 0)),
             ("dbname", Box::new(|p| p.dbname = String::new())),

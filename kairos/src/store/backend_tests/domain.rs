@@ -515,19 +515,17 @@ fn users_and_sessions(db: &TestDb) -> String {
     assert!(!s.remove_assignment("user", &bob.to_string(), &op).unwrap());
     log!(out, "bob after", s.user_assignments(bob).unwrap());
     // 工作階段
-    let groups = vec!["cn=ops,dc=x".to_string()];
     let session = |hash: &'static [u8], public: &'static str, user: i64| NewSession {
         session_hash: hash,
         public_id: public,
         user_id: user,
         method: "password",
-        ldap_groups: if user == 2 { &[] } else { &[] },
+        ldap_groups: &[],
         idle_timeout_ms: 1_800_000,
         expires_at: T0 + DAY,
         ip: "10.0.0.5",
         user_agent: Some("curl/8"),
     };
-    let _ = &groups;
     s.create_session(
         &session(b"hash-a1-0000000000000000000000000", "pub-a1", ann),
         T0 + 100,

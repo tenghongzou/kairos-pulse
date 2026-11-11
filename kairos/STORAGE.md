@@ -442,10 +442,10 @@ systemctl start kairos
 
 ## 11. 量測
 
-`kairos/src/store/tests.rs` 的 `sqlite_throughput`（`#[ignore]`）：以實際的 writer 與 SQLite，每 10 ms 送出一批，每筆從放入佇列到收到結果計時。
+`kairos/src/store/tests.rs` 的 `store_throughput`（`#[ignore]`；0.9 以前名為 `sqlite_throughput`）：以實際的 writer 與 SQLite，每 10 ms 送出一批，每筆從放入佇列到收到結果計時。
 
 ```bash
-cargo test -p kairos --release -- --ignored --nocapture sqlite_throughput
+cargo test -p kairos --release -- --ignored --nocapture store_throughput
 # 可調：KP_BENCH_RATE（筆／秒，預設 2000）、KP_BENCH_SECS（預設 30）、KP_BENCH_HOSTS（預設 10000）、
 #       KP_BENCH_SYNC=full、KP_BENCH_DIR（保留資料庫供檢查）
 # 補送尖峰：KP_BENCH_DURABLE=1（帶去重鍵、取樣時間從 KP_BENCH_BACKFILL_HOURS=72 小時前起）、

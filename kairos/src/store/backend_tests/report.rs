@@ -703,7 +703,10 @@ fn retention_deletes_expired_rows(db: &TestDb) -> String {
         let r = f4_record(A, d as u64, t, 1, 1)
             .with_dedup(dedup(&format!("boot-{d}"), 1))
             .with_processes(Some(list.clone()));
-        assert_eq!(store.write_batch(&[r.clone()]), [WriteStatus::Written]);
+        assert_eq!(
+            store.write_batch(std::slice::from_ref(&r)),
+            [WriteStatus::Written]
+        );
         // durable 重送：重複的 report 不寫出重複的快照
         assert_eq!(store.write_batch(&[r]), [WriteStatus::Duplicate]);
         for table in ["rollup_5m", "rollup_1h"] {

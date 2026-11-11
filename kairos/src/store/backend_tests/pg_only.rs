@@ -343,9 +343,9 @@ fn exclusive_access_and_the_running_service_exclude_each_other() {
     let pool = db.pool();
     // 服務執行中：獨占的 CLI 取不到
     let (mut store, _) = db.store(noon);
-    let e = postgres::open_exclusive(&pool, Duration::from_millis(300))
-        .err()
-        .expect("應該被服務擋住");
+    let Err(e) = postgres::open_exclusive(&pool, Duration::from_millis(300)) else {
+        panic!("應該被服務擋住");
+    };
     assert_eq!(e.kind(), ErrorKind::ResourceBusy, "{e}");
     // 一般的讀寫連線不受影響
     db.handle().put_meta("k", "v").unwrap();
@@ -357,9 +357,9 @@ fn exclusive_access_and_the_running_service_exclude_each_other() {
     drop(store);
     // 服務停止後可以獨占；獨占期間服務無法啟動，第二個獨占者也取不到
     let exclusive = postgres::open_exclusive(&pool, Duration::from_millis(300)).unwrap();
-    let e = postgres::report::PgStore::open(pool.clone(), db.opts(), noon)
-        .err()
-        .expect("獨占期間服務不應啟動");
+    let Err(e) = postgres::report::PgStore::open(pool.clone(), db.opts(), noon) else {
+        panic!("獨占期間服務不應啟動");
+    };
     assert_eq!(e.kind(), ErrorKind::ResourceBusy, "{e}");
     assert!(postgres::open_exclusive(&pool, Duration::from_millis(200)).is_err());
     drop(exclusive);
