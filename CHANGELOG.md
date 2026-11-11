@@ -142,6 +142,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 - **`pulse enroll`**：送出申請之前（`server-info`、`token-check`）收到 429／503 時依 `Retry-After × U(1.0, 1.2) + U(0, 2 秒)` 等候後重試（合計不超過 `--wait`，沒有指定時 600 秒；互動時顯示倒數，Ctrl+C 取消）。0.8 直接結束（結束代碼 6）。
 - **`pulse-install.sh --ca-file <根 CA>`**：以 Kairos 的根 CA 驗證下載端點的 HTTPS（完整性仍以發佈公鑰驗證）。
+- **修正：Windows 上 `STATE_DIRECTORY` 永遠被忽略**（CI 的 Windows 端對端測試發現）：這個環境變數以 `:` 分隔取第一個路徑（systemd 的格式），`C:\…` 因此被切成 `C` 而不採用，狀態目錄（集中設定的快取 `remote\config.json`、未設定 `[status] file` 時的狀態檔）一律落在 `%ProgramData%\Pulse`，同一台機器上的多個 Pulse 會共用同一份快取。Windows 上改為把整個值視為一個路徑；沒有設定這個環境變數時（MSI／服務的預設）位置不變，Linux 的行為不變。
 - **修正：`pulse enroll` 改寫 `pulse.toml` 後服務讀不到設定**（0.8.0 的 deb／rpm 與一行安裝腳本起；systemd 實測發現）：root 改寫套件的 `/opt/pulse/pulse.toml`（`root:pulse 640`）時新檔案變成 `root:root`，一行安裝腳本、Ansible role 裝好的 deb／rpm 主機一直連 127.0.0.1、不用 mTLS。現在 `pulse.toml` 與 `pulse.toml.bak-<時間>` 都沿用原檔的擁有者、群組與權限（備份原本以 umask 的預設權限寫入）。0.8 已安裝的主機請 `chgrp pulse /opt/pulse/pulse.toml` 後重新啟動。
 
 ### 主控台（設計包 `decisions/INTEGRATION.md` §31）
