@@ -28,7 +28,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 log = { version = "0.4", features = ["kv"] }
 # report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
 # 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 # 註冊通道（8444）的簽發器：依範本簽發用戶端憑證、產生 CRL、產生簽發 CA 的金鑰與 CSR
 # （crates/kairos-proto/ENROLL.md 第 15.3 節選定；以 ring 為後端，不引入 aws-lc-rs）
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }

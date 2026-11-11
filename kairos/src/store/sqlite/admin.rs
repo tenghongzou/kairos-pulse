@@ -28,7 +28,7 @@ fn rows_json(
     use rusqlite::types::ValueRef;
     use serde_json::{Value, json};
     let mut stmt = conn.prepare(sql)?;
-    let names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+    let names: Vec<String> = stmt.column_names().map(String::from).collect();
     let rows = stmt.query_map(p, |r| {
         let mut m = serde_json::Map::new();
         for (i, n) in names.iter().enumerate() {
