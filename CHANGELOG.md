@@ -60,9 +60,12 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **全域搜尋納入升級推送與設定檔**（F8）：`GET /api/v1/rollouts`、`GET /api/v1/config/profiles` 新增查詢參數 `q`（推送的名稱、編號、目標版本；設定檔的名稱、說明；子字串、不分大小寫），主控台的全域搜尋（Ctrl+K）多了「升級推送」「設定檔」兩組，各需要 `rollouts:read`、`config:read`。
 
 - **升級中主機的離線告警抑制**（F8，REMOTE.md 第 4.7.5、13.1 節、ALERTS.md 第 5.5 節）：升級推送中的主機從交給輔助程式（`applying`）到回報結果之間，不再因為替換與重新啟動的短暫離線而開「主機離線」「主機長期失聯」事件（系統規則與自訂的 `host_offline`／`host_long_offline` 規則），也不計入網段離線、大規模離線的台數；其他規則（指標門檻、回報延遲…）不受影響。抑制最長到 `applying` 之後 `health_timeout_secs + 10 分鐘`：**超過後仍離線就照常告警**（離線時間以實際離線的時間計），事件的 `details.upgrade` 與處理紀錄的新動作 `upgrade_suppressed` 註明「升級中」；Kairos 重新啟動後抑制狀態由資料庫重建。Webhook 等接收端若列舉處理紀錄的動作，請忽略不認得的值。
+- **升級推送的自訂批次**（F8，REMOTE.md 第 4.7.1、13.1 節、API.md 第 17.3 節）：`waves` 由最多 2 批放寬為最多 10 批；每批的 `size` 為台數或**當時剩餘**的可升級主機的百分比，最後一批為 `"rest"`，每批各有觀察時間、失敗上限與是否人工繼續。省略 `waves` 時仍是 0.9 的兩批預設範本，既有兩批推送的分批結果不變。預覽另回 `wave_templates`（含第 4.7.1 節建議的四批範本 1% → 10% → 50% → 其餘）與 `max_waves`。主控台 S26 的建立表單可以增減「中間的批次」並套用四批範本，詳情的批次時間軸支援多批。
+- **升級推送的排程與維護時段**（F8，REMOTE.md 第 4.7.1、4.7.3、4.7.5、13.1 節、API.md 第 17.3 節）：推送新增 `schedule`——`starts_at`（在這之前為新的狀態 `scheduled`，到時由推送引擎開始）、`ends_at`（到時推送結束，尚未開始替換的主機標為 `expired`／`rollout_ended`）、`windows[]`（每週的維護時段：星期、`HH:MM` 的開始與結束，可跨午夜）與 `timezone`（固定位移，預設 `alerts.timezone`）。時段是「允許開始替換的時間」：時段外不提議新的主機，提議的 `apply_window` 到時段結束為止，已開始替換的照常完成；時段結束時還沒開始的主機在下一個時段重新提議，不計入失敗。`next_action` 新增 `scheduled`、`waiting_window`；已排程的推送可以取消，修改時退回草稿、需要重新送出。對象仍在**送出時**固定。Pulse 0.9.0 就會遵守 `apply_window`，不需要升級 Pulse。主控台 S26：建立表單的「排程與維護時段」、清單與詳情的「已排程」「等待維護時段」。
 
 ### 變更
 
+- 推送的本文帶 `schedule` 不再回 400（0.9.0 一律拒絕）；`windows`、`starts_at`、`ends_at`、`timezone` 要放在 `schedule` 物件內。`GET /api/v1/rollouts` 的 `state` 篩選多了 `scheduled`，讀取端應忽略不認得的 `state` 與 `next_action.code`。
 - 重複上傳同一個發佈檔（`PUT /api/v1/releases/{version}/artifacts/{filename}`、`kairos releases import`）時，版本庫中已有同名而大小不同的檔案會被取代（0.9.0 一律保留既有的檔案，被截斷的檔案無法以重新上傳修復）。
 
 ### 新代碼

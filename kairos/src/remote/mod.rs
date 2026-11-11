@@ -431,7 +431,7 @@ impl RemoteService {
                             "current_wave": r.current_wave,
                             "progress": rollout::progress(&hosts),
                             "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
-                            "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now),
+                            "next_action": rollout::next_action_scheduled(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), &schedule::ScheduleSpec::from_db(&r.schedule), now),
                         });
                         let mut host_events = Vec::new();
                         let mut marks = None;

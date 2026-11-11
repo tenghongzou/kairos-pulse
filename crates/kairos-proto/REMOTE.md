@@ -1073,7 +1073,15 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 **推送**（第 4.7 節的 MVP）
 
-- 最多兩批（`waves` 的最後一批為 `"rest"`；預設範本為 canary 1%（至多 10 台）、觀察 60 分鐘、上限 0、人工繼續，其餘 5%），送出後立即開始（`draft` → `running`；`scheduled`、`pending_approval` 保留給 0.10）。對象在**送出時**固定（第 4.7.2 節寫「開始時」，建立草稿時只預覽），不符資格的記為 `skipped`（`wave = -1`）。
+- 0.9.0：最多兩批（0.10.0 起見下方「自訂批次」「排程與維護時段」；`waves` 的最後一批為 `"rest"`；預設範本為 canary 1%（至多 10 台）、觀察 60 分鐘、上限 0、人工繼續，其餘 5%），送出後立即開始（`draft` → `running`；`scheduled`、`pending_approval` 保留給 0.10）。對象在**送出時**固定（第 4.7.2 節寫「開始時」，建立草稿時只預覽），不符資格的記為 `skipped`（`wave = -1`）。
+- **自訂批次**（0.10.0，第 4.7.1 節）：`waves` 最多 10 批（`rollout::MAX_WAVES`），最後一批 `"rest"`；`size` 的百分比以**當時剩餘**的可升級主機計（至少 1 台，`max_hosts` 為上限），兩批時與 0.9 的結果相同。省略 `waves` 時仍是 0.9 的兩批預設範本（API 相容）；第 4.7.1 節的四批範本由預覽的 `wave_templates.recommended` 提供，主控台可一鍵套用。`canary_agent_ids` 仍指定第一批。失敗比例、觀察期、人工繼續逐批計算。
+- **排程與維護時段**（0.10.0，第 4.7.1、4.7.3、4.7.5 節；`kairos/src/remote/schedule.rs` 的純函式）：`rollouts.schedule`（JSON）＝`starts_at`、`ends_at`、`windows[]`（`days`：`mon`～`sun`，省略＝每天；`start`／`end`：`HH:MM`，跨午夜的時段屬於開始的那一天；最多 16 個，相連或重疊的時段視為一段）、`timezone`。
+  - 狀態：送出時 `starts_at` 在未來 → `scheduled`（對象同樣在送出時固定，算在「未結束的推送」中，其他推送會 `rollout_overlap`）；推送引擎到時轉為 `running` 並以 `system` 寫 `rollout.start`。`scheduled` 可以取消；修改（`PUT`）時退回 `draft`、刪除已固定的對象，需要重新送出。
+  - 時段外不提議新的主機（`next_action: waiting_window{until}`）。提議的 `apply_window` 為 `[提議時, 所在時段結束]`（沒有時段時照舊為提議後 24 小時；都不超過 `ends_at`）。時段結束後 `upgrade_get`（含 Pulse 交付前的再確認，第 17.2 節 #10）回 `upgrade_unavailable`，Pulse 不會在時段外替換。
+  - 時段結束時還沒開始替換的主機——Pulse 回報 `expired`，或時段結束 2 分鐘後仍停在提議中——回到 `pending`（`reason: window_closed`、新的 `upgrade_id`、`attempts` 加 1），下一個時段重新提議，不計入失敗比例、不阻擋批次；同一台超過 10 次後留在 `expired`（可手動重試）。沒有時段的推送維持 0.9 的行為（`expired` 為終止狀態）。
+  - `ends_at`：到時尚未開始替換的主機（`pending`、提議中、`skipped_offline`）標為 `expired`（`reason: rollout_ended`）；沒有替換中的主機時推送 `completed`，有的話等它們結束。送出時 `ends_at` 已過 → 409 `schedule_ended`。
+  - Kairos 重新啟動：時段以目前時間與資料表中的 `schedule` 重新計算，不需要另外的狀態。暫停後 `resume` 同樣重新判斷時段。
+  - 不需要協定變更：Pulse 0.9.0 已遵守 `apply_window`（已暫存的升級等待 `not_before`、超過 `not_after` 回報 `expired`）。
 - **資格分類的主機資訊**：預覽、建立與送出都以清冊的列為基礎，連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤覆蓋，協商了 `upgrade` 的連線再以發提議時使用的資訊（`AgentSession`）覆蓋——與發提議一致，主機連線後不必等清冊每 30 秒的同步（原本只有協商了遠端管理的連線如此，沒有 mTLS 時約有 30 秒的落差）。清冊還沒有的主機（連線後尚未寫入過任何資料，沒有 `host_id`）不在對象中。`GET /api/v1/hosts/{agent_id}/upgrade` 的版本、`install`、`arch` 同樣以 hello 為準。
 - 推送引擎每 5 秒（狀態改變時立即）每個推送一個交易：逾時（提議後 24＋1 小時仍未開始 → `expired`；`applying` 後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線 → `unknown`）、離線寬限（`skipped_offline`，重新連線時回到 `pending`）、失敗比例（持續檢查）、觀察期、人工繼續、完成。只對**連線中且協商了 `upgrade`** 的主機提議；連線中但沒有協商的主機記為 `skipped`（`not_ready`）。
 - **`server_lost`**：`applying` 的逾時判斷中，最後一次離線的原因是 Kairos 這端（`server_shutdown`、叢集的 `server_lost`）時，期限從 Kairos 這次啟動時重新起算，不把主機標為 `unknown`（主機連不上是因為 Kairos 的節點失聯或停機，不是卡在替換中）；`server_lost` 已在 0.9.0 的 `offline_reason` 列舉中（單機的 Kairos 不會產生）。Kairos 啟動後 1 分鐘內不提議新的主機（第 4.7.4 節第 5 項）。
@@ -1105,6 +1113,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 | 項目 | 規格 | 實作 |
 |---|---|---|
+| 維護時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **固定位移**（`+08:00`；另接受 `UTC`、`Z`），預設 `alerts.timezone`（本來就是固定位移），沒有設定時 `+08:00`。不支援時區名稱與日光節約時間：Kairos 沒有時區資料庫的依賴，告警的時區也是固定位移；有日光節約時間的地區需要在換季時調整時段（列入待決） |
+| 修改已排程的推送（0.10.0） | `draft`／`pending_approval`／`scheduled` 可修改，修改後重新送審 | `scheduled` 的推送修改時退回 `draft`（對象重新計算、確認字串重新輸入） |
 | `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
 | 對象固定的時間 | 推送開始時（第 4.7.2 節） | 送出時（0.9 送出即開始，兩者相同） |
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
