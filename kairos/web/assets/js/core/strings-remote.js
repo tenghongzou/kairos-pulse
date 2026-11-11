@@ -20,6 +20,12 @@ export const REMOTE_STRINGS = {
   'nav.rollouts': '升級推送',
   'nav.releases': 'Pulse 版本庫',
   'nav.badge.rollouts': '{n} 項需要處理（已暫停的推送與回滾失敗的主機）',
+  // ---- 全域搜尋（Ctrl+K）與 S04 版本欄 ----
+  'search.group.rollouts': '升級推送',
+  'search.group.profiles': '設定檔',
+  'search.rolloutTarget': '目標 {v}',
+  'search.profileHosts': '套用到 {n} 台',
+  'hosts.versionOutdated': '低於建議的最低版本 {min}：無法遠端升級到最新版本，請手動升級（與伺服器的協定仍相容）',
 
   // ---- 稽核（S18「0.9 規格」） ----
   'adm.audit.cat.config': '集中設定',

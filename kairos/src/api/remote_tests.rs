@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use super::tests::{Fixture, Resp, call, fixture, send_raw};
+use super::tests::{Fixture, Resp, Sse, call, fixture, send_raw};
 use super::tokens::{self, TokenGrant};
 use crate::rbac::Role;
 use crate::remote::test_sign::{TestSigner, release};
@@ -93,6 +93,28 @@ async fn central_config_endpoints_over_https() {
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let id = body(&r)["data"]["id"].as_i64().unwrap();
     assert_eq!(body(&r)["data"]["keys"], 1);
+    // 全域搜尋：清單的 q（名稱或說明；不分大小寫），需要 config:read
+    for (q, n) in [("linux", 1), ("%E9%A0%90%E8%A8%AD", 1), ("zzz", 0)] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/config/profiles?q={q}"),
+            Some(&op),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        assert_eq!(body(&r)["data"].as_array().unwrap().len(), n, "q={q}");
+    }
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/config/profiles?q=linux",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 403);
     let r = call(addr, "PUT", &format!("/api/v1/config/profiles/{id}"), Some(&op), Some(&json!({"settings": {"report": {"interval": 15}, "log": {"level": "debug"}}, "reason": "除錯"}))).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(body(&r)["data"]["revision"], 2);
@@ -442,6 +464,19 @@ async fn releases_and_rollouts_over_https() {
         ),
         (400, Some("升級 1 台"))
     );
+    // SSE（REMOTE.md 第 8.4 節）：`rollout.host` 只送給以 rollout_id 訂閱這個推送、且有 rollouts:read 的連線
+    let ro = token(&f, Role::Viewer);
+    let events = format!("/api/v1/events?rollout_id={id}");
+    let mut watching = Sse::open_path(addr, &op, &events, None).await;
+    let mut other =
+        Sse::open_path(addr, &op, "/api/v1/events?rollout_id=r-20000101-0001", None).await;
+    let mut plain = Sse::open(addr, &op, None).await;
+    let mut no_perm = Sse::open_path(addr, &ro, &events, None).await;
+    for s in [&mut watching, &mut other, &mut plain, &mut no_perm] {
+        assert_eq!(s.status, 200);
+        s.wait_for("ready").await;
+    }
+    let remote = f.remote.clone().expect("遠端管理");
     let r = call(
         addr,
         "POST",
@@ -452,6 +487,86 @@ async fn releases_and_rollouts_over_https() {
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(body(&r)["data"]["state"], "running");
+    remote.flush_progress().await;
+    let ev = watching.next().await.expect("rollout.host");
+    assert_eq!(ev.event, "rollout.host", "主機的事件先於 rollout.progress");
+    assert_eq!(
+        (
+            ev.data["rollout_id"].as_str(),
+            ev.data["agent_id"].as_str(),
+            ev.data["state"].as_str(),
+            ev.data["wave"].as_i64()
+        ),
+        (Some(id.as_str()), Some(H), Some("pending"), Some(0))
+    );
+    assert_eq!(watching.next().await.unwrap().event, "rollout.progress");
+    // 訂閱別的推送、沒有訂閱的連線只收到 rollout.progress；沒有 rollouts:read 的連線兩者都收不到
+    for s in [&mut other, &mut plain] {
+        let ev = s.next().await.unwrap();
+        assert_eq!(ev.event, "rollout.progress");
+        assert_eq!(ev.data["rollout_id"], id.as_str());
+    }
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(700), no_perm.next()).await;
+    assert!(quiet.is_err(), "唯讀角色不應收到推送的事件");
+    // 沒有改變的主機不重送；取消訂閱後不再逐台送出
+    remote.mark_dirty(&id);
+    remote.flush_progress().await;
+    assert_eq!(watching.next().await.unwrap().event, "rollout.progress");
+    drop(watching);
+    drop(other);
+    drop(plain);
+    drop(no_perm);
+    // 全域搜尋：清單的 q（名稱、編號、目標版本；不分大小寫），需要 rollouts:read
+    for (q, n) in [
+        ("WEB", 1),
+        (id.as_str(), 1),
+        ("0.9.2", 1),
+        ("zzz", 0),
+        ("", 1),
+    ] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/rollouts?q={q}"),
+            Some(&auditor),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        assert_eq!(body(&r)["data"].as_array().unwrap().len(), n, "q={q}");
+        assert_eq!(body(&r)["meta"]["paused"], 0, "meta 不受 q 影響");
+    }
+    let r = call(addr, "GET", "/api/v1/rollouts?q=web", Some(&ro), None).await;
+    assert_eq!(r.status, 403);
+    // S04 版本欄的 ⚠：建議的最低版本＝版本庫中最新版本的清單 min_upgrade_from（0.9.0）；只需要 hosts:read
+    add_host(&f, "7e2f0a11-0000-4000-8000-0000000000c2", "0.8.0", "tar");
+    f.console.ctx.hosts.invalidate().await;
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/hosts?sort=agent_version",
+        Some(&ro),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = body(&r);
+    assert_eq!(v["meta"]["recommended_min_agent_version"], "0.9.0");
+    let flags: Vec<(String, bool)> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["agent_version"].as_str().unwrap().to_string(),
+                h["agent_outdated"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![("0.8.0".to_string(), true), ("0.9.0".to_string(), false)]
+    );
     let r = call(
         addr,
         "GET",

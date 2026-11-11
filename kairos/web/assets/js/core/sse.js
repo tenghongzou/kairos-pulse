@@ -22,6 +22,7 @@ let retryTimer = null;
 let backoffMs = 5000;
 let connected = false;
 let enabled = true;
+let watchedRollout = null;
 
 function setConnected(v) {
   if (v !== connected) {
@@ -58,11 +59,15 @@ function dispatch(type, ev) {
 }
 
 // 0.9：遠端管理的 config.host（需要 config:read）、rollout.progress（需要 rollouts:read；API.md 第 17.5 節）
-const TYPES = ['ready', 'resync', 'host.added', 'host.online', 'host.offline', 'alert.created', 'alert.updated', 'alert.resolved', 'config.host', 'rollout.progress'];
+// 0.10：rollout.host（單台主機的升級狀態；只送給以 ?rollout_id= 訂閱那個推送的連線，見 watchRollout）
+const TYPES = ['ready', 'resync', 'host.added', 'host.online', 'host.offline', 'alert.created', 'alert.updated', 'alert.resolved', 'config.host', 'rollout.progress', 'rollout.host'];
 
 function open() {
   if (es || !enabled || handlers.size === 0) return;
-  const url = lastEventId ? `/api/v1/events?last_event_id=${encodeURIComponent(lastEventId)}` : '/api/v1/events';
+  const params = [];
+  if (lastEventId) params.push(`last_event_id=${encodeURIComponent(lastEventId)}`);
+  if (watchedRollout) params.push(`rollout_id=${encodeURIComponent(watchedRollout)}`);
+  const url = params.length ? `/api/v1/events?${params.join('&')}` : '/api/v1/events';
   es = new EventSource(url, { withCredentials: true });
   for (const type of TYPES) {
     es.addEventListener(type, (ev) => {
@@ -108,6 +113,26 @@ export function subscribe(fn) {
   return () => {
     handlers.delete(fn);
     if (handlers.size === 0) close();
+  };
+}
+
+/**
+ * 訂閱一個推送的 rollout.host（S26 推送詳情）：整個主控台共用一條串流，所以以 ?rollout_id= 重新開啟它
+ * （帶 last_event_id 接續，不會漏掉事件）。回傳取消的函式；同一時間只有一個畫面訂閱。
+ */
+export function watchRollout(id) {
+  const reopen = () => {
+    if (!es) return;
+    es.close();
+    es = null;
+    open();
+  };
+  watchedRollout = id;
+  reopen();
+  return () => {
+    if (watchedRollout !== id) return;
+    watchedRollout = null;
+    reopen();
   };
 }
 

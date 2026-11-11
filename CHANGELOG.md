@@ -55,6 +55,9 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 - **`kairos releases list|import|delete`**（F8，REMOTE.md 第 8.2、13.1 節）：Pulse 發佈版本庫的命令列。`import <目錄>` 讀取同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json` 與發佈檔，可以重複執行補上發佈檔，也可以在 Kairos 啟動前先匯入（離線環境）；`list [--json]` 列出版本、發佈檔與使用情形，並標出已存入而檔案遺失或大小不符的發佈檔；`delete <版本> --confirm <版本>`（L2）。驗證、`release_in_use` 的保護與稽核事件與主控台 API 相同，執行者為 `cli:<OS 帳號>`。`import --external <URL>` 的參數保留給外部 URL 的版本庫。
 - **系統健康的「版本庫的檔案遺失」**（F8，設計包 S20「遠端管理」列）：已存入的發佈檔不存在或大小與記錄不符時（例如還原備份之後：`kairos db backup` 不含發佈檔），`GET /api/v1/system/health` 的 `remote` 項目為警告（`KRS-W8417`〔暫定〕），`values.release_files_missing`、`missing_files[]` 列出版本、檔名與需要它回滾的主機數；主控台 S20 附「前往 Pulse 版本庫」。重新匯入這個版本的發佈檔即可（大小不符的檔案會被取代）。
+- **SSE `rollout.host`**（F8，REMOTE.md 第 8.4 節、API.md 第 17.5 節）：主控台的 SSE 連線以 `GET /api/v1/events?rollout_id=<推送>` 訂閱一個推送後，推送中每台主機的狀態、進度、代碼改變時收到 `rollout.host`（內容同主機表的一列；需要 `rollouts:read`，沒有訂閱或沒有權限的連線不會收到）。每台主機每一輪（最遲 5 秒）最多一則；一輪改變超過 200 台時改在 `rollout.progress` 帶 `hosts_resync: true`。主控台 S26 的推送詳情改為就地更新主機列，不再每次重新抓取主機表。
+- **S04 agent 版本欄的「低於建議版本」**（F8，REMOTE.md 第 4.9 節、R9）：`GET /api/v1/hosts` 新增 `meta.recommended_min_agent_version`（Pulse 版本庫中最新版本的發佈清單的 `min_upgrade_from`；沒有時 `null`）與每一列的 `agent_outdated`，主控台對低於它的主機加 ⚠ 與說明（無法遠端升級到最新版本，需要手動升級；協定仍相容）。只需要 `hosts:read`。
+- **全域搜尋納入升級推送與設定檔**（F8）：`GET /api/v1/rollouts`、`GET /api/v1/config/profiles` 新增查詢參數 `q`（推送的名稱、編號、目標版本；設定檔的名稱、說明；子字串、不分大小寫），主控台的全域搜尋（Ctrl+K）多了「升級推送」「設定檔」兩組，各需要 `rollouts:read`、`config:read`。
 
 ### 變更
 

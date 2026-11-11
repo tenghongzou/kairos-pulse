@@ -906,6 +906,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 - `config.host`：主機的設定狀態改變（`agent_id`、`state`、`applied_rev`）；需要 `config:read`。
 - `rollout.progress`：推送的狀態與各狀態台數（每個推送每 2 秒最多一則）；`rollout.host`：單台狀態改變（只送給正在看該推送詳情的連線，以查詢參數 `rollout_id` 訂閱）；需要 `rollouts:read`。
+- 實作（0.10.0，第 13.1 節）：`rollout.host` 隨推送引擎的每一輪送出（每台主機每輪最多一則，內容同主機表的一列）；一輪改變超過 200 台時改在 `rollout.progress` 帶 `hosts_resync: true`，主控台重新抓取主機表。沒有連線訂閱的推送不產生 `rollout.host`。
 
 ## 9. 主控台畫面需求（給設計包）
 
@@ -1079,6 +1080,9 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - 允許無法自動回滾的主機（`allow_no_rollback`）而有這類主機時，送出的 L2 確認字串為設計包 S26 的「升級 N 台（無法自動回滾 M 台）」（全形括號；只接受這個字串），降版的 L3「降版 N 台」優先。
 - 系統健康（`GET /api/v1/system/health`）的 `remote` 項目（設計包 S20「遠端管理」列，需要 `rollouts:read` 才看得到細節）：回滾失敗未處理為嚴重（`KRS-E8408`）、自動暫停的推送為警告（`KRS-W8414`）、版本庫有發佈版本但沒有 `allowed_signers` 為警告。**版本庫的檔案遺失**（0.10.0）：`stored = 1` 的發佈檔在 `<releases_dir>/<sha256>` 不存在、不是一般檔案或大小與記錄不符（例如還原備份之後，第 6 節）時為警告（`KRS-W8417`〔暫定〕），摘要為「版本庫的檔案遺失：0.9.0 的 pulse-0.9.0-…deb（312 台的回滾需要）」（多於一個時加「等 N 個檔案」；大小不符時為「版本庫的檔案大小不符」），`values.release_files_missing`、`missing_files[]`（前 20 個：`version`、`filename`、`problem`＝`missing`／`size_mismatch`、`rollback_target_for`）；每次查詢只 `stat` 已存入的檔案、不重算雜湊（內容被改而大小相同的檔案由 Pulse 的雜湊與簽章檢查發現）。優先序：回滾失敗 ＞ 自動暫停 ＞ 檔案遺失 ＞ 信任錨未設定。處理方式是重新匯入這個版本的發佈檔（主控台 S25 或 `kairos releases import`；大小不符的檔案會被取代）。
 - 推送中主機的離線告警抑制（第 4.7.5 節）尚未實作。
+- **SSE `rollout.host`**（0.10.0，第 8.4 節）：主控台的 SSE 連線以 `GET /api/v1/events?rollout_id=…` 訂閱一個推送（`RemoteService::watch_rollout`，串流結束時取消；需要 `rollouts:read`）。有訂閱的推送在每一輪 `flush_progress` 時比對每台主機上次送出的樣子（`updated_at`、狀態、進度、重試次數、是否已處理），只送改變的主機，並排在 `rollout.progress` 之前；第一次（還沒有基準）補送最近 15 秒內改變過的主機。一輪超過 200 台（`ROLLOUT_HOST_EVENTS_MAX`）時不逐台送，`rollout.progress` 帶 `hosts_resync: true`、`hosts_changed`。沒有訂閱的推送不比對、不送（1 萬台的推送沒有人看詳情時沒有額外成本）。
+- **建議的最低 Pulse 版本**（0.10.0，第 4.9 節、R9）：版本庫中**最新版本**的清單的 `min_upgrade_from`（低於它的主機無法遠端升級到最新版，需要手動升級）；`GET /api/v1/hosts` 的 `meta.recommended_min_agent_version` 與每一列的 `agent_outdated`，主控台 S04 的 agent 版本欄加 ⚠ 與說明。版本庫是空的或最新版本沒有清單時不標示。規格只寫「取版本庫中最新版的清單」，取哪個欄位是實作的判斷（待確認）。
+- **全域搜尋**（0.10.0）：`GET /api/v1/rollouts`、`GET /api/v1/config/profiles` 新增 `q`（名稱、編號、目標版本／名稱、說明的子字串），主控台的全域搜尋多了「升級推送」「設定檔」兩組（各需要 `rollouts:read`、`config:read`）。
 
 **版本庫**
 
@@ -1102,11 +1106,11 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
 | 對象固定的時間 | 推送開始時（第 4.7.2 節） | 送出時（0.9 送出即開始，兩者相同） |
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
-| SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪；另帶 `pause_cause`）；`rollout.host` 未提供 |
+| SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪；另帶 `pause_cause`）；`rollout.host`（0.10.0）隨每一輪送出、每台每輪最多一則，一輪超過 200 台時以 `rollout.progress` 的 `hosts_resync` 取代 |
 | 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨；0.10.0 起另有「版本庫的檔案遺失」，`KRS-W8417`〔暫定〕，只 `stat` 不重算雜湊） |
 | CLI | `kairos releases import／list／delete` | 0.10.0 提供（直接開資料庫，不經執行中的 Kairos）；`--external` 尚未提供 |
 | 告警 | 系統規則與離線告警抑制 | 三條系統規則已接上；升級中主機的離線告警抑制（第 4.7.5 節）未提供 |
-| `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選 |
+| `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選；0.10.0 另有 `agent_outdated` 與 `meta.recommended_min_agent_version`（R9 的 ⚠） |
 | 刪除主機資料 | — | 一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management` |
 
 ## 14. 已決定（2026-10-19，採建議）

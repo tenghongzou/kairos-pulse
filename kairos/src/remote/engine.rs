@@ -724,43 +724,51 @@ impl RemoteService {
     ) -> Result<Value, ApiError> {
         let now = self.now_ms();
         let who = who.clone();
-        self.in_tx(move |s| {
-            let h = s.rollout_host(&id, &agent_id)?.ok_or_else(|| {
-                TxError::Api(ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "host_not_in_rollout",
-                    format!("{agent_id} 不在推送 {id} 中"),
-                ))
-            })?;
-            if h.state != HOST_ROLLBACK_FAILED {
-                return Err(ApiError::conflict(
-                    "invalid_state",
-                    "只有回滾失敗的主機需要標記為已處理",
+        let rid = id.clone();
+        let r = self
+            .in_tx(move |s| {
+                let h = s.rollout_host(&id, &agent_id)?.ok_or_else(|| {
+                    TxError::Api(ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "host_not_in_rollout",
+                        format!("{agent_id} 不在推送 {id} 中"),
+                    ))
+                })?;
+                if h.state != HOST_ROLLBACK_FAILED {
+                    return Err(ApiError::conflict(
+                        "invalid_state",
+                        "只有回滾失敗的主機需要標記為已處理",
+                    )
+                    .into());
+                }
+                s.update_rollout_host(
+                    &id,
+                    h.host_id,
+                    &HostTransition {
+                        acknowledged: Some((now, who.actor.clone())),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                who.event(
+                    "host",
+                    "host.upgrade.acknowledge",
+                    Some(agent_id.clone()),
+                    None,
+                    json!({"rollout_id": id, "agent_id": agent_id, "note": note}),
                 )
-                .into());
-            }
-            s.update_rollout_host(
-                &id,
-                h.host_id,
-                &HostTransition {
-                    acknowledged: Some((now, who.actor.clone())),
-                    ..Default::default()
-                },
-                now,
-            )?;
-            who.event(
-                "host",
-                "host.upgrade.acknowledge",
-                Some(agent_id.clone()),
-                None,
-                json!({"rollout_id": id, "agent_id": agent_id, "note": note}),
-            )
-            .append(s, now)?;
-            let h = s.rollout_host(&id, &agent_id)?.unwrap_or(h);
-            Ok(rollout::host_json(&h))
-        })
-        .await
-        .map_err(|e| e.into_api("推送"))
+                .append(s, now)?;
+                let h = s.rollout_host(&id, &agent_id)?.unwrap_or(h);
+                Ok(rollout::host_json(&h))
+            })
+            .await
+            .map_err(|e| e.into_api("推送"));
+        if r.is_ok() {
+            // 主控台的 `rollout.host` 與 `rollout.progress`
+            self.mark_dirty(&rid);
+            self.wake();
+        }
+        r
     }
 
     // ---- 推送引擎 ----

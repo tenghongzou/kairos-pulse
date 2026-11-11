@@ -1214,7 +1214,25 @@ pub async fn list(
     let snap = ctx.hosts.snapshot(ctx).await?;
     let now_ms = now.timestamp_millis();
     let page = query(&snap, &filter, &sort, q.get("cursor"), limit, now_ms)?;
-    let data: Vec<Value> = page.items.iter().map(|h| h.summary(now_ms)).collect();
+    let mut data: Vec<Value> = page.items.iter().map(|h| h.summary(now_ms)).collect();
+    // 建議的最低 Pulse 版本（版本庫中最新版本的清單 `min_upgrade_from`；REMOTE.md 第 4.9 節、R9）：低於它的
+    // 主機標 `agent_outdated`（S04 版本欄的 ⚠）。只需要 `hosts:read`，不透露版本庫的其他內容
+    let recommended = match &ctx.remote {
+        Some(r) => r.recommended_min_agent_version().await,
+        None => None,
+    };
+    let min = recommended
+        .as_deref()
+        .and_then(|v| kairos_proto::release::Version::parse(v).ok());
+    for h in data.iter_mut() {
+        let outdated = match (&min, h["agent_version"].as_str()) {
+            (Some(min), Some(v)) => {
+                kairos_proto::release::Version::parse(v).is_ok_and(|v| v < *min)
+            }
+            _ => false,
+        };
+        h["agent_outdated"] = json!(outdated);
+    }
     let unsupported: Vec<&str> = Status::ALL
         .iter()
         .filter(|s| !s.supported())
@@ -1231,6 +1249,7 @@ pub async fn list(
                 "unsupported_status": unsupported,
                 "last_event_id": snap.last_event_id,
                 "data_as_of": ts(snap.at),
+                "recommended_min_agent_version": recommended,
             },
         }),
     ))

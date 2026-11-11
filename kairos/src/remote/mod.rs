@@ -107,7 +107,7 @@ pub const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 /// 下載名額不足時的 `retry_after_ms`（Pulse 另加 ±20% 抖動）
 pub const DOWNLOAD_RETRY_AFTER_MS: u32 = 15_000;
 
-/// 給主控台 SSE 的變化（`config.host`、`rollout.progress`；REMOTE.md 第 8.4 節）
+/// 給主控台 SSE 的變化（`config.host`、`rollout.progress`、`rollout.host`；REMOTE.md 第 8.4 節）
 #[derive(Debug, Clone)]
 pub struct RemoteEvent {
     pub kind: &'static str,
@@ -116,6 +116,45 @@ pub struct RemoteEvent {
 
 /// SSE 事件的緩衝（推送的進度每 5 秒最多一則；設定的狀態每台主機每次回報一則）
 pub const EVENT_BUFFER: usize = 1024;
+/// 一個推送一輪最多送出幾則 `rollout.host`；超過時不逐台送，改在 `rollout.progress` 帶 `hosts_resync: true`
+/// （主控台重新抓取主機表），避免大型推送灌滿事件緩衝
+pub const ROLLOUT_HOST_EVENTS_MAX: usize = 200;
+/// 建議的最低 Pulse 版本多久重新計算一次（`kairos releases` 的 CLI 直接寫資料庫，不會通知服務）
+pub const RECOMMENDED_MIN_TTL: Duration = Duration::from_secs(30);
+/// 開始訂閱一個推送時，往回補送這段時間內改變過的主機（畫面載入到第一輪之間的變化）
+pub const ROLLOUT_WATCH_LOOKBACK_MS: i64 = 15_000;
+
+/// 一台主機上次送出 `rollout.host` 時的樣子（有改變才再送）
+type HostMark = (i64, String, Option<i64>, i64, bool);
+
+fn host_mark(h: &store::RolloutHostRow) -> HostMark {
+    (
+        h.updated_at,
+        h.state.clone(),
+        h.bytes_done,
+        h.attempts,
+        h.acknowledged_at.is_some(),
+    )
+}
+
+/// 主控台 SSE 連線對一個推送的訂閱（`GET /api/v1/events?rollout_id=…`）；放掉時取消
+pub struct RolloutWatch {
+    svc: Arc<RemoteService>,
+    rollout_id: String,
+}
+
+impl Drop for RolloutWatch {
+    fn drop(&mut self) {
+        let mut st = self.svc.lock();
+        if let Some(n) = st.watchers.get_mut(&self.rollout_id) {
+            *n -= 1;
+            if *n == 0 {
+                st.watchers.remove(&self.rollout_id);
+                st.host_seen.remove(&self.rollout_id);
+            }
+        }
+    }
+}
 
 /// 這條連線上協商的遠端管理與主機資訊（hello 時記下，推送引擎與提議使用）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +190,12 @@ struct State {
     downloads: HashMap<String, Instant>,
     /// 狀態改變、尚未送出 `rollout.progress` 的推送
     dirty_rollouts: HashSet<String>,
+    /// 推送 → 訂閱它的 SSE 連線數（有訂閱時才送 `rollout.host`）
+    watchers: HashMap<String, usize>,
+    /// 訂閱中的推送 → 每台主機上次送出的樣子（還沒有基準時沒有項目）
+    host_seen: HashMap<String, HashMap<i64, HostMark>>,
+    /// 建議的最低 Pulse 版本的快取（[`RECOMMENDED_MIN_TTL`]）
+    recommended_min: Option<(Instant, Option<String>)>,
     /// 已發布給告警引擎、仍有效的系統檢查（規則, 對象）；`None` 為尚未調和過
     alert_keys: Option<HashSet<(&'static str, String)>>,
 }
@@ -277,17 +322,64 @@ impl RemoteService {
         let _ = self.events.send(RemoteEvent { kind, data });
     }
 
+    /// 建議的最低 Pulse 版本（S04 版本欄的 ⚠；REMOTE.md 第 4.9 節）：版本庫中**最新版本**的清單的
+    /// `min_upgrade_from`——低於它的主機無法遠端升級到最新版，需要手動升級。版本庫是空的、最新版本沒有清單
+    /// （0.9.0 以前的發佈）或讀不到資料庫時為 `None`（不標示）
+    pub async fn recommended_min_agent_version(&self) -> Option<String> {
+        if let Some((at, v)) = &self.lock().recommended_min
+            && at.elapsed() < RECOMMENDED_MIN_TTL
+        {
+            return v.clone();
+        }
+        let v = match self.db.read(|s| Ok(s.list_releases()?)).await {
+            Ok(list) => ops::recommended_min_version(&list),
+            Err(e) => {
+                debug!("遠端管理：無法讀取版本庫（建議的最低版本）：{e}");
+                return None;
+            }
+        };
+        self.lock().recommended_min = Some((Instant::now(), v.clone()));
+        v
+    }
+
+    /// 版本庫改變（匯入、刪除）：下一次重新計算建議的最低版本
+    pub(crate) fn forget_recommended_min(&self) {
+        self.lock().recommended_min = None;
+    }
+
+    /// 主控台 SSE 連線訂閱一個推送的 `rollout.host`（下一輪建立基準並補送最近的變化）
+    pub fn watch_rollout(self: &Arc<Self>, rollout_id: &str) -> RolloutWatch {
+        {
+            let mut st = self.lock();
+            *st.watchers.entry(rollout_id.to_string()).or_default() += 1;
+            st.dirty_rollouts.insert(rollout_id.to_string());
+        }
+        self.wake();
+        RolloutWatch {
+            svc: self.clone(),
+            rollout_id: rollout_id.to_string(),
+        }
+    }
+
     /// 推送的狀態或主機改變：下一輪送出 `rollout.progress`
     pub(crate) fn mark_dirty(&self, rollout_id: &str) {
         self.lock().dirty_rollouts.insert(rollout_id.to_string());
     }
 
     /// 送出改變過的推送的 `rollout.progress`（`rollout_id`、`state`、`current_wave`、各狀態的台數、`pause_cause`、
-    /// `next_action`）
+    /// `next_action`），有 SSE 連線訂閱的推送另送每台改變的主機的 `rollout.host`（[`rollout::host_json`]；
+    /// 一輪超過 [`ROLLOUT_HOST_EVENTS_MAX`] 台時改在 `rollout.progress` 帶 `hosts_resync: true`）
     pub(crate) async fn flush_progress(&self) {
-        let ids: Vec<String> = std::mem::take(&mut self.lock().dirty_rollouts)
-            .into_iter()
-            .collect();
+        let (ids, mut seen) = {
+            let mut st = self.lock();
+            let ids: Vec<String> = std::mem::take(&mut st.dirty_rollouts).into_iter().collect();
+            let seen: HashMap<String, Option<HashMap<i64, HostMark>>> = ids
+                .iter()
+                .filter(|id| st.watchers.contains_key(*id))
+                .map(|id| (id.clone(), st.host_seen.get(id).cloned()))
+                .collect();
+            (ids, seen)
+        };
         if ids.is_empty() || self.events.receiver_count() == 0 {
             return;
         }
@@ -299,14 +391,39 @@ impl RemoteService {
                 for id in ids {
                     if let Some(r) = s.get_rollout(&id)? {
                         let hosts = s.rollout_hosts(&id)?;
-                        out.push(serde_json::json!({
+                        let mut v = serde_json::json!({
                             "rollout_id": r.id,
                             "state": r.state,
                             "current_wave": r.current_wave,
                             "progress": rollout::progress(&hosts),
                             "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
                             "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now),
-                        }));
+                        });
+                        let mut host_events = Vec::new();
+                        let mut marks = None;
+                        if let Some(before) = seen.remove(&id) {
+                            let changed: Vec<&store::RolloutHostRow> = hosts
+                                .iter()
+                                .filter(|h| match &before {
+                                    Some(m) => m.get(&h.host_id) != Some(&host_mark(h)),
+                                    None => h.updated_at >= now - ROLLOUT_WATCH_LOOKBACK_MS,
+                                })
+                                .collect();
+                            if changed.len() > ROLLOUT_HOST_EVENTS_MAX {
+                                v["hosts_resync"] = serde_json::json!(true);
+                                v["hosts_changed"] = serde_json::json!(changed.len());
+                            } else {
+                                host_events =
+                                    changed.iter().map(|h| rollout::host_json(h)).collect();
+                            }
+                            marks = Some(
+                                hosts
+                                    .iter()
+                                    .map(|h| (h.host_id, host_mark(h)))
+                                    .collect::<HashMap<_, _>>(),
+                            );
+                        }
+                        out.push((id, v, host_events, marks));
                     }
                 }
                 Ok(out)
@@ -314,7 +431,17 @@ impl RemoteService {
             .await;
         match rows {
             Ok(list) => {
-                for v in list {
+                for (id, v, host_events, marks) in list {
+                    if let Some(m) = marks {
+                        let mut st = self.lock();
+                        // 這一輪之間取消訂閱的不留基準
+                        if st.watchers.contains_key(&id) {
+                            st.host_seen.insert(id, m);
+                        }
+                    }
+                    for h in host_events {
+                        self.emit("rollout.host", h);
+                    }
                     self.emit("rollout.progress", v);
                 }
             }

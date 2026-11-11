@@ -6,10 +6,11 @@
 //   （refreshRolloutCount）立即更新。功能關閉（503）或其他錯誤時不顯示泡泡。
 
 import { t } from '../core/strings.js';
-import { api } from '../core/api.js';
+import { api, qs } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as sse from '../core/sse.js';
 import { setNavCount } from '../ui/shell.js';
+import { registerProvider } from '../ui/search.js';
 
 let poll = null;
 let seq = 0;
@@ -55,6 +56,37 @@ function stop() {
   seq++;
   setNavCount('rollouts', null);
 }
+
+// 全域搜尋（Ctrl+K；設計包 ia.md §2）：升級推送（名稱、編號、目標版本；需要 rollouts:read）與設定檔（名稱、說明；
+// 需要 config:read）。清單端點的 q 由伺服器篩選；功能關閉（503）時這一組顯示錯誤訊息，不影響主機的結果。
+const SEARCH_MAX = 6;
+registerProvider({
+  id: 'rollouts',
+  group: () => t('search.group.rollouts'),
+  allowed: () => session.can('rollouts:read'),
+  async search(q, signal) {
+    const [rows, common] = await Promise.all([api(`/api/v1/rollouts${qs({ q })}`, { signal }), import('./pulse-common.js')]);
+    return rows.slice(0, SEARCH_MAX).map((r) => ({
+      text: r.name,
+      sub: [r.id, t('search.rolloutTarget', { v: r.target_version })].join(' · '),
+      href: `/pulse/rollouts/${encodeURIComponent(r.id)}`,
+      badge: common.rolloutStateBadge(r.state),
+    }));
+  },
+});
+registerProvider({
+  id: 'profiles',
+  group: () => t('search.group.profiles'),
+  allowed: () => session.can('config:read'),
+  async search(q, signal) {
+    const rows = await api(`/api/v1/config/profiles${qs({ q })}`, { signal });
+    return rows.slice(0, SEARCH_MAX).map((p) => ({
+      text: p.name,
+      sub: [p.description, t('search.profileHosts', { n: p.hosts || 0 })].filter(Boolean).join(' · '),
+      href: `/pulse/config/${encodeURIComponent(p.id)}`,
+    }));
+  },
+});
 
 session.onChange((me) => {
   if (me && session.can('rollouts:read')) start();

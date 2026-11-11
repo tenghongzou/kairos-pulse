@@ -189,10 +189,10 @@ async fn config(
         }
         (_, ["schema"] | ["status"]) => Err(method_not_allowed("GET")),
         (_, ["profiles"]) if get => {
-            query.reject_unknown(&[], &[])?;
+            query.reject_unknown(&["q"], &[])?;
             p.require(Permission::ConfigRead)?;
             service(ctx, true)?;
-            list_profiles(ctx, now).await
+            list_profiles(ctx, search_term(query)?, now).await
         }
         ("POST", ["profiles"]) => {
             p.require(Permission::ConfigWrite)?;
@@ -416,9 +416,19 @@ async fn optional_body_reason(req: Request<Incoming>) -> Result<Option<String>, 
     }
 }
 
+/// 清單的 `q`（全域搜尋）：去掉前後空白、轉小寫；空字串視為沒有；最多 128 個字元
+fn search_term(query: &Query) -> Result<Option<String>, ApiError> {
+    match query.get("q").map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(q) if q.chars().count() > 128 => Err(ApiError::param("q", "q 最多 128 個字元")),
+        Some(q) => Ok(Some(q.to_lowercase())),
+    }
+}
+
 /// 每個設定檔的指派數與比對到的主機數
 async fn list_profiles(
     ctx: &Arc<ApiContext>,
+    q: Option<String>,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let now_ms = now.timestamp_millis();
@@ -426,6 +436,16 @@ async fn list_profiles(
         .pool
         .read("設定檔", move |s| {
             let profiles = s.list_profiles().map_err(query_failed("設定檔"))?;
+            // `q`：名稱或說明的子字串（不分大小寫；全域搜尋）
+            let profiles: Vec<_> = profiles
+                .into_iter()
+                .filter(|p| {
+                    q.as_deref().is_none_or(|q| {
+                        p.name.to_lowercase().contains(q)
+                            || p.description.to_lowercase().contains(q)
+                    })
+                })
+                .collect();
             let snap = desired::ConfigSnapshot::load(s).map_err(query_failed("設定檔"))?;
             let targets = s.config_targets().map_err(query_failed("設定檔"))?;
             Ok(profiles
@@ -1115,9 +1135,10 @@ async fn rollouts(
     let who = actor(p, peer);
     match (method.as_str(), sub) {
         (_, []) if get => {
-            query.reject_unknown(&["state"], &[])?;
+            query.reject_unknown(&["state", "q"], &[])?;
             p.require(Permission::RolloutsRead)?;
             service(ctx, false)?;
+            let q = search_term(query)?;
             let state = query.get("state").map(str::to_string);
             if state.as_deref().is_some_and(|s| {
                 !matches!(
@@ -1137,6 +1158,17 @@ async fn rollouts(
                     let list = s
                         .list_rollouts(state.as_deref())
                         .map_err(query_failed("升級推送"))?;
+                    // `q`：名稱、編號或目標版本的子字串（不分大小寫；全域搜尋）
+                    let list: Vec<_> = list
+                        .into_iter()
+                        .filter(|r| {
+                            q.as_deref().is_none_or(|q| {
+                                r.name.to_lowercase().contains(q)
+                                    || r.id.to_lowercase().contains(q)
+                                    || r.target_version.to_lowercase().contains(q)
+                            })
+                        })
+                        .collect();
                     let mut out = Vec::new();
                     for r in &list {
                         let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;

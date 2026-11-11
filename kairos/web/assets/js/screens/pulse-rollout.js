@@ -9,7 +9,10 @@
 // - 批次：先行批次與其餘的台數、各狀態的台數、失敗比例與上限、觀察時間、目前的批次。
 // - 主機表：GET /rollouts/{id}/hosts（伺服器端分頁「載入更多」；批次、狀態、搜尋篩選；「失敗的主機」一次選取 4 種失敗狀態）；
 //   欄位：主機、狀態（略過的原因）、版本、進度、代碼、時間；「重試」（rollouts:write）只對可以重試的主機。
-// - 即時更新：SSE rollout.progress（這個推送）2 秒內合併後重新載入頁首、批次與主機表的第一頁（rollout.host 在 0.9 尚未提供）。
+// - 即時更新（REMOTE.md 第 8.4 節）：以 sse.watchRollout(id) 訂閱這個推送的 rollout.host，收到就地更新那一列
+//   （不重新抓取、不重排；不在目前頁面的主機略過）；rollout.progress 2 秒內合併後重新載入頁首、說明與批次的統計，
+//   主機表只在伺服器要求（hosts_resync：一輪改變的主機太多，不逐台送）、出現表中沒有的主機、或這段期間沒有收到
+//   任何 rollout.host（沒有訂閱成功時的後援）時才重新載入第一頁。resync 時整頁重新抓取。
 
 import { h, icon, mount } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -54,6 +57,9 @@ export function render(ctx) {
   const filter = { wave: '', state: '', q: '' };
   let nextCursor = null;
   let total = 0;
+  // 即時更新：上一則 rollout.progress 之後收到的 rollout.host 數、下一次是否要重新載入主機表
+  let hostEvents = 0;
+  let reloadHosts = false;
 
   const head = h('div');
   const alerts = h('div', { class: 'k-stack--sm' });
@@ -358,7 +364,7 @@ export function render(ctx) {
     );
   }
 
-  async function load({ first = false } = {}) {
+  async function load({ first = false, hosts = true } = {}) {
     try {
       r = await api(`/api/v1/rollouts/${encodeURIComponent(id)}`);
     } catch (err) {
@@ -386,7 +392,7 @@ export function render(ctx) {
     renderWaves();
     renderHostsCard();
     await renderAlerts();
-    if (r.state !== 'draft' && table.count <= PAGE) loadHosts();
+    if (r.state !== 'draft' && hosts && table.count <= PAGE) loadHosts();
     if (first) ctx.focusTitle();
   }
 
@@ -396,16 +402,31 @@ export function render(ctx) {
       load().finally(() => sse.resyncSettled());
       return;
     }
-    if (ev.type !== 'rollout.progress' || !ev.data || ev.data.rollout_id !== id) return;
+    if (!ev.data || ev.data.rollout_id !== id) return;
+    if (ev.type === 'rollout.host') {
+      hostEvents += 1;
+      // 就地更新；表中沒有的主機（剛送出、還沒載入）留給下一次重新載入（有篩選或分頁時不在表中是正常的）
+      if (!table.updateRow(ev.data) && !nextCursor && !filter.wave && !filter.state && !filter.q) reloadHosts = true;
+      return;
+    }
+    if (ev.type !== 'rollout.progress') return;
+    if (ev.data.hosts_resync || hostEvents === 0) reloadHosts = true;
+    hostEvents = 0;
     clearTimeout(timer);
-    timer = setTimeout(() => load(), 2000);
+    timer = setTimeout(() => {
+      const hosts = reloadHosts;
+      reloadHosts = false;
+      load({ hosts });
+    }, 2000);
   });
+  const unwatch = sse.watchRollout(id);
   return {
     dispose() {
       disposed = true;
       clearTimeout(timer);
       clearTimeout(qTimer);
       unsub();
+      unwatch();
     },
   };
 }

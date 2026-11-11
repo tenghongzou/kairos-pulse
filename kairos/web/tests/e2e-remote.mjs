@@ -339,6 +339,44 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await axe(ap.page, 'F8 S26 已自動暫停');
     await ap.ctx.close();
 
+    // 即時更新（0.10；REMOTE.md 第 8.4 節）：推送詳情以 ?rollout_id= 訂閱 SSE，收到 rollout.host 就地更新那一列，
+    // 之後的 rollout.progress 只重新載入頁首與批次、不重新抓取主機表（攔截 SSE：等主機表出現後才送出事件）
+    const lv = await newPage();
+    let rowReady = null;
+    const rowShown = new Promise((resolve) => (rowReady = resolve));
+    const watched = [];
+    await lv.page.route('**/api/v1/events**', async (route) => {
+      const u = new URL(route.request().url());
+      if (u.searchParams.get('rollout_id') !== rolloutId) return route.continue();
+      watched.push(u.search);
+      await rowShown;
+      const host = { rollout_id: rolloutId, agent_id: P09, hostname: 'pulse-09', upgrade_id: 'x', wave: 0, ordinal: 0, state: 'accepted', reason: null, from_version: '0.9.0', to_version: VERSION, attempts: 1, progress: { bytes: 18000, total: 40000 }, code: 'PLS-W8404', detail: '', offered_at: null, applying_at: null, finished_at: null, updated_at: new Date().toISOString(), acknowledged_at: null, acknowledged_by: null };
+      const progress = { rollout_id: rolloutId, state: 'paused', current_wave: 0, progress: { accepted: 1 }, pause_cause: 'manual', next_action: { code: 'paused', reason: 'x', cause: 'manual' } };
+      const body = `retry: 600000\n\nevent: ready\ndata: {"resumed":false}\n\nevent: rollout.host\ndata: ${JSON.stringify(host)}\n\nevent: rollout.progress\ndata: ${JSON.stringify(progress)}\n\n`;
+      return route.fulfill({ status: 200, contentType: 'text/event-stream', body });
+    });
+    let hostLists = 0;
+    lv.page.on('request', (rq) => {
+      if (rq.url().includes(`/api/v1/rollouts/${rolloutId}/hosts?`)) hostLists += 1;
+    });
+    await login(lv.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(lv.page, 'E2E 0.9.1');
+    const liveRow = lv.page.locator(`tbody tr[data-key="${P09}"]`);
+    await liveRow.waitFor({ timeout: 15000 });
+    assert.equal(await liveRow.getByText('PLS-W8404').count(), 0);
+    const before = hostLists;
+    rowReady();
+    await liveRow.getByText('PLS-W8404').waitFor({ timeout: 15000 });
+    await liveRow.getByText('已接受').waitFor();
+    assert.match(await liveRow.innerText(), /45/, '進度 18000／40000');
+    assert.ok(watched.length >= 1 && watched[0].includes(`rollout_id=${rolloutId}`), 'SSE 以 rollout_id 訂閱');
+    // rollout.progress 之後 2 秒重新載入頁首與批次；主機表不重新抓取（那一列仍是事件的內容）
+    await lv.page.waitForTimeout(3500);
+    assert.equal(hostLists, before, '收到 rollout.host 後不重新抓取主機表');
+    assert.equal(await liveRow.getByText('PLS-W8404').count(), 1);
+    await axe(lv.page, 'F8 S26 推送詳情（即時更新後）');
+    await lv.ctx.close();
+
     // 管理員：繼續 → 取消
     const a = await newPage();
     await login(a.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
@@ -506,6 +544,55 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(await page.getByRole('link', { name: '新增設定檔' }).count(), 0);
     const w = await api(page, 'DELETE', `/api/v1/config/profiles/${created.id}`, {});
     assert.equal(w.status, 403);
+    // 全域搜尋（0.10）：推送（名稱、編號、目標版本）與設定檔（名稱、說明）；稽核員有 rollouts:read、config:read
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('E2E');
+    const found = page.getByRole('listbox', { name: '搜尋結果' });
+    await found.getByRole('group', { name: '升級推送' }).getByRole('option', { name: /E2E 0\.9\.1/ }).waitFor();
+    await found.getByRole('group', { name: '設定檔' }).getByRole('option', { name: /E2E 稽核/ }).waitFor();
+    await axe(page, '全域搜尋（推送與設定檔）');
+    await found.getByRole('option', { name: /E2E 稽核/ }).click();
+    await waitTitle(page, 'E2E 稽核');
+    assert.equal(new URL(page.url()).pathname, `/pulse/config/${created.id}`);
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type(rolloutId);
+    await page.getByRole('option', { name: /E2E 0\.9\.1/ }).click();
+    await waitTitle(page, 'E2E 0.9.1');
+    assert.equal(new URL(page.url()).pathname, `/pulse/rollouts/${rolloutId}`);
+    // 唯讀角色（沒有 rollouts:read、config:read）：不查詢這兩個清單，也沒有結果
+    const vs = await newPage();
+    const asked = [];
+    vs.page.on('request', (rq) => {
+      const p = new URL(rq.url()).pathname;
+      if (p === '/api/v1/rollouts' || p === '/api/v1/config/profiles') asked.push(p);
+    });
+    await login(vs.page, 'viewer', PW, '/hosts');
+    await waitTitle(vs.page, '主機');
+    await vs.page.keyboard.press('Control+k');
+    await vs.page.keyboard.type('E2E 0.9');
+    await vs.page.getByText('沒有符合「E2E 0.9」的結果。').waitFor();
+    assert.deepEqual(asked, []);
+    await vs.page.keyboard.press('Escape');
+    // S04 agent 版本欄的 ⚠（0.10）：低於建議的最低版本（攔截主機清單：建議 0.9.5，全部標為低於）；只需要 hosts:read
+    await vs.page.route('**/api/v1/hosts?**', async (route) => {
+      const r = await route.fetch();
+      const body = await r.json();
+      if (!body.meta || !Array.isArray(body.data)) return route.fulfill({ response: r });
+      assert.ok('recommended_min_agent_version' in body.meta, 'meta.recommended_min_agent_version');
+      assert.ok(body.data.every((x) => typeof x.agent_outdated === 'boolean'), 'agent_outdated');
+      body.meta.recommended_min_agent_version = '0.9.5';
+      for (const x of body.data) x.agent_outdated = x.agent_id === P09;
+      return route.fulfill({ response: r, json: body });
+    });
+    await vs.page.goto(`${URL0}/hosts?q=pulse-09`);
+    await waitTitle(vs.page, '主機');
+    const flagged = vs.page.locator(`tbody tr[data-key="${P09}"] .k-version-flag`);
+    await flagged.waitFor({ timeout: 15000 });
+    assert.match(await flagged.getAttribute('title'), /低於建議的最低版本 0\.9\.5/);
+    assert.match(await flagged.innerText(), /低於建議的最低版本 0\.9\.5/, '螢幕報讀的文字');
+    assert.equal(await vs.page.locator('.k-version-flag').count(), 1, '其他主機不標示');
+    await axe(vs.page, 'S04 低於建議版本');
+    await vs.ctx.close();
     // S05 的「升級」卡片：回滾失敗（攔截 API）→ 稽核員沒有「標記為已處理…」
     await page.route(`**/api/v1/hosts/${P09}/upgrade`, (route) =>
       route.fulfill({

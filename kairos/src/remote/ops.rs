@@ -927,6 +927,7 @@ impl RemoteService {
             })
             .await
             .map_err(|e| e.into_api("發佈版本"))?;
+        self.forget_recommended_min();
         log::info!(event = "release.import"; "版本庫：已匯入 Pulse {}（{} 個發佈檔待上傳）", row.version, artifacts.len());
         Ok(release_json(&row, &artifacts, None))
     }
@@ -1062,6 +1063,7 @@ impl RemoteService {
             })
             .await
             .map_err(|e| e.into_api("發佈版本"))?;
+        self.forget_recommended_min();
         for sha in files {
             let p = releases::artifact_path(&self.releases_dir, &sha);
             if let Err(e) = std::fs::remove_file(&p)
@@ -1164,4 +1166,18 @@ pub fn release_json(
         v["in_use_by_rollouts"] = json!(rollouts);
     }
     v
+}
+
+/// 建議的最低 Pulse 版本：版本庫中最新版本的清單的 `min_upgrade_from`（REMOTE.md 第 4.9 節；沒有版本、
+/// 最新版本沒有清單或清單無法解析時 `None`）
+pub fn recommended_min_version(releases: &[ReleaseRow]) -> Option<String> {
+    use kairos_proto::release::{ReleaseManifest, Version};
+    let latest = releases
+        .iter()
+        .filter_map(|r| Version::parse(&r.version).ok().map(|v| (v, r)))
+        .max_by(|a, b| a.0.cmp(&b.0))?
+        .1;
+    let m = ReleaseManifest::parse(latest.manifest.as_deref()?).ok()?;
+    Version::parse(&m.min_upgrade_from).ok()?;
+    Some(m.min_upgrade_from)
 }
