@@ -63,6 +63,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **容量上限**（`storage.max_total_bytes`）在 PostgreSQL 上以資料表與索引的大小計算，刪除改為估計制（PostgreSQL 刪除後檔案不會變小；STORAGE.md 第 19.5 節）。
 - **不支援的命令**：`kairos db backup`（改用 `pg_dump` 等工具，或 `kairos db migrate --to sqlite:<檔案>`）與 `kairos reports import`（先匯入 SQLite 再搬移）在 PostgreSQL 後端以 `KRS-E4406`〔暫定〕拒絕。
 - **限制**：這一版沒有叢集協調，**同一個資料庫與 schema 同時只能有一個 Kairos 使用**；HA.md 第 5.5 節的叢集資料表尚未建立。與 HA.md 規格不同之處列在 HA.md 第 5.7 節。
+- **效能**（kp-build 上的小規模對照，STORAGE.md 第 19.8 節）：穩定狀態每秒 8,000 筆的 p99 約 85 ms（SQLite 約 12 ms）；1 萬台全新的主機同時出現時前 15 秒左右的寫入會超過 5 秒（回 `storage_unavailable`，Pulse 重送），每秒 8,000 筆的補送尖峰在該環境撐不住。HA.md 第 7.6 節的目標尚未在正式環境驗證。
 - 安裝與搬移步驟：`kairos/packaging/INSTALL.md` 附錄 D。
 
 ### 相容性
@@ -73,7 +74,8 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 其他變更
 
-- 新依賴：`postgres` 0.19、`tokio-postgres-rustls` 0.14（MIT／Apache-2.0；`deny.toml` 的授權允許清單不需變更，加密後端仍只有 ring）。
+- 新依賴：`postgres` 0.19、`tokio-postgres-rustls` 0.14（MIT／Apache-2.0；`deny.toml` 的授權允許清單不需變更，加密後端仍只有 ring）。`tokio` 升級到 1.53.3（RUSTSEC-2026-0386）、`rusqlite` 升級到 0.41（內附 SQLite 3.54，RUSTSEC-2026-0459）。
+- 量測 `sqlite_throughput` 改名為 `store_throughput`，以 `KP_BENCH_BACKEND=postgres` 量測 PostgreSQL 後端。
 - 儲存層的測試改為同一個測試本體在 SQLite 與 PostgreSQL 各跑一次（`KAIROS_TEST_PG_URL` 指定資料庫；沒有設定時明確略過，`KAIROS_TEST_PG_REQUIRED=1` 時不可略過）；CI 的 Linux job 以 PostgreSQL 14 執行整套測試，另有 `postgres-compat` job 以 PostgreSQL 17 執行儲存層與 PostgreSQL 的端對端測試。Windows job 不執行 PostgreSQL 的測試。
 - 端對端測試 `tests/e2e/tests/postgres.rs`：實際的 Kairos＋Pulse 跑在 PostgreSQL 後端上（補送不重複不缺號、重新啟動後載回主機、稽核鏈驗證、`db migrate` 搬回 SQLite 後內容相同）。
 

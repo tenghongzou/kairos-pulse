@@ -890,7 +890,33 @@ sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --con
 
 ### 19.8 量測
 
-<!-- PG-BENCH -->
+`store_throughput`（第 11 節；`KP_BENCH_BACKEND=postgres` 加 `KAIROS_TEST_PG_URL`）在 kp-build（4 vCPU、4 GB RAM、與另一條開發線共用）2026-11-11 的結果。PostgreSQL 14 跑在同一台機器的容器中（記憶體上限 512 MB、預設參數 `shared_buffers = 128MB`、`synchronous_commit = on`、沒有備庫，經 docker 的埠轉送連線）；這是**小規模、資源受限的對照**，不是 HA.md 第 7.6 節的目標環境，該節的目標（叢集每秒 2,000 筆時 p99 < 50 ms、每秒 8,000 筆的補送尖峰 5 分鐘沒有 `storage_unavailable`）**在這個環境沒有達到**（見下），需要在正式規格的硬體與獨立的資料庫主機上重新量測。
+
+每筆 17 個指標；延遲是從放入佇列到收到結果。
+
+| 情境 | 後端 | 筆數 | p50 | p99 | 最大 | 超過 5 秒的筆數 |
+|---|---|---|---|---|---|---|
+| 每秒 2,000 筆、100 台主機、30 秒 | PostgreSQL | 60,000 | 4.1 ms | 41 ms | 238 ms | 0 |
+| 每秒 8,000 筆、100 台主機、30 秒 | PostgreSQL | 240,000 | 5.5 ms | 85 ms | 311 ms | 0 |
+| 同上 | SQLite | 240,000 | 1.3 ms | 12 ms | 23 ms | 0 |
+| 每秒 2,000 筆、**1 萬台全新的主機**、120 秒 | PostgreSQL | 240,000 | 4.4 ms | 6.1 秒 | 6.7 秒 | 8,172（3.4%） |
+| 同上 | SQLite | 240,000 | 0.88 ms | 3.8 ms | 39 ms | 0 |
+| 每秒 2,000 筆、1 萬台全新的主機、30 秒 | PostgreSQL | 60,000 | 452 ms | 7.8 秒 | 7.9 秒 | 14,596（24%） |
+| 同上 | SQLite | 60,000 | 0.81 ms | 9.9 ms | 31 ms | 0 |
+
+補送尖峰（第 11.1 節的情境：1 萬台、每筆帶去重鍵、取樣時間從 72 小時前起、2% 重送、同時第一次清冊同步；`KP_BENCH_TIMEOUT=1` 與連線相同地在 5 秒取消）60 秒：
+
+| 速率 | 後端 | 寫入 | 重複 | `storage_unavailable`（5 秒內未開始寫入） | 逾時（已開始寫入、6 秒內沒有結果） |
+|---|---|---|---|---|---|
+| 每秒 8,000 筆 | SQLite（沒有模擬逾時） | 480,000 | 9,600 | 0（p99 48 ms、最大 143 ms） | 0 |
+| 每秒 8,000 筆 | PostgreSQL | 355,650 | 6,990 | 126,836（26%） | 6,119 |
+| 每秒 4,000 筆 | PostgreSQL | 217,578 | 4,296 | 22,869（9.5%） | 2,943 |
+
+- **穩定狀態**（主機都已在清冊中）PostgreSQL 的延遲是 SQLite 的 3～7 倍，每秒 8,000 筆仍在 100 ms 內（p99），沒有逾時。
+- **大量新主機同時出現**是瓶頸：每台主機第一次出現時要寫入它用到的序列（`host_series`，每台 18 列，帶外鍵檢查），慢查詢日誌顯示每批（約 1,000 台、1.8 萬列）這個敘述約 1 秒。1 萬台全新的主機在 5 秒內全部出現時，前 15 秒左右的 report 會等 5 秒以上（連線回 `storage_unavailable`，Pulse 0.3 以上重送，不遺失）；之後回到穩定狀態。主機已在清冊中時（一般的重新啟動、`kairos db migrate` 之後）沒有這個階段。實作時已把這裡的逐筆往返改成每個交易一個敘述（改之前同一個情境 30 秒內 p50 為 37 秒）；再進一步要調整 `host_series` 的寫法或外鍵，尚未做。
+- **補送尖峰**在這個環境撐不住每秒 8,000 筆：除了上面的啟動階段，寫入一旦落後，記憶體中的桶因為「15 秒沒有新值」被寫出，之後同一個桶的資料走遲到路徑（逐批 upsert 彙總表），讓寫入更慢。SQLite 在同一台機器上沒有落後，所以沒有進入這個狀態。這是 HA.md 第 7.3 節提到「補送尖峰時 upsert 太多」的情況，需要在正式環境量測後決定是否調整寫出規則。
+- **大小**：`reports`（含索引與 TOAST）每筆約 305～375 bytes，SQLite 約 204～215 bytes（PostgreSQL 的列標頭與索引較大）；容量估算（第 10 節）在 PostgreSQL 上請乘以約 1.6。
+- **沒有量測的**：`kairos db migrate` 的速度（HA.md 第 5.6 節的時間估算）、同步備庫下的延遲、1 萬台以上的規模、長時間（含 5 分鐘彙總寫出與保留清除）的行為、PostgreSQL 17 的效能（只跑過功能測試）。
 
 ### 19.9 測試
 
@@ -903,4 +929,4 @@ sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --con
   KAIROS_TEST_PG_URL=… cargo test -p kp-e2e --test postgres      # 實際的 Kairos＋Pulse 跑在 PostgreSQL 上
   ```
 
-  每個測試使用自己的 schema，結束時刪除。沒有設定 `KAIROS_TEST_PG_URL` 時這些測試**明確略過**（在 stderr 印出「略過：未設定 KAIROS_TEST_PG_URL…」），不算驗證過；設定 `KAIROS_TEST_PG_REQUIRED=1` 時沒有可用的資料庫就失敗（CI 的 Linux job 與 `postgres-compat` job 如此設定，分別以 PostgreSQL 14 與 17 執行）。
+  共用的測試本體 25 個（report 路徑 14 個、領域 store 11 個）：PostgreSQL 的版本除了在 PostgreSQL 上執行，還在 SQLite 上再跑一次，兩邊每個步驟的結果必須完全相同；另有 PostgreSQL 專屬的 9 個（連線池、唯讀連線、服務鎖、schema 檢查、8 條連線並行寫稽核鏈、並行的原子更新）與 `db migrate` 的 3 個。每個測試使用自己的 schema，結束時刪除。沒有設定 `KAIROS_TEST_PG_URL` 時這些測試**明確略過**（在 stderr 印出「略過：未設定 KAIROS_TEST_PG_URL…」），不算驗證過；設定 `KAIROS_TEST_PG_REQUIRED=1` 時沒有可用的資料庫就失敗（CI 的 Linux job 與 `postgres-compat` job 如此設定，分別以 PostgreSQL 14 與 17 執行）。
