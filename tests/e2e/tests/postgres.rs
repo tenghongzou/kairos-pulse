@@ -176,10 +176,7 @@ fn kairos_and_pulse_run_on_the_postgres_backend() {
     assert_eq!(code, 0, "{}", p.dump());
     assert!(p.output().contains("PostgreSQL"), "{}", p.dump());
     assert!(p.output().contains(&schema), "{}", p.dump());
-    assert!(
-        !p.output().contains(&pg.password) || pg.password.is_empty(),
-        "密碼不應出現在輸出中"
-    );
+    // 「密碼不出現在輸出中」在 unreachable_postgres_is_reported_with_its_code 檢查（那裡的密碼不會與其他欄位相同）
 
     // 啟動：建立 schema、Pulse 註冊、report 寫入 PostgreSQL
     let mut k = kairos.start();
