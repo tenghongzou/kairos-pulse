@@ -78,15 +78,22 @@ fn release_context(s: &dyn Store, version: &str) -> Result<(i64, ReleaseContext)
         .manifest
         .as_deref()
         .and_then(|m| ReleaseManifest::parse(m).ok());
+    // 外部 URL 的版本（0.10）：SHA256SUMS 列出的發佈檔都可以提議。回滾檔來自外部 URL 的版本時，只在目標
+    // 也是外部 URL 時才附上（主機本來就要允許外部 URL；否則一台不允許外部 URL 的主機會因為回滾檔而拒絕
+    // 整個提議），見 [`RemoteService::build_offer`]
+    let external = rel.source == super::ops::SOURCE_EXTERNAL;
     let mut by_version: HashMap<String, Vec<super::store::ArtifactRow>> = HashMap::new();
-    let versions: HashMap<i64, String> = s
-        .list_releases()?
-        .into_iter()
-        .map(|r| (r.id, r.version))
-        .collect();
+    let releases: HashMap<i64, super::store::ReleaseRow> =
+        s.list_releases()?.into_iter().map(|r| (r.id, r)).collect();
     for a in s.all_artifacts()? {
-        if let Some(v) = versions.get(&a.release_id) {
-            by_version.entry(v.clone()).or_default().push(a);
+        if let Some(r) = releases.get(&a.release_id) {
+            if r.source == super::ops::SOURCE_EXTERNAL && !external {
+                continue;
+            }
+            by_version
+                .entry(r.version.clone())
+                .or_default()
+                .extend(super::ops::offerable(r, vec![a]));
         }
     }
     let artifacts = by_version.get(&rel.version).cloned().unwrap_or_default();
@@ -1243,7 +1250,8 @@ impl RemoteService {
                 let options = rollout::options_from_db(&r.options);
                 let method = session.install_method.clone().unwrap_or_default();
                 let arch = session.arch.clone().unwrap_or_default();
-                let artifacts = s.release_artifacts(rel.id)?;
+                let external = rel.source == super::ops::SOURCE_EXTERNAL;
+                let artifacts = super::ops::offerable(&rel, s.release_artifacts(rel.id)?);
                 let Some(a) = rollout::pick_artifact(&artifacts, &method, &arch).cloned() else {
                     return Ok(None);
                 };
@@ -1251,24 +1259,35 @@ impl RemoteService {
                 let target = Version::parse(&rel.version).ok();
                 let downgrade = matches!((&current, &target), (Some(c), Some(t)) if t < c);
                 // 回滾檔：deb／rpm、主機目前的版本、同格式同平台
+                // 回滾檔所屬的版本若是外部 URL 的版本庫，只在目標也是外部 URL 時附上（見 release_context）
                 let rollback = if matches!(method.as_str(), "deb" | "rpm") {
                     match s.get_release(&session.agent_version)? {
-                        Some(cur) => {
-                            rollout::pick_artifact(&s.release_artifacts(cur.id)?, &method, &arch)
+                        Some(cur) if cur.source != super::ops::SOURCE_EXTERNAL || external => {
+                            let list = super::ops::offerable(&cur, s.release_artifacts(cur.id)?);
+                            rollout::pick_artifact(&list, &method, &arch)
                                 .cloned()
+                                .map(|a| (a, cur.base_url.clone()))
                         }
-                        None => None,
+                        _ => None,
                     }
                 } else {
                     None
                 };
-                let artifact_ref = |a: &super::store::ArtifactRow| ArtifactRef {
-                    filename: a.filename.clone(),
-                    size: a.size.max(0) as u64,
-                    sha256: a.sha256.clone(),
-                    source: SOURCE_KAIROS.to_string(),
-                    url: None,
-                };
+                // 外部 URL：`artifact.url` 為 base_url ＋檔名，Pulse 依本機白名單下載；簽章、SHA256SUMS 與
+                // 雜湊照舊附在提議中，Pulse 的驗證與從 Kairos 下載完全相同
+                let artifact_ref =
+                    |a: &super::store::ArtifactRow, base: Option<&str>| ArtifactRef {
+                        filename: a.filename.clone(),
+                        size: a.size.max(0) as u64,
+                        sha256: a.sha256.clone(),
+                        source: if base.is_some() {
+                            mgmt::SOURCE_URL
+                        } else {
+                            SOURCE_KAIROS
+                        }
+                        .to_string(),
+                        url: base.map(|b| format!("{b}{}", a.filename)),
+                    };
                 let offered = h.offered_at.unwrap_or(r.updated_at);
                 // apply_window：沒有維護時段時為提議後 24 小時；有時段時到提議所在的時段結束為止
                 // （都不超過 ends_at）。時段已過（Pulse 交付前的再確認）時不再提議：upgrade_unavailable，
@@ -1294,8 +1313,10 @@ impl RemoteService {
                         version: rel.version.clone(),
                         commit: rel.commit.clone(),
                     },
-                    artifact: artifact_ref(&a),
-                    rollback_artifact: rollback.as_ref().map(artifact_ref),
+                    artifact: artifact_ref(&a, rel.base_url.as_deref()),
+                    rollback_artifact: rollback
+                        .as_ref()
+                        .map(|(b, base)| artifact_ref(b, base.as_deref())),
                     manifest: match (&rel.manifest_name, &rel.manifest) {
                         (Some(n), Some(c)) => Some(ManifestRef {
                             filename: n.clone(),
@@ -1312,8 +1333,12 @@ impl RemoteService {
                     health_timeout_secs: options.health_timeout_secs,
                     allow_downgrade: options.allow_downgrade,
                 };
-                let mut files = vec![(a.filename.clone(), a.sha256.clone(), a.size.max(0) as u64)];
-                if let Some(b) = &rollback {
+                // 經 8443 提供的檔案（外部 URL 的檔案不經這條連線）
+                let mut files = Vec::new();
+                if rel.base_url.is_none() {
+                    files.push((a.filename.clone(), a.sha256.clone(), a.size.max(0) as u64));
+                }
+                if let Some((b, None)) = &rollback {
                     files.push((b.filename.clone(), b.sha256.clone(), b.size.max(0) as u64));
                 }
                 Ok(Some((offer, files)))

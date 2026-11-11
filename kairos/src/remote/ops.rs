@@ -810,7 +810,8 @@ impl RemoteService {
         }
     }
 
-    /// `POST /api/v1/releases`、`kairos releases import`：驗證並建立版本（發佈檔另外上傳）
+    /// 匯入 Kairos 代管的版本（測試用的簡寫；API 與 CLI 用 [`Self::import_release_from`]）
+    #[cfg(test)]
     pub async fn import_release(
         &self,
         who: &Actor,
@@ -818,6 +819,28 @@ impl RemoteService {
         signature: String,
         manifest: Option<String>,
     ) -> Result<Value, ApiError> {
+        self.import_release_from(who, sha256sums, signature, manifest, None)
+            .await
+    }
+
+    /// `POST /api/v1/releases`、`kairos releases import`：驗證並建立版本（發佈檔另外上傳）。
+    /// `base_url` 有值時為外部 URL 的版本庫（`source: external`，REMOTE.md 第 4.1.2 節）：只登記 `SHA256SUMS`、簽章與清單（驗證與代管的完全相同），Kairos 不保存發佈檔，
+    /// 提議的 `artifact.url` 為 `base_url` ＋檔名，由 Pulse 依本機白名單下載並以同一份簽章驗證
+    pub async fn import_release_from(
+        &self,
+        who: &Actor,
+        sha256sums: String,
+        signature: String,
+        manifest: Option<String>,
+        base_url: Option<String>,
+    ) -> Result<Value, ApiError> {
+        let base_url = match base_url {
+            None => None,
+            Some(u) => Some(
+                kairos_proto::mgmt::url::normalize_base_url(&u)
+                    .map_err(|e| param("base_url", format!("base_url 不合法：{e}")))?,
+            ),
+        };
         let now = self.now_ms();
         let trust = self.trust().map_err(|e| {
             log::error!("遠端管理：remote.allowed_signers 無法使用：{e}");
@@ -887,7 +910,13 @@ impl RemoteService {
                     id: 0,
                     version: v.version.clone(),
                     commit: v.commit.clone(),
-                    source: "hosted".into(),
+                    source: if base_url.is_some() {
+                        SOURCE_EXTERNAL
+                    } else {
+                        SOURCE_HOSTED
+                    }
+                    .into(),
+                    base_url: base_url.clone(),
                     sha256sums: sha256sums.clone(),
                     signature: signature.clone(),
                     signer_fingerprint: v.signer.as_ref().map(|s| s.1.clone()),
@@ -920,6 +949,8 @@ impl RemoteService {
                         "signer_principal": v.signer.as_ref().map(|s| s.0.clone()),
                         "key_fingerprint": v.key_fingerprint,
                         "verified_with_trust_anchor": v.signer.is_some(),
+                        "source": row.source,
+                        "base_url": row.base_url,
                     }),
                 )
                 .append(s, now)?;
@@ -928,7 +959,14 @@ impl RemoteService {
             .await
             .map_err(|e| e.into_api("發佈版本"))?;
         self.forget_recommended_min();
-        log::info!(event = "release.import"; "版本庫：已匯入 Pulse {}（{} 個發佈檔待上傳）", row.version, artifacts.len());
+        match &row.base_url {
+            Some(u) => {
+                log::info!(event = "release.import"; "版本庫：已匯入 Pulse {}（外部 URL {u}，{} 個發佈檔由 Pulse 自行下載）", row.version, artifacts.len())
+            }
+            None => {
+                log::info!(event = "release.import"; "版本庫：已匯入 Pulse {}（{} 個發佈檔待上傳）", row.version, artifacts.len())
+            }
+        }
         Ok(release_json(&row, &artifacts, None))
     }
 
@@ -971,13 +1009,20 @@ impl RemoteService {
                     .with_details(json!({"expected": a.sha256, "actual": sha256}))
                     .into());
                 }
-                upload
-                    .commit(&sha256)
-                    .map_err(|e| DbError(format!("無法寫入版本庫：{e}")))?;
+                // 外部 URL 的版本庫：只「登記」——確認雜湊相符並記下大小（提議的 artifact.size 需要它，
+                // SHA256SUMS 沒有大小），檔案不存入版本庫（upload 在離開時刪除暫存檔）
+                let external = rel.source == SOURCE_EXTERNAL;
+                if external {
+                    drop(upload);
+                } else {
+                    upload
+                        .commit(&sha256)
+                        .map_err(|e| DbError(format!("無法寫入版本庫：{e}")))?;
+                }
                 let row = ArtifactRow {
                     size: size as i64,
-                    stored: true,
-                    stored_at: Some(now),
+                    stored: !external,
+                    stored_at: (!external).then_some(now),
                     ..a.clone()
                 };
                 s.upsert_artifact(&row)?;
@@ -986,7 +1031,7 @@ impl RemoteService {
                     "release.import",
                     Some(format!("pulse {version}")),
                     None,
-                    json!({"version": version, "artifact": filename, "sha256": sha256, "size": size}),
+                    json!({"version": version, "artifact": filename, "sha256": sha256, "size": size, "registered_only": external}),
                 )
                 .append(s, now)?;
                 Ok(row)
@@ -1126,8 +1171,27 @@ pub fn artifact_json(a: &ArtifactRow) -> Value {
         "sha256": a.sha256,
         "size": (a.size > 0).then_some(a.size),
         "stored": a.stored,
+        // 外部 URL 的版本庫：已登記（雜湊確認過、大小已知，可以推送），檔案不在 Kairos
+        "registered": !a.stored && a.size > 0,
         "stored_at": a.stored_at.map(crate::api::http::ts_ms),
     })
+}
+
+/// `releases.source`
+pub const SOURCE_HOSTED: &str = "hosted";
+/// 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節）
+pub const SOURCE_EXTERNAL: &str = "external";
+
+/// 推送可以用的發佈檔：代管的版本為已存入的檔案；外部 URL 的版本為**已登記**的檔案（上傳或
+/// `kairos releases import --external` 時確認過雜湊並記下大小；提議的 `artifact.size` 需要它。Kairos 無法
+/// 得知 URL 上是否真的有檔案，由 Pulse 下載時發現）。回傳的 `stored` 表示「可以提議」
+pub fn offerable(rel: &ReleaseRow, mut artifacts: Vec<ArtifactRow>) -> Vec<ArtifactRow> {
+    if rel.source == SOURCE_EXTERNAL {
+        for a in &mut artifacts {
+            a.stored = a.size > 0;
+        }
+    }
+    artifacts
 }
 
 /// 版本的 JSON（`usage`：(目前執行的主機數, 作為回滾目標的主機數, 使用中的推送數)）
@@ -1144,6 +1208,7 @@ pub fn release_json(
         "version": r.version,
         "commit": r.commit,
         "source": r.source,
+        "base_url": r.base_url,
         "signer_fingerprint": r.signer_fingerprint,
         "signer_principal": r.signer_principal,
         "verified": r.signer_fingerprint.is_some(),

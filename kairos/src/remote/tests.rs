@@ -2313,3 +2313,253 @@ async fn approval_is_off_by_default() {
         .unwrap_err();
     assert_eq!(e.code, "invalid_state");
 }
+
+/// 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節，0.10.0）：只登記簽章資料（驗證與代管相同），發佈檔不能上傳；
+/// 提議的 artifact 為 `source: url`、`url` = base_url＋檔名，簽章、SHA256SUMS 與雜湊照舊附上；外部 URL 的
+/// 檔案不經 8443 提供。回滾檔所屬的版本是外部 URL 時，只在目標也是外部 URL 時附上
+#[tokio::test]
+async fn external_releases_offer_urls_and_keep_the_signature_chain() {
+    let signer = TestSigner::new(27);
+    let fx = Fx::new("external", trust_settings(&signer)).await;
+    let r091 = release(&signer, "0.9.1", "1111111");
+    let r092 = release(&signer, "0.9.2", "2222222");
+    let r093 = release(&signer, "0.9.3", "3333333");
+    // base_url 的檢查：https、不含查詢字串或帳號密碼
+    for bad in [
+        "http://repo.example.gov.tw/p/",
+        "https://repo.example.gov.tw/p/?token=1",
+        "https://user@repo.example.gov.tw/p/",
+    ] {
+        let e = fx
+            .svc
+            .import_release_from(
+                &who(),
+                r091.sha256sums.clone(),
+                r091.signature.clone(),
+                Some(r091.manifest.clone()),
+                Some(bad.into()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (
+                e.status.as_u16(),
+                e.details.as_ref().map(|d| d["parameter"].clone())
+            ),
+            (400, Some(json!("base_url"))),
+            "{bad}"
+        );
+    }
+    // 簽章不符的外部版本一樣被拒（驗證不因外部 URL 而省略）
+    let e = fx
+        .svc
+        .import_release_from(
+            &who(),
+            r091.sha256sums.clone(),
+            TestSigner::new(28).sign(r091.sha256sums.as_bytes()),
+            Some(r091.manifest.clone()),
+            Some("https://repo.example.gov.tw/p/".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "release_signature_invalid");
+    // 0.9.1（主機目前的版本）與 0.9.2 是外部 URL 的版本，0.9.3 由 Kairos 代管
+    for (r, base) in [
+        (&r091, "https://Repo.example.gov.tw/kairos-pulse/0.9.1"),
+        (&r092, "https://repo.example.gov.tw/kairos-pulse/0.9.2/"),
+    ] {
+        let v = fx
+            .svc
+            .import_release_from(
+                &who(),
+                r.sha256sums.clone(),
+                r.signature.clone(),
+                Some(r.manifest.clone()),
+                Some(base.into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["source"], "external");
+        assert_eq!(v["verified"], true);
+        assert!(
+            v["base_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://repo.example.gov.tw/kairos-pulse/0.9."),
+            "{v}"
+        );
+        assert!(v["base_url"].as_str().unwrap().ends_with('/'));
+    }
+    import(&fx, &r093).await;
+    let stored_before = std::fs::read_dir(&fx.svc.releases_dir).unwrap().count();
+    // 尚未登記的外部版本沒有可以提議的發佈檔（提議需要大小）
+    fx.add_host(A, "0.9.1", "Web", &[], "deb", "ready").await;
+    fx.connect(A, "0.9.1", "deb");
+    let p = fx
+        .svc
+        .preview_rollout(
+            RolloutSpec::parse(
+                &json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}}),
+            )
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(p["skipped"]["no_artifact"], 1, "{p}");
+    // 登記發佈檔：雜湊不符被拒；相符時記下大小，檔案不存入 Kairos
+    let (name, data) = r092.files[0].clone();
+    let mut up = releases::Upload::create(&fx.svc.releases_dir, 1 << 20).unwrap();
+    up.write(b"not the file").unwrap();
+    let (sha, size) = up.finish().unwrap();
+    let e = fx
+        .svc
+        .store_artifact(&who(), "0.9.2".into(), name, up, sha, size)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "artifact_hash_mismatch");
+    for r in [&r091, &r092] {
+        for (name, data) in &r.files {
+            let mut up = releases::Upload::create(&fx.svc.releases_dir, 1 << 20).unwrap();
+            up.write(data).unwrap();
+            let (sha, size) = up.finish().unwrap();
+            let v = fx
+                .svc
+                .store_artifact(&who(), r.version.clone(), name.clone(), up, sha, size)
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    v["stored"].as_bool(),
+                    v["registered"].as_bool(),
+                    v["size"].as_u64()
+                ),
+                (Some(false), Some(true), Some(data.len() as u64)),
+                "{v}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_dir(&fx.svc.releases_dir).unwrap().count(),
+        stored_before,
+        "外部版本的發佈檔不存入版本庫"
+    );
+    let _ = data;
+
+    let rollout = |target: &str| {
+        RolloutSpec::parse(&json!({
+            "name": target, "target_version": target, "selector": {"agent_ids": [A]},
+            "waves": [{"size": "rest"}], "options": {"allow_no_rollback": true},
+        }))
+        .unwrap()
+    };
+    // 目標是外部 URL 的版本：可升級（發佈檔不必存入）；回滾檔也在外部 URL，不算「無法自動回滾」
+    let p = fx
+        .svc
+        .preview_rollout(rollout("0.9.2"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
+        (Some(1), Some(0)),
+        "{p}"
+    );
+    let created = fx
+        .svc
+        .create_rollout(&who(), rollout("0.9.2"))
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up_a = fx.svc.offer_of(A).expect("offered");
+    let offer = fx.svc.build_offer(A, &up_a, 1).await.unwrap().unwrap();
+    kairos_proto::mgmt::validate_upgrade_offer(&offer).unwrap();
+    assert_eq!(offer.artifact.source, "url");
+    assert_eq!(
+        offer.artifact.url.as_deref(),
+        Some(
+            format!(
+                "https://repo.example.gov.tw/kairos-pulse/0.9.2/{}",
+                offer.artifact.filename
+            )
+            .as_str()
+        )
+    );
+    assert!(offer.artifact.filename.ends_with(".deb"));
+    // 簽章鏈不變：提議附的 SHA256SUMS 與簽章就是匯入時驗證過的那一份，artifact 的雜湊列在其中
+    assert_eq!(offer.sha256sums, r092.sha256sums);
+    assert_eq!(offer.signature, r092.signature);
+    assert!(offer.sha256sums.contains(&offer.artifact.sha256));
+    let rb = offer.rollback_artifact.as_ref().expect("回滾檔");
+    assert_eq!(rb.source, "url");
+    assert!(
+        rb.url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://repo.example.gov.tw/kairos-pulse/0.9.1/")),
+        "{rb:?}"
+    );
+    // 外部 URL 的檔案不經 8443 提供
+    assert!(
+        fx.svc
+            .offered_file(A, &up_a, &offer.artifact.filename)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fx.svc
+        .cancel_rollout(&who(), id, "換目標".into())
+        .await
+        .unwrap();
+
+    // 目標由 Kairos 代管、主機目前的版本只在外部 URL：不附回滾檔（不讓不允許外部 URL 的主機因此拒絕提議），
+    // 資格分類算作「無法自動回滾」
+    let p = fx
+        .svc
+        .preview_rollout(rollout("0.9.3"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
+        (Some(1), Some(1)),
+        "{p}"
+    );
+    let created = fx
+        .svc
+        .create_rollout(&who(), rollout("0.9.3"))
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    fx.svc
+        .submit_rollout(
+            &who(),
+            id.clone(),
+            Some("升級 1 台（無法自動回滾 1 台）".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    fx.set_now(T0 + 70_000);
+    fx.svc.tick().await.unwrap();
+    let up_a = fx.svc.offer_of(A).expect("offered");
+    let offer = fx.svc.build_offer(A, &up_a, 2).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            offer.artifact.source.as_str(),
+            offer.artifact.url.as_deref()
+        ),
+        ("kairos", None)
+    );
+    assert!(offer.rollback_artifact.is_none());
+    assert!(
+        fx.svc
+            .offered_file(A, &up_a, &offer.artifact.filename)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

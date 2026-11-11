@@ -70,6 +70,8 @@ fn mgmt_settings(dir: &Path, local: AppConfig) -> (Settings, Arc<RemoteMgmt>) {
         require_root_owner: false,
         free_space: |_| None,
         redetect: None,
+        url_allowlist: Vec::new(),
+        external_ca: String::new(),
     });
     let mgmt = RemoteMgmt::new(central, agent);
     let mut s = settings(60);

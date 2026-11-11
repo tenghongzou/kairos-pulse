@@ -44,8 +44,8 @@ pub const RELEASES_USAGE: &str = "kairos releases — Pulse 發佈版本庫（�
   --config <path>   Kairos 的設定檔（用來找到 storage.data_dir 與 [remote]；預設為目前目錄的 kairos.toml）
   --confirm <版本>  delete：再輸入一次版本號（L2 確認）
   --reason <原因>   delete：寫入稽核日誌的原因
-  --external <URL>  import：外部 URL 的版本庫（只登記 SHA256SUMS、簽章與清單，發佈檔由 Pulse 從 URL 下載）；
-                    這個版本尚未提供
+  --external <URL>  import：外部 URL 的版本庫（只登記 SHA256SUMS、簽章與清單，Kairos 不保存發佈檔；Pulse 從
+                    <URL><檔名> 下載，URL 必須在每台 Pulse 本機的 upgrade.url_allowlist 中；https://…/）
   --json            輸出機器可讀的 JSON（純 ASCII，schema kairos.releases.<命令>/v1）
   --ascii           不使用 Unicode 符號（也可設定環境變數 KAIROS_SYMBOLS=ascii）
   -h, --help        顯示本說明
@@ -75,7 +75,7 @@ pub enum ReleasesAction {
     List,
     Import {
         dir: PathBuf,
-        /// `--external <base_url>`（外部 URL 的版本庫；尚未提供，見 [`execute`]）
+        /// `--external <base_url>`：外部 URL 的版本庫（REMOTE.md 第 4.1.2 節；只登記簽章資料，不匯入發佈檔）
         external: Option<String>,
     },
     Delete {
@@ -467,7 +467,12 @@ struct Imported {
     warnings: Vec<String>,
 }
 
-async fn import(svc: &RemoteService, who: &Actor, dir: &Path) -> Result<Imported, Failure> {
+async fn import(
+    svc: &RemoteService,
+    who: &Actor,
+    dir: &Path,
+    external: Option<&str>,
+) -> Result<Imported, Failure> {
     if !dir.is_dir() {
         return Err(Failure::new(
             "找不到發佈檔的目錄",
@@ -497,7 +502,16 @@ async fn import(svc: &RemoteService, who: &Actor, dir: &Path) -> Result<Imported
         );
     }
     // 版本已在版本庫：SHA256SUMS 必須相同（同一次發佈），只補上發佈檔
-    let (release, created) = match svc.import_release(who, sums.clone(), sig, manifest).await {
+    let (release, created) = match svc
+        .import_release_from(
+            who,
+            sums.clone(),
+            sig,
+            manifest,
+            external.map(str::to_string),
+        )
+        .await
+    {
         Ok(v) => (v, true),
         Err(e) if e.code == "release_exists" => {
             // 版本號要從 SHA256SUMS 得知：以內容比對版本庫中的版本
@@ -532,11 +546,28 @@ async fn import(svc: &RemoteService, who: &Actor, dir: &Path) -> Result<Imported
     };
     let version = release["version"].as_str().unwrap_or("").to_string();
     let (mut stored, mut already, mut absent) = (Vec::new(), Vec::new(), Vec::new());
+    // 外部 URL 的版本庫：Kairos 不保存發佈檔（由 Pulse 從 base_url 下載），只登記簽章資料
+    let is_external = release["source"] == "external";
+    if is_external {
+        warnings.push(format!(
+            "Pulse {version} 是外部 URL 的版本庫（{}）：目錄中的發佈檔只登記雜湊與大小，不存入 Kairos；請自行把它們放到這個 URL，並確認每台 Pulse 的 upgrade.url_allowlist 允許它。",
+            release["base_url"].as_str().unwrap_or("")
+        ));
+    } else if external.is_some() {
+        return Err(Failure::new(
+            "版本庫已有這個版本",
+            format!("Pulse {version} 已經以 Kairos 代管的方式匯入，不能改為外部 URL"),
+            vec![format!(
+                "要改為外部 URL：先 kairos releases delete {version} --confirm {version}，再以 --external 匯入。"
+            )],
+            EXIT_CONFLICT,
+        ));
+    }
     for a in release["artifacts"].as_array().cloned().unwrap_or_default() {
         let name = a["filename"].as_str().unwrap_or("").to_string();
         let src = dir.join(&name);
         if !src.is_file() {
-            if a["stored"] == true {
+            if a["stored"] == true || a["registered"] == true {
                 already.push(name);
             } else {
                 absent.push(name);
@@ -684,20 +715,6 @@ pub fn execute(
                 ..Default::default()
             };
         }
-        // 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節）尚未提供：參數已解析，接上時在這裡改為傳給匯入
-        ReleasesAction::Import {
-            external: Some(_), ..
-        } => {
-            return fail(Failure::new(
-                "外部 URL 的版本庫尚未提供",
-                "--external 需要 Kairos 端的外部版本庫（source: external）；這個版本只支援 Kairos 代管的發佈檔",
-                vec![
-                    "不加 --external：把發佈檔放在目錄中，由 Kairos 代管並經 8443 提供給 Pulse。"
-                        .to_string(),
-                ],
-                EXIT_USAGE,
-            ));
-        }
         ReleasesAction::Delete {
             version, confirm, ..
         } if confirm.as_deref() != Some(version.as_str()) => {
@@ -747,8 +764,8 @@ pub fn execute(
                     }
                 })
             }
-            ReleasesAction::Import { dir, .. } => {
-                let r = import(&svc, &who, dir).await?;
+            ReleasesAction::Import { dir, external } => {
+                let r = import(&svc, &who, dir, external.as_deref()).await?;
                 if cmd.json {
                     return Ok(ok_json(
                         json!({
@@ -757,6 +774,8 @@ pub fn execute(
                             "created": r.created,
                             "verified": r.release["verified"],
                             "signer_fingerprint": r.release["signer_fingerprint"],
+                            "source": r.release["source"],
+                            "base_url": r.release["base_url"],
                             "stored": r.stored,
                             "already_stored": r.already,
                             "not_in_directory": r.absent,
@@ -1175,8 +1194,9 @@ mod tests {
             ],
             &cfg,
         );
-        assert_eq!(out.exit, EXIT_USAGE);
-        assert!(out.stderr.contains("尚未提供"), "{out:?}");
+        // 已經以代管的方式匯入的版本不能改為外部 URL
+        assert_eq!(out.exit, EXIT_CONFLICT);
+        assert!(out.stderr.contains("不能改為外部 URL"), "{out:?}");
 
         let audit = audit_actions(&cfg);
         assert!(

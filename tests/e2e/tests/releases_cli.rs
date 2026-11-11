@@ -217,6 +217,56 @@ fn releases_cli_imports_lists_and_deletes_alongside_a_running_kairos() {
     assert_eq!(code, 0);
     assert!(p.stdout().contains("版本庫沒有任何版本"), "{}", p.dump());
 
+    // 外部 URL 的版本庫（0.10，REMOTE.md 第 4.1.2 節）：只登記簽章資料，不存入發佈檔；base_url 必須是 https://
+    let (code, p) = cli(&[
+        "import",
+        all.to_str().unwrap(),
+        "--external",
+        "http://repo.example.gov.tw/kairos-pulse/",
+    ]);
+    assert_ne!(code, 0, "{}", p.dump());
+    let (code, p) = cli(&[
+        "import",
+        all.to_str().unwrap(),
+        "--external",
+        "https://Repo.example.gov.tw/kairos-pulse/0.9.1",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{}", p.dump());
+    let d = &json(&p)["data"];
+    assert_eq!(d["source"], "external", "{d}");
+    assert_eq!(
+        d["base_url"], "https://repo.example.gov.tw/kairos-pulse/0.9.1/",
+        "正規化：小寫的主機名稱、結尾的 /"
+    );
+    // 目錄中的發佈檔只登記（雜湊確認過、記下大小），不存入版本庫
+    assert_eq!(d["stored"].as_array().map(Vec::len), Some(2), "{d}");
+    assert_eq!(
+        std::fs::read_dir(&store).unwrap().count(),
+        0,
+        "外部 URL 的版本庫不存放發佈檔"
+    );
+    let rel = &api.data("/api/v1/releases")[0];
+    assert_eq!(
+        (rel["source"].as_str(), rel["verified"].as_bool()),
+        (Some("external"), Some(true)),
+        "{rel}"
+    );
+    for a in rel["artifacts"].as_array().unwrap() {
+        let listed = [DEB, TAR].contains(&a["filename"].as_str().unwrap());
+        assert_eq!(
+            (a["stored"].as_bool(), a["registered"].as_bool()),
+            (Some(false), Some(listed)),
+            "{a}"
+        );
+        assert_eq!(a["size"].is_number(), listed, "{a}");
+    }
+    // 系統健康：外部版本沒有「檔案遺失」
+    let health = remote_item(&api.data("/api/v1/system/health"));
+    assert_eq!(health["status"], "ok", "{health}");
+    let (code, p) = cli(&["delete", VERSION, "--confirm", VERSION]);
+    assert_eq!(code, 0, "{}", p.dump());
+
     // 稽核：cli 的 release.* 事件在雜湊鏈中，鏈完整
     let audit = api.data("/api/v1/audit?category=release&limit=50");
     let actions: Vec<(&str, &str)> = audit

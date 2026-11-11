@@ -120,8 +120,11 @@ pub struct ReleaseRow {
     pub id: i64,
     pub version: String,
     pub commit: String,
-    /// `hosted`（0.9.0 只有這個）或 `external`（0.10）
+    /// `hosted`（Kairos 代管，發佈檔經 8443 下載）或 `external`（0.10.0：外部 URL 的版本庫，Kairos 不保存
+    /// 發佈檔，提議的 `artifact.url` 為 `base_url` ＋檔名；REMOTE.md 第 4.1.2 節）
     pub source: String,
+    /// `external` 時的 URL 前綴（`https://…/`，已正規化為以 `/` 結尾）；`hosted` 為 `None`
+    pub base_url: Option<String>,
     pub sha256sums: String,
     pub signature: String,
     /// 匯入時驗證的金鑰指紋（`[remote] allowed_signers` 沒有設定時為 `None`：沒有驗證）

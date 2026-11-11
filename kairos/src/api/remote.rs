@@ -839,19 +839,30 @@ async fn releases(
                 &b,
                 &["sha256sums", "signature", "manifest", "source", "base_url"],
             )?;
-            match http::str_field(&b, "source").unwrap_or("hosted") {
-                "hosted" => {}
-                "external" => {
+            // 外部 URL 的版本庫（0.10.0，REMOTE.md 第 4.1.2 節）：source = external 時必須有 base_url
+            let base_url = opt_string(&b, "base_url")?;
+            let base_url = match (http::str_field(&b, "source").unwrap_or("hosted"), base_url) {
+                ("hosted", None) => None,
+                ("hosted", Some(_)) => {
                     return Err(ApiError::param(
-                        "source",
-                        "外部 URL 的版本庫在 0.10 提供；0.9 只有 Kairos 代管（hosted）",
+                        "base_url",
+                        "base_url 只用於外部 URL 的版本庫（source: external）",
                     ));
                 }
-                _ => return Err(ApiError::param("source", "source 必須是 hosted")),
-            }
-            if b.get("base_url").is_some_and(|v| !v.is_null()) {
-                return Err(ApiError::param("base_url", "外部 URL 的版本庫在 0.10 提供"));
-            }
+                ("external", Some(u)) => Some(u),
+                ("external", None) => {
+                    return Err(ApiError::param(
+                        "base_url",
+                        "外部 URL 的版本庫（source: external）需要 base_url（https://…/）",
+                    ));
+                }
+                _ => {
+                    return Err(ApiError::param(
+                        "source",
+                        "source 必須是 hosted 或 external",
+                    ));
+                }
+            };
             let sums = opt_string(&b, "sha256sums")?.ok_or_else(|| {
                 ApiError::param("sha256sums", "需要 sha256sums（SHA256SUMS 的全文）")
             })?;
@@ -860,7 +871,7 @@ async fn releases(
             })?;
             let manifest = opt_string(&b, "manifest")?;
             let v = svc
-                .import_release(&actor(p, peer), sums, sig, manifest)
+                .import_release_from(&actor(p, peer), sums, sig, manifest, base_url)
                 .await?;
             Ok(http::json(StatusCode::CREATED, now, json!({"data": v})))
         }

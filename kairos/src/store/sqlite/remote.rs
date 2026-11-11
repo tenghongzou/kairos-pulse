@@ -632,7 +632,8 @@ pub fn record_config_status(
 // ---- 版本庫 ----
 
 const RELEASE_COLUMNS: &str = "release_id, version, commit_id, source, sha256sums, signature, \
-     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by";
+     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by, \
+     base_url";
 
 fn release_of(r: &Row<'_>) -> rusqlite::Result<ReleaseRow> {
     Ok(ReleaseRow {
@@ -648,6 +649,7 @@ fn release_of(r: &Row<'_>) -> rusqlite::Result<ReleaseRow> {
         manifest: r.get(9)?,
         imported_at: r.get(10)?,
         imported_by: r.get(11)?,
+        base_url: r.get(12)?,
     })
 }
 
@@ -680,8 +682,9 @@ pub fn get_release_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<
 pub fn insert_release(conn: &Connection, r: &ReleaseRow) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO releases (product, version, commit_id, source, sha256sums, signature,
-            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by)
-         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by,
+            base_url)
+         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             r.version,
             r.commit,
@@ -693,7 +696,8 @@ pub fn insert_release(conn: &Connection, r: &ReleaseRow) -> rusqlite::Result<i64
             r.manifest_name,
             r.manifest,
             r.imported_at,
-            r.imported_by
+            r.imported_by,
+            r.base_url
         ],
     )?;
     Ok(conn.last_insert_rowid())

@@ -917,7 +917,21 @@ fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgm
         require_root_owner: true,
         free_space: remote::upgrade::free_space,
         redetect: Some(redetect),
+        url_allowlist: upgrade.url_allowlist.clone(),
+        external_ca: upgrade.external_ca.clone(),
     });
+    // 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節）：本機白名單不是空的才會接受 source: "url" 的提議，
+    // 也才需要背景的下載工作。白名單與 CA 以 pulse.toml 的值為準（環境變數不能放寬）
+    if !upgrade.url_allowlist.is_empty() {
+        for p in &upgrade.url_allowlist {
+            if let Err(e) = remote::upgrade::fetch::parse_https_url(p.trim()) {
+                warn!("upgrade.url_allowlist 的「{p}」不會比對到任何 URL：{e}");
+            }
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(remote::upgrade::run_url_downloads(agent.clone()));
+        }
+    }
     remote::RemoteMgmt::new(central, agent)
 }
 
