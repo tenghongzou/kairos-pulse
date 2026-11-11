@@ -13,7 +13,7 @@ use std::time::Duration;
 
 mod accounts;
 mod alerts;
-mod cluster;
+pub mod cluster;
 mod enroll;
 pub mod export;
 mod postgres;
@@ -165,7 +165,8 @@ kairos alert-channels list（通知管道）\n       \
 kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
 kairos config show --effective（實際生效的設定與來源）\n       \
 kairos users create|list|show|grant|revoke-role|disable|enable|delete|reset-password|reset-mfa|unlock|sessions|end-sessions|map-group [選項]（使用者與角色）\n       \
-kairos audit list|verify|export [選項]（稽核日誌）\n\n\
+kairos audit list|verify|export [選項]（稽核日誌）\n       \
+kairos cluster status|init|keys|drain|step-down|forget [選項]（叢集；kairos cluster --help 顯示說明）\n\n\
 kairos --check-config [--config <path>] [--strict] [--json]（檢查設定後結束）\n       \
 kairos diag [選項]（產生支援診斷包；kairos diag --help 顯示說明）\n\n\
 選項:\n  \
@@ -859,6 +860,8 @@ pub enum CliAction {
     Users(crate::users_cli::UsersCommand),
     /// `kairos audit ...`（稽核日誌的查詢、驗證與匯出，見 [`crate::audit_cli`]）
     Audit(crate::audit_cli::AuditCommand),
+    /// `kairos cluster ...`（叢集的維運命令，見 [`crate::cluster_cli`]）
+    Cluster(crate::cluster_cli::ClusterCommand),
     /// `kairos diag ...`（支援診斷包，見 [`crate::diag`]）
     Diag(crate::diag::DiagArgs),
     /// `kairos --check-config`／`kairos check-config`（檢查設定後結束，見 [`crate::diag`]）
@@ -932,6 +935,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "audit") {
         iter.next();
         return crate::audit_cli::parse_args(iter).map(CliAction::Audit);
+    }
+    if iter.peek().is_some_and(|a| a == "cluster") {
+        iter.next();
+        return crate::cluster_cli::parse_args(iter).map(CliAction::Cluster);
     }
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();
@@ -1258,6 +1265,11 @@ impl AppConfig {
         // 不設定：測試各自載入不同的設定，行程層級的後端會互相干擾
         #[cfg(not(test))]
         crate::store::postgres::pool::configure(&settings);
+        // 叢集模式：這個行程（服務與所有子命令）不自動建立金鑰檔（kairos/HA.md 第 11.1 節）
+        #[cfg(not(test))]
+        if settings.cluster.enabled {
+            crate::cluster::keys::disable_autocreate();
+        }
         Ok(settings)
     }
 
@@ -1457,6 +1469,17 @@ impl AppConfig {
         self.audit.validate()?;
         self.export.validate()?;
         self.cluster.validate()?;
+        // 叢集模式只支援 PostgreSQL，且不支援 JSONL 鏡像（kairos/HA.md 第 15.1 節、第 21 節 #17）
+        if self.cluster.enabled && self.storage.backend != StorageBackend::Postgres {
+            return invalid(
+                "錯誤 KRS-E0202：設定互相矛盾：cluster.enabled = true 需要 storage.backend = \"postgres\"（叢集的節點共用一個 PostgreSQL；SQLite 與 JSONL 只支援單機）",
+            );
+        }
+        if self.cluster.enabled && self.storage.jsonl_mirror {
+            return invalid(
+                "錯誤 KRS-E0202：設定互相矛盾：叢集模式（cluster.enabled = true）不支援 storage.jsonl_mirror = true（JSONL 鏡像是節點本機的檔案）",
+            );
+        }
         self.remote.validate()?;
         self.validate_listen_conflicts()?;
         self.log.level_filter()?;

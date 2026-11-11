@@ -537,6 +537,9 @@ pub fn check(path: Option<&Path>) -> CheckReport {
     if c.storage.backend == StorageBackend::Postgres {
         checks.push(postgres_check(c));
     }
+    if c.cluster.enabled {
+        checks.push(cluster_check(c));
+    }
 
     // 日誌
     let logs = Path::new(crate::logger::LOG_DIR);
@@ -940,6 +943,108 @@ fn postgres_check(c: &AppConfig) -> Check {
     if let Some(w) = password_file_warning(&p.password_file) {
         check.result = check.result.max(Outcome::Warning);
         check.details.push(w);
+    }
+    check
+}
+
+/// `[cluster] enabled = true` 的檢查（`kairos/HA.md` 第 11.1、15 節）：叢集是否已建立（`kairos cluster init`）、
+/// 這個節點的金鑰是否與叢集一致（`KRS-E8504`）、`cluster.service_name` 是否在伺服器憑證的 SAN 中。
+/// 只讀取，不建立也不修改任何東西；連不上資料庫時不重複回報（由 PostgreSQL 的檢查項目回報）
+fn cluster_check(c: &AppConfig) -> Check {
+    use crate::cluster::keys::LocalKeys;
+    use crate::store::postgres::{self, SchemaState, pool};
+    use crate::store::prelude::*;
+    let node_id = c.cluster.effective_node_id(&kp_obs::logfmt::hostname());
+    let mut check = Check::new(
+        "cluster",
+        "叢集",
+        Outcome::Ok,
+        format!(
+            "節點 {node_id}；{}；租約 {} 秒、心跳 {} 秒",
+            c.cluster.mode, c.cluster.lease_ttl_secs, c.cluster.heartbeat_secs
+        ),
+    );
+    // 伺服器憑證的 SAN（Pulse 一律以 server.domain 驗證，所有節點的憑證都要含服務名稱；HA.md 第 8.5 節）
+    let service = c.cluster.service_name.trim();
+    if !service.is_empty() {
+        let sans = std::fs::read_to_string(&c.server.cert_path)
+            .map_err(|e| e.to_string())
+            .and_then(|pem| crate::pki::x509::pem_decode_all(&pem, Some("CERTIFICATE")))
+            .and_then(|certs| {
+                certs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "憑證檔中沒有憑證".to_string())
+            })
+            .and_then(|(_, der)| crate::pki::x509::parse_cert(&der))
+            .map(|info| info.dns_sans);
+        // 憑證本身的問題由 TLS 的檢查項目回報
+        if let Ok(sans) = sans {
+            {
+                let wanted = service.to_ascii_lowercase();
+                let covered = sans.iter().any(|san| {
+                    let san = san.to_ascii_lowercase();
+                    san == wanted
+                        || san.strip_prefix("*.").is_some_and(|rest| {
+                            wanted.split_once('.').is_some_and(|(_, r)| r == rest)
+                        })
+                });
+                if covered {
+                    check.summary.push_str(&format!("；伺服器憑證含 {service}"));
+                } else {
+                    check.result = check.result.max(Outcome::Warning);
+                    check.details.push(format!(
+                        "伺服器憑證（server.cert_path）的 SAN 沒有 cluster.service_name「{service}」（憑證的 DNS SAN：{}）。Pulse 以 server.domain 驗證伺服器憑證，叢集中每個節點的憑證都要含服務名稱；請重新簽發含這個 SAN 的憑證。",
+                        if sans.is_empty() { "沒有".to_string() } else { sans.join("、") }
+                    ));
+                }
+            }
+        }
+    }
+    let pg = pool::active().unwrap_or_else(|| pool::PgPool::new(c.storage.postgres.clone()));
+    let Ok(conn) = postgres::open_read(&pg) else {
+        return check;
+    };
+    match postgres::schema_state(&conn) {
+        Ok(SchemaState::Version(n)) if n == crate::store::sqlite::SCHEMA_VERSION => {}
+        _ => {
+            check.result = check.result.max(Outcome::Warning);
+            check.details.push(
+                "資料庫的 schema 還沒有建立（或尚未升級到這個版本）：在第一個節點執行 kairos cluster init 建立叢集後再啟動。".to_string(),
+            );
+            return check;
+        }
+    }
+    let (Ok(cluster_id), Ok(meta), Ok(cas)) = (
+        conn.get_meta(crate::cluster::META_CLUSTER_ID),
+        conn.get_meta(crate::cluster::META_CLUSTER_KEYS),
+        conn.list_cas(),
+    ) else {
+        return check;
+    };
+    let Some(cluster_id) = cluster_id else {
+        check.result = check.result.max(Outcome::Warning);
+        check.details.push(
+            "叢集尚未建立：在第一個節點執行 kairos cluster init（建立金鑰、cluster_id 並記錄金鑰指紋）；在那之前節點不參與 leader 選舉。".to_string(),
+        );
+        return check;
+    };
+    check
+        .summary
+        .push_str(&format!("；cluster_id {cluster_id}"));
+    let problems = LocalKeys::read(Path::new(&c.storage.data_dir)).compare(meta.as_deref(), &cas);
+    if problems.is_empty() {
+        check.summary.push_str("；金鑰與叢集一致");
+    } else {
+        check.result = Outcome::Error;
+        check.code = Some(crate::cluster::CODE_KEYS);
+        check.details.push(format!(
+            "這個節點的金鑰與叢集不一致或缺少：{}。節點不會進入就緒，也不參與 leader 選舉。",
+            problems.join("；")
+        ));
+        check.details.push(
+            "從已在叢集中的節點執行 kairos cluster keys export，再在這個節點執行 kairos cluster keys import。".to_string(),
+        );
     }
     check
 }

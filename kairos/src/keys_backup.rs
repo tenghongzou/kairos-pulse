@@ -36,6 +36,20 @@ use crate::api::http::{b64url_decode, b64url_encode};
 pub const CODE_KEYS_BACKUP: &str = "KRS-E4307";
 /// 格式名稱
 pub const FORMAT: &str = "kairos.keys-backup/v1";
+/// 叢集的金鑰匯出（`kairos cluster keys export`；`kairos/HA.md` 第 11.4 節）：與 v1 相同的 KDF 與加密，
+/// 內容另含簽發 CA 私鑰（`pki/issuing-<ca_id>.key`）。`kairos db restore-keys` 兩種都接受
+pub const FORMAT_V2: &str = "kairos.keys-backup/v2";
+/// v2 中簽發 CA 私鑰（PKCS#8 PEM）的長度上限
+pub const MAX_CA_KEY_BYTES: usize = 16 * 1024;
+
+/// `name` 是不是簽發 CA 私鑰的檔名（相對於資料目錄：`pki/issuing-<ca_id>.key`）
+pub fn is_ca_key_name(name: &str) -> bool {
+    name.strip_prefix("pki/issuing-")
+        .and_then(|r| r.strip_suffix(".key"))
+        .is_some_and(|id| {
+            !id.is_empty() && id.len() <= 18 && id.bytes().all(|b| b.is_ascii_digit())
+        })
+}
 /// 金鑰備份檔的副檔名（接在資料庫備份檔的路徑後面）
 pub const SUFFIX: &str = ".keys";
 /// 備份的金鑰檔（資料目錄下）
@@ -214,8 +228,63 @@ pub fn read_keys(data_dir: &Path) -> Result<(KeySet, Vec<&'static str>), Error> 
     Ok((files, missing))
 }
 
-/// 加密成備份檔的內容
+/// 讀取叢集需要一致的所有金鑰：四個對稱金鑰檔（[`read_keys`]）加上資料目錄中所有的簽發 CA 私鑰
+/// （`pki/issuing-<ca_id>.key`）。回傳（金鑰檔, 不存在的對稱金鑰檔名）
+pub fn read_cluster_keys(data_dir: &Path) -> Result<(KeySet, Vec<&'static str>), Error> {
+    let (mut files, missing) = read_keys(data_dir)?;
+    let pki = crate::pki::pki_dir(data_dir);
+    let mut ca: Vec<(String, Zeroizing<Vec<u8>>)> = Vec::new();
+    match std::fs::read_dir(&pki) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = format!(
+                    "{}/{}",
+                    crate::pki::PKI_DIR,
+                    entry.file_name().to_string_lossy()
+                );
+                if !is_ca_key_name(&name) {
+                    continue;
+                }
+                let content = Zeroizing::new(std::fs::read(entry.path()).map_err(|e| {
+                    Error::new(
+                        e.kind(),
+                        format!("無法讀取 {}: {e}", entry.path().display()),
+                    )
+                })?);
+                if content.is_empty() || content.len() > MAX_CA_KEY_BYTES {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("{} 的長度不合理，不匯出", entry.path().display()),
+                    ));
+                }
+                ca.push((name, content));
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::new(
+                e.kind(),
+                format!("無法讀取 {}: {e}", pki.display()),
+            ));
+        }
+    }
+    ca.sort_by(|a, b| a.0.cmp(&b.0));
+    files.extend(ca);
+    Ok((files, missing))
+}
+
+/// 加密成備份檔的內容（v1）
 pub fn seal(files: &KeySet, password: &Password, kdf: KdfParams) -> Result<String, String> {
+    seal_as(FORMAT, files, password, kdf)
+}
+
+/// 加密成指定格式（[`FORMAT`] 或 [`FORMAT_V2`]）的備份檔內容
+pub fn seal_as(
+    format: &str,
+    files: &KeySet,
+    password: &Password,
+    kdf: KdfParams,
+) -> Result<String, String> {
     let rng = SystemRandom::new();
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; NONCE_LEN];
@@ -238,7 +307,7 @@ pub fn seal(files: &KeySet, password: &Password, kdf: KdfParams) -> Result<Strin
         )
         .map_err(|_| "加密失敗".to_string())?;
     Ok(json!({
-        "format": FORMAT,
+        "format": format,
         "kdf": kdf_json,
         "cipher": "aes-256-gcm",
         "nonce": b64url_encode(&nonce),
@@ -256,11 +325,15 @@ pub fn open(text: &str, password: &Password) -> Result<KeySet, String> {
     let v: Value = serde_json::from_str(text.trim()).map_err(|_| {
         "不是 kairos db backup --include-keys 產生的金鑰備份檔（不是 JSON）".to_string()
     })?;
-    if v.get("format").and_then(Value::as_str) != Some(FORMAT)
+    let format = v.get("format").and_then(Value::as_str);
+    if !matches!(format, Some(FORMAT | FORMAT_V2))
         || v.get("cipher").and_then(Value::as_str) != Some("aes-256-gcm")
     {
-        return Err(format!("不支援的金鑰備份格式（需要 {FORMAT}）"));
+        return Err(format!(
+            "不支援的金鑰備份格式（需要 {FORMAT} 或 {FORMAT_V2}）"
+        ));
     }
+    let v2 = format == Some(FORMAT_V2);
     let kdf_json = v.get("kdf").cloned().unwrap_or(Value::Null);
     let num = |k: &str| {
         kdf_json
@@ -298,7 +371,10 @@ pub fn open(text: &str, password: &Password) -> Result<KeySet, String> {
     zeroize::Zeroize::zeroize(&mut data[..len]);
     let files = files.ok_or_else(|| BAD.to_string())?;
     for (name, content) in &files {
-        if !KEY_FILES.contains(&name.as_str()) || content.len() != 32 {
+        let symmetric = KEY_FILES.contains(&name.as_str()) && content.len() == 32;
+        let ca_key =
+            v2 && is_ca_key_name(name) && !content.is_empty() && content.len() <= MAX_CA_KEY_BYTES;
+        if !symmetric && !ca_key {
             return Err(format!("金鑰備份中有不認得的檔案或長度不符：{name}"));
         }
     }
@@ -393,12 +469,21 @@ pub fn restore(
             out.push((name, Restored::Unchanged));
             continue;
         }
-        let tmp = data_dir.join(format!(".{name}.restore-{}", std::process::id()));
+        // 暫存檔與保留的舊檔放在目的檔的同一個目錄（簽發 CA 私鑰在 pki/ 之下）
+        let file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        if is_ca_key_name(&name) {
+            let dir = crate::pki::ensure_pki_dir(data_dir)?;
+            match_owner(data_dir, &dir);
+        }
+        let tmp = path.with_file_name(format!(".{file}.restore-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         write_new_private(&tmp, content)?;
         match_owner(data_dir, &tmp);
         let result = if replace {
-            let kept = data_dir.join(format!("{name}.replaced-{stamp}"));
+            let kept = path.with_file_name(format!("{file}.replaced-{stamp}"));
             std::fs::rename(&path, &kept)
                 .and_then(|_| std::fs::rename(&tmp, &path))
                 .map(|_| Restored::Replaced(kept))

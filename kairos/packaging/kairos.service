@@ -40,6 +40,9 @@ TimeoutStopSec=10
 #   2 用法錯誤（ExecStart 的命令列參數）
 #   3 設定錯誤（設定檔無法載入或驗證不通過、未啟用 mTLS 卻監聽對外位址等）
 #   4 憑證錯誤（伺服器憑證、私鑰、client CA、CRL 無法讀取、格式錯誤或不成對）
+# 叢集模式（cluster.enabled = true，kairos/HA.md）：主動節點失去 leader 租約時以結束代碼 75 結束
+# （KRS-W8502），由這裡的 Restart=on-failure 重新啟動為備援節點；備援節點連不上資料庫時不結束，持續重試。
+# 被 kairos cluster drain 排空的主動節點正常結束（代碼 0），不會自動重新啟動。
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=2 3 4

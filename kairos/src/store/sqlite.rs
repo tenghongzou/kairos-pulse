@@ -45,6 +45,7 @@ pub(crate) mod admin;
 pub(crate) mod alerts;
 pub(crate) mod api;
 pub(crate) mod audit;
+pub(crate) mod cluster;
 pub(crate) mod conn;
 pub(crate) mod enroll;
 pub(crate) mod hosts;
@@ -739,10 +740,15 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: remote::SCHEMA_V9,
     },
+    // v10（0.10.0）：叢集協調的資料表（SQL 在 store/sqlite/cluster.rs；獨立的一步，可重新編號）
+    Migration {
+        version: 10,
+        sql: cluster::SCHEMA_V10,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";

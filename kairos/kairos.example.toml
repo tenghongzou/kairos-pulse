@@ -220,8 +220,15 @@ process_command = "redact"    # keep | redact（遮蔽命令列中的密碼、to
 process_user = "keep"         # keep | pseudonymize | drop
 inventory_network = "keep"    # keep | truncate（介面位址 /24、/48，MAC 只留廠商碼）| drop
 
-[cluster]                     # 叢集的節點設定（kairos/HA.md）；0.9.0 只有 node_id，叢集模式之後的版本才提供
-node_id = ""                  # 節點名稱（Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）
+[cluster]                     # 叢集（高可用，kairos/HA.md；0.10.0 的階段 A：主動／備援）：兩個以上的 Kairos 共用一個 PostgreSQL，以資料庫中的租約選出唯一的主動節點（leader），其餘是不監聽的備援；部署步驟見 INSTALL 附錄 H
+enabled = false               # true：叢集模式。需要 storage.backend = "postgres"，不支援 storage.jsonl_mirror（KRS-E0202）；啟動前先在第一個節點執行 kairos cluster init，其他節點以 kairos cluster keys import 匯入金鑰。false 時（單機）這個 Kairos 不與其他 Kairos 共用資料庫
+mode = "active_passive"       # active_passive（主動／備援）；active_active（多主動連線層）尚未實作
+node_id = ""                  # 節點名稱（叢集內必須唯一；Pulse 的 pulse status 顯示連到哪個節點）：1～63 個字元的 [a-z0-9-]；空字串＝主機名稱的第一段（轉成小寫）
+service_name = ""             # 選用：服務名稱（例 kairos.example.com，Pulse 的 server.domain）；--check-config 檢查伺服器憑證的 SAN 含這個名稱
+advertise = ""                # 選用：顯示用的位址（kairos cluster status、系統健康）
+lease_ttl_secs = 15           # leader 租約的存活時間，5..=120。主動節點失效後，備援最慢在這個時間加 2 秒取得租約；leader 超過「這個時間 − 5 秒」沒有續約成功就結束（結束代碼 75，由 systemd 重新啟動為備援）。應大於資料庫自動切換所需的時間
+heartbeat_secs = 5            # 節點心跳的間隔，1..=30
+node_lost_secs = 20           # 心跳超過這個時間的節點視為失聯（KRS-W8506）；至少是 heartbeat_secs 的 3 倍
 
 [remote]                      # 集中設定與 Pulse 遠端升級（crates/kairos-proto/REMOTE.md；需要 SQLite 與 mTLS，Pulse 0.9.0 以上）；改變後需重新啟動
 config_enabled = true         # 宣告 feature config（集中設定）

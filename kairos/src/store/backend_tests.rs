@@ -27,6 +27,7 @@ use crate::config::{PostgresSettings, SqliteSynchronous};
 use crate::registry::{RegistrySnapshot, RestoredAgent};
 use crate::storage::Clock;
 
+mod cluster;
 mod domain;
 mod domain2;
 mod migrate;

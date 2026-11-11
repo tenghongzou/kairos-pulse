@@ -731,6 +731,8 @@ impl PgStore {
                     Error::other(format!("{}：無法取得資料庫的使用鎖: {e}", self.target))
                 }
             })?;
+        // 啟動保護：單機模式的 Kairos 不與其他 Kairos 共用 schema（重新連線時也重新取得）
+        self.pool.claim_service_mode(&conn)?;
         super::ensure_schema(&conn)?;
         Self::apply_timeout(&conn, self.write_timeout).map_err(|e| {
             Error::other(format!("{}：無法設定 statement_timeout: {e}", self.target))

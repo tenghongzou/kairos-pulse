@@ -139,7 +139,7 @@ impl EventHub {
                     }
                     _ => Resume::Resync("too_old"),
                 },
-                _ => Resume::Resync("restarted"),
+                _ => Resume::Resync(restart_reason()),
             },
         };
         (rx, resume, last)
@@ -258,6 +258,21 @@ fn sse_event(id: Option<&str>, kind: &str, data: &str) -> Bytes {
     s.push_str(data);
     s.push_str("\n\n");
     Bytes::from(s)
+}
+
+/// `Last-Event-ID` 屬於另一個行程（epoch 不同）時的 `resync` 原因：叢集模式下這個節點是從**另一個節點**
+/// 接手 leader 的話為 `failover`（`kairos/HA.md` 第 10.3 節、第 21 節 #12），否則為 `restarted`
+fn restart_reason() -> &'static str {
+    match crate::cluster::global() {
+        Some(c)
+            if c.takeover()
+                .and_then(|t| t.previous)
+                .is_some_and(|p| p != c.node_id) =>
+        {
+            "failover"
+        }
+        _ => "restarted",
+    }
 }
 
 fn resync_event(reason: &str) -> Bytes {

@@ -181,6 +181,42 @@ fn parse_heartbeat(text: Option<String>) -> Option<(i64, bool)> {
     Some((v.get("at")?.as_i64()?, v.get("clean")?.as_bool()?))
 }
 
+/// 心跳中的節點名稱（叢集模式才有；`kairos/HA.md` 第 13.2 節）
+fn heartbeat_node(text: Option<&str>) -> Option<String> {
+    let v: Value = serde_json::from_str(text?).ok()?;
+    Some(v.get("node_id")?.as_str()?.to_string())
+}
+
+/// 心跳的內容：`{at, clean}`；叢集模式另帶 `node_id` 與 `epoch`（叢集層級的 leader 心跳）
+fn heartbeat_json(now: i64, clean: bool) -> String {
+    match crate::cluster::global() {
+        Some(c) => json!({
+            "at": now,
+            "clean": clean,
+            "node_id": c.node_id,
+            "epoch": c.epoch.load(Ordering::Relaxed),
+        }),
+        None => json!({ "at": now, "clean": clean }),
+    }
+    .to_string()
+}
+
+/// 上一個心跳是另一個節點寫的：這次啟動是 leader 換手
+fn handover_from(
+    previous_node: Option<String>,
+    previous_at: Option<i64>,
+    now: i64,
+) -> Option<engine::Handover> {
+    let c = crate::cluster::global()?;
+    let from = previous_node.filter(|n| *n != c.node_id)?;
+    let window_ms = (c.settings.lease_ttl_secs as i64 + 60) * 1000;
+    Some(engine::Handover {
+        from,
+        to: c.node_id.clone(),
+        recent: previous_at.is_some_and(|at| now - at <= window_ms),
+    })
+}
+
 fn days_around(now: i64, offset: chrono::FixedOffset) -> Vec<String> {
     (-2..=1)
         .filter_map(|d| chrono::DateTime::from_timestamp_millis(now + d * 86_400_000))
@@ -202,7 +238,9 @@ impl AlertService {
         let (loaded, previous, expected) = db
             .write(move |conn| {
                 conn.ensure_builtin_rules(now)?;
-                let previous = parse_heartbeat(conn.get_meta(store::META_HEARTBEAT)?);
+                let previous_text = conn.get_meta(store::META_HEARTBEAT)?;
+                let previous_node = heartbeat_node(previous_text.as_deref());
+                let previous = parse_heartbeat(previous_text);
                 let mut loaded = Loaded {
                     rules: conn.load_rules()?,
                     silences: conn.load_silences(now - 86_400_000)?,
@@ -219,16 +257,14 @@ impl AlertService {
                     }
                     None => HashSet::new(),
                 };
-                conn.put_meta(
-                    store::META_HEARTBEAT,
-                    &json!({ "at": now, "clean": false }).to_string(),
-                )?;
+                conn.put_meta(store::META_HEARTBEAT, &heartbeat_json(now, false))?;
                 let rev = conn.config_rev()?;
-                Ok(((loaded, rev), previous, expected))
+                Ok(((loaded, rev), (previous, previous_node), expected))
             })
             .await
             .map_err(db_err)?;
-        let ((loaded, rev), previous) = (loaded, previous);
+        let ((loaded, rev), (previous, previous_node)) = (loaded, previous);
+        let handover = handover_from(previous_node, previous.map(|p| p.0), now);
         let in_maintenance = previous.is_some_and(|(at, _)| {
             loaded.silences.iter().any(|s| {
                 s.kind == model::SilenceKind::Maintenance
@@ -253,6 +289,7 @@ impl AlertService {
             },
             loaded,
         );
+        engine.set_handover(handover);
         engine.record_startup(previous, p.enroll_closed_default, in_maintenance, now);
         let dispatcher = Dispatcher::new(
             db.clone(),
@@ -386,7 +423,7 @@ impl AlertService {
 
     async fn heartbeat(&self, clean: bool) {
         let now = (self.clock)();
-        let text = json!({ "at": now, "clean": clean }).to_string();
+        let text = heartbeat_json(now, clean);
         if let Err(e) = self
             .db
             .write(move |conn| Ok(conn.put_meta(store::META_HEARTBEAT, &text)?))

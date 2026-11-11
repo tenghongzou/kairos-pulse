@@ -54,6 +54,10 @@ pub enum LockKind {
     /// （離線刪除主機資料、`kairos db migrate`）取得互斥鎖，取不到表示有 Kairos 正在使用這個資料庫
     /// （對應 SQLite 資料庫檔的 EXCLUSIVE 鎖）
     Service = 4,
+    /// 「這個 schema 由誰服務」（啟動保護）：沒有啟用叢集模式的 Kairos 以 session 層級的**互斥**鎖持有，
+    /// 叢集模式的節點（含備援）以**共享**鎖持有。因此同一個 schema 上，單機模式的 Kairos 同時只能有一個，
+    /// 也不能與叢集的節點並存；叢集的節點彼此可以並存（由 leader 租約決定誰服務）
+    Mode = 5,
 }
 
 /// PostgreSQL 後端的錯誤
@@ -792,6 +796,23 @@ pub struct PgConn {
     pooled: bool,
     /// 持有 session 層級的 advisory lock（歸還連線池前釋放）
     session_locked: Cell<bool>,
+    /// 唯讀連線（`default_transaction_read_only = on`）：不做 fencing（唯讀交易不能 `FOR SHARE`，也不會寫入）
+    read_only: bool,
+    /// 不做 fencing 的連線（叢集協調自己的連線：心跳、租約的取得與續約）
+    fence_exempt: Cell<bool>,
+}
+
+/// fencing 檢查失敗時 PostgreSQL 回報的 SQLSTATE（`1 / count(*)` 除以零；見 [`PgPool::set_fence`]）
+const FENCE_SQLSTATE: &str = "22012";
+
+/// 自動提交模式下會被包進 fencing 交易的敘述：`INSERT`／`UPDATE`／`DELETE` 開頭（不分大小寫）
+fn is_plain_write(sql: &str) -> bool {
+    let head = sql.trim_start().as_bytes();
+    [&b"INSERT"[..], b"UPDATE", b"DELETE"].iter().any(|kw| {
+        head.len() > kw.len()
+            && head[..kw.len()].eq_ignore_ascii_case(kw)
+            && head[kw.len()].is_ascii_whitespace()
+    })
 }
 
 impl fmt::Debug for PgConn {
@@ -806,6 +827,8 @@ impl fmt::Debug for PgConn {
 impl PgConn {
     pub(super) fn new(raw: RawConn, pool: Arc<PgPool>, busy: Duration, pooled: bool) -> Self {
         Self {
+            read_only: raw.read_only,
+            fence_exempt: Cell::new(false),
             raw: RefCell::new(Some(raw)),
             in_tx: Cell::new(false),
             broken: Cell::new(false),
@@ -824,6 +847,60 @@ impl PgConn {
     /// 連線已中斷（之後的操作都會失敗；drop 時不歸還連線池）
     pub fn is_broken(&self) -> bool {
         self.broken.get()
+    }
+
+    /// 這條連線不做 fencing（叢集協調自己的連線：節點心跳、租約的取得、續約與交還）
+    pub fn exempt_from_fencing(&self) {
+        self.fence_exempt.set(true);
+    }
+
+    /// 這條連線目前要做的 fencing 檢查（SQL）：連線池設定了 fencing（這個行程是叢集的 leader）、
+    /// 連線可寫、且沒有豁免時才有
+    fn fence_sql(&self) -> Option<Arc<str>> {
+        if self.read_only || self.fence_exempt.get() {
+            return None;
+        }
+        self.pool.fence_sql()
+    }
+
+    /// 把 fencing 檢查的失敗（除以零）轉成明確的錯誤，並通知連線池「已失去租約」
+    fn fence_failed(&self, e: PgError) -> PgError {
+        if e.sqlstate() == Some(FENCE_SQLSTATE) {
+            self.pool.note_fence_lost();
+            PgError::other(format!(
+                "{}：這個節點已不是 leader（租約已到期或已被其他節點取得），拒絕寫入",
+                crate::cluster::CODE_LEASE_LOST
+            ))
+        } else {
+            e
+        }
+    }
+
+    /// 自動提交模式下的單一寫入敘述：需要 fencing 時包進「BEGIN；檢查租約；敘述；COMMIT」
+    /// （`kairos/HA.md` 第 6.2 節：`FOR SHARE` 讓接手的節點等到這個交易結束）
+    fn fenced_autocommit<R>(&self, sql: &str, f: impl FnOnce() -> PgResult<R>) -> PgResult<R> {
+        if self.in_tx.get() || !is_plain_write(sql) {
+            return f();
+        }
+        let Some(fence) = self.fence_sql() else {
+            return f();
+        };
+        self.execute_batch(&format!("BEGIN; {fence}"))
+            .map_err(|e| {
+                // BEGIN 成功、檢查失敗時交易仍開著（且已中止）：結束它
+                let _ = self.execute_batch("ROLLBACK");
+                self.fence_failed(e)
+            })?;
+        match f() {
+            Ok(r) => {
+                self.end_tx("COMMIT")?;
+                Ok(r)
+            }
+            Err(e) => {
+                let _ = self.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     fn with_raw<R>(&self, f: impl FnOnce(&mut RawConn) -> PgResult<R>) -> PgResult<R> {
@@ -870,28 +947,32 @@ impl PgConn {
     /// 執行一個敘述，回傳影響的列數
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> PgResult<usize> {
         let values = params.into_values();
-        self.with_raw(|raw| {
-            let stmt = Self::statement(raw, sql)?;
-            Self::check_arity(&stmt, &values, sql)?;
-            let refs: Vec<&(dyn ToSql + Sync)> =
-                values.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            let n = raw.client.execute(&stmt, &refs)?;
-            Ok(usize::try_from(n).unwrap_or(usize::MAX))
+        self.fenced_autocommit(sql, || {
+            self.with_raw(|raw| {
+                let stmt = Self::statement(raw, sql)?;
+                Self::check_arity(&stmt, &values, sql)?;
+                let refs: Vec<&(dyn ToSql + Sync)> =
+                    values.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+                let n = raw.client.execute(&stmt, &refs)?;
+                Ok(usize::try_from(n).unwrap_or(usize::MAX))
+            })
         })
     }
 
     /// 執行查詢，回傳所有列
     pub fn query_rows<P: Params>(&self, sql: &str, params: P) -> PgResult<Vec<Row>> {
         let values = params.into_values();
-        self.with_raw(|raw| {
-            let stmt = Self::statement(raw, sql)?;
-            Self::check_arity(&stmt, &values, sql)?;
-            let mut it = raw.client.query_raw(&stmt, values.iter())?;
-            let mut rows = Vec::new();
-            while let Some(row) = it.next()? {
-                rows.push(Row(row));
-            }
-            Ok(rows)
+        self.fenced_autocommit(sql, || {
+            self.with_raw(|raw| {
+                let stmt = Self::statement(raw, sql)?;
+                Self::check_arity(&stmt, &values, sql)?;
+                let mut it = raw.client.query_raw(&stmt, values.iter())?;
+                let mut rows = Vec::new();
+                while let Some(row) = it.next()? {
+                    rows.push(Row(row));
+                }
+                Ok(rows)
+            })
         })
     }
 
@@ -964,6 +1045,43 @@ impl PgConn {
         ))
     }
 
+    /// 嘗試取得 session 層級的共享 advisory lock（不等待）；回傳是否取得
+    pub fn try_session_lock_shared(&self, kind: LockKind) -> PgResult<bool> {
+        let key = self.pool.lock_key(kind);
+        let got: bool = self.query_row(
+            &format!("SELECT pg_try_advisory_lock_shared({key})"),
+            (),
+            |r| r.get(0),
+        )?;
+        if got {
+            self.session_locked.set(true);
+        }
+        Ok(got)
+    }
+
+    /// `LISTEN <channel>`（channel 必須是不需要引號的識別字）
+    pub fn listen(&self, channel: &str) -> PgResult<()> {
+        self.execute_batch(&format!("LISTEN {channel}"))
+    }
+
+    /// `NOTIFY <channel>`：只用來縮短其他節點的反應時間，遺失不影響正確性（`kairos/HA.md` 第 6.4 節）
+    pub fn notify(&self, channel: &str) -> PgResult<()> {
+        self.execute_batch(&format!("NOTIFY {channel}"))
+    }
+
+    /// 等待 `LISTEN` 的通知，最多 `timeout`；回傳是否收到（收到時把已到達的通知全部取走）
+    pub fn wait_notification(&self, timeout: Duration) -> PgResult<bool> {
+        self.with_raw(|raw| {
+            let mut n = raw.client.notifications();
+            let got = n.timeout_iter(timeout).next()?.is_some();
+            if got {
+                let mut pending = n.iter();
+                while pending.next()?.is_some() {}
+            }
+            Ok(got)
+        })
+    }
+
     /// 嘗試取得 session 層級的互斥 advisory lock（不等待）；回傳是否取得
     pub fn try_session_lock(&self, kind: LockKind) -> PgResult<bool> {
         let key = self.pool.lock_key(kind);
@@ -1023,6 +1141,14 @@ impl PgConn {
                 "SET LOCAL lock_timeout = {}; SELECT pg_advisory_xact_lock({key})",
                 self.busy.as_millis().max(1)
             ))?;
+        }
+        // fencing（`kairos/HA.md` 第 6.2 節）：這個行程是叢集的 leader 時，每個可寫交易的第一個敘述都確認
+        // 租約仍是自己的（`FOR SHARE`）。唯讀快照不檢查。順序：寫入鎖 → 租約列 → 業務列 → 稽核鎖
+        if options.is_empty()
+            && let Some(fence) = self.fence_sql()
+        {
+            self.execute_batch(&fence)
+                .map_err(|e| self.fence_failed(e))?;
         }
         Ok(tx)
     }

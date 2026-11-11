@@ -17,6 +17,7 @@ pub(crate) mod admin;
 pub(crate) mod alerts;
 pub(crate) mod api;
 pub(crate) mod audit;
+pub(crate) mod cluster;
 pub mod conn;
 pub(crate) mod enroll;
 pub(crate) mod hosts;
@@ -136,16 +137,29 @@ fn newer_schema(found: i32) -> Error {
     )
 }
 
-/// 把 [`SchemaState`] 轉成「可以使用」或錯誤（`Empty` 由呼叫端決定要不要建立）
-fn usable(state: &SchemaState, target: &str) -> Result<bool, Error> {
+/// [`usable`] 的結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Usable {
+    /// 版本相同，可以直接使用
+    Ready,
+    /// 空的 schema：由呼叫端決定要不要建立
+    Create,
+    /// 較舊的版本，有升級步驟（[`schema::UPGRADES`]）
+    Upgrade(i32),
+}
+
+/// 把 [`SchemaState`] 轉成「可以使用」、「需要建立或升級」或錯誤
+fn usable(state: &SchemaState, target: &str) -> Result<Usable, Error> {
     match state {
-        SchemaState::Version(n) if *n == SCHEMA_VERSION => Ok(true),
+        SchemaState::Version(n) if *n == SCHEMA_VERSION => Ok(Usable::Ready),
         SchemaState::Version(n) if *n > SCHEMA_VERSION => Err(newer_schema(*n)),
+        SchemaState::Version(n) if *n >= schema::BASE_VERSION => Ok(Usable::Upgrade(*n)),
         SchemaState::Version(n) => Err(Error::new(
             ErrorKind::InvalidData,
             format!(
-                "{}：{target} 的 schema 版本 {n} 比本版 Kairos 需要的 {SCHEMA_VERSION} 舊，而且沒有對應的升級步驟（PostgreSQL 後端從 v{SCHEMA_VERSION} 開始）",
-                pool::CODE_PG_REQUIREMENTS
+                "{}：{target} 的 schema 版本 {n} 比本版 Kairos 需要的 {SCHEMA_VERSION} 舊，而且沒有對應的升級步驟（PostgreSQL 後端從 v{} 開始）",
+                pool::CODE_PG_REQUIREMENTS,
+                schema::BASE_VERSION
             ),
         )),
         SchemaState::Migrating => Err(Error::new(
@@ -161,15 +175,27 @@ fn usable(state: &SchemaState, target: &str) -> Result<bool, Error> {
                 pool::CODE_PG_REQUIREMENTS
             ),
         )),
-        SchemaState::Empty => Ok(false),
+        SchemaState::Empty => Ok(Usable::Create),
     }
 }
 
-/// 在交易中建立 schema v9 的所有資料表（不寫 `schema_version`；`kairos db migrate` 在搬移完成後才寫）
+/// 在交易中套用 `from` 之後的升級步驟（[`schema::UPGRADES`]；不寫 `schema_version`）
+fn apply_upgrades(conn: &PgConn, from: i32) -> PgResult<()> {
+    for (version, sql) in schema::UPGRADES {
+        if *version > from {
+            conn.execute_batch(sql)?;
+        }
+    }
+    Ok(())
+}
+
+/// 在交易中建立目前版本的所有資料表：v9 加上之後的升級步驟（不寫 `schema_version`；
+/// `kairos db migrate` 在搬移完成後才寫）
 pub(crate) fn create_tables(conn: &PgConn) -> PgResult<()> {
     let schema = conn.pool().schema().to_string();
     conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))?;
     conn.execute_batch(schema::SCHEMA_V9)?;
+    apply_upgrades(conn, schema::BASE_VERSION)?;
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -193,30 +219,38 @@ pub(crate) fn stamp_version(conn: &PgConn) -> PgResult<()> {
     Ok(())
 }
 
-/// 確認 schema 可以使用：空的 schema 上建立 v9（一個交易；以 advisory lock 確保同時啟動的節點只有
-/// 一個執行，其他等待後重新檢查）。版本較新（`KRS-E4405`）、搬移未完成（`KRS-E4404`）或不是 Kairos 的
+/// 確認 schema 可以使用：空的 schema 上建立目前的版本，較舊的版本（v9 起）依 [`schema::UPGRADES`] 升級
+/// （一個交易；以 advisory lock [`LockKind::Migrate`] 確保同時啟動的節點只有一個執行，其他等待後重新檢查；
+/// `kairos/HA.md` 第 5.5 節）。版本較新（`KRS-E4405`）、搬移未完成（`KRS-E4404`）或不是 Kairos 的
 /// schema（`KRS-E4402`）時回錯誤，不做任何變更。回傳 schema 版本
 pub fn ensure_schema(conn: &PgConn) -> Result<i32, Error> {
     let target = conn.pool().settings().display_target();
     let state = schema_state(conn)
         .map_err(|e| pg_error(&format!("{target}：無法讀取 schema 的狀態"), e))?;
-    if usable(&state, &target)? {
+    if usable(&state, &target)? == Usable::Ready {
         return Ok(SCHEMA_VERSION);
     }
     let create = || -> PgResult<Result<(), Error>> {
         let tx = conn.begin_tx(TxMode::Deferred)?;
         tx.lock_in_tx(LockKind::Migrate)?;
-        // 等待期間可能已由另一個節點建立
+        // 等待期間可能已由另一個節點建立或升級
         let state = schema_state(&tx)?;
         match usable(&state, &target) {
-            Ok(true) => return Ok(Ok(())),
-            Ok(false) => {}
+            Ok(Usable::Ready) => return Ok(Ok(())),
+            Ok(Usable::Create) => {
+                create_tables(&tx)?;
+                stamp_version(&tx)?;
+                tx.commit()?;
+                info!("已在 {target} 建立資料庫 schema v{SCHEMA_VERSION}");
+            }
+            Ok(Usable::Upgrade(from)) => {
+                apply_upgrades(&tx, from)?;
+                stamp_version(&tx)?;
+                tx.commit()?;
+                info!("{target} 的資料庫 schema 已從 v{from} 升級到 v{SCHEMA_VERSION}");
+            }
             Err(e) => return Ok(Err(e)),
         }
-        create_tables(&tx)?;
-        stamp_version(&tx)?;
-        tx.commit()?;
-        info!("已在 {target} 建立資料庫 schema v{SCHEMA_VERSION}");
         Ok(Ok(()))
     };
     let result = create();

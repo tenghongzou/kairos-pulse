@@ -687,6 +687,7 @@ fn known_route(rest: &[&str]) -> bool {
             | ["rollouts", ..]
             | ["overview"]
             | ["system", "health"]
+            | ["cluster"]
             | ["events"]
             | ["enroll", ..]
             | ["pki", ..]
@@ -763,7 +764,7 @@ async fn route(
     let read_only = !privacy::is_route(rest)
         && matches!(
             rest,
-            ["hosts", ..] | ["overview"] | ["system", "health"] | ["events"]
+            ["hosts", ..] | ["overview"] | ["system", "health"] | ["cluster"] | ["events"]
         );
     if read_only {
         if method != Method::GET && method != Method::HEAD {
@@ -929,6 +930,12 @@ async fn dispatch(
                 now,
                 health::compute(ctx, now).await?.redact(&principal.grants),
             ))
+        }
+        // 叢集的狀態（kairos/HA.md 第 14.3 節；階段 A 只有讀取，排空與交還用 kairos cluster）
+        ["cluster"] => {
+            query.reject_unknown(&[], &[])?;
+            principal.require(Permission::SettingsRead)?;
+            Ok(http::ok(now, health::cluster_status(ctx).await?))
         }
         _ => Err(ApiError::not_found()),
     }

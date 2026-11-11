@@ -249,6 +249,34 @@ pub struct PgPool {
     server: Mutex<Option<ServerInfo>>,
     /// 上次記錄伺服器警告（`KRS-W4403`、`KRS-W8305`）的時間：啟動時與之後每小時一次
     warned_at: Mutex<Option<Instant>>,
+    /// fencing（`kairos/HA.md` 第 6.2 節）：這個行程持有 leader 租約時的檢查敘述；`None` 時不檢查
+    /// （單機、CLI、備援節點）
+    fence: Mutex<Option<Arc<str>>>,
+    /// fencing 檢查曾經失敗（已失去租約）
+    fence_lost: std::sync::atomic::AtomicBool,
+    /// fencing 檢查失敗時呼叫（叢集協調據此結束行程）
+    on_fence_lost: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// 這個行程是常駐的 Kairos 服務時，它使用 schema 的方式（啟動保護，[`LockKind::Mode`]）；
+    /// CLI 與測試為 `None`（不取鎖）
+    service_mode: Mutex<Option<ServiceMode>>,
+}
+
+/// 常駐服務使用 schema 的方式（[`LockKind::Mode`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceMode {
+    /// 沒有啟用叢集模式：這個 schema 只能有這一個 Kairos（互斥鎖）
+    Solo,
+    /// 叢集模式的節點：可以與其他叢集節點並存（共享鎖）
+    Cluster,
+}
+
+/// fencing 的對象：持有租約的節點與 epoch
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fence {
+    pub node: String,
+    pub epoch: i64,
+    /// 測試用：取代資料庫時間的「現在」（Unix 毫秒）
+    pub now: Option<i64>,
 }
 
 impl std::fmt::Debug for PgPool {
@@ -281,7 +309,96 @@ impl PgPool {
             retries_serialization: AtomicU64::new(0),
             server: Mutex::new(None),
             warned_at: Mutex::new(None),
+            fence: Mutex::new(None),
+            fence_lost: std::sync::atomic::AtomicBool::new(false),
+            on_fence_lost: OnceLock::new(),
+            service_mode: Mutex::new(None),
         })
+    }
+
+    /// 設定常駐服務使用 schema 的方式（啟動時，建立 writer 的連線之前）
+    pub fn set_service_mode(&self, mode: Option<ServiceMode>) {
+        *self.service_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+
+    pub fn service_mode(&self) -> Option<ServiceMode> {
+        *self.service_mode.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 啟動保護（[`LockKind::Mode`]）：在 `conn`（長期持有的專用連線）上依 [`PgPool::service_mode`] 取得
+    /// session 層級的鎖。取不到時回錯誤（`KRS-E4402`：schema 被其他程式使用）；沒有設定服務模式時不做事
+    pub fn claim_service_mode(&self, conn: &PgConn) -> Result<(), Error> {
+        let Some(mode) = self.service_mode() else {
+            return Ok(());
+        };
+        let got = match mode {
+            ServiceMode::Solo => conn.try_session_lock(LockKind::Mode),
+            ServiceMode::Cluster => conn.try_session_lock_shared(LockKind::Mode),
+        }
+        .map_err(|e| Error::other(format!("無法取得資料庫的使用鎖: {e}")))?;
+        if got {
+            return Ok(());
+        }
+        let target = self.settings.display_target();
+        Err(Error::new(
+            ErrorKind::ResourceBusy,
+            match mode {
+                ServiceMode::Solo => format!(
+                    "{CODE_PG_REQUIREMENTS}：{target} 已有另一個 Kairos 正在使用（另一個單機模式的 Kairos，或叢集的節點）。沒有啟用叢集模式（cluster.enabled = false）的 Kairos 不能與其他 Kairos 共用同一個 schema：兩個行程會各自執行告警、彙總與保留清除。請確認 storage.postgres 沒有指到別的 Kairos 的資料庫；要讓多個 Kairos 共用資料庫時，每個節點都要設定 cluster.enabled = true（kairos/HA.md）"
+                ),
+                ServiceMode::Cluster => format!(
+                    "{CODE_PG_REQUIREMENTS}：{target} 正被一個沒有啟用叢集模式的 Kairos 使用（cluster.enabled = false）。請先停止它並改為叢集模式，再啟動這個節點（kairos/HA.md）"
+                ),
+            },
+        ))
+    }
+
+    /// 設定（或清除）fencing：之後這個池的每個可寫交易與自動提交的寫入敘述都先確認 `fence.node` 仍以
+    /// `fence.epoch` 持有 leader 租約，否則失敗（`KRS-W8502`）並呼叫 [`PgPool::on_fence_lost`] 註冊的處理。
+    /// 檢查是一個敘述：租約列存在且未到期時取得它的 `FOR SHARE` 列鎖，否則除以零（SQLSTATE 22012）
+    pub fn set_fence(&self, fence: Option<Fence>) {
+        let sql = fence.map(|f| {
+            // node 已由設定驗證為 [a-z0-9-]；仍把單引號加倍，避免組出不合法的 SQL
+            let node = f.node.replace('\'', "''");
+            let now = match f.now {
+                Some(ms) => ms.to_string(),
+                None => "(extract(epoch FROM clock_timestamp()) * 1000)::bigint".to_string(),
+            };
+            Arc::<str>::from(format!(
+                "SELECT 1 / count(*) FROM (SELECT 1 FROM {schema}.cluster_leases \
+                 WHERE name = '{lease}' AND holder = '{node}' AND epoch = {epoch} \
+                 AND expires_at > {now} FOR SHARE) kairos_fence",
+                schema = self.settings.schema,
+                lease = crate::cluster::store::LEASE_LEADER,
+                epoch = f.epoch,
+            ))
+        });
+        *self.fence.lock().unwrap_or_else(|e| e.into_inner()) = sql;
+    }
+
+    /// 目前的 fencing 檢查敘述
+    pub(super) fn fence_sql(&self) -> Option<Arc<str>> {
+        self.fence.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 註冊「fencing 檢查失敗」的處理（只能註冊一次）
+    pub fn on_fence_lost(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_fence_lost.set(Box::new(f));
+    }
+
+    /// fencing 檢查失敗：記下並呼叫處理（只在第一次）
+    pub(super) fn note_fence_lost(&self) {
+        if !self.fence_lost.swap(true, Ordering::SeqCst)
+            && let Some(f) = self.on_fence_lost.get()
+        {
+            f();
+        }
+    }
+
+    /// fencing 檢查曾經失敗
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn fence_lost(&self) -> bool {
+        self.fence_lost.load(Ordering::SeqCst)
     }
 
     /// 記下最近一次讀到的伺服器狀態
@@ -349,8 +466,13 @@ impl PgPool {
             .user(&s.user)
             .application_name("kairos")
             .connect_timeout(s.connect_timeout())
-            // 伺服器或網路無聲無息地消失時，由 TCP keepalive 發現（預設即啟用；這裡縮短閒置時間）
+            // 伺服器或網路無聲無息地消失時，由 TCP keepalive 發現（預設即啟用；這裡縮短閒置時間與探測間隔：
+            // 閒置 30 秒後每 10 秒探測一次，3 次沒有回應就中斷）。tcp_user_timeout：送出的資料 30 秒沒有被
+            // 確認就中斷（Linux；備援節點的協調連線不會無限期卡在已經消失的資料庫上）
             .keepalives_idle(Duration::from_secs(30))
+            .keepalives_interval(Duration::from_secs(10))
+            .keepalives_retries(3)
+            .tcp_user_timeout(Duration::from_secs(30))
             .ssl_mode(match mode {
                 PgSslMode::Disable => postgres::config::SslMode::Disable,
                 PgSslMode::Require | PgSslMode::VerifyFull => postgres::config::SslMode::Require,
