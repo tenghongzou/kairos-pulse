@@ -49,7 +49,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-10-21
+## [0.9.0] - 2026-11-11
 
 **Kairos 0.9.0、Pulse 0.9.0**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。
 
