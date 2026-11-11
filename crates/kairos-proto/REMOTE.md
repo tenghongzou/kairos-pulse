@@ -809,7 +809,7 @@ CREATE INDEX rollout_hosts_state ON rollout_hosts(rollout_id, wave, state);
 ```
 
 - 保存期限：設定檔的版本保留全部（數量小）；`rollout_hosts` 隨推送保留，已完成或取消的推送在 `[remote] rollout_retention_days`（預設 400 天）後刪除；`data/releases/` 中沒有任何版本參照的檔案在每日清理時刪除。
-- `kairos db backup` 包含這些資料表，但**不含** `data/releases/` 的發佈檔（可從發佈處重新取得）；還原後版本庫中 `stored = 1` 而檔案不存在的版本標為「檔案遺失」，需重新匯入檔案。
+- `kairos db backup` 包含這些資料表，但**不含** `data/releases/` 的發佈檔（可從發佈處重新取得）；還原後版本庫中 `stored = 1` 而檔案不存在的版本標為「檔案遺失」，需重新匯入檔案（0.10.0：系統健康的「遠端管理」與 `kairos releases list` 標出，`kairos releases import <目錄>` 補上，第 13.1 節）。
 - 升級到這個 schema 後 0.8 的 Kairos 無法開啟（與先前的版本相同）。
 
 ## 7. Kairos 設定 `[remote]`
@@ -867,7 +867,7 @@ rollout_retention_days = 400
 | `DELETE /api/v1/releases/{version}` | `releases:write` | L2（輸入版本號）；使用中 409 `release_in_use` |
 | `GET /api/v1/releases/{version}` | `releases:read` | 詳情，另有各平台、安裝方式的主機數 |
 
-CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄中的 `SHA256SUMS`、`.sig`、清單與 `pulse-*` 發佈檔）、`kairos releases list`、`kairos releases delete <版本> --confirm <版本>`。
+CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄中的 `SHA256SUMS`、`.sig`、清單與 `pulse-*` 發佈檔）、`kairos releases list`、`kairos releases delete <版本> --confirm <版本>`。〔0.10.0 已實作，見第 13.1 節「版本庫」；`--external` 與外部 URL 的版本庫一起提供〕
 
 ### 8.3 推送
 
@@ -983,6 +983,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 8414 | `KRS-W8414` | | | 推送已自動暫停（失敗比例、回滾失敗、簽章失敗、主機卡在替換中） |
 | 8415 | `KRS-W8415` | | | 目標版本與目前的 Kairos 不相容（`min_kairos`） |
 | 8416 | `KRS-I8416` | `PLS-I8416` | 鏡像 | 升級完成 |
+| 8417〔暫定〕 | `KRS-W8417` | | | 版本庫的檔案遺失：已存入的發佈檔不存在或大小與記錄不符（系統健康的「遠端管理」；0.10.0，號碼待設計包正式分配） |
 
 協定錯誤碼與產品代碼的對照（`copywriting.md` §3.4）：`upgrade_unavailable` → 不對應（Pulse 就地處理，記 `DEBUG`）；`rate_limited`（下載）→ 不對應（排隊，不是錯誤）。
 
@@ -1076,13 +1077,18 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - 暫停時提議中、尚未替換的主機回到 `pending` 並在恢復時換新的 `upgrade_id`（Pulse 對舊的 id 收到 `upgrade_unavailable`，同一目標版本的暫存檔可以沿用）；取消時改為 `cancelled`；替換中的照常完成。重試同樣換新的 `upgrade_id`（`attempts` 加 1），`rollback_failed` 需要先 `acknowledge`。
 - 自動暫停：失敗比例、`rollback_failed`、簽章失敗（`PLS-E8401`；同一版本的其他推送也暫停），記 `rollout.auto_pause`（`KRS-W8414`）。API 與 SSE `rollout.progress` 的 `pause_cause`（暫停中才有值）：`failure_ratio`、`rollback_failed`、`signature_failed`（自動暫停，存在 `rollouts.pause_cause`），主控台或 API 暫停（資料表為 NULL）為 `manual`；主控台只在自動暫停時附 `KRS-W8414`。推送清單另回每筆的 `rollback_failed_unacknowledged` 與 `meta`（`paused`、`rollback_failed_unacknowledged`，不受篩選影響），SideNav「升級推送」的計數泡泡直接用它。系統規則（`kairos/ALERTS.md`）：`sys.rollout_paused`「升級推送已暫停」（`KRS-W8414`，警告；原因為回滾失敗或簽章失敗時為嚴重）、`sys.upgrade_rollback_failed`「升級回滾失敗」（`KRS-E8408`，嚴重，對象為主機）、`sys.release_signature_failed`「發佈簽章驗證失敗」（`KRS-E8401`，嚴重，對象為目標版本）。遠端管理服務每一輪依資料庫調和（自動暫停的推送記 `rollouts.pause_cause`，手動暫停不開事件），以內部事件 `RemoteCondition` 發布改變的部分；推送繼續或取消、回滾失敗標記為已處理（或重試）時恢復，Kairos 重新啟動後重新發布。
 - 允許無法自動回滾的主機（`allow_no_rollback`）而有這類主機時，送出的 L2 確認字串為設計包 S26 的「升級 N 台（無法自動回滾 M 台）」（全形括號；只接受這個字串），降版的 L3「降版 N 台」優先。
-- 系統健康（`GET /api/v1/system/health`）的 `remote` 項目（設計包 S20「遠端管理」列，需要 `rollouts:read` 才看得到細節）：回滾失敗未處理為嚴重（`KRS-E8408`）、自動暫停的推送為警告（`KRS-W8414`）、版本庫有發佈版本但沒有 `allowed_signers` 為警告；設計包的「版本庫的檔案遺失」尚未檢查（需要逐一確認檔案，之後與 `kairos releases` 的 CLI 一起做）。
+- 系統健康（`GET /api/v1/system/health`）的 `remote` 項目（設計包 S20「遠端管理」列，需要 `rollouts:read` 才看得到細節）：回滾失敗未處理為嚴重（`KRS-E8408`）、自動暫停的推送為警告（`KRS-W8414`）、版本庫有發佈版本但沒有 `allowed_signers` 為警告。**版本庫的檔案遺失**（0.10.0）：`stored = 1` 的發佈檔在 `<releases_dir>/<sha256>` 不存在、不是一般檔案或大小與記錄不符（例如還原備份之後，第 6 節）時為警告（`KRS-W8417`〔暫定〕），摘要為「版本庫的檔案遺失：0.9.0 的 pulse-0.9.0-…deb（312 台的回滾需要）」（多於一個時加「等 N 個檔案」；大小不符時為「版本庫的檔案大小不符」），`values.release_files_missing`、`missing_files[]`（前 20 個：`version`、`filename`、`problem`＝`missing`／`size_mismatch`、`rollback_target_for`）；每次查詢只 `stat` 已存入的檔案、不重算雜湊（內容被改而大小相同的檔案由 Pulse 的雜湊與簽章檢查發現）。優先序：回滾失敗 ＞ 自動暫停 ＞ 檔案遺失 ＞ 信任錨未設定。處理方式是重新匯入這個版本的發佈檔（主控台 S25 或 `kairos releases import`；大小不符的檔案會被取代）。
 - 推送中主機的離線告警抑制（第 4.7.5 節）尚未實作。
 
 **版本庫**
 
 - 匯入：`POST /api/v1/releases`（`SHA256SUMS`、`.sig`、清單全文）建立版本，之後逐一 `PUT …/artifacts/{filename}` 上傳（串流寫入暫存檔並計算 SHA-256，符合 `SHA256SUMS` 才改名為 `<sha256>`）。有 `[remote] allowed_signers` 時以 `release::verify_bundle` 驗證；沒有設定時只確認簽章本身（`SshSignature::verify_message`）與雜湊，`signer_fingerprint` 為 NULL（主控台警告）。`allowed_signers` 在每次匯入時讀取（修改後不需重新啟動）。
-- `kairos releases import|list|delete` 的 CLI 與外部 URL（`source: external`）尚未提供（後者為 0.10）。
+- **`kairos releases list|import|delete`**（0.10.0，`kairos/src/releases_cli.rs`；`kairos releases --help`）：與主控台 API 用同一套操作（`RemoteService` 的 `import_release`、`store_artifact`、`delete_release`），簽章與雜湊的驗證、`release_in_use` 的保護與稽核事件（`release.import`、`release.import_failed`、`release.delete`）都相同，執行者為 `cli:<OS 帳號>`。版本庫只有資料庫的列與檔案、沒有記憶體中的狀態，因此不經第 4.7.6 節的「寫入後由執行中的 Kairos 接手」：CLI 直接開資料庫（WAL），Kairos 執行中或啟動前（離線環境先匯入）都可以使用；請以 Kairos 的服務帳號執行。
+  - `import <目錄>`：讀取 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json`（至多一個）與 `SHA256SUMS` 列出、目錄中有的 Pulse 發佈檔。版本已在版本庫且 `SHA256SUMS` 完全相同時只補上發佈檔（已存入且檔案正常的略過；遺失或大小不符的重新存入）；`SHA256SUMS` 不同時結束代碼 11。目錄中不在 `SHA256SUMS` 的 `pulse-*` 檔案不匯入並提醒；沒有設定 `allowed_signers` 時警告「沒有驗證簽署者」。任何一個檔案驗證失敗時停止（結束代碼 1、`KRS-E8413`），已存入的檔案保留，修正後重新執行即可。
+  - `list [--json]`：版本、commit、簽署金鑰、發佈檔（已存入／列出的數量）、執行中、回滾目標、推送中的數量；標出已存入而檔案遺失或大小不符的發佈檔（`--json` 的 `artifacts[].file_problem`）。
+  - `delete <版本> --confirm <版本> [--reason …]`：L2 以 `--confirm` 再輸入一次版本號；使用中時結束代碼 11（`release_in_use`）。
+  - `import --external <base_url>` 的參數已解析，執行時回報「外部 URL 的版本庫尚未提供」（結束代碼 2）；與外部 URL 的版本庫（`source: external`，第 4.1.2 節）一起提供。
+- 重複上傳同一個發佈檔時，版本庫中已有同名而**大小不同**的檔案會被這次（雜湊已符合 `SHA256SUMS`）的內容取代（0.9.0 一律保留既有的檔案，無法修復被截斷的檔案）。
 
 **集中設定**
 
@@ -1097,8 +1103,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 對象固定的時間 | 推送開始時（第 4.7.2 節） | 送出時（0.9 送出即開始，兩者相同） |
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
 | SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪；另帶 `pause_cause`）；`rollout.host` 未提供 |
-| 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨）；「版本庫的檔案遺失」未檢查 |
-| CLI | `kairos releases import／list／delete` | 未提供（以 API） |
+| 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨；0.10.0 起另有「版本庫的檔案遺失」，`KRS-W8417`〔暫定〕，只 `stat` 不重算雜湊） |
+| CLI | `kairos releases import／list／delete` | 0.10.0 提供（直接開資料庫，不經執行中的 Kairos）；`--external` 尚未提供 |
 | 告警 | 系統規則與離線告警抑制 | 三條系統規則已接上；升級中主機的離線告警抑制（第 4.7.5 節）未提供 |
 | `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選 |
 | 刪除主機資料 | — | 一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management` |

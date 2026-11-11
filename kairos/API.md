@@ -474,7 +474,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `enroll`（0.8；有註冊服務時） | `mode`、`state`、`listening`、`listen_addr`、`not_listening_reason`、`expired_renew_grace_days`、`blocked_sources`、`impact`（`N`、`M`、`L`、`R`、`T`，第 11.4 節） | 嚴重：模式不是關閉卻沒有在監聽（`KRS-E2001`）；警告：關閉且 N＋M＞0（`KRS-W2009`）、僅續簽但寬限期為 0 天（`KRS-W2011`）、僅續簽但仍有有效 token、封鎖中的來源 ≥ 1（`KRS-W3005`）（設計包 S20「註冊端點」） |
 | `alerts`（0.8） | `enabled`；啟用時同 `GET /api/v1/alerts/summary` 的 `engine`（`running`、`last_tick_at`、`warmup`、`last_error`…） | 嚴重：告警引擎沒有在執行（最近 60 秒沒有完成判定）。`alerts.enabled = false` 時為正常（「已停用」） |
 | `metrics`（0.8） | `on_console`、`token`（是否設定 `observability.metrics_token_file`）、`listen`、`proxied_rejected`（這次啟動後曾拒絕經反向代理轉送的請求，`KRS-W0304`） | —（摘要為設計包 S20「/metrics 端點」列的寫法） |
-| `remote`（0.9；第 17 節） | `available`（`false`：不是 SQLite 儲存）、`config_enabled`、`upgrade_enabled`、`allowed_signers_configured`；遠端升級啟用時另有 `rollouts_running`、`rollouts_paused`、`rollouts_auto_paused`、`paused[]`（前 10 個：`id`、`name`、`reason`、`cause`＝第 17.3 節的 `pause_cause`）、`releases`（版本庫的版本數）、`rollback_failed_unacknowledged`、`downloads_in_progress`、`max_concurrent_downloads` | 嚴重：有回滾失敗且尚未標記為已處理的主機（`KRS-E8408`）；警告：有自動暫停的推送（`KRS-W8414`；主控台暫停的不算）、遠端升級啟用且版本庫有發佈版本但沒有設定 `[remote] allowed_signers`（匯入時無法驗證簽章；版本庫是空的時只在摘要註明）。兩者都停用時為正常（「已停用」）（設計包 S20「遠端管理」列） |
+| `remote`（0.9；第 17 節） | `available`（`false`：不是 SQLite 儲存）、`config_enabled`、`upgrade_enabled`、`allowed_signers_configured`；遠端升級啟用時另有 `rollouts_running`、`rollouts_paused`、`rollouts_auto_paused`、`paused[]`（前 10 個：`id`、`name`、`reason`、`cause`＝第 17.3 節的 `pause_cause`）、`releases`（版本庫的版本數）、`release_files_missing`、`missing_files[]`（0.10.0；前 20 個：`version`、`filename`、`problem`＝`missing`／`size_mismatch`、`rollback_target_for`）、`rollback_failed_unacknowledged`、`downloads_in_progress`、`max_concurrent_downloads` | 嚴重：有回滾失敗且尚未標記為已處理的主機（`KRS-E8408`）；警告：有自動暫停的推送（`KRS-W8414`；主控台暫停的不算）、**版本庫的檔案遺失**（0.10.0，`KRS-W8417`〔暫定〕：已存入的發佈檔不存在或大小與記錄不符，例如還原備份之後；只 `stat`，重新匯入即可）、遠端升級啟用且版本庫有發佈版本但沒有設定 `[remote] allowed_signers`（匯入時無法驗證簽章；版本庫是空的時只在摘要註明）。兩者都停用時為正常（「已停用」）（設計包 S20「遠端管理」列） |
 
 **細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）、`remote`（`rollouts:read`，0.9）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
 
@@ -1463,7 +1463,14 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 | `GET /api/v1/releases/{version}` | `releases:read` | 同清單的一筆，另有 `hosts_by_platform`（`<install.method>/<arch>` → 目前執行這個版本的主機數）與 `sha256sums`；沒有時 404 `release_not_found` |
 | `DELETE /api/v1/releases/{version}` | `releases:write` | L2：本文 `confirm` 為版本號（否則 400 `confirmation_required`，`details.confirm_text`）、`reason` 選填。使用中（未結束的推送以它為目標，或有主機以它為回滾目標）409 `release_in_use`（`details.in_use_by_rollouts`、`rollback_target_for`）。刪除紀錄，版本庫中沒有其他版本參照的檔案一併刪除。稽核 `release.delete` |
 
-CLI（`kairos releases import <目錄>`）在 0.9 尚未提供；以 `curl` 匯入的例子：
+CLI（0.10.0）：`kairos releases import <目錄>`（目錄中放同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json` 與發佈檔；可以重複執行補上發佈檔）、`kairos releases list [--json]`（另標出檔案遺失或大小不符的發佈檔）、`kairos releases delete <版本> --confirm <版本> [--reason …]`。與上表的端點是同一套驗證、保護（`release_in_use`）與稽核，執行者為 `cli:<OS 帳號>`；直接開資料庫，Kairos 執行中或啟動前都可以用（以 Kairos 的服務帳號執行）。結束代碼：0 正常、1 失敗（`KRS-E8413` 等）、2 用法錯誤（含沒有 `--confirm`）、3 設定錯誤、10 權限不足、11 衝突（版本使用中、同版本號而 `SHA256SUMS` 不同）。`--json` 的 schema 為 `kairos.releases.list/v1`、`import/v1`、`delete/v1`。
+
+```bash
+sudo -u kairos /opt/kairos/kairos releases import /tmp/pulse-0.9.1 --config /opt/kairos/kairos.toml
+sudo -u kairos /opt/kairos/kairos releases list --config /opt/kairos/kairos.toml
+```
+
+以 `curl` 匯入的例子：
 
 ```bash
 B=https://kairos.example.com:9443/api/v1; H="Authorization: Bearer $TOKEN"

@@ -34,6 +34,7 @@ mod protocol;
 mod rate;
 mod rbac;
 mod registry;
+mod releases_cli;
 mod reload;
 mod remote;
 mod retention;
@@ -491,6 +492,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Alerts(cmd)) => return ExitCode::from(alerts_cli::run(cmd)),
         Ok(CliAction::Users(cmd)) => return ExitCode::from(users_cli::run(cmd)),
         Ok(CliAction::Audit(cmd)) => return ExitCode::from(audit_cli::run(cmd)),
+        Ok(CliAction::Releases(cmd)) => return ExitCode::from(releases_cli::run(cmd)),
         Ok(CliAction::Diag(args)) => return ExitCode::from(diag::run(args)),
         Ok(CliAction::CheckConfig(args)) => return ExitCode::from(diag::run_check(args)),
         Err(e) => {
@@ -515,6 +517,7 @@ fn main() -> ExitCode {
                 Some(a) if a == "alert-channels" => alerts_cli::CHANNELS_USAGE,
                 Some(a) if a == "users" => users_cli::USERS_USAGE,
                 Some(a) if a == "audit" => audit_cli::AUDIT_USAGE,
+                Some(a) if a == "releases" => releases_cli::RELEASES_USAGE,
                 Some(a) if a == "diag" => diag::DIAG_USAGE,
                 Some(a) if a == "check-config" => diag::CHECK_USAGE,
                 _ if std::env::args_os().any(|a| a == "--check-config") => diag::CHECK_USAGE,

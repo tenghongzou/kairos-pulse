@@ -544,6 +544,47 @@ async fn releases_and_rollouts_over_https() {
         it["summary"].as_str().unwrap().contains("已暫停 1 個"),
         "{it}"
     );
+    // 版本庫的檔案遺失（例如還原備份之後）：警告、KRS-W8417〔暫定〕；大小不符也算；補回後恢復
+    let store = f.remote.as_ref().unwrap().releases_dir.clone();
+    let stored_file = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .next()
+        .expect("版本庫有一個發佈檔");
+    let content = std::fs::read(&stored_file).unwrap();
+    std::fs::remove_file(&stored_file).unwrap();
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(
+        (it["status"].as_str(), it["product_code"].as_str()),
+        (Some("warning"), Some("KRS-W8417")),
+        "{it}"
+    );
+    assert!(
+        it["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("版本庫的檔案遺失：0.9.2 的 {tar_name}")),
+        "{it}"
+    );
+    assert_eq!(it["values"]["release_files_missing"], 1);
+    assert_eq!(
+        it["values"]["missing_files"][0],
+        json!({"version": "0.9.2", "filename": tar_name, "problem": "missing", "rollback_target_for": 0})
+    );
+    std::fs::write(&stored_file, &content[..content.len() - 1]).unwrap();
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(it["values"]["missing_files"][0]["problem"], "size_mismatch");
+    assert!(it["summary"].as_str().unwrap().contains("大小不符"), "{it}");
+    // 重新上傳同一個檔案：取代大小不符的檔案
+    let r = put_artifact(&f, &admin, "0.9.2", &tar_name, &tar).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(std::fs::read(&stored_file).unwrap(), content);
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(it["status"], "ok", "{it}");
+    assert_eq!(it["values"]["release_files_missing"], 0);
     // 回滾失敗（以 SQL 模擬）：嚴重、KRS-E8408；清單的每筆與 meta 都有未處理的台數；唯讀看不到細節
     f.admin()
         .execute("UPDATE rollout_hosts SET state = 'rollback_failed'", [])

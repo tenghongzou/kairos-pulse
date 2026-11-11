@@ -72,6 +72,8 @@ pub const CODE_ROLLOUT_PAUSED: &str = "KRS-W8414";
 pub const CODE_INCOMPATIBLE: &str = "KRS-W8415";
 /// 升級完成（鏡像 `PLS-I8416`）
 pub const CODE_UPGRADED: &str = "KRS-I8416";
+/// 版本庫的檔案遺失：已存入的發佈檔不存在或大小不符（系統健康；〔暫定〕號碼，待設計包正式分配）
+pub const CODE_RELEASE_FILE_MISSING: &str = "KRS-W8417";
 
 /// Pulse 的代碼換成鏡像的 Kairos 代碼（同號；`KRS-W8402` 與 `PLS-E8402` 等級不同）
 pub fn mirror_code(pulse_code: &str) -> Option<&'static str> {

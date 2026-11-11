@@ -491,6 +491,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 
   - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
   - `data/` 已有內容不同的金鑰檔時（例如 Kairos 在還原前已啟動並產生了新的金鑰），`restore-keys` 拒絕；確認後加 `--overwrite`，原本的檔案改名為 `<名稱>.replaced-<時間>` 保留。
+  - 使用遠端升級時：備份**不含** Pulse 版本庫的發佈檔（`data/releases/`）。還原後系統健康的「遠端管理」會顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕），`sudo -u kairos /opt/kairos/kairos releases list --config /opt/kairos/kairos.toml` 列出遺失的檔案；把各版本的發佈檔放回目錄後以 `kairos releases import <目錄>` 補上（0.10.0）。
   - 少了 `alerts-secrets.key`（或與資料庫不成對）時，通知管道的狀態為 `secrets_unavailable`（`KRS-E5110`，主控台、`kairos alert-channels list` 與「通知管道失敗」事件都會顯示），不會發送；還原金鑰檔後重新啟動即恢復，或重新輸入機密。少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。少了 `audit-hmac.key` 時，`kairos audit verify` 與每日的自我驗證以 `hmac_key_unavailable`（`KRS-E6201`）失敗，並開「稽核日誌完整性」緊急事件。
 - 使用線上簽發（第 6 節的 `pki init`）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 

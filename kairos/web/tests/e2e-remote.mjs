@@ -11,7 +11,7 @@
 //   → 無法自動回滾的 L2 字串（攔截預覽）→ L2 輸入「升級 1 台」送出 → 詳情；維運者只有「暫停…」（L1、原因必填；
 //   主控台暫停不附 KRS-W8414）→ 計數泡泡；自動暫停的標題與 KRS-W8414、計數泡泡依清單的 meta（攔截 API）→
 //   管理員「繼續…」→「取消推送…」。
-// - S20「遠端管理」列（信任錨未設定的警告與捷徑；唯讀不顯示）。
+// - S20「遠端管理」列（信任錨未設定的警告與捷徑；0.10 的「版本庫的檔案遺失」；唯讀不顯示）。
 // - S24（維運者，config:write）：新增設定檔（依 schema 產生的欄位、範圍錯誤、隱私敏感的選項）→ 指派全站（影響預覽）→
 //   修改產生第 2 版 → 版本歷史 → 回復到第 1 版 → 刪除被指派擋下 → S05「設定」分頁 → 解除指派 → 刪除；稽核員唯讀。
 // - S04 的「設定狀態」「遠端升級」篩選；S05 的「升級」卡片（攔截 API 模擬回滾失敗與「標記為已處理…」）。
@@ -178,6 +178,31 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await remoteRow.getByText(/信任錨未設定：匯入的發佈版本無法驗證簽章/).waitFor();
     await remoteRow.getByRole('link', { name: '前往 Pulse 版本庫' }).waitFor();
     await axe(page, 'F8 S20 遠端管理列');
+    // 版本庫的檔案遺失（0.10；以攔截的健康 API 模擬還原備份之後的狀態）：警告、代碼、前往版本庫的捷徑
+    await ctx.route('**/api/v1/system/health', async (route) => {
+      const real = await (await route.fetch()).json();
+      const items = (real.data.items || []).map((i) =>
+        i.id === 'remote'
+          ? {
+              ...i,
+              status: 'warning',
+              product_code: 'KRS-W8417',
+              summary: `版本庫的檔案遺失：${VERSION} 的 ${rel.tar}（3 台的回滾需要）；請重新匯入這個版本的發佈檔`,
+              values: { ...i.values, allowed_signers_configured: true, release_files_missing: 1, missing_files: [{ version: VERSION, filename: rel.tar, problem: 'missing', rollback_target_for: 3 }] },
+            }
+          : i,
+      );
+      await route.fulfill({ json: { ...real, data: { ...real.data, items } } });
+    });
+    await page.reload();
+    await waitTitle(page, '系統健康');
+    const missingRow = page.locator('[data-item="remote"]');
+    await missingRow.getByText(/版本庫的檔案遺失：.*3 台的回滾需要/).waitFor();
+    assert.equal(await missingRow.getAttribute('data-status'), 'warning');
+    await missingRow.getByText('KRS-W8417').waitFor();
+    assert.equal(await missingRow.getByRole('link', { name: '前往 Pulse 版本庫' }).getAttribute('href'), '/pulse/releases');
+    await axe(page, 'F8 S20 版本庫的檔案遺失');
+    await ctx.unroute('**/api/v1/system/health');
     await ctx.close();
     // 唯讀（沒有 rollouts:read）：不顯示「遠端管理」列
     const v = await newPage();

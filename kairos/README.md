@@ -665,7 +665,7 @@ Kairos 下發 Pulse 的部分設定（白名單：回報與心跳間隔、採集
 
 - 條件：SQLite 儲存、agent 連線埠啟用 **mTLS**、Pulse 0.9.0 以上（0.8 → 0.9 必須手動升級一次）。`[remote] config_enabled`／`upgrade_enabled` 預設啟用。
 - **集中設定**（S24）：設定檔（每一版保留、可回復）指派給全站、主機群組、標籤或單台，依優先序合併；本機的 `pulse.toml` 與環境變數永遠優先（回報為「本機覆蓋」）。Pulse 在下一次心跳（預設 15 秒內）取得新的設定並回報實際生效的值。
-- **Pulse 版本庫**（S25）：上傳同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-<版本>-<commit>-release.json` 與需要的發佈檔（tar.gz、deb、rpm）。設定 `[remote] allowed_signers`（與客戶驗證發佈包用的同一份公鑰）後，匯入時就驗證簽章；信任仍由每台 Pulse 以本機的 `allowed_signers` 決定，Kairos 被入侵也不能讓主機安裝非官方的程式。
+- **Pulse 版本庫**（S25）：上傳同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-<版本>-<commit>-release.json` 與需要的發佈檔（tar.gz、deb、rpm）。設定 `[remote] allowed_signers`（與客戶驗證發佈包用的同一份公鑰）後，匯入時就驗證簽章；信任仍由每台 Pulse 以本機的 `allowed_signers` 決定，Kairos 被入侵也不能讓主機安裝非官方的程式。命令列（0.10.0）：`kairos releases import <目錄>`（離線環境建議；可以在 Kairos 啟動前先匯入）、`kairos releases list`、`kairos releases delete <版本> --confirm <版本>`。`kairos db backup` 不含發佈檔：還原後系統健康的「遠端管理」與 `kairos releases list` 會標出遺失的檔案，重新匯入即可。
 - **升級推送**（S26）：選擇主機（全站、群組、標籤、指定主機）→ 預覽資格分類 → 送出（L2「升級 N 台」）。發佈包經 8443 的同一條 mTLS 連線分段下載（不需要新的防火牆規則），同時下載數受 `max_concurrent_downloads` 限制。0.9 只有 Linux（Windows、維護時段、雙人覆核、外部 URL 在 0.10）。
 - 權限：`config:read`／`write`（維運者可修改設定）、`releases:read`／`write`、`rollouts:read`／`write`（建立與執行只限管理員）、`rollouts:pause`（維運者可以暫停）。
 
@@ -1091,6 +1091,7 @@ kairos/
     ├── token_cli.rs       kairos api-token create|list|revoke
     ├── users_cli.rs       kairos users …（使用者、角色指派、工作階段、目錄服務群組對應）
     ├── audit_cli.rs       kairos audit list|verify|export
+    ├── releases_cli.rs    kairos releases list|import|delete（Pulse 發佈版本庫）
     ├── audit.rs           稽核事件的雜湊鏈（寫入、補上舊紀錄的雜湊、清除與錨點、驗證、查詢）
     ├── rbac.rs            權限（集中定義）、內建角色、範圍、0.4／0.5 token 的凍結範圍
     ├── users/             帳號：password.rs（Argon2id、政策）、totp.rs（RFC 6238、復原碼）、secrets.rs（主控台金鑰）、

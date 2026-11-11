@@ -163,7 +163,8 @@ kairos alert-channels list（通知管道）\n       \
 kairos pki issuing-ca|certificates|revoke|queue|sign-bundle [選項]（簽發 CA、憑證與 CRL）\n       \
 kairos config show --effective（實際生效的設定與來源）\n       \
 kairos users create|list|show|grant|revoke-role|disable|enable|delete|reset-password|reset-mfa|unlock|sessions|end-sessions|map-group [選項]（使用者與角色）\n       \
-kairos audit list|verify|export [選項]（稽核日誌）\n\n\
+kairos audit list|verify|export [選項]（稽核日誌）\n       \
+kairos releases list|import|delete [選項]（Pulse 發佈版本庫）\n\n\
 kairos --check-config [--config <path>] [--strict] [--json]（檢查設定後結束）\n       \
 kairos diag [選項]（產生支援診斷包；kairos diag --help 顯示說明）\n\n\
 選項:\n  \
@@ -837,6 +838,8 @@ pub enum CliAction {
     Users(crate::users_cli::UsersCommand),
     /// `kairos audit ...`（稽核日誌的查詢、驗證與匯出，見 [`crate::audit_cli`]）
     Audit(crate::audit_cli::AuditCommand),
+    /// `kairos releases ...`（Pulse 發佈版本庫，見 [`crate::releases_cli`]）
+    Releases(crate::releases_cli::ReleasesCommand),
     /// `kairos diag ...`（支援診斷包，見 [`crate::diag`]）
     Diag(crate::diag::DiagArgs),
     /// `kairos --check-config`／`kairos check-config`（檢查設定後結束，見 [`crate::diag`]）
@@ -910,6 +913,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<CliAction
     if iter.peek().is_some_and(|a| a == "audit") {
         iter.next();
         return crate::audit_cli::parse_args(iter).map(CliAction::Audit);
+    }
+    if iter.peek().is_some_and(|a| a == "releases") {
+        iter.next();
+        return crate::releases_cli::parse_args(iter).map(CliAction::Releases);
     }
     if iter.peek().is_some_and(|a| a == "api-token") {
         iter.next();

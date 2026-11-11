@@ -49,6 +49,21 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
+> 0.10.0 的草稿（版本號與日期在整合時統一決定）。
+
+### 新增
+
+- **`kairos releases list|import|delete`**（F8，REMOTE.md 第 8.2、13.1 節）：Pulse 發佈版本庫的命令列。`import <目錄>` 讀取同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json` 與發佈檔，可以重複執行補上發佈檔，也可以在 Kairos 啟動前先匯入（離線環境）；`list [--json]` 列出版本、發佈檔與使用情形，並標出已存入而檔案遺失或大小不符的發佈檔；`delete <版本> --confirm <版本>`（L2）。驗證、`release_in_use` 的保護與稽核事件與主控台 API 相同，執行者為 `cli:<OS 帳號>`。`import --external <URL>` 的參數保留給外部 URL 的版本庫。
+- **系統健康的「版本庫的檔案遺失」**（F8，設計包 S20「遠端管理」列）：已存入的發佈檔不存在或大小與記錄不符時（例如還原備份之後：`kairos db backup` 不含發佈檔），`GET /api/v1/system/health` 的 `remote` 項目為警告（`KRS-W8417`〔暫定〕），`values.release_files_missing`、`missing_files[]` 列出版本、檔名與需要它回滾的主機數；主控台 S20 附「前往 Pulse 版本庫」。重新匯入這個版本的發佈檔即可（大小不符的檔案會被取代）。
+
+### 變更
+
+- 重複上傳同一個發佈檔（`PUT /api/v1/releases/{version}/artifacts/{filename}`、`kairos releases import`）時，版本庫中已有同名而大小不同的檔案會被取代（0.9.0 一律保留既有的檔案，被截斷的檔案無法以重新上傳修復）。
+
+### 新代碼
+
+- `KRS-W8417`〔暫定，待設計包正式分配〕：版本庫的檔案遺失。
+
 ## [0.9.0] - 2026-10-21
 
 **Kairos 0.9.0、Pulse 0.9.0**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。
