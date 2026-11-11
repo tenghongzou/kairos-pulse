@@ -28,7 +28,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 log = { version = "0.4", features = ["kv"] }
 # report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
 # 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 # PostgreSQL 後端（kairos/HA.md 第 4.2 節、第 21 節 #4）：同步 API 的驅動（內部是 tokio-postgres），TLS 用
 # rustls＋ring（與其他連接埠相同的加密後端；不啟用 aws-lc-rs，不引入 openssl、native-tls）。
 # 連線池自行實作（store/postgres/pool.rs），不引入 r2d2
