@@ -362,6 +362,45 @@ fn host_limit_rejects_only_new_hosts(db: &TestDb) -> String {
     format!("{results:?}")
 }
 
+/// 一批中有許多第一次出現的主機（PostgreSQL 以一個敘述建立）：結果、主機編號的順序與上限都與逐台建立相同
+fn many_new_hosts_in_one_batch(db: &TestDb) -> String {
+    let agents: Vec<String> = (0..8)
+        .map(|i| format!("0000000{i}-0000-4000-8000-000000000000"))
+        .collect();
+    let mut o = db.opts();
+    o.max_hosts = 6;
+    let (mut store, _) = db.store_with(o, noon);
+    // 先有一台既有的主機
+    assert_eq!(
+        store.write_batch(&[legacy(&agents[3], 1, noon(), 1.0)]),
+        [WriteStatus::Written]
+    );
+    // 8 台中 7 台是新的（其中一台出現兩次），清冊只剩 5 個位置
+    let mut batch: Vec<_> = agents.iter().map(|a| legacy(a, 2, noon(), 2.0)).collect();
+    batch.push(legacy(&agents[0], 3, noon(), 3.0));
+    let results = store.write_batch(&batch);
+    let written = results
+        .iter()
+        .filter(|r| **r == WriteStatus::Written)
+        .count();
+    assert_eq!(written, 7, "{results:?}");
+    assert!(
+        results[6..8]
+            .iter()
+            .all(|r| matches!(r, WriteStatus::Failed(m) if m.contains("storage.max_hosts"))),
+        "{results:?}"
+    );
+    store.close();
+    let hosts = db.rows("SELECT agent_id, host_id, hostname, online FROM hosts ORDER BY host_id");
+    assert_eq!(hosts.len(), 6);
+    let reports = db.rows("SELECT host_id, seq FROM reports ORDER BY id");
+    format!(
+        "{results:?}
+{hosts:?}
+{reports:?}"
+    )
+}
+
 fn agent_snapshot(agent: &str, online: bool, last_seen: DateTime<Utc>) -> AgentSnapshot {
     AgentSnapshot {
         agent_id: agent.into(),
@@ -1018,6 +1057,7 @@ backend_tests!(
     duplicates_are_acknowledged_but_stored_once,
     failures_and_unknown_commits,
     host_limit_rejects_only_new_hosts,
+    many_new_hosts_in_one_batch,
     inventory_is_persisted_and_restored,
     rollups_are_flushed_and_recovered,
     late_samples_are_merged_by_sample_time,

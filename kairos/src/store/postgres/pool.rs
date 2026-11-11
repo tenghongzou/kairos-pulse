@@ -544,6 +544,18 @@ impl PgPool {
     }
 }
 
+impl Drop for PgPool {
+    /// 關閉閒置的連線。同步驅動關閉連線時會阻塞（`block_on`），最後一個參考可能在 tokio 的 worker
+    /// 執行緒上被釋放（例如 writer task 結束時），所以經由 [`super::conn::blocking`]
+    fn drop(&mut self) {
+        let idle =
+            std::mem::take(&mut self.state.get_mut().unwrap_or_else(|e| e.into_inner()).idle);
+        if !idle.is_empty() {
+            super::conn::blocking(|| drop(idle));
+        }
+    }
+}
+
 /// 讀取伺服器的狀態（一個查詢）
 pub fn server_info(conn: &PgConn) -> super::conn::PgResult<ServerInfo> {
     conn.query_row(

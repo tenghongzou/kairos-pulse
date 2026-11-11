@@ -138,6 +138,9 @@ struct Caches {
     boots: HashMap<i64, (String, i64)>,
     /// v1 三欄位對應的標準序列：cpu、memory.total、memory.used
     legacy: Option<[i64; 3]>,
+    /// 這個交易中新增、尚未寫入 `host_series` 的（主機, 序列）：提交前以一個敘述寫入
+    /// （[`Caches::flush_admitted`]）。新主機的第一筆 report 有十幾個新序列，逐筆寫入時每個都是一次往返
+    admitted: Vec<(i64, i64)>,
 }
 
 impl Caches {
@@ -191,6 +194,56 @@ impl Caches {
                 }),
             );
         }
+    }
+
+    /// 一批 report 中第一次出現的主機：以一個敘述在清冊中新增（新主機大量出現時——第一次啟動、整批
+    /// 註冊——逐台新增每台要兩次往返，1 萬台會讓寫入落後十幾秒）。超過 `max_hosts` 的不新增，之後
+    /// [`Caches::host_id_of`] 會回 `None`。剛新增的主機沒有更早的 report，計數器不需要查「上一筆」
+    fn create_hosts(
+        &mut self,
+        tx: &PgConn,
+        records: &[ReportRecord],
+        opts: &SqliteOptions,
+    ) -> PgResult<()> {
+        let room = opts.max_hosts.saturating_sub(self.hosts.len());
+        let mut seen: HashSet<&str> = HashSet::new();
+        let new: Vec<&ReportRecord> = records
+            .iter()
+            .filter(|r| !self.hosts.contains_key(r.agent_id.as_str()) && seen.insert(&r.agent_id))
+            .take(room)
+            .collect();
+        // 只有一台時走原本的路徑（少一種寫法要驗證的情況）
+        if new.len() < 2 {
+            return Ok(());
+        }
+        let rows = tx.query_rows(
+            "INSERT INTO hosts (agent_id, hostname, peer, identity_verified, online, first_seen, last_seen)
+             SELECT u.a, u.h, u.p, ?4::bigint, 1, u.t, u.t
+             FROM unnest(?1::text[], ?2::text[], ?3::text[], ?5::bigint[]) AS u(a, h, p, t)
+             ON CONFLICT (agent_id) DO NOTHING
+             RETURNING agent_id, host_id, rollup_until",
+            vec![
+                array(new.iter().map(|r| r.agent_id.as_str())),
+                array(new.iter().map(|r| r.hostname.as_str())),
+                array(new.iter().map(|r| r.peer.as_str())),
+                Value::Integer(i64::from(opts.mtls)),
+                array(new.iter().map(|r| r.recv_at.timestamp_millis())),
+            ],
+        )?;
+        for row in rows {
+            let agent_id: String = row.get(0)?;
+            let host_id: i64 = row.get(1)?;
+            self.seeded.insert(host_id);
+            self.hosts.insert(
+                agent_id,
+                HostEntry {
+                    host_id,
+                    rollup_until: row.get(2)?,
+                    synced: None,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// 主機編號；第一次出現的主機在清冊中新增一列。清冊已滿時為 `None`
@@ -280,20 +333,35 @@ impl Caches {
 
     /// 這台主機可以使用這個序列：已用過、或尚未達 `cap`（新序列寫入 `host_series`）。
     /// 已達上限時回傳 `false`（這個指標不保存）
-    fn admit(&mut self, tx: &PgConn, host_id: i64, series_id: i64, cap: usize) -> PgResult<bool> {
+    fn admit(&mut self, host_id: i64, series_id: i64, cap: usize) -> bool {
         let set = self.host_series.entry(host_id).or_default();
         if set.contains(&series_id) {
-            return Ok(true);
+            return true;
         }
         if set.len() >= cap {
-            return Ok(false);
+            return false;
+        }
+        set.insert(series_id);
+        self.admitted.push((host_id, series_id));
+        true
+    }
+
+    /// 把這個交易中新增的（主機, 序列）寫入 `host_series`（一個敘述）。每個會呼叫 [`Caches::admit`] 的
+    /// 交易在提交前呼叫；交易失敗時整個快取（含尚未寫入的部分）會被清空重載
+    fn flush_admitted(&mut self, tx: &PgConn) -> PgResult<()> {
+        if self.admitted.is_empty() {
+            return Ok(());
         }
         tx.execute(
-            "INSERT INTO host_series (host_id, series_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-            params![host_id, series_id],
+            "INSERT INTO host_series (host_id, series_id)
+             SELECT * FROM unnest(?1::bigint[], ?2::bigint[]) ON CONFLICT DO NOTHING",
+            vec![
+                array(self.admitted.iter().map(|p| p.0)),
+                array(self.admitted.iter().map(|p| p.1)),
+            ],
         )?;
-        set.insert(series_id);
-        Ok(true)
+        self.admitted.clear();
+        Ok(())
     }
 
     /// v1 的三個欄位在彙總中對應的標準序列（記憶體換算成 bytes，與 v2 的指標合併）
@@ -765,6 +833,7 @@ impl PgStore {
         let cap = opts.max_series_per_host;
 
         // (1) 準備
+        caches.create_hosts(&tx, records, opts).map_err(before)?;
         let mut prepared: Vec<Prepared<'_>> = Vec::with_capacity(records.len());
         let mut seen_keys: HashSet<(i64, i64)> = HashSet::new();
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
@@ -798,7 +867,7 @@ impl PgStore {
                         continue;
                     };
                     for id in [cpu, total, used] {
-                        caches.admit(&tx, host_id, id, cap).map_err(before)?;
+                        caches.admit(host_id, id, cap);
                     }
                     codec::encode_legacy(&mut buf, *cpu_usage, *total_memory, *used_memory);
                     record_samples.extend([
@@ -817,7 +886,7 @@ impl PgStore {
                             .map_err(before)?
                         {
                             Some(id) => {
-                                if caches.admit(&tx, host_id, id, cap).map_err(before)? {
+                                if caches.admit(host_id, id, cap) {
                                     kept.push((id, m, labels));
                                 } else {
                                     dropped += 1;
@@ -981,7 +1050,7 @@ impl PgStore {
                     else {
                         continue;
                     };
-                    if caches.admit(&tx, host_id, id, cap).map_err(before)? {
+                    if caches.admit(host_id, id, cap) {
                         record_samples.push((host_id, id, ts, point.value));
                     }
                 }
@@ -1019,6 +1088,7 @@ impl PgStore {
         if !late.is_empty() {
             merge_rollup_rows(&tx, &aggregate(late.drain(..))).map_err(before)?;
         }
+        caches.flush_admitted(&tx).map_err(before)?;
         // 失敗注入（測試）：回傳錯誤時 tx 被釋放，交易回復
         let injected = || PgError::other("測試注入的失敗");
         match fail_next.take() {
@@ -1258,7 +1328,7 @@ impl PgStore {
                         for p in points {
                             if let Some(id) = caches
                                 .series_id_derived(&tx, &p.name, &p.unit, &p.labels, p.derived)?
-                                && caches.admit(&tx, host_id, id, cap)?
+                                && caches.admit(host_id, id, cap)
                             {
                                 rollup.add(host_id, id, ts, p.value, now_ms);
                             }
@@ -1268,6 +1338,7 @@ impl PgStore {
                 }
             }
         }
+        caches.flush_admitted(&tx)?;
         tx.commit()?;
         Ok(count)
     }

@@ -501,3 +501,39 @@ fn concurrent_updates_are_atomic() {
     drop(tx);
     let _ = LockKind::Write;
 }
+
+/// 連線池的最後一個參考在 tokio 的 worker 執行緒上被釋放時（writer task 結束），閒置的連線要能正常關閉：
+/// 同步驅動關閉連線時會 `block_on`，直接在 worker 上執行會 panic（量測 `store_throughput` 時發現）
+#[test]
+fn pool_can_be_dropped_on_a_runtime_worker() {
+    let Some(db) = TestDb::postgres("pool_drop") else {
+        return;
+    };
+    let settings = db.pool().settings().clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let joined = runtime.block_on(async move {
+        tokio::spawn(async move {
+            let pool = PgPool::new(settings);
+            // 取用後歸還：池中留有一條閒置的連線
+            let conn = tokio::task::spawn_blocking({
+                let pool = pool.clone();
+                move || pool.get(Access::ReadOnly, Duration::from_secs(1)).unwrap()
+            })
+            .await
+            .unwrap();
+            // 連線本身也在 worker 上釋放（歸還連線池）
+            drop(conn);
+            assert_eq!(pool.stats().idle, 1);
+            drop(pool);
+        })
+        .await
+    });
+    assert!(
+        joined.is_ok(),
+        "在 worker 上釋放連線池不應 panic：{joined:?}"
+    );
+}
