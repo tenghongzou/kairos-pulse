@@ -316,10 +316,18 @@ async fn failed_logins_lock_without_revealing_whether_the_account_exists() {
     let id = conn.find_user("alice").unwrap().unwrap().user_id;
     conn.unlock(id).unwrap();
     assert_eq!(try_login(&f, "alice", PW).await.status, 200);
-    // 同一來源失敗太多次（共 10 次）：來源被限速，正確的密碼也一樣
-    for i in 0..4 {
-        try_login(&f, &format!("nobody-{i}"), "x").await;
+    // 同一來源失敗太多次（額度 10 次）：來源被限速，正確的密碼也一樣。
+    // 額度以實際時間補充（每 6 秒 1 次）：慢的機器上（CI 的 Windows runner 跑到這裡已超過 12 秒）
+    // 前面扣掉的額度會補回來，所以持續失敗到被限速為止，不假設剛好再 4 次；
+    // 「剛好 10 次」由注入時間的 failure_limiter_blocks_after_the_burst_and_recovers 驗證
+    let mut limited = false;
+    for i in 0..40 {
+        if try_login(&f, &format!("nobody-{i}"), "x").await.status == 429 {
+            limited = true;
+            break;
+        }
     }
+    assert!(limited, "失敗 40 次後仍未被限速");
     let r = try_login(&f, "alice", PW).await;
     assert_eq!(r.status, 429, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["error"]["product_code"], "KRS-W6011");
