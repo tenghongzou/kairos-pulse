@@ -520,7 +520,7 @@ fn start_pair(root: &TestDir, a: &Node, b: &Node) -> (Proc, Proc) {
     }
     kp_e2e::release_port(a.obs_port);
     let ka = a.kairos.start();
-    let mut kb = spawn_standby(b);
+    let kb = spawn_standby(b);
     assert!(
         poll_until(WAIT, || {
             readyz(b.obs_port, "").is_some_and(|(s, c)| s == 503 && c["cluster"] == "standby")
@@ -531,10 +531,22 @@ fn start_pair(root: &TestDir, a: &Node, b: &Node) -> (Proc, Proc) {
     (ka, kb)
 }
 
-/// 稽核紀錄的筆數（`kairos audit list --json` 的 `data.total`）
+/// 「系統關機」稽核紀錄的筆數（`kairos audit list --action system.shutdown --json` 的 `data.total`）：
+/// 被 fencing 擋下的節點不走關機流程，也寫不進稽核
 #[cfg(target_os = "linux")]
 fn audit_count(dir: &Path) -> u64 {
-    let (code, v) = cli(dir, &["audit", "list", "--limit", "1", "--json"]);
+    let (code, v) = cli(
+        dir,
+        &[
+            "audit",
+            "list",
+            "--action",
+            "system.shutdown",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
     assert_eq!(code, 0, "{}", v.dump());
     let doc: Value = serde_json::from_str(v.stdout().trim()).unwrap();
     doc["data"]["total"]
@@ -638,7 +650,7 @@ fn a_frozen_leader_is_fenced_and_drain_hands_over() {
         "舊 leader 應在恢復後立刻結束：{:?}",
         thawed.elapsed()
     );
-    // 舊節點沒有寫入：leader 仍是 B（epoch 2），稽核鏈沒有多出舊節點的紀錄（它沒有走關機流程）
+    // 舊節點沒有寫入：leader 仍是 B（epoch 2），稽核鏈沒有多出舊節點的關機紀錄（它沒有走關機流程，也寫不進去）
     let (_, status) = cluster_status(&b.kairos.dir);
     assert_eq!(status["leader"]["node_id"], "kairos-b", "{status:#}");
     assert_eq!(status["leader"]["epoch"], 2, "{status:#}");
