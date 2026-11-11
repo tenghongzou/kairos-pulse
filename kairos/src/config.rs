@@ -16,6 +16,7 @@ mod alerts;
 mod cluster;
 mod enroll;
 pub mod export;
+mod postgres;
 mod remote;
 
 pub use alerts::{AlertSettings, parse_offset as alerts_parse_offset};
@@ -27,6 +28,7 @@ pub use enroll::{
     MIN_CERT_LIFETIME_DAYS, PkiMode, PkiSettings,
 };
 pub use export::{ExportSettings, OtlpSettings, PrometheusExportSettings};
+pub use postgres::{PgSslMode, PostgresSettings};
 pub use remote::RemoteSettings;
 
 /// 未指定 `--config` 時讀取的設定檔（不存在則略過）
@@ -479,6 +481,23 @@ pub enum StorageBackend {
     Sqlite,
     /// 舊版的按日 JSONL（`reports-YYYY-MM-DD.jsonl`）；沒有主機清冊與彙總，只供相容與回復
     Jsonl,
+    /// PostgreSQL（`[storage.postgres]`；`kairos/HA.md` 第 4、5 節）：功能與 SQLite 相同，資料放在外部資料庫
+    Postgres,
+}
+
+impl StorageBackend {
+    /// 是資料庫後端（SQLite 或 PostgreSQL）：有主機清冊、彙總、主控台、註冊、告警等需要資料庫的功能
+    pub fn is_database(self) -> bool {
+        matches!(self, StorageBackend::Sqlite | StorageBackend::Postgres)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageBackend::Sqlite => "sqlite",
+            StorageBackend::Jsonl => "jsonl",
+            StorageBackend::Postgres => "postgres",
+        }
+    }
 }
 
 /// SQLite 的 `PRAGMA synchronous`（`storage.sqlite_synchronous`）
@@ -525,6 +544,8 @@ pub struct StorageSettings {
     /// 每台主機最多幾個指標序列（含 Kairos 算出的速率與推算序列）。超過時新序列的指標不保存
     /// （`KRS-W4104`），其餘照存並回 `ack`（METRICS.md 第 9.1 節）
     pub max_series_per_host: usize,
+    /// `backend = "postgres"` 時的連線設定
+    pub postgres: PostgresSettings,
 }
 
 impl Default for StorageSettings {
@@ -542,6 +563,7 @@ impl Default for StorageSettings {
             sqlite_synchronous: SqliteSynchronous::Normal,
             max_hosts: None,
             max_series_per_host: DEFAULT_MAX_SERIES_PER_HOST,
+            postgres: PostgresSettings::default(),
         }
     }
 }
@@ -1120,8 +1142,7 @@ impl AppConfig {
     pub fn total_limit_below_estimate(&self) -> Option<(u64, u64)> {
         let max = self.storage.max_total_bytes;
         let estimate = self.estimated_sqlite_bytes(self.server.max_connections as u64);
-        (self.storage.backend == StorageBackend::Sqlite && max > 0 && estimate > max)
-            .then_some((max, estimate))
+        (self.storage.backend.is_database() && max > 0 && estimate > max).then_some((max, estimate))
     }
 
     /// 到期預警的門檻（O1）
@@ -1233,6 +1254,10 @@ impl AppConfig {
         };
 
         settings.validate()?;
+        // 這個行程使用的資料庫後端（`storage.backend = "postgres"` 時建立連線池，不連線）。單元測試中
+        // 不設定：測試各自載入不同的設定，行程層級的後端會互相干擾
+        #[cfg(not(test))]
+        crate::store::postgres::pool::configure(&settings);
         Ok(settings)
     }
 
@@ -1417,8 +1442,11 @@ impl AppConfig {
         }
         if self.storage.jsonl_mirror && self.storage.backend == StorageBackend::Jsonl {
             return invalid(
-                "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
+                "storage.jsonl_mirror 只在 storage.backend = \"sqlite\" 或 \"postgres\" 時有效（backend = \"jsonl\" 時 JSONL 已是主要輸出）",
             );
+        }
+        if self.storage.backend == StorageBackend::Postgres {
+            self.storage.postgres.validate()?;
         }
         self.validate_console()?;
         self.enroll.validate()?;
@@ -1490,7 +1518,7 @@ impl AppConfig {
 
     /// 8444 是否可能監聽（模式可在執行中切換，與目前的模式無關）：需要 SQLite、mTLS 與 `pki.server_ca_path`
     pub fn enroll_possible(&self) -> bool {
-        self.storage.backend == StorageBackend::Sqlite
+        self.storage.backend.is_database()
             && self.auth.client_ca_path().is_some()
             && self.pki.server_ca().is_some()
     }

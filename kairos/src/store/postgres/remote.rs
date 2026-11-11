@@ -1,0 +1,1029 @@
+//! [`crate::remote::store`] 的 PostgreSQL 實作（[`RemoteStore`]）。逐函式對照 `store/sqlite/remote.rs`；
+//! 資料表（schema v9：`config_profiles`、`config_assignments`、`host_config`、`releases`、
+//! `release_artifacts`、`rollouts`、`rollout_hosts`）定義在 `store/postgres/schema.rs`。
+// 方法參數與資料表欄位對應
+#![allow(clippy::too_many_arguments)]
+
+use super::conn::{OptionalExtension, PgConn, PgResult, Row, params, pg_domain};
+use crate::remote::store::{
+    ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate, HostConfigRow,
+    HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow, RemoteStore,
+    RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
+};
+
+/// `meta` 的鍵：全域單調遞增的設定版本（REMOTE.md 第 3.4.4 節）
+pub const META_CONFIG_REV: &str = "config_rev";
+
+/// 推送已結束的狀態
+const ROLLOUT_ENDED: &str = "('completed', 'cancelled')";
+
+pg_domain! { RemoteStore {
+    fn remote_config_rev(&self) -> i64 => remote_config_rev;
+    fn bump_remote_config_rev(&self) -> i64 => bump_remote_config_rev;
+    fn list_profiles(&self) -> Vec<ProfileRow> => list_profiles;
+    fn get_profile(&self, id: i64) -> Option<ProfileRow> => get_profile;
+    fn profile_id_by_name(&self, name: &str) -> Option<i64> => profile_id_by_name;
+    fn insert_profile(&self, name: &str, description: &str, settings: &str, now_ms: i64, by: &str, reason: Option<&str>) -> i64 => insert_profile;
+    fn update_profile(&self, id: i64, name: &str, description: &str, settings: &str, now_ms: i64, by: &str, reason: Option<&str>) -> i64 => update_profile;
+    fn delete_profile(&self, id: i64) -> bool => delete_profile;
+    fn profile_revisions(&self, id: i64) -> Vec<ProfileRevisionRow> => profile_revisions;
+    fn list_assignments(&self) -> Vec<AssignmentRow> => list_assignments;
+    fn get_assignment(&self, id: i64) -> Option<AssignmentRow> => get_assignment;
+    fn insert_assignment(&self, profile_id: i64, selector_kind: &str, selector_value: &str, priority: i64, expires_at: Option<i64>, now_ms: i64, by: &str) -> Option<i64> => insert_assignment;
+    fn delete_assignment(&self, id: i64) -> bool => delete_assignment;
+    fn expired_assignments(&self, now_ms: i64) -> Vec<AssignmentRow> => expired_assignments;
+    fn config_targets(&self) -> Vec<ConfigTarget> => config_targets;
+    fn config_target(&self, agent_id: &str) -> Option<ConfigTarget> => config_target;
+    fn desired_all(&self) -> Vec<(String, i64, String)> => desired_all;
+    fn host_config(&self, agent_id: &str) -> Option<HostConfigRow> => host_config;
+    fn host_configs(&self) -> Vec<HostConfigRow> => host_configs;
+    fn upsert_desired(&self, rows: &[DesiredUpdate]) -> () => upsert_desired;
+    fn upsert_hello_info(&self, agent_id: &str, tags: &str, agent_version: &str, install_config: Option<&str>) -> () => upsert_hello_info;
+    fn record_config_status(&self, r: &ConfigReport) -> (Option<String>, usize) => record_config_status;
+    fn list_releases(&self) -> Vec<ReleaseRow> => list_releases;
+    fn get_release(&self, version: &str) -> Option<ReleaseRow> => get_release;
+    fn get_release_by_id(&self, id: i64) -> Option<ReleaseRow> => get_release_by_id;
+    fn insert_release(&self, r: &ReleaseRow) -> i64 => insert_release;
+    fn delete_release(&self, id: i64) -> bool => delete_release;
+    fn release_artifacts(&self, release_id: i64) -> Vec<ArtifactRow> => release_artifacts;
+    fn all_artifacts(&self) -> Vec<ArtifactRow> => all_artifacts;
+    fn upsert_artifact(&self, a: &ArtifactRow) -> () => upsert_artifact;
+    fn artifact_refs(&self, sha256: &str) -> i64 => artifact_refs;
+    fn upgrade_hosts(&self) -> Vec<UpgradeHost> => upgrade_hosts;
+    fn upgrade_host(&self, agent_id: &str) -> Option<UpgradeHost> => upgrade_host;
+    fn list_rollouts(&self, state: Option<&str>) -> Vec<RolloutRow> => list_rollouts;
+    fn get_rollout(&self, id: &str) -> Option<RolloutRow> => get_rollout;
+    fn count_rollouts_with_prefix(&self, prefix: &str) -> i64 => count_rollouts_with_prefix;
+    fn insert_rollout(&self, r: &RolloutRow) -> () => insert_rollout;
+    fn update_rollout_spec(&self, id: &str, name: &str, release_id: i64, selector: &str, waves: &str, options: &str, now_ms: i64) -> bool => update_rollout_spec;
+    fn update_rollout_state(&self, r: &RolloutRow) -> () => update_rollout_state;
+    fn delete_old_rollouts(&self, before_ms: i64) -> i64 => delete_old_rollouts;
+    fn insert_rollout_hosts(&self, rollout_id: &str, hosts: &[NewRolloutHost], now_ms: i64) -> () => insert_rollout_hosts;
+    fn rollout_hosts(&self, rollout_id: &str) -> Vec<RolloutHostRow> => rollout_hosts;
+    fn rollout_host_by_upgrade_id(&self, upgrade_id: &str) -> Option<RolloutHostRow> => rollout_host_by_upgrade_id;
+    fn rollout_host(&self, rollout_id: &str, agent_id: &str) -> Option<RolloutHostRow> => rollout_host;
+    fn host_upgrades(&self, agent_id: &str, limit: i64) -> Vec<RolloutHostRow> => host_upgrades;
+    fn update_rollout_host(&self, rollout_id: &str, host_id: i64, t: &HostTransition, now_ms: i64) -> () => update_rollout_host;
+    fn hosts_in_active_rollouts(&self) -> Vec<(String, String)> => hosts_in_active_rollouts;
+    fn active_offers(&self) -> Vec<(String, String)> => active_offers;
+    fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
+    fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
+} }
+
+// ---- 設定版本 ----
+
+pub fn remote_config_rev(conn: &PgConn) -> PgResult<i64> {
+    // `meta.value` 是 TEXT：不是數字時視為 0（與 SQLite 版相同）
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [META_CONFIG_REV],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(value.and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// 原子遞增（`kairos/HA.md` 第 5.4 節 D6 的作法，版本仍放在 `meta`）：單一敘述完成「讀出、加一、寫回」，
+/// 並行的兩個呼叫不會拿到同一個版本。既有的值不是數字時從 0 起算
+pub fn bump_remote_config_rev(conn: &PgConn) -> PgResult<i64> {
+    conn.query_row(
+        "INSERT INTO meta (key, value) VALUES (?1, '1')
+         ON CONFLICT (key) DO UPDATE SET value =
+            (CASE WHEN meta.value ~ '^[0-9]+$' THEN meta.value::bigint ELSE 0 END + 1)::text
+         RETURNING value",
+        [META_CONFIG_REV],
+        |r| r.get(0),
+    )
+}
+
+// ---- 設定檔 ----
+
+const PROFILE_COLUMNS: &str = "profile_id, name, description, settings, revision, created_at, \
+                               created_by, updated_at, updated_by";
+
+fn profile_of(r: &Row) -> PgResult<ProfileRow> {
+    Ok(ProfileRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        settings: r.get(3)?,
+        revision: r.get(4)?,
+        created_at: r.get(5)?,
+        created_by: r.get(6)?,
+        updated_at: r.get(7)?,
+        updated_by: r.get(8)?,
+    })
+}
+
+pub fn list_profiles(conn: &PgConn) -> PgResult<Vec<ProfileRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PROFILE_COLUMNS} FROM config_profiles ORDER BY lower(name), profile_id"
+    ))?;
+    let rows = stmt.query_map((), profile_of)?;
+    rows.collect()
+}
+
+pub fn get_profile(conn: &PgConn, id: i64) -> PgResult<Option<ProfileRow>> {
+    conn.query_row(
+        &format!("SELECT {PROFILE_COLUMNS} FROM config_profiles WHERE profile_id = ?1"),
+        [id],
+        profile_of,
+    )
+    .optional()
+}
+
+pub fn profile_id_by_name(conn: &PgConn, name: &str) -> PgResult<Option<i64>> {
+    conn.query_row(
+        "SELECT profile_id FROM config_profiles WHERE lower(name) = lower(?1)",
+        [name],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+pub fn insert_profile(
+    conn: &PgConn,
+    name: &str,
+    description: &str,
+    settings: &str,
+    now_ms: i64,
+    by: &str,
+    reason: Option<&str>,
+) -> PgResult<i64> {
+    let id: i64 = conn.query_row(
+        "INSERT INTO config_profiles (name, description, settings, revision, created_at, created_by,
+            updated_at, updated_by)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?4, ?5)
+         RETURNING profile_id",
+        params![name, description, settings, now_ms, by],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO config_profile_revisions (profile_id, revision, settings, description,
+            changed_at, changed_by, reason)
+         VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, settings, description, now_ms, by, reason],
+    )?;
+    Ok(id)
+}
+
+pub fn update_profile(
+    conn: &PgConn,
+    id: i64,
+    name: &str,
+    description: &str,
+    settings: &str,
+    now_ms: i64,
+    by: &str,
+    reason: Option<&str>,
+) -> PgResult<i64> {
+    let revision: i64 = conn.query_row(
+        "UPDATE config_profiles SET name = ?2, description = ?3, settings = ?4,
+            revision = revision + 1, updated_at = ?5, updated_by = ?6
+         WHERE profile_id = ?1 RETURNING revision",
+        params![id, name, description, settings, now_ms, by],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO config_profile_revisions (profile_id, revision, settings, description,
+            changed_at, changed_by, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, revision, settings, description, now_ms, by, reason],
+    )?;
+    Ok(revision)
+}
+
+pub fn delete_profile(conn: &PgConn, id: i64) -> PgResult<bool> {
+    conn.execute(
+        "DELETE FROM config_profile_revisions WHERE profile_id = ?1",
+        [id],
+    )?;
+    Ok(conn.execute("DELETE FROM config_profiles WHERE profile_id = ?1", [id])? > 0)
+}
+
+pub fn profile_revisions(conn: &PgConn, id: i64) -> PgResult<Vec<ProfileRevisionRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT revision, settings, description, changed_at, changed_by, reason
+         FROM config_profile_revisions WHERE profile_id = ?1 ORDER BY revision DESC",
+    )?;
+    let rows = stmt.query_map([id], |r| {
+        Ok(ProfileRevisionRow {
+            revision: r.get(0)?,
+            settings: r.get(1)?,
+            description: r.get(2)?,
+            changed_at: r.get(3)?,
+            changed_by: r.get(4)?,
+            reason: r.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+// ---- 指派 ----
+
+const ASSIGNMENT_COLUMNS: &str = "assignment_id, profile_id, selector_kind, selector_value, \
+                                  priority, expires_at, created_at, created_by";
+
+fn assignment_of(r: &Row) -> PgResult<AssignmentRow> {
+    Ok(AssignmentRow {
+        id: r.get(0)?,
+        profile_id: r.get(1)?,
+        selector_kind: r.get(2)?,
+        selector_value: r.get(3)?,
+        priority: r.get(4)?,
+        expires_at: r.get(5)?,
+        created_at: r.get(6)?,
+        created_by: r.get(7)?,
+    })
+}
+
+pub fn list_assignments(conn: &PgConn) -> PgResult<Vec<AssignmentRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ASSIGNMENT_COLUMNS} FROM config_assignments ORDER BY priority, assignment_id"
+    ))?;
+    let rows = stmt.query_map((), assignment_of)?;
+    rows.collect()
+}
+
+pub fn get_assignment(conn: &PgConn, id: i64) -> PgResult<Option<AssignmentRow>> {
+    conn.query_row(
+        &format!("SELECT {ASSIGNMENT_COLUMNS} FROM config_assignments WHERE assignment_id = ?1"),
+        [id],
+        assignment_of,
+    )
+    .optional()
+}
+
+/// 相同的 (selector_kind, selector_value, profile_id) 已存在時不寫入，回傳 `None`
+pub fn insert_assignment(
+    conn: &PgConn,
+    profile_id: i64,
+    selector_kind: &str,
+    selector_value: &str,
+    priority: i64,
+    expires_at: Option<i64>,
+    now_ms: i64,
+    by: &str,
+) -> PgResult<Option<i64>> {
+    conn.query_row(
+        "INSERT INTO config_assignments (profile_id, selector_kind, selector_value, priority,
+            expires_at, created_at, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (selector_kind, selector_value, profile_id) DO NOTHING
+         RETURNING assignment_id",
+        params![
+            profile_id,
+            selector_kind,
+            selector_value,
+            priority,
+            expires_at,
+            now_ms,
+            by
+        ],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+pub fn delete_assignment(conn: &PgConn, id: i64) -> PgResult<bool> {
+    Ok(conn.execute(
+        "DELETE FROM config_assignments WHERE assignment_id = ?1",
+        [id],
+    )? > 0)
+}
+
+pub fn expired_assignments(conn: &PgConn, now_ms: i64) -> PgResult<Vec<AssignmentRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ASSIGNMENT_COLUMNS} FROM config_assignments
+         WHERE expires_at IS NOT NULL AND expires_at <= ?1 ORDER BY assignment_id"
+    ))?;
+    let rows = stmt.query_map([now_ms], assignment_of)?;
+    rows.collect()
+}
+
+// ---- 每台主機的設定 ----
+
+fn parse_tags(text: Option<String>) -> Vec<String> {
+    text.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn target_of(r: &Row) -> PgResult<ConfigTarget> {
+    Ok(ConfigTarget {
+        agent_id: r.get(0)?,
+        host_group: r.get(1)?,
+        tags: parse_tags(r.get(2)?),
+        agent_version: r.get(3)?,
+        install_config: r.get(4)?,
+    })
+}
+
+/// 欄位另取別名：`UNION ALL` 的結果在 [`config_target`] 中當成子查詢再篩選
+const TARGETS: &str = "SELECT h.agent_id AS agent_id, h.host_group AS host_group,
+        coalesce(hc.tags, h.tags) AS tags,
+        coalesce(hc.agent_version, h.agent_version) AS agent_version,
+        coalesce(hc.install_config, h.install_config) AS install_config
+     FROM hosts h LEFT JOIN host_config hc ON hc.agent_id = h.agent_id
+     WHERE h.lifecycle = 'active'
+     UNION ALL
+     SELECT agent_id, NULL::text, tags, agent_version, install_config FROM host_config
+     WHERE agent_id NOT IN (SELECT agent_id FROM hosts)";
+
+pub fn config_targets(conn: &PgConn) -> PgResult<Vec<ConfigTarget>> {
+    let mut stmt = conn.prepare(TARGETS)?;
+    let rows = stmt.query_map((), target_of)?;
+    rows.collect()
+}
+
+pub fn config_target(conn: &PgConn, agent_id: &str) -> PgResult<Option<ConfigTarget>> {
+    conn.query_row(
+        &format!(
+            "SELECT t.agent_id, t.host_group, t.tags, t.agent_version, t.install_config
+             FROM ({TARGETS}) t WHERE t.agent_id = ?1"
+        ),
+        [agent_id],
+        target_of,
+    )
+    .optional()
+}
+
+pub fn desired_all(conn: &PgConn) -> PgResult<Vec<(String, i64, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT agent_id, desired_rev, desired_hash FROM host_config ORDER BY agent_id")?;
+    let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect()
+}
+
+const HOST_CONFIG_COLUMNS: &str = "agent_id, desired_rev, desired_hash, desired, sources, \
+     applied_rev, applied_hash, state, effective, overridden, ignored, errors, code, reported_at, \
+     tags, agent_version, install_config";
+
+fn host_config_of(r: &Row) -> PgResult<HostConfigRow> {
+    Ok(HostConfigRow {
+        agent_id: r.get(0)?,
+        desired_rev: r.get(1)?,
+        desired_hash: r.get(2)?,
+        desired: r.get(3)?,
+        sources: r.get(4)?,
+        applied_rev: r.get(5)?,
+        applied_hash: r.get(6)?,
+        state: r.get(7)?,
+        effective: r.get(8)?,
+        overridden: r.get(9)?,
+        ignored: r.get(10)?,
+        errors: r.get(11)?,
+        code: r.get(12)?,
+        reported_at: r.get(13)?,
+        tags: r.get(14)?,
+        agent_version: r.get(15)?,
+        install_config: r.get(16)?,
+    })
+}
+
+pub fn host_config(conn: &PgConn, agent_id: &str) -> PgResult<Option<HostConfigRow>> {
+    conn.query_row(
+        &format!("SELECT {HOST_CONFIG_COLUMNS} FROM host_config WHERE agent_id = ?1"),
+        [agent_id],
+        host_config_of,
+    )
+    .optional()
+}
+
+pub fn host_configs(conn: &PgConn) -> PgResult<Vec<HostConfigRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {HOST_CONFIG_COLUMNS} FROM host_config ORDER BY agent_id"
+    ))?;
+    let rows = stmt.query_map((), host_config_of)?;
+    rows.collect()
+}
+
+pub fn upsert_desired(conn: &PgConn, rows: &[DesiredUpdate]) -> PgResult<()> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO host_config (agent_id, desired_rev, desired_hash, desired, sources)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (agent_id) DO UPDATE SET
+            desired_rev = excluded.desired_rev, desired_hash = excluded.desired_hash,
+            desired = excluded.desired, sources = excluded.sources",
+    )?;
+    for r in rows {
+        stmt.execute(params![
+            r.agent_id,
+            r.desired_rev,
+            r.desired_hash,
+            r.desired,
+            r.sources
+        ])?;
+    }
+    Ok(())
+}
+
+pub fn upsert_hello_info(
+    conn: &PgConn,
+    agent_id: &str,
+    tags: &str,
+    agent_version: &str,
+    install_config: Option<&str>,
+) -> PgResult<()> {
+    conn.execute(
+        "INSERT INTO host_config (agent_id, tags, agent_version, install_config) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (agent_id) DO UPDATE SET tags = excluded.tags,
+            agent_version = excluded.agent_version, install_config = excluded.install_config",
+        params![agent_id, tags, agent_version, install_config],
+    )?;
+    Ok(())
+}
+
+/// 回傳值（回報之前的 `state` 與 `overridden` 的筆數）先讀出；「是否為晚到的回報」則在 UPDATE 中以該列
+/// 當下的 `applied_rev`／`desired_rev` 判斷（單一敘述，不依賴先前讀到的值），並行的兩個回報不會讓版本倒退
+pub fn record_config_status(conn: &PgConn, r: &ConfigReport) -> PgResult<(Option<String>, usize)> {
+    let before: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT state, overridden FROM host_config WHERE agent_id = ?1",
+            [&r.agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (prev_state, prev_overridden) = before.unwrap_or((None, None));
+    let prev_count = prev_overridden
+        .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
+        .map_or(0, |v| v.len());
+    conn.execute(
+        "INSERT INTO host_config (agent_id) VALUES (?1) ON CONFLICT (agent_id) DO NOTHING",
+        [&r.agent_id],
+    )?;
+    // 比已記錄的舊、又不是目前的期望版本：晚到的回報，不倒退版本（只更新 effective、overridden、
+    // reported_at）。期望設定回到第 0 版（刪除所有指派）時 Pulse 回報的 rev 0 比已記錄的小，但就是目前的
+    // 期望版本，照常記錄。SET 右邊的欄位都是更新前的值
+    const STALE: &str = "?2::bigint < applied_rev AND ?2::bigint <> desired_rev";
+    conn.execute(
+        &format!(
+            "UPDATE host_config SET
+                applied_rev = CASE WHEN {STALE} THEN applied_rev ELSE ?2::bigint END,
+                applied_hash = CASE WHEN {STALE} THEN applied_hash ELSE ?3::text END,
+                state = CASE WHEN {STALE} THEN state ELSE ?4::text END,
+                effective = ?5,
+                overridden = ?6,
+                ignored = CASE WHEN {STALE} THEN ignored ELSE ?7::text END,
+                errors = CASE WHEN {STALE} THEN errors ELSE ?8::text END,
+                code = CASE WHEN {STALE} THEN code ELSE ?9::text END,
+                reported_at = ?10
+             WHERE agent_id = ?1"
+        ),
+        params![
+            r.agent_id,
+            r.rev,
+            r.hash,
+            r.state,
+            r.effective,
+            r.overridden,
+            r.ignored,
+            r.errors,
+            r.code,
+            r.reported_at
+        ],
+    )?;
+    Ok((prev_state, prev_count))
+}
+
+// ---- 版本庫 ----
+
+const RELEASE_COLUMNS: &str = "release_id, version, commit_id, source, sha256sums, signature, \
+     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by";
+
+fn release_of(r: &Row) -> PgResult<ReleaseRow> {
+    Ok(ReleaseRow {
+        id: r.get(0)?,
+        version: r.get(1)?,
+        commit: r.get(2)?,
+        source: r.get(3)?,
+        sha256sums: r.get(4)?,
+        signature: r.get(5)?,
+        signer_fingerprint: r.get(6)?,
+        signer_principal: r.get(7)?,
+        manifest_name: r.get(8)?,
+        manifest: r.get(9)?,
+        imported_at: r.get(10)?,
+        imported_by: r.get(11)?,
+    })
+}
+
+pub fn list_releases(conn: &PgConn) -> PgResult<Vec<ReleaseRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RELEASE_COLUMNS} FROM releases ORDER BY imported_at DESC, release_id DESC"
+    ))?;
+    let rows = stmt.query_map((), release_of)?;
+    rows.collect()
+}
+
+pub fn get_release(conn: &PgConn, version: &str) -> PgResult<Option<ReleaseRow>> {
+    conn.query_row(
+        &format!("SELECT {RELEASE_COLUMNS} FROM releases WHERE product = 'pulse' AND version = ?1"),
+        [version],
+        release_of,
+    )
+    .optional()
+}
+
+pub fn get_release_by_id(conn: &PgConn, id: i64) -> PgResult<Option<ReleaseRow>> {
+    conn.query_row(
+        &format!("SELECT {RELEASE_COLUMNS} FROM releases WHERE release_id = ?1"),
+        [id],
+        release_of,
+    )
+    .optional()
+}
+
+pub fn insert_release(conn: &PgConn, r: &ReleaseRow) -> PgResult<i64> {
+    conn.query_row(
+        "INSERT INTO releases (product, version, commit_id, source, sha256sums, signature,
+            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by)
+         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         RETURNING release_id",
+        params![
+            r.version,
+            r.commit,
+            r.source,
+            r.sha256sums,
+            r.signature,
+            r.signer_fingerprint,
+            r.signer_principal,
+            r.manifest_name,
+            r.manifest,
+            r.imported_at,
+            r.imported_by
+        ],
+        |row| row.get(0),
+    )
+}
+
+pub fn delete_release(conn: &PgConn, id: i64) -> PgResult<bool> {
+    conn.execute("DELETE FROM release_artifacts WHERE release_id = ?1", [id])?;
+    Ok(conn.execute("DELETE FROM releases WHERE release_id = ?1", [id])? > 0)
+}
+
+const ARTIFACT_COLUMNS: &str =
+    "release_id, filename, os, arch, format, sha256, size_bytes, stored, stored_at";
+
+fn artifact_of(r: &Row) -> PgResult<ArtifactRow> {
+    Ok(ArtifactRow {
+        release_id: r.get(0)?,
+        filename: r.get(1)?,
+        os: r.get(2)?,
+        arch: r.get(3)?,
+        format: r.get(4)?,
+        sha256: r.get(5)?,
+        size: r.get(6)?,
+        stored: r.get::<_, i64>(7)? != 0,
+        stored_at: r.get(8)?,
+    })
+}
+
+pub fn release_artifacts(conn: &PgConn, release_id: i64) -> PgResult<Vec<ArtifactRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM release_artifacts WHERE release_id = ?1 ORDER BY filename"
+    ))?;
+    let rows = stmt.query_map([release_id], artifact_of)?;
+    rows.collect()
+}
+
+pub fn all_artifacts(conn: &PgConn) -> PgResult<Vec<ArtifactRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM release_artifacts ORDER BY release_id, filename"
+    ))?;
+    let rows = stmt.query_map((), artifact_of)?;
+    rows.collect()
+}
+
+pub fn upsert_artifact(conn: &PgConn, a: &ArtifactRow) -> PgResult<()> {
+    conn.execute(
+        "INSERT INTO release_artifacts (release_id, filename, os, arch, format, sha256, size_bytes,
+            stored, stored_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT (release_id, filename) DO UPDATE SET
+            size_bytes = excluded.size_bytes, stored = excluded.stored, stored_at = excluded.stored_at",
+        params![
+            a.release_id,
+            a.filename,
+            a.os,
+            a.arch,
+            a.format,
+            a.sha256,
+            a.size,
+            a.stored as i64,
+            a.stored_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn artifact_refs(conn: &PgConn, sha256: &str) -> PgResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM release_artifacts WHERE sha256 = ?1 AND stored = 1",
+        [sha256],
+        |r| r.get(0),
+    )
+}
+
+// ---- 推送 ----
+
+const UPGRADE_HOST_COLUMNS: &str = "host_id, agent_id, hostname, agent_version, os, install_method, \
+     install_upgrade, install_config, host_group, tags, online, lifecycle";
+
+fn upgrade_host_of(r: &Row) -> PgResult<UpgradeHost> {
+    Ok(UpgradeHost {
+        host_id: r.get(0)?,
+        agent_id: r.get(1)?,
+        hostname: r.get(2)?,
+        agent_version: r.get(3)?,
+        os: r.get(4)?,
+        install_method: r.get(5)?,
+        install_upgrade: r.get(6)?,
+        install_config: r.get(7)?,
+        host_group: r.get(8)?,
+        tags: parse_tags(r.get(9)?),
+        online: r.get::<_, i64>(10)? != 0,
+        decommissioned: r.get::<_, String>(11)? != "active",
+    })
+}
+
+pub fn upgrade_hosts(conn: &PgConn) -> PgResult<Vec<UpgradeHost>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {UPGRADE_HOST_COLUMNS} FROM hosts ORDER BY host_id"
+    ))?;
+    let rows = stmt.query_map((), upgrade_host_of)?;
+    rows.collect()
+}
+
+pub fn upgrade_host(conn: &PgConn, agent_id: &str) -> PgResult<Option<UpgradeHost>> {
+    conn.query_row(
+        &format!("SELECT {UPGRADE_HOST_COLUMNS} FROM hosts WHERE agent_id = ?1"),
+        [agent_id],
+        upgrade_host_of,
+    )
+    .optional()
+}
+
+const ROLLOUT_COLUMNS: &str = "r.rollout_id, r.name, r.release_id, r.target_version, r.selector, r.waves, \
+     r.schedule, r.options, r.state, r.current_wave, r.wave_started_at, r.soak_until, \
+     r.awaiting_continue, r.pause_reason, r.cancel_reason, r.created_at, r.created_by, r.started_at, \
+     r.completed_at, r.updated_at, r.pause_cause";
+
+fn rollout_of(r: &Row) -> PgResult<RolloutRow> {
+    Ok(RolloutRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        release_id: r.get(2)?,
+        target_version: r.get(3)?,
+        selector: r.get(4)?,
+        waves: r.get(5)?,
+        schedule: r.get(6)?,
+        options: r.get(7)?,
+        state: r.get(8)?,
+        current_wave: r.get(9)?,
+        wave_started_at: r.get(10)?,
+        soak_until: r.get(11)?,
+        awaiting_continue: r.get::<_, i64>(12)? != 0,
+        pause_reason: r.get(13)?,
+        pause_cause: r.get(20)?,
+        cancel_reason: r.get(14)?,
+        created_at: r.get(15)?,
+        created_by: r.get(16)?,
+        started_at: r.get(17)?,
+        completed_at: r.get(18)?,
+        updated_at: r.get(19)?,
+    })
+}
+
+pub fn list_rollouts(conn: &PgConn, state: Option<&str>) -> PgResult<Vec<RolloutRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ROLLOUT_COLUMNS} FROM rollouts r
+         WHERE ?1::text IS NULL OR r.state = ?1::text ORDER BY r.created_at DESC, r.rollout_id DESC"
+    ))?;
+    let rows = stmt.query_map([state], rollout_of)?;
+    rows.collect()
+}
+
+pub fn get_rollout(conn: &PgConn, id: &str) -> PgResult<Option<RolloutRow>> {
+    conn.query_row(
+        &format!("SELECT {ROLLOUT_COLUMNS} FROM rollouts r WHERE r.rollout_id = ?1"),
+        [id],
+        rollout_of,
+    )
+    .optional()
+}
+
+pub fn count_rollouts_with_prefix(conn: &PgConn, prefix: &str) -> PgResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM rollouts WHERE substr(rollout_id, 1, length(?1::text)) = ?1::text",
+        [prefix],
+        |r| r.get(0),
+    )
+}
+
+pub fn insert_rollout(conn: &PgConn, r: &RolloutRow) -> PgResult<()> {
+    conn.execute(
+        "INSERT INTO rollouts (rollout_id, name, release_id, selector, waves, schedule, options, state,
+            current_wave, wave_started_at, soak_until, awaiting_continue, pause_reason, cancel_reason,
+            created_at, created_by, started_at, completed_at, updated_at, target_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        params![
+            r.id,
+            r.name,
+            r.release_id,
+            r.selector,
+            r.waves,
+            r.schedule,
+            r.options,
+            r.state,
+            r.current_wave,
+            r.wave_started_at,
+            r.soak_until,
+            r.awaiting_continue as i64,
+            r.pause_reason,
+            r.cancel_reason,
+            r.created_at,
+            r.created_by,
+            r.started_at,
+            r.completed_at,
+            r.updated_at,
+            r.target_version
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update_rollout_spec(
+    conn: &PgConn,
+    id: &str,
+    name: &str,
+    release_id: i64,
+    selector: &str,
+    waves: &str,
+    options: &str,
+    now_ms: i64,
+) -> PgResult<bool> {
+    Ok(conn.execute(
+        "UPDATE rollouts SET name = ?2, release_id = ?3, selector = ?4, waves = ?5, options = ?6,
+            updated_at = ?7,
+            target_version = coalesce((SELECT version FROM releases WHERE release_id = ?3), target_version)
+         WHERE rollout_id = ?1 AND state = 'draft'",
+        params![id, name, release_id, selector, waves, options, now_ms],
+    )? > 0)
+}
+
+pub fn update_rollout_state(conn: &PgConn, r: &RolloutRow) -> PgResult<()> {
+    conn.execute(
+        "UPDATE rollouts SET state = ?2, current_wave = ?3, wave_started_at = ?4, soak_until = ?5,
+            awaiting_continue = ?6, pause_reason = ?7, cancel_reason = ?8, started_at = ?9,
+            pause_cause = ?12,
+            completed_at = ?10, updated_at = ?11
+         WHERE rollout_id = ?1",
+        params![
+            r.id,
+            r.state,
+            r.current_wave,
+            r.wave_started_at,
+            r.soak_until,
+            r.awaiting_continue as i64,
+            r.pause_reason,
+            r.cancel_reason,
+            r.started_at,
+            r.completed_at,
+            r.updated_at,
+            r.pause_cause
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_old_rollouts(conn: &PgConn, before_ms: i64) -> PgResult<i64> {
+    let ids = format!(
+        "SELECT rollout_id FROM rollouts WHERE state IN {ROLLOUT_ENDED}
+         AND coalesce(completed_at, updated_at) < ?1"
+    );
+    conn.execute(
+        &format!("DELETE FROM rollout_hosts WHERE rollout_id IN ({ids})"),
+        [before_ms],
+    )?;
+    Ok(conn.execute(
+        &format!("DELETE FROM rollouts WHERE rollout_id IN ({ids})"),
+        [before_ms],
+    )? as i64)
+}
+
+pub fn insert_rollout_hosts(
+    conn: &PgConn,
+    rollout_id: &str,
+    hosts: &[NewRolloutHost],
+    now_ms: i64,
+) -> PgResult<()> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO rollout_hosts (rollout_id, host_id, upgrade_id, wave, ordinal, state, reason,
+            from_version, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for h in hosts {
+        stmt.execute(params![
+            rollout_id,
+            h.host_id,
+            h.upgrade_id,
+            h.wave,
+            h.ordinal,
+            h.state,
+            h.reason,
+            h.from_version,
+            now_ms
+        ])?;
+    }
+    Ok(())
+}
+
+const ROLLOUT_HOST_COLUMNS: &str = "rh.rollout_id, rh.host_id, coalesce(h.agent_id, ''), \
+     coalesce(h.hostname, ''), rh.upgrade_id, rh.wave, rh.ordinal, rh.state, rh.reason, \
+     rh.from_version, rh.to_version, rh.attempts, rh.bytes_done, rh.bytes_total, rh.code, rh.detail, \
+     rh.offered_at, rh.applying_at, rh.finished_at, rh.updated_at, rh.acknowledged_at, \
+     rh.acknowledged_by";
+
+const ROLLOUT_HOST_FROM: &str = "rollout_hosts rh LEFT JOIN hosts h ON h.host_id = rh.host_id";
+
+fn rollout_host_of(r: &Row) -> PgResult<RolloutHostRow> {
+    Ok(RolloutHostRow {
+        rollout_id: r.get(0)?,
+        host_id: r.get(1)?,
+        agent_id: r.get(2)?,
+        hostname: r.get(3)?,
+        upgrade_id: r.get(4)?,
+        wave: r.get(5)?,
+        ordinal: r.get(6)?,
+        state: r.get(7)?,
+        reason: r.get(8)?,
+        from_version: r.get(9)?,
+        to_version: r.get(10)?,
+        attempts: r.get(11)?,
+        bytes_done: r.get(12)?,
+        bytes_total: r.get(13)?,
+        code: r.get(14)?,
+        detail: r.get(15)?,
+        offered_at: r.get(16)?,
+        applying_at: r.get(17)?,
+        finished_at: r.get(18)?,
+        updated_at: r.get(19)?,
+        acknowledged_at: r.get(20)?,
+        acknowledged_by: r.get(21)?,
+    })
+}
+
+pub fn rollout_hosts(conn: &PgConn, rollout_id: &str) -> PgResult<Vec<RolloutHostRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ROLLOUT_HOST_COLUMNS} FROM {ROLLOUT_HOST_FROM}
+         WHERE rh.rollout_id = ?1 ORDER BY rh.wave, rh.ordinal"
+    ))?;
+    let rows = stmt.query_map([rollout_id], rollout_host_of)?;
+    rows.collect()
+}
+
+pub fn rollout_host_by_upgrade_id(
+    conn: &PgConn,
+    upgrade_id: &str,
+) -> PgResult<Option<RolloutHostRow>> {
+    conn.query_row(
+        &format!("SELECT {ROLLOUT_HOST_COLUMNS} FROM {ROLLOUT_HOST_FROM} WHERE rh.upgrade_id = ?1"),
+        [upgrade_id],
+        rollout_host_of,
+    )
+    .optional()
+}
+
+pub fn rollout_host(
+    conn: &PgConn,
+    rollout_id: &str,
+    agent_id: &str,
+) -> PgResult<Option<RolloutHostRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {ROLLOUT_HOST_COLUMNS} FROM {ROLLOUT_HOST_FROM}
+             WHERE rh.rollout_id = ?1 AND h.agent_id = ?2"
+        ),
+        [rollout_id, agent_id],
+        rollout_host_of,
+    )
+    .optional()
+}
+
+pub fn host_upgrades(conn: &PgConn, agent_id: &str, limit: i64) -> PgResult<Vec<RolloutHostRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ROLLOUT_HOST_COLUMNS} FROM {ROLLOUT_HOST_FROM}
+         WHERE h.agent_id = ?1 ORDER BY rh.updated_at DESC, rh.rollout_id DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![agent_id, limit], rollout_host_of)?;
+    rows.collect()
+}
+
+pub fn update_rollout_host(
+    conn: &PgConn,
+    rollout_id: &str,
+    host_id: i64,
+    t: &HostTransition,
+    now_ms: i64,
+) -> PgResult<()> {
+    // 只更新有給的欄位：以 coalesce／CASE 組出一個 UPDATE（欄位數固定，可以快取 statement）。
+    // 旗標是 0/1 的整數（`<> 0`）；參數一律明確轉型，PostgreSQL 才能決定型別
+    let flag = |b: bool| b as i64;
+    let mut stmt = conn.prepare(
+        "UPDATE rollout_hosts SET
+            state = coalesce(?3::text, state),
+            reason = CASE WHEN ?4::bigint <> 0 THEN ?5::text ELSE reason END,
+            upgrade_id = coalesce(?6::text, upgrade_id),
+            from_version = coalesce(?7::text, from_version),
+            to_version = coalesce(?8::text, to_version),
+            attempts = attempts + ?9::bigint,
+            bytes_done = coalesce(?10::bigint, bytes_done),
+            bytes_total = coalesce(?11::bigint, bytes_total),
+            code = CASE WHEN ?12::bigint <> 0 THEN ?13::text ELSE code END,
+            detail = CASE WHEN ?14::bigint <> 0 THEN ?15::text ELSE detail END,
+            offered_at = CASE WHEN ?16::bigint <> 0 THEN ?17::bigint ELSE offered_at END,
+            applying_at = CASE WHEN ?18::bigint <> 0 THEN ?19::bigint ELSE applying_at END,
+            finished_at = CASE WHEN ?20::bigint <> 0 THEN ?21::bigint ELSE finished_at END,
+            acknowledged_at = CASE WHEN ?22::bigint <> 0 THEN ?23::bigint ELSE acknowledged_at END,
+            acknowledged_by = CASE WHEN ?22::bigint <> 0 THEN ?24::text ELSE acknowledged_by END,
+            updated_at = ?25
+         WHERE rollout_id = ?1 AND host_id = ?2",
+    )?;
+    let (ack_at, ack_by) = match &t.acknowledged {
+        Some((at, by)) => (Some(*at), Some(by.as_str())),
+        None => (None, None),
+    };
+    stmt.execute(params![
+        rollout_id,
+        host_id,
+        t.state,
+        flag(t.reason.is_some()),
+        t.reason.clone().flatten(),
+        t.upgrade_id,
+        t.from_version,
+        t.to_version,
+        flag(t.bump_attempts),
+        t.bytes_done,
+        t.bytes_total,
+        flag(t.code.is_some()),
+        t.code.clone().flatten(),
+        flag(t.detail.is_some()),
+        t.detail.clone().flatten(),
+        flag(t.offered_at.is_some()),
+        t.offered_at.flatten(),
+        flag(t.applying_at.is_some()),
+        t.applying_at.flatten(),
+        flag(t.finished_at.is_some()),
+        t.finished_at.flatten(),
+        flag(t.acknowledged.is_some()),
+        ack_at,
+        ack_by,
+        now_ms
+    ])?;
+    Ok(())
+}
+
+pub fn hosts_in_active_rollouts(conn: &PgConn) -> PgResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT h.agent_id, rh.rollout_id FROM rollout_hosts rh
+         JOIN rollouts r ON r.rollout_id = rh.rollout_id
+         JOIN hosts h ON h.host_id = rh.host_id
+         WHERE r.state NOT IN {ROLLOUT_ENDED} AND r.state <> 'draft'
+           AND rh.state NOT IN ('skipped', 'cancelled') ORDER BY rh.rollout_id, rh.host_id"
+    ))?;
+    let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+pub fn active_offers(conn: &PgConn) -> PgResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, rh.upgrade_id FROM rollout_hosts rh
+         JOIN rollouts r ON r.rollout_id = rh.rollout_id
+         JOIN hosts h ON h.host_id = rh.host_id
+         WHERE r.state = 'running' AND rh.state IN ('offered', 'accepted', 'staged') ORDER BY rh.rollout_id, rh.host_id",
+    )?;
+    let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+pub fn unacknowledged_rollback_failures(conn: &PgConn) -> PgResult<Vec<RollbackFailure>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, h.hostname, rh.rollout_id, rh.detail FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL ORDER BY rh.rollout_id, rh.host_id",
+    )?;
+    let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
+}
+
+pub fn rollouts_using_release(conn: &PgConn, release_id: i64) -> PgResult<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM rollouts WHERE release_id = ?1 AND state NOT IN {ROLLOUT_ENDED}"
+        ),
+        [release_id],
+        |r| r.get(0),
+    )
+}

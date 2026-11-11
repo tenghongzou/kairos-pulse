@@ -23,6 +23,7 @@ mod integration_tests;
 mod keys_backup;
 mod logger;
 mod metrics;
+mod migrate_cli;
 mod monitor;
 mod per_ip;
 mod pki;
@@ -452,6 +453,23 @@ fn listen_error(e: Error) -> Error {
     }
 }
 
+/// 儲存啟動失敗：PostgreSQL 無法連線或不符合要求（`KRS-E4401`、`E4402`、`E4404`、`E4405`；
+/// `kairos/HA.md` 第 19 節）標記為設定錯誤（[`EXIT_CONFIG`]）；其他原因不標記
+fn storage_start_error(e: Error) -> Error {
+    let text = e.to_string();
+    let pg = [
+        store::postgres::pool::CODE_PG_UNREACHABLE,
+        store::postgres::pool::CODE_PG_REQUIREMENTS,
+        store::postgres::pool::CODE_PG_SCHEMA_NEWER,
+        store::postgres::CODE_MIGRATE_FAILED,
+    ];
+    if pg.iter().any(|code| text.contains(code)) {
+        config_error(e)
+    } else {
+        e
+    }
+}
+
 /// 錯誤上標記的結束代碼（未標記時為 `None`）
 fn classified_code(e: &Error) -> Option<u8> {
     e.get_ref()
@@ -761,7 +779,7 @@ async fn run(
 
     // 載入 TLS 設定；設定 auth.client_ca 時啟用 mTLS。先取指紋再建立，之間的變更會在下一次重載偵測到。
     // Kairos 簽發 CA 的信任錨與 CRL（kairos/PKI.md 第 2、10 節）：SQLite 且啟用 mTLS 時才可能存在
-    let pki_files = (config.storage.backend == StorageBackend::Sqlite
+    let pki_files = (config.storage.backend.is_database()
         && config.auth.client_ca_path().is_some())
     .then(|| {
         let data_dir = Path::new(&config.storage.data_dir);
@@ -837,7 +855,9 @@ async fn run(
         restored,
         assets,
         purger,
-    } = store::start(&config, &paths.data_dir, chrono::Utc::now).await?;
+    } = store::start(&config, &paths.data_dir, chrono::Utc::now)
+        .await
+        .map_err(storage_start_error)?;
     // 個資政策（[privacy]，kairos/PRIVACY.md）：要求假名化時金鑰檔一定要可用，否則不啟動
     let privacy = Arc::new(
         privacy::PrivacyPolicy::for_service(config.privacy, &paths.data_dir).map_err(|e| {
@@ -981,7 +1001,7 @@ async fn run(
         );
     }
     // 稽核雜湊鏈的 HMAC 金鑰（data/audit-hmac.key）：只由服務建立，之後的稽核紀錄都帶 HMAC
-    if config.storage.backend == StorageBackend::Sqlite
+    if config.storage.backend.is_database()
         && let Err(e) = audit::ensure_key(&paths.data_dir)
     {
         error!(
@@ -992,7 +1012,7 @@ async fn run(
     }
     let enroll = match config.storage.backend {
         StorageBackend::Jsonl => None,
-        StorageBackend::Sqlite => {
+        StorageBackend::Sqlite | StorageBackend::Postgres => {
             let mut other_listens = vec![
                 listener
                     .local_addr()
@@ -1035,7 +1055,7 @@ async fn run(
     // 遠端管理（集中設定、Pulse 遠端升級；crates/kairos-proto/REMOTE.md）：需要 SQLite
     let remote = match config.storage.backend {
         StorageBackend::Jsonl => None,
-        StorageBackend::Sqlite => {
+        StorageBackend::Sqlite | StorageBackend::Postgres => {
             match remote::RemoteService::open(remote::StartParams {
                 settings: config.remote.clone(),
                 data_dir: paths.data_dir.clone(),
@@ -1114,7 +1134,7 @@ async fn run(
             );
             None
         }
-        (true, StorageBackend::Sqlite) => {
+        (true, StorageBackend::Sqlite | StorageBackend::Postgres) => {
             match alerts::AlertService::start(alerts::StartParams {
                 config: Arc::new(config.clone()),
                 data_dir: paths.data_dir.clone(),
@@ -1151,7 +1171,7 @@ async fn run(
             tls: tls_state.clone(),
             enroll: enroll_service.clone(),
             shutdown: shutdown.clone(),
-            db_path: (config.storage.backend == StorageBackend::Sqlite)
+            db_path: (config.storage.backend.is_database())
                 .then(|| store::sqlite::SqliteOptions::from_config(&config, &paths.data_dir).path),
             alerts: alert_service.clone(),
         })
@@ -1209,7 +1229,7 @@ async fn run(
             );
             None
         }
-        (true, StorageBackend::Sqlite) => {
+        (true, StorageBackend::Sqlite | StorageBackend::Postgres) => {
             let agent_addr = listener
                 .local_addr()
                 .map_err(|e| Error::new(e.kind(), format!("無法取得監聽位址: {e}")))?;

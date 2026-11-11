@@ -29,6 +29,11 @@ log = { version = "0.4", features = ["kv"] }
 # report 與主機清冊的 SQLite 儲存（A1、A6、A9）。bundled：編譯內附的 SQLite（public domain），
 # 不依賴系統的 libsqlite3，musl 靜態連結與 Windows 都不需額外安裝
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# PostgreSQL 後端（kairos/HA.md 第 4.2 節、第 21 節 #4）：同步 API 的驅動（內部是 tokio-postgres），TLS 用
+# rustls＋ring（與其他連接埠相同的加密後端；不啟用 aws-lc-rs，不引入 openssl、native-tls）。
+# 連線池自行實作（store/postgres/pool.rs），不引入 r2d2
+postgres = "0.19"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 # 註冊通道（8444）的簽發器：依範本簽發用戶端憑證、產生 CRL、產生簽發 CA 的金鑰與 CSR
 # （crates/kairos-proto/ENROLL.md 第 15.3 節選定；以 ring 為後端，不引入 aws-lc-rs）
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }

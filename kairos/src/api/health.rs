@@ -116,6 +116,24 @@ pub(crate) fn read_db_stats(conn: &dyn Store) -> StoreResult<DbStats> {
     })
 }
 
+/// PostgreSQL 後端的狀態（`storage.backend = "postgres"` 時；否則為 `null`）：伺服器版本、同步複寫、時差
+/// 與連線池。伺服器的狀態由健康檢查（`/readyz`、`/metrics`）定期更新，尚未讀到時相關欄位為 `null`
+fn postgres_values() -> serde_json::Value {
+    let Some(pool) = crate::store::postgres::pool::active() else {
+        return serde_json::Value::Null;
+    };
+    let s = pool.stats();
+    let server = pool.last_server();
+    json!({
+        "target": pool.settings().display_target(),
+        "sslmode": pool.settings().effective_sslmode().as_str(),
+        "server_version": server.as_ref().map(|i| i.version.clone()),
+        "synchronous_replication": server.as_ref().map(|i| i.synchronous_replication()),
+        "clock_skew_ms": server.as_ref().map(|i| i.clock_skew_ms),
+        "pool": { "size": s.size, "idle": s.idle, "busy": s.busy, "exhausted": s.exhausted },
+    })
+}
+
 /// 以 GB（10^9）表示，一位小數
 pub fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
@@ -190,6 +208,8 @@ fn database(ctx: &ApiContext, db: &DbStats, live: &[LiveAgent], now_ms: i64) -> 
         status,
         summary,
         json!({
+            "backend": ctx.config.storage.backend.as_str(),
+            "postgres": postgres_values(),
             "used_bytes": db.used_bytes,
             "file_bytes": file,
             "wal_bytes": wal,

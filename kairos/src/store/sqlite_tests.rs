@@ -1980,3 +1980,45 @@ fn assets_are_merged_and_changes_recorded() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// 兩個後端共用的測試（`store/backend_tests.rs`）需要的內部狀態
+impl crate::store::backend_tests::TestStore for SqliteStore {
+    fn set_fail(&mut self, f: FailPoint) {
+        self.fail_next = Some(f);
+    }
+    fn rollup_len(&self) -> usize {
+        self.rollup.len()
+    }
+    fn rollup_clear(&mut self) {
+        self.rollup.clear();
+    }
+    fn rollup_take_count(&mut self) -> i64 {
+        self.rollup
+            .take_ready(i64::MAX, usize::MAX)
+            .iter()
+            .map(|r| r.agg.count as i64)
+            .sum()
+    }
+    fn defer_capacity(&mut self) {
+        self.capacity.next_check = Some(Instant::now() + Duration::from_secs(3600));
+    }
+    fn reset_capacity(&mut self) {
+        self.capacity = Capacity::default();
+    }
+    fn reset_retention(&mut self) {
+        self.next_retention = None;
+    }
+    fn set_max_total_bytes(&mut self, n: u64) {
+        self.opts.max_total_bytes = n;
+    }
+    fn set_max_hosts(&mut self, n: usize) {
+        self.opts.max_hosts = n;
+    }
+    fn used(&mut self) -> u64 {
+        self.ensure_ready().unwrap();
+        self.used_bytes().unwrap()
+    }
+    fn sync_now(&mut self, snapshot: &RegistrySnapshot) -> usize {
+        self.sync(snapshot).unwrap()
+    }
+}

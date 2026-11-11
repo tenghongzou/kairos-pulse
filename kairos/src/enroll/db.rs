@@ -95,6 +95,11 @@ impl EnrollDb {
             .as_mut()
             .ok_or_else(|| DbError("資料庫未開啟".into()))?;
         let result = f(conn.as_ref());
+        if crate::store::pooled() {
+            // PostgreSQL：連線用完就歸還連線池；沒有全域寫入鎖，不需要間隔
+            *guard = None;
+            return result;
+        }
         if let Err(e) = &result
             && e.0.starts_with("sqlite:")
         {
@@ -134,6 +139,10 @@ impl EnrollDb {
             }
         };
         let result = f(reader.conn.as_ref());
+        if crate::store::pooled() {
+            // PostgreSQL：drop 即歸還連線池
+            return result;
+        }
         let mut idle = self.readers.lock().unwrap_or_else(|e| e.into_inner());
         if idle.len() < MAX_READERS {
             idle.push(reader);

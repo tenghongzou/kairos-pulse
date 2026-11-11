@@ -122,7 +122,7 @@ fn purge_cmd(cmd: &Cmd, env: &mut Env<'_>) -> Result<Output, Failure> {
             ..Default::default()
         });
     }
-    if !dir.join(DB_FILE).is_file() {
+    if !crate::store::database_exists(&dir.join(DB_FILE)).unwrap_or(true) {
         return Err(not_found(&agent_id));
     }
     if let Some(f) = crate::token_cli::refuse_root(&dir) {

@@ -12,7 +12,7 @@ use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::api::tokens::{self, NewToken, Revoked, TokenGrant, TokenRow, TokenState};
-use crate::config::{AppConfig, StorageBackend, take_config_arg};
+use crate::config::{AppConfig, take_config_arg};
 use crate::hosts_cli::{ascii_json, display_width, parse_duration, use_unicode};
 use crate::rbac::{LegacyScope, Role};
 use crate::storage::fmt_time;
@@ -436,7 +436,7 @@ pub(crate) fn open(config_path: Option<&Path>, create: bool) -> Result<Option<Db
             EXIT_CONFIG,
         )
     })?;
-    if config.storage.backend != StorageBackend::Sqlite {
+    if !config.storage.backend.is_database() {
         return Err(Failure::new(
             "這個命令需要 SQLite",
             "storage.backend 為 \"jsonl\"：主控台 API、token、註冊與 PKI 的資料存在 SQLite 資料庫中。",
@@ -445,7 +445,8 @@ pub(crate) fn open(config_path: Option<&Path>, create: bool) -> Result<Option<Db
         ));
     }
     let data_dir = PathBuf::from(&config.storage.data_dir);
-    if !create && !data_dir.join(DB_FILE).is_file() {
+    // 連不上 PostgreSQL 時不在這裡回報：交給下面的 open_admin 給出完整的錯誤
+    if !create && !crate::store::database_exists(&data_dir.join(DB_FILE)).unwrap_or(true) {
         return Ok(None);
     }
     if let Some(f) = refuse_root(&data_dir) {

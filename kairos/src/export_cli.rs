@@ -40,13 +40,14 @@ pub const REPORTS_USAGE: &str = "kairos reports export — 以 JSON Lines 匯出
 結束代碼：0 正常、1 無法讀取資料庫、2 用法錯誤、3 設定錯誤、10 權限不足";
 
 /// `kairos db --help`
-pub const DB_USAGE: &str = "kairos db backup|restore-keys — 線上備份 SQLite 資料庫；金鑰檔的加密備份與還原
+pub const DB_USAGE: &str = "kairos db backup|restore-keys|migrate — 線上備份 SQLite 資料庫；金鑰檔的加密備份與還原；SQLite 與 PostgreSQL 互搬
 
 用法：
+  kairos db migrate --to postgres|sqlite:<檔案> [選項]（詳見 kairos db migrate --help）
   kairos db backup <備份檔路徑> [--include-keys (--password-file <檔案> | --password-stdin)] [--config <path>]
   kairos db restore-keys <金鑰備份檔> (--password-file <檔案> | --password-stdin) [--overwrite] [--config <path>]
 
-backup：以 SQLite 的 VACUUM INTO 寫出一致的快照（不含空閒頁）。備份檔已存在時不覆寫；Unix 上權限為 0640。
+backup：以 SQLite 的 VACUUM INTO 寫出一致的快照（不含空閒頁）。storage.backend = \"postgres\" 時不支援（KRS-E4406，改用 pg_dump）。備份檔已存在時不覆寫；Unix 上權限為 0640。
   資料庫備份不含資料目錄的金鑰檔（alerts-secrets.key、console.key、audit-hmac.key）。
   --include-keys      另把存在的金鑰檔以備份密碼加密（Argon2id＋AES-256-GCM），寫成 <備份檔路徑>.keys（0600）
   --password-file     從檔案讀取備份密碼（第一行；至少 12 個字元）
@@ -87,19 +88,29 @@ pub enum DbCommand {
         password: PasswordSource,
         overwrite: bool,
     },
+    /// `kairos db migrate`：SQLite 與 PostgreSQL 互搬（[`crate::migrate_cli`]）
+    Migrate(crate::migrate_cli::MigrateArgs),
+    /// `kairos db migrate --help`
+    MigrateHelp,
 }
 
 /// 解析 `kairos db` 之後的參數
 pub fn parse_db_args(args: impl Iterator<Item = OsString>) -> Result<DbCommand, String> {
     let mut args = args.peekable();
     let restore = match args.next() {
-        None => return Err("kairos db 需要子命令（backup、restore-keys）".to_string()),
+        None => return Err("kairos db 需要子命令（backup、restore-keys、migrate）".to_string()),
         Some(a) if a == "-h" || a == "--help" => return Ok(DbCommand::Help),
         Some(a) if a == "backup" => false,
         Some(a) if a == "restore-keys" => true,
+        Some(a) if a == "migrate" => {
+            return Ok(match crate::migrate_cli::parse_args(args)? {
+                Some(m) => DbCommand::Migrate(m),
+                None => DbCommand::MigrateHelp,
+            });
+        }
         Some(a) => {
             return Err(format!(
-                "無法辨識的子命令: {}（backup、restore-keys）",
+                "無法辨識的子命令: {}（backup、restore-keys、migrate）",
                 a.to_string_lossy()
             ));
         }
@@ -314,6 +325,11 @@ pub fn run_db(cmd: DbCommand) -> u8 {
             println!("{DB_USAGE}");
             return 0;
         }
+        DbCommand::MigrateHelp => {
+            println!("{}", crate::migrate_cli::MIGRATE_USAGE);
+            return 0;
+        }
+        DbCommand::Migrate(args) => return crate::migrate_cli::run(args),
         DbCommand::Backup {
             config_path,
             dest,
@@ -355,6 +371,24 @@ pub fn run_db(cmd: DbCommand) -> u8 {
     };
     let code = "KRS-E4301";
     let title = "無法產生備份檔";
+    // PostgreSQL 後端沒有資料庫檔可以備份（kairos/HA.md 第 16.3 節）：明確拒絕，不產生任何檔案
+    if let Ok(config) = crate::config::AppConfig::load(config_path.as_deref())
+        && config.storage.backend == crate::config::StorageBackend::Postgres
+    {
+        let e = CliError {
+            code: crate::store::postgres::CODE_PG_UNSUPPORTED,
+            title: "kairos db backup 不支援 PostgreSQL 後端".to_string(),
+            cause: "storage.backend 為 \"postgres\"：資料在外部的 PostgreSQL 中，沒有可以用 VACUUM INTO 備份的資料庫檔。".to_string(),
+            fix: vec![
+                "以 PostgreSQL 的工具備份：pg_dump（邏輯備份）、pgBackRest 或 pg_basebackup 加 WAL 歸檔（實體備份與 PITR）。".to_string(),
+                "需要可攜的 SQLite 快照時：停止所有 Kairos 節點後執行 kairos db migrate --to sqlite:<檔案>。".to_string(),
+                "資料目錄的金鑰檔不在資料庫中，仍需另外備份（直接複製 alerts-secrets.key、console.key、audit-hmac.key，權限 0600）。".to_string(),
+            ],
+            exit: EXIT_GENERAL,
+        };
+        eprint!("{}", e.render_human(unicode));
+        return e.exit;
+    }
     // 金鑰備份先做（密碼不符合要求、金鑰檔無法讀取時不留下資料庫備份）
     let keys_done = match &keys {
         Some(src) => match backup_keys(config_path.as_deref(), &dest, src) {

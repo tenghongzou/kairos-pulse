@@ -62,6 +62,10 @@ impl ReadPool {
     }
 
     fn put_back(&self, reader: Reader) {
+        if crate::store::pooled() {
+            // PostgreSQL：drop 即歸還連線池
+            return;
+        }
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         if idle.len() < MAX_READERS {
             idle.push(reader);
@@ -152,13 +156,12 @@ impl WriteConn {
                 );
             }
             let conn = guard.as_ref().ok_or("資料庫未開啟")?;
-            match f(conn.as_ref()) {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    *guard = None;
-                    Err(e.to_string())
-                }
+            let result = f(conn.as_ref());
+            if result.is_err() || crate::store::pooled() {
+                // 失敗時關閉連線；PostgreSQL 的連線用完就歸還連線池
+                *guard = None;
             }
+            result.map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())?

@@ -685,6 +685,47 @@ pub async fn render_with(ctx: &Arc<ObsContext>, db: Option<&DbSnapshot>) -> Stri
             "WAL 檔的大小",
             d.wal_bytes as f64,
         );
+        if let Some(pool) = crate::store::postgres::pool::active() {
+            let s = pool.stats();
+            e.gauge_by(
+                "kairos_db_pool_connections",
+                "PostgreSQL 連線池的連線數（idle 閒置、busy 使用中）",
+                "state",
+                &[("idle", s.idle as f64), ("busy", s.busy as f64)],
+            );
+            e.gauge(
+                "kairos_db_pool_size",
+                "PostgreSQL 連線池的上限（storage.postgres.pool_size）",
+                s.size as f64,
+            );
+            e.counter_by(
+                "kairos_db_pool_errors_total",
+                "PostgreSQL 連線池的錯誤（connect 建立連線失敗、exhausted 等不到連線）",
+                "kind",
+                &[("connect", s.connect_errors), ("exhausted", s.exhausted)],
+            );
+            e.counter_by(
+                "kairos_db_transaction_retries_total",
+                "因死結（40P01）或序列化失敗（40001）自動重試的交易數",
+                "reason",
+                &[
+                    ("40P01", s.retries_deadlock),
+                    ("40001", s.retries_serialization),
+                ],
+            );
+            if let Some(server) = pool.last_server() {
+                e.gauge(
+                    "kairos_db_clock_skew_seconds",
+                    "這個節點的時鐘減資料庫的時鐘（秒；超過 2 秒時 KRS-W8305）",
+                    server.clock_skew_ms as f64 / 1000.0,
+                );
+                e.gauge(
+                    "kairos_db_synchronous_replication",
+                    "PostgreSQL 是否有同步複寫（1 是；0 時 KRS-W4403）",
+                    b(server.synchronous_replication()),
+                );
+            }
+        }
         e.gauge(
             "kairos_database_max_bytes",
             "總容量上限（storage.max_total_bytes；0 不限制）",

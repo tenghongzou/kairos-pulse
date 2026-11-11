@@ -18,6 +18,8 @@ pub mod db;
 pub mod derive;
 pub mod hosts;
 pub mod import;
+pub mod migrate;
+pub mod postgres;
 pub mod purge;
 pub mod rollup;
 pub mod sqlite;
@@ -44,13 +46,22 @@ use crate::throttle::{Category, LogThrottle};
 use crate::throttled;
 
 /// 開啟既有資料庫的唯讀連線（不建立檔案、不升級 schema；Kairos 執行中也可以開啟）。CLI、主控台與註冊服務
-/// 的唯讀查詢使用；目前一律是 SQLite（[`sqlite::open_read_only`]）
+/// 的唯讀查詢使用。`storage.backend = "postgres"` 時（[`postgres::pool::active`]）從連線池取出一條唯讀連線，
+/// `path` 不使用；否則是 SQLite（[`sqlite::open_read_only`]）。以下各函式相同
 pub fn open_read(path: &Path) -> Result<db::DbHandle, Error> {
+    if let Some(pool) = postgres::pool::active() {
+        return Ok(Box::new(postgres::open_read(&pool)?));
+    }
     Ok(Box::new(sqlite::open_read_only(path)?))
 }
 
 /// 診斷包的唯讀連線（[`sqlite::open_for_diag`]）
 pub fn open_for_diag(path: &Path) -> Result<db::DbHandle, String> {
+    if let Some(pool) = postgres::pool::active() {
+        return Ok(Box::new(
+            postgres::open_read(&pool).map_err(|e| e.to_string())?,
+        ));
+    }
     Ok(Box::new(sqlite::open_for_diag(path)?))
 }
 
@@ -59,29 +70,77 @@ pub fn open_for_probe(
     path: &Path,
     busy: Duration,
 ) -> Result<(db::DbHandle, Result<(), String>), String> {
+    if let Some(pool) = postgres::pool::active() {
+        let conn = postgres::open_write(&pool, busy).map_err(|e| e.to_string())?;
+        let writable = postgres::probe_writable(&conn);
+        postgres::refresh_server(&conn);
+        return Ok((Box::new(conn), writable));
+    }
     let (conn, writable) = sqlite::open_for_probe(path, busy)?;
     Ok((Box::new(conn), writable))
 }
 
 /// 主控台 API 唯讀連線池的連線：[`open_read`] 再設定為只讀（`query_only`）並加大快取
 pub fn open_console_read(path: &Path) -> Result<db::DbHandle, Error> {
+    if let Some(pool) = postgres::pool::active() {
+        return Ok(Box::new(postgres::open_read(&pool)?));
+    }
     Ok(Box::new(sqlite::open_console_reader(path)?))
 }
 
 /// Kairos 行程內開啟既有資料庫的讀寫連線（主控台、註冊服務、告警的寫入；不以 `std::fs` 開關資料庫檔，
 /// 見 [`sqlite::open_existing_read_write`]）
 pub fn open_write(path: &Path, busy: Duration) -> Result<db::DbHandle, Error> {
+    if let Some(pool) = postgres::pool::active() {
+        return Ok(Box::new(postgres::open_write(&pool, busy)?));
+    }
     Ok(Box::new(sqlite::open_existing_read_write(path, busy)?))
 }
 
 /// CLI 的讀寫連線（必要時建立資料庫並升級 schema；[`sqlite::open_admin`]）
 pub fn open_admin(opts: &sqlite::SqliteOptions, busy: Duration) -> Result<db::DbHandle, Error> {
+    if let Some(pool) = postgres::pool::active() {
+        return Ok(Box::new(postgres::open_admin(&pool, busy)?));
+    }
     Ok(Box::new(sqlite::open_admin(opts, busy)?))
 }
 
-/// CLI 的獨占連線（Kairos 執行中時失敗；[`sqlite::open_exclusive`]）
+/// CLI 的獨占連線（Kairos 執行中時失敗；[`sqlite::open_exclusive`]）。PostgreSQL：以「服務執行中」的
+/// advisory lock 判斷（[`postgres::open_exclusive`]），任何節點的 Kairos 連著這個資料庫時失敗
 pub fn open_exclusive(opts: &sqlite::SqliteOptions, busy: Duration) -> Result<db::DbHandle, Error> {
+    if let Some(pool) = postgres::pool::active() {
+        return Ok(Box::new(postgres::open_exclusive(&pool, busy)?));
+    }
     Ok(Box::new(sqlite::open_exclusive(opts, busy)?))
+}
+
+/// 連線來自連線池（PostgreSQL）：呼叫端用完就該放掉（drop 即歸還），不要自己留著重複使用——
+/// SQLite 的連線則由各元件保留（重新開啟的成本較高，而且每條連線有自己的頁快取）
+pub fn pooled() -> bool {
+    postgres::pool::active().is_some()
+}
+
+/// 這個行程使用的資料庫是否存在（CLI 在開啟前檢查，給出「還沒有資料」的訊息）：SQLite 為資料庫檔存在，
+/// PostgreSQL 為 schema 已由 Kairos 建立。連不上 PostgreSQL 時回錯誤
+pub fn database_exists(path: &Path) -> Result<bool, Error> {
+    match postgres::pool::active() {
+        Some(pool) => {
+            let conn = postgres::open_read(&pool)?;
+            match postgres::schema_state(&conn).map_err(Error::other)? {
+                postgres::SchemaState::Empty => Ok(false),
+                _ => Ok(true),
+            }
+        }
+        None => Ok(path.is_file()),
+    }
+}
+
+/// 顯示用的資料庫位置：SQLite 為檔案路徑，PostgreSQL 為 `postgres://user@host:port/dbname（schema）`
+pub fn database_label(path: &Path) -> String {
+    match postgres::pool::active() {
+        Some(pool) => pool.settings().display_target(),
+        None => path.display().to_string(),
+    }
 }
 
 /// writer 一批最多取出的筆數（一個交易）
@@ -494,53 +553,97 @@ pub async fn start(config: &AppConfig, data_dir: &Path, clock: Clock) -> Result<
             })
         }
         StorageBackend::Sqlite => {
-            let mirror = if config.storage.jsonl_mirror {
-                let (sink, task) = start_mirror_writer(
-                    data_dir.to_path_buf(),
-                    retention_days,
-                    max_daily_bytes,
-                    clock,
-                    RETENTION_SWEEP_INTERVAL,
-                )
-                .await?;
-                info!("另外輸出 JSONL 鏡像（storage.jsonl_mirror = true）");
-                Some((sink, tokio::spawn(task)))
-            } else {
-                None
-            };
             let opts = sqlite::SqliteOptions::from_config(config, data_dir);
-            let (store, restored) =
-                tokio::task::spawn_blocking(move || sqlite::SqliteStore::open(opts, clock))
-                    .await
-                    .map_err(Error::other)??;
-            let (reports, rx) = report_channel(REPORT_QUEUE_CAPACITY);
-            let (assets, assets_rx) = asset_channel(ASSET_QUEUE_CAPACITY);
-            let (feed, inventory_rx) = watch::channel(None);
-            let (mirror_sink, mirror_task) = match mirror {
-                Some((sink, task)) => (Some(sink), Some(task)),
-                None => (None, None),
-            };
-            let writer = async move {
-                run_store_writer_with_assets(store, rx, Some(assets_rx), inventory_rx, mirror_sink)
-                    .await;
-                // writer 結束時釋放了鏡像的 sender，鏡像寫完剩餘的資料後結束
-                if let Some(task) = mirror_task
-                    && let Err(e) = task.await
-                {
-                    error!("JSONL 鏡像的寫入工作異常結束: {e}");
-                }
-            };
-            Ok(Storage {
-                reports,
-                writer: Box::pin(writer),
-                inventory: Some(Arc::new(feed)),
-                restored,
-                purger: Some(assets.purge_sink()),
-                assets: Some(assets),
+            start_database(config, data_dir, clock, move || {
+                sqlite::SqliteStore::open(opts, clock)
             })
+            .await
+        }
+        StorageBackend::Postgres => {
+            let opts = sqlite::SqliteOptions::from_config(config, data_dir);
+            let pool = postgres::pool::active().unwrap_or_else(|| {
+                postgres::pool::PgPool::with_data_dir(
+                    config.storage.postgres.clone(),
+                    Some(data_dir.to_path_buf()),
+                )
+            });
+            let write_timeout = config.timeouts.write();
+            start_database(config, data_dir, clock, move || {
+                let (server, warnings) = postgres::check_server(&pool)?;
+                info!(
+                    "PostgreSQL {}（{}）",
+                    server.version,
+                    pool.settings().display_target()
+                );
+                if pool.warning_due(postgres::SERVER_WARNING_INTERVAL) {
+                    postgres::log_warnings(&warnings);
+                }
+                let (store, restored) = postgres::report::PgStore::open(pool, opts, clock)?;
+                Ok((store.with_write_timeout(write_timeout), restored))
+            })
+            .await
         }
     }
 }
 
+/// 資料庫後端（SQLite、PostgreSQL）共用的啟動流程：JSONL 鏡像、開啟 store（blocking 執行緒）、
+/// 建立佇列與 writer
+async fn start_database<S, F>(
+    config: &AppConfig,
+    data_dir: &Path,
+    clock: Clock,
+    open: F,
+) -> Result<Storage, Error>
+where
+    S: ReportStore,
+    F: FnOnce() -> Result<(S, Vec<RestoredAgent>), Error> + Send + 'static,
+{
+    let retention_days = config.storage.retention_days;
+    let max_daily_bytes = config.storage.max_daily_bytes;
+    let mirror = if config.storage.jsonl_mirror {
+        let (sink, task) = start_mirror_writer(
+            data_dir.to_path_buf(),
+            retention_days,
+            max_daily_bytes,
+            clock,
+            RETENTION_SWEEP_INTERVAL,
+        )
+        .await?;
+        info!("另外輸出 JSONL 鏡像（storage.jsonl_mirror = true）");
+        Some((sink, tokio::spawn(task)))
+    } else {
+        None
+    };
+    let (store, restored) = tokio::task::spawn_blocking(open)
+        .await
+        .map_err(Error::other)??;
+    let (reports, rx) = report_channel(REPORT_QUEUE_CAPACITY);
+    let (assets, assets_rx) = asset_channel(ASSET_QUEUE_CAPACITY);
+    let (feed, inventory_rx) = watch::channel(None);
+    let (mirror_sink, mirror_task) = match mirror {
+        Some((sink, task)) => (Some(sink), Some(task)),
+        None => (None, None),
+    };
+    let writer = async move {
+        run_store_writer_with_assets(store, rx, Some(assets_rx), inventory_rx, mirror_sink).await;
+        // writer 結束時釋放了鏡像的 sender，鏡像寫完剩餘的資料後結束
+        if let Some(task) = mirror_task
+            && let Err(e) = task.await
+        {
+            error!("JSONL 鏡像的寫入工作異常結束: {e}");
+        }
+    };
+    Ok(Storage {
+        reports,
+        writer: Box::pin(writer),
+        inventory: Some(Arc::new(feed)),
+        restored,
+        purger: Some(assets.purge_sink()),
+        assets: Some(assets),
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod backend_tests;
 #[cfg(test)]
 pub(crate) mod tests;
