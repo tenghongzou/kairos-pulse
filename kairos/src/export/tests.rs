@@ -381,12 +381,14 @@ async fn otlp_pushes_semconv_metrics_with_resource_and_headers() {
     });
     let hub = ExportHub::new(eff_of(&c), None, None);
     let shutdown = Arc::new(Shutdown::new());
-    let task = tokio::spawn(otlp::run(hub.clone(), shutdown.clone()));
     assert!(hub.wants_samples());
+    // 三筆都進佇列後才啟動送出的 task：送出每 1 秒一次，先啟動的話慢的機器上（CI 的 Windows runner）
+    // 這三行之間可能剛好跨過一次送出，第一個請求就只有一部分的主機
     let t0 = 1_760_000_000_000i64;
     hub.accept(sample(A, "web-01", t0, 12.5, 1_000));
     hub.accept(sample(A, "web-01", t0 + 5_000, 50.0, 6_000));
     hub.accept(sample(B, "db-02", t0, 1.0, 10));
+    let task = tokio::spawn(otlp::run(hub.clone(), shutdown.clone()));
     wait_for("collector 收到請求", Duration::from_secs(10), || {
         col.count() >= 1
     })
