@@ -316,7 +316,7 @@ hello 的 `tags` 由本機 `pulse.toml` 決定（第 3.2 節不下發），Kairo
 
 ### 3.7 離線與重連的同步
 
-- 遠端設定快取：`<狀態目錄>/remote/config.json`（Linux 的狀態目錄為 `STATE_DIRECTORY`，預設 `/var/lib/pulse`；Windows `%ProgramData%\Pulse`；目錄 0750、檔案 0640），內容為最後套用的 `rev`、`hash`、`settings`、`sources`，以及 last-known-good 的同樣欄位。
+- 遠端設定快取：`<狀態目錄>/remote/config.json`（Linux 的狀態目錄為 `STATE_DIRECTORY`，預設 `/var/lib/pulse`；Windows `%ProgramData%\Pulse`，環境變數 `STATE_DIRECTORY` 設為絕對路徑時改用它（整個值視為一個路徑）；目錄 0750、檔案 0640），內容為最後套用的 `rev`、`hash`、`settings`、`sources`，以及 last-known-good 的同樣欄位。
 - **離線或 Kairos 停機時**，Pulse 以快取的遠端設定啟動與運作，不會退回內建預設。快取沒有期限（中央的設定在連上之前一直有效）。
 - 重新連線後，`hello_ack` 的 `pending.config_rev` 與快取的 `rev` 不同才送 `config_get`；相同時只送一次 `config_status`。斷線期間 Kairos 端累積的多次變更只會套用最後一版。
 - 連上**不支援 `config` 的 Kairos**（舊版、JSONL）時，快取保留但不使用（只用本機設定），避免換到另一台 Kairos 後沿用不屬於它的設定；`pulse status` 顯示「集中設定：未使用（Kairos 不支援）」。

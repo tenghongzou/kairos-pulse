@@ -626,10 +626,16 @@ mod win {
     }
 }
 
-/// systemd 設定的 `STATE_DIRECTORY`（可能以 `:` 分隔多個）的第一個絕對路徑
+/// systemd 設定的 `STATE_DIRECTORY`（可能以 `:` 分隔多個）的第一個絕對路徑。
+/// Windows 沒有 systemd，路徑本身含磁碟機代號的 `:`（`C:\…`）：整個值視為一個路徑、不分隔
+/// （以 `:` 分隔會得到 `C`，不是絕對路徑，等於永遠忽略這個環境變數）
 pub fn state_directory(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
     let text = value?.to_str()?;
-    let first = text.split(':').next()?.trim();
+    let first = if cfg!(windows) {
+        text.trim()
+    } else {
+        text.split(':').next()?.trim()
+    };
     let path = std::path::Path::new(first);
     (!first.is_empty() && path.is_absolute()).then(|| path.to_path_buf())
 }
@@ -826,6 +832,18 @@ mod tests {
                 state_directory(Some(std::ffi::OsStr::new("relative"))),
                 None
             );
+        }
+        if cfg!(windows) {
+            // 磁碟機代號的 `:` 不是分隔符號
+            assert_eq!(
+                state_directory(Some(std::ffi::OsStr::new(r"C:\ProgramData\Pulse\2"))),
+                Some(std::path::PathBuf::from(r"C:\ProgramData\Pulse\2"))
+            );
+            assert_eq!(
+                state_directory(Some(std::ffi::OsStr::new(r"relative\dir"))),
+                None
+            );
+            assert_eq!(state_directory(Some(std::ffi::OsStr::new("C"))), None);
         }
         assert_eq!(state_directory(Some(std::ffi::OsStr::new(""))), None);
         assert_eq!(state_directory(None), None);
