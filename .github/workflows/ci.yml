@@ -30,7 +30,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 依 rust-toolchain.toml 安裝工具鏈與元件（runner 已內建 rustup）
       - name: Install toolchain from rust-toolchain.toml
@@ -65,7 +65,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain from rust-toolchain.toml
         run: |
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # 完整歷史與 tag：短 commit 的長度與 HEAD 上的 <名稱>-v* tag 檢查都和本機一致
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -112,7 +112,7 @@ jobs:
         working-directory: dist
         run: sha256sum -c SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ github.sha }}
           path: |
@@ -135,7 +135,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -144,7 +144,7 @@ jobs:
 
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reproducible-logs-${{ github.sha }}
           path: dist/repro/
