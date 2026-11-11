@@ -6,9 +6,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::conn::{AsConn, forward};
 use crate::remote::store::{
-    ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate, HostConfigRow,
-    HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow, RemoteStore,
-    RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
+    ApplyingHost, ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate,
+    HostConfigRow, HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow,
+    RemoteStore, RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
 };
 
 /// schema v9（0.9.0〔草稿〕）：集中設定與 Pulse 遠端升級（商業審計 F8；`crates/kairos-proto/REMOTE.md`
@@ -226,6 +226,7 @@ impl<C: AsConn> RemoteStore for C {
         fn hosts_in_active_rollouts(&self) -> Vec<(String, String)> => hosts_in_active_rollouts;
         fn active_offers(&self) -> Vec<(String, String)> => active_offers;
         fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
+        fn applying_hosts(&self) -> Vec<ApplyingHost> => applying_hosts;
         fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
     }
 }
@@ -1148,6 +1149,18 @@ pub fn unacknowledged_rollback_failures(
         "SELECT h.agent_id, h.hostname, rh.rollout_id, rh.detail FROM rollout_hosts rh
          JOIN hosts h ON h.host_id = rh.host_id
          WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
+}
+
+pub fn applying_hosts(conn: &Connection) -> rusqlite::Result<Vec<ApplyingHost>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, rh.rollout_id, COALESCE(rh.applying_at, rh.updated_at), r.options
+         FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         JOIN rollouts r ON r.rollout_id = rh.rollout_id
+         WHERE rh.state = 'applying'",
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     rows.collect()

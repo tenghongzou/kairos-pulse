@@ -1284,7 +1284,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 `GET /api/v1/alerts/summary`：`counts`、`silences`（`active` 個數、`hosts` 以主機為範圍的靜音涵蓋的台數，S06「目前有 2 個靜音規則生效，影響 301 台主機」）、`engine`。
 
-`GET /api/v1/alerts/{event_id}`：另有 `timeline`（處理紀錄：`fired`、`notified`、`acknowledged`、`assigned`、`snoozed`、`commented`、`recovered`、`reopened`、`escalated`、`absorbed`、`detached`、`flapping`、`stable`、`eta_expired`、`resolved`）、`children`（`total`、最多 100 筆）、`parent`（`banner`：「此事件由系統事件『…』造成，請先處理該事件」）、`deliveries`（通知發送狀態：管道、種類、`state`〔`pending`／`held`／`sent`／`failed`／`dropped`／`merged`〕、`attempts`、`response_code`、`error_code`、`error`）、`rule`、`actions`（目前可做的動作）、`link`。
+`GET /api/v1/alerts/{event_id}`：另有 `timeline`（處理紀錄：`fired`、`notified`、`acknowledged`、`assigned`、`snoozed`、`commented`、`recovered`、`reopened`、`escalated`、`absorbed`、`detached`、`flapping`、`stable`、`eta_expired`、`resolved`；0.10 另有 `upgrade_suppressed`：這台主機在升級推送的替換期間離線、離線告警抑制到期限後仍未恢復，`details` 為 `rollout_id`、`until`，事件的 `details.upgrade` 另有 `rollout_id`、`suppressed_until`，ALERTS.md 第 5.5 節）、`children`（`total`、最多 100 筆）、`parent`（`banner`：「此事件由系統事件『…』造成，請先處理該事件」）、`deliveries`（通知發送狀態：管道、種類、`state`〔`pending`／`held`／`sent`／`failed`／`dropped`／`merged`〕、`attempts`、`response_code`、`error_code`、`error`）、`rule`、`actions`（目前可做的動作）、`link`。
 
 | 方法與路徑 | 本文 | 說明 |
 |---|---|---|

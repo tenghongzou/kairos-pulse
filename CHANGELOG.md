@@ -59,6 +59,8 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **S04 agent 版本欄的「低於建議版本」**（F8，REMOTE.md 第 4.9 節、R9）：`GET /api/v1/hosts` 新增 `meta.recommended_min_agent_version`（Pulse 版本庫中最新版本的發佈清單的 `min_upgrade_from`；沒有時 `null`）與每一列的 `agent_outdated`，主控台對低於它的主機加 ⚠ 與說明（無法遠端升級到最新版本，需要手動升級；協定仍相容）。只需要 `hosts:read`。
 - **全域搜尋納入升級推送與設定檔**（F8）：`GET /api/v1/rollouts`、`GET /api/v1/config/profiles` 新增查詢參數 `q`（推送的名稱、編號、目標版本；設定檔的名稱、說明；子字串、不分大小寫），主控台的全域搜尋（Ctrl+K）多了「升級推送」「設定檔」兩組，各需要 `rollouts:read`、`config:read`。
 
+- **升級中主機的離線告警抑制**（F8，REMOTE.md 第 4.7.5、13.1 節、ALERTS.md 第 5.5 節）：升級推送中的主機從交給輔助程式（`applying`）到回報結果之間，不再因為替換與重新啟動的短暫離線而開「主機離線」「主機長期失聯」事件（系統規則與自訂的 `host_offline`／`host_long_offline` 規則），也不計入網段離線、大規模離線的台數；其他規則（指標門檻、回報延遲…）不受影響。抑制最長到 `applying` 之後 `health_timeout_secs + 10 分鐘`：**超過後仍離線就照常告警**（離線時間以實際離線的時間計），事件的 `details.upgrade` 與處理紀錄的新動作 `upgrade_suppressed` 註明「升級中」；Kairos 重新啟動後抑制狀態由資料庫重建。Webhook 等接收端若列舉處理紀錄的動作，請忽略不認得的值。
+
 ### 變更
 
 - 重複上傳同一個發佈檔（`PUT /api/v1/releases/{version}/artifacts/{filename}`、`kairos releases import`）時，版本庫中已有同名而大小不同的檔案會被取代（0.9.0 一律保留既有的檔案，被截斷的檔案無法以重新上傳修復）。

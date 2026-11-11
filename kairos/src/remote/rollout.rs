@@ -140,6 +140,15 @@ pub const APPLY_WINDOW_MS: i64 = 24 * 3600 * 1000;
 pub const EXPIRE_GRACE_MS: i64 = 3600 * 1000;
 /// `applying` 之後超過 `health_timeout_secs` 再加這段時間沒有回報且離線：`unknown`
 pub const APPLY_STUCK_GRACE_MS: i64 = 30 * 60 * 1000;
+/// 升級中主機的離線告警抑制：`applying` 之後 `health_timeout_secs` 再加這段時間（REMOTE.md 第 4.7.5 節）
+pub const SUPPRESS_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// 離線告警抑制的期限：主機進入 `applying` 的時間＋`health_timeout_secs`＋10 分鐘。主機在這之前到達終止
+/// 狀態時提早結束；超過後仍離線就照常告警
+pub fn suppress_until(applying_at: i64, health_timeout_secs: u32) -> i64 {
+    applying_at + i64::from(health_timeout_secs) * 1000 + SUPPRESS_GRACE_MS
+}
+
 /// Kairos 啟動後這段時間內不提議新的主機（REMOTE.md 第 4.7.4 節第 5 項）
 pub const START_GRACE_MS: i64 = 60 * 1000;
 

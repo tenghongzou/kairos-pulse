@@ -279,6 +279,11 @@ pub struct Engine {
     /// 遠端管理的系統檢查：(規則, 對象) → (開始時間, 標題, 細節)
     pub(super) remote_conditions:
         std::collections::BTreeMap<(&'static str, String), (i64, String, Value)>,
+    /// 升級中的主機（遠端管理服務發布的 `UpgradeWindow`）：agent_id → (推送, 離線告警抑制的期限)
+    pub(super) upgrading: HashMap<String, (String, i64)>,
+    /// 升級期間離線而沒有開事件的主機：agent_id → (推送, 抑制的期限, 那一次離線的時間)。主機恢復連線時
+    /// 移除；期限過後**同一次離線**仍未恢復而開事件時，在事件的細節與處理紀錄註明「升級中」
+    pub(super) upgrade_notes: HashMap<String, (String, i64, i64)>,
     pub(super) flaps: HashMap<String, VecDeque<i64>>,
     pub(super) warmup: Warmup,
     pub(super) seq_by_day: HashMap<String, u64>,
@@ -317,6 +322,8 @@ impl Engine {
             tls_failed: None,
             audit_failed: None,
             remote_conditions: std::collections::BTreeMap::new(),
+            upgrading: HashMap::new(),
+            upgrade_notes: HashMap::new(),
             flaps: HashMap::new(),
             warmup,
             seq_by_day: loaded.seq_by_day,
@@ -1267,6 +1274,25 @@ impl Engine {
                     self.remote_conditions.remove(&key);
                 }
             }
+            EventKind::UpgradeWindow {
+                agent_id,
+                rollout_id,
+                until_ms,
+            } => match until_ms {
+                Some(until) => {
+                    self.upgrading
+                        .insert(agent_id.clone(), (rollout_id.clone(), *until));
+                }
+                None => {
+                    // 期限前解除＝主機已回報結果（連上過）：之後的離線與這次升級無關，不再註明。
+                    // 期限已過的解除保留註記（仍離線的主機這一輪或下一輪才開事件）
+                    if let Some((_, until)) = self.upgrading.remove(agent_id)
+                        && until > at
+                    {
+                        self.upgrade_notes.remove(agent_id);
+                    }
+                }
+            },
             EventKind::AuditIntegrity {
                 ok,
                 reason,

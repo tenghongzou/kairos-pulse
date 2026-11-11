@@ -1385,3 +1385,190 @@ fn remote_conditions_open_system_events_until_cleared() {
     }
     assert!(rules::builtin_default(ids::RELEASE_SIGNATURE_FAILED).is_some());
 }
+
+// ---- 升級中主機的離線告警抑制（REMOTE.md 第 4.7.5 節） ----
+
+fn upgrade_window(seq: u64, t: i64, agent: &str, until: Option<i64>) -> BusEvent {
+    BusEvent {
+        seq,
+        at: chrono::DateTime::from_timestamp_millis(t).unwrap(),
+        kind: EventKind::UpgradeWindow {
+            agent_id: agent.into(),
+            rollout_id: "r-20261111-0001".into(),
+            until_ms: until,
+        },
+    }
+}
+
+/// 升級重啟期間（`applying` 到終止狀態之間）不開離線事件；主機回來後抑制結束，也沒有事件
+#[test]
+fn host_offline_is_suppressed_while_the_host_is_upgrading() {
+    let mut e = engine();
+    let a = host("a", "10.0.0.1");
+    let b = host("b", "10.0.0.2");
+    e.tick(world(T0, vec![a.clone(), b.clone()]));
+    // a 進入 applying：健康確認 600 秒＋10 分鐘
+    let until = T0 + MIN + 20 * MIN;
+    e.on_bus(&upgrade_window(1, T0 + MIN, "a", Some(until)));
+    let a_off = offline(a.clone(), T0 + MIN, DisconnectReason::IdleTimeout);
+    let b_off = offline(b.clone(), T0 + MIN, DisconnectReason::IdleTimeout);
+    // 超過 3 分鐘的寬限：沒有在升級的 b 照常開事件，a 不開
+    e.tick(world(T0 + 5 * MIN, vec![a_off.clone(), b_off.clone()]));
+    let evs = by_rule(&e, ids::HOST_OFFLINE);
+    assert_eq!(evs.len(), 1, "{:?}", open(&e));
+    assert_eq!(evs[0].subject, "b");
+    assert!(evs[0].details.get("upgrade").is_none());
+    let out = e.take_output();
+    assert!(
+        out.deliveries
+            .iter()
+            .all(|d| !d.payload.to_string().contains("h-a")),
+        "{:?}",
+        out.deliveries
+    );
+    // a 升級完成、重新連上：抑制結束，從頭到尾沒有 a 的事件
+    e.on_bus(&upgrade_window(2, T0 + 6 * MIN, "a", None));
+    e.tick(world(T0 + 6 * MIN, vec![a.clone(), b_off.clone()]));
+    e.tick(world(T0 + 30 * MIN, vec![a, b_off]));
+    assert!(
+        by_rule(&e, ids::HOST_OFFLINE)
+            .iter()
+            .all(|x| x.subject == "b")
+    );
+    let out = e.take_output();
+    assert!(
+        out.timeline
+            .iter()
+            .all(|t| t.action != "upgrade_suppressed"),
+        "{:?}",
+        out.timeline
+    );
+}
+
+/// 期限（`applying_at + health_timeout_secs + 10 分鐘`）過後仍離線：立即照常告警（以實際離線的時間計），
+/// 事件的細節與處理紀錄註明「升級中」
+#[test]
+fn host_offline_fires_once_the_upgrade_window_has_passed() {
+    let mut e = engine();
+    let a = host("a", "10.0.0.1");
+    e.tick(world(T0, vec![a.clone()]));
+    let until = T0 + 21 * MIN;
+    e.on_bus(&upgrade_window(1, T0 + MIN, "a", Some(until)));
+    let off = offline(a.clone(), T0 + MIN, DisconnectReason::IdleTimeout);
+    e.tick(world(T0 + 10 * MIN, vec![off.clone()]));
+    e.tick(world(until - 1000, vec![off.clone()]));
+    assert!(by_rule(&e, ids::HOST_OFFLINE).is_empty());
+    assert!(e.take_output().deliveries.is_empty());
+    // 期限一到（遠端管理服務的調和還沒送出解除也一樣）：這一輪就開事件並通知
+    e.tick(world(until + 1000, vec![off.clone()]));
+    let evs = by_rule(&e, ids::HOST_OFFLINE);
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].episode, Some(T0 + MIN), "離線時間以實際離線的時間計");
+    assert_eq!(evs[0].details["upgrade"]["rollout_id"], "r-20261111-0001");
+    assert_eq!(evs[0].details["upgrade"]["suppressed_until"], until);
+    let out = e.take_output();
+    assert_eq!(
+        out.deliveries.iter().filter(|d| d.kind == "firing").count(),
+        2,
+        "{:?}",
+        out.deliveries
+    );
+    let notes: Vec<_> = out
+        .timeline
+        .iter()
+        .filter(|t| t.action == "upgrade_suppressed")
+        .collect();
+    assert_eq!(notes.len(), 1, "{:?}", out.timeline);
+    assert_eq!(notes[0].details["until"], until);
+    // 之後的解除不影響已開的事件；主機回來後照常恢復
+    e.on_bus(&upgrade_window(2, until + 2000, "a", None));
+    e.tick(world(until + MIN, vec![off]));
+    assert_eq!(by_rule(&e, ids::HOST_OFFLINE)[0].state, EventState::Firing);
+    e.tick(world(until + 2 * MIN, vec![a]));
+    assert_eq!(
+        by_rule(&e, ids::HOST_OFFLINE)[0].state,
+        EventState::Recovered
+    );
+}
+
+/// 抑制只針對離線類：升級中的主機照常觸發回報延遲；已經開著的離線事件不會因為進入升級而消失；
+/// 長期失聯在期限內不開、期限後照常
+#[test]
+fn upgrade_window_only_suppresses_new_offline_events() {
+    let mut e = engine();
+    let mut a = host("a", "10.0.0.1");
+    a.report_interval_ms = Some(5000);
+    a.last_report_at = Some(T0);
+    let b = host("b", "10.0.0.2");
+    e.tick(world(T0, vec![a.clone(), b.clone()]));
+    // b 已經離線並開了事件，之後才（不合理地）被標為升級中：事件維持
+    let b_off = offline(b.clone(), T0, DisconnectReason::IdleTimeout);
+    e.tick(world(T0 + 4 * MIN, vec![a.clone(), b_off.clone()]));
+    assert_eq!(by_rule(&e, ids::HOST_OFFLINE).len(), 1);
+    e.on_bus(&upgrade_window(
+        1,
+        T0 + 4 * MIN,
+        "a",
+        Some(T0 + 30 * 60 * MIN),
+    ));
+    e.on_bus(&upgrade_window(
+        2,
+        T0 + 4 * MIN,
+        "b",
+        Some(T0 + 30 * 60 * MIN),
+    ));
+    e.tick(world(T0 + 5 * MIN, vec![a.clone(), b_off.clone()]));
+    assert_eq!(by_rule(&e, ids::HOST_OFFLINE).len(), 1);
+    assert_eq!(by_rule(&e, ids::HOST_OFFLINE)[0].state, EventState::Firing);
+    // a 連線中但沒有新的 report：回報延遲不受抑制
+    assert_eq!(by_rule(&e, ids::REPORT_STALE).len(), 1, "{:?}", open(&e));
+    // 長期失聯（預設 24 小時）：期限內不開新事件，期限後照常
+    let a_off = offline(a, T0 + 5 * MIN, DisconnectReason::IdleTimeout);
+    e.tick(world(
+        T0 + 26 * 60 * MIN,
+        vec![a_off.clone(), b_off.clone()],
+    ));
+    assert!(
+        by_rule(&e, ids::HOST_LONG_OFFLINE)
+            .iter()
+            .all(|x| x.subject != "a"),
+        "{:?}",
+        open(&e)
+    );
+    e.tick(world(T0 + 31 * 60 * MIN, vec![a_off, b_off]));
+    assert!(
+        by_rule(&e, ids::HOST_LONG_OFFLINE)
+            .iter()
+            .any(|x| x.subject == "a")
+    );
+    assert!(
+        by_rule(&e, ids::HOST_OFFLINE)
+            .iter()
+            .any(|x| x.subject == "a")
+    );
+}
+
+/// 一批主機同時升級重啟不算大規模離線、網段離線
+#[test]
+fn upgrading_hosts_do_not_count_toward_mass_or_subnet_offline() {
+    let mut e = engine();
+    let hosts: Vec<HostView> = (0..30)
+        .map(|i| host(&format!("m{i}"), &format!("10.50.{}.{}", i % 6, i + 1)))
+        .collect();
+    e.tick(world(T0, hosts.clone()));
+    for (i, h) in hosts.iter().enumerate() {
+        e.on_bus(&upgrade_window(
+            i as u64 + 1,
+            T0 + MIN,
+            &h.agent_id,
+            Some(T0 + 21 * MIN),
+        ));
+    }
+    let down: Vec<HostView> = hosts
+        .iter()
+        .map(|h| offline(h.clone(), T0 + MIN, DisconnectReason::IdleTimeout))
+        .collect();
+    e.tick(world(T0 + MIN + 30_000, down.clone()));
+    e.tick(world(T0 + 5 * MIN, down));
+    assert!(open(&e).is_empty(), "{:?}", open(&e));
+}

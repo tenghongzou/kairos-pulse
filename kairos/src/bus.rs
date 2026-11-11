@@ -215,6 +215,14 @@ pub enum EventKind {
         title: String,
         details: serde_json::Value,
     },
+    /// 升級中主機的離線告警抑制（REMOTE.md 第 4.7.5 節）：推送中的主機進入 `applying`（已交給輔助程式）時
+    /// `until_ms` 為抑制的期限（`applying_at + health_timeout_secs + 10 分鐘`）；到達終止狀態或期限已過時
+    /// `None`。由遠端管理服務在狀態改變的當下與每一輪依資料庫調和後發布
+    UpgradeWindow {
+        agent_id: String,
+        rollout_id: String,
+        until_ms: Option<i64>,
+    },
 }
 
 impl EventKind {
@@ -235,6 +243,7 @@ impl EventKind {
             EventKind::ChannelSecrets { .. } => "channel_secrets",
             EventKind::AuditIntegrity { .. } => "audit_integrity",
             EventKind::RemoteCondition { .. } => "remote_condition",
+            EventKind::UpgradeWindow { .. } => "upgrade_window",
         }
     }
 }

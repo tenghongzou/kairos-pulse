@@ -1215,11 +1215,23 @@ impl RemoteService {
                     }
                 }
                 let terminal = t.state.as_deref().is_some_and(|x| rollout::is_terminal(x) || x == HOST_APPLYING);
-                Ok(Some((terminal, cleared, r.id.clone())))
+                // 離線告警抑制（第 4.7.5 節）：進入 applying 時開始，到達終止狀態時結束
+                let window = match t.state.as_deref() {
+                    Some(HOST_APPLYING) => Some(Some((
+                        r.id.clone(),
+                        rollout::suppress_until(now, rollout::options_from_db(&r.options).health_timeout_secs),
+                    ))),
+                    Some(x) if rollout::is_terminal(x) => Some(None),
+                    _ => None,
+                };
+                Ok(Some((terminal, cleared, r.id.clone(), window)))
             })
             .await;
         match r {
-            Ok(Some((terminal, cleared, rollout_id))) => {
+            Ok(Some((terminal, cleared, rollout_id, window))) => {
+                if let Some(w) = window {
+                    self.set_upgrade_window(agent_id, w);
+                }
                 self.mark_dirty(&rollout_id);
                 if terminal {
                     // 已交給輔助程式或已結束：不再提議、釋出下載名額

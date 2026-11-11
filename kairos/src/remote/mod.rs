@@ -168,6 +168,19 @@ pub struct AgentSession {
     pub upgrade: bool,
 }
 
+/// 「升級中」每隔這段時間重新發布一次（告警引擎漏掉時補上）
+pub const UPGRADE_WINDOW_REPUBLISH_MS: i64 = 60_000;
+
+/// 已發布的「升級中」（離線告警抑制）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpgradeWindow {
+    rollout_id: String,
+    /// 抑制的期限（[`rollout::suppress_until`]）
+    until_ms: i64,
+    /// 設定的時間（調和時不解除剛設定的）
+    set_ms: i64,
+}
+
 /// 提議中的檔案（`upgrade_chunk_get` 只接受這些）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfferFiles {
@@ -198,6 +211,8 @@ struct State {
     recommended_min: Option<(Instant, Option<String>)>,
     /// 已發布給告警引擎、仍有效的系統檢查（規則, 對象）；`None` 為尚未調和過
     alert_keys: Option<HashSet<(&'static str, String)>>,
+    /// 已發布給告警引擎的「升級中」（離線告警抑制，REMOTE.md 第 4.7.5 節）：agent_id → 抑制的期限
+    upgrade_windows: HashMap<String, UpgradeWindow>,
 }
 
 /// [`RemoteService::start`] 的參數
@@ -609,6 +624,7 @@ impl RemoteService {
             }
             self.flush_progress().await;
             self.reconcile_alerts().await;
+            self.reconcile_upgrade_windows().await;
         }
         debug!("遠端管理的背景工作結束");
     }
@@ -700,6 +716,99 @@ impl RemoteService {
                 details: serde_json::Value::Null,
             });
         }
+    }
+
+    /// 升級中主機的離線告警抑制（REMOTE.md 第 4.7.5 節）：這台主機進入 `applying`（`Some`：推送與期限）
+    /// 或到達終止狀態（`None`）。有改變時才發布給告警引擎
+    pub(crate) fn set_upgrade_window(&self, agent_id: &str, w: Option<(String, i64)>) {
+        let now = self.now_ms();
+        let event = {
+            let mut st = self.lock();
+            match w {
+                Some((rollout_id, until_ms)) if until_ms > now => {
+                    // 沒有改變時不重複發布；但每分鐘重送一次（告警服務比遠端管理服務晚啟動、或匯流排落後
+                    // 而漏掉時補上，數量最多是替換中的主機數）
+                    let same = st.upgrade_windows.get(agent_id).is_some_and(|o| {
+                        o.rollout_id == rollout_id
+                            && o.until_ms == until_ms
+                            && now - o.set_ms < UPGRADE_WINDOW_REPUBLISH_MS
+                    });
+                    if same {
+                        None
+                    } else {
+                        st.upgrade_windows.insert(
+                            agent_id.to_string(),
+                            UpgradeWindow {
+                                rollout_id: rollout_id.clone(),
+                                until_ms,
+                                set_ms: now,
+                            },
+                        );
+                        Some((rollout_id, Some(until_ms)))
+                    }
+                }
+                _ => st
+                    .upgrade_windows
+                    .remove(agent_id)
+                    .map(|o| (o.rollout_id, None)),
+            }
+        };
+        if let Some((rollout_id, until_ms)) = event {
+            self.registry
+                .bus()
+                .publish(crate::bus::EventKind::UpgradeWindow {
+                    agent_id: agent_id.to_string(),
+                    rollout_id,
+                    until_ms,
+                });
+        }
+    }
+
+    /// 依資料庫調和「升級中」的主機（`rollout_hosts.state = applying`，不論推送的狀態）：Kairos 重新啟動後
+    /// 重建告警引擎的抑制狀態；期限已過或主機已不在 `applying`（例如被推送引擎標為 `unknown`）時解除
+    pub(crate) async fn reconcile_upgrade_windows(&self) {
+        let rows = match self.db.read(|s| Ok(s.applying_hosts()?)).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("升級推送：無法讀取替換中的主機（離線告警抑制）：{e}");
+                return;
+            }
+        };
+        let now = self.now_ms();
+        let want: HashMap<String, (String, i64)> = rows
+            .into_iter()
+            .map(|(agent, rollout_id, applying_at, options)| {
+                let secs = rollout::options_from_db(&options).health_timeout_secs;
+                (
+                    agent,
+                    (rollout_id, rollout::suppress_until(applying_at, secs)),
+                )
+            })
+            .filter(|(_, (_, until))| *until > now)
+            .collect();
+        // 剛在 `apply_upgrade_status` 設定、這一輪讀資料庫時可能還沒看到的不解除
+        let fresh = ENGINE_INTERVAL.as_millis() as i64;
+        let gone: Vec<String> = self
+            .lock()
+            .upgrade_windows
+            .iter()
+            .filter(|(a, o)| {
+                !want.contains_key(*a) && (o.until_ms <= now || now - o.set_ms >= fresh)
+            })
+            .map(|(a, _)| a.clone())
+            .collect();
+        for a in gone {
+            self.set_upgrade_window(&a, None);
+        }
+        for (a, w) in want {
+            self.set_upgrade_window(&a, Some(w));
+        }
+    }
+
+    /// 目前離線告警被抑制的主機數
+    #[cfg(test)]
+    pub(crate) fn upgrade_windows(&self) -> usize {
+        self.lock().upgrade_windows.len()
     }
 
     /// 刪除超過 `rollout_retention_days` 的已結束推送

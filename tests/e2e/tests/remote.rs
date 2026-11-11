@@ -5,7 +5,8 @@
 //! 建立並送出推送；Pulse 端以 [`RawClient`] 模擬 0.9.0 的 Pulse（升級流程需要 root 與 systemd，實際的 Pulse
 //! 無法在這裡替換自己；實際兩端的集中設定互通見 `remote_interop.rs`）：協商 `config`、
 //! `upgrade`，依 `pending` 取得設定、提議並經 8443 分段下載，回報升級的各個狀態，替換後以新版本重新連線
-//! 回報成功，推送完成。
+//! 回報成功，推送完成。主機離線規則的寬限設為 0 秒：`applying` 之後斷線的期間沒有離線事件（升級中的離線告警
+//! 抑制，REMOTE.md 第 4.7.5 節），升級結束後同一台主機離線則照常開事件。
 
 use kp_e2e::{
     GOOD, KAIROS_STARTED, Kairos, RawClient, TestDir, WAIT, api_request, poll_until, run_to_exit,
@@ -102,6 +103,30 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
             &token,
             Some(("application/json", body.to_string().as_bytes())),
         )
+    };
+
+    // 主機離線規則的寬限改為 0 秒：升級重啟期間的離線告警抑制（REMOTE.md 第 4.7.5 節）才看得出來
+    let (s, v) = api_request(
+        port,
+        "PUT",
+        "/api/v1/alert-rules/sys.host_offline",
+        &token,
+        Some((
+            "application/json",
+            json!({"params": {"grace_secs": 0}}).to_string().as_bytes(),
+        )),
+    );
+    assert_eq!(s, 200, "{v}");
+    let offline_events = || -> Vec<Value> {
+        let (s, v) = api_request(port, "GET", "/api/v1/alerts?limit=200", &token, None);
+        assert_eq!(s, 200, "{v}");
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["rule_id"] == "sys.host_offline" && e["agent_id"] == GOOD.agent_id)
+            .cloned()
+            .collect()
     };
 
     // 模擬的 Pulse 0.9.0：協商 config、upgrade
@@ -269,6 +294,15 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
     }
     c.close();
 
+    // 替換、重新啟動期間主機離線：告警引擎（每 5 秒一輪）不開離線事件（寬限 0 秒也一樣）
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        offline_events().is_empty(),
+        "升級中的主機不應該有離線事件：{:?}\n{}",
+        offline_events(),
+        k.dump()
+    );
+
     // 替換後的新版重新連線：回報成功，推送完成
     let mut c = RawClient::connect(kairos.port, GOOD);
     c.send(&hello("0.9.1"));
@@ -300,7 +334,26 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         None,
     );
     assert_eq!(v["data"]["upgrades"][0]["to_version"], "0.9.1", "{v}");
+    assert!(offline_events().is_empty(), "{:?}", offline_events());
     c.close();
+    // 對照：升級結束後抑制解除，同一台主機離線就照常開事件
+    assert!(
+        poll_until(Duration::from_secs(40), || !offline_events().is_empty()),
+        "升級結束後的離線沒有開事件\n{}",
+        k.dump()
+    );
+    let ev = offline_events().remove(0);
+    let (_, v) = api_request(
+        port,
+        "GET",
+        &format!("/api/v1/alerts/{}", ev["event_id"].as_str().unwrap()),
+        &token,
+        None,
+    );
+    assert!(
+        v["data"]["details"].get("upgrade").is_none(),
+        "不是升級期間的離線：{v}"
+    );
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());
     assert!(

@@ -1521,3 +1521,155 @@ async fn pause_cause_and_open_rollback_failures_are_in_the_rollout_json() {
     assert_eq!(v["rollback_failed_unacknowledged"], 0, "已標記為已處理");
     assert_eq!(v["progress"]["rollback_failed"], 1, "progress 仍含已處理的");
 }
+
+/// 升級中主機的離線告警抑制（REMOTE.md 第 4.7.5 節）：進入 `applying` 時發布期限、到達終止狀態或期限已過時
+/// 解除；只有這台主機自己、對 Kairos 提議給它的 upgrade_id 回報才算；Kairos 重新啟動後從資料庫重建
+#[tokio::test]
+async fn upgrade_windows_follow_applying_hosts_and_survive_restart() {
+    let signer = TestSigner::new(6);
+    let fx = Fx::new("window", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.0", "1111111")).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.add_host(B, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    fx.connect(B, "0.9.0", "tar");
+    let spec = RolloutSpec::parse(&json!({
+        "name": "0.9.2 web",
+        "target_version": "0.9.2",
+        "selector": {"groups": ["web"]},
+        "waves": [{"size": "rest", "max_failure_ratio": 1}],
+        "options": {"health_timeout_secs": 300},
+    }))
+    .unwrap();
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 2 台".into()), None)
+        .await
+        .unwrap();
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up_a = fx.svc.offer_of(A).unwrap();
+    let up_b = fx.svc.offer_of(B).unwrap();
+    let status = |up: &str, state: &str| kairos_proto::mgmt::UpgradeStatus {
+        seq: 1,
+        ts: "2026-11-20T02:00:00.000Z".into(),
+        upgrade_id: up.to_string(),
+        state: state.into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.2".into(),
+        code: None,
+        detail: String::new(),
+        progress: None,
+    };
+    let windows = |bus: &mut tokio::sync::broadcast::Receiver<Arc<crate::bus::BusEvent>>| {
+        let mut v = Vec::new();
+        while let Ok(ev) = bus.try_recv() {
+            if let crate::bus::EventKind::UpgradeWindow {
+                agent_id,
+                rollout_id,
+                until_ms,
+            } = &ev.kind
+            {
+                v.push((agent_id.clone(), rollout_id.clone(), *until_ms));
+            }
+        }
+        v.sort();
+        v
+    };
+    let mut bus = fx.registry.bus().subscribe();
+    // 下載、暫存不抑制
+    for s in ["accepted", "staged"] {
+        fx.svc
+            .apply_upgrade_status(A, "0.9.0", status(&up_a, s))
+            .await
+            .unwrap();
+    }
+    assert!(windows(&mut bus).is_empty());
+    // 其他主機拿 A 的 upgrade_id 回報 applying、或回報不存在的 upgrade_id：不抑制（不能藉此隱藏離線）
+    fx.svc
+        .apply_upgrade_status(B, "0.9.0", status(&up_a, "applying"))
+        .await
+        .unwrap();
+    fx.svc
+        .apply_upgrade_status(
+            B,
+            "0.9.0",
+            status("00000000-0000-4000-8000-000000000000", "applying"),
+        )
+        .await
+        .unwrap();
+    assert!(windows(&mut bus).is_empty());
+    assert_eq!(fx.svc.upgrade_windows(), 0);
+    // A、B 交給輔助程式：期限為 applying 的時間＋health_timeout_secs（300 秒）＋10 分鐘
+    let applied = T0 + 61_000;
+    let until = applied + 300_000 + 600_000;
+    assert_eq!(rollout::suppress_until(applied, 300), until);
+    for (agent, up) in [(A, &up_a), (B, &up_b)] {
+        fx.svc
+            .apply_upgrade_status(agent, "0.9.0", status(up, "applying"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        windows(&mut bus),
+        vec![
+            (A.to_string(), id.clone(), Some(until)),
+            (B.to_string(), id.clone(), Some(until))
+        ]
+    );
+    // 重送與調和：沒有改變就不重複發布
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", status(&up_a, "applying"))
+        .await
+        .unwrap();
+    fx.set_now(applied + 10_000);
+    fx.svc.reconcile_upgrade_windows().await;
+    assert!(windows(&mut bus).is_empty());
+    // 推送暫停後，已在替換中的主機照常抑制
+    fx.svc
+        .pause_rollout(&who(), id.clone(), "看一下".into())
+        .await
+        .unwrap();
+    fx.svc.reconcile_upgrade_windows().await;
+    assert!(windows(&mut bus).is_empty());
+    assert_eq!(fx.svc.upgrade_windows(), 2);
+    // B 升級完成：立即解除
+    fx.svc
+        .apply_upgrade_status(B, "0.9.2", status(&up_b, "succeeded"))
+        .await
+        .unwrap();
+    assert_eq!(windows(&mut bus), vec![(B.to_string(), id.clone(), None)]);
+    // Kairos 重新啟動：從資料庫重建（只有還在 applying 的 A）
+    let registry2 = Arc::new(crate::registry::Registry::new());
+    let n = fx.now.clone();
+    let svc2 = RemoteService::open(StartParams {
+        settings: RemoteSettings::default(),
+        data_dir: fx.dir.clone(),
+        db_path: fx.dir.join(crate::store::sqlite::DB_FILE),
+        registry: registry2.clone(),
+        shutdown: Arc::new(crate::shutdown::Shutdown::new()),
+        clock: Arc::new(move || n.load(Ordering::SeqCst)),
+    })
+    .await
+    .unwrap();
+    let mut bus2 = registry2.bus().subscribe();
+    svc2.reconcile_upgrade_windows().await;
+    assert_eq!(
+        windows(&mut bus2),
+        vec![(A.to_string(), id.clone(), Some(until))]
+    );
+    // 期限已過而 A 仍在 applying（沒有回報）：解除抑制，離線照常告警
+    fx.set_now(until + 1);
+    fx.svc.reconcile_upgrade_windows().await;
+    assert_eq!(windows(&mut bus), vec![(A.to_string(), id.clone(), None)]);
+    assert_eq!(fx.svc.upgrade_windows(), 0);
+    svc2.reconcile_upgrade_windows().await;
+    assert_eq!(windows(&mut bus2), vec![(A.to_string(), id.clone(), None)]);
+    // 期限後才啟動的 Kairos 不會發布已過期的抑制
+    fx.svc.reconcile_upgrade_windows().await;
+    assert!(windows(&mut bus).is_empty());
+}

@@ -259,6 +259,9 @@ pub struct HostTransition {
 /// 回滾失敗、尚未標記處理的主機：(agent_id, hostname, rollout_id, detail)
 pub type RollbackFailure = (String, String, String, Option<String>);
 
+/// 替換中的主機：(agent_id, rollout_id, 進入 `applying` 的時間, 推送的 `options` JSON)
+pub type ApplyingHost = (String, String, i64, String);
+
 /// 遠端管理的資料庫操作
 pub trait RemoteStore {
     // ---- 設定版本 ----
@@ -450,6 +453,10 @@ pub trait RemoteStore {
 
     /// 回滾失敗、尚未標記為已處理的主機：(agent_id, hostname, rollout_id, detail)
     fn unacknowledged_rollback_failures(&self) -> StoreResult<Vec<RollbackFailure>>;
+
+    /// 替換中（`applying`）的主機：(agent_id, rollout_id, 進入 `applying` 的時間, 推送的 `options` JSON)。
+    /// 不論推送的狀態（暫停、取消後已交給輔助程式的主機照常完成）；升級中的離線告警抑制用
+    fn applying_hosts(&self) -> StoreResult<Vec<ApplyingHost>>;
 
     /// 使用中（草稿、進行中、暫停）的推送中以這個版本為目標的數量
     fn rollouts_using_release(&self, release_id: i64) -> StoreResult<i64>;

@@ -113,6 +113,13 @@ impl Engine {
             .map(|(i, h)| (h.agent_id.clone(), i))
             .collect();
         self.update_silences(now);
+        // 升級中的離線告警抑制：期限已過的不再抑制；恢復連線的主機不必再註明
+        self.upgrading.retain(|_, (_, until)| *until > now);
+        if !self.upgrade_notes.is_empty() {
+            let index = &self.host_index;
+            self.upgrade_notes
+                .retain(|a, _| index.get(a.as_str()).is_some_and(|i| !hosts[*i].online));
+        }
         self.step_warmup(&hosts, now);
         if self.warmup.ended {
             // 大規模離線先判斷：同一輪成立的網段事件直接成為它的子事件
@@ -128,6 +135,15 @@ impl Engine {
         self.eval_cert_rejected(&hosts, &world.rejections, now);
         self.eval_mass_decommission(now);
         self.lifecycle(now);
+    }
+
+    /// 這台主機正在升級（推送中 `applying` 到終止狀態之間，REMOTE.md 第 4.7.5 節）：離線類的規則（主機離線、
+    /// 長期失聯、網段與大規模離線的計數）在期限前不開新事件。回傳 (推送, 期限)
+    pub(super) fn upgrading(&self, agent_id: &str, now: i64) -> Option<(String, i64)> {
+        self.upgrading
+            .get(agent_id)
+            .filter(|(_, until)| *until > now)
+            .cloned()
     }
 
     fn enabled_rules(&self, kind_name: &str) -> Vec<Rule> {
@@ -464,6 +480,7 @@ impl Engine {
         !h.online
             && !h.decommissioned
             && aggregatable(h.offline_reason)
+            && self.upgrading(&h.agent_id, now).is_none()
             && h.offline_at
                 .is_some_and(|t| t >= (now - window_ms).max(self.started_ms))
     }
@@ -874,6 +891,7 @@ impl Engine {
                 .cloned()
                 .unwrap_or_default();
             let mut signals = Vec::new();
+            let mut noted: Vec<(String, String, i64)> = Vec::new();
             for h in hosts {
                 if h.online || h.decommissioned || !scope.matches(&h.facts()) {
                     continue;
@@ -885,6 +903,12 @@ impl Engine {
                     continue;
                 }
                 let open = self.active_event(&rule.rule_id, &h.agent_id).is_some();
+                // 升級中（替換、重新啟動、健康確認）：期限前不開新的離線事件；期限過後仍離線就照常開
+                if !open && let Some(w) = self.upgrading(&h.agent_id, now) {
+                    self.upgrade_notes
+                        .insert(h.agent_id.to_string(), (w.0, w.1, off));
+                    continue;
+                }
                 let missing = self.warmup.missing.contains(&*h.agent_id);
                 // 暖機期內不開新的主機離線事件；Kairos 啟動前就已離線的主機不開新事件（重新啟動與升級
                 // 不灌出通知，§7「計畫性重啟造成的主機離線通知 0 則」；長期失聯另有規則）
@@ -896,6 +920,17 @@ impl Engine {
                     continue;
                 }
                 let name = h.name().to_string();
+                let mut details = host_details(h, self.cfg.prefix_v4, self.cfg.prefix_v6);
+                // 只註明升級期間開始的那一次離線（兩輪之間重新連上又離線的不算）
+                if let Some((rollout_id, until, _)) =
+                    self.upgrade_notes.get(&*h.agent_id).filter(|n| n.2 == off)
+                {
+                    details["upgrade"] =
+                        json!({ "rollout_id": rollout_id, "suppressed_until": until });
+                    if !open {
+                        noted.push((h.agent_id.to_string(), rollout_id.clone(), *until));
+                    }
+                }
                 signals.push((
                     h.agent_id.to_string(),
                     Signal {
@@ -903,13 +938,27 @@ impl Engine {
                         title: format!("主機離線：{name}"),
                         code: None,
                         agent_id: Some(h.agent_id.to_string()),
-                        details: host_details(h, self.cfg.prefix_v4, self.cfg.prefix_v6),
+                        details,
                         episode: Some(off),
                         parent,
                     },
                 ));
             }
             self.reconcile(&rule, signals, now, false);
+            // 升級期間被抑制、期限過後才開的事件：處理紀錄註明「升級中」
+            for (agent, rollout_id, until) in noted {
+                if let Some(id) = self.active_event(&rule.rule_id, &agent)
+                    && self.events.get(&id).is_some_and(|e| e.started_at == now)
+                {
+                    self.timeline(
+                        &id,
+                        now,
+                        "system",
+                        "upgrade_suppressed",
+                        json!({ "rollout_id": rollout_id, "until": until }),
+                    );
+                }
+            }
         }
     }
 
@@ -929,6 +978,9 @@ impl Engine {
                 let off = h.offline_at.unwrap_or(h.last_seen);
                 let open = self.active_event(&rule.rule_id, &h.agent_id).is_some();
                 if now - off < after || (!open && !self.warmup.ended) {
+                    continue;
+                }
+                if !open && self.upgrading(&h.agent_id, now).is_some() {
                     continue;
                 }
                 signals.push((
