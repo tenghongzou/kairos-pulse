@@ -19,7 +19,7 @@ import { isUnavailable, unavailableState, rolloutStateBadge, rolloutStateLabel, 
 
 function waveText(r) {
   if (r.state === 'completed') return t('rm.ro.waveDone');
-  if (r.state === 'draft' || r.state === 'cancelled' || r.state === 'scheduled') return '—';
+  if (r.state === 'draft' || r.state === 'cancelled' || r.state === 'scheduled' || r.state === 'pending_approval') return '—';
   return t('rm.ro.waveOf', { n: fmt.num((r.current_wave || 0) + 1), total: fmt.num(r.waves_total || 0) });
 }
 

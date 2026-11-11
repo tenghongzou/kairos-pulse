@@ -81,7 +81,7 @@ export function isWindowsMethod(install) {
 }
 
 // ---- 推送與主機的狀態 ----
-export const ROLLOUT_STATES = ['running', 'scheduled', 'paused', 'completed', 'cancelled', 'draft'];
+export const ROLLOUT_STATES = ['running', 'pending_approval', 'scheduled', 'paused', 'completed', 'cancelled', 'draft'];
 
 export function rolloutStateLabel(s) {
   return has(`rm.rs.${s}`) ? t(`rm.rs.${s}`) : s;
@@ -91,7 +91,7 @@ export function rolloutStateBadge(s) {
   if (s === 'running') return statusBadge('info', rolloutStateLabel(s));
   if (s === 'paused') return statusBadge('warning', rolloutStateLabel(s));
   if (s === 'completed') return statusBadge('online', rolloutStateLabel(s));
-  if (s === 'scheduled') return statusBadge('pending', rolloutStateLabel(s));
+  if (s === 'scheduled' || s === 'pending_approval') return statusBadge('pending', rolloutStateLabel(s));
   return neutralBadge(rolloutStateLabel(s));
 }
 
@@ -143,6 +143,8 @@ export function nextActionText(na) {
   switch (na.code) {
     case 'soaking':
       return t('rm.next.soaking', { m: fmt.num(na.minutes ?? 0) });
+    case 'pending_approval':
+      return t('rm.next.pending_approval');
     case 'scheduled':
       return na.starts_at ? t('rm.next.scheduled', { t: fmt.dateTime(na.starts_at, { seconds: false }) }) : t('rm.next.scheduledNoTime');
     case 'waiting_window':

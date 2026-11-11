@@ -25,6 +25,8 @@ use super::store::{ArtifactRow, RolloutHostRow, UpgradeHost};
 // ---- 推送的狀態 ----
 
 pub const ROLLOUT_DRAFT: &str = "draft";
+/// 已送出、等待另一位有 `rollouts:approve` 的使用者核准（雙人覆核，REMOTE.md 第 5.4 節；0.10）
+pub const ROLLOUT_PENDING_APPROVAL: &str = "pending_approval";
 /// 已送出、等待 `schedule.starts_at`（0.10）
 pub const ROLLOUT_SCHEDULED: &str = "scheduled";
 pub const ROLLOUT_RUNNING: &str = "running";
@@ -1092,6 +1094,7 @@ pub fn pause_cause<'a>(state: &str, cause: Option<&'a str>) -> Option<&'a str> {
 
 /// 推送清單的 `next_action`（固定代碼＋參數，主控台組文案；設計包 §31.8 F8 #4）。暫停中另附 `cause`
 /// （[`pause_cause`]）
+#[cfg(test)]
 pub fn next_action(
     state: &str,
     soak_until: Option<i64>,
@@ -1124,6 +1127,7 @@ pub fn next_action_scheduled(
 ) -> Value {
     match state {
         ROLLOUT_DRAFT => json!({"code": "draft"}),
+        ROLLOUT_PENDING_APPROVAL => json!({"code": "pending_approval"}),
         ROLLOUT_SCHEDULED => json!({
             "code": "scheduled",
             "starts_at": schedule.starts_at.map(crate::api::http::ts_ms),

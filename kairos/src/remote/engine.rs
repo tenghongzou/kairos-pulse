@@ -17,8 +17,8 @@ use super::rollout::{
     self, HOST_ACCEPTED, HOST_APPLYING, HOST_CANCELLED, HOST_DECLINED, HOST_EXPIRED, HOST_FAILED,
     HOST_OFFERED, HOST_PENDING, HOST_ROLLBACK_FAILED, HOST_ROLLED_BACK, HOST_SKIPPED,
     HOST_SKIPPED_OFFLINE, HOST_STAGED, HOST_SUCCEEDED, HOST_UNKNOWN, HostAction, ROLLOUT_CANCELLED,
-    ROLLOUT_COMPLETED, ROLLOUT_DRAFT, ROLLOUT_PAUSED, ROLLOUT_RUNNING, ROLLOUT_SCHEDULED,
-    ReleaseContext, RolloutAction, RolloutSpec,
+    ROLLOUT_COMPLETED, ROLLOUT_DRAFT, ROLLOUT_PAUSED, ROLLOUT_PENDING_APPROVAL, ROLLOUT_RUNNING,
+    ROLLOUT_SCHEDULED, ReleaseContext, RolloutAction, RolloutSpec,
 };
 use super::schedule::ScheduleSpec;
 use super::store::{HostTransition, NewRolloutHost, RolloutHostRow, RolloutRow};
@@ -167,6 +167,11 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         "soak_until": ts(r.soak_until),
         "created_at": crate::api::http::ts_ms(r.created_at),
         "created_by": r.created_by,
+        "submitted_at": ts(r.submitted_at),
+        "submitted_by": r.submitted_by,
+        "approved_at": ts(r.approved_at),
+        "approved_by": r.approved_by,
+        "reject_reason": r.reject_reason,
         "started_at": ts(r.started_at),
         "completed_at": ts(r.completed_at),
         "updated_at": crate::api::http::ts_ms(r.updated_at),
@@ -293,6 +298,7 @@ impl RemoteService {
         let live = self.live_hellos();
         let now = self.now_ms();
         let default_tz = self.default_timezone();
+        let approval = self.settings.approval_required();
         self.in_tx(move |s| {
             let (_, ctx) = release_context(s, &spec.target_version)?;
             let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
@@ -348,6 +354,8 @@ impl RemoteService {
                 "recommended": template(rollout::WaveSpec::recommended_template()),
             });
             v["max_waves"] = json!(rollout::MAX_WAVES);
+            // 雙人覆核：送出後要等另一位使用者核准（主控台在送出確認中說明）
+            v["approval_required"] = json!(approval);
             Ok(v)
         })
         .await
@@ -395,6 +403,11 @@ impl RemoteService {
                 started_at: None,
                 completed_at: None,
                 updated_at: now,
+                submitted_at: None,
+                submitted_by: None,
+                approved_at: None,
+                approved_by: None,
+                reject_reason: None,
             };
             s.insert_rollout(&r)?;
             who.event(
@@ -425,18 +438,26 @@ impl RemoteService {
         let schedule = schedule_to_store(&spec, &self.default_timezone(), now)?;
         let v = self.in_tx(move |s| {
             let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
-            if r.state != ROLLOUT_DRAFT && r.state != ROLLOUT_SCHEDULED {
-                return Err(invalid_state(&r, "修改（只有草稿與已排程、尚未開始的推送可以修改）").into());
+            if r.state != ROLLOUT_DRAFT
+                && r.state != ROLLOUT_SCHEDULED
+                && r.state != ROLLOUT_PENDING_APPROVAL
+            {
+                return Err(invalid_state(&r, "修改（只有草稿、待核准與已排程而尚未開始的推送可以修改）").into());
             }
             let (release_id, ctx) = release_context(s, &spec.target_version)?;
             if let Some(min) = incompatible(&ctx) {
                 return Err(incompatible_error(&spec.target_version, &min).into());
             }
-            // 已排程的推送：退回草稿、刪除已固定的對象，修改後要重新送出（確認字串以新的對象計算）
-            let reverted = r.state == ROLLOUT_SCHEDULED;
+            // 待核准或已排程的推送：退回草稿、刪除已固定的對象，修改後要重新送出（確認字串以新的對象計算；
+            // 雙人覆核時核准也失效，需要重新送審）
+            let reverted = r.state != ROLLOUT_DRAFT;
             if reverted {
                 s.delete_rollout_hosts(&id)?;
                 r.state = ROLLOUT_DRAFT.into();
+                r.submitted_at = None;
+                r.submitted_by = None;
+                r.approved_at = None;
+                r.approved_by = None;
                 r.updated_at = now;
                 s.update_rollout_state(&r)?;
             }
@@ -482,6 +503,7 @@ impl RemoteService {
         let now = self.now_ms();
         let who = who.clone();
         let live = self.live_hellos();
+        let approval = self.settings.approval_required();
         let v = self
             .in_tx(move |s| {
                 let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
@@ -545,9 +567,17 @@ impl RemoteService {
                     });
                 }
                 s.insert_rollout_hosts(&r.id, &rows, now)?;
+                r.submitted_at = Some(now);
+                r.submitted_by = Some(who.actor.clone());
+                r.approved_at = None;
+                r.approved_by = None;
+                r.reject_reason = None;
+                // 雙人覆核：先 pending_approval，核准後才排程或開始。
                 // 排程：starts_at 還沒到時先 scheduled（推送引擎到時轉為 running）
                 let later = schedule.starts_at.is_some_and(|t| t > now);
-                if later {
+                if approval {
+                    r.state = ROLLOUT_PENDING_APPROVAL.into();
+                } else if later {
                     r.state = ROLLOUT_SCHEDULED.into();
                 } else {
                     r.state = ROLLOUT_RUNNING.into();
@@ -564,7 +594,7 @@ impl RemoteService {
                     json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason, "schedule": schedule.json(), "state": r.state}),
                 )
                 .append(s, now)?;
-                if !later {
+                if r.state == ROLLOUT_RUNNING {
                     who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id}))
                         .append(s, now)?;
                 }
@@ -577,6 +607,109 @@ impl RemoteService {
             self.mark_dirty(id);
         }
         self.wake();
+        Ok(v)
+    }
+
+    /// `POST /api/v1/rollouts/{id}/approve`（雙人覆核，REMOTE.md 第 5.4 節）：`pending_approval` → `scheduled`
+    /// 或 `running`。核准者不得是建立者或送出者（403 `self_approval`，`KRS-E6106`）；呼叫端（API）已確認是
+    /// 以帳號登入的工作階段、有 `rollouts:approve`
+    pub async fn approve_rollout(&self, who: &Actor, id: String) -> Result<Value, ApiError> {
+        let now = self.now_ms();
+        let who = who.clone();
+        let v = self
+            .in_tx(move |s| {
+                let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
+                if r.state != ROLLOUT_PENDING_APPROVAL {
+                    return Err(invalid_state(&r, "核准（只有待核准的推送可以核准）").into());
+                }
+                if who.actor == r.created_by || r.submitted_by.as_deref() == Some(who.actor.as_str()) {
+                    return Err(ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "self_approval",
+                        "不能核准自己建立或送出的推送，請由另一位有 rollouts:approve 權限的使用者核准",
+                    )
+                    .with_product_code(super::CODE_SELF_APPROVAL)
+                    .with_details(json!({"created_by": r.created_by, "submitted_by": r.submitted_by}))
+                    .into());
+                }
+                let schedule = ScheduleSpec::from_db(&r.schedule);
+                if schedule.ends_at.is_some_and(|e| e <= now) {
+                    return Err(ApiError::conflict("schedule_ended", "排程的結束時間（ends_at）已經過了，請退回後修改排程").into());
+                }
+                r.approved_at = Some(now);
+                r.approved_by = Some(who.actor.clone());
+                if schedule.starts_at.is_some_and(|t| t > now) {
+                    r.state = ROLLOUT_SCHEDULED.into();
+                } else {
+                    r.state = ROLLOUT_RUNNING.into();
+                    r.started_at = Some(now);
+                    r.wave_started_at = Some(now);
+                }
+                r.updated_at = now;
+                s.update_rollout_state(&r)?;
+                let hosts = s.rollout_hosts(&r.id)?;
+                who.event(
+                    "rollout",
+                    "rollout.approve",
+                    Some(r.id.clone()),
+                    None,
+                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "created_by": r.created_by, "submitted_by": r.submitted_by, "state": r.state, "progress": rollout::progress(&hosts)}),
+                )
+                .append(s, now)?;
+                if r.state == ROLLOUT_RUNNING {
+                    who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id, "approved": true}))
+                        .append(s, now)?;
+                }
+                Ok(rollout_json(&r, &hosts, now, true))
+            })
+            .await
+            .map_err(|e| e.into_api("推送"))?;
+        if let Some(id) = v["id"].as_str() {
+            self.mark_dirty(id);
+        }
+        self.wake();
+        Ok(v)
+    }
+
+    /// `POST /api/v1/rollouts/{id}/reject`：退回待核准的推送（回到草稿、刪除已固定的對象，`reject_reason`
+    /// 留給建立者看；修改後重新送出）
+    pub async fn reject_rollout(
+        &self,
+        who: &Actor,
+        id: String,
+        reason: String,
+    ) -> Result<Value, ApiError> {
+        let now = self.now_ms();
+        let who = who.clone();
+        let v = self
+            .in_tx(move |s| {
+                let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
+                if r.state != ROLLOUT_PENDING_APPROVAL {
+                    return Err(invalid_state(&r, "退回（只有待核准的推送可以退回）").into());
+                }
+                s.delete_rollout_hosts(&r.id)?;
+                let (was_at, was_by) = (r.submitted_at.take(), r.submitted_by.take());
+                r.state = ROLLOUT_DRAFT.into();
+                r.approved_at = None;
+                r.approved_by = None;
+                r.reject_reason = Some(reason.clone());
+                r.updated_at = now;
+                s.update_rollout_state(&r)?;
+                who.event(
+                    "rollout",
+                    "rollout.reject",
+                    Some(r.id.clone()),
+                    None,
+                    json!({"rollout_id": r.id, "name": r.name, "reason": reason, "submitted_by": was_by, "submitted_at": was_at.map(crate::api::http::ts_ms)}),
+                )
+                .append(s, now)?;
+                Ok(rollout_json(&r, &[], now, true))
+            })
+            .await
+            .map_err(|e| e.into_api("推送"))?;
+        if let Some(id) = v["id"].as_str() {
+            self.mark_dirty(id);
+        }
         Ok(v)
     }
 

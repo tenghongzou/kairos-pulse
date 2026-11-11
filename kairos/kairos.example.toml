@@ -220,3 +220,4 @@ extra_principals = []         # 除 release@kairos-pulse 外另外接受的 prin
 max_concurrent_downloads = 100 # 同時經 8443 下載發佈檔的主機數，1..=10000；超過時回 rate_limited（retry_after_ms）
 max_release_bytes = 134217728 # 單一發佈檔的上限（bytes），1 MiB～128 MiB
 rollout_retention_days = 400  # 已完成或取消的推送保留天數，1..=3650
+rollout_approval = "none"     # 雙人覆核（0.10.0）："none" 或 "required"：送出的推送必須由另一位有 rollouts:approve 的使用者（帳號登入）核准才會開始；只能在這裡設定

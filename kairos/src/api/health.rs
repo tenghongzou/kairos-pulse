@@ -780,6 +780,7 @@ async fn remote(ctx: &ApiContext) -> Item {
         "config_enabled": st.config_enabled,
         "upgrade_enabled": st.upgrade_enabled,
         "allowed_signers_configured": trust,
+        "rollout_approval": st.rollout_approval,
     });
     if !st.config_enabled && !st.upgrade_enabled {
         return Item::new(

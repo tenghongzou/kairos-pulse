@@ -440,6 +440,54 @@ async fn releases_and_rollouts_over_https() {
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&spec)).await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let id = body(&r)["data"]["id"].as_str().unwrap().to_string();
+    // 雙人覆核的端點（0.10）：需要 rollouts:approve（只有管理員）與以帳號登入的工作階段——API token 不能核准、退回
+    for action in ["approve", "reject"] {
+        let path = format!("/api/v1/rollouts/{id}/{action}");
+        let r = call(
+            addr,
+            "POST",
+            &path,
+            Some(&op),
+            Some(&json!({"reason": "x"})),
+        )
+        .await;
+        assert_eq!(
+            (
+                r.status,
+                body(&r)["error"]["details"]["permission"].as_str()
+            ),
+            (403, Some("rollouts:approve")),
+            "{action}"
+        );
+        let r = call(
+            addr,
+            "POST",
+            &path,
+            Some(&admin),
+            Some(&json!({"reason": "x"})),
+        )
+        .await;
+        assert_eq!(
+            (r.status, body(&r)["error"]["code"].as_str()),
+            (403, Some("session_required")),
+            "{action}"
+        );
+        let r = call(addr, "GET", &path, Some(&admin), None).await;
+        assert_eq!(r.status, 405, "{action}");
+    }
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/rollouts?state=pending_approval",
+        Some(&op),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        body(&r)["meta"],
+        json!({"paused": 0, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "rollout_approval": "none"})
+    );
     let r = call(
         addr,
         "GET",
@@ -628,7 +676,7 @@ async fn releases_and_rollouts_over_https() {
     assert_eq!(list["data"].as_array().map(Vec::len), Some(0));
     assert_eq!(
         list["meta"],
-        json!({"paused": 1, "rollback_failed_unacknowledged": 0})
+        json!({"paused": 1, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "rollout_approval": "none"})
     );
     // 系統健康的「遠端管理」：主控台暫停不算異常
     let viewer = token(&f, Role::Viewer);

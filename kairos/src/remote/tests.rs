@@ -2100,3 +2100,216 @@ async fn four_wave_rollouts_advance_wave_by_wave() {
         .unwrap();
     assert_eq!((r.state.as_str(), r.current_wave), ("completed", 3));
 }
+
+/// 雙人覆核（REMOTE.md 第 5.4 節）：送出後待核准、不能核准自己建立或送出的推送（KRS-E6106）、退回回到草稿、
+/// 修改待核准的推送要重新送審、核准後才開始（有 starts_at 時先排程）
+#[tokio::test]
+async fn approval_gates_the_rollout_until_someone_else_approves() {
+    let signer = TestSigner::new(23);
+    let fx = Fx::new("approval", |s, dir| {
+        trust_settings(&signer)(s, dir);
+        s.rollout_approval = "required".into();
+    })
+    .await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let other = Actor {
+        actor: "user:bob".into(),
+        ip: None,
+    };
+    let third = Actor {
+        actor: "user:carol".into(),
+        ip: None,
+    };
+    let body = |name: &str| json!({"name": name, "target_version": "0.9.2", "selector": {"agent_ids": [A]}, "waves": [{"size": "rest"}]});
+    let created = fx
+        .svc
+        .create_rollout(&who(), RolloutSpec::parse(&body("x")).unwrap())
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    // 草稿不能核准
+    let e = fx
+        .svc
+        .approve_rollout(&other, id.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state");
+    // 送出（另一位管理員 bob）：待核准，對象已固定但不提議、沒有 rollout.start
+    let v = fx
+        .svc
+        .submit_rollout(&other, id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "pending_approval");
+    assert_eq!(v["next_action"]["code"], "pending_approval");
+    assert_eq!(v["submitted_by"], "user:bob");
+    assert_eq!(fx.host_state(&id, A).await.state, "pending");
+    fx.set_now(T0 + MIN);
+    fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(A), None, "核准前不提議");
+    assert!(
+        !fx.audit_actions()
+            .await
+            .contains(&"rollout.start".to_string())
+    );
+    // 待核准的主機算在未結束的推送裡
+    let e = fx
+        .svc
+        .create_rollout(&who(), RolloutSpec::parse(&body("y")).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "rollout_overlap");
+    // 建立者與送出者都不能核准
+    for actor in [who(), other.clone()] {
+        let e = fx
+            .svc
+            .approve_rollout(&actor, id.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.status.as_u16(), e.code, e.product_code),
+            (403, "self_approval", Some("KRS-E6106")),
+            "{}",
+            actor.actor
+        );
+    }
+    // 退回：回到草稿、對象刪除、留下原因
+    let v = fx
+        .svc
+        .reject_rollout(&third, id.clone(), "時段不對".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["reject_reason"].as_str()),
+        (Some("draft"), Some("時段不對"))
+    );
+    assert_eq!(v["submitted_by"], Value::Null);
+    let rid = id.clone();
+    let n = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.rollout_hosts(&rid)?.len()))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    let e = fx
+        .svc
+        .reject_rollout(&third, id.clone(), "x".into())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state");
+    // 重新送出（建立者）：退回的原因清除；修改待核准的推送 → 退回草稿，要重新送審
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["reject_reason"].is_null()),
+        (Some("pending_approval"), true)
+    );
+    let v = fx
+        .svc
+        .update_rollout(&who(), id.clone(), RolloutSpec::parse(&body("x2")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "draft");
+    let e = fx
+        .svc
+        .approve_rollout(&third, id.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state", "修改後核准失效");
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    // 第三人核准：開始推送，稽核有 approve 與 start
+    let v = fx.svc.approve_rollout(&third, id.clone()).await.unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["approved_by"].as_str()),
+        (Some("running"), Some("user:carol"))
+    );
+    let e = fx
+        .svc
+        .approve_rollout(&third, id.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state", "不能重複核准");
+    fx.set_now(T0 + 3 * MIN);
+    fx.svc.tick().await.unwrap();
+    assert!(fx.svc.offer_of(A).is_some(), "核准後才提議");
+    let actions = fx.audit_actions().await;
+    for a in [
+        "rollout.submit",
+        "rollout.reject",
+        "rollout.approve",
+        "rollout.start",
+    ] {
+        assert!(actions.contains(&a.to_string()), "{a}：{actions:?}");
+    }
+    fx.svc
+        .cancel_rollout(&who(), id, "結束".into())
+        .await
+        .unwrap();
+
+    // 有 starts_at：核准後先排程
+    let mut later = body("z");
+    later["schedule"] = json!({"starts_at": crate::api::http::ts_ms(T0 + 60 * MIN)});
+    let created = fx
+        .svc
+        .create_rollout(&who(), RolloutSpec::parse(&later).unwrap())
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    let v = fx.svc.approve_rollout(&third, id.clone()).await.unwrap();
+    assert_eq!(v["state"], "scheduled");
+    // 待核准的推送也可以取消
+    fx.svc
+        .cancel_rollout(&who(), id, "結束".into())
+        .await
+        .unwrap();
+}
+
+/// 沒有啟用雙人覆核時（預設）送出後直接開始，核准／退回為 invalid_state
+#[tokio::test]
+async fn approval_is_off_by_default() {
+    let signer = TestSigner::new(24);
+    let fx = Fx::new("noapproval", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let spec = RolloutSpec::parse(
+        &json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}, "waves": [{"size": "rest"}]}),
+    )
+    .unwrap();
+    let created = fx.svc.create_rollout(&who(), spec).await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["submitted_by"].as_str()),
+        (Some("running"), Some("user:admin"))
+    );
+    let bob = Actor {
+        actor: "user:bob".into(),
+        ip: None,
+    };
+    let e = fx.svc.approve_rollout(&bob, id.clone()).await.unwrap_err();
+    assert_eq!(e.code, "invalid_state");
+    let e = fx
+        .svc
+        .reject_rollout(&bob, id, "x".into())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_state");
+}

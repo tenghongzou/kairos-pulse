@@ -1082,6 +1082,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
   - `ends_at`：到時尚未開始替換的主機（`pending`、提議中、`skipped_offline`）標為 `expired`（`reason: rollout_ended`）；沒有替換中的主機時推送 `completed`，有的話等它們結束。送出時 `ends_at` 已過 → 409 `schedule_ended`。
   - Kairos 重新啟動：時段以目前時間與資料表中的 `schedule` 重新計算，不需要另外的狀態。暫停後 `resume` 同樣重新判斷時段。
   - 不需要協定變更：Pulse 0.9.0 已遵守 `apply_window`（已暫存的升級等待 `not_before`、超過 `not_after` 回報 `expired`）。
+- **雙人覆核**（0.10.0，第 5.4 節）：`[remote] rollout_approval = "none" | "required"`（預設 `none`；`kairos.toml`，需要重新啟動）。`required` 時 `submit`（L2／L3 確認照舊、對象在此時固定）之後為 `pending_approval`，推送引擎不處理它；`POST …/approve`（權限 `rollouts:approve`，只有管理員；**只接受以帳號登入的工作階段**，API token 403 `session_required`）由建立者（`created_by`）與送出者（`submitted_by`）以外的人核准（否則 403 `self_approval`，`KRS-E6106`）後轉為 `running`，`starts_at` 在未來時為 `scheduled`。`POST …/reject`（`reason` 必填）退回 `draft`、刪除已固定的對象並記下 `reject_reason`；修改（`PUT`）待核准的推送同樣退回 `draft`（核准的是固定下來的內容，改了就要重新送審）。待核准的推送可以取消，它的主機算在未結束的推送中（`rollout_overlap`）。稽核 `rollout.approve`、`rollout.reject`（`rollout.submit` 的 `details.state` 為 `pending_approval`）。`rollout_approval = "none"` 時核准／退回為 409 `invalid_state`；由 `required` 改回 `none` 時，已在 `pending_approval` 的推送仍要核准或退回。schema v10：`rollouts.submitted_at`、`submitted_by`、`reject_reason`。
 - **資格分類的主機資訊**：預覽、建立與送出都以清冊的列為基礎，連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤覆蓋，協商了 `upgrade` 的連線再以發提議時使用的資訊（`AgentSession`）覆蓋——與發提議一致，主機連線後不必等清冊每 30 秒的同步（原本只有協商了遠端管理的連線如此，沒有 mTLS 時約有 30 秒的落差）。清冊還沒有的主機（連線後尚未寫入過任何資料，沒有 `host_id`）不在對象中。`GET /api/v1/hosts/{agent_id}/upgrade` 的版本、`install`、`arch` 同樣以 hello 為準。
 - 推送引擎每 5 秒（狀態改變時立即）每個推送一個交易：逾時（提議後 24＋1 小時仍未開始 → `expired`；`applying` 後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線 → `unknown`）、離線寬限（`skipped_offline`，重新連線時回到 `pending`）、失敗比例（持續檢查）、觀察期、人工繼續、完成。只對**連線中且協商了 `upgrade`** 的主機提議；連線中但沒有協商的主機記為 `skipped`（`not_ready`）。
 - **`server_lost`**：`applying` 的逾時判斷中，最後一次離線的原因是 Kairos 這端（`server_shutdown`、叢集的 `server_lost`）時，期限從 Kairos 這次啟動時重新起算，不把主機標為 `unknown`（主機連不上是因為 Kairos 的節點失聯或停機，不是卡在替換中）；`server_lost` 已在 0.9.0 的 `offline_reason` 列舉中（單機的 Kairos 不會產生）。Kairos 啟動後 1 分鐘內不提議新的主機（第 4.7.4 節第 5 項）。
@@ -1114,7 +1115,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 項目 | 規格 | 實作 |
 |---|---|---|
 | 維護時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **固定位移**（`+08:00`；另接受 `UTC`、`Z`），預設 `alerts.timezone`（本來就是固定位移），沒有設定時 `+08:00`。不支援時區名稱與日光節約時間：Kairos 沒有時區資料庫的依賴，告警的時區也是固定位移；有日光節約時間的地區需要在換季時調整時段（列入待決） |
-| 修改已排程的推送（0.10.0） | `draft`／`pending_approval`／`scheduled` 可修改，修改後重新送審 | `scheduled` 的推送修改時退回 `draft`（對象重新計算、確認字串重新輸入） |
+| 修改已排程的推送（0.10.0） | `draft`／`pending_approval`／`scheduled` 可修改，修改後重新送審 | `pending_approval`、`scheduled` 的推送修改時退回 `draft`（對象重新計算、確認字串重新輸入、重新核准） |
+| 雙人覆核（0.10.0） | 核准者不得是建立者；關閉雙人覆核是 L3 操作；主控台唯讀顯示設定；降版 L3 要重新驗證 | 核准者不得是建立者**或送出者**（比規格嚴格：否則甲建立、乙送出並自己核准，仍只有一個人看過固定下來的對象）；`reject` 不限制身分（往安全的方向）。`rollout_approval` 只在 `kairos.toml`，修改需要主機上的檔案權限與重新啟動，沒有另外的 L3 流程或稽核事件；目前的值在系統健康 `remote` 項目的 `values.rollout_approval` 與推送清單的 `meta`，S21 系統設定頁尚未顯示。降版推送的 L3 仍是固定字串＋原因（設計包 §31.12 #7 的暫行做法，未要求重新驗證密碼；列入待決） |
 | `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
 | 對象固定的時間 | 推送開始時（第 4.7.2 節） | 送出時（0.9 送出即開始，兩者相同） |
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |

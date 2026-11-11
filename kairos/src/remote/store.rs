@@ -177,6 +177,14 @@ pub struct RolloutRow {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub updated_at: i64,
+    /// 送出的時間與執行者（0.10.0，schema v10；雙人覆核時核准者不得是建立者或送出者）
+    pub submitted_at: Option<i64>,
+    pub submitted_by: Option<String>,
+    /// 核准的時間與執行者（雙人覆核）
+    pub approved_at: Option<i64>,
+    pub approved_by: Option<String>,
+    /// 最近一次被退回的原因（退回後回到草稿；再次送出時清除）
+    pub reject_reason: Option<String>,
 }
 
 /// `rollout_hosts` 的一列（`agent_id`、`hostname` 取自清冊）

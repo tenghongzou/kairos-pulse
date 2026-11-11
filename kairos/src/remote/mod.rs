@@ -69,6 +69,8 @@ pub const CODE_ROLLED_BACK: &str = "KRS-W8407";
 pub const CODE_IMPORT_FAILED: &str = "KRS-E8413";
 /// 推送已自動暫停
 pub const CODE_ROLLOUT_PAUSED: &str = "KRS-W8414";
+/// 不能核准自己建立或送出的推送（雙人覆核，REMOTE.md 第 5.4 節；API 403 `self_approval`）
+pub const CODE_SELF_APPROVAL: &str = "KRS-E6106";
 /// 目標版本與目前的 Kairos 不相容（`min_kairos`）
 pub const CODE_INCOMPATIBLE: &str = "KRS-W8415";
 /// 升級完成（鏡像 `PLS-I8416`）

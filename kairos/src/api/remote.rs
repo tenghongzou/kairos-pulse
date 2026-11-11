@@ -1143,15 +1143,25 @@ async fn rollouts(
             if state.as_deref().is_some_and(|s| {
                 !matches!(
                     s,
-                    "draft" | "scheduled" | "running" | "paused" | "completed" | "cancelled"
+                    "draft"
+                        | "pending_approval"
+                        | "scheduled"
+                        | "running"
+                        | "paused"
+                        | "completed"
+                        | "cancelled"
                 )
             }) {
                 return Err(ApiError::param(
                     "state",
-                    "state 必須是 draft、scheduled、running、paused、completed 或 cancelled",
+                    "state 必須是 draft、pending_approval、scheduled、running、paused、completed 或 cancelled",
                 ));
             }
             let now_ms = now.timestamp_millis();
+            let approval = ctx
+                .remote
+                .as_ref()
+                .map(|s| s.settings.rollout_approval.clone());
             let (data, meta) = ctx
                 .pool
                 .read("升級推送", move |s| {
@@ -1183,9 +1193,19 @@ async fn rollouts(
                         .unacknowledged_rollback_failures()
                         .map_err(query_failed("升級推送"))?
                         .len();
+                    // 雙人覆核（0.10）：待核准的推送數與目前的設定
+                    let pending = s
+                        .list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))
+                        .map_err(query_failed("升級推送"))?
+                        .len();
                     Ok((
                         out,
-                        json!({"paused": paused, "rollback_failed_unacknowledged": failures}),
+                        json!({
+                            "paused": paused,
+                            "rollback_failed_unacknowledged": failures,
+                            "pending_approval": pending,
+                            "rollout_approval": approval,
+                        }),
                     ))
                 })
                 .await?;
@@ -1276,9 +1296,36 @@ async fn rollouts(
             };
             Ok(http::ok(now, v))
         }
-        (_, [_, "submit" | "pause" | "resume" | "continue" | "cancel"]) => {
-            Err(method_not_allowed("POST"))
+        // 雙人覆核（REMOTE.md 第 5.4 節）：需要 rollouts:approve 與以帳號登入的工作階段（API token 不能核准、
+        // 退回）；核准者不得是建立者或送出者（403 self_approval，KRS-E6106）
+        ("POST", [id, action @ ("approve" | "reject")]) => {
+            p.require(Permission::RolloutsApprove)?;
+            if !matches!(p.kind, super::auth::PrincipalKind::Session { .. }) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "session_required",
+                    "核准與退回推送需要以帳號登入的工作階段（API token 不能使用）",
+                ));
+            }
+            let svc = service(ctx, false)?;
+            let b = body_json_optional(req).await?.unwrap_or(json!({}));
+            reject_unknown_fields(&b, &["reason"])?;
+            let reason = ops::reason_of(&b)?;
+            let v = if *action == "approve" {
+                svc.approve_rollout(&who, id.to_string()).await?
+            } else {
+                let reason = reason.ok_or_else(|| ApiError::param("reason", "需要 reason"))?;
+                svc.reject_rollout(&who, id.to_string(), reason).await?
+            };
+            Ok(http::ok(now, v))
         }
+        (
+            _,
+            [
+                _,
+                "submit" | "pause" | "resume" | "continue" | "cancel" | "approve" | "reject",
+            ],
+        ) => Err(method_not_allowed("POST")),
         ("POST", [id, "hosts", agent, action @ ("retry" | "acknowledge")]) => {
             p.require(Permission::RolloutsWrite)?;
             let svc = service(ctx, false)?;

@@ -28,7 +28,8 @@ export async function refreshRolloutCount() {
     // 推送清單的 meta 直接給總數（已暫停的推送、回滾失敗且尚未標記為已處理的主機），不必逐一查主機
     const res = await api('/api/v1/rollouts', { raw: true });
     const meta = (res && res.meta) || {};
-    const n = (meta.paused || 0) + (meta.rollback_failed_unacknowledged || 0);
+    // 有核准權限的人另計待核准的推送（雙人覆核，0.10）
+    const n = (meta.paused || 0) + (meta.rollback_failed_unacknowledged || 0) + (session.can('rollouts:approve') ? meta.pending_approval || 0 : 0);
     if (my !== seq) return;
     setNavCount('rollouts', n ? { n, tone: 'warning', label: t('nav.badge.rollouts', { n }) } : null);
   } catch {

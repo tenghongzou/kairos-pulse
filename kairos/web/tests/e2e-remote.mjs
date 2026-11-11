@@ -388,6 +388,64 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await axe(ap.page, 'F8 S26 已自動暫停');
     await ap.ctx.close();
 
+    // 雙人覆核（0.10；REMOTE.md 第 5.4 節；測試用的 Kairos 沒有啟用，攔截詳情模擬 pending_approval）：
+    // 別人送出的推送 → 管理員看到「核准…」「退回…」；核准被伺服器拒絕（403 self_approval，KRS-E6106）時就地顯示；
+    // 自己建立的推送沒有「核准…」並說明原因；維運者（沒有 rollouts:approve）沒有這兩個按鈕
+    const pendingBy = (who) => async (route) => {
+      const r = await route.fetch();
+      const body = await r.json();
+      Object.assign(body.data, { state: 'pending_approval', next_action: { code: 'pending_approval' }, pause_reason: null, pause_cause: null, created_by: who, submitted_by: who, submitted_at: new Date().toISOString() });
+      return route.fulfill({ response: r, json: body });
+    };
+    const pa = await newPage();
+    await pa.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:someone-else'));
+    let approveCalls = 0;
+    await pa.page.route(`**/api/v1/rollouts/${rolloutId}/approve`, async (route) => {
+      approveCalls += 1;
+      return route.fulfill({
+        status: 403,
+        contentType: 'application/json',
+        body: JSON.stringify({ data: null, error: { code: 'self_approval', product_code: 'KRS-E6106', message: '不能核准自己建立或送出的推送，請由另一位有 rollouts:approve 權限的使用者核准' } }),
+      });
+    });
+    await login(pa.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(pa.page, 'E2E 0.9.1');
+    await pa.page.locator('.ds-alert', { hasText: '待核准' }).getByText(/user:someone-else 於 .* 送出，對象已固定/).waitFor();
+    assert.equal(await pa.page.getByRole('button', { name: '退回…' }).count(), 1);
+    assert.equal(await pa.page.getByRole('button', { name: '取消推送…' }).count(), 1, '待核准的推送可以取消');
+    await axe(pa.page, 'F8 S26 待核准（核准者）');
+    await pa.page.getByRole('button', { name: '核准…' }).click();
+    const ad = pa.page.getByRole('dialog');
+    await ad.getByText('核准推送「E2E 0.9.1」？').waitFor();
+    await axe(pa.page, 'F8 S26 核准確認');
+    await ad.getByRole('button', { name: '核准推送' }).click();
+    await ad.getByText('KRS-E6106').waitFor();
+    assert.equal(approveCalls, 1);
+    await ad.getByRole('button', { name: '取消' }).click();
+    await ad.waitFor({ state: 'detached' });
+    // 退回需要原因
+    await pa.page.getByRole('button', { name: '退回…' }).click();
+    const rd = pa.page.getByRole('dialog');
+    await rd.getByRole('button', { name: '退回推送' }).click();
+    await rd.getByText('請填寫原因').waitFor();
+    await rd.getByRole('button', { name: '取消' }).click();
+    await pa.ctx.close();
+    const own = await newPage();
+    await own.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin'));
+    await login(own.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(own.page, 'E2E 0.9.1');
+    await own.page.getByText('你建立或送出了這個推送，不能自己核准（KRS-E6106）。').waitFor();
+    assert.equal(await own.page.getByRole('button', { name: '核准…' }).count(), 0, '不能核准自己的推送');
+    assert.equal(await own.page.getByRole('button', { name: '退回…' }).count(), 1);
+    await own.ctx.close();
+    const po = await newPage();
+    await po.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin'));
+    await login(po.page, 'operator', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(po.page, 'E2E 0.9.1');
+    await po.page.locator('.ds-alert', { hasText: '待核准' }).waitFor();
+    assert.equal(await po.page.getByRole('button', { name: /^(核准…|退回…|取消推送…)$/ }).count(), 0, '維運者不能核准、退回或取消');
+    await po.ctx.close();
+
     // 即時更新（0.10；REMOTE.md 第 8.4 節）：推送詳情以 ?rollout_id= 訂閱 SSE，收到 rollout.host 就地更新那一列，
     // 之後的 rollout.progress 只重新載入頁首與批次、不重新抓取主機表（攔截 SSE：等主機表出現後才送出事件）
     const lv = await newPage();

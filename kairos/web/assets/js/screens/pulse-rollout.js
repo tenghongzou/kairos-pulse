@@ -173,6 +173,8 @@ export function render(ctx) {
       resume: { title: t('rm.det.resumeTitle', { name }), body: t('rm.det.resumeBody'), confirmText: t('rm.det.resumeConfirm'), reason: null, path: 'resume', done: t('rm.det.resumed') },
       continue: { title: t('rm.det.continueTitle'), body: t('rm.det.continueBody'), confirmText: t('rm.det.resumeConfirm'), reason: null, path: 'continue', done: t('rm.det.resumed') },
       cancel: { title: t('rm.det.cancelTitle', { name }), body: t('rm.det.cancelBody'), confirmText: t('rm.det.cancelConfirm'), reason: 'required', danger: true, path: 'cancel', done: t('rm.det.cancelled') },
+      approve: { title: t('rm.det.approveTitle', { name }), body: t('rm.det.approveBody', { n: fmt.num(r.hosts_total || 0) }), confirmText: t('rm.det.approveConfirm'), reason: null, path: 'approve', done: t('rm.det.approved') },
+      reject: { title: t('rm.det.rejectTitle', { name }), body: t('rm.det.rejectBody'), confirmText: t('rm.det.rejectConfirm'), reason: 'required', danger: true, path: 'reject', done: t('rm.det.rejectedDone') },
     }[kind];
     confirmL1({
       title: conf.title,
@@ -215,9 +217,16 @@ export function render(ctx) {
       submit: (confirm, reason) => api(`/api/v1/rollouts/${encodeURIComponent(id)}/submit`, { method: 'POST', body: { confirm, reason } }),
     });
     if (!res) return;
-    toast({ kind: 'success', title: t('rm.new.submitted', { name: r.name }) });
+    toast({ kind: 'success', title: res.state === 'pending_approval' ? t('rm.new.submittedApproval', { name: r.name }) : t('rm.new.submitted', { name: r.name }) });
     refreshRolloutCount();
     load();
+  }
+
+  /** 雙人覆核：目前的使用者是否為這個推送的建立者或送出者（不能自己核准，KRS-E6106） */
+  function isOwnRollout() {
+    const me = session.current();
+    const who = me && me.user ? `user:${me.user.username}` : null;
+    return Boolean(who) && (r.created_by === who || r.submitted_by === who);
   }
 
   function btn(text, onClick, variant = 'secondary', iconName = null) {
@@ -232,7 +241,12 @@ export function render(ctx) {
     if (r.state === 'running' && session.can('rollouts:pause')) acts.push(btn(t('rm.det.pause'), () => action('pause'), 'secondary', 'pause'));
     if (r.state === 'running' && r.awaiting_continue && write) acts.push(btn(t('rm.det.resume'), () => action('continue'), 'primary', 'play'));
     if (r.state === 'paused' && write) acts.push(btn(t('rm.det.resume'), () => action('resume'), 'primary', 'play'));
-    if ((r.state === 'running' || r.state === 'paused' || r.state === 'scheduled') && write) acts.push(btn(t('rm.det.cancel'), () => action('cancel'), 'danger-secondary'));
+    // 雙人覆核（0.10）：待核准的推送由另一位有 rollouts:approve 的使用者（以帳號登入）核准或退回
+    if (r.state === 'pending_approval' && session.can('rollouts:approve') && session.isSession()) {
+      if (!isOwnRollout()) acts.push(btn(t('rm.det.approve'), () => action('approve'), 'primary'));
+      acts.push(btn(t('rm.det.reject'), () => action('reject'), 'secondary'));
+    }
+    if ((r.state === 'running' || r.state === 'paused' || r.state === 'scheduled' || r.state === 'pending_approval') && write) acts.push(btn(t('rm.det.cancel'), () => action('cancel'), 'danger-secondary'));
     ctx.setTitle(r.name);
     mount(
       head,
@@ -248,6 +262,15 @@ export function render(ctx) {
   async function renderAlerts() {
     const out = [];
     if (r.state === 'draft') out.push(inlineAlert({ kind: 'info', body: t('rm.det.draftNote') }));
+    if (r.state === 'draft' && r.reject_reason) out.push(inlineAlert({ kind: 'warning', title: t('rm.det.rejected'), body: t('rm.det.rejectedBody', { reason: r.reject_reason }) }));
+    if (r.state === 'pending_approval') {
+      const notes = [t('rm.det.pendingBody', { who: r.submitted_by || '—', time: fmt.dateTime(r.submitted_at, { seconds: false }) })];
+      if (session.can('rollouts:approve')) {
+        if (!session.isSession()) notes.push(t('rm.det.pendingToken'));
+        else if (isOwnRollout()) notes.push(t('rm.det.pendingSelf'));
+      }
+      out.push(inlineAlert({ kind: 'info', role: 'status', title: t('rm.det.pendingTitle'), body: notes.join(' ') }));
+    }
     if (r.state === 'paused') {
       const auto = Boolean(r.pause_cause) && r.pause_cause !== 'manual';
       const acts = [

@@ -89,6 +89,7 @@ export function submitDialog({ name, preview, submit, onExclude }) {
         'div',
         { class: 'k-stack--sm' },
         lead,
+        preview.approval_required ? h('p', { class: 'strong' }, t('rm.new.submitLeadApproval')) : null,
         later ? h('p', null, t('rm.new.submitLeadLater', { t: fmt.dateTime(sch.starts_at, { seconds: false }) })) : null,
         sch.windows && sch.windows.length ? h('p', null, win.open === false && win.next ? t('rm.new.windowClosed', { t: fmt.dateTime(win.next, { seconds: false }) }) : t('rm.new.submitLeadWindow')) : null,
         preview.downgrade ? h('p', { class: 'strong' }, t('rm.new.submitLeadDown', { n: fmt.num(preview.downgrade) })) : null,
@@ -664,7 +665,7 @@ export function render(ctx) {
     });
     if (!r) return;
     submitted = true;
-    toast({ kind: 'success', title: r.state === 'scheduled' ? t('rm.new.submittedLater', { name: s.name, t: fmt.dateTime(r.starts_at, { seconds: false }) }) : t('rm.new.submitted', { name: s.name }) });
+    toast({ kind: 'success', title: r.state === 'pending_approval' ? t('rm.new.submittedApproval', { name: s.name }) : r.state === 'scheduled' ? t('rm.new.submittedLater', { name: s.name, t: fmt.dateTime(r.starts_at, { seconds: false }) }) : t('rm.new.submitted', { name: s.name }) });
     refreshRolloutCount();
     navigate(`/pulse/rollouts/${encodeURIComponent(r.id || draftId)}`, { replace: true });
   }

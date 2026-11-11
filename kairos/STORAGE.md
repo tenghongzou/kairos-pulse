@@ -176,6 +176,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v7（0.7.0，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v8（0.8.0，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v9（0.9.0，衝刺 9，商業審計 F8）：集中設定與 Pulse 遠端升級（第 18 節）。`config_profiles`、`config_profile_revisions`、`config_assignments`、`host_config`、`releases`、`release_artifacts`、`rollouts`、`rollout_hosts` 與索引；`hosts.install_method`、`install_upgrade`、`install_config`；`meta.config_rev`。SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V9`（新的資料表依 L1a 的做法放在領域的檔案中，`MIGRATIONS` 仍在 `store/sqlite.rs`）。升級後 0.8 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v10（0.10.0，衝刺 10，商業審計 F8）：升級推送的雙人覆核（REMOTE.md 第 5.4 節）。`rollouts` 新增 `submitted_at`、`submitted_by`、`reject_reason`（`approved_at`／`approved_by` v9 就有，0.10.0 起使用）。只新增欄位；`store/sqlite/remote.rs` 的 `SCHEMA_V10_ROLLOUT_APPROVAL`，是獨立的一步（叢集線也使用 v10，整合時重新編號）。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略

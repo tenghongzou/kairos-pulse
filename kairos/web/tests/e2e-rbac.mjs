@@ -117,6 +117,9 @@ const WRITES = [
   ['POST', `/api/v1/rollouts/r-${NOBODY}/submit`, 'rollouts:write'],
   ['POST', `/api/v1/rollouts/r-${NOBODY}/cancel`, 'rollouts:write'],
   ['POST', `/api/v1/rollouts/r-${NOBODY}/pause`, 'rollouts:pause'],
+  // 雙人覆核（0.10）：核准、退回只限有 rollouts:approve 的角色（管理員）
+  ['POST', `/api/v1/rollouts/r-${NOBODY}/approve`, 'rollouts:approve'],
+  ['POST', `/api/v1/rollouts/r-${NOBODY}/reject`, 'rollouts:approve'],
 ];
 
 // 清單頁 → 第一筆的詳情頁（也掃描寫入按鈕）：[清單路徑, 詳情連結的選擇器]
@@ -172,6 +175,7 @@ const BUTTON_PERMS = [
   [/^\/pulse\/releases/, /^(匯入版本|上傳發佈檔|刪除版本)/, 'releases:write'],
   [/^\/pulse\/rollouts/, /^(建立推送|送出推送|繼續…|取消推送)/, 'rollouts:write'],
   [/^\/pulse\/rollouts\//, /^暫停…/, 'rollouts:pause'],
+  [/^\/pulse\/rollouts\//, /^(核准…|退回…)/, 'rollouts:approve'],
   [/^\/hosts\//, /^標記為已處理/, 'rollouts:write'],
 ];
 

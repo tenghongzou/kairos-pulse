@@ -22,6 +22,14 @@ use crate::remote::store::{
 /// （回滾失敗標記為已處理）；`rollouts` 另存 `target_version`、`release_id` 不設外鍵（rusqlite 內附的 SQLite
 /// 預設開啟外鍵檢查；發佈版本刪除後已結束的推送紀錄仍要能顯示目標版本）。0.8 無法開啟 v9 的資料庫（降版從
 /// 備份還原）。
+/// v10（0.10.0）：升級推送的雙人覆核（REMOTE.md 第 5.4 節）。只新增欄位（`approved_at`／`approved_by`
+/// v9 就有）；獨立的一步，整合時可以重新編號
+pub(crate) const SCHEMA_V10_ROLLOUT_APPROVAL: &str = "
+ALTER TABLE rollouts ADD COLUMN submitted_at INTEGER;
+ALTER TABLE rollouts ADD COLUMN submitted_by TEXT;
+ALTER TABLE rollouts ADD COLUMN reject_reason TEXT;
+";
+
 pub(crate) const SCHEMA_V9: &str = "
 CREATE TABLE config_profiles (
     profile_id  INTEGER PRIMARY KEY,
@@ -801,7 +809,7 @@ pub fn upgrade_host(conn: &Connection, agent_id: &str) -> rusqlite::Result<Optio
 const ROLLOUT_COLUMNS: &str = "r.rollout_id, r.name, r.release_id, r.target_version, r.selector, r.waves, \
      r.schedule, r.options, r.state, r.current_wave, r.wave_started_at, r.soak_until, \
      r.awaiting_continue, r.pause_reason, r.cancel_reason, r.created_at, r.created_by, r.started_at, \
-     r.completed_at, r.updated_at, r.pause_cause";
+     r.completed_at, r.updated_at, r.pause_cause, r.submitted_at, r.submitted_by, r.approved_at,      r.approved_by, r.reject_reason";
 
 fn rollout_of(r: &Row<'_>) -> rusqlite::Result<RolloutRow> {
     Ok(RolloutRow {
@@ -826,6 +834,11 @@ fn rollout_of(r: &Row<'_>) -> rusqlite::Result<RolloutRow> {
         started_at: r.get(17)?,
         completed_at: r.get(18)?,
         updated_at: r.get(19)?,
+        submitted_at: r.get(21)?,
+        submitted_by: r.get(22)?,
+        approved_at: r.get(23)?,
+        approved_by: r.get(24)?,
+        reject_reason: r.get(25)?,
     })
 }
 
@@ -931,7 +944,9 @@ pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Resu
         "UPDATE rollouts SET state = ?2, current_wave = ?3, wave_started_at = ?4, soak_until = ?5,
             awaiting_continue = ?6, pause_reason = ?7, cancel_reason = ?8, started_at = ?9,
             pause_cause = ?12,
-            completed_at = ?10, updated_at = ?11
+            completed_at = ?10, updated_at = ?11,
+            submitted_at = ?13, submitted_by = ?14, approved_at = ?15, approved_by = ?16,
+            reject_reason = ?17
          WHERE rollout_id = ?1",
         params![
             r.id,
@@ -945,7 +960,12 @@ pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Resu
             r.started_at,
             r.completed_at,
             r.updated_at,
-            r.pause_cause
+            r.pause_cause,
+            r.submitted_at,
+            r.submitted_by,
+            r.approved_at,
+            r.approved_by,
+            r.reject_reason
         ],
     )?;
     Ok(())
