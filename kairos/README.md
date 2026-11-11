@@ -408,8 +408,8 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `timeouts.hello_secs` | `KAIROS__TIMEOUTS__HELLO_SECS` | `5` | 握手後等待 hello 的時間（秒），逾時直接關閉，1～3600 |
 | `timeouts.write_secs` | `KAIROS__TIMEOUTS__WRITE_SECS` | `5` | 每則訊息寫出、以及等待 report 寫入資料檔的逾時（秒），**1～6**：伺服器的回應延遲必須不超過 8 秒，Pulse 的讀取閒置只在心跳間隔上預留 10 秒餘裕（見「協定概述」） |
 | `storage.data_dir` | `KAIROS__STORAGE__DATA_DIR` | `data` | 資料輸出目錄（SQLite 的 `kairos.db` 與 `agents.json`；寫 JSONL 時另有 `reports-*.jsonl`）。須為本機磁碟（不要用 NFS／SMB） |
-| `storage.backend` | `KAIROS__STORAGE__BACKEND` | `sqlite` | report 的儲存：`sqlite`（原始資料、彙總、主機清冊，見 STORAGE.md）或 `jsonl`（舊版的按日 JSONL，沒有主機清冊與彙總；durable 的去重只在記憶體中，範圍有限） |
-| `storage.jsonl_mirror` | `KAIROS__STORAGE__JSONL_MIRROR` | `false` | `backend = "sqlite"` 時另外輸出 JSONL 鏡像（格式與 `backend = "jsonl"` 相同，盡力而為，不影響 `ack`）；`backend = "jsonl"` 時設為 `true` 是設定錯誤 |
+| `storage.backend` | `KAIROS__STORAGE__BACKEND` | `sqlite` | report 的儲存：`sqlite`（原始資料、彙總、主機清冊，見 STORAGE.md）、`postgres`（0.10.0：外部的 PostgreSQL 14 以上，功能與 `sqlite` 相同，連線設定在 `storage.postgres.*`；STORAGE.md 第 19 節、INSTALL.md 附錄 D）或 `jsonl`（舊版的按日 JSONL，沒有主機清冊與彙總；durable 的去重只在記憶體中，範圍有限） |
+| `storage.jsonl_mirror` | `KAIROS__STORAGE__JSONL_MIRROR` | `false` | `backend = "sqlite"`／`"postgres"` 時另外輸出 JSONL 鏡像（格式與 `backend = "jsonl"` 相同，盡力而為，不影響 `ack`）；`backend = "jsonl"` 時設為 `true` 是設定錯誤 |
 | `storage.raw_retention_days` | `KAIROS__STORAGE__RAW_RETENTION_DAYS` | `7` | SQLite 原始 report 保留天數（今天與前 N 天，UTC），`0` = 不依時間刪除，上限 3650 |
 | `storage.rollup_5m_retention_days` | `KAIROS__STORAGE__ROLLUP_5M_RETENTION_DAYS` | `31` | 5 分鐘彙總（min／max／sum／count）保留天數，`0` = 不依時間刪除 |
 | `storage.rollup_1h_retention_days` | `KAIROS__STORAGE__ROLLUP_1H_RETENTION_DAYS` | `400` | 1 小時彙總保留天數，`0` = 不依時間刪除 |
@@ -418,6 +418,16 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `storage.max_hosts` | `KAIROS__STORAGE__MAX_HOSTS` | 未設定時為 `max(100000, limits.max_agents)` | 主機清冊最多幾台，明確設定時必須介於 `limits.max_agents`～1000000；已滿時新主機的 report 回 `storage_unavailable` |
 | `storage.retention_days` | `KAIROS__STORAGE__RETENTION_DAYS` | `30` | JSONL（`backend = "jsonl"` 或鏡像）的 `reports-YYYY-MM-DD.jsonl` 保留天數（今天與前 N 天保留），`0` = 永久保留，上限 3650 |
 | `storage.max_daily_bytes` | `KAIROS__STORAGE__MAX_DAILY_BYTES` | `0` | 每個 `reports-YYYY-MM-DD.jsonl` 的大小上限（bytes），`0` = 不限制。合適的上限取決於部署規模，請自行設定。只寫入放得下的完整紀錄；放不下的 report 不寫入：`backend = "jsonl"` 時回 `storage_unavailable`（`report could not be stored`，確定未保存），鏡像時只是不寫入鏡像（SQLite 照常寫入、照常 `ack`），並記 `ERROR`（節流）。換日後寫入新檔即恢復。寫 JSONL 且設定值小於「`server.max_connections` 條連線 × 每秒 1 則 × 約 250 bytes × 86400 秒」的估算量時，啟動時記 `WARN` |
+| `storage.postgres.host` | `KAIROS__STORAGE__POSTGRES__HOST` | `127.0.0.1` | 只在 `backend = "postgres"` 時使用（以下同）。PostgreSQL 的主機名稱、IP，或 Unix socket 的目錄（以 `/` 開頭；只有 Unix） |
+| `storage.postgres.port` | `KAIROS__STORAGE__POSTGRES__PORT` | `5432` | 連接埠 |
+| `storage.postgres.dbname` | `KAIROS__STORAGE__POSTGRES__DBNAME` | `kairos` | 資料庫（必須是 `UTF8` 編碼） |
+| `storage.postgres.user` | `KAIROS__STORAGE__POSTGRES__USER` | `kairos` | 帳號：需要能建立 `schema`，或對既有的 schema 有 `CREATE`、`USAGE` 權限 |
+| `storage.postgres.password_file` | `KAIROS__STORAGE__POSTGRES__PASSWORD_FILE` | 空 | 密碼檔（去掉結尾的換行；建議 0600）。密碼只從檔案讀取、每次建立連線時重新讀，不接受寫在設定檔或環境變數中；空字串 = 不送密碼（peer／trust 驗證） |
+| `storage.postgres.schema` | `KAIROS__STORAGE__POSTGRES__SCHEMA` | `kairos` | Kairos 專用的 schema（不存在時建立）：小寫英文字母或 `_` 開頭，只含小寫英文字母、數字與 `_`，最多 63 個字元 |
+| `storage.postgres.sslmode` | `KAIROS__STORAGE__POSTGRES__SSLMODE` | 未設定 | `verify-full`（加密並驗證伺服器憑證與主機名稱）、`require`（只加密，記 `WARN`）、`disable`（不加密；非本機時記 `WARN`）。未設定時：`host` 是 loopback 或 Unix socket 為 `disable`，其他為 `verify-full` |
+| `storage.postgres.ca_file` | `KAIROS__STORAGE__POSTGRES__CA_FILE` | 空 | `verify-full` 時驗證伺服器憑證的 CA（PEM，可含多張）；空字串 = 作業系統的信任清單 |
+| `storage.postgres.pool_size` | `KAIROS__STORAGE__POSTGRES__POOL_SIZE` | `16` | 連線池的連線數上限（2..=128）。另有 report 寫入等專用連線；資料庫的 `max_connections` 至少要 `pool_size` ＋ 4 |
+| `storage.postgres.connect_timeout_secs` | `KAIROS__STORAGE__POSTGRES__CONNECT_TIMEOUT_SECS` | `5` | 建立連線、以及連線池已滿時等待連線的上限（1..=120 秒） |
 | `auth.client_ca` | `KAIROS__AUTH__CLIENT_CA` | `""` | 非空時啟用 mTLS：要求客戶端憑證，以此 PEM（可含多張 CA）驗證，並強制 `agent_id` 與憑證綁定（見「啟用 mTLS」） |
 | `auth.crl` | `KAIROS__AUTH__CRL`（逗號分隔） | `[]` | CRL 檔路徑清單（PEM 或 DER）；只在設定 `auth.client_ca` 時有效（見「撤銷客戶端憑證」） |
 | `auth.allow_multiple_dns_sans` | `KAIROS__AUTH__ALLOW_MULTIPLE_DNS_SANS` | `false` | 是否接受含多個 DNS SAN 的客戶端憑證；`false` 時憑證必須恰好有一個 DNS SAN |
@@ -436,7 +446,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `observability.listen` | `KAIROS__OBSERVABILITY__LISTEN` | 空字串 | 另外以純 HTTP 監聽 `/healthz`、`/readyz`、`/metrics`（例如 `127.0.0.1:9464`）；空字串＝只在主控台的監聽上提供。不可與其他監聽位址相同（`KRS-E0202`） |
 | `observability.on_console` | `KAIROS__OBSERVABILITY__ON_CONSOLE` | `true` | 主控台的監聽（`console.listen`，HTTPS）也提供這三個端點 |
 | `observability.metrics_token_file` | `KAIROS__OBSERVABILITY__METRICS_TOKEN_FILE` | 空字串 | `/metrics` 的 bearer token 檔（一行，至少 16 個字元）；設定時任何來源都要帶 `Authorization: Bearer <token>`，未設定時只接受 loopback 來源。啟動時讀取，更換 token 後需重新啟動；檔案讀不到或內容不合格式時拒絕啟動（結束代碼 3） |
-| `console.enabled` | `KAIROS__CONSOLE__ENABLED` | `true` | 主控台 API（[API.md](API.md)）；`false` 時不監聽。需要 `storage.backend = "sqlite"`（`jsonl` 時不啟動並記 `WARN`） |
+| `console.enabled` | `KAIROS__CONSOLE__ENABLED` | `true` | 主控台 API（[API.md](API.md)）；`false` 時不監聽。需要 `storage.backend = "sqlite"` 或 `"postgres"`（`jsonl` 時不啟動並記 `WARN`） |
 | `console.listen` | `KAIROS__CONSOLE__LISTEN` | `127.0.0.1:9443` | 主控台的 HTTPS 監聽位址；預設只綁 loopback，開放給管理網段時改成 `0.0.0.0:9443` 並以防火牆限制來源。與 `server.listen` 的位址相同時拒絕啟動（`KRS-E0202`，結束代碼 3），連接埠被佔用時結束代碼 11 |
 | `console.cert_path`、`console.key_path` | `KAIROS__CONSOLE__CERT_PATH`、`KAIROS__CONSOLE__KEY_PATH` | `""` | 主控台的伺服器憑證與私鑰；都留空時沿用 `server.cert_path`／`key_path`，必須同時設定或同時留空。內容變更時依 `server.reload_interval_secs` 熱重載 |
 | `console.max_connections` | `KAIROS__CONSOLE__MAX_CONNECTIONS` | `64` | 主控台的同時連線上限（含 SSE），1～4096；計入檔案描述元的需要量 |

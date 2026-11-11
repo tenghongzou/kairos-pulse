@@ -49,6 +49,42 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
+> 以下是 **0.10.0 的草稿**（版本號尚未更新，整合時統一調整）。0.10.0 的範圍是 HA 的 L1b（PostgreSQL 後端）與 L2（叢集協調，階段 A）；這裡只有 L1b（分支 `sprint10/pg-backend`）。
+
+### Kairos：PostgreSQL 儲存後端（HA L1b；`kairos/HA.md` 第 4、5、7、12 節、`kairos/STORAGE.md` 第 19 節）
+
+- **`storage.backend = "postgres"`**：SQLite 後端保存的所有資料（原始 report、彙總、主機清冊、資產、告警、使用者與工作階段、稽核雜湊鏈、註冊與 PKI、設定、指標轉出設定、遠端管理）可以改放在外部的 **PostgreSQL 14 以上**（只用社群版的功能，不需要擴充）。API、CLI、協定與 SQLite 後端相同。**SQLite 仍是預設值，既有部署的行為不變**。
+- **`[storage.postgres]`**：`host`（或 Unix socket 的目錄）、`port`、`dbname`、`user`、`password_file`、`schema`、`sslmode`（`verify-full`／`require`／`disable`；未設定時本機為 `disable`、其他為 `verify-full`）、`ca_file`、`pool_size`（預設 16）、`connect_timeout_secs`。密碼只從檔案讀取（每次建立連線時重新讀），不寫入日誌、`kairos diag` 與 `--check-config` 的輸出。TLS 使用 rustls＋ring（與其他連接埠相同）。
+- **schema** 與 SQLite 的 v9 一對一（資料表、欄位、索引名稱相同；文字欄位為 `COLLATE "C"`，排序與分頁的結果與 SQLite 一致），第一次啟動時在空的 schema 上建立。schema 比程式新（`KRS-E4405`）、不是 Kairos 的 schema（`KRS-E4402`）或 `kairos db migrate` 尚未完成（`KRS-E4404`）時拒絕使用。
+- **並行控制**：序列化的寫入交易以交易層級的 advisory lock 排成一列（等同 SQLite 的 `BEGIN IMMEDIATE`）；稽核雜湊鏈另有自己的鎖，`id` 在持鎖期間指定（連續、沒有空號），雜湊與 HMAC 與 SQLite 完全相同。report 的寫入不經過這些鎖：一批一個交易，以多列 `INSERT … ON CONFLICT DO NOTHING RETURNING` 去重；死結與序列化失敗自動重試，commit 時連線中斷為結果不明（Pulse 重送後去重）。
+- **`kairos db migrate`**（新）：`--to postgres`（SQLite → PostgreSQL）與 `--to sqlite:<檔案>`（PostgreSQL → SQLite），停止 Kairos 後執行。保留所有主鍵值；完成後一定驗證每張表的列數、`reports` 的 id 範圍與抽樣 1,000 列、稽核鏈（與來源的驗證結果相同），不一致時目的端不可使用（`KRS-E4404`）。`--reports-since <期間>` 只搬最近的原始資料；`--dry-run`、`--restart`、`--json`（`kairos.db.migrate/v1`）。Kairos 執行中時 `KRS-E4304`。
+- **啟動與檢查**：啟動時檢查版本、編碼、是否連到主庫（`KRS-E4402`）；連不上為 `KRS-E4401`（結束代碼 3）。沒有同步複寫時照常啟動，啟動時與之後每小時記一次 `KRS-W4403`；時差超過 2 秒記 `KRS-W8305`；`max_connections` 不足、連線未加密或不驗證憑證記 `WARN`。`kairos --check-config` 新增 `database` 項目（實際連線，不修改任何東西）。
+- **可觀測性**：`/readyz` 的 `database` 檢查連線池、主庫與 schema；`/metrics` 新增 `kairos_db_pool_connections{state}`、`kairos_db_pool_size`、`kairos_db_pool_errors_total{kind}`、`kairos_db_transaction_retries_total{reason}`、`kairos_db_clock_skew_seconds`、`kairos_db_synchronous_replication`；系統健康的 `database` 項目新增 `values.backend` 與 `values.postgres`（SQLite 時 `backend` 為 `sqlite`、`postgres` 為 `null`）。
+- **容量上限**（`storage.max_total_bytes`）在 PostgreSQL 上以資料表與索引的大小計算，刪除改為估計制（PostgreSQL 刪除後檔案不會變小；STORAGE.md 第 19.5 節）。
+- **不支援的命令**：`kairos db backup`（改用 `pg_dump` 等工具，或 `kairos db migrate --to sqlite:<檔案>`）與 `kairos reports import`（先匯入 SQLite 再搬移）在 PostgreSQL 後端以 `KRS-E4406`〔暫定〕拒絕。
+- **限制**：這一版沒有叢集協調，**同一個資料庫與 schema 同時只能有一個 Kairos 使用**；HA.md 第 5.5 節的叢集資料表尚未建立。與 HA.md 規格不同之處列在 HA.md 第 5.7 節。
+- 安裝與搬移步驟：`kairos/packaging/INSTALL.md` 附錄 D。
+
+### 相容性
+
+- 預設值（`storage.backend = "sqlite"`）下的行為、資料庫與 schema 版本（v9）都不變；沒有破壞性變更。
+- 系統健康 `GET /api/v1/system/health` 的 `database` 項目多了 `values.backend`、`values.postgres` 兩個欄位（新增欄位，既有欄位不變）。
+- `storage.jsonl_mirror` 的錯誤訊息文字改為「只在 backend = "sqlite" 或 "postgres" 時有效」。
+
+### 其他變更
+
+- 新依賴：`postgres` 0.19、`tokio-postgres-rustls` 0.14（MIT／Apache-2.0；`deny.toml` 的授權允許清單不需變更，加密後端仍只有 ring）。
+- 儲存層的測試改為同一個測試本體在 SQLite 與 PostgreSQL 各跑一次（`KAIROS_TEST_PG_URL` 指定資料庫；沒有設定時明確略過，`KAIROS_TEST_PG_REQUIRED=1` 時不可略過）；CI 的 Linux job 以 PostgreSQL 14 執行整套測試，另有 `postgres-compat` job 以 PostgreSQL 17 執行儲存層與 PostgreSQL 的端對端測試。Windows job 不執行 PostgreSQL 的測試。
+- 端對端測試 `tests/e2e/tests/postgres.rs`：實際的 Kairos＋Pulse 跑在 PostgreSQL 後端上（補送不重複不缺號、重新啟動後載回主機、稽核鏈驗證、`db migrate` 搬回 SQLite 後內容相同）。
+
+### 新的產品代碼
+
+`kairos/HA.md` 第 19 節已由設計包正式分配、這一版開始使用的代碼：`KRS-E4401`（無法連線到 PostgreSQL）、`KRS-E4402`（PostgreSQL 不符合要求）、`KRS-W4403`（沒有同步複寫）、`KRS-E4404`（資料搬移失敗或驗證不一致）、`KRS-E4405`（schema 比這個 Kairos 新）、`KRS-W8305`（時差超過 2 秒）。
+
+| 代碼 | 意義 | 狀態 |
+|---|---|---|
+| `KRS-E4406` | 這個命令不支援 PostgreSQL 後端（`kairos db backup`、`kairos reports import`） | **暫定**，待設計包正式分配（子類別 44） |
+
 ## [0.9.0] - 2026-10-21
 
 **Kairos 0.9.0、Pulse 0.9.0**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。

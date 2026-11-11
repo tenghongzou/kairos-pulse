@@ -447,6 +447,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 ### 10.2 備份
 
 - `/opt/kairos/kairos.toml`、憑證與 CRL
+- `storage.backend = "postgres"`（0.10.0）時資料庫以 PostgreSQL 的工具備份，`kairos db backup` 不適用，見附錄 D.4。以下是預設的 SQLite。
 - SQLite 資料庫：以線上備份產生一致的快照，**不要在執行中直接複製 `data/kairos.db`**（最新的交易可能還在 `kairos.db-wal` 中）。例如每天一次：
 
   ```bash
@@ -677,6 +678,93 @@ userdel kairos
 | 匯入期間 Kairos 啟動失敗（`database is locked`） | `kairos reports import` 正獨占資料庫。匯入結束後 systemd 會依 `Restart=on-failure` 自動重新啟動；匯入時請先停止服務 |
 | `kairos reports import` 以 root 執行時以結束代碼 10 拒絕 | 匯入會建立或寫入 `kairos.db`，請以服務帳號執行：`sudo -u kairos /opt/kairos/kairos reports import …` |
 | 其他錯誤訊息 | 見 `README.md`「疑難排解」 |
+
+## 附錄 D：以 PostgreSQL 作為儲存後端（0.10.0）
+
+預設的儲存是資料目錄中的 SQLite（`data/kairos.db`），單機部署不需要這個附錄。要把資料放在外部的 PostgreSQL（已有 DBA 與備份工具的環境，或為之後的高可用部署做準備）時依下列步驟；細節與限制見 `STORAGE.md` 第 19 節、`HA.md` 第 4.3 節。
+
+> 0.10.0 的這一部分只有儲存後端：**同一個資料庫與 schema 同時只能有一個 Kairos 使用**。多個 Kairos 共用資料庫的叢集協調（主動／備援）是另一個功能，完成前不要讓兩個 Kairos 指向同一個 schema。
+
+### D.1 準備資料庫
+
+需要 PostgreSQL 14 以上、`UTF8` 編碼，不需要任何擴充。在資料庫主機上（以 `postgres` 身分）：
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE ROLE kairos LOGIN PASSWORD '請換成隨機產生的密碼';
+CREATE DATABASE kairos OWNER kairos ENCODING 'UTF8' TEMPLATE template0;
+SQL
+```
+
+- Kairos 在資料庫中建立自己的 schema（預設 `kairos`）。不想讓 `kairos` 帳號擁有整個資料庫時，由 DBA 先建立 schema 並授權：`CREATE SCHEMA kairos AUTHORIZATION kairos;`。
+- `pg_hba.conf` 允許 Kairos 主機以 `scram-sha-256` 連線；不在同一台主機時啟用 TLS（`ssl = on`），並把簽發資料庫伺服器憑證的 CA 複製到 Kairos 主機。
+- `max_connections` 至少為 `storage.postgres.pool_size` ＋ 4（預設 20）。
+- 已確認（`ack`）的資料在主庫故障時不遺失需要同步複寫：`synchronous_commit = on` 且 `synchronous_standby_names` 非空。沒有同步備庫時 Kairos 照常啟動，但每小時記一次 `KRS-W4403`。
+- 連線池中介（PgBouncer）只能用 session pooling。
+
+### D.2 設定 Kairos
+
+```bash
+# 密碼檔：只有服務帳號可讀
+sudo install -d -o root -g kairos -m 750 /etc/kairos
+sudo install -o kairos -g kairos -m 600 /dev/null /etc/kairos/pg.password
+echo '上面設定的密碼' | sudo tee /etc/kairos/pg.password >/dev/null
+sudo install -o root -g kairos -m 640 pg-ca.pem /etc/kairos/pg-ca.pem      # 資料庫伺服器憑證的 CA
+```
+
+`/opt/kairos/kairos.toml`：
+
+```toml
+[storage]
+data_dir = "data"               # 仍然需要：金鑰檔、PKI 快取、agents.json 留在本機
+backend = "postgres"
+
+[storage.postgres]
+host = "db.example.com"
+port = 5432
+dbname = "kairos"
+user = "kairos"
+password_file = "/etc/kairos/pg.password"
+schema = "kairos"
+sslmode = "verify-full"         # 資料庫在本機（127.0.0.1 或 Unix socket）時可省略，預設為 disable
+ca_file = "/etc/kairos/pg-ca.pem"
+```
+
+檢查（會實際連線；不建立也不修改任何東西）後啟動：
+
+```bash
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+sudo systemctl start kairos
+```
+
+- `--check-config` 的 `database` 項目回報 PostgreSQL 的版本與 schema 的狀態；連不上為 `KRS-E4401`，不符合需求（版本、編碼、連到備庫、schema 不是 Kairos 的）為 `KRS-E4402`。
+- 第一次啟動時建立 schema v9。啟動時連不上資料庫，Kairos 以結束代碼 3 結束（`KRS-E4401`；systemd 不自動重試，修正後 `systemctl start kairos`）。執行中資料庫中斷時 Kairos 不會結束：report 回 `storage_unavailable`（Pulse 0.3 以上把取樣留在本機緩衝，恢復後補送）、`/readyz` 回 503，資料庫恢復後自動重新連線。
+- 隨附的 systemd unit 不限制對外連線的位址（`RestrictAddressFamilies` 已包含 `AF_INET`、`AF_INET6`、`AF_UNIX`），不需要修改；自行加了 `IPAddressDeny` 的部署要允許資料庫的位址。
+
+### D.3 從既有的 SQLite 搬到 PostgreSQL
+
+```bash
+sudo systemctl stop kairos
+sudo -u kairos /opt/kairos/kairos db backup /var/backups/kairos/pre-pg.db --include-keys --password-stdin \
+  --config /opt/kairos/kairos.toml < backup.pass
+# kairos.toml：加入 [storage.postgres]，storage.backend 先維持 "sqlite"
+sudo -u kairos /opt/kairos/kairos db migrate --to postgres --config /opt/kairos/kairos.toml
+# 驗證通過後：把 storage.backend 改成 "postgres"
+sudo -u kairos /opt/kairos/kairos --check-config --config /opt/kairos/kairos.toml
+sudo systemctl start kairos
+```
+
+- 搬移會驗證每張表的列數、抽樣比對 report 的內容並驗證稽核鏈；任何一項不一致以 `KRS-E4404` 結束，PostgreSQL 端不可使用（以 `--restart` 重新執行）。SQLite 資料庫不會被修改，可以照常以 `backend = "sqlite"` 啟動。
+- 原始 report 很多時以 `--reports-since 2d` 只搬最近的原始資料（彙總、清冊、告警、稽核一律全部搬），縮短停機時間；`--dry-run` 先看每張表的列數。
+- 停機期間 Pulse 0.3 以上把取樣存在本機緩衝，恢復後補送。
+- **回到 SQLite**：停止 Kairos，`kairos db migrate --to sqlite:/opt/kairos/data/kairos.db`（檔案不可已存在），把 `storage.backend` 改回 `"sqlite"` 後啟動。
+
+### D.4 備份與還原
+
+- **資料庫**以 PostgreSQL 的工具備份：`pg_dump -Fc -n kairos kairos`（邏輯備份，中小型）、pgBackRest 或 `pg_basebackup` 加 WAL 歸檔（實體備份與 PITR，建議）。`kairos db backup` 在這個後端不支援（`KRS-E4406`）；需要可攜的 SQLite 快照時停止 Kairos 後執行 `kairos db migrate --to sqlite:<檔案>`。
+- **金鑰檔不在資料庫中**：`data/audit-hmac.key`、`data/alerts-secrets.key`、`data/console.key`、`data/privacy.key` 與 `data/pki/` 的簽發 CA 私鑰要另外備份（複製檔案並保持 0600，或在改用 PostgreSQL 之前以 `kairos db backup --include-keys` 產生加密的金鑰備份），還原時與資料庫要是同一個時間點的組合。
+- **還原**：停止 Kairos → 以 PostgreSQL 的工具還原資料庫 → 確認資料目錄的金鑰檔是對應的那一組 → 啟動，執行 `kairos audit verify`。還原到較早的時間點時，那之後 Pulse 已收到 `ack` 的資料不會補送。
+- 大量刪除（保留清除、容量上限）之後空間由 autovacuum 回收重複使用，檔案不會自動變小；需要時在離峰時段執行 `VACUUM FULL` 或 `pg_repack`。
 
 ## 附錄 P：以 openssl 手動管理 PKI（0.7 以前的部署）
 

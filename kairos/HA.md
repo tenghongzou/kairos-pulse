@@ -14,6 +14,7 @@
 協定的線上格式仍以 [`crates/kairos-proto/PROTOCOL.md`](../crates/kairos-proto/PROTOCOL.md) 為準；本文件第 18 節的協定增補是草稿，實作時再併入 PROTOCOL.md。儲存的現況見 [`STORAGE.md`](STORAGE.md)，PKI 見 [`PKI.md`](PKI.md)，主控台 API 見 [`API.md`](API.md)，告警見 [`ALERTS.md`](ALERTS.md)。
 
 - 狀態：**衝刺 8 規格（分支 `sprint8/ha-spec`，從 0.8.0 `ef78b44` 分出；已併入 `sprint8/integration`）**。只有文件，沒有程式碼變更。第 21 節的 20 項**已決定（2026-10-19，採建議）**，本文件的規則即依各項的建議撰寫。**0.9.0 的範圍**：L1a 儲存抽象與 L4 Pulse 多位址（第 20 節）。**L4 已實作**（`sprint8/pulse-multiaddr`，已併入整合分支）；**L1a 已實作**（`sprint9/store-abstraction`，第 5.1、5.2 節標明與原規劃的差異）；與本文件原規劃不同之處已在第 8.6、18.1～18.3 節標明「0.9.0 的實作」；L1b PostgreSQL 後端（含 schema v9）與 L2 叢集協調（階段 A）延到 **0.10.0**。
+- **0.10.0〔草稿〕的進度**：**L1b PostgreSQL 後端已實作**（分支 `sprint10/pg-backend`；`storage.backend = "postgres"`、`[storage.postgres]`、`kairos db migrate`、`--check-config`／`/readyz`／`/metrics`／系統健康的資料庫檢查），細節見 [STORAGE.md](STORAGE.md) 第 19 節；與本文件不同之處列在第 5.7 節。**L2 叢集協調尚未實作**：沒有 `[cluster] enabled`、租約、leader 與 fencing，同一個資料庫同時只能有一個 Kairos 使用；第 5.5 節的叢集資料表也還沒有建立。
 - 商業審計 A2 的原文：「沒有 HA：Kairos 是單一行程，狀態放在記憶體，資料目錄假設只有一個寫入者。Pulse 只能設定一個伺服器位址。修正方向：讓 Kairos 只負責連線（無狀態），狀態與資料移到外部資料庫，前面放 L4 LB；Pulse 支援多個位址或 DNS SRV。6～10 人週。」
 - 設計依據（設計包，唯讀）：`decisions/INTEGRATION.md` §26～§30 的代碼分配慣例、`design-system/copywriting.md` §3（代碼格式與號段）、`kairos/screens.md` S20（系統健康）。設計包需要配合的事項列在第 22 節，**本線沒有修改 `design/`**。
 - 埠號寫法：本文件沿用文件慣例，以 8443 表示 agent 連線埠（`server.listen`）、8444 表示註冊通道（`enroll.listen`）、9443 表示主控台（`console.listen`）。注意 Kairos 程式內 `server.listen` 的預設值是 `127.0.0.1:8080`（`config.rs`），Pulse `server.port` 的預設值也是 8080。
@@ -469,6 +470,35 @@ sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --con
   任何一項不一致都以 `KRS-E4404` 結束（結束代碼 1），目的端保留供檢查，不會被當成可用的資料庫：遷移完成前 `meta.schema_version` 不寫入，Kairos 會拒絕使用。
 - **時間估算**（實作線 L3 需在 kp-build 量測後補上）：以每秒 10 萬列估算，1,000 台主機、原始資料 7 天（約 1.2 億列）約 20 分鐘；`--reports-since 1d` 約 3 分鐘。
 - **輸出**：依 `cli-style.md`，每張表一行進度，最後是摘要；`--json` 的 `schema` 為 `kairos.db.migrate/v1`。
+
+### 5.7 L1b 的實作與本文件的差異（0.10.0〔草稿〕，分支 `sprint10/pg-backend`）
+
+細節見 [STORAGE.md](STORAGE.md) 第 19 節。規格已決定的事（驅動 `postgres`＋`tokio-postgres-rustls`、自行實作的連線池、最低版本 14、READ COMMITTED、第 5.3 節的方言對應、`kairos db migrate`）照規格實作；下列各項與本文件不同，原則是「規格沒寫或無法照做時採最保守的做法」：
+
+| # | 本文件 | 實作 | 理由 |
+|---|---|---|---|
+| 1 | 第 5.5 節：v9 含叢集資料表（`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures`）與 `enroll_requests.issuing_node`／`issuing_at`、`alert_deliveries.claim_epoch` | **沒有建立**。PostgreSQL 的 schema 與 0.9.0 實際發佈的 SQLite v9（遠端管理的資料表）一對一 | 0.9.0 的 v9 已用於 F8；叢集資料表要以下一個 schema 版本在兩個後端同時新增，由 L2 決定欄位的最終形狀。`kairos db migrate` 依 `schema::TABLES` 逐表複製，新增資料表時加進清單即可 |
+| 2 | 第 5.4 節：D2～D8 逐項改寫成條件式 UPDATE、`ON CONFLICT … RETURNING` 或列鎖；鎖的順序 | `TxMode::Immediate` 的交易在 `BEGIN` 後取得交易層級的 advisory lock，全部排成一列（等同 `BEGIN IMMEDIATE`，跨節點成立）。D2（token 扣次數）、D6（設定版本）另外改成原子敘述；D3、D4、D5、D7、D8 維持「交易內先檢查再寫入」，由這個鎖保護 | 領域介面是 L1a 的「一個函式一條或數條 SQL、交易邊界在呼叫端」，逐項改寫需要改 trait 的簽章與呼叫端（`consume_token` 要回傳是否扣到、`replay_insert` 要回傳是否新插入、簽發要有搶占的方法），會與並行的 F8 線衝突。全域鎖在正確性上是這些改寫的上位集合；這些交易的量很小。之後要讓它們並行時再逐項改寫 |
+| 3 | 第 5.4 節：`40P01`／`40001` 時領域 store 自動重試整個交易最多 3 次 | 只有 report 的批次自動重試；領域 store 回暫時性錯誤（`StoreErrorKind::Busy` → API 503、Pulse 重試） | 交易邊界在呼叫端（`Store::begin` … `Tx::commit`），儲存層無法重放呼叫端的邏輯。有全域鎖時這些交易之間不會死結 |
+| 4 | 第 12.1 節：`SELECT value FROM meta WHERE key = 'audit_chain_head' FOR UPDATE` 序列化稽核寫入者 | 專用的交易層級 advisory lock；`id` 在持鎖期間指定為 `max(id) + 1` | 空資料庫時 head 列不存在，列鎖鎖不到東西（要另外處理第一筆的競爭）；advisory lock 沒有這個邊界情況。鏈的順序＝commit 的順序、`id` 連續、雜湊與 HMAC 與 SQLite 相同這幾個性質都成立 |
+| 5 | 第 7.3、7.4 節：PostgreSQL 後端由 leader 從原始資料產生彙總與速率 | 沿用 SQLite 的記憶體桶與寫入時計算速率 | 第 20.3 節允許的順序：只有一個 writer（單一節點、階段 A）時記憶體桶的不變式成立；leader 版屬於階段 B（M17、M18），需要租約與 fencing |
+| 6 | 第 7.5 節：保留與容量只由 leader 執行，容量規則與 STORAGE.md 第 8 節相同 | 由（唯一的）writer 執行；容量上限改為估計制（STORAGE.md 第 19.5 節） | PostgreSQL 刪除後檔案不會變小，照「刪到量測值低於 95%」會把資料刪光 |
+| 7 | 第 5.6 節：`COPY … FROM STDIN (FORMAT binary)`；來源是 PostgreSQL 時以 `cluster_nodes` 的心跳判斷是否所有節點都已停止 | 多列 `INSERT … SELECT FROM unnest(…)`；以「服務執行中」的 session advisory lock 判斷（Kairos 的寫入連線持有共享鎖，`db migrate` 取互斥鎖） | COPY 的二進位格式要自己實作；`cluster_nodes` 還不存在。advisory lock 在連線中斷時立即釋放，不會有「心跳還沒過期」的誤判 |
+| 8 | 第 5.6 節：驗證「在目的端執行完整的稽核鏈驗證」 | 目的端的驗證結果必須與來源**相同** | 來源的鏈原本就有斷點時（例如從 0.5 升級上來的未封存紀錄被改動過），搬移不應該永遠無法完成；輸出會註明 |
+| 9 | 第 15.1 節：`sslmode = "verify-full"`（預設） | 未設定時：loopback 與 Unix socket 為 `disable`，其他為 `verify-full`（第 4.3 節的「非 loopback 或 Unix socket 時預設 verify-full」） | 第 4.3 節與第 15.1 節的寫法不一致，採第 4.3 節 |
+| 10 | 第 16.3 節：`kairos db backup` 在 PostgreSQL 後端時拒絕 | 以暫定代碼 `KRS-E4406` 拒絕；`kairos reports import` 相同 | 第 19 節沒有分配這個情況的代碼 |
+| 11 | 第 5.2 節：測試以 `#[cfg(feature = "pg-tests")]` 加 `KAIROS_TEST_PG_URL` | 沒有 feature：測試一律編譯，執行時依 `KAIROS_TEST_PG_URL` 決定執行或明確略過；`KAIROS_TEST_PG_REQUIRED=1` 時不可略過 | 用 feature 會讓 CI 的 clippy／test 要多一組組合，而且沒開 feature 時看不出測試被跳過 |
+
+**給 L2（叢集協調）的接點**：
+
+- **連線**：`store::postgres::pool::active()` 是這個行程的連線池；`PgPool::get(Access, busy)` 取用池中的連線，`PgPool::dedicated(busy)` 建立不佔池的專用連線（租約續約、`LISTEN` 應該用它：池中的連線歸還後會被其他工作使用）。時間一律可以用資料庫的 `clock_timestamp()`；`pool::server_info` 已讀取時差。
+- **鎖**：`conn::LockKind`（`Write`、`Migrate`、`Audit`、`Service`）與 `PgPool::lock_key` 是 advisory lock 的鍵空間，新增種類時往後加。`Service` 的共享鎖目前由 writer 連線持有；多節點時每個節點都持有共享鎖，`db migrate`／離線 CLI 的互斥判斷不需要修改。
+- **fencing**：leader 專屬的寫入交易可以在取得 `Write` 鎖之後、第一個敘述加上第 6.2 節的 `SELECT … FROM cluster_leases … FOR SHARE`；`PgConn::begin_tx` 是加入點（單機時為空操作）。
+- **schema**：叢集資料表加在 `store/postgres/schema.rs`（新的版本常數與升級步驟；`ensure_schema` 目前只會在空的 schema 上建立 v9，還沒有「從 v9 升級」的路徑，L2 新增 v10 時要補上，並以既有的 `LockKind::Migrate` 序列化）與 SQLite 的 `MIGRATIONS`，同時把新資料表加進 `schema::TABLES`／`IDENTITY_COLUMNS`。
+- **領域介面**：`ClusterStore` 尚未定義；新增時依 L1a 的做法加入 `Store` 的 supertrait，並在 `store/sqlite/`、`store/postgres/` 各實作一份（`pg_domain!`）。
+- **需要改成只由 leader 執行的工作**（第 6.3 節）目前都在 `report::PgStore::maintain`（彙總寫出、保留、容量）與各服務的背景工作中，沒有任何租約檢查。
+- **啟動時把主機標為離線**（M2）：`PgStore::open` 與 SQLite 相同，執行 `UPDATE hosts SET online = 0 WHERE online = 1`；多節點時要改成第 6.6 節的規則。
+- **節點本機的檔案**：金鑰、PKI 快取、遠端升級的版本庫（`<data_dir>/releases/`）仍在資料目錄；版本庫的發佈檔在多節點下要另外處理（本文件沒有涵蓋）。
 
 ## 6. 叢集協調
 
