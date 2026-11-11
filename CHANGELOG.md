@@ -165,7 +165,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ### 其他變更
 
-- **安全性**：`rustls-webpki` 升級到 0.103.16（RUSTSEC-2026-0382：可能接受含已外洩 emSign 中繼憑證的憑證路徑），Kairos 與 Pulse 都受影響。
+- **安全性**：`rustls-webpki` 升級到 0.103.16（RUSTSEC-2026-0382：可能接受含已外洩 emSign 中繼憑證的憑證路徑），Kairos 與 Pulse 都受影響。`rusqlite` 升級到 0.41.1（`libsqlite3-sys` 0.39.1，內含的 SQLite 3.54 以上；RUSTSEC-2026-0459／CVE-2026-119375：資料庫與頁面大小不同的 `-wal` 檔一起開啟時可能讀到未初始化的記憶體，需要能改寫資料目錄的人才能利用），只有 Kairos 受影響；`tokio` 升級到 1.53.3（RUSTSEC-2026-0386：`AsyncFd` 的安全建構函式不符合 I/O safety，Kairos 與 Pulse 都沒有使用 `AsyncFd`）。
 - `kairos db backup --include-keys` 一併加密備份 `data/privacy.key`。
 - 主控台 API 的 `downloads` 另有 `base_url`、`install_script`、`files`、`product_code`；模式的 `stats` 另有 `downloads_in_progress`。
 - 註冊服務每小時另外刪除「清冊中已沒有的主機」過期超過 1 天的憑證紀錄。
