@@ -75,8 +75,20 @@ fn spec_defaults_and_validation() {
     assert_eq!(waves_from_db(&s.waves_json().to_string()), s.waves);
     for (body, field) in [
         (
-            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "schedule": {}}),
+            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "schedule": []}),
             "schedule",
+        ),
+        (
+            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "windows": []}),
+            "windows",
+        ),
+        (
+            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "schedule": {"timezone": "Asia/Taipei"}}),
+            "schedule.timezone",
+        ),
+        (
+            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "waves": vec![json!({"size": "rest"}); MAX_WAVES + 1]}),
+            "waves",
         ),
         (
             json!({"name": "", "target_version": "0.9.1", "selector": {"all": true}}),
@@ -95,7 +107,7 @@ fn spec_defaults_and_validation() {
             "selector.agent_ids",
         ),
         (
-            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "waves": [{"size": 1}, {"size": 2}, {"size": "rest"}]}),
+            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "waves": []}),
             "waves",
         ),
         (
@@ -285,8 +297,16 @@ fn opts(max: u32) -> RolloutOptions {
 
 const T0: i64 = 1_000_000_000;
 
+static NO_SCHEDULE: ScheduleSpec = ScheduleSpec {
+    starts_at: None,
+    ends_at: None,
+    windows: Vec::new(),
+    timezone: None,
+};
+
 fn input<'a>(waves: &'a [WaveSpec], o: &'a RolloutOptions, now: i64) -> TickInput<'a> {
     TickInput {
+        schedule: &NO_SCHEDULE,
         now_ms: now,
         started_ms: T0,
         start_grace_ms: START_GRACE_MS,
@@ -549,4 +569,353 @@ fn selector_matches_groups_tags_ids_and_excludes() {
     };
     assert!(id.matches(&h));
     assert!(!SelectorSpec::default().matches(&h));
+}
+
+// ---- 0.10：自訂批次 ----
+
+fn wave_counts(a: &[(i64, i64, i64)], waves: usize) -> Vec<usize> {
+    (0..waves as i64)
+        .map(|w| a.iter().filter(|x| x.1 == w).count())
+        .collect()
+}
+
+#[test]
+fn custom_waves_take_percentages_of_the_remaining_hosts() {
+    let hosts: Vec<UpgradeHost> = (1..=200)
+        .map(|i| host(i as u8, "0.9.0", "tar", "ready"))
+        .enumerate()
+        .map(|(n, mut h)| {
+            h.host_id = n as i64 + 1;
+            h.agent_id = format!("00000000-0000-4000-8000-{:012x}", n + 1);
+            h
+        })
+        .collect();
+    let refs: Vec<&UpgradeHost> = hosts.iter().collect();
+    // 建議的四批範本：1%（2 台）→ 剩餘 198 的 10%（20 台）→ 剩餘 178 的 50%（89 台）→ 其餘 89 台
+    let w = WaveSpec::recommended_template();
+    assert_eq!(w.len(), 4);
+    assert_eq!(w[0], WaveSpec::default_template()[0]);
+    assert_eq!(w[3].size, WaveSize::Rest);
+    let a = assign_waves("r-1", &refs, &w, &[]);
+    assert_eq!(wave_counts(&a, 4), [2, 20, 89, 89]);
+    // 每一批內的順序從 0 起連續，每台主機只出現一次
+    for wave in 0..4 {
+        let mut ords: Vec<i64> = a.iter().filter(|x| x.1 == wave).map(|x| x.2).collect();
+        ords.sort();
+        assert_eq!(ords, (0..ords.len() as i64).collect::<Vec<_>>());
+    }
+    let mut ids: Vec<i64> = a.iter().map(|x| x.0).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 200);
+    // 兩批的結果與批次數無關的部分一致：第一批是同樣的主機（0.9 相容）
+    let two = assign_waves("r-1", &refs, &WaveSpec::default_template(), &[]);
+    let first = |a: &[(i64, i64, i64)]| -> Vec<i64> {
+        a.iter().filter(|x| x.1 == 0).map(|x| x.0).collect()
+    };
+    assert_eq!(first(&a), first(&two));
+    assert_eq!(wave_counts(&two, 2), [2, 198]);
+    // 台數、max_hosts 與 canary
+    let mut w3 = vec![w[0].clone(), w[1].clone(), w[3].clone()];
+    w3[0].size = WaveSize::Count(5);
+    w3[0].max_hosts = None;
+    w3[1].size = WaveSize::Percent(50);
+    w3[1].max_hosts = Some(30);
+    assert_eq!(
+        wave_counts(&assign_waves("r-1", &refs, &w3, &[]), 3),
+        [5, 30, 165]
+    );
+    let canary = vec![hosts[7].agent_id.clone(), hosts[3].agent_id.clone()];
+    let c = assign_waves("r-1", &refs, &w3, &canary);
+    assert_eq!(first(&c), vec![hosts[7].host_id, hosts[3].host_id]);
+    assert_eq!(wave_counts(&c, 3), [2, 30, 168]);
+    // 主機比批次少：前面的批次各至少 1 台，後面的批次是空的
+    let few: Vec<&UpgradeHost> = hosts.iter().take(2).collect();
+    assert_eq!(
+        wave_counts(&assign_waves("r-1", &few, &w, &[]), 4),
+        [1, 1, 0, 0]
+    );
+    assert!(assign_waves("r-1", &[], &w, &[]).is_empty());
+    // 解析：最多 MAX_WAVES 批、只有最後一批是 rest
+    let body = |waves: serde_json::Value| json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "waves": waves});
+    let s = RolloutSpec::parse(&body(json!([
+        {"size": 1, "max_failure_ratio": 0, "manual_continue": true},
+        {"size": "10%", "soak_minutes": 30},
+        {"size": "50%", "soak_minutes": 30},
+        {"size": "rest"},
+    ])))
+    .unwrap();
+    assert_eq!(s.waves.len(), 4);
+    assert_eq!(waves_from_db(&s.waves_json().to_string()), s.waves);
+    assert_eq!(
+        RolloutSpec::parse(&body(
+            json!([{"size": "rest"}, {"size": "10%"}, {"size": "rest"}])
+        ))
+        .unwrap_err()
+        .0,
+        "waves[0]"
+    );
+}
+
+#[test]
+fn three_waves_advance_with_their_own_soak_limits_and_manual_continue() {
+    let mut w = WaveSpec::recommended_template();
+    w.remove(2); // canary（人工繼續、上限 0）→ 10%（觀察 30 分鐘、上限 5%）→ 其餘
+    w[1].max_failure_ratio = 0.5;
+    let o = opts(50);
+    let now = T0 + START_GRACE_MS;
+    let tick = |wave: i64, soak: Option<i64>, awaiting: bool, at: i64, hosts: &[RolloutHostRow]| {
+        let mut i = input(&w, &o, at);
+        i.current_wave = wave;
+        i.soak_until = soak;
+        i.awaiting_continue = awaiting;
+        plan_tick(&i, hosts, &capable)
+    };
+    // 第 1 批結束 → 觀察 60 分鐘 → 等待人工繼續（不會自己進下一批）
+    let hosts = vec![
+        rh(1, 0, 0, HOST_SUCCEEDED),
+        rh(2, 1, 0, HOST_PENDING),
+        rh(3, 1, 1, HOST_PENDING),
+        rh(4, 2, 0, HOST_PENDING),
+    ];
+    let (a, r) = tick(0, None, false, now, &hosts);
+    assert!(a.is_empty(), "後面的批次還不提議");
+    assert_eq!(
+        r,
+        Some(RolloutAction::StartSoak {
+            until: now + 60 * 60_000
+        })
+    );
+    let soak = Some(now + 60 * 60_000);
+    assert_eq!(tick(0, soak, false, now + 1000, &hosts).1, None);
+    assert_eq!(
+        tick(0, soak, false, now + 61 * 60_000, &hosts).1,
+        Some(RolloutAction::AwaitContinue)
+    );
+    assert_eq!(tick(0, soak, true, now + 62 * 60_000, &hosts).1, None);
+    // 第 2 批：只提議第 2 批（與之前批次）的主機
+    let (a, r) = tick(1, None, false, now, &hosts);
+    assert_eq!(a, vec![(1, HostAction::Offer), (2, HostAction::Offer)]);
+    assert_eq!(r, None);
+    // 第 2 批一成一敗：失敗比例 50% 沒有超過這一批的上限 50% → 觀察 30 分鐘 → 自動進第 3 批
+    let hosts = vec![
+        rh(1, 0, 0, HOST_SUCCEEDED),
+        rh(2, 1, 0, HOST_SUCCEEDED),
+        rh(3, 1, 1, HOST_ROLLED_BACK),
+        rh(4, 2, 0, HOST_PENDING),
+    ];
+    assert_eq!(
+        tick(1, None, false, now, &hosts).1,
+        Some(RolloutAction::StartSoak {
+            until: now + 30 * 60_000
+        })
+    );
+    assert_eq!(
+        tick(1, Some(now + 30 * 60_000), false, now + 31 * 60_000, &hosts).1,
+        Some(RolloutAction::NextWave)
+    );
+    // 同樣的結果在上限 5% 的批次就會暫停
+    let mut strict = w.clone();
+    strict[1].max_failure_ratio = 0.05;
+    let mut i = input(&strict, &o, now);
+    i.current_wave = 1;
+    assert!(matches!(
+        plan_tick(&i, &hosts, &capable).1,
+        Some(RolloutAction::Pause {
+            failures: 1,
+            finished: 2,
+            ..
+        })
+    ));
+    // 第 1 批（canary）的上限是 0：第 2 批的失敗不影響第 1 批，但第 1 批任何失敗都暫停
+    let canary_failed = vec![rh(1, 0, 0, HOST_FAILED), rh(2, 1, 0, HOST_PENDING)];
+    assert!(matches!(
+        tick(0, None, false, now, &canary_failed).1,
+        Some(RolloutAction::Pause { .. })
+    ));
+    // 最後一批：提議、全部結束後完成（最後一批沒有觀察期）
+    let (a, r) = tick(2, None, false, now, &hosts);
+    assert_eq!(a, vec![(3, HostAction::Offer)]);
+    assert_eq!(r, None);
+    let done = vec![
+        rh(1, 0, 0, HOST_SUCCEEDED),
+        rh(2, 1, 0, HOST_SUCCEEDED),
+        rh(3, 1, 1, HOST_ROLLED_BACK),
+        rh(4, 2, 0, HOST_SUCCEEDED),
+    ];
+    assert_eq!(
+        tick(2, None, false, now, &done).1,
+        Some(RolloutAction::Complete)
+    );
+    // 批次的統計
+    let j = waves_json(&w, &done, 2);
+    assert_eq!(j.as_array().unwrap().len(), 3);
+    assert_eq!(j[1]["hosts"], 2);
+    assert_eq!(j[1]["failure_ratio"], 0.5);
+    assert_eq!(j[2]["current"], true);
+}
+
+// ---- 0.10：排程與維護時段 ----
+
+fn ms(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .timestamp_millis()
+}
+
+fn nightly() -> ScheduleSpec {
+    ScheduleSpec::parse(Some(
+        &json!({"windows": [{"start": "01:00", "end": "05:00"}], "timezone": "+08:00"}),
+    ))
+    .unwrap()
+}
+
+fn windowed_input<'a>(
+    w: &'a [WaveSpec],
+    o: &'a RolloutOptions,
+    s: &'a ScheduleSpec,
+    now: i64,
+) -> TickInput<'a> {
+    TickInput {
+        schedule: s,
+        started_ms: 0,
+        ..input(w, o, now)
+    }
+}
+
+#[test]
+fn hosts_are_only_offered_inside_a_maintenance_window() {
+    let w = WaveSpec::default_template();
+    let o = opts(50);
+    let s = nightly();
+    let hosts = vec![rh(1, 0, 0, HOST_PENDING)];
+    // 時段外：不提議，批次也不會結束
+    let (a, r) = plan_tick(
+        &windowed_input(&w, &o, &s, ms("2026-11-12T00:30:00+08:00")),
+        &hosts,
+        &capable,
+    );
+    assert!(a.is_empty());
+    assert_eq!(r, None);
+    // 時段內：提議
+    let (a, _) = plan_tick(
+        &windowed_input(&w, &o, &s, ms("2026-11-12T01:00:00+08:00")),
+        &hosts,
+        &capable,
+    );
+    assert_eq!(a, vec![(0, HostAction::Offer)]);
+    // 替換中的主機在時段結束後照常完成（不受時段影響、不會被重新排入）
+    let mut applying = rh(1, 0, 0, HOST_APPLYING);
+    applying.offered_at = Some(ms("2026-11-12T04:50:00+08:00"));
+    applying.applying_at = Some(ms("2026-11-12T04:58:00+08:00"));
+    let (a, _) = plan_tick(
+        &windowed_input(&w, &o, &s, ms("2026-11-12T05:10:00+08:00")),
+        &[applying],
+        &capable,
+    );
+    assert!(a.is_empty());
+}
+
+#[test]
+fn hosts_that_miss_the_window_are_requeued_for_the_next_one() {
+    let w = WaveSpec::default_template();
+    let o = opts(50);
+    let s = nightly();
+    let end = ms("2026-11-12T05:00:00+08:00");
+    let mut staged = rh(1, 0, 0, HOST_STAGED);
+    staged.offered_at = Some(ms("2026-11-12T04:55:00+08:00"));
+    // 時段剛結束（留給 Pulse 回報 expired 的時間內）：不動
+    let (a, _) = plan_tick(
+        &windowed_input(&w, &o, &s, end + WINDOW_EXPIRE_GRACE_MS),
+        std::slice::from_ref(&staged),
+        &capable,
+    );
+    assert!(a.is_empty());
+    // 之後仍停在提議中：回到 pending（下一個時段重新提議），不是 expired、不算失敗
+    let (a, r) = plan_tick(
+        &windowed_input(&w, &o, &s, end + WINDOW_EXPIRE_GRACE_MS + 1),
+        std::slice::from_ref(&staged),
+        &capable,
+    );
+    assert_eq!(a, vec![(0, HostAction::Requeue)]);
+    assert_eq!(r, None, "批次還沒結束");
+    // Pulse 自己回報 expired：同樣重新排入；即使下一個時段已經開始，也要等下一輪（先換 upgrade_id）才提議
+    let mut expired = rh(1, 0, 0, HOST_EXPIRED);
+    expired.offered_at = staged.offered_at;
+    let (a, r) = plan_tick(
+        &windowed_input(&w, &o, &s, ms("2026-11-13T01:30:00+08:00")),
+        std::slice::from_ref(&expired),
+        &capable,
+    );
+    assert_eq!(a, vec![(0, HostAction::Requeue)]);
+    assert_eq!(r, None);
+    // 重新排入的次數有上限：超過後留在 expired（批次可以結束，可手動重試）
+    expired.attempts = MAX_WINDOW_REQUEUES;
+    let (a, r) = plan_tick(
+        &windowed_input(&w, &o, &s, ms("2026-11-13T01:30:00+08:00")),
+        std::slice::from_ref(&expired),
+        &capable,
+    );
+    assert!(a.is_empty());
+    assert!(r.is_some());
+    staged.attempts = MAX_WINDOW_REQUEUES;
+    let (a, _) = plan_tick(
+        &windowed_input(&w, &o, &s, end + WINDOW_EXPIRE_GRACE_MS + 1),
+        std::slice::from_ref(&staged),
+        &capable,
+    );
+    assert_eq!(a, vec![(0, HostAction::Expire)]);
+    // ends_at 造成的 expired 不重新排入
+    let mut ended = rh(1, 0, 0, HOST_EXPIRED);
+    ended.reason = Some(REASON_ROLLOUT_ENDED.into());
+    let (a, _) = plan_tick(
+        &windowed_input(&w, &o, &s, ms("2026-11-13T01:30:00+08:00")),
+        &[ended],
+        &capable,
+    );
+    assert!(a.is_empty());
+    // 沒有時段的推送維持 0.9 的行為：expired 是終止狀態，提議 24＋1 小時後才逾時
+    let mut old = rh(1, 0, 0, HOST_EXPIRED);
+    old.offered_at = Some(T0);
+    let (a, _) = plan_tick(&input(&w, &o, T0 + START_GRACE_MS), &[old], &capable);
+    assert!(a.is_empty());
+}
+
+#[test]
+fn next_action_reports_schedule_and_window() {
+    let s = ScheduleSpec::parse(Some(&json!({
+        "starts_at": "2026-11-12T01:00:00+08:00",
+        "windows": [{"start": "01:00", "end": "05:00"}],
+        "timezone": "+08:00",
+    })))
+    .unwrap();
+    let na =
+        |state: &str, now: &str| next_action_scheduled(state, None, false, None, None, &s, ms(now));
+    let v = na(ROLLOUT_SCHEDULED, "2026-11-11T12:00:00+08:00");
+    assert_eq!(v["code"], "scheduled");
+    assert_eq!(v["starts_at"], "2026-11-11T17:00:00.000Z");
+    let v = na(ROLLOUT_RUNNING, "2026-11-12T06:00:00+08:00");
+    assert_eq!(v["code"], "waiting_window");
+    assert_eq!(v["until"], "2026-11-12T17:00:00.000Z");
+    assert_eq!(
+        na(ROLLOUT_RUNNING, "2026-11-12T02:00:00+08:00")["code"],
+        "upgrading"
+    );
+    // 觀察中、等待繼續、暫停優先於時段
+    assert_eq!(
+        next_action_scheduled(
+            ROLLOUT_RUNNING,
+            None,
+            true,
+            None,
+            None,
+            &s,
+            ms("2026-11-12T06:00:00+08:00")
+        )["code"],
+        "waiting_continue"
+    );
+    assert_eq!(
+        na(ROLLOUT_PAUSED, "2026-11-12T06:00:00+08:00")["code"],
+        "paused"
+    );
 }

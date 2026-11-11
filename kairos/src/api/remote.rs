@@ -1143,12 +1143,12 @@ async fn rollouts(
             if state.as_deref().is_some_and(|s| {
                 !matches!(
                     s,
-                    "draft" | "running" | "paused" | "completed" | "cancelled"
+                    "draft" | "scheduled" | "running" | "paused" | "completed" | "cancelled"
                 )
             }) {
                 return Err(ApiError::param(
                     "state",
-                    "state 必須是 draft、running、paused、completed 或 cancelled",
+                    "state 必須是 draft、scheduled、running、paused、completed 或 cancelled",
                 ));
             }
             let now_ms = now.timestamp_millis();
@@ -1330,6 +1330,7 @@ async fn rollout_detail(
             selector: rollout::selector_from_db(&r.selector),
             waves: rollout::waves_from_db(&r.waves),
             options: rollout::options_from_db(&r.options),
+            schedule: crate::remote::schedule::ScheduleSpec::from_db(&r.schedule),
         };
         v["preview"] = svc.preview_rollout(spec, Some(r.id.clone())).await?;
     }

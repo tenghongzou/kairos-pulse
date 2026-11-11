@@ -432,10 +432,10 @@ async fn releases_and_rollouts_over_https() {
     );
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&op), Some(&spec)).await;
     assert_eq!(r.status, 403, "建立只限管理員（D8）");
-    let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "schedule": {}}))).await;
+    let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "schedule": {"windows": [{"start": "25:00", "end": "01:00"}]}}))).await;
     assert_eq!(
         (r.status, body(&r)["error"]["details"]["parameter"].as_str()),
-        (400, Some("schedule"))
+        (400, Some("schedule.windows[0]"))
     );
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&spec)).await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));

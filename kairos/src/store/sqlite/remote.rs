@@ -215,7 +215,9 @@ impl<C: AsConn> RemoteStore for C {
         fn count_rollouts_with_prefix(&self, prefix: &str) -> i64 => count_rollouts_with_prefix;
         fn insert_rollout(&self, r: &RolloutRow) -> () => insert_rollout;
         fn update_rollout_spec(&self, id: &str, name: &str, release_id: i64, selector: &str, waves: &str, options: &str, now_ms: i64) -> bool => update_rollout_spec;
+        fn update_rollout_schedule(&self, id: &str, schedule: &str, now_ms: i64) -> bool => update_rollout_schedule;
         fn update_rollout_state(&self, r: &RolloutRow) -> () => update_rollout_state;
+        fn delete_rollout_hosts(&self, rollout_id: &str) -> i64 => delete_rollout_hosts;
         fn delete_old_rollouts(&self, before_ms: i64) -> i64 => delete_old_rollouts;
         fn insert_rollout_hosts(&self, rollout_id: &str, hosts: &[NewRolloutHost], now_ms: i64) -> () => insert_rollout_hosts;
         fn rollout_hosts(&self, rollout_id: &str) -> Vec<RolloutHostRow> => rollout_hosts;
@@ -902,6 +904,26 @@ pub fn update_rollout_spec(
          WHERE rollout_id = ?1 AND state = 'draft'",
         params![id, name, release_id, selector, waves, options, now_ms],
     )? > 0)
+}
+
+pub fn update_rollout_schedule(
+    conn: &Connection,
+    id: &str,
+    schedule: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE rollouts SET schedule = ?2, updated_at = ?3
+         WHERE rollout_id = ?1 AND state = 'draft'",
+        params![id, schedule, now_ms],
+    )? > 0)
+}
+
+pub fn delete_rollout_hosts(conn: &Connection, rollout_id: &str) -> rusqlite::Result<i64> {
+    Ok(conn.execute(
+        "DELETE FROM rollout_hosts WHERE rollout_id = ?1",
+        [rollout_id],
+    )? as i64)
 }
 
 pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Result<()> {

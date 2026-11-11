@@ -1673,3 +1673,430 @@ async fn upgrade_windows_follow_applying_hosts_and_survive_restart() {
     fx.svc.reconcile_upgrade_windows().await;
     assert!(windows(&mut bus).is_empty());
 }
+
+// ---- 0.10：排程、維護時段與自訂批次 ----
+
+fn status(up: &str, state: &str) -> kairos_proto::mgmt::UpgradeStatus {
+    kairos_proto::mgmt::UpgradeStatus {
+        seq: 1,
+        ts: "2027-01-15T08:00:00.000Z".into(),
+        upgrade_id: up.to_string(),
+        state: state.into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.2".into(),
+        code: None,
+        detail: String::new(),
+        progress: None,
+    }
+}
+
+const MIN: i64 = 60_000;
+
+/// T0 是 2027-01-15T08:00:00Z：排程 08:30 開始、每天 09:00～10:00（UTC）的時段
+#[tokio::test]
+async fn scheduled_rollouts_start_later_and_only_offer_inside_windows() {
+    let signer = TestSigner::new(21);
+    let fx = Fx::new("schedule", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let ts = crate::api::http::ts_ms;
+    let body = |name: &str| {
+        json!({
+            "name": name,
+            "target_version": "0.9.2",
+            "selector": {"agent_ids": [A]},
+            "waves": [{"size": "rest"}],
+            "schedule": {
+                "starts_at": ts(T0 + 30 * MIN),
+                "windows": [{"start": "09:00", "end": "10:00"}],
+                "timezone": "UTC",
+            },
+        })
+    };
+    let spec = RolloutSpec::parse(&body("x")).unwrap();
+    let preview = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(
+        preview["window"],
+        json!({"open": false, "next": ts(T0 + 60 * MIN)})
+    );
+    assert_eq!(
+        preview["wave_templates"]["recommended"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let created = fx.svc.create_rollout(&who(), spec).await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["schedule"]["windows"][0]["start"], "09:00");
+    assert_eq!(created["schedule"]["timezone"], "UTC");
+    // 送出：對象固定，但還沒到 starts_at → scheduled，不寫 rollout.start
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "scheduled");
+    assert_eq!(v["next_action"]["code"], "scheduled");
+    assert_eq!(v["next_action"]["starts_at"], ts(T0 + 30 * MIN));
+    assert_eq!(fx.host_state(&id, A).await.state, "pending");
+    assert!(
+        !fx.audit_actions()
+            .await
+            .contains(&"rollout.start".to_string())
+    );
+    fx.set_now(T0 + 2 * MIN);
+    fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(A), None, "還沒到開始時間");
+    // 已排程的主機算在進行中的推送裡（rollout_overlap）
+    let other = RolloutSpec::parse(
+        &json!({"name": "y", "target_version": "0.9.2", "selector": {"agent_ids": [A]}}),
+    )
+    .unwrap();
+    let e = fx.svc.create_rollout(&who(), other).await.unwrap_err();
+    assert_eq!(e.code, "rollout_overlap");
+    // 修改已排程的推送：退回草稿、刪除已固定的對象，要重新送出
+    let v = fx
+        .svc
+        .update_rollout(&who(), id.clone(), RolloutSpec::parse(&body("x2")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["name"].as_str()),
+        (Some("draft"), Some("x2"))
+    );
+    let rid = id.clone();
+    let hosts = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.rollout_hosts(&rid)?.len()))
+        .await
+        .unwrap();
+    assert_eq!(hosts, 0);
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "scheduled");
+    // 到了開始時間：running（rollout.start 由 system 寫入），但 08:31 在時段外 → 不提議
+    fx.set_now(T0 + 31 * MIN);
+    fx.svc.tick().await.unwrap();
+    let rid = id.clone();
+    let r = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(r.state, "running");
+    assert_eq!(r.started_at, Some(T0 + 31 * MIN));
+    assert!(
+        fx.audit_actions()
+            .await
+            .contains(&"rollout.start".to_string())
+    );
+    assert_eq!(fx.svc.offer_of(A), None, "時段外不提議");
+    let na = rollout_json(&r, &[], fx.svc.now_ms(), false)["next_action"].clone();
+    assert_eq!(
+        na,
+        json!({"code": "waiting_window", "until": ts(T0 + 60 * MIN)})
+    );
+    // 進入時段：提議，apply_window 到時段結束為止
+    fx.set_now(T0 + 65 * MIN);
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).expect("時段內提議");
+    let offer = fx.svc.build_offer(A, &up, 1).await.unwrap().unwrap();
+    assert_eq!(offer.apply_window.not_before, ts(T0 + 65 * MIN));
+    assert_eq!(offer.apply_window.not_after, ts(T0 + 120 * MIN));
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", status(&up, "staged"))
+        .await
+        .unwrap();
+    // 時段結束後 Pulse 交付前的再確認：upgrade_unavailable（不會在時段外替換）
+    fx.set_now(T0 + 120 * MIN + 1000);
+    assert!(fx.svc.build_offer(A, &up, 2).await.unwrap().is_none());
+    fx.svc.tick().await.unwrap();
+    assert_eq!(
+        fx.host_state(&id, A).await.state,
+        "staged",
+        "留給 Pulse 回報 expired 的時間"
+    );
+    // 之後仍停在 staged：回到 pending、換新的 upgrade_id，推送不結束
+    fx.set_now(T0 + 123 * MIN);
+    fx.svc.tick().await.unwrap();
+    let h = fx.host_state(&id, A).await;
+    assert_eq!((h.state.as_str(), h.attempts), ("pending", 1));
+    assert_eq!(h.reason.as_deref(), Some("window_closed"));
+    assert_ne!(h.upgrade_id, up);
+    assert_eq!(fx.svc.offer_of(A), None);
+    // 隔天的時段：以新的 upgrade_id 重新提議
+    let day = 24 * 60 * MIN;
+    fx.set_now(T0 + day + 61 * MIN);
+    fx.svc.tick().await.unwrap();
+    let up2 = fx.svc.offer_of(A).expect("下一個時段重新提議");
+    assert_eq!(up2, h.upgrade_id);
+    let offer = fx.svc.build_offer(A, &up2, 3).await.unwrap().unwrap();
+    assert_eq!(offer.apply_window.not_after, ts(T0 + day + 120 * MIN));
+    // Pulse 在時段結束時自己回報 expired：同樣重新排入，再下一個時段提議
+    fx.svc
+        .apply_upgrade_status(A, "0.9.0", status(&up2, "expired"))
+        .await
+        .unwrap();
+    assert_eq!(fx.host_state(&id, A).await.state, "expired");
+    fx.set_now(T0 + day + 121 * MIN);
+    fx.svc.tick().await.unwrap();
+    let h = fx.host_state(&id, A).await;
+    assert_eq!((h.state.as_str(), h.attempts), ("pending", 2));
+    fx.set_now(T0 + 2 * day + 61 * MIN);
+    fx.svc.tick().await.unwrap();
+    let up3 = fx.svc.offer_of(A).unwrap();
+    assert_ne!(up3, up2);
+    // 這次在時段內替換並成功 → 推送完成
+    for s in ["applying", "succeeded"] {
+        let v = if s == "succeeded" { "0.9.2" } else { "0.9.0" };
+        fx.svc
+            .apply_upgrade_status(A, v, status(&up3, s))
+            .await
+            .unwrap();
+    }
+    fx.svc.tick().await.unwrap();
+    let rid = id.clone();
+    let r = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(r.state, "completed");
+}
+
+#[tokio::test]
+async fn ends_at_expires_hosts_that_have_not_started_and_waits_for_applying_ones() {
+    let signer = TestSigner::new(22);
+    let fx = Fx::new("ends", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    for a in [A, B] {
+        fx.add_host(a, "0.9.0", "Web", &[], "tar", "ready").await;
+        fx.connect(a, "0.9.0", "tar");
+    }
+    let ts = crate::api::http::ts_ms;
+    // 有時段而沒有指定時區：以預設（alerts.timezone，沒有設定時 +08:00）填入
+    fx.svc.set_default_timezone("+09:00");
+    let spec = |extra: Value| {
+        let mut b = json!({
+            "name": "x",
+            "target_version": "0.9.2",
+            "selector": {"all": true},
+            "waves": [{"size": "rest", "max_failure_ratio": 1.0}],
+            "options": {"max_in_progress": 1},
+        });
+        b["schedule"] = extra;
+        RolloutSpec::parse(&b).unwrap()
+    };
+    let e = fx
+        .svc
+        .create_rollout(&who(), spec(json!({"ends_at": ts(T0 - 1)})))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_parameter");
+    let tz = fx
+        .svc
+        .create_rollout(
+            &who(),
+            spec(json!({"windows": [{"start": "00:00", "end": "23:59"}]})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tz["schedule"]["timezone"], "+09:00");
+    let created = fx
+        .svc
+        .create_rollout(&who(), spec(json!({"ends_at": ts(T0 + 120 * MIN)})))
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 2 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running", "沒有 starts_at：立即開始");
+    fx.set_now(T0 + 2 * MIN);
+    fx.svc.tick().await.unwrap();
+    // 同時最多 1 台：一台被提議，另一台還在 pending
+    let (first, second) = if fx.svc.offer_of(A).is_some() {
+        (A, B)
+    } else {
+        (B, A)
+    };
+    let up = fx.svc.offer_of(first).unwrap();
+    let offer = fx.svc.build_offer(first, &up, 1).await.unwrap().unwrap();
+    assert_eq!(
+        offer.apply_window.not_after,
+        ts(T0 + 120 * MIN),
+        "apply_window 不超過 ends_at"
+    );
+    fx.svc
+        .apply_upgrade_status(first, "0.9.0", status(&up, "applying"))
+        .await
+        .unwrap();
+    // ends_at 到了：還沒開始的主機 expired（rollout_ended），替換中的照常完成後推送才結束
+    fx.set_now(T0 + 120 * MIN);
+    fx.svc.tick().await.unwrap();
+    let h = fx.host_state(&id, second).await;
+    assert_eq!(
+        (h.state.as_str(), h.reason.as_deref()),
+        ("expired", Some("rollout_ended"))
+    );
+    assert_eq!(fx.host_state(&id, first).await.state, "applying");
+    let state = |fx: &Fx, id: &str| {
+        let (svc, id) = (fx.svc.clone(), id.to_string());
+        async move {
+            svc.db
+                .read(move |s| Ok(s.get_rollout(&id)?.unwrap().state))
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(state(&fx, &id).await, "running");
+    fx.svc
+        .apply_upgrade_status(first, "0.9.2", status(&up, "succeeded"))
+        .await
+        .unwrap();
+    fx.svc.tick().await.unwrap();
+    assert_eq!(state(&fx, &id).await, "completed");
+    assert!(
+        fx.audit_actions()
+            .await
+            .contains(&"rollout.complete".to_string())
+    );
+    // 已過 ends_at 的草稿不能送出
+    let late = fx
+        .svc
+        .create_rollout(&who(), spec(json!({"ends_at": ts(T0 + 121 * MIN)})))
+        .await
+        .unwrap();
+    fx.set_now(T0 + 122 * MIN);
+    let e = fx
+        .svc
+        .submit_rollout(
+            &who(),
+            late["id"].as_str().unwrap().to_string(),
+            Some("升級 1 台".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "schedule_ended");
+}
+
+#[tokio::test]
+async fn four_wave_rollouts_advance_wave_by_wave() {
+    let signer = TestSigner::new(23);
+    let fx = Fx::new("waves4", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    let hosts = [A, B, C, D];
+    for a in hosts {
+        fx.add_host(a, "0.9.0", "Web", &[], "tar", "ready").await;
+        fx.connect(a, "0.9.0", "tar");
+    }
+    let spec = RolloutSpec::parse(&json!({
+        "name": "四批",
+        "target_version": "0.9.2",
+        "selector": {"all": true},
+        "waves": [
+            {"size": 1, "soak_minutes": 0, "max_failure_ratio": 0, "manual_continue": true},
+            {"size": 1, "soak_minutes": 10},
+            {"size": "50%", "soak_minutes": 0},
+            {"size": "rest"},
+        ],
+    }))
+    .unwrap();
+    let preview = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    assert_eq!(preview["waves"], json!([1, 1, 1, 1]));
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 4 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["waves_total"], 4);
+    let mut now = T0 + 2 * MIN;
+    let mut done = 0;
+    // 每一批：提議一台 → 成功 → （第 1 批：人工繼續；第 2 批：觀察 10 分鐘）→ 下一批
+    for wave in 0..4i64 {
+        fx.set_now(now);
+        fx.svc.tick().await.unwrap();
+        let offered: Vec<&str> = hosts
+            .iter()
+            .copied()
+            .filter(|a| fx.svc.offer_of(a).is_some())
+            .collect();
+        assert_eq!(offered.len(), 1, "第 {} 批只提議這一批的主機", wave + 1);
+        let a = offered[0];
+        assert_eq!(fx.host_state(&id, a).await.wave, wave);
+        let up = fx.svc.offer_of(a).unwrap();
+        fx.svc
+            .apply_upgrade_status(a, "0.9.0", status(&up, "applying"))
+            .await
+            .unwrap();
+        fx.svc
+            .apply_upgrade_status(a, "0.9.2", status(&up, "succeeded"))
+            .await
+            .unwrap();
+        done += 1;
+        // 這批結束 → 開始觀察
+        fx.svc.tick().await.unwrap();
+        let rid = id.clone();
+        let r = fx
+            .svc
+            .db
+            .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+            .await
+            .unwrap();
+        match wave {
+            0 => {
+                // 觀察期 0 分鐘、需要人工繼續
+                fx.svc.tick().await.unwrap();
+                let e = fx.svc.offer_of(hosts[0]).is_some() as usize
+                    + hosts
+                        .iter()
+                        .filter(|a| fx.svc.offer_of(a).is_some())
+                        .count();
+                assert_eq!(e, 0, "等待繼續時不提議下一批");
+                fx.svc.continue_rollout(&who(), id.clone()).await.unwrap();
+            }
+            1 => {
+                assert_eq!(r.soak_until, Some(now + 10 * MIN));
+                fx.set_now(now + 5 * MIN);
+                fx.svc.tick().await.unwrap();
+                assert!(
+                    hosts.iter().all(|a| fx.svc.offer_of(a).is_none()),
+                    "觀察中不提議"
+                );
+                now += 10 * MIN;
+                fx.set_now(now);
+                fx.svc.tick().await.unwrap();
+            }
+            2 => {
+                // 觀察期 0 分鐘、不需要人工：下一輪自動進最後一批
+                fx.svc.tick().await.unwrap();
+            }
+            _ => assert_eq!(r.state, "completed"),
+        }
+        now += MIN;
+    }
+    assert_eq!(done, 4);
+    let rid = id.clone();
+    let r = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!((r.state.as_str(), r.current_wave), ("completed", 3));
+}

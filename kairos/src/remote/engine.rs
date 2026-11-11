@@ -17,9 +17,10 @@ use super::rollout::{
     self, HOST_ACCEPTED, HOST_APPLYING, HOST_CANCELLED, HOST_DECLINED, HOST_EXPIRED, HOST_FAILED,
     HOST_OFFERED, HOST_PENDING, HOST_ROLLBACK_FAILED, HOST_ROLLED_BACK, HOST_SKIPPED,
     HOST_SKIPPED_OFFLINE, HOST_STAGED, HOST_SUCCEEDED, HOST_UNKNOWN, HostAction, ROLLOUT_CANCELLED,
-    ROLLOUT_COMPLETED, ROLLOUT_DRAFT, ROLLOUT_PAUSED, ROLLOUT_RUNNING, ReleaseContext,
-    RolloutAction, RolloutSpec,
+    ROLLOUT_COMPLETED, ROLLOUT_DRAFT, ROLLOUT_PAUSED, ROLLOUT_RUNNING, ROLLOUT_SCHEDULED,
+    ReleaseContext, RolloutAction, RolloutSpec,
 };
+use super::schedule::ScheduleSpec;
 use super::store::{HostTransition, NewRolloutHost, RolloutHostRow, RolloutRow};
 use super::{
     CODE_INCOMPATIBLE, CODE_ROLLBACK_FAILED, CODE_ROLLED_BACK, CODE_ROLLOUT_PAUSED,
@@ -121,9 +122,29 @@ fn spec_of(
     )
 }
 
+/// 儲存用的排程：有時段而沒有指定 `timezone` 時填入預設（`alerts.timezone`）；`ends_at` 已過時拒絕
+fn schedule_to_store(
+    spec: &RolloutSpec,
+    default_tz: &str,
+    now: i64,
+) -> Result<ScheduleSpec, ApiError> {
+    let mut schedule = spec.schedule.clone();
+    if schedule.ends_at.is_some_and(|e| e <= now) {
+        return Err(ApiError::param(
+            "schedule.ends_at",
+            "ends_at 已經過了".to_string(),
+        ));
+    }
+    if schedule.timezone.is_none() && !schedule.windows.is_empty() {
+        schedule.timezone = Some(default_tz.to_string());
+    }
+    Ok(schedule)
+}
+
 /// 推送的 JSON（清單與詳情；`hosts` 有給時另加各批的統計）
 pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detail: bool) -> Value {
     let (selector, waves, options) = spec_of(r);
+    let schedule = ScheduleSpec::from_db(&r.schedule);
     let ts = |v: Option<i64>| v.map(crate::api::http::ts_ms);
     let mut v = json!({
         "id": r.id,
@@ -136,7 +157,9 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         "hosts_total": hosts.iter().filter(|h| h.state != HOST_SKIPPED).count(),
         // 回滾失敗、尚未標記為已處理的主機（progress.rollback_failed 含已處理的）
         "rollback_failed_unacknowledged": hosts.iter().filter(|h| h.state == HOST_ROLLBACK_FAILED && h.acknowledged_at.is_none()).count(),
-        "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now_ms),
+        "next_action": rollout::next_action_scheduled(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), &schedule, now_ms),
+        "starts_at": ts(schedule.starts_at),
+        "ends_at": ts(schedule.ends_at),
         "pause_reason": r.pause_reason,
         "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
         "cancel_reason": r.cancel_reason,
@@ -152,7 +175,7 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         v["selector"] = serde_json::to_value(&selector).unwrap_or(Value::Null);
         v["options"] = serde_json::to_value(&options).unwrap_or(Value::Null);
         v["waves"] = rollout::waves_json(&waves, hosts, r.current_wave);
-        v["schedule"] = serde_json::from_str(&r.schedule).unwrap_or(json!({}));
+        v["schedule"] = schedule.json();
     }
     v
 }
@@ -268,6 +291,8 @@ impl RemoteService {
         rollout_id: Option<String>,
     ) -> Result<Value, ApiError> {
         let live = self.live_hellos();
+        let now = self.now_ms();
+        let default_tz = self.default_timezone();
         self.in_tx(move |s| {
             let (_, ctx) = release_context(s, &spec.target_version)?;
             let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
@@ -300,6 +325,29 @@ impl RemoteService {
             ));
             v["confirm_level"] = json!(if p.downgrade > 0 { "L3" } else { "L2" });
             v["waves_spec"] = spec.waves_json();
+            // 排程：正規化後的內容與目前是否在時段內（主控台顯示「送出後等待時段」）
+            let mut schedule = spec.schedule.clone();
+            if schedule.timezone.is_none() && !schedule.windows.is_empty() {
+                schedule.timezone = Some(default_tz.clone());
+            }
+            v["schedule"] = schedule.json();
+            v["window"] = match schedule.window_at(now) {
+                super::schedule::WindowState::Open { until } => {
+                    json!({"open": true, "until": until.map(crate::api::http::ts_ms)})
+                }
+                super::schedule::WindowState::Closed { next } => {
+                    json!({"open": false, "next": next.map(crate::api::http::ts_ms)})
+                }
+            };
+            v["default_timezone"] = json!(default_tz);
+            let template = |w: Vec<rollout::WaveSpec>| {
+                Value::Array(w.iter().map(rollout::WaveSpec::json).collect())
+            };
+            v["wave_templates"] = json!({
+                "default": template(rollout::WaveSpec::default_template()),
+                "recommended": template(rollout::WaveSpec::recommended_template()),
+            });
+            v["max_waves"] = json!(rollout::MAX_WAVES);
             Ok(v)
         })
         .await
@@ -311,6 +359,7 @@ impl RemoteService {
         let now = self.now_ms();
         let who = who.clone();
         let live = self.live_hellos();
+        let schedule = schedule_to_store(&spec, &self.default_timezone(), now)?;
         self.in_tx(move |s| {
             let (release_id, ctx) = release_context(s, &spec.target_version)?;
             if let Some(min) = incompatible(&ctx) {
@@ -331,7 +380,7 @@ impl RemoteService {
                 target_version: spec.target_version.clone(),
                 selector: serde_json::to_string(&spec.selector).unwrap_or_default(),
                 waves: spec.waves_json().to_string(),
-                schedule: "{}".into(),
+                schedule: schedule.json().to_string(),
                 options: serde_json::to_string(&spec.options).unwrap_or_default(),
                 state: ROLLOUT_DRAFT.into(),
                 current_wave: 0,
@@ -353,7 +402,7 @@ impl RemoteService {
                 "rollout.create",
                 Some(r.id.clone()),
                 None,
-                json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "selector": spec.selector, "waves": spec.waves_json(), "options": spec.options, "eligible": p.eligible}),
+                json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "selector": spec.selector, "waves": spec.waves_json(), "options": spec.options, "schedule": schedule.json(), "eligible": p.eligible}),
             )
             .append(s, now)?;
             let mut v = rollout_json(&r, &[], now, true);
@@ -373,15 +422,25 @@ impl RemoteService {
     ) -> Result<Value, ApiError> {
         let now = self.now_ms();
         let who = who.clone();
-        self.in_tx(move |s| {
-            let r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
-            if r.state != ROLLOUT_DRAFT {
-                return Err(invalid_state(&r, "修改（只有草稿可以修改）").into());
+        let schedule = schedule_to_store(&spec, &self.default_timezone(), now)?;
+        let v = self.in_tx(move |s| {
+            let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
+            if r.state != ROLLOUT_DRAFT && r.state != ROLLOUT_SCHEDULED {
+                return Err(invalid_state(&r, "修改（只有草稿與已排程、尚未開始的推送可以修改）").into());
             }
             let (release_id, ctx) = release_context(s, &spec.target_version)?;
             if let Some(min) = incompatible(&ctx) {
                 return Err(incompatible_error(&spec.target_version, &min).into());
             }
+            // 已排程的推送：退回草稿、刪除已固定的對象，修改後要重新送出（確認字串以新的對象計算）
+            let reverted = r.state == ROLLOUT_SCHEDULED;
+            if reverted {
+                s.delete_rollout_hosts(&id)?;
+                r.state = ROLLOUT_DRAFT.into();
+                r.updated_at = now;
+                s.update_rollout_state(&r)?;
+            }
+            s.update_rollout_schedule(&id, &schedule.json().to_string(), now)?;
             s.update_rollout_spec(
                 &id,
                 &spec.name,
@@ -396,14 +455,18 @@ impl RemoteService {
                 "rollout.update",
                 Some(id.clone()),
                 None,
-                json!({"rollout_id": id, "name": spec.name, "target_version": spec.target_version, "selector": spec.selector, "waves": spec.waves_json(), "options": spec.options}),
+                json!({"rollout_id": id, "name": spec.name, "target_version": spec.target_version, "selector": spec.selector, "waves": spec.waves_json(), "options": spec.options, "schedule": schedule.json(), "reverted_to_draft": reverted}),
             )
             .append(s, now)?;
             let r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
             Ok(rollout_json(&r, &[], now, true))
         })
         .await
-        .map_err(|e| e.into_api("推送"))
+        .map_err(|e| e.into_api("推送"))?;
+        if let Some(id) = v["id"].as_str() {
+            self.mark_dirty(id);
+        }
+        Ok(v)
     }
 
     /// `POST /api/v1/rollouts/{id}/submit`：固定推送的對象並立即開始（0.9 沒有覆核與排程）。
@@ -424,6 +487,10 @@ impl RemoteService {
                 let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
                 if r.state != ROLLOUT_DRAFT {
                     return Err(invalid_state(&r, "送出").into());
+                }
+                let schedule = ScheduleSpec::from_db(&r.schedule);
+                if schedule.ends_at.is_some_and(|e| e <= now) {
+                    return Err(ApiError::conflict("schedule_ended", "排程的結束時間（ends_at）已經過了，請先修改排程").into());
                 }
                 let (selector, waves, options) = spec_of(&r);
                 let (_, ctx) = release_context(s, &r.target_version)?;
@@ -478,9 +545,15 @@ impl RemoteService {
                     });
                 }
                 s.insert_rollout_hosts(&r.id, &rows, now)?;
-                r.state = ROLLOUT_RUNNING.into();
-                r.started_at = Some(now);
-                r.wave_started_at = Some(now);
+                // 排程：starts_at 還沒到時先 scheduled（推送引擎到時轉為 running）
+                let later = schedule.starts_at.is_some_and(|t| t > now);
+                if later {
+                    r.state = ROLLOUT_SCHEDULED.into();
+                } else {
+                    r.state = ROLLOUT_RUNNING.into();
+                    r.started_at = Some(now);
+                    r.wave_started_at = Some(now);
+                }
                 r.updated_at = now;
                 s.update_rollout_state(&r)?;
                 who.event(
@@ -488,11 +561,13 @@ impl RemoteService {
                     "rollout.submit",
                     Some(r.id.clone()),
                     None,
-                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason}),
+                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason, "schedule": schedule.json(), "state": r.state}),
                 )
                 .append(s, now)?;
-                who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id}))
-                    .append(s, now)?;
+                if !later {
+                    who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id}))
+                        .append(s, now)?;
+                }
                 let hosts = s.rollout_hosts(&r.id)?;
                 Ok(rollout_json(&r, &hosts, now, true))
             })
@@ -778,10 +853,18 @@ impl RemoteService {
         let ids: Vec<String> = self
             .db
             .read(|s| {
-                Ok(s.list_rollouts(Some(ROLLOUT_RUNNING))?
+                // 進行中的推送，加上已排程（到 starts_at 時轉為進行中）的推送
+                let mut ids: Vec<String> = s
+                    .list_rollouts(Some(ROLLOUT_SCHEDULED))?
                     .into_iter()
                     .map(|r| r.id)
-                    .collect())
+                    .collect();
+                ids.extend(
+                    s.list_rollouts(Some(ROLLOUT_RUNNING))?
+                        .into_iter()
+                        .map(|r| r.id),
+                );
+                Ok(ids)
             })
             .await?;
         for id in ids {
@@ -801,12 +884,63 @@ impl RemoteService {
                 let Some(mut r) = s.get_rollout(&id)? else {
                     return Ok((Vec::new(), Vec::new(), false));
                 };
+                let schedule = ScheduleSpec::from_db(&r.schedule);
+                let mut started_now = false;
+                if r.state == ROLLOUT_SCHEDULED {
+                    // 已排程：到 starts_at 才開始（稽核的 rollout.start 此時才寫，執行者為 system）
+                    if schedule.starts_at.is_some_and(|t| t > now) {
+                        return Ok((Vec::new(), Vec::new(), false));
+                    }
+                    r.state = ROLLOUT_RUNNING.into();
+                    r.started_at = Some(now);
+                    r.wave_started_at = Some(now);
+                    r.updated_at = now;
+                    s.update_rollout_state(&r)?;
+                    Actor::system()
+                        .event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id, "scheduled": true}))
+                        .append(s, now)?;
+                    log::info!(event = "rollout.start"; "推送「{}」（{}）到達排程的開始時間，開始推送", r.name, r.id);
+                    started_now = true;
+                }
                 if r.state != ROLLOUT_RUNNING {
                     return Ok((Vec::new(), Vec::new(), false));
                 }
                 let hosts = s.rollout_hosts(&r.id)?;
                 let (_, waves, options) = spec_of(&r);
+                // ends_at 到了：尚未開始替換的主機標為 expired（rollout_ended），替換中的照常完成後推送才結束
+                if schedule.ends_at.is_some_and(|e| now >= e) {
+                    let mut cleared = Vec::new();
+                    let mut changed = started_now;
+                    for h in hosts.iter().filter(|h| {
+                        rollout::is_offered(&h.state)
+                            || h.state == HOST_PENDING
+                            || h.state == HOST_SKIPPED_OFFLINE
+                    }) {
+                        s.update_rollout_host(
+                            &r.id,
+                            h.host_id,
+                            &HostTransition {
+                                state: Some(HOST_EXPIRED.into()),
+                                reason: Some(Some(rollout::REASON_ROLLOUT_ENDED.into())),
+                                finished_at: Some(Some(now)),
+                                ..Default::default()
+                            },
+                            now,
+                        )?;
+                        if rollout::is_offered(&h.state) {
+                            cleared.push(h.agent_id.clone());
+                        }
+                        changed = true;
+                    }
+                    if !hosts.iter().any(|h| h.state == HOST_APPLYING) {
+                        log::info!(event = "rollout.ended"; "推送「{}」（{}）到達排程的結束時間", r.name, r.id);
+                        complete_in_tx(s, &mut r, now)?;
+                        changed = true;
+                    }
+                    return Ok((Vec::new(), cleared, changed));
+                }
                 let input = rollout::TickInput {
+                    schedule: &schedule,
                     now_ms: now,
                     started_ms: started,
                     start_grace_ms: crate::testhooks::remote_start_grace_ms()
@@ -819,7 +953,7 @@ impl RemoteService {
                 };
                 let live = |a: &str| live_of(&reg2, a, &live_capable);
                 let (actions, ra) = rollout::plan_tick(&input, &hosts, &live);
-                let changed = !actions.is_empty() || ra.is_some();
+                let changed = started_now || !actions.is_empty() || ra.is_some();
                 let mut set = Vec::new();
                 let mut cleared = Vec::new();
                 for (i, a) in actions {
@@ -868,6 +1002,24 @@ impl RemoteService {
                             reason: Some(None),
                             ..Default::default()
                         },
+                        HostAction::Requeue => {
+                            // 時段結束時還沒開始替換：下一個時段以新的 upgrade_id 重新提議
+                            // （Pulse 對舊的 id 收到 upgrade_unavailable，已暫存的檔案可以沿用）
+                            if rollout::is_offered(&h.state) {
+                                cleared.push(h.agent_id.clone());
+                            }
+                            HostTransition {
+                                state: Some(HOST_PENDING.into()),
+                                upgrade_id: Some(new_upgrade_id()?),
+                                reason: Some(Some("window_closed".into())),
+                                bump_attempts: true,
+                                offered_at: Some(None),
+                                finished_at: Some(None),
+                                code: Some(None),
+                                detail: Some(None),
+                                ..Default::default()
+                            }
+                        }
                     };
                     s.update_rollout_host(&r.id, h.host_id, &t, now)?;
                 }
@@ -936,6 +1088,7 @@ impl RemoteService {
             return Ok(None);
         };
         let (agent, upgrade) = (agent_id.to_string(), upgrade_id.to_string());
+        let now = self.now_ms();
         let built = self
             .db
             .read(move |s| {
@@ -984,6 +1137,16 @@ impl RemoteService {
                     url: None,
                 };
                 let offered = h.offered_at.unwrap_or(r.updated_at);
+                // apply_window：沒有維護時段時為提議後 24 小時；有時段時到提議所在的時段結束為止
+                // （都不超過 ends_at）。時段已過（Pulse 交付前的再確認）時不再提議：upgrade_unavailable，
+                // Pulse 不會在時段外替換，主機在下一個時段以新的 upgrade_id 重新提議
+                let schedule = ScheduleSpec::from_db(&r.schedule);
+                let Some((not_before, not_after)) = schedule
+                    .apply_window(offered, rollout::APPLY_WINDOW_MS)
+                    .filter(|(_, end)| now < *end)
+                else {
+                    return Ok(None);
+                };
                 let offer = UpgradeOffer {
                     seq,
                     upgrade_id: h.upgrade_id.clone(),
@@ -1010,8 +1173,8 @@ impl RemoteService {
                     sha256sums: rel.sha256sums.clone(),
                     signature: rel.signature.clone(),
                     apply_window: ApplyWindow {
-                        not_before: crate::api::http::ts_ms(offered),
-                        not_after: crate::api::http::ts_ms(offered + rollout::APPLY_WINDOW_MS),
+                        not_before: crate::api::http::ts_ms(not_before),
+                        not_after: crate::api::http::ts_ms(not_after),
                     },
                     health_timeout_secs: options.health_timeout_secs,
                     allow_downgrade: options.allow_downgrade,

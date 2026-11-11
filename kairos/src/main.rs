@@ -1050,6 +1050,7 @@ async fn run(
             .await
             {
                 Ok(svc) => {
+                    svc.set_default_timezone(&config.alerts.timezone);
                     svc.spawn_engine();
                     info!(
                         "遠端管理：集中設定{}、遠端升級{}（需要 mTLS 與 Pulse 0.9.0 以上；版本庫 {}{}）",

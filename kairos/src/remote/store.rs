@@ -414,8 +414,14 @@ pub trait RemoteStore {
         now_ms: i64,
     ) -> StoreResult<bool>;
 
+    /// 修改草稿的排程（`schedule` 的 JSON；0.10）。不是草稿時 `false`
+    fn update_rollout_schedule(&self, id: &str, schedule: &str, now_ms: i64) -> StoreResult<bool>;
+
     /// 修改推送的狀態欄位
     fn update_rollout_state(&self, r: &RolloutRow) -> StoreResult<()>;
+
+    /// 刪除一個推送已固定的對象（已排程的推送被修改而退回草稿時；0.10）；回傳刪除的列數
+    fn delete_rollout_hosts(&self, rollout_id: &str) -> StoreResult<i64>;
 
     /// 刪除已完成或取消、`completed_at` 早於 `before_ms` 的推送（含主機）；回傳刪除的推送數
     fn delete_old_rollouts(&self, before_ms: i64) -> StoreResult<i64>;

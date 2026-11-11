@@ -35,6 +35,8 @@ import {
   skipLabel,
   progressGroups,
   hostLink,
+  waveName,
+  scheduleSummary,
   HOST_STATES,
 } from './pulse-common.js';
 
@@ -230,7 +232,7 @@ export function render(ctx) {
     if (r.state === 'running' && session.can('rollouts:pause')) acts.push(btn(t('rm.det.pause'), () => action('pause'), 'secondary', 'pause'));
     if (r.state === 'running' && r.awaiting_continue && write) acts.push(btn(t('rm.det.resume'), () => action('continue'), 'primary', 'play'));
     if (r.state === 'paused' && write) acts.push(btn(t('rm.det.resume'), () => action('resume'), 'primary', 'play'));
-    if ((r.state === 'running' || r.state === 'paused') && write) acts.push(btn(t('rm.det.cancel'), () => action('cancel'), 'danger-secondary'));
+    if ((r.state === 'running' || r.state === 'paused' || r.state === 'scheduled') && write) acts.push(btn(t('rm.det.cancel'), () => action('cancel'), 'danger-secondary'));
     ctx.setTitle(r.name);
     mount(
       head,
@@ -275,6 +277,10 @@ export function render(ctx) {
       );
     }
     const na = r.next_action || {};
+    if (r.state === 'scheduled') out.push(inlineAlert({ kind: 'info', role: 'status', body: na.starts_at ? t('rm.det.scheduledNote', { t: fmt.dateTime(na.starts_at, { seconds: false }) }) : t('rm.det.scheduledNoteNoTime') }));
+    if (r.state === 'running' && na.code === 'waiting_window') out.push(inlineAlert({ kind: 'info', role: 'status', body: na.until ? t('rm.det.waitingWindow', { t: fmt.dateTime(na.until, { seconds: false }) }) : t('rm.det.waitingWindowNone') }));
+    const sch = scheduleSummary(r.schedule);
+    if (sch) out.push(h('p', { class: 'caption', id: 'rollout-schedule' }, sch));
     if (r.state === 'running' && na.code === 'soaking') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.soaking', { m: fmt.num(na.minutes || 0), t: fmt.dateTime(na.until, { seconds: false }) }) }));
     if (r.state === 'running' && na.code === 'waiting_continue') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.awaiting') }));
     if (r.state === 'cancelled' && r.cancel_reason) out.push(h('p', { class: 'caption' }, t('rm.det.cancelReason', { r: r.cancel_reason })));
@@ -327,7 +333,7 @@ export function render(ctx) {
               h(
                 'div',
                 null,
-                h('p', { class: 'strong' }, i === 0 && waves.length > 1 ? t('rm.det.wave0') : t('rm.det.wave1'), ' · ', t('rm.det.waveLine', { n: fmt.num(w.hosts || 0) }), w.current && r.state !== 'completed' && r.state !== 'cancelled' ? [' · ', t('rm.det.waveCurrent')] : null),
+                h('p', { class: 'strong' }, waveName(i, waves.length), ' · ', t('rm.det.waveLine', { n: fmt.num(w.hosts || 0) }), w.current && r.state !== 'completed' && r.state !== 'cancelled' ? [' · ', t('rm.det.waveCurrent')] : null),
                 h('p', null, g.total ? countsLine(w.progress) : '—'),
                 h('p', { class: 'caption' }, meta.join(' · ')),
               ),
@@ -344,7 +350,7 @@ export function render(ctx) {
       return;
     }
     const prev = waveSel.value;
-    mount(waveSel, h('option', { value: '' }, t('rm.ro.filter.all')), (r.waves || []).map((w, i) => h('option', { value: String(i) }, i === 0 && (r.waves || []).length > 1 ? t('rm.det.wave0') : t('rm.det.wave1'))), h('option', { value: '-1' }, t('rm.det.skippedWave')));
+    mount(waveSel, h('option', { value: '' }, t('rm.ro.filter.all')), (r.waves || []).map((w, i) => h('option', { value: String(i) }, waveName(i, (r.waves || []).length))), h('option', { value: '-1' }, t('rm.det.skippedWave')));
     waveSel.value = prev;
     if (hostsBox.firstChild) return;
     mount(

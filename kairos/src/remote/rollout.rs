@@ -1,4 +1,5 @@
-//! 升級推送（REMOTE.md 第 4.7 節；0.9.0 的 MVP：最多兩批、立即開始，沒有維護時段與雙人覆核）。
+//! 升級推送（REMOTE.md 第 4.7 節；0.10 起：自訂批次（最多 [`MAX_WAVES`] 批）、排程與維護時段
+//! （[`super::schedule`]）；雙人覆核另見第 5.4 節）。
 //!
 //! - [`RolloutSpec`]：建立推送的內容（名稱、目標版本、選擇器、批次、選項）；JSON 存在 `rollouts`。
 //! - [`classify`]：資格分類（第 4.7.2 節），送出（submit）時固定推送的對象並寫入 `rollout_hosts`。
@@ -18,11 +19,14 @@ use kairos_proto::mgmt::{
 };
 use kairos_proto::release::{self, Os, ReleaseManifest, Version};
 
+use super::schedule::{ScheduleSpec, WindowState};
 use super::store::{ArtifactRow, RolloutHostRow, UpgradeHost};
 
 // ---- 推送的狀態 ----
 
 pub const ROLLOUT_DRAFT: &str = "draft";
+/// 已送出、等待 `schedule.starts_at`（0.10）
+pub const ROLLOUT_SCHEDULED: &str = "scheduled";
 pub const ROLLOUT_RUNNING: &str = "running";
 pub const ROLLOUT_PAUSED: &str = "paused";
 pub const ROLLOUT_COMPLETED: &str = "completed";
@@ -128,8 +132,8 @@ pub const DEFAULT_OFFLINE_GRACE_HOURS: u32 = 24;
 pub const MAX_OFFLINE_GRACE_HOURS: u32 = 720;
 /// 觀察期的上限（7 天）
 pub const MAX_SOAK_MINUTES: u32 = 10_080;
-/// 0.9.0 的批次數上限（canary＋其餘；自訂批次在 0.10）
-pub const MAX_WAVES: usize = 2;
+/// 批次數上限（0.9.0 為 2：canary＋其餘；0.10 起可自訂）
+pub const MAX_WAVES: usize = 10;
 /// 選擇器每個清單的項目上限
 pub const MAX_SELECTOR_ITEMS: usize = 10_000;
 /// 推送名稱的長度上限（字元）
@@ -149,6 +153,13 @@ pub fn suppress_until(applying_at: i64, health_timeout_secs: u32) -> i64 {
     applying_at + i64::from(health_timeout_secs) * 1000 + SUPPRESS_GRACE_MS
 }
 
+/// 有維護時段的推送：時段結束後超過這段時間仍未開始替換的主機回到 `pending`，下一個時段重新提議
+/// （留給 Pulse 回報 `expired` 的時間）
+pub const WINDOW_EXPIRE_GRACE_MS: i64 = 2 * 60 * 1000;
+/// 有維護時段的推送：一台主機因時段結束而重新排入的次數上限，超過後留在 `expired`（可手動重試）
+pub const MAX_WINDOW_REQUEUES: i64 = 10;
+/// `ends_at` 到了而尚未開始替換的主機的 `reason`
+pub const REASON_ROLLOUT_ENDED: &str = "rollout_ended";
 /// Kairos 啟動後這段時間內不提議新的主機（REMOTE.md 第 4.7.4 節第 5 項）
 pub const START_GRACE_MS: i64 = 60 * 1000;
 
@@ -304,6 +315,22 @@ impl WaveSpec {
         ]
     }
 
+    /// REMOTE.md 第 4.7.1 節的四批「建議」範本（主控台選用）：canary 1%（至多 10 台、觀察 60 分鐘、
+    /// 任何失敗都暫停、人工繼續）→ 10% → 50%（各觀察 30 分鐘、上限 5%）→ 其餘。百分比以**剩餘**的
+    /// 可升級主機計
+    pub fn recommended_template() -> Vec<WaveSpec> {
+        let mid = |p: u32| WaveSpec {
+            size: WaveSize::Percent(p),
+            max_hosts: None,
+            soak_minutes: 30,
+            max_failure_ratio: 0.05,
+            manual_continue: false,
+        };
+        let mut w = WaveSpec::default_template();
+        w.splice(1..1, [mid(10), mid(50)]);
+        w
+    }
+
     fn parse(v: &Value, last: bool) -> Result<WaveSpec, String> {
         let Value::Object(m) = v else {
             return Err("每一批必須是物件".to_string());
@@ -399,6 +426,8 @@ pub struct RolloutSpec {
     pub selector: SelectorSpec,
     pub waves: Vec<WaveSpec>,
     pub options: RolloutOptions,
+    /// 排程與維護時段（沒有時立即開始、隨時可以提議）
+    pub schedule: ScheduleSpec,
 }
 
 /// 欄位錯誤：(欄位, 說明)
@@ -412,12 +441,10 @@ impl RolloutSpec {
         };
         for k in m.keys() {
             match k.as_str() {
-                "name" | "target_version" | "selector" | "waves" | "options" | "impact_token" => {}
-                "schedule" | "windows" | "starts_at" | "ends_at" => {
-                    return Err((
-                        k.clone(),
-                        "維護時段與排程在 0.10 提供；0.9 的推送送出後立即開始".into(),
-                    ));
+                "name" | "target_version" | "selector" | "waves" | "options" | "schedule"
+                | "impact_token" => {}
+                "windows" | "starts_at" | "ends_at" | "timezone" => {
+                    return Err((k.clone(), format!("{k} 請放在 schedule 物件內")));
                 }
                 _ => return Err((k.clone(), format!("不認得的欄位 {k}"))),
             }
@@ -459,10 +486,7 @@ impl RolloutSpec {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => {
-                return Err((
-                    "waves".into(),
-                    format!("waves 必須是 1～{MAX_WAVES} 批（0.9：canary＋其餘；自訂批次在 0.10）"),
-                ));
+                return Err(("waves".into(), format!("waves 必須是 1～{MAX_WAVES} 批")));
             }
         };
         let mut options: RolloutOptions = match m.get("options") {
@@ -506,12 +530,14 @@ impl RolloutSpec {
                 "指定 canary 主機時需要兩批".into(),
             ));
         }
+        let schedule = ScheduleSpec::parse(m.get("schedule"))?;
         Ok(RolloutSpec {
             name: name.to_string(),
             target_version: target_version.to_string(),
             selector,
             waves,
             options,
+            schedule,
         })
     }
 
@@ -688,32 +714,32 @@ pub fn assign_waves(
         )
     });
     let n = ordered.len();
-    let first = if waves.len() < 2 {
-        n
-    } else if !canary.is_empty() {
-        ordered
-            .iter()
-            .filter(|h| canary.contains(&h.agent_id))
-            .count()
-    } else {
-        let size = match waves[0].size {
-            WaveSize::Count(c) => c as usize,
-            WaveSize::Percent(p) => (n * p as usize).div_ceil(100).max(1),
-            WaveSize::Rest => n,
-        };
-        let size = waves[0].max_hosts.map_or(size, |m| size.min(m as usize));
-        size.min(n)
-    };
+    // 每批的台數：最後一批取其餘；第一批有指定 canary 時就是那些主機；其他依 size（百分比以**剩餘**
+    // 的可升級主機計，至少 1 台）與 max_hosts。兩批時與 0.9 的結果相同
     let mut out = Vec::with_capacity(n);
-    let mut ordinal = [0i64; MAX_WAVES];
-    for (i, h) in ordered.iter().enumerate() {
-        let wave = if i < first {
-            0
+    let mut hosts = ordered.iter();
+    let mut remaining = n;
+    for (wave, w) in waves.iter().enumerate() {
+        let size = if wave + 1 == waves.len() {
+            remaining
+        } else if wave == 0 && !canary.is_empty() {
+            ordered
+                .iter()
+                .filter(|h| canary.contains(&h.agent_id))
+                .count()
         } else {
-            1usize.min(waves.len() - 1)
-        };
-        out.push((h.host_id, wave as i64, ordinal[wave]));
-        ordinal[wave] += 1;
+            let size = match w.size {
+                WaveSize::Count(c) => c as usize,
+                WaveSize::Percent(p) => (remaining * p as usize).div_ceil(100).max(1),
+                WaveSize::Rest => remaining,
+            };
+            w.max_hosts.map_or(size, |m| size.min(m as usize))
+        }
+        .min(remaining);
+        for (ordinal, h) in hosts.by_ref().take(size).enumerate() {
+            out.push((h.host_id, wave as i64, ordinal as i64));
+        }
+        remaining -= size;
     }
     out
 }
@@ -841,6 +867,9 @@ pub enum HostAction {
     Revive,
     /// 連線中但沒有協商 `upgrade`（本機停用或缺少輔助程式）：跳過
     SkipNotReady,
+    /// 有維護時段的推送：時段結束時還沒開始替換（Pulse 回報 `expired`，或時段結束後仍停在提議中）
+    /// → 回到 `pending`、換新的 `upgrade_id`，下一個時段重新提議
+    Requeue,
 }
 
 /// 推送層級的決定
@@ -875,6 +904,8 @@ pub struct TickInput<'a> {
     pub awaiting_continue: bool,
     pub waves: &'a [WaveSpec],
     pub options: &'a RolloutOptions,
+    /// 排程與維護時段：時段外不提議新的主機
+    pub schedule: &'a ScheduleSpec,
 }
 
 /// 推送引擎的一步（純函式）：每台主機的動作與推送層級的動作。主機動作先套用，推送動作以套用後的狀態計算
@@ -885,15 +916,33 @@ pub fn plan_tick(
 ) -> (Vec<(usize, HostAction)>, Option<RolloutAction>) {
     let mut actions = Vec::new();
     let mut states: Vec<&str> = hosts.iter().map(|h| h.state.as_str()).collect();
+    let windowed = !t.schedule.windows.is_empty();
     let health_ms = i64::from(t.options.health_timeout_secs) * 1000;
     let grace_ms = i64::from(t.options.offline_grace_hours) * 3_600_000;
     for (i, h) in hosts.iter().enumerate() {
         let l = live(&h.agent_id);
         let act = match h.state.as_str() {
+            s if is_offered(s) && windowed => h.offered_at.and_then(|at| {
+                // 提議時所在時段的結束（提議的 apply_window.not_after）
+                let end = t
+                    .schedule
+                    .apply_window(at, APPLY_WINDOW_MS)
+                    .map_or(at, |(_, e)| e);
+                (t.now_ms > end + WINDOW_EXPIRE_GRACE_MS).then(|| requeue_or_expire(h))
+            }),
             s if is_offered(s) => h
                 .offered_at
                 .filter(|at| t.now_ms > at + APPLY_WINDOW_MS + EXPIRE_GRACE_MS)
                 .map(|_| HostAction::Expire),
+            // Pulse 在時段結束時回報的 expired：下一個時段再提議
+            HOST_EXPIRED
+                if windowed
+                    && h.wave >= 0
+                    && h.reason.as_deref() != Some(REASON_ROLLOUT_ENDED)
+                    && h.attempts < MAX_WINDOW_REQUEUES =>
+            {
+                Some(HostAction::Requeue)
+            }
             HOST_APPLYING => {
                 // Kairos 這端造成的離線（關機、server_lost）從 Kairos 啟動時重新起算，不算主機卡住
                 let since = h.applying_at.unwrap_or(h.updated_at);
@@ -923,7 +972,7 @@ pub fn plan_tick(
                 HostAction::Unknown => HOST_UNKNOWN,
                 HostAction::SkipOffline => HOST_SKIPPED_OFFLINE,
                 HostAction::SkipNotReady => HOST_SKIPPED,
-                HostAction::Revive => HOST_PENDING,
+                HostAction::Revive | HostAction::Requeue => HOST_PENDING,
                 HostAction::Offer => HOST_OFFERED,
             };
             actions.push((i, a));
@@ -954,13 +1003,19 @@ pub fn plan_tick(
             );
         }
     }
-    // 提議新的主機：Kairos 剛啟動、觀察中或等待繼續時不提議
+    // 提議新的主機：Kairos 剛啟動、觀察中、等待繼續或維護時段外不提議
     let soaking = t.soak_until.is_some();
-    if t.now_ms >= t.started_ms + t.start_grace_ms && !soaking && !t.awaiting_continue {
+    if t.now_ms >= t.started_ms + t.start_grace_ms
+        && !soaking
+        && !t.awaiting_continue
+        && t.schedule.window_at(t.now_ms).is_open()
+    {
         let mut slots = (t.options.max_in_progress as usize)
             .saturating_sub(states.iter().filter(|s| is_in_progress(s)).count());
         let mut pending: Vec<usize> = (0..hosts.len())
             .filter(|i| states[*i] == HOST_PENDING && hosts[*i].wave <= t.current_wave)
+            // 這一輪才重新排入的主機要先換 upgrade_id，下一輪再提議
+            .filter(|i| !actions.contains(&(*i, HostAction::Requeue)))
             .collect();
         pending.sort_by_key(|i| (hosts[*i].wave, hosts[*i].ordinal));
         for i in pending {
@@ -1003,6 +1058,15 @@ pub fn plan_tick(
     (actions, action)
 }
 
+/// 有維護時段的推送中逾時的主機：重新排入，超過次數上限時標為 `expired`
+fn requeue_or_expire(h: &RolloutHostRow) -> HostAction {
+    if h.attempts < MAX_WINDOW_REQUEUES {
+        HostAction::Requeue
+    } else {
+        HostAction::Expire
+    }
+}
+
 /// 各狀態的台數
 pub fn progress(hosts: &[RolloutHostRow]) -> BTreeMap<String, usize> {
     let mut m: BTreeMap<String, usize> = HOST_STATES.iter().map(|s| (s.to_string(), 0)).collect();
@@ -1036,8 +1100,34 @@ pub fn next_action(
     cause: Option<&str>,
     now_ms: i64,
 ) -> Value {
+    next_action_scheduled(
+        state,
+        soak_until,
+        awaiting_continue,
+        pause_reason,
+        cause,
+        &ScheduleSpec::default(),
+        now_ms,
+    )
+}
+
+/// [`next_action`] 加上排程：`scheduled{starts_at}`（等待開始時間）、`waiting_window{until}`（維護時段外，
+/// `until` 為下一個時段開始的時間；之後沒有時段時為 `null`）
+pub fn next_action_scheduled(
+    state: &str,
+    soak_until: Option<i64>,
+    awaiting_continue: bool,
+    pause_reason: Option<&str>,
+    cause: Option<&str>,
+    schedule: &ScheduleSpec,
+    now_ms: i64,
+) -> Value {
     match state {
         ROLLOUT_DRAFT => json!({"code": "draft"}),
+        ROLLOUT_SCHEDULED => json!({
+            "code": "scheduled",
+            "starts_at": schedule.starts_at.map(crate::api::http::ts_ms),
+        }),
         ROLLOUT_PAUSED => {
             json!({"code": "paused", "reason": pause_reason, "cause": pause_cause(state, cause)})
         }
@@ -1050,7 +1140,13 @@ pub fn next_action(
                 "minutes": ((t - now_ms) as f64 / 60_000.0).ceil() as i64,
                 "until": crate::api::http::ts_ms(t),
             }),
-            _ => json!({"code": "upgrading"}),
+            _ => match schedule.window_at(now_ms) {
+                WindowState::Closed { next } => json!({
+                    "code": "waiting_window",
+                    "until": next.map(crate::api::http::ts_ms),
+                }),
+                WindowState::Open { .. } => json!({"code": "upgrading"}),
+            },
         },
     }
 }

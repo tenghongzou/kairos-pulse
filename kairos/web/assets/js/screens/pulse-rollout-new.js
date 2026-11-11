@@ -1,17 +1,20 @@
 // S26 建立推送（/pulse/rollouts/new；rollouts:write）（設計包 kairos/screens.md S26「建立推送」；API.md 第 17.3 節）。
 //
-// 0.9 為單頁表單（0.10 加入自訂批次與維護時段時改為精靈，設計包 §31.7 #6）：
+// 單頁表單（設計包 §31.7 #6 預定 0.10 改為精靈，但設計包還沒有精靈的規格：0.10 先在同一頁加上「中間的批次」
+// 與「排程與維護時段」兩個區塊）：
 // 1. 目標版本（版本庫）；breaking 時要求勾選「我已閱讀破壞性變更與升級步驟」；目前的 Kairos 低於 min_kairos 時
 //    就地錯誤 KRS-W8415，不能送出。
 // 2. 對象：全部主機，或群組、標籤、主機（agent_id）的聯集，另可排除主機。下方即時顯示資格預覽
 //    （POST /rollouts/preview，600 ms 合併；可升級台數以 aria-live 朗讀）：不會升級的依原因分列，每類可展開前 100 台。
-// 3. 批次（0.9 固定兩批）：先行批次（%、上限台數或指定主機）＋觀察時間（人工繼續）；其餘的失敗上限；
-//    同時升級的上限、健康確認期限。
+// 3. 批次：先行批次（%、上限台數或指定主機）＋觀察時間（人工繼續）；中間的批次（0.10：可增減，大小為剩餘主機的 %、
+//    觀察時間、失敗上限；「套用建議的四批範本」）；其餘的失敗上限；同時升級的上限、健康確認期限。最多 10 批。
+// 3b. 排程與維護時段（0.10）：開始／結束時間（選填）、每週的時段（星期、開始、結束；跨午夜可），時區為 Kairos 的
+//    alerts.timezone（預覽回傳 default_timezone）。預覽回報目前是否在時段內。
 // 4. 選項：允許無法自動回滾的主機、允許降版。
 // 5. 送出：建立草稿（POST /rollouts）→ L2 DangerConfirmDialog 輸入預覽的 confirm_text（「升級 N 台」）→ submit；
 //    降版時 L3（「降版 N 台」＋原因必填；0.9 不要求重新驗證密碼）。台數在送出時改變（400 confirmation_required）
 //    時對話框內換成新的確認字串；主機已在另一個推送（409 rollout_overlap）時列出主機並提供「從對象排除這些主機」。
-// 0.10 的維護時段、雙人覆核、Windows、外部 URL 不顯示。
+// 雙人覆核、Windows、外部 URL 不顯示。
 
 import { h, icon, mount, uid, announce } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -26,6 +29,14 @@ import { refreshRolloutCount } from './pulse-boot.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CRUMB = { text: t('rm.ro.title'), href: '/pulse/rollouts' };
+const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+const MAX_WAVES = 10;
+const MAX_WINDOWS = 16;
+
+/** 各批的台數（「2 → 20 → 89 → 89」） */
+function waveList(waves) {
+  return (waves || []).map((n) => fmt.num(n || 0)).join(' → ');
+}
 
 function cmpVersion(a, b) {
   const pa = String(a).split(/[.-]/).map((x) => Number.parseInt(x, 10) || 0);
@@ -58,7 +69,11 @@ export function submitDialog({ name, preview, submit, onExclude }) {
     const cancel = h('button', { type: 'button', class: 'ds-button ds-button--secondary' }, t('common.cancel'));
     const waves = preview.waves || [];
     const soak = preview.waves_spec && preview.waves_spec[0] ? preview.waves_spec[0].soak_minutes : 60;
-    const lead = h('p', { class: 'k-danger-lead' }, icon('status-critical'), h('span', null, t('rm.new.submitLead', { a: fmt.num(waves[0] || 0), m: fmt.num(soak), b: fmt.num(waves[1] || 0) })));
+    const leadText = waves.length > 2 ? t('rm.new.submitLeadN', { n: fmt.num(waves.length), list: waveList(waves), m: fmt.num(soak) }) : t('rm.new.submitLead', { a: fmt.num(waves[0] || 0), m: fmt.num(soak), b: fmt.num(waves[1] || 0) });
+    const lead = h('p', { class: 'k-danger-lead' }, icon('status-critical'), h('span', null, leadText));
+    const sch = preview.schedule || {};
+    const later = sch.starts_at && new Date(sch.starts_at).getTime() > fmt.serverNow();
+    const win = preview.window || {};
     const l3Note = h('p', { class: 'caption', hidden: level !== 'L3' }, t('rm.new.l3Note'));
     const sync = () => {
       const m = typed.value.trim() === phrase;
@@ -74,6 +89,8 @@ export function submitDialog({ name, preview, submit, onExclude }) {
         'div',
         { class: 'k-stack--sm' },
         lead,
+        later ? h('p', null, t('rm.new.submitLeadLater', { t: fmt.dateTime(sch.starts_at, { seconds: false }) })) : null,
+        sch.windows && sch.windows.length ? h('p', null, win.open === false && win.next ? t('rm.new.windowClosed', { t: fmt.dateTime(win.next, { seconds: false }) }) : t('rm.new.submitLeadWindow')) : null,
         preview.downgrade ? h('p', { class: 'strong' }, t('rm.new.submitLeadDown', { n: fmt.num(preview.downgrade) })) : null,
         preview.no_rollback ? h('p', null, t('rm.new.submitNoRollback', { n: fmt.num(preview.no_rollback) })) : null,
         errBox,
@@ -177,7 +194,10 @@ export function previewView(p, { onExclude, version } = {}) {
     h('p', { class: 'k-preview-big' }, h('span', { class: 'strong' }, t('rm.new.eligible', { n: fmt.num(p.eligible || 0) })), ' · ', t('rm.new.matched', { n: fmt.num(p.matched || 0) })),
     p.downgrade ? h('p', null, t('rm.new.downgradeN', { n: fmt.num(p.downgrade) })) : null,
     p.no_rollback ? h('p', null, t('rm.new.noRollbackN', { n: fmt.num(p.no_rollback) })) : null,
-    p.waves && p.waves.length ? h('p', null, t('rm.new.waves', { a: fmt.num(p.waves[0] || 0), b: fmt.num(p.waves[1] || 0) })) : null,
+    p.waves && p.waves.length ? h('p', { id: 'rollout-preview-waves' }, p.waves.length > 2 ? t('rm.new.wavesN', { n: fmt.num(p.waves.length), list: waveList(p.waves) }) : t('rm.new.waves', { a: fmt.num(p.waves[0] || 0), b: fmt.num(p.waves[1] || 0) })) : null,
+    p.window && p.window.open === false
+      ? inlineAlert({ kind: p.window.next ? 'info' : 'warning', role: 'status', body: p.window.next ? t('rm.new.windowClosed', { t: fmt.dateTime(p.window.next, { seconds: false }) }) : t('rm.new.windowNone') })
+      : null,
     p.loses_remote_management && p.eligible ? inlineAlert({ kind: 'warning', body: t('rm.new.loses') }) : null,
     p.overlap && p.overlap.count
       ? inlineAlert({
@@ -275,6 +295,128 @@ export function render(ctx) {
   const health = numField(t('rm.new.health'), 'health_timeout_secs', 600, t('rm.new.healthHint'), 120, 3600);
   const nums = [canaryPct, canaryMax, soak, restFail, maxIn, health];
 
+  // ---- 中間的批次（0.10）：先行批次與「其餘」之間，可增減 ----
+  const mids = [];
+  const midList = h('div', { class: 'k-stack--sm', id: 'rollout-mid-waves' });
+  const midAdd = h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => addMid({}, true) } }, icon('plus'), t('rm.new.midAdd'));
+  const midTemplate = h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => applyTemplate() } }, t('rm.new.midTemplate'));
+  function renderMids() {
+    mount(
+      midList,
+      mids.map((m, i) =>
+        h(
+          'fieldset',
+          { class: 'k-fieldset', dataset: { wave: String(i + 1) } },
+          h('legend', null, t('rm.new.midLegend', { n: fmt.num(i + 2) })),
+          h('div', { class: 'ds-form-row' }, m.pct.f, m.soak.f, m.fail.f),
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'ds-button ds-button--tertiary ds-button--sm',
+              on: {
+                click: () => {
+                  mids.splice(i, 1);
+                  renderMids();
+                  schedule();
+                  midAdd.focus();
+                },
+              },
+            },
+            t('rm.new.midRemove', { n: fmt.num(i + 2) }),
+          ),
+        ),
+      ),
+    );
+    midAdd.disabled = mids.length + 2 >= MAX_WAVES;
+  }
+  function addMid({ pct = 10, soakMin = 30, fail = 5 }, focus) {
+    if (mids.length + 2 >= MAX_WAVES) return;
+    const k = uid('w');
+    const m = {
+      pct: numField(t('rm.new.midPct'), `${k}_pct`, pct, null, 1, 100),
+      soak: numField(t('rm.new.midSoak'), `${k}_soak`, soakMin, null, 0, 10080),
+      fail: numField(t('rm.new.midFail'), `${k}_fail`, fail, null, 0, 100),
+    };
+    for (const n of [m.pct, m.soak, m.fail]) n.el.addEventListener('input', schedule);
+    mids.push(m);
+    renderMids();
+    schedule();
+    if (focus) m.pct.el.focus();
+  }
+  function applyTemplate() {
+    // REMOTE.md 第 4.7.1 節的建議範本：1%（至多 10 台、觀察 60 分鐘）→ 10% → 50%（各觀察 30 分鐘、上限 5%）→ 其餘
+    canaryPct.el.value = '1';
+    canaryMax.el.value = '10';
+    soak.el.value = '60';
+    restFail.el.value = '5';
+    mids.length = 0;
+    addMid({ pct: 10 });
+    addMid({ pct: 50 });
+    announce(t('rm.new.midTemplateDone'));
+  }
+
+  // ---- 排程與維護時段（0.10） ----
+  const startsIn = input({ type: 'datetime-local', name: 'starts_at' });
+  const fstarts = field({ label: t('rm.new.startsAt'), input: startsIn, hint: t('rm.new.startsAtHint') });
+  const endsIn = input({ type: 'datetime-local', name: 'ends_at' });
+  const fends = field({ label: t('rm.new.endsAt'), input: endsIn, hint: t('rm.new.endsAtHint') });
+  const wins = [];
+  const winList = h('div', { class: 'k-stack--sm', id: 'rollout-windows' });
+  const winAdd = h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => addWindow(true) } }, icon('plus'), t('rm.new.winAdd'));
+  const tzNote = h('p', { class: 'caption', id: 'rollout-window-tz' }, t('rm.new.winTzUnknown'));
+  function renderWindows() {
+    mount(
+      winList,
+      wins.map((w, i) =>
+        h(
+          'fieldset',
+          { class: 'k-fieldset', dataset: { window: String(i) } },
+          h('legend', null, t('rm.new.winLegend', { n: fmt.num(i + 1) })),
+          h('div', { class: 'ds-form-row' }, w.fstart, w.fend),
+          h('fieldset', { class: 'k-fieldset' }, h('legend', null, t('rm.new.winDays')), h('div', { class: 'ds-radio-group' }, w.days.map((d, j) => h('label', { class: 'ds-checkbox' }, d, t(`rm.day.${DAYS[j]}`))))),
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'ds-button ds-button--tertiary ds-button--sm',
+              on: {
+                click: () => {
+                  wins.splice(i, 1);
+                  renderWindows();
+                  schedule();
+                  winAdd.focus();
+                },
+              },
+            },
+            t('rm.new.winRemove', { n: fmt.num(i + 1) }),
+          ),
+        ),
+      ),
+    );
+    winAdd.disabled = wins.length >= MAX_WINDOWS;
+  }
+  function addWindow(focus) {
+    if (wins.length >= MAX_WINDOWS) return;
+    const k = uid('win');
+    const start = input({ type: 'time', name: `${k}_start`, value: '01:00' });
+    const end = input({ type: 'time', name: `${k}_end`, value: '05:00' });
+    const w = {
+      start,
+      end,
+      fstart: field({ label: t('rm.new.winStart'), input: start }),
+      fend: field({ label: t('rm.new.winEnd'), input: end, hint: t('rm.new.winHint') }),
+      days: DAYS.map((d) => h('input', { type: 'checkbox', class: 'ds-check', name: `${k}_${d}`, value: d })),
+    };
+    for (const el of [start, end]) el.addEventListener('input', schedule);
+    for (const el of w.days) el.addEventListener('change', schedule);
+    wins.push(w);
+    renderWindows();
+    schedule();
+    if (focus) start.focus();
+  }
+  for (const el of [startsIn, endsIn]) el.addEventListener('input', schedule);
+
   const noRbId = uid('norb');
   const noRb = h('input', { type: 'checkbox', id: noRbId, name: 'allow_no_rollback', class: 'ds-check', 'aria-describedby': `${noRbId}-hint` });
   const downId = uid('down');
@@ -369,11 +511,42 @@ export function render(ctx) {
     const badC = canaryIds.find((x) => !UUID_RE.test(x));
     mark(fcanaryAgents, canaryAgentsIn, badC ? t('rm.new.badId', { v: badC }) : '');
     const v = {};
-    for (const n of nums) {
+    const readNum = (n) => {
       const x = n.read();
       mark(n.f, n.el, x == null ? t('rm.new.numBad', { min: fmt.num(n.min), max: fmt.num(n.max) }) : '');
-      v[n.el.name] = x;
+      return x;
+    };
+    for (const n of nums) v[n.el.name] = readNum(n);
+    const midWaves = mids.map((m) => {
+      const [pct, soakMin, fail] = [readNum(m.pct), readNum(m.soak), readNum(m.fail)];
+      return { size: `${pct}%`, soak_minutes: soakMin, max_failure_ratio: (fail ?? 0) / 100 };
+    });
+    // 排程：開始／結束時間以瀏覽器的本地時間輸入，送出為 RFC 3339（UTC）
+    const sch = {};
+    const readTime = (f, el) => {
+      if (!el.value) {
+        mark(f, el, '');
+        return null;
+      }
+      const d = new Date(el.value);
+      const bad = Number.isNaN(d.getTime());
+      mark(f, el, bad ? t('rm.new.timeBad') : '');
+      return bad ? null : d;
+    };
+    const st = readTime(fstarts, startsIn);
+    const en = readTime(fends, endsIn);
+    if (st) sch.starts_at = st.toISOString();
+    if (en) {
+      if (st && en <= st) mark(fends, endsIn, t('rm.new.endBeforeStart'));
+      sch.ends_at = en.toISOString();
     }
+    const windows = wins.map((w) => {
+      const [s, e] = [w.start.value.slice(0, 5), w.end.value.slice(0, 5)];
+      const bad = !s || !e || s === e;
+      mark(w.fend, w.end, bad ? t('rm.new.winBad') : '');
+      return { days: DAYS.filter((_, j) => w.days[j].checked), start: s, end: e };
+    });
+    if (windows.length) sch.windows = windows;
     if (strict && release() && release().manifest && release().manifest.breaking && !ack.checked) {
       ackErr.hidden = false;
       if (!bad) bad = ack;
@@ -388,8 +561,10 @@ export function render(ctx) {
       selector,
       waves: [
         { size: `${v.canary_pct}%`, max_hosts: v.canary_max, soak_minutes: v.soak_minutes, max_failure_ratio: 0, manual_continue: true },
+        ...midWaves,
         { size: 'rest', max_failure_ratio: v.rest_failure_pct / 100 },
       ],
+      ...(Object.keys(sch).length ? { schedule: sch } : {}),
       options: {
         max_in_progress: v.max_in_progress,
         health_timeout_secs: v.health_timeout_secs,
@@ -401,7 +576,7 @@ export function render(ctx) {
   }
 
   function snapshot() {
-    return JSON.stringify([nameIn.value, verSel.value, allR.checked, groupsIn.value, tagsIn.value, agentsIn.value, excludeIn.value, canaryAgentsIn.value, nums.map((n) => n.el.value), noRb.checked, down.checked, ack.checked]);
+    return JSON.stringify([nameIn.value, verSel.value, allR.checked, groupsIn.value, tagsIn.value, agentsIn.value, excludeIn.value, canaryAgentsIn.value, nums.map((n) => n.el.value), noRb.checked, down.checked, ack.checked, mids.map((m) => [m.pct.el.value, m.soak.el.value, m.fail.el.value]), startsIn.value, endsIn.value, wins.map((w) => [w.start.value, w.end.value, w.days.map((d) => d.checked)])]);
   }
 
   let timer = null;
@@ -420,6 +595,7 @@ export function render(ctx) {
       if (my !== seq || disposed) return;
       lastPreview = p;
       mount(previewBox, previewView(p, { onExclude: excludeHosts, version: verSel.value }));
+      if (p.default_timezone) tzNote.textContent = t('rm.new.winTz', { tz: p.default_timezone });
       live.textContent = `${t('rm.new.eligible', { n: fmt.num(p.eligible || 0) })}，${t('rm.new.matched', { n: fmt.num(p.matched || 0) })}`;
       syncSubmit();
     } catch (err) {
@@ -488,7 +664,7 @@ export function render(ctx) {
     });
     if (!r) return;
     submitted = true;
-    toast({ kind: 'success', title: t('rm.new.submitted', { name: s.name }) });
+    toast({ kind: 'success', title: r.state === 'scheduled' ? t('rm.new.submittedLater', { name: s.name, t: fmt.dateTime(r.starts_at, { seconds: false }) }) : t('rm.new.submitted', { name: s.name }) });
     refreshRolloutCount();
     navigate(`/pulse/rollouts/${encodeURIComponent(r.id || draftId)}`, { replace: true });
   }
@@ -555,7 +731,22 @@ export function render(ctx) {
               h('p', { class: 'caption' }, t('rm.new.canaryNote')),
               h('div', { class: 'ds-form-row' }, canaryPct.f, canaryMax.f, soak.f),
               fcanaryAgents,
+              h('h3', { class: 'k-section-title' }, t('rm.new.midTitle')),
+              h('p', { class: 'caption' }, t('rm.new.midNote', { max: fmt.num(MAX_WAVES) })),
+              midList,
+              h('div', { class: 'ds-button-row' }, midAdd, midTemplate),
               h('div', { class: 'ds-form-row' }, restFail.f, maxIn.f, health.f),
+            ],
+          }),
+          card({
+            title: t('rm.new.schedule'),
+            body: [
+              h('p', { class: 'caption' }, t('rm.new.scheduleNote')),
+              h('div', { class: 'ds-form-row' }, fstarts, fends),
+              h('h3', { class: 'k-section-title' }, t('rm.new.winTitle')),
+              tzNote,
+              winList,
+              h('div', { class: 'ds-button-row' }, winAdd),
             ],
           }),
           card({

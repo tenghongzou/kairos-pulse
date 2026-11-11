@@ -223,16 +223,65 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(upg.status, 200);
     assert.equal(upg.json.data.install.upgrade, 'ready');
     await axe(page, 'F8 S26 推送（空）');
+    // 0.10 排程：starts_at 在未來的推送送出後為「已排程」，可以取消（以 API 建立，畫面檢查清單與詳情）
+    const startsAt = new Date(Date.now() + 6 * 3600 * 1000).toISOString();
+    const sch = await api(page, 'POST', '/api/v1/rollouts', {
+      name: 'E2E 排程',
+      target_version: VERSION,
+      selector: { all: true },
+      waves: [{ size: 1, manual_continue: true }, { size: '50%', soak_minutes: 5 }, { size: 'rest' }],
+      schedule: { starts_at: startsAt, windows: [{ days: ['sat', 'sun'], start: '23:00', end: '03:00' }] },
+    });
+    assert.equal(sch.status, 201, JSON.stringify(sch.json));
+    const schId = sch.json.data.id;
+    assert.equal(sch.json.data.schedule.windows[0].end, '03:00');
+    assert.ok(sch.json.data.schedule.timezone, '有時段時填入預設時區');
+    const schSubmit = await api(page, 'POST', `/api/v1/rollouts/${schId}/submit`, { confirm: '升級 1 台' });
+    assert.equal(schSubmit.status, 200, JSON.stringify(schSubmit.json));
+    assert.equal(schSubmit.json.data.state, 'scheduled');
+    assert.equal(schSubmit.json.data.next_action.code, 'scheduled');
+    await page.reload();
+    await waitTitle(page, '升級推送');
+    const schRow = page.locator(`tr[data-rollout="${schId}"]`);
+    await schRow.getByText('已排程').first().waitFor();
+    await schRow.getByText(/已排程，.* 開始/).waitFor();
+    await axe(page, 'F8 S26 推送清單（已排程）');
+    await page.goto(`${URL0}/pulse/rollouts/${schId}`);
+    await waitTitle(page, 'E2E 排程');
+    await page.getByText(/已排程：.* 開始升級。對象已在送出時固定/).waitFor();
+    await page.locator('#rollout-schedule').getByText(/維護時段：週六、週日 23:00～03:00（時區 /).waitFor();
+    // 三批：先行批次、第 2 批、其餘
+    await page.locator('#rollout-waves').getByText('第 2 批').waitFor();
+    assert.equal(await page.getByRole('button', { name: '取消推送…' }).count(), 1, '已排程的推送可以取消');
+    await axe(page, 'F8 S26 推送詳情（已排程、三批）');
+    const schCancel = await api(page, 'POST', `/api/v1/rollouts/${schId}/cancel`, { reason: 'E2E：排程測試結束' });
+    assert.equal(schCancel.status, 200, JSON.stringify(schCancel.json));
+    await page.goto(`${URL0}/pulse/rollouts`);
+    await waitTitle(page, '升級推送');
     await page.getByRole('link', { name: '建立推送' }).first().click();
     await waitTitle(page, '建立推送');
-    // 0.10 的控制項不出現（維護時段、雙人覆核）
-    assert.equal(await page.getByText(/維護時段|核准者|雙人覆核/).count(), 0);
+    // 雙人覆核的控制項不出現
+    assert.equal(await page.getByText(/核准者|雙人覆核/).count(), 0);
     await page.getByLabel(/^名稱/).fill('E2E 0.9.1');
     const preview = page.locator('#rollout-preview');
     await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
     // 0.6／0.8 的假 agent：Pulse 太舊（0.8 → 0.9 必須手動升級一次）
     await preview.locator('li[data-reason="unsupported_version"]').waitFor();
     await preview.getByText('先行批次 1 台、其餘 0 台').waitFor();
+    // 0.10 自訂批次：套用建議的四批範本 → 預覽列出各批台數 → 移除中間的批次回到兩批
+    await page.getByRole('button', { name: /套用建議的四批範本/ }).click();
+    await preview.getByText('分 4 批：1 → 0 → 0 → 0 台').waitFor({ timeout: 15000 });
+    await page.locator('#rollout-mid-waves fieldset[data-wave="2"]').waitFor();
+    // 0.10 維護時段：新增一個時段，時區說明來自預覽的 default_timezone
+    await page.getByRole('button', { name: '新增時段' }).click();
+    await page.locator('#rollout-windows fieldset[data-window="0"]').waitFor();
+    await page.locator('#rollout-window-tz').getByText(/時段以 Kairos 的時區 [+-]\d\d:\d\d 計算/).waitFor({ timeout: 15000 });
+    await axe(page, 'F8 S26 建立推送（四批＋維護時段）');
+    await page.getByRole('button', { name: '移除時段 1' }).click();
+    await page.getByRole('button', { name: '移除第 2 批' }).click();
+    await page.getByRole('button', { name: '移除第 2 批' }).click();
+    assert.equal(await page.locator('#rollout-mid-waves fieldset').count(), 0);
+    await preview.getByText('先行批次 1 台、其餘 0 台').waitFor({ timeout: 15000 });
     await axe(page, 'F8 S26 建立推送');
     await shot(page, 'f8-rollout-new');
     // 數字欄位的範圍
