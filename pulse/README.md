@@ -481,8 +481,8 @@ enabled = true                 # false = 不接受 Kairos 推送的升級
 allowed_signers = ""           # 信任錨；空字串 = /etc/kairos-pulse/allowed_signers（root 擁有、其他人不可寫）
 extra_principals = []          # 除 release@kairos-pulse 外另外接受的 principal（以自己的金鑰重新簽署時）
 allow_downgrade = false        # 接受遠端降版（推送也必須允許）；自動回滾不受影響
-url_allowlist = []             # 外部 URL 下載的前綴（0.10.0 起使用）
-external_ca = ""               # 外部 URL 的 CA（0.10.0 起使用）
+url_allowlist = []             # 允許從外部 URL 下載發佈檔的前綴（0.10.0；空 = 只從 Kairos 下載）
+external_ca = ""               # 外部 URL 的 CA（PEM；設定時只信任它，空 = 作業系統信任庫）
 health_timeout_secs = 0        # 替換後的健康確認期限（0 = 依 Kairos；非 0 時取兩者較大，120～3600）
 ```
 
@@ -541,7 +541,7 @@ health_timeout_secs = 0        # 替換後的健康確認期限（0 = 依 Kairos
 | `inventory.interval` | 300～86400 秒 | |
 | `upgrade.health_timeout_secs` | 0，或 120～3600 秒 | 0 = 依 Kairos 推送的值（預設 600） |
 | `upgrade.extra_principals` | 每項 1～256 bytes，不含空白與逗號 | |
-| `upgrade.url_allowlist` | 每項以 `https://` 開頭 | 0.10.0 起使用 |
+| `upgrade.url_allowlist` | 每項以 `https://` 開頭 | 0.10.0：外部 URL 的版本庫。以目錄比對；不合法的項目（查詢字串、帳號密碼…）不比對任何 URL，啟動時記 `WARN` |
 
 ### ⚠️ 安全性提醒
 
@@ -969,7 +969,7 @@ sudo pulse diag -c /opt/pulse/pulse.toml --redact strict --since 7d   # 主機�
 - 8444 本機時鐘偏差的例外（忽略伺服器憑證有效期間只取 `server_time`）只用於 `pulse enroll` 的錯誤訊息；服務端憑證到期判定仍以 Kairos 的 `CertificateExpired` 為準，沒有以 8444 `server-info` 校正（設計包 §8.1 (d)）。
 - Windows 上的檔案權限檢查只看 ACL 中授權給一般使用者群組的「允許」項目，不計算「拒絕」項目與實際有效權限，也不展開自訂群組（見「敏感檔案的權限檢查」）。
 - 集中設定（0.9.0）：即時的取樣設定改變時重新開始取樣（下一筆在一個新的間隔之後）；`retry.*`、`buffer.replay_interval_ms` 與 hello 的 `report_interval_ms` 在下一次連線生效。執行中修改 `pulse.toml` 仍需重新啟動 Pulse。
-- 遠端升級（0.9.0）：只支援 Linux（Windows 的 MSI／zip、外部 URL 下載、維護時段與雙人覆核在 0.10.0）。deb／rpm 的回滾檔只在本機保存過它所屬發佈的驗證紀錄時使用（從 0.9.0 手動安裝後的第一次遠端升級沒有，回滾時以 `pulse.prev` 回復、套件資料庫仍顯示新版，之後以套件管理員重新安裝即可一致）。
+- 遠端升級：只支援 Linux（Windows 的 MSI／zip 尚未提供）。外部 URL 下載自 0.10.0 起提供（`[upgrade] url_allowlist`，預設空＝只從 Kairos 下載；`pulse/packaging/INSTALL.md` 第 10.1 節）。deb／rpm 的回滾檔只在本機保存過它所屬發佈的驗證紀錄時使用（從 0.9.0 手動安裝後的第一次遠端升級沒有，回滾時以 `pulse.prev` 回復、套件資料庫仍顯示新版，之後以套件管理員重新安裝即可一致）。
 
 ## 授權
 

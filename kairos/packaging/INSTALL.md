@@ -493,6 +493,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 
   - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
   - `data/` 已有內容不同的金鑰檔時（例如 Kairos 在還原前已啟動並產生了新的金鑰），`restore-keys` 拒絕；確認後加 `--overwrite`，原本的檔案改名為 `<名稱>.replaced-<時間>` 保留。
+  - 使用遠端升級時：備份**不含** Pulse 版本庫的發佈檔（`data/releases/`）。還原後系統健康的「遠端管理」會顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕），`sudo -u kairos /opt/kairos/kairos releases list --config /opt/kairos/kairos.toml` 列出遺失的檔案；把各版本的發佈檔放回目錄後以 `kairos releases import <目錄>` 補上（0.10.0）。
   - 少了 `alerts-secrets.key`（或與資料庫不成對）時，通知管道的狀態為 `secrets_unavailable`（`KRS-E5110`，主控台、`kairos alert-channels list` 與「通知管道失敗」事件都會顯示），不會發送；還原金鑰檔後重新啟動即恢復，或重新輸入機密。少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。少了 `audit-hmac.key` 時，`kairos audit verify` 與每日的自我驗證以 `hmac_key_unavailable`（`KRS-E6201`）失敗，並開「稽核日誌完整性」緊急事件。
 - 使用線上簽發（第 6 節的 `pki init`）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 
@@ -571,6 +572,8 @@ mv /opt/kairos/data/pki/server.pem.new /opt/kairos/data/pki/server.pem
 **從 0.4 升級到 0.5 的順序：先升級 Kairos，再升級 Pulse**：(1) `kairos db backup` → (2) 換上新版 Kairos 並重新啟動（此時註冊通道仍關閉）→ (3) 建立簽發 CA 並在 `kairos.toml` 開啟 `[enroll]`、`[pki]`（第 P.5 節），重新啟動後確認日誌有「註冊端點（8444）已啟動」→ (4) 防火牆開放 8444，只允許要註冊的主機 → (5) 通知 Pulse 端升級（建立 `/opt/pulse/identity`、換上新版 `pulse.service`，Pulse 的 INSTALL 第 10 節）。`storage.backend = "jsonl"` 時沒有註冊服務（不監聽 8444）。完整步驟與版本組合見 `CHANGELOG.md` [0.5.0]。
 
 **從 0.7 升級到 0.8：指標擴充（schema v8）、套件、`kairos pki`、aarch64**。資料庫升級到 schema v8（計數器的速率與推算序列、主機資產、行程快照；第一次啟動時重建 `series`，大型資料庫會多花一些時間）：**升級前以 `kairos db backup` 備份**，升級後 0.7 無法開啟。容量估算由每台約 52 MB 改為約 129 MB：主機多、沿用預設 `storage.max_total_bytes` 的部署依 `STORAGE.md` 第 10 節調高上限或縮短保留天數。協定版本不變，其他設定不需要修改。0.8 新增的 deb／rpm 是另一種安裝方式：既有的 tar.gz 安裝**不要**直接改裝套件（套件的預設設定是全新安裝用的；兩者版面相同，但 `kairos.service` 會從 `/etc/systemd/system` 換到 `/usr/lib/systemd/system`），照下方的步驟換執行檔即可。新版 `kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`（`kairos pki init` 的根 CA 暫存目錄；目錄不存在時沒有影響），手動 PKI 的部署可以沿用舊 unit。**`auth.client_ca`（安全修正）**：0.8 起 8443 一律拒絕經過已退役簽發 CA 的用戶端憑證鏈，`auth.client_ca` 指向根 CA 或代理 CA 的既有部署不需要修改設定也受到保護（`PKI.md` 第 15.4 節第 1 項）。仍**建議**改為 `client_ca = "/opt/kairos/data/pki/issuing-cas.pem"`：以根 CA 當信任錨時，根 CA 底下任何其他 CA 簽出的用戶端憑證都會通過，且不受 Kairos 的 CRL 管理。改之前以 `kairos pki certificates list` 與主控台 S04 確認每台主機都已改用 Kairos 簽發的憑證；仍有手動簽發的憑證時，`auth.client_ca` 只保留那張舊代理 CA（不要放根 CA），等那些主機重新註冊後再改。
+
+**從 0.9 升級到 0.10：升級推送的雙人覆核（schema v10〔草稿，版本號在整合時定案〕）**。資料庫升級到 schema v10（`rollouts` 新增送出者與退回原因的欄位）：**升級前以 `kairos db backup` 備份**，升級後 0.9 無法開啟。雙人覆核預設關閉；要求每個升級推送都由另一位管理員核准時，在 `kairos.toml` 的 `[remote]` 加上 `rollout_approval = "required"` 後重新啟動（只能在設定檔改；至少要有兩位管理員帳號，API token 不能核准）。協定不變，0.9 與 0.10 的 Kairos／Pulse 可任意混用；推送的排程、維護時段與自訂批次不需要升級 Pulse，外部 URL 的版本庫需要 Pulse 0.10 並在每台主機的 `pulse.toml` 設定 `upgrade.url_allowlist`（`pulse/packaging/INSTALL.md` 第 10.1 節）。
 
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 

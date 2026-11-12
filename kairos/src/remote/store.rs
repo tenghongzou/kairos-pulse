@@ -120,8 +120,11 @@ pub struct ReleaseRow {
     pub id: i64,
     pub version: String,
     pub commit: String,
-    /// `hosted`（0.9.0 只有這個）或 `external`（0.10）
+    /// `hosted`（Kairos 代管，發佈檔經 8443 下載）或 `external`（0.10.0：外部 URL 的版本庫，Kairos 不保存
+    /// 發佈檔，提議的 `artifact.url` 為 `base_url` ＋檔名；REMOTE.md 第 4.1.2 節）
     pub source: String,
+    /// `external` 時的 URL 前綴（`https://…/`，已正規化為以 `/` 結尾）；`hosted` 為 `None`
+    pub base_url: Option<String>,
     pub sha256sums: String,
     pub signature: String,
     /// 匯入時驗證的金鑰指紋（`[remote] allowed_signers` 沒有設定時為 `None`：沒有驗證）
@@ -177,6 +180,14 @@ pub struct RolloutRow {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub updated_at: i64,
+    /// 送出的時間與執行者（0.10.0，schema v10；雙人覆核時核准者不得是建立者或送出者）
+    pub submitted_at: Option<i64>,
+    pub submitted_by: Option<String>,
+    /// 核准的時間與執行者（雙人覆核）
+    pub approved_at: Option<i64>,
+    pub approved_by: Option<String>,
+    /// 最近一次被退回的原因（退回後回到草稿；再次送出時清除）
+    pub reject_reason: Option<String>,
 }
 
 /// `rollout_hosts` 的一列（`agent_id`、`hostname` 取自清冊）
@@ -258,6 +269,9 @@ pub struct HostTransition {
 
 /// 回滾失敗、尚未標記處理的主機：(agent_id, hostname, rollout_id, detail)
 pub type RollbackFailure = (String, String, String, Option<String>);
+
+/// 替換中的主機：(agent_id, rollout_id, 進入 `applying` 的時間, 推送的 `options` JSON)
+pub type ApplyingHost = (String, String, i64, String);
 
 /// 遠端管理的資料庫操作
 pub trait RemoteStore {
@@ -411,8 +425,14 @@ pub trait RemoteStore {
         now_ms: i64,
     ) -> StoreResult<bool>;
 
+    /// 修改草稿的排程（`schedule` 的 JSON；0.10）。不是草稿時 `false`
+    fn update_rollout_schedule(&self, id: &str, schedule: &str, now_ms: i64) -> StoreResult<bool>;
+
     /// 修改推送的狀態欄位
     fn update_rollout_state(&self, r: &RolloutRow) -> StoreResult<()>;
+
+    /// 刪除一個推送已固定的對象（已排程的推送被修改而退回草稿時；0.10）；回傳刪除的列數
+    fn delete_rollout_hosts(&self, rollout_id: &str) -> StoreResult<i64>;
 
     /// 刪除已完成或取消、`completed_at` 早於 `before_ms` 的推送（含主機）；回傳刪除的推送數
     fn delete_old_rollouts(&self, before_ms: i64) -> StoreResult<i64>;
@@ -450,6 +470,10 @@ pub trait RemoteStore {
 
     /// 回滾失敗、尚未標記為已處理的主機：(agent_id, hostname, rollout_id, detail)
     fn unacknowledged_rollback_failures(&self) -> StoreResult<Vec<RollbackFailure>>;
+
+    /// 替換中（`applying`）的主機：(agent_id, rollout_id, 進入 `applying` 的時間, 推送的 `options` JSON)。
+    /// 不論推送的狀態（暫停、取消後已交給輔助程式的主機照常完成）；升級中的離線告警抑制用
+    fn applying_hosts(&self) -> StoreResult<Vec<ApplyingHost>>;
 
     /// 使用中（草稿、進行中、暫停）的推送中以這個版本為目標的數量
     fn rollouts_using_release(&self, release_id: i64) -> StoreResult<i64>;

@@ -1,6 +1,6 @@
 //! `[remote]`：集中設定與 Pulse 遠端升級（商業審計 F8；`crates/kairos-proto/REMOTE.md` 第 7 節）。
 //!
-//! 需要重新啟動才生效（與其他安全相關設定相同）。0.9.0 不提供 `rollout_approval`（雙人覆核，0.10）。
+//! 需要重新啟動才生效（與其他安全相關設定相同）。`rollout_approval`（雙人覆核，第 5.4 節）自 0.10.0 起提供。
 
 use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind};
@@ -35,7 +35,14 @@ pub struct RemoteSettings {
     pub max_release_bytes: u64,
     /// 已完成或取消的推送保留天數（1～3650）
     pub rollout_retention_days: u32,
+    /// 雙人覆核（REMOTE.md 第 5.4 節，0.10.0）：`none`（預設）或 `required`——送出的推送先進入
+    /// `pending_approval`，必須由另一位有 `rollouts:approve` 的使用者核准。只在 `kairos.toml` 設定
+    pub rollout_approval: String,
 }
+
+/// `rollout_approval` 的值
+pub const ROLLOUT_APPROVAL_NONE: &str = "none";
+pub const ROLLOUT_APPROVAL_REQUIRED: &str = "required";
 
 impl Default for RemoteSettings {
     fn default() -> Self {
@@ -48,6 +55,7 @@ impl Default for RemoteSettings {
             max_concurrent_downloads: kairos_proto::mgmt::DEFAULT_MAX_CONCURRENT_DOWNLOADS,
             max_release_bytes: MAX_RELEASE_BYTES,
             rollout_retention_days: 400,
+            rollout_approval: ROLLOUT_APPROVAL_NONE.to_string(),
         }
     }
 }
@@ -78,6 +86,15 @@ impl RemoteSettings {
                 "remote.rollout_retention_days 必須介於 1..={MAX_ROLLOUT_RETENTION_DAYS}"
             )));
         }
+        if !matches!(
+            self.rollout_approval.as_str(),
+            ROLLOUT_APPROVAL_NONE | ROLLOUT_APPROVAL_REQUIRED
+        ) {
+            return Err(invalid(format!(
+                "remote.rollout_approval 必須是 \"none\" 或 \"required\"（目前是「{}」）",
+                self.rollout_approval
+            )));
+        }
         for p in &self.extra_principals {
             let p = p.trim();
             if p.is_empty() || p.len() > 256 || p.chars().any(|c| c.is_whitespace() || c == ',') {
@@ -87,6 +104,11 @@ impl RemoteSettings {
             }
         }
         Ok(())
+    }
+
+    /// 推送是否需要雙人覆核
+    pub fn approval_required(&self) -> bool {
+        self.rollout_approval == ROLLOUT_APPROVAL_REQUIRED
     }
 
     /// 發佈檔目錄的實際路徑
@@ -134,6 +156,17 @@ mod tests {
         assert_eq!(r.max_concurrent_downloads, 100);
         assert_eq!(r.max_release_bytes, 128 * 1024 * 1024);
         assert_eq!(r.rollout_retention_days, 400);
+        assert!(!r.approval_required());
+        let req = RemoteSettings {
+            rollout_approval: "required".into(),
+            ..RemoteSettings::default()
+        };
+        assert!(req.validate().is_ok() && req.approval_required());
+        let bad = RemoteSettings {
+            rollout_approval: "always".into(),
+            ..RemoteSettings::default()
+        };
+        assert!(bad.validate().is_err());
         assert!(r.validate().is_ok());
         let data = Path::new("/var/lib/kairos");
         assert_eq!(r.releases_path(data), data.join("releases"));

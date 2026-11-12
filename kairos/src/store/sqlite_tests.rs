@@ -1585,11 +1585,12 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(migrate(&mut conn, &MIGRATIONS[..5]).unwrap(), 5);
     assert!(has(&conn, "alert_events"));
     assert!(!has(&conn, "users"));
-    // 再升級到最新版（整合後的線性順序 v4 → v5 → v6 → v7 → v8 → v9 → v10）：使用者的資料表建立
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 10);
+    // 再升級到最新版（整合後的線性順序 v4 → v5 → v6 → v7 → v8 → v9 → v10 → v11）：使用者的資料表建立
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 11);
+    assert_eq!(SCHEMA_VERSION, 11);
     assert_eq!(
         MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     );
     for t in [
         "users",
@@ -1623,7 +1624,7 @@ fn upgrade_from_v4_through_v5_to_v6_keeps_data_and_adds_the_alert_and_user_table
     assert_eq!(n, crate::alerts::rules::builtins().len());
     assert_eq!(conn.ensure_builtin_rules(2).unwrap(), 0);
     // 再執行一次升級：不變
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 10);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 11);
     drop(conn);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -2021,4 +2022,63 @@ impl crate::store::backend_tests::TestStore for SqliteStore {
     fn sync_now(&mut self, snapshot: &RegistrySnapshot) -> usize {
         self.sync(snapshot).unwrap()
     }
+}
+
+/// v9 → v11（0.10.0）：v10 建立叢集協調的資料表、v11（升級推送的雙人覆核）只新增 `rollouts` 的欄位，
+/// 既有的推送保留、新欄位為 NULL
+#[test]
+fn upgrade_from_v9_to_v11_adds_the_rollout_approval_columns() {
+    use crate::remote::store::RemoteStore;
+    let dir = temp_dir("v9v11");
+    let path = dir.join("m.db");
+    let mut conn = Connection::open(&path).unwrap();
+    assert_eq!(migrate(&mut conn, &MIGRATIONS[..9]).unwrap(), 9);
+    conn.execute(
+        "INSERT INTO rollouts (rollout_id, name, release_id, target_version, selector, waves, schedule,
+            options, state, created_at, created_by, approved_at, approved_by, updated_at)
+         VALUES ('r-20261020-0001', 'x', 1, '0.9.1', '{}', '[]', '{}', '{}', 'completed', 1, 'user:a', NULL, NULL, 2)",
+        [],
+    )
+    .unwrap();
+    // 先到 v10：叢集的資料表建立，rollouts 還沒有新欄位
+    assert_eq!(migrate(&mut conn, &MIGRATIONS[..10]).unwrap(), 10);
+    let cols = |conn: &Connection| -> Vec<String> {
+        conn.prepare("SELECT name FROM pragma_table_info('rollouts')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect()
+    };
+    assert!(!cols(&conn).iter().any(|c| c == "submitted_at"));
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), SCHEMA_VERSION);
+    assert_eq!(MIGRATIONS.last().map(|m| m.version), Some(11));
+    for c in ["submitted_at", "submitted_by", "reject_reason"] {
+        assert!(cols(&conn).iter().any(|x| x == c), "{c}");
+    }
+    let r = conn.get_rollout("r-20261020-0001").unwrap().unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.created_by.as_str(), r.updated_at),
+        ("completed", "user:a", 2)
+    );
+    assert_eq!(
+        (
+            r.submitted_at,
+            r.submitted_by.clone(),
+            r.approved_at,
+            r.reject_reason.clone()
+        ),
+        (None, None, None, None)
+    );
+    // 新欄位可以寫入與讀回
+    let mut r2 = r.clone();
+    r2.submitted_at = Some(5);
+    r2.submitted_by = Some("user:b".into());
+    r2.approved_at = Some(6);
+    r2.approved_by = Some("user:c".into());
+    r2.reject_reason = Some("原因".into());
+    conn.update_rollout_state(&r2).unwrap();
+    assert_eq!(conn.get_rollout("r-20261020-0001").unwrap().unwrap(), r2);
+    drop(conn);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -2064,3 +2064,229 @@ async fn permissions_are_recomputed_for_long_lived_streams() {
     );
     f.stop().await;
 }
+
+/// 雙人覆核（REMOTE.md 第 5.4 節；`[remote] rollout_approval = "required"`）：送出後待核准；建立者、送出者
+/// 不能核准（403 `self_approval`，`KRS-E6106`）；維運者沒有 `rollouts:approve`；另一位管理員的工作階段核准後才開始；
+/// 退回需要原因
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollout_approval_needs_another_admins_session() {
+    use crate::remote::test_sign::{TestSigner, release};
+    let signer = TestSigner::new(31);
+    let trust = crate::api::tests::temp_dir("approval-trust").join("allowed_signers");
+    std::fs::create_dir_all(trust.parent().unwrap()).unwrap();
+    std::fs::write(&trust, signer.allowed_signers()).unwrap();
+    let t = trust.to_string_lossy().into_owned();
+    let f = fixture("approval", move |c| {
+        cheap(c);
+        c.remote.allowed_signers = t;
+        c.remote.rollout_approval = "required".into();
+    })
+    .await;
+    add_user(&f, "alice", &["admin"], false);
+    add_user(&f, "bob", &["admin"], false);
+    add_user(&f, "carol", &["admin"], false);
+    add_user(&f, "oscar", &["operator"], false);
+    let alice = login(&f, "alice").await;
+    let bob = login(&f, "bob").await;
+    let carol = login(&f, "carol").await;
+    let oscar = login(&f, "oscar").await;
+    f.admin()
+        .execute(
+            "INSERT INTO hosts (agent_id, hostname, agent_version, host_group, tags, os, install_method,
+                install_upgrade, install_config, first_seen, last_seen, online)
+             VALUES ('7e2f0a11-0000-4000-8000-0000000000c1', 'web-01', '0.9.0', 'web', '[]', '{\"arch\":\"x86_64\"}', 'tar', 'ready', 'enabled', 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+    // 版本庫：匯入並上傳 tar（工作階段）
+    let rel = release(&signer, "0.9.2", "abcdef1");
+    let r = call(
+        &f,
+        "POST",
+        "/api/v1/releases",
+        Auth::Session(&alice),
+        Some(json!({"sha256sums": rel.sha256sums, "signature": rel.signature, "manifest": rel.manifest})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let (tar_name, tar) = rel
+        .files
+        .iter()
+        .find(|(n, _)| n.ends_with(".tar.gz"))
+        .unwrap()
+        .clone();
+    let mut req = format!(
+        "PUT /api/v1/releases/0.9.2/artifacts/{tar_name} HTTP/1.0\r\nHost: localhost\r\nCookie: {}\r\nX-CSRF-Token: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        alice.cookie,
+        alice.csrf,
+        tar.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(&tar);
+    let r = send_raw(f.addr(), &req).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    // alice 建立、bob 送出：待核准
+    let spec = json!({"name": "0.9.2 全站", "target_version": "0.9.2", "selector": {"all": true}, "waves": [{"size": "rest"}]});
+    let r = call(
+        &f,
+        "POST",
+        "/api/v1/rollouts/preview",
+        Auth::Session(&alice),
+        Some(spec.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!(r.json()["data"]["approval_required"], true, "{}", r.json());
+    let r = call(
+        &f,
+        "POST",
+        "/api/v1/rollouts",
+        Auth::Session(&alice),
+        Some(spec),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let id = r.json()["data"]["id"].as_str().unwrap().to_string();
+    let path = |a: &str| format!("/api/v1/rollouts/{id}/{a}");
+    let r = call(
+        &f,
+        "POST",
+        &path("submit"),
+        Auth::Session(&bob),
+        Some(json!({"confirm": "升級 1 台"})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["data"]["state"], "pending_approval");
+    assert_eq!(r.json()["data"]["submitted_by"], "user:bob");
+    let r = call(
+        &f,
+        "GET",
+        "/api/v1/rollouts?state=pending_approval",
+        Auth::Session(&oscar),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (
+            r.json()["meta"]["pending_approval"].as_i64(),
+            r.json()["meta"]["rollout_approval"].as_str()
+        ),
+        (Some(1), Some("required"))
+    );
+
+    // 維運者沒有權限；建立者與送出者不能核准；沒有 CSRF token 的請求被拒
+    let r = call(
+        &f,
+        "POST",
+        &path("approve"),
+        Auth::Session(&oscar),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (
+            r.status,
+            r.json()["error"]["details"]["permission"].as_str()
+        ),
+        (403, Some("rollouts:approve"))
+    );
+    for s in [&alice, &bob] {
+        let r = call(&f, "POST", &path("approve"), Auth::Session(s), None, &[]).await;
+        assert_eq!(
+            (
+                r.status,
+                r.json()["error"]["code"].as_str(),
+                r.json()["error"]["product_code"].as_str()
+            ),
+            (403, Some("self_approval"), Some("KRS-E6106"))
+        );
+    }
+    let r = call(
+        &f,
+        "POST",
+        &path("approve"),
+        Auth::CookieOnly(&carol),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 403, "CSRF");
+    // 退回需要原因
+    let r = call(
+        &f,
+        "POST",
+        &path("reject"),
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["error"]["details"]["parameter"].as_str()),
+        (400, Some("reason"))
+    );
+    // 仍然待核准、沒有開始
+    let r = call(
+        &f,
+        "GET",
+        &format!("/api/v1/rollouts/{id}"),
+        Auth::Session(&oscar),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(r.json()["data"]["state"], "pending_approval");
+    assert_eq!(r.json()["data"]["started_at"], Value::Null);
+
+    // 第三位管理員核准：開始
+    let r = call(
+        &f,
+        "POST",
+        &path("approve"),
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        (
+            r.json()["data"]["state"].as_str(),
+            r.json()["data"]["approved_by"].as_str()
+        ),
+        (Some("running"), Some("user:carol"))
+    );
+    let r = call(
+        &f,
+        "POST",
+        &path("approve"),
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["error"]["code"].as_str()),
+        (409, Some("invalid_state"))
+    );
+    let actions: Vec<(String, String)> =
+        audit_actions(&f).into_iter().map(|a| (a.0, a.1)).collect();
+    for (action, actor) in [
+        ("rollout.submit", "user:bob"),
+        ("rollout.approve", "user:carol"),
+        ("rollout.start", "user:carol"),
+    ] {
+        assert!(
+            actions.contains(&(action.to_string(), actor.to_string())),
+            "{action} {actor}：{actions:?}"
+        );
+    }
+    f.stop().await;
+}

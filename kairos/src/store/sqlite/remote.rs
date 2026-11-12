@@ -6,12 +6,21 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::conn::{AsConn, forward};
 use crate::remote::store::{
-    ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate, HostConfigRow,
-    HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow, RemoteStore,
-    RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
+    ApplyingHost, ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate,
+    HostConfigRow, HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow,
+    RemoteStore, RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
 };
 
-/// schema v9（0.9.0〔草稿〕）：集中設定與 Pulse 遠端升級（商業審計 F8；`crates/kairos-proto/REMOTE.md`
+/// schema v11（0.10.0）：升級推送的雙人覆核（REMOTE.md 第 5.4 節）。只新增欄位（`approved_at`／
+/// `approved_by` v9 就有）。v10 是叢集協調（`store/sqlite/cluster.rs`）；PostgreSQL 的對等步驟在
+/// `store/postgres/schema.rs` 的 `SCHEMA_V11`
+pub(crate) const SCHEMA_V11_ROLLOUT_APPROVAL: &str = "
+ALTER TABLE rollouts ADD COLUMN submitted_at INTEGER;
+ALTER TABLE rollouts ADD COLUMN submitted_by TEXT;
+ALTER TABLE rollouts ADD COLUMN reject_reason TEXT;
+";
+
+/// schema v9（0.9.0）：集中設定與 Pulse 遠端升級（商業審計 F8；`crates/kairos-proto/REMOTE.md`
 /// 第 6 節、`kairos/STORAGE.md` 第 18 節）。只新增資料表與 `hosts` 的欄位，不修改既有的唯一鍵。
 ///
 /// 與 REMOTE.md 第 6 節草案的差異：`host_config` 以 `agent_id` 為鍵（主機可能在清冊寫入之前就送出
@@ -215,7 +224,9 @@ impl<C: AsConn> RemoteStore for C {
         fn count_rollouts_with_prefix(&self, prefix: &str) -> i64 => count_rollouts_with_prefix;
         fn insert_rollout(&self, r: &RolloutRow) -> () => insert_rollout;
         fn update_rollout_spec(&self, id: &str, name: &str, release_id: i64, selector: &str, waves: &str, options: &str, now_ms: i64) -> bool => update_rollout_spec;
+        fn update_rollout_schedule(&self, id: &str, schedule: &str, now_ms: i64) -> bool => update_rollout_schedule;
         fn update_rollout_state(&self, r: &RolloutRow) -> () => update_rollout_state;
+        fn delete_rollout_hosts(&self, rollout_id: &str) -> i64 => delete_rollout_hosts;
         fn delete_old_rollouts(&self, before_ms: i64) -> i64 => delete_old_rollouts;
         fn insert_rollout_hosts(&self, rollout_id: &str, hosts: &[NewRolloutHost], now_ms: i64) -> () => insert_rollout_hosts;
         fn rollout_hosts(&self, rollout_id: &str) -> Vec<RolloutHostRow> => rollout_hosts;
@@ -226,6 +237,7 @@ impl<C: AsConn> RemoteStore for C {
         fn hosts_in_active_rollouts(&self) -> Vec<(String, String)> => hosts_in_active_rollouts;
         fn active_offers(&self) -> Vec<(String, String)> => active_offers;
         fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
+        fn applying_hosts(&self) -> Vec<ApplyingHost> => applying_hosts;
         fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
     }
 }
@@ -621,7 +633,8 @@ pub fn record_config_status(
 // ---- 版本庫 ----
 
 const RELEASE_COLUMNS: &str = "release_id, version, commit_id, source, sha256sums, signature, \
-     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by";
+     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by, \
+     base_url";
 
 fn release_of(r: &Row<'_>) -> rusqlite::Result<ReleaseRow> {
     Ok(ReleaseRow {
@@ -637,6 +650,7 @@ fn release_of(r: &Row<'_>) -> rusqlite::Result<ReleaseRow> {
         manifest: r.get(9)?,
         imported_at: r.get(10)?,
         imported_by: r.get(11)?,
+        base_url: r.get(12)?,
     })
 }
 
@@ -669,8 +683,9 @@ pub fn get_release_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<
 pub fn insert_release(conn: &Connection, r: &ReleaseRow) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO releases (product, version, commit_id, source, sha256sums, signature,
-            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by)
-         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by,
+            base_url)
+         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             r.version,
             r.commit,
@@ -682,7 +697,8 @@ pub fn insert_release(conn: &Connection, r: &ReleaseRow) -> rusqlite::Result<i64
             r.manifest_name,
             r.manifest,
             r.imported_at,
-            r.imported_by
+            r.imported_by,
+            r.base_url
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -798,7 +814,7 @@ pub fn upgrade_host(conn: &Connection, agent_id: &str) -> rusqlite::Result<Optio
 const ROLLOUT_COLUMNS: &str = "r.rollout_id, r.name, r.release_id, r.target_version, r.selector, r.waves, \
      r.schedule, r.options, r.state, r.current_wave, r.wave_started_at, r.soak_until, \
      r.awaiting_continue, r.pause_reason, r.cancel_reason, r.created_at, r.created_by, r.started_at, \
-     r.completed_at, r.updated_at, r.pause_cause";
+     r.completed_at, r.updated_at, r.pause_cause, r.submitted_at, r.submitted_by, r.approved_at,      r.approved_by, r.reject_reason";
 
 fn rollout_of(r: &Row<'_>) -> rusqlite::Result<RolloutRow> {
     Ok(RolloutRow {
@@ -823,6 +839,11 @@ fn rollout_of(r: &Row<'_>) -> rusqlite::Result<RolloutRow> {
         started_at: r.get(17)?,
         completed_at: r.get(18)?,
         updated_at: r.get(19)?,
+        submitted_at: r.get(21)?,
+        submitted_by: r.get(22)?,
+        approved_at: r.get(23)?,
+        approved_by: r.get(24)?,
+        reject_reason: r.get(25)?,
     })
 }
 
@@ -903,12 +924,34 @@ pub fn update_rollout_spec(
     )? > 0)
 }
 
+pub fn update_rollout_schedule(
+    conn: &Connection,
+    id: &str,
+    schedule: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE rollouts SET schedule = ?2, updated_at = ?3
+         WHERE rollout_id = ?1 AND state = 'draft'",
+        params![id, schedule, now_ms],
+    )? > 0)
+}
+
+pub fn delete_rollout_hosts(conn: &Connection, rollout_id: &str) -> rusqlite::Result<i64> {
+    Ok(conn.execute(
+        "DELETE FROM rollout_hosts WHERE rollout_id = ?1",
+        [rollout_id],
+    )? as i64)
+}
+
 pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE rollouts SET state = ?2, current_wave = ?3, wave_started_at = ?4, soak_until = ?5,
             awaiting_continue = ?6, pause_reason = ?7, cancel_reason = ?8, started_at = ?9,
             pause_cause = ?12,
-            completed_at = ?10, updated_at = ?11
+            completed_at = ?10, updated_at = ?11,
+            submitted_at = ?13, submitted_by = ?14, approved_at = ?15, approved_by = ?16,
+            reject_reason = ?17
          WHERE rollout_id = ?1",
         params![
             r.id,
@@ -922,7 +965,12 @@ pub fn update_rollout_state(conn: &Connection, r: &RolloutRow) -> rusqlite::Resu
             r.started_at,
             r.completed_at,
             r.updated_at,
-            r.pause_cause
+            r.pause_cause,
+            r.submitted_at,
+            r.submitted_by,
+            r.approved_at,
+            r.approved_by,
+            r.reject_reason
         ],
     )?;
     Ok(())
@@ -1148,6 +1196,18 @@ pub fn unacknowledged_rollback_failures(
         "SELECT h.agent_id, h.hostname, rh.rollout_id, rh.detail FROM rollout_hosts rh
          JOIN hosts h ON h.host_id = rh.host_id
          WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
+}
+
+pub fn applying_hosts(conn: &Connection) -> rusqlite::Result<Vec<ApplyingHost>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, rh.rollout_id, COALESCE(rh.applying_at, rh.updated_at), r.options
+         FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         JOIN rollouts r ON r.rollout_id = rh.rollout_id
+         WHERE rh.state = 'applying'",
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     rows.collect()

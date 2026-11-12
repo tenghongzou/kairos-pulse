@@ -1014,6 +1014,7 @@ fn remote_config_and_rollouts(db: &TestDb) -> String {
         manifest: None,
         imported_at: T0,
         imported_by: "user:ann".into(),
+        base_url: None,
     };
     let r1 = s.insert_release(&release("0.9.1")).unwrap();
     let r2 = s.insert_release(&release("0.10.0")).unwrap();
@@ -1085,6 +1086,11 @@ fn remote_config_and_rollouts(db: &TestDb) -> String {
         started_at: None,
         completed_at: None,
         updated_at: T0 + 200,
+        submitted_at: None,
+        submitted_by: None,
+        approved_at: None,
+        approved_by: None,
+        reject_reason: None,
     };
     s.insert_rollout(&rollout("RO-20261009-01", "draft"))
         .unwrap();
@@ -1248,4 +1254,318 @@ fn remote_config_and_rollouts(db: &TestDb) -> String {
     out
 }
 
-backend_tests!(alerts, hosts_and_api_queries, remote_config_and_rollouts);
+/// 0.10.0（schema v11）的遠端管理介面：外部 URL 的版本庫（`releases.base_url`、已登記而未存入的發佈檔）、
+/// 推送的排程（`update_rollout_schedule`、狀態 `scheduled`）、雙人覆核（`pending_approval`、
+/// `submitted_*`／`approved_*`／`reject_reason`）、退回草稿時刪除固定的對象（`delete_rollout_hosts`）、
+/// 替換中的主機（`applying_hosts`）
+fn rollout_schedule_approval_and_external_releases(db: &TestDb) -> String {
+    let mut out = String::new();
+    seed_hosts(db);
+    let s = db.handle();
+    // 外部 URL 的版本庫：base_url 保存與讀回；代管的版本為 NULL
+    let release = |version: &str, source: &str, base_url: Option<&str>| ReleaseRow {
+        id: 0,
+        version: version.into(),
+        commit: "abc1234".into(),
+        source: source.into(),
+        sha256sums: "sums".into(),
+        signature: "sig".into(),
+        signer_fingerprint: None,
+        signer_principal: None,
+        manifest_name: Some("pulse-release.json".into()),
+        manifest: Some("{}".into()),
+        imported_at: T0,
+        imported_by: "cli:root".into(),
+        base_url: base_url.map(str::to_string),
+    };
+    let hosted = s
+        .insert_release(&release("0.10.0", "hosted", None))
+        .unwrap();
+    let external = s
+        .insert_release(&release(
+            "0.10.1",
+            "external",
+            Some("https://mirror.example/pulse/0.10.1/"),
+        ))
+        .unwrap();
+    assert!(
+        s.insert_release(&release("0.10.2", "elsewhere", None))
+            .is_err()
+    );
+    log!(out, "releases", s.list_releases().unwrap());
+    log!(
+        out,
+        "external",
+        s.get_release("0.10.1")
+            .unwrap()
+            .map(|r| (r.source, r.base_url))
+    );
+    log!(
+        out,
+        "hosted",
+        s.get_release_by_id(hosted)
+            .unwrap()
+            .map(|r| (r.source, r.base_url))
+    );
+    // 外部版本的發佈檔：size > 0 且 stored = 0 表示已登記（檔案不在 Kairos）；不計入 artifact_refs
+    let artifact = |rel: i64, name: &str, sha: &str, size: i64, stored: bool| ArtifactRow {
+        release_id: rel,
+        filename: name.into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        format: "deb".into(),
+        sha256: sha.into(),
+        size,
+        stored,
+        stored_at: stored.then_some(T0),
+    };
+    for a in [
+        artifact(external, "pulse_0.10.1_amd64.deb", "ee", 0, false),
+        artifact(external, "pulse_0.10.1_arm64.deb", "ff", 0, false),
+        artifact(external, "pulse_0.10.1_amd64.deb", "ee", 4321, false),
+        artifact(hosted, "pulse_0.10.0_amd64.deb", "ee", 4321, true),
+    ] {
+        s.upsert_artifact(&a).unwrap();
+    }
+    log!(
+        out,
+        "external artifacts",
+        s.release_artifacts(external).unwrap()
+    );
+    log!(
+        out,
+        "registered",
+        s.release_artifacts(external)
+            .unwrap()
+            .iter()
+            .map(|a| (a.filename.clone(), a.size > 0 && !a.stored))
+            .collect::<Vec<_>>()
+    );
+    log!(
+        out,
+        "refs",
+        (
+            s.artifact_refs("ee").unwrap(),
+            s.artifact_refs("ff").unwrap()
+        )
+    );
+    // 推送：insert_rollout 不寫雙人覆核的欄位（送出、核准時才由 update_rollout_state 寫入），讀回為 NULL
+    let rollout = |id: &str, at: i64| RolloutRow {
+        id: id.into(),
+        name: format!("推送 {id}"),
+        release_id: external,
+        target_version: "0.10.1".into(),
+        selector: "{\"all\":true}".into(),
+        waves: "[]".into(),
+        schedule: "{}".into(),
+        options: "{\"health_timeout_secs\":300}".into(),
+        state: "draft".into(),
+        current_wave: 0,
+        wave_started_at: None,
+        soak_until: None,
+        awaiting_continue: false,
+        pause_reason: None,
+        pause_cause: None,
+        cancel_reason: None,
+        created_at: at,
+        created_by: "user:ann".into(),
+        started_at: None,
+        completed_at: None,
+        updated_at: at,
+        submitted_at: Some(1),
+        submitted_by: Some("user:x".into()),
+        approved_at: Some(1),
+        approved_by: Some("user:x".into()),
+        reject_reason: Some("x".into()),
+    };
+    const R1: &str = "r-20261101-0001";
+    const R2: &str = "r-20261101-0002";
+    const R3: &str = "r-20261101-0003";
+    for (i, id) in [R1, R2, R3].into_iter().enumerate() {
+        s.insert_rollout(&rollout(id, T0 + 100 + i as i64)).unwrap();
+    }
+    log!(out, "draft", s.get_rollout(R1).unwrap());
+    // 排程：只有草稿可以修改
+    let schedule = "{\"starts_at\":1790000900000,\"timezone\":\"+08:00\",\"windows\":[{\"days\":[1,2],\"start\":\"22:00\",\"end\":\"02:00\"}]}";
+    log!(
+        out,
+        "schedule draft",
+        s.update_rollout_schedule(R1, schedule, T0 + 110).unwrap()
+    );
+    log!(
+        out,
+        "schedule missing",
+        s.update_rollout_schedule("r-nope", schedule, T0 + 110)
+            .unwrap()
+    );
+    // 送出：雙人覆核時先進入 pending_approval，對象已固定
+    let a = s.host_id_of(A).unwrap().unwrap();
+    let b = s.host_id_of(B).unwrap().unwrap();
+    let nh = |host: i64, n: i64| NewRolloutHost {
+        host_id: host,
+        upgrade_id: format!("up-{n}-{host}"),
+        wave: 0,
+        ordinal: n,
+        state: "pending".into(),
+        reason: None,
+        from_version: Some("0.9.0".into()),
+    };
+    let mut r1 = s.get_rollout(R1).unwrap().unwrap();
+    r1.state = "pending_approval".into();
+    r1.submitted_at = Some(T0 + 120);
+    r1.submitted_by = Some("user:ann".into());
+    r1.updated_at = T0 + 120;
+    s.update_rollout_state(&r1).unwrap();
+    s.insert_rollout_hosts(R1, &[nh(a, 1), nh(b, 2)], T0 + 120)
+        .unwrap();
+    assert_eq!(s.get_rollout(R1).unwrap().unwrap(), r1);
+    log!(out, "pending approval", s.get_rollout(R1).unwrap());
+    log!(
+        out,
+        "schedule while pending",
+        s.update_rollout_schedule(R1, "{}", T0 + 121).unwrap()
+    );
+    log!(
+        out,
+        "list pending",
+        s.list_rollouts(Some("pending_approval"))
+            .unwrap()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>()
+    );
+    // 待核准、已排程的推送都算使用中（版本不能刪、主機不能再加入另一個推送）
+    log!(
+        out,
+        "using release",
+        s.rollouts_using_release(external).unwrap()
+    );
+    log!(out, "in active", s.hosts_in_active_rollouts().unwrap());
+    log!(out, "offers while pending", s.active_offers().unwrap());
+    // 退回：回到草稿、記下原因、刪除固定的對象
+    let mut rejected = r1.clone();
+    rejected.state = "draft".into();
+    rejected.reject_reason = Some("時段不對，改到週末".into());
+    rejected.updated_at = T0 + 130;
+    {
+        let tx = s.begin(TxMode::Immediate).unwrap();
+        tx.update_rollout_state(&rejected).unwrap();
+        log!(out, "delete hosts", tx.delete_rollout_hosts(R1).unwrap());
+        log!(out, "delete again", tx.delete_rollout_hosts(R1).unwrap());
+        tx.commit().unwrap();
+    }
+    assert!(s.rollout_hosts(R1).unwrap().is_empty());
+    log!(out, "rejected", s.get_rollout(R1).unwrap());
+    // 重新送出、由另一位核准：有 starts_at 時進入 scheduled
+    let mut approved = rejected.clone();
+    approved.state = "scheduled".into();
+    approved.submitted_at = Some(T0 + 140);
+    approved.submitted_by = Some("user:ann".into());
+    approved.approved_at = Some(T0 + 150);
+    approved.approved_by = Some("user:bob".into());
+    approved.reject_reason = None;
+    approved.updated_at = T0 + 150;
+    s.update_rollout_state(&approved).unwrap();
+    s.insert_rollout_hosts(R1, &[nh(a, 3), nh(b, 4)], T0 + 140)
+        .unwrap();
+    assert_eq!(s.get_rollout(R1).unwrap().unwrap(), approved);
+    log!(out, "scheduled", s.get_rollout(R1).unwrap());
+    log!(
+        out,
+        "list scheduled",
+        s.list_rollouts(Some("scheduled"))
+            .unwrap()
+            .iter()
+            .map(|r| (r.id.clone(), r.approved_by.clone()))
+            .collect::<Vec<_>>()
+    );
+    log!(
+        out,
+        "all",
+        s.list_rollouts(None)
+            .unwrap()
+            .iter()
+            .map(|r| (r.id.clone(), r.state.clone()))
+            .collect::<Vec<_>>()
+    );
+    log!(
+        out,
+        "in active scheduled",
+        s.hosts_in_active_rollouts().unwrap()
+    );
+    // 開始：替換中的主機（applying_at 沒有時用 updated_at），不論推送之後的狀態
+    assert!(s.applying_hosts().unwrap().is_empty());
+    let mut running = approved.clone();
+    running.state = "running".into();
+    running.started_at = Some(T0 + 900);
+    running.wave_started_at = Some(T0 + 900);
+    running.updated_at = T0 + 900;
+    s.update_rollout_state(&running).unwrap();
+    s.update_rollout_host(
+        R1,
+        a,
+        &HostTransition {
+            state: Some("applying".into()),
+            applying_at: Some(Some(T0 + 910)),
+            ..Default::default()
+        },
+        T0 + 911,
+    )
+    .unwrap();
+    s.update_rollout_host(
+        R1,
+        b,
+        &HostTransition {
+            state: Some("applying".into()),
+            ..Default::default()
+        },
+        T0 + 920,
+    )
+    .unwrap();
+    let applying = |s: &dyn crate::store::db::Store| {
+        let mut rows = s.applying_hosts().unwrap();
+        rows.sort();
+        rows
+    };
+    log!(out, "applying", applying(s.as_ref()));
+    let mut cancelled = running.clone();
+    cancelled.state = "cancelled".into();
+    cancelled.cancel_reason = Some("停止".into());
+    cancelled.completed_at = Some(T0 + 930);
+    cancelled.updated_at = T0 + 930;
+    s.update_rollout_state(&cancelled).unwrap();
+    log!(out, "applying after cancel", applying(s.as_ref()));
+    s.update_rollout_host(
+        R1,
+        a,
+        &HostTransition {
+            state: Some("succeeded".into()),
+            finished_at: Some(Some(T0 + 940)),
+            ..Default::default()
+        },
+        T0 + 940,
+    )
+    .unwrap();
+    log!(out, "applying left", applying(s.as_ref()));
+    // 其他推送不受影響
+    log!(
+        out,
+        "others",
+        [R2, R3]
+            .iter()
+            .map(|id| s
+                .get_rollout(id)
+                .unwrap()
+                .map(|r| (r.state, r.submitted_at)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(s.delete_rollout_hosts(R2).unwrap(), 0);
+    out
+}
+
+backend_tests!(
+    alerts,
+    hosts_and_api_queries,
+    remote_config_and_rollouts,
+    rollout_schedule_approval_and_external_releases
+);

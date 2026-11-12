@@ -32,11 +32,12 @@ function shortcut(it) {
   if (it.id === 'enroll' && session.can('settings:read')) return h('a', { href: '/system/settings/security' }, t('adm.health.toEnrollMode'));
   if ((it.id === 'issuing_ca' || it.id === 'tls') && session.can('pki:read') && it.status !== 'ok') return h('a', { href: '/certificates/ca' }, t('adm.health.toCa'));
   if (it.id === 'alerts' && session.can('alerts:read') && it.status !== 'ok') return h('a', { href: '/alerts/events' }, t('adm.health.toAlerts'));
-  // 遠端管理：回滾失敗 → 推送清單；自動暫停 → 已暫停的推送；信任錨未設定 → 版本庫（S25 有設定說明）
+  // 遠端管理：回滾失敗 → 推送清單；自動暫停 → 已暫停的推送；版本庫的檔案遺失、信任錨未設定 → 版本庫（S25）
   if (it.id === 'remote' && it.status !== 'ok' && it.values) {
     const v = it.values;
     if (v.rollback_failed_unacknowledged > 0) return h('a', { href: '/pulse/rollouts' }, t('adm.health.toRollouts'));
     if (v.rollouts_auto_paused > 0) return h('a', { href: '/pulse/rollouts?state=paused' }, t('adm.health.toPausedRollouts'));
+    if (v.release_files_missing > 0 && session.can('releases:read')) return h('a', { href: '/pulse/releases' }, t('adm.health.toReleases'));
     if (v.upgrade_enabled && !v.allowed_signers_configured && session.can('releases:read')) return h('a', { href: '/pulse/releases' }, t('adm.health.toReleases'));
   }
   return null;

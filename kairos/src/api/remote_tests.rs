@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use super::tests::{Fixture, Resp, call, fixture, send_raw};
+use super::tests::{Fixture, Resp, Sse, call, fixture, send_raw};
 use super::tokens::{self, TokenGrant};
 use crate::rbac::Role;
 use crate::remote::test_sign::{TestSigner, release};
@@ -93,6 +93,28 @@ async fn central_config_endpoints_over_https() {
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let id = body(&r)["data"]["id"].as_i64().unwrap();
     assert_eq!(body(&r)["data"]["keys"], 1);
+    // 全域搜尋：清單的 q（名稱或說明；不分大小寫），需要 config:read
+    for (q, n) in [("linux", 1), ("%E9%A0%90%E8%A8%AD", 1), ("zzz", 0)] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/config/profiles?q={q}"),
+            Some(&op),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        assert_eq!(body(&r)["data"].as_array().unwrap().len(), n, "q={q}");
+    }
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/config/profiles?q=linux",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 403);
     let r = call(addr, "PUT", &format!("/api/v1/config/profiles/{id}"), Some(&op), Some(&json!({"settings": {"report": {"interval": 15}, "log": {"level": "debug"}}, "reason": "除錯"}))).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(body(&r)["data"]["revision"], 2);
@@ -410,14 +432,62 @@ async fn releases_and_rollouts_over_https() {
     );
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&op), Some(&spec)).await;
     assert_eq!(r.status, 403, "建立只限管理員（D8）");
-    let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "schedule": {}}))).await;
+    let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "schedule": {"windows": [{"start": "25:00", "end": "01:00"}]}}))).await;
     assert_eq!(
         (r.status, body(&r)["error"]["details"]["parameter"].as_str()),
-        (400, Some("schedule"))
+        (400, Some("schedule.windows[0]"))
     );
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&spec)).await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let id = body(&r)["data"]["id"].as_str().unwrap().to_string();
+    // 雙人覆核的端點（0.10）：需要 rollouts:approve（只有管理員）與以帳號登入的工作階段——API token 不能核准、退回
+    for action in ["approve", "reject"] {
+        let path = format!("/api/v1/rollouts/{id}/{action}");
+        let r = call(
+            addr,
+            "POST",
+            &path,
+            Some(&op),
+            Some(&json!({"reason": "x"})),
+        )
+        .await;
+        assert_eq!(
+            (
+                r.status,
+                body(&r)["error"]["details"]["permission"].as_str()
+            ),
+            (403, Some("rollouts:approve")),
+            "{action}"
+        );
+        let r = call(
+            addr,
+            "POST",
+            &path,
+            Some(&admin),
+            Some(&json!({"reason": "x"})),
+        )
+        .await;
+        assert_eq!(
+            (r.status, body(&r)["error"]["code"].as_str()),
+            (403, Some("session_required")),
+            "{action}"
+        );
+        let r = call(addr, "GET", &path, Some(&admin), None).await;
+        assert_eq!(r.status, 405, "{action}");
+    }
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/rollouts?state=pending_approval",
+        Some(&op),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        body(&r)["meta"],
+        json!({"paused": 0, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "rollout_approval": "none"})
+    );
     let r = call(
         addr,
         "GET",
@@ -442,6 +512,19 @@ async fn releases_and_rollouts_over_https() {
         ),
         (400, Some("升級 1 台"))
     );
+    // SSE（REMOTE.md 第 8.4 節）：`rollout.host` 只送給以 rollout_id 訂閱這個推送、且有 rollouts:read 的連線
+    let ro = token(&f, Role::Viewer);
+    let events = format!("/api/v1/events?rollout_id={id}");
+    let mut watching = Sse::open_path(addr, &op, &events, None).await;
+    let mut other =
+        Sse::open_path(addr, &op, "/api/v1/events?rollout_id=r-20000101-0001", None).await;
+    let mut plain = Sse::open(addr, &op, None).await;
+    let mut no_perm = Sse::open_path(addr, &ro, &events, None).await;
+    for s in [&mut watching, &mut other, &mut plain, &mut no_perm] {
+        assert_eq!(s.status, 200);
+        s.wait_for("ready").await;
+    }
+    let remote = f.remote.clone().expect("遠端管理");
     let r = call(
         addr,
         "POST",
@@ -452,6 +535,86 @@ async fn releases_and_rollouts_over_https() {
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(body(&r)["data"]["state"], "running");
+    remote.flush_progress().await;
+    let ev = watching.next().await.expect("rollout.host");
+    assert_eq!(ev.event, "rollout.host", "主機的事件先於 rollout.progress");
+    assert_eq!(
+        (
+            ev.data["rollout_id"].as_str(),
+            ev.data["agent_id"].as_str(),
+            ev.data["state"].as_str(),
+            ev.data["wave"].as_i64()
+        ),
+        (Some(id.as_str()), Some(H), Some("pending"), Some(0))
+    );
+    assert_eq!(watching.next().await.unwrap().event, "rollout.progress");
+    // 訂閱別的推送、沒有訂閱的連線只收到 rollout.progress；沒有 rollouts:read 的連線兩者都收不到
+    for s in [&mut other, &mut plain] {
+        let ev = s.next().await.unwrap();
+        assert_eq!(ev.event, "rollout.progress");
+        assert_eq!(ev.data["rollout_id"], id.as_str());
+    }
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(700), no_perm.next()).await;
+    assert!(quiet.is_err(), "唯讀角色不應收到推送的事件");
+    // 沒有改變的主機不重送；取消訂閱後不再逐台送出
+    remote.mark_dirty(&id);
+    remote.flush_progress().await;
+    assert_eq!(watching.next().await.unwrap().event, "rollout.progress");
+    drop(watching);
+    drop(other);
+    drop(plain);
+    drop(no_perm);
+    // 全域搜尋：清單的 q（名稱、編號、目標版本；不分大小寫），需要 rollouts:read
+    for (q, n) in [
+        ("WEB", 1),
+        (id.as_str(), 1),
+        ("0.9.2", 1),
+        ("zzz", 0),
+        ("", 1),
+    ] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/rollouts?q={q}"),
+            Some(&auditor),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        assert_eq!(body(&r)["data"].as_array().unwrap().len(), n, "q={q}");
+        assert_eq!(body(&r)["meta"]["paused"], 0, "meta 不受 q 影響");
+    }
+    let r = call(addr, "GET", "/api/v1/rollouts?q=web", Some(&ro), None).await;
+    assert_eq!(r.status, 403);
+    // S04 版本欄的 ⚠：建議的最低版本＝版本庫中最新版本的清單 min_upgrade_from（0.9.0）；只需要 hosts:read
+    add_host(&f, "7e2f0a11-0000-4000-8000-0000000000c2", "0.8.0", "tar");
+    f.console.ctx.hosts.invalidate().await;
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/hosts?sort=agent_version",
+        Some(&ro),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = body(&r);
+    assert_eq!(v["meta"]["recommended_min_agent_version"], "0.9.0");
+    let flags: Vec<(String, bool)> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["agent_version"].as_str().unwrap().to_string(),
+                h["agent_outdated"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![("0.8.0".to_string(), true), ("0.9.0".to_string(), false)]
+    );
     let r = call(
         addr,
         "GET",
@@ -513,7 +676,7 @@ async fn releases_and_rollouts_over_https() {
     assert_eq!(list["data"].as_array().map(Vec::len), Some(0));
     assert_eq!(
         list["meta"],
-        json!({"paused": 1, "rollback_failed_unacknowledged": 0})
+        json!({"paused": 1, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "rollout_approval": "none"})
     );
     // 系統健康的「遠端管理」：主控台暫停不算異常
     let viewer = token(&f, Role::Viewer);
@@ -544,6 +707,47 @@ async fn releases_and_rollouts_over_https() {
         it["summary"].as_str().unwrap().contains("已暫停 1 個"),
         "{it}"
     );
+    // 版本庫的檔案遺失（例如還原備份之後）：警告、KRS-W8417〔暫定〕；大小不符也算；補回後恢復
+    let store = f.remote.as_ref().unwrap().releases_dir.clone();
+    let stored_file = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .next()
+        .expect("版本庫有一個發佈檔");
+    let content = std::fs::read(&stored_file).unwrap();
+    std::fs::remove_file(&stored_file).unwrap();
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(
+        (it["status"].as_str(), it["product_code"].as_str()),
+        (Some("warning"), Some("KRS-W8417")),
+        "{it}"
+    );
+    assert!(
+        it["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("版本庫的檔案遺失：0.9.2 的 {tar_name}")),
+        "{it}"
+    );
+    assert_eq!(it["values"]["release_files_missing"], 1);
+    assert_eq!(
+        it["values"]["missing_files"][0],
+        json!({"version": "0.9.2", "filename": tar_name, "problem": "missing", "rollback_target_for": 0})
+    );
+    std::fs::write(&stored_file, &content[..content.len() - 1]).unwrap();
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(it["values"]["missing_files"][0]["problem"], "size_mismatch");
+    assert!(it["summary"].as_str().unwrap().contains("大小不符"), "{it}");
+    // 重新上傳同一個檔案：取代大小不符的檔案
+    let r = put_artifact(&f, &admin, "0.9.2", &tar_name, &tar).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(std::fs::read(&stored_file).unwrap(), content);
+    let r = call(addr, "GET", "/api/v1/system/health", Some(&auditor), None).await;
+    let it = remote_item(&r);
+    assert_eq!(it["status"], "ok", "{it}");
+    assert_eq!(it["values"]["release_files_missing"], 0);
     // 回滾失敗（以 SQL 模擬）：嚴重、KRS-E8408；清單的每筆與 meta 都有未處理的台數；唯讀看不到細節
     f.admin()
         .execute("UPDATE rollout_hosts SET state = 'rollback_failed'", [])
@@ -686,6 +890,103 @@ async fn releases_and_rollouts_over_https() {
     ] {
         assert!(actions.iter().any(|x| x == a), "{a}");
     }
+
+    // 外部 URL 的版本庫（0.10，REMOTE.md 第 4.1.2 節）：source: external 需要合法的 base_url；簽章驗證照舊；
+    // 上傳發佈檔只登記雜湊與大小（維運者不能）
+    let ext = release(&signer, "0.9.4", "4444444");
+    let ext_body = |base: Option<&str>, sig: &str| {
+        let mut b = json!({"sha256sums": ext.sha256sums, "signature": sig, "manifest": ext.manifest, "source": "external"});
+        if let Some(u) = base {
+            b["base_url"] = json!(u);
+        }
+        b
+    };
+    for (base, param) in [
+        (None, "base_url"),
+        (Some("http://repo.example.gov.tw/p/"), "base_url"),
+        (Some("https://repo.example.gov.tw/p/?sig=1"), "base_url"),
+    ] {
+        let r = call(
+            addr,
+            "POST",
+            "/api/v1/releases",
+            Some(&admin),
+            Some(&ext_body(base, &ext.signature)),
+        )
+        .await;
+        assert_eq!(
+            (r.status, body(&r)["error"]["details"]["parameter"].as_str()),
+            (400, Some(param)),
+            "{base:?}"
+        );
+    }
+    let r = call(addr, "POST", "/api/v1/releases", Some(&admin), Some(&json!({"sha256sums": ext.sha256sums, "signature": ext.signature, "base_url": "https://repo.example.gov.tw/p/"}))).await;
+    assert_eq!(r.status, 400, "base_url 只用於 source: external");
+    let forged = TestSigner::new(12).sign(ext.sha256sums.as_bytes());
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&admin),
+        Some(&ext_body(Some("https://repo.example.gov.tw/p/"), &forged)),
+    )
+    .await;
+    assert_eq!(
+        (r.status, body(&r)["error"]["code"].as_str()),
+        (400, Some("release_signature_invalid")),
+        "外部版本的簽章同樣要驗證"
+    );
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&op),
+        Some(&ext_body(
+            Some("https://repo.example.gov.tw/p/"),
+            &ext.signature,
+        )),
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&admin),
+        Some(&ext_body(
+            Some("https://Repo.example.gov.tw/p"),
+            &ext.signature,
+        )),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        (
+            body(&r)["data"]["source"].as_str(),
+            body(&r)["data"]["base_url"].as_str(),
+            body(&r)["data"]["verified"].as_bool()
+        ),
+        (
+            Some("external"),
+            Some("https://repo.example.gov.tw/p/"),
+            Some(true)
+        )
+    );
+    let (ext_name, ext_data) = ext.files[0].clone();
+    let r = put_artifact(&f, &admin, "0.9.4", &ext_name, b"something else").await;
+    assert_eq!(
+        (r.status, body(&r)["error"]["code"].as_str()),
+        (400, Some("artifact_hash_mismatch"))
+    );
+    let r = put_artifact(&f, &admin, "0.9.4", &ext_name, &ext_data).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        (
+            body(&r)["data"]["stored"].as_bool(),
+            body(&r)["data"]["registered"].as_bool()
+        ),
+        (Some(false), Some(true))
+    );
     let _ = std::fs::remove_dir_all(trust.parent().unwrap());
     f.stop().await;
 }

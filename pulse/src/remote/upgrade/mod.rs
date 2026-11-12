@@ -14,6 +14,7 @@
 //! 使用（`<狀態目錄>/upgrade/releases/<版本>/`，每次驗證通過的發佈都會保存）；否則輔助程式改以替換前保留的
 //! 執行檔回復（`detail` 註明套件資料庫仍為新版），不以 root 安裝未經信任錨驗證的套件。
 
+pub mod fetch;
 pub mod files;
 pub mod helper;
 #[cfg(all(test, unix))]
@@ -70,6 +71,10 @@ const DOWNLOAD_LOG_WINDOW: Duration = Duration::from_secs(600);
 /// 超過每秒 20 則」並延後處理同一條連線上的心跳與 report（tests/systemd 實測）。保留約每秒 4 則給其他訊息；
 /// 10 MB 約 20 秒，與規格估計的 20～40 秒相同
 const CHUNK_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
+/// 外部 URL 下載失敗後多久再試（±20% 抖動；續傳）
+const URL_RETRY: Duration = Duration::from_secs(60);
+/// 沒有外部 URL 的下載工作時，多久再檢查一次
+const URL_POLL: Duration = Duration::from_secs(2);
 /// 驗證過的發佈的簽章資料（回滾檔的信任來源）
 const RELEASES_DIR: &str = "releases";
 
@@ -95,6 +100,10 @@ pub struct UpgradeEnv {
     /// 每次連線前重新偵測 `install`（放好信任錨、啟用 `pulse-upgrade.path` 後不必重新啟動 Pulse）；
     /// `None` 時沿用啟動時的結果（測試）
     pub redetect: Option<fn() -> Detection>,
+    /// 本機的 `upgrade.url_allowlist`：允許從外部 URL 下載的前綴（空＝只從 Kairos 下載；REMOTE.md 第 4.1.2 節）
+    pub url_allowlist: Vec<String>,
+    /// 本機的 `upgrade.external_ca`：外部 URL 的 CA（PEM 的路徑；空字串＝作業系統信任庫）
+    pub external_ca: String,
 }
 
 /// 檔案系統的可用空間（Unix：`statvfs` 的 `f_bavail × f_frsize`）
@@ -147,6 +156,9 @@ pub struct FileItem {
     pub size: u64,
     pub sha256: String,
     pub done: bool,
+    /// 從外部 URL 下載（`artifact.source = "url"`，已通過本機白名單；0.10.0）。`None`＝從 Kairos 分段下載
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// 進行中的升級
@@ -308,6 +320,8 @@ struct Inner {
     file: StateFile,
     state_error: Option<String>,
     download_log: LogThrottle,
+    /// 外部 URL 下載失敗後，到這個時間才重試
+    url_retry_at: Option<Instant>,
 }
 
 /// 遠端升級的狀態（跨連線保留）
@@ -340,6 +354,26 @@ pub struct UpgradeView {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// 外部 URL 的下載工作（REMOTE.md 第 4.1.2 節）：本機白名單不是空的時候在背景執行，下載目前升級中
+/// `source: "url"` 的檔案到暫存目錄；完成、失敗都交回 [`UpgradeAgent`]（雜湊檢查、暫存、回報與分段下載相同）
+pub async fn run_url_downloads(agent: Arc<UpgradeAgent>) {
+    loop {
+        let Some(job) = agent.next_url_job(Instant::now()) else {
+            tokio::time::sleep(URL_POLL).await;
+            continue;
+        };
+        let (allowlist, external_ca) = agent.url_settings();
+        let result = match fetch::client_config(&external_ca) {
+            Ok(tls) => {
+                let (a, j) = (agent.clone(), job.clone());
+                fetch::download(&job, &allowlist, tls, None, &move || a.on_url_progress(&j)).await
+            }
+            Err(e) => Err(fetch::FetchError::Transient(e)),
+        };
+        agent.on_url_result(&job, result);
+    }
 }
 
 fn jitter(d: Duration) -> Duration {
@@ -392,6 +426,7 @@ impl UpgradeAgent {
                 file,
                 state_error,
                 download_log: LogThrottle::new(DOWNLOAD_LOG_WINDOW),
+                url_retry_at: None,
             }),
         });
         {
@@ -624,7 +659,8 @@ impl UpgradeAgent {
             return None;
         }
         let dir = Self::staging_dir(inner, &c.upgrade_id);
-        let file = c.files.iter().find(|f| !f.done)?;
+        // 外部 URL 的檔案由 [`run_url_downloads`] 下載，不經這條連線
+        let file = c.files.iter().find(|f| !f.done && f.url.is_none())?;
         let on_disk =
             std::fs::metadata(dir.join(format!("{}.part", file.name))).map_or(0, |m| m.len());
         let next = cs
@@ -1064,12 +1100,21 @@ impl UpgradeAgent {
             inner.file.current = None;
             Self::persist(&mut inner);
         }
-        // 2. 來源（外部 URL 在 0.10.0）
-        if offer.artifact.source != SOURCE_KAIROS
+        // 2. 來源：外部 URL 只在符合本機白名單（`upgrade.url_allowlist`，預設空）、而且指向提議的檔名時接受
+        // （REMOTE.md 第 4.1.2 節）。簽章與雜湊的驗證與從 Kairos 下載完全相同（下面的第 5 步與下載後的檢查）
+        let source_ok = |a: &ArtifactRef| match (a.source.as_str(), a.url.as_deref()) {
+            (SOURCE_KAIROS, _) => true,
+            (mgmt::SOURCE_URL, Some(u)) => {
+                fetch::url_allowed(u, &inner.env.url_allowlist)
+                    && fetch::url_names_file(u, &a.filename)
+            }
+            _ => false,
+        };
+        if !source_ok(&offer.artifact)
             || offer
                 .rollback_artifact
                 .as_ref()
-                .is_some_and(|r| r.source != SOURCE_KAIROS)
+                .is_some_and(|r| !source_ok(r))
         {
             Self::decline(
                 &mut inner,
@@ -1209,19 +1254,18 @@ impl UpgradeAgent {
         }
         // 接受
         let id = offer.upgrade_id.to_ascii_lowercase();
-        let mut files = vec![FileItem {
-            name: offer.artifact.filename.clone(),
-            size: offer.artifact.size,
-            sha256: offer.artifact.sha256.clone(),
+        let item = |a: &ArtifactRef| FileItem {
+            name: a.filename.clone(),
+            size: a.size,
+            sha256: a.sha256.clone(),
             done: false,
-        }];
+            url: (a.source == mgmt::SOURCE_URL)
+                .then(|| a.url.clone())
+                .flatten(),
+        };
+        let mut files = vec![item(&offer.artifact)];
         if rollback_trusted && let Some(r) = &offer.rollback_artifact {
-            files.push(FileItem {
-                name: r.filename.clone(),
-                size: r.size,
-                sha256: r.sha256.clone(),
-                done: false,
-            });
+            files.push(item(r));
         }
         let dir = Self::staging_dir(&inner, &id);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1372,22 +1416,20 @@ impl UpgradeAgent {
             cs.retry_until = Some(Instant::now() + Duration::from_secs(30));
             return;
         }
-        // 進度（每 25%）
-        let (done, total) = Self::progress(&inner, &c);
-        let quarter = u8::try_from(done.saturating_mul(4) / total.max(1)).unwrap_or(4);
-        if quarter > c.quarter && quarter < 4 {
-            let mut r = Self::status_for(&c, UPGRADE_STATE_ACCEPTED, None, String::new());
-            r.progress = Some(UpgradeProgress { bytes: done, total });
-            if let Some(cur) = inner.file.current.as_mut() {
-                cur.quarter = quarter;
-            }
-            Self::push_status(&mut inner, r);
-            Self::persist(&mut inner);
-        }
+        Self::note_progress(&mut inner, &c);
         if !complete {
             return;
         }
-        // 一個檔案下載完成：以提議的 SHA-256 檢查
+        Self::file_downloaded(&mut inner, &c, idx);
+    }
+
+    /// 一個檔案下載完成（暫存檔已有完整的大小；從 Kairos 分段或從外部 URL）：以提議的 SHA-256 檢查，
+    /// 相符才改名；全部完成後進入 [`Self::stage`]
+    fn file_downloaded(inner: &mut Inner, c: &Current, idx: usize) {
+        let file = c.files[idx].clone();
+        let name = file.name.clone();
+        let dir = Self::staging_dir(inner, &c.upgrade_id);
+        let part = dir.join(format!("{name}.part"));
         let actual = files::sha256_file(&part).unwrap_or_default();
         if actual != file.sha256 {
             let _ = std::fs::remove_file(&part);
@@ -1400,32 +1442,123 @@ impl UpgradeAgent {
                     "SHA-256 of {name} did not match {MAX_DOWNLOAD_HASH_MISMATCHES} times"
                 ));
                 let offer = c.offer.clone();
-                Self::verify_failed(&mut inner, &offer, &e, &name, "-");
+                Self::verify_failed(inner, &offer, &e, &name, "-");
             } else {
                 Self::log_download(
-                    &mut inner,
-                    &c,
+                    inner,
+                    c,
                     &format!("{name} 的 SHA-256 與提議不符（第 {mismatches} 次），刪除後重新下載"),
                 );
-                Self::persist(&mut inner);
+                Self::persist(inner);
             }
             return;
         }
         if let Err(e) = std::fs::rename(&part, dir.join(&name)) {
-            Self::log_download(&mut inner, &c, &format!("無法改名暫存檔：{e}"));
+            Self::log_download(inner, c, &format!("無法改名暫存檔：{e}"));
             return;
         }
         if let Some(cur) = inner.file.current.as_mut() {
             cur.files[idx].done = true;
         }
-        Self::persist(&mut inner);
+        Self::persist(inner);
         if inner
             .file
             .current
             .as_ref()
             .is_some_and(|c| c.files.iter().all(|f| f.done))
         {
-            Self::stage(&mut inner);
+            Self::stage(inner);
+        }
+    }
+
+    // ---- 外部 URL 的下載（REMOTE.md 第 4.1.2 節；由 [`run_url_downloads`] 驅動） ----
+
+    /// 下一個要從外部 URL 下載的檔案（下載中、尚未完成、不在重試的等待期內）
+    pub fn next_url_job(&self, now: Instant) -> Option<fetch::UrlJob> {
+        let inner = self.lock();
+        if inner.url_retry_at.is_some_and(|t| now < t) {
+            return None;
+        }
+        let c = inner.file.current.as_ref()?;
+        if c.phase != Phase::Downloading {
+            return None;
+        }
+        let f = c.files.iter().find(|f| !f.done && f.url.is_some())?;
+        Some(fetch::UrlJob {
+            upgrade_id: c.upgrade_id.clone(),
+            filename: f.name.clone(),
+            url: f.url.clone().unwrap_or_default(),
+            size: f.size,
+            part: fetch::part_path(&Self::staging_dir(&inner, &c.upgrade_id), &f.name),
+        })
+    }
+
+    /// 外部 URL 的白名單與 CA（下載工作用）
+    pub fn url_settings(&self) -> (Vec<String>, String) {
+        let inner = self.lock();
+        (
+            inner.env.url_allowlist.clone(),
+            inner.env.external_ca.clone(),
+        )
+    }
+
+    /// 這個下載工作仍然是目前的升級（提議被取代或取消時放棄下載）
+    fn url_job_index(inner: &Inner, job: &fetch::UrlJob) -> Option<(Current, usize)> {
+        let c = inner.file.current.as_ref()?;
+        if c.phase != Phase::Downloading || c.upgrade_id != job.upgrade_id {
+            return None;
+        }
+        let idx = c.files.iter().position(|f| {
+            f.name == job.filename && !f.done && f.url.as_deref() == Some(&job.url)
+        })?;
+        Some((c.clone(), idx))
+    }
+
+    /// 外部 URL 下載中的進度（每 25% 回報一次，與分段下載相同）
+    pub fn on_url_progress(&self, job: &fetch::UrlJob) {
+        let mut inner = self.lock();
+        let Some((c, _)) = Self::url_job_index(&inner, job) else {
+            return;
+        };
+        Self::note_progress(&mut inner, &c);
+    }
+
+    /// 進度（每 25%）
+    fn note_progress(inner: &mut Inner, c: &Current) {
+        let (done, total) = Self::progress(inner, c);
+        let quarter = u8::try_from(done.saturating_mul(4) / total.max(1)).unwrap_or(4);
+        let reported = inner.file.current.as_ref().map_or(c.quarter, |x| x.quarter);
+        if quarter > reported && quarter < 4 {
+            let mut r = Self::status_for(c, UPGRADE_STATE_ACCEPTED, None, String::new());
+            r.progress = Some(UpgradeProgress { bytes: done, total });
+            if let Some(cur) = inner.file.current.as_mut() {
+                cur.quarter = quarter;
+            }
+            Self::push_status(inner, r);
+            Self::persist(inner);
+        }
+    }
+
+    /// 外部 URL 的下載結束：成功時檢查雜湊（與分段下載相同的路徑）；失敗時記錄並稍後續傳
+    pub fn on_url_result(&self, job: &fetch::UrlJob, result: Result<(), fetch::FetchError>) {
+        let mut inner = self.lock();
+        let Some((c, idx)) = Self::url_job_index(&inner, job) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                inner.url_retry_at = None;
+                Self::note_progress(&mut inner, &c);
+                Self::file_downloaded(&mut inner, &c, idx);
+            }
+            Err(e) => {
+                Self::log_download(
+                    &mut inner,
+                    &c,
+                    &format!("從外部 URL 下載 {} 失敗：{e}", job.filename),
+                );
+                inner.url_retry_at = Some(Instant::now() + jitter(URL_RETRY));
+            }
         }
     }
 

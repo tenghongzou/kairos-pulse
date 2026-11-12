@@ -450,12 +450,22 @@ pub(crate) struct Sse {
 
 impl Sse {
     pub async fn open(addr: SocketAddr, token: &str, last_event_id: Option<&str>) -> Sse {
+        Self::open_path(addr, token, "/api/v1/events", last_event_id).await
+    }
+
+    /// 指定路徑（含查詢參數，例如 `?rollout_id=…`）
+    pub async fn open_path(
+        addr: SocketAddr,
+        token: &str,
+        path: &str,
+        last_event_id: Option<&str>,
+    ) -> Sse {
         let mut tls = connect(addr).await;
         let mut extra = vec![("Accept", "text/event-stream")];
         if let Some(id) = last_event_id {
             extra.push(("Last-Event-ID", id));
         }
-        tls.write_all(request_text("GET", "/api/v1/events", Some(token), &extra).as_bytes())
+        tls.write_all(request_text("GET", path, Some(token), &extra).as_bytes())
             .await
             .unwrap();
         let mut raw = Vec::new();

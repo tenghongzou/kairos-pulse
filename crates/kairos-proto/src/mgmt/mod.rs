@@ -15,6 +15,7 @@
 //! 本模組只有型別與純函式；兩端的行為（何時送、狀態機、儲存）由 Kairos／Pulse 實作。
 
 pub mod settings;
+pub mod url;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -823,10 +824,10 @@ fn check_artifact(field: &str, a: &ArtifactRef) -> Result<(), String> {
     }
     match (a.source.as_str(), &a.url) {
         (SOURCE_KAIROS, None) => Ok(()),
-        (SOURCE_URL, Some(url))
-            if url.starts_with("https://")
-                && url.len() <= MAX_ARTIFACT_URL_BYTES
-                && !url.chars().any(|c| c.is_whitespace() || is_forbidden(c)) =>
+        (SOURCE_URL, Some(u))
+            if u.starts_with("https://")
+                && u.len() <= MAX_ARTIFACT_URL_BYTES
+                && !u.chars().any(|c| c.is_whitespace() || is_forbidden(c)) =>
         {
             Ok(())
         }

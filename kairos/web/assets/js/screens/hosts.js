@@ -90,6 +90,7 @@ export function render(ctx) {
   let facets = null;
   let lastEventId = null;
   let nextCursor = null;
+  let recommendedMin = null;
   let total = 0;
   let ctrl = null;
   let disposed = false;
@@ -235,6 +236,14 @@ export function render(ctx) {
   }
 
   // ---- 表格 ----
+  // agent 版本：低於建議的最低版本（版本庫中最新版本的清單 min_upgrade_from；API 的 agent_outdated 與
+  // meta.recommended_min_agent_version）時加 ⚠ 與說明（設計包 S04；REMOTE.md 第 4.9 節、R9）
+  const versionCell = (r) => {
+    if (!r.agent_version) return '—';
+    if (!r.agent_outdated || !recommendedMin) return r.agent_version;
+    const why = t('hosts.versionOutdated', { min: recommendedMin });
+    return [r.agent_version, ' ', h('span', { class: 'k-flag k-version-flag', title: why }, icon('status-warning'), h('span', { class: 'ds-visually-hidden' }, why))];
+  };
   // 資產欄位：舊版 Pulse（沒有資產）時「—」，title 寫完整的原因（設計包 S04）
   const na = (r) => (isOldPulse(r) ? h('span', { class: 'muted', title: t('host.na.oldPulse', { version: F4_VERSION }) }, '—') : '—');
   const inv = (r, k) => (r.inventory && r.inventory[k] != null ? r.inventory[k] : null);
@@ -261,7 +270,7 @@ export function render(ctx) {
     { key: 'group', label: t('col.group'), render: (r) => r.group || '—' },
     { key: 'ip', label: t('col.ip'), sort: 'ip', render: (r) => (r.ip ? h('span', { class: 'mono' }, r.ip) : '—') },
     { key: 'os', label: t('col.os'), render: (r) => osText(r.os) },
-    { key: 'version', label: t('col.version'), sort: 'agent_version', render: (r) => r.agent_version || '—' },
+    { key: 'version', label: t('col.version'), sort: 'agent_version', render: versionCell },
     { key: 'last_seen', label: t('col.lastSeen', { tz: fmt.tzLabel() }), sort: 'last_seen', defaultDesc: true, render: (r) => fmt.timeEl(r.last_seen) },
     { key: 'offline_for', label: t('col.offlineFor'), render: offlineFor },
     { key: 'cpu', label: t('col.cpu'), sort: 'cpu', num: true, defaultDesc: true, render: (r) => (r.status === 'online' && r.last_report ? fmt.pct(r.last_report.cpu_usage) : '—') },
@@ -359,6 +368,7 @@ export function render(ctx) {
       const res = await api(`/api/v1/hosts${qs(apiParams(st))}`, { raw: true, signal });
       if (disposed) return;
       lastEventId = res.meta && res.meta.last_event_id;
+      recommendedMin = (res.meta && res.meta.recommended_min_agent_version) || null;
       total = res.page.total;
       nextCursor = res.page.next_cursor;
       renderChips(res.meta.status_counts);

@@ -374,8 +374,9 @@ fn concurrent_acquisition_yields_exactly_one_leader() {
 }
 
 #[test]
-fn sqlite_v9_is_upgraded_to_v10_and_keeps_data() {
-    // 0.9 的 SQLite（v9）升級到 v10：只新增叢集的資料表與三個欄位，既有資料不變
+fn sqlite_v9_is_upgraded_to_v11_and_keeps_data() {
+    // 0.9 的 SQLite（v9）升級到 v11：v10 只新增叢集的資料表與三個欄位、v11 只新增 rollouts 的三個欄位，
+    // 既有資料不變
     use crate::store::sqlite::{MIGRATIONS, migrate};
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     let v9: Vec<_> = MIGRATIONS
@@ -391,7 +392,12 @@ fn sqlite_v9_is_upgraded_to_v10_and_keeps_data() {
     .unwrap();
     conn.execute("INSERT INTO meta (key, value) VALUES ('keep', 'me')", [])
         .unwrap();
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 10);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 11);
+    conn.execute(
+        "UPDATE rollouts SET submitted_at = 1, submitted_by = 'u', reject_reason = 'r' WHERE 0",
+        [],
+    )
+    .unwrap();
     let tables: Vec<String> = conn
         .prepare(
             "SELECT name FROM sqlite_master
@@ -504,6 +510,12 @@ fn schema_v9_is_upgraded_in_place() {
         (),
     )
     .unwrap();
+    // v11：rollouts 的雙人覆核欄位
+    conn.execute(
+        "UPDATE rollouts SET submitted_at = 1, submitted_by = 'u', reject_reason = 'r' WHERE false",
+        (),
+    )
+    .unwrap();
     assert!(
         conn.cluster_lease_acquire(LEASE_LEADER, "kairos-a", TTL_MS, None)
             .unwrap()
@@ -513,6 +525,94 @@ fn schema_v9_is_upgraded_in_place() {
         postgres::ensure_schema(&conn).unwrap(),
         crate::store::sqlite::SCHEMA_VERSION
     );
+}
+
+#[test]
+fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
+    // 只到 v10 的 PostgreSQL schema（0.10.0 開發期間、叢集協調先建立的資料庫）升級到 v11：只套用
+    // rollouts 的三個欄位，既有的推送保留、新欄位為 NULL，叢集的資料表不重建
+    use crate::remote::store::RemoteStore;
+    let Some(db) = TestDb::postgres("upgrade11") else {
+        return;
+    };
+    assert_eq!(
+        postgres::schema::UPGRADES
+            .iter()
+            .map(|(v, _)| *v)
+            .collect::<Vec<_>>(),
+        [10, 11]
+    );
+    assert_eq!(crate::store::sqlite::SCHEMA_VERSION, 11);
+    let pool = db.pool();
+    let conn = pool.get(Access::ReadWrite, Duration::from_secs(5)).unwrap();
+    {
+        let tx = conn.begin_tx(TxMode::Deferred).unwrap();
+        tx.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {}", pool.schema()))
+            .unwrap();
+        tx.execute_batch(postgres::schema::SCHEMA_V9).unwrap();
+        tx.execute_batch(postgres::schema::SCHEMA_V10).unwrap();
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('application', 'KRS1'), ('schema_version', '10')",
+            (),
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO rollouts (rollout_id, name, release_id, target_version, selector, waves,
+                schedule, options, state, created_at, created_by, updated_at)
+             VALUES ('r-20261020-0001', 'x', 1, '0.9.1', '{}', '[]', '{}', '{}', 'completed', 1,
+                'user:a', 2)",
+            (),
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO cluster_revs (name, rev) VALUES ('keep', 7)",
+            (),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    conn.clear_statements();
+    assert_eq!(
+        postgres::schema_state(&conn).unwrap(),
+        SchemaState::Version(10)
+    );
+    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 11);
+    assert_eq!(
+        postgres::schema_state(&conn).unwrap(),
+        SchemaState::Version(11)
+    );
+    let rev: i64 = conn
+        .query_row(
+            "SELECT rev FROM cluster_revs WHERE name = 'keep'",
+            (),
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rev, 7);
+    let r = conn.get_rollout("r-20261020-0001").unwrap().unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.created_by.as_str(), r.updated_at),
+        ("completed", "user:a", 2)
+    );
+    assert_eq!(
+        (
+            r.submitted_at,
+            r.submitted_by.clone(),
+            r.approved_at,
+            r.reject_reason.clone()
+        ),
+        (None, None, None, None)
+    );
+    let mut r2 = r.clone();
+    r2.submitted_at = Some(5);
+    r2.submitted_by = Some("user:b".into());
+    r2.approved_at = Some(6);
+    r2.approved_by = Some("user:c".into());
+    r2.reject_reason = Some("原因".into());
+    conn.update_rollout_state(&r2).unwrap();
+    assert_eq!(conn.get_rollout("r-20261020-0001").unwrap().unwrap(), r2);
+    // 再執行一次：沒有變化
+    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 11);
 }
 
 #[test]

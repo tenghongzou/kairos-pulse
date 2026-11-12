@@ -21,6 +21,7 @@ mod engine;
 pub mod ops;
 pub mod releases;
 pub mod rollout;
+pub mod schedule;
 pub mod store;
 
 pub use engine::rollout_json;
@@ -68,10 +69,14 @@ pub const CODE_ROLLED_BACK: &str = "KRS-W8407";
 pub const CODE_IMPORT_FAILED: &str = "KRS-E8413";
 /// 推送已自動暫停
 pub const CODE_ROLLOUT_PAUSED: &str = "KRS-W8414";
+/// 不能核准自己建立或送出的推送（雙人覆核，REMOTE.md 第 5.4 節；API 403 `self_approval`）
+pub const CODE_SELF_APPROVAL: &str = "KRS-E6106";
 /// 目標版本與目前的 Kairos 不相容（`min_kairos`）
 pub const CODE_INCOMPATIBLE: &str = "KRS-W8415";
 /// 升級完成（鏡像 `PLS-I8416`）
 pub const CODE_UPGRADED: &str = "KRS-I8416";
+/// 版本庫的檔案遺失：已存入的發佈檔不存在或大小不符（系統健康；〔暫定〕號碼，待設計包正式分配）
+pub const CODE_RELEASE_FILE_MISSING: &str = "KRS-W8417";
 
 /// Pulse 的代碼換成鏡像的 Kairos 代碼（同號；`KRS-W8402` 與 `PLS-E8402` 等級不同）
 pub fn mirror_code(pulse_code: &str) -> Option<&'static str> {
@@ -105,7 +110,7 @@ pub const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 /// 下載名額不足時的 `retry_after_ms`（Pulse 另加 ±20% 抖動）
 pub const DOWNLOAD_RETRY_AFTER_MS: u32 = 15_000;
 
-/// 給主控台 SSE 的變化（`config.host`、`rollout.progress`；REMOTE.md 第 8.4 節）
+/// 給主控台 SSE 的變化（`config.host`、`rollout.progress`、`rollout.host`；REMOTE.md 第 8.4 節）
 #[derive(Debug, Clone)]
 pub struct RemoteEvent {
     pub kind: &'static str,
@@ -114,6 +119,45 @@ pub struct RemoteEvent {
 
 /// SSE 事件的緩衝（推送的進度每 5 秒最多一則；設定的狀態每台主機每次回報一則）
 pub const EVENT_BUFFER: usize = 1024;
+/// 一個推送一輪最多送出幾則 `rollout.host`；超過時不逐台送，改在 `rollout.progress` 帶 `hosts_resync: true`
+/// （主控台重新抓取主機表），避免大型推送灌滿事件緩衝
+pub const ROLLOUT_HOST_EVENTS_MAX: usize = 200;
+/// 建議的最低 Pulse 版本多久重新計算一次（`kairos releases` 的 CLI 直接寫資料庫，不會通知服務）
+pub const RECOMMENDED_MIN_TTL: Duration = Duration::from_secs(30);
+/// 開始訂閱一個推送時，往回補送這段時間內改變過的主機（畫面載入到第一輪之間的變化）
+pub const ROLLOUT_WATCH_LOOKBACK_MS: i64 = 15_000;
+
+/// 一台主機上次送出 `rollout.host` 時的樣子（有改變才再送）
+type HostMark = (i64, String, Option<i64>, i64, bool);
+
+fn host_mark(h: &store::RolloutHostRow) -> HostMark {
+    (
+        h.updated_at,
+        h.state.clone(),
+        h.bytes_done,
+        h.attempts,
+        h.acknowledged_at.is_some(),
+    )
+}
+
+/// 主控台 SSE 連線對一個推送的訂閱（`GET /api/v1/events?rollout_id=…`）；放掉時取消
+pub struct RolloutWatch {
+    svc: Arc<RemoteService>,
+    rollout_id: String,
+}
+
+impl Drop for RolloutWatch {
+    fn drop(&mut self) {
+        let mut st = self.svc.lock();
+        if let Some(n) = st.watchers.get_mut(&self.rollout_id) {
+            *n -= 1;
+            if *n == 0 {
+                st.watchers.remove(&self.rollout_id);
+                st.host_seen.remove(&self.rollout_id);
+            }
+        }
+    }
+}
 
 /// 這條連線上協商的遠端管理與主機資訊（hello 時記下，推送引擎與提議使用）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +169,19 @@ pub struct AgentSession {
     pub arch: Option<String>,
     pub config: bool,
     pub upgrade: bool,
+}
+
+/// 「升級中」每隔這段時間重新發布一次（告警引擎漏掉時補上）
+pub const UPGRADE_WINDOW_REPUBLISH_MS: i64 = 60_000;
+
+/// 已發布的「升級中」（離線告警抑制）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpgradeWindow {
+    rollout_id: String,
+    /// 抑制的期限（[`rollout::suppress_until`]）
+    until_ms: i64,
+    /// 設定的時間（調和時不解除剛設定的）
+    set_ms: i64,
 }
 
 /// 提議中的檔案（`upgrade_chunk_get` 只接受這些）
@@ -149,8 +206,16 @@ struct State {
     downloads: HashMap<String, Instant>,
     /// 狀態改變、尚未送出 `rollout.progress` 的推送
     dirty_rollouts: HashSet<String>,
+    /// 推送 → 訂閱它的 SSE 連線數（有訂閱時才送 `rollout.host`）
+    watchers: HashMap<String, usize>,
+    /// 訂閱中的推送 → 每台主機上次送出的樣子（還沒有基準時沒有項目）
+    host_seen: HashMap<String, HashMap<i64, HostMark>>,
+    /// 建議的最低 Pulse 版本的快取（[`RECOMMENDED_MIN_TTL`]）
+    recommended_min: Option<(Instant, Option<String>)>,
     /// 已發布給告警引擎、仍有效的系統檢查（規則, 對象）；`None` 為尚未調和過
     alert_keys: Option<HashSet<(&'static str, String)>>,
+    /// 已發布給告警引擎的「升級中」（離線告警抑制，REMOTE.md 第 4.7.5 節）：agent_id → 抑制的期限
+    upgrade_windows: HashMap<String, UpgradeWindow>,
 }
 
 /// [`RemoteService::start`] 的參數
@@ -174,6 +239,8 @@ pub struct RemoteService {
     clock: crate::enroll::Clock,
     /// 服務啟動的時間（Unix 毫秒；推送引擎在啟動後 1 分鐘內不提議新的主機）
     pub started_ms: i64,
+    /// 推送的維護時段沒有指定 `timezone` 時的預設（Kairos 的 `alerts.timezone`；沒有設定時 `+08:00`）
+    default_timezone: std::sync::OnceLock<String>,
     state: Mutex<State>,
     snapshot: RwLock<Arc<ConfigSnapshot>>,
     wake: Notify,
@@ -223,6 +290,7 @@ impl RemoteService {
             shutdown: p.shutdown,
             clock: p.clock,
             started_ms: now,
+            default_timezone: std::sync::OnceLock::new(),
             state: Mutex::new(State {
                 desired,
                 offers,
@@ -242,6 +310,21 @@ impl RemoteService {
 
     pub fn now_ms(&self) -> i64 {
         (self.clock)()
+    }
+
+    /// 設定維護時段的預設時區（啟動時以 `alerts.timezone` 呼叫一次；不是固定位移時忽略）
+    pub fn set_default_timezone(&self, tz: &str) {
+        if schedule::parse_offset_secs(tz).is_some() {
+            let _ = self.default_timezone.set(tz.trim().to_string());
+        }
+    }
+
+    /// 維護時段的預設時區（固定位移）
+    pub fn default_timezone(&self) -> String {
+        self.default_timezone
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "+08:00".to_string())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -275,17 +358,64 @@ impl RemoteService {
         let _ = self.events.send(RemoteEvent { kind, data });
     }
 
+    /// 建議的最低 Pulse 版本（S04 版本欄的 ⚠；REMOTE.md 第 4.9 節）：版本庫中**最新版本**的清單的
+    /// `min_upgrade_from`——低於它的主機無法遠端升級到最新版，需要手動升級。版本庫是空的、最新版本沒有清單
+    /// （0.9.0 以前的發佈）或讀不到資料庫時為 `None`（不標示）
+    pub async fn recommended_min_agent_version(&self) -> Option<String> {
+        if let Some((at, v)) = &self.lock().recommended_min
+            && at.elapsed() < RECOMMENDED_MIN_TTL
+        {
+            return v.clone();
+        }
+        let v = match self.db.read(|s| Ok(s.list_releases()?)).await {
+            Ok(list) => ops::recommended_min_version(&list),
+            Err(e) => {
+                debug!("遠端管理：無法讀取版本庫（建議的最低版本）：{e}");
+                return None;
+            }
+        };
+        self.lock().recommended_min = Some((Instant::now(), v.clone()));
+        v
+    }
+
+    /// 版本庫改變（匯入、刪除）：下一次重新計算建議的最低版本
+    pub(crate) fn forget_recommended_min(&self) {
+        self.lock().recommended_min = None;
+    }
+
+    /// 主控台 SSE 連線訂閱一個推送的 `rollout.host`（下一輪建立基準並補送最近的變化）
+    pub fn watch_rollout(self: &Arc<Self>, rollout_id: &str) -> RolloutWatch {
+        {
+            let mut st = self.lock();
+            *st.watchers.entry(rollout_id.to_string()).or_default() += 1;
+            st.dirty_rollouts.insert(rollout_id.to_string());
+        }
+        self.wake();
+        RolloutWatch {
+            svc: self.clone(),
+            rollout_id: rollout_id.to_string(),
+        }
+    }
+
     /// 推送的狀態或主機改變：下一輪送出 `rollout.progress`
     pub(crate) fn mark_dirty(&self, rollout_id: &str) {
         self.lock().dirty_rollouts.insert(rollout_id.to_string());
     }
 
     /// 送出改變過的推送的 `rollout.progress`（`rollout_id`、`state`、`current_wave`、各狀態的台數、`pause_cause`、
-    /// `next_action`）
+    /// `next_action`），有 SSE 連線訂閱的推送另送每台改變的主機的 `rollout.host`（[`rollout::host_json`]；
+    /// 一輪超過 [`ROLLOUT_HOST_EVENTS_MAX`] 台時改在 `rollout.progress` 帶 `hosts_resync: true`）
     pub(crate) async fn flush_progress(&self) {
-        let ids: Vec<String> = std::mem::take(&mut self.lock().dirty_rollouts)
-            .into_iter()
-            .collect();
+        let (ids, mut seen) = {
+            let mut st = self.lock();
+            let ids: Vec<String> = std::mem::take(&mut st.dirty_rollouts).into_iter().collect();
+            let seen: HashMap<String, Option<HashMap<i64, HostMark>>> = ids
+                .iter()
+                .filter(|id| st.watchers.contains_key(*id))
+                .map(|id| (id.clone(), st.host_seen.get(id).cloned()))
+                .collect();
+            (ids, seen)
+        };
         if ids.is_empty() || self.events.receiver_count() == 0 {
             return;
         }
@@ -297,14 +427,39 @@ impl RemoteService {
                 for id in ids {
                     if let Some(r) = s.get_rollout(&id)? {
                         let hosts = s.rollout_hosts(&id)?;
-                        out.push(serde_json::json!({
+                        let mut v = serde_json::json!({
                             "rollout_id": r.id,
                             "state": r.state,
                             "current_wave": r.current_wave,
                             "progress": rollout::progress(&hosts),
                             "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
-                            "next_action": rollout::next_action(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), now),
-                        }));
+                            "next_action": rollout::next_action_scheduled(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), &schedule::ScheduleSpec::from_db(&r.schedule), now),
+                        });
+                        let mut host_events = Vec::new();
+                        let mut marks = None;
+                        if let Some(before) = seen.remove(&id) {
+                            let changed: Vec<&store::RolloutHostRow> = hosts
+                                .iter()
+                                .filter(|h| match &before {
+                                    Some(m) => m.get(&h.host_id) != Some(&host_mark(h)),
+                                    None => h.updated_at >= now - ROLLOUT_WATCH_LOOKBACK_MS,
+                                })
+                                .collect();
+                            if changed.len() > ROLLOUT_HOST_EVENTS_MAX {
+                                v["hosts_resync"] = serde_json::json!(true);
+                                v["hosts_changed"] = serde_json::json!(changed.len());
+                            } else {
+                                host_events =
+                                    changed.iter().map(|h| rollout::host_json(h)).collect();
+                            }
+                            marks = Some(
+                                hosts
+                                    .iter()
+                                    .map(|h| (h.host_id, host_mark(h)))
+                                    .collect::<HashMap<_, _>>(),
+                            );
+                        }
+                        out.push((id, v, host_events, marks));
                     }
                 }
                 Ok(out)
@@ -312,7 +467,17 @@ impl RemoteService {
             .await;
         match rows {
             Ok(list) => {
-                for v in list {
+                for (id, v, host_events, marks) in list {
+                    if let Some(m) = marks {
+                        let mut st = self.lock();
+                        // 這一輪之間取消訂閱的不留基準
+                        if st.watchers.contains_key(&id) {
+                            st.host_seen.insert(id, m);
+                        }
+                    }
+                    for h in host_events {
+                        self.emit("rollout.host", h);
+                    }
                     self.emit("rollout.progress", v);
                 }
             }
@@ -480,6 +645,7 @@ impl RemoteService {
             }
             self.flush_progress().await;
             self.reconcile_alerts().await;
+            self.reconcile_upgrade_windows().await;
         }
         debug!("遠端管理的背景工作結束");
     }
@@ -571,6 +737,99 @@ impl RemoteService {
                 details: serde_json::Value::Null,
             });
         }
+    }
+
+    /// 升級中主機的離線告警抑制（REMOTE.md 第 4.7.5 節）：這台主機進入 `applying`（`Some`：推送與期限）
+    /// 或到達終止狀態（`None`）。有改變時才發布給告警引擎
+    pub(crate) fn set_upgrade_window(&self, agent_id: &str, w: Option<(String, i64)>) {
+        let now = self.now_ms();
+        let event = {
+            let mut st = self.lock();
+            match w {
+                Some((rollout_id, until_ms)) if until_ms > now => {
+                    // 沒有改變時不重複發布；但每分鐘重送一次（告警服務比遠端管理服務晚啟動、或匯流排落後
+                    // 而漏掉時補上，數量最多是替換中的主機數）
+                    let same = st.upgrade_windows.get(agent_id).is_some_and(|o| {
+                        o.rollout_id == rollout_id
+                            && o.until_ms == until_ms
+                            && now - o.set_ms < UPGRADE_WINDOW_REPUBLISH_MS
+                    });
+                    if same {
+                        None
+                    } else {
+                        st.upgrade_windows.insert(
+                            agent_id.to_string(),
+                            UpgradeWindow {
+                                rollout_id: rollout_id.clone(),
+                                until_ms,
+                                set_ms: now,
+                            },
+                        );
+                        Some((rollout_id, Some(until_ms)))
+                    }
+                }
+                _ => st
+                    .upgrade_windows
+                    .remove(agent_id)
+                    .map(|o| (o.rollout_id, None)),
+            }
+        };
+        if let Some((rollout_id, until_ms)) = event {
+            self.registry
+                .bus()
+                .publish(crate::bus::EventKind::UpgradeWindow {
+                    agent_id: agent_id.to_string(),
+                    rollout_id,
+                    until_ms,
+                });
+        }
+    }
+
+    /// 依資料庫調和「升級中」的主機（`rollout_hosts.state = applying`，不論推送的狀態）：Kairos 重新啟動後
+    /// 重建告警引擎的抑制狀態；期限已過或主機已不在 `applying`（例如被推送引擎標為 `unknown`）時解除
+    pub(crate) async fn reconcile_upgrade_windows(&self) {
+        let rows = match self.db.read(|s| Ok(s.applying_hosts()?)).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("升級推送：無法讀取替換中的主機（離線告警抑制）：{e}");
+                return;
+            }
+        };
+        let now = self.now_ms();
+        let want: HashMap<String, (String, i64)> = rows
+            .into_iter()
+            .map(|(agent, rollout_id, applying_at, options)| {
+                let secs = rollout::options_from_db(&options).health_timeout_secs;
+                (
+                    agent,
+                    (rollout_id, rollout::suppress_until(applying_at, secs)),
+                )
+            })
+            .filter(|(_, (_, until))| *until > now)
+            .collect();
+        // 剛在 `apply_upgrade_status` 設定、這一輪讀資料庫時可能還沒看到的不解除
+        let fresh = ENGINE_INTERVAL.as_millis() as i64;
+        let gone: Vec<String> = self
+            .lock()
+            .upgrade_windows
+            .iter()
+            .filter(|(a, o)| {
+                !want.contains_key(*a) && (o.until_ms <= now || now - o.set_ms >= fresh)
+            })
+            .map(|(a, _)| a.clone())
+            .collect();
+        for a in gone {
+            self.set_upgrade_window(&a, None);
+        }
+        for (a, w) in want {
+            self.set_upgrade_window(&a, Some(w));
+        }
+    }
+
+    /// 目前離線告警被抑制的主機數
+    #[cfg(test)]
+    pub(crate) fn upgrade_windows(&self) -> usize {
+        self.lock().upgrade_windows.len()
     }
 
     /// 刪除超過 `rollout_retention_days` 的已結束推送

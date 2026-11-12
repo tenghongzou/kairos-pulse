@@ -846,7 +846,8 @@ async fn route(
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string)
                     .or_else(|| query.get("last_event_id").map(str::to_string));
-                events::stream(ctx.clone(), principal.clone(), access, last).await
+                let rollout_id = events::rollout_id_param(query.get("rollout_id"));
+                events::stream(ctx.clone(), principal.clone(), access, last, rollout_id).await
             }
             Err(e) => Err(e),
         },

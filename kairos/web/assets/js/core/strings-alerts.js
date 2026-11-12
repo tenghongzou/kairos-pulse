@@ -334,6 +334,8 @@ export const ALERT_STRINGS = {
   'alerts.tl.stable': '狀態已穩定',
   'alerts.tl.eta_expired': '預計處理時間已到',
   'alerts.tl.resolved': '已解決',
+  'alerts.tl.upgrade_suppressed': '升級中：這台主機在升級期間離線，離線告警抑制到期限後仍未恢復',
+  'alerts.tl.rollout': '推送 {id}',
   'alerts.tl.assignSelf': '負責人為確認者',
   'alerts.tl.eta': '預計 {n} 分鐘內處理',
   'alerts.tl.assignee': '負責人 {who}',

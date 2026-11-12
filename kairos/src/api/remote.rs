@@ -189,10 +189,10 @@ async fn config(
         }
         (_, ["schema"] | ["status"]) => Err(method_not_allowed("GET")),
         (_, ["profiles"]) if get => {
-            query.reject_unknown(&[], &[])?;
+            query.reject_unknown(&["q"], &[])?;
             p.require(Permission::ConfigRead)?;
             service(ctx, true)?;
-            list_profiles(ctx, now).await
+            list_profiles(ctx, search_term(query)?, now).await
         }
         ("POST", ["profiles"]) => {
             p.require(Permission::ConfigWrite)?;
@@ -416,9 +416,19 @@ async fn optional_body_reason(req: Request<Incoming>) -> Result<Option<String>, 
     }
 }
 
+/// 清單的 `q`（全域搜尋）：去掉前後空白、轉小寫；空字串視為沒有；最多 128 個字元
+fn search_term(query: &Query) -> Result<Option<String>, ApiError> {
+    match query.get("q").map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(q) if q.chars().count() > 128 => Err(ApiError::param("q", "q 最多 128 個字元")),
+        Some(q) => Ok(Some(q.to_lowercase())),
+    }
+}
+
 /// 每個設定檔的指派數與比對到的主機數
 async fn list_profiles(
     ctx: &Arc<ApiContext>,
+    q: Option<String>,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let now_ms = now.timestamp_millis();
@@ -426,6 +436,16 @@ async fn list_profiles(
         .pool
         .read("設定檔", move |s| {
             let profiles = s.list_profiles().map_err(query_failed("設定檔"))?;
+            // `q`：名稱或說明的子字串（不分大小寫；全域搜尋）
+            let profiles: Vec<_> = profiles
+                .into_iter()
+                .filter(|p| {
+                    q.as_deref().is_none_or(|q| {
+                        p.name.to_lowercase().contains(q)
+                            || p.description.to_lowercase().contains(q)
+                    })
+                })
+                .collect();
             let snap = desired::ConfigSnapshot::load(s).map_err(query_failed("設定檔"))?;
             let targets = s.config_targets().map_err(query_failed("設定檔"))?;
             Ok(profiles
@@ -819,19 +839,30 @@ async fn releases(
                 &b,
                 &["sha256sums", "signature", "manifest", "source", "base_url"],
             )?;
-            match http::str_field(&b, "source").unwrap_or("hosted") {
-                "hosted" => {}
-                "external" => {
+            // 外部 URL 的版本庫（0.10.0，REMOTE.md 第 4.1.2 節）：source = external 時必須有 base_url
+            let base_url = opt_string(&b, "base_url")?;
+            let base_url = match (http::str_field(&b, "source").unwrap_or("hosted"), base_url) {
+                ("hosted", None) => None,
+                ("hosted", Some(_)) => {
                     return Err(ApiError::param(
-                        "source",
-                        "外部 URL 的版本庫在 0.10 提供；0.9 只有 Kairos 代管（hosted）",
+                        "base_url",
+                        "base_url 只用於外部 URL 的版本庫（source: external）",
                     ));
                 }
-                _ => return Err(ApiError::param("source", "source 必須是 hosted")),
-            }
-            if b.get("base_url").is_some_and(|v| !v.is_null()) {
-                return Err(ApiError::param("base_url", "外部 URL 的版本庫在 0.10 提供"));
-            }
+                ("external", Some(u)) => Some(u),
+                ("external", None) => {
+                    return Err(ApiError::param(
+                        "base_url",
+                        "外部 URL 的版本庫（source: external）需要 base_url（https://…/）",
+                    ));
+                }
+                _ => {
+                    return Err(ApiError::param(
+                        "source",
+                        "source 必須是 hosted 或 external",
+                    ));
+                }
+            };
             let sums = opt_string(&b, "sha256sums")?.ok_or_else(|| {
                 ApiError::param("sha256sums", "需要 sha256sums（SHA256SUMS 的全文）")
             })?;
@@ -840,7 +871,7 @@ async fn releases(
             })?;
             let manifest = opt_string(&b, "manifest")?;
             let v = svc
-                .import_release(&actor(p, peer), sums, sig, manifest)
+                .import_release_from(&actor(p, peer), sums, sig, manifest, base_url)
                 .await?;
             Ok(http::json(StatusCode::CREATED, now, json!({"data": v})))
         }
@@ -1115,28 +1146,50 @@ async fn rollouts(
     let who = actor(p, peer);
     match (method.as_str(), sub) {
         (_, []) if get => {
-            query.reject_unknown(&["state"], &[])?;
+            query.reject_unknown(&["state", "q"], &[])?;
             p.require(Permission::RolloutsRead)?;
             service(ctx, false)?;
+            let q = search_term(query)?;
             let state = query.get("state").map(str::to_string);
             if state.as_deref().is_some_and(|s| {
                 !matches!(
                     s,
-                    "draft" | "running" | "paused" | "completed" | "cancelled"
+                    "draft"
+                        | "pending_approval"
+                        | "scheduled"
+                        | "running"
+                        | "paused"
+                        | "completed"
+                        | "cancelled"
                 )
             }) {
                 return Err(ApiError::param(
                     "state",
-                    "state 必須是 draft、running、paused、completed 或 cancelled",
+                    "state 必須是 draft、pending_approval、scheduled、running、paused、completed 或 cancelled",
                 ));
             }
             let now_ms = now.timestamp_millis();
+            let approval = ctx
+                .remote
+                .as_ref()
+                .map(|s| s.settings.rollout_approval.clone());
             let (data, meta) = ctx
                 .pool
                 .read("升級推送", move |s| {
                     let list = s
                         .list_rollouts(state.as_deref())
                         .map_err(query_failed("升級推送"))?;
+                    // `q`：名稱、編號或目標版本的子字串（不分大小寫；全域搜尋）
+                    let list: Vec<_> = list
+                        .into_iter()
+                        .filter(|r| {
+                            q.as_deref().is_none_or(|q| {
+                                r.name.to_lowercase().contains(q)
+                                    || r.id.to_lowercase().contains(q)
+                                    || r.target_version.to_lowercase().contains(q)
+                            })
+                        })
+                        .collect();
                     let mut out = Vec::new();
                     for r in &list {
                         let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;
@@ -1151,9 +1204,19 @@ async fn rollouts(
                         .unacknowledged_rollback_failures()
                         .map_err(query_failed("升級推送"))?
                         .len();
+                    // 雙人覆核（0.10）：待核准的推送數與目前的設定
+                    let pending = s
+                        .list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))
+                        .map_err(query_failed("升級推送"))?
+                        .len();
                     Ok((
                         out,
-                        json!({"paused": paused, "rollback_failed_unacknowledged": failures}),
+                        json!({
+                            "paused": paused,
+                            "rollback_failed_unacknowledged": failures,
+                            "pending_approval": pending,
+                            "rollout_approval": approval,
+                        }),
                     ))
                 })
                 .await?;
@@ -1244,9 +1307,36 @@ async fn rollouts(
             };
             Ok(http::ok(now, v))
         }
-        (_, [_, "submit" | "pause" | "resume" | "continue" | "cancel"]) => {
-            Err(method_not_allowed("POST"))
+        // 雙人覆核（REMOTE.md 第 5.4 節）：需要 rollouts:approve 與以帳號登入的工作階段（API token 不能核准、
+        // 退回）；核准者不得是建立者或送出者（403 self_approval，KRS-E6106）
+        ("POST", [id, action @ ("approve" | "reject")]) => {
+            p.require(Permission::RolloutsApprove)?;
+            if !matches!(p.kind, super::auth::PrincipalKind::Session { .. }) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "session_required",
+                    "核准與退回推送需要以帳號登入的工作階段（API token 不能使用）",
+                ));
+            }
+            let svc = service(ctx, false)?;
+            let b = body_json_optional(req).await?.unwrap_or(json!({}));
+            reject_unknown_fields(&b, &["reason"])?;
+            let reason = ops::reason_of(&b)?;
+            let v = if *action == "approve" {
+                svc.approve_rollout(&who, id.to_string()).await?
+            } else {
+                let reason = reason.ok_or_else(|| ApiError::param("reason", "需要 reason"))?;
+                svc.reject_rollout(&who, id.to_string(), reason).await?
+            };
+            Ok(http::ok(now, v))
         }
+        (
+            _,
+            [
+                _,
+                "submit" | "pause" | "resume" | "continue" | "cancel" | "approve" | "reject",
+            ],
+        ) => Err(method_not_allowed("POST")),
         ("POST", [id, "hosts", agent, action @ ("retry" | "acknowledge")]) => {
             p.require(Permission::RolloutsWrite)?;
             let svc = service(ctx, false)?;
@@ -1298,6 +1388,7 @@ async fn rollout_detail(
             selector: rollout::selector_from_db(&r.selector),
             waves: rollout::waves_from_db(&r.waves),
             options: rollout::options_from_db(&r.options),
+            schedule: crate::remote::schedule::ScheduleSpec::from_db(&r.schedule),
         };
         v["preview"] = svc.preview_rollout(spec, Some(r.id.clone())).await?;
     }

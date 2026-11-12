@@ -81,7 +81,7 @@ export function isWindowsMethod(install) {
 }
 
 // ---- 推送與主機的狀態 ----
-export const ROLLOUT_STATES = ['running', 'paused', 'completed', 'cancelled', 'draft'];
+export const ROLLOUT_STATES = ['running', 'pending_approval', 'scheduled', 'paused', 'completed', 'cancelled', 'draft'];
 
 export function rolloutStateLabel(s) {
   return has(`rm.rs.${s}`) ? t(`rm.rs.${s}`) : s;
@@ -91,6 +91,7 @@ export function rolloutStateBadge(s) {
   if (s === 'running') return statusBadge('info', rolloutStateLabel(s));
   if (s === 'paused') return statusBadge('warning', rolloutStateLabel(s));
   if (s === 'completed') return statusBadge('online', rolloutStateLabel(s));
+  if (s === 'scheduled' || s === 'pending_approval') return statusBadge('pending', rolloutStateLabel(s));
   return neutralBadge(rolloutStateLabel(s));
 }
 
@@ -111,12 +112,43 @@ export function skipLabel(reason) {
   return has(`rm.skip.${reason}`) ? t(`rm.skip.${reason}`) : reason;
 }
 
+/** 批次的名稱：兩批以上時第一批為「先行批次」、最後一批為「其餘」，中間為「第 N 批」 */
+export function waveName(i, total) {
+  if (total > 1 && i === 0) return t('rm.det.wave0');
+  if (i === total - 1) return t('rm.det.wave1');
+  return t('rm.det.waveN', { n: fmt.num(i + 1) });
+}
+
+/** 排程的摘要（詳情）：開始、結束、每週的時段與時區；沒有排程時 null */
+export function scheduleSummary(s) {
+  if (!s || (!s.starts_at && !s.ends_at && !(s.windows && s.windows.length))) return null;
+  const parts = [];
+  if (s.starts_at) parts.push(t('rm.det.startsAt', { t: fmt.dateTime(s.starts_at, { seconds: false }) }));
+  if (s.ends_at) parts.push(t('rm.det.endsAt', { t: fmt.dateTime(s.ends_at, { seconds: false }) }));
+  if (s.windows && s.windows.length) {
+    const list = s.windows
+      .map((w) => {
+        const days = w.days && w.days.length && w.days.length < 7 ? w.days.map((d) => t(`rm.day.${d}`)).join('、') : t('rm.day.every');
+        return t('rm.det.window', { days, start: w.start, end: w.end });
+      })
+      .join('；');
+    parts.push(t('rm.det.windows', { list, tz: s.timezone || '+08:00' }));
+  }
+  return parts.join(' · ');
+}
+
 /** 推送清單的「下一步」（next_action 的固定代碼＋參數） */
 export function nextActionText(na) {
   if (!na || !na.code) return '—';
   switch (na.code) {
     case 'soaking':
       return t('rm.next.soaking', { m: fmt.num(na.minutes ?? 0) });
+    case 'pending_approval':
+      return t('rm.next.pending_approval');
+    case 'scheduled':
+      return na.starts_at ? t('rm.next.scheduled', { t: fmt.dateTime(na.starts_at, { seconds: false }) }) : t('rm.next.scheduledNoTime');
+    case 'waiting_window':
+      return na.until ? t('rm.next.waiting_window', { t: fmt.dateTime(na.until, { seconds: false }) }) : t('rm.next.waiting_windowNone');
     case 'paused':
       return na.reason ? t('rm.next.paused', { reason: na.reason }) : t('rm.next.pausedNoReason');
     default:

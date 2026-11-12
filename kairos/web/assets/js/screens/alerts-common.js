@@ -91,6 +91,7 @@ export function timelineText(item) {
   if (item.action === 'resolved' && d.root_cause) extra.push(t('alerts.tl.rootCause', { c: rootCauseLabel(d.root_cause) }));
   if (item.action === 'notified' && Array.isArray(d.channels) && d.channels.length) extra.push(d.channels.join('、'));
   if (item.action === 'escalated' && d.severity) extra.push(severityLabel(d.severity));
+  if (item.action === 'upgrade_suppressed' && d.rollout_id) extra.push(t('alerts.tl.rollout', { id: d.rollout_id }));
   if (extra.length) text = `${text}（${extra.join('，')}）`;
   return text;
 }

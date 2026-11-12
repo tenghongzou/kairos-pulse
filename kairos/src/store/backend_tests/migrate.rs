@@ -7,6 +7,7 @@ use super::TestDb;
 use super::domain2::seed_hosts;
 use super::report::{A, noon};
 use crate::audit::Audit;
+use crate::remote::store::{ArtifactRow, NewRolloutHost, ReleaseRow, RolloutRow};
 use crate::store::migrate::{self, Options, TableResult};
 use crate::store::postgres::conn::Value;
 use crate::store::postgres::pool::Access;
@@ -14,7 +15,7 @@ use crate::store::postgres::{self, SchemaState, schema};
 use crate::users::store::NewUser;
 
 /// 來源資料庫：report（durable 與非 durable、`agent_ts` 兩種型別）、彙總、資產、使用者、稽核鏈（含 HMAC）、
-/// 設定、PKI、告警規則
+/// 設定、PKI、告警規則、遠端管理（外部 URL 的版本、已登記的發佈檔、帶 schema v11 雙人覆核欄位的推送）
 fn seed(db: &TestDb) -> std::sync::Arc<crate::audit::AuditKey> {
     seed_hosts(db);
     let key = crate::audit::ensure_key(&db.dir).unwrap();
@@ -87,8 +88,93 @@ fn seed(db: &TestDb) -> std::sync::Arc<crate::audit::AuditKey> {
     })
     .unwrap();
     s.ensure_builtin_rules(1).unwrap();
+    // 遠端管理（0.10.0）：外部 URL 的版本與已登記而未存入的發佈檔、待核准後被退回再核准的推送
+    let release = s
+        .insert_release(&ReleaseRow {
+            id: 0,
+            version: "0.10.1".into(),
+            commit: "abc1234".into(),
+            source: "external".into(),
+            base_url: Some("https://mirror.example/pulse/0.10.1/".into()),
+            sha256sums: "sums".into(),
+            signature: "sig".into(),
+            signer_fingerprint: None,
+            signer_principal: None,
+            manifest_name: None,
+            manifest: None,
+            imported_at: 10,
+            imported_by: "cli:root".into(),
+        })
+        .unwrap();
+    s.upsert_artifact(&ArtifactRow {
+        release_id: release,
+        filename: "pulse_0.10.1_amd64.deb".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        format: "deb".into(),
+        sha256: "ee".into(),
+        size: 4321,
+        stored: false,
+        stored_at: None,
+    })
+    .unwrap();
+    let mut rollout = RolloutRow {
+        id: ROLLOUT.into(),
+        name: "週末升級".into(),
+        release_id: release,
+        target_version: "0.10.1".into(),
+        selector: "{\"all\":true}".into(),
+        waves: "[]".into(),
+        schedule: "{\"starts_at\":1790000900000}".into(),
+        options: "{}".into(),
+        state: "draft".into(),
+        current_wave: 0,
+        wave_started_at: None,
+        soak_until: None,
+        awaiting_continue: false,
+        pause_reason: None,
+        pause_cause: None,
+        cancel_reason: None,
+        created_at: 20,
+        created_by: "user:Ann".into(),
+        started_at: None,
+        completed_at: None,
+        updated_at: 20,
+        submitted_at: None,
+        submitted_by: None,
+        approved_at: None,
+        approved_by: None,
+        reject_reason: None,
+    };
+    s.insert_rollout(&rollout).unwrap();
+    rollout.state = "scheduled".into();
+    rollout.submitted_at = Some(21);
+    rollout.submitted_by = Some("user:Ann".into());
+    rollout.approved_at = Some(22);
+    rollout.approved_by = Some("user:Bob".into());
+    rollout.reject_reason = Some("先前被退回：時段不對".into());
+    rollout.updated_at = 22;
+    s.update_rollout_state(&rollout).unwrap();
+    let host = s.host_id_of(A).unwrap().unwrap();
+    s.insert_rollout_hosts(
+        ROLLOUT,
+        &[NewRolloutHost {
+            host_id: host,
+            upgrade_id: "up-1".into(),
+            wave: 0,
+            ordinal: 0,
+            state: "pending".into(),
+            reason: None,
+            from_version: Some("0.9.0".into()),
+        }],
+        21,
+    )
+    .unwrap();
     key
 }
+
+/// [`seed`] 建立的推送
+const ROLLOUT: &str = "r-20261101-0001";
 
 fn dump(db: &TestDb, table: &str) -> Vec<Vec<Value>> {
     let mut rows = db.rows(&format!("SELECT * FROM {table}"));
@@ -166,6 +252,67 @@ fn sqlite_to_postgres_and_back_is_lossless() {
         pg.int("SELECT count(*) FROM reports WHERE agent_ts_text IS NOT NULL"),
         1
     );
+    // schema v11 的欄位（rollouts 的雙人覆核）與外部 URL 的版本一併搬移
+    let moved = s.get_rollout(ROLLOUT).unwrap().unwrap();
+    assert_eq!(
+        (
+            moved.state.as_str(),
+            moved.submitted_at,
+            moved.submitted_by.as_deref(),
+            moved.approved_at,
+            moved.approved_by.as_deref(),
+            moved.reject_reason.as_deref()
+        ),
+        (
+            "scheduled",
+            Some(21),
+            Some("user:Ann"),
+            Some(22),
+            Some("user:Bob"),
+            Some("先前被退回：時段不對")
+        )
+    );
+    assert_eq!(moved, src.handle().get_rollout(ROLLOUT).unwrap().unwrap());
+    assert_eq!(s.rollout_hosts(ROLLOUT).unwrap().len(), 1);
+    let release = s.get_release("0.10.1").unwrap().unwrap();
+    assert_eq!(
+        (release.source.as_str(), release.base_url.as_deref()),
+        ("external", Some("https://mirror.example/pulse/0.10.1/"))
+    );
+    let artifacts = s.release_artifacts(release.id).unwrap();
+    assert_eq!(
+        artifacts
+            .iter()
+            .map(|a| (a.size, a.stored))
+            .collect::<Vec<_>>(),
+        [(4321, false)]
+    );
+    // 兩個後端的 rollouts 欄位一致（搬移時逐欄對應，缺一個就會拒絕）
+    let pg_columns: Vec<String> = pg
+        .rows(
+            "SELECT column_name::text FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'rollouts'
+             ORDER BY column_name",
+        )
+        .into_iter()
+        .filter_map(|r| match r.into_iter().next() {
+            Some(Value::Text(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let mut lite_columns: Vec<String> = src
+        .rows("SELECT name FROM pragma_table_info('rollouts')")
+        .into_iter()
+        .filter_map(|r| match r.into_iter().next() {
+            Some(Value::Text(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    lite_columns.sort();
+    assert_eq!(pg_columns, lite_columns);
+    for c in ["submitted_at", "submitted_by", "reject_reason"] {
+        assert!(pg_columns.iter().any(|x| x == c), "{c}");
+    }
     drop(s);
     // 目的端非空：拒絕，不做合併
     let e = migrate::sqlite_to_postgres(

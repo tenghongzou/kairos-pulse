@@ -107,11 +107,13 @@ pub enum Permission {
     RolloutsWrite,
     /// 暫停推送（緊急煞車：維運者也能停，不能啟動）
     RolloutsPause,
+    /// 雙人覆核時核准、退回推送（0.10.0；只有管理員，不能核准自己建立或送出的推送，REMOTE.md 第 5.4 節）
+    RolloutsApprove,
 }
 
 impl Permission {
     /// 所有權限（新增變體時同步加入；測試會檢查沒有遺漏與名稱不重複）
-    pub const ALL: [Permission; 45] = [
+    pub const ALL: [Permission; 46] = [
         Permission::HostsRead,
         Permission::HealthRead,
         Permission::EnrollRead,
@@ -157,6 +159,7 @@ impl Permission {
         Permission::RolloutsRead,
         Permission::RolloutsWrite,
         Permission::RolloutsPause,
+        Permission::RolloutsApprove,
     ];
 
     /// 對外的名稱（穩定；`<資源>:<動作>`）
@@ -207,6 +210,7 @@ impl Permission {
             Permission::RolloutsRead => "rollouts:read",
             Permission::RolloutsWrite => "rollouts:write",
             Permission::RolloutsPause => "rollouts:pause",
+            Permission::RolloutsApprove => "rollouts:approve",
         }
     }
 
@@ -743,6 +747,7 @@ mod tests {
                         | AlertRulesAdmin
                         | ChannelsTest
                         | RolloutsPause
+                        | RolloutsApprove
                 );
             if write {
                 assert!(!aud.contains(p), "稽核員不應有 {p:?}");
@@ -813,6 +818,7 @@ mod tests {
             (RolloutsRead, true, true, true, false),
             (RolloutsWrite, true, false, false, false),
             (RolloutsPause, true, true, false, false),
+            (RolloutsApprove, true, false, false, false),
         ];
         for (p, admin, op, aud, view) in matrix {
             assert_eq!(Role::Admin.permissions().contains(p), admin, "admin {p:?}");

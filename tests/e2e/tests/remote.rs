@@ -5,7 +5,8 @@
 //! 建立並送出推送；Pulse 端以 [`RawClient`] 模擬 0.9.0 的 Pulse（升級流程需要 root 與 systemd，實際的 Pulse
 //! 無法在這裡替換自己；實際兩端的集中設定互通見 `remote_interop.rs`）：協商 `config`、
 //! `upgrade`，依 `pending` 取得設定、提議並經 8443 分段下載，回報升級的各個狀態，替換後以新版本重新連線
-//! 回報成功，推送完成。
+//! 回報成功，推送完成。主機離線規則的寬限設為 0 秒：`applying` 之後斷線的期間沒有離線事件（升級中的離線告警
+//! 抑制，REMOTE.md 第 4.7.5 節），升級結束後同一台主機離線則照常開事件。
 
 use kp_e2e::{
     GOOD, KAIROS_STARTED, Kairos, RawClient, TestDir, WAIT, api_request, poll_until, run_to_exit,
@@ -104,6 +105,30 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         )
     };
 
+    // 主機離線規則的寬限改為 0 秒：升級重啟期間的離線告警抑制（REMOTE.md 第 4.7.5 節）才看得出來
+    let (s, v) = api_request(
+        port,
+        "PUT",
+        "/api/v1/alert-rules/sys.host_offline",
+        &token,
+        Some((
+            "application/json",
+            json!({"params": {"grace_secs": 0}}).to_string().as_bytes(),
+        )),
+    );
+    assert_eq!(s, 200, "{v}");
+    let offline_events = || -> Vec<Value> {
+        let (s, v) = api_request(port, "GET", "/api/v1/alerts?limit=200", &token, None);
+        assert_eq!(s, 200, "{v}");
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["rule_id"] == "sys.host_offline" && e["agent_id"] == GOOD.agent_id)
+            .cloned()
+            .collect()
+    };
+
     // 模擬的 Pulse 0.9.0：協商 config、upgrade
     let mut c = RawClient::connect(kairos.port, GOOD);
     c.send(&hello("0.9.0"));
@@ -188,10 +213,82 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
     );
     assert_eq!(s, 200, "{v}");
 
-    // 推送：預覽 → 建立 → 送出（L2）
-    let spec = json!({"name": "0.9.1", "target_version": "0.9.1", "selector": {"agent_ids": [GOOD.agent_id]}, "waves": [{"size": "rest"}]});
+    // 維護時段（0.10）：現在在時段外的推送不提議任何主機（下一步為 waiting_window），取消後再建正式的推送
+    let now = time::OffsetDateTime::now_utc();
+    let hhmm = |t: time::OffsetDateTime| format!("{:02}:{:02}", t.hour(), t.minute());
+    let rfc3339 = |t: time::OffsetDateTime| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            t.year(),
+            u8::from(t.month()),
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second()
+        )
+    };
+    let closed = json!({
+        "name": "時段外", "target_version": "0.9.1", "selector": {"agent_ids": [GOOD.agent_id]},
+        "waves": [{"size": "rest"}],
+        "schedule": {"windows": [{"start": hhmm(now + time::Duration::hours(2)), "end": hhmm(now + time::Duration::hours(3))}], "timezone": "UTC"}
+    });
+    let (s, v) = post("/api/v1/rollouts/preview", closed.clone());
+    assert_eq!(
+        (s, v["data"]["window"]["open"].as_bool()),
+        (200, Some(false)),
+        "{v}"
+    );
+    let (s, v) = post("/api/v1/rollouts", closed);
+    assert_eq!(s, 201, "{v}");
+    let closed_id = v["data"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post(
+        &format!("/api/v1/rollouts/{closed_id}/submit"),
+        json!({"confirm": "升級 1 台"}),
+    );
+    assert_eq!(
+        (s, v["data"]["state"].as_str()),
+        (200, Some("running")),
+        "{v}"
+    );
+    assert_eq!(v["data"]["next_action"]["code"], "waiting_window", "{v}");
+    // 推送引擎每 5 秒一輪：兩輪之後仍然沒有提議
+    std::thread::sleep(Duration::from_secs(11));
+    seq += 1;
+    c.send(&json!({"type": "heartbeat", "seq": seq, "ts": TS}));
+    let ack = c.recv();
+    assert!(
+        ack["pending"].get("upgrade_id").is_none(),
+        "時段外不應該提議：{ack}"
+    );
+    let (_, v) = api_request(
+        port,
+        "GET",
+        &format!("/api/v1/rollouts/{closed_id}/hosts"),
+        &token,
+        None,
+    );
+    assert_eq!(v["data"][0]["state"], "pending", "{v}");
+    let (s, v) = post(
+        &format!("/api/v1/rollouts/{closed_id}/cancel"),
+        json!({"reason": "e2e：時段外的推送"}),
+    );
+    assert_eq!(s, 200, "{v}");
+
+    // 推送：預覽 → 建立 → 送出（L2）。排程（0.10）：6 秒後開始（送出後為 scheduled，到時由推送引擎開始），
+    // 維護時段涵蓋現在（跨午夜也可以），提議的 apply_window 到時段結束為止
+    let window_end = now + time::Duration::hours(3);
+    let spec = json!({
+        "name": "0.9.1", "target_version": "0.9.1", "selector": {"agent_ids": [GOOD.agent_id]},
+        "waves": [{"size": "rest"}],
+        "schedule": {
+            "starts_at": rfc3339(time::OffsetDateTime::now_utc() + time::Duration::seconds(6)),
+            "windows": [{"start": hhmm(now - time::Duration::hours(1)), "end": hhmm(window_end)}],
+            "timezone": "UTC"
+        }
+    });
     let (s, v) = post("/api/v1/rollouts/preview", spec.clone());
     assert_eq!((s, v["data"]["eligible"].as_i64()), (200, Some(1)), "{v}");
+    assert_eq!(v["data"]["window"]["open"], true, "{v}");
     let (s, v) = post("/api/v1/rollouts", spec);
     assert_eq!(s, 201, "{v}");
     let id = v["data"]["id"].as_str().unwrap().to_string();
@@ -200,8 +297,17 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         json!({"confirm": "升級 1 台"}),
     );
     assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["state"], "scheduled", "{v}");
+    assert_eq!(v["data"]["next_action"]["code"], "scheduled", "{v}");
+    seq += 1;
+    c.send(&json!({"type": "heartbeat", "seq": seq, "ts": TS}));
+    let ack = c.recv();
+    assert!(
+        ack["pending"].get("upgrade_id").is_none(),
+        "starts_at 之前不應該提議：{ack}"
+    );
 
-    // 下一次心跳帶出 upgrade_id
+    // starts_at 之後的心跳帶出 upgrade_id
     let ack = heartbeat_until(&mut c, &mut seq, |p| p["upgrade_id"].is_string());
     let upgrade_id = ack["pending"]["upgrade_id"].as_str().unwrap().to_string();
     seq += 1;
@@ -213,6 +319,14 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         offer["target"],
         json!({"version": "0.9.1", "commit": "5e6f7a8"})
     );
+    // apply_window 到維護時段結束為止（不是提議後 24 小時）
+    let not_after = offer["apply_window"]["not_after"].as_str().unwrap();
+    assert!(
+        not_after.contains(&format!("T{}:00", hhmm(window_end))),
+        "{offer}"
+    );
+    let (_, v) = api_request(port, "GET", &format!("/api/v1/rollouts/{id}"), &token, None);
+    assert_eq!(v["data"]["state"], "running", "{v}");
     let parsed: kairos_proto::mgmt::UpgradeOffer = serde_json::from_value(offer.clone()).unwrap();
     // Pulse 端以本機信任錨驗證（測試向量的金鑰）
     let trust = kairos_proto::release::AllowedSigners::parse(&text("allowed_signers"));
@@ -269,6 +383,15 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
     }
     c.close();
 
+    // 替換、重新啟動期間主機離線：告警引擎（每 5 秒一輪）不開離線事件（寬限 0 秒也一樣）
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        offline_events().is_empty(),
+        "升級中的主機不應該有離線事件：{:?}\n{}",
+        offline_events(),
+        k.dump()
+    );
+
     // 替換後的新版重新連線：回報成功，推送完成
     let mut c = RawClient::connect(kairos.port, GOOD);
     c.send(&hello("0.9.1"));
@@ -300,7 +423,26 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         None,
     );
     assert_eq!(v["data"]["upgrades"][0]["to_version"], "0.9.1", "{v}");
+    assert!(offline_events().is_empty(), "{:?}", offline_events());
     c.close();
+    // 對照：升級結束後抑制解除，同一台主機離線就照常開事件
+    assert!(
+        poll_until(Duration::from_secs(40), || !offline_events().is_empty()),
+        "升級結束後的離線沒有開事件\n{}",
+        k.dump()
+    );
+    let ev = offline_events().remove(0);
+    let (_, v) = api_request(
+        port,
+        "GET",
+        &format!("/api/v1/alerts/{}", ev["event_id"].as_str().unwrap()),
+        &token,
+        None,
+    );
+    assert!(
+        v["data"]["details"].get("upgrade").is_none(),
+        "不是升級期間的離線：{v}"
+    );
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());
     assert!(

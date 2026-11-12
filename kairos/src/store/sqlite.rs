@@ -740,15 +740,21 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: remote::SCHEMA_V9,
     },
-    // v10（0.10.0）：叢集協調的資料表（SQL 在 store/sqlite/cluster.rs；獨立的一步，可重新編號）
+    // v10（0.10.0）：叢集協調的資料表（SQL 在 store/sqlite/cluster.rs）
     Migration {
         version: 10,
         sql: cluster::SCHEMA_V10,
     },
+    // v11（0.10.0）：升級推送的雙人覆核（rollouts.submitted_at／submitted_by／reject_reason；
+    // SQL 在 store/sqlite/remote.rs）
+    Migration {
+        version: 11,
+        sql: remote::SCHEMA_V11_ROLLOUT_APPROVAL,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";

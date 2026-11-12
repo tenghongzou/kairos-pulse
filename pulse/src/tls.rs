@@ -375,6 +375,28 @@ fn load_roots(ca_path: &str, use_system_roots: bool) -> Result<RootCertStore, St
     Ok(roots)
 }
 
+/// 外部服務（遠端升級的外部 URL，`upgrade.external_ca`）的信任庫：`ca_path` 不是空字串時**只**信任它
+/// （PEM，可含多張），空字串時為作業系統信任庫
+pub(crate) fn load_roots_for(ca_path: &str, field: &str) -> Result<RootCertStore, String> {
+    let mut roots = RootCertStore::empty();
+    if ca_path.is_empty() {
+        let native = rustls_native_certs::load_native_certs();
+        let (added, _) = roots.add_parsable_certificates(native.certs);
+        if added == 0 {
+            return Err(format!(
+                "作業系統信任庫沒有任何可用的憑證；請以 {field} 指定 CA（PEM）"
+            ));
+        }
+        return Ok(roots);
+    }
+    for cert in load_certs(ca_path, field, "CA 憑證")? {
+        roots
+            .add(cert)
+            .map_err(|e| format!("{field}「{ca_path}」中的憑證無法作為信任錨：{e}"))?;
+    }
+    Ok(roots)
+}
+
 /// 讀取 PEM 檔中的所有憑證；一張都沒有時回傳錯誤。
 fn load_certs(path: &str, field: &str, item: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let certs = CertificateDer::pem_file_iter(path)

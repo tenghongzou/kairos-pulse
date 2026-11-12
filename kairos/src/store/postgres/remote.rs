@@ -1,14 +1,18 @@
 //! [`crate::remote::store`] 的 PostgreSQL 實作（[`RemoteStore`]）。逐函式對照 `store/sqlite/remote.rs`；
 //! 資料表（schema v9：`config_profiles`、`config_assignments`、`host_config`、`releases`、
-//! `release_artifacts`、`rollouts`、`rollout_hosts`）定義在 `store/postgres/schema.rs`。
+//! `release_artifacts`、`rollouts`、`rollout_hosts`；v11：`rollouts` 的雙人覆核欄位）定義在
+//! `store/postgres/schema.rs`。
+//!
+//! 叢集模式的 fencing 只辨識以 `INSERT`／`UPDATE`／`DELETE` 開頭的自動提交寫入：這裡的寫入敘述不要以
+//! `WITH …` 開頭。
 // 方法參數與資料表欄位對應
 #![allow(clippy::too_many_arguments)]
 
 use super::conn::{OptionalExtension, PgConn, PgResult, Row, params, pg_domain};
 use crate::remote::store::{
-    ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate, HostConfigRow,
-    HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow, RemoteStore,
-    RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
+    ApplyingHost, ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate,
+    HostConfigRow, HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow,
+    RemoteStore, RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
 };
 
 /// `meta` 的鍵：全域單調遞增的設定版本（REMOTE.md 第 3.4.4 節）
@@ -56,7 +60,9 @@ pg_domain! { RemoteStore {
     fn count_rollouts_with_prefix(&self, prefix: &str) -> i64 => count_rollouts_with_prefix;
     fn insert_rollout(&self, r: &RolloutRow) -> () => insert_rollout;
     fn update_rollout_spec(&self, id: &str, name: &str, release_id: i64, selector: &str, waves: &str, options: &str, now_ms: i64) -> bool => update_rollout_spec;
+    fn update_rollout_schedule(&self, id: &str, schedule: &str, now_ms: i64) -> bool => update_rollout_schedule;
     fn update_rollout_state(&self, r: &RolloutRow) -> () => update_rollout_state;
+    fn delete_rollout_hosts(&self, rollout_id: &str) -> i64 => delete_rollout_hosts;
     fn delete_old_rollouts(&self, before_ms: i64) -> i64 => delete_old_rollouts;
     fn insert_rollout_hosts(&self, rollout_id: &str, hosts: &[NewRolloutHost], now_ms: i64) -> () => insert_rollout_hosts;
     fn rollout_hosts(&self, rollout_id: &str) -> Vec<RolloutHostRow> => rollout_hosts;
@@ -67,6 +73,7 @@ pg_domain! { RemoteStore {
     fn hosts_in_active_rollouts(&self) -> Vec<(String, String)> => hosts_in_active_rollouts;
     fn active_offers(&self) -> Vec<(String, String)> => active_offers;
     fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
+    fn applying_hosts(&self) -> Vec<ApplyingHost> => applying_hosts;
     fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
 } }
 
@@ -490,7 +497,7 @@ pub fn record_config_status(conn: &PgConn, r: &ConfigReport) -> PgResult<(Option
 // ---- 版本庫 ----
 
 const RELEASE_COLUMNS: &str = "release_id, version, commit_id, source, sha256sums, signature, \
-     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by";
+     signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by,      base_url";
 
 fn release_of(r: &Row) -> PgResult<ReleaseRow> {
     Ok(ReleaseRow {
@@ -506,6 +513,7 @@ fn release_of(r: &Row) -> PgResult<ReleaseRow> {
         manifest: r.get(9)?,
         imported_at: r.get(10)?,
         imported_by: r.get(11)?,
+        base_url: r.get(12)?,
     })
 }
 
@@ -538,8 +546,9 @@ pub fn get_release_by_id(conn: &PgConn, id: i64) -> PgResult<Option<ReleaseRow>>
 pub fn insert_release(conn: &PgConn, r: &ReleaseRow) -> PgResult<i64> {
     conn.query_row(
         "INSERT INTO releases (product, version, commit_id, source, sha256sums, signature,
-            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by)
-         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            signer_fingerprint, signer_principal, manifest_name, manifest, imported_at, imported_by,
+            base_url)
+         VALUES ('pulse', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          RETURNING release_id",
         params![
             r.version,
@@ -552,7 +561,8 @@ pub fn insert_release(conn: &PgConn, r: &ReleaseRow) -> PgResult<i64> {
             r.manifest_name,
             r.manifest,
             r.imported_at,
-            r.imported_by
+            r.imported_by,
+            r.base_url
         ],
         |row| row.get(0),
     )
@@ -668,7 +678,7 @@ pub fn upgrade_host(conn: &PgConn, agent_id: &str) -> PgResult<Option<UpgradeHos
 const ROLLOUT_COLUMNS: &str = "r.rollout_id, r.name, r.release_id, r.target_version, r.selector, r.waves, \
      r.schedule, r.options, r.state, r.current_wave, r.wave_started_at, r.soak_until, \
      r.awaiting_continue, r.pause_reason, r.cancel_reason, r.created_at, r.created_by, r.started_at, \
-     r.completed_at, r.updated_at, r.pause_cause";
+     r.completed_at, r.updated_at, r.pause_cause, r.submitted_at, r.submitted_by, r.approved_at,      r.approved_by, r.reject_reason";
 
 fn rollout_of(r: &Row) -> PgResult<RolloutRow> {
     Ok(RolloutRow {
@@ -693,6 +703,11 @@ fn rollout_of(r: &Row) -> PgResult<RolloutRow> {
         started_at: r.get(17)?,
         completed_at: r.get(18)?,
         updated_at: r.get(19)?,
+        submitted_at: r.get(21)?,
+        submitted_by: r.get(22)?,
+        approved_at: r.get(23)?,
+        approved_by: r.get(24)?,
+        reject_reason: r.get(25)?,
     })
 }
 
@@ -773,12 +788,34 @@ pub fn update_rollout_spec(
     )? > 0)
 }
 
+pub fn update_rollout_schedule(
+    conn: &PgConn,
+    id: &str,
+    schedule: &str,
+    now_ms: i64,
+) -> PgResult<bool> {
+    Ok(conn.execute(
+        "UPDATE rollouts SET schedule = ?2, updated_at = ?3
+         WHERE rollout_id = ?1 AND state = 'draft'",
+        params![id, schedule, now_ms],
+    )? > 0)
+}
+
+pub fn delete_rollout_hosts(conn: &PgConn, rollout_id: &str) -> PgResult<i64> {
+    Ok(conn.execute(
+        "DELETE FROM rollout_hosts WHERE rollout_id = ?1",
+        [rollout_id],
+    )? as i64)
+}
+
 pub fn update_rollout_state(conn: &PgConn, r: &RolloutRow) -> PgResult<()> {
     conn.execute(
         "UPDATE rollouts SET state = ?2, current_wave = ?3, wave_started_at = ?4, soak_until = ?5,
             awaiting_continue = ?6, pause_reason = ?7, cancel_reason = ?8, started_at = ?9,
             pause_cause = ?12,
-            completed_at = ?10, updated_at = ?11
+            completed_at = ?10, updated_at = ?11,
+            submitted_at = ?13, submitted_by = ?14, approved_at = ?15, approved_by = ?16,
+            reject_reason = ?17
          WHERE rollout_id = ?1",
         params![
             r.id,
@@ -792,7 +829,12 @@ pub fn update_rollout_state(conn: &PgConn, r: &RolloutRow) -> PgResult<()> {
             r.started_at,
             r.completed_at,
             r.updated_at,
-            r.pause_cause
+            r.pause_cause,
+            r.submitted_at,
+            r.submitted_by,
+            r.approved_at,
+            r.approved_by,
+            r.reject_reason
         ],
     )?;
     Ok(())
@@ -1013,6 +1055,19 @@ pub fn unacknowledged_rollback_failures(conn: &PgConn) -> PgResult<Vec<RollbackF
         "SELECT h.agent_id, h.hostname, rh.rollout_id, rh.detail FROM rollout_hosts rh
          JOIN hosts h ON h.host_id = rh.host_id
          WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL ORDER BY rh.rollout_id, rh.host_id",
+    )?;
+    let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
+}
+
+/// 替換中（`applying`）的主機，不論推送的狀態（升級中的離線告警抑制用）
+pub fn applying_hosts(conn: &PgConn) -> PgResult<Vec<ApplyingHost>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.agent_id, rh.rollout_id, coalesce(rh.applying_at, rh.updated_at), r.options
+         FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         JOIN rollouts r ON r.rollout_id = rh.rollout_id
+         WHERE rh.state = 'applying' ORDER BY rh.rollout_id, rh.host_id",
     )?;
     let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     rows.collect()

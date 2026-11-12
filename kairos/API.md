@@ -319,6 +319,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 - `status_counts`：套用**狀態以外**的篩選後各狀態的台數（主機清單的狀態 chip，設計包 S04）。
 - `last_event_id`：產生這份列表時最新的 SSE 事件編號（第 6 節）：先開 SSE、再取列表，之後只套用編號較新的事件。
 - `data_as_of`：列表所依據的狀態表快照時間（最多約 1 秒前，第 9 節）。
+- `recommended_min_agent_version`（0.10.0）：建議的最低 Pulse 版本——Pulse 版本庫中**最新版本**的發佈清單的 `min_upgrade_from`（REMOTE.md 第 4.9 節；版本庫是空的、最新版本沒有清單或遠端管理停用時為 `null`）。`data[]` 的每一列另有 `agent_outdated`（布林）：`agent_version` 低於它（SemVer 比較；沒有版本或沒有建議值時 `false`），主控台 S04 的 agent 版本欄據此加 ⚠。只需要 `hosts:read`，不透露版本庫的其他內容；匯入、刪除版本後立即更新，`kairos releases` 的命令列變更最多 30 秒後反映。
 
 ### 5.2 `GET /api/v1/hosts/{agent_id}`
 
@@ -475,7 +476,7 @@ GET /api/v1/hosts/6f1c…/metrics/system.filesystem.available?from=2026-10-01T00
 | `enroll`（0.8；有註冊服務時） | `mode`、`state`、`listening`、`listen_addr`、`not_listening_reason`、`expired_renew_grace_days`、`blocked_sources`、`impact`（`N`、`M`、`L`、`R`、`T`，第 11.4 節） | 嚴重：模式不是關閉卻沒有在監聽（`KRS-E2001`）；警告：關閉且 N＋M＞0（`KRS-W2009`）、僅續簽但寬限期為 0 天（`KRS-W2011`）、僅續簽但仍有有效 token、封鎖中的來源 ≥ 1（`KRS-W3005`）（設計包 S20「註冊端點」） |
 | `alerts`（0.8） | `enabled`；啟用時同 `GET /api/v1/alerts/summary` 的 `engine`（`running`、`last_tick_at`、`warmup`、`last_error`…） | 嚴重：告警引擎沒有在執行（最近 60 秒沒有完成判定）。`alerts.enabled = false` 時為正常（「已停用」） |
 | `metrics`（0.8） | `on_console`、`token`（是否設定 `observability.metrics_token_file`）、`listen`、`proxied_rejected`（這次啟動後曾拒絕經反向代理轉送的請求，`KRS-W0304`） | —（摘要為設計包 S20「/metrics 端點」列的寫法） |
-| `remote`（0.9；第 17 節） | `available`（`false`：不是 SQLite 儲存）、`config_enabled`、`upgrade_enabled`、`allowed_signers_configured`；遠端升級啟用時另有 `rollouts_running`、`rollouts_paused`、`rollouts_auto_paused`、`paused[]`（前 10 個：`id`、`name`、`reason`、`cause`＝第 17.3 節的 `pause_cause`）、`releases`（版本庫的版本數）、`rollback_failed_unacknowledged`、`downloads_in_progress`、`max_concurrent_downloads` | 嚴重：有回滾失敗且尚未標記為已處理的主機（`KRS-E8408`）；警告：有自動暫停的推送（`KRS-W8414`；主控台暫停的不算）、遠端升級啟用且版本庫有發佈版本但沒有設定 `[remote] allowed_signers`（匯入時無法驗證簽章；版本庫是空的時只在摘要註明）。兩者都停用時為正常（「已停用」）（設計包 S20「遠端管理」列） |
+| `remote`（0.9；第 17 節） | `available`（`false`：不是 SQLite 儲存）、`config_enabled`、`upgrade_enabled`、`allowed_signers_configured`；遠端升級啟用時另有 `rollouts_running`、`rollouts_paused`、`rollouts_auto_paused`、`paused[]`（前 10 個：`id`、`name`、`reason`、`cause`＝第 17.3 節的 `pause_cause`）、`releases`（版本庫的版本數）、`release_files_missing`、`missing_files[]`（0.10.0；前 20 個：`version`、`filename`、`problem`＝`missing`／`size_mismatch`、`rollback_target_for`）、`rollback_failed_unacknowledged`、`downloads_in_progress`、`max_concurrent_downloads` | 嚴重：有回滾失敗且尚未標記為已處理的主機（`KRS-E8408`）；警告：有自動暫停的推送（`KRS-W8414`；主控台暫停的不算）、**版本庫的檔案遺失**（0.10.0，`KRS-W8417`〔暫定〕：已存入的發佈檔不存在或大小與記錄不符，例如還原備份之後；只 `stat`，重新匯入即可）、遠端升級啟用且版本庫有發佈版本但沒有設定 `[remote] allowed_signers`（匯入時無法驗證簽章；版本庫是空的時只在摘要註明）。兩者都停用時為正常（「已停用」）（設計包 S20「遠端管理」列） |
 | `cluster`（0.10.0〔草稿〕；**只在叢集模式** `cluster.enabled = true` 時出現） | 同 `GET /api/v1/cluster` 的 `data`（第 5.11 節）：`enabled`、`mode`、`cluster_id`、`node_id`、`leader`、`last_leader`、`nodes[]`、`database`。摘要為「leader kairos-a（epoch 3）；2 個節點在執行」加上各個問題 | 嚴重：沒有任何節點持有 leader 租約（`KRS-E8503`）、有節點的金鑰與叢集不一致或缺少、或還沒有執行 `kairos cluster init`（`KRS-E8504`）。警告：有節點失聯（`KRS-W8506`）、有節點需要一致的設定與 leader 不同（`KRS-W8505`）、只有一個節點在執行（沒有備援）、資料庫沒有同步複寫（`KRS-W4403`）、這個節點與資料庫的時差超過 2 秒（`KRS-W8305`）、無法讀取叢集的狀態。`product_code` 取最嚴重的那一個問題的代碼 |
 
 **細節依權限省略**（0.8，設計包 INTEGRATION §29.6）：整體狀態與每一項的 `status`、`product_code` 對所有有 `health:read` 的身分都相同；`issuing_ca`（需 `pki:read`）、`enroll`（`enroll:read`）、`alerts`（`alerts:read`）、`metrics`（`settings:read`）、`remote`（`rollouts:read`，0.9）、`cluster`（`settings:read`，0.10）的 `summary` 與 `values` 只給有對應權限的身分，其他身分收到 `"restricted": true`、`summary` 為空字串、`values` 為 `null`。`GET /api/v1/overview` 的 `health` 同樣省略（另帶 `restricted`）。主控台側邊導覽「系統健康」的計數泡泡＝狀態為警告或嚴重的項目數（設計包 `ia.md` §7）。
@@ -1041,6 +1042,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `rollouts:read` | ✓ | ✓ | ✓ | | 升級推送與每台主機的升級狀態（第 17.3 節） |
 | `rollouts:write` | ✓ | | | | 建立、修改草稿、送出、繼續、取消推送，重試主機（REMOTE.md D8） |
 | `rollouts:pause` | ✓ | ✓ | | | 暫停推送（緊急煞車：維運者也能停，不能啟動） |
+| `rollouts:approve` | ✓ | | | | 雙人覆核時核准、退回推送（0.10.0；需要以帳號登入的工作階段，不能核准自己建立或送出的推送；第 17.3 節） |
 
 個人設定（`/api/v1/me/…`：自己的工作階段、密碼、TOTP）不需要權限，只需要以帳號登入的工作階段。
 
@@ -1158,7 +1160,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `enroll`、`pki`、`host` | 註冊申請、核准、拒絕、撤回、簽發、撤銷、CA、CRL、除役（0.5 起） |
 | `config` | `config.profile.create`／`update`（變更前後的鍵與值）／`delete`／`revert`、`config.assign`、`config.unassign`、`config.assign_expired`（`system`）（0.9.0，第 17.1 節） |
 | `release` | `release.import`（版本、檔案、簽署金鑰指紋；上傳發佈檔也記一筆）、`release.import_failed`（`KRS-E8413`）、`release.delete`（0.9.0，第 17.2 節） |
-| `rollout` | `rollout.create`、`update`（含重試主機）、`submit`、`start`、`pause`、`auto_pause`（`system`，`KRS-W8414`）、`resume`（含繼續下一批）、`cancel`、`complete`（`system`，各狀態的台數）（0.9.0，第 17.3 節；`approve`／`reject` 在 0.10） |
+| `rollout` | `rollout.create`、`update`（含重試主機）、`submit`、`start`、`pause`、`auto_pause`（`system`，`KRS-W8414`）、`resume`（含繼續下一批）、`cancel`、`complete`（`system`，各狀態的台數）（0.9.0，第 17.3 節）；0.10.0：`approve`、`reject`（雙人覆核） |
 | `host`（遠端升級） | `host.upgrade.signature_failed`（`KRS-E8401`）、`host.upgrade.rolled_back`（`KRS-W8407`）、`host.upgrade.rollback_failed`（`KRS-E8408`）、`host.upgrade.acknowledge`（執行者 `system` 或標記的使用者；一般的升級結果不逐台記錄，REMOTE.md D17） |
 | `access` | `access.denied`：被拒絕（403）的寫入請求（方法、路徑、所需的權限） |
 | `audit` | `audit.query`（第一頁）、`audit.export`、`audit.verify`：稽核員與管理員自己的查詢與匯出也記錄 |
@@ -1330,7 +1332,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 `GET /api/v1/alerts/summary`：`counts`、`silences`（`active` 個數、`hosts` 以主機為範圍的靜音涵蓋的台數，S06「目前有 2 個靜音規則生效，影響 301 台主機」）、`engine`。
 
-`GET /api/v1/alerts/{event_id}`：另有 `timeline`（處理紀錄：`fired`、`notified`、`acknowledged`、`assigned`、`snoozed`、`commented`、`recovered`、`reopened`、`escalated`、`absorbed`、`detached`、`flapping`、`stable`、`eta_expired`、`resolved`）、`children`（`total`、最多 100 筆）、`parent`（`banner`：「此事件由系統事件『…』造成，請先處理該事件」）、`deliveries`（通知發送狀態：管道、種類、`state`〔`pending`／`held`／`sent`／`failed`／`dropped`／`merged`〕、`attempts`、`response_code`、`error_code`、`error`）、`rule`、`actions`（目前可做的動作）、`link`。
+`GET /api/v1/alerts/{event_id}`：另有 `timeline`（處理紀錄：`fired`、`notified`、`acknowledged`、`assigned`、`snoozed`、`commented`、`recovered`、`reopened`、`escalated`、`absorbed`、`detached`、`flapping`、`stable`、`eta_expired`、`resolved`；0.10 另有 `upgrade_suppressed`：這台主機在升級推送的替換期間離線、離線告警抑制到期限後仍未恢復，`details` 為 `rollout_id`、`until`，事件的 `details.upgrade` 另有 `rollout_id`、`suppressed_until`，ALERTS.md 第 5.5 節）、`children`（`total`、最多 100 筆）、`parent`（`banner`：「此事件由系統事件『…』造成，請先處理該事件」）、`deliveries`（通知發送狀態：管道、種類、`state`〔`pending`／`held`／`sent`／`failed`／`dropped`／`merged`〕、`attempts`、`response_code`、`error_code`、`error`）、`rule`、`actions`（目前可做的動作）、`link`。
 
 | 方法與路徑 | 本文 | 說明 |
 |---|---|---|
@@ -1469,7 +1471,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 商業審計 F8（MVP，REMOTE.md 第 14 節 D15）；規格見 [`crates/kairos-proto/REMOTE.md`](../crates/kairos-proto/REMOTE.md) 第 3、4、8 節，8443 的協定見 PROTOCOL.md「遠端管理」，實作附註見 REMOTE.md 第 13.1 節。實作在 `kairos/src/remote/`（服務、合併與版本、版本庫、推送引擎）與 `kairos/src/api/remote.rs`（端點）。
 
 - **可用的條件**：SQLite 儲存（JSONL 時沒有這些端點，回 503 `remote_unavailable`）。集中設定的端點需要 `[remote] config_enabled = true`，版本庫與推送的端點需要 `upgrade_enabled = true`（預設都啟用），否則 503 `remote_unavailable`（主控台 S24～S26 顯示整頁 `EmptyState`）。Kairos 只在 **mTLS** 的連線上與 0.9.0 以上、也宣告了 feature 的 Pulse 協商 `config`／`upgrade`。
-- **權限**（第 12.1 節）：`config:read`／`config:write`（維運者可寫，D9）、`releases:read`／`releases:write`（匯入、刪除只限管理員）、`rollouts:read`／`rollouts:write`（建立與執行只限管理員，D8）、`rollouts:pause`（維運者也能暫停）。全部只由全站範圍的角色授予，0.4／0.5 的舊範圍 token 沒有。`rollouts:approve`（雙人覆核）在 0.10。
+- **權限**（第 12.1 節）：`config:read`／`config:write`（維運者可寫，D9）、`releases:read`／`releases:write`（匯入、刪除只限管理員）、`rollouts:read`／`rollouts:write`（建立與執行只限管理員，D8）、`rollouts:pause`（維運者也能暫停）。全部只由全站範圍的角色授予，0.4／0.5 的舊範圍 token 沒有。`rollouts:approve`（0.10.0，雙人覆核：核准、退回；只有管理員）。
 - **寫入**：JSON 本文上限 1 MiB（發佈檔上傳另計）；工作階段的寫入需要 `X-CSRF-Token`；每個寫入都寫稽核（第 12.8 節的 `config`、`release`、`rollout`、`host` 類別），與變更在同一個交易中。
 - **時間**：`expires_at` 等輸入為 RFC 3339；輸出一律 UTC 毫秒（第 1 節）。
 
@@ -1478,7 +1480,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/config/schema` | `config:read` | 白名單（REMOTE.md 第 3.1 節，`kairos_proto::mgmt::settings::SETTINGS`）：每個鍵的 `key`、`section`、`name`、`value`（`{"type":"integer","min","max"}`／`boolean`／`{"type":"enum","values"}`／`{"type":"string_list","max_items","max_item_bytes"}`）、`apply`（`live`／`reconnect`）、`min_pulse`、`privacy_restrict_only`、`privacy`（`ordered` 的保守順序、`false_is_conservative`）、`merge`（`local_wins`／`union`）、`local_only_values`；另有 `selectors`（種類與預設優先序）與 `limits`。內建預設值由 Pulse 提供（`pulse/config.toml`），這裡不重複 |
-| `GET /api/v1/config/profiles` | `config:read` | `data[]`：`id`、`name`、`description`、`settings`、`keys`（鍵數）、`revision`、`assignments`（指派數）、`hosts`（比對到的主機數，未到期的指派）、`created_*`、`updated_at`、`updated_by` |
+| `GET /api/v1/config/profiles` | `config:read` | 選用的 `q`（0.10.0，全域搜尋：名稱或說明的子字串，不分大小寫，最多 128 個字元）。`data[]`：`id`、`name`、`description`、`settings`、`keys`（鍵數）、`revision`、`assignments`（指派數）、`hosts`（比對到的主機數，未到期的指派）、`created_*`、`updated_at`、`updated_by` |
 | `POST /api/v1/config/profiles` | `config:write` | `name`（1～128 字元，不分大小寫唯一，重複 409 `profile_exists`）、`description`（≤ 1000）、`settings`（兩層物件，只能有白名單的鍵；空的區段不保存）、`reason`（選填）。不合法 400 `config_invalid`（`KRS-E0502`，`details.key`、`details.reason`：`unknown_key`／`type_mismatch`／`out_of_range`／`invalid_value`／`conflict`，`details.errors[]`）。回 201 與設定檔。稽核 `config.profile.create` |
 | `GET /api/v1/config/profiles/{id}` | `config:read` | 同清單的欄位，另有 `assignment_list[]`（第 17.1 節的指派欄位）；沒有時 404 `profile_not_found` |
 | `PUT /api/v1/config/profiles/{id}` | `config:write` | `name`、`description`、`settings`（省略的不變）、`reason`、`impact_token`。新增一版（`config_profile_revisions`）；相同優先序的指派因此設定了相同的鍵且比對到同一台主機時 409 `assignment_conflict`（`details.keys`、`hosts`、`assignments`）；期望設定改變的主機達 1,000 台以上時需要 `impact_token`（第 17.1.1 節）。稽核 `config.profile.update`（`details.changes` 為每個改變的鍵的 `before`／`after`） |
@@ -1504,13 +1506,21 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
-| `GET /api/v1/releases` | `releases:read` | `data[]`：`version`、`commit`、`source`（0.9 只有 `hosted`）、`signer_fingerprint`、`signer_principal`、`verified`（匯入時以 `[remote] allowed_signers` 驗證過）、`manifest`（`filename`、`released_at`、`min_kairos`、`min_upgrade_from`、`remote_features`、`breaking`、`kairos_compatible`；0.9.0 以前的發佈為 `null`）、`artifacts[]`（`filename`、`os`、`arch`、`format`、`sha256`、`size`、`stored`、`stored_at`）、`hosts_on_version`、`rollback_target_for`（deb／rpm、目前執行這個版本、且版本庫有同格式同平台檔案的主機數）、`in_use_by_rollouts`、`imported_at`、`imported_by`。`meta`：`allowed_signers_configured`（`false` 時主控台警告「匯入時不驗證簽署者」）、`downloads_in_progress`、`max_concurrent_downloads` |
-| `POST /api/v1/releases` | `releases:write` | `sha256sums`（`SHA256SUMS` 全文）、`signature`（`SHA256SUMS.sig` 全文）、`manifest`（`pulse-<版本>-<commit>-release.json` 的**完整內容，含結尾換行**：雜湊必須與 `SHA256SUMS` 相符；0.9.0 以前的發佈可省略）。`source` 只接受 `hosted`（`external`／`base_url` 為 0.10，400）。驗證（REMOTE.md 第 4.2.2 節步驟 1～3）：有設定 `allowed_signers` 時以它驗證簽署者（principal `release@kairos-pulse` 或 `extra_principals`），沒有設定時只檢查簽章本身（namespace、雜湊演算法、Ed25519）與雜湊；清單必須列在 `SHA256SUMS` 中、`product` 為 `pulse`；`SHA256SUMS` 中這個版本的 Pulse 發佈檔建立為「待上傳」（`stored: false`），`-dirty` 的建置、版本或 commit 不一致時拒絕。失敗：400 `release_signature_invalid`（簽章）或 `release_invalid`（格式、雜湊、清單），都是 `KRS-E8413` 並記稽核 `release.import_failed`；`allowed_signers` 無法讀取時 503 `trust_anchor_unavailable`；同一個版本已存在 409 `release_exists`。回 201（版本，`artifacts` 都是 `stored: false`）。稽核 `release.import`（版本、檔案、簽署金鑰指紋） |
+| `GET /api/v1/releases` | `releases:read` | `data[]`：`version`、`commit`、`source`（`hosted`；0.10.0 起另有 `external`）、`base_url`（`external` 時的 URL 前綴，否則 `null`）、`signer_fingerprint`、`signer_principal`、`verified`（匯入時以 `[remote] allowed_signers` 驗證過）、`manifest`（`filename`、`released_at`、`min_kairos`、`min_upgrade_from`、`remote_features`、`breaking`、`kairos_compatible`；0.9.0 以前的發佈為 `null`）、`artifacts[]`（`filename`、`os`、`arch`、`format`、`sha256`、`size`、`stored`、`stored_at`）、`hosts_on_version`、`rollback_target_for`（deb／rpm、目前執行這個版本、且版本庫有同格式同平台檔案的主機數）、`in_use_by_rollouts`、`imported_at`、`imported_by`。`meta`：`allowed_signers_configured`（`false` 時主控台警告「匯入時不驗證簽署者」）、`downloads_in_progress`、`max_concurrent_downloads` |
+| `POST /api/v1/releases` | `releases:write` | `sha256sums`（`SHA256SUMS` 全文）、`signature`（`SHA256SUMS.sig` 全文）、`manifest`（`pulse-<版本>-<commit>-release.json` 的**完整內容，含結尾換行**：雜湊必須與 `SHA256SUMS` 相符；0.9.0 以前的發佈可省略）。`source`：`hosted`（預設）或 `external`（0.10.0，外部 URL 的版本庫：必須另有 `base_url`——`https://<主機>[:<埠>]/<路徑>`，不可有帳號密碼、查詢字串、片段、百分比編碼或 `..`，否則 400 `invalid_parameter`；儲存時主機名稱轉小寫並補上結尾的 `/`。Kairos 不保存發佈檔，Pulse 從 `base_url＋檔名` 下載，URL 必須在每台 Pulse 本機的 `upgrade.url_allowlist` 中；`hosted` 帶 `base_url` 400）。驗證（REMOTE.md 第 4.2.2 節步驟 1～3）：有設定 `allowed_signers` 時以它驗證簽署者（principal `release@kairos-pulse` 或 `extra_principals`），沒有設定時只檢查簽章本身（namespace、雜湊演算法、Ed25519）與雜湊；清單必須列在 `SHA256SUMS` 中、`product` 為 `pulse`；`SHA256SUMS` 中這個版本的 Pulse 發佈檔建立為「待上傳」（`stored: false`），`-dirty` 的建置、版本或 commit 不一致時拒絕。失敗：400 `release_signature_invalid`（簽章）或 `release_invalid`（格式、雜湊、清單），都是 `KRS-E8413` 並記稽核 `release.import_failed`；`allowed_signers` 無法讀取時 503 `trust_anchor_unavailable`；同一個版本已存在 409 `release_exists`。回 201（版本，`artifacts` 都是 `stored: false`）。稽核 `release.import`（版本、檔案、簽署金鑰指紋） |
 | `PUT /api/v1/releases/{version}/artifacts/{filename}` | `releases:write` | 本文為檔案內容：`Content-Type: application/octet-stream`（其他 415）、必須有 `Content-Length`（不接受 chunked）、1～`max_release_bytes`（預設 128 MiB，超過 413）。檔名不在這個版本的 `SHA256SUMS` 中 400 `artifact_not_listed`、SHA-256 不符 400 `artifact_hash_mismatch`（`details.expected`、`actual`），都是 `KRS-E8413`。通過後以 SHA-256 命名存入 `<releases_dir>/<sha256>`（目錄 0700），回發佈檔的欄位。可以分次補上、重複上傳同一個檔案（覆寫紀錄）。這個端點不受 30 秒的請求逾時限制 |
+| （同上，0.10.0） | | **外部 URL 的版本**：同一個端點用來「登記」發佈檔——照樣確認檔名與 SHA-256，但只記下大小、不保存檔案（回應的 `stored: false`、`registered: true`）。只有登記過的發佈檔可以推送（提議需要 `artifact.size`） |
 | `GET /api/v1/releases/{version}` | `releases:read` | 同清單的一筆，另有 `hosts_by_platform`（`<install.method>/<arch>` → 目前執行這個版本的主機數）與 `sha256sums`；沒有時 404 `release_not_found` |
 | `DELETE /api/v1/releases/{version}` | `releases:write` | L2：本文 `confirm` 為版本號（否則 400 `confirmation_required`，`details.confirm_text`）、`reason` 選填。使用中（未結束的推送以它為目標，或有主機以它為回滾目標）409 `release_in_use`（`details.in_use_by_rollouts`、`rollback_target_for`）。刪除紀錄，版本庫中沒有其他版本參照的檔案一併刪除。稽核 `release.delete` |
 
-CLI（`kairos releases import <目錄>`）在 0.9 尚未提供；以 `curl` 匯入的例子：
+CLI（0.10.0）：`kairos releases import <目錄> [--external <base_url>]`（`--external`：外部 URL 的版本庫，目錄中的發佈檔只登記雜湊與大小、不存入 Kairos；目錄中放同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json` 與發佈檔；可以重複執行補上發佈檔）、`kairos releases list [--json]`（另標出檔案遺失或大小不符的發佈檔）、`kairos releases delete <版本> --confirm <版本> [--reason …]`。與上表的端點是同一套驗證、保護（`release_in_use`）與稽核，執行者為 `cli:<OS 帳號>`；直接開資料庫，Kairos 執行中或啟動前都可以用（以 Kairos 的服務帳號執行）。結束代碼：0 正常、1 失敗（`KRS-E8413` 等）、2 用法錯誤（含沒有 `--confirm`）、3 設定錯誤、10 權限不足、11 衝突（版本使用中、同版本號而 `SHA256SUMS` 不同）。`--json` 的 schema 為 `kairos.releases.list/v1`、`import/v1`、`delete/v1`。
+
+```bash
+sudo -u kairos /opt/kairos/kairos releases import /tmp/pulse-0.9.1 --config /opt/kairos/kairos.toml
+sudo -u kairos /opt/kairos/kairos releases list --config /opt/kairos/kairos.toml
+```
+
+以 `curl` 匯入的例子：
 
 ```bash
 B=https://kairos.example.com:9443/api/v1; H="Authorization: Bearer $TOKEN"
@@ -1524,7 +1534,7 @@ done
 
 ### 17.3 升級推送（S26、S05「升級」）
 
-0.9 的推送：最多兩批（canary＋其餘）、送出後**立即開始**（沒有維護時段 `schedule`／`windows`，送出時帶這些欄位 400）、沒有雙人覆核（`pending_approval`、`approve`／`reject` 在 0.10）、只有 Linux 的 tar／deb／rpm（Windows 的主機在資格分類為 `unsupported_platform`）。
+0.9 的推送：最多兩批（canary＋其餘）、送出後**立即開始**、只有 Linux 的 tar／deb／rpm（Windows 的主機在資格分類為 `unsupported_platform`）。**0.10.0 起**：自訂批次（最多 10 批）與排程、維護時段（`schedule`）；省略 `waves`、`schedule` 時與 0.9 相同（兩批、立即開始）。
 
 **推送的內容**（`POST /rollouts`、`/rollouts/preview`、`PUT /rollouts/{id}` 的本文）：
 
@@ -1533,23 +1543,28 @@ done
 | `name` | 1～128 字元 |
 | `target_version` | 版本庫中的 Pulse 版本（沒有時 400 `invalid_parameter`） |
 | `selector` | `all`（布林），或 `groups[]`（不分大小寫）、`tags[]`、`agent_ids[]` 的聯集，再減去 `exclude_agent_ids[]`；各最多 10,000 項 |
-| `waves` | 1～2 批，最後一批的 `size` 必須是 `"rest"`；每批 `size`（台數，或 `"N%"`：可升級主機的百分比、至少 1 台）、`max_hosts`（百分比時的上限）、`soak_minutes`（這批全部結束後的觀察時間，0～10080）、`max_failure_ratio`（0～1，超過即自動暫停）、`manual_continue`（觀察期滿後要人工 `continue`）。省略時為預設範本：canary `1%`（至多 10 台）、觀察 60 分鐘、上限 0（任何失敗都暫停）、人工繼續；其餘上限 5% |
+| `schedule`（0.10.0） | 選用。`starts_at`、`ends_at`（RFC 3339；`ends_at` 必須晚於 `starts_at` 與現在）、`windows[]`（每週的維護時段，最多 16 個：`days`〔`mon`～`sun`，省略或空陣列＝每天〕、`start`、`end`〔`HH:MM`；`end` 早於 `start` 時跨午夜，時段屬於開始的那一天；兩者不可相同〕）、`timezone`（時段的時區，**固定位移**如 `+08:00`，另接受 `UTC`、`Z`；有時段而省略時填入 Kairos 的 `alerts.timezone`，沒有設定時 `+08:00`；不接受 IANA 時區名稱）。`starts_at` 在未來時送出後為 `scheduled`，到時由推送引擎轉為 `running`。**時段是「允許開始替換的時間」**：時段外不提議新的主機，提議的 `apply_window` 到所在時段結束為止（相連的時段視為一段），已開始替換的照常完成；時段結束時還沒開始替換的主機回到 `pending`（`reason: window_closed`、新的 `upgrade_id`、`attempts` 加 1），下一個時段重新提議，不計入失敗（同一台最多 10 次，之後留在 `expired`，可手動重試）。`ends_at` 到時：尚未開始替換的主機標為 `expired`（`reason: rollout_ended`），替換中的主機結束後推送 `completed` |
+| `waves` | 1～10 批（0.9 為 1～2 批），最後一批的 `size` 必須是 `"rest"`；每批 `size`（台數，或 `"N%"`：**當時剩餘**的可升級主機的百分比、至少 1 台；兩批時與 0.9 的結果相同）、`max_hosts`（百分比時的上限）、`soak_minutes`（這批全部結束後的觀察時間，0～10080）、`max_failure_ratio`（0～1，超過即自動暫停）、`manual_continue`（觀察期滿後要人工 `continue`）。省略時為預設範本：canary `1%`（至多 10 台）、觀察 60 分鐘、上限 0（任何失敗都暫停）、人工繼續；其餘上限 5% |
 | `options` | `max_in_progress`（同時在下載到確認之間的主機數，預設 50、1～1000）、`health_timeout_secs`（預設 600、120～3600）、`allow_downgrade`（降版；Pulse 本機也要允許）、`allow_no_rollback`（允許沒有回滾檔的 deb／rpm 主機）、`canary_agent_ids[]`（指定第一批的主機，需要兩批）、`offline_grace_hours`（離線多久標為 `skipped_offline`，預設 24） |
+
+**雙人覆核**（0.10.0；REMOTE.md 第 5.4 節）：`kairos.toml` 的 `[remote] rollout_approval = "required"`（預設 `"none"`，需要重新啟動；只能在設定檔改）時，送出（`submit`，L2／L3 確認照舊）的推送先進入 `pending_approval`：對象已固定並算在未結束的推送中，但不提議任何主機，直到**另一位**有 `rollouts:approve` 的使用者以工作階段 `approve`。`reject`（原因必填）或修改（`PUT`）待核准的推送會退回 `draft`，需要重新送出、重新核准；待核准的推送可以 `cancel`。`rollout_approval = "none"` 時 `approve`／`reject` 一律 409 `invalid_state`。推送的 JSON 另有 `submitted_at`、`submitted_by`、`approved_at`、`approved_by`、`reject_reason`；清單的 `meta` 另有 `pending_approval`（待核准的推送數）與 `rollout_approval`；預覽另有 `approval_required`；系統健康 `remote` 項目的 `values.rollout_approval`。降版推送（L3）仍是固定字串＋原因，不要求重新驗證密碼（設計包 §31.12 #7 的暫行做法，待決）。
 
 **資格分類**（REMOTE.md 第 4.7.2 節；`skipped` 的 `reason`）：`already`、`unsupported_version`（低於 0.9.0 或沒有 `install`）、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`、`not_ready`（依 `install.upgrade`）、`unsupported_platform`、`no_artifact`、`min_upgrade_from`、`no_manifest`（升級的目標沒有清單）、`downgrade_not_allowed`、`no_rollback`、`decommissioned`。連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤為準，協商了 `upgrade` 的連線再以發提議時使用的資訊覆蓋：預覽、建立、送出與發提議一致，主機連線後不必等清冊每 30 秒的同步（0.9.0〔草稿〕起；之前只有協商了遠端管理的連線如此）。清冊還沒有的主機（連線後尚未寫入過任何資料）不在對象中。已在另一個未結束的推送中的主機：建立與送出時 409 `rollout_overlap`（`details.count`、`agent_ids`、`hosts[]` 前 100 台）。順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)`。
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
-| `POST /api/v1/rollouts/preview` | `rollouts:read` | 回 `matched`、`eligible`、`downgrade`、`no_rollback`、`skipped`（原因 → 台數）、`samples`（原因 → 前 100 台的 `agent_id`、`hostname`）、`overlap`（`count`、`hosts[]`）、`waves`（每批的台數）、`incompatible`（`min_kairos` 高於目前的 Kairos 時 `{min_kairos, code: "KRS-W8415"}`）、`breaking`、`remote_features`、`loses_remote_management`（目標沒有 `upgrade` feature 或沒有清單）、`confirm_text`（「升級 N 台」；有無法自動回滾的主機〔`allow_no_rollback`〕時「升級 N 台（無法自動回滾 M 台）」，全形括號；降版時「降版 N 台」）、`confirm_level`（`L2`／`L3`）、`waves_spec` |
-| `GET /api/v1/rollouts` | `rollouts:read` | 篩選 `state`（`draft`、`running`、`paused`、`completed`、`cancelled`）。`data[]`：`id`（`r-YYYYMMDD-NNNN`）、`name`、`target_version`、`state`、`current_wave`（0 起算）、`waves_total`、`progress`（每個主機狀態的台數，鍵為下表的 15 個狀態）、`hosts_total`（不含 `skipped`）、`rollback_failed_unacknowledged`（回滾失敗且尚未標記為已處理的台數；`progress.rollback_failed` 含已處理的）、`next_action`、`pause_reason`、`pause_cause`（暫停中才有值：`manual`〔主控台或 API 暫停〕、`failure_ratio`、`rollback_failed`、`signature_failed`〔三者為自動暫停，`KRS-W8414`〕；其他狀態為 `null`；讀取端應忽略不認得的值）、`cancel_reason`、`awaiting_continue`、`soak_until`、`created_*`、`started_at`、`completed_at`、`updated_at`。`meta`（不受 `state` 篩選影響）：`paused`（暫停中的推送數）、`rollback_failed_unacknowledged`（全部推送中回滾失敗且尚未標記為已處理的主機數）；主控台側邊導覽「升級推送」的計數泡泡＝兩者相加 |
+| `POST /api/v1/rollouts/preview` | `rollouts:read` | 回 `matched`、`eligible`、`downgrade`、`no_rollback`、`skipped`（原因 → 台數）、`samples`（原因 → 前 100 台的 `agent_id`、`hostname`）、`overlap`（`count`、`hosts[]`）、`waves`（每批的台數）、`incompatible`（`min_kairos` 高於目前的 Kairos 時 `{min_kairos, code: "KRS-W8415"}`）、`breaking`、`remote_features`、`loses_remote_management`（目標沒有 `upgrade` feature 或沒有清單）、`confirm_text`（「升級 N 台」；有無法自動回滾的主機〔`allow_no_rollback`〕時「升級 N 台（無法自動回滾 M 台）」，全形括號；降版時「降版 N 台」）、`confirm_level`（`L2`／`L3`）、`waves_spec`；0.10.0 另有 `schedule`（正規化後的排程）、`window`（現在是否在時段內：`{open: true, until}` 或 `{open: false, next}`；`next` 為 `null` 表示之後沒有時段）、`default_timezone`、`wave_templates`（`default`：兩批；`recommended`：REMOTE.md 第 4.7.1 節的四批 1% → 10% → 50% → 其餘）、`max_waves` |
+| `GET /api/v1/rollouts` | `rollouts:read` | 篩選 `state`（`draft`、`pending_approval`、`scheduled`〔兩者 0.10.0〕、`running`、`paused`、`completed`、`cancelled`）與 `q`（0.10.0，全域搜尋：名稱、編號或目標版本的子字串，不分大小寫，最多 128 個字元；`meta` 不受影響）。`data[]`：`id`（`r-YYYYMMDD-NNNN`）、`name`、`target_version`、`state`、`current_wave`（0 起算）、`waves_total`、`progress`（每個主機狀態的台數，鍵為下表的 15 個狀態）、`hosts_total`（不含 `skipped`）、`rollback_failed_unacknowledged`（回滾失敗且尚未標記為已處理的台數；`progress.rollback_failed` 含已處理的）、`next_action`、`pause_reason`、`pause_cause`（暫停中才有值：`manual`〔主控台或 API 暫停〕、`failure_ratio`、`rollback_failed`、`signature_failed`〔三者為自動暫停，`KRS-W8414`〕；其他狀態為 `null`；讀取端應忽略不認得的值）、`cancel_reason`、`awaiting_continue`、`soak_until`、`starts_at`、`ends_at`（0.10.0，排程；沒有時 `null`）、`created_*`、`started_at`、`completed_at`、`updated_at`。`next_action`（固定代碼＋參數）：`draft`、`pending_approval`（0.10.0）、`scheduled{starts_at}`（0.10.0）、`upgrading`、`waiting_window{until}`（0.10.0：維護時段外，`until` 為下一個時段開始的時間，之後沒有時段時 `null`）、`soaking{minutes, until}`、`waiting_continue`、`paused{reason, cause}`、`completed`、`cancelled`；讀取端應忽略不認得的代碼。`meta`（不受 `state` 篩選影響）：`paused`（暫停中的推送數）、`rollback_failed_unacknowledged`（全部推送中回滾失敗且尚未標記為已處理的主機數）；主控台側邊導覽「升級推送」的計數泡泡＝兩者相加 |
 | `POST /api/v1/rollouts` | `rollouts:write` | 建立草稿（`draft`）；對象在送出時才固定。`min_kairos` 不符 400 `incompatible_release`（`KRS-W8415`）。回 201：推送（另有 `selector`、`options`、`waves`、`schedule`）與 `preview`。稽核 `rollout.create` |
-| `GET /api/v1/rollouts/{id}` | `rollouts:read` | 同清單的欄位，另有 `selector`、`options`、`schedule`（0.9 為 `{}`）、`waves[]`（每批的設定、`index`、`hosts`、`progress`、`failure_ratio`、`current`）；草稿另有即時的 `preview`。沒有時 404 `rollout_not_found` |
-| `PUT /api/v1/rollouts/{id}` | `rollouts:write` | 修改草稿的內容（其他狀態 409 `invalid_state`）。稽核 `rollout.update` |
-| `POST /api/v1/rollouts/{id}/submit` | `rollouts:write` | 送出並立即開始：L2 `confirm` 為預覽的 `confirm_text`（「升級 N 台」；有無法自動回滾的主機時只接受「升級 N 台（無法自動回滾 M 台）」，設計包 S26；不符時 400 `confirmation_required`，`details.confirm_text`、`confirm_level`、`eligible`、`downgrade`、`no_rollback`）；包含降版時為 L3（「降版 N 台」）且 `reason` 必填（0.9 不要求重新驗證密碼，設計包 §31.12 #7）。沒有可升級的主機 409 `no_eligible_hosts`。固定對象寫入主機表（不符資格的記為 `skipped`），狀態 `running`。稽核 `rollout.submit`、`rollout.start` |
+| `GET /api/v1/rollouts/{id}` | `rollouts:read` | 同清單的欄位，另有 `selector`、`options`、`schedule`（沒有排程時 `{}`）、`waves[]`（每批的設定、`index`、`hosts`、`progress`、`failure_ratio`、`current`）；草稿另有即時的 `preview`。沒有時 404 `rollout_not_found` |
+| `PUT /api/v1/rollouts/{id}` | `rollouts:write` | 修改草稿的內容。0.10.0 起也可以修改 `pending_approval`、`scheduled`（尚未開始）的推送：推送**退回 `draft`**、已固定的對象刪除，必須重新送出（確認字串以新的對象計算；稽核 `details.reverted_to_draft`）。其他狀態 409 `invalid_state`。稽核 `rollout.update` |
+| `POST /api/v1/rollouts/{id}/submit` | `rollouts:write` | 送出並立即開始：L2 `confirm` 為預覽的 `confirm_text`（「升級 N 台」；有無法自動回滾的主機時只接受「升級 N 台（無法自動回滾 M 台）」，設計包 S26；不符時 400 `confirmation_required`，`details.confirm_text`、`confirm_level`、`eligible`、`downgrade`、`no_rollback`）；包含降版時為 L3（「降版 N 台」）且 `reason` 必填（0.9 不要求重新驗證密碼，設計包 §31.12 #7）。沒有可升級的主機 409 `no_eligible_hosts`。固定對象寫入主機表（不符資格的記為 `skipped`），狀態 `running`。稽核 `rollout.submit`、`rollout.start`。0.10.0：`schedule.starts_at` 在未來時狀態為 `scheduled`（對象同樣在送出時固定，這些主機算在未結束的推送中），到時由推送引擎轉為 `running` 並以 `system` 寫 `rollout.start`（`details.scheduled`）；`ends_at` 已過時 409 `schedule_ended`；`rollout_approval = "required"` 時狀態為 `pending_approval`（見上方「雙人覆核」） |
+| `POST /api/v1/rollouts/{id}/approve`（0.10.0） | `rollouts:approve` | 雙人覆核：`pending_approval` → `running`（`schedule.starts_at` 在未來時 `scheduled`）。**只接受以帳號登入的工作階段**（API token 403 `session_required`）；核准者是建立者（`created_by`）或送出者（`submitted_by`）時 403 `self_approval`（`KRS-E6106`）；其他狀態 409 `invalid_state`；`ends_at` 已過 409 `schedule_ended`。稽核 `rollout.approve`（開始時另有 `rollout.start`） |
+| `POST /api/v1/rollouts/{id}/reject`（0.10.0） | `rollouts:approve` | 退回待核准的推送：`reason` 必填；推送回到 `draft`、已固定的對象刪除，`reject_reason` 留給建立者（再次送出時清除）。同樣只接受工作階段。稽核 `rollout.reject` |
 | `POST /api/v1/rollouts/{id}/pause` | `rollouts:pause` | `reason` 必填。只有 `running` 可以暫停。提議中、尚未替換的主機（`offered`／`accepted`／`staged`）回到 `pending`，恢復時以新的 `upgrade_id` 重新提議（Pulse 對舊的 id 收到 `upgrade_unavailable`）；替換中的照常完成。稽核 `rollout.pause` |
 | `POST /api/v1/rollouts/{id}/resume` | `rollouts:write` | 暫停中 → `running`。稽核 `rollout.resume` |
 | `POST /api/v1/rollouts/{id}/continue` | `rollouts:write` | 觀察期滿、`manual_continue` 的批次開始下一批（`awaiting_continue` 不是 `true` 時 409 `invalid_state`）。稽核 `rollout.resume`（`details.continue`） |
-| `POST /api/v1/rollouts/{id}/cancel` | `rollouts:write` | `reason` 必填。尚未開始替換的主機（`pending`、`offered`、`accepted`、`staged`、`skipped_offline`）改為 `cancelled`，替換中的照常完成。L1。稽核 `rollout.cancel` |
+| `POST /api/v1/rollouts/{id}/cancel` | `rollouts:write` | `reason` 必填。尚未開始替換的主機（`pending`、`offered`、`accepted`、`staged`、`skipped_offline`）改為 `cancelled`，替換中的照常完成；`pending_approval`、`scheduled` 的推送也可以取消。L1。稽核 `rollout.cancel` |
 | `GET /api/v1/rollouts/{id}/hosts` | `rollouts:read` | 分頁（`limit` 1～1000、`cursor`，第 3 節）；篩選 `wave`、`state`（可重複或逗號分隔）、`reason`、`code`、`q`（主機名稱或 agent_id 片段）。`data[]`：`agent_id`、`hostname`、`upgrade_id`、`wave`（`skipped` 為 -1）、`ordinal`、`state`、`reason`、`from_version`、`to_version`、`attempts`、`progress`（`bytes`、`total`）、`code`（Pulse 回報的代碼）、`detail`、`offered_at`、`applying_at`、`finished_at`、`updated_at`、`acknowledged_at`、`acknowledged_by` |
 | `POST /api/v1/rollouts/{id}/hosts/{agent_id}/retry` | `rollouts:write` | 對 `failed`、`rolled_back`、`expired`、`skipped_offline`、`declined`、`unknown`（以及已標記處理的 `rollback_failed`）的主機以新的 `upgrade_id` 重新提議（`attempts` 加 1）；推送須為 `running` 或 `paused`。稽核 `rollout.update`（`details.retry`） |
 | `POST /api/v1/rollouts/{id}/hosts/{agent_id}/acknowledge` | `rollouts:write` | 回滾失敗已人工處理（`note` 選填；S05「標記為已處理」）。稽核 `host.upgrade.acknowledge` |
@@ -1585,6 +1600,9 @@ done
 | 409 | `rollout_overlap` | — | 主機已在另一個未結束的推送 |
 | 409 | `no_eligible_hosts` | — | 送出時沒有可升級的主機 |
 | 409 | `invalid_state` | — | 推送或主機的狀態不允許這個操作 |
+| 403 | `self_approval` | `KRS-E6106` | 核准自己建立或送出的推送（雙人覆核，0.10.0） |
+| 403 | `session_required` | — | 以 API token 核准或退回推送（需要以帳號登入的工作階段） |
+| 409 | `schedule_ended` | — | 送出或核准時排程的 `ends_at` 已過 |
 | 404 | `profile_not_found`、`assignment_not_found`、`release_not_found`、`rollout_not_found`、`host_not_in_rollout` | — | |
 | 503 | `remote_unavailable` | — | `[remote]` 停用或不是 SQLite 儲存 |
 
@@ -1592,4 +1610,4 @@ done
 
 - `config.host`（需要 `config:read`，且看得到那台主機）：Pulse 送出 `config_status` 後，`{agent_id, state, applied_rev, code, overridden}`（`overridden` 為本機覆蓋的鍵數）。
 - `rollout.progress`（需要 `rollouts:read`）：推送的狀態或主機改變後，每個推送每 5 秒最多一則（推送引擎每一輪送出），`{rollout_id, state, current_wave, progress, pause_cause, next_action}`（欄位同第 17.3 節的清單）。
-- `rollout.host`（只送給正在看某個推送詳情的連線，REMOTE.md 第 8.4 節）在 0.9 尚未提供：推送詳情收到 `rollout.progress` 後重新載入主機表。
+- `rollout.host`（0.10.0；需要 `rollouts:read`，而且**只送給以查詢參數 `rollout_id` 訂閱那個推送的連線**：`GET /api/v1/events?rollout_id=r-20261120-0001`；REMOTE.md 第 8.4 節）：推送中一台主機的狀態、進度、代碼、重試次數或「已處理」的標記改變後，在推送引擎的下一輪（狀態改變時立即，最遲 5 秒）送出，內容與 `GET /api/v1/rollouts/{id}/hosts` 的一列相同（`rollout_id`、`agent_id`、`hostname`、`wave`、`state`、`reason`、`from_version`、`to_version`、`attempts`、`progress`、`code`、`detail`、各時間），同一輪中排在該推送的 `rollout.progress` 之前。每台主機每一輪最多一則（下載進度的多次回報合併）；一個推送一輪改變的主機超過 200 台時不逐台送，改在 `rollout.progress` 帶 `hosts_resync: true` 與 `hosts_changed`（台數），用戶端重新抓取主機表。開始訂閱時補送最近 15 秒內改變過的主機（可能與已載入的內容重複，以整列取代即可）。`rollout_id` 的格式不符、開啟串流時沒有 `rollouts:read`、或 `[remote]` 停用時不訂閱（不回錯誤）；一條連線只能訂閱一個推送，沒有訂閱的連線照常收到 `rollout.progress`。

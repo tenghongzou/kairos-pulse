@@ -245,6 +245,16 @@ pub fn artifact_path(dir: &Path, sha256: &str) -> PathBuf {
     dir.join(sha256)
 }
 
+/// 版本庫中已存入（`stored`）的發佈檔是否還在（只 `stat`，不重算雜湊）：不存在或不是一般檔案為
+/// `Some("missing")`，大小與記錄不符為 `Some("size_mismatch")`，正常為 `None`。備份不含發佈檔
+/// （REMOTE.md 第 6 節），還原後由系統健康與 `kairos releases list` 標出
+pub fn file_problem(dir: &Path, sha256: &str, size: i64) -> Option<&'static str> {
+    match std::fs::metadata(artifact_path(dir, sha256)) {
+        Ok(m) if m.is_file() => (size > 0 && m.len() != size as u64).then_some("size_mismatch"),
+        _ => Some("missing"),
+    }
+}
+
 /// 寫入中的上傳：暫存檔、SHA-256 與大小
 pub struct Upload {
     dir: PathBuf,
@@ -307,7 +317,9 @@ impl Upload {
     /// 把暫存檔改名為 `<sha256>`（已存在相同內容的檔案時直接刪除暫存檔）
     pub fn commit(mut self, sha256: &str) -> std::io::Result<PathBuf> {
         let dest = artifact_path(&self.dir, sha256);
-        if dest.exists() {
+        // 已有同名的檔案而大小不同（被截斷或換掉，系統健康的「版本庫的檔案遺失」）：以這次上傳的取代
+        let same = std::fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == self.size);
+        if same {
             let _ = std::fs::remove_file(&self.tmp);
         } else {
             std::fs::rename(&self.tmp, &dest)?;

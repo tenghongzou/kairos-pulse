@@ -52,6 +52,8 @@ fn env(dir: &Path, version: &str) -> UpgradeEnv {
         require_root_owner: false,
         free_space: |_| None,
         redetect: None,
+        url_allowlist: Vec::new(),
+        external_ca: String::new(),
     }
 }
 
@@ -714,5 +716,123 @@ fn install_info_and_status_text_limits() {
     let mut cs = agent.on_registered(false, Some(&pending(ID)));
     assert_eq!(agent.poll(&mut cs, Instant::now()), None);
     assert_eq!(agent.next_wake(&cs, Instant::now(), false), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節，0.10.0）：URL 符合本機白名單且指向提議的檔名才接受；檔案由背景
+/// 的下載工作取得（不送段落請求），下載完成後與分段下載走同一條驗證路徑（提議的 SHA-256、簽章驗證過的
+/// SHA256SUMS）才 staged；內容不符時刪除重來，連續 3 次後放棄
+#[test]
+fn external_url_needs_the_local_allowlist_and_the_same_verification() {
+    let url = format!("https://repo.example.gov.tw/kairos-pulse/0.9.1/{FILE}");
+    let with_url = |u: &str| {
+        let mut o = offer((-60, 3600));
+        o.artifact.source = mgmt::SOURCE_URL.into();
+        o.artifact.url = Some(u.to_string());
+        o
+    };
+    fn allow(e: &mut UpgradeEnv, list: &[&str]) {
+        e.url_allowlist = list.iter().map(|s| s.to_string()).collect();
+    }
+    // 不在白名單、白名單是另一台主機（字串前綴相同）、URL 指向別的檔名：一律 declined（url_not_allowed）
+    for (i, (list, u)) in [
+        (vec![], url.clone()),
+        (vec!["https://repo.example.gov.tw/other/"], url.clone()),
+        (
+            vec!["https://repo.example.gov"],
+            "https://repo.example.gov.tw/x/".to_string() + FILE,
+        ),
+        (
+            vec!["https://repo.example.gov.tw/kairos-pulse/"],
+            "https://repo.example.gov.tw/kairos-pulse/0.9.1/other.tar.gz".to_string(),
+        ),
+        (
+            vec!["https://repo.example.gov.tw/kairos-pulse/"],
+            "http://repo.example.gov.tw/kairos-pulse/0.9.1/".to_string() + FILE,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = tmp(&format!("url-declined-{i}"));
+        let mut e = env(&dir, "0.9.0");
+        allow(&mut e, &list);
+        let agent = UpgradeAgent::new(e);
+        let _cs = accept(&agent, with_url(&u));
+        let s = statuses(&agent);
+        assert_eq!(s.len(), 1, "{i}: {s:?}");
+        assert_eq!(s[0].state, mgmt::UPGRADE_STATE_DECLINED, "{i}");
+        assert!(agent.next_url_job(Instant::now()).is_none(), "{i}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 在白名單內：接受，不送段落請求，由下載工作取得
+    let dir = tmp("url-ok");
+    let mut e = env(&dir, "0.9.0");
+    allow(&mut e, &["https://repo.example.gov.tw/kairos-pulse"]);
+    let agent = UpgradeAgent::new(e);
+    let mut cs = accept(&agent, with_url(&url));
+    let sent = ack_all(&agent, &mut cs);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].state, UPGRADE_STATE_ACCEPTED);
+    assert_eq!(
+        agent.poll(&mut cs, Instant::now()),
+        None,
+        "不經 Kairos 下載"
+    );
+    let job = agent.next_url_job(Instant::now()).expect("url job");
+    assert_eq!(
+        (job.url.as_str(), job.filename.as_str(), job.size),
+        (url.as_str(), FILE, TAR.len() as u64)
+    );
+    // 下載失敗：稍後重試（等待期內沒有工作）
+    agent.on_url_result(
+        &job,
+        Err(fetch::FetchError::Transient("連線：refused".into())),
+    );
+    assert!(agent.next_url_job(Instant::now()).is_none());
+    assert!(
+        agent
+            .next_url_job(Instant::now() + Duration::from_secs(120))
+            .is_some()
+    );
+    // 內容被換掉（大小相同、雜湊不符）：刪除重來，不會 staged
+    let mut bad = TAR.to_vec();
+    bad[0] ^= 1;
+    std::fs::write(&job.part, &bad).unwrap();
+    agent.on_url_result(&job, Ok(()));
+    assert!(!job.part.exists(), "雜湊不符的暫存檔要刪除");
+    assert!(statuses(&agent).is_empty());
+    // 正確的內容：staged
+    std::fs::write(&job.part, TAR).unwrap();
+    agent.on_url_result(&job, Ok(()));
+    let sent = ack_all(&agent, &mut cs);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].state, mgmt::UPGRADE_STATE_STAGED);
+    assert!(agent.next_url_job(Instant::now()).is_none());
+    // 過期的下載工作（提議已被取代）不影響狀態
+    agent.on_url_result(&job, Ok(()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 連續 3 次雜湊不符：放棄（failed，PLS-E8402），與分段下載相同
+    let dir = tmp("url-mismatch");
+    let mut e = env(&dir, "0.9.0");
+    allow(&mut e, &["https://repo.example.gov.tw/"]);
+    let agent = UpgradeAgent::new(e);
+    let mut cs = accept(&agent, with_url(&url));
+    ack_all(&agent, &mut cs);
+    for _ in 0..3 {
+        let job = agent
+            .next_url_job(Instant::now() + Duration::from_secs(600))
+            .expect("url job");
+        std::fs::write(&job.part, &bad).unwrap();
+        agent.on_url_result(&job, Ok(()));
+    }
+    let s = states(&agent);
+    assert_eq!(
+        s.last().map(|x| x.0.as_str()),
+        Some(mgmt::UPGRADE_STATE_FAILED),
+        "{s:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

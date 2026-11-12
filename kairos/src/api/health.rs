@@ -779,8 +779,9 @@ fn metrics_endpoint(ctx: &ApiContext) -> Item {
 }
 
 /// 遠端管理（S20「遠端管理」列；設計包 screens.md S20「0.9 規格」、REMOTE.md R10）：集中設定與遠端升級是否
-/// 啟用、信任錨、推送的暫停與回滾失敗。數值需要 `rollouts:read`。嚴重度：回滾失敗未處理（`KRS-E8408`）＞
-/// 自動暫停的推送（`KRS-W8414`）＞ 信任錨未設定（遠端升級啟用、版本庫有發佈版本時；版本庫是空的只註明）；
+/// 啟用、信任錨、推送的暫停與回滾失敗、版本庫的檔案遺失。數值需要 `rollouts:read`。嚴重度：回滾失敗未處理
+/// （`KRS-E8408`）＞ 自動暫停的推送（`KRS-W8414`）＞ 版本庫的檔案遺失（已存入的發佈檔不存在或大小不符，例如
+/// 還原備份之後；`KRS-W8417`〔暫定〕）＞ 信任錨未設定（遠端升級啟用、版本庫有發佈版本時；版本庫是空的只註明）；
 /// 主控台暫停的推送不算異常
 async fn remote(ctx: &ApiContext) -> Item {
     let Some(svc) = ctx.remote.as_ref() else {
@@ -799,6 +800,7 @@ async fn remote(ctx: &ApiContext) -> Item {
         "config_enabled": st.config_enabled,
         "upgrade_enabled": st.upgrade_enabled,
         "allowed_signers_configured": trust,
+        "rollout_approval": st.rollout_approval,
     });
     if !st.config_enabled && !st.upgrade_enabled {
         return Item::new(
@@ -819,18 +821,44 @@ async fn remote(ctx: &ApiContext) -> Item {
         .needs(Permission::RolloutsRead);
     }
     use crate::remote::rollout;
+    let dir = svc.releases_dir.clone();
     let counts = svc
         .db
-        .read(|s| {
+        .read(move |s| {
+            let releases = s.list_releases()?;
+            // 版本庫的檔案遺失：已存入的發佈檔只 stat（不重算雜湊；這個讀取本來就在 blocking 執行緒）
+            let mut missing = Vec::new();
+            let mut hosts = None;
+            for r in &releases {
+                let artifacts = s.release_artifacts(r.id)?;
+                for a in artifacts.iter().filter(|a| a.stored) {
+                    let Some(problem) =
+                        crate::remote::releases::file_problem(&dir, &a.sha256, a.size)
+                    else {
+                        continue;
+                    };
+                    if hosts.is_none() {
+                        hosts = Some(s.upgrade_hosts()?);
+                    }
+                    // 這個檔案是多少台主機的回滾檔（deb／rpm、目前執行這個版本）
+                    let rollback = crate::remote::ops::rollback_target_count(
+                        hosts.as_deref().unwrap_or_default(),
+                        &r.version,
+                        std::slice::from_ref(a),
+                    );
+                    missing.push((r.version.clone(), a.filename.clone(), problem, rollback));
+                }
+            }
             Ok((
                 s.list_rollouts(Some(rollout::ROLLOUT_RUNNING))?.len(),
                 s.list_rollouts(Some(rollout::ROLLOUT_PAUSED))?,
-                s.list_releases()?.len(),
+                releases.len(),
                 s.unacknowledged_rollback_failures()?.len(),
+                missing,
             ))
         })
         .await;
-    let (running, paused, releases, failures) = match counts {
+    let (running, paused, releases, failures, missing) = match counts {
         Ok(v) => v,
         Err(e) => {
             log::warn!("系統健康：無法讀取推送的狀態：{e}");
@@ -856,6 +884,19 @@ async fn remote(ctx: &ApiContext) -> Item {
             .collect::<Vec<_>>()
     );
     values["releases"] = json!(releases);
+    values["release_files_missing"] = json!(missing.len());
+    values["missing_files"] = json!(
+        missing
+            .iter()
+            .take(20)
+            .map(|(version, filename, problem, rollback)| json!({
+                "version": version,
+                "filename": filename,
+                "problem": problem,
+                "rollback_target_for": rollback,
+            }))
+            .collect::<Vec<_>>()
+    );
     values["rollback_failed_unacknowledged"] = json!(failures);
     values["downloads_in_progress"] = json!(svc.downloads_in_progress());
     values["max_concurrent_downloads"] = json!(st.max_concurrent_downloads);
@@ -884,6 +925,27 @@ async fn remote(ctx: &ApiContext) -> Item {
                 r.name,
                 r.pause_reason.as_deref().unwrap_or("—")
             ),
+        )
+    } else if let Some((version, filename, problem, rollback)) = missing.first() {
+        let what = if *problem == "size_mismatch" {
+            "版本庫的檔案大小不符"
+        } else {
+            "版本庫的檔案遺失"
+        };
+        let need = if *rollback > 0 {
+            format!("（{rollback} 台的回滾需要）")
+        } else {
+            String::new()
+        };
+        let more = if missing.len() > 1 {
+            format!(" 等 {} 個檔案", missing.len())
+        } else {
+            String::new()
+        };
+        (
+            Level::Warning,
+            Some(crate::remote::CODE_RELEASE_FILE_MISSING),
+            format!("{what}：{version} 的 {filename}{need}{more}；請重新匯入這個版本的發佈檔"),
         )
     } else if !trust && releases > 0 {
         (

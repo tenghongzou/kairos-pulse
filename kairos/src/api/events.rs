@@ -351,11 +351,25 @@ pub async fn remote_pump(
 
 /// 事件屬於哪一台主機
 fn event_agent(data: &str) -> Option<String> {
+    event_field(data, "agent_id")
+}
+
+fn event_field(data: &str, field: &str) -> Option<String> {
     serde_json::from_str::<Value>(data)
         .ok()?
-        .get("agent_id")?
+        .get(field)?
         .as_str()
         .map(str::to_string)
+}
+
+/// `GET /api/v1/events?rollout_id=…` 的推送編號（`r-YYYYMMDD-NNNN`；格式不符時視為沒有訂閱）
+pub fn rollout_id_param(v: Option<&str>) -> Option<String> {
+    v.filter(|s| {
+        (1..=64).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+    .map(str::to_string)
 }
 
 pub async fn stream(
@@ -363,6 +377,7 @@ pub async fn stream(
     principal: Principal,
     mut access: HostAccess,
     last_event_id: Option<String>,
+    rollout_id: Option<String>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let permit: OwnedSemaphorePermit = ctx.streams.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
@@ -400,7 +415,14 @@ pub async fn stream(
     let mut allowed = visible_hosts(&ctx, &access).await;
     // 告警的事件（`alert.*`）只送給全站範圍有 `alerts:read` 的身分（0.4／0.5 的 token 沒有；心跳時重新計算）
     let mut alerts_ok = StreamPerms::of(&principal.grants);
+    // `rollout.host` 只送給以 `rollout_id` 訂閱那個推送、且有 `rollouts:read` 的連線（REMOTE.md 第 8.4 節）；
+    // 訂閱在串流結束時取消。開啟時沒有權限的連線不登記（之後取得權限要重新連線）
+    let watch = match (&rollout_id, &ctx.remote) {
+        (Some(id), Some(remote)) if alerts_ok.rollouts => Some(remote.watch_rollout(id)),
+        _ => None,
+    };
     tokio::spawn(async move {
+        let _watch = watch;
         let mut last_sent = last;
         let mut overflow = false;
         let visible =
@@ -411,6 +433,11 @@ pub async fn stream(
                 // 遠端管理：`config.host` 另需看得到那台主機（下方的範圍判斷）；`rollout.*` 不屬於單一主機
                 if kind.starts_with("config.") && !perms.config {
                     return false;
+                }
+                if kind == "rollout.host" {
+                    return perms.rollouts
+                        && rollout_id.is_some()
+                        && event_field(data, "rollout_id") == rollout_id;
                 }
                 if kind.starts_with("rollout.") {
                     return perms.rollouts;

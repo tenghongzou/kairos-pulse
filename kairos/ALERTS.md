@@ -41,6 +41,7 @@
 | `lifecycle` | 主程式 | `phase`：`started`、`shutting_down` |
 | `channel_secrets` | 告警服務（0.7；管道的機密變成無法解開或恢復時） | `channel_id`、`name`、`available` |
 | `audit_integrity` | 稽核的定期自我驗證（0.7；每次驗證） | `ok`、`reason`、`id`（斷點）、`summary` |
+| `upgrade_window` | 遠端管理服務（0.10；推送中的主機進入 `applying`、到達終止狀態或期限已過時，第 5.5 節） | `agent_id`、`rollout_id`、`until_ms`（抑制的期限；解除時 `null`） |
 
 **斷線原因分類**（Webhook 的 `offline_reason` 固定代碼，`alerts-ux.md` §6.6）：`idle_timeout`（逾時，未收到心跳）、`agent_closed`（agent 關閉或網路中斷）、`certificate_rejected`（連線中重新驗證時憑證被拒）、`server_shutdown`（Kairos 關機，永遠不產生告警）、`write_unknown`（report 寫入結果未知，Kairos 關閉了連線；0.6 新增）、`server_lost`（服務這台主機的叢集節點失聯；0.9 定義名稱，叢集模式才會產生，`kairos/HA.md` 第 6.6 節；依一般的主機離線寬限判斷，Pulse 改連其他節點後重新上線）。接收端應忽略不認得的值。**0.7 起主機 API、SSE 與 `/metrics` 都使用這組名稱**（過渡期主機 API 另帶舊名稱的 `offline_reason_legacy`，`API.md` 第 5.2 節）。`auth_failed`、`superseded` 不是離線原因（前者在 hello 之前被拒、後者主機仍在線上），以各自的事件發布；`revocation_unavailable` 保留給之後區分「CRL 問題造成的拒絕」（目前歸在 `certificate_rejected`，握手時被拒的另由 `tls::rejections` 記錄原因 `revocation_status_unavailable`）。
 
@@ -169,6 +170,20 @@ subnet_prefix_v6 = 64
 - 彙總事件只在範圍不限主機或範圍的網段涵蓋該網段時被靜音（保守：不因部分主機在範圍內就靜音整個彙總）。
 - 結束時（到期或提前結束）仍有範圍內未恢復的事件 → 立即送出一則「已結束，仍有 N 個事件未恢復」。
 - 範圍超過 1,000 台主機、所有規則＋全部主機、或包含緊急等級時，`preview` 回 `confirm.required`（主控台以 L1 確認；CLI 互動時詢問、非互動需 `--yes`）。
+
+### 5.5 升級中主機的離線告警抑制（0.10；REMOTE.md 第 4.7.5 節）
+
+升級推送中的主機在替換、重新啟動與健康確認期間（`rollout_hosts` 的 `applying` 到終止狀態之間）會短暫離線。遠端管理服務以匯流排的 `upgrade_window` 告訴引擎每台主機的抑制期限（`applying_at + health_timeout_secs + 10 分鐘`；到達終止狀態時解除；Kairos 重新啟動後依資料庫重建）。
+
+| | 行為 |
+|---|---|
+| 抑制的規則 | 離線類：`host_offline`（`sys.host_offline` 與自訂規則）、`host_long_offline`；升級中的主機不計入 `sys.subnet_offline`、`sys.mass_offline` 的台數 |
+| 不受影響 | 指標門檻、回報延遲、身分衝突、憑證被拒等其他規則；系統規則「升級推送已暫停」「升級回滾失敗」「發佈簽章驗證失敗」；**已經開著**的離線事件 |
+| 期限內 | 不開新事件、不通知（與靜音不同：不留下已靜音的事件）；主機恢復連線後不留任何紀錄 |
+| 期限過後仍離線 | 下一輪照常開事件並通知。離線時間以實際離線的時間計（`episode`、「已離線多久」），不重新起算 `grace_secs`；事件的 `details.upgrade`（`rollout_id`、`suppressed_until`〔Unix 毫秒〕）與處理紀錄 `upgrade_suppressed`（`rollout_id`、`until`）註明這台主機是在升級期間離線的 |
+| 推送暫停、取消 | 已交給輔助程式的主機照常抑制到期限（替換照常完成） |
+
+抑制只會由主機自己對 Kairos 提議給它的 `upgrade_id` 回報 `applying` 而開始（REMOTE.md 第 13.1 節），一次提議最長 `3600 + 600` 秒；沒有手動開關。
 
 ## 6. 通知（§2.1.1、§3.4、§5.4、§6）
 

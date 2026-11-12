@@ -105,6 +105,41 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 |---|---|---|
 | `KRS-E4406` | 這個命令不支援 PostgreSQL 後端（`kairos db backup`、`kairos reports import`） | **暫定**，待設計包正式分配（子類別 44） |
 
+> 0.10.0 的草稿（版本號與日期在整合時統一決定）。
+
+### 新增
+
+- **`kairos releases list|import|delete`**（F8，REMOTE.md 第 8.2、13.1 節）：Pulse 發佈版本庫的命令列。`import <目錄>` 讀取同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json` 與發佈檔，可以重複執行補上發佈檔，也可以在 Kairos 啟動前先匯入（離線環境）；`list [--json]` 列出版本、發佈檔與使用情形，並標出已存入而檔案遺失或大小不符的發佈檔；`delete <版本> --confirm <版本>`（L2）。驗證、`release_in_use` 的保護與稽核事件與主控台 API 相同，執行者為 `cli:<OS 帳號>`。`import --external <URL>` 的參數保留給外部 URL 的版本庫。
+- **系統健康的「版本庫的檔案遺失」**（F8，設計包 S20「遠端管理」列）：已存入的發佈檔不存在或大小與記錄不符時（例如還原備份之後：`kairos db backup` 不含發佈檔），`GET /api/v1/system/health` 的 `remote` 項目為警告（`KRS-W8417`〔暫定〕），`values.release_files_missing`、`missing_files[]` 列出版本、檔名與需要它回滾的主機數；主控台 S20 附「前往 Pulse 版本庫」。重新匯入這個版本的發佈檔即可（大小不符的檔案會被取代）。
+- **SSE `rollout.host`**（F8，REMOTE.md 第 8.4 節、API.md 第 17.5 節）：主控台的 SSE 連線以 `GET /api/v1/events?rollout_id=<推送>` 訂閱一個推送後，推送中每台主機的狀態、進度、代碼改變時收到 `rollout.host`（內容同主機表的一列；需要 `rollouts:read`，沒有訂閱或沒有權限的連線不會收到）。每台主機每一輪（最遲 5 秒）最多一則；一輪改變超過 200 台時改在 `rollout.progress` 帶 `hosts_resync: true`。主控台 S26 的推送詳情改為就地更新主機列，不再每次重新抓取主機表。
+- **S04 agent 版本欄的「低於建議版本」**（F8，REMOTE.md 第 4.9 節、R9）：`GET /api/v1/hosts` 新增 `meta.recommended_min_agent_version`（Pulse 版本庫中最新版本的發佈清單的 `min_upgrade_from`；沒有時 `null`）與每一列的 `agent_outdated`，主控台對低於它的主機加 ⚠ 與說明（無法遠端升級到最新版本，需要手動升級；協定仍相容）。只需要 `hosts:read`。
+- **全域搜尋納入升級推送與設定檔**（F8）：`GET /api/v1/rollouts`、`GET /api/v1/config/profiles` 新增查詢參數 `q`（推送的名稱、編號、目標版本；設定檔的名稱、說明；子字串、不分大小寫），主控台的全域搜尋（Ctrl+K）多了「升級推送」「設定檔」兩組，各需要 `rollouts:read`、`config:read`。
+
+- **升級中主機的離線告警抑制**（F8，REMOTE.md 第 4.7.5、13.1 節、ALERTS.md 第 5.5 節）：升級推送中的主機從交給輔助程式（`applying`）到回報結果之間，不再因為替換與重新啟動的短暫離線而開「主機離線」「主機長期失聯」事件（系統規則與自訂的 `host_offline`／`host_long_offline` 規則），也不計入網段離線、大規模離線的台數；其他規則（指標門檻、回報延遲…）不受影響。抑制最長到 `applying` 之後 `health_timeout_secs + 10 分鐘`：**超過後仍離線就照常告警**（離線時間以實際離線的時間計），事件的 `details.upgrade` 與處理紀錄的新動作 `upgrade_suppressed` 註明「升級中」；Kairos 重新啟動後抑制狀態由資料庫重建。Webhook 等接收端若列舉處理紀錄的動作，請忽略不認得的值。
+- **升級推送的自訂批次**（F8，REMOTE.md 第 4.7.1、13.1 節、API.md 第 17.3 節）：`waves` 由最多 2 批放寬為最多 10 批；每批的 `size` 為台數或**當時剩餘**的可升級主機的百分比，最後一批為 `"rest"`，每批各有觀察時間、失敗上限與是否人工繼續。省略 `waves` 時仍是 0.9 的兩批預設範本，既有兩批推送的分批結果不變。預覽另回 `wave_templates`（含第 4.7.1 節建議的四批範本 1% → 10% → 50% → 其餘）與 `max_waves`。主控台 S26 的建立表單可以增減「中間的批次」並套用四批範本，詳情的批次時間軸支援多批。
+- **升級推送的排程與維護時段**（F8，REMOTE.md 第 4.7.1、4.7.3、4.7.5、13.1 節、API.md 第 17.3 節）：推送新增 `schedule`——`starts_at`（在這之前為新的狀態 `scheduled`，到時由推送引擎開始）、`ends_at`（到時推送結束，尚未開始替換的主機標為 `expired`／`rollout_ended`）、`windows[]`（每週的維護時段：星期、`HH:MM` 的開始與結束，可跨午夜）與 `timezone`（固定位移，預設 `alerts.timezone`）。時段是「允許開始替換的時間」：時段外不提議新的主機，提議的 `apply_window` 到時段結束為止，已開始替換的照常完成；時段結束時還沒開始的主機在下一個時段重新提議，不計入失敗。`next_action` 新增 `scheduled`、`waiting_window`；已排程的推送可以取消，修改時退回草稿、需要重新送出。對象仍在**送出時**固定。Pulse 0.9.0 就會遵守 `apply_window`，不需要升級 Pulse。主控台 S26：建立表單的「排程與維護時段」、清單與詳情的「已排程」「等待維護時段」。
+- **升級推送的雙人覆核**（F8，REMOTE.md 第 5.4、13.1 節、API.md 第 17.3 節）：`kairos.toml` 新增 `[remote] rollout_approval = "none" | "required"`（預設 `none`，需要重新啟動，只能在設定檔改）。`required` 時送出的推送先進入新的狀態 `pending_approval`（對象已固定、不提議任何主機），必須由**另一位**有新權限 `rollouts:approve`（只有管理員）的使用者以帳號登入的工作階段核准（`POST /api/v1/rollouts/{id}/approve`）才會開始或排程；API token 不能核准（403 `session_required`），建立者與送出者不能核准（403 `self_approval`，`KRS-E6106`）。`…/reject`（原因必填）或修改待核准的推送會退回草稿，需要重新送出與核准。稽核 `rollout.approve`、`rollout.reject`；推送另記錄 `submitted_at`／`submitted_by`、`approved_at`／`approved_by`、`reject_reason`。主控台 S26：「待核准」狀態、核准…／退回…、不能核准自己的推送的說明，側邊導覽的計數泡泡對有核准權限的人另計待核准的推送。降版推送（L3）仍是固定字串＋原因，沒有重新驗證密碼（待決）。
+- **外部 URL 的 Pulse 版本庫**（F8，REMOTE.md 第 4.1.2、13.1、17.7 節）：發佈檔可以放在客戶自己的 HTTPS 伺服器，Kairos 只保存 `SHA256SUMS`、簽章與清單。
+  - **Kairos**：`POST /api/v1/releases` 的 `source: "external"`＋`base_url`、`kairos releases import <目錄> --external <base_url>`、主控台匯入對話框的「外部 URL（選填）」。簽章與雜湊的驗證與代管相同；要推送的發佈檔照樣上傳（或由 CLI 讀取）一次以**登記**雜湊與大小，但不保存在 Kairos。提議的 `artifact.source` 為 `url`、`url` 為 `base_url＋檔名`。主機目前版本的發佈是外部 URL 時，只在目標也是外部 URL 時才附回滾檔。
+  - **Pulse**：`[upgrade] url_allowlist`（0.9.0 已可設定，現在生效；**預設空＝只從 Kairos 下載**，行為不變）與 `external_ca`。提議的 URL 必須符合白名單的目錄前綴且指向提議的檔名，否則 `declined`（`PLS-W8411`，`url_not_allowed`）；以 HTTPS 下載（TLS 1.2 以上、不跟隨重新導向、大小以提議為上限、斷線以 `Range` 續傳、沒有代理）。**驗證鏈不變**：下載的檔案與從 Kairos 下載的一樣，要符合本機信任錨驗證過的 `SHA256SUMS`，輔助程式以 root 再驗證一次。
+  - 相容性：沒有新的協定 feature。0.9.0 的 Pulse（或沒有設定白名單的 0.10）收到外部 URL 的提議時回報 `declined`，不計入失敗比例；Kairos 目前無法在預覽時得知哪些主機允許外部 URL。
+
+### 變更
+
+- **資料庫 schema v10**（升級時自動套用，不可逆，升級前先備份）：`rollouts` 新增 `submitted_at`、`submitted_by`、`reject_reason`（雙人覆核）。升級後 0.9 的 Kairos 無法開啟。〔版本號在整合時與叢集線的遷移一起重新編號〕
+- `GET /api/v1/releases` 的每個版本多了 `base_url`，`artifacts[]` 多了 `registered`（外部 URL 的版本庫：已登記、檔案不在 Kairos）；`POST /api/v1/releases` 的 `source: "external"` 不再回 400（需要 `base_url`）。
+- 推送的本文帶 `schedule` 不再回 400（0.9.0 一律拒絕）；`windows`、`starts_at`、`ends_at`、`timezone` 要放在 `schedule` 物件內。`GET /api/v1/rollouts` 的 `state` 篩選多了 `scheduled`，讀取端應忽略不認得的 `state` 與 `next_action.code`。
+- 重複上傳同一個發佈檔（`PUT /api/v1/releases/{version}/artifacts/{filename}`、`kairos releases import`）時，版本庫中已有同名而大小不同的檔案會被取代（0.9.0 一律保留既有的檔案，被截斷的檔案無法以重新上傳修復）。
+
+### 尚未提供
+
+- **Windows 的遠端升級**（F8，REMOTE.md 第 4.4.4、18 節）：0.10.0 沒有實作，Windows 主機的 `install.upgrade` 仍是 `unsupported`（推送的資格分類為 `unsupported_platform`），以既有的 MSI／SCCM 升級；集中設定不受影響。理由：升級程序的每一步（脫離服務、`msiexec`、服務控制、ACL 檢查、回滾）都只能在 Windows 實機驗證，而信任邊界（ACL）寫錯不會有任何錯誤訊息；0.8.0 的 Windows 服務與 MSI 本身也還沒有實機驗證。需要的 VM 與驗證清單見 REMOTE.md 第 18.3 節，是否與何時實作待決定。
+
+### 新代碼
+
+- `KRS-W8417`〔暫定，待設計包正式分配〕：版本庫的檔案遺失。
+- `KRS-E6106`（設計包 §31.3 已分配，0.10 起使用）：不能核准自己建立或送出的推送（雙人覆核）。
+
 ## [0.9.0] - 2026-11-11
 
 **Kairos 0.9.0、Pulse 0.9.0**：衝刺 8——**指標轉出**（商業審計 F7，`kairos/EXPORT.md`：Prometheus exporter、OTLP/HTTP 推送、Grafana 儀表板）、**個資保護**（商業審計 S6，`kairos/PRIVACY.md`：`[privacy]`、刪除主機資料、個資匯出、DPA 範本骨架）與衝刺 4 延後的小項（手動簽發憑證的匯入、8444 的下載端點、`pulse enroll` 送出申請前的 429 等候、過期寬限期 #14 的端對端測試），**HA 的 L4**（審計 A2，`kairos/HA.md`：Pulse 的多個伺服器位址 `server.fallback_addresses`、協定 feature `cluster` 與關機排空 `drain`），**集中設定與 Pulse 遠端升級**（F8，`crates/kairos-proto/REMOTE.md`）的 Kairos 端（K1／K2）、Pulse 端（P1／P2）與共用協定（S1），另有高可用的規格。**協定版本不變（v1～v2）**，新增 feature `cluster`、`config`、`upgrade`（雙方都宣告時才使用），8444 的 API 不變，0.8 與 0.9 的任何組合都能連線；Kairos 的資料庫升級到 **schema v9**（不可逆，升級前先備份）。

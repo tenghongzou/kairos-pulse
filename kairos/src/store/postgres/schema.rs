@@ -968,9 +968,18 @@ ALTER TABLE enroll_requests ADD COLUMN issuing_at BIGINT;
 ALTER TABLE alert_deliveries ADD COLUMN claim_epoch BIGINT;
 "#;
 
+/// schema v11（0.10.0）：升級推送的雙人覆核（`crates/kairos-proto/REMOTE.md` 第 5.4 節）。與 SQLite 的
+/// `store/sqlite/remote.rs` `SCHEMA_V11_ROLLOUT_APPROVAL` 對等：`rollouts` 新增三個可為 NULL 的欄位
+/// （`approved_at`／`approved_by` v9 就有）
+pub const SCHEMA_V11: &str = r#"
+ALTER TABLE rollouts ADD COLUMN submitted_at BIGINT;
+ALTER TABLE rollouts ADD COLUMN submitted_by TEXT COLLATE "C";
+ALTER TABLE rollouts ADD COLUMN reject_reason TEXT COLLATE "C";
+"#;
+
 /// [`SCHEMA_V9`] 之後的升級步驟（版本, SQL），依序套用；最後一項的版本必須等於 SQLite 的
 /// `SCHEMA_VERSION`。空的 schema 建立 v9 後也依序套用這些步驟（每一步都是對 v9 之後的差異）
-pub const UPGRADES: &[(i32, &str)] = &[(10, SCHEMA_V10)];
+pub const UPGRADES: &[(i32, &str)] = &[(10, SCHEMA_V10), (11, SCHEMA_V11)];
 
 /// PostgreSQL 後端的第一個 schema 版本（[`SCHEMA_V9`]）；更舊的版本沒有升級路徑
 pub const BASE_VERSION: i32 = 9;

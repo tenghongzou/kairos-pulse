@@ -11,7 +11,7 @@
 //   → 無法自動回滾的 L2 字串（攔截預覽）→ L2 輸入「升級 1 台」送出 → 詳情；維運者只有「暫停…」（L1、原因必填；
 //   主控台暫停不附 KRS-W8414）→ 計數泡泡；自動暫停的標題與 KRS-W8414、計數泡泡依清單的 meta（攔截 API）→
 //   管理員「繼續…」→「取消推送…」。
-// - S20「遠端管理」列（信任錨未設定的警告與捷徑；唯讀不顯示）。
+// - S20「遠端管理」列（信任錨未設定的警告與捷徑；0.10 的「版本庫的檔案遺失」；唯讀不顯示）。
 // - S24（維運者，config:write）：新增設定檔（依 schema 產生的欄位、範圍錯誤、隱私敏感的選項）→ 指派全站（影響預覽）→
 //   修改產生第 2 版 → 版本歷史 → 回復到第 1 版 → 刪除被指派擋下 → S05「設定」分頁 → 解除指派 → 刪除；稽核員唯讀。
 // - S04 的「設定狀態」「遠端升級」篩選；S05 的「升級」卡片（攔截 API 模擬回滾失敗與「標記為已處理…」）。
@@ -178,6 +178,31 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await remoteRow.getByText(/信任錨未設定：匯入的發佈版本無法驗證簽章/).waitFor();
     await remoteRow.getByRole('link', { name: '前往 Pulse 版本庫' }).waitFor();
     await axe(page, 'F8 S20 遠端管理列');
+    // 版本庫的檔案遺失（0.10；以攔截的健康 API 模擬還原備份之後的狀態）：警告、代碼、前往版本庫的捷徑
+    await ctx.route('**/api/v1/system/health', async (route) => {
+      const real = await (await route.fetch()).json();
+      const items = (real.data.items || []).map((i) =>
+        i.id === 'remote'
+          ? {
+              ...i,
+              status: 'warning',
+              product_code: 'KRS-W8417',
+              summary: `版本庫的檔案遺失：${VERSION} 的 ${rel.tar}（3 台的回滾需要）；請重新匯入這個版本的發佈檔`,
+              values: { ...i.values, allowed_signers_configured: true, release_files_missing: 1, missing_files: [{ version: VERSION, filename: rel.tar, problem: 'missing', rollback_target_for: 3 }] },
+            }
+          : i,
+      );
+      await route.fulfill({ json: { ...real, data: { ...real.data, items } } });
+    });
+    await page.reload();
+    await waitTitle(page, '系統健康');
+    const missingRow = page.locator('[data-item="remote"]');
+    await missingRow.getByText(/版本庫的檔案遺失：.*3 台的回滾需要/).waitFor();
+    assert.equal(await missingRow.getAttribute('data-status'), 'warning');
+    await missingRow.getByText('KRS-W8417').waitFor();
+    assert.equal(await missingRow.getByRole('link', { name: '前往 Pulse 版本庫' }).getAttribute('href'), '/pulse/releases');
+    await axe(page, 'F8 S20 版本庫的檔案遺失');
+    await ctx.unroute('**/api/v1/system/health');
     await ctx.close();
     // 唯讀（沒有 rollouts:read）：不顯示「遠端管理」列
     const v = await newPage();
@@ -198,16 +223,65 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(upg.status, 200);
     assert.equal(upg.json.data.install.upgrade, 'ready');
     await axe(page, 'F8 S26 推送（空）');
+    // 0.10 排程：starts_at 在未來的推送送出後為「已排程」，可以取消（以 API 建立，畫面檢查清單與詳情）
+    const startsAt = new Date(Date.now() + 6 * 3600 * 1000).toISOString();
+    const sch = await api(page, 'POST', '/api/v1/rollouts', {
+      name: 'E2E 排程',
+      target_version: VERSION,
+      selector: { all: true },
+      waves: [{ size: 1, manual_continue: true }, { size: '50%', soak_minutes: 5 }, { size: 'rest' }],
+      schedule: { starts_at: startsAt, windows: [{ days: ['sat', 'sun'], start: '23:00', end: '03:00' }] },
+    });
+    assert.equal(sch.status, 201, JSON.stringify(sch.json));
+    const schId = sch.json.data.id;
+    assert.equal(sch.json.data.schedule.windows[0].end, '03:00');
+    assert.ok(sch.json.data.schedule.timezone, '有時段時填入預設時區');
+    const schSubmit = await api(page, 'POST', `/api/v1/rollouts/${schId}/submit`, { confirm: '升級 1 台' });
+    assert.equal(schSubmit.status, 200, JSON.stringify(schSubmit.json));
+    assert.equal(schSubmit.json.data.state, 'scheduled');
+    assert.equal(schSubmit.json.data.next_action.code, 'scheduled');
+    await page.reload();
+    await waitTitle(page, '升級推送');
+    const schRow = page.locator(`tr[data-rollout="${schId}"]`);
+    await schRow.getByText('已排程').first().waitFor();
+    await schRow.getByText(/已排程，.* 開始/).waitFor();
+    await axe(page, 'F8 S26 推送清單（已排程）');
+    await page.goto(`${URL0}/pulse/rollouts/${schId}`);
+    await waitTitle(page, 'E2E 排程');
+    await page.getByText(/已排程：.* 開始升級。對象已在送出時固定/).waitFor();
+    await page.locator('#rollout-schedule').getByText(/維護時段：週六、週日 23:00～03:00（時區 /).waitFor();
+    // 三批：先行批次、第 2 批、其餘
+    await page.locator('#rollout-waves').getByText('第 2 批').waitFor();
+    assert.equal(await page.getByRole('button', { name: '取消推送…' }).count(), 1, '已排程的推送可以取消');
+    await axe(page, 'F8 S26 推送詳情（已排程、三批）');
+    const schCancel = await api(page, 'POST', `/api/v1/rollouts/${schId}/cancel`, { reason: 'E2E：排程測試結束' });
+    assert.equal(schCancel.status, 200, JSON.stringify(schCancel.json));
+    await page.goto(`${URL0}/pulse/rollouts`);
+    await waitTitle(page, '升級推送');
     await page.getByRole('link', { name: '建立推送' }).first().click();
     await waitTitle(page, '建立推送');
-    // 0.10 的控制項不出現（維護時段、雙人覆核）
-    assert.equal(await page.getByText(/維護時段|核准者|雙人覆核/).count(), 0);
+    // 雙人覆核的控制項不出現
+    assert.equal(await page.getByText(/核准者|雙人覆核/).count(), 0);
     await page.getByLabel(/^名稱/).fill('E2E 0.9.1');
     const preview = page.locator('#rollout-preview');
     await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
     // 0.6／0.8 的假 agent：Pulse 太舊（0.8 → 0.9 必須手動升級一次）
     await preview.locator('li[data-reason="unsupported_version"]').waitFor();
     await preview.getByText('先行批次 1 台、其餘 0 台').waitFor();
+    // 0.10 自訂批次：套用建議的四批範本 → 預覽列出各批台數 → 移除中間的批次回到兩批
+    await page.getByRole('button', { name: /套用建議的四批範本/ }).click();
+    await preview.getByText('分 4 批：1 → 0 → 0 → 0 台').waitFor({ timeout: 15000 });
+    await page.locator('#rollout-mid-waves fieldset[data-wave="2"]').waitFor();
+    // 0.10 維護時段：新增一個時段，時區說明來自預覽的 default_timezone
+    await page.getByRole('button', { name: '新增時段' }).click();
+    await page.locator('#rollout-windows fieldset[data-window="0"]').waitFor();
+    await page.locator('#rollout-window-tz').getByText(/時段以 Kairos 的時區 [+-]\d\d:\d\d 計算/).waitFor({ timeout: 15000 });
+    await axe(page, 'F8 S26 建立推送（四批＋維護時段）');
+    await page.getByRole('button', { name: '移除時段 1' }).click();
+    await page.getByRole('button', { name: '移除第 2 批' }).click();
+    await page.getByRole('button', { name: '移除第 2 批' }).click();
+    assert.equal(await page.locator('#rollout-mid-waves fieldset').count(), 0);
+    await preview.getByText('先行批次 1 台、其餘 0 台').waitFor({ timeout: 15000 });
     await axe(page, 'F8 S26 建立推送');
     await shot(page, 'f8-rollout-new');
     // 數字欄位的範圍
@@ -314,6 +388,102 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await axe(ap.page, 'F8 S26 已自動暫停');
     await ap.ctx.close();
 
+    // 雙人覆核（0.10；REMOTE.md 第 5.4 節；測試用的 Kairos 沒有啟用，攔截詳情模擬 pending_approval）：
+    // 別人送出的推送 → 管理員看到「核准…」「退回…」；核准被伺服器拒絕（403 self_approval，KRS-E6106）時就地顯示；
+    // 自己建立的推送沒有「核准…」並說明原因；維運者（沒有 rollouts:approve）沒有這兩個按鈕
+    const pendingBy = (who) => async (route) => {
+      const r = await route.fetch();
+      const body = await r.json();
+      Object.assign(body.data, { state: 'pending_approval', next_action: { code: 'pending_approval' }, pause_reason: null, pause_cause: null, created_by: who, submitted_by: who, submitted_at: new Date().toISOString() });
+      return route.fulfill({ response: r, json: body });
+    };
+    const pa = await newPage();
+    await pa.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:someone-else'));
+    let approveCalls = 0;
+    await pa.page.route(`**/api/v1/rollouts/${rolloutId}/approve`, async (route) => {
+      approveCalls += 1;
+      return route.fulfill({
+        status: 403,
+        contentType: 'application/json',
+        body: JSON.stringify({ data: null, error: { code: 'self_approval', product_code: 'KRS-E6106', message: '不能核准自己建立或送出的推送，請由另一位有 rollouts:approve 權限的使用者核准' } }),
+      });
+    });
+    await login(pa.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(pa.page, 'E2E 0.9.1');
+    await pa.page.locator('.ds-alert', { hasText: '待核准' }).getByText(/user:someone-else 於 .* 送出，對象已固定/).waitFor();
+    assert.equal(await pa.page.getByRole('button', { name: '退回…' }).count(), 1);
+    assert.equal(await pa.page.getByRole('button', { name: '取消推送…' }).count(), 1, '待核准的推送可以取消');
+    await axe(pa.page, 'F8 S26 待核准（核准者）');
+    await pa.page.getByRole('button', { name: '核准…' }).click();
+    const ad = pa.page.getByRole('dialog');
+    await ad.getByText('核准推送「E2E 0.9.1」？').waitFor();
+    await axe(pa.page, 'F8 S26 核准確認');
+    await ad.getByRole('button', { name: '核准推送' }).click();
+    await ad.getByText('KRS-E6106').waitFor();
+    assert.equal(approveCalls, 1);
+    await ad.getByRole('button', { name: '取消' }).click();
+    await ad.waitFor({ state: 'detached' });
+    // 退回需要原因
+    await pa.page.getByRole('button', { name: '退回…' }).click();
+    const rd = pa.page.getByRole('dialog');
+    await rd.getByRole('button', { name: '退回推送' }).click();
+    await rd.getByText('請填寫原因').waitFor();
+    await rd.getByRole('button', { name: '取消' }).click();
+    await pa.ctx.close();
+    const own = await newPage();
+    await own.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin'));
+    await login(own.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(own.page, 'E2E 0.9.1');
+    await own.page.getByText('你建立或送出了這個推送，不能自己核准（KRS-E6106）。').waitFor();
+    assert.equal(await own.page.getByRole('button', { name: '核准…' }).count(), 0, '不能核准自己的推送');
+    assert.equal(await own.page.getByRole('button', { name: '退回…' }).count(), 1);
+    await own.ctx.close();
+    const po = await newPage();
+    await po.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin'));
+    await login(po.page, 'operator', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(po.page, 'E2E 0.9.1');
+    await po.page.locator('.ds-alert', { hasText: '待核准' }).waitFor();
+    assert.equal(await po.page.getByRole('button', { name: /^(核准…|退回…|取消推送…)$/ }).count(), 0, '維運者不能核准、退回或取消');
+    await po.ctx.close();
+
+    // 即時更新（0.10；REMOTE.md 第 8.4 節）：推送詳情以 ?rollout_id= 訂閱 SSE，收到 rollout.host 就地更新那一列，
+    // 之後的 rollout.progress 只重新載入頁首與批次、不重新抓取主機表（攔截 SSE：等主機表出現後才送出事件）
+    const lv = await newPage();
+    let rowReady = null;
+    const rowShown = new Promise((resolve) => (rowReady = resolve));
+    const watched = [];
+    await lv.page.route('**/api/v1/events**', async (route) => {
+      const u = new URL(route.request().url());
+      if (u.searchParams.get('rollout_id') !== rolloutId) return route.continue();
+      watched.push(u.search);
+      await rowShown;
+      const host = { rollout_id: rolloutId, agent_id: P09, hostname: 'pulse-09', upgrade_id: 'x', wave: 0, ordinal: 0, state: 'accepted', reason: null, from_version: '0.9.0', to_version: VERSION, attempts: 1, progress: { bytes: 18000, total: 40000 }, code: 'PLS-W8404', detail: '', offered_at: null, applying_at: null, finished_at: null, updated_at: new Date().toISOString(), acknowledged_at: null, acknowledged_by: null };
+      const progress = { rollout_id: rolloutId, state: 'paused', current_wave: 0, progress: { accepted: 1 }, pause_cause: 'manual', next_action: { code: 'paused', reason: 'x', cause: 'manual' } };
+      const body = `retry: 600000\n\nevent: ready\ndata: {"resumed":false}\n\nevent: rollout.host\ndata: ${JSON.stringify(host)}\n\nevent: rollout.progress\ndata: ${JSON.stringify(progress)}\n\n`;
+      return route.fulfill({ status: 200, contentType: 'text/event-stream', body });
+    });
+    let hostLists = 0;
+    lv.page.on('request', (rq) => {
+      if (rq.url().includes(`/api/v1/rollouts/${rolloutId}/hosts?`)) hostLists += 1;
+    });
+    await login(lv.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
+    await waitTitle(lv.page, 'E2E 0.9.1');
+    const liveRow = lv.page.locator(`tbody tr[data-key="${P09}"]`);
+    await liveRow.waitFor({ timeout: 15000 });
+    assert.equal(await liveRow.getByText('PLS-W8404').count(), 0);
+    const before = hostLists;
+    rowReady();
+    await liveRow.getByText('PLS-W8404').waitFor({ timeout: 15000 });
+    await liveRow.getByText('已接受').waitFor();
+    assert.match(await liveRow.innerText(), /45/, '進度 18000／40000');
+    assert.ok(watched.length >= 1 && watched[0].includes(`rollout_id=${rolloutId}`), 'SSE 以 rollout_id 訂閱');
+    // rollout.progress 之後 2 秒重新載入頁首與批次；主機表不重新抓取（那一列仍是事件的內容）
+    await lv.page.waitForTimeout(3500);
+    assert.equal(hostLists, before, '收到 rollout.host 後不重新抓取主機表');
+    assert.equal(await liveRow.getByText('PLS-W8404').count(), 1);
+    await axe(lv.page, 'F8 S26 推送詳情（即時更新後）');
+    await lv.ctx.close();
+
     // 管理員：繼續 → 取消
     const a = await newPage();
     await login(a.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
@@ -349,6 +519,45 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await a.page.getByText(`已刪除 Pulse ${VERSION}`).waitFor();
     await waitTitle(a.page, 'Pulse 版本庫');
     await a.ctx.close();
+  });
+
+  test('F8 S25 外部 URL 的版本庫（0.10）：base_url 不合法 → 匯入並登記（不存入 Kairos）→ 詳情 → 刪除', async () => {
+    const rel = testRelease();
+    const { ctx, page } = await newPage();
+    await login(page, 'admin', PW, '/pulse/releases');
+    await waitTitle(page, 'Pulse 版本庫');
+    await page.getByRole('button', { name: '匯入版本…' }).first().click();
+    const dlg = page.getByRole('dialog');
+    await dlg.getByLabel('檔案').setInputFiles(rel.good);
+    // http:// 不接受（只接受 https://，不可有查詢字串或帳號密碼）
+    await dlg.getByLabel('外部 URL（選填）').fill('http://repo.example.gov.tw/kairos-pulse/');
+    await dlg.getByRole('button', { name: '驗證並匯入' }).click();
+    // 錯誤的詳細訊息在可展開的技術細節中（HTTP 400 · invalid_parameter · base_url 不合法：…）
+    await dlg.locator('.k-code-line', { hasText: 'base_url 不合法' }).waitFor({ state: 'attached' });
+    await dlg.locator('.ds-alert').first().waitFor();
+    await axe(page, 'F8 S25 匯入對話框（外部 URL 不合法）');
+    await dlg.getByLabel('外部 URL（選填）').fill('https://Repo.example.gov.tw/kairos-pulse/0.9.1');
+    await dlg.getByRole('button', { name: '驗證並匯入' }).click();
+    await dlg.getByText(`2. 簽章驗證通過：Pulse ${VERSION}（commit ${COMMIT}）`).waitFor();
+    await dlg.locator(`li[data-file="${rel.tar}"]`).getByText('✓ 雜湊相符，已登記（檔案不存入 Kairos）').waitFor({ timeout: 20000 });
+    await dlg.getByRole('button', { name: '完成' }).click();
+    const row = page.locator(`tr[data-version="${VERSION}"]`);
+    await row.waitFor();
+    await row.getByRole('link', { name: VERSION }).click();
+    await waitTitle(page, `Pulse ${VERSION}`);
+    // base_url 已正規化（小寫的主機名稱、結尾的 /）；已登記的檔案與尚未登記的檔案
+    assert.equal((await page.locator('#release-base-url').textContent()).trim(), 'https://repo.example.gov.tw/kairos-pulse/0.9.1/');
+    await page.getByText(/這個版本的發佈檔不存放在 Kairos/).waitFor();
+    await page.locator(`tr[data-file="${rel.tar}"]`).getByText('已登記（外部 URL）').waitFor();
+    await page.locator(`tr[data-file="${rel.deb}"]`).getByText('待上傳').waitFor();
+    await axe(page, 'F8 S25 版本詳情（外部 URL）');
+    const got = await api(page, 'GET', `/api/v1/releases/${VERSION}`);
+    assert.equal(got.json.data.source, 'external');
+    const tarRow = got.json.data.artifacts.find((x) => x.filename === rel.tar);
+    assert.deepEqual([tarRow.stored, tarRow.registered, tarRow.size], [false, true, 40000]);
+    const del = await api(page, 'DELETE', `/api/v1/releases/${VERSION}`, { confirm: VERSION });
+    assert.equal(del.status, 200, JSON.stringify(del.json));
+    await ctx.close();
   });
 
   test('F8 S24 集中設定（維運者）：新增設定檔 → 指派全站 → 第 2 版 → 回復 → S05 設定分頁 → 解除指派、刪除', async () => {
@@ -481,6 +690,55 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(await page.getByRole('link', { name: '新增設定檔' }).count(), 0);
     const w = await api(page, 'DELETE', `/api/v1/config/profiles/${created.id}`, {});
     assert.equal(w.status, 403);
+    // 全域搜尋（0.10）：推送（名稱、編號、目標版本）與設定檔（名稱、說明）；稽核員有 rollouts:read、config:read
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('E2E');
+    const found = page.getByRole('listbox', { name: '搜尋結果' });
+    await found.getByRole('group', { name: '升級推送' }).getByRole('option', { name: /E2E 0\.9\.1/ }).waitFor();
+    await found.getByRole('group', { name: '設定檔' }).getByRole('option', { name: /E2E 稽核/ }).waitFor();
+    await axe(page, '全域搜尋（推送與設定檔）');
+    await found.getByRole('option', { name: /E2E 稽核/ }).click();
+    await waitTitle(page, 'E2E 稽核');
+    assert.equal(new URL(page.url()).pathname, `/pulse/config/${created.id}`);
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type(rolloutId);
+    await page.getByRole('option', { name: /E2E 0\.9\.1/ }).click();
+    await waitTitle(page, 'E2E 0.9.1');
+    assert.equal(new URL(page.url()).pathname, `/pulse/rollouts/${rolloutId}`);
+    // 唯讀角色（沒有 rollouts:read、config:read）：不查詢這兩個清單，也沒有結果
+    const vs = await newPage();
+    const asked = [];
+    vs.page.on('request', (rq) => {
+      const p = new URL(rq.url()).pathname;
+      if (p === '/api/v1/rollouts' || p === '/api/v1/config/profiles') asked.push(p);
+    });
+    await login(vs.page, 'viewer', PW, '/hosts');
+    await waitTitle(vs.page, '主機');
+    await vs.page.keyboard.press('Control+k');
+    await vs.page.keyboard.type('E2E 0.9');
+    await vs.page.getByText('沒有符合「E2E 0.9」的結果。').waitFor();
+    assert.deepEqual(asked, []);
+    await vs.page.keyboard.press('Escape');
+    // S04 agent 版本欄的 ⚠（0.10）：低於建議的最低版本（攔截主機清單：建議 0.9.5，全部標為低於）；只需要 hosts:read
+    await vs.page.route('**/api/v1/hosts?**', async (route) => {
+      const r = await route.fetch();
+      const body = await r.json();
+      if (!body.meta || !Array.isArray(body.data)) return route.fulfill({ response: r });
+      assert.ok('recommended_min_agent_version' in body.meta, 'meta.recommended_min_agent_version');
+      assert.ok(body.data.every((x) => typeof x.agent_outdated === 'boolean'), 'agent_outdated');
+      body.meta.recommended_min_agent_version = '0.9.5';
+      for (const x of body.data) x.agent_outdated = x.agent_id === P09;
+      return route.fulfill({ response: r, json: body });
+    });
+    await vs.page.goto(`${URL0}/hosts?q=pulse-09`);
+    await waitTitle(vs.page, '主機');
+    const flagged = vs.page.locator(`tbody tr[data-key="${P09}"] .k-version-flag`);
+    await flagged.waitFor({ timeout: 15000 });
+    assert.match(await flagged.getAttribute('title'), /低於建議的最低版本 0\.9\.5/);
+    assert.match(await flagged.innerText(), /低於建議的最低版本 0\.9\.5/, '螢幕報讀的文字');
+    assert.equal(await vs.page.locator('.k-version-flag').count(), 1, '其他主機不標示');
+    await axe(vs.page, 'S04 低於建議版本');
+    await vs.ctx.close();
     // S05 的「升級」卡片：回滾失敗（攔截 API）→ 稽核員沒有「標記為已處理…」
     await page.route(`**/api/v1/hosts/${P09}/upgrade`, (route) =>
       route.fulfill({
