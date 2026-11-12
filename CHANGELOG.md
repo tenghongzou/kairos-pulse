@@ -69,7 +69,7 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 **升級步驟（單機，SQLite；v9 → v11）**：
 
 1. 備份：`kairos db backup <檔案> --include-keys --password-stdin < <密碼檔>`（版本庫的發佈檔 `data/releases/` 不在備份中，需要時另外複製）。
-2. 換上 Kairos 0.10.0（tar.gz 照 INSTALL 第 11 節換執行檔；deb／rpm 直接升級）並啟動：schema 由 v9 依序升級到 v10、v11（只新增空的資料表與可為 NULL 的欄位，一個交易）。日誌出現「資料庫 schema 已升級」後，0.9 的 Kairos 就無法再開啟這個資料庫。
+2. 換上 Kairos 0.10.0（tar.gz 照 INSTALL 第 11 節換執行檔；deb／rpm 直接升級）並啟動：schema 由 v9 依序升級到 v10、v11（只新增空的資料表與可為 NULL 的欄位，一個交易）。升級完成後，0.9 的 Kairos 就無法再開啟這個資料庫（SQLite：`PRAGMA user_version` 為 11）。
 3. 換上 Pulse 0.10.0：0.9.0 的主機可以由 Kairos 推送（`min_upgrade_from` 仍是 0.9.0），或照舊手動升級。0.9 的 Pulse 可以繼續使用——排程、維護時段、自訂批次與雙人覆核都不需要升級 Pulse；只有外部 URL 的版本庫需要 Pulse 0.10.0。
 4. 需要時再啟用新功能：雙人覆核（`[remote] rollout_approval = "required"`，需要重新啟動，至少要有兩位管理員帳號）、外部 URL 的版本庫（每台 Pulse 的 `[upgrade] url_allowlist`）。
 
@@ -142,6 +142,10 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 
 - **外部 URL 的下載**（REMOTE.md 第 17.7 節）：`[upgrade] url_allowlist`（0.9.0 已可設定，現在生效；**預設空＝只從 Kairos 下載**，行為不變）與 `external_ca`。提議的 URL 必須符合白名單的目錄前綴且指向提議的檔名，否則 `declined`（`PLS-W8411`，`url_not_allowed`）；以 HTTPS 下載（TLS 1.2 以上、不跟隨重新導向、大小以提議為上限、斷線以 `Range` 續傳、沒有代理）。**驗證鏈不變**：下載的檔案與從 Kairos 下載的一樣，要符合本機信任錨驗證過的 `SHA256SUMS`，輔助程式以 root 再驗證一次。
 - 其餘沒有變更：0.10.0 沒有新的協定 feature；叢集模式的容錯移轉使用 0.9.0 已有的 `server.fallback_addresses` 與 feature `cluster`。
+
+### 修正
+
+- **`kairos reports export` 在 Kairos 執行中可能誤報「report 內容損毀」**（`KRS-E4301`，結束代碼 1；0.3.0 起就有，兩個儲存後端都是）：匯出先讀序列對照表、再讀 report，兩次讀取各自的快照；剛好有新的主機或新的指標出現（Kairos 在同一個交易中建立序列並寫入參照它的 report）時，後讀到的 report 參照對照表中沒有的序列而被誤判。資料沒有損毀，重新執行就會成功。現在兩者在同一個快照（SQLite：同一個讀取交易；PostgreSQL：`REPEATABLE READ` 的唯讀交易）中讀取。整合時由叢集的端對端測試發現（三次中出現一次）。
 
 ### 已知限制
 

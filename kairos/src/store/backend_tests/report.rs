@@ -1052,7 +1052,64 @@ fn purging_a_host_keeps_the_others(db: &TestDb) -> String {
     out
 }
 
+/// `kairos reports export` 在 Kairos 寫入的同時執行（CLI 另一條連線）：writer 在同一個交易中建立新的序列
+/// 並寫入參照它的 report。匯出必須在**同一個快照**中讀取序列對照表與 report，否則剛提交的 report 參照的
+/// 序列不在先前讀到的對照表中，會誤報「report 內容損毀」（`KRS-E4301`）
+fn export_sees_series_and_reports_in_one_snapshot(db: &TestDb) -> String {
+    const BATCHES: u64 = 200;
+    let mut o = db.opts();
+    o.max_series_per_host = 10_000;
+    let (mut store, _) = db.store_with(o, noon);
+    assert_eq!(
+        store.write_batch(&[metrics_record(A, 0, noon(), 1.0)]),
+        [WriteStatus::Written]
+    );
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            for i in 1..=BATCHES {
+                // 每一批都帶一個新的序列
+                let record = ReportRecord::new(
+                    noon() + chrono::Duration::seconds(i as i64),
+                    "10.0.0.2:5000".into(),
+                    A.into(),
+                    "web-01".into(),
+                    i,
+                    fmt_time(noon()),
+                    RecordBody::Metrics {
+                        metrics: vec![Metric::new(&format!("test.series.{i}"), i, "1")],
+                    },
+                );
+                let status = store.write_batch(&[record]);
+                assert_eq!(status, [WriteStatus::Written], "第 {i} 批");
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            store.close();
+        })
+    };
+    let reader = db.read();
+    let mut exports = 0;
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        let mut seen = 0_u64;
+        let n = reader
+            .export_reports(0, None, &mut |_| {
+                seen += 1;
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("寫入期間的第 {} 次匯出失敗：{e}", exports + 1));
+        assert_eq!(n, seen);
+        exports += 1;
+    }
+    writer.join().expect("writer");
+    assert!(exports > 0);
+    let n = reader.export_reports(0, None, &mut |_| Ok(())).unwrap();
+    assert_eq!(n, BATCHES + 1);
+    String::new()
+}
+
 backend_tests!(
+    export_sees_series_and_reports_in_one_snapshot,
     reports_are_stored_and_read_back,
     duplicates_are_acknowledged_but_stored_once,
     failures_and_unknown_commits,

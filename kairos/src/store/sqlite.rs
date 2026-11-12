@@ -3263,7 +3263,11 @@ pub fn list_hosts(conn: &Connection) -> Result<Vec<HostRow>, Error> {
 
 /// 匯出原始 report（`kairos reports export`）：取樣時間（`reports.ts`）不早於 `since_ms` 的 report，
 /// 依寫入順序轉回 JSONL 的格式（[`ReportRecord`]，`recv_at` 為收到的時間 = `ts + recv_lag`）逐筆
-/// 交給 `out`。SQLite 不逐筆保存 `peer` 與 `hostname`，以主機清冊中最後的值代替。回傳匯出的筆數
+/// 交給 `out`。SQLite 不逐筆保存 `peer` 與 `hostname`，以主機清冊中最後的值代替。回傳匯出的筆數。
+///
+/// 序列對照表與 report 在**同一個讀取交易**（同一個快照）中讀取：writer 在同一個交易中建立新的序列並寫入
+/// 參照它的 report，兩個敘述各自讀取時，在兩者之間提交的 report 會參照對照表中沒有的序列而被誤判為
+/// 「內容損毀」（Kairos 執行中匯出、剛好有新的主機或指標出現時）。呼叫端已在交易中時沿用它的交易
 pub fn export_reports(
     conn: &Connection,
     since_ms: i64,
@@ -3271,6 +3275,12 @@ pub fn export_reports(
     mut out: impl FnMut(&ReportRecord) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     let fail = |e| db_error("無法讀取 report", e);
+    // 唯讀：結束時回復即可（drop）
+    let _snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction().map_err(fail)?)
+    } else {
+        None
+    };
     let mut series: HashMap<i64, (String, String, std::collections::BTreeMap<String, String>)> =
         HashMap::new();
     {

@@ -112,7 +112,26 @@ fn real_kairos_pushes_central_config_to_a_real_pulse() {
         host_config()
     );
     let hc = host_config();
-    assert_eq!(hc["agent_version"], "0.9.0", "{hc}");
+    // 實際的 Pulse 回報自己的版本（pulse/Cargo.toml；不寫死，版本號改變時不必修改測試）
+    let pulse_version = {
+        let (code, p) = kp_e2e::run_to_exit("pulse", &pulse.dir, &["--version"], &[]);
+        assert_eq!(code, 0, "{}", p.dump());
+        p.stdout()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "pulse --version 的輸出不是「pulse <版本> (<commit>)」：{}",
+                    p.dump()
+                )
+            })
+            .to_string()
+    };
+    assert_eq!(hc["agent_version"], pulse_version.as_str(), "{hc}");
+    assert!(
+        pulse_version.split('.').count() == 3 && pulse_version != "0.0.0",
+        "{pulse_version}"
+    );
     assert_eq!(hc["config_state"], "in_sync", "{hc}");
     assert_eq!(status(&pulse)["report_interval_ms"], 5000, "內建預設");
 

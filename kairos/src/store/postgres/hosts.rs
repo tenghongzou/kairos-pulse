@@ -414,8 +414,31 @@ pub fn list_hosts(conn: &PgConn) -> PgResult<Vec<HostRow>> {
 /// 交給 `out`。資料庫不逐筆保存 `peer` 與 `hostname`，以主機清冊中最後的值代替。回傳匯出的筆數。
 ///
 /// client 原本的 `ts` 在 PostgreSQL 拆成兩欄：`agent_ts_ms`（可無損還原的 RFC 3339，以毫秒保存）與
-/// `agent_ts_text`（其餘原樣保存的字串），兩者最多一個非 NULL。report 以串流讀取（不全部放進記憶體）
+/// `agent_ts_text`（其餘原樣保存的字串），兩者最多一個非 NULL。report 以串流讀取（不全部放進記憶體）。
+///
+/// 序列對照表與 report 在**同一個快照**（`REPEATABLE READ` 的唯讀交易）中讀取：writer 在同一個交易中建立
+/// 新的序列並寫入參照它的 report，分成兩個敘述各自的快照時，在兩者之間提交的 report 會參照對照表中沒有
+/// 的序列而被誤判為「內容損毀」（Kairos 執行中匯出、剛好有新的主機或指標出現時）。呼叫端已在交易中時
+/// 沿用它的交易
 pub fn export_reports(
+    conn: &PgConn,
+    since_ms: i64,
+    agent_id: Option<&str>,
+    out: &mut dyn FnMut(&ReportRecord) -> Result<(), std::io::Error>,
+) -> PgResult<u64> {
+    let snapshot = if conn.in_transaction() {
+        None
+    } else {
+        Some(conn.begin_snapshot()?)
+    };
+    let n = export_reports_in_snapshot(conn, since_ms, agent_id, out)?;
+    if let Some(tx) = snapshot {
+        tx.commit()?;
+    }
+    Ok(n)
+}
+
+fn export_reports_in_snapshot(
     conn: &PgConn,
     since_ms: i64,
     agent_id: Option<&str>,
