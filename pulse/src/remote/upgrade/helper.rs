@@ -432,7 +432,7 @@ impl Helper<'_> {
     /// 寫入狀態檔；失敗時回錯誤（替換前：不得繼續，見 [`Helper::replace`]）
     fn try_save(&mut self, s: &HelperState) -> Result<(), String> {
         let b = serde_json::to_vec_pretty(s).map_err(|e| format!("無法產生狀態檔：{e}"))?;
-        crate::remote::write_atomic(&self.state_path, &b, 0o600, 0o700)
+        crate::remote::write_atomic_durable(&self.state_path, &b, 0o600, 0o700)
             .map_err(|e| format!("無法寫入 {}：{e}", self.state_path.display()))
     }
 

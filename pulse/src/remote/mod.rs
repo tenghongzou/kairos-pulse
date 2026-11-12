@@ -68,6 +68,27 @@ pub fn write_atomic(path: &Path, content: &[u8], mode: u32, dir_mode: u32) -> io
     result
 }
 
+/// [`write_atomic`]，另外在改名之後 fsync 上層目錄（Unix）：改名本身要等目錄的資料寫入磁碟才算持久，
+/// 否則斷電後可能回到舊的內容或檔案不存在。升級輔助程式的狀態檔與進行中交易的指標使用（重新開機後的
+/// 接續只信它們）；其他呼叫點維持 [`write_atomic`]。Windows 沒有對應的作法，與 [`write_atomic`] 相同
+pub fn write_atomic_durable(
+    path: &Path,
+    content: &[u8],
+    mode: u32,
+    dir_mode: u32,
+) -> io::Result<()> {
+    write_atomic(path, content, mode, dir_mode)?;
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// 建立目錄（含上層），Unix 上新建的目錄權限為 `mode`
 pub fn create_dir_all_mode(dir: &Path, mode: u32) -> io::Result<()> {
     if dir.is_dir() {
