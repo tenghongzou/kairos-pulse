@@ -531,6 +531,11 @@ scenario_tamper_resume() {
     fake=$(cat /proc/sys/kernel/random/uuid)
     say "情境 f：升級中改寫 request.json 的 upgrade_id 後重新開機 $cur → $T4（崩潰 → 回滾確認中竄改並重新開機 → 接續原交易）"
     rm -f "$WORK/rebooted" "$WORK/tampered"
+    # 情境 d 留下暫停的推送（它的主機仍算在未結束的推送中，新的推送會 409 rollout_overlap）：先取消
+    api GET "/api/v1/rollouts?state=paused" >/dev/null
+    for rid in $(body | jq -r '.data[].id'); do
+        api POST "/api/v1/rollouts/$rid/cancel" '{"reason":"systest：tamper-resume 之前取消暫停的推送"}' >/dev/null
+    done
     id=$(rollout "systest tamper resume" $T4)
     pids=""
     for th in $HOSTS; do
