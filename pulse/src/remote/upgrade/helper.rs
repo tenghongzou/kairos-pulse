@@ -251,6 +251,9 @@ struct HelperState {
     target: Option<kairos_proto::mgmt::UpgradeTarget>,
     #[serde(default)]
     rollback_artifact: Option<String>,
+    /// 這次升級已經把替換前的執行檔保留為 `pulse.prev`（之後不再覆寫，見 [`Helper::replace`]）
+    #[serde(default)]
+    prev_saved: bool,
     /// 最後的結果（`Done` 時）
     result: Option<UpgradeResult>,
 }
@@ -261,6 +264,10 @@ pub const DETAIL_FROM_VERSION_MISMATCH: &str = "from_version_mismatch";
 pub const NOTE_FROM_VERSION_IGNORED: &str = "request_from_version_ignored";
 /// `request.json` 的 `method` 與輔助程式自己偵測到的安裝方式不符時，結果 `detail` 的開頭
 pub const DETAIL_METHOD_MISMATCH: &str = "method_mismatch";
+/// 狀態檔損毀或遺失、而這次升級已經開始替換時，結果 `detail` 的開頭
+pub const DETAIL_STATE_UNUSABLE: &str = "state_unusable";
+/// 替換前無法寫入狀態檔時，結果 `detail` 的開頭
+pub const DETAIL_STATE_NOT_SAVED: &str = "state_not_saved";
 /// 接續時 `request.json` 的 `method`、`target` 或 `rollback_artifact` 與狀態檔記下的不同：沿用狀態檔的內容
 pub const NOTE_REQUEST_FIELDS_IGNORED: &str = "request_fields_ignored";
 
@@ -349,10 +356,7 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         ),
     );
     let state_path = work.join("state.json");
-    let state = std::fs::read(&state_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<HelperState>(&b).ok())
-        .filter(|s| s.schema == HELPER_SCHEMA);
+    let state = read_state(&state_path, &work);
     let mut h = Helper {
         paths,
         sys,
@@ -361,9 +365,40 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         state_path,
         log,
     };
-    let r = h.drive(state);
+    let r = match state {
+        Ok(state) => h.drive(state),
+        // 狀態檔不可用而這次升級已經動過手：不當成全新的請求（那樣會改信 request.json，並可能以新版覆寫
+        // pulse.prev）。不替換也不回滾，回報後由人處理
+        Err(why) => h.fail(
+            codes::E_UPGRADE_INTEGRITY,
+            format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required"),
+        ),
+    };
     h.finish(&r);
     Ok(r)
+}
+
+/// 讀取這次升級的狀態檔。`Ok(None)`：全新的請求（沒有狀態檔，工作目錄中也沒有替換階段才會出現的檔案）。
+/// `Err`：狀態檔存在但讀不到、不是合法的內容或 schema 不符，或狀態檔不見了而工作目錄裡已有替換階段的
+/// 檔案（`rollback.pkg`、`pulse.service.prev`——都在第一次寫入狀態檔之後才建立）
+fn read_state(state_path: &Path, work: &Path) -> Result<Option<HelperState>, String> {
+    match std::fs::read(state_path) {
+        Ok(b) => match serde_json::from_slice::<HelperState>(&b) {
+            Ok(s) if s.schema == HELPER_SCHEMA => Ok(Some(s)),
+            Ok(s) => Err(format!("state.json has schema {:?}", s.schema)),
+            Err(e) => Err(format!("state.json is not valid: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match ["rollback.pkg", "pulse.service.prev"]
+                .iter()
+                .find(|n| work.join(n).exists())
+            {
+                Some(n) => Err(format!("state.json is missing but {n} exists")),
+                None => Ok(None),
+            }
+        }
+        Err(e) => Err(format!("state.json cannot be read: {e}")),
+    }
 }
 
 struct Helper<'a> {
@@ -386,14 +421,19 @@ struct Prepared {
 }
 
 impl Helper<'_> {
+    /// 寫入狀態檔。替換之後的步驟寫不進去時只能記下來繼續（不能半途停下；這次執行仍會做完健康確認與
+    /// 回滾，只有重新開機後的接續受影響）
     fn save(&mut self, s: &HelperState) {
-        let b = serde_json::to_vec_pretty(s).unwrap_or_default();
-        if let Err(e) = crate::remote::write_atomic(&self.state_path, &b, 0o600, 0o700) {
-            self.log.line(
-                "WARN",
-                &format!("無法寫入 {}：{e}", self.state_path.display()),
-            );
+        if let Err(e) = self.try_save(s) {
+            self.log.line("WARN", &e);
         }
+    }
+
+    /// 寫入狀態檔；失敗時回錯誤（替換前：不得繼續，見 [`Helper::replace`]）
+    fn try_save(&mut self, s: &HelperState) -> Result<(), String> {
+        let b = serde_json::to_vec_pretty(s).map_err(|e| format!("無法產生狀態檔：{e}"))?;
+        crate::remote::write_atomic(&self.state_path, &b, 0o600, 0o700)
+            .map_err(|e| format!("無法寫入 {}：{e}", self.state_path.display()))
     }
 
     /// `request.json` 由服務帳號寫入、不可信（REMOTE.md 第 5.1、17.8 節）。決定「怎麼替換、回滾到哪一版」
@@ -507,6 +547,7 @@ impl Helper<'_> {
         if let Err(r) = self.trust_request(state.as_mut()) {
             return *r;
         }
+        let mut prior = None;
         if let Some(s) = state {
             match s.step {
                 Step::Done => {}
@@ -524,14 +565,16 @@ impl Helper<'_> {
                     };
                     return self.confirm_rollback(s, reason);
                 }
-                Step::Verified => {}
+                // 上一次執行在「寫入狀態檔」與「記下已替換」之間中斷：重新驗證後再替換一次，但沿用當時
+                // 記下的內容（pulse.prev 是否已保留）
+                Step::Verified => prior = Some(s),
             }
         }
         let prepared = match self.prepare() {
             Ok(p) => p,
             Err(r) => return *r,
         };
-        self.replace(prepared)
+        self.replace(prepared, prior)
     }
 
     fn fail(&mut self, code: &str, detail: String) -> UpgradeResult {
@@ -818,21 +861,18 @@ impl Helper<'_> {
         })
     }
 
-    /// 步驟 4：保留舊版、替換、重新啟動
-    fn replace(&mut self, p: Prepared) -> UpgradeResult {
+    /// 步驟 4：保留舊版、替換、重新啟動。
+    ///
+    /// 順序（fail closed）：**先寫入狀態檔**（`Verified`：替換前的版本、安裝方式、目標）——接續時只信這份
+    /// 狀態檔，寫不進去就不得開始替換；再保留 `pulse.prev` 與回滾檔，並把「已保留」記進狀態檔（同樣寫不
+    /// 進去就停）。`prior` 是上一次執行留下的 `Verified` 狀態：當時已保留過 `pulse.prev` 的話不再覆寫——
+    /// 上一次可能在替換完成、還沒記下 `Replaced` 時中斷，此時目前的執行檔已是新版，再複製一次會把舊版的
+    /// 備份蓋掉，之後的回滾就換不回舊版
+    fn replace(&mut self, p: Prepared, prior: Option<HelperState>) -> UpgradeResult {
         let install = self.paths.install_dir.clone();
         let current = install.join("pulse");
         let prev = install.join("pulse.prev");
-        if let Err(e) = copy_executable(&current, &prev) {
-            return self.fail(
-                codes::E_UPGRADE_REPLACE,
-                format!("無法保留目前的執行檔：{e}"),
-            );
-        }
-        // 回滾檔留在工作目錄（重新開機後接續時使用）
-        if let Some(r) = &p.rollback {
-            let _ = std::fs::copy(r, self.work.join("rollback.pkg"));
-        }
+        let prev_saved = prior.as_ref().is_some_and(|s| s.prev_saved) && prev.is_file();
         let mut state = HelperState {
             schema: HELPER_SCHEMA.to_string(),
             step: Step::Verified,
@@ -847,11 +887,41 @@ impl Helper<'_> {
             from_version: self.req.from_version.clone(),
             method: self.req.method.clone(),
             target: Some(self.req.target.clone()),
-            // 只記通過驗證的回滾檔（已複製到工作目錄的 rollback.pkg）
+            // 只記通過驗證的回滾檔（之後複製到工作目錄的 rollback.pkg）
             rollback_artifact: p.rollback.as_ref().and(self.req.rollback_artifact.clone()),
+            prev_saved,
             result: None,
         };
-        self.save(&state);
+        if let Err(e) = self.try_save(&state) {
+            return self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+            );
+        }
+        if prev_saved {
+            self.log.line(
+                "INFO",
+                "上一次執行已保留 pulse.prev（在記下「已替換」之前中斷），不再覆寫",
+            );
+        } else {
+            if let Err(e) = copy_executable(&current, &prev) {
+                return self.fail(
+                    codes::E_UPGRADE_REPLACE,
+                    format!("無法保留目前的執行檔：{e}"),
+                );
+            }
+            state.prev_saved = true;
+            if let Err(e) = self.try_save(&state) {
+                return self.fail(
+                    codes::E_UPGRADE_REPLACE,
+                    format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+                );
+            }
+        }
+        // 回滾檔留在工作目錄（重新開機後接續時使用）
+        if let Some(r) = &p.rollback {
+            let _ = std::fs::copy(r, self.work.join("rollback.pkg"));
+        }
         let before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
         let replaced = match self.req.method.as_str() {
             "tar" => {

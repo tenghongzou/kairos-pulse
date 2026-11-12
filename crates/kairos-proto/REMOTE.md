@@ -1298,9 +1298,13 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - **安裝方式由輔助程式自己偵測**（與 Pulse 回報 `install.method` 相同的判斷：`/opt/pulse/.install-method`、dpkg／rpm 的資料庫、執行檔的位置，都不是服務帳號可寫的）。第一次執行時請求的 `method` 與偵測結果不符就拒絕（`PLS-E8402`，`method_mismatch: request says <x>, detected install method is <y>`）。
 - 替換前另外把 `method`、`target`（版本與 commit）與通過驗證的回滾檔名寫進 `state.json`。**接續時這些欄位一律取自 `state.json`**，不重新偵測、也不採用 `request.json` 的值；請求被改過時在結果的 `detail` 加註 `request_fields_ignored`。接續時輔助程式仍會讀 `request.json`，但只用它的 `upgrade_id` 找到工作目錄（健康確認的期限在替換時也已記在 `state.json`）。
 - `Request::validate` 另外要求 `from_version` 是合法的版本號（不合法的請求整份拒絕並刪除）。
+- **狀態檔 fail closed**（接續時只信它，所以它不能悄悄失效）：
+  - 替換前的順序改為「先寫入 `state.json`（`verified`：版本、安裝方式、目標）→ 保留 `pulse.prev` → 再寫一次（記下已保留）→ 複製回滾檔 → 替換」。這兩次寫入任何一次失敗就**不開始替換**：`failed`、`PLS-E8406`、`state_not_saved: …`。0.9.0 寫入失敗只記 `WARN` 後照常替換。替換之後的步驟（`replaced`、`rolling_back`、`done`）寫不進去時仍只記 `WARN`——不能半途停下，這次執行會做完健康確認與回滾，只有重新開機後的接續受影響。
+  - `state.json` 存在但讀不到、不是合法的內容或 schema 不符，或 `state.json` 不見了而工作目錄裡已有替換階段才會出現的檔案（`rollback.pkg`、`pulse.service.prev`）時，**不當成全新的請求**（0.9.0 會重新開始並改信 `request.json`）：`failed`、`PLS-E8402`、`state_unusable: …; manual check required`，不替換也不回滾，由人檢查這台主機。只有日誌（上一次在預檢時中斷）的工作目錄照常重新開始。
+- **替換完成到記下 `replaced` 之間中斷**（當機、斷電）：狀態仍是 `verified`，接續時會重新驗證並再替換一次。0.9.0 的 `replace()` 一開始就覆寫 `pulse.prev`——此時目前的執行檔已是新版，舊版的備份被新版蓋掉，之後健康確認失敗時「回滾」換回的仍是新版（tar，以及沒有回滾檔的 deb／rpm），最後是 `rollback_failed`。現在 `state.json` 記下這次升級是否已保留 `pulse.prev`（`prev_saved`），已保留就不再覆寫。這個窗口中 tar 安裝已換上的新 unit 不會在回滾時還原（`unit_replaced` 是在替換之後才記下的），留給 ADR-0003 的實作。
 - 由 0.9.0 的輔助程式寫入的 `state.json` 沒有 `from_version`：升級到 0.10.0 的途中重新開機時，接續的（0.10.0 的）輔助程式只能沿用請求中的值，行為與 0.9.0 相同——那一次升級的回滾檔已由 0.9.0 的輔助程式驗證並複製。**從 0.9.0 升級到 0.10.0 的那一次仍在受影響的範圍內**；之後的升級才受到保護。
 
-**測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`、`method_and_target_come_from_the_helper_and_the_recorded_state`（`helper/tests.rs`）；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。
+**測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`、`method_and_target_come_from_the_helper_and_the_recorded_state`、`the_state_file_fails_closed`、`a_crash_between_replacing_and_recording_it_keeps_the_old_backup`（`helper/tests.rs`）；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。
 
 **這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。回滾檔所屬發佈的信任方式（目前是 Pulse 保存的 `SHA256SUMS` 紀錄，由輔助程式以信任錨重新驗證簽章）也由 ADR-0003 處理。
 

@@ -46,6 +46,8 @@ struct Fake {
     dpkg_locks: Cell<u32>,
     check_config: Cell<i32>,
     version_override: RefCell<Option<String>>,
+    /// 預檢的最後一步（check-config）執行時呼叫：模擬「預檢之後、替換之前」發生的事
+    after_precheck: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 fn binary_version(path: &Path) -> String {
@@ -73,6 +75,7 @@ impl Fake {
             dpkg_locks: Cell::new(0),
             check_config: Cell::new(0),
             version_override: RefCell::new(None),
+            after_precheck: RefCell::new(None),
         }
     }
 
@@ -234,6 +237,9 @@ impl System for Fake {
                         .unwrap_or_else(|| binary_version(program));
                     ok(format!("pulse {v} (5e6f7a8)\n"))
                 } else {
+                    if let Some(f) = self.after_precheck.borrow().as_ref() {
+                        f();
+                    }
                     Output {
                         status: Some(self.check_config.get()),
                         stdout: "{}".into(),
@@ -1087,5 +1093,177 @@ fn method_and_target_come_from_the_helper_and_the_recorded_state() {
     assert!(!r.detail.contains("binary_restored"), "{}", r.detail);
     assert_eq!(fake.calls(), ["dpkg rollback.pkg", "restart"]);
     assert_eq!(env.installed(), "0.9.0");
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// 接續時只信 root 的狀態檔，所以它必須 fail closed（REMOTE.md 第 17.8 節）：
+/// 替換前寫不進狀態檔就不得開始替換；狀態檔損毀，或不見了而工作目錄裡已有替換階段的檔案時，不得當成
+/// 全新的請求（那樣會改信 `request.json`）
+#[test]
+fn the_state_file_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // 1. 替換前無法寫入狀態檔：不替換
+    let env = setup("state-unwritable", "tar");
+    let work = env.paths.work_root.join(ID);
+    let fake = Fake::new(&env.root);
+    let w = work.clone();
+    *fake.after_precheck.borrow_mut() = Some(Box::new(move || {
+        std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o500)).unwrap();
+    }));
+    let r = apply(&env.paths, &fake).unwrap();
+    let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
+    // root 不受目錄權限限制（容器中以 root 執行測試時）：這一段無法模擬，略過
+    let probe = work.join("probe");
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let is_root = std::fs::write(&probe, b"x").is_ok();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if !is_root {
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("failed", Some(codes::E_UPGRADE_REPLACE)),
+            "{r:?}"
+        );
+        assert!(r.detail.starts_with(DETAIL_STATE_NOT_SAVED), "{}", r.detail);
+        assert_eq!(env.installed(), "0.9.0");
+        assert!(!env.paths.install_dir.join("pulse.prev").exists());
+        assert!(
+            !fake.calls().contains(&"restart".to_string()),
+            "{:?}",
+            fake.calls()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 2. 狀態檔損毀（不是合法的內容、schema 不符、讀不到）：不重新開始
+    for (name, content) in [
+        ("garbage", Some("{ not json")),
+        (
+            "schema",
+            Some(
+                r#"{"schema":"something/else","step":"replaced","deadline_unix":0,"n_restarts_before":0,"restarted_unix":0,"unit_replaced":false,"notes":[],"result":null}"#,
+            ),
+        ),
+        ("unreadable", None),
+    ] {
+        let env = setup(&format!("state-{name}"), "tar");
+        let work = env.paths.work_root.join(ID);
+        std::fs::create_dir_all(&work).unwrap();
+        match content {
+            Some(c) => std::fs::write(work.join("state.json"), c).unwrap(),
+            // 一個目錄：讀取失敗但不是「不存在」
+            None => std::fs::create_dir(work.join("state.json")).unwrap(),
+        }
+        // 已替換成新版、pulse.prev 是舊版：重新開始的話會以新版覆寫 pulse.prev
+        std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
+        std::fs::write(env.paths.install_dir.join("pulse.prev"), "VERSION=0.9.0\n").unwrap();
+        let fake = Fake::new(&env.root);
+        let r = apply(&env.paths, &fake).unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("failed", Some(codes::E_UPGRADE_INTEGRITY)),
+            "{name}: {r:?}"
+        );
+        assert!(
+            r.detail.starts_with(DETAIL_STATE_UNUSABLE),
+            "{name}: {}",
+            r.detail
+        );
+        assert!(fake.calls().is_empty(), "{name}: {:?}", fake.calls());
+        assert_eq!(
+            binary_version(&env.paths.install_dir.join("pulse.prev")),
+            "0.9.0",
+            "{name}"
+        );
+        let _ = std::fs::remove_dir_all(&env.root);
+    }
+
+    // 3. 狀態檔不見了，但工作目錄裡有替換階段才會出現的檔案
+    let env = setup("state-missing", "deb");
+    let work = env.paths.work_root.join(ID);
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("rollback.pkg"), "VERSION=0.8.0\n").unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_INTEGRITY), "{r:?}");
+    assert!(
+        r.detail.starts_with(DETAIL_STATE_UNUSABLE) && r.detail.contains("rollback.pkg"),
+        "{}",
+        r.detail
+    );
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    assert_eq!(env.installed(), "0.9.0");
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 對照：工作目錄已存在（上一次在預檢時中斷，只有日誌）但沒有動過手：照常重新開始
+    let env = setup("state-fresh", "tar");
+    let work = env.paths.work_root.join(ID);
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("upgrade.log"), "earlier attempt\n").unwrap();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// 當機窗口：替換完成、還沒記下 `Replaced` 就中斷（狀態仍是 `Verified`）。接續時重新驗證並再替換一次，
+/// 但**不得再覆寫 `pulse.prev`**——目前的執行檔已是新版，覆寫後回滾就換不回舊版
+#[test]
+fn a_crash_between_replacing_and_recording_it_keeps_the_old_backup() {
+    let mut env = setup("crash-window", "tar");
+    // 上一次執行留下的狀態：已保留 pulse.prev（0.9.0）、執行檔已換成 0.9.1、狀態仍是 verified
+    let work = env.paths.work_root.join(ID);
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
+    std::fs::write(env.paths.install_dir.join("pulse.prev"), "VERSION=0.9.0\n").unwrap();
+    let state = HelperState {
+        schema: HELPER_SCHEMA.to_string(),
+        step: Step::Verified,
+        deadline_unix: 0,
+        n_restarts_before: 0,
+        restarted_unix: 0,
+        health_timeout_secs: 600,
+        unit_replaced: false,
+        notes: Vec::new(),
+        rollback_reason: String::new(),
+        from_version: "0.9.0".into(),
+        method: "tar".into(),
+        target: Some(kairos_proto::mgmt::UpgradeTarget {
+            version: "0.9.1".into(),
+            commit: "5e6f7a8".into(),
+        }),
+        rollback_artifact: None,
+        prev_saved: true,
+        result: None,
+    };
+    std::fs::write(work.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+    // 輔助程式現在是新版；新版一啟動就崩潰 → 回滾
+    env.paths.current_version = "0.9.1".into();
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert_eq!(r.from_version, "0.9.0");
+    assert_eq!(env.installed(), "0.9.0", "回滾換回的是舊版");
+    assert_eq!(
+        binary_version(&env.paths.install_dir.join("pulse.prev")),
+        "0.9.0"
+    );
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 沒有記下「已保留」（在複製 pulse.prev 之前中斷，執行檔還是舊版）：照常保留
+    let env = setup("crash-window-early", "tar");
+    let work = env.paths.work_root.join(ID);
+    std::fs::create_dir_all(&work).unwrap();
+    let early = HelperState {
+        prev_saved: false,
+        ..state
+    };
+    std::fs::write(work.join("state.json"), serde_json::to_vec(&early).unwrap()).unwrap();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    assert_eq!(
+        binary_version(&env.paths.install_dir.join("pulse.prev")),
+        "0.9.0"
+    );
     let _ = std::fs::remove_dir_all(&env.root);
 }
