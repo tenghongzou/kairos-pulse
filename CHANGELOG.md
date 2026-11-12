@@ -143,6 +143,10 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 - **外部 URL 的下載**（REMOTE.md 第 17.7 節）：`[upgrade] url_allowlist`（0.9.0 已可設定，現在生效；**預設空＝只從 Kairos 下載**，行為不變）與 `external_ca`。提議的 URL 必須符合白名單的目錄前綴且指向提議的檔名，否則 `declined`（`PLS-W8411`，`url_not_allowed`）；以 HTTPS 下載（TLS 1.2 以上、不跟隨重新導向、大小以提議為上限、斷線以 `Range` 續傳、沒有代理）。**驗證鏈不變**：下載的檔案與從 Kairos 下載的一樣，要符合本機信任錨驗證過的 `SHA256SUMS`，輔助程式以 root 再驗證一次。
 - 其餘沒有變更：0.10.0 沒有新的協定 feature；叢集模式的容錯移轉使用 0.9.0 已有的 `server.fallback_addresses` 與 feature `cluster`。
 
+### 安全性
+
+- **Pulse：取得服務帳號的人可以藉升級輔助程式的「回滾」把主機降到任一個有官方簽章的舊版**（**0.9.0 受影響**；deb／rpm 安裝；REMOTE.md 第 5.1、17.8 節）。root 的輔助程式（`pulse upgrade apply`）驗證回滾檔時，預期的版本取自 `request.json` 的 `from_version`，而 `request.json` 是 `pulse` 服務帳號寫的。已取得 `pulse` 帳號的人可以自己寫一份請求——目標是較新的官方版本，`from_version` 謊報為較舊的版本並附上那個舊版有官方簽章的套件當回滾檔，再讓新版的健康確認失敗——輔助程式就會以 `dpkg -i`／`rpm -U --oldpackage` 裝回那個舊版，**繞過本機的 `upgrade.allow_downgrade = false`**。攻擊者必須已經取得 `pulse` 帳號，能安裝的只限有官方簽章的 Pulse 套件；tar 安裝不受影響。**修正**：輔助程式改以自己的版本（＝目前安裝的版本）為準，`from_version` 不符就拒絕（`failed`、`PLS-E8402`、`from_version_mismatch`，什麼都不改）；替換前把這個版本寫進只有 root 可寫的 `state.json`，重新開機後接續時以它為準；`from_version` 必須是合法的版本號。正常的升級不受影響（Pulse 一向以自己的版本填 `from_version`）。**從 0.9.0 遠端升級到 0.10.0 的那一次仍由 0.9.0 的輔助程式執行**，之後的升級才受到保護；不使用遠端升級的主機可在 `pulse.toml` 設定 `[upgrade] enabled = false`。系統層測試 `tests/systemd/run.sh` 新增情境 `tamper`。
+
 ### 修正
 
 - **`kairos reports export` 在 Kairos 執行中可能誤報「report 內容損毀」**（`KRS-E4301`，結束代碼 1；0.3.0 起就有，兩個儲存後端都是）：匯出先讀序列對照表、再讀 report，兩次讀取各自的快照；剛好有新的主機或新的指標出現（Kairos 在同一個交易中建立序列並寫入參照它的 report）時，後讀到的 report 參照對照表中沒有的序列而被誤判。資料沒有損毀，重新執行就會成功。現在兩者在同一個快照（SQLite：同一個讀取交易；PostgreSQL：`REPEATABLE READ` 的唯讀交易）中讀取。整合時由叢集的端對端測試發現（三次中出現一次）。

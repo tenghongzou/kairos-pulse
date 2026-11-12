@@ -233,9 +233,19 @@ struct HelperState {
     /// 回滾的原因（健康確認沒有通過的項目）：回滾中重新開機後接續時沿用，結果的 `detail` 才不會只剩 `resumed`
     #[serde(default)]
     rollback_reason: String,
+    /// 替換前實際執行的版本（輔助程式自己的版本，第一次執行時記下；0.10.0）。`request.json` 是服務帳號
+    /// 寫的、不可信：回滾檔的版本、回滾後的健康確認與結果都以這裡為準，重新開機後接續時（執行檔已是新版）
+    /// 也是。0.9.0 的狀態檔沒有這個欄位（空字串）
+    #[serde(default)]
+    from_version: String,
     /// 最後的結果（`Done` 時）
     result: Option<UpgradeResult>,
 }
+
+/// `request.json` 的 `from_version` 與輔助程式自己認定的不符時，結果 `detail` 的開頭
+pub const DETAIL_FROM_VERSION_MISMATCH: &str = "from_version_mismatch";
+/// 接續時 `request.json` 的 `from_version` 與狀態檔記下的不同：沿用狀態檔的版本，結果 `detail` 加註
+pub const NOTE_FROM_VERSION_IGNORED: &str = "request_from_version_ignored";
 
 /// 日誌：stderr（journal）與工作目錄的 `upgrade.log`
 struct Log {
@@ -369,14 +379,81 @@ impl Helper<'_> {
         }
     }
 
-    fn drive(&mut self, state: Option<HelperState>) -> UpgradeResult {
+    /// 「替換前的版本」的可信來源（REMOTE.md 第 5.1 節）：狀態檔（只有 root 可寫）記下的版本；還沒有
+    /// 狀態檔時是這個輔助程式自己的版本（＝目前安裝的版本）。`request.json` 的 `from_version` 由服務帳號
+    /// 寫入，只用來比對：
+    ///
+    /// - 尚未替換（第一次執行）：不符就拒絕（`Err`，什麼都不改）——否則取得服務帳號的人可以謊報較舊的
+    ///   `from_version`、附上該舊版有官方簽章的套件當回滾檔，再讓新版的健康確認失敗，使 root 以
+    ///   `dpkg -i`／`rpm -U --oldpackage` 裝回任一個舊版，繞過本機的 `allow_downgrade = false`；
+    /// - 已替換（重新開機後接續）：不能半途停下，沿用狀態檔的版本、忽略請求中的值並在結果加註。
+    ///
+    /// 之後 `self.req.from_version` 一律是可信的值。0.9.0 的輔助程式寫的狀態檔沒有記版本：接續時只能
+    /// 沿用請求中的值（回滾檔已由當時的輔助程式處理）
+    fn trust_from_version(
+        &mut self,
+        state: Option<&mut HelperState>,
+    ) -> Result<(), Box<UpgradeResult>> {
+        let claimed = self.req.from_version.clone();
+        let replaced = state
+            .as_ref()
+            .is_some_and(|s| matches!(s.step, Step::Replaced | Step::RollingBack));
+        let recorded = state
+            .as_ref()
+            .map(|s| s.from_version.clone())
+            .filter(|v| !v.is_empty());
+        let trusted = match recorded {
+            Some(v) => v,
+            None if replaced => {
+                self.log.line(
+                    "WARN",
+                    "狀態檔沒有記錄替換前的版本（由 0.9.0 的輔助程式寫入），沿用請求中的 from_version",
+                );
+                return Ok(());
+            }
+            None => self.paths.current_version.clone(),
+        };
+        if claimed == trusted {
+            return Ok(());
+        }
+        self.req.from_version = trusted.clone();
+        if replaced {
+            self.log.line(
+                "WARN",
+                &format!(
+                    "request.json 的 from_version（{claimed}）與替換前記下的版本（{trusted}）不同，以後者為準"
+                ),
+            );
+            if let Some(s) = state
+                && !s.notes.iter().any(|n| n == NOTE_FROM_VERSION_IGNORED)
+            {
+                s.notes.push(NOTE_FROM_VERSION_IGNORED.to_string());
+            }
+            return Ok(());
+        }
+        Err(Box::new(self.fail(
+            codes::E_UPGRADE_INTEGRITY,
+            format!(
+                "{DETAIL_FROM_VERSION_MISMATCH}: request says {claimed}, installed version is {trusted}"
+            ),
+        )))
+    }
+
+    fn drive(&mut self, mut state: Option<HelperState>) -> UpgradeResult {
+        if let Some(HelperState {
+            step: Step::Done,
+            result: Some(r),
+            ..
+        }) = &state
+        {
+            return r.clone();
+        }
+        if let Err(r) = self.trust_from_version(state.as_mut()) {
+            return *r;
+        }
         if let Some(s) = state {
             match s.step {
-                Step::Done => {
-                    if let Some(r) = s.result {
-                        return r;
-                    }
-                }
+                Step::Done => {}
                 Step::Replaced => {
                     self.log
                         .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
@@ -567,6 +644,7 @@ impl Helper<'_> {
             .ok()
             .and_then(|v| {
                 let name = req.rollback_artifact.clone().unwrap_or_default();
+                // 版本以輔助程式自己認定的「替換前的版本」為準（trust_from_version），不是請求中的值
                 let e = ArtifactExpectation {
                     product: Some(Product::Pulse),
                     version: Some(&req.from_version),
@@ -709,6 +787,8 @@ impl Helper<'_> {
             unit_replaced: false,
             notes: Vec::new(),
             rollback_reason: String::new(),
+            // 已在 trust_from_version 確認與輔助程式自己的版本相同
+            from_version: self.req.from_version.clone(),
             result: None,
         };
         self.save(&state);

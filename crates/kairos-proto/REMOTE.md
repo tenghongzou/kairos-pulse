@@ -615,7 +615,7 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | Kairos 被入侵，推送有漏洞的舊版 | 本機預設拒絕降版（第 4.8 節） |
 | Kairos 被入侵，下發設定破壞監控或洩漏資料 | 白名單（第 3.1 節）不含連線、信任、路徑、對外送出；隱私敏感的鍵只能更保守；本機設定優先；可本機停用 |
 | Kairos 被入侵，把 agent 當成對內網發出請求的工具 | 外部 URL 需要本機白名單（預設空）；從 Kairos 下載只走既有的 mTLS 連線 |
-| `pulse` 帳號被入侵，藉輔助程式提權 | 輔助程式只執行固定的動作、只接受信任錨驗證的發佈包、對複本操作、拒絕連結、不讀 Pulse 可寫的設定、不連網路（第 4.4.1 節）；最多能觸發「安裝某個官方版本」，且同樣受降版政策限制 |
+| `pulse` 帳號被入侵，藉輔助程式提權 | 輔助程式只執行固定的動作、只接受信任錨驗證的發佈包、對複本操作、拒絕連結、不讀 Pulse 可寫的設定、不連網路（第 4.4.1 節）；最多能觸發「安裝某個官方版本」，且同樣受降版政策限制。**`request.json` 的每個欄位都不可信**：目標版本以輔助程式自己的版本（＝目前安裝的版本）套用降版政策；**回滾檔的版本也以輔助程式自己的版本為準**，不採用 `request.json` 的 `from_version`——第一次執行時 `from_version` 與輔助程式的版本不符就拒絕（`PLS-E8402`，`from_version_mismatch`，什麼都不改），替換前把這個版本寫進 root 專用的 `state.json`，重新開機後接續時（執行檔已是新版）以 `state.json` 為準（0.10.0 的安全性修正，第 17.8 節；0.9.0 採用請求中的值，可被用來繞過降版政策） |
 | 傳輸中被竄改 | 簽章與雜湊；8443 本來就是 mTLS |
 | 冒用其他主機取得提議 | 提議只經該主機的 mTLS 連線送出；發佈包本身不是秘密 |
 | 權限過大的操作員一次推送全部主機 | RBAC（第 5.2 節）、分批與自動暫停、選用的雙人覆核（第 5.4 節）、L2／L3 確認、稽核 |
@@ -1278,6 +1278,27 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - **驗證鏈不變**：下載前已以本機信任錨驗證 `SHA256SUMS.sig`、清單與發佈檔在 `SHA256SUMS` 中的雜湊（第 17.2 節 #8）；下載完成後與分段下載走同一段程式（`file_downloaded`）比對提議的 SHA-256（不符刪除重來，連續 3 次後 `failed`、`PLS-E8402`），`stage` 再驗證一次，輔助程式以 root 重新驗證所有檔案。TLS 與白名單只決定「可以向哪裡發出請求」，不是信任的來源：外部伺服器或 CA 被入侵時，最多讓下載失敗。
 - **進度**與分段下載相同（每 25% 一則 `accepted`）；`staged` 之後的流程（時段、交付、健康確認、回滾）沒有差別。
 - **沒有新的 feature**：Kairos 0.10 對 0.9.0 的 Pulse 提議 `source: "url"` 時得到 `declined`（`url_not_allowed`），不影響連線與其他主機；0.10 的 Pulse 連上 0.9 的 Kairos 不會收到這種提議。
+
+### 17.8 安全性修正：回滾檔的版本不再採用 `request.json` 的 `from_version`（0.10.0；0.9.0 受影響）
+
+**問題**（0.9.0）。`request.json` 由 `pulse` 服務帳號寫入，第 5.1 節把它列為不可信。輔助程式對**目標**版本的降版政策用的是自己的版本，但驗證**回滾檔**時，預期的版本取自 `request.json` 的 `from_version`，`Request::validate` 也沒有檢查這個欄位。取得 `pulse` 帳號的人可以自己寫一份請求：
+
+1. 目標：任何一個比目前新、有官方簽章的版本（通過降版政策與簽章驗證）；
+2. `from_version` 謊報為某個**較舊**的版本，`rollback_artifact` 附上那個舊版有官方簽章的 deb／rpm 與它的 `SHA256SUMS`（「版本與 `from_version` 相符」的檢查因此通過）；
+3. 讓新版的健康確認失敗（同一個帳號可以反覆終止服務行程，或讓它連不上 Kairos）。
+
+輔助程式於是「回滾」：以 root 執行 `dpkg -i`／`rpm -U --oldpackage --replacepkgs` 把主機裝回那個舊版，回滾後的健康確認也以謊報的版本比對而通過。結果是**繞過本機的 `upgrade.allow_downgrade = false`**，把主機降到任一個有官方簽章、可能有已知漏洞的舊版。只影響 deb／rpm 安裝（tar 的回滾是換回替換前保留的 `pulse.prev`，不使用回滾檔）；攻擊者必須已經取得 `pulse` 帳號，能安裝的仍只限有官方簽章的 Pulse 套件。
+
+**修正**（`pulse/src/remote/upgrade/helper.rs` `trust_from_version`、`files.rs` `Request::validate`）：
+
+- 「替換前的版本」的可信來源是**輔助程式自己的版本**（輔助程式就是目前安裝的 `/opt/pulse/pulse`，由 root 的 unit 執行）。第一次執行時 `request.json` 的 `from_version` 與它不符就拒絕：`failed`、`PLS-E8402`、`detail` 為 `from_version_mismatch: request says <謊報的版本>, installed version is <實際的版本>`，不複製、不解開、不替換任何東西；結果的 `from_version` 回報實際的版本。
+- 替換前把這個版本寫進 `/var/lib/pulse-upgrade/<id>/state.json`（0700 目錄、0600 檔案，只有 root 可寫）的 `from_version`。**重新開機後接續**時執行檔與輔助程式已是新版，改以 `state.json` 記下的版本為準：回滾後的健康確認與結果都用它；此時 `request.json` 的 `from_version` 若被改過，輔助程式不能半途停下，忽略請求中的值並在結果的 `detail` 加註 `request_from_version_ignored`。驗證過的回滾檔（`rollback.pkg`）在第一次執行時就已複製到 root 專用的工作目錄，接續時不再讀取暫存區。
+- `Request::validate` 另外要求 `from_version` 是合法的版本號（不合法的請求整份拒絕並刪除）。
+- 由 0.9.0 的輔助程式寫入的 `state.json` 沒有 `from_version`：升級到 0.10.0 的途中重新開機時，接續的（0.10.0 的）輔助程式只能沿用請求中的值，行為與 0.9.0 相同——那一次升級的回滾檔已由 0.9.0 的輔助程式驗證並複製。**從 0.9.0 升級到 0.10.0 的那一次仍在受影響的範圍內**；之後的升級才受到保護。
+
+**測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`（`helper/tests.rs`）；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。
+
+**這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。另外，接續時 `request.json` 的其他欄位（`method`、`target.version`）同樣取自請求；它們只影響「以哪一種方式回滾、以哪個版本做健康確認」，不會讓輔助程式安裝未經驗證的檔案，但也應一併改為取自 `state.json`。
 
 ## 18. Windows 的遠端升級：0.10.0 不實作的評估與需要的實機驗證（待使用者決定）
 

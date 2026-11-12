@@ -111,6 +111,14 @@ impl Request {
         if let Some(r) = &self.rollback_artifact {
             kairos_proto::release::ReleaseFile::parse(r)?;
         }
+        // 只檢查格式：`from_version` 是服務帳號寫的，輔助程式另以自己的版本（或狀態檔記下的版本）比對，
+        // 不符就拒絕（`helper.rs` 的 `trust_from_version`）
+        if kairos_proto::release::Version::parse(&self.from_version).is_err() {
+            return Err(format!(
+                "request.json 的 from_version {:?} 不是合法的版本",
+                self.from_version
+            ));
+        }
         Ok(())
     }
 }

@@ -7,6 +7,7 @@
 #   WORK=<目錄>         工作目錄（發佈物、金鑰、日誌；預設 ~/kp-systest，不可在 git repo 內）
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback reboot reboot-rollback signature
+#                       tamper
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
 #   KEEP=1              結束時保留容器與網路（除錯用；之後以 CLEAN_ONLY=1 清除）
@@ -26,7 +27,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -420,6 +421,79 @@ scenario_signature() {
     check "d2：版本沒有改變" "$after" "^$before\$"
 }
 
+# 情境 e（REMOTE.md 第 5.1 節；0.10.0 的安全性修正）：取得服務帳號的人自己寫 request.json——目標是有官方
+# 簽章的較新版本（崩潰的建置，健康確認一定失敗），謊報 from_version 為較舊的版本並附上那個舊版有官方簽章
+# 的套件當回滾檔，企圖讓 root 的輔助程式在「回滾」時以 dpkg -i／rpm -U --oldpackage 把主機降到舊版（繞過
+# 本機的 allow_downgrade = false）。輔助程式以自己的版本為準：from_version 不符就拒絕，什麼都不改
+scenario_tamper() {
+    need "$V0" $T1 $T4
+    say "情境 e：以服務帳號竄改 request.json（謊報 from_version＋較舊的已簽章回滾檔）→ 輔助程式拒絕"
+    for h in deb rpm; do
+        cur=$(hx "$h" /opt/pulse/pulse --version | awk '{print $2}')
+        # 謊報的版本：比目前舊的 $V0；主機還在 $V0 時（單獨執行這個情境）改用 $T1
+        old=$V0
+        [ "$cur" != "$V0" ] || old=$T1
+        pv=$(pkg_version "$h")
+        uid=$(cat /proc/sys/kernel/random/uuid)
+        art=$(basename "$(ls "$DIST/$T4"/pulse-*-linux-x86_64."$h")")
+        man=$(basename "$(ls "$DIST/$T4"/pulse-*-release.json)")
+        rb=$(basename "$(ls "$DIST/$old"/pulse-*-linux-x86_64."$h")")
+        stage=$WORK/tamper-$h
+        rm -rf "$stage"
+        mkdir -p "$stage"
+        cp "$DIST/$T4/$art" "$DIST/$T4/$man" "$DIST/$T4/SHA256SUMS" "$DIST/$T4/SHA256SUMS.sig" "$DIST/$old/$rb" "$stage/"
+        cp "$DIST/$old/SHA256SUMS" "$stage/rollback.SHA256SUMS"
+        cp "$DIST/$old/SHA256SUMS.sig" "$stage/rollback.SHA256SUMS.sig"
+        jq -n -c --arg id "$uid" --arg v "$T4" --arg c "$(jq -r .commit "$DIST/$T4/$man")" --arg m "$h" \
+            --arg a "$art" --arg man "$man" --arg rb "$rb" --arg from "$old" \
+            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson t "$HEALTH_TIMEOUT" \
+            '{schema: "pulse.upgrade-request/v1", upgrade_id: $id, target: {version: $v, commit: $c},
+              method: $m, artifact: $a, manifest: $man, rollback_artifact: $rb, health_timeout_secs: $t,
+              allow_downgrade: false, from_version: $from, requested_at: $at}' >"$stage/request.json"
+        chmod -R a+rX "$stage"
+        hx "$h" rm -rf /tmp/tamper
+        docker cp "$stage" "$P-$h:/tmp/tamper"
+        # 以服務帳號放進暫存區，最後寫入 request.json（pulse-upgrade.path 觸發 root 的輔助程式）
+        if ! hx "$h" setpriv --reuid pulse --regid pulse --init-groups sh -c "
+            set -e
+            mkdir -p /var/lib/pulse/upgrade/$uid
+            cp /tmp/tamper/pulse-* /tmp/tamper/SHA256SUMS /tmp/tamper/SHA256SUMS.sig /tmp/tamper/rollback.* /var/lib/pulse/upgrade/$uid/
+            cp /tmp/tamper/request.json /var/lib/pulse/upgrade/request.json.tmp
+            mv /var/lib/pulse/upgrade/request.json.tmp /var/lib/pulse/upgrade/request.json"; then
+            fail "e/$h：無法以服務帳號寫入 request.json"
+            continue
+        fi
+        i=0
+        line=""
+        while [ $i -lt 90 ]; do
+            line=$(hx "$h" sh -c "grep -h from_version_mismatch /var/lib/pulse-upgrade/$uid/upgrade.log 2>/dev/null | tail -n 1" || true)
+            [ -z "$line" ] || break
+            # 修正前的行為：輔助程式照做（替換 → 崩潰 → 以回滾檔降版）；出現結果就不必再等
+            if hx "$h" sh -c "grep -qs '\"step\": \"done\"' /var/lib/pulse-upgrade/$uid/state.json" 2>/dev/null; then break; fi
+            sleep 2
+            i=$((i + 1))
+        done
+        collect_logs "e-$h"
+        check "e/$h：輔助程式拒絕（PLS-E8402 from_version_mismatch）" \
+            "$(printf '%s' "$line" | grep -o 'PLS-E8402.*' || true)" \
+            'PLS-E8402.*from_version_mismatch: request says .*, installed version is '
+        case "$line" in
+        *"request says $old, installed version is $cur"*) pass "e/$h：拒絕的原因列出謊報的 $old 與實際的 $cur" ;;
+        *) fail "e/$h：拒絕的原因沒有列出謊報的 $old 與實際的 $cur：$line" ;;
+        esac
+        after=$(hx "$h" /opt/pulse/pulse --version | awk '{print $2}')
+        if [ "$after" = "$cur" ]; then pass "e/$h：/opt/pulse/pulse --version 沒有改變：$after"; else fail "e/$h：版本由 $cur 變成 $after"; fi
+        pa=$(pkg_version "$h")
+        if [ "$pa" = "$pv" ]; then pass "e/$h：套件資料庫的版本沒有改變：$pa"; else fail "e/$h：套件資料庫由 $pv 變成 $pa"; fi
+        check "e/$h：沒有替換也沒有執行套件管理員" \
+            "$(hx "$h" sh -c "grep -c -E '已替換|經套件管理員|pulse.prev' /var/lib/pulse-upgrade/$uid/upgrade.log || true")" '^0$'
+        check "e/$h：沒有留下回滾檔" "$(hx "$h" sh -c "ls /var/lib/pulse-upgrade/$uid/rollback.pkg 2>/dev/null | wc -l")" '^0$'
+        check "e/$h：request.json 已刪除" "$(hx "$h" sh -c 'ls /var/lib/pulse/upgrade/request.json 2>/dev/null | wc -l')" '^0$'
+        check "e/$h：systemctl is-active pulse" "$(hx "$h" systemctl is-active pulse.service 2>&1)" '^active$'
+        hx "$h" rm -rf /tmp/tamper
+    done
+}
+
 # ---- 0. 發佈物 --------------------------------------------------------------
 if [ -z "${SKIP_BUILD:-}" ]; then
     say "建置發佈物（tests/systemd/build.sh）"
@@ -615,6 +689,7 @@ for s in $SCENARIOS; do
     reboot) scenario_reboot ;;
     reboot-rollback) scenario_reboot_rollback ;;
     signature) scenario_signature ;;
+    tamper) scenario_tamper ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac

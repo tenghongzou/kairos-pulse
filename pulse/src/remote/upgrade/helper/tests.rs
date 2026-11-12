@@ -547,7 +547,11 @@ fn reverification_rejects_untrusted_or_swapped_files() {
     let env = setup("downgrade", "tar");
     let mut paths = env.paths.clone();
     paths.current_version = "0.9.2".into();
-    rewrite_request(&env, |r| r.allow_downgrade = true);
+    rewrite_request(&env, |r| {
+        r.allow_downgrade = true;
+        // 服務以自己的版本填 from_version；與輔助程式的版本不符的請求另有測試
+        r.from_version = "0.9.2".into();
+    });
     let r = apply(&paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.code.as_deref(), Some(codes::W_UPGRADE_DOWNGRADE));
     let _ = std::fs::remove_dir_all(&env.root);
@@ -830,6 +834,172 @@ fn resuming_a_rollback_after_a_reboot_keeps_the_original_reason() {
     assert_eq!(
         (r.state.as_str(), r.detail.as_str()),
         ("rolled_back", "resumed")
+    );
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// 在暫存區放一個有官方簽章的回滾檔（`version` 的 deb）並寫進請求
+fn stage_rollback(env: &Env, version: &str) {
+    let name = format!("pulse-{version}-1a2b3c4-linux-x86_64.deb");
+    let content = format!("VERSION={version}\n");
+    let rel = testsign::release(
+        &env.key,
+        version,
+        "1a2b3c4",
+        &[(name.as_str(), content.as_bytes())],
+        None,
+    );
+    std::fs::write(env.staging().join(&name), content).unwrap();
+    std::fs::write(env.staging().join(files::ROLLBACK_SUMS_FILE), &rel.sums).unwrap();
+    std::fs::write(env.staging().join(files::ROLLBACK_SIG_FILE), &rel.sig).unwrap();
+    rewrite_request(env, |r| r.rollback_artifact = Some(name));
+}
+
+/// `request.json` 由服務帳號寫入、不可信（REMOTE.md 第 5.1 節）：取得服務帳號的人謊報較舊的
+/// `from_version`、附上那個舊版**有官方簽章**的套件當回滾檔，再讓新版的健康確認失敗——修正前輔助程式會以
+/// `dpkg -i` 把主機裝回 0.8.0，繞過本機的 `allow_downgrade = false`。輔助程式以自己的版本為準：不符就
+/// 拒絕，什麼都不改
+#[test]
+fn tampered_from_version_is_refused_before_anything_changes() {
+    let env = setup("from-tamper", "deb");
+    stage_rollback(&env, "0.8.0");
+    rewrite_request(&env, |r| r.from_version = "0.8.0".into());
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("failed", Some(codes::E_UPGRADE_INTEGRITY)),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.starts_with(DETAIL_FROM_VERSION_MISMATCH)
+            && r.detail.contains("0.8.0")
+            && r.detail.contains("0.9.0"),
+        "{}",
+        r.detail
+    );
+    // 結果回報的是實際的版本，不是請求中謊報的
+    assert_eq!(r.from_version, "0.9.0");
+    assert_eq!(env.installed(), "0.9.0");
+    assert!(
+        fake.calls().is_empty(),
+        "不應解開或安裝任何東西：{:?}",
+        fake.calls()
+    );
+    assert!(!env.paths.install_dir.join("pulse.prev").exists());
+    assert!(!env.paths.work_root.join(ID).join("rollback.pkg").exists());
+    assert_eq!(env.result(), r);
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 不是版本號的 from_version：請求本身不合法（刪除 request.json，path unit 不再觸發）
+    let env = setup("from-garbage", "deb");
+    rewrite_request(&env, |r| r.from_version = "../../etc".into());
+    assert!(apply(&env.paths, &Fake::new(&env.root)).is_err());
+    assert!(!env.paths.request.exists());
+    assert_eq!(env.installed(), "0.9.0");
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// 重新開機後接續時執行檔（與輔助程式）已是新版：「替換前的版本」以第一次執行時寫進狀態檔（只有 root
+/// 可寫）的為準。期間 `request.json` 被改成較舊的 `from_version` 也不影響：回滾仍裝回狀態檔記下的版本、
+/// 以它做健康確認，結果加註
+#[test]
+fn resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement() {
+    let mut env = setup("from-resume", "deb");
+    stage_rollback(&env, "0.9.0");
+    let request = std::fs::read(&env.paths.request).unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    let state_path = env.paths.work_root.join(ID).join("state.json");
+    let mut s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(s["from_version"], "0.9.0", "{s}");
+    // 模擬健康確認期間重新開機、期限已過：接續後回滾。輔助程式現在是新版
+    s["step"] = "replaced".into();
+    s["result"] = serde_json::Value::Null;
+    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
+    s["n_restarts_before"] = 0.into();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    env.paths.current_version = "0.9.1".into();
+    // 驗證過的回滾檔在 root 專用的工作目錄（升級結束時才刪除：這裡放回去，模擬升級還沒結束）
+    let rollback_pkg = env.paths.work_root.join(ID).join("rollback.pkg");
+    let put_rollback = || {
+        std::fs::write(
+            &rollback_pkg,
+            "VERSION=0.9.0
+",
+        )
+        .unwrap()
+    };
+
+    // 請求沒有被動過：照常回滾到 0.9.0，沒有加註
+    put_rollback();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.from_version.as_str()),
+        ("rolled_back", "0.9.0"),
+        "{r:?}"
+    );
+    assert!(
+        !r.detail.contains(NOTE_FROM_VERSION_IGNORED),
+        "{}",
+        r.detail
+    );
+    assert_eq!(env.installed(), "0.9.0");
+
+    // 回到「已替換」，這次請求的 from_version 被改成 0.8.0
+    std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    rewrite_request(&env, |r| r.from_version = "0.8.0".into());
+    put_rollback();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert_eq!(r.from_version, "0.9.0", "以狀態檔的版本為準：{r:?}");
+    assert!(r.detail.contains(NOTE_FROM_VERSION_IGNORED), "{}", r.detail);
+    assert_eq!(
+        fake.calls(),
+        ["dpkg rollback.pkg", "restart"],
+        "{:?}",
+        fake.calls()
+    );
+    assert_eq!(env.installed(), "0.9.0");
+
+    // 回滾確認期間再重新開機：同樣以狀態檔的版本確認
+    let mut s2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    s2["step"] = "rolling_back".into();
+    s2["result"] = serde_json::Value::Null;
+    s2["deadline_unix"] = (chrono::Utc::now().timestamp() + 600).into();
+    s2["n_restarts_before"] = 0.into();
+    std::fs::write(&state_path, serde_json::to_vec(&s2).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    rewrite_request(&env, |r| r.from_version = "0.8.0".into());
+    env.paths.current_version = "0.9.0".into();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.from_version.as_str()),
+        ("rolled_back", "0.9.0"),
+        "{r:?}"
+    );
+
+    // 0.9.0 的輔助程式寫的狀態檔沒有記版本：接續時沿用請求中的值（與 0.9.0 相同）
+    s.as_object_mut().unwrap().remove("from_version");
+    std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    env.paths.current_version = "0.9.1".into();
+    put_rollback();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.from_version.as_str()),
+        ("rolled_back", "0.9.0"),
+        "{r:?}"
     );
     let _ = std::fs::remove_dir_all(&env.root);
 }
