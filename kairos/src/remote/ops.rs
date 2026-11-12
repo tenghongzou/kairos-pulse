@@ -1177,6 +1177,22 @@ pub fn artifact_json(a: &ArtifactRow) -> Value {
     })
 }
 
+/// 在 [`release_json`] 的 `artifacts[]` 加上 `file_problem`：已存入（`stored`）的發佈檔在這個節點的
+/// 版本庫中不存在（`"missing"`）或大小與記錄不符（`"size_mismatch"`），正常與未存入的為 `null`
+/// （[`releases::file_problem`]，與系統健康「版本庫的檔案遺失」相同的判斷，只 `stat`）。主控台據此在
+/// 重新匯入時補上檔案，而不是把它當成「已上傳過」跳過
+pub fn annotate_file_problems(v: &mut Value, artifacts: &[ArtifactRow], dir: &std::path::Path) {
+    if let Some(list) = v["artifacts"].as_array_mut() {
+        for (j, a) in list.iter_mut().zip(artifacts) {
+            j["file_problem"] = json!(
+                a.stored
+                    .then(|| releases::file_problem(dir, &a.sha256, a.size))
+                    .flatten()
+            );
+        }
+    }
+}
+
 /// `releases.source`
 pub const SOURCE_HOSTED: &str = "hosted";
 /// 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節）

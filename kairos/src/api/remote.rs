@@ -1060,6 +1060,8 @@ async fn list_releases(
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let detail = version.is_some();
+    // 版本庫的目錄（這個節點的）：標出已存入而檔案遺失或大小不符的發佈檔
+    let releases_dir = ctx.remote.as_ref().map(|svc| svc.releases_dir.clone());
     let data = ctx
         .pool
         .read("Pulse 版本庫", move |s| {
@@ -1082,6 +1084,9 @@ async fn list_releases(
                     .rollouts_using_release(r.id)
                     .map_err(query_failed("Pulse 版本庫"))?;
                 let mut v = ops::release_json(r, &artifacts, Some((on, rollback, rollouts)));
+                if let Some(dir) = &releases_dir {
+                    ops::annotate_file_problems(&mut v, &artifacts, dir);
+                }
                 if version.is_some() {
                     // 詳情：各平台與安裝方式的主機數（目前執行這個版本）
                     let mut by: BTreeMap<String, usize> = BTreeMap::new();

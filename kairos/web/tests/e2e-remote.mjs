@@ -169,6 +169,34 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await page.emulateMedia({ colorScheme: 'dark' });
     await axe(page, 'F8 S25 版本詳情（深色）');
     await page.emulateMedia({ colorScheme: 'light' });
+    // 版本庫的檔案遺失（0.10；以攔截的版本 API 模擬還原備份之後的狀態：資料庫標為已上傳、檔案不在）：
+    // 詳情標出，重新上傳時不被當成「已上傳過」而跳過
+    const relApi = `**/api/v1/releases/${VERSION}`;
+    await ctx.route(relApi, async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const real = await (await route.fetch()).json();
+      const artifacts = real.data.artifacts.map((a) => (a.filename === rel.tar ? { ...a, file_problem: 'missing' } : a));
+      // 測試結束移除攔截時還在途的請求已由 Playwright 接手：忽略
+      return route.fulfill({ json: { ...real, data: { ...real.data, artifacts } } }).catch(() => {});
+    });
+    await page.reload();
+    await waitTitle(page, `Pulse ${VERSION}`);
+    await page.locator(`tr[data-file="${rel.tar}"]`).getByText('檔案遺失（請重新上傳）').waitFor();
+    await axe(page, 'F8 S25 版本詳情（檔案遺失）');
+    await page.getByRole('button', { name: '上傳發佈檔…' }).click();
+    const again = page.getByRole('dialog');
+    await again.getByLabel('檔案').setInputFiles(rel.good.filter((f) => f.name === rel.tar));
+    await again.getByRole('button', { name: '上傳發佈檔', exact: true }).click();
+    await again.locator(`li[data-file="${rel.tar}"]`).getByText('✓ 雜湊相符').waitFor({ timeout: 20000 });
+    assert.equal(await again.locator(`li[data-file="${rel.tar}"]`).getByText('已上傳過').count(), 0);
+    await again.getByRole('button', { name: '完成' }).click();
+    // 對話框關閉後詳情重新載入（仍是攔截的內容）；載入完成後才移除攔截
+    await again.waitFor({ state: 'detached' });
+    await page.locator(`tr[data-file="${rel.tar}"]`).getByText('檔案遺失（請重新上傳）').waitFor();
+    await ctx.unroute(relApi);
+    await page.reload();
+    await waitTitle(page, `Pulse ${VERSION}`);
+    await page.locator(`tr[data-file="${rel.tar}"]`).getByText('已上傳', { exact: true }).waitFor();
     // S20「遠端管理」列：版本庫有發佈版本、信任錨未設定 → 警告，附前往版本庫的捷徑
     await page.goto(`${URL0}/system/health`);
     await waitTitle(page, '系統健康');

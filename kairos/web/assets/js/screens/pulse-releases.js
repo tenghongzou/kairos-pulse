@@ -42,7 +42,7 @@ function platformsText(arts) {
   for (const a of arts || []) {
     const k = `${a.os} ${a.arch}`;
     if (!by.has(k)) by.set(k, []);
-    by.get(k).push(a.stored || a.registered ? a.format : `${a.format}${t('rm.rel.notStored')}`);
+    by.get(k).push(a.file_problem ? `${a.format}${t('rm.rel.fileProblemShort')}` : a.stored || a.registered ? a.format : `${a.format}${t('rm.rel.notStored')}`);
   }
   if (!by.size) return '—';
   return h('ul', { class: 'k-plain-list' }, [...by].map(([k, fmts]) => h('li', null, `${k}：${fmts.join(' ')}`)));
@@ -216,7 +216,7 @@ function renderDetail(ctx) {
     const m = r.manifest;
     const actions = [];
     if (canWrite) {
-      if (r.artifacts && r.artifacts.some((a) => !a.stored && !a.registered)) {
+      if (r.artifacts && r.artifacts.some((a) => (!a.stored && !a.registered) || a.file_problem)) {
         actions.push(h('button', { type: 'button', class: 'ds-button ds-button--secondary', on: { click: () => importDialog({ release: r, onDone: load }) } }, icon('upload'), t('rm.rel.upload')));
       }
       const why = r.in_use_by_rollouts ? t('rm.rel.inUseRollouts', { n: fmt.num(r.in_use_by_rollouts) }) : r.rollback_target_for ? t('rm.rel.inUseRollback', { n: fmt.num(r.rollback_target_for) }) : null;
@@ -297,7 +297,7 @@ function renderDetail(ctx) {
                     h('td', null, a.format),
                     h('td', { class: 'num' }, a.size ? fmt.bytes(a.size) : '—'),
                     h('td', null, h('span', { class: 'mono', title: a.sha256 }, String(a.sha256 || '').slice(0, 16)), ' ', copyButton(a.sha256, t('rm.rel.copySha', { f: a.filename }))),
-                    h('td', null, a.stored ? statusBadge('online', t('rm.rel.stored')) : a.registered ? statusBadge('online', t('rm.rel.registered')) : neutralBadge(t('rm.rel.pending'))),
+                    h('td', null, a.file_problem ? statusBadge('warning', t(a.file_problem === 'size_mismatch' ? 'rm.rel.fileSizeMismatch' : 'rm.rel.fileMissing')) : a.stored ? statusBadge('online', t('rm.rel.stored')) : a.registered ? statusBadge('online', t('rm.rel.registered')) : neutralBadge(t('rm.rel.pending'))),
                   ),
                 ),
               ),
@@ -418,7 +418,8 @@ function importDialog({ release = null, onDone } = {}) {
         bad += 1;
         continue;
       }
-      if ((a.stored || a.registered) && release) {
+      // 已上傳過的不重傳；但已存入而檔案遺失或大小不符的（file_problem，例如還原備份之後）照常上傳補上
+      if (((a.stored && !a.file_problem) || a.registered) && release) {
         r.prog.hidden = true;
         r.result.textContent = t('rm.imp.already');
         continue;

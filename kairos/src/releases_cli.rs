@@ -361,15 +361,7 @@ async fn list(svc: &RemoteService) -> Result<Vec<Value>, Failure> {
                 let rollback = ops::rollback_target_count(&hosts, &r.version, &artifacts);
                 let rollouts = s.rollouts_using_release(r.id)?;
                 let mut v = ops::release_json(&r, &artifacts, Some((on, rollback, rollouts)));
-                if let Some(list) = v["artifacts"].as_array_mut() {
-                    for (j, a) in list.iter_mut().zip(&artifacts) {
-                        j["file_problem"] = json!(
-                            a.stored
-                                .then(|| releases::file_problem(&dir, &a.sha256, a.size))
-                                .flatten()
-                        );
-                    }
-                }
+                ops::annotate_file_problems(&mut v, &artifacts, &dir);
                 out.push(v);
             }
             Ok(out)

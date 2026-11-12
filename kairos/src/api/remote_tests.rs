@@ -411,6 +411,86 @@ async fn releases_and_rollouts_over_https() {
     assert_eq!(r.status, 200);
     assert!(body(&r)["data"]["sha256sums"].is_string());
 
+    // 版本庫的檔案遺失（0.10.0）：清單與詳情的 artifacts[] 以 file_problem 標出（已存入而檔案不在、
+    // 大小不符；未存入的為 null），主控台才不會把它當成「已上傳過」；重新上傳後補上
+    let problems = |v: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+        v["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["filename"].as_str().unwrap().to_string(),
+                    a["file_problem"].clone(),
+                )
+            })
+            .collect()
+    };
+    let detail = |who: &str| {
+        let who = who.to_string();
+        async move {
+            let r = call(addr, "GET", "/api/v1/releases/0.9.2", Some(&who), None).await;
+            assert_eq!(r.status, 200);
+            body(&r)["data"].clone()
+        }
+    };
+    let d = detail(&auditor).await;
+    assert!(
+        problems(&d).iter().all(|(_, p)| p.is_null()),
+        "{:?}",
+        problems(&d)
+    );
+    let tar_sha = d["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["filename"] == tar_name.as_str())
+        .unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored_file = f.remote.as_ref().unwrap().releases_dir.join(&tar_sha);
+    assert!(stored_file.is_file(), "{}", stored_file.display());
+    std::fs::write(&stored_file, b"truncated").unwrap();
+    let d = detail(&auditor).await;
+    for (name, p) in problems(&d) {
+        if name == tar_name {
+            assert_eq!(p, "size_mismatch", "{name}");
+        } else {
+            assert!(p.is_null(), "{name}: {p}");
+        }
+    }
+    std::fs::remove_file(&stored_file).unwrap();
+    let r = call(addr, "GET", "/api/v1/releases", Some(&auditor), None).await;
+    let listed = problems(&body(&r)["data"][0]);
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|(_, p)| *p == "missing")
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        [tar_name.as_str()]
+    );
+    // 資料庫仍標為已存入
+    assert_eq!(
+        body(&r)["data"][0]["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["stored"] == true)
+            .count(),
+        1
+    );
+    let r = put_artifact(&f, &admin, "0.9.2", &tar_name, &tar).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(stored_file.is_file());
+    let d = detail(&auditor).await;
+    assert!(
+        problems(&d).iter().all(|(_, p)| p.is_null()),
+        "{:?}",
+        problems(&d)
+    );
+
     // 推送
     add_host(&f, H, "0.9.0", "tar");
     let spec = json!({"name": "0.9.2 web", "target_version": "0.9.2", "selector": {"groups": ["web"]}, "waves": [{"size": "rest"}]});
