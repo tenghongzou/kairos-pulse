@@ -16,5 +16,6 @@ min_upgrade_from = "0.9.0"
 remote_features = ["config", "upgrade"]
 
 # 有破壞性變更（CHANGELOG「破壞性變更與升級步驟」有 Pulse 的項目）：主控台在建立推送時要求勾選
-# 「已閱讀升級步驟」。0.9.0：pulse enroll 在送出申請前收到 429／503 時等候後重試（第 2 項）
-breaking = true
+# 「已閱讀升級步驟」。0.9.0 為 true（pulse enroll 在送出申請前收到 429／503 時等候後重試）；
+# 0.10.0：破壞性變更表沒有 Pulse 的項目（外部 URL 的下載預設不啟用，行為不變）
+breaking = false

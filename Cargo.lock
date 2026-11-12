@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "kairos"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "argon2",
  "chrono",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "pulse"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "config",
