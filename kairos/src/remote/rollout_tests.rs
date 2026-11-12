@@ -755,7 +755,7 @@ fn three_waves_advance_with_their_own_soak_limits_and_manual_continue() {
     assert_eq!(j[2]["current"], true);
 }
 
-// ---- 0.10：排程與維護時段 ----
+// ---- 0.10：排程與升級時段 ----
 
 fn ms(s: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(s)

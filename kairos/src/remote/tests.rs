@@ -1674,7 +1674,7 @@ async fn upgrade_windows_follow_applying_hosts_and_survive_restart() {
     assert!(windows(&mut bus).is_empty());
 }
 
-// ---- 0.10：排程、維護時段與自訂批次 ----
+// ---- 0.10：排程、升級時段與自訂批次 ----
 
 fn status(up: &str, state: &str) -> kairos_proto::mgmt::UpgradeStatus {
     kairos_proto::mgmt::UpgradeStatus {

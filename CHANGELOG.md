@@ -52,7 +52,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [0.10.0] - 〔草稿：發佈日期待定〕
 
-**Kairos 0.10.0、Pulse 0.10.0**：衝刺 10——**PostgreSQL 儲存後端**（高可用 L1b，`kairos/STORAGE.md` 第 19 節）、**叢集模式**（高可用 L2，階段 A：主動／備援，`kairos/HA.md` 第 6.8、17.1 節；**HA 預覽**）與**遠端管理 F8 的其餘項目**（`crates/kairos-proto/REMOTE.md`：`kairos releases` 命令列、推送的排程與維護時段、自訂批次、雙人覆核、外部 URL 的版本庫、升級中主機的離線告警抑制、SSE `rollout.host`、版本庫檔案的健康檢查）。**協定版本不變（v1～v2）、沒有新的協定 feature**，8444 的 API 不變，0.9 與 0.10 的 Kairos／Pulse 任意組合都能連線；Kairos 的資料庫升級到 **schema v11**（v9 → v10 → v11，不可逆，升級前先備份）。預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`、`remote.rollout_approval = "none"`）下不需要修改設定檔。
+**Kairos 0.10.0、Pulse 0.10.0**：衝刺 10——**PostgreSQL 儲存後端**（高可用 L1b，`kairos/STORAGE.md` 第 19 節）、**叢集模式**（高可用 L2，階段 A：主動／備援，`kairos/HA.md` 第 6.8、17.1 節；**HA 預覽**）與**遠端管理 F8 的其餘項目**（`crates/kairos-proto/REMOTE.md`：`kairos releases` 命令列、推送的排程與升級時段、自訂批次、雙人覆核、外部 URL 的版本庫、升級中主機的離線告警抑制、SSE `rollout.host`、版本庫檔案的健康檢查）。**協定版本不變（v1～v2）、沒有新的協定 feature**，8444 的 API 不變，0.9 與 0.10 的 Kairos／Pulse 任意組合都能連線；Kairos 的資料庫升級到 **schema v11**（v9 → v10 → v11，不可逆，升級前先備份）。預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`、`remote.rollout_approval = "none"`）下不需要修改設定檔。
 
 **叢集模式是 HA 預覽**：只在一台測試機上以兩個 Kairos、一個沒有備庫的 PostgreSQL 驗證過；資料庫主備切換、真正的網路分割、L4 負載平衡器與虛擬 IP 等情境還沒有實測（下方「已知限制」與 HA.md 第 17.1 節）。上線前必須在實際的拓撲上演練。
 
@@ -70,7 +70,7 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 
 1. 備份：`kairos db backup <檔案> --include-keys --password-stdin < <密碼檔>`（版本庫的發佈檔 `data/releases/` 不在備份中，需要時另外複製）。
 2. 換上 Kairos 0.10.0（tar.gz 照 INSTALL 第 11 節換執行檔；deb／rpm 直接升級）並啟動：schema 由 v9 依序升級到 v10、v11（只新增空的資料表與可為 NULL 的欄位，一個交易）。升級完成後，0.9 的 Kairos 就無法再開啟這個資料庫（SQLite：`PRAGMA user_version` 為 11）。
-3. 換上 Pulse 0.10.0：0.9.0 的主機可以由 Kairos 推送（`min_upgrade_from` 仍是 0.9.0），或照舊手動升級。0.9 的 Pulse 可以繼續使用——排程、維護時段、自訂批次與雙人覆核都不需要升級 Pulse；只有外部 URL 的版本庫需要 Pulse 0.10.0。
+3. 換上 Pulse 0.10.0：0.9.0 的主機可以由 Kairos 推送（`min_upgrade_from` 仍是 0.9.0），或照舊手動升級。0.9 的 Pulse 可以繼續使用——排程、升級時段、自訂批次與雙人覆核都不需要升級 Pulse；只有外部 URL 的版本庫需要 Pulse 0.10.0。
 4. 需要時再啟用新功能：雙人覆核（`[remote] rollout_approval = "required"`，需要重新啟動，至少要有兩位管理員帳號）、外部 URL 的版本庫（每台 Pulse 的 `[upgrade] url_allowlist`）。
 
 **改用 PostgreSQL**（選用；`kairos/packaging/INSTALL.md` 附錄 D）：先完成上面的步驟 1、2（`kairos db migrate` 只搬移 v11 的資料庫），停止 Kairos → `kairos db migrate --to postgres` → 設定 `storage.backend = "postgres"` 與 `[storage.postgres]` → 啟動。版本庫的發佈檔與金鑰檔仍在資料目錄，不在資料庫中。
@@ -94,7 +94,7 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 
 | Pulse ＼ Kairos | Kairos 0.9 | Kairos 0.10 |
 |---|---|---|
-| **Pulse 0.9** | 不變 | 與 0.9 相同，另外可以使用推送的排程、維護時段（Pulse 0.9.0 就遵守 `apply_window`）、自訂批次與雙人覆核；外部 URL 的提議回報 `declined` |
+| **Pulse 0.9** | 不變 | 與 0.9 相同，另外可以使用推送的排程、升級時段（Pulse 0.9.0 就遵守 `apply_window`）、自訂批次與雙人覆核；外部 URL 的提議回報 `declined` |
 | **Pulse 0.10** | 與 0.9 相同（Kairos 0.9 不會提議外部 URL） | 全部功能；外部 URL 的版本庫另需要 Pulse 本機的 `upgrade.url_allowlist`。叢集模式下協商了 `cluster` 的 Pulse 在 `hello_ack` 收到 `cluster_id` |
 
 ### Kairos：PostgreSQL 儲存後端（HA L1b；`kairos/HA.md` 第 4、5、7、12 節、`kairos/STORAGE.md` 第 19 節）
@@ -122,13 +122,13 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 - **可觀測性**：`/readyz` 的 `checks` 新增 `cluster`（`leader`／`standby`／`draining`／`lost`；單機為 `disabled`）、`keys`、`schema`，並支援 `?scope=agent|enroll|console|leader`（keepalived 的 `track_script` 用 `scope=leader`）；`/metrics` 新增 `kairos_cluster_enabled`、`kairos_cluster_role{role}`、`kairos_cluster_lease_epoch`、`kairos_cluster_lease_renewals_total{result}`、`kairos_cluster_leader_changes_total`、`kairos_cluster_nodes{state}`、`kairos_cluster_keys_ok`；系統健康新增 `cluster` 項目（沒有 leader、金鑰不一致為嚴重；節點失聯、設定不一致、沒有同步複寫、時差、只有一個節點為警告），另有 `GET /api/v1/cluster`（`settings:read`）；JSON 格式的日誌每行多一個 `node_id`。
 - **其他**：節點的設定雜湊不同時記 `KRS-W8505`（只警告）；心跳逾時的節點由 leader 標為失聯（`KRS-W8506`）；`node_id` 與另一台主機上執行中的節點重複時拒絕啟動（`KRS-E8503`）；協商了 `cluster` 的 Pulse 在 `hello_ack` 收到 `cluster_id`；主控台的 SSE 在接手後以 `resync("failover")` 重新載入；告警在換手時記「叢集的 leader 已由 A 切換到 B」（`KRS-I8501`），不開「停機」事件；`--check-config` 檢查叢集是否已建立、金鑰是否一致、`cluster.service_name` 是否在伺服器憑證的 SAN 中。
 - **schema v10**（SQLite 與 PostgreSQL）：新增叢集的資料表（`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures`）與三個欄位（`enroll_requests.issuing_node`、`issuing_at`、`alert_deliveries.claim_epoch`）；這一版只使用 `cluster_nodes` 與 `cluster_leases`，其餘先建立、保持空白。
-- **遠端管理在叢集模式下**（HA.md 第 6.8 節的盤點）：推送引擎、排程與維護時段、離線告警抑制的調和、SSE 的差異比對都只在主動節點的行程中執行，狀態在資料庫；換手後由接手的節點從資料庫繼續——已排程的推送到 `starts_at` 開始、替換中（`applying`）主機的離線抑制在接手後約 5 秒內重建。端對端測試 `remote_upgrade_state_survives_failover` 以兩次換手驗證。`[remote] rollout_approval` 納入「需要一致的設定」（不一致時 `KRS-W8505`）。版本庫的發佈檔是節點本機的檔案（見「已知限制」）。
+- **遠端管理在叢集模式下**（HA.md 第 6.8 節的盤點）：推送引擎、排程與升級時段、離線告警抑制的調和、SSE 的差異比對都只在主動節點的行程中執行，狀態在資料庫；換手後由接手的節點從資料庫繼續——已排程的推送到 `starts_at` 開始、替換中（`applying`）主機的離線抑制在接手後約 5 秒內重建。端對端測試 `remote_upgrade_state_survives_failover` 以兩次換手驗證。`[remote] rollout_approval` 納入「需要一致的設定」（不一致時 `KRS-W8505`）。版本庫的發佈檔是節點本機的檔案（見「已知限制」）。
 - 部署步驟：INSTALL 附錄 H。
 
 ### Kairos：遠端管理 F8 的其餘項目（`crates/kairos-proto/REMOTE.md`、API.md 第 17 節）
 
 - **`kairos releases list|import|delete`**（REMOTE.md 第 8.2、13.1 節）：Pulse 發佈版本庫的命令列。`import <目錄>` 讀取同一次發佈的 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json` 與發佈檔，可以重複執行補上發佈檔，也可以在 Kairos 啟動前先匯入（離線環境）；`list [--json]` 列出版本、發佈檔與使用情形，並標出已存入而檔案遺失或大小不符的發佈檔；`delete <版本> --confirm <版本>`（L2）。驗證、`release_in_use` 的保護與稽核事件與主控台 API 相同，執行者為 `cli:<OS 帳號>`。`import --external <URL>` 登記外部 URL 的版本庫。兩個儲存後端都可以使用；叢集模式下可以在任何節點（含備援）執行。
-- **升級推送的排程與維護時段**（REMOTE.md 第 4.7.1、4.7.3、4.7.5、13.1 節、API.md 第 17.3 節）：推送新增 `schedule`——`starts_at`（在這之前為新的狀態 `scheduled`，到時由推送引擎開始）、`ends_at`（到時推送結束，尚未開始替換的主機標為 `expired`／`rollout_ended`）、`windows[]`（每週的維護時段：星期、`HH:MM` 的開始與結束，可跨午夜）與 `timezone`（**固定位移**，預設 `alerts.timezone`）。時段是「允許開始替換的時間」：時段外不提議新的主機，提議的 `apply_window` 到時段結束為止，已開始替換的照常完成；時段結束時還沒開始的主機在下一個時段重新提議，不計入失敗。`next_action` 新增 `scheduled`、`waiting_window`；已排程的推送可以取消，修改時退回草稿、需要重新送出。對象仍在**送出時**固定。Pulse 0.9.0 就會遵守 `apply_window`，不需要升級 Pulse。主控台 S26：建立表單的「排程與維護時段」、清單與詳情的「已排程」「等待維護時段」。
+- **升級推送的排程與升級時段**（REMOTE.md 第 4.7.1、4.7.3、4.7.5、13.1 節、API.md 第 17.3 節）：推送新增 `schedule`——`starts_at`（在這之前為新的狀態 `scheduled`，到時由推送引擎開始）、`ends_at`（到時推送結束，尚未開始替換的主機標為 `expired`／`rollout_ended`）、`windows[]`（每週的升級時段：星期、`HH:MM` 的開始與結束，可跨午夜）與 `timezone`（**固定位移**，預設 `alerts.timezone`）。時段是「允許開始替換的時間」：時段外不提議新的主機，提議的 `apply_window` 到時段結束為止，已開始替換的照常完成；時段結束時還沒開始的主機在下一個時段重新提議，不計入失敗。`next_action` 新增 `scheduled`、`waiting_window`；已排程的推送可以取消，修改時退回草稿、需要重新送出。對象仍在**送出時**固定。Pulse 0.9.0 就會遵守 `apply_window`，不需要升級 Pulse。主控台 S26：建立表單的「排程與升級時段」、清單與詳情的「已排程」「等待升級時段」。
 - **升級推送的自訂批次**（REMOTE.md 第 4.7.1、13.1 節）：`waves` 由最多 2 批放寬為最多 10 批；每批的 `size` 為台數或**當時剩餘**的可升級主機的百分比，最後一批為 `"rest"`，每批各有觀察時間、失敗上限與是否人工繼續。省略 `waves` 時仍是 0.9 的兩批預設範本，既有兩批推送的分批結果不變。預覽另回 `wave_templates`（含第 4.7.1 節建議的四批範本 1% → 10% → 50% → 其餘）與 `max_waves`。主控台 S26 的建立表單可以增減「中間的批次」並套用四批範本，詳情的批次時間軸支援多批。
 - **升級推送的雙人覆核**（REMOTE.md 第 5.4、13.1 節）：`kairos.toml` 新增 `[remote] rollout_approval = "none" | "required"`（預設 `none`，需要重新啟動，只能在設定檔改）。`required` 時送出的推送先進入新的狀態 `pending_approval`（對象已固定、不提議任何主機），必須由**另一位**有新權限 `rollouts:approve`（只有管理員）的使用者以帳號登入的工作階段核准（`POST /api/v1/rollouts/{id}/approve`）才會開始或排程；API token 不能核准（403 `session_required`），建立者與送出者不能核准（403 `self_approval`，`KRS-E6106`）。`…/reject`（原因必填）或修改待核准的推送會退回草稿，需要重新送出與核准。稽核 `rollout.approve`、`rollout.reject`；推送另記錄 `submitted_at`／`submitted_by`、`approved_at`／`approved_by`、`reject_reason`（**schema v11**，兩個後端）。主控台 S26：「待核准」狀態、核准…／退回…、不能核准自己的推送的說明，側邊導覽的計數泡泡對有核准權限的人另計待核准的推送。降版推送（L3）仍是固定字串＋原因，沒有重新驗證密碼（待決）。
 - **外部 URL 的 Pulse 版本庫**（REMOTE.md 第 4.1.2、13.1、17.7 節）：發佈檔可以放在客戶自己的 HTTPS 伺服器，Kairos 只保存 `SHA256SUMS`、簽章與清單。`POST /api/v1/releases` 的 `source: "external"`＋`base_url`、`kairos releases import <目錄> --external <base_url>`、主控台匯入對話框的「外部 URL（選填）」。簽章與雜湊的驗證與代管相同；要推送的發佈檔照樣上傳（或由 CLI 讀取）一次以**登記**雜湊與大小，但不保存在 Kairos。提議的 `artifact.source` 為 `url`、`url` 為 `base_url＋檔名`。主機目前版本的發佈是外部 URL 時，只在目標也是外部 URL 時才附回滾檔。
@@ -160,7 +160,7 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。
 - **PROXY protocol v2 沒有做**（`KRS-W2206` 尚未使用）：經 L4 負載平衡器時，每 IP 的連線與速率限制、日誌與稽核看到的來源都是負載平衡器的位址。請把負載平衡器的位址加入允許清單，或改用虛擬 IP／`server.fallback_addresses`。
 - **遠端升級的版本庫是節點本機的檔案**（`<data_dir>/releases/`）：版本與發佈檔的清單在共用的資料庫，檔案只在匯入它的那個節點。叢集部署要**在每個節點各自匯入相同的發佈版本**（`kairos releases import` 可以在備援節點執行；主控台的上傳只存到當時的主動節點），否則換手後進行中的推送會下載失敗；接手的節點以系統健康的「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕）標出它缺少的檔案。刪除版本只刪除執行它的節點上的檔案。外部 URL 的版本庫不受影響。跨節點同步是待決事項。
 - **Windows 的遠端升級不含在 0.10.0**（REMOTE.md 第 4.4.4、18 節）：Windows 主機的 `install.upgrade` 仍是 `unsupported`（推送的資格分類為 `unsupported_platform`），以既有的 MSI／SCCM 升級；集中設定不受影響。理由：升級程序的每一步（脫離服務、`msiexec`、服務控制、ACL 檢查、回滾）都只能在 Windows 實機驗證，而信任邊界（ACL）寫錯不會有任何錯誤訊息；0.8.0 的 Windows 服務與 MSI 本身也還沒有實機驗證。需要的 VM 與驗證清單見 REMOTE.md 第 18.3 節，是否與何時實作待決定。
-- **維護時段的時區是固定位移**（例如 `+08:00`；不支援 `Asia/Taipei` 這類時區名稱）：有日光節約時間的地區，換季時要自行修改推送的時段。叢集模式下排程與時段以主動節點的系統時鐘判斷，節點之間的時差會讓換手後的時間邊界偏移同樣的量（時差超過 2 秒記 `KRS-W8305`）。
+- **升級時段的時區是固定位移**（例如 `+08:00`；不支援 `Asia/Taipei` 這類時區名稱）：有日光節約時間的地區，換季時要自行修改推送的時段。叢集模式下排程與時段以主動節點的系統時鐘判斷，節點之間的時差會讓換手後的時間邊界偏移同樣的量（時差超過 2 秒記 `KRS-W8305`）。
 - **暫定的產品代碼**：`KRS-W8417`（版本庫的檔案遺失）與 `KRS-E4406`（這個命令不支援 PostgreSQL 後端）尚待設計包正式分配，正式分配後代碼可能改變；請不要在自動化中寫死這兩個代碼。
 - 叢集模式還沒有：主控台的叢集畫面與排空／交還的 API、叢集相關的系統告警規則（節點失聯等只顯示在系統健康、`kairos cluster status` 與日誌）、通知的 `delivery_id`（換手時通知是 at-least-once）。備援節點的 `/metrics` 只有版本與 `kairos_cluster_*`。
 - **Pulse 升級輔助程式的交易紀錄還不完整**（REMOTE.md 第 17.8 節；ADR-0003 的實作會處理）：狀態檔沒有 checksum 與完整的交易 schema；沒有獨立的「替換中」步驟——在替換途中當機後接續時會重新驗證並再替換一次，此時若重新驗證失敗會以 `failed` 結束而不回滾（tar 已換上的新 unit 也不會還原）；套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時直接 `rollback_failed`，不會退回以 `pulse.prev` 換回執行檔；沒有檢查既存工作目錄的擁有者、沒有工作目錄數量的上限；沒有故障注入的測試矩陣。狀態檔或進行中交易的指標損毀時輔助程式拒絕繼續（`state_unusable`／`transaction_pointer_unusable`），需要人工檢查主機後刪除 `/var/lib/pulse-upgrade/active.json` 與對應的工作目錄才能再遠端升級。

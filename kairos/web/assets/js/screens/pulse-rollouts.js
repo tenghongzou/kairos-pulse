@@ -5,7 +5,7 @@
 //   （next_action 的代碼＋參數由 pulse-common.js 組文案；已暫停寫出原因）、建立。
 // - 即時更新：SSE rollout.progress 就地更新該列（狀態、批次、進度、下一步），不重排（screens.md §0.2）。
 // - 空狀態：「還沒有升級推送…」；版本庫為空時主要動作改為「前往 Pulse 版本庫」。
-// - 權限：建立只限管理員（rollouts:write）；維運者、稽核員檢視。0.9 不顯示 0.10 的維護時段、雙人覆核。
+// - 權限：建立只限管理員（rollouts:write）；維運者、稽核員檢視。0.9 不顯示 0.10 的升級時段、雙人覆核。
 
 import { h, icon, mount } from '../core/dom.js';
 import { t } from '../core/strings.js';

@@ -277,7 +277,7 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await page.goto(`${URL0}/pulse/rollouts/${schId}`);
     await waitTitle(page, 'E2E 排程');
     await page.getByText(/已排程：.* 開始升級。對象已在送出時固定/).waitFor();
-    await page.locator('#rollout-schedule').getByText(/維護時段：週六、週日 23:00～03:00（時區 /).waitFor();
+    await page.locator('#rollout-schedule').getByText(/升級時段：週六、週日 23:00～03:00（時區 /).waitFor();
     // 三批：先行批次、第 2 批、其餘
     await page.locator('#rollout-waves').getByText('第 2 批').waitFor();
     assert.equal(await page.getByRole('button', { name: '取消推送…' }).count(), 1, '已排程的推送可以取消');
@@ -300,11 +300,11 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await page.getByRole('button', { name: /套用建議的四批範本/ }).click();
     await preview.getByText('分 4 批：1 → 0 → 0 → 0 台').waitFor({ timeout: 15000 });
     await page.locator('#rollout-mid-waves fieldset[data-wave="2"]').waitFor();
-    // 0.10 維護時段：新增一個時段，時區說明來自預覽的 default_timezone
+    // 0.10 升級時段：新增一個時段，時區說明來自預覽的 default_timezone
     await page.getByRole('button', { name: '新增時段' }).click();
     await page.locator('#rollout-windows fieldset[data-window="0"]').waitFor();
     await page.locator('#rollout-window-tz').getByText(/時段以 Kairos 的時區 [+-]\d\d:\d\d 計算/).waitFor({ timeout: 15000 });
-    await axe(page, 'F8 S26 建立推送（四批＋維護時段）');
+    await axe(page, 'F8 S26 建立推送（四批＋升級時段）');
     await page.getByRole('button', { name: '移除時段 1' }).click();
     await page.getByRole('button', { name: '移除第 2 批' }).click();
     await page.getByRole('button', { name: '移除第 2 批' }).click();

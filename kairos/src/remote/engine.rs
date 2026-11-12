@@ -1289,7 +1289,7 @@ impl RemoteService {
                         url: base.map(|b| format!("{b}{}", a.filename)),
                     };
                 let offered = h.offered_at.unwrap_or(r.updated_at);
-                // apply_window：沒有維護時段時為提議後 24 小時；有時段時到提議所在的時段結束為止
+                // apply_window：沒有升級時段時為提議後 24 小時；有時段時到提議所在的時段結束為止
                 // （都不超過 ends_at）。時段已過（Pulse 交付前的再確認）時不再提議：upgrade_unavailable，
                 // Pulse 不會在時段外替換，主機在下一個時段以新的 upgrade_id 重新提議
                 let schedule = ScheduleSpec::from_db(&r.schedule);

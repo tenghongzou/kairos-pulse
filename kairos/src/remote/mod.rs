@@ -239,7 +239,7 @@ pub struct RemoteService {
     clock: crate::enroll::Clock,
     /// 服務啟動的時間（Unix 毫秒；推送引擎在啟動後 1 分鐘內不提議新的主機）
     pub started_ms: i64,
-    /// 推送的維護時段沒有指定 `timezone` 時的預設（Kairos 的 `alerts.timezone`；沒有設定時 `+08:00`）
+    /// 推送的升級時段沒有指定 `timezone` 時的預設（Kairos 的 `alerts.timezone`；沒有設定時 `+08:00`）
     default_timezone: std::sync::OnceLock<String>,
     state: Mutex<State>,
     snapshot: RwLock<Arc<ConfigSnapshot>>,
@@ -312,14 +312,14 @@ impl RemoteService {
         (self.clock)()
     }
 
-    /// 設定維護時段的預設時區（啟動時以 `alerts.timezone` 呼叫一次；不是固定位移時忽略）
+    /// 設定升級時段的預設時區（啟動時以 `alerts.timezone` 呼叫一次；不是固定位移時忽略）
     pub fn set_default_timezone(&self, tz: &str) {
         if schedule::parse_offset_secs(tz).is_some() {
             let _ = self.default_timezone.set(tz.trim().to_string());
         }
     }
 
-    /// 維護時段的預設時區（固定位移）
+    /// 升級時段的預設時區（固定位移）
     pub fn default_timezone(&self) -> String {
         self.default_timezone
             .get()

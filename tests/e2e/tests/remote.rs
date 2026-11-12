@@ -213,7 +213,7 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
     );
     assert_eq!(s, 200, "{v}");
 
-    // 維護時段（0.10）：現在在時段外的推送不提議任何主機（下一步為 waiting_window），取消後再建正式的推送
+    // 升級時段（0.10）：現在在時段外的推送不提議任何主機（下一步為 waiting_window），取消後再建正式的推送
     let now = time::OffsetDateTime::now_utc();
     let hhmm = |t: time::OffsetDateTime| format!("{:02}:{:02}", t.hour(), t.minute());
     let rfc3339 = |t: time::OffsetDateTime| {
@@ -275,7 +275,7 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
     assert_eq!(s, 200, "{v}");
 
     // 推送：預覽 → 建立 → 送出（L2）。排程（0.10）：6 秒後開始（送出後為 scheduled，到時由推送引擎開始），
-    // 維護時段涵蓋現在（跨午夜也可以），提議的 apply_window 到時段結束為止
+    // 升級時段涵蓋現在（跨午夜也可以），提議的 apply_window 到時段結束為止
     let window_end = now + time::Duration::hours(3);
     let spec = json!({
         "name": "0.9.1", "target_version": "0.9.1", "selector": {"agent_ids": [GOOD.agent_id]},
@@ -319,7 +319,7 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         offer["target"],
         json!({"version": "0.9.1", "commit": "5e6f7a8"})
     );
-    // apply_window 到維護時段結束為止（不是提議後 24 小時）
+    // apply_window 到升級時段結束為止（不是提議後 24 小時）
     let not_after = offer["apply_window"]["not_after"].as_str().unwrap();
     assert!(
         not_after.contains(&format!("T{}:00", hhmm(window_end))),

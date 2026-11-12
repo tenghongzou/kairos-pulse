@@ -1,4 +1,4 @@
-//! 推送的排程與維護時段（REMOTE.md 第 4.7.1、4.7.5 節；0.10）。
+//! 推送的排程與升級時段（REMOTE.md 第 4.7.1、4.7.5 節；0.10）。
 //!
 //! `schedule` = `{starts_at?, ends_at?, windows[], timezone}`：
 //!

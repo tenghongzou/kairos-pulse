@@ -675,7 +675,7 @@ RETURNING conn_epoch, (SELECT conn_node FROM prev), (SELECT conn_epoch FROM prev
 | 稽核的自我驗證與鏈尾外送 | `audit_monitor.rs` | 稽核寫入（自己開交易） |
 | 主控台的工作階段清除、token 最後使用時間與稽核旗標、被拒憑證寫入清冊 | `api/maint.rs` | 同上 |
 | 遠端管理：推送引擎（每 5 秒一輪）、到期指派、舊推送的清除 | `remote/mod.rs` `RemoteService::run`、`remote/engine.rs` | `TxMode::Immediate` 與自動提交 |
-| 遠端管理（0.10.0）：**排程與維護時段**——`scheduled` 的推送到 `starts_at` 開始、`ends_at` 結束、時段外不提議、時段結束後把未開始的主機退回 `pending` | 推送引擎的同一輪（`RemoteService::tick`、`rollout::plan_tick`、`remote/schedule.rs`） | 同上。排程（`rollouts.schedule`，含建立時填入的時區）與狀態都在資料庫；引擎沒有另外的計時器，每一輪以資料庫的內容與**節點本機的時鐘**判斷 |
+| 遠端管理（0.10.0）：**排程與升級時段**——`scheduled` 的推送到 `starts_at` 開始、`ends_at` 結束、時段外不提議、時段結束後把未開始的主機退回 `pending` | 推送引擎的同一輪（`RemoteService::tick`、`rollout::plan_tick`、`remote/schedule.rs`） | 同上。排程（`rollouts.schedule`，含建立時填入的時區）與狀態都在資料庫；引擎沒有另外的計時器，每一輪以資料庫的內容與**節點本機的時鐘**判斷 |
 | 遠端管理（0.10.0）：**雙人覆核** | 沒有背景工作：`pending_approval` 的推送引擎不處理，核准／退回是主控台 API 的交易（`remote/ops.rs`） | `TxMode::Immediate`。`submitted_*`、`approved_*`、`reject_reason` 在 `rollouts`（schema v11）；核准需要的工作階段在資料庫 |
 | 遠端管理：告警的系統檢查（`reconcile_alerts`：自動暫停、簽章失敗、回滾失敗）與**升級中離線抑制的調和**（0.10.0，`reconcile_upgrade_windows`：`RemoteStore::applying_hosts()`） | 推送引擎的每一輪之後 | 只讀資料庫、發布到行程內的匯流排（告警引擎訂閱）；第一輪全部重新發布，「升級中」另外每 60 秒重送一次 |
 | 遠端管理（0.10.0）：SSE `rollout.host` 的差異比對（每個訂閱中的推送、每台主機上次送出的樣子） | `RemoteService::flush_progress`（推送引擎的每一輪） | 不寫資料庫；基準在記憶體中，隨主控台的 SSE 連線建立與結束 |
@@ -718,7 +718,7 @@ RETURNING conn_epoch, (SELECT conn_node FROM prev), (SELECT conn_epoch FROM prev
 - **遠端管理在換手後的狀態（0.10.0 的排程、雙人覆核、離線抑制、SSE）**——盤點的結論：
   - 推送、主機進度、排程、覆核的紀錄都在資料庫；`RemoteService` 記憶體中的狀態（期望設定的版本、提議中的 `upgrade_id`）在接手的節點啟動服務時從資料庫載入，連線中的工作階段、提議的檔案、下載名額隨 Pulse 重新連線重建。接手的節點**不需要**上一個 leader 的任何記憶體狀態。
   - **已排程的推送**：接手的節點在推送引擎的第一輪就依 `starts_at`／`ends_at`／時段處理；換手期間（約 13 秒）錯過的 `starts_at` 在接手後的第一輪開始。與單機重新啟動相同，推送引擎在啟動（接手）後 1 分鐘內不提議新的主機（REMOTE.md 第 4.7.4 節第 5 項）。
-  - **時鐘**：排程與維護時段以 leader 的系統時鐘判斷（租約與 fencing 才用資料庫的時鐘）。節點之間的時差會讓換手後的開始時間與時段邊界偏移同樣的量；時差超過 2 秒時 `KRS-W8305`。維護時段的時區是固定位移，建立推送時寫入資料庫，不隨節點改變。
+  - **時鐘**：排程與升級時段以 leader 的系統時鐘判斷（租約與 fencing 才用資料庫的時鐘）。節點之間的時差會讓換手後的開始時間與時段邊界偏移同樣的量；時差超過 2 秒時 `KRS-W8305`。升級時段的時區是固定位移，建立推送時寫入資料庫，不隨節點改變。
   - **雙人覆核的開關**（`[remote] rollout_approval`）是設定檔的值、各節點各自讀取：它納入「需要一致的設定」的雜湊，節點之間不同時 `KRS-W8505`（只警告）——不一致時，換手後新送出的推送是否需要核准會跟著 leader 改變；已在 `pending_approval` 的推送不受影響（仍要核准或退回）。
   - **升級中的離線告警抑制**：接手的節點在推送引擎的第一輪（啟動服務後約 5 秒）從資料庫的 `applying` 主機重建，主機在抑制期限前不會因為替換與換手而開離線事件。重建之前的這幾秒由告警的暖機期（等待主機重新連上；最長 `alerts.warmup_secs`，至少 60 秒）與離線規則的寬限（預設 180 秒）涵蓋；把寬限設為 0、而且其他主機在 5 秒內就全部重新連上時，理論上可能在重建前開出離線事件（端對端測試沒有遇到）。
   - **SSE `rollout.host`**：基準在記憶體中；換手後主控台以 `resync("failover")` 重新載入並重新訂閱，接手的節點建立新的基準。換手期間的主機狀態變化由重新載入的主機表補上，不會遺失。
@@ -1324,7 +1324,7 @@ kairos db migrate --to sqlite:/opt/kairos/data/kairos.db
 | F15 | 在任一節點上執行 CLI | **已驗證** | 端對端：兩個節點的目錄都執行過 `reports export`、`audit verify`、`cluster status`／`step-down`／`drain`／`forget`；稽核鏈在兩個節點與 CLI 交錯寫入後驗證通過 |
 | F16 | 所有節點都停止 | **部分驗證** | 端對端的收尾：全部停止後 `kairos cluster status` 回報沒有 leader（結束代碼 9）。「全部停止後再啟動、Pulse 補送」由 `tests/postgres.rs` 的單一節點重新啟動涵蓋 |
 | F17 | 同一個 agent 在兩個節點上同時連線 | 不適用（階段 B） | 階段 A 只有一個節點監聽 |
-| — | 遠端管理在換手後的狀態（0.10.0；第 6.8 節的盤點） | **已驗證**（Pulse 以模擬 client 代替） | 端對端 `tests/e2e/tests/cluster.rs` `remote_upgrade_state_survives_failover`：(1) `kairos releases import` 在**備援**節點執行（PostgreSQL 後端、不經 fencing），主動節點的系統健康標出它缺少的發佈檔（`KRS-W8417`〔暫定〕），在主動節點再匯入一次後恢復；(2) 已排程（`scheduled`）的推送在主動節點被 SIGKILL 後由接手的節點從資料庫繼續：到 `starts_at` 開始、提議主機，發佈檔由接手節點自己的版本庫經 8443 提供；(3) 主機替換中（`applying`）時再換手一次：接手的節點重建離線告警抑制，主機斷線（寬限 0 秒）15 秒內沒有離線事件，回報成功後推送完成，之後的離線照常開事件。**沒有驗證**：實際的 Pulse 與輔助程式在換手期間替換（系統層測試 `tests/systemd/` 是單機、SQLite）、雙人覆核在換手前後的端對端流程（核准需要兩個以帳號登入的工作階段；資料庫的狀態由兩個後端共用的儲存層測試涵蓋）、維護時段的邊界剛好落在換手期間、節點時鐘不一致時的排程 |
+| — | 遠端管理在換手後的狀態（0.10.0；第 6.8 節的盤點） | **已驗證**（Pulse 以模擬 client 代替） | 端對端 `tests/e2e/tests/cluster.rs` `remote_upgrade_state_survives_failover`：(1) `kairos releases import` 在**備援**節點執行（PostgreSQL 後端、不經 fencing），主動節點的系統健康標出它缺少的發佈檔（`KRS-W8417`〔暫定〕），在主動節點再匯入一次後恢復；(2) 已排程（`scheduled`）的推送在主動節點被 SIGKILL 後由接手的節點從資料庫繼續：到 `starts_at` 開始、提議主機，發佈檔由接手節點自己的版本庫經 8443 提供；(3) 主機替換中（`applying`）時再換手一次：接手的節點重建離線告警抑制，主機斷線（寬限 0 秒）15 秒內沒有離線事件，回報成功後推送完成，之後的離線照常開事件。**沒有驗證**：實際的 Pulse 與輔助程式在換手期間替換（系統層測試 `tests/systemd/` 是單機、SQLite）、雙人覆核在換手前後的端對端流程（核准需要兩個以帳號登入的工作階段；資料庫的狀態由兩個後端共用的儲存層測試涵蓋）、升級時段的邊界剛好落在換手期間、節點時鐘不一致時的排程 |
 
 另外**沒有驗證**的：同步備庫切換時的行為（F5）、兩個以上備援節點同時搶租約的端對端情境（單元測試以 6 條連線同時搶租約驗證了「恰好一個成功」）、大量主機（1,000 台以上）下的接手時間（清冊載入的時間隨主機數增加，STORAGE.md 第 11.2 節）、Windows 上的 Kairos（只做了 `x86_64-pc-windows-gnu` 的編譯檢查）、PgBouncer 之後的連線（只支援 session pooling）。第 23 節的「1,000 台模擬 agent、F1 換手 10 次」與「換手時間的分布（F1、F2 各 20 次）」沒有做：這裡的數字是一台 Pulse、7～8 次的範圍。
 

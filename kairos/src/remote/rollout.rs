@@ -1,4 +1,4 @@
-//! 升級推送（REMOTE.md 第 4.7 節；0.10 起：自訂批次（最多 [`MAX_WAVES`] 批）、排程與維護時段
+//! 升級推送（REMOTE.md 第 4.7 節；0.10 起：自訂批次（最多 [`MAX_WAVES`] 批）、排程與升級時段
 //! （[`super::schedule`]）；雙人覆核另見第 5.4 節）。
 //!
 //! - [`RolloutSpec`]：建立推送的內容（名稱、目標版本、選擇器、批次、選項）；JSON 存在 `rollouts`。
@@ -140,7 +140,7 @@ pub const MAX_WAVES: usize = 10;
 pub const MAX_SELECTOR_ITEMS: usize = 10_000;
 /// 推送名稱的長度上限（字元）
 pub const MAX_ROLLOUT_NAME_CHARS: usize = 128;
-/// 提議的 `apply_window`：提議後 24 小時內開始替換（0.9.0 沒有維護時段）
+/// 提議的 `apply_window`：提議後 24 小時內開始替換（0.9.0 沒有升級時段）
 pub const APPLY_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 提議後超過 `apply_window` 再加這段時間仍未開始替換：Kairos 端標為 `expired`
 pub const EXPIRE_GRACE_MS: i64 = 3600 * 1000;
@@ -155,10 +155,10 @@ pub fn suppress_until(applying_at: i64, health_timeout_secs: u32) -> i64 {
     applying_at + i64::from(health_timeout_secs) * 1000 + SUPPRESS_GRACE_MS
 }
 
-/// 有維護時段的推送：時段結束後超過這段時間仍未開始替換的主機回到 `pending`，下一個時段重新提議
+/// 有升級時段的推送：時段結束後超過這段時間仍未開始替換的主機回到 `pending`，下一個時段重新提議
 /// （留給 Pulse 回報 `expired` 的時間）
 pub const WINDOW_EXPIRE_GRACE_MS: i64 = 2 * 60 * 1000;
-/// 有維護時段的推送：一台主機因時段結束而重新排入的次數上限，超過後留在 `expired`（可手動重試）
+/// 有升級時段的推送：一台主機因時段結束而重新排入的次數上限，超過後留在 `expired`（可手動重試）
 pub const MAX_WINDOW_REQUEUES: i64 = 10;
 /// `ends_at` 到了而尚未開始替換的主機的 `reason`
 pub const REASON_ROLLOUT_ENDED: &str = "rollout_ended";
@@ -428,7 +428,7 @@ pub struct RolloutSpec {
     pub selector: SelectorSpec,
     pub waves: Vec<WaveSpec>,
     pub options: RolloutOptions,
-    /// 排程與維護時段（沒有時立即開始、隨時可以提議）
+    /// 排程與升級時段（沒有時立即開始、隨時可以提議）
     pub schedule: ScheduleSpec,
 }
 
@@ -869,7 +869,7 @@ pub enum HostAction {
     Revive,
     /// 連線中但沒有協商 `upgrade`（本機停用或缺少輔助程式）：跳過
     SkipNotReady,
-    /// 有維護時段的推送：時段結束時還沒開始替換（Pulse 回報 `expired`，或時段結束後仍停在提議中）
+    /// 有升級時段的推送：時段結束時還沒開始替換（Pulse 回報 `expired`，或時段結束後仍停在提議中）
     /// → 回到 `pending`、換新的 `upgrade_id`，下一個時段重新提議
     Requeue,
 }
@@ -906,7 +906,7 @@ pub struct TickInput<'a> {
     pub awaiting_continue: bool,
     pub waves: &'a [WaveSpec],
     pub options: &'a RolloutOptions,
-    /// 排程與維護時段：時段外不提議新的主機
+    /// 排程與升級時段：時段外不提議新的主機
     pub schedule: &'a ScheduleSpec,
 }
 
@@ -1005,7 +1005,7 @@ pub fn plan_tick(
             );
         }
     }
-    // 提議新的主機：Kairos 剛啟動、觀察中、等待繼續或維護時段外不提議
+    // 提議新的主機：Kairos 剛啟動、觀察中、等待繼續或升級時段外不提議
     let soaking = t.soak_until.is_some();
     if t.now_ms >= t.started_ms + t.start_grace_ms
         && !soaking
@@ -1060,7 +1060,7 @@ pub fn plan_tick(
     (actions, action)
 }
 
-/// 有維護時段的推送中逾時的主機：重新排入，超過次數上限時標為 `expired`
+/// 有升級時段的推送中逾時的主機：重新排入，超過次數上限時標為 `expired`
 fn requeue_or_expire(h: &RolloutHostRow) -> HostAction {
     if h.attempts < MAX_WINDOW_REQUEUES {
         HostAction::Requeue
@@ -1114,7 +1114,7 @@ pub fn next_action(
     )
 }
 
-/// [`next_action`] 加上排程：`scheduled{starts_at}`（等待開始時間）、`waiting_window{until}`（維護時段外，
+/// [`next_action`] 加上排程：`scheduled{starts_at}`（等待開始時間）、`waiting_window{until}`（升級時段外，
 /// `until` 為下一個時段開始的時間；之後沒有時段時為 `null`）
 pub fn next_action_scheduled(
     state: &str,

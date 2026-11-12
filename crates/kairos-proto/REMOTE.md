@@ -14,7 +14,7 @@
 | 在範圍內 | 不在範圍內 |
 |---|---|
 | Kairos 下發 Pulse 的部分設定（白名單），以群組、標籤、單台指派，回報實際生效值與差異，失敗回復 | 下發伺服器位址、憑證、信任設定等安全相關設定（永遠只在本機改，第 3.2 節） |
-| Kairos 推送 Pulse 的**官方簽章發佈包**，分批（canary、百分比、維護時段），健康檢查與自動回滾 | 任意指令、指令碼、外掛的下發；不是遠端執行通道（第 5.5 節） |
+| Kairos 推送 Pulse 的**官方簽章發佈包**，分批（canary、百分比、升級時段），健康檢查與自動回滾 | 任意指令、指令碼、外掛的下發；不是遠端執行通道（第 5.5 節） |
 | Linux tar／deb／rpm、Windows MSI／zip 的替換方式 | Kairos 自身的升級（第 4.11 節）；macOS |
 | 離線 agent 重連後的同步 | 多實例主機的遠端升級（第 4.4.5 節，第一版不支援） |
 
@@ -572,7 +572,7 @@ stateDiagram-v2
 
 恢復（`resume`）時重新檢查時段與資格。
 
-#### 4.7.5 維護時段
+#### 4.7.5 升級時段
 
 > 〔離線告警的自動抑制已在 0.10.0 實作，做法與差異見第 13.1 節「升級中主機的離線告警抑制」〕
 
@@ -949,7 +949,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 ### 10.3 `pulse status`
 
 - 「設定」列加上集中設定的狀態：「集中設定：已同步（第 42 版，2 個鍵被本機覆蓋）」「集中設定：第 43 版被拒（PLS-W0501）」「集中設定：本機停用」。
-- 新增一列「升級」（只在有進行中的升級或最近 24 小時有結果時顯示）：「下載中 45%（0.9.1）」「等待維護時段 01:00」「已回滾到 0.9.0（PLS-W8407）」「回滾失敗，需要人工處理（PLS-E8408）」。
+- 新增一列「升級」（只在有進行中的升級或最近 24 小時有結果時顯示）：「下載中 45%（0.9.1）」「等待升級時段 01:00」「已回滾到 0.9.0（PLS-W8407）」「回滾失敗，需要人工處理（PLS-E8408）」。
 - `--json` 的 `data` 新增 `management`（`config`、`upgrade` 物件）；只新增欄位。
 - `rollback_failed` 時結束代碼為 9（需要處理），與服務異常相同。
 
@@ -1067,15 +1067,15 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - `pending`：`hello_ack` 與回應 `heartbeat` 的 `ack`（`ServerMsg::heartbeat_ack`；其他 `ack` 一律 `ServerMsg::ack()`）。`config_rev`／`upgrade_id` 取自記憶體（啟動時由 `host_config`、進行中的推送載入，變更時更新），心跳不查資料庫。
 - hello（協商了 `config`）時以 hello 的 `tags`、`agent_version`、`install.config` 與清冊的群組重新計算這台主機的期望設定，只有雜湊或 hello 的資訊改變時才寫入；hello 的資訊另存在 `host_config`，之後的設定變更以它計算（清冊每 30 秒才同步）。
 - `config_get` → `config`：`rev` 為 `desired_rev`，`settings` 依 `agent_version` 過濾（`filter_for_version`），`hash` 以送出的 `settings` 計算；沒有設定時 `rev: 0`、空的 `settings`。`config_status` → `ack`，依「`rev` 比已記錄的舊時只更新 `effective`／`overridden`」寫入（但 `rev` 等於目前的 `desired_rev` 時照常記錄：刪除所有指派後期望設定回到第 0 版，Pulse 回報的 `rev: 0`）；`rejected`、`rolled_back` 記 WARN（`KRS-W0501`／`KRS-W0504`），停用與本機覆蓋記 INFO（`KRS-I0505`／`KRS-I0503`）。
-- `upgrade_get`：只有目前提議給這台主機（`offered`／`accepted`／`staged`、推送 `running`）的 `upgrade_id` 才回 `upgrade_offer`，否則 `upgrade_unavailable`。發佈檔依 hello 的 `install.method` 與 `os.arch` 選擇（`release::artifact_kind`）；deb／rpm 另附**主機目前版本**的同格式檔案為 `rollback_artifact`（版本庫有時）。`apply_window`：提議時起 24 小時（0.9 沒有維護時段）。組出的提議先以 `validate_upgrade_offer` 檢查。
+- `upgrade_get`：只有目前提議給這台主機（`offered`／`accepted`／`staged`、推送 `running`）的 `upgrade_id` 才回 `upgrade_offer`，否則 `upgrade_unavailable`。發佈檔依 hello 的 `install.method` 與 `os.arch` 選擇（`release::artifact_kind`）；deb／rpm 另附**主機目前版本**的同格式檔案為 `rollback_artifact`（版本庫有時）。`apply_window`：提議時起 24 小時（0.9 沒有升級時段）。組出的提議先以 `validate_upgrade_offer` 檢查。
 - `upgrade_chunk_get`：`filename` 只能是這次提議的檔案（其他 `upgrade_unavailable`）；下載名額（`max_concurrent_downloads`，同一台主機延續名額，10 分鐘沒有請求或回報 `staged`／結束時釋出）不足時 `rate_limited`＋`retry_after_ms: 15000`；從 `<releases_dir>/<sha256>` 讀取（blocking 執行緒），檔案遺失或比記錄的短時 `upgrade_unavailable` 並記 WARN。Kairos **不在提供時重新驗證**檔案內容（被竄改的檔案由 Pulse 的雜湊與簽章檢查發現，第 12.2 節第 5 項）。
 - `upgrade_status`：以 (`upgrade_id`, `state`) 去重；晚到的較早狀態（例如 `applying` 之後的 `accepted`）與已結束的主機的回報只記錄不改變；不認得的 `upgrade_id` 也回 `ack`。`succeeded` 以這條連線 hello 的 `agent_version` 交叉確認（不符 → `failed`／`version_mismatch`／`KRS-W8402`）。資料庫失敗時 `storage_unavailable`（`config_get`、`config_status`、`upgrade_get`、`upgrade_chunk_get`、`upgrade_status` 都是）。
 
 **推送**（第 4.7 節的 MVP）
 
-- 0.9.0：最多兩批（0.10.0 起見下方「自訂批次」「排程與維護時段」；`waves` 的最後一批為 `"rest"`；預設範本為 canary 1%（至多 10 台）、觀察 60 分鐘、上限 0、人工繼續，其餘 5%），送出後立即開始（`draft` → `running`；`scheduled`、`pending_approval` 保留給 0.10）。對象在**送出時**固定（第 4.7.2 節寫「開始時」，建立草稿時只預覽），不符資格的記為 `skipped`（`wave = -1`）。
+- 0.9.0：最多兩批（0.10.0 起見下方「自訂批次」「排程與升級時段」；`waves` 的最後一批為 `"rest"`；預設範本為 canary 1%（至多 10 台）、觀察 60 分鐘、上限 0、人工繼續，其餘 5%），送出後立即開始（`draft` → `running`；`scheduled`、`pending_approval` 保留給 0.10）。對象在**送出時**固定（第 4.7.2 節寫「開始時」，建立草稿時只預覽），不符資格的記為 `skipped`（`wave = -1`）。
 - **自訂批次**（0.10.0，第 4.7.1 節）：`waves` 最多 10 批（`rollout::MAX_WAVES`），最後一批 `"rest"`；`size` 的百分比以**當時剩餘**的可升級主機計（至少 1 台，`max_hosts` 為上限），兩批時與 0.9 的結果相同。省略 `waves` 時仍是 0.9 的兩批預設範本（API 相容）；第 4.7.1 節的四批範本由預覽的 `wave_templates.recommended` 提供，主控台可一鍵套用。`canary_agent_ids` 仍指定第一批。失敗比例、觀察期、人工繼續逐批計算。
-- **排程與維護時段**（0.10.0，第 4.7.1、4.7.3、4.7.5 節；`kairos/src/remote/schedule.rs` 的純函式）：`rollouts.schedule`（JSON）＝`starts_at`、`ends_at`、`windows[]`（`days`：`mon`～`sun`，省略＝每天；`start`／`end`：`HH:MM`，跨午夜的時段屬於開始的那一天；最多 16 個，相連或重疊的時段視為一段）、`timezone`。
+- **排程與升級時段**（0.10.0，第 4.7.1、4.7.3、4.7.5 節；`kairos/src/remote/schedule.rs` 的純函式）：`rollouts.schedule`（JSON）＝`starts_at`、`ends_at`、`windows[]`（`days`：`mon`～`sun`，省略＝每天；`start`／`end`：`HH:MM`，跨午夜的時段屬於開始的那一天；最多 16 個，相連或重疊的時段視為一段）、`timezone`。
   - 狀態：送出時 `starts_at` 在未來 → `scheduled`（對象同樣在送出時固定，算在「未結束的推送」中，其他推送會 `rollout_overlap`）；推送引擎到時轉為 `running` 並以 `system` 寫 `rollout.start`。`scheduled` 可以取消；修改（`PUT`）時退回 `draft`、刪除已固定的對象，需要重新送出。
   - 時段外不提議新的主機（`next_action: waiting_window{until}`）。提議的 `apply_window` 為 `[提議時, 所在時段結束]`（沒有時段時照舊為提議後 24 小時；都不超過 `ends_at`）。時段結束後 `upgrade_get`（含 Pulse 交付前的再確認，第 17.2 節 #10）回 `upgrade_unavailable`，Pulse 不會在時段外替換。
   - 時段結束時還沒開始替換的主機——Pulse 回報 `expired`，或時段結束 2 分鐘後仍停在提議中——回到 `pending`（`reason: window_closed`、新的 `upgrade_id`、`attempts` 加 1），下一個時段重新提議，不計入失敗比例、不阻擋批次；同一台超過 10 次後留在 `expired`（可手動重試）。沒有時段的推送維持 0.9 的行為（`expired` 為終止狀態）。
@@ -1083,7 +1083,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
   - Kairos 重新啟動：時段以目前時間與資料表中的 `schedule` 重新計算，不需要另外的狀態。暫停後 `resume` 同樣重新判斷時段。
   - 不需要協定變更：Pulse 0.9.0 已遵守 `apply_window`（已暫存的升級等待 `not_before`、超過 `not_after` 回報 `expired`）。
 - **雙人覆核**（0.10.0，第 5.4 節）：`[remote] rollout_approval = "none" | "required"`（預設 `none`；`kairos.toml`，需要重新啟動）。`required` 時 `submit`（L2／L3 確認照舊、對象在此時固定）之後為 `pending_approval`，推送引擎不處理它；`POST …/approve`（權限 `rollouts:approve`，只有管理員；**只接受以帳號登入的工作階段**，API token 403 `session_required`）由建立者（`created_by`）與送出者（`submitted_by`）以外的人核准（否則 403 `self_approval`，`KRS-E6106`）後轉為 `running`，`starts_at` 在未來時為 `scheduled`。`POST …/reject`（`reason` 必填）退回 `draft`、刪除已固定的對象並記下 `reject_reason`；修改（`PUT`）待核准的推送同樣退回 `draft`（核准的是固定下來的內容，改了就要重新送審）。待核准的推送可以取消，它的主機算在未結束的推送中（`rollout_overlap`）。稽核 `rollout.approve`、`rollout.reject`（`rollout.submit` 的 `details.state` 為 `pending_approval`）。`rollout_approval = "none"` 時核准／退回為 409 `invalid_state`；由 `required` 改回 `none` 時，已在 `pending_approval` 的推送仍要核准或退回。schema v11（SQLite 與 PostgreSQL 兩個後端；v10 是叢集協調的資料表）：`rollouts.submitted_at`、`submitted_by`、`reject_reason`。
-- **PostgreSQL 後端與叢集模式**（0.10.0，`kairos/HA.md` 第 6.8 節）：本節 0.10.0 的項目（`kairos releases`、排程與維護時段、自訂批次、雙人覆核、外部 URL 的版本庫、升級中的離線告警抑制、SSE `rollout.host`、版本庫檔案的健康檢查）在 `storage.backend = "postgres"` 下行為相同（儲存層的測試在兩個後端各跑一次）。叢集模式下推送引擎只在取得租約的主動節點上執行，換手後由接手的節點從資料庫繼續（已排程的推送、`applying` 主機的離線抑制）；**版本庫的發佈檔是節點本機的檔案，每個節點要各自匯入**（`kairos releases import` 可以在備援節點執行），`rollout_approval` 在各節點要一致（不一致時 `KRS-W8505`）。
+- **PostgreSQL 後端與叢集模式**（0.10.0，`kairos/HA.md` 第 6.8 節）：本節 0.10.0 的項目（`kairos releases`、排程與升級時段、自訂批次、雙人覆核、外部 URL 的版本庫、升級中的離線告警抑制、SSE `rollout.host`、版本庫檔案的健康檢查）在 `storage.backend = "postgres"` 下行為相同（儲存層的測試在兩個後端各跑一次）。叢集模式下推送引擎只在取得租約的主動節點上執行，換手後由接手的節點從資料庫繼續（已排程的推送、`applying` 主機的離線抑制）；**版本庫的發佈檔是節點本機的檔案，每個節點要各自匯入**（`kairos releases import` 可以在備援節點執行），`rollout_approval` 在各節點要一致（不一致時 `KRS-W8505`）。
 - **資格分類的主機資訊**：預覽、建立與送出都以清冊的列為基礎，連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤覆蓋，協商了 `upgrade` 的連線再以發提議時使用的資訊（`AgentSession`）覆蓋——與發提議一致，主機連線後不必等清冊每 30 秒的同步（原本只有協商了遠端管理的連線如此，沒有 mTLS 時約有 30 秒的落差）。清冊還沒有的主機（連線後尚未寫入過任何資料，沒有 `host_id`）不在對象中。`GET /api/v1/hosts/{agent_id}/upgrade` 的版本、`install`、`arch` 同樣以 hello 為準。
 - 推送引擎每 5 秒（狀態改變時立即）每個推送一個交易：逾時（提議後 24＋1 小時仍未開始 → `expired`；`applying` 後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線 → `unknown`）、離線寬限（`skipped_offline`，重新連線時回到 `pending`）、失敗比例（持續檢查）、觀察期、人工繼續、完成。只對**連線中且協商了 `upgrade`** 的主機提議；連線中但沒有協商的主機記為 `skipped`（`not_ready`）。
 - **`server_lost`**：`applying` 的逾時判斷中，最後一次離線的原因是 Kairos 這端（`server_shutdown`、叢集的 `server_lost`）時，期限從 Kairos 這次啟動時重新起算，不把主機標為 `unknown`（主機連不上是因為 Kairos 的節點失聯或停機，不是卡在替換中）；`server_lost` 已在 0.9.0 的 `offline_reason` 列舉中（單機的 Kairos 不會產生）。Kairos 啟動後 1 分鐘內不提議新的主機（第 4.7.4 節第 5 項）。
@@ -1121,7 +1121,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 | 項目 | 規格 | 實作 |
 |---|---|---|
-| 維護時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **固定位移**（`+08:00`；另接受 `UTC`、`Z`），預設 `alerts.timezone`（本來就是固定位移），沒有設定時 `+08:00`。不支援時區名稱與日光節約時間：Kairos 沒有時區資料庫的依賴，告警的時區也是固定位移；有日光節約時間的地區需要在換季時調整時段（列入待決） |
+| 升級時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **固定位移**（`+08:00`；另接受 `UTC`、`Z`），預設 `alerts.timezone`（本來就是固定位移），沒有設定時 `+08:00`。不支援時區名稱與日光節約時間：Kairos 沒有時區資料庫的依賴，告警的時區也是固定位移；有日光節約時間的地區需要在換季時調整時段（列入待決） |
 | 修改已排程的推送（0.10.0） | `draft`／`pending_approval`／`scheduled` 可修改，修改後重新送審 | `pending_approval`、`scheduled` 的推送修改時退回 `draft`（對象重新計算、確認字串重新輸入、重新核准） |
 | 雙人覆核（0.10.0） | 核准者不得是建立者；關閉雙人覆核是 L3 操作；主控台唯讀顯示設定；降版 L3 要重新驗證 | 核准者不得是建立者**或送出者**（比規格嚴格：否則甲建立、乙送出並自己核准，仍只有一個人看過固定下來的對象）；`reject` 不限制身分（往安全的方向）。`rollout_approval` 只在 `kairos.toml`，修改需要主機上的檔案權限與重新啟動，沒有另外的 L3 流程或稽核事件；目前的值在系統健康 `remote` 項目的 `values.rollout_approval` 與推送清單的 `meta`，S21 系統設定頁尚未顯示。降版推送的 L3 仍是固定字串＋原因（設計包 §31.12 #7 的暫行做法，未要求重新驗證密碼；列入待決） |
 | `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
@@ -1187,7 +1187,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 ## 17. P1／P2 實作附註（Pulse 端，衝刺 9）
 
-〔衝刺 9，已與 K1／K2（第 13.1 節）一起整合。範圍依 D15：集中設定（P1）與 Linux 的遠端升級（P2）；Windows（P3）、外部 URL、維護時段與雙人覆核延到 0.10.0。設定說明見 `pulse/README.md`「集中設定與遠端升級」、`pulse/packaging/INSTALL.md` 第 10.1 節，代碼見 `pulse/ERROR-CODES.md` 2.9〕
+〔衝刺 9，已與 K1／K2（第 13.1 節）一起整合。範圍依 D15：集中設定（P1）與 Linux 的遠端升級（P2）；Windows（P3）、外部 URL、升級時段與雙人覆核延到 0.10.0。設定說明見 `pulse/README.md`「集中設定與遠端升級」、`pulse/packaging/INSTALL.md` 第 10.1 節，代碼見 `pulse/ERROR-CODES.md` 2.9〕
 
 ### 17.1 程式位置
 

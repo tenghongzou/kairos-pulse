@@ -1,14 +1,14 @@
 // S26 建立推送（/pulse/rollouts/new；rollouts:write）（設計包 kairos/screens.md S26「建立推送」；API.md 第 17.3 節）。
 //
 // 單頁表單（設計包 §31.7 #6 預定 0.10 改為精靈，但設計包還沒有精靈的規格：0.10 先在同一頁加上「中間的批次」
-// 與「排程與維護時段」兩個區塊）：
+// 與「排程與升級時段」兩個區塊）：
 // 1. 目標版本（版本庫）；breaking 時要求勾選「我已閱讀破壞性變更與升級步驟」；目前的 Kairos 低於 min_kairos 時
 //    就地錯誤 KRS-W8415，不能送出。
 // 2. 對象：全部主機，或群組、標籤、主機（agent_id）的聯集，另可排除主機。下方即時顯示資格預覽
 //    （POST /rollouts/preview，600 ms 合併；可升級台數以 aria-live 朗讀）：不會升級的依原因分列，每類可展開前 100 台。
 // 3. 批次：先行批次（%、上限台數或指定主機）＋觀察時間（人工繼續）；中間的批次（0.10：可增減，大小為剩餘主機的 %、
 //    觀察時間、失敗上限；「套用建議的四批範本」）；其餘的失敗上限；同時升級的上限、健康確認期限。最多 10 批。
-// 3b. 排程與維護時段（0.10）：開始／結束時間（選填）、每週的時段（星期、開始、結束；跨午夜可），時區為 Kairos 的
+// 3b. 排程與升級時段（0.10）：開始／結束時間（選填）、每週的時段（星期、開始、結束；跨午夜可），時區為 Kairos 的
 //    alerts.timezone（預覽回傳 default_timezone）。預覽回報目前是否在時段內。
 // 4. 選項：允許無法自動回滾的主機、允許降版。
 // 5. 送出：建立草稿（POST /rollouts）→ L2 DangerConfirmDialog 輸入預覽的 confirm_text（「升級 N 台」）→ submit；
@@ -357,7 +357,7 @@ export function render(ctx) {
     announce(t('rm.new.midTemplateDone'));
   }
 
-  // ---- 排程與維護時段（0.10） ----
+  // ---- 排程與升級時段（0.10） ----
   const startsIn = input({ type: 'datetime-local', name: 'starts_at' });
   const fstarts = field({ label: t('rm.new.startsAt'), input: startsIn, hint: t('rm.new.startsAtHint') });
   const endsIn = input({ type: 'datetime-local', name: 'ends_at' });
