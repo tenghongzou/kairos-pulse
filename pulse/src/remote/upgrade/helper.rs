@@ -159,6 +159,8 @@ pub struct Paths {
     pub require_root_owner: bool,
     /// 這個輔助程式的版本（＝目前安裝的版本）
     pub current_version: String,
+    /// 輔助程式自己偵測到的安裝方式（`tar`／`deb`／`rpm`／`unknown`；不採用 `request.json` 的 `method`）
+    pub method: String,
     pub arch: String,
 }
 
@@ -176,6 +178,9 @@ impl Paths {
             unit_path: PathBuf::from(UNIT_PATH),
             require_root_owner: true,
             current_version: env!("CARGO_PKG_VERSION").to_string(),
+            method:
+                crate::remote::install::detect_method(&crate::remote::install::Probe::for_cli())
+                    .to_string(),
             arch: std::env::consts::ARCH.to_string(),
         }
     }
@@ -238,6 +243,14 @@ struct HelperState {
     /// 也是。0.9.0 的狀態檔沒有這個欄位（空字串）
     #[serde(default)]
     from_version: String,
+    /// 替換時使用的安裝方式（輔助程式自己偵測的；0.10.0）、目標與驗證過的回滾檔名：接續時以這裡為準，
+    /// 不再採用 `request.json` 的值。0.9.0 的狀態檔沒有這些欄位（`method` 為空字串）
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    target: Option<kairos_proto::mgmt::UpgradeTarget>,
+    #[serde(default)]
+    rollback_artifact: Option<String>,
     /// 最後的結果（`Done` 時）
     result: Option<UpgradeResult>,
 }
@@ -246,6 +259,10 @@ struct HelperState {
 pub const DETAIL_FROM_VERSION_MISMATCH: &str = "from_version_mismatch";
 /// 接續時 `request.json` 的 `from_version` 與狀態檔記下的不同：沿用狀態檔的版本，結果 `detail` 加註
 pub const NOTE_FROM_VERSION_IGNORED: &str = "request_from_version_ignored";
+/// `request.json` 的 `method` 與輔助程式自己偵測到的安裝方式不符時，結果 `detail` 的開頭
+pub const DETAIL_METHOD_MISMATCH: &str = "method_mismatch";
+/// 接續時 `request.json` 的 `method`、`target` 或 `rollback_artifact` 與狀態檔記下的不同：沿用狀態檔的內容
+pub const NOTE_REQUEST_FIELDS_IGNORED: &str = "request_fields_ignored";
 
 /// 日誌：stderr（journal）與工作目錄的 `upgrade.log`
 struct Log {
@@ -379,64 +396,103 @@ impl Helper<'_> {
         }
     }
 
-    /// 「替換前的版本」的可信來源（REMOTE.md 第 5.1 節）：狀態檔（只有 root 可寫）記下的版本；還沒有
-    /// 狀態檔時是這個輔助程式自己的版本（＝目前安裝的版本）。`request.json` 的 `from_version` 由服務帳號
-    /// 寫入，只用來比對：
+    /// `request.json` 由服務帳號寫入、不可信（REMOTE.md 第 5.1、17.8 節）。決定「怎麼替換、回滾到哪一版」
+    /// 的欄位以輔助程式自己可信的來源為準，請求中的值只用來比對：
     ///
-    /// - 尚未替換（第一次執行）：不符就拒絕（`Err`，什麼都不改）——否則取得服務帳號的人可以謊報較舊的
-    ///   `from_version`、附上該舊版有官方簽章的套件當回滾檔，再讓新版的健康確認失敗，使 root 以
-    ///   `dpkg -i`／`rpm -U --oldpackage` 裝回任一個舊版，繞過本機的 `allow_downgrade = false`；
-    /// - 已替換（重新開機後接續）：不能半途停下，沿用狀態檔的版本、忽略請求中的值並在結果加註。
+    /// - **尚未替換**（第一次執行）：`from_version` 必須等於輔助程式自己的版本（＝目前安裝的版本），
+    ///   `method` 必須等於輔助程式自己偵測到的安裝方式；不符就拒絕（`Err`，什麼都不改）。否則取得服務
+    ///   帳號的人可以謊報較舊的 `from_version`、附上該舊版有官方簽章的套件當回滾檔，再讓新版的健康確認
+    ///   失敗，使 root 以 `dpkg -i`／`rpm -U --oldpackage` 裝回任一個舊版，繞過本機的
+    ///   `allow_downgrade = false`。
+    /// - **已替換**（重新開機後接續；執行檔已是新版）：`from_version`、`method`、`target`、
+    ///   `rollback_artifact` 一律取自替換前寫進狀態檔（只有 root 可寫）的值，不再採用請求中的值；請求
+    ///   被改過時在結果加註（不能半途停下）。
     ///
-    /// 之後 `self.req.from_version` 一律是可信的值。0.9.0 的輔助程式寫的狀態檔沒有記版本：接續時只能
-    /// 沿用請求中的值（回滾檔已由當時的輔助程式處理）
-    fn trust_from_version(
-        &mut self,
-        state: Option<&mut HelperState>,
-    ) -> Result<(), Box<UpgradeResult>> {
-        let claimed = self.req.from_version.clone();
+    /// 之後 `self.req` 的這些欄位都是可信的值。0.9.0 的輔助程式寫的狀態檔沒有記這些欄位：接續時只能
+    /// 沿用請求中的值（那一次升級由 0.9.0 的輔助程式開始，行為與 0.9.0 相同）
+    fn trust_request(&mut self, state: Option<&mut HelperState>) -> Result<(), Box<UpgradeResult>> {
         let replaced = state
             .as_ref()
             .is_some_and(|s| matches!(s.step, Step::Replaced | Step::RollingBack));
-        let recorded = state
+        let recorded_from = state
             .as_ref()
             .map(|s| s.from_version.clone())
             .filter(|v| !v.is_empty());
-        let trusted = match recorded {
-            Some(v) => v,
-            None if replaced => {
+        if replaced {
+            let Some(s) = state else {
+                return Ok(());
+            };
+            let Some(from) = recorded_from else {
                 self.log.line(
                     "WARN",
-                    "狀態檔沒有記錄替換前的版本（由 0.9.0 的輔助程式寫入），沿用請求中的 from_version",
+                    "狀態檔沒有記錄替換前的版本與安裝方式（由 0.9.0 的輔助程式寫入），沿用請求中的值",
                 );
                 return Ok(());
+            };
+            if self.req.from_version != from {
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "request.json 的 from_version（{}）與替換前記下的版本（{from}）不同，以後者為準",
+                        self.req.from_version
+                    ),
+                );
+                self.req.from_version = from;
+                if !s.notes.iter().any(|n| n == NOTE_FROM_VERSION_IGNORED) {
+                    s.notes.push(NOTE_FROM_VERSION_IGNORED.to_string());
+                }
             }
-            None => self.paths.current_version.clone(),
-        };
-        if claimed == trusted {
-            return Ok(());
-        }
-        self.req.from_version = trusted.clone();
-        if replaced {
-            self.log.line(
-                "WARN",
-                &format!(
-                    "request.json 的 from_version（{claimed}）與替換前記下的版本（{trusted}）不同，以後者為準"
-                ),
-            );
-            if let Some(s) = state
-                && !s.notes.iter().any(|n| n == NOTE_FROM_VERSION_IGNORED)
+            let mut changed = Vec::new();
+            if !s.method.is_empty() && self.req.method != s.method {
+                changed.push(format!("method {} → {}", self.req.method, s.method));
+                self.req.method = s.method.clone();
+            }
+            if let Some(t) = &s.target
+                && self.req.target != *t
             {
-                s.notes.push(NOTE_FROM_VERSION_IGNORED.to_string());
+                changed.push(format!(
+                    "target {} → {}",
+                    self.req.target.version, t.version
+                ));
+                self.req.target = t.clone();
+            }
+            if !s.method.is_empty() && self.req.rollback_artifact != s.rollback_artifact {
+                changed.push("rollback_artifact".to_string());
+                self.req.rollback_artifact = s.rollback_artifact.clone();
+            }
+            if !changed.is_empty() {
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "request.json 在替換後被改過（{}），以替換前記下的內容為準",
+                        changed.join("、")
+                    ),
+                );
+                if !s.notes.iter().any(|n| n == NOTE_REQUEST_FIELDS_IGNORED) {
+                    s.notes.push(NOTE_REQUEST_FIELDS_IGNORED.to_string());
+                }
             }
             return Ok(());
         }
-        Err(Box::new(self.fail(
-            codes::E_UPGRADE_INTEGRITY,
-            format!(
-                "{DETAIL_FROM_VERSION_MISMATCH}: request says {claimed}, installed version is {trusted}"
-            ),
-        )))
+        let claimed = self.req.from_version.clone();
+        let trusted = recorded_from.unwrap_or_else(|| self.paths.current_version.clone());
+        if claimed != trusted {
+            self.req.from_version = trusted.clone();
+            return Err(Box::new(self.fail(
+                codes::E_UPGRADE_INTEGRITY,
+                format!(
+                    "{DETAIL_FROM_VERSION_MISMATCH}: request says {claimed}, installed version is {trusted}"
+                ),
+            )));
+        }
+        if self.req.method != self.paths.method {
+            let detail = format!(
+                "{DETAIL_METHOD_MISMATCH}: request says {}, detected install method is {}",
+                self.req.method, self.paths.method
+            );
+            return Err(Box::new(self.fail(codes::E_UPGRADE_INTEGRITY, detail)));
+        }
+        Ok(())
     }
 
     fn drive(&mut self, mut state: Option<HelperState>) -> UpgradeResult {
@@ -448,7 +504,7 @@ impl Helper<'_> {
         {
             return r.clone();
         }
-        if let Err(r) = self.trust_from_version(state.as_mut()) {
+        if let Err(r) = self.trust_request(state.as_mut()) {
             return *r;
         }
         if let Some(s) = state {
@@ -644,7 +700,7 @@ impl Helper<'_> {
             .ok()
             .and_then(|v| {
                 let name = req.rollback_artifact.clone().unwrap_or_default();
-                // 版本以輔助程式自己認定的「替換前的版本」為準（trust_from_version），不是請求中的值
+                // 版本以輔助程式自己認定的「替換前的版本」為準（trust_request），不是請求中的值
                 let e = ArtifactExpectation {
                     product: Some(Product::Pulse),
                     version: Some(&req.from_version),
@@ -787,8 +843,12 @@ impl Helper<'_> {
             unit_replaced: false,
             notes: Vec::new(),
             rollback_reason: String::new(),
-            // 已在 trust_from_version 確認與輔助程式自己的版本相同
+            // 已在 trust_request 確認與輔助程式自己的版本、偵測到的安裝方式相同
             from_version: self.req.from_version.clone(),
+            method: self.req.method.clone(),
+            target: Some(self.req.target.clone()),
+            // 只記通過驗證的回滾檔（已複製到工作目錄的 rollback.pkg）
+            rollback_artifact: p.rollback.as_ref().and(self.req.rollback_artifact.clone()),
             result: None,
         };
         self.save(&state);

@@ -615,7 +615,7 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | Kairos 被入侵，推送有漏洞的舊版 | 本機預設拒絕降版（第 4.8 節） |
 | Kairos 被入侵，下發設定破壞監控或洩漏資料 | 白名單（第 3.1 節）不含連線、信任、路徑、對外送出；隱私敏感的鍵只能更保守；本機設定優先；可本機停用 |
 | Kairos 被入侵，把 agent 當成對內網發出請求的工具 | 外部 URL 需要本機白名單（預設空）；從 Kairos 下載只走既有的 mTLS 連線 |
-| `pulse` 帳號被入侵，藉輔助程式提權 | 輔助程式只執行固定的動作、只接受信任錨驗證的發佈包、對複本操作、拒絕連結、不讀 Pulse 可寫的設定、不連網路（第 4.4.1 節）；最多能觸發「安裝某個官方版本」，且同樣受降版政策限制。**`request.json` 的每個欄位都不可信**：目標版本以輔助程式自己的版本（＝目前安裝的版本）套用降版政策；**回滾檔的版本也以輔助程式自己的版本為準**，不採用 `request.json` 的 `from_version`——第一次執行時 `from_version` 與輔助程式的版本不符就拒絕（`PLS-E8402`，`from_version_mismatch`，什麼都不改），替換前把這個版本寫進 root 專用的 `state.json`，重新開機後接續時（執行檔已是新版）以 `state.json` 為準（0.10.0 的安全性修正，第 17.8 節；0.9.0 採用請求中的值，可被用來繞過降版政策） |
+| `pulse` 帳號被入侵，藉輔助程式提權 | 輔助程式只執行固定的動作、只接受信任錨驗證的發佈包、對複本操作、拒絕連結、不讀 Pulse 可寫的設定、不連網路（第 4.4.1 節）；最多能觸發「安裝某個官方版本」，且同樣受降版政策限制。**`request.json` 的每個欄位都不可信**：目標版本以輔助程式自己的版本（＝目前安裝的版本）套用降版政策；**回滾檔的版本也以輔助程式自己的版本為準**，不採用 `request.json` 的 `from_version`——第一次執行時 `from_version` 與輔助程式的版本不符就拒絕（`PLS-E8402`，`from_version_mismatch`，什麼都不改），安裝方式同樣由輔助程式自己偵測（`method` 不符就拒絕）；替換前把版本、安裝方式、目標與驗證過的回滾檔名寫進 root 專用的 `state.json`，重新開機後接續時（執行檔已是新版）只以 `state.json` 為準，不再採用 `request.json` 的這些欄位（0.10.0 的安全性修正，第 17.8 節；0.9.0 採用請求中的值，可被用來繞過降版政策） |
 | 傳輸中被竄改 | 簽章與雜湊；8443 本來就是 mTLS |
 | 冒用其他主機取得提議 | 提議只經該主機的 mTLS 連線送出；發佈包本身不是秘密 |
 | 權限過大的操作員一次推送全部主機 | RBAC（第 5.2 節）、分批與自動暫停、選用的雙人覆核（第 5.4 節）、L2／L3 確認、稽核 |
@@ -1289,16 +1289,20 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 輔助程式於是「回滾」：以 root 執行 `dpkg -i`／`rpm -U --oldpackage --replacepkgs` 把主機裝回那個舊版，回滾後的健康確認也以謊報的版本比對而通過。結果是**繞過本機的 `upgrade.allow_downgrade = false`**，把主機降到任一個有官方簽章、可能有已知漏洞的舊版。只影響 deb／rpm 安裝（tar 的回滾是換回替換前保留的 `pulse.prev`，不使用回滾檔）；攻擊者必須已經取得 `pulse` 帳號，能安裝的仍只限有官方簽章的 Pulse 套件。
 
-**修正**（`pulse/src/remote/upgrade/helper.rs` `trust_from_version`、`files.rs` `Request::validate`）：
+同一個根因的另外兩處（0.9.0）：輔助程式每次執行（包含重新開機後的接續）都重讀 `request.json`，服務帳號可以在替換之後改寫它；替換與回滾走哪一條路（套件管理員或換回 `pulse.prev`）由請求的 `method` 決定，輔助程式沒有自己偵測安裝方式。目標設為「重新安裝目前的版本」也不算降版，所以第 1 步不需要真的有更新的版本。
+
+**修正**（`pulse/src/remote/upgrade/helper.rs` `trust_request`、`files.rs` `Request::validate`）：
 
 - 「替換前的版本」的可信來源是**輔助程式自己的版本**（輔助程式就是目前安裝的 `/opt/pulse/pulse`，由 root 的 unit 執行）。第一次執行時 `request.json` 的 `from_version` 與它不符就拒絕：`failed`、`PLS-E8402`、`detail` 為 `from_version_mismatch: request says <謊報的版本>, installed version is <實際的版本>`，不複製、不解開、不替換任何東西；結果的 `from_version` 回報實際的版本。
 - 替換前把這個版本寫進 `/var/lib/pulse-upgrade/<id>/state.json`（0700 目錄、0600 檔案，只有 root 可寫）的 `from_version`。**重新開機後接續**時執行檔與輔助程式已是新版，改以 `state.json` 記下的版本為準：回滾後的健康確認與結果都用它；此時 `request.json` 的 `from_version` 若被改過，輔助程式不能半途停下，忽略請求中的值並在結果的 `detail` 加註 `request_from_version_ignored`。驗證過的回滾檔（`rollback.pkg`）在第一次執行時就已複製到 root 專用的工作目錄，接續時不再讀取暫存區。
+- **安裝方式由輔助程式自己偵測**（與 Pulse 回報 `install.method` 相同的判斷：`/opt/pulse/.install-method`、dpkg／rpm 的資料庫、執行檔的位置，都不是服務帳號可寫的）。第一次執行時請求的 `method` 與偵測結果不符就拒絕（`PLS-E8402`，`method_mismatch: request says <x>, detected install method is <y>`）。
+- 替換前另外把 `method`、`target`（版本與 commit）與通過驗證的回滾檔名寫進 `state.json`。**接續時這些欄位一律取自 `state.json`**，不重新偵測、也不採用 `request.json` 的值；請求被改過時在結果的 `detail` 加註 `request_fields_ignored`。接續時輔助程式仍會讀 `request.json`，但只用它的 `upgrade_id` 找到工作目錄（健康確認的期限在替換時也已記在 `state.json`）。
 - `Request::validate` 另外要求 `from_version` 是合法的版本號（不合法的請求整份拒絕並刪除）。
 - 由 0.9.0 的輔助程式寫入的 `state.json` 沒有 `from_version`：升級到 0.10.0 的途中重新開機時，接續的（0.10.0 的）輔助程式只能沿用請求中的值，行為與 0.9.0 相同——那一次升級的回滾檔已由 0.9.0 的輔助程式驗證並複製。**從 0.9.0 升級到 0.10.0 的那一次仍在受影響的範圍內**；之後的升級才受到保護。
 
-**測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`（`helper/tests.rs`）；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。
+**測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`、`method_and_target_come_from_the_helper_and_the_recorded_state`（`helper/tests.rs`）；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。
 
-**這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。另外，接續時 `request.json` 的其他欄位（`method`、`target.version`）同樣取自請求；它們只影響「以哪一種方式回滾、以哪個版本做健康確認」，不會讓輔助程式安裝未經驗證的檔案，但也應一併改為取自 `state.json`。
+**這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。回滾檔所屬發佈的信任方式（目前是 Pulse 保存的 `SHA256SUMS` 紀錄，由輔助程式以信任錨重新驗證簽章）也由 ADR-0003 處理。
 
 ## 18. Windows 的遠端升級：0.10.0 不實作的評估與需要的實機驗證（待使用者決定）
 

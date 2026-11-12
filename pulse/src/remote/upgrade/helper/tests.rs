@@ -333,6 +333,7 @@ fn setup(name: &str, method: &str) -> Env {
         unit_path: unit,
         require_root_owner: false,
         current_version: "0.9.0".into(),
+        method: method.into(),
         arch: "x86_64".into(),
     };
     Env { root, paths, key }
@@ -1001,5 +1002,90 @@ fn resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement() {
         ("rolled_back", "0.9.0"),
         "{r:?}"
     );
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// 安裝方式由輔助程式自己偵測，不採用 `request.json` 的 `method`；替換後 `method`、`target`、
+/// `rollback_artifact` 一律取自替換前寫進狀態檔的值——重新開機接續時請求被改寫也不影響回滾的方式
+#[test]
+fn method_and_target_come_from_the_helper_and_the_recorded_state() {
+    // 第一次執行：請求的 method 與偵測到的不同就拒絕（deb 安裝的主機被要求當成 tar 替換）
+    let env = setup("method-tamper", "tar");
+    let mut paths = env.paths.clone();
+    paths.method = "deb".into();
+    let fake = Fake::new(&env.root);
+    let r = apply(&paths, &fake).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("failed", Some(codes::E_UPGRADE_INTEGRITY)),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.starts_with(DETAIL_METHOD_MISMATCH) && r.detail.contains("deb"),
+        "{}",
+        r.detail
+    );
+    assert_eq!(env.installed(), "0.9.0");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 接續：deb 的升級在健康確認期間重新開機，期間請求被改成 tar、另一個目標、沒有回滾檔
+    let mut env = setup("method-resume", "deb");
+    stage_rollback(&env, "0.9.0");
+    let request = std::fs::read(&env.paths.request).unwrap();
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    let state_path = env.paths.work_root.join(ID).join("state.json");
+    let mut s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        (
+            s["method"].as_str(),
+            s["target"]["version"].as_str(),
+            s["rollback_artifact"].as_str()
+        ),
+        (
+            Some("deb"),
+            Some("0.9.1"),
+            Some("pulse-0.9.0-1a2b3c4-linux-x86_64.deb")
+        ),
+        "{s}"
+    );
+    s["step"] = "replaced".into();
+    s["result"] = serde_json::Value::Null;
+    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
+    s["n_restarts_before"] = 0.into();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    std::fs::write(
+        env.paths.work_root.join(ID).join("rollback.pkg"),
+        "VERSION=0.9.0\n",
+    )
+    .unwrap();
+    std::fs::write(&env.paths.request, &request).unwrap();
+    rewrite_request(&env, |r| {
+        r.method = "tar".into();
+        r.target.version = "0.9.9".into();
+        r.rollback_artifact = None;
+    });
+    env.paths.current_version = "0.9.1".into();
+    // 接續時不重新偵測：即使偵測結果不同（例如標記檔被刪）也以狀態檔為準
+    env.paths.method = "unknown".into();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert_eq!(
+        (r.from_version.as_str(), r.to_version.as_str()),
+        ("0.9.0", "0.9.1"),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.contains(NOTE_REQUEST_FIELDS_IGNORED),
+        "{}",
+        r.detail
+    );
+    // 仍以套件管理員裝回（deb），不是 tar 的「換回 pulse.prev」
+    assert!(!r.detail.contains("binary_restored"), "{}", r.detail);
+    assert_eq!(fake.calls(), ["dpkg rollback.pkg", "restart"]);
+    assert_eq!(env.installed(), "0.9.0");
     let _ = std::fs::remove_dir_all(&env.root);
 }
