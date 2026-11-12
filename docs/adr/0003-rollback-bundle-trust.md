@@ -2,9 +2,9 @@
 
 | 項目 | 內容 |
 |---|---|
-| 狀態 | 提議（2026-11-12 依外部審查修訂，見第 14 節） |
+| 狀態 | 已核定（2026-11-13，使用者核定；依 2026-11-12 外部審查修訂後的版本。待決事項除另有註明外，皆採文內建議）；修訂紀錄見第 14 節 |
 | 日期 | 2026-11-12 |
-| 決策者 | 待使用者核定（P1 已由使用者決定，見第 11 節） |
+| 決策者 | 使用者（2026-11-13 核定；P1、P13 先前已個別決定，見第 11 節） |
 | 處理的待決 | [`REMOTE.md`](../../crates/kairos-proto/REMOTE.md) 第 17.5 節第 1 項（回滾檔的信任）、第 3 項（套件資料庫與執行檔不一致）；第 17.3 節第 1 項（與規格的差異） |
 | 取代／修訂 | 核定後修訂 `REMOTE.md` 的章節見第 6.5 節 |
 | 相關 | [ADR-0001](0001-windows-ota-upgrade.md)（Windows 的 OTA 式版本槽，第 4.11 節向本 ADR 提出 Q1～Q6）；[ADR-0002](0002-rollout-console-design.md)（主控台）；外部審查 [`reviews/0003-codex-review.md`](reviews/0003-codex-review.md)、[`reviews/0001-codex-review.md`](reviews/0001-codex-review.md)；`RELEASING.md` 第 3 節 |
