@@ -48,6 +48,8 @@ struct Fake {
     version_override: RefCell<Option<String>>,
     /// 預檢的最後一步（check-config）執行時呼叫：模擬「預檢之後、替換之前」發生的事
     after_precheck: RefCell<Option<Box<dyn Fn()>>>,
+    /// 重新啟動服務時呼叫（替換之後、健康確認之前）
+    on_restart: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 fn binary_version(path: &Path) -> String {
@@ -76,6 +78,7 @@ impl Fake {
             check_config: Cell::new(0),
             version_override: RefCell::new(None),
             after_precheck: RefCell::new(None),
+            on_restart: RefCell::new(None),
         }
     }
 
@@ -160,6 +163,9 @@ impl System for Fake {
 
     fn restart_service(&self) -> Result<(), String> {
         self.calls.borrow_mut().push("restart".into());
+        if let Some(f) = self.on_restart.borrow().as_ref() {
+            f();
+        }
         {
             let mut s = self.svc.borrow_mut();
             s.active = "active".into();
@@ -1265,5 +1271,175 @@ fn a_crash_between_replacing_and_recording_it_keeps_the_old_backup() {
         binary_version(&env.paths.install_dir.join("pulse.prev")),
         "0.9.0"
     );
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+const OTHER_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+fn write_active(env: &Env, id: &str) {
+    std::fs::create_dir_all(&env.paths.work_root).unwrap();
+    std::fs::write(
+        env.paths.work_root.join(ACTIVE_FILE),
+        serde_json::to_vec(&serde_json::json!({"schema": HELPER_SCHEMA, "upgrade_id": id}))
+            .unwrap(),
+    )
+    .unwrap();
+}
+
+/// 進行中交易的指標（REMOTE.md 第 17.8 節）：工作目錄不由 `request.json` 的 `upgrade_id` 決定。交易進行
+/// 中（已替換、健康確認期間重新開機）服務帳號把請求換成另一個 `upgrade_id`：輔助程式仍接續原本的交易
+/// ——不開新的交易、不重新替換、不覆寫 `pulse.prev`、不刪除原交易的工作目錄
+#[test]
+fn an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrade() {
+    let mut env = setup("active-swap", "tar");
+    let request = std::fs::read(&env.paths.request).unwrap();
+    let active = env.paths.work_root.join(ACTIVE_FILE);
+    // 正常的一次升級：替換期間指標存在，結束後清除
+    let fake = Fake::new(&env.root);
+    let seen = std::rc::Rc::new(Cell::new(None));
+    let (seen2, active2) = (seen.clone(), active.clone());
+    *fake.on_restart.borrow_mut() = Some(Box::new(move || {
+        let id = std::fs::read(&active2)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["upgrade_id"].as_str().map(str::to_string));
+        seen2.set(Some(id));
+    }));
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    assert_eq!(seen.take(), Some(Some(ID.to_string())), "替換時指標已寫入");
+    assert!(!active.exists(), "交易結束後清除");
+
+    // 回到「已替換、健康確認中」（期限已過），指標還在；請求被換成另一個 upgrade_id
+    let state_path = env.paths.work_root.join(ID).join("state.json");
+    let mut s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    s["step"] = "replaced".into();
+    s["result"] = serde_json::Value::Null;
+    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
+    s["n_restarts_before"] = 0.into();
+    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
+    write_active(&env, ID);
+    std::fs::write(&env.paths.request, &request).unwrap();
+    rewrite_request(&env, |r| {
+        r.upgrade_id = OTHER_ID.into();
+        // 對新的交易而言「誠實」的內容：目前的版本、重新安裝同一版
+        r.from_version = "0.9.1".into();
+    });
+    env.paths.current_version = "0.9.1".into();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.upgrade_id, ID, "結果屬於原本的交易：{r:?}");
+    assert_eq!(
+        (
+            r.state.as_str(),
+            r.from_version.as_str(),
+            r.to_version.as_str()
+        ),
+        ("rolled_back", "0.9.0", "0.9.1"),
+        "{r:?}"
+    );
+    assert!(r.detail.contains(NOTE_UPGRADE_ID_IGNORED), "{}", r.detail);
+    // 沒有重新驗證與替換（只有回滾後的重新啟動），pulse.prev 仍是舊版，回滾換回的是舊版
+    assert_eq!(
+        fake.calls(),
+        ["daemon-reload", "restart"],
+        "只有回滾（還原 unit、重新啟動）：{:?}",
+        fake.calls()
+    );
+    assert_eq!(env.installed(), "0.9.0");
+    assert_eq!(
+        binary_version(&env.paths.install_dir.join("pulse.prev")),
+        "0.9.0"
+    );
+    assert!(!env.paths.work_root.join(OTHER_ID).exists());
+    assert!(env.paths.work_root.join(ID).join("state.json").is_file());
+    assert!(!active.exists(), "交易結束後清除");
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 指標讀不到或內容不合法：不開新的交易，保留指標
+    let env = setup("active-garbage", "tar");
+    std::fs::create_dir_all(&env.paths.work_root).unwrap();
+    std::fs::write(env.paths.work_root.join(ACTIVE_FILE), "{ not json").unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("failed", Some(codes::E_UPGRADE_INTEGRITY)),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.starts_with(DETAIL_POINTER_UNUSABLE),
+        "{}",
+        r.detail
+    );
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    assert_eq!(env.installed(), "0.9.0");
+    assert!(env.paths.work_root.join(ACTIVE_FILE).exists());
+    assert!(!env.paths.request.exists());
+    assert_eq!(env.result(), r);
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 狀態檔不可用時指標保留（之後的請求同樣被擋下，直到人工檢查）
+    let env = setup("active-kept", "tar");
+    let work = env.paths.work_root.join(ID);
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("state.json"), "{ not json").unwrap();
+    write_active(&env, ID);
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert!(r.detail.starts_with(DETAIL_STATE_UNUSABLE), "{}", r.detail);
+    assert!(env.paths.work_root.join(ACTIVE_FILE).exists());
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// 上一次執行已寫下狀態檔（`Verified`）後中斷：接續時目標以狀態檔記下的為準，請求中的目標被改過也一樣
+#[test]
+fn a_verified_transaction_keeps_its_recorded_target() {
+    let env = setup("verified-target", "tar");
+    let work = env.paths.work_root.join(ID);
+    std::fs::create_dir_all(&work).unwrap();
+    let state = HelperState {
+        schema: HELPER_SCHEMA.to_string(),
+        step: Step::Verified,
+        deadline_unix: 0,
+        n_restarts_before: 0,
+        restarted_unix: 0,
+        health_timeout_secs: 600,
+        unit_replaced: false,
+        notes: Vec::new(),
+        rollback_reason: String::new(),
+        from_version: "0.9.0".into(),
+        method: "tar".into(),
+        target: Some(kairos_proto::mgmt::UpgradeTarget {
+            version: "0.9.1".into(),
+            commit: "5e6f7a8".into(),
+        }),
+        rollback_artifact: None,
+        prev_saved: false,
+        result: None,
+    };
+    std::fs::write(work.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+    write_active(&env, ID);
+    rewrite_request(&env, |r| r.target.version = "0.9.9".into());
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.to_version.as_str()),
+        ("succeeded", "0.9.1"),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.contains(NOTE_REQUEST_FIELDS_IGNORED),
+        "{}",
+        r.detail
+    );
+    assert_eq!(env.installed(), "0.9.1");
+    let _ = std::fs::remove_dir_all(&env.root);
+
+    // 對照：沒有狀態檔時，目標與發佈檔不符的請求照常被拒
+    let env = setup("verified-target-fresh", "tar");
+    rewrite_request(&env, |r| r.target.version = "0.9.9".into());
+    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    assert_eq!(r.state, "failed", "{r:?}");
+    assert_eq!(env.installed(), "0.9.0");
     let _ = std::fs::remove_dir_all(&env.root);
 }

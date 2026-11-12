@@ -7,7 +7,7 @@
 #   WORK=<目錄>         工作目錄（發佈物、金鑰、日誌；預設 ~/kp-systest，不可在 git repo 內）
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback reboot reboot-rollback signature
-#                       tamper
+#                       tamper tamper-resume
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
 #   KEEP=1              結束時保留容器與網路（除錯用；之後以 CLEAN_ONLY=1 清除）
@@ -27,7 +27,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -495,6 +495,68 @@ scenario_tamper() {
     done
 }
 
+# tamper_reboot <主機> <假的 upgrade_id>：輔助程式到回滾確認（rolling_back）時，以服務帳號把 request.json 的
+# upgrade_id 改成另一個 UUID，再重新開機
+tamper_reboot() {
+    deadline=$(($(date +%s) + 600))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if hx "$1" sh -c "grep -qs '\"step\": \"rolling_back\"' /var/lib/pulse-upgrade/*/state.json" 2>/dev/null; then
+            if hx "$1" setpriv --reuid pulse --regid pulse --init-groups sh -c "
+                set -e
+                cd /var/lib/pulse/upgrade
+                sed 's/\"upgrade_id\": *\"[0-9a-f-]*\"/\"upgrade_id\":\"$2\"/' request.json > request.json.tmp
+                grep -q '$2' request.json.tmp
+                mv request.json.tmp request.json"; then
+                echo "$1" >>"$WORK/tampered"
+            fi
+            info "$1：輔助程式在 rolling_back，已改寫 request.json 的 upgrade_id，重新開機（docker restart）"
+            docker restart -t 60 "$P-$1" >/dev/null
+            wait_boot "$1"
+            echo "$1" >>"$WORK/rebooted"
+            return 0
+        fi
+        sleep 1
+    done
+    info "$1：等不到輔助程式的 rolling_back"
+    return 1
+}
+
+# 情境 f（REMOTE.md 第 17.8 節；進行中交易的指標）：升級進行中（新版崩潰、回滾確認期間）服務帳號把
+# request.json 的 upgrade_id 換成另一個 UUID，然後主機重新開機。輔助程式仍接續原本的交易（以 root 的
+# active.json 與 state.json 為準）：回報原交易的 rolled_back，沒有為假的 upgrade_id 開新的交易，
+# pulse.prev 沒有被覆寫
+scenario_tamper_resume() {
+    need $T4
+    cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    fake=$(cat /proc/sys/kernel/random/uuid)
+    say "情境 f：升級中改寫 request.json 的 upgrade_id 後重新開機 $cur → $T4（崩潰 → 回滾確認中竄改並重新開機 → 接續原交易）"
+    rm -f "$WORK/rebooted" "$WORK/tampered"
+    id=$(rollout "systest tamper resume" $T4)
+    pids=""
+    for th in $HOSTS; do
+        tamper_reboot "$th" "$fake" &
+        pids="$pids $!"
+    done
+    for p in $pids; do wait "$p" || true; done
+    for th in $HOSTS; do
+        if grep -qx "$th" "$WORK/tampered" 2>/dev/null && grep -qx "$th" "$WORK/rebooted" 2>/dev/null; then
+            pass "f/$th：已在回滾確認期間改寫 upgrade_id 並重新開機"
+        else
+            fail "f/$th：沒有在回滾確認期間改寫 upgrade_id 並重新開機"
+        fi
+    done
+    wait_rollout "$id" 1200 || fail "f：推送沒有在 1200 秒內結束"
+    collect_logs f
+    for th in $HOSTS; do
+        verify f "$id" "$th" rolled_back PLS-W8407 "$cur"
+        check "f/$th：接續原本的交易並加註" "$(host_state "$id" "$th")" 'request_upgrade_id_ignored'
+        check "f/$th：輔助程式接續回滾" "$(helper_log "$th" | grep -c '接續上次中斷的回滾')" '^[1-9]'
+        check "f/$th：沒有為假的 upgrade_id 開新的交易" "$(hx "$th" sh -c "ls -d /var/lib/pulse-upgrade/$fake 2>/dev/null | wc -l")" '^0$'
+        check "f/$th：進行中交易的指標已清除" "$(hx "$th" sh -c 'ls /var/lib/pulse-upgrade/active.json 2>/dev/null | wc -l')" '^0$'
+        check "f/$th：pulse.prev 仍是替換前的版本" "$(hx "$th" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}')" "^$(printf '%s' "$cur" | sed 's/\./\\./g')\$"
+    done
+}
+
 # ---- 0. 發佈物 --------------------------------------------------------------
 if [ -z "${SKIP_BUILD:-}" ]; then
     say "建置發佈物（tests/systemd/build.sh）"
@@ -691,6 +753,7 @@ for s in $SCENARIOS; do
     reboot-rollback) scenario_reboot_rollback ;;
     signature) scenario_signature ;;
     tamper) scenario_tamper ;;
+    tamper-resume) scenario_tamper_resume ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac

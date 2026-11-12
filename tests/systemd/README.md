@@ -77,6 +77,7 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 | `reboot-rollback`（c2） | test.3 → test.4（崩潰） | 回滾確認（`rolling_back`）時重新開機；開機後接續 → `rolled_back`、回到 test.3 |
 | `signature`（d） | — ／ test.9 | d1：Kairos 拒絕匯入 `evil-a`（400 `release_signature_invalid`）；d2：Kairos 匯入 test.9，Pulse 下載前驗證簽章失敗 → `failed`（`PLS-E8401`）、版本不變、推送自動暫停 |
 | `tamper`（e） | （不經 Kairos）test.4＋謊報的 `from_version` | 0.10.0 的安全性修正（REMOTE.md 第 5.1 節）：在 deb、rpm 主機上**以服務帳號**自己寫 `request.json`——目標是有官方簽章的 test.4（崩潰，健康確認一定失敗），`from_version` 謊報為較舊的 `<V0>` 並附上 `<V0>` 有官方簽章的套件當回滾檔。輔助程式以自己的版本為準：`failed`（`PLS-E8402`，`from_version_mismatch: request says <V0>, installed version is <目前的版本>`），執行檔與套件資料庫都沒有改變、沒有執行套件管理員、`request.json` 已刪除、服務照常執行。修正前同樣的請求會讓 root 以 `dpkg -i`／`rpm -U --oldpackage` 把主機降到 `<V0>` |
+| `tamper-resume`（f） | 目前的版本 → test.4（崩潰） | 進行中交易的指標（REMOTE.md 第 17.8 節）：回滾確認（`rolling_back`）期間**以服務帳號**把 `request.json` 的 `upgrade_id` 改成另一個 UUID，然後重新開機。輔助程式仍接續原本的交易：三台 `rolled_back`（`PLS-W8407`）、`detail` 加註 `request_upgrade_id_ignored`，沒有為假的 `upgrade_id` 建立工作目錄，`/var/lib/pulse-upgrade/active.json` 已清除，`pulse.prev` 仍是替換前的版本 |
 
 每個情境結束後的日誌：`logs/<情境>-<主機>.log`（`pulse upgrade status`、`journalctl -u pulse-upgrade`、
 輔助程式的 `upgrade.log`、Pulse 日誌中與升級有關的行）、`logs/<情境>-kairos.log`。

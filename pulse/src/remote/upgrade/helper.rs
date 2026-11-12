@@ -268,6 +268,12 @@ pub const DETAIL_METHOD_MISMATCH: &str = "method_mismatch";
 pub const DETAIL_STATE_UNUSABLE: &str = "state_unusable";
 /// 替換前無法寫入狀態檔時，結果 `detail` 的開頭
 pub const DETAIL_STATE_NOT_SAVED: &str = "state_not_saved";
+/// 進行中交易的指標（工作目錄的根目錄下）
+pub const ACTIVE_FILE: &str = "active.json";
+/// 進行中交易的指標讀不到或內容不合法時，結果 `detail` 的開頭
+pub const DETAIL_POINTER_UNUSABLE: &str = "transaction_pointer_unusable";
+/// `request.json` 的 `upgrade_id` 不是進行中的交易：接續進行中的交易，結果 `detail` 加註
+pub const NOTE_UPGRADE_ID_IGNORED: &str = "request_upgrade_id_ignored";
 /// 接續時 `request.json` 的 `method`、`target` 或 `rollback_artifact` 與狀態檔記下的不同：沿用狀態檔的內容
 pub const NOTE_REQUEST_FIELDS_IGNORED: &str = "request_fields_ignored";
 
@@ -336,13 +342,40 @@ pub fn run(request: &Path) -> u8 {
 /// 執行一次請求（或接續上次中斷的請求）。無法讀取請求時回傳 `Err`（刪除 `request.json`，避免
 /// `pulse-upgrade.path` 反覆觸發）
 pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
-    let req = match Request::read_untrusted(&paths.request) {
+    let mut req = match Request::read_untrusted(&paths.request) {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_file(&paths.request);
             return Err(e);
         }
     };
+    // 進行中的交易（REMOTE.md 第 17.8 節）：工作目錄不由 request.json 的 upgrade_id 決定。有尚未結束的
+    // 交易時只接續那一筆——服務帳號在交易進行中把 request.json 換成另一個 upgrade_id，不會讓輔助程式
+    // 開一筆新的交易（那樣會略過原交易的 state.json、重新替換並覆寫 pulse.prev）
+    let mut pending_notes = Vec::new();
+    let mut swapped = None;
+    match read_active(&paths.work_root) {
+        Ok(Some(active)) if active != req.upgrade_id => {
+            swapped = Some(std::mem::replace(&mut req.upgrade_id, active));
+            pending_notes.push(NOTE_UPGRADE_ID_IGNORED.to_string());
+        }
+        Ok(_) => {}
+        Err(why) => {
+            // 指標不可用：不知道是否有進行中的交易，不開新的交易也不猜（保留指標，由人檢查）
+            let r = result(
+                &req,
+                UPGRADE_STATE_FAILED,
+                Some(codes::E_UPGRADE_INTEGRITY),
+                format!("{DETAIL_POINTER_UNUSABLE}: {why}; manual check required"),
+            );
+            eprintln!("錯誤 {}：{}", codes::E_UPGRADE_INTEGRITY, r.detail);
+            if let Ok(bytes) = serde_json::to_vec_pretty(&r) {
+                let _ = crate::remote::write_atomic(&paths.result_path(), &bytes, 0o644, 0o750);
+            }
+            let _ = std::fs::remove_file(&paths.request);
+            return Ok(r);
+        }
+    }
     let work = paths.work_root.join(&req.upgrade_id);
     crate::remote::create_dir_all_mode(&paths.work_root, 0o700)
         .and_then(|()| crate::remote::create_dir_all_mode(&work, 0o700))
@@ -355,6 +388,15 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
             req.upgrade_id, req.from_version, req.target.version, req.method
         ),
     );
+    if let Some(claimed) = &swapped {
+        log.line(
+            "WARN",
+            &format!(
+                "request.json 的 upgrade_id（{claimed}）不是進行中的交易（{}）：接續進行中的交易，不開新的交易",
+                req.upgrade_id
+            ),
+        );
+    }
     let state_path = work.join("state.json");
     let state = read_state(&state_path, &work);
     let mut h = Helper {
@@ -364,18 +406,47 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         work,
         state_path,
         log,
+        pending_notes,
+        keep_active: false,
     };
     let r = match state {
         Ok(state) => h.drive(state),
         // 狀態檔不可用而這次升級已經動過手：不當成全新的請求（那樣會改信 request.json，並可能以新版覆寫
-        // pulse.prev）。不替換也不回滾，回報後由人處理
-        Err(why) => h.fail(
-            codes::E_UPGRADE_INTEGRITY,
-            format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required"),
-        ),
+        // pulse.prev）。不替換也不回滾，回報後由人處理；進行中交易的指標保留（之後的請求同樣被擋下，
+        // 檢查後刪除 /var/lib/pulse-upgrade/active.json 與那個工作目錄）
+        Err(why) => {
+            h.keep_active = true;
+            h.fail(
+                codes::E_UPGRADE_INTEGRITY,
+                format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required"),
+            )
+        }
     };
     h.finish(&r);
     Ok(r)
+}
+
+/// 進行中交易的指標（`/var/lib/pulse-upgrade/active.json`，只有 root 可寫）：開始替換前寫入、交易結束
+/// 時刪除。`Ok(None)`：沒有進行中的交易；`Err`：檔案存在但讀不到或內容不合法
+fn read_active(work_root: &Path) -> Result<Option<String>, String> {
+    #[derive(Deserialize)]
+    struct Active {
+        schema: String,
+        upgrade_id: String,
+    }
+    match std::fs::read(work_root.join(ACTIVE_FILE)) {
+        Ok(b) => match serde_json::from_slice::<Active>(&b) {
+            Ok(a) if a.schema == HELPER_SCHEMA && kairos_proto::is_uuid_text(&a.upgrade_id) => {
+                Ok(Some(a.upgrade_id))
+            }
+            Ok(_) => Err(format!(
+                "{ACTIVE_FILE} has an unexpected schema or upgrade_id"
+            )),
+            Err(e) => Err(format!("{ACTIVE_FILE} is not valid: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{ACTIVE_FILE} cannot be read: {e}")),
+    }
 }
 
 /// 讀取這次升級的狀態檔。`Ok(None)`：全新的請求（沒有狀態檔，工作目錄中也沒有替換階段才會出現的檔案）。
@@ -408,6 +479,10 @@ struct Helper<'a> {
     work: PathBuf,
     state_path: PathBuf,
     log: Log,
+    /// 還沒有狀態檔可記時先放在這裡的說明（寫入狀態檔的 `notes`，最後附在結果的 `detail`）
+    pending_notes: Vec<String>,
+    /// 結束時保留進行中交易的指標（狀態檔不可用，需要人工檢查）
+    keep_active: bool,
 }
 
 /// 預檢與替換需要的資料
@@ -434,6 +509,18 @@ impl Helper<'_> {
         let b = serde_json::to_vec_pretty(s).map_err(|e| format!("無法產生狀態檔：{e}"))?;
         crate::remote::write_atomic_durable(&self.state_path, &b, 0o600, 0o700)
             .map_err(|e| format!("無法寫入 {}：{e}", self.state_path.display()))
+    }
+
+    /// 寫入進行中交易的指標（這一筆的 `upgrade_id`）
+    fn set_active(&mut self) -> Result<(), String> {
+        let path = self.paths.work_root.join(ACTIVE_FILE);
+        let b = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": HELPER_SCHEMA,
+            "upgrade_id": self.req.upgrade_id,
+        }))
+        .map_err(|e| format!("無法產生 {ACTIVE_FILE}：{e}"))?;
+        crate::remote::write_atomic_durable(&path, &b, 0o600, 0o700)
+            .map_err(|e| format!("無法寫入 {}：{e}", path.display()))
     }
 
     /// `request.json` 由服務帳號寫入、不可信（REMOTE.md 第 5.1、17.8 節）。決定「怎麼替換、回滾到哪一版」
@@ -532,6 +619,28 @@ impl Helper<'_> {
             );
             return Err(Box::new(self.fail(codes::E_UPGRADE_INTEGRITY, detail)));
         }
+        // 上一次執行已經寫下狀態檔（`Verified`：可能在替換途中中斷）：目標以當時記下的為準。請求中的
+        // 目標被改過時，發佈檔仍要通過對「記下的目標」的驗證，否則照常失敗
+        if let Some(t) = state.as_ref().and_then(|s| s.target.clone())
+            && self.req.target != t
+        {
+            self.log.line(
+                "WARN",
+                &format!(
+                    "request.json 的目標（{}）與這次升級記下的目標（{}）不同，以後者為準",
+                    self.req.target.version, t.version
+                ),
+            );
+            self.req.target = t;
+            if !self
+                .pending_notes
+                .iter()
+                .any(|n| n == NOTE_REQUEST_FIELDS_IGNORED)
+            {
+                self.pending_notes
+                    .push(NOTE_REQUEST_FIELDS_IGNORED.to_string());
+            }
+        }
         Ok(())
     }
 
@@ -546,6 +655,13 @@ impl Helper<'_> {
         }
         if let Err(r) = self.trust_request(state.as_mut()) {
             return *r;
+        }
+        if let Some(s) = state.as_mut() {
+            for n in &self.pending_notes {
+                if !s.notes.contains(n) {
+                    s.notes.push(n.clone());
+                }
+            }
         }
         let mut prior = None;
         if let Some(s) = state {
@@ -881,7 +997,7 @@ impl Helper<'_> {
             restarted_unix: 0,
             health_timeout_secs: p.health_timeout.as_secs(),
             unit_replaced: false,
-            notes: Vec::new(),
+            notes: self.pending_notes.clone(),
             rollback_reason: String::new(),
             // 已在 trust_request 確認與輔助程式自己的版本、偵測到的安裝方式相同
             from_version: self.req.from_version.clone(),
@@ -892,6 +1008,13 @@ impl Helper<'_> {
             prev_saved,
             result: None,
         };
+        // 進行中交易的指標先於狀態檔寫入：之後到交易結束為止，輔助程式只接續這一筆
+        if let Err(e) = self.set_active() {
+            return self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+            );
+        }
         if let Err(e) = self.try_save(&state) {
             return self.fail(
                 codes::E_UPGRADE_REPLACE,
@@ -1329,13 +1452,23 @@ impl Helper<'_> {
                     let _ = std::fs::remove_file(name.path());
                 }
             }
-            // 只保留最近一次的紀錄
+            // 只保留最近一次的紀錄（進行中交易的指標不是紀錄，另外處理）
             if let Ok(entries) = std::fs::read_dir(&self.paths.work_root) {
                 for e in entries.flatten() {
-                    if e.path() != self.work {
+                    if e.path() != self.work && e.file_name() != ACTIVE_FILE {
                         let _ = std::fs::remove_dir_all(e.path());
                     }
                 }
+            }
+        }
+        // 交易結束：清除進行中交易的指標（狀態檔不可用、需要人工檢查時保留）
+        if !self.keep_active {
+            let active = self.paths.work_root.join(ACTIVE_FILE);
+            if let Err(e) = std::fs::remove_file(&active)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                self.log
+                    .line("WARN", &format!("無法刪除 {}：{e}", active.display()));
             }
         }
         self.log.line(
