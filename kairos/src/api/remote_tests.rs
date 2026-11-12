@@ -890,6 +890,103 @@ async fn releases_and_rollouts_over_https() {
     ] {
         assert!(actions.iter().any(|x| x == a), "{a}");
     }
+
+    // 外部 URL 的版本庫（0.10，REMOTE.md 第 4.1.2 節）：source: external 需要合法的 base_url；簽章驗證照舊；
+    // 上傳發佈檔只登記雜湊與大小（維運者不能）
+    let ext = release(&signer, "0.9.4", "4444444");
+    let ext_body = |base: Option<&str>, sig: &str| {
+        let mut b = json!({"sha256sums": ext.sha256sums, "signature": sig, "manifest": ext.manifest, "source": "external"});
+        if let Some(u) = base {
+            b["base_url"] = json!(u);
+        }
+        b
+    };
+    for (base, param) in [
+        (None, "base_url"),
+        (Some("http://repo.example.gov.tw/p/"), "base_url"),
+        (Some("https://repo.example.gov.tw/p/?sig=1"), "base_url"),
+    ] {
+        let r = call(
+            addr,
+            "POST",
+            "/api/v1/releases",
+            Some(&admin),
+            Some(&ext_body(base, &ext.signature)),
+        )
+        .await;
+        assert_eq!(
+            (r.status, body(&r)["error"]["details"]["parameter"].as_str()),
+            (400, Some(param)),
+            "{base:?}"
+        );
+    }
+    let r = call(addr, "POST", "/api/v1/releases", Some(&admin), Some(&json!({"sha256sums": ext.sha256sums, "signature": ext.signature, "base_url": "https://repo.example.gov.tw/p/"}))).await;
+    assert_eq!(r.status, 400, "base_url 只用於 source: external");
+    let forged = TestSigner::new(12).sign(ext.sha256sums.as_bytes());
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&admin),
+        Some(&ext_body(Some("https://repo.example.gov.tw/p/"), &forged)),
+    )
+    .await;
+    assert_eq!(
+        (r.status, body(&r)["error"]["code"].as_str()),
+        (400, Some("release_signature_invalid")),
+        "外部版本的簽章同樣要驗證"
+    );
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&op),
+        Some(&ext_body(
+            Some("https://repo.example.gov.tw/p/"),
+            &ext.signature,
+        )),
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&admin),
+        Some(&ext_body(
+            Some("https://Repo.example.gov.tw/p"),
+            &ext.signature,
+        )),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        (
+            body(&r)["data"]["source"].as_str(),
+            body(&r)["data"]["base_url"].as_str(),
+            body(&r)["data"]["verified"].as_bool()
+        ),
+        (
+            Some("external"),
+            Some("https://repo.example.gov.tw/p/"),
+            Some(true)
+        )
+    );
+    let (ext_name, ext_data) = ext.files[0].clone();
+    let r = put_artifact(&f, &admin, "0.9.4", &ext_name, b"something else").await;
+    assert_eq!(
+        (r.status, body(&r)["error"]["code"].as_str()),
+        (400, Some("artifact_hash_mismatch"))
+    );
+    let r = put_artifact(&f, &admin, "0.9.4", &ext_name, &ext_data).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        (
+            body(&r)["data"]["stored"].as_bool(),
+            body(&r)["data"]["registered"].as_bool()
+        ),
+        (Some(false), Some(true))
+    );
     let _ = std::fs::remove_dir_all(trust.parent().unwrap());
     f.stop().await;
 }

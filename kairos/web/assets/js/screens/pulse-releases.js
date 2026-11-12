@@ -42,7 +42,7 @@ function platformsText(arts) {
   for (const a of arts || []) {
     const k = `${a.os} ${a.arch}`;
     if (!by.has(k)) by.set(k, []);
-    by.get(k).push(a.stored ? a.format : `${a.format}${t('rm.rel.notStored')}`);
+    by.get(k).push(a.stored || a.registered ? a.format : `${a.format}${t('rm.rel.notStored')}`);
   }
   if (!by.size) return '—';
   return h('ul', { class: 'k-plain-list' }, [...by].map(([k, fmts]) => h('li', null, `${k}：${fmts.join(' ')}`)));
@@ -216,7 +216,7 @@ function renderDetail(ctx) {
     const m = r.manifest;
     const actions = [];
     if (canWrite) {
-      if (r.artifacts && r.artifacts.some((a) => !a.stored)) {
+      if (r.artifacts && r.artifacts.some((a) => !a.stored && !a.registered)) {
         actions.push(h('button', { type: 'button', class: 'ds-button ds-button--secondary', on: { click: () => importDialog({ release: r, onDone: load }) } }, icon('upload'), t('rm.rel.upload')));
       }
       const why = r.in_use_by_rollouts ? t('rm.rel.inUseRollouts', { n: fmt.num(r.in_use_by_rollouts) }) : r.rollback_target_for ? t('rm.rel.inUseRollback', { n: fmt.num(r.rollback_target_for) }) : null;
@@ -230,6 +230,7 @@ function renderDetail(ctx) {
       pageHead({ title: t('rm.rel.detailTitle', { v: r.version }), crumbs: [CRUMB, { text: r.version }], actions: actions.length ? actions : null }),
       incompatible ? inlineAlert({ kind: 'error', title: t('rm.rel.incompatible', { v: r.version, min: m.min_kairos }), code: 'KRS-W8415' }) : null,
       m ? null : inlineAlert({ kind: 'info', body: t('rm.rel.noManifest') }),
+      r.source === 'external' ? inlineAlert({ kind: 'info', body: t('rm.rel.externalNote') }) : null,
       h(
         'div',
         { class: 'k-grid k-grid--1-1' },
@@ -238,6 +239,7 @@ function renderDetail(ctx) {
           body: dl([
             [t('rm.rel.commit'), h('span', { class: 'mono' }, r.commit || '—')],
             [t('rm.rel.signer'), signerCell(r)],
+            r.source === 'external' ? [t('rm.rel.baseUrl'), h('span', { class: 'mono k-break', id: 'release-base-url' }, r.base_url || '—')] : null,
             m ? [t('rm.rel.releasedAt'), m.released_at || '—'] : null,
             m ? [t('rm.rel.minKairos'), m.min_kairos || '—'] : null,
             m ? [t('rm.rel.minUpgradeFrom'), m.min_upgrade_from || '—'] : null,
@@ -295,7 +297,7 @@ function renderDetail(ctx) {
                     h('td', null, a.format),
                     h('td', { class: 'num' }, a.size ? fmt.bytes(a.size) : '—'),
                     h('td', null, h('span', { class: 'mono', title: a.sha256 }, String(a.sha256 || '').slice(0, 16)), ' ', copyButton(a.sha256, t('rm.rel.copySha', { f: a.filename }))),
-                    h('td', null, a.stored ? statusBadge('online', t('rm.rel.stored')) : neutralBadge(t('rm.rel.pending'))),
+                    h('td', null, a.stored ? statusBadge('online', t('rm.rel.stored')) : a.registered ? statusBadge('online', t('rm.rel.registered')) : neutralBadge(t('rm.rel.pending'))),
                   ),
                 ),
               ),
@@ -356,6 +358,9 @@ function importDialog({ release = null, onDone } = {}) {
   const fid = uid('files');
   const fileIn = h('input', { type: 'file', id: fid, name: 'files', multiple: true, class: 'ds-input' });
   const chosen = h('p', { class: 'caption', 'aria-live': 'polite' });
+  // 外部 URL 的版本庫（0.10；只在匯入新版本時）
+  const bid = uid('base');
+  const baseIn = h('input', { type: 'url', id: bid, name: 'base_url', class: 'ds-input ds-input--mono', placeholder: 'https://repo.example.gov.tw/kairos-pulse/0.10.0/', maxlength: '1800', 'aria-describedby': `${bid}-hint` });
   const errBox = h('div');
   const status = h('div', { class: 'k-stack--sm' });
   const fileList = h('ul', { class: 'k-imp-files', id: 'import-files' });
@@ -374,6 +379,7 @@ function importDialog({ release = null, onDone } = {}) {
       { class: 'k-stack--sm' },
       h('p', null, release ? t('rm.imp.step1Upload') : t('rm.imp.step1')),
       h('div', { class: 'ds-field' }, h('label', { class: 'ds-field__label', for: fid }, t('rm.imp.files')), fileIn, chosen),
+      release ? null : h('div', { class: 'ds-field' }, h('label', { class: 'ds-field__label', for: bid }, t('rm.imp.baseUrl')), baseIn, h('p', { class: 'ds-field__hint', id: `${bid}-hint` }, t('rm.imp.baseUrlHint'))),
       errBox,
       status,
       fileList,
@@ -412,7 +418,7 @@ function importDialog({ release = null, onDone } = {}) {
         bad += 1;
         continue;
       }
-      if (a.stored && release) {
+      if ((a.stored || a.registered) && release) {
         r.prog.hidden = true;
         r.result.textContent = t('rm.imp.already');
         continue;
@@ -428,7 +434,7 @@ function importDialog({ release = null, onDone } = {}) {
         });
         r.bar.style.setProperty('width', '100%');
         r.prog.setAttribute('aria-valuenow', '100');
-        mount(r.result, h('span', { class: 'k-fg--online' }, t('rm.imp.hashOk')));
+        mount(r.result, h('span', { class: 'k-fg--online' }, rel.source === 'external' ? t('rm.imp.hashOkExternal') : t('rm.imp.hashOk')));
         good += 1;
       } catch (err) {
         r.prog.hidden = true;
@@ -461,12 +467,17 @@ function importDialog({ release = null, onDone } = {}) {
     busy = true;
     cancel.disabled = true;
     fileIn.disabled = true;
+    baseIn.disabled = true;
     setBusy(ok, true, release ? t('rm.imp.uploading') : t('rm.imp.verifying'));
     let rel = release;
     try {
       if (!rel) {
         const body = { sha256sums: await readText(sums), signature: await readText(sig) };
         if (manifest) body.manifest = await readText(manifest);
+        if (baseIn.value.trim()) {
+          body.source = 'external';
+          body.base_url = baseIn.value.trim();
+        }
         try {
           rel = await api('/api/v1/releases', { method: 'POST', body });
           mount(
@@ -502,6 +513,7 @@ function importDialog({ release = null, onDone } = {}) {
     } catch (err) {
       setBusy(ok, false, t('rm.imp.verifying'));
       fileIn.disabled = false;
+      baseIn.disabled = false;
       cancel.disabled = false;
       const a = errorAlert(err, { title: t('rm.imp.failed') });
       mount(errBox, a);

@@ -63,12 +63,21 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **升級推送的自訂批次**（F8，REMOTE.md 第 4.7.1、13.1 節、API.md 第 17.3 節）：`waves` 由最多 2 批放寬為最多 10 批；每批的 `size` 為台數或**當時剩餘**的可升級主機的百分比，最後一批為 `"rest"`，每批各有觀察時間、失敗上限與是否人工繼續。省略 `waves` 時仍是 0.9 的兩批預設範本，既有兩批推送的分批結果不變。預覽另回 `wave_templates`（含第 4.7.1 節建議的四批範本 1% → 10% → 50% → 其餘）與 `max_waves`。主控台 S26 的建立表單可以增減「中間的批次」並套用四批範本，詳情的批次時間軸支援多批。
 - **升級推送的排程與維護時段**（F8，REMOTE.md 第 4.7.1、4.7.3、4.7.5、13.1 節、API.md 第 17.3 節）：推送新增 `schedule`——`starts_at`（在這之前為新的狀態 `scheduled`，到時由推送引擎開始）、`ends_at`（到時推送結束，尚未開始替換的主機標為 `expired`／`rollout_ended`）、`windows[]`（每週的維護時段：星期、`HH:MM` 的開始與結束，可跨午夜）與 `timezone`（固定位移，預設 `alerts.timezone`）。時段是「允許開始替換的時間」：時段外不提議新的主機，提議的 `apply_window` 到時段結束為止，已開始替換的照常完成；時段結束時還沒開始的主機在下一個時段重新提議，不計入失敗。`next_action` 新增 `scheduled`、`waiting_window`；已排程的推送可以取消，修改時退回草稿、需要重新送出。對象仍在**送出時**固定。Pulse 0.9.0 就會遵守 `apply_window`，不需要升級 Pulse。主控台 S26：建立表單的「排程與維護時段」、清單與詳情的「已排程」「等待維護時段」。
 - **升級推送的雙人覆核**（F8，REMOTE.md 第 5.4、13.1 節、API.md 第 17.3 節）：`kairos.toml` 新增 `[remote] rollout_approval = "none" | "required"`（預設 `none`，需要重新啟動，只能在設定檔改）。`required` 時送出的推送先進入新的狀態 `pending_approval`（對象已固定、不提議任何主機），必須由**另一位**有新權限 `rollouts:approve`（只有管理員）的使用者以帳號登入的工作階段核准（`POST /api/v1/rollouts/{id}/approve`）才會開始或排程；API token 不能核准（403 `session_required`），建立者與送出者不能核准（403 `self_approval`，`KRS-E6106`）。`…/reject`（原因必填）或修改待核准的推送會退回草稿，需要重新送出與核准。稽核 `rollout.approve`、`rollout.reject`；推送另記錄 `submitted_at`／`submitted_by`、`approved_at`／`approved_by`、`reject_reason`。主控台 S26：「待核准」狀態、核准…／退回…、不能核准自己的推送的說明，側邊導覽的計數泡泡對有核准權限的人另計待核准的推送。降版推送（L3）仍是固定字串＋原因，沒有重新驗證密碼（待決）。
+- **外部 URL 的 Pulse 版本庫**（F8，REMOTE.md 第 4.1.2、13.1、17.7 節）：發佈檔可以放在客戶自己的 HTTPS 伺服器，Kairos 只保存 `SHA256SUMS`、簽章與清單。
+  - **Kairos**：`POST /api/v1/releases` 的 `source: "external"`＋`base_url`、`kairos releases import <目錄> --external <base_url>`、主控台匯入對話框的「外部 URL（選填）」。簽章與雜湊的驗證與代管相同；要推送的發佈檔照樣上傳（或由 CLI 讀取）一次以**登記**雜湊與大小，但不保存在 Kairos。提議的 `artifact.source` 為 `url`、`url` 為 `base_url＋檔名`。主機目前版本的發佈是外部 URL 時，只在目標也是外部 URL 時才附回滾檔。
+  - **Pulse**：`[upgrade] url_allowlist`（0.9.0 已可設定，現在生效；**預設空＝只從 Kairos 下載**，行為不變）與 `external_ca`。提議的 URL 必須符合白名單的目錄前綴且指向提議的檔名，否則 `declined`（`PLS-W8411`，`url_not_allowed`）；以 HTTPS 下載（TLS 1.2 以上、不跟隨重新導向、大小以提議為上限、斷線以 `Range` 續傳、沒有代理）。**驗證鏈不變**：下載的檔案與從 Kairos 下載的一樣，要符合本機信任錨驗證過的 `SHA256SUMS`，輔助程式以 root 再驗證一次。
+  - 相容性：沒有新的協定 feature。0.9.0 的 Pulse（或沒有設定白名單的 0.10）收到外部 URL 的提議時回報 `declined`，不計入失敗比例；Kairos 目前無法在預覽時得知哪些主機允許外部 URL。
 
 ### 變更
 
 - **資料庫 schema v10**（升級時自動套用，不可逆，升級前先備份）：`rollouts` 新增 `submitted_at`、`submitted_by`、`reject_reason`（雙人覆核）。升級後 0.9 的 Kairos 無法開啟。〔版本號在整合時與叢集線的遷移一起重新編號〕
+- `GET /api/v1/releases` 的每個版本多了 `base_url`，`artifacts[]` 多了 `registered`（外部 URL 的版本庫：已登記、檔案不在 Kairos）；`POST /api/v1/releases` 的 `source: "external"` 不再回 400（需要 `base_url`）。
 - 推送的本文帶 `schedule` 不再回 400（0.9.0 一律拒絕）；`windows`、`starts_at`、`ends_at`、`timezone` 要放在 `schedule` 物件內。`GET /api/v1/rollouts` 的 `state` 篩選多了 `scheduled`，讀取端應忽略不認得的 `state` 與 `next_action.code`。
 - 重複上傳同一個發佈檔（`PUT /api/v1/releases/{version}/artifacts/{filename}`、`kairos releases import`）時，版本庫中已有同名而大小不同的檔案會被取代（0.9.0 一律保留既有的檔案，被截斷的檔案無法以重新上傳修復）。
+
+### 尚未提供
+
+- **Windows 的遠端升級**（F8，REMOTE.md 第 4.4.4、18 節）：0.10.0 沒有實作，Windows 主機的 `install.upgrade` 仍是 `unsupported`（推送的資格分類為 `unsupported_platform`），以既有的 MSI／SCCM 升級；集中設定不受影響。理由：升級程序的每一步（脫離服務、`msiexec`、服務控制、ACL 檢查、回滾）都只能在 Windows 實機驗證，而信任邊界（ACL）寫錯不會有任何錯誤訊息；0.8.0 的 Windows 服務與 MSI 本身也還沒有實機驗證。需要的 VM 與驗證清單見 REMOTE.md 第 18.3 節，是否與何時實作待決定。
 
 ### 新代碼
 

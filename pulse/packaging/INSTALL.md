@@ -724,6 +724,16 @@ Kairos 0.9.0 可以推送**官方簽章**的新版 Pulse（`crates/kairos-proto/
 
 升級時：tar 安裝替換 `/opt/pulse/pulse`（舊版保留為 `pulse.prev`），`/etc/systemd/system/pulse.service` 是歷來的官方版本（沒有被修改過）時一併換新並 `daemon-reload`，改過的不動（結果的 `detail` 註明 `unit_not_updated`，服務照常執行）；deb／rpm 以 `dpkg -i --force-confold`／`rpm -U --oldpackage --replacepkgs` 安裝（`pulse.toml` 不覆寫；版本政策依實際的執行檔判斷，套件資料庫的版本不影響）。替換後在健康確認期限內（預設 600 秒）確認新版已連上 Kairos 並有 report 被確認，再穩定 60 秒才算成功；否則自動回滾。紀錄：`journalctl -u pulse-upgrade`、`/var/lib/pulse-upgrade/<upgrade_id>/upgrade.log`（`pulse diag` 收集）。回滾失敗（`PLS-E8408`）時所有暫存都保留，請依紀錄手動處理：tar 安裝 `sudo /opt/pulse/pulse upgrade rollback --yes`（換回 `pulse.prev`；可在任何目錄執行）；deb／rpm 以舊版套件 `dpkg -i`／`rpm -U --oldpackage` 重新安裝。rpm 的輔助程式需要 `cpio`（解開新版做預檢；0.9.0 的 rpm 已宣告相依）。
 
+**從自己的 HTTPS 伺服器下載發佈檔（0.10.0，選用）**：Kairos 的版本庫可以登記為「外部 URL」（發佈檔放在客戶內部的檔案伺服器，Kairos 只保存簽章與雜湊）。Pulse 預設**不會**向 Kairos 以外的位址下載；要允許時在 `pulse.toml` 寫入允許的 URL 前綴（以目錄比對），需要時另外指定 CA，然後重新啟動 Pulse：
+
+```toml
+[upgrade]
+url_allowlist = ["https://repo.example.gov.tw/kairos-pulse/"]
+external_ca = "/etc/kairos-pulse/repo-ca.pem"   # 省略時用作業系統信任庫
+```
+
+下載的檔案與從 Kairos 下載的一樣，要通過本機信任錨（`allowed_signers`）的簽章與雜湊驗證才會安裝；不在白名單的 URL 一律拒絕（`pulse upgrade status`／主控台顯示 `url_not_allowed`，`PLS-W8411`）。不跟隨重新導向、不使用 HTTP 代理。
+
 不要遠端升級：`pulse.toml` 寫入 `[upgrade] enabled = false`（或 `systemctl disable --now pulse-upgrade.path`）。不要集中設定：`[remote_config] enabled = false`。這兩個區段只能寫在 `pulse.toml`（輔助程式只讀它；環境變數只能關閉、不能開啟）。
 
 ## 11. 憑證更新與 agent_id 重新產生

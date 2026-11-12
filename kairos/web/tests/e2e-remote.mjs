@@ -521,6 +521,45 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await a.ctx.close();
   });
 
+  test('F8 S25 外部 URL 的版本庫（0.10）：base_url 不合法 → 匯入並登記（不存入 Kairos）→ 詳情 → 刪除', async () => {
+    const rel = testRelease();
+    const { ctx, page } = await newPage();
+    await login(page, 'admin', PW, '/pulse/releases');
+    await waitTitle(page, 'Pulse 版本庫');
+    await page.getByRole('button', { name: '匯入版本…' }).first().click();
+    const dlg = page.getByRole('dialog');
+    await dlg.getByLabel('檔案').setInputFiles(rel.good);
+    // http:// 不接受（只接受 https://，不可有查詢字串或帳號密碼）
+    await dlg.getByLabel('外部 URL（選填）').fill('http://repo.example.gov.tw/kairos-pulse/');
+    await dlg.getByRole('button', { name: '驗證並匯入' }).click();
+    // 錯誤的詳細訊息在可展開的技術細節中（HTTP 400 · invalid_parameter · base_url 不合法：…）
+    await dlg.locator('.k-code-line', { hasText: 'base_url 不合法' }).waitFor({ state: 'attached' });
+    await dlg.locator('.ds-alert').first().waitFor();
+    await axe(page, 'F8 S25 匯入對話框（外部 URL 不合法）');
+    await dlg.getByLabel('外部 URL（選填）').fill('https://Repo.example.gov.tw/kairos-pulse/0.9.1');
+    await dlg.getByRole('button', { name: '驗證並匯入' }).click();
+    await dlg.getByText(`2. 簽章驗證通過：Pulse ${VERSION}（commit ${COMMIT}）`).waitFor();
+    await dlg.locator(`li[data-file="${rel.tar}"]`).getByText('✓ 雜湊相符，已登記（檔案不存入 Kairos）').waitFor({ timeout: 20000 });
+    await dlg.getByRole('button', { name: '完成' }).click();
+    const row = page.locator(`tr[data-version="${VERSION}"]`);
+    await row.waitFor();
+    await row.getByRole('link', { name: VERSION }).click();
+    await waitTitle(page, `Pulse ${VERSION}`);
+    // base_url 已正規化（小寫的主機名稱、結尾的 /）；已登記的檔案與尚未登記的檔案
+    assert.equal((await page.locator('#release-base-url').textContent()).trim(), 'https://repo.example.gov.tw/kairos-pulse/0.9.1/');
+    await page.getByText(/這個版本的發佈檔不存放在 Kairos/).waitFor();
+    await page.locator(`tr[data-file="${rel.tar}"]`).getByText('已登記（外部 URL）').waitFor();
+    await page.locator(`tr[data-file="${rel.deb}"]`).getByText('待上傳').waitFor();
+    await axe(page, 'F8 S25 版本詳情（外部 URL）');
+    const got = await api(page, 'GET', `/api/v1/releases/${VERSION}`);
+    assert.equal(got.json.data.source, 'external');
+    const tarRow = got.json.data.artifacts.find((x) => x.filename === rel.tar);
+    assert.deepEqual([tarRow.stored, tarRow.registered, tarRow.size], [false, true, 40000]);
+    const del = await api(page, 'DELETE', `/api/v1/releases/${VERSION}`, { confirm: VERSION });
+    assert.equal(del.status, 200, JSON.stringify(del.json));
+    await ctx.close();
+  });
+
   test('F8 S24 集中設定（維運者）：新增設定檔 → 指派全站 → 第 2 版 → 回復 → S05 設定分頁 → 解除指派、刪除', async () => {
     const { ctx, page } = await newPage();
     await login(page, 'operator', PW, '/pulse/config');

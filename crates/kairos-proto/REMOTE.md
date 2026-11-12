@@ -461,7 +461,7 @@ Kairos 建立推送時，對 deb／rpm／msi 主機檢查版本庫是否有「�
 - **回滾（msi）**：目前的 wxs 是 `MajorUpgrade DowngradeErrorMessage=…`，不允許降版。0.9.0 的 wxs 改為 `AllowDowngrades="yes"`（第 14 節 D5），回滾時 `msiexec /i <目前版本.msi>`；降版政策改由 Pulse 端判斷（第 4.8 節）。
 - **zip**：停止服務 → `pulse.exe` 改名為 `pulse.exe.prev` → 複製新版 → 啟動服務。
 - 重新開機：服務啟動時 Pulse 讀 `%ProgramData%\Pulse\upgrade\state.json`；狀態為「已替換、確認中」而升級程序已不在時，重新啟動升級程序接續（健康確認，或期限已過時回滾）。
-- 0.8.0 的 MSI 與服務**尚未在 Windows 實機驗證**；遠端升級的 Windows 部分必須在實機（至少 Windows Server 2019／2022、Windows 11）驗證後才列入支援（第 12 節）。
+- 0.8.0 的 MSI 與服務**尚未在 Windows 實機驗證**；遠端升級的 Windows 部分必須在實機（至少 Windows Server 2019／2022、Windows 11）驗證後才列入支援（第 12 節）。**0.10.0 仍未實作**：評估、建議的做法與實機驗證清單見第 18 節。
 
 #### 4.4.5 不支援的情況（第一版）
 
@@ -1102,7 +1102,13 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
   - `import <目錄>`：讀取 `SHA256SUMS`、`SHA256SUMS.sig`、`pulse-*-release.json`（至多一個）與 `SHA256SUMS` 列出、目錄中有的 Pulse 發佈檔。版本已在版本庫且 `SHA256SUMS` 完全相同時只補上發佈檔（已存入且檔案正常的略過；遺失或大小不符的重新存入）；`SHA256SUMS` 不同時結束代碼 11。目錄中不在 `SHA256SUMS` 的 `pulse-*` 檔案不匯入並提醒；沒有設定 `allowed_signers` 時警告「沒有驗證簽署者」。任何一個檔案驗證失敗時停止（結束代碼 1、`KRS-E8413`），已存入的檔案保留，修正後重新執行即可。
   - `list [--json]`：版本、commit、簽署金鑰、發佈檔（已存入／列出的數量）、執行中、回滾目標、推送中的數量；標出已存入而檔案遺失或大小不符的發佈檔（`--json` 的 `artifacts[].file_problem`）。
   - `delete <版本> --confirm <版本> [--reason …]`：L2 以 `--confirm` 再輸入一次版本號；使用中時結束代碼 11（`release_in_use`）。
-  - `import --external <base_url>` 的參數已解析，執行時回報「外部 URL 的版本庫尚未提供」（結束代碼 2）；與外部 URL 的版本庫（`source: external`，第 4.1.2 節）一起提供。
+  - `import <目錄> --external <base_url>`（0.10.0）：外部 URL 的版本庫，見下一項。
+- **外部 URL 的版本庫**（0.10.0，第 4.1.2 節；`releases.source = 'external'`、`base_url`）：
+  - 匯入：`POST /api/v1/releases` 的 `source: "external"`＋`base_url`，或 `kairos releases import <目錄> --external <base_url>`。`SHA256SUMS`、簽章與清單的驗證與代管**完全相同**（同一個 `verify_release`）。`base_url` 以兩端共用的規則檢查並正規化（`kairos_proto::mgmt::url`：只接受 `https://<主機>[:<埠>]/<路徑>`，不接受帳號密碼、查詢字串、片段、百分比編碼、`.`／`..`；主機名稱轉小寫、補上結尾的 `/`）。
+  - **發佈檔只登記、不保存**：`PUT …/artifacts/{filename}`（與 CLI 的匯入）照樣讀取檔案、確認 SHA-256 與 `SHA256SUMS` 相符，但只記下大小（`release_artifacts.size_bytes`，`stored = 0`），檔案不存入 `releases_dir`。提議的 `artifact.size` 需要大小而 `SHA256SUMS` 沒有，所以**只有登記過的發佈檔可以推送**（API 的 `artifacts[].registered`）；尚未登記的在資格分類為 `no_artifact`。規格寫「只上傳 `SHA256SUMS`、`.sig` 與清單」，這是差異（見下表）。
+  - 提議：`artifact.source = "url"`、`artifact.url = base_url＋檔名`；`sha256sums`、`signature`、`manifest` 照舊附上，Pulse 的驗證鏈不變。外部 URL 的檔案不經 8443 提供（`upgrade_chunk_get` 回 `upgrade_unavailable`）。
+  - 回滾檔：主機目前版本的發佈是外部 URL 時，**只在目標也是外部 URL 時**才附 `rollback_artifact`（`source: "url"`）；目標由 Kairos 代管時不附（資格分類算作「無法自動回滾」），避免不允許外部 URL 的主機因為回滾檔而拒絕整個提議。
+  - Kairos **不知道**哪些主機的本機白名單允許這個 URL（沒有新的 feature；見第 17 節）：不允許的主機（含 0.9.0 的 Pulse）回報 `declined`（`PLS-W8411`、`detail: url_not_allowed`），不計入失敗比例。
 - 重複上傳同一個發佈檔時，版本庫中已有同名而**大小不同**的檔案會被這次（雜湊已符合 `SHA256SUMS`）的內容取代（0.9.0 一律保留既有的檔案，無法修復被截斷的檔案）。
 
 **集中設定**
@@ -1122,7 +1128,9 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
 | SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪；另帶 `pause_cause`）；`rollout.host`（0.10.0）隨每一輪送出、每台每輪最多一則，一輪超過 200 台時以 `rollout.progress` 的 `hosts_resync` 取代 |
 | 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨；0.10.0 起另有「版本庫的檔案遺失」，`KRS-W8417`〔暫定〕，只 `stat` 不重算雜湊） |
-| CLI | `kairos releases import／list／delete` | 0.10.0 提供（直接開資料庫，不經執行中的 Kairos）；`--external` 尚未提供 |
+| CLI | `kairos releases import／list／delete` | 0.10.0 提供（直接開資料庫，不經執行中的 Kairos），含 `--external` |
+| 外部 URL 的版本庫（0.10.0） | 匯入時只上傳 `SHA256SUMS`、`.sig` 與清單，另填 `base_url` | 另外要「登記」要推送的發佈檔（上傳或 CLI 匯入時確認雜湊並記下大小，檔案不保存）：協定的 `artifact.size` 必填、Pulse 以它作為下載上限與空間檢查，而 `SHA256SUMS` 沒有大小；由 Kairos 向 URL 查詢大小會讓 Kairos 對外發出請求，不採用 |
+| 外部 URL 的資格預覽（0.10.0） | — | Kairos 不知道主機的 `upgrade.url_allowlist`，預覽不會把「不允許外部 URL」的主機列為不符資格；它們在推送中回報 `declined`（`url_not_allowed`）。之後可以加一個 feature（例如 `upgrade_url`）讓 Pulse 宣告，列入待決 |
 | 告警 | 系統規則與離線告警抑制 | 三條系統規則已接上；升級中主機的離線告警抑制（第 4.7.5 節）在 0.10.0 提供。與規格的差異：規格寫「等同於針對該主機的靜音，事件時間軸註明『升級中』」，實作為期限前**不開事件**（一般的升級重啟短於離線規則的寬限，本來就沒有事件；靜音會留下上萬筆已靜音的事件），期限過後才開的事件在細節與處理紀錄註明 |
 | `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選；0.10.0 另有 `agent_outdated` 與 `meta.recommended_min_agent_version`（R9 的 ⚠） |
 | 刪除主機資料 | — | 一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management` |
@@ -1224,7 +1232,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | # | 規格 | 實作 | 理由 |
 |---|---|---|---|
 | 1 | 第 4.4.2 節：deb／rpm 以提議的 `rollback_artifact` 回滾 | 回滾檔沒有簽章可驗證（`SHA256SUMS` 屬於另一次發佈，提議中沒有）。Pulse 只在本機保存過**它所屬發佈的、驗證過的** `SHA256SUMS`（`<狀態目錄>/upgrade/releases/<版本>/`，每次驗證通過的發佈都會保存，只留目前與目標版本）時才下載並交給輔助程式，輔助程式以信任錨重新驗證後才 `dpkg -i`／`rpm -U --oldpackage`；否則改以替換前保留的 `pulse.prev` 回復執行檔，`detail` 附 `binary_restored_package_db_shows_<版本>` | 否則被入侵的 Kairos 可以讓健康確認失敗（不 `ack` report），讓主機以 root 安裝它提供的任意套件，違反第 1 節原則 2。代價：從 0.9.0 手動安裝後的第一次遠端升級沒有可用的回滾檔（之後的升級就有）；建議 0.10.0 在 `upgrade_offer` 加入選用的 `rollback_bundle`（回滾檔所屬發佈的 `sha256sums`、`signature`），見第 17.5 節 |
-| 2 | 第 4.1.2 節：外部 URL（`source: "url"`）以本機白名單下載 | 0.9.0 一律 `declined`（`PLS-W8411`、`detail: url_not_allowed`）；`url_allowlist`、`external_ca` 已可設定與驗證格式，0.10.0 起使用 | D15 |
+| 2 | 第 4.1.2 節：外部 URL（`source: "url"`）以本機白名單下載 | 0.9.0 一律 `declined`（`PLS-W8411`、`detail: url_not_allowed`）。**0.10.0 起提供**（`remote/upgrade/fetch.rs`、第 17.7 節）：一律不跟隨重新導向（規格只禁止跨主機的） | D15；重新導向一律不跟隨比較單純，也不會被導向白名單以外的位址 |
 | 3 | 第 4.4.1 節：`TimeoutStartSec` 為健康確認上限加 15 分鐘 | 2.5 小時 | 17.2 #14 |
 | 4 | 第 5.5 節：外部程式只有 `systemctl`、`dpkg`、`rpm`、`msiexec`、`sc` | 另有預檢用的 `tar`、`dpkg-deb`、`rpm2cpio`、`cpio`（固定路徑、參數由程式組成） | 第 4.4.1 節步驟 4 的預檢需要解開發佈檔 |
 | 5 | 第 10.2 節：`pulse config show` 不加 `--effective` 時「列出設定」 | 只列出白名單的鍵（本機與內建預設，`--effective` 另合併快取）；完整設定請看 `pulse check-config`／`pulse diag` | 指令的目的在集中設定 |
@@ -1260,3 +1268,62 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 7 | 每台主機下載時 Kairos 記 WARN「送出訊息超過每秒 20 則（可連續 50 則），延後處理」 | 區域網路上 2 段在途的段落請求遠超過每條連線的訊息速率 | 段落請求之間至少隔 60 ms（17.2 #21） |
 
 另外為了維運，輔助程式在回滾前記下回滾的方式（「以回滾檔 … 經套件管理員裝回」或「以替換前保留的 /opt/pulse/pulse.prev 換回」）。
+
+### 17.7 外部 URL 的下載（0.10.0，第 4.1.2 節）
+
+- **接受的條件**（`on_offer` 第 2 步，早於簽章驗證）：`artifact`（與 `rollback_artifact`）的 `source` 為 `url` 時，`url` 必須（1）通過 `kairos_proto::mgmt::url::parse_https_url`，（2）符合本機 `upgrade.url_allowlist` 的任一個前綴，（3）最後一個路徑段等於提議的檔名。否則 `declined`（`PLS-W8411`、`detail: url_not_allowed`）。白名單預設是空的：**預設只接受從 Kairos 下載**，0.9.0 的行為不變。
+- **前綴比對**：白名單的每一項視為目錄，比對前補上結尾的 `/`（`https://repo.example.gov.tw` 不會放行 `https://repo.example.gov.tw.evil.example/…`，`https://repo/kairos-pulse` 不會放行 `https://repo/kairos-pulse-evil/…`）；主機名稱不分大小寫、路徑區分；URL 中不可有 `@`、`?`、`#`、`%`、`\`、`.`／`..` 路徑段。不合法的白名單項目不比對任何 URL，啟動時記 `WARN`。白名單與 CA 以 `pulse.toml` 的值為準（`PULSE__UPGRADE__*` 不能放寬，第 17.2 節 #18）。
+- **下載**（背景工作 `run_url_downloads`，白名單不是空的才啟動；不經 8443、不占段落請求）：HTTPS（rustls，TLS 1.2 以上），信任 `upgrade.external_ca`（PEM；設定時**只**信任它，空字串時為作業系統信任庫），不送用戶端憑證；`GET`、`Accept-Encoding: identity`、`Connection: close`；只接受 200／206，**不跟隨任何重新導向**；不接受 `Transfer-Encoding: chunked` 或 `Content-Encoding`；`Content-Length` 必須等於提議的大小（續傳時為剩餘的大小），沒有 `Content-Length` 時讀到提議的大小為止、多出來即失敗；連線 30 秒、閒置 60 秒逾時；沒有 HTTP 代理。失敗時約 60 秒（±20%）後以 `Range` 續傳，`upgrade.download_failed`（`PLS-W8404`）照既有的節流記錄。
+- **驗證鏈不變**：下載前已以本機信任錨驗證 `SHA256SUMS.sig`、清單與發佈檔在 `SHA256SUMS` 中的雜湊（第 17.2 節 #8）；下載完成後與分段下載走同一段程式（`file_downloaded`）比對提議的 SHA-256（不符刪除重來，連續 3 次後 `failed`、`PLS-E8402`），`stage` 再驗證一次，輔助程式以 root 重新驗證所有檔案。TLS 與白名單只決定「可以向哪裡發出請求」，不是信任的來源：外部伺服器或 CA 被入侵時，最多讓下載失敗。
+- **進度**與分段下載相同（每 25% 一則 `accepted`）；`staged` 之後的流程（時段、交付、健康確認、回滾）沒有差別。
+- **沒有新的 feature**：Kairos 0.10 對 0.9.0 的 Pulse 提議 `source: "url"` 時得到 `declined`（`url_not_allowed`），不影響連線與其他主機；0.10 的 Pulse 連上 0.9 的 Kairos 不會收到這種提議。
+
+## 18. Windows 的遠端升級：0.10.0 不實作的評估與需要的實機驗證（待使用者決定）
+
+〔衝刺 10。第 4.4.4 節的 Windows 部分（P3：MSI／zip 的替換與回滾）**沒有實作**：`install.upgrade` 在 Windows 仍一律是 `unsupported`，Pulse 不宣告 `upgrade`，Kairos 把 Windows 主機分類為 `unsupported_platform`，與 0.9.0 相同。集中設定（feature `config`）在 Windows 不受影響。本節說明理由、建議的做法與實機驗證清單，是否與何時實作由使用者決定〕
+
+### 18.1 為什麼沒有實機就不出貨
+
+1. **整條路徑都是無法在 kp-build 上執行的 Win32 行為**。P3 要做的事是：以 LocalSystem 把目前的 `pulse.exe` 複製成 `pulse-upgrader.exe`、以 `CREATE_BREAKAWAY_FROM_JOB`／`DETACHED_PROCESS` 脫離服務的工作物件、呼叫 `msiexec /i … /qn`（MajorUpgrade 會停止並移除服務）、以服務控制管理員重新啟動服務、判斷 `RUNNING` 與 1618／3010 等結束代碼、失敗時以舊版 MSI 降版（需要把 wxs 改為 `AllowDowngrades="yes"`）或把 `pulse.exe.prev` 換回。交叉編譯（`x86_64-pc-windows-gnu`）只能證明「型別對得上」，單元測試只能測到命令列的組成與狀態機，**測不到任何一個會出錯的地方**：服務停止時升級程序是否被一起結束、MSI 交易失敗時的狀態、檔案被防毒或服務本身鎖住、`msiexec` 在 session 0 的行為。
+2. **信任邊界是 ACL，寫錯了不會有任何錯誤訊息**。Linux 的輔助程式靠「root 擁有、其他人不可寫」「`O_NOFOLLOW`」「`st_nlink`」保護信任錨與暫存目錄（第 4.4.1 節）；Windows 要改為檢查擁有者是 SYSTEM／Administrators、DACL 沒有給其他主體寫入權限、路徑沒有重新解析點（junction、符號連結）。這段程式判斷錯誤的結果是「任何本機使用者可以讓 LocalSystem 安裝他提供的檔案」的提權路徑，而且在 Linux 上的測試一定是綠的。沒有在實機上以一般使用者實際嘗試攻擊前，不應該存在於出貨的執行檔中——即使以本機開關預設關閉也一樣（開關本身就是請客戶在正式環境替我們做第一次測試）。
+3. **底下的基礎還沒有驗證過**。0.8.0 的 Windows 服務與 MSI 本身至今「未在 Windows 實機驗證前不列入支援」（CHANGELOG「支援期限」與 [0.8.0]「尚未實機驗證」）：服務的安裝與啟停、MajorUpgrade、工作目錄、檔案 ACL 都還沒有在 Windows 上跑過。在沒有驗證過的服務與 MSI 上再疊一層「自動替換自己並回滾」，出問題時無法分辨是哪一層。
+4. **失敗的代價是到現場處理**。遠端升級失敗而回滾也失敗時（`rollback_failed`），主機的監控 agent 停止，只能人工處理；Windows 主機通常數量多、由 SCCM／GPO 管理。寧可晚一個版本，也不要讓第一次遠端升級就把一批 Windows 主機的 agent 弄停。
+5. **客戶目前有替代方案**：Windows 主機以既有的 MSI（SCCM、GPO、手動）升級，這條路徑在設計包 `pulse/sccm-deployment.md` 已有說明；集中設定已可用。
+
+### 18.2 建議的做法
+
+| 階段 | 內容 | 前提 |
+|---|---|---|
+| W0（可以先做，不出貨行為） | 準備 Windows VM（Windows Server 2019、2022、Windows 11 各一台，可還原快照），先完成 0.8.0 遺留的服務與 MSI 的實機驗證（CHANGELOG [0.8.0]「尚未實機驗證」的清單） | 使用者提供 VM 或同意在 PVE 上建立 |
+| W1 | Pulse：安裝方式偵測改以登錄的 UpgradeCode 判斷（第 4.3 節）、信任錨與暫存目錄的 ACL 檢查、`install.upgrade = "ready"` 的條件；Kairos：`msi`／`zip` 的發佈檔選擇與 `rollback_artifact`（`msi`） | W0 |
+| W2 | 升級程序（`pulse-upgrader.exe upgrade apply`）：脫離服務、複製並重新驗證、預檢、zip 的替換與回滾、MSI 的安裝與降版回滾、健康確認、重新開機後接續；wxs `AllowDowngrades="yes"`、`ALLOWEDSIGNERS`／`REMOTEUPGRADE`／`REMOTECONFIG` 屬性 | W1 |
+| W3 | 第 18.3 節的實機驗證全部通過後才把 `install.upgrade` 改為 `ready`；第一個版本標示為預覽並在 CHANGELOG 列出驗證過的 Windows 版本 | W2 |
+
+估工維持第 13 節的 P3（約 1 人週）加上 W0 的實機驗證（約 0.5 人週）；關鍵不是程式量，而是每一步都要在 VM 上實際執行。
+
+### 18.3 實機驗證清單（通過條件）
+
+在 Windows Server 2019、Windows Server 2022、Windows 11 各做一次（MSI 與 zip 兩種安裝），以測試金鑰簽署的 `0.10.x-test.1`～`test.4`（與 `tests/systemd/` 相同的四個建置：正常、啟動即結束、正常、啟動即結束）與實際的 Kairos：
+
+| # | 情境 | 通過條件 |
+|---|---|---|
+| 1 | MSI 安裝 `test.0`，放好 `allowed_signers`（`ALLOWEDSIGNERS=`） | 服務 `Pulse` 為 `RUNNING`；hello 的 `install` 為 `msi`／`ready`；`pulse upgrade status` 顯示信任錨指紋 |
+| 2 | 推送 `test.1`（成功） | 升級程序在 MSI 停止服務後仍在執行（工作物件已脫離）；`msiexec` 結束代碼 0；服務重新啟動為 `RUNNING`；Kairos 的 `agent_version`、「應用程式與功能」的版本、`pulse --version` 一致；推送 `succeeded`（`PLS-I8416`）；`%ProgramData%\Pulse\upgrade` 的暫存已清除 |
+| 3 | 推送 `test.2`（啟動即結束） | 健康確認失敗 → 以 `rollback_artifact`（`test.1` 的 MSI，`AllowDowngrades`）回復；服務 `RUNNING`、版本為 `test.1`（登錄與執行檔一致）；`rolled_back`（`PLS-W8407`）；推送自動暫停 |
+| 4 | zip 安裝：升級成功、失敗回滾 | `pulse.exe.prev` 的保留與換回；服務的啟停順序；檔案被鎖住時的重試與錯誤訊息 |
+| 5 | 替換後、健康確認期間重新開機（正常關機與直接斷電各一次） | 開機後服務啟動、依 `state.json` 接續（確認或回滾），結果正確回報 |
+| 6 | 另一個安裝正在進行（`msiexec` 1618） | 每 30 秒重試、最多 10 分鐘，之後 `failed`（`PLS-E8406`），主機仍是舊版且服務執行中 |
+| 7 | `msiexec` 回 3010（需要重新開機） | 視為成功並記錄，不自動重新開機 |
+| 8 | **ACL 與提權**（以一般使用者登入） | `allowed_signers` 可被 Users 寫入時 `install.upgrade = "no_trust_anchor"`；一般使用者無法在 `%ProgramData%\Pulse\upgrade\` 建立或替換檔案、無法以 junction／符號連結把升級程序導向其他路徑；換掉已驗證的檔案（TOCTOU）會被第二次驗證擋下；升級程序的命令列不能由一般使用者控制 |
+| 9 | 簽章錯誤（Pulse 不信任的金鑰） | 下載前驗證失敗、`failed`（`PLS-E8401`）、沒有任何檔案被替換、推送暫停 |
+| 10 | 防毒軟體（至少 Microsoft Defender 即時保護開啟） | 複製出來的 `pulse-upgrader.exe` 與 MSI 不被隔離；被隔離時的錯誤是可診斷的 `failed`，不是卡住 |
+| 11 | 服務帳號與 session 0 | `msiexec /qn` 在 LocalSystem、沒有互動工作階段時完成；記錄檔 `msiexec.log` 可由 `pulse diag` 收集 |
+| 12 | SCCM 並用（選做） | SCCM 的偵測規則在遠端升級後仍判定為已安裝（`pulse/sccm-deployment.md`） |
+
+結果記在 CHANGELOG「尚未實機驗證」一節；任何一項沒有通過，Windows 的 `install.upgrade` 維持 `unsupported`。
+
+### 18.4 需要使用者決定
+
+- **(a) 建議**：0.10.0 不含 Windows 的遠端升級；先取得 Windows VM、完成 W0，之後的版本依 18.2 實作並以 18.3 驗證。
+- (b) 先實作（W1、W2）並以本機開關預設關閉的「預覽」出貨，由願意的客戶協助驗證：可以早一點拿到回饋，但把未驗證的特權程式放進出貨的執行檔（18.1 第 2 項），不建議。
+- (c) 只做 zip 安裝（不經 MSI，沒有降版與交易的問題）：範圍小，但多數 Windows 部署使用 MSI（SCCM），效益有限，且 ACL 的問題相同。

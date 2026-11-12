@@ -244,7 +244,7 @@ enabled = true
 # 遠端升級（Kairos 0.9.0 以上、SQLite 儲存、mTLS 時協商 feature「upgrade」；REMOTE.md 第 4 節）：
 # 接受 Kairos 推送的「官方簽章」Pulse 發佈包，下載後以本機的信任錨驗證簽章與雜湊，再交給 root 的
 # pulse-upgrade.service 重新驗證、替換、重新啟動與健康確認，失敗時自動回滾。0.9.0 只支援 Linux 的
-# tar／deb／rpm 安裝（systemd，單一實例）；Windows、外部 URL 下載在 0.10.0。
+# tar／deb／rpm 安裝（systemd，單一實例）；Windows 在 0.10.0 之後；外部 URL 下載自 0.10.0 起（url_allowlist）。
 # 本區段只能寫在 pulse.toml（輔助程式只讀 pulse.toml）；PULSE__UPGRADE__* 環境變數只能用來關閉。
 # false = 不宣告 upgrade（PLS-I8409）
 enabled = true
@@ -257,9 +257,11 @@ allowed_signers = ""
 extra_principals = []
 # 接受遠端降版（推送也必須允許，PLS-W8410）。升級失敗時的自動回滾不受這個設定影響
 allow_downgrade = false
-# 允許從外部 URL 下載的前綴（https://…/）；0.10.0 起使用，0.9.0 一律只從 Kairos 下載
+# 允許從外部 URL 下載發佈檔的前綴（0.10.0 起；空 = 只從 Kairos 下載）。每一項是 https://<主機>[:<埠>]/<目錄>/，
+# 以「目錄」比對（https://repo.example.gov.tw/kairos-pulse 只放行這個目錄之下的 URL）；不可有帳號密碼、查詢字串。
+# 只決定 Pulse 可以向哪裡下載：下載的檔案仍要通過本機信任錨的簽章與雜湊驗證。只能在 pulse.toml 設定
 url_allowlist = []
-# 外部 URL 的 CA（PEM）；0.10.0 起使用。空字串 = 作業系統信任庫
+# 外部 URL 的 CA（PEM 檔的路徑，可含多張）：設定時只信任它；空字串 = 作業系統信任庫
 external_ca = ""
 # 替換後的健康確認期限（秒）：0 = 依 Kairos 推送的值（預設 600）；非 0 時取兩者較大（120～3600）
 health_timeout_secs = 0
