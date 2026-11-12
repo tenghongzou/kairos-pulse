@@ -641,11 +641,18 @@ async fn open_service(
     config_path: Option<&Path>,
     create: bool,
 ) -> Result<Option<Arc<RemoteService>>, Failure> {
-    // 與其他命令相同的檢查（設定、SQLite、root、權限），並在需要時建立、遷移資料庫
-    let Some(conn) = open(config_path, create)? else {
+    // 與其他命令相同的檢查（設定、資料庫、root、權限），並在需要時建立、遷移資料庫。
+    // 在 blocking 執行緒上開啟：PostgreSQL 後端的同步用戶端不能在 runtime 的執行緒上連線
+    // （「Cannot start a runtime from within a runtime」）
+    let path = config_path.map(Path::to_path_buf);
+    let exists = tokio::task::spawn_blocking(move || {
+        open(path.as_deref(), create).map(|conn| conn.is_some())
+    })
+    .await
+    .map_err(|e| db_failure(format!("背景工作失敗：{e}")))??;
+    if !exists {
         return Ok(None);
-    };
-    drop(conn);
+    }
     let config = AppConfig::load(config_path).map_err(|e| {
         Failure::new(
             "設定檔無法載入",

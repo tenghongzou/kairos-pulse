@@ -7,14 +7,15 @@
 #
 # 產出（<工作目錄>/dist/<名稱>/，每個目錄是一次「發佈」：SHA256SUMS、SHA256SUMS.sig、發佈清單與發佈檔）：
 #   kairos         Kairos（x86_64 musl tar.gz，不簽章；測試環境的 Kairos 伺服器）
-#   0.9.0          Pulse HEAD（Cargo.toml 的版本）：tar.gz、deb、rpm、pulse-install.sh
-#   0.9.1-test.1   同一份程式碼，只改版本號（升級成功）
-#   0.9.1-test.2   另加「無參數啟動時立刻以結束代碼 1 結束」（服務一直崩潰：健康確認失敗 → 自動回滾）；
+#   <V0>           Pulse HEAD（Cargo.toml 的版本，例如 0.10.0）：tar.gz、deb、rpm、pulse-install.sh
+#   <N>-test.1     同一份程式碼，只改版本號（升級成功）。<N> 是 <V0> 的下一個 PATCH（0.10.0 → 0.10.1），
+#                  所以測試用的版本一定比 HEAD 新（不會被當成降版）
+#   <N>-test.2     另加「無參數啟動時立刻以結束代碼 1 結束」（服務一直崩潰：健康確認失敗 → 自動回滾）；
 #                  --version、check-config、--print-agent-id 正常，所以會通過輔助程式的預檢
-#   0.9.1-test.3   同 test.1，只改版本號（重新開機接續後升級成功）
-#   0.9.1-test.4   同 test.2（崩潰），版本高於 test.3（回滾期間重新開機）
+#   <N>-test.3     同 test.1，只改版本號（重新開機接續後升級成功）
+#   <N>-test.4     同 test.2（崩潰），版本高於 test.3（回滾期間重新開機）
 #   evil-a         test.1 的檔案，SHA256SUMS 改以「沒有人信任」的金鑰 evil-a 簽章（Kairos 匯入時拒絕）
-#   0.9.1-test.9   test.1 的檔案改名為 test.9，以 evil-b 簽章：Kairos 的信任錨有 evil-b（匯入成功），
+#   <N>-test.9     test.1 的檔案改名為 test.9，以 evil-b 簽章：Kairos 的信任錨有 evil-b（匯入成功），
 #                  Pulse 的信任錨沒有（Pulse 拒絕，PLS-E8401）
 # 金鑰（<工作目錄>/keys/）：release（Pulse 與 Kairos 都信任）、evil-a、evil-b；allowed_signers（Pulse）、
 # kairos_allowed_signers（Kairos：release＋evil-b）。
@@ -42,6 +43,9 @@ fi
     echo "警告：工作目錄有未提交的修改，建置只使用 HEAD 的內容" >&2
 BASE=$(git -C "$REPO" rev-parse HEAD)
 BASE_VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
+# 測試用的較新版本：<BASE_VERSION 的下一個 PATCH>-test.N（與 run.sh 相同的算法）
+NEXT_VERSION=$(echo "$BASE_VERSION" | awk -F. '{ printf "%d.%d.%d", $1, $2, $3 + 1 }')
+NEXT_RE=$(echo "$NEXT_VERSION" | sed 's/\./\\./g')
 export BUILD_VOLUME="${BUILD_VOLUME:-kp-systemd-test-build}"
 export TARGETS=x86_64-unknown-linux-musl
 export BUILD_JOBS="${BUILD_JOBS:-2}"
@@ -130,31 +134,32 @@ build_kairos() {
 
 build_kairos
 build_pulse "$BASE_VERSION" "$BASE_VERSION"
-build_pulse 0.9.1-test.1 0.9.1-test.1
-build_pulse 0.9.1-test.2 0.9.1-test.2 1
-build_pulse 0.9.1-test.3 0.9.1-test.3
-build_pulse 0.9.1-test.4 0.9.1-test.4 1
+build_pulse "$NEXT_VERSION-test.1" "$NEXT_VERSION-test.1"
+build_pulse "$NEXT_VERSION-test.2" "$NEXT_VERSION-test.2" 1
+build_pulse "$NEXT_VERSION-test.3" "$NEXT_VERSION-test.3"
+build_pulse "$NEXT_VERSION-test.4" "$NEXT_VERSION-test.4" 1
 
 # ---- 簽章錯誤的發佈 ---------------------------------------------------------
 sums() {
     (cd "$1" && rm -f SHA256SUMS SHA256SUMS.sig && for f in pulse-*; do sha256sum "$f"; done >SHA256SUMS)
 }
-T1=$WORK/dist/0.9.1-test.1
-say "簽章錯誤的發佈：evil-a（沒有人信任的金鑰）、0.9.1-test.9（只有 Kairos 信任的金鑰）"
-rm -rf "$WORK/dist/evil-a" "$WORK/dist/0.9.1-test.9"
-mkdir -p "$WORK/dist/evil-a" "$WORK/dist/0.9.1-test.9"
+T1=$WORK/dist/$NEXT_VERSION-test.1
+T9=$WORK/dist/$NEXT_VERSION-test.9
+say "簽章錯誤的發佈：evil-a（沒有人信任的金鑰）、$NEXT_VERSION-test.9（只有 Kairos 信任的金鑰）"
+rm -rf "$WORK/dist/evil-a" "$T9"
+mkdir -p "$WORK/dist/evil-a" "$T9"
 cp "$T1"/pulse-* "$T1/SHA256SUMS" "$WORK/dist/evil-a/"
 sh "$REPO/packaging/sign-release.sh" sign "$WORK/dist/evil-a" "$KEYS/evil-a" >/dev/null
-for f in "$T1"/pulse-0.9.1-test.1-*-linux-x86_64.tar.gz "$T1"/pulse-0.9.1-test.1-*-linux-x86_64.deb \
-    "$T1"/pulse-0.9.1-test.1-*-linux-x86_64.rpm "$T1"/pulse-0.9.1-test.1-*-release.json; do
-    n=$(basename "$f" | sed 's/0\.9\.1-test\.1/0.9.1-test.9/')
+for f in "$T1"/pulse-"$NEXT_VERSION"-test.1-*-linux-x86_64.tar.gz "$T1"/pulse-"$NEXT_VERSION"-test.1-*-linux-x86_64.deb \
+    "$T1"/pulse-"$NEXT_VERSION"-test.1-*-linux-x86_64.rpm "$T1"/pulse-"$NEXT_VERSION"-test.1-*-release.json; do
+    n=$(basename "$f" | sed "s/$NEXT_RE-test\\.1/$NEXT_VERSION-test.9/")
     case "$n" in
-    *-release.json) sed 's/"version":"0\.9\.1-test\.1"/"version":"0.9.1-test.9"/' "$f" >"$WORK/dist/0.9.1-test.9/$n" ;;
-    *) cp "$f" "$WORK/dist/0.9.1-test.9/$n" ;;
+    *-release.json) sed "s/\"version\":\"$NEXT_RE-test\\.1\"/\"version\":\"$NEXT_VERSION-test.9\"/" "$f" >"$T9/$n" ;;
+    *) cp "$f" "$T9/$n" ;;
     esac
 done
-sums "$WORK/dist/0.9.1-test.9"
-sh "$REPO/packaging/sign-release.sh" sign "$WORK/dist/0.9.1-test.9" "$KEYS/evil-b" >/dev/null
+sums "$T9"
+sh "$REPO/packaging/sign-release.sh" sign "$T9" "$KEYS/evil-b" >/dev/null
 
 say "完成"
 for d in "$WORK"/dist/*/; do

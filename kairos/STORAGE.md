@@ -178,7 +178,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v7（0.7.0，衝刺 6）：`audit_events.hmac`（稽核紀錄的 HMAC，[`API.md`](API.md) 第 12.8 節）。既有的紀錄為 NULL（只有雜湊鏈）；服務以 0.7 啟動、建立 `data/audit-hmac.key` 之後寫入的第一筆起才有 HMAC，邊界記在 `meta.audit_hmac`（`since_id`、`key_id`），`meta.audit_chain_head` 另帶 `mac`。升級後 0.6 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v8（0.8.0，衝刺 7，審計 F4）：指標擴充（第 15 節）。`series` 加上 `derived` 並把唯一鍵改為 (name, unit, labels, derived)（SQLite 無法修改唯一鍵，遷移時重建資料表，`series_id` 不變）、索引 `series_name`；`host_series`（由既有的彙總補上）；`hosts.boot_time`、`hosts.series_limited_at`；`host_inventory`、`inventory_changes`、`process_snapshots`。升級後 0.7 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
 - v9（0.9.0，衝刺 9，商業審計 F8）：集中設定與 Pulse 遠端升級（第 18 節）。`config_profiles`、`config_profile_revisions`、`config_assignments`、`host_config`、`releases`、`release_artifacts`、`rollouts`、`rollout_hosts` 與索引；`hosts.install_method`、`install_upgrade`、`install_config`；`meta.config_rev`。SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V9`（新的資料表依 L1a 的做法放在領域的檔案中，`MIGRATIONS` 仍在 `store/sqlite.rs`）。升級後 0.8 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
-- v10（0.10.0〔草稿〕，衝刺 10，HA L2）：叢集協調的資料表（第 20 節）。`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures` 與索引；`enroll_requests.issuing_node`、`issuing_at`；`alert_deliveries.claim_epoch`。SQL 在 `store/sqlite/cluster.rs` 的 `SCHEMA_V10`。叢集模式只支援 PostgreSQL，SQLite 上這些資料表保持空白（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製）。升級後 0.9 的 Kairos 無法開啟（降版從備份還原）；任何開啟資料庫的 CLI 同樣會升級 schema。
+- v10（0.10.0，衝刺 10，HA L2）：叢集協調的資料表（第 20 節）。`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures` 與索引；`enroll_requests.issuing_node`、`issuing_at`；`alert_deliveries.claim_epoch`。SQL 在 `store/sqlite/cluster.rs` 的 `SCHEMA_V10`。叢集模式只支援 PostgreSQL，SQLite 上這些資料表保持空白（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製）。0.10.0 沒有停在 v10 的發佈版本：與 v11 一起套用。
 - v11（0.10.0，衝刺 10，商業審計 F8）：升級推送的雙人覆核（REMOTE.md 第 5.4 節）。`rollouts` 新增 `submitted_at`、`submitted_by`、`reject_reason`（`approved_at`／`approved_by` v9 就有，0.10.0 起使用）。只新增三個可為 NULL 的欄位；SQLite 的 SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V11_ROLLOUT_APPROVAL`，PostgreSQL 在 `store/postgres/schema.rs` 的 `SCHEMA_V11`（`UPGRADES` 的第二步；全新的 schema 建立 v9 後依序套用 v10、v11）。0.9 的資料庫（v9）第一次以 0.10.0 啟動時在一個交易中依序套用 v10、v11；升級後 0.9 的 Kairos 無法開啟（降版從備份還原）。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
@@ -809,7 +809,7 @@ connect_timeout_secs = 5
 
 ### 19.2 schema
 
-與 SQLite 的 schema 一對一（`store/postgres/schema.rs`；目前是 v10：`SCHEMA_V9` 加上 `UPGRADES` 的升級步驟）：資料表、欄位、索引名稱相同，第一次啟動（或任何會建立資料庫的 CLI）時在空的 schema 上以一個交易建立目前的版本。對應規則（HA.md 第 5.3 節）：
+與 SQLite 的 schema 一對一（`store/postgres/schema.rs`；目前是 v11：`SCHEMA_V9` 加上 `UPGRADES` 的升級步驟 v10、v11）：資料表、欄位、索引名稱相同，第一次啟動（或任何會建立資料庫的 CLI）時在空的 schema 上以一個交易建立目前的版本。對應規則（HA.md 第 5.3 節）：
 
 | SQLite | PostgreSQL |
 |---|---|
@@ -826,7 +826,7 @@ connect_timeout_secs = 5
 
 - **HA.md 第 5.5 節列的叢集資料表與欄位**（`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures`、`enroll_requests.issuing_node`、`alert_deliveries.claim_epoch`）**不在 v9**：0.9.0 實際發佈的 v9 是遠端管理的資料表（第 18 節），叢集的資料表在 **v10** 新增（兩個後端同時，第 20 節）。
 - schema 的版本比程式新時拒絕啟動（`KRS-E4405`）；不是 Kairos 建立的 schema（有資料表但沒有 `meta.application = KRS1`）拒絕使用（`KRS-E4402`）；`kairos db migrate` 尚未完成的 schema 拒絕使用（`KRS-E4404`）。
-- PostgreSQL 後端從 v9 開始（`BASE_VERSION`），沒有 v1～v8 的升級步驟（舊資料以 `kairos db migrate` 從 SQLite 搬入）。v9 之後的版本有升級路徑：`UPGRADES` 列出每一版的 SQL，既有的 v9 schema 在啟動（或 CLI 開啟資料庫）時自動升級到 v10（第 20.3 節）。
+- PostgreSQL 後端從 v9 開始（`BASE_VERSION`），沒有 v1～v8 的升級步驟（舊資料以 `kairos db migrate` 從 SQLite 搬入）。v9 之後的版本有升級路徑：`UPGRADES` 列出每一版的 SQL，既有的 v9（或 0.10.0 開發期間的 v10）schema 在啟動（或 CLI 開啟資料庫）時自動升級到 v11（第 20.3 節）。
 
 ### 19.3 並行控制
 
@@ -933,11 +933,11 @@ sudo -u kairos kairos db migrate --to sqlite:/var/backups/kairos/export.db --con
 
   共用的測試本體 25 個（report 路徑 14 個、領域 store 11 個）：PostgreSQL 的版本除了在 PostgreSQL 上執行，還在 SQLite 上再跑一次，兩邊每個步驟的結果必須完全相同；另有 PostgreSQL 專屬的 9 個（連線池、唯讀連線、服務鎖、schema 檢查、8 條連線並行寫稽核鏈、並行的原子更新）與 `db migrate` 的 3 個。每個測試使用自己的 schema，結束時刪除。沒有設定 `KAIROS_TEST_PG_URL` 時這些測試**明確略過**（在 stderr 印出「略過：未設定 KAIROS_TEST_PG_URL…」），不算驗證過；設定 `KAIROS_TEST_PG_REQUIRED=1` 時沒有可用的資料庫就失敗（CI 的 Linux job 與 `postgres-compat` job 如此設定，分別以 PostgreSQL 14 與 17 執行）。
 
-## 20. 叢集協調的資料表（schema v10；0.10.0〔草稿〕；HA L2）
+## 20. 叢集協調的資料表（schema v10；0.10.0；HA L2）
 
 叢集模式（`[cluster] enabled = true`，階段 A：主動／備援）讓多個 Kairos 共用一個 PostgreSQL，以資料庫中的租約選出唯一的主動節點（leader）。規格見 [`HA.md`](HA.md) 第 5.5、6 節，實作與規格的差異見 HA.md 第 6.8 節；部署步驟見 INSTALL 附錄 H。SQL 在 `store/sqlite/cluster.rs` 與 `store/postgres/schema.rs` 的 `SCHEMA_V10`，領域介面 `ClusterStore`（`cluster/store.rs`，兩個後端都實作）。
 
-v10 是**獨立的一步**：只新增資料表與三個可為 NULL 的欄位，不修改既有的資料與唯一鍵。**叢集模式只支援 PostgreSQL**；SQLite 也建立同樣的資料表（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製），單機時保持空白。
+v10 是**獨立的一步**：只新增資料表與三個可為 NULL 的欄位，不修改既有的資料與唯一鍵。（0.10.0 的 schema 版本是 **v11**：v11 是 `rollouts` 的雙人覆核欄位，見第 3 節；0.9 的資料庫升級時依序套用 v10、v11。）**叢集模式只支援 PostgreSQL**；SQLite 也建立同樣的資料表（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製），單機時保持空白。
 
 ### 20.1 資料表
 
@@ -980,11 +980,11 @@ v10 是**獨立的一步**：只新增資料表與三個可為 NULL 的欄位，
 
 ### 20.3 升級與降版
 
-- **SQLite**：`MIGRATIONS` 的第 10 步（`store/sqlite.rs`；SQL 在 `store/sqlite/cluster.rs`），與之前的版本相同——啟動或任何開啟資料庫的 CLI 依 `PRAGMA user_version` 套用，一個交易。
-- **PostgreSQL**：`store/postgres/schema.rs` 的 `UPGRADES`（目前只有 `(10, SCHEMA_V10)`）。`ensure_schema` 發現 schema 是 v9（`BASE_VERSION`）以上、低於程式的版本時，在一個交易中取得 advisory lock `LockKind::Migrate`、重新讀取版本（等待期間可能已由另一個節點升級）、依序套用比目前版本新的步驟，最後寫入 `meta.schema_version` 與 `meta.schema_upgraded_by`（執行升級的 Kairos 版本）。同時啟動的多個節點只有一個執行升級，其他等待後直接使用。空的 schema 則是建立 v9 之後接著套用同樣的步驟。
+- **SQLite**：`MIGRATIONS` 的第 10 步（`store/sqlite.rs`；SQL 在 `store/sqlite/cluster.rs`）與第 11 步（`rollouts` 的雙人覆核欄位，`store/sqlite/remote.rs`），與之前的版本相同——啟動或任何開啟資料庫的 CLI 依 `PRAGMA user_version` 套用，一個交易。
+- **PostgreSQL**：`store/postgres/schema.rs` 的 `UPGRADES`（`(10, SCHEMA_V10)`、`(11, SCHEMA_V11)`）。`ensure_schema` 發現 schema 是 v9（`BASE_VERSION`）以上、低於程式的版本時，在一個交易中取得 advisory lock `LockKind::Migrate`、重新讀取版本（等待期間可能已由另一個節點升級）、依序套用比目前版本新的步驟，最後寫入 `meta.schema_version` 與 `meta.schema_upgraded_by`（執行升級的 Kairos 版本）。同時啟動的多個節點只有一個執行升級，其他等待後直接使用。空的 schema 則是建立 v9 之後接著套用同樣的步驟。
   - 觸發的時機：第一個以新版啟動的節點（叢集模式：協調執行緒在備援階段就執行），或任何以可寫方式開啟資料庫的 CLI（例如 `kairos cluster init`）。`kairos --check-config` 只讀取，不升級。
   - 低於 v9 的 PostgreSQL schema 不存在（後端從 v9 開始）；遇到時回 `KRS-E4402`。
-- **降版**：升級到 v10 之後，0.9 的 Kairos（以及 0.10.0 草稿中 schema v9 的建置）無法開啟——SQLite 回「資料庫的 schema 版本 10 比本版 Kairos 支援的 9 新」，PostgreSQL 回 `KRS-E4405`，都不做任何變更。沒有降版的遷移：請從升級前的備份還原（SQLite：第 9 節；PostgreSQL：`pg_dump` 等的備份）。**升級前先備份**。
+- **降版**：升級到 0.10.0 的 schema（v11）之後，0.9 的 Kairos（以及 0.10.0 開發期間 schema v9、v10 的建置）無法開啟——SQLite 回「資料庫的 schema 版本 11 比本版 Kairos 支援的 9 新」，PostgreSQL 回 `KRS-E4405`，都不做任何變更。沒有降版的遷移：請從升級前的備份還原（SQLite：第 9 節；PostgreSQL：`pg_dump` 等的備份）。**升級前先備份**。
 - **叢集中的版本升級**：schema 不變的版本可以滾動升級；schema 改變的版本要先停止所有節點，升級所有節點的執行檔，再啟動第一個節點（由它升級 schema）。版本較舊的節點看到較新的 schema 時拒絕啟動（`KRS-E4405`）。步驟見 INSTALL 第 H.5 節。
 
 ### 20.4 fencing：租約對寫入的意義
@@ -1018,7 +1018,7 @@ v10 是**獨立的一步**：只新增資料表與三個可為 NULL 的欄位，
 
 ### 20.6 `kairos db migrate` 與備份
 
-- `kairos db migrate` **一併複製**第 20.1 節的資料表（`store/postgres/schema.rs` 的 `TABLES`；彼此沒有相依，`cluster_events.id` 的 IDENTITY 以 `setval` 對齊）與 `meta` 的 `cluster_id`、`cluster_keys`。來源與目的都必須是目前的 schema 版本（v10）；較舊的來源先以相同版本的 Kairos 開啟一次完成升級。
+- `kairos db migrate` **一併複製**第 20.1 節的資料表（`store/postgres/schema.rs` 的 `TABLES`；彼此沒有相依，`cluster_events.id` 的 IDENTITY 以 `setval` 對齊）與 `meta` 的 `cluster_id`、`cluster_keys`。來源與目的都必須是目前的 schema 版本（v11）；較舊的來源先以相同版本的 Kairos 開啟一次完成升級。
 - 搬移需要停止**所有**節點（取得「服務執行中」的互斥鎖，否則 `KRS-E4304`）。搬到 SQLite（回到單機）之後，`cluster_nodes` 與 `cluster_leases` 留著原本的列但不再使用；把 `cluster.enabled` 改回 `false` 後啟動。
 - PostgreSQL 的備份（`pg_dump` 等）自然包含這些資料表。還原到另一組主機時，舊節點的列以 `kairos cluster forget` 刪除；`cluster_leases` 中過期的租約不需要處理（到期後任何節點都能取得）。金鑰另以 `kairos cluster keys export` 備份，還原時與資料庫要是同一個時間點的組合（第 9 節）。
 

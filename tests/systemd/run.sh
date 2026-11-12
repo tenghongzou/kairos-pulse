@@ -29,11 +29,14 @@ HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
 SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
-T1=0.9.1-test.1
-T2=0.9.1-test.2
-T3=0.9.1-test.3
-T4=0.9.1-test.4
-T9=0.9.1-test.9
+# 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
+# 一定比 HEAD 新，不會被當成降版
+TV=$(echo "$V0" | awk -F. '{ printf "%d.%d.%d", $1, $2, $3 + 1 }')
+T1=$TV-test.1
+T2=$TV-test.2
+T3=$TV-test.3
+T4=$TV-test.4
+T9=$TV-test.9
 
 say() { printf '\n==> %s\n' "$*" >&2; }
 info() { printf '    %s\n' "$*" >&2; }
@@ -253,7 +256,7 @@ verify() {
     check "$1/$3：systemctl is-active pulse" "$(hx "$3" systemctl is-active pulse.service 2>&1)" '^active$'
     if [ "$3" != tar ]; then
         pv=$(pkg_version "$3")
-        # deb／rpm 的套件版本：0.9.1-test.1 → 0.9.1~test.1-1（nfpm）
+        # deb／rpm 的套件版本：0.10.1-test.1 → 0.10.1~test.1-1（nfpm）
         pre=$(printf '%s' "${7:-$6}" | sed 's/-/[~-]/; s/\./\\./g')
         check "$1/$3：套件資料庫的版本" "$pv" "^$pre-1\$"
     fi

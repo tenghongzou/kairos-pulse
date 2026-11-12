@@ -115,6 +115,26 @@ mod tests {
         assert_ne!(config_hash(&a), config_hash(&d));
     }
 
+    /// 遠端管理（0.10.0）：雙人覆核的開關與維護時段的預設時區是叢集的行為，節點之間必須一致
+    /// （不一致時 `KRS-W8505`；否則換手後送出的推送是否需要核准會跟著 leader 改變）。版本庫的目錄是
+    /// 節點本機的路徑
+    #[test]
+    fn remote_approval_and_timezone_are_shared_but_the_releases_dir_is_node_local() {
+        let a = AppConfig::default();
+        let mut b = AppConfig::default();
+        b.remote.rollout_approval = "required".into();
+        assert_ne!(config_hash(&a), config_hash(&b));
+        let mut c = AppConfig::default();
+        c.alerts.timezone = "+09:00".into();
+        assert_ne!(config_hash(&a), config_hash(&c));
+        let mut d = AppConfig::default();
+        d.remote.releases_dir = "/srv/kairos-b/releases".into();
+        assert_eq!(config_hash(&a), config_hash(&d));
+        assert!(is_node_local("remote.releases_dir"));
+        assert!(!is_node_local("remote.rollout_approval"));
+        assert!(!is_node_local("remote.allowed_signers"));
+    }
+
     #[test]
     fn classification_of_keys() {
         for k in [

@@ -67,6 +67,9 @@ cargo deny check                        # 需先 cargo install cargo-deny --lock
 | `tests/import.rs` | `kairos reports import`：Kairos 執行中拒絕（檔案鎖跨行程；主控台的寫入連線不得放掉這把鎖）、停止後匯入、重新啟動後匯出與清冊 |
 | `tests/export.rs` | 指標轉出（0.9.0，`kairos/EXPORT.md`）：`[export.prometheus]`、`[export.otlp]` 啟用的 Kairos 與 Pulse → 連線保存的 report 出現在 `GET /api/v1/export/prometheus`（`kairos api-token create` 的唯讀 token）→ OTLP/HTTP 推送到測試內的假 collector（`headers_file` 的標頭、semconv 名稱、`resource_attributes`）→ Pulse 結束後 `kairos_host_up` 為 0、不再輸出指標 → `/metrics` 有推送的計數 → 正常關機、日誌沒有 OTLP 錯誤 |
 | `tests/privacy.rs` | 個資保護（0.9.0，`kairos/PRIVACY.md`）：`[privacy]` 的假名化與網段（清冊、`agents.json`、JSONL 鏡像；`kairos hosts pseudonym`；`privacy.key` 為 0600）、仍連線中不能刪除、主控台 API 的個資匯出與刪除主機資料、`kairos hosts purge` 在 Kairos 執行中拒絕（`KRS-E4304`）與停止後刪除 |
+| `tests/remote.rs`、`tests/releases_cli.rs` | 集中設定與 Pulse 遠端升級（0.9.0／0.10.0，`crates/kairos-proto/REMOTE.md`）：以送出相同訊息的模擬 client 走完設定下發、版本匯入、維護時段與已排程的推送、分段下載、升級中的離線告警抑制到推送完成；`kairos releases import\|list\|delete` 與執行中的 Kairos 並用、版本庫檔案遺失的系統健康（`KRS-W8417`〔暫定〕）、外部 URL 的版本庫 |
+| `tests/postgres.rs` | PostgreSQL 儲存後端（0.10.0，`kairos/STORAGE.md` 第 19 節；需要 `KAIROS_TEST_PG_URL`，沒有設定時明確略過、`KAIROS_TEST_PG_REQUIRED=1` 時不可略過）：實際的 Kairos＋Pulse 跑在 PostgreSQL 上，補送不重複不缺號、重新啟動後載回主機、稽核鏈驗證、`kairos db migrate` 搬回 SQLite 後內容相同 |
+| `tests/cluster.rs` | 叢集模式（0.10.0，階段 A：主動／備援，`kairos/HA.md` 第 17.1 節；需要 PostgreSQL，只在 Linux）：兩個 Kairos＋Pulse 的容錯移轉（SIGKILL、`step-down`）後 durable 的資料不缺號不重複、凍結的舊 leader 被 fencing 擋下並以代碼 75 結束、排空、啟動保護；遠端管理在換手後的狀態（`remote_upgrade_state_survives_failover`：版本庫是節點本機的檔案、已排程的推送由接手的節點繼續、替換中主機的離線告警抑制從資料庫重建）。`database_outage_makes_nodes_wait_and_recover` 預設不執行（會停止測試用的資料庫容器） |
 
 - 第一次需要執行檔時，測試以 `cargo build -p kairos -p pulse` 建置到與測試相同的 target 目錄與 profile（已是最新時幾乎不花時間），所以測的一定是目前的原始碼；設定環境變數 `KP_E2E_BIN_DIR=<目錄>` 時改用該目錄中已建置好的執行檔、不建置。
 - 每個測試使用自己的暫存目錄（`<系統暫存目錄>/kp-e2e-*`）與隨機埠，可平行執行；每個等待都有逾時（30 秒）。測試失敗時保留暫存目錄（路徑印在輸出中）並附上兩端的 stdout／stderr。

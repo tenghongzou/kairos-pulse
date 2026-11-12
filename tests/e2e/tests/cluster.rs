@@ -8,6 +8,13 @@
 //!      `server.fallback_addresses` 重連；
 //!   3. 原本的節點重新啟動為備援；`kairos cluster step-down` 讓 leader 以結束代碼 75 結束，另一個節點接手；
 //!   4. 全程 durable 的 report **不遺失、不重複**（同一個 `boot_id` 的 `report_seq` 連續），稽核鏈完整。
+//! - `remote_upgrade_state_survives_failover`（叢集 × 遠端管理，0.10.0；HA.md 第 6.8 節）：
+//!   1. `kairos releases import` 在**備援**節點執行：版本登記在共用的資料庫，發佈檔只在該節點；主動節點的
+//!      系統健康標出「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕）；
+//!   2. 已排程（`scheduled`）的推送在主動節點被強制終止後，由接手的節點**從資料庫**繼續：到 `starts_at`
+//!      開始、提議主機，發佈檔由接手節點自己的版本庫提供；
+//!   3. 主機替換中（`applying`）時再換手一次：接手的節點從資料庫重建「升級中」的離線告警抑制，主機斷線
+//!      不開離線事件；回報成功後推送完成，之後的離線照常開事件。
 //! - `a_second_solo_kairos_is_refused`：沒有啟用叢集模式的 Kairos 連到已有另一個 Kairos 在服務的 schema 時
 //!   拒絕啟動（`KRS-E4402`，結束代碼 3）。
 //!
@@ -24,7 +31,11 @@ use kp_e2e::{
     GOOD, KAIROS_STARTED, Kairos, PULSE_REGISTERED, Proc, Pulse, TestDir, WAIT, poll_until,
     run_to_exit, test_pki,
 };
+#[cfg(target_os = "linux")]
+use kp_e2e::{RawClient, api_request, start_kairos, workspace_root};
 use serde_json::Value;
+#[cfg(target_os = "linux")]
+use serde_json::json;
 
 /// 換手相關的等待上限：租約 15 秒＋取得 2 秒＋載入，再加上 Pulse 的退避（2、4、8、16 秒…）
 const FAILOVER_WAIT: Duration = Duration::from_secs(90);
@@ -138,9 +149,14 @@ fn cli(dir: &Path, args: &[&str]) -> (i32, Proc) {
 
 /// 以備援身分啟動（不等「已啟動，監聽」：備援不監聽）；回傳行程
 fn spawn_standby(n: &Node) -> Proc {
+    spawn_standby_env(n, &[])
+}
+
+/// [`spawn_standby`]，另帶環境變數（測試掛鉤）
+fn spawn_standby_env(n: &Node, envs: &[(&str, &str)]) -> Proc {
     n.kairos.release_ports();
     kp_e2e::release_port(n.obs_port);
-    let mut p = Proc::spawn("kairos", &n.kairos.dir, &["--config", "kairos.toml"], &[]);
+    let mut p = Proc::spawn("kairos", &n.kairos.dir, &["--config", "kairos.toml"], envs);
     p.wait_for("等待取得 leader 租約", WAIT);
     p
 }
@@ -499,6 +515,12 @@ fn leader_failover_keeps_durable_data() {
 /// 建立兩個節點的叢集並啟動：A 是主動節點、B 是備援（金鑰已分發）。回傳（A 的行程, B 的行程）
 #[cfg(target_os = "linux")]
 fn start_pair(root: &TestDir, a: &Node, b: &Node) -> (Proc, Proc) {
+    start_pair_env(root, a, b, &[])
+}
+
+/// [`start_pair`]，兩個節點另帶環境變數（測試掛鉤）
+#[cfg(target_os = "linux")]
+fn start_pair_env(root: &TestDir, a: &Node, b: &Node, envs: &[(&str, &str)]) -> (Proc, Proc) {
     let (code, p) = cli(&a.kairos.dir, &["cluster", "init"]);
     assert_eq!(code, 0, "{}", p.dump());
     let pw = root.sub("secrets").join("keys.password");
@@ -519,8 +541,8 @@ fn start_pair(root: &TestDir, a: &Node, b: &Node) -> (Proc, Proc) {
         assert_eq!(code, 0, "{}", p.dump());
     }
     kp_e2e::release_port(a.obs_port);
-    let ka = a.kairos.start();
-    let kb = spawn_standby(b);
+    let ka = start_kairos(&a.kairos.dir, envs, &a.kairos.ports(), &[KAIROS_STARTED]);
+    let kb = spawn_standby_env(b, envs);
     assert!(
         poll_until(WAIT, || {
             readyz(b.obs_port, "").is_some_and(|(s, c)| s == 503 && c["cluster"] == "standby")
@@ -529,6 +551,343 @@ fn start_pair(root: &TestDir, a: &Node, b: &Node) -> (Proc, Proc) {
         kb.dump()
     );
     (ka, kb)
+}
+
+/// 叢集 × 遠端管理（0.10.0，HA.md 第 6.8 節的盤點）：版本庫是節點本機的檔案、已排程的推送與「升級中」的
+/// 離線告警抑制在換手後由接手的節點從資料庫重建。Pulse 以送出相同訊息的模擬 client 代替（與
+/// `tests/remote.rs` 相同）。
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_upgrade_state_survives_failover() {
+    const TS: &str = "2026-11-20T02:00:00.000Z";
+    const TAR: &str = "pulse-0.9.1-5e6f7a8-linux-x86_64.tar.gz";
+    // 推送引擎在啟動（接手）後 1 分鐘內不提議新的主機：測試縮短
+    const ENVS: [(&str, &str); 1] = [("KAIROS_TEST_REMOTE_START_GRACE_MS", "1")];
+    let Some(pg) = test_database("remote_upgrade_state_survives_failover") else {
+        return;
+    };
+    let root = TestDir::new("cluster-remote");
+    let schema = new_schema();
+    let a = node(&root, "kairos-a", &pg, &schema, true);
+    let b = node(&root, "kairos-b", &pg, &schema, true);
+    let vectors = workspace_root().join("crates/kairos-proto/testdata/release");
+    for n in [&a, &b] {
+        let path = n.kairos.dir.join("kairos.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "\n[remote]\nallowed_signers = {:?}\n",
+            vectors.join("allowed_signers").to_string_lossy()
+        ));
+        std::fs::write(&path, text).unwrap();
+    }
+    let (mut ka, mut kb) = start_pair_env(&root, &a, &b, &ENVS);
+    let token = {
+        let (code, p) = cli(
+            &a.kairos.dir,
+            &[
+                "api-token",
+                "create",
+                "--name",
+                "admin",
+                "--role",
+                "admin",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "{}", p.dump());
+        let doc: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+        doc["data"]["token"].as_str().unwrap().to_string()
+    };
+    let get = |port: u16, path: &str| api_request(port, "GET", path, &token, None);
+    let post = |port: u16, path: &str, body: Value| {
+        api_request(
+            port,
+            "POST",
+            path,
+            &token,
+            Some(("application/json", body.to_string().as_bytes())),
+        )
+    };
+    let remote_health = |port: u16| -> Value {
+        let (s, v) = get(port, "/api/v1/system/health");
+        assert_eq!(s, 200, "{v}");
+        v["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["id"] == "remote")
+            .cloned()
+            .expect("remote 項目")
+    };
+    let offline_events = |port: u16| -> Vec<Value> {
+        let (s, v) = get(port, "/api/v1/alerts?limit=200");
+        assert_eq!(s, 200, "{v}");
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["rule_id"] == "sys.host_offline" && e["agent_id"] == GOOD.agent_id)
+            .cloned()
+            .collect()
+    };
+    let hello = |version: &str| {
+        json!({
+            "type": "hello", "seq": 1, "proto": 1, "proto_min": 1, "proto_max": 2,
+            "features": ["metrics", "config", "upgrade"],
+            "agent_id": GOOD.agent_id, "hostname": "web-01", "agent_version": version,
+            "heartbeat_interval_ms": 15000, "ts": TS, "tags": ["env:prod"],
+            "os": {"name": "Ubuntu", "version": "24.04", "arch": "x86_64"},
+            "install": {"method": "tar", "upgrade": "ready", "config": "enabled"}
+        })
+    };
+    let (pa, pb) = (a.kairos.console_port, b.kairos.console_port);
+
+    // ---- 1. 版本庫是節點本機的檔案 ----
+    // 在備援節點匯入（CLI 直接寫共用的資料庫；發佈檔存在 B 的 data/releases/）
+    let bundle = root.sub("bundle");
+    std::fs::create_dir_all(&bundle).unwrap();
+    for f in [
+        "SHA256SUMS",
+        "SHA256SUMS.sig",
+        "pulse-0.9.1-5e6f7a8-release.json",
+        TAR,
+    ] {
+        std::fs::copy(vectors.join(f), bundle.join(f)).unwrap();
+    }
+    let import = |n: &Node| -> Value {
+        let (code, p) = cli(
+            &n.kairos.dir,
+            &["releases", "import", bundle.to_str().unwrap(), "--json"],
+        );
+        assert_eq!(code, 0, "{}", p.dump());
+        serde_json::from_str(p.stdout().trim()).unwrap()
+    };
+    let v = import(&b);
+    assert_eq!(
+        (
+            v["data"]["created"].as_bool(),
+            v["data"]["verified"].as_bool()
+        ),
+        (Some(true), Some(true)),
+        "{v}"
+    );
+    assert_eq!(v["data"]["stored"], json!([TAR]), "{v}");
+    // 主動節點看到同一個版本（資料庫），但檔案不在它的版本庫：系統健康警告
+    let (s, v) = get(pa, "/api/v1/releases");
+    assert_eq!(
+        (s, v["data"][0]["version"].as_str()),
+        (200, Some("0.9.1")),
+        "{v}"
+    );
+    let health = remote_health(pa);
+    assert_eq!(
+        (health["status"].as_str(), health["product_code"].as_str()),
+        (Some("warning"), Some("KRS-W8417")),
+        "{health}"
+    );
+    assert_eq!(health["values"]["release_files_missing"], 1, "{health}");
+    // 在主動節點再匯入一次：補上檔案（版本已存在）
+    let v = import(&a);
+    assert_eq!(v["data"]["created"], false, "{v}");
+    assert_eq!(v["data"]["stored"], json!([TAR]), "{v}");
+    let health = remote_health(pa);
+    assert_eq!(health["values"]["release_files_missing"], 0, "{health}");
+    // 備援節點上的 list 讀同一個資料庫、檢查自己的檔案
+    let (code, p) = cli(&b.kairos.dir, &["releases", "list", "--json"]);
+    assert_eq!(code, 0, "{}", p.dump());
+    let list: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    assert_eq!(list["data"]["releases"][0]["version"], "0.9.1", "{list}");
+
+    // 主機離線規則的寬限改為 0 秒（存在資料庫，換手後仍有效）
+    let (s, v) = api_request(
+        pa,
+        "PUT",
+        "/api/v1/alert-rules/sys.host_offline",
+        &token,
+        Some((
+            "application/json",
+            json!({"params": {"grace_secs": 0}}).to_string().as_bytes(),
+        )),
+    );
+    assert_eq!(s, 200, "{v}");
+
+    // ---- 2. 已排程的推送在換手後繼續 ----
+    let mut c = RawClient::connect(a.kairos.port, GOOD);
+    c.send(&hello("0.9.0"));
+    let ack = c.recv();
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    c.send(&json!({"type": "report", "seq": 2, "ts": TS, "metrics": [{"name": "system.cpu.usage", "value": 3.0, "unit": "%"}]}));
+    assert_eq!(c.recv()["type"], "ack");
+    let rfc3339 = |t: time::OffsetDateTime| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            t.year(),
+            u8::from(t.month()),
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second()
+        )
+    };
+    let starts_at = Instant::now() + Duration::from_secs(40);
+    let spec = json!({
+        "name": "換手", "target_version": "0.9.1", "selector": {"agent_ids": [GOOD.agent_id]},
+        "waves": [{"size": "rest"}],
+        "schedule": {
+            "starts_at": rfc3339(time::OffsetDateTime::now_utc() + time::Duration::seconds(40))
+        }
+    });
+    let (s, v) = post(pa, "/api/v1/rollouts/preview", spec.clone());
+    assert_eq!((s, v["data"]["eligible"].as_i64()), (200, Some(1)), "{v}");
+    let (s, v) = post(pa, "/api/v1/rollouts", spec);
+    assert_eq!(s, 201, "{v}");
+    let id = v["data"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post(
+        pa,
+        &format!("/api/v1/rollouts/{id}/submit"),
+        json!({"confirm": "升級 1 台"}),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["state"], "scheduled", "{v}");
+
+    let killed = Instant::now();
+    ka.kill();
+    drop(c);
+    kb.wait_for("KRS-I8501", FAILOVER_WAIT);
+    kb.wait_for(KAIROS_STARTED, FAILOVER_WAIT);
+    eprintln!(
+        "REMOTE_FAILOVER_SECS={:.2}（已排程的推送；強制終止 → 備援開始監聽）",
+        killed.elapsed().as_secs_f64()
+    );
+    // 接手的節點從資料庫看到同一個推送；還沒到 starts_at 時仍是 scheduled
+    let before_start = Instant::now() < starts_at;
+    let (s, v) = get(pb, &format!("/api/v1/rollouts/{id}"));
+    assert_eq!(s, 200, "{v}");
+    if before_start {
+        assert_eq!(v["data"]["state"], "scheduled", "{v}");
+        assert_eq!(v["data"]["next_action"]["code"], "scheduled", "{v}");
+    }
+    assert_eq!(v["data"]["name"], "換手", "{v}");
+    // B 有自己匯入的發佈檔
+    let health = remote_health(pb);
+    assert_eq!(health["values"]["release_files_missing"], 0, "{health}");
+    // 主機重新連到 B：到 starts_at 後由 B 的推送引擎開始並提議
+    let mut c = RawClient::connect(b.kairos.port, GOOD);
+    c.send(&hello("0.9.0"));
+    let ack = c.recv();
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    let mut seq = 1;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let upgrade_id = loop {
+        seq += 1;
+        c.send(&json!({"type": "heartbeat", "seq": seq, "ts": TS}));
+        let ack = c.recv();
+        assert_eq!(ack["type"], "ack", "{ack}");
+        if let Some(u) = ack["pending"]["upgrade_id"].as_str() {
+            break u.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "接手後已排程的推送沒有開始提議：{ack}\n{}",
+            kb.dump()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        Instant::now() + Duration::from_secs(1) >= starts_at,
+        "不應早於 starts_at 提議"
+    );
+    let (_, v) = get(pb, &format!("/api/v1/rollouts/{id}"));
+    assert_eq!(v["data"]["state"], "running", "{v}");
+    seq += 1;
+    c.send(&json!({"type": "upgrade_get", "seq": seq, "ts": TS, "upgrade_id": upgrade_id}));
+    let offer = c.recv();
+    assert_eq!(offer["type"], "upgrade_offer", "{offer}");
+    assert_eq!(offer["artifact"]["filename"], TAR, "{offer}");
+    seq += 1;
+    c.send(&json!({"type": "upgrade_status", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "state": "accepted", "from_version": "0.9.0", "to_version": "0.9.1", "code": null, "detail": ""}));
+    assert_eq!(c.recv()["type"], "ack");
+    // 發佈檔由 B 自己的版本庫提供（在 B 還是備援時以 CLI 匯入的）
+    let tar = std::fs::read(vectors.join(TAR)).unwrap();
+    let mut data = Vec::new();
+    loop {
+        seq += 1;
+        c.send(&json!({"type": "upgrade_chunk_get", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "filename": TAR, "offset": data.len(), "length": 32768}));
+        let chunk = c.recv();
+        assert_eq!(chunk["type"], "upgrade_chunk", "{chunk}");
+        let m: kairos_proto::mgmt::UpgradeChunk = serde_json::from_value(chunk).unwrap();
+        data.extend(m.decode_data().unwrap());
+        if m.eof {
+            break;
+        }
+    }
+    assert_eq!(data, tar);
+    for state in ["staged", "applying"] {
+        seq += 1;
+        c.send(&json!({"type": "upgrade_status", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "state": state, "from_version": "0.9.0", "to_version": "0.9.1", "code": null, "detail": ""}));
+        assert_eq!(c.recv()["type"], "ack");
+    }
+
+    // ---- 3. 替換中再換手一次：離線告警抑制由接手的節點從資料庫重建 ----
+    let mut ka = spawn_standby_env(&a, &ENVS);
+    assert!(
+        poll_until(WAIT, || {
+            readyz(a.obs_port, "").is_some_and(|(s, c)| s == 503 && c["cluster"] == "standby")
+        }),
+        "{}",
+        ka.dump()
+    );
+    kb.kill();
+    drop(c);
+    ka.wait_for("KRS-I8501", FAILOVER_WAIT);
+    ka.wait_for(KAIROS_STARTED, FAILOVER_WAIT);
+    let (_, v) = get(pa, &format!("/api/v1/rollouts/{id}/hosts"));
+    assert_eq!(v["data"][0]["state"], "applying", "{v}");
+    // 主機（還是舊版：輔助程式尚未替換）連上接手的節點後又斷線（替換、重新啟動）。這次離線發生在 A 啟動
+    // 之後、寬限 0 秒：沒有抑制的話，告警引擎（每 5 秒一輪）會開離線事件
+    let mut c = RawClient::connect(a.kairos.port, GOOD);
+    c.send(&hello("0.9.0"));
+    let ack = c.recv();
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    assert!(ack["pending"].get("upgrade_id").is_none(), "{ack}");
+    // 推送引擎至少跑過一輪（每 5 秒；重建抑制狀態）之後才斷線
+    std::thread::sleep(Duration::from_secs(8));
+    c.close();
+    std::thread::sleep(Duration::from_secs(15));
+    assert!(
+        offline_events(pa).is_empty(),
+        "換手後替換中的主機不應該有離線事件：{:?}\n{}",
+        offline_events(pa),
+        ka.dump()
+    );
+    // 新版連上、回報成功：推送完成
+    let mut c = RawClient::connect(a.kairos.port, GOOD);
+    c.send(&hello("0.9.1"));
+    let ack = c.recv();
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    c.send(&json!({"type": "upgrade_status", "seq": 2, "ts": TS, "upgrade_id": upgrade_id, "state": "succeeded", "from_version": "0.9.0", "to_version": "0.9.1", "code": "PLS-I8416", "detail": ""}));
+    assert_eq!(c.recv()["type"], "ack");
+    assert!(
+        poll_until(WAIT, || {
+            get(pa, &format!("/api/v1/rollouts/{id}")).1["data"]["state"] == "completed"
+        }),
+        "推送沒有完成\n{}",
+        ka.dump()
+    );
+    let (_, v) = get(pa, &format!("/api/v1/rollouts/{id}/hosts"));
+    assert_eq!(v["data"][0]["state"], "succeeded", "{v}");
+    assert!(offline_events(pa).is_empty(), "{:?}", offline_events(pa));
+    // 對照：升級結束後抑制解除，同一台主機離線就照常開事件（證明上面的「沒有事件」來自抑制）
+    c.close();
+    assert!(
+        poll_until(Duration::from_secs(40), || !offline_events(pa).is_empty()),
+        "升級結束後的離線沒有開事件\n{}",
+        ka.dump()
+    );
+    let (code, _) = ka.stop();
+    assert_eq!(code, 0, "{}", ka.dump());
+    let (code, v) = cli(&a.kairos.dir, &["audit", "verify", "--json"]);
+    assert_eq!(code, 0, "{}", v.dump());
 }
 
 /// 「系統關機」稽核紀錄的筆數（`kairos audit list --action system.shutdown --json` 的 `data.total`）：

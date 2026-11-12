@@ -573,7 +573,7 @@ mv /opt/kairos/data/pki/server.pem.new /opt/kairos/data/pki/server.pem
 
 **從 0.7 升級到 0.8：指標擴充（schema v8）、套件、`kairos pki`、aarch64**。資料庫升級到 schema v8（計數器的速率與推算序列、主機資產、行程快照；第一次啟動時重建 `series`，大型資料庫會多花一些時間）：**升級前以 `kairos db backup` 備份**，升級後 0.7 無法開啟。容量估算由每台約 52 MB 改為約 129 MB：主機多、沿用預設 `storage.max_total_bytes` 的部署依 `STORAGE.md` 第 10 節調高上限或縮短保留天數。協定版本不變，其他設定不需要修改。0.8 新增的 deb／rpm 是另一種安裝方式：既有的 tar.gz 安裝**不要**直接改裝套件（套件的預設設定是全新安裝用的；兩者版面相同，但 `kairos.service` 會從 `/etc/systemd/system` 換到 `/usr/lib/systemd/system`），照下方的步驟換執行檔即可。新版 `kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`（`kairos pki init` 的根 CA 暫存目錄；目錄不存在時沒有影響），手動 PKI 的部署可以沿用舊 unit。**`auth.client_ca`（安全修正）**：0.8 起 8443 一律拒絕經過已退役簽發 CA 的用戶端憑證鏈，`auth.client_ca` 指向根 CA 或代理 CA 的既有部署不需要修改設定也受到保護（`PKI.md` 第 15.4 節第 1 項）。仍**建議**改為 `client_ca = "/opt/kairos/data/pki/issuing-cas.pem"`：以根 CA 當信任錨時，根 CA 底下任何其他 CA 簽出的用戶端憑證都會通過，且不受 Kairos 的 CRL 管理。改之前以 `kairos pki certificates list` 與主控台 S04 確認每台主機都已改用 Kairos 簽發的憑證；仍有手動簽發的憑證時，`auth.client_ca` 只保留那張舊代理 CA（不要放根 CA），等那些主機重新註冊後再改。
 
-**從 0.9 升級到 0.10：升級推送的雙人覆核（schema v10〔草稿，版本號在整合時定案〕）**。資料庫升級到 schema v10（`rollouts` 新增送出者與退回原因的欄位）：**升級前以 `kairos db backup` 備份**，升級後 0.9 無法開啟。雙人覆核預設關閉；要求每個升級推送都由另一位管理員核准時，在 `kairos.toml` 的 `[remote]` 加上 `rollout_approval = "required"` 後重新啟動（只能在設定檔改；至少要有兩位管理員帳號，API token 不能核准）。協定不變，0.9 與 0.10 的 Kairos／Pulse 可任意混用；推送的排程、維護時段與自訂批次不需要升級 Pulse，外部 URL 的版本庫需要 Pulse 0.10 並在每台主機的 `pulse.toml` 設定 `upgrade.url_allowlist`（`pulse/packaging/INSTALL.md` 第 10.1 節）。
+**從 0.9 升級到 0.10：PostgreSQL 後端、叢集模式與遠端管理的擴充（schema v11）**。資料庫由 v9 依序升級到 schema v10（叢集協調的資料表；單機與 SQLite 上保持空白）與 v11（`rollouts` 新增送出者與退回原因的欄位），第一次以 0.10.0 啟動（或任何開啟資料庫的 CLI）時在一個交易中自動套用：**升級前以 `kairos db backup <檔案> --include-keys` 備份**，升級後 0.9 無法開啟（降版從備份還原）。預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`、`rollout_approval = "none"`）下不需要修改 `kairos.toml`。要改用 PostgreSQL 見附錄 D（先升級到 0.10.0 並啟動一次，再以 `kairos db migrate --to postgres` 搬移：來源必須已是 v11），叢集部署見附錄 H。雙人覆核預設關閉；要求每個升級推送都由另一位管理員核准時，在 `kairos.toml` 的 `[remote]` 加上 `rollout_approval = "required"` 後重新啟動（只能在設定檔改；至少要有兩位管理員帳號，API token 不能核准）。協定不變，0.9 與 0.10 的 Kairos／Pulse 可任意混用；推送的排程、維護時段與自訂批次不需要升級 Pulse，外部 URL 的版本庫需要 Pulse 0.10 並在每台主機的 `pulse.toml` 設定 `upgrade.url_allowlist`（`pulse/packaging/INSTALL.md` 第 10.1 節）。
 
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
@@ -742,7 +742,7 @@ sudo systemctl start kairos
 ```
 
 - `--check-config` 的 `database` 項目回報 PostgreSQL 的版本與 schema 的狀態；連不上為 `KRS-E4401`，不符合需求（版本、編碼、連到備庫、schema 不是 Kairos 的）為 `KRS-E4402`。
-- 第一次啟動時建立 schema（0.10.0 為 v10）；既有的 v9 schema 由第一個以新版啟動的 Kairos（或開啟資料庫的 CLI）自動升級到 v10（`STORAGE.md` 第 20 節）。啟動時連不上資料庫，Kairos 以結束代碼 3 結束（`KRS-E4401`；systemd 不自動重試，修正後 `systemctl start kairos`；叢集模式的節點不結束、持續重試，見附錄 H）。執行中資料庫中斷時 Kairos 不會結束：report 回 `storage_unavailable`（Pulse 0.3 以上把取樣留在本機緩衝，恢復後補送）、`/readyz` 回 503，資料庫恢復後自動重新連線。
+- 第一次啟動時建立 schema（0.10.0 為 v11）；較舊的 schema（PostgreSQL 後端從 v9 開始）由第一個以新版啟動的 Kairos（或開啟資料庫的 CLI）自動升級到 v11（`STORAGE.md` 第 20.3 節）。啟動時連不上資料庫，Kairos 以結束代碼 3 結束（`KRS-E4401`；systemd 不自動重試，修正後 `systemctl start kairos`；叢集模式的節點不結束、持續重試，見附錄 H）。執行中資料庫中斷時 Kairos 不會結束：report 回 `storage_unavailable`（Pulse 0.3 以上把取樣留在本機緩衝，恢復後補送）、`/readyz` 回 503，資料庫恢復後自動重新連線。
 - 隨附的 systemd unit 不限制對外連線的位址（`RestrictAddressFamilies` 已包含 `AF_INET`、`AF_INET6`、`AF_UNIX`），不需要修改；自行加了 `IPAddressDeny` 的部署要允許資料庫的位址。
 
 ### D.3 從既有的 SQLite 搬到 PostgreSQL
@@ -789,7 +789,8 @@ sudo systemctl start kairos
 - **PROXY protocol v2**：經 L4 負載平衡器時，Kairos 看到的來源位址是負載平衡器的位址（每 IP 上限、註冊的來源位址、稽核的 `actor_ip`、主機的 `peer` 都是它）。請把負載平衡器的位址加入 `server.per_ip_allowlist`，或改用虛擬 IP／`fallback_addresses`（第 H.3 節）。
 - **主控台的叢集畫面、`POST` 的排空／交還 API**：叢集的狀態看 `kairos cluster status`、系統健康的 `cluster` 項目與 `GET /api/v1/cluster`；排空與交還只有 CLI。
 - **叢集專用的系統告警規則**：節點失聯、金鑰不一致等不會產生 Kairos 的告警事件；請以 Prometheus 規則（`kairos-alerts.example.yml` 最後「叢集模式」的三條規則）或外部監控補上。
-- **遠端升級版本庫的跨節點同步**：`<資料目錄>/releases/` 是節點本機的檔案，**每個節點要各自匯入相同的 Pulse 發佈版本**；否則接手的節點沒有發佈檔，進行中的升級推送會下載失敗。
+- **遠端升級版本庫的跨節點同步**：`<資料目錄>/releases/` 是節點本機的檔案，**每個節點要各自匯入相同的 Pulse 發佈版本**；否則接手的節點沒有發佈檔，進行中的升級推送會下載失敗。做法：把同一次發佈的目錄複製到每個節點，各執行一次 `sudo -u kairos /opt/kairos/kairos releases import <目錄> --config /opt/kairos/kairos.toml`（備援節點也可以執行；版本已在資料庫時只補上這個節點的檔案）。主控台的上傳只存到當時的主動節點。接手的節點缺少檔案時，它的系統健康「遠端管理」顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕）；備援節點可以用 `kairos releases list` 事先確認（缺少的檔案標為「檔案遺失」）。外部 URL 的版本庫（`--external`）不保存發佈檔，不需要逐節點匯入。
+- **雙人覆核與排程**：`[remote] rollout_approval` 在所有節點要相同（不同時 `KRS-W8505`；否則換手後新送出的推送是否需要核准會跟著主動節點改變）。已排程與待核准的推送在資料庫中，換手後由接手的節點繼續；排程與維護時段以主動節點的系統時鐘判斷，請讓所有節點對時（NTP／chrony）。
 - 換手後告警規則的 `for` 計時與通知的速率限制重新計算（它們在主動節點的記憶體中）；主控台的工作階段在資料庫中，換手後仍有效。
 
 **前置條件**：
@@ -1005,7 +1006,7 @@ sudo -u kairos /opt/kairos/kairos cluster drain kairos-b --config /opt/kairos/ka
   1. 升級備援節點（停止 → 換上新版 → 啟動，第 11 節；以套件升級時 `systemctl try-restart` 會自動重新啟動），確認它回到 `standby`；
   2. 在主動節點 `systemctl stop kairos`（正常關機會交還租約），升級好的節點接手；
   3. 升級原本的主動節點並啟動，它成為備援。
-- **schema 改變的版本**（CHANGELOG 會註明；例如 PostgreSQL 後端的 v9 → v10）：**停止所有節點 → 升級所有節點的執行檔 → 啟動第一個節點**（它在啟動時升級 schema）**→ 啟動其餘節點**。版本較舊的節點看到較新的 schema 時拒絕啟動（`KRS-E4405`）。升級前先備份資料庫。
+- **schema 改變的版本**（CHANGELOG 會註明；例如 PostgreSQL 後端的 v9 → v11）：**停止所有節點 → 升級所有節點的執行檔 → 啟動第一個節點**（它在啟動時升級 schema）**→ 啟動其餘節點**。版本較舊的節點看到較新的 schema 時拒絕啟動（`KRS-E4405`）。升級前先備份資料庫。
 
 **移除節點**：停止該節點（`systemctl stop kairos`，並 `systemctl disable kairos` 避免它再啟動），之後在任何一個節點執行：
 
@@ -1042,7 +1043,7 @@ sudo -u kairos /opt/kairos/kairos cluster forget kairos-b --config /opt/kairos/k
 | 備援節點的 `/readyz` 連不上（connection refused） | 沒有設定 `observability.listen`：備援節點不監聽主控台，探針只在這個監聽上提供 |
 | 備援節點的 `/metrics` 只有幾個指標 | 預期的行為：只有版本與 `kairos_cluster_*`；完整的指標在取得租約之後才有 |
 | 主動節點被 `kairos cluster drain` 之後沒有回來 | 排空的 leader 以結束代碼 0 結束，systemd 不會重新啟動；`systemctl start kairos` |
-| 換手後 Pulse 的升級推送下載失敗 | 接手的節點沒有匯入那個發佈版本（版本庫是節點本機的檔案）。在每個節點匯入相同的發佈版本 |
+| 換手後 Pulse 的升級推送下載失敗；系統健康的「遠端管理」顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕） | 接手的節點沒有匯入那個發佈版本（版本庫是節點本機的檔案）。在每個節點執行 `kairos releases import <目錄>` 匯入相同的發佈版本（可以重複執行，只補上缺少的檔案） |
 | 經 HAProxy 時 agent 被 `KRS-W2201`（每 IP 上限）拒絕 | 所有連線的來源都是 HAProxy 的位址。把它加入 `server.per_ip_allowlist` |
 
 ## 附錄 P：以 openssl 手動管理 PKI（0.7 以前的部署）

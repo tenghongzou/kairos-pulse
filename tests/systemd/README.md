@@ -34,11 +34,11 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 | 目錄 | 內容 |
 |---|---|
 | `kairos` | Kairos（tar.gz） |
-| `0.9.0` | Pulse HEAD（`pulse/Cargo.toml` 的版本）：tar.gz、deb、rpm、`pulse-install.sh`、發佈清單 |
-| `0.9.1-test.1`、`0.9.1-test.3` | 同一份程式碼，只改版本號 |
-| `0.9.1-test.2`、`0.9.1-test.4` | 另加「沒有參數啟動（服務）時立刻以結束代碼 1 結束」：通過輔助程式的預檢（`--version`、`check-config`），啟動後一直崩潰 |
+| `<V0>`（例如 `0.10.0`） | Pulse HEAD（`pulse/Cargo.toml` 的版本）：tar.gz、deb、rpm、`pulse-install.sh`、發佈清單 |
+| `<N>-test.1`、`<N>-test.3` | 同一份程式碼，只改版本號。`<N>` 是 `<V0>` 的下一個 PATCH（`0.10.0` → `0.10.1`；`build.sh` 與 `run.sh` 各自由 `pulse/Cargo.toml` 算出），所以測試用的版本一定比 HEAD 新，不會被當成降版 |
+| `<N>-test.2`、`<N>-test.4` | 另加「沒有參數啟動（服務）時立刻以結束代碼 1 結束」：通過輔助程式的預檢（`--version`、`check-config`），啟動後一直崩潰 |
 | `evil-a` | test.1 的檔案，`SHA256SUMS` 以沒有人信任的金鑰簽章 |
-| `0.9.1-test.9` | test.1 的檔案改名為 test.9，以只有 Kairos 信任的金鑰簽章 |
+| `<N>-test.9` | test.1 的檔案改名為 test.9，以只有 Kairos 信任的金鑰簽章 |
 
 簽章一律用測試時以 `ssh-keygen -t ed25519` 產生的臨時金鑰（`packaging/sign-release.sh`，namespace
 `kairos-pulse-release`）；Pulse 的信任錨（`/etc/kairos-pulse/allowed_signers`）只有 `release`，Kairos 的
@@ -70,8 +70,8 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 
 | 情境 | 推送 | 預期 |
 |---|---|---|
-| `rollback-first`（b0） | 0.9.0 → test.2（崩潰） | 第一次遠端升級：本機沒有 0.9.0 的已驗證發佈，回滾檔不可信（REMOTE.md 第 17.3 節第 1 項）→ 三台以 `pulse.prev` 換回執行檔、`rolled_back`（`PLS-W8407`）；deb／rpm 的套件資料庫仍是 test.2，`detail` 有 `binary_restored_package_db_shows_0.9.1-test.2` |
-| `upgrade`（a） | 0.9.0 → test.1 | 套件資料庫是 test.2（比目標新：rpm 需要 `--oldpackage`）。三台 `succeeded`（`PLS-I8416`）；`--version`、`dpkg-query`／`rpm -q`、Kairos 的 `agent_version` 為 test.1；tar 的 `pulse.prev` 為 0.9.0；推送 `completed` |
+| `rollback-first`（b0） | `<V0>` → test.2（崩潰） | 第一次遠端升級：本機沒有 `<V0>` 的已驗證發佈，回滾檔不可信（REMOTE.md 第 17.3 節第 1 項）→ 三台以 `pulse.prev` 換回執行檔、`rolled_back`（`PLS-W8407`）；deb／rpm 的套件資料庫仍是 test.2，`detail` 有 `binary_restored_package_db_shows_0.9.1-test.2` |
+| `upgrade`（a） | `<V0>` → test.1 | 套件資料庫是 test.2（比目標新：rpm 需要 `--oldpackage`）。三台 `succeeded`（`PLS-I8416`）；`--version`、`dpkg-query`／`rpm -q`、Kairos 的 `agent_version` 為 test.1；tar 的 `pulse.prev` 為 0.9.0；推送 `completed` |
 | `rollback`（b） | test.1 → test.2（崩潰） | 三台 `rolled_back`（`PLS-W8407`，`crash_restart`）、回到 test.1 且服務正常；deb／rpm 以 `rollback_artifact`（`dpkg -i`／`rpm -U --oldpackage --replacepkgs`）回滾，套件資料庫也是 test.1 |
 | `reboot`（c） | test.1 → test.3 | 輔助程式在健康確認（`state.json` 的 `replaced`）時重新開機；開機後 `pulse-upgrade.path` 再次觸發、接續健康確認 → `succeeded` |
 | `reboot-rollback`（c2） | test.3 → test.4（崩潰） | 回滾確認（`rolling_back`）時重新開機；開機後接續 → `rolled_back`、回到 test.3 |
