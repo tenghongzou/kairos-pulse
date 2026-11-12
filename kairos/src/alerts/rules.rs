@@ -80,6 +80,8 @@ pub mod ids {
     pub const UPGRADE_ROLLBACK_FAILED: &str = "sys.upgrade_rollback_failed";
     /// 發佈簽章驗證失敗（0.9）
     pub const RELEASE_SIGNATURE_FAILED: &str = "sys.release_signature_failed";
+    /// 雙人覆核已關閉（0.10；REMOTE.md 第 5.4 節、ADR-0002 決策點 2i）
+    pub const ROLLOUT_APPROVAL_DISABLED: &str = "sys.rollout_approval_disabled";
 }
 
 /// 指標門檻（`metric_threshold`）的指標（METRICS.md 第 11.1 節）
@@ -515,6 +517,13 @@ pub fn builtins() -> Vec<Rule> {
             Critical,
             json!({"code": "KRS-E8401"}),
             "主機以本機信任錨驗證 Pulse 發佈包的簽章失敗：版本庫或傳輸可能被竄改，或信任錨與發佈不符。使用同一版本的推送全部暫停；推送繼續或取消時恢復。",
+        ),
+        sys(
+            ids::ROLLOUT_APPROVAL_DISABLED,
+            "雙人覆核已關閉",
+            Warning,
+            json!({}),
+            "Kairos 啟動時發現升級推送的雙人覆核（remote.rollout_approval）由 required 改為 none（與資料庫記錄的上一次設定不同）：送出的推送不再需要另一位管理員核准。這個設定只能在設定檔或環境變數修改；不是預期的變更時請檢查誰修改了設定。改回 required 並重新啟動後恢復，不會自己結束。啟用雙人覆核的單位請把這條規則接到通知管道。",
         ),
     ]
 }

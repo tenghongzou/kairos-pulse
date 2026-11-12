@@ -1100,8 +1100,27 @@ async fn run(
             {
                 Ok(svc) => {
                     svc.set_default_timezone(&config.alerts.timezone);
-                    svc.spawn_engine();
-                    info!(
+                    // 雙人覆核政策的前值比對與稽核（ADR-0002 決策點 2i）：在遠端管理開始接受請求（主控台
+                    // API、8443 的遠端管理訊息、推送引擎）之前寫入；寫入失敗時遠端管理不啟動
+                    let policy = svc
+                        .observe_approval_policy(
+                            config
+                                .provenance
+                                .source("remote.rollout_approval")
+                                .as_str(),
+                            &config
+                                .cluster
+                                .effective_node_id(&kp_obs::logfmt::hostname()),
+                        )
+                        .await;
+                    if let Err(e) = &policy {
+                        error!(
+                            "遠端管理無法啟動：無法記錄雙人覆核的設定（remote.rollout_approval）與稽核事件：{e}。不宣告 config、upgrade，主控台的集中設定、版本庫與升級推送回 503 remote_unavailable；既有主機照常連線。排除資料庫的問題後重新啟動 Kairos"
+                        );
+                    }
+                    if policy.is_ok() {
+                        svc.spawn_engine();
+                        info!(
                         "遠端管理：集中設定{}、遠端升級{}（需要 mTLS 與 Pulse 0.9.0 以上；版本庫 {}{}）",
                         if config.remote.config_enabled {
                             "啟用"
@@ -1120,7 +1139,8 @@ async fn run(
                             ""
                         }
                     );
-                    Some(svc)
+                    }
+                    policy.ok().map(|_| svc)
                 }
                 Err(e) => {
                     error!("遠端管理無法啟動（不宣告 config、upgrade；既有主機照常連線）：{e}");

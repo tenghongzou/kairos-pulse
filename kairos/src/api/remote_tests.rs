@@ -566,7 +566,7 @@ async fn releases_and_rollouts_over_https() {
     assert_eq!(r.status, 200);
     assert_eq!(
         body(&r)["meta"],
-        json!({"paused": 0, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "rollout_approval": "none"})
+        json!({"paused": 0, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "pending_approval_actionable": 0, "rollout_approval": "none", "rollout_approval_change": null})
     );
     let r = call(
         addr,
@@ -756,7 +756,7 @@ async fn releases_and_rollouts_over_https() {
     assert_eq!(list["data"].as_array().map(Vec::len), Some(0));
     assert_eq!(
         list["meta"],
-        json!({"paused": 1, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "rollout_approval": "none"})
+        json!({"paused": 1, "rollback_failed_unacknowledged": 0, "pending_approval": 0, "pending_approval_actionable": 0, "rollout_approval": "none", "rollout_approval_change": null})
     );
     // 系統健康的「遠端管理」：主控台暫停不算異常
     let viewer = token(&f, Role::Viewer);
@@ -787,7 +787,7 @@ async fn releases_and_rollouts_over_https() {
         it["summary"].as_str().unwrap().contains("已暫停 1 個"),
         "{it}"
     );
-    // 版本庫的檔案遺失（例如還原備份之後）：警告、KRS-W8417〔暫定〕；大小不符也算；補回後恢復
+    // 版本庫的檔案遺失（例如還原備份之後）：警告、KRS-W8417；大小不符也算；補回後恢復
     let store = f.remote.as_ref().unwrap().releases_dir.clone();
     let stored_file = std::fs::read_dir(&store)
         .unwrap()

@@ -175,6 +175,37 @@ fn who() -> Actor {
     }
 }
 
+/// 推送目前的送審摘要（伺服器依已固定的內容算出的確認字串與 digest）
+async fn submission_of(fx: &Fx, id: &str) -> super::submission::Submission {
+    let rid = id.to_string();
+    fx.svc
+        .db
+        .read(move |s| {
+            let r = s.get_rollout(&rid)?.unwrap();
+            Ok(super::submission::submission(&r, &s.rollout_hosts(&rid)?))
+        })
+        .await
+        .unwrap()
+}
+
+/// 核准的請求：帶上目前的確認字串與 digest（主控台的做法）
+async fn approval(fx: &Fx, id: &str) -> ApproveRequest {
+    let sub = submission_of(fx, id).await;
+    ApproveRequest {
+        confirm: Some(sub.confirm_text()),
+        digest: Some(sub.digest),
+        reason: None,
+    }
+}
+
+async fn approve(fx: &Fx, who: &Actor, id: &str) -> Result<Value, crate::api::http::ApiError> {
+    let req = approval(fx, id).await;
+    fx.svc.approve_rollout(who, id.to_string(), req).await
+}
+
+#[path = "approval_tests.rs"]
+mod approval_tests;
+
 fn profile(name: &str, settings: Value) -> ProfileInput {
     ProfileInput {
         name: Some(name.into()),
@@ -842,7 +873,7 @@ async fn rollout_offers_downloads_statuses_pauses_and_retries() {
         "options": {"canary_agent_ids": [A]},
     }))
     .unwrap();
-    let preview = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    let preview = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
     assert_eq!(preview["eligible"], 2);
     assert_eq!(preview["skipped"]["disabled"], 1);
     assert_eq!(preview["waves"], json!([1, 1]));
@@ -1337,11 +1368,11 @@ async fn preview_and_submit_use_the_live_hello_instead_of_the_inventory() {
     })
     .await;
     let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"tags": ["site:b"]}, "waves": [{"size": "rest"}]})).unwrap();
-    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
     assert_eq!(p["matched"], 0, "清冊沒有標籤：比對不到");
     // 剛連線、hello 已升到 0.9.0（tar、就緒、標籤 site:b），沒有協商 upgrade：資格依 hello
     connect_hello_only(&fx, A, "0.9.0", "tar", "ready");
-    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
     assert_eq!(
         (p["matched"].as_i64(), p["eligible"].as_i64()),
         (Some(1), Some(1)),
@@ -1388,7 +1419,7 @@ async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
     let body = |allow: bool| json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "waves": [{"size": "rest"}], "options": {"allow_no_rollback": allow}});
     let p = fx
         .svc
-        .preview_rollout(RolloutSpec::parse(&body(false)).unwrap(), None)
+        .preview_rollout(RolloutSpec::parse(&body(false)).unwrap(), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -1397,7 +1428,7 @@ async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
     );
     assert_eq!(p["confirm_text"], "升級 1 台");
     let spec = RolloutSpec::parse(&body(true)).unwrap();
-    let p = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
     assert_eq!(
         (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
         (Some(2), Some(1))
@@ -1715,7 +1746,7 @@ async fn scheduled_rollouts_start_later_and_only_offer_inside_windows() {
         })
     };
     let spec = RolloutSpec::parse(&body("x")).unwrap();
-    let preview = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    let preview = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
     assert_eq!(
         preview["window"],
         json!({"open": false, "next": ts(T0 + 60 * MIN)})
@@ -2013,7 +2044,7 @@ async fn four_wave_rollouts_advance_wave_by_wave() {
         ],
     }))
     .unwrap();
-    let preview = fx.svc.preview_rollout(spec.clone(), None).await.unwrap();
+    let preview = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
     assert_eq!(preview["waves"], json!([1, 1, 1, 1]));
     let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
         .as_str()
@@ -2130,11 +2161,7 @@ async fn approval_gates_the_rollout_until_someone_else_approves() {
         .unwrap();
     let id = created["id"].as_str().unwrap().to_string();
     // 草稿不能核准
-    let e = fx
-        .svc
-        .approve_rollout(&other, id.clone())
-        .await
-        .unwrap_err();
+    let e = approve(&fx, &other, &id).await.unwrap_err();
     assert_eq!(e.code, "invalid_state");
     // 送出（另一位管理員 bob）：待核准，對象已固定但不提議、沒有 rollout.start
     let v = fx
@@ -2163,11 +2190,7 @@ async fn approval_gates_the_rollout_until_someone_else_approves() {
     assert_eq!(e.code, "rollout_overlap");
     // 建立者與送出者都不能核准
     for actor in [who(), other.clone()] {
-        let e = fx
-            .svc
-            .approve_rollout(&actor, id.clone())
-            .await
-            .unwrap_err();
+        let e = approve(&fx, &actor, &id).await.unwrap_err();
         assert_eq!(
             (e.status.as_u16(), e.code, e.product_code),
             (403, "self_approval", Some("KRS-E6106")),
@@ -2216,27 +2239,19 @@ async fn approval_gates_the_rollout_until_someone_else_approves() {
         .await
         .unwrap();
     assert_eq!(v["state"], "draft");
-    let e = fx
-        .svc
-        .approve_rollout(&third, id.clone())
-        .await
-        .unwrap_err();
+    let e = approve(&fx, &third, &id).await.unwrap_err();
     assert_eq!(e.code, "invalid_state", "修改後核准失效");
     fx.svc
         .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
         .await
         .unwrap();
     // 第三人核准：開始推送，稽核有 approve 與 start
-    let v = fx.svc.approve_rollout(&third, id.clone()).await.unwrap();
+    let v = approve(&fx, &third, &id).await.unwrap();
     assert_eq!(
         (v["state"].as_str(), v["approved_by"].as_str()),
         (Some("running"), Some("user:carol"))
     );
-    let e = fx
-        .svc
-        .approve_rollout(&third, id.clone())
-        .await
-        .unwrap_err();
+    let e = approve(&fx, &third, &id).await.unwrap_err();
     assert_eq!(e.code, "invalid_state", "不能重複核准");
     fx.set_now(T0 + 3 * MIN);
     fx.svc.tick().await.unwrap();
@@ -2268,7 +2283,7 @@ async fn approval_gates_the_rollout_until_someone_else_approves() {
         .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
         .await
         .unwrap();
-    let v = fx.svc.approve_rollout(&third, id.clone()).await.unwrap();
+    let v = approve(&fx, &third, &id).await.unwrap();
     assert_eq!(v["state"], "scheduled");
     // 待核准的推送也可以取消
     fx.svc
@@ -2304,7 +2319,7 @@ async fn approval_is_off_by_default() {
         actor: "user:bob".into(),
         ip: None,
     };
-    let e = fx.svc.approve_rollout(&bob, id.clone()).await.unwrap_err();
+    let e = approve(&fx, &bob, &id).await.unwrap_err();
     assert_eq!(e.code, "invalid_state");
     let e = fx
         .svc
@@ -2403,6 +2418,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
             )
             .unwrap(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2456,7 +2472,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     // 目標是外部 URL 的版本：可升級（發佈檔不必存入）；回滾檔也在外部 URL，不算「無法自動回滾」
     let p = fx
         .svc
-        .preview_rollout(rollout("0.9.2"), None)
+        .preview_rollout(rollout("0.9.2"), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -2520,7 +2536,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     // 資格分類算作「無法自動回滾」
     let p = fx
         .svc
-        .preview_rollout(rollout("0.9.3"), None)
+        .preview_rollout(rollout("0.9.3"), None, None)
         .await
         .unwrap();
     assert_eq!(

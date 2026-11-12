@@ -22,13 +22,25 @@ use super::rollout::{
 };
 use super::schedule::ScheduleSpec;
 use super::store::{HostTransition, NewRolloutHost, RolloutHostRow, RolloutRow};
+use super::submission::{self, MissingFile};
 use super::{
-    CODE_INCOMPATIBLE, CODE_ROLLBACK_FAILED, CODE_ROLLED_BACK, CODE_ROLLOUT_PAUSED,
-    CODE_SIGNATURE_FAILED, CODE_VERSION_MISMATCH, OfferFiles, RemoteService,
+    CODE_INCOMPATIBLE, CODE_RELEASE_FILE_MISSING, CODE_ROLLBACK_FAILED, CODE_ROLLED_BACK,
+    CODE_ROLLOUT_PAUSED, CODE_SIGNATURE_FAILED, CODE_VERSION_MISMATCH, OfferFiles, RemoteService,
 };
 use crate::api::http::ApiError;
 use crate::enroll::db::DbError;
 use crate::store::db::Store;
+
+/// `POST /api/v1/rollouts/{id}/approve` 的本文（ADR-0002 決策點 2b）：`confirm` 與 `digest` 必填
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApproveRequest {
+    /// 「核准 N 台」／「核准降版 N 台」（推送的 `submission.confirm_text`）
+    pub confirm: Option<String>,
+    /// 核准者檢視的那一份送審內容（推送的 `submission.digest`）
+    pub digest: Option<String>,
+    /// 降版時必填
+    pub reason: Option<String>,
+}
 
 /// 新的 upgrade_id（UUID v4）
 pub fn new_upgrade_id() -> Result<String, DbError> {
@@ -64,8 +76,13 @@ fn invalid_state(r: &RolloutRow, what: &str) -> ApiError {
     .with_details(json!({"state": r.state}))
 }
 
-/// 目標版本與版本庫（資格分類用）
-fn release_context(s: &dyn Store, version: &str) -> Result<(i64, ReleaseContext), TxError> {
+/// 目標版本與版本庫（資格分類用）。`missing`：檔案有問題的發佈檔（[`submission::missing_files`]）——它們不算
+/// 可以提議的檔案（ADR-0002 F1：需要它的主機分類為 `artifact_missing`；回滾檔遺失的主機算無法自動回滾）
+pub(super) fn release_context(
+    s: &dyn Store,
+    version: &str,
+    missing: &[MissingFile],
+) -> Result<(i64, ReleaseContext), TxError> {
     let rel = s.get_release(version)?.ok_or_else(|| {
         TxError::Api(ApiError::param(
             "target_version",
@@ -85,9 +102,19 @@ fn release_context(s: &dyn Store, version: &str) -> Result<(i64, ReleaseContext)
     let mut by_version: HashMap<String, Vec<super::store::ArtifactRow>> = HashMap::new();
     let releases: HashMap<i64, super::store::ReleaseRow> =
         s.list_releases()?.into_iter().map(|r| (r.id, r)).collect();
+    let mut missing_target = Vec::new();
     for a in s.all_artifacts()? {
         if let Some(r) = releases.get(&a.release_id) {
             if r.source == super::ops::SOURCE_EXTERNAL && !external {
+                continue;
+            }
+            if missing
+                .iter()
+                .any(|m| m.artifact.release_id == a.release_id && m.artifact.filename == a.filename)
+            {
+                if r.id == rel.id {
+                    missing_target.push(a);
+                }
                 continue;
             }
             by_version
@@ -104,6 +131,7 @@ fn release_context(s: &dyn Store, version: &str) -> Result<(i64, ReleaseContext)
             manifest,
             artifacts,
             by_version,
+            missing: missing_target,
         },
     ))
 }
@@ -148,6 +176,33 @@ fn schedule_to_store(
     Ok(schedule)
 }
 
+/// 推送的 `next_action`（[`rollout::next_action_scheduled`]）；進行中而有主機在等版本庫的檔案補回時為
+/// `waiting_artifact{hosts}`（ADR-0002 F3：不計入失敗、不自動暫停，補檔後下一輪自動繼續）
+pub(crate) fn next_action_of(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64) -> Value {
+    let v = rollout::next_action_scheduled(
+        &r.state,
+        r.soak_until,
+        r.awaiting_continue,
+        r.pause_reason.as_deref(),
+        r.pause_cause.as_deref(),
+        &ScheduleSpec::from_db(&r.schedule),
+        now_ms,
+    );
+    if v["code"] == "upgrading" {
+        let waiting = hosts
+            .iter()
+            .filter(|h| {
+                h.state == HOST_PENDING
+                    && h.reason.as_deref() == Some(rollout::SKIP_ARTIFACT_MISSING)
+            })
+            .count();
+        if waiting > 0 {
+            return json!({"code": "waiting_artifact", "hosts": waiting});
+        }
+    }
+    v
+}
+
 /// 推送的 JSON（清單與詳情；`hosts` 有給時另加各批的統計）
 pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detail: bool) -> Value {
     let (selector, waves, options) = spec_of(r);
@@ -164,7 +219,7 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         "hosts_total": hosts.iter().filter(|h| h.state != HOST_SKIPPED).count(),
         // 回滾失敗、尚未標記為已處理的主機（progress.rollback_failed 含已處理的）
         "rollback_failed_unacknowledged": hosts.iter().filter(|h| h.state == HOST_ROLLBACK_FAILED && h.acknowledged_at.is_none()).count(),
-        "next_action": rollout::next_action_scheduled(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), &schedule, now_ms),
+        "next_action": next_action_of(r, hosts, now_ms),
         "starts_at": ts(schedule.starts_at),
         "ends_at": ts(schedule.ends_at),
         "pause_reason": r.pause_reason,
@@ -301,13 +356,16 @@ impl RemoteService {
         &self,
         spec: RolloutSpec,
         rollout_id: Option<String>,
+        viewer: Option<String>,
     ) -> Result<Value, ApiError> {
         let live = self.live_hellos();
         let now = self.now_ms();
         let default_tz = self.default_timezone();
         let approval = self.settings.approval_required();
+        let dir = self.releases_dir.clone();
         self.in_tx(move |s| {
-            let (_, ctx) = release_context(s, &spec.target_version)?;
+            let missing = submission::missing_files(s, &dir)?;
+            let (_, ctx) = release_context(s, &spec.target_version, &missing)?;
             let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
             let id = rollout_id.unwrap_or_else(|| "preview".to_string());
             let (p, _, _) = rollout::plan(
@@ -363,6 +421,44 @@ impl RemoteService {
             v["max_waves"] = json!(rollout::MAX_WAVES);
             // 雙人覆核：送出後要等另一位使用者核准（主控台在送出確認中說明）
             v["approval_required"] = json!(approval);
+            // 目標版本中檔案有問題的發佈檔（需要它的主機已分類為 artifact_missing）與風險提醒的固定代碼
+            v["artifact_problems"] = Value::Array(
+                missing
+                    .iter()
+                    .filter(|m| {
+                        ctx.missing.iter().any(|a| {
+                            a.filename == m.artifact.filename
+                                && a.release_id == m.artifact.release_id
+                        })
+                    })
+                    .map(|m| json!({"version": m.version, "filename": m.artifact.filename, "file_problem": m.problem}))
+                    .collect(),
+            );
+            let mut warnings = rollout::risk_warnings(
+                &spec.waves,
+                &p.waves,
+                p.eligible,
+                p.downgrade,
+                p.no_rollback,
+                !ctx.missing.is_empty(),
+            );
+            // 沒有可核准者的偵測（決策點 2g）：以這次請求的身分為建立者與送出者計算；沒有啟用雙人覆核、
+            // 或不知道身分時為 null
+            v["approvers_available"] = match (&viewer, approval) {
+                (Some(actor), true) => {
+                    let n = submission::approvers_available(
+                        &submission::approvers(s, now)?,
+                        actor,
+                        Some(actor.as_str()),
+                    );
+                    if n == 0 {
+                        warnings.push("no_approvers");
+                    }
+                    json!(n)
+                }
+                _ => Value::Null,
+            };
+            v["warnings"] = json!(warnings);
             Ok(v)
         })
         .await
@@ -375,8 +471,10 @@ impl RemoteService {
         let who = who.clone();
         let live = self.live_hellos();
         let schedule = schedule_to_store(&spec, &self.default_timezone(), now)?;
+        let dir = self.releases_dir.clone();
         self.in_tx(move |s| {
-            let (release_id, ctx) = release_context(s, &spec.target_version)?;
+            let missing = submission::missing_files(s, &dir)?;
+            let (release_id, ctx) = release_context(s, &spec.target_version, &missing)?;
             if let Some(min) = incompatible(&ctx) {
                 return Err(incompatible_error(&spec.target_version, &min).into());
             }
@@ -443,6 +541,7 @@ impl RemoteService {
         let now = self.now_ms();
         let who = who.clone();
         let schedule = schedule_to_store(&spec, &self.default_timezone(), now)?;
+        let dir = self.releases_dir.clone();
         let v = self.in_tx(move |s| {
             let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
             if r.state != ROLLOUT_DRAFT
@@ -451,7 +550,8 @@ impl RemoteService {
             {
                 return Err(invalid_state(&r, "修改（只有草稿、待核准與已排程而尚未開始的推送可以修改）").into());
             }
-            let (release_id, ctx) = release_context(s, &spec.target_version)?;
+            let missing = submission::missing_files(s, &dir)?;
+            let (release_id, ctx) = release_context(s, &spec.target_version, &missing)?;
             if let Some(min) = incompatible(&ctx) {
                 return Err(incompatible_error(&spec.target_version, &min).into());
             }
@@ -511,6 +611,7 @@ impl RemoteService {
         let who = who.clone();
         let live = self.live_hellos();
         let approval = self.settings.approval_required();
+        let dir = self.releases_dir.clone();
         let v = self
             .in_tx(move |s| {
                 let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
@@ -522,12 +623,16 @@ impl RemoteService {
                     return Err(ApiError::conflict("schedule_ended", "排程的結束時間（ends_at）已經過了，請先修改排程").into());
                 }
                 let (selector, waves, options) = spec_of(&r);
-                let (_, ctx) = release_context(s, &r.target_version)?;
+                // 版本庫的檔案在這裡重新檢查（ADR-0002 F1）：預覽之後檔案被刪除或大小改變時，需要它的主機
+                // 以 artifact_missing 固定為不會升級，確認字串的台數也跟著改變
+                let missing = submission::missing_files(s, &dir)?;
+                let (_, ctx) = release_context(s, &r.target_version, &missing)?;
                 if let Some(min) = incompatible(&ctx) {
                     return Err(incompatible_error(&r.target_version, &min).into());
                 }
                 let busy = rollout::busy_map(s.hosts_in_active_rollouts()?);
-                let (p, classified, assigned) = rollout::plan(&r.id, &with_live(s.upgrade_hosts()?, &live), &selector, &waves, &options, &ctx, &busy);
+                let inventory = with_live(s.upgrade_hosts()?, &live);
+                let (p, classified, assigned) = rollout::plan(&r.id, &inventory, &selector, &waves, &options, &ctx, &busy);
                 if p.overlap_count > 0 {
                     return Err(overlap_error(&p).into());
                 }
@@ -593,20 +698,31 @@ impl RemoteService {
                 }
                 r.updated_at = now;
                 s.update_rollout_state(&r)?;
+                let hosts = s.rollout_hosts(&r.id)?;
+                // 送審內容的 digest（核准時在同一個交易重新計算並比對；稽核留下這次送出的是哪一份內容）
+                let sub = submission::submission(&r, &hosts);
                 who.event(
                     "rollout",
                     "rollout.submit",
                     Some(r.id.clone()),
                     None,
-                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason, "schedule": schedule.json(), "state": r.state}),
+                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason, "schedule": schedule.json(), "state": r.state, "digest": sub.digest}),
                 )
                 .append(s, now)?;
                 if r.state == ROLLOUT_RUNNING {
                     who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id}))
                         .append(s, now)?;
                 }
-                let hosts = s.rollout_hosts(&r.id)?;
-                Ok(rollout_json(&r, &hosts, now, true))
+                let mut v = rollout_json(&r, &hosts, now, true);
+                if r.state == ROLLOUT_PENDING_APPROVAL {
+                    let cx = submission::PendingContext {
+                        inventory: inventory.into_iter().map(|h| (h.host_id, h)).collect(),
+                        missing,
+                        approvers: submission::approvers(s, now)?,
+                    };
+                    v["submission"] = submission::submission_json(s, &r, &hosts, &cx)?;
+                }
+                Ok(v)
             })
             .await
             .map_err(|e| e.into_api("推送"))?;
@@ -617,12 +733,28 @@ impl RemoteService {
         Ok(v)
     }
 
-    /// `POST /api/v1/rollouts/{id}/approve`（雙人覆核，REMOTE.md 第 5.4 節）：`pending_approval` → `scheduled`
-    /// 或 `running`。核准者不得是建立者或送出者（403 `self_approval`，`KRS-E6106`）；呼叫端（API）已確認是
-    /// 以帳號登入的工作階段、有 `rollouts:approve`
-    pub async fn approve_rollout(&self, who: &Actor, id: String) -> Result<Value, ApiError> {
+    /// `POST /api/v1/rollouts/{id}/approve`（雙人覆核，REMOTE.md 第 5.4 節；ADR-0002 決策點 2b）：
+    /// `pending_approval` → `scheduled` 或 `running`。呼叫端（API）已確認是以帳號登入的工作階段、有
+    /// `rollouts:approve`。**同一個交易**中依序檢查，全部通過才轉移狀態：
+    ///
+    /// 1. 狀態是 `pending_approval`（409 `invalid_state`）；
+    /// 2. 核准者不是建立者或送出者（403 `self_approval`，`KRS-E6106`）；
+    /// 3. 重新讀取已固定的對象、重新計算送審內容的 `digest`：請求的 `digest` 不符 → 409
+    ///    `submission_changed`（核准者看到摘要之後推送被修改或重新送出）；
+    /// 4. 重新計算確認字串「核准 N 台」（降版 L3「核准降版 N 台」）：`confirm`（去掉前後空白）不符 → 400
+    ///    `confirmation_required`；沒有帶 `digest` → 400 `invalid_parameter`；降版而沒有 `reason` → 400；
+    /// 5. 排程的結束時間還沒過（409 `schedule_ended`）；
+    /// 6. 已固定的主機需要的發佈檔都還在版本庫（409 `artifact_missing`，`KRS-W8417`；ADR-0002 F2）
+    pub async fn approve_rollout(
+        &self,
+        who: &Actor,
+        id: String,
+        req: ApproveRequest,
+    ) -> Result<Value, ApiError> {
         let now = self.now_ms();
         let who = who.clone();
+        let live = self.live_hellos();
+        let dir = self.releases_dir.clone();
         let v = self
             .in_tx(move |s| {
                 let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
@@ -639,9 +771,72 @@ impl RemoteService {
                     .with_details(json!({"created_by": r.created_by, "submitted_by": r.submitted_by}))
                     .into());
                 }
+                let hosts = s.rollout_hosts(&r.id)?;
+                let sub = submission::submission(&r, &hosts);
+                if req.digest.as_deref().is_some_and(|d| d.trim() != sub.digest) {
+                    return Err(ApiError::conflict(
+                        "submission_changed",
+                        "這個推送在你檢視之後被修改或重新送出，請重新載入送審摘要後再核准",
+                    )
+                    .with_details(json!({"digest": sub.digest}))
+                    .into());
+                }
+                let expected = sub.confirm_text();
+                let level = sub.confirm_level();
+                if req.confirm.as_deref().map(str::trim) != Some(expected.as_str()) {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "confirmation_required",
+                        format!("核准推送需要在 confirm 輸入「{expected}」（{level}）"),
+                    )
+                    .with_details(json!({"confirm_text": expected, "confirm_level": level, "eligible": sub.eligible, "downgrade": sub.downgrade}))
+                    .into());
+                }
+                if req.digest.is_none() {
+                    return Err(ApiError::param(
+                        "digest",
+                        "核准推送需要 digest（推送的 submission.digest：你檢視的那一份送審內容）",
+                    )
+                    .into());
+                }
+                if sub.downgrade > 0 && req.reason.is_none() {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "confirmation_required",
+                        "核准降版推送（L3）必須填寫 reason",
+                    )
+                    .with_details(json!({"confirm_text": expected, "confirm_level": level, "parameter": "reason"}))
+                    .into());
+                }
                 let schedule = ScheduleSpec::from_db(&r.schedule);
                 if schedule.ends_at.is_some_and(|e| e <= now) {
                     return Err(ApiError::conflict("schedule_ended", "排程的結束時間（ends_at）已經過了，請退回後修改排程").into());
+                }
+                // 已固定的主機需要的發佈檔：送出之後檔案被刪除或大小改變時不核准（狀態不變；補檔後再核准，
+                // 或退回後重新送出）
+                let missing = submission::missing_files(s, &dir)?;
+                if !missing.is_empty() {
+                    let inventory: HashMap<i64, super::store::UpgradeHost> =
+                        with_live(s.upgrade_hosts()?, &live)
+                            .into_iter()
+                            .map(|h| (h.host_id, h))
+                            .collect();
+                    let problems = submission::fixed_problems(
+                        &missing,
+                        &r,
+                        &rollout::options_from_db(&r.options),
+                        &hosts,
+                        &inventory,
+                    );
+                    if let Some(((version, filename, _), _)) = problems.iter().next() {
+                        return Err(ApiError::conflict(
+                            rollout::SKIP_ARTIFACT_MISSING,
+                            format!("版本庫的檔案遺失或大小不符：Pulse {version} 的 {filename}。請在 Pulse 版本庫重新上傳後再核准，或退回這個推送"),
+                        )
+                        .with_product_code(CODE_RELEASE_FILE_MISSING)
+                        .with_details(json!({"files": submission::problems_json(&problems)}))
+                        .into());
+                    }
                 }
                 r.approved_at = Some(now);
                 r.approved_by = Some(who.actor.clone());
@@ -654,13 +849,13 @@ impl RemoteService {
                 }
                 r.updated_at = now;
                 s.update_rollout_state(&r)?;
-                let hosts = s.rollout_hosts(&r.id)?;
+                // 稽核留下核准的是哪一份內容（digest）、台數與原本的送審資訊
                 who.event(
                     "rollout",
                     "rollout.approve",
                     Some(r.id.clone()),
                     None,
-                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "created_by": r.created_by, "submitted_by": r.submitted_by, "state": r.state, "progress": rollout::progress(&hosts)}),
+                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "created_by": r.created_by, "submitted_by": r.submitted_by, "submitted_at": r.submitted_at.map(crate::api::http::ts_ms), "state": r.state, "progress": rollout::progress(&hosts), "digest": sub.digest, "eligible": sub.eligible, "downgrade": sub.downgrade, "confirm_level": level, "reason": req.reason}),
                 )
                 .append(s, now)?;
                 if r.state == ROLLOUT_RUNNING {
@@ -990,9 +1185,10 @@ impl RemoteService {
 
     /// 推送引擎的一輪：每個進行中的推送一個交易
     pub(crate) async fn tick(&self) -> Result<(), DbError> {
-        let ids: Vec<String> = self
+        let dir = self.releases_dir.clone();
+        let (ids, missing): (Vec<String>, Vec<MissingFile>) = self
             .db
-            .read(|s| {
+            .read(move |s| {
                 // 進行中的推送，加上已排程（到 starts_at 時轉為進行中）的推送
                 let mut ids: Vec<String> = s
                     .list_rollouts(Some(ROLLOUT_SCHEDULED))?
@@ -1004,21 +1200,35 @@ impl RemoteService {
                         .into_iter()
                         .map(|r| r.id),
                 );
-                Ok(ids)
+                // 版本庫的檔案（ADR-0002 F3）：有推送在進行時，每一輪檢查一次（每個已存入的檔案一次 stat）；
+                // 檔案有問題的主機這一輪不提議
+                let missing = if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    submission::missing_files(s, &dir)?
+                };
+                Ok((ids, missing))
             })
             .await?;
+        let missing = Arc::new(missing);
         for id in ids {
-            self.tick_one(id).await?;
+            self.tick_one(id, missing.clone()).await?;
         }
         Ok(())
     }
 
-    async fn tick_one(&self, id: String) -> Result<(), DbError> {
+    async fn tick_one(&self, id: String, missing: Arc<Vec<MissingFile>>) -> Result<(), DbError> {
         let rollout_id = id.clone();
         let now = self.now_ms();
         let started = self.started_ms;
         let live_capable = self.capable_agents();
         let reg2 = self.registry.clone();
+        // 有檔案遺失時才需要每台主機的安裝方式與平台（連線中的 hello）
+        let live_hellos = if missing.is_empty() {
+            HashMap::new()
+        } else {
+            self.live_hellos()
+        };
         let r = self
             .in_tx(move |s| {
                 let Some(mut r) = s.get_rollout(&id)? else {
@@ -1045,11 +1255,71 @@ impl RemoteService {
                 if r.state != ROLLOUT_RUNNING {
                     return Ok((Vec::new(), Vec::new(), false));
                 }
-                let hosts = s.rollout_hosts(&r.id)?;
+                let mut hosts = s.rollout_hosts(&r.id)?;
                 let (_, waves, options) = spec_of(&r);
+                // 版本庫的檔案遺失（ADR-0002 F3）：需要那個檔案的主機不提議、留在 pending（reason 為
+                // artifact_missing）；已提議而還沒下載完的收回提議、回到 pending。不計入失敗、不暫停推送，
+                // 補檔後下一輪清除 reason、照常提議
+                let mut blocked: HashSet<String> = HashSet::new();
+                let mut waiting_changed = false;
+                let mut withdrawn = Vec::new();
+                if !missing.is_empty() {
+                    let inventory: HashMap<i64, super::store::UpgradeHost> =
+                        with_live(s.upgrade_hosts()?, &live_hellos)
+                            .into_iter()
+                            .map(|h| (h.host_id, h))
+                            .collect();
+                    for h in hosts.iter().filter(|h| submission::waits_for_file(&h.state)) {
+                        let u = inventory.get(&h.host_id);
+                        let method = u.and_then(|u| u.install_method.clone()).unwrap_or_default();
+                        let arch = u.and_then(|u| rollout::arch_of(u.os.as_deref())).unwrap_or_default();
+                        if !submission::blocked_files(&missing, &r.target_version, &method, &arch, h.from_version.as_deref(), options.allow_no_rollback).is_empty() {
+                            blocked.insert(h.agent_id.clone());
+                        }
+                    }
+                }
+                for h in &hosts {
+                    let waiting = h.state == HOST_PENDING && h.reason.as_deref() == Some(rollout::SKIP_ARTIFACT_MISSING);
+                    let t = if blocked.contains(&h.agent_id) {
+                        if rollout::is_offered(&h.state) {
+                            withdrawn.push(h.agent_id.clone());
+                            log::warn!(event = "rollout.artifact_missing", code = CODE_RELEASE_FILE_MISSING; "警告 {CODE_RELEASE_FILE_MISSING}：推送「{}」（{}）：{} 需要的發佈檔不在版本庫（遺失或大小不符），收回提議，補檔後自動繼續", r.name, r.id, h.agent_id);
+                            Some(HostTransition {
+                                state: Some(HOST_PENDING.into()),
+                                upgrade_id: Some(new_upgrade_id()?),
+                                reason: Some(Some(rollout::SKIP_ARTIFACT_MISSING.into())),
+                                offered_at: Some(None),
+                                ..Default::default()
+                            })
+                        } else if !waiting {
+                            Some(HostTransition {
+                                reason: Some(Some(rollout::SKIP_ARTIFACT_MISSING.into())),
+                                ..Default::default()
+                            })
+                        } else {
+                            None
+                        }
+                    } else if waiting {
+                        // 檔案補回來了
+                        Some(HostTransition {
+                            reason: Some(None),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(t) = t {
+                        s.update_rollout_host(&r.id, h.host_id, &t, now)?;
+                        waiting_changed = true;
+                    }
+                }
+                if waiting_changed {
+                    hosts = s.rollout_hosts(&r.id)?;
+                }
+                let started_now = started_now || waiting_changed;
                 // ends_at 到了：尚未開始替換的主機標為 expired（rollout_ended），替換中的照常完成後推送才結束
                 if schedule.ends_at.is_some_and(|e| now >= e) {
-                    let mut cleared = Vec::new();
+                    let mut cleared = withdrawn;
                     let mut changed = started_now;
                     for h in hosts.iter().filter(|h| {
                         rollout::is_offered(&h.state)
@@ -1091,11 +1361,18 @@ impl RemoteService {
                     waves: &waves,
                     options: &options,
                 };
-                let live = |a: &str| live_of(&reg2, a, &live_capable);
+                // 等待檔案的主機對引擎來說「不在」：不提議，也不因離線或沒有協商 upgrade 而跳過
+                let live = |a: &str| {
+                    if blocked.contains(a) {
+                        rollout::HostLive::default()
+                    } else {
+                        live_of(&reg2, a, &live_capable)
+                    }
+                };
                 let (actions, ra) = rollout::plan_tick(&input, &hosts, &live);
                 let changed = started_now || !actions.is_empty() || ra.is_some();
                 let mut set = Vec::new();
-                let mut cleared = Vec::new();
+                let mut cleared = withdrawn;
                 for (i, a) in actions {
                     let h = &hosts[i];
                     let t = match a {
@@ -1229,6 +1506,7 @@ impl RemoteService {
         };
         let (agent, upgrade) = (agent_id.to_string(), upgrade_id.to_string());
         let now = self.now_ms();
+        let dir = self.releases_dir.clone();
         let built = self
             .db
             .read(move |s| {
@@ -1255,6 +1533,14 @@ impl RemoteService {
                 let Some(a) = rollout::pick_artifact(&artifacts, &method, &arch).cloned() else {
                     return Ok(None);
                 };
+                // 版本庫的檔案遺失或大小不符（ADR-0002 F3）：不發出無法下載的提議。推送引擎的下一輪把這台
+                // 主機收回到 pending（reason artifact_missing），補檔後自動繼續
+                let file_problem = |a: &super::store::ArtifactRow| {
+                    a.stored && super::releases::file_problem(&dir, &a.sha256, a.size).is_some()
+                };
+                if !external && file_problem(&a) {
+                    return Ok(None);
+                }
                 let current = Version::parse(&session.agent_version).ok();
                 let target = Version::parse(&rel.version).ok();
                 let downgrade = matches!((&current, &target), (Some(c), Some(t)) if t < c);
@@ -1272,6 +1558,16 @@ impl RemoteService {
                     }
                 } else {
                     None
+                };
+                // 回滾檔在代管的版本庫中遺失：允許無法自動回滾的推送不附回滾檔，否則不提議
+                let rollback = match rollback {
+                    Some((b, None)) if file_problem(&b) => {
+                        if !options.allow_no_rollback {
+                            return Ok(None);
+                        }
+                        None
+                    }
+                    other => other,
                 };
                 // 外部 URL：`artifact.url` 為 base_url ＋檔名，Pulse 依本機白名單下載；簽章、SHA256SUMS 與
                 // 雜湊照舊附在提議中，Pulse 的驗證與從 Kairos 下載完全相同

@@ -585,7 +585,14 @@ pub struct ReleaseContext {
     pub artifacts: Vec<ArtifactRow>,
     /// 版本 → 已存入的發佈檔（回滾檔：主機目前的版本、同格式同平台）
     pub by_version: HashMap<String, Vec<ArtifactRow>>,
+    /// 目標版本中資料庫記為已存入、但檔案不存在或大小不符的發佈檔（ADR-0002 F1；`KRS-W8417`）。不在
+    /// `artifacts` 與 `by_version` 中：需要它的主機分類為 [`SKIP_ARTIFACT_MISSING`]，而不是可升級
+    pub missing: Vec<ArtifactRow>,
 }
+
+/// 資格分類的原因：版本庫記錄這個平台的發佈檔已存入，但檔案不存在或大小不符（重新上傳即可；與「版本庫
+/// 沒有這個平台的檔案」的 `no_artifact` 分開）。也是推送中主機等待檔案時的 `reason`、API 的 409 錯誤碼
+pub const SKIP_ARTIFACT_MISSING: &str = "artifact_missing";
 
 /// 這台主機的發佈檔（依 `install.method` 與 `os.arch`）
 pub fn pick_artifact<'a>(
@@ -620,7 +627,8 @@ pub struct Eligibility {
 
 /// REMOTE.md 第 4.7.2 節的資格分類。跳過的原因：`already`、`unsupported_version`、`disabled`、
 /// `no_trust_anchor`、`no_helper`、`unsupported`、`not_ready`、`unsupported_platform`、`no_artifact`、
-/// `min_upgrade_from`、`no_manifest`、`downgrade_not_allowed`、`no_rollback`、`decommissioned`
+/// `artifact_missing`、`min_upgrade_from`、`no_manifest`、`downgrade_not_allowed`、`no_rollback`、
+/// `decommissioned`
 pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) -> Eligibility {
     let mut e = Eligibility {
         skip: None,
@@ -664,6 +672,10 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
         return skip(e, "unsupported_platform");
     }
     if pick_artifact(&ctx.artifacts, method, &arch).is_none() {
+        // 檔案遺失（已存入但不在版本庫的目錄中）與「沒有這個平台的檔案」分開：處理方式不同
+        if pick_artifact(&ctx.missing, method, &arch).is_some() {
+            return skip(e, SKIP_ARTIFACT_MISSING);
+        }
         return skip(e, "no_artifact");
     }
     if ctx.target < current {
@@ -1165,6 +1177,69 @@ pub fn confirm_text(eligible: usize, downgrade: bool, no_rollback: usize) -> Str
     } else {
         format!("升級 {eligible} 台")
     }
+}
+
+/// 核准的確認字串（ADR-0002 決策點 2b）：L2「核准 N 台」；含降版時 L3「核准降版 N 台」。N 為已固定的
+/// 可升級台數（與送出的 [`confirm_text`] 同一個數字），由伺服器依 `rollout_hosts` 計算
+pub fn approve_confirm_text(eligible: usize, downgrade: bool) -> String {
+    if downgrade {
+        format!("核准降版 {eligible} 台")
+    } else {
+        format!("核准 {eligible} 台")
+    }
+}
+
+/// 第一批超過可升級主機的這個比例（或 [`LARGE_FIRST_WAVE_HOSTS`] 台）時提醒 `large_first_wave`
+pub const LARGE_FIRST_WAVE_PERCENT: usize = 10;
+pub const LARGE_FIRST_WAVE_HOSTS: usize = 100;
+
+/// 風險提醒的固定代碼（ADR-0002 決策點 3、B9；主控台組文案，預覽、送審摘要與核准對話框顯示同一組）：
+/// `single_wave`（只有一批）、`large_first_wave`（第一批超過 10% 或 100 台）、`no_pause_between_waves`
+/// （批次之間沒有觀察時間、也不需要人工繼續）、`empty_wave`（某一批是 0 台）、`downgrade`、`no_rollback`、
+/// `artifact_problem`（目標版本有檔案遺失或大小不符的發佈檔）。`wave_hosts` 為每批的台數
+pub fn risk_warnings(
+    waves: &[WaveSpec],
+    wave_hosts: &[usize],
+    eligible: usize,
+    downgrade: usize,
+    no_rollback: usize,
+    artifact_problem: bool,
+) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if eligible > 0 {
+        if waves.len() <= 1 {
+            if eligible > 1 {
+                out.push("single_wave");
+            }
+        } else {
+            let first = wave_hosts.first().copied().unwrap_or(0);
+            if first > LARGE_FIRST_WAVE_HOSTS || first * 100 > eligible * LARGE_FIRST_WAVE_PERCENT {
+                // 只有幾台主機時第一批必然超過 10%：至少 1 台不算
+                if first > 1 {
+                    out.push("large_first_wave");
+                }
+            }
+            if waves[..waves.len() - 1]
+                .iter()
+                .all(|w| w.soak_minutes == 0 && !w.manual_continue)
+            {
+                out.push("no_pause_between_waves");
+            }
+            if wave_hosts.iter().any(|n| *n == 0) {
+                out.push("empty_wave");
+            }
+        }
+    }
+    if downgrade > 0 {
+        out.push("downgrade");
+    }
+    if no_rollback > 0 {
+        out.push("no_rollback");
+    }
+    if artifact_problem {
+        out.push("artifact_problem");
+    }
+    out
 }
 
 /// 已在進行中推送的主機（agent_id → rollout_id）

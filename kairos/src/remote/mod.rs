@@ -21,10 +21,12 @@ mod engine;
 pub mod ops;
 pub mod releases;
 pub mod rollout;
+pub mod policy;
 pub mod schedule;
 pub mod store;
+pub mod submission;
 
-pub use engine::rollout_json;
+pub use engine::{ApproveRequest, rollout_json};
 
 #[cfg(test)]
 pub(crate) mod test_sign;
@@ -75,7 +77,9 @@ pub const CODE_SELF_APPROVAL: &str = "KRS-E6106";
 pub const CODE_INCOMPATIBLE: &str = "KRS-W8415";
 /// 升級完成（鏡像 `PLS-I8416`）
 pub const CODE_UPGRADED: &str = "KRS-I8416";
-/// 版本庫的檔案遺失：已存入的發佈檔不存在或大小不符（系統健康；〔暫定〕號碼，待設計包正式分配）
+/// 版本庫的檔案遺失：已存入的發佈檔不存在或大小不符（系統健康、S25、資格分類 `artifact_missing`、核准時的
+/// 409 `artifact_missing`、推送中等待檔案的主機）。ADR-0002 決策點 7／U10：照工程的號碼正式採用（子類別 84
+/// 「遠端升級」、只有 Kairos 端、不鏡像；「不存在」與「大小不符」同號）
 pub const CODE_RELEASE_FILE_MISSING: &str = "KRS-W8417";
 
 /// Pulse 的代碼換成鏡像的 Kairos 代碼（同號；`KRS-W8402` 與 `PLS-E8402` 等級不同）
@@ -241,6 +245,8 @@ pub struct RemoteService {
     pub started_ms: i64,
     /// 推送的升級時段沒有指定 `timezone` 時的預設（Kairos 的 `alerts.timezone`；沒有設定時 `+08:00`）
     default_timezone: std::sync::OnceLock<String>,
+    /// 啟動時比對過的雙人覆核政策（[`RemoteService::observe_approval_policy`]；CLI 與測試沒有呼叫時為空）
+    approval_policy: std::sync::OnceLock<policy::Observed>,
     state: Mutex<State>,
     snapshot: RwLock<Arc<ConfigSnapshot>>,
     wake: Notify,
@@ -291,6 +297,7 @@ impl RemoteService {
             clock: p.clock,
             started_ms: now,
             default_timezone: std::sync::OnceLock::new(),
+            approval_policy: std::sync::OnceLock::new(),
             state: Mutex::new(State {
                 desired,
                 offers,
@@ -300,6 +307,57 @@ impl RemoteService {
             wake: Notify::new(),
             events: tokio::sync::broadcast::channel(EVENT_BUFFER).0,
         }))
+    }
+
+    /// 啟動時比對雙人覆核的政策（[`policy::observe`]；ADR-0002 決策點 2i）：`source` 為 `rollout_approval`
+    /// 的來源（`file`／`environment`／`default`）、`node` 為這個節點的名稱。**在遠端管理開始接受請求
+    /// （主控台 API、8443 的遠端管理訊息、推送引擎）之前呼叫**；回 `Err` 時呼叫端不得啟動遠端管理——不能在
+    /// 沒有記錄的情況下以新的政策接受推送。叢集模式下服務只在取得租約的節點啟動，所以只有 leader 會寫入
+    pub async fn observe_approval_policy(
+        &self,
+        source: &str,
+        node: &str,
+    ) -> Result<policy::Outcome, String> {
+        let now = self.now_ms();
+        let value = self.settings.rollout_approval.clone();
+        let (source, node) = (source.to_string(), node.to_string());
+        let (outcome, record) = self
+            .in_tx(move |s| policy::observe(s, &value, &source, &node, now))
+            .await
+            .map_err(|e| match e {
+                ops::TxError::Db(e) => e.to_string(),
+                ops::TxError::Api(e) => e.message,
+            })?;
+        match outcome {
+            policy::Outcome::Disabled | policy::Outcome::BaselineDisabled => warn!(
+                event = "settings.rollout_approval.change";
+                "警告：雙人覆核已關閉（remote.rollout_approval 由 required 改為 none，來源 {}；與資料庫記錄的上一次設定不同）。送出的推送不再需要另一位管理員核准；已寫入稽核並開啟告警事件「雙人覆核已關閉」",
+                record.source
+            ),
+            policy::Outcome::Enabled => info!(
+                event = "settings.rollout_approval.change";
+                "雙人覆核已啟用（remote.rollout_approval 由 none 改為 required，來源 {}）",
+                record.source
+            ),
+            policy::Outcome::SourceChanged => info!(
+                event = "settings.rollout_approval.change";
+                "remote.rollout_approval 的來源改變（值仍是 {}，來源 {}）",
+                record.value, record.source
+            ),
+            policy::Outcome::Baseline => info!(
+                event = "settings.rollout_approval.baseline";
+                "雙人覆核的設定已記錄為基準（remote.rollout_approval = {}，來源 {}）",
+                record.value, record.source
+            ),
+            policy::Outcome::Unchanged => {}
+        }
+        let _ = self.approval_policy.set(record);
+        Ok(outcome)
+    }
+
+    /// 啟動時比對過的雙人覆核政策（前值、最近一次改變；沒有比對過時 `None`）
+    pub fn approval_policy(&self) -> Option<&policy::Observed> {
+        self.approval_policy.get()
     }
 
     /// 啟動推送引擎與到期指派、保留期限的背景工作
@@ -433,7 +491,7 @@ impl RemoteService {
                             "current_wave": r.current_wave,
                             "progress": rollout::progress(&hosts),
                             "pause_cause": rollout::pause_cause(&r.state, r.pause_cause.as_deref()),
-                            "next_action": rollout::next_action_scheduled(&r.state, r.soak_until, r.awaiting_continue, r.pause_reason.as_deref(), r.pause_cause.as_deref(), &schedule::ScheduleSpec::from_db(&r.schedule), now),
+                            "next_action": engine::next_action_of(&r, &hosts, now),
                         });
                         let mut host_events = Vec::new();
                         let mut marks = None;
@@ -700,6 +758,25 @@ impl RemoteService {
                 (
                     format!("升級回滾失敗：{host} 需要人工處理"),
                     serde_json::json!({"agent_id": agent, "hostname": host, "rollout_id": rid, "detail": detail}),
+                ),
+            );
+        }
+        // 雙人覆核已關閉（ADR-0002 決策點 2i）：啟動時觀察到 `required` → `none`，到改回 `required`（下一次
+        // 啟動）為止一直成立——事件不會自己結束
+        if let Some(p) = self.approval_policy()
+            && let Some(at) = p.disabled_at
+        {
+            want.insert(
+                (ids::ROLLOUT_APPROVAL_DISABLED, "remote".to_string()),
+                (
+                    "雙人覆核已關閉：升級推送不再需要另一位管理員核准".to_string(),
+                    serde_json::json!({
+                        "disabled_at": crate::api::http::ts_ms(at),
+                        "source": p.source,
+                        "node": p.node,
+                        "from": p.changed_from,
+                        "to": p.value,
+                    }),
                 ),
             );
         }

@@ -736,16 +736,18 @@ impl Engine {
         }
         for ((rule, subject), (since, title, details)) in &self.remote_conditions {
             let (severity, code) = match *rule {
-                ids::UPGRADE_ROLLBACK_FAILED => (Severity::Critical, "KRS-E8408"),
-                ids::RELEASE_SIGNATURE_FAILED => (Severity::Critical, "KRS-E8401"),
+                ids::UPGRADE_ROLLBACK_FAILED => (Severity::Critical, Some("KRS-E8408")),
+                ids::RELEASE_SIGNATURE_FAILED => (Severity::Critical, Some("KRS-E8401")),
+                // 雙人覆核已關閉（ADR-0002 決策點 2i）：警告；還沒有分配產品代碼（設計包待辦）
+                ids::ROLLOUT_APPROVAL_DISABLED => (Severity::Warning, None),
                 _ if matches!(
                     details.get("cause").and_then(Value::as_str),
                     Some("rollback_failed" | "signature_failed")
                 ) =>
                 {
-                    (Severity::Critical, "KRS-W8414")
+                    (Severity::Critical, Some("KRS-W8414"))
                 }
-                _ => (Severity::Warning, "KRS-W8414"),
+                _ => (Severity::Warning, Some("KRS-W8414")),
             };
             let mut d = details.clone();
             if let Value::Object(m) = &mut d {
@@ -756,7 +758,7 @@ impl Engine {
                 subject: subject.clone(),
                 severity,
                 title: title.clone(),
-                code: Some(code),
+                code,
                 details: d,
             });
         }
@@ -833,6 +835,7 @@ impl Engine {
             ids::ROLLOUT_PAUSED,
             ids::UPGRADE_ROLLBACK_FAILED,
             ids::RELEASE_SIGNATURE_FAILED,
+            ids::ROLLOUT_APPROVAL_DISABLED,
         ];
         // 同一規則、同一對象取最嚴重的一項
         let mut by_rule: HashMap<&'static str, HashMap<String, SystemCondition>> = HashMap::new();
