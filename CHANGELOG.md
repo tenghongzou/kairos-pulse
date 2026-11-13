@@ -64,7 +64,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | 2 | Kairos | **升級推送中的主機不再因為替換與重新啟動而開離線事件**（行為變更）：主機從交給輔助程式（`applying`）到回報結果之間，系統規則與自訂的 `host_offline`／`host_long_offline` 規則不開新事件，也不計入網段離線、大規模離線的台數。抑制最長到 `applying` 之後 `health_timeout_secs + 10 分鐘`，超過後仍離線就照常告警 | 以「主機離線」通知確認遠端升級正在進行，或在升級期間依賴離線告警的部署 | 不需要修改設定（沒有開關）。升級的進度請看推送詳情或 SSE `rollout.progress`／`rollout.host`；其他規則（指標門檻、回報延遲…）不受影響 |
 | 3 | Kairos | **API 的列舉值增加**：推送的 `state` 多了 `scheduled`、`pending_approval`，`next_action.code` 多了 `scheduled`、`waiting_window`，告警處理紀錄的動作多了 `upgrade_suppressed`；推送的本文帶 `schedule` 不再回 400，`waves` 由最多 2 批放寬為最多 10 批 | 列舉這些值、遇到不認得的值就報錯的整合（Webhook 接收端、自行呼叫 `/api/v1/rollouts` 的工具）；依「帶 `schedule` 會被拒絕」寫的腳本 | 讀取端忽略不認得的 `state`、`next_action.code` 與處理紀錄的動作；`windows`、`starts_at`、`ends_at`、`timezone` 放在 `schedule` 物件內 |
 
-Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。**從 0.10.0 開始的下一次遠端升級**（0.10.0 → 之後的版本；0.9 → 0.10 由 0.9 的輔助程式執行，不受影響），升級輔助程式會先檢查路徑（「Pulse」一節）：`/opt/pulse`、`/opt/pulse/pulse`、`/var/lib/pulse-upgrade` 與它們的每一層上層目錄必須屬於 root、群組與其他人不可寫（上層目錄與 `/opt/pulse` 設了 sticky 位元時例外，例如 `1777`；`/opt/pulse/pulse` 與 `/var/lib/pulse-upgrade` 沒有這個例外），`/opt/pulse` 與 `/var/lib/pulse-upgrade` 不得是符號連結，`/opt/pulse/pulse` 必須是一般檔案。依 INSTALL 或套件安裝的主機符合這些條件。不符合時遠端升級以 `PLS-E8405`（`unsafe_path: <路徑>: <原因>`）失敗，不做任何變更，推送會依失敗比例自動暫停；手動升級不受影響。升級到 0.10.0 後可以用 `stat -c '%U %a %n' / /opt /opt/pulse /opt/pulse/pulse /var /var/lib /var/lib/pulse-upgrade` 自行檢查。
+Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。**從 0.10.0 開始的下一次遠端升級**（0.10.0 → 之後的版本；0.9 → 0.10 由 0.9 的輔助程式執行，不受影響），升級輔助程式會先檢查路徑（「Pulse」一節）：`/opt/pulse`、`/opt/pulse/pulse`、`/var/lib/pulse-upgrade` 與它們的每一層上層目錄必須屬於 root、群組與其他人不可寫（上層目錄與 `/opt/pulse` 設了 sticky 位元時例外，例如 `1777`；`/opt/pulse/pulse` 與 `/var/lib/pulse-upgrade` 沒有這個例外），`/opt/pulse` 與 `/var/lib/pulse-upgrade` 不得是符號連結，`/opt/pulse/pulse` 必須是一般檔案。依 INSTALL 或套件安裝的主機符合這些條件。不符合時遠端升級以 `PLS-E8405`（`unsafe_path: <路徑>: <原因>`）失敗，不做任何變更，推送會依失敗比例自動暫停；手動升級不受影響。升級到 0.10.0 之後**不必等到推送失敗才發現**：0.10.0 的 Pulse 在每次連線時事先做同一套檢查，不符合的主機在 hello 回報 `install.upgrade = "unsafe_path"`，主控台的資格預覽（建立推送時）與主機詳情會標出「路徑不安全」與處置方式（「Pulse」一節）；在主機上可以用 `pulse upgrade status`，或 `stat -c '%U %a %n' / /opt /opt/pulse /opt/pulse/pulse /var /var/lib /var/lib/pulse-upgrade` 自行檢查。
 
 **升級步驟（單機，SQLite；v9 → v11）**：
 
@@ -95,7 +95,7 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。**從 
 | Pulse ＼ Kairos | Kairos 0.9 | Kairos 0.10 |
 |---|---|---|
 | **Pulse 0.9** | 不變 | 與 0.9 相同，另外可以使用推送的排程、升級時段（Pulse 0.9.0 就遵守 `apply_window`）、自訂批次與雙人覆核；外部 URL 的提議回報 `declined` |
-| **Pulse 0.10** | 與 0.9 相同（Kairos 0.9 不會提議外部 URL） | 全部功能；外部 URL 的版本庫另需要 Pulse 本機的 `upgrade.url_allowlist`。叢集模式下協商了 `cluster` 的 Pulse 在 `hello_ack` 收到 `cluster_id` |
+| **Pulse 0.10** | 與 0.9 相同（Kairos 0.9 不會提議外部 URL；安裝路徑不安全的主機回報 `install.upgrade = "unsafe_path"`，Kairos 0.9 分類為 `not_ready`、顯示「其他」） | 全部功能；外部 URL 的版本庫另需要 Pulse 本機的 `upgrade.url_allowlist`。叢集模式下協商了 `cluster` 的 Pulse 在 `hello_ack` 收到 `cluster_id` |
 
 ### Kairos：PostgreSQL 儲存後端（HA L1b；`kairos/HA.md` 第 4、5、7、12 節、`kairos/STORAGE.md` 第 19 節）
 
@@ -153,6 +153,7 @@ Pulse 沒有破壞性變更（發佈清單的 `breaking` 為 `false`）。**從 
   - **路徑檢查**（每次執行、讀取指標之前）：`/var/lib/pulse-upgrade` 與每筆交易的工作目錄必須是 root 擁有、不是符號連結、群組與其他人沒有任何權限（只多了讀取／執行權限時改回 0700 並記 `WARN`）；它們與 `/opt/pulse` 的每一個上層目錄必須由 root 擁有、群組與其他人不可寫（sticky 的目錄除外）；`/opt/pulse/pulse` 必須是 root 擁有的一般檔案，`pulse.prev` 不得是符號連結。不通過：`failed`（`PLS-E8405`，`unsafe_path: <路徑>: <原因>`），不做任何變更。**依 INSTALL 安裝的主機不受影響**（`/opt/pulse` 為 `root:pulse 751`）；自行把 `/opt/pulse` 或它的上層目錄改成群組可寫、或把 `/opt/pulse` 做成符號連結的主機，遠端升級會被拒絕。
   - **工作目錄不隨請求的次數成長**：同一時間只有一筆交易；只保留最近 1 筆已結束的紀錄與最近 3 筆 `rollback_failed`（只有最近的一筆保留全部檔案），已結束的交易只留 `state.json` 與 `upgrade.log`。
   - 由 0.9.0 的輔助程式開始的交易（`state.json` 為 v1；也就是 0.9.0 → 0.10.0 的那一次升級途中重新開機）：只接續已替換之後的步驟，轉成 v2 後依上面的規則；v1 的 `verified` 以輔助程式自己的版本判斷是否已替換，無法判斷時 `state_unusable`。
+- **hello 事先回報路徑檢查的結果：`install.upgrade = "unsafe_path"`**（REMOTE.md 第 2.1、17.9.7 節）。其他條件都就緒的主機，Pulse 在每次連線前以**與升級輔助程式相同的函式**檢查 `/opt/pulse`、`/opt/pulse/pulse`、`pulse.prev`、`/var/lib/pulse-upgrade` 與它們的上層目錄；不通過時回報 `unsafe_path`、不宣告 `upgrade`，`pulse upgrade status` 顯示「路徑不安全（`PLS-E8405`）」與 `unsafe_path: <路徑>: <原因>`。Kairos 的資格分類新增原因 `unsafe_path`（主控台的資格預覽、推送中主機的原因、主機詳情的「升級」卡片與主機清單的「遠端升級」篩選都顯示「路徑不安全」與處置方式），不合規的主機在建立推送時就被標出來，而不是等推送以 `PLS-E8405` 失敗。預檢由服務帳號執行、不建立也不修改任何東西：看不到的部分（權限不足）略過、不誤報，每筆交易的工作目錄（`/var/lib/pulse-upgrade/<upgrade_id>`）不在預檢的範圍；**輔助程式自己的檢查不變**，執行時仍會再檢查一次。**協定版本與 schema 不變**：`install` 的值本來就允許不認得的——0.9 的 Kairos 收到 `unsafe_path` 時原樣保存、分類為 `not_ready`（主控台顯示「其他」）；0.9 的 Pulse 不做預檢（它的輔助程式也沒有路徑檢查）。路徑在連線期間被改掉時，要到下一次重新連線才會回報。
 - 其餘沒有變更：0.10.0 沒有新的協定 feature；叢集模式的容錯移轉使用 0.9.0 已有的 `server.fallback_addresses` 與 feature `cluster`。
 
 ### 安全性

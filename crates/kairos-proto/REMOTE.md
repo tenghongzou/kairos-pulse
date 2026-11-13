@@ -73,10 +73,11 @@ flowchart LR
 | 欄位 | 型別 | 說明 |
 |---|---|---|
 | `method` | string | 安裝方式：`tar`、`deb`、`rpm`、`msi`、`zip`、`unknown`（偵測方式見第 4.3 節） |
-| `upgrade` | string | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台） |
+| `upgrade` | string | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）、`unsafe_path`（**Pulse 0.10.0 起**：其他條件都就緒，但安裝路徑沒有通過升級輔助程式的路徑檢查，第 17.9.7 節「hello 之前的預檢」） |
 | `config` | string | 集中設定的本機狀態：`enabled`、`disabled` |
 
 - 限制：三個欄位都是 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值由 Kairos 原樣保存、顯示為「其他」。其他欄位忽略。物件或欄位型別錯誤時 `bad_request`（與 `os` 相同）；協商結果為 v1 時忽略。
+- **`unsafe_path` 不需要改協定版本**（0.10.0）：它符合上面的格式限制，而「不認得的值不是錯誤」是 0.9.0 就定下的規則。0.9 的 Kairos 收到 0.10 的 Pulse 送的 `unsafe_path`：原樣保存，主控台顯示為「其他（unsafe_path）」，資格分類為 `not_ready`（一樣不會被提議升級，只是原因不精確）。0.10 的 Kairos 收到 0.9 的 Pulse：0.9 不做預檢，不合規的主機回報 `ready`，要到升級到 0.10.0 之後才會回報——0.9 的輔助程式也沒有路徑檢查，所以 0.9 → 0.10 的那一次升級不受影響。判斷順序：`disabled` → `unsupported` → `no_trust_anchor` → `no_helper` → `unsafe_path` → `ready`（只有「原本會是 `ready`」的主機才做預檢）。
 - `upgrade` 為 `ready` 以外的值時 Pulse **不宣告** `upgrade`；Kairos 因此不會對它提議升級，主控台依 `install.upgrade` 顯示原因。
 
 ### 2.2 `pending`：有新的設定或升級
@@ -547,7 +548,7 @@ stateDiagram-v2
 
 #### 4.7.2 主機的順序與資格
 
-- 建立推送時計算資格（預覽 API，第 8.3 節）：可升級、已是目標版本（`skipped: already`）、Pulse 太舊（`unsupported_version`，< 0.9.0）、本機停用或缺少輔助程式（依 `install.upgrade`）、低於 `min_upgrade_from`、沒有對應平台的發佈檔、無法自動回滾、多實例、已在另一個進行中的推送（一台主機同時只能屬於一個進行中的推送，建立時 409 `rollout_overlap`）。
+- 建立推送時計算資格（預覽 API，第 8.3 節）：可升級、已是目標版本（`skipped: already`）、Pulse 太舊（`unsupported_version`，< 0.9.0）、本機停用、缺少輔助程式或安裝路徑不安全（依 `install.upgrade`；`unsafe_path` 是 Pulse 0.10.0 起事先回報的路徑檢查結果，原因代碼 `unsafe_path`，第 17.9.7 節——不事先標出的話這台主機要到推送時才以 `PLS-E8405` 失敗；不認得的 `install.upgrade` 值分類為 `not_ready`）、低於 `min_upgrade_from`、沒有對應平台的發佈檔、無法自動回滾、多實例、已在另一個進行中的推送（一台主機同時只能屬於一個進行中的推送，建立時 409 `rollout_overlap`）。
 - **版本庫的檔案遺失**（0.10.0，ADR-0002 F1～F3；`KRS-W8417`）：資料庫記為已存入、但檔案不存在或大小不符的發佈檔（代管的版本；只 `stat`，與系統健康相同）不算可以提議的檔案。預覽與送出時，需要它的主機分類為 `artifact_missing`（與「版本庫沒有這個平台的檔案」的 `no_artifact` 分開：一個是重新上傳、一個是匯入另一個檔案）；回滾檔遺失的 deb／rpm 主機算無法自動回滾。核准時再檢查一次（409 `artifact_missing`）；提議時不發出無法下載的提議（第 13.1 節）。外部 URL 的版本沒有本機檔案，不適用。
 - 批次中的順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)` 排序（同一個推送每次計算結果相同，不偏向某個群組）。
 - 推送進行中新註冊、或之後才符合選擇器的主機**不加入**（推送的對象在開始時固定）；要涵蓋它們請另建推送。
@@ -780,7 +781,7 @@ CREATE INDEX host_config_state ON host_config(state);
 
 -- 主機的安裝資訊（hello 的 install）
 ALTER TABLE hosts ADD COLUMN install_method  TEXT;
-ALTER TABLE hosts ADD COLUMN install_upgrade TEXT;   -- ready／disabled／no_trust_anchor／no_helper／unsupported
+ALTER TABLE hosts ADD COLUMN install_upgrade TEXT;   -- ready／disabled／no_trust_anchor／no_helper／unsupported／unsafe_path（0.10.0；欄位是自由文字，不需要 schema 變更）
 ALTER TABLE hosts ADD COLUMN install_config  TEXT;
 
 -- 發佈版本庫
@@ -1501,6 +1502,16 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 | 工作目錄中接續要用的檔案（`state.json`、複本、備份） | 以 `O_NOFOLLOW` 開啟、必須是一般檔案 |
 
 沒有檢查：掛載選項（`nosuid`、`noexec`）、檔案系統類型、ACL 與 SELinux 標籤、`/etc/systemd/system` 的權限、`pulse.toml` 的擁有者（INSTALL 規定 `root:pulse 640`；輔助程式只讀它，不寫）。
+
+**hello 之前的預檢（0.10.0；`install.upgrade = "unsafe_path"`）**：Pulse（服務帳號 `pulse`，不是 root）在每次連線前偵測安裝狀態時（第 2.1、4.3 節），對「其他條件都就緒」的主機先做一次上表的檢查，不通過就在 hello 回報 `install.upgrade = "unsafe_path"`、不宣告 `upgrade`；Kairos 的資格預覽把它分類為 `unsafe_path`（第 4.7.2 節），主控台的資格預覽與主機詳情顯示「路徑不安全」與處置方式。目的是讓不合規的主機在建立推送時就被標出來，而不是等推送失敗（`PLS-E8405`）。`pulse upgrade status` 顯示「路徑不安全（PLS-E8405）」，「原因」是與輔助程式的 `detail` 相同的 `unsafe_path: <路徑>: <原因>`。
+
+- **同一套檢查**：預檢與輔助程式呼叫同一組函式（`helper/txn.rs` 的 `inspect_install`、`inspect_private_dir`；預檢的進入點是 `precheck`），不是另外寫的一份。單元測試對每一種不安全的情況確認兩者回報**同一個**路徑與原因。
+- **預檢不建立、不修改任何東西**；輔助程式的檢查**維持不變**（`/var/lib/pulse-upgrade` 不存在時建立、只多了讀取／執行權限時改回 0700）。預檢只是提早告知，不取代輔助程式的檢查：兩者之間路徑可能改變，輔助程式每次執行都重新檢查。
+- **涵蓋**（服務帳號以 `lstat`／`realpath` 做得到的）：`/opt/pulse` 與它的每一層上層目錄、`/opt/pulse/pulse`、`/opt/pulse/pulse.prev`（存在時）、`/var/lib/pulse-upgrade` 本身（`0700 root` 的目錄可以 `lstat`）與它的每一層上層目錄。`/var/lib/pulse-upgrade` 不存在（輔助程式第一次執行時才建立）、或群組與其他人只多了讀取／執行權限（輔助程式會改回）都算通過。
+- **不涵蓋**：每筆交易的工作目錄 `/var/lib/pulse-upgrade/<upgrade_id>` 與其中的檔案（根目錄是 `0700 root`，服務帳號進不去）——仍由輔助程式在執行時檢查（第 17.9.5 節的 `unsafe_path`）；上表「沒有檢查」的項目。
+- **看不到的不算不安全**：`lstat`／`realpath` 因為權限不足（`EACCES`）失敗時略過那一部分（安裝目錄、工作目錄的根目錄各自獨立），不回報 `unsafe_path`——服務帳號看不到不代表路徑有問題；輔助程式（root）沒有這個例外。
+- **什麼時候更新**：與其他的 `install` 欄位相同，每次連線前重新偵測。連線期間路徑被改掉，要到下一次重新連線才會回報；已送出的推送中，送出之後才變成 `unsafe_path` 的主機沒有協商 `upgrade`，在推送中標為 `skipped`（`not_ready`），主機詳情顯示實際的狀態。
+- **相容**：見第 2.1 節。協定版本、schema 都不變。
 
 **路徑檢查在一切之前，包括接續**：`apply()` 的第一步就是安裝目錄與 `/var/lib/pulse-upgrade` 的檢查，在讀指標、掃描工作目錄之前。不通過時不論有沒有未結束的交易，都回報 `failed`（`PLS-E8405`）、刪除 `request.json`，不接續、不健康確認、不回滾。對全新的請求這就是「不做任何變更」；但有一個需要兩件事同時成立的情況：**0.9 → 0.10 的升級在替換之後中斷（當機、斷電），由 0.10.0 的輔助程式接續，而這台主機的路徑不符合上表**（0.9.0 的輔助程式沒有這項檢查，所以替換本身做得完）。此時主機停在新版（0.10.0）、沒有健康確認也沒有回滾，回報的 `upgrade_id` 是請求的；0.9.0 留下的 v1 紀錄（`replaced`）原封不動。修正路徑之後的**下一個**請求會依第 17.9.6 節接續這筆 v1 的交易——期限早已過去，結果是回滾到 0.9（`pulse.prev`）。處置：修正路徑後，先確認 0.10.0 運作正常，再刪除 `/var/lib/pulse-upgrade/<upgrade_id>`（那筆 v1 紀錄的工作目錄）才送出新的升級；不刪除的話，下一個請求（不論目標版本）得到的是回滾。0.10.0 之後開始的交易（v2）遇到同樣的情況時指標與紀錄同樣留著，修正路徑後的下一次觸發依第 17.9.3 節接續（期限已過 → 回滾）。
 

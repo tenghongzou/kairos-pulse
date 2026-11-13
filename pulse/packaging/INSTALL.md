@@ -720,7 +720,7 @@ Kairos 0.9.0 可以推送**官方簽章**的新版 Pulse（`crates/kairos-proto/
    ```
 
    `pulse-upgrade.path` 監看 `/var/lib/pulse/upgrade/request.json`（Pulse 在升級時段內寫入），檔案出現時啟動 `pulse-upgrade.service`（`Type=oneshot`、root、`RestrictAddressFamilies=AF_UNIX`，工作目錄 `/var/lib/pulse-upgrade` 為 0700）。
-3. **確認**：Pulse 每次連線前重新偵測（不必重新啟動；`[upgrade]` 的設定改變時才需要重新啟動）。`pulse upgrade status` 應顯示「遠端升級：就緒」與信任錨的金鑰指紋；不是時顯示原因（`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`：多實例、容器、不是 `/opt/pulse` 的 tar 安裝）。
+3. **確認**：Pulse 每次連線前重新偵測（不必重新啟動；`[upgrade]` 的設定改變時才需要重新啟動）。`pulse upgrade status` 應顯示「遠端升級：就緒」與信任錨的金鑰指紋；不是時顯示原因（`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`：多實例、容器、不是 `/opt/pulse` 的 tar 安裝；`unsafe_path`〔0.10.0〕：`/opt/pulse`、`/opt/pulse/pulse`、`/var/lib/pulse-upgrade` 或它們的上層目錄不屬於 root、可由群組或其他人寫入，或 `/opt/pulse` 是符號連結——「原因」寫出是哪一個路徑；以 `stat -c '%U %a %n' / /opt /opt/pulse /opt/pulse/pulse /var /var/lib /var/lib/pulse-upgrade` 檢查，改為 root 擁有並 `chmod go-w` 後，Pulse 下一次連線時恢復為就緒。依本文件安裝的 `/opt/pulse`〔`root:pulse 751`〕符合）。
 
 升級時：tar 安裝替換 `/opt/pulse/pulse`（舊版保留為 `pulse.prev`），`/etc/systemd/system/pulse.service` 是歷來的官方版本（沒有被修改過）時一併換新並 `daemon-reload`，改過的不動（結果的 `detail` 註明 `unit_not_updated`，服務照常執行）；deb／rpm 以 `dpkg -i --force-confold`／`rpm -U --oldpackage --replacepkgs` 安裝（`pulse.toml` 不覆寫；版本政策依實際的執行檔判斷，套件資料庫的版本不影響）。替換後在健康確認期限內（預設 600 秒）確認新版已連上 Kairos 並有 report 被確認，再穩定 60 秒才算成功；否則自動回滾。紀錄：`journalctl -u pulse-upgrade`、`/var/lib/pulse-upgrade/<upgrade_id>/upgrade.log`（`pulse diag` 收集）。回滾失敗（`PLS-E8408`）時所有暫存都保留，請依紀錄手動處理：tar 安裝 `sudo /opt/pulse/pulse upgrade rollback --yes`（換回 `pulse.prev`；可在任何目錄執行）；deb／rpm 以舊版套件 `dpkg -i`／`rpm -U --oldpackage` 重新安裝。rpm 的輔助程式需要 `cpio`（解開新版做預檢；0.9.0 的 rpm 已宣告相依）。
 
