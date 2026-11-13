@@ -822,6 +822,16 @@ async fn remote(ctx: &ApiContext) -> Item {
     }
     use crate::remote::rollout;
     let dir = svc.releases_dir.clone();
+    let now_ms = svc.now_ms();
+    // 雙人覆核：啟動時與資料庫的前值比對的結果（前值、來源、最近一次改變；ADR-0002 決策點 2i）
+    let policy = svc.approval_policy();
+    values["rollout_approval_observed"] = policy.map_or(Value::Null, |o| o.json());
+    values["rollout_approval_change"] =
+        policy.map_or(Value::Null, |o| o.recent_change_json(now_ms));
+    let disabled_recently = policy.is_some_and(|o| {
+        o.disabled_at
+            .is_some_and(|at| now_ms - at < crate::remote::policy::RECENT_CHANGE_MS)
+    });
     let counts = svc
         .db
         .read(move |s| {
@@ -849,24 +859,58 @@ async fn remote(ctx: &ApiContext) -> Item {
                     missing.push((r.version.clone(), a.filename.clone(), problem, rollback));
                 }
             }
+            // 進行中的推送裡等待版本庫檔案的主機（ADR-0002 F3：不提議、留在 pending，補檔後自動繼續）
+            let running = s.list_rollouts(Some(rollout::ROLLOUT_RUNNING))?;
+            let mut waiting = 0usize;
+            if !missing.is_empty() {
+                for r in &running {
+                    waiting += s
+                        .rollout_hosts(&r.id)?
+                        .iter()
+                        .filter(|h| {
+                            h.state == rollout::HOST_PENDING
+                                && h.reason.as_deref() == Some(rollout::SKIP_ARTIFACT_MISSING)
+                        })
+                        .count();
+                }
+            }
+            // 待核准的推送，以及其中目前沒有任何人可以核准的（ADR-0002 決策點 2g）
+            let pending = s.list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))?;
+            let no_approvers = if pending.is_empty() {
+                0
+            } else {
+                let approvers = crate::remote::submission::approvers(s, now_ms)?;
+                pending
+                    .iter()
+                    .filter(|r| {
+                        crate::remote::submission::approvers_available(
+                            &approvers,
+                            &r.created_by,
+                            r.submitted_by.as_deref(),
+                        ) == 0
+                    })
+                    .count()
+            };
             Ok((
-                s.list_rollouts(Some(rollout::ROLLOUT_RUNNING))?.len(),
+                running.len(),
                 s.list_rollouts(Some(rollout::ROLLOUT_PAUSED))?,
                 releases.len(),
                 s.unacknowledged_rollback_failures()?.len(),
                 missing,
+                (waiting, pending.len(), no_approvers),
             ))
         })
         .await;
-    let (running, paused, releases, failures, missing) = match counts {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("系統健康：無法讀取推送的狀態：{e}");
-            values["error"] = json!("無法讀取推送的狀態");
-            return Item::new("remote", Level::Warning, "無法讀取推送的狀態", values)
-                .needs(Permission::RolloutsRead);
-        }
-    };
+    let (running, paused, releases, failures, missing, (waiting, pending, no_approvers)) =
+        match counts {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("系統健康：無法讀取推送的狀態：{e}");
+                values["error"] = json!("無法讀取推送的狀態");
+                return Item::new("remote", Level::Warning, "無法讀取推送的狀態", values)
+                    .needs(Permission::RolloutsRead);
+            }
+        };
     let auto: Vec<_> = paused.iter().filter(|r| r.pause_cause.is_some()).collect();
     values["rollouts_running"] = json!(running);
     values["rollouts_paused"] = json!(paused.len());
@@ -898,6 +942,9 @@ async fn remote(ctx: &ApiContext) -> Item {
             .collect::<Vec<_>>()
     );
     values["rollback_failed_unacknowledged"] = json!(failures);
+    values["hosts_waiting_artifact"] = json!(waiting);
+    values["pending_approval"] = json!(pending);
+    values["pending_approval_no_approvers"] = json!(no_approvers);
     values["downloads_in_progress"] = json!(svc.downloads_in_progress());
     values["max_concurrent_downloads"] = json!(st.max_concurrent_downloads);
     let config_note = if st.config_enabled {
@@ -942,10 +989,32 @@ async fn remote(ctx: &ApiContext) -> Item {
         } else {
             String::new()
         };
+        let waiting_note = if waiting > 0 {
+            format!("；{waiting} 台主機等待中")
+        } else {
+            String::new()
+        };
         (
             Level::Warning,
             Some(crate::remote::CODE_RELEASE_FILE_MISSING),
-            format!("{what}：{version} 的 {filename}{need}{more}；請重新匯入這個版本的發佈檔"),
+            format!(
+                "{what}：{version} 的 {filename}{need}{more}{waiting_note}；請重新匯入這個版本的發佈檔"
+            ),
+        )
+    } else if disabled_recently {
+        (
+            Level::Warning,
+            None,
+            "雙人覆核已關閉（remote.rollout_approval 由 required 改為 none）：送出的推送不需要另一位管理員核准"
+                .to_string(),
+        )
+    } else if no_approvers > 0 {
+        (
+            Level::Warning,
+            None,
+            format!(
+                "{no_approvers} 個待核准的推送目前沒有可以核准的管理員（建立者與送出者不能核准）"
+            ),
         )
     } else if !trust && releases > 0 {
         (

@@ -52,7 +52,7 @@ function signer(seedByte) {
   };
 }
 
-function testRelease() {
+export function testRelease() {
   const manifestName = `pulse-${VERSION}-${COMMIT}-release.json`;
   const manifest = `{"schema":"kairos-pulse.release/v1","product":"pulse","version":"${VERSION}","commit":"${COMMIT}","released_at":"2026-11-18","min_kairos":"0.5.0","min_upgrade_from":"0.9.0","remote_features":["config","upgrade"],"breaking":false}\n`;
   const tar = `pulse-${VERSION}-${COMMIT}-linux-x86_64.tar.gz`;
@@ -74,7 +74,7 @@ function testRelease() {
   };
 }
 
-async function api(page, method, path, body) {
+export async function api(page, method, path, body) {
   return page.evaluate(
     async ([m, p, b]) => {
       const me = (await (await fetch('/api/v1/me')).json()).data;
@@ -91,7 +91,7 @@ async function api(page, method, path, body) {
   );
 }
 
-async function until(fn, ms = 20000, what = '條件') {
+export async function until(fn, ms = 20000, what = '條件') {
   const t0 = Date.now();
   for (;;) {
     const v = await fn();
@@ -416,17 +416,29 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await axe(ap.page, 'F8 S26 已自動暫停');
     await ap.ctx.close();
 
-    // 雙人覆核（0.10；REMOTE.md 第 5.4 節；測試用的 Kairos 沒有啟用，攔截詳情模擬 pending_approval）：
-    // 別人送出的推送 → 管理員看到「核准…」「退回…」；核准被伺服器拒絕（403 self_approval，KRS-E6106）時就地顯示；
-    // 自己建立的推送沒有「核准…」並說明原因；維運者（沒有 rollouts:approve）沒有這兩個按鈕
-    const pendingBy = (who) => async (route) => {
+    // 雙人覆核（0.10；REMOTE.md 第 5.4 節）：完整的流程（送出 → 待核准 → L2 核准、退回、三人邊界、檔案遺失）在
+    // 啟用雙人覆核的第三個 Kairos 上測試（e2e-approval.mjs）。這裡只測伺服器拒絕時的畫面——這台 Kairos 沒有啟用，
+    // 攔截詳情模擬 pending_approval（含伺服器算出的 submission 與 viewer）：
+    // 可以核准的人看到「核准…」「退回…」；核准被伺服器拒絕（403 self_approval，KRS-E6106）時就地顯示；
+    // 建立者或送出者沒有「核准…」「退回…」並說明原因；維運者（沒有 rollouts:approve）沒有這些按鈕
+    const pendingBy = (who, viewer) => async (route) => {
       const r = await route.fetch();
       const body = await r.json();
-      Object.assign(body.data, { state: 'pending_approval', next_action: { code: 'pending_approval' }, pause_reason: null, pause_cause: null, created_by: who, submitted_by: who, submitted_at: new Date().toISOString() });
+      Object.assign(body.data, {
+        state: 'pending_approval',
+        next_action: { code: 'pending_approval' },
+        pause_reason: null,
+        pause_cause: null,
+        created_by: who,
+        submitted_by: who,
+        submitted_at: new Date().toISOString(),
+        submission: { digest: 'd'.repeat(64), confirm_text: '核准 1 台', confirm_level: 'L2', eligible: 1, downgrade: 0, no_rollback: 0, skipped: {}, waves: [1, 0], warnings: [], artifact_problems: [], approvers_available: 1, approval_deadline: null },
+        viewer,
+      });
       return route.fulfill({ response: r, json: body });
     };
     const pa = await newPage();
-    await pa.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:someone-else'));
+    await pa.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:someone-else', { can_approve: true, blocked: null, is_creator: false, is_submitter: false }));
     let approveCalls = 0;
     await pa.page.route(`**/api/v1/rollouts/${rolloutId}/approve`, async (route) => {
       approveCalls += 1;
@@ -438,15 +450,19 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     });
     await login(pa.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
     await waitTitle(pa.page, 'E2E 0.9.1');
-    await pa.page.locator('.ds-alert', { hasText: '待核准' }).getByText(/user:someone-else 於 .* 送出，對象已固定/).waitFor();
+    await pa.page.locator('.ds-alert', { hasText: '待核准' }).getByText(/user:someone-else 於 .* 送出（已等待 .*），等待核准/).waitFor();
     assert.equal(await pa.page.getByRole('button', { name: '退回…' }).count(), 1);
     assert.equal(await pa.page.getByRole('button', { name: '取消推送…' }).count(), 1, '待核准的推送可以取消');
     await axe(pa.page, 'F8 S26 待核准（核准者）');
     await pa.page.getByRole('button', { name: '核准…' }).click();
     const ad = pa.page.getByRole('dialog');
     await ad.getByText('核准推送「E2E 0.9.1」？').waitFor();
+    // L2：輸入伺服器算出的確認字串之前不能按
+    const adOk = ad.getByRole('button', { name: '核准 1 台', exact: true });
+    assert.ok(await adOk.isDisabled(), '輸入確認字串前不能核准');
     await axe(pa.page, 'F8 S26 核准確認');
-    await ad.getByRole('button', { name: '核准推送' }).click();
+    await ad.getByLabel(/輸入「核准 1 台」以確認/).fill('核准 1 台');
+    await adOk.click();
     await ad.getByText('KRS-E6106').waitFor();
     assert.equal(approveCalls, 1);
     await ad.getByRole('button', { name: '取消' }).click();
@@ -459,15 +475,15 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await rd.getByRole('button', { name: '取消' }).click();
     await pa.ctx.close();
     const own = await newPage();
-    await own.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin'));
+    await own.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin', { can_approve: false, blocked: 'self_approval', is_creator: true, is_submitter: true }));
     await login(own.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
     await waitTitle(own.page, 'E2E 0.9.1');
     await own.page.getByText('你建立或送出了這個推送，不能自己核准（KRS-E6106）。').waitFor();
-    assert.equal(await own.page.getByRole('button', { name: '核准…' }).count(), 0, '不能核准自己的推送');
-    assert.equal(await own.page.getByRole('button', { name: '退回…' }).count(), 1);
+    assert.equal(await own.page.getByRole('button', { name: /^(核准…|退回…)$/ }).count(), 0, '建立者與送出者沒有核准、退回');
+    assert.equal(await own.page.getByRole('button', { name: '取消推送…' }).count(), 1);
     await own.ctx.close();
     const po = await newPage();
-    await po.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin'));
+    await po.page.route(`**/api/v1/rollouts/${rolloutId}`, pendingBy('user:admin', { can_approve: false, blocked: 'forbidden', is_creator: false, is_submitter: false }));
     await login(po.page, 'operator', PW, `/pulse/rollouts/${rolloutId}`);
     await waitTitle(po.page, 'E2E 0.9.1');
     await po.page.locator('.ds-alert', { hasText: '待核准' }).waitFor();
@@ -719,7 +735,12 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     const w = await api(page, 'DELETE', `/api/v1/config/profiles/${created.id}`, {});
     assert.equal(w.status, 403);
     // 全域搜尋（0.10）：推送（名稱、編號、目標版本）與設定檔（名稱、說明）；稽核員有 rollouts:read、config:read
+    // 提示文字依可用的搜尋提供者組成（ADR-0002 決策點 6）：頂列只寫「搜尋」，對話框的標籤列出稽核員可以搜尋的四類
+    assert.equal(await page.locator('.k-search-trigger').getAttribute('title'), '搜尋（Ctrl K）');
     await page.keyboard.press('Control+k');
+    const auBox = page.getByRole('combobox', { name: '搜尋主機、告警事件、升級推送、設定檔', exact: true });
+    await auBox.waitFor();
+    assert.equal(await auBox.getAttribute('placeholder'), '例如 hmi-line3、10.30.3.0/24、r-20261120-0001');
     await page.keyboard.type('E2E');
     const found = page.getByRole('listbox', { name: '搜尋結果' });
     await found.getByRole('group', { name: '升級推送' }).getByRole('option', { name: /E2E 0\.9\.1/ }).waitFor();
@@ -743,6 +764,10 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await login(vs.page, 'viewer', PW, '/hosts');
     await waitTitle(vs.page, '主機');
     await vs.page.keyboard.press('Control+k');
+    // 唯讀角色只能搜尋主機與告警事件：標籤不列出搜不到的類別，範例不附推送編號
+    const vsBox = vs.page.getByRole('combobox', { name: '搜尋主機、告警事件', exact: true });
+    await vsBox.waitFor();
+    assert.equal(await vsBox.getAttribute('placeholder'), '例如 hmi-line3、6f1c0e4a、10.30.3.27、10.30.3.0/24');
     await vs.page.keyboard.type('E2E 0.9');
     await vs.page.getByText('沒有符合「E2E 0.9」的結果。').waitFor();
     assert.deepEqual(asked, []);

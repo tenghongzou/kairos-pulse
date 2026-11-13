@@ -32,6 +32,7 @@ use crate::remote::RemoteService;
 use crate::remote::desired::{self, Selector};
 use crate::remote::ops::{self, Actor, PreviewChange, ProfileInput};
 use crate::remote::rollout::{self, RolloutSpec};
+use crate::remote::submission::{self, PendingContext, Viewer};
 
 /// JSON 本文的上限（REMOTE.md 第 8 節：1 MiB，發佈檔上傳除外）
 const MAX_BODY: usize = 1024 * 1024;
@@ -77,6 +78,15 @@ fn service(ctx: &ApiContext, config_area: bool) -> Result<Arc<RemoteService>, Ap
         ));
     }
     Ok(svc)
+}
+
+/// 這次請求的身分（雙人覆核：能否核准由後端計算，主控台不以帳號字串比對）
+fn viewer_of(p: &Principal) -> Viewer {
+    Viewer {
+        actor: p.actor(),
+        session: matches!(p.kind, super::auth::PrincipalKind::Session { .. }),
+        approve: p.grants.has(Permission::RolloutsApprove),
+    }
 }
 
 fn actor(p: &Principal, peer: SocketAddr) -> Actor {
@@ -1153,7 +1163,7 @@ async fn rollouts(
         (_, []) if get => {
             query.reject_unknown(&["state", "q"], &[])?;
             p.require(Permission::RolloutsRead)?;
-            service(ctx, false)?;
+            let svc = service(ctx, false)?;
             let q = search_term(query)?;
             let state = query.get("state").map(str::to_string);
             if state.as_deref().is_some_and(|s| {
@@ -1174,10 +1184,14 @@ async fn rollouts(
                 ));
             }
             let now_ms = now.timestamp_millis();
-            let approval = ctx
-                .remote
-                .as_ref()
-                .map(|s| s.settings.rollout_approval.clone());
+            let approval = svc.settings.rollout_approval.clone();
+            // 雙人覆核最近 30 天內的改變（啟動時與資料庫的前值比對，ADR-0002 決策點 2i）
+            let approval_change = svc
+                .approval_policy()
+                .map_or(Value::Null, |o| o.recent_change_json(now_ms));
+            let viewer = viewer_of(p);
+            let live = svc.live_hellos();
+            let releases_dir = svc.releases_dir.clone();
             let (data, meta) = ctx
                 .pool
                 .read("升級推送", move |s| {
@@ -1196,9 +1210,26 @@ async fn rollouts(
                         })
                         .collect();
                     let mut out = Vec::new();
+                    // 待核准的推送另附送審摘要與這次請求的身分能否核准（「待核准」檢視）；需要的清冊、
+                    // 版本庫檔案與可核准者只在清單中有待核准的推送時載入一次
+                    let mut pending_cx: Option<PendingContext> = None;
                     for r in &list {
                         let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;
-                        out.push(crate::remote::rollout_json(r, &hosts, now_ms, false));
+                        let mut v = crate::remote::rollout_json(r, &hosts, now_ms, false);
+                        if r.state == rollout::ROLLOUT_PENDING_APPROVAL {
+                            if pending_cx.is_none() {
+                                pending_cx = Some(
+                                    PendingContext::load(s, &live, &releases_dir, now_ms)
+                                        .map_err(query_failed("升級推送"))?,
+                                );
+                            }
+                            if let Some(cx) = &pending_cx {
+                                v["submission"] = submission::submission_json(s, r, &hosts, cx)
+                                    .map_err(|e| e.into_api("升級推送"))?;
+                            }
+                            v["viewer"] = viewer.json(r);
+                        }
+                        out.push(v);
                     }
                     // 需要人處理的數量（SideNav 的計數泡泡；不受 state 篩選影響）
                     let paused = s
@@ -1212,15 +1243,19 @@ async fn rollouts(
                     // 雙人覆核（0.10）：待核准的推送數與目前的設定
                     let pending = s
                         .list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))
-                        .map_err(query_failed("升級推送"))?
-                        .len();
+                        .map_err(query_failed("升級推送"))?;
+                    // 這次請求的身分可以核准的筆數（有 rollouts:approve、是帳號登入的工作階段、不是建立者
+                    // 或送出者）：由後端計算，SideNav 的泡泡只計這個數字
+                    let actionable = pending.iter().filter(|r| viewer.can_approve(r)).count();
                     Ok((
                         out,
                         json!({
                             "paused": paused,
                             "rollback_failed_unacknowledged": failures,
-                            "pending_approval": pending,
+                            "pending_approval": pending.len(),
+                            "pending_approval_actionable": actionable,
                             "rollout_approval": approval,
+                            "rollout_approval_change": approval_change,
                         }),
                     ))
                 })
@@ -1245,14 +1280,18 @@ async fn rollouts(
             let svc = service(ctx, false)?;
             let b = http::read_json(req, MAX_BODY).await?;
             let spec = RolloutSpec::parse(&b).map_err(|(f, m)| ApiError::param(&f, m))?;
-            Ok(http::ok(now, svc.preview_rollout(spec, None).await?))
+            Ok(http::ok(
+                now,
+                svc.preview_rollout(spec, None, Some(who.actor.clone()))
+                    .await?,
+            ))
         }
         (_, ["preview"]) => Err(method_not_allowed("POST")),
         (_, [id]) if get => {
             query.reject_unknown(&[], &[])?;
             p.require(Permission::RolloutsRead)?;
             let svc = service(ctx, false)?;
-            rollout_detail(ctx, &svc, id.to_string(), now).await
+            rollout_detail(ctx, &svc, id.to_string(), viewer_of(p), now).await
         }
         ("PUT", [id]) => {
             p.require(Permission::RolloutsWrite)?;
@@ -1325,10 +1364,21 @@ async fn rollouts(
             }
             let svc = service(ctx, false)?;
             let b = body_json_optional(req).await?.unwrap_or(json!({}));
-            reject_unknown_fields(&b, &["reason"])?;
+            // 核准（L2，ADR-0002 決策點 2b）：`confirm`（「核准 N 台」；降版「核准降版 N 台」）與 `digest`
+            // （推送的 `submission.digest`）必填，伺服器在核准的交易中重新計算並比對；降版另需 `reason`
+            if *action == "approve" {
+                reject_unknown_fields(&b, &["confirm", "digest", "reason"])?;
+            } else {
+                reject_unknown_fields(&b, &["reason"])?;
+            }
             let reason = ops::reason_of(&b)?;
             let v = if *action == "approve" {
-                svc.approve_rollout(&who, id.to_string()).await?
+                let req = crate::remote::ApproveRequest {
+                    confirm: opt_string(&b, "confirm")?,
+                    digest: opt_string(&b, "digest")?,
+                    reason,
+                };
+                svc.approve_rollout(&who, id.to_string(), req).await?
             } else {
                 let reason = reason.ok_or_else(|| ApiError::param("reason", "需要 reason"))?;
                 svc.reject_rollout(&who, id.to_string(), reason).await?
@@ -1365,10 +1415,14 @@ async fn rollout_detail(
     ctx: &Arc<ApiContext>,
     svc: &Arc<RemoteService>,
     id: String,
+    viewer: Viewer,
     now: DateTime<Utc>,
 ) -> Result<Response<ApiBody>, ApiError> {
     let now_ms = now.timestamp_millis();
     let i = id.clone();
+    let live = svc.live_hellos();
+    let releases_dir = svc.releases_dir.clone();
+    let actor = viewer.actor.clone();
     let (r, v) = ctx
         .pool
         .read("升級推送", move |s| {
@@ -1380,7 +1434,16 @@ async fn rollout_detail(
                 ));
             };
             let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;
-            let v = crate::remote::rollout_json(&r, &hosts, now_ms, true);
+            let mut v = crate::remote::rollout_json(&r, &hosts, now_ms, true);
+            if r.state == rollout::ROLLOUT_PENDING_APPROVAL {
+                // 送審摘要（核准者要確認的內容；`digest` 與 `confirm_text` 在核准時由伺服器重新計算並比對）
+                // 與這次請求的身分能否核准
+                let cx = PendingContext::load(s, &live, &releases_dir, now_ms)
+                    .map_err(query_failed("升級推送"))?;
+                v["submission"] = submission::submission_json(s, &r, &hosts, &cx)
+                    .map_err(|e| e.into_api("升級推送"))?;
+                v["viewer"] = viewer.json(&r);
+            }
             Ok((r, v))
         })
         .await?;
@@ -1395,7 +1458,9 @@ async fn rollout_detail(
             options: rollout::options_from_db(&r.options),
             schedule: crate::remote::schedule::ScheduleSpec::from_db(&r.schedule),
         };
-        v["preview"] = svc.preview_rollout(spec, Some(r.id.clone())).await?;
+        v["preview"] = svc
+            .preview_rollout(spec, Some(r.id.clone()), Some(actor))
+            .await?;
     }
     Ok(http::ok(now, v))
 }

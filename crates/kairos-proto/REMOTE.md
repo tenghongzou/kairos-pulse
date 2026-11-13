@@ -548,6 +548,7 @@ stateDiagram-v2
 #### 4.7.2 主機的順序與資格
 
 - 建立推送時計算資格（預覽 API，第 8.3 節）：可升級、已是目標版本（`skipped: already`）、Pulse 太舊（`unsupported_version`，< 0.9.0）、本機停用或缺少輔助程式（依 `install.upgrade`）、低於 `min_upgrade_from`、沒有對應平台的發佈檔、無法自動回滾、多實例、已在另一個進行中的推送（一台主機同時只能屬於一個進行中的推送，建立時 409 `rollout_overlap`）。
+- **版本庫的檔案遺失**（0.10.0，ADR-0002 F1～F3；`KRS-W8417`）：資料庫記為已存入、但檔案不存在或大小不符的發佈檔（代管的版本；只 `stat`，與系統健康相同）不算可以提議的檔案。預覽與送出時，需要它的主機分類為 `artifact_missing`（與「版本庫沒有這個平台的檔案」的 `no_artifact` 分開：一個是重新上傳、一個是匯入另一個檔案）；回滾檔遺失的 deb／rpm 主機算無法自動回滾。核准時再檢查一次（409 `artifact_missing`）；提議時不發出無法下載的提議（第 13.1 節）。外部 URL 的版本沒有本機檔案，不適用。
 - 批次中的順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)` 排序（同一個推送每次計算結果相同，不偏向某個群組）。
 - 推送進行中新註冊、或之後才符合選擇器的主機**不加入**（推送的對象在開始時固定）；要涵蓋它們請另建推送。
 
@@ -634,7 +635,7 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | `rollouts:read` | ✓ | ✓ | ✓ | | 推送清單、詳情、每台主機的升級狀態 |
 | `rollouts:write` | ✓ | | | | 建立、修改草稿、啟動、繼續、取消推送（第 14 節 D8） |
 | `rollouts:pause` | ✓ | ✓ | | | 暫停推送（緊急煞車：維運者也能停，不能啟動） |
-| `rollouts:approve` | ✓ | | | | 雙人覆核時核准（不能核准自己建立的推送） |
+| `rollouts:approve` | ✓ | | | | 雙人覆核時核准、退回（建立者與送出者都不能核准自己的推送，第 5.4 節） |
 
 - 主機詳情中的「設定」「升級」卡片只需要 `hosts:read` 看摘要（目前版本、設定是否同步），細節需要 `config:read`／`rollouts:read`。
 - 全部只由**全站範圍**的角色指派授予（與告警相同的保守做法；群組範圍的寫入屬於延後項目，API.md 第 12.11 節）。
@@ -650,15 +651,48 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | `release` | `release.import`（版本、檔案、簽署金鑰指紋）、`release.import_failed`（`KRS-E8413`）、`release.delete` |
 | `rollout` | `rollout.create`、`rollout.update`、`rollout.submit`、`rollout.approve`、`rollout.reject`、`rollout.start`、`rollout.pause`、`rollout.auto_pause`（`system`，原因）、`rollout.resume`、`rollout.cancel`、`rollout.complete`（各狀態的台數） |
 | `host` | `host.upgrade.signature_failed`（`PLS-E8401`，主機、檔案）、`host.upgrade.rollback_failed`、`host.upgrade.rolled_back` |
+| `settings` | `settings.rollout_approval.baseline`、`settings.rollout_approval.change`（0.10.0；`system`，啟動時與資料庫的前值比對，對象 `remote.rollout_approval`；第 5.4 節） |
+
+- 0.10.0（ADR-0002）：`rollout.submit` 的 `details` 另有 `digest`；`rollout.approve` 的 `details` 有 `digest`、`eligible`、`downgrade`、`confirm_level`、`reason`，以及原本的送審資訊（`created_by`、`submitted_by`、`submitted_at`）。
 
 - 每台主機的一般升級結果（`succeeded`、`declined`…）記在 `rollout_hosts`，**不**逐台寫入稽核鏈（1 萬台的推送會產生 1 萬筆；第 14 節 D17）；推送完成時的 `rollout.complete` 帶各狀態的台數。安全相關（簽章失敗）與需要人工處理（回滾失敗）的逐台記錄。
 - 被拒絕的寫入照舊以 `access.denied` 記錄。
 
 ### 5.4 雙人覆核
 
-- Kairos 設定 `[remote] rollout_approval = "none" | "required"`（預設 `none`，第 14 節 D7）。`required` 時推送建立後為 `pending_approval`，必須由**另一位**有 `rollouts:approve` 的使用者核准（以帳號登入的工作階段；API token 不能核准），核准者與建立者相同時 403 `self_approval`（`KRS-E6106`）。核准後推送內容（目標、選擇器、批次、時段）鎖定，修改要重新送審。
-- 把 `rollout_approval` 由 `required` 改為 `none` 是 L3 操作（設計包 §0.3 已有「關閉雙人覆核」）。設定只在 `kairos.toml`，主控台唯讀顯示（與其他安全設定相同）。
+> 0.10.0 依 ADR-0002（`docs/adr/0002-rollout-console-design.md`，2026-11-13 核定；實作範圍 S0～S3）修訂。實作的細節在第 13.1 節「雙人覆核」。
+
+- Kairos 設定 `[remote] rollout_approval = "none" | "required"`（預設 `none`，第 14 節 D7）。`required` 時推送送出（`submit`）後為 `pending_approval`，必須由有 `rollouts:approve` 的使用者核准（以帳號登入的工作階段；API token 不能核准）。核准後推送內容（目標、選擇器、批次、時段）鎖定，修改要重新送審。
+- **誰可以核准（三人邊界）**：推送的**建立者與送出者都不能核准**（403 `self_approval`，`KRS-E6106`）。由同一個人建立並送出時，另一位管理員就可以核准；甲建立、乙送出時，甲和乙都不能核准，需要第三位管理員丙。只有兩位管理員的部署請由同一個人建立並送出。修改推送的人不在限制之列（修改會把推送退回草稿，內容由送出者重新確認）。
+- **核准是 L2，由伺服器強制**：`POST …/approve` 的本文必須帶 `confirm`（「核准 N 台」，N 為已固定的可升級台數；含降版時為 L3 字串「核准降版 N 台」，另需 `reason`，不要求重新驗證密碼）與 `digest`。伺服器在核准的**同一個交易**中重新讀取推送與已固定的對象、重新計算兩者並比對，再檢查狀態、身分、排程的結束時間與版本庫的檔案，全部通過才轉移狀態——只在畫面上要求輸入字串不構成第二人的確認。
+- **送審摘要與 `digest`**：待核准的推送有 `submission` 物件（第 13.1 節）。`digest` 是這次送審內容的 SHA-256：推送的內容（編號、名稱、目標版本、選擇條件、批次、排程、選項）、建立者、送出的時間與送出者，以及每台已固定主機的 (`agent_id`、批次、順序、狀態、原因、原本的版本)。內容或對象有任何改變、或重新送出，`digest` 就不同；核准者檢視之後推送被修改並重新送出時，舊的 `digest` 得到 409 `submission_changed`。稽核 `rollout.submit` 與 `rollout.approve` 都記下 `digest`，之後可以證明核准者核准的是哪一份內容。
+- **沒有可核准者**：`submission.approvers_available` 是目前已知、啟用中、全站範圍有 `rollouts:approve`、不是這個推送的建立者或送出者的帳號數（目錄服務的帳號以最近一次登入時的群組計算，從未登入過的不計入）。為 0 時預覽、送出對話框、待核准的詳情頁與系統健康都會警告，但不阻擋送出。
+- **沒有逾時**（0.10.0）：待核准的推送會一直佔住它的主機，直到核准、退回、修改或取消；主控台顯示已等待多久。逾時自動退回與通知規則屬於 ADR-0002 的切片 S6，尚未實作（`submission.approval_deadline` 一律 `null`）。
 - 集中設定的變更**不需要**覆核（風險低、可立即回復；白名單不含安全設定）。
+
+**`rollout_approval` 只能在設定檔修改——已接受的治理缺口**
+
+把 `rollout_approval` 由 `required` 改為 `none` **不是** L3 操作，也沒有任何主控台流程：設定只在 `kairos.toml`（或環境變數 `KAIROS__REMOTE__ROLLOUT_APPROVAL`），需要重新啟動，主控台 S21 唯讀顯示。修改設定檔需要主機上的系統權限，但「權限高」不等於「兩個人」：有主機權限的人可以獨自把政策關掉、重新啟動，然後以單人送出大型推送（他也可以直接改資料庫）。主控台內的雙人覆核能防的是「單一的主控台管理員」，防不了主機的系統管理者。Kairos 做的是**讓關閉這件事無法安靜地發生**：
+
+- **前值保存在資料庫**（`meta` 表的 `remote.rollout_approval_observed`，JSON：`value`、`source`＝`file`／`environment`／`default`、`observed_at`、`node`、`changed_at`、`changed_from`、`disabled_at`；隨備份、`kairos db migrate` 與叢集共用，不需要 schema 變更）。
+- **啟動時比對**，在遠端管理開始接受請求（主控台 API、8443 的遠端管理訊息、推送引擎）**之前**、在同一個交易中寫入稽核與新的紀錄。叢集模式下只有取得租約的節點會啟動遠端管理，所以只有主動節點寫入。
+
+  | 情況 | 處理 |
+  |---|---|
+  | 沒有前值（升級到 0.10.0 後第一次啟動、全新安裝、換了新的資料庫） | 記下目前的值作為基準，稽核 `settings.rollout_approval.baseline`，不告警。但目前是 `none` 而資料庫裡有待核准或核准過的推送時，表示曾經啟用過雙人覆核：視同 `required` → `none`（稽核 `…change`，`details.basis = "reviewed_rollouts"`） |
+  | 值與來源都相同 | 不寫任何東西 |
+  | `none` → `required` | 稽核 `settings.rollout_approval.change`（`from`、`to`、`source`、`previous_source`、`node`、`previous_observed_at`） |
+  | `required` → `none` | 稽核同上；另開系統規則「雙人覆核已關閉」的告警事件（下述） |
+  | 只有來源改變（例如由設定檔改為環境變數） | 稽核同上，`details.source_changed = true` |
+  | 還原資料庫備份 | 前值是備份當時的值，與目前的設定不同時照上列處理（可能把還原前就做過的修改再報一次——寧可重複） |
+  | 前值無法解析 | 視同沒有前值，稽核的 `details.previous_unreadable = true` |
+
+- **寫入失敗時遠端管理不啟動**：主控台的集中設定、版本庫與升級推送回 503 `remote_unavailable`，Kairos 不宣告 `config`、`upgrade`；其餘功能與既有主機的連線照常。不能在沒有記錄的情況下以新的政策接受推送。
+- **告警事件「雙人覆核已關閉」**（系統規則 `sys.rollout_approval_disabled`，警告等級、預設推播；尚未分配產品代碼）：觀察到 `required` → `none` 時開啟，到改回 `required` 並重新啟動為止不會自己結束。系統健康的「遠端管理」與 S26 清單頁首在 30 天內顯示關閉的時間與來源（`rollout_approval_change`）；S21 顯示目前的值、來源與上一次改變的時間。
+- **事件只留在同一台 Kairos 上的侷限**：能改設定檔的人通常也能動這台機器上的紀錄。事件的價值取決於它有沒有離開這台機器——通知管道（Email、Webhook）與稽核的外送。
+- **部署端的補償措施**（部署單位的責任，Kairos 不強制；`kairos/packaging/INSTALL.md`「啟用雙人覆核時的部署建議」）：`kairos.toml` 納入設定管理並由另一個人審核修改；主機上的特權操作經過核准或側錄、限制誰可以重新啟動 Kairos；對 `kairos.toml` 設檔案完整性監控；把「雙人覆核已關閉」接到通知管道、稽核日誌外送到 Kairos 以外的系統。
+- 資料庫遺失或換成新的資料庫時等同「沒有前值」，沒有歷史可以判斷，是這個做法的已知限制。可從主控台修改並需要另一位管理員核准的做法（ADR-0002 決策點 2i 的方案 B）列為之後的版本。
+- 改為 `none` 之後，已經在 `pending_approval` 的推送仍然要核准或退回（核准只看推送的狀態）。
 
 ### 5.5 不是遠端執行通道
 
@@ -828,7 +862,7 @@ rollout_approval = "none"        # none／required（第 5.4 節）
 rollout_retention_days = 400
 ```
 
-需要重新啟動才生效（與其他安全相關設定相同）；主控台 S21 唯讀顯示。
+需要重新啟動才生效（與其他安全相關設定相同）；主控台 S21「連線與安全」的「遠端管理」卡片唯讀顯示（0.10.0）。`rollout_approval` 的改變在啟動時與資料庫的前值比對並寫入稽核，`required` → `none` 另開告警事件（第 5.4 節）。
 
 ## 8. 主控台 API 草案
 
@@ -880,7 +914,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `POST /api/v1/rollouts` | `rollouts:write` | 建立（`draft`）：第 4.7.1 節的欄位、`impact_token`；與其他推送重疊 409 `rollout_overlap`（`details.agent_ids` 前 100 台） |
 | `PUT /api/v1/rollouts/{id}` | `rollouts:write` | 只有 `draft`／`pending_approval`／`scheduled` 可修改（修改後需要重新送審） |
 | `POST /api/v1/rollouts/{id}/submit` | `rollouts:write` | 送出：`rollout_approval = "required"` 時進入 `pending_approval`，否則 `scheduled`。L2：`confirm` 為「升級 N 台」（N 為可升級台數）；`allow_downgrade` 時 L3（「降版 N 台」＋重新驗證） |
-| `POST /api/v1/rollouts/{id}/approve`、`/reject` | `rollouts:approve` | 核准者不得是建立者（403 `self_approval`，`KRS-E6106`）；需要以帳號登入的工作階段；`reject` 需要 `reason` |
+| `POST /api/v1/rollouts/{id}/approve`、`/reject` | `rollouts:approve` | 核准者不得是建立者或送出者（403 `self_approval`，`KRS-E6106`）；需要以帳號登入的工作階段（API token 403 `session_required`）。`approve` 的本文（0.10.0，第 5.4 節）：`confirm`（「核准 N 台」；降版「核准降版 N 台」）與 `digest`（推送的 `submission.digest`）必填，降版另需 `reason`；`reject` 需要 `reason` |
 | `POST /api/v1/rollouts/{id}/pause` | `rollouts:pause` | `reason` 必填 |
 | `POST /api/v1/rollouts/{id}/resume`、`/continue` | `rollouts:write` | `continue`：觀察期滿、`manual_continue` 的批次開始下一批 |
 | `POST /api/v1/rollouts/{id}/cancel` | `rollouts:write` | `reason` 必填；已提議但尚未替換的主機收到 `upgrade_unavailable`，替換中的照常完成 |
@@ -900,8 +934,12 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 409 | `release_in_use` | — | 刪除推送使用中或作為回滾目標的版本 |
 | 400 | `incompatible_release` | `KRS-W8415` | 目標版本的 `min_kairos` 高於目前的 Kairos |
 | 409 | `rollout_overlap` | — | 主機已在另一個進行中的推送 |
-| 403 | `self_approval` | `KRS-E6106` | 核准自己建立的推送 |
-| 409 | `invalid_state` | — | 推送的狀態不允許這個操作 |
+| 403 | `self_approval` | `KRS-E6106` | 核准自己建立或送出的推送 |
+| 403 | `session_required` | — | 以 API token 核准或退回（需要以帳號登入的工作階段） |
+| 400 | `confirmation_required` | — | 核准的 `confirm` 與伺服器算出的確認字串不符，或降版而沒有 `reason`（`details.confirm_text`、`confirm_level`；0.10.0） |
+| 409 | `submission_changed` | — | 核准的 `digest` 與目前的送審內容不符：檢視之後推送被修改或重新送出（`details.digest`；0.10.0） |
+| 409 | `artifact_missing` | `KRS-W8417` | 核准時已固定的主機需要的發佈檔不在版本庫（遺失或大小不符；`details.files[]`；0.10.0） |
+| 409 | `invalid_state` | — | 推送的狀態不允許這個操作（核准與退回只看推送的狀態，不論 `rollout_approval` 目前的值） |
 | 503 | `remote_unavailable` | — | `[remote]` 停用，或 `storage.backend = "jsonl"`（遠端管理需要資料庫：SQLite 或 PostgreSQL） |
 
 ### 8.4 即時推送（SSE）
@@ -969,7 +1007,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 0504 | `KRS-W0504` | `PLS-W0504` | 鏡像 | 套用後確認失敗，已回復上一份可用的設定 |
 | 0505 | `KRS-I0505` | `PLS-I0505` | 鏡像 | 集中設定在本機停用 |
 | 0506 | | `PLS-E0506` | | 遠端設定快取損毀或無法寫入，改用本機設定 |
-| 6106 | `KRS-E6106` | | | 不能核准自己建立的推送（雙人覆核） |
+| 6106 | `KRS-E6106` | | | 不能核准自己建立或送出的推送（雙人覆核；建立者與送出者都不能核准，第 5.4 節） |
 | 8401 | `KRS-E8401` | `PLS-E8401` | 鏡像 | 發佈包的簽章驗證失敗（簽署者不在信任錨中、簽章無效、namespace 不符） |
 | 8402 | `KRS-W8402` | `PLS-E8402` | 鏡像 | 發佈包的雜湊、檔名、平台或版本不符；升級後的版本與目標不符 |
 | 8403 | | `PLS-E8403` | | 找不到或無法使用信任錨 `allowed_signers`（遠端升級停用） |
@@ -986,7 +1024,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 8414 | `KRS-W8414` | | | 推送已自動暫停（失敗比例、回滾失敗、簽章失敗、主機卡在替換中） |
 | 8415 | `KRS-W8415` | | | 目標版本與目前的 Kairos 不相容（`min_kairos`） |
 | 8416 | `KRS-I8416` | `PLS-I8416` | 鏡像 | 升級完成 |
-| 8417〔暫定〕 | `KRS-W8417` | | | 版本庫的檔案遺失：已存入的發佈檔不存在或大小與記錄不符（系統健康的「遠端管理」；0.10.0，號碼待設計包正式分配） |
+| 8417 | `KRS-W8417` | | | 版本庫的檔案遺失：已存入的發佈檔不存在或大小與記錄不符（系統健康的「遠端管理」、S25、資格分類 `artifact_missing`、核准時的 409 `artifact_missing`、推送中等待檔案的主機；0.10.0）。ADR-0002 決策點 7／U10（2026-11-13 核定）：照工程的號碼採用——子類別 84、只有 Kairos 端、不鏡像，「不存在」與「大小不符」同號；設計包的總表與三段式尚未收錄（主控台暫用 `error-codes-local.js`） |
 
 協定錯誤碼與產品代碼的對照（`copywriting.md` §3.4）：`upgrade_unavailable` → 不對應（Pulse 就地處理，記 `DEBUG`）；`rate_limited`（下載）→ 不對應（排隊，不是錯誤）。
 
@@ -1082,7 +1120,13 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
   - `ends_at`：到時尚未開始替換的主機（`pending`、提議中、`skipped_offline`）標為 `expired`（`reason: rollout_ended`）；沒有替換中的主機時推送 `completed`，有的話等它們結束。送出時 `ends_at` 已過 → 409 `schedule_ended`。
   - Kairos 重新啟動：時段以目前時間與資料表中的 `schedule` 重新計算，不需要另外的狀態。暫停後 `resume` 同樣重新判斷時段。
   - 不需要協定變更：Pulse 0.9.0 已遵守 `apply_window`（已暫存的升級等待 `not_before`、超過 `not_after` 回報 `expired`）。
-- **雙人覆核**（0.10.0，第 5.4 節）：`[remote] rollout_approval = "none" | "required"`（預設 `none`；`kairos.toml`，需要重新啟動）。`required` 時 `submit`（L2／L3 確認照舊、對象在此時固定）之後為 `pending_approval`，推送引擎不處理它；`POST …/approve`（權限 `rollouts:approve`，只有管理員；**只接受以帳號登入的工作階段**，API token 403 `session_required`）由建立者（`created_by`）與送出者（`submitted_by`）以外的人核准（否則 403 `self_approval`，`KRS-E6106`）後轉為 `running`，`starts_at` 在未來時為 `scheduled`。`POST …/reject`（`reason` 必填）退回 `draft`、刪除已固定的對象並記下 `reject_reason`；修改（`PUT`）待核准的推送同樣退回 `draft`（核准的是固定下來的內容，改了就要重新送審）。待核准的推送可以取消，它的主機算在未結束的推送中（`rollout_overlap`）。稽核 `rollout.approve`、`rollout.reject`（`rollout.submit` 的 `details.state` 為 `pending_approval`）。`rollout_approval = "none"` 時核准／退回為 409 `invalid_state`；由 `required` 改回 `none` 時，已在 `pending_approval` 的推送仍要核准或退回。schema v11（SQLite 與 PostgreSQL 兩個後端；v10 是叢集協調的資料表）：`rollouts.submitted_at`、`submitted_by`、`reject_reason`。
+- **雙人覆核**（0.10.0，第 5.4 節）：`[remote] rollout_approval = "none" | "required"`（預設 `none`；`kairos.toml`，需要重新啟動）。`required` 時 `submit`（L2／L3 確認照舊、對象在此時固定）之後為 `pending_approval`，推送引擎不處理它；`POST …/approve`（權限 `rollouts:approve`，只有管理員；**只接受以帳號登入的工作階段**，API token 403 `session_required`）由建立者（`created_by`）與送出者（`submitted_by`）以外的人核准（否則 403 `self_approval`，`KRS-E6106`）後轉為 `running`，`starts_at` 在未來時為 `scheduled`。`POST …/reject`（`reason` 必填）退回 `draft`、刪除已固定的對象並記下 `reject_reason`；修改（`PUT`）待核准的推送同樣退回 `draft`（核准的是固定下來的內容，改了就要重新送審）。待核准的推送可以取消，它的主機算在未結束的推送中（`rollout_overlap`）。稽核 `rollout.approve`、`rollout.reject`（`rollout.submit` 的 `details.state` 為 `pending_approval`）。核准與退回**只看推送的狀態**：不是 `pending_approval` 的推送一律 409 `invalid_state`（不論 `rollout_approval` 目前的值）；由 `required` 改回 `none` 時，已在 `pending_approval` 的推送仍要核准或退回。schema v11（SQLite 與 PostgreSQL 兩個後端；v10 是叢集協調的資料表）：`rollouts.submitted_at`、`submitted_by`、`reject_reason`。
+  - **核准的伺服器驗證**（ADR-0002 切片 S1；`kairos/src/remote/submission.rs`、`engine.rs` 的 `approve_rollout`）。`POST …/approve` 的本文 `{ "confirm": "核准 1520 台", "digest": "…", "reason": "…" }`，在同一個寫入交易中依序檢查，全部通過才轉移狀態：(1) 狀態是 `pending_approval`（409 `invalid_state`）；(2) 核准者不是建立者或送出者（403 `self_approval`，`details.created_by`、`submitted_by`）；(3) 重新讀取已固定的對象並重新計算 `digest`，請求的 `digest` 不符 → 409 `submission_changed`（`details.digest` 為目前的值）；(4) 重新計算確認字串，`confirm`（比照 `submit` 去掉前後空白）不符 → 400 `confirmation_required`（`details.confirm_text`、`confirm_level`、`eligible`、`downgrade`），沒有帶 `digest` → 400 `invalid_parameter`，降版而沒有 `reason` → 400 `confirmation_required`（`details.parameter = "reason"`）；(5) 排程的結束時間還沒過（409 `schedule_ended`）；(6) 已固定的主機需要的發佈檔都還在版本庫（409 `artifact_missing`，`KRS-W8417`，`details.files[]`：`version`、`filename`、`file_problem`、`hosts`）。本文不認得的欄位 400 `invalid_parameter`。確認字串：「核准 N 台」（L2）；已固定的對象含降版時「核准降版 N 台」（L3），N 為已固定的可升級台數（不含 `skipped`），與 `submit` 的確認字串一樣不加千分位（「核准 1520 台」）。
+  - **`submission`**（待核准的推送才有；`GET /api/v1/rollouts`、`GET …/{id}`、`submit` 的回應）：`digest`、`confirm_text`、`confirm_level`、`eligible`、`downgrade`、`skipped`（原因 → 台數）、`waves`（每批台數）只由已固定的內容計算（核准時驗證的就是這些）；`no_rollback`、`artifact_problems[]`、`warnings[]`、`approvers_available` 依目前的版本庫、清冊與帳號計算，每次讀取都可能不同；`approval_deadline` 一律 `null`（逾時尚未實作）。`digest` 的格式版本為 `kairos.rollout.submission.v1`（組成改變時遞增）。
+  - **`viewer`**（待核准的推送才有）：這次請求的身分能否核准，由後端計算，主控台不以帳號字串比對——`can_approve`、`blocked`（`forbidden`／`session_required`／`self_approval`／`null`，與 `approve` 的檢查順序相同）、`is_creator`、`is_submitter`。清單的 `meta.pending_approval_actionable` 是這個身分可以核准的筆數（SideNav 的泡泡只計這個數字）；`meta.pending_approval` 是總數；`meta.rollout_approval_change` 是 30 天內的政策改變（`from`、`to`、`at`、`source`、`node`；沒有時 `null`）。
+  - **風險提醒 `warnings[]`**（預覽與 `submission`；固定代碼，主控台組文案，預覽、送出對話框、送審摘要與核准對話框顯示同一組）：`single_wave`（只有一批而可升級超過 1 台）、`large_first_wave`（第一批超過可升級主機的 10% 或 100 台）、`no_pause_between_waves`（批次之間沒有觀察時間、也不需要人工繼續）、`empty_wave`（某一批是 0 台）、`downgrade`、`no_rollback`、`artifact_problem`（目標版本有檔案遺失或大小不符的發佈檔）、`no_approvers`（啟用雙人覆核而沒有可核准者）。預覽另有 `artifact_problems[]`（`version`、`filename`、`file_problem`）與 `approvers_available`（以這次請求的身分為建立者與送出者計算；沒有啟用雙人覆核時 `null`）。
+  - **版本庫的檔案檢查**（ADR-0002 切片 S2）：預覽、送出（F1：`artifact_missing`）、核准（F2：409）與提議（F3）四處使用同一個檢查。F3：推送引擎每一輪（有推送在進行時，每個已存入的檔案一次 `stat`）發現檔案有問題時，需要它的主機**不提議**、留在 `pending`（`reason: artifact_missing`）；已提議而還沒下載完的收回提議、回到 `pending`（新的 `upgrade_id`）；不計入失敗、不自動暫停，檔案補回後下一輪清除 `reason`、照常提議。推送的 `next_action` 為 `waiting_artifact{hosts}`，系統健康的 `values.hosts_waiting_artifact`。`build_offer` 另外在發出提議前檢查一次（檔案在這一輪之後才消失時不發出無法下載的提議）；回滾檔遺失時，允許無法自動回滾的推送不附回滾檔，否則不提議。刪除版本的保護（F6）：`pending_approval` 與 `scheduled` 的推送使用中的版本不能刪除（409 `release_in_use`）。
+  - **併發**：核准、退回、修改、取消都在寫入交易中先檢查狀態再轉移，對同一個待核准的推送同時發出時只有一個成功，其餘 409 `invalid_state`，沒有半更新的狀態。SQLite 是單一寫入者；PostgreSQL 後端的寫入交易以交易層級的 advisory lock 序列化。儲存層的測試在兩個後端各跑一次（`kairos/src/store/backend_tests/domain2.rs`）。
 - **PostgreSQL 後端與叢集模式**（0.10.0，`kairos/HA.md` 第 6.8 節）：本節 0.10.0 的項目（`kairos releases`、排程與升級時段、自訂批次、雙人覆核、外部 URL 的版本庫、升級中的離線告警抑制、SSE `rollout.host`、版本庫檔案的健康檢查）在 `storage.backend = "postgres"` 下行為相同（儲存層的測試在兩個後端各跑一次）。叢集模式下推送引擎只在取得租約的主動節點上執行，換手後由接手的節點從資料庫繼續（已排程的推送、`applying` 主機的離線抑制）；**版本庫的發佈檔是節點本機的檔案，每個節點要各自匯入**（`kairos releases import` 可以在備援節點執行），`rollout_approval` 在各節點要一致（不一致時 `KRS-W8505`）。
 - **資格分類的主機資訊**：預覽、建立與送出都以清冊的列為基礎，連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤覆蓋，協商了 `upgrade` 的連線再以發提議時使用的資訊（`AgentSession`）覆蓋——與發提議一致，主機連線後不必等清冊每 30 秒的同步（原本只有協商了遠端管理的連線如此，沒有 mTLS 時約有 30 秒的落差）。清冊還沒有的主機（連線後尚未寫入過任何資料，沒有 `host_id`）不在對象中。`GET /api/v1/hosts/{agent_id}/upgrade` 的版本、`install`、`arch` 同樣以 hello 為準。
 - 推送引擎每 5 秒（狀態改變時立即）每個推送一個交易：逾時（提議後 24＋1 小時仍未開始 → `expired`；`applying` 後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線 → `unknown`）、離線寬限（`skipped_offline`，重新連線時回到 `pending`）、失敗比例（持續檢查）、觀察期、人工繼續、完成。只對**連線中且協商了 `upgrade`** 的主機提議；連線中但沒有協商的主機記為 `skipped`（`not_ready`）。
@@ -1090,7 +1134,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - 暫停時提議中、尚未替換的主機回到 `pending` 並在恢復時換新的 `upgrade_id`（Pulse 對舊的 id 收到 `upgrade_unavailable`，同一目標版本的暫存檔可以沿用）；取消時改為 `cancelled`；替換中的照常完成。重試同樣換新的 `upgrade_id`（`attempts` 加 1），`rollback_failed` 需要先 `acknowledge`。
 - 自動暫停：失敗比例、`rollback_failed`、簽章失敗（`PLS-E8401`；同一版本的其他推送也暫停），記 `rollout.auto_pause`（`KRS-W8414`）。API 與 SSE `rollout.progress` 的 `pause_cause`（暫停中才有值）：`failure_ratio`、`rollback_failed`、`signature_failed`（自動暫停，存在 `rollouts.pause_cause`），主控台或 API 暫停（資料表為 NULL）為 `manual`；主控台只在自動暫停時附 `KRS-W8414`。推送清單另回每筆的 `rollback_failed_unacknowledged` 與 `meta`（`paused`、`rollback_failed_unacknowledged`，不受篩選影響），SideNav「升級推送」的計數泡泡直接用它。系統規則（`kairos/ALERTS.md`）：`sys.rollout_paused`「升級推送已暫停」（`KRS-W8414`，警告；原因為回滾失敗或簽章失敗時為嚴重）、`sys.upgrade_rollback_failed`「升級回滾失敗」（`KRS-E8408`，嚴重，對象為主機）、`sys.release_signature_failed`「發佈簽章驗證失敗」（`KRS-E8401`，嚴重，對象為目標版本）。遠端管理服務每一輪依資料庫調和（自動暫停的推送記 `rollouts.pause_cause`，手動暫停不開事件），以內部事件 `RemoteCondition` 發布改變的部分；推送繼續或取消、回滾失敗標記為已處理（或重試）時恢復，Kairos 重新啟動後重新發布。
 - 允許無法自動回滾的主機（`allow_no_rollback`）而有這類主機時，送出的 L2 確認字串為設計包 S26 的「升級 N 台（無法自動回滾 M 台）」（全形括號；只接受這個字串），降版的 L3「降版 N 台」優先。
-- 系統健康（`GET /api/v1/system/health`）的 `remote` 項目（設計包 S20「遠端管理」列，需要 `rollouts:read` 才看得到細節）：回滾失敗未處理為嚴重（`KRS-E8408`）、自動暫停的推送為警告（`KRS-W8414`）、版本庫有發佈版本但沒有 `allowed_signers` 為警告。**版本庫的檔案遺失**（0.10.0）：`stored = 1` 的發佈檔在 `<releases_dir>/<sha256>` 不存在、不是一般檔案或大小與記錄不符（例如還原備份之後，第 6 節）時為警告（`KRS-W8417`〔暫定〕），摘要為「版本庫的檔案遺失：0.9.0 的 pulse-0.9.0-…deb（312 台的回滾需要）」（多於一個時加「等 N 個檔案」；大小不符時為「版本庫的檔案大小不符」），`values.release_files_missing`、`missing_files[]`（前 20 個：`version`、`filename`、`problem`＝`missing`／`size_mismatch`、`rollback_target_for`）；每次查詢只 `stat` 已存入的檔案、不重算雜湊（內容被改而大小相同的檔案由 Pulse 的雜湊與簽章檢查發現）。優先序：回滾失敗 ＞ 自動暫停 ＞ 檔案遺失 ＞ 信任錨未設定。處理方式是重新匯入這個版本的發佈檔（主控台 S25 或 `kairos releases import`；大小不符的檔案會被取代）。
+- 系統健康（`GET /api/v1/system/health`）的 `remote` 項目（設計包 S20「遠端管理」列，需要 `rollouts:read` 才看得到細節）：回滾失敗未處理為嚴重（`KRS-E8408`）、自動暫停的推送為警告（`KRS-W8414`）、版本庫有發佈版本但沒有 `allowed_signers` 為警告。**版本庫的檔案遺失**（0.10.0）：`stored = 1` 的發佈檔在 `<releases_dir>/<sha256>` 不存在、不是一般檔案或大小與記錄不符（例如還原備份之後，第 6 節）時為警告（`KRS-W8417`），摘要為「版本庫的檔案遺失：0.9.0 的 pulse-0.9.0-…deb（312 台的回滾需要）」（多於一個時加「等 N 個檔案」；大小不符時為「版本庫的檔案大小不符」），`values.release_files_missing`、`missing_files[]`（前 20 個：`version`、`filename`、`problem`＝`missing`／`size_mismatch`、`rollback_target_for`）；每次查詢只 `stat` 已存入的檔案、不重算雜湊（內容被改而大小相同的檔案由 Pulse 的雜湊與簽章檢查發現）。優先序：回滾失敗 ＞ 自動暫停 ＞ 檔案遺失 ＞ 雙人覆核在 30 天內被關閉 ＞ 待核准的推送沒有可核准者 ＞ 信任錨未設定。處理方式是重新匯入這個版本的發佈檔（主控台 S25 或 `kairos releases import`；大小不符的檔案會被取代）。0.10.0（ADR-0002）另有：檔案遺失而有主機在等待時摘要加「N 台主機等待中」（`values.hosts_waiting_artifact`）；`values.rollout_approval_observed`（啟動時與資料庫比對的紀錄：`value`、`source`、`observed_at`、`node`、`changed_at`、`changed_from`、`disabled_at`）、`rollout_approval_change`（30 天內的改變，沒有時 `null`）；`values.pending_approval`、`pending_approval_no_approvers`。雙人覆核在 30 天內由 `required` 改為 `none` 時為警告「雙人覆核已關閉…」；待核准的推送沒有可核准者時為警告。
 - **升級中主機的離線告警抑制**（第 4.7.5 節，0.10.0）：主機回報 `applying`（已交給輔助程式）時，遠端管理服務在匯流排發布 `upgrade_window`（主機、推送、期限 `applying_at + health_timeout_secs + 10 分鐘`），到達終止狀態（`succeeded`、`failed`、`rolled_back`、`rollback_failed`、被引擎標為 `unknown`…）時發布解除；另外每一輪依資料庫（`rollout_hosts.state = applying`，不論推送是否已暫停或取消）調和，Kairos 重新啟動後由此重建，仍有效的每分鐘重送一次。告警引擎在期限前**不開新的**離線類事件：`host_offline`（系統規則與自訂規則）、`host_long_offline`，升級中的主機也不計入網段離線、大規模離線的台數；指標門檻、回報延遲等其他規則不受影響，已經開著的離線事件不會因此關閉。**期限過後仍離線時在下一輪照常開事件並通知**（離線時間以實際離線的時間計，不重新起算寬限），事件的 `details.upgrade`（`rollout_id`、`suppressed_until`）與處理紀錄 `upgrade_suppressed` 註明「升級中」；期限內恢復連線的主機不留事件。抑制只由 `upgrade_status` 觸發：必須是這台主機自己（mTLS 的 `agent_id`）、對 Kairos 目前提議給它的 `upgrade_id`（狀態為 `offered`／`accepted`／`staged`，或取消時已交給輔助程式）回報，其他主機的 `upgrade_id`、不存在的 `upgrade_id`、已結束的主機都不會開始抑制；一次提議最多抑制到期限為止（最長 `3600 + 600` 秒），之後引擎把仍未回報的主機標為 `unknown`（計入失敗）。
 - **SSE `rollout.host`**（0.10.0，第 8.4 節）：主控台的 SSE 連線以 `GET /api/v1/events?rollout_id=…` 訂閱一個推送（`RemoteService::watch_rollout`，串流結束時取消；需要 `rollouts:read`）。有訂閱的推送在每一輪 `flush_progress` 時比對每台主機上次送出的樣子（`updated_at`、狀態、進度、重試次數、是否已處理），只送改變的主機，並排在 `rollout.progress` 之前；第一次（還沒有基準）補送最近 15 秒內改變過的主機。一輪超過 200 台（`ROLLOUT_HOST_EVENTS_MAX`）時不逐台送，`rollout.progress` 帶 `hosts_resync: true`、`hosts_changed`。沒有訂閱的推送不比對、不送（1 萬台的推送沒有人看詳情時沒有額外成本）。
 - **建議的最低 Pulse 版本**（0.10.0，第 4.9 節、R9）：版本庫中**最新版本**的清單的 `min_upgrade_from`（低於它的主機無法遠端升級到最新版，需要手動升級）；`GET /api/v1/hosts` 的 `meta.recommended_min_agent_version` 與每一列的 `agent_outdated`，主控台 S04 的 agent 版本欄加 ⚠ 與說明。版本庫是空的或最新版本沒有清單時不標示。規格只寫「取版本庫中最新版的清單」，取哪個欄位是實作的判斷（待確認）。
@@ -1123,12 +1167,12 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 |---|---|---|
 | 升級時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **固定位移**（`+08:00`；另接受 `UTC`、`Z`），預設 `alerts.timezone`（本來就是固定位移），沒有設定時 `+08:00`。不支援時區名稱與日光節約時間：Kairos 沒有時區資料庫的依賴，告警的時區也是固定位移；有日光節約時間的地區需要在換季時調整時段（列入待決） |
 | 修改已排程的推送（0.10.0） | `draft`／`pending_approval`／`scheduled` 可修改，修改後重新送審 | `pending_approval`、`scheduled` 的推送修改時退回 `draft`（對象重新計算、確認字串重新輸入、重新核准） |
-| 雙人覆核（0.10.0） | 核准者不得是建立者；關閉雙人覆核是 L3 操作；主控台唯讀顯示設定；降版 L3 要重新驗證 | 核准者不得是建立者**或送出者**（比規格嚴格：否則甲建立、乙送出並自己核准，仍只有一個人看過固定下來的對象）；`reject` 不限制身分（往安全的方向）。`rollout_approval` 只在 `kairos.toml`，修改需要主機上的檔案權限與重新啟動，沒有另外的 L3 流程或稽核事件；目前的值在系統健康 `remote` 項目的 `values.rollout_approval` 與推送清單的 `meta`，S21 系統設定頁尚未顯示。降版推送的 L3 仍是固定字串＋原因（設計包 §31.12 #7 的暫行做法，未要求重新驗證密碼；列入待決） |
+| 雙人覆核（0.10.0） | 核准者不得是建立者；關閉雙人覆核是 L3 操作；主控台唯讀顯示設定；降版 L3 要重新驗證 | 核准者不得是建立者**或送出者**（比規格嚴格：否則甲建立、乙送出並自己核准，仍只有一個人看過固定下來的對象）；`reject` 不限制身分（往安全的方向）。`rollout_approval` 只在 `kairos.toml`，修改需要主機上的檔案權限與重新啟動，**沒有 L3 流程**（ADR-0002 決策點 2i：已接受的治理缺口，第 5.4 節已修訂）；啟動時與資料庫的前值比對，改變時寫稽核、`required` → `none` 另開告警事件；目前的值在系統健康 `remote` 項目的 `values.rollout_approval` 與推送清單的 `meta`，S21「連線與安全」的「遠端管理」卡片唯讀顯示。核准是 L2（`confirm`＋`digest`，伺服器在交易內驗證）。降版推送的 L3 是固定字串＋原因，不要求重新驗證密碼（已定案，ADR-0002 第 1.1 節） |
 | `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
 | 對象固定的時間 | 推送開始時（第 4.7.2 節） | 送出時（0.9 送出即開始，兩者相同） |
 | `rollout_hosts` | — | 另有 `acknowledged_at`／`_by`；`skipped` 的 `wave` 為 -1 |
 | SSE | `config.host`、`rollout.progress`（每 2 秒）、`rollout.host` | `config.host`、`rollout.progress`（每 5 秒，推送引擎每一輪；另帶 `pause_cause`）；`rollout.host`（0.10.0）隨每一輪送出、每台每輪最多一則，一輪超過 200 台時以 `rollout.progress` 的 `hosts_resync` 取代 |
-| 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨；0.10.0 起另有「版本庫的檔案遺失」，`KRS-W8417`〔暫定〕，只 `stat` 不重算雜湊） |
+| 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨；0.10.0 起另有「版本庫的檔案遺失」，`KRS-W8417`，只 `stat` 不重算雜湊；雙人覆核已關閉、沒有可核准者、等待檔案的主機） |
 | CLI | `kairos releases import／list／delete` | 0.10.0 提供（直接開資料庫，不經執行中的 Kairos），含 `--external` |
 | 外部 URL 的版本庫（0.10.0） | 匯入時只上傳 `SHA256SUMS`、`.sig` 與清單，另填 `base_url` | 另外要「登記」要推送的發佈檔（上傳或 CLI 匯入時確認雜湊並記下大小，檔案不保存）：協定的 `artifact.size` 必填、Pulse 以它作為下載上限與空間檢查，而 `SHA256SUMS` 沒有大小；由 Kairos 向 URL 查詢大小會讓 Kairos 對外發出請求，不採用 |
 | 外部 URL 的資格預覽（0.10.0） | — | Kairos 不知道主機的 `upgrade.url_allowlist`，預覽不會把「不允許外部 URL」的主機列為不符資格；它們在推送中回報 `declined`（`url_not_allowed`）。之後可以加一個 feature（例如 `upgrade_url`）讓 Pulse 宣告，列入待決 |

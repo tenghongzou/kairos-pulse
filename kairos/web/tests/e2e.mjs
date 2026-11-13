@@ -16,6 +16,7 @@ import { registerMetrics } from './e2e-metrics.mjs';
 import { registerExport } from './e2e-export.mjs';
 import { registerPrivacy } from './e2e-privacy.mjs';
 import { registerRemote } from './e2e-remote.mjs';
+import { registerApproval } from './e2e-approval.mjs';
 
 const PW_DIR = process.env.PW_DIR;
 const require = createRequire(join(PW_DIR, 'node_modules', 'noop.js'));
@@ -543,6 +544,8 @@ registerMetrics({ test, newPage, login, waitTitle, axe, shot, URL0, PW });
 registerExport({ test, newPage, login, waitTitle, axe, shot, URL0, PW });
 // 遠端管理（F8：S24 集中設定、S25 Pulse 版本庫、S26 升級推送、S04／S05 的整合）
 registerRemote({ test, newPage, login, waitTitle, axe, shot, FakeAgent, URL0, PW });
+// 升級推送的雙人覆核、檔案完整性、政策的可見性（ADR-0002 S1～S3；第三個 Kairos，approval-env.sh）
+registerApproval({ test, newPage, waitTitle, axe, shot, FakeAgent, PW });
 // 個資保護（S6：S05 的匯出個資與刪除主機資料、S12 的一行安裝指令、S14 的匯入憑證）：e2e-privacy.mjs（放在最後：會刪除主機）
 registerPrivacy({ test, newPage, login, waitTitle, axe, shot, FakeAgent, URL0, PW });
 

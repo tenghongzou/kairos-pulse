@@ -81,8 +81,9 @@ const M = {
   'shell.skip': '跳到主要內容',
   'shell.menu': '開啟導覽選單',
   'shell.mainNav': '主要導覽',
-  'shell.searchLabel': '搜尋主機（Ctrl K）',
-  'shell.searchPlaceholder': '搜尋主機名稱、agent_id、IP',
+  // 頂列只寫「搜尋」：可以搜尋的類別依權限不同，在搜尋對話框的標籤列出（ADR-0002 決策點 6）
+  'shell.searchLabel': '搜尋（Ctrl K）',
+  'shell.searchPlaceholder': '搜尋…',
   'shell.userMenu': '使用者選單：{name}',
   'shell.userMenuShort': '使用者選單',
   'shell.account': '個人設定',
@@ -509,8 +510,12 @@ const M = {
 
   // ---- 全域搜尋 ----
   'search.title': '搜尋',
+  // 只有主機可以搜尋時（唯讀角色）維持原句；有其他類別時列出目前使用者可以搜尋的類別（ADR-0002 決策點 6）
   'search.label': '搜尋主機名稱、agent_id、IP 或網段',
+  'search.labelGroups': '搜尋{groups}',
+  'search.groupSep': '、',
   'search.placeholder': '例如 hmi-line3、6f1c0e4a、10.30.3.27、10.30.3.0/24',
+  'search.placeholderRollouts': '例如 hmi-line3、10.30.3.0/24、r-20261120-0001',
   'search.hint': '輸入 2 個字元以上開始搜尋；↑↓ 選擇、Enter 開啟。',
   'search.searching': '搜尋中…',
   'search.results': '搜尋結果',

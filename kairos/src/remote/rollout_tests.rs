@@ -52,6 +52,7 @@ fn ctx(target: &str) -> ReleaseContext {
         manifest: Some(manifest(target, "0.9.0")),
         artifacts: vec![artifact(target, "tar.gz"), artifact(target, "deb")],
         by_version,
+        missing: Vec::new(),
     }
 }
 

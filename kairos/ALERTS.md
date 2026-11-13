@@ -139,6 +139,7 @@ subnet_prefix_v6 = 64
 | `sys.rollout_paused` | 升級推送已暫停（0.9） | 升級推送因失敗比例超過上限、主機回滾失敗或發佈簽章驗證失敗而自動暫停（手動暫停不開）；推送繼續或取消時恢復（REMOTE.md 第 4.7.4 節） | 警告（回滾失敗、簽章失敗為嚴重） | `KRS-W8414` | 匯流排（`remote_condition`，遠端管理服務每 5 秒調和） |
 | `sys.upgrade_rollback_failed` | 升級回滾失敗（0.9） | 主機升級後回滾也失敗，需要人工處理；對象為主機；標記為已處理或重試時恢復 | 嚴重 | `KRS-E8408` | 匯流排（`remote_condition`） |
 | `sys.release_signature_failed` | 發佈簽章驗證失敗（0.9） | 主機驗證發佈包的簽章失敗（`PLS-E8401`），使用同一版本的推送已暫停；對象為目標版本；推送繼續或取消時恢復 | 嚴重 | `KRS-E8401` | 匯流排（`remote_condition`） |
+| `sys.rollout_approval_disabled` | 雙人覆核已關閉（0.10） | Kairos 啟動時發現 `[remote] rollout_approval` 由 `required` 改為 `none`（與資料庫記錄的上一次設定不同；REMOTE.md 第 5.4 節、ADR-0002 決策點 2i）：送出的推送不再需要另一位管理員核准。對象為 `remote`；改回 `required` 並重新啟動後恢復，**不會自己結束**。預設推播——啟用雙人覆核的單位請把這條規則接到通知管道 | 警告 | —（尚未分配） | 匯流排（`remote_condition`） |
 | `sys.restarted`、`sys.downtime` | 第 5.2 節 | | 資訊（非預期：嚴重）、嚴重 | — | 心跳 |
 
 **使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。

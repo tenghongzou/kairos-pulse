@@ -13,6 +13,8 @@
 // - 詳情：發佈資訊（commit、簽署金鑰、min_kairos〔目前的 Kairos 不相容時 KRS-W8415〕、min_upgrade_from、breaking）、
 //   發佈檔（檔名、平台、格式、大小、SHA-256 前 16 碼可複製、已上傳／待上傳）、依安裝方式與平台的主機數。
 // - 刪除：L2（輸入版本號）；推送使用中或作為回滾目標時 aria-disabled 並說明（409 release_in_use）。
+// - 版本庫的檔案遺失（0.10；artifacts[].file_problem，KRS-W8417）：清單與詳情的頁首是三段式（原因、處理方式、代碼、
+//   檔案清單），「重新上傳 <版本>…」直接開啟該版本的上傳（ADR-0002 F4）；檔案列另有標記。
 
 import { h, icon, mount, uid } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -46,6 +48,47 @@ function platformsText(arts) {
   }
   if (!by.size) return '—';
   return h('ul', { class: 'k-plain-list' }, [...by].map(([k, fmts]) => h('li', null, `${k}：${fmts.join(' ')}`)));
+}
+
+/**
+ * 頁首的三段式（KRS-W8417，ADR-0002 F4）：版本庫記錄已存入、但檔案不存在或大小不符的發佈檔（artifacts[].file_problem）。
+ * 標題、原因、處理方式、代碼，另列出每個檔案；有 releases:write 時每個版本一個「重新上傳…」直接開啟該版本的上傳。
+ * 沒有這類檔案時 null。
+ */
+function missingAlert(releases, onUpload) {
+  const files = [];
+  for (const r of releases || []) for (const a of r.artifacts || []) if (a.file_problem) files.push({ r, a });
+  if (!files.length) return null;
+  const versions = [...new Set(files.map((x) => x.r.version))];
+  const first = files[0];
+  return h(
+    'div',
+    { id: 'release-files-missing' },
+    inlineAlert({
+      kind: 'warning',
+      title: files.length > 1 ? t('rm.rel.missingTitleMore', { v: first.r.version, f: first.a.filename, n: fmt.num(files.length) }) : t('rm.rel.missingTitle', { v: first.r.version, f: first.a.filename }),
+      code: 'KRS-W8417',
+      body: [
+        h(
+          'dl',
+          { class: 'k-3part' },
+          h('dt', null, t('err.label.reason')),
+          h('dd', null, t('rm.rel.missingReason')),
+          h('dt', null, t('err.label.fix')),
+          h('dd', null, h('ol', { class: 'k-fix-steps' }, h('li', null, t('rm.rel.missingFix1')), h('li', null, t('rm.rel.missingFix2')))),
+        ),
+        h('p', { class: 'strong' }, t('rm.rel.missingList')),
+        h(
+          'ul',
+          { class: 'k-plain-list' },
+          files.map(({ r, a }) => h('li', { dataset: { file: a.filename } }, t('rm.rel.missingItem', { v: r.version, f: a.filename, p: t(a.file_problem === 'size_mismatch' ? 'rm.rel.problem.size_mismatch' : 'rm.rel.problem.missing') }))),
+        ),
+      ],
+      actions: onUpload
+        ? versions.map((v) => h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => onUpload(files.find((x) => x.r.version === v).r) } }, icon('upload'), t('rm.rel.missingReupload', { v })))
+        : null,
+    }),
+  );
 }
 
 function cmpVersion(a, b) {
@@ -92,6 +135,9 @@ function renderList(ctx) {
     const list = res.data || [];
     const meta = res.meta || {};
     const n = [];
+    // 版本庫的檔案遺失（KRS-W8417）：頁首的三段式與「重新上傳…」
+    const missing = missingAlert(list, canWrite ? (r) => importDialog({ release: r, onDone: load }) : null);
+    if (missing) n.push(missing);
     if (meta.allowed_signers_configured === false) n.push(inlineAlert({ kind: 'warning', title: t('rm.rel.noTrust'), body: t('rm.rel.noTrustBody') }));
     // 部署中、0.9.0 以上、不在版本庫的版本：建議匯入（自動回滾需要它的檔案）
     const have = new Set(list.map((r) => r.version));
@@ -229,6 +275,7 @@ function renderDetail(ctx) {
       root,
       pageHead({ title: t('rm.rel.detailTitle', { v: r.version }), crumbs: [CRUMB, { text: r.version }], actions: actions.length ? actions : null }),
       incompatible ? inlineAlert({ kind: 'error', title: t('rm.rel.incompatible', { v: r.version, min: m.min_kairos }), code: 'KRS-W8415' }) : null,
+      missingAlert([r], canWrite ? (x) => importDialog({ release: x, onDone: load }) : null),
       m ? null : inlineAlert({ kind: 'info', body: t('rm.rel.noManifest') }),
       r.source === 'external' ? inlineAlert({ kind: 'info', body: t('rm.rel.externalNote') }) : null,
       h(

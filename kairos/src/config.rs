@@ -29,7 +29,7 @@ pub use enroll::{
 };
 pub use export::{ExportSettings, OtlpSettings, PrometheusExportSettings};
 pub use postgres::{PgSslMode, PostgresSettings};
-pub use remote::RemoteSettings;
+pub use remote::{ROLLOUT_APPROVAL_NONE, ROLLOUT_APPROVAL_REQUIRED, RemoteSettings};
 
 /// 未指定 `--config` 時讀取的設定檔（不存在則略過）
 pub const DEFAULT_CONFIG_FILE: &str = "kairos.toml";

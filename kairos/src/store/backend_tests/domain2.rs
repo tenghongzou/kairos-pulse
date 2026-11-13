@@ -1563,9 +1563,221 @@ fn rollout_schedule_approval_and_external_releases(db: &TestDb) -> String {
     out
 }
 
+/// ADR-0002 A7、A12 在儲存層的部分：(1) 對同一個待核准的推送，多條連線同時在序列化的寫入交易
+/// （`TxMode::Immediate`）中「先檢查狀態再轉移」（核准、退回、取消、逾時退回），每一輪恰好一個成功、沒有
+/// 半更新的狀態——SQLite 靠單一寫入者，PostgreSQL 靠交易層級的 advisory lock；(2) 雙人覆核政策的前值
+/// （`meta` 表）與稽核在同一個交易中寫入，交易回復時兩者都不留下
+fn rollout_review_transitions_and_policy_record(db: &TestDb) -> String {
+    use crate::remote::policy;
+    let mut out = String::new();
+    seed_hosts(db);
+    let s = db.handle();
+    let release = s
+        .insert_release(&ReleaseRow {
+            id: 0,
+            version: "0.10.0".into(),
+            commit: "abc1234".into(),
+            source: "hosted".into(),
+            sha256sums: "sums".into(),
+            signature: "sig".into(),
+            signer_fingerprint: None,
+            signer_principal: None,
+            manifest_name: None,
+            manifest: None,
+            imported_at: T0,
+            imported_by: "cli:root".into(),
+            base_url: None,
+        })
+        .unwrap();
+    let a = s.host_id_of(A).unwrap().unwrap();
+    let b = s.host_id_of(B).unwrap().unwrap();
+    const ROUNDS: i64 = 6;
+    // 測試的連線池只有 4 條連線：這條加上三個同時操作的連線
+    const WORKERS: usize = 3;
+    let mut winners = Vec::new();
+    for round in 0..ROUNDS {
+        let id = format!("r-20261113-{:04}", round + 1);
+        let at = T0 + round * 1000;
+        s.insert_rollout(&RolloutRow {
+            id: id.clone(),
+            name: format!("推送 {id}"),
+            release_id: release,
+            target_version: "0.10.0".into(),
+            selector: "{\"all\":true}".into(),
+            waves: "[]".into(),
+            schedule: "{}".into(),
+            options: "{}".into(),
+            state: "draft".into(),
+            current_wave: 0,
+            wave_started_at: None,
+            soak_until: None,
+            awaiting_continue: false,
+            pause_reason: None,
+            pause_cause: None,
+            cancel_reason: None,
+            created_at: at,
+            created_by: "user:ann".into(),
+            started_at: None,
+            completed_at: None,
+            updated_at: at,
+            submitted_at: None,
+            submitted_by: None,
+            approved_at: None,
+            approved_by: None,
+            reject_reason: None,
+        })
+        .unwrap();
+        let mut r = s.get_rollout(&id).unwrap().unwrap();
+        r.state = "pending_approval".into();
+        r.submitted_at = Some(at + 1);
+        r.submitted_by = Some("user:ann".into());
+        s.update_rollout_state(&r).unwrap();
+        let nh = |host: i64, n: i64| NewRolloutHost {
+            host_id: host,
+            upgrade_id: format!("up-{round}-{n}"),
+            wave: 0,
+            ordinal: n,
+            state: "pending".into(),
+            reason: None,
+            from_version: Some("0.9.0".into()),
+        };
+        s.insert_rollout_hosts(&id, &[nh(a, 1), nh(b, 2)], at + 1)
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|i| {
+                let conn = db.handle_busy(std::time::Duration::from_secs(20));
+                let (barrier, id) = (barrier.clone(), id.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let tx = conn.begin(TxMode::Immediate).unwrap();
+                    let mut r = tx.get_rollout(&id).unwrap().unwrap();
+                    if r.state != "pending_approval" {
+                        // 交易回復：輸的一方不寫任何東西（API 回 409 invalid_state）
+                        return None;
+                    }
+                    let kind = match i {
+                        // 核准
+                        0 => {
+                            r.state = "running".into();
+                            r.approved_at = Some(at + 10);
+                            r.approved_by = Some(format!("user:approver-{i}"));
+                            r.started_at = Some(at + 10);
+                            "approve"
+                        }
+                        // 退回（與待核准逾時的退回相同的轉移）
+                        1 => {
+                            tx.delete_rollout_hosts(&id).unwrap();
+                            r.state = "draft".into();
+                            r.submitted_at = None;
+                            r.submitted_by = None;
+                            r.reject_reason = Some("不行".into());
+                            "reject"
+                        }
+                        // 取消
+                        _ => {
+                            r.state = "cancelled".into();
+                            r.cancel_reason = Some("不做了".into());
+                            r.completed_at = Some(at + 10);
+                            "cancel"
+                        }
+                    };
+                    r.updated_at = at + 10;
+                    tx.update_rollout_state(&r).unwrap();
+                    tx.commit().unwrap();
+                    Some(kind)
+                })
+            })
+            .collect();
+        let won: Vec<&str> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(won.len(), 1, "第 {round} 輪：{won:?}");
+        let r = s.get_rollout(&id).unwrap().unwrap();
+        let hosts = s.rollout_hosts(&id).unwrap().len();
+        // 最後的狀態與贏的那個操作一致
+        let consistent = match won[0] {
+            "approve" => {
+                r.state == "running"
+                    && r.approved_by.is_some()
+                    && r.submitted_by.is_some()
+                    && hosts == 2
+            }
+            "reject" => {
+                r.state == "draft"
+                    && r.approved_by.is_none()
+                    && r.submitted_by.is_none()
+                    && r.reject_reason.is_some()
+                    && hosts == 0
+            }
+            _ => r.state == "cancelled" && r.approved_by.is_none() && hosts == 2,
+        };
+        assert!(consistent, "第 {round} 輪：{} {r:?}（{hosts} 台）", won[0]);
+        winners.push(won.len());
+        // 讓出主機給下一輪
+        s.delete_rollout_hosts(&id).unwrap();
+    }
+    // 哪一個操作贏是不確定的；兩個後端的紀錄只比「每輪恰好一個」
+    log!(out, "winners per round", winners);
+
+    // 政策的前值與稽核：同一個交易
+    let audits = |s: &dyn crate::store::db::Store| {
+        let filter = crate::audit::AuditFilter {
+            action: Some("settings.rollout_approval.".into()),
+            ..Default::default()
+        };
+        let mut rows = s.audit_query(&filter, 50).unwrap().0;
+        rows.sort_by_key(|e| e.id);
+        rows.into_iter()
+            .map(|e| (e.action, e.actor, e.at, e.object))
+            .collect::<Vec<_>>()
+    };
+    {
+        let tx = s.begin(TxMode::Immediate).unwrap();
+        let (outcome, rec) = policy::observe(&*tx, "required", "file", "node-a", T0).unwrap();
+        log!(out, "baseline", (format!("{outcome:?}"), rec.disabled_at));
+        // 沒有提交：前值與稽核都不留下
+    }
+    log!(
+        out,
+        "after rollback",
+        (s.get_meta(policy::META_KEY).unwrap(), audits(s.as_ref()))
+    );
+    for (value, source, at) in [
+        ("required", "file", T0),
+        ("required", "file", T0 + 1),
+        ("none", "file", T0 + 2),
+        ("none", "environment", T0 + 3),
+        ("required", "environment", T0 + 4),
+    ] {
+        let tx = s.begin(TxMode::Immediate).unwrap();
+        let (outcome, rec) = policy::observe(&*tx, value, source, "node-a", at).unwrap();
+        tx.commit().unwrap();
+        log!(
+            out,
+            "observe",
+            (
+                format!("{outcome:?}"),
+                rec.value,
+                rec.source,
+                rec.changed_at,
+                rec.disabled_at
+            )
+        );
+    }
+    log!(out, "record", s.get_meta(policy::META_KEY).unwrap());
+    log!(out, "audit", audits(s.as_ref()));
+    let report = s.audit_verify().unwrap();
+    assert!(report.broken.is_none(), "{:?}", report.broken);
+    log!(out, "chain", report.checked);
+    out
+}
+
 backend_tests!(
     alerts,
     hosts_and_api_queries,
     remote_config_and_rollouts,
-    rollout_schedule_approval_and_external_releases
+    rollout_schedule_approval_and_external_releases,
+    rollout_review_transitions_and_policy_record
 );

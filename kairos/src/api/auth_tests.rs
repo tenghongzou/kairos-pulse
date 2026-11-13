@@ -2163,6 +2163,20 @@ async fn rollout_approval_needs_another_admins_session() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["data"]["state"], "pending_approval");
     assert_eq!(r.json()["data"]["submitted_by"], "user:bob");
+    // 送審摘要：確認字串與 digest 由伺服器計算（ADR-0002 決策點 2b）
+    let digest = r.json()["data"]["submission"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(digest.len(), 64);
+    assert_eq!(
+        (
+            r.json()["data"]["submission"]["confirm_text"].as_str(),
+            r.json()["data"]["submission"]["confirm_level"].as_str(),
+            r.json()["data"]["submission"]["eligible"].as_i64(),
+        ),
+        (Some("核准 1 台"), Some("L2"), Some(1))
+    );
     let r = call(
         &f,
         "GET",
@@ -2178,6 +2192,73 @@ async fn rollout_approval_needs_another_admins_session() {
             r.json()["meta"]["rollout_approval"].as_str()
         ),
         (Some(1), Some("required"))
+    );
+    // 「我可以核准的」筆數與每一筆的 viewer 由後端依這次請求的身分計算（A5）：維運者沒有權限、建立者與
+    // 送出者不能核准自己的、API token 不能核准；只有第三位管理員的工作階段是 1。可核准者是 carol 一人
+    let admin_token = super::tokens::create_with(
+        &f.admin(),
+        "admin",
+        &super::tokens::TokenGrant::Role(crate::rbac::Role::Admin),
+        None,
+        Some("tester"),
+        None,
+        Utc::now().timestamp_millis(),
+    )
+    .unwrap()
+    .token;
+    for (auth, actionable, blocked, creator, submitter) in [
+        (Auth::Session(&oscar), 0, Some("forbidden"), false, false),
+        (Auth::Session(&alice), 0, Some("self_approval"), true, false),
+        (Auth::Session(&bob), 0, Some("self_approval"), false, true),
+        (
+            Auth::Token(&admin_token),
+            0,
+            Some("session_required"),
+            false,
+            false,
+        ),
+        (Auth::Session(&carol), 1, None, false, false),
+    ] {
+        let r = call(&f, "GET", "/api/v1/rollouts", auth, None, &[]).await;
+        let j = r.json();
+        assert_eq!(
+            (
+                j["meta"]["pending_approval"].as_i64(),
+                j["meta"]["pending_approval_actionable"].as_i64()
+            ),
+            (Some(1), Some(actionable)),
+            "{blocked:?}"
+        );
+        assert_eq!(
+            j["data"][0]["viewer"],
+            json!({"can_approve": blocked.is_none(), "blocked": blocked, "is_creator": creator, "is_submitter": submitter}),
+        );
+        assert_eq!(j["data"][0]["submission"]["digest"], digest.as_str());
+        assert_eq!(j["data"][0]["submission"]["approvers_available"], 1);
+    }
+    // 系統健康：待核准 1 個、沒有「沒有可核准者」的推送
+    let r = call(
+        &f,
+        "GET",
+        "/api/v1/system/health",
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
+    let j = r.json();
+    let remote = j["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "remote")
+        .unwrap();
+    assert_eq!(
+        (
+            remote["values"]["pending_approval"].as_i64(),
+            remote["values"]["pending_approval_no_approvers"].as_i64()
+        ),
+        (Some(1), Some(0))
     );
 
     // 維運者沒有權限；建立者與送出者不能核准；沒有 CSRF token 的請求被拒
@@ -2245,13 +2326,96 @@ async fn rollout_approval_needs_another_admins_session() {
     assert_eq!(r.json()["data"]["state"], "pending_approval");
     assert_eq!(r.json()["data"]["started_at"], Value::Null);
 
-    // 第三位管理員核准：開始
+    // 直接打 API 的負面測試（A1、A2）：核准必須帶伺服器算出的確認字串與 digest——空的本文、空字串、
+    // 舊的台數、降版的字串、沒有 digest、舊的 digest、不認得的欄位都被拒絕，狀態不變
+    for (body, status, code) in [
+        (None, 400, "confirmation_required"),
+        (Some(json!({})), 400, "confirmation_required"),
+        (
+            Some(json!({"confirm": "", "digest": digest})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "核准 2 台", "digest": digest})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "核准降版 1 台", "digest": digest, "reason": "x"})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "升級 1 台", "digest": digest})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "核准 1 台"})),
+            400,
+            "invalid_parameter",
+        ),
+        (
+            Some(json!({"confirm": "核准 1 台", "digest": "0".repeat(64)})),
+            409,
+            "submission_changed",
+        ),
+        (
+            Some(json!({"confirm": "核准 1 台", "digest": digest, "force": true})),
+            400,
+            "invalid_parameter",
+        ),
+        (
+            Some(json!({"confirm": 1, "digest": digest})),
+            400,
+            "invalid_parameter",
+        ),
+    ] {
+        let r = call(
+            &f,
+            "POST",
+            &path("approve"),
+            Auth::Session(&carol),
+            body.clone(),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.json()["error"]["code"].as_str()),
+            (status, Some(code)),
+            "{body:?}"
+        );
+        if code == "confirmation_required" {
+            assert_eq!(
+                r.json()["error"]["details"]["confirm_text"],
+                "核准 1 台",
+                "{body:?}"
+            );
+        }
+    }
+    let r = call(
+        &f,
+        "GET",
+        &format!("/api/v1/rollouts/{id}"),
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
+    let j = r.json();
+    assert_eq!(j["data"]["state"], "pending_approval");
+    assert_eq!(j["data"]["submission"]["digest"], digest.as_str());
+    assert_eq!(j["data"]["viewer"]["can_approve"], true);
+    assert!(!audit_actions(&f).iter().any(|a| a.0 == "rollout.approve"));
+
+    // 第三位管理員核准（前後空白比照 submit 去掉）：開始
     let r = call(
         &f,
         "POST",
         &path("approve"),
         Auth::Session(&carol),
-        None,
+        Some(json!({"confirm": " 核准 1 台 ", "digest": digest})),
         &[],
     )
     .await;
@@ -2268,7 +2432,7 @@ async fn rollout_approval_needs_another_admins_session() {
         "POST",
         &path("approve"),
         Auth::Session(&carol),
-        None,
+        Some(json!({"confirm": "核准 1 台", "digest": digest})),
         &[],
     )
     .await;
@@ -2276,6 +2440,18 @@ async fn rollout_approval_needs_another_admins_session() {
         (r.status, r.json()["error"]["code"].as_str()),
         (409, Some("invalid_state"))
     );
+    // 核准之後清單不再有可以核准的，推送的 JSON 也不再帶 submission
+    let r = call(
+        &f,
+        "GET",
+        "/api/v1/rollouts",
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(r.json()["meta"]["pending_approval_actionable"], 0);
+    assert_eq!(r.json()["data"][0].get("submission"), None);
     let actions: Vec<(String, String)> =
         audit_actions(&f).into_iter().map(|a| (a.0, a.1)).collect();
     for (action, actor) in [

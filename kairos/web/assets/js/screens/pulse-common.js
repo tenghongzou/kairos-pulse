@@ -107,9 +107,80 @@ export function hostStateBadge(s) {
   return tone ? statusBadge(tone, hostStateLabel(s)) : neutralBadge(hostStateLabel(s));
 }
 
+/** 原因代碼的文案；不認得的代碼（之後的版本新增的）顯示為「其他原因（代碼）」，台數與主機照常列出 */
 export function skipLabel(reason) {
   if (!reason) return null;
-  return has(`rm.skip.${reason}`) ? t(`rm.skip.${reason}`) : reason;
+  return has(`rm.skip.${reason}`) ? t(`rm.skip.${reason}`) : t('rm.skip.other', { code: reason });
+}
+
+/** 風險提醒（預覽與送審摘要的 warnings[]：伺服器回傳固定代碼）；沒有時 null */
+export function warningsList(codes) {
+  if (!codes || !codes.length) return null;
+  return h(
+    'div',
+    { class: 'k-ro-warnings' },
+    h('h3', { class: 'k-section-title' }, t('rm.warn.title')),
+    h(
+      'ul',
+      { class: 'k-plain-list' },
+      codes.map((c) => h('li', { dataset: { warning: c } }, icon('status-warning'), ' ', has(`rm.warn.${c}`) ? t(`rm.warn.${c}`) : t('rm.warn.other', { code: c }))),
+    ),
+  );
+}
+
+/** 已等待多久（待核准的推送）：分鐘、小時、天 */
+export function waitedText(since) {
+  const ms = fmt.serverNow() - new Date(since).getTime();
+  if (!Number.isFinite(ms) || ms < 60000) return t('rm.ro.waited.now');
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return t('rm.ro.waited.minutes', { n: fmt.num(mins) });
+  if (mins < 48 * 60) return t('rm.ro.waited.hours', { n: fmt.num(Math.floor(mins / 60)) });
+  return t('rm.ro.waited.days', { n: fmt.num(Math.floor(mins / 1440)) });
+}
+
+/** 設定來源的文字（file／environment／default） */
+export function sourceLabel(src) {
+  return has(`rm.src.${src}`) ? t(`rm.src.${src}`) : src || '—';
+}
+
+/**
+ * 送審摘要（ADR-0002 決策點 2b）：待核准的詳情頁與核准對話框共用。數字、確認字串與風險提醒都由伺服器計算
+ * （r.submission），這裡只組文案；不認得的原因與提醒代碼照常列出。
+ */
+export function submissionView(r) {
+  const sub = r.submission || {};
+  const skipped = Object.entries(sub.skipped || {}).sort((a, b) => b[1] - a[1]);
+  const waves = sub.waves || [];
+  const files = sub.artifact_problems || [];
+  const sch = scheduleSummary(r.schedule);
+  return h(
+    'div',
+    { class: 'k-stack--sm k-ro-submission' },
+    h('p', { class: 'k-preview-big' }, h('span', { class: 'strong' }, t('rm.sub.eligible', { n: fmt.num(sub.eligible || 0) })), ' · ', t('rm.sub.target', { v: r.target_version })),
+    sub.downgrade ? h('p', { class: 'strong' }, t('rm.sub.downgrade', { n: fmt.num(sub.downgrade) })) : null,
+    sub.no_rollback ? h('p', null, t('rm.sub.noRollback', { n: fmt.num(sub.no_rollback) })) : null,
+    waves.length ? h('p', null, t('rm.sub.wavesList', { n: fmt.num(waves.length), list: waves.map((n) => fmt.num(n || 0)).join(' → ') })) : null,
+    h('p', null, sch || t('rm.sub.scheduleNone')),
+    warningsList(sub.warnings),
+    files.length
+      ? [
+          h('h3', { class: 'k-section-title' }, t('rm.sub.files')),
+          h(
+            'ul',
+            { class: 'k-plain-list' },
+            files.map((f) => h('li', null, t('rm.sub.fileLine', { v: f.version, f: f.filename, p: has(`rm.rel.problem.${f.file_problem}`) ? t(`rm.rel.problem.${f.file_problem}`) : f.file_problem, n: fmt.num(f.hosts || 0) }))),
+          ),
+        ]
+      : null,
+    h('h3', { class: 'k-section-title' }, t('rm.sub.skipped')),
+    skipped.length
+      ? h(
+          'ul',
+          { class: 'k-ro-skip' },
+          skipped.map(([reason, n]) => h('li', { dataset: { reason } }, t('rm.new.skipLine', { label: skipLabel(reason), n: fmt.num(n) }))),
+        )
+      : h('p', { class: 'caption' }, t('rm.sub.skippedNone')),
+  );
 }
 
 /** 批次的名稱：兩批以上時第一批為「先行批次」、最後一批為「其餘」，中間為「第 N 批」 */
@@ -151,6 +222,8 @@ export function nextActionText(na) {
       return na.until ? t('rm.next.waiting_window', { t: fmt.dateTime(na.until, { seconds: false }) }) : t('rm.next.waiting_windowNone');
     case 'paused':
       return na.reason ? t('rm.next.paused', { reason: na.reason }) : t('rm.next.pausedNoReason');
+    case 'waiting_artifact':
+      return t('rm.next.waiting_artifact', { n: fmt.num(na.hosts ?? 0) });
     default:
       return has(`rm.next.${na.code}`) ? t(`rm.next.${na.code}`) : na.code;
   }

@@ -35,6 +35,12 @@
 .k-ro-wave__n { font: var(--ds-text-label); display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: var(--ds-radius-full); background: var(--ds-color-bg-subtle); }
 .k-ro-waves li.is-current .k-ro-wave__n { background: var(--ds-color-accent-subtle); color: var(--ds-color-text-primary); }
 
+/* S26 雙人覆核（0.10）：風險提醒、送審摘要、「待核准」檢視的風險標示 */
+.k-ro-warnings ul { list-style: none; padding: 0; display: flex; flex-direction: column; gap: var(--ds-space-100); }
+.k-ro-warnings li { display: flex; gap: var(--ds-space-200); align-items: baseline; }
+.k-ro-submission p { margin: 0; }
+.k-ro-risks { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: var(--ds-space-100); }
+
 /* S25 匯入：每個檔案一列（檔名、進度、結果） */
 .k-imp-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--ds-space-200); }
 .k-imp-files li { display: grid; grid-template-columns: minmax(0, 1fr) minmax(8rem, 12rem); gap: var(--ds-space-200) var(--ds-space-400); align-items: center; }

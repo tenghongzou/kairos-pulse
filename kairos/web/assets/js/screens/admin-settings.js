@@ -22,7 +22,7 @@ import { t, has } from '../core/strings.js';
 import { api, qs } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as fmt from '../core/format.js';
-import { pageHead, card, errorState, errorAlert, field, inlineAlert, skeletonBlock, neutralBadge, codeTag } from '../ui/components.js';
+import { pageHead, card, errorState, errorAlert, field, inlineAlert, skeletonBlock, neutralBadge, statusBadge, codeTag } from '../ui/components.js';
 import { toast } from '../ui/toast.js';
 import { linkTabs, confirmL1, confirmL2, valueText } from './admin-common.js';
 import { tokensCard } from './admin-tokens.js';
@@ -31,7 +31,9 @@ import { exportCard } from './admin-export.js';
 const TABS = ['general', 'security', 'storage', 'integrations'];
 const TAB_SECTIONS = {
   general: ['accounts', 'alerts'],
-  security: ['server', 'console', 'auth', 'limits', 'timeouts', 'enroll', 'pki'],
+  // remote（0.10，ADR-0002 決策點 2i）：「遠端管理」卡片——[remote] 的鍵唯讀；雙人覆核（rollout_approval）另外寫出
+  // 「需要／不需要」、來源與上一次改變的時間（系統健康「遠端管理」的 rollout_approval_observed）
+  security: ['server', 'console', 'auth', 'limits', 'timeouts', 'enroll', 'pki', 'remote'],
   storage: ['storage', 'audit'],
   integrations: ['log', 'observability'],
 };
@@ -126,6 +128,7 @@ export function render(ctx) {
   let modeDirty = null;
   // 指標轉出卡片（「整合」）的未儲存變更
   let exportEl = null;
+  let approvalObserved = null;
   const body = h('div', null, skeletonBlock(10));
   mount(
     root,
@@ -146,6 +149,18 @@ export function render(ctx) {
       return;
     }
     const byKey = new Map(list.map((s) => [s.key, s]));
+    // 雙人覆核的前值與上一次改變（啟動時與資料庫比對的結果）：在系統健康的「遠端管理」項目，需要 rollouts:read；
+    // 取不到時卡片照常顯示生效值與來源
+    approvalObserved = null;
+    if (section === 'security' && byKey.has('remote.rollout_approval') && session.can('rollouts:read')) {
+      try {
+        const hd = await api('/api/v1/system/health');
+        const it = (hd.items || []).find((i) => i.id === 'remote');
+        approvalObserved = (it && it.values && it.values.rollout_approval_observed) || null;
+      } catch {
+        approvalObserved = null;
+      }
+    }
     const blocks = [];
     if (section === 'security' && session.can('enroll:read')) blocks.push(modeCard(byKey));
     for (const sec of TAB_SECTIONS[section]) {
@@ -262,11 +277,33 @@ export function render(ctx) {
     );
   }
 
+  /**
+   * 雙人覆核（remote.rollout_approval；ADR-0002 決策點 2i）：唯讀——「需要／不需要」、來源、只能在設定檔修改、
+   * 上一次改變的時間，以及這個做法的侷限（能修改設定檔的人可以獨自關閉；Kairos 只做到記錄與告警）。
+   */
+  function approvalBlock(s) {
+    const required = s.value === 'required';
+    const o = approvalObserved;
+    const at = (x) => `${fmt.dateTime(x, { seconds: false })} ${fmt.tzLabel()}`;
+    const changed = o && o.changed_at ? t('adm.set.approval.changed', { t: at(o.changed_at), from: t(o.changed_from === 'required' ? 'adm.set.approval.required' : 'adm.set.approval.none'), to: t(o.value === 'required' ? 'adm.set.approval.required' : 'adm.set.approval.none'), node: o.node || '—' }) : o && o.observed_at ? t('adm.set.approval.unchanged', { t: at(o.observed_at) }) : t('adm.set.approval.unknown');
+    return h(
+      'div',
+      { class: 'k-stack--sm', id: 'rollout-approval-setting', dataset: { value: String(s.value), source: s.source } },
+      h('p', null, h('span', { class: 'strong' }, t('adm.set.approval.label')), ' ', required ? statusBadge('online', t('adm.set.approval.required')) : neutralBadge(t('adm.set.approval.none')), ' ', neutralBadge(sourceLabel(s.source), s.source === 'env' ? 'lock' : null)),
+      h('p', null, required ? t('adm.set.approval.requiredBody') : t('adm.set.approval.noneBody')),
+      h('p', { class: 'caption', id: 'rollout-approval-changed' }, changed),
+      h('p', { class: 'caption' }, t('adm.set.approval.fileOnly'), session.can('audit:read') ? [' ', h('a', { href: '/audit?target=remote.rollout_approval' }, t('adm.set.approval.audit'))] : null),
+    );
+  }
+
   function sectionCard(sec, rows) {
-    const restart = ['server', 'console', 'auth', 'limits', 'timeouts', 'storage', 'audit', 'log', 'observability', 'accounts'].includes(sec);
+    const restart = ['server', 'console', 'auth', 'limits', 'timeouts', 'storage', 'audit', 'log', 'observability', 'accounts', 'remote'].includes(sec);
+    const approval = sec === 'remote' ? rows.find((s) => s.key === 'remote.rollout_approval') : null;
     return card({
       title: has(`adm.set.section.${sec}`) ? t(`adm.set.section.${sec}`) : sec,
+      id: sec === 'remote' ? 'settings-remote' : undefined,
       body: [
+        approval ? approvalBlock(approval) : null,
         h('p', { class: 'caption' }, restart ? t('adm.set.fileOnly') : sec === 'pki' ? t('adm.set.pkiNote') : t('adm.set.consoleKeys')),
         // 「整合」：/metrics 經反向代理時必須設定 token（screens.md S21「整合」、D42）
         sec === 'observability' ? h('p', { class: 'caption' }, t('adm.health.metrics.proxy'), ' ', codeTag('KRS-W0304')) : null,
