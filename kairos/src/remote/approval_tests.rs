@@ -172,7 +172,11 @@ async fn approve_requires_the_server_computed_phrase_and_digest() {
     assert_eq!(v["state"], "pending_approval");
     let sub = submission_of(&fx, &id).await;
     assert_eq!(
-        (sub.confirm_text().as_str(), sub.confirm_level(), sub.eligible),
+        (
+            sub.confirm_text().as_str(),
+            sub.confirm_level(),
+            sub.eligible
+        ),
         ("核准 2 台", "L2", 2)
     );
     // 送出的回應就帶著 submission，與之後讀到的相同
@@ -249,7 +253,10 @@ async fn approve_requires_the_server_computed_phrase_and_digest() {
     assert_eq!(actor, "user:carol");
     assert_eq!(details["digest"], d.as_str());
     assert_eq!(
-        (details["eligible"].as_i64(), details["confirm_level"].as_str()),
+        (
+            details["eligible"].as_i64(),
+            details["confirm_level"].as_str()
+        ),
         (Some(2), Some("L2"))
     );
     assert_eq!(details["submitted_by"], "user:admin");
@@ -348,7 +355,11 @@ async fn approving_a_downgrade_needs_the_l3_phrase_and_a_reason() {
         .unwrap();
     let sub = submission_of(&fx, &id).await;
     assert_eq!(
-        (sub.confirm_text().as_str(), sub.confirm_level(), sub.downgrade),
+        (
+            sub.confirm_text().as_str(),
+            sub.confirm_level(),
+            sub.downgrade
+        ),
         ("核准降版 1 台", "L3", 1)
     );
     let req = |confirm: &str, reason: Option<&str>| ApproveRequest {
@@ -365,7 +376,10 @@ async fn approving_a_downgrade_needs_the_l3_phrase_and_a_reason() {
     assert_eq!((e.status.as_u16(), e.code), (400, "confirmation_required"));
     let details = e.details.unwrap();
     assert_eq!(
-        (details["confirm_text"].as_str(), details["confirm_level"].as_str()),
+        (
+            details["confirm_text"].as_str(),
+            details["confirm_level"].as_str()
+        ),
         (Some("核准降版 1 台"), Some("L3"))
     );
     // 字串正確但沒有原因
@@ -449,7 +463,10 @@ async fn creator_and_submitter_cannot_approve_and_available_approvers_are_counte
     let p = fx
         .svc
         .preview_rollout(
-            RolloutSpec::parse(&json!({"name": "p", "target_version": "0.9.2", "selector": {"agent_ids": [C]}})).unwrap(),
+            RolloutSpec::parse(
+                &json!({"name": "p", "target_version": "0.9.2", "selector": {"agent_ids": [C]}}),
+            )
+            .unwrap(),
             None,
             Some("user:alice".into()),
         )
@@ -504,7 +521,12 @@ async fn creator_and_submitter_cannot_approve_and_available_approvers_are_counte
         .unwrap();
     let sub = submission_json_of(&fx, &id).await;
     assert_eq!(sub["approvers_available"], 0);
-    assert!(sub["warnings"].as_array().unwrap().contains(&json!("no_approvers")));
+    assert!(
+        sub["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("no_approvers"))
+    );
     // 核准的身分檢查在引擎（與帳號表無關）：丙成功
     approve(&fx, &carol, &id).await.unwrap();
 }
@@ -675,20 +697,41 @@ async fn files_deleted_between_preview_submit_and_approval_are_caught() {
     let (fx, r092) = fixture("a9", 48).await;
     let carol = user("carol");
     let spec = RolloutSpec::parse(&body("x")).unwrap();
-    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
-    assert_eq!((p["eligible"].as_i64(), p["confirm_text"].as_str()), (Some(2), Some("升級 2 台")));
+    let p = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["confirm_text"].as_str()),
+        (Some(2), Some("升級 2 台"))
+    );
     assert_eq!(p["artifact_problems"], json!([]));
     let id = create(&fx, &who(), &body("x")).await;
     // 預覽之後 tar.gz 被刪除
     let tar = file_of(&fx, &r092, "tar.gz");
     std::fs::remove_file(&tar).unwrap();
-    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let p = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(p["eligible"], 1, "{p}");
     assert_eq!(p["skipped"]["artifact_missing"], 1);
     assert_eq!(p["skipped"].get("no_artifact"), None);
     assert_eq!(p["artifact_problems"][0]["file_problem"], "missing");
-    assert!(p["artifact_problems"][0]["filename"].as_str().unwrap().ends_with("tar.gz"));
-    assert!(p["warnings"].as_array().unwrap().contains(&json!("artifact_problem")));
+    assert!(
+        p["artifact_problems"][0]["filename"]
+            .as_str()
+            .unwrap()
+            .ends_with("tar.gz")
+    );
+    assert!(
+        p["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("artifact_problem"))
+    );
     // 用預覽當時的字串送出：台數已經不同
     let e = fx
         .svc
@@ -712,7 +755,12 @@ async fn files_deleted_between_preview_submit_and_approval_are_caught() {
     let sub = submission_json_of(&fx, &id).await;
     assert_eq!(sub["artifact_problems"][0]["file_problem"], "size_mismatch");
     assert_eq!(sub["artifact_problems"][0]["hosts"], 1);
-    assert!(sub["warnings"].as_array().unwrap().contains(&json!("artifact_problem")));
+    assert!(
+        sub["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("artifact_problem"))
+    );
     let e = approve(&fx, &carol, &id).await.unwrap_err();
     assert_eq!(
         (e.status.as_u16(), e.code, e.product_code),
@@ -762,12 +810,20 @@ async fn hosts_wait_for_a_missing_file_and_continue_after_it_is_restored() {
         .db
         .read(move |s| {
             let r = s.get_rollout(&rid)?.unwrap();
-            Ok(rollout_json(&r, &s.rollout_hosts(&rid)?, T0 + 2 * MIN, true))
+            Ok(rollout_json(
+                &r,
+                &s.rollout_hosts(&rid)?,
+                T0 + 2 * MIN,
+                true,
+            ))
         })
         .await
         .unwrap();
     assert_eq!(v["state"], "running");
-    assert_eq!(v["next_action"], json!({"code": "waiting_artifact", "hosts": 1}));
+    assert_eq!(
+        v["next_action"],
+        json!({"code": "waiting_artifact", "hosts": 1})
+    );
     assert_eq!(v["progress"]["failed"], 0);
     // 已提議的主機（B）的檔案也不見了：不發出無法下載的提議，下一輪收回
     let up_b = fx.svc.offer_of(B).unwrap();
@@ -800,7 +856,11 @@ async fn hosts_wait_for_a_missing_file_and_continue_after_it_is_restored() {
         let up = fx.svc.offer_of(agent).unwrap();
         assert!(fx.svc.build_offer(agent, &up, 3).await.unwrap().is_some());
     }
-    assert!(!fx.audit_actions().await.contains(&"rollout.auto_pause".to_string()));
+    assert!(
+        !fx.audit_actions()
+            .await
+            .contains(&"rollout.auto_pause".to_string())
+    );
 }
 
 /// A10：送審之後、已排程的推送使用中的版本不能刪除（409 `release_in_use`）
@@ -860,7 +920,11 @@ async fn approval_policy_changes_are_recorded_against_the_stored_value() {
     let (actor, d) = last_audit(&fx, ACTION_BASELINE).await.unwrap();
     assert_eq!(actor, "system");
     assert_eq!(
-        (d["value"].as_str(), d["source"].as_str(), d["node"].as_str()),
+        (
+            d["value"].as_str(),
+            d["source"].as_str(),
+            d["node"].as_str()
+        ),
         (Some("none"), Some("default"), Some("node-a"))
     );
     // 相同：不寫
@@ -878,14 +942,28 @@ async fn approval_policy_changes_are_recorded_against_the_stored_value() {
     let (actor, d) = last_audit(&fx, ACTION_CHANGE).await.unwrap();
     assert_eq!(actor, "system");
     assert_eq!(
-        (d["from"].as_str(), d["to"].as_str(), d["source"].as_str(), d["previous_source"].as_str()),
-        (Some("none"), Some("required"), Some("file"), Some("default"))
+        (
+            d["from"].as_str(),
+            d["to"].as_str(),
+            d["source"].as_str(),
+            d["previous_source"].as_str()
+        ),
+        (
+            Some("none"),
+            Some("required"),
+            Some("file"),
+            Some("default")
+        )
     );
     // 只有來源改變（設定檔 → 環境變數）
     fx.set_now(T0 + 2 * MIN);
     let (o, rec) = observe(&fx, "required", "environment").await;
     assert_eq!(o, Outcome::SourceChanged);
-    assert_eq!(rec.changed_at, Some(T0 + MIN), "值沒有變，上一次改變的時間不動");
+    assert_eq!(
+        rec.changed_at,
+        Some(T0 + MIN),
+        "值沒有變，上一次改變的時間不動"
+    );
     let (_, d) = last_audit(&fx, ACTION_CHANGE).await.unwrap();
     assert_eq!(d["source_changed"], true);
     // required → none：記下關閉的時間
@@ -902,7 +980,10 @@ async fn approval_policy_changes_are_recorded_against_the_stored_value() {
     // 之後維持 none：不再寫，但「已關閉」的紀錄留著
     fx.set_now(T0 + 4 * MIN);
     let (o, rec) = observe(&fx, "none", "environment").await;
-    assert_eq!((o, rec.disabled_at), (Outcome::Unchanged, Some(T0 + 3 * MIN)));
+    assert_eq!(
+        (o, rec.disabled_at),
+        (Outcome::Unchanged, Some(T0 + 3 * MIN))
+    );
     assert_eq!(audit_count(&fx, ACTION_CHANGE).await, 3);
     assert_eq!(rec.recent_change_json(T0 + 5 * MIN)["to"], "none");
     assert_eq!(
@@ -1022,7 +1103,13 @@ async fn disabling_approval_opens_an_alert_and_a_failed_audit_write_blocks_start
                     details,
                 } = &ev.kind
                 {
-                    out.push((*rule, subject.clone(), *active, title.clone(), details.clone()));
+                    out.push((
+                        *rule,
+                        subject.clone(),
+                        *active,
+                        title.clone(),
+                        details.clone(),
+                    ));
                 }
             }
             out

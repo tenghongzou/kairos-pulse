@@ -1104,10 +1104,7 @@ async fn run(
                     // API、8443 的遠端管理訊息、推送引擎）之前寫入；寫入失敗時遠端管理不啟動
                     let policy = svc
                         .observe_approval_policy(
-                            config
-                                .provenance
-                                .source("remote.rollout_approval")
-                                .as_str(),
+                            config.provenance.source("remote.rollout_approval").as_str(),
                             &config
                                 .cluster
                                 .effective_node_id(&kp_obs::logfmt::hostname()),
@@ -1121,24 +1118,24 @@ async fn run(
                     if policy.is_ok() {
                         svc.spawn_engine();
                         info!(
-                        "遠端管理：集中設定{}、遠端升級{}（需要 mTLS 與 Pulse 0.9.0 以上；版本庫 {}{}）",
-                        if config.remote.config_enabled {
-                            "啟用"
-                        } else {
-                            "停用（remote.config_enabled = false）"
-                        },
-                        if config.remote.upgrade_enabled {
-                            "啟用"
-                        } else {
-                            "停用（remote.upgrade_enabled = false）"
-                        },
-                        svc.releases_dir.display(),
-                        if config.remote.allowed_signers.trim().is_empty() {
-                            "；remote.allowed_signers 未設定，匯入發佈版本時不驗證簽署者"
-                        } else {
-                            ""
-                        }
-                    );
+                            "遠端管理：集中設定{}、遠端升級{}（需要 mTLS 與 Pulse 0.9.0 以上；版本庫 {}{}）",
+                            if config.remote.config_enabled {
+                                "啟用"
+                            } else {
+                                "停用（remote.config_enabled = false）"
+                            },
+                            if config.remote.upgrade_enabled {
+                                "啟用"
+                            } else {
+                                "停用（remote.upgrade_enabled = false）"
+                            },
+                            svc.releases_dir.display(),
+                            if config.remote.allowed_signers.trim().is_empty() {
+                                "；remote.allowed_signers 未設定，匯入發佈版本時不驗證簽署者"
+                            } else {
+                                ""
+                            }
+                        );
                     }
                     policy.ok().map(|_| svc)
                 }

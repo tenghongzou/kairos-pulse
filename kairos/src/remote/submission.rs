@@ -197,7 +197,10 @@ pub fn submission(r: &RolloutRow, hosts: &[RolloutHostRow]) -> Submission {
         if let Some(w) = usize::try_from(h.wave).ok().and_then(|w| waves.get_mut(w)) {
             *w += 1;
         }
-        let from = h.from_version.as_deref().and_then(|v| Version::parse(v).ok());
+        let from = h
+            .from_version
+            .as_deref()
+            .and_then(|v| Version::parse(v).ok());
         if matches!((&from, &target), (Some(c), Some(t)) if t < c) {
             downgrade += 1;
         }
@@ -218,7 +221,14 @@ pub fn submission(r: &RolloutRow, hosts: &[RolloutHostRow]) -> Submission {
         r.submitted_at,
         r.submitted_by,
         rows.iter()
-            .map(|h| json!([h.agent_id, h.wave, h.ordinal, h.state, h.reason, h.from_version]))
+            .map(|h| json!([
+                h.agent_id,
+                h.wave,
+                h.ordinal,
+                h.state,
+                h.reason,
+                h.from_version
+            ]))
             .collect::<Vec<_>>(),
     ]);
     Submission {
@@ -260,7 +270,11 @@ fn involved(r_created_by: &str, r_submitted_by: Option<&str>, actor: &str) -> bo
 }
 
 /// `approvers_available`：[`approvers`] 中不是這個推送的建立者或送出者的人數
-pub fn approvers_available(approvers: &[String], created_by: &str, submitted_by: Option<&str>) -> usize {
+pub fn approvers_available(
+    approvers: &[String],
+    created_by: &str,
+    submitted_by: Option<&str>,
+) -> usize {
     approvers
         .iter()
         .filter(|a| !involved(created_by, submitted_by, a))
@@ -466,7 +480,10 @@ mod tests {
         assert_eq!((s.eligible, s.downgrade), (2, 0));
         assert_eq!(s.waves, vec![1, 1]);
         assert_eq!(s.skipped.get("already"), Some(&1));
-        assert_eq!((s.confirm_text().as_str(), s.confirm_level()), ("核准 2 台", "L2"));
+        assert_eq!(
+            (s.confirm_text().as_str(), s.confirm_level()),
+            ("核准 2 台", "L2")
+        );
         // 列的順序與 upgrade_id（隨機、暫停後會換）不影響
         let mut shuffled = hosts.clone();
         shuffled.reverse();
@@ -507,7 +524,10 @@ mod tests {
     #[test]
     fn downgrades_need_the_l3_phrase() {
         let r = rollout(100);
-        let hosts = vec![host("a", 0, "pending", "0.9.3"), host("b", 1, "pending", "0.9.0")];
+        let hosts = vec![
+            host("a", 0, "pending", "0.9.3"),
+            host("b", 1, "pending", "0.9.0"),
+        ];
         let s = submission(&r, &hosts);
         assert_eq!((s.eligible, s.downgrade), (2, 1));
         assert_eq!(
@@ -524,24 +544,45 @@ mod tests {
             session,
             approve,
         };
-        assert_eq!(v("user:alice", true, true).blocked(&r), Some("self_approval"));
+        assert_eq!(
+            v("user:alice", true, true).blocked(&r),
+            Some("self_approval")
+        );
         assert_eq!(v("user:bob", true, true).blocked(&r), Some("self_approval"));
         assert_eq!(v("user:carol", true, true).blocked(&r), None);
         assert_eq!(v("user:carol", true, false).blocked(&r), Some("forbidden"));
-        assert_eq!(v("token:t1", false, true).blocked(&r), Some("session_required"));
+        assert_eq!(
+            v("token:t1", false, true).blocked(&r),
+            Some("session_required")
+        );
         assert!(v("user:carol", true, true).can_approve(&r));
         let mut draft = r.clone();
         draft.state = rollout::ROLLOUT_DRAFT.into();
         assert!(!v("user:carol", true, true).can_approve(&draft));
         let j = v("user:bob", true, true).json(&r);
         assert_eq!(
-            (j["can_approve"].as_bool(), j["blocked"].as_str(), j["is_creator"].as_bool(), j["is_submitter"].as_bool()),
+            (
+                j["can_approve"].as_bool(),
+                j["blocked"].as_str(),
+                j["is_creator"].as_bool(),
+                j["is_submitter"].as_bool()
+            ),
             (Some(false), Some("self_approval"), Some(false), Some(true))
         );
-        let all = vec!["user:alice".to_string(), "user:bob".into(), "user:carol".into()];
+        let all = vec![
+            "user:alice".to_string(),
+            "user:bob".into(),
+            "user:carol".into(),
+        ];
         assert_eq!(approvers_available(&all, "user:alice", Some("user:bob")), 1);
-        assert_eq!(approvers_available(&all[..2], "user:alice", Some("user:bob")), 0);
-        assert_eq!(approvers_available(&all[..2], "user:alice", Some("user:alice")), 1);
+        assert_eq!(
+            approvers_available(&all[..2], "user:alice", Some("user:bob")),
+            0
+        );
+        assert_eq!(
+            approvers_available(&all[..2], "user:alice", Some("user:alice")),
+            1
+        );
     }
 
     #[test]
@@ -550,12 +591,20 @@ mod tests {
         let two = WaveSpec::default_template();
         assert!(risk_warnings(&two, &[1, 99], 100, 0, 0, false).is_empty());
         // 第一批超過 10%
-        assert_eq!(risk_warnings(&two, &[20, 80], 100, 0, 0, false), vec!["large_first_wave"]);
+        assert_eq!(
+            risk_warnings(&two, &[20, 80], 100, 0, 0, false),
+            vec!["large_first_wave"]
+        );
         // 只有一批、降版、無法自動回滾、檔案有問題
         let one = vec![two[1].clone()];
         assert_eq!(
             risk_warnings(&one, &[100], 100, 3, 2, true),
-            vec!["single_wave", "downgrade", "no_rollback", "artifact_problem"]
+            vec![
+                "single_wave",
+                "downgrade",
+                "no_rollback",
+                "artifact_problem"
+            ]
         );
         // 只有一台主機時一批不算風險
         assert!(risk_warnings(&one, &[1], 1, 0, 0, false).is_empty());

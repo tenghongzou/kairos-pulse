@@ -826,7 +826,8 @@ async fn remote(ctx: &ApiContext) -> Item {
     // 雙人覆核：啟動時與資料庫的前值比對的結果（前值、來源、最近一次改變；ADR-0002 決策點 2i）
     let policy = svc.approval_policy();
     values["rollout_approval_observed"] = policy.map_or(Value::Null, |o| o.json());
-    values["rollout_approval_change"] = policy.map_or(Value::Null, |o| o.recent_change_json(now_ms));
+    values["rollout_approval_change"] =
+        policy.map_or(Value::Null, |o| o.recent_change_json(now_ms));
     let disabled_recently = policy.is_some_and(|o| {
         o.disabled_at
             .is_some_and(|at| now_ms - at < crate::remote::policy::RECENT_CHANGE_MS)
@@ -900,15 +901,16 @@ async fn remote(ctx: &ApiContext) -> Item {
             ))
         })
         .await;
-    let (running, paused, releases, failures, missing, (waiting, pending, no_approvers)) = match counts {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("系統健康：無法讀取推送的狀態：{e}");
-            values["error"] = json!("無法讀取推送的狀態");
-            return Item::new("remote", Level::Warning, "無法讀取推送的狀態", values)
-                .needs(Permission::RolloutsRead);
-        }
-    };
+    let (running, paused, releases, failures, missing, (waiting, pending, no_approvers)) =
+        match counts {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("系統健康：無法讀取推送的狀態：{e}");
+                values["error"] = json!("無法讀取推送的狀態");
+                return Item::new("remote", Level::Warning, "無法讀取推送的狀態", values)
+                    .needs(Permission::RolloutsRead);
+            }
+        };
     let auto: Vec<_> = paused.iter().filter(|r| r.pause_cause.is_some()).collect();
     values["rollouts_running"] = json!(running);
     values["rollouts_paused"] = json!(paused.len());
@@ -1010,7 +1012,9 @@ async fn remote(ctx: &ApiContext) -> Item {
         (
             Level::Warning,
             None,
-            format!("{no_approvers} 個待核准的推送目前沒有可以核准的管理員（建立者與送出者不能核准）"),
+            format!(
+                "{no_approvers} 個待核准的推送目前沒有可以核准的管理員（建立者與送出者不能核准）"
+            ),
         )
     } else if !trust && releases > 0 {
         (

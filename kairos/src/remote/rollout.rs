@@ -1225,7 +1225,7 @@ pub fn risk_warnings(
             {
                 out.push("no_pause_between_waves");
             }
-            if wave_hosts.iter().any(|n| *n == 0) {
+            if wave_hosts.contains(&0) {
                 out.push("empty_wave");
             }
         }

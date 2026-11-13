@@ -873,7 +873,11 @@ async fn rollout_offers_downloads_statuses_pauses_and_retries() {
         "options": {"canary_agent_ids": [A]},
     }))
     .unwrap();
-    let preview = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let preview = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(preview["eligible"], 2);
     assert_eq!(preview["skipped"]["disabled"], 1);
     assert_eq!(preview["waves"], json!([1, 1]));
@@ -1368,11 +1372,19 @@ async fn preview_and_submit_use_the_live_hello_instead_of_the_inventory() {
     })
     .await;
     let spec = RolloutSpec::parse(&json!({"name": "x", "target_version": "0.9.2", "selector": {"tags": ["site:b"]}, "waves": [{"size": "rest"}]})).unwrap();
-    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let p = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(p["matched"], 0, "清冊沒有標籤：比對不到");
     // 剛連線、hello 已升到 0.9.0（tar、就緒、標籤 site:b），沒有協商 upgrade：資格依 hello
     connect_hello_only(&fx, A, "0.9.0", "tar", "ready");
-    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let p = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(
         (p["matched"].as_i64(), p["eligible"].as_i64()),
         (Some(1), Some(1)),
@@ -1428,7 +1440,11 @@ async fn hosts_without_a_rollback_artifact_need_the_longer_l2_phrase() {
     );
     assert_eq!(p["confirm_text"], "升級 1 台");
     let spec = RolloutSpec::parse(&body(true)).unwrap();
-    let p = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let p = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(
         (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
         (Some(2), Some(1))
@@ -1746,7 +1762,11 @@ async fn scheduled_rollouts_start_later_and_only_offer_inside_windows() {
         })
     };
     let spec = RolloutSpec::parse(&body("x")).unwrap();
-    let preview = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let preview = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(
         preview["window"],
         json!({"open": false, "next": ts(T0 + 60 * MIN)})
@@ -2044,7 +2064,11 @@ async fn four_wave_rollouts_advance_wave_by_wave() {
         ],
     }))
     .unwrap();
-    let preview = fx.svc.preview_rollout(spec.clone(), None, None).await.unwrap();
+    let preview = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
     assert_eq!(preview["waves"], json!([1, 1, 1, 1]));
     let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
         .as_str()

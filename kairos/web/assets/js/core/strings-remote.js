@@ -726,6 +726,18 @@ export const REMOTE_STRINGS = {
   'rm.det.submissionChanged': '這個推送在你檢視之後被修改或重新送出，已重新載入送審摘要，請重新檢視後再核准',
   'rm.det.approveFailed': '無法核准推送',
   'rm.det.approveFileMissing': '版本庫的檔案遺失，無法核准',
+  // 雙人覆核的 API 錯誤的就地說明（core/errors.js 依機器代碼查 err.<code>.*）。KRS-E6106 在設計包的總表只有
+  // 「不能核准自己建立的推送」、沒有三段式；實際的規則是建立者與送出者都不能核准（ADR-0002 決策點 2c）。
+  // submission_changed、session_required 不對應產品代碼（ADR-0002 決策點 7）〔ADR 0002 暫行〕
+  'err.self_approval.title': '不能核准自己建立或送出的推送',
+  'err.self_approval.reason': '雙人覆核要求由建立者與送出者以外的管理員核准：建立推送的人與送出推送的人都不能核准（由別人建立、你送出的推送也一樣）。',
+  'err.self_approval.fix': '請另一位有核准權限的管理員以帳號登入後核准。只有兩位管理員時，由同一個人建立並送出、另一個人核准。',
+  'err.session_required.title': '核准與退回需要以帳號登入',
+  'err.session_required.reason': 'API token 不能核准或退回升級推送。',
+  'err.session_required.fix': '以帳號登入主控台後再操作。',
+  'err.submission_changed.title': '送審內容已經改變',
+  'err.submission_changed.reason': '這個推送在你檢視之後被修改或重新送出，你確認的不是目前的內容。',
+  'err.submission_changed.fix': '重新載入送審摘要，檢視後再核准。',
   // 送審摘要（核准者要確認的內容；數字與確認字串由伺服器計算）
   'rm.sub.title': '送審摘要',
   'rm.sub.eligible': '可升級 {n} 台',

@@ -738,8 +738,9 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     // 提示文字依可用的搜尋提供者組成（ADR-0002 決策點 6）：頂列只寫「搜尋」，對話框的標籤列出稽核員可以搜尋的四類
     assert.equal(await page.locator('.k-search-trigger').getAttribute('title'), '搜尋（Ctrl K）');
     await page.keyboard.press('Control+k');
-    await page.getByRole('combobox', { name: '搜尋主機、告警事件、升級推送、設定檔', exact: true }).waitFor();
-    assert.equal(await page.getByRole('combobox').getAttribute('placeholder'), '例如 hmi-line3、10.30.3.0/24、r-20261120-0001');
+    const auBox = page.getByRole('combobox', { name: '搜尋主機、告警事件、升級推送、設定檔', exact: true });
+    await auBox.waitFor();
+    assert.equal(await auBox.getAttribute('placeholder'), '例如 hmi-line3、10.30.3.0/24、r-20261120-0001');
     await page.keyboard.type('E2E');
     const found = page.getByRole('listbox', { name: '搜尋結果' });
     await found.getByRole('group', { name: '升級推送' }).getByRole('option', { name: /E2E 0\.9\.1/ }).waitFor();
@@ -764,8 +765,9 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await waitTitle(vs.page, '主機');
     await vs.page.keyboard.press('Control+k');
     // 唯讀角色只能搜尋主機與告警事件：標籤不列出搜不到的類別，範例不附推送編號
-    await vs.page.getByRole('combobox', { name: '搜尋主機、告警事件', exact: true }).waitFor();
-    assert.equal(await vs.page.getByRole('combobox').getAttribute('placeholder'), '例如 hmi-line3、6f1c0e4a、10.30.3.27、10.30.3.0/24');
+    const vsBox = vs.page.getByRole('combobox', { name: '搜尋主機、告警事件', exact: true });
+    await vsBox.waitFor();
+    assert.equal(await vsBox.getAttribute('placeholder'), '例如 hmi-line3、6f1c0e4a、10.30.3.27、10.30.3.0/24');
     await vs.page.keyboard.type('E2E 0.9');
     await vs.page.getByText('沒有符合「E2E 0.9」的結果。').waitFor();
     assert.deepEqual(asked, []);
