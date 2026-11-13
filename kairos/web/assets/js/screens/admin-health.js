@@ -4,6 +4,8 @@
 //   後端併入（INTEGRATION §29.6）：頁首「整體」與頂列系統狀態燈都依 API 的 status，兩處一致；沒有對應權限的
 //   項目只有狀態與代碼（restricted），不顯示數值。
 // - 0.9 的「遠端管理」列（remote）：需要 rollouts:read，沒有權限時不顯示；異常時附前往推送或版本庫的捷徑。
+//   0.10（ADR-0002）：版本庫的檔案遺失時寫出等待中的主機數、雙人覆核在 30 天內被關閉、待核准的推送沒有可核准者
+//   （摘要由後端組出；這裡另外顯示關閉的時間與來源，並提供捷徑）。
 // - 「下載診斷包」沒有 API：改為「如何產生診斷包」與可複製的 kairos diag 指令；「目錄服務」列隱藏（§28.6）。
 // - 唯讀（沒有 settings:read）只看整體狀態與各項 StatusBadge，不看數值細節（S20 權限差異）。
 // - 健康 API 本身無回應：整頁 Banner「無法取得健康狀態」，與「全部正常」在視覺上完全不同。
@@ -38,9 +40,25 @@ function shortcut(it) {
     if (v.rollback_failed_unacknowledged > 0) return h('a', { href: '/pulse/rollouts' }, t('adm.health.toRollouts'));
     if (v.rollouts_auto_paused > 0) return h('a', { href: '/pulse/rollouts?state=paused' }, t('adm.health.toPausedRollouts'));
     if (v.release_files_missing > 0 && session.can('releases:read')) return h('a', { href: '/pulse/releases' }, t('adm.health.toReleases'));
+    // 0.10（ADR-0002）：雙人覆核最近被關閉 → S21 的「遠端管理」卡片；待核准而沒有可核准者 → 「待核准」檢視
+    if (approvalOff(it) && session.can('settings:read')) return h('a', { href: '/system/settings/security' }, t('adm.health.toRemoteSettings'));
+    if (v.pending_approval_no_approvers > 0) return h('a', { href: '/pulse/rollouts?view=pending_approval' }, t('adm.health.toPendingRollouts'));
     if (v.upgrade_enabled && !v.allowed_signers_configured && session.can('releases:read')) return h('a', { href: '/pulse/releases' }, t('adm.health.toReleases'));
   }
   return null;
+}
+
+/** 「遠端管理」：雙人覆核在 30 天內由 required 改為 none（values.rollout_approval_change；ADR-0002 決策點 2i） */
+function approvalOff(it) {
+  const ch = it.id === 'remote' && it.values && it.values.rollout_approval_change;
+  return ch && ch.to === 'none' && ch.at ? ch : null;
+}
+
+function approvalOffLine(it) {
+  const ch = approvalOff(it);
+  if (!ch) return null;
+  const src = has(`adm.health.src.${ch.source}`) ? t(`adm.health.src.${ch.source}`) : ch.source || '—';
+  return h('p', { class: 'secondary', id: 'health-approval-off' }, t('adm.health.approvalOff', { t: fmt.dateTime(ch.at, { seconds: false }), src }));
 }
 
 export function render(ctx) {
@@ -112,6 +130,8 @@ export function render(ctx) {
               h('p', { class: 'strong' }, itemLabel(it.id), it.product_code && it.status !== 'ok' ? [' ', codeTag(it.product_code)] : null),
               detail && it.summary && !it.restricted ? h('p', { class: 'secondary' }, it.summary) : null,
               detail && it.restricted ? h('p', { class: 'caption' }, t('adm.health.restricted')) : null,
+              // 雙人覆核最近被關閉：摘要可能被更優先的異常蓋過，這一行一律顯示（30 天內）
+              detail && !it.restricted ? approvalOffLine(it) : null,
               // /metrics 端點：說明一律附反向代理的限制（screens.md S20「/metrics 端點」列，D42）
               detail && it.id === 'metrics' ? h('p', { class: 'caption' }, t('adm.health.metrics.proxy'), ' ', codeTag('KRS-W0304')) : null,
               detail ? (() => {

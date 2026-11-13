@@ -20,7 +20,6 @@ export const REMOTE_STRINGS = {
   'nav.pulseConfig': '集中設定',
   'nav.rollouts': '升級推送',
   'nav.releases': 'Pulse 版本庫',
-  'nav.badge.rollouts': '{n} 項需要處理（已暫停的推送與回滾失敗的主機）',
   // 泡泡的可存取名稱寫出組成（ADR-0002 決策點 2a）：「升級推送，2 個等你核准、1 個已暫停」
   'nav.badge.rolloutsParts': '{n} 項需要處理：{parts}',
   'nav.badge.rolloutsApprove': '{n} 個等你核准',
@@ -449,6 +448,10 @@ export const REMOTE_STRINGS = {
   'rm.ro.mineToken': '不行（需要以帳號登入）',
   'rm.ro.noApprovers': '目前沒有可以核准的管理員',
   'rm.ro.riskNone': '—',
+  'rm.risk.downgrade': '降版',
+  'rm.risk.no_rollback': '無法自動回滾',
+  'rm.risk.single_wave': '一次全部',
+  'rm.risk.artifact_problem': '檔案遺失',
   'rm.ro.waited.minutes': '{n} 分鐘',
   'rm.ro.waited.hours': '{n} 小時',
   'rm.ro.waited.days': '{n} 天',

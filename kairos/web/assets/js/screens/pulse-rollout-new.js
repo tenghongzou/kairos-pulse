@@ -14,7 +14,10 @@
 // 5. 送出：建立草稿（POST /rollouts）→ L2 DangerConfirmDialog 輸入預覽的 confirm_text（「升級 N 台」）→ submit；
 //    降版時 L3（「降版 N 台」＋原因必填；0.9 不要求重新驗證密碼）。台數在送出時改變（400 confirmation_required）
 //    時對話框內換成新的確認字串；主機已在另一個推送（409 rollout_overlap）時列出主機並提供「從對象排除這些主機」。
-// 雙人覆核、Windows、外部 URL 不顯示。
+// 6. 0.10（ADR-0002 S1、S2；精靈之前先加在這個表單）：預覽與送出對話框顯示伺服器回傳的風險提醒（warnings[] 的
+//    固定代碼）、目標版本的檔案遺失（artifact_problems，KRS-W8417；需要它的主機分類為 artifact_missing）；啟用
+//    雙人覆核時寫出誰可以核准，沒有可核准者（approvers_available = 0）時警告但不阻擋。
+// Windows、外部 URL 不顯示。
 
 import { h, icon, mount, uid, announce } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -24,7 +27,8 @@ import { navigate } from '../core/router.js';
 import { pageHead, card, emptyState, errorState, errorAlert, inlineAlert, field, input, skeletonBlock, setBusy } from '../ui/components.js';
 import { openDialog } from '../ui/dialog.js';
 import { toast } from '../ui/toast.js';
-import { isUnavailable, unavailableState, skipLabel, hostLink } from './pulse-common.js';
+import * as session from '../core/session.js';
+import { isUnavailable, unavailableState, skipLabel, hostLink, warningsList } from './pulse-common.js';
 import { refreshRolloutCount } from './pulse-boot.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -90,10 +94,16 @@ export function submitDialog({ name, preview, submit, onExclude }) {
         { class: 'k-stack--sm' },
         lead,
         preview.approval_required ? h('p', { class: 'strong' }, t('rm.new.submitLeadApproval')) : null,
+        // 誰可以核准（三人邊界）與沒有可核准者的警告（不阻擋：之後可能新增帳號；ADR-0002 決策點 2c、2g）
+        preview.approval_required ? h('p', { id: 'submit-who-approves' }, t('rm.new.whoApproves')) : null,
+        preview.approval_required && preview.approvers_available === 0 ? h('div', { id: 'submit-no-approvers' }, inlineAlert({ kind: 'warning', title: t('rm.new.noApprovers'), body: t('rm.new.noApproversBody') })) : null,
         later ? h('p', null, t('rm.new.submitLeadLater', { t: fmt.dateTime(sch.starts_at, { seconds: false }) })) : null,
         sch.windows && sch.windows.length ? h('p', null, win.open === false && win.next ? t('rm.new.windowClosed', { t: fmt.dateTime(win.next, { seconds: false }) }) : t('rm.new.submitLeadWindow')) : null,
         preview.downgrade ? h('p', { class: 'strong' }, t('rm.new.submitLeadDown', { n: fmt.num(preview.downgrade) })) : null,
         preview.no_rollback ? h('p', null, t('rm.new.submitNoRollback', { n: fmt.num(preview.no_rollback) })) : null,
+        // 風險提醒：與預覽、送審摘要、核准對話框同一組（伺服器回傳的固定代碼）。降版、無法自動回滾與沒有可核准者
+        // 上面已經各有一句，這裡不重複
+        warningsList((preview.warnings || []).filter((c) => !['downgrade', 'no_rollback', 'no_approvers'].includes(c))),
         errBox,
         h('div', { class: 'ds-field' }, reasonLabel, reasonIn, reasonErr),
         h('div', { class: 'ds-field' }, h('label', { class: 'ds-field__label', for: tid }, labelText), typed, matchState),
@@ -200,6 +210,24 @@ export function previewView(p, { onExclude, version } = {}) {
       ? inlineAlert({ kind: p.window.next ? 'info' : 'warning', role: 'status', body: p.window.next ? t('rm.new.windowClosed', { t: fmt.dateTime(p.window.next, { seconds: false }) }) : t('rm.new.windowNone') })
       : null,
     p.loses_remote_management && p.eligible ? inlineAlert({ kind: 'warning', body: t('rm.new.loses') }) : null,
+    // 目標版本有檔案遺失或大小不符的發佈檔（KRS-W8417，ADR-0002 F5）：需要它的主機已分類為 artifact_missing
+    p.artifact_problems && p.artifact_problems.length
+      ? h(
+          'div',
+          { id: 'rollout-preview-files' },
+          inlineAlert({
+            kind: 'warning',
+            title: t('rm.new.artifactProblem', { v: version || p.artifact_problems[0].version, n: fmt.num(p.artifact_problems.length) }),
+            code: 'KRS-W8417',
+            body: [h('p', null, t('rm.new.artifactProblemBody')), h('ul', { class: 'k-plain-list' }, p.artifact_problems.map((f) => h('li', null, f.filename)))],
+            actions: session.can('releases:read') ? [h('a', { class: 'ds-button ds-button--secondary ds-button--sm', href: `/pulse/releases/${encodeURIComponent(version || p.artifact_problems[0].version)}` }, t('rm.new.artifactProblemLink', { v: version || p.artifact_problems[0].version }))] : null,
+          }),
+        )
+      : null,
+    // 沒有可核准者（啟用雙人覆核時；決策點 2g）
+    p.approval_required && p.approvers_available === 0 ? h('div', { id: 'rollout-preview-no-approvers' }, inlineAlert({ kind: 'warning', title: t('rm.new.noApprovers'), body: t('rm.new.noApproversBody') })) : null,
+    // 風險提醒（伺服器回傳的固定代碼；檔案與可核准者上面已經各有一則）
+    warningsList((p.warnings || []).filter((c) => !['artifact_problem', 'no_approvers'].includes(c))),
     p.overlap && p.overlap.count
       ? inlineAlert({
           kind: 'warning',

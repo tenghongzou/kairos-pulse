@@ -478,7 +478,7 @@ export function render(ctx) {
               r.approved_at ? [t('rm.rev.approved'), whoAt(r.approved_by, r.approved_at)] : null,
               r.reject_reason ? [t('rm.rev.rejected'), r.reject_reason] : null,
             ]),
-            session.can('audit:read') ? h('p', null, h('a', { href: `/admin/audit${qs({ target: id })}` }, t('rm.rev.audit'))) : null,
+            session.can('audit:read') ? h('p', null, h('a', { href: `/audit${qs({ target: id })}` }, t('rm.rev.audit'))) : null,
           ],
         }),
       );
