@@ -539,7 +539,7 @@ fn two_crashes_in_one_transaction_still_end_with_the_old_version() {
     env.cleanup();
 }
 
-/// 只有輔助程式被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機：服務仍是替換前啟動的行程。接續
+/// 只有輔助程式被終止（OOM、人工 `kill` 等，很快就被重新觸發）而主機沒有重新開機：服務仍是替換前啟動的行程。接續
 /// 時還沒送出的 `systemctl restart` 要再送一次，否則健康確認看到的永遠是舊的行程
 #[test]
 fn a_helper_killed_without_a_reboot_restarts_the_service_on_resume() {

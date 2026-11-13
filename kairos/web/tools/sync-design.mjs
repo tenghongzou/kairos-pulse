@@ -64,8 +64,23 @@ writeFileSync(
 console.log(`error-codes.js：${Object.keys(out).length} 個 KRS 代碼`);
 
 // 3. 工程暫行的代碼（assets/js/core/error-codes-local.js，人工維護）：設計包已經收錄的可以從那裡刪除
+//    檔案後半的 LOCAL_ERROR_CODE_SUPPLEMENTS 是「設計包已收錄、說明需要補充」的代碼：它們本來就在設計包中，
+//    只列出來供人工比對（設計包的說明涵蓋後再刪）
 const localSrc = readFileSync(join(web, 'assets', 'js', 'core', 'error-codes-local.js'), 'utf8');
-const covered = [...localSrc.matchAll(/^\s*'(KRS-[A-Z]\d{4})':/gm)].map((m) => m[1]).filter((code) => out[code]);
+const split = localSrc.indexOf('export const LOCAL_ERROR_CODE_SUPPLEMENTS');
+const [newCodes, supplements] = split < 0 ? [localSrc, ''] : [localSrc.slice(0, split), localSrc.slice(split)];
+const keys = (text) => [...text.matchAll(/^\s*'(KRS-[A-Z]\d{4})':/gm)].map((m) => m[1]);
+const covered = keys(newCodes).filter((code) => out[code]);
 if (covered.length) {
   console.log(`error-codes-local.js：設計包已收錄 ${covered.join('、')}，請從 error-codes-local.js 刪除這些條目`);
+}
+const supplemented = keys(supplements);
+if (supplemented.length) {
+  console.log(
+    `error-codes-local.js：${supplemented.join('、')} 以本機的補充說明覆蓋設計包的欄位；請比對設計包的說明，已涵蓋就刪除補充`,
+  );
+}
+const orphan = supplemented.filter((code) => !out[code]);
+if (orphan.length) {
+  console.log(`error-codes-local.js：補充說明中的 ${orphan.join('、')} 不在設計包的總表中，請改放在 LOCAL_ERROR_CODES`);
 }

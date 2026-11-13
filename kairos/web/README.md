@@ -189,7 +189,7 @@ registerProvider({
 
 - `assets/tokens.css` 必須與設計包 `design-system/tokens.css` 相同。`cargo test -p kairos api::web::tests::tokens_css_matches_the_design_package` 檢查複本的 SHA-256 與 `web/tokens.css.sha256` 記錄的相同，並在找得到設計包時（環境變數 `KAIROS_DESIGN_DIR`，或 `kairos/` 往上各層的 `design/`）逐位元組比對（換行一律 LF）。
 - 設計包更新後：`node kairos/web/tools/sync-design.mjs [設計包目錄]`（只用 Node.js 內建模組），會重新複製 `tokens.css`、更新 `tokens.css.sha256`、重新產生 `assets/js/core/error-codes.js`（設計包 `prototype/kairos/error-codes.js` 中 KRS- 的代碼與三段式）。
-- **設計包還沒有收錄的代碼**放在 `assets/js/core/error-codes-local.js`（人工維護；`core/errors.js` 先查 `error-codes.js`，找不到才查這裡）：目前是 `KRS-W8417`（版本庫的檔案遺失；ADR-0002 決策點 7／U10 決定照工程的號碼採用，三段式是 ADR 的草稿）。設計包收錄後重新執行 `sync-design.mjs`，它會列出這個檔案中已經可以刪除的代碼。
+- **設計包還沒有收錄的代碼**放在 `assets/js/core/error-codes-local.js`（人工維護；`core/errors.js` 先查 `error-codes.js`，找不到才查這裡）：目前是 `KRS-W8417`（版本庫的檔案遺失；ADR-0002 決策點 7／U10 決定照工程的號碼採用，三段式是 ADR 的草稿）。設計包收錄後重新執行 `sync-design.mjs`，它會列出這個檔案中已經可以刪除的代碼。同一個檔案的 `LOCAL_ERROR_CODE_SUPPLEMENTS` 放**設計包已收錄、但說明還沒有涵蓋工程新增情況**的代碼（欄位覆蓋 `error-codes.js` 的同名欄位）：目前是 `KRS-E8405`（0.10 起另涵蓋升級輔助程式的路徑檢查 `unsafe_path`；三段式是工程的草稿）。
 
 ## 7. 測試
 

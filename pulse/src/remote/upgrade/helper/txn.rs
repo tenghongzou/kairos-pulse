@@ -180,8 +180,8 @@ pub struct Record {
     #[serde(default)]
     pub restarted_unix: i64,
     /// 這個步驟（`replaced`／`rolling_back`）的 `systemctl restart` 已經送出。接續時還是 `false` 就再送
-    /// 一次：輔助程式可能只是自己被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機，此時服務仍是
-    /// 替換前啟動的那個行程
+    /// 一次：輔助程式可能只是自己被終止（OOM、人工 `kill` 等）而主機沒有重新開機，此時服務仍是
+    /// 替換前啟動的那個行程。期限不重新起算（REMOTE.md 第 17.9.3 節）
     #[serde(default)]
     pub service_restarted: bool,
     #[serde(default)]
