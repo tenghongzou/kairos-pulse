@@ -1,6 +1,10 @@
-//! 特權輔助程式的測試（REMOTE.md 第 12.1 節「輔助程式」）：以暫存目錄模擬 `/opt/pulse`、`/var/lib/pulse`、
-//! `/var/lib/pulse-upgrade`，以假的 [`System`] 模擬 systemd、套件管理員與「替換後的 Pulse」（寫狀態檔、
-//! 崩潰、連不上），時鐘也是假的（健康確認的 600 秒不必真的等）。
+//! 特權輔助程式的測試（REMOTE.md 第 12.1 節「輔助程式」、第 17.8、17.9 節）：以暫存目錄模擬 `/opt/pulse`、
+//! `/var/lib/pulse`、`/var/lib/pulse-upgrade`，以假的 [`System`] 模擬 systemd、套件管理員與「替換後的
+//! Pulse」（寫狀態檔、崩潰、連不上），時鐘也是假的（健康確認的 600 秒不必真的等）。
+//!
+//! 這個檔案另外提供 `fault_tests.rs`（當機點的故障注入矩陣）共用的假系統：[`Fake`] 可以在指定的
+//! checkpoint 中止這次執行（[`apply_until`]），並在每個 checkpoint 檢查寫入順序的不變條件（紀錄先於
+//! 指標、指標先於任何變更；`pulse.prev` 只會是替換前的執行檔）。
 
 #![cfg(unix)]
 
@@ -8,51 +12,92 @@ use super::*;
 use crate::remote::upgrade::testsign::{self, TestKey};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 
-const ID: &str = "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70";
-const OLD_UNIT: &str = "[Unit]\nDescription=Pulse 0.9.0\n";
-const NEW_UNIT: &str = "[Unit]\nDescription=Pulse 0.9.1\n";
+pub(super) const ID: &str = "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70";
+pub(super) const OTHER_ID: &str = "11111111-2222-4333-8444-555555555555";
+pub(super) const OLD_UNIT: &str = "[Unit]\nDescription=Pulse 0.9.0\n";
+pub(super) const NEW_UNIT: &str = "[Unit]\nDescription=Pulse 0.9.1\n";
 
-fn sha(b: &[u8]) -> String {
+pub(super) fn sha(b: &[u8]) -> String {
     files::hex(ring::digest::digest(&ring::digest::SHA256, b).as_ref())
 }
 
+pub(super) fn chmod(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// 以 root 執行測試時（容器中）目錄權限擋不住寫入：依賴「寫不進去」的測試略過
+pub(super) fn running_as_root() -> bool {
+    // SAFETY: geteuid 沒有前置條件，也不會失敗
+    unsafe { libc::geteuid() == 0 }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Behavior {
+pub(super) enum Behavior {
     Healthy,
     Crash,
     NoConnect,
     Exit(i32),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Svc {
     active: String,
     n_restarts: u64,
     pid: u32,
     exit: Option<i32>,
     restarted_at: Duration,
+    /// 服務行程啟動時的執行檔版本（替換執行檔不會改變已在執行的行程）
+    running: String,
 }
 
-/// 假的作業系統：執行檔的內容是 `VERSION=<版本>`，狀態檔由「目前安裝的版本」依它的行為寫出
-struct Fake {
+/// [`Fake`] 在指定的 checkpoint 中止這次執行時的 panic 內容（模擬行程被終止：之後的程式都不會執行）
+pub(super) struct Crashed(pub(super) String);
+
+/// 交易開始前的系統狀態（寫入順序的不變條件以它判斷「系統是否已變更」）
+#[derive(Debug, Clone)]
+struct Baseline {
+    binary: Option<Vec<u8>>,
+    prev: Option<Vec<u8>>,
+    unit: Option<Vec<u8>>,
+    pkg_db: Option<String>,
+}
+
+/// checkpoint 的名稱與到達它時要呼叫的函式
+pub(super) type CheckpointHook = (String, Box<dyn Fn()>);
+
+/// 假的作業系統：執行檔的內容是 `VERSION=<版本>`，狀態檔由「服務行程的版本」依它的行為寫出
+pub(super) struct Fake {
     install: PathBuf,
     status: PathBuf,
+    work_root: PathBuf,
+    unit: PathBuf,
     mono: Cell<Duration>,
     t0: i64,
     behavior: RefCell<HashMap<String, Behavior>>,
     svc: RefCell<Svc>,
     calls: RefCell<Vec<String>>,
-    dpkg_locks: Cell<u32>,
-    check_config: Cell<i32>,
-    version_override: RefCell<Option<String>>,
+    pub(super) dpkg_locks: Cell<u32>,
+    /// 套件管理員一律失敗（不是被鎖住），不改變任何東西
+    pub(super) pkg_fails: Cell<bool>,
+    pub(super) check_config: Cell<i32>,
+    pub(super) version_override: RefCell<Option<String>>,
     /// 預檢的最後一步（check-config）執行時呼叫：模擬「預檢之後、替換之前」發生的事
-    after_precheck: RefCell<Option<Box<dyn Fn()>>>,
+    pub(super) after_precheck: RefCell<Option<Box<dyn Fn()>>>,
     /// 重新啟動服務時呼叫（替換之後、健康確認之前）
-    on_restart: RefCell<Option<Box<dyn Fn()>>>,
+    pub(super) on_restart: RefCell<Option<Box<dyn Fn()>>>,
+    /// 到達指定的 checkpoint 時呼叫（不中止）
+    pub(super) at_checkpoint: RefCell<Option<CheckpointHook>>,
+    /// 套件資料庫中 pulse 的狀態（`<版本> ii`；安裝到一半為 `<版本> iF`）
+    pub(super) pkg_db: RefCell<Option<String>>,
+    crash_at: RefCell<Option<String>>,
+    seen: RefCell<Vec<String>>,
+    violations: RefCell<Vec<String>>,
+    baseline: Baseline,
 }
 
-fn binary_version(path: &Path) -> String {
+pub(super) fn binary_version(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .trim()
@@ -61,47 +106,188 @@ fn binary_version(path: &Path) -> String {
 }
 
 impl Fake {
-    fn new(root: &Path) -> Self {
+    pub(super) fn new(root: &Path) -> Self {
+        let install = root.join("opt/pulse");
+        let unit = root.join("etc/systemd/system/pulse.service");
+        let installed = binary_version(&install.join("pulse"));
+        let pkg_db = Some(format!("{installed} ii"));
+        let baseline = Baseline {
+            binary: std::fs::read(install.join("pulse")).ok(),
+            prev: std::fs::read(install.join("pulse.prev")).ok(),
+            unit: std::fs::read(&unit).ok(),
+            pkg_db: pkg_db.clone(),
+        };
         Self {
-            install: root.join("opt/pulse"),
+            install,
             status: root.join("var/lib/pulse/status.json"),
+            work_root: root.join("var/lib/pulse-upgrade"),
+            unit,
             mono: Cell::new(Duration::ZERO),
             t0: chrono::Utc::now().timestamp(),
             behavior: RefCell::new(HashMap::new()),
             svc: RefCell::new(Svc {
                 active: "active".into(),
                 pid: 100,
+                running: installed,
                 ..Default::default()
             }),
             calls: RefCell::new(Vec::new()),
             dpkg_locks: Cell::new(0),
+            pkg_fails: Cell::new(false),
             check_config: Cell::new(0),
             version_override: RefCell::new(None),
             after_precheck: RefCell::new(None),
             on_restart: RefCell::new(None),
+            at_checkpoint: RefCell::new(None),
+            pkg_db: RefCell::new(pkg_db),
+            crash_at: RefCell::new(None),
+            seen: RefCell::new(Vec::new()),
+            violations: RefCell::new(Vec::new()),
+            baseline,
         }
     }
 
-    fn set(&self, version: &str, b: Behavior) {
+    fn successor(&self, secs: u64, rebooted: bool) -> Fake {
+        let mut svc = self.svc.borrow().clone();
+        svc.restarted_at = Duration::ZERO;
+        if rebooted {
+            // 開機時 systemd 以目前安裝的執行檔啟動服務；NRestarts 從 0 起算
+            svc = Svc {
+                active: "active".into(),
+                n_restarts: 0,
+                pid: svc.pid + 100,
+                exit: None,
+                restarted_at: Duration::ZERO,
+                running: binary_version(&self.install.join("pulse")),
+            };
+        }
+        Fake {
+            install: self.install.clone(),
+            status: self.status.clone(),
+            work_root: self.work_root.clone(),
+            unit: self.unit.clone(),
+            mono: Cell::new(Duration::ZERO),
+            t0: self.now_unix() + i64::try_from(secs).unwrap(),
+            behavior: RefCell::new(self.behavior.borrow().clone()),
+            svc: RefCell::new(svc),
+            calls: RefCell::new(Vec::new()),
+            dpkg_locks: Cell::new(0),
+            pkg_fails: Cell::new(false),
+            check_config: Cell::new(0),
+            version_override: RefCell::new(None),
+            after_precheck: RefCell::new(None),
+            on_restart: RefCell::new(None),
+            at_checkpoint: RefCell::new(None),
+            pkg_db: RefCell::new(self.pkg_db.borrow().clone()),
+            crash_at: RefCell::new(None),
+            seen: RefCell::new(Vec::new()),
+            violations: RefCell::new(Vec::new()),
+            baseline: self.baseline.clone(),
+        }
+    }
+
+    /// 這次執行被中止後主機重新開機（30 秒後）：同一筆交易，另一個行程
+    pub(super) fn reboot(&self) -> Fake {
+        self.successor(30, true)
+    }
+
+    /// 重新開機，`secs` 秒後才回來（期限可能已過）
+    pub(super) fn reboot_after(&self, secs: u64) -> Fake {
+        self.successor(secs, true)
+    }
+
+    /// 只有輔助程式被終止（`TimeoutStartSec`、`SIGKILL`），主機沒有重新開機：服務仍是原本的行程
+    pub(super) fn helper_killed(&self) -> Fake {
+        self.successor(5, false)
+    }
+
+    pub(super) fn set(&self, version: &str, b: Behavior) {
         self.behavior.borrow_mut().insert(version.into(), b);
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub(super) fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
 
+    /// 這次執行經過的 checkpoint
+    pub(super) fn seen(&self) -> Vec<String> {
+        self.seen.borrow().clone()
+    }
+
+    /// 每個 checkpoint 都符合寫入順序的不變條件
+    pub(super) fn assert_invariants(&self) {
+        let v = self.violations.borrow();
+        assert!(v.is_empty(), "寫入順序的不變條件被破壞：{v:#?}");
+    }
+
+    fn restarts(&self) -> usize {
+        self.calls
+            .borrow()
+            .iter()
+            .filter(|c| *c == "restart")
+            .count()
+    }
+
+    fn maybe_crash(&self, name: &str) {
+        let hit = self.crash_at.borrow().as_deref() == Some(name);
+        if hit {
+            *self.crash_at.borrow_mut() = None;
+            // resume_unwind 不經過 panic hook：測試輸出不會有多餘的 panic 訊息
+            std::panic::resume_unwind(Box::new(Crashed(name.to_string())));
+        }
+    }
+
+    /// 寫入順序的不變條件（REMOTE.md 第 17.9.3 節）：系統有任何變更時，指標與 `replacing` 之後的紀錄必定
+    /// 已經寫入；指標存在時必定有一份屬於它的可用紀錄；`pulse.prev` 只會是交易前的內容或替換前的執行檔
+    fn observe(&self, at: &str) {
+        let read = |p: &Path| std::fs::read(p).ok();
+        let bin = read(&self.install.join("pulse"));
+        let prev = read(&self.install.join("pulse.prev"));
+        let unit = read(&self.unit);
+        let mut bad = Vec::new();
+        if prev != self.baseline.prev && prev != self.baseline.binary {
+            bad.push("pulse.prev 不是替換前的執行檔".to_string());
+        }
+        let changed = bin != self.baseline.binary
+            || prev != self.baseline.prev
+            || unit != self.baseline.unit
+            || *self.pkg_db.borrow() != self.baseline.pkg_db;
+        match txn::read_active(&self.work_root) {
+            Ok(Some(a)) => match txn::load_record(&self.work_root.join(&a.upgrade_id)) {
+                Loaded::V2(r)
+                    if r.step != Step::Preparing && r.binding_sha256 == a.binding_sha256 =>
+                {
+                    if changed && r.step == Step::Prepared {
+                        bad.push("系統已變更，紀錄卻還是 prepared".to_string());
+                    }
+                }
+                other => bad.push(format!("指標存在但沒有屬於它的可用紀錄：{other:?}")),
+            },
+            // 交易結束時最後才清除指標，之後沒有 checkpoint
+            Ok(None) => {
+                if changed {
+                    bad.push("系統已變更但沒有指標".to_string());
+                }
+            }
+            Err(e) => bad.push(format!("指標不可用：{e}")),
+        }
+        for b in bad {
+            self.violations.borrow_mut().push(format!("{at}: {b}"));
+        }
+    }
+
     fn simulate(&self) {
-        let v = binary_version(&self.install.join("pulse"));
+        let mut s = self.svc.borrow_mut();
+        if s.active != "active" {
+            return;
+        }
+        let v = s.running.clone();
         let b = self
             .behavior
             .borrow()
             .get(&v)
             .copied()
             .unwrap_or(Behavior::Healthy);
-        let mut s = self.svc.borrow_mut();
-        if s.active != "active" {
-            return;
-        }
         let now = self.now_unix();
         let write = |registered: bool, pid: u32| {
             let f = crate::status_file::StatusFile {
@@ -134,9 +320,11 @@ impl Fake {
             Behavior::NoConnect => write(false, s.pid),
             Behavior::Crash => {
                 if self.mono.get().saturating_sub(s.restarted_at) >= Duration::from_secs(1) {
+                    // Restart=always：systemd 以目前的執行檔再啟動一次
                     s.n_restarts += 1;
                     s.pid += 1;
                     s.restarted_at = self.mono.get();
+                    s.running = binary_version(&self.install.join("pulse"));
                 }
             }
             Behavior::Exit(code) => {
@@ -159,6 +347,12 @@ impl System for Fake {
     fn sleep(&self, d: Duration) {
         self.mono.set(self.mono.get() + d);
         self.simulate();
+        // 健康確認、回滾確認的等待中（對照表第 14、19 列；只在第一次執行時注入）
+        match self.restarts() {
+            1 => self.maybe_crash("health_wait"),
+            2 => self.maybe_crash("rollback_wait"),
+            _ => {}
+        }
     }
 
     fn restart_service(&self) -> Result<(), String> {
@@ -172,6 +366,7 @@ impl System for Fake {
             s.exit = None;
             s.pid += 1;
             s.restarted_at = self.mono.get();
+            s.running = binary_version(&self.install.join("pulse"));
         }
         Ok(())
     }
@@ -192,6 +387,17 @@ impl System for Fake {
         Ok(())
     }
 
+    fn checkpoint(&self, name: &str) {
+        self.seen.borrow_mut().push(name.to_string());
+        self.observe(name);
+        if let Some((at, f)) = self.at_checkpoint.borrow().as_ref()
+            && at == name
+        {
+            f();
+        }
+        self.maybe_crash(name);
+    }
+
     fn run(&self, cmd: &Cmd) -> Output {
         let ok = |stdout: String| Output {
             status: Some(0),
@@ -201,7 +407,7 @@ impl System for Fake {
         match cmd {
             Cmd::TarExtract { archive, dir } => {
                 self.calls.borrow_mut().push("tar".into());
-                let top = dir.join("pulse-0.9.1-5e6f7a8-linux-x86_64");
+                let top = dir.join("pulse-new-linux-x86_64");
                 std::fs::create_dir_all(&top).unwrap();
                 std::fs::copy(archive, top.join("pulse")).unwrap();
                 std::fs::write(top.join("pulse.service"), NEW_UNIT).unwrap();
@@ -219,10 +425,15 @@ impl System for Fake {
                 } else {
                     "rpm"
                 };
-                self.calls.borrow_mut().push(format!(
-                    "{name} {}",
-                    package.file_name().unwrap().to_string_lossy()
-                ));
+                let file = package.file_name().unwrap().to_string_lossy().to_string();
+                self.calls.borrow_mut().push(format!("{name} {file}"));
+                if self.pkg_fails.get() {
+                    return Output {
+                        status: Some(1),
+                        stdout: String::new(),
+                        stderr: "dpkg: error processing archive (simulated failure)\n".into(),
+                    };
+                }
                 if self.dpkg_locks.get() > 0 {
                     self.dpkg_locks.set(self.dpkg_locks.get() - 1);
                     return Output {
@@ -231,9 +442,32 @@ impl System for Fake {
                         stderr: "dpkg: error: dpkg frontend lock was locked by another process with pid 7\n".into(),
                     };
                 }
+                let version = binary_version(package);
+                // 安裝到一半就被終止（對照表第 10、16 列）：執行檔已換、套件資料庫是半安裝
+                let point = if file == txn::ROLLBACK_PKG_FILE {
+                    "rollback_package_running"
+                } else {
+                    "package_running"
+                };
+                if self.crash_at.borrow().as_deref() == Some(point) {
+                    std::fs::copy(package, self.install.join("pulse")).unwrap();
+                    *self.pkg_db.borrow_mut() = Some(format!("{version} iF"));
+                    self.seen.borrow_mut().push(point.to_string());
+                    self.observe(point);
+                    self.maybe_crash(point);
+                }
                 std::fs::copy(package, self.install.join("pulse")).unwrap();
+                *self.pkg_db.borrow_mut() = Some(format!("{version} ii"));
                 ok(String::new())
             }
+            Cmd::PackageVersion { .. } => match self.pkg_db.borrow().as_ref() {
+                Some(v) => ok(v.clone()),
+                None => Output {
+                    status: Some(1),
+                    stdout: String::new(),
+                    stderr: "package pulse is not installed\n".into(),
+                },
+            },
             Cmd::RunAsService { program, args, .. } => {
                 if args.first().map(String::as_str) == Some("--version") {
                     let v = self
@@ -257,64 +491,101 @@ impl System for Fake {
     }
 }
 
-struct Env {
-    root: PathBuf,
-    paths: Paths,
-    key: TestKey,
+pub(super) struct Env {
+    pub(super) root: PathBuf,
+    pub(super) paths: Paths,
+    pub(super) key: TestKey,
 }
 
 impl Env {
-    fn staging(&self) -> PathBuf {
+    pub(super) fn staging(&self) -> PathBuf {
         self.root.join("var/lib/pulse/upgrade").join(ID)
     }
 
-    fn installed(&self) -> String {
-        binary_version(&self.root.join("opt/pulse/pulse"))
+    /// root 的工作目錄（`ID` 的交易）
+    pub(super) fn work(&self) -> PathBuf {
+        self.paths.work_root.join(ID)
     }
 
-    fn result(&self) -> UpgradeResult {
+    pub(super) fn installed(&self) -> String {
+        binary_version(&self.paths.install_dir.join("pulse"))
+    }
+
+    /// `pulse.prev` 的版本（不存在時為空字串）
+    pub(super) fn prev(&self) -> String {
+        binary_version(&self.paths.install_dir.join("pulse.prev"))
+    }
+
+    pub(super) fn unit(&self) -> String {
+        std::fs::read_to_string(&self.paths.unit_path).unwrap()
+    }
+
+    pub(super) fn result(&self) -> UpgradeResult {
         UpgradeResult::read(&self.root.join("var/lib/pulse/upgrade/result.json"))
             .unwrap()
             .unwrap()
     }
+
+    pub(super) fn has_result(&self) -> bool {
+        self.root.join("var/lib/pulse/upgrade/result.json").exists()
+    }
+
+    /// `ID` 的交易紀錄（必須是可用的 v2）
+    pub(super) fn record(&self) -> Record {
+        match txn::load_record(&self.work()) {
+            Loaded::V2(r) => *r,
+            other => panic!("預期可用的交易紀錄，實際 {other:?}"),
+        }
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.paths.work_root.join(ACTIVE_FILE).exists()
+    }
+
+    /// 建立 root 的工作目錄（根目錄與 `ID` 的；0700，與 systemd 的 `StateDirectoryMode` 相同）
+    pub(super) fn make_work(&self) {
+        std::fs::create_dir_all(self.work()).unwrap();
+        chmod(&self.paths.work_root, 0o700);
+        chmod(&self.work(), 0o700);
+    }
+
+    /// 重新開機後執行的輔助程式就是目前安裝的執行檔
+    pub(super) fn helper_is_installed(&mut self) {
+        self.paths.current_version = self.installed();
+    }
+
+    pub(super) fn cleanup(&self) {
+        // 測試可能把目錄改成唯讀
+        for d in [self.paths.work_root.clone(), self.work()] {
+            if d.is_dir() && !d.is_symlink() {
+                let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
-/// 建立 0.9.0 已安裝、暫存了 0.9.1 的環境（`method`：tar／deb／rpm）
-fn setup(name: &str, method: &str) -> Env {
-    let root = std::env::temp_dir().join(format!("pulse-helper-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let install = root.join("opt/pulse");
-    std::fs::create_dir_all(&install).unwrap();
-    std::fs::write(install.join("pulse"), "VERSION=0.9.0\n").unwrap();
-    let key = TestKey::generate();
-    let anchor = root.join("etc/kairos-pulse/allowed_signers");
-    std::fs::create_dir_all(anchor.parent().unwrap()).unwrap();
-    std::fs::write(&anchor, key.allowed_signers()).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::write(
-        install.join("pulse.toml"),
-        format!("[upgrade]\nallowed_signers = \"{}\"\n", anchor.display()),
-    )
-    .unwrap();
-    let unit = root.join("etc/systemd/system/pulse.service");
-    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-    std::fs::write(&unit, OLD_UNIT).unwrap();
-
+fn artifact_name(version: &str, commit: &str, method: &str) -> String {
     let ext = match method {
         "tar" => "tar.gz",
         other => other,
     };
-    let artifact = format!("pulse-0.9.1-5e6f7a8-linux-x86_64.{ext}");
-    let content = b"VERSION=0.9.1\n";
+    format!("pulse-{version}-{commit}-linux-x86_64.{ext}")
+}
+
+/// 在暫存區放好 `from` → `to` 的升級（有官方簽章的發佈檔、清單）並寫入 `request.json`
+pub(super) fn stage_upgrade(env: &Env, id: &str, from: &str, to: &str) -> Request {
+    let method = env.paths.method.clone();
+    let artifact = artifact_name(to, "5e6f7a8", &method);
+    let content = format!("VERSION={to}\n");
     let rel = testsign::release(
-        &key,
-        "0.9.1",
+        &env.key,
+        to,
         "5e6f7a8",
-        &[(artifact.as_str(), content)],
+        &[(artifact.as_str(), content.as_bytes())],
         Some((&sha(NEW_UNIT.as_bytes()), &[&sha(OLD_UNIT.as_bytes())])),
     );
-    let staging = root.join("var/lib/pulse/upgrade").join(ID);
+    let staging = env.root.join("var/lib/pulse/upgrade").join(id);
     std::fs::create_dir_all(&staging).unwrap();
     std::fs::write(staging.join(&artifact), content).unwrap();
     std::fs::write(staging.join(files::SUMS_FILE), &rel.sums).unwrap();
@@ -322,40 +593,122 @@ fn setup(name: &str, method: &str) -> Env {
     std::fs::write(staging.join(&rel.manifest_name), &rel.manifest).unwrap();
     let req = Request {
         schema: files::REQUEST_SCHEMA.into(),
-        upgrade_id: ID.into(),
+        upgrade_id: id.into(),
         target: kairos_proto::mgmt::UpgradeTarget {
-            version: "0.9.1".into(),
+            version: to.into(),
             commit: "5e6f7a8".into(),
         },
-        method: method.into(),
+        method,
         artifact,
         manifest: Some(rel.manifest_name.clone()),
         rollback_artifact: None,
         health_timeout_secs: 600,
         allow_downgrade: false,
-        from_version: "0.9.0".into(),
+        from_version: from.into(),
         requested_at: crate::protocol::now_ts(),
     };
-    let request = root.join("var/lib/pulse/upgrade/request.json");
-    std::fs::write(&request, serde_json::to_vec(&req).unwrap()).unwrap();
+    std::fs::write(&env.paths.request, serde_json::to_vec(&req).unwrap()).unwrap();
+    req
+}
+
+/// 建立 0.9.0 已安裝、暫存了 0.9.1 的環境（`method`：tar／deb／rpm）
+pub(super) fn setup(name: &str, method: &str) -> Env {
+    let root = std::env::temp_dir().join(format!("pulse-helper-{name}-{}", std::process::id()));
+    if root.exists() {
+        // 上一次執行留下的（可能有唯讀的目錄）
+        for d in [
+            "var/lib/pulse-upgrade",
+            &format!("var/lib/pulse-upgrade/{ID}"),
+        ] {
+            let d = root.join(d);
+            if d.is_dir() && !d.is_symlink() {
+                let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    let install = root.join("opt/pulse");
+    let anchor = root.join("etc/kairos-pulse/allowed_signers");
+    let unit = root.join("etc/systemd/system/pulse.service");
+    for d in [
+        install.as_path(),
+        anchor.parent().unwrap(),
+        unit.parent().unwrap(),
+        &root.join("var/lib/pulse/upgrade"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // 路徑檢查（第 17.9.7 節）要求上層目錄不可由群組或其他人寫入：不依賴執行測試的帳號的 umask
+    for d in ["", "opt", "opt/pulse", "var", "var/lib", "etc"] {
+        chmod(&root.join(d), 0o755);
+    }
+    std::fs::write(install.join("pulse"), "VERSION=0.9.0\n").unwrap();
+    chmod(&install.join("pulse"), 0o755);
+    let key = TestKey::generate();
+    std::fs::write(&anchor, key.allowed_signers()).unwrap();
+    chmod(&anchor, 0o644);
+    std::fs::write(
+        install.join("pulse.toml"),
+        format!("[upgrade]\nallowed_signers = \"{}\"\n", anchor.display()),
+    )
+    .unwrap();
+    std::fs::write(&unit, OLD_UNIT).unwrap();
     let paths = Paths {
-        request,
+        request: root.join("var/lib/pulse/upgrade/request.json"),
         install_dir: install,
         work_root: root.join("var/lib/pulse-upgrade"),
         unit_path: unit,
         require_root_owner: false,
         current_version: "0.9.0".into(),
+        current_commit: "1a2b3c4".into(),
         method: method.into(),
         arch: "x86_64".into(),
     };
-    Env { root, paths, key }
+    let env = Env { root, paths, key };
+    stage_upgrade(&env, ID, "0.9.0", "0.9.1");
+    env
 }
 
-fn rewrite_request(env: &Env, f: impl FnOnce(&mut Request)) {
+pub(super) fn rewrite_request(env: &Env, f: impl FnOnce(&mut Request)) {
     let mut req: Request =
         serde_json::from_slice(&std::fs::read(&env.paths.request).unwrap()).unwrap();
     f(&mut req);
     std::fs::write(&env.paths.request, serde_json::to_vec(&req).unwrap()).unwrap();
+}
+
+/// 在暫存區放一個有官方簽章的回滾檔（`version` 的套件）並寫進請求
+pub(super) fn stage_rollback(env: &Env, version: &str) -> String {
+    let name = artifact_name(version, "1a2b3c4", &env.paths.method);
+    let content = format!("VERSION={version}\n");
+    let rel = testsign::release(
+        &env.key,
+        version,
+        "1a2b3c4",
+        &[(name.as_str(), content.as_bytes())],
+        None,
+    );
+    std::fs::write(env.staging().join(&name), content).unwrap();
+    std::fs::write(env.staging().join(files::ROLLBACK_SUMS_FILE), &rel.sums).unwrap();
+    std::fs::write(env.staging().join(files::ROLLBACK_SIG_FILE), &rel.sig).unwrap();
+    let n = name.clone();
+    rewrite_request(env, |r| r.rollback_artifact = Some(n));
+    name
+}
+
+/// 執行 [`apply`]，在 `point` 中止（模擬行程在那個 checkpoint 之後被終止）。沒有到達那個點就是測試的錯誤
+pub(super) fn apply_until(paths: &Paths, fake: &Fake, point: &str) {
+    *fake.crash_at.borrow_mut() = Some(point.to_string());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(paths, fake)));
+    match r {
+        Err(payload) => match payload.downcast::<Crashed>() {
+            Ok(c) => assert_eq!(c.0, point),
+            Err(other) => std::panic::resume_unwind(other),
+        },
+        Ok(r) => panic!(
+            "沒有到達當機點 {point}（經過 {:?}）：{r:?}",
+            fake.seen.borrow()
+        ),
+    }
 }
 
 #[test]
@@ -366,14 +719,8 @@ fn tar_upgrade_replaces_binary_and_unmodified_unit_then_confirms_health() {
     assert_eq!(r.state, "succeeded", "{r:?}");
     assert_eq!(r.code.as_deref(), Some(codes::I_UPGRADE_COMPLETED));
     assert_eq!(env.installed(), "0.9.1");
-    assert_eq!(
-        binary_version(&env.paths.install_dir.join("pulse.prev")),
-        "0.9.0"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&env.paths.unit_path).unwrap(),
-        NEW_UNIT
-    );
+    assert_eq!(env.prev(), "0.9.0");
+    assert_eq!(env.unit(), NEW_UNIT);
     let calls = fake.calls();
     assert_eq!(calls, ["tar", "daemon-reload", "restart"], "{calls:?}");
     // 結果、清理、紀錄
@@ -386,17 +733,54 @@ fn tar_upgrade_replaces_binary_and_unmodified_unit_then_confirms_health() {
             .join(format!(".upgrade-{ID}"))
             .exists()
     );
-    let work = env.paths.work_root.join(ID);
+    let work = env.work();
     assert!(work.join("upgrade.log").is_file());
-    assert!(work.join("state.json").is_file());
-    use std::os::unix::fs::PermissionsExt;
     assert_eq!(
         std::fs::metadata(&work).unwrap().permissions().mode() & 0o777,
         0o700
     );
+    assert_eq!(
+        std::fs::metadata(work.join("state.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    // 交易紀錄（第 17.9.2 節）：綁定的欄位都已記錄，結束後只留紀錄與日誌，指標已清除
+    let rec = env.record();
+    assert_eq!(rec.schema, txn::RECORD_SCHEMA);
+    assert_eq!(rec.step, Step::Done);
+    assert_eq!(rec.upgrade_id, ID);
+    assert_eq!(
+        (rec.from_version.as_str(), rec.from_commit.as_str()),
+        ("0.9.0", "1a2b3c4")
+    );
+    assert_eq!(rec.target.version, "0.9.1");
+    assert_eq!(rec.method, "tar");
+    assert_eq!(rec.old_binary_sha256, sha(b"VERSION=0.9.0\n"));
+    assert_eq!(rec.new_binary_sha256, sha(b"VERSION=0.9.1\n"));
+    let artifact = rec.artifact.clone().unwrap();
+    assert_eq!(artifact.sha256, sha(b"VERSION=0.9.1\n"));
+    assert!(!artifact.signer.is_empty(), "{artifact:?}");
+    assert_eq!(
+        rec.unit,
+        Some(UnitPlan {
+            old_sha256: sha(OLD_UNIT.as_bytes()),
+            new_sha256: sha(NEW_UNIT.as_bytes()),
+        })
+    );
+    assert!(rec.prev_saved && rec.unit_backed_up && rec.unit_replaced && rec.service_restarted);
+    assert_eq!(rec.pkg_db_before, None);
+    assert_eq!(rec.binding_sha256, rec.compute_binding());
+    assert_eq!(rec.health_timeout_secs, 600);
+    assert_eq!(rec.result.as_ref(), Some(&r));
+    assert_eq!(txn::traces(&work), Vec::<String>::new());
+    assert!(!env.active());
     // 健康確認需要穩定 60 秒
     assert!(fake.mono() >= STABLE_FOR, "{:?}", fake.mono());
-    let _ = std::fs::remove_dir_all(&env.root);
+    fake.assert_invariants();
+    env.cleanup();
 }
 
 #[test]
@@ -407,13 +791,11 @@ fn modified_unit_is_left_alone() {
     let r = apply(&env.paths, &fake).unwrap();
     assert_eq!(r.state, "succeeded");
     assert_eq!(r.detail, "unit_not_updated");
-    assert!(
-        std::fs::read_to_string(&env.paths.unit_path)
-            .unwrap()
-            .contains("客戶自己改過")
-    );
+    assert!(env.unit().contains("客戶自己改過"));
     assert!(!fake.calls().contains(&"daemon-reload".to_string()));
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert_eq!(env.record().unit, None);
+    fake.assert_invariants();
+    env.cleanup();
 }
 
 #[test]
@@ -426,13 +808,17 @@ fn crash_after_restart_rolls_back_binary_and_unit() {
     assert_eq!(r.code.as_deref(), Some(codes::W_UPGRADE_ROLLED_BACK));
     assert!(r.detail.contains("crash_restart"), "{}", r.detail);
     assert_eq!(env.installed(), "0.9.0");
-    assert_eq!(
-        std::fs::read_to_string(&env.paths.unit_path).unwrap(),
-        OLD_UNIT
-    );
+    assert_eq!(env.unit(), OLD_UNIT);
     assert_eq!(fake.calls().iter().filter(|c| *c == "restart").count(), 2);
     assert!(!env.staging().exists());
-    let _ = std::fs::remove_dir_all(&env.root);
+    // 回滾的意圖在還原之前就記下（原因、類別、方式）
+    let rec = env.record();
+    let intent = rec.rollback_intent.clone().unwrap();
+    assert!(intent.reason.starts_with("crash_restart"), "{intent:?}");
+    assert_eq!((intent.cause, intent.via), (Cause::Health, Via::Binary));
+    assert!(!env.active());
+    fake.assert_invariants();
+    env.cleanup();
 }
 
 #[test]
@@ -445,7 +831,7 @@ fn health_timeout_and_exit_codes_roll_back() {
     assert!(r.detail.contains("health_timeout"), "{}", r.detail);
     assert!(r.detail.contains("not_registered"), "{}", r.detail);
     assert!(fake.mono() >= Duration::from_secs(600));
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     let env = setup("exit3", "tar");
     let fake = Fake::new(&env.root);
@@ -457,7 +843,7 @@ fn health_timeout_and_exit_codes_roll_back() {
         fake.mono() < Duration::from_secs(600),
         "結束代碼 3 立即回滾"
     );
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 }
 
 #[test]
@@ -472,7 +858,11 @@ fn rollback_that_does_not_recover_needs_manual_attention() {
     assert!(env.staging().exists(), "保留暫存供人工處理");
     assert!(!env.paths.request.exists(), "不再觸發");
     assert_eq!(env.result().state, "rollback_failed");
-    let _ = std::fs::remove_dir_all(&env.root);
+    // 最近一筆 rollback_failed 保留工作目錄的全部檔案；交易已結束，指標清除
+    assert!(env.work().join(txn::NEW_BINARY_FILE).is_file());
+    assert_eq!(env.record().step, Step::Done);
+    assert!(!env.active());
+    env.cleanup();
 }
 
 #[test]
@@ -488,7 +878,17 @@ fn precheck_failures_change_nothing() {
     assert_eq!(env.installed(), "0.9.0");
     assert!(!fake.calls().contains(&"restart".to_string()));
     assert!(!env.paths.install_dir.join("pulse.prev").exists());
-    let _ = std::fs::remove_dir_all(&env.root);
+    // 沒有動手：沒有指標；結果記在紀錄裡，預檢用的目錄已刪除
+    assert!(!env.active());
+    assert_eq!(env.record().result.as_ref(), Some(&r));
+    assert!(
+        !env.paths
+            .install_dir
+            .join(format!(".upgrade-{ID}"))
+            .exists()
+    );
+    fake.assert_invariants();
+    env.cleanup();
 
     let env = setup("precheck-config", "tar");
     let fake = Fake::new(&env.root);
@@ -497,13 +897,13 @@ fn precheck_failures_change_nothing() {
     assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_PRECHECK));
     assert!(r.detail.contains("check-config"), "{}", r.detail);
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
     // 設定檢查回 8（有警告）仍通過
     let env = setup("precheck-warn", "tar");
     let fake = Fake::new(&env.root);
     fake.check_config.set(8);
     assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 }
 
 #[test]
@@ -524,7 +924,7 @@ fn reverification_rejects_untrusted_or_swapped_files() {
     );
     assert_eq!(env.installed(), "0.9.0");
     assert!(fake.calls().is_empty());
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     // Pulse 驗證後換掉了發佈檔（TOCTOU）：雜湊不符
     let env = setup("swap", "tar");
@@ -533,7 +933,7 @@ fn reverification_rejects_untrusted_or_swapped_files() {
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_INTEGRITY));
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     // 符號連結與硬連結
     for (i, link) in ["symlink", "hardlink"].into_iter().enumerate() {
@@ -553,7 +953,7 @@ fn reverification_rejects_untrusted_or_swapped_files() {
             Some(codes::E_UPGRADE_INTEGRITY),
             "{link}: {r:?}"
         );
-        let _ = std::fs::remove_dir_all(&env.root);
+        env.cleanup();
     }
 
     // 降版：pulse.toml 不允許
@@ -567,7 +967,7 @@ fn reverification_rejects_untrusted_or_swapped_files() {
     });
     let r = apply(&paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.code.as_deref(), Some(codes::W_UPGRADE_DOWNGRADE));
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     // pulse.toml 停用了遠端升級（環境變數無法開啟）
     let env = setup("disabled", "tar");
@@ -578,7 +978,7 @@ fn reverification_rejects_untrusted_or_swapped_files() {
     std::fs::write(&toml, text).unwrap();
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.code.as_deref(), Some(codes::I_UPGRADE_DISABLED));
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 }
 
 #[test]
@@ -590,8 +990,9 @@ fn invalid_requests_are_removed_so_the_path_unit_stops() {
     let env2 = setup("pathreq", "tar");
     rewrite_request(&env2, |r| r.artifact = "../../../etc/shadow".into());
     assert!(apply(&env2.paths, &Fake::new(&env2.root)).is_err());
-    let _ = std::fs::remove_dir_all(&env.root);
-    let _ = std::fs::remove_dir_all(&env2.root);
+    assert!(!env2.paths.request.exists());
+    env.cleanup();
+    env2.cleanup();
 }
 
 #[test]
@@ -608,7 +1009,13 @@ fn deb_retries_a_locked_database_and_restores_the_binary_without_a_trusted_rollb
         .collect();
     assert_eq!(dpkg.len(), 3, "被鎖住時重試：{dpkg:?}");
     assert!(fake.mono() >= Duration::from_secs(60), "每 30 秒重試");
-    let _ = std::fs::remove_dir_all(&env.root);
+    // 替換前後套件資料庫的狀態都記在交易紀錄
+    let rec = env.record();
+    assert_eq!(rec.pkg_db_before.as_deref(), Some("0.9.0 ii"));
+    assert_eq!(rec.pkg_db_after.as_deref(), Some("0.9.1 ii"));
+    assert_eq!(rec.rollback, None);
+    fake.assert_invariants();
+    env.cleanup();
 
     let env = setup("deb-rb", "deb");
     let fake = Fake::new(&env.root);
@@ -621,20 +1028,15 @@ fn deb_retries_a_locked_database_and_restores_the_binary_without_a_trusted_rollb
         r.detail
     );
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    fake.assert_invariants();
+    env.cleanup();
 }
 
 #[test]
 fn deb_rolls_back_with_a_verified_rollback_package() {
     let env = setup("deb-pkg", "deb");
     // 回滾檔：0.9.0 的 deb，以同一把金鑰簽署的 SHA256SUMS（Pulse 保存的驗證紀錄）
-    let rb_name = "pulse-0.9.0-1a2b3c4-linux-x86_64.deb";
-    let rb = b"VERSION=0.9.0\n";
-    let rel = testsign::release(&env.key, "0.9.0", "1a2b3c4", &[(rb_name, rb)], None);
-    std::fs::write(env.staging().join(rb_name), rb).unwrap();
-    std::fs::write(env.staging().join(files::ROLLBACK_SUMS_FILE), &rel.sums).unwrap();
-    std::fs::write(env.staging().join(files::ROLLBACK_SIG_FILE), &rel.sig).unwrap();
-    rewrite_request(&env, |r| r.rollback_artifact = Some(rb_name.into()));
+    let rb_name = stage_rollback(&env, "0.9.0");
     let fake = Fake::new(&env.root);
     fake.set("0.9.1", Behavior::Crash);
     let r = apply(&env.paths, &fake).unwrap();
@@ -646,23 +1048,40 @@ fn deb_rolls_back_with_a_verified_rollback_package() {
         "{calls:?}"
     );
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.0 ii"));
+    // 驗證過的回滾套件與它的雜湊、簽署者記在交易紀錄
+    let rec = env.record();
+    let rb = rec.rollback.clone().unwrap();
+    assert_eq!(
+        (rb.name.as_str(), rb.sha256.as_str()),
+        (rb_name.as_str(), sha(b"VERSION=0.9.0\n").as_str())
+    );
+    assert!(!rb.signer.is_empty());
+    assert_eq!(rec.rollback_intent.unwrap().via, Via::Package);
+    fake.assert_invariants();
+    env.cleanup();
 
     // 回滾檔的簽章資料被換掉：不使用，改以 pulse.prev 回復
     let env = setup("deb-pkg-bad", "deb");
+    let rb_name = stage_rollback(&env, "0.9.0");
     let other = TestKey::generate();
-    let rel = testsign::release(&other, "0.9.0", "1a2b3c4", &[(rb_name, rb)], None);
-    std::fs::write(env.staging().join(rb_name), rb).unwrap();
+    let rel = testsign::release(
+        &other,
+        "0.9.0",
+        "1a2b3c4",
+        &[(rb_name.as_str(), b"VERSION=0.9.0\n")],
+        None,
+    );
     std::fs::write(env.staging().join(files::ROLLBACK_SUMS_FILE), &rel.sums).unwrap();
     std::fs::write(env.staging().join(files::ROLLBACK_SIG_FILE), &rel.sig).unwrap();
-    rewrite_request(&env, |r| r.rollback_artifact = Some(rb_name.into()));
     let fake = Fake::new(&env.root);
     fake.set("0.9.1", Behavior::Crash);
     let r = apply(&env.paths, &fake).unwrap();
     assert_eq!(r.state, "rolled_back");
     assert!(r.detail.contains("binary_restored"), "{}", r.detail);
     assert!(!fake.calls().contains(&"dpkg rollback.pkg".to_string()));
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert_eq!(env.record().rollback, None);
+    env.cleanup();
 }
 
 #[test]
@@ -676,40 +1095,40 @@ fn rpm_upgrade_uses_rpm() {
         "{:?}",
         fake.calls()
     );
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 }
 
 #[test]
 fn resumes_after_a_reboot_in_the_middle_of_the_health_check() {
-    // 第一次執行到「已替換」後中斷（模擬：先完成一次替換，再把狀態改回 Replaced、放回 request.json）
-    let env = setup("resume", "tar");
-    let request = std::fs::read(&env.paths.request).unwrap();
+    // 健康確認期間重新開機：pulse-upgrade.path 再次觸發，只做健康確認（不重新替換）
+    let mut env = setup("resume", "tar");
     let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
-    assert_eq!(r.state, "succeeded");
-    let state_path = env.paths.work_root.join(ID).join("state.json");
-    let mut s: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    s["step"] = "replaced".into();
-    s["result"] = serde_json::Value::Null;
-    s["deadline_unix"] = (chrono::Utc::now().timestamp() + 600).into();
-    s["n_restarts_before"] = 0.into();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
-    // 重新開機後 pulse-upgrade.path 再次觸發：只做健康確認（不重新替換）
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    apply_until(&env.paths, &fake, "health_wait");
+    assert_eq!(env.record().step, Step::Replaced);
+    env.helper_is_installed();
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
-    assert!(fake.calls().is_empty(), "沒有重新替換：{:?}", fake.calls());
-    // 期限已過：回滾
-    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
+    assert!(
+        after.calls().is_empty(),
+        "沒有重新替換：{:?}",
+        after.calls()
+    );
+    after.assert_invariants();
+    env.cleanup();
+
+    // 開機回來時期限已過：回滾
+    let mut env = setup("resume-late", "tar");
     let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    apply_until(&env.paths, &fake, "health_wait");
+    env.helper_is_installed();
+    let after = fake.reboot_after(601);
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(r.detail.starts_with("health_timeout"), "{}", r.detail);
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert_eq!(env.unit(), OLD_UNIT);
+    env.cleanup();
 }
 
 #[test]
@@ -756,7 +1175,6 @@ fn units_point_at_the_request_file() {
 
 /// `rpm2cpio | cpio`：cpio 無法執行（Rocky 9 的最小安裝沒有 cpio）時立即回報失敗，不會因 rpm2cpio 寫滿管線而
 /// 卡住（tests/systemd 實測：輔助程式卡到 TimeoutStartSec）。以 `cat` 輸出大於管線緩衝的資料代替 rpm2cpio
-#[cfg(unix)]
 #[test]
 fn rpm_extract_does_not_hang_when_cpio_cannot_run() {
     let dir = std::env::temp_dir().join(format!("pulse-helper-rpm-extract-{}", std::process::id()));
@@ -808,64 +1226,33 @@ fn rpm_install_allows_reinstall_and_older_package_database_versions() {
 #[test]
 fn resuming_a_rollback_after_a_reboot_keeps_the_original_reason() {
     let env = setup("resume-rollback", "tar");
-    let request = std::fs::read(&env.paths.request).unwrap();
     let fake = Fake::new(&env.root);
     fake.set("0.9.1", Behavior::Crash);
-    let r = apply(&env.paths, &fake).unwrap();
-    assert_eq!(r.state, "rolled_back", "{r:?}");
-    assert!(r.detail.starts_with("crash_restart"), "{}", r.detail);
-    // 模擬在回滾確認中途重新開機：狀態改回 rolling_back、放回 request.json
-    let state_path = env.paths.work_root.join(ID).join("state.json");
-    let mut s: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    apply_until(&env.paths, &fake, "rollback_wait");
+    let rec = env.record();
+    assert_eq!(rec.step, Step::RollingBack);
     assert!(
-        s["rollback_reason"]
-            .as_str()
-            .is_some_and(|r| r.starts_with("crash_restart")),
-        "{s}"
+        rec.rollback_intent
+            .is_some_and(|i| i.reason.starts_with("crash_restart")),
+        "回滾的原因記在交易紀錄"
     );
-    s["step"] = "rolling_back".into();
-    s["result"] = serde_json::Value::Null;
-    s["deadline_unix"] = (chrono::Utc::now().timestamp() + 600).into();
-    s["n_restarts_before"] = 0.into();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    // 開機後執行的是已換回的舊版
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "rolled_back", "{r:?}");
     assert!(
-        r.detail.starts_with("crash_restart") && r.detail.contains("resumed"),
+        r.detail.starts_with("crash_restart") && r.detail.contains("; resumed"),
         "{}",
         r.detail
     );
-    assert!(fake.calls().is_empty(), "沒有重新替換：{:?}", fake.calls());
-    // 0.9.0 的狀態檔沒有這個欄位：照舊只回報 resumed
-    s.as_object_mut().unwrap().remove("rollback_reason");
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
-    assert_eq!(
-        (r.state.as_str(), r.detail.as_str()),
-        ("rolled_back", "resumed")
+    assert!(
+        after.calls().is_empty(),
+        "沒有重新替換：{:?}",
+        after.calls()
     );
-    let _ = std::fs::remove_dir_all(&env.root);
-}
-
-/// 在暫存區放一個有官方簽章的回滾檔（`version` 的 deb）並寫進請求
-fn stage_rollback(env: &Env, version: &str) {
-    let name = format!("pulse-{version}-1a2b3c4-linux-x86_64.deb");
-    let content = format!("VERSION={version}\n");
-    let rel = testsign::release(
-        &env.key,
-        version,
-        "1a2b3c4",
-        &[(name.as_str(), content.as_bytes())],
-        None,
-    );
-    std::fs::write(env.staging().join(&name), content).unwrap();
-    std::fs::write(env.staging().join(files::ROLLBACK_SUMS_FILE), &rel.sums).unwrap();
-    std::fs::write(env.staging().join(files::ROLLBACK_SIG_FILE), &rel.sig).unwrap();
-    rewrite_request(env, |r| r.rollback_artifact = Some(name));
+    assert_eq!(env.installed(), "0.9.0");
+    after.assert_invariants();
+    env.cleanup();
 }
 
 /// `request.json` 由服務帳號寫入、不可信（REMOTE.md 第 5.1 節）：取得服務帳號的人謊報較舊的
@@ -901,9 +1288,11 @@ fn tampered_from_version_is_refused_before_anything_changes() {
         fake.calls()
     );
     assert!(!env.paths.install_dir.join("pulse.prev").exists());
-    assert!(!env.paths.work_root.join(ID).join("rollback.pkg").exists());
+    assert!(!env.work().join("rollback.pkg").exists());
+    assert!(!env.work().join("state.json").exists(), "還沒有交易紀錄");
+    assert!(!env.active());
     assert_eq!(env.result(), r);
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     // 不是版本號的 from_version：請求本身不合法（刪除 request.json，path unit 不再觸發）
     let env = setup("from-garbage", "deb");
@@ -911,114 +1300,97 @@ fn tampered_from_version_is_refused_before_anything_changes() {
     assert!(apply(&env.paths, &Fake::new(&env.root)).is_err());
     assert!(!env.paths.request.exists());
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
+
+    // 回滾檔是另一個版本的套件（有官方簽章）：不使用，回滾時改以 pulse.prev 回復
+    let env = setup("from-rb-version", "deb");
+    stage_rollback(&env, "0.8.0");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(r.detail.contains("binary_restored"), "{}", r.detail);
+    assert_eq!(env.installed(), "0.9.0");
+    assert!(!fake.calls().contains(&"dpkg rollback.pkg".to_string()));
+    env.cleanup();
 }
 
-/// 重新開機後接續時執行檔（與輔助程式）已是新版：「替換前的版本」以第一次執行時寫進狀態檔（只有 root
-/// 可寫）的為準。期間 `request.json` 被改成較舊的 `from_version` 也不影響：回滾仍裝回狀態檔記下的版本、
-/// 以它做健康確認，結果加註
+/// 健康確認期間重新開機、開機回來時期限已過的 deb 升級（有驗證過的回滾套件）；`tamper` 在接續之前改寫請求
+fn resumed_deb_rollback(name: &str, tamper: impl FnOnce(&Env)) -> (Env, Fake, UpgradeResult) {
+    let mut env = setup(name, "deb");
+    stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "health_wait");
+    assert_eq!(env.record().from_version, "0.9.0");
+    tamper(&env);
+    // 輔助程式現在是新版
+    env.helper_is_installed();
+    assert_eq!(env.paths.current_version, "0.9.1");
+    let after = fake.reboot_after(601);
+    let r = apply(&env.paths, &after).unwrap();
+    (env, after, r)
+}
+
+/// 重新開機後接續時執行檔（與輔助程式）已是新版：「替換前的版本」以第一次執行時寫進交易紀錄（只有 root
+/// 可寫）的為準。期間 `request.json` 被改成較舊的 `from_version` 也不影響：回滾仍裝回紀錄的版本、以它做
+/// 健康確認，結果加註
 #[test]
 fn resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement() {
-    let mut env = setup("from-resume", "deb");
-    stage_rollback(&env, "0.9.0");
-    let request = std::fs::read(&env.paths.request).unwrap();
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
-    assert_eq!(r.state, "succeeded", "{r:?}");
-    let state_path = env.paths.work_root.join(ID).join("state.json");
-    let mut s: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(s["from_version"], "0.9.0", "{s}");
-    // 模擬健康確認期間重新開機、期限已過：接續後回滾。輔助程式現在是新版
-    s["step"] = "replaced".into();
-    s["result"] = serde_json::Value::Null;
-    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
-    s["n_restarts_before"] = 0.into();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    env.paths.current_version = "0.9.1".into();
-    // 驗證過的回滾檔在 root 專用的工作目錄（升級結束時才刪除：這裡放回去，模擬升級還沒結束）
-    let rollback_pkg = env.paths.work_root.join(ID).join("rollback.pkg");
-    let put_rollback = || {
-        std::fs::write(
-            &rollback_pkg,
-            "VERSION=0.9.0
-",
-        )
-        .unwrap()
-    };
-
     // 請求沒有被動過：照常回滾到 0.9.0，沒有加註
-    put_rollback();
-    std::fs::write(&env.paths.request, &request).unwrap();
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    let (env, after, r) = resumed_deb_rollback("from-resume", |_| {});
     assert_eq!(
         (r.state.as_str(), r.from_version.as_str()),
         ("rolled_back", "0.9.0"),
         "{r:?}"
     );
     assert!(
-        !r.detail.contains(NOTE_FROM_VERSION_IGNORED),
+        !r.detail.contains(NOTE_FROM_VERSION_IGNORED) && !r.detail.contains("request_"),
         "{}",
         r.detail
     );
     assert_eq!(env.installed(), "0.9.0");
+    assert_eq!(after.calls(), ["dpkg rollback.pkg", "restart"]);
+    after.assert_invariants();
+    env.cleanup();
 
-    // 回到「已替換」，這次請求的 from_version 被改成 0.8.0
-    std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
-    rewrite_request(&env, |r| r.from_version = "0.8.0".into());
-    put_rollback();
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    // 請求的 from_version 被改成 0.8.0
+    let (env, after, r) = resumed_deb_rollback("from-resume-tamper", |env| {
+        rewrite_request(env, |r| r.from_version = "0.8.0".into());
+    });
     assert_eq!(r.state, "rolled_back", "{r:?}");
-    assert_eq!(r.from_version, "0.9.0", "以狀態檔的版本為準：{r:?}");
+    assert_eq!(r.from_version, "0.9.0", "以交易紀錄的版本為準：{r:?}");
     assert!(r.detail.contains(NOTE_FROM_VERSION_IGNORED), "{}", r.detail);
     assert_eq!(
-        fake.calls(),
+        after.calls(),
         ["dpkg rollback.pkg", "restart"],
         "{:?}",
-        fake.calls()
+        after.calls()
     );
     assert_eq!(env.installed(), "0.9.0");
+    assert_eq!(after.pkg_db.borrow().as_deref(), Some("0.9.0 ii"));
+    env.cleanup();
 
-    // 回滾確認期間再重新開機：同樣以狀態檔的版本確認
-    let mut s2: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    s2["step"] = "rolling_back".into();
-    s2["result"] = serde_json::Value::Null;
-    s2["deadline_unix"] = (chrono::Utc::now().timestamp() + 600).into();
-    s2["n_restarts_before"] = 0.into();
-    std::fs::write(&state_path, serde_json::to_vec(&s2).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
+    // 回滾確認期間重新開機、請求被改寫：同樣以交易紀錄的版本確認
+    let env = setup("from-resume-rollback", "deb");
+    stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    apply_until(&env.paths, &fake, "rollback_wait");
     rewrite_request(&env, |r| r.from_version = "0.8.0".into());
-    env.paths.current_version = "0.9.0".into();
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(
         (r.state.as_str(), r.from_version.as_str()),
         ("rolled_back", "0.9.0"),
         "{r:?}"
     );
-
-    // 0.9.0 的輔助程式寫的狀態檔沒有記版本：接續時沿用請求中的值（與 0.9.0 相同）
-    s.as_object_mut().unwrap().remove("from_version");
-    std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
-    env.paths.current_version = "0.9.1".into();
-    put_rollback();
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
-    assert_eq!(
-        (r.state.as_str(), r.from_version.as_str()),
-        ("rolled_back", "0.9.0"),
-        "{r:?}"
-    );
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert!(r.detail.contains(NOTE_FROM_VERSION_IGNORED), "{}", r.detail);
+    assert!(after.calls().is_empty(), "{:?}", after.calls());
+    env.cleanup();
 }
 
-/// 安裝方式由輔助程式自己偵測，不採用 `request.json` 的 `method`；替換後 `method`、`target`、
-/// `rollback_artifact` 一律取自替換前寫進狀態檔的值——重新開機接續時請求被改寫也不影響回滾的方式
+/// 安裝方式由輔助程式自己偵測，不採用 `request.json` 的 `method`；替換後 `method`、`target`、回滾套件
+/// 一律取自替換前寫進交易紀錄的值——重新開機接續時請求被改寫也不影響回滾的方式
 #[test]
 fn method_and_target_come_from_the_helper_and_the_recorded_state() {
     // 第一次執行：請求的 method 與偵測到的不同就拒絕（deb 安裝的主機被要求當成 tar 替換）
@@ -1039,51 +1411,32 @@ fn method_and_target_come_from_the_helper_and_the_recorded_state() {
     );
     assert_eq!(env.installed(), "0.9.0");
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     // 接續：deb 的升級在健康確認期間重新開機，期間請求被改成 tar、另一個目標、沒有回滾檔
     let mut env = setup("method-resume", "deb");
-    stage_rollback(&env, "0.9.0");
-    let request = std::fs::read(&env.paths.request).unwrap();
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
-    assert_eq!(r.state, "succeeded", "{r:?}");
-    let state_path = env.paths.work_root.join(ID).join("state.json");
-    let mut s: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let rb_name = stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "health_wait");
+    let rec = env.record();
     assert_eq!(
         (
-            s["method"].as_str(),
-            s["target"]["version"].as_str(),
-            s["rollback_artifact"].as_str()
+            rec.method.as_str(),
+            rec.target.version.as_str(),
+            rec.rollback.as_ref().map(|r| r.name.as_str())
         ),
-        (
-            Some("deb"),
-            Some("0.9.1"),
-            Some("pulse-0.9.0-1a2b3c4-linux-x86_64.deb")
-        ),
-        "{s}"
+        ("deb", "0.9.1", Some(rb_name.as_str()))
     );
-    s["step"] = "replaced".into();
-    s["result"] = serde_json::Value::Null;
-    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
-    s["n_restarts_before"] = 0.into();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    std::fs::write(
-        env.paths.work_root.join(ID).join("rollback.pkg"),
-        "VERSION=0.9.0\n",
-    )
-    .unwrap();
-    std::fs::write(&env.paths.request, &request).unwrap();
     rewrite_request(&env, |r| {
         r.method = "tar".into();
         r.target.version = "0.9.9".into();
         r.rollback_artifact = None;
     });
-    env.paths.current_version = "0.9.1".into();
-    // 接續時不重新偵測：即使偵測結果不同（例如標記檔被刪）也以狀態檔為準
+    env.helper_is_installed();
+    // 接續時不重新偵測：即使偵測結果不同（例如標記檔被刪）也以交易紀錄為準
     env.paths.method = "unknown".into();
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    let after = fake.reboot_after(601);
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "rolled_back", "{r:?}");
     assert_eq!(
         (r.from_version.as_str(), r.to_version.as_str()),
@@ -1097,51 +1450,68 @@ fn method_and_target_come_from_the_helper_and_the_recorded_state() {
     );
     // 仍以套件管理員裝回（deb），不是 tar 的「換回 pulse.prev」
     assert!(!r.detail.contains("binary_restored"), "{}", r.detail);
-    assert_eq!(fake.calls(), ["dpkg rollback.pkg", "restart"]);
+    assert_eq!(after.calls(), ["dpkg rollback.pkg", "restart"]);
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 }
 
-/// 接續時只信 root 的狀態檔，所以它必須 fail closed（REMOTE.md 第 17.8 節）：
-/// 替換前寫不進狀態檔就不得開始替換；狀態檔損毀，或不見了而工作目錄裡已有替換階段的檔案時，不得當成
-/// 全新的請求（那樣會改信 `request.json`）
+/// 接續時只信 root 的交易紀錄，所以它必須 fail closed（REMOTE.md 第 17.8、17.9.3 節）：
+/// 替換前任何一次寫不進去就不得繼續；紀錄損毀，或不見了而工作目錄裡已有交易的痕跡時，不得當成全新的
+/// 請求（那樣會改信 `request.json`）
 #[test]
 fn the_state_file_fails_closed() {
-    use std::os::unix::fs::PermissionsExt;
-
-    // 1. 替換前無法寫入狀態檔：不替換
-    let env = setup("state-unwritable", "tar");
-    let work = env.paths.work_root.join(ID);
-    let fake = Fake::new(&env.root);
-    let w = work.clone();
-    *fake.after_precheck.borrow_mut() = Some(Box::new(move || {
-        std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o500)).unwrap();
-    }));
-    let r = apply(&env.paths, &fake).unwrap();
-    let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
-    // root 不受目錄權限限制（容器中以 root 執行測試時）：這一段無法模擬，略過
-    let probe = work.join("probe");
-    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let is_root = std::fs::write(&probe, b"x").is_ok();
-    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if !is_root {
-        assert_eq!(
-            (r.state.as_str(), r.code.as_deref()),
-            ("failed", Some(codes::E_UPGRADE_REPLACE)),
-            "{r:?}"
-        );
-        assert!(r.detail.starts_with(DETAIL_STATE_NOT_SAVED), "{}", r.detail);
-        assert_eq!(env.installed(), "0.9.0");
-        assert!(!env.paths.install_dir.join("pulse.prev").exists());
-        assert!(
-            !fake.calls().contains(&"restart".to_string()),
-            "{:?}",
-            fake.calls()
-        );
+    // 1. 替換前無法寫入指標或紀錄：不替換（root 不受目錄權限限制：容器中以 root 執行測試時無法模擬）
+    if !running_as_root() {
+        for (i, (point, lock_root)) in [
+            // prepared 之後：指標寫不進去
+            ("record_prepared", true),
+            // 指標之後：replacing 寫不進去
+            ("pointer_written", false),
+            // pulse.prev 已保留：prev_saved 寫不進去
+            ("prev_copied", false),
+            // unit 已備份：unit_backed_up 寫不進去
+            ("unit_backed_up", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let env = setup(&format!("state-unwritable{i}"), "tar");
+            let fake = Fake::new(&env.root);
+            let dir = if lock_root {
+                env.paths.work_root.clone()
+            } else {
+                env.work()
+            };
+            let d = dir.clone();
+            *fake.at_checkpoint.borrow_mut() =
+                Some((point.to_string(), Box::new(move || chmod(&d, 0o500))));
+            let r = apply(&env.paths, &fake).unwrap();
+            chmod(&dir, 0o700);
+            assert_eq!(
+                (r.state.as_str(), r.code.as_deref()),
+                ("failed", Some(codes::E_UPGRADE_REPLACE)),
+                "{point}: {r:?}"
+            );
+            assert!(
+                r.detail.starts_with(DETAIL_STATE_NOT_SAVED),
+                "{point}: {}",
+                r.detail
+            );
+            assert_eq!(env.installed(), "0.9.0", "{point}");
+            assert_eq!(env.unit(), OLD_UNIT, "{point}");
+            assert!(
+                !fake.calls().contains(&"restart".to_string()),
+                "{point}: {:?}",
+                fake.calls()
+            );
+            assert!(matches!(env.prev().as_str(), "" | "0.9.0"), "{point}");
+            assert_eq!(env.result(), r);
+            fake.assert_invariants();
+            env.cleanup();
+        }
     }
-    let _ = std::fs::remove_dir_all(&env.root);
 
-    // 2. 狀態檔損毀（不是合法的內容、schema 不符、讀不到）：不重新開始
+    // 2. 紀錄損毀（不是合法的內容、schema 不符、讀不到）：不重新開始
     for (name, content) in [
         ("garbage", Some("{ not json")),
         (
@@ -1153,8 +1523,8 @@ fn the_state_file_fails_closed() {
         ("unreadable", None),
     ] {
         let env = setup(&format!("state-{name}"), "tar");
-        let work = env.paths.work_root.join(ID);
-        std::fs::create_dir_all(&work).unwrap();
+        let work = env.work();
+        env.make_work();
         match content {
             Some(c) => std::fs::write(work.join("state.json"), c).unwrap(),
             // 一個目錄：讀取失敗但不是「不存在」
@@ -1176,18 +1546,15 @@ fn the_state_file_fails_closed() {
             r.detail
         );
         assert!(fake.calls().is_empty(), "{name}: {:?}", fake.calls());
-        assert_eq!(
-            binary_version(&env.paths.install_dir.join("pulse.prev")),
-            "0.9.0",
-            "{name}"
-        );
-        let _ = std::fs::remove_dir_all(&env.root);
+        assert_eq!(env.prev(), "0.9.0", "{name}");
+        assert!(work.join("state.json").exists(), "{name}: 現場保留");
+        env.cleanup();
     }
 
-    // 3. 狀態檔不見了，但工作目錄裡有替換階段才會出現的檔案
+    // 3. 紀錄不見了，但工作目錄裡有交易的痕跡
     let env = setup("state-missing", "deb");
-    let work = env.paths.work_root.join(ID);
-    std::fs::create_dir_all(&work).unwrap();
+    let work = env.work();
+    env.make_work();
     std::fs::write(work.join("rollback.pkg"), "VERSION=0.8.0\n").unwrap();
     let fake = Fake::new(&env.root);
     let r = apply(&env.paths, &fake).unwrap();
@@ -1199,136 +1566,97 @@ fn the_state_file_fails_closed() {
     );
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
     // 對照：工作目錄已存在（上一次在預檢時中斷，只有日誌）但沒有動過手：照常重新開始
     let env = setup("state-fresh", "tar");
-    let work = env.paths.work_root.join(ID);
-    std::fs::create_dir_all(&work).unwrap();
+    let work = env.work();
+    env.make_work();
+    chmod(&work, 0o700);
     std::fs::write(work.join("upgrade.log"), "earlier attempt\n").unwrap();
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert!(
+        std::fs::read_to_string(work.join("upgrade.log"))
+            .unwrap()
+            .starts_with("earlier attempt\n"),
+        "日誌保留"
+    );
+    env.cleanup();
 }
 
-/// 當機窗口：替換完成、還沒記下 `Replaced` 就中斷（狀態仍是 `Verified`）。接續時重新驗證並再替換一次，
-/// 但**不得再覆寫 `pulse.prev`**——目前的執行檔已是新版，覆寫後回滾就換不回舊版
+/// 當機窗口：執行檔已替換、還沒記下 `replaced` 就中斷（紀錄仍是 `replacing`）。接續時依磁碟上的實況繼續，
+/// **不得再覆寫 `pulse.prev`**——目前的執行檔已是新版，覆寫後回滾就換不回舊版
 #[test]
 fn a_crash_between_replacing_and_recording_it_keeps_the_old_backup() {
     let mut env = setup("crash-window", "tar");
-    // 上一次執行留下的狀態：已保留 pulse.prev（0.9.0）、執行檔已換成 0.9.1、狀態仍是 verified
-    let work = env.paths.work_root.join(ID);
-    std::fs::create_dir_all(&work).unwrap();
-    std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.1\n").unwrap();
-    std::fs::write(env.paths.install_dir.join("pulse.prev"), "VERSION=0.9.0\n").unwrap();
-    let state = HelperState {
-        schema: HELPER_SCHEMA.to_string(),
-        step: Step::Verified,
-        deadline_unix: 0,
-        n_restarts_before: 0,
-        restarted_unix: 0,
-        health_timeout_secs: 600,
-        unit_replaced: false,
-        notes: Vec::new(),
-        rollback_reason: String::new(),
-        from_version: "0.9.0".into(),
-        method: "tar".into(),
-        target: Some(kairos_proto::mgmt::UpgradeTarget {
-            version: "0.9.1".into(),
-            commit: "5e6f7a8".into(),
-        }),
-        rollback_artifact: None,
-        prev_saved: true,
-        result: None,
-    };
-    std::fs::write(work.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
-    // 輔助程式現在是新版；新版一啟動就崩潰 → 回滾
-    env.paths.current_version = "0.9.1".into();
     let fake = Fake::new(&env.root);
+    // 新版一啟動就崩潰 → 接續後回滾
     fake.set("0.9.1", Behavior::Crash);
-    let r = apply(&env.paths, &fake).unwrap();
+    apply_until(&env.paths, &fake, "binary_replaced");
+    assert_eq!(
+        (env.installed().as_str(), env.prev().as_str()),
+        ("0.9.1", "0.9.0")
+    );
+    assert_eq!(env.record().step, Step::Replacing);
+    // 輔助程式現在是新版
+    env.helper_is_installed();
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "rolled_back", "{r:?}");
     assert_eq!(r.from_version, "0.9.0");
     assert_eq!(env.installed(), "0.9.0", "回滾換回的是舊版");
-    assert_eq!(
-        binary_version(&env.paths.install_dir.join("pulse.prev")),
-        "0.9.0"
+    assert_eq!(env.prev(), "0.9.0");
+    assert!(
+        !after.calls().contains(&"tar".to_string()),
+        "接續時不再解開發佈檔：{:?}",
+        after.calls()
     );
-    let _ = std::fs::remove_dir_all(&env.root);
+    after.assert_invariants();
+    env.cleanup();
 
-    // 沒有記下「已保留」（在複製 pulse.prev 之前中斷，執行檔還是舊版）：照常保留
+    // 在保留 pulse.prev 之前中斷（執行檔還是舊版）：照常保留
     let env = setup("crash-window-early", "tar");
-    let work = env.paths.work_root.join(ID);
-    std::fs::create_dir_all(&work).unwrap();
-    let early = HelperState {
-        prev_saved: false,
-        ..state
-    };
-    std::fs::write(work.join("state.json"), serde_json::to_vec(&early).unwrap()).unwrap();
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "record_replacing");
+    assert_eq!(env.prev(), "");
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
-    assert_eq!(
-        binary_version(&env.paths.install_dir.join("pulse.prev")),
-        "0.9.0"
-    );
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert_eq!(env.prev(), "0.9.0");
+    after.assert_invariants();
+    env.cleanup();
 }
 
-const OTHER_ID: &str = "11111111-2222-4333-8444-555555555555";
-
-fn write_active(env: &Env, id: &str) {
-    std::fs::create_dir_all(&env.paths.work_root).unwrap();
-    std::fs::write(
-        env.paths.work_root.join(ACTIVE_FILE),
-        serde_json::to_vec(&serde_json::json!({"schema": HELPER_SCHEMA, "upgrade_id": id}))
-            .unwrap(),
-    )
-    .unwrap();
-}
-
-/// 進行中交易的指標（REMOTE.md 第 17.8 節）：工作目錄不由 `request.json` 的 `upgrade_id` 決定。交易進行
-/// 中（已替換、健康確認期間重新開機）服務帳號把請求換成另一個 `upgrade_id`：輔助程式仍接續原本的交易
+/// 進行中交易的指標（REMOTE.md 第 17.8、17.9 節）：工作目錄不由 `request.json` 的 `upgrade_id` 決定。交易
+/// 進行中（已替換、健康確認期間重新開機）服務帳號把請求換成另一個 `upgrade_id`：輔助程式仍接續原本的交易
 /// ——不開新的交易、不重新替換、不覆寫 `pulse.prev`、不刪除原交易的工作目錄
 #[test]
 fn an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrade() {
     let mut env = setup("active-swap", "tar");
-    let request = std::fs::read(&env.paths.request).unwrap();
     let active = env.paths.work_root.join(ACTIVE_FILE);
-    // 正常的一次升級：替換期間指標存在，結束後清除
+    // 替換期間指標存在（屬於這筆交易）
     let fake = Fake::new(&env.root);
-    let seen = std::rc::Rc::new(Cell::new(None));
-    let (seen2, active2) = (seen.clone(), active.clone());
+    let seen = std::rc::Rc::new(RefCell::new(None));
+    let (seen2, root2) = (seen.clone(), env.paths.work_root.clone());
     *fake.on_restart.borrow_mut() = Some(Box::new(move || {
-        let id = std::fs::read(&active2)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v["upgrade_id"].as_str().map(str::to_string));
-        seen2.set(Some(id));
+        *seen2.borrow_mut() = txn::read_active(&root2).ok().flatten();
     }));
-    let r = apply(&env.paths, &fake).unwrap();
-    assert_eq!(r.state, "succeeded", "{r:?}");
-    assert_eq!(seen.take(), Some(Some(ID.to_string())), "替換時指標已寫入");
-    assert!(!active.exists(), "交易結束後清除");
+    apply_until(&env.paths, &fake, "health_wait");
+    let pointer = seen.borrow().clone().expect("替換時指標已寫入");
+    assert_eq!(pointer.upgrade_id, ID);
+    assert_eq!(pointer.binding_sha256, env.record().binding_sha256);
+    assert!(active.exists());
 
-    // 回到「已替換、健康確認中」（期限已過），指標還在；請求被換成另一個 upgrade_id
-    let state_path = env.paths.work_root.join(ID).join("state.json");
-    let mut s: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    s["step"] = "replaced".into();
-    s["result"] = serde_json::Value::Null;
-    s["deadline_unix"] = (chrono::Utc::now().timestamp() - 1).into();
-    s["n_restarts_before"] = 0.into();
-    std::fs::write(&state_path, serde_json::to_vec(&s).unwrap()).unwrap();
-    write_active(&env, ID);
-    std::fs::write(&env.paths.request, &request).unwrap();
+    // 健康確認中重新開機（期限已過）；請求被換成另一個 upgrade_id
     rewrite_request(&env, |r| {
         r.upgrade_id = OTHER_ID.into();
         // 對新的交易而言「誠實」的內容：目前的版本、重新安裝同一版
         r.from_version = "0.9.1".into();
     });
-    env.paths.current_version = "0.9.1".into();
-    let fake = Fake::new(&env.root);
-    let r = apply(&env.paths, &fake).unwrap();
+    env.helper_is_installed();
+    let after = fake.reboot_after(601);
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.upgrade_id, ID, "結果屬於原本的交易：{r:?}");
     assert_eq!(
         (
@@ -1342,24 +1670,23 @@ fn an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrad
     assert!(r.detail.contains(NOTE_UPGRADE_ID_IGNORED), "{}", r.detail);
     // 沒有重新驗證與替換（只有回滾後的重新啟動），pulse.prev 仍是舊版，回滾換回的是舊版
     assert_eq!(
-        fake.calls(),
+        after.calls(),
         ["daemon-reload", "restart"],
         "只有回滾（還原 unit、重新啟動）：{:?}",
-        fake.calls()
+        after.calls()
     );
     assert_eq!(env.installed(), "0.9.0");
-    assert_eq!(
-        binary_version(&env.paths.install_dir.join("pulse.prev")),
-        "0.9.0"
-    );
+    assert_eq!(env.prev(), "0.9.0");
     assert!(!env.paths.work_root.join(OTHER_ID).exists());
-    assert!(env.paths.work_root.join(ID).join("state.json").is_file());
+    assert!(env.work().join("state.json").is_file());
     assert!(!active.exists(), "交易結束後清除");
-    let _ = std::fs::remove_dir_all(&env.root);
+    after.assert_invariants();
+    env.cleanup();
 
     // 指標讀不到或內容不合法：不開新的交易，保留指標
     let env = setup("active-garbage", "tar");
     std::fs::create_dir_all(&env.paths.work_root).unwrap();
+    chmod(&env.paths.work_root, 0o700);
     std::fs::write(env.paths.work_root.join(ACTIVE_FILE), "{ not json").unwrap();
     let fake = Fake::new(&env.root);
     let r = apply(&env.paths, &fake).unwrap();
@@ -1378,50 +1705,41 @@ fn an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrad
     assert!(env.paths.work_root.join(ACTIVE_FILE).exists());
     assert!(!env.paths.request.exists());
     assert_eq!(env.result(), r);
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 
-    // 狀態檔不可用時指標保留（之後的請求同樣被擋下，直到人工檢查）
+    // 紀錄不可用時指標保留（之後的請求同樣被擋下，直到人工檢查）
     let env = setup("active-kept", "tar");
-    let work = env.paths.work_root.join(ID);
-    std::fs::create_dir_all(&work).unwrap();
-    std::fs::write(work.join("state.json"), "{ not json").unwrap();
-    write_active(&env, ID);
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
-    assert!(r.detail.starts_with(DETAIL_STATE_UNUSABLE), "{}", r.detail);
-    assert!(env.paths.work_root.join(ACTIVE_FILE).exists());
-    let _ = std::fs::remove_dir_all(&env.root);
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "binary_replaced");
+    std::fs::write(env.work().join("state.json"), "{ not json").unwrap();
+    for _ in 0..2 {
+        if !env.paths.request.exists() {
+            stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+        }
+        let after = fake.reboot();
+        let r = apply(&env.paths, &after).unwrap();
+        assert!(r.detail.starts_with(DETAIL_STATE_UNUSABLE), "{}", r.detail);
+        assert_eq!(r.upgrade_id, ID, "回報的是進行中的交易");
+        assert!(env.paths.work_root.join(ACTIVE_FILE).exists());
+        assert!(after.calls().is_empty(), "{:?}", after.calls());
+        assert!(!env.paths.work_root.join(OTHER_ID).exists());
+    }
+    env.cleanup();
 }
 
-/// 上一次執行已寫下狀態檔（`Verified`）後中斷：接續時目標以狀態檔記下的為準，請求中的目標被改過也一樣
+/// 上一次執行已寫下紀錄與指標（`prepared`）後中斷：接續時目標與發佈檔以交易紀錄為準——不重讀暫存區、
+/// 不重新驗證，請求中的目標被改過也一樣
 #[test]
 fn a_verified_transaction_keeps_its_recorded_target() {
     let env = setup("verified-target", "tar");
-    let work = env.paths.work_root.join(ID);
-    std::fs::create_dir_all(&work).unwrap();
-    let state = HelperState {
-        schema: HELPER_SCHEMA.to_string(),
-        step: Step::Verified,
-        deadline_unix: 0,
-        n_restarts_before: 0,
-        restarted_unix: 0,
-        health_timeout_secs: 600,
-        unit_replaced: false,
-        notes: Vec::new(),
-        rollback_reason: String::new(),
-        from_version: "0.9.0".into(),
-        method: "tar".into(),
-        target: Some(kairos_proto::mgmt::UpgradeTarget {
-            version: "0.9.1".into(),
-            commit: "5e6f7a8".into(),
-        }),
-        rollback_artifact: None,
-        prev_saved: false,
-        result: None,
-    };
-    std::fs::write(work.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
-    write_active(&env, ID);
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "pointer_written");
+    assert_eq!(env.record().step, Step::Prepared);
     rewrite_request(&env, |r| r.target.version = "0.9.9".into());
-    let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
+    // 暫存區（服務帳號可寫）被清空也不影響：只用 root 工作目錄裡驗證過的複本
+    std::fs::remove_dir_all(env.staging()).unwrap();
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
     assert_eq!(
         (r.state.as_str(), r.to_version.as_str()),
         ("succeeded", "0.9.1"),
@@ -1433,13 +1751,19 @@ fn a_verified_transaction_keeps_its_recorded_target() {
         r.detail
     );
     assert_eq!(env.installed(), "0.9.1");
-    let _ = std::fs::remove_dir_all(&env.root);
+    assert!(
+        !after.calls().contains(&"tar".to_string()),
+        "{:?}",
+        after.calls()
+    );
+    after.assert_invariants();
+    env.cleanup();
 
-    // 對照：沒有狀態檔時，目標與發佈檔不符的請求照常被拒
+    // 對照：沒有紀錄時，目標與發佈檔不符的請求照常被拒
     let env = setup("verified-target-fresh", "tar");
     rewrite_request(&env, |r| r.target.version = "0.9.9".into());
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.state, "failed", "{r:?}");
     assert_eq!(env.installed(), "0.9.0");
-    let _ = std::fs::remove_dir_all(&env.root);
+    env.cleanup();
 }

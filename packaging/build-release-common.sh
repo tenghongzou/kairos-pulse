@@ -48,6 +48,11 @@
 #                 可重現性檢查以全新的 volume 指定，確保不是沿用上次的建置產物
 #   SIGNING_KEY   簽章私鑰路徑（repo 之外）。有設定時打包後以 packaging/sign-release.sh 簽署
 #                 SHA256SUMS；沒有設定時，因 SHA256SUMS 已改變，刪除舊的 SHA256SUMS.sig
+#   TEST_FEATURES **只給 tests/systemd/build.sh**：建置時另外開啟的 Cargo feature（以空白分隔；目前只有 Pulse
+#                 的 fault-injection，crates/kairos-proto/REMOTE.md 第 17.9.9 節）。產物是「測試用建置」，
+#                 不可發佈：packaging/release.sh 在設定了它時拒絕執行。沒有設定時（正式的建置），每個目標
+#                 建置完成後以 packaging/check-release-binary.sh 確認執行檔不含測試用 feature 的程式，
+#                 有就中止打包；有設定時反過來確認標記存在（這個檢查真的認得出測試用建置）
 #
 # 發佈包內容（一層 <基本名稱>/ 目錄）：執行檔（755）、範例設定、README.md、PROTOCOL.md、
 # CHANGELOG.md、INSTALL.md、THIRD-PARTY-LICENSES、<名稱>.cdx.json、systemd unit（Linux）與
@@ -135,6 +140,17 @@ done
 TARGETS=${TARGETS:-$DEFAULT_TARGETS}
 PACKAGES=${PACKAGES-deb rpm}
 BUILD_JOBS=${BUILD_JOBS:-2}
+TEST_FEATURES=${TEST_FEATURES:-}
+for f in $TEST_FEATURES; do
+    case "$f" in
+    fault-injection) ;;
+    *) die "不支援的 TEST_FEATURES「$f」（fault-injection）" ;;
+    esac
+done
+if [ -n "$TEST_FEATURES" ]; then
+    echo "警告：TEST_FEATURES=$TEST_FEATURES：這是測試用建置（tests/systemd），產物不可發佈" >&2
+fi
+[ -f packaging/check-release-binary.sh ] || die "缺少 packaging/check-release-binary.sh"
 APK_PACKAGES=$APK_BASE
 for t in $TARGETS; do
     case "$t" in
@@ -317,27 +333,45 @@ for T in $TARGETS; do
     PKG="$NAME-$VERSION-$BUILD_COMMIT-$OS-$ARCH"
     echo "==> [$T] cargo build（$PKG）"
     cd "$SRC"
+    # 測試用建置（TEST_FEATURES，只給 tests/systemd）才有額外的 feature；正式的建置沒有任何 --features
+    set --
+    [ -z "$TEST_FEATURES" ] || set -- --features "$TEST_FEATURES"
     case "$T" in
     aarch64-unknown-linux-musl)
-        cargo zigbuild --release --locked --target "$T" ;;
+        cargo zigbuild --release --locked --target "$T" "$@" ;;
     x86_64-pc-windows-gnu)
         # 可重現：PE 標頭不寫建置時間；去掉符號表（rustc 為 raw-dylib 產生的匯入程式庫放在隨機命名的
         # 暫存目錄 rustcXXXXXX，目錄名稱會進入 COFF 符號表，每次建置都不同）
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C link-arg=-Wl,--no-insert-timestamp -C strip=symbols" \
-            cargo build --release --locked --target "$T" ;;
+            cargo build --release --locked --target "$T" "$@" ;;
     *)
-        cargo build --release --locked --target "$T" ;;
+        cargo build --release --locked --target "$T" "$@" ;;
     esac
     BIN="$CARGO_TARGET_DIR/$T/release/$NAME$EXE"
     [ -f "$BIN" ] || { echo "找不到建置產物 $BIN" >&2; exit 1; }
 
+    # 正式的建置不得含測試用 feature 的程式（REMOTE.md 第 17.9.9 節的故障注入）：有就中止打包。
+    # 測試用建置反過來確認標記存在——這個檢查真的認得出來，不是永遠通過
+    echo "==> [$T] 測試用 feature 的檢查（packaging/check-release-binary.sh）"
     EXPECTED="$NAME $VERSION ($BUILD_COMMIT)"
+    case " $TEST_FEATURES " in
+    *" fault-injection "*)
+        sh /src/packaging/check-release-binary.sh --test-build "$BIN" || exit 1
+        EXPECTED="$EXPECTED [fault-injection]"
+        ;;
+    *)
+        sh /src/packaging/check-release-binary.sh "$BIN" || {
+            echo "錯誤：$BIN 含測試用 feature 的程式，中止打包" >&2
+            exit 1
+        }
+        ;;
+    esac
     case "$T" in
     x86_64-pc-windows-gnu)
         # 容器內無法執行 Windows 執行檔：確認是 PE（MZ）且內嵌的版本字串與檔名一致
         [ "$(head -c 2 "$BIN")" = MZ ] || { echo "錯誤：$BIN 不是 PE 執行檔" >&2; exit 1; }
-        grep -aq "$EXPECTED" "$BIN" || { echo "錯誤：$BIN 中找不到版本字串「$EXPECTED」" >&2; exit 1; }
+        grep -aqF -- "$EXPECTED" "$BIN" || { echo "錯誤：$BIN 中找不到版本字串「$EXPECTED」" >&2; exit 1; }
         echo "    （Windows 執行檔：已確認 PE 格式與內嵌的「$EXPECTED」，未執行）"
         ;;
     *)
@@ -573,6 +607,7 @@ git -c core.autocrlf=false archive --format=tar "$TREEISH" |
     -e VERSION="$VERSION" \
     -e TARGETS="$TARGETS" \
     -e PACKAGES="$PACKAGES" \
+    -e TEST_FEATURES="$TEST_FEATURES" \
     -e HOST_TRIPLE="$HOST_TRIPLE" \
     -e PKG_SUBDIR="$PKG_SUBDIR" \
     -e EXAMPLE_SRC="$EXAMPLE_SRC" \

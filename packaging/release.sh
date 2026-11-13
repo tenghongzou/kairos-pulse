@@ -10,6 +10,8 @@
 #   SIGNING_KEY   簽章私鑰路徑（必須在 repo 之外）；沒有設定時只打包不簽章（例如 CI）
 #   SKIP_CHECKS=1 略過 fmt／clippy／test（含端對端測試）／deny（只用於已在同一個 commit 通過這些檢查的 CI job）
 #   ALLOW_DIRTY=1 允許工作目錄有未提交的變更（產物帶 -dirty，不能簽章；只用於測試打包腳本）
+#   TEST_FEATURES 不可設定：測試用的 Cargo feature（tests/systemd 的故障注入）只能由 tests/systemd/build.sh
+#                 經 build-release-common.sh 開啟；這裡看到就拒絕執行
 #   DIST_DIR、BUILD_VOLUME 見 packaging/build-release-common.sh
 #
 # 輸出目錄（預設 <repo>/dist）中由本腳本產生的檔案（kairos-*、pulse-*、SHA256SUMS*）會先刪除，
@@ -26,6 +28,11 @@ REPO=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel) || die "$SCRIPT_DIR 不�
 cd "$REPO"
 DIST_DIR=${DIST_DIR:-$REPO/dist}
 export DIST_DIR
+
+# 測試用的 feature（tests/systemd 的故障注入，crates/kairos-proto/REMOTE.md 第 17.9.9 節）不得進入正式發佈：
+# 環境中有 TEST_FEATURES 時（例如從測試用的 shell 執行）直接拒絕，不是悄悄忽略
+[ -z "${TEST_FEATURES:-}" ] ||
+    die "環境變數 TEST_FEATURES=$TEST_FEATURES：測試用的 feature 不可用於正式發佈（請 unset TEST_FEATURES）"
 
 if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
     [ "${ALLOW_DIRTY:-}" = 1 ] || die "工作目錄有未提交的變更；正式發佈必須從乾淨的 commit 建置（測試打包可設 ALLOW_DIRTY=1）"
@@ -65,6 +72,15 @@ rm -f "$DIST_DIR"/kairos-* "$DIST_DIR"/pulse-* "$DIST_DIR"/SHA256SUMS "$DIST_DIR
 # 兩個產品各自打包時不簽章，全部完成後只簽一次
 (unset SIGNING_KEY; sh kairos/packaging/build-release.sh)
 (unset SIGNING_KEY; sh pulse/packaging/build-release.sh)
+
+# ---- 發佈檔不得是測試用建置 --------------------------------------------------
+# 每個目標建置完成時已在容器內檢查過執行檔（build-release-common.sh）；這裡再對「要發佈的檔案」檢查一次：
+# 取出 tar.gz 內的執行檔，確認沒有測試用 feature（故障注入）的程式。簽章之前執行，不通過就不簽
+echo "==> 確認發佈檔不是測試用建置（packaging/check-release-binary.sh）"
+for f in "$DIST_DIR"/kairos-*.tar.gz "$DIST_DIR"/pulse-*.tar.gz; do
+    [ -f "$f" ] || die "找不到發佈檔 $f"
+    sh packaging/check-release-binary.sh --archive "$f" || die "$f 不可發佈"
+done
 
 if [ -n "${SIGNING_KEY:-}" ]; then
     sh packaging/sign-release.sh sign "$DIST_DIR" "$SIGNING_KEY"

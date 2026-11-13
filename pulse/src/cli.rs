@@ -4,12 +4,24 @@
 ///
 /// commit 由 `build.rs` 決定（環境變數 `BUILD_COMMIT` → `git rev-parse --short HEAD` → `unknown`）。
 /// hello 的 `agent_version` 欄位不使用這個字串，仍只送 `CARGO_PKG_VERSION`。
+#[cfg(not(feature = "fault-injection"))]
 pub const VERSION: &str = concat!(
     "pulse ",
     env!("CARGO_PKG_VERSION"),
     " (",
     env!("PULSE_BUILD_COMMIT"),
     ")"
+);
+
+/// 開啟 feature `fault-injection` 的測試用建置（`tests/systemd/`）：版本字串另外標明，不會被誤認為
+/// 正式發佈的執行檔（打包腳本比對 `--version` 的完整輸出）
+#[cfg(feature = "fault-injection")]
+pub const VERSION: &str = concat!(
+    "pulse ",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PULSE_BUILD_COMMIT"),
+    ") [fault-injection]"
 );
 
 /// 使用說明（`-h` / `--help`）。
@@ -423,13 +435,34 @@ mod tests {
         assert!(parse_args(["--version=1"]).is_err());
     }
 
+    /// 故障注入只給 tests/systemd/ 的測試用建置：不得是預設的 feature（正式發佈以預設的 feature 建置）
+    #[test]
+    fn fault_injection_is_not_a_default_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("default"))
+            .expect("pulse/Cargo.toml 的 [features] 要有 default");
+        assert_eq!(default.replace(' ', ""), "default=[]", "{default}");
+        assert!(manifest.lines().any(|l| l == "fault-injection = []"));
+        // 沒有開啟時版本字串不帶標記
+        #[cfg(not(feature = "fault-injection"))]
+        assert!(!VERSION.contains("fault-injection"), "{VERSION}");
+        #[cfg(feature = "fault-injection")]
+        assert!(VERSION.ends_with(" [fault-injection]"), "{VERSION}");
+    }
+
     #[test]
     fn version_string_format() {
         // D3：pulse <版本> (<commit>)，單行
         let expected_prefix = format!("pulse {} (", env!("CARGO_PKG_VERSION"));
         assert!(VERSION.starts_with(&expected_prefix), "{VERSION}");
-        assert!(VERSION.ends_with(')'), "{VERSION}");
-        let commit = &VERSION[expected_prefix.len()..VERSION.len() - 1];
+        // 測試用建置（feature fault-injection）在後面另有標記；其餘格式相同
+        let plain = VERSION.trim_end_matches(" [fault-injection]");
+        #[cfg(not(feature = "fault-injection"))]
+        assert_eq!(plain, VERSION);
+        assert!(plain.ends_with(')'), "{VERSION}");
+        let commit = &plain[expected_prefix.len()..plain.len() - 1];
         assert!(!commit.is_empty(), "{VERSION}");
         assert!(
             commit
