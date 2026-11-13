@@ -2210,7 +2210,13 @@ async fn rollout_approval_needs_another_admins_session() {
         (Auth::Session(&oscar), 0, Some("forbidden"), false, false),
         (Auth::Session(&alice), 0, Some("self_approval"), true, false),
         (Auth::Session(&bob), 0, Some("self_approval"), false, true),
-        (Auth::Token(&admin_token), 0, Some("session_required"), false, false),
+        (
+            Auth::Token(&admin_token),
+            0,
+            Some("session_required"),
+            false,
+            false,
+        ),
         (Auth::Session(&carol), 1, None, false, false),
     ] {
         let r = call(&f, "GET", "/api/v1/rollouts", auth, None, &[]).await;
@@ -2325,14 +2331,46 @@ async fn rollout_approval_needs_another_admins_session() {
     for (body, status, code) in [
         (None, 400, "confirmation_required"),
         (Some(json!({})), 400, "confirmation_required"),
-        (Some(json!({"confirm": "", "digest": digest})), 400, "confirmation_required"),
-        (Some(json!({"confirm": "核准 2 台", "digest": digest})), 400, "confirmation_required"),
-        (Some(json!({"confirm": "核准降版 1 台", "digest": digest, "reason": "x"})), 400, "confirmation_required"),
-        (Some(json!({"confirm": "升級 1 台", "digest": digest})), 400, "confirmation_required"),
-        (Some(json!({"confirm": "核准 1 台"})), 400, "invalid_parameter"),
-        (Some(json!({"confirm": "核准 1 台", "digest": "0".repeat(64)})), 409, "submission_changed"),
-        (Some(json!({"confirm": "核准 1 台", "digest": digest, "force": true})), 400, "invalid_parameter"),
-        (Some(json!({"confirm": 1, "digest": digest})), 400, "invalid_parameter"),
+        (
+            Some(json!({"confirm": "", "digest": digest})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "核准 2 台", "digest": digest})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "核准降版 1 台", "digest": digest, "reason": "x"})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "升級 1 台", "digest": digest})),
+            400,
+            "confirmation_required",
+        ),
+        (
+            Some(json!({"confirm": "核准 1 台"})),
+            400,
+            "invalid_parameter",
+        ),
+        (
+            Some(json!({"confirm": "核准 1 台", "digest": "0".repeat(64)})),
+            409,
+            "submission_changed",
+        ),
+        (
+            Some(json!({"confirm": "核准 1 台", "digest": digest, "force": true})),
+            400,
+            "invalid_parameter",
+        ),
+        (
+            Some(json!({"confirm": 1, "digest": digest})),
+            400,
+            "invalid_parameter",
+        ),
     ] {
         let r = call(
             &f,
@@ -2369,11 +2407,7 @@ async fn rollout_approval_needs_another_admins_session() {
     assert_eq!(j["data"]["state"], "pending_approval");
     assert_eq!(j["data"]["submission"]["digest"], digest.as_str());
     assert_eq!(j["data"]["viewer"]["can_approve"], true);
-    assert!(
-        !audit_actions(&f)
-            .iter()
-            .any(|a| a.0 == "rollout.approve")
-    );
+    assert!(!audit_actions(&f).iter().any(|a| a.0 == "rollout.approve"));
 
     // 第三位管理員核准（前後空白比照 submit 去掉）：開始
     let r = call(
@@ -2407,7 +2441,15 @@ async fn rollout_approval_needs_another_admins_session() {
         (409, Some("invalid_state"))
     );
     // 核准之後清單不再有可以核准的，推送的 JSON 也不再帶 submission
-    let r = call(&f, "GET", "/api/v1/rollouts", Auth::Session(&carol), None, &[]).await;
+    let r = call(
+        &f,
+        "GET",
+        "/api/v1/rollouts",
+        Auth::Session(&carol),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(r.json()["meta"]["pending_approval_actionable"], 0);
     assert_eq!(r.json()["data"][0].get("submission"), None);
     let actions: Vec<(String, String)> =
