@@ -621,3 +621,15 @@ root 封存與索引（主鍵為發佈檔 SHA-256、generation、政策快照、
 | 0001 審查：Windows 沒有權限隔離 | **採納** | 不變條件在 Windows 只是縱深防禦 | 0、7.3、8.3（R9） |
 | 0001 審查：槽 ID 應含發佈檔雜湊 | **採納** | 與 Q3 的主鍵一致 | 7.2、7.3 |
 | 0001 審查：commit generation 取代時間 | **採納** | — | 5.2（INV-10）、7.2、7.3 |
+
+### 2026-11-13：階段 0b 的實作紀錄（不改變任何決定）
+
+第 9.1 節的 0b-1～0b-7 已實作（分支 `sprint11/helper-txn`）：設計、每個當機點的結果與驗證紀錄在 [`REMOTE.md`](../../crates/kairos-proto/REMOTE.md) 第 17.9 節，程式在 `pulse/src/remote/upgrade/helper.rs`、`helper/txn.rs`，測試在 `helper/tests.rs`、`helper/fault_tests.rs` 與 `tests/systemd/`（情境 `tamper-resume`、`crash-replace`、`crash-rollback`）。第 10 節表中 #2 的 G1、G3 與 #4 的 G2 及其後各項隨之完成；#5（套件回滾失敗的降級）、#6、#7 的其餘章節不在階段 0b 的範圍，沒有改。
+
+實作與本 ADR 字面不同之處（都在 `REMOTE.md` 第 17.9 節說明）：
+
+| 本 ADR | 實作 | 理由 |
+|---|---|---|
+| 0b-1：指標 `/var/lib/pulse-upgrade/active`，「在第一次寫交易紀錄前寫入（含 `upgrade_id`、交易紀錄的雜湊）」 | 檔名 `active.json`（main 上的 0005679 已用這個名稱）；順序是**紀錄先於指標、指標先於任何變更**：`preparing`、`prepared` 兩份紀錄先寫，驗證與預檢都通過後才寫指標，再進入 `replacing`。指標內容是 `upgrade_id` 與交易紀錄中「綁定欄位」的雜湊（`binding_sha256`），不是整份紀錄的雜湊 | 指標代表「已經（或即將）變更系統」：預檢失敗的請求不留下指標，也就不會把之後的請求擋下；綁定欄位在 `prepared` 之後不變，整份紀錄的雜湊則每一步都會變（指標就得每一步重寫，多一個當機窗口）。INV-6「進行中的交易由特權專屬的指標找回」不受影響：任何變更之前指標一定已經寫入 |
+| 0b-3：`read_state` 判斷「已動過手」時另外看 `pulse.prev` 的雜湊與套件資料庫版本 | 沒有指標的 `preparing`／`prepared` 紀錄：比對執行檔的雜湊（`old_binary_sha256`）與套件資料庫（`pkg_db_before`），不同就 `state_unusable`；`pulse.prev` 的雜湊用在「是否已保留」「能否用來回滾」的判斷 | `pulse.prev` 在交易之前可能已經存在（上一次升級留下的），它的存在或內容不能說明這一筆交易是否動過手；執行檔與套件資料庫才是 |
+| 0b-7 的當機點清單 | 22 個當機點（`REMOTE.md` 第 17.9.4 節），涵蓋並細分 0b-7 列的每一點 | — |

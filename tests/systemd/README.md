@@ -36,13 +36,19 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 | `kairos` | Kairos（tar.gz） |
 | `<V0>`（例如 `0.10.0`） | Pulse HEAD（`pulse/Cargo.toml` 的版本）：tar.gz、deb、rpm、`pulse-install.sh`、發佈清單 |
 | `<N>-test.1`、`<N>-test.3` | 同一份程式碼，只改版本號。`<N>` 是 `<V0>` 的下一個 PATCH（`0.10.0` → `0.10.1`；`build.sh` 與 `run.sh` 各自由 `pulse/Cargo.toml` 算出），所以測試用的版本一定比 HEAD 新，不會被當成降版 |
-| `<N>-test.2`、`<N>-test.4` | 另加「沒有參數啟動（服務）時立刻以結束代碼 1 結束」：通過輔助程式的預檢（`--version`、`check-config`），啟動後一直崩潰 |
+| `<N>-test.2`、`<N>-test.4`、`<N>-test.7` | 另加「沒有參數啟動（服務）時立刻以結束代碼 1 結束」：通過輔助程式的預檢（`--version`、`check-config`），啟動後一直崩潰 |
+| `<N>-test.5`、`<N>-test.6` | 同 test.1，另以 `TEST_FEATURES=fault-injection` 開啟 Pulse 的編譯期 feature（REMOTE.md 第 17.9.9 節）：**測試用建置**，升級輔助程式可以在指定的當機點停住。`pulse --version` 結尾有 `[fault-injection]` |
 | `evil-a` | test.1 的檔案，`SHA256SUMS` 以沒有人信任的金鑰簽章 |
 | `<N>-test.9` | test.1 的檔案改名為 test.9，以只有 Kairos 信任的金鑰簽章 |
 
 簽章一律用測試時以 `ssh-keygen -t ed25519` 產生的臨時金鑰（`packaging/sign-release.sh`，namespace
 `kairos-pulse-release`）；Pulse 的信任錨（`/etc/kairos-pulse/allowed_signers`）只有 `release`，Kairos 的
 `[remote] allowed_signers` 有 `release` 與 `evil-b`。**不使用正式的離線發佈金鑰。**
+
+**故障注入只在 test.5、test.6**：其餘版本（含安裝在主機上的 `<V0>`，情境 b0～f 用到的全部版本）都是與正式發佈
+相同方式建置的執行檔。打包腳本對每一個版本執行 `packaging/check-release-binary.sh`——正式的建置含故障注入的
+標記就中止打包，測試用建置反過來要求標記存在；`build.sh` 建置後確認兩種檢查都有執行過、以 `tar.gz` 內的執行檔
+再確認一次，並確認 `packaging/release.sh` 在設定了 `TEST_FEATURES` 時拒絕執行。
 
 ## 環境（`run.sh`）
 
@@ -77,12 +83,20 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 | `reboot-rollback`（c2） | test.3 → test.4（崩潰） | 回滾確認（`rolling_back`）時重新開機；開機後接續 → `rolled_back`、回到 test.3 |
 | `signature`（d） | — ／ test.9 | d1：Kairos 拒絕匯入 `evil-a`（400 `release_signature_invalid`）；d2：Kairos 匯入 test.9，Pulse 下載前驗證簽章失敗 → `failed`（`PLS-E8401`）、版本不變、推送自動暫停 |
 | `tamper`（e） | （不經 Kairos）test.4＋謊報的 `from_version` | 0.10.0 的安全性修正（REMOTE.md 第 5.1 節）：在 deb、rpm 主機上**以服務帳號**自己寫 `request.json`——目標是有官方簽章的 test.4（崩潰，健康確認一定失敗），`from_version` 謊報為較舊的 `<V0>` 並附上 `<V0>` 有官方簽章的套件當回滾檔。輔助程式以自己的版本為準：`failed`（`PLS-E8402`，`from_version_mismatch: request says <V0>, installed version is <目前的版本>`），執行檔與套件資料庫都沒有改變、沒有執行套件管理員、`request.json` 已刪除、服務照常執行。修正前同樣的請求會讓 root 以 `dpkg -i`／`rpm -U --oldpackage` 把主機降到 `<V0>` |
-| `tamper-resume`（f） | 目前的版本 → test.4（崩潰） | 進行中交易的指標（REMOTE.md 第 17.8 節）：回滾確認（`rolling_back`）期間**以服務帳號**把 `request.json` 的 `upgrade_id` 改成另一個 UUID，然後重新開機。輔助程式仍接續原本的交易：三台 `rolled_back`（`PLS-W8407`）、`detail` 加註 `request_upgrade_id_ignored`，沒有為假的 `upgrade_id` 建立工作目錄，`/var/lib/pulse-upgrade/active.json` 已清除，`pulse.prev` 仍是替換前的版本 |
+| `tamper-resume`（f） | 目前的版本 → test.4（崩潰） | 進行中交易的指標與交易紀錄（REMOTE.md 第 17.8、17.9 節）：回滾確認（`rolling_back`）期間**以服務帳號**把 `request.json` 的 `upgrade_id` 改成另一個 UUID、`from_version` 改成謊報的 `0.0.1`，然後重新開機。輔助程式仍接續原本的交易：三台 `rolled_back`（`PLS-W8407`）、`detail` 加註 `request_upgrade_id_ignored` 與 `request_from_version_ignored`，沒有為假的 `upgrade_id` 建立工作目錄，`/var/lib/pulse-upgrade/active.json` 已清除，`pulse.prev` 仍是替換前的版本。另外檢查竄改當下 root 的檔案：`active.json`（schema `pulse.upgrade-active/v1`）與它指向的 `state.json`（schema `pulse.upgrade-helper/v2`、步驟 `rolling_back`）的 `checksum` 以 `sha256sum` 重新計算相符、兩者的 `upgrade_id` 與 `binding_sha256` 相同、紀錄有替換前的版本、新舊執行檔與發佈檔的雜湊、`prev_saved` 與回滾的意圖；工作目錄 0700、兩個檔案 0600、都屬於 root，服務帳號讀不到 `/var/lib/pulse-upgrade`。交易結束後紀錄為 `done`、工作目錄只留 `state.json` 與 `upgrade.log`、`/var/lib/pulse-upgrade` 只保留最近一筆交易 |
+| `crash-replace`（g） | （test.3 → test.5）→ test.6 | 當機點（REMOTE.md 第 17.9.4 節第 11 列）。主機上的輔助程式不是測試用建置時，先以一次正常的推送升級到 test.5。在每台主機放好掛鉤 `/var/lib/pulse-upgrade/fault-inject`（內容 `binary_replaced`），推送 test.6：輔助程式在**執行檔已替換（deb／rpm：套件已安裝完成）、還沒記下 `replaced`** 時停住，腳本確認當時的紀錄是 `replacing`（checksum 相符）、執行檔已是 test.6、`pulse.prev` 是 test.5，然後 `docker kill`（SIGKILL PID 1）並重新啟動容器。開機後輔助程式「接續上次中斷的替換」：不再保留 `pulse.prev`（「不再覆寫」）、健康確認 → 三台 `succeeded`（`PLS-I8416`），`pulse.prev` 仍是 test.5，指標已清除 |
+| `crash-rollback`（h） | test.6 → test.7（崩潰） | 當機點（第 17 列）：掛鉤 `rollback_restored`。新版崩潰 → 輔助程式記下回滾的意圖、還原（tar：換回 `pulse.prev`；deb／rpm：以回滾套件經套件管理員裝回），在**已還原、還沒記下 `rolling_back`** 時停住；腳本確認紀錄是 `rollback_intent`（`cause: health`，`via` 為 `binary`／`package`）、執行檔已是 test.6，然後 `docker kill` 並重新啟動。開機後「接續上次中斷的回滾：重新還原」（冪等重做）→ 三台 `rolled_back`（`PLS-W8407`，`detail` 為「<原因>; resumed」），deb／rpm 的套件資料庫也是 test.6 |
 
 每個情境結束後的日誌：`logs/<情境>-<主機>.log`（`pulse upgrade status`、`journalctl -u pulse-upgrade`、
 輔助程式的 `upgrade.log`、Pulse 日誌中與升級有關的行）、`logs/<情境>-kairos.log`。
 
+情境 g、h 的 `docker kill` 等同「所有行程立即終止」，不是真正的斷電：已寫入頁面快取的資料不會遺失。其餘的
+當機點（REMOTE.md 第 17.9.4 節共 22 列）由單元測試的故障注入矩陣涵蓋（`pulse/src/remote/upgrade/helper/fault_tests.rs`）；
+要在實機重現其他的當機點，把掛鉤的內容換成那個 checkpoint 的名稱即可（只有 test.5、test.6 的輔助程式會讀）。
+
 ## 沒有涵蓋
+
+- 真正的斷電（頁面快取遺失、fsync 之前的寫入消失）：情境 g、h 只終止行程。
 
 - 套件資料庫被鎖住時的重試（第 12.3 節「另測」）：需要在替換的那一刻持有 dpkg／rpm 的鎖，時序不易穩定重現，
   以 `remote::upgrade::helper::tests` 的假套件管理員涵蓋。

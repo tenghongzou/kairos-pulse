@@ -452,7 +452,7 @@ Kairos 建立推送時，對 deb／rpm／msi 主機檢查版本庫是否有「�
 
 #### 4.4.3 健康確認期間的重新開機
 
-`request.json` 在成功或回滾完成前不刪除，因此主機在替換中途重新開機時，`pulse-upgrade.path` 在開機後再次觸發輔助程式；輔助程式依 `/var/lib/pulse-upgrade/<id>/state.json` 的步驟接續（已替換 → 重新做健康確認；健康確認期限已過 → 回滾）。
+`request.json` 在成功或回滾完成前不刪除，因此主機在替換中途重新開機時，`pulse-upgrade.path` 在開機後再次觸發輔助程式；輔助程式依 `/var/lib/pulse-upgrade/<id>/state.json` 的步驟接續（已替換 → 重新做健康確認；健康確認期限已過 → 回滾）。0.10.0 起要接續哪一筆交易由 root 的 `/var/lib/pulse-upgrade/active.json` 決定（不是 `request.json` 的 `upgrade_id`），`state.json` 是有 checksum 的正式交易紀錄；每個步驟、每個當機點接續後的結果，以及紀錄損毀時的處理見第 17.9 節。
 
 #### 4.4.4 Windows（服務 `Pulse`，LocalSystem）
 
@@ -997,7 +997,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - `kairos-proto`：新訊息的序列化與驗證（範例改為 PROTOCOL.md 的測試向量）、`install` 欄位限制、`pending` 的容錯；**SSHSIG 驗證**（以 `ssh-keygen -Y sign` 產生的測試向量：正確簽章、錯誤 namespace、錯誤金鑰、`valid-before` 過期、被修改的 `SHA256SUMS`、`cert-authority` 行、RSA 金鑰行）；`SHA256SUMS` 解析；發佈檔名解析；清單的版本比較；設定的正規化 JSON 與雜湊。
 - Kairos：指派合併與衝突偵測、`desired_rev` 只對雜湊改變的主機更新、到期的指派；推送引擎的狀態轉換（以假的時鐘：批次、觀察期、時段跨午夜與時區、失敗比例、自動暫停的每個條件、離線寬限、重疊）；資格分類；版本庫匯入與 `release_in_use`。
 - Pulse：合併順序（預設 < 遠端 < 檔案 < 環境變數、`interface_exclude` 聯集、隱私鍵只取保守值）、驗證失敗整份拒絕、即時與重新連線的套用、確認期與崩潰保護、快取損毀；升級狀態機（以假的輔助程式）、續傳、空間不足、降版政策、URL 白名單；安裝方式偵測。
-- 輔助程式：以暫存目錄模擬 `/opt/pulse` 與 `/var/lib/pulse`：符號連結、硬連結、超大檔案、驗證後換檔（TOCTOU）、`allowed_signers` 權限過寬、unit 是否替換的判斷、重新開機後接續。
+- 輔助程式：以暫存目錄模擬 `/opt/pulse` 與 `/var/lib/pulse`：符號連結、硬連結、超大檔案、驗證後換檔（TOCTOU）、`allowed_signers` 權限過寬、unit 是否替換的判斷、重新開機後接續。0.10.0 另有交易紀錄的故障注入矩陣（第 17.9.4 節的每一個當機點 × 安裝方式 × 新版健康／崩潰）、紀錄與指標損毀或遺失、舊格式、路徑檢查與保留上限（`helper/fault_tests.rs`，第 17.9.10 節）。
 
 ### 12.2 端對端測試（`tests/e2e`，必須真的升級並回滾一個 Pulse 執行檔）
 
@@ -1198,7 +1198,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 第 3.3～3.7 節（合併、驗證、套用、快取、確認期、回復） | `remote/config.rs`（`CentralConfig`；合併以 `mgmt::settings::check_remote`／`merge_key`，重新連線以 `needs_reconnect`） |
 | 每條連線上的訊息（`pending`、`config_get`／`config_status`、`upgrade_*`） | `remote/conn.rs`（`MgmtConn`），由 `network.rs` 的兩個連線迴圈呼叫 |
 | 第 4.6 節的 Pulse 端狀態機（評估、下載、驗證、暫存、交付、回報） | `remote/upgrade/mod.rs`（`UpgradeAgent`；`<狀態目錄>/upgrade/state.json`） |
-| 第 4.4.1～4.5 節的輔助程式 | `remote/upgrade/helper.rs`（`pulse upgrade apply`；`pulse/packaging/pulse-upgrade.path`、`pulse-upgrade.service`） |
+| 第 4.4.1～4.5 節的輔助程式 | `remote/upgrade/helper.rs`（`pulse upgrade apply`；`pulse/packaging/pulse-upgrade.path`、`pulse-upgrade.service`）；0.10.0 的交易紀錄、指標、路徑檢查與清理在 `remote/upgrade/helper/txn.rs`（第 17.9 節） |
 | `request.json`、`result.json` 與不信任的檔案的讀取 | `remote/upgrade/files.rs` |
 | 第 10.2、10.3 節的命令與 `pulse status` | `remote/cli.rs`、`status_cmd/eval.rs`（「設定」列與「升級」列）、`status_file.rs` 的 `management` |
 | 即時的鍵的套用與重建 | `main.rs` 的 `pipeline`、`collect_live`、`spawn_live_logging`；`inventory.rs` 的 `InventoryAgent::update`、`spool.rs` 的 `set_limits`、`backoff.rs` 的 `set_limits` |
@@ -1309,7 +1309,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 **測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`、`method_and_target_come_from_the_helper_and_the_recorded_state`、`the_state_file_fails_closed`、`a_crash_between_replacing_and_recording_it_keeps_the_old_backup`、`an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrade`、`a_verified_transaction_keeps_its_recorded_target`（`helper/tests.rs`）；系統層另有情境 `tamper-resume`（f）：回滾確認期間以服務帳號改寫 `request.json` 的 `upgrade_id` 後重新開機；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。2026-11-12 在 kp-build 以修正後的程式實跑全部情境（b0、a、b、c、c2、d、e；目標版本由 0.10.0 推導為 0.10.1-test.N）：144 項通過、0 失敗——包含重新開機接續的 c、c2（接續時改用 `state.json` 的內容），以及 e 在兩台主機上的結果 `PLS-E8402 from_version_mismatch: request says 0.10.0, installed version is 0.10.1-test.3`、版本與套件資料庫不變。沒有在修正前的程式上實跑情境 e（修正前的行為由讀程式與單元測試的對照推得）。
 
-**這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。回滾檔所屬發佈的信任方式（目前是 Pulse 保存的 `SHA256SUMS` 紀錄，由輔助程式以信任錨重新驗證簽章）也由 ADR-0003 處理。ADR-0003 列的其餘補強這次同樣沒有做：交易紀錄的完整 schema 與 checksum、明確的「替換中」步驟（目前 `verified` 涵蓋「尚未替換」與「替換途中」，接續時重新驗證後再替換一次；此時重新驗證失敗會以 `failed` 結束而不回滾）、故障注入的測試矩陣、既存工作目錄的擁有者與權限檢查、工作目錄數量的上限。
+**這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。回滾檔所屬發佈的信任方式（目前是 Pulse 保存的 `SHA256SUMS` 紀錄，由輔助程式以信任錨重新驗證簽章）也由 ADR-0003 處理。ADR-0003 列的其餘補強這次同樣沒有做：交易紀錄的完整 schema 與 checksum、明確的「替換中」步驟（目前 `verified` 涵蓋「尚未替換」與「替換途中」，接續時重新驗證後再替換一次；此時重新驗證失敗會以 `failed` 結束而不回滾）、故障注入的測試矩陣、既存工作目錄的擁有者與權限檢查、工作目錄數量的上限。**〔後續〕這一段列的「其餘補強」已由第 17.9 節（ADR-0003 階段 0b）完成**；套件回滾失敗的降級狀態與回滾檔所屬發佈的信任方式仍屬 ADR-0003 階段 1，沒有改。本節描述的 `state.json` 是 0.10.0 開發期間的 v1 加欄位版本（未曾發佈），發佈的 0.10.0 使用第 17.9.2 節的 v2。
 
 ### 17.9 輔助程式的交易紀錄（0.10.0；ADR-0003 階段 0b）
 
@@ -1352,6 +1352,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `prev_saved` | 這筆交易已把替換前的執行檔保留為 `pulse.prev`（且雜湊等於 `old_binary_sha256`） |
 | `unit_backed_up`、`unit_replaced` | tar：unit 已備份到 `pulse.service.prev`、已換上新 unit |
 | `health_timeout_secs`、`deadline_unix`、`n_restarts_before`、`restarted_unix` | 健康確認（與 v1 相同） |
+| `service_restarted` | 這個步驟（`replaced`／`rolling_back`）的 `systemctl restart pulse.service` 已經送出。接續時還是 `false` 就再送一次（第 17.9.3 節） |
+| `legacy` | 這份紀錄由 v1 的狀態檔轉換而來（沒有雜湊可比對，第 17.9.6 節） |
 | `rollback_intent`（`reason`、`cause`、`via`） | 回滾的意圖（還原**之前**寫入）：原因；`cause` 為 `health`（健康確認失敗）或 `replace_failed`（替換無法完成）；`via` 為 `package`（以 `rollback.pkg` 經套件管理員）或 `binary`（換回 `pulse.prev`，tar 另還原 unit） |
 | `notes`、`result` | 附在結果 `detail` 的說明；最後的結果（`done` 時） |
 
@@ -1366,13 +1368,15 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | （無紀錄） | 讀指標與 `request.json`；檢查路徑；`from_version`、`method` 與輔助程式自己的值相符 | 寫入紀錄 `preparing` |
 | `preparing` | 紀錄已有替換前的狀態（版本、commit、安裝方式、`old_binary_sha256`、`pkg_db_before`） | 從暫存區複製到工作目錄、重新驗證簽章與雜湊、版本政策、預檢；保存 `new.bin`、新 unit、`rollback.pkg`；寫入 `prepared`（全部綁定欄位） |
 | `prepared` | 已驗證的複本都在工作目錄、雜湊已記錄；系統沒有任何變更 | 寫入指標 → 寫入 `replacing` |
-| `replacing` | 指標已寫入：可以變更系統 | ① 保留 `pulse.prev` → 記錄 `prev_saved`；② tar 且要換 unit：備份 unit → 記錄 `unit_backed_up`；③ 替換執行檔（tar：`new.bin` 改名取代；deb／rpm：套件管理員）；④ tar：換上新 unit、`daemon-reload`；⑤ 寫入 `replaced`（期限、`pkg_db_after`、`unit_replaced`） |
-| `replaced` | 執行檔（與 unit、套件資料庫）已是新版 | 重新啟動服務 → 健康確認 → 通過：`done`（`succeeded`）；不通過：回滾 |
-| `rollback_intent` | 已記錄回滾的原因與方式（**先寫意圖再還原**） | 還原（`package`：`rollback.pkg`；`binary`：`pulse.prev`，tar 另還原 unit）→ 寫入 `rolling_back`（期限） |
-| `rolling_back` | 已還原 | 重新啟動服務 → 確認舊版恢復 → `done`（`rolled_back`；`cause` 為 `replace_failed` 時是 `failed`／`PLS-E8406`；不恢復：`rollback_failed`） |
+| `replacing` | 指標已寫入：可以變更系統 | ① 保留 `pulse.prev` → 記錄 `prev_saved`；② tar 且要換 unit：備份 unit → 記錄 `unit_backed_up`；③ 替換執行檔（tar：把 `new.bin` 複製成同目錄的暫存檔、fsync 後改名取代，`new.bin` 留在工作目錄供接續時重做；deb／rpm：套件管理員）；④ tar：換上新 unit、`daemon-reload`；⑤ 寫入 `replaced`（期限、`pkg_db_after`、`unit_replaced`、`service_restarted = false`） |
+| `replaced` | 執行檔（與 unit、套件資料庫）已是新版 | 重新啟動服務 → 記錄 `service_restarted` → 健康確認 → 通過：`done`（`succeeded`）；不通過：回滾 |
+| `rollback_intent` | 已記錄回滾的原因與方式（**先寫意圖再還原**） | 還原（`package`：`rollback.pkg`；`binary`：`pulse.prev`，tar 另還原 unit）→ 寫入 `rolling_back`（期限、`service_restarted = false`） |
+| `rolling_back` | 已還原 | 重新啟動服務 → 記錄 `service_restarted` → 確認舊版恢復 → `done`（`rolled_back`；`cause` 為 `replace_failed` 時是 `failed`／`PLS-E8406`；不恢復：`rollback_failed`） |
 | `done` | 結果已記錄 | 寫 `result.json` → 刪除 `request.json` → 清理 → 刪除指標 |
 
-寫入失敗的處理（fail closed）：`preparing`、`prepared`、指標、`replacing`、`prev_saved`、`unit_backed_up` 任何一次寫不進去就**不再往下做**——此時執行檔、unit、套件資料庫都還沒被改過，結果是 `failed`（`PLS-E8406`，`state_not_saved: …`）。`replaced` 之後的寫入（`replaced`、`rollback_intent`、`rolling_back`、`done`）失敗時不能半途停下：記 `WARN` 後繼續，這次執行仍會做完；之後接續時依磁碟實況冪等重做（下表）。`done` 寫不進去時，為了不讓下一個請求把這筆已結束的交易當成未結束，輔助程式改為刪除 `state.json`（刪除不需要空間）；連刪除都失敗時指標保留，之後的請求以 `state_unusable` 擋下。
+寫入失敗的處理（fail closed）：`preparing`、`prepared`、指標、`replacing`、`prev_saved`、`unit_backed_up` 任何一次寫不進去就**不再往下做**——此時執行檔、unit、套件資料庫都還沒被改過，結果是 `failed`（`PLS-E8406`，`state_not_saved: …`）。`replaced` 之後的寫入（`replaced`、`rollback_intent`、`rolling_back`、`done`）失敗時不能半途停下：記 `WARN` 後繼續，這次執行仍會做完；之後接續時依磁碟實況冪等重做（下表）。`done` 寫不進去時，為了不讓下一個請求把這筆已結束的交易當成未結束，輔助程式改為刪除 `state.json`（刪除不需要空間）；連刪除都失敗時（檔案系統唯讀或損壞）**指標照常清除**：留下的那份未結束的紀錄沒有指標，之後的請求依第 17.9.5 節以 `state_unusable` 擋下。〔與實作前的設計不同：原本寫「指標保留」。指標保留的話，下一次觸發會「接續」這筆其實已經結束的交易——期限早已過去，結果是回滾一個已完成的升級；清除指標才是不替換也不回滾的那一邊〕
+
+**重新啟動只送一次，但中斷後會補送**：`replaced`、`rolling_back` 寫入時 `service_restarted = false`，`systemctl restart` 送出後才記為 `true`。接續時還是 `false`（在兩者之間中斷）就再送一次——主機重新開機的話多重新啟動一次沒有副作用（`NRestarts` 只計自動重啟）；只有輔助程式自己被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機時，服務仍是替換（或還原）前啟動的行程，不補送的話健康確認會一路等到期限而誤判。〔實作時補上；實作前的設計假設中斷一定伴隨重新開機〕由 v1 轉換的紀錄照 v1 的行為（不補送）。
 
 **接續時不重讀暫存區、不重新驗證簽章**：`replacing` 之後的接續只使用工作目錄裡的複本，以紀錄中的雜湊確認它們沒有變（信任結論在 `prepared` 時已經與雜湊一起記下，INV-3 的「取得時驗證」）。暫存區（`pulse` 帳號可寫）、`request.json`、當下的信任錨與 `pulse.toml` 的 `[upgrade]` 都不再影響這筆交易。`request.json` 只用來觸發輔助程式；它讀不到或不合法時，有指標就照常接續（加註 `request_unreadable`）。
 
@@ -1380,7 +1384,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 #### 17.9.4 當機點對照表
 
-「當機」指輔助程式在該點之後、下一個動作之前被終止（斷電、`SIGKILL`、`TimeoutStartSec`）。`request.json` 還在，所以開機後 `pulse-upgrade.path` 再次觸發輔助程式。「舊」＝替換前的版本，「新」＝目標版本。每一列都有對應的單元測試（`helper/fault_tests.rs`，名稱為 checkpoint）；標 ★ 的另有 `tests/systemd/` 的實機情境。
+「當機」指輔助程式在該點之後、下一個動作之前被終止（斷電、`SIGKILL`、`TimeoutStartSec`）。`request.json` 還在，所以開機後 `pulse-upgrade.path` 再次觸發輔助程式。「舊」＝替換前的版本，「新」＝目標版本。每一列都有對應的單元測試（`helper/fault_tests.rs` 的 `crash_point_matrix_*`，以 checkpoint 的名稱注入；`the_matrix_covers_every_row_of_the_crash_point_table` 讀這張表，確認矩陣與它的列號、名稱一致）；標 ★ 的另有 `tests/systemd/` 的實機情境。第 10、14、16（套件）、19 列不在輔助程式自己的兩個動作之間，而是在套件管理員執行中或等待中：測試由假的作業系統注入（名稱 `package_running`、`health_wait`、`rollback_package_running`、`rollback_wait`），程式中沒有這四個 checkpoint。
 
 | # | checkpoint | 當機時磁碟上的狀態 | 接續時的判斷 | 接續後的結果 |
 |---|---|---|---|---|
@@ -1396,12 +1400,12 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 10 | `package_running`（deb／rpm） | 套件管理員執行到一半：執行檔可能已是新版、套件資料庫可能是半安裝 | `replacing`：以驗證過的複本**再執行一次**套件管理員（`dpkg -i`／`rpm -U --replacepkgs` 可重複執行），之後執行檔必須＝新 | 成功 → `replaced` → 健康確認；套件管理員仍失敗 → 依第 17.9.3 節「替換無法完成時」還原並確認，`failed`（`restored`）或 `rollback_failed` |
 | 11 ★ | `binary_replaced` | 執行檔＝新（deb／rpm：套件已安裝完成）；紀錄仍是 `replacing`；tar 的 unit 仍是舊的 | 執行檔＝新 → tar：不再複製，接著換 unit；deb／rpm：再執行一次套件管理員（冪等）。**不覆寫 `pulse.prev`**（`prev_saved` 且雜湊相符） | `replaced` → 健康確認 → `succeeded`；之後若不健康 → 回滾換回的是舊版 |
 | 12 | `unit_replaced`（tar） | 執行檔＝新、unit＝新；`unit_replaced` 尚未記錄 | unit 的雜湊＝`unit.new_sha256` → 不再寫入，`daemon-reload` 後記錄 | 同上；之後若回滾，unit 依雜湊判斷並還原（不依賴 `unit_replaced`） |
-| 13 | `record_replaced` | `replaced`（期限已記錄）；服務尚未重新啟動 | `replaced`：重新做健康確認（開機時服務已由新版啟動） | 期限內健康 → `succeeded`；期限已過 → 回滾 |
-| 14 | （健康確認中） | `replaced` | 同上 | 同上（情境 `reboot`） |
+| 13 | `record_replaced` | `replaced`（期限已記錄）；服務尚未重新啟動（`service_restarted = false`） | `replaced`：補送重新啟動（主機沒有重新開機時服務仍是舊的行程），再做健康確認 | 期限內健康 → `succeeded`；期限已過 → 回滾 |
+| 14 | （健康確認中） | `replaced`、`service_restarted = true` | `replaced`：重新做健康確認（不再重新啟動；開機時服務已由新版啟動） | 同上（情境 `reboot`） |
 | 15 | `rollback_intent_recorded` | `rollback_intent`；尚未還原：執行檔＝新 | 依紀錄的 `via` 還原：`binary` → `pulse.prev` 的雜湊＝`old_binary_sha256` 才使用；`package` → `rollback.pkg` 的雜湊相符才使用 | `rolling_back` → 確認舊版 → `rolled_back`（`detail` 為「<原因>; resumed」） |
 | 16 | `rollback_restoring` | 還原到一半：套件管理員執行中，或執行檔已換回而 unit 尚未還原 | 同上，冪等重做（執行檔已＝舊時不再複製；unit 依雜湊；套件管理員再執行一次） | 同上 |
 | 17 ★ | `rollback_restored` | 已還原（執行檔＝舊、unit＝舊、套件已裝回）；紀錄仍是 `rollback_intent` | 同上：實況已是還原後的狀態，重做不改變任何內容 | 同上 |
-| 18 | `record_rolling_back` | `rolling_back`（期限已記錄）；服務尚未重新啟動 | `rolling_back`：確認舊版恢復 | `rolled_back`；期限內不恢復 → `rollback_failed` |
+| 18 | `record_rolling_back` | `rolling_back`（期限已記錄）；服務尚未重新啟動（`service_restarted = false`） | `rolling_back`：補送重新啟動，再確認舊版恢復 | `rolled_back`；期限內不恢復 → `rollback_failed` |
 | 19 | （回滾確認中） | `rolling_back` | 同上 | 同上（情境 `reboot-rollback`、`tamper-resume`） |
 | 20 | `record_done` | `done`（含結果）；`result.json` 尚未寫出；指標還在 | `done`：不再做任何替換或回滾 | 寫出同一份結果、清理、刪除指標 |
 | 21 | `result_written` | `done`；`result.json` 已寫出；`request.json` 還在 | 同上 | 同上（結果相同） |
@@ -1416,7 +1420,9 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 情況 | 處理 |
 |---|---|
 | `active.json` 存在但讀不到、不是合法的內容、`checksum` 不符或 schema 不認識 | `transaction_pointer_unusable`，指標保留 |
-| 指標有效，但它指向的 `state.json` 不存在、讀不到、`checksum` 不符、schema 不認識、`upgrade_id` 或 `binding_sha256` 與指標不同，或步驟是 `preparing` | `state_unusable`，指標保留 |
+| 指標有效，但它指向的 `state.json` 不存在、讀不到、`checksum` 不符、schema 不認識、`upgrade_id` 或 `binding_sha256` 與指標不同，步驟是 `preparing`、是 `done` 卻沒有結果，或它是 v1 的格式（v1 沒有指標）；`state.json` 是符號連結或有多個硬連結時同樣讀不到 | `state_unusable`，指標保留；結果回報的是指標指向的 `upgrade_id` |
+| 指標有效、紀錄可用，但那筆交易的工作目錄沒有通過路徑檢查（第 17.9.7 節） | `unsafe_path`（`PLS-E8405`），不接續，指標保留 |
+| 指標有效、紀錄是 `done`（有結果），而請求是另一個 `upgrade_id`（上一筆交易只差清除指標，第 17.9.4 節第 22 列） | 清除指標，照常處理新的請求 |
 | 沒有指標，但某個工作目錄的紀錄停在 `replacing`、`replaced`、`rollback_intent` 或 `rolling_back`（指標遺失） | `state_unusable`（列出那個 `upgrade_id`） |
 | 沒有指標，某個工作目錄的 `state.json` 讀不到或 `checksum` 不符 | `state_unusable`（無法判斷那筆交易是否已結束） |
 | 沒有指標，請求的工作目錄已存在、沒有 `state.json`，但有日誌以外的檔案（交易的痕跡） | `state_unusable`（列出檔名） |
@@ -1456,14 +1462,19 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 
 - 同一時間只有一筆交易（指標）；有未結束的交易時不為其他 `upgrade_id` 建立工作目錄。
 - 每次開始新的交易之前與每筆交易結束時清理（只處理名稱是 UUID 的子目錄；其他名稱不動）：保留**最近 1 筆**已結束的紀錄（任何結果）與**最近 3 筆** `rollback_failed` 的紀錄，其餘刪除。沒有紀錄的殘留目錄（預檢中斷）一律刪除。
-- 已結束的交易只留 `state.json` 與 `upgrade.log`；發佈檔、`new.bin`、回滾套件等大檔在結束時刪除。例外：最近一筆 `rollback_failed` 保留全部檔案供人工處理（較舊的 `rollback_failed` 只留紀錄與日誌）。因此磁碟用量的上限約為「進行中的交易」＋「一筆 `rollback_failed` 的完整檔案」，各不超過發佈檔大小上限的 3 倍。
+- 已結束的交易只留 `state.json` 與 `upgrade.log`；發佈檔、`new.bin`、回滾套件等大檔在結束時刪除（在記下 `done` 之後、清理之前中斷而沒有再被觸發的交易會留著大檔，下一次清理時刪除）。例外：最近一筆 `rollback_failed` 保留全部檔案供人工處理（較舊的 `rollback_failed` 只留紀錄與日誌）。因此磁碟用量的上限約為「進行中的交易」＋「一筆 `rollback_failed` 的完整檔案」，各不超過發佈檔大小上限的 3 倍。
 - 清理**不會**刪除：指標指向的工作目錄、任何未結束的紀錄（`replacing`～`rolling_back`；它們會讓請求被 `state_unusable` 擋下，由人處理）、`/opt/pulse/pulse.prev`（下一次升級保留新的備份時才被取代）。
 - 預檢用的 `/opt/pulse/.upgrade-*` 在預檢結束時刪除；開始新的交易時清掉先前中斷留下的。
 
 #### 17.9.9 故障注入
 
-- **單元測試**：`System::checkpoint(name)` 在第 17.9.4 節的每個點被呼叫（正式的 `RealSystem` 不做任何事）；測試用的假 `System` 在指定的點以 panic 中止這次執行（模擬行程被終止：之後的程式都不會執行），再以新的假 `System` 重新呼叫 `apply`，斷言結果、`pulse.prev`、執行檔、unit、套件資料庫、指標與工作目錄。
-- **實機**（`tests/systemd/`）：編譯期 feature `fault-injection`（`pulse/Cargo.toml`，預設關閉）。開啟時 `RealSystem::checkpoint` 讀 `/var/lib/pulse-upgrade/fault-inject`（只有 root 可寫；內容是一個 checkpoint 名稱）：到達那個點時把檔案改名為 `fault-inject.hit` 後停住，測試腳本看到 `.hit` 就 `docker kill` 容器（`SIGKILL` PID 1：所有行程立即終止，等同斷電但不遺失已寫入頁面快取的資料）再啟動。**正式發佈的執行檔不含這段程式**：feature 只由 `tests/systemd/build.sh` 以 `TEST_FEATURES=fault-injection` 開啟；`packaging/build-release-common.sh` 在沒有 `TEST_FEATURES` 時檢查建置出的執行檔不含標記字串 `pulse-fault-injection-build`（有就中止打包），`packaging/release.sh`（正式發佈與 CI 的打包）在設定了 `TEST_FEATURES` 時拒絕執行；開啟 feature 的執行檔 `pulse --version` 的輸出另有 `[fault-injection]`。
+- **單元測試**：`System::checkpoint(name)` 在第 17.9.4 節的每個點被呼叫（正式的 `RealSystem` 不做任何事）；測試用的假 `System`（`helper/tests.rs` 的 `Fake`）在指定的點中止這次執行（`std::panic::resume_unwind`，模擬行程被終止：之後的程式都不會執行；沒有到達那個點就是測試失敗），再以「重新開機後」的另一個假 `System` 重新呼叫 `apply`，斷言當機時磁碟上的狀態與接續後的結果、`pulse.prev`、執行檔、unit、套件資料庫、指標與工作目錄。假的 `System` 另外在**每一個** checkpoint 檢查寫入順序的不變條件：系統（執行檔、`pulse.prev`、unit、套件資料庫）有任何變更時，指標與 `replacing` 之後的紀錄必定已經寫入；指標存在時必定有一份屬於它（`binding_sha256` 相同）的可用紀錄；`pulse.prev` 只會是交易前的內容或替換前的執行檔。
+- **實機**（`tests/systemd/`）：編譯期 feature `fault-injection`（`pulse/Cargo.toml`，預設關閉）。開啟時 `RealSystem::checkpoint` 讀 `/var/lib/pulse-upgrade/fault-inject`（只有 root 可寫；內容是一個 checkpoint 名稱）：到達那個點時把檔案改名為 `fault-inject.hit` 後停住，測試腳本看到 `.hit` 就 `docker kill` 容器（`SIGKILL` PID 1：所有行程立即終止，等同斷電但不遺失已寫入頁面快取的資料）再啟動。改名讓掛鉤只觸發一次：重新開機後的接續不會再停。
+- **正式發佈的執行檔不含這段程式**（已定的規則：注入掛鉤只能是測試建置用的編譯期 feature）。保證的方式有四層，任何一層不通過都不會產生可發佈的檔案：
+  1. feature 不是預設的（`pulse/Cargo.toml` 的 `default = []`；單元測試 `fault_injection_is_not_a_default_feature`），停住的程式與標記字串都在 `#[cfg(feature = "fault-injection")]` 之下。
+  2. 只有設定了環境變數 `TEST_FEATURES=fault-injection` 時，`packaging/build-release-common.sh` 才會以 `--features` 建置；只有 `tests/systemd/build.sh` 這樣做（`test.5`、`test.6` 兩個版本），正式的打包（`packaging/release.sh`、CI 的 package job）在環境中有 `TEST_FEATURES` 時**拒絕執行**。
+  3. `packaging/check-release-binary.sh`：執行檔含標記字串 `pulse-fault-injection-build`（`FAULT_INJECTION_MARKER`，開啟 feature 時才編譯進去）或 `--version` 的結尾標記 `[fault-injection]` 時判定為測試用建置。`build-release-common.sh` 在每個目標建置完成後對執行檔執行它（沒有 `TEST_FEATURES`：含標記就中止打包；有 `TEST_FEATURES`：反過來要求標記存在，確認這個檢查認得出來），`--version` 的輸出也必須逐字等於期望值（正式的建置沒有結尾標記）；`release.sh` 在打包後、簽章前對 `tar.gz` 內的執行檔再檢查一次；CI 的 package job 對要上傳的 `tar.gz`、`zip`、`deb` 再檢查一次，並確認 `release.sh` 拒絕 `TEST_FEATURES`。單元測試 `the_packaging_check_knows_the_fault_injection_marker` 確認腳本與程式用的是同一個標記。
+  4. CI 的 check job 另以 `--features fault-injection` 對 Pulse 執行 clippy（這段程式不在預設的建置裡，避免無人發現地壞掉）。
 - 沒有涵蓋：真正的斷電（頁面快取遺失）——fsync 的順序只由程式審查與單元測試中的順序斷言保證；檔案系統回報寫入成功但實際損毀的情況由 `checksum` 偵測、以 `state_unusable` 擋下。
 
 ## 18. Windows 的遠端升級：0.10.0 不實作的評估與需要的實機驗證（待使用者決定）

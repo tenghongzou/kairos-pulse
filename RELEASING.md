@@ -52,9 +52,9 @@ SIGNING_KEY=/離線媒體/kairos-pulse-release sh packaging/release.sh
 
 `packaging/release.sh` 依序：
 
-1. 確認工作目錄乾淨（有未提交的變更時拒絕；發佈包帶 `-dirty` 時也拒絕簽章）。
+1. 確認工作目錄乾淨（有未提交的變更時拒絕；發佈包帶 `-dirty` 時也拒絕簽章）。環境中有 `TEST_FEATURES` 時拒絕執行（0.10.0 起）：它只給 `tests/systemd/build.sh` 用來開啟 Pulse 的測試用 feature `fault-injection`（升級輔助程式的故障注入，`crates/kairos-proto/REMOTE.md` 第 17.9.9 節），那樣建置的執行檔不可發佈。
 2. 執行 `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test`、`cargo deny check`，任一失敗即停止。`cargo test` 的步驟與 CI 相同：先 `cargo test --workspace --exclude kp-e2e`，再 `cargo build -p kairos -p pulse --bins` 建置執行檔，最後單獨執行端對端測試 `cargo test -p kp-e2e`（失敗時可從輸出分辨是單元／整合測試還是端對端測試）。
-3. 刪除 `dist/` 中舊的 `kairos-*`、`pulse-*`、`SHA256SUMS*`，打包兩個產品（`kairos/packaging/build-release.sh`、`pulse/packaging/build-release.sh`，共用實作 `packaging/build-release-common.sh`）。
+3. 刪除 `dist/` 中舊的 `kairos-*`、`pulse-*`、`SHA256SUMS*`，打包兩個產品（`kairos/packaging/build-release.sh`、`pulse/packaging/build-release.sh`，共用實作 `packaging/build-release-common.sh`）。每個目標建置完成後，以及全部打包完成後（對 `tar.gz` 內的執行檔），以 `packaging/check-release-binary.sh` 確認執行檔不是測試用建置（不含故障注入的標記、`--version` 沒有 `[fault-injection]`）；不通過就停止，不簽章。
 4. 以 `packaging/sign-release.sh` 簽署合併版 `SHA256SUMS`，並以 `<私鑰>.pub` 驗證剛產生的簽章。
 
 產出（`dist/`；0.8.0 起）：
