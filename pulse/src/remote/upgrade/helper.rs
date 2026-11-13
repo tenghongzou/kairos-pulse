@@ -66,6 +66,11 @@ pub const UNIT_PATH: &str = "/etc/systemd/system/pulse.service";
 pub const SERVICE_USER: &str = "pulse";
 /// 符合健康條件後還要穩定多久
 pub const STABLE_FOR: Duration = Duration::from_secs(60);
+/// 接續 `replaced` 的交易時健康確認至少有的時間（0.10.1；REMOTE.md 第 17.9.3 節「接續 `replaced` 時的
+/// 健康確認」）：期限已過或只剩幾秒時，仍以這段時間做與正常流程相同的檢查，通過就是 `succeeded`，不通過才
+/// 回滾。[`STABLE_FOR`]（條件本身要求的穩定時間）加 60 秒（剛被補送重新啟動的服務連線、註冊並讓一筆
+/// report 被確認）；等於推送可以設定的最短健康確認期限（`health_timeout_secs` 的下限 120）
+pub const RESUME_GRACE: Duration = Duration::from_secs(STABLE_FOR.as_secs() + 60);
 /// 回滾後確認舊版恢復的最短期限
 pub const MIN_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// 健康確認的輪詢間隔
@@ -165,6 +170,11 @@ pub trait System {
     fn service_state(&self) -> Result<ServiceState, String>;
     fn daemon_reload(&self) -> Result<(), String>;
     fn run(&self, cmd: &Cmd) -> Output;
+    /// 這次開機的識別（`/proc/sys/kernel/random/boot_id`）：寫入 `replaced` 時記在交易紀錄，接續時比較，
+    /// 判斷替換之後主機有沒有重新開機（`NRestarts` 在開機後從 0 起算）。讀不到時 `None`（接續時視為無法判斷）
+    fn boot_id(&self) -> Option<String> {
+        None
+    }
     /// 故障注入點（REMOTE.md 第 17.9.4、17.9.9 節）：交易的每一步之間呼叫。正式環境不做任何事；測試用的
     /// 實作在指定的點中止這次執行
     fn checkpoint(&self, _name: &str) {}
@@ -767,12 +777,8 @@ fn resume(
         Step::Replaced => {
             h.log
                 .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
-            if !rec.service_restarted {
-                h.log
-                    .line("INFO", "上次還沒有重新啟動 pulse.service：現在重新啟動");
-                h.restart(&mut rec);
-            }
-            h.after_replace(rec)
+            // 還沒送出的重新啟動由 after_replace 補送（先確認接續之前沒有崩潰重啟過）
+            h.after_replace(rec, true)
         }
         Step::RollbackIntent => {
             h.log.line("INFO", "接續上次中斷的回滾：重新還原");
@@ -966,6 +972,7 @@ fn resume_legacy(
     );
     if restart {
         rec.n_restarts_before = sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
+        rec.boot_id = sys.boot_id();
         rec.restarted_unix = sys.now_unix();
         rec.deadline_unix = rec.restarted_unix + i64::try_from(timeout).unwrap_or(i64::MAX);
     }
@@ -987,10 +994,7 @@ fn resume_legacy(
         _ => {
             h.log
                 .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
-            if !rec.service_restarted {
-                h.restart(&mut rec);
-            }
-            h.after_replace(rec)
+            h.after_replace(rec, true)
         }
     };
     h.finish(&r);
@@ -1580,7 +1584,7 @@ impl<'a> Helper<'a> {
                     ),
                 );
                 self.restart(&mut rec);
-                self.after_replace(rec)
+                self.after_replace(rec, false)
             }
             Err(e) => self.replace_failed(rec, e),
         }
@@ -1739,6 +1743,7 @@ impl<'a> Helper<'a> {
         rec.step = Step::Replaced;
         rec.service_restarted = false;
         rec.n_restarts_before = before;
+        rec.boot_id = self.sys.boot_id();
         rec.restarted_unix = self.sys.now_unix();
         rec.deadline_unix =
             rec.restarted_unix + i64::try_from(rec.health_timeout_secs).unwrap_or(i64::MAX);
@@ -1801,8 +1806,61 @@ impl<'a> Helper<'a> {
         }
     }
 
-    /// 步驟 5：健康確認；失敗則回滾
-    fn after_replace(&mut self, rec: Record) -> UpgradeResult {
+    /// 接續 `replaced` 時崩潰偵測的基準（REMOTE.md 第 17.9.3 節「接續 `replaced` 時的健康確認」第 2 點）。
+    /// 紀錄的 `n_restarts_before` 是替換前量的；`NRestarts` 在重新開機（或 root 執行 `reset-failed`）後從 0
+    /// 起算。**先判斷接續之前有沒有崩潰重啟過**（有 → `Err`，回滾），沒有任何證據時才決定之後的基準——
+    /// 基準只會維持或降低，不會因為重設而漏掉接續之前的崩潰。`systemctl show` 失敗時沿用紀錄的基準
+    /// （健康確認自己會處理讀不到狀態的情況）
+    fn resume_crash_baseline(&mut self, rec: &Record) -> Result<u64, String> {
+        let Ok(state) = self.sys.service_state() else {
+            return Ok(rec.n_restarts_before);
+        };
+        let (cur, before) = (state.n_restarts, rec.n_restarts_before);
+        let rebooted = match (rec.boot_id.as_deref(), self.sys.boot_id()) {
+            (Some(then), Some(now)) => then != now,
+            // 紀錄沒有 boot_id（0.10.0 的輔助程式寫的）或現在讀不到：無法判斷，依計數本身
+            _ => false,
+        };
+        if rebooted {
+            // 開機後的自動重啟都發生在替換之後
+            return if cur > 0 {
+                Err(format!("crash_restart (NRestarts 0 → {cur} after reboot)"))
+            } else {
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "替換之後主機重新開機過：崩潰偵測的基準由 {before} 改為 0（NRestarts 在開機後重新起算）"
+                    ),
+                );
+                Ok(0)
+            };
+        }
+        if cur > before {
+            return Err(format!("crash_restart (NRestarts {before} → {cur})"));
+        }
+        if cur < before {
+            // 計數比替換前小：替換之後被重設過（重新開機而無法以 boot_id 判斷，或 reset-failed）
+            return if cur > 0 {
+                Err(format!(
+                    "crash_restart (NRestarts {before} → reset → {cur})"
+                ))
+            } else {
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "NRestarts 比替換前小（{before} → 0，計數被重設過）：崩潰偵測的基準改為 0"
+                    ),
+                );
+                Ok(0)
+            };
+        }
+        Ok(before)
+    }
+
+    /// 步驟 5：健康確認；失敗則回滾。`resumed`：這是接續上次中斷的 `replaced`（不是這次執行剛替換完）——
+    /// 接續時至少有 [`RESUME_GRACE`] 做與正常流程相同的檢查（0.10.0 在期限已過時不檢查、直接回滾），崩潰
+    /// 偵測的基準也重新判斷（[`Helper::resume_crash_baseline`]）
+    fn after_replace(&mut self, mut rec: Record, resumed: bool) -> UpgradeResult {
         if !rec.legacy && self.sha(&self.paths.binary()) != rec.new_binary_sha256 {
             self.log.line(
                 "WARN",
@@ -1812,7 +1870,40 @@ impl<'a> Helper<'a> {
         let now = self.sys.now_unix();
         let remaining = Duration::from_secs(u64::try_from(rec.deadline_unix - now).unwrap_or(0));
         let target = self.req.target.version.clone();
-        let check = if remaining.is_zero() {
+        let check = if resumed {
+            match self.resume_crash_baseline(&rec) {
+                Err(reason) => Err(reason),
+                Ok(baseline) => {
+                    // 上次在送出重新啟動之前中斷：現在補送（主機沒有重新開機時服務仍是替換前啟動的行程）
+                    if !rec.service_restarted {
+                        self.log
+                            .line("INFO", "上次還沒有重新啟動 pulse.service：現在重新啟動");
+                        self.restart(&mut rec);
+                    }
+                    let window = if remaining < RESUME_GRACE {
+                        self.log.line(
+                            "INFO",
+                            &format!(
+                                "健康確認的期限{}：仍以 {} 秒做與正常流程相同的健康確認，通過才算成功、不通過才回滾",
+                                if remaining.is_zero() {
+                                    format!("已過（{} 秒前）", now.saturating_sub(rec.deadline_unix))
+                                } else {
+                                    format!("只剩 {} 秒", remaining.as_secs())
+                                },
+                                RESUME_GRACE.as_secs()
+                            ),
+                        );
+                        RESUME_GRACE
+                    } else {
+                        remaining
+                    };
+                    // 紀錄本身不改寫（期限、基準都是替換當時的事實；每次接續重新計算）
+                    let mut probe = rec.clone();
+                    probe.n_restarts_before = baseline;
+                    self.health(&target, &probe, window)
+                }
+            }
+        } else if remaining.is_zero() {
             Err("health_timeout".to_string())
         } else {
             self.health(&target, &rec, remaining)
@@ -2321,6 +2412,13 @@ fn service_ids() -> Option<(u32, u32)> {
 impl System for RealSystem {
     fn mono(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     fn now_unix(&self) -> i64 {

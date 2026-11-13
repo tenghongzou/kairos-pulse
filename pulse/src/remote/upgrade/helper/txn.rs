@@ -179,6 +179,11 @@ pub struct Record {
     pub n_restarts_before: u64,
     #[serde(default)]
     pub restarted_unix: i64,
+    /// 寫入 `replaced` 時這次開機的識別（0.10.1；`/proc/sys/kernel/random/boot_id`，讀不到時 `None`）。
+    /// 接續 `replaced` 時與目前的值比較：不同＝替換之後重新開機過，`NRestarts` 已從 0 起算（REMOTE.md
+    /// 第 17.9.3 節）。0.10.0 的輔助程式寫的紀錄沒有這個欄位；不屬於綁定欄位
+    #[serde(default)]
+    pub boot_id: Option<String>,
     /// 這個步驟（`replaced`／`rolling_back`）的 `systemctl restart` 已經送出。接續時還是 `false` 就再送
     /// 一次：輔助程式可能只是自己被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機，此時服務仍是
     /// 替換前啟動的那個行程
@@ -228,6 +233,7 @@ impl Record {
             deadline_unix: 0,
             n_restarts_before: 0,
             restarted_unix: 0,
+            boot_id: None,
             service_restarted: false,
             rollback_intent: None,
             notes: Vec::new(),

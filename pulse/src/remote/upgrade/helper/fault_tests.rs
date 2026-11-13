@@ -509,6 +509,72 @@ fn the_matrix_covers_every_row_of_the_crash_point_table() {
     }
 }
 
+/// 對照表第 13、14 列，**健康確認的期限已過才接續**（0.10.1；REMOTE.md 第 17.9.3 節「接續 `replaced` 時的
+/// 健康確認」）：不再直接回滾——健康 → `succeeded`；不健康（連不上 Kairos）→ 確認窗結束後回滾。每一種安裝
+/// 方式各跑一次
+#[test]
+fn rows_13_and_14_resumed_after_the_deadline_check_health_before_rolling_back() {
+    let mut cases = 0;
+    for kind in [Kind::Tar, Kind::Deb, Kind::DebNoRollback, Kind::Rpm] {
+        for p in POINTS.iter().filter(|p| p.row == 13 || p.row == 14) {
+            for healthy in [true, false] {
+                let label = format!(
+                    "{kind:?}／第 {} 列 {}／期限已過／新版{}",
+                    p.row,
+                    p.name,
+                    if healthy { "健康" } else { "連不上" }
+                );
+                let mut env = setup(
+                    &format!("fm-late-{kind:?}-{}-{healthy}", p.name),
+                    kind.method(),
+                );
+                if kind.rollback_package() {
+                    stage_rollback(&env, "0.9.0");
+                }
+                let fake = Fake::new(&env.root);
+                apply_until(&env.paths, &fake, p.name);
+                fake.assert_invariants();
+                crash_state(&env, &fake, kind, p, &label);
+                env.helper_is_installed();
+                let _ = std::fs::remove_dir_all(env.staging());
+                // 一天之後才開機（health_timeout_secs 是 600）
+                let after = fake.reboot_after(86_400);
+                if !healthy {
+                    after.set("0.9.1", Behavior::NoConnect);
+                }
+                let r = apply(&env.paths, &after).unwrap();
+                after.assert_invariants();
+                if healthy {
+                    final_state(&env, &after, kind, p, false, &r, &label);
+                } else {
+                    assert_eq!(
+                        (r.state.as_str(), r.code.as_deref()),
+                        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+                        "{label}: {r:?}"
+                    );
+                    assert!(
+                        r.detail.starts_with("health_timeout (not_registered"),
+                        "{label}: {}",
+                        r.detail
+                    );
+                    assert_eq!(env.installed(), "0.9.0", "{label}: 回滾換回的是舊版");
+                    assert_eq!(env.prev(), "0.9.0", "{label}: pulse.prev");
+                    assert_eq!(&env.result(), &r, "{label}: result.json");
+                }
+                assert!(!env.active(), "{label}: 指標已清除");
+                assert!(
+                    !after.calls().iter().any(|c| c == "tar" || c == "extract"),
+                    "{label}: 接續時不重新解開發佈檔：{:?}",
+                    after.calls()
+                );
+                env.cleanup();
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 16);
+}
+
 /// 中斷兩次（替換後、還原後）仍然回到舊版
 #[test]
 fn two_crashes_in_one_transaction_still_end_with_the_old_version() {
