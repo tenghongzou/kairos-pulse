@@ -608,6 +608,91 @@ fn silences_suppress_notifications_but_not_records_and_never_system_events_by_ho
     );
 }
 
+/// 0.10.1（H1）：「雙人覆核已關閉」不可靜音、不可停用。資料庫裡那一列是舊版寫入的樣子
+/// （`params` 為 `{}`）、已經被停用、又有一筆明確選取它的臨時靜音時，事件照常開、照常通知。
+#[test]
+fn rollout_approval_disabled_ignores_silences_and_a_disabled_row() {
+    let now = T0;
+    let silence = Silence {
+        silence_id: "s-pre".into(),
+        kind: SilenceKind::Silence,
+        name: "預先靜音".into(),
+        scope: Scope::default(),
+        rules: vec![
+            ids::ROLLOUT_APPROVAL_DISABLED.into(),
+            ids::CRL_EXPIRING.into(),
+        ],
+        starts_at: now - MIN,
+        ends_at: now + 60 * MIN,
+        reason: "r".into(),
+        notify_on_end: true,
+        exclude_uptime: false,
+        from_event: None,
+        created_at: now,
+        created_by: "t".into(),
+        updated_at: now,
+        updated_by: "t".into(),
+        ended_at: None,
+        ended_by: None,
+        end_reason: None,
+        end_notified: false,
+    };
+    let old_rows = || -> Vec<Rule> {
+        rules_with_channels()
+            .into_iter()
+            .map(|mut r| {
+                if r.rule_id == ids::ROLLOUT_APPROVAL_DISABLED {
+                    r.params = json!({});
+                    r.enabled = false;
+                    r.disabled_reason = Some("先關掉".into());
+                }
+                r
+            })
+            .collect()
+    };
+    let cond = |rule: &'static str, subject: &str| SystemCondition {
+        rule_id: rule,
+        subject: subject.into(),
+        severity: Severity::Warning,
+        title: "t".into(),
+        code: None,
+        details: json!({}),
+    };
+    let w = |t: i64| World {
+        now_ms: t,
+        conditions: vec![
+            cond(ids::ROLLOUT_APPROVAL_DISABLED, "remote"),
+            cond(ids::CRL_EXPIRING, "crl:x:0"),
+        ],
+        checked: vec![ids::CRL_EXPIRING],
+        ..World::default()
+    };
+    // 啟動時載入（Engine::new）
+    let mut e = engine_with(old_rows(), vec![silence.clone()], &[], true);
+    e.tick(w(now));
+    let ev = by_rule(&e, ids::ROLLOUT_APPROVAL_DISABLED);
+    assert_eq!(ev.len(), 1, "被停用的列照常判定");
+    assert!(!ev[0].silenced, "明確選取它的靜音不生效");
+    assert!(
+        by_rule(&e, ids::CRL_EXPIRING)[0].silenced,
+        "同一筆靜音對其他系統規則照常生效"
+    );
+    let out = e.take_output();
+    assert!(
+        out.deliveries
+            .iter()
+            .any(|d| d.kind == "firing" && d.event_id.as_deref() == Some(&ev[0].event_id)),
+        "照常通知"
+    );
+    // 執行期間重新載入（set_rules）：資料庫那一列又被停用，事件不會因此轉為已恢復
+    e.set_rules(old_rows(), now + MIN);
+    e.tick(w(now + 2 * MIN));
+    let again = by_rule(&e, ids::ROLLOUT_APPROVAL_DISABLED);
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].event_id, ev[0].event_id, "仍是同一筆進行中的事件");
+    assert!(!again[0].silenced);
+}
+
 #[test]
 fn system_condition_escalates_the_same_event_and_recovers() {
     let mut e = engine();

@@ -129,6 +129,10 @@ export function render(ctx) {
   function switchFor(r) {
     const label = t('alerts.rules.switchAria', { name: r.name });
     if (!canWrite) return h('span', null, r.enabled ? t('alerts.rules.on') : t('alerts.rules.off'));
+    // 不可停用的系統規則（0.10.1：「雙人覆核已關閉」）：不是開關，只顯示狀態與原因（伺服器回 409 rule_always_enabled）
+    if (r.always_enabled) {
+      return h('span', { class: 'k-locked-on', dataset: { rule: r.rule_id, locked: 'true' } }, icon('lock'), h('span', null, t('alerts.rules.alwaysOn')));
+    }
     const b = h(
       'button',
       { type: 'button', role: 'switch', class: 'k-switch', 'aria-checked': r.enabled ? 'true' : 'false', 'aria-label': label, title: label, dataset: { rule: r.rule_id } },
@@ -275,6 +279,9 @@ export function render(ctx) {
                     h('a', { href: `/alerts/rules/${encodeURIComponent(r.rule_id)}` }, r.name),
                     r.builtin ? [' ', neutralBadge(t('alerts.rules.builtinTag'))] : null,
                     !r.enabled && r.disabled_reason ? h('span', { class: 'k-sub' }, t('alerts.rules.disabledBecause', { r: r.disabled_reason })) : null,
+                    r.always_enabled || r.unsilenceable
+                      ? h('span', { class: 'k-sub', dataset: { protected: r.rule_id } }, t(r.always_enabled ? 'alerts.rules.protectedBoth' : 'alerts.rules.protectedSilence'))
+                      : null,
                   ),
                   h('td', null, kindLabel(r.kind)),
                   h('td', null, sevCell(r)),

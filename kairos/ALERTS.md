@@ -106,6 +106,18 @@ subnet_prefix_v6 = 64
 
 不可刪除，停用必須填原因；可調整通知管道與通知設定，條件（`params` 中既有的數值）只有 `admin` 範圍能改，系統類規則的嚴重度不可低於預設。依剩餘天數升級的規則（CRL、伺服器憑證、連線數）是**同一事件逐級升級**，升級時通知一次。
 
+**受保護的系統規則**（由程式碼決定，`src/alerts/rules.rs` 的 `UNSILENCEABLE`、`ALWAYS_ENABLED`；API 的 `unsilenceable`、`always_enabled`）：
+
+| 規則 | 不可靜音 | 不可停用 |
+|---|---|---|
+| `sys.unauthenticated`（未認證連線已允許） | 是 | 否 |
+| `sys.rollout_approval_disabled`（雙人覆核已關閉；0.10.1 起） | 是 | 是 |
+
+- **不可靜音**：事件不受任何靜音影響——包含明確選取它的臨時靜音，以及升級前就已經建立的靜音。建立或修改靜音時在 `rules` 選取它回 400 `rule_unsilenceable`（`details.rule_id`）；事件詳情的 `actions` 沒有 `silence`；主控台的靜音表單不能勾選。
+- **不可停用**：`POST /api/v1/alert-rules/{rule_id}/disable` 回 409 `rule_always_enabled`，並寫一筆稽核（`alert_rule.disable`、結果 `rejected`）；主控台的規則清單顯示「啟用（不可停用）」而不是開關。
+- **既有的資料庫列**：系統預設規則只在不存在時寫入，升級上來的環境裡這些列是舊版的內容（`params` 沒有 `unsilenceable`，也可能已經被停用）。所以保護不依賴那一列：(1) 啟動時 `ensure_builtin_rules` 把受保護的列同步成程式碼規定的樣子（重新啟用、清掉停用原因、補上 `params.unsilenceable`；不需要資料庫遷移）；(2) 引擎載入規則時（啟動與每次重新載入）再套一次，資料庫在執行期間被直接改掉也照常判定、照常通知。
+- 仍然可以調整的：通知管道與通知設定（沒有接管道就不會推播，事件照常記錄）、把嚴重度調高。事件本身可以確認、暫停重送、解決，這些動作各自留在稽核紀錄。
+
 | 規則 ID | 名稱 | 預設條件 | 等級 | 代碼 | 資料來源 |
 |---|---|---|---|---|---|
 | `sys.host_offline` | 主機離線 | 離線持續 ≥ `grace_secs`（180） | 嚴重 | — | 狀態表 |
@@ -139,7 +151,7 @@ subnet_prefix_v6 = 64
 | `sys.rollout_paused` | 升級推送已暫停（0.9） | 升級推送因失敗比例超過上限、主機回滾失敗或發佈簽章驗證失敗而自動暫停（手動暫停不開）；推送繼續或取消時恢復（REMOTE.md 第 4.7.4 節） | 警告（回滾失敗、簽章失敗為嚴重） | `KRS-W8414` | 匯流排（`remote_condition`，遠端管理服務每 5 秒調和） |
 | `sys.upgrade_rollback_failed` | 升級回滾失敗（0.9） | 主機升級後回滾也失敗，需要人工處理；對象為主機；標記為已處理或重試時恢復 | 嚴重 | `KRS-E8408` | 匯流排（`remote_condition`） |
 | `sys.release_signature_failed` | 發佈簽章驗證失敗（0.9） | 主機驗證發佈包的簽章失敗（`PLS-E8401`），使用同一版本的推送已暫停；對象為目標版本；推送繼續或取消時恢復 | 嚴重 | `KRS-E8401` | 匯流排（`remote_condition`） |
-| `sys.rollout_approval_disabled` | 雙人覆核已關閉（0.10） | Kairos 啟動時發現 `[remote] rollout_approval` 由 `required` 改為 `none`（與資料庫記錄的上一次設定不同；REMOTE.md 第 5.4 節、ADR-0002 決策點 2i）：送出的推送不再需要另一位管理員核准。對象為 `remote`；改回 `required` 並重新啟動後恢復，**不會自己結束**。預設推播——啟用雙人覆核的單位請把這條規則接到通知管道 | 警告 | —（尚未分配） | 匯流排（`remote_condition`） |
+| `sys.rollout_approval_disabled` | 雙人覆核已關閉（0.10） | Kairos 啟動時發現 `[remote] rollout_approval` 由 `required` 改為 `none`（與資料庫記錄的上一次設定不同；REMOTE.md 第 5.4 節、ADR-0002 決策點 2i）：送出的推送不再需要另一位管理員核准。對象為 `remote`；改回 `required` 並重新啟動後恢復，**不會自己結束**。0.10.1 起**不可靜音、不可停用**（上述「受保護的系統規則」）。預設推播——啟用雙人覆核的單位請把這條規則接到通知管道 | 警告 | —（尚未分配） | 匯流排（`remote_condition`） |
 | `sys.restarted`、`sys.downtime` | 第 5.2 節 | | 資訊（非預期：嚴重）、嚴重 | — | 心跳 |
 
 **使用者規則**（S09，`POST /api/v1/alert-rules`）：`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`（`>`、`>=`、`<`、`<=`，持續 `for_secs`，可設恢復門檻與恢復持續時間——恢復門檻不可在觸發門檻的另一側，`KRS-E5001`）、`identity_conflict`。範圍為標籤、網段、主機（同欄位「或」、跨欄位「且」）。

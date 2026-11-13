@@ -37,6 +37,8 @@
 .k-switch { all: unset; display: inline-flex; align-items: center; gap: var(--ds-space-200); cursor: pointer; min-height: var(--ds-size-target-min); border-radius: var(--ds-radius-sm); }
 .k-switch:focus-visible { outline: var(--ds-focus-ring); outline-offset: 2px; }
 .k-switch:disabled { cursor: progress; opacity: 0.6; }
+/* 不可停用的系統規則：不是開關，只有狀態（鎖頭＋文字） */
+.k-locked-on { display: inline-flex; align-items: center; gap: var(--ds-space-100); min-height: var(--ds-size-target-min); color: var(--ds-color-text-secondary); white-space: nowrap; }
 .k-switch__track { position: relative; width: 36px; height: 20px; border-radius: var(--ds-radius-full); background: var(--ds-color-bg-subtle); border: var(--ds-border-width) solid var(--ds-color-border-control); flex: none; }
 .k-switch__thumb { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: var(--ds-radius-full); background: var(--ds-color-text-secondary); transition: left var(--ds-duration-fast) var(--ds-easing-standard); }
 .k-switch[aria-checked="true"] .k-switch__track { background: var(--ds-color-accent); border-color: var(--ds-color-accent); }

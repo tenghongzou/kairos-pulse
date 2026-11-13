@@ -99,6 +99,43 @@ fn alerts(db: &TestDb) -> String {
     let builtins = log!(out, "builtins", s.ensure_builtin_rules(T0).unwrap());
     assert!(builtins > 0);
     assert_eq!(s.ensure_builtin_rules(T0 + 1).unwrap(), 0);
+    // 受保護的系統規則（0.10.1 H1）：舊版寫入的列（params 為 {}、已被停用）在啟動的同步時修正；
+    // 其他系統規則被停用的狀態不動
+    {
+        use crate::alerts::rules::ids;
+        let mut old = s.get_rule(ids::ROLLOUT_APPROVAL_DISABLED).unwrap().unwrap();
+        assert_eq!(old.params["unsilenceable"], true, "新安裝的列");
+        old.params = json!({});
+        old.enabled = false;
+        old.disabled_reason = Some("先關掉".into());
+        s.save_rule(&old).unwrap();
+        let mut other = s.get_rule(ids::ROLLOUT_PAUSED).unwrap().unwrap();
+        other.enabled = false;
+        other.disabled_reason = Some("太吵".into());
+        s.save_rule(&other).unwrap();
+        let rev = s.config_rev().unwrap();
+        assert_eq!(s.ensure_builtin_rules(T0 + 2).unwrap(), 0);
+        let fixed = s.get_rule(ids::ROLLOUT_APPROVAL_DISABLED).unwrap().unwrap();
+        assert!(fixed.enabled);
+        assert_eq!(fixed.disabled_reason, None);
+        assert_eq!(fixed.params, json!({"unsilenceable": true}));
+        assert_eq!(
+            (fixed.updated_at, fixed.updated_by.as_str()),
+            (T0 + 2, "system")
+        );
+        assert!(s.config_rev().unwrap() > rev, "引擎會重新載入");
+        let other = s.get_rule(ids::ROLLOUT_PAUSED).unwrap().unwrap();
+        assert!(!other.enabled);
+        // 已經正確：不再寫入
+        let rev = s.config_rev().unwrap();
+        assert_eq!(s.ensure_builtin_rules(T0 + 3).unwrap(), 0);
+        assert_eq!(s.config_rev().unwrap(), rev);
+        // 還原（之後的檢查不受影響）
+        let mut other = s.get_rule(ids::ROLLOUT_PAUSED).unwrap().unwrap();
+        other.enabled = true;
+        other.disabled_reason = None;
+        s.save_rule(&other).unwrap();
+    }
     s.save_rule(&rule("r-cpu", &["ch-1"])).unwrap();
     s.save_rule(&rule("r-mem", &[])).unwrap();
     let mut changed = rule("r-cpu", &["ch-1", "ch-2"]);

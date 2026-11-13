@@ -569,9 +569,88 @@ async fn alerts_end_to_end_over_https() {
     )
     .await;
     assert_eq!(r.json()["data"]["enabled"], false);
+    // 0.10.1（H1）：「雙人覆核已關閉」不可停用（409）、不可靜音（400）；嘗試停用留在稽核紀錄
+    for who in [&operate, &admin] {
+        let r = call(
+            addr,
+            "POST",
+            "/api/v1/alert-rules/sys.rollout_approval_disabled/disable",
+            Some(who),
+            Some(&json!({ "reason": "不想看到" })),
+        )
+        .await;
+        assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["error"]["code"], "rule_always_enabled");
+    }
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/alert-rules/sys.rollout_approval_disabled/enable",
+        Some(&operate),
+        Some(&json!({})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "啟用是冪等的");
+    assert_eq!(r.json()["data"]["enabled"], true);
+    let rejected: i64 = f
+        .admin()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE category = 'alerts' AND action = 'alert_rule.disable' AND object = 'sys.rollout_approval_disabled' AND result = 'rejected'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected, 2);
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/silences",
+        Some(&operate),
+        Some(&json!({
+            "kind": "silence", "name": "預先靜音", "reason": "測試",
+            "rules": ["sys.rollout_approval_disabled"], "duration_secs": 600,
+        })),
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["error"]["code"], "rule_unsilenceable");
+    assert_eq!(
+        r.json()["error"]["details"]["rule_id"],
+        "sys.rollout_approval_disabled"
+    );
+    // 條件（params）沒有可調整的項目：不能藉由修改規則拿掉 unsilenceable
+    let r = call(
+        addr,
+        "PUT",
+        "/api/v1/alert-rules/sys.rollout_approval_disabled",
+        Some(&admin),
+        Some(&json!({ "params": { "unsilenceable": false } })),
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
     let r = call(addr, "GET", "/api/v1/alert-rules", Some(&auditor), None).await;
     let rules = r.json()["data"].as_array().unwrap().clone();
     assert!(rules.len() >= 31);
+    let locked = rules
+        .iter()
+        .find(|x| x["rule_id"] == "sys.rollout_approval_disabled")
+        .unwrap();
+    assert_eq!(
+        (
+            &locked["enabled"],
+            &locked["always_enabled"],
+            &locked["unsilenceable"]
+        ),
+        (&json!(true), &json!(true), &json!(true))
+    );
+    let un = rules
+        .iter()
+        .find(|x| x["rule_id"] == "sys.unauthenticated")
+        .unwrap();
+    assert_eq!(
+        (&un["always_enabled"], &un["unsilenceable"]),
+        (&json!(false), &json!(true))
+    );
     let ho = rules
         .iter()
         .find(|x| x["rule_id"] == "sys.host_offline")

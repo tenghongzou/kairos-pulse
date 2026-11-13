@@ -1313,6 +1313,8 @@ retention_days = 1095           # 稽核紀錄保留天數，90..=36500（獨立
 | 409 | `invalid_state` | — | 事件已解決（只能新增註解）、已結束的靜音不能修改 |
 | 409 | `not_acknowledgeable` | — | 規劃提醒與紀錄不需要確認、暫停通知、解決（`alerts-ux.md` §2.3） |
 | 409 | `builtin_rule` | — | 系統預設規則不可刪除 |
+| 409 | `rule_always_enabled` | — | 停用不可停用的系統規則（0.10.1：`sys.rollout_approval_disabled`；ALERTS.md 第 5.3 節）。另寫一筆稽核 `alert_rule.disable`、結果 `rejected` |
+| 400 | `rule_unsilenceable` | — | 建立或修改靜音時在 `rules` 選取不可靜音的系統規則（0.10.1：`sys.unauthenticated`、`sys.rollout_approval_disabled`；`details.rule_id`） |
 | 503 | `alerts_unavailable` | — | 告警引擎沒有啟動 |
 
 ### 13.2 事件（S06、S07）
@@ -1346,7 +1348,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 ### 13.3 規則（S08、S09）
 
-`GET /api/v1/alert-rules`（篩選 `kind`、`category`、`severity`、`enabled`）：每條規則另有 `max_severity`（依天數升級者為最高等級）、`attention`、`scope_text`、`notify_effective`（套用嚴重度預設後的重送、恢復、升級）、`fires_7d`、`noise_7d`（7 天內 10 分鐘內自行恢復且未確認的比例）、`noisy`（> 50% 且至少 5 次）。
+`GET /api/v1/alert-rules`（篩選 `kind`、`category`、`severity`、`enabled`）：每條規則另有 `max_severity`（依天數升級者為最高等級）、`attention`、`scope_text`、`notify_effective`（套用嚴重度預設後的重送、恢復、升級）、`fires_7d`、`noise_7d`（7 天內 10 分鐘內自行恢復且未確認的比例）、`noisy`（> 50% 且至少 5 次）。0.10.1 起另有 `unsilenceable`（事件不受靜音影響）與 `always_enabled`（不可停用；`…/disable` 回 409 `rule_always_enabled`）兩個布林值，由程式碼決定、不可修改（ALERTS.md 第 5.3 節）。
 
 `POST /api/v1/alert-rules`：`kind`（`host_offline`、`host_long_offline`、`report_stale`、`metric_threshold`、`identity_conflict`）、`name`、`severity`、`params`（`metric_threshold`：`metric`〔`cpu`／`memory`〕、`op`、`threshold`〔0～100〕、`for_secs`、`clear_threshold`、`clear_for_secs`）、`scope`（`tags`、`subnets`、`hosts`）、`channels`、`notify`（`repeat_interval_secs`、`repeat_max`、`notify_recovery`、`escalate_after_secs`、`escalate_channels`）、`description`、`enabled`。回 201。
 

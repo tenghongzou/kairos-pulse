@@ -357,6 +357,9 @@ impl Engine {
             e.events.insert(ev.event_id.clone(), ev);
         }
         e.rules = loaded.rules;
+        for r in &mut e.rules {
+            super::rules::enforce_protected(r);
+        }
         e.recompile();
         e
     }
@@ -374,7 +377,11 @@ impl Engine {
     }
 
     /// 換掉規則；停用的規則的進行中事件轉為已恢復（不再判定）
-    pub fn set_rules(&mut self, rules: Vec<Rule>, now: i64) {
+    pub fn set_rules(&mut self, mut rules: Vec<Rule>, now: i64) {
+        // 不可停用的系統規則：資料庫那一列被停用也照常判定（rules::enforce_protected）
+        for r in &mut rules {
+            super::rules::enforce_protected(r);
+        }
         let disabled: Vec<String> = rules
             .iter()
             .filter(|r| !r.enabled)
@@ -955,11 +962,15 @@ impl Engine {
 
     /// 事件符合的靜音（`None`：沒有）；回傳（是否靜音, 是否在維護時段內）
     pub(super) fn silence_match(&self, ev: &Event, now: i64) -> (bool, bool, Vec<String>) {
-        let unsilenceable = self
-            .rules
-            .iter()
-            .find(|r| r.rule_id == ev.rule_id)
-            .is_some_and(|r| r.params.get("unsilenceable").and_then(Value::as_bool) == Some(true));
+        // 不可靜音的系統規則由程式碼決定（rules::is_unsilenceable），不只看資料庫那一列的 params
+        let unsilenceable = super::rules::is_unsilenceable(&ev.rule_id)
+            || self
+                .rules
+                .iter()
+                .find(|r| r.rule_id == ev.rule_id)
+                .is_some_and(|r| {
+                    r.params.get("unsilenceable").and_then(Value::as_bool) == Some(true)
+                });
         if unsilenceable || !self.silences.iter().any(|(s, _)| s.is_active(now)) {
             return (false, false, Vec::new());
         }

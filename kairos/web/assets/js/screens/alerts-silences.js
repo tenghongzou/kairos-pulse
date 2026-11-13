@@ -255,6 +255,9 @@ export function render(ctx) {
     let kind = s ? s.kind : pre.kind || 'maintenance';
     const scope = s ? s.scope : { tags: [], subnets: pre.subnets || [], hosts: (pre.hosts || []).map((x) => x.agent_id) };
     const selectedRules = new Set(s ? s.rules : pre.rules || []);
+    // 不可靜音的系統規則（API 的 unsilenceable）：不能勾選；從事件帶進來的預選也拿掉（伺服器回 400 rule_unsilenceable）
+    const unsilenceable = new Set((rules || []).filter((r) => r.unsilenceable).map((r) => r.rule_id));
+    if (isNew) for (const id of unsilenceable) selectedRules.delete(id);
     let preview = null;
 
     const nameIn = input({ name: 'name', value: s ? s.name : pre.name || '', maxlength: 100 });
@@ -294,8 +297,9 @@ export function render(ctx) {
             h(
               'label',
               { class: 'ds-checkbox' },
-              h('input', { type: 'checkbox', name: 'rules', value: r.rule_id, checked: selectedRules.has(r.rule_id), disabled: ro, on: { change: (ev) => { if (ev.target.checked) selectedRules.add(r.rule_id); else selectedRules.delete(r.rule_id); refresh(); } } }),
+              h('input', { type: 'checkbox', name: 'rules', value: r.rule_id, checked: selectedRules.has(r.rule_id), disabled: ro || (r.unsilenceable && !selectedRules.has(r.rule_id)), on: { change: (ev) => { if (ev.target.checked) selectedRules.add(r.rule_id); else selectedRules.delete(r.rule_id); refresh(); } } }),
               r.name,
+              r.unsilenceable ? h('span', { class: 'caption' }, t('alerts.sl.f.ruleUnsilenceable')) : null,
               r.severity === 'emergency' || r.max_severity === 'emergency' ? h('span', { class: 'caption' }, t('alerts.sl.f.ruleEmergency')) : null,
               r.category === 'system' ? h('span', { class: 'caption' }, t('alerts.sl.f.ruleSystem')) : null,
             ),

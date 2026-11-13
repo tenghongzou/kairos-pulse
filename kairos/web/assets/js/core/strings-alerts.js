@@ -390,6 +390,11 @@ export const ALERT_STRINGS = {
   'alerts.rules.builtinTag': '系統預設',
   'alerts.rules.disabledBecause': '停用原因：{r}',
   'alerts.rules.switchAria': '啟用規則 {name}',
+  // 不可停用、不可靜音的系統規則（0.10.1；API 的 always_enabled、unsilenceable）。設計包尚未收錄，文案為工程暫行〔0.10.1 暫行〕
+  'alerts.rules.alwaysOn': '啟用（不可停用）',
+  'alerts.rules.protectedBoth': '不可停用、不可靜音',
+  'alerts.rules.protectedSilence': '不可靜音',
+  'alerts.sl.f.ruleUnsilenceable': '（不可靜音）',
   'alerts.rules.enabledToast': '已啟用「{name}」',
   'alerts.rules.disabledToast': '已停用「{name}」',
   'alerts.rules.disabledDesc': '這條規則進行中的事件會轉為已恢復。',
