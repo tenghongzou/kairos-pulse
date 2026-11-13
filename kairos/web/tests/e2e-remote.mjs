@@ -283,7 +283,8 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await schRow.getByText('已排程').first().waitFor();
     await schRow.getByText(/已排程，.* 開始/).waitFor();
     const schBadge = schRow.locator('[data-approval="not_required"]');
-    await schBadge.getByText('未經核准').waitFor();
+    await schBadge.waitFor();
+    assert.equal((await schBadge.textContent()).trim(), '未經核准');
     assert.match(await schBadge.getAttribute('class'), /ds-status-badge--neutral/);
     await axe(page, 'F8 S26 推送清單（已排程）');
     await page.goto(`${URL0}/pulse/rollouts/${schId}`);
@@ -292,7 +293,11 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await schNote.getByText('這個推送沒有經過另一位管理員核准，到排程的時間就會開始').waitFor();
     assert.equal(await schNote.getAttribute('data-emphasis'), 'info');
     await schNote.getByText(/送出時雙人覆核是關閉的/).waitFor();
-    await page.locator('#rollout-approval[data-approval="not_required"]').getByText('未經核准（送出時雙人覆核為關閉）').waitFor();
+    const schApproval = page.locator('#rollout-approval[data-approval="not_required"]');
+    await schApproval.waitFor();
+    assert.equal((await schApproval.textContent()).trim(), '未經核准（送出時雙人覆核為關閉）');
+    // 頁首的標記（中性）
+    assert.match(await page.locator('.k-page-head__meta [data-approval="not_required"]').getAttribute('class'), /ds-status-badge--neutral/);
     await page.getByText(/已排程：.* 開始升級。對象已在送出時固定/).waitFor();
     await page.locator('#rollout-schedule').getByText(/升級時段：週六、週日 23:00～03:00（時區 /).waitFor();
     // 三批：先行批次、第 2 批、其餘

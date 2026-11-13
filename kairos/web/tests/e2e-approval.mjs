@@ -750,7 +750,10 @@ export function registerApproval({ test, newPage, waitTitle, axe, shot, FakeAgen
     await ca.page.goto(`${BASE}/pulse/rollouts`);
     await waitTitle(ca.page, '升級推送');
     const row2 = ca.page.locator(`tr[data-rollout="${id2}"]`);
-    await row2.locator('[data-approval="not_required"]').getByText('未經核准').waitFor();
+    const badge2 = row2.locator('[data-approval="not_required"]');
+    await badge2.waitFor();
+    assert.equal((await badge2.textContent()).trim(), '未經核准');
+    assert.match(await badge2.getAttribute('class'), /ds-status-badge--neutral/);
     assert.equal(await ca.page.locator(`tr[data-rollout="${id}"] [data-approval]`).count(), 0, '核准過的推送沒有標記');
     await axe(ca.page, '政策 S26 清單（未經核准的推送）');
     await dark(ca.page, '政策 S26 清單（未經核准的推送）');
@@ -768,7 +771,8 @@ export function registerApproval({ test, newPage, waitTitle, axe, shot, FakeAgen
     await restartKairos('required', 'none');
     const cb = await session('carol', '/pulse/rollouts', '升級推送');
     const warnBadge = cb.page.locator(`tr[data-rollout="${id2}"] [data-approval="not_required"]`);
-    await warnBadge.getByText('未經核准').waitFor();
+    await warnBadge.waitFor();
+    assert.equal((await warnBadge.textContent()).trim(), '未經核准');
     assert.match(await warnBadge.getAttribute('class'), /ds-status-badge--warning/);
     await axe(cb.page, '政策 S26 清單（未經核准的推送，目前要求覆核）');
     await dark(cb.page, '政策 S26 清單（未經核准的推送，目前要求覆核）');
