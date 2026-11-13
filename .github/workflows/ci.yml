@@ -64,13 +64,15 @@ jobs:
         shell: bash
         run: |
           docker run -d --name kairos-test-pg             -e POSTGRES_USER=kairos -e POSTGRES_PASSWORD=kairos -e POSTGRES_DB=kairos             -p 127.0.0.1:55432:5432 postgres:14-alpine
+          # 以 TCP（-h 127.0.0.1）實際查詢來等待：映像檔初始化期間的暫時伺服器只聽 unix socket，
+          # 那時 pg_isready 已回報就緒，但資料庫 kairos 還沒建立、之後伺服器還會重新啟動一次
           for i in $(seq 1 60); do
-            if docker exec kairos-test-pg pg_isready -U kairos -d kairos >/dev/null 2>&1; then
+            if docker exec kairos-test-pg psql -h 127.0.0.1 -U kairos -d kairos -Atc 'select 1' >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
-          docker exec kairos-test-pg psql -U kairos -d kairos -Atc 'select version()'
+          docker exec kairos-test-pg psql -h 127.0.0.1 -U kairos -d kairos -Atc 'select version()'
           # 設定後 PostgreSQL 的測試不可略過：連不上就失敗（KAIROS_TEST_PG_REQUIRED）
           echo "KAIROS_TEST_PG_URL=postgres://kairos:kairos@127.0.0.1:55432/kairos" >> "$GITHUB_ENV"
           echo "KAIROS_TEST_PG_REQUIRED=1" >> "$GITHUB_ENV"
