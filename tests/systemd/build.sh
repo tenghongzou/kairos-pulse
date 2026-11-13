@@ -19,6 +19,8 @@
 #                  crash-rollback）。**測試用建置**：`pulse --version` 結尾有 [fault-injection]，打包腳本確認
 #                  執行檔含故障注入的標記；其他版本（含 <V0>）都是正式的建置，打包腳本確認它們不含
 #   <N>-test.7     同 test.2（崩潰），版本高於 test.6（crash-rollback 的目標；不需要 fault-injection）
+#   <N>-test.8     同 test.1，只改版本號，版本高於 test.7（late-resume 的目標：健康確認的期限已過才接續 →
+#                  升級成功；正式的建置，接續的輔助程式就是它）
 #   evil-a         test.1 的檔案，SHA256SUMS 改以「沒有人信任」的金鑰 evil-a 簽章（Kairos 匯入時拒絕）
 #   <N>-test.9     test.1 的檔案改名為 test.9，以 evil-b 簽章：Kairos 的信任錨有 evil-b（匯入成功），
 #                  Pulse 的信任錨沒有（Pulse 拒絕，PLS-E8401）
@@ -160,10 +162,11 @@ build_pulse "$NEXT_VERSION-test.4" "$NEXT_VERSION-test.4" 1
 build_pulse "$NEXT_VERSION-test.5" "$NEXT_VERSION-test.5" 0 fault-injection
 build_pulse "$NEXT_VERSION-test.6" "$NEXT_VERSION-test.6" 0 fault-injection
 build_pulse "$NEXT_VERSION-test.7" "$NEXT_VERSION-test.7" 1
+build_pulse "$NEXT_VERSION-test.8" "$NEXT_VERSION-test.8"
 
 # 正式的建置與測試用建置都以「要安裝的檔案」再確認一次（取出 tar.gz 內的執行檔）
 for d in "$BASE_VERSION" "$NEXT_VERSION-test.1" "$NEXT_VERSION-test.2" "$NEXT_VERSION-test.3" "$NEXT_VERSION-test.4" \
-    "$NEXT_VERSION-test.7"; do
+    "$NEXT_VERSION-test.7" "$NEXT_VERSION-test.8"; do
     sh "$REPO/packaging/check-release-binary.sh" --archive "$WORK/dist/$d"/pulse-*-linux-x86_64.tar.gz >/dev/null ||
         die "$d 應該是正式的建置，卻含測試用 feature 的程式"
 done
