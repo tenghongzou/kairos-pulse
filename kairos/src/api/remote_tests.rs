@@ -314,6 +314,7 @@ async fn remote_unavailable_when_disabled() {
         "/api/v1/config/profiles",
         "/api/v1/releases",
         "/api/v1/rollouts",
+        "/api/v1/rollouts/summary",
     ] {
         let r = call(f.addr(), "GET", path, Some(&admin), None).await;
         assert_eq!(r.status, 503, "{path}");
@@ -853,6 +854,89 @@ async fn releases_and_rollouts_over_https() {
     let list = body(&r);
     assert_eq!(list["meta"]["rollback_failed_unacknowledged"], 1);
     assert_eq!(list["data"][0]["rollback_failed_unacknowledged"], 1);
+    // 0.10.1（H3）：清單的進度由資料庫彙總——每一筆與詳情（從主機列計算）的數字相同，格式不變
+    //（15 個狀態都有鍵）；state 篩選下也一樣
+    let filtered = body(
+        &call(
+            addr,
+            "GET",
+            "/api/v1/rollouts?state=paused",
+            Some(&auditor),
+            None,
+        )
+        .await,
+    );
+    assert_eq!(filtered["data"], list["data"], "這時只有一個已暫停的推送");
+    for item in list["data"].as_array().unwrap() {
+        let rid = item["id"].as_str().unwrap();
+        let detail = body(
+            &call(
+                addr,
+                "GET",
+                &format!("/api/v1/rollouts/{rid}"),
+                Some(&auditor),
+                None,
+            )
+            .await,
+        )["data"]
+            .clone();
+        for key in [
+            "progress",
+            "hosts_total",
+            "rollback_failed_unacknowledged",
+            "next_action",
+            "state",
+            "approval",
+        ] {
+            assert_eq!(item[key], detail[key], "{rid} {key}");
+        }
+        assert_eq!(item["progress"].as_object().unwrap().len(), 15, "{rid}");
+        let total: i64 = item["progress"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.as_str() != "skipped")
+            .map(|(_, v)| v.as_i64().unwrap())
+            .sum();
+        assert_eq!(item["hosts_total"].as_i64(), Some(total), "{rid}");
+        assert!(item.get("waves").is_none(), "清單沒有詳情的欄位");
+    }
+    assert_eq!(list["data"][0]["progress"]["rollback_failed"], 1);
+    // 計數的輕量端點（SideNav 的泡泡）：與清單的 meta 相同，另有各狀態的推送數（七個狀態都有鍵）
+    for who in [&auditor, &op, &admin] {
+        let r = call(addr, "GET", "/api/v1/rollouts/summary", Some(who), None).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let s = body(&r)["data"].clone();
+        for (k, v) in list["meta"].as_object().unwrap() {
+            assert_eq!(&s[k], v, "{k}");
+        }
+        let states = s["states"].as_object().unwrap();
+        assert_eq!(states.len(), 7);
+        assert_eq!(states["paused"], 1);
+        assert_eq!(
+            states.values().map(|v| v.as_i64().unwrap()).sum::<i64>(),
+            list["data"].as_array().unwrap().len() as i64
+        );
+        assert_eq!(s["paused"], 1);
+    }
+    let r = call(
+        addr,
+        "GET",
+        "/api/v1/rollouts/summary?state=paused",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 400, "沒有查詢參數");
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/rollouts/summary",
+        Some(&admin),
+        Some(&json!({})),
+    )
+    .await;
+    assert_eq!(r.status, 405);
     f.admin()
         .execute("UPDATE rollout_hosts SET state = 'pending'", [])
         .unwrap();

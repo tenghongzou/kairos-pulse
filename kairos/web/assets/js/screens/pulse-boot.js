@@ -1,8 +1,8 @@
 // 遠端管理的全域部分（main.js 載入一次）：側邊導覽「升級推送」的計數泡泡（設計包 ia.md §3、§7；§31.5）。
 //
 // - 計數＝已暫停的推送＋回滾失敗、尚未標記為已處理的主機＋目前使用者可以核准的待核准推送（需要人處理的數量）：
-//   GET /api/v1/rollouts 的 meta.paused＋meta.rollback_failed_unacknowledged＋meta.pending_approval_actionable
-//   （伺服器計算，不受篩選影響）。
+//   GET /api/v1/rollouts/summary 的 paused＋rollback_failed_unacknowledged＋pending_approval_actionable
+//   （伺服器計算；0.10.1 起用這個只回計數的端點，不再每次取整份推送清單——清單要讀每一筆推送的內容與進度）。
 // - 有 rollouts:read 時每 30 秒更新一次；收到 SSE rollout.progress 時（2 秒內合併）與 S26／S05 的操作後
 //   （refreshRolloutCount）立即更新。功能關閉（503）或其他錯誤時不顯示泡泡。
 
@@ -26,9 +26,9 @@ export async function refreshRolloutCount() {
     return;
   }
   try {
-    // 推送清單的 meta 直接給總數（已暫停的推送、回滾失敗且尚未標記為已處理的主機），不必逐一查主機
-    const res = await api('/api/v1/rollouts', { raw: true });
-    const meta = (res && res.meta) || {};
+    // 只回計數的端點（0.10.1）：伺服器以 COUNT 查詢算出總數（各狀態的推送數、回滾失敗且尚未標記為已處理的
+    // 主機數），不讀推送清單也不讀主機列；欄位與推送清單的 meta 相同
+    const meta = (await api('/api/v1/rollouts/summary')) || {};
     // 雙人覆核（0.10，ADR-0002 決策點 2a）：只計「目前使用者可以核准的」待核准推送——由後端依這次請求的身分
     // 計算（meta.pending_approval_actionable：有 rollouts:approve、以帳號登入、不是建立者或送出者），主控台不以
     // 帳號字串比對。可存取名稱寫出組成：「3 項需要處理：2 個等你核准、1 個已暫停」

@@ -152,7 +152,7 @@ pub struct ArtifactRow {
 }
 
 /// `rollouts` 的一列（`target_version` 取自 `releases`）
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RolloutRow {
     pub id: String,
     pub name: String,
@@ -477,4 +477,28 @@ pub trait RemoteStore {
 
     /// 使用中（草稿、進行中、暫停）的推送中以這個版本為目標的數量
     fn rollouts_using_release(&self, release_id: i64) -> StoreResult<i64>;
+
+    /// 各推送、各主機狀態的台數（0.10.1；推送清單的進度由資料庫彙總，不把每台主機載入記憶體）。
+    /// `state` 有給時只算這個狀態的推送；依 (rollout_id, state) 排序。沒有主機的推送沒有列
+    fn rollout_host_counts(&self, state: Option<&str>) -> StoreResult<Vec<RolloutHostCount>>;
+
+    /// 各狀態的推送數（0.10.1；計數泡泡的輕量來源）：(state, 筆數)，依 state 排序
+    fn rollout_state_counts(&self) -> StoreResult<Vec<(String, i64)>>;
+
+    /// 回滾失敗、尚未標記為已處理的主機數（[`RemoteStore::unacknowledged_rollback_failures`] 的筆數，
+    /// 不載入列）
+    fn count_unacknowledged_rollback_failures(&self) -> StoreResult<i64>;
+}
+
+/// [`RemoteStore::rollout_host_counts`] 的一列
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutHostCount {
+    pub rollout_id: String,
+    /// 主機的狀態（`rollout_hosts.state`）
+    pub state: String,
+    /// 這個狀態的台數
+    pub hosts: i64,
+    /// 其中需要另外計數的台數：`rollback_failed` 為尚未標記為已處理的（`acknowledged_at` 為 NULL），
+    /// `pending` 為等待版本庫檔案的（`reason = 'artifact_missing'`），其他狀態為 0
+    pub flagged: i64,
 }

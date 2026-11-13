@@ -26,7 +26,7 @@ pub mod schedule;
 pub mod store;
 pub mod submission;
 
-pub use engine::{ApproveRequest, rollout_json};
+pub use engine::{ApproveRequest, HostSummary, rollout_json, rollout_summary_json};
 
 #[cfg(test)]
 pub(crate) mod test_sign;

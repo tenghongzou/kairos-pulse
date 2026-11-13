@@ -19,7 +19,7 @@ import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
 import { replaceQuery } from '../core/router.js';
 import { pageHead, card, emptyState, errorState, inlineAlert, skeletonBlock, statusBadge, neutralBadge } from '../ui/components.js';
-import { isUnavailable, unavailableState, rolloutStateBadge, rolloutStateLabel, progressCell, nextActionText, warnText, waitedText, sourceLabel, ROLLOUT_STATES } from './pulse-common.js';
+import { isUnavailable, unavailableState, rolloutStateBadge, rolloutStateLabel, progressCell, nextActionText, warnText, waitedText, sourceLabel, unapprovedBadge, ROLLOUT_STATES } from './pulse-common.js';
 
 const VIEW_PENDING = 'pending_approval';
 // 「待核准」檢視的風險標示（submission.warnings 的固定代碼中屬於內容風險的；完整的提醒在詳情頁的送審摘要）
@@ -43,6 +43,8 @@ export function render(ctx) {
   let state = !view && ROLLOUT_STATES.includes(ctx.query.get('state')) ? ctx.query.get('state') : '';
   let disposed = false;
   let seq = 0;
+  // 目前的雙人覆核設定（meta.rollout_approval）：決定「未經核准」的標記要不要以警告呈現
+  let approvalNow = '';
   const rowEls = new Map();
   const rowsData = new Map();
   const body = h('div', null, skeletonBlock(6));
@@ -193,7 +195,7 @@ export function render(ctx) {
       { dataset: { rollout: r.id } },
       h('td', null, h('a', { href: `/pulse/rollouts/${encodeURIComponent(r.id)}` }, r.name), h('span', { class: 'k-host-id mono' }, r.id)),
       h('td', null, r.target_version),
-      h('td', null, rolloutStateBadge(r.state)),
+      h('td', null, rolloutStateBadge(r.state), r.approval === 'not_required' ? [' ', unapprovedBadge(approvalNow === 'required')] : null),
       h('td', null, r.state === 'draft' ? '—' : progressCell(r.progress)),
       h('td', null, waveText(r)),
       h('td', null, nextCell(r)),
@@ -227,6 +229,7 @@ export function render(ctx) {
     if (disposed || my !== seq) return;
     rowEls.clear();
     rowsData.clear();
+    approvalNow = meta.rollout_approval || '';
     renderTabs(meta);
     renderNotes(meta);
     if (view === VIEW_PENDING) {

@@ -654,6 +654,15 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | `settings` | `settings.rollout_approval.baseline`、`settings.rollout_approval.change`（0.10.0；`system`，啟動時與資料庫的前值比對，對象 `remote.rollout_approval`；第 5.4 節） |
 
 - 0.10.0（ADR-0002）：`rollout.submit` 的 `details` 另有 `digest`；`rollout.approve` 的 `details` 有 `digest`、`eligible`、`downgrade`、`confirm_level`、`reason`，以及原本的送審資訊（`created_by`、`submitted_by`、`submitted_at`）。
+- 0.10.1：**推送開始時生效的雙人覆核設定留在推送自己的稽核紀錄**。`rollout.submit` 的 `details` 另有 `rollout_approval`（送出當下的 `none`／`required`）；`rollout.start`（實際開始的那一刻：`none` 時送出就開始由送出者寫入、核准後開始由核准者寫入、排程的開始由 `system` 寫入）的 `details` 有 `rollout_approval`（開始當下的設定）、`approval`（`approved`／`not_required`／`unknown`，下述）、`submitted_by`、`approved_by`，以及原有的 `approved`／`scheduled`。用途：雙人覆核的關閉原本只靠 `meta` 表的前值偵測（第 5.4 節），能寫資料庫的人把前值改掉就沒有 `settings.rollout_approval.change`；現在「在 `none` 之下送出並開始」的每一個推送各自在雜湊鏈（HMAC）裡留下一筆，改掉前值或 `rollouts` 的列都不會讓這些紀錄消失（刪改稽核紀錄會被完整性驗證發現）。沒有經過核准就開始時 Kairos 另記一行警告日誌（`rollout.start_unapproved`）。
+- 0.10.1：推送的 API 有 `approval`（清單、詳情、SSE `rollout.progress`）：開始或排定開始時有沒有經過另一位管理員核准。**由既有欄位導出，沒有 schema 變更**——推送離開草稿只有 `submit` 一條路，`required` 時一定先到 `pending_approval`、核准時寫 `approved_at`；`none` 時直接排程或開始，`approved_at` 維持空值（每次送出都清除上一輪的核准）。所以「已開始或已排程、有 `submitted_at`、沒有 `approved_at`」就是「送出時政策為 `none`」，另存一個「開始時的政策」欄位不會多出資訊，同樣可以被能寫資料庫的人改掉；不可否認的證據放在稽核（上一點）。
+
+  | `approval` | 條件 | 主控台 |
+  |---|---|---|
+  | `approved` | 有 `approved_at` | 覆核紀錄列出核准者 |
+  | `not_required` | 已開始或已排程、有 `submitted_at`、沒有 `approved_at` | 清單與詳情標示「未經核准」；目前的設定是 `required` 時以警告呈現（這個推送是在覆核關閉的期間送出的），否則是中性的標籤 |
+  | `unknown` | 已開始、沒有 `submitted_at`（`submitted_at` 是 schema v10 加的：0.9.x 建立並開始的推送） | 覆核紀錄寫「無法判斷」，不標示成未經核准 |
+  | `null` | 草稿、待核准、開始之前就取消 | 不顯示 |
 
 - 每台主機的一般升級結果（`succeeded`、`declined`…）記在 `rollout_hosts`，**不**逐台寫入稽核鏈（1 萬台的推送會產生 1 萬筆；第 14 節 D17）；推送完成時的 `rollout.complete` 帶各狀態的台數。安全相關（簽章失敗）與需要人工處理（回滾失敗）的逐台記錄。
 - 被拒絕的寫入照舊以 `access.denied` 記錄。
@@ -911,6 +920,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 |---|---|---|
 | `POST /api/v1/rollouts/preview` | `rollouts:read` | 本文同建立；回各批次的台數、資格分類（第 4.7.2 節的每個原因與台數、前 100 台樣本）、`incompatible`（`min_kairos`）、`breaking`、`no_rollback`、`impact_token` |
 | `GET /api/v1/rollouts` | `rollouts:read` | 篩選 `state`；每筆有 `progress`（各主機狀態的台數）、`current_wave`、`next_action`（「等待時段 01:00」「觀察中，還有 23 分鐘」「等待繼續」） |
+| `GET /api/v1/rollouts/summary`（0.10.1） | `rollouts:read` | 只回計數（各狀態的推送數、已暫停、回滾失敗未處理的主機數、待核准與這次請求的身分可以核准的筆數）：主控台計數泡泡的來源，不讀推送的內容與主機列。清單每一筆的 `progress` 自 0.10.1 起由資料庫彙總（API.md 第 17.3 節） |
 | `POST /api/v1/rollouts` | `rollouts:write` | 建立（`draft`）：第 4.7.1 節的欄位、`impact_token`；與其他推送重疊 409 `rollout_overlap`（`details.agent_ids` 前 100 台） |
 | `PUT /api/v1/rollouts/{id}` | `rollouts:write` | 只有 `draft`／`pending_approval`／`scheduled` 可修改（修改後需要重新送審） |
 | `POST /api/v1/rollouts/{id}/submit` | `rollouts:write` | 送出：`rollout_approval = "required"` 時進入 `pending_approval`，否則 `scheduled`。L2：`confirm` 為「升級 N 台」（N 為可升級台數）；`allow_downgrade` 時 L3（「降版 N 台」＋重新驗證） |

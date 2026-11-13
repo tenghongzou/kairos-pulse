@@ -49,14 +49,14 @@ function healthz() {
 }
 
 /** 把 rollout_approval 改為 value 後重新啟動第三個 Kairos（設定只能在設定檔修改、需要重新啟動） */
-async function restartKairos(value) {
+async function restartKairos(value, from = 'required') {
   const pidFile = process.env.APPROVAL_PID_FILE;
   const cfgFile = process.env.APPROVAL_CFG;
   process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGTERM');
   await until(async () => (await healthz()) === 0, 30000, 'Kairos 停止');
   const cfg = readFileSync(cfgFile, 'utf8');
-  assert.match(cfg, /rollout_approval = "required"/);
-  writeFileSync(cfgFile, cfg.replace('rollout_approval = "required"', `rollout_approval = "${value}"`));
+  assert.ok(cfg.includes(`rollout_approval = "${from}"`), `設定檔目前應該是 ${from}`);
+  writeFileSync(cfgFile, cfg.replace(`rollout_approval = "${from}"`, `rollout_approval = "${value}"`));
   const out = openSync(process.env.APPROVAL_LOG, 'a');
   const child = spawn(process.env.KAIROS_BIN, ['--config', cfgFile], { detached: true, stdio: ['ignore', out, out] });
   child.unref();
@@ -727,7 +727,61 @@ export function registerApproval({ test, newPage, waitTitle, axe, shot, FakeAgen
     await dlg.getByRole('button', { name: '核准降版 1 台', exact: true }).click();
     await ca.page.getByText('已核准推送').first().waitFor();
     assert.equal((await stateOf(ca.page, id)).approved_by, 'user:carol');
+    // 0.10.1（H2）：核准過的推送 approval = approved；稽核的 rollout.start 記下開始時生效的設定（已是 none）與核准者
+    assert.equal((await stateOf(ca.page, id)).approval, 'approved');
+    const started = (await api(ca.page, 'GET', '/api/v1/audit?action=rollout.start')).json.data.find((e) => e.object === id);
+    assert.ok(started, '核准後開始的稽核');
+    assert.deepEqual([started.details.rollout_approval, started.details.approval, started.details.approved_by], ['none', 'approved', 'user:carol']);
+    assert.equal(await ca.page.locator('#rollout-unapproved').count(), 0, '核准過的推送沒有「未經核准」的說明');
     await cancel(ca.page, id);
+
+    // 關閉之後送出的推送：不必核准就排程（approval = not_required），清單與詳情標示「未經核准」，稽核記下送出時的設定。
+    // 這個 Kairos 目前的設定是 none，所以是中性的標籤與資訊
+    const startsAt = new Date(Date.now() + 6 * 3600 * 1000).toISOString();
+    const c2 = await api(ca.page, 'POST', '/api/v1/rollouts', spec('E2E 未經核准', A1, { schedule: { starts_at: startsAt } }));
+    assert.equal(c2.status, 201, JSON.stringify(c2.json));
+    const id2 = c2.json.data.id;
+    const d2 = await api(ca.page, 'GET', `/api/v1/rollouts/${id2}`);
+    const s2 = await api(ca.page, 'POST', `/api/v1/rollouts/${id2}/submit`, { confirm: d2.json.data.preview.confirm_text });
+    assert.equal(s2.status, 200, JSON.stringify(s2.json));
+    assert.deepEqual([s2.json.data.state, s2.json.data.approval, s2.json.data.approved_by], ['scheduled', 'not_required', null]);
+    const submitted = (await api(ca.page, 'GET', '/api/v1/audit?action=rollout.submit')).json.data.find((e) => e.object === id2);
+    assert.equal(submitted.details.rollout_approval, 'none');
+    await ca.page.goto(`${BASE}/pulse/rollouts`);
+    await waitTitle(ca.page, '升級推送');
+    const row2 = ca.page.locator(`tr[data-rollout="${id2}"]`);
+    await row2.locator('[data-approval="not_required"]').getByText('未經核准').waitFor();
+    assert.equal(await ca.page.locator(`tr[data-rollout="${id}"] [data-approval]`).count(), 0, '核准過的推送沒有標記');
+    await axe(ca.page, '政策 S26 清單（未經核准的推送）');
+    await dark(ca.page, '政策 S26 清單（未經核准的推送）');
+    await ca.page.goto(`${BASE}/pulse/rollouts/${id2}`);
+    await waitTitle(ca.page, 'E2E 未經核准');
+    const note = ca.page.locator('#rollout-unapproved');
+    await note.getByText('這個推送沒有經過另一位管理員核准，到排程的時間就會開始').waitFor();
+    assert.equal(await note.getAttribute('data-emphasis'), 'info');
+    await ca.page.locator('#rollout-approval[data-approval="not_required"]').waitFor();
+    await axe(ca.page, '政策 S26 詳情（未經核准的推送）');
+    await dark(ca.page, '政策 S26 詳情（未經核准的推送）');
+    await shot(ca.page, 'approval-unapproved-detail');
+
+    // 改回 required 重新啟動：覆核關閉期間送出的推送仍然標示，而且是警告（目前的設定要求覆核）
+    await restartKairos('required', 'none');
+    const cb = await session('carol', '/pulse/rollouts', '升級推送');
+    const warnBadge = cb.page.locator(`tr[data-rollout="${id2}"] [data-approval="not_required"]`);
+    await warnBadge.getByText('未經核准').waitFor();
+    assert.match(await warnBadge.getAttribute('class'), /ds-status-badge--warning/);
+    await axe(cb.page, '政策 S26 清單（未經核准的推送，目前要求覆核）');
+    await dark(cb.page, '政策 S26 清單（未經核准的推送，目前要求覆核）');
+    await cb.page.goto(`${BASE}/pulse/rollouts/${id2}`);
+    await waitTitle(cb.page, 'E2E 未經核准');
+    const warnNote = cb.page.locator('#rollout-unapproved');
+    await warnNote.getByText(/目前的設定要求雙人覆核：這個推送是在覆核關閉的期間送出的/).waitFor();
+    assert.equal(await warnNote.getAttribute('data-emphasis'), 'warning');
+    await axe(cb.page, '政策 S26 詳情（未經核准的推送，目前要求覆核）');
+    await dark(cb.page, '政策 S26 詳情（未經核准的推送，目前要求覆核）');
+    await shot(cb.page, 'approval-unapproved-detail-required');
+    await cancel(cb.page, id2);
+    await cb.ctx.close();
     await ca.ctx.close();
   });
 }

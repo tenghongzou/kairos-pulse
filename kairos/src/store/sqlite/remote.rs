@@ -8,7 +8,7 @@ use super::conn::{AsConn, forward};
 use crate::remote::store::{
     ApplyingHost, ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate,
     HostConfigRow, HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow,
-    RemoteStore, RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
+    RemoteStore, RollbackFailure, RolloutHostCount, RolloutHostRow, RolloutRow, UpgradeHost,
 };
 
 /// schema v11（0.10.0）：升級推送的雙人覆核（REMOTE.md 第 5.4 節）。只新增欄位（`approved_at`／
@@ -239,6 +239,9 @@ impl<C: AsConn> RemoteStore for C {
         fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
         fn applying_hosts(&self) -> Vec<ApplyingHost> => applying_hosts;
         fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
+        fn rollout_host_counts(&self, state: Option<&str>) -> Vec<RolloutHostCount> => rollout_host_counts;
+        fn rollout_state_counts(&self) -> Vec<(String, i64)> => rollout_state_counts;
+        fn count_unacknowledged_rollback_failures(&self) -> i64 => count_unacknowledged_rollback_failures;
     }
 }
 
@@ -1219,6 +1222,53 @@ pub fn rollouts_using_release(conn: &Connection, release_id: i64) -> rusqlite::R
             "SELECT COUNT(*) FROM rollouts WHERE release_id = ?1 AND state NOT IN {ROLLOUT_ENDED}"
         ),
         [release_id],
+        |r| r.get(0),
+    )
+}
+
+/// 各推送、各主機狀態的台數（推送清單的進度；0.10.1）。只讀 `rollout_hosts`（不 JOIN `hosts`），
+/// 一次彙總所有推送，回傳的列數是「推送數 × 出現過的狀態數」而不是主機數
+pub fn rollout_host_counts(
+    conn: &Connection,
+    state: Option<&str>,
+) -> rusqlite::Result<Vec<RolloutHostCount>> {
+    let mut stmt = conn.prepare(
+        "SELECT rh.rollout_id, rh.state, COUNT(*),
+                SUM(CASE WHEN rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL THEN 1
+                         WHEN rh.state = 'pending' AND rh.reason = 'artifact_missing' THEN 1
+                         ELSE 0 END)
+         FROM rollout_hosts rh
+         WHERE ?1 IS NULL
+            OR rh.rollout_id IN (SELECT r.rollout_id FROM rollouts r WHERE r.state = ?1)
+         GROUP BY rh.rollout_id, rh.state
+         ORDER BY rh.rollout_id, rh.state",
+    )?;
+    let rows = stmt.query_map([state], |r| {
+        Ok(RolloutHostCount {
+            rollout_id: r.get(0)?,
+            state: r.get(1)?,
+            hosts: r.get(2)?,
+            flagged: r.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 各狀態的推送數（計數泡泡；0.10.1）
+pub fn rollout_state_counts(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT state, COUNT(*) FROM rollouts GROUP BY state ORDER BY state")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// 回滾失敗、尚未標記為已處理的主機數：條件與 [`unacknowledged_rollback_failures`] 相同
+pub fn count_unacknowledged_rollback_failures(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL",
+        [],
         |r| r.get(0),
     )
 }

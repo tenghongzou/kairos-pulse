@@ -1240,6 +1240,63 @@ fn remote_config_and_rollouts(db: &TestDb) -> String {
         "rollback failures",
         s.unacknowledged_rollback_failures().unwrap()
     );
+    // 0.10.1（H3）：推送清單的進度由資料庫彙總。這時 01（running）的 a 是回滾失敗未處理、b 是 pending；
+    // 02 是草稿、沒有主機（沒有列）
+    {
+        use crate::remote::HostSummary;
+        use crate::remote::store::RolloutHostCount;
+        let count = |state: &str, hosts: i64, flagged: i64| RolloutHostCount {
+            rollout_id: "RO-20261009-01".into(),
+            state: state.into(),
+            hosts,
+            flagged,
+        };
+        let all = log!(out, "host counts", s.rollout_host_counts(None).unwrap());
+        assert_eq!(
+            all,
+            vec![count("pending", 1, 0), count("rollback_failed", 1, 1)]
+        );
+        assert_eq!(s.rollout_host_counts(Some("running")).unwrap(), all);
+        assert!(s.rollout_host_counts(Some("draft")).unwrap().is_empty());
+        assert!(s.rollout_host_counts(Some("nope")).unwrap().is_empty());
+        // 等待版本庫檔案的 pending 另外計數；彙總的結果與從主機列計算的相同
+        let waiting = HostTransition {
+            reason: Some(Some("artifact_missing".into())),
+            ..Default::default()
+        };
+        s.update_rollout_host("RO-20261009-01", b, &waiting, T0 + 271)
+            .unwrap();
+        let counts = s.rollout_host_counts(None).unwrap();
+        assert_eq!(
+            counts,
+            vec![count("pending", 1, 1), count("rollback_failed", 1, 1)]
+        );
+        let by_rollout = HostSummary::from_counts(counts);
+        assert_eq!(by_rollout.len(), 1);
+        let from_rows = HostSummary::of(&s.rollout_hosts("RO-20261009-01").unwrap());
+        assert_eq!(by_rollout["RO-20261009-01"], from_rows);
+        assert_eq!(
+            (
+                from_rows.hosts_total(),
+                from_rows.rollback_failed_unacknowledged,
+                from_rows.waiting_artifact,
+                from_rows.progress.len(),
+            ),
+            (2, 1, 1, 15)
+        );
+        let clear = HostTransition {
+            reason: Some(None),
+            ..Default::default()
+        };
+        s.update_rollout_host("RO-20261009-01", b, &clear, T0 + 272)
+            .unwrap();
+        log!(out, "state counts", s.rollout_state_counts().unwrap());
+        assert_eq!(
+            s.rollout_state_counts().unwrap(),
+            vec![("draft".to_string(), 1), ("running".to_string(), 1)]
+        );
+        assert_eq!(s.count_unacknowledged_rollback_failures().unwrap(), 1);
+    }
     s.update_rollout_host(
         "RO-20261009-01",
         a,
@@ -1252,6 +1309,16 @@ fn remote_config_and_rollouts(db: &TestDb) -> String {
     )
     .unwrap();
     assert!(s.unacknowledged_rollback_failures().unwrap().is_empty());
+    assert_eq!(s.count_unacknowledged_rollback_failures().unwrap(), 0);
+    assert_eq!(
+        s.rollout_host_counts(None)
+            .unwrap()
+            .iter()
+            .map(|c| (c.state.as_str(), c.hosts, c.flagged))
+            .collect::<Vec<_>>(),
+        vec![("pending", 1, 0), ("rollback_failed", 1, 0)],
+        "已標記為已處理的不再計入"
+    );
     log!(
         out,
         "acknowledged",
