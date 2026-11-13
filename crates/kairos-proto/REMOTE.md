@@ -1029,7 +1029,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 實測發現並修正：`pulse enroll` 改寫套件的 `pulse.toml`（`root:pulse 640`）時變成 `root:root`，服務帳號讀不到設定；讀不到的 `pulse.toml` 被當成不存在、改用內建預設值（現在以 `PLS-E0402` 結束）；Rocky 9 沒有 `cpio` 時輔助程式解開 rpm 卡到 `TimeoutStartSec`（rpm 另宣告相依 `cpio`）；rpm 在套件資料庫比目標新或同版時拒絕安裝（改為 `--oldpackage --replacepkgs`）；tar 主機在其他目錄執行 `pulse upgrade status`／`rollback` 時判斷為 `unknown`；回滾確認期間重新開機後 `detail` 只剩 `resumed`；段落請求超過 Kairos 每條連線的訊息速率（Kairos 每台主機都記 WARN）。詳見第 17.6 節。
 
-沒有實測（原因見 `tests/systemd/README.md`「沒有涵蓋」）：套件資料庫被鎖住時的重試（時序不易穩定重現，以單元測試的假套件管理員涵蓋）、tar 安裝替換已修改／未修改的 `pulse.service`（同一個 commit 的新舊 unit 相同，輔助程式不替換）、斷電（`docker kill`）而非正常關機的重新開機、aarch64、Debian 11／RHEL 8。
+沒有實測（原因見 `tests/systemd/README.md`「沒有涵蓋」）：套件資料庫被鎖住時的重試（時序不易穩定重現，以單元測試的假套件管理員涵蓋）、tar 安裝替換已修改／未修改的 `pulse.service`（同一個 commit 的新舊 unit 相同，輔助程式不替換）、斷電（`docker kill`）而非正常關機的重新開機、aarch64、Debian 11／RHEL 8。〔0.10.0：`docker kill` 後重新啟動已由情境 `crash-replace`、`crash-rollback` 涵蓋兩個當機點（第 17.9.10 節）；它終止的是行程，真正的斷電（頁面快取遺失）仍沒有實測〕
 
 ### 12.4 Windows（實機，手動清單）
 
@@ -1476,6 +1476,43 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
   3. `packaging/check-release-binary.sh`：執行檔含標記字串 `pulse-fault-injection-build`（`FAULT_INJECTION_MARKER`，開啟 feature 時才編譯進去）或 `--version` 的結尾標記 `[fault-injection]` 時判定為測試用建置。`build-release-common.sh` 在每個目標建置完成後對執行檔執行它（沒有 `TEST_FEATURES`：含標記就中止打包；有 `TEST_FEATURES`：反過來要求標記存在，確認這個檢查認得出來），`--version` 的輸出也必須逐字等於期望值（正式的建置沒有結尾標記）；`release.sh` 在打包後、簽章前對 `tar.gz` 內的執行檔再檢查一次；CI 的 package job 對要上傳的 `tar.gz`、`zip`、`deb` 再檢查一次，並確認 `release.sh` 拒絕 `TEST_FEATURES`。單元測試 `the_packaging_check_knows_the_fault_injection_marker` 確認腳本與程式用的是同一個標記。
   4. CI 的 check job 另以 `--features fault-injection` 對 Pulse 執行 clippy（這段程式不在預設的建置裡，避免無人發現地壞掉）。
 - 沒有涵蓋：真正的斷電（頁面快取遺失）——fsync 的順序只由程式審查與單元測試中的順序斷言保證；檔案系統回報寫入成功但實際損毀的情況由 `checksum` 偵測、以 `state_unusable` 擋下。
+
+#### 17.9.10 實作與驗證（2026-11-13）
+
+**與實作前的設計（本節在 ab824dc 的版本）不同之處**，都已寫回上面各小節：
+
+| 小節 | 實作前的設計 | 實作 | 理由 |
+|---|---|---|---|
+| 17.9.2、17.9.3、17.9.4 第 13、18 列 | `replaced`／`rolling_back` 接續時直接做健康確認（假設中斷一定伴隨重新開機） | 新欄位 `service_restarted`；接續時 `systemctl restart` 還沒送出就補送 | 輔助程式只是自己被終止（`TimeoutStartSec`、`SIGKILL`）時服務仍是舊的行程，會一路等到期限而誤判（0.9.0 起就有的窗口） |
+| 17.9.3 | `done` 寫不進去、連刪除都失敗時指標保留 | 指標照常清除；留下的未結束紀錄讓之後的請求以 `state_unusable` 擋下 | 指標保留會讓下一次觸發「接續」並回滾一筆其實已完成的升級 |
+| 17.9.3 ③ | tar：`new.bin` 改名取代 | 以 `new.bin` 的複本改名取代，`new.bin` 留到交易結束 | 接續時可依雜湊重做；替換仍是原子的改名 |
+| 17.9.4 | 每一列都是程式中的 checkpoint | 第 10、14、16（套件）、19 列由測試的假作業系統注入 | 這四點在套件管理員執行中或等待中，不在輔助程式自己的兩個動作之間 |
+| 17.9.5 | — | 補上：指標有效而工作目錄不安全（`unsafe_path`，指標保留）；`done` 的交易只差清除指標而請求是另一筆；`done` 卻沒有結果、指標指向 v1 的紀錄 | 實作時列舉到的情況 |
+| 17.9.8 | 已結束的交易的大檔在結束時刪除 | 另外在下一次清理時刪除「記下 `done` 後、清理前中斷」留下的大檔 | 對照表第 20～22 列 |
+| 17.9.9 | `build-release-common.sh` 自己比對標記字串 | 獨立的 `packaging/check-release-binary.sh`（另檢查 `--version` 的結尾標記、可檢查發佈檔內的執行檔、`--test-build` 反向確認），`release.sh` 與 CI 各再檢查一次 | 檢查本身要能單獨執行與驗證 |
+
+沒有改變的：對外行為（`upgrade_status` 的狀態與代碼、協定、Kairos）、第 17.9.1 節的檔案、第 17.9.6 節的舊格式規則、第 17.9.7 節的路徑條件。
+
+**單元測試**（`cargo test -p pulse`；`remote::upgrade::helper::` 共 55 個測試）：
+
+- `fault_tests::crash_point_matrix_{tar,deb_with_a_rollback_package,deb_without_a_rollback_package,rpm}`：對照表 22 列中適用的列 × 新版健康／崩潰，共 136 個案例（tar 37、deb 有回滾套件 33、deb 無回滾套件 33、rpm 33）。每個案例：在那個點中止 → 檢查當機時的步驟、指標、執行檔、`pulse.prev`、unit、套件資料庫與旗標 → 重新開機（另一個假系統；第 4 列之後先刪掉服務帳號的暫存區）→ 接續 → 檢查結果、`detail`、執行檔、`pulse.prev`（一律是舊版）、unit、套件資料庫、`result.json`、指標已清除、工作目錄只留紀錄與日誌。
+- `the_matrix_covers_every_row_of_the_crash_point_table`：讀本文件第 17.9.4 節的表，列號連續 1～22、每一列的名稱都有對應的測試、矩陣沒有表以外的列；另確認一次完整的升級＋回滾經過程式中的每一個 checkpoint，且程式中沒有表以外的 checkpoint。
+- 其他：連續兩次中斷、只有輔助程式被終止（補送重新啟動）、`request.json` 讀不到或不見、替換無法完成（未變更／已變更後還原／還原後不恢復／複本被換掉）、回滾用的複本被換掉、結果寫不進紀錄；第 17.9.5 節的每一種損毀與遺失（指標 5 種、紀錄 10 種、指標遺失 4 個步驟、其他工作目錄的紀錄損毀、紀錄與系統矛盾、同一筆交易再次出現、全部消失）；第 17.9.6 節（`replaced`、`rolling_back`、`verified` 兩種、請求換了 `upgrade_id`、兩筆未結束、已結束）；第 17.9.7 節（工作目錄與安裝目錄各種不安全的情況、擁有者、接續時的工作目錄）；第 17.9.8 節（清理的保留規則、不刪除未結束或無法判斷的紀錄與非 UUID 的項目、連續 8 個請求不成長、連續 5 次 `rollback_failed`）；第 17.9.9 節（打包檢查的標記與程式一致）。
+- 驗證測試本身有效：暫時植入三處錯誤（接續時不補送重新啟動、回滾時不還原 unit、沒有指標的未結束紀錄不擋下），9 個測試失敗；還原後全部通過。
+
+**kp-build 的結果**（Ubuntu 24.04；分支 `sprint11/helper-txn`）：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、同一命令加 `--target x86_64-pc-windows-gnu`、`cargo clippy -p pulse --all-targets --locked --features fault-injection -- -D warnings`、`cargo deny check` 通過；`cargo test --workspace --locked --exclude kp-e2e`（PostgreSQL 14，`KAIROS_TEST_PG_REQUIRED=1`）1646 通過、0 失敗、12 略過（其中 Pulse 572）；`cargo test -p kp-e2e` 62 通過、0 失敗、1 略過。
+
+**系統層**（`tests/systemd/run.sh`，全部情境依序一次；commit ca52ba3，之後的 commit 只改文件）：**319 項通過、0 失敗**——b0 22、a 19、b 24、c 23、c2 26、d 10、e 16、f 65、g 67（含升級到 test.5 的準備 20 項）、h 43，另 4 項環境檢查。情境 b0～e 與先前相同（輔助程式整個改寫後的回歸）；f、g、h 的實測：
+
+| 情境 | 三台主機（deb／rpm／tar）的結果 |
+|---|---|
+| f `tamper-resume` | `rolled_back`（`PLS-W8407`），`detail` 為 `crash_restart (NRestarts 0 → 1); resumed; request_upgrade_id_ignored,request_from_version_ignored`。竄改當下 `active.json`（`pulse.upgrade-active/v1`）與 `state.json`（`pulse.upgrade-helper/v2`、`rolling_back`）的 `checksum` 以 `sha256sum` 重算相符、`upgrade_id` 與 `binding_sha256` 相同；`700 root:root`（兩個目錄）、`600 root:root`（兩個檔案）；服務帳號 `ls /var/lib/pulse-upgrade` 被拒。結束後紀錄為 `done`、工作目錄只有 `state.json` 與 `upgrade.log`、`/var/lib/pulse-upgrade` 只有 1 筆交易 |
+| g `crash-replace`（第 11 列） | 輔助程式停在 `binary_replaced`：紀錄 `replacing`、`prev_saved = true`、checksum 相符，執行檔已是 test.6、`pulse.prev` 是 test.5。`docker kill`、重新啟動後「接續上次中斷的替換（replacing）」「pulse.prev 已是替換前的執行檔，不再覆寫」→ `succeeded`（`PLS-I8416`）；`pulse.prev` 仍是 test.5，deb／rpm 的套件資料庫為 test.6，指標已清除 |
+| h `crash-rollback`（第 17 列） | 輔助程式停在 `rollback_restored`：紀錄 `rollback_intent`（`cause: health`；`via` 為 deb／rpm 的 `package`、tar 的 `binary`），執行檔已換回 test.6。`docker kill`、重新啟動後「接續上次中斷的回滾：重新還原」→ `rolled_back`（`PLS-W8407`，`crash_restart (NRestarts 0 → 1); resumed`）；deb／rpm 經套件管理員回滾，套件資料庫為 test.6 |
+
+**故障注入只在測試用建置**的實測：`tests/systemd/build.sh` 建置的 8 個 Pulse 發佈中，6 個正式的建置（`<V0>`、test.1～test.4、test.7）在打包時通過「不含測試用 feature」的檢查，test.5、test.6（`TEST_FEATURES=fault-injection`）通過反向的檢查（`pulse 0.10.1-test.5 (76a42da) [fault-injection]`）；`TEST_FEATURES=fault-injection sh packaging/release.sh` 在刪除或建置任何東西之前以「測試用的 feature 不可用於正式發佈」結束。對同一份原始碼的 debug 建置：預設建置 `check-release-binary.sh` 回 0、`--features fault-injection` 的建置回 1（`--test-build` 相反）。**反向驗證**：在暫時的 clone 把 `pulse/Cargo.toml` 改成 `default = ["fault-injection"]`（模擬 feature 經由 `TEST_FEATURES` 以外的途徑被開啟）後照正式的方式執行 `pulse/packaging/build-release.sh`（沒有 `TEST_FEATURES`）：建置完成後以「含測試用 feature 的程式，中止打包」結束（結束代碼 1），輸出目錄沒有任何檔案。
+
+**沒有驗證的**：真正的斷電（頁面快取遺失）；系統層只實測 22 個當機點中的 2 個（其餘由單元測試涵蓋）；由 0.9.0 的輔助程式開始、0.10.0 接續的交易（v1 → v2）只有單元測試，沒有在實機上以真的 0.9.0 套件跑過；aarch64；GitHub 上的 CI（新增的步驟沒有在 GitHub 跑過）；發佈包的可重現性檢查（`packaging/check-reproducible.sh`）沒有重跑。
 
 ## 18. Windows 的遠端升級：0.10.0 不實作的評估與需要的實機驗證（待使用者決定）
 
