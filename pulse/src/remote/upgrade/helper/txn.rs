@@ -179,6 +179,11 @@ pub struct Record {
     pub n_restarts_before: u64,
     #[serde(default)]
     pub restarted_unix: i64,
+    /// 這個步驟（`replaced`／`rolling_back`）的 `systemctl restart` 已經送出。接續時還是 `false` 就再送
+    /// 一次：輔助程式可能只是自己被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機，此時服務仍是
+    /// 替換前啟動的那個行程
+    #[serde(default)]
+    pub service_restarted: bool,
     #[serde(default)]
     pub rollback_intent: Option<RollbackIntent>,
     #[serde(default)]
@@ -223,6 +228,7 @@ impl Record {
             deadline_unix: 0,
             n_restarts_before: 0,
             restarted_unix: 0,
+            service_restarted: false,
             rollback_intent: None,
             notes: Vec::new(),
             result: None,
@@ -255,7 +261,9 @@ impl Record {
             self.new_binary_sha256.clone(),
             v(&self.rollback),
             unit,
-            self.pkg_db_before.clone().unwrap_or_else(|| "-".to_string()),
+            self.pkg_db_before
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
             self.health_timeout_secs.to_string(),
         ]
         .join("\n");
@@ -465,7 +473,11 @@ pub fn active_bytes(upgrade_id: &str, binding_sha256: &str) -> Result<Vec<u8>, S
 }
 
 /// 寫入指標（耐久）
-pub fn write_active(work_root: &Path, upgrade_id: &str, binding_sha256: &str) -> Result<(), String> {
+pub fn write_active(
+    work_root: &Path,
+    upgrade_id: &str,
+    binding_sha256: &str,
+) -> Result<(), String> {
     let path = work_root.join(ACTIVE_FILE);
     let bytes = active_bytes(upgrade_id, binding_sha256)?;
     crate::remote::write_atomic_durable(&path, &bytes, 0o600, 0o700)
@@ -581,8 +593,8 @@ impl Owner {
 #[cfg(unix)]
 fn check_component(p: &Path, owner: Owner) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    let meta =
-        std::fs::symlink_metadata(p).map_err(|e| format!("{}: cannot be examined: {e}", p.display()))?;
+    let meta = std::fs::symlink_metadata(p)
+        .map_err(|e| format!("{}: cannot be examined: {e}", p.display()))?;
     if !owner.accepts(meta.uid()) {
         return Err(format!(
             "{}: owned by uid {}, not root",
@@ -888,7 +900,7 @@ pub fn prune(work_root: &Path, keep: &[&str], current: Option<&str>) -> Vec<Stri
             removed.push(e.id);
         }
     }
-    finished.sort_by(|a, b| b.modified.cmp(&a.modified));
+    finished.sort_by_key(|e| std::cmp::Reverse(e.modified));
     let mut failed_kept =
         usize::from(current == Some(kairos_proto::mgmt::UPGRADE_STATE_ROLLBACK_FAILED));
     for (i, e) in finished.into_iter().enumerate() {
@@ -899,7 +911,9 @@ pub fn prune(work_root: &Path, keep: &[&str], current: Option<&str>) -> Vec<Stri
                 strip(&e.path);
             }
         } else if i == 0 && !latest_is_kept {
-            // 最近一筆已結束的紀錄（不是 rollback_failed：大檔在結束時已刪除）
+            // 最近一筆已結束的紀錄：只留紀錄與日誌（大檔通常在結束時已刪除；在記下 done 之後、清理之前
+            // 中斷而且沒有再被觸發的交易會留著）
+            strip(&e.path);
         } else if std::fs::remove_dir_all(&e.path).is_ok() {
             removed.push(e.id);
         }
@@ -916,7 +930,12 @@ mod tests {
 
     #[test]
     fn checksum_detects_any_change_and_survives_unknown_fields() {
-        let mut r = Record::new("9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70", "0.9.0", "1a2b3c4", "tar");
+        let mut r = Record::new(
+            "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70",
+            "0.9.0",
+            "1a2b3c4",
+            "tar",
+        );
         r.notes
             .push("a note with \"checksum\": \"deadbeef\" inside".to_string());
         let bytes = r.to_bytes().unwrap();
@@ -944,7 +963,12 @@ mod tests {
 
     #[test]
     fn binding_covers_the_fields_that_decide_what_gets_installed() {
-        let mut r = Record::new("9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70", "0.9.0", "1a2b3c4", "deb");
+        let mut r = Record::new(
+            "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70",
+            "0.9.0",
+            "1a2b3c4",
+            "deb",
+        );
         r.old_binary_sha256 = "aa".into();
         let base = r.compute_binding();
         let mut changed = Vec::new();

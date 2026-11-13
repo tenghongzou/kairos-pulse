@@ -407,7 +407,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
     };
     if let Some(a) = active {
         let work = paths.work_root.join(&a.upgrade_id);
-        let unusable = |why: String| format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required");
+        let unusable =
+            |why: String| format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required");
         let why = match txn::load_record(&work) {
             Loaded::V2(rec) => {
                 if rec.upgrade_id != a.upgrade_id || rec.binding_sha256 != a.binding_sha256 {
@@ -766,6 +767,11 @@ fn resume(
         Step::Replaced => {
             h.log
                 .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
+            if !rec.service_restarted {
+                h.log
+                    .line("INFO", "上次還沒有重新啟動 pulse.service：現在重新啟動");
+                h.restart(&mut rec);
+            }
             h.after_replace(rec)
         }
         Step::RollbackIntent => {
@@ -774,6 +780,11 @@ fn resume(
         }
         Step::RollingBack => {
             h.log.line("INFO", "接續上次中斷的回滾");
+            if !rec.service_restarted {
+                h.log
+                    .line("INFO", "上次還沒有重新啟動 pulse.service：現在重新啟動");
+                h.restart(&mut rec);
+            }
             let reason = resumed_reason(&rec);
             h.confirm_rollback(rec, reason)
         }
@@ -958,6 +969,9 @@ fn resume_legacy(
         rec.restarted_unix = sys.now_unix();
         rec.deadline_unix = rec.restarted_unix + i64::try_from(timeout).unwrap_or(i64::MAX);
     }
+    // v1 沒有記下重新啟動是否已送出：replaced／rolling_back 照 v1 的行為（不再送）；只有「已替換、尚未
+    // 記錄」需要現在重新啟動
+    rec.service_restarted = !restart;
     rec.binding_sha256 = rec.compute_binding();
     // 轉換後的紀錄與指標寫不進去時仍繼續（系統已被替換，不能半途停下）
     h.save(&mut rec);
@@ -973,9 +987,8 @@ fn resume_legacy(
         _ => {
             h.log
                 .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
-            if restart && let Err(e) = sys.restart_service() {
-                h.log
-                    .line("WARN", &format!("systemctl restart 失敗：{e}"));
+            if !rec.service_restarted {
+                h.restart(&mut rec);
             }
             h.after_replace(rec)
         }
@@ -1348,7 +1361,7 @@ impl<'a> Helper<'a> {
                 };
                 v.check_artifact(&name, &sha, &e)
                     .ok()
-                    .map(|()| v.signer.fingerprint.clone())
+                    .map(|_| v.signer.fingerprint.clone())
             });
             // 驗證過的回滾套件留在工作目錄（接續時只用這一份）。複製而不是改名：重新安裝同一版時回滾檔
             // 與發佈檔是同一個檔名
@@ -1566,14 +1579,22 @@ impl<'a> Helper<'a> {
                         self.req.target.version
                     ),
                 );
-                if let Err(e) = self.sys.restart_service() {
-                    self.log
-                        .line("WARN", &format!("systemctl restart 失敗：{e}"));
-                }
+                self.restart(&mut rec);
                 self.after_replace(rec)
             }
             Err(e) => self.replace_failed(rec, e),
         }
+    }
+
+    /// `systemctl restart pulse.service`，並記下已經送出（接續時不必再送）。在記下之前中斷的話接續時會再
+    /// 送一次：多重新啟動一次沒有副作用（`NRestarts` 只計自動重啟）
+    fn restart(&mut self, rec: &mut Record) {
+        if let Err(e) = self.sys.restart_service() {
+            self.log
+                .line("WARN", &format!("systemctl restart 失敗：{e}"));
+        }
+        rec.service_restarted = true;
+        self.save(rec);
     }
 
     /// 步驟 4：保留舊版、替換（REMOTE.md 第 17.9.3 節的 ①～⑤）。第一次執行與接續走同一段：每個動作都先看
@@ -1616,8 +1637,7 @@ impl<'a> Helper<'a> {
                     .line("INFO", "pulse.prev 已是替換前的執行檔，不再覆寫");
             }
         } else if cur == old {
-            copy_executable(&current, &prev)
-                .map_err(|e| format!("無法保留目前的執行檔：{e}"))?;
+            copy_executable(&current, &prev).map_err(|e| format!("無法保留目前的執行檔：{e}"))?;
             if self.sha(&prev) != old {
                 return Err("保留的 pulse.prev 與替換前的執行檔不符".to_string());
             }
@@ -1717,6 +1737,7 @@ impl<'a> Helper<'a> {
         }
         // ⑤ replaced
         rec.step = Step::Replaced;
+        rec.service_restarted = false;
         rec.n_restarts_before = before;
         rec.restarted_unix = self.sys.now_unix();
         rec.deadline_unix =
@@ -1748,7 +1769,10 @@ impl<'a> Helper<'a> {
         }
         self.log.line(
             "WARN",
-            &format!("替換無法完成（{e}），系統已被改過：還原到 {}", self.req.from_version),
+            &format!(
+                "替換無法完成（{e}），系統已被改過：還原到 {}",
+                self.req.from_version
+            ),
         );
         self.rollback(rec, format!("replace_failed: {e}"), Cause::ReplaceFailed)
     }
@@ -1863,6 +1887,7 @@ impl<'a> Helper<'a> {
         }
         self.sys.checkpoint("rollback_restored");
         rec.step = Step::RollingBack;
+        rec.service_restarted = false;
         rec.n_restarts_before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
         rec.restarted_unix = self.sys.now_unix();
         let timeout = Duration::from_secs(rec.health_timeout_secs).max(MIN_ROLLBACK_TIMEOUT);
@@ -1870,10 +1895,7 @@ impl<'a> Helper<'a> {
             rec.restarted_unix + i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
         self.save(&mut rec);
         self.sys.checkpoint("record_rolling_back");
-        if let Err(e) = self.sys.restart_service() {
-            self.log
-                .line("WARN", &format!("systemctl restart 失敗：{e}"));
-        }
+        self.restart(&mut rec);
         self.confirm_rollback(rec, reason)
     }
 
@@ -1941,7 +1963,7 @@ impl<'a> Helper<'a> {
                 }
                 if !old.is_empty() && prev_sha != old {
                     return Err(
-                        "無法換回 pulse.prev：它與這筆交易記下的替換前執行檔不符".to_string(),
+                        "無法換回 pulse.prev：它與這筆交易記下的替換前執行檔不符".to_string()
                     );
                 }
                 if self.sha(&current) != prev_sha {
@@ -2540,5 +2562,7 @@ pub fn parse_show(text: &str) -> ServiceState {
     s
 }
 
+#[cfg(test)]
+mod fault_tests;
 #[cfg(test)]
 mod tests;
