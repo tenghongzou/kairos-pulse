@@ -306,12 +306,19 @@ fn result_is_picked_up_while_still_running() {
 fn offers_are_declined_by_local_policy() {
     // (目前版本, 調整, 預期的代碼, detail 開頭)
     type Tweak = fn(&mut UpgradeEnv, &mut UpgradeOffer);
-    let cases: [(&str, Tweak, &str, &str); 6] = [
+    let cases: [(&str, Tweak, &str, &str); 7] = [
         (
             "0.9.0",
             |e, _| e.detection.upgrade = mgmt::INSTALL_UPGRADE_DISABLED,
             codes::I_UPGRADE_DISABLED,
             "disabled",
+        ),
+        // 路徑不安全的主機不宣告 upgrade，正常不會收到提議；收到時以輔助程式會回報的同一個代碼拒絕
+        (
+            "0.9.0",
+            |e, _| e.detection.upgrade = mgmt::INSTALL_UPGRADE_UNSAFE_PATH,
+            codes::E_UPGRADE_PRECHECK,
+            "unsafe_path",
         ),
         (
             "0.9.0",

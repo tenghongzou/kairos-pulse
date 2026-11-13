@@ -245,7 +245,7 @@ a07e1c5590d2b3f4  report   read  有效  2026-07-20 09:12 ops    2026-10-18 09:1
 | `version` | `0.3.0,0.2.0` | `agent_version`（完全相同） |
 | `durable` | `true` | 最近一次連線是否協商了補送（`durable`）；Kairos 重新啟動後尚未連線的主機不知道，兩種值都不符合 |
 | `config_state` | `pending,rejected` | 集中設定的狀態（0.9.0；`in_sync`、`pending`、`rejected`、`rolled_back`、`overridden`、`disabled`、`unsupported`、`never_reported`，第 17.1 節）。其他值 400 |
-| `remote_upgrade` | `ready,no_helper` | 遠端升級的本機狀態（0.9.0；hello 的 `install.upgrade`：`ready`、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`，沒有 `install` 的主機〔Pulse 0.8 以前〕為 `none`）。格式不符 400 |
+| `remote_upgrade` | `ready,no_helper` | 遠端升級的本機狀態（0.9.0；hello 的 `install.upgrade`：`ready`、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`、`unsafe_path`〔Pulse 0.10.0 起：安裝路徑沒有通過升級輔助程式的路徑檢查〕，沒有 `install` 的主機〔Pulse 0.8 以前〕為 `none`）。格式不符 400 |
 | `subnet` | `10.30.3.0/24,2001:db8::/48` | 最後已知 IP 在網段內（CIDR；只寫位址表示單一位址；主機位元必須為 0，否則 400 並建議正確的寫法） |
 | `q` | `hmi-line3`、`6f1c0e4a`、`10.30.3.27`、`10.30.3.0/24` | 搜尋（設計包 S04）：是 IP 時比對最後已知 IP；是 CIDR 時同 `subnet`；其他比對主機名稱與顯示名稱（片段、不分大小寫）與 `agent_id` 前綴（4 個字元以上） |
 | `sort` | `-last_seen` | 排序欄位，前面加 `-` 為遞減；見下表。預設 `status` |
@@ -1560,7 +1560,7 @@ done
 
 `approve` 的本文必須帶 `confirm` 與 `digest`（從 `submission` 取得），伺服器在核准的同一個交易中重新計算並比對；只在用戶端比對不構成確認。`warnings[]` 是固定代碼（預覽也有；讀取端應容忍不認得的代碼）：`single_wave`、`large_first_wave`、`no_pause_between_waves`、`empty_wave`、`downgrade`、`no_rollback`、`artifact_problem`、`no_approvers`。
 
-**資格分類**（REMOTE.md 第 4.7.2 節；`skipped` 的 `reason`）：`already`、`unsupported_version`（低於 0.9.0 或沒有 `install`）、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`、`not_ready`（依 `install.upgrade`）、`unsupported_platform`、`no_artifact`、`artifact_missing`（0.10.0：版本庫記錄這個平台的發佈檔已存入，但檔案不存在或大小不符，`KRS-W8417`；重新上傳後可以升級。與「沒有這個平台的檔案」的 `no_artifact` 分開）、`min_upgrade_from`、`no_manifest`（升級的目標沒有清單）、`downgrade_not_allowed`、`no_rollback`、`decommissioned`。讀取端應容忍不認得的原因（主控台顯示為「其他原因（代碼）」）。連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤為準，協商了 `upgrade` 的連線再以發提議時使用的資訊覆蓋：預覽、建立、送出與發提議一致，主機連線後不必等清冊每 30 秒的同步（0.9.0〔草稿〕起；之前只有協商了遠端管理的連線如此）。清冊還沒有的主機（連線後尚未寫入過任何資料）不在對象中。已在另一個未結束的推送中的主機：建立與送出時 409 `rollout_overlap`（`details.count`、`agent_ids`、`hosts[]` 前 100 台）。順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)`。
+**資格分類**（REMOTE.md 第 4.7.2 節；`skipped` 的 `reason`）：`already`、`unsupported_version`（低於 0.9.0 或沒有 `install`）、`disabled`、`no_trust_anchor`、`no_helper`、`unsupported`、`unsafe_path`（0.10.0：Pulse 0.10.0 起在 hello 事先回報安裝路徑沒有通過升級輔助程式的路徑檢查——不標出的話要到推送時才以 `PLS-E8405` 失敗；在主機上修正路徑的擁有者與權限後，Pulse 下一次連線時恢復）、`not_ready`（以上依 `install.upgrade`；`not_ready` 是不認得的值）、`unsupported_platform`、`no_artifact`、`artifact_missing`（0.10.0：版本庫記錄這個平台的發佈檔已存入，但檔案不存在或大小不符，`KRS-W8417`；重新上傳後可以升級。與「沒有這個平台的檔案」的 `no_artifact` 分開）、`min_upgrade_from`、`no_manifest`（升級的目標沒有清單）、`downgrade_not_allowed`、`no_rollback`、`decommissioned`。讀取端應容忍不認得的原因（主控台顯示為「其他原因（代碼）」）。連線中的主機（狀態表）以最近一次 hello 的版本、`install`、`os.arch` 與標籤為準，協商了 `upgrade` 的連線再以發提議時使用的資訊覆蓋：預覽、建立、送出與發提議一致，主機連線後不必等清冊每 30 秒的同步（0.9.0〔草稿〕起；之前只有協商了遠端管理的連線如此）。清冊還沒有的主機（連線後尚未寫入過任何資料）不在對象中。已在另一個未結束的推送中的主機：建立與送出時 409 `rollout_overlap`（`details.count`、`agent_ids`、`hosts[]` 前 100 台）。順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)`。
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|

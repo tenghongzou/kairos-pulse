@@ -168,6 +168,37 @@ fn eligibility_follows_section_4_7_2() {
         why(&host(1, "0.9.0", "tar", "something"), &o),
         Some("not_ready")
     );
+    // Pulse 0.10.0 起的 `unsafe_path`：專屬的原因，不落入 not_ready；deb／rpm 也一樣（在平台與發佈檔的
+    // 檢查之前：路徑不修正的話，有沒有發佈檔都無法升級）
+    for method in ["tar", "deb", "rpm"] {
+        assert_eq!(
+            why(&host(1, "0.10.0", method, "unsafe_path"), &o),
+            Some(SKIP_UNSAFE_PATH),
+            "{method}"
+        );
+    }
+    assert_eq!(SKIP_UNSAFE_PATH, "unsafe_path");
+    assert_eq!(
+        SKIP_UNSAFE_PATH,
+        kairos_proto::mgmt::INSTALL_UPGRADE_UNSAFE_PATH
+    );
+    // 已是目標版本、已除役、Pulse 太舊的判斷仍然優先
+    assert_eq!(
+        why(&host(1, "0.9.1", "tar", "unsafe_path"), &o),
+        Some("already")
+    );
+    let mut gone = host(1, "0.10.0", "tar", "unsafe_path");
+    gone.decommissioned = true;
+    assert_eq!(why(&gone, &o), Some("decommissioned"));
+    // 新版 Kairos 收到舊 Pulse（0.9：沒有這個值）照舊；規格定義的每個值都有專屬的原因，不落入 not_ready
+    for state in kairos_proto::mgmt::INSTALL_UPGRADE_STATES {
+        let got = why(&host(1, "0.9.0", "tar", state), &o);
+        if state == kairos_proto::mgmt::INSTALL_UPGRADE_READY {
+            assert_eq!(got, None);
+        } else {
+            assert_eq!(got, Some(state), "install.upgrade = {state}");
+        }
+    }
     assert_eq!(
         why(&host(1, "0.9.0", "msi", "ready"), &o),
         Some("unsupported_platform")

@@ -47,7 +47,7 @@ export function configStateBadge(s) {
 }
 
 // ---- 遠端升級的本機狀態（install.upgrade；沒有 install 為 none） ----
-export const UPGRADE_STATES = ['ready', 'disabled', 'no_trust_anchor', 'no_helper', 'unsupported', 'none'];
+export const UPGRADE_STATES = ['ready', 'disabled', 'no_trust_anchor', 'no_helper', 'unsafe_path', 'unsupported', 'none'];
 
 export function upgradeKey(install) {
   return install && install.upgrade ? install.upgrade : 'none';
@@ -60,7 +60,7 @@ export function upgradeLabel(v) {
 
 export function upgradeBadge(v) {
   if (v === 'ready') return statusBadge('online', upgradeLabel(v));
-  if (v === 'no_trust_anchor' || v === 'no_helper') return statusBadge('warning', upgradeLabel(v));
+  if (v === 'no_trust_anchor' || v === 'no_helper' || v === 'unsafe_path') return statusBadge('warning', upgradeLabel(v));
   return neutralBadge(upgradeLabel(v));
 }
 

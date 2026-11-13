@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use kairos_proto::mgmt::{
     DEFAULT_HEALTH_TIMEOUT_SECS, INSTALL_METHOD_DEB, INSTALL_METHOD_RPM, INSTALL_UPGRADE_READY,
-    MAX_HEALTH_TIMEOUT_SECS, MIN_HEALTH_TIMEOUT_SECS,
+    INSTALL_UPGRADE_UNSAFE_PATH, MAX_HEALTH_TIMEOUT_SECS, MIN_HEALTH_TIMEOUT_SECS,
 };
 use kairos_proto::release::{self, Os, ReleaseManifest, Version};
 
@@ -594,6 +594,11 @@ pub struct ReleaseContext {
 /// 沒有這個平台的檔案」的 `no_artifact` 分開）。也是推送中主機等待檔案時的 `reason`、API 的 409 錯誤碼
 pub const SKIP_ARTIFACT_MISSING: &str = "artifact_missing";
 
+/// 資格分類的原因：Pulse（0.10.0 起）在 hello 回報 `install.upgrade = "unsafe_path"`——安裝目錄、執行檔、
+/// 輔助程式的工作目錄或它們的上層目錄沒有通過升級輔助程式的路徑檢查（REMOTE.md 第 17.9.7 節）。不事先
+/// 標出的話，這台主機要到推送時才以 `PLS-E8405`（`unsafe_path`）失敗
+pub const SKIP_UNSAFE_PATH: &str = "unsafe_path";
+
 /// 這台主機的發佈檔（依 `install.method` 與 `os.arch`）
 pub fn pick_artifact<'a>(
     artifacts: &'a [ArtifactRow],
@@ -626,7 +631,8 @@ pub struct Eligibility {
 }
 
 /// REMOTE.md 第 4.7.2 節的資格分類。跳過的原因：`already`、`unsupported_version`、`disabled`、
-/// `no_trust_anchor`、`no_helper`、`unsupported`、`not_ready`、`unsupported_platform`、`no_artifact`、
+/// `no_trust_anchor`、`no_helper`、`unsupported`、`unsafe_path`（0.10.0）、`not_ready`（不認得的
+/// `install.upgrade`）、`unsupported_platform`、`no_artifact`、
 /// `artifact_missing`、`min_upgrade_from`、`no_manifest`、`downgrade_not_allowed`、`no_rollback`、
 /// `decommissioned`
 pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) -> Eligibility {
@@ -660,6 +666,10 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
         Some("no_trust_anchor") => return skip(e, "no_trust_anchor"),
         Some("no_helper") => return skip(e, "no_helper"),
         Some("unsupported") => return skip(e, "unsupported"),
+        // Pulse 0.10.0 起：其他條件都就緒，但安裝路徑不會通過升級輔助程式的路徑檢查（推送的話會以
+        // PLS-E8405 `unsafe_path` 失敗）。0.9 的 Pulse 不會送這個值
+        Some(INSTALL_UPGRADE_UNSAFE_PATH) => return skip(e, SKIP_UNSAFE_PATH),
+        // 不認得的值（比這個 Kairos 新的 Pulse）
         Some(_) => return skip(e, "not_ready"),
     }
     let method = h.install_method.as_deref().unwrap_or("unknown");

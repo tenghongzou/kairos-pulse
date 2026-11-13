@@ -389,7 +389,7 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 | 欄位 | 說明 |
 |---|---|
 | `method` | 安裝方式：`tar`、`deb`、`rpm`、`msi`、`zip`、`unknown`（偵測方式見 REMOTE.md 第 4.3 節） |
-| `upgrade` | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）。不是 `ready` 時 Pulse **不宣告** `upgrade` |
+| `upgrade` | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）、`unsafe_path`（Pulse 0.10.0 起：其他條件都就緒，但安裝路徑沒有通過升級輔助程式的路徑檢查；REMOTE.md 第 17.9.7 節。協定版本不變：不認得的值不是錯誤，0.9 的 Kairos 原樣保存並把這台主機分類為 `not_ready`）。不是 `ready` 時 Pulse **不宣告** `upgrade` |
 | `config` | 集中設定的本機狀態：`enabled`、`disabled` |
 
 ### `pending`

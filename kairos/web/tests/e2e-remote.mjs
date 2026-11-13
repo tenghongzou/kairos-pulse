@@ -11,6 +11,8 @@
 //   → 無法自動回滾的 L2 字串（攔截預覽）→ L2 輸入「升級 1 台」送出 → 詳情；維運者只有「暫停…」（L1、原因必填；
 //   主控台暫停不附 KRS-W8414）→ 計數泡泡；自動暫停的標題與 KRS-W8414、計數泡泡依清單的 meta（攔截 API）→
 //   管理員「繼續…」→「取消推送…」。
+// - 0.10 路徑不安全：pulse-09 以 install.upgrade = unsafe_path 重新連線 → 資格預覽的專屬原因（API 與 S26 表單）、
+//   S05「升級」卡片的狀態與處置方式 → 還原為就緒。
 // - S20「遠端管理」列（信任錨未設定的警告與捷徑；0.10 的「版本庫的檔案遺失」；唯讀不顯示）。
 // - S24（維運者，config:write）：新增設定檔（依 schema 產生的欄位、範圍錯誤、隱私敏感的選項）→ 指派全站（影響預覽）→
 //   修改產生第 2 版 → 版本歷史 → 回復到第 1 版 → 刪除被指派擋下 → S05「設定」分頁 → 解除指派 → 刪除；稽核員唯讀。
@@ -239,6 +241,69 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await v.page.locator('[data-item="database"]').waitFor();
     assert.equal(await v.page.locator('[data-item="remote"]').count(), 0);
     await v.ctx.close();
+  });
+
+  test('F8 S26／S05 路徑不安全（0.10）：hello 的 install.upgrade = unsafe_path → 資格預覽與主機詳情標出原因與處置', async () => {
+    assert.ok(agent, '需要上一個測試連線的 pulse-09');
+    const { ctx, page } = await newPage();
+    await login(page, 'admin', PW, '/account');
+    await waitTitle(page, '個人設定');
+    // 同一台主機以新的 install 重新連線（同一個 boot_id：不是重新開機）
+    const reconnect = async (upgrade) => {
+      agent.close();
+      agent.install = { method: 'tar', upgrade, config: 'enabled' };
+      agent.seq = 0;
+      await until(async () => {
+        try {
+          await agent.connect();
+          return true;
+        } catch {
+          agent.close();
+          return false;
+        }
+      }, 30000, `pulse-09 以 install.upgrade=${upgrade} 重新連線`);
+      await until(async () => {
+        const r = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
+        return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === upgrade;
+      }, 30000, `pulse-09 的 install.upgrade=${upgrade}`);
+    };
+    await reconnect('unsafe_path');
+    try {
+      // 資格預覽（API）：專屬的原因 unsafe_path，不是 not_ready，也不算可升級
+      const pv = await api(page, 'POST', '/api/v1/rollouts/preview', { name: 'x', target_version: VERSION, selector: { all: true }, waves: [{ size: 'rest' }] });
+      assert.equal(pv.status, 200, JSON.stringify(pv.json));
+      assert.deepEqual([pv.json.data.eligible, pv.json.data.skipped.unsafe_path, pv.json.data.skipped.not_ready], [0, 1, undefined], JSON.stringify(pv.json.data));
+      // S26 建立推送的資格預覽
+      await page.goto(`${URL0}/pulse/rollouts/new`);
+      await waitTitle(page, '建立推送');
+      await page.getByLabel(/^名稱/).fill('E2E 路徑不安全');
+      const preview = page.locator('#rollout-preview');
+      const line = preview.locator('li[data-reason="unsafe_path"]');
+      await line.waitFor({ timeout: 15000 });
+      assert.match(await line.innerText(), /安裝路徑不安全（PLS-E8405；.*）：1 台/);
+      await preview.getByText('可升級 0 台').waitFor();
+      await axe(page, 'F8 S26 資格預覽（路徑不安全）');
+      // S05 的「升級」卡片：狀態與處置方式（主機詳情的 install 來自主機清單的索引，定期同步）
+      await until(async () => {
+        const r = await api(page, 'GET', `/api/v1/hosts/${P09}`);
+        return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === 'unsafe_path';
+      }, 60000, '主機詳情的 install.upgrade');
+      await page.goto(`${URL0}/hosts/${P09}`);
+      await waitTitle(page, 'pulse-09');
+      await page.locator('#host-upgrade-title').waitFor({ timeout: 15000 });
+      await page.getByText('路徑不安全', { exact: true }).first().waitFor({ timeout: 15000 });
+      await page.getByText(/安裝路徑不安全（PLS-E8405）：.*pulse upgrade status/).first().waitFor();
+      await axe(page, 'F8 S05 升級卡片（路徑不安全）');
+      await shot(page, 'remote-host-unsafe-path');
+    } finally {
+      // 還原：之後的測試需要就緒的 pulse-09
+      await reconnect('ready');
+      await until(async () => {
+        const r = await api(page, 'GET', `/api/v1/hosts/${P09}`);
+        return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === 'ready';
+      }, 60000, '主機詳情的 install.upgrade 還原');
+    }
+    await ctx.close();
   });
 
   test('F8 S26 升級推送：資格預覽 → L2 送出 → 維運者暫停（計數泡泡）→ 管理員繼續、取消 → 刪除版本（L2）', async () => {

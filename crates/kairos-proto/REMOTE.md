@@ -73,10 +73,11 @@ flowchart LR
 | 欄位 | 型別 | 說明 |
 |---|---|---|
 | `method` | string | 安裝方式：`tar`、`deb`、`rpm`、`msi`、`zip`、`unknown`（偵測方式見第 4.3 節） |
-| `upgrade` | string | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台） |
+| `upgrade` | string | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）、`unsafe_path`（**Pulse 0.10.0 起**：其他條件都就緒，但安裝路徑沒有通過升級輔助程式的路徑檢查，第 17.9.7 節「hello 之前的預檢」） |
 | `config` | string | 集中設定的本機狀態：`enabled`、`disabled` |
 
 - 限制：三個欄位都是 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值由 Kairos 原樣保存、顯示為「其他」。其他欄位忽略。物件或欄位型別錯誤時 `bad_request`（與 `os` 相同）；協商結果為 v1 時忽略。
+- **`unsafe_path` 不需要改協定版本**（0.10.0）：它符合上面的格式限制，而「不認得的值不是錯誤」是 0.9.0 就定下的規則。0.9 的 Kairos 收到 0.10 的 Pulse 送的 `unsafe_path`：原樣保存，主控台顯示為「其他（unsafe_path）」，資格分類為 `not_ready`（一樣不會被提議升級，只是原因不精確）。0.10 的 Kairos 收到 0.9 的 Pulse：0.9 不做預檢，不合規的主機回報 `ready`，要到升級到 0.10.0 之後才會回報——0.9 的輔助程式也沒有路徑檢查，所以 0.9 → 0.10 的那一次升級不受影響。判斷順序：`disabled` → `unsupported` → `no_trust_anchor` → `no_helper` → `unsafe_path` → `ready`（只有「原本會是 `ready`」的主機才做預檢）。
 - `upgrade` 為 `ready` 以外的值時 Pulse **不宣告** `upgrade`；Kairos 因此不會對它提議升級，主控台依 `install.upgrade` 顯示原因。
 
 ### 2.2 `pending`：有新的設定或升級
@@ -547,7 +548,7 @@ stateDiagram-v2
 
 #### 4.7.2 主機的順序與資格
 
-- 建立推送時計算資格（預覽 API，第 8.3 節）：可升級、已是目標版本（`skipped: already`）、Pulse 太舊（`unsupported_version`，< 0.9.0）、本機停用或缺少輔助程式（依 `install.upgrade`）、低於 `min_upgrade_from`、沒有對應平台的發佈檔、無法自動回滾、多實例、已在另一個進行中的推送（一台主機同時只能屬於一個進行中的推送，建立時 409 `rollout_overlap`）。
+- 建立推送時計算資格（預覽 API，第 8.3 節）：可升級、已是目標版本（`skipped: already`）、Pulse 太舊（`unsupported_version`，< 0.9.0）、本機停用、缺少輔助程式或安裝路徑不安全（依 `install.upgrade`；`unsafe_path` 是 Pulse 0.10.0 起事先回報的路徑檢查結果，原因代碼 `unsafe_path`，第 17.9.7 節——不事先標出的話這台主機要到推送時才以 `PLS-E8405` 失敗；不認得的 `install.upgrade` 值分類為 `not_ready`）、低於 `min_upgrade_from`、沒有對應平台的發佈檔、無法自動回滾、多實例、已在另一個進行中的推送（一台主機同時只能屬於一個進行中的推送，建立時 409 `rollout_overlap`）。
 - **版本庫的檔案遺失**（0.10.0，ADR-0002 F1～F3；`KRS-W8417`）：資料庫記為已存入、但檔案不存在或大小不符的發佈檔（代管的版本；只 `stat`，與系統健康相同）不算可以提議的檔案。預覽與送出時，需要它的主機分類為 `artifact_missing`（與「版本庫沒有這個平台的檔案」的 `no_artifact` 分開：一個是重新上傳、一個是匯入另一個檔案）；回滾檔遺失的 deb／rpm 主機算無法自動回滾。核准時再檢查一次（409 `artifact_missing`）；提議時不發出無法下載的提議（第 13.1 節）。外部 URL 的版本沒有本機檔案，不適用。
 - 批次中的順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)` 排序（同一個推送每次計算結果相同，不偏向某個群組）。
 - 推送進行中新註冊、或之後才符合選擇器的主機**不加入**（推送的對象在開始時固定）；要涵蓋它們請另建推送。
@@ -672,7 +673,7 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 
 **`rollout_approval` 只能在設定檔修改——已接受的治理缺口**
 
-把 `rollout_approval` 由 `required` 改為 `none` **不是** L3 操作，也沒有任何主控台流程：設定只在 `kairos.toml`（或環境變數 `KAIROS__REMOTE__ROLLOUT_APPROVAL`），需要重新啟動，主控台 S21 唯讀顯示。修改設定檔需要主機上的系統權限，但「權限高」不等於「兩個人」：有主機權限的人可以獨自把政策關掉、重新啟動，然後以單人送出大型推送（他也可以直接改資料庫）。主控台內的雙人覆核能防的是「單一的主控台管理員」，防不了主機的系統管理者。Kairos 做的是**讓關閉這件事無法安靜地發生**：
+把 `rollout_approval` 由 `required` 改為 `none` **不是** L3 操作，也沒有任何主控台流程：`rollout_approval` 只能在設定檔 `kairos.toml` 或環境變數（`KAIROS__REMOTE__ROLLOUT_APPROVAL`）修改，需要重新啟動，主控台 S21 唯讀顯示。主控台內的雙人覆核約束的是**主控台帳號**：沒有任何單一主控台帳號能讓自己的推送不經另一位管理員核准就開始。它**不約束**能修改 Kairos 主機的設定、或能直接寫入 Kairos 資料庫的人（PostgreSQL 時包括資料庫管理者）：這些人可以獨自關閉政策，也可以直接改資料庫中推送的狀態——「權限高」不等於「兩個人」。Kairos 能做到的是**偵測經由設定檔的關閉**：啟動時與資料庫記錄的前值比對，寫入稽核並開告警事件。這個偵測有前提：前值記錄存在同一個資料庫，能寫資料庫的人可以先改掉它；告警事件可以被有 `alert-rules:write`、`silences:write` 的帳號（維運者以上）預先靜音或停用（停用系統預設規則要填原因；這些操作有稽核 `alert_rule.disable`、`silence.create`，但稽核也在同一套系統內）。因此偵測只有在告警即時送到通知管道、稽核即時外送到 Kairos 以外的系統時才可靠。做法：
 
 - **前值保存在資料庫**（`meta` 表的 `remote.rollout_approval_observed`，JSON：`value`、`source`＝`file`／`environment`／`default`、`observed_at`、`node`、`changed_at`、`changed_from`、`disabled_at`；隨備份、`kairos db migrate` 與叢集共用，不需要 schema 變更）。
 - **啟動時比對**，在遠端管理開始接受請求（主控台 API、8443 的遠端管理訊息、推送引擎）**之前**、在同一個交易中寫入稽核與新的紀錄。叢集模式下只有取得租約的節點會啟動遠端管理，所以只有主動節點寫入。
@@ -689,7 +690,7 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 
 - **寫入失敗時遠端管理不啟動**：主控台的集中設定、版本庫與升級推送回 503 `remote_unavailable`，Kairos 不宣告 `config`、`upgrade`；其餘功能與既有主機的連線照常。不能在沒有記錄的情況下以新的政策接受推送。
 - **告警事件「雙人覆核已關閉」**（系統規則 `sys.rollout_approval_disabled`，警告等級、預設推播；尚未分配產品代碼）：觀察到 `required` → `none` 時開啟，到改回 `required` 並重新啟動為止不會自己結束。系統健康的「遠端管理」與 S26 清單頁首在 30 天內顯示關閉的時間與來源（`rollout_approval_change`）；S21 顯示目前的值、來源與上一次改變的時間。
-- **事件只留在同一台 Kairos 上的侷限**：能改設定檔的人通常也能動這台機器上的紀錄。事件的價值取決於它有沒有離開這台機器——通知管道（Email、Webhook）與稽核的外送。
+- **偵測的侷限（0.10.0 的現況）**：前值、告警事件與稽核都在同一套系統內。能改設定檔的人通常也能動這台機器上的紀錄；能寫資料庫的人可以先改掉前值，讓啟動時的比對看不出改變；維運者以上的主控台帳號可以預先靜音這條系統規則或把它停用（`sys.rollout_approval_disabled` 在 0.10.0 沒有標為不可靜音）。所以這個偵測只有在事件即時離開 Kairos 時才可靠——告警送到通知管道（Email、Webhook），稽核（含 `alert_rule.*`、`silence.*`）外送到 Kairos 以外的系統。
 - **部署端的補償措施**（部署單位的責任，Kairos 不強制；`kairos/packaging/INSTALL.md`「啟用雙人覆核時的部署建議」）：`kairos.toml` 納入設定管理並由另一個人審核修改；主機上的特權操作經過核准或側錄、限制誰可以重新啟動 Kairos；對 `kairos.toml` 設檔案完整性監控；把「雙人覆核已關閉」接到通知管道、稽核日誌外送到 Kairos 以外的系統。
 - 資料庫遺失或換成新的資料庫時等同「沒有前值」，沒有歷史可以判斷，是這個做法的已知限制。可從主控台修改並需要另一位管理員核准的做法（ADR-0002 決策點 2i 的方案 B）列為之後的版本。
 - 改為 `none` 之後，已經在 `pending_approval` 的推送仍然要核准或退回（核准只看推送的狀態）。
@@ -780,7 +781,7 @@ CREATE INDEX host_config_state ON host_config(state);
 
 -- 主機的安裝資訊（hello 的 install）
 ALTER TABLE hosts ADD COLUMN install_method  TEXT;
-ALTER TABLE hosts ADD COLUMN install_upgrade TEXT;   -- ready／disabled／no_trust_anchor／no_helper／unsupported
+ALTER TABLE hosts ADD COLUMN install_upgrade TEXT;   -- ready／disabled／no_trust_anchor／no_helper／unsupported／unsafe_path（0.10.0；欄位是自由文字，不需要 schema 變更）
 ALTER TABLE hosts ADD COLUMN install_config  TEXT;
 
 -- 發佈版本庫
@@ -1418,9 +1419,11 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `rolling_back` | 已還原 | 重新啟動服務 → 記錄 `service_restarted` → 確認舊版恢復 → `done`（`rolled_back`；`cause` 為 `replace_failed` 時是 `failed`／`PLS-E8406`；不恢復：`rollback_failed`） |
 | `done` | 結果已記錄 | 寫 `result.json` → 刪除 `request.json` → 清理 → 刪除指標 |
 
-寫入失敗的處理（fail closed）：`preparing`、`prepared`、指標、`replacing`、`prev_saved`、`unit_backed_up` 任何一次寫不進去就**不再往下做**——此時執行檔、unit、套件資料庫都還沒被改過，結果是 `failed`（`PLS-E8406`，`state_not_saved: …`）。`replaced` 之後的寫入（`replaced`、`rollback_intent`、`rolling_back`、`done`）失敗時不能半途停下：記 `WARN` 後繼續，這次執行仍會做完；之後接續時依磁碟實況冪等重做（下表）。`done` 寫不進去時，為了不讓下一個請求把這筆已結束的交易當成未結束，輔助程式改為刪除 `state.json`（刪除不需要空間）；連刪除都失敗時（檔案系統唯讀或損壞）**指標照常清除**：留下的那份未結束的紀錄沒有指標，之後的請求依第 17.9.5 節以 `state_unusable` 擋下。〔與實作前的設計不同：原本寫「指標保留」。指標保留的話，下一次觸發會「接續」這筆其實已經結束的交易——期限早已過去，結果是回滾一個已完成的升級；清除指標才是不替換也不回滾的那一邊〕
+寫入失敗的處理（fail closed）：`preparing`、`prepared`、指標、`replacing`、`prev_saved`、`unit_backed_up` 任何一次寫不進去就**不再往下做**——此時執行檔、unit、套件資料庫都還沒被改過，結果是 `failed`（`PLS-E8406`，`state_not_saved: …`）。`replaced` 之後的寫入（`replaced`、`rollback_intent`、`rolling_back`、`done`）失敗時不能半途停下：記 `WARN` 後繼續，這次執行仍會做完；之後接續時依磁碟實況冪等重做（下表）。`done` 寫不進去時，為了不讓下一個請求把這筆已結束的交易當成未結束，輔助程式改為刪除 `state.json`（刪除不需要空間）；連刪除都失敗時（檔案系統唯讀或損壞）**指標照常清除**：留下的那份未結束的紀錄沒有指標，之後的請求依第 17.9.5 節以 `state_unusable` 擋下。〔與實作前的設計不同：原本寫「指標保留」。指標保留的話，下一次觸發會「接續」這筆其實已經結束的交易——期限早已過去，結果是回滾一個已完成的升級；清除指標才是不替換也不回滾的那一邊〕**已知的殘餘情況**：連指標都刪不掉時（例如整個 `/var/lib/pulse-upgrade` 所在的檔案系統變成唯讀，`state.json` 與 `active.json` 的 unlink 一起失敗），這次執行仍回報它實際的結果，但指標與停在 `replaced` 的紀錄都留著；檔案系統恢復後的下一次觸發會接續這筆交易，期限已過 → 回滾一個其實已完成的升級（單元測試 `a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_resumed_later` 鎖住現行行為；輔助程式的日誌有 `無法寫入也無法刪除 …state.json` 與 `無法刪除 …active.json`）。
 
-**重新啟動只送一次，但中斷後會補送**：`replaced`、`rolling_back` 寫入時 `service_restarted = false`，`systemctl restart` 送出後才記為 `true`。接續時還是 `false`（在兩者之間中斷）就再送一次——主機重新開機的話多重新啟動一次沒有副作用（`NRestarts` 只計自動重啟）；只有輔助程式自己被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機時，服務仍是替換（或還原）前啟動的行程，不補送的話健康確認會一路等到期限而誤判。〔實作時補上；實作前的設計假設中斷一定伴隨重新開機〕由 v1 轉換的紀錄照 v1 的行為（不補送）。
+**重新啟動只送一次，但中斷後會補送**：`replaced`、`rolling_back` 寫入時 `service_restarted = false`，`systemctl restart` 送出後才記為 `true`。接續時還是 `false`（在兩者之間中斷）就再送一次——主機重新開機的話多重新啟動一次沒有副作用（`NRestarts` 只計自動重啟）；只有輔助程式自己被終止而主機沒有重新開機時（OOM、人工 `kill` 等，`request.json` 還在，很快就被 `pulse-upgrade.path` 重新觸發），服務仍是替換（或還原）前啟動的行程，不補送的話健康確認會一路等到期限而誤判。〔實作時補上；實作前的設計假設中斷一定伴隨重新開機〕由 v1 轉換的紀錄照 v1 的行為（不補送）。
+
+**補送重新啟動時不重新起算期限**：期限（`deadline_unix`）在寫入 `replaced`／`rolling_back` 時就定下，接續時沿用。接續 `replaced` 時期限已過的話，輔助程式**不做健康確認、直接回滾**（原因 `health_timeout`，沒有括號中的最後狀態）——即使新版的服務一直正常執行，也即使剛剛才補送了重新啟動。所以補送只對「很快就被重新觸發」的終止有意義。被 unit 的 `TimeoutStartSec` 終止**不是**這種情況：`pulse-upgrade.service` 的逾時是 2.5 小時，健康確認的期限最長 3600 秒，被逾時終止時期限早已過去，接續的結果是回滾。〔先前這裡以 `TimeoutStartSec` 為例，不成立。單元測試 `a_helper_killed_and_resumed_after_the_deadline_rolls_back_without_a_health_check` 鎖住現行行為；「期限已過而服務健康」時是否改為先確認再決定，屬於之後版本的補強〕
 
 **接續時不重讀暫存區、不重新驗證簽章**：`replacing` 之後的接續只使用工作目錄裡的複本，以紀錄中的雜湊確認它們沒有變（信任結論在 `prepared` 時已經與雜湊一起記下，INV-3 的「取得時驗證」）。暫存區（`pulse` 帳號可寫）、`request.json`、當下的信任錨與 `pulse.toml` 的 `[upgrade]` 都不再影響這筆交易。`request.json` 只用來觸發輔助程式；它讀不到或不合法時，有指標就照常接續（加註 `request_unreadable`）。
 
@@ -1500,6 +1503,18 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 
 沒有檢查：掛載選項（`nosuid`、`noexec`）、檔案系統類型、ACL 與 SELinux 標籤、`/etc/systemd/system` 的權限、`pulse.toml` 的擁有者（INSTALL 規定 `root:pulse 640`；輔助程式只讀它，不寫）。
 
+**hello 之前的預檢（0.10.0；`install.upgrade = "unsafe_path"`）**：Pulse（服務帳號 `pulse`，不是 root）在每次連線前偵測安裝狀態時（第 2.1、4.3 節），對「其他條件都就緒」的主機先做一次上表的檢查，不通過就在 hello 回報 `install.upgrade = "unsafe_path"`、不宣告 `upgrade`；Kairos 的資格預覽把它分類為 `unsafe_path`（第 4.7.2 節），主控台的資格預覽與主機詳情顯示「路徑不安全」與處置方式。目的是讓不合規的主機在建立推送時就被標出來，而不是等推送失敗（`PLS-E8405`）。`pulse upgrade status` 顯示「路徑不安全（PLS-E8405）」，「原因」是與輔助程式的 `detail` 相同的 `unsafe_path: <路徑>: <原因>`。
+
+- **同一套檢查**：預檢與輔助程式呼叫同一組函式（`helper/txn.rs` 的 `inspect_install`、`inspect_private_dir`；預檢的進入點是 `precheck`），不是另外寫的一份。單元測試對每一種不安全的情況確認兩者回報**同一個**路徑與原因。
+- **預檢不建立、不修改任何東西**；輔助程式的檢查**維持不變**（`/var/lib/pulse-upgrade` 不存在時建立、只多了讀取／執行權限時改回 0700）。預檢只是提早告知，不取代輔助程式的檢查：兩者之間路徑可能改變，輔助程式每次執行都重新檢查。
+- **涵蓋**（服務帳號以 `lstat`／`realpath` 做得到的）：`/opt/pulse` 與它的每一層上層目錄、`/opt/pulse/pulse`、`/opt/pulse/pulse.prev`（存在時）、`/var/lib/pulse-upgrade` 本身（`0700 root` 的目錄可以 `lstat`）與它的每一層上層目錄。`/var/lib/pulse-upgrade` 不存在（輔助程式第一次執行時才建立）、或群組與其他人只多了讀取／執行權限（輔助程式會改回）都算通過。
+- **不涵蓋**：每筆交易的工作目錄 `/var/lib/pulse-upgrade/<upgrade_id>` 與其中的檔案（根目錄是 `0700 root`，服務帳號進不去）——仍由輔助程式在執行時檢查（第 17.9.5 節的 `unsafe_path`）；上表「沒有檢查」的項目。
+- **看不到的不算不安全**：`lstat`／`realpath` 因為權限不足（`EACCES`）失敗時略過那一部分（安裝目錄、工作目錄的根目錄各自獨立），不回報 `unsafe_path`——服務帳號看不到不代表路徑有問題；輔助程式（root）沒有這個例外。
+- **什麼時候更新**：與其他的 `install` 欄位相同，每次連線前重新偵測。連線期間路徑被改掉，要到下一次重新連線才會回報；已送出的推送中，送出之後才變成 `unsafe_path` 的主機沒有協商 `upgrade`，在推送中標為 `skipped`（`not_ready`），主機詳情顯示實際的狀態。
+- **相容**：見第 2.1 節。協定版本、schema 都不變。
+
+**路徑檢查在一切之前，包括接續**：`apply()` 的第一步就是安裝目錄與 `/var/lib/pulse-upgrade` 的檢查，在讀指標、掃描工作目錄之前。不通過時不論有沒有未結束的交易，都回報 `failed`（`PLS-E8405`）、刪除 `request.json`，不接續、不健康確認、不回滾。對全新的請求這就是「不做任何變更」；但有一個需要兩件事同時成立的情況：**0.9 → 0.10 的升級在替換之後中斷（當機、斷電），由 0.10.0 的輔助程式接續，而這台主機的路徑不符合上表**（0.9.0 的輔助程式沒有這項檢查，所以替換本身做得完）。此時主機停在新版（0.10.0）、沒有健康確認也沒有回滾，回報的 `upgrade_id` 是請求的；0.9.0 留下的 v1 紀錄（`replaced`）原封不動。修正路徑之後的**下一個**請求會依第 17.9.6 節接續這筆 v1 的交易——期限早已過去，結果是回滾到 0.9（`pulse.prev`）。處置：修正路徑後，先確認 0.10.0 運作正常，再刪除 `/var/lib/pulse-upgrade/<upgrade_id>`（那筆 v1 紀錄的工作目錄）才送出新的升級；不刪除的話，下一個請求（不論目標版本）得到的是回滾。0.10.0 之後開始的交易（v2）遇到同樣的情況時指標與紀錄同樣留著，修正路徑後的下一次觸發依第 17.9.3 節接續（期限已過 → 回滾）。
+
 #### 17.9.8 工作目錄的保留上限
 
 `pulse` 帳號可以不斷寫入新的 `request.json`（不同的 `upgrade_id`，或反覆讓升級失敗）。輔助程式保證 `/var/lib/pulse-upgrade` 不隨請求的次數成長：
@@ -1527,7 +1542,7 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 
 | 小節 | 實作前的設計 | 實作 | 理由 |
 |---|---|---|---|
-| 17.9.2、17.9.3、17.9.4 第 13、18 列 | `replaced`／`rolling_back` 接續時直接做健康確認（假設中斷一定伴隨重新開機） | 新欄位 `service_restarted`；接續時 `systemctl restart` 還沒送出就補送 | 輔助程式只是自己被終止（`TimeoutStartSec`、`SIGKILL`）時服務仍是舊的行程，會一路等到期限而誤判（0.9.0 起就有的窗口） |
+| 17.9.2、17.9.3、17.9.4 第 13、18 列 | `replaced`／`rolling_back` 接續時直接做健康確認（假設中斷一定伴隨重新開機） | 新欄位 `service_restarted`；接續時 `systemctl restart` 還沒送出就補送 | 輔助程式只是自己被終止（OOM、人工 `kill` 等，很快就被重新觸發）時服務仍是舊的行程，會一路等到期限而誤判（0.9.0 起就有的窗口）。期限不重新起算（第 17.9.3 節） |
 | 17.9.3 | `done` 寫不進去、連刪除都失敗時指標保留 | 指標照常清除；留下的未結束紀錄讓之後的請求以 `state_unusable` 擋下 | 指標保留會讓下一次觸發「接續」並回滾一筆其實已完成的升級 |
 | 17.9.3 ③ | tar：`new.bin` 改名取代 | 以 `new.bin` 的複本改名取代，`new.bin` 留到交易結束 | 接續時可依雜湊重做；替換仍是原子的改名 |
 | 17.9.4 | 每一列都是程式中的 checkpoint | 第 10、14、16（套件）、19 列由測試的假作業系統注入 | 這四點在套件管理員執行中或等待中，不在輔助程式自己的兩個動作之間 |
@@ -1542,6 +1557,7 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 - `fault_tests::crash_point_matrix_{tar,deb_with_a_rollback_package,deb_without_a_rollback_package,rpm}`：對照表 22 列中適用的列 × 新版健康／崩潰，共 136 個案例（tar 37、deb 有回滾套件 33、deb 無回滾套件 33、rpm 33）。每個案例：在那個點中止 → 檢查當機時的步驟、指標、執行檔、`pulse.prev`、unit、套件資料庫與旗標 → 重新開機（另一個假系統；第 4 列之後先刪掉服務帳號的暫存區）→ 接續 → 檢查結果、`detail`、執行檔、`pulse.prev`（一律是舊版）、unit、套件資料庫、`result.json`、指標已清除、工作目錄只留紀錄與日誌。
 - `the_matrix_covers_every_row_of_the_crash_point_table`：讀本文件第 17.9.4 節的表，列號連續 1～22、每一列的名稱都有對應的測試、矩陣沒有表以外的列；另確認一次完整的升級＋回滾經過程式中的每一個 checkpoint，且程式中沒有表以外的 checkpoint。
 - 其他：連續兩次中斷、只有輔助程式被終止（補送重新啟動）、`request.json` 讀不到或不見、替換無法完成（未變更／已變更後還原／還原後不恢復／複本被換掉）、回滾用的複本被換掉、結果寫不進紀錄；第 17.9.5 節的每一種損毀與遺失（指標 5 種、紀錄 10 種、指標遺失 4 個步驟、其他工作目錄的紀錄損毀、紀錄與系統矛盾、同一筆交易再次出現、全部消失）；第 17.9.6 節（`replaced`、`rolling_back`、`verified` 兩種、請求換了 `upgrade_id`、兩筆未結束、已結束）；第 17.9.7 節（工作目錄與安裝目錄各種不安全的情況、擁有者、接續時的工作目錄）；第 17.9.8 節（清理的保留規則、不刪除未結束或無法判斷的紀錄與非 UUID 的項目、連續 8 個請求不成長、連續 5 次 `rollback_failed`）；第 17.9.9 節（打包檢查的標記與程式一致）。
+- 0.10.0 打 tag 前補上（之後共 57 個）：兩個**鎖住現行行為**的測試——只終止輔助程式、期限之後才接續（不做健康確認就回滾；補送重新啟動不重新起算期限），以及 `done` 寫不進去且指標也刪不掉（指標留著，之後的請求接續並回滾）。見第 17.9.3 節。
 - 驗證測試本身有效：暫時植入三處錯誤（接續時不補送重新啟動、回滾時不還原 unit、沒有指標的未結束紀錄不擋下），9 個測試失敗；還原後全部通過。
 
 **kp-build 的結果**（Ubuntu 24.04；分支 `sprint11/helper-txn`）：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、同一命令加 `--target x86_64-pc-windows-gnu`、`cargo clippy -p pulse --all-targets --locked --features fault-injection -- -D warnings`、`cargo deny check` 通過；`cargo test --workspace --locked --exclude kp-e2e`（PostgreSQL 14，`KAIROS_TEST_PG_REQUIRED=1`）1646 通過、0 失敗、12 略過（其中 Pulse 572）；`cargo test -p kp-e2e` 62 通過、0 失敗、1 略過。

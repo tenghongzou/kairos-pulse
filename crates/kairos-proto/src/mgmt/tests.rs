@@ -544,6 +544,39 @@ fn install_limits() {
     assert_eq!(ext.host.as_ref().unwrap().install, None);
 }
 
+/// `install.upgrade = "unsafe_path"`（Pulse 0.10.0 起）不需要改協定版本：它符合 0.9.0 就定下的 `install`
+/// 欄位格式（1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值不是錯誤、原樣保存），所以 0.9 的 Kairos
+/// 收到新的 Pulse 的 hello 一樣能解析並通過驗證；Pulse 不因此宣告 `upgrade`，與其他非 `ready` 的值相同
+#[test]
+fn unsafe_path_is_a_valid_install_upgrade_value_for_old_and_new_peers() {
+    assert_eq!(INSTALL_UPGRADE_UNSAFE_PATH, "unsafe_path");
+    assert!(INSTALL_UPGRADE_STATES.contains(&INSTALL_UPGRADE_UNSAFE_PATH));
+    // 0.9.0 的格式限制（這個函式自 0.9.0 起沒有改變；常數本身必須永遠符合它）
+    assert!(is_install_token(INSTALL_UPGRADE_UNSAFE_PATH));
+    assert!(INSTALL_UPGRADE_UNSAFE_PATH.len() <= MAX_INSTALL_FIELD_BYTES);
+    for state in INSTALL_UPGRADE_STATES {
+        assert!(is_install_token(state), "{state}");
+    }
+    // 新的 Pulse 的 hello：可以解析、通過驗證，值原樣保存
+    let base = vectors(Ver::Mgmt, 'P')[0];
+    let line = base.replace(r#""upgrade":"ready""#, r#""upgrade":"unsafe_path""#);
+    assert_ne!(line, base);
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!();
+    };
+    let host = ext.host.as_ref().unwrap();
+    crate::validate_host_info(host).unwrap();
+    let install = host.install.clone().unwrap();
+    assert_eq!(install.upgrade.as_deref(), Some("unsafe_path"));
+    assert_eq!(install.method.as_deref(), Some(INSTALL_METHOD_TAR));
+    // Pulse 不宣告 upgrade（集中設定不受影響）
+    assert_eq!(client_mgmt_features(true, &install), [FEATURE_CONFIG]);
+    // 序列化後再解析結果相同（Kairos 存入資料庫的就是這個字串）
+    let json = serde_json::to_string(&install).unwrap();
+    assert!(json.contains(r#""upgrade":"unsafe_path""#), "{json}");
+    assert_eq!(serde_json::from_str::<InstallInfo>(&json).unwrap(), install);
+}
+
 // ---- 驗證 ----
 
 fn status() -> ConfigStatus {

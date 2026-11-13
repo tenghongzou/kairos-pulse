@@ -94,12 +94,17 @@ export const REMOTE_STRINGS = {
   'rm.up.no_trust_anchor': '缺少信任錨',
   'rm.up.no_helper': '缺少輔助程式',
   'rm.up.unsupported': '不支援',
+  // Pulse 0.10 起在 hello 事先回報升級輔助程式的路徑檢查結果（REMOTE.md 第 2.1、17.9.7 節）。設計包還沒有
+  // 這個狀態的文案（rm.up／rm.upFix／rm.skip 的 unsafe_path 三則），定案後替換〔工程暫行〕
+  'rm.up.unsafe_path': '路徑不安全',
   'rm.up.none': 'Pulse 太舊',
   'rm.up.other': '其他（{v}）',
   'rm.upFix.disabled': '這台主機的 pulse.toml 設定了 upgrade.enabled = false（PLS-I8409）；需要時在主機上開啟。',
   'rm.upFix.no_trust_anchor': '信任錨 allowed_signers 不存在或無法使用（PLS-E8403）：以 root 擁有、0644 放置官方公鑰。',
   'rm.upFix.no_helper': '缺少升級輔助程式（PLS-W8411）：啟用 pulse-upgrade.path，或改用 deb／rpm 套件安裝。',
   'rm.upFix.unsupported': '這台主機的安裝方式或條件不支援遠端升級（PLS-W8411），例如多實例或不明的安裝方式。',
+  'rm.upFix.unsafe_path':
+    '安裝路徑不安全（PLS-E8405）：/opt/pulse、/opt/pulse/pulse、/var/lib/pulse-upgrade 或它們的上層目錄不屬於 root、可由群組或其他人寫入，或是符號連結，遠端升級會被升級輔助程式拒絕。在主機上執行 pulse upgrade status 查看是哪一個路徑，改為 root 擁有並移除群組與其他人的寫入權限；Pulse 下一次連線時重新偵測。',
   'rm.upFix.none': '需要 Pulse 0.9.0 以上；0.8 → 0.9 必須在主機上手動升級一次。',
   // 安裝方式
   'rm.method.tar': 'tar',
@@ -509,6 +514,7 @@ export const REMOTE_STRINGS = {
   'rm.skip.no_trust_anchor': '缺少信任錨',
   'rm.skip.no_helper': '缺少輔助程式',
   'rm.skip.unsupported': '安裝方式不支援（多實例等）',
+  'rm.skip.unsafe_path': '安裝路徑不安全（PLS-E8405；在主機上修正 /opt/pulse 等路徑的擁有者與權限，主機詳情有說明）',
   'rm.skip.not_ready': '沒有協商遠端升級（未以 mTLS 連線或 Pulse 尚未就緒）',
   'rm.skip.unsupported_platform': 'Windows 或不支援的平台（Windows 在 0.10 起）',
   'rm.skip.no_artifact': '版本庫沒有這個平台的發佈檔',

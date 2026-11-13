@@ -7,7 +7,7 @@
 #   WORK=<目錄>         工作目錄（發佈物、金鑰、日誌；預設 ~/kp-systest，不可在 git repo 內）
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback reboot reboot-rollback signature
-#                       tamper tamper-resume crash-replace crash-rollback
+#                       tamper tamper-resume crash-replace crash-rollback unsafe-path
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
 #   KEEP=1              結束時保留容器與網路（除錯用；之後以 CLEAN_ONLY=1 清除）
@@ -27,7 +27,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume crash-replace crash-rollback}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume crash-replace crash-rollback unsafe-path}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -764,6 +764,54 @@ scenario_crash_rollback() {
     done
 }
 
+# install_state <主機>：「method upgrade negotiated version」（Kairos 看到的 hello）
+install_state() {
+    api GET "/api/v1/hosts/$(agent_of "$1")/upgrade" >/dev/null
+    body | jq -r '[.data.install.method, .data.install.upgrade, (.data.upgrade_negotiated|tostring), .data.agent_version] | join(" ")' 2>/dev/null || true
+}
+
+# wait_install <主機> <預期（grep -E）>：等 Kairos 看到的 install 符合（最多 180 秒）；stdout 為最後的狀態
+wait_install() {
+    wi=0
+    wstate=""
+    while [ $wi -lt 90 ]; do
+        wstate=$(install_state "$1")
+        if printf '%s' "$wstate" | grep -Eq -- "$2"; then break; fi
+        sleep 2
+        wi=$((wi + 1))
+    done
+    echo "$wstate"
+}
+
+# 情境 i（REMOTE.md 第 2.1、17.9.7 節；0.10.0）：Pulse 在 hello 事先回報升級輔助程式的路徑檢查結果。不經推送：
+# 把 /opt/pulse 改成群組可寫 → 服務帳號的 Pulse 重新連線時回報 install.upgrade = unsafe_path、不宣告 upgrade →
+# Kairos 的資格預覽把這台主機分類為 unsafe_path（不是可升級）；改回後恢復 ready。同時確認真實的安裝（deb、rpm、
+# tar；服務帳號、unit 的沙箱）在合規時不會被預檢誤報——run.sh 一開始就要求三台都是 ready
+scenario_unsafe_path() {
+    need $T7
+    say "情境 i：路徑預檢——/opt/pulse 群組可寫 → hello 回報 unsafe_path → 資格預覽分類 → 改回後恢復 ready"
+    for h in $HOSTS; do
+        a=$(agent_of "$h")
+        # 目標版本只用來計算資格（不送出推送）；主機不會停在 test.7（崩潰的建置）
+        spec=$(jq -n -c --arg v "$T7" --arg a "$a" \
+            '{name: "systest unsafe path", target_version: $v, selector: {agent_ids: [$a]}, waves: [{size: "rest"}]}')
+        mode=$(hx "$h" stat -c %a /opt/pulse)
+        check "i/$h：改之前的資格預覽" "$(api POST /api/v1/rollouts/preview "$spec") $(body | jq -c '[.data.eligible, .data.skipped]')" '^200 \[1,\{\}\]$'
+        hx "$h" chmod g+w /opt/pulse
+        hx "$h" systemctl restart pulse.service
+        check "i/$h：hello 回報 unsafe_path、不宣告 upgrade" "$(wait_install "$h" "^$h unsafe_path false ")" "^$h unsafe_path false "
+        check "i/$h：pulse upgrade status 寫出路徑與原因" \
+            "$(hx "$h" /opt/pulse/pulse upgrade status 2>&1 | grep -E '遠端升級|原因' | tr '\n' ' ')" \
+            'PLS-E8405.*unsafe_path: /opt/pulse: writable by group or others'
+        check "i/$h：資格預覽分類為 unsafe_path" "$(api POST /api/v1/rollouts/preview "$spec") $(body | jq -c '[.data.eligible, .data.skipped]')" '^200 \[0,\{"unsafe_path":1\}\]$'
+        hx "$h" chmod "$mode" /opt/pulse
+        hx "$h" systemctl restart pulse.service
+        check "i/$h：改回後恢復 ready、宣告 upgrade" "$(wait_install "$h" "^$h ready true ")" "^$h ready true "
+        check "i/$h：改回後的資格預覽" "$(api POST /api/v1/rollouts/preview "$spec") $(body | jq -c '[.data.eligible, .data.skipped]')" '^200 \[1,\{\}\]$'
+    done
+    collect_logs i
+}
+
 # ---- 0. 發佈物 --------------------------------------------------------------
 if [ -z "${SKIP_BUILD:-}" ]; then
     say "建置發佈物（tests/systemd/build.sh）"
@@ -963,6 +1011,7 @@ for s in $SCENARIOS; do
     tamper-resume) scenario_tamper_resume ;;
     crash-replace) scenario_crash_replace ;;
     crash-rollback) scenario_crash_rollback ;;
+    unsafe-path) scenario_unsafe_path ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac

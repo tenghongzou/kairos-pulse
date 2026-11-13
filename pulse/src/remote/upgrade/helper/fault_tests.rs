@@ -539,7 +539,7 @@ fn two_crashes_in_one_transaction_still_end_with_the_old_version() {
     env.cleanup();
 }
 
-/// 只有輔助程式被終止（`TimeoutStartSec`、`SIGKILL`）而主機沒有重新開機：服務仍是替換前啟動的行程。接續
+/// 只有輔助程式被終止（OOM、人工 `kill` 等，很快就被重新觸發）而主機沒有重新開機：服務仍是替換前啟動的行程。接續
 /// 時還沒送出的 `systemctl restart` 要再送一次，否則健康確認看到的永遠是舊的行程
 #[test]
 fn a_helper_killed_without_a_reboot_restarts_the_service_on_resume() {
@@ -574,6 +574,93 @@ fn a_helper_killed_without_a_reboot_restarts_the_service_on_resume() {
     let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "rolled_back", "{r:?}");
     assert_eq!(after.calls(), ["restart"]);
+    env.cleanup();
+}
+
+/// 現行行為（鎖住，不是期望的最終設計）：只有輔助程式被終止、服務與主機都沒有重新啟動，但**在健康確認的
+/// 期限之後**才接續 `replaced` 的交易——`after_replace` 不做健康確認就判 `health_timeout` 並回滾，即使
+/// 新版的服務一直健康地在執行。補送 `systemctl restart` 時也不重新起算期限（REMOTE.md 第 17.9.3 節）
+#[test]
+fn a_helper_killed_and_resumed_after_the_deadline_rolls_back_without_a_health_check() {
+    // 健康確認中被終止（重新啟動已送出），期限（600 秒）之後才接續
+    let mut env = setup("fm-killed-late", "tar");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "health_wait");
+    assert_eq!(env.installed(), "0.9.1");
+    env.helper_is_installed();
+    let after = fake.helper_killed_after(601);
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+        "{r:?}"
+    );
+    // 原因是單獨的 `health_timeout`：沒有括號中的「最後觀察到的狀態」，代表沒有做過任何一次檢查
+    assert!(
+        r.detail.starts_with("health_timeout") && !r.detail.contains("health_timeout ("),
+        "{}",
+        r.detail
+    );
+    // 只有回滾的那一次重新啟動
+    assert_eq!(
+        after
+            .calls()
+            .iter()
+            .filter(|c| c.as_str() == "restart")
+            .count(),
+        1,
+        "{:?}",
+        after.calls()
+    );
+    assert_eq!(
+        (
+            env.installed().as_str(),
+            env.prev().as_str(),
+            env.unit().as_str()
+        ),
+        ("0.9.0", "0.9.0", OLD_UNIT)
+    );
+    assert!(!env.active() && !env.paths.request.exists());
+    assert_eq!(env.result(), r);
+    after.assert_invariants();
+    env.cleanup();
+
+    // 還沒送出重新啟動就被終止：接續時補送一次，但期限不重新起算——補送之後仍然直接回滾
+    let mut env = setup("fm-killed-late-restart", "tar");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "record_replaced");
+    env.helper_is_installed();
+    let after = fake.helper_killed_after(601);
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(
+        r.detail.starts_with("health_timeout") && !r.detail.contains("health_timeout ("),
+        "{}",
+        r.detail
+    );
+    assert_eq!(
+        after
+            .calls()
+            .iter()
+            .filter(|c| c.as_str() == "restart")
+            .count(),
+        2,
+        "補送的重新啟動＋回滾的重新啟動：{:?}",
+        after.calls()
+    );
+    assert_eq!(env.installed(), "0.9.0");
+    assert!(!env.active());
+    env.cleanup();
+
+    // 對照：期限之內接續（同樣只終止輔助程式）照常做健康確認並成功
+    let mut env = setup("fm-killed-in-time", "tar");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "health_wait");
+    env.helper_is_installed();
+    let after = fake.helper_killed_after(300);
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    assert_eq!(env.installed(), "0.9.1");
     env.cleanup();
 }
 
@@ -778,6 +865,72 @@ fn a_result_that_cannot_be_recorded_blocks_later_requests_instead_of_being_resum
     );
     assert_eq!(env.installed(), "0.9.1", "沒有回滾已完成的升級");
     assert!(later.calls().is_empty(), "{:?}", later.calls());
+    env.cleanup();
+}
+
+/// 現行行為（鎖住，不是期望的最終設計）：結果（`done`）寫不進紀錄，而且進行中交易的指標（`active.json`）
+/// **也刪不掉**（例如整個檔案系統變成唯讀：`state.json` 與指標的 unlink 一起失敗）。這次執行仍然回報
+/// 成功，但指標與停在 `replaced` 的紀錄都留著；之後的請求會**接續**這筆交易——期限早已過去，
+/// `after_replace` 直接判 `health_timeout`，把一個其實已完成的升級回滾。上一個測試的保護（指標刪得掉時以
+/// `state_unusable` 擋下）在這個情況不成立
+#[test]
+fn a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_resumed_later() {
+    if running_as_root() {
+        return;
+    }
+    let mut env = setup("fm-done-unsaved-pointer", "tar");
+    let fake = Fake::new(&env.root);
+    let (work, work_root) = (env.work(), env.paths.work_root.clone());
+    // 重新啟動服務的那一刻起，root 的工作目錄（根目錄與這筆交易的）都不能再寫入或刪除檔案
+    *fake.on_restart.borrow_mut() = Some(Box::new(move || {
+        chmod(&work, 0o500);
+        chmod(&work_root, 0o500);
+    }));
+    let r = apply(&env.paths, &fake).unwrap();
+    chmod(&env.paths.work_root, 0o700);
+    chmod(&env.work(), 0o700);
+    assert_eq!(r.state, "succeeded", "這次執行仍然做完：{r:?}");
+    assert_eq!(env.result(), r);
+    assert!(!env.paths.request.exists());
+    assert_eq!(env.installed(), "0.9.1");
+    assert!(env.active(), "指標刪不掉，留著");
+    let rec = env.record();
+    assert_eq!(rec.step, Step::Replaced, "紀錄停在最後一次寫入");
+    assert!(rec.result.is_none());
+
+    // 之後的請求（檔案系統恢復可寫、一天以後；另一筆升級）：接續留下的交易，而不是被擋下
+    env.helper_is_installed();
+    stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+    let later = Fake::new(&env.root).reboot_after(86_400);
+    let r = apply(&env.paths, &later).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.upgrade_id.as_str(), r.code.as_deref()),
+        ("rolled_back", ID, Some(codes::W_UPGRADE_ROLLED_BACK)),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.starts_with("health_timeout")
+            && !r.detail.contains("health_timeout (")
+            && r.detail.contains(NOTE_UPGRADE_ID_IGNORED),
+        "{}",
+        r.detail
+    );
+    assert_eq!(
+        (r.from_version.as_str(), r.to_version.as_str()),
+        ("0.9.0", "0.9.1")
+    );
+    assert_eq!(env.installed(), "0.9.0", "已完成的升級被回滾");
+    assert!(
+        later.calls().contains(&"restart".to_string()),
+        "{:?}",
+        later.calls()
+    );
+    assert!(!env.active(), "這次交易結束，指標清除");
+    assert_eq!(env.record().step, Step::Done);
+    assert!(
+        !env.paths.work_root.join(OTHER_ID).exists(),
+        "新的請求沒有開始"
+    );
     env.cleanup();
 }
 
@@ -1358,10 +1511,30 @@ fn more_than_one_unfinished_legacy_transaction_is_not_guessed() {
 
 // ---- 第 17.9.7 節：路徑檢查 ------------------------------------------------------
 
-/// 這次請求因路徑不安全被拒絕，沒有任何變更
+/// Pulse 在 hello 之前的預檢（`install.upgrade = "unsafe_path"`）對這個環境的結果
+fn precheck(env: &Env) -> Result<(), String> {
+    precheck_paths(
+        &env.paths.install_dir,
+        &env.paths.work_root,
+        env.paths.require_root_owner,
+    )
+}
+
+/// 這次請求因路徑不安全被拒絕，沒有任何變更。預檢（[`precheck_paths`]）對同一個環境回報**同一個**路徑與
+/// 原因——兩者共用同一套檢查；例外是每筆交易的工作目錄（`work-` 開頭的情境），預檢不涵蓋
 fn refused_as_unsafe(env: &Env, why: &str, label: &str) {
+    let pre = precheck(env);
     let fake = Fake::new(&env.root);
     let r = apply(&env.paths, &fake).unwrap();
+    if label.starts_with("work-") {
+        assert_eq!(pre, Ok(()), "{label}: 預檢不涵蓋每筆交易的工作目錄");
+    } else {
+        assert_eq!(
+            pre.map_err(|why| format!("{DETAIL_UNSAFE_PATH}: {why}")),
+            Err(r.detail.clone()),
+            "{label}: 預檢與輔助程式的結論相同"
+        );
+    }
     assert_eq!(
         (r.state.as_str(), r.code.as_deref()),
         ("failed", Some(codes::E_UPGRADE_PRECHECK)),
@@ -1404,6 +1577,16 @@ fn the_work_directories_must_be_private_and_not_symbolic_links() {
     let env = setup("fm-path-root-755", "tar");
     std::fs::create_dir(&env.paths.work_root).unwrap();
     chmod(&env.paths.work_root, 0o755);
+    // 預檢：算通過（輔助程式會改回 0700），而且預檢自己不修改任何東西
+    assert_eq!(precheck(&env), Ok(()));
+    assert_eq!(
+        std::fs::metadata(&env.paths.work_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
     assert_eq!(
@@ -1447,6 +1630,11 @@ fn the_work_directories_must_be_private_and_not_symbolic_links() {
     env.cleanup();
     let env = setup("fm-path-parent-sticky", "tar");
     chmod(&env.root.join("var/lib"), 0o1777);
+    assert_eq!(precheck(&env), Ok(()));
+    assert!(
+        !env.paths.work_root.exists(),
+        "預檢不建立工作目錄的根目錄（不存在算通過）"
+    );
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
     env.cleanup();
@@ -1493,8 +1681,13 @@ fn the_install_directory_and_binary_must_be_safe() {
     let env = setup("fm-path-prev-link", "tar");
     let fake = Fake::new(&env.root);
     std::os::unix::fs::symlink("pulse", env.paths.install_dir.join("pulse.prev")).unwrap();
+    let pre = precheck(&env);
     let r = apply(&env.paths, &fake).unwrap();
     assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_PRECHECK), "{r:?}");
+    assert_eq!(
+        pre.map_err(|why| format!("{DETAIL_UNSAFE_PATH}: {why}")),
+        Err(r.detail.clone())
+    );
     assert!(
         r.detail.starts_with(DETAIL_UNSAFE_PATH) && r.detail.contains("pulse.prev"),
         "{}",
@@ -1502,6 +1695,61 @@ fn the_install_directory_and_binary_must_be_safe() {
     );
     assert!(fake.calls().is_empty());
     assert_eq!(env.installed(), "0.9.0");
+    env.cleanup();
+}
+
+/// 預檢由服務帳號（不是 root）執行：因為權限不足而看不到的部分略過，不回報不安全；看得到的部分照常檢查
+#[test]
+fn the_precheck_skips_what_the_service_account_cannot_see() {
+    if running_as_root() {
+        return;
+    }
+    // 安裝目錄進不去（`lstat /opt/pulse/pulse` 得到 EACCES）：略過安裝目錄的其餘檢查
+    let env = setup("fm-pre-denied-install", "tar");
+    chmod(&env.paths.install_dir.join("pulse"), 0o775);
+    assert!(precheck(&env).is_err(), "看得到時：執行檔群組可寫");
+    chmod(&env.paths.install_dir, 0o000);
+    assert_eq!(precheck(&env), Ok(()), "看不到執行檔：不誤報");
+    // 工作目錄的根目錄是獨立的一部分，仍然檢查
+    std::fs::create_dir(&env.paths.work_root).unwrap();
+    chmod(&env.paths.work_root, 0o777);
+    let why = precheck(&env).unwrap_err();
+    assert!(
+        why.contains("pulse-upgrade") && why.contains("writable by group or others"),
+        "{why}"
+    );
+    chmod(&env.paths.install_dir, 0o755);
+    env.cleanup();
+
+    // 工作目錄的上層目錄進不去（`lstat /var/lib/pulse-upgrade` 得到 EACCES）：略過，不誤報
+    let env = setup("fm-pre-denied-work", "tar");
+    std::fs::create_dir(&env.paths.work_root).unwrap();
+    chmod(&env.paths.work_root, 0o777);
+    assert!(precheck(&env).is_err(), "看得到時：根目錄其他人可寫");
+    chmod(&env.root.join("var/lib"), 0o000);
+    assert_eq!(precheck(&env), Ok(()), "看不到工作目錄：不誤報");
+    // 安裝目錄仍然檢查
+    chmod(&env.paths.install_dir, 0o775);
+    let why = precheck(&env).unwrap_err();
+    assert!(
+        why.contains("opt/pulse: writable by group or others"),
+        "{why}"
+    );
+    chmod(&env.root.join("var/lib"), 0o755);
+    env.cleanup();
+
+    // 輔助程式（root）對「看不到」沒有例外：同樣的情況它回報 unsafe_path（cannot be examined）
+    let env = setup("fm-pre-denied-helper", "tar");
+    chmod(&env.paths.install_dir, 0o000);
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    chmod(&env.paths.install_dir, 0o755);
+    assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_PRECHECK), "{r:?}");
+    assert!(
+        r.detail.starts_with(DETAIL_UNSAFE_PATH) && r.detail.contains("cannot be examined"),
+        "{}",
+        r.detail
+    );
     env.cleanup();
 }
 

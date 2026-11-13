@@ -368,6 +368,10 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
         "disabled" => format!("本機停用（{}）", codes::I_UPGRADE_DISABLED),
         "no_trust_anchor" => format!("缺少信任錨（{}）", codes::E_UPGRADE_TRUST_ANCHOR),
         "no_helper" => format!("缺少輔助程式（{}）", codes::W_UPGRADE_UNSUPPORTED),
+        "unsafe_path" => format!(
+            "路徑不安全（{}）：遠端升級會被輔助程式拒絕；把「原因」指出的路徑改為 root 擁有、群組與其他人不可寫",
+            codes::E_UPGRADE_PRECHECK
+        ),
         other => format!("不支援（{other}，{}）", codes::W_UPGRADE_UNSUPPORTED),
     };
     println!("遠端升級：{readiness}");
