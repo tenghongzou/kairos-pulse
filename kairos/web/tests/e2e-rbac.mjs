@@ -37,6 +37,8 @@ const PAGES = [
   ['/pulse/config', '集中設定', ['admin', 'operator', 'auditor']],
   ['/pulse/config/assignments', '集中設定', ['admin', 'operator', 'auditor']],
   ['/pulse/rollouts', '升級推送', ['admin', 'operator', 'auditor']],
+  // 0.10（ADR-0002）：「待核准」檢視——維運者、稽核員唯讀（有待核准推送時的檢查在 e2e-approval.mjs）
+  ['/pulse/rollouts?view=pending_approval', '升級推送', ['admin', 'operator', 'auditor']],
   ['/pulse/rollouts/new', '建立推送', ['admin']],
   ['/pulse/releases', 'Pulse 版本庫', ['admin', 'operator', 'auditor']],
   ['/hosts/11111111-1111-4111-8111-000000000001/config', 'web-01', ['admin', 'operator', 'auditor']],
@@ -135,7 +137,7 @@ const DETAILS = [
 ];
 
 // 寫入按鈕的名稱（開頭的動詞；ds-button、連結樣式的按鈕、開關）
-const WRITE_VERBS = /^(新增|建立|核准|拒絕|撤銷|停用|啟用|刪除|儲存|套用|確認|指派|解決|暫停通知|立即更新|匯入|匯出 CSR|允許再次|寄送測試|結束所有|重設|解除鎖定|編輯|改用|複製$|移除|更換|臨時靜音|排定維護|提前結束|取消排程|以帳號測試|解除指派|回復到|上傳|送出推送|暫停…|繼續…|取消推送|標記為已處理)/;
+const WRITE_VERBS = /^(新增|建立|核准|拒絕|撤銷|停用|啟用|刪除|儲存|套用|確認|指派|解決|暫停通知|立即更新|匯入|匯出 CSR|允許再次|寄送測試|結束所有|重設|解除鎖定|編輯|改用|複製$|移除|更換|臨時靜音|排定維護|提前結束|取消排程|以帳號測試|解除指派|回復到|上傳|重新上傳|送出推送|暫停…|繼續…|取消推送|退回…|標記為已處理)/;
 
 // 寫入按鈕 → 需要的權限：[頁面路徑的正規式, 按鈕名稱的正規式, 權限]（ia.md §4.2；權限名稱見 API.md 第 12.1 節）
 const BUTTON_PERMS = [
@@ -170,9 +172,11 @@ const BUTTON_PERMS = [
   [/^\/system\/settings/, /^改用(設定檔的值|內建預設值)：enroll\./, 'enroll.mode:write'],
   [/^\/system\/settings/, /^改用(設定檔的值|內建預設值)：pki\./, 'pki.policy:write'],
   [/^\/system\/settings/, /^(建立 API token|撤銷)/, 'api_tokens:write'],
+  // S21「遠端管理」卡片（[remote]、雙人覆核；0.10）沒有任何寫入按鈕：只能在設定檔修改（e2e-approval.mjs 另外檢查
+  // 卡片內沒有控制項）
   // Pulse 管理（F8）：S24 集中設定（config:write，維運者可寫）、S25 版本庫（releases:write）、S26 推送（rollouts:write／pause）
   [/^\/pulse\/config/, /^(新增設定檔|新增指派|指派$|解除指派|儲存$|刪除設定檔|移除|回復到)/, 'config:write'],
-  [/^\/pulse\/releases/, /^(匯入版本|上傳發佈檔|刪除版本)/, 'releases:write'],
+  [/^\/pulse\/releases/, /^(匯入版本|上傳發佈檔|重新上傳|刪除版本)/, 'releases:write'],
   [/^\/pulse\/rollouts/, /^(建立推送|送出推送|繼續…|取消推送)/, 'rollouts:write'],
   [/^\/pulse\/rollouts\//, /^暫停…/, 'rollouts:pause'],
   [/^\/pulse\/rollouts\//, /^(核准…|退回…)/, 'rollouts:approve'],

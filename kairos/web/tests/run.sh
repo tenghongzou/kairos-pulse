@@ -20,6 +20,8 @@
 # → 以 kairos users create 建立測試帳號 → 啟動 Kairos → node e2e.mjs（假 agent、瀏覽器）。
 # 註冊與憑證（S12～S15）的測試另外啟動第二個 Kairos（mTLS、註冊端點、線上簽發；以 openssl 建立測試用的
 # 根 CA、伺服器憑證與簽發 CA；pki-env.sh、e2e-pki.mjs）。
+# 升級推送的雙人覆核另外啟動第三個 Kairos（rollout_approval = "required"、三位管理員；approval-env.sh、
+# e2e-approval.mjs）。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,7 +62,7 @@ const out = [];
 })();
 ' "$@"
 }
-PORT_VARS=(CONSOLE_PORT AGENT_PORT ENROLL_PORT PKI_CONSOLE_PORT PKI_AGENT_PORT PKI_ENROLL_PORT)
+PORT_VARS=(CONSOLE_PORT AGENT_PORT ENROLL_PORT PKI_CONSOLE_PORT PKI_AGENT_PORT PKI_ENROLL_PORT APPROVAL_CONSOLE_PORT APPROVAL_AGENT_PORT)
 need=()
 given=()
 for v in "${PORT_VARS[@]}"; do
@@ -72,7 +74,7 @@ if [ "${#need[@]}" -gt 0 ]; then
     [ "${#picked[@]}" -eq "${#need[@]}" ] || { echo "找不到足夠的空連接埠" >&2; exit 2; }
     for i in "${!need[@]}"; do printf -v "${need[$i]}" '%s' "${picked[$i]}"; done
 fi
-echo "連接埠：主控台 $CONSOLE_PORT、agent $AGENT_PORT、註冊端點 $ENROLL_PORT；第二個 Kairos：主控台 $PKI_CONSOLE_PORT、agent $PKI_AGENT_PORT、註冊端點 $PKI_ENROLL_PORT"
+echo "連接埠：主控台 $CONSOLE_PORT、agent $AGENT_PORT、註冊端點 $ENROLL_PORT；第二個 Kairos：主控台 $PKI_CONSOLE_PORT、agent $PKI_AGENT_PORT、註冊端點 $PKI_ENROLL_PORT；第三個 Kairos（雙人覆核）：主控台 $APPROVAL_CONSOLE_PORT、agent $APPROVAL_AGENT_PORT"
 
 if [ -z "${KAIROS_BIN:-}" ]; then
     (cd "$REPO" && cargo build -p kairos -p pulse --locked --quiet)
@@ -85,10 +87,14 @@ PULSE_BIN="${PULSE_BIN:-$(dirname "$KAIROS_BIN")/pulse}"
 TMP="$(mktemp -d -t kairos-web-XXXXXX)"
 KAIROS_PID=""
 PKI_PID=""
+# 第三個 Kairos（雙人覆核，approval-env.sh）：測試中會重新啟動，目前的 PID 在這個檔案
+APPROVAL_PID_FILE=""
 cleanup() {
     # 保留原本的結束代碼（測試失敗時 run.sh 必須以非 0 結束，不被清理動作蓋掉）
     local rc=$?
-    for pid in "$KAIROS_PID" "$PKI_PID"; do
+    local approval_pid=""
+    if [ -n "$APPROVAL_PID_FILE" ] && [ -f "$APPROVAL_PID_FILE" ]; then approval_pid="$(cat "$APPROVAL_PID_FILE" 2>/dev/null || true)"; fi
+    for pid in "$KAIROS_PID" "$PKI_PID" "$approval_pid"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
@@ -166,6 +172,10 @@ curl -sk "https://127.0.0.1:$CONSOLE_PORT/healthz" >/dev/null || { cat "$TMP/kai
 # 註冊與憑證（S12～S15）用的第二個 Kairos
 # shellcheck source=pki-env.sh
 . "$HERE/pki-env.sh"
+
+# 升級推送的雙人覆核（ADR-0002）用的第三個 Kairos（rollout_approval = "required"、三位管理員）
+# shellcheck source=approval-env.sh
+. "$HERE/approval-env.sh"
 
 mkdir -p "$OUT_DIR"
 export KAIROS_URL="https://localhost:$CONSOLE_PORT" AGENT_PORT PW NEWBIE_PW OUT_DIR PW_DIR KAIROS_LOG="$TMP/kairos.out"
