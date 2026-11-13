@@ -452,7 +452,7 @@ Kairos 建立推送時，對 deb／rpm／msi 主機檢查版本庫是否有「�
 
 #### 4.4.3 健康確認期間的重新開機
 
-`request.json` 在成功或回滾完成前不刪除，因此主機在替換中途重新開機時，`pulse-upgrade.path` 在開機後再次觸發輔助程式；輔助程式依 `/var/lib/pulse-upgrade/<id>/state.json` 的步驟接續（已替換 → 重新做健康確認；健康確認期限已過 → 回滾）。0.10.0 起要接續哪一筆交易由 root 的 `/var/lib/pulse-upgrade/active.json` 決定（不是 `request.json` 的 `upgrade_id`），`state.json` 是有 checksum 的正式交易紀錄；每個步驟、每個當機點接續後的結果，以及紀錄損毀時的處理見第 17.9 節。
+`request.json` 在成功或回滾完成前不刪除，因此主機在替換中途重新開機時，`pulse-upgrade.path` 在開機後再次觸發輔助程式；輔助程式依 `/var/lib/pulse-upgrade/<id>/state.json` 的步驟接續（已替換 → 重新做健康確認。0.10.0 在健康確認期限已過時直接回滾；0.10.1 起接續時至少有 120 秒做與正常流程相同的健康確認，通過就是 `succeeded`，不通過才回滾——第 17.9.3 節「接續 `replaced` 時的健康確認」）。0.10.0 起要接續哪一筆交易由 root 的 `/var/lib/pulse-upgrade/active.json` 決定（不是 `request.json` 的 `upgrade_id`），`state.json` 是有 checksum 的正式交易紀錄；每個步驟、每個當機點接續後的結果，以及紀錄損毀時的處理見第 17.9 節。
 
 #### 4.4.4 Windows（服務 `Pulse`，LocalSystem）
 
@@ -1406,6 +1406,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | `prev_saved` | 這筆交易已把替換前的執行檔保留為 `pulse.prev`（且雜湊等於 `old_binary_sha256`） |
 | `unit_backed_up`、`unit_replaced` | tar：unit 已備份到 `pulse.service.prev`、已換上新 unit |
 | `health_timeout_secs`、`deadline_unix`、`n_restarts_before`、`restarted_unix` | 健康確認（與 v1 相同） |
+| `boot_id`（0.10.1） | 寫入 `replaced` 時這次開機的識別（`/proc/sys/kernel/random/boot_id`；讀不到時 `null`）。接續 `replaced` 時與目前的值比較，判斷替換之後主機有沒有重新開機（`NRestarts` 在開機後從 0 起算，第 17.9.3 節）。0.10.0 的輔助程式寫的紀錄沒有這個欄位 |
 | `service_restarted` | 這個步驟（`replaced`／`rolling_back`）的 `systemctl restart pulse.service` 已經送出。接續時還是 `false` 就再送一次（第 17.9.3 節） |
 | `legacy` | 這份紀錄由 v1 的狀態檔轉換而來（沒有雜湊可比對，第 17.9.6 節） |
 | `rollback_intent`（`reason`、`cause`、`via`） | 回滾的意圖（還原**之前**寫入）：原因；`cause` 為 `health`（健康確認失敗）或 `replace_failed`（替換無法完成）；`via` 為 `package`（以 `rollback.pkg` 經套件管理員）或 `binary`（換回 `pulse.prev`，tar 另還原 unit） |
@@ -1434,6 +1435,21 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 **接續時不重讀暫存區、不重新驗證簽章**：`replacing` 之後的接續只使用工作目錄裡的複本，以紀錄中的雜湊確認它們沒有變（信任結論在 `prepared` 時已經與雜湊一起記下，INV-3 的「取得時驗證」）。暫存區（`pulse` 帳號可寫）、`request.json`、當下的信任錨與 `pulse.toml` 的 `[upgrade]` 都不再影響這筆交易。`request.json` 只用來觸發輔助程式；它讀不到或不合法時，有指標就照常接續（加註 `request_unreadable`）。
 
+**接續 `replaced` 時的健康確認**（0.10.1；0.10.0 的行為是「期限已過就直接回滾，不做任何檢查」）：接續時距離第一次寫入 `replaced` 可能已經很久——輔助程式被終止後很久才再被觸發、主機關機很久才開機，或紀錄不可用／路徑不安全，由人修好之後下一個請求才接續。此時新版可能早已健康運作，直接回滾會把一個成功的升級退掉。所以：
+
+1. **健康確認的時間至少 120 秒**（`RESUME_GRACE`＝`STABLE_FOR` 60 秒＋60 秒）：接續時的時間是「期限剩下的時間」與 120 秒中較長的一個。期限已過、或只剩幾秒時，仍有 120 秒做**與正常流程完全相同**的檢查（第 4.5.1 節：服務在執行、`NRestarts` 沒有增加、沒有以結束代碼 2／3／4 停止、狀態檔由目前的行程寫入且版本是目標版本、已註冊、`last_ack_at` 晚於替換的時間、連續穩定 60 秒）；通過 → `succeeded`，不通過 → 回滾。**沒有放寬任何條件**，只是不再把「時間到了」當成不健康的證據。120 秒的理由：穩定 60 秒是條件本身；另外 60 秒給剛被補送重新啟動的服務連線、註冊並讓一筆 report 被確認（心跳預設 15 秒、重連退避上限 60 秒）；它也等於推送可以設定的最短健康確認期限（`health_timeout_secs` 的下限 120），所以接續時得到的時間不會比任何一次正常的升級少。紀錄的 `deadline_unix` 不改寫（每次接續各自計算）；確認途中再被中斷，下次接續同樣至少有 120 秒。
+2. **崩潰偵測的基準在接續時重新判斷**（`n_restarts_before` 是替換前量的；`NRestarts` 在重新開機後從 0 起算，0.10.0 沿用舊的基準，開機前若曾自動重啟過 k 次，新版在開機後可以崩潰 k 次而不被這一項發現）。以目前的 `NRestarts`（`cur`）、紀錄的基準（`before`）與 `boot_id` 判斷，**先判斷接續之前有沒有崩潰過，再決定之後的基準**：
+
+   | 情況 | 判斷 | 之後的基準 |
+   |---|---|---|
+   | `boot_id` 與紀錄不同（替換後重新開機過） | 開機後的自動重啟都發生在替換之後：`cur > 0` → `crash_restart`，回滾 | 0 |
+   | `boot_id` 相同或無法判斷，`cur > before` | 替換後崩潰重啟過 → `crash_restart`，回滾（與 0.10.0 相同） | — |
+   | `boot_id` 相同或無法判斷，`cur < before` | 計數被重設過（重新開機，或 root 執行了 `systemctl reset-failed`），重設發生在替換之後：`cur > 0` → `crash_restart`，回滾 | 0 |
+   | `boot_id` 相同或無法判斷，`cur == before` | 沒有崩潰的證據 | `before`（不變） |
+
+   基準只會維持或降低，而且只在「沒有任何崩潰證據」時才沿用，所以不會因為重設基準而漏掉接續之前的崩潰。**殘餘的窗口**：紀錄沒有 `boot_id`（由 0.10.0 的輔助程式替換、0.10.1 接續的那一次升級，或 `/proc` 讀不到）、主機重新開機過、而且開機後新版恰好崩潰了與 `before` 相同的次數（`before > 0`）之後穩定下來——與 0.10.0 相同，這一項看不出來（其餘的健康條件照常）。紀錄的 `n_restarts_before` 不改寫。
+3. `rolling_back` 的接續不變：以紀錄的期限確認舊版恢復，期限已過而舊版沒有通過 → `rollback_failed`。
+
 **替換無法完成時**（第一次執行或接續時；0.9.0 與 0.10.0 先前的做法是「重新驗證失敗就以 `failed` 結束、不回滾」）：先看系統是否已被改過——執行檔的雜湊不等於 `old_binary_sha256`、unit 不等於替換前、或套件資料庫與 `pkg_db_before` 不同。**沒被改過**：`failed`（`PLS-E8406`），不重新啟動服務。**已被改過**：走回滾的路徑（`rollback_intent`，`cause: replace_failed`，一律 `via: binary`——與先前「替換失敗時換回 `pulse.prev`」相同，不使用回滾套件），還原後重新啟動並確認舊版恢復：恢復時結果仍是 `failed`（`PLS-E8406`，`detail` 以 `restored` 結尾；deb／rpm 的套件資料庫可能停在半安裝的狀態，`detail` 附 `package_db_shows_<狀態>`），不恢復時 `rollback_failed`（`PLS-E8408`）。不會再有「回報 `failed` 但系統停在替換到一半」的結果。
 
 #### 17.9.4 當機點對照表
@@ -1454,8 +1470,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 10 | `package_running`（deb／rpm） | 套件管理員執行到一半：執行檔可能已是新版、套件資料庫可能是半安裝 | `replacing`：以驗證過的複本**再執行一次**套件管理員（`dpkg -i`／`rpm -U --replacepkgs` 可重複執行），之後執行檔必須＝新 | 成功 → `replaced` → 健康確認；套件管理員仍失敗 → 依第 17.9.3 節「替換無法完成時」還原並確認，`failed`（`restored`）或 `rollback_failed` |
 | 11 ★ | `binary_replaced` | 執行檔＝新（deb／rpm：套件已安裝完成）；紀錄仍是 `replacing`；tar 的 unit 仍是舊的 | 執行檔＝新 → tar：不再複製，接著換 unit；deb／rpm：再執行一次套件管理員（冪等）。**不覆寫 `pulse.prev`**（`prev_saved` 且雜湊相符） | `replaced` → 健康確認 → `succeeded`；之後若不健康 → 回滾換回的是舊版 |
 | 12 | `unit_replaced`（tar） | 執行檔＝新、unit＝新；`unit_replaced` 尚未記錄 | unit 的雜湊＝`unit.new_sha256` → 不再寫入，`daemon-reload` 後記錄 | 同上；之後若回滾，unit 依雜湊判斷並還原（不依賴 `unit_replaced`） |
-| 13 | `record_replaced` | `replaced`（期限已記錄）；服務尚未重新啟動（`service_restarted = false`） | `replaced`：補送重新啟動（主機沒有重新開機時服務仍是舊的行程），再做健康確認 | 期限內健康 → `succeeded`；期限已過 → 回滾 |
-| 14 | （健康確認中） | `replaced`、`service_restarted = true` | `replaced`：重新做健康確認（不再重新啟動；開機時服務已由新版啟動） | 同上（情境 `reboot`） |
+| 13 | `record_replaced` | `replaced`（期限已記錄）；服務尚未重新啟動（`service_restarted = false`） | `replaced`：先看接續之前有沒有崩潰重啟過（`NRestarts`、`boot_id`；有 → 回滾），再補送重新啟動（主機沒有重新開機時服務仍是舊的行程），做健康確認——時間是期限剩下的時間與 120 秒中較長的一個（第 17.9.3 節「接續 `replaced` 時的健康確認」） | 健康 → `succeeded`（**期限已過也一樣**：仍有 120 秒確認，0.10.1）；不健康 → 回滾〔0.10.0：期限已過 → 不檢查、直接回滾〕 |
+| 14 | （健康確認中） | `replaced`、`service_restarted = true` | `replaced`：同上，但不再重新啟動（開機時服務已由新版啟動） | 同上（情境 `reboot`；期限已過的是情境 `late-resume`） |
 | 15 | `rollback_intent_recorded` | `rollback_intent`；尚未還原：執行檔＝新 | 依紀錄的 `via` 還原：`binary` → `pulse.prev` 的雜湊＝`old_binary_sha256` 才使用；`package` → `rollback.pkg` 的雜湊相符才使用 | `rolling_back` → 確認舊版 → `rolled_back`（`detail` 為「<原因>; resumed」） |
 | 16 | `rollback_restoring` | 還原到一半：套件管理員執行中，或執行檔已換回而 unit 尚未還原 | 同上，冪等重做（執行檔已＝舊時不再複製；unit 依雜湊；套件管理員再執行一次） | 同上 |
 | 17 ★ | `rollback_restored` | 已還原（執行檔＝舊、unit＝舊、套件已裝回）；紀錄仍是 `rollback_intent` | 同上：實況已是還原後的狀態，重做不改變任何內容 | 同上 |
@@ -1546,6 +1562,15 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 | 17.9.9 | `build-release-common.sh` 自己比對標記字串 | 獨立的 `packaging/check-release-binary.sh`（另檢查 `--version` 的結尾標記、可檢查發佈檔內的執行檔、`--test-build` 反向確認），`release.sh` 與 CI 各再檢查一次 | 檢查本身要能單獨執行與驗證 |
 
 沒有改變的：對外行為（`upgrade_status` 的狀態與代碼、協定、Kairos）、第 17.9.1 節的檔案、第 17.9.6 節的舊格式規則、第 17.9.7 節的路徑條件。
+
+**0.10.1 的設計變更**（H4；0.10.0 發佈之後才改的行為，已寫回第 4.4.3、17.9.2、17.9.3 節與第 17.9.4 節第 13、14 列）：
+
+| 小節 | 0.10.0 | 0.10.1 | 理由 |
+|---|---|---|---|
+| 17.9.3、17.9.4 第 13、14 列 | 接續 `replaced` 時健康確認期限已過 → 不做任何檢查、直接回滾（`health_timeout`） | 接續時至少有 120 秒（`RESUME_GRACE`）做與正常流程相同的健康確認：通過 → `succeeded`，不通過 → 回滾 | 輔助程式被終止很久才再觸發、主機關機很久才開機、或紀錄不可用／路徑不安全由人修好之後才接續時，新版可能早已健康運作；「時間到了」不是不健康的證據。健康條件沒有放寬 |
+| 17.9.2、17.9.3 | 崩潰偵測的基準一律是替換前量的 `n_restarts_before` | 新欄位 `boot_id`；接續 `replaced` 時先以目前的 `NRestarts` 判斷接續之前有沒有崩潰過，重新開機過（或計數被重設）時之後的基準是 0 | `NRestarts` 在重新開機後從 0 起算：舊的基準讓新版在開機後可以崩潰同樣多次而不被這一項發現 |
+
+沒有改變的：正常（沒有中斷）的流程、`rolling_back` 與其他步驟的接續、回滾的來源與目標（ADR-0003 的 INV-1～INV-11，逐條對照在 ADR-0003 第 14 節）、對外的狀態與代碼。Kairos 端沒有改：主機在推送中若已被標為 `unknown`（替換後超過期限沒有回報且離線），之後才到的 `succeeded` 與先前晚到的 `rolled_back` 一樣只記錄、不改那台主機在推送中的狀態（仍是 `unknown`，計入失敗、可以重試）；主機實際執行的版本以它的 hello 為準——0.10.0 會把這種主機退回舊版，0.10.1 起它留在已經健康運作的新版，推送中的狀態與實際版本可能不同，重試時依實際版本重新判斷資格。
 
 **單元測試**（`cargo test -p pulse`；`remote::upgrade::helper::` 共 55 個測試）：
 
