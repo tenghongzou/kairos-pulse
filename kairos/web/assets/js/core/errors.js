@@ -8,11 +8,12 @@
 //    （API.md 第 1.2 節：message 給開發者看，不保證固定）。
 
 import { ERROR_CODES } from './error-codes.js';
+import { LOCAL_ERROR_CODES } from './error-codes-local.js';
 import { t, has, permissionLabel, roleLabel } from './strings.js';
 
-/** 代碼的總表說明（找不到時 null） */
+/** 代碼的總表說明（找不到時 null）：設計包產生的 error-codes.js 優先，其次是工程暫行的 error-codes-local.js */
 export function lookup(code) {
-  return (code && ERROR_CODES[code]) || null;
+  return (code && (ERROR_CODES[code] || LOCAL_ERROR_CODES[code])) || null;
 }
 
 /** 處理方式的文字 → 步驟陣列（「1. 」開頭的行為編號步驟；copywriting.md §4.1） */

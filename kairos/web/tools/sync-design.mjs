@@ -62,3 +62,10 @@ writeFileSync(
   `${header}export const ERROR_CODES = ${JSON.stringify(out, null, 1)};\n`,
 );
 console.log(`error-codes.js：${Object.keys(out).length} 個 KRS 代碼`);
+
+// 3. 工程暫行的代碼（assets/js/core/error-codes-local.js，人工維護）：設計包已經收錄的可以從那裡刪除
+const localSrc = readFileSync(join(web, 'assets', 'js', 'core', 'error-codes-local.js'), 'utf8');
+const covered = [...localSrc.matchAll(/^\s*'(KRS-[A-Z]\d{4})':/gm)].map((m) => m[1]).filter((code) => out[code]);
+if (covered.length) {
+  console.log(`error-codes-local.js：設計包已收錄 ${covered.join('、')}，請從 error-codes-local.js 刪除這些條目`);
+}

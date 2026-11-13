@@ -41,6 +41,9 @@ registerProvider({
 /** 開啟搜尋對話框 */
 export function openSearch(initial = '') {
   const listId = uid('sr');
+  // 提示文字依目前使用者可用的搜尋提供者組成（ADR-0002 決策點 6）：只有主機時維持原句；有推送時範例附推送編號
+  const allowed = providers.filter((p) => p.allowed());
+  const onlyHosts = allowed.every((p) => p.id === 'hosts');
   const inputEl = h('input', {
     class: 'ds-input ds-input--lg',
     type: 'search',
@@ -48,8 +51,8 @@ export function openSearch(initial = '') {
     'aria-expanded': 'false',
     'aria-controls': listId,
     'aria-autocomplete': 'list',
-    'aria-label': t('search.label'),
-    placeholder: t('search.placeholder'),
+    'aria-label': onlyHosts ? t('search.label') : t('search.labelGroups', { groups: allowed.map((p) => p.group()).join(t('search.groupSep')) }),
+    placeholder: allowed.some((p) => p.id === 'rollouts') ? t('search.placeholderRollouts') : t('search.placeholder'),
     autocomplete: 'off',
     spellcheck: 'false',
     value: initial,

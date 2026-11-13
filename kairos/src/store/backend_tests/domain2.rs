@@ -1592,7 +1592,8 @@ fn rollout_review_transitions_and_policy_record(db: &TestDb) -> String {
     let a = s.host_id_of(A).unwrap().unwrap();
     let b = s.host_id_of(B).unwrap().unwrap();
     const ROUNDS: i64 = 6;
-    const WORKERS: usize = 5;
+    // 測試的連線池只有 4 條連線：這條加上三個同時操作的連線
+    const WORKERS: usize = 3;
     let mut winners = Vec::new();
     for round in 0..ROUNDS {
         let id = format!("r-20261113-{:04}", round + 1);
@@ -1655,9 +1656,9 @@ fn rollout_review_transitions_and_policy_record(db: &TestDb) -> String {
                         // 交易回復：輸的一方不寫任何東西（API 回 409 invalid_state）
                         return None;
                     }
-                    let kind = match i % 4 {
+                    let kind = match i {
                         // 核准
-                        0 | 1 => {
+                        0 => {
                             r.state = "running".into();
                             r.approved_at = Some(at + 10);
                             r.approved_by = Some(format!("user:approver-{i}"));
@@ -1665,7 +1666,7 @@ fn rollout_review_transitions_and_policy_record(db: &TestDb) -> String {
                             "approve"
                         }
                         // 退回（與待核准逾時的退回相同的轉移）
-                        2 => {
+                        1 => {
                             tx.delete_rollout_hosts(&id).unwrap();
                             r.state = "draft".into();
                             r.submitted_at = None;

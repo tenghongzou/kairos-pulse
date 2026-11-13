@@ -20,10 +20,10 @@ import { api, qs } from '../core/api.js';
 import * as session from '../core/session.js';
 import * as sse from '../core/sse.js';
 import * as fmt from '../core/format.js';
-import { pageHead, card, emptyState, errorState, errorAlert, inlineAlert, field, skeletonBlock } from '../ui/components.js';
+import { pageHead, card, emptyState, errorState, errorAlert, inlineAlert, field, skeletonBlock, dl, setBusy } from '../ui/components.js';
 import { createTable } from '../ui/table.js';
 import { toast } from '../ui/toast.js';
-import { confirmL1 } from './admin-common.js';
+import { confirmL1, confirmL2 } from './admin-common.js';
 import { refreshRolloutCount } from './pulse-boot.js';
 import { submitDialog, previewView } from './pulse-rollout-new.js';
 import {
@@ -37,6 +37,8 @@ import {
   hostLink,
   waveName,
   scheduleSummary,
+  submissionView,
+  waitedText,
   HOST_STATES,
 } from './pulse-common.js';
 
@@ -65,6 +67,8 @@ export function render(ctx) {
 
   const head = h('div');
   const alerts = h('div', { class: 'k-stack--sm' });
+  // 待核准：送審摘要；送出過的推送：覆核紀錄
+  const reviewBox = h('div');
   const wavesBox = h('div');
   const hostsBox = h('div');
   mount(root, pageHead({ title: t('common.loading'), crumbs: [CRUMB, { text: id }] }), skeletonBlock(8));
@@ -173,7 +177,6 @@ export function render(ctx) {
       resume: { title: t('rm.det.resumeTitle', { name }), body: t('rm.det.resumeBody'), confirmText: t('rm.det.resumeConfirm'), reason: null, path: 'resume', done: t('rm.det.resumed') },
       continue: { title: t('rm.det.continueTitle'), body: t('rm.det.continueBody'), confirmText: t('rm.det.resumeConfirm'), reason: null, path: 'continue', done: t('rm.det.resumed') },
       cancel: { title: t('rm.det.cancelTitle', { name }), body: t('rm.det.cancelBody'), confirmText: t('rm.det.cancelConfirm'), reason: 'required', danger: true, path: 'cancel', done: t('rm.det.cancelled') },
-      approve: { title: t('rm.det.approveTitle', { name }), body: t('rm.det.approveBody', { n: fmt.num(r.hosts_total || 0) }), confirmText: t('rm.det.approveConfirm'), reason: null, path: 'approve', done: t('rm.det.approved') },
       reject: { title: t('rm.det.rejectTitle', { name }), body: t('rm.det.rejectBody'), confirmText: t('rm.det.rejectConfirm'), reason: 'required', danger: true, path: 'reject', done: t('rm.det.rejectedDone') },
     }[kind];
     confirmL1({
@@ -222,11 +225,105 @@ export function render(ctx) {
     load();
   }
 
-  /** 雙人覆核：目前的使用者是否為這個推送的建立者或送出者（不能自己核准，KRS-E6106） */
-  function isOwnRollout() {
-    const me = session.current();
-    const who = me && me.user ? `user:${me.user.username}` : null;
-    return Boolean(who) && (r.created_by === who || r.submitted_by === who);
+  /**
+   * 核准（L2；含降版時為 L3 字串＋原因必填；ADR-0002 決策點 2b）：對話框內嵌送審摘要，輸入伺服器算出的確認字串
+   * （submission.confirm_text）後送出 confirm 與 digest——伺服器在核准的交易中重新計算並比對，畫面上的比對只是
+   * 防止誤按。摘要過期（409 submission_changed，或確認字串已經不同）時關閉對話框並重新載入摘要。
+   */
+  async function approve() {
+    // 開啟對話框前重新取一次，讓核准者看到的是最新的摘要
+    try {
+      r = await api(`/api/v1/rollouts/${encodeURIComponent(id)}`);
+    } catch {
+      /* 沿用載入時的內容；送出時伺服器仍會驗證 */
+    }
+    if (disposed) return;
+    const sub = r.submission;
+    if (r.state !== 'pending_approval' || !sub || !(r.viewer && r.viewer.can_approve)) {
+      load();
+      return;
+    }
+    const l3 = sub.confirm_level === 'L3';
+    const starts = r.schedule && r.schedule.starts_at && new Date(r.schedule.starts_at).getTime() > fmt.serverNow() ? r.schedule.starts_at : null;
+    const stale = () => {
+      toast({ kind: 'warning', title: t('rm.det.submissionChanged') });
+      refreshRolloutCount();
+      load();
+      return true;
+    };
+    confirmL2({
+      title: t('rm.det.approveTitle', { name: r.name }),
+      lead: t('rm.det.approveLead', { n: fmt.num(sub.eligible || 0), v: r.target_version }),
+      body: h('div', { class: 'k-stack--sm', id: 'approve-summary' }, h('p', { class: 'strong' }, starts ? t('rm.det.approveStartsLater', { t: fmt.dateTime(starts, { seconds: false }) }) : t('rm.det.approveStartsNow')), submissionView(r)),
+      phrase: sub.confirm_text,
+      confirmText: sub.confirm_text,
+      reason: l3 ? 'required' : 'optional',
+      onConfirm: async ({ reason, errBox }) => {
+        try {
+          await api(`/api/v1/rollouts/${encodeURIComponent(id)}/approve`, { method: 'POST', body: { confirm: sub.confirm_text, digest: sub.digest, reason: reason || undefined } });
+          toast({ kind: 'success', title: t('rm.det.approved') });
+          refreshRolloutCount();
+          load();
+          return true;
+        } catch (err) {
+          if (err.code === 'submission_changed') return stale();
+          if (err.code === 'confirmation_required' && err.details && err.details.confirm_text && err.details.confirm_text !== sub.confirm_text) return stale();
+          if (err.code === 'invalid_state') {
+            // 同時有人核准、退回、修改或取消：重新載入目前的狀態
+            toast({ kind: 'warning', title: t('rm.det.actionFailed'), desc: err.message });
+            refreshRolloutCount();
+            load();
+            return true;
+          }
+          const a = errorAlert(err, { title: err.code === 'artifact_missing' ? t('rm.det.approveFileMissing') : t('rm.det.approveFailed') });
+          mount(errBox, a);
+          a.focus();
+          return false;
+        }
+      },
+    });
+  }
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      toast({ kind: 'success', title: t('rm.det.copied') });
+    } catch {
+      toast({ kind: 'error', title: t('rm.det.copyFailed') });
+    }
+  }
+
+  /** 完整的主機清單（CSV）：以分頁的主機表端點取回已固定的對象，在瀏覽器組成檔案 */
+  async function exportHosts(button) {
+    setBusy(button, true, t('rm.sub.exporting'));
+    const cell = (v) => {
+      const text = v == null ? '' : String(v);
+      // 以 = + - @ 開頭的儲存格前面加單引號，避免試算表當成公式
+      const safe = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+      return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+    };
+    try {
+      const rows = [];
+      let cursor = null;
+      do {
+        const res = await api(`/api/v1/rollouts/${encodeURIComponent(id)}/hosts${qs({ limit: 1000, cursor })}`, { raw: true });
+        rows.push(...res.data);
+        cursor = res.page.next_cursor;
+      } while (cursor && !disposed);
+      if (disposed) return;
+      const lines = [t('rm.sub.csvHead'), ...rows.map((x) => [x.agent_id, x.hostname, x.wave, x.state, x.reason, x.from_version].map(cell).join(','))];
+      const url = URL.createObjectURL(new Blob([`﻿${lines.join('\r\n')}\r\n`], { type: 'text/csv;charset=utf-8' }));
+      const a = h('a', { href: url, download: `${id}-hosts.csv`, dataset: { native: '1' }, hidden: true });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      toast({ kind: 'success', title: t('rm.sub.exported', { n: fmt.num(rows.length) }) });
+    } catch (err) {
+      toast({ kind: 'error', title: t('rm.sub.exportFailed'), desc: err.message || err.code });
+    } finally {
+      setBusy(button, false, t('rm.sub.exporting'));
+    }
   }
 
   function btn(text, onClick, variant = 'secondary', iconName = null) {
@@ -241,10 +338,14 @@ export function render(ctx) {
     if (r.state === 'running' && session.can('rollouts:pause')) acts.push(btn(t('rm.det.pause'), () => action('pause'), 'secondary', 'pause'));
     if (r.state === 'running' && r.awaiting_continue && write) acts.push(btn(t('rm.det.resume'), () => action('continue'), 'primary', 'play'));
     if (r.state === 'paused' && write) acts.push(btn(t('rm.det.resume'), () => action('resume'), 'primary', 'play'));
-    // 雙人覆核（0.10）：待核准的推送由另一位有 rollouts:approve 的使用者（以帳號登入）核准或退回
-    if (r.state === 'pending_approval' && session.can('rollouts:approve') && session.isSession()) {
-      if (!isOwnRollout()) acts.push(btn(t('rm.det.approve'), () => action('approve'), 'primary'));
-      acts.push(btn(t('rm.det.reject'), () => action('reject'), 'secondary'));
+    // 雙人覆核（0.10）：能否核准由後端依這次請求的身分計算（r.viewer）——有 rollouts:approve、以帳號登入、不是
+    // 建立者或送出者。可以核准的人才看到「核准…」「退回…」；建立者與送出者看到的是「取消推送…」與「複製連結」
+    if (r.state === 'pending_approval') {
+      if (r.viewer && r.viewer.can_approve) {
+        acts.push(btn(t('rm.det.approve'), approve, 'primary'));
+        acts.push(btn(t('rm.det.reject'), () => action('reject'), 'secondary'));
+      }
+      acts.push(btn(t('rm.det.copyLink'), copyLink, 'secondary', 'copy'));
     }
     if ((r.state === 'running' || r.state === 'paused' || r.state === 'scheduled' || r.state === 'pending_approval') && write) acts.push(btn(t('rm.det.cancel'), () => action('cancel'), 'danger-secondary'));
     ctx.setTitle(r.name);
@@ -264,12 +365,19 @@ export function render(ctx) {
     if (r.state === 'draft') out.push(inlineAlert({ kind: 'info', body: t('rm.det.draftNote') }));
     if (r.state === 'draft' && r.reject_reason) out.push(inlineAlert({ kind: 'warning', title: t('rm.det.rejected'), body: t('rm.det.rejectedBody', { reason: r.reject_reason }) }));
     if (r.state === 'pending_approval') {
-      const notes = [t('rm.det.pendingBody', { who: r.submitted_by || '—', time: fmt.dateTime(r.submitted_at, { seconds: false }) })];
-      if (session.can('rollouts:approve')) {
-        if (!session.isSession()) notes.push(t('rm.det.pendingToken'));
-        else if (isOwnRollout()) notes.push(t('rm.det.pendingSelf'));
-      }
-      out.push(inlineAlert({ kind: 'info', role: 'status', title: t('rm.det.pendingTitle'), body: notes.join(' ') }));
+      // 依身分的說明（ADR-0002 決策點 2c、2d）：可以核准的人、建立者或送出者、其他人
+      const v = r.viewer || {};
+      const who = r.submitted_by || '—';
+      const time = fmt.dateTime(r.submitted_at, { seconds: false });
+      const waited = waitedText(r.submitted_at);
+      const whoApproves = r.created_by === r.submitted_by ? t('rm.det.pendingWhoSame', { creator: r.created_by || '—' }) : t('rm.det.pendingWho', { creator: r.created_by || '—', submitter: who });
+      const notes = [];
+      if (v.can_approve) notes.push(t('rm.det.pendingForApprover', { who, time, waited }));
+      else if (v.is_creator || v.is_submitter) notes.push(t('rm.det.pendingForOwner', { time, waited }), t('rm.det.pendingSelf'), whoApproves, session.can('rollouts:write') ? t('rm.det.pendingOwnerActions') : null);
+      else notes.push(t('rm.det.pendingBody', { who, time }), whoApproves, v.blocked === 'session_required' ? t('rm.det.pendingToken') : null);
+      out.push(inlineAlert({ kind: 'info', role: 'status', title: t('rm.det.pendingTitle'), body: notes.filter(Boolean).map((x) => h('p', null, x)) }));
+      // 沒有可核准者（決策點 2g）
+      if (r.submission && r.submission.approvers_available === 0) out.push(inlineAlert({ kind: 'warning', title: t('rm.det.noApproversTitle'), body: t('rm.det.noApproversBody') }));
     }
     if (r.state === 'paused') {
       const auto = Boolean(r.pause_cause) && r.pause_cause !== 'manual';
@@ -302,6 +410,19 @@ export function render(ctx) {
     const na = r.next_action || {};
     if (r.state === 'scheduled') out.push(inlineAlert({ kind: 'info', role: 'status', body: na.starts_at ? t('rm.det.scheduledNote', { t: fmt.dateTime(na.starts_at, { seconds: false }) }) : t('rm.det.scheduledNoteNoTime') }));
     if (r.state === 'running' && na.code === 'waiting_window') out.push(inlineAlert({ kind: 'info', role: 'status', body: na.until ? t('rm.det.waitingWindow', { t: fmt.dateTime(na.until, { seconds: false }) }) : t('rm.det.waitingWindowNone') }));
+    // 等待版本庫的檔案（ADR-0002 F3）：不計入失敗、不暫停，補檔後自動繼續
+    if (r.state === 'running' && na.code === 'waiting_artifact') {
+      out.push(
+        inlineAlert({
+          kind: 'warning',
+          role: 'status',
+          title: t('rm.det.waitingArtifact', { n: fmt.num(na.hosts || 0) }),
+          code: 'KRS-W8417',
+          body: t('rm.det.waitingArtifactBody'),
+          actions: session.can('releases:read') ? [h('a', { class: 'ds-button ds-button--secondary ds-button--sm', href: `/pulse/releases/${encodeURIComponent(r.target_version)}` }, t('rm.det.goReleases'))] : null,
+        }),
+      );
+    }
     const sch = scheduleSummary(r.schedule);
     if (sch) out.push(h('p', { class: 'caption', id: 'rollout-schedule' }, sch));
     if (r.state === 'running' && na.code === 'soaking') out.push(inlineAlert({ kind: 'info', role: 'status', body: t('rm.det.soaking', { m: fmt.num(na.minutes || 0), t: fmt.dateTime(na.until, { seconds: false }) }) }));
@@ -327,6 +448,42 @@ export function render(ctx) {
       }
     }
     if (!disposed) mount(alerts, ...out);
+  }
+
+  /** 送審摘要（待核准）與覆核紀錄（送出過的推送；目前這一輪，完整的歷史在稽核日誌） */
+  function renderReview() {
+    const out = [];
+    if (r.state === 'pending_approval' && r.submission) {
+      const exportBtn = h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm' }, icon('download'), t('rm.sub.export'));
+      exportBtn.addEventListener('click', () => exportHosts(exportBtn));
+      out.push(
+        card({
+          title: t('rm.sub.title'),
+          id: 'rollout-submission',
+          actions: exportBtn,
+          body: [submissionView(r), h('p', { class: 'caption' }, t('rm.sub.digest'), '：', h('code', { class: 'mono', id: 'rollout-digest' }, r.submission.digest), ' ', t('rm.sub.digestHint'))],
+        }),
+      );
+    }
+    if (r.submitted_at || r.reject_reason) {
+      const whoAt = (who, at) => (at ? t('rm.rev.whoAt', { who: who || '—', time: fmt.dateTime(at, { seconds: false }) }) : t('rm.rev.none'));
+      out.push(
+        card({
+          title: t('rm.rev.title'),
+          id: 'rollout-review',
+          body: [
+            dl([
+              [t('rm.rev.created'), whoAt(r.created_by, r.created_at)],
+              [t('rm.rev.submitted'), whoAt(r.submitted_by, r.submitted_at)],
+              r.approved_at ? [t('rm.rev.approved'), whoAt(r.approved_by, r.approved_at)] : null,
+              r.reject_reason ? [t('rm.rev.rejected'), r.reject_reason] : null,
+            ]),
+            session.can('audit:read') ? h('p', null, h('a', { href: `/admin/audit${qs({ target: id })}` }, t('rm.rev.audit'))) : null,
+          ],
+        }),
+      );
+    }
+    mount(reviewBox, ...out);
   }
 
   function renderWaves() {
@@ -416,8 +573,9 @@ export function render(ctx) {
       return;
     }
     if (disposed) return;
-    if (first || !root.contains(head)) mount(root, head, alerts, wavesBox, hostsBox);
+    if (first || !root.contains(head)) mount(root, head, alerts, reviewBox, wavesBox, hostsBox);
     renderHead();
+    renderReview();
     renderWaves();
     renderHostsCard();
     await renderAlerts();
