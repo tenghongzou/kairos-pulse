@@ -493,7 +493,7 @@ mv /opt/kairos/cert.pem.new /opt/kairos/cert.pem
 
   - 密碼錯誤與 `.keys` 被修改、截斷無法區分，都以`KRS-E4307` 拒絕，資料目錄不會被寫入任何檔案。
   - `data/` 已有內容不同的金鑰檔時（例如 Kairos 在還原前已啟動並產生了新的金鑰），`restore-keys` 拒絕；確認後加 `--overwrite`，原本的檔案改名為 `<名稱>.replaced-<時間>` 保留。
-  - 使用遠端升級時：備份**不含** Pulse 版本庫的發佈檔（`data/releases/`）。還原後系統健康的「遠端管理」會顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕），`sudo -u kairos /opt/kairos/kairos releases list --config /opt/kairos/kairos.toml` 列出遺失的檔案；把各版本的發佈檔放回目錄後以 `kairos releases import <目錄>` 補上（0.10.0）。
+  - 使用遠端升級時：備份**不含** Pulse 版本庫的發佈檔（`data/releases/`）。還原後系統健康的「遠端管理」會顯示「版本庫的檔案遺失」（`KRS-W8417`；需要這些檔案的主機在推送中不會被提議，補檔後自動繼續），`sudo -u kairos /opt/kairos/kairos releases list --config /opt/kairos/kairos.toml` 列出遺失的檔案；把各版本的發佈檔放回目錄後以 `kairos releases import <目錄>` 補上（0.10.0）。
   - 少了 `alerts-secrets.key`（或與資料庫不成對）時，通知管道的狀態為 `secrets_unavailable`（`KRS-E5110`，主控台、`kairos alert-channels list` 與「通知管道失敗」事件都會顯示），不會發送；還原金鑰檔後重新啟動即恢復，或重新輸入機密。少了 `console.key` 時 Kairos 會建立新的金鑰，已綁定的 TOTP 需以 `kairos users reset-mfa` 重設，主控台需重新取得 CSRF token（重新整理頁面）。少了 `audit-hmac.key` 時，`kairos audit verify` 與每日的自我驗證以 `hmac_key_unavailable`（`KRS-E6201`）失敗，並開「稽核日誌完整性」緊急事件。
 - 使用線上簽發（第 6 節的 `pki init`）時另備份 `/opt/kairos/data/pki/`（**含簽發 CA 私鑰**，`kairos db backup` 不含；加密保存，例如 `tar czf - -C /opt/kairos/data pki | gpg -c > pki-$(date -u +%F).tgz.gpg`）。遺失時已簽發的憑證仍有效，但無法再撤銷，需立即建立新的簽發 CA（`PKI.md` 第 4 節）
 
@@ -555,6 +555,19 @@ mv /opt/kairos/data/pki/server.pem.new /opt/kairos/data/pki/server.pem
 - `pki sign` 在根 CA 私鑰所在的目錄寫一筆紀錄到 `kairos-ca.log`（0600），輸出檔已存在時不覆寫。私鑰不想離開 Kairos 主機時，改以 `--csr` 簽發 Kairos 主機產生的 CSR。
 - 代理簽發 CA 的輪替（5 年；`KRS-W1304` 提醒）：`kairos pki issuing-ca new` → 在離線主機 `kairos pki sign --profile issuing-ca --csr issuing-N.csr …` → `issuing-ca install`、`activate`（`PKI.md` 第 4 節）。
 
+### 10.5 啟用雙人覆核時的部署建議（0.10.0）
+
+升級推送的雙人覆核（`kairos.toml` 的 `[remote] rollout_approval = "required"`；`crates/kairos-proto/REMOTE.md` 第 5.4 節）要求每個送出的推送由建立者與送出者以外的管理員核准，核准時伺服器會驗證核准者輸入的確認字串與送審內容的摘要值。啟用前請先知道它的邊界：
+
+- **帳號**：至少兩位管理員；**建立者與送出者都不能核准**，甲建立、乙送出的推送需要第三位管理員。只有兩位管理員時，由同一個人建立並送出、另一個人核准。核准需要以帳號登入，API token 不能核准。主控台在沒有可核准者時會警告（送出前的預覽、待核准的推送、系統健康）。
+- **這個設定只能在設定檔（或環境變數 `KAIROS__REMOTE__ROLLOUT_APPROVAL`）修改，需要重新啟動**，主控台唯讀顯示（系統設定 →「連線與安全」→「遠端管理」）。**能修改 `kairos.toml` 並重新啟動 Kairos 的人可以獨自把它關掉**——主控台內的雙人覆核防的是單一的主控台管理員，防不了這台主機的系統管理者。Kairos 做的是讓關閉無法安靜地發生：啟動時與資料庫記錄的上一次設定比對，改變時寫入稽核（`settings.rollout_approval.change`），由 `required` 改為 `none` 時另開告警事件「雙人覆核已關閉」（警告、預設推播、不會自己結束），系統健康與升級推送的清單在 30 天內顯示關閉的時間與來源。稽核寫不進去時遠端管理不啟動（主控台的集中設定、版本庫與升級推送回 503，其餘功能照常）。
+- **補償措施是部署單位的責任**（Kairos 不強制）：
+  1. `kairos.toml` 納入設定管理（Git、Ansible 等），修改要經過另一個人審核。
+  2. 主機上的特權操作經過 PAM／sudo 的核准或側錄流程；限制誰可以重新啟動 `kairos.service`。
+  3. 對 `kairos.toml` 設檔案完整性監控（auditd、AIDE 等）。
+  4. 把系統規則「雙人覆核已關閉」接到通知管道（主控台 → 告警規則 → 系統規則；Email 或 Webhook），並把稽核日誌外送到 Kairos 以外的系統——能改設定檔的人通常也能動這台機器上的紀錄，事件要離開這台機器才有價值。
+- **已知限制**：資料庫遺失或換成新的資料庫時沒有上一次的設定可以比對（視為第一次記錄；但資料庫裡有待核准或核准過的推送而目前是 `none` 時仍視同關閉）；還原舊的備份後可能把還原前就做過的修改再報一次。0.10.0 沒有待核准的逾時與通知：待核准的推送會一直佔住它的主機，請以「複製連結」告知核准者。叢集部署中 `rollout_approval` 在所有節點要相同（附錄 H）。
+
 ## 11. 升級
 
 **未啟用 mTLS 的部署請先處理**：從舊版升級時，若 `kairos.toml` 的 `server.listen` 是非 loopback 位址（例如 `0.0.0.0:8080`）而沒有設定 `auth.client_ca`，新版會拒絕啟動（舊版只記 `WARN`）。升級前先依第 6、7 節啟用 mTLS；只有隔離的測試環境才在 `[auth]` 加上 `allow_unauthenticated = true`。
@@ -573,7 +586,7 @@ mv /opt/kairos/data/pki/server.pem.new /opt/kairos/data/pki/server.pem
 
 **從 0.7 升級到 0.8：指標擴充（schema v8）、套件、`kairos pki`、aarch64**。資料庫升級到 schema v8（計數器的速率與推算序列、主機資產、行程快照；第一次啟動時重建 `series`，大型資料庫會多花一些時間）：**升級前以 `kairos db backup` 備份**，升級後 0.7 無法開啟。容量估算由每台約 52 MB 改為約 129 MB：主機多、沿用預設 `storage.max_total_bytes` 的部署依 `STORAGE.md` 第 10 節調高上限或縮短保留天數。協定版本不變，其他設定不需要修改。0.8 新增的 deb／rpm 是另一種安裝方式：既有的 tar.gz 安裝**不要**直接改裝套件（套件的預設設定是全新安裝用的；兩者版面相同，但 `kairos.service` 會從 `/etc/systemd/system` 換到 `/usr/lib/systemd/system`），照下方的步驟換執行檔即可。新版 `kairos.service` 多了 `InaccessiblePaths=-/opt/kairos/root-ca`（`kairos pki init` 的根 CA 暫存目錄；目錄不存在時沒有影響），手動 PKI 的部署可以沿用舊 unit。**`auth.client_ca`（安全修正）**：0.8 起 8443 一律拒絕經過已退役簽發 CA 的用戶端憑證鏈，`auth.client_ca` 指向根 CA 或代理 CA 的既有部署不需要修改設定也受到保護（`PKI.md` 第 15.4 節第 1 項）。仍**建議**改為 `client_ca = "/opt/kairos/data/pki/issuing-cas.pem"`：以根 CA 當信任錨時，根 CA 底下任何其他 CA 簽出的用戶端憑證都會通過，且不受 Kairos 的 CRL 管理。改之前以 `kairos pki certificates list` 與主控台 S04 確認每台主機都已改用 Kairos 簽發的憑證；仍有手動簽發的憑證時，`auth.client_ca` 只保留那張舊代理 CA（不要放根 CA），等那些主機重新註冊後再改。
 
-**從 0.9 升級到 0.10：PostgreSQL 後端、叢集模式與遠端管理的擴充（schema v11）**。資料庫由 v9 依序升級到 schema v10（叢集協調的資料表；單機與 SQLite 上保持空白）與 v11（`rollouts` 新增送出者與退回原因的欄位），第一次以 0.10.0 啟動（或任何開啟資料庫的 CLI）時在一個交易中自動套用：**升級前以 `kairos db backup <檔案> --include-keys` 備份**，升級後 0.9 無法開啟（降版從備份還原）。預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`、`rollout_approval = "none"`）下不需要修改 `kairos.toml`。要改用 PostgreSQL 見附錄 D（先升級到 0.10.0 並啟動一次，再以 `kairos db migrate --to postgres` 搬移：來源必須已是 v11），叢集部署見附錄 H。雙人覆核預設關閉；要求每個升級推送都由另一位管理員核准時，在 `kairos.toml` 的 `[remote]` 加上 `rollout_approval = "required"` 後重新啟動（只能在設定檔改；至少要有兩位管理員帳號，API token 不能核准）。協定不變，0.9 與 0.10 的 Kairos／Pulse 可任意混用；推送的排程、升級時段與自訂批次不需要升級 Pulse，外部 URL 的版本庫需要 Pulse 0.10 並在每台主機的 `pulse.toml` 設定 `upgrade.url_allowlist`（`pulse/packaging/INSTALL.md` 第 10.1 節）。
+**從 0.9 升級到 0.10：PostgreSQL 後端、叢集模式與遠端管理的擴充（schema v11）**。資料庫由 v9 依序升級到 schema v10（叢集協調的資料表；單機與 SQLite 上保持空白）與 v11（`rollouts` 新增送出者與退回原因的欄位），第一次以 0.10.0 啟動（或任何開啟資料庫的 CLI）時在一個交易中自動套用：**升級前以 `kairos db backup <檔案> --include-keys` 備份**，升級後 0.9 無法開啟（降版從備份還原）。預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`、`rollout_approval = "none"`）下不需要修改 `kairos.toml`。要改用 PostgreSQL 見附錄 D（先升級到 0.10.0 並啟動一次，再以 `kairos db migrate --to postgres` 搬移：來源必須已是 v11），叢集部署見附錄 H。雙人覆核預設關閉；要求每個升級推送都由另一位管理員核准時，在 `kairos.toml` 的 `[remote]` 加上 `rollout_approval = "required"` 後重新啟動（只能在設定檔改；至少要有兩位管理員帳號，建立者與送出者都不能核准，API token 不能核准；啟用前請讀第 10.5 節的部署建議）。協定不變，0.9 與 0.10 的 Kairos／Pulse 可任意混用；推送的排程、升級時段與自訂批次不需要升級 Pulse，外部 URL 的版本庫需要 Pulse 0.10 並在每台主機的 `pulse.toml` 設定 `upgrade.url_allowlist`（`pulse/packaging/INSTALL.md` 第 10.1 節）。
 
 **換上新版 unit**：新版 `kairos.service` 新增 `RestartPreventExitStatus=2 3 4`（用法、設定、憑證錯誤時不再無限重試）。升級時以發佈包的 `kairos.service` 覆寫 `/etc/systemd/system/kairos.service`（自訂內容放在 `systemctl edit` 的 drop-in）後 `systemctl daemon-reload`。完整的變更與升級步驟見新版發佈包中的 `CHANGELOG.md`。
 
