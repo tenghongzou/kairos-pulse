@@ -126,7 +126,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Store tests (SQLite and PostgreSQL)
-        run: cargo test -p kairos --locked --no-fail-fast store::
+        run: "cargo test -p kairos --locked --no-fail-fast store::"
 
       - name: Build binaries for end-to-end tests
         run: cargo build -p kairos -p pulse --bins --locked
