@@ -151,6 +151,8 @@ ALTER TABLE hosts ADD COLUMN cert_rejection TEXT;       -- JSON：reason、seria
 
 `meta` 另有 `capacity_event`（最近一次容量上限刪除，第 8.2 節）與 `retention_last`（最近一次保留清除的結果），兩者由 writer 寫入、主控台的系統健康讀取。
 
+0.10.0 起 `meta` 另有 `remote.rollout_approval_observed`（JSON；兩個後端相同，**不需要 schema 變更**，schema 仍是 v11）：遠端管理服務上一次啟動時觀察到的 `[remote] rollout_approval`——`value`、`source`（`file`／`environment`／`default`）、`observed_at`、`node`、`changed_at`、`changed_from`、`disabled_at`。啟動時與目前的設定比對，改變時在同一個寫入交易中寫稽核 `settings.rollout_approval.*` 並更新這個鍵（REMOTE.md 第 5.4 節、`remote/policy.rs`）；隨 `kairos db backup` 與 `kairos db migrate` 一起搬移。升級推送的送審摘要（`submission`、`digest`）不落地，每次由 `rollouts` 與 `rollout_hosts` 計算。
+
 - 不使用 `STRICT` 表與外鍵，讓較舊的 `sqlite3` 命令列工具（例如 RHEL 8 的 3.26）也能開啟備份檔檢查。
 - `seq`、`report_seq` 是 u64，以 i64 的位元形式保存（超過 2^63 時讀回要轉回 u64）。
 - 每筆 report 不重複保存 `peer`、`hostname`、`agent_id`（JSONL 每行約 250 bytes 的重複字串）；`kairos reports export` 以清冊中最後的值補上。

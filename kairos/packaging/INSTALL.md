@@ -802,7 +802,7 @@ sudo systemctl start kairos
 - **PROXY protocol v2**：經 L4 負載平衡器時，Kairos 看到的來源位址是負載平衡器的位址（每 IP 上限、註冊的來源位址、稽核的 `actor_ip`、主機的 `peer` 都是它）。請把負載平衡器的位址加入 `server.per_ip_allowlist`，或改用虛擬 IP／`fallback_addresses`（第 H.3 節）。
 - **主控台的叢集畫面、`POST` 的排空／交還 API**：叢集的狀態看 `kairos cluster status`、系統健康的 `cluster` 項目與 `GET /api/v1/cluster`；排空與交還只有 CLI。
 - **叢集專用的系統告警規則**：節點失聯、金鑰不一致等不會產生 Kairos 的告警事件；請以 Prometheus 規則（`kairos-alerts.example.yml` 最後「叢集模式」的三條規則）或外部監控補上。
-- **遠端升級版本庫的跨節點同步**：`<資料目錄>/releases/` 是節點本機的檔案，**每個節點要各自匯入相同的 Pulse 發佈版本**；否則接手的節點沒有發佈檔，進行中的升級推送會下載失敗。做法：把同一次發佈的目錄複製到每個節點，各執行一次 `sudo -u kairos /opt/kairos/kairos releases import <目錄> --config /opt/kairos/kairos.toml`（備援節點也可以執行；版本已在資料庫時只補上這個節點的檔案）。主控台的上傳只存到當時的主動節點。接手的節點缺少檔案時，它的系統健康「遠端管理」顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕）；備援節點可以用 `kairos releases list` 事先確認（缺少的檔案標為「檔案遺失」）。外部 URL 的版本庫（`--external`）不保存發佈檔，不需要逐節點匯入。
+- **遠端升級版本庫的跨節點同步**：`<資料目錄>/releases/` 是節點本機的檔案，**每個節點要各自匯入相同的 Pulse 發佈版本**；否則接手的節點沒有發佈檔，進行中的升級推送會下載失敗。做法：把同一次發佈的目錄複製到每個節點，各執行一次 `sudo -u kairos /opt/kairos/kairos releases import <目錄> --config /opt/kairos/kairos.toml`（備援節點也可以執行；版本已在資料庫時只補上這個節點的檔案）。主控台的上傳只存到當時的主動節點。接手的節點缺少檔案時，它的系統健康「遠端管理」顯示「版本庫的檔案遺失」（`KRS-W8417`）；備援節點可以用 `kairos releases list` 事先確認（缺少的檔案標為「檔案遺失」）。外部 URL 的版本庫（`--external`）不保存發佈檔，不需要逐節點匯入。
 - **雙人覆核與排程**：`[remote] rollout_approval` 在所有節點要相同（不同時 `KRS-W8505`；否則換手後新送出的推送是否需要核准會跟著主動節點改變）。已排程與待核准的推送在資料庫中，換手後由接手的節點繼續；排程與升級時段以主動節點的系統時鐘判斷，請讓所有節點對時（NTP／chrony）。
 - 換手後告警規則的 `for` 計時與通知的速率限制重新計算（它們在主動節點的記憶體中）；主控台的工作階段在資料庫中，換手後仍有效。
 
@@ -1056,7 +1056,7 @@ sudo -u kairos /opt/kairos/kairos cluster forget kairos-b --config /opt/kairos/k
 | 備援節點的 `/readyz` 連不上（connection refused） | 沒有設定 `observability.listen`：備援節點不監聽主控台，探針只在這個監聽上提供 |
 | 備援節點的 `/metrics` 只有幾個指標 | 預期的行為：只有版本與 `kairos_cluster_*`；完整的指標在取得租約之後才有 |
 | 主動節點被 `kairos cluster drain` 之後沒有回來 | 排空的 leader 以結束代碼 0 結束，systemd 不會重新啟動；`systemctl start kairos` |
-| 換手後 Pulse 的升級推送下載失敗；系統健康的「遠端管理」顯示「版本庫的檔案遺失」（`KRS-W8417`〔暫定〕） | 接手的節點沒有匯入那個發佈版本（版本庫是節點本機的檔案）。在每個節點執行 `kairos releases import <目錄>` 匯入相同的發佈版本（可以重複執行，只補上缺少的檔案） |
+| 換手後 Pulse 的升級推送下載失敗；系統健康的「遠端管理」顯示「版本庫的檔案遺失」（`KRS-W8417`） | 接手的節點沒有匯入那個發佈版本（版本庫是節點本機的檔案）。在每個節點執行 `kairos releases import <目錄>` 匯入相同的發佈版本（可以重複執行，只補上缺少的檔案） |
 | 經 HAProxy 時 agent 被 `KRS-W2201`（每 IP 上限）拒絕 | 所有連線的來源都是 HAProxy 的位址。把它加入 `server.per_ip_allowlist` |
 
 ## 附錄 P：以 openssl 手動管理 PKI（0.7 以前的部署）
