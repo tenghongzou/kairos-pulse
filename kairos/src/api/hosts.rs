@@ -768,7 +768,7 @@ impl Filter {
                 return Err(ApiError::param(
                     "remote_upgrade",
                     format!(
-                        "remote_upgrade 的值 \"{v}\" 無效（ready、disabled、no_trust_anchor、no_helper、unsupported、none）"
+                        "remote_upgrade 的值 \"{v}\" 無效（ready、disabled、no_trust_anchor、no_helper、unsupported、unsafe_path、none）"
                     ),
                 ));
             }

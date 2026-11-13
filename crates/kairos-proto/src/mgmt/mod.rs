@@ -169,13 +169,19 @@ pub const INSTALL_UPGRADE_NO_TRUST_ANCHOR: &str = "no_trust_anchor";
 pub const INSTALL_UPGRADE_NO_HELPER: &str = "no_helper";
 /// `install.upgrade`：多實例、`unknown` 安裝方式或不支援的平台
 pub const INSTALL_UPGRADE_UNSUPPORTED: &str = "unsupported";
+/// `install.upgrade`（Pulse 0.10.0 起）：其他條件都就緒，但安裝目錄、執行檔、輔助程式的工作目錄或它們的
+/// 上層目錄沒有通過輔助程式的路徑檢查（REMOTE.md 第 17.9.7 節）——此時推送會以 `PLS-E8405`
+/// （`unsafe_path`）失敗，所以事先回報。協定版本不變：`install` 的值本來就允許不認得的（Kairos 原樣
+/// 保存）；不認得這個值的 Kairos（0.9）把它分類為 `not_ready`
+pub const INSTALL_UPGRADE_UNSAFE_PATH: &str = "unsafe_path";
 /// 規格定義的 `install.upgrade`
-pub const INSTALL_UPGRADE_STATES: [&str; 5] = [
+pub const INSTALL_UPGRADE_STATES: [&str; 6] = [
     INSTALL_UPGRADE_READY,
     INSTALL_UPGRADE_DISABLED,
     INSTALL_UPGRADE_NO_TRUST_ANCHOR,
     INSTALL_UPGRADE_NO_HELPER,
     INSTALL_UPGRADE_UNSUPPORTED,
+    INSTALL_UPGRADE_UNSAFE_PATH,
 ];
 
 /// `install.config`：集中設定在本機啟用

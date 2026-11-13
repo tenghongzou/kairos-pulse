@@ -333,6 +333,18 @@ pub fn run(request: &Path) -> u8 {
     }
 }
 
+/// Pulse 在 hello 之前的路徑預檢（`install.upgrade = "unsafe_path"`；REMOTE.md 第 2.1、17.9.7 節）：與
+/// [`apply`] 第一步相同的檢查（安裝目錄、執行檔、工作目錄的根目錄與它們的上層目錄），但不建立、不修改
+/// 任何東西，服務帳號因權限不足而看不到的部分略過。`Err` 的內容是結果 `detail` 中 `unsafe_path: ` 之後的
+/// 文字（`<路徑>: <原因>`）。細節見 [`txn::precheck`]
+pub fn precheck_paths(
+    install_dir: &Path,
+    work_root: &Path,
+    require_root_owner: bool,
+) -> Result<(), String> {
+    txn::precheck(install_dir, work_root, txn::Owner::new(require_root_owner))
+}
+
 /// 不做任何變更就拒絕這次請求（路徑不安全、指標或紀錄不可用）：寫出結果、刪除 `request.json`（避免
 /// `pulse-upgrade.path` 反覆觸發）。`id`：結果要回報的 `upgrade_id`（進行中的交易；`None` 時為請求的）。
 /// 請求本身讀不到時無法產生結果，回傳 `Err`

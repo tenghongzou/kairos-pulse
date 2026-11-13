@@ -413,6 +413,12 @@ impl UpgradeAgent {
                 "{}遠端升級已在本機停用（upgrade.enabled = false）",
                 codes::tag(codes::UPGRADE_DECLINED, Some(codes::I_UPGRADE_DISABLED))
             );
+        } else if env.detection.upgrade == mgmt::INSTALL_UPGRADE_UNSAFE_PATH {
+            log::warn!(
+                "{}遠端升級不可用：安裝路徑沒有通過升級輔助程式的路徑檢查（{}）；改為 root 擁有、群組與其他人不可寫後，下一次連線時重新偵測",
+                codes::tag(codes::UPGRADE_DECLINED, Some(codes::E_UPGRADE_PRECHECK)),
+                env.detection.reason.as_deref().unwrap_or("")
+            );
         } else if env.detection.upgrade != mgmt::INSTALL_UPGRADE_READY {
             log::info!(
                 "遠端升級不可用（install.upgrade = {}）：{}",
@@ -1044,6 +1050,7 @@ impl UpgradeAgent {
             let code = match d.upgrade {
                 mgmt::INSTALL_UPGRADE_DISABLED => codes::I_UPGRADE_DISABLED,
                 mgmt::INSTALL_UPGRADE_NO_TRUST_ANCHOR => codes::E_UPGRADE_TRUST_ANCHOR,
+                mgmt::INSTALL_UPGRADE_UNSAFE_PATH => codes::E_UPGRADE_PRECHECK,
                 _ => codes::W_UPGRADE_UNSUPPORTED,
             };
             let detail = d.upgrade.to_string();

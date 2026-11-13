@@ -1511,10 +1511,30 @@ fn more_than_one_unfinished_legacy_transaction_is_not_guessed() {
 
 // ---- 第 17.9.7 節：路徑檢查 ------------------------------------------------------
 
-/// 這次請求因路徑不安全被拒絕，沒有任何變更
+/// Pulse 在 hello 之前的預檢（`install.upgrade = "unsafe_path"`）對這個環境的結果
+fn precheck(env: &Env) -> Result<(), String> {
+    precheck_paths(
+        &env.paths.install_dir,
+        &env.paths.work_root,
+        env.paths.require_root_owner,
+    )
+}
+
+/// 這次請求因路徑不安全被拒絕，沒有任何變更。預檢（[`precheck_paths`]）對同一個環境回報**同一個**路徑與
+/// 原因——兩者共用同一套檢查；例外是每筆交易的工作目錄（`work-` 開頭的情境），預檢不涵蓋
 fn refused_as_unsafe(env: &Env, why: &str, label: &str) {
+    let pre = precheck(env);
     let fake = Fake::new(&env.root);
     let r = apply(&env.paths, &fake).unwrap();
+    if label.starts_with("work-") {
+        assert_eq!(pre, Ok(()), "{label}: 預檢不涵蓋每筆交易的工作目錄");
+    } else {
+        assert_eq!(
+            pre.map_err(|why| format!("{DETAIL_UNSAFE_PATH}: {why}")),
+            Err(r.detail.clone()),
+            "{label}: 預檢與輔助程式的結論相同"
+        );
+    }
     assert_eq!(
         (r.state.as_str(), r.code.as_deref()),
         ("failed", Some(codes::E_UPGRADE_PRECHECK)),
@@ -1557,6 +1577,16 @@ fn the_work_directories_must_be_private_and_not_symbolic_links() {
     let env = setup("fm-path-root-755", "tar");
     std::fs::create_dir(&env.paths.work_root).unwrap();
     chmod(&env.paths.work_root, 0o755);
+    // 預檢：算通過（輔助程式會改回 0700），而且預檢自己不修改任何東西
+    assert_eq!(precheck(&env), Ok(()));
+    assert_eq!(
+        std::fs::metadata(&env.paths.work_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
     assert_eq!(
@@ -1600,6 +1630,11 @@ fn the_work_directories_must_be_private_and_not_symbolic_links() {
     env.cleanup();
     let env = setup("fm-path-parent-sticky", "tar");
     chmod(&env.root.join("var/lib"), 0o1777);
+    assert_eq!(precheck(&env), Ok(()));
+    assert!(
+        !env.paths.work_root.exists(),
+        "預檢不建立工作目錄的根目錄（不存在算通過）"
+    );
     let r = apply(&env.paths, &Fake::new(&env.root)).unwrap();
     assert_eq!(r.state, "succeeded", "{r:?}");
     env.cleanup();
@@ -1646,8 +1681,13 @@ fn the_install_directory_and_binary_must_be_safe() {
     let env = setup("fm-path-prev-link", "tar");
     let fake = Fake::new(&env.root);
     std::os::unix::fs::symlink("pulse", env.paths.install_dir.join("pulse.prev")).unwrap();
+    let pre = precheck(&env);
     let r = apply(&env.paths, &fake).unwrap();
     assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_PRECHECK), "{r:?}");
+    assert_eq!(
+        pre.map_err(|why| format!("{DETAIL_UNSAFE_PATH}: {why}")),
+        Err(r.detail.clone())
+    );
     assert!(
         r.detail.starts_with(DETAIL_UNSAFE_PATH) && r.detail.contains("pulse.prev"),
         "{}",
@@ -1655,6 +1695,61 @@ fn the_install_directory_and_binary_must_be_safe() {
     );
     assert!(fake.calls().is_empty());
     assert_eq!(env.installed(), "0.9.0");
+    env.cleanup();
+}
+
+/// 預檢由服務帳號（不是 root）執行：因為權限不足而看不到的部分略過，不回報不安全；看得到的部分照常檢查
+#[test]
+fn the_precheck_skips_what_the_service_account_cannot_see() {
+    if running_as_root() {
+        return;
+    }
+    // 安裝目錄進不去（`lstat /opt/pulse/pulse` 得到 EACCES）：略過安裝目錄的其餘檢查
+    let env = setup("fm-pre-denied-install", "tar");
+    chmod(&env.paths.install_dir.join("pulse"), 0o775);
+    assert!(precheck(&env).is_err(), "看得到時：執行檔群組可寫");
+    chmod(&env.paths.install_dir, 0o000);
+    assert_eq!(precheck(&env), Ok(()), "看不到執行檔：不誤報");
+    // 工作目錄的根目錄是獨立的一部分，仍然檢查
+    std::fs::create_dir(&env.paths.work_root).unwrap();
+    chmod(&env.paths.work_root, 0o777);
+    let why = precheck(&env).unwrap_err();
+    assert!(
+        why.contains("pulse-upgrade") && why.contains("writable by group or others"),
+        "{why}"
+    );
+    chmod(&env.paths.install_dir, 0o755);
+    env.cleanup();
+
+    // 工作目錄的上層目錄進不去（`lstat /var/lib/pulse-upgrade` 得到 EACCES）：略過，不誤報
+    let env = setup("fm-pre-denied-work", "tar");
+    std::fs::create_dir(&env.paths.work_root).unwrap();
+    chmod(&env.paths.work_root, 0o777);
+    assert!(precheck(&env).is_err(), "看得到時：根目錄其他人可寫");
+    chmod(&env.root.join("var/lib"), 0o000);
+    assert_eq!(precheck(&env), Ok(()), "看不到工作目錄：不誤報");
+    // 安裝目錄仍然檢查
+    chmod(&env.paths.install_dir, 0o775);
+    let why = precheck(&env).unwrap_err();
+    assert!(
+        why.contains("opt/pulse: writable by group or others"),
+        "{why}"
+    );
+    chmod(&env.root.join("var/lib"), 0o755);
+    env.cleanup();
+
+    // 輔助程式（root）對「看不到」沒有例外：同樣的情況它回報 unsafe_path（cannot be examined）
+    let env = setup("fm-pre-denied-helper", "tar");
+    chmod(&env.paths.install_dir, 0o000);
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    chmod(&env.paths.install_dir, 0o755);
+    assert_eq!(r.code.as_deref(), Some(codes::E_UPGRADE_PRECHECK), "{r:?}");
+    assert!(
+        r.detail.starts_with(DETAIL_UNSAFE_PATH) && r.detail.contains("cannot be examined"),
+        "{}",
+        r.detail
+    );
     env.cleanup();
 }
 

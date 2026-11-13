@@ -9,7 +9,9 @@
 //! 遠端升級的本機狀態（第一個符合的）：`disabled`（`upgrade.enabled = false`，`pulse.toml` 與環境變數任一為
 //! `false`）→ `unsupported`（不是 Linux、`unknown` 安裝方式、多實例、容器、沒有 systemd）→
 //! `no_trust_anchor`（`allowed_signers` 不存在、不是 root 擁有、其他人可寫、沒有可用的金鑰）→
-//! `no_helper`（沒有啟用 `pulse-upgrade.path`）→ `ready`。
+//! `no_helper`（沒有啟用 `pulse-upgrade.path`）→ `unsafe_path`（0.10.0：安裝目錄、執行檔、
+//! `/var/lib/pulse-upgrade` 或它們的上層目錄沒有通過輔助程式的路徑檢查；與輔助程式共用同一個函式，
+//! 服務帳號看不到的部分略過）→ `ready`。
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +19,7 @@ use kairos_proto::mgmt::{
     INSTALL_METHOD_DEB, INSTALL_METHOD_MSI, INSTALL_METHOD_RPM, INSTALL_METHOD_TAR,
     INSTALL_METHOD_UNKNOWN, INSTALL_METHOD_ZIP, INSTALL_UPGRADE_DISABLED,
     INSTALL_UPGRADE_NO_HELPER, INSTALL_UPGRADE_NO_TRUST_ANCHOR, INSTALL_UPGRADE_READY,
-    INSTALL_UPGRADE_UNSUPPORTED,
+    INSTALL_UPGRADE_UNSAFE_PATH, INSTALL_UPGRADE_UNSUPPORTED,
 };
 use kairos_proto::release::{AllowedSigners, RELEASE_NAMESPACE};
 
@@ -29,6 +31,9 @@ pub const INSTALL_METHOD_FILE: &str = "/opt/pulse/.install-method";
 pub const HELPER_PATH_UNIT: &str = "pulse-upgrade.path";
 /// 信任錨的大小上限（bytes）
 pub const MAX_ALLOWED_SIGNERS_BYTES: u64 = 64 * 1024;
+/// `install.upgrade = "unsafe_path"` 時 [`Detection::reason`] 的開頭：與輔助程式結果的 `detail`
+/// （`unsafe_path: <路徑>: <原因>`）相同的寫法
+pub const UNSAFE_PATH_REASON_PREFIX: &str = "unsafe_path: ";
 
 /// 偵測的輸入（測試時以暫存目錄模擬根目錄）
 #[derive(Debug, Clone)]
@@ -332,6 +337,18 @@ pub fn detect(enabled: bool, trust_anchor: &Path, p: &Probe) -> Detection {
         d.reason = Some(format!(
             "沒有啟用 {HELPER_PATH_UNIT}（systemctl enable --now {HELPER_PATH_UNIT}）"
         ));
+        return d;
+    }
+    // 其他條件都就緒：事先做輔助程式第一步的路徑檢查（同一個函式；REMOTE.md 第 17.9.7 節）。不通過的話
+    // 推送會以 PLS-E8405（unsafe_path）失敗，所以在 hello 就回報，讓 Kairos 的資格預覽標出這台主機。
+    // 服務帳號看不到的部分略過（不誤報）；輔助程式執行時仍會自己再檢查一次
+    if let Err(why) = crate::remote::upgrade::helper::precheck_paths(
+        &p.path(INSTALL_DIR),
+        &p.path(crate::remote::upgrade::helper::WORK_ROOT),
+        p.require_root_owner,
+    ) {
+        d.upgrade = INSTALL_UPGRADE_UNSAFE_PATH;
+        d.reason = Some(format!("{UNSAFE_PATH_REASON_PREFIX}{why}"));
     }
     d
 }
@@ -369,10 +386,22 @@ mod tests {
         include_str!("../../../crates/kairos-proto/testdata/release/allowed_signers");
 
     #[cfg(target_os = "linux")]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     fn ready_root(name: &str) -> PathBuf {
         let root = tmp(name);
         std::fs::create_dir_all(root.join("opt/pulse")).unwrap();
+        std::fs::create_dir_all(root.join("var/lib")).unwrap();
         std::fs::create_dir_all(root.join("run/systemd/system")).unwrap();
+        write(&root, "opt/pulse/pulse", "VERSION=test\n");
+        // 路徑檢查（REMOTE.md 第 17.9.7 節）要求群組與其他人不可寫：不依賴執行測試的帳號的 umask
+        for p in ["", "opt", "opt/pulse", "opt/pulse/pulse", "var", "var/lib"] {
+            chmod(&root.join(p), 0o755);
+        }
         write(&root, "etc/kairos-pulse/allowed_signers", SIGNERS);
         let anchor = root.join("etc/kairos-pulse/allowed_signers");
         use std::os::unix::fs::PermissionsExt;
@@ -511,6 +540,168 @@ mod tests {
             detect(true, &anchor, &unknown).upgrade,
             INSTALL_UPGRADE_UNSUPPORTED
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `install.upgrade = "unsafe_path"`（0.10.0）：其他條件都就緒的主機，事先做輔助程式第一步的路徑檢查
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ready_host_with_unsafe_paths_reports_unsafe_path() {
+        let unsafe_reason = |root: &Path| {
+            let anchor = root.join("etc/kairos-pulse/allowed_signers");
+            let d = detect(true, &anchor, &probe(root));
+            assert_eq!(d.upgrade, INSTALL_UPGRADE_UNSAFE_PATH, "{d:?}");
+            // 其他欄位不受影響：安裝方式、信任錨的指紋照常回報
+            assert_eq!(d.method, INSTALL_METHOD_TAR);
+            assert_eq!(d.fingerprints.len(), 1);
+            let reason = d.reason.unwrap();
+            assert!(reason.starts_with(UNSAFE_PATH_REASON_PREFIX), "{reason}");
+            reason
+        };
+        let ready = |root: &Path, label: &str| {
+            let anchor = root.join("etc/kairos-pulse/allowed_signers");
+            let d = detect(true, &anchor, &probe(root));
+            assert_eq!(d.upgrade, INSTALL_UPGRADE_READY, "{label}: {d:?}");
+            assert_eq!(d.reason, None, "{label}");
+        };
+
+        // 合規：工作目錄的根目錄還不存在（輔助程式第一次執行時才建立）、0700、或只多了讀取／執行權限
+        let root = ready_root("unsafe-ok");
+        ready(&root, "沒有 /var/lib/pulse-upgrade");
+        assert!(
+            !root.join("var/lib/pulse-upgrade").exists(),
+            "預檢不建立目錄"
+        );
+        std::fs::create_dir(root.join("var/lib/pulse-upgrade")).unwrap();
+        chmod(&root.join("var/lib/pulse-upgrade"), 0o700);
+        ready(&root, "0700");
+        chmod(&root.join("var/lib/pulse-upgrade"), 0o755);
+        ready(&root, "0755（輔助程式會改回 0700）");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("var/lib/pulse-upgrade"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "預檢不修改權限");
+        }
+        // INSTALL 的 root:pulse 751、上層目錄是 sticky 的 1777、pulse.prev 是一般檔案
+        chmod(&root.join("opt/pulse"), 0o751);
+        chmod(&root.join("opt"), 0o1777);
+        write(&root, "opt/pulse/pulse.prev", "VERSION=old\n");
+        ready(&root, "751、sticky 的上層目錄、pulse.prev");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 不合規：每一種各自獨立
+        type Break = fn(&Path);
+        let cases: [(&str, &str, Break); 9] = [
+            ("install-group-writable", "opt/pulse: writable", |r| {
+                chmod(&r.join("opt/pulse"), 0o775)
+            }),
+            ("install-other-writable", "opt/pulse: writable", |r| {
+                chmod(&r.join("opt/pulse"), 0o757)
+            }),
+            ("install-symlink", "opt/pulse: is a symbolic link", |r| {
+                std::fs::rename(r.join("opt/pulse"), r.join("opt/real")).unwrap();
+                std::os::unix::fs::symlink(r.join("opt/real"), r.join("opt/pulse")).unwrap();
+            }),
+            ("parent-writable", "opt: writable", |r| {
+                chmod(&r.join("opt"), 0o777)
+            }),
+            ("binary-writable", "opt/pulse/pulse: writable", |r| {
+                chmod(&r.join("opt/pulse/pulse"), 0o775)
+            }),
+            (
+                "binary-symlink",
+                "opt/pulse/pulse: not a regular file",
+                |r| {
+                    std::fs::rename(r.join("opt/pulse/pulse"), r.join("opt/pulse/pulse.real"))
+                        .unwrap();
+                    std::os::unix::fs::symlink("pulse.real", r.join("opt/pulse/pulse")).unwrap();
+                },
+            ),
+            ("prev-symlink", "pulse.prev: not a regular file", |r| {
+                std::os::unix::fs::symlink("pulse", r.join("opt/pulse/pulse.prev")).unwrap();
+            }),
+            ("work-root-writable", "pulse-upgrade: writable", |r| {
+                std::fs::create_dir(r.join("var/lib/pulse-upgrade")).unwrap();
+                chmod(&r.join("var/lib/pulse-upgrade"), 0o770);
+            }),
+            (
+                "work-root-symlink",
+                "pulse-upgrade: is a symbolic link",
+                |r| {
+                    std::fs::create_dir(r.join("var/elsewhere")).unwrap();
+                    chmod(&r.join("var/elsewhere"), 0o700);
+                    std::os::unix::fs::symlink(
+                        r.join("var/elsewhere"),
+                        r.join("var/lib/pulse-upgrade"),
+                    )
+                    .unwrap();
+                },
+            ),
+        ];
+        for (name, expect, break_it) in cases {
+            let root = ready_root(&format!("unsafe-{name}"));
+            ready(&root, name);
+            break_it(&root);
+            let reason = unsafe_reason(&root);
+            assert!(reason.contains(expect), "{name}: {reason}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 順序：unsafe_path 只在「原本會是 ready」時回報——停用、缺少輔助程式等原因優先
+        let root = ready_root("unsafe-order");
+        let anchor = root.join("etc/kairos-pulse/allowed_signers");
+        chmod(&root.join("opt/pulse"), 0o775);
+        let p = probe(&root);
+        assert_eq!(
+            detect(true, &anchor, &p).upgrade,
+            INSTALL_UPGRADE_UNSAFE_PATH
+        );
+        assert_eq!(detect(false, &anchor, &p).upgrade, INSTALL_UPGRADE_DISABLED);
+        std::fs::remove_file(root.join("etc/systemd/system/paths.target.wants/pulse-upgrade.path"))
+            .unwrap();
+        assert_eq!(detect(true, &anchor, &p).upgrade, INSTALL_UPGRADE_NO_HELPER);
+        assert_eq!(
+            detect(true, &root.join("missing"), &p).upgrade,
+            INSTALL_UPGRADE_NO_TRUST_ANCHOR
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 服務帳號（不是 root）看不到的路徑不算不安全：不因為權限不足而誤報
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paths_the_service_account_cannot_see_are_not_reported_as_unsafe() {
+        // SAFETY: 只讀取目前行程的有效 uid
+        if unsafe { libc::geteuid() } == 0 {
+            // root 不受目錄權限限制，無法模擬「看不到」
+            return;
+        }
+        let root = ready_root("unsafe-denied");
+        let anchor = root.join("etc/kairos-pulse/allowed_signers");
+        let p = probe(&root);
+        // /var/lib 進不去：lstat /var/lib/pulse-upgrade 得到 EACCES
+        std::fs::create_dir(root.join("var/lib/pulse-upgrade")).unwrap();
+        chmod(&root.join("var/lib/pulse-upgrade"), 0o777);
+        assert_eq!(
+            detect(true, &anchor, &p).upgrade,
+            INSTALL_UPGRADE_UNSAFE_PATH,
+            "看得到時回報"
+        );
+        chmod(&root.join("var/lib"), 0o000);
+        let d = detect(true, &anchor, &p);
+        chmod(&root.join("var/lib"), 0o755);
+        assert_eq!(d.upgrade, INSTALL_UPGRADE_READY, "{d:?}");
+        // 正式環境要求 root 擁有：測試帳號擁有的路徑不通過（與輔助程式相同）
+        let why = crate::remote::upgrade::helper::precheck_paths(
+            &root.join("opt/pulse"),
+            &root.join("var/lib/pulse-upgrade-missing"),
+            true,
+        )
+        .unwrap_err();
+        assert!(why.contains("not root"), "{why}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

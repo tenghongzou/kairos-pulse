@@ -589,43 +589,70 @@ impl Owner {
     }
 }
 
+/// 路徑檢查沒有通過的一項。輔助程式（root）把任何一項都當成不安全；Pulse 在 hello 之前的預檢
+/// （[`precheck`]，服務帳號）則略過 `denied` 的——那只代表服務帳號看不到，不代表路徑不安全
+#[cfg(unix)]
+#[derive(Debug)]
+struct Issue {
+    /// `<路徑>: <原因>`（結果 `detail` 中 `unsafe_path: ` 之後的文字）
+    msg: String,
+    /// 因為權限不足（`EACCES`）而無法檢查
+    denied: bool,
+}
+
+#[cfg(unix)]
+impl Issue {
+    fn unsafe_path(msg: String) -> Self {
+        Self { msg, denied: false }
+    }
+
+    /// `lstat`／`realpath` 失敗：`<路徑>: cannot be <動作>: <錯誤>`
+    fn io(p: &Path, action: &str, e: &std::io::Error) -> Self {
+        Self {
+            msg: format!("{}: cannot be {action}: {e}", p.display()),
+            denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+        }
+    }
+}
+
 /// 檢查一個上層目錄（或路徑中的符號連結）：擁有者、群組與其他人不可寫（sticky 的目錄除外）
 #[cfg(unix)]
-fn check_component(p: &Path, owner: Owner) -> Result<(), String> {
+fn check_component(p: &Path, owner: Owner) -> Result<(), Issue> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(p)
-        .map_err(|e| format!("{}: cannot be examined: {e}", p.display()))?;
+    let meta = std::fs::symlink_metadata(p).map_err(|e| Issue::io(p, "examined", &e))?;
     if !owner.accepts(meta.uid()) {
-        return Err(format!(
+        return Err(Issue::unsafe_path(format!(
             "{}: owned by uid {}, not root",
             p.display(),
             meta.uid()
-        ));
+        )));
     }
     if meta.file_type().is_symlink() {
         return Ok(());
     }
     if !meta.file_type().is_dir() {
-        return Err(format!("{}: not a directory", p.display()));
+        return Err(Issue::unsafe_path(format!(
+            "{}: not a directory",
+            p.display()
+        )));
     }
     if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-        return Err(format!(
+        return Err(Issue::unsafe_path(format!(
             "{}: writable by group or others (mode {:o})",
             p.display(),
             meta.mode() & 0o7777
-        ));
+        )));
     }
     Ok(())
 }
 
 /// 檢查 `dir` 與它的每一個上層目錄（路徑中有符號連結時連同解析後的實際路徑）
 #[cfg(unix)]
-fn check_chain(dir: &Path, owner: Owner) -> Result<(), String> {
+fn check_chain(dir: &Path, owner: Owner) -> Result<(), Issue> {
     for p in dir.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         check_component(p, owner)?;
     }
-    let real = std::fs::canonicalize(dir)
-        .map_err(|e| format!("{}: cannot be resolved: {e}", dir.display()))?;
+    let real = std::fs::canonicalize(dir).map_err(|e| Issue::io(dir, "resolved", &e))?;
     if real != dir {
         for p in real.ancestors() {
             check_component(p, owner)?;
@@ -634,62 +661,101 @@ fn check_chain(dir: &Path, owner: Owner) -> Result<(), String> {
     Ok(())
 }
 
+/// [`inspect_private_dir`] 的結果
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateDir {
+    /// 不存在（上層目錄已通過檢查）
+    Missing,
+    /// 符合：群組與其他人沒有任何權限
+    Private,
+    /// 群組或其他人只多了讀取／執行權限（目前的權限）
+    Readable(u32),
+}
+
+/// root 專用目錄的檢查（不做任何變更；[`ensure_private_dir`] 與 [`precheck`] 共用）：上層目錄通過
+/// [`check_chain`]；目錄本身不是符號連結、是目錄、擁有者 root、群組與其他人不可寫
+#[cfg(unix)]
+fn inspect_private_dir(dir: &Path, owner: Owner) -> Result<PrivateDir, Issue> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| Issue::unsafe_path(format!("{}: no parent directory", dir.display())))?;
+    check_chain(parent, owner)?;
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PrivateDir::Missing),
+        Err(e) => return Err(Issue::io(dir, "examined", &e)),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(Issue::unsafe_path(format!(
+            "{}: is a symbolic link",
+            dir.display()
+        )));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(Issue::unsafe_path(format!(
+            "{}: not a directory",
+            dir.display()
+        )));
+    }
+    if !owner.accepts(meta.uid()) {
+        return Err(Issue::unsafe_path(format!(
+            "{}: owned by uid {}, not root",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(Issue::unsafe_path(format!(
+            "{}: writable by group or others (mode {mode:o})",
+            dir.display()
+        )));
+    }
+    if mode & 0o077 != 0 {
+        return Ok(PrivateDir::Readable(mode));
+    }
+    Ok(PrivateDir::Private)
+}
+
 /// root 專用的目錄（工作目錄的根目錄與每筆交易的工作目錄）：必須是目錄、不是符號連結、擁有者 root、
 /// 群組與其他人沒有任何權限；既存的目錄同樣檢查。不存在時以 0700 建立（上層目錄必須存在並通過檢查）。
 /// 群組或其他人只多了讀取／執行權限時改回 0700，回傳 `Ok(Some(說明))` 供呼叫端記錄
 pub fn ensure_private_dir(dir: &Path, owner: Owner) -> Result<Option<String>, String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        let parent = dir
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| format!("{}: no parent directory", dir.display()))?;
-        check_chain(parent, owner)?;
-        let meta = match std::fs::symlink_metadata(dir) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(dir)
-                    .map_err(|e| format!("{}: cannot be created: {e}", dir.display()))?;
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|e| format!("{}: cannot set mode: {e}", dir.display()))?;
-                let _ = fsync_dir(parent);
-                std::fs::symlink_metadata(dir)
-                    .map_err(|e| format!("{}: cannot be examined: {e}", dir.display()))?
-            }
-            Err(e) => return Err(format!("{}: cannot be examined: {e}", dir.display())),
-        };
-        if meta.file_type().is_symlink() {
-            return Err(format!("{}: is a symbolic link", dir.display()));
-        }
-        if !meta.file_type().is_dir() {
-            return Err(format!("{}: not a directory", dir.display()));
-        }
-        if !owner.accepts(meta.uid()) {
-            return Err(format!(
-                "{}: owned by uid {}, not root",
-                dir.display(),
-                meta.uid()
-            ));
-        }
-        let mode = meta.mode() & 0o7777;
-        if mode & 0o022 != 0 {
-            return Err(format!(
-                "{}: writable by group or others (mode {mode:o})",
-                dir.display()
-            ));
-        }
-        if mode & 0o077 != 0 {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut state = inspect_private_dir(dir, owner).map_err(|i| i.msg)?;
+        if state == PrivateDir::Missing {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| format!("{}: cannot be created: {e}", dir.display()))?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| format!("{}: cannot set mode: {e}", dir.display()))?;
-            return Ok(Some(format!(
-                "{} 的權限是 {mode:o}，已改回 700",
-                dir.display()
-            )));
+            if let Some(parent) = dir.parent() {
+                let _ = fsync_dir(parent);
+            }
+            // 剛建立的目錄同樣檢查（建立之後可能已被換掉）
+            state = inspect_private_dir(dir, owner).map_err(|i| i.msg)?;
         }
-        Ok(None)
+        match state {
+            PrivateDir::Private => Ok(None),
+            PrivateDir::Readable(mode) => {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| format!("{}: cannot set mode: {e}", dir.display()))?;
+                Ok(Some(format!(
+                    "{} 的權限是 {mode:o}，已改回 700",
+                    dir.display()
+                )))
+            }
+            PrivateDir::Missing => Err(format!(
+                "{}: cannot be examined: it disappeared after being created",
+                dir.display()
+            )),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -700,51 +766,101 @@ pub fn ensure_private_dir(dir: &Path, owner: Owner) -> Result<Option<String>, St
     }
 }
 
+/// 安裝目錄與執行檔的檢查（不做任何變更；[`check_install`] 與 [`precheck`] 共用）
+#[cfg(unix)]
+fn inspect_install(install_dir: &Path, owner: Owner) -> Result<(), Issue> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(install_dir)
+        .map_err(|e| Issue::io(install_dir, "examined", &e))?;
+    if meta.file_type().is_symlink() {
+        return Err(Issue::unsafe_path(format!(
+            "{}: is a symbolic link",
+            install_dir.display()
+        )));
+    }
+    check_chain(install_dir, owner)?;
+    let bin = install_dir.join("pulse");
+    let meta = std::fs::symlink_metadata(&bin).map_err(|e| Issue::io(&bin, "examined", &e))?;
+    if !meta.file_type().is_file() {
+        return Err(Issue::unsafe_path(format!(
+            "{}: not a regular file",
+            bin.display()
+        )));
+    }
+    if !owner.accepts(meta.uid()) {
+        return Err(Issue::unsafe_path(format!(
+            "{}: owned by uid {}, not root",
+            bin.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(Issue::unsafe_path(format!(
+            "{}: writable by group or others (mode {:o})",
+            bin.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+    let prev = install_dir.join("pulse.prev");
+    match std::fs::symlink_metadata(&prev) {
+        Ok(m) if !m.file_type().is_file() => {
+            return Err(Issue::unsafe_path(format!(
+                "{}: not a regular file",
+                prev.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Issue::io(&prev, "examined", &e)),
+    }
+    Ok(())
+}
+
 /// 安裝目錄與執行檔（第 17.9.7 節）
 pub fn check_install(install_dir: &Path, owner: Owner) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(install_dir)
-            .map_err(|e| format!("{}: cannot be examined: {e}", install_dir.display()))?;
-        if meta.file_type().is_symlink() {
-            return Err(format!("{}: is a symbolic link", install_dir.display()));
-        }
-        check_chain(install_dir, owner)?;
-        let bin = install_dir.join("pulse");
-        let meta = std::fs::symlink_metadata(&bin)
-            .map_err(|e| format!("{}: cannot be examined: {e}", bin.display()))?;
-        if !meta.file_type().is_file() {
-            return Err(format!("{}: not a regular file", bin.display()));
-        }
-        if !owner.accepts(meta.uid()) {
-            return Err(format!(
-                "{}: owned by uid {}, not root",
-                bin.display(),
-                meta.uid()
-            ));
-        }
-        if meta.mode() & 0o022 != 0 {
-            return Err(format!(
-                "{}: writable by group or others (mode {:o})",
-                bin.display(),
-                meta.mode() & 0o7777
-            ));
-        }
-        let prev = install_dir.join("pulse.prev");
-        match std::fs::symlink_metadata(&prev) {
-            Ok(m) if !m.file_type().is_file() => {
-                return Err(format!("{}: not a regular file", prev.display()));
+        inspect_install(install_dir, owner).map_err(|i| i.msg)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (install_dir, owner);
+        Ok(())
+    }
+}
+
+/// Pulse（服務帳號，不是 root）在 hello 之前的預檢（REMOTE.md 第 2.1、17.9.7 節）：與輔助程式在
+/// [`check_install`]、[`ensure_private_dir`]（工作目錄的根目錄）做的是**同一套檢查**（共用
+/// [`inspect_install`]、[`inspect_private_dir`]），但不建立、不修改任何東西，讓不合規的主機在資格預覽
+/// 就被標出來（`install.upgrade = "unsafe_path"`），而不是等推送失敗（`PLS-E8405`）。
+///
+/// 與輔助程式的差別：
+/// - **看不到的不算不安全**：`lstat`／`realpath` 因為權限不足（`EACCES`）失敗時略過那一部分（安裝目錄、
+///   工作目錄的根目錄各自獨立），不回報。服務帳號看不到不代表路徑有問題；輔助程式（root）仍會檢查。
+/// - 工作目錄的根目錄不存在（輔助程式第一次執行時才建立）、或群組與其他人只多了讀取／執行權限（輔助程式
+///   會改回 0700）都算通過。
+/// - **不涵蓋**每筆交易的工作目錄（`/var/lib/pulse-upgrade/<upgrade_id>`；根目錄是 `0700 root`，服務帳號
+///   進不去）與其中的檔案：仍由輔助程式在執行時檢查。
+///
+/// 預檢只是提早告知，不取代輔助程式的檢查：兩者之間路徑可能改變，輔助程式每次執行都重新檢查
+pub fn precheck(install_dir: &Path, work_root: &Path, owner: Owner) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let parts = [
+            inspect_install(install_dir, owner),
+            inspect_private_dir(work_root, owner).map(|_| ()),
+        ];
+        for part in parts {
+            match part {
+                Err(issue) if !issue.denied => return Err(issue.msg),
+                _ => {}
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: cannot be examined: {e}", prev.display())),
         }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let _ = (install_dir, owner);
+        let _ = (install_dir, work_root, owner);
         Ok(())
     }
 }
