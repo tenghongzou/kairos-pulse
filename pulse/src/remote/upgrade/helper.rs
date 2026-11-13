@@ -1,28 +1,36 @@
-//! 特權輔助程式 `pulse upgrade apply --request <檔案>`（`crates/kairos-proto/REMOTE.md` 第 4.4.1～4.5 節）。
+//! 特權輔助程式 `pulse upgrade apply --request <檔案>`（`crates/kairos-proto/REMOTE.md` 第 4.4.1～4.5、17.9 節）。
 //!
 //! 由 root 的 `pulse-upgrade.service`（`pulse-upgrade.path` 在 `request.json` 出現時啟動）以**目前已安裝的**
-//! 執行檔執行，不連網路。步驟：
+//! 執行檔執行，不連網路。步驟（交易紀錄的 `step`，[`txn::Step`]）：
 //!
-//! 1. 讀 `request.json`，把它與暫存的檔案**複製**到 root 專用的 `/var/lib/pulse-upgrade/<upgrade_id>/`（0700；
-//!    只接受一般檔案、`O_NOFOLLOW`、`st_nlink == 1`、大小上限），之後只對複本操作。
-//! 2. 重新驗證（信任錨與 `[upgrade]` 只從 root 擁有的 `pulse.toml` 讀，不讀環境變數或遠端設定快取）：
-//!    簽章、`SHA256SUMS`、檔名與平台、版本政策。
-//! 3. 預檢：把新的執行檔解到 `/opt/pulse/.upgrade-<id>/`，以 `pulse` 帳號執行 `pulse --version`（必須是目標版本）
-//!    與 `pulse check-config --json --with-remote`（結束代碼 0／8）。不通過：`PLS-E8405`，沒有變更。
-//! 4. 替換：tar 為 `pulse.prev` ＋ `rename`（unit 沒被改過時一併換新並 `daemon-reload`）；deb 為
-//!    `dpkg -i --force-confold`、rpm 為 `rpm -U`（套件資料庫被鎖住時每 30 秒重試、最多 10 分鐘）。
-//!    任何方式都先保留 `pulse.prev`。`systemctl restart pulse.service`。
-//! 5. 健康確認（`health_timeout_secs`）：服務 `active`、`NRestarts` 沒有增加、狀態檔由新的行程寫入（`pid`、
-//!    版本相符）、已註冊且有 report 被確認（`last_ack_at` 晚於重新啟動），再穩定 60 秒。結束代碼 2／3／4
-//!    或崩潰重啟立即判定失敗。
-//! 6. 失敗則回滾：tar 換回 `pulse.prev`（與 unit）；deb／rpm 有驗證過的回滾檔時以套件管理員裝回，否則換回
-//!    `pulse.prev`（套件資料庫仍為新版，`detail` 註明）。以 `max(期限, 300 秒)` 確認舊版恢復：成功
-//!    `rolled_back`（`PLS-W8407`），失敗 `rollback_failed`（`PLS-E8408`，保留所有紀錄，不再動作）。
-//! 7. 結果寫 `<狀態目錄>/upgrade/result.json`，刪除 `request.json` 與暫存（`rollback_failed` 時保留暫存）。
+//! 1. 檢查路徑（安裝目錄、root 的工作目錄與上層目錄的擁有者、權限、符號連結），讀進行中交易的指標：有
+//!    尚未結束的交易就只接續那一筆，不看 `request.json` 的內容。
+//! 2. `preparing`：記下替換前的狀態（自己的版本與 commit、偵測到的安裝方式、執行檔的雜湊、套件資料庫），
+//!    把 `request.json` 指到的檔案**複製**到 root 專用的 `/var/lib/pulse-upgrade/<upgrade_id>/`（0700；只接受
+//!    一般檔案、`O_NOFOLLOW`、`st_nlink == 1`、大小上限），重新驗證（信任錨與 `[upgrade]` 只從 root 擁有的
+//!    `pulse.toml` 讀）：簽章、`SHA256SUMS`、檔名與平台、版本政策；預檢：把新的執行檔解到
+//!    `/opt/pulse/.upgrade-<id>/`，以 `pulse` 帳號執行 `pulse --version`（必須是目標版本）與
+//!    `pulse check-config --json --with-remote`（結束代碼 0／8）。不通過：沒有變更。
+//! 3. `prepared`：驗證過的複本（新的執行檔、新 unit、回滾套件）與它們的雜湊都已記錄 → 寫入指標 →
+//!    `replacing`。**紀錄先於指標，指標先於任何變更。**
+//! 4. `replacing`：保留 `pulse.prev`（記錄）→ tar 備份 unit（記錄）→ 替換（tar：改名取代；deb：
+//!    `dpkg -i --force-confold`；rpm：`rpm -U`；套件資料庫被鎖住時每 30 秒重試、最多 10 分鐘）→ tar 換上
+//!    新 unit → `replaced`。`systemctl restart pulse.service`。
+//! 5. `replaced`：健康確認（`health_timeout_secs`）：服務 `active`、`NRestarts` 沒有增加、狀態檔由新的行程
+//!    寫入（`pid`、版本相符）、已註冊且有 report 被確認（`last_ack_at` 晚於重新啟動），再穩定 60 秒。結束
+//!    代碼 2／3／4 或崩潰重啟立即判定失敗。
+//! 6. 失敗則回滾：先記下意圖（`rollback_intent`）再還原——tar 換回 `pulse.prev`（與 unit）；deb／rpm 有驗證
+//!    過的回滾套件時以套件管理員裝回，否則換回 `pulse.prev`（套件資料庫仍為新版，`detail` 註明）——
+//!    `rolling_back`：以 `max(期限, 300 秒)` 確認舊版恢復：成功 `rolled_back`（`PLS-W8407`），失敗
+//!    `rollback_failed`（`PLS-E8408`，保留所有紀錄，不再動作）。
+//! 7. `done`：結果寫 `<狀態目錄>/upgrade/result.json`，刪除 `request.json` 與暫存（`rollback_failed` 時保留
+//!    暫存），清理工作目錄，刪除指標。
 //!
-//! 每一步記在 `/var/lib/pulse-upgrade/<id>/state.json`：重新開機後 `pulse-upgrade.path` 再次觸發時接續
-//! （已替換 → 重新做健康確認；期限已過 → 回滾）。外部程式只有固定路徑的 `systemctl`、`dpkg`、`dpkg-deb`、
-//! `rpm`、`rpm2cpio`、`cpio`、`tar`，參數由程式組成（[`System`]）。
+//! 每一步都先寫進 `state.json`（耐久）才做下一步；重新開機後 `pulse-upgrade.path` 再次觸發時，依紀錄的
+//! 步驟與**磁碟上的實況**（執行檔、unit、`pulse.prev` 的雜湊，套件資料庫）冪等地接續，只使用 root 工作目錄
+//! 裡驗證過的複本，不重讀服務帳號可寫的暫存區。每個當機點的結果見 REMOTE.md 第 17.9.4 節。外部程式只有
+//! 固定路徑的 `systemctl`、`dpkg`、`dpkg-deb`、`dpkg-query`、`rpm`、`rpm2cpio`、`cpio`、`tar`，參數由程式
+//! 組成（[`System`]）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,14 +41,18 @@ use kairos_proto::mgmt::{
     UPGRADE_STATE_SUCCEEDED,
 };
 use kairos_proto::release::{
-    self, Arch, ArtifactExpectation, Os, PolicyDecline, Product, ReleaseBundle, ReleaseManifest,
-    TrustPolicy, Version,
+    self, Arch, ArtifactExpectation, Os, PolicyDecline, Product, ReleaseBundle, TrustPolicy,
+    Version,
 };
-use serde::{Deserialize, Serialize};
 
 use super::files::{self, Request, UpgradeResult};
 use crate::codes;
 use crate::config_manager::AppConfig;
+
+mod txn;
+
+pub use txn::ACTIVE_FILE;
+use txn::{Cause, Loaded, Record, RollbackIntent, Step, UnitPlan, Verified, Via};
 
 /// 輔助程式的工作目錄（root 專用）
 pub const WORK_ROOT: &str = "/var/lib/pulse-upgrade";
@@ -65,8 +77,11 @@ const LOCK_GIVE_UP: Duration = Duration::from_secs(600);
 const MAX_SUMS: u64 = kairos_proto::mgmt::MAX_SHA256SUMS_BYTES as u64;
 const MAX_SIG: u64 = kairos_proto::mgmt::MAX_SIGNATURE_BYTES as u64;
 const MAX_MANIFEST: u64 = kairos_proto::mgmt::MAX_MANIFEST_BYTES as u64;
-/// 輔助程式狀態檔的 schema
-const HELPER_SCHEMA: &str = "pulse.upgrade-helper/v1";
+
+/// 開啟 feature `fault-injection` 的執行檔才有的標記字串（REMOTE.md 第 17.9.9 節）：打包腳本以它確認
+/// 正式發佈的執行檔沒有故障注入的程式
+#[cfg(feature = "fault-injection")]
+pub const FAULT_INJECTION_MARKER: &str = "pulse-fault-injection-build";
 
 /// 服務的狀態（`systemctl show`）
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -126,6 +141,10 @@ pub enum Cmd {
     /// 以 `pulse.prev` 回滾，資料庫仍是失敗的那一版），不加這兩個選項的話，之後重試同一版或推送比它低的
     /// 版本都會被 rpm 拒絕（「already installed」「newer … is already installed」）
     RpmInstall { package: PathBuf },
+    /// 套件資料庫中 `pulse` 的狀態（交易紀錄的 `pkg_db_before`／`pkg_db_after`）：deb 為
+    /// `dpkg-query -W -f='${Version} ${db:Status-Abbrev}' pulse`，rpm 為
+    /// `rpm -q --qf '%{VERSION}-%{RELEASE}' pulse`
+    PackageVersion { method: String },
     /// 以服務帳號執行解開的執行檔（`--version`、`check-config …`），工作目錄為安裝目錄
     RunAsService {
         program: PathBuf,
@@ -146,6 +165,9 @@ pub trait System {
     fn service_state(&self) -> Result<ServiceState, String>;
     fn daemon_reload(&self) -> Result<(), String>;
     fn run(&self, cmd: &Cmd) -> Output;
+    /// 故障注入點（REMOTE.md 第 17.9.4、17.9.9 節）：交易的每一步之間呼叫。正式環境不做任何事；測試用的
+    /// 實作在指定的點中止這次執行
+    fn checkpoint(&self, _name: &str) {}
 }
 
 /// 路徑（正式環境為固定位置；測試時以暫存目錄模擬）
@@ -155,10 +177,12 @@ pub struct Paths {
     pub install_dir: PathBuf,
     pub work_root: PathBuf,
     pub unit_path: PathBuf,
-    /// 信任錨必須由 root 擁有（測試時 `false`）
+    /// 信任錨、安裝目錄與工作目錄必須由 root 擁有（測試時 `false`：執行測試的帳號也可以）
     pub require_root_owner: bool,
     /// 這個輔助程式的版本（＝目前安裝的版本）
     pub current_version: String,
+    /// 這個輔助程式的 commit（`PULSE_BUILD_COMMIT`）
+    pub current_commit: String,
     /// 輔助程式自己偵測到的安裝方式（`tar`／`deb`／`rpm`／`unknown`；不採用 `request.json` 的 `method`）
     pub method: String,
     pub arch: String,
@@ -178,6 +202,7 @@ impl Paths {
             unit_path: PathBuf::from(UNIT_PATH),
             require_root_owner: true,
             current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_commit: env!("PULSE_BUILD_COMMIT").to_string(),
             method:
                 crate::remote::install::detect_method(&crate::remote::install::Probe::for_cli())
                     .to_string(),
@@ -202,80 +227,46 @@ impl Paths {
     fn result_path(&self) -> PathBuf {
         self.upgrade_dir().join(files::RESULT_FILE)
     }
-}
 
-/// 輔助程式的步驟（`/var/lib/pulse-upgrade/<id>/state.json`）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Step {
-    /// 已複製並驗證、預檢通過，尚未替換
-    Verified,
-    /// 已替換、已重新啟動，健康確認中
-    Replaced,
-    /// 回滾中（健康確認舊版）
-    RollingBack,
-    /// 完成（結果已寫出）
-    Done,
-}
+    /// 目前的執行檔
+    fn binary(&self) -> PathBuf {
+        self.install_dir.join("pulse")
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HelperState {
-    schema: String,
-    step: Step,
-    /// 健康確認的期限（Unix 秒）
-    deadline_unix: i64,
-    /// 重新啟動前的 `NRestarts`
-    n_restarts_before: u64,
-    /// 重新啟動的時間（Unix 秒）
-    restarted_unix: i64,
-    /// 實際使用的健康確認期限（秒）
-    #[serde(default)]
-    health_timeout_secs: u64,
-    /// tar：已換上新的 unit（回滾時一併還原）
-    unit_replaced: bool,
-    /// 附在結果 `detail` 的說明（例如 `unit_not_updated`）
-    notes: Vec<String>,
-    /// 回滾的原因（健康確認沒有通過的項目）：回滾中重新開機後接續時沿用，結果的 `detail` 才不會只剩 `resumed`
-    #[serde(default)]
-    rollback_reason: String,
-    /// 替換前實際執行的版本（輔助程式自己的版本，第一次執行時記下；0.10.0）。`request.json` 是服務帳號
-    /// 寫的、不可信：回滾檔的版本、回滾後的健康確認與結果都以這裡為準，重新開機後接續時（執行檔已是新版）
-    /// 也是。0.9.0 的狀態檔沒有這個欄位（空字串）
-    #[serde(default)]
-    from_version: String,
-    /// 替換時使用的安裝方式（輔助程式自己偵測的；0.10.0）、目標與驗證過的回滾檔名：接續時以這裡為準，
-    /// 不再採用 `request.json` 的值。0.9.0 的狀態檔沒有這些欄位（`method` 為空字串）
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    target: Option<kairos_proto::mgmt::UpgradeTarget>,
-    #[serde(default)]
-    rollback_artifact: Option<String>,
-    /// 這次升級已經把替換前的執行檔保留為 `pulse.prev`（之後不再覆寫，見 [`Helper::replace`]）
-    #[serde(default)]
-    prev_saved: bool,
-    /// 最後的結果（`Done` 時）
-    result: Option<UpgradeResult>,
+    /// 替換前保留的執行檔
+    fn prev(&self) -> PathBuf {
+        self.install_dir.join("pulse.prev")
+    }
 }
 
 /// `request.json` 的 `from_version` 與輔助程式自己認定的不符時，結果 `detail` 的開頭
 pub const DETAIL_FROM_VERSION_MISMATCH: &str = "from_version_mismatch";
-/// 接續時 `request.json` 的 `from_version` 與狀態檔記下的不同：沿用狀態檔的版本，結果 `detail` 加註
+/// 接續時 `request.json` 的 `from_version` 與紀錄的不同：沿用紀錄的版本，結果 `detail` 加註
 pub const NOTE_FROM_VERSION_IGNORED: &str = "request_from_version_ignored";
 /// `request.json` 的 `method` 與輔助程式自己偵測到的安裝方式不符時，結果 `detail` 的開頭
 pub const DETAIL_METHOD_MISMATCH: &str = "method_mismatch";
-/// 狀態檔損毀或遺失、而這次升級已經開始替換時，結果 `detail` 的開頭
+/// 交易紀錄損毀、遺失或與系統的實況矛盾時，結果 `detail` 的開頭
 pub const DETAIL_STATE_UNUSABLE: &str = "state_unusable";
-/// 替換前無法寫入狀態檔時，結果 `detail` 的開頭
+/// 替換前無法寫入交易紀錄或指標時，結果 `detail` 的開頭
 pub const DETAIL_STATE_NOT_SAVED: &str = "state_not_saved";
-/// 進行中交易的指標（工作目錄的根目錄下）
-pub const ACTIVE_FILE: &str = "active.json";
 /// 進行中交易的指標讀不到或內容不合法時，結果 `detail` 的開頭
 pub const DETAIL_POINTER_UNUSABLE: &str = "transaction_pointer_unusable";
+/// 安裝目錄或 root 的工作目錄沒有通過路徑檢查時，結果 `detail` 的開頭
+pub const DETAIL_UNSAFE_PATH: &str = "unsafe_path";
+/// 工作目錄裡驗證過的複本與紀錄的雜湊不符時，結果 `detail` 的開頭
+pub const DETAIL_COPY_CHANGED: &str = "verified_copy_changed";
+/// 替換無法完成、已還原並確認舊版恢復時，結果 `detail` 的結尾
+pub const DETAIL_RESTORED: &str = "restored";
 /// `request.json` 的 `upgrade_id` 不是進行中的交易：接續進行中的交易，結果 `detail` 加註
 pub const NOTE_UPGRADE_ID_IGNORED: &str = "request_upgrade_id_ignored";
-/// 接續時 `request.json` 的 `method`、`target` 或 `rollback_artifact` 與狀態檔記下的不同：沿用狀態檔的內容
+/// 接續時 `request.json` 的 `method`、`target` 或 `rollback_artifact` 與紀錄的不同：沿用紀錄的內容
 pub const NOTE_REQUEST_FIELDS_IGNORED: &str = "request_fields_ignored";
+/// 接續時 `request.json` 讀不到或不合法：只依紀錄接續
+pub const NOTE_REQUEST_UNREADABLE: &str = "request_unreadable";
+/// tar：unit 被修改過（或這次沒有換上新的 unit）
+pub const NOTE_UNIT_NOT_UPDATED: &str = "unit_not_updated";
+/// tar：回滾時無法還原 unit（備份與紀錄的雜湊不符）
+pub const NOTE_UNIT_NOT_RESTORED: &str = "unit_not_restored";
 
 /// 日誌：stderr（journal）與工作目錄的 `upgrade.log`
 struct Log {
@@ -285,11 +276,14 @@ struct Log {
 impl Log {
     fn new(path: Option<&Path>) -> Self {
         let file = path.and_then(|p| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
+            let mut o = std::fs::OpenOptions::new();
+            o.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.custom_flags(libc::O_NOFOLLOW);
+            }
+            o.open(p).ok()
         });
         Self { file }
     }
@@ -339,364 +333,745 @@ pub fn run(request: &Path) -> u8 {
     }
 }
 
-/// 執行一次請求（或接續上次中斷的請求）。無法讀取請求時回傳 `Err`（刪除 `request.json`，避免
-/// `pulse-upgrade.path` 反覆觸發）
+/// 不做任何變更就拒絕這次請求（路徑不安全、指標或紀錄不可用）：寫出結果、刪除 `request.json`（避免
+/// `pulse-upgrade.path` 反覆觸發）。`id`：結果要回報的 `upgrade_id`（進行中的交易；`None` 時為請求的）。
+/// 請求本身讀不到時無法產生結果，回傳 `Err`
+fn refuse(
+    paths: &Paths,
+    req: Result<Request, String>,
+    id: Option<&str>,
+    code: &str,
+    detail: String,
+) -> Result<UpgradeResult, String> {
+    let mut req = match req {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&paths.request);
+            return Err(format!("{e}（另外：{detail}）"));
+        }
+    };
+    let mut log = Log::new(None);
+    if let Some(id) = id {
+        if req.upgrade_id != id {
+            req.upgrade_id = id.to_string();
+        }
+        let work = paths.work_root.join(id);
+        if std::fs::symlink_metadata(&work).is_ok_and(|m| m.file_type().is_dir()) {
+            log = Log::new(Some(&work.join(txn::LOG_FILE)));
+        }
+    }
+    let r = result(&req, UPGRADE_STATE_FAILED, Some(code), detail);
+    log.line("ERROR", &format!("升級失敗（{code}）：{}", r.detail));
+    if let Ok(bytes) = serde_json::to_vec_pretty(&r) {
+        let _ = crate::remote::write_atomic(&paths.result_path(), &bytes, 0o644, 0o750);
+    }
+    let _ = std::fs::remove_file(&paths.request);
+    Ok(r)
+}
+
+/// 執行一次請求（或接續上次中斷的交易）。無法讀取請求、又沒有可接續的交易時回傳 `Err`（刪除
+/// `request.json`，避免 `pulse-upgrade.path` 反覆觸發）
 pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
-    let mut req = match Request::read_untrusted(&paths.request) {
+    let req = Request::read_untrusted(&paths.request);
+    let owner = txn::Owner::new(paths.require_root_owner);
+    // 1. 路徑（REMOTE.md 第 17.9.7 節）：既存的目錄同樣檢查，不只依賴 systemd 第一次建立
+    let mut warnings = Vec::new();
+    match txn::check_install(&paths.install_dir, owner)
+        .and_then(|()| txn::ensure_private_dir(&paths.work_root, owner))
+    {
+        Ok(w) => warnings.extend(w),
+        Err(why) => {
+            return refuse(
+                paths,
+                req,
+                None,
+                codes::E_UPGRADE_PRECHECK,
+                format!("{DETAIL_UNSAFE_PATH}: {why}"),
+            );
+        }
+    }
+    // 2. 進行中的交易（第 17.9.5 節）：工作目錄不由 request.json 的 upgrade_id 決定。有尚未結束的交易時
+    //    只接續那一筆——服務帳號在交易進行中改寫或換掉 request.json，都不會讓輔助程式開一筆新的交易
+    let active = match txn::read_active(&paths.work_root) {
+        Ok(a) => a,
+        Err(why) => {
+            // 指標不可用：不知道是否有進行中的交易，不開新的交易也不猜（保留指標，由人檢查）
+            return refuse(
+                paths,
+                req,
+                None,
+                codes::E_UPGRADE_INTEGRITY,
+                format!("{DETAIL_POINTER_UNUSABLE}: {why}; manual check required"),
+            );
+        }
+    };
+    if let Some(a) = active {
+        let work = paths.work_root.join(&a.upgrade_id);
+        let unusable = |why: String| format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required");
+        let why = match txn::load_record(&work) {
+            Loaded::V2(rec) => {
+                if rec.upgrade_id != a.upgrade_id || rec.binding_sha256 != a.binding_sha256 {
+                    Some(format!(
+                        "{} does not belong to the transaction named by {ACTIVE_FILE}",
+                        txn::STATE_FILE
+                    ))
+                } else if rec.step == Step::Preparing {
+                    Some(format!(
+                        "{} is at step preparing but {ACTIVE_FILE} exists",
+                        txn::STATE_FILE
+                    ))
+                } else if rec.step == Step::Done && rec.result.is_none() {
+                    Some(format!("{} is done without a result", txn::STATE_FILE))
+                } else if rec.step == Step::Done
+                    && !req.as_ref().is_ok_and(|r| r.upgrade_id == rec.upgrade_id)
+                {
+                    // 上一筆交易已結束（結果已寫出、request.json 已刪除），只差清除指標；現在的請求是
+                    // 另一筆：清除指標後照常處理（不覆寫 result.json）
+                    if let Err(e) = txn::clear_active(&paths.work_root) {
+                        return refuse(
+                            paths,
+                            req,
+                            None,
+                            codes::E_UPGRADE_INTEGRITY,
+                            format!(
+                                "{DETAIL_POINTER_UNUSABLE}: {ACTIVE_FILE} cannot be removed: {e}; manual check required"
+                            ),
+                        );
+                    }
+                    warnings.push(format!(
+                        "上一筆交易 {} 已結束，清除留下的 {ACTIVE_FILE}",
+                        a.upgrade_id
+                    ));
+                    None
+                } else {
+                    return Ok(resume(paths, sys, *rec, req.ok(), work, warnings));
+                }
+            }
+            Loaded::Missing => Some(format!("{} is missing", txn::STATE_FILE)),
+            Loaded::Legacy(_) => Some(format!("{} has the legacy schema", txn::STATE_FILE)),
+            Loaded::Unusable(why) => Some(why),
+        };
+        if let Some(why) = why {
+            // 指標保留：之後的請求同樣被擋下，檢查後刪除 active.json 與那個工作目錄
+            return refuse(
+                paths,
+                req,
+                Some(&a.upgrade_id),
+                codes::E_UPGRADE_INTEGRITY,
+                unusable(why),
+            );
+        }
+    }
+    // 3. 沒有指標：任何「已動手而未結束」或無法判斷的紀錄都不得被當成不存在
+    let mut legacy_open = Vec::new();
+    for e in txn::scan(&paths.work_root) {
+        let why = match &e.kind {
+            txn::Kind::V2 { step, .. } if step.unfinished() => Some(format!(
+                "transaction {} is at step {} but {ACTIVE_FILE} is missing",
+                e.id,
+                step.name()
+            )),
+            txn::Kind::Unusable(why) => Some(format!("{}: {why}", e.id)),
+            txn::Kind::Legacy { done: false, .. } => {
+                legacy_open.push(e);
+                None
+            }
+            _ => None,
+        };
+        if let Some(why) = why {
+            return refuse(
+                paths,
+                req,
+                None,
+                codes::E_UPGRADE_INTEGRITY,
+                format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required"),
+            );
+        }
+    }
+    if legacy_open.len() > 1 {
+        let ids: Vec<&str> = legacy_open.iter().map(|e| e.id.as_str()).collect();
+        return refuse(
+            paths,
+            req,
+            None,
+            codes::E_UPGRADE_INTEGRITY,
+            format!(
+                "{DETAIL_STATE_UNUSABLE}: more than one unfinished legacy transaction ({}); manual check required",
+                ids.join(", ")
+            ),
+        );
+    }
+    let req = match req {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_file(&paths.request);
             return Err(e);
         }
     };
-    // 進行中的交易（REMOTE.md 第 17.8 節）：工作目錄不由 request.json 的 upgrade_id 決定。有尚未結束的
-    // 交易時只接續那一筆——服務帳號在交易進行中把 request.json 換成另一個 upgrade_id，不會讓輔助程式
-    // 開一筆新的交易（那樣會略過原交易的 state.json、重新替換並覆寫 pulse.prev）
-    let mut pending_notes = Vec::new();
-    let mut swapped = None;
-    match read_active(&paths.work_root) {
-        Ok(Some(active)) if active != req.upgrade_id => {
-            swapped = Some(std::mem::replace(&mut req.upgrade_id, active));
-            pending_notes.push(NOTE_UPGRADE_ID_IGNORED.to_string());
-        }
-        Ok(_) => {}
-        Err(why) => {
-            // 指標不可用：不知道是否有進行中的交易，不開新的交易也不猜（保留指標，由人檢查）
-            let r = result(
-                &req,
-                UPGRADE_STATE_FAILED,
-                Some(codes::E_UPGRADE_INTEGRITY),
-                format!("{DETAIL_POINTER_UNUSABLE}: {why}; manual check required"),
+    if let Some(e) = legacy_open.pop() {
+        // 由 0.9.0 的輔助程式開始的交易（v1，沒有指標）：第 17.9.6 節
+        let Loaded::Legacy(state) = txn::load_record(&e.path) else {
+            return refuse(
+                paths,
+                Ok(req),
+                None,
+                codes::E_UPGRADE_INTEGRITY,
+                format!(
+                    "{DETAIL_STATE_UNUSABLE}: {}: {} changed while it was being read; manual check required",
+                    e.id,
+                    txn::STATE_FILE
+                ),
             );
-            eprintln!("錯誤 {}：{}", codes::E_UPGRADE_INTEGRITY, r.detail);
-            if let Ok(bytes) = serde_json::to_vec_pretty(&r) {
-                let _ = crate::remote::write_atomic(&paths.result_path(), &bytes, 0o644, 0o750);
+        };
+        return resume_legacy(paths, sys, &e.id, *state, req, e.path, warnings);
+    }
+    // 4. 全新的請求（或還沒動手就中斷的同一筆請求）
+    let work = paths.work_root.join(&req.upgrade_id);
+    let work_exists = std::fs::symlink_metadata(&work).is_ok();
+    let stale = |why: String| {
+        refuse(
+            paths,
+            Ok(req.clone()),
+            None,
+            codes::E_UPGRADE_INTEGRITY,
+            format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required"),
+        )
+    };
+    match txn::load_record(&work) {
+        Loaded::Missing => {
+            let left = if work_exists {
+                txn::traces(&work)
+            } else {
+                Vec::new()
+            };
+            if !left.is_empty() {
+                return stale(format!(
+                    "{} is missing but {} exists",
+                    txn::STATE_FILE,
+                    left.join(", ")
+                ));
             }
-            let _ = std::fs::remove_file(&paths.request);
-            return Ok(r);
+        }
+        Loaded::V2(rec) => match rec.step {
+            Step::Done => {
+                if let Some(r) = rec.result {
+                    // 同一個 upgrade_id 的請求再次出現：回報記下的結果
+                    let mut h = Helper::new(paths, sys, req, work, Vec::new());
+                    h.finish(&r);
+                    return Ok(r);
+                }
+                return stale(format!("{} is done without a result", txn::STATE_FILE));
+            }
+            Step::Preparing | Step::Prepared => {
+                // 沒有指標：還沒動手。確認系統仍是紀錄的替換前狀態才重來（輔助程式已是另一個版本時，
+                // 那筆紀錄屬於更早、已無關的嘗試）
+                if rec.from_version == paths.current_version && !rec.old_binary_sha256.is_empty() {
+                    let now = txn::sha256_regular(&paths.binary()).unwrap_or_default();
+                    if now != rec.old_binary_sha256 {
+                        return stale(format!(
+                            "{} is at step {} but the installed binary has changed",
+                            txn::STATE_FILE,
+                            rec.step.name()
+                        ));
+                    }
+                    let db = package_db(sys, &rec.method);
+                    if db != rec.pkg_db_before {
+                        return stale(format!(
+                            "{} is at step {} but the package database has changed ({:?} → {:?})",
+                            txn::STATE_FILE,
+                            rec.step.name(),
+                            rec.pkg_db_before,
+                            db
+                        ));
+                    }
+                }
+                warnings.push(format!(
+                    "上一次執行停在 {}（還沒有任何變更）：重新開始",
+                    rec.step.name()
+                ));
+            }
+            // 已在上面的掃描擋下；到這裡代表紀錄在兩次讀取之間變了
+            _ => {
+                return stale(format!(
+                    "{} is at step {} but {ACTIVE_FILE} is missing",
+                    txn::STATE_FILE,
+                    rec.step.name()
+                ));
+            }
+        },
+        Loaded::Legacy(state) => match state.result {
+            Some(r) if state.step == txn::LegacyStep::Done => {
+                let mut h = Helper::new(paths, sys, req, work, Vec::new());
+                h.finish(&r);
+                return Ok(r);
+            }
+            _ => return stale(format!("{} has the legacy schema", txn::STATE_FILE)),
+        },
+        Loaded::Unusable(why) => return stale(why),
+    }
+    // 第 17.9.8 節：開始新的交易之前清理（這裡沒有進行中的交易）
+    let removed = txn::prune(&paths.work_root, &[req.upgrade_id.as_str()], None);
+    match txn::ensure_private_dir(&work, owner) {
+        Ok(w) => warnings.extend(w),
+        Err(why) => {
+            return refuse(
+                paths,
+                Ok(req),
+                None,
+                codes::E_UPGRADE_PRECHECK,
+                format!("{DETAIL_UNSAFE_PATH}: {why}"),
+            );
         }
     }
-    let work = paths.work_root.join(&req.upgrade_id);
-    crate::remote::create_dir_all_mode(&paths.work_root, 0o700)
-        .and_then(|()| crate::remote::create_dir_all_mode(&work, 0o700))
-        .map_err(|e| format!("無法建立 {}：{e}", work.display()))?;
-    let mut log = Log::new(Some(&work.join("upgrade.log")));
-    log.line(
-        "INFO",
-        &format!(
-            "pulse upgrade apply：升級 {}（{} → {}，{}）",
-            req.upgrade_id, req.from_version, req.target.version, req.method
-        ),
-    );
-    if let Some(claimed) = &swapped {
-        log.line(
-            "WARN",
-            &format!(
-                "request.json 的 upgrade_id（{claimed}）不是進行中的交易（{}）：接續進行中的交易，不開新的交易",
-                req.upgrade_id
-            ),
+    txn::reset(&work);
+    let mut h = Helper::new(paths, sys, req, work, warnings);
+    if !removed.is_empty() {
+        h.log.line(
+            "INFO",
+            &format!("已清除較早的工作目錄：{}", removed.join("、")),
         );
     }
-    let state_path = work.join("state.json");
-    let state = read_state(&state_path, &work);
-    let mut h = Helper {
-        paths,
-        sys,
-        req,
-        work,
-        state_path,
-        log,
-        pending_notes,
-        keep_active: false,
+    let r = h.begin();
+    h.finish(&r);
+    Ok(r)
+}
+
+/// 套件資料庫中 `pulse` 的狀態（tar 與查不到時 `None`）
+fn package_db(sys: &dyn System, method: &str) -> Option<String> {
+    if !matches!(method, "deb" | "rpm") {
+        return None;
+    }
+    let out = sys.run(&Cmd::PackageVersion {
+        method: method.to_string(),
+    });
+    out.ok()
+        .then(|| out.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 接續 v2 的交易：之後 `request.json` 的內容不再有任何作用（只比對並加註），一切以紀錄為準
+fn resume(
+    paths: &Paths,
+    sys: &dyn System,
+    mut rec: Record,
+    req: Option<Request>,
+    work: PathBuf,
+    mut warnings: Vec<String>,
+) -> UpgradeResult {
+    let trusted = Request {
+        schema: files::REQUEST_SCHEMA.to_string(),
+        upgrade_id: rec.upgrade_id.clone(),
+        target: rec.target.clone(),
+        method: rec.method.clone(),
+        artifact: rec
+            .artifact
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_default(),
+        manifest: rec.manifest.clone(),
+        rollback_artifact: rec.rollback.as_ref().map(|r| r.name.clone()),
+        health_timeout_secs: u32::try_from(rec.health_timeout_secs).unwrap_or(u32::MAX),
+        allow_downgrade: false,
+        from_version: rec.from_version.clone(),
+        requested_at: req
+            .as_ref()
+            .map(|r| r.requested_at.clone())
+            .unwrap_or_default(),
     };
-    let r = match state {
-        Ok(state) => h.drive(state),
-        // 狀態檔不可用而這次升級已經動過手：不當成全新的請求（那樣會改信 request.json，並可能以新版覆寫
-        // pulse.prev）。不替換也不回滾，回報後由人處理；進行中交易的指標保留（之後的請求同樣被擋下，
-        // 檢查後刪除 /var/lib/pulse-upgrade/active.json 與那個工作目錄）
+    let mut notes = Vec::new();
+    match &req {
+        None => {
+            warnings.push("request.json 讀不到或不合法：只依交易紀錄接續".to_string());
+            notes.push(NOTE_REQUEST_UNREADABLE);
+        }
+        Some(r) => {
+            if r.upgrade_id != trusted.upgrade_id {
+                warnings.push(format!(
+                    "request.json 的 upgrade_id（{}）不是進行中的交易（{}）：接續進行中的交易，不開新的交易",
+                    r.upgrade_id, trusted.upgrade_id
+                ));
+                notes.push(NOTE_UPGRADE_ID_IGNORED);
+            }
+            if r.from_version != trusted.from_version {
+                warnings.push(format!(
+                    "request.json 的 from_version（{}）與替換前記下的版本（{}）不同，以後者為準",
+                    r.from_version, trusted.from_version
+                ));
+                notes.push(NOTE_FROM_VERSION_IGNORED);
+            }
+            let mut changed = Vec::new();
+            if r.method != trusted.method {
+                changed.push(format!("method {} → {}", r.method, trusted.method));
+            }
+            if r.target != trusted.target {
+                changed.push(format!(
+                    "target {} → {}",
+                    r.target.version, trusted.target.version
+                ));
+            }
+            // 只比對通過驗證而被記下的回滾套件（請求附了回滾檔但沒有通過驗證時，紀錄中沒有它，不算被改過）
+            if !rec.legacy
+                && trusted.rollback_artifact.is_some()
+                && r.rollback_artifact != trusted.rollback_artifact
+            {
+                changed.push("rollback_artifact".to_string());
+            }
+            if !changed.is_empty() {
+                warnings.push(format!(
+                    "request.json 的內容與交易紀錄不同（{}），以紀錄為準",
+                    changed.join("、")
+                ));
+                notes.push(NOTE_REQUEST_FIELDS_IGNORED);
+            }
+        }
+    }
+    for n in notes {
+        if !rec.notes.iter().any(|x| x == n) {
+            rec.notes.push(n.to_string());
+        }
+    }
+    // 進行中交易的工作目錄同樣要通過檢查
+    let owner = txn::Owner::new(paths.require_root_owner);
+    let mut h = match txn::ensure_private_dir(&work, owner) {
+        Ok(w) => {
+            warnings.extend(w);
+            Helper::new(paths, sys, trusted, work, warnings)
+        }
         Err(why) => {
+            let mut h = Helper::new_with(paths, sys, trusted, work, warnings, false);
             h.keep_active = true;
-            h.fail(
+            let r = h.fail(
+                codes::E_UPGRADE_PRECHECK,
+                format!("{DETAIL_UNSAFE_PATH}: {why}; manual check required"),
+            );
+            h.finish(&r);
+            return r;
+        }
+    };
+    let r = match rec.step {
+        Step::Prepared | Step::Replacing => {
+            h.log.line(
+                "INFO",
+                &format!(
+                    "接續上次中斷的替換（{}）：以工作目錄裡驗證過的複本與磁碟上的實況繼續",
+                    rec.step.name()
+                ),
+            );
+            rec.step = Step::Replacing;
+            match h.try_save(&mut rec) {
+                Ok(()) => h.replacing(rec),
+                Err(e) => h.replace_failed(rec, format!("{DETAIL_STATE_NOT_SAVED}: {e}")),
+            }
+        }
+        Step::Replaced => {
+            h.log
+                .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
+            h.after_replace(rec)
+        }
+        Step::RollbackIntent => {
+            h.log.line("INFO", "接續上次中斷的回滾：重新還原");
+            h.restore_and_confirm(rec, true)
+        }
+        Step::RollingBack => {
+            h.log.line("INFO", "接續上次中斷的回滾");
+            let reason = resumed_reason(&rec);
+            h.confirm_rollback(rec, reason)
+        }
+        // `done` 而沒有結果、`preparing` 已在 apply 擋下
+        Step::Done | Step::Preparing => match rec.result.clone() {
+            Some(r) => r,
+            None => {
+                h.keep_active = true;
+                h.fail(
+                    codes::E_UPGRADE_INTEGRITY,
+                    format!(
+                        "{DETAIL_STATE_UNUSABLE}: unexpected step {}; manual check required",
+                        rec.step.name()
+                    ),
+                )
+            }
+        },
+    };
+    h.finish(&r);
+    r
+}
+
+/// 接續回滾時結果的原因：「<原本的原因>; resumed」
+fn resumed_reason(rec: &Record) -> String {
+    match rec.rollback_intent.as_ref().map(|i| i.reason.as_str()) {
+        Some(r) if !r.is_empty() => format!("{r}; resumed"),
+        _ => "resumed".to_string(),
+    }
+}
+
+/// 接續由 0.9.0 的輔助程式開始的交易（v1 的狀態檔；REMOTE.md 第 17.9.6 節）：只接受已替換之後的步驟，
+/// 轉成 v2 的紀錄並寫入指標，之後依 v2 的規則
+fn resume_legacy(
+    paths: &Paths,
+    sys: &dyn System,
+    id: &str,
+    s: txn::LegacyState,
+    req: Request,
+    work: PathBuf,
+    mut warnings: Vec<String>,
+) -> Result<UpgradeResult, String> {
+    let mut notes: Vec<String> = s.notes.clone();
+    let mut note = |n: &str| {
+        if !notes.iter().any(|x| x == n) {
+            notes.push(n.to_string());
+        }
+    };
+    if req.upgrade_id != id {
+        warnings.push(format!(
+            "request.json 的 upgrade_id（{}）不是進行中的交易（{id}）：接續進行中的交易，不開新的交易",
+            req.upgrade_id
+        ));
+        note(NOTE_UPGRADE_ID_IGNORED);
+    }
+    // 0.9.0 的狀態檔沒有記版本、安裝方式與目標：只能沿用請求中的值（那一次升級由 0.9.0 的輔助程式開始，
+    // 行為與 0.9.0 相同）；有記的以紀錄為準
+    let from_version = if s.from_version.is_empty() {
+        warnings.push(
+            "狀態檔沒有記錄替換前的版本與安裝方式（由 0.9.0 的輔助程式寫入），沿用請求中的值"
+                .to_string(),
+        );
+        req.from_version.clone()
+    } else {
+        if req.from_version != s.from_version {
+            note(NOTE_FROM_VERSION_IGNORED);
+        }
+        s.from_version.clone()
+    };
+    let recorded = !s.method.is_empty();
+    let method = if recorded {
+        s.method.clone()
+    } else {
+        req.method.clone()
+    };
+    let target = s.target.clone().unwrap_or_else(|| req.target.clone());
+    let rollback_name = if recorded {
+        s.rollback_artifact.clone()
+    } else {
+        req.rollback_artifact.clone()
+    };
+    if recorded
+        && (req.method != method || req.target != target || req.rollback_artifact != rollback_name)
+    {
+        note(NOTE_REQUEST_FIELDS_IGNORED);
+    }
+    let timeout = if s.health_timeout_secs > 0 {
+        s.health_timeout_secs
+    } else {
+        u64::from(kairos_proto::mgmt::effective_health_timeout_secs(
+            req.health_timeout_secs,
+            0,
+        ))
+    };
+    let mut rec = Record::new(id, &from_version, "", &method);
+    rec.legacy = true;
+    rec.target = target;
+    rec.prev_saved = true;
+    rec.health_timeout_secs = timeout;
+    rec.deadline_unix = s.deadline_unix;
+    rec.n_restarts_before = s.n_restarts_before;
+    rec.restarted_unix = s.restarted_unix;
+    if work.join(txn::ROLLBACK_PKG_FILE).is_file() {
+        rec.rollback = Some(Verified {
+            name: rollback_name.unwrap_or_else(|| txn::ROLLBACK_PKG_FILE.to_string()),
+            sha256: String::new(),
+            signer: String::new(),
+        });
+    }
+    if s.unit_replaced {
+        rec.unit = Some(UnitPlan {
+            old_sha256: String::new(),
+            new_sha256: String::new(),
+        });
+        rec.unit_backed_up = true;
+        rec.unit_replaced = true;
+    }
+    drop(note);
+    rec.notes = notes;
+    let mut restart = false;
+    rec.step = match s.step {
+        txn::LegacyStep::Replaced => Step::Replaced,
+        txn::LegacyStep::RollingBack => {
+            rec.rollback_intent = Some(RollbackIntent {
+                reason: s.rollback_reason.clone(),
+                cause: Cause::Health,
+                via: Via::Binary,
+            });
+            Step::RollingBack
+        }
+        txn::LegacyStep::Verified if paths.current_version == rec.target.version => {
+            // v1 沒有「替換中」：輔助程式自己已是目標版本，代表執行檔已替換（舊版的輔助程式一定先保留
+            // pulse.prev 才替換）、還沒記下 replaced。視為已替換、尚未重新啟動，重新起算健康確認的期限
+            restart = true;
+            Step::Replaced
+        }
+        txn::LegacyStep::Verified | txn::LegacyStep::Done => {
+            return refuse(
+                paths,
+                Ok(req),
+                Some(id),
                 codes::E_UPGRADE_INTEGRITY,
-                format!("{DETAIL_STATE_UNUSABLE}: {why}; manual check required"),
-            )
+                format!(
+                    "{DETAIL_STATE_UNUSABLE}: legacy {} is at step verified and this helper ({}) is not the target version ({}); manual check required",
+                    txn::STATE_FILE,
+                    paths.current_version,
+                    rec.target.version
+                ),
+            );
+        }
+    };
+    let trusted = Request {
+        upgrade_id: id.to_string(),
+        target: rec.target.clone(),
+        method: rec.method.clone(),
+        rollback_artifact: rec.rollback.as_ref().map(|r| r.name.clone()),
+        from_version: rec.from_version.clone(),
+        ..req
+    };
+    let owner = txn::Owner::new(paths.require_root_owner);
+    match txn::ensure_private_dir(&work, owner) {
+        Ok(w) => warnings.extend(w),
+        Err(why) => {
+            return refuse(
+                paths,
+                Ok(trusted),
+                Some(id),
+                codes::E_UPGRADE_PRECHECK,
+                format!("{DETAIL_UNSAFE_PATH}: {why}; manual check required"),
+            );
+        }
+    }
+    let mut h = Helper::new(paths, sys, trusted, work, warnings);
+    h.log.line(
+        "INFO",
+        &format!(
+            "接續由舊版輔助程式開始的交易（狀態檔 v1，步驟 {:?}）：轉成 v2 的紀錄",
+            s.step
+        ),
+    );
+    if restart {
+        rec.n_restarts_before = sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
+        rec.restarted_unix = sys.now_unix();
+        rec.deadline_unix = rec.restarted_unix + i64::try_from(timeout).unwrap_or(i64::MAX);
+    }
+    rec.binding_sha256 = rec.compute_binding();
+    // 轉換後的紀錄與指標寫不進去時仍繼續（系統已被替換，不能半途停下）
+    h.save(&mut rec);
+    if let Err(e) = txn::write_active(&paths.work_root, id, &rec.binding_sha256) {
+        h.log.line("WARN", &e);
+    }
+    let r = match rec.step {
+        Step::RollingBack => {
+            h.log.line("INFO", "接續上次中斷的回滾");
+            let reason = resumed_reason(&rec);
+            h.confirm_rollback(rec, reason)
+        }
+        _ => {
+            h.log
+                .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
+            if restart && let Err(e) = sys.restart_service() {
+                h.log
+                    .line("WARN", &format!("systemctl restart 失敗：{e}"));
+            }
+            h.after_replace(rec)
         }
     };
     h.finish(&r);
     Ok(r)
 }
 
-/// 進行中交易的指標（`/var/lib/pulse-upgrade/active.json`，只有 root 可寫）：開始替換前寫入、交易結束
-/// 時刪除。`Ok(None)`：沒有進行中的交易；`Err`：檔案存在但讀不到或內容不合法
-fn read_active(work_root: &Path) -> Result<Option<String>, String> {
-    #[derive(Deserialize)]
-    struct Active {
-        schema: String,
-        upgrade_id: String,
-    }
-    match std::fs::read(work_root.join(ACTIVE_FILE)) {
-        Ok(b) => match serde_json::from_slice::<Active>(&b) {
-            Ok(a) if a.schema == HELPER_SCHEMA && kairos_proto::is_uuid_text(&a.upgrade_id) => {
-                Ok(Some(a.upgrade_id))
-            }
-            Ok(_) => Err(format!(
-                "{ACTIVE_FILE} has an unexpected schema or upgrade_id"
-            )),
-            Err(e) => Err(format!("{ACTIVE_FILE} is not valid: {e}")),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{ACTIVE_FILE} cannot be read: {e}")),
-    }
-}
-
-/// 讀取這次升級的狀態檔。`Ok(None)`：全新的請求（沒有狀態檔，工作目錄中也沒有替換階段才會出現的檔案）。
-/// `Err`：狀態檔存在但讀不到、不是合法的內容或 schema 不符，或狀態檔不見了而工作目錄裡已有替換階段的
-/// 檔案（`rollback.pkg`、`pulse.service.prev`——都在第一次寫入狀態檔之後才建立）
-fn read_state(state_path: &Path, work: &Path) -> Result<Option<HelperState>, String> {
-    match std::fs::read(state_path) {
-        Ok(b) => match serde_json::from_slice::<HelperState>(&b) {
-            Ok(s) if s.schema == HELPER_SCHEMA => Ok(Some(s)),
-            Ok(s) => Err(format!("state.json has schema {:?}", s.schema)),
-            Err(e) => Err(format!("state.json is not valid: {e}")),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match ["rollback.pkg", "pulse.service.prev"]
-                .iter()
-                .find(|n| work.join(n).exists())
-            {
-                Some(n) => Err(format!("state.json is missing but {n} exists")),
-                None => Ok(None),
-            }
-        }
-        Err(e) => Err(format!("state.json cannot be read: {e}")),
-    }
-}
-
 struct Helper<'a> {
     paths: &'a Paths,
     sys: &'a dyn System,
+    /// 可信的請求內容：新交易在 [`Helper::begin`] 比對過 `from_version` 與 `method`；接續時由紀錄組成
     req: Request,
     work: PathBuf,
-    state_path: PathBuf,
     log: Log,
-    /// 還沒有狀態檔可記時先放在這裡的說明（寫入狀態檔的 `notes`，最後附在結果的 `detail`）
+    /// 還沒有紀錄可記時先放在這裡的說明（寫入紀錄的 `notes`，最後附在結果的 `detail`）
     pending_notes: Vec<String>,
-    /// 結束時保留進行中交易的指標（狀態檔不可用，需要人工檢查）
+    /// 結束時保留進行中交易的指標（紀錄不可用，需要人工檢查）
     keep_active: bool,
+    /// 結果（`done`）沒有寫進紀錄：結束時刪除紀錄，避免它被當成未結束的交易
+    done_unsaved: bool,
 }
 
-/// 預檢與替換需要的資料
-struct Prepared {
-    artifact: PathBuf,
-    manifest: Option<ReleaseManifest>,
-    rollback: Option<PathBuf>,
-    new_binary: PathBuf,
-    new_unit: Option<PathBuf>,
-    health_timeout: Duration,
-}
+impl<'a> Helper<'a> {
+    fn new(
+        paths: &'a Paths,
+        sys: &'a dyn System,
+        req: Request,
+        work: PathBuf,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self::new_with(paths, sys, req, work, warnings, true)
+    }
 
-impl Helper<'_> {
-    /// 寫入狀態檔。替換之後的步驟寫不進去時只能記下來繼續（不能半途停下；這次執行仍會做完健康確認與
-    /// 回滾，只有重新開機後的接續受影響）
-    fn save(&mut self, s: &HelperState) {
-        if let Err(e) = self.try_save(s) {
+    /// `log_file = false`：工作目錄沒有通過檢查，日誌只寫 stderr
+    fn new_with(
+        paths: &'a Paths,
+        sys: &'a dyn System,
+        req: Request,
+        work: PathBuf,
+        warnings: Vec<String>,
+        log_file: bool,
+    ) -> Self {
+        let log_path = work.join(txn::LOG_FILE);
+        let mut log = Log::new(log_file.then_some(log_path.as_path()));
+        log.line(
+            "INFO",
+            &format!(
+                "pulse upgrade apply：升級 {}（{} → {}，{}）",
+                req.upgrade_id, req.from_version, req.target.version, req.method
+            ),
+        );
+        for w in warnings {
+            log.line("WARN", &w);
+        }
+        Self {
+            paths,
+            sys,
+            req,
+            work,
+            log,
+            pending_notes: Vec::new(),
+            keep_active: false,
+            done_unsaved: false,
+        }
+    }
+
+    /// 寫入交易紀錄。替換之後的步驟寫不進去時只能記下來繼續（不能半途停下；這次執行仍會做完健康確認與
+    /// 回滾，接續時依磁碟上的實況冪等重做）
+    fn save(&mut self, rec: &mut Record) {
+        if let Err(e) = self.try_save(rec) {
             self.log.line("WARN", &e);
         }
     }
 
-    /// 寫入狀態檔；失敗時回錯誤（替換前：不得繼續，見 [`Helper::replace`]）
-    fn try_save(&mut self, s: &HelperState) -> Result<(), String> {
-        let b = serde_json::to_vec_pretty(s).map_err(|e| format!("無法產生狀態檔：{e}"))?;
-        crate::remote::write_atomic_durable(&self.state_path, &b, 0o600, 0o700)
-            .map_err(|e| format!("無法寫入 {}：{e}", self.state_path.display()))
-    }
-
-    /// 寫入進行中交易的指標（這一筆的 `upgrade_id`）
-    fn set_active(&mut self) -> Result<(), String> {
-        let path = self.paths.work_root.join(ACTIVE_FILE);
-        let b = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": HELPER_SCHEMA,
-            "upgrade_id": self.req.upgrade_id,
-        }))
-        .map_err(|e| format!("無法產生 {ACTIVE_FILE}：{e}"))?;
-        crate::remote::write_atomic_durable(&path, &b, 0o600, 0o700)
-            .map_err(|e| format!("無法寫入 {}：{e}", path.display()))
-    }
-
-    /// `request.json` 由服務帳號寫入、不可信（REMOTE.md 第 5.1、17.8 節）。決定「怎麼替換、回滾到哪一版」
-    /// 的欄位以輔助程式自己可信的來源為準，請求中的值只用來比對：
-    ///
-    /// - **尚未替換**（第一次執行）：`from_version` 必須等於輔助程式自己的版本（＝目前安裝的版本），
-    ///   `method` 必須等於輔助程式自己偵測到的安裝方式；不符就拒絕（`Err`，什麼都不改）。否則取得服務
-    ///   帳號的人可以謊報較舊的 `from_version`、附上該舊版有官方簽章的套件當回滾檔，再讓新版的健康確認
-    ///   失敗，使 root 以 `dpkg -i`／`rpm -U --oldpackage` 裝回任一個舊版，繞過本機的
-    ///   `allow_downgrade = false`。
-    /// - **已替換**（重新開機後接續；執行檔已是新版）：`from_version`、`method`、`target`、
-    ///   `rollback_artifact` 一律取自替換前寫進狀態檔（只有 root 可寫）的值，不再採用請求中的值；請求
-    ///   被改過時在結果加註（不能半途停下）。
-    ///
-    /// 之後 `self.req` 的這些欄位都是可信的值。0.9.0 的輔助程式寫的狀態檔沒有記這些欄位：接續時只能
-    /// 沿用請求中的值（那一次升級由 0.9.0 的輔助程式開始，行為與 0.9.0 相同）
-    fn trust_request(&mut self, state: Option<&mut HelperState>) -> Result<(), Box<UpgradeResult>> {
-        let replaced = state
-            .as_ref()
-            .is_some_and(|s| matches!(s.step, Step::Replaced | Step::RollingBack));
-        let recorded_from = state
-            .as_ref()
-            .map(|s| s.from_version.clone())
-            .filter(|v| !v.is_empty());
-        if replaced {
-            let Some(s) = state else {
-                return Ok(());
-            };
-            let Some(from) = recorded_from else {
-                self.log.line(
-                    "WARN",
-                    "狀態檔沒有記錄替換前的版本與安裝方式（由 0.9.0 的輔助程式寫入），沿用請求中的值",
-                );
-                return Ok(());
-            };
-            if self.req.from_version != from {
-                self.log.line(
-                    "WARN",
-                    &format!(
-                        "request.json 的 from_version（{}）與替換前記下的版本（{from}）不同，以後者為準",
-                        self.req.from_version
-                    ),
-                );
-                self.req.from_version = from;
-                if !s.notes.iter().any(|n| n == NOTE_FROM_VERSION_IGNORED) {
-                    s.notes.push(NOTE_FROM_VERSION_IGNORED.to_string());
-                }
-            }
-            let mut changed = Vec::new();
-            if !s.method.is_empty() && self.req.method != s.method {
-                changed.push(format!("method {} → {}", self.req.method, s.method));
-                self.req.method = s.method.clone();
-            }
-            if let Some(t) = &s.target
-                && self.req.target != *t
-            {
-                changed.push(format!(
-                    "target {} → {}",
-                    self.req.target.version, t.version
-                ));
-                self.req.target = t.clone();
-            }
-            if !s.method.is_empty() && self.req.rollback_artifact != s.rollback_artifact {
-                changed.push("rollback_artifact".to_string());
-                self.req.rollback_artifact = s.rollback_artifact.clone();
-            }
-            if !changed.is_empty() {
-                self.log.line(
-                    "WARN",
-                    &format!(
-                        "request.json 在替換後被改過（{}），以替換前記下的內容為準",
-                        changed.join("、")
-                    ),
-                );
-                if !s.notes.iter().any(|n| n == NOTE_REQUEST_FIELDS_IGNORED) {
-                    s.notes.push(NOTE_REQUEST_FIELDS_IGNORED.to_string());
-                }
-            }
-            return Ok(());
-        }
-        let claimed = self.req.from_version.clone();
-        let trusted = recorded_from.unwrap_or_else(|| self.paths.current_version.clone());
-        if claimed != trusted {
-            self.req.from_version = trusted.clone();
-            return Err(Box::new(self.fail(
-                codes::E_UPGRADE_INTEGRITY,
-                format!(
-                    "{DETAIL_FROM_VERSION_MISMATCH}: request says {claimed}, installed version is {trusted}"
-                ),
-            )));
-        }
-        if self.req.method != self.paths.method {
-            let detail = format!(
-                "{DETAIL_METHOD_MISMATCH}: request says {}, detected install method is {}",
-                self.req.method, self.paths.method
-            );
-            return Err(Box::new(self.fail(codes::E_UPGRADE_INTEGRITY, detail)));
-        }
-        // 上一次執行已經寫下狀態檔（`Verified`：可能在替換途中中斷）：目標以當時記下的為準。請求中的
-        // 目標被改過時，發佈檔仍要通過對「記下的目標」的驗證，否則照常失敗
-        if let Some(t) = state.as_ref().and_then(|s| s.target.clone())
-            && self.req.target != t
-        {
-            self.log.line(
-                "WARN",
-                &format!(
-                    "request.json 的目標（{}）與這次升級記下的目標（{}）不同，以後者為準",
-                    self.req.target.version, t.version
-                ),
-            );
-            self.req.target = t;
-            if !self
-                .pending_notes
-                .iter()
-                .any(|n| n == NOTE_REQUEST_FIELDS_IGNORED)
-            {
-                self.pending_notes
-                    .push(NOTE_REQUEST_FIELDS_IGNORED.to_string());
-            }
-        }
-        Ok(())
-    }
-
-    fn drive(&mut self, mut state: Option<HelperState>) -> UpgradeResult {
-        if let Some(HelperState {
-            step: Step::Done,
-            result: Some(r),
-            ..
-        }) = &state
-        {
-            return r.clone();
-        }
-        if let Err(r) = self.trust_request(state.as_mut()) {
-            return *r;
-        }
-        if let Some(s) = state.as_mut() {
-            for n in &self.pending_notes {
-                if !s.notes.contains(n) {
-                    s.notes.push(n.clone());
-                }
-            }
-        }
-        let mut prior = None;
-        if let Some(s) = state {
-            match s.step {
-                Step::Done => {}
-                Step::Replaced => {
-                    self.log
-                        .line("INFO", "接續上次中斷的升級：已替換，重新做健康確認");
-                    return self.after_replace(s);
-                }
-                Step::RollingBack => {
-                    self.log.line("INFO", "接續上次中斷的回滾");
-                    let reason = if s.rollback_reason.is_empty() {
-                        "resumed".to_string()
-                    } else {
-                        format!("{}; resumed", s.rollback_reason)
-                    };
-                    return self.confirm_rollback(s, reason);
-                }
-                // 上一次執行在「寫入狀態檔」與「記下已替換」之間中斷：重新驗證後再替換一次，但沿用當時
-                // 記下的內容（pulse.prev 是否已保留）
-                Step::Verified => prior = Some(s),
-            }
-        }
-        let prepared = match self.prepare() {
-            Ok(p) => p,
-            Err(r) => return *r,
-        };
-        self.replace(prepared, prior)
+    /// 寫入交易紀錄；失敗時回錯誤（替換前：不得繼續）
+    fn try_save(&mut self, rec: &mut Record) -> Result<(), String> {
+        rec.save(&self.work)
     }
 
     fn fail(&mut self, code: &str, detail: String) -> UpgradeResult {
         self.log
             .line("ERROR", &format!("升級失敗（{code}）：{detail}"));
         result(&self.req, UPGRADE_STATE_FAILED, Some(code), detail)
+    }
+
+    /// 把結果記進紀錄（`done`）
+    fn done(&mut self, mut rec: Record, r: UpgradeResult) -> UpgradeResult {
+        rec.step = Step::Done;
+        rec.result = Some(r.clone());
+        if let Err(e) = self.try_save(&mut rec) {
+            self.log.line("WARN", &e);
+            self.done_unsaved = true;
+        }
+        self.sys.checkpoint("record_done");
+        r
     }
 
     fn staged(&self, name: &str) -> PathBuf {
@@ -706,8 +1081,102 @@ impl Helper<'_> {
             .join(name)
     }
 
-    /// 步驟 1～3：複製、重新驗證、預檢
-    fn prepare(&mut self) -> Result<Prepared, Box<UpgradeResult>> {
+    fn sha(&self, path: &Path) -> String {
+        txn::sha256_regular(path).unwrap_or_default()
+    }
+
+    fn is_package(&self) -> bool {
+        matches!(self.req.method.as_str(), "deb" | "rpm")
+    }
+
+    /// 新的交易（REMOTE.md 第 17.9.3 節）：`preparing` → 複製、驗證、預檢 → `prepared` → 指標 →
+    /// `replacing` → 替換。
+    ///
+    /// `request.json` 由服務帳號寫入、不可信（第 5.1、17.8 節）。決定「怎麼替換、回滾到哪一版」的欄位以
+    /// 輔助程式自己可信的來源為準，請求中的值只用來比對：`from_version` 必須等於輔助程式自己的版本
+    /// （＝目前安裝的版本），`method` 必須等於輔助程式自己偵測到的安裝方式；不符就拒絕（什麼都不改）。
+    /// 否則取得服務帳號的人可以謊報較舊的 `from_version`、附上該舊版有官方簽章的套件當回滾檔，再讓新版
+    /// 的健康確認失敗，使 root 以 `dpkg -i`／`rpm -U --oldpackage` 裝回任一個舊版，繞過本機的
+    /// `allow_downgrade = false`
+    fn begin(&mut self) -> UpgradeResult {
+        let claimed = self.req.from_version.clone();
+        let trusted = self.paths.current_version.clone();
+        if claimed != trusted {
+            self.req.from_version = trusted.clone();
+            return self.fail(
+                codes::E_UPGRADE_INTEGRITY,
+                format!(
+                    "{DETAIL_FROM_VERSION_MISMATCH}: request says {claimed}, installed version is {trusted}"
+                ),
+            );
+        }
+        if self.req.method != self.paths.method {
+            let detail = format!(
+                "{DETAIL_METHOD_MISMATCH}: request says {}, detected install method is {}",
+                self.req.method, self.paths.method
+            );
+            return self.fail(codes::E_UPGRADE_INTEGRITY, detail);
+        }
+        self.sys.checkpoint("before_record");
+        // preparing：替換前的狀態
+        let mut rec = Record::new(
+            &self.req.upgrade_id,
+            &self.paths.current_version,
+            &self.paths.current_commit,
+            &self.req.method,
+        );
+        rec.target = self.req.target.clone();
+        rec.old_binary_sha256 = self.sha(&self.paths.binary());
+        rec.pkg_db_before = package_db(self.sys, &self.req.method);
+        rec.notes = std::mem::take(&mut self.pending_notes);
+        if rec.old_binary_sha256.is_empty() {
+            return self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("無法讀取 {}", self.paths.binary().display()),
+            );
+        }
+        if let Err(e) = self.try_save(&mut rec) {
+            return self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+            );
+        }
+        self.sys.checkpoint("record_preparing");
+        if let Err(r) = self.prepare(&mut rec) {
+            return self.done(rec, *r);
+        }
+        // prepared：之後綁定的欄位不再改變
+        rec.step = Step::Prepared;
+        rec.binding_sha256 = rec.compute_binding();
+        if let Err(e) = self.try_save(&mut rec) {
+            let r = self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+            );
+            return self.done(rec, r);
+        }
+        self.sys.checkpoint("record_prepared");
+        // 紀錄先於指標，指標先於任何變更：之後到交易結束為止，輔助程式只接續這一筆
+        if let Err(e) =
+            txn::write_active(&self.paths.work_root, &rec.upgrade_id, &rec.binding_sha256)
+        {
+            let r = self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+            );
+            return self.done(rec, r);
+        }
+        self.sys.checkpoint("pointer_written");
+        rec.step = Step::Replacing;
+        if let Err(e) = self.try_save(&mut rec) {
+            return self.replace_failed(rec, format!("{DETAIL_STATE_NOT_SAVED}: {e}"));
+        }
+        self.sys.checkpoint("record_replacing");
+        self.replacing(rec)
+    }
+
+    /// 複製、重新驗證、預檢；把驗證過的複本與它們的雜湊記進 `rec`（還不寫入：由呼叫端寫成 `prepared`）
+    fn prepare(&mut self, rec: &mut Record) -> Result<(), Box<UpgradeResult>> {
         let req = self.req.clone();
         // 1. 複製
         let copy = |this: &mut Self, name: &str, max: u64| -> Result<PathBuf, Box<UpgradeResult>> {
@@ -844,11 +1313,21 @@ impl Helper<'_> {
             };
             return Err(Box::new(self.fail(code, p.detail().to_string())));
         }
+        rec.artifact = Some(Verified {
+            name: req.artifact.clone(),
+            sha256: actual,
+            signer: verified.signer.fingerprint.clone(),
+        });
+        rec.manifest = req.manifest.clone();
         // 回滾檔：以它所屬發佈的 SHA256SUMS（本機驗證過的紀錄）重新驗證
+        rec.rollback = None;
+        let _ = std::fs::remove_file(self.work.join(txn::ROLLBACK_PKG_FILE));
         if let (Some(r), Some((s, g))) = (&rollback, &rollback_sums) {
             let rs = read(s);
             let rg = read(g);
-            let ok = release::verify_bundle(
+            let name = req.rollback_artifact.clone().unwrap_or_default();
+            let sha = files::sha256_file(r).unwrap_or_default();
+            let signer = release::verify_bundle(
                 &ReleaseBundle {
                     sha256sums: &rs,
                     signature: &rg,
@@ -858,8 +1337,7 @@ impl Helper<'_> {
             )
             .ok()
             .and_then(|v| {
-                let name = req.rollback_artifact.clone().unwrap_or_default();
-                // 版本以輔助程式自己認定的「替換前的版本」為準（trust_request），不是請求中的值
+                // 版本以輔助程式自己的版本（替換前的版本）為準，不是請求中的值
                 let e = ArtifactExpectation {
                     product: Some(Product::Pulse),
                     version: Some(&req.from_version),
@@ -868,15 +1346,32 @@ impl Helper<'_> {
                     arch,
                     format,
                 };
-                v.check_artifact(&name, &files::sha256_file(r).unwrap_or_default(), &e)
+                v.check_artifact(&name, &sha, &e)
                     .ok()
-            })
-            .is_some();
-            if !ok {
+                    .map(|()| v.signer.fingerprint.clone())
+            });
+            // 驗證過的回滾套件留在工作目錄（接續時只用這一份）。複製而不是改名：重新安裝同一版時回滾檔
+            // 與發佈檔是同一個檔名
+            let dst = self.work.join(txn::ROLLBACK_PKG_FILE);
+            let kept = signer.and_then(|signer| {
+                txn::copy_durable(r, &dst, 0o600)
+                    .ok()
+                    .filter(|()| self.sha(&dst) == sha)
+                    .map(|()| Verified {
+                        name: name.clone(),
+                        sha256: sha.clone(),
+                        signer,
+                    })
+            });
+            if kept.is_none() {
                 self.log
                     .line("WARN", "回滾檔沒有通過驗證，回滾時改以 pulse.prev 回復");
-                rollback = None;
+                let _ = std::fs::remove_file(&dst);
             }
+            if name != req.artifact {
+                let _ = std::fs::remove_file(r);
+            }
+            rec.rollback = kept;
         }
         self.log.line(
             "INFO",
@@ -886,29 +1381,55 @@ impl Helper<'_> {
             ),
         );
         // 3. 預檢
+        self.remove_precheck_dirs();
         let xdir = self
             .paths
             .install_dir
             .join(format!(".upgrade-{}", req.upgrade_id));
-        let _ = std::fs::remove_dir_all(&xdir);
         if let Err(e) = crate::remote::create_dir_all_mode(&xdir, 0o755) {
             return Err(Box::new(self.fail(
                 codes::E_UPGRADE_PRECHECK,
                 format!("無法建立 {}：{e}", xdir.display()),
             )));
         }
+        let prechecked = self.precheck(rec, &artifact, &xdir, verified.manifest.as_ref());
+        self.remove_precheck_dirs();
+        prechecked?;
+        rec.health_timeout_secs = u64::from(kairos_proto::mgmt::effective_health_timeout_secs(
+            req.health_timeout_secs,
+            config.upgrade.health_timeout_secs,
+        ));
+        // 複本都寫入磁碟後才會記成 prepared
+        if let Err(e) = txn::fsync_dir(&self.work) {
+            return Err(Box::new(self.fail(
+                codes::E_UPGRADE_REPLACE,
+                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
+            )));
+        }
+        Ok(())
+    }
+
+    /// 預檢（解開、`--version`、`check-config`），並把新的執行檔（tar）與要換上的 unit 保存到工作目錄
+    fn precheck(
+        &mut self,
+        rec: &mut Record,
+        artifact: &Path,
+        xdir: &Path,
+        manifest: Option<&release::ReleaseManifest>,
+    ) -> Result<(), Box<UpgradeResult>> {
+        let req = self.req.clone();
         let cmd = match req.method.as_str() {
             "tar" => Cmd::TarExtract {
-                archive: artifact.clone(),
-                dir: xdir.clone(),
+                archive: artifact.to_path_buf(),
+                dir: xdir.to_path_buf(),
             },
             "deb" => Cmd::DebExtract {
-                package: artifact.clone(),
-                dir: xdir.clone(),
+                package: artifact.to_path_buf(),
+                dir: xdir.to_path_buf(),
             },
             _ => Cmd::RpmExtract {
-                package: artifact.clone(),
-                dir: xdir.clone(),
+                package: artifact.to_path_buf(),
+                dir: xdir.to_path_buf(),
             },
         };
         let out = self.sys.run(&cmd);
@@ -918,7 +1439,7 @@ impl Helper<'_> {
                 format!("無法解開發佈檔：{}", out.last_line()),
             )));
         }
-        let (new_binary, new_unit) = match locate_binary(&req.method, &xdir) {
+        let (new_binary, new_unit) = match locate_binary(&req.method, xdir) {
             Ok(x) => x,
             Err(e) => return Err(Box::new(self.fail(codes::E_UPGRADE_PRECHECK, e))),
         };
@@ -960,135 +1481,276 @@ impl Helper<'_> {
             )));
         }
         self.log.line("INFO", "預檢通過（版本與設定檢查）");
-        let manifest = verified.manifest.clone();
-        let health_timeout = Duration::from_secs(u64::from(
-            kairos_proto::mgmt::effective_health_timeout_secs(
-                req.health_timeout_secs,
-                config.upgrade.health_timeout_secs,
-            ),
-        ));
-        Ok(Prepared {
-            artifact,
-            manifest,
-            rollback,
-            new_binary,
-            new_unit,
-            health_timeout,
-        })
+        // 新的執行檔：雜湊是之後判斷「是否已替換」的依據；tar 另外保存一份（接續時不再解開發佈檔）
+        rec.new_binary_sha256 = self.sha(&new_binary);
+        let saved = if req.method == "tar" {
+            let dst = self.work.join(txn::NEW_BINARY_FILE);
+            txn::copy_durable(&new_binary, &dst, 0o755)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    if self.sha(&dst) == rec.new_binary_sha256 {
+                        Ok(())
+                    } else {
+                        Err("複本與來源不符".to_string())
+                    }
+                })
+        } else {
+            Ok(())
+        };
+        if rec.new_binary_sha256.is_empty() || saved.is_err() {
+            return Err(Box::new(self.fail(
+                codes::E_UPGRADE_PRECHECK,
+                format!(
+                    "無法保存新的執行檔：{}",
+                    saved.err().unwrap_or_else(|| "讀取失敗".to_string())
+                ),
+            )));
+        }
+        // tar：發佈清單的 unit 雜湊與目前的 unit 不同、而目前的 unit 是歷來官方版本之一（沒被改過）時換新
+        rec.unit = None;
+        if req.method == "tar"
+            && let (Some(u), Some(new_unit)) = (manifest.and_then(|m| m.unit.as_ref()), &new_unit)
+        {
+            let current = self.sha(&self.paths.unit_path);
+            if current == u.sha256 {
+                // 已是新版的 unit
+            } else if !current.is_empty()
+                && u.previous_sha256.contains(&current)
+                && self.sha(new_unit) == u.sha256
+                && txn::copy_durable(new_unit, &self.work.join(txn::NEW_UNIT_FILE), 0o644).is_ok()
+            {
+                rec.unit = Some(UnitPlan {
+                    old_sha256: current,
+                    new_sha256: u.sha256.clone(),
+                });
+            } else {
+                if !rec.notes.iter().any(|n| n == NOTE_UNIT_NOT_UPDATED) {
+                    rec.notes.push(NOTE_UNIT_NOT_UPDATED.to_string());
+                }
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "{} 被修改過或不存在，不換上新版的 unit（{}）",
+                        self.paths.unit_path.display(),
+                        codes::W_UPGRADE_UNSUPPORTED
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
-    /// 步驟 4：保留舊版、替換、重新啟動。
-    ///
-    /// 順序（fail closed）：**先寫入狀態檔**（`Verified`：替換前的版本、安裝方式、目標）——接續時只信這份
-    /// 狀態檔，寫不進去就不得開始替換；再保留 `pulse.prev` 與回滾檔，並把「已保留」記進狀態檔（同樣寫不
-    /// 進去就停）。`prior` 是上一次執行留下的 `Verified` 狀態：當時已保留過 `pulse.prev` 的話不再覆寫——
-    /// 上一次可能在替換完成、還沒記下 `Replaced` 時中斷，此時目前的執行檔已是新版，再複製一次會把舊版的
-    /// 備份蓋掉，之後的回滾就換不回舊版
-    fn replace(&mut self, p: Prepared, prior: Option<HelperState>) -> UpgradeResult {
-        let install = self.paths.install_dir.clone();
-        let current = install.join("pulse");
-        let prev = install.join("pulse.prev");
-        let prev_saved = prior.as_ref().is_some_and(|s| s.prev_saved) && prev.is_file();
-        let mut state = HelperState {
-            schema: HELPER_SCHEMA.to_string(),
-            step: Step::Verified,
-            deadline_unix: 0,
-            n_restarts_before: 0,
-            restarted_unix: 0,
-            health_timeout_secs: p.health_timeout.as_secs(),
-            unit_replaced: false,
-            notes: self.pending_notes.clone(),
-            rollback_reason: String::new(),
-            // 已在 trust_request 確認與輔助程式自己的版本、偵測到的安裝方式相同
-            from_version: self.req.from_version.clone(),
-            method: self.req.method.clone(),
-            target: Some(self.req.target.clone()),
-            // 只記通過驗證的回滾檔（之後複製到工作目錄的 rollback.pkg）
-            rollback_artifact: p.rollback.as_ref().and(self.req.rollback_artifact.clone()),
-            prev_saved,
-            result: None,
-        };
-        // 進行中交易的指標先於狀態檔寫入：之後到交易結束為止，輔助程式只接續這一筆
-        if let Err(e) = self.set_active() {
-            return self.fail(
-                codes::E_UPGRADE_REPLACE,
-                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
-            );
+    /// 刪除預檢用的 `/opt/pulse/.upgrade-*`（包含先前中斷留下的）
+    fn remove_precheck_dirs(&mut self) {
+        for e in std::fs::read_dir(&self.paths.install_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if e.file_name().to_string_lossy().starts_with(".upgrade-")
+                && std::fs::symlink_metadata(e.path()).is_ok_and(|m| m.file_type().is_dir())
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
         }
-        if let Err(e) = self.try_save(&state) {
-            return self.fail(
-                codes::E_UPGRADE_REPLACE,
-                format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
-            );
+    }
+
+    /// `replacing`：替換，成功後重新啟動並做健康確認；無法完成時依系統是否已被改過決定失敗或還原
+    fn replacing(&mut self, mut rec: Record) -> UpgradeResult {
+        match self.replace(&mut rec) {
+            Ok(()) => {
+                self.log.line(
+                    "INFO",
+                    &format!(
+                        "已替換為 {}，重新啟動 pulse.service",
+                        self.req.target.version
+                    ),
+                );
+                if let Err(e) = self.sys.restart_service() {
+                    self.log
+                        .line("WARN", &format!("systemctl restart 失敗：{e}"));
+                }
+                self.after_replace(rec)
+            }
+            Err(e) => self.replace_failed(rec, e),
         }
-        if prev_saved {
-            self.log.line(
-                "INFO",
-                "上一次執行已保留 pulse.prev（在記下「已替換」之前中斷），不再覆寫",
-            );
+    }
+
+    /// 步驟 4：保留舊版、替換（REMOTE.md 第 17.9.3 節的 ①～⑤）。第一次執行與接續走同一段：每個動作都先看
+    /// 磁碟上的實況（執行檔、`pulse.prev`、unit 的雜湊）再決定要不要做，所以在任何一點中斷後重做都不會
+    /// 把舊版的備份蓋掉，也不會重複套用。只使用工作目錄裡驗證過的複本
+    fn replace(&mut self, rec: &mut Record) -> Result<(), String> {
+        let current = self.paths.binary();
+        let prev = self.paths.prev();
+        let old = rec.old_binary_sha256.clone();
+        let new = rec.new_binary_sha256.clone();
+        let not_saved = |e: String| format!("{DETAIL_STATE_NOT_SAVED}: {e}");
+        // 驗證過的複本沒有變
+        let source = if self.is_package() {
+            let name = rec.artifact.as_ref().map(|a| a.name.clone());
+            let path = self.work.join(name.unwrap_or_default());
+            let want = rec.artifact.as_ref().map(|a| a.sha256.clone());
+            if want.as_deref() != Some(self.sha(&path).as_str()) {
+                return Err(format!(
+                    "{DETAIL_COPY_CHANGED}: {} does not match the recorded SHA-256",
+                    path.display()
+                ));
+            }
+            path
         } else {
-            if let Err(e) = copy_executable(&current, &prev) {
-                return self.fail(
-                    codes::E_UPGRADE_REPLACE,
-                    format!("無法保留目前的執行檔：{e}"),
-                );
+            let path = self.work.join(txn::NEW_BINARY_FILE);
+            if new.is_empty() || self.sha(&path) != new {
+                return Err(format!(
+                    "{DETAIL_COPY_CHANGED}: {} does not match the recorded SHA-256",
+                    path.display()
+                ));
             }
-            state.prev_saved = true;
-            if let Err(e) = self.try_save(&state) {
-                return self.fail(
-                    codes::E_UPGRADE_REPLACE,
-                    format!("{DETAIL_STATE_NOT_SAVED}: {e}"),
-                );
-            }
-        }
-        // 回滾檔留在工作目錄（重新開機後接續時使用）
-        if let Some(r) = &p.rollback {
-            let _ = std::fs::copy(r, self.work.join("rollback.pkg"));
-        }
-        let before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
-        let replaced = match self.req.method.as_str() {
-            "tar" => {
-                let new = install.join("pulse.new");
-                copy_executable(&p.new_binary, &new)
-                    .and_then(|()| std::fs::rename(&new, &current))
-                    .map_err(|e| format!("無法替換執行檔：{e}"))
-            }
-            "deb" => self.package(&Cmd::DpkgInstall {
-                package: p.artifact.clone(),
-            }),
-            _ => self.package(&Cmd::RpmInstall {
-                package: p.artifact.clone(),
-            }),
+            path
         };
-        if let Err(e) = replaced {
-            // 替換前後的執行檔不同時換回
-            if files::sha256_file(&current).ok() != files::sha256_file(&prev).ok() {
-                let _ = restore_executable(&prev, &current);
+        // ① pulse.prev：只在目前的執行檔還是舊版時保留；已保留（雜湊相符）就不再覆寫
+        let cur = self.sha(&current);
+        let prev_is_old = self.sha(&prev) == old;
+        if rec.prev_saved && prev_is_old {
+            if cur != old {
+                self.log
+                    .line("INFO", "pulse.prev 已是替換前的執行檔，不再覆寫");
             }
-            return self.fail(codes::E_UPGRADE_REPLACE, e);
+        } else if cur == old {
+            copy_executable(&current, &prev)
+                .map_err(|e| format!("無法保留目前的執行檔：{e}"))?;
+            if self.sha(&prev) != old {
+                return Err("保留的 pulse.prev 與替換前的執行檔不符".to_string());
+            }
+            self.sys.checkpoint("prev_copied");
+            rec.prev_saved = true;
+            self.try_save(rec).map_err(not_saved)?;
+        } else if prev_is_old {
+            rec.prev_saved = true;
+            self.try_save(rec).map_err(not_saved)?;
+        } else {
+            return Err(
+                "目前的執行檔已不是替換前的版本，pulse.prev 也不是：沒有可用的備份".to_string(),
+            );
         }
-        if self.req.method == "tar" {
-            self.maybe_replace_unit(&p, &mut state);
+        self.sys.checkpoint("prev_recorded");
+        // ② tar：unit 先備份並記錄
+        let mut replace_unit = false;
+        if let Some(u) = rec.unit.clone() {
+            let backup = self.work.join(txn::UNIT_BACKUP_FILE);
+            let backup_ok = self.sha(&backup) == u.old_sha256;
+            if rec.unit_backed_up && backup_ok {
+                replace_unit = true;
+            } else if self.sha(&self.paths.unit_path) == u.old_sha256 {
+                txn::copy_durable(&self.paths.unit_path, &backup, 0o600)
+                    .map_err(|e| format!("無法備份 {}：{e}", self.paths.unit_path.display()))?;
+                if self.sha(&backup) != u.old_sha256 {
+                    return Err("unit 的備份與來源不符".to_string());
+                }
+                self.sys.checkpoint("unit_backed_up");
+                rec.unit_backed_up = true;
+                self.try_save(rec).map_err(not_saved)?;
+                replace_unit = true;
+            } else if backup_ok {
+                rec.unit_backed_up = true;
+                self.try_save(rec).map_err(not_saved)?;
+                replace_unit = true;
+            } else {
+                // unit 在預檢之後被改過、也沒有備份：不動它
+                if !rec.notes.iter().any(|n| n == NOTE_UNIT_NOT_UPDATED) {
+                    rec.notes.push(NOTE_UNIT_NOT_UPDATED.to_string());
+                }
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "{} 在預檢之後被改過，不換上新版的 unit",
+                        self.paths.unit_path.display()
+                    ),
+                );
+            }
+            self.sys.checkpoint("unit_backup_recorded");
         }
-        let _ = std::fs::remove_dir_all(install.join(format!(".upgrade-{}", self.req.upgrade_id)));
+        // ③ 執行檔
+        let before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
+        match self.req.method.as_str() {
+            "tar" => {
+                if self.sha(&current) != new {
+                    // 寫到同目錄的暫存檔、fsync 後改名取代（原子操作），再 fsync 目錄
+                    copy_executable(&source, &current)
+                        .map_err(|e| format!("無法替換執行檔：{e}"))?;
+                }
+            }
+            // 套件管理員可以重複執行：接續時（可能中斷在安裝到一半）再執行一次
+            "deb" => self.package(&Cmd::DpkgInstall { package: source })?,
+            _ => self.package(&Cmd::RpmInstall { package: source })?,
+        }
+        if self.sha(&current) != new {
+            return Err("替換後的執行檔與驗證過的發佈檔不符".to_string());
+        }
+        if self.is_package() {
+            rec.pkg_db_after = package_db(self.sys, &self.req.method);
+        }
+        self.sys.checkpoint("binary_replaced");
+        // ④ tar：換上新 unit（依雜湊判斷是否已換過）
+        if replace_unit && let Some(u) = rec.unit.clone() {
+            let ok = self.sha(&self.paths.unit_path) == u.new_sha256
+                || (self.sha(&self.work.join(txn::NEW_UNIT_FILE)) == u.new_sha256
+                    && txn::copy_durable(
+                        &self.work.join(txn::NEW_UNIT_FILE),
+                        &self.paths.unit_path,
+                        0o644,
+                    )
+                    .is_ok());
+            if ok {
+                if let Err(e) = self.sys.daemon_reload() {
+                    self.log.line("WARN", &format!("daemon-reload 失敗：{e}"));
+                }
+                self.sys.checkpoint("unit_replaced");
+                rec.unit_replaced = true;
+                self.log
+                    .line("INFO", "已換上新版的 pulse.service（沒有被修改過）");
+            } else {
+                if !rec.notes.iter().any(|n| n == NOTE_UNIT_NOT_UPDATED) {
+                    rec.notes.push(NOTE_UNIT_NOT_UPDATED.to_string());
+                }
+                self.log.line("WARN", "無法換上新版的 pulse.service");
+            }
+        }
+        // ⑤ replaced
+        rec.step = Step::Replaced;
+        rec.n_restarts_before = before;
+        rec.restarted_unix = self.sys.now_unix();
+        rec.deadline_unix =
+            rec.restarted_unix + i64::try_from(rec.health_timeout_secs).unwrap_or(i64::MAX);
+        self.save(rec);
+        self.sys.checkpoint("record_replaced");
+        Ok(())
+    }
+
+    /// 系統是否已被這筆交易改過（執行檔、unit、套件資料庫與紀錄的替換前狀態不同）
+    fn touched(&mut self, rec: &Record) -> bool {
+        if self.sha(&self.paths.binary()) != rec.old_binary_sha256 {
+            return true;
+        }
+        if let Some(u) = &rec.unit
+            && self.sha(&self.paths.unit_path) != u.old_sha256
+        {
+            return true;
+        }
+        self.is_package() && package_db(self.sys, &self.req.method) != rec.pkg_db_before
+    }
+
+    /// 替換無法完成（REMOTE.md 第 17.9.3 節）：系統沒被改過 → `failed`；已被改過 → 還原（換回
+    /// `pulse.prev`、tar 另還原 unit）並確認舊版恢復，結果仍是 `failed`（`restored`）或 `rollback_failed`
+    fn replace_failed(&mut self, rec: Record, e: String) -> UpgradeResult {
+        if !self.touched(&rec) {
+            let r = self.fail(codes::E_UPGRADE_REPLACE, e);
+            return self.done(rec, r);
+        }
         self.log.line(
-            "INFO",
-            &format!(
-                "已替換為 {}，重新啟動 pulse.service",
-                self.req.target.version
-            ),
+            "WARN",
+            &format!("替換無法完成（{e}），系統已被改過：還原到 {}", self.req.from_version),
         );
-        state.step = Step::Replaced;
-        state.n_restarts_before = before;
-        state.restarted_unix = self.sys.now_unix();
-        state.deadline_unix =
-            self.sys.now_unix() + i64::try_from(p.health_timeout.as_secs()).unwrap_or(i64::MAX);
-        self.save(&state);
-        if let Err(e) = self.sys.restart_service() {
-            self.log
-                .line("WARN", &format!("systemctl restart 失敗：{e}"));
-        }
-        self.after_replace(state)
+        self.rollback(rec, format!("replace_failed: {e}"), Cause::ReplaceFailed)
     }
 
     /// 套件管理員（被鎖住時每 30 秒重試，最多 10 分鐘）
@@ -1115,61 +1777,25 @@ impl Helper<'_> {
         }
     }
 
-    /// tar：發佈清單的 unit 雜湊與目前的 unit 不同、而目前的 unit 是歷來官方版本之一（沒被改過）時換新
-    fn maybe_replace_unit(&mut self, p: &Prepared, state: &mut HelperState) {
-        let (Some(m), Some(new_unit)) = (&p.manifest, &p.new_unit) else {
-            return;
-        };
-        let Some(u) = &m.unit else {
-            return;
-        };
-        let current = files::sha256_file(&self.paths.unit_path).ok();
-        match current {
-            Some(c) if c == u.sha256 => {}
-            Some(c) if u.previous_sha256.contains(&c) => {
-                let backup = self.work.join("pulse.service.prev");
-                let ok = std::fs::copy(&self.paths.unit_path, &backup)
-                    .and_then(|_| std::fs::copy(new_unit, &self.paths.unit_path))
-                    .is_ok();
-                if ok {
-                    state.unit_replaced = true;
-                    if let Err(e) = self.sys.daemon_reload() {
-                        self.log.line("WARN", &format!("daemon-reload 失敗：{e}"));
-                    }
-                    self.log
-                        .line("INFO", "已換上新版的 pulse.service（沒有被修改過）");
-                }
-            }
-            _ => {
-                state.notes.push("unit_not_updated".to_string());
-                self.log.line(
-                    "WARN",
-                    &format!(
-                        "{} 被修改過或不存在，沒有換上新版的 unit（{}）",
-                        self.paths.unit_path.display(),
-                        codes::W_UPGRADE_UNSUPPORTED
-                    ),
-                );
-            }
-        }
-    }
-
     /// 步驟 5：健康確認；失敗則回滾
-    fn after_replace(&mut self, mut state: HelperState) -> UpgradeResult {
+    fn after_replace(&mut self, rec: Record) -> UpgradeResult {
+        if !rec.legacy && self.sha(&self.paths.binary()) != rec.new_binary_sha256 {
+            self.log.line(
+                "WARN",
+                "目前的執行檔與這筆交易換上的不同（替換後被改過）：健康確認仍以目標版本判斷",
+            );
+        }
         let now = self.sys.now_unix();
-        let remaining = Duration::from_secs(u64::try_from(state.deadline_unix - now).unwrap_or(0));
+        let remaining = Duration::from_secs(u64::try_from(rec.deadline_unix - now).unwrap_or(0));
         let target = self.req.target.version.clone();
         let check = if remaining.is_zero() {
             Err("health_timeout".to_string())
         } else {
-            self.health(&target, &state, remaining)
+            self.health(&target, &rec, remaining)
         };
         match check {
             Ok(()) => {
-                let mut detail = String::new();
-                if !state.notes.is_empty() {
-                    detail = state.notes.join(",");
-                }
+                let detail = rec.notes.join(",");
                 self.log.line(
                     "INFO",
                     &format!("健康確認通過，已升級到 {}", self.req.target.version),
@@ -1180,29 +1806,97 @@ impl Helper<'_> {
                     Some(codes::I_UPGRADE_COMPLETED),
                     detail,
                 );
-                state.step = Step::Done;
-                state.result = Some(r.clone());
-                self.save(&state);
-                r
+                self.done(rec, r)
             }
             Err(reason) => {
                 self.log.line(
                     "WARN",
                     &format!("健康確認失敗（{reason}），回滾到 {}", self.req.from_version),
                 );
-                self.rollback(state, reason)
+                self.rollback(rec, reason, Cause::Health)
             }
         }
     }
 
-    /// 步驟 6：回滾
-    fn rollback(&mut self, mut state: HelperState, reason: String) -> UpgradeResult {
-        let install = self.paths.install_dir.clone();
-        let current = install.join("pulse");
-        let prev = install.join("pulse.prev");
-        let rollback_pkg = self.work.join("rollback.pkg");
-        let restored: Result<(), String> = match self.req.method.as_str() {
-            "deb" | "rpm" if rollback_pkg.is_file() => {
+    /// 步驟 6：回滾。**先記下意圖（原因與方式）再還原**：還原途中中斷時，接續依紀錄的方式冪等重做
+    fn rollback(&mut self, mut rec: Record, reason: String, cause: Cause) -> UpgradeResult {
+        // 替換無法完成時一律換回 pulse.prev（與先前「替換失敗時換回執行檔」相同，不使用回滾套件）
+        let via = if cause == Cause::Health
+            && self.is_package()
+            && rec.rollback.is_some()
+            && self.work.join(txn::ROLLBACK_PKG_FILE).is_file()
+        {
+            Via::Package
+        } else {
+            Via::Binary
+        };
+        if via == Via::Binary && self.is_package() && cause == Cause::Health {
+            let note = format!(
+                "binary_restored_package_db_shows_{}",
+                self.req.target.version
+            );
+            if !rec.notes.contains(&note) {
+                rec.notes.push(note);
+            }
+        }
+        rec.step = Step::RollbackIntent;
+        rec.rollback_intent = Some(RollbackIntent { reason, cause, via });
+        self.save(&mut rec);
+        self.sys.checkpoint("rollback_intent_recorded");
+        self.restore_and_confirm(rec, false)
+    }
+
+    /// `rollback_intent`：還原 → `rolling_back` → 重新啟動 → 確認舊版恢復
+    fn restore_and_confirm(&mut self, mut rec: Record, resumed: bool) -> UpgradeResult {
+        let intent = rec.rollback_intent.clone().unwrap_or(RollbackIntent {
+            reason: String::new(),
+            cause: Cause::Health,
+            via: Via::Binary,
+        });
+        let reason = if resumed {
+            resumed_reason(&rec)
+        } else {
+            intent.reason.clone()
+        };
+        if let Err(e) = self.restore(&mut rec, intent.via) {
+            return self.rollback_failed(rec, format!("{reason}; rollback: {e}"));
+        }
+        self.sys.checkpoint("rollback_restored");
+        rec.step = Step::RollingBack;
+        rec.n_restarts_before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
+        rec.restarted_unix = self.sys.now_unix();
+        let timeout = Duration::from_secs(rec.health_timeout_secs).max(MIN_ROLLBACK_TIMEOUT);
+        rec.deadline_unix =
+            rec.restarted_unix + i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
+        self.save(&mut rec);
+        self.sys.checkpoint("record_rolling_back");
+        if let Err(e) = self.sys.restart_service() {
+            self.log
+                .line("WARN", &format!("systemctl restart 失敗：{e}"));
+        }
+        self.confirm_rollback(rec, reason)
+    }
+
+    /// 還原（可重複執行）：`package` 以驗證過的 `rollback.pkg` 經套件管理員裝回；`binary` 換回
+    /// `pulse.prev`（必須等於紀錄的替換前執行檔），tar 另還原 unit
+    fn restore(&mut self, rec: &mut Record, via: Via) -> Result<(), String> {
+        let current = self.paths.binary();
+        let prev = self.paths.prev();
+        match via {
+            Via::Package => {
+                let pkg = self.work.join(txn::ROLLBACK_PKG_FILE);
+                let want = rec
+                    .rollback
+                    .as_ref()
+                    .map(|r| r.sha256.clone())
+                    .unwrap_or_default();
+                // 由 v1 轉換的紀錄沒有雜湊：照 v1 的行為使用
+                if !want.is_empty() && self.sha(&pkg) != want {
+                    return Err(format!(
+                        "{DETAIL_COPY_CHANGED}: {} does not match the recorded SHA-256",
+                        pkg.display()
+                    ));
+                }
                 self.log.line(
                     "INFO",
                     &format!(
@@ -1210,7 +1904,7 @@ impl Helper<'_> {
                         self.req
                             .rollback_artifact
                             .as_deref()
-                            .unwrap_or("rollback.pkg"),
+                            .unwrap_or(txn::ROLLBACK_PKG_FILE),
                         self.req.from_version,
                         if self.req.method == "deb" {
                             "dpkg -i"
@@ -1220,94 +1914,118 @@ impl Helper<'_> {
                     ),
                 );
                 let cmd = if self.req.method == "deb" {
-                    Cmd::DpkgInstall {
-                        package: rollback_pkg.clone(),
-                    }
+                    Cmd::DpkgInstall { package: pkg }
                 } else {
-                    Cmd::RpmInstall {
-                        package: rollback_pkg.clone(),
-                    }
+                    Cmd::RpmInstall { package: pkg }
                 };
                 self.package(&cmd)
             }
-            m => {
-                if m != "tar" {
-                    state.notes.push(format!(
-                        "binary_restored_package_db_shows_{}",
-                        self.req.target.version
-                    ));
-                }
+            Via::Binary => {
                 self.log.line(
                     "INFO",
                     &format!(
                         "以替換前保留的 {} 換回 {}{}",
                         prev.display(),
                         self.req.from_version,
-                        if m == "tar" {
-                            ""
+                        if self.is_package() {
+                            "（不經套件管理員，套件資料庫仍顯示新版）"
                         } else {
-                            "（沒有可驗證的回滾檔，套件資料庫仍顯示新版）"
+                            ""
                         }
                     ),
                 );
-                let r = restore_executable(&prev, &current)
-                    .map_err(|e| format!("無法換回 pulse.prev：{e}"));
-                if r.is_ok() && state.unit_replaced {
-                    let backup = self.work.join("pulse.service.prev");
-                    if std::fs::copy(&backup, &self.paths.unit_path).is_ok() {
+                let old = rec.old_binary_sha256.clone();
+                let prev_sha = self.sha(&prev);
+                if prev_sha.is_empty() {
+                    return Err(format!("無法換回 pulse.prev：{} 不存在", prev.display()));
+                }
+                if !old.is_empty() && prev_sha != old {
+                    return Err(
+                        "無法換回 pulse.prev：它與這筆交易記下的替換前執行檔不符".to_string(),
+                    );
+                }
+                if self.sha(&current) != prev_sha {
+                    copy_executable(&prev, &current)
+                        .map_err(|e| format!("無法換回 pulse.prev：{e}"))?;
+                }
+                self.sys.checkpoint("rollback_restoring");
+                if let Some(u) = rec.unit.clone()
+                    && rec.unit_backed_up
+                {
+                    let backup = self.work.join(txn::UNIT_BACKUP_FILE);
+                    let backup_sha = self.sha(&backup);
+                    // 依雜湊判斷（不依賴 unit_replaced：換上新 unit 之後、記錄之前可能中斷）
+                    let already = if u.old_sha256.is_empty() {
+                        false
+                    } else {
+                        self.sha(&self.paths.unit_path) == u.old_sha256
+                    };
+                    if already {
+                        // unit 沒被換過，或已還原
+                    } else if !backup_sha.is_empty()
+                        && (u.old_sha256.is_empty() || backup_sha == u.old_sha256)
+                        && txn::copy_durable(&backup, &self.paths.unit_path, 0o644).is_ok()
+                    {
                         let _ = self.sys.daemon_reload();
+                    } else {
+                        if !rec.notes.iter().any(|n| n == NOTE_UNIT_NOT_RESTORED) {
+                            rec.notes.push(NOTE_UNIT_NOT_RESTORED.to_string());
+                        }
+                        self.log.line("WARN", "無法還原 pulse.service");
                     }
                 }
-                r
+                Ok(())
             }
-        };
-        if let Err(e) = restored {
-            return self.rollback_failed(state, format!("{reason}; rollback: {e}"));
         }
-        state.step = Step::RollingBack;
-        state.rollback_reason = reason.clone();
-        state.n_restarts_before = self.sys.service_state().map(|s| s.n_restarts).unwrap_or(0);
-        state.restarted_unix = self.sys.now_unix();
-        let timeout = Duration::from_secs(state.health_timeout_secs).max(MIN_ROLLBACK_TIMEOUT);
-        state.deadline_unix =
-            state.restarted_unix + i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
-        self.save(&state);
-        if let Err(e) = self.sys.restart_service() {
-            self.log
-                .line("WARN", &format!("systemctl restart 失敗：{e}"));
-        }
-        self.confirm_rollback(state, reason)
     }
 
-    fn confirm_rollback(&mut self, mut state: HelperState, reason: String) -> UpgradeResult {
+    fn confirm_rollback(&mut self, rec: Record, reason: String) -> UpgradeResult {
         let remaining = Duration::from_secs(
-            u64::try_from(state.deadline_unix - self.sys.now_unix()).unwrap_or(0),
+            u64::try_from(rec.deadline_unix - self.sys.now_unix()).unwrap_or(0),
         );
         let from = self.req.from_version.clone();
-        match self.health(&from, &state, remaining) {
+        let cause = rec
+            .rollback_intent
+            .as_ref()
+            .map_or(Cause::Health, |i| i.cause);
+        match self.health(&from, &rec, remaining) {
             Ok(()) => {
                 let mut detail = reason;
-                if !state.notes.is_empty() {
-                    detail = format!("{detail}; {}", state.notes.join(","));
+                if !rec.notes.is_empty() {
+                    detail = format!("{detail}; {}", rec.notes.join(","));
                 }
-                self.log
-                    .line("WARN", &format!("已回滾到 {from}（{detail}）"));
-                let r = result(
-                    &self.req,
-                    UPGRADE_STATE_ROLLED_BACK,
-                    Some(codes::W_UPGRADE_ROLLED_BACK),
-                    detail,
-                );
-                state.step = Step::Done;
-                state.result = Some(r.clone());
-                self.save(&state);
-                r
+                let r = match cause {
+                    Cause::Health => {
+                        self.log
+                            .line("WARN", &format!("已回滾到 {from}（{detail}）"));
+                        result(
+                            &self.req,
+                            UPGRADE_STATE_ROLLED_BACK,
+                            Some(codes::W_UPGRADE_ROLLED_BACK),
+                            detail,
+                        )
+                    }
+                    Cause::ReplaceFailed => {
+                        if self.is_package() {
+                            let db = package_db(self.sys, &self.req.method);
+                            if db != rec.pkg_db_before {
+                                detail = format!(
+                                    "{detail}; package_db_shows_{}",
+                                    db.as_deref().unwrap_or("unknown")
+                                );
+                            }
+                        }
+                        detail = format!("{detail}; {DETAIL_RESTORED}");
+                        self.fail(codes::E_UPGRADE_REPLACE, detail)
+                    }
+                };
+                self.done(rec, r)
             }
-            Err(e) => self.rollback_failed(state, format!("{reason}; after rollback: {e}")),
+            Err(e) => self.rollback_failed(rec, format!("{reason}; after rollback: {e}")),
         }
     }
 
-    fn rollback_failed(&mut self, mut state: HelperState, detail: String) -> UpgradeResult {
+    fn rollback_failed(&mut self, rec: Record, detail: String) -> UpgradeResult {
         self.log.line(
             "ERROR",
             &format!(
@@ -1322,19 +2040,11 @@ impl Helper<'_> {
             Some(codes::E_UPGRADE_ROLLBACK_FAILED),
             detail,
         );
-        state.step = Step::Done;
-        state.result = Some(r.clone());
-        self.save(&state);
-        r
+        self.done(rec, r)
     }
 
     /// 健康確認（REMOTE.md 第 4.5.1 節）
-    fn health(
-        &mut self,
-        version: &str,
-        state: &HelperState,
-        timeout: Duration,
-    ) -> Result<(), String> {
+    fn health(&mut self, version: &str, rec: &Record, timeout: Duration) -> Result<(), String> {
         let start = self.sys.mono();
         let status_path = self.status_path();
         let mut stable_since: Option<Duration> = None;
@@ -1343,10 +2053,10 @@ impl Helper<'_> {
             let elapsed = self.sys.mono().saturating_sub(start);
             match self.sys.service_state() {
                 Ok(s) => {
-                    if s.n_restarts > state.n_restarts_before {
+                    if s.n_restarts > rec.n_restarts_before {
                         return Err(format!(
                             "crash_restart (NRestarts {} → {})",
-                            state.n_restarts_before, s.n_restarts
+                            rec.n_restarts_before, s.n_restarts
                         ));
                     }
                     if matches!(s.active.as_str(), "failed" | "inactive")
@@ -1365,7 +2075,7 @@ impl Helper<'_> {
                                     .last_ack_at
                                     .as_deref()
                                     .and_then(crate::status_file::parse_ts)
-                                    .is_some_and(|t| t.timestamp() >= state.restarted_unix);
+                                    .is_some_and(|t| t.timestamp() >= rec.restarted_unix);
                                 if f.pid != s.main_pid || f.version != version || !f.running {
                                     last = "status_not_from_new_process".into();
                                     false
@@ -1423,7 +2133,7 @@ impl Helper<'_> {
         }
     }
 
-    /// 步驟 7：寫結果、刪除請求與暫存
+    /// 步驟 7：寫結果、刪除請求與暫存、清理工作目錄、清除指標（每一步都可以重做）
     fn finish(&mut self, r: &UpgradeResult) {
         let bytes = serde_json::to_vec_pretty(r).unwrap_or_default();
         if let Err(e) = crate::remote::write_atomic(&self.paths.result_path(), &bytes, 0o644, 0o750)
@@ -1433,42 +2143,56 @@ impl Helper<'_> {
                 &format!("無法寫入 {}：{e}", self.paths.result_path().display()),
             );
         }
+        self.sys.checkpoint("result_written");
         let _ = std::fs::remove_file(&self.paths.request);
-        if r.state != UPGRADE_STATE_ROLLBACK_FAILED {
-            let _ = std::fs::remove_dir_all(self.paths.upgrade_dir().join(&self.req.upgrade_id));
-            let _ = std::fs::remove_file(self.work.join("rollback.pkg"));
-            for name in std::fs::read_dir(&self.work)
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let n = name.file_name().to_string_lossy().to_string();
-                if n.starts_with("pulse-")
-                    || n == files::SUMS_FILE
-                    || n == files::SIG_FILE
-                    || n == files::ROLLBACK_SUMS_FILE
-                    || n == files::ROLLBACK_SIG_FILE
-                {
-                    let _ = std::fs::remove_file(name.path());
-                }
+        self.sys.checkpoint("request_removed");
+        if !self.keep_active {
+            self.remove_precheck_dirs();
+            if r.state != UPGRADE_STATE_ROLLBACK_FAILED {
+                let _ =
+                    std::fs::remove_dir_all(self.paths.upgrade_dir().join(&self.req.upgrade_id));
+                // 已結束的交易只留紀錄與日誌
+                txn::strip(&self.work);
             }
-            // 只保留最近一次的紀錄（進行中交易的指標不是紀錄，另外處理）
-            if let Ok(entries) = std::fs::read_dir(&self.paths.work_root) {
-                for e in entries.flatten() {
-                    if e.path() != self.work && e.file_name() != ACTIVE_FILE {
-                        let _ = std::fs::remove_dir_all(e.path());
-                    }
+            if self.done_unsaved {
+                // 結果寫不進紀錄：刪除紀錄（刪除不需要空間），否則它會被當成未結束的交易。連刪除都失敗
+                // 時（檔案系統唯讀或損壞）指標照常清除：留下的未結束紀錄讓之後的請求以 state_unusable
+                // 擋下，而不是在期限早已過去之後「接續」並回滾一個其實已完成的升級
+                match std::fs::remove_file(self.work.join(txn::STATE_FILE)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => self.log.line(
+                        "ERROR",
+                        &format!(
+                            "無法寫入也無法刪除 {}：{e}；需要人工檢查",
+                            self.work.join(txn::STATE_FILE).display()
+                        ),
+                    ),
                 }
             }
         }
-        // 交易結束：清除進行中交易的指標（狀態檔不可用、需要人工檢查時保留）
         if !self.keep_active {
-            let active = self.paths.work_root.join(ACTIVE_FILE);
-            if let Err(e) = std::fs::remove_file(&active)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                self.log
-                    .line("WARN", &format!("無法刪除 {}：{e}", active.display()));
+            // 第 17.9.8 節：只保留最近的紀錄（這一筆不動）
+            let removed = txn::prune(
+                &self.paths.work_root,
+                &[self.req.upgrade_id.as_str()],
+                Some(r.state.as_str()),
+            );
+            if !removed.is_empty() {
+                self.log.line(
+                    "INFO",
+                    &format!("已清除較早的工作目錄：{}", removed.join("、")),
+                );
+            }
+            // 交易結束：清除進行中交易的指標
+            if let Err(e) = txn::clear_active(&self.paths.work_root) {
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "無法刪除 {}：{e}",
+                        self.paths.work_root.join(ACTIVE_FILE).display()
+                    ),
+                );
             }
         }
         self.log.line(
@@ -1505,22 +2229,10 @@ fn locate_binary(method: &str, xdir: &Path) -> Result<(PathBuf, Option<PathBuf>)
     }
 }
 
-/// 複製執行檔（0755），寫完 fsync
+/// 複製執行檔（0755）：寫到同目錄新建的暫存檔（不跟隨符號連結）→ fsync → 改名取代 → fsync 目錄。
+/// 保留 `pulse.prev`、換上新的執行檔與換回 `pulse.prev` 都用它（來源不動）
 fn copy_executable(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let tmp = dst.with_extension("tmp-copy");
-    let mut out = crate::remote::open_new_file(&tmp, 0o755)?;
-    let mut input = std::fs::File::open(src)?;
-    std::io::copy(&mut input, &mut out)?;
-    out.sync_all()?;
-    drop(out);
-    std::fs::rename(&tmp, dst)
-}
-
-/// 以 `pulse.prev` 換回目前的執行檔（複製後改名，保留 `pulse.prev`）
-fn restore_executable(prev: &Path, current: &Path) -> std::io::Result<()> {
-    let tmp = current.with_extension("restore");
-    copy_executable(prev, &tmp)?;
-    std::fs::rename(&tmp, current)
+    txn::copy_durable(src, dst, 0o755)
 }
 
 /// 正式環境的 [`System`]
@@ -1619,6 +2331,15 @@ impl System for RealSystem {
         if o.ok() { Ok(()) } else { Err(o.last_line()) }
     }
 
+    /// 正式發佈的執行檔不做任何事；只有開啟 feature `fault-injection` 的測試用建置會在指定的點停住
+    /// （REMOTE.md 第 17.9.9 節）
+    fn checkpoint(&self, name: &str) {
+        #[cfg(all(unix, feature = "fault-injection"))]
+        fault_injection_hold(name);
+        #[cfg(not(all(unix, feature = "fault-injection")))]
+        let _ = name;
+    }
+
     fn run(&self, cmd: &Cmd) -> Output {
         use std::process::Command;
         match cmd {
@@ -1653,6 +2374,20 @@ impl System for RealSystem {
                 Path::new(first_existing(&["/usr/bin/rpm", "/bin/rpm"])),
                 package,
             )),
+            Cmd::PackageVersion { method } => {
+                let mut c = if method == "deb" {
+                    let mut c =
+                        Command::new(first_existing(&["/usr/bin/dpkg-query", "/bin/dpkg-query"]));
+                    c.args(["-W", "-f=${Version} ${db:Status-Abbrev}", "pulse"]);
+                    c
+                } else {
+                    let mut c = Command::new(first_existing(&["/usr/bin/rpm", "/bin/rpm"]));
+                    c.args(["-q", "--qf", "%{VERSION}-%{RELEASE}", "pulse"]);
+                    c
+                };
+                c.env("LC_ALL", "C");
+                run_command(c)
+            }
             Cmd::RunAsService {
                 program,
                 args,
@@ -1684,6 +2419,29 @@ impl System for RealSystem {
                 run_command(c)
             }
         }
+    }
+}
+
+/// 故障注入（只在 feature `fault-injection`；`tests/systemd/` 的實機當機點）：`/var/lib/pulse-upgrade/
+/// fault-inject`（只有 root 可寫）的內容是這個 checkpoint 的名稱時，把它改名為 `fault-inject.hit` 後停住，
+/// 等測試腳本終止整台主機（`docker kill`）。改名讓它只觸發一次：重新開機後的接續不會再停
+#[cfg(all(unix, feature = "fault-injection"))]
+fn fault_injection_hold(name: &str) {
+    let root = Path::new(WORK_ROOT);
+    let hook = root.join("fault-inject");
+    let Ok(text) = std::fs::read_to_string(&hook) else {
+        return;
+    };
+    if text.trim() != name {
+        return;
+    }
+    if std::fs::rename(&hook, root.join("fault-inject.hit")).is_err() {
+        return;
+    }
+    let _ = txn::fsync_dir(root);
+    eprintln!("{FAULT_INJECTION_MARKER}: holding at checkpoint {name}");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 

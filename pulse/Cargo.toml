@@ -50,6 +50,15 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# 預設沒有任何 feature。
+default = []
+# 只給 tests/systemd/（crates/kairos-proto/REMOTE.md 第 17.9.9 節）：升級輔助程式在指定的當機點停住，讓測試
+# 腳本終止整台主機。**正式發佈的執行檔不得開啟**：packaging/build-release-common.sh 檢查產物不含它的標記
+# 字串，packaging/release.sh 在設定了 TEST_FEATURES 時拒絕執行；開啟時 `pulse --version` 另有
+# `[fault-injection]`
+fault-injection = []
+
 [dev-dependencies]
 # 不是新依賴：只為測試多開 tokio 的 test-util（tokio::time::pause / 自動推進時間）
 tokio = { version = "1.53", features = ["test-util"] }
