@@ -577,6 +577,93 @@ fn a_helper_killed_without_a_reboot_restarts_the_service_on_resume() {
     env.cleanup();
 }
 
+/// 現行行為（鎖住，不是期望的最終設計）：只有輔助程式被終止、服務與主機都沒有重新啟動，但**在健康確認的
+/// 期限之後**才接續 `replaced` 的交易——`after_replace` 不做健康確認就判 `health_timeout` 並回滾，即使
+/// 新版的服務一直健康地在執行。補送 `systemctl restart` 時也不重新起算期限（REMOTE.md 第 17.9.3 節）
+#[test]
+fn a_helper_killed_and_resumed_after_the_deadline_rolls_back_without_a_health_check() {
+    // 健康確認中被終止（重新啟動已送出），期限（600 秒）之後才接續
+    let mut env = setup("fm-killed-late", "tar");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "health_wait");
+    assert_eq!(env.installed(), "0.9.1");
+    env.helper_is_installed();
+    let after = fake.helper_killed_after(601);
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+        "{r:?}"
+    );
+    // 原因是單獨的 `health_timeout`：沒有括號中的「最後觀察到的狀態」，代表沒有做過任何一次檢查
+    assert!(
+        r.detail.starts_with("health_timeout") && !r.detail.contains("health_timeout ("),
+        "{}",
+        r.detail
+    );
+    // 只有回滾的那一次重新啟動
+    assert_eq!(
+        after
+            .calls()
+            .iter()
+            .filter(|c| c.as_str() == "restart")
+            .count(),
+        1,
+        "{:?}",
+        after.calls()
+    );
+    assert_eq!(
+        (
+            env.installed().as_str(),
+            env.prev().as_str(),
+            env.unit().as_str()
+        ),
+        ("0.9.0", "0.9.0", OLD_UNIT)
+    );
+    assert!(!env.active() && !env.paths.request.exists());
+    assert_eq!(env.result(), r);
+    after.assert_invariants();
+    env.cleanup();
+
+    // 還沒送出重新啟動就被終止：接續時補送一次，但期限不重新起算——補送之後仍然直接回滾
+    let mut env = setup("fm-killed-late-restart", "tar");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "record_replaced");
+    env.helper_is_installed();
+    let after = fake.helper_killed_after(601);
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(r.state, "rolled_back", "{r:?}");
+    assert!(
+        r.detail.starts_with("health_timeout") && !r.detail.contains("health_timeout ("),
+        "{}",
+        r.detail
+    );
+    assert_eq!(
+        after
+            .calls()
+            .iter()
+            .filter(|c| c.as_str() == "restart")
+            .count(),
+        2,
+        "補送的重新啟動＋回滾的重新啟動：{:?}",
+        after.calls()
+    );
+    assert_eq!(env.installed(), "0.9.0");
+    assert!(!env.active());
+    env.cleanup();
+
+    // 對照：期限之內接續（同樣只終止輔助程式）照常做健康確認並成功
+    let mut env = setup("fm-killed-in-time", "tar");
+    let fake = Fake::new(&env.root);
+    apply_until(&env.paths, &fake, "health_wait");
+    env.helper_is_installed();
+    let after = fake.helper_killed_after(300);
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    assert_eq!(env.installed(), "0.9.1");
+    env.cleanup();
+}
+
 /// 接續時 `request.json` 讀不到、不合法或不見了：有指標就只依交易紀錄接續
 #[test]
 fn a_transaction_is_resumed_without_a_readable_request() {
@@ -778,6 +865,72 @@ fn a_result_that_cannot_be_recorded_blocks_later_requests_instead_of_being_resum
     );
     assert_eq!(env.installed(), "0.9.1", "沒有回滾已完成的升級");
     assert!(later.calls().is_empty(), "{:?}", later.calls());
+    env.cleanup();
+}
+
+/// 現行行為（鎖住，不是期望的最終設計）：結果（`done`）寫不進紀錄，而且進行中交易的指標（`active.json`）
+/// **也刪不掉**（例如整個檔案系統變成唯讀：`state.json` 與指標的 unlink 一起失敗）。這次執行仍然回報
+/// 成功，但指標與停在 `replaced` 的紀錄都留著；之後的請求會**接續**這筆交易——期限早已過去，
+/// `after_replace` 直接判 `health_timeout`，把一個其實已完成的升級回滾。上一個測試的保護（指標刪得掉時以
+/// `state_unusable` 擋下）在這個情況不成立
+#[test]
+fn a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_resumed_later() {
+    if running_as_root() {
+        return;
+    }
+    let mut env = setup("fm-done-unsaved-pointer", "tar");
+    let fake = Fake::new(&env.root);
+    let (work, work_root) = (env.work(), env.paths.work_root.clone());
+    // 重新啟動服務的那一刻起，root 的工作目錄（根目錄與這筆交易的）都不能再寫入或刪除檔案
+    *fake.on_restart.borrow_mut() = Some(Box::new(move || {
+        chmod(&work, 0o500);
+        chmod(&work_root, 0o500);
+    }));
+    let r = apply(&env.paths, &fake).unwrap();
+    chmod(&env.paths.work_root, 0o700);
+    chmod(&env.work(), 0o700);
+    assert_eq!(r.state, "succeeded", "這次執行仍然做完：{r:?}");
+    assert_eq!(env.result(), r);
+    assert!(!env.paths.request.exists());
+    assert_eq!(env.installed(), "0.9.1");
+    assert!(env.active(), "指標刪不掉，留著");
+    let rec = env.record();
+    assert_eq!(rec.step, Step::Replaced, "紀錄停在最後一次寫入");
+    assert!(rec.result.is_none());
+
+    // 之後的請求（檔案系統恢復可寫、一天以後；另一筆升級）：接續留下的交易，而不是被擋下
+    env.helper_is_installed();
+    stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+    let later = Fake::new(&env.root).reboot_after(86_400);
+    let r = apply(&env.paths, &later).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.upgrade_id.as_str(), r.code.as_deref()),
+        ("rolled_back", ID, Some(codes::W_UPGRADE_ROLLED_BACK)),
+        "{r:?}"
+    );
+    assert!(
+        r.detail.starts_with("health_timeout")
+            && !r.detail.contains("health_timeout (")
+            && r.detail.contains(NOTE_UPGRADE_ID_IGNORED),
+        "{}",
+        r.detail
+    );
+    assert_eq!(
+        (r.from_version.as_str(), r.to_version.as_str()),
+        ("0.9.0", "0.9.1")
+    );
+    assert_eq!(env.installed(), "0.9.0", "已完成的升級被回滾");
+    assert!(
+        later.calls().contains(&"restart".to_string()),
+        "{:?}",
+        later.calls()
+    );
+    assert!(!env.active(), "這次交易結束，指標清除");
+    assert_eq!(env.record().step, Step::Done);
+    assert!(
+        !env.paths.work_root.join(OTHER_ID).exists(),
+        "新的請求沒有開始"
+    );
     env.cleanup();
 }
 

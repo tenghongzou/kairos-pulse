@@ -201,6 +201,11 @@ impl Fake {
         self.successor(5, false)
     }
 
+    /// 只有輔助程式被終止，`secs` 秒後才被重新觸發（期限可能已過）：服務仍是原本的行程
+    pub(super) fn helper_killed_after(&self, secs: u64) -> Fake {
+        self.successor(secs, false)
+    }
+
     pub(super) fn set(&self, version: &str, b: Behavior) {
         self.behavior.borrow_mut().insert(version.into(), b);
     }
