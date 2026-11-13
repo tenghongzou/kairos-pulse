@@ -48,6 +48,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Pulse 的 fault-injection（只給 tests/systemd/ 的測試用建置，REMOTE.md 第 17.9.9 節）不是預設的 feature，
+      # 上面的 clippy 不會編譯到它：另外檢查一次，避免這段程式無人發現地壞掉。正式發佈不開啟它
+      # （package job 的「Verify release binaries are not test builds」）
+      - name: cargo clippy (pulse, fault-injection test feature)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p pulse --all-targets --locked --features fault-injection -- -D warnings
+
       # PostgreSQL 後端的測試（kairos/HA.md 第 5.2、23 節）：只在 Linux 上以容器啟動 PostgreSQL 14（Kairos 支援的
       # 最低主版本；映像檔固定到主版本）。Windows 的 runner 不能執行 Linux 容器，那裡的 PostgreSQL 測試會
       # 「明確略過」（測試在 stderr 印出原因）；較新的主版本由下面的 postgres-compat job 驗證。
@@ -166,6 +173,7 @@ jobs:
           shellcheck -x -P SCRIPTDIR
           packaging/build-release-common.sh packaging/release.sh packaging/sign-release.sh
           packaging/check-reproducible.sh packaging/release-manifest.sh
+          packaging/check-release-binary.sh
           kairos/packaging/build-release.sh pulse/packaging/build-release.sh
           pulse/packaging/install.sh kairos/packaging/pkg/*.sh pulse/packaging/pkg/*.sh
 
@@ -179,6 +187,17 @@ jobs:
       - name: Verify SHA256SUMS
         working-directory: dist
         run: sha256sum -c SHA256SUMS
+
+      # 發佈檔不得含測試用 feature（Pulse 的故障注入，REMOTE.md 第 17.9.9 節）的程式。打包腳本在建置時與
+      # 打包後各檢查過一次；這裡對要上傳的檔案再檢查一次（tar.gz、zip、deb 內的執行檔），並確認 release.sh
+      # 在設定了 TEST_FEATURES 時拒絕執行
+      - name: Verify release binaries are not test builds
+        run: |
+          sh packaging/check-release-binary.sh --archive dist/*.tar.gz dist/*.zip dist/*.deb
+          if TEST_FEATURES=fault-injection SKIP_CHECKS=1 sh packaging/release.sh; then
+            echo "release.sh 應該拒絕 TEST_FEATURES" >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v7
         with:

@@ -14,6 +14,11 @@
 #                  --version、check-config、--print-agent-id 正常，所以會通過輔助程式的預檢
 #   <N>-test.3     同 test.1，只改版本號（重新開機接續後升級成功）
 #   <N>-test.4     同 test.2（崩潰），版本高於 test.3（回滾期間重新開機）
+#   <N>-test.5     同 test.1，另開啟 Pulse 的編譯期 feature fault-injection（TEST_FEATURES；REMOTE.md 第 17.9.9 節）：
+#   <N>-test.6     升級輔助程式可以在指定的當機點停住，讓 run.sh 終止整台主機（情境 crash-replace、
+#                  crash-rollback）。**測試用建置**：`pulse --version` 結尾有 [fault-injection]，打包腳本確認
+#                  執行檔含故障注入的標記；其他版本（含 <V0>）都是正式的建置，打包腳本確認它們不含
+#   <N>-test.7     同 test.2（崩潰），版本高於 test.6（crash-rollback 的目標；不需要 fault-injection）
 #   evil-a         test.1 的檔案，SHA256SUMS 改以「沒有人信任」的金鑰 evil-a 簽章（Kairos 匯入時拒絕）
 #   <N>-test.9     test.1 的檔案改名為 test.9，以 evil-b 簽章：Kairos 的信任錨有 evil-b（匯入成功），
 #                  Pulse 的信任錨沒有（Pulse 拒絕，PLS-E8401）
@@ -49,6 +54,8 @@ NEXT_RE=$(echo "$NEXT_VERSION" | sed 's/\./\\./g')
 export BUILD_VOLUME="${BUILD_VOLUME:-kp-systemd-test-build}"
 export TARGETS=x86_64-unknown-linux-musl
 export BUILD_JOBS="${BUILD_JOBS:-2}"
+# 測試用的 feature 只由下面的 build_pulse 逐次指定；環境中既有的值不沿用
+unset TEST_FEATURES
 
 # ---- 臨時金鑰 -------------------------------------------------------------
 KEYS=$WORK/keys
@@ -99,20 +106,32 @@ prepare_src() {
     fi
 }
 
-# $1 名稱（dist 目錄）、$2 版本、$3 crash
+# $1 名稱（dist 目錄）、$2 版本、$3 crash、$4 測試用的 feature（TEST_FEATURES；空＝正式的建置）
 build_pulse() {
     out=$WORK/dist/$1
-    if [ -f "$out/SHA256SUMS.sig" ] && [ -z "${REBUILD:-}" ] && [ "$(cat "$out/.base" 2>/dev/null)" = "$BASE" ]; then
+    features=${4:-}
+    if [ -f "$out/SHA256SUMS.sig" ] && [ -z "${REBUILD:-}" ] && [ "$(cat "$out/.base" 2>/dev/null)" = "$BASE" ] &&
+        [ "$(cat "$out/.features" 2>/dev/null)" = "$features" ]; then
         say "沿用 $out"
         return
     fi
-    say "建置 Pulse $2（$1）"
+    say "建置 Pulse $2（$1${features:+；測試用建置：$features}）"
     prepare_src "$1" "$2" "${3:-0}"
     rm -rf "$out"
     mkdir -p "$out"
-    (cd "$WORK/src/$1" && DIST_DIR="$out" SIGNING_KEY="$KEYS/release" sh pulse/packaging/build-release.sh) >"$WORK/build-$1.log" 2>&1 ||
+    (cd "$WORK/src/$1" && DIST_DIR="$out" SIGNING_KEY="$KEYS/release" TEST_FEATURES="$features" \
+        sh pulse/packaging/build-release.sh) >"$WORK/build-$1.log" 2>&1 ||
         die "建置失敗，見 $WORK/build-$1.log"
+    # 打包腳本的檢查（packaging/check-release-binary.sh）確實執行過：正式的建置不含故障注入、測試用建置含
+    if [ -n "$features" ]; then
+        grep -q '測試用建置（含故障注入的標記）' "$WORK/build-$1.log" ||
+            die "$1 應該是測試用建置，但打包時沒有確認到故障注入的標記（$WORK/build-$1.log）"
+    else
+        grep -q '沒有測試用的 feature' "$WORK/build-$1.log" ||
+            die "$1 打包時沒有執行測試用 feature 的檢查（$WORK/build-$1.log）"
+    fi
     echo "$BASE" >"$out/.base"
+    echo "$features" >"$out/.features"
     rm -rf "$WORK/src/$1"
 }
 
@@ -138,6 +157,27 @@ build_pulse "$NEXT_VERSION-test.1" "$NEXT_VERSION-test.1"
 build_pulse "$NEXT_VERSION-test.2" "$NEXT_VERSION-test.2" 1
 build_pulse "$NEXT_VERSION-test.3" "$NEXT_VERSION-test.3"
 build_pulse "$NEXT_VERSION-test.4" "$NEXT_VERSION-test.4" 1
+build_pulse "$NEXT_VERSION-test.5" "$NEXT_VERSION-test.5" 0 fault-injection
+build_pulse "$NEXT_VERSION-test.6" "$NEXT_VERSION-test.6" 0 fault-injection
+build_pulse "$NEXT_VERSION-test.7" "$NEXT_VERSION-test.7" 1
+
+# 正式的建置與測試用建置都以「要安裝的檔案」再確認一次（取出 tar.gz 內的執行檔）
+for d in "$BASE_VERSION" "$NEXT_VERSION-test.1" "$NEXT_VERSION-test.2" "$NEXT_VERSION-test.3" "$NEXT_VERSION-test.4" \
+    "$NEXT_VERSION-test.7"; do
+    sh "$REPO/packaging/check-release-binary.sh" --archive "$WORK/dist/$d"/pulse-*-linux-x86_64.tar.gz >/dev/null ||
+        die "$d 應該是正式的建置，卻含測試用 feature 的程式"
+done
+for d in "$NEXT_VERSION-test.5" "$NEXT_VERSION-test.6"; do
+    sh "$REPO/packaging/check-release-binary.sh" --test-build --archive "$WORK/dist/$d"/pulse-*-linux-x86_64.tar.gz >/dev/null ||
+        die "$d 應該是測試用建置，卻沒有故障注入的標記"
+done
+# 設定了 TEST_FEATURES 時，正式發佈的腳本拒絕執行（在刪除或建置任何東西之前）
+if (cd "$REPO" && TEST_FEATURES=fault-injection SKIP_CHECKS=1 DIST_DIR="$WORK/dist/never" sh packaging/release.sh) \
+    >"$WORK/release-refused.log" 2>&1; then
+    die "packaging/release.sh 沒有拒絕 TEST_FEATURES（$WORK/release-refused.log）"
+fi
+grep -q 'TEST_FEATURES' "$WORK/release-refused.log" || die "packaging/release.sh 不是因為 TEST_FEATURES 而失敗（$WORK/release-refused.log）"
+[ ! -e "$WORK/dist/never" ] || die "packaging/release.sh 在拒絕之前建立了輸出目錄"
 
 # ---- 簽章錯誤的發佈 ---------------------------------------------------------
 sums() {

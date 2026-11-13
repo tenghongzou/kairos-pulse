@@ -7,7 +7,7 @@
 #   WORK=<目錄>         工作目錄（發佈物、金鑰、日誌；預設 ~/kp-systest，不可在 git repo 內）
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback reboot reboot-rollback signature
-#                       tamper tamper-resume
+#                       tamper tamper-resume crash-replace crash-rollback
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
 #   KEEP=1              結束時保留容器與網路（除錯用；之後以 CLEAN_ONLY=1 清除）
@@ -27,7 +27,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume crash-replace crash-rollback}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -37,7 +37,13 @@ T1=$TV-test.1
 T2=$TV-test.2
 T3=$TV-test.3
 T4=$TV-test.4
+# test.5、test.6：開啟 fault-injection 的測試用建置（情境 crash-replace、crash-rollback）；test.7：崩潰
+T5=$TV-test.5
+T6=$TV-test.6
+T7=$TV-test.7
 T9=$TV-test.9
+# 輔助程式 root 專用的工作目錄
+HW=/var/lib/pulse-upgrade
 
 say() { printf '\n==> %s\n' "$*" >&2; }
 info() { printf '    %s\n' "$*" >&2; }
@@ -168,6 +174,8 @@ collect_logs() {
             hx "$h" journalctl -u pulse --no-pager -o short-iso 2>&1 | tail -n 60 || true
             echo "## /var/lib/pulse-upgrade/*/upgrade.log"
             hx "$h" sh -c 'cat /var/lib/pulse-upgrade/*/upgrade.log' 2>&1 || true
+            echo "## /var/lib/pulse-upgrade（交易紀錄與指標）"
+            hx "$h" sh -c 'ls -laR /var/lib/pulse-upgrade; for f in /var/lib/pulse-upgrade/active.json /var/lib/pulse-upgrade/*/state.json; do [ -f "$f" ] && { echo "# $f"; cat "$f"; echo; }; done' 2>&1 || true
             echo "## logs/pulse-*.log（upgrade）"
             hx "$h" sh -c 'grep -h -E "upgrade|升級|回滾" /opt/pulse/logs/pulse-*.log | tail -n 80' 2>&1 || true
         } >"$f"
@@ -495,21 +503,32 @@ scenario_tamper() {
     done
 }
 
-# tamper_reboot <主機> <假的 upgrade_id>：輔助程式到回滾確認（rolling_back）時，以服務帳號把 request.json 的
-# upgrade_id 改成另一個 UUID，再重新開機
+# tamper_reboot <主機> <假的 upgrade_id>：輔助程式到回滾確認（rolling_back）時，先記下 root 的指標、交易紀錄
+# 與它們的權限（$WORK/f-<主機>.*，由 scenario_tamper_resume 檢查），再以服務帳號把 request.json 的 upgrade_id
+# 改成另一個 UUID、from_version 改成謊報的 0.0.1，然後重新開機
 tamper_reboot() {
     deadline=$(($(date +%s) + 600))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if hx "$1" sh -c "grep -qs '\"step\": \"rolling_back\"' /var/lib/pulse-upgrade/*/state.json" 2>/dev/null; then
+        if hx "$1" sh -c "grep -qs '\"step\": \"rolling_back\"' $HW/*/state.json" 2>/dev/null; then
+            hx "$1" cat $HW/active.json >"$WORK/f-$1.active.json" 2>/dev/null || true
+            tid=$(jq -r '.upgrade_id // empty' "$WORK/f-$1.active.json" 2>/dev/null || true)
+            hx "$1" cat "$HW/$tid/state.json" >"$WORK/f-$1.state.json" 2>/dev/null || true
+            hx "$1" stat -c '%a %U:%G' $HW "$HW/$tid" "$HW/$tid/state.json" $HW/active.json \
+                >"$WORK/f-$1.stat" 2>&1 || true
+            # 服務帳號讀不到 root 的工作目錄
+            hx "$1" setpriv --reuid pulse --regid pulse --init-groups sh -c "ls $HW >/dev/null 2>&1 && echo readable || echo denied" \
+                >"$WORK/f-$1.access" 2>&1 || true
             if hx "$1" setpriv --reuid pulse --regid pulse --init-groups sh -c "
                 set -e
                 cd /var/lib/pulse/upgrade
-                sed 's/\"upgrade_id\": *\"[0-9a-f-]*\"/\"upgrade_id\":\"$2\"/' request.json > request.json.tmp
+                sed -e 's/\"upgrade_id\": *\"[0-9a-f-]*\"/\"upgrade_id\":\"$2\"/' \
+                    -e 's/\"from_version\": *\"[^\"]*\"/\"from_version\":\"0.0.1\"/' request.json > request.json.tmp
                 grep -q '$2' request.json.tmp
+                grep -q '\"from_version\":\"0.0.1\"' request.json.tmp
                 mv request.json.tmp request.json"; then
                 echo "$1" >>"$WORK/tampered"
             fi
-            info "$1：輔助程式在 rolling_back，已改寫 request.json 的 upgrade_id，重新開機（docker restart）"
+            info "$1：輔助程式在 rolling_back，已改寫 request.json 的 upgrade_id 與 from_version，重新開機（docker restart）"
             docker restart -t 60 "$P-$1" >/dev/null
             wait_boot "$1"
             echo "$1" >>"$WORK/rebooted"
@@ -521,16 +540,27 @@ tamper_reboot() {
     return 1
 }
 
-# 情境 f（REMOTE.md 第 17.8 節；進行中交易的指標）：升級進行中（新版崩潰、回滾確認期間）服務帳號把
-# request.json 的 upgrade_id 換成另一個 UUID，然後主機重新開機。輔助程式仍接續原本的交易（以 root 的
-# active.json 與 state.json 為準）：回報原交易的 rolled_back，沒有為假的 upgrade_id 開新的交易，
-# pulse.prev 沒有被覆寫
+# record_checksum_ok <state.json 或 active.json 的複本>：checksum 欄位等於「整份檔案、checksum 以 64 個 0 代入」
+# 的 SHA-256（REMOTE.md 第 17.9.2 節）
+record_checksum_ok() {
+    want=$(jq -r '.checksum // empty' "$1" 2>/dev/null || true)
+    zeros=0000000000000000000000000000000000000000000000000000000000000000
+    got=$(sed "s/\"checksum\": \"[0-9a-f]*\"/\"checksum\": \"$zeros\"/" "$1" | sha256sum | awk '{print $1}')
+    if [ -n "$want" ] && [ "$want" = "$got" ]; then echo ok; else echo "mismatch（檔案 $want、計算 $got）"; fi
+}
+
+# 情境 f（REMOTE.md 第 17.8、17.9 節；進行中交易的指標與交易紀錄）：升級進行中（新版崩潰、回滾確認期間）
+# 服務帳號把 request.json 的 upgrade_id 換成另一個 UUID、from_version 改成謊報的版本，然後主機重新開機。
+# 輔助程式仍接續原本的交易（以 root 的 active.json 與 state.json 為準）：回報原交易的 rolled_back，沒有為
+# 假的 upgrade_id 開新的交易，pulse.prev 沒有被覆寫。另外檢查竄改當下 root 的指標與交易紀錄（schema v2、
+# checksum、綁定的雜湊、權限）與交易結束後的清理（只留紀錄與日誌、只保留最近一筆）
 scenario_tamper_resume() {
     need $T4
     cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    cur_re=$(printf '%s' "$cur" | sed 's/\./\\./g')
     fake=$(cat /proc/sys/kernel/random/uuid)
-    say "情境 f：升級中改寫 request.json 的 upgrade_id 後重新開機 $cur → $T4（崩潰 → 回滾確認中竄改並重新開機 → 接續原交易）"
-    rm -f "$WORK/rebooted" "$WORK/tampered"
+    say "情境 f：升級中改寫 request.json 的 upgrade_id 與 from_version 後重新開機 $cur → $T4（崩潰 → 回滾確認中竄改並重新開機 → 接續原交易）"
+    rm -f "$WORK/rebooted" "$WORK/tampered" "$WORK"/f-*.json "$WORK"/f-*.stat "$WORK"/f-*.access
     # 情境 d 留下暫停的推送（它的主機仍算在未結束的推送中，新的推送會 409 rollout_overlap）：先取消
     api GET "/api/v1/rollouts?state=paused" >/dev/null
     for rid in $(body | jq -r '.data[].id'); do
@@ -555,10 +585,182 @@ scenario_tamper_resume() {
     for th in $HOSTS; do
         verify f "$id" "$th" rolled_back PLS-W8407 "$cur"
         check "f/$th：接續原本的交易並加註" "$(host_state "$id" "$th")" 'request_upgrade_id_ignored'
+        check "f/$th：謊報的 from_version 被忽略並加註" "$(host_state "$id" "$th")" 'request_from_version_ignored'
         check "f/$th：輔助程式接續回滾" "$(helper_log "$th" | grep -c '接續上次中斷的回滾')" '^[1-9]'
-        check "f/$th：沒有為假的 upgrade_id 開新的交易" "$(hx "$th" sh -c "ls -d /var/lib/pulse-upgrade/$fake 2>/dev/null | wc -l")" '^0$'
-        check "f/$th：進行中交易的指標已清除" "$(hx "$th" sh -c 'ls /var/lib/pulse-upgrade/active.json 2>/dev/null | wc -l')" '^0$'
-        check "f/$th：pulse.prev 仍是替換前的版本" "$(hx "$th" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}')" "^$(printf '%s' "$cur" | sed 's/\./\\./g')\$"
+        check "f/$th：沒有為假的 upgrade_id 開新的交易" "$(hx "$th" sh -c "ls -d $HW/$fake 2>/dev/null | wc -l")" '^0$'
+        check "f/$th：進行中交易的指標已清除" "$(hx "$th" sh -c "ls $HW/active.json 2>/dev/null | wc -l")" '^0$'
+        check "f/$th：pulse.prev 仍是替換前的版本" "$(hx "$th" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}')" "^$cur_re\$"
+        # 竄改當下（回滾確認中）root 的指標與交易紀錄（REMOTE.md 第 17.9.1、17.9.2 節）
+        fa=$WORK/f-$th.active.json
+        fs=$WORK/f-$th.state.json
+        check "f/$th：回滾確認中的指標（schema、checksum）" \
+            "$(jq -r '"\(.schema) \(.checksum | length)"' "$fa" 2>&1) $(record_checksum_ok "$fa")" \
+            '^pulse\.upgrade-active/v1 64 ok$'
+        check "f/$th：指標指向的交易紀錄（schema、步驟、checksum）" \
+            "$(jq -r '"\(.schema) \(.step) \(.checksum | length)"' "$fs" 2>&1) $(record_checksum_ok "$fs")" \
+            '^pulse\.upgrade-helper/v2 rolling_back 64 ok$'
+        check "f/$th：紀錄與指標的 upgrade_id、binding_sha256 相同" \
+            "$(jq -r -s 'if .[0].upgrade_id == .[1].upgrade_id and .[0].binding_sha256 == .[1].binding_sha256 and (.[0].binding_sha256 | length) == 64 then "same" else "different" end' "$fa" "$fs" 2>&1)" \
+            '^same$'
+        check "f/$th：紀錄綁定替換前的版本、新舊執行檔與發佈檔的雜湊，並記下回滾的意圖" \
+            "$(jq -r '"\(.from_version) \(.target.version) \(.method) \(.old_binary_sha256 | length) \(.new_binary_sha256 | length) \(.artifact.sha256 | length) \(.prev_saved) \(.rollback_intent.cause)"' "$fs" 2>&1)" \
+            "^$cur_re $(printf '%s' "$T4" | sed 's/\./\\./g') $th 64 64 64 true health\$"
+        check "f/$th：工作目錄 0700、紀錄與指標 0600，都屬於 root" "$(tr '\n' ' ' <"$WORK/f-$th.stat")" \
+            '^700 root:root 700 root:root 600 root:root 600 root:root $'
+        check "f/$th：服務帳號讀不到 $HW" "$(cat "$WORK/f-$th.access")" '^denied$'
+        # 交易結束後的清理（第 17.9.8 節）
+        tid=$(jq -r '.upgrade_id // empty' "$fa" 2>/dev/null || true)
+        check "f/$th：交易結束後紀錄為 done" "$(hx "$th" sh -c "grep -c '\"step\": \"done\"' $HW/$tid/state.json" 2>&1)" '^1$'
+        check "f/$th：已結束的交易只留紀錄與日誌" "$(hx "$th" sh -c "ls $HW/$tid | tr '\n' ' '" 2>&1)" '^state\.json upgrade\.log $'
+        check "f/$th：$HW 只保留最近一筆交易" "$(hx "$th" sh -c "ls -d $HW/*/ | wc -l" 2>&1)" '^1$'
+    done
+}
+
+# hold_and_kill <主機> <checkpoint>：等開啟 fault-injection 的輔助程式停在指定的當機點（它把
+# $HW/fault-inject 改名為 fault-inject.hit 後停住），記下當時磁碟上的狀態（$WORK/crash-<主機>.*），再
+# docker kill（SIGKILL PID 1：所有行程立即終止，等同斷電但不遺失已寫入頁面快取的資料）並重新啟動容器
+hold_and_kill() {
+    deadline=$(($(date +%s) + 900))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if hx "$1" test -e $HW/fault-inject.hit 2>/dev/null; then
+            hx "$1" cat $HW/fault-inject.hit >"$WORK/crash-$1.hit" 2>/dev/null || true
+            hx "$1" cat $HW/active.json >"$WORK/crash-$1.active.json" 2>/dev/null || true
+            cid=$(jq -r '.upgrade_id // empty' "$WORK/crash-$1.active.json" 2>/dev/null || true)
+            hx "$1" cat "$HW/$cid/state.json" >"$WORK/crash-$1.state.json" 2>/dev/null || true
+            {
+                hx "$1" /opt/pulse/pulse --version 2>&1 | awk '{print $2}'
+                hx "$1" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}'
+            } >"$WORK/crash-$1.versions"
+            pkg_version "$1" >"$WORK/crash-$1.pkg" 2>&1 || true
+            info "$1：輔助程式停在 $2，終止整台主機（docker kill）後重新啟動"
+            docker kill "$P-$1" >/dev/null
+            docker start "$P-$1" >/dev/null
+            wait_boot "$1"
+            echo "$1" >>"$WORK/crashed"
+            return 0
+        fi
+        sleep 1
+    done
+    info "$1：等不到輔助程式停在 $2"
+    return 1
+}
+
+# arm_crash <checkpoint>：在每台主機放好故障注入的掛鉤（只有 root 可寫；開啟 fault-injection 的建置才會讀）
+arm_crash() {
+    for ah in $HOSTS; do
+        hx "$ah" sh -c "rm -f $HW/fault-inject.hit && mkdir -p -m 700 $HW && printf '%s\n' '$1' > $HW/fault-inject && chmod 600 $HW/fault-inject"
+    done
+}
+
+# crash_hosts <情境> <checkpoint>：每台主機都在那個當機點被終止並重新啟動
+crash_hosts() {
+    rm -f "$WORK/crashed" "$WORK"/crash-*
+    pids=""
+    for ch in $HOSTS; do
+        hold_and_kill "$ch" "$2" &
+        pids="$pids $!"
+    done
+    for p in $pids; do wait "$p" || true; done
+    for ch in $HOSTS; do
+        if grep -qx "$ch" "$WORK/crashed" 2>/dev/null; then
+            pass "$1/$ch：輔助程式停在 $2 時終止整台主機並重新啟動"
+        else
+            fail "$1/$ch：輔助程式沒有停在 $2"
+        fi
+        check "$1/$ch：掛鉤只觸發一次（已改名為 fault-inject.hit）" \
+            "$(hx "$ch" sh -c "ls $HW/fault-inject $HW/fault-inject.hit 2>/dev/null | tr '\n' ' '")" "^$HW/fault-inject\\.hit \$"
+    done
+}
+
+# 需要開啟 fault-injection 的輔助程式：主機目前的版本不是測試用建置時，先升級到 test.5
+ensure_injectable() {
+    need $T5
+    inj=1
+    for ih in $HOSTS; do
+        hx "$ih" /opt/pulse/pulse --version 2>&1 | grep -q '\[fault-injection\]$' || inj=0
+    done
+    [ "$inj" = 0 ] || return 0
+    say "升級到開啟 fault-injection 的測試用建置 $T5（之後的輔助程式才能在當機點停住）"
+    api GET "/api/v1/rollouts?state=paused" >/dev/null
+    for rid in $(body | jq -r '.data[].id'); do
+        api POST "/api/v1/rollouts/$rid/cancel" '{"reason":"systest：取消暫停的推送"}' >/dev/null
+    done
+    id=$(rollout "systest injectable" $T5)
+    wait_rollout "$id" 900 || fail "$1：升級到 $T5 的推送沒有在 900 秒內結束"
+    collect_logs "$1-prepare"
+    for ih in $HOSTS; do
+        verify "$1（準備）" "$id" "$ih" succeeded PLS-I8416 $T5
+        check "$1（準備）/$ih：測試用建置的 --version 有標記" "$(hx "$ih" /opt/pulse/pulse --version 2>&1)" '\[fault-injection\]$'
+    done
+}
+
+# 情境 g（REMOTE.md 第 17.9.4 節第 11 列）：執行檔已替換（deb／rpm：套件已安裝完成）、還沒記下 replaced 時
+# 整台主機被終止。開機後輔助程式依 root 的紀錄與磁碟上的實況接續：不重讀暫存區、不覆寫 pulse.prev，
+# 健康確認後 succeeded
+scenario_crash_replace() {
+    ensure_injectable g
+    need $T6
+    cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    cur_re=$(printf '%s' "$cur" | sed 's/\./\\./g')
+    t6_re=$(printf '%s' "$T6" | sed 's/\./\\./g')
+    say "情境 g：替換後、記錄前終止主機 $cur → $T6（當機點 binary_replaced → 開機後接續 → succeeded）"
+    arm_crash binary_replaced
+    id=$(rollout "systest crash replace" $T6)
+    crash_hosts g binary_replaced
+    for ch in $HOSTS; do
+        check "g/$ch：當機時的紀錄停在 replacing（checksum 相符）" \
+            "$(jq -r '"\(.step) \(.prev_saved)"' "$WORK/crash-$ch.state.json" 2>&1) $(record_checksum_ok "$WORK/crash-$ch.state.json")" \
+            '^replacing true ok$'
+        check "g/$ch：當機時執行檔已是新版、pulse.prev 是舊版" "$(tr '\n' ' ' <"$WORK/crash-$ch.versions")" "^$t6_re $cur_re \$"
+        check "g/$ch：當機時指標已存在（checksum 相符）" "$(record_checksum_ok "$WORK/crash-$ch.active.json")" '^ok$'
+    done
+    wait_rollout "$id" 1200 || fail "g：推送沒有在 1200 秒內結束"
+    collect_logs g
+    for ch in $HOSTS; do
+        verify g "$id" "$ch" succeeded PLS-I8416 $T6
+        check "g/$ch：輔助程式接續替換（不重新驗證暫存區）" "$(helper_log "$ch" | grep -c '接續上次中斷的替換（replacing）')" '^1$'
+        check "g/$ch：接續時沒有再保留 pulse.prev" "$(helper_log "$ch" | grep -c 'pulse.prev 已是替換前的執行檔，不再覆寫')" '^[1-9]'
+        check "g/$ch：pulse.prev 仍是替換前的版本" "$(hx "$ch" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}')" "^$cur_re\$"
+        check "g/$ch：進行中交易的指標已清除" "$(hx "$ch" sh -c "ls $HW/active.json 2>/dev/null | wc -l")" '^0$'
+        check "g/$ch：$HW 只保留最近一筆交易" "$(hx "$ch" sh -c "ls -d $HW/*/ | wc -l" 2>&1)" '^1$'
+        hx "$ch" rm -f $HW/fault-inject.hit
+    done
+}
+
+# 情境 h（REMOTE.md 第 17.9.4 節第 17 列）：新版崩潰、輔助程式已還原（執行檔、套件）而還沒記下 rolling_back 時
+# 整台主機被終止。開機後依紀錄的回滾意圖冪等地重做還原，確認舊版恢復 → rolled_back（detail 有 resumed）
+scenario_crash_rollback() {
+    ensure_injectable h
+    need $T7
+    cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    cur_re=$(printf '%s' "$cur" | sed 's/\./\\./g')
+    say "情境 h：還原後、記錄前終止主機 $cur → $T7（崩潰 → 當機點 rollback_restored → 開機後接續 → rolled_back）"
+    arm_crash rollback_restored
+    id=$(rollout "systest crash rollback" $T7)
+    crash_hosts h rollback_restored
+    for ch in $HOSTS; do
+        check "h/$ch：當機時的紀錄停在 rollback_intent（先寫意圖再還原；checksum 相符）" \
+            "$(jq -r '"\(.step) \(.rollback_intent.cause) \(.rollback_intent.via)"' "$WORK/crash-$ch.state.json" 2>&1) $(record_checksum_ok "$WORK/crash-$ch.state.json")" \
+            "^rollback_intent health $([ "$ch" = tar ] && echo binary || echo package) ok\$"
+        check "h/$ch：當機時執行檔已換回舊版、pulse.prev 是舊版" "$(tr '\n' ' ' <"$WORK/crash-$ch.versions")" "^$cur_re $cur_re \$"
+    done
+    wait_rollout "$id" 1200 || fail "h：推送沒有在 1200 秒內結束"
+    collect_logs h
+    for ch in $HOSTS; do
+        verify h "$id" "$ch" rolled_back PLS-W8407 "$cur"
+        check "h/$ch：輔助程式接續回滾並重新還原" "$(helper_log "$ch" | grep -c '接續上次中斷的回滾：重新還原')" '^1$'
+        check "h/$ch：接續後仍回報原本的回滾原因" "$(host_state "$id" "$ch")" '(crash_restart|exit_code|health_timeout).*; resumed'
+        check "h/$ch：pulse.prev 仍是替換前的版本" "$(hx "$ch" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}')" "^$cur_re\$"
+        check "h/$ch：進行中交易的指標已清除" "$(hx "$ch" sh -c "ls $HW/active.json 2>/dev/null | wc -l")" '^0$'
+        hx "$ch" rm -f $HW/fault-inject.hit
+    done
+    for ch in deb rpm; do
+        # 目前的版本是上一次遠端升級裝上的（本機有它的已驗證發佈）：以回滾套件經套件管理員裝回
+        if host_state "$id" "$ch" | grep -q binary_restored; then
+            fail "h/$ch：應以回滾套件經套件管理員回滾，實際只換回執行檔"
+        else
+            pass "h/$ch：以回滾套件經套件管理員回滾（detail 沒有 binary_restored）"
+        fi
     done
 }
 
@@ -703,8 +905,8 @@ fi
 TOKEN=$(kx api-token create --name "systest-$(date +%s)" --role admin --json | jq -r .data.token)
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || die "無法建立 API token"
 
-say "匯入版本庫：$V0、$T1、$T2、$T3、$T4（臨時金鑰 release 簽章）"
-for v in "$V0" $T1 $T2 $T3 $T4; do
+say "匯入版本庫：$V0、$T1、$T2、$T3、$T4、$T5、$T6、$T7（臨時金鑰 release 簽章）"
+for v in "$V0" $T1 $T2 $T3 $T4 $T5 $T6 $T7; do
     [ -f "$DIST/$v/SHA256SUMS.sig" ] || continue
     s=$(import_release "$DIST/$v" "$v")
     case "$s" in
@@ -759,6 +961,8 @@ for s in $SCENARIOS; do
     signature) scenario_signature ;;
     tamper) scenario_tamper ;;
     tamper-resume) scenario_tamper_resume ;;
+    crash-replace) scenario_crash_replace ;;
+    crash-rollback) scenario_crash_rollback ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac

@@ -1790,3 +1790,37 @@ fn leftover_precheck_directories_are_removed() {
     assert!(!stale.exists());
     env.cleanup();
 }
+
+// ---- 第 17.9.9 節：故障注入只在測試用建置 -----------------------------------------
+
+/// 打包時的檢查（`packaging/check-release-binary.sh`）認得的標記，就是開啟 feature `fault-injection` 時才
+/// 編譯進執行檔的那一個字串與 `--version` 的結尾標記；預設的建置兩者都沒有
+#[test]
+fn the_packaging_check_knows_the_fault_injection_marker() {
+    let script = include_str!("../../../../../packaging/check-release-binary.sh");
+    let source = include_str!("../helper.rs");
+    let marker = source
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const FAULT_INJECTION_MARKER: &str = \""))
+        .and_then(|l| l.strip_suffix("\";"))
+        .expect("helper.rs 的 FAULT_INJECTION_MARKER");
+    assert!(marker.len() >= 16, "標記要夠長，不會碰巧出現在別的地方");
+    assert!(
+        script.lines().any(|l| l == format!("MARKER={marker}")),
+        "check-release-binary.sh 的 MARKER 與 helper.rs 不同"
+    );
+    assert!(
+        script
+            .lines()
+            .any(|l| l == "VERSION_TAG='[fault-injection]'")
+    );
+    #[cfg(feature = "fault-injection")]
+    {
+        assert_eq!(marker, FAULT_INJECTION_MARKER);
+        assert!(crate::cli::VERSION.ends_with(" [fault-injection]"));
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    assert!(!crate::cli::VERSION.contains("[fault-injection]"));
+    // 正式的 RealSystem 在沒有 feature 時不做任何事：呼叫不存在的 checkpoint 立即返回
+    RealSystem::default().checkpoint("no-such-checkpoint");
+}
