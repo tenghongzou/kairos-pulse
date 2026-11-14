@@ -51,6 +51,8 @@ pub(crate) enum Ver {
     Cluster,
     /// 遠端管理（feature `config`、`upgrade`）
     Mgmt,
+    /// hello 的 `install.external_url`（0.10.1 之後的 Pulse）
+    MgmtExternalUrl,
     Errors,
 }
 
@@ -64,6 +66,7 @@ impl Ver {
             Ver::Deregister => "除役",
             Ver::Cluster => "叢集",
             Ver::Mgmt => "遠端管理",
+            Ver::MgmtExternalUrl => "遠端管理：外部 URL 的宣告",
             Ver::Errors => "錯誤",
         }
     }
@@ -144,6 +147,8 @@ fn spec_vectors_are_found() {
     assert_eq!(vectors(Ver::Cluster, 'K').len(), 3);
     assert_eq!(vectors(Ver::Mgmt, 'P').len(), 8);
     assert_eq!(vectors(Ver::Mgmt, 'K').len(), 10);
+    assert_eq!(vectors(Ver::MgmtExternalUrl, 'P').len(), 2);
+    assert_eq!(vectors(Ver::MgmtExternalUrl, 'K').len(), 1);
     assert_eq!(vectors(Ver::Errors, 'P').len(), 0);
     assert_eq!(vectors(Ver::Errors, 'K').len(), 5);
 }
@@ -158,6 +163,7 @@ fn every_client_vector_round_trips() {
         Ver::Deregister,
         Ver::Cluster,
         Ver::Mgmt,
+        Ver::MgmtExternalUrl,
     ] {
         for line in vectors(ver, 'P') {
             let msg = parse_client_msg(line).unwrap();
@@ -178,6 +184,7 @@ fn every_server_vector_round_trips() {
         Ver::Deregister,
         Ver::Cluster,
         Ver::Mgmt,
+        Ver::MgmtExternalUrl,
         Ver::Errors,
     ] {
         for line in vectors(ver, 'K') {

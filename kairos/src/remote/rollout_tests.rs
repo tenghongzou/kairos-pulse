@@ -12,6 +12,7 @@ fn host(id: u8, version: &str, method: &str, upgrade: &str) -> UpgradeHost {
         install_method: Some(method.to_string()),
         install_upgrade: Some(upgrade.to_string()),
         install_config: Some("enabled".into()),
+        install_external_url: None,
         host_group: Some("Web".into()),
         tags: vec!["env:prod".into()],
         online: true,
@@ -53,7 +54,161 @@ fn ctx(target: &str) -> ReleaseContext {
         artifacts: vec![artifact(target, "tar.gz"), artifact(target, "deb")],
         by_version,
         missing: Vec::new(),
+        external_base_url: None,
     }
+}
+
+/// 外部 URL 的版本（REMOTE.md 第 4.1.2 節）：[`ctx`] 加上 `base_url`
+fn external_ctx(target: &str) -> ReleaseContext {
+    ReleaseContext {
+        external_base_url: Some(format!(
+            "https://repo.example.gov.tw/kairos-pulse/{target}/"
+        )),
+        ..ctx(target)
+    }
+}
+
+fn declares(mut h: UpgradeHost, external_url: Option<&str>) -> UpgradeHost {
+    h.install_external_url = external_url.map(str::to_string);
+    h
+}
+
+/// 外部 URL 版本的資格分類（REMOTE.md 第 4.7.2 節）：宣告 `install.external_url = "none"` 的主機事先分類為
+/// `url_not_allowed`；沒有宣告（舊 Pulse）、宣告 `allowlist`、不認得的值照舊算可升級
+#[test]
+fn external_url_declaration_is_classified_only_for_external_releases() {
+    let o = RolloutOptions::default();
+    let ext = external_ctx("0.9.1");
+    let why = |h: &UpgradeHost, c: &ReleaseContext| classify(h, c, &o);
+    let ready = || host(1, "0.9.0", "tar", "ready");
+    assert_eq!(SKIP_URL_NOT_ALLOWED, "url_not_allowed");
+    // 不允許（白名單是空的）
+    let e = why(&declares(ready(), Some("none")), &ext);
+    assert_eq!(e.skip, Some(SKIP_URL_NOT_ALLOWED));
+    // 允許（有白名單；內容 Kairos 不知道）
+    let e = why(&declares(ready(), Some("allowlist")), &ext);
+    assert_eq!((e.skip, e.external_url), (None, ExternalUrl::Allowlist));
+    // 未知：舊 Pulse 沒有宣告、或不認得的值——現行行為（可升級，不允許的在推送中 declined）
+    for unknown in [None, Some("per_host"), Some("")] {
+        let e = why(&declares(ready(), unknown), &ext);
+        assert_eq!(
+            (e.skip, e.external_url),
+            (None, ExternalUrl::Undeclared),
+            "{unknown:?}"
+        );
+    }
+    // 目標由 Kairos 代管：不看宣告（提議不含外部 URL）
+    for declared in [None, Some("none"), Some("allowlist")] {
+        let e = why(&declares(ready(), declared), &ctx("0.9.1"));
+        assert_eq!(
+            (e.skip, e.external_url),
+            (None, ExternalUrl::NotApplicable),
+            "{declared:?}"
+        );
+    }
+    // 順序：install.upgrade、平台、發佈檔的原因優先；降版、min_upgrade_from、回滾在後
+    assert_eq!(
+        why(
+            &declares(host(1, "0.9.0", "tar", "no_helper"), Some("none")),
+            &ext
+        )
+        .skip,
+        Some("no_helper")
+    );
+    assert_eq!(
+        why(
+            &declares(host(1, "0.9.1", "tar", "ready"), Some("none")),
+            &ext
+        )
+        .skip,
+        Some("already")
+    );
+    assert_eq!(
+        why(
+            &declares(host(1, "0.9.0", "rpm", "ready"), Some("none")),
+            &ext
+        )
+        .skip,
+        Some("no_artifact")
+    );
+    assert_eq!(
+        why(
+            &declares(host(1, "0.9.2", "tar", "ready"), Some("none")),
+            &ext
+        )
+        .skip,
+        Some(SKIP_URL_NOT_ALLOWED)
+    );
+    assert_eq!(
+        why(
+            &declares(host(1, "0.9.2", "tar", "ready"), Some("allowlist")),
+            &ext
+        )
+        .skip,
+        Some("downgrade_not_allowed")
+    );
+    // 回滾檔的規則不變：deb 沒有目前版本的回滾檔時仍是 no_rollback（宣告 allowlist 的主機）
+    let mut no_rb = external_ctx("0.9.1");
+    no_rb.by_version.remove("0.9.0");
+    let deb = declares(host(1, "0.9.0", "deb", "ready"), Some("allowlist"));
+    assert_eq!(why(&deb, &no_rb).skip, Some("no_rollback"));
+    assert_eq!(why(&deb, &ext).skip, None);
+
+    // 預覽的統計：url_not_allowed 的台數與樣本，可升級主機中沒有宣告與宣告 allowlist 的台數
+    let hosts = vec![
+        declares(host(1, "0.9.0", "tar", "ready"), Some("none")),
+        declares(host(2, "0.9.0", "tar", "ready"), Some("none")),
+        declares(host(3, "0.9.0", "tar", "ready"), Some("allowlist")),
+        declares(host(4, "0.9.0", "tar", "ready"), None),
+        declares(host(5, "0.9.0", "tar", "ready"), None),
+        declares(host(6, "0.9.0", "tar", "ready"), Some("future")),
+        // 不可升級的主機不計入宣告的統計
+        declares(host(7, "0.9.0", "tar", "disabled"), None),
+    ];
+    let all = SelectorSpec {
+        all: true,
+        ..Default::default()
+    };
+    let waves = WaveSpec::default_template();
+    let (p, classified, assigned) = plan("r", &hosts, &all, &waves, &o, &ext, &HashMap::new());
+    assert_eq!((p.matched, p.eligible), (7, 4));
+    assert_eq!(p.skipped.get(SKIP_URL_NOT_ALLOWED), Some(&2));
+    assert_eq!(p.samples[SKIP_URL_NOT_ALLOWED].len(), 2);
+    assert_eq!(
+        p.external_url,
+        Some(ExternalUrlPreview {
+            base_url: "https://repo.example.gov.tw/kairos-pulse/0.9.1/".into(),
+            undeclared: 3,
+            allowlist: 1,
+        })
+    );
+    assert_eq!(assigned.len(), 4);
+    assert_eq!(
+        classified
+            .iter()
+            .filter(|(_, e)| e.skip == Some(SKIP_URL_NOT_ALLOWED))
+            .count(),
+        2
+    );
+    let j = p.json();
+    assert_eq!(j["skipped"]["url_not_allowed"], 2);
+    assert_eq!(
+        j["external_url"],
+        json!({"base_url": "https://repo.example.gov.tw/kairos-pulse/0.9.1/", "undeclared": 3, "allowlist": 1})
+    );
+    // 代管的版本：沒有 external_url，也沒有這個原因
+    let (p, _, _) = plan(
+        "r",
+        &hosts,
+        &all,
+        &waves,
+        &o,
+        &ctx("0.9.1"),
+        &HashMap::new(),
+    );
+    assert_eq!((p.eligible, p.external_url.clone()), (6, None));
+    assert_eq!(p.skipped.get(SKIP_URL_NOT_ALLOWED), None);
+    assert_eq!(p.json()["external_url"], Value::Null);
 }
 
 #[test]

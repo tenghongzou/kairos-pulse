@@ -189,6 +189,17 @@ pub const INSTALL_CONFIG_ENABLED: &str = "enabled";
 /// `install.config`：本機 `remote_config.enabled = false`
 pub const INSTALL_CONFIG_DISABLED: &str = "disabled";
 
+/// `install.external_url`（Pulse 0.10.1 之後的版本；REMOTE.md 第 2.1、4.1.2 節）：本機的
+/// `upgrade.url_allowlist` 是空的（或沒有任何有效的項目）——`source: "url"` 的提議一律 `declined`
+/// （`PLS-W8411`、`url_not_allowed`）。Kairos 據此在外部 URL 版本的資格預覽事先標出這台主機
+pub const INSTALL_EXTERNAL_URL_NONE: &str = "none";
+/// `install.external_url`：本機白名單至少有一個有效的前綴。**只宣告「有白名單」，不回報內容**：某個
+/// `base_url` 是否落在白名單內 Kairos 不知道，不符合時這台主機照舊 `declined`（`url_not_allowed`）
+pub const INSTALL_EXTERNAL_URL_ALLOWLIST: &str = "allowlist";
+/// 規格定義的 `install.external_url`；沒有這個欄位（0.10.1 以前的 Pulse）＝未知
+pub const INSTALL_EXTERNAL_URL_STATES: [&str; 2] =
+    [INSTALL_EXTERNAL_URL_NONE, INSTALL_EXTERNAL_URL_ALLOWLIST];
+
 /// `install` 每個欄位的長度上限（bytes）
 pub const MAX_INSTALL_FIELD_BYTES: usize = 32;
 
@@ -205,6 +216,10 @@ pub struct InstallInfo {
     /// [`INSTALL_CONFIG_ENABLED`] 或 [`INSTALL_CONFIG_DISABLED`]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    /// [`INSTALL_EXTERNAL_URL_STATES`] 之一（Pulse 0.10.1 之後的版本）；沒有＝未知。0.9／0.10 的 Kairos
+    /// 忽略這個欄位（「物件中的其他欄位忽略」是 0.9.0 就定下的規則），協定版本不變
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<String>,
 }
 
 /// `install` 欄位值的格式：1～32 bytes 的小寫英文字母、數字或 `_`
@@ -222,6 +237,7 @@ pub fn validate_install(install: &InstallInfo) -> Result<(), String> {
         ("install.method", &install.method),
         ("install.upgrade", &install.upgrade),
         ("install.config", &install.config),
+        ("install.external_url", &install.external_url),
     ] {
         if let Some(v) = value
             && !is_install_token(v)

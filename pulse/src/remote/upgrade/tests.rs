@@ -717,6 +717,8 @@ fn install_info_and_status_text_limits() {
     let info = agent.install_info();
     assert_eq!(info.method.as_deref(), Some("tar"));
     assert_eq!(info.upgrade.as_deref(), Some("ready"));
+    // 白名單預設是空的：宣告不允許外部 URL（Kairos 的資格預覽據此事先標出；REMOTE.md 第 2.1 節）
+    assert_eq!(info.external_url.as_deref(), Some("none"));
     mgmt::validate_install(&info).unwrap();
     let long = "é".repeat(600);
     let t = truncate_detail(&format!("x\u{202e}y{long}"));
@@ -726,6 +728,54 @@ fn install_info_and_status_text_limits() {
     let mut cs = agent.on_registered(false, Some(&pending(ID)));
     assert_eq!(agent.poll(&mut cs, Instant::now()), None);
     assert_eq!(agent.next_wake(&cs, Instant::now(), false), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// hello 的 `install.external_url`（REMOTE.md 第 2.1 節）：只宣告白名單有沒有有效的項目，不含白名單的內容；
+/// 與 `install.upgrade` 的狀態無關（停用、缺少輔助程式的主機也宣告）
+#[test]
+fn hello_declares_whether_external_urls_are_allowed_without_revealing_the_allowlist() {
+    let dir = tmp("exturl");
+    for (list, want) in [
+        (vec![], "none"),
+        // 不合法的項目不會比對到任何 URL：等同沒有白名單
+        (
+            vec!["http://repo.example.gov.tw/", "repo.example.gov.tw"],
+            "none",
+        ),
+        (
+            vec!["https://repo.example.gov.tw/kairos-pulse/"],
+            "allowlist",
+        ),
+        (
+            vec!["not a url", " https://repo.example.gov.tw/kairos-pulse "],
+            "allowlist",
+        ),
+    ] {
+        for upgrade in [
+            mgmt::INSTALL_UPGRADE_READY,
+            mgmt::INSTALL_UPGRADE_DISABLED,
+            mgmt::INSTALL_UPGRADE_NO_HELPER,
+        ] {
+            let mut e = env(&dir, "0.9.0");
+            e.detection.upgrade = upgrade;
+            e.url_allowlist = list.iter().map(|s| s.to_string()).collect();
+            let info = UpgradeAgent::new(e).install_info();
+            assert_eq!(
+                info.external_url.as_deref(),
+                Some(want),
+                "{list:?} {upgrade}"
+            );
+            mgmt::validate_install(&info).unwrap();
+            // 送出去的只有固定的代碼：白名單的主機名稱與路徑不在 hello 中
+            let json = serde_json::to_string(&info).unwrap();
+            assert!(
+                json.contains(&format!(r#""external_url":"{want}""#)),
+                "{json}"
+            );
+            assert!(!json.contains("repo.example"), "{json}");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

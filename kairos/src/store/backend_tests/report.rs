@@ -535,6 +535,106 @@ fn inventory_is_persisted_and_restored(db: &TestDb) -> String {
     out
 }
 
+/// hello 的 `install.external_url`（schema v12；REMOTE.md 第 2.1 節）：清冊的值在每次帶 `install.upgrade` 的
+/// hello 整個取代——沒有宣告的 hello 清成 NULL（Pulse 降回舊版後是「未知」，不沿用舊值）；沒有主機資訊的
+/// 同步（v1 的連線）保留原值。`upgrade_hosts`（推送的資格分類讀的）與清冊的 `install` 在兩個後端相同
+fn install_external_url_follows_the_latest_hello(db: &TestDb) -> String {
+    let mut out = String::new();
+    let (mut store, _) = db.store(noon);
+    let hello = |agent: &str, secs: i64, external_url: Option<&str>| {
+        let mut a = agent_snapshot(agent, true, noon() + chrono::Duration::seconds(secs));
+        a.agent_version = "0.10.1".into();
+        a.host.as_mut().unwrap().install = Some(kairos_proto::InstallInfo {
+            method: Some("tar".into()),
+            upgrade: Some("ready".into()),
+            config: Some("enabled".into()),
+            external_url: external_url.map(str::to_string),
+        });
+        a
+    };
+    let declared = || {
+        let hosts = db.handle().upgrade_hosts().unwrap();
+        let mut v: Vec<(String, Option<String>, Option<String>)> = hosts
+            .into_iter()
+            .map(|h| (h.agent_id, h.install_upgrade, h.install_external_url))
+            .collect();
+        v.sort();
+        v
+    };
+    let c = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    // A 宣告 none、B 宣告 allowlist、C 沒有宣告（0.10.1 以前的 Pulse）
+    assert_eq!(
+        store.sync_now(&snapshot(vec![
+            hello(A, 0, Some("none")),
+            hello(B, 0, Some("allowlist")),
+            hello(c, 0, None),
+        ])),
+        3
+    );
+    assert_eq!(
+        declared(),
+        [
+            (A.to_string(), Some("ready".into()), Some("none".into())),
+            (
+                B.to_string(),
+                Some("ready".into()),
+                Some("allowlist".into())
+            ),
+            (c.to_string(), Some("ready".into()), None),
+        ]
+    );
+    log!(out, "declared", declared());
+    // 清冊的 install（主機清單與詳情的 API）也帶這個欄位
+    let listed = db.handle().load_hosts().unwrap();
+    let install_of = |agent: &str| {
+        listed
+            .iter()
+            .find(|h| h.agent_id.to_string() == agent)
+            .and_then(|h| h.install.clone())
+            .and_then(|i| i.external_url.clone())
+    };
+    assert_eq!(
+        (install_of(A), install_of(B), install_of(c)),
+        (Some("none".into()), Some("allowlist".into()), None)
+    );
+    // 宣告改變（修改白名單後重新啟動 Pulse）；A 降回舊版（hello 帶 install 而沒有 external_url）→ 清成 NULL
+    assert_eq!(
+        store.sync_now(&snapshot(vec![
+            hello(A, 1, None),
+            hello(B, 1, Some("none")),
+            hello(c, 1, Some("allowlist")),
+        ])),
+        3
+    );
+    assert_eq!(
+        declared()
+            .into_iter()
+            .map(|(_, _, e)| e)
+            .collect::<Vec<_>>(),
+        [
+            None,
+            Some("none".to_string()),
+            Some("allowlist".to_string())
+        ]
+    );
+    log!(out, "changed", declared());
+    // 沒有主機資訊的同步（v1 的連線）：install 的欄位（含 external_url）保留
+    let mut v1 = agent_snapshot(B, true, noon() + chrono::Duration::seconds(2));
+    v1.host = None;
+    v1.proto = 1;
+    assert_eq!(store.sync_now(&snapshot(vec![v1])), 1);
+    assert_eq!(
+        db.text(&format!(
+            "SELECT install_external_url FROM hosts WHERE agent_id = '{B}'"
+        ))
+        .as_deref(),
+        Some("none")
+    );
+    log!(out, "kept", declared());
+    store.close();
+    out
+}
+
 fn rollups_are_flushed_and_recovered(db: &TestDb) -> String {
     let mut out = String::new();
     set_now(noon());
@@ -1168,6 +1268,7 @@ backend_tests!(
     host_limit_rejects_only_new_hosts,
     many_new_hosts_in_one_batch,
     inventory_is_persisted_and_restored,
+    install_external_url_follows_the_latest_hello,
     rollups_are_flushed_and_recovered,
     late_samples_are_merged_by_sample_time,
     counters_become_rates,

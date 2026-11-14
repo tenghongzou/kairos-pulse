@@ -508,6 +508,7 @@ fn install_limits() {
             method: Some("snap".into()),
             upgrade: Some("future_state".into()),
             config: None,
+            external_url: Some("future_mode".into()),
         })
         .is_ok()
     );
@@ -575,6 +576,98 @@ fn unsafe_path_is_a_valid_install_upgrade_value_for_old_and_new_peers() {
     let json = serde_json::to_string(&install).unwrap();
     assert!(json.contains(r#""upgrade":"unsafe_path""#), "{json}");
     assert_eq!(serde_json::from_str::<InstallInfo>(&json).unwrap(), install);
+}
+
+/// `install.external_url`（0.10.1 之後的 Pulse；REMOTE.md 第 2.1 節）：選用欄位，三種狀態——`none`、
+/// `allowlist`、沒有這個欄位（未知）。協定版本不變、不是新的 feature：舊的 Kairos 依「其他欄位忽略」
+/// 略過它，舊的 Pulse 不送它
+#[test]
+fn external_url_declaration_is_optional_and_compatible_with_old_peers() {
+    assert_eq!(INSTALL_EXTERNAL_URL_NONE, "none");
+    assert_eq!(INSTALL_EXTERNAL_URL_ALLOWLIST, "allowlist");
+    for state in INSTALL_EXTERNAL_URL_STATES {
+        assert!(is_install_token(state), "{state}");
+    }
+    // 測試向量：新的 Pulse 的 hello（none、allowlist），可以解析、通過驗證
+    let hellos = vectors(Ver::MgmtExternalUrl, 'P');
+    let installs: Vec<InstallInfo> = hellos
+        .iter()
+        .map(|line| {
+            let ClientMsg::Hello { ext, .. } = parse_client_msg(line).unwrap() else {
+                panic!("{line}");
+            };
+            let host = ext.host.as_ref().unwrap();
+            crate::validate_host_info(host).unwrap();
+            host.install.clone().unwrap()
+        })
+        .collect();
+    assert_eq!(installs[0].external_url.as_deref(), Some("none"));
+    assert_eq!(installs[1].external_url.as_deref(), Some("allowlist"));
+    // 宣告與 install.upgrade 無關：第二則的主機缺少輔助程式，照樣宣告；feature 的宣告不受影響
+    assert_eq!(installs[1].upgrade.as_deref(), Some("no_helper"));
+    assert_eq!(
+        client_mgmt_features(true, &installs[0]),
+        [FEATURE_CONFIG, FEATURE_UPGRADE]
+    );
+    assert_eq!(client_mgmt_features(true, &installs[1]), [FEATURE_CONFIG]);
+    // 舊的 Pulse（0.9、0.10 的向量）沒有這個欄位：未知；序列化時也不會多出這個鍵
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(vectors(Ver::Mgmt, 'P')[0]).unwrap() else {
+        panic!();
+    };
+    let old = ext.host.as_ref().unwrap().install.clone().unwrap();
+    assert_eq!(old.external_url, None);
+    assert!(
+        !serde_json::to_string(&old)
+            .unwrap()
+            .contains("external_url")
+    );
+    // 舊的 Kairos（0.9、0.10：`install` 只有三個欄位、其他欄位忽略）收到新的 hello：照常解析，
+    // 三個欄位的值不變
+    #[derive(serde::Deserialize)]
+    struct InstallV010 {
+        method: Option<String>,
+        upgrade: Option<String>,
+        config: Option<String>,
+    }
+    for (line, new) in hellos.iter().zip(&installs) {
+        let v: Value = serde_json::from_str(line).unwrap();
+        let old: InstallV010 = serde_json::from_value(v["install"].clone()).unwrap();
+        assert_eq!(
+            (&old.method, &old.upgrade, &old.config),
+            (&new.method, &new.upgrade, &new.config)
+        );
+    }
+    // 不認得的值不是錯誤（原樣保存，Kairos 視為未知）；格式不符或型別錯誤是 bad_request
+    let line = hellos[0].replace(r#""external_url":"none""#, r#""external_url":"per_host""#);
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!();
+    };
+    crate::validate_host_info(ext.host.as_ref().unwrap()).unwrap();
+    let line = hellos[0].replace(
+        r#""external_url":"none""#,
+        r#""external_url":"https://repo.example/""#,
+    );
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!();
+    };
+    assert!(crate::validate_host_info(ext.host.as_ref().unwrap()).is_err());
+    // 型別錯誤：host 的部分無法解析（與 os、install 的其他欄位相同）
+    let line = hellos[0].replace(r#""external_url":"none""#, r#""external_url":["none"]"#);
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!();
+    };
+    assert!(ext.host.is_err(), "{line}");
+    // 白名單 → 宣告：只看有沒有有效的項目
+    use super::url::allowlist_state;
+    assert_eq!(allowlist_state(&[]), "none");
+    assert_eq!(allowlist_state(&["ftp://x/".to_string()]), "none");
+    assert_eq!(
+        allowlist_state(&[
+            "bad".to_string(),
+            "https://repo.example.gov.tw/p/".to_string()
+        ]),
+        "allowlist"
+    );
 }
 
 // ---- 驗證 ----

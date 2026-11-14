@@ -217,10 +217,10 @@ async fn hello_declares_config_and_upgrade_and_pending_drives_both_flows() {
     drop(tx);
     assert!(registered, "{err:?}");
     let (hello, got) = srv.await.unwrap();
-    // hello：install 與 features
+    // hello：install 與 features。external_url：白名單預設是空的 → none（只宣告有沒有，不含內容）
     assert_eq!(
         hello["install"],
-        json!({"method": "tar", "upgrade": "ready", "config": "enabled"})
+        json!({"method": "tar", "upgrade": "ready", "config": "enabled", "external_url": "none"})
     );
     let features: Vec<&str> = hello["features"]
         .as_array()

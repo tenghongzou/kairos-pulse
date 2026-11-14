@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
 use kairos_proto::mgmt::{
-    DEFAULT_HEALTH_TIMEOUT_SECS, INSTALL_METHOD_DEB, INSTALL_METHOD_RPM, INSTALL_UPGRADE_READY,
-    INSTALL_UPGRADE_UNSAFE_PATH, MAX_HEALTH_TIMEOUT_SECS, MIN_HEALTH_TIMEOUT_SECS,
+    DEFAULT_HEALTH_TIMEOUT_SECS, INSTALL_EXTERNAL_URL_ALLOWLIST, INSTALL_EXTERNAL_URL_NONE,
+    INSTALL_METHOD_DEB, INSTALL_METHOD_RPM, INSTALL_UPGRADE_READY, INSTALL_UPGRADE_UNSAFE_PATH,
+    MAX_HEALTH_TIMEOUT_SECS, MIN_HEALTH_TIMEOUT_SECS,
 };
 use kairos_proto::release::{self, Os, ReleaseManifest, Version};
 
@@ -588,7 +589,16 @@ pub struct ReleaseContext {
     /// 目標版本中資料庫記為已存入、但檔案不存在或大小不符的發佈檔（ADR-0002 F1；`KRS-W8417`）。不在
     /// `artifacts` 與 `by_version` 中：需要它的主機分類為 [`SKIP_ARTIFACT_MISSING`]，而不是可升級
     pub missing: Vec<ArtifactRow>,
+    /// 目標版本是外部 URL 的版本庫時的 `base_url`（提議的 `artifact.source` 為 `url`；REMOTE.md 第 4.1.2
+    /// 節）。有值時資格分類另看主機的 `install.external_url`（[`SKIP_URL_NOT_ALLOWED`]）；由 Kairos 代管的
+    /// 版本為 `None`
+    pub external_base_url: Option<String>,
 }
+
+/// 資格分類的原因（目標是外部 URL 的版本時）：Pulse 在 hello 宣告 `install.external_url = "none"`——本機的
+/// `upgrade.url_allowlist` 是空的，`source: "url"` 的提議一律 `declined`（`PLS-W8411`、`url_not_allowed`；
+/// 名稱與 Pulse 回報的 `detail` 相同）。不事先標出的話，這台主機要到推送中才回報 `declined`
+pub const SKIP_URL_NOT_ALLOWED: &str = "url_not_allowed";
 
 /// 資格分類的原因：版本庫記錄這個平台的發佈檔已存入，但檔案不存在或大小不符（重新上傳即可；與「版本庫
 /// 沒有這個平台的檔案」的 `no_artifact` 分開）。也是推送中主機等待檔案時的 `reason`、API 的 409 錯誤碼
@@ -628,19 +638,34 @@ pub struct Eligibility {
     pub downgrade: bool,
     /// deb／rpm 沒有回滾檔（`allow_no_rollback` 時仍可升級）
     pub no_rollback: bool,
+    /// 目標是外部 URL 的版本時，這台主機的 `install.external_url`（可升級的主機才有意義）
+    pub external_url: ExternalUrl,
+}
+
+/// 主機對外部 URL 的宣告（hello 的 `install.external_url`；REMOTE.md 第 2.1 節）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExternalUrl {
+    /// 目標不是外部 URL 的版本：不看
+    #[default]
+    NotApplicable,
+    /// 沒有宣告（0.10.1 以前的 Pulse）或不認得的值：照舊算可升級，不允許的主機在推送中 `declined`
+    Undeclared,
+    /// 宣告有白名單（內容不回報：這個 `base_url` 是否在內不知道）
+    Allowlist,
 }
 
 /// REMOTE.md 第 4.7.2 節的資格分類。跳過的原因：`already`、`unsupported_version`、`disabled`、
 /// `no_trust_anchor`、`no_helper`、`unsupported`、`unsafe_path`（0.10.0）、`not_ready`（不認得的
 /// `install.upgrade`）、`unsupported_platform`、`no_artifact`、
-/// `artifact_missing`、`min_upgrade_from`、`no_manifest`、`downgrade_not_allowed`、`no_rollback`、
-/// `decommissioned`
+/// `artifact_missing`、`url_not_allowed`（外部 URL 的版本）、`min_upgrade_from`、
+/// `no_manifest`、`downgrade_not_allowed`、`no_rollback`、`decommissioned`
 pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) -> Eligibility {
     let mut e = Eligibility {
         skip: None,
         from_version: h.agent_version.clone(),
         downgrade: false,
         no_rollback: false,
+        external_url: ExternalUrl::NotApplicable,
     };
     let skip = |mut e: Eligibility, why| {
         e.skip = Some(why);
@@ -687,6 +712,15 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
             return skip(e, SKIP_ARTIFACT_MISSING);
         }
         return skip(e, "no_artifact");
+    }
+    // 外部 URL 的版本：提議的發佈檔要由 Pulse 從 base_url 下載。宣告白名單是空的（`none`）的主機一定
+    // 拒絕——事先分類，不必等推送中的 `declined`。沒有宣告（0.10.1 以前的 Pulse）或不認得的值照舊算可升級
+    if ctx.external_base_url.is_some() {
+        e.external_url = match h.install_external_url.as_deref() {
+            Some(INSTALL_EXTERNAL_URL_NONE) => return skip(e, SKIP_URL_NOT_ALLOWED),
+            Some(INSTALL_EXTERNAL_URL_ALLOWLIST) => ExternalUrl::Allowlist,
+            _ => ExternalUrl::Undeclared,
+        };
     }
     if ctx.target < current {
         if !opts.allow_downgrade {
@@ -784,6 +818,17 @@ pub struct Preview {
     pub overlap_count: usize,
     /// 每批的台數
     pub waves: Vec<usize>,
+    /// 目標是外部 URL 的版本時（`None`：由 Kairos 代管）：可升級主機對外部 URL 的宣告
+    pub external_url: Option<ExternalUrlPreview>,
+}
+
+/// 外部 URL 版本的預覽（API 的 `external_url`）：可升級的主機中，沒有宣告（`undeclared`）與宣告有白名單
+/// （`allowlist`）的台數——兩者都可能在推送中因為白名單不含這個 `base_url` 而 `declined`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalUrlPreview {
+    pub base_url: String,
+    pub undeclared: usize,
+    pub allowlist: usize,
 }
 
 /// [`plan`] 的結果：統計、每台比對到的主機與資格、可升級主機的 (host_id, 批次, 批次內順序)
@@ -803,7 +848,13 @@ pub fn plan(
     ctx: &ReleaseContext,
     busy: &HashMap<String, String>,
 ) -> Plan {
-    let mut p = Preview::default();
+    let mut p = Preview {
+        external_url: ctx.external_base_url.as_ref().map(|u| ExternalUrlPreview {
+            base_url: u.clone(),
+            ..ExternalUrlPreview::default()
+        }),
+        ..Preview::default()
+    };
     let mut classified = Vec::new();
     for h in hosts.iter().filter(|h| spec_selector.matches(h)) {
         p.matched += 1;
@@ -826,6 +877,10 @@ pub fn plan(
                 p.eligible += 1;
                 p.downgrade += usize::from(e.downgrade);
                 p.no_rollback += usize::from(e.no_rollback);
+                if let Some(x) = p.external_url.as_mut() {
+                    x.undeclared += usize::from(e.external_url == ExternalUrl::Undeclared);
+                    x.allowlist += usize::from(e.external_url == ExternalUrl::Allowlist);
+                }
             }
         }
         classified.push((h.clone(), e));
@@ -857,6 +912,11 @@ impl Preview {
                 "hosts": self.overlap.iter().map(|(a, r)| json!({"agent_id": a, "rollout_id": r})).collect::<Vec<_>>(),
             },
             "waves": self.waves,
+            "external_url": self.external_url.as_ref().map(|x| json!({
+                "base_url": x.base_url,
+                "undeclared": x.undeclared,
+                "allowlist": x.allowlist,
+            })),
         })
     }
 }

@@ -857,7 +857,7 @@ async fn host_upgrade(
             Ok(json!({
                 "agent_id": a,
                 "agent_version": h.agent_version,
-                "install": {"method": h.install_method, "upgrade": h.install_upgrade, "config": h.install_config},
+                "install": {"method": h.install_method, "upgrade": h.install_upgrade, "config": h.install_config, "external_url": h.install_external_url},
                 "arch": rollout::arch_of(h.os.as_deref()),
                 "rollback_failed": rollback_failed,
                 "upgrades": list.iter().map(rollout::host_json).collect::<Vec<_>>(),
@@ -877,6 +877,10 @@ async fn host_upgrade(
                 if v.is_some() {
                     data["install"][k] = json!(v);
                 }
+            }
+            // external_url 不沿用清冊的舊值：hello 帶 install 而沒有這個欄位＝沒有宣告（未知）
+            if l.install_upgrade.is_some() {
+                data["install"]["external_url"] = json!(l.install_external_url);
             }
             if let Some(arch) = rollout::arch_of(l.os.as_deref()) {
                 data["arch"] = json!(arch);

@@ -751,10 +751,16 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 11,
         sql: remote::SCHEMA_V11_ROLLOUT_APPROVAL,
     },
+    // v12（0.10.1 之後的版本）：hosts.install_external_url（hello 的 install.external_url；SQL 在
+    // store/sqlite/remote.rs）
+    Migration {
+        version: 12,
+        sql: remote::SCHEMA_V12_INSTALL_EXTERNAL_URL,
+    },
 ];
 
 /// 目前的 schema 版本（`PRAGMA user_version`）
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// `meta` 的鍵：最近一次容量上限刪除（`KRS-W4202`）的事件（JSON，見 [`CapacityEvent`]）
 pub const META_CAPACITY_EVENT: &str = "capacity_event";
@@ -2740,9 +2746,9 @@ impl SqliteStore {
                 "INSERT INTO hosts (agent_id, hostname, agent_version, proto, host_fingerprint,
                     display_name, tags, os, report_interval_ms, peer, identity_verified, online,
                     first_seen, connected_at, last_seen, offline_after_ms, last_report,
-                    install_method, install_upgrade, install_config)
+                    install_method, install_upgrade, install_config, install_external_url)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                    ?18, ?19, ?20)
+                    ?18, ?19, ?20, ?21)
                  ON CONFLICT (agent_id) DO UPDATE SET
                     hostname = excluded.hostname,
                     agent_version = excluded.agent_version,
@@ -2761,7 +2767,9 @@ impl SqliteStore {
                     last_report = coalesce(excluded.last_report, hosts.last_report),
                     install_method = coalesce(excluded.install_method, hosts.install_method),
                     install_upgrade = coalesce(excluded.install_upgrade, hosts.install_upgrade),
-                    install_config = coalesce(excluded.install_config, hosts.install_config)
+                    install_config = coalesce(excluded.install_config, hosts.install_config),
+                    install_external_url = CASE WHEN excluded.install_upgrade IS NOT NULL
+                        THEN excluded.install_external_url ELSE hosts.install_external_url END
                  RETURNING host_id, rollup_until",
             )?;
             for row in rows {
@@ -2787,6 +2795,7 @@ impl SqliteStore {
                         row.install_method,
                         row.install_upgrade,
                         row.install_config,
+                        row.install_external_url,
                     ],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
@@ -2924,6 +2933,10 @@ pub(crate) struct InventoryRow {
     pub(crate) install_method: Option<String>,
     pub(crate) install_upgrade: Option<String>,
     pub(crate) install_config: Option<String>,
+    /// hello 的 `install.external_url`（0.10.1 之後的 Pulse；schema v12）。與其他 `install` 欄位不同，
+    /// 寫入時**不沿用舊值**：hello 帶 `install.upgrade`（0.9.0 起的 Pulse 一定帶）而沒有這個欄位時清成
+    /// NULL——Pulse 降回舊版後是「未知」，不是上一次宣告的值
+    pub(crate) install_external_url: Option<String>,
     /// 除了 last_seen 與 last_report（隨每次 heartbeat、report 改變）之外所有欄位的雜湊
     pub(crate) hash: u64,
 }
@@ -2975,6 +2988,9 @@ impl InventoryRow {
             install_config: host
                 .and_then(|h| h.install.as_ref())
                 .and_then(|i| i.config.clone()),
+            install_external_url: host
+                .and_then(|h| h.install.as_ref())
+                .and_then(|i| i.external_url.clone()),
             hash: 0,
         };
         let mut h = DefaultHasher::new();
@@ -2998,6 +3014,7 @@ impl InventoryRow {
             &row.install_method,
             &row.install_upgrade,
             &row.install_config,
+            &row.install_external_url,
         )
             .hash(&mut h);
         row.hash = h.finish();

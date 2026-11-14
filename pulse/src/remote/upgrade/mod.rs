@@ -513,13 +513,18 @@ impl UpgradeAgent {
         inner.env.detection = d;
     }
 
-    /// hello 的 `install`（`method`、`upgrade`；`config` 由集中設定補上）
+    /// hello 的 `install`（`method`、`upgrade`、`external_url`；`config` 由集中設定補上）。
+    /// `external_url`（REMOTE.md 第 2.1 節）只宣告本機的 `upgrade.url_allowlist` 有沒有有效的項目
+    /// （`none`／`allowlist`），**不回報白名單的內容**；不論 `upgrade` 的狀態都送
     pub fn install_info(&self) -> InstallInfo {
         let inner = self.lock();
         InstallInfo {
             method: Some(inner.env.detection.method.to_string()),
             upgrade: Some(inner.env.detection.upgrade.to_string()),
             config: None,
+            external_url: Some(
+                kairos_proto::mgmt::url::allowlist_state(&inner.env.url_allowlist).to_string(),
+            ),
         }
     }
 

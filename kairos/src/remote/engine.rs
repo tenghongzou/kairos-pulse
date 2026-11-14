@@ -132,6 +132,7 @@ pub(super) fn release_context(
             artifacts,
             by_version,
             missing: missing_target,
+            external_base_url: rel.base_url.clone().filter(|_| external),
         },
     ))
 }
@@ -2042,6 +2043,8 @@ pub struct LiveHello {
     pub install_method: Option<String>,
     pub install_upgrade: Option<String>,
     pub install_config: Option<String>,
+    /// hello 的 `install.external_url`（`None`＝這次 hello 沒有宣告）
+    pub install_external_url: Option<String>,
     /// hello 的 `os`（JSON；資格分類只用 `arch`）
     pub os: Option<String>,
     pub tags: Option<Vec<String>>,
@@ -2056,6 +2059,7 @@ impl LiveHello {
             install_method: install.and_then(|i| i.method.clone()),
             install_upgrade: install.and_then(|i| i.upgrade.clone()),
             install_config: install.and_then(|i| i.config.clone()),
+            install_external_url: install.and_then(|i| i.external_url.clone()),
             os: host
                 .and_then(|h| h.os.as_ref())
                 .and_then(|o| serde_json::to_string(o).ok()),
@@ -2071,6 +2075,8 @@ impl LiveHello {
         }
         if s.install_upgrade.is_some() {
             self.install_upgrade = s.install_upgrade.clone();
+            // 同一則 hello 的宣告（沒有宣告時是 None，不沿用別處的值）
+            self.install_external_url = s.install_external_url.clone();
         }
         if let Some(arch) = &s.arch {
             let mut os: serde_json::Map<String, Value> = self
@@ -2129,6 +2135,8 @@ pub(crate) fn with_live(
             }
             if l.install_upgrade.is_some() {
                 h.install_upgrade = l.install_upgrade.clone();
+                // external_url 以這次 hello 為準、不沿用清冊：沒有宣告（Pulse 降回舊版）就是未知
+                h.install_external_url = l.install_external_url.clone();
             }
             if l.install_config.is_some() {
                 h.install_config = l.install_config.clone();

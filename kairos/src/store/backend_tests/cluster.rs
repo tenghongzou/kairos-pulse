@@ -392,12 +392,29 @@ fn sqlite_v9_is_upgraded_to_v11_and_keeps_data() {
     .unwrap();
     conn.execute("INSERT INTO meta (key, value) VALUES ('keep', 'me')", [])
         .unwrap();
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 11);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 12);
     conn.execute(
         "UPDATE rollouts SET submitted_at = 1, submitted_by = 'u', reject_reason = 'r' WHERE 0",
         [],
     )
     .unwrap();
+    // v12：hosts.install_external_url（既有的主機是 NULL＝沒有宣告；可以寫入）
+    let declared: Option<String> = conn
+        .query_row(
+            "SELECT install_external_url FROM hosts WHERE agent_id = 'a-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(declared, None);
+    assert_eq!(
+        conn.execute(
+            "UPDATE hosts SET install_external_url = 'none' WHERE agent_id = 'a-1'",
+            [],
+        )
+        .unwrap(),
+        1
+    );
     let tables: Vec<String> = conn
         .prepare(
             "SELECT name FROM sqlite_master
@@ -540,9 +557,9 @@ fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
             .iter()
             .map(|(v, _)| *v)
             .collect::<Vec<_>>(),
-        [10, 11]
+        [10, 11, 12]
     );
-    assert_eq!(crate::store::sqlite::SCHEMA_VERSION, 11);
+    assert_eq!(crate::store::sqlite::SCHEMA_VERSION, 12);
     let pool = db.pool();
     let conn = pool.get(Access::ReadWrite, Duration::from_secs(5)).unwrap();
     {
@@ -576,11 +593,17 @@ fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
         postgres::schema_state(&conn).unwrap(),
         SchemaState::Version(10)
     );
-    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 11);
+    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 12);
     assert_eq!(
         postgres::schema_state(&conn).unwrap(),
-        SchemaState::Version(11)
+        SchemaState::Version(12)
     );
+    // v12：hosts.install_external_url（與 SQLite 對等的欄位；NULL＝沒有宣告）
+    conn.execute(
+        "UPDATE hosts SET install_external_url = 'none' WHERE false",
+        (),
+    )
+    .unwrap();
     let rev: i64 = conn
         .query_row(
             "SELECT rev FROM cluster_revs WHERE name = 'keep'",
@@ -612,7 +635,7 @@ fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
     conn.update_rollout_state(&r2).unwrap();
     assert_eq!(conn.get_rollout("r-20261020-0001").unwrap().unwrap(), r2);
     // 再執行一次：沒有變化
-    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 11);
+    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 12);
 }
 
 #[test]
