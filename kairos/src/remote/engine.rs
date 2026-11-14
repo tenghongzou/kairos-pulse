@@ -447,10 +447,11 @@ impl RemoteService {
             v["approvers_available"] = match (&viewer, approval) {
                 (Some(actor), true) => {
                     let n = submission::approvers_available(
+                        s,
                         &submission::approvers(s, now)?,
                         actor,
                         Some(actor.as_str()),
-                    );
+                    )?;
                     if n == 0 {
                         warnings.push("no_approvers");
                     }
@@ -761,7 +762,11 @@ impl RemoteService {
                 if r.state != ROLLOUT_PENDING_APPROVAL {
                     return Err(invalid_state(&r, "核准（只有待核准的推送可以核准）").into());
                 }
-                if who.actor == r.created_by || r.submitted_by.as_deref() == Some(who.actor.as_str()) {
+                // 以背後的使用者身分比對，不只是執行者字串：`token:<id>` 展開成擁有者與建立者，
+                // 單一管理員無法以自己的 token 建立／送出、再用自己的工作階段核准（ADR-0002 S1）。
+                // 核准者一定是工作階段（API 層已擋 token），這裡再以 who.actor 展開比對
+                if submission::involved(s, &r.created_by, r.submitted_by.as_deref(), &who.actor, None)?
+                {
                     return Err(ApiError::new(
                         StatusCode::FORBIDDEN,
                         "self_approval",

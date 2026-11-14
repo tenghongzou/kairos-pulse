@@ -1070,3 +1070,97 @@ async fn releases_and_rollouts_over_https() {
     let _ = std::fs::remove_dir_all(trust.parent().unwrap());
     f.stop().await;
 }
+
+/// 匯入一個已簽署的發佈、加一台 web 主機、以 admin token 建立一個草稿推送（建立不固定對象、不觸發核准，
+/// 用 token 即可）。回傳 (fixture, admin token, 草稿推送 id)。`approval` 為 `[remote] rollout_approval`
+async fn draft_rollout(tag: &str, approval: &str) -> (Fixture, String, String) {
+    let signer = TestSigner::new(31);
+    let trust = crate::api::tests::temp_dir(tag).join("allowed_signers");
+    std::fs::create_dir_all(trust.parent().unwrap()).unwrap();
+    std::fs::write(&trust, signer.allowed_signers()).unwrap();
+    let t = trust.to_string_lossy().into_owned();
+    let approval = approval.to_string();
+    let f = fixture(tag, move |c| {
+        c.remote.allowed_signers = t;
+        c.remote.rollout_approval = approval;
+    })
+    .await;
+    let addr = f.addr();
+    let admin = token(&f, Role::Admin);
+    let rel = release(&signer, "0.9.2", "abcdef1");
+    let import =
+        json!({"sha256sums": rel.sha256sums, "signature": rel.signature, "manifest": rel.manifest});
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&admin),
+        Some(&import),
+    )
+    .await;
+    assert_eq!(r.status, 201, "匯入: {}", String::from_utf8_lossy(&r.body));
+    let (tar_name, tar) = rel
+        .files
+        .iter()
+        .find(|(n, _)| n.ends_with(".tar.gz"))
+        .unwrap()
+        .clone();
+    let r = put_artifact(&f, &admin, "0.9.2", &tar_name, &tar).await;
+    assert_eq!(r.status, 200, "上傳: {}", String::from_utf8_lossy(&r.body));
+    add_host(&f, H, "0.9.0", "tar");
+    let spec = json!({"name": "x", "target_version": "0.9.2", "selector": {"groups": ["web"]}, "waves": [{"size": "rest"}]});
+    let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&spec)).await;
+    assert_eq!(r.status, 201, "建立: {}", String::from_utf8_lossy(&r.body));
+    let id = body(&r)["data"]["id"].as_str().unwrap().to_string();
+    (f, admin, id)
+}
+
+/// 安全回歸（B1 繞過修正 A，REMOTE.md 第 5.4 節）：`rollout_approval = "required"` 時，純 token 不能送出推送
+/// （403 `session_required`），否則單一管理員能用自己的 token 送出、再用自己的工作階段核准。狀態維持草稿
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_with_a_token_is_blocked_when_two_person_review_is_required() {
+    let (f, admin, id) = draft_rollout("remote-submit-req", "required").await;
+    let addr = f.addr();
+    let r = call(
+        addr,
+        "POST",
+        &format!("/api/v1/rollouts/{id}/submit"),
+        Some(&admin),
+        Some(&json!({"confirm": "升級 1 台"})),
+    )
+    .await;
+    assert_eq!(
+        (r.status, body(&r)["error"]["code"].as_str()),
+        (403, Some("session_required")),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = call(
+        addr,
+        "GET",
+        &format!("/api/v1/rollouts/{id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(body(&r)["data"]["state"], "draft");
+    f.stop().await;
+}
+
+/// 修正 A 的反面：`rollout_approval = "none"` 時 token 送出照舊（雙人覆核關閉時不限制自動化）
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_with_a_token_still_works_when_review_is_off() {
+    let (f, admin, id) = draft_rollout("remote-submit-none", "none").await;
+    let addr = f.addr();
+    let r = call(
+        addr,
+        "POST",
+        &format!("/api/v1/rollouts/{id}/submit"),
+        Some(&admin),
+        Some(&json!({"confirm": "升級 1 台"})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(body(&r)["data"]["state"], "running");
+    f.stop().await;
+}
