@@ -57,6 +57,8 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **服務啟動時比對完整的失敗復原設定並校正**（X2）：`ensure_failure_actions()` 原本只在「沒有任何失敗動作」時補上，舊版註冊的服務（三個 10 秒）與被部分修改過的設定不會被修正；現在比對動作陣列、重設期與「非 0 結束代碼也算失敗」旗標，不一致就改回來並記一則日誌（先前靜默）。從 0.8.0～0.10.1 升級的服務在新版第一次啟動時自動改為 10／60／300 秒。副作用：管理者或群組原則自訂的失敗動作會在服務下次啟動時被改回來。另修正：校正時開啟服務的控制代碼少了 `SERVICE_START` 權限（設定含「重新啟動」的失敗動作需要它），由 MSI 註冊的服務可能因此一直沒有被補上失敗動作（未實機確認）。
 - **MSI 升級、修復後服務會再啟動**（X4；`pulse/packaging/windows/pulse.wxs`）：0.8.0～0.10.1 的 MSI 只有 `ServiceControl Stop="both"`，升級或修復會停止服務而不再啟動（以 SCCM 升級後服務停到下次開機或手動啟動）。現在另加一列 `Start="install" Wait="no"`：安裝、升級、修復結束時啟動服務，只送出啟動要求、不等結果，服務啟動後才失敗不影響安裝的結束代碼。**行為變更**：第一次安裝後服務就會啟動（尚未 `pulse enroll` 時連預設的 `127.0.0.1:8080` 並持續重試；`pulse enroll` 之後重新啟動）。已確認的只有 wixl 0.106 產生的表（`ServiceControl` 的 Event／Wait、`StartServices` 的順序）；Windows Installer 的實際行為待 `windows-system` job 執行後確認。
 
+- **Windows 系統層測試 S0 與 CI 的 `windows-system` job**（ADR-0001 第 6.1 節；`tests/windows/`、`.github/workflows/ci.yml`）：在 GitHub 代管的 `windows-2022`、`windows-2025` runner 上實際安裝 `package` job 產出的 MSI 與 zip——服務的命令列與帳號、啟停、失敗復原的設定與連續結束服務行程 5 次（X1、X2）、MSI 修復與 MajorUpgrade 後的服務狀態（X4；另以版本 0.0.1 的舊式 MSI 重現原本的行為）、狀態目錄的 ACL 與不合規時的拒絕（F4）、移除後的殘留；`icacls`、`sc.exe qfailure`、MSI 日誌與結果表存成 artifact。沒有 Kairos，不驗證註冊、連線與回報；需要重開機的項目（X3）在 VM（`docs/windows-vm-validation.md`）。**腳本只通過語法剖析，這個 job 尚未在 runner 上執行過**。
+
 ### 安全修正
 
 - **Windows：`%ProgramData%\Pulse` 在使用前檢查擁有者、DACL 與重新解析點**（安全稽核 F4，中；`pulse/src/state_dir.rs`；影響 0.8.0～0.10.1）：`%ProgramData%` 的預設 ACL 讓一般使用者可以建立子目錄，而 LocalSystem 的服務在第一次啟動時才建立 `%ProgramData%\Pulse`、之後也不檢查它。一般使用者搶先建立這個目錄後，服務會在其中寫 `status.json`（並以路徑修改 ACL）、讀取並套用集中設定的快取 `remote\config.json`——**不需要管理權限就能降低這台主機的監控**——`pulse status` 與 SCCM 的健康檢查也會讀到偽造的狀態檔；即使目錄由服務建立，繼承的 ACL 也讓 Users 能在裡面建立檔案與子目錄。修正：

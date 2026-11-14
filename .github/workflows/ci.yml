@@ -178,6 +178,7 @@ jobs:
           packaging/check-release-binary.sh
           kairos/packaging/build-release.sh pulse/packaging/build-release.sh
           pulse/packaging/install.sh kairos/packaging/pkg/*.sh pulse/packaging/pkg/*.sh
+          tests/windows/make-test-msis.sh
 
       # 檢查已由 check、deny job 完成；release.sh 會確認工作目錄乾淨、清除 dist/ 後打包兩個產品，
       # 產出合併版 SHA256SUMS。CI 沒有私鑰，不簽章。
@@ -214,6 +215,66 @@ jobs:
             dist/pulse-install.sh
             dist/SHA256SUMS
           if-no-files-found: error
+          retention-days: 30
+
+      # windows-system job 用的兩個輔助 MSI（tests/windows/make-test-msis.sh）：內容取自上面打包的 zip，
+      # 只有 MSI 的版本與 ServiceControl 不同（版本 0.0.1 的舊式 MSI、版本 99.0.0 的較新版本）。只供測試，不發佈
+      - name: Build helper MSIs for the Windows system test
+        run: sh tests/windows/make-test-msis.sh dist/pulse-*-windows-x86_64.zip dist/windows-test
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-test-msi-${{ github.sha }}
+          path: dist/windows-test/*.msi
+          if-no-files-found: error
+          retention-days: 7
+
+  # ADR-0001 第 6.1 節的 S0（Windows 基礎驗證）：在 GitHub 代管的 Windows runner 上實際安裝 package job 產出的
+  # MSI 與 zip——服務的命令列與帳號、啟停、失敗復原（X1～X3）、MSI 修復與 MajorUpgrade 後的服務狀態（X4）、
+  # 狀態目錄的 ACL（安全稽核 F4）、移除後的殘留。腳本與說明在 tests/windows/（同一份腳本也在自管 VM 上執行，
+  # docs/windows-vm-validation.md）；每個目錄的 icacls、sc.exe qfailure、MSI 日誌與結果表存成 artifact。
+  # 沒有 Kairos：不驗證 pulse enroll、連線與回報。runner 不能重開機：X3 重開機後的部分與斷電在 VM 驗證。
+  # 連續結束服務行程 5 次要等 10＋60＋300×3 秒，整個 job 約 25 分鐘
+  windows-system:
+    name: windows system S0 (${{ matrix.os }})
+    needs: package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.sha }}
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-test-msi-${{ github.sha }}
+          path: dist/windows-test
+
+      - name: Run S0
+        shell: pwsh
+        run: |
+          $msi = @(Get-ChildItem dist -Filter 'pulse-*-windows-x86_64.msi')
+          $zip = @(Get-ChildItem dist -Filter 'pulse-*-windows-x86_64.zip')
+          if ($msi.Count -ne 1 -or $zip.Count -ne 1) { throw "dist 中應各有一個 Pulse 的 MSI 與 zip（MSI $($msi.Count)、zip $($zip.Count)）" }
+          ./tests/windows/Invoke-S0.ps1 -Msi $msi[0].FullName -Zip $zip[0].FullName `
+            -LegacyMsi dist/windows-test/pulse-test-legacy-0.0.1.msi `
+            -NextMsi dist/windows-test/pulse-test-next-99.0.0.msi `
+            -OutDir s0-out
+
+      - name: Upload S0 results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-s0-${{ matrix.os }}-${{ github.sha }}
+          path: s0-out/
+          if-no-files-found: warn
           retention-days: 30
 
   # 審計 D4：以兩個全新的 docker volume 各建置一次並比對雜湊。從頭編譯兩次約需 15 分鐘，

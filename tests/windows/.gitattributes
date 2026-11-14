@@ -1,0 +1,2 @@
+# 腳本必須是 LF（core.autocrlf=true 的 Windows checkout 與 kp-remote.sh 的 git archive 也一樣）
+*.sh text eol=lf
