@@ -109,7 +109,9 @@ ansible-playbook -i inventory.ini packaging/ansible/site-pulse.yml --ask-vault-p
 
 - 變數：`pulse_dist_dir`、`pulse_allowed_signers`（必填）、`pulse_version`（目錄中有多個版本時）、`pulse_install_string`、`pulse_start`（預設 `true`）。`pulse enroll` 的工作以 `no_log` 執行，安裝字串不會出現在 Ansible 的輸出。
 - 結果：已註冊（0）、等待核准（7，申請編號在主控台「註冊申請」）、已註冊過（11）都視為成功。
-- 只經過 `ansible-playbook --syntax-check` 與套件選擇邏輯的測試（ansible-core 2.21），**尚未對實際主機執行**；沒有 Windows（MSI）的支援。
+- **套件的暫存位置**（0.11.0 之後的 role）：套件複製到 `tempfile` 模組建立的 `/var/tmp/pulse-install.<隨機>/`（root 擁有、0700；role 會檢查），檔案為 `root:root 0600`，核對 SHA-256 與安裝都從這裡進行，結束時不論成敗都移除。0.11.0（含）以前的 role 直接放在 `/var/tmp/<套件檔名>`——任何本機帳號都能寫的目錄下、可以預測的路徑——請更新 role。role 必須以 root 執行（`become: true`）；不是的話在複製之前就停止。
+- 0.11.0（含）以前的 role 在驗證簽章時多送了一個換行（`command` 的 `stdin_add_newline` 預設為 `true`），簽章驗證一律失敗、不會安裝任何東西；已修正。
+- 測試範圍：`ansible-playbook --syntax-check`、套件選擇邏輯（ansible-core 2.21），以及在 Debian 12 容器內以 ansible-core 2.14 對本機執行一次（測試用的空套件與臨時簽章金鑰：驗證簽章 → 暫存目錄 → 複製 → 核對 → `apt` 安裝 → 移除暫存目錄；非 root 執行時在檢查暫存目錄的步驟停止）。**rpm（`dnf`）的路徑、`pulse enroll` 與啟動服務、經由 SSH 對遠端主機執行都還沒有實測**；沒有 Windows（MSI）的支援。
 
 ## 0. 發佈包內容
 
