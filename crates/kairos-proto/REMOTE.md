@@ -1264,7 +1264,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 12. **健康確認**（第 4.5.1 節）：服務 `ActiveState=active`；`NRestarts` **任何增加**即判定失敗（比「1 分鐘內崩潰 3 次」嚴格：`Restart=always` 下第一次崩潰就是失敗）；狀態檔的 `pid` 等於 `MainPID`、`version` 等於期望的版本、`running`；`connection.state = "registered"`；`reporting.last_ack_at` 不早於重新啟動的時間；符合後再穩定 60 秒（期間不符時重新起算）。結束代碼 2／3／4 立即回滾。輔助程式的狀態檔位置為 `pulse.toml` 的 `status.file`（相對路徑以安裝目錄解析），沒有設定時為 `<狀態目錄>/status.json`。
 13. **預檢**的解開方式：tar 以 `tar -xzf … --no-same-owner`、deb 以 `dpkg-deb -x`、rpm 以 `rpm2cpio | cpio -idm`（第 5.5 節的固定外部程式另外加上這三個；`cpio` 不屬於 rpm，Pulse 的 rpm 宣告相依 `cpio`，cpio 無法執行時立即以 `PLS-E8405` 失敗）；以 `pulse` 帳號（`getpwnam`、`setuid`／`setgid`，清空環境變數、只給 `PATH` 與 `STATE_DIRECTORY`）執行 `--version` 與 `check-config --json --with-remote`。
 14. **`pulse-upgrade.service` 的 `TimeoutStartSec`** 為 2.5 小時（健康確認最長 1 小時，回滾後再確認 `max(期限, 300 秒)`，另有套件資料庫最多 10 分鐘的重試）；被 systemd 中止時，`request.json` 仍在，`pulse-upgrade.path` 再次觸發並依步驟接續。
-15. **輔助程式寫 Pulse 可寫的目錄**（`result.json`）時，暫存檔以 `O_EXCL`＋`O_NOFOLLOW` 新建後改名，不會被服務帳號預先放好的符號連結導向其他檔案；刪除暫存與 `request.json` 不跟隨符號連結。
+15. **輔助程式對 Pulse 可寫的請求目錄**（`/var/lib/pulse/upgrade`）**的所有操作都相對一個開啟當下的目錄 fd**（`openat`／`renameat`／`unlinkat`）：輔助程式一開始就以 `O_DIRECTORY | O_NOFOLLOW` 開啟請求目錄取得 fd、`fstat` 確認是目錄且擁有者合理，之後讀 `request.json`、寫 `result.json`（暫存檔另以 `O_EXCL | O_NOFOLLOW` 新建後 `renameat`）、刪 `request.json`、遞迴刪暫存的 `<upgrade_id>` 子目錄、讀暫存的發佈檔都相對這個 fd。`O_EXCL | O_NOFOLLOW` 只保護路徑的最後一段；握住 fd 則連「服務帳號在執行期間把請求目錄本身改名、換成指向任意目錄的符號連結」也擋得住——fd 綁定的是開啟當下那個 inode，root 的寫入與刪除不會被導向別處（安全稽核 2026-11-14 A1；第 17.9.7 節「請求目錄」）。請求目錄本身在開啟時若已是符號連結（`open` 以 `ELOOP` 失敗）或不是目錄，輔助程式什麼都不碰、不寫結果就結束，交由人檢查。
 16. **安裝方式與就緒狀態在每次連線前重新偵測**（放好信任錨、啟用 `pulse-upgrade.path` 後不必重新啟動 Pulse；`upgrade.enabled` 與信任錨的路徑只在啟動時讀取）；Windows 以「執行檔在 `%ProgramFiles%\Pulse`」判斷 `msi`（否則 `zip`），`install.upgrade` 一律 `unsupported`（0.10.0 改以登錄的 UpgradeCode 判斷）。
 17. **`pulse upgrade rollback --yes`** 只對 tar 安裝動作（換回 `pulse.prev`、`systemctl restart`）；deb／rpm 顯示套件管理員的回滾方式。`pulse upgrade status` 與 `rollback` 以執行檔所在的目錄代替目前目錄判斷安裝方式（服務的工作目錄固定是 `/opt/pulse`，管理者可能在任何目錄執行 `sudo /opt/pulse/pulse upgrade …`）。
 18. **`[remote_config]`、`[upgrade]` 以 `pulse.toml` 的值為準**（與輔助程式一致：信任錨的路徑、`extra_principals`、`allow_downgrade`、`health_timeout_secs`），`PULSE__REMOTE_CONFIG__ENABLED`、`PULSE__UPGRADE__ENABLED` 只能關閉（`pulse.toml` 與環境變數都不為 `false` 才算開啟），其他 `PULSE__UPGRADE__*` 不影響遠端升級。
@@ -1502,6 +1502,15 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 | 工作目錄中接續要用的檔案（`state.json`、複本、備份） | 以 `O_NOFOLLOW` 開啟、必須是一般檔案 |
 
 沒有檢查：掛載選項（`nosuid`、`noexec`）、檔案系統類型、ACL 與 SELinux 標籤、`/etc/systemd/system` 的權限、`pulse.toml` 的擁有者（INSTALL 規定 `root:pulse 640`；輔助程式只讀它，不寫）。
+
+**請求目錄 `/var/lib/pulse/upgrade`（服務帳號可寫）的防符號連結**（安全稽核 2026-11-14 A1）：上表的路徑檢查對象是 root 專用的目錄（`/var/lib/pulse-upgrade`、`/opt/pulse`），不適用於請求目錄——請求目錄本來就由低權限的服務帳號擁有、可寫，無法要求「root 擁有、群組與其他人不可寫」。服務帳號可以在輔助程式執行期間把它改名、換成指向任意目錄 D 的符號連結，讓 root 把 `result.json` 寫到 D、把 `D/<upgrade_id>` 刪掉（`O_EXCL | O_NOFOLLOW` 只保護路徑的最後一段，上層目錄被換成符號連結仍會被跟隨）。因此輔助程式不以字面路徑操作請求目錄，而是：
+
+- 一開始就以 `O_DIRECTORY | O_NOFOLLOW` 開啟請求目錄取得一個 fd，`fstat` 確認是目錄、擁有者是 root／服務帳號／輔助程式本身（排除「被換成某個無關帳號擁有的目錄」；真正的保護是 `O_NOFOLLOW` 加上全程握住同一個 fd）。開不起來（已是符號連結 → `ELOOP`、不是目錄、或擁有者不合理）就什麼都不碰、不寫結果就結束。
+- 之後對請求目錄的每一項操作都相對這個 fd：讀 `request.json`（`openat`，同樣 `O_NOFOLLOW`、一般檔案、`st_nlink == 1`、大小上限）、寫 `result.json`（相對 fd 以 `O_EXCL | O_NOFOLLOW` 新建暫存檔 → fsync → `renameat` → fsync 目錄）、刪 `request.json`（`unlinkat`）、遞迴刪暫存的 `<upgrade_id>` 子目錄（`fstatat`／`openat`／`unlinkat` 全程 `AT_SYMLINK_NOFOLLOW`／`O_NOFOLLOW`，不跟隨任何符號連結）、讀暫存的發佈檔（相對請求目錄的 fd 再 `openat` 子目錄，不跟隨連結，之後重新驗證）。
+- fd 綁定的是開啟當下那個 inode：服務帳號事後把路徑改名、換成符號連結，都改變不了 root 寫到哪裡、刪掉哪裡，關閉了「檢查到使用之間」（TOCTOU）的時間窗。這條路徑不經 hello 之前的預檢（請求目錄是服務帳號可寫的，沒有可預檢的條件），只在輔助程式執行時處理。
+- 以 `libc` 的 `openat`／`renameat`／`unlinkat`／`fstatat`／`fdopendir` 實作（`remote/upgrade/helper/reqdir.rs`）；沒有新增相依。Windows（只用於交叉編譯檢查，輔助程式只在 Linux 執行）退回路徑操作。
+
+此外，`request.json` 的 `target.version`／`target.commit` 是服務帳號寫的自由字串，會原樣寫進 `result.json` 的 `to_version`、journal 與 `upgrade.log`；`Request::validate` 以 `release::Version::parse` 限制 `target.version`、以「7..=40 個小寫十六進位」限制 `target.commit`，不合即拒（第 4.4.1 節），避免把 `$( ) \` 反引號、換行等字元帶進可能被 shell `source` 的檔案。寫 `result.json` 前對 `to_version`／`from_version` 再套一次 `sanitize_detail` 與長度上限作為縱深防禦。
 
 **hello 之前的預檢（0.10.0；`install.upgrade = "unsafe_path"`）**：Pulse（服務帳號 `pulse`，不是 root）在每次連線前偵測安裝狀態時（第 2.1、4.3 節），對「其他條件都就緒」的主機先做一次上表的檢查，不通過就在 hello 回報 `install.upgrade = "unsafe_path"`、不宣告 `upgrade`；Kairos 的資格預覽把它分類為 `unsafe_path`（第 4.7.2 節），主控台的資格預覽與主機詳情顯示「路徑不安全」與處置方式。目的是讓不合規的主機在建立推送時就被標出來，而不是等推送失敗（`PLS-E8405`）。`pulse upgrade status` 顯示「路徑不安全（PLS-E8405）」，「原因」是與輔助程式的 `detail` 相同的 `unsafe_path: <路徑>: <原因>`。
 

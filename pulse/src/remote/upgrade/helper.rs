@@ -49,8 +49,10 @@ use super::files::{self, Request, UpgradeResult};
 use crate::codes;
 use crate::config_manager::AppConfig;
 
+mod reqdir;
 mod txn;
 
+use reqdir::ReqDir;
 pub use txn::ACTIVE_FILE;
 use txn::{Cause, Loaded, Record, RollbackIntent, Step, UnitPlan, Verified, Via};
 
@@ -224,10 +226,6 @@ impl Paths {
             .unwrap_or_default()
     }
 
-    fn result_path(&self) -> PathBuf {
-        self.upgrade_dir().join(files::RESULT_FILE)
-    }
-
     /// 目前的執行檔
     fn binary(&self) -> PathBuf {
         self.install_dir.join("pulse")
@@ -305,8 +303,10 @@ fn result(req: &Request, state: &str, code: Option<&str>, detail: String) -> Upg
         state: state.to_string(),
         code: code.map(str::to_string),
         detail: super::truncate_detail(&detail),
-        from_version: req.from_version.clone(),
-        to_version: req.target.version.clone(),
+        // `from_version`／`to_version` 來自服務帳號寫的 request.json（`validate` 已限制成合法版本），
+        // 寫進 result.json 前再套一次 sanitize 與長度上限作為縱深防禦（安全稽核 2026-11-14）
+        from_version: super::truncate_detail(&req.from_version),
+        to_version: super::truncate_detail(&req.target.version),
         finished_at: crate::protocol::now_ts(),
     }
 }
@@ -350,6 +350,8 @@ pub fn precheck_paths(
 /// 請求本身讀不到時無法產生結果，回傳 `Err`
 fn refuse(
     paths: &Paths,
+    reqdir: &ReqDir,
+    request_name: &str,
     req: Result<Request, String>,
     id: Option<&str>,
     code: &str,
@@ -358,7 +360,7 @@ fn refuse(
     let mut req = match req {
         Ok(r) => r,
         Err(e) => {
-            let _ = std::fs::remove_file(&paths.request);
+            let _ = reqdir.remove_file(request_name);
             return Err(format!("{e}（另外：{detail}）"));
         }
     };
@@ -375,16 +377,35 @@ fn refuse(
     let r = result(&req, UPGRADE_STATE_FAILED, Some(code), detail);
     log.line("ERROR", &format!("升級失敗（{code}）：{}", r.detail));
     if let Ok(bytes) = serde_json::to_vec_pretty(&r) {
-        let _ = crate::remote::write_atomic(&paths.result_path(), &bytes, 0o644, 0o750);
+        let _ = reqdir.write_atomic(files::RESULT_FILE, &bytes, 0o644);
     }
-    let _ = std::fs::remove_file(&paths.request);
+    let _ = reqdir.remove_file(request_name);
     Ok(r)
 }
 
 /// 執行一次請求（或接續上次中斷的交易）。無法讀取請求、又沒有可接續的交易時回傳 `Err`（刪除
 /// `request.json`，避免 `pulse-upgrade.path` 反覆觸發）
 pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
-    let req = Request::read_untrusted(&paths.request);
+    // 0. 請求目錄（服務帳號可寫）：一開始就以 O_DIRECTORY|O_NOFOLLOW 開啟取得 fd，之後對它的所有操作
+    //    （讀 request.json、寫 result.json、刪 request.json 與暫存子目錄）都相對這個 fd（安全稽核
+    //    2026-11-14 A1；REMOTE.md 第 17.9.7 節）。開不起來（已被換成符號連結、不是目錄等）就什麼都不碰、
+    //    不寫結果——這種請求目錄沒有合法的升級，交由人檢查
+    let upgrade_dir = paths.upgrade_dir();
+    let request_name = paths
+        .request
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(files::REQUEST_FILE);
+    let reqdir = match ReqDir::open(&upgrade_dir) {
+        Ok(d) => d,
+        Err(why) => {
+            eprintln!("錯誤：無法安全地開啟升級請求目錄：{why}");
+            return Err(format!("{DETAIL_UNSAFE_PATH}: {why}"));
+        }
+    };
+    let req = reqdir
+        .read_file(request_name, files::MAX_REQUEST_BYTES)
+        .and_then(|bytes| Request::from_untrusted_bytes(&bytes));
     let owner = txn::Owner::new(paths.require_root_owner);
     // 1. 路徑（REMOTE.md 第 17.9.7 節）：既存的目錄同樣檢查，不只依賴 systemd 第一次建立
     let mut warnings = Vec::new();
@@ -395,6 +416,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         Err(why) => {
             return refuse(
                 paths,
+                &reqdir,
+                request_name,
                 req,
                 None,
                 codes::E_UPGRADE_PRECHECK,
@@ -410,6 +433,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
             // 指標不可用：不知道是否有進行中的交易，不開新的交易也不猜（保留指標，由人檢查）
             return refuse(
                 paths,
+                &reqdir,
+                request_name,
                 req,
                 None,
                 codes::E_UPGRADE_INTEGRITY,
@@ -443,6 +468,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
                     if let Err(e) = txn::clear_active(&paths.work_root) {
                         return refuse(
                             paths,
+                            &reqdir,
+                            request_name,
                             req,
                             None,
                             codes::E_UPGRADE_INTEGRITY,
@@ -457,7 +484,16 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
                     ));
                     None
                 } else {
-                    return Ok(resume(paths, sys, *rec, req.ok(), work, warnings));
+                    return Ok(resume(
+                        paths,
+                        &reqdir,
+                        request_name,
+                        sys,
+                        *rec,
+                        req.ok(),
+                        work,
+                        warnings,
+                    ));
                 }
             }
             Loaded::Missing => Some(format!("{} is missing", txn::STATE_FILE)),
@@ -468,6 +504,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
             // 指標保留：之後的請求同樣被擋下，檢查後刪除 active.json 與那個工作目錄
             return refuse(
                 paths,
+                &reqdir,
+                request_name,
                 req,
                 Some(&a.upgrade_id),
                 codes::E_UPGRADE_INTEGRITY,
@@ -494,6 +532,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         if let Some(why) = why {
             return refuse(
                 paths,
+                &reqdir,
+                request_name,
                 req,
                 None,
                 codes::E_UPGRADE_INTEGRITY,
@@ -505,6 +545,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         let ids: Vec<&str> = legacy_open.iter().map(|e| e.id.as_str()).collect();
         return refuse(
             paths,
+            &reqdir,
+            request_name,
             req,
             None,
             codes::E_UPGRADE_INTEGRITY,
@@ -517,7 +559,7 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
     let req = match req {
         Ok(r) => r,
         Err(e) => {
-            let _ = std::fs::remove_file(&paths.request);
+            let _ = reqdir.remove_file(request_name);
             return Err(e);
         }
     };
@@ -526,6 +568,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         let Loaded::Legacy(state) = txn::load_record(&e.path) else {
             return refuse(
                 paths,
+                &reqdir,
+                request_name,
                 Ok(req),
                 None,
                 codes::E_UPGRADE_INTEGRITY,
@@ -536,7 +580,17 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
                 ),
             );
         };
-        return resume_legacy(paths, sys, &e.id, *state, req, e.path, warnings);
+        return resume_legacy(
+            paths,
+            &reqdir,
+            request_name,
+            sys,
+            &e.id,
+            *state,
+            req,
+            e.path,
+            warnings,
+        );
     }
     // 4. 全新的請求（或還沒動手就中斷的同一筆請求）
     let work = paths.work_root.join(&req.upgrade_id);
@@ -544,6 +598,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
     let stale = |why: String| {
         refuse(
             paths,
+            &reqdir,
+            request_name,
             Ok(req.clone()),
             None,
             codes::E_UPGRADE_INTEGRITY,
@@ -569,7 +625,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
             Step::Done => {
                 if let Some(r) = rec.result {
                     // 同一個 upgrade_id 的請求再次出現：回報記下的結果
-                    let mut h = Helper::new(paths, sys, req, work, Vec::new());
+                    let mut h =
+                        Helper::new(paths, &reqdir, request_name, sys, req, work, Vec::new());
                     h.finish(&r);
                     return Ok(r);
                 }
@@ -614,7 +671,7 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         },
         Loaded::Legacy(state) => match state.result {
             Some(r) if state.step == txn::LegacyStep::Done => {
-                let mut h = Helper::new(paths, sys, req, work, Vec::new());
+                let mut h = Helper::new(paths, &reqdir, request_name, sys, req, work, Vec::new());
                 h.finish(&r);
                 return Ok(r);
             }
@@ -629,6 +686,8 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         Err(why) => {
             return refuse(
                 paths,
+                &reqdir,
+                request_name,
                 Ok(req),
                 None,
                 codes::E_UPGRADE_PRECHECK,
@@ -637,7 +696,7 @@ pub fn apply(paths: &Paths, sys: &dyn System) -> Result<UpgradeResult, String> {
         }
     }
     txn::reset(&work);
-    let mut h = Helper::new(paths, sys, req, work, warnings);
+    let mut h = Helper::new(paths, &reqdir, request_name, sys, req, work, warnings);
     if !removed.is_empty() {
         h.log.line(
             "INFO",
@@ -663,8 +722,11 @@ fn package_db(sys: &dyn System, method: &str) -> Option<String> {
 }
 
 /// 接續 v2 的交易：之後 `request.json` 的內容不再有任何作用（只比對並加註），一切以紀錄為準
+#[allow(clippy::too_many_arguments)]
 fn resume(
     paths: &Paths,
+    reqdir: &ReqDir,
+    request_name: &str,
     sys: &dyn System,
     mut rec: Record,
     req: Option<Request>,
@@ -748,10 +810,19 @@ fn resume(
     let mut h = match txn::ensure_private_dir(&work, owner) {
         Ok(w) => {
             warnings.extend(w);
-            Helper::new(paths, sys, trusted, work, warnings)
+            Helper::new(paths, reqdir, request_name, sys, trusted, work, warnings)
         }
         Err(why) => {
-            let mut h = Helper::new_with(paths, sys, trusted, work, warnings, false);
+            let mut h = Helper::new_with(
+                paths,
+                reqdir,
+                request_name,
+                sys,
+                trusted,
+                work,
+                warnings,
+                false,
+            );
             h.keep_active = true;
             let r = h.fail(
                 codes::E_UPGRADE_PRECHECK,
@@ -829,8 +900,11 @@ fn resumed_reason(rec: &Record) -> String {
 
 /// 接續由 0.9.0 的輔助程式開始的交易（v1 的狀態檔；REMOTE.md 第 17.9.6 節）：只接受已替換之後的步驟，
 /// 轉成 v2 的紀錄並寫入指標，之後依 v2 的規則
+#[allow(clippy::too_many_arguments)]
 fn resume_legacy(
     paths: &Paths,
+    reqdir: &ReqDir,
+    request_name: &str,
     sys: &dyn System,
     id: &str,
     s: txn::LegacyState,
@@ -935,6 +1009,8 @@ fn resume_legacy(
         txn::LegacyStep::Verified | txn::LegacyStep::Done => {
             return refuse(
                 paths,
+                reqdir,
+                request_name,
                 Ok(req),
                 Some(id),
                 codes::E_UPGRADE_INTEGRITY,
@@ -961,6 +1037,8 @@ fn resume_legacy(
         Err(why) => {
             return refuse(
                 paths,
+                reqdir,
+                request_name,
                 Ok(trusted),
                 Some(id),
                 codes::E_UPGRADE_PRECHECK,
@@ -968,7 +1046,7 @@ fn resume_legacy(
             );
         }
     }
-    let mut h = Helper::new(paths, sys, trusted, work, warnings);
+    let mut h = Helper::new(paths, reqdir, request_name, sys, trusted, work, warnings);
     h.log.line(
         "INFO",
         &format!(
@@ -1011,6 +1089,11 @@ fn resume_legacy(
 
 struct Helper<'a> {
     paths: &'a Paths,
+    /// 請求目錄（服務帳號可寫）的 fd：寫 `result.json`、刪 `request.json` 與暫存子目錄、讀暫存的發佈檔
+    /// 都相對它（安全稽核 2026-11-14 A1）
+    reqdir: &'a ReqDir,
+    /// 請求檔的檔名（`request.json`，相對 [`Helper::reqdir`]）
+    request_name: &'a str,
     sys: &'a dyn System,
     /// 可信的請求內容：新交易在 [`Helper::begin`] 比對過 `from_version` 與 `method`；接續時由紀錄組成
     req: Request,
@@ -1025,19 +1108,25 @@ struct Helper<'a> {
 }
 
 impl<'a> Helper<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         paths: &'a Paths,
+        reqdir: &'a ReqDir,
+        request_name: &'a str,
         sys: &'a dyn System,
         req: Request,
         work: PathBuf,
         warnings: Vec<String>,
     ) -> Self {
-        Self::new_with(paths, sys, req, work, warnings, true)
+        Self::new_with(paths, reqdir, request_name, sys, req, work, warnings, true)
     }
 
     /// `log_file = false`：工作目錄沒有通過檢查，日誌只寫 stderr
+    #[allow(clippy::too_many_arguments)]
     fn new_with(
         paths: &'a Paths,
+        reqdir: &'a ReqDir,
+        request_name: &'a str,
         sys: &'a dyn System,
         req: Request,
         work: PathBuf,
@@ -1058,6 +1147,8 @@ impl<'a> Helper<'a> {
         }
         Self {
             paths,
+            reqdir,
+            request_name,
             sys,
             req,
             work,
@@ -1097,13 +1188,6 @@ impl<'a> Helper<'a> {
         }
         self.sys.checkpoint("record_done");
         r
-    }
-
-    fn staged(&self, name: &str) -> PathBuf {
-        self.paths
-            .upgrade_dir()
-            .join(&self.req.upgrade_id)
-            .join(name)
     }
 
     fn sha(&self, path: &Path) -> String {
@@ -1203,10 +1287,15 @@ impl<'a> Helper<'a> {
     /// 複製、重新驗證、預檢；把驗證過的複本與它們的雜湊記進 `rec`（還不寫入：由呼叫端寫成 `prepared`）
     fn prepare(&mut self, rec: &mut Record) -> Result<(), Box<UpgradeResult>> {
         let req = self.req.clone();
-        // 1. 複製
+        // 1. 複製。暫存的發佈檔在服務帳號可寫的 `<請求目錄>/<upgrade_id>/`：相對請求目錄的 fd 開啟那個
+        //    子目錄（不跟隨符號連結），再相對它讀每個檔案，之後重新驗證（安全稽核 2026-11-14 A1）
+        let staged = match self.reqdir.subdir(&req.upgrade_id) {
+            Ok(d) => d,
+            Err(e) => return Err(Box::new(self.fail(codes::E_UPGRADE_INTEGRITY, e))),
+        };
         let copy = |this: &mut Self, name: &str, max: u64| -> Result<PathBuf, Box<UpgradeResult>> {
             let dst = this.work.join(name);
-            match files::copy_untrusted(&this.staged(name), &dst, max) {
+            match staged.copy_file(name, &dst, max) {
                 Ok(_) => Ok(dst),
                 Err(e) => Err(Box::new(this.fail(codes::E_UPGRADE_INTEGRITY, e))),
             }
@@ -2170,21 +2259,24 @@ impl<'a> Helper<'a> {
     /// 步驟 7：寫結果、刪除請求與暫存、清理工作目錄、清除指標（每一步都可以重做）
     fn finish(&mut self, r: &UpgradeResult) {
         let bytes = serde_json::to_vec_pretty(r).unwrap_or_default();
-        if let Err(e) = crate::remote::write_atomic(&self.paths.result_path(), &bytes, 0o644, 0o750)
-        {
-            self.log.line(
-                "ERROR",
-                &format!("無法寫入 {}：{e}", self.paths.result_path().display()),
-            );
+        // 相對請求目錄的 fd 原子寫入 result.json（安全稽核 2026-11-14 A1）：服務帳號事後把請求目錄
+        // 改名、換成符號連結，都改變不了 root 寫到哪裡
+        if let Err(e) = self.reqdir.write_atomic(files::RESULT_FILE, &bytes, 0o644) {
+            self.log
+                .line("ERROR", &format!("無法寫入 {}：{e}", files::RESULT_FILE));
         }
         self.sys.checkpoint("result_written");
-        let _ = std::fs::remove_file(&self.paths.request);
+        if let Err(e) = self.reqdir.remove_file(self.request_name) {
+            self.log.line("WARN", &format!("無法刪除請求檔：{e}"));
+        }
         self.sys.checkpoint("request_removed");
         if !self.keep_active {
             self.remove_precheck_dirs();
             if r.state != UPGRADE_STATE_ROLLBACK_FAILED {
-                let _ =
-                    std::fs::remove_dir_all(self.paths.upgrade_dir().join(&self.req.upgrade_id));
+                // 相對 fd 遞迴刪除暫存的 `<upgrade_id>/` 子目錄（全程不跟隨符號連結）
+                if let Err(e) = self.reqdir.remove_dir_all(&self.req.upgrade_id) {
+                    self.log.line("WARN", &format!("無法刪除暫存目錄：{e}"));
+                }
                 // 已結束的交易只留紀錄與日誌
                 txn::strip(&self.work);
             }

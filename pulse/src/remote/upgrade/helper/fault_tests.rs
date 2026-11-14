@@ -1780,6 +1780,119 @@ fn an_unsafe_work_directory_stops_a_resumed_transaction() {
     env.cleanup();
 }
 
+// ---- 第 17.9.7 節：請求目錄的防符號連結（安全稽核 2026-11-14 A1）------------------
+//
+// 請求目錄 /var/lib/pulse/upgrade 由低權限的服務帳號擁有、可寫。輔助程式以 root 執行，一開始就以
+// O_DIRECTORY|O_NOFOLLOW 開啟它取得 fd，之後對它的所有操作都相對那個 fd。這些測試只驗證「修好後攻擊被
+// 擋」：不建立可運作的提權鏈。
+
+/// 請求目錄在輔助程式執行前就被換成指向第三方目錄的符號連結：不跟隨、不做任何變更、回傳錯誤
+#[test]
+fn a_symlinked_request_directory_is_refused_without_following_it() {
+    let env = setup("req-dir-link", "tar");
+    let reqdir = env.root.join("var/lib/pulse/upgrade");
+    let elsewhere = env.root.join("attacker");
+    std::fs::create_dir(&elsewhere).unwrap();
+    chmod(&elsewhere, 0o700);
+    // 真正的請求目錄（含 request.json）移走，原位置換成指向攻擊者目錄的符號連結
+    let moved = env.root.join("var/lib/pulse/upgrade.real");
+    std::fs::rename(&reqdir, &moved).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &reqdir).unwrap();
+
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake);
+    // (b) 回傳錯誤
+    assert!(r.is_err(), "請求目錄是符號連結：回傳錯誤，實際 {r:?}");
+    // (a) 不在連結目標建立任何檔案，也沒有做任何系統變更
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "不寫進符號連結的目標"
+    );
+    assert!(fake.calls().is_empty(), "沒有任何變更：{:?}", fake.calls());
+    assert_eq!(env.installed(), "0.9.0");
+    env.cleanup();
+}
+
+/// 執行期間（寫 result.json 之前）服務帳號把請求目錄改名、換成符號連結：root 握住的是開啟當下的 fd，
+/// 寫入與刪除都落在原本那個 inode，不會被導向攻擊者的目標
+#[test]
+fn a_mid_run_swap_of_the_request_directory_does_not_redirect_root_writes() {
+    let env = setup("req-dir-swap", "tar");
+    let reqdir = env.root.join("var/lib/pulse/upgrade");
+    let elsewhere = env.root.join("attacker");
+    std::fs::create_dir(&elsewhere).unwrap();
+    chmod(&elsewhere, 0o700);
+    let moved = env.root.join("var/lib/pulse/upgrade.real");
+
+    let fake = Fake::new(&env.root);
+    let reqdir2 = reqdir.clone();
+    let moved2 = moved.clone();
+    let elsewhere2 = elsewhere.clone();
+    // 在 root 記下結果、寫 result.json 之前換掉請求目錄
+    *fake.at_checkpoint.borrow_mut() = Some((
+        "record_done".to_string(),
+        Box::new(move || {
+            std::fs::rename(&reqdir2, &moved2).unwrap();
+            std::os::unix::fs::symlink(&elsewhere2, &reqdir2).unwrap();
+        }),
+    ));
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    // result.json 落在開啟當下那個 inode（被改名後的真目錄），攻擊者的連結目標保持空的
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "不寫進符號連結的目標"
+    );
+    assert!(
+        moved.join("result.json").exists(),
+        "result.json 落在原本的請求目錄"
+    );
+    assert!(
+        !moved.join("request.json").exists(),
+        "request.json 在原本的請求目錄被刪除"
+    );
+    env.cleanup();
+}
+
+/// request.json 的 target.version／target.commit 含 shell 注入字元、換行或超長：在寫任何結果或日誌之前
+/// 就被 `Request::validate` 擋下，危險字元不會進入 result.json
+#[test]
+fn a_dangerous_target_is_rejected_before_anything_is_written() {
+    let env = setup("req-target-danger", "tar");
+    let dangers = [
+        "0.9.1\n$(touch /tmp/pwn)".to_string(),
+        "0.9.1`id`".to_string(),
+        "$(reboot)".to_string(),
+        "9".repeat(600),
+    ];
+    for danger in dangers {
+        stage_upgrade(&env, ID, "0.9.0", "0.9.1");
+        rewrite_request(&env, |r| r.target.version = danger.clone());
+        let fake = Fake::new(&env.root);
+        let r = apply(&env.paths, &fake);
+        assert!(r.is_err(), "target.version {danger:?}：被拒");
+        assert!(!env.has_result(), "不寫結果：{danger:?}");
+        assert!(
+            !env.paths.request.exists(),
+            "request.json 已刪除：{danger:?}"
+        );
+        assert!(fake.calls().is_empty(), "沒有任何變更：{danger:?}");
+        assert_eq!(env.installed(), "0.9.0", "{danger:?}");
+    }
+    // commit 同樣受限（7..=40 個小寫十六進位）
+    stage_upgrade(&env, ID, "0.9.0", "0.9.1");
+    rewrite_request(&env, |r| r.target.commit = "5e6f7a8`id`".to_string());
+    let fake = Fake::new(&env.root);
+    assert!(
+        apply(&env.paths, &fake).is_err(),
+        "危險的 target.commit 被拒"
+    );
+    assert!(!env.has_result());
+    env.cleanup();
+}
+
 // ---- 第 17.9.8 節：工作目錄的保留上限 ---------------------------------------------
 
 fn new_id() -> String {
