@@ -809,6 +809,7 @@ Pulse 0.5.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 - 過時判斷：寫入時記錄單調時鐘（Linux `/proc/uptime`、Windows `GetTickCount64`），`pulse status` 以同一個時鐘相減，不受系統時間調整或與 Kairos 的時鐘偏差影響；重新開機後一律視為過時。
 - 位置與權限（`cli-spec.md` §4.1）：**所有人可讀，`pulse status` 不需要 root**。Linux 為 `/var/lib/pulse/status.json`，由 `pulse.service` 的 `StateDirectory=pulse`（`StateDirectoryMode=0755`）在 `ProtectSystem=strict` 下建立並開放寫入；以 systemd 執行時優先使用 `STATE_DIRECTORY`（多實例 `StateDirectory=pulse/N`）。檔案 0644、Pulse 自行建立的目錄 0755，以 `set_permissions` 明確設定（unit 的 `UMask=0077` 不影響）。發佈包的 `/opt/pulse` 為 751，一般帳號可以執行 `/opt/pulse/pulse`。Windows 為 `%ProgramData%\Pulse\status.json`，Pulse 在檔案上另外授予 BUILTIN\Users 讀取（目錄被收緊時仍可讀）。沒有權限讀取時結束代碼 10。
 - 預設位置無法寫入時（例如沿用沒有 `StateDirectory=` 的舊 unit）：**服務照常啟動與監控**，狀態檔改寫在工作目錄的 `logs/status.json`，記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 的「設定」列為警告（只有 root／`pulse` 群組讀得到 `logs/`）。預設位置恢復可寫後刪除 `logs/` 中的舊檔。執行中無法寫入狀態檔時，第一次記 `WARN`（`status.write_failed PLS-E8204`），連續失敗滿 60 秒（`pulse status` 開始顯示「未知」）記 `ERROR` 並寫 stderr，之後每 10 分鐘一則 `ERROR` 摘要；恢復時記 `INFO`（`status.write_restored`）。
+- Windows 的預設位置 `%ProgramData%\Pulse`（狀態檔與集中設定的快取）在使用前檢查（安全稽核 F4）：擁有者是 SYSTEM、Administrators 或 TrustedInstaller，DACL 不讓其他主體寫入，不是 junction 或符號連結；不存在時服務以只有 SYSTEM 與 Administrators 可寫的 ACL 建立。不合規時（含 0.8.0～0.10.1 建立、繼承了 Users 寫入權限的目錄）**服務照常執行但不使用它**：狀態檔改寫 `logs\status.json`、設定快取改放 `logs\remote\`，記 `ERROR`（`config.warning PLS-E8207`），`pulse status` 的「設定」列為警告，而且不讀那個目錄中的狀態檔。處理方式見 `INSTALL.md` A.3（停止服務、刪除該目錄、啟動服務）。
 
 ## agent.id
 

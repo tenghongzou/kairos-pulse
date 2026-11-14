@@ -26,15 +26,21 @@ pub const FILE_MODE: u32 = 0o640;
 
 /// 狀態目錄（REMOTE.md 第 3.7 節）：systemd 的 `STATE_DIRECTORY`（第一個絕對路徑，多實例為
 /// `/var/lib/pulse/N`）；沒有時 Linux 等為 `/var/lib/pulse`，Windows 為 `%ProgramData%\Pulse`
-/// （與本機狀態檔的預設位置相同目錄）
+/// （與本機狀態檔的預設位置相同目錄）。Windows 的預設位置沒有通過信任檢查時（一般使用者擁有或可寫、
+/// 重新解析點；`crate::state_dir`，安全稽核 F4）改用工作目錄的 `logs`：不讀取、也不寫入那個目錄
 pub fn state_dir() -> PathBuf {
-    crate::status_file::state_directory(std::env::var_os("STATE_DIRECTORY").as_deref())
-        .unwrap_or_else(|| {
-            crate::status_file::default_path()
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default()
-        })
+    if let Some(dir) =
+        crate::status_file::state_directory(std::env::var_os("STATE_DIRECTORY").as_deref())
+    {
+        return dir;
+    }
+    if crate::state_dir::verdict().is_err() {
+        return crate::state_dir::fallback_dir();
+    }
+    crate::status_file::default_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
 }
 
 /// 以「寫暫存檔、fsync、改名」原子地寫入 `path`（同一個目錄）。上層目錄不存在時建立（Unix 權限
@@ -94,6 +100,8 @@ pub fn create_dir_all_mode(dir: &Path, mode: u32) -> io::Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
+    // Windows 的預設狀態目錄只由 state_dir::prepare 以受保護的 ACL 建立（安全稽核 F4）
+    crate::state_dir::refuse_implicit_create(dir)?;
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]

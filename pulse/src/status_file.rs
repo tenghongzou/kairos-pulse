@@ -8,7 +8,9 @@
 //! - **位置**（`cli-spec.md` §4.1）：`status.file` 未設定時，Linux 等為 `/var/lib/pulse/status.json`
 //!   （systemd unit 的 `StateDirectory=pulse`），Windows 為 `%ProgramData%\Pulse\status.json`。
 //!   無法寫入（例如沿用沒有 `StateDirectory=` 的舊 unit）時，改寫在工作目錄的 `logs/status.json`
-//!   （[`LEGACY_RELATIVE`]），並在狀態中記 `PLS-E8204`，服務照常執行。
+//!   （[`LEGACY_RELATIVE`]），並在狀態中記 `PLS-E8204`，服務照常執行。Windows 的預設目錄在使用前另外檢查
+//!   擁有者、DACL 與重新解析點（`crate::state_dir`，安全稽核 F4）：不合規時不使用它，直接寫在
+//!   `logs/status.json` 並記 `PLS-E8207`，`pulse status` 也不讀那個目錄。
 //! - **權限**：所有人可讀，`pulse status` 不需要 root。Unix 上檔案 0644、自行建立的目錄 0755，
 //!   以 `set_permissions` 明確設定（unit 的 `UMask=0077` 會把建立時的權限位元拿掉）；Windows 在檔案上
 //!   另外授予 BUILTIN\Users 讀取（目錄被管理者收緊時仍可讀）。
@@ -422,6 +424,8 @@ pub fn write_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     if !dir.is_dir() {
+        // Windows 的預設狀態目錄只由 state_dir::prepare 以受保護的 ACL 建立（安全稽核 F4）
+        crate::state_dir::refuse_implicit_create(dir)?;
         fs::DirBuilder::new().recursive(true).create(dir)?;
         // 建立時的權限受 umask 影響（unit 的 UMask=0077），另外明確設定
         #[cfg(unix)]

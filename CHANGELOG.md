@@ -57,6 +57,17 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **服務啟動時比對完整的失敗復原設定並校正**（X2）：`ensure_failure_actions()` 原本只在「沒有任何失敗動作」時補上，舊版註冊的服務（三個 10 秒）與被部分修改過的設定不會被修正；現在比對動作陣列、重設期與「非 0 結束代碼也算失敗」旗標，不一致就改回來並記一則日誌（先前靜默）。從 0.8.0～0.10.1 升級的服務在新版第一次啟動時自動改為 10／60／300 秒。副作用：管理者或群組原則自訂的失敗動作會在服務下次啟動時被改回來。另修正：校正時開啟服務的控制代碼少了 `SERVICE_START` 權限（設定含「重新啟動」的失敗動作需要它），由 MSI 註冊的服務可能因此一直沒有被補上失敗動作（未實機確認）。
 - **MSI 升級、修復後服務會再啟動**（X4；`pulse/packaging/windows/pulse.wxs`）：0.8.0～0.10.1 的 MSI 只有 `ServiceControl Stop="both"`，升級或修復會停止服務而不再啟動（以 SCCM 升級後服務停到下次開機或手動啟動）。現在另加一列 `Start="install" Wait="no"`：安裝、升級、修復結束時啟動服務，只送出啟動要求、不等結果，服務啟動後才失敗不影響安裝的結束代碼。**行為變更**：第一次安裝後服務就會啟動（尚未 `pulse enroll` 時連預設的 `127.0.0.1:8080` 並持續重試；`pulse enroll` 之後重新啟動）。已確認的只有 wixl 0.106 產生的表（`ServiceControl` 的 Event／Wait、`StartServices` 的順序）；Windows Installer 的實際行為待 `windows-system` job 執行後確認。
 
+### 安全修正
+
+- **Windows：`%ProgramData%\Pulse` 在使用前檢查擁有者、DACL 與重新解析點**（安全稽核 F4，中；`pulse/src/state_dir.rs`；影響 0.8.0～0.10.1）：`%ProgramData%` 的預設 ACL 讓一般使用者可以建立子目錄，而 LocalSystem 的服務在第一次啟動時才建立 `%ProgramData%\Pulse`、之後也不檢查它。一般使用者搶先建立這個目錄後，服務會在其中寫 `status.json`（並以路徑修改 ACL）、讀取並套用集中設定的快取 `remote\config.json`——**不需要管理權限就能降低這台主機的監控**——`pulse status` 與 SCCM 的健康檢查也會讀到偽造的狀態檔；即使目錄由服務建立，繼承的 ACL 也讓 Users 能在裡面建立檔案與子目錄。修正：
+  - 使用前檢查目錄本身：擁有者是 SYSTEM、Administrators 或 TrustedInstaller；DACL 不是 NULL，寫入類權限只給這三者（只用於繼承的項目也算；只看允許項目，可能多拒絕、不會漏放）；不是重新解析點（以 `FILE_FLAG_OPEN_REPARSE_POINT` 開啟，屬性、擁有者與 DACL 取自同一個控制代碼）。
+  - 目錄不存在時，服務以明確的安全描述元建立（擁有者 Administrators；SYSTEM、Administrators 完全控制；Users 只能讀取目錄本身），不再繼承 `%ProgramData%` 的 ACL。唯讀的命令（`pulse status` 等）不建立目錄。
+  - **不合規時拒絕使用**，代碼 `PLS-E8207`（工程暫定號）：服務照常執行，狀態檔改寫在工作目錄的 `logs\status.json`、設定快取改放 `logs\remote\`；`pulse status` 不讀該目錄中的狀態檔。
+  - **升級注意**：0.8.0～0.10.1 建立的 `%ProgramData%\Pulse` 繼承了 Users 的寫入權限，升級後**會被拒絕**（`PLS-E8207`）；以系統管理員停止服務、`rd /s /q "%ProgramData%\Pulse"`、啟動服務即可（`pulse/packaging/INSTALL.md` A.3）。
+  - 沒有涵蓋：`%ProgramData%` 本身的 ACL、目錄內既有檔案的擁有者（處理方式是刪除整個目錄）、`status.file` 明確指定的路徑。信任錨的預設位置也在這個目錄（Windows 的遠端升級尚未開放，走不到；ADR-0001 第 4.5 節已決定改放安裝目錄）。
+  - 驗證：判斷邏輯是純函式，在 Linux 上以單元測試涵蓋（一般使用者擁有、Users 可寫、只用於繼承的寫入項目、NULL DACL、重新解析點、損毀的 ACL 都被拒絕）；讀取安全描述元與建立目錄的 Windows 程式只經過交叉編譯與 clippy，**尚未在 Windows 上執行**（Windows 上的單元測試與 `tests/windows/` 的情境待 CI）。
+  - MSI 沒有改為在安裝時建立這個目錄：wixl 0.106 不支援 `<Permission>`／`<PermissionEx>`。以 `msibuild` 匯入 `MsiLockPermissionsEx` 表在技術上可行（已確認匯入成功且輸出可重現），但沒有 Windows 可以驗證安裝行為，這一輪不採用；MSI 安裝後服務會立即啟動並自行建立目錄，「安裝後、第一次啟動前」的空窗已大幅縮短。
+
 ## [0.10.1] - 2026-11-14
 
 **Kairos 0.10.1、Pulse 0.10.1**：0.10.0 之後的四項補強（H1～H4）。協定版本、8443 的 feature 與 8444 的 API 都不變。

@@ -206,6 +206,11 @@ pub fn once(args: &StatusArgs) -> Output {
     };
     // 狀態檔：status.file 未設定時讀設計包的位置，沿用舊 unit 的服務改寫在 logs/status.json（兩者都有時取較新的）
     let (primary, fallback) = match config.status.file.trim() {
+        // Windows：預設的狀態目錄不安全時（一般使用者擁有或可寫、重新解析點；安全稽核 F4）不讀其中的
+        // 狀態檔——內容可能是偽造的，而且「取較新的」會讓它蓋過服務實際寫在 logs/ 的那一份
+        "" if crate::state_dir::verdict().is_err() => {
+            (located.base.join(sf::LEGACY_RELATIVE), None)
+        }
         "" => (
             args.instance
                 .map_or_else(sf::default_path, sf::instance_path),
