@@ -13,3 +13,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # kv：日誌的結構化欄位（`info!(event = "…", code = "…"; "…")`）；這個 feature 沒有額外的依賴
 log = { version = "0.4", features = ["std", "kv"] }
 serde_json = "1"
+
+# 只在 unix 上需要：診斷包讀檔時加 O_NOFOLLOW（安全稽核 N14）。libc 是 workspace 既有的依賴
+# （pulse 已使用），Cargo.lock 不新增外部套件
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

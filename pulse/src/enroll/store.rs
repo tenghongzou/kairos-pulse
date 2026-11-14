@@ -160,11 +160,16 @@ impl IdentityPaths {
     /// 取得 `identity/.lock` 的排他鎖；其他行程持有時回傳 `Ok(None)`
     pub fn try_lock(&self) -> io::Result<Option<IdentityLock>> {
         self.ensure_dir()?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock())?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(false).write(true);
+        // 安全稽核 N13：不跟隨符號連結——否則服務帳號把 identity/.lock 換成指向任意路徑的符號連結時，
+        // 以 root 執行 pulse enroll 會在該路徑建立一個 root 擁有的空檔案
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(self.lock())?;
         match file.try_lock() {
             Ok(()) => Ok(Some(IdentityLock { _file: file })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -654,5 +659,24 @@ mod tests {
         assert!(paths.try_lock().unwrap().is_none(), "已被持有");
         drop(first);
         assert!(paths.try_lock().unwrap().is_some(), "釋放後可再取得");
+    }
+
+    /// 安全稽核 N13：.lock 是符號連結時 try_lock 以 O_NOFOLLOW 開啟失敗，不跟隨連結在 root 身分下
+    /// 於任意路徑建立檔案
+    #[cfg(unix)]
+    #[test]
+    fn try_lock_does_not_follow_a_symlinked_lock_file() {
+        let base = temp_dir();
+        let paths = IdentityPaths::new(base.join("identity"));
+        // 一般情況：取得鎖後釋放（也建立了 identity 目錄與一般檔案的 .lock）
+        assert!(paths.try_lock().unwrap().is_some());
+        // 服務帳號把 .lock 換成指向外部路徑的符號連結
+        let target = base.join("outside-target");
+        remove_if_exists(&paths.lock()).unwrap();
+        std::os::unix::fs::symlink(&target, paths.lock()).unwrap();
+        // try_lock 失敗（Linux 為 ELOOP），且不跟隨連結建立 target
+        let err = paths.try_lock().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err:?}");
+        assert!(!target.exists(), "不應跟隨連結建立檔案");
     }
 }

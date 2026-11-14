@@ -195,7 +195,17 @@ pub fn log_files(
 /// 讀取檔案的最後 `max` bytes（截斷時從下一個換行開始，避免半行）；回傳 (內容, 是否截斷)
 pub fn read_tail(path: &Path, max: u64) -> std::io::Result<(String, bool)> {
     use std::io::{Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
+    // 安全稽核 N14：不跟隨符號連結——診斷命令可能以 root 執行（sudo pulse diag／kairos diag），
+    // 這些來源路徑可能位於服務帳號可寫的目錄；跟隨連結會把 /etc/shadow 等 root 檔案讀進診斷包。
+    // 來源是符號連結時 open 失敗，呼叫端略過該檔
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path)?;
     let len = f.metadata()?.len();
     let truncated = len > max;
     if truncated {
@@ -345,6 +355,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// 安全稽核 N14：read_tail 不跟隨符號連結（診斷命令可能以 root 執行，來源可能在服務帳號可寫的
+    /// 目錄，跟隨連結會把 root 檔案讀進診斷包）
+    #[cfg(unix)]
+    #[test]
+    fn read_tail_does_not_follow_symlinks() {
+        let dir = temp("nofollow");
+        let real = dir.join("secret");
+        std::fs::write(&real, "機密內容\n第二行\n").unwrap();
+        // 一般檔案照常讀得到
+        let (text, _) = read_tail(&real, 1024).unwrap();
+        assert!(text.contains("機密內容"), "{text}");
+        // 指向它的符號連結 → 以 O_NOFOLLOW 開啟失敗（Linux 為 ELOOP），診斷包不會把目標讀進來
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = read_tail(&link, 1024).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
