@@ -847,11 +847,11 @@ fn a_result_that_cannot_be_recorded_blocks_later_requests_instead_of_being_resum
     env.cleanup();
 }
 
-/// 現行行為（鎖住，不是期望的最終設計）：結果（`done`）寫不進紀錄，而且進行中交易的指標（`active.json`）
-/// **也刪不掉**（例如整個檔案系統變成唯讀：`state.json` 與指標的 unlink 一起失敗）。這次執行仍然回報
-/// 成功，但指標與停在 `replaced` 的紀錄都留著；之後的請求會**接續**這筆交易——期限早已過去，
-/// `after_replace` 直接判 `health_timeout`，把一個其實已完成的升級回滾。上一個測試的保護（指標刪得掉時以
-/// `state_unusable` 擋下）在這個情況不成立
+/// 結果（`done`）寫不進紀錄，而且進行中交易的指標（`active.json`）**也刪不掉**（例如整個檔案系統變成
+/// 唯讀：`state.json` 與指標的 unlink 一起失敗）。這次執行仍然回報成功，但指標與停在 `replaced` 的紀錄都
+/// 留著；之後的請求會**接續**這筆交易——期限早已過去，0.10.1 起（H4）接續時仍做與正常流程相同的健康確認：
+/// 新版 0.9.1 其實健康地在執行 → 回報 `succeeded`，不回滾一個其實已完成的升級（0.10.0 會直接以
+/// `health_timeout` 回滾）。上一個測試的保護（指標刪得掉時以 `state_unusable` 擋下）在這個情況不成立
 #[test]
 fn a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_resumed_later() {
     if running_as_root() {
@@ -884,13 +884,12 @@ fn a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_res
     let r = apply(&env.paths, &later).unwrap();
     assert_eq!(
         (r.state.as_str(), r.upgrade_id.as_str(), r.code.as_deref()),
-        ("rolled_back", ID, Some(codes::W_UPGRADE_ROLLED_BACK)),
+        ("succeeded", ID, Some(codes::I_UPGRADE_COMPLETED)),
         "{r:?}"
     );
+    // 期限已過仍做健康確認（H4）；request 的 OTHER_ID 與接續的交易不同 → 忽略並註記
     assert!(
-        r.detail.starts_with("health_timeout")
-            && !r.detail.contains("health_timeout (")
-            && r.detail.contains(NOTE_UPGRADE_ID_IGNORED),
+        r.detail.contains(NOTE_UPGRADE_ID_IGNORED),
         "{}",
         r.detail
     );
@@ -898,10 +897,10 @@ fn a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_res
         (r.from_version.as_str(), r.to_version.as_str()),
         ("0.9.0", "0.9.1")
     );
-    assert_eq!(env.installed(), "0.9.0", "已完成的升級被回滾");
+    assert_eq!(env.installed(), "0.9.1", "已完成且健康的升級沒有被回滾");
     assert!(
         later.calls().contains(&"restart".to_string()),
-        "{:?}",
+        "接續時補送還沒送出的重新啟動：{:?}",
         later.calls()
     );
     assert!(!env.active(), "這次交易結束，指標清除");
