@@ -335,9 +335,66 @@ pub fn effective(config: &AppConfig, rows: &[Row], secrets: Option<&SecretBox>) 
     }
 }
 
+/// 套用變更後，原本的 OTLP 標頭會不會被沿用到另一個端點（安全稽核 E2）。標頭「只能更換、不能檢視」，
+/// 但只改端點就沿用的話，等於可以把它送到任何地方看——包含設定檔 `headers_file` 的標頭（主控台連保存都
+/// 不保存）。`headers_provided`：這次請求有沒有提供新的標頭（空的清單也算：新的端點不帶標頭）
+pub fn carries_headers_to_new_endpoint(
+    before: &Effective,
+    after: &Effective,
+    headers_provided: bool,
+) -> bool {
+    before.otlp.endpoint.trim() != after.otlp.endpoint.trim()
+        && !after.headers.is_empty()
+        && !headers_provided
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 安全稽核 E2：端點改變時，主控台保存的標頭與 headers_file 的標頭都不能沿用
+    #[test]
+    fn changing_the_endpoint_does_not_carry_stored_headers_along() {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-export-e2-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("otlp-headers");
+        std::fs::write(&file, "X-Api-Key: file-secret\n").unwrap();
+        let mut c = AppConfig::default();
+        c.export.otlp.endpoint = "https://collector.example/v1/metrics".into();
+        c.export.otlp.headers_file = file.to_string_lossy().into_owned();
+        let before = effective(&c, &[], None);
+        assert_eq!(before.headers_from, HeadersFrom::File);
+        // 主控台只改端點：設定檔的標頭會跟著走
+        let moved = rows(&[(
+            KEY_OTLP_ENDPOINT,
+            json!("http://elsewhere.example/v1/metrics"),
+        )]);
+        let after = effective(&c, &moved, None);
+        assert_eq!(after.headers_from, HeadersFrom::File);
+        assert!(carries_headers_to_new_endpoint(&before, &after, false));
+        // 同一次請求提供了新的標頭（主控台的值取代 headers_file）：可以
+        assert!(!carries_headers_to_new_endpoint(&before, &after, true));
+        // 端點沒有變（只改別的設定）：不受影響
+        let same = rows(&[(KEY_OTLP_INTERVAL, json!(30))]);
+        assert!(!carries_headers_to_new_endpoint(
+            &before,
+            &effective(&c, &same, None),
+            false
+        ));
+        // 沒有任何標頭：端點可以自由修改
+        c.export.otlp.headers_file = String::new();
+        let before = effective(&c, &[], None);
+        assert!(!carries_headers_to_new_endpoint(
+            &before,
+            &effective(&c, &moved, None),
+            false
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn rows(list: &[(&str, Value)]) -> Vec<Row> {
         list.iter()

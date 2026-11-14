@@ -441,6 +441,46 @@ async fn update(
             "啟用 OTLP 時必須設定端點（例如 https://otel-collector:4318/v1/metrics）",
         ));
     }
+    // 端點改變時，原本的標頭不能沿用到新的端點（安全稽核 E2）：標頭只能更換、不能檢視，沿用就等於可以
+    // 把它送到任何地方看。主控台保存的與 headers_file 的都一樣（後者連主控台都不保存）
+    if xs::carries_headers_to_new_endpoint(&before, &after, matches!(header_names, Some(Some(_)))) {
+        let from_file = after.headers_from == xs::HeadersFrom::File;
+        let event = crate::audit::Event {
+            actor: actor.clone(),
+            actor_ip: Some(peer.ip().to_canonical().to_string()),
+            category: "settings",
+            action: "export.change",
+            object: Some("export".to_string()),
+            result: "rejected",
+            code: Some(CODE_EXPORT_CONFIG),
+            details: Some(json!({
+                "reason": "destination_changed",
+                "headers_source": if from_file { "file" } else { "console" },
+            })),
+        };
+        let _ = ctx
+            .admin
+            .write(move |c| {
+                let tx = c.begin(TxMode::Deferred)?;
+                event.append(&*tx, now_ms)?;
+                tx.commit()
+            })
+            .await;
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "export_secret_required",
+            if from_file {
+                "OTLP 端點已變更：export.otlp.headers_file 的標頭不能沿用到新的端點。請在同一次儲存中輸入這個端點要用的標頭（不需要標頭時送出空的清單），或改在 kairos.toml 修改端點"
+            } else {
+                "OTLP 端點已變更：原本保存的標頭不能沿用到新的端點。請在同一次儲存中重新輸入這個端點要用的標頭（不需要標頭時送出空的清單）"
+            },
+        )
+        .with_product_code(CODE_EXPORT_CONFIG)
+        .with_details(json!({
+            "parameter": KEY_OTLP_HEADERS,
+            "reason": "destination_changed",
+        })));
+    }
     // 稽核的差異（標頭只記名稱）
     let mut diff = serde_json::Map::new();
     for (k, _) in &changes {

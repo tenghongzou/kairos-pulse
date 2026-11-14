@@ -634,7 +634,8 @@ function renderDetail(ctx, id) {
         else load();
       } catch (err) {
         setBusy(saveBtn, false, true);
-        if (err.code === 'channel_invalid' || err.code === 'invalid_parameter') {
+        // channel_secret_required：目的地改變而沿用原本的機密（只能更換、不能檢視）——錯誤顯示在那個機密欄位
+        if (err.code === 'channel_invalid' || err.code === 'invalid_parameter' || err.code === 'channel_secret_required') {
           if (showParamError(err)) return;
         }
         const d = describe(err, { title: t('alerts.ch.saveFailed') });

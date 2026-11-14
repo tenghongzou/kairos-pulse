@@ -318,6 +318,9 @@ export function exportCard() {
       const ep = byK(K.otlpEndpoint);
       const epVal = ep.get();
       if (set(K.otlpEndpoint) && epVal && !/^https?:\/\/[^\s/]+/i.test(epVal)) fail(ep, t('exp.otlp.endpointInvalid'));
+      // 端點改變而沒有一併更換標頭：原本的標頭（只能更換、不能檢視）不能沿用到新的端點；伺服器同樣會拒絕
+      // （export_secret_required）。選「清除」時由伺服器判斷（清除後可能改用 headers_file 的標頭）
+      else if (K.otlpEndpoint in ch && (o.headers || []).length && !(K.otlpHeaders in ch)) fail(ep, t('exp.otlp.endpointNeedsHeaders'));
       const enabled = K.otlpEnabled in ch ? ch[K.otlpEnabled] : byK(K.otlpEnabled).initial;
       if (enabled && !epVal && !ep.el.disabled && ch[K.otlpEndpoint] !== null) fail(ep, t('exp.otlp.endpointMissing'));
       if (Array.isArray(ch[K.otlpHeaders]) && ch[K.otlpHeaders].some((x) => !HEADER_NAME.test(x.name) || !x.value)) {

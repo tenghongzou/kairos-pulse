@@ -975,6 +975,32 @@ async fn export_endpoints_over_https() {
         .status,
         403
     );
+    // 安全稽核 E2：只改端點、沿用已保存的標頭 → 拒絕，設定不變；清除標頭（null）也不行的情況由
+    // settings 的單元測試涵蓋（headers_file）
+    let r = call(
+        addr,
+        "PUT",
+        "/api/v1/export/settings",
+        Some(&admin),
+        Some(&json!({"otlp": {"endpoint": "http://127.0.0.1:9/v1/metrics"}, "reason": "搬家"})),
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    let e = r.json()["error"].clone();
+    assert_eq!(e["code"], "export_secret_required");
+    assert_eq!(e["details"]["parameter"], xs::KEY_OTLP_HEADERS);
+    assert_eq!(e["details"]["reason"], "destination_changed");
+    assert!(!String::from_utf8_lossy(&r.body).contains("otlp-secret-xyz"));
+    let r = request(addr, "GET", "/api/v1/export/settings", Some(&admin), &[]).await;
+    assert_eq!(r.json()["data"]["otlp"]["endpoint"], col.url(false));
+    let rejected: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE action = 'export.change' AND result = 'rejected'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected, 1, "被拒的端點變更寫入稽核");
     // 新的 report → collector
     let before = col.count();
     let outcome = crate::connection::store_report(

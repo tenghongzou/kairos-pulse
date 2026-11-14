@@ -309,6 +309,24 @@ export function register({ test, newPage, login, waitTitle, axe, shot, FakeAgent
       await page.getByRole('button', { name: '更換Webhook 網址' }).waitFor();
       await axe(page, '通知管道：設定與狀態');
       await shot(page, 'alert-channel-light');
+      // 安全稽核 E2：加上自訂標頭後只改網址（沿用標頭）→ 錯誤顯示在「自訂標頭」欄位，管道沒有變
+      await page.getByLabel('自訂標頭').fill('Authorization: Bearer e2e-header-secret');
+      await page.getByRole('button', { name: '儲存', exact: true }).click();
+      await page.getByText('已儲存「E2E Webhook」').waitFor();
+      await page.getByRole('button', { name: '更換自訂標頭' }).waitFor();
+      await page.getByRole('button', { name: '更換Webhook 網址' }).click();
+      await page.getByLabel('Webhook 網址').fill('http://127.0.0.1:9/elsewhere');
+      await page.getByRole('button', { name: '儲存', exact: true }).click();
+      await page.getByText('通知的目的地已變更', { exact: false }).waitFor();
+      await axe(page, '通知管道：目的地改變需重新輸入機密');
+      const kept = await page.evaluate(async (id) => (await (await fetch(`/api/v1/channels/${id}`)).json()).data.secrets.url, id);
+      assert.ok(kept.includes(`127.0.0.1:${server.address().port}`), `管道的網址不應改變：${kept}`);
+      const leaked = await page.evaluate(() => document.documentElement.outerHTML + Array.from(document.querySelectorAll('input, textarea')).map((i) => i.value).join(' '));
+      assert.ok(!leaked.includes('e2e-header-secret'), '標頭的值不應留在畫面上');
+      // 放棄這次修改（未儲存的變更：離開確認由重新載入略過）
+      page.once('dialog', (d) => d.accept());
+      await page.reload();
+      await waitTitle(page, 'E2E Webhook');
       // 已儲存的管道：60 秒內 3 次，第 4 次 429
       for (let i = 0; i < 3; i += 1) {
         await page.getByRole('button', { name: '寄送測試通知' }).click();
