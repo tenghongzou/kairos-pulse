@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use super::conn::{AsConn, forward};
 use crate::audit::{
-    Audit, AuditFilter, AuditKey, AuditLog, AuditRow, ChainBreak, GENESIS, HmacReport, META_ANCHOR,
-    META_HEAD, META_HMAC, META_LEGACY_SEALED, VerifyReport, compute_hash, ct_eq_str,
-    key_for_db_path, truncate,
+    Audit, AuditFilter, AuditKey, AuditLog, AuditRow, ChainBefore, ChainBreak, GENESIS, Head,
+    HmacReport, META_ANCHOR, META_HEAD, META_HMAC, META_LEGACY_SEALED, VerifyReport, check_head,
+    compute_hash, ct_eq_str, key_for_db_path, truncate,
 };
 
 /// 這個連線的資料庫所在資料目錄的金鑰（記憶體中的資料庫、沒有金鑰檔或無法讀取時為 `None`）
@@ -129,6 +129,7 @@ pub fn append_with_key(
     key: Option<&AuditKey>,
 ) -> rusqlite::Result<i64> {
     in_write_tx(conn, |conn| {
+        let before = chain_before(conn)?;
         conn.execute(
             "INSERT INTO audit_events (at, actor, actor_ip, category, action, object, result, code, details)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -152,15 +153,40 @@ pub fn append_with_key(
             seal_one(conn, id)?;
         }
         if let Some(k) = key {
-            sign_one(conn, id, k)?;
+            sign_one(conn, id, k, &before)?;
         }
         Ok(id)
     })
 }
 
+/// 寫入或清除之前鏈的狀態（在同一個寫入交易中讀取）
+fn chain_before(conn: &Connection) -> rusqlite::Result<ChainBefore> {
+    Ok(ChainBefore {
+        head: meta_get(conn, META_HEAD)?,
+        tail: tail(conn)?.map(|(id, hash, _)| (id, hash)),
+        anchor: anchor(conn)?,
+        since: hmac_since(conn)?,
+    })
+}
+
+/// head 與寫入前的狀態不一致時放回原本的值（[`ChainBefore::can_advance`]）
+fn restore_head(conn: &Connection, head: Option<&Value>) -> rusqlite::Result<()> {
+    match head {
+        Some(v) => meta_set(conn, META_HEAD, v),
+        None => conn
+            .execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])
+            .map(|_| ()),
+    }
+}
+
 /// 剛寫入的這一筆加上 HMAC；第一次時記下起點。金鑰與起點記錄的不同時不簽（驗證時以
 /// `hmac_key_mismatch` 指出，不用另一把金鑰把鏈「接續」下去）
-fn sign_one(conn: &Connection, id: i64, key: &AuditKey) -> rusqlite::Result<()> {
+fn sign_one(
+    conn: &Connection,
+    id: i64,
+    key: &AuditKey,
+    before: &ChainBefore,
+) -> rusqlite::Result<()> {
     match hmac_since(conn)? {
         Some((_, kid)) if kid != key.key_id() => return Ok(()),
         Some(_) => {}
@@ -183,11 +209,17 @@ fn sign_one(conn: &Connection, id: i64, key: &AuditKey) -> rusqlite::Result<()> 
     )?;
     let max: i64 = conn.query_row("SELECT max(id) FROM audit_events", [], |r| r.get(0))?;
     if max == id {
-        meta_set(
-            conn,
-            META_HEAD,
-            &json!({"id": id, "hash": hash, "mac": key.head_mac(id, &hash)}),
-        )?;
+        if before.can_advance(key) {
+            meta_set(
+                conn,
+                META_HEAD,
+                &Head::v2_json(key, (id, &hash), anchor(conn)?.as_ref()),
+            )?;
+        } else {
+            // 寫入前 head 就與鏈尾或錨點不一致：這一筆照常寫入並簽章，head 保留原狀，驗證會持續指出
+            log::debug!("稽核鏈的 head 與寫入前的鏈尾或錨點不一致，不更新 head（第 {id} 筆）");
+            restore_head(conn, before.head.as_ref())?;
+        }
     }
     Ok(())
 }
@@ -292,10 +324,22 @@ fn seal_null_rows(conn: &Connection) -> rusqlite::Result<usize> {
 
 /// 依保留期限清除 `before_ms` 之前的紀錄，並把被清除的最後一筆記為新的錨點；回傳清除的筆數
 pub fn purge(conn: &Connection, before_ms: i64, now_ms: i64) -> rusqlite::Result<usize> {
+    let key = key_for(conn);
+    purge_with_key(conn, before_ms, now_ms, key.as_deref())
+}
+
+/// [`purge`]，指定 HMAC 的金鑰：HMAC 已開始且金鑰相符時，新的錨點連同鏈尾一起簽進 head
+pub fn purge_with_key(
+    conn: &Connection,
+    before_ms: i64,
+    now_ms: i64,
+    key: Option<&AuditKey>,
+) -> rusqlite::Result<usize> {
     in_write_tx(conn, |conn| {
         if meta_get(conn, META_LEGACY_SEALED)?.is_none() {
             seal_legacy_in_tx(conn)?;
         }
+        let before = chain_before(conn)?;
         // 只清除「從頭開始、時間早於門檻」的連續一段，鏈的開頭只會往後移
         let last: Option<(i64, String)> = conn
             .query_row(
@@ -320,8 +364,23 @@ pub fn purge(conn: &Connection, before_ms: i64, now_ms: i64) -> rusqlite::Result
             // 全部清除：最新一筆就是錨點（下一筆接在它之後）
             let left: i64 =
                 conn.query_row("SELECT count(*) FROM audit_events", [], |r| r.get(0))?;
-            if left == 0 {
-                conn.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])?;
+            match key.filter(|k| before.signs_with(k)) {
+                // HMAC 已開始：錨點連同鏈尾簽進 head。清除前 head 就不一致時保留原狀（驗證會指出）
+                Some(k) => {
+                    if before.can_advance(k) {
+                        let tail = match (&before.tail, left) {
+                            (Some((tid, Some(th))), 1..) => (*tid, th.as_str()),
+                            _ => (id, hash.as_str()),
+                        };
+                        let new_anchor = (id, hash.clone());
+                        meta_set(conn, META_HEAD, &Head::v2_json(k, tail, Some(&new_anchor)))?;
+                    }
+                }
+                None => {
+                    if left == 0 {
+                        conn.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])?;
+                    }
+                }
             }
         }
         Ok(n)
@@ -353,13 +412,7 @@ pub fn verify_with_key(
 
 fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Result<VerifyReport> {
     let anchor = anchor(conn)?;
-    let head_meta = meta_get(conn, META_HEAD)?;
-    let head = head_meta
-        .as_ref()
-        .and_then(|v| Some((v.get("id")?.as_i64()?, v.get("hash")?.as_str()?.to_string())));
-    let head_mac = head_meta
-        .as_ref()
-        .and_then(|v| v.get("mac")?.as_str().map(str::to_string));
+    let head = meta_get(conn, META_HEAD)?.as_ref().and_then(Head::parse);
     let since = hmac_since(conn)?;
     // 能否逐筆驗證 HMAC：有起點、有金鑰且與起點記錄的相同
     let key_state = match (&since, key) {
@@ -448,24 +501,19 @@ fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Re
         report.last_hash = Some(h.clone());
         prev = Some(h.clone());
     }
-    if report.broken.is_none()
-        && let Some((hid, hh)) = head
-    {
-        let mut ok =
-            report.last_id == Some(hid) && report.last_hash.as_deref() == Some(hh.as_str());
-        // HMAC 開始之後的 head 必須帶正確的 mac（沒有金鑰無法把 head 改成較早的一筆）
-        if ok
-            && let (Some((sid, _)), Some(k)) = (&since, check_mac)
-            && hid >= *sid
-        {
-            ok = head_mac
-                .as_deref()
-                .is_some_and(|m| ct_eq_str(m, &k.head_mac(hid, &hh)));
-        }
-        if !ok {
+    // head：鏈尾與錨點（HMAC 開始之後必須存在、mac 正確；[`check_head`]）
+    if report.broken.is_none() {
+        let tail = report.last_id.zip(report.last_hash.as_deref());
+        let sid = since.as_ref().map(|s| s.0);
+        if let Err(reason) = check_head(head.as_ref(), tail, anchor.as_ref(), sid, check_mac) {
             report.broken = Some(ChainBreak {
-                id: hid,
-                reason: "head_mismatch",
+                id: head
+                    .as_ref()
+                    .map(Head::tail_id)
+                    .or(report.last_id)
+                    .or(sid)
+                    .unwrap_or(0),
+                reason,
                 at: None,
             });
         }
@@ -489,10 +537,9 @@ fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Re
         }
     }
     if key_state == "verified"
-        && report
-            .broken
-            .as_ref()
-            .is_some_and(|b| b.reason.contains("hmac") || b.reason == "head_mismatch")
+        && report.broken.as_ref().is_some_and(|b| {
+            b.reason.contains("hmac") || b.reason == "head_mismatch" || b.at.is_none()
+        })
     {
         report.hmac.status = "failed";
     }
@@ -909,10 +956,207 @@ mod tests {
         assert_eq!(r.hmac.since_id, Some(4));
         assert_eq!((r.hmac.verified, r.hmac.chain_only), (2, 3));
         // 保留期限清除到起點之後也能驗證
-        assert_eq!(purge(&conn, 4, 99).unwrap(), 4);
+        assert_eq!(purge_with_key(&conn, 4, 99, Some(&k)).unwrap(), 4);
         let r = verify_with_key(&conn, Some(&k)).unwrap();
         assert!(r.ok(), "{r:?}");
         assert_eq!((r.hmac.verified, r.hmac.chain_only), (1, 0));
+    }
+
+    fn signed_chain(n: i64, k: &AuditKey) -> Connection {
+        let conn = db();
+        for i in 0..n {
+            append_with_key(&conn, i * 1000, &ev("a", None), Some(k)).unwrap();
+        }
+        assert!(verify_with_key(&conn, Some(k)).unwrap().ok());
+        conn
+    }
+
+    fn broken(conn: &Connection, k: &AuditKey) -> Option<&'static str> {
+        verify_with_key(conn, Some(k))
+            .unwrap()
+            .broken
+            .map(|b| b.reason)
+    }
+
+    // 安全稽核 E1：刪掉最後幾筆、連 head 一起刪掉，驗證不再回報完整
+    #[test]
+    fn deleting_the_tail_together_with_the_head_is_detected() {
+        let k = AuditKey::from_bytes(&[8u8; 32]);
+        let conn = signed_chain(5, &k);
+        conn.execute("DELETE FROM audit_events WHERE id > 3", [])
+            .unwrap();
+        assert_eq!(broken(&conn, &k), Some("head_mismatch"), "head 還在");
+        conn.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])
+            .unwrap();
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert_eq!(
+            r.broken.as_ref().map(|b| b.reason),
+            Some("head_mismatch"),
+            "{r:?}"
+        );
+        assert_eq!(r.hmac.status, "failed");
+        // 沒有金鑰的人寫不出第 2 版 head 的 mac；把 head 改成第 1 版的樣子也不行
+        let h3: String = conn
+            .query_row("SELECT hash FROM audit_events WHERE id = 3", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        meta_set(&conn, META_HEAD, &json!({"id": 3, "hash": h3})).unwrap();
+        assert_eq!(broken(&conn, &k), Some("head_mismatch"));
+        meta_set(
+            &conn,
+            META_HEAD,
+            &json!({"v": 2, "tail_id": 3, "tail_hash": h3, "anchor_id": null, "anchor_hash": null, "mac": "00"}),
+        )
+        .unwrap();
+        assert_eq!(broken(&conn, &k), Some("head_mismatch"));
+        // 連最後一筆有 HMAC 的紀錄都刪掉、head 也刪掉：HMAC 開始之後 head 一定存在
+        let conn = signed_chain(3, &k);
+        conn.execute("DELETE FROM audit_events", []).unwrap();
+        conn.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])
+            .unwrap();
+        assert_eq!(broken(&conn, &k), Some("head_mismatch"));
+    }
+
+    // 安全稽核 E1：刪掉最後幾筆之後，Kairos 再寫入也不會把 head「修好」
+    #[test]
+    fn a_later_append_or_purge_does_not_heal_a_truncated_chain() {
+        let k = AuditKey::from_bytes(&[9u8; 32]);
+        for delete_head in [false, true] {
+            let conn = signed_chain(5, &k);
+            conn.execute("DELETE FROM audit_events WHERE id > 3", [])
+                .unwrap();
+            if delete_head {
+                conn.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])
+                    .unwrap();
+            }
+            // 之後的寫入照常進行（紀錄有雜湊與 HMAC），但驗證持續指出
+            for i in 0..3 {
+                append_with_key(&conn, 9000 + i, &ev("b", None), Some(&k)).unwrap();
+                assert_eq!(
+                    broken(&conn, &k),
+                    Some("head_mismatch"),
+                    "delete_head={delete_head}"
+                );
+            }
+            let signed: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM audit_events WHERE hmac IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(signed, 6);
+            // 保留期限清除也不會
+            assert_eq!(purge_with_key(&conn, 1500, 99_000, Some(&k)).unwrap(), 2);
+            assert!(broken(&conn, &k).is_some());
+        }
+    }
+
+    // 安全稽核 E1：刪掉最前面幾筆並改寫錨點，驗證不再回報完整
+    #[test]
+    fn deleting_the_oldest_rows_and_forging_the_anchor_is_detected() {
+        let k = AuditKey::from_bytes(&[10u8; 32]);
+        let hash_of = |conn: &Connection, id: i64| -> String {
+            conn.query_row("SELECT hash FROM audit_events WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // 沒有清除過：偽造一個錨點
+        let conn = signed_chain(6, &k);
+        let h2 = hash_of(&conn, 2);
+        conn.execute("DELETE FROM audit_events WHERE id <= 2", [])
+            .unwrap();
+        meta_set(
+            &conn,
+            META_ANCHOR,
+            &json!({"id": 2, "hash": h2, "purged_at": 1, "purged": 2}),
+        )
+        .unwrap();
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert_eq!(
+            r.broken.as_ref().map(|b| b.reason),
+            Some("anchor_mismatch"),
+            "{r:?}"
+        );
+        assert_eq!(r.hmac.status, "failed");
+        // 之後的寫入與清除不會把它「修好」
+        append_with_key(&conn, 9000, &ev("b", None), Some(&k)).unwrap();
+        assert!(broken(&conn, &k).is_some());
+        purge_with_key(&conn, 3500, 99_000, Some(&k)).unwrap();
+        assert!(broken(&conn, &k).is_some());
+
+        // 清除過：把錨點往後移
+        let conn = signed_chain(8, &k);
+        assert_eq!(purge_with_key(&conn, 2000, 50_000, Some(&k)).unwrap(), 2);
+        assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
+        let h5 = hash_of(&conn, 5);
+        conn.execute("DELETE FROM audit_events WHERE id <= 5", [])
+            .unwrap();
+        meta_set(
+            &conn,
+            META_ANCHOR,
+            &json!({"id": 5, "hash": h5, "purged_at": 2, "purged": 3}),
+        )
+        .unwrap();
+        assert_eq!(broken(&conn, &k), Some("anchor_mismatch"));
+        // 刪掉錨點（想回到「沒有清除過」）：剩下的第一筆接不上起點
+        let conn = signed_chain(8, &k);
+        assert_eq!(purge_with_key(&conn, 2000, 50_000, Some(&k)).unwrap(), 2);
+        conn.execute("DELETE FROM meta WHERE key = ?1", [META_ANCHOR])
+            .unwrap();
+        assert_eq!(broken(&conn, &k), Some("anchor_mismatch"));
+    }
+
+    // E1 的相容：正常的寫入、清除（含全部清除）在第 2 版 head 下都能驗證；0.11.0 以前寫的第 1 版 head
+    // 照常接受，下一次寫入時換成第 2 版
+    #[test]
+    fn signed_head_follows_appends_purges_and_upgrades_from_the_old_format() {
+        let k = AuditKey::from_bytes(&[11u8; 32]);
+        let head = |conn: &Connection| meta_get(conn, META_HEAD).unwrap().unwrap();
+        let conn = signed_chain(6, &k);
+        assert_eq!(head(&conn)["v"], 2);
+        assert!(
+            head(&conn).get("id").is_none(),
+            "舊版的驗證讀不到 id／hash，會略過 head 而不是誤報"
+        );
+        assert_eq!(purge_with_key(&conn, 2000, 50_000, Some(&k)).unwrap(), 2);
+        assert_eq!(head(&conn)["anchor_id"], 2);
+        assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
+        append_with_key(&conn, 60_000, &ev("b", None), Some(&k)).unwrap();
+        assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
+        // 全部清除：head 的鏈尾＝錨點；下一筆接在錨點之後
+        assert_eq!(
+            purge_with_key(&conn, i64::MAX, 70_000, Some(&k)).unwrap(),
+            5
+        );
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(head(&conn)["tail_id"], head(&conn)["anchor_id"]);
+        append_with_key(&conn, 80_000, &ev("c", None), Some(&k)).unwrap();
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert!(r.ok(), "{r:?}");
+        // 全部清除後連 head 一起刪掉：不是完整的
+        purge_with_key(&conn, i64::MAX, 90_000, Some(&k)).unwrap();
+        conn.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])
+            .unwrap();
+        assert_eq!(broken(&conn, &k), Some("head_mismatch"));
+
+        // 0.11.0 以前的 head（第 1 版，mac 只涵蓋鏈尾）
+        let conn = signed_chain(3, &k);
+        let (id, hash, _) = tail(&conn).unwrap().unwrap();
+        let hash = hash.unwrap();
+        meta_set(
+            &conn,
+            META_HEAD,
+            &json!({"id": id, "hash": hash, "mac": k.head_mac(id, &hash)}),
+        )
+        .unwrap();
+        assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
+        append_with_key(&conn, 5000, &ev("b", None), Some(&k)).unwrap();
+        assert_eq!(head(&conn)["v"], 2);
+        assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
     }
 
     #[test]

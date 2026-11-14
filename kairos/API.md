@@ -1177,7 +1177,7 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
 
 - JSON 為 serde_json 的精簡格式（沒有空白，非 ASCII 原樣以 UTF-8 輸出），`details` 是資料庫中保存的**字串本身**（匯出的 `details_raw`），沒有值時為 `null`；`at` 為 Unix 毫秒（匯出的 `at_ms`）；雜湊為小寫十六進位。第一筆的 `prev_hash` 為 64 個 `0`。
 - 寫入一律經由 `audit::append`：先 INSERT 取得寫入鎖再計算，Kairos、主控台與 CLI 同時寫入也不會分岔；與被記錄的變更在**同一個交易**中（例如建立使用者與它的稽核要嘛都寫入、要嘛都沒有）。
-- 保留期限（`audit.retention_days`，預設 1,095 天＝3 年，獨立於 report 的保留天數）每小時清除最舊的一段，被清除的最後一筆的雜湊記在 `meta.audit_chain_anchor`，剩下的第一筆必須接在它之後；最新一筆記在 `meta.audit_chain_head`，只刪除最後幾筆也會被發現。
+- 保留期限（`audit.retention_days`，預設 1,095 天＝3 年，獨立於 report 的保留天數）每小時清除最舊的一段，被清除的最後一筆的雜湊記在 `meta.audit_chain_anchor`，剩下的第一筆必須接在它之後；最新一筆記在 `meta.audit_chain_head`，只刪除最後幾筆也會被發現（這兩個指標要到有 HMAC 之後才有保護，見下方「head 與錨點的保護」）。
 - 0.5 寫入的紀錄（沒有雜湊）在升級後**第一次**寫入或驗證時依 id 順序補上，並記在 `meta.audit_legacy_sealed`；之後每次寫入只計算它自己那一筆。繞過程式直接插入資料庫、沒有雜湊的紀錄不會被下一次寫入接進鏈中，驗證時以 `missing_hash` 指出。
 - 驗證在同一個讀取交易（同一個快照）中進行，驗證期間的寫入不會造成假的斷點。
 - 被拒絕的寫入請求（`access.denied`）同一個執行者每分鐘最多記 20 筆，超過的筆數併入下一筆的 `details.suppressed_since_last`（避免低權限的身分以大量請求灌爆稽核表）。
@@ -1187,13 +1187,18 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
   - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
   - **自我驗證**：每 `audit.verify_interval_hours` 小時（預設 24，第一次在啟動後 1 分鐘）重新計算整條鏈與 HMAC，寫一筆 `audit.verify`（執行者 `system`，`details.via = "self_check"`），並發布內部事件；失敗時記 `ERROR`（`audit.chain_broken`）且告警引擎開系統規則「稽核日誌完整性」（`sys.audit_integrity`，緊急，`KRS-E6201`），下一次驗證通過時恢復。
   - **列表的 `meta.integrity`**（0.8；`audit:read` 的第一頁，只看自己操作的身分為 `null`）：`hmac_since_id`（目前的 HMAC 起點，尚未開始為 `null`）與 `last_verify`（最近一筆 `audit.verify`：`at`、`actor`、`result`、`self_check`、`checked`、`broken`、`hmac_since_id`），主控台 S18 頁首「完整性：✓ 已驗證至 …（雜湊鏈連續；HMAC 自第 N 筆起）」的來源。`audit.verify` 的 `details` 0.8 起另帶 `hmac`（狀態）與 `hmac_since_id`。
-  - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；重播先前抄下的 head 也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
+  - **head 與錨點的保護**（0.11.0 之後的版本；不需要 schema 變更）：0.7～0.11.0 的 `meta.audit_chain_head` 的 `mac` 只涵蓋鏈尾，驗證也不要求 head 存在；`meta.audit_chain_anchor` 沒有任何保護。能改寫資料庫但沒有 HMAC 金鑰的人因此可以刪掉最後幾筆並把 head 一起刪掉，或刪掉最前面幾筆並改寫錨點，驗證都回報完整。現在：
+    - head 改為第 2 版：`{"v":2,"tail_id","tail_hash","anchor_id","anchor_hash","mac"}`，`mac = HMAC-SHA256(K, "kairos-audit-head/v2\n" ‖ tail_id ‖ "\n" ‖ tail_hash ‖ "\n" ‖ (anchor_id ‖ "\n" ‖ anchor_hash，沒有清除過時為 "-"))`。有金鑰的每一次寫入與保留期限清除都重寫它；全部清除時鏈尾就是錨點。
+    - 驗證：HMAC 開始之後 head **必須存在**（不存在＝`head_mismatch`）；鏈尾、head 內的錨點與 `meta.audit_chain_anchor` 三者必須一致（錨點不一致＝`anchor_mismatch`），`mac` 必須正確。
+    - 寫入端不「修復」：寫入或清除之前 head 與鏈尾、錨點不一致（或 `mac` 不對）時，這一筆照常寫入並簽章，但 head 保留原狀——否則刪尾或改寫錨點之後，只要 Kairos 再寫一筆，痕跡就消失。所以一旦出現 `head_mismatch`／`anchor_mismatch`，之後每一次驗證都會指出，直到從備份還原。
+    - **升級與相容**：升級前寫的第 1 版 head（`{"id","hash","mac"}`）照常接受，升級後第一次寫入時換成第 2 版；在那之前錨點仍沒有保護。第 2 版用了不同的欄位名稱，0.11.0（含）以前的程式讀不到 `id`／`hash`、會略過 head 的檢查（不會誤報，但也沒有刪尾的偵測）。**降版到 0.11.0（含）以前再升回來**：舊版的保留期限清除只改錨點、不更新 head，若清除之後、升回新版之前沒有任何新的稽核紀錄，新版會回報 `anchor_mismatch`（舊版只要再寫過一筆就不會）；要降版請從備份還原，或在升回新版之前確認舊版已寫入新的稽核紀錄。
+  - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；把整個資料庫的稽核部分（紀錄、head、錨點）一起換回先前抄下的一份——也就是重播——也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/audit` | `audit:read`；只有 `audit:read_own` 時固定為自己的操作（`meta.own_only: true`） | `actor`、`category`、`action`（完全相同，或以 `.` 結尾為前綴：`user.`）、`target`（對象片段，不分大小寫）、`result`、`from`／`to`（RFC 3339）、`limit`（1～1000，預設 100）、`cursor`（新到舊，`page.next_cursor`）。每筆含 `prev_hash`、`hash` |
 | `GET /api/v1/audit/export` | `audit:export` | 同樣的篩選，`application/x-ndjson`：每行一筆（`type: "event"`，另有 `at_ms`、`details_raw`，可只靠該行重新計算雜湊；0.7 另有 `hmac`），最後一行 `type: "chain"`（`count`、`first_id`、`first_prev_hash`、`last_id`、`last_hash`；CLI 的匯出另有 `hmac_since`）。只以時間篩選時是連續的一段鏈，可整段驗證 |
-| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈與 HMAC：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch`／`head_mismatch` 最後幾筆被刪除／0.7 的 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`；`product_code: KRS-E6201`）、`hmac`（`status`：`not_started`／`verified`／`key_unavailable`／`key_mismatch`／`failed`，`since_id`、`key_id`、`verified`、`chain_only`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
+| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈與 HMAC：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch` 最前面幾筆被刪除、或錨點被改寫／`head_mismatch` 最後幾筆被刪除、或 head 被刪除或改寫／0.7 的 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`；`product_code: KRS-E6201`）、`hmac`（`status`：`not_started`／`verified`／`key_unavailable`／`key_mismatch`／`failed`，`since_id`、`key_id`、`verified`、`chain_only`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
 
 沒有修改或刪除的端點（`PUT`／`DELETE` 回 405）；CLI 也沒有。
 

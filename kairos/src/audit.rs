@@ -122,6 +122,31 @@ impl AuditKey {
         hex(ctx.sign().as_ref())
     }
 
+    /// 第 2 版 `meta.audit_chain_head` 的 HMAC：除了鏈尾，也涵蓋保留期限清除的錨點（沒有清除過時為
+    /// `None`）。沒有金鑰的人因此不能改寫錨點來掩蓋「刪除最前面幾筆」
+    pub fn head_mac_v2(
+        &self,
+        tail_id: i64,
+        tail_hash: &str,
+        anchor: Option<(i64, &str)>,
+    ) -> String {
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        ctx.update(b"kairos-audit-head/v2\n");
+        ctx.update(tail_id.to_string().as_bytes());
+        ctx.update(b"\n");
+        ctx.update(tail_hash.as_bytes());
+        ctx.update(b"\n");
+        match anchor {
+            Some((id, hash)) => {
+                ctx.update(id.to_string().as_bytes());
+                ctx.update(b"\n");
+                ctx.update(hash.as_bytes());
+            }
+            None => ctx.update(b"-"),
+        }
+        hex(ctx.sign().as_ref())
+    }
+
     /// 讀取資料目錄的金鑰檔；不存在時為 `Ok(None)`（不建立）
     pub fn load(data_dir: &Path) -> Result<Option<Self>, Error> {
         let path = data_dir.join(KEY_FILE);
@@ -182,6 +207,181 @@ impl AuditKey {
                 format!("無法建立 {}: {e}", path.display()),
             )),
         }
+    }
+}
+
+/// `meta.audit_chain_head` 的內容（兩個後端共用的解析與判斷）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Head {
+    /// 第 1 版（0.11.0 以前，以及沒有金鑰時的寫入）：`{"id","hash"[,"mac"]}`。`mac` 只涵蓋鏈尾
+    V1 {
+        id: i64,
+        hash: String,
+        mac: Option<String>,
+    },
+    /// 第 2 版：`{"v":2,"tail_id","tail_hash","anchor_id","anchor_hash","mac"}`。`mac` 涵蓋鏈尾與錨點
+    /// （[`AuditKey::head_mac_v2`]）。欄位名稱與第 1 版不同：舊版的驗證讀不到 `id`／`hash`，會略過 head
+    /// 的檢查而不是誤報
+    V2 {
+        tail_id: i64,
+        tail_hash: String,
+        anchor: Option<(i64, String)>,
+        mac: String,
+    },
+}
+
+impl Head {
+    /// 解析 `meta` 中的值；兩種格式都不是時為 `None`（與沒有 head 相同）
+    pub fn parse(v: &Value) -> Option<Self> {
+        if v.get("v").and_then(Value::as_i64) == Some(2) {
+            let anchor = match (
+                v.get("anchor_id").and_then(Value::as_i64),
+                v.get("anchor_hash").and_then(Value::as_str),
+            ) {
+                (Some(id), Some(hash)) => Some((id, hash.to_string())),
+                _ => None,
+            };
+            return Some(Head::V2 {
+                tail_id: v.get("tail_id")?.as_i64()?,
+                tail_hash: v.get("tail_hash")?.as_str()?.to_string(),
+                anchor,
+                mac: v.get("mac")?.as_str()?.to_string(),
+            });
+        }
+        Some(Head::V1 {
+            id: v.get("id")?.as_i64()?,
+            hash: v.get("hash")?.as_str()?.to_string(),
+            mac: v.get("mac").and_then(Value::as_str).map(str::to_string),
+        })
+    }
+
+    /// 第 2 版 head 的 JSON。`tail`：最新一筆；全部被保留期限清除時為錨點本身
+    pub fn v2_json(key: &AuditKey, tail: (i64, &str), anchor: Option<&(i64, String)>) -> Value {
+        let a = anchor.map(|(id, h)| (*id, h.as_str()));
+        json!({
+            "v": 2,
+            "tail_id": tail.0,
+            "tail_hash": tail.1,
+            "anchor_id": a.map(|a| a.0),
+            "anchor_hash": a.map(|a| a.1),
+            "mac": key.head_mac_v2(tail.0, tail.1, a),
+        })
+    }
+
+    /// head 記錄的鏈尾 id（斷點的位置）
+    pub fn tail_id(&self) -> i64 {
+        match self {
+            Head::V1 { id, .. } => *id,
+            Head::V2 { tail_id, .. } => *tail_id,
+        }
+    }
+}
+
+/// head 與資料庫的現況是否一致（寫入端：能不能把 head 往前推；驗證端：回報斷點的原因）。
+///
+/// - `tail`：最新一筆的 (id, hash)；沒有紀錄時為 `None`
+/// - `anchor`：`meta.audit_chain_anchor`
+/// - `since_id`：`meta.audit_hmac.since_id`（HMAC 的起點）
+/// - `key`：**可以用來驗證**的金鑰（與起點記錄的 `key_id` 相同）；`None` 時不比對 mac
+///
+/// 規則：
+/// - HMAC 開始之後 head 一定存在（有金鑰的每一次寫入與清除都會更新它）；不存在表示被刪除。
+/// - 第 2 版：鏈尾相符（沒有紀錄時鏈尾＝錨點）、head 內的錨點與 `meta` 的錨點相同、mac 正確。
+/// - 第 1 版（舊版寫入的）：鏈尾相符；鏈尾在 HMAC 起點之後時 mac 正確。錨點不在保護範圍內，
+///   新版第一次寫入時換成第 2 版。
+pub fn check_head(
+    head: Option<&Head>,
+    tail: Option<(i64, &str)>,
+    anchor: Option<&(i64, String)>,
+    since_id: Option<i64>,
+    key: Option<&AuditKey>,
+) -> Result<(), &'static str> {
+    match head {
+        None if since_id.is_some() => Err("head_mismatch"),
+        None => Ok(()),
+        Some(Head::V1 { id, hash, mac }) => {
+            if tail != Some((*id, hash.as_str())) {
+                return Err("head_mismatch");
+            }
+            if let (Some(sid), Some(k)) = (since_id, key)
+                && *id >= sid
+                && !mac
+                    .as_deref()
+                    .is_some_and(|m| ct_eq_str(m, &k.head_mac(*id, hash)))
+            {
+                return Err("head_mismatch");
+            }
+            Ok(())
+        }
+        Some(Head::V2 {
+            tail_id,
+            tail_hash,
+            anchor: signed_anchor,
+            mac,
+        }) => {
+            let signed = signed_anchor.as_ref().map(|(id, h)| (*id, h.as_str()));
+            if let Some(k) = key
+                && !ct_eq_str(mac, &k.head_mac_v2(*tail_id, tail_hash, signed))
+            {
+                return Err("head_mismatch");
+            }
+            if signed_anchor.as_ref() != anchor {
+                return Err("anchor_mismatch");
+            }
+            // 沒有紀錄：全部被保留期限清除，鏈尾就是錨點
+            let expected_tail = tail.or(signed);
+            if expected_tail != Some((*tail_id, tail_hash.as_str())) {
+                return Err("head_mismatch");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 寫入或清除之前鏈的狀態：有金鑰的寫入者據此決定能不能把 head 往前推
+#[derive(Debug, Clone, Default)]
+pub struct ChainBefore {
+    /// `meta.audit_chain_head` 原本的值
+    pub head: Option<Value>,
+    /// 最新一筆的 (id, hash)
+    pub tail: Option<(i64, Option<String>)>,
+    pub anchor: Option<(i64, String)>,
+    /// `meta.audit_hmac`：(since_id, key_id)
+    pub since: Option<(i64, String)>,
+}
+
+impl ChainBefore {
+    /// 這把金鑰是不是 HMAC 起點記錄的那一把（還沒開始時不是）
+    pub fn signs_with(&self, key: &AuditKey) -> bool {
+        self.since
+            .as_ref()
+            .is_some_and(|(_, kid)| kid == key.key_id())
+    }
+
+    /// 能不能把 head 更新成新的狀態。HMAC 還沒開始時一律可以（之前的 head 本來就沒有保護）；開始之後
+    /// 原本的 head 必須與原本的鏈尾、錨點一致且 mac 正確。**不一致時不更新**：否則刪掉最後幾筆（或改寫
+    /// 錨點）之後，只要 Kairos 再寫一筆，head 就被「修好」、痕跡消失
+    pub fn can_advance(&self, key: &AuditKey) -> bool {
+        let Some((sid, kid)) = &self.since else {
+            return true;
+        };
+        if kid != key.key_id() {
+            return false;
+        }
+        let tail = match &self.tail {
+            Some((id, Some(h))) => Some((*id, h.as_str())),
+            Some((_, None)) => return false,
+            None => None,
+        };
+        let head = self.head.as_ref().and_then(Head::parse);
+        check_head(
+            head.as_ref(),
+            tail,
+            self.anchor.as_ref(),
+            Some(*sid),
+            Some(key),
+        )
+        .is_ok()
     }
 }
 
