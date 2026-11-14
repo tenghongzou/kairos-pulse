@@ -533,7 +533,7 @@ stateDiagram-v2
 | `waves` | 分批：每批 `size`（台數或剩餘可升級主機的百分比）、`soak_minutes`（這批全部結束後的觀察時間）、`max_failure_ratio`（超過即暫停）、`manual_continue`（觀察期滿後是否要人工按「繼續」） |
 | `canary_agent_ids` | 選用：指定第一批的主機（沒有指定時第一批依下述順序取前 N 台） |
 | `max_in_progress` | 同時在下載到確認之間的主機數上限（預設 50，1～1000），另受 `[remote] max_concurrent_downloads` 限制 |
-| `schedule` | `starts_at`、`ends_at`（選用）、`windows[]`（每週的時段：`days`、`start`、`end`，跨午夜可）、`timezone`（IANA，預設 Kairos 的 `alerts.timezone` 或 `Asia/Taipei`） |
+| `schedule` | `starts_at`、`ends_at`（選用）、`windows[]`（每週的時段：`days`、`start`、`end`，跨午夜可）、`timezone`（IANA 時區名稱，例如 `Asia/Taipei`、`Europe/Berlin`，或固定位移 `+08:00`；預設 Kairos 的 `alerts.timezone`，沒有設定時 `+08:00`。日光節約時間的規則見第 4.7.5 節） |
 | `allow_downgrade`、`allow_no_rollback` | 第 4.8 節、第 4.4.2 節；L3／L2 確認 |
 | `health_timeout_secs` | 預設 600 |
 
@@ -579,6 +579,36 @@ stateDiagram-v2
 > 〔離線告警的自動抑制已在 0.10.0 實作，做法與差異見第 13.1 節「升級中主機的離線告警抑制」〕
 
 推送的 `windows` 是「允許開始替換的時段」，與告警的維護時段（`alert_silences` 的 `maintenance`）是不同的東西；但推送中的主機在替換到健康確認之間（`applying`）**自動抑制**該主機的離線類告警（等同於針對該主機、持續到確認結束或 `health_timeout_secs + 10 分鐘` 的靜音，事件時間軸註明「升級中」），避免每台主機升級都觸發離線告警。
+
+##### 時段的時區與日光節約時間（0.10.1 之後的版本）
+
+`schedule.timezone` 接受兩種寫法：
+
+- **IANA 時區名稱**（`Asia/Taipei`、`Europe/Berlin`、`America/New_York`、`Australia/Sydney`…）：時區資料庫中的任何名稱（含連結的舊名，例如 `Asia/Calcutta`），大小寫必須完全相同，Kairos 原樣保存。時段依該時區**當地的牆上時鐘**計算，日光節約時間的切換依下面的規則處理，操作者不必在換季時調整時段。
+- **固定位移**（`+08:00`、`-05:30`、`UTC`、`Z`；0.10.0 的寫法）：照舊，沒有日光節約時間。已經存在資料庫裡的推送不受影響。
+
+其他的值（不存在的名稱、大小寫不同、`+8`、`GMT+8` 之類）在建立、修改與預覽時 400 `invalid_parameter`（`parameter: "schedule.timezone"`）。`starts_at`、`ends_at` 是絕對時間（RFC 3339，自帶位移），不受 `timezone` 影響。只有推送的升級時段支援時區名稱；告警的 `alerts.timezone` 仍是固定位移（沒有指定 `timezone` 的推送以它為預設）。
+
+**時區資料庫**：Kairos 以 `chrono-tz` 把 IANA 時區資料庫**編進執行檔**（0.10.4 內含 tzdb 2025b；預覽 API 的 `timezone.tzdb` 回報實際的版本），不讀主機的 `/usr/share/zoneinfo`、不連網路。
+
+- 選擇的理由：專案的時間型別本來就是 `chrono` 0.4，`chrono-tz` 直接實作 `chrono::TimeZone`，只多 3 個套件（`chrono-tz`、`phf`、`phf_shared`，授權 MIT／Apache-2.0，`cargo deny check` 的允許清單不必修改）；資料是 crate 內預先產生的 Rust 原始碼，**沒有建置時的程式碼產生**（不啟用 `filter-by-regex`、`case-insensitive`），因此同一個 `Cargo.lock` 在任何平台建置出的時區資料完全相同，發佈包維持可重現；Linux（含 musl 靜態連結）與 Windows 的行為相同。代價是 Kairos 的執行檔變大（內嵌約 600 個時區的規則）。
+- 沒有採用 `jiff`：它是另一套完整的時間函式庫（專案要同時帶兩套時間型別），在 Unix 上預設讀取主機的 `/usr/share/zoneinfo`——同一個推送在兩台 Kairos（或叢集的兩個節點）上可能因為主機的 tzdata 版本不同而算出不同的時段；要避免就得改成內嵌資料，結果與 `chrono-tz` 相同而依賴更多。沒有採用「讀主機的 zoneinfo」：最小化的容器與 Windows 沒有它。
+- **資料的更新方式**：時區資料隨 Kairos 的版本更新（發佈前更新 `chrono-tz`，CHANGELOG 註明 tzdb 的版本）。某個國家臨時修改日光節約時間的規則而 Kairos 還沒有更新時，該時區的時段會偏移（通常是一小時）；過渡期間可以把推送的 `timezone` 改為固定位移。叢集的各節點必須是同一個版本的 Kairos（本來就是 HA.md 的要求），因此各節點的時區資料相同。
+
+**規則**（`kairos/src/remote/schedule.rs` 的純函式；每一條都有假時鐘的測試）。以下「當地時間」指 `timezone` 的牆上時鐘。
+
+1. **時段屬於它開始的那個當地日期**。`days` 比對的是開始那天（當地日期）的星期；`end` 小於或等於 `start` 時結束在**下一個當地日期**。當地的一天可能是 23 或 25 小時，計算以當地日期為準，不以「24 小時」推算。
+2. **時段的兩端各自換算成絕對時間**：開始＝開始日期的 `start`、結束＝結束日期的 `end`，各依第 3～5 條換算。時段的長度因此是**牆上時鐘的長度，不是實際經過的時間**：`01:00`～`05:00` 在跳過一小時的那一晚實際是 3 小時，在重複一小時的那一晚實際是 5 小時（歐洲）——操作者看著時鐘時，時段永遠在時鐘顯示 `01:00` 時開始、顯示 `05:00` 時結束。
+3. **不存在的時刻**（春季撥快，例如 `Europe/Berlin` 2026-03-29 的 02:00～03:00 被跳過）：開始或結束落在被跳過的區間時，換算為**切換的那一刻**（時鐘從 01:59:59 跳到 03:00:00 的瞬間，也就是「時鐘第一次顯示晚於這個時刻」的時候）。開始因此**只會延後、不會提早**（`02:30` 開始的時段在那一天於當地 03:00 開始）；結束在被跳過的區間時，時段在切換的那一刻結束（`01:00`～`02:30` 那一天是 01:00～02:00，實際 1 小時）。午夜被跳過的時區（例如 `America/Santiago` 春季的 00:00～01:00）同樣適用：`00:00` 開始的時段在當地 01:00 開始，仍屬於那個日期。
+4. **重複的時刻**（秋季撥慢，例如 `America/New_York` 2026-11-01 的 01:00～02:00 出現兩次）：
+   - **開始**取**第二次**（較晚的那一次；寧可晚開始）。`01:30` 開始的時段在撥慢之後的 01:30 開始。
+   - **結束**取「開始之後，時鐘**第一次**顯示 `end` 的時刻」。`00:30`～`01:30` 在第一次 01:30 結束（實際 1 小時，與平常相同）；`01:15`～`01:45`（兩端都重複）從第二次 01:15 到第二次 01:45（30 分鐘）。時段因此不會比牆上時鐘的長度多出重複的那一小時，除非重複的區間完整落在時段中間（第 2 條的 `01:00`～`05:00`）。
+5. **時段不會變成零長度**：依第 3、4 條換算後結束沒有晚於開始時（整個時段落在被跳過的區間，例如那一天的 `02:15`～`02:45`；或開始被延後到恰好等於結束，例如 `02:30`～`03:00`），時段改為**從換算後的開始起、維持牆上時鐘的長度**（當地 03:00～03:30）。任何一天該有的時段都不會因為日光節約時間而消失。
+6. **跨午夜的時段遇到切換日**沒有特別的規則：開始與結束各自依第 1～5 條換算。`Europe/Berlin` 週六 `23:00`～`03:00`：2026-03-28 開始的那一次實際 3 小時（23:00 CET～03:00 CEST），2026-10-24 開始的那一次實際 5 小時。
+7. **相連或重疊的時段視為一段**的判斷在換算成絕對時間之後進行（與 0.10.0 相同）。
+8. **看得到的紀錄**：預覽（`POST /api/v1/rollouts/preview`）與推送詳情的 `upcoming_windows[]` 列出接下來的時段實際的開始與結束（`start_local`／`end_local` 含當時的位移，例如 `2026-03-29T03:00:00+02:00`）、實際長度 `minutes`，受日光節約時間影響的那一次標 `dst`（`gap`＝跳過、`fold`＝重複），主控台在建立推送時顯示。`apply_window`（給 Pulse 的是絕對時間）與 `next_action: waiting_window{until}` 都是換算後的絕對時間，Pulse 不需要時區資料、協定不變。
+
+固定位移沒有不存在或重複的時刻，上述規則對它與 0.10.0 的計算結果完全相同。
 
 #### 4.7.6 單一寫入者
 
@@ -1126,7 +1156,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 - 0.9.0：最多兩批（0.10.0 起見下方「自訂批次」「排程與升級時段」；`waves` 的最後一批為 `"rest"`；預設範本為 canary 1%（至多 10 台）、觀察 60 分鐘、上限 0、人工繼續，其餘 5%），送出後立即開始（`draft` → `running`；`scheduled`、`pending_approval` 保留給 0.10）。對象在**送出時**固定（第 4.7.2 節寫「開始時」，建立草稿時只預覽），不符資格的記為 `skipped`（`wave = -1`）。
 - **自訂批次**（0.10.0，第 4.7.1 節）：`waves` 最多 10 批（`rollout::MAX_WAVES`），最後一批 `"rest"`；`size` 的百分比以**當時剩餘**的可升級主機計（至少 1 台，`max_hosts` 為上限），兩批時與 0.9 的結果相同。省略 `waves` 時仍是 0.9 的兩批預設範本（API 相容）；第 4.7.1 節的四批範本由預覽的 `wave_templates.recommended` 提供，主控台可一鍵套用。`canary_agent_ids` 仍指定第一批。失敗比例、觀察期、人工繼續逐批計算。
-- **排程與升級時段**（0.10.0，第 4.7.1、4.7.3、4.7.5 節；`kairos/src/remote/schedule.rs` 的純函式）：`rollouts.schedule`（JSON）＝`starts_at`、`ends_at`、`windows[]`（`days`：`mon`～`sun`，省略＝每天；`start`／`end`：`HH:MM`，跨午夜的時段屬於開始的那一天；最多 16 個，相連或重疊的時段視為一段）、`timezone`。
+- **排程與升級時段**（0.10.0，第 4.7.1、4.7.3、4.7.5 節；`kairos/src/remote/schedule.rs` 的純函式）：`rollouts.schedule`（JSON）＝`starts_at`、`ends_at`、`windows[]`（`days`：`mon`～`sun`，省略＝每天；`start`／`end`：`HH:MM`，跨午夜的時段屬於開始的那一天；最多 16 個，相連或重疊的時段視為一段）、`timezone`（0.10.0、0.10.1 只接受固定位移；之後的版本另接受 IANA 時區名稱，日光節約時間的規則見第 4.7.5 節）。
   - 狀態：送出時 `starts_at` 在未來 → `scheduled`（對象同樣在送出時固定，算在「未結束的推送」中，其他推送會 `rollout_overlap`）；推送引擎到時轉為 `running` 並以 `system` 寫 `rollout.start`。`scheduled` 可以取消；修改（`PUT`）時退回 `draft`、刪除已固定的對象，需要重新送出。
   - 時段外不提議新的主機（`next_action: waiting_window{until}`）。提議的 `apply_window` 為 `[提議時, 所在時段結束]`（沒有時段時照舊為提議後 24 小時；都不超過 `ends_at`）。時段結束後 `upgrade_get`（含 Pulse 交付前的再確認，第 17.2 節 #10）回 `upgrade_unavailable`，Pulse 不會在時段外替換。
   - 時段結束時還沒開始替換的主機——Pulse 回報 `expired`，或時段結束 2 分鐘後仍停在提議中——回到 `pending`（`reason: window_closed`、新的 `upgrade_id`、`attempts` 加 1），下一個時段重新提議，不計入失敗比例、不阻擋批次；同一台超過 10 次後留在 `expired`（可手動重試）。沒有時段的推送維持 0.9 的行為（`expired` 為終止狀態）。
@@ -1178,7 +1208,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 | 項目 | 規格 | 實作 |
 |---|---|---|
-| 升級時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **固定位移**（`+08:00`；另接受 `UTC`、`Z`），預設 `alerts.timezone`（本來就是固定位移），沒有設定時 `+08:00`。不支援時區名稱與日光節約時間：Kairos 沒有時區資料庫的依賴，告警的時區也是固定位移；有日光節約時間的地區需要在換季時調整時段（列入待決） |
+| 升級時段的 `timezone`（0.10.0） | IANA 時區名稱，預設 `alerts.timezone` 或 `Asia/Taipei` | **已支援**（0.10.1 之後的版本，第 4.7.5 節「時段的時區與日光節約時間」）：接受 IANA 時區名稱，並繼續接受固定位移（`+08:00`、`UTC`、`Z`）。0.10.0、0.10.1 只接受固定位移。剩下的差異只有預設值：預設是 `alerts.timezone`（固定位移），沒有設定時 `+08:00`（與 `Asia/Taipei` 的時間相同） |
 | 修改已排程的推送（0.10.0） | `draft`／`pending_approval`／`scheduled` 可修改，修改後重新送審 | `pending_approval`、`scheduled` 的推送修改時退回 `draft`（對象重新計算、確認字串重新輸入、重新核准） |
 | 雙人覆核（0.10.0） | 核准者不得是建立者；關閉雙人覆核是 L3 操作；主控台唯讀顯示設定；降版 L3 要重新驗證 | 核准者不得是建立者**或送出者**（比規格嚴格：否則甲建立、乙送出並自己核准，仍只有一個人看過固定下來的對象）；`reject` 不限制身分（往安全的方向）。`rollout_approval` 只在 `kairos.toml`，修改需要主機上的檔案權限與重新啟動，**沒有 L3 流程**（ADR-0002 決策點 2i：已接受的治理缺口，第 5.4 節已修訂）；啟動時與資料庫的前值比對，改變時寫稽核、`required` → `none` 另開告警事件；目前的值在系統健康 `remote` 項目的 `values.rollout_approval` 與推送清單的 `meta`，S21「連線與安全」的「遠端管理」卡片唯讀顯示。核准是 L2（`confirm`＋`digest`，伺服器在交易內驗證）。降版推送的 L3 是固定字串＋原因，不要求重新驗證密碼（已定案，ADR-0002 第 1.1 節） |
 | `host_config` 的鍵 | `host_id`（`hosts`） | `agent_id`，另存 hello 的 `tags`／`agent_version`／`install_config`（主機可能在清冊寫入前就送出 `config_get`） |
