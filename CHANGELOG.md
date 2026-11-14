@@ -50,7 +50,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
-## [0.10.0] - 〔草稿：發佈日期待定〕
+## [0.10.0] - 2026-11-14
 
 **Kairos 0.10.0、Pulse 0.10.0**：衝刺 10——**PostgreSQL 儲存後端**（高可用 L1b，`kairos/STORAGE.md` 第 19 節）、**叢集模式**（高可用 L2，階段 A：主動／備援，`kairos/HA.md` 第 6.8、17.1 節；**HA 預覽**）與**遠端管理 F8 的其餘項目**（`crates/kairos-proto/REMOTE.md`：`kairos releases` 命令列、推送的排程與升級時段、自訂批次、雙人覆核、外部 URL 的版本庫、升級中主機的離線告警抑制、SSE `rollout.host`、版本庫檔案的健康檢查）。**協定版本不變（v1～v2）、沒有新的協定 feature**，8444 的 API 不變，0.9 與 0.10 的 Kairos／Pulse 任意組合都能連線；Kairos 的資料庫升級到 **schema v11**（v9 → v10 → v11，不可逆，升級前先備份）。預設值（`storage.backend = "sqlite"`、`cluster.enabled = false`、`remote.rollout_approval = "none"`）下不需要修改設定檔。
 
