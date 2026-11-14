@@ -2445,24 +2445,26 @@ async fn approval_is_off_by_default() {
 }
 
 /// 外部 URL 版本的資格預覽（REMOTE.md 第 2.1、4.7.2 節）：Pulse 在 hello 宣告 `install.external_url`。
-/// 宣告 `none` 的主機在預覽與送出時分類為 `url_not_allowed`（不必等推送中的 `declined`）；沒有宣告
-/// （舊 Pulse）與宣告 `allowlist` 的主機照舊可升級，預覽註明台數；宣告 `allowlist` 而實際拒絕的主機
+/// 宣告 `none` 的主機在預覽與送出時分類為 `url_not_allowed`（不必等推送中的 `declined`）；Pulse 低於
+/// 0.10.0 的主機分類為 `url_not_supported`；0.10 以上沒有宣告與宣告 `allowlist` 的主機照舊可升級，預覽註明台數；宣告 `allowlist` 而實際拒絕的主機
 /// 照現行的 `declined` 處理。連線中的主機以這次 hello 為準，不沿用清冊的舊值
 #[tokio::test]
 async fn external_url_declaration_drives_the_eligibility_preview() {
     const E: &str = "eeeeeeee-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const F: &str = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const G: &str = "99999999-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const H: &str = "88888888-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     let signer = TestSigner::new(29);
     let fx = Fx::new("external-declared", trust_settings(&signer)).await;
-    let ext = release(&signer, "0.9.2", "2222222");
-    let hosted = release(&signer, "0.9.3", "3333333");
+    let ext = release(&signer, "0.10.2", "2222222");
+    let hosted = release(&signer, "0.10.3", "3333333");
     fx.svc
         .import_release_from(
             &who(),
             ext.sha256sums.clone(),
             ext.signature.clone(),
             Some(ext.manifest.clone()),
-            Some("https://repo.example.gov.tw/kairos-pulse/0.9.2/".into()),
+            Some("https://repo.example.gov.tw/kairos-pulse/0.10.2/".into()),
         )
         .await
         .unwrap();
@@ -2471,7 +2473,7 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
         up.write(data).unwrap();
         let (sha, size) = up.finish().unwrap();
         fx.svc
-            .store_artifact(&who(), "0.9.2".into(), name.clone(), up, sha, size)
+            .store_artifact(&who(), "0.10.2".into(), name.clone(), up, sha, size)
             .await
             .unwrap();
     }
@@ -2480,8 +2482,21 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
     // D：離線，清冊記著 none。E：離線，清冊沒有宣告。
     // F：清冊記著 none，但這次連線的 hello 沒有宣告（Pulse 降回舊版）→ 未知，不沿用清冊
     for h in [A, B, C, D, E, F] {
-        fx.add_host(h, "0.9.0", "Web", &[], "tar", "ready").await;
+        fx.add_host(h, "0.10.0", "Web", &[], "tar", "ready").await;
     }
+    // G、H：Pulse 0.9（不支援外部 URL）。G 連線中；H 離線，清冊甚至記著 allowlist——版本的判斷先於宣告
+    for h in [G, H] {
+        fx.add_host(h, "0.9.5", "Web", &[], "tar", "ready").await;
+    }
+    fx.sql(|c| {
+        c.execute(
+            "UPDATE hosts SET install_external_url = 'allowlist', online = 0 WHERE agent_id = ?1",
+            [H],
+        )
+        .unwrap();
+    })
+    .await;
+    fx.connect(G, "0.9.5", "tar");
     for h in [D, F] {
         fx.sql(move |c| {
             c.execute(
@@ -2500,10 +2515,10 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
         .unwrap();
     })
     .await;
-    fx.connect_declaring(A, "0.9.0", "tar", Some("none"));
-    fx.connect_declaring(B, "0.9.0", "tar", Some("allowlist"));
-    fx.connect(C, "0.9.0", "tar");
-    fx.connect(F, "0.9.0", "tar");
+    fx.connect_declaring(A, "0.10.0", "tar", Some("none"));
+    fx.connect_declaring(B, "0.10.0", "tar", Some("allowlist"));
+    fx.connect(C, "0.10.0", "tar");
+    fx.connect(F, "0.10.0", "tar");
     let spec = |target: &str| {
         RolloutSpec::parse(&json!({
             "name": target, "target_version": target, "selector": {"all": true},
@@ -2513,15 +2528,27 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
     };
     let p = fx
         .svc
-        .preview_rollout(spec("0.9.2"), None, None)
+        .preview_rollout(spec("0.10.2"), None, None)
         .await
         .unwrap();
     assert_eq!(
         (p["matched"].as_i64(), p["eligible"].as_i64()),
-        (Some(6), Some(4)),
+        (Some(8), Some(4)),
         "{p}"
     );
-    assert_eq!(p["skipped"], json!({"url_not_allowed": 2}), "{p}");
+    assert_eq!(
+        p["skipped"],
+        json!({"url_not_allowed": 2, "url_not_supported": 2}),
+        "{p}"
+    );
+    let mut old: Vec<&str> = p["samples"]["url_not_supported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["agent_id"].as_str().unwrap())
+        .collect();
+    old.sort_unstable();
+    assert_eq!(old, [H, G]);
     let mut sample: Vec<&str> = p["samples"]["url_not_allowed"]
         .as_array()
         .unwrap()
@@ -2533,26 +2560,26 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
     assert_eq!(
         p["external_url"],
         json!({
-            "base_url": "https://repo.example.gov.tw/kairos-pulse/0.9.2/",
+            "base_url": "https://repo.example.gov.tw/kairos-pulse/0.10.2/",
             "undeclared": 3,
             "allowlist": 1,
         })
     );
     assert_eq!(p["confirm_text"], "升級 4 台");
-    // 由 Kairos 代管的版本：不看宣告，六台都可升級
+    // 由 Kairos 代管的版本：不看宣告也不看「支援外部 URL」，八台（含 0.9 的兩台）都可升級
     let p = fx
         .svc
-        .preview_rollout(spec("0.9.3"), None, None)
+        .preview_rollout(spec("0.10.3"), None, None)
         .await
         .unwrap();
     assert_eq!(
         (p["eligible"].as_i64(), p["skipped"].clone()),
-        (Some(6), json!({})),
+        (Some(8), json!({})),
         "{p}"
     );
     assert_eq!(p["external_url"], Value::Null);
     // 送出：對象固定，宣告 none 的主機記為 skipped（url_not_allowed），不會被提議
-    let created = fx.svc.create_rollout(&who(), spec("0.9.2")).await.unwrap();
+    let created = fx.svc.create_rollout(&who(), spec("0.10.2")).await.unwrap();
     let id = created["id"].as_str().unwrap().to_string();
     let v = fx
         .svc
@@ -2568,8 +2595,18 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
             "{h}"
         );
     }
+    // Pulse 0.9 的主機固定為 skipped（url_not_supported），不會被提議
+    for h in [G, H] {
+        let row = fx.host_state(&id, h).await;
+        assert_eq!(
+            (row.state.as_str(), row.reason.as_deref()),
+            ("skipped", Some("url_not_supported")),
+            "{h}"
+        );
+    }
     fx.set_now(T0 + 61_000);
     fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(G), None, "Pulse 0.9 的主機不提議");
     assert_eq!(fx.svc.offer_of(A), None, "宣告 none 的主機不提議");
     let up_b = fx.svc.offer_of(B).expect("宣告 allowlist 的主機照常提議");
     assert!(fx.svc.offer_of(C).is_some(), "沒有宣告的主機照常提議");
@@ -2580,7 +2617,7 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
     declined.code = Some("PLS-W8411".into());
     declined.detail = "url_not_allowed".into();
     fx.svc
-        .apply_upgrade_status(B, "0.9.0", declined)
+        .apply_upgrade_status(B, "0.10.0", declined)
         .await
         .unwrap();
     let row = fx.host_state(&id, B).await;
@@ -2603,9 +2640,9 @@ async fn external_url_declaration_drives_the_eligibility_preview() {
 async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     let signer = TestSigner::new(27);
     let fx = Fx::new("external", trust_settings(&signer)).await;
-    let r091 = release(&signer, "0.9.1", "1111111");
-    let r092 = release(&signer, "0.9.2", "2222222");
-    let r093 = release(&signer, "0.9.3", "3333333");
+    let r091 = release(&signer, "0.10.1", "1111111");
+    let r092 = release(&signer, "0.10.2", "2222222");
+    let r093 = release(&signer, "0.10.3", "3333333");
     // base_url 的檢查：https、不含查詢字串或帳號密碼
     for bad in [
         "http://repo.example.gov.tw/p/",
@@ -2645,10 +2682,10 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
         .await
         .unwrap_err();
     assert_eq!(e.code, "release_signature_invalid");
-    // 0.9.1（主機目前的版本）與 0.9.2 是外部 URL 的版本，0.9.3 由 Kairos 代管
+    // 0.10.1（主機目前的版本）與 0.10.2 是外部 URL 的版本，0.10.3 由 Kairos 代管
     for (r, base) in [
-        (&r091, "https://Repo.example.gov.tw/kairos-pulse/0.9.1"),
-        (&r092, "https://repo.example.gov.tw/kairos-pulse/0.9.2/"),
+        (&r091, "https://Repo.example.gov.tw/kairos-pulse/0.10.1"),
+        (&r092, "https://repo.example.gov.tw/kairos-pulse/0.10.2/"),
     ] {
         let v = fx
             .svc
@@ -2667,7 +2704,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
             v["base_url"]
                 .as_str()
                 .unwrap()
-                .starts_with("https://repo.example.gov.tw/kairos-pulse/0.9."),
+                .starts_with("https://repo.example.gov.tw/kairos-pulse/0.10."),
             "{v}"
         );
         assert!(v["base_url"].as_str().unwrap().ends_with('/'));
@@ -2675,13 +2712,13 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     import(&fx, &r093).await;
     let stored_before = std::fs::read_dir(&fx.svc.releases_dir).unwrap().count();
     // 尚未登記的外部版本沒有可以提議的發佈檔（提議需要大小）
-    fx.add_host(A, "0.9.1", "Web", &[], "deb", "ready").await;
-    fx.connect(A, "0.9.1", "deb");
+    fx.add_host(A, "0.10.1", "Web", &[], "deb", "ready").await;
+    fx.connect(A, "0.10.1", "deb");
     let p = fx
         .svc
         .preview_rollout(
             RolloutSpec::parse(
-                &json!({"name": "x", "target_version": "0.9.2", "selector": {"agent_ids": [A]}}),
+                &json!({"name": "x", "target_version": "0.10.2", "selector": {"agent_ids": [A]}}),
             )
             .unwrap(),
             None,
@@ -2697,7 +2734,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     let (sha, size) = up.finish().unwrap();
     let e = fx
         .svc
-        .store_artifact(&who(), "0.9.2".into(), name, up, sha, size)
+        .store_artifact(&who(), "0.10.2".into(), name, up, sha, size)
         .await
         .unwrap_err();
     assert_eq!(e.code, "artifact_hash_mismatch");
@@ -2739,7 +2776,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     // 目標是外部 URL 的版本：可升級（發佈檔不必存入）；回滾檔也在外部 URL，不算「無法自動回滾」
     let p = fx
         .svc
-        .preview_rollout(rollout("0.9.2"), None, None)
+        .preview_rollout(rollout("0.10.2"), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -2749,7 +2786,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     );
     let created = fx
         .svc
-        .create_rollout(&who(), rollout("0.9.2"))
+        .create_rollout(&who(), rollout("0.10.2"))
         .await
         .unwrap();
     let id = created["id"].as_str().unwrap().to_string();
@@ -2767,7 +2804,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
         offer.artifact.url.as_deref(),
         Some(
             format!(
-                "https://repo.example.gov.tw/kairos-pulse/0.9.2/{}",
+                "https://repo.example.gov.tw/kairos-pulse/0.10.2/{}",
                 offer.artifact.filename
             )
             .as_str()
@@ -2783,7 +2820,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     assert!(
         rb.url
             .as_deref()
-            .is_some_and(|u| u.starts_with("https://repo.example.gov.tw/kairos-pulse/0.9.1/")),
+            .is_some_and(|u| u.starts_with("https://repo.example.gov.tw/kairos-pulse/0.10.1/")),
         "{rb:?}"
     );
     // 外部 URL 的檔案不經 8443 提供
@@ -2803,7 +2840,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     // 資格分類算作「無法自動回滾」
     let p = fx
         .svc
-        .preview_rollout(rollout("0.9.3"), None, None)
+        .preview_rollout(rollout("0.10.3"), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -2813,7 +2850,7 @@ async fn external_releases_offer_urls_and_keep_the_signature_chain() {
     );
     let created = fx
         .svc
-        .create_rollout(&who(), rollout("0.9.3"))
+        .create_rollout(&who(), rollout("0.10.3"))
         .await
         .unwrap();
     let id = created["id"].as_str().unwrap().to_string();

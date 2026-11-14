@@ -1105,7 +1105,7 @@ async fn releases_and_rollouts_over_https() {
 
     // 外部 URL 的版本庫（0.10，REMOTE.md 第 4.1.2 節）：source: external 需要合法的 base_url；簽章驗證照舊；
     // 上傳發佈檔只登記雜湊與大小（維運者不能）
-    let ext = release(&signer, "0.9.4", "4444444");
+    let ext = release(&signer, "0.10.4", "4444444");
     let ext_body = |base: Option<&str>, sig: &str| {
         let mut b = json!({"sha256sums": ext.sha256sums, "signature": sig, "manifest": ext.manifest, "source": "external"});
         if let Some(u) = base {
@@ -1185,12 +1185,12 @@ async fn releases_and_rollouts_over_https() {
         )
     );
     let (ext_name, ext_data) = ext.files[0].clone();
-    let r = put_artifact(&f, &admin, "0.9.4", &ext_name, b"something else").await;
+    let r = put_artifact(&f, &admin, "0.10.4", &ext_name, b"something else").await;
     assert_eq!(
         (r.status, body(&r)["error"]["code"].as_str()),
         (400, Some("artifact_hash_mismatch"))
     );
-    let r = put_artifact(&f, &admin, "0.9.4", &ext_name, &ext_data).await;
+    let r = put_artifact(&f, &admin, "0.10.4", &ext_name, &ext_data).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(
         (
@@ -1201,16 +1201,19 @@ async fn releases_and_rollouts_over_https() {
     );
     // 外部 URL 版本的資格預覽（REMOTE.md 第 4.7.2 節）：Pulse 在 hello 宣告 install.external_url（清冊的
     // hosts.install_external_url）。宣告 none 的主機事先列為 url_not_allowed；沒有宣告與宣告 allowlist 的
-    // 照舊可升級，external_url 回報台數讓主控台註明
+    // 照舊可升級，external_url 回報台數讓主控台註明。Pulse 低於 0.10.0（不支援外部 URL）列為
+    // url_not_supported
     const NONE: &str = "7e2f0a11-0000-4000-8000-0000000000e1";
     const ALLOW: &str = "7e2f0a11-0000-4000-8000-0000000000e2";
     const UNDECLARED: &str = "7e2f0a11-0000-4000-8000-0000000000e3";
-    for (id, declared) in [
-        (NONE, Some("none")),
-        (ALLOW, Some("allowlist")),
-        (UNDECLARED, None),
+    const OLD: &str = "7e2f0a11-0000-4000-8000-0000000000e4";
+    for (id, version, declared) in [
+        (NONE, "0.10.0", Some("none")),
+        (ALLOW, "0.10.0", Some("allowlist")),
+        (UNDECLARED, "0.10.1", None),
+        (OLD, "0.9.0", None),
     ] {
-        add_host(&f, id, "0.9.0", "tar");
+        add_host(&f, id, version, "tar");
         f.admin()
             .execute(
                 "UPDATE hosts SET install_external_url = ?2 WHERE agent_id = ?1",
@@ -1218,24 +1221,29 @@ async fn releases_and_rollouts_over_https() {
             )
             .unwrap();
     }
-    let ext_spec = |target: &str| json!({"name": "ext", "target_version": target, "selector": {"agent_ids": [NONE, ALLOW, UNDECLARED]}, "waves": [{"size": "rest"}]});
+    let ext_spec = |target: &str| json!({"name": "ext", "target_version": target, "selector": {"agent_ids": [NONE, ALLOW, UNDECLARED, OLD]}, "waves": [{"size": "rest"}]});
     let r = call(
         addr,
         "POST",
         "/api/v1/rollouts/preview",
         Some(&op),
-        Some(&ext_spec("0.9.4")),
+        Some(&ext_spec("0.10.4")),
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let d = body(&r)["data"].clone();
     assert_eq!(
         (d["matched"].as_i64(), d["eligible"].as_i64()),
-        (Some(3), Some(2)),
+        (Some(4), Some(2)),
         "{d}"
     );
-    assert_eq!(d["skipped"], json!({"url_not_allowed": 1}), "{d}");
+    assert_eq!(
+        d["skipped"],
+        json!({"url_not_allowed": 1, "url_not_supported": 1}),
+        "{d}"
+    );
     assert_eq!(d["samples"]["url_not_allowed"][0]["agent_id"], NONE);
+    assert_eq!(d["samples"]["url_not_supported"][0]["agent_id"], OLD);
     assert_eq!(
         d["external_url"],
         json!({"base_url": "https://repo.example.gov.tw/p/", "undeclared": 1, "allowlist": 1})
@@ -1275,7 +1283,7 @@ async fn releases_and_rollouts_over_https() {
         "POST",
         "/api/v1/rollouts",
         Some(&admin),
-        Some(&ext_spec("0.9.4")),
+        Some(&ext_spec("0.10.4")),
     )
     .await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
@@ -1303,6 +1311,22 @@ async fn releases_and_rollouts_over_https() {
     assert_eq!(
         (rows[0]["agent_id"].as_str(), rows[0]["state"].as_str()),
         (Some(NONE), Some("skipped"))
+    );
+    // Pulse 0.9 的主機固定為 skipped（url_not_supported）
+    let r = call(
+        addr,
+        "GET",
+        &format!("/api/v1/rollouts/{ext_id}/hosts?reason=url_not_supported"),
+        Some(&op),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let rows = body(&r)["data"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0]["agent_id"].as_str(), rows[0]["state"].as_str()),
+        (Some(OLD), Some("skipped"))
     );
     let _ = std::fs::remove_dir_all(trust.parent().unwrap());
     f.stop().await;

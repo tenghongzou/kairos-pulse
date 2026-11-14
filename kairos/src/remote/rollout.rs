@@ -590,8 +590,8 @@ pub struct ReleaseContext {
     /// `artifacts` 與 `by_version` 中：需要它的主機分類為 [`SKIP_ARTIFACT_MISSING`]，而不是可升級
     pub missing: Vec<ArtifactRow>,
     /// 目標版本是外部 URL 的版本庫時的 `base_url`（提議的 `artifact.source` 為 `url`；REMOTE.md 第 4.1.2
-    /// 節）。有值時資格分類另看主機的 `install.external_url`（[`SKIP_URL_NOT_ALLOWED`]）；由 Kairos 代管的
-    /// 版本為 `None`
+    /// 節）。有值時資格分類另看主機的版本（[`SKIP_URL_NOT_SUPPORTED`]）與 `install.external_url`
+    /// （[`SKIP_URL_NOT_ALLOWED`]）；由 Kairos 代管的版本為 `None`
     pub external_base_url: Option<String>,
 }
 
@@ -599,6 +599,11 @@ pub struct ReleaseContext {
 /// `upgrade.url_allowlist` 是空的，`source: "url"` 的提議一律 `declined`（`PLS-W8411`、`url_not_allowed`；
 /// 名稱與 Pulse 回報的 `detail` 相同）。不事先標出的話，這台主機要到推送中才回報 `declined`
 pub const SKIP_URL_NOT_ALLOWED: &str = "url_not_allowed";
+
+/// 資格分類的原因（目標是外部 URL 的版本時）：Pulse 低於 0.10.0，不支援從外部 URL 下載——0.9 的 Pulse 對
+/// `source: "url"` 的提議一律 `declined`（REMOTE.md 第 17.3 節 #2）。處理方式：先以存放在 Kairos 的版本
+/// 升級到 0.10 以上（ADR-0002 決策點 5c；使用者 2026-11-14 決定實作）
+pub const SKIP_URL_NOT_SUPPORTED: &str = "url_not_supported";
 
 /// 資格分類的原因：版本庫記錄這個平台的發佈檔已存入，但檔案不存在或大小不符（重新上傳即可；與「版本庫
 /// 沒有這個平台的檔案」的 `no_artifact` 分開）。也是推送中主機等待檔案時的 `reason`、API 的 409 錯誤碼
@@ -648,7 +653,8 @@ pub enum ExternalUrl {
     /// 目標不是外部 URL 的版本：不看
     #[default]
     NotApplicable,
-    /// 沒有宣告（0.10.1 以前的 Pulse）或不認得的值：照舊算可升級，不允許的主機在推送中 `declined`
+    /// 0.10.0 以上而沒有宣告（0.10.0、0.10.1 的 Pulse）或不認得的值：照舊算可升級，不允許的主機在推送中
+    /// `declined`。低於 0.10.0 的 Pulse 不會到這裡（[`SKIP_URL_NOT_SUPPORTED`]）
     Undeclared,
     /// 宣告有白名單（內容不回報：這個 `base_url` 是否在內不知道）
     Allowlist,
@@ -657,7 +663,7 @@ pub enum ExternalUrl {
 /// REMOTE.md 第 4.7.2 節的資格分類。跳過的原因：`already`、`unsupported_version`、`disabled`、
 /// `no_trust_anchor`、`no_helper`、`unsupported`、`unsafe_path`（0.10.0）、`not_ready`（不認得的
 /// `install.upgrade`）、`unsupported_platform`、`no_artifact`、
-/// `artifact_missing`、`url_not_allowed`（外部 URL 的版本）、`min_upgrade_from`、
+/// `artifact_missing`、`url_not_supported`、`url_not_allowed`（外部 URL 的版本）、`min_upgrade_from`、
 /// `no_manifest`、`downgrade_not_allowed`、`no_rollback`、`decommissioned`
 pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) -> Eligibility {
     let mut e = Eligibility {
@@ -713,9 +719,14 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
         }
         return skip(e, "no_artifact");
     }
-    // 外部 URL 的版本：提議的發佈檔要由 Pulse 從 base_url 下載。宣告白名單是空的（`none`）的主機一定
-    // 拒絕——事先分類，不必等推送中的 `declined`。沒有宣告（0.10.1 以前的 Pulse）或不認得的值照舊算可升級
+    // 外部 URL 的版本：提議的發佈檔要由 Pulse 從 base_url 下載。0.9 的 Pulse 不支援外部 URL（一律
+    // `declined`）；宣告白名單是空的（`none`）的主機也一定拒絕——事先分類，不必等推送中的 `declined`。
+    // 0.10.0 以上而沒有宣告（0.10.0、0.10.1 的 Pulse）或不認得的值照舊算可升級。版本的判斷先於宣告
+    // （0.9 的 Pulse 不會宣告；即使帶了這個欄位也不支援）
     if ctx.external_base_url.is_some() {
+        if current.core() < (0, 10, 0) {
+            return skip(e, SKIP_URL_NOT_SUPPORTED);
+        }
         e.external_url = match h.install_external_url.as_deref() {
             Some(INSTALL_EXTERNAL_URL_NONE) => return skip(e, SKIP_URL_NOT_ALLOWED),
             Some(INSTALL_EXTERNAL_URL_ALLOWLIST) => ExternalUrl::Allowlist,
