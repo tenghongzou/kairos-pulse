@@ -94,7 +94,7 @@ sc.exe query Pulse            # 應為 RUNNING：MSI 安裝後會啟動服務，
 - **服務的啟動**：MSI 在安裝、升級與修復（`msiexec /fa`）結束時啟動服務（只送出啟動要求、不等它連上 Kairos；服務啟動失敗不會讓安裝失敗）。第一次安裝、還沒有執行 `pulse enroll` 時服務也會啟動：它會連預設的 `127.0.0.1:8080` 並持續重試，`pulse enroll` 寫好設定後會重新啟動它。0.8.0～0.10.1 的 MSI 只會停止服務、不會再啟動：**從這些版本升級、或以它們修復之後，服務會停到下次開機或手動 `sc.exe start Pulse`**（ADR-0001 的 X4）。這一點只確認了 MSI 的內容（`ServiceControl` 表），尚未在 Windows 上實測。
 - 升級：安裝新版 MSI（MajorUpgrade 取代舊版；`pulse.toml` 與執行時產生的檔案保留）。移除：`msiexec /x …` 或「設定 › 應用程式」：停止並刪除服務、刪除安裝的檔案；`pulse.toml`、`agent.id`、`identity\`、`buffer\`、`logs\` 保留。完全移除前先執行 `pulse decommission --initiated-by msi`。
 - 不使用 MSI 時（zip）：解開到任一目錄，以系統管理員執行 `pulse.exe service install --start`（`pulse service --help`）；移除為 `pulse.exe service uninstall`。
-- **0.8.0 的限制**：MSI 與 Windows 服務只在 Linux 上交叉編譯與產生，**尚未在 Windows 實機驗證**；MSI 沒有安裝字串的參數（安裝後另外執行 `pulse enroll`）、移除時不會自動 `pulse decommission`、不寫 Windows 事件記錄、沒有程式碼簽章（Authenticode）。`logs\` 沿用安裝目錄的 ACL（Users 可讀）。
+- **限制（0.8.0 起，仍然成立）**：MSI 與 Windows 服務只在 Linux 上交叉編譯與產生，**尚未在 Windows 實機驗證**（驗證用的腳本與手冊已備妥但還沒有執行：monorepo 的 `tests/windows/` 與 `docs/windows-vm-validation.md`）；MSI 沒有安裝字串的參數（安裝後另外執行 `pulse enroll`）、移除時不會自動 `pulse decommission`、不寫 Windows 事件記錄、沒有程式碼簽章（Authenticode）。`logs\` 沿用安裝目錄的 ACL（Users 可讀）。
 
 ### A.4 Ansible（最小版，0.8.0）
 

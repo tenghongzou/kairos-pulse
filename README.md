@@ -12,7 +12,9 @@ kairos-pulse/
 ├── deny.toml              cargo-deny 設定（安全公告、授權、重複版本、來源）
 ├── CHANGELOG.md           變更紀錄（Kairos／Pulse／共用；含破壞性變更與升級步驟，也放進兩個發佈包）
 ├── RELEASING.md           發佈流程：版本規則、打 tag、建置、簽章與發佈金鑰管理
-├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test（含端對端測試）與 cargo deny，全部通過後打包發佈包
+├── .github/workflows/     CI：Linux／Windows 的 fmt、clippy、test（含端對端測試）與 cargo deny，全部通過後打包發佈包；
+│                          windows-system job 再把打包出的 MSI／zip 實際裝到 Windows runner 上（尚未執行過）
+├── docs/                  架構決策紀錄（adr/）與 Windows VM 驗證手冊（windows-vm-validation.md）
 ├── packaging/             兩個產品共用的打包實作、release.sh、簽章、可重現性檢查與 cargo-about 設定
 ├── crates/                兩個產品共用的內部 crate（publish = false）
 │   ├── kairos-proto/      協定型別、序列化與欄位驗證；PROTOCOL.md 為唯一的協定規格
@@ -21,7 +23,8 @@ kairos-pulse/
 │                          診斷包（tar.gz、敏感資料遮蔽）、--check-config 的輸出
 ├── kairos/                Kairos 伺服器（說明見 kairos/README.md）
 ├── pulse/                 Pulse 代理（說明見 pulse/README.md）
-└── tests/e2e/             端對端測試 kp-e2e（publish = false）：啟動實際的 kairos 與 pulse 執行檔
+├── tests/e2e/             端對端測試 kp-e2e（publish = false）：啟動實際的 kairos 與 pulse 執行檔
+└── tests/windows/         Windows 系統層測試 S0（PowerShell）：MSI／zip 的安裝、服務、失敗復原、升級、移除（ADR-0001 階段 0）
 ```
 
 協定規格只有一份：`crates/kairos-proto/PROTOCOL.md`。`kairos-proto` 的單元測試以 `include_str!` 讀入該文件，直接從「範例」節解析測試向量、從「錯誤碼」表比對 fatal 預設值；`kairos/PROTOCOL.md`、`pulse/PROTOCOL.md` 只是指向它的說明，發佈包內附的則是完整規格。`crates/` 下的共用 crate 都是 `publish = false` 的內部 crate，只使用 workspace 既有的依賴，不做 I/O 也不記日誌（狀態檔讀寫、NDJSON codec 與日誌措辭留在各產品）。
