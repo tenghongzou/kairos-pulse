@@ -10,7 +10,7 @@
 //!   （`KRS-W8417`；只 `stat`，與系統健康相同），預覽、送出、核准、提議四處使用。
 
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use kairos_proto::release::Version;
@@ -264,21 +264,104 @@ pub fn approvers(s: &dyn Store, now_ms: i64) -> StoreResult<Vec<String>> {
     Ok(out)
 }
 
-/// 這些執行者是不是同一個人（建立者或送出者）
-fn involved(r_created_by: &str, r_submitted_by: Option<&str>, actor: &str) -> bool {
-    actor == r_created_by || r_submitted_by == Some(actor)
+/// 遞迴展開 token 的 `created_by` 時的深度上限（防止 token 互相指向造成的無限遞迴）
+const MAX_ACTOR_DEPTH: u8 = 4;
+
+/// 把稽核執行者字串展開成背後的 Kairos 使用者 `user_id` 集合（雙人覆核的身分比對，ADR-0002 S1）。
+/// 核准不能只比對執行者字串（`token:<id>` ≠ `user:<帳號>`），否則單一管理員能用自己建立的 token 送出推送、
+/// 再用自己的工作階段核准。這裡把身分展開回背後的人：
+/// - `user:<帳號>`：以目前的帳號查到的 `user_id`（帳號可改名，故一律以 `user_id` 比對）。
+/// - `token:<id>`：token 的 `owner_user_id`，加上建立這個 token 的執行者（`created_by`）展開後的 `user_id`。
+///   **連已撤銷與過期的 token 都查**（攻擊者可能先撤銷自己的 token 再核准）。
+/// - `cli:<OS 帳號>`、`system`、查無對應者：空集合（沒有對應的 Kairos 使用者，只能以字串比對；CLI 建立或
+///   送出的推送因此可由任何合格的管理員工作階段核准）。
+pub fn backing_user_ids(s: &dyn Store, actor: &str) -> StoreResult<BTreeSet<i64>> {
+    let mut out = BTreeSet::new();
+    collect_backing_user_ids(s, actor, 0, &mut out)?;
+    Ok(out)
 }
 
-/// `approvers_available`：[`approvers`] 中不是這個推送的建立者或送出者的人數
+fn collect_backing_user_ids(
+    s: &dyn Store,
+    actor: &str,
+    depth: u8,
+    out: &mut BTreeSet<i64>,
+) -> StoreResult<()> {
+    if depth >= MAX_ACTOR_DEPTH {
+        return Ok(());
+    }
+    if let Some(username) = actor.strip_prefix("user:") {
+        if let Some(u) = s.find_user(username)? {
+            out.insert(u.user_id);
+        }
+    } else if let Some(token_id) = actor.strip_prefix("token:") {
+        // 含已撤銷與過期的 token（get_api_token 只以 token_id 查，不過濾狀態）
+        if let Some(row) = s.get_api_token(token_id)? {
+            if let Some(uid) = row.owner_user_id {
+                out.insert(uid);
+            }
+            if let Some(by) = row.created_by.as_deref() {
+                collect_backing_user_ids(s, by, depth + 1, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `cand`（執行者字串，另可帶已知的 `user_id`）是不是 `other` 背後的同一個人：執行者字串完全相同，
+/// 或背後的 `user_id` 有交集。
+fn same_person(
+    s: &dyn Store,
+    cand_actor: &str,
+    cand_uid: Option<i64>,
+    other: &str,
+) -> StoreResult<bool> {
+    if cand_actor == other {
+        return Ok(true);
+    }
+    let mut cand = backing_user_ids(s, cand_actor)?;
+    if let Some(uid) = cand_uid {
+        cand.insert(uid);
+    }
+    if cand.is_empty() {
+        return Ok(false);
+    }
+    Ok(!cand.is_disjoint(&backing_user_ids(s, other)?))
+}
+
+/// `cand` 是不是這個推送的建立者或送出者本人（以背後的使用者身分比對，不只是執行者字串）。
+/// `cand_uid` 是已知的背後 user_id（工作階段或 token 擁有者，`Principal::acting_user_id`），沒有時由 `cand_actor`
+/// 展開
+pub fn involved(
+    s: &dyn Store,
+    created_by: &str,
+    submitted_by: Option<&str>,
+    cand_actor: &str,
+    cand_uid: Option<i64>,
+) -> StoreResult<bool> {
+    if same_person(s, cand_actor, cand_uid, created_by)? {
+        return Ok(true);
+    }
+    match submitted_by {
+        Some(sb) => same_person(s, cand_actor, cand_uid, sb),
+        None => Ok(false),
+    }
+}
+
+/// `approvers_available`：[`approvers`] 中不是這個推送的建立者或送出者本人的人數（以背後的使用者身分比對）
 pub fn approvers_available(
+    s: &dyn Store,
     approvers: &[String],
     created_by: &str,
     submitted_by: Option<&str>,
-) -> usize {
-    approvers
-        .iter()
-        .filter(|a| !involved(created_by, submitted_by, a))
-        .count()
+) -> StoreResult<usize> {
+    let mut n = 0;
+    for a in approvers {
+        if !involved(s, created_by, submitted_by, a, None)? {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// 這次請求的身分（清單的 `pending_approval_actionable`、推送的 `viewer`）
@@ -286,6 +369,8 @@ pub fn approvers_available(
 pub struct Viewer {
     /// 稽核的執行者（`user:<帳號>`、`token:<id>`）
     pub actor: String,
+    /// 背後的使用者 `user_id`（工作階段的使用者或 token 擁有者，`Principal::acting_user_id`）
+    pub acting_user: Option<i64>,
     /// 以帳號登入的工作階段（API token 不能核准）
     pub session: bool,
     /// 有 `rollouts:approve`
@@ -294,32 +379,46 @@ pub struct Viewer {
 
 impl Viewer {
     /// 不能核准的原因：`forbidden`（沒有權限）、`session_required`（API token）、`self_approval`
-    /// （建立者或送出者）；可以核准時 `None`。與 `POST …/approve` 的檢查順序相同
-    pub fn blocked(&self, r: &RolloutRow) -> Option<&'static str> {
-        if !self.approve {
+    /// （建立者或送出者本人，以背後的使用者身分比對）；可以核准時 `None`。與 `POST …/approve` 的檢查順序相同
+    pub fn blocked(&self, s: &dyn Store, r: &RolloutRow) -> StoreResult<Option<&'static str>> {
+        Ok(if !self.approve {
             Some("forbidden")
         } else if !self.session {
             Some("session_required")
-        } else if involved(&r.created_by, r.submitted_by.as_deref(), &self.actor) {
+        } else if involved(
+            s,
+            &r.created_by,
+            r.submitted_by.as_deref(),
+            &self.actor,
+            self.acting_user,
+        )? {
             Some("self_approval")
         } else {
             None
-        }
+        })
     }
 
     /// 待核准的推送中這個身分可以核准的
-    pub fn can_approve(&self, r: &RolloutRow) -> bool {
-        r.state == rollout::ROLLOUT_PENDING_APPROVAL && self.blocked(r).is_none()
+    pub fn can_approve(&self, s: &dyn Store, r: &RolloutRow) -> StoreResult<bool> {
+        Ok(r.state == rollout::ROLLOUT_PENDING_APPROVAL && self.blocked(s, r)?.is_none())
     }
 
-    /// 推送 JSON 的 `viewer`（待核准時才有意義）
-    pub fn json(&self, r: &RolloutRow) -> Value {
-        json!({
-            "can_approve": self.can_approve(r),
-            "blocked": self.blocked(r),
-            "is_creator": self.actor == r.created_by,
-            "is_submitter": r.submitted_by.as_deref() == Some(self.actor.as_str()),
-        })
+    /// 推送 JSON 的 `viewer`（待核准時才有意義）。`is_creator`／`is_submitter` 也以背後的使用者身分判斷，
+    /// 讓主控台不會把「以自己擁有的 token 建立推送」的管理員顯示成可核准者
+    pub fn json(&self, s: &dyn Store, r: &RolloutRow) -> StoreResult<Value> {
+        let blocked = self.blocked(s, r)?;
+        let can_approve = r.state == rollout::ROLLOUT_PENDING_APPROVAL && blocked.is_none();
+        let is_creator = same_person(s, &self.actor, self.acting_user, &r.created_by)?;
+        let is_submitter = match r.submitted_by.as_deref() {
+            Some(sb) => same_person(s, &self.actor, self.acting_user, sb)?,
+            None => false,
+        };
+        Ok(json!({
+            "can_approve": can_approve,
+            "blocked": blocked,
+            "is_creator": is_creator,
+            "is_submitter": is_submitter,
+        }))
     }
 }
 
@@ -390,7 +489,7 @@ pub(crate) fn submission_json(
     let waves = rollout::waves_from_db(&r.waves);
     let no_rollback = no_rollback_count(&ctx, hosts, &cx.inventory);
     let problems = fixed_problems(&cx.missing, r, &options, hosts, &cx.inventory);
-    let available = approvers_available(&cx.approvers, &r.created_by, r.submitted_by.as_deref());
+    let available = approvers_available(s, &cx.approvers, &r.created_by, r.submitted_by.as_deref())?;
     let mut warnings = rollout::risk_warnings(
         &waves,
         &sub.waves,
@@ -536,30 +635,86 @@ mod tests {
         );
     }
 
+    /// 以實際的 store 建立使用者與 token，驗證雙人覆核以**背後的使用者身分**比對（ADR-0002 S1 的安全修正）：
+    /// 執行者字串比對（`token:<id>` ≠ `user:<帳號>`）會被單一管理員繞過，這裡展開回背後的人
     #[test]
-    fn viewer_rules_match_the_approve_endpoint() {
-        let r = rollout(100);
-        let v = |actor: &str, session, approve| Viewer {
+    fn viewer_rules_and_identity_expansion() {
+        use crate::store::db::Store;
+        use crate::users::store::{NewUser, SOURCE_LOCAL};
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::sqlite::migrate(&mut conn, crate::store::sqlite::MIGRATIONS).unwrap();
+        let s: &dyn Store = &conn;
+        let mk = |name: &str| {
+            s.create_user(
+                &NewUser {
+                    username: name,
+                    source: SOURCE_LOCAL,
+                    ..Default::default()
+                },
+                "test",
+                1,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let alice = mk("alice");
+        let _bob = mk("bob");
+        let _carol = mk("carol");
+        let _dan = mk("dan");
+        // alice 擁有、bob 建立的 token
+        s.insert_api_token(
+            "tok1",
+            "t",
+            &[1u8; 32],
+            "",
+            1,
+            Some("user:bob"),
+            None,
+            Some("admin"),
+            Some(alice),
+        )
+        .unwrap();
+
+        let v = |actor: &str, uid: Option<i64>, session, approve| Viewer {
             actor: actor.into(),
+            acting_user: uid,
             session,
             approve,
         };
+
+        // 帳號對帳號（原本的行為）：rollout(100) 建立者 user:alice、送出者 user:bob
+        let r = rollout(100);
         assert_eq!(
-            v("user:alice", true, true).blocked(&r),
+            v("user:alice", None, true, true).blocked(s, &r).unwrap(),
             Some("self_approval")
         );
-        assert_eq!(v("user:bob", true, true).blocked(&r), Some("self_approval"));
-        assert_eq!(v("user:carol", true, true).blocked(&r), None);
-        assert_eq!(v("user:carol", true, false).blocked(&r), Some("forbidden"));
         assert_eq!(
-            v("token:t1", false, true).blocked(&r),
+            v("user:bob", None, true, true).blocked(s, &r).unwrap(),
+            Some("self_approval")
+        );
+        assert_eq!(
+            v("user:carol", None, true, true).blocked(s, &r).unwrap(),
+            None
+        );
+        assert_eq!(
+            v("user:carol", None, true, false).blocked(s, &r).unwrap(),
+            Some("forbidden")
+        );
+        assert_eq!(
+            v("token:tok1", Some(alice), false, true)
+                .blocked(s, &r)
+                .unwrap(),
             Some("session_required")
         );
-        assert!(v("user:carol", true, true).can_approve(&r));
+        assert!(v("user:carol", None, true, true).can_approve(s, &r).unwrap());
         let mut draft = r.clone();
         draft.state = rollout::ROLLOUT_DRAFT.into();
-        assert!(!v("user:carol", true, true).can_approve(&draft));
-        let j = v("user:bob", true, true).json(&r);
+        assert!(
+            !v("user:carol", None, true, true)
+                .can_approve(s, &draft)
+                .unwrap()
+        );
+        let j = v("user:bob", None, true, true).json(s, &r).unwrap();
         assert_eq!(
             (
                 j["can_approve"].as_bool(),
@@ -569,20 +724,74 @@ mod tests {
             ),
             (Some(false), Some("self_approval"), Some(false), Some(true))
         );
-        let all = vec![
-            "user:alice".to_string(),
-            "user:bob".into(),
-            "user:carol".into(),
-        ];
-        assert_eq!(approvers_available(&all, "user:alice", Some("user:bob")), 1);
+
+        // 身分展開：建立者是 alice 擁有、bob 建立的 token，送出者是 carol
+        let mut rt = rollout(100);
+        rt.created_by = "token:tok1".into();
+        rt.submitted_by = Some("user:carol".into());
+        // alice（擁有者）、bob（建立 token 者）、carol（送出者）都不能核准
+        for who in ["user:alice", "user:bob", "user:carol"] {
+            assert_eq!(
+                v(who, None, true, true).blocked(s, &rt).unwrap(),
+                Some("self_approval"),
+                "{who} 不應能核准"
+            );
+        }
+        // 第四位管理員 dan 可以核准
+        assert_eq!(v("user:dan", None, true, true).blocked(s, &rt).unwrap(), None);
+        // alice 的 viewer.json：is_creator 為 true（背後是同一個人），主控台不把他列為可核准者
+        let j = v("user:alice", Some(alice), true, true)
+            .json(s, &rt)
+            .unwrap();
         assert_eq!(
-            approvers_available(&all[..2], "user:alice", Some("user:bob")),
+            (j["is_creator"].as_bool(), j["can_approve"].as_bool()),
+            (Some(true), Some(false))
+        );
+
+        // token 撤銷後仍然展開得到擁有者（攻擊者先撤銷自己的 token 也擋得住）
+        s.revoke_api_token("tok1", 2, Some("user:bob"), Some("test"))
+            .unwrap();
+        assert_eq!(
+            v("user:alice", Some(alice), true, true)
+                .blocked(s, &rt)
+                .unwrap(),
+            Some("self_approval")
+        );
+
+        // approvers_available：以背後的使用者身分排除 alice、bob、carol，只剩 dan
+        let all: Vec<String> = ["alice", "bob", "carol", "dan"]
+            .iter()
+            .map(|n| format!("user:{n}"))
+            .collect();
+        assert_eq!(
+            approvers_available(s, &all, "token:tok1", Some("user:carol")).unwrap(),
+            1
+        );
+        // 帳號對帳號的舊情境
+        assert_eq!(
+            approvers_available(s, &all[..3], "user:alice", Some("user:bob")).unwrap(),
+            1
+        );
+        assert_eq!(
+            approvers_available(s, &all[..2], "user:alice", Some("user:bob")).unwrap(),
             0
         );
         assert_eq!(
-            approvers_available(&all[..2], "user:alice", Some("user:alice")),
+            approvers_available(s, &all[..2], "user:alice", Some("user:alice")).unwrap(),
             1
         );
+
+        // cli: 無法對應 Kairos 使用者：CLI 建立／送出的推送可由任何管理員工作階段核准
+        let mut rc = rollout(100);
+        rc.created_by = "cli:root".into();
+        rc.submitted_by = Some("cli:root".into());
+        assert_eq!(
+            v("user:alice", Some(alice), true, true)
+                .blocked(s, &rc)
+                .unwrap(),
+            None
+        );
+        assert!(backing_user_ids(s, "cli:root").unwrap().is_empty());
     }
 
     #[test]

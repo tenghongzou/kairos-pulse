@@ -531,6 +531,93 @@ async fn creator_and_submitter_cannot_approve_and_available_approvers_are_counte
     approve(&fx, &carol, &id).await.unwrap();
 }
 
+/// 安全回歸（B1 繞過修正 B，ADR-0002 S1）：核准以**背後的使用者身分**比對，不只是執行者字串。
+/// alice 擁有、bob 建立的 token 建立並送出推送 → alice 與 bob 的工作階段都不能核准（self_approval）；
+/// token 撤銷後仍然擋得住（攻擊者可能先撤銷自己的 token）；可核准者排除 alice 與 bob，只剩第三位管理員 carol。
+/// cli 建立／送出的推送沒有對應的 Kairos 使用者，任何管理員工作階段都能核准
+#[tokio::test]
+async fn approval_compares_the_person_behind_a_token_not_the_actor_string() {
+    let (fx, _) = fixture("b1", 46).await;
+    let alice_id = add_user(&fx, "alice", Role::Admin).await;
+    add_user(&fx, "bob", Role::Admin).await;
+    add_user(&fx, "carol", Role::Admin).await;
+    let (alice, bob, carol) = (user("alice"), user("bob"), user("carol"));
+    // alice 擁有、bob 建立的 token
+    fx.svc
+        .db
+        .write(move |s| {
+            s.insert_api_token(
+                "tokalice",
+                "a",
+                &[9u8; 32],
+                "",
+                T0,
+                Some("user:bob"),
+                None,
+                Some("admin"),
+                Some(alice_id),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let tok = Actor {
+        actor: "token:tokalice".into(),
+        ip: None,
+    };
+    // 以 token 建立並送出（引擎層測身分展開；API 層的 required 另有 session_required 的測試）
+    let id = create(&fx, &tok, &body("x")).await;
+    let v = submit(&fx, &tok, &id, "升級 2 台").await;
+    assert_eq!(v["state"], "pending_approval");
+    // 主控台看到的可核准者：排除 alice（擁有者）與 bob（建立 token 者），只剩 carol
+    assert_eq!(v["submission"]["approvers_available"], 1);
+    // alice、bob 的工作階段都不能核准（self_approval）
+    for who in [&alice, &bob] {
+        let e = approve(&fx, who, &id).await.unwrap_err();
+        assert_eq!(
+            (e.status.as_u16(), e.code),
+            (403, "self_approval"),
+            "{} 不應能核准",
+            who.actor
+        );
+    }
+    // token 撤銷後仍然擋得住
+    fx.svc
+        .db
+        .write(|s| {
+            s.revoke_api_token("tokalice", T0, Some("user:bob"), Some("rotate"))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        submission_json_of(&fx, &id).await["approvers_available"],
+        1,
+        "撤銷後仍排除 alice 與 bob"
+    );
+    for who in [&alice, &bob] {
+        let e = approve(&fx, who, &id).await.unwrap_err();
+        assert_eq!(e.code, "self_approval", "撤銷後 {} 仍不應能核准", who.actor);
+    }
+    // 第三位管理員 carol 可以核准
+    approve(&fx, &carol, &id).await.unwrap();
+    assert_eq!(state_of(&fx, &id).await.state, "running");
+    fx.svc
+        .cancel_rollout(&carol, id.clone(), "結束".into())
+        .await
+        .unwrap();
+
+    // cli 建立／送出的推送：沒有對應的 Kairos 使用者，管理員工作階段可核准
+    let cli = Actor {
+        actor: "cli:root".into(),
+        ip: None,
+    };
+    let id2 = create(&fx, &cli, &body("y")).await;
+    submit(&fx, &cli, &id2, "升級 2 台").await;
+    approve(&fx, &alice, &id2).await.unwrap();
+    assert_eq!(state_of(&fx, &id2).await.state, "running");
+}
+
 /// A4：`rollout_approval` 改為 `none` 之後，既有的待核准推送仍然要核准或退回（核准只看推送的狀態）
 #[tokio::test]
 async fn pending_rollouts_still_need_approval_after_the_policy_is_turned_off() {

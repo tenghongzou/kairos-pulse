@@ -880,16 +880,19 @@ async fn remote(ctx: &ApiContext) -> Item {
                 0
             } else {
                 let approvers = crate::remote::submission::approvers(s, now_ms)?;
-                pending
-                    .iter()
-                    .filter(|r| {
-                        crate::remote::submission::approvers_available(
-                            &approvers,
-                            &r.created_by,
-                            r.submitted_by.as_deref(),
-                        ) == 0
-                    })
-                    .count()
+                let mut n = 0usize;
+                for r in &pending {
+                    if crate::remote::submission::approvers_available(
+                        s,
+                        &approvers,
+                        &r.created_by,
+                        r.submitted_by.as_deref(),
+                    )? == 0
+                    {
+                        n += 1;
+                    }
+                }
+                n
             };
             Ok((
                 running.len(),

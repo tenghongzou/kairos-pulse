@@ -84,6 +84,7 @@ fn service(ctx: &ApiContext, config_area: bool) -> Result<Arc<RemoteService>, Ap
 fn viewer_of(p: &Principal) -> Viewer {
     Viewer {
         actor: p.actor(),
+        acting_user: p.acting_user_id(),
         session: matches!(p.kind, super::auth::PrincipalKind::Session { .. }),
         approve: p.grants.has(Permission::RolloutsApprove),
     }
@@ -1227,7 +1228,7 @@ async fn rollouts(
                                 v["submission"] = submission::submission_json(s, r, &hosts, cx)
                                     .map_err(|e| e.into_api("升級推送"))?;
                             }
-                            v["viewer"] = viewer.json(r);
+                            v["viewer"] = viewer.json(s, r).map_err(query_failed("升級推送"))?;
                         }
                         out.push(v);
                     }
@@ -1245,8 +1246,13 @@ async fn rollouts(
                         .list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))
                         .map_err(query_failed("升級推送"))?;
                     // 這次請求的身分可以核准的筆數（有 rollouts:approve、是帳號登入的工作階段、不是建立者
-                    // 或送出者）：由後端計算，SideNav 的泡泡只計這個數字
-                    let actionable = pending.iter().filter(|r| viewer.can_approve(r)).count();
+                    // 或送出者本人）：由後端計算，SideNav 的泡泡只計這個數字
+                    let mut actionable = 0usize;
+                    for r in &pending {
+                        if viewer.can_approve(s, r).map_err(query_failed("升級推送"))? {
+                            actionable += 1;
+                        }
+                    }
                     Ok((
                         out,
                         json!({
@@ -1335,6 +1341,18 @@ async fn rollouts(
             let v = match *action {
                 "submit" => {
                     reject_unknown_fields(&b, &["confirm", "reason"])?;
+                    // 雙人覆核（REMOTE.md 第 5.4 節）：required 模式下送出推送必須是真人（以帳號登入的
+                    // 工作階段），純 token／CLI 自動化不能送出。否則單一管理員能用自己的 token 建立並送出、
+                    // 再用自己的工作階段核准（送出者與核准者是同一個背後的人）。none 模式照舊接受 token／CLI
+                    if svc.settings.approval_required()
+                        && !matches!(p.kind, super::auth::PrincipalKind::Session { .. })
+                    {
+                        return Err(ApiError::new(
+                            StatusCode::FORBIDDEN,
+                            "session_required",
+                            "雙人覆核（remote.rollout_approval = \"required\"）下，送出推送需要以帳號登入的工作階段（API token 與 CLI 不能送出）",
+                        ));
+                    }
                     svc.submit_rollout(&who, id, opt_string(&b, "confirm")?, reason)
                         .await?
                 }
@@ -1442,7 +1460,7 @@ async fn rollout_detail(
                     .map_err(query_failed("升級推送"))?;
                 v["submission"] = submission::submission_json(s, &r, &hosts, &cx)
                     .map_err(|e| e.into_api("升級推送"))?;
-                v["viewer"] = viewer.json(&r);
+                v["viewer"] = viewer.json(s, &r).map_err(query_failed("升級推送"))?;
             }
             Ok((r, v))
         })

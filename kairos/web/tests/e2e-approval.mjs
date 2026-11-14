@@ -354,6 +354,68 @@ export function registerApproval({ test, newPage, waitTitle, axe, shot, FakeAgen
     await ca.ctx.close();
   });
 
+  // B1 安全回歸（0.10.0 的修正）：以自己擁有的 API token 建立推送，身分會展開回背後的使用者——
+  // required 時 token 不能送出（session_required），且 token 擁有者不能核准由該 token 建立的推送（self_approval）
+  test('雙人覆核 B1：自己擁有的 token 建立的推送，token 不能送出、擁有者不能核准', async () => {
+    const al = await session('alice');
+    // alice 建立一個「擁有者＝alice」的 API token
+    const t = await api(al.page, 'POST', '/api/v1/api-tokens', { name: 'E2E B1 token', owner: 'alice', expires_in_secs: 3600 });
+    assert.equal(t.status, 201, JSON.stringify(t.json));
+    const token = t.json.data.token;
+    const tokenApi = (page, method, path, body) =>
+      page.evaluate(
+        async ([m, p, b, tok]) => {
+          const r = await fetch(p, { method: m, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` }, body: b == null ? undefined : JSON.stringify(b) });
+          let json = null;
+          try {
+            json = await r.json();
+          } catch {
+            json = null;
+          }
+          return { status: r.status, json };
+        },
+        [method, path, body, token],
+      );
+    // 以 token 建立草稿（建立允許 token——不固定對象、不觸發核准）
+    const c = await tokenApi(al.page, 'POST', '/api/v1/rollouts', spec('E2E B1 token', A1));
+    assert.equal(c.status, 201, JSON.stringify(c.json));
+    const id = c.json.data.id;
+    // 修正 A：required 模式下 token 不能送出（403 session_required），狀態維持草稿
+    const d = await tokenApi(al.page, 'GET', `/api/v1/rollouts/${id}`);
+    const tokSubmit = await tokenApi(al.page, 'POST', `/api/v1/rollouts/${id}/submit`, { confirm: d.json.data.preview.confirm_text });
+    assert.deepEqual([tokSubmit.status, tokSubmit.json.error.code], [403, 'session_required'], 'token 不能送出');
+    assert.equal((await stateOf(al.page, id)).state, 'draft');
+    // 由 bob 的工作階段送出 → pending_approval（建立者是 token，送出者是 bob）
+    const bo = await session('bob', '/pulse/rollouts', '升級推送');
+    const bd = await api(bo.page, 'GET', `/api/v1/rollouts/${id}`);
+    const s = await api(bo.page, 'POST', `/api/v1/rollouts/${id}/submit`, { confirm: bd.json.data.preview.confirm_text });
+    assert.deepEqual([s.status, s.json.data.state], [200, 'pending_approval'], JSON.stringify(s.json));
+    // alice（建立該 token 的擁有者）開待核准詳情：看不到「核准…」「退回…」，被認定為建立者，泡泡不計
+    await al.page.goto(`${BASE}/pulse/rollouts/${id}`);
+    await waitTitle(al.page, 'E2E B1 token');
+    await al.page.locator('.ds-alert', { hasText: '待核准' }).waitFor();
+    assert.equal(await al.page.getByRole('button', { name: /^(核准…|退回…)$/ }).count(), 0, 'token 擁有者看不到核准、退回');
+    const view = await stateOf(al.page, id);
+    assert.equal(view.viewer.can_approve, false);
+    assert.equal(view.viewer.blocked, 'self_approval');
+    assert.equal(view.viewer.is_creator, true, 'token 擁有者被認定為建立者');
+    assert.equal(view.submission.approvers_available, 1, '只剩第三位管理員 carol 可以核准');
+    const mine = await api(al.page, 'GET', '/api/v1/rollouts');
+    assert.equal(mine.json.meta.pending_approval_actionable, 0, 'alice 不能核准任何待核准的推送');
+    // alice 直接打 API 核准也被拒（self_approval；身分展開後擁有者＝建立者）
+    const self = await api(al.page, 'POST', `/api/v1/rollouts/${id}/approve`, { confirm: view.submission.confirm_text, digest: view.submission.digest });
+    assert.deepEqual([self.status, self.json.error.code], [403, 'self_approval'], '身分展開後 token 擁有者不能核准');
+    // 第三位管理員 carol 可以核准
+    const ca = await session('carol');
+    const cv = (await stateOf(ca.page, id)).submission;
+    const ok = await api(ca.page, 'POST', `/api/v1/rollouts/${id}/approve`, { confirm: cv.confirm_text, digest: cv.digest });
+    assert.deepEqual([ok.status, ok.json.data.state], [200, 'running'], JSON.stringify(ok.json));
+    await cancel(ca.page, id);
+    await al.ctx.close();
+    await bo.ctx.close();
+    await ca.ctx.close();
+  });
+
   test('雙人覆核 E1：降版的核准是 L3 字串「核准降版 N 台」，原因必填', async () => {
     const al = await session('alice');
     const id = await createAndSubmit(al.page, al.page, spec('E2E 降版', A2, { options: { allow_downgrade: true } }), 'E2E：回到 0.9.1');
