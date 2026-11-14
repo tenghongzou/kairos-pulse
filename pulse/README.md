@@ -541,7 +541,7 @@ health_timeout_secs = 0        # 替換後的健康確認期限（0 = 依 Kairos
 | `inventory.interval` | 300～86400 秒 | |
 | `upgrade.health_timeout_secs` | 0，或 120～3600 秒 | 0 = 依 Kairos 推送的值（預設 600） |
 | `upgrade.extra_principals` | 每項 1～256 bytes，不含空白與逗號 | |
-| `upgrade.url_allowlist` | 每項以 `https://` 開頭 | 0.10.0：外部 URL 的版本庫。以目錄比對；不合法的項目（查詢字串、帳號密碼…）不比對任何 URL，啟動時記 `WARN` |
+| `upgrade.url_allowlist` | 每項以 `https://` 開頭 | 0.10.0：外部 URL 的版本庫。以目錄比對；不合法的項目（查詢字串、帳號密碼…）不比對任何 URL，啟動時記 `WARN`。0.10.1 之後的版本：Pulse 在 hello 的 `install.external_url` 向 Kairos 宣告白名單是空的（`none`）或有內容（`allowlist`），讓外部 URL 版本的資格預覽事先列出不允許的主機；**白名單的內容不會送出**（`crates/kairos-proto/REMOTE.md` 第 2.1 節） |
 
 ### ⚠️ 安全性提醒
 

@@ -57,6 +57,16 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
   - 預覽（`POST /api/v1/rollouts/preview`）與推送詳情新增 `upcoming_windows[]`：接下來 3 次時段實際的開始與結束（當地時間含當時的位移）、實際長度、是否受日光節約時間影響（`dst`：`gap`／`fold`）；預覽另有 `timezone`（`kind`、目前的位移、時區資料庫的版本）。主控台建立推送的表單新增「升級時段的時區」（可輸入或從建議清單選擇），並列出接下來的時段讓操作者在送出前確認。
   - **時區資料庫編進執行檔**（新依賴 `chrono-tz` 0.10.4，內含 tzdb 2025b；另帶入 `phf`、`phf_shared` 0.12，授權 MIT／Apache-2.0，`deny.toml` 不變）：不讀主機的 `/usr/share/zoneinfo`，Linux、musl 與 Windows 的結果相同，建置時沒有程式碼產生，發佈包維持可重現。**時區資料隨 Kairos 的版本更新**；某地臨時修改日光節約時間的規則而 Kairos 尚未更新時，可以先把推送的時區改為固定位移。
   - 不需要資料庫遷移（`rollouts.schedule` 是 JSON 文字欄位，SQLite 與 PostgreSQL 兩個後端原樣保存）、不需要協定變更（給 Pulse 的 `apply_window` 本來就是絕對時間）。**降回 0.10.1 以前的 Kairos 時**，舊版不認得時區名稱：請先把使用時區名稱的推送改回固定位移或取消。
+- **外部 URL 版本的資格預覽事先列出不允許的主機**（REMOTE.md 第 2.1、4.1.2、4.7.2 節；ADR-0002 決策點 5c）：Pulse 在 hello 宣告本機是否允許從外部 URL 下載（見下方「Pulse：遠端管理」），Kairos 建立外部 URL 版本的推送時，把宣告「不允許」（本機 `upgrade.url_allowlist` 是空的）的主機在預覽與送出時分類為 **`url_not_allowed`**——以前它們算可升級，要到推送中才回報 `declined`（`PLS-W8411`）。沒有宣告（0.10.1 以前的 Pulse）與宣告有白名單的主機**照舊**算可升級，其中不允許這個 URL 的仍在推送中回報 `declined`、不計入失敗比例；預覽新增 `external_url`（`base_url`、`undeclared`、`allowlist`：可升級主機中沒有宣告與宣告有白名單的台數），主控台據此註明並附可複製的 `pulse.toml` 片段。由 Kairos 代管的版本不受影響；回滾檔的規則不變。主機 API（`GET /api/v1/hosts`、`…/{agent_id}`、`…/{agent_id}/upgrade`）的 `install` 多 `external_url`（`none`／`allowlist`／`null`），S05 的「升級」卡片顯示。
+  - **資料庫升級到 schema v12**（SQLite 與 PostgreSQL 兩個後端）：`hosts` 新增一個可為 NULL 的欄位 `install_external_url`，第一次以新版啟動時自動升級，既有資料不變。**升級後 0.10.1 以前的 Kairos 無法開啟這個資料庫**（降版請從升級前的備份還原）；叢集請依 INSTALL「schema 改變的版本」的步驟（停止所有節點 → 升級 → 啟動）。
+
+### Pulse：遠端管理
+
+- **hello 宣告是否允許外部 URL**（REMOTE.md 第 2.1 節；PROTOCOL.md「hello 的 `install`」）：`install` 多一個選用欄位 `external_url`——`none`（本機 `upgrade.url_allowlist` 是空的，或沒有任何有效的項目）或 `allowlist`（至少有一個有效的前綴）。**只宣告「有沒有白名單」，不送出白名單的內容或雜湊**：白名單是「這台主機可以對哪些位址發出請求」的清單，集中到 Kairos 會讓被入侵的 Kairos 直接得知可用的外連目標。修改 `pulse.toml` 的白名單後重新啟動 Pulse 才會更新宣告；Pulse 接受或拒絕外部 URL 提議的條件不變。
+
+### 相容性
+
+- 協定版本與 8443 的 feature 都不變：`install.external_url` 是 hello `install` 物件的選用欄位。新的 Pulse 連 0.9／0.10 的 Kairos——舊 Kairos 依「`install` 的其他欄位忽略」略過它，行為與現在相同。0.10.1 以前的 Pulse 連新的 Kairos——沒有這個欄位視為「未知」，維持現行行為。`kairos-proto` 新增測試向量（PROTOCOL.md「範例／遠端管理：外部 URL 的宣告」）。
 
 ## [0.10.1] - 2026-11-14
 
