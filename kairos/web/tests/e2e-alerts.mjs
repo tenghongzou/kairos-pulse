@@ -123,6 +123,28 @@ export function register({ test, newPage, login, waitTitle, axe, shot, FakeAgent
     await page.getByText('請填寫停用的原因。').waitFor();
     await page.getByRole('dialog').getByRole('button', { name: '取消' }).click();
     assert.equal(await page.getByRole('switch', { name: '啟用規則 主機長期失聯' }).getAttribute('aria-checked'), 'true');
+    // 0.10.1（H1）：「雙人覆核已關閉」不可停用——沒有開關，只有狀態；API 回 409。不可靜音——靜音表單不能勾選，API 回 400
+    const lockedRow = page.locator('tr[data-key="sys.rollout_approval_disabled"]');
+    await lockedRow.getByText('啟用（不可停用）').waitFor();
+    assert.equal(await lockedRow.getByRole('switch').count(), 0, '不可停用的規則沒有開關');
+    await lockedRow.getByText('不可停用、不可靜音').waitFor();
+    await page.locator('tr[data-key="sys.unauthenticated"]').getByText('不可靜音', { exact: true }).waitFor();
+    assert.equal(await page.locator('tr[data-key="sys.unauthenticated"]').getByRole('switch').count(), 1, '未認證連線的規則仍可停用');
+    await axe(page, '告警規則（不可停用的系統規則）');
+    const denied = await apiCall(page, 'POST', '/api/v1/alert-rules/sys.rollout_approval_disabled/disable', { reason: 'e2e' });
+    assert.equal(denied.status, 409);
+    assert.equal(denied.json.error.code, 'rule_always_enabled');
+    const noSilence = await apiCall(page, 'POST', '/api/v1/silences', { kind: 'silence', name: 'e2e 預先靜音', reason: 'e2e', rules: ['sys.rollout_approval_disabled'], duration_secs: 600 });
+    assert.equal(noSilence.status, 400);
+    assert.equal(noSilence.json.error.code, 'rule_unsilenceable');
+    await page.goto(`${URL0}/alerts/silences/new?type=silence&rules=sys.rollout_approval_disabled,sys.host_long_offline`);
+    const box = page.getByRole('checkbox', { name: /雙人覆核已關閉/ });
+    await box.waitFor();
+    assert.equal(await box.isDisabled(), true, '不可靜音的規則不能勾選');
+    assert.equal(await box.isChecked(), false, '網址帶進來的預選也拿掉');
+    assert.equal(await page.getByRole('checkbox', { name: /主機長期失聯/ }).isChecked(), true);
+    await page.getByText('（不可靜音）').first().waitFor();
+    await axe(page, '新增靜音（不可靜音的規則）');
     await ctx.close();
   });
 

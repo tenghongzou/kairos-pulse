@@ -613,6 +613,10 @@ async fn get_alert(c: &Ctx<'_>, id: &str) -> Result<Response<ApiBody>, ApiError>
         vec!["comment"]
     } else {
         let mut a = vec!["assign", "snooze", "resolve", "comment", "silence"];
+        // 不可靜音的系統規則：不提供「建立靜音」
+        if rules::is_unsilenceable(&ev.rule_id) {
+            a.retain(|x| *x != "silence");
+        }
         if !ev.acked {
             a.insert(0, "ack");
         }
@@ -793,6 +797,9 @@ fn rule_json(r: &Rule, stats: Option<(u64, u64)>) -> Value {
         "category": r.category,
         "name": r.name,
         "enabled": r.enabled,
+        // 受保護的系統規則（由程式碼決定，rules.rs）：事件不受靜音影響、不可停用
+        "unsilenceable": rules::is_unsilenceable(&r.rule_id),
+        "always_enabled": rules::is_always_enabled(&r.rule_id),
         "severity": r.severity,
         "max_severity": r.max_severity(),
         "attention": r.attention(),
@@ -1173,6 +1180,24 @@ async fn enable_rule(
             "停用系統預設規則必須填寫原因（L1）",
         )
         .with_details(json!({ "parameter": "reason" })));
+    }
+    // 不可停用的系統規則（0.10.1：「雙人覆核已關閉」）：停用它等於讓關閉雙人覆核不留下告警
+    if !on && rules::is_always_enabled(&rule.rule_id) {
+        c.audit(
+            "alert_rule.disable",
+            Some(id),
+            "rejected",
+            json!({ "reason": reason, "error": "rule_always_enabled" }),
+        )
+        .await;
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "rule_always_enabled",
+            format!(
+                "系統規則「{}」不可停用；它的事件也不受靜音影響。不需要通知時可以調整通知管道，但事件仍會記錄",
+                rule.name
+            ),
+        ));
     }
     if rule.enabled == on {
         return Ok(http::ok(c.now, rule_json(&rule, None)));

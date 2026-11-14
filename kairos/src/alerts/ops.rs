@@ -148,6 +148,22 @@ pub fn validate_silence(
         .collect();
     rules.sort();
     rules.dedup();
+    // 不可靜音的系統規則（未認證連線、雙人覆核已關閉）：這次請求選了它就拒絕，不要建立一筆沒有作用
+    // 的靜音。只在請求帶了 rules 時檢查——既有的靜音（升級前建立的）仍可修改其他欄位，它對這些
+    // 規則本來就不生效（engine 的 silence_match）
+    if input.rules.is_some()
+        && let Some(id) = rules.iter().find(|r| super::rules::is_unsilenceable(r))
+    {
+        let name = all_rules
+            .iter()
+            .find(|r| &r.rule_id == id)
+            .map_or(id.as_str(), |r| r.name.as_str());
+        return Err(Invalid {
+            code: "rule_unsilenceable",
+            details: json!({ "rule_id": id }),
+            ..invalid("rules", format!("規則「{name}」不可靜音"))
+        });
+    }
     let from_emergency = from_event.is_some_and(|e| e.severity == Severity::Emergency);
     let plan = plan(
         kind,
@@ -414,6 +430,44 @@ mod tests {
             .code,
             "rule_not_found"
         );
+        // 不可靜音的系統規則：選了就拒絕
+        for id in [
+            rules::ids::ROLLOUT_APPROVAL_DISABLED,
+            rules::ids::UNAUTHENTICATED,
+        ] {
+            let e = validate_silence(
+                &input("silence", &[rules::ids::RETENTION_PAUSED, id], 60),
+                None,
+                &all,
+                None,
+                3,
+                "t",
+                now,
+            )
+            .unwrap_err();
+            assert_eq!((e.code, e.field.as_str()), ("rule_unsilenceable", "rules"));
+            assert_eq!(e.details["rule_id"], id);
+        }
+        // 既有的靜音（升級前建立、已經選了它）仍可修改其他欄位
+        let (mut old, _) = validate_silence(
+            &input("silence", &[rules::ids::RETENTION_PAUSED], 3600),
+            None,
+            &all,
+            None,
+            3,
+            "t",
+            now,
+        )
+        .unwrap();
+        old.rules
+            .push(rules::ids::ROLLOUT_APPROVAL_DISABLED.to_string());
+        let patch = SilenceInput {
+            reason: Some("改原因".into()),
+            ..SilenceInput::default()
+        };
+        let (updated, _) =
+            validate_silence(&patch, Some(&old), &all, None, 3, "t", now + 1).unwrap();
+        assert_eq!(updated.reason, "改原因");
         // 確認：大範圍、包含緊急
         let (_, plan) = validate_silence(
             &input("silence", &[rules::ids::SUBNET_OFFLINE], 3600),

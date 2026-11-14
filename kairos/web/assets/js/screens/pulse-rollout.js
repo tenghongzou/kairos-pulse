@@ -39,6 +39,7 @@ import {
   scheduleSummary,
   submissionView,
   waitedText,
+  unapprovedBadge,
   HOST_STATES,
 } from './pulse-common.js';
 
@@ -354,7 +355,7 @@ export function render(ctx) {
       pageHead({
         title: r.name,
         crumbs: [CRUMB, { text: r.name }],
-        meta: [rolloutStateBadge(r.state), ' ', t('rm.det.meta', { v: r.target_version, who: r.created_by || '—', time: fmt.dateTime(r.created_at, { seconds: false }) })],
+        meta: [rolloutStateBadge(r.state), ' ', r.approval === 'not_required' ? [unapprovedBadge(r.rollout_approval === 'required'), ' '] : null, t('rm.det.meta', { v: r.target_version, who: r.created_by || '—', time: fmt.dateTime(r.created_at, { seconds: false }) })],
         actions: acts.length ? acts : null,
       }),
     );
@@ -364,6 +365,21 @@ export function render(ctx) {
     const out = [];
     if (r.state === 'draft') out.push(inlineAlert({ kind: 'info', body: t('rm.det.draftNote') }));
     if (r.state === 'draft' && r.reject_reason) out.push(inlineAlert({ kind: 'warning', title: t('rm.det.rejected'), body: t('rm.det.rejectedBody', { reason: r.reject_reason }) }));
+    // 沒有經過核准就開始（或排定開始）的推送（0.10.1；API 的 approval = 'not_required'）：目前的設定要求覆核時為警告
+    if (r.approval === 'not_required') {
+      const requiredNow = r.rollout_approval === 'required';
+      out.push(
+        h(
+          'div',
+          { id: 'rollout-unapproved', dataset: { emphasis: requiredNow ? 'warning' : 'info' } },
+          inlineAlert({
+            kind: requiredNow ? 'warning' : 'info',
+            title: t(r.state === 'scheduled' ? 'rm.appr.title.scheduled' : 'rm.appr.title.started'),
+            body: [t('rm.appr.body', { who: r.submitted_by || '—' }), requiredNow ? t('rm.appr.bodyRequiredNow') : t('rm.appr.bodyAudit')].map((x) => h('p', null, x)),
+          }),
+        ),
+      );
+    }
     if (r.state === 'pending_approval') {
       // 依身分的說明（ADR-0002 決策點 2c、2d）：可以核准的人、建立者或送出者、其他人
       const v = r.viewer || {};
@@ -465,7 +481,7 @@ export function render(ctx) {
         }),
       );
     }
-    if (r.submitted_at || r.reject_reason) {
+    if (r.submitted_at || r.reject_reason || r.approval === 'unknown') {
       const whoAt = (who, at) => (at ? t('rm.rev.whoAt', { who: who || '—', time: fmt.dateTime(at, { seconds: false }) }) : t('rm.rev.none'));
       out.push(
         card({
@@ -476,6 +492,9 @@ export function render(ctx) {
               [t('rm.rev.created'), whoAt(r.created_by, r.created_at)],
               [t('rm.rev.submitted'), whoAt(r.submitted_by, r.submitted_at)],
               r.approved_at ? [t('rm.rev.approved'), whoAt(r.approved_by, r.approved_at)] : null,
+              // 沒有核准紀錄而已經開始或排定（0.10.1）：送出時政策為 none，或 0.10 之前的推送（無法判斷）
+              !r.approved_at && r.approval === 'not_required' ? [t('rm.appr.row'), h('span', { id: 'rollout-approval', dataset: { approval: 'not_required' } }, t('rm.appr.notRequired'))] : null,
+              !r.approved_at && r.approval === 'unknown' ? [t('rm.appr.row'), h('span', { id: 'rollout-approval', dataset: { approval: 'unknown' } }, t('rm.appr.unknown'))] : null,
               r.reject_reason ? [t('rm.rev.rejected'), r.reject_reason] : null,
             ]),
             session.can('audit:read') ? h('p', null, h('a', { href: `/audit${qs({ target: id })}` }, t('rm.rev.audit'))) : null,

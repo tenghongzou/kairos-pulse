@@ -64,6 +64,7 @@ struct Session {
     csrf: String,
 }
 
+#[derive(Clone, Copy)]
 enum Auth<'a> {
     None,
     Token(&'a str),
@@ -689,6 +690,8 @@ async fn every_role_is_denied_what_it_lacks() {
             &["ad"],
         ),
         ("GET", "/api/v1/rollouts", None, &["ad", "op", "au"]),
+        // 0.10.1：計數的輕量端點，權限與清單相同（唯讀角色不查推送）
+        ("GET", "/api/v1/rollouts/summary", None, &["ad", "op", "au"]),
         (
             "POST",
             "/api/v1/rollouts/preview",
@@ -2235,6 +2238,14 @@ async fn rollout_approval_needs_another_admins_session() {
         );
         assert_eq!(j["data"][0]["submission"]["digest"], digest.as_str());
         assert_eq!(j["data"][0]["submission"]["approvers_available"], 1);
+        // 0.10.1（H3）：計數的輕量端點依同一個身分計算，數字與清單的 meta 相同
+        let s = call(&f, "GET", "/api/v1/rollouts/summary", auth, None, &[]).await;
+        assert_eq!(s.status, 200, "{blocked:?}");
+        let s = s.json();
+        for (k, v) in j["meta"].as_object().unwrap() {
+            assert_eq!(&s["data"][k], v, "{blocked:?} {k}");
+        }
+        assert_eq!(s["data"]["states"]["pending_approval"], 1, "{blocked:?}");
     }
     // 系統健康：待核准 1 個、沒有「沒有可核准者」的推送
     let r = call(

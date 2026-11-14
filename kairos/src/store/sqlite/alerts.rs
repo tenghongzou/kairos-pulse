@@ -157,6 +157,17 @@ pub fn ensure_builtin_rules(conn: &Connection, now_ms: i64) -> rusqlite::Result<
             refs.as_slice(),
         )?;
     }
+    // 受保護的系統規則（不可靜音、不可停用）：既有的列同步成程式碼規定的樣子——升級上來的環境裡
+    // 這些列是舊版寫入的（沒有 `unsilenceable`，也可能已經被停用）
+    for id in rules::protected_ids() {
+        if let Some(mut r) = get_rule(conn, id)?
+            && rules::enforce_protected(&mut r)
+        {
+            r.updated_at = now_ms;
+            r.updated_by = "system".to_string();
+            save_rule(conn, &r)?;
+        }
+    }
     Ok(n)
 }
 

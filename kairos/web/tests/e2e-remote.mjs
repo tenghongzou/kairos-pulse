@@ -333,14 +333,36 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(schSubmit.status, 200, JSON.stringify(schSubmit.json));
     assert.equal(schSubmit.json.data.state, 'scheduled');
     assert.equal(schSubmit.json.data.next_action.code, 'scheduled');
+    // 0.10.1（H2）：雙人覆核為 none 時送出的推送標示為沒有經過核准（approval = not_required）；這個 Kairos 的
+    // 設定本來就是 none，所以是中性的標籤與資訊，不是警告。送出時生效的設定記錄在稽核
+    assert.equal(sch.json.data.approval, null, '草稿沒有標示');
+    assert.equal(schSubmit.json.data.approval, 'not_required');
+    const schAudit = await api(page, 'GET', '/api/v1/audit?action=rollout.submit');
+    assert.equal(schAudit.status, 200, JSON.stringify(schAudit.json));
+    const schEntry = schAudit.json.data.find((e) => e.object === schId);
+    assert.ok(schEntry, JSON.stringify(schAudit.json.data));
+    assert.equal(schEntry.details.rollout_approval, 'none');
     await page.reload();
     await waitTitle(page, '升級推送');
     const schRow = page.locator(`tr[data-rollout="${schId}"]`);
     await schRow.getByText('已排程').first().waitFor();
     await schRow.getByText(/已排程，.* 開始/).waitFor();
+    const schBadge = schRow.locator('[data-approval="not_required"]');
+    await schBadge.waitFor();
+    assert.equal((await schBadge.textContent()).trim(), '未經核准');
+    assert.match(await schBadge.getAttribute('class'), /ds-status-badge--neutral/);
     await axe(page, 'F8 S26 推送清單（已排程）');
     await page.goto(`${URL0}/pulse/rollouts/${schId}`);
     await waitTitle(page, 'E2E 排程');
+    const schNote = page.locator('#rollout-unapproved');
+    await schNote.getByText('這個推送沒有經過另一位管理員核准，到排程的時間就會開始').waitFor();
+    assert.equal(await schNote.getAttribute('data-emphasis'), 'info');
+    await schNote.getByText(/送出時雙人覆核是關閉的/).waitFor();
+    const schApproval = page.locator('#rollout-approval[data-approval="not_required"]');
+    await schApproval.waitFor();
+    assert.equal((await schApproval.textContent()).trim(), '未經核准（送出時雙人覆核為關閉）');
+    // 頁首的標記（中性）
+    assert.match(await page.locator('.k-page-head__meta [data-approval="not_required"]').getAttribute('class'), /ds-status-badge--neutral/);
     await page.getByText(/已排程：.* 開始升級。對象已在送出時固定/).waitFor();
     await page.locator('#rollout-schedule').getByText(/升級時段：週六、週日 23:00～03:00（時區 /).waitFor();
     // 三批：先行批次、第 2 批、其餘
@@ -456,8 +478,13 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await o.ctx.close();
 
     // 自動暫停（攔截詳情：pause_cause = failure_ratio）：「已自動暫停：…」並附 KRS-W8414；
-    // 計數泡泡以清單的 meta 計算（攔截：已暫停 1＋回滾失敗未處理 2 → 3）
+    // 計數泡泡以只回計數的端點計算（0.10.1：GET /api/v1/rollouts/summary；攔截：已暫停 1＋回滾失敗未處理 2 → 3），
+    // 不取整份推送清單
     const ap = await newPage();
+    const listed = [];
+    ap.page.on('request', (rq) => {
+      if (new URL(rq.url()).pathname === '/api/v1/rollouts' && rq.method() === 'GET') listed.push(rq.url());
+    });
     await ap.page.route(`**/api/v1/rollouts/${rolloutId}`, async (route) => {
       const r = await route.fetch();
       const body = await r.json();
@@ -465,11 +492,12 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
       body.data.pause_reason = '第 1 批的失敗比例 100%（1／1）超過上限 0%';
       return route.fulfill({ response: r, json: body });
     });
-    await ap.page.route('**/api/v1/rollouts', async (route) => {
-      if (route.request().method() !== 'GET') return route.continue();
+    let summary = null;
+    await ap.page.route('**/api/v1/rollouts/summary', async (route) => {
       const r = await route.fetch();
       const body = await r.json();
-      body.meta = { ...body.meta, rollback_failed_unacknowledged: 2 };
+      summary = JSON.parse(JSON.stringify(body.data));
+      body.data = { ...body.data, rollback_failed_unacknowledged: 2 };
       return route.fulfill({ response: r, json: body });
     });
     await login(ap.page, 'admin', PW, `/pulse/rollouts/${rolloutId}`);
@@ -478,6 +506,13 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await autoAlert.getByText('KRS-W8414').waitFor();
     const apBadge = ap.page.locator('.ds-sidenav__link', { hasText: '升級推送' }).locator('.ds-sidenav__count');
     await until(async () => (await apBadge.count()) && (await apBadge.textContent()).trim() === '3', 15000, '計數泡泡 3');
+    // 伺服器回的計數：已暫停 1 個；各狀態的推送數七個鍵都有；與清單的 meta 相同。詳情頁沒有取推送清單
+    assert.equal(summary.paused, 1);
+    assert.equal(summary.states.paused, 1);
+    assert.deepEqual(Object.keys(summary.states).sort(), ['cancelled', 'completed', 'draft', 'paused', 'pending_approval', 'running', 'scheduled']);
+    const listMeta = (await api(ap.page, 'GET', '/api/v1/rollouts')).json.meta;
+    for (const k of Object.keys(listMeta)) assert.deepEqual(summary[k], listMeta[k], k);
+    assert.deepEqual(listed.filter((u) => !u.includes('?')).length, 1, '只有上面這一次明確的查詢取了清單，泡泡沒有');
     await axe(ap.page, 'F8 S26 已自動暫停');
     await ap.ctx.close();
 
@@ -824,7 +859,7 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     const asked = [];
     vs.page.on('request', (rq) => {
       const p = new URL(rq.url()).pathname;
-      if (p === '/api/v1/rollouts' || p === '/api/v1/config/profiles') asked.push(p);
+      if (p.startsWith('/api/v1/rollouts') || p === '/api/v1/config/profiles') asked.push(p);
     });
     await login(vs.page, 'viewer', PW, '/hosts');
     await waitTitle(vs.page, '主機');

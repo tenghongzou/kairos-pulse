@@ -7,8 +7,9 @@
 #   WORK=<目錄>         工作目錄（發佈物、金鑰、日誌；預設 ~/kp-systest，不可在 git repo 內）
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback reboot reboot-rollback signature
-#                       tamper tamper-resume crash-replace crash-rollback unsafe-path
+#                       tamper tamper-resume crash-replace crash-rollback unsafe-path late-resume
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
+#   LATE_AFTER=30       情境 late-resume：主機在健康確認的期限過後幾秒才開機
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
 #   KEEP=1              結束時保留容器與網路（除錯用；之後以 CLEAN_ONLY=1 清除）
 #   CLEAN_ONLY=1        只清除這個測試建立的容器、網路與映像
@@ -27,7 +28,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume crash-replace crash-rollback unsafe-path}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback reboot reboot-rollback signature tamper tamper-resume crash-replace crash-rollback unsafe-path late-resume}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -41,7 +42,11 @@ T4=$TV-test.4
 T5=$TV-test.5
 T6=$TV-test.6
 T7=$TV-test.7
+# test.8：正常的版本，高於 test.7（情境 late-resume 的目標）
+T8=$TV-test.8
 T9=$TV-test.9
+# 情境 late-resume：主機在健康確認的期限過後多久才開機（秒）
+LATE_AFTER=${LATE_AFTER:-30}
 # 輔助程式 root 專用的工作目錄
 HW=/var/lib/pulse-upgrade
 
@@ -634,6 +639,18 @@ hold_and_kill() {
             pkg_version "$1" >"$WORK/crash-$1.pkg" 2>&1 || true
             info "$1：輔助程式停在 $2，終止整台主機（docker kill）後重新啟動"
             docker kill "$P-$1" >/dev/null
+            if [ -n "${3:-}" ]; then
+                # 關機到交易紀錄的健康確認期限過後 $3 秒才開機（情境 late-resume）
+                dl=$(jq -r '.deadline_unix // 0' "$WORK/crash-$1.state.json" 2>/dev/null || echo 0)
+                [ "$dl" -gt 0 ] || {
+                    info "$1：交易紀錄沒有健康確認的期限"
+                    docker start "$P-$1" >/dev/null
+                    return 1
+                }
+                info "$1：關機到健康確認的期限（$(date -d "@$dl" +%H:%M:%S)）過後 $3 秒"
+                while [ "$(date +%s)" -le $((dl + $3)) ]; do sleep 2; done
+                date +%s >"$WORK/crash-$1.started"
+            fi
             docker start "$P-$1" >/dev/null
             wait_boot "$1"
             echo "$1" >>"$WORK/crashed"
@@ -652,12 +669,12 @@ arm_crash() {
     done
 }
 
-# crash_hosts <情境> <checkpoint>：每台主機都在那個當機點被終止並重新啟動
+# crash_hosts <情境> <checkpoint> [<期限過後幾秒才開機>]：每台主機都在那個當機點被終止並重新啟動
 crash_hosts() {
     rm -f "$WORK/crashed" "$WORK"/crash-*
     pids=""
     for ch in $HOSTS; do
-        hold_and_kill "$ch" "$2" &
+        hold_and_kill "$ch" "$2" "${3:-}" &
         pids="$pids $!"
     done
     for p in $pids; do wait "$p" || true; done
@@ -812,6 +829,43 @@ scenario_unsafe_path() {
     collect_logs i
 }
 
+# 情境 j（REMOTE.md 第 17.9.4 節第 13 列、第 17.9.3 節「接續 replaced 時的健康確認」；0.10.1）：輔助程式已記下
+# replaced（健康確認的期限已定）、還沒重新啟動服務時整台主機被終止，而且**關機到期限過後才開機**。0.10.0 的
+# 輔助程式開機後不做任何檢查、直接回滾；0.10.1 起仍做與正常流程相同的健康確認——新版健康 → succeeded
+scenario_late_resume() {
+    ensure_injectable j
+    need $T8
+    cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    cur_re=$(printf '%s' "$cur" | sed 's/\./\\./g')
+    t8_re=$(printf '%s' "$T8" | sed 's/\./\\./g')
+    say "情境 j：記下 replaced 後終止主機、期限過後 $LATE_AFTER 秒才開機 $cur → $T8（當機點 record_replaced → 期限已過才接續 → succeeded）"
+    arm_crash record_replaced
+    id=$(rollout "systest late resume" $T8)
+    crash_hosts j record_replaced "$LATE_AFTER"
+    for ch in $HOSTS; do
+        check "j/$ch：當機時的紀錄停在 replaced、還沒重新啟動、有 boot_id（checksum 相符）" \
+            "$(jq -r '"\(.step) \(.service_restarted) \(.boot_id | type)"' "$WORK/crash-$ch.state.json" 2>&1) $(record_checksum_ok "$WORK/crash-$ch.state.json")" \
+            '^replaced false string ok$'
+        check "j/$ch：當機時執行檔已是新版、pulse.prev 是舊版" "$(tr '\n' ' ' <"$WORK/crash-$ch.versions")" "^$t8_re $cur_re \$"
+        dl=$(jq -r '.deadline_unix // 0' "$WORK/crash-$ch.state.json" 2>/dev/null || echo 0)
+        st=$(cat "$WORK/crash-$ch.started" 2>/dev/null || echo 0)
+        check "j/$ch：開機時健康確認的期限已過（期限 $dl、開機 $st）" "$([ "$dl" -gt 0 ] && [ "$st" -gt "$dl" ] && echo late || echo "not late")" '^late$'
+    done
+    wait_rollout "$id" 1200 || fail "j：推送沒有在 1200 秒內結束"
+    collect_logs j
+    for ch in $HOSTS; do
+        verify j "$id" "$ch" succeeded PLS-I8416 $T8
+        check "j/$ch：輔助程式接續 replaced" "$(helper_log "$ch" | grep -c '接續上次中斷的升級：已替換，重新做健康確認')" '^1$'
+        check "j/$ch：期限已過仍做健康確認（不直接回滾）" "$(helper_log "$ch" | grep -c '健康確認的期限已過（[0-9]* 秒前）：仍以 120 秒做與正常流程相同的健康確認')" '^1$'
+        check "j/$ch：補送還沒送出的重新啟動" "$(helper_log "$ch" | grep -c '上次還沒有重新啟動 pulse.service：現在重新啟動')" '^1$'
+        check "j/$ch：健康確認通過、沒有回滾" \
+            "$(helper_log "$ch" | grep -c '健康確認通過，已升級到') $(helper_log "$ch" | grep -c '健康確認失敗')" '^1 0$'
+        check "j/$ch：pulse.prev 仍是替換前的版本" "$(hx "$ch" /opt/pulse/pulse.prev --version 2>&1 | awk '{print $2}')" "^$cur_re\$"
+        check "j/$ch：進行中交易的指標已清除" "$(hx "$ch" sh -c "ls $HW/active.json 2>/dev/null | wc -l")" '^0$'
+        hx "$ch" rm -f $HW/fault-inject.hit
+    done
+}
+
 # ---- 0. 發佈物 --------------------------------------------------------------
 if [ -z "${SKIP_BUILD:-}" ]; then
     say "建置發佈物（tests/systemd/build.sh）"
@@ -953,8 +1007,8 @@ fi
 TOKEN=$(kx api-token create --name "systest-$(date +%s)" --role admin --json | jq -r .data.token)
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || die "無法建立 API token"
 
-say "匯入版本庫：$V0、$T1、$T2、$T3、$T4、$T5、$T6、$T7（臨時金鑰 release 簽章）"
-for v in "$V0" $T1 $T2 $T3 $T4 $T5 $T6 $T7; do
+say "匯入版本庫：$V0、$T1、$T2、$T3、$T4、$T5、$T6、$T7、$T8（臨時金鑰 release 簽章）"
+for v in "$V0" $T1 $T2 $T3 $T4 $T5 $T6 $T7 $T8; do
     [ -f "$DIST/$v/SHA256SUMS.sig" ] || continue
     s=$(import_release "$DIST/$v" "$v")
     case "$s" in
@@ -1012,6 +1066,7 @@ for s in $SCENARIOS; do
     crash-replace) scenario_crash_replace ;;
     crash-rollback) scenario_crash_rollback ;;
     unsafe-path) scenario_unsafe_path ;;
+    late-resume) scenario_late_resume ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac

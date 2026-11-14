@@ -90,6 +90,72 @@ fn viewer_of(p: &Principal) -> Viewer {
     }
 }
 
+/// 推送的計數（清單的 `meta` 與 `GET /api/v1/rollouts/summary` 共用；0.10.1 起不載入主機列）：
+/// 回傳（`paused`、`rollback_failed_unacknowledged`、`pending_approval`、`pending_approval_actionable`、
+/// `rollout_approval`、`rollout_approval_change`；各狀態的推送數 `states`——七個狀態都有鍵）。
+///
+/// - 各狀態的推送數與回滾失敗未處理的主機數各是一個 `COUNT` 的查詢；
+/// - 「這次請求的身分可以核准的」要看每一筆待核准推送的建立者與送出者，所以只讀待核准的推送列
+///   （不含主機；待核准的數量受送審流程限制，通常是個位數）。
+fn rollout_counts(
+    s: &dyn crate::store::db::Store,
+    viewer: &Viewer,
+    approval: &str,
+    approval_change: Value,
+) -> Result<(Value, Value), ApiError> {
+    let mut states: BTreeMap<String, i64> = [
+        rollout::ROLLOUT_DRAFT,
+        rollout::ROLLOUT_PENDING_APPROVAL,
+        rollout::ROLLOUT_SCHEDULED,
+        rollout::ROLLOUT_RUNNING,
+        rollout::ROLLOUT_PAUSED,
+        rollout::ROLLOUT_COMPLETED,
+        rollout::ROLLOUT_CANCELLED,
+    ]
+    .into_iter()
+    .map(|k| (k.to_string(), 0))
+    .collect();
+    for (state, n) in s.rollout_state_counts().map_err(query_failed("升級推送"))? {
+        *states.entry(state).or_default() += n;
+    }
+    let failures = s
+        .count_unacknowledged_rollback_failures()
+        .map_err(query_failed("升級推送"))?;
+    let pending_total = states
+        .get(rollout::ROLLOUT_PENDING_APPROVAL)
+        .copied()
+        .unwrap_or(0);
+    // 這次請求的身分可以核准的筆數（有 rollouts:approve、是帳號登入的工作階段、不是建立者或送出者）：
+    // 由後端計算，SideNav 的泡泡只計這個數字。沒有核准權限或沒有待核准的推送時不必讀
+    let actionable = if pending_total > 0 && viewer.approve && viewer.session {
+        // can_approve 需要讀 store（B1：以背後的使用者身分比對建立者／送出者），
+        // 無法在 filter 閉包內用 ?，改以迴圈累計
+        let pending = s
+            .list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))
+            .map_err(query_failed("升級推送"))?;
+        let mut n = 0usize;
+        for r in &pending {
+            if viewer.can_approve(s, r).map_err(query_failed("升級推送"))? {
+                n += 1;
+            }
+        }
+        n
+    } else {
+        0
+    };
+    Ok((
+        json!({
+            "paused": states.get(rollout::ROLLOUT_PAUSED).copied().unwrap_or(0),
+            "rollback_failed_unacknowledged": failures,
+            "pending_approval": pending_total,
+            "pending_approval_actionable": actionable,
+            "rollout_approval": approval,
+            "rollout_approval_change": approval_change,
+        }),
+        json!(states),
+    ))
+}
+
 fn actor(p: &Principal, peer: SocketAddr) -> Actor {
     Actor {
         actor: p.actor(),
@@ -1211,13 +1277,20 @@ async fn rollouts(
                         })
                         .collect();
                     let mut out = Vec::new();
+                    // 進度（各主機狀態的台數）由資料庫彙總（0.10.1）：一個 GROUP BY 的查詢涵蓋清單中所有的
+                    // 推送，不把每台主機載入記憶體。只有待核准的推送仍然讀主機列（送審摘要要逐台計算）
+                    let mut summaries = crate::remote::HostSummary::from_counts(
+                        s.rollout_host_counts(state.as_deref())
+                            .map_err(query_failed("升級推送"))?,
+                    );
                     // 待核准的推送另附送審摘要與這次請求的身分能否核准（「待核准」檢視）；需要的清冊、
                     // 版本庫檔案與可核准者只在清單中有待核准的推送時載入一次
                     let mut pending_cx: Option<PendingContext> = None;
                     for r in &list {
-                        let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;
-                        let mut v = crate::remote::rollout_json(r, &hosts, now_ms, false);
+                        let summary = summaries.remove(&r.id).unwrap_or_default();
+                        let mut v = crate::remote::rollout_summary_json(r, &summary, now_ms);
                         if r.state == rollout::ROLLOUT_PENDING_APPROVAL {
+                            let hosts = s.rollout_hosts(&r.id).map_err(query_failed("升級推送"))?;
                             if pending_cx.is_none() {
                                 pending_cx = Some(
                                     PendingContext::load(s, &live, &releases_dir, now_ms)
@@ -1232,38 +1305,9 @@ async fn rollouts(
                         }
                         out.push(v);
                     }
-                    // 需要人處理的數量（SideNav 的計數泡泡；不受 state 篩選影響）
-                    let paused = s
-                        .list_rollouts(Some(rollout::ROLLOUT_PAUSED))
-                        .map_err(query_failed("升級推送"))?
-                        .len();
-                    let failures = s
-                        .unacknowledged_rollback_failures()
-                        .map_err(query_failed("升級推送"))?
-                        .len();
-                    // 雙人覆核（0.10）：待核准的推送數與目前的設定
-                    let pending = s
-                        .list_rollouts(Some(rollout::ROLLOUT_PENDING_APPROVAL))
-                        .map_err(query_failed("升級推送"))?;
-                    // 這次請求的身分可以核准的筆數（有 rollouts:approve、是帳號登入的工作階段、不是建立者
-                    // 或送出者本人）：由後端計算，SideNav 的泡泡只計這個數字
-                    let mut actionable = 0usize;
-                    for r in &pending {
-                        if viewer.can_approve(s, r).map_err(query_failed("升級推送"))? {
-                            actionable += 1;
-                        }
-                    }
-                    Ok((
-                        out,
-                        json!({
-                            "paused": paused,
-                            "rollback_failed_unacknowledged": failures,
-                            "pending_approval": pending.len(),
-                            "pending_approval_actionable": actionable,
-                            "rollout_approval": approval,
-                            "rollout_approval_change": approval_change,
-                        }),
-                    ))
+                    // 需要人處理的數量（不受 state 篩選影響；與 GET /rollouts/summary 相同）
+                    let (meta, _) = rollout_counts(s, &viewer, &approval, approval_change)?;
+                    Ok((out, meta))
                 })
                 .await?;
             Ok(http::json(
@@ -1272,6 +1316,29 @@ async fn rollouts(
                 json!({"data": data, "meta": meta}),
             ))
         }
+        // 計數的輕量來源（0.10.1；SideNav 的計數泡泡每 30 秒與每次 SSE 事件都會查）：只有各狀態的推送數與
+        // 需要人處理的數量，不讀推送的內容與主機列。權限、功能關閉時的 503 與清單相同
+        (_, ["summary"]) if get => {
+            query.reject_unknown(&[], &[])?;
+            p.require(Permission::RolloutsRead)?;
+            let svc = service(ctx, false)?;
+            let now_ms = now.timestamp_millis();
+            let approval = svc.settings.rollout_approval.clone();
+            let approval_change = svc
+                .approval_policy()
+                .map_or(Value::Null, |o| o.recent_change_json(now_ms));
+            let viewer = viewer_of(p);
+            let data = ctx
+                .pool
+                .read("升級推送", move |s| {
+                    let (mut v, states) = rollout_counts(s, &viewer, &approval, approval_change)?;
+                    v["states"] = states;
+                    Ok(v)
+                })
+                .await?;
+            Ok(http::ok(now, data))
+        }
+        (_, ["summary"]) => Err(method_not_allowed("GET")),
         ("POST", []) => {
             p.require(Permission::RolloutsWrite)?;
             let svc = service(ctx, false)?;
@@ -1466,6 +1533,9 @@ async fn rollout_detail(
         })
         .await?;
     let mut v = v;
+    // 目前的雙人覆核設定（與清單的 meta.rollout_approval 相同）：主控台對「沒有經過核准就開始」
+    // （approval = not_required）的推送，在目前要求覆核時以警告呈現（0.10.1）
+    v["rollout_approval"] = json!(svc.settings.rollout_approval);
     if r.state == rollout::ROLLOUT_DRAFT {
         // 草稿：資格分類的即時預覽（對象在送出時才固定）
         let spec = RolloutSpec {

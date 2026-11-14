@@ -95,6 +95,10 @@ pub(super) struct Fake {
     seen: RefCell<Vec<String>>,
     violations: RefCell<Vec<String>>,
     baseline: Baseline,
+    /// 第幾次開機（[`Fake::reboot`] 加一）：`boot_id` 由它產生
+    boot: u32,
+    /// `boot_id` 讀不到（或模擬 0.10.0 的輔助程式：紀錄沒有 `boot_id`）
+    pub(super) no_boot_id: Cell<bool>,
 }
 
 pub(super) fn binary_version(path: &Path) -> String {
@@ -144,7 +148,14 @@ impl Fake {
             seen: RefCell::new(Vec::new()),
             violations: RefCell::new(Vec::new()),
             baseline,
+            boot: 1,
+            no_boot_id: Cell::new(false),
         }
+    }
+
+    /// 直接設定 `NRestarts`（模擬這次開機中服務先前自動重啟過的次數，或 root 執行 `reset-failed`）
+    pub(super) fn set_n_restarts(&self, n: u64) {
+        self.svc.borrow_mut().n_restarts = n;
     }
 
     fn successor(&self, secs: u64, rebooted: bool) -> Fake {
@@ -183,6 +194,8 @@ impl Fake {
             seen: RefCell::new(Vec::new()),
             violations: RefCell::new(Vec::new()),
             baseline: self.baseline.clone(),
+            boot: self.boot + u32::from(rebooted),
+            no_boot_id: Cell::new(self.no_boot_id.get()),
         }
     }
 
@@ -201,7 +214,7 @@ impl Fake {
         self.successor(5, false)
     }
 
-    /// 只有輔助程式被終止，`secs` 秒後才被重新觸發（期限可能已過）：服務仍是原本的行程
+    /// 只有輔助程式被終止、主機沒有重新開機，`secs` 秒後才再被觸發（期限可能已過）：服務仍是原本的行程
     pub(super) fn helper_killed_after(&self, secs: u64) -> Fake {
         self.successor(secs, false)
     }
@@ -390,6 +403,10 @@ impl System for Fake {
     fn daemon_reload(&self) -> Result<(), String> {
         self.calls.borrow_mut().push("daemon-reload".into());
         Ok(())
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        (!self.no_boot_id.get()).then(|| format!("boot-{}", self.boot))
     }
 
     fn checkpoint(&self, name: &str) {
@@ -1121,19 +1138,257 @@ fn resumes_after_a_reboot_in_the_middle_of_the_health_check() {
     );
     after.assert_invariants();
     env.cleanup();
+}
 
-    // 開機回來時期限已過：回滾
-    let mut env = setup("resume-late", "tar");
+/// 0.10.1（H4；REMOTE.md 第 17.9.3 節「接續 `replaced` 時的健康確認」）：接續時健康確認的期限已過，
+/// 不再直接回滾——仍有 [`RESUME_GRACE`] 做與正常流程相同的檢查，健康 → `succeeded`，不健康 → 回滾
+#[test]
+fn a_late_resume_checks_health_before_deciding_to_roll_back() {
+    let grace = RESUME_GRACE.as_secs();
+    assert_eq!(grace, STABLE_FOR.as_secs() + 60);
+    // 第 14 列（健康確認中）、第 13 列（還沒重新啟動）× 重新開機／只有輔助程式被終止 × 期限已過多久
+    for (i, (point, rebooted, late)) in [
+        ("health_wait", true, 601),
+        ("health_wait", true, 30 * 86_400),
+        ("health_wait", false, 601),
+        ("record_replaced", true, 601),
+        ("record_replaced", false, 601),
+        // 期限還沒過、但只剩幾秒：同樣至少有 RESUME_GRACE
+        ("health_wait", true, 590),
+        ("record_replaced", false, 595),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = format!("{point}／重新開機 {rebooted}／{late} 秒後");
+        // 期限已過且健康 → succeeded
+        let mut env = setup(&format!("late-ok-{i}"), "tar");
+        let fake = Fake::new(&env.root);
+        apply_until(&env.paths, &fake, point);
+        let before = env.record();
+        assert_eq!(before.step, Step::Replaced, "{label}");
+        env.helper_is_installed();
+        let after = if rebooted {
+            fake.reboot_after(late)
+        } else {
+            fake.helper_killed_after(late)
+        };
+        let r = apply(&env.paths, &after).unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref(), r.detail.as_str()),
+            ("succeeded", Some(codes::I_UPGRADE_COMPLETED), ""),
+            "{label}: {r:?}"
+        );
+        assert_eq!(
+            (
+                env.installed().as_str(),
+                env.prev().as_str(),
+                env.unit().as_str()
+            ),
+            ("0.9.1", "0.9.0", NEW_UNIT),
+            "{label}"
+        );
+        // 沒有重新替換；還沒送出的重新啟動只在主機沒有重新開機的那一次才有意義，但一律補送（第 13 列）
+        let expected: &[&str] = if point == "record_replaced" {
+            &["restart"]
+        } else {
+            &[]
+        };
+        assert_eq!(after.calls(), expected, "{label}");
+        // 健康條件照舊：至少穩定 STABLE_FOR 才算成功，而且不超過確認窗
+        let took = after.mono().as_secs();
+        assert!(
+            (STABLE_FOR.as_secs()..=grace + 2).contains(&took),
+            "{label}: 健康確認花了 {took} 秒"
+        );
+        assert!(!env.active(), "{label}");
+        let rec = env.record();
+        assert_eq!(rec.step, Step::Done, "{label}");
+        after.assert_invariants();
+        env.cleanup();
+
+        // 期限已過且不健康（連不上 Kairos）→ 確認窗結束後回滾
+        let mut env = setup(&format!("late-bad-{i}"), "tar");
+        let fake = Fake::new(&env.root);
+        apply_until(&env.paths, &fake, point);
+        env.helper_is_installed();
+        let after = if rebooted {
+            fake.reboot_after(late)
+        } else {
+            fake.helper_killed_after(late)
+        };
+        after.set("0.9.1", Behavior::NoConnect);
+        let r = apply(&env.paths, &after).unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+            "{label}: {r:?}"
+        );
+        assert!(
+            r.detail.starts_with("health_timeout (not_registered"),
+            "{label}: {}",
+            r.detail
+        );
+        assert_eq!(
+            (
+                env.installed().as_str(),
+                env.prev().as_str(),
+                env.unit().as_str()
+            ),
+            ("0.9.0", "0.9.0", OLD_UNIT),
+            "{label}"
+        );
+        // 確認窗恰好是 RESUME_GRACE（不是 0，也不是整個 health_timeout 600 秒），之後確認舊版恢復
+        //（穩定 STABLE_FOR）
+        let took = after.mono().as_secs();
+        let expected = grace + STABLE_FOR.as_secs();
+        assert!(
+            (expected..=expected + 10).contains(&took),
+            "{label}: 確認窗與回滾確認共 {took} 秒"
+        );
+        after.assert_invariants();
+        env.cleanup();
+
+        // 期限已過且新版在崩潰 → 回滾（crash_restart）
+        let mut env = setup(&format!("late-crash-{i}"), "tar");
+        let fake = Fake::new(&env.root);
+        apply_until(&env.paths, &fake, point);
+        env.helper_is_installed();
+        let after = if rebooted {
+            fake.reboot_after(late)
+        } else {
+            fake.helper_killed_after(late)
+        };
+        after.set("0.9.1", Behavior::Crash);
+        let r = apply(&env.paths, &after).unwrap();
+        assert_eq!(r.state, "rolled_back", "{label}: {r:?}");
+        assert!(
+            r.detail.starts_with("crash_restart"),
+            "{label}: {}",
+            r.detail
+        );
+        assert_eq!(env.installed(), "0.9.0", "{label}");
+        env.cleanup();
+    }
+
+    // 紀錄的期限與基準不改寫（每次接續重新計算）：確認窗進行中再被中斷，下次接續同樣有 RESUME_GRACE
+    let mut env = setup("late-twice", "tar");
     let fake = Fake::new(&env.root);
-    apply_until(&env.paths, &fake, "health_wait");
+    apply_until(&env.paths, &fake, "record_replaced");
+    let replaced = env.record();
+    assert!(replaced.boot_id.is_some() && !replaced.service_restarted);
     env.helper_is_installed();
-    let after = fake.reboot_after(601);
-    let r = apply(&env.paths, &after).unwrap();
-    assert_eq!(r.state, "rolled_back", "{r:?}");
-    assert!(r.detail.starts_with("health_timeout"), "{}", r.detail);
-    assert_eq!(env.installed(), "0.9.0");
-    assert_eq!(env.unit(), OLD_UNIT);
+    let second = fake.helper_killed_after(601);
+    // 第二次執行：補送重新啟動之後，在確認窗的等待中被中止
+    apply_until(&env.paths, &second, "health_wait");
+    assert_eq!(second.calls(), ["restart"]);
+    let rec = env.record();
+    assert_eq!(
+        (
+            rec.step,
+            rec.service_restarted,
+            rec.deadline_unix,
+            rec.n_restarts_before,
+            rec.boot_id.clone()
+        ),
+        (
+            Step::Replaced,
+            true,
+            replaced.deadline_unix,
+            replaced.n_restarts_before,
+            replaced.boot_id.clone()
+        ),
+        "接續只記下重新啟動已送出，不改寫期限與基準"
+    );
+    let third = second.reboot_after(3600);
+    let r = apply(&env.paths, &third).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    assert!(third.calls().is_empty(), "{:?}", third.calls());
+    assert_eq!(env.installed(), "0.9.1");
+    third.assert_invariants();
     env.cleanup();
+}
+
+/// 0.10.1（H4）：接續 `replaced` 時崩潰偵測的基準。`n_restarts_before` 是替換前量的，`NRestarts` 在重新
+/// 開機後從 0 起算：先判斷接續之前有沒有崩潰重啟過，沒有證據時才決定之後的基準
+#[test]
+fn resuming_rebases_crash_detection_without_forgetting_earlier_crashes() {
+    // 準備：這次開機中服務在替換之前已經自動重啟過 3 次（n_restarts_before = 3），健康確認中被中斷
+    let prepare = |name: &str, boot_id: bool| {
+        let env = setup(name, "tar");
+        let fake = Fake::new(&env.root);
+        fake.no_boot_id.set(!boot_id);
+        fake.set_n_restarts(3);
+        apply_until(&env.paths, &fake, "health_wait");
+        let rec = env.record();
+        assert_eq!(rec.n_restarts_before, 3, "{name}");
+        assert_eq!(rec.boot_id.is_some(), boot_id, "{name}");
+        (env, fake)
+    };
+    // 預期的 detail：接續之前的崩潰（同一次開機、重新開機後、計數被重設後）、確認窗內的崩潰
+    const C5: &str = "crash_restart (NRestarts 3 → 5)";
+    const A2: &str = "crash_restart (NRestarts 0 → 2 after reboot)";
+    const A3: &str = "crash_restart (NRestarts 0 → 3 after reboot)";
+    const A1: &str = "crash_restart (NRestarts 0 → 1 after reboot)";
+    const RST: &str = "crash_restart (NRestarts 3 → reset → 1)";
+    const WIN: &str = "crash_restart (NRestarts 0 → 1)";
+    // 601 秒後才開機（期限 600 秒已過）
+    const R: Option<u64> = Some(601);
+    // （名稱、紀錄有沒有 boot_id、重新開機〔幾秒後；None：只有輔助程式被終止，601 秒後〕、接續時的
+    //  NRestarts〔None：不另外設定〕、新版在確認窗內崩潰、預期的 detail〔空字串：succeeded〕）
+    let cases = [
+        // 沒有重新開機、沒有再崩潰（cur == before）：基準不變，健康 → succeeded
+        ("same", true, None, None, false, ""),
+        // 沒有重新開機、接續之前新版崩潰重啟過（cur > before）：不因為重設基準而漏掉 → 回滾
+        ("crashed-before", true, None, Some(5), false, C5),
+        // 重新開機過（boot_id 不同）、開機後沒有自動重啟：基準改為 0，健康 → succeeded
+        ("reboot", true, R, None, false, ""),
+        // 重新開機過、開機後新版崩潰重啟過 2 次（比替換前的 3 次少——0.10.0 的基準看不出來）→ 回滾
+        ("reboot-crashed", true, R, Some(2), false, A2),
+        // 重新開機過、開機後恰好崩潰重啟過 3 次（與替換前相同）：有 boot_id 時看得出來 → 回滾
+        ("reboot-same-count", true, R, Some(3), false, A3),
+        // 重新開機過、基準改為 0 之後確認窗內才崩潰：以新的基準發現（0.10.0 要崩潰超過 3 次才發現）
+        ("reboot-then-crash", true, R, None, true, WIN),
+        // 紀錄沒有 boot_id（0.10.0 的輔助程式替換、0.10.1 接續）：依計數本身——
+        // 計數比替換前小而且不是 0（重設之後又自動重啟過）→ 回滾
+        ("legacy-reset-crashed", false, R, Some(1), false, RST),
+        // 計數是 0（重設之後沒有自動重啟）→ 基準 0，健康 → succeeded；之後才崩潰 → 以 0 為基準發現
+        ("legacy-reset", false, R, None, false, ""),
+        ("legacy-reset-then-crash", false, R, None, true, WIN),
+        // 已知的殘餘窗口：沒有 boot_id、重新開機後恰好崩潰了與替換前相同的次數之後穩定下來——這一項
+        // 看不出來（與 0.10.0 相同；REMOTE.md 第 17.9.3 節），其餘健康條件通過時是 succeeded
+        ("legacy-same-count", false, R, Some(3), false, ""),
+        // 沒有重新開機、root 執行過 reset-failed（計數歸零）、之後新版又自動重啟過 → 回滾
+        ("reset-failed", true, None, Some(1), false, RST),
+        // 期限內的接續（0.10.0 就有的情境）同樣套用：重新開機 30 秒後、開機後崩潰過 1 次（< 3）→ 回滾
+        ("in-time", true, Some(30), Some(1), false, A1),
+    ];
+    for (name, boot_id, reboot, cur, crash, detail) in cases {
+        let (mut env, fake) = prepare(&format!("rebase-{name}"), boot_id);
+        let after = match reboot {
+            Some(secs) => fake.reboot_after(secs),
+            None => fake.helper_killed_after(601),
+        };
+        if let Some(n) = cur {
+            after.set_n_restarts(n);
+        }
+        if crash {
+            after.set("0.9.1", Behavior::Crash);
+        }
+        env.helper_is_installed();
+        let r = apply(&env.paths, &after).unwrap();
+        let (state, version) = if detail.is_empty() {
+            ("succeeded", "0.9.1")
+        } else {
+            ("rolled_back", "0.9.0")
+        };
+        assert_eq!(r.state, state, "{name}: {r:?}");
+        assert_eq!(r.detail, detail, "{name}: {r:?}");
+        assert_eq!(env.installed(), version, "{name}");
+        assert_eq!(env.prev(), "0.9.0", "{name}");
+        after.assert_invariants();
+        env.cleanup();
+    }
 }
 
 #[test]
@@ -1320,7 +1575,8 @@ fn tampered_from_version_is_refused_before_anything_changes() {
     env.cleanup();
 }
 
-/// 健康確認期間重新開機、開機回來時期限已過的 deb 升級（有驗證過的回滾套件）；`tamper` 在接續之前改寫請求
+/// 健康確認期間重新開機、開機回來時期限已過而新版不健康（連不上 Kairos）的 deb 升級（有驗證過的回滾
+/// 套件）；`tamper` 在接續之前改寫請求。0.10.1 起期限已過不再直接回滾，所以由「新版不健康」讓接續走回滾
 fn resumed_deb_rollback(name: &str, tamper: impl FnOnce(&Env)) -> (Env, Fake, UpgradeResult) {
     let mut env = setup(name, "deb");
     stage_rollback(&env, "0.9.0");
@@ -1332,6 +1588,7 @@ fn resumed_deb_rollback(name: &str, tamper: impl FnOnce(&Env)) -> (Env, Fake, Up
     env.helper_is_installed();
     assert_eq!(env.paths.current_version, "0.9.1");
     let after = fake.reboot_after(601);
+    after.set("0.9.1", Behavior::NoConnect);
     let r = apply(&env.paths, &after).unwrap();
     (env, after, r)
 }
@@ -1440,7 +1697,9 @@ fn method_and_target_come_from_the_helper_and_the_recorded_state() {
     env.helper_is_installed();
     // 接續時不重新偵測：即使偵測結果不同（例如標記檔被刪）也以交易紀錄為準
     env.paths.method = "unknown".into();
+    // 期限已過而新版不健康 → 回滾（0.10.1 起期限已過本身不再是回滾的理由）
     let after = fake.reboot_after(601);
+    after.set("0.9.1", Behavior::NoConnect);
     let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.state, "rolled_back", "{r:?}");
     assert_eq!(
@@ -1653,7 +1912,7 @@ fn an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrad
     assert_eq!(pointer.binding_sha256, env.record().binding_sha256);
     assert!(active.exists());
 
-    // 健康確認中重新開機（期限已過）；請求被換成另一個 upgrade_id
+    // 健康確認中重新開機（期限已過，而且新版連不上 Kairos → 回滾）；請求被換成另一個 upgrade_id
     rewrite_request(&env, |r| {
         r.upgrade_id = OTHER_ID.into();
         // 對新的交易而言「誠實」的內容：目前的版本、重新安裝同一版
@@ -1661,6 +1920,7 @@ fn an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrad
     });
     env.helper_is_installed();
     let after = fake.reboot_after(601);
+    after.set("0.9.1", Behavior::NoConnect);
     let r = apply(&env.paths, &after).unwrap();
     assert_eq!(r.upgrade_id, ID, "結果屬於原本的交易：{r:?}");
     assert_eq!(

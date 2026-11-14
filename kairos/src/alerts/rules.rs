@@ -522,8 +522,8 @@ pub fn builtins() -> Vec<Rule> {
             ids::ROLLOUT_APPROVAL_DISABLED,
             "雙人覆核已關閉",
             Warning,
-            json!({}),
-            "Kairos 啟動時發現升級推送的雙人覆核（remote.rollout_approval）由 required 改為 none（與資料庫記錄的上一次設定不同）：送出的推送不再需要另一位管理員核准。這個設定只能在設定檔或環境變數修改；不是預期的變更時請檢查誰修改了設定。改回 required 並重新啟動後恢復，不會自己結束。啟用雙人覆核的單位請把這條規則接到通知管道。",
+            json!({"unsilenceable": true}),
+            "Kairos 啟動時發現升級推送的雙人覆核（remote.rollout_approval）由 required 改為 none（與資料庫記錄的上一次設定不同）：送出的推送不再需要另一位管理員核准。這個設定只能在設定檔或環境變數修改；不是預期的變更時請檢查誰修改了設定。改回 required 並重新啟動後恢復，不會自己結束。不可靜音、不可停用。啟用雙人覆核的單位請把這條規則接到通知管道。",
         ),
     ]
 }
@@ -531,6 +531,62 @@ pub fn builtins() -> Vec<Rule> {
 /// 系統預設規則的定義（找不到時為 `None`）
 pub fn builtin_default(rule_id: &str) -> Option<Rule> {
     builtins().into_iter().find(|r| r.rule_id == rule_id)
+}
+
+/// 不可靜音的系統規則。由程式碼決定，不看資料庫裡那一列的 `params`：系統預設規則只在不存在時寫入
+/// （`ensure_builtin_rules`），升級上來的環境裡既有的列沒有 `unsilenceable`；能寫資料庫的人把它拿掉
+/// 也不會讓規則變成可以靜音。`params` 的 `"unsilenceable": true` 只是給 API 與介面看的同一件事
+/// （測試確認兩者一致）。
+const UNSILENCEABLE: &[&str] = &[ids::UNAUTHENTICATED, ids::ROLLOUT_APPROVAL_DISABLED];
+
+/// 不可停用的系統規則（0.10.1）：「雙人覆核已關閉」。停用它等於讓關閉雙人覆核不留下告警，
+/// 所以停用的 API 回 409 `rule_always_enabled`，資料庫裡已經停用的列在啟動與載入時一律視為啟用。
+const ALWAYS_ENABLED: &[&str] = &[ids::ROLLOUT_APPROVAL_DISABLED];
+
+/// 受保護（不可靜音或不可停用）的系統規則
+pub fn protected_ids() -> impl Iterator<Item = &'static str> {
+    UNSILENCEABLE
+        .iter()
+        .chain(
+            ALWAYS_ENABLED
+                .iter()
+                .filter(|id| !UNSILENCEABLE.contains(id)),
+        )
+        .copied()
+}
+
+/// 這條規則的事件不受任何靜音影響
+pub fn is_unsilenceable(rule_id: &str) -> bool {
+    UNSILENCEABLE.contains(&rule_id)
+}
+
+/// 這條規則不可停用
+pub fn is_always_enabled(rule_id: &str) -> bool {
+    ALWAYS_ENABLED.contains(&rule_id)
+}
+
+/// 把受保護的系統規則修正成程式碼規定的樣子（不可停用的一律啟用、不可靜音的補上
+/// `params.unsilenceable`）；回傳是否有改動。啟動時用來同步資料庫既有的列，載入規則給引擎時再套一次
+/// （資料庫在執行期間被直接改掉時，引擎仍照程式碼的規定）。
+pub fn enforce_protected(rule: &mut Rule) -> bool {
+    let mut changed = false;
+    if is_always_enabled(&rule.rule_id) && (!rule.enabled || rule.disabled_reason.is_some()) {
+        rule.enabled = true;
+        rule.disabled_reason = None;
+        changed = true;
+    }
+    if is_unsilenceable(&rule.rule_id)
+        && rule.params.get("unsilenceable").and_then(Value::as_bool) != Some(true)
+    {
+        match &mut rule.params {
+            Value::Object(m) => {
+                m.insert("unsilenceable".into(), json!(true));
+            }
+            other => *other = json!({"unsilenceable": true}),
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// 驗證失敗（欄位、訊息）
@@ -870,6 +926,58 @@ mod tests {
             assert!(r.builtin && r.enabled, "{}", r.rule_id);
             assert!(r.rule_id.starts_with("sys."));
         }
+    }
+
+    #[test]
+    fn protected_rules_match_params_and_are_enforced() {
+        // 程式碼的清單與 params 的標記一致（API 與介面看的是 params）
+        for r in builtins() {
+            assert_eq!(
+                r.params.get("unsilenceable").and_then(Value::as_bool) == Some(true),
+                is_unsilenceable(&r.rule_id),
+                "{}",
+                r.rule_id
+            );
+        }
+        assert!(is_unsilenceable(ids::UNAUTHENTICATED));
+        assert!(is_unsilenceable(ids::ROLLOUT_APPROVAL_DISABLED));
+        assert!(is_always_enabled(ids::ROLLOUT_APPROVAL_DISABLED));
+        assert!(!is_always_enabled(ids::UNAUTHENTICATED));
+        assert!(!is_unsilenceable(ids::ROLLOUT_PAUSED));
+        // 每一條不可停用的規則都是系統類的預設規則
+        for id in ALWAYS_ENABLED.iter().chain(UNSILENCEABLE) {
+            let r = builtin_default(id).unwrap();
+            assert_eq!(r.category, Category::System, "{id}");
+        }
+
+        // 升級上來的列：params 是 {}、被停用過 → 修正回來
+        let mut old = builtin_default(ids::ROLLOUT_APPROVAL_DISABLED).unwrap();
+        old.params = json!({});
+        old.enabled = false;
+        old.disabled_reason = Some("先關掉".into());
+        assert!(enforce_protected(&mut old));
+        assert!(old.enabled);
+        assert_eq!(old.disabled_reason, None);
+        assert_eq!(old.params, json!({"unsilenceable": true}));
+        // 已經正確的不再改動
+        assert!(!enforce_protected(&mut old));
+        // params 不是物件（資料庫被改壞）也補得回來
+        old.params = Value::Null;
+        assert!(enforce_protected(&mut old));
+        assert_eq!(old.params["unsilenceable"], true);
+        // 其他參數保留
+        let mut un = builtin_default(ids::UNAUTHENTICATED).unwrap();
+        un.params = json!({"code": "KRS-W0302", "remind_secs": 3600});
+        un.enabled = false;
+        assert!(enforce_protected(&mut un));
+        assert_eq!(un.params["remind_secs"], 3600);
+        assert_eq!(un.params["unsilenceable"], true);
+        assert!(!un.enabled, "未認證連線的規則仍可停用（0.10.1 沒有改）");
+        // 一般規則不動
+        let mut off = builtin_default(ids::HOST_OFFLINE).unwrap();
+        off.enabled = false;
+        assert!(!enforce_protected(&mut off));
+        assert!(!off.enabled);
     }
 
     #[test]

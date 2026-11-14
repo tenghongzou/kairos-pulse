@@ -1232,3 +1232,226 @@ async fn disabling_approval_opens_an_alert_and_a_failed_audit_write_blocks_start
         .unwrap();
     assert_eq!(meta, None, "交易回復，沒有只寫入前值而沒有稽核");
 }
+
+/// 0.10.1（H2）：`approval_of` 的每一種情況
+#[test]
+fn approval_of_is_derived_from_the_rollout_row() {
+    use super::engine::approval_of;
+    let row =
+        |state: &str, submitted: bool, approved: bool, started: bool| super::store::RolloutRow {
+            id: "ro-1".into(),
+            state: state.into(),
+            submitted_at: submitted.then_some(T0),
+            submitted_by: submitted.then(|| "user:admin".to_string()),
+            approved_at: approved.then_some(T0 + 1),
+            approved_by: approved.then(|| "user:carol".to_string()),
+            started_at: started.then_some(T0 + 2),
+            ..Default::default()
+        };
+    // 還沒開始也沒有排定：null
+    assert_eq!(approval_of(&row("draft", false, false, false)), None);
+    assert_eq!(
+        approval_of(&row("draft", true, false, false)),
+        None,
+        "退回後的草稿"
+    );
+    assert_eq!(
+        approval_of(&row("pending_approval", true, false, false)),
+        None
+    );
+    assert_eq!(
+        approval_of(&row("cancelled", true, false, false)),
+        None,
+        "開始之前就取消（待核准或已排程時）"
+    );
+    assert_eq!(approval_of(&row("cancelled", false, false, false)), None);
+    // 有核准紀錄
+    for state in ["scheduled", "running", "paused", "completed", "cancelled"] {
+        let started = state != "scheduled";
+        assert_eq!(
+            approval_of(&row(state, true, true, started)),
+            Some("approved"),
+            "{state}"
+        );
+        // 送出時政策為 none：沒有核准就排程或開始
+        assert_eq!(
+            approval_of(&row(state, true, false, started)),
+            Some("not_required"),
+            "{state}"
+        );
+    }
+    // 0.9.x 的推送（沒有 submitted_at）：無法判斷，不誤標成 not_required
+    for state in ["running", "paused", "completed", "cancelled"] {
+        assert_eq!(
+            approval_of(&row(state, false, false, true)),
+            Some("unknown"),
+            "{state}"
+        );
+    }
+}
+
+/// 0.10.1（H2）：推送開始時生效的政策與有沒有經過核准，留在稽核（`rollout.submit`、`rollout.start`），
+/// API 的 `approval` 標示沒有經過核准就開始的推送——不依賴 `meta` 的政策前值
+#[tokio::test]
+async fn the_policy_in_effect_is_recorded_when_a_rollout_starts() {
+    // 雙人覆核：送出 → 待核准（approval 為 null）→ 核准 → 開始
+    let (fx, _) = fixture("h2a", 61).await;
+    let id = create(&fx, &who(), &body("x")).await;
+    let v = submit(&fx, &who(), &id, "升級 2 台").await;
+    assert_eq!(v["state"], "pending_approval");
+    assert_eq!(v["approval"], Value::Null);
+    let (_, d) = last_audit(&fx, "rollout.submit").await.unwrap();
+    assert_eq!(d["rollout_approval"], "required");
+    assert_eq!(audit_count(&fx, "rollout.start").await, 0);
+    let req = approval(&fx, &id).await;
+    let v = fx
+        .svc
+        .approve_rollout(&user("carol"), id.clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["approval"].as_str()),
+        (Some("running"), Some("approved"))
+    );
+    let (actor, d) = last_audit(&fx, "rollout.start").await.unwrap();
+    assert_eq!(actor, "user:carol");
+    assert_eq!(
+        (
+            d["rollout_approval"].as_str(),
+            d["approval"].as_str(),
+            d["approved_by"].as_str(),
+            d["submitted_by"].as_str(),
+            d["approved"].as_bool(),
+            d["rollout_id"].as_str(),
+        ),
+        (
+            Some("required"),
+            Some("approved"),
+            Some("user:carol"),
+            Some("user:admin"),
+            Some(true),
+            Some(id.as_str())
+        )
+    );
+    fx.svc
+        .cancel_rollout(&who(), id.clone(), "結束".into())
+        .await
+        .unwrap();
+    assert_eq!(state_of(&fx, &id).await.state, "cancelled");
+    let rid = id.clone();
+    let r = state_of(&fx, &rid).await;
+    assert_eq!(
+        super::engine::approval_of(&r),
+        Some("approved"),
+        "取消後仍看得出核准過"
+    );
+
+    // 同一個資料庫、政策改為 none（重新啟動之後）。把 meta 的前值刪掉（模擬能寫資料庫的人湮滅政策的紀錄）：
+    // 推送本身的稽核與 approval 不受影響
+    let n = fx.now.clone();
+    let svc2 = RemoteService::open(StartParams {
+        settings: RemoteSettings {
+            allowed_signers: "allowed_signers".into(),
+            ..RemoteSettings::default()
+        },
+        data_dir: fx.dir.clone(),
+        db_path: fx.dir.join(crate::store::sqlite::DB_FILE),
+        registry: fx.registry.clone(),
+        shutdown: Arc::new(crate::shutdown::Shutdown::new()),
+        clock: Arc::new(move || n.load(Ordering::SeqCst)),
+    })
+    .await
+    .unwrap();
+    fx.sql(|c| {
+        c.execute("DELETE FROM meta WHERE key = ?1", [super::policy::META_KEY])
+            .unwrap();
+    })
+    .await;
+    fx.set_now(T0 + 10 * MIN);
+    let id2 = svc2
+        .create_rollout(&who(), RolloutSpec::parse(&body("y")).unwrap())
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = svc2
+        .submit_rollout(&who(), id2.clone(), Some("升級 2 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["approval"].as_str()),
+        (Some("running"), Some("not_required")),
+        "政策為 none：送出就開始，標示為沒有經過核准"
+    );
+    let (_, d) = last_audit(&fx, "rollout.submit").await.unwrap();
+    assert_eq!(d["rollout_approval"], "none");
+    let (actor, d) = last_audit(&fx, "rollout.start").await.unwrap();
+    assert_eq!(actor, "user:admin");
+    assert_eq!(
+        (
+            d["rollout_approval"].as_str(),
+            d["approval"].as_str(),
+            d["approved_by"].as_str(),
+            d["submitted_by"].as_str(),
+            d["rollout_id"].as_str(),
+        ),
+        (
+            Some("none"),
+            Some("not_required"),
+            None,
+            Some("user:admin"),
+            Some(id2.as_str())
+        )
+    );
+    svc2.cancel_rollout(&who(), id2, "結束".into())
+        .await
+        .unwrap();
+
+    // 政策為 none、有 starts_at：先排程（已經標示），到時間由 system 開始，稽核同樣記下政策
+    fx.set_now(T0 + 20 * MIN);
+    let mut later = body("z");
+    later["schedule"] = json!({"starts_at": crate::api::http::ts_ms(T0 + 60 * MIN)});
+    let id3 = svc2
+        .create_rollout(&who(), RolloutSpec::parse(&later).unwrap())
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = svc2
+        .submit_rollout(&who(), id3.clone(), Some("升級 2 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (v["state"].as_str(), v["approval"].as_str()),
+        (Some("scheduled"), Some("not_required"))
+    );
+    assert_eq!(audit_count(&fx, "rollout.start").await, 2, "還沒開始");
+    fx.set_now(T0 + 61 * MIN);
+    svc2.tick().await.unwrap();
+    // 開始了（這個服務的主機在同一輪就處理完，推送可能已經是 completed；看的是開始的時間與稽核）
+    let r3 = state_of(&fx, &id3).await;
+    assert_eq!(r3.started_at, Some(T0 + 61 * MIN));
+    assert_eq!(super::engine::approval_of(&r3), Some("not_required"));
+    let (actor, d) = last_audit(&fx, "rollout.start").await.unwrap();
+    assert_eq!(actor, "system");
+    assert_eq!(
+        (
+            d["rollout_approval"].as_str(),
+            d["approval"].as_str(),
+            d["scheduled"].as_bool(),
+            d["submitted_by"].as_str(),
+            d["rollout_id"].as_str(),
+        ),
+        (
+            Some("none"),
+            Some("not_required"),
+            Some(true),
+            Some("user:admin"),
+            Some(id3.as_str())
+        )
+    );
+    // 稽核雜湊鏈完整（這些紀錄受 HMAC 保護）
+    assert_eq!(audit_count(&fx, "rollout.start").await, 3);
+}

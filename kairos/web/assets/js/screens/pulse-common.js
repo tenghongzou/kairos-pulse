@@ -95,6 +95,17 @@ export function rolloutStateBadge(s) {
   return neutralBadge(rolloutStateLabel(s));
 }
 
+/**
+ * 沒有經過核准就開始（或排定開始）的推送的標記（API 的 approval = 'not_required'；0.10.1）。
+ * `emphasize`：目前的設定要求雙人覆核（這個推送是在覆核關閉的期間送出的）時以警告呈現，否則是中性的標籤。
+ */
+export function unapprovedBadge(emphasize) {
+  const b = emphasize ? statusBadge('warning', t('rm.appr.badge')) : neutralBadge(t('rm.appr.badge'));
+  b.dataset.approval = 'not_required';
+  b.title = t('rm.appr.badgeAria');
+  return b;
+}
+
 export const HOST_STATES = ['rollback_failed', 'failed', 'rolled_back', 'unknown', 'applying', 'staged', 'accepted', 'offered', 'pending', 'succeeded', 'declined', 'expired', 'skipped', 'skipped_offline', 'cancelled'];
 const HOST_TONE = { succeeded: 'online', failed: 'warning', rolled_back: 'warning', rollback_failed: 'critical', unknown: 'unknown', applying: 'info', staged: 'info', accepted: 'info', offered: 'info', pending: 'pending' };
 

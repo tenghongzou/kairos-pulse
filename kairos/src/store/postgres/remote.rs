@@ -12,7 +12,7 @@ use super::conn::{OptionalExtension, PgConn, PgResult, Row, params, pg_domain};
 use crate::remote::store::{
     ApplyingHost, ArtifactRow, AssignmentRow, ConfigReport, ConfigTarget, DesiredUpdate,
     HostConfigRow, HostTransition, NewRolloutHost, ProfileRevisionRow, ProfileRow, ReleaseRow,
-    RemoteStore, RollbackFailure, RolloutHostRow, RolloutRow, UpgradeHost,
+    RemoteStore, RollbackFailure, RolloutHostCount, RolloutHostRow, RolloutRow, UpgradeHost,
 };
 
 /// `meta` 的鍵：全域單調遞增的設定版本（REMOTE.md 第 3.4.4 節）
@@ -75,6 +75,9 @@ pg_domain! { RemoteStore {
     fn unacknowledged_rollback_failures(&self) -> Vec<RollbackFailure> => unacknowledged_rollback_failures;
     fn applying_hosts(&self) -> Vec<ApplyingHost> => applying_hosts;
     fn rollouts_using_release(&self, release_id: i64) -> i64 => rollouts_using_release;
+    fn rollout_host_counts(&self, state: Option<&str>) -> Vec<RolloutHostCount> => rollout_host_counts;
+    fn rollout_state_counts(&self) -> Vec<(String, i64)> => rollout_state_counts;
+    fn count_unacknowledged_rollback_failures(&self) -> i64 => count_unacknowledged_rollback_failures;
 } }
 
 // ---- 設定版本 ----
@@ -1079,6 +1082,51 @@ pub fn rollouts_using_release(conn: &PgConn, release_id: i64) -> PgResult<i64> {
             "SELECT COUNT(*) FROM rollouts WHERE release_id = ?1 AND state NOT IN {ROLLOUT_ENDED}"
         ),
         [release_id],
+        |r| r.get(0),
+    )
+}
+
+/// 各推送、各主機狀態的台數（推送清單的進度；0.10.1）。只讀 `rollout_hosts`（不 JOIN `hosts`），
+/// 一次彙總所有推送，回傳的列數是「推送數 × 出現過的狀態數」而不是主機數。`COUNT(*)` 與 `SUM(integer)`
+/// 在 PostgreSQL 都是 `bigint`
+pub fn rollout_host_counts(conn: &PgConn, state: Option<&str>) -> PgResult<Vec<RolloutHostCount>> {
+    let mut stmt = conn.prepare(
+        "SELECT rh.rollout_id, rh.state, COUNT(*),
+                SUM(CASE WHEN rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL THEN 1
+                         WHEN rh.state = 'pending' AND rh.reason = 'artifact_missing' THEN 1
+                         ELSE 0 END)
+         FROM rollout_hosts rh
+         WHERE ?1::text IS NULL
+            OR rh.rollout_id IN (SELECT r.rollout_id FROM rollouts r WHERE r.state = ?1::text)
+         GROUP BY rh.rollout_id, rh.state
+         ORDER BY rh.rollout_id, rh.state",
+    )?;
+    let rows = stmt.query_map([state], |r| {
+        Ok(RolloutHostCount {
+            rollout_id: r.get(0)?,
+            state: r.get(1)?,
+            hosts: r.get(2)?,
+            flagged: r.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 各狀態的推送數（計數泡泡；0.10.1）
+pub fn rollout_state_counts(conn: &PgConn) -> PgResult<Vec<(String, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT state, COUNT(*) FROM rollouts GROUP BY state ORDER BY state")?;
+    let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// 回滾失敗、尚未標記為已處理的主機數：條件與 [`unacknowledged_rollback_failures`] 相同
+pub fn count_unacknowledged_rollback_failures(conn: &PgConn) -> PgResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM rollout_hosts rh
+         JOIN hosts h ON h.host_id = rh.host_id
+         WHERE rh.state = 'rollback_failed' AND rh.acknowledged_at IS NULL",
+        (),
         |r| r.get(0),
     )
 }

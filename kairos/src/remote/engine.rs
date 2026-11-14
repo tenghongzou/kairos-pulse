@@ -3,7 +3,7 @@
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use kairos_proto::mgmt::{
@@ -179,6 +179,76 @@ fn schedule_to_store(
 /// 推送的 `next_action`（[`rollout::next_action_scheduled`]）；進行中而有主機在等版本庫的檔案補回時為
 /// `waiting_artifact{hosts}`（ADR-0002 F3：不計入失敗、不自動暫停，補檔後下一輪自動繼續）
 pub(crate) fn next_action_of(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64) -> Value {
+    next_action_summary(r, &HostSummary::of(hosts), now_ms)
+}
+
+/// 推送的主機統計（清單與詳情的 `progress`、`hosts_total`、`rollback_failed_unacknowledged` 與
+/// `next_action` 的 `waiting_artifact` 需要的數字）。詳情從主機列算（[`HostSummary::of`]）；清單由
+/// 資料庫彙總（[`HostSummary::from_counts`]，`RemoteStore::rollout_host_counts`；0.10.1），兩者的結果相同
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSummary {
+    /// 各狀態的台數：15 個已知的狀態都有鍵（沒有主機時為 0）
+    pub progress: BTreeMap<String, usize>,
+    /// 回滾失敗、尚未標記為已處理的台數
+    pub rollback_failed_unacknowledged: usize,
+    /// 等待版本庫檔案的台數（`pending` 且 `reason = artifact_missing`）
+    pub waiting_artifact: usize,
+}
+
+impl Default for HostSummary {
+    fn default() -> Self {
+        Self::of(&[])
+    }
+}
+
+impl HostSummary {
+    pub fn of(hosts: &[RolloutHostRow]) -> Self {
+        Self {
+            progress: rollout::progress(hosts),
+            rollback_failed_unacknowledged: hosts
+                .iter()
+                .filter(|h| h.state == HOST_ROLLBACK_FAILED && h.acknowledged_at.is_none())
+                .count(),
+            waiting_artifact: hosts
+                .iter()
+                .filter(|h| {
+                    h.state == HOST_PENDING
+                        && h.reason.as_deref() == Some(rollout::SKIP_ARTIFACT_MISSING)
+                })
+                .count(),
+        }
+    }
+
+    /// 資料庫彙總的列（所有推送）依推送分組
+    pub fn from_counts(rows: Vec<super::store::RolloutHostCount>) -> HashMap<String, HostSummary> {
+        let mut out: HashMap<String, HostSummary> = HashMap::new();
+        for c in rows {
+            let s = out.entry(c.rollout_id).or_default();
+            let (n, flagged) = (
+                usize::try_from(c.hosts).unwrap_or(0),
+                usize::try_from(c.flagged).unwrap_or(0),
+            );
+            if c.state == HOST_ROLLBACK_FAILED {
+                s.rollback_failed_unacknowledged += flagged;
+            } else if c.state == HOST_PENDING {
+                s.waiting_artifact += flagged;
+            }
+            *s.progress.entry(c.state).or_default() += n;
+        }
+        out
+    }
+
+    /// 不含 `skipped` 的台數（API 的 `hosts_total`）
+    pub fn hosts_total(&self) -> usize {
+        self.progress
+            .iter()
+            .filter(|(state, _)| state.as_str() != HOST_SKIPPED)
+            .map(|(_, n)| n)
+            .sum()
+    }
+}
+
+fn next_action_summary(r: &RolloutRow, hosts: &HostSummary, now_ms: i64) -> Value {
     let v = rollout::next_action_scheduled(
         &r.state,
         r.soak_until,
@@ -189,13 +259,7 @@ pub(crate) fn next_action_of(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i
         now_ms,
     );
     if v["code"] == "upgrading" {
-        let waiting = hosts
-            .iter()
-            .filter(|h| {
-                h.state == HOST_PENDING
-                    && h.reason.as_deref() == Some(rollout::SKIP_ARTIFACT_MISSING)
-            })
-            .count();
+        let waiting = hosts.waiting_artifact;
         if waiting > 0 {
             return json!({"code": "waiting_artifact", "hosts": waiting});
         }
@@ -203,23 +267,104 @@ pub(crate) fn next_action_of(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i
     v
 }
 
+/// 推送開始（或排定開始）時有沒有經過另一位管理員核准（API 的 `approval`；0.10.1，REMOTE.md 第 5.3 節）。
+/// 由既有欄位導出，不另存：推送離開草稿只有 `submit` 一條路，雙人覆核為 `required` 時一定先到
+/// `pending_approval`、核准時寫入 `approved_at`；為 `none` 時直接排程或開始，`approved_at` 維持 `None`
+/// （每次送出都會清除上一輪的核准）。
+///
+/// | 值 | 意義 |
+/// |---|---|
+/// | `approved` | 有核准紀錄（`approved_at`／`approved_by`） |
+/// | `not_required` | 送出時雙人覆核是 `none`：沒有經過核准就排程或開始 |
+/// | `unknown` | 沒有送出紀錄（`submitted_at` 是 schema v10 加的：0.9.x 建立並開始的推送），無法判斷 |
+/// | `None` | 還沒有開始也沒有排定（草稿、待核准、開始之前就取消） |
+///
+/// 這是資料庫目前的內容，能寫資料庫的人可以改；不可否認的紀錄在稽核雜湊鏈（`rollout.submit`、
+/// `rollout.start` 的 `details.rollout_approval`／`approval`）。
+pub fn approval_of(r: &RolloutRow) -> Option<&'static str> {
+    if r.state == ROLLOUT_DRAFT || r.state == ROLLOUT_PENDING_APPROVAL {
+        return None;
+    }
+    if r.started_at.is_none() && r.state != ROLLOUT_SCHEDULED {
+        return None;
+    }
+    Some(if r.approved_at.is_some() {
+        APPROVAL_APPROVED
+    } else if r.submitted_at.is_some() {
+        APPROVAL_NOT_REQUIRED
+    } else {
+        APPROVAL_UNKNOWN
+    })
+}
+
+/// 稽核 `rollout.start` 的 `details`（0.10.1）：推送實際開始的那一刻留在雜湊鏈裡的證據——當下生效的
+/// 雙人覆核政策（`rollout_approval`）、這個推送有沒有經過核准（`approval`）、送出者與核准者。
+/// 即使 `meta` 的政策前值或 `rollouts` 的列之後被改掉，這一筆仍看得出「政策為 `none` 時開始」。
+/// `extra` 是各入口原有的欄位（`approved`、`scheduled`）
+fn start_details(r: &RolloutRow, policy: &str, extra: Value) -> Value {
+    let mut v = json!({
+        "rollout_id": r.id,
+        "name": r.name,
+        "target_version": r.target_version,
+        "rollout_approval": policy,
+        "approval": approval_of(r),
+        "submitted_by": r.submitted_by,
+        "approved_by": r.approved_by,
+    });
+    if let (Value::Object(m), Value::Object(e)) = (&mut v, extra) {
+        m.extend(e);
+    }
+    v
+}
+
+/// 沒有經過核准就開始的推送在日誌留一行（警告）
+fn warn_unapproved_start(r: &RolloutRow) {
+    if approval_of(r) == Some(APPROVAL_NOT_REQUIRED) {
+        log::warn!(
+            event = "rollout.start_unapproved";
+            "推送「{}」（{}）沒有經過另一位管理員核准就開始（送出時 remote.rollout_approval = none；送出者 {}）",
+            r.name,
+            r.id,
+            r.submitted_by.as_deref().unwrap_or("—")
+        );
+    }
+}
+
+/// [`approval_of`] 的值
+pub const APPROVAL_APPROVED: &str = "approved";
+pub const APPROVAL_NOT_REQUIRED: &str = "not_required";
+pub const APPROVAL_UNKNOWN: &str = "unknown";
+
 /// 推送的 JSON（清單與詳情；`hosts` 有給時另加各批的統計）
 pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detail: bool) -> Value {
-    let (selector, waves, options) = spec_of(r);
+    let mut v = rollout_summary_json(r, &HostSummary::of(hosts), now_ms);
+    if detail {
+        let (selector, waves, options) = spec_of(r);
+        v["selector"] = serde_json::to_value(&selector).unwrap_or(Value::Null);
+        v["options"] = serde_json::to_value(&options).unwrap_or(Value::Null);
+        v["waves"] = rollout::waves_json(&waves, hosts, r.current_wave);
+        v["schedule"] = ScheduleSpec::from_db(&r.schedule).json();
+    }
+    v
+}
+
+/// 推送的 JSON 中不需要逐台主機的部分（清單的每一筆；0.10.1 起清單的主機統計由資料庫彙總）
+pub fn rollout_summary_json(r: &RolloutRow, hosts: &HostSummary, now_ms: i64) -> Value {
+    let (_, waves, _) = spec_of(r);
     let schedule = ScheduleSpec::from_db(&r.schedule);
     let ts = |v: Option<i64>| v.map(crate::api::http::ts_ms);
-    let mut v = json!({
+    json!({
         "id": r.id,
         "name": r.name,
         "target_version": r.target_version,
         "state": r.state,
         "current_wave": r.current_wave,
         "waves_total": waves.len(),
-        "progress": rollout::progress(hosts),
-        "hosts_total": hosts.iter().filter(|h| h.state != HOST_SKIPPED).count(),
+        "progress": hosts.progress,
+        "hosts_total": hosts.hosts_total(),
         // 回滾失敗、尚未標記為已處理的主機（progress.rollback_failed 含已處理的）
-        "rollback_failed_unacknowledged": hosts.iter().filter(|h| h.state == HOST_ROLLBACK_FAILED && h.acknowledged_at.is_none()).count(),
-        "next_action": next_action_of(r, hosts, now_ms),
+        "rollback_failed_unacknowledged": hosts.rollback_failed_unacknowledged,
+        "next_action": next_action_summary(r, hosts, now_ms),
         "starts_at": ts(schedule.starts_at),
         "ends_at": ts(schedule.ends_at),
         "pause_reason": r.pause_reason,
@@ -233,18 +378,13 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         "submitted_by": r.submitted_by,
         "approved_at": ts(r.approved_at),
         "approved_by": r.approved_by,
+        // 開始（或排定開始）時有沒有經過核准：approved／not_required／unknown／null（approval_of）
+        "approval": approval_of(r),
         "reject_reason": r.reject_reason,
         "started_at": ts(r.started_at),
         "completed_at": ts(r.completed_at),
         "updated_at": crate::api::http::ts_ms(r.updated_at),
-    });
-    if detail {
-        v["selector"] = serde_json::to_value(&selector).unwrap_or(Value::Null);
-        v["options"] = serde_json::to_value(&options).unwrap_or(Value::Null);
-        v["waves"] = rollout::waves_json(&waves, hosts, r.current_wave);
-        v["schedule"] = schedule.json();
-    }
-    v
+    })
 }
 
 /// 暫停（主控台或自動）：提議中尚未替換的主機回到 `pending`（恢復時以新的 upgrade_id 重新提議）。
@@ -612,6 +752,8 @@ impl RemoteService {
         let who = who.clone();
         let live = self.live_hellos();
         let approval = self.settings.approval_required();
+        // 這次送出時生效的雙人覆核政策：寫進稽核（0.10.1），不依賴 meta 的前值
+        let policy = self.settings.rollout_approval.clone();
         let dir = self.releases_dir.clone();
         let v = self
             .in_tx(move |s| {
@@ -707,12 +849,13 @@ impl RemoteService {
                     "rollout.submit",
                     Some(r.id.clone()),
                     None,
-                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason, "schedule": schedule.json(), "state": r.state, "digest": sub.digest}),
+                    json!({"rollout_id": r.id, "name": r.name, "target_version": r.target_version, "eligible": p.eligible, "downgrade": p.downgrade, "no_rollback": p.no_rollback, "skipped": p.skipped, "waves": p.waves, "confirm_level": if downgrade { "L3" } else { "L2" }, "reason": reason, "schedule": schedule.json(), "state": r.state, "digest": sub.digest, "rollout_approval": policy}),
                 )
                 .append(s, now)?;
                 if r.state == ROLLOUT_RUNNING {
-                    who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id}))
+                    who.event("rollout", "rollout.start", Some(r.id.clone()), None, start_details(&r, &policy, json!({})))
                         .append(s, now)?;
+                    warn_unapproved_start(&r);
                 }
                 let mut v = rollout_json(&r, &hosts, now, true);
                 if r.state == ROLLOUT_PENDING_APPROVAL {
@@ -756,6 +899,7 @@ impl RemoteService {
         let who = who.clone();
         let live = self.live_hellos();
         let dir = self.releases_dir.clone();
+        let policy = self.settings.rollout_approval.clone();
         let v = self
             .in_tx(move |s| {
                 let mut r = s.get_rollout(&id)?.ok_or_else(|| TxError::Api(not_found(&id)))?;
@@ -864,7 +1008,7 @@ impl RemoteService {
                 )
                 .append(s, now)?;
                 if r.state == ROLLOUT_RUNNING {
-                    who.event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id, "approved": true}))
+                    who.event("rollout", "rollout.start", Some(r.id.clone()), None, start_details(&r, &policy, json!({"approved": true})))
                         .append(s, now)?;
                 }
                 Ok(rollout_json(&r, &hosts, now, true))
@@ -1228,6 +1372,7 @@ impl RemoteService {
         let started = self.started_ms;
         let live_capable = self.capable_agents();
         let reg2 = self.registry.clone();
+        let policy = self.settings.rollout_approval.clone();
         // 有檔案遺失時才需要每台主機的安裝方式與平台（連線中的 hello）
         let live_hellos = if missing.is_empty() {
             HashMap::new()
@@ -1252,8 +1397,9 @@ impl RemoteService {
                     r.updated_at = now;
                     s.update_rollout_state(&r)?;
                     Actor::system()
-                        .event("rollout", "rollout.start", Some(r.id.clone()), None, json!({"rollout_id": r.id, "scheduled": true}))
+                        .event("rollout", "rollout.start", Some(r.id.clone()), None, start_details(&r, &policy, json!({"scheduled": true})))
                         .append(s, now)?;
+                    warn_unapproved_start(&r);
                     log::info!(event = "rollout.start"; "推送「{}」（{}）到達排程的開始時間，開始推送", r.name, r.id);
                     started_now = true;
                 }
