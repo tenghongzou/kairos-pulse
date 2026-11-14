@@ -15,6 +15,21 @@ export const LOCAL_ERROR_CODES = {
     reason: '版本庫記錄這個發佈檔已經存入，但在版本庫的目錄（`data/releases/`）找不到它，或大小與記錄不符。常見的原因是還原了備份（`kairos db backup` 不包含發佈檔）、叢集換手後接手的節點沒有這個檔案，或檔案被手動移動、刪除。補回之前，需要這個檔案的主機無法升級或回滾。',
     fix: '1. 取得同一個版本的官方發佈包，在「Pulse 版本庫」這個版本的詳情按「上傳發佈檔…」重新上傳（或執行 `kairos releases import <目錄>`）；只需要補上遺失或大小不符的檔案。\n2. 不再需要這個版本時可以刪除它（沒有推送使用、也不是任何主機的回滾目標時）。',
   },
+  // ADR-0003 階段 1（降級回滾、提議的單行大小規則）：**暫定號**，正式分配與三段式由設計包定案
+  'KRS-W8418': {
+    level: 'W',
+    text: '降級回滾（鏡像 `PLS-W8418`）：升級後健康確認失敗，主機已回到舊版，但 deb／rpm 只換回了執行檔——沒有可用的回滾套件、套件管理員裝回失敗，或回滾套件的簽署金鑰已撤銷。`upgrade_status.state` 仍是 `rolled_back`，`detail` 以 `degraded:` 開頭並列出原因。推送自動暫停。暫定號。ADR-0003 第 5.4 節',
+    title: '升級已回滾，但主機需要修復套件',
+    reason: 'Pulse 已恢復到升級前的版本並正常運作，但回滾時沒有經套件管理員（dpkg／rpm）裝回舊版的套件，只換回了執行檔，所以套件資料庫仍顯示失敗的那個版本、套件中的其他檔案（systemd unit、文件）也還是新版的。原因列在這台主機升級結果的 `detail`（例如 `no_rollback_package`、`package_rollback_failed`、`rollback_signer_revoked`）。',
+    fix: '1. 在主機上重新安裝目前（舊版）的套件：deb 以 `dpkg -i <套件>`，rpm 以 `rpm -U --replacepkgs --oldpackage <套件>`；`pulse upgrade status` 會顯示是否仍需要修復。\n2. 或在找出新版失敗的原因之後再推送一次升級：升級成功時套件資料庫恢復一致。\n3. 原因是 `no_rollback_package` 時，把主機目前的版本匯入 Pulse 版本庫，之後的升級就能經套件管理員回滾；是 `rollback_signer_revoked` 時，確認信任錨（`allowed_signers`）的變更是預期的。\n4. 處理後繼續推送。',
+  },
+  'KRS-W8419': {
+    level: 'W',
+    text: '升級提議超過協定的單行上限：`upgrade_offer` 實際序列化後（省略 `rollback_bundle` 之後仍然）超過 65536 bytes，Kairos 沒有送出（主機收到 `upgrade_unavailable`，連線不受影響）。主機在推送中標為 `failed`（原因 `offer_too_large`），推送自動暫停。只有 Kairos 端。暫定號。ADR-0003 第 6.3 節',
+    title: '升級提議太大，沒有送出',
+    reason: '這個版本的 `SHA256SUMS`、簽章或發佈清單在轉成協定訊息之後超過單行上限。正常的官方發佈不會發生；通常代表版本庫中這個版本的簽章資料異常（含大量需要跳脫的字元）。',
+    fix: '1. 到「Pulse 版本庫」檢查這個版本的 `SHA256SUMS` 與簽章；以官方的發佈包重新匯入（先刪除再匯入，或匯入為新的版本）。\n2. 修正後對失敗的主機按「重試」，再繼續推送。',
+  },
 };
 
 // 設計包**已收錄**、但總表的說明還沒有涵蓋工程新增情況的代碼（工程暫行；人工維護）。這裡的欄位覆蓋

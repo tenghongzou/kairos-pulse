@@ -124,6 +124,16 @@ export function skipLabel(reason) {
   return has(`rm.skip.${reason}`) ? t(`rm.skip.${reason}`) : t('rm.skip.other', { code: reason });
 }
 
+/**
+ * 降級回滾的註記（主機列的 degraded[]：Pulse 回報的原因代碼；REMOTE.md 第 4.5.2 節）。服務已恢復到舊版，但
+ * 套件資料庫與執行檔不一致。不認得的原因原樣顯示（由資料驅動）；不是降級回滾時 null
+ */
+export function degradedNote(reasons) {
+  if (!Array.isArray(reasons)) return null;
+  const list = reasons.map((r) => (has(`rm.degraded.${r}`) ? t(`rm.degraded.${r}`) : r)).join('、');
+  return h('span', { class: 'k-sub', dataset: { degraded: reasons.join(',') } }, list ? `${t('rm.hs.degraded')}：${list}` : t('rm.hs.degraded'));
+}
+
 /** 風險提醒（預覽與送審摘要的 warnings[]：伺服器回傳固定代碼）；沒有時 null */
 export function warningsList(codes) {
   if (!codes || !codes.length) return null;

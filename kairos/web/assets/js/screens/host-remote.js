@@ -28,6 +28,7 @@ import {
   isWindowsMethod,
   hostStateBadge,
   hostStateLabel,
+  degradedNote,
   valueText,
   flatten,
   isUnavailable,
@@ -55,6 +56,8 @@ export function upgradeCard(hst) {
     [t('rm.host.version'), hst.agent_version ? `Pulse ${hst.agent_version}` : '—'],
     // Pulse 宣告的 install.external_url（REMOTE.md 第 2.1 節）：有宣告時才顯示；不認得的值原樣顯示
     !win && inst && inst.external_url ? [t('rm.host.externalUrl'), h('span', { dataset: { externalUrl: inst.external_url } }, has(`rm.ext.${inst.external_url}`) ? t(`rm.ext.${inst.external_url}`) : t('rm.up.other', { v: inst.external_url }))] : null,
+    // Pulse 宣告的 install.rollback（REMOTE.md 第 2.1 節；ADR-0003 階段 2）：有宣告時才顯示；不認得的值原樣顯示
+    !win && inst && inst.rollback ? [t('rm.host.rollback'), h('span', { dataset: { rollback: inst.rollback } }, has(`rm.rb.${inst.rollback}`) ? t(`rm.rb.${inst.rollback}`) : t('rm.up.other', { v: inst.rollback }))] : null,
   ];
   const alertBox = h('div');
   const recent = h('div');
@@ -82,23 +85,34 @@ async function loadUpgrades(hst, alertBox, recent) {
   const list = d.upgrades || [];
   // 回滾失敗（尚未標記為已處理）
   const failed = list.find((u) => u.state === 'rollback_failed' && !u.acknowledged_at);
+  let failedAlert = null;
   if (failed) {
     const actions = session.can('rollouts:write')
       ? [h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => acknowledge(hst, failed, alertBox, recent) } }, t('rm.host.ack'))]
       : null;
-    mount(
-      alertBox,
-      inlineAlert({
-        kind: 'error',
-        title: t('rm.host.rbTitle'),
-        code: failed.code || 'PLS-E8408',
-        body: h('p', null, t('rm.host.rbBody', { to: failed.to_version || '—', from: failed.from_version || '—' })),
-        actions,
-      }),
-    );
-  } else {
-    mount(alertBox);
+    failedAlert = inlineAlert({
+      kind: 'error',
+      title: t('rm.host.rbTitle'),
+      code: failed.code || 'PLS-E8408',
+      body: h('p', null, t('rm.host.rbBody', { to: failed.to_version || '—', from: failed.from_version || '—' })),
+      actions,
+    });
   }
+  // 需要修復套件（降級回滾之後；package_repair_needed 由伺服器依 Pulse 的宣告與升級紀錄算出）
+  const degraded = list.find((u) => Array.isArray(u.degraded));
+  const repairAlert = d.package_repair_needed
+    ? h(
+        'div',
+        { id: 'host-package-repair' },
+        inlineAlert({
+          kind: 'warning',
+          title: t('rm.host.repairTitle'),
+          code: (degraded && degraded.code) || 'PLS-W8418',
+          body: [h('p', null, t('rm.host.repairBody')), degraded ? h('p', null, degradedNote(degraded.degraded)) : null],
+        }),
+      )
+    : null;
+  mount(alertBox, failedAlert, repairAlert);
   const top = list.slice(0, 3);
   const cur = list.find((u) => IN_PROGRESS.includes(u.state));
   let progressLine = null;
@@ -148,7 +162,7 @@ async function loadUpgrades(hst, alertBox, recent) {
               null,
               h('td', null, fmt.dateTime(u.finished_at || u.updated_at, { seconds: false })),
               h('td', null, t('rm.versions', { from: u.from_version || '—', to: u.to_version || '—' })),
-              h('td', null, hostStateBadge(u.state), u.code ? [' ', h('code', { class: 'k-code-tag' }, u.code)] : null),
+              h('td', null, hostStateBadge(u.state), u.code ? [' ', h('code', { class: 'k-code-tag' }, u.code)] : null, degradedNote(u.degraded)),
               h('td', null, session.can('rollouts:read') ? h('a', { href: `/pulse/rollouts/${encodeURIComponent(u.rollout_id)}` }, u.rollout_id) : u.rollout_id),
             ),
           ),

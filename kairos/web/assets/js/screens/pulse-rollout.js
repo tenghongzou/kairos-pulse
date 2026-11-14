@@ -33,6 +33,7 @@ import {
   hostStateBadge,
   hostStateLabel,
   skipLabel,
+  degradedNote,
   progressGroups,
   hostLink,
   waveName,
@@ -83,7 +84,7 @@ export function render(ctx) {
     rowKey: (x) => x.agent_id,
     columns: [
       { key: 'host', label: t('rm.det.col.host'), cls: 'k-cell-host', render: (x) => [hostLink(x.agent_id, x.hostname), h('span', { class: 'k-host-id mono' }, x.agent_id.slice(0, 8))] },
-      { key: 'state', label: t('rm.det.col.state'), render: (x) => [hostStateBadge(x.state), x.reason ? h('span', { class: 'k-sub' }, skipLabel(x.reason)) : null] },
+      { key: 'state', label: t('rm.det.col.state'), render: (x) => [hostStateBadge(x.state), x.reason ? h('span', { class: 'k-sub' }, skipLabel(x.reason)) : null, degradedNote(x.degraded)] },
       { key: 'version', label: t('rm.det.col.version'), render: (x) => (x.to_version && x.from_version !== x.to_version ? t('rm.versions', { from: x.from_version || '—', to: x.to_version }) : x.from_version || '—') },
       { key: 'progress', label: t('rm.det.col.progress'), num: true, render: (x) => (x.progress && x.progress.total ? fmt.pct((x.progress.bytes / x.progress.total) * 100) : '—') },
       { key: 'code', label: t('rm.det.col.code'), render: (x) => (x.code ? h('code', { class: 'k-code-tag' }, x.code) : '—') },

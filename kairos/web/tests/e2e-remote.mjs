@@ -805,6 +805,54 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
       await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
       await page.locator('#rollout-preview-external [data-ext="allowlist"]').getByText(/1 台回報有白名單/).waitFor();
       assert.equal(await page.locator('#rollout-preview-external [data-ext="undeclared"]').count(), 0);
+      // install.rollback（REMOTE.md 第 2.1、4.5.2 節；ADR-0003）：S05 的「升級」卡片顯示 Pulse 宣告的自動回滾
+      // 能力；宣告 degraded（上一次回滾只換回了執行檔）時另有「需要修復套件」的警告（PLS-W8418 暫定號）
+      const declareRollback = async (rollback) => {
+        agent.close();
+        agent.install = { method: 'tar', upgrade: 'ready', config: 'enabled', rollback };
+        agent.seq = 0;
+        await until(async () => {
+          try {
+            await agent.connect();
+            return true;
+          } catch {
+            agent.close();
+            return false;
+          }
+        }, 30000, `pulse-09 以 install.rollback=${rollback} 重新連線`);
+        await until(async () => {
+          const r = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
+          return r.status === 200 && r.json.data.install && r.json.data.install.rollback === rollback;
+        }, 30000, `pulse-09 的 install.rollback=${rollback}`);
+        await until(async () => {
+          const r = await api(page, 'GET', `/api/v1/hosts/${P09}`);
+          return r.status === 200 && r.json.data.install && r.json.data.install.rollback === rollback;
+        }, 60000, `主機詳情的 install.rollback=${rollback}`);
+      };
+      for (const [rb, text, repair] of [
+        ['archived', '經套件管理員裝回（主機上有目前版本的套件封存）', false],
+        ['binary_only', /^換回執行檔/, false],
+        ['degraded', '需要先修復套件（上一次回滾只換回了執行檔）', true],
+      ]) {
+        await declareRollback(rb);
+        const up = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
+        assert.equal(up.json.data.package_repair_needed, repair, JSON.stringify(up.json.data));
+        await page.goto(`${URL0}/hosts/${P09}`);
+        await waitTitle(page, 'pulse-09');
+        await page.locator('#host-upgrade-title').waitFor({ timeout: 15000 });
+        await page.locator(`[data-rollback="${rb}"]`).getByText(text).waitFor({ timeout: 15000 });
+        if (repair) {
+          const box = page.locator('#host-package-repair');
+          await box.getByText('需要修復套件').first().waitFor({ timeout: 15000 });
+          await box.getByText('PLS-W8418').waitFor();
+          await box.getByText(/重新安裝目前版本的套件/).waitFor();
+          await axe(page, 'F8 S05 升級卡片（需要修復套件）');
+          await shot(page, 'remote-host-package-repair');
+        } else {
+          assert.equal(await page.locator('#host-package-repair').count(), 0, `${rb}: 不需要修復套件`);
+        }
+      }
+      await axe(page, 'F8 S05 升級卡片（自動回滾的宣告）');
     } finally {
       // 還原：之後的測試需要原本的 pulse-09（0.9.0、沒有宣告）
       await declare(null, '0.9.0');
