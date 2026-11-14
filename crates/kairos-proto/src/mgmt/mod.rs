@@ -189,7 +189,7 @@ pub const INSTALL_CONFIG_ENABLED: &str = "enabled";
 /// `install.config`：本機 `remote_config.enabled = false`
 pub const INSTALL_CONFIG_DISABLED: &str = "disabled";
 
-/// `install.external_url`（Pulse 0.10.1 之後的版本；REMOTE.md 第 2.1、4.1.2 節）：本機的
+/// `install.external_url`（Pulse 0.11.0 起；REMOTE.md 第 2.1、4.1.2 節）：本機的
 /// `upgrade.url_allowlist` 是空的（或沒有任何有效的項目）——`source: "url"` 的提議一律 `declined`
 /// （`PLS-W8411`、`url_not_allowed`）。Kairos 據此在外部 URL 版本的資格預覽事先標出這台主機
 pub const INSTALL_EXTERNAL_URL_NONE: &str = "none";
@@ -216,7 +216,7 @@ pub struct InstallInfo {
     /// [`INSTALL_CONFIG_ENABLED`] 或 [`INSTALL_CONFIG_DISABLED`]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
-    /// [`INSTALL_EXTERNAL_URL_STATES`] 之一（Pulse 0.10.1 之後的版本）；沒有＝未知。0.9／0.10 的 Kairos
+    /// [`INSTALL_EXTERNAL_URL_STATES`] 之一（Pulse 0.11.0 起）；沒有＝未知。0.9／0.10 的 Kairos
     /// 忽略這個欄位（「物件中的其他欄位忽略」是 0.9.0 就定下的規則），協定版本不變
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_url: Option<String>,

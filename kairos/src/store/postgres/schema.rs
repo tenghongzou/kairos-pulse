@@ -977,7 +977,7 @@ ALTER TABLE rollouts ADD COLUMN submitted_by TEXT COLLATE "C";
 ALTER TABLE rollouts ADD COLUMN reject_reason TEXT COLLATE "C";
 "#;
 
-/// schema v12（0.10.1 之後的版本）：hello 的 `install.external_url`（`crates/kairos-proto/REMOTE.md`
+/// schema v12（0.11.0 起）：hello 的 `install.external_url`（`crates/kairos-proto/REMOTE.md`
 /// 第 2.1 節）。與 SQLite 的 `store/sqlite/remote.rs` `SCHEMA_V12_INSTALL_EXTERNAL_URL` 對等：`hosts` 新增
 /// 一個可為 NULL 的欄位
 pub const SCHEMA_V12: &str = r#"

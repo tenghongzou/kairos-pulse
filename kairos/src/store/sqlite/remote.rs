@@ -20,7 +20,7 @@ ALTER TABLE rollouts ADD COLUMN submitted_by TEXT;
 ALTER TABLE rollouts ADD COLUMN reject_reason TEXT;
 ";
 
-/// schema v12（0.10.1 之後的版本）：hello 的 `install.external_url`（REMOTE.md 第 2.1 節）——Pulse 宣告本機
+/// schema v12（0.11.0 起）：hello 的 `install.external_url`（REMOTE.md 第 2.1 節）——Pulse 宣告本機
 /// 是否允許從外部 URL 下載（`none`／`allowlist`；NULL＝沒有宣告，較舊的 Pulse）。只新增一個可為 NULL 的
 /// 欄位，不修改既有的資料。PostgreSQL 的對等步驟在 `store/postgres/schema.rs` 的 `SCHEMA_V12`
 pub(crate) const SCHEMA_V12_INSTALL_EXTERNAL_URL: &str = "

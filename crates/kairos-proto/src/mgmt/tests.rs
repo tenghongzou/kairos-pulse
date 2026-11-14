@@ -578,7 +578,7 @@ fn unsafe_path_is_a_valid_install_upgrade_value_for_old_and_new_peers() {
     assert_eq!(serde_json::from_str::<InstallInfo>(&json).unwrap(), install);
 }
 
-/// `install.external_url`（0.10.1 之後的 Pulse；REMOTE.md 第 2.1 節）：選用欄位，三種狀態——`none`、
+/// `install.external_url`（0.11.0 起的 Pulse；REMOTE.md 第 2.1 節）：選用欄位，三種狀態——`none`、
 /// `allowlist`、沒有這個欄位（未知）。協定版本不變、不是新的 feature：舊的 Kairos 依「其他欄位忽略」
 /// 略過它，舊的 Pulse 不送它
 #[test]

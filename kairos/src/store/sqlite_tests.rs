@@ -2056,7 +2056,7 @@ fn upgrade_from_v9_to_v11_adds_the_rollout_approval_columns() {
     for c in ["submitted_at", "submitted_by", "reject_reason"] {
         assert!(cols(&conn).iter().any(|x| x == c), "{c}");
     }
-    // v12（0.10.1 之後的版本）：hosts.install_external_url，只新增一個可為 NULL 的欄位
+    // v12（0.11.0 起）：hosts.install_external_url，只新增一個可為 NULL 的欄位
     let host_cols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('hosts')")
         .unwrap()

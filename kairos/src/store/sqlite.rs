@@ -751,7 +751,7 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 11,
         sql: remote::SCHEMA_V11_ROLLOUT_APPROVAL,
     },
-    // v12（0.10.1 之後的版本）：hosts.install_external_url（hello 的 install.external_url；SQL 在
+    // v12（0.11.0 起）：hosts.install_external_url（hello 的 install.external_url；SQL 在
     // store/sqlite/remote.rs）
     Migration {
         version: 12,
@@ -2933,7 +2933,7 @@ pub(crate) struct InventoryRow {
     pub(crate) install_method: Option<String>,
     pub(crate) install_upgrade: Option<String>,
     pub(crate) install_config: Option<String>,
-    /// hello 的 `install.external_url`（0.10.1 之後的 Pulse；schema v12）。與其他 `install` 欄位不同，
+    /// hello 的 `install.external_url`（0.11.0 起的 Pulse；schema v12）。與其他 `install` 欄位不同，
     /// 寫入時**不沿用舊值**：hello 帶 `install.upgrade`（0.9.0 起的 Pulse 一定帶）而沒有這個欄位時清成
     /// NULL——Pulse 降回舊版後是「未知」，不是上一次宣告的值
     pub(crate) install_external_url: Option<String>,

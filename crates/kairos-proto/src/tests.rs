@@ -51,7 +51,7 @@ pub(crate) enum Ver {
     Cluster,
     /// 遠端管理（feature `config`、`upgrade`）
     Mgmt,
-    /// hello 的 `install.external_url`（0.10.1 之後的 Pulse）
+    /// hello 的 `install.external_url`（0.11.0 起的 Pulse）
     MgmtExternalUrl,
     Errors,
 }
