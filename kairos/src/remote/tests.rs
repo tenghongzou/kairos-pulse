@@ -105,8 +105,14 @@ impl Fx {
         .await;
     }
 
-    /// 主機上線、協商了 config 與 upgrade（狀態表與遠端管理的連線表）
+    /// 主機上線、協商了 config 與 upgrade（狀態表與遠端管理的連線表）；hello 沒有宣告 `install.external_url`
+    /// （0.10.1 以前的 Pulse）
     fn connect(&self, id: &str, version: &str, method: &str) {
+        self.connect_declaring(id, version, method, None);
+    }
+
+    /// [`Fx::connect`]，hello 另帶 `install.external_url`
+    fn connect_declaring(&self, id: &str, version: &str, method: &str, external_url: Option<&str>) {
         let conn_id = crate::registry::next_conn_id();
         self.registry
             .register(
@@ -132,6 +138,7 @@ impl Fx {
                 agent_version: version.to_string(),
                 install_method: Some(method.to_string()),
                 install_upgrade: Some("ready".into()),
+                install_external_url: external_url.map(str::to_string),
                 arch: Some("x86_64".into()),
                 config: true,
                 upgrade: true,
@@ -1342,6 +1349,7 @@ fn connect_hello_only(fx: &Fx, id: &str, version: &str, method: &str, upgrade: &
                         method: Some(method.into()),
                         upgrade: Some(upgrade.into()),
                         config: Some("enabled".into()),
+                        external_url: None,
                     }),
                     tags: Some(vec!["site:b".into()]),
                     ..Default::default()
@@ -1923,6 +1931,89 @@ async fn scheduled_rollouts_start_later_and_only_offer_inside_windows() {
     assert_eq!(r.state, "completed");
 }
 
+/// IANA 時區的升級時段（REMOTE.md 第 4.7.5 節）：Europe/Berlin 每天 02:30～04:00，2027-03-28 的 02:00～03:00
+/// 不存在——時段延後到當地 03:00（01:00Z）開始、04:00（02:00Z）結束；隔天照常 02:30 CEST（00:30Z）
+#[tokio::test]
+async fn iana_timezone_windows_follow_daylight_saving_time_in_the_engine() {
+    let signer = TestSigner::new(27);
+    let fx = Fx::new("schedule-iana", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let ts = crate::api::http::ts_ms;
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .timestamp_millis()
+    };
+    fx.set_now(at("2027-03-27T12:00:00Z"));
+    let spec = RolloutSpec::parse(&json!({
+        "name": "berlin",
+        "target_version": "0.9.2",
+        "selector": {"agent_ids": [A]},
+        "waves": [{"size": "rest"}],
+        "schedule": {"windows": [{"start": "02:30", "end": "04:00"}], "timezone": "Europe/Berlin"},
+    }))
+    .unwrap();
+    let preview = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["window"],
+        json!({"open": false, "next": ts(at("2027-03-28T01:00:00Z"))})
+    );
+    assert_eq!(preview["timezone"]["kind"], "iana");
+    assert_eq!(preview["timezone"]["offset"], "+01:00");
+    let up = &preview["upcoming_windows"];
+    assert_eq!(up[0]["start_local"], "2027-03-28T03:00:00+02:00");
+    assert_eq!(up[0]["end_local"], "2027-03-28T04:00:00+02:00");
+    assert_eq!(
+        (up[0]["minutes"].as_i64(), up[0]["dst"].as_str()),
+        (Some(60), Some("gap"))
+    );
+    assert_eq!(up[1]["start_local"], "2027-03-29T02:30:00+02:00");
+    assert_eq!(up[1]["dst"], Value::Null);
+    let created = fx.svc.create_rollout(&who(), spec).await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["schedule"]["timezone"], "Europe/Berlin");
+    assert_eq!(
+        created["upcoming_windows"][0]["start_local"],
+        "2027-03-28T03:00:00+02:00"
+    );
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running");
+    // 切換（01:00Z）之前還在時段外
+    fx.set_now(at("2027-03-28T00:59:00Z"));
+    fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(A), None, "切換之前不提議（不提早）");
+    let rid = id.clone();
+    let r = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        rollout_json(&r, &[], fx.svc.now_ms(), false)["next_action"],
+        json!({"code": "waiting_window", "until": ts(at("2027-03-28T01:00:00Z"))})
+    );
+    // 切換的那一刻（當地 03:00 CEST）開始；提議的 apply_window 到當地 04:00 CEST 為止
+    fx.set_now(at("2027-03-28T01:00:05Z"));
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).expect("時段內提議");
+    let offer = fx.svc.build_offer(A, &up, 1).await.unwrap().unwrap();
+    assert_eq!(offer.apply_window.not_after, ts(at("2027-03-28T02:00:00Z")));
+    // 時段結束後不再提供提議
+    fx.set_now(at("2027-03-28T02:00:01Z"));
+    assert!(fx.svc.build_offer(A, &up, 2).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn ends_at_expires_hosts_that_have_not_started_and_waits_for_applying_ones() {
     let signer = TestSigner::new(22);
@@ -2351,6 +2442,158 @@ async fn approval_is_off_by_default() {
         .await
         .unwrap_err();
     assert_eq!(e.code, "invalid_state");
+}
+
+/// 外部 URL 版本的資格預覽（REMOTE.md 第 2.1、4.7.2 節）：Pulse 在 hello 宣告 `install.external_url`。
+/// 宣告 `none` 的主機在預覽與送出時分類為 `url_not_allowed`（不必等推送中的 `declined`）；沒有宣告
+/// （舊 Pulse）與宣告 `allowlist` 的主機照舊可升級，預覽註明台數；宣告 `allowlist` 而實際拒絕的主機
+/// 照現行的 `declined` 處理。連線中的主機以這次 hello 為準，不沿用清冊的舊值
+#[tokio::test]
+async fn external_url_declaration_drives_the_eligibility_preview() {
+    const E: &str = "eeeeeeee-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const F: &str = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let signer = TestSigner::new(29);
+    let fx = Fx::new("external-declared", trust_settings(&signer)).await;
+    let ext = release(&signer, "0.9.2", "2222222");
+    let hosted = release(&signer, "0.9.3", "3333333");
+    fx.svc
+        .import_release_from(
+            &who(),
+            ext.sha256sums.clone(),
+            ext.signature.clone(),
+            Some(ext.manifest.clone()),
+            Some("https://repo.example.gov.tw/kairos-pulse/0.9.2/".into()),
+        )
+        .await
+        .unwrap();
+    for (name, data) in &ext.files {
+        let mut up = releases::Upload::create(&fx.svc.releases_dir, 1 << 20).unwrap();
+        up.write(data).unwrap();
+        let (sha, size) = up.finish().unwrap();
+        fx.svc
+            .store_artifact(&who(), "0.9.2".into(), name.clone(), up, sha, size)
+            .await
+            .unwrap();
+    }
+    import(&fx, &hosted).await;
+    // A：連線中，宣告 none。B：連線中，宣告 allowlist。C：連線中、沒有宣告（舊 Pulse）。
+    // D：離線，清冊記著 none。E：離線，清冊沒有宣告。
+    // F：清冊記著 none，但這次連線的 hello 沒有宣告（Pulse 降回舊版）→ 未知，不沿用清冊
+    for h in [A, B, C, D, E, F] {
+        fx.add_host(h, "0.9.0", "Web", &[], "tar", "ready").await;
+    }
+    for h in [D, F] {
+        fx.sql(move |c| {
+            c.execute(
+                "UPDATE hosts SET install_external_url = 'none' WHERE agent_id = ?1",
+                [h],
+            )
+            .unwrap();
+        })
+        .await;
+    }
+    fx.sql(|c| {
+        c.execute(
+            "UPDATE hosts SET online = 0 WHERE agent_id IN (?1, ?2)",
+            [D, E],
+        )
+        .unwrap();
+    })
+    .await;
+    fx.connect_declaring(A, "0.9.0", "tar", Some("none"));
+    fx.connect_declaring(B, "0.9.0", "tar", Some("allowlist"));
+    fx.connect(C, "0.9.0", "tar");
+    fx.connect(F, "0.9.0", "tar");
+    let spec = |target: &str| {
+        RolloutSpec::parse(&json!({
+            "name": target, "target_version": target, "selector": {"all": true},
+            "waves": [{"size": "rest", "max_failure_ratio": 1.0}],
+        }))
+        .unwrap()
+    };
+    let p = fx
+        .svc
+        .preview_rollout(spec("0.9.2"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["matched"].as_i64(), p["eligible"].as_i64()),
+        (Some(6), Some(4)),
+        "{p}"
+    );
+    assert_eq!(p["skipped"], json!({"url_not_allowed": 2}), "{p}");
+    let mut sample: Vec<&str> = p["samples"]["url_not_allowed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["agent_id"].as_str().unwrap())
+        .collect();
+    sample.sort_unstable();
+    assert_eq!(sample, [A, D]);
+    assert_eq!(
+        p["external_url"],
+        json!({
+            "base_url": "https://repo.example.gov.tw/kairos-pulse/0.9.2/",
+            "undeclared": 3,
+            "allowlist": 1,
+        })
+    );
+    assert_eq!(p["confirm_text"], "升級 4 台");
+    // 由 Kairos 代管的版本：不看宣告，六台都可升級
+    let p = fx
+        .svc
+        .preview_rollout(spec("0.9.3"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["skipped"].clone()),
+        (Some(6), json!({})),
+        "{p}"
+    );
+    assert_eq!(p["external_url"], Value::Null);
+    // 送出：對象固定，宣告 none 的主機記為 skipped（url_not_allowed），不會被提議
+    let created = fx.svc.create_rollout(&who(), spec("0.9.2")).await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 4 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running");
+    for h in [A, D] {
+        let row = fx.host_state(&id, h).await;
+        assert_eq!(
+            (row.state.as_str(), row.reason.as_deref()),
+            ("skipped", Some("url_not_allowed")),
+            "{h}"
+        );
+    }
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(A), None, "宣告 none 的主機不提議");
+    let up_b = fx.svc.offer_of(B).expect("宣告 allowlist 的主機照常提議");
+    assert!(fx.svc.offer_of(C).is_some(), "沒有宣告的主機照常提議");
+    let offer = fx.svc.build_offer(B, &up_b, 1).await.unwrap().unwrap();
+    assert_eq!(offer.artifact.source, "url");
+    // 宣告 allowlist 但白名單不含這個 URL：照現行的 declined（PLS-W8411、url_not_allowed），不計入失敗
+    let mut declined = status(&up_b, "declined");
+    declined.code = Some("PLS-W8411".into());
+    declined.detail = "url_not_allowed".into();
+    fx.svc
+        .apply_upgrade_status(B, "0.9.0", declined)
+        .await
+        .unwrap();
+    let row = fx.host_state(&id, B).await;
+    assert_eq!(row.state, "declined");
+    fx.svc.tick().await.unwrap();
+    let rid = id.clone();
+    let r = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(r.state, "running", "declined 不計入失敗比例、不暫停");
 }
 
 /// 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節，0.10.0）：只登記簽章資料（驗證與代管相同），發佈檔不能上傳；

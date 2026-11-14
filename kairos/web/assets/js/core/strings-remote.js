@@ -106,6 +106,10 @@ export const REMOTE_STRINGS = {
   'rm.upFix.unsafe_path':
     '安裝路徑不安全（PLS-E8405）：/opt/pulse、/opt/pulse/pulse、/var/lib/pulse-upgrade 或它們的上層目錄不屬於 root、可由群組或其他人寫入，或是符號連結，遠端升級會被升級輔助程式拒絕。在主機上執行 pulse upgrade status 查看是哪一個路徑，改為 root 擁有並移除群組與其他人的寫入權限；Pulse 下一次連線時重新偵測。',
   'rm.upFix.none': '需要 Pulse 0.9.0 以上；0.8 → 0.9 必須在主機上手動升級一次。',
+  // Pulse 宣告的 install.external_url（S05「升級」卡片；REMOTE.md 第 2.1 節）〔工程暫行〕
+  'rm.host.externalUrl': '外部 URL 的版本',
+  'rm.ext.none': '不允許（主機的 upgrade.url_allowlist 是空的）',
+  'rm.ext.allowlist': '依主機的白名單（Kairos 不知道白名單的內容）',
   // 安裝方式
   'rm.method.tar': 'tar',
   'rm.method.deb': 'deb',
@@ -526,6 +530,9 @@ export const REMOTE_STRINGS = {
   'rm.skip.no_helper': '缺少輔助程式',
   'rm.skip.unsupported': '安裝方式不支援（多實例等）',
   'rm.skip.unsafe_path': '安裝路徑不安全（PLS-E8405；在主機上修正 /opt/pulse 等路徑的擁有者與權限，主機詳情有說明）',
+  // 外部 URL 的版本：Pulse 在 hello 宣告本機的白名單是空的（install.external_url = none；REMOTE.md 第 2.1、
+  // 4.7.2 節；ADR-0002 決策點 5c）〔工程暫行：設計包定稿 S26 的資格分類後替換〕
+  'rm.skip.url_not_allowed': '不允許從外部 URL 下載（PLS-W8411；主機的 upgrade.url_allowlist 是空的：在 pulse.toml 設定後重新啟動 Pulse，或改用存放在 Kairos 的版本）',
   'rm.skip.not_ready': '沒有協商遠端升級（未以 mTLS 連線或 Pulse 尚未就緒）',
   'rm.skip.unsupported_platform': 'Windows 或不支援的平台（Windows 在 0.10 起）',
   'rm.skip.no_artifact': '版本庫沒有這個平台的發佈檔',
@@ -596,6 +603,12 @@ export const REMOTE_STRINGS = {
   'rm.new.wavesN': '分 {n} 批：{list} 台',
   'rm.new.windowClosed': '目前在升級時段外：送出後要等到 {t} 才會開始升級。',
   'rm.new.windowNone': '排程中已經沒有可用的時段：送出後不會升級任何主機。',
+  // 外部 URL 版本的預覽（external_url：base_url、undeclared、allowlist）〔工程暫行，ADR-0002 決策點 5c 的過渡說明〕
+  'rm.new.extTitle': '這個版本的發佈檔由 Pulse 從外部 URL 下載',
+  'rm.new.extBody': '每台主機只在本機的 upgrade.url_allowlist 允許這個 URL 時才下載；不允許的主機不會升級。白名單是空的主機已經列在下方「不會升級」。',
+  'rm.new.extUndeclared': '可升級的主機中有 {n} 台沒有回報是否允許外部 URL（Pulse 版本較舊）：其中不允許的主機會在推送中拒絕（PLS-W8411），不計入失敗。',
+  'rm.new.extAllowlist': '{n} 台回報有白名單，但 Kairos 不知道白名單的內容：白名單不含這個 URL 的主機同樣會在推送中拒絕。',
+  'rm.new.extSnippet': '要允許這個版本，主機的 pulse.toml 需要：',
   'rm.new.downgradeN': '其中 {n} 台是降版',
   'rm.new.noRollbackN': '其中 {n} 台無法自動回滾',
   'rm.new.loses': '目標版本沒有遠端升級功能（或沒有發佈清單）：升級後這些主機無法再以推送升級。',
@@ -628,6 +641,22 @@ export const REMOTE_STRINGS = {
   'rm.new.winEnd': '結束',
   'rm.new.winHint': '結束早於開始時跨午夜（例如 23:00～03:00）。',
   'rm.new.winBad': '請填寫開始與結束時間（兩者不可相同）',
+  // 升級時段的時區（IANA 名稱；REMOTE.md 第 4.7.5 節）〔工程暫行：設計包 copywriting.md §5 的 IANA 寫法與
+  // 日光節約時間的說明句定稿後替換，ADR-0002 第 6 節 #12〕
+  'rm.new.tz': '升級時段的時區',
+  'rm.new.tzHint': '時區名稱（例如 Asia/Taipei、Europe/Berlin；大小寫須相同）或固定位移（例如 +08:00）。使用時區名稱時，時段依當地的時鐘計算，日光節約時間開始與結束時不必調整。留空＝Kairos 的時區。',
+  'rm.new.tzBad': '不認得這個時區。請從建議清單選擇時區名稱（例如 Europe/Berlin），或輸入固定位移（例如 +08:00）。',
+  'rm.new.tzBadPreview': '修正升級時段的時區後才能試算。',
+  'rm.new.winTzIana': '時段以 {tz} 當地的時鐘計算（目前 UTC{offset}；時區資料 {tzdb}）。',
+  'rm.new.winTzFixed': '時段以固定位移 {tz} 計算（沒有日光節約時間）。',
+  'rm.new.winNext': '接下來的升級時段（{tz} 當地時間）',
+  'rm.new.winNextItem': '{start} ～ {end}，{dur}',
+  'rm.new.winStamp': '{date} {time}（UTC{offset}）',
+  'rm.new.winDurHM': '{h} 小時 {m} 分鐘',
+  'rm.new.winDurH': '{h} 小時',
+  'rm.new.winDurM': '{m} 分鐘',
+  'rm.new.winDstGap': '日光節約時間開始（時鐘撥快）：這一次比平常短，或延後開始。',
+  'rm.new.winDstFold': '日光節約時間結束（時鐘撥慢）：這一次比平常長，或在重複的那一小時的第二次開始。',
   'rm.new.winTz': '時段以 Kairos 的時區 {tz} 計算（alerts.timezone）。',
   'rm.new.winTzUnknown': '時段以 Kairos 的時區計算（alerts.timezone）。',
   'rm.day.mon': '週一',

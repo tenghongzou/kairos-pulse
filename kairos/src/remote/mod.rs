@@ -170,6 +170,8 @@ pub struct AgentSession {
     pub agent_version: String,
     pub install_method: Option<String>,
     pub install_upgrade: Option<String>,
+    /// hello 的 `install.external_url`（`None`＝沒有宣告；REMOTE.md 第 2.1 節）
+    pub install_external_url: Option<String>,
     pub arch: Option<String>,
     pub config: bool,
     pub upgrade: bool,

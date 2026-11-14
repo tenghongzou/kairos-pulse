@@ -116,6 +116,17 @@ pub fn url_allowed(url: &str, allowlist: &[String]) -> bool {
     })
 }
 
+/// hello 的 `install.external_url`（REMOTE.md 第 2.1 節）：白名單中至少有一項會比對到 URL（與
+/// [`url_allowed`] 相同的判斷：不合法的項目不算）時 `allowlist`，否則 `none`。只回報「有沒有」，
+/// 不回報內容
+pub fn allowlist_state(allowlist: &[String]) -> &'static str {
+    if allowlist.iter().any(|p| parse_https_url(p.trim()).is_ok()) {
+        super::INSTALL_EXTERNAL_URL_ALLOWLIST
+    } else {
+        super::INSTALL_EXTERNAL_URL_NONE
+    }
+}
+
 /// URL 的最後一個路徑段必須等於檔名（提議的 `url` 為 `base_url` ＋檔名）
 pub fn url_names_file(url: &str, filename: &str) -> bool {
     parse_https_url(url).is_ok_and(|u| u.path.rsplit('/').next() == Some(filename))

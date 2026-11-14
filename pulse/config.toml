@@ -259,7 +259,9 @@ extra_principals = []
 allow_downgrade = false
 # 允許從外部 URL 下載發佈檔的前綴（0.10.0 起；空 = 只從 Kairos 下載）。每一項是 https://<主機>[:<埠>]/<目錄>/，
 # 以「目錄」比對（https://repo.example.gov.tw/kairos-pulse 只放行這個目錄之下的 URL）；不可有帳號密碼、查詢字串。
-# 只決定 Pulse 可以向哪裡下載：下載的檔案仍要通過本機信任錨的簽章與雜湊驗證。只能在 pulse.toml 設定
+# 只決定 Pulse 可以向哪裡下載：下載的檔案仍要通過本機信任錨的簽章與雜湊驗證。只能在 pulse.toml 設定。
+# Pulse 只向 Kairos 回報這份白名單「是空的」或「有內容」（hello 的 install.external_url，供推送的資格預覽使用），
+# 不回報內容；修改後重新啟動 Pulse 才會更新
 url_allowlist = []
 # 外部 URL 的 CA（PEM 檔的路徑，可含多張）：設定時只信任它；空字串 = 作業系統信任庫
 external_ca = ""

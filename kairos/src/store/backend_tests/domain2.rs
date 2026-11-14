@@ -1502,6 +1502,29 @@ fn rollout_schedule_approval_and_external_releases(db: &TestDb) -> String {
         s.update_rollout_schedule("r-nope", schedule, T0 + 110)
             .unwrap()
     );
+    // IANA 時區名稱的排程：schedule 是 JSON 文字欄位，兩個後端原樣保存（不需要 schema 變更），讀回後
+    // 時段的計算結果相同（2026-03-29T00:30:00Z 在 Europe/Berlin 週六 23:00～03:00 的時段內，到 01:00Z）
+    let iana = "{\"timezone\":\"Europe/Berlin\",\"windows\":[{\"days\":[\"sat\"],\"start\":\"23:00\",\"end\":\"03:00\"}]}";
+    log!(
+        out,
+        "schedule iana",
+        s.update_rollout_schedule(R3, iana, T0 + 111).unwrap()
+    );
+    let stored = s.get_rollout(R3).unwrap().unwrap().schedule;
+    assert_eq!(stored, iana);
+    let spec = crate::remote::schedule::ScheduleSpec::from_db(&stored);
+    assert_eq!(spec.timezone.as_deref(), Some("Europe/Berlin"));
+    assert_eq!(
+        spec.window_at(1_774_744_200_000),
+        crate::remote::schedule::WindowState::Open {
+            until: Some(1_774_746_000_000)
+        }
+    );
+    log!(
+        out,
+        "schedule iana window",
+        spec.window_at(1_774_744_200_000)
+    );
     // 送出：雙人覆核時先進入 pending_approval，對象已固定
     let a = s.host_id_of(A).unwrap().unwrap();
     let b = s.host_id_of(B).unwrap().unwrap();

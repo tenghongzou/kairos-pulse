@@ -8,8 +8,10 @@
 //    （POST /rollouts/preview，600 ms 合併；可升級台數以 aria-live 朗讀）：不會升級的依原因分列，每類可展開前 100 台。
 // 3. 批次：先行批次（%、上限台數或指定主機）＋觀察時間（人工繼續）；中間的批次（0.10：可增減，大小為剩餘主機的 %、
 //    觀察時間、失敗上限；「套用建議的四批範本」）；其餘的失敗上限；同時升級的上限、健康確認期限。最多 10 批。
-// 3b. 排程與升級時段（0.10）：開始／結束時間（選填）、每週的時段（星期、開始、結束；跨午夜可），時區為 Kairos 的
-//    alerts.timezone（預覽回傳 default_timezone）。預覽回報目前是否在時段內。
+// 3b. 排程與升級時段（0.10）：開始／結束時間（選填）、每週的時段（星期、開始、結束；跨午夜可）。時區可輸入或從
+//    建議清單選擇 IANA 名稱（Asia/Taipei、Europe/Berlin…）或固定位移，留空為 Kairos 的 alerts.timezone（預覽回傳
+//    default_timezone）；伺服器驗證名稱（400 schedule.timezone → 欄位錯誤）。預覽回報目前是否在時段內，並列出
+//    接下來的時段實際的開始與結束（upcoming_windows：當地時間含位移、實際長度、日光節約時間的影響）。
 // 4. 選項：允許無法自動回滾的主機、允許降版。
 // 5. 送出：建立草稿（POST /rollouts）→ L2 DangerConfirmDialog 輸入預覽的 confirm_text（「升級 N 台」）→ submit；
 //    降版時 L3（「降版 N 台」＋原因必填；0.9 不要求重新驗證密碼）。台數在送出時改變（400 confirmation_required）
@@ -17,7 +19,9 @@
 // 6. 0.10（ADR-0002 S1、S2；精靈之前先加在這個表單）：預覽與送出對話框顯示伺服器回傳的風險提醒（warnings[] 的
 //    固定代碼）、目標版本的檔案遺失（artifact_problems，KRS-W8417；需要它的主機分類為 artifact_missing）；啟用
 //    雙人覆核時寫出誰可以核准，沒有可核准者（approvers_available = 0）時警告但不阻擋。
-// Windows、外部 URL 不顯示。
+// 7. 外部 URL 的版本（REMOTE.md 第 4.7.2 節）：預覽的 external_url（base_url、undeclared、allowlist）顯示為一則說明
+//    ——白名單是空的主機（url_not_allowed）已列在「不會升級」，沒有回報與回報有白名單的台數另外註明，附 pulse.toml 的片段。
+// Windows 不顯示。
 
 import { h, icon, mount, uid, announce } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -40,6 +44,20 @@ const MAX_WINDOWS = 16;
 /** 各批的台數（「2 → 20 → 89 → 89」） */
 function waveList(waves) {
   return (waves || []).map((n) => fmt.num(n || 0)).join(' → ');
+}
+
+/** 伺服器換算的當地時間（`2026-03-29T03:00:00+02:00`）→「2026-03-29 03:00（UTC+02:00）」；不經瀏覽器的時區 */
+function localStamp(s) {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}([+-]\d{2}:\d{2})$/.exec(String(s || ''));
+  return m ? t('rm.new.winStamp', { date: m[1], time: m[2], offset: m[3] }) : String(s || '');
+}
+
+/** 時段的實際長度（分鐘 →「3 小時」「1 小時 30 分鐘」「30 分鐘」） */
+function durationText(minutes) {
+  const m = Number(minutes) || 0;
+  const [hh, mm] = [Math.floor(m / 60), m % 60];
+  if (hh && mm) return t('rm.new.winDurHM', { h: fmt.num(hh), m: fmt.num(mm) });
+  return hh ? t('rm.new.winDurH', { h: fmt.num(hh) }) : t('rm.new.winDurM', { m: fmt.num(mm) });
 }
 
 function cmpVersion(a, b) {
@@ -210,6 +228,26 @@ export function previewView(p, { onExclude, version } = {}) {
       ? inlineAlert({ kind: p.window.next ? 'info' : 'warning', role: 'status', body: p.window.next ? t('rm.new.windowClosed', { t: fmt.dateTime(p.window.next, { seconds: false }) }) : t('rm.new.windowNone') })
       : null,
     p.loses_remote_management && p.eligible ? inlineAlert({ kind: 'warning', body: t('rm.new.loses') }) : null,
+    // 外部 URL 的版本（REMOTE.md 第 4.7.2 節）：宣告白名單是空的主機已分類為 url_not_allowed；沒有宣告與宣告
+    // 有白名單的主機照舊算可升級，這裡註明台數（Kairos 不知道白名單的內容）
+    p.external_url
+      ? h(
+          'div',
+          { id: 'rollout-preview-external' },
+          inlineAlert({
+            kind: 'info',
+            role: 'status',
+            title: t('rm.new.extTitle'),
+            body: [
+              h('p', null, t('rm.new.extBody')),
+              p.external_url.undeclared ? h('p', { dataset: { ext: 'undeclared' } }, t('rm.new.extUndeclared', { n: fmt.num(p.external_url.undeclared) })) : null,
+              p.external_url.allowlist ? h('p', { dataset: { ext: 'allowlist' } }, t('rm.new.extAllowlist', { n: fmt.num(p.external_url.allowlist) })) : null,
+              h('p', null, t('rm.new.extSnippet')),
+              h('pre', { class: 'ds-code-block', tabindex: '0' }, `[upgrade]\nurl_allowlist = ["${p.external_url.base_url}"]`),
+            ],
+          }),
+        )
+      : null,
     // 目標版本有檔案遺失或大小不符的發佈檔（KRS-W8417，ADR-0002 F5）：需要它的主機已分類為 artifact_missing
     p.artifact_problems && p.artifact_problems.length
       ? h(
@@ -394,6 +432,55 @@ export function render(ctx) {
   const winList = h('div', { class: 'k-stack--sm', id: 'rollout-windows' });
   const winAdd = h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => addWindow(true) } }, icon('plus'), t('rm.new.winAdd'));
   const tzNote = h('p', { class: 'caption', id: 'rollout-window-tz' }, t('rm.new.winTzUnknown'));
+  // 時區：IANA 名稱（瀏覽器提供建議清單，伺服器以內建的時區資料庫驗證）或固定位移；留空＝Kairos 的預設
+  const tzListId = uid('tzlist');
+  const tzIn = input({ name: 'timezone', placeholder: 'Asia/Taipei', maxlength: '64', autocomplete: 'off' });
+  tzIn.setAttribute('list', tzListId);
+  const ftz = field({ label: t('rm.new.tz'), input: tzIn, hint: t('rm.new.tzHint') });
+  // 伺服器拒絕過的時區（同一個值不必再送一次才知道不行）
+  let tzBad = null;
+  let tzNames = [];
+  try {
+    tzNames = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+  } catch {
+    tzNames = [];
+  }
+  const tzList = h('datalist', { id: tzListId }, ['UTC', '+08:00', ...tzNames].map((v) => h('option', { value: v })));
+  // 接下來的時段實際的開始與結束（伺服器換算，含當時的位移），讓操作者在送出前確認
+  const winNext = h('div', { id: 'rollout-window-next', role: 'status' });
+  tzIn.addEventListener('input', schedule);
+  function renderUpcoming(p) {
+    const up = (p && p.upcoming_windows) || [];
+    const tz = p && p.timezone;
+    if (!wins.length || !tz) {
+      mount(winNext);
+      tzNote.textContent = p && p.default_timezone ? t('rm.new.winTz', { tz: p.default_timezone }) : t('rm.new.winTzUnknown');
+      return;
+    }
+    tzNote.textContent = tzIn.value.trim()
+      ? t(tz.kind === 'iana' ? 'rm.new.winTzIana' : 'rm.new.winTzFixed', { tz: tz.name, offset: tz.offset || '', tzdb: tz.tzdb || '' })
+      : t('rm.new.winTz', { tz: p.default_timezone || tz.name });
+    mount(
+      winNext,
+      up.length
+        ? [
+            h('p', { class: 'strong' }, t('rm.new.winNext', { tz: tz.name })),
+            h(
+              'ul',
+              { class: 'k-plain-list' },
+              up.map((o) =>
+                h(
+                  'li',
+                  { dataset: { dst: o.dst || '' } },
+                  t('rm.new.winNextItem', { start: localStamp(o.start_local), end: localStamp(o.end_local), dur: durationText(o.minutes) }),
+                  o.dst ? h('span', { class: 'caption' }, ` ${t(o.dst === 'gap' ? 'rm.new.winDstGap' : 'rm.new.winDstFold')}`) : null,
+                ),
+              ),
+            ),
+          ]
+        : h('p', { class: 'caption' }, t('rm.new.windowNone')),
+    );
+  }
   function renderWindows() {
     mount(
       winList,
@@ -576,6 +663,10 @@ export function render(ctx) {
       return { days: DAYS.filter((_, j) => w.days[j].checked), start: s, end: e };
     });
     if (windows.length) sch.windows = windows;
+    // 時區只在有時段時才有意義；留空時由 Kairos 填入預設
+    if (windows.length && tzIn.value.trim()) sch.timezone = tzIn.value.trim();
+    if (tzBad && tzBad === tzIn.value.trim() && windows.length) mark(ftz, tzIn, t('rm.new.tzBad'));
+    else if (strict) ftz.setError('');
     if (strict && release() && release().manifest && release().manifest.breaking && !ack.checked) {
       ackErr.hidden = false;
       if (!bad) bad = ack;
@@ -605,7 +696,7 @@ export function render(ctx) {
   }
 
   function snapshot() {
-    return JSON.stringify([nameIn.value, verSel.value, allR.checked, groupsIn.value, tagsIn.value, agentsIn.value, excludeIn.value, canaryAgentsIn.value, nums.map((n) => n.el.value), noRb.checked, down.checked, ack.checked, mids.map((m) => [m.pct.el.value, m.soak.el.value, m.fail.el.value]), startsIn.value, endsIn.value, wins.map((w) => [w.start.value, w.end.value, w.days.map((d) => d.checked)])]);
+    return JSON.stringify([nameIn.value, verSel.value, allR.checked, groupsIn.value, tagsIn.value, agentsIn.value, excludeIn.value, canaryAgentsIn.value, nums.map((n) => n.el.value), noRb.checked, down.checked, ack.checked, mids.map((m) => [m.pct.el.value, m.soak.el.value, m.fail.el.value]), startsIn.value, endsIn.value, wins.map((w) => [w.start.value, w.end.value, w.days.map((d) => d.checked)]), tzIn.value]);
   }
 
   let timer = null;
@@ -624,12 +715,24 @@ export function render(ctx) {
       if (my !== seq || disposed) return;
       lastPreview = p;
       mount(previewBox, previewView(p, { onExclude: excludeHosts, version: verSel.value }));
-      if (p.default_timezone) tzNote.textContent = t('rm.new.winTz', { tz: p.default_timezone });
+      tzBad = null;
+      ftz.setError('');
+      renderUpcoming(p);
       live.textContent = `${t('rm.new.eligible', { n: fmt.num(p.eligible || 0) })}，${t('rm.new.matched', { n: fmt.num(p.matched || 0) })}`;
       syncSubmit();
     } catch (err) {
       if (my !== seq || disposed) return;
       lastPreview = null;
+      // 不認得的時區：錯誤顯示在時區欄位（伺服器以內建的時區資料庫驗證）
+      if (err.code === 'invalid_parameter' && err.details && err.details.parameter === 'schedule.timezone') {
+        tzBad = tzIn.value.trim();
+        ftz.setError(t('rm.new.tzBad'));
+        mount(winNext);
+        mount(previewBox, h('p', { class: 'muted' }, t('rm.new.tzBadPreview')));
+        live.textContent = t('rm.new.tzBad');
+        syncSubmit();
+        return;
+      }
       mount(previewBox, errorState(err, { title: t('rm.new.previewFailed'), onRetry: runPreview }));
       live.textContent = t('rm.new.previewFailed');
       syncSubmit();
@@ -773,9 +876,12 @@ export function render(ctx) {
               h('p', { class: 'caption' }, t('rm.new.scheduleNote')),
               h('div', { class: 'ds-form-row' }, fstarts, fends),
               h('h3', { class: 'k-section-title' }, t('rm.new.winTitle')),
+              ftz,
+              tzList,
               tzNote,
               winList,
               h('div', { class: 'ds-button-row' }, winAdd),
+              winNext,
             ],
           }),
           card({

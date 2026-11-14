@@ -302,7 +302,7 @@ impl HostView {
             "tags": &*self.tags,
             "group": self.host_group.as_deref(),
             // 遠端管理（0.9.0；API.md 第 17 節）：安裝方式與本機狀態、集中設定的狀態
-            "install": self.install.as_deref().map(|i| json!({"method": i.method, "upgrade": i.upgrade, "config": i.config})),
+            "install": self.install.as_deref().map(|i| json!({"method": i.method, "upgrade": i.upgrade, "config": i.config, "external_url": i.external_url})),
             "config_state": self.config_state,
             "first_seen": ts_ms(self.first_seen),
             "last_seen": ts_ms(self.last_seen),

@@ -518,6 +518,54 @@ async fn releases_and_rollouts_over_https() {
         (r.status, body(&r)["error"]["details"]["parameter"].as_str()),
         (400, Some("schedule.windows[0]"))
     );
+    // 升級時段的時區：IANA 名稱與固定位移都接受；不認得的名稱在預覽與建立時都是 400 invalid_parameter
+    // （與其他參數錯誤相同的格式）
+    let with_tz = |tz: &str| {
+        json!({"name": "tz", "target_version": "0.9.2", "selector": {"groups": ["web"]}, "waves": [{"size": "rest"}],
+            "schedule": {"windows": [{"start": "01:00", "end": "05:00"}], "timezone": tz}})
+    };
+    for bad in ["Asia/Taipe", "europe/berlin", "+8", "GMT+8"] {
+        for path in ["/api/v1/rollouts/preview", "/api/v1/rollouts"] {
+            let r = call(addr, "POST", path, Some(&admin), Some(&with_tz(bad))).await;
+            assert_eq!(
+                (
+                    r.status,
+                    body(&r)["error"]["code"].as_str(),
+                    body(&r)["error"]["details"]["parameter"].as_str()
+                ),
+                (400, Some("invalid_parameter"), Some("schedule.timezone")),
+                "{bad} {path}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+    }
+    for good in ["Europe/Berlin", "Australia/Sydney", "+08:00", "UTC"] {
+        let r = call(
+            addr,
+            "POST",
+            "/api/v1/rollouts/preview",
+            Some(&op),
+            Some(&with_tz(good)),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            200,
+            "{good}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let d = &body(&r)["data"];
+        assert_eq!(d["schedule"]["timezone"], good);
+        assert_eq!(d["timezone"]["name"], good);
+        let iana = good.contains('/');
+        assert_eq!(d["timezone"]["kind"], if iana { "iana" } else { "fixed" });
+        let up = d["upcoming_windows"].as_array().unwrap();
+        assert_eq!(up.len(), 3, "{d}");
+        // 當地時間 01:00 開始，帶著當時的位移
+        let start = up[0]["start_local"].as_str().unwrap();
+        assert!(start.contains("T01:00:00"), "{start}");
+        assert_eq!(start.len(), "2026-11-15T01:00:00+01:00".len(), "{start}");
+    }
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&spec)).await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let id = body(&r)["data"]["id"].as_str().unwrap().to_string();
@@ -1150,6 +1198,111 @@ async fn releases_and_rollouts_over_https() {
             body(&r)["data"]["registered"].as_bool()
         ),
         (Some(false), Some(true))
+    );
+    // 外部 URL 版本的資格預覽（REMOTE.md 第 4.7.2 節）：Pulse 在 hello 宣告 install.external_url（清冊的
+    // hosts.install_external_url）。宣告 none 的主機事先列為 url_not_allowed；沒有宣告與宣告 allowlist 的
+    // 照舊可升級，external_url 回報台數讓主控台註明
+    const NONE: &str = "7e2f0a11-0000-4000-8000-0000000000e1";
+    const ALLOW: &str = "7e2f0a11-0000-4000-8000-0000000000e2";
+    const UNDECLARED: &str = "7e2f0a11-0000-4000-8000-0000000000e3";
+    for (id, declared) in [
+        (NONE, Some("none")),
+        (ALLOW, Some("allowlist")),
+        (UNDECLARED, None),
+    ] {
+        add_host(&f, id, "0.9.0", "tar");
+        f.admin()
+            .execute(
+                "UPDATE hosts SET install_external_url = ?2 WHERE agent_id = ?1",
+                rusqlite::params![id, declared],
+            )
+            .unwrap();
+    }
+    let ext_spec = |target: &str| json!({"name": "ext", "target_version": target, "selector": {"agent_ids": [NONE, ALLOW, UNDECLARED]}, "waves": [{"size": "rest"}]});
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/rollouts/preview",
+        Some(&op),
+        Some(&ext_spec("0.9.4")),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let d = body(&r)["data"].clone();
+    assert_eq!(
+        (d["matched"].as_i64(), d["eligible"].as_i64()),
+        (Some(3), Some(2)),
+        "{d}"
+    );
+    assert_eq!(d["skipped"], json!({"url_not_allowed": 1}), "{d}");
+    assert_eq!(d["samples"]["url_not_allowed"][0]["agent_id"], NONE);
+    assert_eq!(
+        d["external_url"],
+        json!({"base_url": "https://repo.example.gov.tw/p/", "undeclared": 1, "allowlist": 1})
+    );
+    assert_eq!(d["confirm_text"], "升級 2 台");
+    // 主機的 install 帶出宣告（主機詳情與「升級」卡片）：none／allowlist／null（沒有宣告）
+    for (id, declared) in [
+        (NONE, json!("none")),
+        (ALLOW, json!("allowlist")),
+        (UNDECLARED, Value::Null),
+    ] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/hosts/{id}/upgrade"),
+            Some(&op),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(
+            body(&r)["data"]["install"]["external_url"],
+            declared,
+            "{id}"
+        );
+        let r = call(addr, "GET", &format!("/api/v1/hosts/{id}"), Some(&op), None).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(
+            body(&r)["data"]["install"]["external_url"],
+            declared,
+            "{id}"
+        );
+    }
+    // 送出：宣告 none 的主機固定為 skipped（url_not_allowed）
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/rollouts",
+        Some(&admin),
+        Some(&ext_spec("0.9.4")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let ext_id = body(&r)["data"]["id"].as_str().unwrap().to_string();
+    let r = call(
+        addr,
+        "POST",
+        &format!("/api/v1/rollouts/{ext_id}/submit"),
+        Some(&admin),
+        Some(&json!({"confirm": "升級 2 台"})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = call(
+        addr,
+        "GET",
+        &format!("/api/v1/rollouts/{ext_id}/hosts?reason=url_not_allowed"),
+        Some(&op),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let rows = body(&r)["data"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0]["agent_id"].as_str(), rows[0]["state"].as_str()),
+        (Some(NONE), Some("skipped"))
     );
     let _ = std::fs::remove_dir_all(trust.parent().unwrap());
     f.stop().await;

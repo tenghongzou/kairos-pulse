@@ -229,6 +229,8 @@ pub struct UpgradeHost {
     pub install_method: Option<String>,
     pub install_upgrade: Option<String>,
     pub install_config: Option<String>,
+    /// hello 的 `install.external_url`（`none`／`allowlist`；`None`＝沒有宣告，0.10.1 以前的 Pulse）
+    pub install_external_url: Option<String>,
     pub host_group: Option<String>,
     pub tags: Vec<String>,
     pub online: bool,

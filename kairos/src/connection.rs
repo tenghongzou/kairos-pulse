@@ -2206,6 +2206,7 @@ impl Conn {
                 agent_version: agent.agent_version.clone(),
                 install_method: install.and_then(|i| i.method.clone()),
                 install_upgrade: install.and_then(|i| i.upgrade.clone()),
+                install_external_url: install.and_then(|i| i.external_url.clone()),
                 arch: host
                     .and_then(|h| h.os.as_ref())
                     .and_then(|o| o.arch.clone()),

@@ -165,7 +165,7 @@ Pulse 解析 `error` 時容忍欄位缺漏，不會整則忽略：缺 `seq` 視�
 | `tags` | v2 起，選用。字串陣列，最多 32 個，每個 1～64 bytes，字元限制同 `hostname`，不得重複（區分大小寫） | `bad_request` |
 | `report_interval_ms` | v2 起，選用。client 的 report 間隔（毫秒），整數 1000～86400000，供伺服器判定回報延遲 | `bad_request` |
 | `os` | v2 起，選用。物件，欄位 `name`（作業系統名稱）、`version`（作業系統版本）、`kernel`（核心版本）、`arch`（CPU 架構）都可省略，各 1～128 bytes，字元限制同 `hostname`；其他欄位忽略 | `bad_request` |
-| `install` | v2 起，選用（0.9.0 起的 Pulse）。物件，欄位 `method`、`upgrade`、`config` 都可省略，各 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值不是錯誤，其他欄位忽略（見「遠端管理」） | `bad_request` |
+| `install` | v2 起，選用（0.9.0 起的 Pulse）。物件，欄位 `method`、`upgrade`、`config`、`external_url`（0.10.1 之後的 Pulse）都可省略，各 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值不是錯誤，其他欄位忽略（見「遠端管理」） | `bad_request` |
 
 Pulse 端的 `heartbeat.interval` 設定上限為 60 秒，與上表一致。v2 的選用欄位為 `null` 時視同省略。協商結果為 v1 時，`host_fingerprint` 到 `install` 的欄位一律忽略（型別錯誤也不檢查）。
 
@@ -391,6 +391,7 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 | `method` | 安裝方式：`tar`、`deb`、`rpm`、`msi`、`zip`、`unknown`（偵測方式見 REMOTE.md 第 4.3 節） |
 | `upgrade` | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）、`unsafe_path`（Pulse 0.10.0 起：其他條件都就緒，但安裝路徑沒有通過升級輔助程式的路徑檢查；REMOTE.md 第 17.9.7 節。協定版本不變：不認得的值不是錯誤，0.9 的 Kairos 原樣保存並把這台主機分類為 `not_ready`）。不是 `ready` 時 Pulse **不宣告** `upgrade` |
 | `config` | 集中設定的本機狀態：`enabled`、`disabled` |
+| `external_url` | Pulse 0.10.1 之後的版本：本機是否允許從外部 URL 下載發佈檔——`none`（`upgrade.url_allowlist` 是空的或沒有有效的項目：`source: "url"` 的提議一律 `declined`）、`allowlist`（白名單至少有一個有效的前綴；**不回報白名單的內容**）。沒有這個欄位＝未知（較舊的 Pulse）。Kairos 據此在外部 URL 版本的資格預覽事先列出不允許的主機（REMOTE.md 第 2.1、4.7.2 節）。協定版本不變、不是新的 feature：0.9／0.10 的 Kairos 依「其他欄位忽略」略過它 |
 
 ### `pending`
 
@@ -605,6 +606,16 @@ P {"type":"upgrade_status","seq":8,"ts":"2026-11-20T02:00:15.300Z","upgrade_id":
 K {"type":"ack","seq":8}
 K {"type":"error","seq":9,"code":"rate_limited","message":"too many concurrent downloads; retry later","fatal":false,"retry_after_ms":30000}
 K {"type":"error","seq":10,"code":"upgrade_unavailable","message":"the rollout was cancelled","fatal":false}
+```
+
+### 遠端管理：外部 URL 的宣告
+
+0.10.1 之後的 Pulse 在 hello 的 `install.external_url` 宣告本機的 `upgrade.url_allowlist` 是空的（`none`，第一則）或有內容（`allowlist`，第二則；白名單的內容不在 hello 中）。`hello_ack` 與沒有這個欄位時相同；0.9／0.10 的 Kairos 忽略這個欄位：
+
+```
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","renew","inventory","processes","config","upgrade"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.10.2","heartbeat_interval_ms":15000,"ts":"2026-12-01T02:00:00.001Z","os":{"name":"Ubuntu","version":"24.04","arch":"x86_64"},"install":{"method":"deb","upgrade":"ready","config":"enabled","external_url":"none"}}
+P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","renew","inventory","processes","config"],"agent_id":"7a2d1f5b-2c3d-4e4f-8a11-223344556677","hostname":"db-01","agent_version":"0.10.2","heartbeat_interval_ms":15000,"ts":"2026-12-01T02:00:00.001Z","os":{"name":"Rocky Linux","version":"9.4","arch":"x86_64"},"install":{"method":"rpm","upgrade":"no_helper","config":"enabled","external_url":"allowlist"}}
+K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["metrics","durable","renew","inventory","processes","config","upgrade"],"server_time":"2026-12-01T02:00:00.009Z","expired_renew_grace_days":90,"pending":{"config_rev":42}}
 ```
 
 ### 錯誤
