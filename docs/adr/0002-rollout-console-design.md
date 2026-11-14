@@ -391,6 +391,8 @@ Pulse 宣告就緒後，資格預覽新增兩類（原因代碼的名稱由工�
 | `url_not_allowed` | 「不允許從這個外部 URL 下載」N 台 | 在這些主機的 `pulse.toml` 設定 `upgrade.url_allowlist`（附可複製的片段），或改用存放在 Kairos 的版本 |
 | `url_not_supported` | 「Pulse 版本不支援外部 URL（需要 0.10 以上）」N 台 | 先以存放在 Kairos 的版本升級到 0.10 |
 
+> **實作現況（2026-11-14，`sprint13/integration`）**：兩類都已實作，原因代碼即上表的名稱（`REMOTE.md` 第 2.1、4.7.2 節）。`url_not_allowed`＝Pulse（0.10.1 之後的版本）在 hello 宣告 `install.external_url = "none"`（本機白名單是空的；白名單的內容不回報）；`url_not_supported`＝Pulse 低於 0.10.0（使用者 2026-11-14 決定實作）。0.10.0 以上而沒有宣告、或宣告有白名單的主機照舊算可升級，預覽的 `external_url`（`undeclared`、`allowlist`）註明台數並附 `pulse.toml` 的片段——取代下面「過渡」的固定句子；`warnings[]` 的 `external_url_unverified` 沒有實作。主控台的文案仍是工程暫行，待設計包定稿。
+
 宣告就緒之前的過渡：目標是外部 URL 的版本時，資格預覽上方固定顯示「Kairos 目前無法事先知道哪些主機允許外部 URL。不允許的主機會在推送中回報『已拒絕』，不計入失敗比例。」這句話同樣出現在送審摘要（`warnings[]` 的 `external_url_unverified`）。
 
 ### 決策點 6：全域搜尋的提示文字

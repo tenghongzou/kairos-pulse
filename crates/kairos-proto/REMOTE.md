@@ -362,7 +362,7 @@ stateDiagram-v2
 
 - 匯入時只上傳 `SHA256SUMS`、`.sig` 與清單，另填 `base_url`（例如客戶內部的 `https://repo.example.gov.tw/kairos-pulse/0.9.1/`）；Kairos 不保存發佈檔，提議中的 `artifact.url` 為 `base_url` ＋檔名。
 - Pulse 只在 URL 符合**本機** `upgrade.url_allowlist`（前綴比對，例如 `https://repo.example.gov.tw/kairos-pulse/`）時才下載，否則 `declined`（`PLS-W8411`，`detail: url_not_allowed`）。白名單預設為空，也就是**預設只接受從 Kairos 下載**。理由：不讓被入侵的 Kairos 把上萬台主機變成對任意位址（含內網）發出請求的工具。
-- **事先宣告**（Pulse 0.10.1 之後的版本，第 2.1 節）：Pulse 在 hello 的 `install.external_url` 宣告白名單是空的（`none`）或有內容（`allowlist`），**不回報內容**。Kairos 建立外部 URL 版本的推送時據此做資格分類（第 4.7.2 節）：宣告 `none` 的主機事先列為 `url_not_allowed`，不必等到推送中才回報 `declined`。
+- **事先宣告**（Pulse 0.10.1 之後的版本，第 2.1 節）：Pulse 在 hello 的 `install.external_url` 宣告白名單是空的（`none`）或有內容（`allowlist`），**不回報內容**。Kairos 建立外部 URL 版本的推送時據此做資格分類（第 4.7.2 節）：宣告 `none` 的主機事先列為 `url_not_allowed`，不必等到推送中才回報 `declined`；低於 0.10.0 的 Pulse（不支援外部 URL）事先列為 `url_not_supported`。
 - 下載以 HTTPS、TLS 1.2 以上，信任 `upgrade.external_ca`（空字串時為作業系統信任庫），不跟隨跨主機的重新導向，大小以 `artifact.size` 為上限。沒有 HTTP 代理設定（第一版）。
 
 #### 4.1.3 發佈清單（release manifest，0.9.0 起）
@@ -558,11 +558,12 @@ stateDiagram-v2
 
 - 建立推送時計算資格（預覽 API，第 8.3 節）：可升級、已是目標版本（`skipped: already`）、Pulse 太舊（`unsupported_version`，< 0.9.0）、本機停用、缺少輔助程式或安裝路徑不安全（依 `install.upgrade`；`unsafe_path` 是 Pulse 0.10.0 起事先回報的路徑檢查結果，原因代碼 `unsafe_path`，第 17.9.7 節——不事先標出的話這台主機要到推送時才以 `PLS-E8405` 失敗；不認得的 `install.upgrade` 值分類為 `not_ready`）、低於 `min_upgrade_from`、沒有對應平台的發佈檔、無法自動回滾、多實例、已在另一個進行中的推送（一台主機同時只能屬於一個進行中的推送，建立時 409 `rollout_overlap`）。
 - **版本庫的檔案遺失**（0.10.0，ADR-0002 F1～F3；`KRS-W8417`）：資料庫記為已存入、但檔案不存在或大小不符的發佈檔（代管的版本；只 `stat`，與系統健康相同）不算可以提議的檔案。預覽與送出時，需要它的主機分類為 `artifact_missing`（與「版本庫沒有這個平台的檔案」的 `no_artifact` 分開：一個是重新上傳、一個是匯入另一個檔案）；回滾檔遺失的 deb／rpm 主機算無法自動回滾。核准時再檢查一次（409 `artifact_missing`）；提議時不發出無法下載的提議（第 13.1 節）。外部 URL 的版本沒有本機檔案，不適用。
-- **外部 URL 的版本**（0.10.1 之後的版本，ADR-0002 決策點 5c；第 2.1 節的 `install.external_url`）：目標版本是外部 URL 的版本庫（第 4.1.2 節）時，預覽與送出另外分出一類——
+- **外部 URL 的版本**（0.10.1 之後的版本，ADR-0002 決策點 5c；第 2.1 節的 `install.external_url`）：目標版本是外部 URL 的版本庫（第 4.1.2 節）時，預覽與送出另外分出兩類——
+  - `url_not_supported`：Pulse 低於 0.10.0。0.9 的 Pulse 不支援從外部 URL 下載，對 `source: "url"` 的提議一律拒絕（第 17.3 節 #2），所以事先列出。處理方式：先以存放在 Kairos 的版本升級到 0.10 以上。依版本號判斷，先於宣告的比對（0.9 的 Pulse 不會宣告；即使帶了 `external_url` 也一樣）。使用者 2026-11-14 決定實作（ADR-0002 決策點 5c）。
   - `url_not_allowed`：Pulse 宣告 `external_url = "none"`（本機白名單是空的）。處理方式：在這些主機的 `pulse.toml` 設定 `upgrade.url_allowlist` 後重新啟動 Pulse，或改用存放在 Kairos 的版本。原因代碼與 Pulse 拒絕提議時回報的 `detail` 同名。
-  - **未知**（沒有宣告：0.10.1 以前的 Pulse，或不認得的值）與宣告 `allowlist` 的主機**照舊算可升級**（現行行為不變）；其中不允許這個 URL 的主機在推送中回報 `declined`（`PLS-W8411`、`url_not_allowed`），不計入失敗比例。預覽的 `external_url`（`base_url`、`undeclared`：可升級主機中沒有宣告的台數、`allowlist`：宣告有白名單的台數）讓主控台註明「其中 N 台尚未宣告，可能在推送中拒絕」。
-  - ADR-0002 決策點 5c 另外建議的 `url_not_supported`（Pulse 低於 0.10.0：0.9 的 Pulse 對 `source: "url"` 一律拒絕）**沒有實作**：它會改變「沒有宣告的主機照舊」的現行行為，列為待決（第 17.5 節 #5）。
-  - 判斷的位置在平台與發佈檔的檢查之後、降版與 `min_upgrade_from` 之前；`install.upgrade` 不是 `ready` 的主機先依那個原因分類。目標版本由 Kairos 代管時不看 `external_url`（提議不含外部 URL：回滾檔來自外部 URL 的版本時本來就不附，第 13.1 節）。
+  - **未知**（0.10.0 以上而沒有宣告：0.10.0、0.10.1 的 Pulse，或不認得的值）與宣告 `allowlist` 的主機**照舊算可升級**（現行行為不變）；其中不允許這個 URL 的主機在推送中回報 `declined`（`PLS-W8411`、`url_not_allowed`），不計入失敗比例。預覽的 `external_url`（`base_url`、`undeclared`：可升級主機中沒有宣告的台數、`allowlist`：宣告有白名單的台數）讓主控台註明「其中 N 台尚未宣告，可能在推送中拒絕」。
+  - 與 0.10.0、0.10.1 的 Kairos 的差異：那兩版把 0.9 的 Pulse 也算可升級（在推送中 `declined`）；現在 0.9 的 Pulse 在預覽與送出時就是 `skipped`（`url_not_supported`），結果相同（都不會升級），只是事先看得到。
+  - 判斷的位置在平台與發佈檔的檢查之後、降版與 `min_upgrade_from` 之前（先版本、再宣告）；`install.upgrade` 不是 `ready` 的主機先依那個原因分類。目標版本由 Kairos 代管時不看 `external_url`（提議不含外部 URL：回滾檔來自外部 URL 的版本時本來就不附，第 13.1 節）。
 - 批次中的順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)` 排序（同一個推送每次計算結果相同，不偏向某個群組）。
 - 推送進行中新註冊、或之後才符合選擇器的主機**不加入**（推送的對象在開始時固定）；要涵蓋它們請另建推送。
 
@@ -614,7 +615,7 @@ stateDiagram-v2
 2. **時段的兩端各自換算成絕對時間**：開始＝開始日期的 `start`、結束＝結束日期的 `end`，各依第 3～5 條換算。時段的長度因此是**牆上時鐘的長度，不是實際經過的時間**：`01:00`～`05:00` 在跳過一小時的那一晚實際是 3 小時，在重複一小時的那一晚實際是 5 小時（歐洲）——操作者看著時鐘時，時段永遠在時鐘顯示 `01:00` 時開始、顯示 `05:00` 時結束。
 3. **不存在的時刻**（春季撥快，例如 `Europe/Berlin` 2026-03-29 的 02:00～03:00 被跳過）：開始或結束落在被跳過的區間時，換算為**切換的那一刻**（時鐘從 01:59:59 跳到 03:00:00 的瞬間，也就是「時鐘第一次顯示晚於這個時刻」的時候）。開始因此**只會延後、不會提早**（`02:30` 開始的時段在那一天於當地 03:00 開始）；結束在被跳過的區間時，時段在切換的那一刻結束（`01:00`～`02:30` 那一天是 01:00～02:00，實際 1 小時）。午夜被跳過的時區（例如 `America/Santiago` 春季的 00:00～01:00）同樣適用：`00:00` 開始的時段在當地 01:00 開始，仍屬於那個日期。
 4. **重複的時刻**（秋季撥慢，例如 `America/New_York` 2026-11-01 的 01:00～02:00 出現兩次）：
-   - **開始**取**第二次**（較晚的那一次；寧可晚開始）。`01:30` 開始的時段在撥慢之後的 01:30 開始。
+   - **開始**取**第二次**（較晚的那一次；寧可晚開始；使用者 2026-11-14 確認維持）。`01:30` 開始的時段在撥慢之後的 01:30 開始。
    - **結束**取「開始之後，時鐘**第一次**顯示 `end` 的時刻」。`00:30`～`01:30` 在第一次 01:30 結束（實際 1 小時，與平常相同）；`01:15`～`01:45`（兩端都重複）從第二次 01:15 到第二次 01:45（30 分鐘）。時段因此不會比牆上時鐘的長度多出重複的那一小時，除非重複的區間完整落在時段中間（第 2 條的 `01:00`～`05:00`）。
 5. **時段不會變成零長度**：依第 3、4 條換算後結束沒有晚於開始時（整個時段落在被跳過的區間，例如那一天的 `02:15`～`02:45`；或開始被延後到恰好等於結束，例如 `02:30`～`03:00`），時段改為**從換算後的開始起、維持牆上時鐘的長度**（當地 03:00～03:30）。任何一天該有的時段都不會因為日光節約時間而消失。
 6. **跨午夜的時段遇到切換日**沒有特別的規則：開始與結束各自依第 1～5 條換算。`Europe/Berlin` 週六 `23:00`～`03:00`：2026-03-28 開始的那一次實際 3 小時（23:00 CET～03:00 CEST），2026-10-24 開始的那一次實際 5 小時。
@@ -1209,7 +1210,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
   - **發佈檔只登記、不保存**：`PUT …/artifacts/{filename}`（與 CLI 的匯入）照樣讀取檔案、確認 SHA-256 與 `SHA256SUMS` 相符，但只記下大小（`release_artifacts.size_bytes`，`stored = 0`），檔案不存入 `releases_dir`。提議的 `artifact.size` 需要大小而 `SHA256SUMS` 沒有，所以**只有登記過的發佈檔可以推送**（API 的 `artifacts[].registered`）；尚未登記的在資格分類為 `no_artifact`。規格寫「只上傳 `SHA256SUMS`、`.sig` 與清單」，這是差異（見下表）。
   - 提議：`artifact.source = "url"`、`artifact.url = base_url＋檔名`；`sha256sums`、`signature`、`manifest` 照舊附上，Pulse 的驗證鏈不變。外部 URL 的檔案不經 8443 提供（`upgrade_chunk_get` 回 `upgrade_unavailable`）。
   - 回滾檔：主機目前版本的發佈是外部 URL 時，**只在目標也是外部 URL 時**才附 `rollback_artifact`（`source: "url"`）；目標由 Kairos 代管時不附（資格分類算作「無法自動回滾」），避免不允許外部 URL 的主機因為回滾檔而拒絕整個提議。
-  - Kairos **不知道**哪些主機的本機白名單允許這個 URL（沒有新的 feature；見第 17 節）：不允許的主機（含 0.9.0 的 Pulse）回報 `declined`（`PLS-W8411`、`detail: url_not_allowed`），不計入失敗比例。**0.10.1 之後的版本**：Pulse 在 hello 宣告白名單是不是空的（`install.external_url`，第 2.1 節；`hosts.install_external_url`，schema v12），資格分類事先列出 `url_not_allowed`（宣告 `none`）；沒有宣告與宣告 `allowlist` 的主機照舊（第 4.7.2 節），預覽的 `external_url` 回報這兩種的台數。清冊的值在每次 hello 帶 `install.upgrade` 時整個取代（沒有 `external_url` 的 hello 會把它清成 NULL：Pulse 降回舊版後回到「未知」，不沿用舊值）。回滾檔的規則（上一項）不變：`classify` 只在**目標**是外部 URL 時看這個宣告。
+  - Kairos **不知道**哪些主機的本機白名單允許這個 URL（沒有新的 feature；見第 17 節）：不允許的主機（含 0.9.0 的 Pulse）回報 `declined`（`PLS-W8411`、`detail: url_not_allowed`），不計入失敗比例。**0.10.1 之後的版本**：Pulse 在 hello 宣告白名單是不是空的（`install.external_url`，第 2.1 節；`hosts.install_external_url`，schema v12），資格分類事先列出 `url_not_supported`（Pulse 低於 0.10.0）與 `url_not_allowed`（宣告 `none`）；0.10.0 以上沒有宣告與宣告 `allowlist` 的主機照舊（第 4.7.2 節），預覽的 `external_url` 回報這兩種的台數。清冊的值在每次 hello 帶 `install.upgrade` 時整個取代（沒有 `external_url` 的 hello 會把它清成 NULL：Pulse 降回舊版後回到「未知」，不沿用舊值）。回滾檔的規則（上一項）不變：`classify` 只在**目標**是外部 URL 時看這個宣告。
 - 重複上傳同一個發佈檔時，版本庫中已有同名而**大小不同**的檔案會被這次（雜湊已符合 `SHA256SUMS`）的內容取代（0.9.0 一律保留既有的檔案，無法修復被截斷的檔案）。
 
 **集中設定**
@@ -1231,7 +1232,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 系統健康 | R10：S20「遠端管理」列 | `remote` 項目（暫停、回滾失敗、信任錨；0.10.0 起另有「版本庫的檔案遺失」，`KRS-W8417`，只 `stat` 不重算雜湊；雙人覆核已關閉、沒有可核准者、等待檔案的主機） |
 | CLI | `kairos releases import／list／delete` | 0.10.0 提供（直接開資料庫，不經執行中的 Kairos），含 `--external` |
 | 外部 URL 的版本庫（0.10.0） | 匯入時只上傳 `SHA256SUMS`、`.sig` 與清單，另填 `base_url` | 另外要「登記」要推送的發佈檔（上傳或 CLI 匯入時確認雜湊並記下大小，檔案不保存）：協定的 `artifact.size` 必填、Pulse 以它作為下載上限與空間檢查，而 `SHA256SUMS` 沒有大小；由 Kairos 向 URL 查詢大小會讓 Kairos 對外發出請求，不採用 |
-| 外部 URL 的資格預覽（0.10.0） | — | 0.10.0、0.10.1：Kairos 不知道主機的 `upgrade.url_allowlist`，預覽不會把「不允許外部 URL」的主機列為不符資格；它們在推送中回報 `declined`（`url_not_allowed`）。**之後的版本已補上**：Pulse 以 hello 的 `install.external_url` 宣告白名單是不是空的（不是新的 feature，理由見第 2.1 節），預覽與送出事先列出 `url_not_allowed`（第 4.7.2 節）。仍然做不到的：宣告有白名單、但白名單不含這個 `base_url` 的主機（白名單的內容刻意不回報；第 17.5 節 #4） |
+| 外部 URL 的資格預覽（0.10.0） | — | 0.10.0、0.10.1：Kairos 不知道主機的 `upgrade.url_allowlist`，預覽不會把「不允許外部 URL」的主機列為不符資格；它們在推送中回報 `declined`（`url_not_allowed`）。**之後的版本已補上**：Pulse 以 hello 的 `install.external_url` 宣告白名單是不是空的（不是新的 feature，理由見第 2.1 節），預覽與送出事先列出 `url_not_allowed` 與 `url_not_supported`（Pulse 低於 0.10.0；第 4.7.2 節）。仍然做不到的：宣告有白名單、但白名單不含這個 `base_url` 的主機（白名單的內容刻意不回報；第 17.5 節 #4） |
 | 告警 | 系統規則與離線告警抑制 | 三條系統規則已接上；升級中主機的離線告警抑制（第 4.7.5 節）在 0.10.0 提供。與規格的差異：規格寫「等同於針對該主機的靜音，事件時間軸註明『升級中』」，實作為期限前**不開事件**（一般的升級重啟短於離線規則的寬限，本來就沒有事件；靜音會留下上萬筆已靜音的事件），期限過後才開的事件在細節與處理紀錄註明 |
 | `GET /api/v1/hosts` | `config_state` 篩選與欄位 | 另有 `install` 欄位與 `remote_upgrade` 篩選；0.10.0 另有 `agent_outdated` 與 `meta.recommended_min_agent_version`（R9 的 ⚠） |
 | 刪除主機資料 | — | 一併刪除 `host_config`、`rollout_hosts`（`remote_management` 筆數），個資匯出另有 `remote_management` |
@@ -1355,8 +1356,10 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 1. **回滾檔的信任**（17.3 #1）：建議 0.10.0 在 `upgrade_offer` 加選用欄位 `rollback_bundle: {sha256sums, signature}`（Kairos 版本庫有該版本時附上；舊版 Pulse 忽略），Pulse 與輔助程式以信任錨驗證後即可使用，第一次遠端升級也能以套件回滾。
 2. ~~**系統層驗證**（第 12.3 節）~~：已完成（2026-10-21，`tests/systemd/`，結果見第 12.3 節與第 17.6 節）。建議發佈前與修改遠端升級、打包、unit 時在 kp-build 重跑一次 `sh tests/systemd/run.sh`。
 3. **套件資料庫與執行檔不一致**（17.3 #1 的代價，第 12.3 節 b0 實測）：第一次遠端升級失敗而以 `pulse.prev` 回復的 deb／rpm 主機，`dpkg -l`／`rpm -q` 顯示失敗的版本，直到下一次成功的遠端升級或手動重新安裝。0.10.0 的 `rollback_bundle`（第 1 項）可以消除；在那之前主控台的主機詳情可依 `detail` 的 `binary_restored_package_db_shows_<版本>` 提示。
-4. **外部 URL 是否落在主機的白名單內**（第 2.1 節「`external_url` 的設計」）：目前 Pulse 只宣告白名單是不是空的，宣告 `allowlist` 而白名單不含這個 `base_url` 的主機仍要到推送中才回報 `declined`。不建議回報白名單或它的雜湊（被入侵的 Kairos 會得知或可以列舉每台主機可用的外連目標）。若日後需要更精確的預覽，建議改成**由 Pulse 回答**：Kairos 在 `pending` 帶出版本庫中外部版本的 `base_url`（至多數個），Pulse 只回答每一個「允許／不允許」，並限制詢問的頻率與每條連線的次數——這仍然是一個神諭，只是有速率上限而且留下紀錄，是否值得要看實際的落差有多常見。建議先觀察 `declined`（`url_not_allowed`）在宣告 `allowlist` 的主機中出現的比例再決定。
-5. **`url_not_supported`**（ADR-0002 決策點 5c）：外部 URL 的版本對 0.9 的 Pulse 事先分類為「Pulse 版本不支援外部 URL」。0.9 的 Pulse 一定拒絕，事先列出比較清楚；但這是依版本號推定、會改變沒有宣告的主機的現行分類（它們目前算可升級、在推送中 `declined`），而且 0.9 已不在支援的升級路徑上。建議在設計包定稿 S26 的資格分類時一併決定；實作只需要在 `classify` 多一個版本判斷。
+4. **外部 URL 是否落在主機的白名單內**（第 2.1 節「`external_url` 的設計」）：目前 Pulse 只宣告白名單是不是空的，宣告 `allowlist` 而白名單不含這個 `base_url` 的主機仍要到推送中才回報 `declined`。不建議回報白名單或它的雜湊（被入侵的 Kairos 會得知或可以列舉每台主機可用的外連目標）。若日後需要更精確的預覽，建議改成**由 Pulse 回答**：Kairos 在 `pending` 帶出版本庫中外部版本的 `base_url`（至多數個），Pulse 只回答每一個「允許／不允許」，並限制詢問的頻率與每條連線的次數——這仍然是一個神諭，只是有速率上限而且留下紀錄，是否值得要看實際的落差有多常見。建議先觀察 `declined`（`url_not_allowed`）在宣告 `allowlist` 的主機中出現的比例再決定。**使用者 2026-11-14 同意：不回報白名單的內容，先觀察**；這一項維持開放，等有實際的數字再評估。
+5. ~~**`url_not_supported`**（ADR-0002 決策點 5c）~~：**已決定並實作**（使用者 2026-11-14）。外部 URL 的版本對低於 0.10.0 的 Pulse 事先分類為 `url_not_supported`（「Pulse 版本不支援外部 URL（需要 0.10 以上）」），規則見第 4.7.2 節。
+
+本節以外、同一天由使用者確認的決定（都維持實作時的做法）：`hosts.install_external_url` 以 **schema v12** 保存（第 13.1 節；不採用「只看連線中的 hello、不落地」）；升級時段在重複的時刻**開始取第二次**（第 4.7.5 節規則 4）；時區資料庫編進執行檔、執行檔增加約 2.2 MB（第 4.7.5 節）。
 
 ### 17.6 系統層實測發現的問題（第 12.3 節，衝刺 9 修正）
 
