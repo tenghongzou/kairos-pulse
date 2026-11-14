@@ -40,6 +40,11 @@
 //!   被移動（`hmac_boundary_mismatch`）。
 //! - `meta.audit_chain_head` 另帶 `mac`：沒有金鑰無法把 head 改成較早的一筆來掩蓋刪除最後幾筆
 //!   （重播先前抄下的 head 仍需靠定期外送的鏈尾雜湊發現，[`crate::audit_monitor`]）。
+//! - **head 與錨點的保護**（安全稽核 E1；[`Head`]、[`check_head`]、[`ChainBefore`]）：第 1 版 head 的 `mac` 只
+//!   涵蓋鏈尾，驗證也不要求 head 存在，錨點完全沒有保護——刪掉最後幾筆並刪掉 head、或刪掉最前面幾筆並
+//!   改寫錨點，驗證都回報完整。第 2 版 head 的 `mac` 同時涵蓋鏈尾與錨點；HMAC 開始之後 head 必須存在；
+//!   寫入端在 head 與寫入前的鏈尾、錨點不一致時不更新 head（不讓下一次寫入把痕跡「修好」）。升級前的
+//!   第 1 版 head 照常接受，升級後第一次寫入時換成第 2 版。
 //! - 金鑰遺失或與 `meta.audit_hmac.key_id` 不符時驗證失敗（`hmac_key_unavailable`／`hmac_key_mismatch`，
 //!   `KRS-E6201`）；雜湊鏈本身仍會先完整檢查。金鑰不符時不以新的金鑰繼續簽（不「接續」鏈）。
 //! - 已知限制：能同時寫入資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人可以把鏈「降級」成 0.7
