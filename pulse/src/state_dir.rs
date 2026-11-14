@@ -380,13 +380,20 @@ pub fn fallback_dir() -> PathBuf {
 /// 拒絕使用預設狀態目錄時的訊息（日誌與狀態檔的設定警告共用）
 pub fn rejection_message(violation: &Violation) -> String {
     let dir = guarded_default().unwrap_or_default();
-    format!(
-        "預設的狀態目錄 {dir} 不安全（{violation}），不使用：狀態檔改寫在工作目錄的 logs\\status.json，\
-         集中設定的快取改放 logs\\remote\\。處理方式：以系統管理員停止服務，執行 rd /s /q \"{dir}\"\
-         （其中只有狀態檔與設定快取，都會重建），再啟動服務——服務會以只有 SYSTEM 與 Administrators \
-         可寫的 ACL 重新建立它",
-        dir = dir.display()
-    )
+    let dir = dir.display();
+    let fallback = "狀態檔改寫在工作目錄的 logs\\status.json，集中設定的快取改放 logs\\remote\\";
+    match violation {
+        // 目錄不存在：沒有東西要刪，問題在於這個行程沒有權限建立它
+        Violation::Create(_) => format!(
+            "預設的狀態目錄 {dir} 無法使用（{violation}），{fallback}。處理方式：以服務或系統管理員身分\
+             執行（一般帳號無法把目錄的擁有者設為 Administrators）"
+        ),
+        _ => format!(
+            "預設的狀態目錄 {dir} 不安全（{violation}），不使用：{fallback}。處理方式：以系統管理員停止服務，\
+             執行 rd /s /q \"{dir}\"（其中只有狀態檔與設定快取，都會重建），再啟動服務——服務會以只有 \
+             SYSTEM 與 Administrators 可寫的 ACL 重新建立它"
+        ),
+    }
 }
 
 #[cfg(windows)]
@@ -917,12 +924,18 @@ mod tests {
             Violation::UnparsableAcl,
             Violation::WritableBy("S-1-5-32-545".into()),
             Violation::Inspect("x".into()),
-            Violation::Create("x".into()),
         ] {
             assert!(!v.to_string().is_empty());
             let msg = rejection_message(&v);
             assert!(msg.contains("不安全") && msg.contains("rd /s /q"), "{msg}");
+            assert!(msg.contains("logs\\status.json"), "{msg}");
         }
+        // 目錄不存在而建立失敗：沒有東西要刪，不建議 rd
+        let msg = rejection_message(&Violation::Create("x".into()));
+        assert!(
+            msg.contains("無法使用") && msg.contains("logs\\status.json") && !msg.contains("rd /s"),
+            "{msg}"
+        );
     }
 
     #[cfg(not(windows))]
