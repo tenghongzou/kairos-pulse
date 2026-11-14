@@ -721,6 +721,79 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     assert.equal(got.json.data.source, 'external');
     const tarRow = got.json.data.artifacts.find((x) => x.filename === rel.tar);
     assert.deepEqual([tarRow.stored, tarRow.registered, tarRow.size], [false, true, 40000]);
+    // 外部 URL 版本的資格預覽（REMOTE.md 第 2.1、4.7.2 節）：Pulse 在 hello 的 install.external_url 宣告本機是否
+    // 允許外部 URL。宣告 none → 預覽事先列為 url_not_allowed；沒有宣告（舊 Pulse）與宣告 allowlist → 照舊可升級，
+    // 預覽註明台數；S05 的「升級」卡片顯示宣告
+    assert.ok(agent, '需要先前連線的 pulse-09');
+    const declare = async (externalUrl) => {
+      agent.close();
+      agent.install = { method: 'tar', upgrade: 'ready', config: 'enabled', ...(externalUrl ? { external_url: externalUrl } : {}) };
+      agent.seq = 0;
+      await until(async () => {
+        try {
+          await agent.connect();
+          return true;
+        } catch {
+          agent.close();
+          return false;
+        }
+      }, 30000, `pulse-09 以 install.external_url=${externalUrl} 重新連線`);
+      await until(async () => {
+        const r = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
+        return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === 'ready' && (r.json.data.install.external_url || null) === externalUrl;
+      }, 30000, `pulse-09 的 install.external_url=${externalUrl}`);
+    };
+    const openPreview = async (name) => {
+      await page.goto(`${URL0}/pulse/rollouts/new`);
+      await waitTitle(page, '建立推送');
+      await page.getByLabel(/^名稱/).fill(name);
+      return page.locator('#rollout-preview');
+    };
+    const BASE = 'https://repo.example.gov.tw/kairos-pulse/0.9.1/';
+    await declare('none');
+    try {
+      const pv = await api(page, 'POST', '/api/v1/rollouts/preview', { name: 'x', target_version: VERSION, selector: { all: true }, waves: [{ size: 'rest' }] });
+      assert.equal(pv.status, 200, JSON.stringify(pv.json));
+      assert.deepEqual([pv.json.data.eligible, pv.json.data.skipped.url_not_allowed], [0, 1], JSON.stringify(pv.json.data));
+      assert.deepEqual(pv.json.data.external_url, { base_url: BASE, undeclared: 0, allowlist: 0 });
+      let preview = await openPreview('E2E 外部 URL');
+      const line = preview.locator('li[data-reason="url_not_allowed"]');
+      await line.waitFor({ timeout: 15000 });
+      assert.match(await line.innerText(), /不允許從外部 URL 下載（PLS-W8411；.*）：1 台/);
+      await preview.getByText('可升級 0 台').waitFor();
+      const ext = page.locator('#rollout-preview-external');
+      await ext.getByText('這個版本的發佈檔由 Pulse 從外部 URL 下載').waitFor();
+      await ext.getByText(`url_allowlist = ["${BASE}"]`).waitFor();
+      assert.equal(await ext.locator('[data-ext]').count(), 0, '沒有可升級的主機時不註明未回報的台數');
+      await axe(page, 'F8 S26 資格預覽（不允許外部 URL）');
+      await shot(page, 'remote-rollout-external-not-allowed');
+      // S05 的「升級」卡片
+      await until(async () => {
+        const r = await api(page, 'GET', `/api/v1/hosts/${P09}`);
+        return r.status === 200 && r.json.data.install && r.json.data.install.external_url === 'none';
+      }, 60000, '主機詳情的 install.external_url');
+      await page.goto(`${URL0}/hosts/${P09}`);
+      await waitTitle(page, 'pulse-09');
+      await page.locator('#host-upgrade-title').waitFor({ timeout: 15000 });
+      await page.locator('[data-external-url="none"]').getByText('不允許（主機的 upgrade.url_allowlist 是空的）').waitFor({ timeout: 15000 });
+      await axe(page, 'F8 S05 升級卡片（外部 URL 的宣告）');
+      // 沒有宣告（0.10.1 以前的 Pulse）：照舊可升級，預覽註明「沒有回報」的台數
+      await declare(null);
+      preview = await openPreview('E2E 外部 URL 2');
+      await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
+      await page.locator('#rollout-preview-external [data-ext="undeclared"]').getByText(/有 1 台沒有回報是否允許外部 URL/).waitFor();
+      assert.equal(await preview.locator('li[data-reason="url_not_allowed"]').count(), 0);
+      await axe(page, 'F8 S26 資格預覽（外部 URL：沒有宣告）');
+      // 宣告有白名單：可升級，註明 Kairos 不知道白名單的內容
+      await declare('allowlist');
+      preview = await openPreview('E2E 外部 URL 3');
+      await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
+      await page.locator('#rollout-preview-external [data-ext="allowlist"]').getByText(/1 台回報有白名單/).waitFor();
+      assert.equal(await page.locator('#rollout-preview-external [data-ext="undeclared"]').count(), 0);
+    } finally {
+      // 還原：之後的測試需要原本的 pulse-09（沒有宣告）
+      await declare(null);
+    }
     const del = await api(page, 'DELETE', `/api/v1/releases/${VERSION}`, { confirm: VERSION });
     assert.equal(del.status, 200, JSON.stringify(del.json));
     await ctx.close();

@@ -53,6 +53,8 @@ export function upgradeCard(hst) {
     [t('rm.host.installRow'), methodLabel(inst)],
     win ? null : [t('rm.host.upgradeState'), [upgradeBadge(key), fix ? h('span', { class: 'k-sub' }, fix) : null]],
     [t('rm.host.version'), hst.agent_version ? `Pulse ${hst.agent_version}` : '—'],
+    // Pulse 宣告的 install.external_url（REMOTE.md 第 2.1 節）：有宣告時才顯示；不認得的值原樣顯示
+    !win && inst && inst.external_url ? [t('rm.host.externalUrl'), h('span', { dataset: { externalUrl: inst.external_url } }, has(`rm.ext.${inst.external_url}`) ? t(`rm.ext.${inst.external_url}`) : t('rm.up.other', { v: inst.external_url }))] : null,
   ];
   const alertBox = h('div');
   const recent = h('div');

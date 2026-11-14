@@ -19,7 +19,9 @@
 // 6. 0.10（ADR-0002 S1、S2；精靈之前先加在這個表單）：預覽與送出對話框顯示伺服器回傳的風險提醒（warnings[] 的
 //    固定代碼）、目標版本的檔案遺失（artifact_problems，KRS-W8417；需要它的主機分類為 artifact_missing）；啟用
 //    雙人覆核時寫出誰可以核准，沒有可核准者（approvers_available = 0）時警告但不阻擋。
-// Windows、外部 URL 不顯示。
+// 7. 外部 URL 的版本（REMOTE.md 第 4.7.2 節）：預覽的 external_url（base_url、undeclared、allowlist）顯示為一則說明
+//    ——白名單是空的主機（url_not_allowed）已列在「不會升級」，沒有回報與回報有白名單的台數另外註明，附 pulse.toml 的片段。
+// Windows 不顯示。
 
 import { h, icon, mount, uid, announce } from '../core/dom.js';
 import { t } from '../core/strings.js';
@@ -226,6 +228,26 @@ export function previewView(p, { onExclude, version } = {}) {
       ? inlineAlert({ kind: p.window.next ? 'info' : 'warning', role: 'status', body: p.window.next ? t('rm.new.windowClosed', { t: fmt.dateTime(p.window.next, { seconds: false }) }) : t('rm.new.windowNone') })
       : null,
     p.loses_remote_management && p.eligible ? inlineAlert({ kind: 'warning', body: t('rm.new.loses') }) : null,
+    // 外部 URL 的版本（REMOTE.md 第 4.7.2 節）：宣告白名單是空的主機已分類為 url_not_allowed；沒有宣告與宣告
+    // 有白名單的主機照舊算可升級，這裡註明台數（Kairos 不知道白名單的內容）
+    p.external_url
+      ? h(
+          'div',
+          { id: 'rollout-preview-external' },
+          inlineAlert({
+            kind: 'info',
+            role: 'status',
+            title: t('rm.new.extTitle'),
+            body: [
+              h('p', null, t('rm.new.extBody')),
+              p.external_url.undeclared ? h('p', { dataset: { ext: 'undeclared' } }, t('rm.new.extUndeclared', { n: fmt.num(p.external_url.undeclared) })) : null,
+              p.external_url.allowlist ? h('p', { dataset: { ext: 'allowlist' } }, t('rm.new.extAllowlist', { n: fmt.num(p.external_url.allowlist) })) : null,
+              h('p', null, t('rm.new.extSnippet')),
+              h('pre', { class: 'ds-code-block', tabindex: '0' }, `[upgrade]\nurl_allowlist = ["${p.external_url.base_url}"]`),
+            ],
+          }),
+        )
+      : null,
     // 目標版本有檔案遺失或大小不符的發佈檔（KRS-W8417，ADR-0002 F5）：需要它的主機已分類為 artifact_missing
     p.artifact_problems && p.artifact_problems.length
       ? h(
