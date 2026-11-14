@@ -1090,7 +1090,14 @@ async fn draft_rollout(tag: &str, approval: &str) -> (Fixture, String, String) {
     let rel = release(&signer, "0.9.2", "abcdef1");
     let import =
         json!({"sha256sums": rel.sha256sums, "signature": rel.signature, "manifest": rel.manifest});
-    let r = call(addr, "POST", "/api/v1/releases", Some(&admin), Some(&import)).await;
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/releases",
+        Some(&admin),
+        Some(&import),
+    )
+    .await;
     assert_eq!(r.status, 201, "匯入: {}", String::from_utf8_lossy(&r.body));
     let (tar_name, tar) = rel
         .files

@@ -489,7 +489,8 @@ pub(crate) fn submission_json(
     let waves = rollout::waves_from_db(&r.waves);
     let no_rollback = no_rollback_count(&ctx, hosts, &cx.inventory);
     let problems = fixed_problems(&cx.missing, r, &options, hosts, &cx.inventory);
-    let available = approvers_available(s, &cx.approvers, &r.created_by, r.submitted_by.as_deref())?;
+    let available =
+        approvers_available(s, &cx.approvers, &r.created_by, r.submitted_by.as_deref())?;
     let mut warnings = rollout::risk_warnings(
         &waves,
         &sub.waves,
@@ -706,7 +707,11 @@ mod tests {
                 .unwrap(),
             Some("session_required")
         );
-        assert!(v("user:carol", None, true, true).can_approve(s, &r).unwrap());
+        assert!(
+            v("user:carol", None, true, true)
+                .can_approve(s, &r)
+                .unwrap()
+        );
         let mut draft = r.clone();
         draft.state = rollout::ROLLOUT_DRAFT.into();
         assert!(
@@ -738,7 +743,10 @@ mod tests {
             );
         }
         // 第四位管理員 dan 可以核准
-        assert_eq!(v("user:dan", None, true, true).blocked(s, &rt).unwrap(), None);
+        assert_eq!(
+            v("user:dan", None, true, true).blocked(s, &rt).unwrap(),
+            None
+        );
         // alice 的 viewer.json：is_creator 為 true（背後是同一個人），主控台不把他列為可核准者
         let j = v("user:alice", Some(alice), true, true)
             .json(s, &rt)
