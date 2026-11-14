@@ -180,6 +180,8 @@ pub struct Limits {
     /// L4／L4r：每個來源
     pub l4: Keyed<IpAddr>,
     pub l4r: Keyed<IpAddr>,
+    /// L4p：每個來源的輪詢與撤回
+    pub l4p: Keyed<IpAddr>,
     /// L5／L5b：每個 token
     pub l5: Keyed<String>,
     pub l5b: Keyed<String>,
@@ -212,6 +214,7 @@ impl Limits {
             conn_hard: Keyed::new(),
             l4: Keyed::new(),
             l4r: Keyed::new(),
+            l4p: Keyed::new(),
             l5: Keyed::new(),
             l5b: Keyed::new(),
             l6: Keyed::new(),
@@ -932,6 +935,7 @@ impl EnrollService {
             let i = Instant::now();
             self.limits.l4.prune(i);
             self.limits.l4r.prune(i);
+            self.limits.l4p.prune(i);
             self.limits.l10.prune(i);
         } else {
             drop(last_min);

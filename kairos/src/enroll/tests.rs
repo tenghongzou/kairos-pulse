@@ -23,6 +23,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
+use super::limits::InvalidClass;
 use super::ops::{self, TokenInput};
 use super::{Running, StartParams};
 use crate::config::{AppConfig, PkiMode};
@@ -858,6 +859,75 @@ async fn rate_limits_return_429_with_retry_after_and_distinct_invalid_tokens_blo
         .query_row("SELECT count(*) FROM enroll_blocks", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
+}
+
+// 安全稽核 C1：輪詢與撤回有每個來源的限速（L4p），L7 封鎖中的來源不能輪詢、也不能撤回
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_and_withdraw_are_rate_limited_per_source_and_honor_blocks() {
+    let missing = "00000000-0000-4000-8000-000000000000";
+    let poll_path = format!("/v1/enroll/requests/{missing}");
+    let challenge_path = format!("/v1/enroll/requests/{missing}/withdraw/challenge");
+    let withdraw_path = format!("/v1/enroll/requests/{missing}/withdraw");
+
+    // 每秒 1 × 4 次、可連續 120 次；L3（新連線）放寬，確定 429 來自 L4p
+    let env = Env::new("l4p", |c| {
+        c.enroll.poll_target_per_ip_per_sec = 1;
+        c.enroll.max_new_connections_per_ip_burst = 10_000;
+        c.enroll.max_new_connections_per_ip_per_sec = 1000;
+    })
+    .await;
+    let mut limited_at = None;
+    for i in 0..400 {
+        let (s, _, v) = env.call("GET", &poll_path, None, Some("x")).await;
+        if s == 429 {
+            assert_eq!(code(&v), "rate_limited", "{v}");
+            assert_eq!(v["error"]["scope"], "ip");
+            assert!(v["error"]["retry_after_ms"].as_u64().unwrap() >= 1000);
+            limited_at = Some(i);
+            break;
+        }
+        assert_eq!((s, code(&v)), (404, "request_not_found"), "{v}");
+    }
+    let at = limited_at.expect("輪詢沒有被每個來源的限速擋下");
+    assert!(at >= 120, "可連續 120 次：第 {at} 次就被擋");
+    // 撤回的兩個請求與輪詢共用額度
+    let mut limited = 0;
+    for _ in 0..3 {
+        let (s, v) = env.post(&challenge_path, &json!({})).await;
+        limited += usize::from((s, code(&v)) == (429, "rate_limited"));
+        let (s, v) = env.post(&withdraw_path, &json!({})).await;
+        limited += usize::from((s, code(&v)) == (429, "rate_limited"));
+    }
+    assert!(limited >= 4, "撤回沒有計入每個來源的限速：{limited}");
+    // 被限速的請求不計入 L7，也沒有佔用每筆申請（L10）的表
+    assert_eq!(env.svc().limits.l7.sizes().2, 0);
+    assert_eq!(env.svc().limits.l10.len(), 0);
+
+    // L7 封鎖：新註冊類擋輪詢、續簽類擋撤回
+    let env = Env::new("l7poll", |_| {}).await;
+    let src: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let block = |ms: i64| super::limits::Block {
+        until_ms: env.now() + ms,
+        offenses: 0,
+        last_offense_ms: env.now(),
+    };
+    let svc = env.svc();
+    let l7 = &svc.limits.l7;
+    l7.restore(src, InvalidClass::Enroll, block(600_000));
+    let (s, headers, v) = env.call("GET", &poll_path, None, Some("x")).await;
+    assert_eq!((s, code(&v)), (429, "source_blocked"), "{v}");
+    assert_eq!(v["error"]["scope"], "blocked");
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+    // 續簽類沒有被封鎖：撤回照常判定
+    let (s, v) = env.post(&challenge_path, &json!({})).await;
+    assert_eq!((s, code(&v)), (404, "request_not_found"), "{v}");
+    l7.restore(src, InvalidClass::Renew, block(600_000));
+    for path in [&challenge_path, &withdraw_path] {
+        let (s, v) = env.post(path, &json!({})).await;
+        assert_eq!((s, code(&v)), (429, "source_blocked"), "{path}：{v}");
+    }
+    // 封鎖期間送來的無效值不累積
+    assert_eq!(l7.sizes().1, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

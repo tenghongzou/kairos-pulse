@@ -7,9 +7,9 @@
 //! | `server-info` | L4 |
 //! | `token-check` | L7 封鎖 → L4 → 模式 → 本文 → token |
 //! | 新註冊 | 第 6.3 節 1～15 |
-//! | 輪詢 | `wait` → 輪詢憑據（不符計入 L7）→ L10 → 長輪詢 |
+//! | 輪詢 | L7 封鎖 → L4p → `wait` → 輪詢憑據（不符計入 L7）→ L10 → 長輪詢 |
 //! | 過期續簽 | 第 7.2 節 1～16 |
-//! | 撤回 | L10 → nonce → 簽章（不符計入 L7 續簽類）→ 狀態 |
+//! | 撤回 | L7 封鎖（續簽類）→ L4p → 模式 → L10 → nonce → 簽章（不符計入 L7 續簽類）→ 狀態 |
 
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
@@ -57,6 +57,10 @@ pub const BURST_WINDOW_MS: i64 = 10 * 60_000;
 pub const BURST_COUNT: i64 = 50;
 /// L10：同一筆申請可連續輪詢 3 次
 pub const POLL_BURST: f64 = 3.0;
+/// L4p：每個來源的輪詢與撤回速率＝`poll_target_per_ip_per_sec` × 此倍數，可連續的次數＝速率 × 30 秒
+/// （預設每秒 20 次、可連續 600 次，與 L4 的可連續次數相同）
+pub const POLL_IP_HEADROOM: f64 = 4.0;
+pub const POLL_IP_BURST_SECS: f64 = 30.0;
 
 /// 一條連線的資訊
 #[derive(Debug, Clone)]
@@ -144,6 +148,32 @@ impl Ctx<'_> {
             )
             .map_err(|w| {
                 self.svc.stats.limited_renew.fetch_add(1, Ordering::Relaxed);
+                self.limited(EnrollErrorCode::RateLimited, RateScope::Ip, w)
+            })
+    }
+
+    /// L4p：每個來源的輪詢與撤回。額度由輪詢的目標速率推得（動態 `poll_after_ms` 讓守規則的主機合計不超過
+    /// `poll_target_per_ip_per_sec`），留 [`POLL_IP_HEADROOM`] 倍的餘裕；批次部署來源再乘以倍率
+    fn check_l4p(&self) -> Result<(), EnrollError> {
+        let c = &self.svc.config.enroll;
+        let rate = f64::from(c.poll_target_per_ip_per_sec.max(1))
+            * POLL_IP_HEADROOM
+            * self.svc.multiplier(self.src);
+        self.svc
+            .limits
+            .l4p
+            .take(
+                &self.src,
+                rate * POLL_IP_BURST_SECS,
+                rate,
+                Instant::now(),
+                self.max_wait(),
+            )
+            .map_err(|w| {
+                self.svc
+                    .stats
+                    .limited_enroll
+                    .fetch_add(1, Ordering::Relaxed);
                 self.limited(EnrollErrorCode::RateLimited, RateScope::Ip, w)
             })
     }
@@ -394,6 +424,9 @@ async fn route(
             timed(base, grace_renew(ctx, &body)).await
         }
         Route::Poll(id) => {
+            // 錯誤的輪詢憑據計入 L7 新註冊類（過期續簽的申請在 `poll` 中另外檢查續簽類）
+            ctx.check_blocked(InvalidClass::Enroll)?;
+            ctx.check_l4p()?;
             h::reject_body(req.headers())?;
             let wait = parse_wait_secs(req.uri().query())
                 .ok_or_else(|| EnrollError::bad_request("wait", "wait must be 0..=60 seconds"))?
@@ -410,11 +443,16 @@ async fn route(
             .await
         }
         Route::WithdrawChallenge(id) => {
+            // 撤回的簽章不符計入 L7 續簽類
+            ctx.check_blocked(InvalidClass::Renew)?;
+            ctx.check_l4p()?;
             ctx.require_mode(EndpointClass::Withdraw)?;
             let _ = h::read_json_body(req, max_body).await?;
             timed(base, withdraw_challenge(ctx, &id)).await
         }
         Route::Withdraw(id) => {
+            ctx.check_blocked(InvalidClass::Renew)?;
+            ctx.check_l4p()?;
             ctx.require_mode(EndpointClass::Withdraw)?;
             let body = h::read_json_body(req, max_body).await?;
             timed(base, withdraw(ctx, &id, &body)).await
@@ -1198,6 +1236,10 @@ async fn poll(
             .await;
         return Err(EnrollError::request_not_found());
     };
+    // 過期續簽的申請：錯誤的憑據計入續簽類，所以這一類被封鎖的來源也不能再試
+    if r.kind != DbKind::Enroll {
+        ctx.check_blocked(InvalidClass::Renew)?;
+    }
     let expected = r.poll_secret_hash.clone().unwrap_or_else(|| vec![0; 32]);
     let same: bool = expected.ct_eq(&presented[..]).into();
     if !same || r.poll_secret_hash.is_none() {
