@@ -103,8 +103,7 @@ impl Root {
     fn client_cert(&self, a: &Agent, serial: u8, not_before: i64, not_after: i64) -> Vec<u8> {
         let mut p = CertificateParams::new(vec![a.id.clone()]).unwrap();
         p.distinguished_name = DistinguishedName::new();
-        p.distinguished_name
-            .push(DnType::CommonName, a.id.as_str());
+        p.distinguished_name.push(DnType::CommonName, a.id.as_str());
         p.serial_number = Some(SerialNumber::from_slice(&[serial]));
         p.is_ca = IsCa::ExplicitNoCa;
         p.key_usages = vec![KeyUsagePurpose::DigitalSignature];

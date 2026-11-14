@@ -694,7 +694,10 @@ mod tests {
         for i in 0..19u8 {
             t.record(last, InvalidClass::Enroll, [i + 2; 32], i64::from(n));
         }
-        assert!(t.blocked(last, InvalidClass::Enroll, i64::from(n)).is_some());
+        assert!(
+            t.blocked(last, InvalidClass::Enroll, i64::from(n))
+                .is_some()
+        );
 
         // 每個來源一個無效值就封鎖：封鎖表不超過上限，最近的封鎖仍有效
         let t = InvalidTracker::new(InvalidPolicy {
@@ -711,7 +714,10 @@ mod tests {
         let (sources, _, blocks) = t.sizes();
         assert_eq!(sources, 0);
         assert!(blocks <= MAX_TRACKED_SOURCES, "{blocks}");
-        assert!(t.blocked(last, InvalidClass::Enroll, i64::from(n)).is_some());
+        assert!(
+            t.blocked(last, InvalidClass::Enroll, i64::from(n))
+                .is_some()
+        );
     }
 
     #[test]

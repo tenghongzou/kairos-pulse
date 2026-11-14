@@ -325,7 +325,11 @@ pub fn expired_cert_crl_verdict(
         Err(webpki::Error::UnknownRevocationStatus) => {
             return Unknown("auth.crl 沒有涵蓋這張憑證的簽發者".to_string());
         }
-        Err(e) => return Unknown(format!("憑證鏈無法以 auth.client_ca 與 auth.crl 驗證: {e:?}")),
+        Err(e) => {
+            return Unknown(format!(
+                "憑證鏈無法以 auth.client_ca 與 auth.crl 驗證: {e:?}"
+            ));
+        }
     }
     // 涵蓋簽發者的 CRL 已超過 nextUpdate：之後的撤銷可能不在裡面
     for (path, _, crl) in &crls {
