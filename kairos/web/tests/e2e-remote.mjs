@@ -392,6 +392,28 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     await page.locator('#rollout-windows fieldset[data-window="0"]').waitFor();
     await page.locator('#rollout-window-tz').getByText(/時段以 Kairos 的時區 [+-]\d\d:\d\d 計算/).waitFor({ timeout: 15000 });
     await axe(page, 'F8 S26 建立推送（四批＋升級時段）');
+    // 升級時段的 IANA 時區：輸入名稱（建議清單來自瀏覽器）→ 預覽列出接下來的時段實際的開始與結束（當地時間含
+    // 位移，伺服器換算）；不認得的名稱是時區欄位的錯誤（400 schedule.timezone）；固定位移照舊
+    const tz = page.getByLabel('升級時段的時區');
+    assert.ok((await page.locator('datalist option[value="Europe/Berlin"]').count()) >= 1, '建議清單有 IANA 時區名稱');
+    await tz.fill('Europe/Berlin');
+    await page.locator('#rollout-window-tz').getByText(/時段以 Europe\/Berlin 當地的時鐘計算（目前 UTC\+0[12]:00；時區資料 \d{4}[a-z]）/).waitFor({ timeout: 15000 });
+    const next = page.locator('#rollout-window-next');
+    await next.getByText('接下來的升級時段（Europe/Berlin 當地時間）').waitFor();
+    await next.getByText(/\d{4}-\d\d-\d\d 01:00（UTC\+0[12]:00） ～ \d{4}-\d\d-\d\d 05:00（UTC\+0[12]:00），/).first().waitFor();
+    assert.equal(await next.locator('li').count(), 3);
+    await axe(page, 'F8 S26 建立推送（IANA 時區）');
+    await tz.fill('Europe/Berlim');
+    await page.getByText('不認得這個時區。', { exact: false }).first().waitFor({ timeout: 15000 });
+    assert.equal(await tz.getAttribute('aria-invalid'), 'true');
+    assert.equal(await next.locator('li').count(), 0, '時區無效時不顯示時段');
+    await axe(page, 'F8 S26 建立推送（時區錯誤）');
+    await tz.fill('+09:00');
+    await page.locator('#rollout-window-tz').getByText('時段以固定位移 +09:00 計算').waitFor({ timeout: 15000 });
+    assert.equal(await tz.getAttribute('aria-invalid'), null);
+    await next.getByText(/01:00（UTC\+09:00）/).first().waitFor();
+    await tz.fill('');
+    await page.locator('#rollout-window-tz').getByText(/時段以 Kairos 的時區 [+-]\d\d:\d\d 計算/).waitFor({ timeout: 15000 });
     await page.getByRole('button', { name: '移除時段 1' }).click();
     await page.getByRole('button', { name: '移除第 2 批' }).click();
     await page.getByRole('button', { name: '移除第 2 批' }).click();
