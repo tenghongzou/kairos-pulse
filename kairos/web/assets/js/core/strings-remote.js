@@ -533,6 +533,8 @@ export const REMOTE_STRINGS = {
   // 外部 URL 的版本：Pulse 在 hello 宣告本機的白名單是空的（install.external_url = none；REMOTE.md 第 2.1、
   // 4.7.2 節；ADR-0002 決策點 5c）〔工程暫行：設計包定稿 S26 的資格分類後替換〕
   'rm.skip.url_not_allowed': '不允許從外部 URL 下載（PLS-W8411；主機的 upgrade.url_allowlist 是空的：在 pulse.toml 設定後重新啟動 Pulse，或改用存放在 Kairos 的版本）',
+  // 外部 URL 的版本：Pulse 低於 0.10.0（0.9 的 Pulse 不支援從外部 URL 下載）。文案照 ADR-0002 決策點 5c
+  'rm.skip.url_not_supported': 'Pulse 版本不支援外部 URL（需要 0.10 以上；先以存放在 Kairos 的版本升級到 0.10）',
   'rm.skip.not_ready': '沒有協商遠端升級（未以 mTLS 連線或 Pulse 尚未就緒）',
   'rm.skip.unsupported_platform': 'Windows 或不支援的平台（Windows 在 0.10 起）',
   'rm.skip.no_artifact': '版本庫沒有這個平台的發佈檔',
@@ -605,8 +607,8 @@ export const REMOTE_STRINGS = {
   'rm.new.windowNone': '排程中已經沒有可用的時段：送出後不會升級任何主機。',
   // 外部 URL 版本的預覽（external_url：base_url、undeclared、allowlist）〔工程暫行，ADR-0002 決策點 5c 的過渡說明〕
   'rm.new.extTitle': '這個版本的發佈檔由 Pulse 從外部 URL 下載',
-  'rm.new.extBody': '每台主機只在本機的 upgrade.url_allowlist 允許這個 URL 時才下載；不允許的主機不會升級。白名單是空的主機已經列在下方「不會升級」。',
-  'rm.new.extUndeclared': '可升級的主機中有 {n} 台沒有回報是否允許外部 URL（Pulse 版本較舊）：其中不允許的主機會在推送中拒絕（PLS-W8411），不計入失敗。',
+  'rm.new.extBody': '每台主機只在本機的 upgrade.url_allowlist 允許這個 URL 時才下載；不允許的主機不會升級。白名單是空的主機與 Pulse 低於 0.10 的主機已經列在下方「不會升級」。',
+  'rm.new.extUndeclared': '可升級的主機中有 {n} 台沒有回報是否允許外部 URL（Pulse 0.10.0、0.10.1 不會回報）：其中不允許的主機會在推送中拒絕（PLS-W8411），不計入失敗。',
   'rm.new.extAllowlist': '{n} 台回報有白名單，但 Kairos 不知道白名單的內容：白名單不含這個 URL 的主機同樣會在推送中拒絕。',
   'rm.new.extSnippet': '要允許這個版本，主機的 pulse.toml 需要：',
   'rm.new.downgradeN': '其中 {n} 台是降版',

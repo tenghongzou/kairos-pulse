@@ -722,11 +722,13 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
     const tarRow = got.json.data.artifacts.find((x) => x.filename === rel.tar);
     assert.deepEqual([tarRow.stored, tarRow.registered, tarRow.size], [false, true, 40000]);
     // 外部 URL 版本的資格預覽（REMOTE.md 第 2.1、4.7.2 節）：Pulse 在 hello 的 install.external_url 宣告本機是否
-    // 允許外部 URL。宣告 none → 預覽事先列為 url_not_allowed；沒有宣告（舊 Pulse）與宣告 allowlist → 照舊可升級，
-    // 預覽註明台數；S05 的「升級」卡片顯示宣告
+    // 允許外部 URL。Pulse 低於 0.10.0 → url_not_supported；宣告 none → 預覽事先列為 url_not_allowed；0.10 以上
+    // 沒有宣告與宣告 allowlist → 照舊可升級，預覽註明台數；S05 的「升級」卡片顯示宣告。
+    // 測試的發佈是 0.9.1：支援外部 URL 的 Pulse（0.10.1）對它是降版，所以可升級的情境勾選「允許降版」
     assert.ok(agent, '需要先前連線的 pulse-09');
-    const declare = async (externalUrl) => {
+    const declare = async (externalUrl, version = '0.10.1') => {
       agent.close();
+      agent.agentVersion = version;
       agent.install = { method: 'tar', upgrade: 'ready', config: 'enabled', ...(externalUrl ? { external_url: externalUrl } : {}) };
       agent.seq = 0;
       await until(async () => {
@@ -740,23 +742,36 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
       }, 30000, `pulse-09 以 install.external_url=${externalUrl} 重新連線`);
       await until(async () => {
         const r = await api(page, 'GET', `/api/v1/hosts/${P09}/upgrade`);
-        return r.status === 200 && r.json.data.install && r.json.data.install.upgrade === 'ready' && (r.json.data.install.external_url || null) === externalUrl;
-      }, 30000, `pulse-09 的 install.external_url=${externalUrl}`);
+        return r.status === 200 && r.json.data.agent_version === version && r.json.data.install && r.json.data.install.upgrade === 'ready' && (r.json.data.install.external_url || null) === externalUrl;
+      }, 30000, `pulse-09（${version}）的 install.external_url=${externalUrl}`);
     };
-    const openPreview = async (name) => {
+    const openPreview = async (name, { downgrade = false } = {}) => {
       await page.goto(`${URL0}/pulse/rollouts/new`);
       await waitTitle(page, '建立推送');
       await page.getByLabel(/^名稱/).fill(name);
+      if (downgrade) await page.getByLabel('允許降版', { exact: true }).check();
       return page.locator('#rollout-preview');
     };
     const BASE = 'https://repo.example.gov.tw/kairos-pulse/0.9.1/';
-    await declare('none');
+    const previewApi = () => api(page, 'POST', '/api/v1/rollouts/preview', { name: 'x', target_version: VERSION, selector: { all: true }, waves: [{ size: 'rest' }], options: { allow_downgrade: true } });
     try {
-      const pv = await api(page, 'POST', '/api/v1/rollouts/preview', { name: 'x', target_version: VERSION, selector: { all: true }, waves: [{ size: 'rest' }] });
+      // Pulse 0.9（原本的 pulse-09，沒有宣告）：不支援外部 URL → url_not_supported
+      const old = await previewApi();
+      assert.equal(old.status, 200, JSON.stringify(old.json));
+      assert.deepEqual([old.json.data.eligible, old.json.data.skipped.url_not_supported, old.json.data.skipped.url_not_allowed], [0, 1, undefined], JSON.stringify(old.json.data));
+      let preview = await openPreview('E2E 外部 URL 0');
+      const oldLine = preview.locator('li[data-reason="url_not_supported"]');
+      await oldLine.waitFor({ timeout: 15000 });
+      assert.match(await oldLine.innerText(), /Pulse 版本不支援外部 URL（需要 0\.10 以上；先以存放在 Kairos 的版本升級到 0\.10）：1 台/);
+      await preview.getByText('可升級 0 台').waitFor();
+      await axe(page, 'F8 S26 資格預覽（Pulse 版本不支援外部 URL）');
+      // Pulse 0.10.1 宣告 none
+      await declare('none');
+      const pv = await previewApi();
       assert.equal(pv.status, 200, JSON.stringify(pv.json));
-      assert.deepEqual([pv.json.data.eligible, pv.json.data.skipped.url_not_allowed], [0, 1], JSON.stringify(pv.json.data));
+      assert.deepEqual([pv.json.data.eligible, pv.json.data.skipped.url_not_allowed, pv.json.data.skipped.url_not_supported], [0, 1, undefined], JSON.stringify(pv.json.data));
       assert.deepEqual(pv.json.data.external_url, { base_url: BASE, undeclared: 0, allowlist: 0 });
-      let preview = await openPreview('E2E 外部 URL');
+      preview = await openPreview('E2E 外部 URL');
       const line = preview.locator('li[data-reason="url_not_allowed"]');
       await line.waitFor({ timeout: 15000 });
       assert.match(await line.innerText(), /不允許從外部 URL 下載（PLS-W8411；.*）：1 台/);
@@ -777,22 +792,22 @@ export function registerRemote({ test, newPage, login, waitTitle, axe, shot, Fak
       await page.locator('#host-upgrade-title').waitFor({ timeout: 15000 });
       await page.locator('[data-external-url="none"]').getByText('不允許（主機的 upgrade.url_allowlist 是空的）').waitFor({ timeout: 15000 });
       await axe(page, 'F8 S05 升級卡片（外部 URL 的宣告）');
-      // 沒有宣告（0.10.1 以前的 Pulse）：照舊可升級，預覽註明「沒有回報」的台數
+      // 沒有宣告（0.10.0、0.10.1 的 Pulse）：照舊可升級，預覽註明「沒有回報」的台數
       await declare(null);
-      preview = await openPreview('E2E 外部 URL 2');
+      preview = await openPreview('E2E 外部 URL 2', { downgrade: true });
       await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
       await page.locator('#rollout-preview-external [data-ext="undeclared"]').getByText(/有 1 台沒有回報是否允許外部 URL/).waitFor();
       assert.equal(await preview.locator('li[data-reason="url_not_allowed"]').count(), 0);
       await axe(page, 'F8 S26 資格預覽（外部 URL：沒有宣告）');
       // 宣告有白名單：可升級，註明 Kairos 不知道白名單的內容
       await declare('allowlist');
-      preview = await openPreview('E2E 外部 URL 3');
+      preview = await openPreview('E2E 外部 URL 3', { downgrade: true });
       await preview.getByText('可升級 1 台').waitFor({ timeout: 15000 });
       await page.locator('#rollout-preview-external [data-ext="allowlist"]').getByText(/1 台回報有白名單/).waitFor();
       assert.equal(await page.locator('#rollout-preview-external [data-ext="undeclared"]').count(), 0);
     } finally {
-      // 還原：之後的測試需要原本的 pulse-09（沒有宣告）
-      await declare(null);
+      // 還原：之後的測試需要原本的 pulse-09（0.9.0、沒有宣告）
+      await declare(null, '0.9.0');
     }
     const del = await api(page, 'DELETE', `/api/v1/releases/${VERSION}`, { confirm: VERSION });
     assert.equal(del.status, 200, JSON.stringify(del.json));
