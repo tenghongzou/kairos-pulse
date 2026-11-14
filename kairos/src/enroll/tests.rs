@@ -9,9 +9,10 @@ use kairos_proto::enroll::{
     sign_ecdsa_p256_sha256, withdraw_signing_input,
 };
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PublicKeyData, SanType,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams,
+    CertificateSigningRequestParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384,
+    PublicKeyData, RevocationReason, RevokedCertParams, SanType, SerialNumber,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -96,6 +97,43 @@ impl Root {
         csr.params.not_before = t(now - 3600);
         csr.params.not_after = t(now + 5 * 365 * 86_400);
         csr.signed_by(&self.issuer()).unwrap().pem()
+    }
+
+    /// 以根 CA 直接簽發的用戶端憑證（手動簽發、沒有匯入 Kairos 的簽發紀錄），DER
+    fn client_cert(&self, a: &Agent, serial: u8, not_before: i64, not_after: i64) -> Vec<u8> {
+        let mut p = CertificateParams::new(vec![a.id.clone()]).unwrap();
+        p.distinguished_name = DistinguishedName::new();
+        p.distinguished_name
+            .push(DnType::CommonName, a.id.as_str());
+        p.serial_number = Some(SerialNumber::from_slice(&[serial]));
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        p.not_before = t(not_before);
+        p.not_after = t(not_after);
+        p.signed_by(&a.key, &self.issuer()).unwrap().der().to_vec()
+    }
+
+    /// 根 CA 的 CRL（PEM）：列出 `revoked` 的序號，`next_update` 為 Unix 秒
+    fn crl(&self, revoked: &[u8], next_update: i64) -> String {
+        let params = CertificateRevocationListParams {
+            this_update: t(next_update - 30 * 86_400),
+            next_update: t(next_update),
+            crl_number: SerialNumber::from_slice(&[1]),
+            issuing_distribution_point: None,
+            revoked_certs: revoked
+                .iter()
+                .map(|s| RevokedCertParams {
+                    serial_number: SerialNumber::from_slice(&[*s]),
+                    revocation_time: t(next_update - 30 * 86_400),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params.signed_by(&self.issuer()).unwrap();
+        crate::pki::x509::pem_encode("X509 CRL", &crl.der().to_vec())
     }
 }
 
@@ -1109,6 +1147,82 @@ async fn revocation_regenerates_the_crl_and_blocks_grace_renewal() {
     };
     let (s, v) = env.post("/v1/enroll/renewals", &req).await;
     assert_eq!((s, code(&v)), (403, "certificate_revoked"), "{v}");
+}
+
+/// 安全稽核 C2：過期續簽對 `auth.client_ca` 的 CA 簽發的舊憑證檢查 `auth.crl`（與 8443 相同）——
+/// 被撤銷的換不到新憑證，無法判定撤銷狀態（CRL 過期、不是這個 CA 簽的）時也不放行
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grace_renewal_checks_auth_crl_for_externally_issued_certificates() {
+    let env = Env::new("grace-crl", |c| {
+        c.auth.crl = vec![
+            Path::new(&c.auth.client_ca)
+                .with_file_name("client.crl")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+    })
+    .await;
+    let crl_path = PathBuf::from(&env.config.auth.crl[0]);
+    let now_s = env.now() / 1000;
+    let a = agent("99999999-2222-4333-8444-555555555555");
+    // 過期 10 天（寬限期 90 天內）、沒有匯入 Kairos 的憑證；清冊中有這台主機（曾連上 8443）
+    let old = env
+        .root
+        .client_cert(&a, 0x21, now_s - 100 * 86_400, now_s - 10 * 86_400);
+    let conn = env.conn();
+    conn.execute(
+        "INSERT INTO hosts (agent_id, hostname, host_fingerprint, display_name, tags, os, online,
+            first_seen, last_seen, source, current_serial, lifecycle)
+         VALUES (?1, 'h', ?2, NULL, NULL, NULL, 0, ?3, ?3, 'enroll', NULL, 'active')",
+        rusqlite::params![a.id, a.fingerprint, env.now()],
+    )
+    .unwrap();
+    let renew = |n: i64| -> GraceRenewRequest {
+        let new = a.rekey();
+        let sent = format_rfc3339_ms(env.now() + n);
+        let input =
+            grace_renew_signing_input(&a.id, &a.fingerprint, &new.csr, &sent, &env.endpoint())
+                .unwrap();
+        GraceRenewRequest {
+            agent_id: a.id.clone(),
+            csr: b64url_encode(&new.csr),
+            poll_secret: new.poll_secret.clone(),
+            sent_at: sent,
+            host_fingerprint: a.fingerprint.clone(),
+            expired_certificate: b64url_encode(&old),
+            signature: sign_ecdsa_p256_sha256(&a.key.serialize_der(), &input).unwrap(),
+            signature_alg: SignatureAlg::EcdsaP256Sha256,
+            hostname: "h".into(),
+            pulse_version: "0.11.0".into(),
+        }
+    };
+    let issued = || -> i64 {
+        conn.query_row("SELECT count(*) FROM pki_certificates", [], |r| r.get(0))
+            .unwrap()
+    };
+    // CRL 列出這張憑證：已撤銷
+    std::fs::write(&crl_path, env.root.crl(&[0x21], now_s + 86_400)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(1)).await;
+    assert_eq!((s, code(&v)), (403, "certificate_revoked"), "{v}");
+    // CRL 已超過 nextUpdate（沒有列出這張憑證）：無法判定，不放行
+    std::fs::write(&crl_path, env.root.crl(&[], now_s - 3600)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(2)).await;
+    assert_eq!((s, code(&v)), (500, "internal"), "{v}");
+    // CRL 不是這張憑證的簽發 CA 簽的：無法判定，不放行
+    std::fs::write(&crl_path, root().crl(&[], now_s + 86_400)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(3)).await;
+    assert_eq!((s, code(&v)), (500, "internal"), "{v}");
+    // CRL 檔不見了：無法判定，不放行
+    std::fs::remove_file(&crl_path).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(4)).await;
+    assert_eq!((s, code(&v)), (500, "internal"), "{v}");
+    assert_eq!(issued(), 0, "被拒的續簽不得簽出憑證");
+    // 有效的 CRL、沒有列出這張憑證：照常續簽
+    std::fs::write(&crl_path, env.root.crl(&[0x55], now_s + 86_400)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(5)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["state"], "issued");
+    assert_eq!(issued(), 1);
 }
 
 /// 已退役的簽發 CA 簽出的憑證不能以過期續簽換新憑證（PKI.md 第 15.4 節）：`auth.client_ca` 直接含有那張

@@ -47,6 +47,7 @@ use crate::pki::csr::check_csr;
 use crate::pki::store::CertRow;
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode, verify_cert_signature};
 use crate::store::prelude::*;
+use crate::tls::CrlVerdict;
 
 /// 每個請求的處理上限（長輪詢另加 `wait` 秒）
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1390,6 +1391,34 @@ fn verify_grace_identity(
     Err("signature does not verify")
 }
 
+/// 舊憑證在 `auth.crl` 中的撤銷狀態（與 8443 相同的撤銷來源）。`None`：不適用——沒有設定 `auth.crl`
+/// （8443 也不檢查撤銷），或舊憑證由 Kairos 的簽發 CA 簽發（撤銷紀錄在資料庫，第 10 步；8443 以 Kairos
+/// 產生的 CRL 判定，不看 `auth.crl`）
+fn grace_crl_verdict(
+    svc: &EnrollService,
+    cert_der: &[u8],
+    info: &crate::pki::x509::CertInfo,
+) -> Option<CrlVerdict> {
+    let ca = svc.config.auth.client_ca_path()?;
+    let crls = svc.config.auth.crl_paths();
+    if crls.is_empty() {
+        return None;
+    }
+    let by_issuing_ca = std::fs::read_to_string(crate::pki::issuing_cas_path(&svc.data_dir))
+        .ok()
+        .and_then(|text| pem_decode_all(&text, Some("CERTIFICATE")).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|(_, der)| parse_cert(der).is_ok_and(|ca| ca.subject_raw == info.issuer_raw));
+    if by_issuing_ca {
+        return None;
+    }
+    let now = chrono::DateTime::from_timestamp_millis(svc.now_ms())?;
+    Some(crate::tls::expired_cert_crl_verdict(
+        cert_der, ca, &crls, now,
+    ))
+}
+
 /// 過期續簽在交易中的判定（第 8～16 步）
 enum GraceOutcome {
     Respond(Box<(RequestRow, Option<CertRow>)>),
@@ -1467,6 +1496,14 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
         .await;
         return Err(mismatch());
     }
+    // 第 10 步用的 `auth.crl` 判定：讀檔，在交易之外；身分已驗證，只有持有舊私鑰的一方走得到這裡
+    let crl = grace_crl_verdict(svc, &checked.expired_certificate_der, &old);
+    if let Some(CrlVerdict::Unknown(why)) = &crl {
+        warn!(
+            "過期續簽被拒（agent_id {}，來源 {}）：無法以 auth.crl 判定舊憑證（序號 {}）的撤銷狀態：{why}。請更新 auth.crl",
+            checked.agent_id, ctx.observed, old.serial
+        );
+    }
     let key = replay_cache_key(&signing_input);
     let eff = svc.effective();
     let s = svc.clone();
@@ -1476,7 +1513,11 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
     let req2 = req.clone();
     let outcome = svc
         .db
-        .write(move |conn| grace_in_tx(&s, conn, &req2, &checked2, &old, key, &eff, &observed, now))
+        .write(move |conn| {
+            grace_in_tx(
+                &s, conn, &req2, &checked2, &old, crl, key, &eff, &observed, now,
+            )
+        })
         .await
         .map_err(db_err)?;
     match outcome {
@@ -1518,6 +1559,7 @@ fn grace_in_tx(
     req: &GraceRenewRequest,
     checked: &kairos_proto::enroll::CheckedGraceRenewRequest,
     old: &crate::pki::x509::CertInfo,
+    crl: Option<CrlVerdict>,
     key: [u8; 32],
     eff: &crate::settings::Effective,
     source_ip: &str,
@@ -1592,8 +1634,17 @@ fn grace_in_tx(
             _ => {}
         }
     }
-    // 10. 舊憑證已撤銷，或主機已除役
-    if old_cert.as_ref().is_some_and(|c| c.revoked_at.is_some())
+    // 10. 舊憑證已撤銷（Kairos 的撤銷紀錄或 `auth.crl`），或主機已除役
+    if let Some(CrlVerdict::Unknown(_)) = &crl {
+        // 與 8443 相同：無法判定撤銷狀態時不放行。Pulse 依退避重試，`auth.crl` 更新後自行恢復
+        return fail(
+            tx,
+            EnrollErrorCode::Internal,
+            "certificate revocation status is unavailable",
+        );
+    }
+    if crl == Some(CrlVerdict::Revoked)
+        || old_cert.as_ref().is_some_and(|c| c.revoked_at.is_some())
         || host
             .as_ref()
             .is_some_and(|h| h.lifecycle == "decommissioned")

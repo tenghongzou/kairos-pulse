@@ -362,7 +362,7 @@ revoke_superseded = true           # 新憑證第一次 hello 後以 superseded 
    - **維持離線**：`pki.mode = "offline"`，註冊與核准在線上完成，簽發用第 6 節的匯出／匯入（代理 CA 私鑰不離開管理主機）。
    - **改為線上**：`kairos pki issuing-ca new` → 在管理主機以**代理 CA** 簽發（代理 CA 在此扮演根 CA）→ `install`、`activate`；`pki.mode = "online"`。舊的手動憑證繼續有效（代理 CA 仍在 `auth.client_ca`），到期前由 8443 的 `renew` 換成線上簽發的憑證。
 4. 設定 `[enroll]`（`mode = "open"` 或 `renew_only`），開放 8444 的防火牆。
-5. 手動簽發的既有憑證可以 `kairos pki certificates import <檔案或目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；0.9.0 起，第 16 節）；不匯入也能連線。
+5. 手動簽發的既有憑證可以 `kairos pki certificates import <檔案或目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；0.9.0 起，第 16 節）；不匯入也能連線。**沒有匯入的憑證只能以外部 CA 的 CRL（`auth.crl`）撤銷**：8443 與 8444 的過期續簽都以 `auth.crl` 判定（第 13 節第 4 項）。建議匯入——匯入後過期續簽才能判斷哪一張是「最新的憑證」，被取代的舊憑證（例如金鑰外洩後手動重發）才換不到新憑證。
 
 ## 10. 簽發流程（Kairos 內部）
 
@@ -432,7 +432,7 @@ KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_
 | 1 | `enroll_requests` | 另有 `cert_lifetime_days`、`issue_error`；索引另有 `(source_ip, state)`、`(source_ip, created_at)`；`hosts` 另有 `decommissioned_by` 與 `hostname` 索引 |
 | 2 | 信任錨與 CRL 的檔案 | `data/pki/issuing-cas.pem`、`data/pki/crl/issuing.crl`（各簽發 CA 的 CRL 合在一個 PEM），不是每個 CA 一個檔案 |
 | 3 | 第一個簽發 CA | `issuing-ca install` 在沒有啟用中的簽發 CA 時自動啟用（之後的 CA 需 `activate`） |
-| 4 | 過期續簽的身分 | `expired_certificate` 必須由信任錨（簽發 CA 或 `auth.client_ca` 中的 CA）**直接**簽發（Pulse 只送出用戶端憑證，不送中繼憑證）；清冊沒有最新序號（手動簽發、未匯入）的主機只檢查沒有撤銷紀錄 |
+| 4 | 過期續簽的身分 | `expired_certificate` 必須由信任錨（簽發 CA 或 `auth.client_ca` 中的 CA）**直接**簽發（Pulse 只送出用戶端憑證，不送中繼憑證）；清冊沒有最新序號（手動簽發、未匯入）的主機只檢查沒有撤銷紀錄。**撤銷的來源與 8443 相同**：Kairos 簽發 CA 簽出的憑證看資料庫的撤銷紀錄（就是 Kairos 產生的 CRL 的內容）；`auth.client_ca` 的 CA 簽出的憑證另以 `auth.crl` 檢查（有設定 `auth.crl` 時；整條鏈、CRL 的 `nextUpdate` 以現在的時間判定，憑證鏈以憑證有效期間內的時間點驗證）——被 `auth.crl` 撤銷的憑證回 403 `certificate_revoked`；無法判定（CRL 讀不到、已超過 `nextUpdate`、沒有涵蓋簽發者、憑證本身通不過 8443 的鏈驗證）時與 8443 一樣不放行，回 500 `internal` 並記一行警告，Pulse 依退避重試、`auth.crl` 更新後自行恢復。0.11.0（含）以前的過期續簽不看 `auth.crl`：只以外部 CRL 撤銷、沒有匯入也沒有在 Kairos 撤銷的憑證，過期後在寬限期內仍可換到新憑證 |
 | 5 | 過期續簽的「最後嘗試」 | `hosts.last_grace_attempt` 只在通過身分驗證後寫入（時鐘被拒的請求尚未驗證身分，不寫入清冊，避免任何人替別台主機寫入資料） |
 | 6 | 授權節點數 | 本版沒有授權機制：`license_exhausted` 不會出現，`EnrollLicenseOverflow` 保留 |
 | 7 | keep-alive 閒置 | hyper 的標頭讀取計時涵蓋閒置，實際閒置上限為 `min(header_timeout_secs, idle_timeout_secs)`（預設 10 秒） |

@@ -249,7 +249,7 @@ preflight PF09 與 MSI 精靈的 token 頁使用；**不消耗使用次數、不
 | 7 | **身分**：`expired_certificate` 以目前任一信任錨（`auth.client_ca` 與 Kairos 的簽發 CA）驗證鏈的簽章（**忽略有效期間**）、SAN 恰好一個且等於 `agent_id`、公鑰為 P-256；以該憑證的公鑰、對 Kairos 每一個註冊端點名稱（第 16.3 節）組出的簽章內容驗證 `signature`，任一個通過即可；`host_fingerprint` 等於清冊中這台主機最後已知的指紋（清冊沒有指紋時視為不符） | 403 `renew_identity_mismatch`（計入 L7 續簽類，相異值＝`agent_id`） |
 | 8 | **重放快取**：簽章內容的 SHA-256（第 16.4 節）在 10 分鐘內出現過 | 400 `replayed_request`（計入 L7 續簽類，相異值＝內容雜湊）。通過第 7 步的請求一律寫入快取（不論後面的結果），快取**持久化**（第 18 節第 2 項） |
 | 9 | **冪等**：同一 `agent_id`＋同一 CSR 已有過期續簽申請 | 已簽發、且那張憑證仍是這台主機最新、未撤銷的憑證 → 200 回傳**同一張憑證**（不重新簽發；設計包 `INTEGRATION.md` §23.9，第 7.4 節）；待核准 → 200 回傳那一筆申請（`poll_secret` 更新為這次的值） |
-| 10 | 舊憑證已撤銷，或主機已除役 | 403 `certificate_revoked` |
+| 10 | 舊憑證已撤銷，或主機已除役。撤銷的來源與 8443 相同：Kairos 的撤銷紀錄，以及（舊憑證由 `auth.client_ca` 的 CA 簽發、且設定了 `auth.crl` 時）`auth.crl`——整條鏈、CRL 的 `nextUpdate` 以現在的時間判定 | 403 `certificate_revoked`。`auth.crl` 無法判定撤銷狀態（讀不到、已超過 `nextUpdate`、沒有涵蓋簽發者）時與 8443 一樣不放行：500 `internal`，Pulse 依退避重試，`auth.crl` 更新後自行恢復（`kairos/PKI.md` 第 13 節第 4 項） |
 | 11 | 舊憑證不是這台主機**最新**簽發的憑證（已被正常輪替或重新註冊取代） | 403 `renew_identity_mismatch`（防止以外洩的舊私鑰換到新憑證） |
 | 12 | 舊憑證尚未過期（依 Kairos 的時間） | 409 `certificate_not_expired`：Pulse 回到 8443 以這張憑證連線（本機時鐘偏快的情況，設計包 §8.1） |
 | 13 | **寬限期**：`收到時間 > not_after + 寬限天數`，且沒有 `grace_override_until` 或已超過它；寬限期政策為 0 時一律超過 | 403 `renew_grace_exceeded`（附 `grace_ended_at`） |
