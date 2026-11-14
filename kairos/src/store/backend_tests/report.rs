@@ -907,7 +907,10 @@ fn one_host_cannot_exhaust_the_global_series_table(db: &TestDb) -> String {
             RecordBody::Metrics { metrics },
         )
     };
-    assert_eq!(store.write_batch(&[many(A, 1, "a")]), [WriteStatus::Written]);
+    assert_eq!(
+        store.write_batch(&[many(A, 1, "a")]),
+        [WriteStatus::Written]
+    );
     // 全域 series 最多 cap=4 筆（修正前會是 20）；host_series 同樣 4
     assert_eq!(
         db.int("SELECT count(*) FROM series"),
@@ -916,7 +919,10 @@ fn one_host_cannot_exhaust_the_global_series_table(db: &TestDb) -> String {
     );
     assert_eq!(db.int("SELECT count(*) FROM host_series"), 4);
     // 另一台主機仍可新增它自己的 4 個序列（全域表沒有被佔滿而拒絕）
-    assert_eq!(store.write_batch(&[many(B, 1, "b")]), [WriteStatus::Written]);
+    assert_eq!(
+        store.write_batch(&[many(B, 1, "b")]),
+        [WriteStatus::Written]
+    );
     assert_eq!(
         db.int("SELECT count(*) FROM series"),
         8,

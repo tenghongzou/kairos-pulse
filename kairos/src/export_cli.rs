@@ -315,7 +315,8 @@ fn restore_keys(
                 ]
             } else {
                 vec![
-                    "以服務帳號（sudo -u kairos）執行，並確認 storage.data_dir 可寫入。".to_string(),
+                    "以服務帳號（sudo -u kairos）執行，並確認 storage.data_dir 可寫入。"
+                        .to_string(),
                 ]
             },
         )

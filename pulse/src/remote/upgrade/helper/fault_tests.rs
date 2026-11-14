@@ -888,11 +888,7 @@ fn a_result_that_cannot_be_recorded_with_a_pointer_that_cannot_be_removed_is_res
         "{r:?}"
     );
     // 期限已過仍做健康確認（H4）；request 的 OTHER_ID 與接續的交易不同 → 忽略並註記
-    assert!(
-        r.detail.contains(NOTE_UPGRADE_ID_IGNORED),
-        "{}",
-        r.detail
-    );
+    assert!(r.detail.contains(NOTE_UPGRADE_ID_IGNORED), "{}", r.detail);
     assert_eq!(
         (r.from_version.as_str(), r.to_version.as_str()),
         ("0.9.0", "0.9.1")

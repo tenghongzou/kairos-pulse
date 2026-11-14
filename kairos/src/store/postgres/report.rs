@@ -1369,7 +1369,8 @@ impl PgStore {
                         for p in points {
                             // N8：這台主機已達上限時，對它而言是新的衍生序列不寫進全域 series 表
                             if !caches.host_has_room(host_id, cap)
-                                && !caches.has_series_derived(&p.name, &p.unit, &p.labels, p.derived)
+                                && !caches
+                                    .has_series_derived(&p.name, &p.unit, &p.labels, p.derived)
                             {
                                 continue;
                             }
