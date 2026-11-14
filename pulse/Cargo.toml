@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.99"
 # 商業產品，不發佈到 crates.io（cargo-deny 因此略過本套件的授權欄位檢查）
