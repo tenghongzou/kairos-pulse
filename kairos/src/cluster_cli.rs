@@ -781,6 +781,12 @@ fn keys_import(
 ) -> Result<Output, Failure> {
     let config = load_config(cmd.config_path.as_deref())?;
     let data_dir = PathBuf::from(&config.storage.data_dir);
+    // 安全稽核 F2：以 root 執行且資料目錄屬於服務帳號時拒絕——匯入會以 root 建立 data/pki 並以路徑
+    // 把檔案擁有者改掉；服務帳號可先把目標換成符號連結誘使 root chown 任意路徑。與其他寫資料庫的
+    // CLI 一致，一律要求以服務帳號執行（sudo -u kairos）
+    if let Some(f) = crate::token_cli::refuse_root(&data_dir) {
+        return Err(f);
+    }
     let text = std::fs::read_to_string(source).map_err(|e| {
         Failure::new(
             "無法讀取金鑰檔",

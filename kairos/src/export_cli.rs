@@ -52,7 +52,8 @@ backup：以 SQLite 的 VACUUM INTO 寫出一致的快照（不含空閒頁）�
   --include-keys      另把存在的金鑰檔以備份密碼加密（Argon2id＋AES-256-GCM），寫成 <備份檔路徑>.keys（0600）
   --password-file     從檔案讀取備份密碼（第一行；至少 12 個字元）
   --password-stdin    從 stdin 讀取備份密碼（不接受命令列上的密碼）
-restore-keys：解開金鑰備份並寫回 <storage.data_dir>（0600；以 root 執行時擁有者改為資料目錄的擁有者）。
+restore-keys：解開金鑰備份並寫回 <storage.data_dir>（0600）。請以 Kairos 的服務帳號執行（sudo -u kairos）；
+  以 root 執行且資料目錄屬於服務帳號時拒絕（安全考量，見 STORAGE.md）。
   請在 Kairos 停止時執行。資料目錄已有內容不同的金鑰檔時拒絕；--overwrite 時舊檔改名為 <名稱>.replaced-<時間> 保留。
 還原資料庫：停止 Kairos，把備份檔複製成 <storage.data_dir>/kairos.db（並刪除舊的 kairos.db-wal、kairos.db-shm），
 需要時執行 restore-keys，再啟動 Kairos。詳見 STORAGE.md「備份與還原」。
@@ -297,6 +298,12 @@ fn restore_keys(
         )
     })?;
     let data_dir = data_dir_of(config_path)?;
+    // 安全稽核 F2：以 root 執行且資料目錄屬於服務帳號時拒絕——還原會以 root 寫入並（為了讓服務帳號
+    // 讀得到）以路徑把檔案與 data/pki 的擁有者改掉；服務帳號可先把目標換成符號連結誘使 root chown
+    // 任意路徑。與其他寫資料庫的 CLI 一致，一律要求以服務帳號執行（sudo -u kairos）
+    if let Some(f) = crate::token_cli::refuse_root(&data_dir) {
+        return Err(keys_error(&f.title, f.cause, f.fix));
+    }
     kb::restore(&data_dir, &files, overwrite).map_err(|e| {
         keys_error(
             title,
@@ -308,8 +315,7 @@ fn restore_keys(
                 ]
             } else {
                 vec![
-                    "以服務帳號（sudo -u kairos）或 root 執行，並確認 storage.data_dir 可寫入。"
-                        .to_string(),
+                    "以服務帳號（sudo -u kairos）執行，並確認 storage.data_dir 可寫入。".to_string(),
                 ]
             },
         )

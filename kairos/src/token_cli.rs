@@ -385,12 +385,18 @@ pub(crate) fn operator() -> String {
     }
 }
 
-/// 以 root 執行而資料目錄屬於其他帳號時拒絕（新建立的資料庫檔會屬於 root，Kairos 之後無法寫入）
+/// 以 root 執行而資料目錄屬於其他帳號時拒絕（新建立的資料庫檔會屬於 root，Kairos 之後無法寫入；
+/// 也避免以 root 沿路徑對服務帳號可控的目錄做 chown／寫入，見安全稽核 F2）
 pub(crate) fn refuse_root(data_dir: &Path) -> Option<Failure> {
+    refuse_root_for(crate::fsperm::effective_uid(), data_dir)
+}
+
+/// [`refuse_root`] 的純函式核心（`euid` 由呼叫端提供，方便測試非 root 以外的路徑）
+pub(crate) fn refuse_root_for(euid: Option<u32>, data_dir: &Path) -> Option<Failure> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if crate::fsperm::effective_uid() != Some(0) {
+        if euid != Some(0) {
             return None;
         }
         let mut dir = data_dir.to_path_buf();
@@ -420,7 +426,7 @@ pub(crate) fn refuse_root(data_dir: &Path) -> Option<Failure> {
     }
     #[cfg(not(unix))]
     {
-        let _ = data_dir;
+        let _ = (euid, data_dir);
         None
     }
 }
@@ -1001,6 +1007,31 @@ mod tests {
     /// 測試用的固定時區 UTC+8
     fn tz8() -> FixedOffset {
         FixedOffset::east_opt(8 * 3600).unwrap()
+    }
+
+    /// 安全稽核 F2：以 root 執行且資料目錄屬於服務帳號時拒絕；非 root、或資料目錄屬於 root 時放行。
+    /// db restore-keys 與 cluster keys import 都靠這個判斷拒絕以 root 沿路徑對服務帳號可控目錄做
+    /// chown／寫入
+    #[cfg(unix)]
+    #[test]
+    fn refuse_root_blocks_root_with_a_non_root_data_dir() {
+        // 以 root 跑測試時擁有權不符預期，跳過
+        if crate::fsperm::effective_uid() == Some(0) {
+            return;
+        }
+        // 新建在 /tmp 下的子目錄屬於目前的（非 root）使用者
+        let dir = std::env::temp_dir().join(format!("kairos-f2-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // euid 0 + 非 root 擁有的資料目錄 → 拒絕
+        assert!(refuse_root_for(Some(0), &dir).is_some());
+        // 非 root 的身分 → 放行（維持既有行為）
+        assert!(refuse_root_for(Some(1000), &dir).is_none());
+        assert!(refuse_root_for(None, &dir).is_none());
+        // euid 0 但資料目錄屬於 root（/）→ 放行：chown 會是 no-op
+        assert!(refuse_root_for(Some(0), std::path::Path::new("/")).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
