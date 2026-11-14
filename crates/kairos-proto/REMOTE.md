@@ -77,7 +77,12 @@ flowchart LR
 | `config` | string | 集中設定的本機狀態：`enabled`、`disabled` |
 | `external_url` | string | **Pulse 0.11.0 起**。本機是否允許從外部 URL 下載發佈檔（第 4.1.2 節）：`none`（`upgrade.url_allowlist` 是空的，或沒有任何有效的項目——`source: "url"` 的提議一律 `declined`）、`allowlist`（白名單至少有一個有效的前綴）。**沒有這個欄位＝未知**（0.10.1 以前的 Pulse）。只宣告「有沒有白名單」，**不回報白名單的內容**（理由見下方「`external_url` 的設計」）。不論 `upgrade` 的值都送 |
 
+| `rollback` | string | **Pulse 0.11.0 之後的版本**（ADR-0003 階段 2）。這台主機的自動回滾能力：`archived`（deb／rpm：目前版本的套件在 root 專屬的本機封存中，回滾經套件管理員裝回，不依賴 Kairos 的版本庫；第 17.10 節）、`binary_only`（只做執行檔層級的回滾：tar，或 deb／rpm 而沒有本機封存——版本庫有主機目前的版本時，提議附的回滾檔與 `rollback_bundle` 仍可讓它經套件管理員回滾）、`none`（`upgrade` 不是 `ready`：沒有自動回滾）、`degraded`（上一次自動回滾是降級回滾，套件資料庫與實際的執行檔仍不一致，第 4.5.2 節）。**沒有這個欄位＝未知**（較舊的 Pulse）。不論 `upgrade` 的值都送 |
+
 - 限制：每個欄位都是 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值由 Kairos 原樣保存、顯示為「其他」。其他欄位忽略。物件或欄位型別錯誤時 `bad_request`（與 `os` 相同）；協商結果為 v1 時忽略。
+- **`rollback` 的設計**（與 `external_url` 相同的理由放在 `install`、不升協定版本、不是新的 feature；較舊的 Kairos 忽略它）：
+  - 值由 Pulse（服務帳號）依升級輔助程式（root）留在 `/var/lib/pulse/upgrade/rollback.json` 的提示算出（第 17.10.6 節）。提示只在它描述的是「目前執行的這一份執行檔」（SHA-256 相同）時才採用；`degraded` 另外要求套件資料庫的狀態仍與降級回滾當時相同（重新安裝套件之後不再回報）。這個檔案在服務帳號可寫的目錄裡，**只影響顯示與資格預覽**：輔助程式從不讀它，回滾時用什麼來源仍由輔助程式以 root 的封存索引與信任錨決定（ADR-0003 的 INV-6、INV-11）。謊報 `archived` 的主機只會讓預覽少算一台「無法自動回滾」；實際回滾時沒有封存就照第 4.4.2 節往下退。
+  - Kairos 的用途：資格分類（第 4.7.2 節：宣告 `archived` 的 deb／rpm 主機不因「版本庫沒有目前的版本」而列為 `no_rollback`）、預覽的 `rollback` 統計、主機詳情（`install.rollback`、「需要修復套件」）。清冊的 `hosts.install_rollback`（schema v13）與 `install_external_url` 相同：每次帶 `install.upgrade` 的 hello 整個取代，不沿用舊值。
 - **`external_url` 的設計**（0.11.0 起）：
   - **為什麼放在 `install` 而不是新的 feature**：需要分辨三種情況——不允許、允許、舊版沒宣告。feature 只有「宣告／沒宣告」兩種，「沒宣告 `upgrade_url`」分不出是舊版還是白名單是空的（除非再以版本號推測）；`install` 的選用欄位天生有第三種狀態（沒有這個欄位）。這也是 0.10.0 `unsafe_path` 的做法：Pulse 在 hello 事先回報、Kairos 據此做資格分類。
   - **協定版本不升、沒有新的 feature**：「`install` 物件中的其他欄位忽略」是 0.9.0 就定下的規則。新 Pulse 連 0.9／0.10 的 Kairos：舊 Kairos 忽略這個欄位，行為與現在完全相同（不允許外部 URL 的主機在推送中回報 `declined`）。0.10.1 以前的 Pulse 連新 Kairos：沒有這個欄位＝未知，維持現行行為，預覽另外註明台數。值的格式與其他欄位相同，不認得的值（未來的 Pulse）原樣保存並視為未知。
@@ -138,7 +143,7 @@ flowchart LR
 | 訊息 | 方向 | 欄位 |
 |---|---|---|
 | `upgrade_get` | P → K | `seq`、`ts`、`upgrade_id` |
-| `upgrade_offer` | K → P | `seq`、`upgrade_id`、`rollout_id`、`action`（`upgrade`／`downgrade`）、`target`（`version`、`commit`）、`artifact`、`rollback_artifact`（選用）、`manifest`、`sha256sums`、`signature`、`apply_window`、`health_timeout_secs`、`allow_downgrade`（第 2.4.1 節） |
+| `upgrade_offer` | K → P | `seq`、`upgrade_id`、`rollout_id`、`action`（`upgrade`／`downgrade`）、`target`（`version`、`commit`）、`artifact`、`rollback_artifact`（選用）、`rollback_bundle`（選用，0.11.0 之後的 Kairos）、`manifest`、`sha256sums`、`signature`、`apply_window`、`health_timeout_secs`、`allow_downgrade`（第 2.4.1 節） |
 | `upgrade_chunk_get` | P → K | `seq`、`ts`、`upgrade_id`、`filename`、`offset`（u64）、`length`（1～32768） |
 | `upgrade_chunk` | K → P | `seq`、`upgrade_id`、`filename`、`offset`、`data`（標準 base64，含補位）、`eof`（布林：這段之後沒有資料） |
 | `upgrade_status` | P → K | `seq`、`ts`、`upgrade_id`、`state`、`from_version`、`to_version`、`code`、`detail`、`progress`（第 2.4.3 節） |
@@ -150,6 +155,7 @@ flowchart LR
 |---|---|
 | `artifact` | `filename`（發佈檔名，`pulse-<版本>-<commit>-<os>-<arch>.<格式>`）、`size`（bytes，上限 128 MiB）、`sha256`（64 個小寫十六進位）、`source`（`kairos`：以 `upgrade_chunk_get` 從這條連線下載；`url`：從 `url` 下載）、`url`（`source` 為 `url` 時，`https://` 開頭、≤ 2048 bytes） |
 | `rollback_artifact` | deb／rpm／msi 的主機才有：**目前版本**、同格式同平台的發佈檔（欄位同 `artifact`），自動回滾時使用（第 4.4.2 節）；版本庫沒有時省略，Pulse 依第 4.5.3 節處理 |
+| `rollback_bundle` | **0.11.0 之後的 Kairos**（ADR-0003 階段 1）。`rollback_artifact` 所屬那次發佈的簽章資料：`{"sha256sums":"<SHA256SUMS 全文>","signature":"<SHA256SUMS.sig 全文>"}`（各 1 bytes 以上，上限與 `sha256sums`、`signature` 相同）。**只有 `rollback_artifact` 存在時才允許**；Kairos 只對 deb／rpm 主機附上，其他安裝方式的 Pulse 收到也忽略。它讓「本機沒有目前版本的驗證紀錄」的主機（第一次遠端升級、手動安裝的套件）也能驗證並使用回滾檔。**只是提示**：Pulse 與升級輔助程式各自以本機信任錨完整驗證（第 4.4.2 節），驗證不過不讓升級失敗 |
 | `manifest` | 發佈清單的檔名與內容：`{"filename":"pulse-0.9.1-…-release.json","content":"<JSON 字串>"}`（≤ 8 KiB，第 4.1.3 節）。0.9.0 以前的發佈沒有清單，此欄為 `null`，只能作為降版或回滾目標 |
 | `sha256sums` | 該次發佈的 `SHA256SUMS` 全文（≤ 16 KiB） |
 | `signature` | `SHA256SUMS.sig` 全文（≤ 4 KiB，`-----BEGIN SSH SIGNATURE-----` 格式） |
@@ -158,6 +164,14 @@ flowchart LR
 | `allow_downgrade` | 推送是否允許降版。Pulse 只在這個值**與**本機 `upgrade.allow_downgrade` 都為 `true` 時接受低於目前版本的目標（第 4.8 節） |
 
 Kairos 依這台主機的 `install.method`、`os.arch`（hello 的 `os`）選出發佈檔：`tar` → `linux-<arch>.tar.gz`、`deb` → `.deb`、`rpm` → `.rpm`、`msi` → `windows-x86_64.msi`、`zip` → `windows-x86_64.zip`。版本庫中沒有對應的檔案時，這台主機在推送中標為 `skipped`（`no_artifact`），不送提議。
+
+**`rollback_bundle` 不需要新的 feature，條件是整則訊息仍在單行上限內**（ADR-0003 第 6.2、6.3 節）：`upgrade_offer` 的解析不拒絕不認得的欄位，0.9～0.11.0 的 Pulse 忽略它（`kairos-proto` 有凍結的舊型別測試）。但超過單行上限（65536 bytes）的訊息對端會當成**連線錯誤**，不是忽略欄位；欄位的大小上限只限制原始 bytes，JSON 跳脫之後可能更長。所以 Kairos 在送出前套用**單行大小的三段式規則**（`kairos_proto::mgmt::fit_upgrade_offer`）：
+
+1. 以要送出的**完整訊息**（`{"type":"upgrade_offer",…}`）實際序列化，byte 長度加上換行字元與 1 KiB 的餘裕（`OFFER_LINE_RESERVE`）必須 ≤ 65536：原樣送出。
+2. 含 `rollback_bundle` 時超過 → 省略 `rollback_bundle` 再算一次，放得下就送出（主機照常升級；回滾檔只有在主機本機有紀錄時才會被使用）。這台主機在推送中的 `reason` 記為 `rollback_bundle_omitted`（主機表看得到），Kairos 記一則 `WARN`。
+3. 仍超過 → **不送出**：`upgrade_get` 的回應是 `upgrade_unavailable`（連線不受影響）。這台主機在推送中標為 `failed`（`reason` 為 `offer_too_large`，代碼 `KRS-W8419`〔暫定號〕；修正版本庫後可以重試），寫稽核事件 `host.upgrade.offer_too_large`，推送自動暫停（`pause_cause` 為 `offer_too_large`，第 4.7.4 節）。沒有 `rollback_bundle` 的提議也適用這一條。
+
+正常的官方發佈不會碰到第 2、3 段（每個欄位都取上限的合法內容約 55 KB）；它們擋的是版本庫中需要大量跳脫的異常內容。回滾檔所屬發佈的簽章資料本身不合規定（空的、超過欄位上限）時 Kairos 不附 `rollback_bundle`、照常提議。
 
 #### 2.4.2 下載（`source: "kairos"`）
 
@@ -179,6 +193,11 @@ Kairos 依這台主機的 `install.method`、`os.arch`（hello 的 `os`）選出
 
 - `applying` 之後的狀態（`succeeded`、`rolled_back`、`rollback_failed`、`failed`）由**替換後的 Pulse**（新版，或回滾後的原版）在重新連線、`hello_ack` 之後送出：結果先寫在本機的狀態檔（第 4.6 節），收到 `ack` 才標為已回報（at-least-once）。Kairos 以 (`upgrade_id`, `state`) 去重。
 - Kairos 另以 hello 的 `agent_version` 交叉確認：收到 `succeeded` 而版本不是目標版本時記 `KRS-W8402` 並把這台主機標為 `failed`（`version_mismatch`）。
+- **降級回滾**（0.11.0 之後的版本；第 4.5.2 節、ADR-0003 第 5.4 節）：健康確認失敗後服務已恢復到舊版，但 deb／rpm 只換回了執行檔、套件資料庫與實際的執行檔不一致。`state` **仍是 `rolled_back`**（舊的 Kairos 只接受固定的狀態值，新的狀態值會被當成 `bad_request`），另外：
+  - `code` 是 `PLS-W8418`〔暫定號〕，不是一般回滾的 `PLS-W8407`；
+  - `detail` 以固定的前綴 `degraded:` 開頭，接著是以逗號分隔、機器可讀的原因（小寫英文字母、數字與 `_`），到第一個其他字元（`;`）為止，之後才是人讀的說明。例：`degraded:package_rollback_failed,package_db_inconsistent; crash_restart (NRestarts 0 → 1); rollback: dpkg: error processing archive`。
+  - 原因（`kairos_proto::mgmt::DEGRADED_*`；不認得的原因 Kairos 原樣保存與顯示）：`package_db_inconsistent`（每一次降級回滾都有）、`no_rollback_package`（沒有任何回滾套件）、`rollback_not_verified`（回滾套件沒有通過簽章、雜湊或檔名與平台的驗證，含簽署金鑰已到期）、`rollback_commit_mismatch`、`rollback_binary_mismatch`（回滾套件不是替換前執行的那個 commit／那一份執行檔）、`rollback_archive_unusable`（本機封存損毀、缺失或不安全）、`rollback_signer_revoked`（回滾套件的簽署金鑰已從信任錨移除，或信任錨無法讀取）、`rollback_copy_changed`（驗證過的複本在回滾時與紀錄的雜湊不符）、`package_rollback_failed`（套件管理員裝回舊版失敗）。
+  - 較舊的 Kairos 收到時當成一般的 `rolled_back`（`detail` 原樣顯示）。
 
 ### 2.5 新增與擴充的錯誤碼
 
@@ -198,6 +217,15 @@ Kairos 依這台主機的 `install.method`、`os.arch`（hello 的 `os`）選出
 | 0.9.0 | 0.9.0，`storage.backend = "jsonl"` 或沒有 mTLS | Kairos 不列出兩個 feature，同上 |
 | 0.9.0，`remote_config.enabled = false` | 0.9.0 | 只協商 `upgrade`（若準備就緒）；主控台顯示「本機停用集中設定」 |
 | 0.9.0，`install.upgrade` 不是 `ready` | 0.9.0 | 只協商 `config`；主控台依 `install.upgrade` 顯示原因 |
+
+回滾檔的簽章資料、降級回滾與 `install.rollback`（ADR-0003 第 6.4 節；「N」＝含階段 1、2 的版本，0.11.0 之後）：
+
+| Kairos ＼ Pulse | 0.9.x | 0.10.x、0.11.0 | N |
+|---|---|---|---|
+| 0.9.x～0.11.0 | 沒有 `rollback_bundle`：回滾檔只有在本機有紀錄時使用，否則 `pulse.prev` | 同左（`from_version` 等已修） | 沒有 bundle：本機封存、本機紀錄或 `pulse.prev`；只換回執行檔時回報降級回滾——舊 Kairos 當成一般的 `rolled_back`（`detail` 原樣顯示，不暫停推送）；`install.rollback` 被忽略 |
+| N | 忽略 `rollback_bundle`（單行大小的規則保證訊息不超過上限）；沒有 `install.rollback`（未知） | 同左 | 第一次遠端升級即可經套件管理員回滾；降級回滾暫停推送並標示主機；資格預覽依 `install.rollback` 與版本庫 |
+
+「回報降級回滾」取決於**執行回滾的輔助程式**的版本（替換前安裝的那一版；替換後中斷而接續時是新版）：N 的 Pulse 升級到任何版本失敗時都依 N 的規則回滾與回報。
 
 ### 2.7 範例（實作時改為 PROTOCOL.md 的測試向量）
 
@@ -413,9 +441,22 @@ stateDiagram-v2
 
 任何一步失敗都是 `PLS-E8401`（簽章）或 `PLS-E8402`（雜湊、檔名、平台、版本），刪除暫存、回報 `failed`，**不重試同一個提議**。Kairos 收到 `PLS-E8401` 時記稽核事件並開告警（第 5.3 節），因為這代表版本庫或傳輸被竄改，或信任錨與發佈不符。
 
+**「任何一步失敗都 `failed`」只適用於目標**（0.11.0 之後的版本；ADR-0003 第 6.5 節）。回滾來源（回滾檔與它的簽章資料、本機封存）的驗證以同樣的步驟 1～4 進行，版本的期望值是**目前執行的版本**（輔助程式自己的版本），另加 commit 與執行檔雜湊的綁定（第 4.4.2 節）；它驗證失敗時**不讓升級失敗**——改評估下一個來源，最後退到 `pulse.prev`，原因記在交易紀錄，健康確認失敗而真的回滾時寫進降級回滾的 `detail`。理由：回滾來源是 Kairos 提供的提示（或本機的封存），拒絕整個升級等於讓「不附或亂附回滾檔」變成阻擋升級的手段，而退到 `pulse.prev` 永遠是更保守的一邊。
+
 #### 4.2.3 金鑰輪替
 
 依 RELEASING.md 第 3 節：過渡期間 `allowed_signers` 同時列出新舊兩把（可用 `valid-before` 讓舊金鑰自動失效）。更新 `allowed_signers` 是**本機操作**（組態管理工具、Ansible、GPO、手動），第一版不提供經遠端升級通道輪替的方式（第 14 節 D13）。外洩時：客戶從 `allowed_signers` 移除舊金鑰即可讓所有主機拒絕舊金鑰簽的發佈。
+
+**自然到期與撤銷是兩件事**（0.11.0 之後的版本；ADR-0003 的 INV-7、決策點 D1）：
+
+| | 自然到期 | 撤銷 |
+|---|---|---|
+| 怎麼表示 | 那一行還在 `allowed_signers`，`valid-before` 已過 | **刪除那一行**（不是把 `valid-before` 改成過去的時間：那是到期）。信任錨整個讀不到（不存在、權限不符、`pulse.toml` 無法載入）視同撤銷 |
+| 新的升級目標、還沒驗證過的回滾檔（取得時驗證） | 拒絕（完整驗證含有效期間） | 拒絕 |
+| **已綁定的回滾目標**（替換前已完整驗證、雜湊記在 root 交易紀錄的回滾套件；本機封存中已提交的套件） | 照常使用：金鑰到期是正常的輪替，不代表不可信；取得時已完整驗證，整包雜湊綁定 | **不經套件管理員回滾**：不再以 root 執行那個簽署者簽的維護指令碼，改換回 `pulse.prev`（同一份執行檔），結果是降級回滾，`detail` 有 `rollback_signer_revoked`（第 4.5.2 節） |
+| `pulse.prev` | 可用 | 可用（它是替換前實際在執行的位元組，不需要簽章） |
+
+輔助程式在兩個時間點判斷撤銷，都只看「這把金鑰的指紋是否仍列在信任錨中」，不重新判斷有效期間：選用本機封存當回滾來源時（替換前），以及回滾當下。兩條路徑**不是安全等價**：重裝套件會在不同的時間與系統狀態下再執行一次舊版的維護指令碼並把套件的其他檔案換回舊版；只換回 `pulse.prev` 不執行任何新的程式碼，但套件資料庫與 unit 等其他檔案仍是失敗的那一版。撤銷之後要讓套件資料庫恢復一致：以新金鑰簽署的版本升級，或在主機上手動重新安裝套件（第一版不提供「撤銷後強制套件回滾」的命令）。
 
 ### 4.3 安裝方式的偵測
 
@@ -457,7 +498,20 @@ stateDiagram-v2
 | msi | `msiexec /i <目前版本.msi>`（需要 wxs 允許降版，第 4.4.4 節） | 同上 |
 | zip | `pulse.exe.prev` 改名回來 | 無 |
 
-Kairos 建立推送時，對 deb／rpm／msi 主機檢查版本庫是否有「主機目前版本」的同格式檔案；沒有的主機在預覽中列為「無法自動回滾」，推送預設**排除**它們（建立時可勾選「允許無法自動回滾的主機」，L2）。主控台建議匯入新版時一併匯入目前部署中的版本。
+Kairos 建立推送時，對 deb／rpm／msi 主機檢查版本庫是否有「主機目前版本」的同格式檔案；沒有的主機在預覽中列為「無法自動回滾」，推送預設**排除**它們（建立時可勾選「允許無法自動回滾的主機」，L2）。主控台建議匯入新版時一併匯入目前部署中的版本。0.11.0 之後的版本：宣告 `install.rollback = "archived"` 的主機不依賴版本庫，不列為「無法自動回滾」（第 4.7.2 節）；「無法自動回滾」的主機照樣會以 `pulse.prev` 回到舊版，只是結果是降級回滾（第 4.5.2 節）。
+
+**deb／rpm 回滾來源的順序與資格**（0.11.0 之後的版本；ADR-0003 第 5.4 節。0.11.0 以前只有第 2 項與第 4 項，而且不檢查 commit 與執行檔）。輔助程式（root）在**替換之前**依序評估，每個來源都要**全部**符合列出的資格才使用；不符合就評估下一個，**不回頭使用已判定不合格的來源，也不放寬任何資格**。「更保守」指以 root 執行的新內容更少（重跑維護指令碼 → 只換回執行檔），且只依賴更早、更直接由輔助程式自己建立的紀錄：
+
+| 順序 | 來源 | 資格 | 不符合時 |
+|---|---|---|---|
+| 1 | root 的本機封存（`/var/lib/pulse-upgrade/archive/`，第 17.10 節） | 封存索引可用（checksum、路徑檢查）；有一筆**已提交**的條目，版本與 commit 是輔助程式自己的（`CARGO_PKG_VERSION`、`PULSE_BUILD_COMMIT`，前綴比對）；條目記錄的執行檔雜湊＝目前安裝的執行檔；封存的套件整包 SHA-256＝條目的主鍵；簽署金鑰仍列在信任錨中（到期可以，撤銷不行） | 評估 2（索引或套件損毀：`rollback_archive_unusable`；執行檔不同：`rollback_binary_mismatch`；撤銷：`rollback_signer_revoked`；沒有這個版本的條目不算不合格） |
+| 2、3 | 服務帳號暫存的回滾檔（提議的 `rollback_artifact`），簽章資料來自本機紀錄 `releases/<目前版本>/`（2）或提議的 `rollback_bundle`（3）。Pulse 先看本機紀錄、再看 bundle，把通過它自己驗證的那一份暫存成 `rollback.SHA256SUMS(.sig)`；**對輔助程式兩者都只是提示，以同一套規則重新驗證** | 它所屬發佈的 `SHA256SUMS` 以本機信任錨**完整**驗證（含 `valid-after`／`valid-before`），回滾檔列在其中、雜湊相符、平台與格式相符，版本是輔助程式自己的版本（不是請求中的值）；檔名的 commit 與輔助程式自己的 commit 相同（前綴比對；輔助程式不是正式的建置、commit 不是合法的縮寫時一律不符）；**套件中的 `/opt/pulse/pulse` 與目前安裝的執行檔位元組相同**（在 root 的工作目錄解開套件比對，方案 A2） | 評估 4（`rollback_not_verified`、`rollback_commit_mismatch`、`rollback_binary_mismatch`；沒有回滾檔：`no_rollback_package`） |
+| 4 | `pulse.prev`（替換前由輔助程式保留的執行檔） | 存在，雜湊等於交易紀錄的 `old_binary_sha256` | `rollback_failed`（`PLS-E8408`） |
+
+- 通過的回滾套件複製到工作目錄的 `rollback.pkg`，檔名、整包雜湊、簽署者指紋與來源（`archive`／`hint`）記在交易紀錄的 `rollback`（綁定欄位）；之後的接續與回滾只用這一份，以雜湊確認沒有變。沒有通過時，原因記在 `rollback_declined`。
+- **回滾當下**（健康確認失敗）再做兩項檢查：回滾套件的簽署金鑰是否已被撤銷（第 4.2.3 節；撤銷 → 第 4 項），以及 `rollback.pkg` 的雜湊。套件管理員的命令失敗（含交易部分完成）或複本不符時**先以 `pulse.prev` 緊急復原**（第 4 項），不是直接 `rollback_failed`。
+- 以第 4 項回滾的 deb／rpm 是**降級回滾**（第 4.5.2 節）：服務恢復，但套件資料庫與實際的執行檔不一致。
+- Kairos 能影響的只有：要不要附回滾檔與 `rollback_bundle`，以及在「同版本、同平台、同 commit、官方簽署、執行檔相同」的多份封裝之間選哪一份（被選中的封裝的維護指令碼與 unit 會以 root 執行或寫入）。發佈政策以「同一個版本號只發佈一份 `SHA256SUMS`」收斂這個殘餘風險（`RELEASING.md`；Kairos 的版本庫也拒絕同一版本匯入不同的 `SHA256SUMS`）；本機封存綁定的是這台主機實際安裝過的那一份，優先於它。
 
 #### 4.4.3 健康確認期間的重新開機
 
@@ -494,11 +548,23 @@ Kairos 建立推送時，對 deb／rpm／msi 主機檢查版本庫是否有「�
 
 - 期限內不符合，或服務以結束代碼 2／3／4 停止（設定、憑證錯誤；systemd 不會重啟），或 1 分鐘內崩潰 3 次以上 → 回滾（第 4.4.2 節），以同樣的條件、`max(health_timeout_secs, 300)` 的期限確認舊版恢復。
 - 回滾成功：`rolled_back`（`PLS-W8407`）。回滾後也不健康：`rollback_failed`（`PLS-E8408`，ERROR，同時寫 stderr／journal），**不再嘗試任何動作**，保留所有暫存與紀錄，由現場人工處理；Kairos 依 Pulse 是否還連得上，以 `upgrade_status` 或「推送中的主機超過期限未回報」（第 4.7.4 節）得知。
+- **套件回滾失敗先以 `pulse.prev` 緊急復原**（0.11.0 之後的版本；先前是直接 `rollback_failed`）：deb／rpm 經套件管理員裝回舊版的命令失敗（失敗版本的 `prerm` 失敗、舊版的 `postinst` 失敗、解包中斷等，交易可能只完成一部分），或驗證過的 `rollback.pkg` 在回滾時與紀錄的雜湊不符時，輔助程式先把改變後的意圖（`via: binary` 與原因）寫進交易紀錄，再換回 `pulse.prev`、重新啟動並確認舊版恢復。`pulse.prev` 也不能用（不存在，或雜湊與紀錄不符）才是 `rollback_failed`。輔助程式**只回報、不自動修復套件資料庫**（不執行 `dpkg --configure -a` 之類的命令）。
+- **降級回滾**（0.11.0 之後的版本；ADR-0003 第 5.4 節）：deb／rpm 主機因健康確認失敗而回滾、卻只換回了執行檔——沒有合格的回滾套件（第 4.4.2 節）、回滾套件的簽署金鑰已撤銷，或套件回滾失敗。服務已恢復到舊版，但套件資料庫（`dpkg -l`／`rpm -q`）仍顯示失敗的版本（或停在半安裝），套件的其他檔案（unit、文件）也還是新版的。它不再被回報成一般的回滾：
+  - `upgrade_status`：`state` 仍是 `rolled_back`，`code` 為 `PLS-W8418`〔暫定號〕，`detail` 以 `degraded:<原因>,…` 開頭（第 2.4.3 節）；套件資料庫的狀態與交易前不同時 `detail` 另附 `package_db_shows_<狀態>`（沒有回滾套件時是既有的 `binary_restored_package_db_shows_<版本>`）。
+  - Kairos：稽核事件 `host.upgrade.rolled_back_degraded`（`KRS-W8418`〔暫定號〕）、**推送自動暫停**（`pause_cause` 為 `rollback_degraded`，第 4.7.4 節；系統規則「升級推送已暫停」開告警）；推送的主機列帶 `degraded`（原因的陣列）；主機標示「需要修復套件」（主機的升級 API 的 `package_repair_needed`：Pulse 宣告 `install.rollback = "degraded"`，或沒有宣告而最近一次已結束的升級是降級回滾）。
+  - Pulse：`pulse upgrade status` 顯示「需要修復套件」與修復方式，`pulse status` 的「升級」列為警告（結束代碼非 0）直到修復；hello 的 `install.rollback` 為 `degraded`。
+  - **修復**：在主機上重新安裝目前版本的套件（`dpkg -i <套件>`／`rpm -U --replacepkgs --oldpackage <套件>`；`pulse.toml`、身分與狀態不受影響），或推送一次成功的升級（升級經套件管理員安裝，成功後資料庫恢復一致）。修復後 Pulse 下一次連線不再回報 `degraded`。
+  - tar 安裝沒有套件資料庫，換回 `pulse.prev`（與 unit）就是完整的回滾，不會是降級回滾。替換無法完成而還原的情況（`failed`，第 17.9.3 節）照舊。
 - 注意健康條件包含「連上 Kairos」：替換期間若 Kairos 剛好停機或網路中斷，會造成不必要的回滾。這是刻意的保守選擇（寧可回滾）；推送引擎只在主機連線中時提議，且 Kairos 停機時推送自動暫停（第 4.7.4 節），實際發生的機會很小。
 
 #### 4.5.3 沒有回滾檔時
 
-deb／rpm／msi 的提議沒有 `rollback_artifact`（推送勾選了「允許無法自動回滾的主機」）時，Pulse 照常升級，健康確認失敗時回報 `failed`（`PLS-E8406`，`detail: no_rollback_artifact`），不做任何回復動作。
+deb／rpm 的提議沒有 `rollback_artifact`（推送勾選了「允許無法自動回滾的主機」），或回滾檔沒有通過輔助程式的驗證時，Pulse 照常升級；健康確認失敗時輔助程式**換回替換前保留的 `pulse.prev`**、重新啟動並確認舊版恢復。主機上有合格的本機封存時（第 17.10 節）仍經套件管理員回滾。
+
+- 0.9.0～0.11.0：結果是 `rolled_back`（`PLS-W8407`），`detail` 附 `binary_restored_package_db_shows_<目標版本>`（套件資料庫仍顯示失敗的版本）。
+- 0.11.0 之後的版本：結果是**降級回滾**（第 4.5.2 節：`rolled_back`、`PLS-W8418`〔暫定號〕、`detail` 以 `degraded:no_rollback_package,package_db_inconsistent` 等開頭）。
+
+〔本節原本的設計是「回報 `failed`（`PLS-E8406`，`no_rollback_artifact`），不做任何回復動作」；實作從 0.9.0 起就一律保留並換回 `pulse.prev`（第 17.3 節第 1 項）。ADR-0003 核定後把規格改成實際的行為。msi 尚未實作（第 18 節）〕
 
 ### 4.6 Pulse 端狀態機（遠端升級）
 
@@ -564,6 +630,12 @@ stateDiagram-v2
   - **未知**（0.10.0 以上而沒有宣告：0.10.0、0.10.1 的 Pulse，或不認得的值）與宣告 `allowlist` 的主機**照舊算可升級**（現行行為不變）；其中不允許這個 URL 的主機在推送中回報 `declined`（`PLS-W8411`、`url_not_allowed`），不計入失敗比例。預覽的 `external_url`（`base_url`、`undeclared`：可升級主機中沒有宣告的台數、`allowlist`：宣告有白名單的台數）讓主控台註明「其中 N 台尚未宣告，可能在推送中拒絕」。
   - 與 0.10.0、0.10.1 的 Kairos 的差異：那兩版把 0.9 的 Pulse 也算可升級（在推送中 `declined`）；現在 0.9 的 Pulse 在預覽與送出時就是 `skipped`（`url_not_supported`），結果相同（都不會升級），只是事先看得到。
   - 判斷的位置在平台與發佈檔的檢查之後、降版與 `min_upgrade_from` 之前（先版本、再宣告）；`install.upgrade` 不是 `ready` 的主機先依那個原因分類。目標版本由 Kairos 代管時不看 `external_url`（提議不含外部 URL：回滾檔來自外部 URL 的版本時本來就不附，第 13.1 節）。
+- **「無法自動回滾」的口徑**（0.11.0 之後的版本；ADR-0003、ADR-0002 留的接點）。deb／rpm 主機健康確認失敗時預期的回滾方式，由 Kairos 依版本庫與主機的宣告（第 2.1 節的 `install.rollback`）分成三種，預覽的 `rollback` 回報台數：
+  - `archive`：主機宣告 `install.rollback = "archived"`（目前版本的套件在本機封存中）。回滾不依賴版本庫，**即使版本庫沒有主機目前的版本也不是 `no_rollback`**；版本庫有的話提議照樣附回滾檔與 bundle（提示；輔助程式優先用封存）。
+  - `repository`：沒有宣告封存、版本庫有主機目前版本的同格式檔案：提議附回滾檔與 `rollback_bundle`。0.11.0 之後的 Pulse 第一次遠端升級也能經套件管理員回滾；**較舊的 Pulse 忽略 bundle，只有本機有紀錄時才使用回滾檔**——所以這一類對舊 Pulse 是「可能」而不是「一定」（與 0.11.0 以前的 `no_rollback` 口徑相同）。
+  - `binary_only`：兩者都沒有。這就是 `no_rollback`（預設排除；勾選「允許無法自動回滾的主機」後照常升級，失敗時以 `pulse.prev` 回到舊版，結果是降級回滾）。`no_rollback` 的數字與 `rollback.binary_only` 相同；確認字串「無法自動回滾 N 台」用的是它。
+  - `degraded_hosts`：可升級的主機中宣告 `install.rollback = "degraded"`（需要修復套件）的台數。它們照樣可以升級——升級經套件管理員安裝，成功後套件資料庫恢復一致。
+  - 這些是 Kairos 的**預期**：實際用哪一個來源由主機上的輔助程式驗證後決定（第 4.4.2 節），Kairos 不選擇。宣告的其他值（`binary_only`、`none`、不認得的值）與沒有宣告相同。提議時回滾檔在版本庫中遺失：宣告 `archived` 的主機照常提議（不附回滾檔），其餘照舊（允許無法自動回滾才提議）。
 - 批次中的順序：先 `canary_agent_ids`，其餘依 `SHA-256(rollout_id ‖ agent_id)` 排序（同一個推送每次計算結果相同，不偏向某個群組）。
 - 推送進行中新註冊、或之後才符合選擇器的主機**不加入**（推送的對象在開始時固定）；要涵蓋它們請另建推送。
 
@@ -585,6 +657,8 @@ stateDiagram-v2
 3. 任何一台回報簽章失敗（`PLS-E8401`）：可能是版本庫被竄改，**整個推送暫停**，且同一版本的其他推送也暫停。
 4. 一台主機在 `applying` 之後超過 `health_timeout_secs + 30 分鐘` 沒有回報且離線（可能卡在替換中）：該主機標為 `unknown`，計入失敗。
 5. Kairos 重新啟動：推送維持原狀態，但在第一次心跳統計前（1 分鐘）不提議新的主機。
+6. 任何一台回報**降級回滾**（0.11.0 之後的版本；`rolled_back` 而 `detail` 以 `degraded:` 開頭，第 4.5.2 節）：`pause_cause` 為 `rollback_degraded`，`pause_reason` 列出主機與原因。主機的服務已恢復，但套件資料庫不一致、需要人處理；同一個推送的其他主機很可能遇到同樣的情況（例如版本庫沒有目前的版本），所以先停下來。嚴重度：警告。一般的 `rolled_back` 照舊只計入失敗比例。
+7. `upgrade_offer` 省略 `rollback_bundle` 後仍超過單行上限而沒有送出（第 2.4.1 節）：`pause_cause` 為 `offer_too_large`。同一個版本的其他主機會遇到同樣的問題。嚴重度：警告。
 
 恢復（`resume`）時重新檢查時段與資格。
 
@@ -630,7 +704,8 @@ stateDiagram-v2
 
 ### 4.8 降版政策
 
-- **自動回滾**是本機的動作（回到替換前的版本），不受下列限制。
+- **自動回滾**是本機的動作（回到替換前的版本），不受下列限制。它不受降版政策限制，**正因為**目標由輔助程式自己決定、只能是替換前實際執行的版本（ADR-0003 的 INV-1、INV-9）：目標的版本與 commit 是輔助程式第一次執行時自己的 `CARGO_PKG_VERSION` 與 `PULSE_BUILD_COMMIT`，記在 root 的交易紀錄；回滾套件必須是那個版本、那個 commit、執行檔位元組相同（第 4.4.2 節），`pulse.prev` 必須等於紀錄的替換前執行檔。`request.json`、提議的 `rollback_artifact`／`rollback_bundle`、本機紀錄都不能把目標改成別的版本——「回到其他任何版本」一律是下面的遠端降版。
+- **本機管理者的手動回滾**（`pulse upgrade rollback`、手動安裝套件）是本機管理者的動作，不受遠端降版政策限制。
 - **遠端降版**（目標版本低於主機目前版本）需要同時符合：推送 `allow_downgrade: true`（需要 `rollouts:write` 與 L3 確認「降版 N 台」＋重新驗證）、主機本機 `upgrade.allow_downgrade = true`（預設 `false`）。不符時 `declined`（`PLS-W8410`）。
 - 理由：被入侵的 Kairos 可以挑一個有已知漏洞的舊版官方發佈推給所有主機；本機預設拒絕降版就能擋住這種攻擊。代價是「整批回到上一版」預設做不到，建議的處理方式是**發佈修正的 PATCH 版本**再推送（第 14 節 D6）。
 - 目標版本低於清單的 `min_upgrade_from` 規則不適用於降版；降到沒有 `upgrade` feature 的版本（0.8 以前）時主控台另外要求確認「之後無法再遠端管理」。
@@ -662,6 +737,9 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | Kairos 被入侵，下發設定破壞監控或洩漏資料 | 白名單（第 3.1 節）不含連線、信任、路徑、對外送出；隱私敏感的鍵只能更保守；本機設定優先；可本機停用 |
 | Kairos 被入侵，把 agent 當成對內網發出請求的工具 | 外部 URL 需要本機白名單（預設空）；從 Kairos 下載只走既有的 mTLS 連線。**白名單的內容不回報給 Kairos**：hello 的 `install.external_url` 只有「空的／有內容」一個位元（第 2.1 節），被入侵的 Kairos 無法從中得知對某台主機可用的外連目標，仍然要盲猜 |
 | `pulse` 帳號被入侵，藉輔助程式提權 | 輔助程式只執行固定的動作、只接受信任錨驗證的發佈包、對複本操作、拒絕連結、不讀 Pulse 可寫的設定、不連網路（第 4.4.1 節）；最多能觸發「安裝某個官方版本」，且同樣受降版政策限制。**`request.json` 的每個欄位都不可信**：目標版本以輔助程式自己的版本（＝目前安裝的版本）套用降版政策；**回滾檔的版本也以輔助程式自己的版本為準**，不採用 `request.json` 的 `from_version`——第一次執行時 `from_version` 與輔助程式的版本不符就拒絕（`PLS-E8402`，`from_version_mismatch`，什麼都不改），安裝方式同樣由輔助程式自己偵測（`method` 不符就拒絕）；替換前把版本、安裝方式、目標與驗證過的回滾檔名寫進 root 專用的 `state.json`，重新開機後接續時（執行檔已是新版）只以 `state.json` 為準，不再採用 `request.json` 的這些欄位（0.10.0 的安全性修正，第 17.8 節；0.9.0 採用請求中的值，可被用來繞過降版政策） |
+| Kairos 被入侵，藉回滾檔影響主機（0.11.0 之後的版本；ADR-0003） | 回滾的目標由輔助程式自己決定（替換前實際執行的版本與 commit，INV-1），回滾後執行的代理程式必須與替換前的位元組相同（INV-2）；Kairos 提供的回滾檔與 `rollback_bundle` 只是提示，由輔助程式在替換前以本機信任錨完整驗證並綁定（INV-3、INV-4），不合格就往更保守的來源退、不放寬（INV-5）。**殘餘**：在「同版本、同平台、同 commit、官方簽署、執行檔相同」的多份封裝之間選一份（維護指令碼與 unit 不同）；以「同一版本只發佈一份 `SHA256SUMS`」的發佈政策與本機封存（綁定這台主機實際安裝過的那一份，優先於提示）收斂。Kairos 也可以不附回滾檔，使回滾變成降級回滾（可用性與套件資料庫一致性，不是完整性）：會暫停推送並標示主機 |
+| `pulse` 帳號被入侵，竄改回滾的提示（0.11.0 之後的版本） | 本機紀錄 `releases/`、暫存的回滾檔與簽章資料、`request.json`、`rollback.json` 都在服務帳號可寫的位置，對輔助程式只是提示（INV-6、INV-11）：信任的紀錄（交易紀錄、指標、封存與封存索引）只在 root 專屬的 `/var/lib/pulse-upgrade/`，耐久寫入、路徑檢查。竄改提示最多讓套件層級的回滾不可用（退到 `pulse.prev`，降級回滾）或讓 hello 的 `install.rollback` 不正確（只影響顯示與資格預覽） |
+| 發佈金鑰撤銷之後，仍以 root 執行該金鑰簽的程式碼（0.11.0 之後的版本） | 撤銷＝從 `allowed_signers` 刪除那一行（第 4.2.3 節）。之後新的目標與還沒驗證過的回滾檔都驗不過；已綁定的回滾套件（含本機封存）在選用時與回滾當下各檢查一次簽署者是否仍列在信任錨，撤銷時不重跑它的維護指令碼，改換回 `pulse.prev`（INV-7）。自然到期不影響已綁定的回滾目標 |
 | 傳輸中被竄改 | 簽章與雜湊；8443 本來就是 mTLS |
 | 冒用其他主機取得提議 | 提議只經該主機的 mTLS 連線送出；發佈包本身不是秘密 |
 | 權限過大的操作員一次推送全部主機 | RBAC（第 5.2 節）、分批與自動暫停、選用的雙人覆核（第 5.4 節）、L2／L3 確認、稽核 |
@@ -695,7 +773,7 @@ Kairos 仍依 `kairos/packaging/INSTALL.md` 手動升級（備份資料庫、替
 | `config` | `config.profile.create`／`update`（變更前後的鍵與值）／`delete`／`revert`、`config.assign`、`config.unassign`、`config.assign_expired`（`system`） |
 | `release` | `release.import`（版本、檔案、簽署金鑰指紋）、`release.import_failed`（`KRS-E8413`）、`release.delete` |
 | `rollout` | `rollout.create`、`rollout.update`、`rollout.submit`、`rollout.approve`、`rollout.reject`、`rollout.start`、`rollout.pause`、`rollout.auto_pause`（`system`，原因）、`rollout.resume`、`rollout.cancel`、`rollout.complete`（各狀態的台數） |
-| `host` | `host.upgrade.signature_failed`（`PLS-E8401`，主機、檔案）、`host.upgrade.rollback_failed`、`host.upgrade.rolled_back` |
+| `host` | `host.upgrade.signature_failed`（`PLS-E8401`，主機、檔案）、`host.upgrade.rollback_failed`、`host.upgrade.rolled_back`；0.11.0 之後的版本：`host.upgrade.rolled_back_degraded`（降級回滾，`KRS-W8418`〔暫定號〕；`details` 的 `detail` 含 `degraded:` 與原因，取代同一次回滾的 `host.upgrade.rolled_back`）、`host.upgrade.offer_too_large`（`KRS-W8419`〔暫定號〕；`details` 有 `line_bytes`、`max_line_bytes`，第 2.4.1 節） |
 | `settings` | `settings.rollout_approval.baseline`、`settings.rollout_approval.change`（0.10.0；`system`，啟動時與資料庫的前值比對，對象 `remote.rollout_approval`；第 5.4 節） |
 
 - 0.10.0（ADR-0002）：`rollout.submit` 的 `details` 另有 `digest`；`rollout.approve` 的 `details` 有 `digest`、`eligible`、`downgrade`、`confirm_level`、`reason`，以及原本的送審資訊（`created_by`、`submitted_by`、`submitted_at`）。
@@ -1083,7 +1161,12 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 8416 | `KRS-I8416` | `PLS-I8416` | 鏡像 | 升級完成 |
 | 8417 | `KRS-W8417` | | | 版本庫的檔案遺失：已存入的發佈檔不存在或大小與記錄不符（系統健康的「遠端管理」、S25、資格分類 `artifact_missing`、核准時的 409 `artifact_missing`、推送中等待檔案的主機；0.10.0）。ADR-0002 決策點 7／U10（2026-11-13 核定）：照工程的號碼採用——子類別 84、只有 Kairos 端、不鏡像，「不存在」與「大小不符」同號；設計包的總表與三段式尚未收錄（主控台暫用 `error-codes-local.js`） |
 
+| 8418 | `KRS-W8418` | `PLS-W8418` | 鏡像 | **暫定號**（ADR-0003 階段 1；正式分配由設計包負責）。降級回滾：健康確認失敗後服務已恢復到舊版，但 deb／rpm 只換回了執行檔（沒有合格的回滾套件、套件回滾失敗，或回滾套件的簽署金鑰已撤銷），套件資料庫與實際的執行檔不一致，需要重新安裝目前版本的套件。`upgrade_status.state` 仍是 `rolled_back`，`detail` 以 `degraded:` 開頭（第 2.4.3、4.5.2 節）。與一般的回滾（8407）分開，是因為處理方式不同：8407 不需要處理主機，8418 需要修復套件 |
+| 8419 | `KRS-W8419` | | | **暫定號**（ADR-0003 階段 1）。`upgrade_offer` 省略 `rollback_bundle` 後仍超過協定的單行上限，沒有送出（第 2.4.1 節）；推送中的主機 `failed`（`reason` 為 `offer_too_large`），推送自動暫停。只有 Kairos 端、不鏡像 |
+
 協定錯誤碼與產品代碼的對照（`copywriting.md` §3.4）：`upgrade_unavailable` → 不對應（Pulse 就地處理，記 `DEBUG`）；`rate_limited`（下載）→ 不對應（排隊，不是錯誤）。
+
+降級回滾的原因、資格分類與暫停的原因代碼（都是資料，不是產品代碼；主控台不認得時原樣顯示）：`upgrade_status.detail` 的 `degraded:` 原因見第 2.4.3 節；推送中主機的 `reason` 新增 `offer_too_large`、`rollback_bundle_omitted`；推送的 `pause_cause` 新增 `rollback_degraded`、`offer_too_large`；稽核動作新增 `host.upgrade.rolled_back_degraded`、`host.upgrade.offer_too_large`。
 
 ## 12. 測試策略
 
@@ -1093,6 +1176,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 - Kairos：指派合併與衝突偵測、`desired_rev` 只對雜湊改變的主機更新、到期的指派；推送引擎的狀態轉換（以假的時鐘：批次、觀察期、時段跨午夜與時區、失敗比例、自動暫停的每個條件、離線寬限、重疊）；資格分類；版本庫匯入與 `release_in_use`。
 - Pulse：合併順序（預設 < 遠端 < 檔案 < 環境變數、`interface_exclude` 聯集、隱私鍵只取保守值）、驗證失敗整份拒絕、即時與重新連線的套用、確認期與崩潰保護、快取損毀；升級狀態機（以假的輔助程式）、續傳、空間不足、降版政策、URL 白名單；安裝方式偵測。
 - 輔助程式：以暫存目錄模擬 `/opt/pulse` 與 `/var/lib/pulse`：符號連結、硬連結、超大檔案、驗證後換檔（TOCTOU）、`allowed_signers` 權限過寬、unit 是否替換的判斷、重新開機後接續。0.10.0 另有交易紀錄的故障注入矩陣（第 17.9.4 節的每一個當機點 × 安裝方式 × 新版健康／崩潰）、紀錄與指標損毀或遺失、舊格式、路徑檢查與保留上限（`helper/fault_tests.rs`，第 17.9.10 節）。
+
+- 0.11.0 之後的版本（ADR-0003 階段 1、2；第 9.4 節的情境）：`kairos-proto` 的 `rollback_bundle` 測試向量（真實簽章）、凍結的舊型別（0.9～0.11.0 的 Pulse 忽略 bundle、0.11.0 的 Kairos 忽略 `install.rollback`）、單行大小三段式規則的每一個分支（含需要大量 JSON 跳脫的輸入與邊界）、`degraded:` 的解析；Kairos 的提議（附 bundle、省略、不送出並暫停）、降級回滾的暫停與稽核、資格分類的 `rollback`；Pulse 的來源順序（本機紀錄 → bundle）與舊狀態檔；輔助程式的 A2（commit、執行檔、版本、簽章、到期）、套件回滾失敗的降級（含部分完成與中斷後接續）、撤銷與到期（回滾當下）、本機封存（封存、選用、損毀與缺失、清理、撤銷、當機點第 23、24 列）。ADR-0003 的 INV-1～INV-11 與測試的對照在第 17.10.9 節。
 
 ### 12.2 端對端測試（`tests/e2e`，必須真的升級並回滾一個 Pulse 執行檔）
 
@@ -1333,7 +1418,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 | # | 規格 | 實作 | 理由 |
 |---|---|---|---|
-| 1 | 第 4.4.2 節：deb／rpm 以提議的 `rollback_artifact` 回滾 | 回滾檔沒有簽章可驗證（`SHA256SUMS` 屬於另一次發佈，提議中沒有）。Pulse 只在本機保存過**它所屬發佈的、驗證過的** `SHA256SUMS`（`<狀態目錄>/upgrade/releases/<版本>/`，每次驗證通過的發佈都會保存，只留目前與目標版本）時才下載並交給輔助程式，輔助程式以信任錨重新驗證後才 `dpkg -i`／`rpm -U --oldpackage`；否則改以替換前保留的 `pulse.prev` 回復執行檔，`detail` 附 `binary_restored_package_db_shows_<版本>` | 否則被入侵的 Kairos 可以讓健康確認失敗（不 `ack` report），讓主機以 root 安裝它提供的任意套件，違反第 1 節原則 2。代價：從 0.9.0 手動安裝後的第一次遠端升級沒有可用的回滾檔（之後的升級就有）；建議 0.10.0 在 `upgrade_offer` 加入選用的 `rollback_bundle`（回滾檔所屬發佈的 `sha256sums`、`signature`），見第 17.5 節 |
+| 1 | 第 4.4.2 節：deb／rpm 以提議的 `rollback_artifact` 回滾 | 回滾檔沒有簽章可驗證（`SHA256SUMS` 屬於另一次發佈，提議中沒有）。Pulse 只在本機保存過**它所屬發佈的、驗證過的** `SHA256SUMS`（`<狀態目錄>/upgrade/releases/<版本>/`，每次驗證通過的發佈都會保存，只留目前與目標版本）時才下載並交給輔助程式，輔助程式以信任錨重新驗證後才 `dpkg -i`／`rpm -U --oldpackage`；否則改以替換前保留的 `pulse.prev` 回復執行檔，`detail` 附 `binary_restored_package_db_shows_<版本>` | 否則被入侵的 Kairos 可以讓健康確認失敗（不 `ack` report），讓主機以 root 安裝它提供的任意套件，違反第 1 節原則 2。代價：從 0.9.0 手動安裝後的第一次遠端升級沒有可用的回滾檔（之後的升級就有）；建議 0.10.0 在 `upgrade_offer` 加入選用的 `rollback_bundle`（回滾檔所屬發佈的 `sha256sums`、`signature`），見第 17.5 節。**0.11.0 之後的版本已依 ADR-0003 處理**：`rollback_bundle`、安裝時的種子與本機封存讓第一次遠端升級也能經套件管理員回滾（第 4.4.2 節）；規格的第 4.5.3 節已改成實際的行為；只換回 `pulse.prev` 的結果改為降級回滾（第 4.5.2 節） |
 | 2 | 第 4.1.2 節：外部 URL（`source: "url"`）以本機白名單下載 | 0.9.0 一律 `declined`（`PLS-W8411`、`detail: url_not_allowed`）。**0.10.0 起提供**（`remote/upgrade/fetch.rs`、第 17.7 節）：一律不跟隨重新導向（規格只禁止跨主機的） | D15；重新導向一律不跟隨比較單純，也不會被導向白名單以外的位址 |
 | 3 | 第 4.4.1 節：`TimeoutStartSec` 為健康確認上限加 15 分鐘 | 2.5 小時 | 17.2 #14 |
 | 4 | 第 5.5 節：外部程式只有 `systemctl`、`dpkg`、`rpm`、`msiexec`、`sc` | 另有預檢用的 `tar`、`dpkg-deb`、`rpm2cpio`、`cpio`（固定路徑、參數由程式組成） | 第 4.4.1 節步驟 4 的預檢需要解開發佈檔 |
@@ -1353,9 +1438,9 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 ### 17.5 待決（附建議）
 
-1. **回滾檔的信任**（17.3 #1）：建議 0.10.0 在 `upgrade_offer` 加選用欄位 `rollback_bundle: {sha256sums, signature}`（Kairos 版本庫有該版本時附上；舊版 Pulse 忽略），Pulse 與輔助程式以信任錨驗證後即可使用，第一次遠端升級也能以套件回滾。
+1. ~~**回滾檔的信任**（17.3 #1）~~：**已決定並實作**（ADR-0003，使用者 2026-11-13 核定；0.11.0 之後的版本）。`upgrade_offer` 的 `rollback_bundle`（第 2.4.1 節）、輔助程式的來源順序與 A2 綁定（第 4.4.2 節）、root 的本機封存（第 17.10 節）。原本的建議：0.10.0 在 `upgrade_offer` 加選用欄位 `rollback_bundle: {sha256sums, signature}`（Kairos 版本庫有該版本時附上；舊版 Pulse 忽略），Pulse 與輔助程式以信任錨驗證後即可使用，第一次遠端升級也能以套件回滾。
 2. ~~**系統層驗證**（第 12.3 節）~~：已完成（2026-10-21，`tests/systemd/`，結果見第 12.3 節與第 17.6 節）。建議發佈前與修改遠端升級、打包、unit 時在 kp-build 重跑一次 `sh tests/systemd/run.sh`。
-3. **套件資料庫與執行檔不一致**（17.3 #1 的代價，第 12.3 節 b0 實測）：第一次遠端升級失敗而以 `pulse.prev` 回復的 deb／rpm 主機，`dpkg -l`／`rpm -q` 顯示失敗的版本，直到下一次成功的遠端升級或手動重新安裝。0.10.0 的 `rollback_bundle`（第 1 項）可以消除；在那之前主控台的主機詳情可依 `detail` 的 `binary_restored_package_db_shows_<版本>` 提示。
+3. ~~**套件資料庫與執行檔不一致**~~：**已處理**（ADR-0003；0.11.0 之後的版本）。第一次遠端升級的主機可以用 `rollback_bundle` 或安裝時的種子（`pulse-install.sh` 寫入的本機紀錄與本機封存）經套件管理員回滾；仍然只換回執行檔時不再回報成一般的回滾，而是降級回滾（第 4.5.2 節：另一個代碼、`degraded:`、推送暫停、主機標示「需要修復套件」、Pulse 的 `install.rollback = "degraded"`）。原本的說明（17.3 #1 的代價，第 12.3 節 b0 實測）：第一次遠端升級失敗而以 `pulse.prev` 回復的 deb／rpm 主機，`dpkg -l`／`rpm -q` 顯示失敗的版本，直到下一次成功的遠端升級或手動重新安裝。0.10.0 的 `rollback_bundle`（第 1 項）可以消除；在那之前主控台的主機詳情可依 `detail` 的 `binary_restored_package_db_shows_<版本>` 提示。
 4. **外部 URL 是否落在主機的白名單內**（第 2.1 節「`external_url` 的設計」）：目前 Pulse 只宣告白名單是不是空的，宣告 `allowlist` 而白名單不含這個 `base_url` 的主機仍要到推送中才回報 `declined`。不建議回報白名單或它的雜湊（被入侵的 Kairos 會得知或可以列舉每台主機可用的外連目標）。若日後需要更精確的預覽，建議改成**由 Pulse 回答**：Kairos 在 `pending` 帶出版本庫中外部版本的 `base_url`（至多數個），Pulse 只回答每一個「允許／不允許」，並限制詢問的頻率與每條連線的次數——這仍然是一個神諭，只是有速率上限而且留下紀錄，是否值得要看實際的落差有多常見。建議先觀察 `declined`（`url_not_allowed`）在宣告 `allowlist` 的主機中出現的比例再決定。**使用者 2026-11-14 同意：不回報白名單的內容，先觀察**；這一項維持開放，等有實際的數字再評估。
 5. ~~**`url_not_supported`**（ADR-0002 決策點 5c）~~：**已決定並實作**（使用者 2026-11-14）。外部 URL 的版本對低於 0.10.0 的 Pulse 事先分類為 `url_not_supported`（「Pulse 版本不支援外部 URL（需要 0.10 以上）」），規則見第 4.7.2 節。
 
@@ -1415,7 +1500,7 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 
 **測試**：單元測試 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`、`method_and_target_come_from_the_helper_and_the_recorded_state`、`the_state_file_fails_closed`、`a_crash_between_replacing_and_recording_it_keeps_the_old_backup`、`an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrade`、`a_verified_transaction_keeps_its_recorded_target`（`helper/tests.rs`）；系統層另有情境 `tamper-resume`（f）：回滾確認期間以服務帳號改寫 `request.json` 的 `upgrade_id` 後重新開機；系統層 `tests/systemd/run.sh` 的情境 `tamper`（e）在 Debian 12（deb）與 Rocky 9（rpm）以服務帳號實際寫入竄改的 `request.json`。2026-11-12 在 kp-build 以修正後的程式實跑全部情境（b0、a、b、c、c2、d、e；目標版本由 0.10.0 推導為 0.10.1-test.N）：144 項通過、0 失敗——包含重新開機接續的 c、c2（接續時改用 `state.json` 的內容），以及 e 在兩台主機上的結果 `PLS-E8402 from_version_mismatch: request says 0.10.0, installed version is 0.10.1-test.3`、版本與套件資料庫不變。沒有在修正前的程式上實跑情境 e（修正前的行為由讀程式與單元測試的對照推得）。
 
-**這次沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。回滾檔所屬發佈的信任方式（目前是 Pulse 保存的 `SHA256SUMS` 紀錄，由輔助程式以信任錨重新驗證簽章）也由 ADR-0003 處理。ADR-0003 列的其餘補強這次同樣沒有做：交易紀錄的完整 schema 與 checksum、明確的「替換中」步驟（目前 `verified` 涵蓋「尚未替換」與「替換途中」，接續時重新驗證後再替換一次；此時重新驗證失敗會以 `failed` 結束而不回滾）、故障注入的測試矩陣、既存工作目錄的擁有者與權限檢查、工作目錄數量的上限。**〔後續〕這一段列的「其餘補強」已由第 17.9 節（ADR-0003 階段 0b）完成**；套件回滾失敗的降級狀態與回滾檔所屬發佈的信任方式仍屬 ADR-0003 階段 1，沒有改。本節描述的 `state.json` 是 0.10.0 開發期間的 v1 加欄位版本（未曾發佈），發佈的 0.10.0 使用第 17.9.2 節的 v2。
+**ADR-0003 階段 1、2 之後**（0.11.0 之後的版本）：下面兩項都已處理——套件回滾失敗先以 `pulse.prev` 緊急復原、結果是降級回滾（第 4.5.2 節）；回滾檔的信任改為第 4.4.2 節的來源順序（本機封存 → 本機紀錄或 `rollback_bundle` → `pulse.prev`），並加上 commit 與執行檔雜湊的綁定。回滾檔的版本期望值改由 `Paths::current_version`（輔助程式自己的版本）直接取得，不再經過（已比對過的）`req.from_version`。**當時沒有改的**（已確認屬實，由 ADR-0003 的實作處理）：套件回滾失敗（`dpkg -i`／`rpm -U` 回報錯誤）時輔助程式直接回報 `rollback_failed`（`PLS-E8408`），不會退回以 `pulse.prev` 換回執行檔——`rollback()` 中套件管理員與 `pulse.prev` 是二擇一的分支，沒有後備。回滾檔所屬發佈的信任方式（目前是 Pulse 保存的 `SHA256SUMS` 紀錄，由輔助程式以信任錨重新驗證簽章）也由 ADR-0003 處理。ADR-0003 列的其餘補強這次同樣沒有做：交易紀錄的完整 schema 與 checksum、明確的「替換中」步驟（目前 `verified` 涵蓋「尚未替換」與「替換途中」，接續時重新驗證後再替換一次；此時重新驗證失敗會以 `failed` 結束而不回滾）、故障注入的測試矩陣、既存工作目錄的擁有者與權限檢查、工作目錄數量的上限。**〔後續〕這一段列的「其餘補強」已由第 17.9 節（ADR-0003 階段 0b）完成**；套件回滾失敗的降級狀態與回滾檔所屬發佈的信任方式仍屬 ADR-0003 階段 1，沒有改。本節描述的 `state.json` 是 0.10.0 開發期間的 v1 加欄位版本（未曾發佈），發佈的 0.10.0 使用第 17.9.2 節的 v2。
 
 ### 17.9 輔助程式的交易紀錄（0.10.0；ADR-0003 階段 0b）
 
