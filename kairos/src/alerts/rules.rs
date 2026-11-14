@@ -494,7 +494,7 @@ pub fn builtins() -> Vec<Rule> {
             ids::AUDIT_INTEGRITY,
             "稽核日誌完整性",
             Emergency,
-            json!({"code": "KRS-E6201"}),
+            json!({"code": "KRS-E6201", "unsilenceable": true}),
             "定期自我驗證（audit.verify_interval_hours，預設每 24 小時）發現雜湊鏈或 HMAC 斷裂、HMAC 金鑰遺失或不符；下一次驗證通過時恢復。",
         ),
         sys(
@@ -515,7 +515,7 @@ pub fn builtins() -> Vec<Rule> {
             ids::RELEASE_SIGNATURE_FAILED,
             "發佈簽章驗證失敗",
             Critical,
-            json!({"code": "KRS-E8401"}),
+            json!({"code": "KRS-E8401", "unsilenceable": true}),
             "主機以本機信任錨驗證 Pulse 發佈包的簽章失敗：版本庫或傳輸可能被竄改，或信任錨與發佈不符。使用同一版本的推送全部暫停；推送繼續或取消時恢復。",
         ),
         sys(
@@ -537,7 +537,18 @@ pub fn builtin_default(rule_id: &str) -> Option<Rule> {
 /// （`ensure_builtin_rules`），升級上來的環境裡既有的列沒有 `unsilenceable`；能寫資料庫的人把它拿掉
 /// 也不會讓規則變成可以靜音。`params` 的 `"unsilenceable": true` 只是給 API 與介面看的同一件事
 /// （測試確認兩者一致）。
-const UNSILENCEABLE: &[&str] = &[ids::UNAUTHENTICATED, ids::ROLLOUT_APPROVAL_DISABLED];
+///
+/// 安全稽核 B5（0.10.1）：證據類的安全告警一併納入，否則被盜用的管理員工作階段可在動手前先建立
+/// 一筆靜音、讓動作不留下告警。`sys.audit_integrity`（稽核雜湊鏈斷裂或被竄改）與
+/// `sys.release_signature_failed`（發佈簽章驗證失敗）都是低頻、高訊號的竄改證據，設為不可靜音幾乎沒有
+/// 維運代價；偏操作性、可能有誤報的告警（如 `sys.cert_rejected`、各 `sys.enroll_*`、`sys.tls_reload_failed`）
+/// 維持可靜音
+const UNSILENCEABLE: &[&str] = &[
+    ids::UNAUTHENTICATED,
+    ids::ROLLOUT_APPROVAL_DISABLED,
+    ids::AUDIT_INTEGRITY,
+    ids::RELEASE_SIGNATURE_FAILED,
+];
 
 /// 不可停用的系統規則（0.10.1）：「雙人覆核已關閉」。停用它等於讓關閉雙人覆核不留下告警，
 /// 所以停用的 API 回 409 `rule_always_enabled`，資料庫裡已經停用的列在啟動與載入時一律視為啟用。
@@ -941,9 +952,18 @@ mod tests {
         }
         assert!(is_unsilenceable(ids::UNAUTHENTICATED));
         assert!(is_unsilenceable(ids::ROLLOUT_APPROVAL_DISABLED));
+        // B5：證據類的安全告警也不可靜音
+        assert!(is_unsilenceable(ids::AUDIT_INTEGRITY));
+        assert!(is_unsilenceable(ids::RELEASE_SIGNATURE_FAILED));
+        // 但不可靜音不代表不可停用（只有雙人覆核那條不可停用）
+        assert!(!is_always_enabled(ids::AUDIT_INTEGRITY));
+        assert!(!is_always_enabled(ids::RELEASE_SIGNATURE_FAILED));
         assert!(is_always_enabled(ids::ROLLOUT_APPROVAL_DISABLED));
         assert!(!is_always_enabled(ids::UNAUTHENTICATED));
         assert!(!is_unsilenceable(ids::ROLLOUT_PAUSED));
+        // 偏操作性、可能誤報的安全相關告警維持可靜音
+        assert!(!is_unsilenceable(ids::CERT_REJECTED));
+        assert!(!is_unsilenceable(ids::TLS_RELOAD_FAILED));
         // 每一條不可停用的規則都是系統類的預設規則
         for id in ALWAYS_ENABLED.iter().chain(UNSILENCEABLE) {
             let r = builtin_default(id).unwrap();

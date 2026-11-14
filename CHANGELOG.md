@@ -57,6 +57,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 ### Kairos：告警
 
 - **「雙人覆核已關閉」不可靜音、不可停用**（H1；`kairos/ALERTS.md` 第 5.3 節「受保護的系統規則」）：0.10.0 的系統規則 `sys.rollout_approval_disabled` 可以被預先靜音或停用，關閉雙人覆核就不會推播。0.10.1 起它的事件不受任何靜音影響（包含升級前建立、明確選取它的靜音），停用它的 API 回 409 `rule_always_enabled`（並寫一筆結果為 `rejected` 的稽核）；建立或修改靜音時選取不可靜音的規則回 400 `rule_unsilenceable`（`sys.unauthenticated` 也是——它原本就不受靜音影響，只是以前可以建立一筆沒有作用的靜音）。保護由程式碼決定、不依賴資料庫裡那一列的內容：升級上來的環境在啟動時把這一列同步回來（已被停用的重新啟用、補上 `params.unsilenceable`），引擎每次載入規則再套一次；**不需要資料庫遷移**。規則的 API 多 `unsilenceable`、`always_enabled` 兩個欄位；主控台的規則清單對這條規則顯示「啟用（不可停用）」而不是開關，靜音表單不能勾選不可靜音的規則，這類事件的詳情不提供「建立靜音」。通知管道與通知設定仍可調整（沒有接管道就不會推播，事件照常記錄）。
+- **證據類的安全告警不可靜音**（安全稽核 B5；`kairos/ALERTS.md` 第 5.3 節）：`sys.audit_integrity`（稽核雜湊鏈斷裂或被竄改）與 `sys.release_signature_failed`（發佈簽章驗證失敗）0.10.1 起比照 `sys.unauthenticated` 設為不可靜音，避免被盜用的管理員工作階段在動手前先建立一筆靜音讓動作不留下告警。機制與上一項相同（由程式碼決定、啟動時同步既有列、不需資料庫遷移）；兩者仍可停用。偏操作性、可能誤報的安全相關告警（`sys.cert_rejected`、各 `sys.enroll_*`、`sys.tls_reload_failed` 等）維持可靜音。
 
 ### Kairos：遠端管理
 

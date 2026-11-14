@@ -112,6 +112,10 @@ subnet_prefix_v6 = 64
 |---|---|---|
 | `sys.unauthenticated`（未認證連線已允許） | 是 | 否 |
 | `sys.rollout_approval_disabled`（雙人覆核已關閉；0.10.1 起） | 是 | 是 |
+| `sys.audit_integrity`（稽核日誌完整性；0.10.1 起） | 是 | 否 |
+| `sys.release_signature_failed`（發佈簽章驗證失敗；0.10.1 起） | 是 | 否 |
+
+> `sys.audit_integrity` 與 `sys.release_signature_failed` 是證據類的安全告警（稽核雜湊鏈斷裂或被竄改、發佈簽章驗證失敗）：0.10.1 起不可靜音（安全稽核 B5），避免被盜用的管理員工作階段在動手前先建立一筆靜音讓動作不留下告警。兩者仍可停用。偏操作性、可能誤報的安全相關告警（`sys.cert_rejected`、各 `sys.enroll_*`、`sys.tls_reload_failed` 等）維持可靜音。
 
 - **不可靜音**：事件不受任何靜音影響——包含明確選取它的臨時靜音，以及升級前就已經建立的靜音。建立或修改靜音時在 `rules` 選取它回 400 `rule_unsilenceable`（`details.rule_id`）；事件詳情的 `actions` 沒有 `silence`；主控台的靜音表單不能勾選。
 - **不可停用**：`POST /api/v1/alert-rules/{rule_id}/disable` 回 409 `rule_always_enabled`，並寫一筆稽核（`alert_rule.disable`、結果 `rejected`）；主控台的規則清單顯示「啟用（不可停用）」而不是開關。
