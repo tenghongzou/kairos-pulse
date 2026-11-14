@@ -604,7 +604,7 @@ stateDiagram-v2
 
 **時區資料庫**：Kairos 以 `chrono-tz` 把 IANA 時區資料庫**編進執行檔**（0.10.4 內含 tzdb 2025b；預覽 API 的 `timezone.tzdb` 回報實際的版本），不讀主機的 `/usr/share/zoneinfo`、不連網路。
 
-- 選擇的理由：專案的時間型別本來就是 `chrono` 0.4，`chrono-tz` 直接實作 `chrono::TimeZone`，只多 3 個套件（`chrono-tz`、`phf`、`phf_shared`，授權 MIT／Apache-2.0，`cargo deny check` 的允許清單不必修改）；資料是 crate 內預先產生的 Rust 原始碼，**沒有建置時的程式碼產生**（不啟用 `filter-by-regex`、`case-insensitive`），因此同一個 `Cargo.lock` 在任何平台建置出的時區資料完全相同，發佈包維持可重現；Linux（含 musl 靜態連結）與 Windows 的行為相同。代價是 Kairos 的執行檔變大（內嵌約 600 個時區的規則）。
+- 選擇的理由：專案的時間型別本來就是 `chrono` 0.4，`chrono-tz` 直接實作 `chrono::TimeZone`，只多 3 個套件（`chrono-tz`、`phf`、`phf_shared`，授權 MIT／Apache-2.0，`cargo deny check` 的允許清單不必修改）；資料是 crate 內預先產生的 Rust 原始碼，**沒有建置時的程式碼產生**（不啟用 `filter-by-regex`、`case-insensitive`），因此同一個 `Cargo.lock` 在任何平台建置出的時區資料完全相同，發佈包維持可重現；Linux（含 musl 靜態連結）與 Windows 的行為相同。代價是 Kairos 的執行檔變大（內嵌約 600 個時區的規則）：實測 release 建置（x86_64 Linux、預設的 release 設定、`strip` 之後）由 29.45 MB 增加到 31.64 MB，約 **＋2.2 MB（＋7%）**。`chrono-tz` 可以用 `filter-by-regex` 只編入部分時區來縮小，但那需要建置時的程式碼產生與環境變數，而且操作者選不到被排除的時區，沒有採用。
 - 沒有採用 `jiff`：它是另一套完整的時間函式庫（專案要同時帶兩套時間型別），在 Unix 上預設讀取主機的 `/usr/share/zoneinfo`——同一個推送在兩台 Kairos（或叢集的兩個節點）上可能因為主機的 tzdata 版本不同而算出不同的時段；要避免就得改成內嵌資料，結果與 `chrono-tz` 相同而依賴更多。沒有採用「讀主機的 zoneinfo」：最小化的容器與 Windows 沒有它。
 - **資料的更新方式**：時區資料隨 Kairos 的版本更新（發佈前更新 `chrono-tz`，CHANGELOG 註明 tzdb 的版本）。某個國家臨時修改日光節約時間的規則而 Kairos 還沒有更新時，該時區的時段會偏移（通常是一小時）；過渡期間可以把推送的 `timezone` 改為固定位移。叢集的各節點必須是同一個版本的 Kairos（本來就是 HA.md 的要求），因此各節點的時區資料相同。
 
