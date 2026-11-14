@@ -79,7 +79,8 @@ sc.exe start Pulse            # pulse enroll 成功後會自動重新啟動服�
 & "C:\Program Files\Pulse\pulse.exe" status
 ```
 
-- 安裝到 `C:\Program Files\Pulse\`：`pulse.exe`、文件、初始的 `pulse.toml`（安裝目錄**不**加入 PATH）；註冊服務 **`Pulse`**（自動啟動、LocalSystem，參數 `service run`）。服務的工作目錄是安裝目錄（**不是** `C:\Windows\System32`），`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這裡；本機狀態檔為 `%ProgramData%\Pulse\status.json`。服務第一次啟動時設定「失敗時 10 秒後重新啟動，一天最多 3 次」。
+- 安裝到 `C:\Program Files\Pulse\`：`pulse.exe`、文件、初始的 `pulse.toml`（安裝目錄**不**加入 PATH）；註冊服務 **`Pulse`**（自動啟動、LocalSystem，參數 `service run`）。服務的工作目錄是安裝目錄（**不是** `C:\Windows\System32`），`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這裡；本機狀態檔為 `%ProgramData%\Pulse\status.json`。
+- **失敗復原**：服務異常結束（含以非 0 結束代碼停止）時由服務控制管理員重新啟動：第 1 次失敗後等 10 秒、第 2 次 60 秒、第 3 次起每 300 秒，**沒有次數上限**；連續一天沒有失敗才重新從 10 秒算起。設定或憑證錯誤時服務也會每 300 秒重試一次，修好之後不必手動啟動。服務每次啟動時會把這項設定校正回來（`sc.exe qfailure Pulse` 查看；自訂的失敗動作會被改回）。0.8.0～0.10.1 的文件寫「一天最多 3 次」是錯的（實際上每 10 秒重新啟動、沒有上限）。由 MSI 註冊的服務在第一次啟動時才設定失敗復原，其中「非 0 結束代碼也算失敗」依 Microsoft 的文件要到下次開機才生效。
 - 升級：安裝新版 MSI（MajorUpgrade 取代舊版；`pulse.toml` 與執行時產生的檔案保留）。移除：`msiexec /x …` 或「設定 › 應用程式」：停止並刪除服務、刪除安裝的檔案；`pulse.toml`、`agent.id`、`identity\`、`buffer\`、`logs\` 保留。完全移除前先執行 `pulse decommission --initiated-by msi`。
 - 不使用 MSI 時（zip）：解開到任一目錄，以系統管理員執行 `pulse.exe service install --start`（`pulse service --help`）；移除為 `pulse.exe service uninstall`。
 - **0.8.0 的限制**：MSI 與 Windows 服務只在 Linux 上交叉編譯與產生，**尚未在 Windows 實機驗證**；MSI 沒有安裝字串的參數（安裝後另外執行 `pulse enroll`）、移除時不會自動 `pulse decommission`、不寫 Windows 事件記錄、沒有程式碼簽章（Authenticode）。`logs\` 沿用安裝目錄的 ACL（Users 可讀）。

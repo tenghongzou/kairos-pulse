@@ -1,7 +1,7 @@
 //! Windows 服務（商業審計 O4）：`pulse service install|uninstall|run`。
 //!
-//! - `install`：向服務控制管理員註冊 `Pulse`（自動啟動、LocalSystem、失敗時 10 秒後重新啟動，
-//!   一天內最多 3 次；由 MSI 註冊時，服務第一次啟動會自行補上這個失敗動作）。執行檔路徑為目前的 `pulse.exe`，服務參數為 `service run --workdir <目錄>`。
+//! - `install`：向服務控制管理員註冊 `Pulse`（自動啟動、LocalSystem、失敗復原見下方）。執行檔路徑為目前的
+//!   `pulse.exe`，服務參數為 `service run --workdir <目錄>`。
 //!   MSI 安裝時不使用這個命令：服務由 MSI 的 `ServiceInstall` 表註冊（同樣的參數，見
 //!   `pulse/packaging/windows/pulse.wxs`）。
 //! - `uninstall`：停止（最多等 15 秒）並刪除服務。
@@ -14,6 +14,19 @@
 //! 服務收到「停止」或「關機」時以與 Ctrl+C 相同的方式結束（送出 TLS close_notify，最多約 1.5 秒）；
 //! 結束代碼以服務特定的結束代碼回報（`sc.exe query Pulse` 的 `SERVICE_EXIT_CODE`：
 //! 1 一般錯誤、3 設定錯誤、4 憑證錯誤，與 Linux 相同）。
+//!
+//! # 失敗復原（[`recovery`]；ADR-0001 第 1.2 節 X1～X3、第 8 節 U13）
+//!
+//! 服務異常結束（含以非 0 結束代碼停止）時由服務控制管理員重新啟動：第 1 次失敗後等 10 秒、第 2 次 60 秒、
+//! 第 3 次起每 300 秒，**沒有次數上限**（服務控制管理員在失敗次數超過動作數之後重複最後一個動作）；連續
+//! 一天沒有失敗才把失敗計數歸零。0.8.0～0.10.1 設定的是三個「10 秒後重新啟動」，文件寫成「一天內最多
+//! 3 次」是錯的：實際上每 10 秒重新啟動、沒有上限（X1）。
+//!
+//! 服務每次啟動時比對完整的設定（動作陣列、重設期、「非 0 結束代碼也算失敗」旗標），不一致就改回上述內容
+//! （X2：先前只在「沒有任何動作」時補上，MSI 註冊的服務以外——舊版留下的設定、被部分修改過的設定——都不會
+//! 被修正）。管理者或群組原則另外設定的失敗動作因此會在下次啟動時被改回來。該旗標的變更依 Microsoft 的
+//! 文件要到下次開機才生效（X3）：由 MSI 註冊的服務在第一次啟動時才設定它，重開機前非 0 結束代碼可能不會
+//! 觸發重新啟動（待實機驗證，`docs/windows-vm-validation.md`）。
 //!
 //! 只能在 Windows 執行；其他平台以用法錯誤（2）結束。Windows 事件記錄尚未實作（`codes.rs` 的
 //! `win_event_id` 已定案）。
@@ -33,6 +46,105 @@ pub const DESCRIPTION: &str =
 #[cfg_attr(not(windows), allow(unused_imports))]
 pub use crate::codes::{E_SERVICE_INSTALL, E_SERVICE_RUN};
 
+/// 服務的失敗復原政策：改這裡就同時改變 `pulse service install` 與服務啟動時的校正
+/// （[`desired_recovery`]）。ADR-0001 第 8 節 U13 的 (a)「頻率有上限、持續重試」在沒有啟動器時的等效設定；
+/// 現行服務是否採用、設定或憑證錯誤（結束代碼 3／4）要不要不重新啟動，使用者尚未決定
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub mod recovery {
+    /// 第 N 次失敗後等待多久再重新啟動（秒）；失敗次數超過陣列長度後，服務控制管理員重複最後一個
+    pub const RESTART_DELAYS_SECS: &[u64] = &[10, 60, 300];
+    /// 連續這麼久（秒）沒有失敗才把失敗計數歸零
+    pub const RESET_PERIOD_SECS: u64 = 86_400;
+    /// 以非 0 結束代碼正常停止（回報了 `SERVICE_STOPPED`）是否也算失敗。`true`：結束代碼 1／3／4 都會
+    /// 依上面的延遲重新啟動（0.8.0 起的行為；設定錯誤修好後不必手動啟動，代價是修好之前每 300 秒重試一次）。
+    /// `false`：只有行程異常終止才重新啟動，任何非 0 結束代碼都停在「已停止」——服務控制管理員無法只排除
+    /// 結束代碼 3／4，要做到與 Linux 的 unit 相同（3／4 不重啟、其他重啟）需要啟動器（ADR-0001 第 4.4 節）
+    pub const ON_NON_CRASH_FAILURE: bool = true;
+}
+
+/// 失敗動作的種類（`SC_ACTION_TYPE`）
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    None,
+    Restart,
+    Reboot,
+    RunCommand,
+}
+
+/// 服務的失敗復原設定中由 Pulse 管理的部分（重開機訊息與命令列不在其中：只用重新啟動，不比對也不修改）
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryConfig {
+    /// 依失敗次數排列的動作與延遲（毫秒）
+    pub actions: Vec<(RecoveryAction, u64)>,
+    /// 失敗計數的重設期（秒）；`None` 為永不重設
+    pub reset_secs: Option<u64>,
+    /// 「非 0 結束代碼也算失敗」旗標
+    pub on_non_crash_failure: bool,
+}
+
+/// [`recovery`] 對應的設定
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn desired_recovery() -> RecoveryConfig {
+    RecoveryConfig {
+        actions: recovery::RESTART_DELAYS_SECS
+            .iter()
+            .map(|secs| (RecoveryAction::Restart, secs * 1000))
+            .collect(),
+        reset_secs: Some(recovery::RESET_PERIOD_SECS),
+        on_non_crash_failure: recovery::ON_NON_CRASH_FAILURE,
+    }
+}
+
+/// 目前的設定與期望的設定不同之處（給日誌用的說明）；完全相同時為空。`observed` 為 `None` 表示讀不到
+/// 目前的設定（視為不一致）
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn recovery_drift(observed: Option<&RecoveryConfig>, desired: &RecoveryConfig) -> Vec<String> {
+    let Some(observed) = observed else {
+        return vec!["讀不到目前的設定".to_string()];
+    };
+    let mut out = Vec::new();
+    if observed.actions != desired.actions {
+        out.push(if observed.actions.is_empty() {
+            "沒有失敗動作".to_string()
+        } else {
+            format!(
+                "失敗動作為 {}",
+                observed
+                    .actions
+                    .iter()
+                    .map(|(kind, ms)| format!("{kind:?}/{ms}ms"))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
+        });
+    }
+    if observed.reset_secs != desired.reset_secs {
+        out.push(match observed.reset_secs {
+            Some(secs) => format!("重設期為 {secs} 秒"),
+            None => "重設期為永不".to_string(),
+        });
+    }
+    if observed.on_non_crash_failure != desired.on_non_crash_failure {
+        out.push(format!(
+            "「非 0 結束代碼也算失敗」為{}",
+            if observed.on_non_crash_failure {
+                "開啟"
+            } else {
+                "關閉"
+            }
+        ));
+    }
+    out
+}
+
+/// 服務啟動時校正失敗復原設定的結果（日誌等級與訊息）。校正發生在日誌初始化之前，由 `run_agent` 在日誌
+/// 可用後取出並記錄；沒有校正（設定已一致、不是以服務執行）時為 `None`
+pub fn take_startup_note() -> Option<(log::Level, String)> {
+    imp::take_startup_note()
+}
+
 /// `pulse service --help`
 pub const USAGE: &str = "\
 pulse service — Windows 服務
@@ -43,9 +155,12 @@ pulse service — Windows 服務
   pulse service run [--workdir <目錄>]     （服務進入點，由服務控制管理員啟動；不要手動執行）
 
 說明：
-  install 以系統管理員權限執行：註冊服務 Pulse（自動啟動、LocalSystem、失敗時 10 秒後重新啟動，
-  一天內最多 3 次），服務參數為 service run --workdir <目錄>。--workdir 預設為 pulse.exe 所在的目錄；
+  install 以系統管理員權限執行：註冊服務 Pulse（自動啟動、LocalSystem），服務參數為
+  service run --workdir <目錄>。--workdir 預設為 pulse.exe 所在的目錄；
   pulse.toml、agent.id、identity\\、buffer\\ 與 logs\\ 都在這個目錄下。--start 註冊後立即啟動。
+  失敗復原：服務異常結束（含以非 0 結束代碼停止）時由服務控制管理員重新啟動，第 1 次失敗後等 10 秒、
+  第 2 次 60 秒、第 3 次起每 300 秒，沒有次數上限；連續一天沒有失敗才重新從 10 秒算起。服務每次啟動時
+  會把這項設定校正回來（含由 MSI 註冊的服務；以 sc.exe qfailure Pulse 查看）。
   以 MSI 安裝時服務已由 MSI 註冊，不需要執行 install。
   uninstall 停止並刪除服務（不刪除任何檔案；完全移除前先執行 pulse decommission）。
 
@@ -141,6 +256,10 @@ pub fn run(args: &ServiceArgs) -> u8 {
 
 #[cfg(not(windows))]
 mod imp {
+    pub fn take_startup_note() -> Option<(log::Level, String)> {
+        None
+    }
+
     pub fn run(_: &super::ServiceArgs) -> u8 {
         eprintln!(
             "錯誤 PLS-E0002：pulse service 只用於 Windows；Linux 請使用 systemd unit（pulse.service，INSTALL.md 第 7 節）"
@@ -232,8 +351,8 @@ mod imp {
             }
         };
         let _ = service.set_description(DESCRIPTION);
-        // 失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動；一天內最多 3 次，避免設定錯誤時無限重試
-        if let Err(e) = set_failure_actions(&service) {
+        // 失敗復原（模組說明；`recovery`）
+        if let Err(e) = set_failure_actions(&service, &desired_recovery()) {
             eprintln!("警告：無法設定失敗時的重新啟動：{e}");
         }
         println!(
@@ -252,42 +371,136 @@ mod imp {
         0
     }
 
-    /// 失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動；一天內最多 3 次，避免設定錯誤時無限重試
-    fn set_failure_actions(
-        service: &windows_service::service::Service,
-    ) -> windows_service::Result<()> {
-        let restart = ServiceAction {
-            action_type: ServiceActionType::Restart,
-            delay: Duration::from_secs(10),
-        };
-        service.update_failure_actions(ServiceFailureActions {
-            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-            reboot_msg: None,
-            command: None,
-            actions: Some(vec![restart.clone(), restart.clone(), restart]),
-        })?;
-        service.set_failure_actions_on_non_crash_failures(true)
+    fn to_action_type(kind: RecoveryAction) -> ServiceActionType {
+        match kind {
+            RecoveryAction::None => ServiceActionType::None,
+            RecoveryAction::Restart => ServiceActionType::Restart,
+            RecoveryAction::Reboot => ServiceActionType::Reboot,
+            RecoveryAction::RunCommand => ServiceActionType::RunCommand,
+        }
     }
 
-    /// 服務啟動時：沒有設定失敗動作（例如由 MSI 的 ServiceInstall 註冊，wixl 不支援
-    /// MsiServiceConfigFailureActions）時補上，與 pulse service install 相同
+    fn from_action_type(kind: ServiceActionType) -> RecoveryAction {
+        match kind {
+            ServiceActionType::None => RecoveryAction::None,
+            ServiceActionType::Restart => RecoveryAction::Restart,
+            ServiceActionType::Reboot => RecoveryAction::Reboot,
+            ServiceActionType::RunCommand => RecoveryAction::RunCommand,
+        }
+    }
+
+    /// 把失敗復原設為 `config`：動作陣列與重設期、「非 0 結束代碼也算失敗」旗標。重開機訊息與命令列
+    /// 不變（`None` 表示不修改）。動作含重新啟動時，服務控制管理員要求控制代碼有 `SERVICE_START` 權限
+    fn set_failure_actions(
+        service: &windows_service::service::Service,
+        config: &RecoveryConfig,
+    ) -> windows_service::Result<()> {
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: match config.reset_secs {
+                Some(secs) => ServiceFailureResetPeriod::After(Duration::from_secs(secs)),
+                None => ServiceFailureResetPeriod::Never,
+            },
+            reboot_msg: None,
+            command: None,
+            actions: Some(
+                config
+                    .actions
+                    .iter()
+                    .map(|&(kind, ms)| ServiceAction {
+                        action_type: to_action_type(kind),
+                        delay: Duration::from_millis(ms),
+                    })
+                    .collect(),
+            ),
+        })?;
+        service.set_failure_actions_on_non_crash_failures(config.on_non_crash_failure)
+    }
+
+    /// 讀出目前的失敗復原設定；任何一部分讀不到時為 `None`
+    fn observe_recovery(service: &windows_service::service::Service) -> Option<RecoveryConfig> {
+        let current = service.get_failure_actions().ok()?;
+        let flag = service.get_failure_actions_on_non_crash_failures().ok()?;
+        Some(RecoveryConfig {
+            actions: current
+                .actions
+                .unwrap_or_default()
+                .iter()
+                .map(|a| {
+                    (
+                        from_action_type(a.action_type),
+                        u64::try_from(a.delay.as_millis()).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+            reset_secs: match current.reset_period {
+                ServiceFailureResetPeriod::Never => None,
+                ServiceFailureResetPeriod::After(d) => Some(d.as_secs()),
+            },
+            on_non_crash_failure: flag,
+        })
+    }
+
+    /// 服務啟動時校正失敗復原設定的結果（[`take_startup_note`]）
+    static STARTUP_NOTE: std::sync::Mutex<Option<(log::Level, String)>> =
+        std::sync::Mutex::new(None);
+
+    pub fn take_startup_note() -> Option<(log::Level, String)> {
+        STARTUP_NOTE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// 服務啟動時：比對完整的失敗復原設定（動作陣列、重設期、「非 0 結束代碼也算失敗」旗標），與
+    /// [`desired_recovery`] 不一致就改回來。由 MSI 的 ServiceInstall 註冊的服務沒有失敗動作（wixl 不支援
+    /// MsiServiceConfigFailureActions）、0.8.0～0.10.1 註冊的服務是三個 10 秒，都在這裡校正
     fn ensure_failure_actions() {
-        let Ok(manager) =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        else {
-            return;
+        let note = |level, message: String| {
+            *STARTUP_NOTE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((level, message));
         };
-        let Ok(service) = manager.open_service(
-            SERVICE_NAME,
-            ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG,
-        ) else {
-            return;
+        let service = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .and_then(|manager| {
+                manager.open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::QUERY_CONFIG
+                        | ServiceAccess::CHANGE_CONFIG
+                        | ServiceAccess::START,
+                )
+            });
+        let service = match service {
+            Ok(s) => s,
+            Err(e) => {
+                note(
+                    log::Level::Warn,
+                    format!("無法開啟服務 {SERVICE_NAME} 以檢查失敗復原設定：{e}"),
+                );
+                return;
+            }
         };
-        let configured = service
-            .get_failure_actions()
-            .is_ok_and(|a| a.actions.is_some_and(|v| !v.is_empty()));
-        if !configured {
-            let _ = set_failure_actions(&service);
+        let desired = desired_recovery();
+        let drift = recovery_drift(observe_recovery(&service).as_ref(), &desired);
+        if drift.is_empty() {
+            return;
+        }
+        let drift = drift.join("；");
+        match set_failure_actions(&service, &desired) {
+            Ok(()) => note(
+                log::Level::Info,
+                format!(
+                    "已校正服務 {SERVICE_NAME} 的失敗復原設定（原本：{drift}）：重新啟動的延遲依序為 {:?} 秒，\
+                     之後重複最後一個；「非 0 結束代碼也算失敗」的變更可能要到下次開機才生效",
+                    recovery::RESTART_DELAYS_SECS
+                ),
+            ),
+            Err(e) => note(
+                log::Level::Warn,
+                format!(
+                    "服務 {SERVICE_NAME} 的失敗復原設定與預期不同（{drift}），而且無法修正：{e}；\
+                     以 sc.exe qfailure {SERVICE_NAME} 檢查"
+                ),
+            ),
         }
     }
 
@@ -451,9 +664,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_policy_restarts_with_a_capped_frequency() {
+        // X1：最後一個動作會被無限重複，所以它決定長期的重試頻率
+        let d = desired_recovery();
+        assert_eq!(
+            d.actions,
+            [
+                (RecoveryAction::Restart, 10_000),
+                (RecoveryAction::Restart, 60_000),
+                (RecoveryAction::Restart, 300_000)
+            ]
+        );
+        assert_eq!(d.reset_secs, Some(86_400));
+        assert!(d.on_non_crash_failure);
+        // --help 的敘述與常數一致，而且不再出現「最多 3 次」
+        for secs in recovery::RESTART_DELAYS_SECS {
+            assert!(USAGE.contains(&format!("{secs} 秒")), "{secs}");
+        }
+        assert!(USAGE.contains("沒有次數上限") && !USAGE.contains("最多 3 次"));
+    }
+
+    #[test]
+    fn recovery_drift_compares_the_whole_configuration() {
+        let desired = desired_recovery();
+        assert!(recovery_drift(Some(&desired), &desired).is_empty());
+        // 讀不到 → 視為不一致
+        assert_eq!(recovery_drift(None, &desired).len(), 1);
+        // MSI 註冊的服務：沒有任何動作、旗標關閉
+        let msi = RecoveryConfig {
+            actions: Vec::new(),
+            reset_secs: Some(0),
+            on_non_crash_failure: false,
+        };
+        let d = recovery_drift(Some(&msi), &desired);
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert!(d[0].contains("沒有失敗動作"), "{d:?}");
+        // 0.8.0～0.10.1 註冊的服務：三個 10 秒（X1）——先前因為「已有動作」而不會被修正（X2）
+        let legacy = RecoveryConfig {
+            actions: vec![(RecoveryAction::Restart, 10_000); 3],
+            ..desired.clone()
+        };
+        let d = recovery_drift(Some(&legacy), &desired);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("Restart/10000ms"), "{d:?}");
+        // 只有旗標不同、只有重設期不同、只有動作種類或個數不同，各自都算不一致
+        let flag_off = RecoveryConfig {
+            on_non_crash_failure: false,
+            ..desired.clone()
+        };
+        assert_eq!(recovery_drift(Some(&flag_off), &desired).len(), 1);
+        let never = RecoveryConfig {
+            reset_secs: None,
+            ..desired.clone()
+        };
+        assert_eq!(
+            recovery_drift(Some(&never), &desired),
+            ["重設期為永不".to_string()]
+        );
+        let mut stop_after_three = desired.clone();
+        stop_after_three.actions.push((RecoveryAction::None, 0));
+        assert_eq!(recovery_drift(Some(&stop_after_three), &desired).len(), 1);
+        let mut reboot = desired.clone();
+        reboot.actions[2].0 = RecoveryAction::Reboot;
+        assert_eq!(recovery_drift(Some(&reboot), &desired).len(), 1);
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn other_platforms_refuse_with_a_usage_error() {
+        assert_eq!(take_startup_note(), None);
         assert_eq!(run(&ServiceArgs::Uninstall), crate::EXIT_USAGE);
     }
 }

@@ -78,7 +78,8 @@ pulse service uninstall                              # 停止並刪除服務（�
 pulse service run [--workdir <目錄>]                 # 服務進入點，由服務控制管理員啟動
 ```
 
-- 服務名稱 `Pulse`（`pulse status` 查詢的名稱）、自動啟動、LocalSystem；失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動，一天內最多 3 次（設定錯誤時不會無限重試）。
+- 服務名稱 `Pulse`（`pulse status` 查詢的名稱）、自動啟動、LocalSystem。
+- **失敗復原**：服務異常結束（含以非 0 結束代碼停止）時由服務控制管理員重新啟動——第 1 次失敗後等 10 秒、第 2 次 60 秒、第 3 次起每 300 秒，**沒有次數上限**（失敗次數超過動作數之後，服務控制管理員重複最後一個動作）；連續一天沒有失敗才重新從 10 秒算起。設定或憑證錯誤（結束代碼 3／4）因此會每 300 秒重試一次，直到修好為止（Linux 的 unit 對這些代碼不重新啟動，兩個平台不同）。服務每次啟動時比對完整的設定並校正回上述內容（由 MSI 註冊的服務、舊版註冊的服務、被修改過的設定都一樣；`sc.exe qfailure Pulse` 查看）。0.8.0～0.10.1 的文件寫「一天內最多 3 次」是錯的：那些版本設定的是三個「10 秒後重新啟動」，實際上每 10 秒重新啟動、沒有上限。「非 0 結束代碼也算失敗」這個旗標的變更依 Microsoft 的文件要到下次開機才生效，由 MSI 註冊的服務在第一次重開機前可能只對行程異常終止重新啟動（未實機驗證）。
 - `service run` 先把目前目錄切換到 `--workdir`（預設為 `pulse.exe` 所在目錄），**不會落在 `C:\Windows\System32`**：`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這個目錄下；本機狀態檔為 `%ProgramData%\Pulse\status.json`。
 - 服務的「停止」與「關機」要求與 Ctrl+C 相同：送出 TLS close_notify 後結束；結束代碼以服務特定代碼回報（`sc.exe query Pulse` 的 `SERVICE_EXIT_CODE`，1／3／4 與 Linux 相同）。
 - 錯誤代碼：`PLS-E8105` 服務無法安裝、移除或啟動（多半是沒有系統管理員權限）；`PLS-E8106` `service run` 不是由服務控制管理員啟動，或工作目錄不存在。

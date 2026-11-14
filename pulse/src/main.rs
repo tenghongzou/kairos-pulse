@@ -480,6 +480,10 @@ fn run_agent(print_id: bool, external_stop: Option<CancellationToken>) -> u8 {
         eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
         return EXIT_GENERAL;
     }
+    // Windows 服務：啟動時校正失敗復原設定的結果（校正發生在日誌初始化之前）
+    if let Some((level, message)) = winsvc::take_startup_note() {
+        log::log!(level, "{message}");
+    }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_live_logging）
     retention.run();
 
