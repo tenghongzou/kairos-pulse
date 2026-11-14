@@ -40,12 +40,13 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
 
   ```bash
   curl -fsSLO --cacert kairos-ca.pem https://kairos.example.com:8444/agent/pulse-install.sh && \
+    echo '<pulse-install.sh 的 SHA-256>  pulse-install.sh' | sha256sum -c - && \
     sudo PULSE_INSTALL_STRING='pulse-enroll:v1:…' sh pulse-install.sh \
       --base-url https://kairos.example.com:8444/agent --ca-file kairos-ca.pem \
       --allowed-signers /etc/kairos-pulse/allowed_signers
   ```
 
-  `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。套件的完整性仍以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。根 CA 與發佈公鑰都要從另一個管道取得。
+  `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。**套件**的完整性以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。**腳本本身**不在這個保證之內（驗證的邏輯就在腳本裡）：Kairos 0.11 之後的版本，主控台顯示的指令帶著腳本的 SHA-256，下載後先比對、相符才以 root 執行——請複製整行，不要省略 `sha256sum -c` 那一段；這個雜湊來自主控台，所以對腳本的信任在主控台與 Kairos 的下載目錄上（`kairos/PKI.md` 第 17 節）。更早的 Kairos 顯示的指令沒有這一段，請自行比對（雜湊取自以發佈公鑰驗證過的 `SHA256SUMS`，如上方的範例）。根 CA 與發佈公鑰都要從另一個管道取得。
 - 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
 - **遠端管理（0.9.0）**：腳本另外把 `--allowed-signers` 的檔案複製到 `/etc/kairos-pulse/allowed_signers`（root 644），作為遠端升級的信任錨（已經放在那裡時不動）。不接受 Kairos 推送的升級：`--no-remote-upgrade`；不接受下發的設定：`--no-remote-config`（兩者都寫進 `/opt/pulse/pulse.toml`，見第 10.1 節）。
 - 安裝字串會短暫出現在 `pulse enroll` 的命令列（`ps` 看得到）；token 有使用次數與期限，部署完成後由管理者停用（`kairos enroll-token disable`）。

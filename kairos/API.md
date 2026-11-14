@@ -1453,7 +1453,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 
 ### 15.2 下載端點（ENROLL.md 第 19.4 節第 3 項）
 
-`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`）、`reason`、`product_code`（設定了目錄但不完整時為`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令。`stats.downloads_in_progress` 為目前的下載數。
+`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`，且安裝腳本與同目錄 `SHA256SUMS` 記錄的雜湊相符）、`reason`、`product_code`（設定了目錄但不完整或不相符時為`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`install_script_sha256`（`pulse-install.sh` 的 SHA-256，小寫十六進位；不可用時 `null`。0.11.0 之後的版本才有）、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令，指令在執行腳本之前先以 `install_script_sha256` 比對（`kairos/PKI.md` 第 17 節）。`stats.downloads_in_progress` 為目前的下載數。
 
 ## 16. 指標轉出（0.9.0〔草稿〕）
 

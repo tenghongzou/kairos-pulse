@@ -3,8 +3,11 @@
 //! （`pulse-install.sh`、deb／rpm／msi／zip／tar.gz、`SHA256SUMS`、`SHA256SUMS.sig`），供一行安裝指令
 //! 與 `pulse-install.sh --base-url https://<註冊端點>/agent` 使用。
 //!
-//! - **完整性不依賴這個端點**：`pulse-install.sh` 以另外取得的發佈公鑰驗證 `SHA256SUMS.sig`，再以
+//! - **套件的完整性不依賴這個端點**：`pulse-install.sh` 以另外取得的發佈公鑰驗證 `SHA256SUMS.sig`，再以
 //!   `SHA256SUMS` 驗證套件（`pulse/packaging/INSTALL.md`）。Kairos 只是轉送，不簽章、不修改檔案。
+//!   **腳本本身不在這個保證之內**——驗證的邏輯就在被下載的腳本裡。所以主控台的一行安裝指令帶著腳本的
+//!   SHA-256（[`Status::install_script_sha256`]，經主控台的 HTTPS 取得），目標主機在執行之前先比對；
+//!   這把對腳本的信任放在主控台與 `enroll.download_dir` 的內容上，後者只應由管理者可寫。
 //! - **路徑**：檔名只能是 1～128 個英數字與 `. _ -`、不以 `.` 開頭（[`kairos_proto::enroll::parse_route`]，
 //!   沒有 `/`、`..`、百分比編碼）；只提供目錄中**一般檔案**（不跟隨符號連結、不進入子目錄），大小上限 1 GiB。
 //! - **內容類型**依副檔名（[`content_type`]），一律 `X-Content-Type-Options: nosniff` 與
@@ -30,7 +33,11 @@ use tokio::io::AsyncReadExt;
 use crate::api::http::ApiBody;
 
 /// 下載可用時必須存在的檔案（`pulse-install.sh --base-url` 先取這兩個驗證簽章）
-pub const REQUIRED: [&str; 3] = ["pulse-install.sh", "SHA256SUMS", "SHA256SUMS.sig"];
+pub const REQUIRED: [&str; 3] = [SCRIPT, "SHA256SUMS", "SHA256SUMS.sig"];
+/// 一行安裝腳本的檔名
+pub const SCRIPT: &str = "pulse-install.sh";
+/// 安裝腳本的大小上限（計算雜湊時整個讀入）
+pub const MAX_SCRIPT_BYTES: u64 = 4 << 20;
 /// L11 被拒時的 `Retry-After`
 pub const RETRY_AFTER: Duration = Duration::from_secs(15);
 /// 單一檔案的大小上限
@@ -128,6 +135,8 @@ pub struct Status {
     pub reason: Option<String>,
     /// 目錄中可下載的檔案（依名稱排序）
     pub files: Vec<String>,
+    /// `pulse-install.sh` 的 SHA-256（可用時才有）
+    pub install_script_sha256: Option<String>,
 }
 
 /// 檢查下載目錄（`dir` 為空：未設定）
@@ -139,6 +148,7 @@ pub fn status(dir: Option<&Path>) -> Status {
                 "沒有設定 enroll.download_dir（下載端點未啟用，/agent/ 回 404）".to_string(),
             ),
             files: Vec::new(),
+            install_script_sha256: None,
         };
     };
     let mut files: Vec<String> = match std::fs::read_dir(dir) {
@@ -156,6 +166,7 @@ pub fn status(dir: Option<&Path>) -> Status {
                     dir.display()
                 )),
                 files: Vec::new(),
+                install_script_sha256: None,
             };
         }
     };
@@ -165,16 +176,61 @@ pub fn status(dir: Option<&Path>) -> Status {
         .copied()
         .filter(|r| !files.iter().any(|f| f == r))
         .collect();
-    Status {
-        available: missing.is_empty(),
-        reason: (!missing.is_empty()).then(|| {
-            format!(
+    if !missing.is_empty() {
+        return Status {
+            available: false,
+            reason: Some(format!(
                 "enroll.download_dir（{}）缺少 {}：請放入同一個發佈版本的 pulse-install.sh、SHA256SUMS、SHA256SUMS.sig 與套件",
                 dir.display(),
                 missing.join("、")
-            )
-        }),
-        files,
+            )),
+            files,
+            install_script_sha256: None,
+        };
+    }
+    match install_script_sha256(dir) {
+        Ok(hash) => Status {
+            available: true,
+            reason: None,
+            files,
+            install_script_sha256: Some(hash),
+        },
+        Err(why) => Status {
+            available: false,
+            reason: Some(format!("enroll.download_dir（{}）：{why}", dir.display())),
+            files,
+            install_script_sha256: None,
+        },
+    }
+}
+
+/// `pulse-install.sh` 的 SHA-256（小寫十六進位）。主控台把它放進一行安裝指令，目標主機在執行腳本之前先比對
+/// ——腳本是以 root 執行的，而驗證套件簽章的邏輯就在腳本裡，所以腳本本身要有一個不經過這個端點的憑據。
+/// 同一個目錄的 `SHA256SUMS` 有列出 `pulse-install.sh` 時兩者必須相符（放錯版本或檔案被改過時不提供指令）
+fn install_script_sha256(dir: &Path) -> Result<String, String> {
+    let path = dir.join(SCRIPT);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("無法讀取 {SCRIPT}：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "{SCRIPT} 不是一般檔案或超過 {} MiB",
+            MAX_SCRIPT_BYTES >> 20
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("無法讀取 {SCRIPT}：{e}"))?;
+    let hash = kairos_proto::enroll::sha256_hex(&bytes);
+    let listed = std::fs::read_to_string(dir.join("SHA256SUMS"))
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let (h, name) = line.split_once(char::is_whitespace)?;
+                (name.trim().trim_start_matches('*') == SCRIPT).then(|| h.to_ascii_lowercase())
+            })
+        });
+    match listed {
+        Some(l) if l != hash => Err(format!(
+            "{SCRIPT} 的內容與 SHA256SUMS 記錄的雜湊不符：請重新放入同一個發佈版本的檔案"
+        )),
+        _ => Ok(hash),
     }
 }
 
@@ -186,7 +242,8 @@ pub fn status_json(dir: Option<&Path>, base_url: &str) -> Value {
         "reason": s.reason,
         "product_code": (dir.is_some() && !s.available).then_some(CODE_INCOMPLETE),
         "base_url": s.available.then(|| base_url.to_string()),
-        "install_script": s.available.then(|| format!("{base_url}/pulse-install.sh")),
+        "install_script": s.available.then(|| format!("{base_url}/{SCRIPT}")),
+        "install_script_sha256": s.install_script_sha256,
         "files": s.files,
         "alternative": "以安裝套件（MSI、deb、rpm）安裝 Pulse 後執行 pulse enroll --install-string <安裝字串>",
     })
@@ -351,12 +408,60 @@ mod tests {
             "{s:?}"
         );
         assert_eq!(s.files, ["pulse-install.sh"], "隱藏檔與子目錄不列出");
-        std::fs::write(d.join("SHA256SUMS"), "a  pulse-install.sh\n").unwrap();
+        let hash = kairos_proto::enroll::sha256_hex(b"#!/bin/sh\n");
+        std::fs::write(
+            d.join("SHA256SUMS"),
+            format!(
+                "{}  pulse_0.9.0_amd64.deb\n{hash}  pulse-install.sh\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
         std::fs::write(d.join("SHA256SUMS.sig"), "sig").unwrap();
         let v = status_json(Some(&d), "https://k:8444/agent");
         assert_eq!(v["available"], true);
         assert_eq!(v["install_script"], "https://k:8444/agent/pulse-install.sh");
         assert_eq!(v["files"].as_array().unwrap().len(), 3);
+        // 安全稽核 C3：一行安裝指令要帶的腳本雜湊
+        assert_eq!(v["install_script_sha256"], hash.as_str());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // 安全稽核 C3：腳本與同目錄的 SHA256SUMS 不符（被改過或放錯版本）時不提供一行安裝指令
+    #[test]
+    fn a_script_that_does_not_match_sha256sums_disables_the_one_liner() {
+        let d = dir("script-hash");
+        let hash = kairos_proto::enroll::sha256_hex(b"#!/bin/sh\necho ok\n");
+        std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::write(d.join("SHA256SUMS"), format!("{hash} *pulse-install.sh\n")).unwrap();
+        std::fs::write(d.join("SHA256SUMS.sig"), "sig").unwrap();
+        assert_eq!(status(Some(&d)).install_script_sha256, Some(hash));
+        // 腳本被換掉
+        std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\necho changed\n").unwrap();
+        let s = status(Some(&d));
+        assert!(!s.available, "{s:?}");
+        assert!(s.reason.as_ref().unwrap().contains("SHA256SUMS"), "{s:?}");
+        let v = status_json(Some(&d), "https://k:8444/agent");
+        assert_eq!(v["available"], false);
+        assert!(v["base_url"].is_null() && v["install_script_sha256"].is_null());
+        // SHA256SUMS 沒有列出腳本（舊的發佈包）：以實際內容的雜湊為準
+        std::fs::write(d.join("SHA256SUMS"), "x  other\n").unwrap();
+        let s = status(Some(&d));
+        assert!(s.available);
+        assert_eq!(
+            s.install_script_sha256,
+            Some(kairos_proto::enroll::sha256_hex(
+                b"#!/bin/sh\necho changed\n"
+            ))
+        );
+        // 腳本是符號連結：不提供
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(d.join("pulse-install.sh")).unwrap();
+            std::fs::write(d.join("real.sh"), "#!/bin/sh\n").unwrap();
+            std::os::unix::fs::symlink(d.join("real.sh"), d.join("pulse-install.sh")).unwrap();
+            assert!(!status(Some(&d)).available);
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
