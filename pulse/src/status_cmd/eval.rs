@@ -1739,6 +1739,7 @@ fn config_row(
     }
     let codes_list: Vec<&str> = warnings.iter().map(|w| w.code.as_str()).collect();
     let first_code = [
+        codes::E_STATE_DIR_UNSAFE,
         codes::E_STATUS_UNWRITABLE,
         codes::W_TLS_VERIFY_DISABLED,
         codes::W_BOTH_TRUST_STORES,

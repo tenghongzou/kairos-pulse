@@ -853,6 +853,9 @@ pub fn config_warning(_ctx: &Ctx, code: &str, message: &str) -> Issue {
         codes::E_STATUS_UNWRITABLE => {
             "依 INSTALL.md 第 10 節換上新版 pulse.service（StateDirectory=pulse），執行 systemctl daemon-reload 後重新啟動 Pulse。"
         }
+        codes::E_STATE_DIR_UNSAFE => {
+            "以系統管理員停止服務、刪除 %ProgramData%\\Pulse（rd /s /q；其中只有狀態檔與設定快取）後啟動服務，服務會以正確的 ACL 重新建立它（INSTALL.md A.3）。"
+        }
         _ => "依說明修正設定。",
     };
     Issue::new(code, Severity::Warning)

@@ -25,7 +25,7 @@
    - 草稿段落 `## [0.10.0] - 〔草稿：發佈日期待定〕` 改為 `## [0.10.0] - YYYY-MM-DD`，移除段落中的〔草稿〕標記；`[Unreleased]` 中若有新的項目先移入。之後的版本同樣把 `[Unreleased]` 的內容移到新的 `## [<版本>] - YYYY-MM-DD`，上方保留空的 `## [Unreleased]`。兩個產品版本不同時（例如只發佈 Pulse 0.4.1），標題寫成 `## [Pulse 0.4.1] - YYYY-MM-DD`。
    - 更新「版本相容矩陣」，移除已確定項目的〔草稿〕標記。
    - 確認發佈清單的手動欄位 `pulse/packaging/release-meta.toml`（0.9.0 起）：`min_kairos` 與相容矩陣一致、`min_upgrade_from`（需要新的 systemd unit 或資料轉換時提高）、`remote_features`（這版實際宣告的遠端管理 feature）、`breaking`（「破壞性變更與升級步驟」有 Pulse 的項目時為 `true`）。
-4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。
+4. 提交、開 PR，等 CI 全綠（`check`、`deny`、`package`）。`package` job 的 artifact（`release-<commit>`）就是這個 commit 的未簽章發佈包。`package` 之後另有 `windows-system` job（`tests/windows/`，ADR-0001 的 S0）：把同一份 MSI 與 zip 實際安裝到 `windows-2022`、`windows-2025` 的 runner 上，結果在 artifact `windows-s0-<os>-<commit>` 的 `results.md`。這個 job 是 2026-11 新增的，**第一次執行前它的失敗不一定是產品的問題**（腳本本身還沒有在 Windows 上跑過）；在 Windows 列入支援之前它要不要擋發佈，待使用者決定（建議：不擋，但發佈前要看過結果並記錄）。
 5. 合併到整合分支後，記下合併後的 commit（以下稱 `<release-commit>`）；之後的步驟都在這個 commit 上進行。
 
 ### 2.2 打 tag

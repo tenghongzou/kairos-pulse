@@ -85,6 +85,7 @@
 | `PLS-W4201` | `log_files.rs` `log_event` | 系統日期異常，暫停清除日誌 | `log.retention_paused` |
 | `PLS-E4002` | `main.rs` `main` | 無法初始化日誌（結束代碼 1） | stderr |
 | `PLS-E8204` | `local_status.rs` `Tracker::write_locked`、`run_writer` | 預設位置（`/var/lib/pulse`、`%ProgramData%\Pulse`）無法寫入而改寫 `logs/status.json`（記一次）；執行中無法寫入（第一次 `WARN`、連續失敗滿 60 秒 `ERROR` 並寫 stderr、之後每 10 分鐘一則 `ERROR` 摘要、其間 `DEBUG`；恢復時記 `status.write_restored`） | `status.write_failed`；前者為「設定」列 ⚠（提示更新 unit），後者 `pulse status` 隨後顯示「未知」 |
+| `PLS-E8207`（**工程暫定號**，設計包尚未分配） | `main.rs` `run`（`state_dir.rs` 的檢查）；`status_cmd`、`remote::state_dir` 沿用同一個結果 | Windows：預設的狀態目錄 `%ProgramData%\Pulse` 沒有通過信任檢查——擁有者不是 SYSTEM／Administrators／TrustedInstaller、DACL 讓其他主體寫入（含 0.8.0～0.10.1 建立、繼承 `%ProgramData%` ACL 的目錄）、NULL DACL、是重新解析點，或不存在而無法以受保護的 ACL 建立（安全稽核 F4）。服務照常執行，狀態檔改寫 `logs\status.json`、集中設定快取改放 `logs\remote\`；`pulse status` 不讀該目錄 | `config.warning`（ERROR）；「設定」列 ⚠（處理方式：停止服務、`rd /s /q "%ProgramData%\Pulse"`、啟動服務） |
 | `PLS-W8005` | `system_info.rs` `Sampler::refresh_and_read`、`check_stuck`；`inventory.rs` `run_worker` | 系統資訊取樣逾時；收集主機資產超過 10 秒（這次不送 `inventory`，不影響 report） | `sample.timeout` |
 | `PLS-I8009` | `system_info.rs` `report_limited` | 部分系統資訊因權限或平台限制無法取得，每個項目只記一次 `INFO`：系統序號（Linux 沒有 `/run/pulse/product_serial` 且不是 root、或 SMBIOS 沒有序號）、磁碟 I/O（讀不到 `/proc/diskstats`；Windows 讀不到效能計數器）、行程（只看得到自己的行程，例如 `ProtectProc=invisible`）。METRICS.md 第 4.5 節；`8006`～`8008` 保留給安裝前檢查 | `sysinfo.limited` |
 

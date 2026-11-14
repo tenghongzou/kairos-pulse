@@ -271,6 +271,9 @@ pub const W_AGENT_ID_PERMS: &str = "PLS-W8201";
 pub const W_KEY_PERMS: &str = "PLS-W8202";
 pub const E_NEED_ADMIN: &str = "PLS-E8203";
 pub const E_STATUS_UNWRITABLE: &str = "PLS-E8204";
+/// Windows 預設的狀態目錄 `%ProgramData%\Pulse` 不安全（擁有者、DACL 或重新解析點；`state_dir`，
+/// 安全稽核 F4）。**工程暫定號**：設計包尚未分配（`8205`／`8206` 曾是 Windows 服務的暫定號，避開）
+pub const E_STATE_DIR_UNSAFE: &str = "PLS-E8207";
 /// Windows 服務無法安裝、移除或啟動（`pulse service install|uninstall`；設計包 §30.3，子類別 81）
 pub const E_SERVICE_INSTALL: &str = "PLS-E8105";
 /// `pulse service run` 不是由服務控制管理員啟動，或無法切換到工作目錄（設計包 §30.3，子類別 81）
@@ -416,6 +419,7 @@ const ALL_CODES: &[&str] = &[
     W_KEY_PERMS,
     E_NEED_ADMIN,
     E_STATUS_UNWRITABLE,
+    E_STATE_DIR_UNSAFE,
     E_SERVICE_INSTALL,
     E_SERVICE_RUN,
     W_CLOCK_SKEW,
@@ -540,6 +544,7 @@ pub fn title(code: &str) -> Option<&'static str> {
         W_KEY_PERMS => "私鑰檔案權限過寬",
         E_NEED_ADMIN => "需要系統管理員權限",
         E_STATUS_UNWRITABLE => "無法寫入狀態檔",
+        E_STATE_DIR_UNSAFE => "狀態目錄不安全（擁有者或 ACL），已改用工作目錄",
         E_SERVICE_INSTALL => "無法安裝或移除 Windows 服務",
         E_SERVICE_RUN => "服務進入點無法執行",
         W_CLOCK_SKEW => "本機時鐘與 Kairos 相差超過 30 秒",

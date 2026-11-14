@@ -20,6 +20,7 @@ mod server_addr;
 mod service_status;
 mod shutdown;
 mod spool;
+mod state_dir;
 mod status_cmd;
 mod status_file;
 mod system_info;
@@ -315,6 +316,8 @@ fn status_tracker(config: &AppConfig, cwd: Option<&Path>) -> local_status::Track
     // status.file 未設定：設計包的位置（/var/lib/pulse、%ProgramData%\Pulse），無法寫入時改寫 logs/
     // systemd 的 StateDirectory=（多實例為 pulse/N）會設定 STATE_DIRECTORY，優先使用
     let (path, fallback) = match config.status.file.trim() {
+        // Windows：預設的狀態目錄沒有通過信任檢查（安全稽核 F4）時直接寫在 logs/，不碰那個目錄
+        "" if state_dir::verdict().is_err() => (base.join(status_file::LEGACY_RELATIVE), None),
         "" => (
             status_file::state_directory(std::env::var_os("STATE_DIRECTORY").as_deref())
                 .map_or_else(status_file::default_path, |d| d.join("status.json")),
@@ -479,6 +482,10 @@ fn run_agent(print_id: bool, external_stop: Option<CancellationToken>) -> u8 {
     if let Err(e) = setup_logger(&config.log) {
         eprintln!("錯誤 {}：無法初始化日誌：{e}", codes::E_LOG_INIT);
         return EXIT_GENERAL;
+    }
+    // Windows 服務：啟動時校正失敗復原設定的結果（校正發生在日誌初始化之前）
+    if let Some((level, message)) = winsvc::take_startup_note() {
+        log::log!(level, "{message}");
     }
     // 啟動時清除一次過期日誌檔（之後每小時一次，見 spawn_live_logging）
     retention.run();
@@ -664,8 +671,24 @@ async fn run(
         std::process::id()
     );
     let cwd = std::env::current_dir().ok();
+    // Windows：預設的狀態目錄（%ProgramData%\Pulse）不存在時以受保護的 ACL 建立，並檢查擁有者、DACL 與
+    // 重新解析點（安全稽核 F4）。必須在第一次使用狀態目錄之前；不合規時之後的狀態檔與集中設定快取都改用 logs/
+    let state_dir_problem = state_dir::prepare().err();
     // 本機狀態檔（pulse status）：之後各任務的狀態都記在這裡，每 10 秒與狀態變化時寫出
     let tracker = local_status::init(status_tracker(&config, cwd.as_deref()));
+    if let Some(violation) = &state_dir_problem {
+        let message = state_dir::rejection_message(violation);
+        error!(
+            "{}{message}",
+            codes::tag(codes::CONFIG_WARNING, Some(codes::E_STATE_DIR_UNSAFE))
+        );
+        tracker.update(|s| {
+            s.add_config_warning(status_file::CodeNote::new(
+                codes::E_STATE_DIR_UNSAFE,
+                message.clone(),
+            ));
+        });
+    }
     for (level, msg) in startup_location_messages(cwd.as_deref(), config.local_file_found) {
         log::log!(level, "{msg}");
         if let Some(rest) = msg.strip_prefix(&codes::tag(

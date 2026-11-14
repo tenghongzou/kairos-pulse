@@ -78,7 +78,8 @@ pulse service uninstall                              # 停止並刪除服務（�
 pulse service run [--workdir <目錄>]                 # 服務進入點，由服務控制管理員啟動
 ```
 
-- 服務名稱 `Pulse`（`pulse status` 查詢的名稱）、自動啟動、LocalSystem；失敗（含以非 0 結束代碼停止）時 10 秒後重新啟動，一天內最多 3 次（設定錯誤時不會無限重試）。
+- 服務名稱 `Pulse`（`pulse status` 查詢的名稱）、自動啟動、LocalSystem。
+- **失敗復原**：服務異常結束（含以非 0 結束代碼停止）時由服務控制管理員重新啟動——第 1 次失敗後等 10 秒、第 2 次 60 秒、第 3 次起每 300 秒，**沒有次數上限**（失敗次數超過動作數之後，服務控制管理員重複最後一個動作）；連續一天沒有失敗才重新從 10 秒算起。設定或憑證錯誤（結束代碼 3／4）因此會每 300 秒重試一次，直到修好為止（Linux 的 unit 對這些代碼不重新啟動，兩個平台不同）。服務每次啟動時比對完整的設定並校正回上述內容（由 MSI 註冊的服務、舊版註冊的服務、被修改過的設定都一樣；`sc.exe qfailure Pulse` 查看）。0.8.0～0.10.1 的文件寫「一天內最多 3 次」是錯的：那些版本設定的是三個「10 秒後重新啟動」，實際上每 10 秒重新啟動、沒有上限。「非 0 結束代碼也算失敗」這個旗標的變更依 Microsoft 的文件要到下次開機才生效，由 MSI 註冊的服務在第一次重開機前可能只對行程異常終止重新啟動（未實機驗證）。
 - `service run` 先把目前目錄切換到 `--workdir`（預設為 `pulse.exe` 所在目錄），**不會落在 `C:\Windows\System32`**：`pulse.toml`、`agent.id`、`identity\`、`buffer\` 與日誌 `logs\pulse-YYYY-MM-DD.log` 都在這個目錄下；本機狀態檔為 `%ProgramData%\Pulse\status.json`。
 - 服務的「停止」與「關機」要求與 Ctrl+C 相同：送出 TLS close_notify 後結束；結束代碼以服務特定代碼回報（`sc.exe query Pulse` 的 `SERVICE_EXIT_CODE`，1／3／4 與 Linux 相同）。
 - 錯誤代碼：`PLS-E8105` 服務無法安裝、移除或啟動（多半是沒有系統管理員權限）；`PLS-E8106` `service run` 不是由服務控制管理員啟動，或工作目錄不存在。
@@ -808,6 +809,7 @@ Pulse 0.5.0 (b81e2d4) · plc-hmi-07 · agent_id 9422cb70-1b2c-4d3e-9f00-11223344
 - 過時判斷：寫入時記錄單調時鐘（Linux `/proc/uptime`、Windows `GetTickCount64`），`pulse status` 以同一個時鐘相減，不受系統時間調整或與 Kairos 的時鐘偏差影響；重新開機後一律視為過時。
 - 位置與權限（`cli-spec.md` §4.1）：**所有人可讀，`pulse status` 不需要 root**。Linux 為 `/var/lib/pulse/status.json`，由 `pulse.service` 的 `StateDirectory=pulse`（`StateDirectoryMode=0755`）在 `ProtectSystem=strict` 下建立並開放寫入；以 systemd 執行時優先使用 `STATE_DIRECTORY`（多實例 `StateDirectory=pulse/N`）。檔案 0644、Pulse 自行建立的目錄 0755，以 `set_permissions` 明確設定（unit 的 `UMask=0077` 不影響）。發佈包的 `/opt/pulse` 為 751，一般帳號可以執行 `/opt/pulse/pulse`。Windows 為 `%ProgramData%\Pulse\status.json`，Pulse 在檔案上另外授予 BUILTIN\Users 讀取（目錄被收緊時仍可讀）。沒有權限讀取時結束代碼 10。
 - 預設位置無法寫入時（例如沿用沒有 `StateDirectory=` 的舊 unit）：**服務照常啟動與監控**，狀態檔改寫在工作目錄的 `logs/status.json`，記一次 `WARN`（`status.write_failed PLS-E8204`），`pulse status` 的「設定」列為警告（只有 root／`pulse` 群組讀得到 `logs/`）。預設位置恢復可寫後刪除 `logs/` 中的舊檔。執行中無法寫入狀態檔時，第一次記 `WARN`（`status.write_failed PLS-E8204`），連續失敗滿 60 秒（`pulse status` 開始顯示「未知」）記 `ERROR` 並寫 stderr，之後每 10 分鐘一則 `ERROR` 摘要；恢復時記 `INFO`（`status.write_restored`）。
+- Windows 的預設位置 `%ProgramData%\Pulse`（狀態檔與集中設定的快取）在使用前檢查（安全稽核 F4）：擁有者是 SYSTEM、Administrators 或 TrustedInstaller，DACL 不讓其他主體寫入，不是 junction 或符號連結；不存在時服務以只有 SYSTEM 與 Administrators 可寫的 ACL 建立。不合規時（含 0.8.0～0.10.1 建立、繼承了 Users 寫入權限的目錄）**服務照常執行但不使用它**：狀態檔改寫 `logs\status.json`、設定快取改放 `logs\remote\`，記 `ERROR`（`config.warning PLS-E8207`），`pulse status` 的「設定」列為警告，而且不讀那個目錄中的狀態檔。處理方式見 `INSTALL.md` A.3（停止服務、刪除該目錄、啟動服務）。
 
 ## agent.id
 
