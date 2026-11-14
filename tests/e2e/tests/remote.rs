@@ -451,3 +451,223 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
         k.dump()
     );
 }
+
+/// 外部 URL 版本的資格預覽（REMOTE.md 第 2.1、4.7.2 節）：Pulse 在 hello 的 `install.external_url` 宣告本機是否
+/// 允許外部 URL，實際的 Kairos 據此分類——
+///
+/// - 宣告 `none`（白名單是空的）：預覽列為 `url_not_allowed`，送出時固定為 `skipped`，不會被提議
+/// - 宣告 `allowlist`：可升級（Kairos 不知道白名單的內容）
+/// - 沒有宣告（0.10.1 以前的 Pulse；舊 Pulse 連新 Kairos）：照舊可升級，預覽的 `external_url.undeclared`
+///   註明台數；連線中的主機以這次 hello 為準，不沿用上一次宣告的值
+/// - 由 Kairos 代管的版本不看這個宣告
+#[test]
+fn external_url_declaration_reaches_the_eligibility_preview() {
+    let root = TestDir::new("remote-exturl");
+    let kairos = Kairos::new(&root, test_pki::CRL_EMPTY);
+    let signers = workspace_root().join("crates/kairos-proto/testdata/release/allowed_signers");
+    let toml = kairos.dir.join("kairos.toml");
+    let mut cfg = std::fs::read_to_string(&toml).unwrap();
+    cfg.push_str(&format!(
+        "\n[remote]\nallowed_signers = {:?}\n",
+        signers.to_string_lossy()
+    ));
+    std::fs::write(&toml, cfg).unwrap();
+    let mut k = start_kairos(
+        &kairos.dir,
+        &[("KAIROS_TEST_REMOTE_START_GRACE_MS", "1")],
+        &kairos.ports(),
+        &[KAIROS_STARTED],
+    );
+    let (code, p) = run_to_exit(
+        "kairos",
+        &kairos.dir,
+        &[
+            "api-token",
+            "create",
+            "--name",
+            "admin",
+            "--role",
+            "admin",
+            "--config",
+            "kairos.toml",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{}", p.dump());
+    let doc: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    let token = doc["data"]["token"].as_str().unwrap().to_string();
+    let port = kairos.console_port;
+    let post = |path: &str, body: Value| {
+        api_request(
+            port,
+            "POST",
+            path,
+            &token,
+            Some(("application/json", body.to_string().as_bytes())),
+        )
+    };
+
+    // 外部 URL 的版本庫：測試向量的發佈（真實的簽章），發佈檔只登記雜湊與大小
+    let base_url = "https://repo.example.gov.tw/kairos-pulse/0.9.1/";
+    let (s, v) = post(
+        "/api/v1/releases",
+        json!({
+            "sha256sums": text("SHA256SUMS"), "signature": text("SHA256SUMS.sig"),
+            "manifest": text("pulse-0.9.1-5e6f7a8-release.json"),
+            "source": "external", "base_url": base_url,
+        }),
+    );
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["data"]["source"], "external", "{v}");
+    let tar_name = "pulse-0.9.1-5e6f7a8-linux-x86_64.tar.gz";
+    let (s, v) = api_request(
+        port,
+        "PUT",
+        &format!("/api/v1/releases/0.9.1/artifacts/{tar_name}"),
+        &token,
+        Some(("application/octet-stream", &vector(tar_name))),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["registered"], true, "{v}");
+
+    // 模擬的 Pulse：hello 帶（或不帶）install.external_url；送一筆 report 讓主機進入清冊
+    let connect = |declared: Option<&str>| {
+        let mut h = hello("0.9.0");
+        if let Some(d) = declared {
+            h["install"]["external_url"] = json!(d);
+        }
+        let mut c = RawClient::connect(kairos.port, GOOD);
+        c.send(&h);
+        let ack = c.recv();
+        assert_eq!(ack["type"], "hello_ack", "{declared:?}: {ack}");
+        // 協定版本與 feature 不因這個欄位改變
+        assert_eq!(ack["proto"], 2, "{ack}");
+        c.send(&json!({"type": "report", "seq": 2, "ts": TS, "metrics": [{"name": "system.cpu.usage", "value": 3.0, "unit": "%"}]}));
+        assert_eq!(c.recv()["type"], "ack");
+        c
+    };
+    let spec = json!({
+        "name": "外部 URL", "target_version": "0.9.1",
+        "selector": {"agent_ids": [GOOD.agent_id]}, "waves": [{"size": "rest"}],
+    });
+    let preview = || {
+        let (s, v) = post("/api/v1/rollouts/preview", spec.clone());
+        assert_eq!(s, 200, "{v}");
+        v["data"].clone()
+    };
+    let declared_in_api = || {
+        let (s, v) = api_request(
+            port,
+            "GET",
+            &format!("/api/v1/hosts/{}/upgrade", GOOD.agent_id),
+            &token,
+            None,
+        );
+        if s == 200 {
+            v["data"]["install"]["external_url"].clone()
+        } else {
+            json!("（清冊還沒有這台主機）")
+        }
+    };
+
+    // 1. 宣告 none：事先列為 url_not_allowed，不算可升級
+    let c = connect(Some("none"));
+    assert!(
+        poll_until(WAIT, || preview()["skipped"]["url_not_allowed"] == 1),
+        "{}\n{}",
+        preview(),
+        k.dump()
+    );
+    let p = preview();
+    assert_eq!(p["eligible"], 0, "{p}");
+    assert_eq!(
+        p["samples"]["url_not_allowed"][0]["agent_id"], GOOD.agent_id,
+        "{p}"
+    );
+    assert_eq!(
+        p["external_url"],
+        json!({"base_url": base_url, "undeclared": 0, "allowlist": 0}),
+        "{p}"
+    );
+    assert_eq!(declared_in_api(), "none");
+    c.close();
+
+    // 2. 宣告 allowlist（修改 pulse.toml 後重新啟動的 Pulse）：可升級，註明 Kairos 不知道白名單的內容
+    let c = connect(Some("allowlist"));
+    assert!(
+        poll_until(WAIT, || preview()["eligible"] == 1),
+        "{}\n{}",
+        preview(),
+        k.dump()
+    );
+    let p = preview();
+    assert_eq!(p["skipped"], json!({}), "{p}");
+    assert_eq!(
+        p["external_url"],
+        json!({"base_url": base_url, "undeclared": 0, "allowlist": 1}),
+        "{p}"
+    );
+    assert_eq!(declared_in_api(), "allowlist");
+    c.close();
+
+    // 3. 沒有宣告（0.10.1 以前的 Pulse 連新的 Kairos）：照舊可升級；不沿用上一次連線宣告的值
+    let mut c = connect(None);
+    assert!(
+        poll_until(WAIT, || preview()["external_url"]["undeclared"] == 1),
+        "{}\n{}",
+        preview(),
+        k.dump()
+    );
+    let p = preview();
+    assert_eq!(
+        (p["eligible"].as_i64(), &p["skipped"]),
+        (Some(1), &json!({})),
+        "{p}"
+    );
+    assert_eq!(declared_in_api(), Value::Null);
+    // 送出並提議：外部 URL 的提議照現行的流程（source: url）；主機拒絕時是 declined
+    let (s, v) = post("/api/v1/rollouts", spec.clone());
+    assert_eq!(s, 201, "{v}");
+    let id = v["data"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post(
+        &format!("/api/v1/rollouts/{id}/submit"),
+        json!({"confirm": "升級 1 台"}),
+    );
+    assert_eq!(
+        (s, v["data"]["state"].as_str()),
+        (200, Some("running")),
+        "{v}"
+    );
+    let mut seq = 2;
+    let ack = heartbeat_until(&mut c, &mut seq, |p| p.get("upgrade_id").is_some());
+    let upgrade_id = ack["pending"]["upgrade_id"].as_str().unwrap().to_string();
+    seq += 1;
+    c.send(&json!({"type": "upgrade_get", "seq": seq, "ts": TS, "upgrade_id": upgrade_id}));
+    let offer = c.recv();
+    assert_eq!(offer["type"], "upgrade_offer", "{offer}");
+    assert_eq!(offer["artifact"]["source"], "url", "{offer}");
+    assert_eq!(
+        offer["artifact"]["url"],
+        format!("{base_url}{tar_name}"),
+        "{offer}"
+    );
+    seq += 1;
+    c.send(&json!({
+        "type": "upgrade_status", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "state": "declined",
+        "from_version": "0.9.0", "to_version": "0.9.1", "code": "PLS-W8411", "detail": "url_not_allowed"
+    }));
+    assert_eq!(c.recv()["type"], "ack");
+    let (s, v) = api_request(
+        port,
+        "GET",
+        &format!("/api/v1/rollouts/{id}/hosts"),
+        &token,
+        None,
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"][0]["state"], "declined", "{v}");
+    c.close();
+    let (code, _) = k.stop();
+    assert_eq!(code, 0, "{}", k.dump());
+}

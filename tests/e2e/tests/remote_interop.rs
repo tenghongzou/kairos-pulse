@@ -276,6 +276,20 @@ fn real_kairos_pushes_central_config_to_a_real_pulse() {
         host_config()
     );
 
+    // 實際的 Pulse 在 hello 宣告 install.external_url（REMOTE.md 第 2.1 節）：這份 pulse.toml 沒有設定
+    // upgrade.url_allowlist → `none`。Kairos 的主機 API 帶出這個值，外部 URL 版本的資格預覽據此分類
+    // （分類本身見 remote.rs 的 external_url_declaration_reaches_the_eligibility_preview）
+    let (s, v) = call(
+        "GET",
+        &format!("/api/v1/hosts/{}/upgrade", GOOD.agent_id),
+        None,
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["install"]["external_url"], "none", "{v}");
+    let (s, v) = call("GET", &format!("/api/v1/hosts/{}", GOOD.agent_id), None);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["install"]["external_url"], "none", "{v}");
+
     p.stop();
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());
