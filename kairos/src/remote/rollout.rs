@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use kairos_proto::mgmt::{
     DEFAULT_HEALTH_TIMEOUT_SECS, INSTALL_EXTERNAL_URL_ALLOWLIST, INSTALL_EXTERNAL_URL_NONE,
-    INSTALL_METHOD_DEB, INSTALL_METHOD_RPM, INSTALL_UPGRADE_READY, INSTALL_UPGRADE_UNSAFE_PATH,
-    MAX_HEALTH_TIMEOUT_SECS, MIN_HEALTH_TIMEOUT_SECS,
+    INSTALL_METHOD_DEB, INSTALL_METHOD_RPM, INSTALL_ROLLBACK_ARCHIVED, INSTALL_ROLLBACK_DEGRADED,
+    INSTALL_UPGRADE_READY, INSTALL_UPGRADE_UNSAFE_PATH, MAX_HEALTH_TIMEOUT_SECS,
+    MIN_HEALTH_TIMEOUT_SECS,
 };
 use kairos_proto::release::{self, Os, ReleaseManifest, Version};
 
@@ -641,10 +642,31 @@ pub struct Eligibility {
     pub from_version: Option<String>,
     /// 降版
     pub downgrade: bool,
-    /// deb／rpm 沒有回滾檔（`allow_no_rollback` 時仍可升級）
+    /// deb／rpm 無法經套件管理員回滾：Kairos 的版本庫沒有主機目前的版本，主機也沒有宣告本機封存
+    /// （`allow_no_rollback` 時仍可升級；健康確認失敗時只換回執行檔，結果是降級回滾）
     pub no_rollback: bool,
+    /// 健康確認失敗時預期的回滾方式（可升級的主機才有意義）
+    pub rollback: RollbackVia,
+    /// 主機宣告 `install.rollback = "degraded"`（上一次是降級回滾，套件資料庫仍不一致）
+    pub degraded: bool,
     /// 目標是外部 URL 的版本時，這台主機的 `install.external_url`（可升級的主機才有意義）
     pub external_url: ExternalUrl,
+}
+
+/// 健康確認失敗時預期的回滾方式（ADR-0003 第 5.4 節的來源順序；資格預覽的 `rollback`）。這是 Kairos 依
+/// 版本庫與主機的宣告所做的**預期**：實際使用哪一個來源由主機上的升級輔助程式驗證後決定
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RollbackVia {
+    /// tar 等只做執行檔層級回滾的安裝方式：不適用
+    #[default]
+    NotApplicable,
+    /// 主機宣告本機封存（`install.rollback = "archived"`）：經套件管理員回滾，不依賴版本庫
+    Archive,
+    /// 版本庫有主機目前的版本：提議附回滾檔與 `rollback_bundle`（第一次遠端升級的主機也能經套件
+    /// 管理員回滾；較舊的 Pulse 忽略 bundle，只有本機有紀錄時才使用回滾檔）
+    Repository,
+    /// 只能換回執行檔（`no_rollback`）
+    BinaryOnly,
 }
 
 /// 主機對外部 URL 的宣告（hello 的 `install.external_url`；REMOTE.md 第 2.1 節）
@@ -671,6 +693,8 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
         from_version: h.agent_version.clone(),
         downgrade: false,
         no_rollback: false,
+        rollback: RollbackVia::NotApplicable,
+        degraded: h.install_rollback.as_deref() == Some(INSTALL_ROLLBACK_DEGRADED),
         external_url: ExternalUrl::NotApplicable,
     };
     let skip = |mut e: Eligibility, why| {
@@ -751,7 +775,16 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
             .by_version
             .get(&current.to_string())
             .is_some_and(|list| pick_artifact(list, method, &arch).is_some());
-        if !has {
+        // 本機封存（Pulse 0.11.0 之後的版本宣告）優先於版本庫：封存的是這台主機實際安裝過的那一份套件，
+        // 回滾不依賴 Kairos。沒有宣告、宣告其他值或不認得的值：看版本庫有沒有主機目前的版本
+        e.rollback = if h.install_rollback.as_deref() == Some(INSTALL_ROLLBACK_ARCHIVED) {
+            RollbackVia::Archive
+        } else if has {
+            RollbackVia::Repository
+        } else {
+            RollbackVia::BinaryOnly
+        };
+        if e.rollback == RollbackVia::BinaryOnly {
             e.no_rollback = true;
             if !opts.allow_no_rollback {
                 return skip(e, "no_rollback");
@@ -820,6 +853,12 @@ pub struct Preview {
     pub eligible: usize,
     pub downgrade: usize,
     pub no_rollback: usize,
+    /// 可升級的 deb／rpm 主機預期的回滾方式（[`RollbackVia`]）：本機封存、版本庫的回滾檔（＋bundle）的台數
+    /// （只能換回執行檔的就是 `no_rollback`）
+    pub rollback_archive: usize,
+    pub rollback_repository: usize,
+    /// 可升級的主機中宣告 `install.rollback = "degraded"`（需要修復套件）的台數
+    pub degraded: usize,
     /// 原因 → 台數
     pub skipped: BTreeMap<&'static str, usize>,
     /// 原因 → 前 100 台的 agent_id
@@ -888,6 +927,9 @@ pub fn plan(
                 p.eligible += 1;
                 p.downgrade += usize::from(e.downgrade);
                 p.no_rollback += usize::from(e.no_rollback);
+                p.rollback_archive += usize::from(e.rollback == RollbackVia::Archive);
+                p.rollback_repository += usize::from(e.rollback == RollbackVia::Repository);
+                p.degraded += usize::from(e.degraded);
                 if let Some(x) = p.external_url.as_mut() {
                     x.undeclared += usize::from(e.external_url == ExternalUrl::Undeclared);
                     x.allowlist += usize::from(e.external_url == ExternalUrl::Allowlist);
@@ -916,6 +958,14 @@ impl Preview {
             "eligible": self.eligible,
             "downgrade": self.downgrade,
             "no_rollback": self.no_rollback,
+            // 可升級的 deb／rpm 主機預期的回滾方式（ADR-0003 第 5.4 節）：本機封存、版本庫的回滾檔、只能
+            // 換回執行檔（與 no_rollback 同一個數字）；degraded_hosts＝宣告需要修復套件的主機
+            "rollback": {
+                "archive": self.rollback_archive,
+                "repository": self.rollback_repository,
+                "binary_only": self.no_rollback,
+                "degraded_hosts": self.degraded,
+            },
             "skipped": self.skipped,
             "samples": self.samples.iter().map(|(k, v)| (k.to_string(), v.iter().map(|(a, h)| json!({"agent_id": a, "hostname": h})).collect::<Vec<_>>())).collect::<BTreeMap<_, _>>(),
             "overlap": {
@@ -1177,6 +1227,16 @@ pub const PAUSE_MANUAL: &str = "manual";
 pub const PAUSE_FAILURE_RATIO: &str = "failure_ratio";
 /// 自動暫停：主機回報回滾失敗
 pub const PAUSE_ROLLBACK_FAILED: &str = "rollback_failed";
+/// 自動暫停：主機回報降級回滾（服務已恢復，但套件資料庫與實際的執行檔不一致；REMOTE.md 第 4.5.2、
+/// 4.7.4 節）
+pub const PAUSE_ROLLBACK_DEGRADED: &str = "rollback_degraded";
+/// 自動暫停：`upgrade_offer` 省略 `rollback_bundle` 後仍超過單行上限，沒有送出（REMOTE.md 第 2.4.1 節）
+pub const PAUSE_OFFER_TOO_LARGE: &str = "offer_too_large";
+/// 推送中主機的 `reason`：`upgrade_offer` 超過單行上限而沒有送出（狀態 `failed`，代碼 `KRS-W8419`）
+pub const REASON_OFFER_TOO_LARGE: &str = "offer_too_large";
+/// 推送中主機的 `reason`：含 `rollback_bundle` 的提議超過單行上限，已省略 bundle 後送出（主機照常升級；
+/// 回滾檔只有在主機本機有紀錄時才會被使用）
+pub const REASON_BUNDLE_OMITTED: &str = "rollback_bundle_omitted";
 /// 自動暫停：主機回報發佈包的簽章驗證失敗（同一版本的其他推送一起暫停）
 pub const PAUSE_SIGNATURE_FAILED: &str = "signature_failed";
 
@@ -1359,6 +1419,30 @@ pub fn waves_json(waves: &[WaveSpec], hosts: &[RolloutHostRow], current: i64) ->
     )
 }
 
+/// 這一列是降級回滾時的原因（`state` 為 `rolled_back` 且 `detail` 以 `degraded:` 開頭）；否則 `None`
+pub fn degraded_of(h: &RolloutHostRow) -> Option<Vec<String>> {
+    if h.state != HOST_ROLLED_BACK {
+        return None;
+    }
+    kairos_proto::mgmt::degraded_reasons(h.detail.as_deref()?)
+        .map(|v| v.into_iter().map(str::to_string).collect())
+}
+
+/// 主機「需要修復套件」（降級回滾之後套件資料庫與實際的執行檔不一致；REMOTE.md 第 4.5.2 節）：
+/// Pulse 宣告 `install.rollback = "degraded"`；或 Pulse 沒有宣告（0.11.0 以前的版本不會做降級回滾，這裡
+/// 只是保守處理不認得的組合）而最近一次已結束的升級是降級回滾。宣告了其他值＝已修復（重新安裝套件或
+/// 之後的升級成功）
+pub fn needs_package_repair(install_rollback: Option<&str>, upgrades: &[RolloutHostRow]) -> bool {
+    match install_rollback {
+        Some(v) => v == kairos_proto::mgmt::INSTALL_ROLLBACK_DEGRADED,
+        None => upgrades
+            .iter()
+            .filter(|u| u.finished_at.is_some())
+            .max_by_key(|u| u.finished_at)
+            .is_some_and(|u| degraded_of(u).is_some()),
+    }
+}
+
 /// 主機欄位的 JSON（推送的主機表、主機的升級紀錄）
 pub fn host_json(h: &RolloutHostRow) -> Value {
     let ts = |v: Option<i64>| v.map(crate::api::http::ts_ms);
@@ -1377,6 +1461,9 @@ pub fn host_json(h: &RolloutHostRow) -> Value {
         "progress": h.bytes_total.map(|t| json!({"bytes": h.bytes_done.unwrap_or(0), "total": t})),
         "code": h.code,
         "detail": h.detail,
+        // 降級回滾（REMOTE.md 第 4.5.2 節）：`rolled_back` 而 `detail` 以 `degraded:` 開頭時，機器可讀的原因
+        // （Pulse 回報什麼就列什麼，由資料驅動）；其他情況為 null
+        "degraded": degraded_of(h),
         "offered_at": ts(h.offered_at),
         "applying_at": ts(h.applying_at),
         "finished_at": ts(h.finished_at),

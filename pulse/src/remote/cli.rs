@@ -340,6 +340,11 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
         Ok(s) => (s.current.clone(), s.history.last().cloned()),
         Err(_) => (None, None),
     };
+    // 需要修復套件：最近一次的結果是降級回滾（REMOTE.md 第 4.5.2 節）
+    let repair = last.as_ref().is_some_and(|l| {
+        l.state == kairos_proto::mgmt::UPGRADE_STATE_ROLLED_BACK
+            && kairos_proto::mgmt::degraded_reasons(&l.detail).is_some()
+    });
     if json_out {
         let out = json!({
             "schema": "pulse.upgrade-status/v1",
@@ -353,6 +358,7 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
                 "apply_window": c.offer.apply_window,
             })),
             "last": last,
+            "package_repair_needed": repair,
             "state_error": state.as_ref().err(),
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
@@ -405,6 +411,28 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
                 .unwrap_or_default(),
             l.at
         );
+        if !l.detail.is_empty() {
+            println!("  說明：{}", l.detail);
+        }
+    }
+    if repair {
+        println!(
+            "需要修復套件（{}）：上一次升級失敗後只換回了執行檔，套件資料庫與實際安裝的執行檔不一致。",
+            codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+        );
+        println!(
+            "  請重新安裝 Pulse {} 的套件（不會改動 pulse.toml 與身分）：",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!(
+            "  {}",
+            if d.method == "rpm" {
+                "sudo rpm -U --replacepkgs --oldpackage pulse-<版本>-<commit>-linux-<arch>.rpm"
+            } else {
+                "sudo dpkg -i pulse-<版本>-<commit>-linux-<arch>.deb"
+            }
+        );
+        println!("  （先驗證發佈包的簽章與雜湊；或由 Kairos 再推送一次升級，升級成功後恢復一致）");
     }
     if let Err(e) = &state {
         println!("（無法讀取遠端升級的狀態檔：{e}）");

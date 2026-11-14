@@ -1887,9 +1887,10 @@ impl PgStore {
                 "INSERT INTO hosts (agent_id, hostname, agent_version, proto, host_fingerprint,
                     display_name, tags, os, report_interval_ms, peer, identity_verified, online,
                     first_seen, connected_at, last_seen, offline_after_ms, last_report,
-                    install_method, install_upgrade, install_config, install_external_url)
+                    install_method, install_upgrade, install_config, install_external_url,
+                    install_rollback)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                    ?18, ?19, ?20, ?21)
+                    ?18, ?19, ?20, ?21, ?22)
                  ON CONFLICT (agent_id) DO UPDATE SET
                     hostname = excluded.hostname,
                     agent_version = excluded.agent_version,
@@ -1910,7 +1911,9 @@ impl PgStore {
                     install_upgrade = COALESCE(excluded.install_upgrade, hosts.install_upgrade),
                     install_config = COALESCE(excluded.install_config, hosts.install_config),
                     install_external_url = CASE WHEN excluded.install_upgrade IS NOT NULL
-                        THEN excluded.install_external_url ELSE hosts.install_external_url END
+                        THEN excluded.install_external_url ELSE hosts.install_external_url END,
+                    install_rollback = CASE WHEN excluded.install_upgrade IS NOT NULL
+                        THEN excluded.install_rollback ELSE hosts.install_rollback END
                  RETURNING host_id, rollup_until",
                 params![
                     row.agent_id,
@@ -1934,6 +1937,7 @@ impl PgStore {
                     row.install_upgrade,
                     row.install_config,
                     row.install_external_url,
+                    row.install_rollback,
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;

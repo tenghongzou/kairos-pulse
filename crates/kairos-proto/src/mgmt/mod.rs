@@ -200,6 +200,26 @@ pub const INSTALL_EXTERNAL_URL_ALLOWLIST: &str = "allowlist";
 pub const INSTALL_EXTERNAL_URL_STATES: [&str; 2] =
     [INSTALL_EXTERNAL_URL_NONE, INSTALL_EXTERNAL_URL_ALLOWLIST];
 
+/// `install.rollback`（Pulse 0.11.0 之後的版本；ADR-0003 階段 2、REMOTE.md 第 2.1、4.4.2 節）：這台主機
+/// 目前的版本在 root 專屬的本機封存中有完整的套件（deb／rpm）——自動回滾可以經套件管理員裝回，不需要
+/// Kairos 的版本庫有這個版本
+pub const INSTALL_ROLLBACK_ARCHIVED: &str = "archived";
+/// `install.rollback`：只能做執行檔層級的回滾（`pulse.prev`）：tar 安裝，或 deb／rpm 而沒有本機封存
+/// （Kairos 的版本庫有主機目前的版本時，提議附的回滾檔與 `rollback_bundle` 仍可讓它經套件管理員回滾）
+pub const INSTALL_ROLLBACK_BINARY_ONLY: &str = "binary_only";
+/// `install.rollback`：沒有自動回滾（遠端升級在這台主機上不可用：`install.upgrade` 不是 `ready`）
+pub const INSTALL_ROLLBACK_NONE: &str = "none";
+/// `install.rollback`：上一次自動回滾是降級回滾，套件資料庫與實際的執行檔仍不一致（需要重新安裝目前
+/// 版本的套件；REMOTE.md 第 4.5.2 節）
+pub const INSTALL_ROLLBACK_DEGRADED: &str = "degraded";
+/// 規格定義的 `install.rollback`；沒有這個欄位（0.11.0 以前的 Pulse）＝未知
+pub const INSTALL_ROLLBACK_STATES: [&str; 4] = [
+    INSTALL_ROLLBACK_ARCHIVED,
+    INSTALL_ROLLBACK_BINARY_ONLY,
+    INSTALL_ROLLBACK_NONE,
+    INSTALL_ROLLBACK_DEGRADED,
+];
+
 /// `install` 每個欄位的長度上限（bytes）
 pub const MAX_INSTALL_FIELD_BYTES: usize = 32;
 
@@ -220,6 +240,10 @@ pub struct InstallInfo {
     /// 忽略這個欄位（「物件中的其他欄位忽略」是 0.9.0 就定下的規則），協定版本不變
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_url: Option<String>,
+    /// [`INSTALL_ROLLBACK_STATES`] 之一（Pulse 0.11.0 之後的版本）；沒有＝未知。較舊的 Kairos 忽略這個
+    /// 欄位，協定版本不變
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<String>,
 }
 
 /// `install` 欄位值的格式：1～32 bytes 的小寫英文字母、數字或 `_`
@@ -238,6 +262,7 @@ pub fn validate_install(install: &InstallInfo) -> Result<(), String> {
         ("install.upgrade", &install.upgrade),
         ("install.config", &install.config),
         ("install.external_url", &install.external_url),
+        ("install.rollback", &install.rollback),
     ] {
         if let Some(v) = value
             && !is_install_token(v)
@@ -761,6 +786,87 @@ pub struct ArtifactRef {
     pub url: Option<String>,
 }
 
+/// `upgrade_offer.rollback_bundle`：回滾檔所屬發佈的簽章資料（ADR-0003 第 6.1 節）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackBundle {
+    /// 該次發佈的 `SHA256SUMS` 全文，1..=[`MAX_SHA256SUMS_BYTES`]
+    pub sha256sums: String,
+    /// 該次發佈的 `SHA256SUMS.sig` 全文，1..=[`MAX_SIGNATURE_BYTES`]
+    pub signature: String,
+}
+
+/// 送出 `upgrade_offer` 前為單行上限預留的餘裕（bytes；ADR-0003 第 6.3 節）
+pub const OFFER_LINE_RESERVE: usize = 1024;
+
+/// [`fit_upgrade_offer`] 的結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferFit {
+    /// 原樣送出
+    Full,
+    /// 含 `rollback_bundle` 時超過單行上限：已省略 `rollback_bundle`（主機照常升級；回滾檔只有在主機
+    /// 本機有它所屬發佈的紀錄時才會被使用）
+    BundleOmitted,
+    /// 省略 `rollback_bundle` 後仍超過：不得送出
+    TooLarge,
+}
+
+/// 完整的伺服器訊息（`{"type":"upgrade_offer",…}`）實際序列化後的長度，加上換行字元
+pub fn upgrade_offer_line_len(offer: &UpgradeOffer) -> usize {
+    crate::ServerMsg::UpgradeOffer(Box::new(offer.clone()))
+        .to_line()
+        .map_or(usize::MAX, |l| l.len().saturating_add(1))
+}
+
+/// 單行大小的三段式規則（Kairos 送出 `upgrade_offer` 前；ADR-0003 第 6.3 節、REMOTE.md 第 2.4.1 節）：
+/// 以要送出的完整訊息**實際序列化**後的長度（含換行）加上 [`OFFER_LINE_RESERVE`]，必須不超過
+/// [`MAX_LINE_LENGTH`](crate::MAX_LINE_LENGTH)。含 `rollback_bundle` 時超過 → 省略它再算一次；仍超過 →
+/// [`OfferFit::TooLarge`]（呼叫端不得送出：超過單行上限的訊息對端會當成連線錯誤，而不是忽略欄位）
+pub fn fit_upgrade_offer(offer: &mut UpgradeOffer) -> OfferFit {
+    let fits = |o: &UpgradeOffer| {
+        upgrade_offer_line_len(o).saturating_add(OFFER_LINE_RESERVE) <= crate::MAX_LINE_LENGTH
+    };
+    if fits(offer) {
+        return OfferFit::Full;
+    }
+    if offer.rollback_bundle.take().is_some() && fits(offer) {
+        return OfferFit::BundleOmitted;
+    }
+    OfferFit::TooLarge
+}
+
+/// 降級回滾（ADR-0003 第 5.4 節、REMOTE.md 第 4.5.2 節）：`upgrade_status.state` 仍是 `rolled_back`，
+/// `detail` 以這個前綴開頭，接著是以逗號分隔的原因（[`degraded_reasons`]），之後才是人讀的說明
+pub const DEGRADED_PREFIX: &str = "degraded:";
+/// 降級回滾的原因：套件資料庫與實際的執行檔不一致（每一次降級回滾都有）
+pub const DEGRADED_PACKAGE_DB_INCONSISTENT: &str = "package_db_inconsistent";
+/// 降級回滾的原因：套件管理員裝回回滾套件失敗，改以 `pulse.prev` 緊急復原
+pub const DEGRADED_PACKAGE_ROLLBACK_FAILED: &str = "package_rollback_failed";
+/// 降級回滾的原因：回滾套件的簽署金鑰已從信任錨移除（撤銷）或信任錨無法讀取
+pub const DEGRADED_SIGNER_REVOKED: &str = "rollback_signer_revoked";
+/// 降級回滾的原因：沒有任何回滾套件（提議沒有附、本機也沒有封存）
+pub const DEGRADED_NO_PACKAGE: &str = "no_rollback_package";
+/// 降級回滾的原因：回滾套件沒有通過簽章、雜湊或檔名與平台的驗證（含簽署金鑰已到期）
+pub const DEGRADED_NOT_VERIFIED: &str = "rollback_not_verified";
+/// 降級回滾的原因：回滾套件中的執行檔與替換前實際安裝的執行檔不同
+pub const DEGRADED_BINARY_MISMATCH: &str = "rollback_binary_mismatch";
+/// 降級回滾的原因：回滾套件的 commit 與替換前執行的版本不同
+pub const DEGRADED_COMMIT_MISMATCH: &str = "rollback_commit_mismatch";
+/// 降級回滾的原因：驗證過的回滾套件複本在回滾時與紀錄的雜湊不符
+pub const DEGRADED_COPY_CHANGED: &str = "rollback_copy_changed";
+/// 降級回滾的原因：本機封存的索引或內容損毀、缺失或不安全
+pub const DEGRADED_ARCHIVE_UNUSABLE: &str = "rollback_archive_unusable";
+
+/// 降級回滾的 `detail` 中機器可讀的原因；不是降級回滾（沒有 [`DEGRADED_PREFIX`]）時 `None`。
+/// 原因是小寫英文字母、數字與 `_` 的代碼，以逗號分隔，到第一個其他字元（通常是 `;`）為止；不認得的
+/// 代碼照樣回傳（由資料驅動：之後的 Pulse 可以新增原因）
+pub fn degraded_reasons(detail: &str) -> Option<Vec<&str>> {
+    let rest = detail.strip_prefix(DEGRADED_PREFIX)?;
+    let end = rest
+        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == ','))
+        .unwrap_or(rest.len());
+    Some(rest[..end].split(',').filter(|s| !s.is_empty()).collect())
+}
+
 /// `upgrade_offer.manifest`：發佈清單的檔名與內容（JSON 字串）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestRef {
@@ -810,6 +916,11 @@ pub struct UpgradeOffer {
     /// deb／rpm／msi 的主機才有：目前版本、同格式同平台的發佈檔（自動回滾用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_artifact: Option<ArtifactRef>,
+    /// `rollback_artifact` 所屬那次發佈的 `SHA256SUMS` 與簽章（0.11.0 之後的 Kairos；ADR-0003 階段 1、
+    /// REMOTE.md 第 2.4.1 節）。只有 `rollback_artifact` 存在時才允許。**只是提示**：Pulse 與升級輔助
+    /// 程式各自以本機信任錨完整驗證後才使用回滾檔；較舊的 Pulse 忽略這個欄位
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_bundle: Option<RollbackBundle>,
     /// 0.9.0 以前的發佈沒有清單：`null`（只能作為降版或回滾目標）
     pub manifest: Option<ManifestRef>,
     /// 該次發佈的 `SHA256SUMS` 全文
@@ -881,6 +992,21 @@ pub fn validate_upgrade_offer(o: &UpgradeOffer) -> Result<(), String> {
     check_artifact("artifact", &o.artifact)?;
     if let Some(r) = &o.rollback_artifact {
         check_artifact("rollback_artifact", r)?;
+    }
+    if let Some(b) = &o.rollback_bundle {
+        if o.rollback_artifact.is_none() {
+            return Err("rollback_bundle is only allowed with rollback_artifact".to_string());
+        }
+        if b.sha256sums.is_empty() || b.sha256sums.len() > MAX_SHA256SUMS_BYTES {
+            return Err(format!(
+                "rollback_bundle.sha256sums must be 1..={MAX_SHA256SUMS_BYTES} bytes"
+            ));
+        }
+        if b.signature.is_empty() || b.signature.len() > MAX_SIGNATURE_BYTES {
+            return Err(format!(
+                "rollback_bundle.signature must be 1..={MAX_SIGNATURE_BYTES} bytes"
+            ));
+        }
     }
     if let Some(m) = &o.manifest {
         if m.content.len() > MAX_MANIFEST_BYTES {

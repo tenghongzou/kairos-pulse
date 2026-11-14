@@ -124,6 +124,24 @@ fn pkg_db(fake: &Fake) -> String {
     fake.pkg_db.borrow().clone().unwrap_or_default()
 }
 
+/// 健康確認失敗而回滾時的代碼：沒有回滾套件的 deb 只換回執行檔，是降級回滾（ADR-0003 第 5.4 節）
+fn rolled_back_code(kind: Kind) -> &'static str {
+    if kind == Kind::DebNoRollback {
+        codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+    } else {
+        codes::W_UPGRADE_ROLLED_BACK
+    }
+}
+
+/// 降級回滾的 `detail` 開頭（機器可讀的原因）；其他情況是空字串
+fn degraded_prefix(kind: Kind) -> &'static str {
+    if kind == Kind::DebNoRollback {
+        "degraded:no_rollback_package,package_db_inconsistent; "
+    } else {
+        ""
+    }
+}
+
 /// 當機時磁碟上的狀態（對照表的第三欄）
 fn crash_state(env: &Env, fake: &Fake, kind: Kind, p: &Point, label: &str) {
     let rec = match txn::load_record(&env.work()) {
@@ -269,13 +287,21 @@ fn final_state(
         "{label}: {r:?}"
     );
     if crashy {
+        // 沒有回滾套件的 deb：只換回執行檔＝降級回滾（state 相同，代碼與 detail 的前綴不同）
         assert_eq!(
             (r.state.as_str(), r.code.as_deref()),
-            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+            ("rolled_back", Some(rolled_back_code(kind))),
             "{label}: {r:?}"
         );
         assert!(
-            r.detail.starts_with("crash_restart"),
+            r.detail
+                .starts_with(&format!("{}crash_restart", degraded_prefix(kind))),
+            "{label}: {}",
+            r.detail
+        );
+        assert_eq!(
+            kairos_proto::mgmt::degraded_reasons(&r.detail).is_some(),
+            kind == Kind::DebNoRollback,
             "{label}: {}",
             r.detail
         );
@@ -547,13 +573,17 @@ fn rows_13_and_14_resumed_after_the_deadline_check_health_before_rolling_back() 
                 if healthy {
                     final_state(&env, &after, kind, p, false, &r, &label);
                 } else {
+                    // 沒有回滾套件的 deb：只換回執行檔＝降級回滾（state 相同，代碼與 detail 的前綴不同）
                     assert_eq!(
                         (r.state.as_str(), r.code.as_deref()),
-                        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+                        ("rolled_back", Some(rolled_back_code(kind))),
                         "{label}: {r:?}"
                     );
                     assert!(
-                        r.detail.starts_with("health_timeout (not_registered"),
+                        r.detail.starts_with(&format!(
+                            "{}health_timeout (not_registered",
+                            degraded_prefix(kind)
+                        )),
                         "{label}: {}",
                         r.detail
                     );
@@ -769,8 +799,9 @@ fn a_replacement_that_cannot_complete_fails_untouched_or_restores_the_old_versio
     env.cleanup();
 }
 
-/// 回滾只使用與紀錄的雜湊相符的複本：`rollback.pkg`、`pulse.prev` 在中斷期間被換掉時不安裝它，
-/// 結果是 `rollback_failed`（由人處理）
+/// 回滾只使用與紀錄的雜湊相符的複本：`rollback.pkg` 在中斷期間被換掉時不安裝它，改以 `pulse.prev`
+/// （雜湊仍與紀錄相符）緊急復原，結果是降級回滾（ADR-0003 第 5.4 節；0.11.0 以前是 `rollback_failed`）；
+/// `pulse.prev` 被換掉時沒有更保守的來源可退：`rollback_failed`（由人處理）
 #[test]
 fn rollback_only_uses_copies_that_match_the_recorded_hashes() {
     let mut env = setup("fm-rb-pkg-changed", "deb");
@@ -784,8 +815,14 @@ fn rollback_only_uses_copies_that_match_the_recorded_hashes() {
     let r = apply(&env.paths, &after).unwrap();
     assert_eq!(
         (r.state.as_str(), r.code.as_deref()),
-        ("rollback_failed", Some(codes::E_UPGRADE_ROLLBACK_FAILED)),
+        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED)),
         "{r:?}"
+    );
+    assert_eq!(
+        kairos_proto::mgmt::degraded_reasons(&r.detail),
+        Some(vec!["rollback_copy_changed", "package_db_inconsistent"]),
+        "{}",
+        r.detail
     );
     assert!(r.detail.contains(DETAIL_COPY_CHANGED), "{}", r.detail);
     assert!(
@@ -793,7 +830,35 @@ fn rollback_only_uses_copies_that_match_the_recorded_hashes() {
         "{:?}",
         after.calls()
     );
-    assert_eq!(env.installed(), "0.9.1", "沒有安裝被換掉的套件");
+    assert_eq!(env.installed(), "0.9.0", "換回的是替換前的執行檔");
+    assert_eq!(env.prev(), "0.9.0");
+    assert_eq!(pkg_db(&after), "0.9.1 ii", "沒有安裝被換掉的套件");
+    after.assert_invariants();
+    env.cleanup();
+
+    // 被換掉的套件加上被換掉的 pulse.prev：沒有可用的來源
+    let mut env = setup("fm-rb-both-changed", "deb");
+    stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    apply_until(&env.paths, &fake, "rollback_intent_recorded");
+    std::fs::write(env.work().join(txn::ROLLBACK_PKG_FILE), "VERSION=0.8.0\n").unwrap();
+    std::fs::write(env.paths.install_dir.join("pulse.prev"), "VERSION=0.8.0\n").unwrap();
+    env.helper_is_installed();
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("rollback_failed", Some(codes::E_UPGRADE_ROLLBACK_FAILED)),
+        "{r:?}"
+    );
+    assert!(r.detail.contains("pulse.prev"), "{}", r.detail);
+    assert!(!after.calls().iter().any(|c| c.starts_with("dpkg")));
+    assert_eq!(
+        env.installed(),
+        "0.9.1",
+        "沒有安裝被換掉的套件，也沒有換上被換掉的執行檔"
+    );
     env.cleanup();
 
     let mut env = setup("fm-rb-prev-changed", "tar");

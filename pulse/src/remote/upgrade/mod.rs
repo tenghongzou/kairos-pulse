@@ -77,6 +77,10 @@ const URL_RETRY: Duration = Duration::from_secs(60);
 const URL_POLL: Duration = Duration::from_secs(2);
 /// 驗證過的發佈的簽章資料（回滾檔的信任來源）
 const RELEASES_DIR: &str = "releases";
+/// [`Current::rollback_source`]：回滾檔的簽章資料來自本機紀錄（`releases/<版本>/`）
+pub const ROLLBACK_SOURCE_RECORD: &str = "record";
+/// [`Current::rollback_source`]：回滾檔的簽章資料來自提議的 `rollback_bundle`（ADR-0003 階段 1）
+pub const ROLLBACK_SOURCE_BUNDLE: &str = "bundle";
 
 /// 遠端升級的設定與環境（啟動時決定；測試時以暫存目錄模擬）
 #[derive(Debug, Clone)]
@@ -180,9 +184,14 @@ pub struct Current {
     pub quarter: u8,
     /// 實際使用的健康確認期限
     pub health_timeout_secs: u32,
-    /// 回滾檔所屬的發佈在本機有驗證過的紀錄
+    /// 回滾檔可以使用：它所屬發佈的簽章資料（本機紀錄或提議的 `rollback_bundle`）以本機信任錨驗證通過。
+    /// 只是 Pulse（服務帳號）的判斷：輔助程式會以 root 重新驗證並綁定（REMOTE.md 第 4.4.2 節）
     #[serde(default)]
     pub rollback_trusted: bool,
+    /// 回滾檔的簽章資料來自哪裡：[`ROLLBACK_SOURCE_RECORD`]（本機紀錄 `releases/<版本>/`；0.11.0 以前的
+    /// 狀態檔沒有這個欄位，視為本機紀錄）或 [`ROLLBACK_SOURCE_BUNDLE`]（提議的 `rollback_bundle`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_source: Option<String>,
     pub accepted_at: String,
     #[serde(default)]
     pub applying_at: Option<String>,
@@ -350,6 +359,13 @@ pub struct UpgradeView {
     pub total: Option<u64>,
     pub not_before: Option<String>,
     pub last: Option<Finished>,
+    /// 需要修復套件：最近一次升級的結果是降級回滾（REMOTE.md 第 4.5.2 節），套件資料庫與實際的執行檔
+    /// 仍不一致。重新安裝目前版本的套件、或之後的升級成功後恢復為 `false`
+    #[serde(default)]
+    pub package_repair_needed: bool,
+    /// hello 的 `install.rollback`（`archived`／`binary_only`／`none`／`degraded`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -525,6 +541,7 @@ impl UpgradeAgent {
             external_url: Some(
                 kairos_proto::mgmt::url::allowlist_state(&inner.env.url_allowlist).to_string(),
             ),
+            rollback: None,
         }
     }
 
@@ -1250,19 +1267,40 @@ impl UpgradeAgent {
         if offer.action == ACTION_DOWNGRADE && target >= current {
             log::debug!("提議的 action 為 downgrade，但目標不低於目前版本，依版本比較處理");
         }
-        // 7. 回滾檔：只有本機有它所屬發佈的驗證紀錄時才使用
-        let rollback_trusted = offer
-            .rollback_artifact
-            .as_ref()
-            .is_some_and(|r| Self::rollback_is_trusted(&inner, &signers, r, os, arch, format));
-        if offer.rollback_artifact.is_some() && !rollback_trusted {
-            log::info!(
-                "提議附的回滾檔 {} 所屬的發佈在本機沒有驗證過的 SHA256SUMS：不下載，自動回滾時改以替換前保留的執行檔回復",
-                offer
-                    .rollback_artifact
-                    .as_ref()
-                    .map_or("", |r| r.filename.as_str())
-            );
+        // 7. 回滾檔（deb／rpm；REMOTE.md 第 4.4.2 節、ADR-0003 第 5.4 節的來源順序）：它所屬發佈的簽章資料
+        // 先看本機紀錄，沒有（或驗證不過）再看提議的 rollback_bundle。兩者都只是提示，都以本機信任錨
+        // 完整驗證；都不通過就不下載回滾檔，照常升級（回滾時由輔助程式換回 pulse.prev）。Kairos 能做的
+        // 只有「附或不附」：驗證不過不會讓升級失敗，也不會放寬任何條件
+        let packaged = matches!(
+            inner.env.detection.method,
+            mgmt::INSTALL_METHOD_DEB | mgmt::INSTALL_METHOD_RPM
+        );
+        let rollback_source = match &offer.rollback_artifact {
+            Some(r) if packaged => {
+                Self::rollback_source(&inner, &signers, &offer, r, os, arch, format)
+            }
+            _ => None,
+        };
+        let rollback_trusted = rollback_source.is_some();
+        if let Some(r) = &offer.rollback_artifact {
+            match rollback_source {
+                Some(ROLLBACK_SOURCE_BUNDLE) => log::info!(
+                    "提議附的回滾檔 {} 所屬的發佈以提議的 rollback_bundle 驗證通過（本機沒有這個版本的紀錄）：一併下載，由升級輔助程式重新驗證後使用",
+                    r.filename
+                ),
+                Some(_) => {}
+                None => log::info!(
+                    "提議附的回滾檔 {} 無法使用（{}）：不下載，自動回滾時改以替換前保留的執行檔回復",
+                    r.filename,
+                    if !packaged {
+                        "這種安裝方式不需要回滾檔"
+                    } else if offer.rollback_bundle.is_some() {
+                        "本機紀錄與提議的 rollback_bundle 都沒有通過驗證"
+                    } else {
+                        "本機沒有它所屬發佈的驗證紀錄，提議也沒有附 rollback_bundle"
+                    }
+                ),
+            }
         }
         // 接受
         let id = offer.upgrade_id.to_ascii_lowercase();
@@ -1303,6 +1341,7 @@ impl UpgradeAgent {
                 inner.env.health_timeout_secs,
             ),
             rollback_trusted,
+            rollback_source: rollback_source.map(str::to_string),
             accepted_at: crate::protocol::now_ts(),
             applying_at: None,
             phase: Phase::Downloading,
@@ -1314,41 +1353,52 @@ impl UpgradeAgent {
         Self::persist(&mut inner);
     }
 
-    /// 回滾檔所屬的發佈（目前的版本）在本機有驗證過的 `SHA256SUMS`，且回滾檔列在其中
-    fn rollback_is_trusted(
+    /// 回滾檔可以用哪一份簽章資料驗證（都以本機信任錨與目前的時間完整驗證，回滾檔必須列在其中、版本是
+    /// 目前的版本、平台與格式相符）：本機紀錄 `releases/<目前版本>/` 優先，其次是提議的 `rollback_bundle`；
+    /// 都不通過時 `None`。commit 與執行檔雜湊的綁定（ADR-0003 方案 A2）由輔助程式以 root 檢查
+    fn rollback_source(
         inner: &Inner,
         signers: &AllowedSigners,
+        offer: &UpgradeOffer,
         r: &ArtifactRef,
         os: Os,
         arch: Arch,
         format: Format,
-    ) -> bool {
+    ) -> Option<&'static str> {
+        let listed = |sums: &str, sig: &str| {
+            let bundle = ReleaseBundle {
+                sha256sums: sums,
+                signature: sig,
+                manifest: None,
+            };
+            let Ok(v) = release::verify_bundle(&bundle, &Self::trust(inner, signers)) else {
+                return false;
+            };
+            let expect = ArtifactExpectation {
+                product: Some(Product::Pulse),
+                version: Some(&inner.env.current_version),
+                commit: None,
+                os: Some(os),
+                arch: Some(arch),
+                format: Some(format),
+            };
+            v.check_artifact(&r.filename, &r.sha256, &expect).is_ok()
+        };
         let dir = Self::upgrade_dir(inner)
             .join(RELEASES_DIR)
             .join(&inner.env.current_version);
-        let (Ok(sums), Ok(sig)) = (
+        if let (Ok(sums), Ok(sig)) = (
             std::fs::read_to_string(dir.join(files::SUMS_FILE)),
             std::fs::read_to_string(dir.join(files::SIG_FILE)),
-        ) else {
-            return false;
-        };
-        let bundle = ReleaseBundle {
-            sha256sums: &sums,
-            signature: &sig,
-            manifest: None,
-        };
-        let Ok(v) = release::verify_bundle(&bundle, &Self::trust(inner, signers)) else {
-            return false;
-        };
-        let expect = ArtifactExpectation {
-            product: Some(Product::Pulse),
-            version: Some(&inner.env.current_version),
-            commit: None,
-            os: Some(os),
-            arch: Some(arch),
-            format: Some(format),
-        };
-        v.check_artifact(&r.filename, &r.sha256, &expect).is_ok()
+        ) && listed(&sums, &sig)
+        {
+            return Some(ROLLBACK_SOURCE_RECORD);
+        }
+        offer
+            .rollback_bundle
+            .as_ref()
+            .filter(|b| listed(&b.sha256sums, &b.signature))
+            .map(|_| ROLLBACK_SOURCE_BUNDLE)
     }
 
     /// 處理 `upgrade_chunk`
@@ -1657,17 +1707,27 @@ impl UpgradeAgent {
             result = result.and_then(|()| write(&m.filename, m.content.as_bytes()));
         }
         if c.rollback_trusted {
-            let rel = Self::upgrade_dir(inner)
-                .join(RELEASES_DIR)
-                .join(&c.from_version);
-            for (src, dst) in [
-                (files::SUMS_FILE, files::ROLLBACK_SUMS_FILE),
-                (files::SIG_FILE, files::ROLLBACK_SIG_FILE),
-            ] {
-                result = result.and_then(|()| {
-                    let b = std::fs::read(rel.join(src))?;
-                    write(dst, &b)
-                });
+            // 回滾檔的簽章資料（輔助程式以 root 重新驗證）：接受提議時採用的那一份
+            match (c.rollback_source.as_deref(), offer.rollback_bundle.as_ref()) {
+                (Some(ROLLBACK_SOURCE_BUNDLE), Some(b)) => {
+                    result = result
+                        .and_then(|()| write(files::ROLLBACK_SUMS_FILE, b.sha256sums.as_bytes()))
+                        .and_then(|()| write(files::ROLLBACK_SIG_FILE, b.signature.as_bytes()));
+                }
+                _ => {
+                    let rel = Self::upgrade_dir(inner)
+                        .join(RELEASES_DIR)
+                        .join(&c.from_version);
+                    for (src, dst) in [
+                        (files::SUMS_FILE, files::ROLLBACK_SUMS_FILE),
+                        (files::SIG_FILE, files::ROLLBACK_SIG_FILE),
+                    ] {
+                        result = result.and_then(|()| {
+                            let b = std::fs::read(rel.join(src))?;
+                            write(dst, &b)
+                        });
+                    }
+                }
             }
         }
         // 驗證過的發佈：日後作為回滾檔的信任來源
@@ -1852,6 +1912,19 @@ impl UpgradeAgent {
                     .and_then(|t| kairos_proto::enroll::parse_rfc3339_ms(t).ok())
                     .map_or(0, |t| (now_ms() - t).max(0))
             ),
+            // 降級回滾（REMOTE.md 第 4.5.2 節）：服務已恢復，但套件資料庫與實際的執行檔不一致
+            UPGRADE_STATE_ROLLED_BACK if mgmt::degraded_reasons(&detail).is_some() => {
+                let msg = format!(
+                    "{}升級到 Pulse {} 後沒有恢復正常，已回滾到 {}，但只換回執行檔（降級回滾：{detail}）。套件資料庫與實際的執行檔不一致，請重新安裝 Pulse {} 的套件（dpkg -i／rpm -U --replacepkgs --oldpackage）  upgrade_id={} failed_check={detail} restored_version={}",
+                    codes::tag(codes::UPGRADE_ROLLED_BACK, code),
+                    result.to_version,
+                    result.from_version,
+                    result.from_version,
+                    c.upgrade_id,
+                    result.from_version
+                );
+                log::warn!("{msg}");
+            }
             UPGRADE_STATE_ROLLED_BACK => log::warn!(
                 "{}升級到 Pulse {} 後沒有恢復正常，已自動回滾到 {}（{detail}）  upgrade_id={} failed_check={detail} restored_version={}",
                 codes::tag(codes::UPGRADE_ROLLED_BACK, code),
@@ -2033,6 +2106,9 @@ impl UpgradeAgent {
             last: inner.file.history.last().cloned(),
             ..Default::default()
         };
+        v.package_repair_needed = v.last.as_ref().is_some_and(|l| {
+            l.state == UPGRADE_STATE_ROLLED_BACK && mgmt::degraded_reasons(&l.detail).is_some()
+        });
         if let Some(c) = &inner.file.current {
             let (done, total) = Self::progress(&inner, c);
             v.phase = Some(

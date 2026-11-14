@@ -642,7 +642,8 @@ pub fn artifact_refs(conn: &PgConn, sha256: &str) -> PgResult<i64> {
 // ---- 推送 ----
 
 const UPGRADE_HOST_COLUMNS: &str = "host_id, agent_id, hostname, agent_version, os, install_method, \
-     install_upgrade, install_config, host_group, tags, online, lifecycle, install_external_url";
+     install_upgrade, install_config, host_group, tags, online, lifecycle, install_external_url, \
+     install_rollback";
 
 fn upgrade_host_of(r: &Row) -> PgResult<UpgradeHost> {
     Ok(UpgradeHost {
@@ -659,6 +660,7 @@ fn upgrade_host_of(r: &Row) -> PgResult<UpgradeHost> {
         online: r.get::<_, i64>(10)? != 0,
         decommissioned: r.get::<_, String>(11)? != "active",
         install_external_url: r.get(12)?,
+        install_rollback: r.get(13)?,
     })
 }
 

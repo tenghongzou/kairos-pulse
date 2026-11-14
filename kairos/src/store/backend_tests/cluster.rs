@@ -392,7 +392,16 @@ fn sqlite_v9_is_upgraded_to_v11_and_keeps_data() {
     .unwrap();
     conn.execute("INSERT INTO meta (key, value) VALUES ('keep', 'me')", [])
         .unwrap();
-    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 12);
+    assert_eq!(migrate(&mut conn, MIGRATIONS).unwrap(), 13);
+    // v13：hosts.install_rollback（既有的主機是 NULL＝沒有宣告；可以寫入）
+    assert_eq!(
+        conn.execute(
+            "UPDATE hosts SET install_rollback = 'archived' WHERE agent_id = 'a-1' AND install_rollback IS NULL",
+            [],
+        )
+        .unwrap(),
+        1
+    );
     conn.execute(
         "UPDATE rollouts SET submitted_at = 1, submitted_by = 'u', reject_reason = 'r' WHERE 0",
         [],
@@ -557,9 +566,9 @@ fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
             .iter()
             .map(|(v, _)| *v)
             .collect::<Vec<_>>(),
-        [10, 11, 12]
+        [10, 11, 12, 13]
     );
-    assert_eq!(crate::store::sqlite::SCHEMA_VERSION, 12);
+    assert_eq!(crate::store::sqlite::SCHEMA_VERSION, 13);
     let pool = db.pool();
     let conn = pool.get(Access::ReadWrite, Duration::from_secs(5)).unwrap();
     {
@@ -593,11 +602,17 @@ fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
         postgres::schema_state(&conn).unwrap(),
         SchemaState::Version(10)
     );
-    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 12);
+    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 13);
     assert_eq!(
         postgres::schema_state(&conn).unwrap(),
-        SchemaState::Version(12)
+        SchemaState::Version(13)
     );
+    // v13：hosts.install_rollback（與 SQLite 對等的欄位；NULL＝沒有宣告）
+    conn.execute(
+        "UPDATE hosts SET install_rollback = 'archived' WHERE false",
+        (),
+    )
+    .unwrap();
     // v12：hosts.install_external_url（與 SQLite 對等的欄位；NULL＝沒有宣告）
     conn.execute(
         "UPDATE hosts SET install_external_url = 'none' WHERE false",
@@ -635,7 +650,7 @@ fn schema_v10_is_upgraded_to_v11_and_keeps_rollouts() {
     conn.update_rollout_state(&r2).unwrap();
     assert_eq!(conn.get_rollout("r-20261020-0001").unwrap().unwrap(), r2);
     // 再執行一次：沒有變化
-    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 12);
+    assert_eq!(postgres::ensure_schema(&conn).unwrap(), 13);
 }
 
 #[test]

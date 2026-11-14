@@ -1655,6 +1655,17 @@ fn upgrade_row(u: &crate::remote::upgrade::UpgradeView, now: DateTime<Utc>) -> O
                 codes::E_UPGRADE_ROLLBACK_FAILED
             ),
         ),
+        // 降級回滾（REMOTE.md 第 4.5.2 節）：服務已恢復，但套件資料庫與實際的執行檔不一致——在修復
+        // （重新安裝目前版本的套件）或下一次升級之前一律顯示，`pulse status` 以警告的結束代碼表示需要處理
+        UPGRADE_STATE_ROLLED_BACK if u.package_repair_needed => (
+            Outcome::Warning,
+            format!(
+                "已回滾到 {}，但只換回執行檔：請重新安裝 Pulse {} 的套件（{}）",
+                last.from_version,
+                last.from_version,
+                codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+            ),
+        ),
         _ if !recent => return None,
         UPGRADE_STATE_SUCCEEDED => (
             Outcome::Ok,
@@ -1686,7 +1697,11 @@ fn upgrade_row(u: &crate::remote::upgrade::UpgradeView, now: DateTime<Utc>) -> O
     let code = match result {
         Outcome::Error => Some(codes::E_UPGRADE_ROLLBACK_FAILED),
         Outcome::Warning if last.state == UPGRADE_STATE_ROLLED_BACK => {
-            Some(codes::W_UPGRADE_ROLLED_BACK)
+            Some(if u.package_repair_needed {
+                codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+            } else {
+                codes::W_UPGRADE_ROLLED_BACK
+            })
         }
         _ => None,
     };

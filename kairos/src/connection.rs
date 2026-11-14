@@ -2207,6 +2207,7 @@ impl Conn {
                 install_method: install.and_then(|i| i.method.clone()),
                 install_upgrade: install.and_then(|i| i.upgrade.clone()),
                 install_external_url: install.and_then(|i| i.external_url.clone()),
+                install_rollback: install.and_then(|i| i.rollback.clone()),
                 arch: host
                     .and_then(|h| h.os.as_ref())
                     .and_then(|o| o.arch.clone()),

@@ -113,6 +113,22 @@ impl Fx {
 
     /// [`Fx::connect`]，hello 另帶 `install.external_url`
     fn connect_declaring(&self, id: &str, version: &str, method: &str, external_url: Option<&str>) {
+        self.connect_full(id, version, method, external_url, None);
+    }
+
+    /// [`Fx::connect`]，hello 另帶 `install.rollback`（0.11.0 之後的 Pulse；ADR-0003 階段 2）
+    fn connect_rollback(&self, id: &str, version: &str, method: &str, rollback: Option<&str>) {
+        self.connect_full(id, version, method, None, rollback);
+    }
+
+    fn connect_full(
+        &self,
+        id: &str,
+        version: &str,
+        method: &str,
+        external_url: Option<&str>,
+        rollback: Option<&str>,
+    ) {
         let conn_id = crate::registry::next_conn_id();
         self.registry
             .register(
@@ -139,6 +155,7 @@ impl Fx {
                 install_method: Some(method.to_string()),
                 install_upgrade: Some("ready".into()),
                 install_external_url: external_url.map(str::to_string),
+                install_rollback: rollback.map(str::to_string),
                 arch: Some("x86_64".into()),
                 config: true,
                 upgrade: true,
@@ -1234,8 +1251,340 @@ async fn download_slots_are_limited_and_released_when_idle_or_staged() {
     assert!(fx.svc.acquire_download(B));
 }
 
+async fn rollout_row(fx: &Fx, id: &str) -> super::store::RolloutRow {
+    let id = id.to_string();
+    fx.svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&id)?.unwrap()))
+        .await
+        .unwrap()
+}
+
+/// ADR-0003 階段 1（REMOTE.md 第 2.4.1 節）：deb／rpm 主機的提議在附回滾檔時另附它所屬發佈的
+/// `SHA256SUMS` 與簽章（`rollback_bundle`）；tar 不附。單行大小的三段式規則：含 bundle 時超過 → 省略
+/// bundle 後送出（主機列加註 `rollback_bundle_omitted`）；仍超過 → 不送出（`upgrade_unavailable`）、主機
+/// `failed`（`offer_too_large`）、稽核事件、推送自動暫停
+#[tokio::test]
+async fn deb_offers_carry_the_rollback_bundle_and_respect_the_line_limit() {
+    let signer = TestSigner::new(21);
+    let fx = Fx::new("bundle", trust_settings(&signer)).await;
+    let r090 = release(&signer, "0.9.0", "1111111");
+    let r092 = release(&signer, "0.9.2", "2222222");
+    import(&fx, &r090).await;
+    import(&fx, &r092).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(B, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.add_host(C, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.connect(A, "0.9.0", "deb");
+    fx.connect(B, "0.9.0", "tar");
+    fx.connect(C, "0.9.0", "deb");
+    let spec = RolloutSpec::parse(&json!({"name": "bundle", "target_version": "0.9.2", "selector": {"all": true}, "waves": [{"size": "rest", "max_failure_ratio": 1.0}]})).unwrap();
+    let preview = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
+    // 版本庫有主機目前的版本：兩台 deb 預期經版本庫的回滾檔（＋bundle）回滾
+    assert_eq!(
+        preview["rollback"],
+        json!({"archive": 0, "repository": 2, "binary_only": 0, "degraded_hosts": 0})
+    );
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some("升級 3 台".into()), None)
+        .await
+        .unwrap();
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let (up_a, up_b, up_c) = (
+        fx.svc.offer_of(A).unwrap(),
+        fx.svc.offer_of(B).unwrap(),
+        fx.svc.offer_of(C).unwrap(),
+    );
+    // 1. deb：回滾檔與它所屬發佈（0.9.0）的簽章資料；整則訊息在單行上限內
+    let offer = fx.svc.build_offer(A, &up_a, 1).await.unwrap().unwrap();
+    let rb = offer.rollback_artifact.as_ref().expect("回滾檔");
+    assert!(rb.filename.starts_with("pulse-0.9.0-1111111-"));
+    assert_eq!(
+        offer.rollback_bundle,
+        Some(kairos_proto::mgmt::RollbackBundle {
+            sha256sums: r090.sha256sums.clone(),
+            signature: r090.signature.clone(),
+        })
+    );
+    // 目標版本的簽章資料不變（bundle 是另外的欄位）
+    assert_eq!(offer.sha256sums, r092.sha256sums);
+    kairos_proto::mgmt::validate_upgrade_offer(&offer).unwrap();
+    assert!(
+        kairos_proto::mgmt::upgrade_offer_line_len(&offer) + kairos_proto::mgmt::OFFER_LINE_RESERVE
+            <= kairos_proto::MAX_LINE_LENGTH
+    );
+    assert_eq!(fx.host_state(&id, A).await.reason, None);
+    // tar：沒有回滾檔，也沒有 bundle
+    let offer = fx.svc.build_offer(B, &up_b, 1).await.unwrap().unwrap();
+    assert!(offer.rollback_artifact.is_none() && offer.rollback_bundle.is_none());
+
+    // 2. 含 bundle 時超過單行上限（回滾檔所屬發佈的 SHA256SUMS 需要大量 JSON 跳脫；欄位本身沒有超過
+    //    上限）：省略 bundle，其餘照常；主機列加註
+    let hostile = "\u{1}".repeat(kairos_proto::mgmt::MAX_SHA256SUMS_BYTES);
+    let set_sums = |version: &'static str, sums: String| {
+        fx.sql(move |c| {
+            c.execute(
+                "UPDATE releases SET sha256sums = ?2 WHERE version = ?1",
+                rusqlite::params![version, sums],
+            )
+            .unwrap()
+        })
+    };
+    assert_eq!(set_sums("0.9.0", hostile.clone()).await, 1);
+    let offer = fx.svc.build_offer(C, &up_c, 2).await.unwrap().unwrap();
+    assert!(offer.rollback_artifact.is_some());
+    assert_eq!(offer.rollback_bundle, None);
+    assert!(
+        kairos_proto::mgmt::upgrade_offer_line_len(&offer) + kairos_proto::mgmt::OFFER_LINE_RESERVE
+            <= kairos_proto::MAX_LINE_LENGTH
+    );
+    let h = fx.host_state(&id, C).await;
+    assert_eq!(
+        (h.state.as_str(), h.reason.as_deref()),
+        ("offered", Some(rollout::REASON_BUNDLE_OMITTED))
+    );
+    assert_eq!(rollout_row(&fx, &id).await.state, "running", "不暫停");
+    // 版本庫的內容恢復後放得下：重新附上，註記清除
+    set_sums("0.9.0", r090.sha256sums.clone()).await;
+    let offer = fx.svc.build_offer(C, &up_c, 3).await.unwrap().unwrap();
+    assert!(offer.rollback_bundle.is_some());
+    assert_eq!(fx.host_state(&id, C).await.reason, None);
+
+    // 3. 省略 bundle 之後仍超過（目標版本的 SHA256SUMS 本身）：不送出
+    set_sums("0.9.2", hostile).await;
+    assert!(fx.svc.build_offer(C, &up_c, 4).await.unwrap().is_none());
+    let h = fx.host_state(&id, C).await;
+    assert_eq!(
+        (h.state.as_str(), h.reason.as_deref(), h.code.as_deref()),
+        (
+            "failed",
+            Some(rollout::REASON_OFFER_TOO_LARGE),
+            Some(CODE_OFFER_TOO_LARGE)
+        )
+    );
+    assert_eq!(fx.svc.offer_of(C), None);
+    let r = rollout_row(&fx, &id).await;
+    assert_eq!(
+        (r.state.as_str(), r.pause_cause.as_deref()),
+        ("paused", Some(rollout::PAUSE_OFFER_TOO_LARGE))
+    );
+    // 暫停：其他提議中的主機收回（回到 pending）
+    assert_eq!(fx.svc.offer_of(A), None);
+    assert_eq!(fx.host_state(&id, A).await.state, "pending");
+    let actions = fx.audit_actions().await;
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| *a == "host.upgrade.offer_too_large")
+            .count(),
+        1
+    );
+    assert!(actions.iter().any(|a| a == "rollout.auto_pause"));
+    // 再要一次同一個提議：仍然沒有，也不重複記錄
+    assert!(fx.svc.build_offer(C, &up_c, 5).await.unwrap().is_none());
+    assert_eq!(
+        fx.audit_actions()
+            .await
+            .iter()
+            .filter(|a| *a == "host.upgrade.offer_too_large")
+            .count(),
+        1
+    );
+    // 告警：由系統規則「升級推送已暫停」開（警告）
+    let mut bus = fx.registry.bus().subscribe();
+    fx.svc.reconcile_alerts().await;
+    let mut causes = Vec::new();
+    while let Ok(ev) = bus.try_recv() {
+        if let crate::bus::EventKind::RemoteCondition { rule, details, .. } = &ev.kind {
+            causes.push((*rule, details["cause"].clone()));
+        }
+    }
+    assert_eq!(
+        causes,
+        [("sys.rollout_paused", json!(rollout::PAUSE_OFFER_TOO_LARGE))]
+    );
+}
+
+/// 降級回滾（ADR-0003 第 5.4 節；REMOTE.md 第 4.5.2、4.7.4 節）：`rolled_back` 而 `detail` 以 `degraded:`
+/// 開頭——另一個稽核事件與代碼、推送自動暫停、主機列帶機器可讀的原因；一般的 `rolled_back` 照舊
+/// （不暫停）。宣告本機封存的主機不依賴版本庫的回滾檔
+#[tokio::test]
+async fn degraded_rollback_pauses_the_rollout_and_archived_hosts_do_not_need_the_repository() {
+    let signer = TestSigner::new(22);
+    let fx = Fx::new("degraded", trust_settings(&signer)).await;
+    // 版本庫只有目標版本：沒有主機目前的版本（0.9.0）
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(B, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(C, "0.9.0", "Web", &[], "deb", "ready").await;
+    fx.add_host(D, "0.9.0", "Web", &[], "deb", "ready").await;
+    // A 宣告本機封存；B 宣告只能換回執行檔；C 宣告需要修復套件；D 沒有宣告（較舊的 Pulse）
+    fx.connect_rollback(A, "0.9.0", "deb", Some("archived"));
+    fx.connect_rollback(B, "0.9.0", "deb", Some("binary_only"));
+    fx.connect_rollback(C, "0.9.0", "deb", Some("degraded"));
+    fx.connect(D, "0.9.0", "deb");
+    let body = |allow: bool| json!({"name": "x", "target_version": "0.9.2", "selector": {"all": true}, "waves": [{"size": "rest", "max_failure_ratio": 1.0}], "options": {"allow_no_rollback": allow}});
+    // 不允許無法自動回滾：只有宣告封存的主機可升級，其餘 no_rollback
+    let p = fx
+        .svc
+        .preview_rollout(RolloutSpec::parse(&body(false)).unwrap(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["skipped"]["no_rollback"].as_i64()),
+        (Some(1), Some(3)),
+        "{p}"
+    );
+    assert_eq!(
+        p["rollback"],
+        json!({"archive": 1, "repository": 0, "binary_only": 0, "degraded_hosts": 0})
+    );
+    assert_eq!(p["confirm_text"], "升級 1 台");
+    // 允許：四台都可升級，三台無法經套件管理員回滾
+    let spec = RolloutSpec::parse(&body(true)).unwrap();
+    let p = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p["eligible"].as_i64(), p["no_rollback"].as_i64()),
+        (Some(4), Some(3))
+    );
+    assert_eq!(
+        p["rollback"],
+        json!({"archive": 1, "repository": 0, "binary_only": 3, "degraded_hosts": 1})
+    );
+    let confirm = p["confirm_text"].as_str().unwrap().to_string();
+    assert_eq!(confirm, "升級 4 台（無法自動回滾 3 台）");
+    let id = fx.svc.create_rollout(&who(), spec).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.svc
+        .submit_rollout(&who(), id.clone(), Some(confirm), None)
+        .await
+        .unwrap();
+    fx.set_now(T0 + 61_000);
+    fx.svc.tick().await.unwrap();
+    let up_a = fx.svc.offer_of(A).unwrap();
+    let up_b = fx.svc.offer_of(B).unwrap();
+    let up_d = fx.svc.offer_of(D).unwrap();
+    // 版本庫沒有 0.9.0：提議沒有回滾檔，也就沒有 bundle（宣告封存的主機照樣收到提議）
+    let offer = fx.svc.build_offer(A, &up_a, 1).await.unwrap().unwrap();
+    assert!(offer.rollback_artifact.is_none() && offer.rollback_bundle.is_none());
+    let status = |up: &str, detail: &str, code: &str| kairos_proto::mgmt::UpgradeStatus {
+        seq: 1,
+        ts: "2026-11-20T02:00:00.000Z".into(),
+        upgrade_id: up.to_string(),
+        state: "rolled_back".into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.2".into(),
+        code: Some(code.into()),
+        detail: detail.into(),
+        progress: None,
+    };
+    // 一般的回滾（封存的套件經套件管理員裝回）：照舊，不暫停
+    fx.svc
+        .apply_upgrade_status(
+            A,
+            "0.9.0",
+            status(&up_a, "crash_restart (NRestarts 0 → 1)", "PLS-W8407"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rollout_row(&fx, &id).await.state, "running");
+    let h = fx.host_state(&id, A).await;
+    assert_eq!(rollout::degraded_of(&h), None);
+    assert_eq!(rollout::host_json(&h)["degraded"], Value::Null);
+    // 降級回滾：暫停、稽核、原因
+    let detail = "degraded:no_rollback_package,package_db_inconsistent; health_timeout (not_registered (reconnecting))";
+    let st = status(&up_b, detail, "PLS-W8418");
+    fx.svc
+        .apply_upgrade_status(B, "0.9.0", st.clone())
+        .await
+        .unwrap();
+    // 重送：去重
+    fx.svc.apply_upgrade_status(B, "0.9.0", st).await.unwrap();
+    let h = fx.host_state(&id, B).await;
+    assert_eq!(
+        (h.state.as_str(), h.code.as_deref()),
+        ("rolled_back", Some("PLS-W8418"))
+    );
+    assert_eq!(
+        rollout::host_json(&h)["degraded"],
+        json!(["no_rollback_package", "package_db_inconsistent"])
+    );
+    let r = rollout_row(&fx, &id).await;
+    assert_eq!(
+        (r.state.as_str(), r.pause_cause.as_deref()),
+        ("paused", Some(rollout::PAUSE_ROLLBACK_DEGRADED))
+    );
+    assert!(
+        r.pause_reason
+            .as_deref()
+            .unwrap()
+            .contains("no_rollback_package")
+    );
+    let actions = fx.audit_actions().await;
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| *a == "host.upgrade.rolled_back_degraded")
+            .count(),
+        1
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| *a == "host.upgrade.rolled_back")
+            .count(),
+        1,
+        "只有 A 的一般回滾"
+    );
+    // 暫停後提議中的主機收回；晚到的回報只記錄
+    assert_eq!(fx.svc.offer_of(D), None);
+    assert!(fx.svc.build_offer(D, &up_d, 1).await.unwrap().is_none());
+    // 告警：系統規則「升級推送已暫停」，原因 rollback_degraded（警告，不是嚴重）
+    let mut bus = fx.registry.bus().subscribe();
+    fx.svc.reconcile_alerts().await;
+    let mut causes = Vec::new();
+    while let Ok(ev) = bus.try_recv() {
+        if let crate::bus::EventKind::RemoteCondition { rule, details, .. } = &ev.kind {
+            causes.push((*rule, details["cause"].clone()));
+        }
+    }
+    assert_eq!(
+        causes,
+        [(
+            "sys.rollout_paused",
+            json!(rollout::PAUSE_ROLLBACK_DEGRADED)
+        )]
+    );
+    // 「需要修復套件」：宣告 degraded 的主機；沒有宣告時看最近一次已結束的升級
+    let rows = vec![fx.host_state(&id, B).await];
+    assert!(rollout::needs_package_repair(None, &rows));
+    assert!(rollout::needs_package_repair(Some("degraded"), &[]));
+    assert!(!rollout::needs_package_repair(Some("binary_only"), &rows));
+    assert!(!rollout::needs_package_repair(Some("archived"), &rows));
+    assert!(!rollout::needs_package_repair(
+        None,
+        &[fx.host_state(&id, A).await]
+    ));
+}
+
 #[test]
 fn pulse_codes_map_to_mirrored_kairos_codes() {
+    assert_eq!(mirror_code("PLS-W8418"), Some(CODE_ROLLED_BACK_DEGRADED));
     assert_eq!(mirror_code("PLS-W0501"), Some("KRS-W0501"));
     assert_eq!(mirror_code("PLS-E8402"), Some("KRS-W8402"));
     assert_eq!(mirror_code("PLS-E8403"), None);
@@ -1350,6 +1699,7 @@ fn connect_hello_only(fx: &Fx, id: &str, version: &str, method: &str, upgrade: &
                         upgrade: Some(upgrade.into()),
                         config: Some("enabled".into()),
                         external_url: None,
+                        rollback: None,
                     }),
                     tags: Some(vec!["site:b".into()]),
                     ..Default::default()

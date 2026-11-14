@@ -33,12 +33,14 @@ pub const NEW_BINARY_FILE: &str = "new.bin";
 pub const NEW_UNIT_FILE: &str = "pulse.service.new";
 pub const UNIT_BACKUP_FILE: &str = "pulse.service.prev";
 pub const ROLLBACK_PKG_FILE: &str = "rollback.pkg";
+/// 檢查回滾套件中的執行檔時暫時解開的目錄（檢查完就刪除）
+pub const ROLLBACK_EXTRACT_DIR: &str = "rollback.x";
 /// 紀錄與指標的大小上限
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
 /// 保留的 `rollback_failed` 紀錄數（第 17.9.8 節）
 pub const KEEP_ROLLBACK_FAILED: usize = 3;
 /// checksum 計算時代入的值
-const CHECKSUM_PLACEHOLDER: &str =
+pub(super) const CHECKSUM_PLACEHOLDER: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 const CHECKSUM_KEY: &str = "\"checksum\": \"";
 
@@ -94,7 +96,15 @@ pub struct Verified {
     /// 簽署金鑰的指紋（`SHA256:…`）
     #[serde(default)]
     pub signer: String,
+    /// 回滾套件的來源（ADR-0003 第 5.4 節）：[`SOURCE_HINT`]（服務帳號暫存的回滾檔，簽章資料來自本機
+    /// 紀錄或提議的 `rollback_bundle`，由輔助程式重新驗證）。發佈檔與 0.11.0 以前的紀錄為空字串。不屬於
+    /// 綁定欄位（檔名、雜湊、簽署者已綁定）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
+
+/// [`Verified::source`]：服務帳號暫存、輔助程式重新驗證過的回滾檔
+pub const SOURCE_HINT: &str = "hint";
 
 /// tar：這次要替換 unit 時的新舊雜湊（由 v1 轉換的紀錄為空字串：不比對）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +139,10 @@ pub struct RollbackIntent {
     pub reason: String,
     pub cause: Cause,
     pub via: Via,
+    /// 降級回滾的原因（`kairos_proto::mgmt::DEGRADED_*`；ADR-0003 第 5.4 節）：deb／rpm 因健康確認失敗而
+    /// 回滾、卻只能換回 `pulse.prev`（套件資料庫與實際的執行檔不一致）時非空。0.11.0 以前的紀錄沒有
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 /// 交易紀錄（`state.json`，schema v2）。欄位說明見 REMOTE.md 第 17.9.2 節
@@ -157,6 +171,10 @@ pub struct Record {
     pub new_binary_sha256: String,
     #[serde(default)]
     pub rollback: Option<Verified>,
+    /// deb／rpm：沒有採用套件層級回滾來源的原因（`kairos_proto::mgmt::DEGRADED_*`；`rollback` 為 `None` 時
+    /// 才有意義）。回滾時寫進降級回滾的 `detail`；升級成功時不出現在結果中。不屬於綁定欄位
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollback_declined: Vec<String>,
     #[serde(default)]
     pub unit: Option<UnitPlan>,
     #[serde(default)]
@@ -222,6 +240,7 @@ impl Record {
             manifest: None,
             new_binary_sha256: String::new(),
             rollback: None,
+            rollback_declined: Vec::new(),
             unit: None,
             pkg_db_before: None,
             pkg_db_after: None,
@@ -296,7 +315,7 @@ impl Record {
 }
 
 /// 把內容中的 checksum（必須是佔位值）換成整份內容的 SHA-256
-fn seal(text: &str) -> Result<String, String> {
+pub(super) fn seal(text: &str) -> Result<String, String> {
     let needle = format!("{CHECKSUM_KEY}{CHECKSUM_PLACEHOLDER}\"");
     let Some(at) = text.find(&needle) else {
         return Err("內容沒有 checksum 欄位".to_string());
@@ -311,7 +330,7 @@ fn seal(text: &str) -> Result<String, String> {
 }
 
 /// 檢查內容的 checksum（以檔案的原始位元組計算：不受欄位增減影響）
-fn verify_seal(bytes: &[u8]) -> Result<(), String> {
+pub(super) fn verify_seal(bytes: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
     // JSON 字串裡的引號一定被跳脫，所以第一個符合的位置是真正的鍵（不會落在某個字串值裡）
     let at = text
@@ -1111,6 +1130,7 @@ mod tests {
             name: "a".into(),
             sha256: "cc".into(),
             signer: String::new(),
+            source: String::new(),
         });
         changed.push(x);
         let mut x = r.clone();
@@ -1118,6 +1138,7 @@ mod tests {
             name: "r".into(),
             sha256: "dd".into(),
             signer: String::new(),
+            source: String::new(),
         });
         changed.push(x);
         let mut x = r.clone();

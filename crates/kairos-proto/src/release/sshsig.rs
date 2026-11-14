@@ -147,6 +147,13 @@ impl AllowedSigners {
                 .is_some_and(|ns| ns.iter().any(|n| n == namespace))
         })
     }
+
+    /// 這把金鑰（指紋 `SHA256:…`）是否仍**列在**信任錨中，不看 `valid-after`／`valid-before`、principal 與
+    /// namespace（ADR-0003 的 INV-7、決策點 D1）：金鑰自然到期時那一行還在（`true`）；撤銷的方式是
+    /// **刪除那一行**（`false`）。只用來判斷「已綁定的回滾目標的簽署者是否被撤銷」，不是簽章驗證
+    pub fn lists_fingerprint(&self, fingerprint: &str) -> bool {
+        !fingerprint.is_empty() && self.entries.iter().any(|e| e.fingerprint() == fingerprint)
+    }
 }
 
 /// 公鑰的指紋（`SHA256:` 加 base64、不補位），與 `ssh-keygen -l` 相同

@@ -509,6 +509,7 @@ fn install_limits() {
             upgrade: Some("future_state".into()),
             config: None,
             external_url: Some("future_mode".into()),
+            rollback: Some("future_source".into()),
         })
         .is_ok()
     );
@@ -668,6 +669,421 @@ fn external_url_declaration_is_optional_and_compatible_with_old_peers() {
         ]),
         "allowlist"
     );
+}
+
+// ---- 回滾檔的簽章資料、降級回滾、install.rollback（ADR-0003 階段 1、2） ----
+
+fn rollback_offer() -> (&'static str, UpgradeOffer) {
+    let line = vectors(Ver::MgmtRollback, 'K')
+        .into_iter()
+        .find(|l| l.contains(r#""type":"upgrade_offer""#))
+        .unwrap();
+    match parse_server_msg(line).unwrap() {
+        ServerMsg::UpgradeOffer(o) => (line, *o),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 0.9／0.10／0.11.0 的 Pulse 解析 `upgrade_offer` 用的型別（凍結；沒有 `rollback_bundle`，也沒有
+/// `deny_unknown_fields`）：新欄位被忽略，其餘欄位不變（ADR-0003 第 6.2、6.4 節）
+#[derive(Debug, serde::Deserialize)]
+struct UpgradeOfferV011 {
+    seq: u64,
+    upgrade_id: String,
+    rollout_id: String,
+    action: String,
+    target: UpgradeTarget,
+    artifact: ArtifactRef,
+    #[serde(default)]
+    rollback_artifact: Option<ArtifactRef>,
+    manifest: Option<ManifestRef>,
+    sha256sums: String,
+    signature: String,
+    apply_window: ApplyWindow,
+    health_timeout_secs: u32,
+    allow_downgrade: bool,
+}
+
+fn old_pulse_sees_the_same_offer(line: &str, new: &UpgradeOffer) {
+    let v: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(v["type"], "upgrade_offer");
+    let old: UpgradeOfferV011 = serde_json::from_value(v).unwrap();
+    assert_eq!(
+        (
+            old.seq,
+            &old.upgrade_id,
+            &old.rollout_id,
+            &old.action,
+            &old.target,
+            &old.artifact,
+            &old.rollback_artifact,
+            &old.manifest,
+        ),
+        (
+            new.seq,
+            &new.upgrade_id,
+            &new.rollout_id,
+            &new.action,
+            &new.target,
+            &new.artifact,
+            &new.rollback_artifact,
+            &new.manifest,
+        )
+    );
+    assert_eq!(
+        (
+            &old.sha256sums,
+            &old.signature,
+            &old.apply_window,
+            old.health_timeout_secs,
+            old.allow_downgrade
+        ),
+        (
+            &new.sha256sums,
+            &new.signature,
+            &new.apply_window,
+            new.health_timeout_secs,
+            new.allow_downgrade
+        )
+    );
+}
+
+#[test]
+fn rollback_bundle_vector_verifies_and_older_peers_ignore_it() {
+    use crate::release::*;
+    let (line, o) = rollback_offer();
+    validate_upgrade_offer(&o).unwrap();
+    let b = o.rollback_bundle.as_ref().expect("向量帶 rollback_bundle");
+    let rb = o.rollback_artifact.as_ref().unwrap();
+    // 回滾檔的簽章資料以本機信任錨驗證（與目標版本相同的規則），回滾檔列在其中、平台與格式相符
+    let signers = AllowedSigners::parse(include_str!("../../testdata/release/allowed_signers"));
+    let verified = verify_bundle(
+        &ReleaseBundle {
+            sha256sums: &b.sha256sums,
+            signature: &b.signature,
+            manifest: None,
+        },
+        &TrustPolicy {
+            signers: &signers,
+            extra_principals: &[],
+            now_unix: 1_795_000_000,
+        },
+    )
+    .unwrap();
+    let (os, arch, format) = artifact_kind(INSTALL_METHOD_DEB, "x86_64").unwrap();
+    let file = verified
+        .check_artifact(
+            &rb.filename,
+            &rb.sha256,
+            &ArtifactExpectation {
+                product: Some(Product::Pulse),
+                version: Some("0.9.1"),
+                commit: None,
+                os: Some(os),
+                arch: Some(arch),
+                format: Some(format),
+            },
+        )
+        .unwrap();
+    // 方案 A2：commit 以前綴比對（執行檔內建的 commit 可能比檔名的長）
+    assert!(commits_match(&file.commit, "5e6f7a8"));
+    assert!(commits_match(
+        &file.commit,
+        "5e6f7a8c0ffee0000000000000000000000000ab"
+    ));
+    assert!(!commits_match(&file.commit, "5e6f7a9"));
+    assert!(!commits_match(&file.commit, "5e6f"));
+    assert!(!commits_match("", ""));
+    // 撤銷的判斷只看金鑰是否仍列在信任錨（不看有效期間）
+    assert!(signers.lists_fingerprint(&verified.signer.fingerprint));
+    assert!(!AllowedSigners::parse("").lists_fingerprint(&verified.signer.fingerprint));
+    assert!(!signers.lists_fingerprint(""));
+    // 舊的 Pulse（凍結的型別）忽略 rollback_bundle，其餘欄位不變
+    old_pulse_sees_the_same_offer(line, &o);
+    // 新的 Pulse 解析舊 Kairos 的提議：沒有 rollback_bundle；序列化時也不會多出這個鍵
+    let old = offer();
+    assert_eq!(old.rollback_bundle, None);
+    assert!(
+        !serde_json::to_string(&old)
+            .unwrap()
+            .contains("rollback_bundle")
+    );
+    // 限制：只有 rollback_artifact 存在時才允許；大小 1..=上限
+    let mut x = o.clone();
+    x.rollback_artifact = None;
+    assert!(
+        validate_upgrade_offer(&x)
+            .unwrap_err()
+            .contains("rollback_bundle")
+    );
+    for (sums, sig) in [
+        (String::new(), b.signature.clone()),
+        (b.sha256sums.clone(), String::new()),
+        ("s".repeat(MAX_SHA256SUMS_BYTES + 1), b.signature.clone()),
+        (b.sha256sums.clone(), "s".repeat(MAX_SIGNATURE_BYTES + 1)),
+    ] {
+        let mut x = o.clone();
+        x.rollback_bundle = Some(RollbackBundle {
+            sha256sums: sums,
+            signature: sig,
+        });
+        assert!(
+            validate_upgrade_offer(&x)
+                .unwrap_err()
+                .contains("rollback_bundle")
+        );
+    }
+    let mut x = o.clone();
+    x.rollback_bundle = Some(RollbackBundle {
+        sha256sums: "s".repeat(MAX_SHA256SUMS_BYTES),
+        signature: "s".repeat(MAX_SIGNATURE_BYTES),
+    });
+    validate_upgrade_offer(&x).unwrap();
+}
+
+/// ADR-0003 第 6.3 節：以完整的伺服器訊息實際序列化，三段式規則的每一個分支；含需要大量 JSON 跳脫的
+/// 合法與惡意輸入。通過的訊息（含省略 bundle 後的）在舊端同樣的單行上限內
+#[test]
+fn offer_line_length_rule_has_three_stages() {
+    let (_, base) = rollback_offer();
+    let limit = crate::MAX_LINE_LENGTH;
+    let line = |o: &UpgradeOffer| {
+        ServerMsg::UpgradeOffer(Box::new(o.clone()))
+            .to_line()
+            .unwrap()
+    };
+    let check_sent = |o: &UpgradeOffer| {
+        let l = line(o);
+        assert_eq!(upgrade_offer_line_len(o), l.len() + 1);
+        assert!(l.len() + 1 + OFFER_LINE_RESERVE <= limit, "{}", l.len());
+        // 舊的 Pulse 解析得了、欄位不變
+        old_pulse_sees_the_same_offer(&l, o);
+        validate_upgrade_offer(o).unwrap();
+    };
+    // 1. 一般的提議：原樣送出
+    let mut o = base.clone();
+    assert_eq!(fit_upgrade_offer(&mut o), OfferFit::Full);
+    assert_eq!(o, base);
+    check_sent(&o);
+    // 2. 每個欄位都取上限的合法內容（SHA256SUMS 每行約 100 bytes、ASCII；兩個外部 URL 取上限）：仍在上限內
+    let sums_line = format!(
+        "{}  pulse-0.11.1-9a8b7c6-linux-x86_64.deb\n",
+        "a".repeat(64)
+    );
+    let fill = |max: usize| {
+        let mut s = sums_line.repeat(max / sums_line.len());
+        s.push_str(&"b".repeat(max - s.len()));
+        s
+    };
+    let long_url = |name: &str| {
+        let prefix = "https://repo.example/";
+        format!(
+            "{prefix}{}/{name}",
+            "p".repeat(MAX_ARTIFACT_URL_BYTES - prefix.len() - name.len() - 1)
+        )
+    };
+    let mut o = base.clone();
+    o.sha256sums = fill(MAX_SHA256SUMS_BYTES);
+    o.signature = fill(MAX_SIGNATURE_BYTES);
+    o.manifest = Some(ManifestRef {
+        filename: "pulse-0.11.1-9a8b7c6-release.json".into(),
+        content: "m".repeat(MAX_MANIFEST_BYTES),
+    });
+    o.artifact.source = SOURCE_URL.into();
+    o.artifact.url = Some(long_url(&o.artifact.filename));
+    let rb = o.rollback_artifact.as_mut().unwrap();
+    rb.source = SOURCE_URL.into();
+    rb.url = Some(long_url(&rb.filename));
+    o.rollback_bundle = Some(RollbackBundle {
+        sha256sums: fill(MAX_SHA256SUMS_BYTES),
+        signature: fill(MAX_SIGNATURE_BYTES),
+    });
+    validate_upgrade_offer(&o).unwrap();
+    let full = o.clone();
+    assert_eq!(
+        fit_upgrade_offer(&mut o),
+        OfferFit::Full,
+        "{}",
+        line(&o).len()
+    );
+    assert_eq!(o, full);
+    check_sent(&o);
+    // 3. 通過欄位驗證（只限制原始 bytes）但需要大量跳脫的 bundle：引號與反斜線各變成 2 bytes、控制字元
+    //    變成 6 bytes。含 bundle 時超過 → 省略 bundle，其餘欄位不變
+    for hostile in ["\"", "\\", "\u{1}"] {
+        let mut o = full.clone();
+        o.rollback_bundle = Some(RollbackBundle {
+            sha256sums: hostile.repeat(MAX_SHA256SUMS_BYTES),
+            signature: hostile.repeat(MAX_SIGNATURE_BYTES),
+        });
+        validate_upgrade_offer(&o).unwrap();
+        assert!(line(&o).len() + 1 + OFFER_LINE_RESERVE > limit);
+        let mut expected = o.clone();
+        expected.rollback_bundle = None;
+        assert_eq!(
+            fit_upgrade_offer(&mut o),
+            OfferFit::BundleOmitted,
+            "{hostile:?}"
+        );
+        assert_eq!(o, expected);
+        check_sent(&o);
+    }
+    // 4. 省略 bundle 之後仍超過（目標的簽章資料本身需要大量跳脫；現行的欄位驗證擋不住）：不得送出。
+    //    沒有 bundle 的提議也適用同一條規則
+    for with_bundle in [true, false] {
+        let mut o = full.clone();
+        o.sha256sums = "\u{1}".repeat(MAX_SHA256SUMS_BYTES);
+        if !with_bundle {
+            o.rollback_bundle = None;
+        }
+        validate_upgrade_offer(&o).unwrap();
+        assert_eq!(fit_upgrade_offer(&mut o), OfferFit::TooLarge);
+        assert!(line(&o).len() + 1 + OFFER_LINE_RESERVE > limit);
+    }
+    // 5. 邊界：序列化後的長度（含換行）加上餘裕恰好等於上限 → 送出；多 1 byte → 省略 bundle
+    let mut o = base.clone();
+    let room = limit - OFFER_LINE_RESERVE - upgrade_offer_line_len(&o);
+    let pad = |o: &mut UpgradeOffer, n: usize| {
+        let b = o.rollback_bundle.as_mut().unwrap();
+        b.sha256sums.push_str(&"c".repeat(n));
+    };
+    pad(&mut o, room);
+    assert_eq!(upgrade_offer_line_len(&o) + OFFER_LINE_RESERVE, limit);
+    let exact = o.clone();
+    assert_eq!(fit_upgrade_offer(&mut o), OfferFit::Full);
+    assert_eq!(o, exact);
+    pad(&mut o, 1);
+    assert_eq!(fit_upgrade_offer(&mut o), OfferFit::BundleOmitted);
+    assert_eq!(o.rollback_bundle, None);
+    check_sent(&o);
+}
+
+#[test]
+fn degraded_rollback_is_reported_with_a_machine_readable_detail() {
+    let st = vectors(Ver::MgmtRollback, 'P')
+        .into_iter()
+        .find(|l| l.contains(r#""type":"upgrade_status""#))
+        .unwrap();
+    let ClientMsg::UpgradeStatus(st) = parse_client_msg(st).unwrap() else {
+        panic!();
+    };
+    // 舊的 Kairos 只接受固定的 state：降級回滾仍是 rolled_back，代碼與 detail 不同
+    validate_upgrade_status(&st).unwrap();
+    assert_eq!(st.state, UPGRADE_STATE_ROLLED_BACK);
+    assert_eq!(st.code.as_deref(), Some("PLS-W8418"));
+    assert_eq!(
+        degraded_reasons(&st.detail),
+        Some(vec![
+            DEGRADED_PACKAGE_ROLLBACK_FAILED,
+            DEGRADED_PACKAGE_DB_INCONSISTENT
+        ])
+    );
+    // 一般的回滾（沒有前綴）不是降級回滾；前綴只在開頭才算
+    assert_eq!(degraded_reasons("crash_restart (NRestarts 0 → 1)"), None);
+    assert_eq!(degraded_reasons(""), None);
+    assert_eq!(
+        degraded_reasons("x; degraded:package_db_inconsistent"),
+        None
+    );
+    // 不認得的原因照樣回傳（由資料驅動）；原因到第一個其他字元為止
+    assert_eq!(
+        degraded_reasons(
+            "degraded:rollback_signer_revoked,some_future_reason,package_db_inconsistent"
+        ),
+        Some(vec![
+            DEGRADED_SIGNER_REVOKED,
+            "some_future_reason",
+            DEGRADED_PACKAGE_DB_INCONSISTENT
+        ])
+    );
+    assert_eq!(
+        degraded_reasons("degraded:no_rollback_package; health_timeout (x,y)"),
+        Some(vec![DEGRADED_NO_PACKAGE])
+    );
+    assert_eq!(degraded_reasons("degraded:"), Some(vec![]));
+    for r in [
+        DEGRADED_PACKAGE_DB_INCONSISTENT,
+        DEGRADED_PACKAGE_ROLLBACK_FAILED,
+        DEGRADED_SIGNER_REVOKED,
+        DEGRADED_NO_PACKAGE,
+        DEGRADED_NOT_VERIFIED,
+        DEGRADED_BINARY_MISMATCH,
+        DEGRADED_COMMIT_MISMATCH,
+        DEGRADED_COPY_CHANGED,
+        DEGRADED_ARCHIVE_UNUSABLE,
+    ] {
+        assert!(is_install_token(r), "{r}");
+    }
+}
+
+#[test]
+fn rollback_declaration_is_optional_and_compatible_with_old_peers() {
+    for state in INSTALL_ROLLBACK_STATES {
+        assert!(is_install_token(state), "{state}");
+    }
+    let hellos = vectors(Ver::MgmtRollback, 'P');
+    let installs: Vec<InstallInfo> = hellos
+        .iter()
+        .filter(|l| l.contains(r#""type":"hello""#))
+        .map(|line| {
+            let ClientMsg::Hello { ext, .. } = parse_client_msg(line).unwrap() else {
+                panic!("{line}");
+            };
+            let host = ext.host.as_ref().unwrap();
+            crate::validate_host_info(host).unwrap();
+            host.install.clone().unwrap()
+        })
+        .collect();
+    assert_eq!(installs.len(), 2);
+    assert_eq!(
+        installs[0].rollback.as_deref(),
+        Some(INSTALL_ROLLBACK_ARCHIVED)
+    );
+    assert_eq!(
+        installs[1].rollback.as_deref(),
+        Some(INSTALL_ROLLBACK_DEGRADED)
+    );
+    // 宣告不影響 feature
+    assert_eq!(
+        client_mgmt_features(true, &installs[1]),
+        [FEATURE_CONFIG, FEATURE_UPGRADE]
+    );
+    // 舊的 Pulse 沒有這個欄位：未知；序列化時不會多出這個鍵
+    let ClientMsg::Hello { ext, .. } =
+        parse_client_msg(vectors(Ver::MgmtExternalUrl, 'P')[0]).unwrap()
+    else {
+        panic!();
+    };
+    let old = ext.host.as_ref().unwrap().install.clone().unwrap();
+    assert_eq!(old.rollback, None);
+    assert!(!serde_json::to_string(&old).unwrap().contains("rollback"));
+    // 舊的 Kairos（0.11.0：install 有四個欄位、其他欄位忽略）收到新的 hello：照常解析
+    #[derive(serde::Deserialize)]
+    struct InstallV011 {
+        method: Option<String>,
+        upgrade: Option<String>,
+        config: Option<String>,
+        external_url: Option<String>,
+    }
+    for (line, new) in hellos.iter().zip(&installs) {
+        let v: Value = serde_json::from_str(line).unwrap();
+        let old: InstallV011 = serde_json::from_value(v["install"].clone()).unwrap();
+        assert_eq!(
+            (&old.method, &old.upgrade, &old.config, &old.external_url),
+            (&new.method, &new.upgrade, &new.config, &new.external_url)
+        );
+    }
+    // 不認得的值不是錯誤；格式不符是 bad_request
+    let line = hellos[0].replace(r#""rollback":"archived""#, r#""rollback":"slot""#);
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!();
+    };
+    crate::validate_host_info(ext.host.as_ref().unwrap()).unwrap();
+    let line = hellos[0].replace(r#""rollback":"archived""#, r#""rollback":"Archived!""#);
+    let ClientMsg::Hello { ext, .. } = parse_client_msg(&line).unwrap() else {
+        panic!();
+    };
+    assert!(crate::validate_host_info(ext.host.as_ref().unwrap()).is_err());
 }
 
 // ---- 驗證 ----

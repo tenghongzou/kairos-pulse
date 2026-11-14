@@ -24,8 +24,9 @@ use super::schedule::ScheduleSpec;
 use super::store::{HostTransition, NewRolloutHost, RolloutHostRow, RolloutRow};
 use super::submission::{self, MissingFile};
 use super::{
-    CODE_INCOMPATIBLE, CODE_RELEASE_FILE_MISSING, CODE_ROLLBACK_FAILED, CODE_ROLLED_BACK,
-    CODE_ROLLOUT_PAUSED, CODE_SIGNATURE_FAILED, CODE_VERSION_MISMATCH, OfferFiles, RemoteService,
+    CODE_INCOMPATIBLE, CODE_OFFER_TOO_LARGE, CODE_RELEASE_FILE_MISSING, CODE_ROLLBACK_FAILED,
+    CODE_ROLLED_BACK, CODE_ROLLED_BACK_DEGRADED, CODE_ROLLOUT_PAUSED, CODE_SIGNATURE_FAILED,
+    CODE_VERSION_MISMATCH, OfferFiles, RemoteService,
 };
 use crate::api::http::ApiError;
 use crate::enroll::db::DbError;
@@ -1437,7 +1438,9 @@ impl RemoteService {
                         let u = inventory.get(&h.host_id);
                         let method = u.and_then(|u| u.install_method.clone()).unwrap_or_default();
                         let arch = u.and_then(|u| rollout::arch_of(u.os.as_deref())).unwrap_or_default();
-                        if !submission::blocked_files(&missing, &r.target_version, &method, &arch, h.from_version.as_deref(), options.allow_no_rollback).is_empty() {
+                        // 宣告有本機封存的主機回滾不依賴版本庫：回滾檔遺失不擋下它
+                        let archived = u.and_then(|u| u.install_rollback.as_deref()) == Some(mgmt::INSTALL_ROLLBACK_ARCHIVED);
+                        if !submission::blocked_files(&missing, &r.target_version, &method, &arch, h.from_version.as_deref(), options.allow_no_rollback || archived).is_empty() {
                             blocked.insert(h.agent_id.clone());
                         }
                     }
@@ -1714,19 +1717,31 @@ impl RemoteService {
                     match s.get_release(&session.agent_version)? {
                         Some(cur) if cur.source != super::ops::SOURCE_EXTERNAL || external => {
                             let list = super::ops::offerable(&cur, s.release_artifacts(cur.id)?);
+                            // 回滾檔所屬發佈的簽章資料（`rollback_bundle`，ADR-0003 階段 1）：讓第一次遠端
+                            // 升級的主機（本機沒有這個版本的驗證紀錄）也能驗證並使用回滾檔。只是提示：
+                            // Pulse 與輔助程式各自以本機信任錨驗證
                             rollout::pick_artifact(&list, &method, &arch)
                                 .cloned()
-                                .map(|a| (a, cur.base_url.clone()))
+                                .map(|a| {
+                                    let bundle = mgmt::RollbackBundle {
+                                        sha256sums: cur.sha256sums.clone(),
+                                        signature: cur.signature.clone(),
+                                    };
+                                    (a, cur.base_url.clone(), bundle)
+                                })
                         }
                         _ => None,
                     }
                 } else {
                     None
                 };
-                // 回滾檔在代管的版本庫中遺失：允許無法自動回滾的推送不附回滾檔，否則不提議
+                // 回滾檔在代管的版本庫中遺失：允許無法自動回滾的推送、或主機宣告有本機封存（回滾不依賴
+                // 版本庫）時不附回滾檔，否則不提議
+                let archived =
+                    session.install_rollback.as_deref() == Some(mgmt::INSTALL_ROLLBACK_ARCHIVED);
                 let rollback = match rollback {
-                    Some((b, None)) if file_problem(&b) => {
-                        if !options.allow_no_rollback {
+                    Some((b, None, _)) if file_problem(&b) => {
+                        if !options.allow_no_rollback && !archived {
                             return Ok(None);
                         }
                         None
@@ -1776,7 +1791,8 @@ impl RemoteService {
                     artifact: artifact_ref(&a, rel.base_url.as_deref()),
                     rollback_artifact: rollback
                         .as_ref()
-                        .map(|(b, base)| artifact_ref(b, base.as_deref())),
+                        .map(|(b, base, _)| artifact_ref(b, base.as_deref())),
+                    rollback_bundle: rollback.as_ref().map(|(_, _, bundle)| bundle.clone()),
                     manifest: match (&rel.manifest_name, &rel.manifest) {
                         (Some(n), Some(c)) => Some(ManifestRef {
                             filename: n.clone(),
@@ -1798,18 +1814,56 @@ impl RemoteService {
                 if rel.base_url.is_none() {
                     files.push((a.filename.clone(), a.sha256.clone(), a.size.max(0) as u64));
                 }
-                if let Some((b, None)) = &rollback {
+                if let Some((b, None, _)) = &rollback {
                     files.push((b.filename.clone(), b.sha256.clone(), b.size.max(0) as u64));
                 }
-                Ok(Some((offer, files)))
+                Ok(Some((offer, files, r.name.clone(), h.reason.clone())))
             })
             .await?;
-        let Some((offer, files)) = built else {
+        let Some((mut offer, files, rollout_name, host_reason)) = built else {
             return Ok(None);
         };
+        // 回滾檔的簽章資料不合規定（空的、超過欄位上限；匯入時的檢查應該已經擋下）：不附 bundle，
+        // 不因此擋下提議
+        if let Some(b) = &offer.rollback_bundle
+            && (b.sha256sums.is_empty()
+                || b.sha256sums.len() > mgmt::MAX_SHA256SUMS_BYTES
+                || b.signature.is_empty()
+                || b.signature.len() > mgmt::MAX_SIGNATURE_BYTES)
+        {
+            log::warn!(
+                "升級推送：回滾檔所屬發佈的簽章資料不合規定，提議不附 rollback_bundle（{agent_id}，{upgrade_id}）"
+            );
+            offer.rollback_bundle = None;
+        }
         if let Err(e) = mgmt::validate_upgrade_offer(&offer) {
             log::error!("升級推送：組出的 upgrade_offer 不合規定（{agent_id}，{upgrade_id}）：{e}");
             return Ok(None);
+        }
+        // 單行大小的三段式規則（REMOTE.md 第 2.4.1 節；ADR-0003 第 6.3 節）：以完整的伺服器訊息實際
+        // 序列化。超過單行上限的訊息對端會當成連線錯誤（不是忽略欄位），所以寧可省略 bundle 或不送
+        match mgmt::fit_upgrade_offer(&mut offer) {
+            mgmt::OfferFit::Full => {
+                // 上一次省略過、這次放得下（例如版本庫的內容變了）：清掉註記
+                if host_reason.as_deref() == Some(rollout::REASON_BUNDLE_OMITTED) {
+                    self.note_offer(upgrade_id, None).await?;
+                }
+            }
+            mgmt::OfferFit::BundleOmitted => {
+                log::warn!(
+                    event = "rollout.rollback_bundle_omitted";
+                    "升級推送「{rollout_name}」：{agent_id} 的提議含 rollback_bundle 時超過單行上限，已省略 bundle 後送出（回滾檔只有在主機本機有紀錄時才會被使用）"
+                );
+                if host_reason.as_deref() != Some(rollout::REASON_BUNDLE_OMITTED) {
+                    self.note_offer(upgrade_id, Some(rollout::REASON_BUNDLE_OMITTED))
+                        .await?;
+                }
+            }
+            mgmt::OfferFit::TooLarge => {
+                self.offer_too_large(agent_id, upgrade_id, mgmt::upgrade_offer_line_len(&offer))
+                    .await?;
+                return Ok(None);
+            }
         }
         self.cache_files(
             upgrade_id,
@@ -1819,6 +1873,121 @@ impl RemoteService {
             }),
         );
         Ok(Some(offer))
+    }
+
+    /// 提議中的主機的註記（`reason`）：`rollback_bundle_omitted` 或清除。主機已不在提議中時不動
+    async fn note_offer(&self, upgrade_id: &str, reason: Option<&str>) -> Result<(), DbError> {
+        let now = self.now_ms();
+        let (upgrade, reason) = (upgrade_id.to_string(), reason.map(str::to_string));
+        let r = self
+            .in_tx(move |s| {
+                let Some(h) = s.rollout_host_by_upgrade_id(&upgrade)? else {
+                    return Ok(None);
+                };
+                if !rollout::is_offered(&h.state) {
+                    return Ok(None);
+                }
+                s.update_rollout_host(
+                    &h.rollout_id,
+                    h.host_id,
+                    &HostTransition {
+                        reason: Some(reason),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                Ok(Some(h.rollout_id))
+            })
+            .await;
+        match r {
+            Ok(Some(id)) => {
+                self.mark_dirty(&id);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(TxError::Db(e)) => Err(e),
+            Err(TxError::Api(e)) => Err(DbError(e.message)),
+        }
+    }
+
+    /// 省略 `rollback_bundle` 後仍超過單行上限（REMOTE.md 第 2.4.1 節的第三段）：這則提議**不送出**
+    /// （Pulse 收到 `upgrade_unavailable`，連線不受影響）。主機在推送中標為 `failed`（`reason` 為
+    /// `offer_too_large`；修正版本庫後可以重試），寫稽核事件，推送自動暫停（系統規則「升級推送已暫停」
+    /// 開告警）——同一個版本的其他主機會遇到同樣的問題，需要人處理版本庫的內容
+    async fn offer_too_large(
+        &self,
+        agent_id: &str,
+        upgrade_id: &str,
+        line_len: usize,
+    ) -> Result<(), DbError> {
+        let now = self.now_ms();
+        let (agent, upgrade) = (agent_id.to_string(), upgrade_id.to_string());
+        let r = self
+            .in_tx(move |s| {
+                let Some(h) = s.rollout_host_by_upgrade_id(&upgrade)? else {
+                    return Ok(None);
+                };
+                if h.agent_id != agent || !rollout::is_offered(&h.state) {
+                    return Ok(None);
+                }
+                let Some(mut r) = s.get_rollout(&h.rollout_id)? else {
+                    return Ok(None);
+                };
+                log::warn!(
+                    event = "rollout.offer_too_large", code = CODE_OFFER_TOO_LARGE;
+                    "警告 {CODE_OFFER_TOO_LARGE}：推送「{}」（{}）：{agent} 的 upgrade_offer 序列化後 {line_len} bytes，省略 rollback_bundle 後仍超過單行上限，沒有送出；推送已暫停",
+                    r.name, r.id
+                );
+                s.update_rollout_host(
+                    &r.id,
+                    h.host_id,
+                    &HostTransition {
+                        state: Some(HOST_FAILED.into()),
+                        reason: Some(Some(rollout::REASON_OFFER_TOO_LARGE.into())),
+                        code: Some(Some(CODE_OFFER_TOO_LARGE.into())),
+                        detail: Some(Some(format!("upgrade_offer is {line_len} bytes"))),
+                        finished_at: Some(Some(now)),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                Actor::system()
+                    .event(
+                        "host",
+                        "host.upgrade.offer_too_large",
+                        Some(agent.clone()),
+                        Some(CODE_OFFER_TOO_LARGE),
+                        json!({"rollout_id": r.id, "upgrade_id": upgrade, "target_version": r.target_version, "line_bytes": line_len, "max_line_bytes": kairos_proto::MAX_LINE_LENGTH}),
+                    )
+                    .append(s, now)?;
+                let mut cleared = Vec::new();
+                if r.state == ROLLOUT_RUNNING {
+                    cleared = pause_in_tx(
+                        s,
+                        &mut r,
+                        &format!("{agent} 的升級提議超過協定的單行上限，沒有送出"),
+                        &Actor::system(),
+                        Some(json!({"cause": rollout::PAUSE_OFFER_TOO_LARGE, "agent_id": agent})),
+                        now,
+                    )?;
+                }
+                Ok(Some((r.id.clone(), cleared)))
+            })
+            .await;
+        match r {
+            Ok(Some((rollout_id, cleared))) => {
+                self.set_offer(agent_id, None);
+                for a in cleared {
+                    self.set_offer(&a, None);
+                }
+                self.mark_dirty(&rollout_id);
+                self.wake();
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(TxError::Db(e)) => Err(e),
+            Err(TxError::Api(e)) => Err(DbError(e.message)),
+        }
     }
 
     /// `upgrade_chunk_get` 可以讀的檔案：(路徑, 大小)；不是這次提議的檔案時 `None`（`upgrade_unavailable`）
@@ -1942,8 +2111,21 @@ impl RemoteService {
                     }
                     HOST_ROLLED_BACK => {
                         t.finished_at = Some(Some(now));
-                        events.push(("host.upgrade.rolled_back", Some(CODE_ROLLED_BACK)));
-                        log::warn!(event = "rollout.rolled_back", code = CODE_ROLLED_BACK; "警告 {CODE_ROLLED_BACK}：{agent} 升級到 {} 後沒有恢復正常，已自動回滾到 {}", r.target_version, st.from_version);
+                        // 降級回滾（REMOTE.md 第 4.5.2 節；ADR-0003 第 5.4 節）：state 仍是 rolled_back，
+                        // detail 以 `degraded:` 開頭。服務已恢復到舊版，但套件資料庫與實際的執行檔不一致：
+                        // 另一個稽核事件與代碼，推送自動暫停（系統規則「升級推送已暫停」開告警）
+                        match mgmt::degraded_reasons(&st.detail) {
+                            Some(reasons) => {
+                                let reasons = reasons.join(",");
+                                events.push(("host.upgrade.rolled_back_degraded", Some(CODE_ROLLED_BACK_DEGRADED)));
+                                log::warn!(event = "rollout.rolled_back_degraded", code = CODE_ROLLED_BACK_DEGRADED; "警告 {CODE_ROLLED_BACK_DEGRADED}：{agent} 升級到 {} 後沒有恢復正常，已回滾到 {}，但只換回執行檔（{reasons}）：套件資料庫與實際的執行檔不一致，需要重新安裝 {} 的套件", r.target_version, st.from_version, st.from_version);
+                                pause = Some((format!("{agent} 降級回滾：服務已恢復，但需要修復套件（{reasons}）"), json!({"cause": rollout::PAUSE_ROLLBACK_DEGRADED, "agent_id": agent, "reasons": reasons}), false));
+                            }
+                            None => {
+                                events.push(("host.upgrade.rolled_back", Some(CODE_ROLLED_BACK)));
+                                log::warn!(event = "rollout.rolled_back", code = CODE_ROLLED_BACK; "警告 {CODE_ROLLED_BACK}：{agent} 升級到 {} 後沒有恢復正常，已自動回滾到 {}", r.target_version, st.from_version);
+                            }
+                        }
                     }
                     HOST_ROLLBACK_FAILED => {
                         t.finished_at = Some(Some(now));
@@ -2045,6 +2227,8 @@ pub struct LiveHello {
     pub install_config: Option<String>,
     /// hello 的 `install.external_url`（`None`＝這次 hello 沒有宣告）
     pub install_external_url: Option<String>,
+    /// hello 的 `install.rollback`（`None`＝這次 hello 沒有宣告）
+    pub install_rollback: Option<String>,
     /// hello 的 `os`（JSON；資格分類只用 `arch`）
     pub os: Option<String>,
     pub tags: Option<Vec<String>>,
@@ -2060,6 +2244,7 @@ impl LiveHello {
             install_upgrade: install.and_then(|i| i.upgrade.clone()),
             install_config: install.and_then(|i| i.config.clone()),
             install_external_url: install.and_then(|i| i.external_url.clone()),
+            install_rollback: install.and_then(|i| i.rollback.clone()),
             os: host
                 .and_then(|h| h.os.as_ref())
                 .and_then(|o| serde_json::to_string(o).ok()),
@@ -2077,6 +2262,7 @@ impl LiveHello {
             self.install_upgrade = s.install_upgrade.clone();
             // 同一則 hello 的宣告（沒有宣告時是 None，不沿用別處的值）
             self.install_external_url = s.install_external_url.clone();
+            self.install_rollback = s.install_rollback.clone();
         }
         if let Some(arch) = &s.arch {
             let mut os: serde_json::Map<String, Value> = self
@@ -2137,6 +2323,7 @@ pub(crate) fn with_live(
                 h.install_upgrade = l.install_upgrade.clone();
                 // external_url 以這次 hello 為準、不沿用清冊：沒有宣告（Pulse 降回舊版）就是未知
                 h.install_external_url = l.install_external_url.clone();
+                h.install_rollback = l.install_rollback.clone();
             }
             if l.install_config.is_some() {
                 h.install_config = l.install_config.clone();

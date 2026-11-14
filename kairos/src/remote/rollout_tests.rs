@@ -13,6 +13,7 @@ fn host(id: u8, version: &str, method: &str, upgrade: &str) -> UpgradeHost {
         install_upgrade: Some(upgrade.to_string()),
         install_config: Some("enabled".into()),
         install_external_url: None,
+        install_rollback: None,
         host_group: Some("Web".into()),
         tags: vec!["env:prod".into()],
         online: true,
@@ -421,6 +422,50 @@ fn eligibility_follows_section_4_7_2() {
     };
     let e = classify(&d, &c3, &allow);
     assert_eq!((e.skip, e.no_rollback), (None, true));
+    assert_eq!(e.rollback, RollbackVia::BinaryOnly);
+    // 預期的回滾方式（ADR-0003 第 5.4 節）：版本庫有目前的版本 → 回滾檔（＋bundle）；主機宣告本機封存
+    // （install.rollback = "archived"）→ 不依賴版本庫，沒有目前的版本也不是 no_rollback；其他宣告
+    // （binary_only、none、degraded、不認得的值）與沒有宣告相同，看版本庫；tar 不適用
+    let e = classify(&d, &ctx("0.9.1"), &o);
+    assert_eq!(
+        (e.skip, e.no_rollback, e.rollback, e.degraded),
+        (None, false, RollbackVia::Repository, false)
+    );
+    let declares_rollback = |v: &str| {
+        let mut h = d.clone();
+        h.install_rollback = Some(v.to_string());
+        h
+    };
+    let e = classify(&declares_rollback("archived"), &c3, &o);
+    assert_eq!(
+        (e.skip, e.no_rollback, e.rollback),
+        (None, false, RollbackVia::Archive)
+    );
+    // 兩者都有：封存優先（回滾綁定本機實際安裝過的那一份）
+    let e = classify(&declares_rollback("archived"), &ctx("0.9.1"), &o);
+    assert_eq!(e.rollback, RollbackVia::Archive);
+    for v in ["binary_only", "none", "degraded", "future_value"] {
+        let h = declares_rollback(v);
+        assert_eq!(classify(&h, &c3, &o).skip, Some("no_rollback"), "{v}");
+        let e = classify(&h, &c3, &allow);
+        assert_eq!(
+            (e.skip, e.no_rollback, e.rollback, e.degraded),
+            (None, true, RollbackVia::BinaryOnly, v == "degraded"),
+            "{v}"
+        );
+        assert_eq!(
+            classify(&h, &ctx("0.9.1"), &o).rollback,
+            RollbackVia::Repository,
+            "{v}"
+        );
+    }
+    let mut t = host(1, "0.9.0", "tar", "ready");
+    t.install_rollback = Some("binary_only".into());
+    let e = classify(&t, &c3, &o);
+    assert_eq!(
+        (e.skip, e.no_rollback, e.rollback),
+        (None, false, RollbackVia::NotApplicable)
+    );
     // 預發佈版本低於 min_upgrade_from（0.9.0-test.1 < 0.9.0）
     let mut pre = host(1, "0.9.0", "tar", "ready");
     pre.agent_version = Some("0.9.0-test.1".into());

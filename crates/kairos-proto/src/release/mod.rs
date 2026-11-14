@@ -171,6 +171,12 @@ pub fn is_commit(s: &str) -> bool {
     (7..=40).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// 兩個 commit 的縮寫是否指同一個 commit：都合法（[`is_commit`]），而且其中一個是另一個的前綴。
+/// 發佈檔名中的 commit 與執行檔內建的 `PULSE_BUILD_COMMIT` 長度可能不同（ADR-0003 方案 A2）
+pub fn commits_match(a: &str, b: &str) -> bool {
+    is_commit(a) && is_commit(b) && (a.starts_with(b) || b.starts_with(a))
+}
+
 // ---- 發佈檔名 ----
 
 /// 產品
@@ -821,6 +827,114 @@ pub fn check_version_policy(
                 Ok(VersionAction::Upgrade)
             }
         }
+    }
+}
+
+// ---- 已驗證發佈的本機紀錄（ADR-0003 第 7.1 節 Q3） ----
+
+/// [`ReleaseRecord::schema`]
+pub const RELEASE_RECORD_SCHEMA: &str = "kairos-pulse.release-record/v1";
+/// [`ReleaseRecord::source`]：遠端升級（OTA）成功、健康確認通過後由特權元件封存
+pub const RECORD_SOURCE_OTA: &str = "ota";
+/// [`ReleaseRecord::source`]：安裝時由一行安裝腳本交給特權元件驗證並封存的種子
+pub const RECORD_SOURCE_SEED: &str = "seed";
+/// [`ReleaseRecord::source`]：本機管理者事後以命令（`pulse upgrade archive-current`）封存目前安裝的版本
+pub const RECORD_SOURCE_INSTALL: &str = "install";
+
+/// 驗證當時的信任政策快照（[`ReleaseRecord::policy`]）：之後判斷「簽署金鑰是否被撤銷」以指紋比對
+/// 目前的信任錨；其餘欄位供鑑識
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustSnapshot {
+    /// 簽署金鑰的指紋（`SHA256:…`）
+    pub signer: String,
+    /// 符合的 principal
+    #[serde(default)]
+    pub principal: String,
+    /// 驗證當時 `allowed_signers` 那一行的 `valid-after`／`valid-before`（Unix 秒；沒有時 `None`）
+    #[serde(default)]
+    pub valid_after: Option<i64>,
+    #[serde(default)]
+    pub valid_before: Option<i64>,
+    /// 驗證當時信任錨檔案的 SHA-256
+    #[serde(default)]
+    pub anchor_sha256: String,
+    /// 驗證的時間（Unix 秒）
+    #[serde(default)]
+    pub verified_at: i64,
+}
+
+impl TrustSnapshot {
+    /// 由驗證結果與當時的信任錨組成
+    pub fn of(
+        signer: &VerifiedSigner,
+        signers: &AllowedSigners,
+        anchor_sha256: &str,
+        now_unix: i64,
+    ) -> Self {
+        let entry = signers.entries.iter().find(|e| e.line == signer.line);
+        Self {
+            signer: signer.fingerprint.clone(),
+            principal: signer.principal.clone(),
+            valid_after: entry.and_then(|e| e.valid_after),
+            valid_before: entry.and_then(|e| e.valid_before),
+            anchor_sha256: anchor_sha256.to_string(),
+            verified_at: now_unix,
+        }
+    }
+}
+
+/// 一份「已驗證發佈」的本機紀錄：Linux 升級輔助程式的本機封存（`/var/lib/pulse-upgrade/archive/`，REMOTE.md
+/// 第 17.10 節）的條目；Windows 的版本槽紀錄（ADR-0001）沿用同一種內容。**只定義內容的格式**；信任來自
+/// 它存放的位置（只有特權元件可寫）與提交紀錄，不來自這份資料本身（INV-6、INV-10）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRecord {
+    /// [`RELEASE_RECORD_SCHEMA`]
+    pub schema: String,
+    /// **主鍵**：發佈檔（套件）整包的 SHA-256
+    pub artifact_sha256: String,
+    /// 索引與人讀資訊
+    pub version: String,
+    pub commit: String,
+    /// 發佈時的檔名
+    pub artifact: String,
+    /// 發佈檔中代理程式執行檔的 SHA-256（回滾時與目前安裝的執行檔比對）
+    pub binary_sha256: String,
+    /// [`RECORD_SOURCE_OTA`]／[`RECORD_SOURCE_SEED`]／[`RECORD_SOURCE_INSTALL`]
+    pub source: String,
+    /// 驗證當時的信任政策
+    pub policy: TrustSnapshot,
+    /// 偵測到簽署金鑰已被撤銷（不在信任錨中）的時間（Unix 秒）；沒有偵測到時 `None`
+    #[serde(default)]
+    pub revoked_at: Option<i64>,
+    /// 這個條目被提交時的 generation（單調遞增；只有提交紀錄中的條目才是回滾目標）
+    #[serde(default)]
+    pub generation: u64,
+    /// 封存的時間（RFC 3339）
+    #[serde(default)]
+    pub archived_at: String,
+}
+
+impl ReleaseRecord {
+    /// 內容的基本檢查：schema、雜湊的格式、版本、commit 與檔名一致
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != RELEASE_RECORD_SCHEMA {
+            return Err(format!("unexpected schema {:?}", self.schema));
+        }
+        if !is_sha256_hex(&self.artifact_sha256) || !is_sha256_hex(&self.binary_sha256) {
+            return Err("artifact_sha256 and binary_sha256 must be SHA-256 hex".to_string());
+        }
+        let file = ReleaseFile::parse(&self.artifact)?;
+        let version = Version::parse(&self.version)?;
+        if file.version != version || file.commit != self.commit || file.dirty {
+            return Err(format!(
+                "{} does not match version {} commit {}",
+                self.artifact, self.version, self.commit
+            ));
+        }
+        if self.policy.signer.is_empty() {
+            return Err("policy.signer must not be empty".to_string());
+        }
+        Ok(())
     }
 }
 

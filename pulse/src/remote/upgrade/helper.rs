@@ -983,6 +983,7 @@ fn resume_legacy(
             name: rollback_name.unwrap_or_else(|| txn::ROLLBACK_PKG_FILE.to_string()),
             sha256: String::new(),
             signer: String::new(),
+            source: String::new(),
         });
     }
     if s.unit_replaced {
@@ -1003,6 +1004,7 @@ fn resume_legacy(
                 reason: s.rollback_reason.clone(),
                 cause: Cause::Health,
                 via: Via::Binary,
+                degraded: Vec::new(),
             });
             Step::RollingBack
         }
@@ -1435,61 +1437,71 @@ impl<'a> Helper<'a> {
             name: req.artifact.clone(),
             sha256: actual,
             signer: verified.signer.fingerprint.clone(),
+            source: String::new(),
         });
         rec.manifest = req.manifest.clone();
-        // 回滾檔：以它所屬發佈的 SHA256SUMS（本機驗證過的紀錄）重新驗證
+        // 回滾來源（deb／rpm；REMOTE.md 第 4.4.2 節、ADR-0003 第 5.4 節）：依固定的順序評估，每個來源都要
+        // 符合列舉的資格，不符合就評估下一個——不回頭、不放寬。這裡決定的是「健康確認失敗時能不能經套件
+        // 管理員裝回」；不能的話回滾時換回 pulse.prev（結果是降級回滾，原因記在 rollback_declined）。
+        // 回滾來源的驗證失敗**不讓升級失敗**
         rec.rollback = None;
-        let _ = std::fs::remove_file(self.work.join(txn::ROLLBACK_PKG_FILE));
-        if let (Some(r), Some((s, g))) = (&rollback, &rollback_sums) {
-            let rs = read(s);
-            let rg = read(g);
-            let name = req.rollback_artifact.clone().unwrap_or_default();
-            let sha = files::sha256_file(r).unwrap_or_default();
-            let signer = release::verify_bundle(
-                &ReleaseBundle {
-                    sha256sums: &rs,
-                    signature: &rg,
-                    manifest: None,
-                },
-                &trust,
-            )
-            .ok()
-            .and_then(|v| {
-                // 版本以輔助程式自己的版本（替換前的版本）為準，不是請求中的值
-                let e = ArtifactExpectation {
-                    product: Some(Product::Pulse),
-                    version: Some(&req.from_version),
-                    commit: None,
-                    os: Some(Os::Linux),
-                    arch,
-                    format,
-                };
-                v.check_artifact(&name, &sha, &e)
-                    .ok()
-                    .map(|_| v.signer.fingerprint.clone())
-            });
-            // 驗證過的回滾套件留在工作目錄（接續時只用這一份）。複製而不是改名：重新安裝同一版時回滾檔
-            // 與發佈檔是同一個檔名
-            let dst = self.work.join(txn::ROLLBACK_PKG_FILE);
-            let kept = signer.and_then(|signer| {
-                txn::copy_durable(r, &dst, 0o600)
-                    .ok()
-                    .filter(|()| self.sha(&dst) == sha)
-                    .map(|()| Verified {
-                        name: name.clone(),
-                        sha256: sha.clone(),
-                        signer,
-                    })
-            });
-            if kept.is_none() {
-                self.log
-                    .line("WARN", "回滾檔沒有通過驗證，回滾時改以 pulse.prev 回復");
-                let _ = std::fs::remove_file(&dst);
+        rec.rollback_declined.clear();
+        let dst = self.work.join(txn::ROLLBACK_PKG_FILE);
+        let _ = std::fs::remove_file(&dst);
+        if self.is_package() {
+            let mut declined: Vec<String> = Vec::new();
+            // 2、3：服務帳號暫存的回滾檔（簽章資料來自本機紀錄或提議的 rollback_bundle；兩者對輔助程式
+            // 都只是提示，以相同的規則重新驗證）
+            let mut kept = None;
+            match (&rollback, &rollback_sums) {
+                (Some(r), Some((s, g))) => {
+                    let name = req.rollback_artifact.clone().unwrap_or_default();
+                    match self.verify_rollback_hint(rec, r, &name, &read(s), &read(g), &trust, arch)
+                    {
+                        Ok(v) => {
+                            // 驗證過的回滾套件留在工作目錄（接續時只用這一份）。複製而不是改名：重新
+                            // 安裝同一版時回滾檔與發佈檔是同一個檔名
+                            if txn::copy_durable(r, &dst, 0o600).is_ok()
+                                && self.sha(&dst) == v.sha256
+                            {
+                                kept = Some(v);
+                            } else {
+                                declined
+                                    .push(kairos_proto::mgmt::DEGRADED_NOT_VERIFIED.to_string());
+                            }
+                        }
+                        Err(why) => declined.push(why.to_string()),
+                    }
+                    if name != req.artifact {
+                        let _ = std::fs::remove_file(r);
+                    }
+                }
+                // 請求說有回滾檔，但檔案或它的簽章資料無法從暫存區複製
+                _ if req.rollback_artifact.is_some() => {
+                    declined.push(kairos_proto::mgmt::DEGRADED_NOT_VERIFIED.to_string());
+                }
+                _ => {}
             }
-            if name != req.artifact {
-                let _ = std::fs::remove_file(r);
+            if kept.is_none() {
+                let _ = std::fs::remove_file(&dst);
+                if declined.is_empty() {
+                    declined.push(kairos_proto::mgmt::DEGRADED_NO_PACKAGE.to_string());
+                }
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "沒有可用的回滾套件（{}）：健康確認失敗時改以 pulse.prev 回復（降級回滾，套件資料庫會與執行檔不一致）",
+                        declined.join(",")
+                    ),
+                );
+                rec.rollback_declined = declined;
             }
             rec.rollback = kept;
+        } else if let Some(r) = &rollback
+            && req.rollback_artifact.as_deref() != Some(req.artifact.as_str())
+        {
+            // tar 不需要回滾檔（回滾換回 pulse.prev）：不保留
+            let _ = std::fs::remove_file(r);
         }
         self.log.line(
             "INFO",
@@ -1525,6 +1537,117 @@ impl<'a> Helper<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// 服務帳號暫存的回滾檔能不能當成套件層級的回滾來源（ADR-0003 第 5.4 節第 2、3 項的資格；全部成立才
+    /// 使用，任何一項不成立就回原因，由呼叫端改以 `pulse.prev` 回滾）：
+    ///
+    /// 1. 它所屬發佈的 `SHA256SUMS` 以本機信任錨**完整**驗證（含 `valid-after`／`valid-before`），回滾檔
+    ///    列在其中、雜湊相符，版本是輔助程式自己的版本（INV-1；不是請求中的值），平台與格式相符（INV-3）；
+    /// 2. 檔名的 commit 與輔助程式自己的 commit（`PULSE_BUILD_COMMIT`）是同一個（前綴比對）；
+    /// 3. 套件中的 `/opt/pulse/pulse` 與替換前實際安裝的執行檔位元組相同（INV-2、方案 A2）。
+    ///
+    /// 套件在簽章與雜湊通過之後才解開，解在 root 專用的工作目錄，檢查完就刪除
+    #[allow(clippy::too_many_arguments)]
+    fn verify_rollback_hint(
+        &mut self,
+        rec: &Record,
+        pkg: &Path,
+        name: &str,
+        sums: &str,
+        sig: &str,
+        trust: &TrustPolicy<'_>,
+        arch: Option<Arch>,
+    ) -> Result<Verified, &'static str> {
+        use kairos_proto::mgmt::{
+            DEGRADED_BINARY_MISMATCH, DEGRADED_COMMIT_MISMATCH, DEGRADED_NOT_VERIFIED,
+        };
+        let sha = files::sha256_file(pkg).unwrap_or_default();
+        let bundle = ReleaseBundle {
+            sha256sums: sums,
+            signature: sig,
+            manifest: None,
+        };
+        let verified = release::verify_bundle(&bundle, trust).map_err(|e| {
+            self.log
+                .line("WARN", &format!("回滾檔的簽章資料沒有通過驗證：{e}"));
+            DEGRADED_NOT_VERIFIED
+        })?;
+        let expect = ArtifactExpectation {
+            product: Some(Product::Pulse),
+            version: Some(&self.paths.current_version),
+            commit: None,
+            os: Some(Os::Linux),
+            arch,
+            format: super::method_format(&self.req.method),
+        };
+        let file = verified.check_artifact(name, &sha, &expect).map_err(|e| {
+            self.log.line("WARN", &format!("回滾檔沒有通過驗證：{e}"));
+            DEGRADED_NOT_VERIFIED
+        })?;
+        if !release::commits_match(&file.commit, &self.paths.current_commit) {
+            self.log.line(
+                "WARN",
+                &format!(
+                    "回滾檔 {name} 的 commit（{}）與目前執行的版本（{}）不同：不使用",
+                    file.commit, self.paths.current_commit
+                ),
+            );
+            return Err(DEGRADED_COMMIT_MISMATCH);
+        }
+        self.package_binary_matches(pkg, &rec.old_binary_sha256)
+            .map_err(|e| {
+                self.log.line("WARN", &format!("回滾檔 {name} 不使用：{e}"));
+                DEGRADED_BINARY_MISMATCH
+            })?;
+        self.log.line(
+            "INFO",
+            &format!(
+                "回滾檔 {name} 已驗證（簽署者 {}；commit 與套件中的執行檔都與目前安裝的相同）",
+                verified.signer.fingerprint
+            ),
+        );
+        Ok(Verified {
+            name: name.to_string(),
+            sha256: sha,
+            signer: verified.signer.fingerprint.clone(),
+            source: txn::SOURCE_HINT.to_string(),
+        })
+    }
+
+    /// 套件（deb／rpm）中的 `/opt/pulse/pulse` 是否與 `want`（替換前執行檔的 SHA-256）相同。解在 root
+    /// 專用的工作目錄 `rollback.x/`，檢查完就刪除
+    fn package_binary_matches(&mut self, pkg: &Path, want: &str) -> Result<(), String> {
+        let dir = self.work.join(txn::ROLLBACK_EXTRACT_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+        let checked = (|| {
+            crate::remote::create_dir_all_mode(&dir, 0o700)
+                .map_err(|e| format!("無法建立 {}：{e}", dir.display()))?;
+            let cmd = if self.req.method == "deb" {
+                Cmd::DebExtract {
+                    package: pkg.to_path_buf(),
+                    dir: dir.clone(),
+                }
+            } else {
+                Cmd::RpmExtract {
+                    package: pkg.to_path_buf(),
+                    dir: dir.clone(),
+                }
+            };
+            let out = self.sys.run(&cmd);
+            if !out.ok() {
+                return Err(format!("無法解開套件：{}", out.last_line()));
+            }
+            let (bin, _) = locate_binary(&self.req.method, &dir)?;
+            // sha256_regular：不跟隨符號連結、必須是一般檔案
+            let got = self.sha(&bin);
+            if got.is_empty() || got != want {
+                return Err("套件中的 /opt/pulse/pulse 與目前安裝的執行檔不同".to_string());
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        checked
     }
 
     /// 預檢（解開、`--version`、`check-config`），並把新的執行檔（tar）與要換上的 unit 保存到工作目錄
@@ -2036,17 +2159,34 @@ impl<'a> Helper<'a> {
 
     /// 步驟 6：回滾。**先記下意圖（原因與方式）再還原**：還原途中中斷時，接續依紀錄的方式冪等重做
     fn rollback(&mut self, mut rec: Record, reason: String, cause: Cause) -> UpgradeResult {
-        // 替換無法完成時一律換回 pulse.prev（與先前「替換失敗時換回執行檔」相同，不使用回滾套件）
-        let via = if cause == Cause::Health
-            && self.is_package()
-            && rec.rollback.is_some()
-            && self.work.join(txn::ROLLBACK_PKG_FILE).is_file()
-        {
-            Via::Package
+        // 替換無法完成時一律換回 pulse.prev（與先前「替換失敗時換回執行檔」相同，不使用回滾套件）。
+        // 健康確認失敗的 deb／rpm：有驗證過的回滾套件就經套件管理員裝回；沒有、或它的簽署金鑰已被撤銷
+        // （ADR-0003 的 INV-7、決策點 D1）時換回 pulse.prev——服務恢復，但套件資料庫與實際的執行檔不
+        // 一致，結果是**降級回滾**（原因記在意圖裡）
+        let mut degraded: Vec<String> = Vec::new();
+        let via = if cause == Cause::Health && self.is_package() {
+            let has_package =
+                rec.rollback.is_some() && self.work.join(txn::ROLLBACK_PKG_FILE).is_file();
+            if !has_package {
+                if rec.rollback.is_some() {
+                    degraded.push(kairos_proto::mgmt::DEGRADED_COPY_CHANGED.to_string());
+                } else if rec.rollback_declined.is_empty() {
+                    degraded.push(kairos_proto::mgmt::DEGRADED_NO_PACKAGE.to_string());
+                } else {
+                    degraded.extend(rec.rollback_declined.iter().cloned());
+                }
+                Via::Binary
+            } else if self.rollback_signer_revoked(&rec) {
+                degraded.push(kairos_proto::mgmt::DEGRADED_SIGNER_REVOKED.to_string());
+                Via::Binary
+            } else {
+                Via::Package
+            }
         } else {
             Via::Binary
         };
         if via == Via::Binary && self.is_package() && cause == Cause::Health {
+            degraded.push(kairos_proto::mgmt::DEGRADED_PACKAGE_DB_INCONSISTENT.to_string());
             let note = format!(
                 "binary_restored_package_db_shows_{}",
                 self.req.target.version
@@ -2056,10 +2196,62 @@ impl<'a> Helper<'a> {
             }
         }
         rec.step = Step::RollbackIntent;
-        rec.rollback_intent = Some(RollbackIntent { reason, cause, via });
+        rec.rollback_intent = Some(RollbackIntent {
+            reason,
+            cause,
+            via,
+            degraded,
+        });
         self.save(&mut rec);
         self.sys.checkpoint("rollback_intent_recorded");
         self.restore_and_confirm(rec, false)
+    }
+
+    /// 回滾當下，回滾套件的簽署金鑰是否已被**撤銷**（ADR-0003 的 INV-7、決策點 D1）：金鑰已不在信任錨中
+    /// （那一行被刪除），或信任錨、`pulse.toml` 無法讀取（視同撤銷）。只看「是否仍列在其中」，**不重新
+    /// 判斷** `valid-before`：金鑰自然到期是正常的輪替，取得時已完整驗證、整包雜湊綁定，照常使用。撤銷
+    /// 時不得再以 root 執行該簽署者簽的維護指令碼：改用 `pulse.prev`。由 v1 轉換的紀錄沒有簽署者
+    /// 指紋：照 v1 的行為（不檢查）
+    fn rollback_signer_revoked(&mut self, rec: &Record) -> bool {
+        let Some(signer) = rec.rollback.as_ref().map(|r| r.signer.clone()) else {
+            return false;
+        };
+        if signer.is_empty() {
+            return false;
+        }
+        let listed = AppConfig::load_file_only(&self.paths.install_dir.join("pulse.toml"))
+            .map_err(|e| format!("pulse.toml 無法載入：{e}"))
+            .and_then(|config| {
+                let p = config.upgrade.allowed_signers_path();
+                let anchor = if p.is_relative() {
+                    self.paths.install_dir.join(p)
+                } else {
+                    p
+                };
+                crate::remote::install::load_trust_anchor(&anchor, self.paths.require_root_owner)
+            })
+            .map(|signers| signers.lists_fingerprint(&signer));
+        match listed {
+            Ok(true) => false,
+            Ok(false) => {
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "回滾套件的簽署金鑰 {signer} 已不在信任錨中（已撤銷）：不經套件管理員回滾，改以 pulse.prev 回復"
+                    ),
+                );
+                true
+            }
+            Err(e) => {
+                self.log.line(
+                    "WARN",
+                    &format!(
+                        "回滾時信任錨無法讀取（{e}），視同回滾套件的簽署金鑰已撤銷：不經套件管理員回滾，改以 pulse.prev 回復"
+                    ),
+                );
+                true
+            }
+        }
     }
 
     /// `rollback_intent`：還原 → `rolling_back` → 重新啟動 → 確認舊版恢復
@@ -2068,14 +2260,42 @@ impl<'a> Helper<'a> {
             reason: String::new(),
             cause: Cause::Health,
             via: Via::Binary,
+            degraded: Vec::new(),
         });
-        let reason = if resumed {
+        let mut reason = if resumed {
             resumed_reason(&rec)
         } else {
             intent.reason.clone()
         };
         if let Err(e) = self.restore(&mut rec, intent.via) {
-            return self.rollback_failed(rec, format!("{reason}; rollback: {e}"));
+            if intent.via != Via::Package {
+                return self.rollback_failed(rec, format!("{reason}; rollback: {e}"));
+            }
+            // 套件回滾失敗（套件管理員的命令失敗、交易部分完成，或驗證過的複本已不符）：先以 pulse.prev
+            // 緊急復原（ADR-0003 第 5.4 節）。**先把改變後的意圖寫進紀錄再還原**：之後中斷的話，接續時
+            // 直接換回 pulse.prev，不再執行套件管理員。只回報，不自動修復套件資料庫
+            self.log.line(
+                "WARN",
+                &format!("套件回滾失敗（{e}）：改以 pulse.prev 緊急復原（降級回滾）"),
+            );
+            let why = if e.starts_with(DETAIL_COPY_CHANGED) {
+                kairos_proto::mgmt::DEGRADED_COPY_CHANGED
+            } else {
+                kairos_proto::mgmt::DEGRADED_PACKAGE_ROLLBACK_FAILED
+            };
+            let mut next = intent.clone();
+            next.via = Via::Binary;
+            next.degraded = vec![
+                why.to_string(),
+                kairos_proto::mgmt::DEGRADED_PACKAGE_DB_INCONSISTENT.to_string(),
+            ];
+            next.reason = format!("{}; rollback: {e}", intent.reason);
+            reason = format!("{reason}; rollback: {e}");
+            rec.rollback_intent = Some(next);
+            self.save(&mut rec);
+            if let Err(e2) = self.restore(&mut rec, Via::Binary) {
+                return self.rollback_failed(rec, format!("{reason}; pulse.prev: {e2}"));
+            }
         }
         self.sys.checkpoint("rollback_restored");
         rec.step = Step::RollingBack;
@@ -2208,7 +2428,42 @@ impl<'a> Helper<'a> {
                 if !rec.notes.is_empty() {
                     detail = format!("{detail}; {}", rec.notes.join(","));
                 }
+                let degraded = rec
+                    .rollback_intent
+                    .as_ref()
+                    .map(|i| i.degraded.clone())
+                    .unwrap_or_default();
                 let r = match cause {
+                    // 降級回滾（ADR-0003 第 5.4 節）：state 仍是 rolled_back（舊的 Kairos 只接受固定的
+                    // 狀態值），代碼不同，detail 以 `degraded:` 開頭、接著是機器可讀的原因
+                    Cause::Health if !degraded.is_empty() => {
+                        // 套件回滾失敗時套件資料庫可能停在半安裝的狀態：照實附上
+                        if self.is_package()
+                            && !detail.contains("binary_restored_package_db_shows_")
+                            && let Some(db) = package_db(self.sys, &self.req.method)
+                            && Some(&db) != rec.pkg_db_before.as_ref()
+                        {
+                            detail = format!("{detail}; package_db_shows_{db}");
+                        }
+                        let detail = format!(
+                            "{}{}; {detail}",
+                            kairos_proto::mgmt::DEGRADED_PREFIX,
+                            degraded.join(",")
+                        );
+                        self.log.line(
+                            "WARN",
+                            &format!(
+                                "{}：已回滾到 {from}，但只換回執行檔，套件資料庫與實際的執行檔不一致（{detail}）。修復方式：重新安裝 Pulse {from} 的套件",
+                                codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+                            ),
+                        );
+                        result(
+                            &self.req,
+                            UPGRADE_STATE_ROLLED_BACK,
+                            Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED),
+                            detail,
+                        )
+                    }
                     Cause::Health => {
                         self.log
                             .line("WARN", &format!("已回滾到 {from}（{detail}）"));

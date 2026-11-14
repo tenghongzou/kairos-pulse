@@ -984,9 +984,21 @@ pub const SCHEMA_V12: &str = r#"
 ALTER TABLE hosts ADD COLUMN install_external_url TEXT COLLATE "C";
 "#;
 
+/// schema v13（0.11.0 之後的版本）：hello 的 `install.rollback`（`crates/kairos-proto/REMOTE.md`
+/// 第 2.1 節；ADR-0003 階段 2）。與 SQLite 的 `store/sqlite/remote.rs` `SCHEMA_V13_INSTALL_ROLLBACK`
+/// 對等：`hosts` 新增一個可為 NULL 的欄位
+pub const SCHEMA_V13: &str = r#"
+ALTER TABLE hosts ADD COLUMN install_rollback TEXT COLLATE "C";
+"#;
+
 /// [`SCHEMA_V9`] 之後的升級步驟（版本, SQL），依序套用；最後一項的版本必須等於 SQLite 的
 /// `SCHEMA_VERSION`。空的 schema 建立 v9 後也依序套用這些步驟（每一步都是對 v9 之後的差異）
-pub const UPGRADES: &[(i32, &str)] = &[(10, SCHEMA_V10), (11, SCHEMA_V11), (12, SCHEMA_V12)];
+pub const UPGRADES: &[(i32, &str)] = &[
+    (10, SCHEMA_V10),
+    (11, SCHEMA_V11),
+    (12, SCHEMA_V12),
+    (13, SCHEMA_V13),
+];
 
 /// PostgreSQL 後端的第一個 schema 版本（[`SCHEMA_V9`]）；更舊的版本沒有升級路徑
 pub const BASE_VERSION: i32 = 9;
