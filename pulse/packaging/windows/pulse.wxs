@@ -12,7 +12,20 @@
   （自動啟動、LocalSystem，參數 service run：工作目錄為 pulse.exe 所在目錄）。
   不把安裝目錄加到系統 PATH：wixl 0.106 會為 <Environment> 產生隨機的主鍵（Id 被忽略；刪除後字串仍留在
   字串池中），MSI 因此無法重現。
-  服務在安裝時不啟動：以 pulse enroll 註冊後由 pulse enroll 重新啟動（或 sc.exe start Pulse）。
+  服務的啟停（ADR-0001 第 1.2 節 X4；0.8.0～0.10.1 只有 Stop，MSI 升級或修復後服務停著不動）：
+    PulseServiceStop   Stop="both" Remove="uninstall" Wait="yes"：安裝、升級、修復、移除前停止並等它結束
+                       （檔案才換得掉）；移除時刪除服務。
+    PulseServiceStart  Start="install" Wait="no"：安裝、升級（MajorUpgrade 先移除舊版再安裝新版，
+                       RemoveExistingProducts 排在 InstallValidate 之後）、修復後啟動服務。
+                       Wait="no"：只等服務控制管理員接受啟動要求，不等服務進入「執行中」。服務一啟動就回報
+                       「執行中」（winsvc.rs 的 service_main），之後即使因設定或憑證錯誤結束也不影響安裝結果。
+    第一次安裝（尚未 pulse enroll）時服務也會啟動：沒有 [server] 設定的 Pulse 會連預設的 127.0.0.1:8080
+    並持續重試，不會結束；pulse enroll 寫好設定後會重新啟動服務。
+    wixl 0.106 對這兩列的輸出已確認（ServiceControl 表的 Event 為 162 與 1、Wait 為 1 與 0，StartServices
+    排在 InstallServices 之後）；Windows Installer 的實際行為待 tests/windows/ 在 Windows 上執行後確認。
+  %ProgramData%\Pulse（本機狀態檔、集中設定的快取）不由 MSI 建立：wixl 0.106 不支援 <Permission>／
+    <PermissionEx>（遇到就中止），MSI 無法設定它的 ACL。服務第一次啟動時自行以只有 SYSTEM、Administrators
+    可寫的 ACL 建立，並在每次使用前檢查擁有者、DACL 與重新解析點（pulse/src/state_dir.rs，安全稽核 F4）。
   移除：停止並刪除服務、刪除安裝的檔案；pulse.toml（Permanent）與執行時產生的 agent.id、identity\、
   buffer\、logs\ 保留（重新安裝後沿用同一個身分）。完全移除前先執行 pulse decommission。
   升級：pulse.toml 是沒有版本的檔案，Windows Installer 只在檔案的修改時間等於建立時間（沒有被改過）時
@@ -36,7 +49,8 @@
             <ServiceInstall Id="PulseService" Name="Pulse" DisplayName="Pulse monitoring agent"
                             Description="Pulse: reports system information to the Kairos monitoring server (mTLS)."
                             Type="ownProcess" Start="auto" ErrorControl="normal" Arguments="service run"/>
-            <ServiceControl Id="PulseServiceControl" Name="Pulse" Stop="both" Remove="uninstall" Wait="yes"/>
+            <ServiceControl Id="PulseServiceStop" Name="Pulse" Stop="both" Remove="uninstall" Wait="yes"/>
+            <ServiceControl Id="PulseServiceStart" Name="Pulse" Start="install" Wait="no"/>
           </Component>
           <Component Id="PulseConfig" Guid="3D2C7A10-5B1E-4C8F-9A61-0E2B7D4F1002" Win64="yes" Permanent="yes">
             <File Id="PulseToml" Name="pulse.toml" Source="@SRC@/pulse.toml" KeyPath="yes"/>
