@@ -1420,6 +1420,37 @@ impl Caches {
         Ok(true)
     }
 
+    /// 這台主機還能收下「對它而言是新的」序列（尚未達每主機上限 `cap`）。安全稽核 N8：全域 `series`
+    /// 表的新列只在呼叫端確認這台主機還有空間時才建立，單一主機因此最多讓全域表增加 `cap` 筆，
+    /// 不會塞爆 [`MAX_SERIES`] 讓其他主機的 report 被拒
+    pub(super) fn host_has_room(&self, host_id: i64, cap: usize) -> bool {
+        self.host_series
+            .get(&host_id)
+            .map_or(cap > 0, |set| set.len() < cap)
+    }
+
+    /// 全域 `series` 快取是否已有這個序列（唯讀，不新增）
+    pub(super) fn has_series(&mut self, name: &str, unit: &str, labels: &str) -> bool {
+        self.has_series_derived(name, unit, labels, derive::DERIVED_NONE)
+    }
+
+    /// 同 [`Self::has_series`]，含衍生序列
+    pub(super) fn has_series_derived(
+        &mut self,
+        name: &str,
+        unit: &str,
+        labels: &str,
+        derived: i64,
+    ) -> bool {
+        self.key.clear();
+        push_series_key(&mut self.key, name, unit, labels);
+        if derived != derive::DERIVED_NONE {
+            self.key.push('\u{1f}');
+            self.key.push_str(&derived.to_string());
+        }
+        self.series.contains_key(self.key.as_str())
+    }
+
     /// v1 的三個欄位在彙總中對應的標準序列（記憶體換算成 bytes，與 v2 的指標合併）
     pub(super) fn legacy_series(&mut self, tx: &Transaction) -> rusqlite::Result<Option<[i64; 3]>> {
         if let Some(ids) = self.legacy {
@@ -1863,6 +1894,14 @@ impl SqliteStore {
                         let mut dropped = 0;
                         for m in metrics {
                             let labels = canonical_labels(&m.labels);
+                            // N8：這台主機已達每主機上限時，對它而言是新的序列直接丟棄，不先寫進全域
+                            // series 表（host_has_room 是 O(1)，只有已滿時才多查一次 has_series）
+                            if !caches.host_has_room(host_id, cap)
+                                && !caches.has_series(&m.name, &m.unit, &labels)
+                            {
+                                dropped += 1;
+                                continue;
+                            }
                             match caches
                                 .series_id(&tx, &m.name, &m.unit, &labels)
                                 .map_err(before)?
@@ -1942,6 +1981,12 @@ impl SqliteStore {
                     let state = caches.counters.entry(host_id).or_default();
                     let points = derive::derive(&items, ts, state);
                     for p in points {
+                        // N8：這台主機已達上限時，對它而言是新的衍生序列不寫進全域 series 表
+                        if !caches.host_has_room(host_id, cap)
+                            && !caches.has_series_derived(&p.name, &p.unit, &p.labels, p.derived)
+                        {
+                            continue;
+                        }
                         let Some(id) = caches
                             .series_id_derived(&tx, &p.name, &p.unit, &p.labels, p.derived)
                             .map_err(before)?
@@ -2227,6 +2272,14 @@ impl SqliteStore {
                                 derive::derive(&caches.derive_items(&decoded), ts, &mut state);
                             caches.counters.insert(host_id, state);
                             for p in points {
+                                // N8：這台主機已達上限時，對它而言是新的衍生序列不寫進全域 series 表
+                                if !caches.host_has_room(host_id, cap)
+                                    && !caches.has_series_derived(
+                                        &p.name, &p.unit, &p.labels, p.derived,
+                                    )
+                                {
+                                    continue;
+                                }
                                 if let Some(id) = caches.series_id_derived(
                                     &tx, &p.name, &p.unit, &p.labels, p.derived,
                                 )? && caches.admit(&tx, host_id, id, cap)?

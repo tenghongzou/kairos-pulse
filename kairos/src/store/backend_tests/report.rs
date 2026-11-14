@@ -881,6 +881,52 @@ fn per_host_series_limit(db: &TestDb) -> String {
     out
 }
 
+/// 安全稽核 N8：單一主機送進超過每主機上限的不同序列時，不得讓**全域** `series` 表無上限成長
+/// （舊版先寫全域表才檢查每主機上限，一台主機可塞爆全域表讓其他主機的 report 被拒）。另驗證
+/// 全域表不會因此被佔滿——其他主機仍可新增它自己的序列
+fn one_host_cannot_exhaust_the_global_series_table(db: &TestDb) -> String {
+    let mut o = db.opts();
+    o.max_series_per_host = 4;
+    let (mut store, _) = db.store_with(o, noon);
+    // 20 個不同的檔案系統序列（gauge，不產生衍生序列），每個掛載點一個；prefix 讓不同主機的序列不同
+    let many = |agent: &str, seq: u64, prefix: &str| -> ReportRecord {
+        let metrics: Vec<Metric> = (0..20_u64)
+            .map(|k| {
+                Metric::new("system.filesystem.used", 100 + k, "By")
+                    .with_label("mountpoint", format!("/{prefix}/{k}"))
+                    .with_label("fstype", "ext4")
+            })
+            .collect();
+        ReportRecord::new(
+            noon(),
+            "10.0.0.9:5000".into(),
+            agent.into(),
+            "n8".into(),
+            seq,
+            fmt_time(noon()),
+            RecordBody::Metrics { metrics },
+        )
+    };
+    assert_eq!(store.write_batch(&[many(A, 1, "a")]), [WriteStatus::Written]);
+    // 全域 series 最多 cap=4 筆（修正前會是 20）；host_series 同樣 4
+    assert_eq!(
+        db.int("SELECT count(*) FROM series"),
+        4,
+        "單一主機不得塞爆全域 series 表"
+    );
+    assert_eq!(db.int("SELECT count(*) FROM host_series"), 4);
+    // 另一台主機仍可新增它自己的 4 個序列（全域表沒有被佔滿而拒絕）
+    assert_eq!(store.write_batch(&[many(B, 1, "b")]), [WriteStatus::Written]);
+    assert_eq!(
+        db.int("SELECT count(*) FROM series"),
+        8,
+        "其他主機仍可新增序列"
+    );
+    assert_eq!(db.int("SELECT count(*) FROM host_series"), 8);
+    store.close();
+    String::new()
+}
+
 fn assets_are_merged(db: &TestDb) -> String {
     let mut out = String::new();
     let (mut store, _) = db.store(noon);
@@ -1122,6 +1168,7 @@ backend_tests!(
     retention_deletes_expired_rows,
     capacity_limit_deletes_the_oldest_first,
     per_host_series_limit,
+    one_host_cannot_exhaust_the_global_series_table,
     assets_are_merged,
     purging_a_host_keeps_the_others,
 );

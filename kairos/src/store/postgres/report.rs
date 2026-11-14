@@ -346,6 +346,26 @@ impl Caches {
         true
     }
 
+    /// 這台主機還能收下「對它而言是新的」序列（尚未達每主機上限 `cap`）。安全稽核 N8：全域 `series`
+    /// 表的新列只在這台主機還有空間時才建立，單一主機因此最多讓全域表增加 `cap` 筆，不會塞爆
+    /// [`MAX_SERIES`] 讓其他主機的 report 被拒
+    fn host_has_room(&self, host_id: i64, cap: usize) -> bool {
+        self.host_series
+            .get(&host_id)
+            .map_or(cap > 0, |set| set.len() < cap)
+    }
+
+    /// 全域 `series` 快取是否已有這個序列（唯讀，不新增）
+    fn has_series(&self, name: &str, unit: &str, labels: &str) -> bool {
+        self.has_series_derived(name, unit, labels, derive::DERIVED_NONE)
+    }
+
+    /// 同 [`Self::has_series`]，含衍生序列
+    fn has_series_derived(&self, name: &str, unit: &str, labels: &str, derived: i64) -> bool {
+        self.series
+            .contains_key(series_key_derived(name, unit, labels, derived).as_str())
+    }
+
     /// 把這個交易中新增的（主機, 序列）寫入 `host_series`（一個敘述）。每個會呼叫 [`Caches::admit`] 的
     /// 交易在提交前呼叫；交易失敗時整個快取（含尚未寫入的部分）會被清空重載
     fn flush_admitted(&mut self, tx: &PgConn) -> PgResult<()> {
@@ -883,6 +903,14 @@ impl PgStore {
                     let mut dropped = 0;
                     for m in metrics {
                         let labels = canonical_labels(&m.labels);
+                        // N8：這台主機已達每主機上限時，對它而言是新的序列直接丟棄，不先寫進全域
+                        // series 表（host_has_room 是 O(1)，只有已滿時才多查一次 has_series）
+                        if !caches.host_has_room(host_id, cap)
+                            && !caches.has_series(&m.name, &m.unit, &labels)
+                        {
+                            dropped += 1;
+                            continue;
+                        }
                         match caches
                             .series_id(&tx, &m.name, &m.unit, &labels)
                             .map_err(before)?
@@ -1040,6 +1068,17 @@ impl PgStore {
                 let state = caches.counters.entry(host_id).or_default();
                 let points = derive::derive(&items, ts, state);
                 for point in points {
+                    // N8：這台主機已達上限時，對它而言是新的衍生序列不寫進全域 series 表
+                    if !caches.host_has_room(host_id, cap)
+                        && !caches.has_series_derived(
+                            &point.name,
+                            &point.unit,
+                            &point.labels,
+                            point.derived,
+                        )
+                    {
+                        continue;
+                    }
                     let Some(id) = caches
                         .series_id_derived(
                             &tx,
@@ -1328,6 +1367,12 @@ impl PgStore {
                         let points = derive::derive(&caches.derive_items(&decoded), ts, &mut state);
                         caches.counters.insert(host_id, state);
                         for p in points {
+                            // N8：這台主機已達上限時，對它而言是新的衍生序列不寫進全域 series 表
+                            if !caches.host_has_room(host_id, cap)
+                                && !caches.has_series_derived(&p.name, &p.unit, &p.labels, p.derived)
+                            {
+                                continue;
+                            }
                             if let Some(id) = caches
                                 .series_id_derived(&tx, &p.name, &p.unit, &p.labels, p.derived)?
                                 && caches.admit(host_id, id, cap)
