@@ -76,11 +76,11 @@ pub struct UpgradeResult {
 }
 
 impl Request {
-    /// 讀取並檢查 `request.json`（輔助程式：`O_NOFOLLOW`、一般檔案、`st_nlink == 1`、≤ 64 KiB）
-    pub fn read_untrusted(path: &Path) -> Result<Self, String> {
-        let bytes = read_untrusted_file(path, MAX_REQUEST_BYTES)?;
-        let r: Request = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("{} 不是合法的請求：{e}", path.display()))?;
+    /// 解析並檢查已讀入的 `request.json` 內容（輔助程式相對請求目錄的 fd 讀入後呼叫，見
+    /// [`super::helper`] 的 `ReqDir`；讀入時已做 `O_NOFOLLOW`、一般檔案、`st_nlink == 1`、≤ 64 KiB）
+    pub fn from_untrusted_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let r: Request =
+            serde_json::from_slice(bytes).map_err(|e| format!("不是合法的 JSON：{e}"))?;
         r.validate()?;
         Ok(r)
     }
@@ -112,11 +112,26 @@ impl Request {
             kairos_proto::release::ReleaseFile::parse(r)?;
         }
         // 只檢查格式：`from_version` 是服務帳號寫的，輔助程式另以自己的版本（或狀態檔記下的版本）比對，
-        // 不符就拒絕（`helper.rs` 的 `trust_request`）
+        // 不符就拒絕（`helper.rs` 的 `begin`）
         if kairos_proto::release::Version::parse(&self.from_version).is_err() {
             return Err(format!(
                 "request.json 的 from_version {:?} 不是合法的版本",
                 self.from_version
+            ));
+        }
+        // `target` 也是服務帳號寫的自由字串，且會原樣寫進 `result.json` 的 `to_version`、journal 與
+        // `upgrade.log`。限制成合法的版本與 commit，避免把 `$( ) ` 換行等字元帶進會被 shell source 的
+        // 檔案（安全稽核 2026-11-14）。輔助程式之後另以發佈檔名、簽章、清單重新驗證實際的版本與 commit
+        if kairos_proto::release::Version::parse(&self.target.version).is_err() {
+            return Err(format!(
+                "request.json 的 target.version {:?} 不是合法的版本",
+                self.target.version
+            ));
+        }
+        if !kairos_proto::release::is_commit(&self.target.commit) {
+            return Err(format!(
+                "request.json 的 target.commit {:?} 不是 7..=40 個小寫十六進位",
+                self.target.commit
             ));
         }
         Ok(())
@@ -177,32 +192,43 @@ pub fn open_untrusted(path: &Path, max: u64) -> Result<std::fs::File, String> {
     let f = o
         .open(path)
         .map_err(|e| format!("無法開啟 {}（不接受符號連結）：{e}", path.display()))?;
+    check_untrusted_meta(&f, &path.display().to_string(), max)?;
+    Ok(f)
+}
+
+/// 檢查已開啟的 Pulse 檔案：一般檔案、`st_nlink == 1`、不超過 `max` bytes。路徑開啟（[`open_untrusted`]）
+/// 與相對目錄 fd 的 `openat`（輔助程式的 `ReqDir`）共用
+pub fn check_untrusted_meta(f: &std::fs::File, display: &str, max: u64) -> Result<(), String> {
     let meta = f
         .metadata()
-        .map_err(|e| format!("無法讀取 {} 的屬性：{e}", path.display()))?;
+        .map_err(|e| format!("無法讀取 {display} 的屬性：{e}"))?;
     if !meta.file_type().is_file() {
-        return Err(format!("{} 不是一般檔案", path.display()));
+        return Err(format!("{display} 不是一般檔案"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if meta.nlink() > 1 {
-            return Err(format!("{} 有多個硬連結，拒絕使用", path.display()));
+            return Err(format!("{display} 有多個硬連結，拒絕使用"));
         }
     }
     if meta.len() > max {
         return Err(format!(
-            "{} 超過大小上限（{} > {max} bytes）",
-            path.display(),
+            "{display} 超過大小上限（{} > {max} bytes）",
             meta.len()
         ));
     }
-    Ok(f)
+    Ok(())
 }
 
-/// 把 Pulse 暫存的檔案複製到輔助程式的目錄（[`open_untrusted`] 的檢查；目的地 0600），回傳 SHA-256
-pub fn copy_untrusted(src: &Path, dst: &Path, max: u64) -> Result<String, String> {
-    let mut f = open_untrusted(src, max)?;
+/// 把已開啟、已通過 [`check_untrusted_meta`] 的來源串流到 `dst`（新建、0600），回傳 SHA-256。
+/// 路徑來源（`open_untrusted` + 這個函式）與相對 fd 的來源（輔助程式的 `ReqDir`）共用
+pub fn copy_checked(
+    mut f: std::fs::File,
+    src_display: &str,
+    dst: &Path,
+    max: u64,
+) -> Result<String, String> {
     let mut out = crate::remote::open_new_file(dst, 0o600)
         .map_err(|e| format!("無法建立 {}：{e}", dst.display()))?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
@@ -211,13 +237,13 @@ pub fn copy_untrusted(src: &Path, dst: &Path, max: u64) -> Result<String, String
     loop {
         let n = f
             .read(&mut buf)
-            .map_err(|e| format!("無法讀取 {}：{e}", src.display()))?;
+            .map_err(|e| format!("無法讀取 {src_display}：{e}"))?;
         if n == 0 {
             break;
         }
         total += n as u64;
         if total > max {
-            return Err(format!("{} 超過 {max} bytes", src.display()));
+            return Err(format!("{src_display} 超過 {max} bytes"));
         }
         ctx.update(&buf[..n]);
         std::io::Write::write_all(&mut out, &buf[..n])
@@ -298,9 +324,27 @@ mod tests {
         let mut bad = ok.clone();
         bad.upgrade_id = "x".into();
         assert!(bad.validate().is_err());
-        let mut bad = ok;
+        let mut bad = ok.clone();
         bad.schema = "other".into();
         assert!(bad.validate().is_err());
+        // target.version／target.commit 是服務帳號寫的自由字串：含危險字元、換行或超長時拒絕
+        // （安全稽核 2026-11-14；它們會原樣寫進 result.json 與日誌）
+        for danger in [
+            "0.9.1; $(touch /tmp/x)",
+            "0.9.1`id`",
+            "0.9.1\n[Unit]",
+            "$(reboot)",
+            &"9".repeat(300),
+        ] {
+            let mut bad = ok.clone();
+            bad.target.version = danger.into();
+            assert!(bad.validate().is_err(), "target.version {danger:?}");
+        }
+        for danger in ["", "zzzzzzz", "5e6", "5e6f7a8$(id)", &"a".repeat(41)] {
+            let mut bad = ok.clone();
+            bad.target.commit = danger.into();
+            assert!(bad.validate().is_err(), "target.commit {danger:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -334,7 +378,13 @@ mod tests {
                 .contains("一般檔案")
         );
         let dst = dir.join("copy");
-        let sha = copy_untrusted(&real, &dst, 100).unwrap();
+        let sha = copy_checked(
+            open_untrusted(&real, 100).unwrap(),
+            &real.display().to_string(),
+            &dst,
+            100,
+        )
+        .unwrap();
         assert_eq!(sha, sha256_file(&real).unwrap());
         assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
         let _ = std::fs::remove_dir_all(&dir);

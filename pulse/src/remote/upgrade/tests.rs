@@ -202,7 +202,10 @@ fn download_verify_stage_handoff_and_report_after_restart() {
     agent.tick(&mut cs, Instant::now(), false);
     let sent = ack_all(&agent, &mut cs);
     assert_eq!(sent[0].state, UPGRADE_STATE_APPLYING);
-    let req = Request::read_untrusted(&dir.join("state/upgrade/request.json")).unwrap();
+    let req = Request::from_untrusted_bytes(
+        &std::fs::read(dir.join("state/upgrade/request.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(req.upgrade_id, ID);
     assert_eq!(req.method, "tar");
     assert_eq!(req.artifact, FILE);
