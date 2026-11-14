@@ -456,7 +456,10 @@ pub fn format_body(line: &Line) -> String {
     {
         let _ = write!(out, "{event} {} ", line.code.as_deref().unwrap_or("-"));
     }
-    out.push_str(&line.message);
+    // 訊息本身可能帶外部來源的內容（例如 SMTP／OTLP 伺服器的回應被回顯進記錄的訊息）：
+    // 跳脫控制字元，避免 CR／LF 在文字格式的記錄中偽造出額外的日誌行（E6）。欄位值由
+    // text_field 以 JSON 編碼，已經安全
+    push_escaped(&mut out, &line.message);
     if !line.fields.is_empty() {
         out.push(' ');
         for (k, v) in &line.fields {
@@ -464,6 +467,22 @@ pub fn format_body(line: &Line) -> String {
         }
     }
     out
+}
+
+/// 把 `s` 附加到 `out`，以 `\n`／`\r`／`\t` 與 `\xNN` 跳脫控制字元（C0 與 DEL），
+/// 其餘字元原樣輸出。用於文字格式的記錄，防止換行注入偽造日誌行
+fn push_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c.is_control()) => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 /// syslog 的 MSGID：錯誤代碼，沒有時為事件名稱（沒有指定事件時為 `-`）
@@ -698,6 +717,26 @@ mod tests {
             fallback_event("kairos::enroll::handlers"),
             "kairos.enroll.handlers"
         );
+    }
+
+    #[test]
+    fn format_body_escapes_control_characters_in_the_message() {
+        // 外部來源（SMTP／OTLP 回應）被回顯進訊息時，CR／LF 不得在文字格式中偽造日誌行（E6）
+        let line = Line::plain(
+            Level::Warn,
+            "kairos::alerts",
+            "SMTP 回應 250 ok\r\n2026-01-01T00:00:00Z [ERROR] 偽造的一行\ttab\x07bell",
+        );
+        let body = format_body(&line);
+        assert!(
+            !body.contains('\n') && !body.contains('\r') && !body.contains('\t'),
+            "body 不得含原始控制字元：{body:?}"
+        );
+        assert!(body.contains("\\r\\n"), "{body}");
+        assert!(body.contains("\\ttab"), "{body}");
+        assert!(body.contains("\\x07bell"), "{body}");
+        // 整個 body 仍是單一行
+        assert_eq!(body.lines().count(), 1, "{body:?}");
     }
 
     #[test]
