@@ -455,9 +455,10 @@ fn central_config_and_remote_upgrade_with_a_simulated_pulse() {
 /// 外部 URL 版本的資格預覽（REMOTE.md 第 2.1、4.7.2 節）：Pulse 在 hello 的 `install.external_url` 宣告本機是否
 /// 允許外部 URL，實際的 Kairos 據此分類——
 ///
+/// - Pulse 低於 0.10.0（不支援外部 URL）：預覽列為 `url_not_supported`
 /// - 宣告 `none`（白名單是空的）：預覽列為 `url_not_allowed`，送出時固定為 `skipped`，不會被提議
 /// - 宣告 `allowlist`：可升級（Kairos 不知道白名單的內容）
-/// - 沒有宣告（0.10.1 以前的 Pulse；舊 Pulse 連新 Kairos）：照舊可升級，預覽的 `external_url.undeclared`
+/// - 沒有宣告（0.10.0、0.10.1 的 Pulse；舊 Pulse 連新 Kairos）：照舊可升級，預覽的 `external_url.undeclared`
 ///   註明台數；連線中的主機以這次 hello 為準，不沿用上一次宣告的值
 /// - 由 Kairos 代管的版本不看這個宣告
 #[test]
@@ -532,8 +533,8 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
     assert_eq!(v["data"]["registered"], true, "{v}");
 
     // 模擬的 Pulse：hello 帶（或不帶）install.external_url；送一筆 report 讓主機進入清冊
-    let connect = |declared: Option<&str>| {
-        let mut h = hello("0.9.0");
+    let connect = |version: &str, declared: Option<&str>| {
+        let mut h = hello(version);
         if let Some(d) = declared {
             h["install"]["external_url"] = json!(d);
         }
@@ -547,9 +548,12 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
         assert_eq!(c.recv()["type"], "ack");
         c
     };
+    // 測試向量的發佈是 0.9.1；支援外部 URL 的 Pulse 至少是 0.10.0，所以對它們而言這是降版（允許降版，
+    // 資格分類中外部 URL 的判斷在降版之前）
     let spec = json!({
         "name": "外部 URL", "target_version": "0.9.1",
         "selector": {"agent_ids": [GOOD.agent_id]}, "waves": [{"size": "rest"}],
+        "options": {"allow_downgrade": true},
     });
     let preview = || {
         let (s, v) = post("/api/v1/rollouts/preview", spec.clone());
@@ -571,8 +575,30 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
         }
     };
 
+    // 0. Pulse 0.9（不支援外部 URL，也不會宣告）：事先列為 url_not_supported，不算可升級
+    let c = connect("0.9.0", None);
+    assert!(
+        poll_until(WAIT, || preview()["skipped"]["url_not_supported"] == 1),
+        "{}\n{}",
+        preview(),
+        k.dump()
+    );
+    let p = preview();
+    assert_eq!(p["eligible"], 0, "{p}");
+    assert_eq!(p["skipped"], json!({"url_not_supported": 1}), "{p}");
+    assert_eq!(
+        p["samples"]["url_not_supported"][0]["agent_id"], GOOD.agent_id,
+        "{p}"
+    );
+    assert_eq!(
+        p["external_url"],
+        json!({"base_url": base_url, "undeclared": 0, "allowlist": 0}),
+        "{p}"
+    );
+    c.close();
+
     // 1. 宣告 none：事先列為 url_not_allowed，不算可升級
-    let c = connect(Some("none"));
+    let c = connect("0.10.1", Some("none"));
     assert!(
         poll_until(WAIT, || preview()["skipped"]["url_not_allowed"] == 1),
         "{}\n{}",
@@ -594,7 +620,7 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
     c.close();
 
     // 2. 宣告 allowlist（修改 pulse.toml 後重新啟動的 Pulse）：可升級，註明 Kairos 不知道白名單的內容
-    let c = connect(Some("allowlist"));
+    let c = connect("0.10.1", Some("allowlist"));
     assert!(
         poll_until(WAIT, || preview()["eligible"] == 1),
         "{}\n{}",
@@ -611,8 +637,8 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
     assert_eq!(declared_in_api(), "allowlist");
     c.close();
 
-    // 3. 沒有宣告（0.10.1 以前的 Pulse 連新的 Kairos）：照舊可升級；不沿用上一次連線宣告的值
-    let mut c = connect(None);
+    // 3. 沒有宣告（0.10.0、0.10.1 的 Pulse 連新的 Kairos）：照舊可升級；不沿用上一次連線宣告的值
+    let mut c = connect("0.10.1", None);
     assert!(
         poll_until(WAIT, || preview()["external_url"]["undeclared"] == 1),
         "{}\n{}",
@@ -630,9 +656,10 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
     let (s, v) = post("/api/v1/rollouts", spec.clone());
     assert_eq!(s, 201, "{v}");
     let id = v["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(p["confirm_text"], "降版 1 台", "{p}");
     let (s, v) = post(
         &format!("/api/v1/rollouts/{id}/submit"),
-        json!({"confirm": "升級 1 台"}),
+        json!({"confirm": "降版 1 台", "reason": "e2e：外部 URL 的測試向量是 0.9.1"}),
     );
     assert_eq!(
         (s, v["data"]["state"].as_str()),
@@ -655,7 +682,7 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
     seq += 1;
     c.send(&json!({
         "type": "upgrade_status", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "state": "declined",
-        "from_version": "0.9.0", "to_version": "0.9.1", "code": "PLS-W8411", "detail": "url_not_allowed"
+        "from_version": "0.10.1", "to_version": "0.9.1", "code": "PLS-W8411", "detail": "url_not_allowed"
     }));
     assert_eq!(c.recv()["type"], "ack");
     let (s, v) = api_request(
