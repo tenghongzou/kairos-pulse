@@ -518,6 +518,54 @@ async fn releases_and_rollouts_over_https() {
         (r.status, body(&r)["error"]["details"]["parameter"].as_str()),
         (400, Some("schedule.windows[0]"))
     );
+    // 升級時段的時區：IANA 名稱與固定位移都接受；不認得的名稱在預覽與建立時都是 400 invalid_parameter
+    // （與其他參數錯誤相同的格式）
+    let with_tz = |tz: &str| {
+        json!({"name": "tz", "target_version": "0.9.2", "selector": {"groups": ["web"]}, "waves": [{"size": "rest"}],
+            "schedule": {"windows": [{"start": "01:00", "end": "05:00"}], "timezone": tz}})
+    };
+    for bad in ["Asia/Taipe", "europe/berlin", "+8", "GMT+8"] {
+        for path in ["/api/v1/rollouts/preview", "/api/v1/rollouts"] {
+            let r = call(addr, "POST", path, Some(&admin), Some(&with_tz(bad))).await;
+            assert_eq!(
+                (
+                    r.status,
+                    body(&r)["error"]["code"].as_str(),
+                    body(&r)["error"]["details"]["parameter"].as_str()
+                ),
+                (400, Some("invalid_parameter"), Some("schedule.timezone")),
+                "{bad} {path}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+    }
+    for good in ["Europe/Berlin", "Australia/Sydney", "+08:00", "UTC"] {
+        let r = call(
+            addr,
+            "POST",
+            "/api/v1/rollouts/preview",
+            Some(&op),
+            Some(&with_tz(good)),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            200,
+            "{good}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let d = &body(&r)["data"];
+        assert_eq!(d["schedule"]["timezone"], good);
+        assert_eq!(d["timezone"]["name"], good);
+        let iana = good.contains('/');
+        assert_eq!(d["timezone"]["kind"], if iana { "iana" } else { "fixed" });
+        let up = d["upcoming_windows"].as_array().unwrap();
+        assert_eq!(up.len(), 3, "{d}");
+        // 當地時間 01:00 開始，帶著當時的位移
+        let start = up[0]["start_local"].as_str().unwrap();
+        assert!(start.contains("T01:00:00"), "{start}");
+        assert_eq!(start.len(), "2026-11-15T01:00:00+01:00".len(), "{start}");
+    }
     let r = call(addr, "POST", "/api/v1/rollouts", Some(&admin), Some(&spec)).await;
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let id = body(&r)["data"]["id"].as_str().unwrap().to_string();

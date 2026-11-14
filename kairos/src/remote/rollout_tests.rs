@@ -84,7 +84,7 @@ fn spec_defaults_and_validation() {
             "windows",
         ),
         (
-            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "schedule": {"timezone": "Asia/Taipei"}}),
+            json!({"name": "x", "target_version": "0.9.1", "selector": {"all": true}, "schedule": {"timezone": "Asia/Taipe"}}),
             "schedule.timezone",
         ),
         (

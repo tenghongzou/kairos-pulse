@@ -1923,6 +1923,89 @@ async fn scheduled_rollouts_start_later_and_only_offer_inside_windows() {
     assert_eq!(r.state, "completed");
 }
 
+/// IANA 時區的升級時段（REMOTE.md 第 4.7.5 節）：Europe/Berlin 每天 02:30～04:00，2027-03-28 的 02:00～03:00
+/// 不存在——時段延後到當地 03:00（01:00Z）開始、04:00（02:00Z）結束；隔天照常 02:30 CEST（00:30Z）
+#[tokio::test]
+async fn iana_timezone_windows_follow_daylight_saving_time_in_the_engine() {
+    let signer = TestSigner::new(27);
+    let fx = Fx::new("schedule-iana", trust_settings(&signer)).await;
+    import(&fx, &release(&signer, "0.9.2", "2222222")).await;
+    fx.add_host(A, "0.9.0", "Web", &[], "tar", "ready").await;
+    fx.connect(A, "0.9.0", "tar");
+    let ts = crate::api::http::ts_ms;
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .timestamp_millis()
+    };
+    fx.set_now(at("2027-03-27T12:00:00Z"));
+    let spec = RolloutSpec::parse(&json!({
+        "name": "berlin",
+        "target_version": "0.9.2",
+        "selector": {"agent_ids": [A]},
+        "waves": [{"size": "rest"}],
+        "schedule": {"windows": [{"start": "02:30", "end": "04:00"}], "timezone": "Europe/Berlin"},
+    }))
+    .unwrap();
+    let preview = fx
+        .svc
+        .preview_rollout(spec.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["window"],
+        json!({"open": false, "next": ts(at("2027-03-28T01:00:00Z"))})
+    );
+    assert_eq!(preview["timezone"]["kind"], "iana");
+    assert_eq!(preview["timezone"]["offset"], "+01:00");
+    let up = &preview["upcoming_windows"];
+    assert_eq!(up[0]["start_local"], "2027-03-28T03:00:00+02:00");
+    assert_eq!(up[0]["end_local"], "2027-03-28T04:00:00+02:00");
+    assert_eq!(
+        (up[0]["minutes"].as_i64(), up[0]["dst"].as_str()),
+        (Some(60), Some("gap"))
+    );
+    assert_eq!(up[1]["start_local"], "2027-03-29T02:30:00+02:00");
+    assert_eq!(up[1]["dst"], Value::Null);
+    let created = fx.svc.create_rollout(&who(), spec).await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["schedule"]["timezone"], "Europe/Berlin");
+    assert_eq!(
+        created["upcoming_windows"][0]["start_local"],
+        "2027-03-28T03:00:00+02:00"
+    );
+    let v = fx
+        .svc
+        .submit_rollout(&who(), id.clone(), Some("升級 1 台".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(v["state"], "running");
+    // 切換（01:00Z）之前還在時段外
+    fx.set_now(at("2027-03-28T00:59:00Z"));
+    fx.svc.tick().await.unwrap();
+    assert_eq!(fx.svc.offer_of(A), None, "切換之前不提議（不提早）");
+    let rid = id.clone();
+    let r = fx
+        .svc
+        .db
+        .read(move |s| Ok(s.get_rollout(&rid)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        rollout_json(&r, &[], fx.svc.now_ms(), false)["next_action"],
+        json!({"code": "waiting_window", "until": ts(at("2027-03-28T01:00:00Z"))})
+    );
+    // 切換的那一刻（當地 03:00 CEST）開始；提議的 apply_window 到當地 04:00 CEST 為止
+    fx.set_now(at("2027-03-28T01:00:05Z"));
+    fx.svc.tick().await.unwrap();
+    let up = fx.svc.offer_of(A).expect("時段內提議");
+    let offer = fx.svc.build_offer(A, &up, 1).await.unwrap().unwrap();
+    assert_eq!(offer.apply_window.not_after, ts(at("2027-03-28T02:00:00Z")));
+    // 時段結束後不再提供提議
+    fx.set_now(at("2027-03-28T02:00:01Z"));
+    assert!(fx.svc.build_offer(A, &up, 2).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn ends_at_expires_hosts_that_have_not_started_and_waits_for_applying_ones() {
     let signer = TestSigner::new(22);

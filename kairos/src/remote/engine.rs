@@ -343,10 +343,15 @@ pub fn rollout_json(r: &RolloutRow, hosts: &[RolloutHostRow], now_ms: i64, detai
         v["selector"] = serde_json::to_value(&selector).unwrap_or(Value::Null);
         v["options"] = serde_json::to_value(&options).unwrap_or(Value::Null);
         v["waves"] = rollout::waves_json(&waves, hosts, r.current_wave);
-        v["schedule"] = ScheduleSpec::from_db(&r.schedule).json();
+        let schedule = ScheduleSpec::from_db(&r.schedule);
+        v["schedule"] = schedule.json();
+        v["upcoming_windows"] = schedule.upcoming_json(now_ms, UPCOMING_WINDOWS);
     }
     v
 }
+
+/// 預覽與推送詳情的 `upcoming_windows[]` 列出的時段數
+const UPCOMING_WINDOWS: usize = 3;
 
 /// 推送的 JSON 中不需要逐台主機的部分（清單的每一筆；0.10.1 起清單的主機統計由資料庫彙總）
 pub fn rollout_summary_json(r: &RolloutRow, hosts: &HostSummary, now_ms: i64) -> Value {
@@ -549,6 +554,13 @@ impl RemoteService {
                 super::schedule::WindowState::Closed { next } => {
                     json!({"open": false, "next": next.map(crate::api::http::ts_ms)})
                 }
+            };
+            // 接下來的時段實際的開始與結束（當地時間含位移；日光節約時間的影響，REMOTE.md 第 4.7.5 節）
+            v["upcoming_windows"] = schedule.upcoming_json(now, UPCOMING_WINDOWS);
+            v["timezone"] = if schedule.windows.is_empty() {
+                Value::Null
+            } else {
+                schedule.timezone_json(now)
             };
             v["default_timezone"] = json!(default_tz);
             let template = |w: Vec<rollout::WaveSpec>| {
