@@ -412,7 +412,7 @@ unit 重點（內容見 `pulse.service`）：
 
 | 設定 | 值 | 理由 |
 |---|---|---|
-| `User`／`Group` | `pulse` | 不以 root 執行 |
+| `User`／`Group` | `pulse` | 不以 root 執行。0.12.0 之後的版本：常駐程式發現自己是 root、而 `logs/` 屬於其他帳號時拒絕啟動（`PLS-E8208`，結束代碼 3）——手動測試請用 `sudo -u pulse /opt/pulse/pulse`；確定要以 root 執行的部署（例如容器）把 `logs/`、`buffer/`、`identity/` 改為 root 擁有即可 |
 | `WorkingDirectory` | `/opt/pulse` | `pulse.toml`、`agent.id`、憑證與 `logs/` 都以工作目錄解析 |
 | `StandardOutput` | `null` | 日誌只保留 `logs/` 一份（理由見下） |
 | `KillSignal`／`TimeoutStopSec` | `SIGINT`／`10` | Pulse 送出 `close_notify` 後約 1 秒內結束 |

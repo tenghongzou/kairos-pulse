@@ -473,6 +473,26 @@ fn run_agent(print_id: bool, external_stop: Option<CancellationToken>) -> u8 {
         return print_agent_id(&config);
     }
 
+    // 安全稽核 N15：常駐程式不以 root 在其他帳號擁有的 logs/ 中寫入（那個帳號可以把日誌檔換成符號連結）
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid 沒有前置條件，也不會失敗
+        let euid = unsafe { libc::geteuid() };
+        if let Some(owner) =
+            log_files::root_with_foreign_log_dir(euid, Path::new(log_files::LOG_DIR))
+        {
+            eprintln!(
+                "錯誤 {}：以 root 啟動，但日誌目錄 {} 屬於 uid {owner}：請以該服務帳號啟動（發佈包的 \
+                 pulse.service 已設定 User=pulse；手動執行時用 sudo -u pulse），或確定要以 root 執行時\
+                 把工作目錄下的 logs/、buffer/、identity/ 改為 root 擁有",
+                codes::E_ROOT_WITH_SERVICE_DIR,
+                log_files::LOG_DIR
+            );
+            // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
+            return EXIT_CONFIG;
+        }
+    }
+
     // 日誌清除的日期基準必須在初始化日誌之前決定：fern 一初始化就會建立今天的日誌檔，
     // 時鐘被誤校到未來時，那個檔案不能被當成「最新日誌檔的日期」
     let mut retention =

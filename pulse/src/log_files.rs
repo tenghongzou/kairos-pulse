@@ -46,9 +46,48 @@ const LOG_NAMES_JSON: DatedName = DatedName {
     suffix: ".jsonl",
 };
 
-/// 以附加模式開啟日誌檔
+/// 以附加模式開啟日誌檔。Unix 上不跟隨符號連結（安全稽核 N15）：日誌檔名由 Pulse 自己決定，正常情況
+/// 不會是連結；`logs/` 目錄本身可以是指向其他磁碟的連結，這裡只限制最後一段
 fn open_append(path: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new().create(true).append(true).open(path)
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+/// 以 root（`euid == 0`）啟動而日誌目錄屬於其他帳號時，回傳那個帳號的 uid（安全稽核 N15）。
+///
+/// 常駐程式依賴 unit 的 `User=` 降權；手動以 root 啟動時，它會以 root 在服務帳號擁有的 `logs/` 中建立
+/// 並附加寫入檔案，而服務帳號可以事先把檔名換成符號連結。目錄不存在時以工作目錄判斷（`logs/` 會建在
+/// 它底下）；`logs/` 是符號連結時，連結本身與它指向的目錄都要屬於 root。全部屬於 root（例如容器內
+/// 一律以 root 執行的部署）時不拒絕
+#[cfg(unix)]
+pub fn root_with_foreign_log_dir(euid: u32, log_dir: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    if euid != 0 {
+        return None;
+    }
+    let owners: Vec<u32> = match fs::symlink_metadata(log_dir) {
+        Ok(link) => {
+            let mut v = vec![link.uid()];
+            if let Ok(target) = fs::metadata(log_dir) {
+                v.push(target.uid());
+            }
+            v
+        }
+        Err(_) => {
+            let parent = log_dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            vec![fs::metadata(parent).ok()?.uid()]
+        }
+    };
+    owners.into_iter().find(|uid| *uid != 0)
 }
 
 /// 按日分檔的日誌輸出（UTC 日期；副檔名依格式：`.log` 或 `.jsonl`）
@@ -1152,6 +1191,50 @@ mod tests {
         let nested = dir.join("sub").join(GUARD_STATE_FILE);
         write_state_atomically(&nested, &state2).unwrap();
         assert!(nested.is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 安全稽核 N15：以 root 啟動而 logs/ 屬於其他帳號時拒絕；全部屬於 root 或不是 root 時不拒絕
+    #[cfg(unix)]
+    #[test]
+    fn root_is_refused_when_the_log_dir_belongs_to_another_account() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = temp_dir("root-foreign-logs");
+        let me = fs::metadata(&dir).unwrap().uid();
+        if me == 0 {
+            // 以 root 跑測試時目錄也屬於 root：只能確認不拒絕
+            assert_eq!(root_with_foreign_log_dir(0, &dir), None);
+            return;
+        }
+        assert_eq!(root_with_foreign_log_dir(0, &dir), Some(me));
+        // logs/ 還不存在：以它的上層目錄判斷
+        assert_eq!(root_with_foreign_log_dir(0, &dir.join("logs")), Some(me));
+        // root 擁有的連結指向其他帳號的目錄也拒絕（這裡連結本身屬於測試帳號，同樣拒絕）
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(root_with_foreign_log_dir(0, &link), Some(me));
+        // 不是 root：不檢查
+        assert_eq!(root_with_foreign_log_dir(me, &dir), None);
+        // 屬於 root 的目錄：不拒絕
+        assert_eq!(root_with_foreign_log_dir(0, Path::new("/")), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 安全稽核 N15：日誌檔是符號連結時不跟隨（不在連結指向的位置建立或附加寫入）
+    #[cfg(unix)]
+    #[test]
+    fn log_file_is_not_opened_through_a_symlink() {
+        let dir = temp_dir("log-symlink");
+        let target = dir.join("outside.txt");
+        let link = dir.join("pulse-2026-11-15.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = open_append(&link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err:?}");
+        assert!(!target.exists());
+        // 一般檔案照常
+        let plain = dir.join("pulse-2026-11-16.log");
+        open_append(&plain).unwrap();
+        assert!(plain.is_file());
         fs::remove_dir_all(dir).unwrap();
     }
 }
