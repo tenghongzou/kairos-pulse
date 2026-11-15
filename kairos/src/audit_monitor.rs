@@ -24,6 +24,8 @@ use crate::shutdown::Shutdown;
 pub const CODE_ANCHOR: &str = "KRS-I6202";
 /// 第一次外送與驗證：啟動後多久（啟動時的寫入先完成）
 pub const FIRST_RUN: Duration = Duration::from_secs(60);
+/// 多久看一次有沒有新的重新錨定（`meta.audit_reanchor`）
+pub const REANCHOR_POLL: Duration = Duration::from_secs(60);
 
 /// 寫一行鏈尾的固定事件
 pub async fn log_anchor(db: &Arc<EnrollDb>) {
@@ -67,21 +69,42 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
             return None;
         }
     };
-    let ok = report.ok();
-    let summary = match &report.broken {
-        None => format!(
+    let chain_ok = report.ok();
+    // 最近重新錨定過（`kairos audit reanchor`）：鏈從新的起點起算是完整的，但「稽核日誌完整性」告警保持
+    // 開啟 [`audit::REANCHOR_ALERT_HOLD_MS`]——斷鏈之後重新錨定不可能不被看到（告警不可靜音）
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let held = report
+        .reanchor
+        .as_ref()
+        .filter(|r| chain_ok && now_ms - r.at < audit::REANCHOR_ALERT_HOLD_MS);
+    let ok = chain_ok && held.is_none();
+    let summary = match (&report.broken, held) {
+        (Some(b), _) => format!("第 {} 筆：{}", b.id, describe(b.reason)),
+        (None, Some(r)) => format!(
+            "稽核鏈已由 {} 在 {} 重新錨定（第 {} 筆）：之前的 {} 筆完整性未驗證",
+            r.by,
+            crate::api::http::ts_ms(r.at),
+            r.event_id,
+            r.unverified
+        ),
+        (None, None) => format!(
             "已驗證 {} 筆（HMAC：{}）",
             report.checked, report.hmac.status
         ),
-        Some(b) => format!("第 {} 筆：{}", b.id, describe(b.reason)),
     };
+    if let Some(r) = held {
+        log::error!(
+            event = "audit.reanchored", code = CODE_CHAIN_BROKEN, reanchor_id = r.event_id;
+            "錯誤 {CODE_CHAIN_BROKEN}：{summary}。這是管理者以 kairos audit reanchor 執行的；如果不是預期中的操作，請立即保全資料庫並以外送的鏈尾（audit.chain_anchor）比對"
+        );
+    }
     if let Some(b) = &report.broken {
         log::error!(
             event = "audit.chain_broken", code = CODE_CHAIN_BROKEN;
             "錯誤 {CODE_CHAIN_BROKEN}：稽核日誌的定期自我驗證失敗：第 {} 筆（{}）。紀錄可能被修改或刪除，請保全資料庫檔並與匯出或外送的鏈尾（audit.chain_anchor）比對",
             b.id, b.reason
         );
-    } else {
+    } else if held.is_none() {
         log::info!(
             event = "audit.verified";
             "稽核日誌的定期自我驗證通過：{summary}"
@@ -89,8 +112,16 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
     }
     bus.publish(EventKind::AuditIntegrity {
         ok,
-        reason: report.broken.as_ref().map(|b| b.reason.to_string()),
-        id: report.broken.as_ref().map(|b| b.id),
+        reason: report
+            .broken
+            .as_ref()
+            .map(|b| b.reason.to_string())
+            .or(held.map(|_| "reanchored".to_string())),
+        id: report
+            .broken
+            .as_ref()
+            .map(|b| b.id)
+            .or(held.map(|r| r.event_id)),
         summary: summary.clone(),
     });
     let details = serde_json::json!({
@@ -99,8 +130,12 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
         "hmac": report.hmac.status,
         "hmac_since_id": report.hmac.since_id,
         "broken": report.broken.as_ref().map(|b| serde_json::json!({"id": b.id, "reason": b.reason})),
+        "reanchor": report.reanchor.as_ref().map(|r| serde_json::json!({"event_id": r.event_id, "unverified": r.unverified})),
     });
-    let now = chrono::Utc::now().timestamp_millis();
+    // 發布的結果（重新錨定後的保持期間為 false）；寫入稽核的結果是鏈本身的驗證結果
+    let published_ok = ok;
+    let ok = chain_ok;
+    let now = now_ms;
     let r = db
         .write(move |conn| {
             conn.audit_append(
@@ -121,7 +156,17 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
     if let Err(e) = r {
         log::warn!(event = "audit.write_failed"; "無法寫入稽核紀錄（audit.verify）：{e}");
     }
-    Some(ok)
+    Some(published_ok)
+}
+
+/// 「稽核日誌完整性」告警事件的標題：重新錨定後的保持期間（原因 `reanchored`）不是鏈又斷了，
+/// 標題直接寫出是重新錨定（`summary` 已含執行者、時間與未驗證的筆數）
+pub fn alert_title(reason: &str, summary: &str) -> String {
+    if reason == "reanchored" {
+        format!("稽核鏈已重新錨定（不是新的斷裂）：{summary}")
+    } else {
+        format!("稽核日誌完整性驗證失敗：{summary}")
+    }
 }
 
 /// 斷點原因的說明（CLI、日誌、告警事件共用）
@@ -137,6 +182,8 @@ pub fn describe(reason: &str) -> &'static str {
         "hmac_boundary_mismatch" => "HMAC 的起點被移動",
         "hmac_key_unavailable" => "HMAC 的金鑰檔（audit-hmac.key）遺失或無法讀取",
         "hmac_key_mismatch" => "HMAC 的金鑰檔與起點記錄的金鑰不符",
+        "reanchor_mismatch" => "重新錨定的紀錄被刪除或修改，或指標被改寫",
+        "reanchored" => "稽核鏈已由管理者重新錨定（之前的紀錄完整性未驗證）",
         _ => "雜湊鏈斷裂",
     }
 }
@@ -154,8 +201,13 @@ pub async fn run(
     let start = tokio::time::Instant::now();
     let mut next_anchor = anchor_every.map(|_| start + FIRST_RUN);
     let mut next_verify = start + FIRST_RUN;
+    // 每分鐘看一次有沒有新的重新錨定（CLI 在另一個行程執行）：有的話立刻驗證並發布，不等下一次定期驗證
+    let mut next_poll = start + FIRST_RUN + REANCHOR_POLL;
+    let mut seen_reanchor: Option<Option<i64>> = None;
     loop {
-        let wake = next_anchor.map_or(next_verify, |a| a.min(next_verify));
+        let wake = next_anchor
+            .map_or(next_verify, |a| a.min(next_verify))
+            .min(next_poll);
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -167,6 +219,16 @@ pub async fn run(
         {
             log_anchor(&db).await;
             next_anchor = Some(now + every);
+        }
+        if now >= next_poll {
+            next_poll = now + REANCHOR_POLL;
+            if let Ok(point) = db.read(|c| Ok(c.audit_reanchor_point()?)).await {
+                let id = point.map(|p| p.event_id);
+                if seen_reanchor.is_some_and(|s| s != id) && id.is_some() {
+                    next_verify = now;
+                }
+                seen_reanchor = Some(id);
+            }
         }
         if now >= next_verify {
             self_verify(&db, &bus).await;
@@ -270,9 +332,86 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // 重新錨定之後的 24 小時內，自我驗證把「稽核日誌完整性」保持在不通過（原因 reanchored）
+    #[tokio::test]
+    async fn a_recent_reanchor_keeps_the_integrity_condition_open() {
+        let (dir, db) = temp_db();
+        audit::ensure_key(&dir).unwrap();
+        db.write(|c| {
+            for i in 0..3 {
+                c.audit_append(i, &ev("user.create"))?;
+            }
+            c.test_sqlite()
+                .execute("UPDATE audit_events SET object = 'eve' WHERE id = 2", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        assert_eq!(self_verify(&db, &bus).await, Some(false));
+        let _ = rx.recv().await.unwrap();
+        let reanchor = |at: i64| {
+            let db = db.clone();
+            async move {
+                db.write(move |c| {
+                    let e = audit::Audit {
+                        actor: "ops",
+                        category: "audit",
+                        action: audit::ACTION_REANCHOR,
+                        result: "ok",
+                        ..Default::default()
+                    };
+                    Ok(c.audit_reanchor(at, &e)?.expect("有金鑰"))
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        // 超過保持期間的重新錨定：鏈從新的起點起算，通過
+        reanchor(now - audit::REANCHOR_ALERT_HOLD_MS - 60_000).await;
+        assert_eq!(self_verify(&db, &bus).await, Some(true));
+        let _ = rx.recv().await.unwrap();
+        // 剛剛的重新錨定：不通過，原因 reanchored，指向那一筆事件
+        let id = reanchor(now).await;
+        assert_eq!(self_verify(&db, &bus).await, Some(false));
+        match &rx.recv().await.unwrap().kind {
+            EventKind::AuditIntegrity {
+                ok,
+                reason,
+                id: at_id,
+                summary,
+            } => {
+                assert!(!ok);
+                assert_eq!(reason.as_deref(), Some("reanchored"));
+                assert_eq!(*at_id, Some(id));
+                assert!(summary.contains("重新錨定"), "{summary}");
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_alert_title_tells_a_reanchor_from_a_break() {
+        assert!(
+            alert_title("hmac_mismatch", "第 42 筆：HMAC 不符")
+                .starts_with("稽核日誌完整性驗證失敗：")
+        );
+        let t = alert_title("reanchored", "稽核鏈已由 ops 在 … 重新錨定");
+        assert!(
+            t.starts_with("稽核鏈已重新錨定") && !t.contains("驗證失敗"),
+            "{t}"
+        );
+    }
+
     #[test]
     fn every_break_reason_has_a_description() {
         for r in [
+            "reanchor_mismatch",
+            "reanchored",
             "hash_mismatch",
             "prev_mismatch",
             "missing_hash",

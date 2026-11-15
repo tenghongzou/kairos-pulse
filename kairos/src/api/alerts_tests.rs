@@ -37,6 +37,185 @@ async fn wait_for<F: Fn() -> bool>(what: &str, limit: Duration, cond: F) {
     }
 }
 
+/// 安全稽核 E2：管道的機密「只能更換、不能檢視」。只改目的地（SMTP 主機、Webhook 網址、LINE 格式的
+/// 網址）而沿用原本的機密會把它送到新的目的地，所以被拒；重新提供或清除之後才接受
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changing_a_channel_destination_requires_the_secrets_again() {
+    let f = fixture_alerts("alerts-e2", |c| c.alerts.warmup_secs = 60).await;
+    let addr = f.addr();
+    let admin = token(&f, Role::Admin);
+    let create = |body: Value| {
+        let admin = admin.clone();
+        async move {
+            let r = call(addr, "POST", "/api/v1/channels", Some(&admin), Some(&body)).await;
+            assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+            r.json()["data"]["channel_id"].as_str().unwrap().to_string()
+        }
+    };
+    let put = |id: String, body: Value| {
+        let admin = admin.clone();
+        async move {
+            let r = call(
+                addr,
+                "PUT",
+                &format!("/api/v1/channels/{id}"),
+                Some(&admin),
+                Some(&body),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&r.body).into_owned();
+            (r.status, r.json(), text)
+        }
+    };
+    let needs = |r: &(u16, Value, String), key: &str| {
+        assert_eq!(r.0, 400, "{}", r.2);
+        assert_eq!(r.1["error"]["code"], "channel_secret_required", "{}", r.2);
+        assert_eq!(r.1["error"]["details"]["parameter"], key, "{}", r.2);
+        assert_eq!(r.1["error"]["details"]["reason"], "destination_changed");
+    };
+
+    // Webhook：認證標頭
+    let hook = create(json!({
+        "name": "SIEM",
+        "kind": "webhook",
+        "config": { "format": "kairos" },
+        "secrets": {
+            "url": "https://siem.example.com/hook",
+            "headers": { "Authorization": "Bearer hook-secret-1" },
+            "hmac_secret": "hk-secret",
+        },
+    }))
+    .await;
+    let r = put(
+        hook.clone(),
+        json!({ "secrets": { "url": "https://elsewhere.example.net/collect" } }),
+    )
+    .await;
+    needs(&r, "secrets.headers");
+    assert!(!r.2.contains("hook-secret-1"));
+    // 被拒：管道沒有變
+    let cur = call(
+        addr,
+        "GET",
+        &format!("/api/v1/channels/{hook}"),
+        Some(&admin),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(cur["data"]["secrets"]["url"], "https://siem.example.com/…");
+    // 不改目的地的修改照常（名稱、嚴重度、同一個網址）
+    let r = put(
+        hook.clone(),
+        json!({ "name": "SIEM-2", "config": { "format": "kairos", "min_severity": "critical" } }),
+    )
+    .await;
+    assert_eq!(r.0, 200, "{}", r.2);
+    let r = put(
+        hook.clone(),
+        json!({ "secrets": { "url": "https://siem.example.com/hook" } }),
+    )
+    .await;
+    assert_eq!(r.0, 200, "{}", r.2);
+    // 重新提供、或清除標頭之後可以改網址（hmac_secret 只用來簽章，不會送出，沿用）
+    let r = put(
+        hook.clone(),
+        json!({ "secrets": { "url": "https://elsewhere.example.net/collect", "headers": null } }),
+    )
+    .await;
+    assert_eq!(r.0, 200, "{}", r.2);
+    assert_eq!(r.1["data"]["secrets"]["hmac_secret"], "••••");
+    assert!(
+        r.1["data"]["secrets"]
+            .get("headers")
+            .is_none_or(|h| h.as_object().is_none_or(|m| m.is_empty()))
+    );
+
+    // LINE：沒有設定網址時 token 送到 LINE；加上網址就是換了目的地
+    let line = create(json!({
+        "name": "LINE",
+        "kind": "webhook",
+        "config": { "format": "line", "line_to": "C123" },
+        "secrets": { "line_token": "line-token-1" },
+    }))
+    .await;
+    let r = put(
+        line.clone(),
+        json!({ "secrets": { "url": "https://elsewhere.example.net/push" } }),
+    )
+    .await;
+    needs(&r, "secrets.line_token");
+    let r = put(
+        line.clone(),
+        json!({ "secrets": { "url": "https://elsewhere.example.net/push", "line_token": "line-token-2" } }),
+    )
+    .await;
+    assert_eq!(r.0, 200, "{}", r.2);
+
+    // 電子郵件：SMTP 密碼
+    let mail = create(json!({
+        "name": "Mail",
+        "kind": "email",
+        "config": {
+            "host": "smtp.example.com", "port": 587, "security": "starttls",
+            "username": "kairos", "from": "kairos@example.com", "to": ["ops@example.com"],
+        },
+        "secrets": { "password": "smtp-secret-1" },
+    }))
+    .await;
+    let cfg = |host: &str, port: u64, to: &str| {
+        json!({
+            "host": host, "port": port, "security": "starttls",
+            "username": "kairos", "from": "kairos@example.com", "to": [to],
+        })
+    };
+    for config in [
+        cfg("smtp.elsewhere.example.net", 587, "ops@example.com"),
+        cfg("smtp.example.com", 2525, "ops@example.com"),
+    ] {
+        let r = put(mail.clone(), json!({ "config": config })).await;
+        needs(&r, "secrets.password");
+        assert!(!r.2.contains("smtp-secret-1"));
+    }
+    // 收件者不是目的地
+    let r = put(
+        mail.clone(),
+        json!({ "config": cfg("smtp.example.com", 587, "noc@example.com") }),
+    )
+    .await;
+    assert_eq!(r.0, 200, "{}", r.2);
+    // 換主機並重新輸入密碼
+    let r = put(
+        mail.clone(),
+        json!({
+            "config": cfg("smtp.elsewhere.example.net", 587, "noc@example.com"),
+            "secrets": { "password": "smtp-secret-2" },
+        }),
+    )
+    .await;
+    assert_eq!(r.0, 200, "{}", r.2);
+    // 被拒的修改寫入稽核（不含機密的值）
+    let conn = f.admin();
+    let rejected: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE action = 'channel.update' AND result = 'rejected'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected, 4);
+    let details: String = conn
+        .query_row(
+            "SELECT group_concat(coalesce(details, ''), ' ') FROM audit_events",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for s in ["hook-secret-1", "line-token-1", "smtp-secret-1"] {
+        assert!(!details.contains(s), "稽核不可有機密的值");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alerts_end_to_end_over_https() {
     let hook = FakeHttp::start().await;

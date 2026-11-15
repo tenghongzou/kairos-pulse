@@ -260,7 +260,7 @@ service:
 系統設定 →「整合」分頁的「指標轉出」卡片（管理員與稽核員看得到「整合」分頁；維運者只有「連線與安全」）：
 
 - Prometheus：是否啟用、端點、最近一次抓取（時間、主機數、序列數、大小、耗時）、抓取次數；可修改啟用、過期門檻、行程排行。
-- OTLP：狀態（未啟用／沒有端點／等待第一次推送／正常／推送失敗）、佇列、送出、丟棄（佇列已滿／重試用完／collector 拒絕）、最近一次成功與錯誤（代碼）；可修改啟用、端點、間隔、名稱對應、HTTP 標頭（不更換／更換／清除主控台的值；值只能更換不能檢視），「測試連線」。
+- OTLP：狀態（未啟用／沒有端點／等待第一次推送／正常／推送失敗）、佇列、送出、丟棄（佇列已滿／重試用完／collector 拒絕）、最近一次成功與錯誤（代碼）；可修改啟用、端點、間隔、名稱對應、HTTP 標頭（不更換／更換／清除主控台的值；值只能更換不能檢視；修改端點時必須一併更換標頭，第 6.2 節），「測試連線」。
 - 每個鍵都顯示來源（環境變數／主控台／設定檔／內建預設）；環境變數設定的鍵唯讀並寫出變數名稱；主控台的值可「改用設定檔的值」。
 - 儲存為 L1 確認（列出變更，原因選填），寫入稽核（`settings` 類別、動作 `export.change`，標頭只記名稱）。
 - 只有 `export:write`（管理員）能修改與測試連線；稽核員唯讀。
@@ -291,6 +291,7 @@ service:
 ```
 
 - `otlp.headers`：陣列為「整組取代」（可為空陣列＝不帶標頭），`null` 為刪除主控台的值（改用 `headers_file`）；最多 16 個，不可自訂 `Host`、`Content-Type`、`Content-Length`、`Transfer-Encoding`、`Connection`、`User-Agent`。
+- **端點改變時標頭不沿用**（0.11.0 之後的版本）：標頭「只能更換、不能檢視」，但如果只改端點就沿用，等於可以把標頭送到任何地方去看——包含 `headers_file` 的標頭（主控台連保存都不保存，卻會跟著主控台改的端點走；端點是 `http://` 時還是明文）。所以套用變更後 `otlp.endpoint` 與原本不同（包含第一次設定、以 `null` 改回設定檔的值）、而且還有標頭會送出時，同一次請求必須提供 `otlp.headers`（新的清單；`[]` 表示新的端點不帶標頭——主控台的空清單會取代 `headers_file`），否則 `400 export_secret_required`（`KRS-E4314`，`details.parameter` 為 `export.otlp.headers`、`details.reason` 為 `destination_changed`），設定不變，並寫一筆結果為 `rejected` 的稽核。標頭來自 `headers_file` 而想繼續使用它時，請在 `kairos.toml` 修改端點（與標頭檔在同一個地方設定）。`headers_file` 由環境變數設定時主控台不能提供標頭，端點也就只能在設定檔或環境變數修改。不論 OTLP 是否啟用都一樣（否則可以先在停用時改端點、再啟用）。
 - 錯誤：不合法的值、未知的欄位、啟用 OTLP 卻沒有端點 → `400 invalid_parameter`（`KRS-E4314`，`details.parameter` 為設定鍵）；鍵由環境變數設定 → `409 locked_by_environment`（`details.variable`；標頭看 `KAIROS__EXPORT__OTLP__HEADERS_FILE`）；`alerts-secrets.key` 無法使用時不能保存標頭 → `503 secrets_unavailable`（`GET` 的 `otlp.secrets_available` 為 `false` 時就是這種情況，主控台據此一開始就停用標頭欄位）。
 - 回應與 `GET` 相同：
 

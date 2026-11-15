@@ -729,7 +729,7 @@ impl Engine {
                 rule_id: ids::AUDIT_INTEGRITY,
                 subject: "audit".into(),
                 severity: Severity::Emergency,
-                title: format!("稽核日誌完整性驗證失敗：{summary}"),
+                title: crate::audit_monitor::alert_title(reason, summary),
                 code: Some("KRS-E6201"),
                 details: json!({ "since": since, "reason": reason, "id": id }),
             });

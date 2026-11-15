@@ -1616,6 +1616,84 @@ async fn end_silence(c: &Ctx<'_>, id: &str, body: &Value) -> Result<Response<Api
 // 通知管道
 // ---------------------------------------------------------------------------
 
+/// 管道的機密會被送到哪裡（安全稽核 E2）。機密「只能更換、不能檢視」，但如果只改目的地就能沿用原本的
+/// 機密，等於可以把它送到任何地方看——所以目的地改變時，會被送出的機密必須重新提供或清除
+/// （[`transmitted_secrets`]）。
+///
+/// - 電子郵件：SMTP 主機、連接埠（未設定時依 `security` 的預設）、`security`、`ca_file`
+/// - Webhook：實際的網址（`secrets.url`；LINE 格式未設定網址時為 LINE 的端點）、是不是 LINE 格式
+///   （`line_token` 只在 LINE 格式送出）、`ca_file`
+pub fn channel_destination(kind: ChannelKind, config: &Value, secrets: &Value) -> Value {
+    let s = |k: &str| {
+        config
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    };
+    match kind {
+        ChannelKind::Email => {
+            let security = if s("security").is_empty() {
+                "starttls"
+            } else {
+                s("security")
+            };
+            let port = config
+                .get("port")
+                .and_then(Value::as_u64)
+                .unwrap_or(if security == "tls" { 465 } else { 587 });
+            json!({
+                "host": s("host").to_ascii_lowercase(),
+                "port": port,
+                "security": security,
+                "ca_file": s("ca_file"),
+            })
+        }
+        ChannelKind::Webhook => {
+            let line = s("format") == "line";
+            let url = secrets
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    line.then(|| crate::alerts::notify::transport::LINE_PUSH_URL.to_string())
+                })
+                .unwrap_or_default();
+            json!({ "url": url, "line": line, "ca_file": s("ca_file") })
+        }
+    }
+}
+
+/// 會被送到目的地的機密欄位。`hmac_secret` 只用來簽章、不會送出；Webhook 的 `url` 本身就是目的地
+pub fn transmitted_secrets(kind: ChannelKind) -> &'static [&'static str] {
+    match kind {
+        ChannelKind::Email => &["password"],
+        ChannelKind::Webhook => &["headers", "line_token"],
+    }
+}
+
+/// 目的地改變、而請求沒有重新提供（或清除）的已保存機密欄位；沒有時為 `None`
+pub fn secret_needing_reentry(
+    kind: ChannelKind,
+    old: (&Value, &Value),
+    new: (&Value, &Value),
+    provided: Option<&Map<String, Value>>,
+) -> Option<&'static str> {
+    if channel_destination(kind, old.0, old.1) == channel_destination(kind, new.0, new.1) {
+        return None;
+    }
+    transmitted_secrets(kind).iter().copied().find(|k| {
+        let stored = match old.1.get(*k) {
+            Some(Value::String(s)) => !s.is_empty(),
+            Some(Value::Object(m)) => !m.is_empty(),
+            _ => false,
+        };
+        stored && !provided.is_some_and(|m| m.contains_key(*k))
+    })
+}
+
 /// 驗證管道的設定與機密；回傳（不含機密的設定, 機密）
 pub fn validate_channel(
     kind: ChannelKind,
@@ -1984,6 +2062,32 @@ async fn save_channel(
         }
     }
     let (config, secrets) = validate_channel(kind, &config, &Value::Object(secrets))?;
+    // 目的地改變：會被送出的機密不能沿用（安全稽核 E2）
+    if let Some(b) = &base
+        && let Some(key) = secret_needing_reentry(
+            kind,
+            (&b.config, &b.secrets),
+            (&config, &secrets),
+            body.get("secrets").and_then(Value::as_object),
+        )
+    {
+        c.audit(
+            "channel.update",
+            Some(&b.channel_id),
+            "rejected",
+            json!({ "name": b.name, "reason": "destination_changed", "secret": key }),
+        )
+        .await;
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "channel_secret_required",
+            "通知的目的地已變更：原本保存的機密不能沿用到新的目的地，請重新輸入，或清除它",
+        )
+        .with_details(json!({
+            "parameter": format!("secrets.{key}"),
+            "reason": "destination_changed",
+        })));
+    }
     let now = c.now_ms();
     let ch = Channel {
         channel_id: base

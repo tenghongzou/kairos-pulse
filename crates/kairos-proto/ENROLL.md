@@ -85,10 +85,10 @@
 | `GET /v1/enroll/server-info` | `server_info` | 無 | 開放、自動暫停中、僅續簽 | 新註冊類（L4） | 是（唯讀） |
 | `POST /v1/enroll/token-check` | `token_check` | token（不消耗次數） | 開放 | 新註冊類（L4、L7） | 是（唯讀） |
 | `POST /v1/enroll/requests` | `enroll_request`（新註冊） | token | 開放 | 新註冊類（L4～L9） | 是：同一 `agent_id`＋同一 CSR＋同一 `poll_secret` 回傳同一筆申請（第 6.3 節） |
-| `GET /v1/enroll/requests/{request_id}` | `enroll_poll`、`enroll_result`（取回憑證） | `Authorization: Bearer <poll_secret>` | 開放、自動暫停中、僅續簽 | 每筆申請（L10） | 是（唯讀） |
+| `GET /v1/enroll/requests/{request_id}` | `enroll_poll`、`enroll_result`（取回憑證） | `Authorization: Bearer <poll_secret>` | 開放、自動暫停中、僅續簽 | L7 封鎖、每 IP（L4p）、每筆申請（L10） | 是（唯讀） |
 | `POST /v1/enroll/renewals` | 過期續簽（設計包稱「以舊私鑰簽名、不帶 token 的 `enroll_request`」） | 舊私鑰簽章＋主機指紋 | 開放、自動暫停中、僅續簽 | 續簽類（L4r、L6r、L7 續簽、L8、L9） | 是：同一 `agent_id`＋同一 CSR 回傳同一張憑證，不重複簽發（第 7.4 節） |
-| `POST /v1/enroll/requests/{request_id}/withdraw/challenge` | `enroll_withdraw` 第 1 步 | 無（只發 nonce） | 開放、自動暫停中、僅續簽 | 每筆申請（L10） | 每次發新的 nonce，作廢舊的 |
-| `POST /v1/enroll/requests/{request_id}/withdraw` | `enroll_withdraw` 第 2 步 | CSR 私鑰對 nonce 的簽章 | 開放、自動暫停中、僅續簽 | 每筆申請（L10）；簽章不符計入 L7 續簽類 | 是：已撤回時回 `already_withdrawn: true` |
+| `POST /v1/enroll/requests/{request_id}/withdraw/challenge` | `enroll_withdraw` 第 1 步 | 無（只發 nonce） | 開放、自動暫停中、僅續簽 | L7 封鎖（續簽類）、每 IP（L4p）、每筆申請（L10） | 每次發新的 nonce，作廢舊的 |
+| `POST /v1/enroll/requests/{request_id}/withdraw` | `enroll_withdraw` 第 2 步 | CSR 私鑰對 nonce 的簽章 | 開放、自動暫停中、僅續簽 | L7 封鎖（續簽類）、每 IP（L4p）、每筆申請（L10）；簽章不符計入 L7 續簽類 | 是：已撤回時回 `already_withdrawn: true` |
 | `GET /agent/<檔名>` | 安裝腳本、agent 套件 | 無 | 開放 | 下載（L11） | 是 |
 
 `request_id` 是 Kairos 產生的 UUID（不是秘密），一律以小寫輸出；路徑中大小寫皆可。給人以電話核對的**申請編號** `request_code`（`XXXX-XXXX`）由公鑰衍生、不保證唯一，**不當作路徑**（第 14.3 節）。
@@ -184,6 +184,7 @@ preflight PF09 與 MSI 精靈的 token 頁使用；**不消耗使用次數、不
 
 - 標頭 `Authorization: Bearer <poll_secret>`（scheme 不分大小寫）。缺少、格式錯誤或不符時 404 `request_not_found`（與申請不存在相同，不透露申請是否存在），以出示的值的雜湊計入 L7（依申請的種類分類；申請不存在時計入新註冊類）。比較雜湊時用常數時間。
 - 查詢參數 `wait`（選填）：長輪詢秒數 0～60（伺服器宣告 `long_poll` 時才可使用；不合法 400 `bad_request`，`field: wait`）。申請為 `pending_approval` 且有長輪詢名額（每 IP 32、全域 1,000）時，Kairos 保持連線直到狀態改變或 `wait` 秒到期；名額用完時立即回應（附 `poll_after_ms`），不算錯誤。
+- **判定順序**：L7 封鎖（新註冊類；429 `source_blocked`）→ L4p（每個來源的輪詢與撤回；429 `rate_limited`、`scope: ip`）→ `wait` → 輪詢憑據 → L10。過期續簽的申請另外檢查續簽類的封鎖。被 L7 封鎖或 L4p 拒絕的請求不讀資料庫、不計入 L7 與 L10。
 - L10：同一筆申請兩次輪詢至少間隔 10 秒，可連續 3 次（服務重新啟動、接續）；太頻繁 429（`scope: request`）。撤回的兩個請求也計入同一個額度。
 - 回應：`EnrollResult`。`issued` 時含完整的憑證，**取回憑證就是輪詢**：同一筆申請在保存期間（結束後 30 天，設計包 S13「最近結束」）內每次輪詢都回同一張憑證，回應遺失可以再取一次；Kairos 記錄第一次交付的時間（`delivered_at`）。
 - 申請已超過保存期限而被清除：404 `request_not_found`。Pulse 視同 `request_expired`（`PLS-E3303`，需 `pulse enroll --force`）。
@@ -248,7 +249,7 @@ preflight PF09 與 MSI 精靈的 token 頁使用；**不消耗使用次數、不
 | 7 | **身分**：`expired_certificate` 以目前任一信任錨（`auth.client_ca` 與 Kairos 的簽發 CA）驗證鏈的簽章（**忽略有效期間**）、SAN 恰好一個且等於 `agent_id`、公鑰為 P-256；以該憑證的公鑰、對 Kairos 每一個註冊端點名稱（第 16.3 節）組出的簽章內容驗證 `signature`，任一個通過即可；`host_fingerprint` 等於清冊中這台主機最後已知的指紋（清冊沒有指紋時視為不符） | 403 `renew_identity_mismatch`（計入 L7 續簽類，相異值＝`agent_id`） |
 | 8 | **重放快取**：簽章內容的 SHA-256（第 16.4 節）在 10 分鐘內出現過 | 400 `replayed_request`（計入 L7 續簽類，相異值＝內容雜湊）。通過第 7 步的請求一律寫入快取（不論後面的結果），快取**持久化**（第 18 節第 2 項） |
 | 9 | **冪等**：同一 `agent_id`＋同一 CSR 已有過期續簽申請 | 已簽發、且那張憑證仍是這台主機最新、未撤銷的憑證 → 200 回傳**同一張憑證**（不重新簽發；設計包 `INTEGRATION.md` §23.9，第 7.4 節）；待核准 → 200 回傳那一筆申請（`poll_secret` 更新為這次的值） |
-| 10 | 舊憑證已撤銷，或主機已除役 | 403 `certificate_revoked` |
+| 10 | 舊憑證已撤銷，或主機已除役。撤銷的來源與 8443 相同：Kairos 的撤銷紀錄，以及（舊憑證由 `auth.client_ca` 的 CA 簽發、且設定了 `auth.crl` 時）`auth.crl`——整條鏈、CRL 的 `nextUpdate` 以現在的時間判定 | 403 `certificate_revoked`。`auth.crl` 無法判定撤銷狀態（讀不到、已超過 `nextUpdate`、沒有涵蓋簽發者）時與 8443 一樣不放行：500 `internal`，Pulse 依退避重試，`auth.crl` 更新後自行恢復（`kairos/PKI.md` 第 13 節第 4 項） |
 | 11 | 舊憑證不是這台主機**最新**簽發的憑證（已被正常輪替或重新註冊取代） | 403 `renew_identity_mismatch`（防止以外洩的舊私鑰換到新憑證） |
 | 12 | 舊憑證尚未過期（依 Kairos 的時間） | 409 `certificate_not_expired`：Pulse 回到 8443 以這張憑證連線（本機時鐘偏快的情況，設計包 §8.1） |
 | 13 | **寬限期**：`收到時間 > not_after + 寬限天數`，且沒有 `grace_override_until` 或已超過它；寬限期政策為 0 時一律超過 | 403 `renew_grace_exceeded`（附 `grace_ended_at`） |
@@ -306,7 +307,7 @@ Kairos 已簽發、但回應在途中遺失時，Pulse 會以**同一個 CSR**�
 | `hostname`、`pulse_version`、`sent_at` | 同第 6.3 節（`sent_at` 只記錄，不判定時鐘：nonce 已防重放） |
 | `host_fingerprint` | 選填 |
 
-**判定順序**：L10 → nonce 屬於這筆申請、未用過、未逾時（400 `nonce_invalid`／`nonce_expired`；**任何一次驗證嘗試都作廢 nonce**）→ `agent_id` 等於申請 CSR 的 SAN，並以**建立申請時保存的 CSR 公鑰**（不是請求帶來的任何東西）驗證簽章，簽章內容的最後一行接受 Kairos 的任一註冊端點名稱（403 `withdraw_signature_invalid`，兩者對外不細分；計入 L7 續簽類）→ 依狀態：
+**判定順序**（challenge 的前三步相同）：L7 封鎖（續簽類；429 `source_blocked`）→ L4p（429 `rate_limited`、`scope: ip`）→ L10 → nonce 屬於這筆申請、未用過、未逾時（400 `nonce_invalid`／`nonce_expired`；**任何一次驗證嘗試都作廢 nonce**）→ `agent_id` 等於申請 CSR 的 SAN，並以**建立申請時保存的 CSR 公鑰**（不是請求帶來的任何東西）驗證簽章，簽章內容的最後一行接受 Kairos 的任一註冊端點名稱（403 `withdraw_signature_invalid`，兩者對外不細分；計入 L7 續簽類）→ 依狀態：
 
 | 申請狀態 | 處理 |
 |---|---|
@@ -355,9 +356,10 @@ Kairos 已簽發、但回應在途中遺失時，Pulse 會以**同一個 CSR**�
 | L3 軟上限 | 所有請求 | 429 `rate_limited`（`scope: ip`） |
 | L4 每 IP 新註冊類 | `server-info`、`token-check`、新註冊 | 429（`scope: ip`） |
 | L4r 每 IP 續簽類 | 過期續簽 | 429（`scope: ip`） |
+| L4p 每 IP 輪詢與撤回（沒有自己的設定鍵：速率＝`enroll.poll_target_per_ip_per_sec` × 4，可連續的次數＝速率 × 30 秒；預設每秒 20 次、可連續 600 次） | 輪詢、撤回的兩個請求 | 429（`scope: ip`） |
 | L5、L5b 每 token | 新註冊 | 429（`scope: token`） |
 | L6 每 `agent_id`（新註冊）、L6r（續簽，每小時 10 次） | 新註冊、過期續簽 | 429（`scope: agent`） |
-| L7 相異無效值（新註冊類、續簽類分開計數與封鎖） | 新註冊類：不存在／停用的 token、錯誤的 `poll_secret`。續簽類：`renew_identity_mismatch`、`replayed_request`、`withdraw_signature_invalid`。`clock_skew` 一律不計 | 429 `source_blocked`（`scope: blocked`，`Retry-After` 為封鎖剩餘秒數） |
+| L7 相異無效值（新註冊類、續簽類分開計數與封鎖） | 新註冊類：不存在／停用的 token、錯誤的 `poll_secret`。續簽類：`renew_identity_mismatch`、`replayed_request`、`withdraw_signature_invalid`。`clock_skew` 一律不計。封鎖期間不再計數；新註冊類的封鎖也擋輪詢，續簽類的封鎖也擋撤回與過期續簽申請的輪詢 | 429 `source_blocked`（`scope: blocked`，`Retry-After` 為封鎖剩餘秒數） |
 | L8 全域申請速率 | 新註冊、過期續簽 | 503 `enroll_busy`（`scope: global`） |
 | L9 待核准佇列上限 | 結果為待核准的新註冊與過期續簽 | 503 `pending_queue_full`（`scope: global`，`Retry-After: 3600`） |
 | L10 每筆申請 | 輪詢、撤回的兩個請求 | 429（`scope: request`）；長輪詢名額用完時不算錯誤 |
@@ -366,7 +368,8 @@ Kairos 已簽發、但回應在途中遺失時，Pulse 會以**同一個 CSR**�
 - **429／503 的回應**：`Retry-After` 標頭（整數秒，無條件進位）＋`error.retry_after_ms`（相同的時間）、`error.scope`、`error.observed_ip`。`Retry-After` 依排隊位置計算（GCRA，`enroll-rate-limit.md` §5.1），上限 600 秒（`enroll.retry_after_max_secs`；L7 封鎖與 L9 除外）。
 - 只要回 429 或 503，就不會建立申請、不會消耗 token 次數、不會簽發憑證。
 - 規則與 8443 的 `per_ip.rs` 相同：被前面某層拒絕的請求不扣後面各層的額度。
-- 「批次部署來源」與 token 的「批次部署模式」（`enroll-rate-limit.md` §4.3）把 L2、L3、L4、L11 乘以 10；L5～L9 不變，L7 照常。
+- 「批次部署來源」與 token 的「批次部署模式」（`enroll-rate-limit.md` §4.3）把 L2、L3、L4、L4p、L11 乘以 10；L5～L9 不變，L7 照常。
+- 各層的限流表都有筆數上限（每張 bucket 表 262,144 個鍵；L7 的計數表與封鎖表各 65,536 個來源）。bucket 表滿的時候新的鍵一律 429（`Retry-After` 為上限值），既有的鍵不受影響；L7 的表滿的時候淘汰最久沒有出現的來源。
 
 ## 12. 申請的狀態機
 

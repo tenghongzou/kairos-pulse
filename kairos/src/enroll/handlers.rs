@@ -7,9 +7,9 @@
 //! | `server-info` | L4 |
 //! | `token-check` | L7 封鎖 → L4 → 模式 → 本文 → token |
 //! | 新註冊 | 第 6.3 節 1～15 |
-//! | 輪詢 | `wait` → 輪詢憑據（不符計入 L7）→ L10 → 長輪詢 |
+//! | 輪詢 | L7 封鎖 → L4p → `wait` → 輪詢憑據（不符計入 L7）→ L10 → 長輪詢 |
 //! | 過期續簽 | 第 7.2 節 1～16 |
-//! | 撤回 | L10 → nonce → 簽章（不符計入 L7 續簽類）→ 狀態 |
+//! | 撤回 | L7 封鎖（續簽類）→ L4p → 模式 → L10 → nonce → 簽章（不符計入 L7 續簽類）→ 狀態 |
 
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
@@ -47,6 +47,7 @@ use crate::pki::csr::check_csr;
 use crate::pki::store::CertRow;
 use crate::pki::x509::{parse_cert, pem_decode_all, pem_encode, verify_cert_signature};
 use crate::store::prelude::*;
+use crate::tls::CrlVerdict;
 
 /// 每個請求的處理上限（長輪詢另加 `wait` 秒）
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,6 +58,10 @@ pub const BURST_WINDOW_MS: i64 = 10 * 60_000;
 pub const BURST_COUNT: i64 = 50;
 /// L10：同一筆申請可連續輪詢 3 次
 pub const POLL_BURST: f64 = 3.0;
+/// L4p：每個來源的輪詢與撤回速率＝`poll_target_per_ip_per_sec` × 此倍數，可連續的次數＝速率 × 30 秒
+/// （預設每秒 20 次、可連續 600 次，與 L4 的可連續次數相同）
+pub const POLL_IP_HEADROOM: f64 = 4.0;
+pub const POLL_IP_BURST_SECS: f64 = 30.0;
 
 /// 一條連線的資訊
 #[derive(Debug, Clone)]
@@ -144,6 +149,26 @@ impl Ctx<'_> {
             )
             .map_err(|w| {
                 self.svc.stats.limited_renew.fetch_add(1, Ordering::Relaxed);
+                self.limited(EnrollErrorCode::RateLimited, RateScope::Ip, w)
+            })
+    }
+
+    /// L4p：每個來源的輪詢與撤回。額度由輪詢的目標速率推得（動態 `poll_after_ms` 讓守規則的主機合計不超過
+    /// `poll_target_per_ip_per_sec`），留 [`POLL_IP_HEADROOM`] 倍的餘裕；批次部署來源再乘以倍率
+    fn check_l4p(&self) -> Result<(), EnrollError> {
+        let (capacity, rate) = l4p_bucket(
+            self.svc.config.enroll.poll_target_per_ip_per_sec,
+            self.svc.multiplier(self.src),
+        );
+        self.svc
+            .limits
+            .l4p
+            .take(&self.src, capacity, rate, Instant::now(), self.max_wait())
+            .map_err(|w| {
+                self.svc
+                    .stats
+                    .limited_enroll
+                    .fetch_add(1, Ordering::Relaxed);
                 self.limited(EnrollErrorCode::RateLimited, RateScope::Ip, w)
             })
     }
@@ -242,6 +267,14 @@ impl Ctx<'_> {
         let dynamic = pending * 1000 / u64::from(c.poll_target_per_ip_per_sec.max(1));
         base.max(dynamic).min(max)
     }
+}
+
+/// L4p 的 (可連續的次數, 每秒補充)：`poll_target_per_ip_per_sec` × [`POLL_IP_HEADROOM`] × 批次部署來源的
+/// 倍率，可連續 [`POLL_IP_BURST_SECS`] 秒的量。設定驗證保證目標速率至少是 1；0 只會出現在測試中
+/// （只剩 1 次、不補充，結果不受測試機的速度影響）
+pub(super) fn l4p_bucket(target_per_sec: u32, multiplier: f64) -> (f64, f64) {
+    let rate = f64::from(target_per_sec) * POLL_IP_HEADROOM * multiplier;
+    (rate * POLL_IP_BURST_SECS, rate)
 }
 
 fn shutting_down() -> EnrollError {
@@ -394,6 +427,9 @@ async fn route(
             timed(base, grace_renew(ctx, &body)).await
         }
         Route::Poll(id) => {
+            // 錯誤的輪詢憑據計入 L7 新註冊類（過期續簽的申請在 `poll` 中另外檢查續簽類）
+            ctx.check_blocked(InvalidClass::Enroll)?;
+            ctx.check_l4p()?;
             h::reject_body(req.headers())?;
             let wait = parse_wait_secs(req.uri().query())
                 .ok_or_else(|| EnrollError::bad_request("wait", "wait must be 0..=60 seconds"))?
@@ -410,11 +446,16 @@ async fn route(
             .await
         }
         Route::WithdrawChallenge(id) => {
+            // 撤回的簽章不符計入 L7 續簽類
+            ctx.check_blocked(InvalidClass::Renew)?;
+            ctx.check_l4p()?;
             ctx.require_mode(EndpointClass::Withdraw)?;
             let _ = h::read_json_body(req, max_body).await?;
             timed(base, withdraw_challenge(ctx, &id)).await
         }
         Route::Withdraw(id) => {
+            ctx.check_blocked(InvalidClass::Renew)?;
+            ctx.check_l4p()?;
             ctx.require_mode(EndpointClass::Withdraw)?;
             let body = h::read_json_body(req, max_body).await?;
             timed(base, withdraw(ctx, &id, &body)).await
@@ -1198,6 +1239,10 @@ async fn poll(
             .await;
         return Err(EnrollError::request_not_found());
     };
+    // 過期續簽的申請：錯誤的憑據計入續簽類，所以這一類被封鎖的來源也不能再試
+    if r.kind != DbKind::Enroll {
+        ctx.check_blocked(InvalidClass::Renew)?;
+    }
     let expected = r.poll_secret_hash.clone().unwrap_or_else(|| vec![0; 32]);
     let same: bool = expected.ct_eq(&presented[..]).into();
     if !same || r.poll_secret_hash.is_none() {
@@ -1348,6 +1393,34 @@ fn verify_grace_identity(
     Err("signature does not verify")
 }
 
+/// 舊憑證在 `auth.crl` 中的撤銷狀態（與 8443 相同的撤銷來源）。`None`：不適用——沒有設定 `auth.crl`
+/// （8443 也不檢查撤銷），或舊憑證由 Kairos 的簽發 CA 簽發（撤銷紀錄在資料庫，第 10 步；8443 以 Kairos
+/// 產生的 CRL 判定，不看 `auth.crl`）
+fn grace_crl_verdict(
+    svc: &EnrollService,
+    cert_der: &[u8],
+    info: &crate::pki::x509::CertInfo,
+) -> Option<CrlVerdict> {
+    let ca = svc.config.auth.client_ca_path()?;
+    let crls = svc.config.auth.crl_paths();
+    if crls.is_empty() {
+        return None;
+    }
+    let by_issuing_ca = std::fs::read_to_string(crate::pki::issuing_cas_path(&svc.data_dir))
+        .ok()
+        .and_then(|text| pem_decode_all(&text, Some("CERTIFICATE")).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|(_, der)| parse_cert(der).is_ok_and(|ca| ca.subject_raw == info.issuer_raw));
+    if by_issuing_ca {
+        return None;
+    }
+    let now = chrono::DateTime::from_timestamp_millis(svc.now_ms())?;
+    Some(crate::tls::expired_cert_crl_verdict(
+        cert_der, ca, &crls, now,
+    ))
+}
+
 /// 過期續簽在交易中的判定（第 8～16 步）
 enum GraceOutcome {
     Respond(Box<(RequestRow, Option<CertRow>)>),
@@ -1425,6 +1498,14 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
         .await;
         return Err(mismatch());
     }
+    // 第 10 步用的 `auth.crl` 判定：讀檔，在交易之外；身分已驗證，只有持有舊私鑰的一方走得到這裡
+    let crl = grace_crl_verdict(svc, &checked.expired_certificate_der, &old);
+    if let Some(CrlVerdict::Unknown(why)) = &crl {
+        warn!(
+            "過期續簽被拒（agent_id {}，來源 {}）：無法以 auth.crl 判定舊憑證（序號 {}）的撤銷狀態：{why}。請更新 auth.crl",
+            checked.agent_id, ctx.observed, old.serial
+        );
+    }
     let key = replay_cache_key(&signing_input);
     let eff = svc.effective();
     let s = svc.clone();
@@ -1434,7 +1515,11 @@ async fn grace_renew(ctx: &Ctx<'_>, body: &[u8]) -> Result<Response<ApiBody>, En
     let req2 = req.clone();
     let outcome = svc
         .db
-        .write(move |conn| grace_in_tx(&s, conn, &req2, &checked2, &old, key, &eff, &observed, now))
+        .write(move |conn| {
+            grace_in_tx(
+                &s, conn, &req2, &checked2, &old, crl, key, &eff, &observed, now,
+            )
+        })
         .await
         .map_err(db_err)?;
     match outcome {
@@ -1476,6 +1561,7 @@ fn grace_in_tx(
     req: &GraceRenewRequest,
     checked: &kairos_proto::enroll::CheckedGraceRenewRequest,
     old: &crate::pki::x509::CertInfo,
+    crl: Option<CrlVerdict>,
     key: [u8; 32],
     eff: &crate::settings::Effective,
     source_ip: &str,
@@ -1550,8 +1636,17 @@ fn grace_in_tx(
             _ => {}
         }
     }
-    // 10. 舊憑證已撤銷，或主機已除役
-    if old_cert.as_ref().is_some_and(|c| c.revoked_at.is_some())
+    // 10. 舊憑證已撤銷（Kairos 的撤銷紀錄或 `auth.crl`），或主機已除役
+    if let Some(CrlVerdict::Unknown(_)) = &crl {
+        // 與 8443 相同：無法判定撤銷狀態時不放行。Pulse 依退避重試，`auth.crl` 更新後自行恢復
+        return fail(
+            tx,
+            EnrollErrorCode::Internal,
+            "certificate revocation status is unavailable",
+        );
+    }
+    if crl == Some(CrlVerdict::Revoked)
+        || old_cert.as_ref().is_some_and(|c| c.revoked_at.is_some())
         || host
             .as_ref()
             .is_some_and(|h| h.lifecycle == "decommissioned")

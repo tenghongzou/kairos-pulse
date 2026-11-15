@@ -20,7 +20,10 @@
       - kairos-pulse-release
       - -s
       - "{{ pulse_dist_dir }}/SHA256SUMS.sig"
+    # lookup 會去掉檔尾的換行，這裡補回一個；command 預設還會再加一個（stdin_add_newline），
+    # 多出的換行會讓簽章驗證失敗，所以關掉
     stdin: "{{ lookup('ansible.builtin.file', pulse_dist_dir + '/SHA256SUMS') }}\n"
+    stdin_add_newline: false
   delegate_to: localhost
   become: false
   run_once: true
@@ -50,39 +53,76 @@
     pulse_pkg_sha256: "{{ pulse_pkg_line[0].split()[0] }}"
     pulse_pkg_file: "{{ pulse_pkg_line[0].split()[1] | replace('*', '') }}"
 
-# 3. 複製並核對雜湊（copy 的 checksum 是 SHA-1，另以 stat 的 SHA-256 核對）
-- name: 複製套件
-  ansible.builtin.copy:
-    src: "{{ pulse_dist_dir }}/{{ pulse_pkg_file }}"
-    dest: "/var/tmp/{{ pulse_pkg_file }}"
-    mode: "0644"
+# 3. 複製並核對雜湊（copy 的 checksum 是 SHA-1，另以 stat 的 SHA-256 核對）。
+#    套件放在只有 root 能進入的暫存目錄，不直接放在 /var/tmp：/var/tmp 是任何本機帳號都能寫的目錄，
+#    套件的檔名又可以預測，別的帳號可以先放一個自己擁有的同名檔，在核對雜湊之後、安裝之前把內容換掉
+#    （安裝是以 root 執行的，含套件的維護指令碼）。tempfile 以 mkdtemp 建立目錄：名稱不可預測、
+#    權限 0700、同名的東西已存在時不會沿用。
+- name: 建立只有 root 能進入的暫存目錄
+  ansible.builtin.tempfile:
+    state: directory
+    path: /var/tmp
+    prefix: pulse-install.
+  register: pulse_pkg_tmp
 
-- name: 核對 SHA-256
-  ansible.builtin.stat:
-    path: "/var/tmp/{{ pulse_pkg_file }}"
-    checksum_algorithm: sha256
-  register: pulse_pkg_stat
-  failed_when: pulse_pkg_stat.stat.checksum != pulse_pkg_sha256
+- name: 複製、核對並安裝套件
+  block:
+    - name: 檢查暫存目錄
+      ansible.builtin.stat:
+        path: "{{ pulse_pkg_tmp.path }}"
+        follow: false
+      register: pulse_pkg_tmp_stat
 
-# 4. 安裝（升級時保留 pulse.toml、identity/、agent.id）
-- name: 安裝 deb
-  ansible.builtin.apt:
-    deb: "/var/tmp/{{ pulse_pkg_file }}"
-  environment:
-    PULSE_INSTALL_QUIET: "1"
-  when: pulse_pkg_ext == 'deb'
-  notify: restart pulse
+    - name: 暫存目錄必須是 root 擁有、其他帳號不能進入的目錄
+      ansible.builtin.assert:
+        that:
+          - pulse_pkg_tmp_stat.stat.isdir
+          - not pulse_pkg_tmp_stat.stat.islnk
+          - pulse_pkg_tmp_stat.stat.uid == 0
+          - pulse_pkg_tmp_stat.stat.mode == '0700'
+        fail_msg: >-
+          暫存目錄 {{ pulse_pkg_tmp.path }} 不是 root 擁有的 0700 目錄：這個 role 必須以 root 執行（become: true）
 
-- name: 安裝 rpm
-  ansible.builtin.dnf:
-    name: "/var/tmp/{{ pulse_pkg_file }}"
-    state: present
-    # 套件以簽過章的 SHA256SUMS 驗證（上方），rpm 本身沒有 GPG 簽章
-    disable_gpg_check: true
-  environment:
-    PULSE_INSTALL_QUIET: "1"
-  when: pulse_pkg_ext == 'rpm'
-  notify: restart pulse
+    - name: 複製套件
+      ansible.builtin.copy:
+        src: "{{ pulse_dist_dir }}/{{ pulse_pkg_file }}"
+        dest: "{{ pulse_pkg_tmp.path }}/{{ pulse_pkg_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: 核對 SHA-256
+      ansible.builtin.stat:
+        path: "{{ pulse_pkg_tmp.path }}/{{ pulse_pkg_file }}"
+        checksum_algorithm: sha256
+      register: pulse_pkg_stat
+      failed_when: pulse_pkg_stat.stat.checksum != pulse_pkg_sha256
+
+    # 4. 安裝（升級時保留 pulse.toml、identity/、agent.id）
+    - name: 安裝 deb
+      ansible.builtin.apt:
+        deb: "{{ pulse_pkg_tmp.path }}/{{ pulse_pkg_file }}"
+      environment:
+        PULSE_INSTALL_QUIET: "1"
+      when: pulse_pkg_ext == 'deb'
+      notify: restart pulse
+
+    - name: 安裝 rpm
+      ansible.builtin.dnf:
+        name: "{{ pulse_pkg_tmp.path }}/{{ pulse_pkg_file }}"
+        state: present
+        # 套件以簽過章的 SHA256SUMS 驗證（上方），rpm 本身沒有 GPG 簽章
+        disable_gpg_check: true
+      environment:
+        PULSE_INSTALL_QUIET: "1"
+      when: pulse_pkg_ext == 'rpm'
+      notify: restart pulse
+  always:
+    - name: 移除暫存目錄
+      ansible.builtin.file:
+        path: "{{ pulse_pkg_tmp.path }}"
+        state: absent
+      when: pulse_pkg_tmp.path is defined
 
 # 5. 註冊：已有身分（client.pem）或進行中的申請（enrollment.json）時不再執行。
 #    安裝字串經 stdin 傳入（--install-string-file -），不放在命令列：命令列參數在執行期間其他帳號可從 ps 看到

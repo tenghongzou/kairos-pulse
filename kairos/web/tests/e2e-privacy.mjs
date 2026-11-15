@@ -8,6 +8,7 @@
 //   （再匯入同一張為「先前已匯入」、伺服器憑證全部未通過為 InlineAlert 與 KRS-E1305 三段式）→ 清單出現這台主機。
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -121,8 +122,10 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
     // 下載端點的檔案（同一個發佈版本的安裝腳本、SHA256SUMS 與簽章）
     const dl = join(PKI_DIR, 'dl');
     mkdirSync(dl, { recursive: true });
-    writeFileSync(join(dl, 'pulse-install.sh'), '#!/bin/sh\n');
-    writeFileSync(join(dl, 'SHA256SUMS'), '0000  pulse-install.sh\n');
+    const script = '#!/bin/sh\n';
+    const scriptSha = createHash('sha256').update(script).digest('hex');
+    writeFileSync(join(dl, 'pulse-install.sh'), script);
+    writeFileSync(join(dl, 'SHA256SUMS'), `${scriptSha}  pulse-install.sh\n`);
     writeFileSync(join(dl, 'SHA256SUMS.sig'), '-----BEGIN SSH SIGNATURE-----\n');
     const { ctx, page } = await newPage();
     await page.goto(`${PKI_BASE}/login?next=${encodeURIComponent('/enrollment/tokens')}`);
@@ -141,6 +144,11 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
     const cmd = await one.innerText();
     assert.match(cmd, /curl -fsSLO --cacert kairos-ca\.pem https:\/\/127\.0\.0\.1:\d+\/agent\/pulse-install\.sh/);
     assert.match(cmd, /--base-url https:\/\/127\.0\.0\.1:\d+\/agent --ca-file kairos-ca\.pem/);
+    // 安全稽核 C3：下載後先比對腳本的 SHA-256，相符才以 root 執行（比對在 sudo 之前）
+    const check = `echo '${scriptSha}  pulse-install.sh' | sha256sum -c - && sudo `;
+    assert.ok(cmd.includes(check), cmd);
+    assert.ok(cmd.indexOf('pulse-install.sh &&') < cmd.indexOf(check), cmd);
+    await page.getByText('指令會先比對安裝腳本的 SHA-256', { exact: false }).waitFor();
     assert.match(cmd, /PULSE_INSTALL_STRING='pulse-enroll:v1:/);
     await page.getByText('已先以安裝套件（MSI、deb、rpm）安裝 Pulse 時，改為執行：').waitFor();
     await axe(page, 'S12 建立完成（一行安裝指令）');

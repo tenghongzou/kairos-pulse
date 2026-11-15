@@ -18,7 +18,11 @@ use std::time::{Duration, Instant};
 
 /// bucket 表超過此筆數時清掉已補滿的項目
 pub const PRUNE_THRESHOLD: usize = 4096;
-/// L7 追蹤的來源數上限（封鎖表）
+/// bucket 表的鍵數上限：達到後清不出空位時，新的鍵一律被拒
+pub const MAX_KEYS: usize = 262_144;
+/// bucket 表已滿時兩次清理的最短間隔
+pub const FULL_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+/// L7 追蹤的來源數上限（計數表與封鎖表各自）
 pub const MAX_TRACKED_SOURCES: usize = 65_536;
 
 /// token bucket＋排隊位置（GCRA）
@@ -87,16 +91,60 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
     (wait.as_millis().div_ceil(1000) as u64).max(1)
 }
 
-/// 依鍵分開的 bucket 表
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct KeyedState<K> {
+    map: HashMap<K, Gcra>,
+    /// 筆數達到這個值時才清理（每次清理後設為剩餘筆數的 2 倍）：清理的成本攤在之後的新鍵上，
+    /// 不會每個新鍵都在鎖內掃描整張表
+    prune_at: usize,
+    last_prune: Option<Instant>,
+}
+
+impl<K: Eq + Hash> KeyedState<K> {
+    fn prune(&mut self, now: Instant) {
+        self.map.retain(|_, b| !b.is_full(now));
+        self.last_prune = Some(now);
+        self.prune_at = (self.map.len() * 2).clamp(PRUNE_THRESHOLD + 1, MAX_KEYS);
+    }
+
+    /// 是否還放得下一個新的鍵（必要時清理）
+    fn make_room(&mut self, now: Instant) -> bool {
+        if self.map.len() < self.prune_at {
+            return true;
+        }
+        // 已達上限且剛清理過：不再掃描，直接拒絕
+        if self.map.len() >= MAX_KEYS
+            && self
+                .last_prune
+                .is_some_and(|t| now.saturating_duration_since(t) < FULL_PRUNE_INTERVAL)
+        {
+            return false;
+        }
+        self.prune(now);
+        self.map.len() < MAX_KEYS
+    }
+}
+
+/// 依鍵分開的 bucket 表。最多 [`MAX_KEYS`] 個鍵；滿的時候新的鍵一律被拒（回 `max_wait`），既有的鍵不受影響
+#[derive(Debug)]
 pub struct Keyed<K: Eq + Hash + Clone> {
-    map: Mutex<HashMap<K, Gcra>>,
+    state: Mutex<KeyedState<K>>,
+}
+
+impl<K: Eq + Hash + Clone> Default for Keyed<K> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K: Eq + Hash + Clone> Keyed<K> {
     pub fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            state: Mutex::new(KeyedState {
+                map: HashMap::new(),
+                prune_at: PRUNE_THRESHOLD + 1,
+                last_prune: None,
+            }),
         }
     }
 
@@ -109,11 +157,12 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         now: Instant,
         max_wait: Duration,
     ) -> Result<(), Duration> {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() > PRUNE_THRESHOLD && !map.contains_key(key) {
-            map.retain(|_, b| !b.is_full(now));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.map.contains_key(key) && !st.make_room(now) {
+            return Err(max_wait);
         }
-        let b = map
+        let b = st
+            .map
             .entry(key.clone())
             .or_insert_with(|| Gcra::new(capacity, rate, now));
         b.retune(capacity, rate);
@@ -122,8 +171,20 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
 
     /// 清掉已補滿的項目
     pub fn prune(&self, now: Instant) {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, b| !b.is_full(now));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prune(now);
+    }
+
+    /// 目前的鍵數
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len()
     }
 }
 
@@ -174,11 +235,61 @@ pub struct Block {
 /// 封鎖的再犯紀錄在 24 小時沒有再犯後歸零
 pub const OFFENSE_RESET_MS: i64 = 86_400_000;
 
+/// 一個來源在時間窗內的相異無效值。筆數不會超過政策的上限：達到上限就封鎖並清空，封鎖期間不再記錄
+#[derive(Debug, Default)]
+struct SourceValues {
+    /// 無效值（SHA-256）→ 最後一次出現的時間
+    values: HashMap<[u8; 32], i64>,
+    /// 這個來源最後一次被記錄的時間（淘汰時不必掃描每個值）
+    last_ms: i64,
+}
+
 #[derive(Debug, Default)]
 struct InvalidState {
-    /// (來源, 類別) → 相異無效值（SHA-256）→ 最後一次出現的時間
-    seen: HashMap<(IpAddr, InvalidClass), HashMap<[u8; 32], i64>>,
+    seen: HashMap<(IpAddr, InvalidClass), SourceValues>,
     blocks: HashMap<(IpAddr, InvalidClass), Block>,
+}
+
+/// 表滿時一次淘汰的比例（1/8）：之後的 `上限 ÷ 8` 個新來源不必再掃描整張表
+const EVICT_DIVISOR: usize = 8;
+
+/// 從 `map` 淘汰 `key_of` 最小的 1/8（至少 1 筆）
+fn evict_oldest<K: Eq + Hash, V>(map: &mut HashMap<K, V>, key_of: impl Fn(&V) -> i64) {
+    let mut keys: Vec<i64> = map.values().map(&key_of).collect();
+    if keys.is_empty() {
+        return;
+    }
+    let n = (keys.len() / EVICT_DIVISOR).max(1);
+    let (_, cutoff, _) = keys.select_nth_unstable(n - 1);
+    let cutoff = *cutoff;
+    let mut left = n;
+    map.retain(|_, v| {
+        if left > 0 && key_of(v) <= cutoff {
+            left -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
+impl InvalidState {
+    /// 計數表已滿、要記錄新的來源：先清掉時間窗外的來源，仍然滿時淘汰最久沒有出現的一批
+    fn make_room_for_source(&mut self, now_ms: i64, window_ms: i64) {
+        self.seen.retain(|_, s| now_ms - s.last_ms < window_ms);
+        if self.seen.len() >= MAX_TRACKED_SOURCES {
+            evict_oldest(&mut self.seen, |s| s.last_ms);
+        }
+    }
+
+    /// 封鎖表超過上限：先清掉已結束且再犯紀錄已歸零的，仍然超過時淘汰最早結束的一批
+    fn trim_blocks(&mut self, now_ms: i64) {
+        self.blocks
+            .retain(|_, b| b.until_ms > now_ms || now_ms - b.last_offense_ms < OFFENSE_RESET_MS);
+        if self.blocks.len() > MAX_TRACKED_SOURCES {
+            evict_oldest(&mut self.blocks, |b| b.until_ms);
+        }
+    }
 }
 
 /// L7：每個來源在時間窗內嘗試過的**相異**無效值。同一個無效值重複出現（NAT 後的 300 台主機帶著同一個
@@ -226,36 +337,26 @@ impl InvalidTracker {
             InvalidClass::Renew => policy.renew_limit,
         };
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.seen.len() >= MAX_TRACKED_SOURCES && !st.seen.contains_key(&(source, class)) {
-            // 清掉時間窗外的值；仍然太多時清掉最舊的來源
-            st.seen.retain(|_, m| {
-                m.retain(|_, t| now_ms - *t < policy.window_ms);
-                !m.is_empty()
-            });
-            if st.seen.len() >= MAX_TRACKED_SOURCES
-                && let Some(oldest) = st
-                    .seen
-                    .iter()
-                    .min_by_key(|(_, m)| m.values().max().copied().unwrap_or(0))
-                    .map(|(k, _)| *k)
-            {
-                st.seen.remove(&oldest);
-            }
-        }
-        let distinct = {
-            let values = st.seen.entry((source, class)).or_default();
-            values.retain(|_, t| now_ms - *t < policy.window_ms);
-            values.insert(value, now_ms);
-            values.len()
-        };
-        if distinct < limit {
-            return None;
-        }
+        // 封鎖中：不再累積（封鎖結束後重新計數）。否則被封鎖的來源每送一個相異值就多佔一筆
         if st
             .blocks
             .get(&(source, class))
             .is_some_and(|b| b.until_ms > now_ms)
         {
+            st.seen.remove(&(source, class));
+            return None;
+        }
+        if st.seen.len() >= MAX_TRACKED_SOURCES && !st.seen.contains_key(&(source, class)) {
+            st.make_room_for_source(now_ms, policy.window_ms);
+        }
+        let distinct = {
+            let s = st.seen.entry((source, class)).or_default();
+            s.values.retain(|_, t| now_ms - *t < policy.window_ms);
+            s.values.insert(value, now_ms);
+            s.last_ms = now_ms;
+            s.values.len()
+        };
+        if distinct < limit {
             return None;
         }
         let prev = st.blocks.get(&(source, class)).copied();
@@ -276,11 +377,20 @@ impl InvalidTracker {
         // 封鎖後重新計數
         st.seen.remove(&(source, class));
         if st.blocks.len() > MAX_TRACKED_SOURCES {
-            st.blocks.retain(|_, b| {
-                b.until_ms > now_ms || now_ms - b.last_offense_ms < OFFENSE_RESET_MS
-            });
+            st.trim_blocks(now_ms);
         }
         Some(block)
+    }
+
+    /// (計數表的來源數, 其中相異無效值的總數, 封鎖表的筆數)
+    #[cfg(test)]
+    pub fn sizes(&self) -> (usize, usize, usize) {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            st.seen.len(),
+            st.seen.values().map(|s| s.values.len()).sum(),
+            st.blocks.len(),
+        )
     }
 
     /// 解除封鎖
@@ -511,6 +621,103 @@ mod tests {
         assert_eq!((b.offenses, b.until_ms), (0, now + 900_000));
         assert!(t.unblock(ip, InvalidClass::Enroll));
         assert_eq!(t.blocked(ip, InvalidClass::Enroll, now), None);
+    }
+
+    // 安全稽核 C1：bucket 表有上限，滿的時候新的鍵被拒、既有的鍵照常，項目補滿後空位會回來
+    #[test]
+    fn keyed_table_is_bounded_and_rejects_new_keys_when_full() {
+        let t0 = Instant::now();
+        let k: Keyed<u32> = Keyed::new();
+        // 每個鍵取 1 次、幾乎不補充：清理時沒有任何項目是滿的
+        for i in 0..MAX_KEYS as u32 {
+            assert!(k.take(&i, 2.0, 1e-9, t0, MAX).is_ok());
+        }
+        assert_eq!(k.len(), MAX_KEYS);
+        for i in 0..1000u32 {
+            assert_eq!(
+                k.take(&(MAX_KEYS as u32 + i), 2.0, 1e-9, t0, MAX),
+                Err(MAX),
+                "表已滿：新的鍵被拒"
+            );
+        }
+        assert_eq!(k.len(), MAX_KEYS, "被拒的鍵不佔位置");
+        assert!(k.take(&0, 2.0, 1e-9, t0, MAX).is_ok(), "既有的鍵不受影響");
+        // 補充得快的表：項目補滿後被清掉，新的鍵可以進來
+        let k: Keyed<u32> = Keyed::new();
+        for i in 0..(PRUNE_THRESHOLD as u32 * 4) {
+            assert!(k.take(&i, 2.0, 1.0, t0, MAX).is_ok());
+        }
+        let later = t0 + Duration::from_secs(10);
+        k.prune(later);
+        assert_eq!(k.len(), 0, "已補滿的項目在清理時移除");
+        assert!(k.take(&u32::MAX, 2.0, 1.0, later, MAX).is_ok());
+    }
+
+    // 安全稽核 C1：封鎖期間不再累積無效值
+    #[test]
+    fn l7_does_not_accumulate_values_while_blocked() {
+        let t = InvalidTracker::new(policy());
+        let ip: IpAddr = "203.0.113.20".parse().unwrap();
+        for i in 0..20u8 {
+            t.record(ip, InvalidClass::Enroll, [i; 32], 0);
+        }
+        assert!(t.blocked(ip, InvalidClass::Enroll, 1).is_some());
+        for i in 0..10_000u32 {
+            let mut v = [0u8; 32];
+            v[..4].copy_from_slice(&i.to_be_bytes());
+            v[31] = 0xff;
+            assert!(t.record(ip, InvalidClass::Enroll, v, 1000).is_none());
+        }
+        assert_eq!(t.sizes(), (0, 0, 1), "封鎖中的來源不佔計數表");
+        // 未被封鎖的來源：相異值不超過政策的上限（達到就封鎖並清空）
+        let other: IpAddr = "203.0.113.21".parse().unwrap();
+        for i in 0..19u8 {
+            t.record(other, InvalidClass::Renew, [i; 32], 1000);
+        }
+        assert_eq!(t.sizes(), (1, 19, 1));
+    }
+
+    // 安全稽核 C1：來源很多時計數表與封鎖表都有上限
+    #[test]
+    fn l7_tables_are_bounded_across_many_sources() {
+        let t = InvalidTracker::new(policy());
+        let n = MAX_TRACKED_SOURCES as u32 + 20_000;
+        for i in 0..n {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + i));
+            t.record(ip, InvalidClass::Enroll, [1; 32], i64::from(i));
+        }
+        let (sources, values, _) = t.sizes();
+        assert!(sources <= MAX_TRACKED_SOURCES, "{sources}");
+        assert!(values <= MAX_TRACKED_SOURCES, "{values}");
+        // 最近的來源還在（淘汰的是最久沒有出現的）
+        let last = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + n - 1));
+        for i in 0..19u8 {
+            t.record(last, InvalidClass::Enroll, [i + 2; 32], i64::from(n));
+        }
+        assert!(
+            t.blocked(last, InvalidClass::Enroll, i64::from(n))
+                .is_some()
+        );
+
+        // 每個來源一個無效值就封鎖：封鎖表不超過上限，最近的封鎖仍有效
+        let t = InvalidTracker::new(InvalidPolicy {
+            enroll_limit: 1,
+            ..policy()
+        });
+        for i in 0..n {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + i));
+            assert!(
+                t.record(ip, InvalidClass::Enroll, [1; 32], i64::from(i))
+                    .is_some()
+            );
+        }
+        let (sources, _, blocks) = t.sizes();
+        assert_eq!(sources, 0);
+        assert!(blocks <= MAX_TRACKED_SOURCES, "{blocks}");
+        assert!(
+            t.blocked(last, InvalidClass::Enroll, i64::from(n))
+                .is_some()
+        );
     }
 
     #[test]

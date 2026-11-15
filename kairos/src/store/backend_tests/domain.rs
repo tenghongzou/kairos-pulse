@@ -350,6 +350,159 @@ fn audit_hmac(db: &TestDb) -> String {
     out
 }
 
+/// 有 HMAC 的 6 筆紀錄（時間相隔 1 秒）；回傳驗證的斷點原因用的 closure 需要的 handle
+fn signed_audit_chain(db: &TestDb) -> crate::store::db::DbHandle {
+    let s = db.handle();
+    crate::audit::ensure_key(&db.dir).unwrap();
+    for i in 0..6 {
+        s.audit_append(T0 + i * 1000, &audit("user:ann", "user.update", None))
+            .unwrap();
+    }
+    let r = s.audit_verify().unwrap();
+    assert!(r.broken.is_none(), "{r:?}");
+    s
+}
+
+fn audit_break(s: &crate::store::db::DbHandle) -> Option<(i64, &'static str, &'static str)> {
+    let r = s.audit_verify().unwrap();
+    r.broken.map(|b| (b.id, b.reason, r.hmac.status))
+}
+
+/// 安全稽核 E1：刪掉最後幾筆、連 `meta.audit_chain_head` 一起刪掉 → 驗證指出；之後的寫入與清除不會把
+/// head「修好」
+fn audit_tail_deletion_is_detected(db: &TestDb) -> String {
+    let mut out = String::new();
+    let s = signed_audit_chain(db);
+    db.exec("DELETE FROM audit_events WHERE id > 4");
+    let b = log!(out, "tail deleted", audit_break(&s));
+    assert_eq!(b.map(|b| b.1), Some("head_mismatch"));
+    db.exec("DELETE FROM meta WHERE key = 'audit_chain_head'");
+    let b = log!(out, "tail and head deleted", audit_break(&s));
+    assert_eq!(b.map(|b| (b.1, b.2)), Some(("head_mismatch", "failed")));
+    // 之後的寫入照常簽章，但 head 不會被重新建立
+    for i in 0..2 {
+        s.audit_append(T0 + 9000 + i, &audit("user:ann", "user.update", None))
+            .unwrap();
+        let b = log!(out, "after append", audit_break(&s));
+        assert_eq!(b.map(|b| b.1), Some("head_mismatch"));
+    }
+    assert_eq!(
+        db.int("SELECT count(*) FROM audit_events WHERE hmac IS NOT NULL"),
+        6
+    );
+    assert_eq!(
+        db.int("SELECT count(*) FROM meta WHERE key = 'audit_chain_head'"),
+        0
+    );
+    log!(
+        out,
+        "purged",
+        s.audit_purge(T0 + 1500, T0 + 99_000).unwrap()
+    );
+    let b = log!(out, "after purge", audit_break(&s));
+    assert!(b.is_some());
+    out
+}
+
+/// 安全稽核 E1：刪掉最前面幾筆並改寫 `meta.audit_chain_anchor` → 驗證指出；正常的保留期限清除照常通過
+fn audit_anchor_forgery_is_detected(db: &TestDb) -> String {
+    let mut out = String::new();
+    let s = signed_audit_chain(db);
+    // 正常的清除：錨點簽進 head
+    log!(
+        out,
+        "purged",
+        s.audit_purge(T0 + 2000, T0 + 50_000).unwrap()
+    );
+    let r = s.audit_verify().unwrap();
+    assert!(r.broken.is_none(), "{r:?}");
+    s.audit_append(T0 + 60_000, &audit("user:ann", "user.update", None))
+        .unwrap();
+    assert_eq!(log!(out, "after purge and append", audit_break(&s)), None);
+    // 再刪掉兩筆，把錨點改成被刪掉的最後一筆（雜湊是公開的）
+    let h4 = s
+        .audit_export_batch(&AuditFilter::default(), 100)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == 4)
+        .and_then(|r| r.hash)
+        .unwrap();
+    db.exec("DELETE FROM audit_events WHERE id <= 4");
+    db.exec(&format!(
+        "UPDATE meta SET value = '{{\"id\":4,\"hash\":\"{h4}\",\"purged_at\":1,\"purged\":2}}' WHERE key = 'audit_chain_anchor'"
+    ));
+    let b = log!(out, "anchor forged", audit_break(&s));
+    assert_eq!(b.map(|b| (b.1, b.2)), Some(("anchor_mismatch", "failed")));
+    // 之後的寫入不會把被改寫的錨點簽進 head
+    s.audit_append(T0 + 70_000, &audit("user:ann", "user.update", None))
+        .unwrap();
+    let b = log!(out, "after append", audit_break(&s));
+    assert_eq!(b.map(|b| b.1), Some("anchor_mismatch"));
+    out
+}
+
+/// 重新錨定（`kairos audit reanchor` 的儲存層）：斷尾之後重新錨定 → 驗證從新的事件起算、之前的紀錄
+/// 不動；事件被刪除時指出；保留期限清除到它之後照常驗證
+fn audit_reanchor(db: &TestDb) -> String {
+    let mut out = String::new();
+    let s = signed_audit_chain(db);
+    db.exec("DELETE FROM audit_events WHERE id > 4");
+    db.exec("DELETE FROM meta WHERE key = 'audit_chain_head'");
+    assert!(audit_break(&s).is_some());
+    let ev = Audit {
+        category: "audit",
+        action: crate::audit::ACTION_REANCHOR,
+        ..audit("ops", "x", None)
+    };
+    let id = log!(
+        out,
+        "reanchor",
+        s.audit_reanchor(T0 + 50_000, &ev).unwrap().unwrap()
+    );
+    let r = s.audit_verify().unwrap();
+    assert!(r.broken.is_none(), "{r:?}");
+    log!(
+        out,
+        "after reanchor",
+        (
+            r.first_id,
+            r.checked,
+            r.reanchor
+                .as_ref()
+                .map(|x| (x.event_id, x.unverified, x.at, x.by.clone()))
+        )
+    );
+    assert_eq!(r.reanchor.as_ref().map(|x| x.unverified), Some(4));
+    assert_eq!(db.int("SELECT count(*) FROM audit_events WHERE id <= 4"), 4);
+    assert_eq!(
+        s.audit_reanchor_point().unwrap().map(|p| p.event_id),
+        Some(id)
+    );
+    // 指標指到的那一筆不是重新錨定的事件（被換掉）
+    db.exec(&format!(
+        "UPDATE audit_events SET action = 'user.update' WHERE id = {id}"
+    ));
+    let b = log!(out, "event replaced", audit_break(&s));
+    assert_eq!(b.map(|b| b.1), Some("reanchor_mismatch"));
+    db.exec(&format!(
+        "UPDATE audit_events SET action = 'audit.reanchor' WHERE id = {id}"
+    ));
+    assert_eq!(audit_break(&s), None);
+    s.audit_append(T0 + 60_000, &audit("user:ann", "user.update", None))
+        .unwrap();
+    assert_eq!(log!(out, "after append", audit_break(&s)), None);
+    // 保留期限清除到它之後：指標移除
+    log!(
+        out,
+        "purged",
+        s.audit_purge(T0 + 55_000, T0 + 99_000).unwrap()
+    );
+    assert_eq!(s.audit_reanchor_point().unwrap(), None);
+    let r = s.audit_verify().unwrap();
+    assert!(r.broken.is_none() && r.reanchor.is_none(), "{r:?}");
+    out
+}
+
 fn users_and_sessions(db: &TestDb) -> String {
     let mut out = String::new();
     let s = db.handle();
@@ -1418,6 +1571,9 @@ backend_tests!(
     transactions,
     audit_chain,
     audit_hmac,
+    audit_tail_deletion_is_detected,
+    audit_anchor_forgery_is_detected,
+    audit_reanchor,
     users_and_sessions,
     api_tokens,
     pki,

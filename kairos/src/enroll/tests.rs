@@ -9,9 +9,10 @@ use kairos_proto::enroll::{
     sign_ecdsa_p256_sha256, withdraw_signing_input,
 };
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PublicKeyData, SanType,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams,
+    CertificateSigningRequestParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384,
+    PublicKeyData, RevocationReason, RevokedCertParams, SanType, SerialNumber,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
+use super::limits::InvalidClass;
 use super::ops::{self, TokenInput};
 use super::{Running, StartParams};
 use crate::config::{AppConfig, PkiMode};
@@ -95,6 +97,42 @@ impl Root {
         csr.params.not_before = t(now - 3600);
         csr.params.not_after = t(now + 5 * 365 * 86_400);
         csr.signed_by(&self.issuer()).unwrap().pem()
+    }
+
+    /// 以根 CA 直接簽發的用戶端憑證（手動簽發、沒有匯入 Kairos 的簽發紀錄），DER
+    fn client_cert(&self, a: &Agent, serial: u8, not_before: i64, not_after: i64) -> Vec<u8> {
+        let mut p = CertificateParams::new(vec![a.id.clone()]).unwrap();
+        p.distinguished_name = DistinguishedName::new();
+        p.distinguished_name.push(DnType::CommonName, a.id.as_str());
+        p.serial_number = Some(SerialNumber::from_slice(&[serial]));
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        p.not_before = t(not_before);
+        p.not_after = t(not_after);
+        p.signed_by(&a.key, &self.issuer()).unwrap().der().to_vec()
+    }
+
+    /// 根 CA 的 CRL（PEM）：列出 `revoked` 的序號，`next_update` 為 Unix 秒
+    fn crl(&self, revoked: &[u8], next_update: i64) -> String {
+        let params = CertificateRevocationListParams {
+            this_update: t(next_update - 30 * 86_400),
+            next_update: t(next_update),
+            crl_number: SerialNumber::from_slice(&[1]),
+            issuing_distribution_point: None,
+            revoked_certs: revoked
+                .iter()
+                .map(|s| RevokedCertParams {
+                    serial_number: SerialNumber::from_slice(&[*s]),
+                    revocation_time: t(next_update - 30 * 86_400),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params.signed_by(&self.issuer()).unwrap();
+        crate::pki::x509::pem_encode("X509 CRL", crl.der())
     }
 }
 
@@ -860,6 +898,65 @@ async fn rate_limits_return_429_with_retry_after_and_distinct_invalid_tokens_blo
     assert_eq!(n, 1);
 }
 
+// 安全稽核 C1：輪詢與撤回有每個來源的限速（L4p），L7 封鎖中的來源不能輪詢、也不能撤回
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_and_withdraw_are_rate_limited_per_source_and_honor_blocks() {
+    let missing = "00000000-0000-4000-8000-000000000000";
+    let poll_path = format!("/v1/enroll/requests/{missing}");
+    let challenge_path = format!("/v1/enroll/requests/{missing}/withdraw/challenge");
+    let withdraw_path = format!("/v1/enroll/requests/{missing}/withdraw");
+
+    // 額度的算式：預設每秒 5 × 4 次、可連續 600 次；批次部署來源 × 10
+    assert_eq!(super::handlers::l4p_bucket(5, 1.0), (600.0, 20.0));
+    assert_eq!(super::handlers::l4p_bucket(5, 10.0), (6000.0, 200.0));
+    // 目標速率設為 0（只在測試中可能）：L4p 只剩 1 次、不補充，結果不受測試機的速度影響。
+    // 預設的 L3（新連線）遠高於這裡的請求數，429 只可能來自 L4p
+    let env = Env::new("l4p", |c| c.enroll.poll_target_per_ip_per_sec = 0).await;
+    let (s, _, v) = env.call("GET", &poll_path, None, Some("x")).await;
+    assert_eq!((s, code(&v)), (404, "request_not_found"), "{v}");
+    for _ in 0..3 {
+        let (s, headers, v) = env.call("GET", &poll_path, None, Some("x")).await;
+        assert_eq!((s, code(&v)), (429, "rate_limited"), "{v}");
+        assert_eq!(v["error"]["scope"], "ip");
+        assert!(v["error"]["retry_after_ms"].as_u64().unwrap() >= 1000);
+        assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+    }
+    // 撤回的兩個請求與輪詢共用額度
+    for path in [&challenge_path, &withdraw_path] {
+        let (s, v) = env.post(path, &json!({})).await;
+        assert_eq!((s, code(&v)), (429, "rate_limited"), "{path}：{v}");
+    }
+    // 被限速的請求不計入 L7，也沒有佔用每筆申請（L10）的表
+    assert_eq!(env.svc().limits.l7.sizes().2, 0);
+    assert_eq!(env.svc().limits.l10.len(), 0);
+
+    // L7 封鎖：新註冊類擋輪詢、續簽類擋撤回
+    let env = Env::new("l7poll", |_| {}).await;
+    let src: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let block = |ms: i64| super::limits::Block {
+        until_ms: env.now() + ms,
+        offenses: 0,
+        last_offense_ms: env.now(),
+    };
+    let svc = env.svc();
+    let l7 = &svc.limits.l7;
+    l7.restore(src, InvalidClass::Enroll, block(600_000));
+    let (s, headers, v) = env.call("GET", &poll_path, None, Some("x")).await;
+    assert_eq!((s, code(&v)), (429, "source_blocked"), "{v}");
+    assert_eq!(v["error"]["scope"], "blocked");
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+    // 續簽類沒有被封鎖：撤回照常判定
+    let (s, v) = env.post(&challenge_path, &json!({})).await;
+    assert_eq!((s, code(&v)), (404, "request_not_found"), "{v}");
+    l7.restore(src, InvalidClass::Renew, block(600_000));
+    for path in [&challenge_path, &withdraw_path] {
+        let (s, v) = env.post(path, &json!({})).await;
+        assert_eq!((s, code(&v)), (429, "source_blocked"), "{path}：{v}");
+    }
+    // 封鎖期間送來的無效值不累積
+    assert_eq!(l7.sizes().1, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mode_switching_and_auto_pause() {
     let env = Env::new("mode", |c| {
@@ -1039,6 +1136,82 @@ async fn revocation_regenerates_the_crl_and_blocks_grace_renewal() {
     };
     let (s, v) = env.post("/v1/enroll/renewals", &req).await;
     assert_eq!((s, code(&v)), (403, "certificate_revoked"), "{v}");
+}
+
+/// 安全稽核 C2：過期續簽對 `auth.client_ca` 的 CA 簽發的舊憑證檢查 `auth.crl`（與 8443 相同）——
+/// 被撤銷的換不到新憑證，無法判定撤銷狀態（CRL 過期、不是這個 CA 簽的）時也不放行
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grace_renewal_checks_auth_crl_for_externally_issued_certificates() {
+    let env = Env::new("grace-crl", |c| {
+        c.auth.crl = vec![
+            Path::new(&c.auth.client_ca)
+                .with_file_name("client.crl")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+    })
+    .await;
+    let crl_path = PathBuf::from(&env.config.auth.crl[0]);
+    let now_s = env.now() / 1000;
+    let a = agent("99999999-2222-4333-8444-555555555555");
+    // 過期 10 天（寬限期 90 天內）、沒有匯入 Kairos 的憑證；清冊中有這台主機（曾連上 8443）
+    let old = env
+        .root
+        .client_cert(&a, 0x21, now_s - 100 * 86_400, now_s - 10 * 86_400);
+    let conn = env.conn();
+    conn.execute(
+        "INSERT INTO hosts (agent_id, hostname, host_fingerprint, display_name, tags, os, online,
+            first_seen, last_seen, source, current_serial, lifecycle)
+         VALUES (?1, 'h', ?2, NULL, NULL, NULL, 0, ?3, ?3, 'enroll', NULL, 'active')",
+        rusqlite::params![a.id, a.fingerprint, env.now()],
+    )
+    .unwrap();
+    let renew = |n: i64| -> GraceRenewRequest {
+        let new = a.rekey();
+        let sent = format_rfc3339_ms(env.now() + n);
+        let input =
+            grace_renew_signing_input(&a.id, &a.fingerprint, &new.csr, &sent, &env.endpoint())
+                .unwrap();
+        GraceRenewRequest {
+            agent_id: a.id.clone(),
+            csr: b64url_encode(&new.csr),
+            poll_secret: new.poll_secret.clone(),
+            sent_at: sent,
+            host_fingerprint: a.fingerprint.clone(),
+            expired_certificate: b64url_encode(&old),
+            signature: sign_ecdsa_p256_sha256(&a.key.serialize_der(), &input).unwrap(),
+            signature_alg: SignatureAlg::EcdsaP256Sha256,
+            hostname: "h".into(),
+            pulse_version: "0.11.0".into(),
+        }
+    };
+    let issued = || -> i64 {
+        conn.query_row("SELECT count(*) FROM pki_certificates", [], |r| r.get(0))
+            .unwrap()
+    };
+    // CRL 列出這張憑證：已撤銷
+    std::fs::write(&crl_path, env.root.crl(&[0x21], now_s + 86_400)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(1)).await;
+    assert_eq!((s, code(&v)), (403, "certificate_revoked"), "{v}");
+    // CRL 已超過 nextUpdate（沒有列出這張憑證）：無法判定，不放行
+    std::fs::write(&crl_path, env.root.crl(&[], now_s - 3600)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(2)).await;
+    assert_eq!((s, code(&v)), (500, "internal"), "{v}");
+    // CRL 不是這張憑證的簽發 CA 簽的：無法判定，不放行
+    std::fs::write(&crl_path, root().crl(&[], now_s + 86_400)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(3)).await;
+    assert_eq!((s, code(&v)), (500, "internal"), "{v}");
+    // CRL 檔不見了：無法判定，不放行
+    std::fs::remove_file(&crl_path).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(4)).await;
+    assert_eq!((s, code(&v)), (500, "internal"), "{v}");
+    assert_eq!(issued(), 0, "被拒的續簽不得簽出憑證");
+    // 有效的 CRL、沒有列出這張憑證：照常續簽
+    std::fs::write(&crl_path, env.root.crl(&[0x55], now_s + 86_400)).unwrap();
+    let (s, v) = env.post("/v1/enroll/renewals", &renew(5)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["state"], "issued");
+    assert_eq!(issued(), 1);
 }
 
 /// 已退役的簽發 CA 簽出的憑證不能以過期續簽換新憑證（PKI.md 第 15.4 節）：`auth.client_ca` 直接含有那張

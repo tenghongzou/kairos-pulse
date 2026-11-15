@@ -1420,6 +1420,59 @@ fn spool_settings(buffer: &config_manager::BufferConfig) -> spool::SpoolSettings
 mod tests {
     use super::*;
 
+    // 安全稽核 N12：Ansible role 不把要以 root 安裝的套件放在大家都能寫的目錄下的固定路徑
+    // （/var/tmp/<可預測的檔名>：別的本機帳號可以先放一個同名檔，在核對雜湊之後、安裝之前換掉內容），
+    // 而是放進 mkdtemp 建立、只有 root 能進入的暫存目錄，並確認它的擁有者與權限
+    #[test]
+    fn ansible_role_installs_the_package_from_a_private_temporary_directory() {
+        let tasks = include_str!("../../packaging/ansible/roles/pulse/tasks/main.yml");
+        // 註解以外的每一行：不得把檔案寫到或讀自 /tmp、/var/tmp 之下的固定路徑
+        let code: Vec<&str> = tasks
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        for l in &code {
+            assert!(
+                !l.contains("/var/tmp/") && !l.contains("/tmp/"),
+                "不得使用大家都能寫的目錄下的固定路徑：{l}"
+            );
+        }
+        let value = |key: &str| -> Vec<&str> {
+            code.iter()
+                .filter_map(|l| l.trim().strip_prefix(key))
+                .map(|v| v.trim().trim_matches('"'))
+                .collect()
+        };
+        // 套件的目的地、核對與安裝的來源都在 tempfile 建立的目錄下
+        assert!(tasks.contains("ansible.builtin.tempfile:"));
+        assert!(code.iter().any(|l| l.trim() == "state: directory"));
+        let in_private_dir = |v: &&str| v.starts_with("{{ pulse_pkg_tmp.path }}/");
+        assert_eq!(value("dest:").len(), 1);
+        assert!(value("dest:").iter().all(in_private_dir));
+        assert_eq!(value("deb:").len(), 1);
+        assert!(value("deb:").iter().all(in_private_dir));
+        let rpm: Vec<&str> = value("name:")
+            .into_iter()
+            .filter(|v| v.contains("pulse_pkg_file"))
+            .collect();
+        assert_eq!(rpm.len(), 1);
+        assert!(rpm.iter().all(in_private_dir));
+        // 目錄必須是 root 擁有、0700，不是符號連結；套件檔屬於 root
+        for needed in [
+            "pulse_pkg_tmp_stat.stat.uid == 0",
+            "pulse_pkg_tmp_stat.stat.mode == '0700'",
+            "not pulse_pkg_tmp_stat.stat.islnk",
+            "owner: root",
+        ] {
+            assert!(code.iter().any(|l| l.contains(needed)), "缺少：{needed}");
+        }
+        // 用完移除（成功或失敗都會）
+        let always = tasks
+            .find("\n  always:")
+            .expect("暫存目錄要在 always 中移除");
+        assert!(tasks[always..].contains("state: absent"));
+    }
+
     #[test]
     fn unit_does_not_restart_when_retrying_cannot_help() {
         // pulse.service 的 RestartPreventExitStatus 必須恰好是用法、設定、憑證錯誤（2、3、4）；

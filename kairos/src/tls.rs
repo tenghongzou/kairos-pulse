@@ -247,6 +247,106 @@ fn load_crls(
     Ok(all)
 }
 
+/// [`expired_cert_crl_verdict`] 的結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrlVerdict {
+    /// 涵蓋簽發者的 CRL 沒有列出這張憑證，CRL 也還沒超過 nextUpdate
+    Good,
+    Revoked,
+    /// 無法判定（CRL 讀不到、已超過 nextUpdate、沒有涵蓋簽發者…）：與 8443 相同，視為失敗
+    Unknown(String),
+}
+
+/// 以 `auth.client_ca` 與 `auth.crl` 判定一張**已過期**的用戶端憑證的撤銷狀態（8444 的過期續簽）。
+///
+/// 8443 對出示的憑證以 `auth.crl` 檢查撤銷；過期續簽出示的憑證已經過期、不會經過 8443 的驗證器，
+/// 所以在這裡以同一組檔案、同樣的規則（整條鏈、無法判定視為失敗、CRL 的 nextUpdate 以現在的時間判定）
+/// 再檢查一次。憑證鏈以憑證有效期間內的時間點驗證（過期本身由呼叫端依寬限期處理）
+pub fn expired_cert_crl_verdict(
+    cert_der: &[u8],
+    ca_path: &str,
+    crl_paths: &[String],
+    now: DateTime<Utc>,
+) -> CrlVerdict {
+    use CrlVerdict::Unknown;
+    let info = match crate::pki::x509::parse_cert(cert_der) {
+        Ok(i) => i,
+        Err(e) => return Unknown(e),
+    };
+    let cas = match load_certs(ca_path, "CA 憑證") {
+        Ok(c) => c,
+        Err(e) => return Unknown(e.to_string()),
+    };
+    let crls = match load_crls(crl_paths) {
+        Ok(c) => c,
+        Err(e) => return Unknown(e.to_string()),
+    };
+    let anchors: Vec<_> = cas
+        .iter()
+        .filter_map(|c| webpki::anchor_from_trusted_cert(c).ok())
+        .collect();
+    let mut parsed = Vec::with_capacity(crls.len());
+    for (path, _, crl) in &crls {
+        match webpki::OwnedCertRevocationList::from_der(crl.as_ref()) {
+            Ok(c) => parsed.push(webpki::CertRevocationList::from(c)),
+            Err(e) => return Unknown(format!("{path} 中的 CRL 格式錯誤: {e:?}")),
+        }
+    }
+    let refs: Vec<&webpki::CertRevocationList<'_>> = parsed.iter().collect();
+    let Ok(builder) = webpki::RevocationOptionsBuilder::new(&refs) else {
+        return Unknown("auth.crl 沒有任何 CRL".to_string());
+    };
+    let revocation = builder
+        .with_depth(webpki::RevocationCheckDepth::Chain)
+        .with_status_policy(webpki::UnknownStatusPolicy::Deny)
+        .with_expiration_policy(webpki::ExpirationPolicy::Ignore)
+        .build();
+    let der = CertificateDer::from(cert_der);
+    let ee = match webpki::EndEntityCert::try_from(&der) {
+        Ok(c) => c,
+        Err(e) => return Unknown(format!("憑證無法解析: {e:?}")),
+    };
+    let at_ms = (info.not_after_ms - 1000).max(info.not_before_ms).max(0);
+    let at = UnixTime::since_unix_epoch(std::time::Duration::from_millis(at_ms as u64));
+    let algs = tokio_rustls::rustls::crypto::ring::default_provider()
+        .signature_verification_algorithms
+        .all;
+    match ee.verify_for_usage(
+        algs,
+        &anchors,
+        &[],
+        at,
+        webpki::KeyUsage::client_auth(),
+        Some(revocation),
+        None,
+    ) {
+        Ok(_) => {}
+        Err(webpki::Error::CertRevoked) => return CrlVerdict::Revoked,
+        Err(webpki::Error::UnknownRevocationStatus) => {
+            return Unknown("auth.crl 沒有涵蓋這張憑證的簽發者".to_string());
+        }
+        Err(e) => {
+            return Unknown(format!(
+                "憑證鏈無法以 auth.client_ca 與 auth.crl 驗證: {e:?}"
+            ));
+        }
+    }
+    // 涵蓋簽發者的 CRL 已超過 nextUpdate：之後的撤銷可能不在裡面
+    for (path, _, crl) in &crls {
+        let Ok((_, list)) = x509_parser::parse_x509_crl(crl.as_ref()) else {
+            continue;
+        };
+        if list.issuer().as_raw() != info.issuer_raw.as_slice() {
+            continue;
+        }
+        return match expiry::crl_next_update(crl.as_ref()) {
+            Some(next) if next < now => Unknown(format!("{path} 已超過 nextUpdate（{next}）")),
+            _ => CrlVerdict::Good,
+        };
+    }
+    CrlVerdict::Good
+}
+
 /// Kairos 簽發 CA 的信任錨（DER）與它們的 CRL
 type Issuing = (
     Vec<CertificateDer<'static>>,

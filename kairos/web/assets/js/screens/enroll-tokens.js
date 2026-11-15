@@ -210,9 +210,12 @@ function showCreated(data, onCreated) {
   // 下載端點可用時（enroll.download_dir；API 的 downloads.base_url）另顯示一行安裝指令
   const dlBase = data.downloads && data.downloads.available ? data.downloads.base_url : null;
   const downloadsIncomplete = Boolean(data.downloads && !data.downloads.available && data.downloads.product_code === 'KRS-W2012');
+  // 指令帶著安裝腳本的 SHA-256（downloads.install_script_sha256），下載後先比對、相符才以 root 執行：
+  // 驗證套件簽章的邏輯在腳本裡，腳本本身要靠這個雜湊。沒有雜湊（格式不對）時不顯示一行指令
+  const scriptSha = data.downloads && /^[0-9a-f]{64}$/.test(data.downloads.install_script_sha256 || '') ? data.downloads.install_script_sha256 : null;
   const oneLiner =
-    install && dlBase
-      ? `curl -fsSLO --cacert kairos-ca.pem ${dlBase}/pulse-install.sh && sudo PULSE_INSTALL_STRING='${install}' sh pulse-install.sh --base-url ${dlBase} --ca-file kairos-ca.pem --allowed-signers /etc/kairos-pulse/allowed_signers`
+    install && dlBase && scriptSha
+      ? `curl -fsSLO --cacert kairos-ca.pem ${dlBase}/pulse-install.sh && echo '${scriptSha}  pulse-install.sh' | sha256sum -c - && sudo PULSE_INSTALL_STRING='${install}' sh pulse-install.sh --base-url ${dlBase} --ca-file kairos-ca.pem --allowed-signers /etc/kairos-pulse/allowed_signers`
       : '';
   const body = h(
     'div',
@@ -245,7 +248,7 @@ function showCreated(data, onCreated) {
       : null,
     // 設定了下載目錄但缺檔（KRS-W2012）：只對管理員（enroll.mode:write，S21 註冊端點的設定）顯示；維運者只看到 pulse enroll
     !oneLiner && downloadsIncomplete && session.can('enroll.mode:write')
-      ? inlineAlert({ kind: 'warning', title: t('token.done.downloadsIncomplete'), body: t('token.done.downloadsIncompleteBody'), code: 'KRS-W2012' })
+      ? inlineAlert({ kind: 'warning', title: t('token.done.downloadsIncomplete'), body: data.downloads.reason || t('token.done.downloadsIncompleteBody'), code: 'KRS-W2012' })
       : null,
     install
       ? h(

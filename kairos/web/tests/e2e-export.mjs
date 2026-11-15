@@ -165,6 +165,27 @@ export function registerExport({ test, newPage, login, waitTitle, axe, shot, URL
       await axe(page, 'F7 指標轉出：OTLP 已啟用');
       await card.getByRole('heading', { name: /OTLP 推送/ }).scrollIntoViewIfNeeded();
       await shot(page, 'f7-export-otlp');
+      // 安全稽核 E2：只改端點、沿用原本的標頭 → 欄位錯誤，不開確認對話框；改回原值後照常
+      const ep = card.getByLabel('OTLP/HTTP 端點');
+      const savedEp = await ep.inputValue();
+      await ep.fill('http://127.0.0.1:9/v1/metrics');
+      await save.click();
+      await card.getByText('端點改變時不能沿用原本的標頭', { exact: false }).waitFor();
+      assert.equal(await page.getByRole('dialog').count(), 0, '不應送出只改端點的變更');
+      await axe(page, 'F7 指標轉出：端點改變需更換標頭');
+      // 伺服器端同樣拒絕（不靠前端的檢查）
+      const rejected = await page.evaluate(async () => {
+        const me = await (await fetch('/api/v1/me')).json();
+        const r = await fetch('/api/v1/export/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': me.data.csrf_token },
+          body: JSON.stringify({ otlp: { endpoint: 'http://127.0.0.1:9/v1/metrics' } }),
+        });
+        return { status: r.status, body: await r.json() };
+      });
+      assert.equal(rejected.status, 400, JSON.stringify(rejected.body));
+      assert.equal(rejected.body.error.code, 'export_secret_required');
+      await ep.fill(savedEp);
       // 停用（改用設定檔的值：內建預設為停用）
       await card.getByRole('button', { name: '改用設定檔的值：export.otlp.enabled' }).click();
       await dlg.getByText('export.otlp.enabled：改用設定檔的值').waitFor();

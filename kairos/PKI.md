@@ -362,7 +362,7 @@ revoke_superseded = true           # 新憑證第一次 hello 後以 superseded 
    - **維持離線**：`pki.mode = "offline"`，註冊與核准在線上完成，簽發用第 6 節的匯出／匯入（代理 CA 私鑰不離開管理主機）。
    - **改為線上**：`kairos pki issuing-ca new` → 在管理主機以**代理 CA** 簽發（代理 CA 在此扮演根 CA）→ `install`、`activate`；`pki.mode = "online"`。舊的手動憑證繼續有效（代理 CA 仍在 `auth.client_ca`），到期前由 8443 的 `renew` 換成線上簽發的憑證。
 4. 設定 `[enroll]`（`mode = "open"` 或 `renew_only`），開放 8444 的防火牆。
-5. 手動簽發的既有憑證可以 `kairos pki certificates import <檔案或目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；0.9.0 起，第 16 節）；不匯入也能連線。
+5. 手動簽發的既有憑證可以 `kairos pki certificates import <檔案或目錄>` 匯入簽發紀錄（S14 的清冊與撤銷才看得到它們；0.9.0 起，第 16 節）；不匯入也能連線。**沒有匯入的憑證只能以外部 CA 的 CRL（`auth.crl`）撤銷**：8443 與 8444 的過期續簽都以 `auth.crl` 判定（第 13 節第 4 項）。建議匯入——匯入後過期續簽才能判斷哪一張是「最新的憑證」，被取代的舊憑證（例如金鑰外洩後手動重發）才換不到新憑證。
 
 ## 10. 簽發流程（Kairos 內部）
 
@@ -432,7 +432,7 @@ KP_BENCH_BATCH=1 cargo test -p kairos --release -- --ignored --nocapture enroll_
 | 1 | `enroll_requests` | 另有 `cert_lifetime_days`、`issue_error`；索引另有 `(source_ip, state)`、`(source_ip, created_at)`；`hosts` 另有 `decommissioned_by` 與 `hostname` 索引 |
 | 2 | 信任錨與 CRL 的檔案 | `data/pki/issuing-cas.pem`、`data/pki/crl/issuing.crl`（各簽發 CA 的 CRL 合在一個 PEM），不是每個 CA 一個檔案 |
 | 3 | 第一個簽發 CA | `issuing-ca install` 在沒有啟用中的簽發 CA 時自動啟用（之後的 CA 需 `activate`） |
-| 4 | 過期續簽的身分 | `expired_certificate` 必須由信任錨（簽發 CA 或 `auth.client_ca` 中的 CA）**直接**簽發（Pulse 只送出用戶端憑證，不送中繼憑證）；清冊沒有最新序號（手動簽發、未匯入）的主機只檢查沒有撤銷紀錄 |
+| 4 | 過期續簽的身分 | `expired_certificate` 必須由信任錨（簽發 CA 或 `auth.client_ca` 中的 CA）**直接**簽發（Pulse 只送出用戶端憑證，不送中繼憑證）；清冊沒有最新序號（手動簽發、未匯入）的主機只檢查沒有撤銷紀錄。**撤銷的來源與 8443 相同**：Kairos 簽發 CA 簽出的憑證看資料庫的撤銷紀錄（就是 Kairos 產生的 CRL 的內容）；`auth.client_ca` 的 CA 簽出的憑證另以 `auth.crl` 檢查（有設定 `auth.crl` 時；整條鏈、CRL 的 `nextUpdate` 以現在的時間判定，憑證鏈以憑證有效期間內的時間點驗證）——被 `auth.crl` 撤銷的憑證回 403 `certificate_revoked`；無法判定（CRL 讀不到、已超過 `nextUpdate`、沒有涵蓋簽發者、憑證本身通不過 8443 的鏈驗證）時與 8443 一樣不放行，回 500 `internal` 並記一行警告，Pulse 依退避重試、`auth.crl` 更新後自行恢復。0.11.0（含）以前的過期續簽不看 `auth.crl`：只以外部 CRL 撤銷、沒有匯入也沒有在 Kairos 撤銷的憑證，過期後在寬限期內仍可換到新憑證 |
 | 5 | 過期續簽的「最後嘗試」 | `hosts.last_grace_attempt` 只在通過身分驗證後寫入（時鐘被拒的請求尚未驗證身分，不寫入清冊，避免任何人替別台主機寫入資料） |
 | 6 | 授權節點數 | 本版沒有授權機制：`license_exhausted` 不會出現，`EnrollLicenseOverflow` 保留 |
 | 7 | keep-alive 閒置 | hyper 的標頭讀取計時涵蓋閒置，實際閒置上限為 `min(header_timeout_secs, idle_timeout_secs)`（預設 10 秒） |
@@ -552,5 +552,6 @@ kairos pki certificates import host-07.pem --agent-id 6f1c0e4a-1b2c-4d3e-9f00-11
 - 只提供目錄中的一般檔案：檔名白名單沿用 `parse_route`（英數字與 `. _ -`、不以 `.` 開頭，沒有 `/`、`..`、百分比編碼），不跟隨符號連結、不進入子目錄，大小上限 1 GiB；不符合的一律 404。
 - 內容類型依副檔名（`.sh`、`.deb`、`.rpm`、`.msi`、`.zip`、`.tar.gz`、`SHA256SUMS`、`.sig`…），`X-Content-Type-Options: nosniff`、`Content-Disposition: attachment`；`SHA256SUMS`、`SHA256SUMS.sig`、`pulse-install.sh` 為 `Cache-Control: no-cache`，其他 `public, max-age=3600`；`ETag`、`Last-Modified`，`If-None-Match` 相符時 304；`HEAD` 只回標頭；以串流送出。
 - L11：每個來源同時 `enroll.max_downloads_per_ip`（批次部署來源乘以倍率）、全部 `enroll.max_downloads` 個，超過 429（`scope: download`，`Retry-After: 15`）。註冊端點為僅續簽或自動暫停時 403。
-- **完整性不依賴 Kairos**：`pulse-install.sh` 以另外取得的發佈公鑰驗證 `SHA256SUMS.sig`，再以 `SHA256SUMS` 驗證套件。8444 的伺服器憑證由 Kairos 的根 CA 簽發，安裝腳本以 `--ca-file <根 CA>` 驗證 HTTPS（`pulse/packaging/INSTALL.md`）。
-- 主控台 API 的 `downloads.available` 在目錄有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 時為 `true`，S12 據此顯示一行安裝指令；設定了目錄但不完整時啟動記`KRS-W2012`。
+- **套件的完整性不依賴 Kairos；安裝腳本本身依賴主控台與下載目錄**：`pulse-install.sh` 以另外取得的發佈公鑰驗證 `SHA256SUMS.sig`，再以 `SHA256SUMS` 驗證套件，所以被改過的套件裝不上去。但這些驗證就寫在腳本裡，而腳本是從 8444 下載、以 root 執行的——腳本本身不在發佈公鑰的保護之內。因此主控台的一行安裝指令帶著腳本的 SHA-256（API 的 `downloads.install_script_sha256`，由 Kairos 從下載目錄的檔案算出），下載後先 `sha256sum -c`、相符才執行：目標主機執行的就是管理者在主控台看到指令那一刻的腳本。這把對腳本的信任放在兩處：主控台（指令經主控台的 HTTPS 取得；Kairos 被完全入侵時攻擊者本來就能改主控台顯示的指令）與下載目錄的內容。0.11.0（含）以前的指令不比對腳本，本節先前「完整性不依賴 Kairos」的說法對腳本本身不成立。8444 的伺服器憑證由 Kairos 的根 CA 簽發，安裝腳本以 `--ca-file <根 CA>` 驗證 HTTPS（`pulse/packaging/INSTALL.md`）。
+- **下載目錄的權限**：`enroll.download_dir` 與其中的檔案應該由管理者（例如 root）擁有、只有管理者可寫，Kairos 的服務帳號只需要讀取與進入目錄（例如目錄 `root:kairos 750`、檔案 `640`）。能寫這個目錄的帳號可以換掉之後建立的 token 所顯示的指令要執行的腳本。Kairos 不檢查這個目錄的擁有者與權限。要在目標主機上不依賴 Kairos 驗證腳本，可以用發佈公鑰先驗證 `SHA256SUMS`、再比對腳本（`pulse/packaging/INSTALL.md` 第 A.1 節）。
+- 主控台 API 的 `downloads.available` 在目錄有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`，且 `pulse-install.sh` 是一般檔案、與同目錄 `SHA256SUMS` 記錄的雜湊相符（`SHA256SUMS` 沒有列出它時不比對）時為 `true`，S12 據此顯示一行安裝指令；設定了目錄但不完整或不相符時啟動記`KRS-W2012`，`downloads.reason` 說明原因。

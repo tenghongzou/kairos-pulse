@@ -1177,7 +1177,7 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
 
 - JSON 為 serde_json 的精簡格式（沒有空白，非 ASCII 原樣以 UTF-8 輸出），`details` 是資料庫中保存的**字串本身**（匯出的 `details_raw`），沒有值時為 `null`；`at` 為 Unix 毫秒（匯出的 `at_ms`）；雜湊為小寫十六進位。第一筆的 `prev_hash` 為 64 個 `0`。
 - 寫入一律經由 `audit::append`：先 INSERT 取得寫入鎖再計算，Kairos、主控台與 CLI 同時寫入也不會分岔；與被記錄的變更在**同一個交易**中（例如建立使用者與它的稽核要嘛都寫入、要嘛都沒有）。
-- 保留期限（`audit.retention_days`，預設 1,095 天＝3 年，獨立於 report 的保留天數）每小時清除最舊的一段，被清除的最後一筆的雜湊記在 `meta.audit_chain_anchor`，剩下的第一筆必須接在它之後；最新一筆記在 `meta.audit_chain_head`，只刪除最後幾筆也會被發現。
+- 保留期限（`audit.retention_days`，預設 1,095 天＝3 年，獨立於 report 的保留天數）每小時清除最舊的一段，被清除的最後一筆的雜湊記在 `meta.audit_chain_anchor`，剩下的第一筆必須接在它之後；最新一筆記在 `meta.audit_chain_head`，只刪除最後幾筆也會被發現（這兩個指標要到有 HMAC 之後才有保護，見下方「head 與錨點的保護」）。
 - 0.5 寫入的紀錄（沒有雜湊）在升級後**第一次**寫入或驗證時依 id 順序補上，並記在 `meta.audit_legacy_sealed`；之後每次寫入只計算它自己那一筆。繞過程式直接插入資料庫、沒有雜湊的紀錄不會被下一次寫入接進鏈中，驗證時以 `missing_hash` 指出。
 - 驗證在同一個讀取交易（同一個快照）中進行，驗證期間的寫入不會造成假的斷點。
 - 被拒絕的寫入請求（`access.denied`）同一個執行者每分鐘最多記 20 筆，超過的筆數併入下一筆的 `details.suppressed_since_last`（避免低權限的身分以大量請求灌爆稽核表）。
@@ -1186,14 +1186,28 @@ hash = SHA-256( prev_hash ‖ "\n" ‖ JSON([id, at, actor, actor_ip, category, 
   - 新的斷點原因：`missing_hmac`（起點之後沒有 HMAC）、`hmac_mismatch`（紀錄或雜湊被重新計算）、`hmac_boundary_mismatch`（起點被移動）、`hmac_key_unavailable`（金鑰檔遺失或無法讀取）、`hmac_key_mismatch`（金鑰檔與起點記錄的 `key_id` 不同；不會以新的金鑰「接續」簽下去）。都是 `KRS-E6201`。
   - **外送鏈尾**：每 `audit.anchor_log_minutes` 分鐘（預設 60，0 不寫）寫一行固定事件 `audit.chain_anchor`（`KRS-I6202`，INFO；`fields`：`last_id`、`last_hash`、`last_hmac`、`hmac_since`）。以 syslog 或日誌收集器送到其他主機後就是資料庫之外的副本；比對時取外送的某一行，確認資料庫中同一個 `last_id` 的 `hash` 相同，且之後的紀錄能從它接上。
   - **自我驗證**：每 `audit.verify_interval_hours` 小時（預設 24，第一次在啟動後 1 分鐘）重新計算整條鏈與 HMAC，寫一筆 `audit.verify`（執行者 `system`，`details.via = "self_check"`），並發布內部事件；失敗時記 `ERROR`（`audit.chain_broken`）且告警引擎開系統規則「稽核日誌完整性」（`sys.audit_integrity`，緊急，`KRS-E6201`），下一次驗證通過時恢復。
-  - **列表的 `meta.integrity`**（0.8；`audit:read` 的第一頁，只看自己操作的身分為 `null`）：`hmac_since_id`（目前的 HMAC 起點，尚未開始為 `null`）與 `last_verify`（最近一筆 `audit.verify`：`at`、`actor`、`result`、`self_check`、`checked`、`broken`、`hmac_since_id`），主控台 S18 頁首「完整性：✓ 已驗證至 …（雜湊鏈連續；HMAC 自第 N 筆起）」的來源。`audit.verify` 的 `details` 0.8 起另帶 `hmac`（狀態）與 `hmac_since_id`。
-  - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；重播先前抄下的 head 也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
+  - **列表的 `meta.integrity`**（0.8；`audit:read` 的第一頁，只看自己操作的身分為 `null`）：`hmac_since_id`（目前的 HMAC 起點，尚未開始為 `null`）、`reanchor`（0.11.0 之後的版本；重新錨定過、而且未驗證的區段還在時：`event_id`、`at`、`by`、`reason`〔取自那一筆事件的 `details.reason`〕、`unverified`〔取自最近一次驗證；還沒有驗證過為 `null`〕、`alert_until`〔「稽核日誌完整性」告警因為重新錨定而保持開啟到什麼時候〕；否則 `null`。主控台 S18 據此顯示說明並在清單標出那一筆與它之前的列；主控台沒有執行重新錨定的入口）與 `last_verify`（最近一筆 `audit.verify`：`at`、`actor`、`result`、`self_check`、`checked`、`broken`、`hmac_since_id`），主控台 S18 頁首「完整性：✓ 已驗證至 …（雜湊鏈連續；HMAC 自第 N 筆起）」的來源。`audit.verify` 的 `details` 0.8 起另帶 `hmac`（狀態）與 `hmac_since_id`。
+  - **head 與錨點的保護**（0.11.0 之後的版本；不需要 schema 變更）：0.7～0.11.0 的 `meta.audit_chain_head` 的 `mac` 只涵蓋鏈尾，驗證也不要求 head 存在；`meta.audit_chain_anchor` 沒有任何保護。能改寫資料庫但沒有 HMAC 金鑰的人因此可以刪掉最後幾筆並把 head 一起刪掉，或刪掉最前面幾筆並改寫錨點，驗證都回報完整。現在：
+    - head 改為第 2 版：`{"v":2,"tail_id","tail_hash","anchor_id","anchor_hash","mac"}`，`mac = HMAC-SHA256(K, "kairos-audit-head/v2\n" ‖ tail_id ‖ "\n" ‖ tail_hash ‖ "\n" ‖ (anchor_id ‖ "\n" ‖ anchor_hash，沒有清除過時為 "-"))`。有金鑰的每一次寫入與保留期限清除都重寫它；全部清除時鏈尾就是錨點。
+    - 驗證：HMAC 開始之後 head **必須存在**（不存在＝`head_mismatch`）；鏈尾、head 內的錨點與 `meta.audit_chain_anchor` 三者必須一致（錨點不一致＝`anchor_mismatch`），`mac` 必須正確。
+    - 寫入端不「修復」：寫入或清除之前 head 與鏈尾、錨點不一致（或 `mac` 不對）時，這一筆照常寫入並簽章，但 head 保留原狀——否則刪尾或改寫錨點之後，只要 Kairos 再寫一筆，痕跡就消失。所以一旦出現 `head_mismatch`／`anchor_mismatch`，之後每一次驗證都會指出，直到從備份還原或重新錨定（下方）。
+    - **升級與相容**：升級前寫的第 1 版 head（`{"id","hash","mac"}`）照常接受，升級後第一次寫入時換成第 2 版；在那之前錨點仍沒有保護。第 2 版用了不同的欄位名稱，0.11.0（含）以前的程式讀不到 `id`／`hash`、會略過 head 的檢查（不會誤報，但也沒有刪尾的偵測）。這個變更與同一版的 schema 升級一起發佈，舊版的程式無法開啟升級後的資料庫，所以舊版程式不會再碰到第 2 版的 head（舊版的保留期限清除只改錨點、不更新 head，若能與新版交替執行會造成 `anchor_mismatch`——schema 的版本檢查排除了這種情況）；要降版請從備份還原。
+  - **重新錨定**（`kairos audit reanchor`；0.11.0 之後的版本，不需要 schema 變更）：斷點不會自己消失（上一點的「不修復」），之後的紀錄也就一直得不到「完整」的結論。管理者保全證據之後，可以把鏈重新錨定到現況：
+    - **只有本機 CLI**，沒有 API 或主控台入口；以資料目錄的擁有者執行（以 root 執行而資料目錄屬於服務帳號時拒絕，與其他寫入資料庫的 CLI 相同）。L3：不帶 `--confirm` 時只印出目前的驗證結果（斷在哪一筆、原因、共幾筆）與將要做的事，結束代碼 9，不改任何東西；執行需要 `--reason <原因>`（最多 500 個字元）與 `--confirm "重新錨定稽核鏈"`。鏈完整時不做任何事（結束代碼 0）。
+    - **需要 HMAC 金鑰**（資料目錄的 `audit-hmac.key`）：只能改寫資料庫的人不能用它把被動過的鏈洗白。斷點原因是 `hmac_key_unavailable` 時拒絕。金鑰換過（`hmac_key_mismatch`）時可以執行，HMAC 的起點（`meta.audit_hmac`）改從重新錨定的那一筆、以目前的金鑰起算。
+    - **做的事**（一個寫入交易）：寫入一筆 `audit.reanchor` 事件（類別 `audit`，執行者為作業系統帳號，`code` 為 `KRS-E6201`，`details`：`reason`、`before`〔重新錨定前完整的驗證結果〕、`head`／`anchor`〔當時 `meta` 中的鏈尾與錨點指標原值〕、`rows`、`last_id`），接在目前最後一筆之後、以 HMAC 簽章；把 head 重寫成這一筆；記下指標 `meta.audit_reanchor`＝`{"v":1,"event_id","event_hash","at","by","mac"}`，`mac = HMAC-SHA256(K, "kairos-audit-reanchor/v1\n" ‖ event_id ‖ "\n" ‖ event_hash ‖ "\n" ‖ at ‖ "\n" ‖ by)`。**不刪除、不修改任何既有的紀錄。**
+    - **之後的驗證**從這一筆事件起算：`first_id`、`checked` 與 HMAC 的筆數只算它與之後的紀錄；它之前的紀錄只計數，結果多一個 `reanchor` 物件（`event_id`、`at`、`by`、`unverified`＝之前的筆數）——這一段是「重新錨定之前、完整性未驗證」，清單與匯出照常看得到。重新錨定之後的刪除與竄改照常被發現。
+    - **重新錨定本身不能被抹除**：事件被刪除、被換成別的紀錄、或指標的 `mac` 不對（被改寫、被往後移）→ `reanchor_mismatch`；事件的內容被修改 → `hash_mismatch`／`hmac_mismatch`；指標被刪除 → 驗證回到原本的斷點。重播更早的指標屬於上面「重播」的限制。
+    - **看得到**：自我驗證在重新錨定後的 24 小時內把「稽核日誌完整性」（`sys.audit_integrity`，不可靜音）保持在不通過，原因 `reanchored`、`id` 為事件的 id，並記 ERROR `audit.reanchored`（`KRS-E6201`，隨日誌外送）；執行中的 Kairos 每分鐘檢查一次指標，有新的重新錨定就立刻驗證並發布。24 小時後恢復。`audit.verify` 的 `details` 多 `reanchor`。
+    - **保留期限**：清除到這一筆事件之後，未驗證的區段已不存在，指標一併移除，驗證回到一般的樣子。
+    - **叢集**：在任一個有金鑰檔的節點執行一次；寫入與其他稽核寫入者以同一把鎖序列化（PostgreSQL 的 advisory lock、SQLite 的寫入鎖），不需要停止其他節點。告警由主動節點的自我驗證開啟。
+  - **仍然的限制**：同時能改寫資料庫並刪除 `meta.audit_hmac` 與所有 `hmac` 的人，可以把鏈「降級」成 0.7 之前的樣子；把整個資料庫的稽核部分（紀錄、head、錨點）一起換回先前抄下的一份——也就是重播——也無法由資料庫本身發現。兩者都由外送的鏈尾雜湊在外部發現。
 
 | 方法與路徑 | 權限 | 說明 |
 |---|---|---|
 | `GET /api/v1/audit` | `audit:read`；只有 `audit:read_own` 時固定為自己的操作（`meta.own_only: true`） | `actor`、`category`、`action`（完全相同，或以 `.` 結尾為前綴：`user.`）、`target`（對象片段，不分大小寫）、`result`、`from`／`to`（RFC 3339）、`limit`（1～1000，預設 100）、`cursor`（新到舊，`page.next_cursor`）。每筆含 `prev_hash`、`hash` |
 | `GET /api/v1/audit/export` | `audit:export` | 同樣的篩選，`application/x-ndjson`：每行一筆（`type: "event"`，另有 `at_ms`、`details_raw`，可只靠該行重新計算雜湊；0.7 另有 `hmac`），最後一行 `type: "chain"`（`count`、`first_id`、`first_prev_hash`、`last_id`、`last_hash`；CLI 的匯出另有 `hmac_since`）。只以時間篩選時是連續的一段鏈，可整段驗證 |
-| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈與 HMAC：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch`／`head_mismatch` 最後幾筆被刪除／0.7 的 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`；`product_code: KRS-E6201`）、`hmac`（`status`：`not_started`／`verified`／`key_unavailable`／`key_mismatch`／`failed`，`since_id`、`key_id`、`verified`、`chain_only`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
+| `POST /api/v1/audit/verify` | `audit:read` | 重新計算整條鏈與 HMAC：`ok`、`checked`、`first_id`、`last_id`、`last_hash`、`broken`（第一個斷點的 `id`、`reason`：`hash_mismatch` 內容被修改／`prev_mismatch` 前一筆被刪除或順序被改／`missing_hash`／`anchor_mismatch` 最前面幾筆被刪除、或錨點被改寫／`head_mismatch` 最後幾筆被刪除、或 head 被刪除或改寫／0.7 的 `missing_hmac`、`hmac_mismatch`、`hmac_boundary_mismatch`、`hmac_key_unavailable`、`hmac_key_mismatch`／`reanchor_mismatch` 重新錨定的事件被刪除或指標被改寫；`product_code: KRS-E6201`）、`reanchor`（重新錨定過時：`event_id`、`at`、`by`、`unverified`；否則 `null`）、`hmac`（`status`：`not_started`／`verified`／`key_unavailable`／`key_mismatch`／`failed`，`since_id`、`key_id`、`verified`、`chain_only`）。斷裂時 Kairos 記 `ERROR`「錯誤 KRS-E6201：…」 |
 
 沒有修改或刪除的端點（`PUT`／`DELETE` 回 405）；CLI 也沒有。
 
@@ -1372,7 +1386,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 | `webhook` | `format`（`kairos`／`slack`／`teams`／`line`）、`method`（`POST`／`PUT`）、`allow_http`、`line_to` | `url`、`headers`（物件）、`hmac_secret`、`line_token` |
 | 共用 | `timeout_secs`（1～60，預設 10）、`timezone`、`show_ip`（`full`／`subnet`／`none`）、`min_severity`、`notify_ack`、`ca_file` | |
 
-回應的 `secrets` 只有遮蔽值（`url` 為 `https://主機/…`，其餘 `••••`）。`PUT` 時沒有提供的機密欄位沿用原本的值、值為 `null` 時刪除。列表與詳情另有 `state`（`ok`／`failed`／`secrets_unavailable`／`disabled`；`secrets_unavailable`〔0.7〕：機密無法解開——資料目錄的 `alerts-secrets.key` 遺失或與資料庫不成對——`last_error_code` 為 `KRS-E5110`，不會嘗試發送，「通知管道失敗」系統規則以 `KRS-E5110` 開事件；還原金鑰檔並重新啟動，或重新輸入全部機密後恢復）、`consecutive_failures`、`failed_since`、`last_attempt_at`、`last_success_at`、`last_error_code`、`last_error`（已移除機密）、`rules_using`；詳情另有 `rules[]` 與最近 20 筆 `deliveries`。
+回應的 `secrets` 只有遮蔽值（`url` 為 `https://主機/…`，其餘 `••••`）。`PUT` 時沒有提供的機密欄位沿用原本的值、值為 `null` 時刪除；**目的地改變時**（SMTP 的 `host`／`port`／`security`、Webhook 實際送出的網址或 LINE 格式的切換、`ca_file`）會被送到目的地的機密（`password`、`headers`、`line_token`）不能沿用，必須在同一次請求重新提供或以 `null` 清除，否則 `400 channel_secret_required`（`details.parameter`：`secrets.<欄位>`，`details.reason`：`destination_changed`；`kairos/ALERTS.md` 第 6 節「目的地改變時機密不沿用」，0.11.0 之後的版本）。列表與詳情另有 `state`（`ok`／`failed`／`secrets_unavailable`／`disabled`；`secrets_unavailable`〔0.7〕：機密無法解開——資料目錄的 `alerts-secrets.key` 遺失或與資料庫不成對——`last_error_code` 為 `KRS-E5110`，不會嘗試發送，「通知管道失敗」系統規則以 `KRS-E5110` 開事件；還原金鑰檔並重新啟動，或重新輸入全部機密後恢復）、`consecutive_failures`、`failed_since`、`last_attempt_at`、`last_success_at`、`last_error_code`、`last_error`（已移除機密）、`rules_using`；詳情另有 `rules[]` 與最近 20 筆 `deliveries`。
 
 `POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
 
@@ -1453,7 +1467,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 
 ### 15.2 下載端點（ENROLL.md 第 19.4 節第 3 項）
 
-`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`）、`reason`、`product_code`（設定了目錄但不完整時為`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令。`stats.downloads_in_progress` 為目前的下載數。
+`GET /api/v1/enroll/mode` 的 `downloads`（token 的建立回應、列表的 `meta.downloads` 相同）：`available`（`enroll.download_dir` 有 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`，且安裝腳本與同目錄 `SHA256SUMS` 記錄的雜湊相符）、`reason`、`product_code`（設定了目錄但不完整或不相符時為`KRS-W2012`）、`base_url`（`https://<註冊端點>/agent`）、`install_script`、`install_script_sha256`（`pulse-install.sh` 的 SHA-256，小寫十六進位；不可用時 `null`。0.11.0 之後的版本才有）、`files`、`alternative`。主控台 S12 在可用時顯示一行安裝指令，指令在執行腳本之前先以 `install_script_sha256` 比對（`kairos/PKI.md` 第 17 節）。`stats.downloads_in_progress` 為目前的下載數。
 
 ## 16. 指標轉出（0.9.0〔草稿〕）
 
@@ -1463,7 +1477,7 @@ CLI：`kairos pki certificates import <檔案或目錄>... [--agent-id <agent_id
 |---|---|---|
 | `GET /api/v1/export/prometheus[?group=…]` | `hosts:read`（依主機群組篩選） | 所有可見主機的最新指標，Prometheus text 0.0.4；`Accept: application/openmetrics-text` 時為 OpenMetrics 1.0。未啟用時 `404 export_disabled`（`KRS-E4315`）。回應不是 JSON（錯誤仍是第 1.2 節的 JSON） |
 | `GET /api/v1/export/settings` | `settings:read` | 生效的設定、每個主控台可修改的鍵的來源與鎖定、Prometheus 抓取與 OTLP 推送的狀態；`otlp.secrets_available`（0.9.0〔草稿〕）：機密的金鑰檔 `alerts-secrets.key` 可以使用（`false` 時不能保存或更換標頭，`PUT` 會回 503 `secrets_unavailable`；主控台一開始就停用標頭欄位） |
-| `PUT /api/v1/export/settings` | `export:write` | 修改 `prometheus.{enabled,stale_after_secs,include_processes}`、`otlp.{enabled,endpoint,interval_secs,naming,headers}`；`null` 為改用設定檔的值；`reason` 選填。不合法 `400 invalid_parameter`（`KRS-E4314`）、環境變數鎖定 `409 locked_by_environment`；寫入稽核（`settings`／`export.change`，標頭只記名稱） |
+| `PUT /api/v1/export/settings` | `export:write` | 修改 `prometheus.{enabled,stale_after_secs,include_processes}`、`otlp.{enabled,endpoint,interval_secs,naming,headers}`；`null` 為改用設定檔的值；`reason` 選填。不合法 `400 invalid_parameter`（`KRS-E4314`）、環境變數鎖定 `409 locked_by_environment`；寫入稽核（`settings`／`export.change`，標頭只記名稱）。**端點改變時標頭不沿用**（0.11.0 之後的版本）：套用後 `otlp.endpoint` 與原本不同、而且還有標頭會送出（主控台保存的或 `export.otlp.headers_file` 的）時，同一次請求必須提供 `otlp.headers`（新的清單；`[]` 表示新的端點不帶標頭），否則 `400 export_secret_required`（`KRS-E4314`，`details.parameter`：`export.otlp.headers`，`details.reason`：`destination_changed`），設定不變並寫一筆結果為 `rejected` 的稽核（`kairos/EXPORT.md` 第 6.2 節） |
 | `POST /api/v1/export/otlp/test` | `export:write` | 以已儲存的設定送出空的 OTLP 請求，回 `{ok, status, code, message, elapsed_ms, endpoint}`；寫入稽核（`export.otlp_test`） |
 
 - 指標轉出的鍵存在同一張 `settings` 表，但不列入第 11.7 節的 `GET /api/v1/settings`／`POST /api/v1/settings/reset`（那裡只有設定檔與環境變數的值）。

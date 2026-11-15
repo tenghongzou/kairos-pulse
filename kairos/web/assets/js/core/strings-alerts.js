@@ -702,7 +702,7 @@ export const ALERT_STRINGS = {
   'alerts.ch.f.timeout': '逾時（秒）',
   'alerts.ch.f.timeoutHint': '1～60，預設 10。',
   'alerts.ch.f.notifyAck': '事件被確認時在這個管道通知',
-  'alerts.ch.f.secretsKey': '機密以資料目錄的 alerts-secrets.key 加密；還原到新主機時需一併複製這個檔案，否則要重新輸入。',
+  'alerts.ch.f.secretsKey': '機密以資料目錄的 alerts-secrets.key 加密；還原到新主機時需一併複製這個檔案，否則要重新輸入。修改通知的目的地（SMTP 主機或連接埠、Webhook 網址）時，密碼、自訂標頭與 LINE token 必須重新輸入或清除，不會沿用到新的目的地。',
   'alerts.ch.create': '建立管道',
   'alerts.ch.save': '儲存',
   'alerts.ch.created': '已建立通知管道「{name}」',

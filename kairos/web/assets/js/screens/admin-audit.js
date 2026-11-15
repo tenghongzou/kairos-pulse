@@ -105,6 +105,10 @@ export function render(ctx) {
   const headIntegrity = h('span', { class: 'k-integrity-head' });
   let verifiedHere = false;
   let startCursor = null;
+  // 重新錨定（meta.integrity.reanchor；kairos audit reanchor）：說明卡片，以及清單中那一筆與它之前的列的標示。
+  // 主控台只顯示狀態，不提供執行的入口
+  let reanchor = null;
+  const reanchorBox = h('div');
   const verifyBtn = canAll ? h('button', { type: 'button', class: 'ds-button ds-button--secondary', on: { click: () => verify() } }, icon('shield-check'), t('adm.audit.verify')) : null;
   const exportLink = canExport ? h('a', { class: 'ds-button ds-button--secondary', href: '#', download: '', dataset: { native: '1' } }, icon('download'), t('adm.audit.exportJsonl')) : null;
 
@@ -162,7 +166,17 @@ export function render(ctx) {
       { key: 'at', label: t('adm.audit.col.time', { tz: fmt.tzLabel() }), render: (r) => h('span', { class: 'nowrap' }, fmt.dateTime(r.at)) },
       { key: 'actor', label: t('adm.audit.col.actor'), render: (r) => h('span', { title: r.actor }, actorText(r.actor)) },
       { key: 'ip', label: t('adm.audit.col.ip'), render: (r) => (r.actor_ip ? h('span', { class: 'mono' }, r.actor_ip) : '—') },
-      { key: 'action', label: t('adm.audit.col.action'), render: (r) => [h('span', null, actionText(r.action)), h('span', { class: 'k-host-id mono' }, r.action)] },
+      {
+        key: 'action',
+        label: t('adm.audit.col.action'),
+        render: (r) => [
+          h('span', null, actionText(r.action)),
+          h('span', { class: 'k-host-id mono' }, r.action),
+          // 重新錨定的那一筆，與它之前（完整性未驗證）的列
+          reanchor && r.id === reanchor.event_id ? [' ', statusBadge('warning', t('adm.audit.reanchor.rowEvent'))] : null,
+          reanchor && r.id < reanchor.event_id ? [' ', h('span', { class: 'ds-status-badge ds-status-badge--neutral', title: t('adm.audit.reanchor.rowBeforeTitle') }, t('adm.audit.reanchor.rowBefore'))] : null,
+        ],
+      },
       { key: 'object', label: t('adm.audit.col.target'), render: (r) => r.object || '—' },
       { key: 'result', label: t('adm.audit.col.result'), render: (r) => [resultBadge(r.result), r.code ? [' ', codeTag(r.code)] : null] },
       {
@@ -178,7 +192,7 @@ export function render(ctx) {
   mount(
     root,
     pageHead({ title: t('adm.audit.title'), meta: canAll ? headIntegrity : null, actions: [verifyBtn, exportLink].filter(Boolean) }),
-    canAll ? card({ title: t('adm.audit.integrity'), body: [integrity, h('p', { class: 'caption' }, t('adm.audit.limits'))] }) : null,
+    canAll ? card({ title: t('adm.audit.integrity'), body: [integrity, reanchorBox, h('p', { class: 'caption' }, t('adm.audit.limits'))] }) : null,
     ownNote,
     h('section', { class: 'ds-filterbar', 'aria-label': t('adm.audit.filters') }, filterRow, selects),
     table.el,
@@ -207,6 +221,10 @@ export function render(ctx) {
       if (my !== seq) return;
       cursor = res.page && res.page.next_cursor;
       mount(ownNote, res.meta && res.meta.own_only ? inlineAlert({ kind: 'info', title: t('adm.audit.ownOnly') }) : null);
+      if (res.meta && res.meta.integrity) {
+        reanchor = res.meta.integrity.reanchor || null;
+        mount(reanchorBox, reanchor ? reanchorNotice(reanchor, { onJump: jumpTo }) : null);
+      }
       if (res.meta && res.meta.integrity && !verifiedHere) {
         hmacSince = res.meta.integrity.hmac_since_id;
         mount(headIntegrity, ...integrityHead(res.meta.integrity));
@@ -281,14 +299,37 @@ export function integrityHead(ig) {
   const by = v.self_check || v.actor === 'system' ? t('adm.audit.head.bySystem') : t('adm.audit.head.byUser', { who: actorText(v.actor) });
   if (v.result === 'ok') {
     const hm = ig.hmac_since_id != null ? t('adm.audit.head.hmacSince', { n: ig.hmac_since_id }) : t('adm.audit.head.hmacNone');
-    return [t('adm.audit.head.label'), ' ', statusBadge('online', t('adm.audit.head.okBadge')), ' ', t('adm.audit.head.ok', { at, hmac: hm }), ' · ', by];
+    // 重新錨定過：頁首也寫出來（驗證通過的是重新錨定之後的部分）
+    const ra = ig.reanchor ? [' · ', t('adm.audit.reanchor.head', { at: fmt.dateTime(ig.reanchor.at, { seconds: false }), id: ig.reanchor.event_id })] : [];
+    return [t('adm.audit.head.label'), ' ', statusBadge('online', t('adm.audit.head.okBadge')), ' ', t('adm.audit.head.ok', { at, hmac: hm }), ...ra, ' · ', by];
   }
   const b = v.broken || {};
   const reason = BREAK_REASONS.includes(b.reason) ? t(`adm.audit.break.${b.reason}`) : b.reason || '—';
   return [t('adm.audit.head.label'), ' ', statusBadge('critical', t('adm.audit.head.failedBadge')), ' ', t('adm.audit.head.failed', { at, id: b.id ?? '—', r: reason }), ' ', codeTag('KRS-E6201'), ' · ', by];
 }
 
-const BREAK_REASONS = ['hash_mismatch', 'prev_mismatch', 'missing_hash', 'anchor_mismatch', 'head_mismatch', 'missing_hmac', 'hmac_mismatch', 'hmac_boundary_mismatch', 'hmac_key_unavailable', 'hmac_key_mismatch'];
+const BREAK_REASONS = ['hash_mismatch', 'prev_mismatch', 'missing_hash', 'anchor_mismatch', 'head_mismatch', 'missing_hmac', 'hmac_mismatch', 'hmac_boundary_mismatch', 'hmac_key_unavailable', 'hmac_key_mismatch', 'reanchor_mismatch', 'reanchored'];
+
+/**
+ * 重新錨定的說明（meta.integrity.reanchor）：時間、執行者、原因；之前的紀錄完整性未驗證；
+ * 告警保持開啟的期間內寫明原因是重新錨定。只是狀態，沒有任何操作（重新錨定只能在 Kairos 主機上以 CLI 執行）
+ */
+export function reanchorNotice(ra, { onJump } = {}) {
+  const until = ra.alert_until && Date.parse(ra.alert_until) > fmt.serverNow() ? `${fmt.dateTime(ra.alert_until, { seconds: false })} ${fmt.tzLabel()}` : null;
+  return inlineAlert({
+    kind: 'warning',
+    title: t('adm.audit.reanchor.title'),
+    body: h(
+      'div',
+      { class: 'k-stack--sm', id: 'audit-reanchor' },
+      h('p', null, t('adm.audit.reanchor.when', { at: `${fmt.dateTime(ra.at, { seconds: false })} ${fmt.tzLabel()}`, by: ra.by || '—', id: ra.event_id })),
+      h('p', null, ra.reason ? t('adm.audit.reanchor.reason', { r: ra.reason }) : t('adm.audit.reanchor.noReason')),
+      h('p', null, ra.unverified != null ? t('adm.audit.reanchor.unverified', { id: ra.event_id, n: fmt.num(ra.unverified) }) : t('adm.audit.reanchor.unverifiedUnknown', { id: ra.event_id })),
+      until ? h('p', null, t('adm.audit.reanchor.alertHeld', { until })) : null,
+      onJump ? h('p', null, h('button', { type: 'button', class: 'ds-button ds-button--secondary ds-button--sm', on: { click: () => onJump(ra.event_id) } }, t('adm.audit.reanchor.jump'))) : null,
+    ),
+  });
+}
 
 /** 驗證結果：雜湊鏈與 HMAC 的邊界 */
 export function verifyResult(r, { onJump } = {}) {
@@ -310,6 +351,7 @@ export function verifyResult(r, { onJump } = {}) {
           null,
           h('li', null, t('adm.audit.checkedOk', { n: fmt.num(r.checked), first: r.first_id ?? '—', last: r.last_id ?? '—' })),
           h('li', null, hmacLine),
+          r.reanchor ? h('li', null, t('adm.audit.reanchor.verified', { id: r.reanchor.event_id, n: fmt.num(r.reanchor.unverified) })) : null,
           r.last_hash ? h('li', null, t('adm.audit.lastHash'), ' ', h('span', { class: 'mono k-break' }, r.last_hash)) : null,
         ),
       }),
@@ -332,6 +374,8 @@ export function verifyResult(r, { onJump } = {}) {
           : h('p', { class: 'strong' }, t('adm.audit.broken', { id: b.id ?? '—' }), ' ', codeTag(b.product_code || 'KRS-E6201')),
         h('p', null, keyIssue ? t('adm.audit.brokenKeyReason', { what: t(`adm.audit.brokenKeyWhat.${b.reason}`) }) : t('adm.audit.brokenReason', { r: reason })),
         h('p', null, keyIssue ? t('adm.audit.brokenKeyFix') : t('adm.audit.brokenFix')),
+        // 斷裂之後的出路：從備份還原，或在主機上重新錨定（主控台不提供）
+        keyIssue ? null : h('p', null, t('adm.audit.reanchor.cli')),
         h('p', null, t('adm.audit.checked', { n: fmt.num(r.checked), first: r.first_id ?? '—', last: r.last_id ?? '—' })),
         h('p', null, hmacLine),
       ),
