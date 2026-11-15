@@ -51,7 +51,7 @@ pub fn cert_hosts(
 const HOST_EXTRA_COLUMNS: &str = "boot_time, i_os_family, i_cpu_model, i_cores, i_memory, \
      i_vendor, i_product, i_serial, series_limited_at, install_method, install_upgrade, \
      install_config, hc_desired_rev, hc_applied_rev, hc_state, hc_overridden, \
-     install_external_url";
+     install_external_url, install_rollback";
 /// PostgreSQL 的子查詢必須有別名（`inv`、`hc`）
 const HOST_EXTRA_JOIN: &str = "LEFT JOIN (SELECT host_id AS i_host, os_family AS i_os_family, \
      cpu_model AS i_cpu_model, cpu_logical_cores AS i_cores, memory_total AS i_memory, \
@@ -129,6 +129,7 @@ fn host_of(r: &Row) -> PgResult<DbHost> {
                 upgrade: text(31)?,
                 config: text(32)?,
                 external_url: text(37)?,
+                rollback: text(38)?,
             };
             (i != kairos_proto::InstallInfo::default()).then(|| Arc::new(i))
         },

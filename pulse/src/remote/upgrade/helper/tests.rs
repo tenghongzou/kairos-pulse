@@ -81,6 +81,10 @@ pub(super) struct Fake {
     pub(super) dpkg_locks: Cell<u32>,
     /// 套件管理員一律失敗（不是被鎖住），不改變任何東西
     pub(super) pkg_fails: Cell<bool>,
+    /// 套件管理員做到一半失敗（維護指令碼失敗）：執行檔已換、套件資料庫停在半安裝，然後回錯誤
+    pub(super) pkg_fails_half: Cell<bool>,
+    /// `pkg_fails`／`pkg_fails_half` 只套用在回滾套件（`rollback.pkg`）的安裝：升級本身照常成功
+    pub(super) fail_only_rollback: Cell<bool>,
     pub(super) check_config: Cell<i32>,
     pub(super) version_override: RefCell<Option<String>>,
     /// 預檢的最後一步（check-config）執行時呼叫：模擬「預檢之後、替換之前」發生的事
@@ -138,6 +142,8 @@ impl Fake {
             calls: RefCell::new(Vec::new()),
             dpkg_locks: Cell::new(0),
             pkg_fails: Cell::new(false),
+            pkg_fails_half: Cell::new(false),
+            fail_only_rollback: Cell::new(false),
             check_config: Cell::new(0),
             version_override: RefCell::new(None),
             after_precheck: RefCell::new(None),
@@ -184,6 +190,8 @@ impl Fake {
             calls: RefCell::new(Vec::new()),
             dpkg_locks: Cell::new(0),
             pkg_fails: Cell::new(false),
+            pkg_fails_half: Cell::new(false),
+            fail_only_rollback: Cell::new(false),
             check_config: Cell::new(0),
             version_override: RefCell::new(None),
             after_precheck: RefCell::new(None),
@@ -449,7 +457,8 @@ impl System for Fake {
                 };
                 let file = package.file_name().unwrap().to_string_lossy().to_string();
                 self.calls.borrow_mut().push(format!("{name} {file}"));
-                if self.pkg_fails.get() {
+                let applies = !self.fail_only_rollback.get() || file == txn::ROLLBACK_PKG_FILE;
+                if self.pkg_fails.get() && applies {
                     return Output {
                         status: Some(1),
                         stdout: String::new(),
@@ -465,6 +474,15 @@ impl System for Fake {
                     };
                 }
                 let version = binary_version(package);
+                if self.pkg_fails_half.get() && applies {
+                    std::fs::copy(package, self.install.join("pulse")).unwrap();
+                    *self.pkg_db.borrow_mut() = Some(format!("{version} iF"));
+                    return Output {
+                        status: Some(1),
+                        stdout: String::new(),
+                        stderr: "dpkg: error processing package pulse (--install):\n installed pulse package post-installation script subprocess returned error exit status 1\n".into(),
+                    };
+                }
                 // 安裝到一半就被終止（對照表第 10、16 列）：執行檔已換、套件資料庫是半安裝
                 let point = if file == txn::ROLLBACK_PKG_FILE {
                     "rollback_package_running"
@@ -685,6 +703,7 @@ pub(super) fn setup(name: &str, method: &str) -> Env {
         current_commit: "1a2b3c4".into(),
         method: method.into(),
         arch: "x86_64".into(),
+        free_space: |_| None,
     };
     let env = Env { root, paths, key };
     stage_upgrade(&env, ID, "0.9.0", "0.9.1");
@@ -700,12 +719,28 @@ pub(super) fn rewrite_request(env: &Env, f: impl FnOnce(&mut Request)) {
 
 /// 在暫存區放一個有官方簽章的回滾檔（`version` 的套件）並寫進請求
 pub(super) fn stage_rollback(env: &Env, version: &str) -> String {
-    let name = artifact_name(version, "1a2b3c4", &env.paths.method);
-    let content = format!("VERSION={version}\n");
-    let rel = testsign::release(
+    stage_rollback_with(
+        env,
         &env.key,
         version,
         "1a2b3c4",
+        &format!("VERSION={version}\n"),
+    )
+}
+
+/// [`stage_rollback`]，另外指定簽署金鑰、檔名的 commit 與套件的內容（＝假的套件中的執行檔）
+pub(super) fn stage_rollback_with(
+    env: &Env,
+    key: &TestKey,
+    version: &str,
+    commit: &str,
+    content: &str,
+) -> String {
+    let name = artifact_name(version, commit, &env.paths.method);
+    let rel = testsign::release(
+        key,
+        version,
+        commit,
         &[(name.as_str(), content.as_bytes())],
         None,
     );
@@ -1103,6 +1138,1114 @@ fn deb_rolls_back_with_a_verified_rollback_package() {
     assert!(r.detail.contains("binary_restored"), "{}", r.detail);
     assert!(!fake.calls().contains(&"dpkg rollback.pkg".to_string()));
     assert_eq!(env.record().rollback, None);
+    env.cleanup();
+}
+
+fn anchor_path(env: &Env) -> PathBuf {
+    env.root.join("etc/kairos-pulse/allowed_signers")
+}
+
+fn reasons(r: &UpgradeResult) -> Vec<String> {
+    kairos_proto::mgmt::degraded_reasons(&r.detail)
+        .unwrap_or_else(|| panic!("不是降級回滾：{r:?}"))
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// ADR-0003 方案 A2 與第 5.4 節第 2、3 項的資格（INV-1、INV-2、INV-3、INV-5）：服務帳號暫存的回滾檔
+/// 只是提示——簽章完整驗證、版本是輔助程式自己的、commit 相同（前綴比對）、套件中的執行檔與替換前
+/// 安裝的位元組相同，全部成立才會經套件管理員回滾。任何一項不成立：**升級照常**，健康確認失敗時換回
+/// `pulse.prev`，結果是降級回滾並標明原因；升級成功時原因不出現在結果中
+#[test]
+fn a_staged_rollback_package_is_only_used_when_it_is_the_installed_version_commit_and_binary() {
+    struct Case {
+        name: &'static str,
+        /// (版本, 檔名的 commit, 套件的內容)
+        package: (&'static str, &'static str, &'static str),
+        /// 輔助程式自己的 commit
+        helper_commit: &'static str,
+        /// `None`：使用回滾套件
+        declined: Option<&'static str>,
+    }
+    let cases = [
+        Case {
+            name: "ok",
+            package: ("0.9.0", "1a2b3c4", "VERSION=0.9.0\n"),
+            helper_commit: "1a2b3c4",
+            declined: None,
+        },
+        // 執行檔內建的 commit 比檔名的長：前綴相同就是同一個 commit
+        Case {
+            name: "long-commit",
+            package: ("0.9.0", "1a2b3c4", "VERSION=0.9.0\n"),
+            helper_commit: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+            declined: None,
+        },
+        // 同版本、不同 commit 的官方重新出包
+        Case {
+            name: "commit",
+            package: ("0.9.0", "9f8e7d6", "VERSION=0.9.0\n"),
+            helper_commit: "1a2b3c4",
+            declined: Some("rollback_commit_mismatch"),
+        },
+        // 輔助程式不是正式的建置（commit 不是合法的縮寫）：無法綁定，不使用
+        Case {
+            name: "unknown-commit",
+            package: ("0.9.0", "1a2b3c4", "VERSION=0.9.0\n"),
+            helper_commit: "unknown",
+            declined: Some("rollback_commit_mismatch"),
+        },
+        // 同版本同 commit、官方簽署，但套件中的執行檔不是目前安裝的那一份
+        Case {
+            name: "binary",
+            package: ("0.9.0", "1a2b3c4", "VERSION=0.9.0\n# rebuilt\n"),
+            helper_commit: "1a2b3c4",
+            declined: Some("rollback_binary_mismatch"),
+        },
+        // 不是輔助程式自己的版本（即使有官方簽章）：第 17.8 節的降版繞過
+        Case {
+            name: "version",
+            package: ("0.8.0", "1a2b3c4", "VERSION=0.9.0\n"),
+            helper_commit: "1a2b3c4",
+            declined: Some("rollback_not_verified"),
+        },
+    ];
+    for c in &cases {
+        for crashy in [true, false] {
+            let label = format!("{}／crashy={crashy}", c.name);
+            let mut env = setup(&format!("a2-{}-{crashy}", c.name), "deb");
+            env.paths.current_commit = c.helper_commit.to_string();
+            let (version, commit, content) = c.package;
+            let name = stage_rollback_with(&env, &env.key, version, commit, content);
+            let fake = Fake::new(&env.root);
+            if crashy {
+                fake.set("0.9.1", Behavior::Crash);
+            }
+            let r = apply(&env.paths, &fake).unwrap();
+            fake.assert_invariants();
+            let rec = env.record();
+            let used = fake.calls().contains(&"dpkg rollback.pkg".to_string());
+            match c.declined {
+                None => {
+                    let rb = rec.rollback.clone().expect("記錄了回滾套件");
+                    assert_eq!(
+                        (rb.name.as_str(), rb.sha256.as_str(), rb.source.as_str()),
+                        (
+                            name.as_str(),
+                            sha(content.as_bytes()).as_str(),
+                            txn::SOURCE_HINT
+                        ),
+                        "{label}"
+                    );
+                    assert!(
+                        !rb.signer.is_empty() && rec.rollback_declined.is_empty(),
+                        "{label}"
+                    );
+                }
+                Some(why) => {
+                    assert_eq!(rec.rollback, None, "{label}");
+                    assert_eq!(rec.rollback_declined, [why], "{label}");
+                    assert!(!used, "{label}: 不合格的回滾檔不得交給套件管理員");
+                }
+            }
+            if !crashy {
+                // 回滾來源不合格不讓升級失敗，也不出現在成功的結果中
+                assert_eq!(
+                    (r.state.as_str(), r.code.as_deref(), r.detail.as_str()),
+                    ("succeeded", Some(codes::I_UPGRADE_COMPLETED), ""),
+                    "{label}"
+                );
+                assert_eq!(env.installed(), "0.9.1", "{label}");
+            } else {
+                assert_eq!(r.state, "rolled_back", "{label}: {r:?}");
+                assert_eq!(env.installed(), "0.9.0", "{label}");
+                assert_eq!(env.prev(), "0.9.0", "{label}");
+                match c.declined {
+                    None => {
+                        assert!(used, "{label}");
+                        assert_eq!(
+                            r.code.as_deref(),
+                            Some(codes::W_UPGRADE_ROLLED_BACK),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            kairos_proto::mgmt::degraded_reasons(&r.detail),
+                            None,
+                            "{label}"
+                        );
+                        assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.0 ii"), "{label}");
+                    }
+                    Some(why) => {
+                        assert_eq!(
+                            r.code.as_deref(),
+                            Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED),
+                            "{label}"
+                        );
+                        assert_eq!(reasons(&r), [why, "package_db_inconsistent"], "{label}");
+                        assert_eq!(
+                            fake.pkg_db.borrow().as_deref(),
+                            Some("0.9.1 ii"),
+                            "{label}: 套件資料庫仍是失敗的那一版"
+                        );
+                    }
+                }
+            }
+            // 解開回滾套件用的目錄不留下
+            assert!(
+                !env.work().join(txn::ROLLBACK_EXTRACT_DIR).exists(),
+                "{label}"
+            );
+            env.cleanup();
+        }
+    }
+}
+
+/// INV-3：回滾檔的簽章在取得時（替換前）**完整**驗證，含 `valid-before`——金鑰已到期、或不在信任錨中的
+/// 簽署者簽的回滾檔不使用（第一階段的提示來源沒有「到期仍可用」的例外；那是本機封存的規則）
+#[test]
+fn a_staged_rollback_package_signed_by_an_expired_or_unknown_key_is_not_used() {
+    for (name, expired) in [("expired", true), ("unknown", false)] {
+        let env = setup(&format!("rb-key-{name}"), "deb");
+        let other = TestKey::generate();
+        stage_rollback_with(&env, &other, "0.9.0", "1a2b3c4", "VERSION=0.9.0\n");
+        if expired {
+            // 另一把金鑰列在信任錨中，但 valid-before 已過
+            let line = other.allowed_signers().replace(
+                "namespaces=\"kairos-pulse-release\"",
+                "namespaces=\"kairos-pulse-release\",valid-before=\"20200101\"",
+            );
+            std::fs::write(
+                anchor_path(&env),
+                format!("{}{line}", env.key.allowed_signers()),
+            )
+            .unwrap();
+        }
+        let fake = Fake::new(&env.root);
+        fake.set("0.9.1", Behavior::Crash);
+        let r = apply(&env.paths, &fake).unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED)),
+            "{name}: {r:?}"
+        );
+        assert_eq!(
+            reasons(&r),
+            ["rollback_not_verified", "package_db_inconsistent"],
+            "{name}"
+        );
+        assert!(!fake.calls().contains(&"dpkg rollback.pkg".to_string()));
+        assert_eq!(env.installed(), "0.9.0");
+        fake.assert_invariants();
+        env.cleanup();
+    }
+}
+
+/// ADR-0003 第 5.4 節最後一列：套件管理員裝回回滾套件失敗（含交易部分完成）時，先以 `pulse.prev` 緊急
+/// 復原，結果是降級回滾（`rolled_back`＋`PLS-W8418`＋`degraded:`），不是 `rollback_failed`；只回報，不
+/// 自動修復套件資料庫。改變後的意圖先寫進紀錄：之後中斷的話接續時直接換回 `pulse.prev`
+#[test]
+fn a_failed_package_rollback_falls_back_to_the_saved_binary_and_is_reported_as_degraded() {
+    for (name, half, method) in [
+        ("clean", false, "deb"),
+        ("half", true, "deb"),
+        ("rpm", true, "rpm"),
+    ] {
+        let env = setup(&format!("rb-pkg-fails-{name}"), method);
+        stage_rollback(&env, "0.9.0");
+        let fake = Fake::new(&env.root);
+        fake.set("0.9.1", Behavior::Crash);
+        fake.fail_only_rollback.set(true);
+        fake.pkg_fails.set(!half);
+        fake.pkg_fails_half.set(half);
+        let r = apply(&env.paths, &fake).unwrap();
+        fake.assert_invariants();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED)),
+            "{name}: {r:?}"
+        );
+        assert_eq!(
+            reasons(&r),
+            ["package_rollback_failed", "package_db_inconsistent"],
+            "{name}"
+        );
+        assert!(r.detail.contains("crash_restart"), "{name}: {}", r.detail);
+        assert!(r.detail.contains("; rollback: "), "{name}: {}", r.detail);
+        // 套件管理員被呼叫過一次（回滾套件），之後不再呼叫（不自動修復）
+        let pkg_calls: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.ends_with(" rollback.pkg"))
+            .collect();
+        assert_eq!(pkg_calls.len(), 1, "{name}: {pkg_calls:?}");
+        assert_eq!(env.installed(), "0.9.0", "{name}: 服務回到舊版");
+        assert_eq!(env.prev(), "0.9.0", "{name}");
+        let db = fake.pkg_db.borrow().clone().unwrap();
+        if half {
+            // 交易部分完成：套件資料庫停在半安裝，照實回報
+            assert_eq!(db, "0.9.0 iF", "{name}");
+            assert!(
+                r.detail.contains("package_db_shows_0.9.0 iF"),
+                "{name}: {}",
+                r.detail
+            );
+        } else {
+            assert_eq!(db, "0.9.1 ii", "{name}");
+            assert!(
+                r.detail.contains("package_db_shows_0.9.1 ii"),
+                "{name}: {}",
+                r.detail
+            );
+        }
+        let rec = env.record();
+        let intent = rec.rollback_intent.clone().unwrap();
+        assert_eq!(intent.via, Via::Binary, "{name}: 意圖已改為換回執行檔");
+        assert_eq!(
+            intent.degraded,
+            ["package_rollback_failed", "package_db_inconsistent"],
+            "{name}"
+        );
+        assert_eq!(&env.result(), &r, "{name}");
+        assert!(!env.active(), "{name}");
+        env.cleanup();
+    }
+
+    // 套件回滾失敗之後、換回 pulse.prev 的途中中斷：接續時依紀錄的意圖直接換回執行檔，不再執行套件管理員
+    let mut env = setup("rb-pkg-fails-crash", "deb");
+    stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    fake.fail_only_rollback.set(true);
+    fake.pkg_fails_half.set(true);
+    apply_until(&env.paths, &fake, "rollback_restoring");
+    fake.assert_invariants();
+    let rec = env.record();
+    assert_eq!(rec.step, Step::RollbackIntent);
+    assert_eq!(rec.rollback_intent.clone().unwrap().via, Via::Binary);
+    env.helper_is_installed();
+    let _ = std::fs::remove_dir_all(env.staging());
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
+    after.assert_invariants();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED)),
+        "{r:?}"
+    );
+    assert_eq!(
+        reasons(&r),
+        ["package_rollback_failed", "package_db_inconsistent"]
+    );
+    assert!(r.detail.contains("; resumed"), "{}", r.detail);
+    assert!(
+        !after.calls().iter().any(|c| c.starts_with("dpkg")),
+        "{:?}",
+        after.calls()
+    );
+    assert_eq!(
+        (env.installed().as_str(), env.prev().as_str()),
+        ("0.9.0", "0.9.0")
+    );
+    env.cleanup();
+
+    // 套件回滾失敗、pulse.prev 也不能用：沒有更保守的來源，rollback_failed
+    let env = setup("rb-pkg-fails-noprev", "deb");
+    stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    fake.fail_only_rollback.set(true);
+    fake.pkg_fails.set(true);
+    let prev = env.paths.install_dir.join("pulse.prev");
+    *fake.on_restart.borrow_mut() = Some(Box::new(move || {
+        let _ = std::fs::write(&prev, "VERSION=0.8.0\n");
+    }));
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("rollback_failed", Some(codes::E_UPGRADE_ROLLBACK_FAILED)),
+        "{r:?}"
+    );
+    assert!(r.detail.contains("pulse.prev"), "{}", r.detail);
+    assert_eq!(env.installed(), "0.9.1");
+    env.cleanup();
+}
+
+/// ADR-0003 的 INV-7、決策點 D1（回滾當下）：回滾套件的簽署金鑰**仍列在**信任錨中、只是 `valid-before`
+/// 已過（自然到期）→ 照常經套件管理員回滾；金鑰**已不在**信任錨中（撤銷＝刪除那一行）或信任錨無法
+/// 讀取 → 不執行該套件的維護指令碼，換回 `pulse.prev`，降級回滾並標明 `rollback_signer_revoked`
+#[test]
+fn a_revoked_signer_is_not_used_at_rollback_time_but_an_expired_one_is() {
+    for (name, revoked) in [
+        ("expired", false),
+        ("removed", true),
+        ("unreadable", true),
+        ("empty", true),
+    ] {
+        let env = setup(&format!("d1-{name}"), "deb");
+        stage_rollback(&env, "0.9.0");
+        let fake = Fake::new(&env.root);
+        fake.set("0.9.1", Behavior::Crash);
+        // 替換之後、回滾之前信任錨改變（重新啟動服務是替換後的第一件事）
+        let anchor = anchor_path(&env);
+        let line = env.key.allowed_signers();
+        let other = TestKey::generate().allowed_signers();
+        *fake.on_restart.borrow_mut() = Some(Box::new(move || match name {
+            "expired" => std::fs::write(
+                &anchor,
+                line.replace(
+                    "namespaces=\"kairos-pulse-release\"",
+                    "namespaces=\"kairos-pulse-release\",valid-before=\"20200101\"",
+                ),
+            )
+            .unwrap(),
+            "removed" => std::fs::write(&anchor, &other).unwrap(),
+            "empty" => std::fs::write(&anchor, "# 全部撤銷\n").unwrap(),
+            _ => {
+                let _ = std::fs::remove_file(&anchor);
+            }
+        }));
+        let r = apply(&env.paths, &fake).unwrap();
+        fake.assert_invariants();
+        let used = fake.calls().contains(&"dpkg rollback.pkg".to_string());
+        assert_eq!(r.state, "rolled_back", "{name}: {r:?}");
+        assert_eq!(env.installed(), "0.9.0", "{name}");
+        if revoked {
+            assert!(!used, "{name}: 撤銷後不得再執行該簽署者的套件");
+            assert_eq!(
+                r.code.as_deref(),
+                Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED),
+                "{name}"
+            );
+            assert_eq!(
+                reasons(&r),
+                ["rollback_signer_revoked", "package_db_inconsistent"],
+                "{name}"
+            );
+            assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.1 ii"), "{name}");
+            assert_eq!(env.record().rollback_intent.unwrap().via, Via::Binary);
+        } else {
+            assert!(used, "{name}: 自然到期時照常使用已綁定的回滾套件");
+            assert_eq!(
+                r.code.as_deref(),
+                Some(codes::W_UPGRADE_ROLLED_BACK),
+                "{name}"
+            );
+            assert_eq!(
+                kairos_proto::mgmt::degraded_reasons(&r.detail),
+                None,
+                "{name}"
+            );
+            assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.0 ii"), "{name}");
+        }
+        env.cleanup();
+    }
+}
+
+// ---- root 的本機封存（ADR-0003 階段 2；REMOTE.md 第 17.10 節） ----
+
+const THIRD_ID: &str = "33333333-4444-4555-8666-777777777777";
+/// [`stage_upgrade`] 的發佈檔用的 commit：升級成功後，輔助程式自己的 commit 就是它
+const NEW_COMMIT: &str = "5e6f7a8";
+
+fn owner() -> txn::Owner {
+    txn::Owner::new(false)
+}
+
+fn index(env: &Env) -> Option<archive::Index> {
+    archive::read_index(&env.paths.work_root, owner()).expect("封存索引可用")
+}
+
+fn hint(env: &Env) -> Option<files::RollbackHint> {
+    files::RollbackHint::read(&env.root.join("var/lib/pulse/upgrade/rollback.json"))
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// 0.9.0 的 deb／rpm 主機成功升級到 0.9.1（封存了 0.9.1 的套件），之後執行的輔助程式是 0.9.1
+fn archived_host(name: &str, method: &str) -> Env {
+    let mut env = setup(name, method);
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    fake.assert_invariants();
+    env.helper_is_installed();
+    env.paths.current_commit = NEW_COMMIT.to_string();
+    assert_eq!(index(&env).expect("已封存").entries.len(), 1);
+    env
+}
+
+/// 封存條目的目錄
+fn entry_dir_of(env: &Env, version: &str) -> PathBuf {
+    let e = index(env)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.version == version)
+        .unwrap();
+    archive::entry_dir(&env.paths.work_root, &e.artifact_sha256)
+}
+
+/// 升級成功後封存；下一次升級失敗時以封存的套件經套件管理員回滾——**不需要 Kairos 附回滾檔，也不需要
+/// 服務帳號暫存的任何東西**（INV-4）。沒有通過健康確認的版本不進封存（INV-10）；下一次成功的升級提交
+/// 新的 generation 並清除舊的條目（保留 1 份）
+#[test]
+fn a_successful_upgrade_archives_the_package_and_the_next_rollback_uses_it() {
+    for method in ["deb", "rpm"] {
+        let env = archived_host(&format!("arch-ok-{method}"), method);
+        // 封存：索引（已提交的條目）、目錄與檔案的權限、驗證當時的信任政策
+        let idx = index(&env).unwrap();
+        assert_eq!(
+            (idx.schema.as_str(), idx.generation),
+            (archive::INDEX_SCHEMA, 1)
+        );
+        let e = idx.entries[0].clone();
+        assert_eq!(
+            (
+                e.version.as_str(),
+                e.commit.as_str(),
+                e.source.as_str(),
+                e.generation,
+                e.revoked_at
+            ),
+            ("0.9.1", NEW_COMMIT, "ota", 1, None),
+            "{method}"
+        );
+        assert_eq!(e.binary_sha256, sha(b"VERSION=0.9.1\n"));
+        assert_eq!(
+            e.artifact_sha256,
+            sha(b"VERSION=0.9.1\n"),
+            "假的套件＝執行檔的內容"
+        );
+        assert_eq!(e.policy.principal, "release@kairos-pulse");
+        assert!(e.policy.signer.starts_with("SHA256:") && e.policy.anchor_sha256.len() == 64);
+        assert!(e.policy.verified_at > 0);
+        let dir = archive::dir(&env.paths.work_root);
+        let entry = archive::entry_dir(&env.paths.work_root, &e.artifact_sha256);
+        assert_eq!((mode(&dir), mode(&entry)), (0o700, 0o700), "{method}");
+        for f in [
+            dir.join(archive::INDEX_FILE),
+            entry.join(archive::PACKAGE_FILE),
+            entry.join(archive::RECORD_FILE),
+            entry.join(files::SUMS_FILE),
+            entry.join(files::SIG_FILE),
+        ] {
+            assert_eq!(mode(&f), 0o600, "{}", f.display());
+        }
+        assert_eq!(
+            std::fs::read_to_string(entry.join(archive::PACKAGE_FILE)).unwrap(),
+            "VERSION=0.9.1\n"
+        );
+        // Pulse 用的提示：描述的是目前安裝的執行檔
+        let h = hint(&env).expect("rollback.json");
+        assert_eq!(
+            (h.state.as_str(), h.binary_sha256.as_str()),
+            ("archived", sha(b"VERSION=0.9.1\n").as_str())
+        );
+
+        // 下一次升級（0.9.1 → 0.9.2）失敗：暫存區沒有回滾檔、請求也沒有
+        stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+        let fake = Fake::new(&env.root);
+        fake.set("0.9.2", Behavior::Crash);
+        let r = apply(&env.paths, &fake).unwrap();
+        fake.assert_invariants();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+            "{method}: {r:?}"
+        );
+        assert_eq!(kairos_proto::mgmt::degraded_reasons(&r.detail), None);
+        let tool = if method == "deb" { "dpkg" } else { "rpm" };
+        assert!(
+            fake.calls().contains(&format!("{tool} rollback.pkg")),
+            "{method}: {:?}",
+            fake.calls()
+        );
+        assert_eq!(env.installed(), "0.9.1");
+        assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.1 ii"));
+        let rec = match txn::load_record(&env.paths.work_root.join(OTHER_ID)) {
+            Loaded::V2(r) => *r,
+            other => panic!("{other:?}"),
+        };
+        let rb = rec.rollback.clone().unwrap();
+        assert_eq!(
+            (rb.source.as_str(), rb.sha256.as_str(), rb.signer.as_str()),
+            (
+                txn::SOURCE_ARCHIVE,
+                e.artifact_sha256.as_str(),
+                e.policy.signer.as_str()
+            ),
+            "{method}"
+        );
+        assert_eq!(rb.name, e.artifact);
+        assert!(rec.rollback_declined.is_empty());
+        // 0.9.2 沒有通過健康確認：不進封存；索引不變
+        assert_eq!(index(&env).unwrap(), idx, "{method}");
+        assert_eq!(hint(&env).unwrap().state, "archived");
+
+        // 再下一次升級（0.9.1 → 0.9.3）成功：新的 generation，只留新版
+        stage_upgrade(&env, THIRD_ID, "0.9.1", "0.9.3");
+        let fake = Fake::new(&env.root);
+        assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
+        let idx2 = index(&env).unwrap();
+        assert_eq!(idx2.generation, 2);
+        assert_eq!(
+            idx2.entries
+                .iter()
+                .map(|e| (e.version.as_str(), e.generation))
+                .collect::<Vec<_>>(),
+            [("0.9.3", 2)]
+        );
+        assert!(!entry.exists(), "{method}: 舊的條目已清除");
+        assert_eq!(hint(&env).unwrap().binary_sha256, sha(b"VERSION=0.9.3\n"));
+        env.cleanup();
+    }
+}
+
+/// 回滾來源的順序與資格（ADR-0003 第 5.4 節；INV-5、INV-6、INV-10）：封存損毀、缺失、不安全或不是目前
+/// 安裝的執行檔時不使用，改評估下一個來源（服務帳號暫存、通過驗證的回滾檔），都沒有才換回 `pulse.prev`
+/// （降級回滾，標明原因）。不回頭、不放寬；升級本身照常
+#[test]
+fn a_damaged_or_missing_archive_is_not_used_and_the_next_source_is_evaluated() {
+    type Tamper = fn(&Env);
+    let cases: [(&str, Tamper, Option<&str>); 9] = [
+        // 對照：完好的封存
+        ("intact", |_| {}, None),
+        // 套件被改過（整包雜湊不符）
+        (
+            "package",
+            |env| {
+                let p = entry_dir_of(env, "0.9.1").join(archive::PACKAGE_FILE);
+                std::fs::write(&p, "VERSION=0.9.1\n# tampered\n").unwrap();
+            },
+            Some("rollback_archive_unusable"),
+        ),
+        // 套件不見了
+        (
+            "package-missing",
+            |env| {
+                std::fs::remove_file(entry_dir_of(env, "0.9.1").join(archive::PACKAGE_FILE))
+                    .unwrap()
+            },
+            Some("rollback_archive_unusable"),
+        ),
+        // 套件被換成符號連結（指向內容相同的檔案也不行：不跟隨連結）
+        (
+            "package-symlink",
+            |env| {
+                let p = entry_dir_of(env, "0.9.1").join(archive::PACKAGE_FILE);
+                let other = env.root.join("elsewhere.pkg");
+                std::fs::rename(&p, &other).unwrap();
+                std::os::unix::fs::symlink(&other, &p).unwrap();
+            },
+            Some("rollback_archive_unusable"),
+        ),
+        // 條目的目錄不見了
+        (
+            "entry-missing",
+            |env| std::fs::remove_dir_all(entry_dir_of(env, "0.9.1")).unwrap(),
+            Some("rollback_archive_unusable"),
+        ),
+        // 索引被改過（checksum 不符）
+        (
+            "index-checksum",
+            |env| {
+                let p = archive::dir(&env.paths.work_root).join(archive::INDEX_FILE);
+                let text = std::fs::read_to_string(&p).unwrap();
+                std::fs::write(&p, text.replace("\"ota\"", "\"seed\"")).unwrap();
+            },
+            Some("rollback_archive_unusable"),
+        ),
+        // 索引不是合法的內容
+        (
+            "index-garbage",
+            |env| {
+                std::fs::write(
+                    archive::dir(&env.paths.work_root).join(archive::INDEX_FILE),
+                    "{",
+                )
+                .unwrap()
+            },
+            Some("rollback_archive_unusable"),
+        ),
+        // 封存目錄可由其他人寫入
+        (
+            "dir-writable",
+            |env| chmod(&archive::dir(&env.paths.work_root), 0o777),
+            Some("rollback_archive_unusable"),
+        ),
+        // 索引不見了（目錄還在）：沒有已提交的條目，不是回滾目標；不算不合格
+        (
+            "index-missing",
+            |env| {
+                std::fs::remove_file(archive::dir(&env.paths.work_root).join(archive::INDEX_FILE))
+                    .unwrap()
+            },
+            Some("no_rollback_package"),
+        ),
+    ];
+    for (name, tamper, declined) in cases {
+        // (a) 沒有其他來源：封存不能用就只能換回 pulse.prev
+        // (b) 另有服務帳號暫存、通過驗證的回滾檔：改用它，照常經套件管理員回滾
+        for with_hint in [false, true] {
+            let label = format!("{name}／hint={with_hint}");
+            let env = archived_host(&format!("arch-bad-{name}-{with_hint}"), "deb");
+            tamper(&env);
+            stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+            if with_hint {
+                // 0.9.1 的官方套件（與安裝的同一個 commit、同一份執行檔）
+                let staging = env.root.join("var/lib/pulse/upgrade").join(OTHER_ID);
+                let pkg = artifact_name("0.9.1", NEW_COMMIT, "deb");
+                let rel = testsign::release(
+                    &env.key,
+                    "0.9.1",
+                    NEW_COMMIT,
+                    &[(pkg.as_str(), b"VERSION=0.9.1\n")],
+                    None,
+                );
+                std::fs::write(staging.join(&pkg), "VERSION=0.9.1\n").unwrap();
+                std::fs::write(staging.join(files::ROLLBACK_SUMS_FILE), &rel.sums).unwrap();
+                std::fs::write(staging.join(files::ROLLBACK_SIG_FILE), &rel.sig).unwrap();
+                rewrite_request(&env, |r| r.rollback_artifact = Some(pkg));
+            }
+            let fake = Fake::new(&env.root);
+            fake.set("0.9.2", Behavior::Crash);
+            let r = apply(&env.paths, &fake).unwrap();
+            fake.assert_invariants();
+            assert_eq!(r.state, "rolled_back", "{label}: {r:?}");
+            assert_eq!(env.installed(), "0.9.1", "{label}");
+            let rec = match txn::load_record(&env.paths.work_root.join(OTHER_ID)) {
+                Loaded::V2(r) => *r,
+                other => panic!("{label}: {other:?}"),
+            };
+            let used = fake.calls().contains(&"dpkg rollback.pkg".to_string());
+            match (declined, with_hint) {
+                (None, _) => {
+                    assert!(used, "{label}");
+                    assert_eq!(rec.rollback.unwrap().source, txn::SOURCE_ARCHIVE, "{label}");
+                    assert_eq!(r.code.as_deref(), Some(codes::W_UPGRADE_ROLLED_BACK));
+                }
+                (Some(_), true) => {
+                    // 往下一個來源退：提示來源合格 → 套件回滾，不是降級回滾
+                    assert!(used, "{label}");
+                    assert_eq!(rec.rollback.unwrap().source, txn::SOURCE_HINT, "{label}");
+                    assert_eq!(
+                        r.code.as_deref(),
+                        Some(codes::W_UPGRADE_ROLLED_BACK),
+                        "{label}"
+                    );
+                    assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.1 ii"), "{label}");
+                }
+                (Some(why), false) => {
+                    assert!(!used, "{label}: 不合格的封存不得交給套件管理員");
+                    assert_eq!(rec.rollback, None, "{label}");
+                    assert_eq!(
+                        r.code.as_deref(),
+                        Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED),
+                        "{label}"
+                    );
+                    assert_eq!(reasons(&r), [why, "package_db_inconsistent"], "{label}");
+                }
+            }
+            // 權限被改寬的目錄：測試結束前改回來才刪得掉
+            let d = archive::dir(&env.paths.work_root);
+            if d.is_dir() {
+                chmod(&d, 0o700);
+            }
+            env.cleanup();
+        }
+    }
+
+    // 封存的條目記錄的是另一份執行檔（不是目前安裝的那一份）：不使用。假的套件的內容就是執行檔，所以
+    // 兩個雜湊相同；把索引中的雜湊都換掉並重新計算 checksum——先比對的是執行檔
+    let env = archived_host("arch-bad-binary", "deb");
+    let p = archive::dir(&env.paths.work_root).join(archive::INDEX_FILE);
+    let text = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(
+        &p,
+        txn::reseal(&text.replace(&sha(b"VERSION=0.9.1\n"), &"e".repeat(64))),
+    )
+    .unwrap();
+    assert_eq!(
+        index(&env).unwrap().entries[0].binary_sha256,
+        "e".repeat(64)
+    );
+    stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.2", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        reasons(&r),
+        ["rollback_binary_mismatch", "package_db_inconsistent"],
+        "{r:?}"
+    );
+    assert!(!fake.calls().contains(&"dpkg rollback.pkg".to_string()));
+    env.cleanup();
+
+    // 封存是另一個 commit 的（輔助程式自己的 commit 不同）：不是這個版本的條目，不使用
+    let mut env = archived_host("arch-bad-commit", "deb");
+    env.paths.current_commit = "0dd0dd0".to_string();
+    stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.2", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        reasons(&r),
+        ["no_rollback_package", "package_db_inconsistent"],
+        "{r:?}"
+    );
+    env.cleanup();
+}
+
+/// ADR-0003 的 INV-7、決策點 D1（本機封存）：簽署金鑰**自然到期**（那一行還在，`valid-before` 已過）→
+/// 封存照常使用（取得時已完整驗證、整包雜湊綁定）；金鑰**被撤銷**（那一行已刪除）→ 選用時與回滾當下都
+/// 不使用，換回 `pulse.prev`、降級回滾 `rollback_signer_revoked`，索引記下偵測到撤銷的時間
+#[test]
+fn an_archived_package_survives_key_expiry_but_not_revocation() {
+    let expired = |line: String| {
+        line.replace(
+            "namespaces=\"kairos-pulse-release\"",
+            "namespaces=\"kairos-pulse-release\",valid-before=\"20200101\"",
+        )
+    };
+    for (name, at_rollback, revoked) in [
+        ("expired", false, false),
+        ("revoked", false, true),
+        ("expired-late", true, false),
+        ("revoked-late", true, true),
+    ] {
+        let mut env = archived_host(&format!("arch-key-{name}"), "deb");
+        // 金鑰輪替：之後的發佈以新金鑰簽署；舊金鑰（封存的 0.9.1 的簽署者）到期或被移除
+        let old_line = env.key.allowed_signers();
+        env.key = TestKey::generate();
+        let new_line = env.key.allowed_signers();
+        let anchor = anchor_path(&env);
+        let rotated = if revoked {
+            new_line.clone()
+        } else {
+            format!("{new_line}{}", expired(old_line.clone()))
+        };
+        if at_rollback {
+            // 替換前兩把都有效；替換之後、回滾之前才到期或撤銷
+            std::fs::write(&anchor, format!("{new_line}{old_line}")).unwrap();
+        } else {
+            std::fs::write(&anchor, &rotated).unwrap();
+        }
+        stage_upgrade(&env, OTHER_ID, "0.9.1", "0.9.2");
+        let fake = Fake::new(&env.root);
+        fake.set("0.9.2", Behavior::Crash);
+        if at_rollback {
+            let (a, text) = (anchor.clone(), rotated.clone());
+            *fake.on_restart.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&a, &text).unwrap();
+            }));
+        }
+        let r = apply(&env.paths, &fake).unwrap();
+        fake.assert_invariants();
+        assert_eq!(r.state, "rolled_back", "{name}: {r:?}");
+        assert_eq!(env.installed(), "0.9.1", "{name}");
+        let used = fake.calls().contains(&"dpkg rollback.pkg".to_string());
+        let e = index(&env).unwrap().entries[0].clone();
+        if revoked {
+            assert!(!used, "{name}: 撤銷後不得再執行該簽署者的套件");
+            assert_eq!(
+                reasons(&r),
+                ["rollback_signer_revoked", "package_db_inconsistent"],
+                "{name}"
+            );
+            // 選用時偵測到的撤銷記在索引（回滾當下才偵測到的只影響這一次回滾）
+            assert_eq!(e.revoked_at.is_some(), !at_rollback, "{name}");
+            assert_eq!(e.generation, 1, "{name}: 不是新的提交");
+        } else {
+            assert!(used, "{name}: 自然到期時照常使用封存");
+            assert_eq!(
+                r.code.as_deref(),
+                Some(codes::W_UPGRADE_ROLLED_BACK),
+                "{name}"
+            );
+            assert_eq!(e.revoked_at, None, "{name}");
+            assert_eq!(fake.pkg_db.borrow().as_deref(), Some("0.9.1 ii"), "{name}");
+        }
+        env.cleanup();
+    }
+}
+
+/// 封存的數量與空間上限：只保留 1 份；空間不足或封存失敗時不封存——升級的結果不受影響，下一次回滾
+/// 往下一個來源退
+#[test]
+fn archiving_is_bounded_and_never_fails_the_upgrade() {
+    // 可用空間不足（套件大小加 16 MiB 的餘裕）
+    let mut env = setup("arch-space", "deb");
+    env.paths.free_space = |_| Some(archive::SPACE_MARGIN);
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.detail.as_str()),
+        ("succeeded", ""),
+        "{r:?}"
+    );
+    assert_eq!(index(&env), None);
+    assert_eq!(hint(&env).unwrap().state, "binary_only");
+    let log = std::fs::read_to_string(env.work().join(txn::LOG_FILE)).unwrap();
+    assert!(log.contains("insufficient_space"), "{log}");
+    env.cleanup();
+
+    // 封存目錄被換成檔案：無法封存，升級照常成功
+    let env = setup("arch-blocked", "deb");
+    env.make_work();
+    std::fs::write(archive::dir(&env.paths.work_root), "not a directory").unwrap();
+    let fake = Fake::new(&env.root);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(r.state, "succeeded", "{r:?}");
+    assert_eq!(hint(&env).unwrap().state, "binary_only");
+    env.cleanup();
+
+    // tar 不封存（回滾是 pulse.prev），也不寫提示
+    let env = setup("arch-tar", "tar");
+    let fake = Fake::new(&env.root);
+    assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
+    assert!(!archive::dir(&env.paths.work_root).exists());
+    assert_eq!(hint(&env), None);
+    env.cleanup();
+
+    // 連續升級：封存目錄不隨次數成長（1 份＋索引）
+    let mut env = archived_host("arch-keep", "deb");
+    for (i, (id, to)) in [(OTHER_ID, "0.9.2"), (THIRD_ID, "0.9.3")]
+        .into_iter()
+        .enumerate()
+    {
+        let from = env.installed();
+        stage_upgrade(&env, id, &from, to);
+        let fake = Fake::new(&env.root);
+        assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
+        env.helper_is_installed();
+        let idx = index(&env).unwrap();
+        assert_eq!(idx.generation, 2 + i as u64);
+        assert_eq!(idx.entries.len(), archive::KEEP);
+        let mut names: Vec<String> = std::fs::read_dir(archive::dir(&env.paths.work_root))
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                idx.entries[0].artifact_sha256.clone(),
+                archive::INDEX_FILE.to_string()
+            ]
+        );
+    }
+    // 不屬於封存的項目不動；殘留的暫存目錄在下一次提交時清除
+    let dir = archive::dir(&env.paths.work_root);
+    std::fs::write(dir.join("README"), "x").unwrap();
+    std::fs::create_dir(dir.join(".staging-leftover")).unwrap();
+    std::fs::create_dir(dir.join("a".repeat(64))).unwrap();
+    let from = env.installed();
+    let id = "44444444-5555-4666-8777-888888888888";
+    stage_upgrade(&env, id, &from, "0.9.4");
+    let fake = Fake::new(&env.root);
+    assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
+    assert!(dir.join("README").exists());
+    assert!(!dir.join(".staging-leftover").exists() && !dir.join("a".repeat(64)).exists());
+    env.cleanup();
+}
+
+/// `pulse upgrade archive-current`（與一行安裝腳本的種子）：把目前安裝的版本的套件封存起來，第一次遠端
+/// 升級失敗時就能經套件管理員回滾。資格與遠端升級的回滾來源相同（INV-3、INV-8）：官方簽章完整驗證、
+/// 版本與 commit 是這個執行檔的、套件中的執行檔與安裝的相同；不合格就不封存
+#[test]
+fn archive_current_seeds_the_archive_only_with_the_installed_signed_package() {
+    let package_of = |env: &Env, key: &TestKey, version: &str, commit: &str, content: &str| {
+        let dir = env.root.join("download");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = artifact_name(version, commit, &env.paths.method);
+        let rel = testsign::release(
+            key,
+            version,
+            commit,
+            &[(name.as_str(), content.as_bytes())],
+            None,
+        );
+        std::fs::write(dir.join(&name), content).unwrap();
+        std::fs::write(dir.join("SHA256SUMS"), &rel.sums).unwrap();
+        std::fs::write(dir.join("SHA256SUMS.sig"), &rel.sig).unwrap();
+        ArchiveArgs {
+            package: dir.join(&name),
+            sums: dir.join("SHA256SUMS"),
+            signature: dir.join("SHA256SUMS.sig"),
+            seed: true,
+        }
+    };
+    // 不合格的情況：什麼都不封存
+    let other = TestKey::generate();
+    type Break = fn(&mut Env, &Fake, &mut ArchiveArgs);
+    let bad: [(&str, Break, &str); 8] = [
+        ("tar", |env, _, _| env.paths.method = "tar".into(), "tar"),
+        (
+            "tampered",
+            |_, _, a| std::fs::write(&a.package, "VERSION=0.9.0\n# x\n").unwrap(),
+            "沒有通過驗證",
+        ),
+        (
+            "sums",
+            |_, _, a| {
+                let t = std::fs::read_to_string(&a.sums).unwrap();
+                std::fs::write(&a.sums, format!("{t}# x\n")).unwrap()
+            },
+            "SHA256SUMS 沒有通過驗證",
+        ),
+        (
+            "renamed",
+            |_, _, a| {
+                let to = a
+                    .package
+                    .with_file_name("pulse-0.9.9-1a2b3c4-linux-x86_64.deb");
+                std::fs::rename(&a.package, &to).unwrap();
+                a.package = to;
+            },
+            "沒有通過驗證",
+        ),
+        (
+            "commit",
+            |env, _, _| env.paths.current_commit = "0dd0dd0".into(),
+            "commit",
+        ),
+        (
+            "binary",
+            |env, _, _| {
+                std::fs::write(env.paths.install_dir.join("pulse"), "VERSION=0.9.0\n# y\n").unwrap()
+            },
+            "執行檔不同",
+        ),
+        (
+            "half-installed",
+            |_, fake, _| *fake.pkg_db.borrow_mut() = Some("0.9.0 iF".into()),
+            "套件資料庫",
+        ),
+        (
+            "active",
+            |env, _, _| {
+                env.make_work();
+                txn::write_active(&env.paths.work_root, ID, &"0".repeat(64)).unwrap()
+            },
+            "進行中",
+        ),
+    ];
+    for (name, breakage, needle) in bad {
+        let mut env = setup(&format!("seed-bad-{name}"), "deb");
+        let fake = Fake::new(&env.root);
+        let mut args = package_of(&env, &env.key, "0.9.0", "1a2b3c4", "VERSION=0.9.0\n");
+        breakage(&mut env, &fake, &mut args);
+        let e = archive_current(&env.paths, &fake, &args).unwrap_err();
+        assert!(e.contains(needle), "{name}: {e}");
+        assert_eq!(index(&env), None, "{name}");
+        assert_eq!(hint(&env), None, "{name}");
+        env.cleanup();
+    }
+    // 不是本機信任錨接受的金鑰簽的、另一個版本的套件
+    let env = setup("seed-bad-key", "deb");
+    let fake = Fake::new(&env.root);
+    let args = package_of(&env, &other, "0.9.0", "1a2b3c4", "VERSION=0.9.0\n");
+    assert!(archive_current(&env.paths, &fake, &args).is_err());
+    let args = package_of(&env, &env.key, "0.8.0", "1a2b3c4", "VERSION=0.9.0\n");
+    assert!(archive_current(&env.paths, &fake, &args).is_err());
+    assert_eq!(index(&env), None);
+    env.cleanup();
+
+    // 合格：封存（來源 seed／install），重做不變；第一次遠端升級失敗就以它經套件管理員回滾
+    for method in ["deb", "rpm"] {
+        let env = setup(&format!("seed-ok-{method}"), method);
+        let fake = Fake::new(&env.root);
+        let mut args = package_of(&env, &env.key, "0.9.0", "1a2b3c4", "VERSION=0.9.0\n");
+        let msg = archive_current(&env.paths, &fake, &args).unwrap();
+        assert!(
+            msg.contains("已封存") && msg.contains("generation 1"),
+            "{msg}"
+        );
+        let idx = index(&env).unwrap();
+        let e = &idx.entries[0];
+        assert_eq!(
+            (
+                e.version.as_str(),
+                e.commit.as_str(),
+                e.source.as_str(),
+                e.generation
+            ),
+            ("0.9.0", "1a2b3c4", "seed", 1)
+        );
+        assert_eq!(hint(&env).unwrap().state, "archived");
+        assert!(
+            std::fs::read_dir(archive::dir(&env.paths.work_root))
+                .unwrap()
+                .flatten()
+                .all(|d| !d.file_name().to_string_lossy().starts_with(".staging-")),
+            "暫存目錄已清除"
+        );
+        // 再執行一次（本機管理者）：已是目前的版本，不產生新的 generation
+        args.seed = false;
+        let msg = archive_current(&env.paths, &fake, &args).unwrap();
+        assert!(msg.contains("generation 1"), "{msg}");
+        assert_eq!(index(&env).unwrap(), idx);
+        // 第一次遠端升級（0.9.0 → 0.9.1）失敗：沒有 Kairos 的回滾檔，仍經套件管理員回滾
+        let fake = Fake::new(&env.root);
+        fake.set("0.9.1", Behavior::Crash);
+        let r = apply(&env.paths, &fake).unwrap();
+        fake.assert_invariants();
+        assert_eq!(
+            (r.state.as_str(), r.code.as_deref()),
+            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+            "{method}: {r:?}"
+        );
+        assert_eq!(
+            fake.pkg_db.borrow().as_deref(),
+            Some("0.9.0 ii"),
+            "{method}"
+        );
+        assert_eq!(env.record().rollback.unwrap().source, txn::SOURCE_ARCHIVE);
+        env.cleanup();
+    }
+}
+
+/// 輔助程式留給 Pulse 的提示（`rollback.json`，hello 的 `install.rollback`）：降級回滾之後是 `degraded`，
+/// 記下當時的執行檔與套件資料庫；之後的交易（沒有改變執行檔與套件資料庫）不會把它洗掉；套件重新安裝
+/// 之後就不再是
+#[test]
+fn the_rollback_hint_tracks_degraded_until_the_package_is_repaired() {
+    let env = setup("hint-degraded", "deb");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    let r = apply(&env.paths, &fake).unwrap();
+    assert_eq!(
+        reasons(&r),
+        ["no_rollback_package", "package_db_inconsistent"]
+    );
+    let h = hint(&env).unwrap();
+    assert_eq!(
+        (h.schema.as_str(), h.state.as_str(), h.pkg_db.as_deref()),
+        (files::ROLLBACK_HINT_SCHEMA, "degraded", Some("0.9.1 ii"))
+    );
+    assert_eq!(h.binary_sha256, sha(b"VERSION=0.9.0\n"));
+    // 之後一次在預檢就失敗的請求（什麼都沒變）：仍然需要修復套件
+    stage_upgrade(&env, OTHER_ID, "0.9.0", "0.9.2");
+    let next = Fake::new(&env.root);
+    *next.pkg_db.borrow_mut() = Some("0.9.1 ii".into());
+    next.check_config.set(1);
+    let r = apply(&env.paths, &next).unwrap();
+    assert_eq!(r.state, "failed", "{r:?}");
+    assert_eq!(hint(&env).unwrap().state, "degraded");
+    // 本機管理者重新安裝了套件（套件資料庫回到 0.9.0）：下一筆交易結束時不再是 degraded
+    stage_upgrade(&env, THIRD_ID, "0.9.0", "0.9.2");
+    let next = Fake::new(&env.root);
+    next.check_config.set(1);
+    assert_eq!(apply(&env.paths, &next).unwrap().state, "failed");
+    assert_eq!(hint(&env).unwrap().state, "binary_only");
     env.cleanup();
 }
 

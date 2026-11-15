@@ -634,6 +634,33 @@ root 封存與索引（主鍵為發佈檔 SHA-256、generation、政策快照、
 | 0b-3：`read_state` 判斷「已動過手」時另外看 `pulse.prev` 的雜湊與套件資料庫版本 | 沒有指標的 `preparing`／`prepared` 紀錄：比對執行檔的雜湊（`old_binary_sha256`）與套件資料庫（`pkg_db_before`），不同就 `state_unusable`；`pulse.prev` 的雜湊用在「是否已保留」「能否用來回滾」的判斷 | `pulse.prev` 在交易之前可能已經存在（上一次升級留下的），它的存在或內容不能說明這一筆交易是否動過手；執行檔與套件資料庫才是 |
 | 0b-7 的當機點清單 | 22 個當機點（`REMOTE.md` 第 17.9.4 節），涵蓋並細分 0b-7 列的每一點 | — |
 
+### 2026-11-15：階段 1 與階段 2（Linux）的實作紀錄
+
+第 9.2 節（階段 1）與第 9.3 節（階段 2）已實作（分支 `sprint14/rollback-bundle`，0.11.0 之後的版本；待決事項皆採文內建議）。規格寫回 [`REMOTE.md`](../../crates/kairos-proto/REMOTE.md)：第 2.1、2.4.1、2.4.3、2.6、4.2.2、4.2.3、4.4.2、4.5.2、4.5.3、4.7.2、4.7.4、4.8、5.1、5.3、11、12.1、17.3、17.5、17.8 節，第 17.9.4 節第 23、24 列，以及新的第 17.10 節（封存的格式、寫入順序、損毀處理、種子、提示、上限；**INV-1～INV-11 與測試的對照在第 17.10.9 節**）。第 10 節表中 #5（套件回滾失敗的降級）、#7（第 4.5.3 節）隨之完成；#6（版本庫多份簽章，P8）沒有做。
+
+| 項目 | 實作 |
+|---|---|
+| 階段 1：協定 | `upgrade_offer.rollback_bundle`、`fit_upgrade_offer`（三段式規則，以完整的 `ServerMsg` 實際序列化）、`degraded_reasons`；PROTOCOL.md 的測試向量與凍結的舊型別測試 |
+| 階段 1：Kairos | 附 bundle、省略、`offer_too_large`；降級回滾的暫停、稽核、主機標記；資格分類與預覽的 `rollback`；主控台 |
+| 階段 1：Pulse 與輔助程式 | 來源順序（本機紀錄 → bundle）；A2（commit 前綴比對、解開套件比對執行檔）；回滾當下的撤銷檢查；套件回滾失敗的緊急復原；降級回滾的結果與本機顯示；`pulse-install.sh` 的種子紀錄 |
+| 階段 2 | root 封存與索引（主鍵為發佈檔 SHA-256、generation、政策快照、撤銷時間）、保留 1 份與清理、封存優先；撤銷判斷（D1）；hello 的 `install.rollback`（schema v13）；`pulse upgrade archive-current` 與 `pulse-install.sh` 的種子封存；紀錄格式在 `kairos-proto` 的 `release::ReleaseRecord` |
+
+實作與本 ADR 字面不同之處（理由見 `REMOTE.md` 第 17.10.9 節）：
+
+| 本 ADR | 實作 |
+|---|---|
+| 第 5.4 節：降級回滾列的是「套件管理員命令失敗」與撤銷 | deb／rpm **只要以 `pulse.prev` 回滾**（含本來就沒有合格的回滾套件）都回報為降級回滾；因此勾選「允許無法自動回滾」的推送在第一台失敗時會暫停 |
+| 第 5.4 節：Kairos「開告警」 | 由既有的系統規則「升級推送已暫停」（`pause_cause` 為 `rollback_degraded`／`offer_too_large`）開，沒有新增告警規則 |
+| 第 6.3 節規則 3：主機標為明確的原因 | 主機 `failed`（`reason: offer_too_large`，可重試）並暫停推送 |
+| P9：Pulse 回報 `install.rollback` | Pulse 依輔助程式留在服務帳號目錄的提示（`rollback.json`）回報；提示綁定執行檔雜湊與套件資料庫的狀態，只影響顯示與資格預覽 |
+| 第 9.2 節：種子紀錄含發佈檔雜湊 | 種子紀錄只有 `SHA256SUMS` 與簽章（提示）；雜湊綁定在種子封存的條目 |
+| 第 5.3 節：封存與交易紀錄保存簽署者指紋、撤銷狀態 | 相同；回滾當下才偵測到的撤銷不寫回封存索引（選用封存時偵測到的才寫） |
+| 第 9.4 節的 systemd 情境 | 實作了 b0（改預期：種子封存與 bundle）、封存的回滾、`archive-tamper`、`degraded`（回滾檔的簽章被換掉；含修復與 `archive-current`）；`pkg-rollback-fails`、`binary-mismatch`、`key-expired`／`key-revoked`、封存當機點的斷電模擬只有單元測試 |
+
+沒有做（不在這次的範圍）：Windows（ADR-0001 的版本槽）、P8（版本庫多份簽章與重簽）、P12（撤銷後強制套件回滾的命令，照建議第一版不提供）、Windows 的 `previous_slot_signer_revoked`。新的代碼 `PLS-W8418`／`KRS-W8418`（降級回滾）、`KRS-W8419`（`offer_too_large`）是暫定號，待設計包分配。
+
+第 12 節未確認事項的現況：第 5 項（`PULSE_BUILD_COMMIT` 與發佈檔名的 commit 一致）、第 6 項（安裝後的 `/opt/pulse/pulse` 與套件內的位元組相同）由 `tests/systemd` 的套件回滾實測（A2 的兩項比對都通過才會經套件管理員回滾）；第 2、4 項由序列化測試與凍結型別測試涵蓋；第 7 項（`prerm` 使套件回滾失敗）仍只有假套件管理員的單元測試。
+
 ### 2026-11-14：接續 `replaced` 時的健康確認（0.10.1；設計變更，不改變本 ADR 的任何決定）
 
 0.10.0 的輔助程式在接續 `replaced` 的交易時，健康確認期限已過就不做任何檢查、直接回滾（`REMOTE.md` 第 17.9.4 節第 13、14 列原本的設計）。輔助程式被終止很久才再觸發、主機關機很久才開機，或紀錄不可用／路徑不安全由人修好之後才接續時，這會退掉一個可能已經健康運作的升級。0.10.1（分支 `sprint12/hardening`）改為：接續時至少有 120 秒做**與正常流程相同**的健康確認，通過就是 `succeeded`，不通過才回滾；崩潰偵測的基準在接續時先判斷「接續之前有沒有崩潰過」再決定（新欄位 `boot_id`）。細節在 `REMOTE.md` 第 17.9.3 節「接續 `replaced` 時的健康確認」與第 17.9.10 節。

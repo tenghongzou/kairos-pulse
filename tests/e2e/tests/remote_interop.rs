@@ -286,9 +286,15 @@ fn real_kairos_pushes_central_config_to_a_real_pulse() {
     );
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["data"]["install"]["external_url"], "none", "{v}");
+    // 實際的 Pulse 也宣告 install.rollback（REMOTE.md 第 2.1 節；ADR-0003 階段 2）：這裡的 Pulse 不是安裝在
+    // /opt/pulse 的服務，遠端升級沒有就緒 → `none`（沒有自動回滾），也不需要修復套件
+    assert_ne!(v["data"]["install"]["upgrade"], "ready", "{v}");
+    assert_eq!(v["data"]["install"]["rollback"], "none", "{v}");
+    assert_eq!(v["data"]["package_repair_needed"], false, "{v}");
     let (s, v) = call("GET", &format!("/api/v1/hosts/{}", GOOD.agent_id), None);
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["data"]["install"]["external_url"], "none", "{v}");
+    assert_eq!(v["data"]["install"]["rollback"], "none", "{v}");
 
     p.stop();
     let (code, _) = k.stop();

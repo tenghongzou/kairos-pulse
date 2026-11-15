@@ -353,6 +353,10 @@ pub const W_UPGRADE_UNSUPPORTED: &str = "PLS-W8411";
 pub const W_UPGRADE_SPACE: &str = "PLS-W8412";
 /// 升級完成
 pub const I_UPGRADE_COMPLETED: &str = "PLS-I8416";
+/// 降級回滾（ADR-0003 第 5.4 節；REMOTE.md 第 4.5.2 節）：健康確認失敗後服務已恢復到舊版，但 deb／rpm
+/// 只換回了執行檔（沒有可用的回滾套件、套件回滾失敗，或回滾套件的簽署金鑰已撤銷），套件資料庫與實際的
+/// 執行檔不一致，需要重新安裝目前版本的套件。**暫定號**（正式分配由設計包負責）
+pub const W_UPGRADE_ROLLED_BACK_DEGRADED: &str = "PLS-W8418";
 
 /// 程式中有常數的代碼（[`title`] 認得的代碼）；不認得時 `None`
 pub fn known(code: &str) -> Option<&'static str> {
@@ -471,6 +475,7 @@ const ALL_CODES: &[&str] = &[
     E_UPGRADE_PRECHECK,
     E_UPGRADE_REPLACE,
     W_UPGRADE_ROLLED_BACK,
+    W_UPGRADE_ROLLED_BACK_DEGRADED,
     E_UPGRADE_ROLLBACK_FAILED,
     I_UPGRADE_DISABLED,
     W_UPGRADE_DOWNGRADE,
@@ -593,6 +598,9 @@ pub fn title(code: &str) -> Option<&'static str> {
         E_UPGRADE_PRECHECK => "新版預檢失敗，沒有變更",
         E_UPGRADE_REPLACE => "替換失敗，已復原",
         W_UPGRADE_ROLLED_BACK => "升級後沒有恢復正常，已自動回滾",
+        W_UPGRADE_ROLLED_BACK_DEGRADED => {
+            "升級後沒有恢復正常，已回滾，但只換回執行檔：需要重新安裝目前版本的套件"
+        }
         E_UPGRADE_ROLLBACK_FAILED => "升級回滾失敗，需要人工處理",
         I_UPGRADE_DISABLED => "遠端升級在這台主機上停用",
         W_UPGRADE_DOWNGRADE => "不接受降版",

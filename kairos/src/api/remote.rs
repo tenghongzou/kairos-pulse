@@ -857,9 +857,12 @@ async fn host_upgrade(
             Ok(json!({
                 "agent_id": a,
                 "agent_version": h.agent_version,
-                "install": {"method": h.install_method, "upgrade": h.install_upgrade, "config": h.install_config, "external_url": h.install_external_url},
+                "install": {"method": h.install_method, "upgrade": h.install_upgrade, "config": h.install_config, "external_url": h.install_external_url, "rollback": h.install_rollback},
                 "arch": rollout::arch_of(h.os.as_deref()),
                 "rollback_failed": rollback_failed,
+                // 需要修復套件（降級回滾之後；REMOTE.md 第 4.5.2 節）。連線中的主機在下面以 hello 重算
+                "package_repair_needed": rollout::needs_package_repair(h.install_rollback.as_deref(), &list),
+                "recent_degraded": list.iter().any(|u| rollout::degraded_of(u).is_some()),
                 "upgrades": list.iter().map(rollout::host_json).collect::<Vec<_>>(),
             }))
         })
@@ -881,6 +884,12 @@ async fn host_upgrade(
             // external_url 不沿用清冊的舊值：hello 帶 install 而沒有這個欄位＝沒有宣告（未知）
             if l.install_upgrade.is_some() {
                 data["install"]["external_url"] = json!(l.install_external_url);
+                data["install"]["rollback"] = json!(l.install_rollback);
+                // 宣告了就以宣告為準；沒有宣告時沿用依升級紀錄算出的值
+                if let Some(v) = l.install_rollback.as_deref() {
+                    data["package_repair_needed"] =
+                        json!(v == kairos_proto::mgmt::INSTALL_ROLLBACK_DEGRADED);
+                }
             }
             if let Some(arch) = rollout::arch_of(l.os.as_deref()) {
                 data["arch"] = json!(arch);

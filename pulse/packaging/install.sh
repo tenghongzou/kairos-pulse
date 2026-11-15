@@ -208,6 +208,42 @@ add_section() {
 [ "$REMOTE_UPGRADE" = 1 ] || add_section upgrade
 [ "$REMOTE_CONFIG" = 1 ] || add_section remote_config
 
+# 4c. 回滾的種子（crates/kairos-proto/REMOTE.md 第 4.4.2、17.10.5 節；ADR-0003）：讓這台主機**第一次**遠端
+#     升級失敗時也能經套件管理員裝回現在這一版（套件資料庫保持一致），不必依賴 Kairos 的版本庫有這個版本。
+#     兩者都不影響安裝的結果：做不到只提醒，屆時回滾改為只換回執行檔（主控台會標示需要修復套件）。
+#     (1) 本機紀錄：這次發佈的 SHA256SUMS 與簽章，放在服務帳號的狀態目錄（只是提示：升級輔助程式會以
+#         信任錨重新驗證）。以服務帳號寫入——那個目錄是服務帳號可寫的，root 不直接在裡面建立檔案
+#     (2) 本機封存：把剛安裝的套件交給 pulse 自己驗證（信任錨、版本、commit、套件中的執行檔都要與安裝的
+#         相同）後封存到 root 專用的 /var/lib/pulse-upgrade/archive/
+if [ "$REMOTE_UPGRADE" = 1 ]; then
+    SEED_VERSION=$(/opt/pulse/pulse --version 2>/dev/null | awk '{print $2}')
+    case "$SEED_VERSION" in
+    "" | *[!0-9A-Za-z.+-]*) SEED_VERSION="" ;;
+    esac
+    if [ -n "$SEED_VERSION" ] && id pulse >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1; then
+        # 與 pulse.service 的 StateDirectory=pulse（0755、擁有者 pulse）相同；服務第一次啟動前可能還不存在
+        install -d -o pulse -g pulse -m 755 /var/lib/pulse
+        seed_as_pulse() {
+            # $1 = 目的檔名；內容從 stdin
+            setpriv --reuid pulse --regid pulse --init-groups sh -c '
+                umask 027
+                d=/var/lib/pulse/upgrade/releases/$1
+                mkdir -p "$d" && cat >"$d/$2.tmp" && mv "$d/$2.tmp" "$d/$2"' sh "$SEED_VERSION" "$1"
+        }
+        if seed_as_pulse SHA256SUMS <"$WORK/SHA256SUMS" && seed_as_pulse SHA256SUMS.sig <"$WORK/SHA256SUMS.sig"; then
+            say "已保存這次發佈的簽章紀錄（/var/lib/pulse/upgrade/releases/$SEED_VERSION）"
+        else
+            echo "注意：無法保存這次發佈的簽章紀錄（不影響安裝）" >&2
+        fi
+    fi
+    if /opt/pulse/pulse upgrade archive-current --seed --package "$WORK/$PKG" \
+        --sums "$WORK/SHA256SUMS" --signature "$WORK/SHA256SUMS.sig" >&2; then
+        :
+    else
+        echo "注意：無法封存 $PKG 作為回滾的種子（不影響安裝）；之後可以執行 pulse upgrade archive-current 補上" >&2
+    fi
+fi
+
 # 5. 註冊（私鑰在本機產生，不會離開這台主機）；需人工核准時不等待，服務在背景接續
 code=0
 if [ "$ENROLL" = 1 ]; then

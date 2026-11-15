@@ -183,6 +183,7 @@ varint 為 LEB128。數值保留收到的 JSON 數字種類，`kairos reports ex
 - v10（0.10.0，衝刺 10，HA L2）：叢集協調的資料表（第 20 節）。`cluster_nodes`、`cluster_leases`、`cluster_revs`、`host_presence`、`cluster_events`、`alert_event_seq`、`login_challenges`、`enroll_nonces`、`auth_failures` 與索引；`enroll_requests.issuing_node`、`issuing_at`；`alert_deliveries.claim_epoch`。SQL 在 `store/sqlite/cluster.rs` 的 `SCHEMA_V10`。叢集模式只支援 PostgreSQL，SQLite 上這些資料表保持空白（兩個後端的資料表一致，`kairos db migrate` 才能一對一複製）。0.10.0 沒有停在 v10 的發佈版本：與 v11 一起套用。
 - v11（0.10.0，衝刺 10，商業審計 F8）：升級推送的雙人覆核（REMOTE.md 第 5.4 節）。`rollouts` 新增 `submitted_at`、`submitted_by`、`reject_reason`（`approved_at`／`approved_by` v9 就有，0.10.0 起使用）。只新增三個可為 NULL 的欄位；SQLite 的 SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V11_ROLLOUT_APPROVAL`，PostgreSQL 在 `store/postgres/schema.rs` 的 `SCHEMA_V11`（`UPGRADES` 的第二步；全新的 schema 建立 v9 後依序套用 v10、v11）。0.9 的資料庫（v9）第一次以 0.10.0 啟動時在一個交易中依序套用 v10、v11；升級後 0.9 的 Kairos 無法開啟（降版從備份還原）。
 - v12（0.11.0 起）：hello 的 `install.external_url`（REMOTE.md 第 2.1 節）。`hosts` 新增 `install_external_url`（TEXT，可為 NULL：`none`／`allowlist`；NULL＝Pulse 沒有宣告）。只新增一個可為 NULL 的欄位，不修改既有的資料；SQLite 的 SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V12_INSTALL_EXTERNAL_URL`，PostgreSQL 在 `store/postgres/schema.rs` 的 `SCHEMA_V12`（`UPGRADES` 的第三步）。與其他 `install_*` 欄位不同，清冊同步時**不以 `coalesce` 保留舊值**：hello 帶 `install.upgrade` 時整個取代（沒有宣告就寫 NULL——Pulse 降回舊版後是「未知」），沒有主機資訊的同步才保留。v11 的資料庫第一次以新版啟動時自動升級；升級後 0.10.1 以前的 Kairos 無法開啟（降版從備份還原），叢集的升級步驟照「schema 改變的版本」（INSTALL.md）。
+- v13（0.11.0 之後的版本）：hello 的 `install.rollback`（REMOTE.md 第 2.1 節；ADR-0003 階段 2）。`hosts` 新增 `install_rollback`（TEXT，可為 NULL：`archived`／`binary_only`／`none`／`degraded`；NULL＝Pulse 沒有宣告）。只新增一個可為 NULL 的欄位，不修改既有的資料；SQLite 的 SQL 在 `store/sqlite/remote.rs` 的 `SCHEMA_V13_INSTALL_ROLLBACK`，PostgreSQL 在 `store/postgres/schema.rs` 的 `SCHEMA_V13`（`UPGRADES` 的第四步）。寫入規則與 `install_external_url` 相同：hello 帶 `install.upgrade` 時整個取代（沒有宣告就寫 NULL），沒有主機資訊的同步才保留。v12 的資料庫第一次以新版啟動時自動升級；升級後 0.11.0 以前的 Kairos 無法開啟（降版從備份還原），叢集的升級步驟照「schema 改變的版本」（INSTALL.md）。
 - 資料庫中**沒有任何私鑰**：簽發 CA 的私鑰在 `data/pki/`（0600，目錄 0700），`kairos db backup` 不含它，需另外（加密）備份；註冊 token 與 `poll_secret` 只存 SHA-256。
 
 ## 4. 寫入路徑與批次策略
@@ -759,7 +760,7 @@ store/sqlite/{audit,users,tokens,pki,enroll,alerts,hosts,api,admin}.rs：原封�
 | `rollouts` | 推送：`rollout_id`（`r-YYYYMMDD-NNNN`）、`name`、`release_id`、`selector`／`waves`／`schedule`／`options`（JSON）、`state`、`current_wave`、`wave_started_at`、`soak_until`、`awaiting_continue`、`pause_reason`、`pause_cause`（自動暫停的原因，告警用）、`cancel_reason`、建立、開始、完成與更新的時間（`approved_*` 保留給 0.10 的雙人覆核）；索引 `rollouts_state` | `rollout_id` |
 | `rollout_hosts` | 推送中的每台主機：`upgrade_id`（唯一）、`wave`（`skipped` 為 -1）、`ordinal`、`state`、`reason`、`from_version`、`to_version`、`attempts`、`bytes_done`／`bytes_total`、`code`、`detail`、`offered_at`、`applying_at`、`finished_at`、`updated_at`、`acknowledged_at`／`_by`；索引 `rollout_hosts_host`、`rollout_hosts_state` | (`rollout_id`, `host_id`) |
 
-- `hosts` 新增 `install_method`、`install_upgrade`、`install_config`（hello 的 `install`，由清冊同步寫入，與 `os` 相同以 `coalesce` 保留上一次的值）。schema v12 另有 `install_external_url`（hello 的 `install.external_url`；每次帶 `install.upgrade` 的 hello 整個取代，不保留舊值，見前面「schema 版本」的 v12）。
+- `hosts` 新增 `install_method`、`install_upgrade`、`install_config`（hello 的 `install`，由清冊同步寫入，與 `os` 相同以 `coalesce` 保留上一次的值）。schema v12 另有 `install_external_url`（hello 的 `install.external_url`；每次帶 `install.upgrade` 的 hello 整個取代，不保留舊值，見前面「schema 版本」的 v12）。schema v13 另有 `install_rollback`（hello 的 `install.rollback`；寫入規則相同）。
 - `meta.config_rev`：全域單調遞增的設定版本（任何設定檔、指派改變時加 1）。
 - **與 REMOTE.md 第 6 節草案的差異**：`rollouts` 另有 `target_version`、`pause_cause`，`release_id` 不設外鍵（rusqlite 內附的 SQLite 預設開啟外鍵檢查，刪除版本後已結束的推送仍要能顯示目標）；`host_config` 以 `agent_id` 為鍵、另記最近一次 hello 的標籤與版本（主機可能在 report 寫入清冊之前就送出 `config_get`；清冊每 30 秒才同步一次，期望設定以 hello 的標籤計算）；主鍵欄位沿用既有的命名（`profile_id`、`assignment_id`、`release_id`）；`releases` 另有 `signer_principal`、`manifest_name`；`release_artifacts` 另有 `stored_at`；`rollout_hosts` 另有 `acknowledged_at`／`_by`（回滾失敗標記為已處理）。
 - **寫入**：遠端管理有自己的資料庫連線（與註冊服務相同的做法：一條寫入連線、busy 等待 2 秒、兩個寫入交易之間至少間隔 2 毫秒，加上數條唯讀連線），每個操作一個 `BEGIN IMMEDIATE` 交易、稽核在同一個交易中。8443 上的 `config_status`、`upgrade_status` 各一個短交易；`config_get`、`upgrade_get`、`upgrade_chunk_get` 只讀（發佈檔的內容從檔案讀，不在資料庫中）。心跳的 `pending` 不查資料庫（記憶體中的 `desired_rev` 與提議中的 `upgrade_id`，啟動時載入）。
@@ -812,7 +813,7 @@ connect_timeout_secs = 5
 
 ### 19.2 schema
 
-與 SQLite 的 schema 一對一（`store/postgres/schema.rs`；目前是 v12：`SCHEMA_V9` 加上 `UPGRADES` 的升級步驟 v10、v11、v12）：資料表、欄位、索引名稱相同，第一次啟動（或任何會建立資料庫的 CLI）時在空的 schema 上以一個交易建立目前的版本。對應規則（HA.md 第 5.3 節）：
+與 SQLite 的 schema 一對一（`store/postgres/schema.rs`；目前是 v13：`SCHEMA_V9` 加上 `UPGRADES` 的升級步驟 v10、v11、v12、v13）：資料表、欄位、索引名稱相同，第一次啟動（或任何會建立資料庫的 CLI）時在空的 schema 上以一個交易建立目前的版本。對應規則（HA.md 第 5.3 節）：
 
 | SQLite | PostgreSQL |
 |---|---|

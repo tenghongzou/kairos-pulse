@@ -698,3 +698,352 @@ fn external_url_declaration_reaches_the_eligibility_preview() {
     let (code, _) = k.stop();
     assert_eq!(code, 0, "{}", k.dump());
 }
+
+/// 以系統的 `ssh-keygen` 產生臨時的發佈金鑰並簽署（測試向量只有一次發佈；回滾檔的情境需要兩次）
+#[cfg(unix)]
+struct Signer {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Signer {
+    fn new(dir: &std::path::Path) -> Self {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "e2e", "-f"])
+            .arg(dir.join("key"))
+            .output()
+            .expect("需要 ssh-keygen（OpenSSH 8.1 以上）");
+        assert!(out.status.success(), "{out:?}");
+        let public = std::fs::read_to_string(dir.join("key.pub")).unwrap();
+        let mut parts = public.split_whitespace();
+        let (kind, blob) = (parts.next().unwrap(), parts.next().unwrap());
+        std::fs::write(
+            dir.join("allowed_signers"),
+            format!("release@kairos-pulse namespaces=\"kairos-pulse-release\" {kind} {blob}\n"),
+        )
+        .unwrap();
+        Self {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    fn allowed_signers(&self) -> std::path::PathBuf {
+        self.dir.join("allowed_signers")
+    }
+
+    /// 一次發佈：(`SHA256SUMS`, 簽章, 清單的內容)；`files` 為 (檔名, 內容)
+    fn release(
+        &self,
+        version: &str,
+        commit: &str,
+        files: &[(&str, &[u8])],
+    ) -> (String, String, String) {
+        let manifest = format!(
+            "{{\"schema\":\"kairos-pulse.release/v1\",\"product\":\"pulse\",\"version\":\"{version}\",\"commit\":\"{commit}\",\"released_at\":\"2026-11-18\",\"min_kairos\":\"0.5.0\",\"min_upgrade_from\":\"0.9.0\",\"remote_features\":[\"config\",\"upgrade\"],\"breaking\":false}}\n"
+        );
+        let manifest_name = format!("pulse-{version}-{commit}-release.json");
+        let mut entries: Vec<(String, String)> = files
+            .iter()
+            .map(|(n, b)| (n.to_string(), kairos_proto::release::sha256_hex(b)))
+            .collect();
+        entries.push((
+            manifest_name,
+            kairos_proto::release::sha256_hex(manifest.as_bytes()),
+        ));
+        entries.sort();
+        let sums: String = entries.iter().map(|(n, h)| format!("{h}  {n}\n")).collect();
+        let work = self.dir.join(format!("release-{version}"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("SHA256SUMS"), &sums).unwrap();
+        let out = std::process::Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-n", "kairos-pulse-release", "-f"])
+            .arg(self.dir.join("key"))
+            .arg(work.join("SHA256SUMS"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let sig = std::fs::read_to_string(work.join("SHA256SUMS.sig")).unwrap();
+        (sums, sig, manifest)
+    }
+}
+
+/// ADR-0003 階段 1、2 的 Kairos 端（實際的 Kairos；模擬的 deb 主機）：
+///
+/// - 版本庫有主機目前的版本時，提議附回滾檔與它所屬發佈的簽章資料（`rollback_bundle`）；Pulse 端以本機
+///   信任錨驗證得過；整則訊息在單行上限內（較舊的 Pulse 忽略這個欄位）
+/// - 降級回滾（`rolled_back`＋`degraded:`）：推送自動暫停（`rollback_degraded`）、主機列帶原因、主機
+///   「需要修復套件」；之後 hello 宣告 `install.rollback` 時以宣告為準
+#[cfg(unix)]
+#[test]
+fn rollback_bundle_is_offered_and_a_degraded_rollback_is_surfaced() {
+    let root = TestDir::new("remote-bundle");
+    let kairos = Kairos::new(&root, test_pki::CRL_EMPTY);
+    let signer = Signer::new(&root.sub("signer"));
+    let toml = kairos.dir.join("kairos.toml");
+    let mut cfg = std::fs::read_to_string(&toml).unwrap();
+    cfg.push_str(&format!(
+        "\n[remote]\nallowed_signers = {:?}\n",
+        signer.allowed_signers().to_string_lossy()
+    ));
+    std::fs::write(&toml, cfg).unwrap();
+    let mut k = start_kairos(
+        &kairos.dir,
+        &[("KAIROS_TEST_REMOTE_START_GRACE_MS", "1")],
+        &kairos.ports(),
+        &[KAIROS_STARTED],
+    );
+    let (code, p) = run_to_exit(
+        "kairos",
+        &kairos.dir,
+        &[
+            "api-token",
+            "create",
+            "--name",
+            "admin",
+            "--role",
+            "admin",
+            "--config",
+            "kairos.toml",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{}", p.dump());
+    let doc: Value = serde_json::from_str(p.stdout().trim()).unwrap();
+    let token = doc["data"]["token"].as_str().unwrap().to_string();
+    let port = kairos.console_port;
+    let post = |path: &str, body: Value| {
+        api_request(
+            port,
+            "POST",
+            path,
+            &token,
+            Some(("application/json", body.to_string().as_bytes())),
+        )
+    };
+    let get = |path: &str| {
+        let (s, v) = api_request(port, "GET", path, &token, None);
+        assert_eq!(s, 200, "{path}: {v}");
+        v["data"].clone()
+    };
+
+    // 版本庫：主機目前的版本（0.9.0）與目標（0.9.2），各一個 deb
+    let old_deb = (
+        "pulse-0.9.0-1a2b3c4-linux-x86_64.deb",
+        b"deb 0.9.0\n".as_slice(),
+    );
+    let new_deb = (
+        "pulse-0.9.2-6f7a8b9-linux-x86_64.deb",
+        b"deb 0.9.2\n".as_slice(),
+    );
+    let (old_sums, old_sig, old_manifest) = signer.release("0.9.0", "1a2b3c4", &[old_deb]);
+    let (new_sums, new_sig, new_manifest) = signer.release("0.9.2", "6f7a8b9", &[new_deb]);
+    for (version, sums, sig, manifest, file) in [
+        ("0.9.0", &old_sums, &old_sig, &old_manifest, old_deb),
+        ("0.9.2", &new_sums, &new_sig, &new_manifest, new_deb),
+    ] {
+        let (s, v) = post(
+            "/api/v1/releases",
+            json!({"sha256sums": sums, "signature": sig, "manifest": manifest}),
+        );
+        assert_eq!(s, 201, "{v}");
+        let (s, v) = api_request(
+            port,
+            "PUT",
+            &format!("/api/v1/releases/{version}/artifacts/{}", file.0),
+            &token,
+            Some(("application/octet-stream", file.1)),
+        );
+        assert_eq!(s, 200, "{v}");
+    }
+
+    // 模擬的 deb 主機（0.9.0）；`rollback`：hello 的 install.rollback（None＝較舊的 Pulse，沒有宣告）
+    let connect = |rollback: Option<&str>| {
+        let mut h = hello("0.9.0");
+        h["install"]["method"] = json!("deb");
+        if let Some(r) = rollback {
+            h["install"]["rollback"] = json!(r);
+        }
+        let mut c = RawClient::connect(kairos.port, GOOD);
+        c.send(&h);
+        let ack = c.recv();
+        assert_eq!(ack["type"], "hello_ack", "{rollback:?}: {ack}");
+        assert_eq!(ack["proto"], 2, "{ack}");
+        c.send(&json!({"type": "report", "seq": 2, "ts": TS, "metrics": [{"name": "system.cpu.usage", "value": 3.0, "unit": "%"}]}));
+        assert_eq!(c.recv()["type"], "ack");
+        c
+    };
+    let mut c = connect(None);
+    let mut seq = 2;
+    let spec = json!({
+        "name": "bundle", "target_version": "0.9.2",
+        "selector": {"agent_ids": [GOOD.agent_id]}, "waves": [{"size": "rest"}],
+    });
+    // 預覽：版本庫有目前的版本 → 預期以版本庫的回滾檔回滾，不是 no_rollback
+    assert!(
+        poll_until(WAIT, || {
+            let (_, v) = post("/api/v1/rollouts/preview", spec.clone());
+            v["data"]["eligible"] == 1
+        }),
+        "主機沒有進入清冊\n{}",
+        k.dump()
+    );
+    let (_, v) = post("/api/v1/rollouts/preview", spec.clone());
+    assert_eq!(
+        v["data"]["rollback"],
+        json!({"archive": 0, "repository": 1, "binary_only": 0, "degraded_hosts": 0}),
+        "{v}"
+    );
+    assert_eq!(v["data"]["no_rollback"], 0, "{v}");
+    let (s, v) = post("/api/v1/rollouts", spec);
+    assert_eq!(s, 201, "{v}");
+    let id = v["data"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post(
+        &format!("/api/v1/rollouts/{id}/submit"),
+        json!({"confirm": "升級 1 台"}),
+    );
+    assert_eq!(s, 200, "{v}");
+    let ack = heartbeat_until(&mut c, &mut seq, |p| p["upgrade_id"].is_string());
+    let upgrade_id = ack["pending"]["upgrade_id"].as_str().unwrap().to_string();
+    seq += 1;
+    c.send(&json!({"type": "upgrade_get", "seq": seq, "ts": TS, "upgrade_id": upgrade_id}));
+    let offer = c.recv();
+    assert_eq!(offer["type"], "upgrade_offer", "{offer}");
+    // 整則訊息（Kairos 實際送出的那一行）在單行上限內，含預留的餘裕
+    assert!(
+        offer.to_string().len() + 1 + kairos_proto::mgmt::OFFER_LINE_RESERVE
+            <= kairos_proto::MAX_LINE_LENGTH,
+        "{}",
+        offer.to_string().len()
+    );
+    let parsed: kairos_proto::mgmt::UpgradeOffer = serde_json::from_value(offer.clone()).unwrap();
+    kairos_proto::mgmt::validate_upgrade_offer(&parsed).unwrap();
+    assert_eq!(parsed.artifact.filename, new_deb.0);
+    let rb = parsed.rollback_artifact.as_ref().expect("回滾檔");
+    assert_eq!(rb.filename, old_deb.0);
+    let bundle = parsed.rollback_bundle.as_ref().expect("rollback_bundle");
+    assert_eq!(
+        (bundle.sha256sums.as_str(), bundle.signature.as_str()),
+        (old_sums.as_str(), old_sig.as_str())
+    );
+    // Pulse 端（與升級輔助程式）以本機信任錨驗證 bundle：回滾檔列在其中、版本是主機目前的版本、commit 相同
+    let trust = kairos_proto::release::AllowedSigners::parse(
+        &std::fs::read_to_string(signer.allowed_signers()).unwrap(),
+    );
+    let verified = kairos_proto::release::verify_bundle(
+        &kairos_proto::release::ReleaseBundle {
+            sha256sums: &bundle.sha256sums,
+            signature: &bundle.signature,
+            manifest: None,
+        },
+        &kairos_proto::release::TrustPolicy {
+            signers: &trust,
+            extra_principals: &[],
+            now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        },
+    )
+    .expect("ssh-keygen 的簽章以 kairos-proto 驗證");
+    let file = verified
+        .check_artifact(
+            &rb.filename,
+            &rb.sha256,
+            &kairos_proto::release::ArtifactExpectation {
+                product: Some(kairos_proto::release::Product::Pulse),
+                version: Some("0.9.0"),
+                commit: None,
+                os: Some(kairos_proto::release::Os::Linux),
+                arch: kairos_proto::release::Arch::parse("x86_64"),
+                format: Some(kairos_proto::release::Format::Deb),
+            },
+        )
+        .unwrap();
+    assert!(kairos_proto::release::commits_match(
+        &file.commit,
+        "1a2b3c4"
+    ));
+    assert!(trust.lists_fingerprint(&verified.signer.fingerprint));
+    // 回滾檔可以經這條連線下載
+    seq += 1;
+    c.send(&json!({"type": "upgrade_chunk_get", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "filename": rb.filename, "offset": 0, "length": 32768}));
+    let chunk = c.recv();
+    assert_eq!(chunk["type"], "upgrade_chunk", "{chunk}");
+    let m: kairos_proto::mgmt::UpgradeChunk = serde_json::from_value(chunk).unwrap();
+    assert_eq!(m.decode_data().unwrap(), old_deb.1);
+
+    // 降級回滾：state 仍是 rolled_back，代碼與 detail 不同
+    for state in ["accepted", "staged", "applying"] {
+        seq += 1;
+        c.send(&json!({"type": "upgrade_status", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "state": state, "from_version": "0.9.0", "to_version": "0.9.2", "code": null, "detail": ""}));
+        assert_eq!(c.recv()["type"], "ack");
+    }
+    seq += 1;
+    c.send(&json!({
+        "type": "upgrade_status", "seq": seq, "ts": TS, "upgrade_id": upgrade_id, "state": "rolled_back",
+        "from_version": "0.9.0", "to_version": "0.9.2", "code": "PLS-W8418",
+        "detail": "degraded:package_rollback_failed,package_db_inconsistent; crash_restart (NRestarts 0 → 1); rollback: dpkg: error"
+    }));
+    assert_eq!(c.recv()["type"], "ack");
+    let r = get(&format!("/api/v1/rollouts/{id}"));
+    assert_eq!(
+        (r["state"].as_str(), r["pause_cause"].as_str()),
+        (Some("paused"), Some("rollback_degraded")),
+        "{r}"
+    );
+    let hosts = get(&format!("/api/v1/rollouts/{id}/hosts"));
+    assert_eq!(
+        (hosts[0]["state"].as_str(), hosts[0]["code"].as_str()),
+        (Some("rolled_back"), Some("PLS-W8418")),
+        "{hosts}"
+    );
+    assert_eq!(
+        hosts[0]["degraded"],
+        json!(["package_rollback_failed", "package_db_inconsistent"]),
+        "{hosts}"
+    );
+    // 主機「需要修復套件」：這條連線的 hello 沒有宣告 install.rollback → 依升級紀錄
+    let u = get(&format!("/api/v1/hosts/{}/upgrade", GOOD.agent_id));
+    assert_eq!(u["package_repair_needed"], true, "{u}");
+    assert_eq!(u["install"]["rollback"], Value::Null, "{u}");
+    assert_eq!(
+        u["upgrades"][0]["degraded"],
+        json!(["package_rollback_failed", "package_db_inconsistent"]),
+        "{u}"
+    );
+    // 稽核事件
+    let audit = get("/api/v1/audit?limit=200");
+    let actions: Vec<&str> = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["action"].as_str())
+        .collect();
+    assert!(
+        actions.contains(&"host.upgrade.rolled_back_degraded")
+            && actions.contains(&"rollout.auto_pause")
+            && !actions.contains(&"host.upgrade.rolled_back"),
+        "{actions:?}"
+    );
+    c.close();
+
+    // 之後的 hello 宣告 install.rollback：以宣告為準（修復後不再標示；仍不一致時標示）
+    for (declared, needed) in [
+        ("binary_only", false),
+        ("degraded", true),
+        ("archived", false),
+    ] {
+        let c = connect(Some(declared));
+        assert!(
+            poll_until(WAIT, || {
+                let u = get(&format!("/api/v1/hosts/{}/upgrade", GOOD.agent_id));
+                u["install"]["rollback"] == declared && u["package_repair_needed"] == needed
+            }),
+            "{declared}: {}\n{}",
+            get(&format!("/api/v1/hosts/{}/upgrade", GOOD.agent_id)),
+            k.dump()
+        );
+        c.close();
+    }
+    let (code, _) = k.stop();
+    assert_eq!(code, 0, "{}", k.dump());
+}

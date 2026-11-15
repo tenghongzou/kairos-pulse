@@ -1277,6 +1277,38 @@ async fn releases_and_rollouts_over_https() {
             "{id}"
         );
     }
+    // install.rollback（schema v13；REMOTE.md 第 2.1 節）：主機詳情與「升級」卡片帶出宣告；宣告 degraded 的
+    // 主機「需要修復套件」（package_repair_needed），沒有宣告的主機依升級紀錄（這裡沒有紀錄：false）
+    for (id, declared) in [(NONE, Some("degraded")), (ALLOW, Some("archived"))] {
+        f.admin()
+            .execute(
+                "UPDATE hosts SET install_rollback = ?2 WHERE agent_id = ?1",
+                rusqlite::params![id, declared],
+            )
+            .unwrap();
+    }
+    for (id, declared, repair) in [
+        (NONE, json!("degraded"), true),
+        (ALLOW, json!("archived"), false),
+        (UNDECLARED, Value::Null, false),
+    ] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/api/v1/hosts/{id}/upgrade"),
+            Some(&op),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let d = body(&r)["data"].clone();
+        assert_eq!(d["install"]["rollback"], declared, "{id}: {d}");
+        assert_eq!(d["package_repair_needed"], repair, "{id}: {d}");
+        assert_eq!(d["recent_degraded"], false, "{id}: {d}");
+        let r = call(addr, "GET", &format!("/api/v1/hosts/{id}"), Some(&op), None).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(body(&r)["data"]["install"]["rollback"], declared, "{id}");
+    }
     // 送出：宣告 none 的主機固定為 skipped（url_not_allowed）
     let r = call(
         addr,

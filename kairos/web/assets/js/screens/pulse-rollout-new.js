@@ -223,6 +223,10 @@ export function previewView(p, { onExclude, version } = {}) {
     h('p', { class: 'k-preview-big' }, h('span', { class: 'strong' }, t('rm.new.eligible', { n: fmt.num(p.eligible || 0) })), ' · ', t('rm.new.matched', { n: fmt.num(p.matched || 0) })),
     p.downgrade ? h('p', null, t('rm.new.downgradeN', { n: fmt.num(p.downgrade) })) : null,
     p.no_rollback ? h('p', null, t('rm.new.noRollbackN', { n: fmt.num(p.no_rollback) })) : null,
+    // 可升級的 deb／rpm 主機預期的回滾方式（rollback：archive、repository、degraded_hosts；ADR-0003 第 5.4 節）
+    p.rollback && p.rollback.archive ? h('p', { dataset: { rollback: 'archive' } }, t('rm.new.rollbackArchiveN', { n: fmt.num(p.rollback.archive) })) : null,
+    p.rollback && p.rollback.repository ? h('p', { dataset: { rollback: 'repository' } }, t('rm.new.rollbackRepositoryN', { n: fmt.num(p.rollback.repository) })) : null,
+    p.rollback && p.rollback.degraded_hosts ? h('p', { dataset: { rollback: 'degraded' } }, t('rm.new.degradedHostsN', { n: fmt.num(p.rollback.degraded_hosts) })) : null,
     p.waves && p.waves.length ? h('p', { id: 'rollout-preview-waves' }, p.waves.length > 2 ? t('rm.new.wavesN', { n: fmt.num(p.waves.length), list: waveList(p.waves) }) : t('rm.new.waves', { a: fmt.num(p.waves[0] || 0), b: fmt.num(p.waves[1] || 0) })) : null,
     p.window && p.window.open === false
       ? inlineAlert({ kind: p.window.next ? 'info' : 'warning', role: 'status', body: p.window.next ? t('rm.new.windowClosed', { t: fmt.dateTime(p.window.next, { seconds: false }) }) : t('rm.new.windowNone') })

@@ -54,6 +54,8 @@ fn env(dir: &Path, version: &str) -> UpgradeEnv {
         redetect: None,
         url_allowlist: Vec::new(),
         external_ca: String::new(),
+        own_binary_sha256: None,
+        pkg_db: |_| None,
     }
 }
 
@@ -894,5 +896,533 @@ fn external_url_needs_the_local_allowlist_and_the_same_verification() {
         Some(mgmt::UPGRADE_STATE_FAILED),
         "{s:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- 回滾檔的簽章資料（rollback_bundle；ADR-0003 階段 1、REMOTE.md 第 4.4.2 節） ----
+
+/// deb 主機（目前 0.9.1）收到升級到 0.9.2 的提議：以臨時金鑰簽署的兩次發佈
+/// （簽署用系統的 `ssh-keygen`，與 `testsign` 相同只在 unix 編譯）
+#[cfg(unix)]
+struct BundleFx {
+    dir: PathBuf,
+    key: testsign::TestKey,
+    /// 目標（0.9.2）的 deb
+    target: (String, Vec<u8>),
+    /// 回滾檔（0.9.1）的 deb
+    rollback: (String, Vec<u8>),
+    rollback_release: testsign::TestRelease,
+    offer: UpgradeOffer,
+}
+
+#[cfg(unix)]
+impl BundleFx {
+    fn new(name: &str) -> Self {
+        let dir = tmp(name);
+        let key = testsign::TestKey::generate();
+        let target = (
+            "pulse-0.9.2-6f7a8b9-linux-x86_64.deb".to_string(),
+            b"deb 0.9.2\n".to_vec(),
+        );
+        let rollback = (
+            "pulse-0.9.1-5e6f7a8-linux-x86_64.deb".to_string(),
+            b"deb 0.9.1\n".to_vec(),
+        );
+        let rel = testsign::release(&key, "0.9.2", "6f7a8b9", &[(&target.0, &target.1)], None);
+        let rollback_release = testsign::release(
+            &key,
+            "0.9.1",
+            "5e6f7a8",
+            &[(&rollback.0, &rollback.1)],
+            None,
+        );
+        let artifact = |f: &(String, Vec<u8>)| mgmt::ArtifactRef {
+            filename: f.0.clone(),
+            size: f.1.len() as u64,
+            sha256: files::hex(ring::digest::digest(&ring::digest::SHA256, &f.1).as_ref()),
+            source: mgmt::SOURCE_KAIROS.into(),
+            url: None,
+        };
+        let offer = UpgradeOffer {
+            seq: 5,
+            upgrade_id: ID.into(),
+            rollout_id: "r-20261210-0001".into(),
+            action: mgmt::ACTION_UPGRADE.into(),
+            target: mgmt::UpgradeTarget {
+                version: "0.9.2".into(),
+                commit: "6f7a8b9".into(),
+            },
+            artifact: artifact(&target),
+            rollback_artifact: Some(artifact(&rollback)),
+            rollback_bundle: Some(mgmt::RollbackBundle {
+                sha256sums: rollback_release.sums.clone(),
+                signature: rollback_release.sig.clone(),
+            }),
+            manifest: Some(mgmt::ManifestRef {
+                filename: rel.manifest_name.clone(),
+                content: rel.manifest.clone(),
+            }),
+            sha256sums: rel.sums.clone(),
+            signature: rel.sig.clone(),
+            apply_window: ApplyWindow {
+                not_before: ts(-60),
+                not_after: ts(3600),
+            },
+            health_timeout_secs: 600,
+            allow_downgrade: false,
+        };
+        mgmt::validate_upgrade_offer(&offer).unwrap();
+        Self {
+            dir,
+            key,
+            target,
+            rollback,
+            rollback_release,
+            offer,
+        }
+    }
+
+    fn agent(&self, method: &'static str) -> Arc<UpgradeAgent> {
+        let mut e = env(&self.dir, "0.9.1");
+        write_anchor(&e.detection.trust_anchor, &self.key.allowed_signers());
+        e.detection.method = method;
+        UpgradeAgent::new(e)
+    }
+
+    /// 本機紀錄（`releases/0.9.1/`）
+    fn write_record(&self, sums: &str, sig: &str) {
+        let rel = self.dir.join("state/upgrade/releases/0.9.1");
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(rel.join(files::SUMS_FILE), sums).unwrap();
+        std::fs::write(rel.join(files::SIG_FILE), sig).unwrap();
+    }
+
+    /// 這次提議要下載的檔名、是否採用回滾檔、來源
+    fn accepted(agent: &UpgradeAgent) -> (Vec<String>, bool, Option<String>) {
+        let inner = agent.lock();
+        let c = inner.file.current.as_ref().expect("提議被接受");
+        (
+            c.files.iter().map(|f| f.name.clone()).collect(),
+            c.rollback_trusted,
+            c.rollback_source.clone(),
+        )
+    }
+}
+
+/// 新 Kairos × 新 Pulse（ADR-0003 第 6.4 節）：第一次遠端升級的 deb 主機本機沒有目前版本的紀錄，以提議的
+/// `rollback_bundle` 驗證回滾檔——下載、暫存它的簽章資料、寫進 `request.json`（輔助程式會以 root 重新驗證）
+#[cfg(unix)]
+#[test]
+fn a_first_remote_upgrade_uses_the_rollback_bundle_from_the_offer() {
+    let fx = BundleFx::new("bundle-first");
+    let agent = fx.agent(mgmt::INSTALL_METHOD_DEB);
+    let mut cs = accept(&agent, fx.offer.clone());
+    assert_eq!(
+        BundleFx::accepted(&agent),
+        (
+            vec![fx.target.0.clone(), fx.rollback.0.clone()],
+            true,
+            Some(ROLLBACK_SOURCE_BUNDLE.to_string())
+        )
+    );
+    ack_all(&agent, &mut cs);
+    // 下載兩個檔案
+    let mut served = Vec::new();
+    let mut reported = Vec::new();
+    // 段落請求之間有最短間隔：每次往後推
+    let mut now = Instant::now();
+    while let Some(Out::Chunk {
+        filename,
+        offset,
+        length,
+        ..
+    }) = {
+        now += Duration::from_secs(60);
+        // 進度回報（每 25%）先送出並收到 ack，poll 才輪到段落請求
+        reported.extend(ack_all(&agent, &mut cs));
+        agent.poll(&mut cs, now)
+    } {
+        let data = if filename == fx.target.0 {
+            &fx.target.1
+        } else {
+            assert_eq!(filename, fx.rollback.0);
+            &fx.rollback.1
+        };
+        assert_eq!((offset, length as usize), (0, data.len()));
+        served.push(filename.clone());
+        let c = UpgradeChunk::new(9, ID, filename.clone(), offset, data, true);
+        agent.on_chunk(&mut cs, &c, (filename, offset, length));
+    }
+    assert_eq!(served.len(), 2, "{served:?}");
+    reported.extend(ack_all(&agent, &mut cs));
+    assert_eq!(
+        reported.last().map(|r| r.state.as_str()),
+        Some(mgmt::UPGRADE_STATE_STAGED),
+        "{reported:?}"
+    );
+    // 暫存：回滾檔與它所屬發佈的簽章資料（來自 bundle）
+    let staging = fx.dir.join("state/upgrade").join(ID);
+    assert_eq!(
+        std::fs::read_to_string(staging.join(files::ROLLBACK_SUMS_FILE)).unwrap(),
+        fx.rollback_release.sums
+    );
+    assert_eq!(
+        std::fs::read_to_string(staging.join(files::ROLLBACK_SIG_FILE)).unwrap(),
+        fx.rollback_release.sig
+    );
+    assert_eq!(
+        std::fs::read(staging.join(&fx.rollback.0)).unwrap(),
+        fx.rollback.1
+    );
+    // bundle 不會被存成本機紀錄（本機紀錄只記這台主機驗證並暫存過的**目標**發佈）
+    assert!(!fx.dir.join("state/upgrade/releases/0.9.1").exists());
+    assert!(
+        fx.dir
+            .join("state/upgrade/releases/0.9.2/SHA256SUMS")
+            .is_file()
+    );
+    // 交付：request.json 帶回滾檔
+    agent.tick(&mut cs, Instant::now(), false);
+    assert_eq!(
+        agent.poll(&mut cs, Instant::now()),
+        Some(Out::Get(ID.into()))
+    );
+    agent.on_offer(&mut cs, fx.offer.clone());
+    agent.tick(&mut cs, Instant::now(), false);
+    ack_all(&agent, &mut cs);
+    let req = Request::from_untrusted_bytes(
+        &std::fs::read(fx.dir.join("state/upgrade/request.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(req.method, "deb");
+    assert_eq!(
+        req.rollback_artifact.as_deref(),
+        Some(fx.rollback.0.as_str())
+    );
+    let _ = std::fs::remove_dir_all(&fx.dir);
+}
+
+#[cfg(unix)]
+type OfferTweak = fn(&BundleFx, &mut UpgradeOffer, &testsign::TestKey);
+
+/// 來源的順序與資格（ADR-0003 第 5.4 節；INV-4、INV-5）：本機紀錄優先於 bundle；兩者都只是提示，都以
+/// 本機信任錨完整驗證；都不通過時**照常升級**、不下載回滾檔（Kairos 能做的只有附或不附，驗證失敗不會
+/// 讓升級失敗，也不會放寬條件）。新 Pulse × 舊 Kairos（沒有 bundle）與 0.11.0 以前相同
+#[cfg(unix)]
+#[test]
+fn rollback_bundle_and_local_record_are_hints_verified_with_the_local_trust_anchor() {
+    let other = testsign::TestKey::generate();
+    let cases: [(&str, &'static str, OfferTweak, Option<&str>); 9] = [
+        // 舊 Kairos：沒有 bundle、本機也沒有紀錄
+        ("no-bundle", "deb", |_, o, _| o.rollback_bundle = None, None),
+        // 舊 Kairos＋本機紀錄（0.11.0 以前就有的路徑）
+        (
+            "record-only",
+            "deb",
+            |fx, o, _| {
+                o.rollback_bundle = None;
+                fx.write_record(&fx.rollback_release.sums, &fx.rollback_release.sig);
+            },
+            Some(ROLLBACK_SOURCE_RECORD),
+        ),
+        // 本機紀錄有效：優先於 bundle（即使 bundle 是壞的）
+        (
+            "record-first",
+            "deb",
+            |fx, o, _| {
+                fx.write_record(&fx.rollback_release.sums, &fx.rollback_release.sig);
+                o.rollback_bundle.as_mut().unwrap().signature = "junk".into();
+            },
+            Some(ROLLBACK_SOURCE_RECORD),
+        ),
+        // 本機紀錄被改壞（服務帳號可寫，只是提示）：改看 bundle
+        (
+            "record-bad",
+            "deb",
+            |fx, _, _| fx.write_record(&fx.rollback_release.sums, "junk"),
+            Some(ROLLBACK_SOURCE_BUNDLE),
+        ),
+        // bundle 的簽章不是本機信任錨接受的金鑰簽的
+        (
+            "bundle-other-key",
+            "deb",
+            |fx, o, other| {
+                let r = testsign::release(
+                    other,
+                    "0.9.1",
+                    "5e6f7a8",
+                    &[(&fx.rollback.0, &fx.rollback.1)],
+                    None,
+                );
+                o.rollback_bundle = Some(mgmt::RollbackBundle {
+                    sha256sums: r.sums,
+                    signature: r.sig,
+                });
+            },
+            None,
+        ),
+        // bundle 的內容被改過（簽章對不上）
+        (
+            "bundle-tampered",
+            "deb",
+            |_, o, _| {
+                o.rollback_bundle
+                    .as_mut()
+                    .unwrap()
+                    .sha256sums
+                    .push_str("# x\n")
+            },
+            None,
+        ),
+        // 官方簽署，但回滾檔不在這份 SHA256SUMS 中（拿目標版本的簽章資料充當）
+        (
+            "bundle-other-release",
+            "deb",
+            |_, o, _| {
+                o.rollback_bundle = Some(mgmt::RollbackBundle {
+                    sha256sums: o.sha256sums.clone(),
+                    signature: o.signature.clone(),
+                })
+            },
+            None,
+        ),
+        // 回滾檔的雜湊與 bundle 列的不同
+        (
+            "artifact-hash",
+            "deb",
+            |_, o, _| o.rollback_artifact.as_mut().unwrap().sha256 = "0".repeat(64),
+            None,
+        ),
+        // tar 不需要回滾檔：不論有沒有 bundle 都忽略
+        ("tar", "tar", |_, _, _| {}, None),
+    ];
+    for (name, method, tweak, source) in cases {
+        let fx = BundleFx::new(&format!("bundle-{name}"));
+        let mut o = fx.offer.clone();
+        if method == "tar" {
+            // tar 主機的提議：目標是 tar.gz（另簽一次），回滾檔與 bundle 照附
+            let t = (
+                "pulse-0.9.2-6f7a8b9-linux-x86_64.tar.gz".to_string(),
+                b"tar 0.9.2\n".to_vec(),
+            );
+            let rel = testsign::release(&fx.key, "0.9.2", "6f7a8b9", &[(&t.0, &t.1)], None);
+            o.artifact.filename = t.0.clone();
+            o.artifact.size = t.1.len() as u64;
+            o.artifact.sha256 =
+                files::hex(ring::digest::digest(&ring::digest::SHA256, &t.1).as_ref());
+            o.manifest = Some(mgmt::ManifestRef {
+                filename: rel.manifest_name,
+                content: rel.manifest,
+            });
+            o.sha256sums = rel.sums;
+            o.signature = rel.sig;
+        }
+        tweak(&fx, &mut o, &other);
+        let agent = fx.agent(method);
+        let mut cs = accept(&agent, o.clone());
+        // 不論回滾檔能不能用，提議都被接受（不是 declined、也不是驗證失敗）
+        let sent = ack_all(&agent, &mut cs);
+        assert_eq!(
+            sent.iter().map(|s| s.state.as_str()).collect::<Vec<_>>(),
+            [UPGRADE_STATE_ACCEPTED],
+            "{name}"
+        );
+        let (names, trusted, got) = BundleFx::accepted(&agent);
+        assert_eq!(got.as_deref(), source, "{name}");
+        assert_eq!(trusted, source.is_some(), "{name}");
+        assert_eq!(
+            names.len(),
+            if source.is_some() { 2 } else { 1 },
+            "{name}: {names:?}"
+        );
+        assert_eq!(names[0], o.artifact.filename, "{name}");
+        let _ = std::fs::remove_dir_all(&fx.dir);
+    }
+}
+
+/// 0.11.0 以前的狀態檔（`Current` 沒有 `rollback_source`）在升級後照常讀得回來：有 `rollback_trusted`
+/// 而沒有來源＝本機紀錄
+#[cfg(unix)]
+#[test]
+fn state_files_written_before_the_rollback_bundle_still_load() {
+    let fx = BundleFx::new("bundle-old-state");
+    fx.write_record(&fx.rollback_release.sums, &fx.rollback_release.sig);
+    let agent = fx.agent(mgmt::INSTALL_METHOD_DEB);
+    let mut o = fx.offer.clone();
+    o.rollback_bundle = None;
+    let _cs = accept(&agent, o);
+    let c = agent.lock().file.current.clone().unwrap();
+    assert_eq!(c.rollback_source.as_deref(), Some(ROLLBACK_SOURCE_RECORD));
+    let mut v = serde_json::to_value(&c).unwrap();
+    // 舊版寫的：沒有 rollback_source，offer 也沒有 rollback_bundle
+    v.as_object_mut().unwrap().remove("rollback_source");
+    assert!(v["offer"].get("rollback_bundle").is_none());
+    let old: Current = serde_json::from_value(v).unwrap();
+    assert!(old.rollback_trusted);
+    assert_eq!(old.rollback_source, None);
+    let _ = std::fs::remove_dir_all(&fx.dir);
+}
+
+/// 降級回滾的結果（輔助程式寫的 `result.json`）：照樣回報 `rolled_back`，代碼與 `detail` 原樣轉給 Kairos；
+/// `pulse upgrade status`／`pulse status` 標示需要修復套件
+#[test]
+fn a_degraded_rollback_is_forwarded_and_flagged_for_package_repair() {
+    let dir = tmp("degraded");
+    let agent = UpgradeAgent::new(env(&dir, "0.9.0"));
+    let mut cs = accept(&agent, offer((-60, 3600)));
+    ack_all(&agent, &mut cs);
+    let Some(Out::Chunk {
+        filename,
+        offset,
+        length,
+        ..
+    }) = agent.poll(&mut cs, Instant::now())
+    else {
+        panic!("expected a chunk request");
+    };
+    agent.on_chunk(&mut cs, &chunk(0, TAR, true), (filename, offset, length));
+    ack_all(&agent, &mut cs);
+    agent.tick(&mut cs, Instant::now(), false);
+    assert_eq!(
+        agent.poll(&mut cs, Instant::now()),
+        Some(Out::Get(ID.into()))
+    );
+    agent.on_offer(&mut cs, offer((-60, 3600)));
+    agent.tick(&mut cs, Instant::now(), false);
+    ack_all(&agent, &mut cs);
+    assert!(!agent.view().package_repair_needed);
+    let detail = "degraded:package_rollback_failed,package_db_inconsistent; crash_restart (NRestarts 0 → 1); rollback: dpkg: error";
+    let result = UpgradeResult {
+        schema: files::RESULT_SCHEMA.into(),
+        upgrade_id: ID.into(),
+        state: UPGRADE_STATE_ROLLED_BACK.into(),
+        code: Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED.into()),
+        detail: detail.into(),
+        from_version: "0.9.0".into(),
+        to_version: "0.9.1".into(),
+        finished_at: ts(0),
+    };
+    std::fs::write(
+        dir.join("state/upgrade/result.json"),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    drop(agent);
+    // 回滾後舊版的行程重新啟動：讀 result.json 並回報
+    let agent = UpgradeAgent::new(env(&dir, "0.9.0"));
+    let mut cs = agent.on_registered(true, None);
+    let sent = ack_all(&agent, &mut cs);
+    let last = sent.last().expect("回報結果");
+    assert_eq!(
+        (
+            last.state.as_str(),
+            last.code.as_deref(),
+            last.detail.as_str()
+        ),
+        (
+            "rolled_back",
+            Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED),
+            detail
+        )
+    );
+    assert!(agent.view().package_repair_needed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// hello 的 `install.rollback`（REMOTE.md 第 2.1、17.10.6 節）：由輔助程式（root）留下的提示算出。提示只在
+/// 它描述的是這個行程的執行檔時採用；`degraded` 另外要求套件資料庫的狀態沒有變。提示在服務帳號可寫的
+/// 目錄裡——它只決定回報給 Kairos 的值，讀不到、不合法或不相符時一律退回 `binary_only`
+#[test]
+fn hello_declares_the_rollback_capability_from_the_helper_hint() {
+    const OWN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    fn db(_: &str) -> Option<String> {
+        Some("0.9.2 ii".to_string())
+    }
+    let dir = tmp("rollback-state");
+    let updir = dir.join("state/upgrade");
+    std::fs::create_dir_all(&updir).unwrap();
+    let write = |state: &str, binary: &str, pkg_db: Option<&str>| {
+        let h = files::RollbackHint {
+            schema: files::ROLLBACK_HINT_SCHEMA.into(),
+            state: state.into(),
+            binary_sha256: binary.into(),
+            pkg_db: pkg_db.map(str::to_string),
+            updated_at: ts(0),
+        };
+        std::fs::write(
+            updir.join(files::ROLLBACK_HINT_FILE),
+            serde_json::to_vec(&h).unwrap(),
+        )
+        .unwrap();
+    };
+    let state = |ready: bool, method: &str, own: Option<&str>| {
+        rollback_state(ready, method, &updir, own, db)
+    };
+    // 沒有提示
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    assert_eq!(state(true, "tar", Some(OWN)), "binary_only");
+    assert_eq!(state(false, "deb", Some(OWN)), "none");
+    // archived：描述的是這個行程的執行檔才算
+    write("archived", OWN, Some("0.9.1 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "archived");
+    assert_eq!(state(true, "rpm", Some(OWN)), "archived");
+    assert_eq!(
+        state(true, "deb", Some(OTHER)),
+        "binary_only",
+        "升級或回滾之後舊的提示失效"
+    );
+    assert_eq!(state(true, "deb", None), "binary_only", "算不出自己的雜湊");
+    assert_eq!(state(true, "tar", Some(OWN)), "binary_only", "tar 沒有封存");
+    assert_eq!(state(false, "deb", Some(OWN)), "none", "遠端升級沒有就緒");
+    // degraded：套件資料庫仍是降級回滾當時的狀態才算；重新安裝套件之後不再是
+    write("degraded", OWN, Some("0.9.2 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "degraded");
+    write("degraded", OWN, Some("0.9.3 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    write("degraded", OTHER, Some("0.9.2 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    // 不認得的狀態、schema 或不是合法的內容
+    write("future", OWN, None);
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    std::fs::write(
+        updir.join(files::ROLLBACK_HINT_FILE),
+        r#"{"schema":"pulse.upgrade-rollback/v9","state":"archived","binary_sha256":"1111111111111111111111111111111111111111111111111111111111111111"}"#,
+    )
+    .unwrap();
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    std::fs::write(updir.join(files::ROLLBACK_HINT_FILE), "{").unwrap();
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    for s in ["archived", "binary_only", "none", "degraded"] {
+        assert!(mgmt::INSTALL_ROLLBACK_STATES.contains(&s));
+    }
+
+    // 經 UpgradeAgent：hello 的 install 與 view 都帶出；需要修復套件以提示為準
+    let mut e = env(&dir, "0.9.1");
+    e.detection.method = mgmt::INSTALL_METHOD_DEB;
+    e.own_binary_sha256 = Some(OWN.to_string());
+    e.pkg_db = db;
+    write("archived", OWN, None);
+    let agent = UpgradeAgent::new(e);
+    let info = agent.install_info();
+    assert_eq!(info.rollback.as_deref(), Some("archived"));
+    mgmt::validate_install(&info).unwrap();
+    let v = agent.view();
+    assert_eq!(v.rollback.as_deref(), Some("archived"));
+    assert!(!v.package_repair_needed);
+    // 宣告之後提示改變（輔助程式在交易結束時才寫出，那時 Pulse 已經連上）：要求重新連線以更新宣告；
+    // 檢查有間隔，重新連線（新的 hello）之後不再要求
+    let now = Instant::now();
+    assert!(!agent.rollback_changed(now), "沒有改變");
+    write("degraded", OWN, Some("0.9.2 ii"));
+    assert!(
+        !agent.rollback_changed(now + Duration::from_secs(5)),
+        "30 秒內不重複檢查"
+    );
+    assert!(agent.rollback_changed(now + Duration::from_secs(31)));
+    // 與其他 install 欄位相同：每次連線前重新計算
+    assert_eq!(agent.install_info().rollback.as_deref(), Some("degraded"));
+    assert!(!agent.rollback_changed(now + Duration::from_secs(120)));
+    assert!(agent.view().package_repair_needed);
     let _ = std::fs::remove_dir_all(&dir);
 }

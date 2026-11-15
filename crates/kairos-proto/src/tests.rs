@@ -53,6 +53,8 @@ pub(crate) enum Ver {
     Mgmt,
     /// hello 的 `install.external_url`（0.11.0 起的 Pulse）
     MgmtExternalUrl,
+    /// `upgrade_offer.rollback_bundle`、hello 的 `install.rollback`、降級回滾（ADR-0003 階段 1、2）
+    MgmtRollback,
     Errors,
 }
 
@@ -67,6 +69,7 @@ impl Ver {
             Ver::Cluster => "叢集",
             Ver::Mgmt => "遠端管理",
             Ver::MgmtExternalUrl => "遠端管理：外部 URL 的宣告",
+            Ver::MgmtRollback => "遠端管理：回滾檔的簽章資料與降級回滾",
             Ver::Errors => "錯誤",
         }
     }
@@ -149,6 +152,8 @@ fn spec_vectors_are_found() {
     assert_eq!(vectors(Ver::Mgmt, 'K').len(), 10);
     assert_eq!(vectors(Ver::MgmtExternalUrl, 'P').len(), 2);
     assert_eq!(vectors(Ver::MgmtExternalUrl, 'K').len(), 1);
+    assert_eq!(vectors(Ver::MgmtRollback, 'P').len(), 3);
+    assert_eq!(vectors(Ver::MgmtRollback, 'K').len(), 3);
     assert_eq!(vectors(Ver::Errors, 'P').len(), 0);
     assert_eq!(vectors(Ver::Errors, 'K').len(), 5);
 }
@@ -164,6 +169,7 @@ fn every_client_vector_round_trips() {
         Ver::Cluster,
         Ver::Mgmt,
         Ver::MgmtExternalUrl,
+        Ver::MgmtRollback,
     ] {
         for line in vectors(ver, 'P') {
             let msg = parse_client_msg(line).unwrap();
@@ -185,6 +191,7 @@ fn every_server_vector_round_trips() {
         Ver::Cluster,
         Ver::Mgmt,
         Ver::MgmtExternalUrl,
+        Ver::MgmtRollback,
         Ver::Errors,
     ] {
         for line in vectors(ver, 'K') {

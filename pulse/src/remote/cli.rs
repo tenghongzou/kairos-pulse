@@ -36,12 +36,24 @@ pulse upgrade — 遠端升級的本機狀態與操作（Linux）
 用法：
   pulse upgrade status [--json] [-c <pulse.toml>]
   pulse upgrade rollback --yes [-c <pulse.toml>]
+  pulse upgrade archive-current --package <套件> --sums <SHA256SUMS> --signature <SHA256SUMS.sig>
   pulse upgrade apply --request <檔案>     （內部使用：pulse-upgrade.service 的進入點，需要 root）
 
 命令：
-  status     安裝方式、遠端升級是否就緒（與原因）、信任錨的金鑰指紋、進行中的升級與最近一次結果
+  status     安裝方式、遠端升級是否就緒（與原因）、信任錨的金鑰指紋、自動回滾的方式、進行中的升級與
+             最近一次結果
   rollback   手動回滾：tar 安裝換回 /opt/pulse/pulse.prev 並重新啟動 pulse.service（需要 root）；
-             deb／rpm 安裝顯示以套件管理員回滾的方式。危險操作，必須加 --yes";
+             deb／rpm 安裝顯示以套件管理員回滾的方式。危險操作，必須加 --yes
+  archive-current
+             deb／rpm 安裝：把「目前安裝的版本」的套件封存到 root 專用的 /var/lib/pulse-upgrade/archive/
+             （需要 root），讓下一次遠端升級失敗時可以經套件管理員回滾，不依賴 Kairos 的版本庫。套件必須
+             是官方發佈的那一份：以本機信任錨驗證 SHA256SUMS 的簽章與套件的雜湊，版本、commit 與套件中的
+             執行檔都必須與目前安裝的相同。一行安裝腳本會自動執行（--seed）；手動安裝套件的主機可以事後
+             補上。有進行中的遠端升級時拒絕
+               --package <檔案>     套件（檔名必須是發佈時的檔名 pulse-<版本>-<commit>-linux-<arch>.deb|rpm）
+               --sums <檔案>        這次發佈的 SHA256SUMS
+               --signature <檔案>   SHA256SUMS.sig
+               --seed               由安裝腳本在安裝時呼叫（只影響封存紀錄的來源欄位）";
 
 /// `pulse config …`
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -58,6 +70,7 @@ pub enum UpgradeArgs {
     Status { json: bool, config: Option<String> },
     Apply { request: PathBuf },
     Rollback { yes: bool, config: Option<String> },
+    ArchiveCurrent(super::upgrade::helper::ArchiveArgs),
 }
 
 fn take_value<'a>(
@@ -130,7 +143,7 @@ pub fn parse_upgrade(args: &[String]) -> Result<Option<UpgradeArgs>, UsageError>
     let err = |m: String| Err(UsageError::new(m, UPGRADE_USAGE));
     let Some(cmd) = args.first() else {
         return err(format!(
-            "{}：用法為 pulse upgrade status|rollback",
+            "{}：用法為 pulse upgrade status|rollback|archive-current",
             codes::E_BAD_ARG_VALUE
         ));
     };
@@ -138,11 +151,21 @@ pub fn parse_upgrade(args: &[String]) -> Result<Option<UpgradeArgs>, UsageError>
     let mut yes = false;
     let mut config = None;
     let mut request = None;
+    let (mut package, mut sums, mut signature, mut seed) = (None, None, None, false);
     let mut i = 1;
     while i < args.len() {
         match (cmd.as_str(), args[i].as_str()) {
             ("status", "--json") => json = true,
             ("rollback", "--yes") => yes = true,
+            ("archive-current", "--seed") => seed = true,
+            ("archive-current", flag @ ("--package" | "--sums" | "--signature")) => {
+                let value = PathBuf::from(take_value(args, &mut i, flag, UPGRADE_USAGE)?);
+                match flag {
+                    "--package" => package = Some(value),
+                    "--sums" => sums = Some(value),
+                    _ => signature = Some(value),
+                }
+            }
             ("status" | "rollback", "-c" | "--config") => {
                 config = Some(take_value(args, &mut i, "--config", UPGRADE_USAGE)?.to_string());
             }
@@ -166,6 +189,22 @@ pub fn parse_upgrade(args: &[String]) -> Result<Option<UpgradeArgs>, UsageError>
     Ok(Some(match cmd.as_str() {
         "status" => UpgradeArgs::Status { json, config },
         "rollback" => UpgradeArgs::Rollback { yes, config },
+        "archive-current" => match (package, sums, signature) {
+            (Some(package), Some(sums), Some(signature)) => {
+                UpgradeArgs::ArchiveCurrent(super::upgrade::helper::ArchiveArgs {
+                    package,
+                    sums,
+                    signature,
+                    seed,
+                })
+            }
+            _ => {
+                return err(format!(
+                    "{}：pulse upgrade archive-current 需要 --package、--sums 與 --signature",
+                    codes::E_BAD_ARG_VALUE
+                ));
+            }
+        },
         "apply" => match request {
             Some(request) => UpgradeArgs::Apply { request },
             None => {
@@ -313,6 +352,7 @@ pub fn run_upgrade(args: &UpgradeArgs) -> u8 {
         UpgradeArgs::Apply { request } => super::upgrade::helper::run(request),
         UpgradeArgs::Status { json, config } => upgrade_status(*json, config.as_deref()),
         UpgradeArgs::Rollback { yes, config } => rollback(*yes, config.as_deref()),
+        UpgradeArgs::ArchiveCurrent(a) => super::upgrade::helper::run_archive_current(a),
     }
 }
 
@@ -340,11 +380,28 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
         Ok(s) => (s.current.clone(), s.history.last().cloned()),
         Err(_) => (None, None),
     };
+    // 自動回滾的能力（hello 的 install.rollback；REMOTE.md 第 2.1、17.10.6 節）：這個命令就是安裝的執行檔，
+    // 以自己的雜湊比對輔助程式留下的提示
+    let own = super::upgrade::own_binary_sha256();
+    let rollback_state = super::upgrade::rollback_state(
+        d.upgrade == kairos_proto::mgmt::INSTALL_UPGRADE_READY,
+        d.method,
+        &super::upgrade::files::upgrade_dir(&super::state_dir()),
+        own.as_deref(),
+        super::upgrade::helper::query_package_db,
+    );
+    // 需要修復套件（降級回滾之後，第 4.5.2 節）：提示說仍是降級的狀態；沒有提示可以判斷時依最近一次的結果
+    let repair = rollback_state == kairos_proto::mgmt::INSTALL_ROLLBACK_DEGRADED
+        || (own.is_none()
+            && last.as_ref().is_some_and(|l| {
+                l.state == kairos_proto::mgmt::UPGRADE_STATE_ROLLED_BACK
+                    && kairos_proto::mgmt::degraded_reasons(&l.detail).is_some()
+            }));
     if json_out {
         let out = json!({
             "schema": "pulse.upgrade-status/v1",
             "version": env!("CARGO_PKG_VERSION"),
-            "install": {"method": d.method, "upgrade": d.upgrade, "reason": d.reason},
+            "install": {"method": d.method, "upgrade": d.upgrade, "reason": d.reason, "rollback": rollback_state},
             "trust_anchor": {"path": d.trust_anchor.display().to_string(), "fingerprints": d.fingerprints},
             "current": current.as_ref().map(|c| json!({
                 "upgrade_id": c.upgrade_id,
@@ -353,6 +410,7 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
                 "apply_window": c.offer.apply_window,
             })),
             "last": last,
+            "package_repair_needed": repair,
             "state_error": state.as_ref().err(),
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
@@ -382,6 +440,18 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
     for f in &d.fingerprints {
         println!("  金鑰：{f}");
     }
+    println!(
+        "自動回滾：{}",
+        match rollback_state {
+            "archived" =>
+                "經套件管理員裝回（目前版本的套件已封存在 /var/lib/pulse-upgrade/archive/）",
+            "degraded" => "需要先修復套件（上一次回滾只換回了執行檔，見下方）",
+            "none" => "沒有（遠端升級沒有就緒）",
+            _ if matches!(d.method, "deb" | "rpm") =>
+                "換回執行檔（沒有目前版本的套件封存；Kairos 的版本庫有這個版本時仍可經套件管理員裝回。封存目前的版本：sudo pulse upgrade archive-current …）",
+            _ => "換回替換前保留的執行檔（pulse.prev）",
+        }
+    );
     match &current {
         Some(c) => println!(
             "進行中：{} → {}（{:?}，時段 {}～{}）",
@@ -405,6 +475,28 @@ fn upgrade_status(json_out: bool, config: Option<&str>) -> u8 {
                 .unwrap_or_default(),
             l.at
         );
+        if !l.detail.is_empty() {
+            println!("  說明：{}", l.detail);
+        }
+    }
+    if repair {
+        println!(
+            "需要修復套件（{}）：上一次升級失敗後只換回了執行檔，套件資料庫與實際安裝的執行檔不一致。",
+            codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+        );
+        println!(
+            "  請重新安裝 Pulse {} 的套件（不會改動 pulse.toml 與身分）：",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!(
+            "  {}",
+            if d.method == "rpm" {
+                "sudo rpm -U --replacepkgs --oldpackage pulse-<版本>-<commit>-linux-<arch>.rpm"
+            } else {
+                "sudo dpkg -i pulse-<版本>-<commit>-linux-<arch>.deb"
+            }
+        );
+        println!("  （先驗證發佈包的簽章與雜湊；或由 Kairos 再推送一次升級，升級成功後恢復一致）");
     }
     if let Err(e) = &state {
         println!("（無法讀取遠端升級的狀態檔：{e}）");
@@ -571,6 +663,33 @@ mod tests {
             "apply 必須有 --request"
         );
         assert!(parse_upgrade(&s(&["status", "--yes"])).is_err());
+        // archive-current：三個檔案都必須指定
+        assert_eq!(
+            parse_upgrade(&s(&[
+                "archive-current",
+                "--package",
+                "/tmp/pulse-0.11.1-9a8b7c6-linux-x86_64.deb",
+                "--sums",
+                "/tmp/SHA256SUMS",
+                "--signature",
+                "/tmp/SHA256SUMS.sig",
+                "--seed",
+            ]))
+            .unwrap()
+            .unwrap(),
+            UpgradeArgs::ArchiveCurrent(crate::remote::upgrade::helper::ArchiveArgs {
+                package: PathBuf::from("/tmp/pulse-0.11.1-9a8b7c6-linux-x86_64.deb"),
+                sums: PathBuf::from("/tmp/SHA256SUMS"),
+                signature: PathBuf::from("/tmp/SHA256SUMS.sig"),
+                seed: true,
+            })
+        );
+        assert!(
+            parse_upgrade(&s(&["archive-current", "--package", "/tmp/x.deb"])).is_err(),
+            "缺少 --sums 與 --signature"
+        );
+        assert!(parse_upgrade(&s(&["archive-current", "--package"])).is_err());
+        assert!(parse_upgrade(&s(&["archive-current", "--yes"])).is_err());
         assert!(parse_upgrade(&s(&["frobnicate"])).is_err());
         assert!(parse_upgrade(&[]).is_err());
         assert_eq!(parse_upgrade(&s(&["--help"])).unwrap(), None);

@@ -27,6 +27,14 @@ pub(crate) const SCHEMA_V12_INSTALL_EXTERNAL_URL: &str = "
 ALTER TABLE hosts ADD COLUMN install_external_url TEXT;
 ";
 
+/// schema v13（0.11.0 之後的版本）：hello 的 `install.rollback`（REMOTE.md 第 2.1 節；ADR-0003 階段 2）——
+/// Pulse 宣告自動回滾的能力（`archived`／`binary_only`／`none`／`degraded`；NULL＝沒有宣告，較舊的 Pulse）。
+/// 只新增一個可為 NULL 的欄位，不修改既有的資料。PostgreSQL 的對等步驟在 `store/postgres/schema.rs` 的
+/// `SCHEMA_V13`
+pub(crate) const SCHEMA_V13_INSTALL_ROLLBACK: &str = "
+ALTER TABLE hosts ADD COLUMN install_rollback TEXT;
+";
+
 /// schema v9（0.9.0）：集中設定與 Pulse 遠端升級（商業審計 F8；`crates/kairos-proto/REMOTE.md`
 /// 第 6 節、`kairos/STORAGE.md` 第 18 節）。只新增資料表與 `hosts` 的欄位，不修改既有的唯一鍵。
 ///
@@ -785,7 +793,8 @@ pub fn artifact_refs(conn: &Connection, sha256: &str) -> rusqlite::Result<i64> {
 // ---- 推送 ----
 
 const UPGRADE_HOST_COLUMNS: &str = "host_id, agent_id, hostname, agent_version, os, install_method, \
-     install_upgrade, install_config, host_group, tags, online, lifecycle, install_external_url";
+     install_upgrade, install_config, host_group, tags, online, lifecycle, install_external_url, \
+     install_rollback";
 
 fn upgrade_host_of(r: &Row<'_>) -> rusqlite::Result<UpgradeHost> {
     Ok(UpgradeHost {
@@ -802,6 +811,7 @@ fn upgrade_host_of(r: &Row<'_>) -> rusqlite::Result<UpgradeHost> {
         online: r.get::<_, i64>(10)? != 0,
         decommissioned: r.get::<_, String>(11)? != "active",
         install_external_url: r.get(12)?,
+        install_rollback: r.get(13)?,
     })
 }
 

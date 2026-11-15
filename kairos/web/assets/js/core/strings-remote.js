@@ -59,6 +59,9 @@ export const REMOTE_STRINGS = {
   'adm.audit.action.host.upgrade.signature_failed': '發佈包簽章驗證失敗',
   'adm.audit.action.host.upgrade.rolled_back': '升級已自動回滾',
   'adm.audit.action.host.upgrade.rollback_failed': '升級回滾失敗',
+  // 降級回滾與提議過大（ADR-0003 階段 1；REMOTE.md 第 4.5.2、2.4.1 節）〔工程暫行〕
+  'adm.audit.action.host.upgrade.rolled_back_degraded': '升級已回滾，但需要修復套件（降級回滾）',
+  'adm.audit.action.host.upgrade.offer_too_large': '升級提議超過單行上限，沒有送出',
   'adm.audit.action.host.upgrade.acknowledge': '升級回滾失敗已標記為已處理',
 
   // ---- 共用 ----
@@ -110,6 +113,27 @@ export const REMOTE_STRINGS = {
   'rm.host.externalUrl': '外部 URL 的版本',
   'rm.ext.none': '不允許（主機的 upgrade.url_allowlist 是空的）',
   'rm.ext.allowlist': '依主機的白名單（Kairos 不知道白名單的內容）',
+  // Pulse 宣告的 install.rollback（S05「升級」卡片；REMOTE.md 第 2.1 節；ADR-0003 階段 2）〔工程暫行〕
+  'rm.host.rollback': '自動回滾',
+  'rm.rb.archived': '經套件管理員裝回（主機上有目前版本的套件封存）',
+  'rm.rb.binary_only': '換回執行檔（主機上沒有目前版本的套件封存；deb／rpm 在版本庫有這個版本時仍可經套件管理員裝回）',
+  'rm.rb.none': '沒有（遠端升級在這台主機上不可用）',
+  'rm.rb.degraded': '需要先修復套件（上一次回滾只換回了執行檔）',
+  // 降級回滾之後（package_repair_needed；PLS-W8418 暫定號）
+  'rm.host.repairTitle': '需要修復套件',
+  'rm.host.repairBody':
+    '上一次升級失敗後這台主機只換回了執行檔（降級回滾）：Pulse 已恢復運作，但套件資料庫（dpkg／rpm）與實際安裝的執行檔不一致，弱點掃描與之後的套件操作會看到錯誤的版本。請在主機上重新安裝目前版本的套件（deb：dpkg -i <套件>；rpm：rpm -U --replacepkgs --oldpackage <套件>），或推送一次成功的升級；pulse upgrade status 會顯示目前的狀態。',
+  // 降級回滾的原因（主機列的 degraded[]；Pulse 回報的代碼，不認得的原樣顯示）
+  'rm.hs.degraded': '需要修復套件',
+  'rm.degraded.package_db_inconsistent': '套件資料庫與執行檔不一致',
+  'rm.degraded.package_rollback_failed': '套件管理員裝回舊版失敗',
+  'rm.degraded.rollback_signer_revoked': '回滾套件的簽署金鑰已撤銷',
+  'rm.degraded.no_rollback_package': '沒有回滾套件',
+  'rm.degraded.rollback_not_verified': '回滾套件沒有通過驗證',
+  'rm.degraded.rollback_binary_mismatch': '回滾套件的執行檔與安裝的不同',
+  'rm.degraded.rollback_commit_mismatch': '回滾套件的 commit 與安裝的不同',
+  'rm.degraded.rollback_copy_changed': '回滾套件的複本與紀錄不符',
+  'rm.degraded.rollback_archive_unusable': '本機封存無法使用',
   // 安裝方式
   'rm.method.tar': 'tar',
   'rm.method.deb': 'deb',
@@ -549,6 +573,9 @@ export const REMOTE_STRINGS = {
   'rm.skip.no_report_after_apply': '替換後沒有回報',
   'rm.skip.version_mismatch': '回報成功但版本不符',
   'rm.skip.artifact_missing': '版本庫的檔案遺失或大小不符（重新上傳後可以升級）',
+  // upgrade_offer 的單行大小規則（REMOTE.md 第 2.4.1 節；KRS-W8419 暫定號）〔工程暫行〕
+  'rm.skip.offer_too_large': '升級提議超過協定的單行上限，沒有送出（KRS-W8419；請檢查版本庫中這個版本的簽章資料）',
+  'rm.skip.rollback_bundle_omitted': '提議沒有附回滾檔的簽章資料（超過單行上限）：主機本機沒有紀錄時只能換回執行檔',
   'rm.skip.window_closed': '等待下一個升級時段',
   'rm.skip.rollout_ended': '推送已到結束時間',
   // 不認得的原因代碼（之後的版本新增的分類）：照常列出台數與主機（ADR-0002 決策點 8 的接點 1）
@@ -613,6 +640,10 @@ export const REMOTE_STRINGS = {
   'rm.new.extSnippet': '要允許這個版本，主機的 pulse.toml 需要：',
   'rm.new.downgradeN': '其中 {n} 台是降版',
   'rm.new.noRollbackN': '其中 {n} 台無法自動回滾',
+  // 預覽的 rollback（archive、repository、degraded_hosts；ADR-0003 第 5.4 節）〔工程暫行〕
+  'rm.new.rollbackArchiveN': '{n} 台以主機上的套件封存回滾',
+  'rm.new.rollbackRepositoryN': '{n} 台以版本庫的回滾檔回滾',
+  'rm.new.degradedHostsN': '其中 {n} 台需要修復套件（上一次回滾只換回了執行檔；這次升級成功後恢復一致）',
   'rm.new.loses': '目標版本沒有遠端升級功能（或沒有發佈清單）：升級後這些主機無法再以推送升級。',
   'rm.new.choosePreview': '選擇目標版本與對象後顯示可升級的台數。',
   'rm.new.batches': '批次',

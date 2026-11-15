@@ -537,8 +537,16 @@ fn inventory_is_persisted_and_restored(db: &TestDb) -> String {
 
 /// hello 的 `install.external_url`（schema v12；REMOTE.md 第 2.1 節）：清冊的值在每次帶 `install.upgrade` 的
 /// hello 整個取代——沒有宣告的 hello 清成 NULL（Pulse 降回舊版後是「未知」，不沿用舊值）；沒有主機資訊的
-/// 同步（v1 的連線）保留原值。`upgrade_hosts`（推送的資格分類讀的）與清冊的 `install` 在兩個後端相同
+/// 同步（v1 的連線）保留原值。`upgrade_hosts`（推送的資格分類讀的）與清冊的 `install` 在兩個後端相同。
+/// `install.rollback`（schema v13；ADR-0003 階段 2）的規則相同，一併檢查
 fn install_external_url_follows_the_latest_hello(db: &TestDb) -> String {
+    fn rollback_for(external_url: &str) -> &'static str {
+        if external_url == "none" {
+            "archived"
+        } else {
+            "binary_only"
+        }
+    }
     let mut out = String::new();
     let (mut store, _) = db.store(noon);
     let hello = |agent: &str, secs: i64, external_url: Option<&str>| {
@@ -549,8 +557,15 @@ fn install_external_url_follows_the_latest_hello(db: &TestDb) -> String {
             upgrade: Some("ready".into()),
             config: Some("enabled".into()),
             external_url: external_url.map(str::to_string),
+            // `install.rollback`（schema v13）與 external_url 的寫入規則相同：這裡讓兩者一起宣告或一起沒有
+            rollback: external_url.map(|e| rollback_for(e).to_string()),
         });
         a
+    };
+    let rollback_of = |agent: &str| {
+        db.text(&format!(
+            "SELECT install_rollback FROM hosts WHERE agent_id = '{agent}'"
+        ))
     };
     let declared = || {
         let hosts = db.handle().upgrade_hosts().unwrap();
@@ -597,6 +612,32 @@ fn install_external_url_follows_the_latest_hello(db: &TestDb) -> String {
         (install_of(A), install_of(B), install_of(c)),
         (Some("none".into()), Some("allowlist".into()), None)
     );
+    let rollback_listed = |agent: &str| {
+        listed
+            .iter()
+            .find(|h| h.agent_id.to_string() == agent)
+            .and_then(|h| h.install.clone())
+            .and_then(|i| i.rollback.clone())
+    };
+    assert_eq!(
+        (rollback_listed(A), rollback_listed(B), rollback_listed(c)),
+        (Some("archived".into()), Some("binary_only".into()), None)
+    );
+    assert_eq!(
+        (rollback_of(A), rollback_of(B), rollback_of(c)),
+        (Some("archived".into()), Some("binary_only".into()), None)
+    );
+    let hosts = db.handle().upgrade_hosts().unwrap();
+    let from_inventory = |agent: &str| {
+        hosts
+            .iter()
+            .find(|h| h.agent_id == agent)
+            .and_then(|h| h.install_rollback.clone())
+    };
+    assert_eq!(
+        (from_inventory(A), from_inventory(B), from_inventory(c)),
+        (Some("archived".into()), Some("binary_only".into()), None)
+    );
     // 宣告改變（修改白名單後重新啟動 Pulse）；A 降回舊版（hello 帶 install 而沒有 external_url）→ 清成 NULL
     assert_eq!(
         store.sync_now(&snapshot(vec![
@@ -617,6 +658,10 @@ fn install_external_url_follows_the_latest_hello(db: &TestDb) -> String {
             Some("allowlist".to_string())
         ]
     );
+    assert_eq!(
+        (rollback_of(A), rollback_of(B), rollback_of(c)),
+        (None, Some("archived".into()), Some("binary_only".into()))
+    );
     log!(out, "changed", declared());
     // 沒有主機資訊的同步（v1 的連線）：install 的欄位（含 external_url）保留
     let mut v1 = agent_snapshot(B, true, noon() + chrono::Duration::seconds(2));
@@ -630,6 +675,7 @@ fn install_external_url_follows_the_latest_hello(db: &TestDb) -> String {
         .as_deref(),
         Some("none")
     );
+    assert_eq!(rollback_of(B).as_deref(), Some("archived"));
     log!(out, "kept", declared());
     store.close();
     out

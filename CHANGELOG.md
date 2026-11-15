@@ -51,6 +51,39 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
+**遠端升級的回滾（ADR-0003 階段 1、2；Linux）**：deb／rpm 主機第一次遠端升級失敗也能經套件管理員回滾；回滾檔由升級輔助程式以信任錨驗證並綁定「同一個版本、commit、執行檔」；只換回執行檔的回滾不再被回報成一般的回滾（降級回滾）。新的代碼 `PLS-W8418`／`KRS-W8418`、`KRS-W8419` 是**暫定號**。
+
+### Kairos：遠端管理
+
+- **`upgrade_offer` 附回滾檔的簽章資料（`rollback_bundle`）**（REMOTE.md 第 2.4.1、4.4.2 節）：版本庫有主機目前的版本時，deb／rpm 的提議除了回滾檔，另附它所屬發佈的 `SHA256SUMS` 與簽章。送出前以完整的訊息實際序列化，套用單行大小的三段式規則：放得下就原樣送出；含 bundle 時超過協定的單行上限就省略 bundle（主機列的 `reason` 為 `rollback_bundle_omitted`）；仍超過就不送出（`upgrade_unavailable`，連線不受影響），主機 `failed`（`offer_too_large`、`KRS-W8419`）、稽核 `host.upgrade.offer_too_large`、推送自動暫停。正常的官方發佈不會碰到後兩段。
+- **降級回滾**（REMOTE.md 第 4.5.2、4.7.4 節）：Pulse 回報 `rolled_back` 而 `detail` 以 `degraded:` 開頭時（服務已恢復，但 deb／rpm 只換回了執行檔，套件資料庫不一致），稽核事件為 `host.upgrade.rolled_back_degraded`（`KRS-W8418`），**推送自動暫停**（`pause_cause: rollback_degraded`；系統規則「升級推送已暫停」開告警），推送的主機列多 `degraded`（原因的陣列），主機的升級 API 多 `package_repair_needed`、`recent_degraded`。**行為變更**：勾選「允許無法自動回滾的主機」的推送，現在第一台只換回執行檔的回滾就會暫停推送（先前只計入失敗比例）。
+- **「無法自動回滾」的口徑**（REMOTE.md 第 4.7.2 節）：Pulse 宣告 `install.rollback = "archived"`（主機上有目前版本的套件封存）的主機不因為版本庫沒有它目前的版本而列為 `no_rollback`。預覽多 `rollback`（`archive`／`repository`／`binary_only`／`degraded_hosts`）；`no_rollback` 與確認字串的數字就是 `binary_only`。
+  - **資料庫升級到 schema v13**（SQLite 與 PostgreSQL 兩個後端）：`hosts` 新增一個可為 NULL 的欄位 `install_rollback`，第一次以新版啟動時自動升級，既有資料不變。升級後 0.11.0 以前的 Kairos 無法開啟這個資料庫（降版從備份還原）；叢集照「schema 改變的版本」的步驟升級（全部停止 → 升級 → 啟動）。
+- 主控台：S05「升級」卡片顯示 Pulse 宣告的自動回滾方式與「需要修復套件」的警告；S27 的主機表列出降級回滾的原因；S26 的資格預覽列出以封存／版本庫回滾檔回滾的台數。文案為工程暫行。
+
+### Pulse：遠端管理
+
+- **回滾來源的順序與資格**（REMOTE.md 第 4.4.2 節；ADR-0003 第 5.4 節）：deb／rpm 的升級輔助程式在替換前依序評估 (1) root 的本機封存、(2)(3) 服務帳號暫存的回滾檔（簽章資料來自本機紀錄或提議的 `rollback_bundle`）、(4) `pulse.prev`。回滾檔必須通過本機信任錨的完整驗證，而且是**輔助程式自己的版本、同一個 commit、套件中的 `/opt/pulse/pulse` 與目前安裝的執行檔位元組相同**；不合格時不讓升級失敗，往下一個來源退。Pulse 端接受提議時先看本機紀錄、再看 `rollback_bundle`：第一次遠端升級的主機也能使用回滾檔。
+- **本機封存**（REMOTE.md 第 17.10 節）：deb／rpm 每次遠端升級成功（健康確認通過）後，輔助程式把剛裝好的套件與它的簽章資料封存到 `/var/lib/pulse-upgrade/archive/`（root 專用；索引有 checksum 與 generation、原子提交；只保留 1 份；封存前檢查可用空間）。下一次升級失敗時優先以它經套件管理員回滾，不依賴 Kairos。封存損毀、缺失或被改過時不使用，改用下一個來源。
+- **`pulse upgrade archive-current`**（需要 root）與安裝時的種子：把目前安裝的版本的套件（通過同樣的驗證後）封存起來。`pulse-install.sh` 安裝後自動執行，並保存這次發佈的簽章紀錄；手動安裝套件的主機可以事後執行（INSTALL.md 第 10.1 節）。
+- **套件回滾失敗不再直接 `rollback_failed`**：套件管理員裝回舊版失敗（含交易部分完成）時，輔助程式先以 `pulse.prev` 緊急復原並確認舊版恢復；`pulse.prev` 也不能用才是 `rollback_failed`。輔助程式不自動修復套件資料庫。
+- **降級回滾**（`PLS-W8418`）：deb／rpm 因健康確認失敗而回滾、卻只換回了執行檔時，`upgrade_status` 的 `state` 仍是 `rolled_back`，代碼改為 `PLS-W8418`，`detail` 以 `degraded:<原因>,…` 開頭（`no_rollback_package`、`rollback_not_verified`、`rollback_commit_mismatch`、`rollback_binary_mismatch`、`rollback_archive_unusable`、`rollback_signer_revoked`、`rollback_copy_changed`、`package_rollback_failed`，以及一定會有的 `package_db_inconsistent`）。**行為變更**：先前這種情況回報的是一般的 `PLS-W8407`（`detail` 有 `binary_restored_package_db_shows_<版本>`）。`pulse upgrade status` 顯示「需要修復套件」與修復的命令，`pulse status` 的「升級」列為警告（結束代碼 8）直到重新安裝套件或下一次成功的升級。
+- **金鑰到期與撤銷分開處理**（REMOTE.md 第 4.2.3 節）：已綁定的回滾套件（含本機封存）在簽署金鑰只是到期（那一行還在信任錨中）時照常使用；金鑰被撤銷（那一行已刪除）或信任錨讀不到時，不再經套件管理員回滾，改換回 `pulse.prev`（降級回滾，`rollback_signer_revoked`）。
+- **hello 宣告自動回滾的能力**（`install.rollback`：`archived`／`binary_only`／`none`／`degraded`；REMOTE.md 第 2.1、17.10.6 節），`pulse upgrade status` 多一行「自動回滾」。宣告的值在連線期間改變（升級成功後的封存、降級回滾、`archive-current`）時，Pulse 會重新連線以更新宣告。
+
+### 相容性
+
+- 協定版本與 8443 的 feature 都不變。`rollback_bundle` 是 `upgrade_offer` 的選用欄位：0.9～0.11.0 的 Pulse 忽略它（單行大小的規則保證訊息不超過舊端的上限）；新的 Pulse 連較舊的 Kairos 時沒有 bundle，回滾檔照舊只在本機有紀錄時使用。`install.rollback` 是 hello `install` 物件的選用欄位，較舊的 Kairos 忽略。降級回滾的 `state` 仍是 `rolled_back`：較舊的 Kairos 當成一般的回滾（不暫停推送）。
+- 由 0.11.0 以前的輔助程式開始、新版接續的升級交易照常接續（交易紀錄新增的欄位都有預設值）。「回報降級回滾」取決於執行回滾的輔助程式的版本——也就是**替換前安裝的那一版**。
+- 發佈政策（RELEASING.md 第 3 節）：同一個版本號只發佈一份 `SHA256SUMS`；撤銷金鑰的方式是從 `allowed_signers` 刪除那一行。
+
+### 已知限制
+
+- 只有 Linux（deb／rpm）；Windows 的版本槽（ADR-0001）尚未實作。版本庫保存多份簽章（重簽）尚未實作：發佈金鑰輪替後，舊版本的 `rollback_bundle` 在主機上驗證不過時，回滾靠本機封存或 `pulse.prev`。
+- 撤銷之後沒有「本機管理者核准後強制套件回滾」的命令：以新金鑰簽署的版本升級，或手動重新安裝套件。
+- 直接以 `apt install ./x.deb`／`dnf install ./x.rpm` 安裝、Kairos 的版本庫又沒有那個版本的主機，第一次遠端升級仍只能換回執行檔（降級回滾）；安裝後執行一次 `pulse upgrade archive-current` 即可。
+- 測試向量的版本字串 `0.11.1` 是暫填的；`PLS-W8418`、`KRS-W8418`、`KRS-W8419` 與主控台文案待設計包分配與定稿。
+
 ## [0.11.0] - 2026-11-14
 
 **Kairos 0.11.0、Pulse 0.11.0**：升級時段支援 IANA 時區、外部 URL 版本的資格預覽（`url_not_allowed`、`url_not_supported`）、Windows 服務與 MSI 的既有缺陷修正（ADR-0001 階段 0；**仍未在 Windows 實機驗證**）與安全稽核 F4。協定版本、8443 的 feature 與 8444 的 API 都不變；**Kairos 的資料庫升級到 schema v12，升級後 0.10.1 以前的 Kairos 無法開啟**（見下方「Kairos：遠端管理」）。

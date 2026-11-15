@@ -81,6 +81,12 @@ pub const CODE_UPGRADED: &str = "KRS-I8416";
 /// 409 `artifact_missing`、推送中等待檔案的主機）。ADR-0002 決策點 7／U10：照工程的號碼正式採用（子類別 84
 /// 「遠端升級」、只有 Kairos 端、不鏡像；「不存在」與「大小不符」同號）
 pub const CODE_RELEASE_FILE_MISSING: &str = "KRS-W8417";
+/// 降級回滾：服務已恢復到舊版，但套件資料庫與實際的執行檔不一致，需要修復套件（鏡像 `PLS-W8418`；
+/// ADR-0003 第 5.4 節。**暫定號**，正式分配由設計包負責）
+pub const CODE_ROLLED_BACK_DEGRADED: &str = "KRS-W8418";
+/// `upgrade_offer` 省略 `rollback_bundle` 後仍超過單行上限，沒有送出（ADR-0003 第 6.3 節；只有 Kairos
+/// 端。**暫定號**）
+pub const CODE_OFFER_TOO_LARGE: &str = "KRS-W8419";
 
 /// Pulse 的代碼換成鏡像的 Kairos 代碼（同號；`KRS-W8402` 與 `PLS-E8402` 等級不同）
 pub fn mirror_code(pulse_code: &str) -> Option<&'static str> {
@@ -101,6 +107,7 @@ pub fn mirror_code(pulse_code: &str) -> Option<&'static str> {
         "8411" => "KRS-W8411",
         "8412" => "KRS-W8412",
         "8416" => CODE_UPGRADED,
+        "8418" => CODE_ROLLED_BACK_DEGRADED,
         _ => return None,
     })
 }
@@ -172,6 +179,8 @@ pub struct AgentSession {
     pub install_upgrade: Option<String>,
     /// hello 的 `install.external_url`（`None`＝沒有宣告；REMOTE.md 第 2.1 節）
     pub install_external_url: Option<String>,
+    /// hello 的 `install.rollback`（`None`＝沒有宣告；REMOTE.md 第 2.1 節）
+    pub install_rollback: Option<String>,
     pub arch: Option<String>,
     pub config: bool,
     pub upgrade: bool,

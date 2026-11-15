@@ -231,6 +231,9 @@ pub struct UpgradeHost {
     pub install_config: Option<String>,
     /// hello 的 `install.external_url`（`none`／`allowlist`；`None`＝沒有宣告，0.10.1 以前的 Pulse）
     pub install_external_url: Option<String>,
+    /// hello 的 `install.rollback`（`archived`／`binary_only`／`none`／`degraded`；`None`＝沒有宣告，
+    /// 0.11.0 以前的 Pulse；schema v13）
+    pub install_rollback: Option<String>,
     pub host_group: Option<String>,
     pub tags: Vec<String>,
     pub online: bool,

@@ -77,13 +77,15 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 
 | 情境 | 推送 | 預期 |
 |---|---|---|
-| `rollback-first`（b0） | `<V0>` → test.2（崩潰） | 第一次遠端升級：本機沒有 `<V0>` 的已驗證發佈，回滾檔不可信（REMOTE.md 第 17.3 節第 1 項）→ 三台以 `pulse.prev` 換回執行檔、`rolled_back`（`PLS-W8407`）；deb／rpm 的套件資料庫仍是 test.2，`detail` 有 `binary_restored_package_db_shows_0.9.1-test.2` |
-| `upgrade`（a） | `<V0>` → test.1 | 套件資料庫是 test.2（比目標新：rpm 需要 `--oldpackage`）。三台 `succeeded`（`PLS-I8416`）；`--version`、`dpkg-query`／`rpm -q`、Kairos 的 `agent_version` 為 test.1；tar 的 `pulse.prev` 為 0.9.0；推送 `completed` |
-| `rollback`（b） | test.1 → test.2（崩潰） | 三台 `rolled_back`（`PLS-W8407`，`crash_restart`）、回到 test.1 且服務正常；deb／rpm 以 `rollback_artifact`（`dpkg -i`／`rpm -U --oldpackage --replacepkgs`）回滾，套件資料庫也是 test.1 |
+| `rollback-first`（b0） | `<V0>` → test.2（崩潰） | **第一次遠端升級就失敗也經套件管理員回滾**（ADR-0003 階段 1、2；0.11.0 以前三台都只能以 `pulse.prev` 換回執行檔）。先確認安裝腳本留下的種子（deb：封存索引 `<V0> seed 1`、服務帳號擁有的本機紀錄、hello 的 `install.rollback = archived`）。deb：以種子封存回滾（日誌「回滾來源：本機封存的 …來源 seed」）；rpm：先刪除種子封存、本機紀錄與提示（模擬手動安裝套件的主機，hello 變成 `binary_only`），Pulse 以提議的 `rollback_bundle` 驗證回滾檔、輔助程式重新驗證並綁定 commit 與執行檔後回滾；tar：`pulse.prev`。三台 `rolled_back`（`PLS-W8407`），deb／rpm 的套件資料庫也回到 `<V0>`，都不是降級回滾，推送沒有因此暫停 |
+| `upgrade`（a） | `<V0>` → test.1 | 三台 `succeeded`（`PLS-I8416`）；`--version`、`dpkg-query`／`rpm -q`、Kairos 的 `agent_version` 為 test.1；tar 的 `pulse.prev` 為 `<V0>`；推送 `completed`。deb／rpm：升級成功後封存了 test.1 的套件（索引只有一筆、來源 `ota`；`archive/` 0700、`index.json` 0600、屬於 root），hello 宣告 `archived`；tar 不封存 |
+| `rollback`（b） | test.1 → test.2（崩潰） | 三台 `rolled_back`（`PLS-W8407`，`crash_restart`）、回到 test.1 且服務正常；deb／rpm 以**本機封存**（情境 a 封存的那一份）經 `dpkg -i`／`rpm -U --oldpackage --replacepkgs` 回滾，套件資料庫也是 test.1；失敗的 test.2 沒有進封存 |
+| `archive-tamper`（k） | test.1 → test.2（崩潰） | **封存被竄改**（REMOTE.md 第 17.10.4 節）：deb 的封存套件被附加一個位元組（整包雜湊不符）、rpm 的 `index.json` 被改（checksum 不符）。輔助程式「本機封存不使用（rollback_archive_unusable）」，改評估下一個來源——提議附的回滾檔，重新驗證（簽章、commit、執行檔）後經套件管理員回滾。三台 `rolled_back`（`PLS-W8407`），不是降級回滾 |
 | `reboot`（c） | test.1 → test.3 | 輔助程式在健康確認（`state.json` 的 `replaced`）時重新開機；開機後 `pulse-upgrade.path` 再次觸發、接續健康確認 → `succeeded` |
 | `reboot-rollback`（c2） | test.3 → test.4（崩潰） | 回滾確認（`rolling_back`）時重新開機；開機後接續 → `rolled_back`、回到 test.3 |
 | `signature`（d） | — ／ test.9 | d1：Kairos 拒絕匯入 `evil-a`（400 `release_signature_invalid`）；d2：Kairos 匯入 test.9，Pulse 下載前驗證簽章失敗 → `failed`（`PLS-E8401`）、版本不變、推送自動暫停 |
 | `tamper`（e） | （不經 Kairos）test.4＋謊報的 `from_version` | 0.10.0 的安全性修正（REMOTE.md 第 5.1 節）：在 deb、rpm 主機上**以服務帳號**自己寫 `request.json`——目標是有官方簽章的 test.4（崩潰，健康確認一定失敗），`from_version` 謊報為較舊的 `<V0>` 並附上 `<V0>` 有官方簽章的套件當回滾檔。輔助程式以自己的版本為準：`failed`（`PLS-E8402`，`from_version_mismatch: request says <V0>, installed version is <目前的版本>`），執行檔與套件資料庫都沒有改變、沒有執行套件管理員、`request.json` 已刪除、服務照常執行。修正前同樣的請求會讓 root 以 `dpkg -i`／`rpm -U --oldpackage` 把主機降到 `<V0>` |
+| `degraded`（l） | （不經 Kairos）目前的版本 → test.4（崩潰）＋簽章被換掉的回滾檔 | **回滾檔沒有通過驗證 → 降級回滾**（REMOTE.md 第 4.5.2 節）。deb、rpm：先刪除本機封存（模擬沒有封存的主機），以服務帳號自己寫 `request.json`——回滾檔是目前版本的官方套件，但它的 `SHA256SUMS.sig` 換成不被信任的金鑰簽的。輔助程式不採用回滾檔（`rollback_not_verified`）、照常升級；新版崩潰 → 換回 `pulse.prev`：結果 `rolled_back`、`PLS-W8418`、`detail` 以 `degraded:rollback_not_verified,package_db_inconsistent` 開頭，沒有執行套件管理員回滾，套件資料庫停在 test.4。之後：`rollback.json` 為 `degraded`、`pulse upgrade status` 提示修復、`pulse status` 結束代碼非 0、Kairos 看到 `install.rollback = degraded` 與 `package_repair_needed`。**修復**：`dpkg -i`／`rpm -U --replacepkgs --oldpackage` 重新安裝目前的套件 → 不再宣告 `degraded`。**`pulse upgrade archive-current`**：被改過的套件被拒（結束代碼 1、沒有封存）、官方套件封存成功（索引 `<版本> install 1`）、服務帳號執行被拒（結束代碼 10）、hello 宣告 `archived` |
 | `tamper-resume`（f） | 目前的版本 → test.4（崩潰） | 進行中交易的指標與交易紀錄（REMOTE.md 第 17.8、17.9 節）：回滾確認（`rolling_back`）期間**以服務帳號**把 `request.json` 的 `upgrade_id` 改成另一個 UUID、`from_version` 改成謊報的 `0.0.1`，然後重新開機。輔助程式仍接續原本的交易：三台 `rolled_back`（`PLS-W8407`）、`detail` 加註 `request_upgrade_id_ignored` 與 `request_from_version_ignored`，沒有為假的 `upgrade_id` 建立工作目錄，`/var/lib/pulse-upgrade/active.json` 已清除，`pulse.prev` 仍是替換前的版本。另外檢查竄改當下 root 的檔案：`active.json`（schema `pulse.upgrade-active/v1`）與它指向的 `state.json`（schema `pulse.upgrade-helper/v2`、步驟 `rolling_back`）的 `checksum` 以 `sha256sum` 重新計算相符、兩者的 `upgrade_id` 與 `binding_sha256` 相同、紀錄有替換前的版本、新舊執行檔與發佈檔的雜湊、`prev_saved` 與回滾的意圖；工作目錄 0700、兩個檔案 0600、都屬於 root，服務帳號讀不到 `/var/lib/pulse-upgrade`。交易結束後紀錄為 `done`、工作目錄只留 `state.json` 與 `upgrade.log`、`/var/lib/pulse-upgrade` 只保留最近一筆交易 |
 | `crash-replace`（g） | （test.3 → test.5）→ test.6 | 當機點（REMOTE.md 第 17.9.4 節第 11 列）。主機上的輔助程式不是測試用建置時，先以一次正常的推送升級到 test.5。在每台主機放好掛鉤 `/var/lib/pulse-upgrade/fault-inject`（內容 `binary_replaced`），推送 test.6：輔助程式在**執行檔已替換（deb／rpm：套件已安裝完成）、還沒記下 `replaced`** 時停住，腳本確認當時的紀錄是 `replacing`（checksum 相符）、執行檔已是 test.6、`pulse.prev` 是 test.5，然後 `docker kill`（SIGKILL PID 1）並重新啟動容器。開機後輔助程式「接續上次中斷的替換」：不再保留 `pulse.prev`（「不再覆寫」）、健康確認 → 三台 `succeeded`（`PLS-I8416`），`pulse.prev` 仍是 test.5，指標已清除 |
 | `crash-rollback`（h） | test.6 → test.7（崩潰） | 當機點（第 17 列）：掛鉤 `rollback_restored`。新版崩潰 → 輔助程式記下回滾的意圖、還原（tar：換回 `pulse.prev`；deb／rpm：以回滾套件經套件管理員裝回），在**已還原、還沒記下 `rolling_back`** 時停住；腳本確認紀錄是 `rollback_intent`（`cause: health`，`via` 為 `binary`／`package`）、執行檔已是 test.6，然後 `docker kill` 並重新啟動。開機後「接續上次中斷的回滾：重新還原」（冪等重做）→ 三台 `rolled_back`（`PLS-W8407`，`detail` 為「<原因>; resumed」），deb／rpm 的套件資料庫也是 test.6 |
@@ -94,10 +96,18 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 輔助程式的 `upgrade.log`、Pulse 日誌中與升級有關的行）、`logs/<情境>-kairos.log`。
 
 情境 g、h 的 `docker kill` 等同「所有行程立即終止」，不是真正的斷電：已寫入頁面快取的資料不會遺失。其餘的
-當機點（REMOTE.md 第 17.9.4 節共 22 列）由單元測試的故障注入矩陣涵蓋（`pulse/src/remote/upgrade/helper/fault_tests.rs`）；
+當機點（REMOTE.md 第 17.9.4 節共 24 列）由單元測試的故障注入矩陣涵蓋（`pulse/src/remote/upgrade/helper/fault_tests.rs`）；
 要在實機重現其他的當機點，把掛鉤的內容換成那個 checkpoint 的名稱即可（只有 test.5、test.6 的輔助程式會讀）。
 
 ## 沒有涵蓋
+
+- 回滾來源（ADR-0003）：金鑰到期／撤銷時的封存與回滾（`key-expired`、`key-revoked`）、套件管理員裝回舊版失敗
+  （`pkg-rollback-fails`）、回滾套件的執行檔或 commit 不符（`binary-mismatch`）、封存的當機點（第 23、24 列）
+  沒有系統層的情境，由單元測試涵蓋（`helper::tests` 的 `an_archived_package_survives_key_expiry_but_not_revocation`、
+  `a_revoked_signer_is_not_used_at_rollback_time_but_an_expired_one_is`、
+  `a_failed_package_rollback_falls_back_to_the_saved_binary_and_is_reported_as_degraded`、
+  `a_staged_rollback_package_is_only_used_when_it_is_the_installed_version_commit_and_binary` 與故障注入矩陣）。
+  降級回滾造成的推送自動暫停由 Kairos 的測試與 `tests/e2e` 涵蓋（情境 l 不經推送）。
 
 - 真正的斷電（頁面快取遺失、fsync 之前的寫入消失）：情境 g、h、i 只終止行程。
 - 重新開機後 `boot_id` 的改變（情境 i）：容器的 `/proc/sys/kernel/random/boot_id` 是宿主機核心的，`docker kill`／

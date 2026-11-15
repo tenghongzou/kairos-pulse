@@ -49,6 +49,8 @@ enum Phase {
     Forward,
     /// 回滾（只有新版崩潰時經過）
     Rollback,
+    /// 升級成功後的封存（只有新版健康、deb／rpm 時經過；REMOTE.md 第 17.10 節）
+    Archive,
     /// 結果已記錄之後
     Finish,
 }
@@ -118,10 +120,44 @@ const POINTS: &[Point] = &[
     point(20, "record_done", Phase::Finish, all),
     point(21, "result_written", Phase::Finish, all),
     point(22, "request_removed", Phase::Finish, all),
+    // 第 23、24 列在時間上位於第 14 列（健康確認通過）與第 20 列（記下 done）之間；列號接在最後
+    point(23, "archive_staged", Phase::Archive, package_only),
+    point(24, "archive_committed", Phase::Archive, package_only),
 ];
+
+/// root 的本機封存索引（沒有時 `None`）
+fn archive_index(env: &Env) -> Option<archive::Index> {
+    archive::read_index(&env.paths.work_root, txn::Owner::new(false)).expect("封存索引可用")
+}
+
+/// 封存中 `version` 的條目（已提交的）
+fn archived(env: &Env, version: &str) -> Option<kairos_proto::release::ReleaseRecord> {
+    archive_index(env)?
+        .entries
+        .into_iter()
+        .find(|e| e.version == version)
+}
 
 fn pkg_db(fake: &Fake) -> String {
     fake.pkg_db.borrow().clone().unwrap_or_default()
+}
+
+/// 健康確認失敗而回滾時的代碼：沒有回滾套件的 deb 只換回執行檔，是降級回滾（ADR-0003 第 5.4 節）
+fn rolled_back_code(kind: Kind) -> &'static str {
+    if kind == Kind::DebNoRollback {
+        codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+    } else {
+        codes::W_UPGRADE_ROLLED_BACK
+    }
+}
+
+/// 降級回滾的 `detail` 開頭（機器可讀的原因）；其他情況是空字串
+fn degraded_prefix(kind: Kind) -> &'static str {
+    if kind == Kind::DebNoRollback {
+        "degraded:no_rollback_package,package_db_inconsistent; "
+    } else {
+        ""
+    }
 }
 
 /// 當機時磁碟上的狀態（對照表的第三欄）
@@ -143,7 +179,9 @@ fn crash_state(env: &Env, fake: &Fake, kind: Kind, p: &Point, label: &str) {
         | "package_running"
         | "binary_replaced"
         | "unit_replaced" => Some(Step::Replacing),
-        "record_replaced" | "health_wait" => Some(Step::Replaced),
+        "record_replaced" | "health_wait" | "archive_staged" | "archive_committed" => {
+            Some(Step::Replaced)
+        }
         "rollback_intent_recorded"
         | "rollback_restoring"
         | "rollback_package_running"
@@ -245,6 +283,25 @@ fn crash_state(env: &Env, fake: &Fake, kind: Kind, p: &Point, label: &str) {
         "request_removed" => {
             assert!(env.has_result() && !env.paths.request.exists(), "{label}")
         }
+        // 套件已寫進封存目錄，索引還沒有它：不是回滾目標（INV-10）
+        "archive_staged" => {
+            assert_eq!(env.installed(), "0.9.1", "{label}");
+            assert!(archived(env, "0.9.1").is_none(), "{label}: 尚未提交");
+            let sha = rec.artifact.as_ref().unwrap().sha256.clone();
+            assert_eq!(
+                txn::sha256_regular(
+                    &archive::entry_dir(&env.paths.work_root, &sha).join(archive::PACKAGE_FILE)
+                ),
+                Some(sha),
+                "{label}: 套件已在封存目錄"
+            );
+        }
+        // 索引已提交；紀錄還是 replaced（done 尚未記下）
+        "archive_committed" => {
+            let e = archived(env, "0.9.1").expect("已提交");
+            assert_eq!(e.generation, 1, "{label}");
+            assert!(rec.result.is_none(), "{label}");
+        }
         _ => {}
     }
 }
@@ -269,13 +326,21 @@ fn final_state(
         "{label}: {r:?}"
     );
     if crashy {
+        // 沒有回滾套件的 deb：只換回執行檔＝降級回滾（state 相同，代碼與 detail 的前綴不同）
         assert_eq!(
             (r.state.as_str(), r.code.as_deref()),
-            ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+            ("rolled_back", Some(rolled_back_code(kind))),
             "{label}: {r:?}"
         );
         assert!(
-            r.detail.starts_with("crash_restart"),
+            r.detail
+                .starts_with(&format!("{}crash_restart", degraded_prefix(kind))),
+            "{label}: {}",
+            r.detail
+        );
+        assert_eq!(
+            kairos_proto::mgmt::degraded_reasons(&r.detail).is_some(),
+            kind == Kind::DebNoRollback,
             "{label}: {}",
             r.detail
         );
@@ -322,6 +387,50 @@ fn final_state(
     let rec = env.record();
     assert_eq!(rec.step, Step::Done, "{label}");
     assert_eq!(rec.result.as_ref(), Some(r), "{label}");
+    // 本機封存（第 17.10 節；INV-10）：deb／rpm 升級成功後恰好提交一次、只有新版的套件；回滾的版本
+    // 沒有通過健康確認，不得被封存。在任何一個當機點中斷後接續都一樣（不重複提交、不留下暫存目錄）
+    let index = archive_index(env);
+    if kind.package() && !crashy {
+        let index = index.expect("升級成功後有封存");
+        assert_eq!(index.generation, 1, "{label}: 只提交一次");
+        assert_eq!(index.entries.len(), 1, "{label}");
+        let e = &index.entries[0];
+        let artifact = rec.artifact.as_ref().unwrap();
+        assert_eq!(
+            (
+                e.version.as_str(),
+                e.artifact_sha256.as_str(),
+                e.binary_sha256.as_str(),
+                e.source.as_str(),
+                e.generation
+            ),
+            (
+                "0.9.1",
+                artifact.sha256.as_str(),
+                rec.new_binary_sha256.as_str(),
+                "ota",
+                1
+            ),
+            "{label}"
+        );
+        assert_eq!(e.policy.signer, artifact.signer, "{label}");
+        let names: Vec<String> = std::fs::read_dir(archive::dir(&env.paths.work_root))
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().to_string())
+            .filter(|n| n != archive::INDEX_FILE)
+            .collect();
+        assert_eq!(
+            names,
+            std::slice::from_ref(&e.artifact_sha256),
+            "{label}: 沒有殘留"
+        );
+    } else {
+        assert!(
+            index.is_none_or(|i| i.entries.is_empty()),
+            "{label}: tar 與回滾的版本不封存"
+        );
+    }
 }
 
 fn run_case(kind: Kind, p: &Point, crashy: bool) {
@@ -408,8 +517,11 @@ fn run_matrix(kind: Kind) {
             run_case(kind, p, false);
             cases += 1;
         }
-        run_case(kind, p, true);
-        cases += 1;
+        // 封存只在新版健康時發生
+        if p.phase != Phase::Archive {
+            run_case(kind, p, true);
+            cases += 1;
+        }
     }
     assert!(cases >= 30, "{kind:?}: 只跑了 {cases} 個案例");
 }
@@ -460,7 +572,7 @@ fn the_matrix_covers_every_row_of_the_crash_point_table() {
         };
         rows.push((n, name));
     }
-    assert_eq!(rows.len(), 22, "{rows:?}");
+    assert_eq!(rows.len(), 24, "{rows:?}");
     for (i, (n, name)) in rows.iter().enumerate() {
         assert_eq!(usize::from(*n), i + 1, "列號連續");
         let points: Vec<&Point> = POINTS.iter().filter(|p| p.row == *n).collect();
@@ -492,12 +604,40 @@ fn the_matrix_covers_every_row_of_the_crash_point_table() {
             "package_running",
             "rollback_package_running",
         ];
-        for p in POINTS.iter().filter(|p| (p.applies)(kind)) {
+        for p in POINTS
+            .iter()
+            .filter(|p| (p.applies)(kind) && p.phase != Phase::Archive)
+        {
             assert!(
                 injected.contains(&p.name) || seen.iter().any(|s| s == p.name),
                 "{kind:?}: 沒有經過 {}（經過 {seen:?}）",
                 p.name
             );
+        }
+        for s in &seen {
+            assert!(
+                POINTS.iter().any(|p| p.name == s),
+                "程式中的 checkpoint {s} 不在對照表中"
+            );
+        }
+        env.cleanup();
+    }
+    // 成功的升級（deb）另外經過封存的兩個 checkpoint，而且都在 record_done 之前；tar 不封存
+    for kind in [Kind::Tar, Kind::Deb] {
+        let env = setup(&format!("fm-seen-ok-{kind:?}"), kind.method());
+        let fake = Fake::new(&env.root);
+        assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
+        let seen = fake.seen();
+        let at = |name: &str| seen.iter().position(|s| s == name);
+        if kind.package() {
+            let (staged, committed, done) = (
+                at("archive_staged").expect("archive_staged"),
+                at("archive_committed").expect("archive_committed"),
+                at("record_done").unwrap(),
+            );
+            assert!(staged < committed && committed < done, "{seen:?}");
+        } else {
+            assert!(at("archive_staged").is_none() && at("archive_committed").is_none());
         }
         for s in &seen {
             assert!(
@@ -547,13 +687,17 @@ fn rows_13_and_14_resumed_after_the_deadline_check_health_before_rolling_back() 
                 if healthy {
                     final_state(&env, &after, kind, p, false, &r, &label);
                 } else {
+                    // 沒有回滾套件的 deb：只換回執行檔＝降級回滾（state 相同，代碼與 detail 的前綴不同）
                     assert_eq!(
                         (r.state.as_str(), r.code.as_deref()),
-                        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK)),
+                        ("rolled_back", Some(rolled_back_code(kind))),
                         "{label}: {r:?}"
                     );
                     assert!(
-                        r.detail.starts_with("health_timeout (not_registered"),
+                        r.detail.starts_with(&format!(
+                            "{}health_timeout (not_registered",
+                            degraded_prefix(kind)
+                        )),
                         "{label}: {}",
                         r.detail
                     );
@@ -769,8 +913,9 @@ fn a_replacement_that_cannot_complete_fails_untouched_or_restores_the_old_versio
     env.cleanup();
 }
 
-/// 回滾只使用與紀錄的雜湊相符的複本：`rollback.pkg`、`pulse.prev` 在中斷期間被換掉時不安裝它，
-/// 結果是 `rollback_failed`（由人處理）
+/// 回滾只使用與紀錄的雜湊相符的複本：`rollback.pkg` 在中斷期間被換掉時不安裝它，改以 `pulse.prev`
+/// （雜湊仍與紀錄相符）緊急復原，結果是降級回滾（ADR-0003 第 5.4 節；0.11.0 以前是 `rollback_failed`）；
+/// `pulse.prev` 被換掉時沒有更保守的來源可退：`rollback_failed`（由人處理）
 #[test]
 fn rollback_only_uses_copies_that_match_the_recorded_hashes() {
     let mut env = setup("fm-rb-pkg-changed", "deb");
@@ -784,8 +929,14 @@ fn rollback_only_uses_copies_that_match_the_recorded_hashes() {
     let r = apply(&env.paths, &after).unwrap();
     assert_eq!(
         (r.state.as_str(), r.code.as_deref()),
-        ("rollback_failed", Some(codes::E_UPGRADE_ROLLBACK_FAILED)),
+        ("rolled_back", Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED)),
         "{r:?}"
+    );
+    assert_eq!(
+        kairos_proto::mgmt::degraded_reasons(&r.detail),
+        Some(vec!["rollback_copy_changed", "package_db_inconsistent"]),
+        "{}",
+        r.detail
     );
     assert!(r.detail.contains(DETAIL_COPY_CHANGED), "{}", r.detail);
     assert!(
@@ -793,7 +944,35 @@ fn rollback_only_uses_copies_that_match_the_recorded_hashes() {
         "{:?}",
         after.calls()
     );
-    assert_eq!(env.installed(), "0.9.1", "沒有安裝被換掉的套件");
+    assert_eq!(env.installed(), "0.9.0", "換回的是替換前的執行檔");
+    assert_eq!(env.prev(), "0.9.0");
+    assert_eq!(pkg_db(&after), "0.9.1 ii", "沒有安裝被換掉的套件");
+    after.assert_invariants();
+    env.cleanup();
+
+    // 被換掉的套件加上被換掉的 pulse.prev：沒有可用的來源
+    let mut env = setup("fm-rb-both-changed", "deb");
+    stage_rollback(&env, "0.9.0");
+    let fake = Fake::new(&env.root);
+    fake.set("0.9.1", Behavior::Crash);
+    apply_until(&env.paths, &fake, "rollback_intent_recorded");
+    std::fs::write(env.work().join(txn::ROLLBACK_PKG_FILE), "VERSION=0.8.0\n").unwrap();
+    std::fs::write(env.paths.install_dir.join("pulse.prev"), "VERSION=0.8.0\n").unwrap();
+    env.helper_is_installed();
+    let after = fake.reboot();
+    let r = apply(&env.paths, &after).unwrap();
+    assert_eq!(
+        (r.state.as_str(), r.code.as_deref()),
+        ("rollback_failed", Some(codes::E_UPGRADE_ROLLBACK_FAILED)),
+        "{r:?}"
+    );
+    assert!(r.detail.contains("pulse.prev"), "{}", r.detail);
+    assert!(!after.calls().iter().any(|c| c.starts_with("dpkg")));
+    assert_eq!(
+        env.installed(),
+        "0.9.1",
+        "沒有安裝被換掉的套件，也沒有換上被換掉的執行檔"
+    );
     env.cleanup();
 
     let mut env = setup("fm-rb-prev-changed", "tar");
