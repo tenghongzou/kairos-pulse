@@ -111,7 +111,7 @@ ansible-playbook -i inventory.ini packaging/ansible/site-pulse.yml --ask-vault-p
 - 結果：已註冊（0）、等待核准（7，申請編號在主控台「註冊申請」）、已註冊過（11）都視為成功。
 - **套件的暫存位置**（0.11.0 之後的 role）：套件複製到 `tempfile` 模組建立的 `/var/tmp/pulse-install.<隨機>/`（root 擁有、0700；role 會檢查），檔案為 `root:root 0600`，核對 SHA-256 與安裝都從這裡進行，結束時不論成敗都移除。0.11.0（含）以前的 role 直接放在 `/var/tmp/<套件檔名>`——任何本機帳號都能寫的目錄下、可以預測的路徑——請更新 role。role 必須以 root 執行（`become: true`）；不是的話在複製之前就停止。
 - 0.11.0（含）以前的 role 在驗證簽章時多送了一個換行（`command` 的 `stdin_add_newline` 預設為 `true`），簽章驗證一律失敗、不會安裝任何東西；已修正。
-- 測試範圍：`ansible-playbook --syntax-check`、套件選擇邏輯（ansible-core 2.21），以及在 Debian 12（deb、`apt`）與 Rocky Linux 9（rpm、`dnf`）的容器內以 ansible-core 2.14 對本機各執行一次（測試用的空套件與臨時簽章金鑰：驗證簽章 → 暫存目錄 → 複製 → 核對 → 安裝 → 移除暫存目錄；非 root 執行時在檢查暫存目錄的步驟停止並移除目錄）。**`pulse enroll` 與啟動服務、經由 SSH 對遠端主機執行都還沒有實測**；沒有 Windows（MSI）的支援。
+- 測試範圍：`ansible-playbook --syntax-check`、套件選擇邏輯（ansible-core 2.21），以及在 Debian 12（deb、`apt`）與 Rocky Linux 9（rpm、`dnf`）的容器內以 ansible-core 2.14 對本機各執行一次（測試用的空套件與臨時簽章金鑰：驗證簽章 → 暫存目錄 → 複製 → 核對 → 安裝 → 移除暫存目錄；非 root 執行時在檢查暫存目錄的步驟停止並移除目錄）。另以容器模擬「控制端經 SSH 連到受管主機」各執行一次（控制端 ansible-core 2.14；受管主機是帶 systemd 與 sshd 的 Debian 12 與 Rocky Linux 9 容器；連線帳號是一般使用者、以 `become`〔sudo〕取得 root；套件是只含一個 `pulse.service` 的測試套件）：整個 role 成功，暫存目錄為 root、0700 且用完移除，`pulse.service` 已啟用並啟動、handler 的重新啟動成功；role 執行期間以連線帳號反覆嘗試列出、讀取、寫入、搬走暫存目錄，全部被拒；不用 `become` 時在檢查暫存目錄的步驟停止並移除目錄。**還沒有實測的**：`pulse enroll`（測試套件不是真正的 Pulse，沒有接上 Kairos）、真正的 Pulse 套件經這個 role 安裝、實體主機或 VM；沒有 Windows（MSI）的支援。
 
 ## 0. 發佈包內容
 
