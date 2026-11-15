@@ -441,6 +441,68 @@ fn audit_anchor_forgery_is_detected(db: &TestDb) -> String {
     out
 }
 
+/// 重新錨定（`kairos audit reanchor` 的儲存層）：斷尾之後重新錨定 → 驗證從新的事件起算、之前的紀錄
+/// 不動；事件被刪除時指出；保留期限清除到它之後照常驗證
+fn audit_reanchor(db: &TestDb) -> String {
+    let mut out = String::new();
+    let s = signed_audit_chain(db);
+    db.exec("DELETE FROM audit_events WHERE id > 4");
+    db.exec("DELETE FROM meta WHERE key = 'audit_chain_head'");
+    assert!(audit_break(&s).is_some());
+    let ev = Audit {
+        category: "audit",
+        action: crate::audit::ACTION_REANCHOR,
+        ..audit("ops", "x", None)
+    };
+    let id = log!(
+        out,
+        "reanchor",
+        s.audit_reanchor(T0 + 50_000, &ev).unwrap().unwrap()
+    );
+    let r = s.audit_verify().unwrap();
+    assert!(r.broken.is_none(), "{r:?}");
+    log!(
+        out,
+        "after reanchor",
+        (
+            r.first_id,
+            r.checked,
+            r.reanchor
+                .as_ref()
+                .map(|x| (x.event_id, x.unverified, x.at, x.by.clone()))
+        )
+    );
+    assert_eq!(r.reanchor.as_ref().map(|x| x.unverified), Some(4));
+    assert_eq!(db.int("SELECT count(*) FROM audit_events WHERE id <= 4"), 4);
+    assert_eq!(
+        s.audit_reanchor_point().unwrap().map(|p| p.event_id),
+        Some(id)
+    );
+    // 指標指到的那一筆不是重新錨定的事件（被換掉）
+    db.exec(&format!(
+        "UPDATE audit_events SET action = 'user.update' WHERE id = {id}"
+    ));
+    let b = log!(out, "event replaced", audit_break(&s));
+    assert_eq!(b.map(|b| b.1), Some("reanchor_mismatch"));
+    db.exec(&format!(
+        "UPDATE audit_events SET action = 'audit.reanchor' WHERE id = {id}"
+    ));
+    assert_eq!(audit_break(&s), None);
+    s.audit_append(T0 + 60_000, &audit("user:ann", "user.update", None))
+        .unwrap();
+    assert_eq!(log!(out, "after append", audit_break(&s)), None);
+    // 保留期限清除到它之後：指標移除
+    log!(
+        out,
+        "purged",
+        s.audit_purge(T0 + 55_000, T0 + 99_000).unwrap()
+    );
+    assert_eq!(s.audit_reanchor_point().unwrap(), None);
+    let r = s.audit_verify().unwrap();
+    assert!(r.broken.is_none() && r.reanchor.is_none(), "{r:?}");
+    out
+}
+
 fn users_and_sessions(db: &TestDb) -> String {
     let mut out = String::new();
     let s = db.handle();
@@ -1511,6 +1573,7 @@ backend_tests!(
     audit_hmac,
     audit_tail_deletion_is_detected,
     audit_anchor_forgery_is_detected,
+    audit_reanchor,
     users_and_sessions,
     api_tokens,
     pki,

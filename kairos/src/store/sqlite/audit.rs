@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use super::conn::{AsConn, forward};
 use crate::audit::{
-    Audit, AuditFilter, AuditKey, AuditLog, AuditRow, ChainBefore, ChainBreak, GENESIS, Head,
-    HmacReport, META_ANCHOR, META_HEAD, META_HMAC, META_LEGACY_SEALED, VerifyReport, check_head,
+    ACTION_REANCHOR, Audit, AuditFilter, AuditKey, AuditLog, AuditRow, ChainBefore, ChainBreak,
+    GENESIS, Head, HmacReport, META_ANCHOR, META_HEAD, META_HMAC, META_LEGACY_SEALED,
+    META_REANCHOR, ReanchorInfo, ReanchorPoint, ReanchorRefused, VerifyReport, check_head,
     compute_hash, ct_eq_str, key_for_db_path, truncate,
 };
 
@@ -26,6 +27,8 @@ impl<C: AsConn> AuditLog for C {
         fn audit_seal_legacy(&self) -> usize => seal_legacy;
         fn audit_purge(&self, before_ms: i64, now_ms: i64) -> usize => purge;
         fn audit_verify(&self) -> VerifyReport => verify;
+        fn audit_reanchor(&self, at_ms: i64, a: &Audit<'_>) -> Result<i64, ReanchorRefused> => reanchor;
+        fn audit_reanchor_point(&self) -> Option<ReanchorPoint> => reanchor_point;
         fn audit_query(&self, f: &AuditFilter, limit: usize) -> (Vec<AuditRow>, u64) => query;
         fn audit_export_batch(&self, f: &AuditFilter, limit: usize) -> Vec<AuditRow> => export_batch;
     }
@@ -155,6 +158,67 @@ pub fn append_with_key(
         if let Some(k) = key {
             sign_one(conn, id, k, &before)?;
         }
+        Ok(id)
+    })
+}
+
+/// `meta.audit_reanchor`（不驗證 mac）
+pub fn reanchor_point(conn: &Connection) -> rusqlite::Result<Option<ReanchorPoint>> {
+    Ok(meta_get(conn, META_REANCHOR)?
+        .as_ref()
+        .and_then(ReanchorPoint::parse))
+}
+
+/// 把鏈重新錨定到現況（[`ReanchorPoint`]）；金鑰依資料庫路徑取得，沒有金鑰時拒絕
+pub fn reanchor(
+    conn: &Connection,
+    at_ms: i64,
+    a: &Audit<'_>,
+) -> rusqlite::Result<Result<i64, ReanchorRefused>> {
+    match key_for(conn) {
+        Some(k) => reanchor_with_key(conn, at_ms, a, &k).map(Ok),
+        None => Ok(Err(ReanchorRefused::NoKey)),
+    }
+}
+
+/// [`reanchor`]，指定金鑰。在一個寫入交易中：寫入事件（接在目前最後一筆有雜湊的紀錄之後）、簽章、
+/// 把 head 重寫成這一筆、記下指標。HMAC 的起點不存在或屬於另一把金鑰時改從這一筆起算。
+/// 不刪除、不修改任何既有的紀錄
+pub fn reanchor_with_key(
+    conn: &Connection,
+    at_ms: i64,
+    a: &Audit<'_>,
+    key: &AuditKey,
+) -> rusqlite::Result<i64> {
+    debug_assert_eq!(a.action, ACTION_REANCHOR);
+    in_write_tx(conn, |conn| {
+        let id = append_with_key(conn, at_ms, a, None)?;
+        let (hash, by): (String, String) = conn.query_row(
+            "SELECT hash, actor FROM audit_events WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if !hmac_since(conn)?.is_some_and(|(_, kid)| kid == key.key_id()) {
+            meta_set(
+                conn,
+                META_HMAC,
+                &json!({ "since_id": id, "key_id": key.key_id(), "started_at": at_ms, "reanchored": true }),
+            )?;
+        }
+        conn.execute(
+            "UPDATE audit_events SET hmac = ?2 WHERE id = ?1",
+            params![id, key.record_mac(&hash)],
+        )?;
+        meta_set(
+            conn,
+            META_HEAD,
+            &Head::v2_json(key, (id, &hash), anchor(conn)?.as_ref()),
+        )?;
+        meta_set(
+            conn,
+            META_REANCHOR,
+            &ReanchorPoint::new(key, id, &hash, at_ms, &by).json(),
+        )?;
         Ok(id)
     })
 }
@@ -361,6 +425,10 @@ pub fn purge_with_key(
                 META_ANCHOR,
                 &json!({"id": id, "hash": hash, "purged_at": now_ms, "purged": n}),
             )?;
+            // 清除到重新錨定的那一筆之後：未驗證的區段已不存在，指標一併移除
+            if reanchor_point(conn)?.is_some_and(|r| r.event_id <= id) {
+                conn.execute("DELETE FROM meta WHERE key = ?1", [META_REANCHOR])?;
+            }
             // 全部清除：最新一筆就是錨點（下一筆接在它之後）
             let left: i64 =
                 conn.query_row("SELECT count(*) FROM audit_events", [], |r| r.get(0))?;
@@ -436,12 +504,46 @@ fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Re
             verified: 0,
             chain_only: 0,
         },
+        reanchor: None,
     };
+    // 重新錨定過：驗證從那一筆起算，之前的紀錄只計數（完整性未驗證）
+    let reanchor = reanchor_point(conn)?.filter(|r| r.active(anchor.as_ref()));
+    if let Some(r) = &reanchor {
+        if check_mac.is_some_and(|k| !r.mac_ok(k)) {
+            report.broken = Some(ChainBreak {
+                id: r.event_id,
+                reason: "reanchor_mismatch",
+                at: None,
+            });
+            report.hmac.status = "failed";
+            return Ok(report);
+        }
+        report.reanchor = Some(ReanchorInfo {
+            event_id: r.event_id,
+            at: r.at,
+            by: r.by.clone(),
+            unverified: 0,
+        });
+    }
+    let mut reanchor_seen = false;
     let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM audit_events ORDER BY id"))?;
     let mut rows = stmt.query([])?;
     let mut prev: Option<String> = None;
     while let Some(r) = rows.next()? {
         let row = row_of(r)?;
+        if let (Some(point), Some(info)) = (&reanchor, report.reanchor.as_mut()) {
+            if row.id < point.event_id {
+                info.unverified += 1;
+                continue;
+            }
+            if row.id == point.event_id {
+                reanchor_seen = row.action == ACTION_REANCHOR
+                    && row.hash.as_deref() == Some(point.event_hash.as_str());
+                if !reanchor_seen {
+                    break;
+                }
+            }
+        }
         report.checked += 1;
         let brk = |reason| ChainBreak {
             id: row.id,
@@ -458,7 +560,8 @@ fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Re
                 report.first_prev_hash = Some(p.clone());
                 // 清除過：剩下的第一筆接在錨點之後（全部清除後 id 可能重新使用，不以 id 判斷）
                 let expected = anchor.as_ref().map_or(GENESIS, |(_, h)| h.as_str());
-                if p != expected {
+                // 重新錨定的那一筆是新的起點，不必接在錨點之後
+                if p != expected && reanchor.is_none() {
                     report.broken = Some(brk("anchor_mismatch"));
                     break;
                 }
@@ -500,6 +603,17 @@ fn verify_in_snapshot(conn: &Connection, key: Option<&AuditKey>) -> rusqlite::Re
         report.last_id = Some(row.id);
         report.last_hash = Some(h.clone());
         prev = Some(h.clone());
+    }
+    // 重新錨定的事件不見了，或不是指標記下的那一筆
+    if report.broken.is_none()
+        && let Some(point) = &reanchor
+        && !reanchor_seen
+    {
+        report.broken = Some(ChainBreak {
+            id: point.event_id,
+            reason: "reanchor_mismatch",
+            at: None,
+        });
     }
     // head：鏈尾與錨點（HMAC 開始之後必須存在、mac 正確；[`check_head`]）
     if report.broken.is_none() {
@@ -1107,6 +1221,145 @@ mod tests {
         conn.execute("DELETE FROM meta WHERE key = ?1", [META_ANCHOR])
             .unwrap();
         assert_eq!(broken(&conn, &k), Some("anchor_mismatch"));
+    }
+
+    fn reanchor_ev() -> Audit<'static> {
+        Audit {
+            actor: "ops（uid 1000）",
+            category: "audit",
+            action: ACTION_REANCHOR,
+            result: "ok",
+            details: Some(json!({"reason": "測試"})),
+            ..Audit::default()
+        }
+    }
+
+    // 重新錨定：斷尾、斷頭、中段竄改之後，驗證從新的事件起算；之前的紀錄不動、標示為未驗證
+    #[test]
+    fn reanchor_restarts_verification_and_marks_earlier_rows_unverified() {
+        let k = AuditKey::from_bytes(&[12u8; 32]);
+        let tamper: [(&str, fn(&Connection)); 3] = [
+            ("斷尾", |c| {
+                c.execute("DELETE FROM audit_events WHERE id > 3", [])
+                    .unwrap();
+                c.execute("DELETE FROM meta WHERE key = ?1", [META_HEAD])
+                    .unwrap();
+            }),
+            ("斷頭", |c| {
+                let h2: String = c
+                    .query_row("SELECT hash FROM audit_events WHERE id = 2", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                c.execute("DELETE FROM audit_events WHERE id <= 2", [])
+                    .unwrap();
+                meta_set(c, META_ANCHOR, &json!({"id": 2, "hash": h2})).unwrap();
+            }),
+            ("中段竄改", |c| {
+                c.execute("UPDATE audit_events SET object = 'eve' WHERE id = 3", [])
+                    .unwrap();
+            }),
+        ];
+        for (name, f) in tamper {
+            let conn = signed_chain(6, &k);
+            f(&conn);
+            let before = verify_with_key(&conn, Some(&k)).unwrap();
+            assert!(!before.ok(), "{name}");
+            let rows_before: Vec<AuditRow> =
+                export_batch(&conn, &AuditFilter::default(), 100).unwrap();
+            let id = reanchor_with_key(&conn, 50_000, &reanchor_ev(), &k).unwrap();
+            let r = verify_with_key(&conn, Some(&k)).unwrap();
+            assert!(r.ok(), "{name}：{r:?}");
+            let info = r.reanchor.clone().unwrap();
+            assert_eq!(
+                (info.event_id, info.unverified, info.at),
+                (id, rows_before.len() as u64, 50_000),
+                "{name}"
+            );
+            assert_eq!((r.first_id, r.checked), (Some(id), 1), "{name}");
+            assert_eq!(r.json()["reanchor"]["unverified"], rows_before.len());
+            // 既有的紀錄一筆都沒有被刪除或修改
+            let rows_after: Vec<AuditRow> =
+                export_batch(&conn, &AuditFilter::default(), 100).unwrap();
+            assert_eq!(&rows_after[..rows_before.len()], &rows_before[..], "{name}");
+            // 之後的寫入照常接在後面
+            append_with_key(&conn, 60_000, &ev("a", None), Some(&k)).unwrap();
+            let r = verify_with_key(&conn, Some(&k)).unwrap();
+            assert!(r.ok(), "{name}：{r:?}");
+            assert_eq!(r.checked, 2);
+            // 重新錨定之後的竄改照樣被發現
+            conn.execute(
+                "UPDATE audit_events SET object = 'x' WHERE id = ?1",
+                [id + 1],
+            )
+            .unwrap();
+            assert_eq!(broken(&conn, &k), Some("hash_mismatch"), "{name}");
+        }
+    }
+
+    // 重新錨定本身不能被抹除，也不能由沒有金鑰的人偽造
+    #[test]
+    fn the_reanchor_record_cannot_be_removed_or_forged() {
+        let k = AuditKey::from_bytes(&[13u8; 32]);
+        let setup = || {
+            let conn = signed_chain(5, &k);
+            conn.execute("UPDATE audit_events SET object = 'eve' WHERE id = 2", [])
+                .unwrap();
+            let id = reanchor_with_key(&conn, 50_000, &reanchor_ev(), &k).unwrap();
+            append_with_key(&conn, 60_000, &ev("a", None), Some(&k)).unwrap();
+            assert!(verify_with_key(&conn, Some(&k)).unwrap().ok());
+            (conn, id)
+        };
+        // 刪掉事件
+        let (conn, id) = setup();
+        conn.execute("DELETE FROM audit_events WHERE id = ?1", [id])
+            .unwrap();
+        assert_eq!(broken(&conn, &k), Some("reanchor_mismatch"));
+        // 修改事件的內容
+        let (conn, id) = setup();
+        conn.execute(
+            "UPDATE audit_events SET actor = 'nobody' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        assert!(broken(&conn, &k).is_some());
+        // 刪掉指標：回到原本的斷點
+        let (conn, _) = setup();
+        conn.execute("DELETE FROM meta WHERE key = ?1", [META_REANCHOR])
+            .unwrap();
+        let b = verify_with_key(&conn, Some(&k)).unwrap().broken.unwrap();
+        assert_eq!((b.id, b.reason), (2, "hash_mismatch"));
+        // 沒有金鑰的人把指標往後移（想蓋掉之後的竄改）、或自己寫一個指標
+        let (conn, id) = setup();
+        let h: String = conn
+            .query_row(
+                "SELECT hash FROM audit_events WHERE id = ?1",
+                [id + 1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut point = reanchor_point(&conn).unwrap().unwrap();
+        point.event_id = id + 1;
+        point.event_hash = h;
+        meta_set(&conn, META_REANCHOR, &point.json()).unwrap();
+        assert_eq!(broken(&conn, &k), Some("reanchor_mismatch"));
+        let other = AuditKey::from_bytes(&[14u8; 32]);
+        let forged = ReanchorPoint::new(&other, point.event_id, &point.event_hash, 1, "x");
+        meta_set(&conn, META_REANCHOR, &forged.json()).unwrap();
+        assert_eq!(broken(&conn, &k), Some("reanchor_mismatch"));
+        // 沒有金鑰檔：拒絕（記憶體中的資料庫找不到金鑰）
+        let conn = signed_chain(3, &k);
+        assert_eq!(
+            reanchor(&conn, 1, &reanchor_ev()).unwrap(),
+            Err(ReanchorRefused::NoKey)
+        );
+        assert_eq!(reanchor_point(&conn).unwrap(), None);
+        // 保留期限清除到重新錨定的那一筆之後：指標移除，照常驗證
+        let (conn, id) = setup();
+        assert!(purge_with_key(&conn, 55_000, 99_000, Some(&k)).unwrap() as i64 >= id);
+        assert_eq!(reanchor_point(&conn).unwrap(), None);
+        let r = verify_with_key(&conn, Some(&k)).unwrap();
+        assert!(r.ok() && r.reanchor.is_none(), "{r:?}");
     }
 
     // E1 的相容：正常的寫入、清除（含全部清除）在第 2 版 head 下都能驗證；0.11.0 以前寫的第 1 版 head

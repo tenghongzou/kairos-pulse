@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use super::conn::{LockKind, OptionalExtension, PgConn, PgResult, Row, params, pg_domain};
 use crate::audit::{
-    Audit, AuditFilter, AuditKey, AuditLog, AuditRow, ChainBefore, ChainBreak, GENESIS, Head,
-    HmacReport, META_ANCHOR, META_HEAD, META_HMAC, META_LEGACY_SEALED, VerifyReport, check_head,
+    ACTION_REANCHOR, Audit, AuditFilter, AuditKey, AuditLog, AuditRow, ChainBefore, ChainBreak,
+    GENESIS, Head, HmacReport, META_ANCHOR, META_HEAD, META_HMAC, META_LEGACY_SEALED,
+    META_REANCHOR, ReanchorInfo, ReanchorPoint, ReanchorRefused, VerifyReport, check_head,
     compute_hash, ct_eq_str, key_for_db_path, truncate,
 };
 use crate::store::db::TxMode;
@@ -36,6 +37,8 @@ pg_domain! { AuditLog {
     fn audit_seal_legacy(&self) -> usize => seal_legacy;
     fn audit_purge(&self, before_ms: i64, now_ms: i64) -> usize => purge;
     fn audit_verify(&self) -> VerifyReport => verify;
+    fn audit_reanchor(&self, at_ms: i64, a: &Audit<'_>) -> Result<i64, ReanchorRefused> => reanchor;
+    fn audit_reanchor_point(&self) -> Option<ReanchorPoint> => reanchor_point;
     fn audit_query(&self, f: &AuditFilter, limit: usize) -> (Vec<AuditRow>, u64) => query;
     fn audit_export_batch(&self, f: &AuditFilter, limit: usize) -> Vec<AuditRow> => export_batch;
 } }
@@ -167,6 +170,66 @@ pub fn append_with_key(
         if let Some(k) = key {
             sign_one(conn, id, k, &before)?;
         }
+        Ok(id)
+    })
+}
+
+/// `meta.audit_reanchor`（不驗證 mac）
+pub fn reanchor_point(conn: &PgConn) -> PgResult<Option<ReanchorPoint>> {
+    Ok(meta_get(conn, META_REANCHOR)?
+        .as_ref()
+        .and_then(ReanchorPoint::parse))
+}
+
+/// 把鏈重新錨定到現況（[`ReanchorPoint`]）；金鑰依節點的資料目錄取得，沒有金鑰時拒絕
+pub fn reanchor(
+    conn: &PgConn,
+    at_ms: i64,
+    a: &Audit<'_>,
+) -> PgResult<Result<i64, ReanchorRefused>> {
+    match key_for(conn) {
+        Some(k) => reanchor_with_key(conn, at_ms, a, &k).map(Ok),
+        None => Ok(Err(ReanchorRefused::NoKey)),
+    }
+}
+
+/// [`reanchor`]，指定金鑰；逐步對照 SQLite 版。持有稽核鎖的交易中進行
+pub fn reanchor_with_key(
+    conn: &PgConn,
+    at_ms: i64,
+    a: &Audit<'_>,
+    key: &AuditKey,
+) -> PgResult<i64> {
+    debug_assert_eq!(a.action, ACTION_REANCHOR);
+    in_write_tx(conn, |conn| {
+        conn.lock_in_tx(LockKind::Audit)?;
+        let id = append_with_key(conn, at_ms, a, None)?;
+        let (hash, by): (String, String) = conn.query_row(
+            "SELECT hash, actor FROM audit_events WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if !hmac_since(conn)?.is_some_and(|(_, kid)| kid == key.key_id()) {
+            meta_set(
+                conn,
+                META_HMAC,
+                &json!({ "since_id": id, "key_id": key.key_id(), "started_at": at_ms, "reanchored": true }),
+            )?;
+        }
+        conn.execute(
+            "UPDATE audit_events SET hmac = ?2 WHERE id = ?1",
+            params![id, key.record_mac(&hash)],
+        )?;
+        meta_set(
+            conn,
+            META_HEAD,
+            &Head::v2_json(key, (id, &hash), anchor(conn)?.as_ref()),
+        )?;
+        meta_set(
+            conn,
+            META_REANCHOR,
+            &ReanchorPoint::new(key, id, &hash, at_ms, &by).json(),
+        )?;
         Ok(id)
     })
 }
@@ -372,6 +435,10 @@ pub fn purge_with_key(
                 META_ANCHOR,
                 &json!({"id": id, "hash": hash, "purged_at": now_ms, "purged": n}),
             )?;
+            // 清除到重新錨定的那一筆之後：未驗證的區段已不存在，指標一併移除
+            if reanchor_point(conn)?.is_some_and(|r| r.event_id <= id) {
+                conn.execute("DELETE FROM meta WHERE key = ?1", [META_REANCHOR])?;
+            }
             // 全部清除：最新一筆就是錨點（下一筆接在它之後）
             let left: i64 =
                 conn.query_row("SELECT count(*) FROM audit_events", (), |r| r.get(0))?;
@@ -445,7 +512,28 @@ fn verify_in_snapshot(conn: &PgConn, key: Option<&AuditKey>) -> PgResult<VerifyR
             verified: 0,
             chain_only: 0,
         },
+        reanchor: None,
     };
+    // 重新錨定過：驗證從那一筆起算，之前的紀錄只計數（完整性未驗證）
+    let reanchor = reanchor_point(conn)?.filter(|r| r.active(anchor.as_ref()));
+    if let Some(r) = &reanchor {
+        if check_mac.is_some_and(|k| !r.mac_ok(k)) {
+            report.broken = Some(ChainBreak {
+                id: r.event_id,
+                reason: "reanchor_mismatch",
+                at: None,
+            });
+            report.hmac.status = "failed";
+            return Ok(report);
+        }
+        report.reanchor = Some(ReanchorInfo {
+            event_id: r.event_id,
+            at: r.at,
+            by: r.by.clone(),
+            unverified: 0,
+        });
+    }
+    let mut reanchor_seen = false;
     let mut prev: Option<String> = None;
     // 逐列串流（不把整張表放進記憶體）；進行中這條連線不能送出其他敘述，所以需要的 meta 都已先讀出。
     // 回傳 `false`＝遇到斷點，停止
@@ -454,6 +542,19 @@ fn verify_in_snapshot(conn: &PgConn, key: Option<&AuditKey>) -> PgResult<VerifyR
         (),
         |r| {
             let row = row_of(r)?;
+            if let (Some(point), Some(info)) = (&reanchor, report.reanchor.as_mut()) {
+                if row.id < point.event_id {
+                    info.unverified += 1;
+                    return Ok(true);
+                }
+                if row.id == point.event_id {
+                    reanchor_seen = row.action == ACTION_REANCHOR
+                        && row.hash.as_deref() == Some(point.event_hash.as_str());
+                    if !reanchor_seen {
+                        return Ok(false);
+                    }
+                }
+            }
             report.checked += 1;
             let brk = |reason| ChainBreak {
                 id: row.id,
@@ -470,7 +571,8 @@ fn verify_in_snapshot(conn: &PgConn, key: Option<&AuditKey>) -> PgResult<VerifyR
                     report.first_prev_hash = Some(p.clone());
                     // 清除過：剩下的第一筆接在錨點之後（全部清除後 id 可能重新使用，不以 id 判斷）
                     let expected = anchor.as_ref().map_or(GENESIS, |(_, h)| h.as_str());
-                    if p != expected {
+                    // 重新錨定的那一筆是新的起點，不必接在錨點之後
+                    if p != expected && reanchor.is_none() {
                         report.broken = Some(brk("anchor_mismatch"));
                         return Ok(false);
                     }
@@ -515,6 +617,17 @@ fn verify_in_snapshot(conn: &PgConn, key: Option<&AuditKey>) -> PgResult<VerifyR
             Ok(true)
         },
     )?;
+    // 重新錨定的事件不見了，或不是指標記下的那一筆
+    if report.broken.is_none()
+        && let Some(point) = &reanchor
+        && !reanchor_seen
+    {
+        report.broken = Some(ChainBreak {
+            id: point.event_id,
+            reason: "reanchor_mismatch",
+            at: None,
+        });
+    }
     // head：鏈尾與錨點（HMAC 開始之後必須存在、mac 正確；[`check_head`]）
     if report.broken.is_none() {
         let tail = report.last_id.zip(report.last_hash.as_deref());

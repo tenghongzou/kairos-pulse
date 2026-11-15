@@ -406,6 +406,7 @@ sudo -u kairos /opt/kairos/kairos users create admin --role admin --display-name
   回應的 `csrf_token` 要放在之後每個寫入請求的 `X-CSRF-Token` 標頭（例如 `POST /api/v1/me/password` 變更密碼）。
 - 建議接著：在主控台的「個人設定」啟用兩步驟驗證（或 `POST /api/v1/me/totp/setup`、`/enable`；10 組復原碼離線保存）；為其他人建立各自的帳號（`kairos users create <帳號> --role operator|auditor|viewer`），不要共用 `admin`；至少保留兩位管理員（最後一位管理員不能被停用或移除）。
 - 確認稽核日誌：`sudo -u kairos /opt/kairos/kairos audit verify --config /opt/kairos/kairos.toml`（完整時結束代碼 0；斷裂時 9、`KRS-E6201`）。
+- 稽核鏈斷裂之後（0.11.0 之後的版本）：斷點不會自己消失，之後每一次驗證與自我驗證都會指出它。處理順序：(1) **先保全證據**——複製資料庫（SQLite 的 `kairos.db` 與 `-wal`，或 PostgreSQL 的備份）、`kairos audit export --out <檔案>`、與外送的鏈尾（日誌中的 `audit.chain_anchor`）比對，找出被動過的範圍；(2) 能從備份還原時優先還原；(3) 確定要在現況上繼續時，以服務帳號執行 `sudo -u kairos /opt/kairos/kairos audit reanchor --config /opt/kairos/kairos.toml`（先看它列出的斷點與影響），再加上 `--reason <原因> --confirm "重新錨定稽核鏈"` 執行。它不刪除也不修改任何紀錄，只寫入一筆 `audit.reanchor` 事件作為新的起點，之前的紀錄標示為「完整性未驗證」；需要資料目錄的 `audit-hmac.key`。執行後「稽核日誌完整性」告警會保持開啟 24 小時、日誌有一行 ERROR `audit.reanchored`——這是設計上的：重新錨定必須被所有收到告警的人看到。叢集模式下在任一個有金鑰檔的節點執行一次即可（寫入以資料庫的鎖序列化），主動節點在 1 分鐘內察覺並開啟告警。細節見 `API.md` 第 12.8 節「重新錨定」。
 - 使用 AD／LDAP 時，在 `kairos.toml` 設定 `[ldap]`（`ca_file` 必填；服務帳號密碼放在 `chmod 600` 的 `bind_password_file`），重新啟動後以 `kairos users map-group "<群組 DN>" --role operator` 對應角色（API.md 第 12.7 節）。
 - 主控台金鑰 `data/console.key`（0600）在第一次啟動主控台時建立，用於 CSRF 與 TOTP 秘密的加密；備份資料庫時一併（加密）備份，遺失時已綁定的 TOTP 需以 `kairos users reset-mfa` 重設。
 

@@ -25,8 +25,16 @@ pub const AUDIT_USAGE: &str = "kairos audit — 稽核日誌（雜湊鏈；kairo
                     [--result ok|failed|denied|rejected] [--since <時間> | --from <時間> --to <時間>] [--limit <N>]
   kairos audit verify
   kairos audit export [--out <檔案>] [--since <時間> | --from <時間> --to <時間>]
+  kairos audit reanchor [--reason <原因> --confirm \"重新錨定稽核鏈\"]
+
+reanchor（L3）：驗證失敗（KRS-E6201）之後，在保全證據（複製資料庫、kairos audit export、比對外送的鏈尾）
+之後，把雜湊鏈重新錨定到現況。不帶 --confirm 時只顯示目前的驗證結果與將要做的事，不改任何東西。
+不刪除、不修改任何既有的紀錄：之前的紀錄標示為「重新錨定之前、完整性未驗證」，之後的驗證從新寫入的
+audit.reanchor 事件起算。需要資料目錄的 audit-hmac.key；「稽核日誌完整性」告警會保持開啟 24 小時。
 
 選項：
+  --reason <原因>    reanchor 的原因（必填，最多 500 個字元；寫入稽核）
+  --confirm <字串>   reanchor 的確認字串，必須是「重新錨定稽核鏈」
   --since <時間>     最近多久（90m、24h、7d、2w）
   --from、--to       RFC 3339 時間（例如 2026-10-01T00:00:00Z）
   --limit <N>        list 最多幾筆（預設 50，上限 1000），新到舊
@@ -47,9 +55,18 @@ const EXIT_CONFLICT: u8 = 11;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditAction {
     Help,
-    List { limit: usize },
+    List {
+        limit: usize,
+    },
     Verify,
-    Export { out: Option<PathBuf> },
+    Export {
+        out: Option<PathBuf>,
+    },
+    /// 把斷裂的鏈重新錨定到現況（L3；`kairos/API.md` 第 12.8 節「重新錨定」）
+    Reanchor {
+        reason: Option<String>,
+        confirm: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +107,7 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<AuditCommand, 
         Some(a) => a.to_string_lossy().into_owned(),
     };
     let (mut limit, mut out) = (50usize, None);
+    let (mut reason, mut confirm) = (None, None);
     while let Some(arg) = args.next() {
         if let Some(path) = take_config_arg(&arg, &mut args)? {
             if cmd.config_path.replace(path).is_some() {
@@ -154,6 +172,8 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<AuditCommand, 
                     .ok_or_else(|| format!("--limit 必須介於 1～1000（目前為 {v}）"))?;
             }
             "--out" if sub == "export" => out = Some(PathBuf::from(value("--out")?)),
+            "--reason" if sub == "reanchor" => reason = Some(value("--reason")?),
+            "--confirm" if sub == "reanchor" => confirm = Some(value("--confirm")?),
             _ => return Err(format!("無法辨識的參數: {a}")),
         }
     }
@@ -164,7 +184,12 @@ pub fn parse_args(args: impl Iterator<Item = OsString>) -> Result<AuditCommand, 
         "list" => AuditAction::List { limit },
         "verify" => AuditAction::Verify,
         "export" => AuditAction::Export { out },
-        _ => return Err(format!("無法辨識的子命令: {sub}（list、verify、export）")),
+        "reanchor" => AuditAction::Reanchor { reason, confirm },
+        _ => {
+            return Err(format!(
+                "無法辨識的子命令: {sub}（list、verify、export、reanchor）"
+            ));
+        }
     };
     Ok(cmd)
 }
@@ -195,6 +220,7 @@ fn filter_of(cmd: &AuditCommand, now: DateTime<Utc>) -> AuditFilter {
 
 pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode: bool) -> Output {
     let schema = match cmd.action {
+        AuditAction::Reanchor { .. } => "kairos.audit.reanchor/v1",
         AuditAction::Verify => "kairos.audit.verify/v1",
         AuditAction::Export { .. } => "kairos.audit.export/v1",
         _ => "kairos.audit.list/v1",
@@ -359,6 +385,17 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                 ),
                 (Some(s), _) => format!("HMAC：第 {s} 筆起（{} 筆）", report.hmac.verified),
             };
+            // 重新錨定過：驗證從那一筆起算，之前的紀錄完整性未驗證
+            let boundary = match &report.reanchor {
+                Some(r) => format!(
+                    "{boundary}\n  重新錨定：第 {} 筆（{}，{}）；它之前的 {} 筆是重新錨定之前的紀錄，完整性未驗證",
+                    r.event_id,
+                    human_time(r.at, tz),
+                    r.by,
+                    r.unverified
+                ),
+                None => boundary,
+            };
             match &report.broken {
                 None => Output {
                     stdout: format!(
@@ -395,6 +432,129 @@ pub fn execute(cmd: &AuditCommand, now: DateTime<Utc>, tz: FixedOffset, unicode:
                         ..Default::default()
                     }
                 }
+            }
+        }
+        AuditAction::Reanchor { reason, confirm } => {
+            if let Err(e) = conn.audit_seal_legacy() {
+                return fail(db_failure(e));
+            }
+            let report = match conn.audit_verify() {
+                Ok(r) => r,
+                Err(e) => return fail(db_failure(e)),
+            };
+            let mark = |ok: bool| match (ok, unicode) {
+                (true, true) => "✓",
+                (true, false) => "[ OK ]",
+                (false, true) => "✗",
+                (false, false) => "[FAIL]",
+            };
+            let done = |text: String, data: Value, exit: u8| Output {
+                stdout: if cmd.json {
+                    ascii_json(&json!({
+                        "schema": schema, "ok": true, "generated_at": fmt_time(now),
+                        "data": data, "warnings": [], "error": null,
+                    })) + "\n"
+                } else {
+                    text
+                },
+                exit,
+                ..Default::default()
+            };
+            let Some(b) = report.broken.clone() else {
+                // 鏈是完整的：沒有東西需要重新錨定，不寫入任何紀錄
+                return done(
+                    format!(
+                        "{} 稽核日誌完整（{} 筆），不需要重新錨定；沒有變更。\n",
+                        mark(true),
+                        report.checked
+                    ),
+                    json!({ "changed": false, "verify": report.json() }),
+                    0,
+                );
+            };
+            let no_key = || {
+                Failure::new(
+                    "無法重新錨定：沒有稽核 HMAC 的金鑰",
+                    "資料目錄的 audit-hmac.key 不存在或無法讀取；重新錨定的紀錄必須以這把金鑰簽章",
+                    vec![
+                        "從備份還原金鑰檔（kairos db restore-keys），並以 Kairos 的服務帳號執行。"
+                            .to_string(),
+                        "金鑰確實遺失時，先啟動 Kairos 服務讓它建立新的金鑰，再執行這個命令。"
+                            .to_string(),
+                    ],
+                    EXIT_BROKEN,
+                )
+            };
+            if b.reason == "hmac_key_unavailable" {
+                return fail(no_key());
+            }
+            let total = conn
+                .audit_query(&AuditFilter::default(), 1)
+                .map(|(_, n)| n)
+                .unwrap_or(0);
+            let last_id = conn.audit_tail().ok().flatten().map(|t| t.0);
+            let preview = format!(
+                "{} 錯誤 {CODE_CHAIN_BROKEN}：稽核日誌完整性驗證失敗\n  斷點：第 {} 筆：{}\n  目前共 {total} 筆（最後一筆是第 {} 筆）\n\n重新錨定會做的事：\n  1. 寫入一筆 audit.reanchor 事件（執行者 {by}、原因、這次的驗證結果、目前的鏈尾與錨點指標），以 HMAC 簽章。\n  2. 之後的驗證從這一筆起算；它之前的 {total} 筆一筆都不刪除、不修改，但標示為「重新錨定之前、完整性未驗證」。\n  3. 「稽核日誌完整性」告警（sys.audit_integrity，不可靜音）保持開啟 24 小時，並記一行 ERROR（audit.reanchored）。\n這不會讓被刪除或修改的紀錄恢復。執行之前請先保全證據：複製資料庫、kairos audit export、與外送的鏈尾（audit.chain_anchor）比對。\n",
+                mark(false),
+                b.id,
+                crate::audit_monitor::describe(b.reason),
+                last_id.map_or("—".to_string(), |x| x.to_string()),
+            );
+            if confirm.as_deref() != Some(audit::REANCHOR_CONFIRM) {
+                return done(
+                    format!(
+                        "{preview}\n沒有變更。確定要執行時加上：--reason <原因> --confirm \"{}\"\n",
+                        audit::REANCHOR_CONFIRM
+                    ),
+                    json!({ "changed": false, "verify": report.json(), "rows": total, "confirm": audit::REANCHOR_CONFIRM }),
+                    EXIT_BROKEN,
+                );
+            }
+            let reason = reason.as_deref().map(str::trim).unwrap_or("");
+            if reason.is_empty() || reason.chars().count() > 500 {
+                return fail(Failure::new(
+                    "重新錨定需要原因",
+                    "--reason 必填，最多 500 個字元（寫入稽核）",
+                    Vec::new(),
+                    2,
+                ));
+            }
+            let meta = |k: &str| -> Value {
+                conn.get_meta(k)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or(Value::Null)
+            };
+            let details = json!({
+                "via": "cli",
+                "reason": reason,
+                "before": report.json(),
+                "head": meta(audit::META_HEAD),
+                "anchor": meta(audit::META_ANCHOR),
+                "rows": total,
+                "last_id": last_id,
+            });
+            let ev = audit::Audit {
+                actor: &by,
+                category: "audit",
+                action: audit::ACTION_REANCHOR,
+                result: "ok",
+                code: Some(CODE_CHAIN_BROKEN),
+                details: Some(details),
+                ..Default::default()
+            };
+            match conn.audit_reanchor(now_ms, &ev) {
+                Ok(Ok(id)) => done(
+                    format!(
+                        "{} 稽核鏈已重新錨定：第 {id} 筆（audit.reanchor）\n  之前的 {total} 筆沒有刪除或修改，標示為「重新錨定之前、完整性未驗證」。\n  「稽核日誌完整性」告警會保持開啟 24 小時（Kairos 執行中時 1 分鐘內開啟）。\n  接著請執行 kairos audit verify 確認，並以 kairos audit export 留存一份。\n",
+                        mark(true)
+                    ),
+                    json!({ "changed": true, "event_id": id, "unverified": total, "before": report.json() }),
+                    0,
+                ),
+                Ok(Err(audit::ReanchorRefused::NoKey)) => fail(no_key()),
+                Err(e) => fail(db_failure(e)),
             }
         }
         AuditAction::Export { out } => {
@@ -534,6 +694,159 @@ mod tests {
             AuditAction::Verify
         );
         assert!(!AUDIT_USAGE.contains("delete"));
+    }
+
+    // 重新錨定（L3）：沒有確認字串或原因時不改任何東西；確認後驗證從新的事件起算；沒有金鑰時拒絕
+    #[test]
+    fn reanchor_needs_the_confirmation_string_a_reason_and_the_key() {
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let setup = |tag: &str, with_key: bool| {
+            let dir = std::env::temp_dir().join(format!(
+                "kairos-audit-reanchor-{tag}-{}-{}",
+                std::process::id(),
+                crate::registry::next_conn_id()
+            ));
+            let data = dir.join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            let cfg = dir.join("kairos.toml");
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[storage]\ndata_dir = \"{}\"\n",
+                    data.display().to_string().replace('\\', "/")
+                ),
+            )
+            .unwrap();
+            let conn = open(Some(&cfg), true).unwrap().unwrap();
+            if with_key {
+                audit::ensure_key(&data).unwrap();
+            }
+            for i in 0..3 {
+                conn.audit_append(
+                    i,
+                    &audit::Audit {
+                        actor: "system",
+                        category: "system",
+                        action: "system.start",
+                        result: "ok",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            conn.test_sqlite()
+                .execute("UPDATE audit_events SET actor = 'mallory' WHERE id = 2", [])
+                .unwrap();
+            (dir, cfg, conn)
+        };
+        let run = |cfg: &std::path::Path, args: &[&str]| {
+            let mut cmd = parse_args(os(args)).unwrap();
+            cmd.config_path = Some(cfg.to_path_buf());
+            execute(&cmd, Utc::now(), tz, false)
+        };
+        let state = |conn: &crate::store::db::DbHandle| {
+            let rows: i64 = conn
+                .test_sqlite()
+                .query_row("SELECT count(*) FROM audit_events", [], |r| r.get(0))
+                .unwrap();
+            (
+                rows,
+                conn.audit_reanchor_point().unwrap().map(|p| p.event_id),
+            )
+        };
+        let (dir, cfg, conn) = setup("key", true);
+        // 沒有 --confirm、確認字串不對、沒有原因：只顯示，不改
+        for args in [
+            &["reanchor"][..],
+            &["reanchor", "--reason", "x", "--confirm", "yes"][..],
+            &["reanchor", "--confirm", audit::REANCHOR_CONFIRM][..],
+            &[
+                "reanchor",
+                "--reason",
+                "  ",
+                "--confirm",
+                audit::REANCHOR_CONFIRM,
+            ][..],
+        ] {
+            let out = run(&cfg, args);
+            assert_ne!(out.exit, 0, "{args:?}：{out:?}");
+            assert_eq!(state(&conn), (3, None), "{args:?}");
+        }
+        let out = run(&cfg, &["reanchor"]);
+        assert_eq!(out.exit, EXIT_BROKEN);
+        assert!(
+            out.stdout.contains("第 2 筆") && out.stdout.contains("沒有變更"),
+            "{out:?}"
+        );
+        // 確認：寫入一筆 audit.reanchor，之後的驗證通過並標出未驗證的區段
+        let out = run(
+            &cfg,
+            &[
+                "reanchor",
+                "--reason",
+                "事故 2026-11",
+                "--confirm",
+                audit::REANCHOR_CONFIRM,
+            ],
+        );
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert_eq!(state(&conn), (4, Some(4)));
+        let details: String = conn
+            .test_sqlite()
+            .query_row(
+                "SELECT details FROM audit_events WHERE id = 4 AND action = 'audit.reanchor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let d: Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(d["reason"], "事故 2026-11");
+        assert_eq!(d["before"]["broken"]["id"], 2);
+        assert!(d["head"].is_object(), "記下舊的 head：{d}");
+        let out = run(&cfg, &["verify", "--json"]);
+        assert_eq!(out.exit, 0, "{out:?}");
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["data"]["reanchor"]["event_id"], 4);
+        assert_eq!(v["data"]["reanchor"]["unverified"], 3);
+        let out = run(&cfg, &["verify"]);
+        assert!(out.stdout.contains("完整性未驗證"), "{out:?}");
+        // 鏈完整時不做任何事
+        let before = state(&conn);
+        let out = run(
+            &cfg,
+            &[
+                "reanchor",
+                "--reason",
+                "x",
+                "--confirm",
+                audit::REANCHOR_CONFIRM,
+                "--json",
+            ],
+        );
+        assert_eq!(out.exit, 0);
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["data"]["changed"], false);
+        assert_eq!(state(&conn).1, before.1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // 沒有 HMAC 金鑰：拒絕，不改
+        let (dir, cfg, conn) = setup("nokey", false);
+        let out = run(
+            &cfg,
+            &[
+                "reanchor",
+                "--reason",
+                "x",
+                "--confirm",
+                audit::REANCHOR_CONFIRM,
+            ],
+        );
+        assert_eq!(out.exit, EXIT_BROKEN, "{out:?}");
+        assert!(out.stderr.contains("金鑰"), "{out:?}");
+        assert_eq!(state(&conn), (3, None));
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

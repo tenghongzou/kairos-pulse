@@ -152,6 +152,20 @@ impl AuditKey {
         hex(ctx.sign().as_ref())
     }
 
+    /// `meta.audit_reanchor` 的 HMAC（[`ReanchorPoint`]）
+    pub fn reanchor_mac(&self, event_id: i64, event_hash: &str, at: i64, by: &str) -> String {
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        ctx.update(b"kairos-audit-reanchor/v1\n");
+        ctx.update(event_id.to_string().as_bytes());
+        ctx.update(b"\n");
+        ctx.update(event_hash.as_bytes());
+        ctx.update(b"\n");
+        ctx.update(at.to_string().as_bytes());
+        ctx.update(b"\n");
+        ctx.update(by.as_bytes());
+        hex(ctx.sign().as_ref())
+    }
+
     /// 讀取資料目錄的金鑰檔；不存在時為 `Ok(None)`（不建立）
     pub fn load(data_dir: &Path) -> Result<Option<Self>, Error> {
         let path = data_dir.join(KEY_FILE);
@@ -341,6 +355,99 @@ pub fn check_head(
             Ok(())
         }
     }
+}
+
+/// `meta.audit_reanchor`：最近一次「重新錨定」（`kairos audit reanchor`）的指標。
+///
+/// 稽核鏈斷裂（被刪尾、刪頭、竄改）之後，驗證會永遠指出同一個斷點，之後的紀錄也得不到保證。管理者
+/// 保全證據之後可以把鏈重新錨定到現況：寫入一筆 `audit.reanchor` 事件（誰、何時、為什麼、重新錨定前的
+/// 驗證結果與舊的 head／錨點），之後的驗證從這一筆起算；它之前的紀錄一筆都不刪、不改，但標示為
+/// 「重新錨定之前、完整性未驗證」。
+///
+/// 指標 `{"v":1,"event_id","event_hash","at","by","mac"}` 的 `mac` 需要 HMAC 金鑰：沒有金鑰的人不能
+/// 用它把被動過的鏈「洗白」，也不能把指標往後移來蓋掉之後的竄改。指標被刪除時驗證回到原本的斷點；
+/// 事件被刪除或修改、指標被改寫時為 `reanchor_mismatch`。保留期限清除到這一筆之後，指標一併移除
+/// （未驗證的區段已經不存在）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReanchorPoint {
+    pub event_id: i64,
+    pub event_hash: String,
+    pub at: i64,
+    pub by: String,
+    pub mac: String,
+}
+
+/// `meta` 的鍵：[`ReanchorPoint`]
+pub const META_REANCHOR: &str = "audit_reanchor";
+/// 重新錨定事件的動作名稱
+pub const ACTION_REANCHOR: &str = "audit.reanchor";
+/// `kairos audit reanchor` 的確認字串（L3）
+pub const REANCHOR_CONFIRM: &str = "重新錨定稽核鏈";
+/// 重新錨定之後「稽核日誌完整性」告警保持開啟多久（讓重新錨定不可能不被看到）
+pub const REANCHOR_ALERT_HOLD_MS: i64 = 24 * 3_600_000;
+
+impl ReanchorPoint {
+    pub fn parse(v: &Value) -> Option<Self> {
+        Some(Self {
+            event_id: v.get("event_id")?.as_i64()?,
+            event_hash: v.get("event_hash")?.as_str()?.to_string(),
+            at: v.get("at")?.as_i64()?,
+            by: v.get("by")?.as_str()?.to_string(),
+            mac: v.get("mac")?.as_str()?.to_string(),
+        })
+    }
+
+    pub fn new(key: &AuditKey, event_id: i64, event_hash: &str, at: i64, by: &str) -> Self {
+        Self {
+            event_id,
+            event_hash: event_hash.to_string(),
+            at,
+            by: by.to_string(),
+            mac: key.reanchor_mac(event_id, event_hash, at, by),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "v": 1,
+            "event_id": self.event_id,
+            "event_hash": self.event_hash,
+            "at": self.at,
+            "by": self.by,
+            "mac": self.mac,
+        })
+    }
+
+    /// 指標的 mac 是否正確
+    pub fn mac_ok(&self, key: &AuditKey) -> bool {
+        ct_eq_str(
+            &self.mac,
+            &key.reanchor_mac(self.event_id, &self.event_hash, self.at, &self.by),
+        )
+    }
+
+    /// 這個指標是否仍然有效：保留期限已經清除到它之後（錨點的 id 不小於它）時，未驗證的區段已不存在
+    pub fn active(&self, anchor: Option<&(i64, String)>) -> bool {
+        !anchor.is_some_and(|(id, _)| *id >= self.event_id)
+    }
+}
+
+/// 驗證結果中的重新錨定資訊
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReanchorInfo {
+    /// 重新錨定事件的 id：驗證從這一筆起算
+    pub event_id: i64,
+    pub at: i64,
+    pub by: String,
+    /// 這一筆之前、完整性未驗證的筆數
+    pub unverified: u64,
+}
+
+/// [`AuditLog::audit_reanchor`] 被拒的原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReanchorRefused {
+    /// 沒有 HMAC 金鑰（資料目錄的 `audit-hmac.key` 不存在或無法讀取）
+    NoKey,
 }
 
 /// 寫入或清除之前鏈的狀態：有金鑰的寫入者據此決定能不能把 head 往前推
@@ -548,6 +655,8 @@ pub struct VerifyReport {
     pub broken: Option<ChainBreak>,
     /// HMAC 的邊界與結果
     pub hmac: HmacReport,
+    /// 重新錨定過（且未驗證的區段還在）：驗證從這一筆起算，`checked` 等欄位只算這一筆之後
+    pub reanchor: Option<ReanchorInfo>,
 }
 
 /// HMAC 的驗證結果
@@ -602,6 +711,12 @@ impl VerifyReport {
                 "verified": self.hmac.verified,
                 "chain_only": self.hmac.chain_only,
             },
+            "reanchor": self.reanchor.as_ref().map(|r| json!({
+                "event_id": r.event_id,
+                "at": crate::api::http::ts_ms(r.at),
+                "by": r.by,
+                "unverified": r.unverified,
+            })),
         })
     }
 }
@@ -687,6 +802,17 @@ pub trait AuditLog {
     /// 從頭到尾重新計算雜湊鏈，回報第一個斷點（不修改任何資料；在同一個讀取快照中進行）。HMAC 的金鑰
     /// 依資料庫所在的資料目錄取得
     fn audit_verify(&self) -> StoreResult<VerifyReport>;
+
+    /// 把鏈重新錨定到現況（[`ReanchorPoint`]）：寫入 `a`（動作必須是 [`ACTION_REANCHOR`]）並簽章、
+    /// 重寫 head、記下指標；不刪除也不修改任何既有的紀錄。需要 HMAC 金鑰。回傳事件的 id
+    fn audit_reanchor(
+        &self,
+        at_ms: i64,
+        a: &Audit<'_>,
+    ) -> StoreResult<Result<i64, ReanchorRefused>>;
+
+    /// `meta.audit_reanchor`（不驗證 mac；只用來察覺「有新的重新錨定」）
+    fn audit_reanchor_point(&self) -> StoreResult<Option<ReanchorPoint>>;
 
     /// 新到舊的 `limit` 筆，以及符合條件的總數
     fn audit_query(&self, f: &AuditFilter, limit: usize) -> StoreResult<(Vec<AuditRow>, u64)>;
