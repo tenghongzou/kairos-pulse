@@ -72,14 +72,19 @@ StateDirectoryMode=0755
 # 主機資產的系統序號（0.8.0，METRICS.md 第 4.5 節、第 17 節 D4）：/sys/class/dmi/id/product_serial
 # 只有 root 能讀，而 Pulse 以 pulse 使用者、沒有任何 capability 執行。啟動前以 root 執行一次複製
 # （前綴 + 不受下方的沙箱與 User= 限制；前綴 - 表示失敗不影響啟動，例如沒有 DMI 的虛擬機），
-# 放到 RuntimeDirectory（/run/pulse，擁有者 pulse），Pulse 讀 /run/pulse/product_serial。
+# 放到 /run/pulse-hw/product_serial，Pulse 讀這個檔案。0.12.0 之後的版本（安全稽核 A2）：目的地改為
+# root 擁有的目錄（root:pulse 0750，檔案 root:pulse 0440）——root 不在服務帳號可寫的目錄中寫入，
+# 服務帳號無法事先在目的地放符號連結；-T 讓 install 一律把目的地當成檔案。舊版 unit 複製到
+# /run/pulse/product_serial，Pulse 仍會讀它（新版執行檔搭配舊 unit 時）。
 # 讀不到時 Pulse 不送序號並記一次 PLS-I8009。不想送序號時在 pulse.toml 設定
-# [inventory] hardware_serials = false（這幾行可保留）。多實例共用同一個 /run/pulse，
+# [inventory] hardware_serials = false（這幾行可保留）。多實例共用同一個 /run/pulse-hw。
+# RuntimeDirectory=pulse（/run/pulse，擁有者 pulse）保留給舊版執行檔與日後的執行期檔案；多實例共用，
 # 因此 RuntimeDirectoryPreserve=yes（停止其中一個實例時不刪除）
 RuntimeDirectory=pulse
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
-ExecStartPre=-+/usr/bin/install -o pulse -g pulse -m 0400 /sys/class/dmi/id/product_serial /run/pulse/product_serial
+ExecStartPre=-+/usr/bin/install -d -o root -g pulse -m 0750 /run/pulse-hw
+ExecStartPre=-+/usr/bin/install -T -o root -g pulse -m 0440 /sys/class/dmi/id/product_serial /run/pulse-hw/product_serial
 
 # ---- 硬化 -------------------------------------------------------------------
 ProtectSystem=strict

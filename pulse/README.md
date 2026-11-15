@@ -651,7 +651,7 @@ health_timeout_secs = 0        # 替換後的健康確認期限（0 = 依 Kairos
 
 - **何時送**：連線建立（`hello_ack` 之後）收集一次並送出（不論與上次是否相同）；之後每 `inventory.interval`（預設 1 小時）重新收集，內容（`inventory_digest`，不含開機時間）改變才送，距離上次送達滿 24 小時也送一次。Kairos 回 `invalid_report` 時記 `WARN`（`inventory.rejected PLS-W2108`），同樣的內容不再送；回 `storage_unavailable` 時 5 分鐘後重送（Kairos 暫時無法保存記 `PLS-W4101`；資產的速率限制只記 `DEBUG`）。資產不經過本機緩衝（它是狀態，不是時序；重新連線後一定會再送一次）。收集在背景執行緒進行，超過 10 秒記 `WARN`（`PLS-W8005`）、這次不送，不影響 report 的取樣。
 - **內容**：取不到的欄位省略（不是空字串或 0）。磁碟與網路介面的篩選、名稱與指標相同，但不受每類上限限制（各最多 64 個）。CPU 時脈為標稱值（型號字串中的「@ 2.00GHz」、Linux 的 `base_frequency`／`cpuinfo_max_freq`、Windows 登錄的 `~MHz`），不用會隨負載變動的目前時脈。BIOS 在 Linux 讀 `/sys/class/dmi/id/bios_*`（所有人可讀），Windows 讀登錄 `HKLM\HARDWARE\DESCRIPTION\System\BIOS`。
-- **系統序號**：Linux 的 `/sys/class/dmi/id/product_serial` 只有 root 能讀；發佈包的 `pulse.service` 以 `ExecStartPre=+`（以 root 執行、不受沙箱限制）在啟動前複製到 `/run/pulse/product_serial`，Pulse 依序讀該檔、再直接讀 sysfs（以 root 互動執行時）。都讀不到，或是廠商的預設字串（`To Be Filled By O.E.M.`、`Default string` 等）時不送，記一次 `INFO`（`sysinfo.limited PLS-I8009`）。Windows 由 SMBIOS 讀取，不需要系統管理員權限。`inventory.hardware_serials = false` 不送序號，`inventory.network_addresses = false` 不送 MAC 與 IP。
+- **系統序號**：Linux 的 `/sys/class/dmi/id/product_serial` 只有 root 能讀；發佈包的 `pulse.service` 以 `ExecStartPre=+`（以 root 執行、不受沙箱限制）在啟動前複製到 root 擁有的 `/run/pulse-hw/product_serial`（0.12.0 以前的 unit 為 `/run/pulse/product_serial`），Pulse 依序讀這兩個檔、再直接讀 sysfs（以 root 互動執行時）。都讀不到，或是廠商的預設字串（`To Be Filled By O.E.M.`、`Default string` 等）時不送，記一次 `INFO`（`sysinfo.limited PLS-I8009`）。Windows 由 SMBIOS 讀取，不需要系統管理員權限。`inventory.hardware_serials = false` 不送序號，`inventory.network_addresses = false` 不送 MAC 與 IP。
 - 整則超過單行上限時，依序捨去介面的位址（每個介面只留第一個 IPv4 與第一個 IPv6）、再捨去優先順序最低的介面與磁碟。
 
 主機名稱與 `agent_id` 只在連線開頭的 `hello` 送一次，不會重複出現在每筆 report 中。

@@ -420,7 +420,7 @@ unit 重點（內容見 `pulse.service`）：
 | `RestartPreventExitStatus` | `2 3 4` | 重試也不會成功的錯誤不重啟：2 命令列參數錯誤、3 設定錯誤（`pulse.toml` 語法、型別、範圍錯誤等）、4 憑證錯誤（`ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，SAN 與 agent_id 不符，`agent.id` 無法讀取或內容不合法）。`systemctl status pulse` 顯示 `status=2`／`3`／`4`，原因在 `journalctl -u pulse`，修正後 `systemctl restart pulse` |
 | `NotifyAccess` | `main` | 只用來以 sd_notify 更新 `systemctl status` 的 `Status:` 文字（見 8.1）；不送 `READY=1`，所以 `Type` 仍為 `simple` |
 | `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節）。`-` 表示 `buffer/` 不存在時不影響啟動（Pulse 改為 at-most-once 並記 `ERROR`） |
-| `RuntimeDirectory=pulse`＋`ExecStartPre=-+/usr/bin/install … /sys/class/dmi/id/product_serial /run/pulse/product_serial` | `/run/pulse`（0750，擁有者 `pulse`；`RuntimeDirectoryPreserve=yes`） | 0.8.0 起的主機資產需要系統序號，但 `/sys/class/dmi/id/product_serial` 只有 root 能讀（0400）。前綴 `+` 讓這一行以 root、不受沙箱限制執行，把序號複製成 `pulse` 可讀的檔案；Pulse 本身仍以 `pulse` 執行、沒有任何 capability。前綴 `-` 表示複製失敗（例如沒有 DMI 的虛擬機）不影響啟動，Pulse 不送序號並記一次 `PLS-I8009`。不想送序號時在 `pulse.toml` 設定 `[inventory] hardware_serials = false`（這幾行可保留） |
+| 兩行 `ExecStartPre=-+/usr/bin/install …`（建立 `/run/pulse-hw`、複製 `/sys/class/dmi/id/product_serial`）＋`RuntimeDirectory=pulse` | `/run/pulse-hw`（`root:pulse` 0750）與其中的 `product_serial`（`root:pulse` 0440）；`/run/pulse`（0750，擁有者 `pulse`；`RuntimeDirectoryPreserve=yes`） | 0.12.0 之後的版本把序號複製到 **root 擁有**的 `/run/pulse-hw/`（先前是擁有者為 `pulse` 的 `/run/pulse/`）：以 root 執行的這一步不在服務帳號可寫的目錄中寫入。新版執行檔兩個位置都讀，舊的 unit 不必急著換；手動安裝（tar）的主機請依第 10 節換上新的 `pulse.service`。 0.8.0 起的主機資產需要系統序號，但 `/sys/class/dmi/id/product_serial` 只有 root 能讀（0400）。前綴 `+` 讓這一行以 root、不受沙箱限制執行，把序號複製成 `pulse` 可讀的檔案；Pulse 本身仍以 `pulse` 執行、沒有任何 capability。前綴 `-` 表示複製失敗（例如沒有 DMI 的虛擬機）不影響啟動，Pulse 不送序號並記一次 `PLS-I8009`。不想送序號時在 `pulse.toml` 設定 `[inventory] hardware_serials = false`（這幾行可保留） |
 
 ### 7.1 為什麼選擇 `StandardOutput=null`
 
@@ -599,7 +599,7 @@ grep -E '^(WorkingDirectory|ReadWritePaths|ExecStart|StateDirectory)=' /etc/syst
 #   ExecStart=/opt/pulse/pulse
 #   StateDirectory=pulse/2          ← 狀態檔 /var/lib/pulse/2/status.json（Pulse 依 STATE_DIRECTORY 自動使用）
 #   ReadWritePaths=/opt/pulse-2/logs -/opt/pulse-2/buffer
-#   （RuntimeDirectory=pulse 與複製序號的 ExecStartPre= 不必改：各實例共用 /run/pulse/product_serial，
+#   （RuntimeDirectory=pulse 與複製序號的 ExecStartPre= 不必改：各實例共用 /run/pulse-hw/product_serial，
 #    RuntimeDirectoryPreserve=yes 讓停止其中一個實例時不會刪除它）
 
 # 3. agent_id（第 5.1 節，在 /opt/pulse-N 執行）

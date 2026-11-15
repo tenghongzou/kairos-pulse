@@ -174,7 +174,7 @@ Pulse 一律經由 `sysinfo`（第 4.1 節）；下表列出 `sysinfo` 0.39 實�
 
 | 平台 | 項目 | 說明 |
 |---|---|---|
-| Linux | 系統序號 `system.serial` | `/sys/class/dmi/id/product_serial` 為 root 才能讀（0400），而 Pulse 以 `pulse` 使用者、`CapabilityBoundingSet=` 執行，**讀不到**。建議 unit 加 `ExecStartPre=+`（以 root 執行、不受沙箱限制）把序號複製到 `RuntimeDirectory=pulse` 的檔案，Pulse 優先讀該檔（第 17 節 D4）。讀不到時不送該欄位，啟動時記一次 `PLS-I8009` |
+| Linux | 系統序號 `system.serial` | `/sys/class/dmi/id/product_serial` 為 root 才能讀（0400），而 Pulse 以 `pulse` 使用者、`CapabilityBoundingSet=` 執行，**讀不到**。建議 unit 加 `ExecStartPre=+`（以 root 執行、不受沙箱限制）把序號複製到 root 擁有的 `/run/pulse-hw/product_serial`（0.12.0 以前的 unit 複製到 `RuntimeDirectory=pulse` 之下），Pulse 優先讀該檔（第 17 節 D4）。讀不到時不送該欄位，啟動時記一次 `PLS-I8009` |
 | Linux | 其他資產 | `sys_vendor`、`product_name`、`board_*`、`bios_*` 所有人可讀；`PrivateDevices=yes` 不影響 `/proc`、`/sys` 的讀取 |
 | Linux | 行程 | unit 沒有 `ProtectProc=`，可以看到所有行程；命令列（`/proc/<pid>/cmdline`）所有人可讀。若管理者加上 `ProtectProc=invisible`，只看得到 pulse 自己的行程：此時 `system.process.count` 與 `processes` **不送**（看到的數目明顯少於 2 時判定為受限），記一次 `PLS-I8009` |
 | Windows | 行程 | 虛擬服務帳號 `NT SERVICE\Pulse` 以 `PROCESS_QUERY_LIMITED_INFORMATION` 可取得名稱、CPU 時間與 Working Set；受保護的行程（例如 `csrss.exe`）的記憶體可能取不到（視為 0，不列入記憶體排行）。命令列需要 `PROCESS_VM_READ`，其他帳號的行程取不到 → 該行程不帶 `command` |

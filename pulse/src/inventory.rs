@@ -219,7 +219,7 @@ pub async fn run_worker(agent: Arc<InventoryAgent>) {
 fn limited_detail(item: &str) -> &'static str {
     match item {
         "system.serial" if cfg!(target_os = "linux") => {
-            "/sys/class/dmi/id/product_serial 只有 root 能讀，且沒有 /run/pulse/product_serial \
+            "/sys/class/dmi/id/product_serial 只有 root 能讀，且沒有 /run/pulse-hw/product_serial \
              （發佈包的 pulse.service 以 ExecStartPre=+ 複製；舊的 unit 請更新，見 INSTALL.md）"
         }
         "system.serial" => "SMBIOS 中沒有系統序號（或為廠商的預設字串）",
