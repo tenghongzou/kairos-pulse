@@ -49,6 +49,8 @@ enum Phase {
     Forward,
     /// 回滾（只有新版崩潰時經過）
     Rollback,
+    /// 升級成功後的封存（只有新版健康、deb／rpm 時經過；REMOTE.md 第 17.10 節）
+    Archive,
     /// 結果已記錄之後
     Finish,
 }
@@ -118,7 +120,23 @@ const POINTS: &[Point] = &[
     point(20, "record_done", Phase::Finish, all),
     point(21, "result_written", Phase::Finish, all),
     point(22, "request_removed", Phase::Finish, all),
+    // 第 23、24 列在時間上位於第 14 列（健康確認通過）與第 20 列（記下 done）之間；列號接在最後
+    point(23, "archive_staged", Phase::Archive, package_only),
+    point(24, "archive_committed", Phase::Archive, package_only),
 ];
+
+/// root 的本機封存索引（沒有時 `None`）
+fn archive_index(env: &Env) -> Option<archive::Index> {
+    archive::read_index(&env.paths.work_root, txn::Owner::new(false)).expect("封存索引可用")
+}
+
+/// 封存中 `version` 的條目（已提交的）
+fn archived(env: &Env, version: &str) -> Option<kairos_proto::release::ReleaseRecord> {
+    archive_index(env)?
+        .entries
+        .into_iter()
+        .find(|e| e.version == version)
+}
 
 fn pkg_db(fake: &Fake) -> String {
     fake.pkg_db.borrow().clone().unwrap_or_default()
@@ -161,7 +179,9 @@ fn crash_state(env: &Env, fake: &Fake, kind: Kind, p: &Point, label: &str) {
         | "package_running"
         | "binary_replaced"
         | "unit_replaced" => Some(Step::Replacing),
-        "record_replaced" | "health_wait" => Some(Step::Replaced),
+        "record_replaced" | "health_wait" | "archive_staged" | "archive_committed" => {
+            Some(Step::Replaced)
+        }
         "rollback_intent_recorded"
         | "rollback_restoring"
         | "rollback_package_running"
@@ -263,6 +283,25 @@ fn crash_state(env: &Env, fake: &Fake, kind: Kind, p: &Point, label: &str) {
         "request_removed" => {
             assert!(env.has_result() && !env.paths.request.exists(), "{label}")
         }
+        // 套件已寫進封存目錄，索引還沒有它：不是回滾目標（INV-10）
+        "archive_staged" => {
+            assert_eq!(env.installed(), "0.9.1", "{label}");
+            assert!(archived(env, "0.9.1").is_none(), "{label}: 尚未提交");
+            let sha = rec.artifact.as_ref().unwrap().sha256.clone();
+            assert_eq!(
+                txn::sha256_regular(
+                    &archive::entry_dir(&env.paths.work_root, &sha).join(archive::PACKAGE_FILE)
+                ),
+                Some(sha),
+                "{label}: 套件已在封存目錄"
+            );
+        }
+        // 索引已提交；紀錄還是 replaced（done 尚未記下）
+        "archive_committed" => {
+            let e = archived(env, "0.9.1").expect("已提交");
+            assert_eq!(e.generation, 1, "{label}");
+            assert!(rec.result.is_none(), "{label}");
+        }
         _ => {}
     }
 }
@@ -348,6 +387,50 @@ fn final_state(
     let rec = env.record();
     assert_eq!(rec.step, Step::Done, "{label}");
     assert_eq!(rec.result.as_ref(), Some(r), "{label}");
+    // 本機封存（第 17.10 節；INV-10）：deb／rpm 升級成功後恰好提交一次、只有新版的套件；回滾的版本
+    // 沒有通過健康確認，不得被封存。在任何一個當機點中斷後接續都一樣（不重複提交、不留下暫存目錄）
+    let index = archive_index(env);
+    if kind.package() && !crashy {
+        let index = index.expect("升級成功後有封存");
+        assert_eq!(index.generation, 1, "{label}: 只提交一次");
+        assert_eq!(index.entries.len(), 1, "{label}");
+        let e = &index.entries[0];
+        let artifact = rec.artifact.as_ref().unwrap();
+        assert_eq!(
+            (
+                e.version.as_str(),
+                e.artifact_sha256.as_str(),
+                e.binary_sha256.as_str(),
+                e.source.as_str(),
+                e.generation
+            ),
+            (
+                "0.9.1",
+                artifact.sha256.as_str(),
+                rec.new_binary_sha256.as_str(),
+                "ota",
+                1
+            ),
+            "{label}"
+        );
+        assert_eq!(e.policy.signer, artifact.signer, "{label}");
+        let names: Vec<String> = std::fs::read_dir(archive::dir(&env.paths.work_root))
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().to_string())
+            .filter(|n| n != archive::INDEX_FILE)
+            .collect();
+        assert_eq!(
+            names,
+            std::slice::from_ref(&e.artifact_sha256),
+            "{label}: 沒有殘留"
+        );
+    } else {
+        assert!(
+            index.is_none_or(|i| i.entries.is_empty()),
+            "{label}: tar 與回滾的版本不封存"
+        );
+    }
 }
 
 fn run_case(kind: Kind, p: &Point, crashy: bool) {
@@ -434,8 +517,11 @@ fn run_matrix(kind: Kind) {
             run_case(kind, p, false);
             cases += 1;
         }
-        run_case(kind, p, true);
-        cases += 1;
+        // 封存只在新版健康時發生
+        if p.phase != Phase::Archive {
+            run_case(kind, p, true);
+            cases += 1;
+        }
     }
     assert!(cases >= 30, "{kind:?}: 只跑了 {cases} 個案例");
 }
@@ -486,7 +572,7 @@ fn the_matrix_covers_every_row_of_the_crash_point_table() {
         };
         rows.push((n, name));
     }
-    assert_eq!(rows.len(), 22, "{rows:?}");
+    assert_eq!(rows.len(), 24, "{rows:?}");
     for (i, (n, name)) in rows.iter().enumerate() {
         assert_eq!(usize::from(*n), i + 1, "列號連續");
         let points: Vec<&Point> = POINTS.iter().filter(|p| p.row == *n).collect();
@@ -518,12 +604,40 @@ fn the_matrix_covers_every_row_of_the_crash_point_table() {
             "package_running",
             "rollback_package_running",
         ];
-        for p in POINTS.iter().filter(|p| (p.applies)(kind)) {
+        for p in POINTS
+            .iter()
+            .filter(|p| (p.applies)(kind) && p.phase != Phase::Archive)
+        {
             assert!(
                 injected.contains(&p.name) || seen.iter().any(|s| s == p.name),
                 "{kind:?}: 沒有經過 {}（經過 {seen:?}）",
                 p.name
             );
+        }
+        for s in &seen {
+            assert!(
+                POINTS.iter().any(|p| p.name == s),
+                "程式中的 checkpoint {s} 不在對照表中"
+            );
+        }
+        env.cleanup();
+    }
+    // 成功的升級（deb）另外經過封存的兩個 checkpoint，而且都在 record_done 之前；tar 不封存
+    for kind in [Kind::Tar, Kind::Deb] {
+        let env = setup(&format!("fm-seen-ok-{kind:?}"), kind.method());
+        let fake = Fake::new(&env.root);
+        assert_eq!(apply(&env.paths, &fake).unwrap().state, "succeeded");
+        let seen = fake.seen();
+        let at = |name: &str| seen.iter().position(|s| s == name);
+        if kind.package() {
+            let (staged, committed, done) = (
+                at("archive_staged").expect("archive_staged"),
+                at("archive_committed").expect("archive_committed"),
+                at("record_done").unwrap(),
+            );
+            assert!(staged < committed && committed < done, "{seen:?}");
+        } else {
+            assert!(at("archive_staged").is_none() && at("archive_committed").is_none());
         }
         for s in &seen {
             assert!(

@@ -35,6 +35,41 @@ pub const SIG_FILE: &str = "SHA256SUMS.sig";
 /// 回滾檔所屬發佈的簽章資料（本機驗證過的紀錄，[`super::releases_dir`]）
 pub const ROLLBACK_SUMS_FILE: &str = "rollback.SHA256SUMS";
 pub const ROLLBACK_SIG_FILE: &str = "rollback.SHA256SUMS.sig";
+/// 自動回滾能力的提示（[`RollbackHint`]）：輔助程式寫，Pulse 讀來決定 hello 的 `install.rollback`
+pub const ROLLBACK_HINT_FILE: &str = "rollback.json";
+/// `rollback.json` 的 `schema`
+pub const ROLLBACK_HINT_SCHEMA: &str = "pulse.upgrade-rollback/v1";
+/// `rollback.json` 的上限
+pub const MAX_ROLLBACK_HINT_BYTES: u64 = 16 * 1024;
+
+/// 自動回滾能力的提示（`<狀態目錄>/upgrade/rollback.json`；REMOTE.md 第 17.10.6 節）。升級輔助程式（root）
+/// 在每筆交易結束與 `pulse upgrade archive-current` 時寫出，Pulse（服務帳號）據此在 hello 宣告
+/// `install.rollback`。這個檔案在服務帳號可寫的目錄裡，**只是提示**：輔助程式不依據它做任何決定（封存
+/// 是否可用由 root 的封存索引決定），它只影響主控台的顯示與資格預覽
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackHint {
+    pub schema: String,
+    /// `archived`、`binary_only` 或 `degraded`（`kairos_proto::mgmt::INSTALL_ROLLBACK_*`）
+    pub state: String,
+    /// 這份提示描述的執行檔（寫出當時 `/opt/pulse/pulse` 的 SHA-256）：Pulse 只在它等於自己的執行檔時
+    /// 才採用——升級、回滾或手動替換執行檔之後，舊的提示自動失效
+    pub binary_sha256: String,
+    /// 寫出當時套件資料庫的狀態（與交易紀錄的 `pkg_db_*` 相同的查詢）。`degraded` 只在套件資料庫仍是
+    /// 這個狀態時成立：重新安裝套件之後就不再是降級的狀態
+    #[serde(default)]
+    pub pkg_db: Option<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+impl RollbackHint {
+    /// 讀取提示；不存在、讀不到、不是合法的內容或 schema 不認得時 `None`（視為沒有提示）
+    pub fn read(path: &Path) -> Option<Self> {
+        let bytes = read_untrusted_file(path, MAX_ROLLBACK_HINT_BYTES).ok()?;
+        let hint: Self = serde_json::from_slice(&bytes).ok()?;
+        (hint.schema == ROLLBACK_HINT_SCHEMA).then_some(hint)
+    }
+}
 
 /// 交給輔助程式的請求（`request.json`）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

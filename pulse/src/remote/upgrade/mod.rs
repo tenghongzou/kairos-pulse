@@ -108,6 +108,51 @@ pub struct UpgradeEnv {
     pub url_allowlist: Vec<String>,
     /// 本機的 `upgrade.external_ca`：外部 URL 的 CA（PEM 的路徑；空字串＝作業系統信任庫）
     pub external_ca: String,
+    /// 這個行程的執行檔的 SHA-256（啟動時算一次；算不出來時 `None`）：輔助程式留下的回滾提示只在它描述的
+    /// 是這一份執行檔時才採用（[`rollback_state`]）
+    pub own_binary_sha256: Option<String>,
+    /// 套件資料庫中 pulse 的狀態（`helper::query_package_db`；測試時以假的實作取代）
+    pub pkg_db: fn(&str) -> Option<String>,
+}
+
+/// 這個行程的執行檔的 SHA-256（讀不到時 `None`）
+pub fn own_binary_sha256() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| files::sha256_file(&p).ok())
+}
+
+/// hello 的 `install.rollback`（REMOTE.md 第 2.1、17.10.6 節）：這台主機自動回滾的能力。
+///
+/// - 遠端升級沒有就緒 → `none`；
+/// - deb／rpm：輔助程式（root）留下的提示 `<升級目錄>/rollback.json` 描述的是**這個行程的執行檔**時採用——
+///   `archived`（目前版本的套件在本機封存中），或 `degraded`（上一次回滾只換回了執行檔）而且套件資料庫的
+///   狀態仍與當時相同（重新安裝套件之後就不再是）；其他情況 `binary_only`；
+/// - tar 等其他安裝方式 → `binary_only`。
+///
+/// 提示在服務帳號可寫的目錄裡，這個值**只影響顯示與資格預覽**；回滾實際用什麼由輔助程式決定
+pub fn rollback_state(
+    ready: bool,
+    method: &str,
+    upgrade_dir: &Path,
+    own_binary_sha256: Option<&str>,
+    pkg_db: fn(&str) -> Option<String>,
+) -> &'static str {
+    if !ready {
+        return mgmt::INSTALL_ROLLBACK_NONE;
+    }
+    if !matches!(method, mgmt::INSTALL_METHOD_DEB | mgmt::INSTALL_METHOD_RPM) {
+        return mgmt::INSTALL_ROLLBACK_BINARY_ONLY;
+    }
+    let hint = files::RollbackHint::read(&upgrade_dir.join(files::ROLLBACK_HINT_FILE))
+        .filter(|h| own_binary_sha256.is_some_and(|own| own == h.binary_sha256));
+    match hint {
+        Some(h) if h.state == mgmt::INSTALL_ROLLBACK_ARCHIVED => mgmt::INSTALL_ROLLBACK_ARCHIVED,
+        Some(h) if h.state == mgmt::INSTALL_ROLLBACK_DEGRADED && pkg_db(method) == h.pkg_db => {
+            mgmt::INSTALL_ROLLBACK_DEGRADED
+        }
+        _ => mgmt::INSTALL_ROLLBACK_BINARY_ONLY,
+    }
 }
 
 /// 檔案系統的可用空間（Unix：`statvfs` 的 `f_bavail × f_frsize`）
@@ -541,8 +586,19 @@ impl UpgradeAgent {
             external_url: Some(
                 kairos_proto::mgmt::url::allowlist_state(&inner.env.url_allowlist).to_string(),
             ),
-            rollback: None,
+            rollback: Some(Self::rollback_of(&inner).to_string()),
         }
+    }
+
+    /// hello 的 `install.rollback`（[`rollback_state`]；與其他 `install` 欄位相同，每次連線前重新計算）
+    fn rollback_of(inner: &Inner) -> &'static str {
+        rollback_state(
+            inner.env.detection.upgrade == mgmt::INSTALL_UPGRADE_READY,
+            inner.env.detection.method,
+            &Self::upgrade_dir(inner),
+            inner.env.own_binary_sha256.as_deref(),
+            inner.env.pkg_db,
+        )
     }
 
     fn known(inner: &Inner, cs: &ConnState, id: &str) -> bool {
@@ -2106,9 +2162,16 @@ impl UpgradeAgent {
             last: inner.file.history.last().cloned(),
             ..Default::default()
         };
-        v.package_repair_needed = v.last.as_ref().is_some_and(|l| {
-            l.state == UPGRADE_STATE_ROLLED_BACK && mgmt::degraded_reasons(&l.detail).is_some()
-        });
+        let rollback = Self::rollback_of(&inner);
+        v.rollback = Some(rollback.to_string());
+        // 需要修復套件：輔助程式的提示說仍是降級的狀態（執行檔與套件資料庫都沒有變）。沒有提示可以判斷時
+        // （算不出自己的雜湊、0.11.0 以前的輔助程式做的回滾）依最近一次的結果
+        v.package_repair_needed = rollback == mgmt::INSTALL_ROLLBACK_DEGRADED
+            || (inner.env.own_binary_sha256.is_none()
+                && v.last.as_ref().is_some_and(|l| {
+                    l.state == UPGRADE_STATE_ROLLED_BACK
+                        && mgmt::degraded_reasons(&l.detail).is_some()
+                }));
         if let Some(c) = &inner.file.current {
             let (done, total) = Self::progress(&inner, c);
             v.phase = Some(

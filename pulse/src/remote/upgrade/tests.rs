@@ -54,6 +54,8 @@ fn env(dir: &Path, version: &str) -> UpgradeEnv {
         redetect: None,
         url_allowlist: Vec::new(),
         external_ca: String::new(),
+        own_binary_sha256: None,
+        pkg_db: |_| None,
     }
 }
 
@@ -1316,6 +1318,94 @@ fn a_degraded_rollback_is_forwarded_and_flagged_for_package_repair() {
             detail
         )
     );
+    assert!(agent.view().package_repair_needed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// hello 的 `install.rollback`（REMOTE.md 第 2.1、17.10.6 節）：由輔助程式（root）留下的提示算出。提示只在
+/// 它描述的是這個行程的執行檔時採用；`degraded` 另外要求套件資料庫的狀態沒有變。提示在服務帳號可寫的
+/// 目錄裡——它只決定回報給 Kairos 的值，讀不到、不合法或不相符時一律退回 `binary_only`
+#[test]
+fn hello_declares_the_rollback_capability_from_the_helper_hint() {
+    const OWN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    fn db(_: &str) -> Option<String> {
+        Some("0.9.2 ii".to_string())
+    }
+    let dir = tmp("rollback-state");
+    let updir = dir.join("state/upgrade");
+    std::fs::create_dir_all(&updir).unwrap();
+    let write = |state: &str, binary: &str, pkg_db: Option<&str>| {
+        let h = files::RollbackHint {
+            schema: files::ROLLBACK_HINT_SCHEMA.into(),
+            state: state.into(),
+            binary_sha256: binary.into(),
+            pkg_db: pkg_db.map(str::to_string),
+            updated_at: ts(0),
+        };
+        std::fs::write(
+            updir.join(files::ROLLBACK_HINT_FILE),
+            serde_json::to_vec(&h).unwrap(),
+        )
+        .unwrap();
+    };
+    let state = |ready: bool, method: &str, own: Option<&str>| {
+        rollback_state(ready, method, &updir, own, db)
+    };
+    // 沒有提示
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    assert_eq!(state(true, "tar", Some(OWN)), "binary_only");
+    assert_eq!(state(false, "deb", Some(OWN)), "none");
+    // archived：描述的是這個行程的執行檔才算
+    write("archived", OWN, Some("0.9.1 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "archived");
+    assert_eq!(state(true, "rpm", Some(OWN)), "archived");
+    assert_eq!(
+        state(true, "deb", Some(OTHER)),
+        "binary_only",
+        "升級或回滾之後舊的提示失效"
+    );
+    assert_eq!(state(true, "deb", None), "binary_only", "算不出自己的雜湊");
+    assert_eq!(state(true, "tar", Some(OWN)), "binary_only", "tar 沒有封存");
+    assert_eq!(state(false, "deb", Some(OWN)), "none", "遠端升級沒有就緒");
+    // degraded：套件資料庫仍是降級回滾當時的狀態才算；重新安裝套件之後不再是
+    write("degraded", OWN, Some("0.9.2 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "degraded");
+    write("degraded", OWN, Some("0.9.3 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    write("degraded", OTHER, Some("0.9.2 ii"));
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    // 不認得的狀態、schema 或不是合法的內容
+    write("future", OWN, None);
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    std::fs::write(
+        updir.join(files::ROLLBACK_HINT_FILE),
+        r#"{"schema":"pulse.upgrade-rollback/v9","state":"archived","binary_sha256":"1111111111111111111111111111111111111111111111111111111111111111"}"#,
+    )
+    .unwrap();
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    std::fs::write(updir.join(files::ROLLBACK_HINT_FILE), "{").unwrap();
+    assert_eq!(state(true, "deb", Some(OWN)), "binary_only");
+    for s in ["archived", "binary_only", "none", "degraded"] {
+        assert!(mgmt::INSTALL_ROLLBACK_STATES.contains(&s));
+    }
+
+    // 經 UpgradeAgent：hello 的 install 與 view 都帶出；需要修復套件以提示為準
+    let mut e = env(&dir, "0.9.1");
+    e.detection.method = mgmt::INSTALL_METHOD_DEB;
+    e.own_binary_sha256 = Some(OWN.to_string());
+    e.pkg_db = db;
+    write("archived", OWN, None);
+    let agent = UpgradeAgent::new(e);
+    let info = agent.install_info();
+    assert_eq!(info.rollback.as_deref(), Some("archived"));
+    mgmt::validate_install(&info).unwrap();
+    let v = agent.view();
+    assert_eq!(v.rollback.as_deref(), Some("archived"));
+    assert!(!v.package_repair_needed);
+    // 與其他 install 欄位相同：每次連線前重新計算
+    write("degraded", OWN, Some("0.9.2 ii"));
+    assert_eq!(agent.install_info().rollback.as_deref(), Some("degraded"));
     assert!(agent.view().package_repair_needed);
     let _ = std::fs::remove_dir_all(&dir);
 }

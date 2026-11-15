@@ -96,12 +96,15 @@ pub struct Verified {
     /// 簽署金鑰的指紋（`SHA256:…`）
     #[serde(default)]
     pub signer: String,
-    /// 回滾套件的來源（ADR-0003 第 5.4 節）：[`SOURCE_HINT`]（服務帳號暫存的回滾檔，簽章資料來自本機
-    /// 紀錄或提議的 `rollback_bundle`，由輔助程式重新驗證）。發佈檔與 0.11.0 以前的紀錄為空字串。不屬於
-    /// 綁定欄位（檔名、雜湊、簽署者已綁定）
+    /// 回滾套件的來源（ADR-0003 第 5.4 節）：[`SOURCE_ARCHIVE`]（root 的本機封存）或 [`SOURCE_HINT`]
+    /// （服務帳號暫存的回滾檔，簽章資料來自本機紀錄或提議的 `rollback_bundle`，由輔助程式重新驗證）。
+    /// 發佈檔與 0.11.0 以前的紀錄為空字串。不屬於綁定欄位（檔名、雜湊、簽署者已綁定）
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
 }
+
+/// [`Verified::source`]：root 的本機封存
+pub const SOURCE_ARCHIVE: &str = "archive";
 
 /// [`Verified::source`]：服務帳號暫存、輔助程式重新驗證過的回滾檔
 pub const SOURCE_HINT: &str = "hint";
@@ -165,6 +168,10 @@ pub struct Record {
     pub old_binary_sha256: String,
     #[serde(default)]
     pub artifact: Option<Verified>,
+    /// 驗證發佈檔當時的信任政策（簽署者、principal、那一行的有效期間、信任錨的雜湊、時間）：升級成功後
+    /// 封存時寫進封存的紀錄（REMOTE.md 第 17.10 節）。0.11.0 以前的紀錄沒有。不屬於綁定欄位
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<kairos_proto::release::TrustSnapshot>,
     #[serde(default)]
     pub manifest: Option<String>,
     #[serde(default)]
@@ -237,6 +244,7 @@ impl Record {
             method: method.to_string(),
             old_binary_sha256: String::new(),
             artifact: None,
+            policy: None,
             manifest: None,
             new_binary_sha256: String::new(),
             rollback: None,

@@ -1645,6 +1645,20 @@ fn upgrade_row(u: &crate::remote::upgrade::UpgradeView, now: DateTime<Utc>) -> O
         };
         return Some(Row::new("upgrade", "升級", Outcome::Ok, line.clone()).summary(line));
     }
+    // 需要修復套件（降級回滾之後；REMOTE.md 第 4.5.2 節）：服務已恢復，但套件資料庫與實際的執行檔不一致。
+    // 在修復（重新安裝目前版本的套件）或下一次成功的升級之前一律顯示，不受 24 小時的限制；`pulse status`
+    // 以警告的結束代碼表示需要處理
+    if u.package_repair_needed {
+        let line = format!(
+            "需要修復套件：上一次回滾只換回了執行檔，請重新安裝目前版本的套件（{}；pulse upgrade status）",
+            codes::W_UPGRADE_ROLLED_BACK_DEGRADED
+        );
+        return Some(
+            Row::new("upgrade", "升級", Outcome::Warning, line.clone())
+                .summary(line)
+                .code(codes::W_UPGRADE_ROLLED_BACK_DEGRADED),
+        );
+    }
     let last = u.last.as_ref()?;
     let recent = sf::parse_ts(&last.at).is_some_and(|t| now - t <= chrono::TimeDelta::hours(24));
     let (result, line) = match last.state.as_str() {
@@ -1653,17 +1667,6 @@ fn upgrade_row(u: &crate::remote::upgrade::UpgradeView, now: DateTime<Utc>) -> O
             format!(
                 "回滾失敗，需要人工處理（{}）",
                 codes::E_UPGRADE_ROLLBACK_FAILED
-            ),
-        ),
-        // 降級回滾（REMOTE.md 第 4.5.2 節）：服務已恢復，但套件資料庫與實際的執行檔不一致——在修復
-        // （重新安裝目前版本的套件）或下一次升級之前一律顯示，`pulse status` 以警告的結束代碼表示需要處理
-        UPGRADE_STATE_ROLLED_BACK if u.package_repair_needed => (
-            Outcome::Warning,
-            format!(
-                "已回滾到 {}，但只換回執行檔：請重新安裝 Pulse {} 的套件（{}）",
-                last.from_version,
-                last.from_version,
-                codes::W_UPGRADE_ROLLED_BACK_DEGRADED
             ),
         ),
         _ if !recent => return None,
@@ -1697,11 +1700,7 @@ fn upgrade_row(u: &crate::remote::upgrade::UpgradeView, now: DateTime<Utc>) -> O
     let code = match result {
         Outcome::Error => Some(codes::E_UPGRADE_ROLLBACK_FAILED),
         Outcome::Warning if last.state == UPGRADE_STATE_ROLLED_BACK => {
-            Some(if u.package_repair_needed {
-                codes::W_UPGRADE_ROLLED_BACK_DEGRADED
-            } else {
-                codes::W_UPGRADE_ROLLED_BACK
-            })
+            Some(codes::W_UPGRADE_ROLLED_BACK)
         }
         _ => None,
     };
@@ -1862,5 +1861,53 @@ fn clock_row(
         )
         .code(code)
         .summary(format!("比 Kairos {direction} {amount}"))
+    }
+}
+
+#[cfg(test)]
+mod upgrade_row_tests {
+    use super::*;
+    use crate::remote::upgrade::{Finished, UpgradeView};
+
+    /// 「升級」列：需要修復套件（降級回滾之後，REMOTE.md 第 4.5.2 節）時一律是警告，不受 24 小時的限制、
+    /// 也不依賴最近一次的結果；一般的回滾超過 24 小時就不再顯示
+    #[test]
+    fn a_host_that_needs_a_package_repair_is_a_warning_until_it_is_repaired() {
+        let now = Utc::now();
+        let old = (now - chrono::TimeDelta::days(30)).to_rfc3339();
+        let last = |detail: &str| Finished {
+            upgrade_id: "9d3e7a10-4b2c-4f6e-8a1d-2c3b4a5f6e70".into(),
+            state: "rolled_back".into(),
+            code: Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED.into()),
+            detail: detail.into(),
+            from_version: "0.11.0".into(),
+            to_version: "0.11.1".into(),
+            at: old.clone(),
+        };
+        let mut v = UpgradeView {
+            method: "deb".into(),
+            readiness: "ready".into(),
+            last: Some(last(
+                "degraded:no_rollback_package,package_db_inconsistent; x",
+            )),
+            package_repair_needed: true,
+            ..Default::default()
+        };
+        let row = upgrade_row(&v, now).expect("需要修復套件時一律顯示");
+        assert_eq!(row.result, Outcome::Warning);
+        assert_eq!(row.code, Some(codes::W_UPGRADE_ROLLED_BACK_DEGRADED));
+        assert!(row.lines[0].contains("需要修復套件"), "{:?}", row.lines);
+        // 沒有任何升級紀錄（降級回滾不是經這個 Pulse 的狀態機：例如狀態檔被重建）也顯示
+        v.last = None;
+        assert_eq!(
+            upgrade_row(&v, now).map(|r| r.result),
+            Some(Outcome::Warning)
+        );
+        // 修復之後：30 天前的回滾不再顯示
+        v.package_repair_needed = false;
+        v.last = Some(last(
+            "degraded:no_rollback_package,package_db_inconsistent; x",
+        ));
+        assert!(upgrade_row(&v, now).is_none());
     }
 }

@@ -942,6 +942,8 @@ fn remote_setup(config: &AppConfig, cwd: Option<&Path>) -> Arc<remote::RemoteMgm
         redetect: Some(redetect),
         url_allowlist: upgrade.url_allowlist.clone(),
         external_ca: upgrade.external_ca.clone(),
+        own_binary_sha256: remote::upgrade::own_binary_sha256(),
+        pkg_db: remote::upgrade::helper::query_package_db,
     });
     // 外部 URL 的版本庫（REMOTE.md 第 4.1.2 節）：本機白名單不是空的才會接受 source: "url" 的提議，
     // 也才需要背景的下載工作。白名單與 CA 以 pulse.toml 的值為準（環境變數不能放寬）

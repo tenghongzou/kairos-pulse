@@ -72,6 +72,8 @@ fn mgmt_settings(dir: &Path, local: AppConfig) -> (Settings, Arc<RemoteMgmt>) {
         redetect: None,
         url_allowlist: Vec::new(),
         external_ca: String::new(),
+        own_binary_sha256: None,
+        pkg_db: |_| None,
     });
     let mgmt = RemoteMgmt::new(central, agent);
     let mut s = settings(60);
@@ -217,10 +219,11 @@ async fn hello_declares_config_and_upgrade_and_pending_drives_both_flows() {
     drop(tx);
     assert!(registered, "{err:?}");
     let (hello, got) = srv.await.unwrap();
-    // hello：install 與 features。external_url：白名單預設是空的 → none（只宣告有沒有，不含內容）
+    // hello：install 與 features。external_url：白名單預設是空的 → none（只宣告有沒有，不含內容）；
+    // rollback：tar 安裝只做執行檔層級的回滾（REMOTE.md 第 2.1 節）
     assert_eq!(
         hello["install"],
-        json!({"method": "tar", "upgrade": "ready", "config": "enabled", "external_url": "none"})
+        json!({"method": "tar", "upgrade": "ready", "config": "enabled", "external_url": "none", "rollback": "binary_only"})
     );
     let features: Vec<&str> = hello["features"]
         .as_array()
