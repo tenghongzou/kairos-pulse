@@ -18,6 +18,8 @@
 //!
 //! Linux 上 `pulse enroll` 以 root 執行、服務以 `pulse` 帳號執行：`identity/` 已存在時，新寫入的
 //! 檔案改為與 `identity/` 相同的擁有者（安裝時建立 `pulse:pulse 0700` 的目錄），服務才讀得到。
+//! 這個目錄由服務帳號擁有，所以 Unix 上的寫入全程相對於目錄的 fd（`openat`／`fchown`／`renameat`），
+//! 以 root 執行時 `identity/` 本身是符號連結就拒絕（安全稽核 F2，見 `write_atomic_at`）。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
@@ -213,38 +215,116 @@ pub fn write_atomic(path: &Path, content: &[u8], kind: FileKind) -> io::Result<(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(kind.mode());
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid 沒有前置條件，也不會失敗
+        let root = unsafe { libc::geteuid() } == 0;
+        write_atomic_at(dir, &name, content, kind.mode(), root)
+    }
+    #[cfg(not(unix))]
+    {
+        let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options.open(&tmp)?;
+            // 先收緊 ACL 再寫入內容：秘密不會有一刻落在繼承來的寬鬆 ACL 下
+            #[cfg(windows)]
+            if kind == FileKind::Secret {
+                win::restrict_to_admins(&tmp, false)?;
+            }
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, path)?;
+            sync_dir(path);
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        let mut file = options.open(&tmp)?;
-        #[cfg(unix)]
+        result
+    }
+}
+
+/// Unix 的原子寫入：全程相對於目錄的 fd（安全稽核 2026-11-14 F2）。
+///
+/// `pulse enroll` 以 root 執行，而 `identity/` 屬於服務帳號：以路徑做 `chown`／`rename` 時，服務帳號
+/// 可以在檢查與使用之間把暫存檔或目錄換成符號連結。這裡先開啟目錄取得 fd（`nofollow_dir` 為 true——
+/// 也就是以 root 執行——時加 `O_NOFOLLOW`：`identity/` 本身是符號連結就拒絕），暫存檔以
+/// `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` 新建，權限與擁有者以 `fchmod`／`fchown` 設在**已開啟的 fd**
+/// 上（擁有者取自目錄 fd 的 `fstat`），最後 `renameat`、fsync 目錄。沒有任何一步重新解析路徑
+#[cfg(unix)]
+fn write_atomic_at(
+    dir: &Path,
+    name: &str,
+    content: &[u8],
+    mode: u32,
+    nofollow_dir: bool,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+
+    let nul = |_| io::Error::new(io::ErrorKind::InvalidInput, "路徑含有 NUL");
+    let cdir = CString::new(dir.as_os_str().as_bytes()).map_err(nul)?;
+    let tmp = format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple());
+    let ctmp = CString::new(tmp).map_err(nul)?;
+    let cname = CString::new(name).map_err(nul)?;
+
+    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if nofollow_dir {
+        flags |= libc::O_NOFOLLOW;
+    }
+    // SAFETY: cdir 是有效的 C 字串；open 回傳新的 fd 或 -1
+    let raw = unsafe { libc::open(cdir.as_ptr(), flags) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw 是剛取得、尚未被任何人持有的有效 fd
+    let dir_file = unsafe { File::from_raw_fd(raw) };
+    let dir_meta = dir_file.metadata()?;
+    let dfd = dir_file.as_raw_fd();
+
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: dfd 有效、ctmp 是有效的 C 字串；第四個可變參數是新檔案的 mode
+    let raw = unsafe { libc::openat(dfd, ctmp.as_ptr(), flags, mode as libc::c_uint) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw 是剛取得的有效 fd
+    let mut file = unsafe { File::from_raw_fd(raw) };
+    let written = (|| -> io::Result<()> {
+        // umask 可能讓新檔案更嚴格：設回明確的權限
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        // root 寫入的檔案改為與所在目錄相同的擁有者（服務帳號才讀得到）。失敗只記 debug
+        let meta = file.metadata()?;
+        if (meta.uid() != dir_meta.uid() || meta.gid() != dir_meta.gid())
+            && let Err(e) =
+                std::os::unix::fs::fchown(&file, Some(dir_meta.uid()), Some(dir_meta.gid()))
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(fs::Permissions::from_mode(kind.mode()))?;
-            match_dir_owner(&tmp, dir);
-        }
-        // 先收緊 ACL 再寫入內容：秘密不會有一刻落在繼承來的寬鬆 ACL 下
-        #[cfg(windows)]
-        if kind == FileKind::Secret {
-            win::restrict_to_admins(&tmp, false)?;
+            log::debug!("無法變更 {}/{name} 暫存檔的擁有者：{e}", dir.display());
         }
         file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)?;
-        sync_dir(path);
-        Ok(())
+        file.sync_all()
     })();
+    drop(file);
+    let result = written.and_then(|()| {
+        // SAFETY: dfd、ctmp、cname 皆有效
+        if unsafe { libc::renameat(dfd, ctmp.as_ptr(), dfd, cname.as_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    });
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        // SAFETY: dfd、ctmp 有效
+        unsafe { libc::unlinkat(dfd, ctmp.as_ptr(), 0) };
+        return result;
     }
-    result
+    // 改名要等目錄寫入磁碟才算持久
+    let _ = dir_file.sync_all();
+    Ok(())
 }
 
 /// fsync 檔案所在的目錄（讓 rename 本身持久化）；Windows 沒有對應操作，略過
@@ -257,24 +337,6 @@ fn sync_dir(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
-}
-
-/// root 寫入的檔案改為與所在目錄相同的擁有者（服務帳號才讀得到）。失敗只記 debug
-#[cfg(unix)]
-fn match_dir_owner(path: &Path, dir: &Path) {
-    use std::os::unix::fs::MetadataExt as _;
-    let Ok(dir_meta) = fs::metadata(dir) else {
-        return;
-    };
-    let Ok(meta) = fs::metadata(path) else {
-        return;
-    };
-    if meta.uid() == dir_meta.uid() && meta.gid() == dir_meta.gid() {
-        return;
-    }
-    if let Err(e) = std::os::unix::fs::chown(path, Some(dir_meta.uid()), Some(dir_meta.gid())) {
-        log::debug!("無法變更 {} 的擁有者：{e}", path.display());
-    }
 }
 
 /// Pulse 端的註冊狀態（設計包 `enrollment-ux.md` §4.1；`enrollment.json` 的 `state`）
@@ -659,6 +721,37 @@ mod tests {
         assert!(paths.try_lock().unwrap().is_none(), "已被持有");
         drop(first);
         assert!(paths.try_lock().unwrap().is_some(), "釋放後可再取得");
+    }
+
+    /// 安全稽核 F2：以 root 寫入時（`nofollow_dir`）`identity/` 被換成符號連結就拒絕，不在連結指向的
+    /// 目錄留下任何檔案；一般的目錄照常寫入，暫存檔不殘留
+    #[cfg(unix)]
+    #[test]
+    fn privileged_write_refuses_a_symlinked_identity_dir() {
+        let base = temp_dir();
+        let outside = base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = base.join("identity");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = write_atomic_at(&link, "client.key", b"key", 0o600, true).unwrap_err();
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            "{err:?}"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "不應寫到連結目標");
+
+        // 真正的目錄：寫入成功、權限正確、沒有殘留的暫存檔；既有的同名符號連結被取代而不是被跟隨
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let victim = base.join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, real.join("client.key")).unwrap();
+        write_atomic_at(&real, "client.key", b"key", 0o600, true).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        let meta = fs::symlink_metadata(real.join("client.key")).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(fs::read(real.join("client.key")).unwrap(), b"key");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 1);
     }
 
     /// 安全稽核 N13：.lock 是符號連結時 try_lock 以 O_NOFOLLOW 開啟失敗，不跟隨連結在 root 身分下
