@@ -8,7 +8,7 @@
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback archive-tamper reboot
 #                       reboot-rollback signature tamper degraded tamper-resume crash-replace crash-rollback
-#                       unsafe-path late-resume key-revoked pkg-rollback-fails
+#                       unsafe-path late-resume key-revoked pkg-rollback-fails ansible
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
 #   LATE_AFTER=30       情境 late-resume：主機在健康確認的期限過後幾秒才開機
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
@@ -29,7 +29,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback archive-tamper reboot reboot-rollback signature tamper degraded tamper-resume crash-replace crash-rollback unsafe-path late-resume key-revoked pkg-rollback-fails}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback archive-tamper reboot reboot-rollback signature tamper degraded tamper-resume crash-replace crash-rollback unsafe-path late-resume key-revoked pkg-rollback-fails ansible}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -65,7 +65,7 @@ cleanup() {
     for c in $(docker ps -aq --filter "name=^$P-"); do docker rm -f "$c" >/dev/null 2>&1 || true; done
     docker network rm "$NET" >/dev/null 2>&1 || true
     if [ -n "${CLEAN_IMAGES:-}" ]; then
-        for i in debian12 ubuntu2404 rocky9; do docker rmi "$P-$i" >/dev/null 2>&1 || true; done
+        for i in debian12-managed rocky9-managed ansible debian12 ubuntu2404 rocky9; do docker rmi "$P-$i" >/dev/null 2>&1 || true; done
     fi
 }
 
@@ -1336,6 +1336,176 @@ scenario_pkg_rollback_fails() {
     done
 }
 
+# ax <命令…>：在 Ansible 控制端容器的 /work 執行
+ax() { docker exec -w /work "$P-ansible" "$@"; }
+
+# ansible_run <標籤> <playbook> <allowed_signers>：對兩台受管主機執行 playbook，輸出在 $LOGS/ansible-<標籤>.log，
+# stdout 為結束代碼。安裝字串在控制端只有擁有者可讀的變數檔裡（對應文件建議的 Ansible Vault），不放在命令列
+ansible_run() {
+    arc=0
+    ax env ANSIBLE_ROLES_PATH=/work/ansible/roles ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
+        ansible-playbook -i /work/inventory.ini "/work/ansible/$2" \
+        -e pulse_dist_dir=/work/dist -e "pulse_allowed_signers=/work/$3" -e @/work/vars.yml \
+        >"$LOGS/ansible-$1.log" 2>&1 || arc=$?
+    echo "$arc"
+}
+
+# 情境 o（安全稽核 N12；Pulse 的 INSTALL.md 第 A.4 節）：packaging/ansible 的 role，以**這一輪建置的真正套件**
+# 與測試環境的 Kairos，由控制端容器經 SSH（一般帳號 ops＋become）對兩台全新的受管主機（Debian 12：deb、
+# Rocky Linux 9：rpm；systemd 為 PID 1、有 sshd）執行：
+#   o1 發佈公鑰不對 → 在控制端驗證簽章的步驟停止，受管主機沒有任何改變
+#   o2 不用 become → 在檢查暫存目錄的步驟停止並移除目錄，沒有安裝
+#   o3 整個 role：驗證簽章 → 暫存目錄（root、0700，連線帳號進不去，用完移除）→ 核對雜湊 → apt／dnf 安裝 →
+#      pulse enroll → 啟動服務並連上 Kairos
+#   o4 再執行一次：不重新註冊，服務照常
+# SSH 金鑰臨時產生，結束時連同控制端與受管主機的容器一起刪除。不影響其他情境的三台主機
+scenario_ansible() {
+    need "$V0"
+    say "情境 o：Ansible role 經 SSH（一般帳號＋become）安裝真正的 Pulse $V0 套件、pulse enroll、連上 Kairos"
+    v0_re=$(printf '%s' "$V0" | sed 's/\./\\./g')
+    AW=$WORK/ansible
+    rm -rf "$AW"
+    mkdir -p "$AW"
+    chmod 700 "$AW"
+    for c in ansible adeb arpm; do docker rm -f "$P-$c" >/dev/null 2>&1 || true; done
+    docker build -q -t "$P-ansible" -f "$HERE/images/ansible.Dockerfile" "$HERE/images" >/dev/null
+    docker build -q -t "$P-debian12-managed" --build-arg BASE="$P-debian12" -f "$HERE/images/managed.Dockerfile" "$HERE/images" >/dev/null
+    docker build -q -t "$P-rocky9-managed" --build-arg BASE="$P-rocky9" -f "$HERE/images/managed.Dockerfile" "$HERE/images" >/dev/null
+    docker run -d --name "$P-ansible" --hostname ansible-control --network "$NET" "$P-ansible" >/dev/null
+    docker run -d --name "$P-adeb" --hostname pulse-adeb --privileged --cgroupns=private --network "$NET" "$P-debian12-managed" >/dev/null
+    docker run -d --name "$P-arpm" --hostname pulse-arpm --privileged --cgroupns=private --network "$NET" "$P-rocky9-managed" >/dev/null
+    # 臨時的 SSH 金鑰：公鑰放進受管主機 ops 的 authorized_keys，私鑰只複製到控制端容器
+    ssh-keygen -q -t ed25519 -N '' -C "kp systemd test ansible" -f "$AW/id_ed25519"
+    : >"$AW/known_hosts"
+    for oh in adeb arpm; do
+        wait_boot "$oh"
+        # Debian 的映像不帶主機金鑰（不把金鑰留在映像裡）：開機後產生
+        hx "$oh" sh -c 'ssh-keygen -A >/dev/null 2>&1; systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service'
+        docker cp "$AW/id_ed25519.pub" "$P-$oh:/home/ops/.ssh/authorized_keys"
+        hx "$oh" sh -c 'chown ops:ops /home/ops/.ssh/authorized_keys && chmod 600 /home/ops/.ssh/authorized_keys'
+        # 主機金鑰經 docker exec（可信的管道）取得，控制端照常檢查主機金鑰
+        printf '%s %s\n' "$P-$oh" "$(hx "$oh" cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >>"$AW/known_hosts"
+        # 非 root 帳號的 sudo（PAM 的帳號檢查）在測試映像裡可用（images/managed.Dockerfile 的說明）
+        check "o/$oh：受管主機上一般帳號的 sudo 可用" \
+            "$(hx "$oh" setpriv --reuid ops --regid ops --init-groups sudo -n id -u 2>&1 | tail -n 1)" '^0$'
+    done
+    SUBNET=$(docker network inspect "$NET" -f "{{(index .IPAM.Config 0).Subnet}}")
+    ois=$(kx enroll-token create --name "systest-ansible-$(date +%s)" --group default --max-uses 5 --approval auto \
+        --allow-cidr "$SUBNET" --json | jq -r .data.install_string)
+    case "$ois" in pulse-enroll:v1:*) ;; *) die "無法建立註冊 token：$ois" ;; esac
+    (umask 077 && jq -n --arg s "$ois" '{pulse_install_string: $s}' >"$AW/vars.yml")
+    {
+        echo "[pulse_agents]"
+        for oh in adeb arpm; do
+            echo "$oh ansible_host=$P-$oh ansible_user=ops ansible_ssh_private_key_file=/work/id_ed25519 ansible_ssh_common_args='-o UserKnownHostsFile=/work/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes'"
+        done
+    } >"$AW/inventory.ini"
+    # 沒有被信任的發佈公鑰（o1）
+    printf 'release@kairos-pulse namespaces="kairos-pulse-release" %s\n' "$(cut -d' ' -f1,2 "$KEYS/evil-a.pub")" >"$AW/wrong_signers"
+    cp "$KEYS/allowed_signers" "$AW/allowed_signers"
+    cp -r "$REPO/packaging/ansible" "$AW/ansible"
+    # 同一份 playbook，只把 become 關掉（o2）
+    sed 's/become: true/become: false/' "$AW/ansible/site-pulse.yml" >"$AW/ansible/site-nobecome.yml"
+    grep -q 'become: false' "$AW/ansible/site-nobecome.yml" || die "無法產生不用 become 的 playbook"
+    mkdir -p "$AW/dist"
+    cp "$DIST/$V0"/SHA256SUMS "$DIST/$V0"/SHA256SUMS.sig "$DIST/$V0"/pulse-* "$AW/dist/"
+    docker exec "$P-ansible" mkdir -p /work
+    docker cp "$AW/." "$P-ansible:/work/"
+    docker exec "$P-ansible" sh -c 'chown -R root:root /work && chmod 600 /work/id_ed25519 /work/vars.yml'
+    info "ansible：$(ax ansible --version 2>&1 | head -n 1)"
+    check "o：控制端經 SSH 以一般帳號連得上兩台受管主機" \
+        "$(ax ansible -i /work/inventory.ini pulse_agents -m ansible.builtin.command -a 'id -un' 2>&1 | grep -c '^ops$')" '^2$'
+    not_installed() {
+        for nh in adeb arpm; do
+            hx "$nh" sh -c 'ls -d /opt/pulse /var/tmp/pulse-install.* 2>/dev/null | wc -l'
+        done | tr '\n' ' '
+    }
+
+    # o1：發佈公鑰不對
+    rc=$(ansible_run o1-wrong-key site-pulse.yml wrong_signers)
+    check "o1：發佈公鑰不對時 playbook 失敗" "$rc" '^[1-9]'
+    check "o1：停在控制端驗證簽章的步驟" "$(grep -c '^fatal: \[adeb -> localhost\]' "$LOGS/ansible-o1-wrong-key.log")" '^1$'
+    check "o1：沒有執行之後的步驟" "$(grep -c -E '^TASK \[pulse : (建立只有 root|複製套件|安裝 deb|安裝 rpm|pulse enroll)' "$LOGS/ansible-o1-wrong-key.log")" '^0$'
+    check "o1：受管主機沒有安裝、沒有留下暫存目錄" "$(not_installed)" '^0 0 $'
+
+    # o2：不用 become
+    rc=$(ansible_run o2-no-become site-nobecome.yml allowed_signers)
+    check "o2：不用 become 時 playbook 失敗" "$rc" '^[1-9]'
+    check "o2：兩台都停在檢查暫存目錄的步驟" \
+        "$(grep -c '這個 role 必須以 root 執行（become: true）' "$LOGS/ansible-o2-no-become.log")" '^2$'
+    check "o2：沒有複製也沒有安裝套件" "$(grep -c -E '^TASK \[pulse : (複製套件|安裝 deb|安裝 rpm|pulse enroll)' "$LOGS/ansible-o2-no-become.log")" '^0$'
+    check "o2：受管主機沒有安裝、暫存目錄已移除" "$(not_installed)" '^0 0 $'
+
+    # o3：整個 role。執行期間在每台受管主機上等暫存目錄出現，記下它的擁有者與權限，並以連線帳號嘗試進入
+    for oh in adeb arpm; do
+        hx "$oh" sh -c '
+i=0
+while [ $i -lt 3000 ]; do
+    for d in /var/tmp/pulse-install.*; do
+        if [ -d "$d" ]; then
+            stat -c "%U:%G %a" "$d"
+            if setpriv --reuid ops --regid ops --init-groups ls "$d" >/dev/null 2>&1; then echo listable; else echo denied; fi
+            exit 0
+        fi
+    done
+    sleep 0.2
+    i=$((i + 1))
+done
+echo never' >"$AW/tmpdir-$oh.txt" 2>&1 &
+    done
+    rc=$(ansible_run o3-install site-pulse.yml allowed_signers)
+    wait
+    check "o3：playbook 成功" "$rc $(grep -c 'failed=0' "$LOGS/ansible-o3-install.log")" '^0 2$'
+    check "o3：安裝字串沒有出現在 Ansible 的輸出" "$(grep -c 'pulse-enroll:v1:' "$LOGS/ansible-o3-install.log")" '^0$'
+    for oh in adeb arpm; do
+        case "$oh" in adeb) om=deb ;; *) om=rpm ;; esac
+        check "o3/$oh：暫存目錄是 root 擁有的 0700 目錄，連線帳號進不去" "$(tr '\n' ' ' <"$AW/tmpdir-$oh.txt")" '^root:root 700 denied $'
+        check "o3/$oh：暫存目錄用完已移除" "$(hx "$oh" sh -c 'ls -d /var/tmp/pulse-install.* 2>/dev/null | wc -l')" '^0$'
+        # shellcheck disable=SC2016 # ${Version} 是 dpkg-query 的格式，不是 shell 變數
+        if [ "$om" = deb ]; then
+            opv=$(hx "$oh" dpkg-query -W -f='${Version} ${db:Status-Abbrev}' pulse 2>&1)
+        else
+            opv=$(hx "$oh" rpm -q --qf '%{VERSION}-%{RELEASE}' pulse 2>&1)
+        fi
+        check "o3/$oh：套件已安裝" "$opv" "^$v0_re-1( ii ?)?\$"
+        check "o3/$oh：/opt/pulse/pulse --version" "$(hx "$oh" /opt/pulse/pulse --version 2>&1 | awk '{print $2}')" "^$v0_re\$"
+        check "o3/$oh：pulse enroll 取得身分（服務帳號擁有、其他人讀不到）" \
+            "$(hx "$oh" stat -c '%U %a' /opt/pulse/identity/client.key 2>&1)" '^pulse [46]00$'
+        check "o3/$oh：服務已啟用並啟動" \
+            "$(hx "$oh" sh -c 'systemctl is-enabled pulse.service; systemctl is-active pulse.service' 2>&1 | tr '\n' ' ')" '^enabled active $'
+        oa=$(hx "$oh" cat /opt/pulse/agent.id | tr -d '\r\n ')
+        eval "AGENT_$oh=$oa"
+        check "o3/$oh：連上 Kairos（hello 的安裝方式與版本）" "$(wait_install "$oh" "^$om [a-z_]+ (true|false) $v0_re\$")" \
+            "^$om [a-z_]+ (true|false) $v0_re\$"
+        api GET "/api/v1/hosts/$oa" >/dev/null
+        check "o3/$oh：Kairos 的主機清單有這台、連線中" "$(body | jq -r '"\(.data.hostname) \(.data.online // .data.connected // .data.status)"' 2>&1)" \
+            "^pulse-$oh (true|online|connected)"
+    done
+
+    # o4：再執行一次
+    rc=$(ansible_run o4-again site-pulse.yml allowed_signers)
+    check "o4：再執行一次仍成功" "$rc $(grep -c 'failed=0' "$LOGS/ansible-o4-again.log")" '^0 2$'
+    for oh in adeb arpm; do
+        check "o4/$oh：沒有重新註冊（agent.id 不變）、服務照常" \
+            "$(hx "$oh" sh -c 'cat /opt/pulse/agent.id; echo; systemctl is-active pulse.service' 2>&1 | tr -d '\r' | tr '\n' ' ')" \
+            "^$(agent_of "$oh") active \$"
+    done
+    for oh in adeb arpm; do
+        {
+            echo "## journalctl -u pulse"
+            hx "$oh" journalctl -u pulse --no-pager -o short-iso 2>&1 | tail -n 60 || true
+            echo "## journalctl（ssh、sudo）"
+            hx "$oh" journalctl --no-pager -o short-iso 2>&1 | grep -E 'sshd|sudo' | tail -n 40 || true
+        } >"$LOGS/ansible-$oh.log"
+    done
+    # 臨時金鑰與安裝字串：連同控制端、受管主機的容器一起刪除
+    if [ -z "${KEEP:-}" ]; then
+        for c in ansible adeb arpm; do docker rm -f "$P-$c" >/dev/null 2>&1 || true; done
+    fi
+    rm -rf "$AW"
+    check "o：臨時的 SSH 金鑰與安裝字串已刪除" "$(ls -d "$AW" 2>/dev/null | wc -l)" '^0$'
+}
+
 # ---- 0. 發佈物 --------------------------------------------------------------
 if [ -z "${SKIP_BUILD:-}" ]; then
     say "建置發佈物（tests/systemd/build.sh）"
@@ -1541,6 +1711,7 @@ for s in $SCENARIOS; do
     late-resume) scenario_late_resume ;;
     key-revoked) scenario_key_revoked ;;
     pkg-rollback-fails) scenario_pkg_rollback_fails ;;
+    ansible) scenario_ansible ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac
