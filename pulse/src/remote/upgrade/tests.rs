@@ -902,6 +902,8 @@ fn external_url_needs_the_local_allowlist_and_the_same_verification() {
 // ---- 回滾檔的簽章資料（rollback_bundle；ADR-0003 階段 1、REMOTE.md 第 4.4.2 節） ----
 
 /// deb 主機（目前 0.9.1）收到升級到 0.9.2 的提議：以臨時金鑰簽署的兩次發佈
+/// （簽署用系統的 `ssh-keygen`，與 `testsign` 相同只在 unix 編譯）
+#[cfg(unix)]
 struct BundleFx {
     dir: PathBuf,
     key: testsign::TestKey,
@@ -913,6 +915,7 @@ struct BundleFx {
     offer: UpgradeOffer,
 }
 
+#[cfg(unix)]
 impl BundleFx {
     fn new(name: &str) -> Self {
         let dir = tmp(name);
@@ -1008,6 +1011,7 @@ impl BundleFx {
 
 /// 新 Kairos × 新 Pulse（ADR-0003 第 6.4 節）：第一次遠端升級的 deb 主機本機沒有目前版本的紀錄，以提議的
 /// `rollback_bundle` 驗證回滾檔——下載、暫存它的簽章資料、寫進 `request.json`（輔助程式會以 root 重新驗證）
+#[cfg(unix)]
 #[test]
 fn a_first_remote_upgrade_uses_the_rollback_bundle_from_the_offer() {
     let fx = BundleFx::new("bundle-first");
@@ -1098,11 +1102,13 @@ fn a_first_remote_upgrade_uses_the_rollback_bundle_from_the_offer() {
     let _ = std::fs::remove_dir_all(&fx.dir);
 }
 
+#[cfg(unix)]
 type OfferTweak = fn(&BundleFx, &mut UpgradeOffer, &testsign::TestKey);
 
 /// 來源的順序與資格（ADR-0003 第 5.4 節；INV-4、INV-5）：本機紀錄優先於 bundle；兩者都只是提示，都以
 /// 本機信任錨完整驗證；都不通過時**照常升級**、不下載回滾檔（Kairos 能做的只有附或不附，驗證失敗不會
 /// 讓升級失敗，也不會放寬條件）。新 Pulse × 舊 Kairos（沒有 bundle）與 0.11.0 以前相同
+#[cfg(unix)]
 #[test]
 fn rollback_bundle_and_local_record_are_hints_verified_with_the_local_trust_anchor() {
     let other = testsign::TestKey::generate();
@@ -1236,6 +1242,7 @@ fn rollback_bundle_and_local_record_are_hints_verified_with_the_local_trust_anch
 
 /// 0.11.0 以前的狀態檔（`Current` 沒有 `rollback_source`）在升級後照常讀得回來：有 `rollback_trusted`
 /// 而沒有來源＝本機紀錄
+#[cfg(unix)]
 #[test]
 fn state_files_written_before_the_rollback_bundle_still_load() {
     let fx = BundleFx::new("bundle-old-state");
