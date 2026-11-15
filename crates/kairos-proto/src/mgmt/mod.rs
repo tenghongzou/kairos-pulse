@@ -200,7 +200,7 @@ pub const INSTALL_EXTERNAL_URL_ALLOWLIST: &str = "allowlist";
 pub const INSTALL_EXTERNAL_URL_STATES: [&str; 2] =
     [INSTALL_EXTERNAL_URL_NONE, INSTALL_EXTERNAL_URL_ALLOWLIST];
 
-/// `install.rollback`（Pulse 0.11.0 之後的版本；ADR-0003 階段 2、REMOTE.md 第 2.1、4.4.2 節）：這台主機
+/// `install.rollback`（Pulse 0.12.0 起；ADR-0003 階段 2、REMOTE.md 第 2.1、4.4.2 節）：這台主機
 /// 目前的版本在 root 專屬的本機封存中有完整的套件（deb／rpm）——自動回滾可以經套件管理員裝回，不需要
 /// Kairos 的版本庫有這個版本
 pub const INSTALL_ROLLBACK_ARCHIVED: &str = "archived";
@@ -240,7 +240,7 @@ pub struct InstallInfo {
     /// 忽略這個欄位（「物件中的其他欄位忽略」是 0.9.0 就定下的規則），協定版本不變
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_url: Option<String>,
-    /// [`INSTALL_ROLLBACK_STATES`] 之一（Pulse 0.11.0 之後的版本）；沒有＝未知。較舊的 Kairos 忽略這個
+    /// [`INSTALL_ROLLBACK_STATES`] 之一（Pulse 0.12.0 起）；沒有＝未知。較舊的 Kairos 忽略這個
     /// 欄位，協定版本不變
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<String>,
@@ -916,7 +916,7 @@ pub struct UpgradeOffer {
     /// deb／rpm／msi 的主機才有：目前版本、同格式同平台的發佈檔（自動回滾用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_artifact: Option<ArtifactRef>,
-    /// `rollback_artifact` 所屬那次發佈的 `SHA256SUMS` 與簽章（0.11.0 之後的 Kairos；ADR-0003 階段 1、
+    /// `rollback_artifact` 所屬那次發佈的 `SHA256SUMS` 與簽章（0.12.0 起的 Kairos；ADR-0003 階段 1、
     /// REMOTE.md 第 2.4.1 節）。只有 `rollback_artifact` 存在時才允許。**只是提示**：Pulse 與升級輔助
     /// 程式各自以本機信任錨完整驗證後才使用回滾檔；較舊的 Pulse 忽略這個欄位
     #[serde(default, skip_serializing_if = "Option::is_none")]

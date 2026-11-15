@@ -984,7 +984,7 @@ pub const SCHEMA_V12: &str = r#"
 ALTER TABLE hosts ADD COLUMN install_external_url TEXT COLLATE "C";
 "#;
 
-/// schema v13（0.11.0 之後的版本）：hello 的 `install.rollback`（`crates/kairos-proto/REMOTE.md`
+/// schema v13（0.12.0 起）：hello 的 `install.rollback`（`crates/kairos-proto/REMOTE.md`
 /// 第 2.1 節；ADR-0003 階段 2）。與 SQLite 的 `store/sqlite/remote.rs` `SCHEMA_V13_INSTALL_ROLLBACK`
 /// 對等：`hosts` 新增一個可為 NULL 的欄位
 pub const SCHEMA_V13: &str = r#"

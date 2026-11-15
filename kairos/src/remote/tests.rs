@@ -116,7 +116,7 @@ impl Fx {
         self.connect_full(id, version, method, external_url, None);
     }
 
-    /// [`Fx::connect`]，hello 另帶 `install.rollback`（0.11.0 之後的 Pulse；ADR-0003 階段 2）
+    /// [`Fx::connect`]，hello 另帶 `install.rollback`（0.12.0 起的 Pulse；ADR-0003 階段 2）
     fn connect_rollback(&self, id: &str, version: &str, method: &str, rollback: Option<&str>) {
         self.connect_full(id, version, method, None, rollback);
     }

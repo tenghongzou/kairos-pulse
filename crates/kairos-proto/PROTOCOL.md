@@ -165,7 +165,7 @@ Pulse 解析 `error` 時容忍欄位缺漏，不會整則忽略：缺 `seq` 視�
 | `tags` | v2 起，選用。字串陣列，最多 32 個，每個 1～64 bytes，字元限制同 `hostname`，不得重複（區分大小寫） | `bad_request` |
 | `report_interval_ms` | v2 起，選用。client 的 report 間隔（毫秒），整數 1000～86400000，供伺服器判定回報延遲 | `bad_request` |
 | `os` | v2 起，選用。物件，欄位 `name`（作業系統名稱）、`version`（作業系統版本）、`kernel`（核心版本）、`arch`（CPU 架構）都可省略，各 1～128 bytes，字元限制同 `hostname`；其他欄位忽略 | `bad_request` |
-| `install` | v2 起，選用（0.9.0 起的 Pulse）。物件，欄位 `method`、`upgrade`、`config`、`external_url`（0.11.0 起的 Pulse）、`rollback`（0.11.0 之後的 Pulse）都可省略，各 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值不是錯誤，其他欄位忽略（見「遠端管理」） | `bad_request` |
+| `install` | v2 起，選用（0.9.0 起的 Pulse）。物件，欄位 `method`、`upgrade`、`config`、`external_url`（0.11.0 起的 Pulse）、`rollback`（0.12.0 起的 Pulse）都可省略，各 1～32 bytes 的小寫英文字母、數字或 `_`；不認得的值不是錯誤，其他欄位忽略（見「遠端管理」） | `bad_request` |
 
 Pulse 端的 `heartbeat.interval` 設定上限為 60 秒，與上表一致。v2 的選用欄位為 `null` 時視同省略。協商結果為 v1 時，`host_fingerprint` 到 `install` 的欄位一律忽略（型別錯誤也不檢查）。
 
@@ -392,7 +392,7 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 | `upgrade` | 遠端升級的本機狀態：`ready`（可接受）、`disabled`（`upgrade.enabled = false`）、`no_trust_anchor`（找不到或無法使用 `allowed_signers`）、`no_helper`（Linux 沒有啟用 `pulse-upgrade.path`）、`unsupported`（多實例、`unknown` 安裝方式、不支援的平台）、`unsafe_path`（Pulse 0.10.0 起：其他條件都就緒，但安裝路徑沒有通過升級輔助程式的路徑檢查；REMOTE.md 第 17.9.7 節。協定版本不變：不認得的值不是錯誤，0.9 的 Kairos 原樣保存並把這台主機分類為 `not_ready`）。不是 `ready` 時 Pulse **不宣告** `upgrade` |
 | `config` | 集中設定的本機狀態：`enabled`、`disabled` |
 | `external_url` | Pulse 0.11.0 起：本機是否允許從外部 URL 下載發佈檔——`none`（`upgrade.url_allowlist` 是空的或沒有有效的項目：`source: "url"` 的提議一律 `declined`）、`allowlist`（白名單至少有一個有效的前綴；**不回報白名單的內容**）。沒有這個欄位＝未知（較舊的 Pulse）。Kairos 據此在外部 URL 版本的資格預覽事先列出不允許的主機（REMOTE.md 第 2.1、4.7.2 節）。協定版本不變、不是新的 feature：0.9／0.10 的 Kairos 依「其他欄位忽略」略過它 |
-| `rollback` | Pulse 0.11.0 之後的版本：這台主機自動回滾的能力——`archived`（deb／rpm：目前版本的套件在 root 專屬的本機封存中，回滾經套件管理員裝回，不依賴 Kairos 的版本庫）、`binary_only`（只做執行檔層級的回滾：tar，或沒有本機封存的 deb／rpm）、`none`（`upgrade` 不是 `ready`）、`degraded`（上一次自動回滾是降級回滾，套件資料庫與實際的執行檔仍不一致）。沒有這個欄位＝未知（較舊的 Pulse）。Kairos 用於資格預覽的「無法自動回滾」與主機詳情（REMOTE.md 第 2.1、4.7.2、17.10.6 節）。協定版本不變、不是新的 feature：較舊的 Kairos 略過它 |
+| `rollback` | Pulse 0.12.0 起：這台主機自動回滾的能力——`archived`（deb／rpm：目前版本的套件在 root 專屬的本機封存中，回滾經套件管理員裝回，不依賴 Kairos 的版本庫）、`binary_only`（只做執行檔層級的回滾：tar，或沒有本機封存的 deb／rpm）、`none`（`upgrade` 不是 `ready`）、`degraded`（上一次自動回滾是降級回滾，套件資料庫與實際的執行檔仍不一致）。沒有這個欄位＝未知（較舊的 Pulse）。Kairos 用於資格預覽的「無法自動回滾」與主機詳情（REMOTE.md 第 2.1、4.7.2、17.10.6 節）。協定版本不變、不是新的 feature：較舊的 Kairos 略過它 |
 
 ### `pending`
 
@@ -449,7 +449,7 @@ feature `renew`、`deregister`（0.5.0 起；原為 ENROLL.md 第 13 節的草�
 |---|---|
 | `artifact` | `filename`（發佈檔名 `pulse-<版本>-<commit>-<os>-<arch>.<格式>`）、`size`（bytes，1～128 MiB）、`sha256`（64 個小寫十六進位）、`source`（`kairos`：以 `upgrade_chunk_get` 從這條連線下載；`url`：從 `url` 下載，0.10.0）、`url`（`source` 為 `url` 時，`https://` 開頭、≤ 2048 bytes） |
 | `rollback_artifact` | deb／rpm／msi 的主機才有：**目前版本**、同格式同平台的發佈檔（欄位同 `artifact`），自動回滾時使用；版本庫沒有時省略 |
-| `rollback_bundle` | 0.11.0 之後的 Kairos，選用：`rollback_artifact` 所屬那次發佈的簽章資料 `{"sha256sums":"…","signature":"…"}`（各 1 bytes 以上，上限同 `sha256sums`、`signature`）。只有 `rollback_artifact` 存在時才允許（否則 Pulse 以 `PLS-E8402` 拒絕這個提議）。只是提示：Pulse 與升級輔助程式各自以本機信任錨完整驗證後才使用回滾檔，驗證不過不讓升級失敗。較舊的 Pulse 忽略這個欄位（解析不拒絕不認得的欄位）。**不是新的 feature**，條件是整則訊息仍在單行上限內：Kairos 送出前以完整的訊息實際序列化，長度（含換行）加 1 KiB 的餘裕超過 65536 時省略 `rollback_bundle`，仍超過就不送出（回 `upgrade_unavailable`）——REMOTE.md 第 2.4.1 節 |
+| `rollback_bundle` | 0.12.0 起的 Kairos，選用：`rollback_artifact` 所屬那次發佈的簽章資料 `{"sha256sums":"…","signature":"…"}`（各 1 bytes 以上，上限同 `sha256sums`、`signature`）。只有 `rollback_artifact` 存在時才允許（否則 Pulse 以 `PLS-E8402` 拒絕這個提議）。只是提示：Pulse 與升級輔助程式各自以本機信任錨完整驗證後才使用回滾檔，驗證不過不讓升級失敗。較舊的 Pulse 忽略這個欄位（解析不拒絕不認得的欄位）。**不是新的 feature**，條件是整則訊息仍在單行上限內：Kairos 送出前以完整的訊息實際序列化，長度（含換行）加 1 KiB 的餘裕超過 65536 時省略 `rollback_bundle`，仍超過就不送出（回 `upgrade_unavailable`）——REMOTE.md 第 2.4.1 節 |
 | `manifest` | 發佈清單的檔名與內容：`{"filename":"pulse-0.9.1-…-release.json","content":"<JSON 字串>"}`（≤ 8 KiB）。0.9.0 以前的發佈沒有清單，此欄為 `null`，只能作為降版或回滾目標 |
 | `sha256sums` | 該次發佈的 `SHA256SUMS` 全文（≤ 16 KiB） |
 | `signature` | `SHA256SUMS.sig` 全文（≤ 4 KiB，`-----BEGIN SSH SIGNATURE-----` 格式） |
@@ -472,7 +472,7 @@ Pulse 收到提議後以**本機信任錨**驗證（REMOTE.md 第 4.2.2 節，`r
 | `state` | `accepted`（收到提議、開始下載）、`declined`（拒絕：本機停用、降版、不支援、空間不足、`min_upgrade_from` 不符）、`staged`（下載並驗證完成，等待時段）、`expired`（超過 `apply_window.not_after` 未開始）、`applying`（已交給輔助程式）、`succeeded`、`failed`（替換前或替換中失敗，沒有變更、或已復原）、`rolled_back`（健康確認失敗，已回到原版本）、`rollback_failed`（回滾也失敗，需要人工處理） |
 | `from_version`、`to_version` | 替換前與目標版本（0～64 bytes，字元限制同 `hostname`） |
 | `code` | Pulse 代碼或 `null` |
-| `detail` | 0～512 bytes，字元限制同 `hostname`（例如套件管理員的最後一行錯誤）。**降級回滾**（0.11.0 之後的 Pulse；REMOTE.md 第 2.4.3、4.5.2 節）：`state` 仍是 `rolled_back`，`code` 為 `PLS-W8418`〔暫定號〕，`detail` 以固定的前綴 `degraded:` 開頭、接著是以逗號分隔的原因代碼（小寫英文字母、數字、`_`；到第一個其他字元為止），之後才是人讀的說明。較舊的 Kairos 當成一般的 `rolled_back` |
+| `detail` | 0～512 bytes，字元限制同 `hostname`（例如套件管理員的最後一行錯誤）。**降級回滾**（0.12.0 起的 Pulse；REMOTE.md 第 2.4.3、4.5.2 節）：`state` 仍是 `rolled_back`，`code` 為 `PLS-W8418`〔暫定號〕，`detail` 以固定的前綴 `degraded:` 開頭、接著是以逗號分隔的原因代碼（小寫英文字母、數字、`_`；到第一個其他字元為止），之後才是人讀的說明。較舊的 Kairos 當成一般的 `rolled_back` |
 | `progress` | 選用：`{"bytes":1048576,"total":10485760}`；`accepted` 之後每完成 25% 送一次 |
 
 - `applying` 之後的狀態（`succeeded`、`rolled_back`、`rollback_failed`、`failed`）由**替換後的 Pulse**（新版，或回滾後的原版）在重新連線、`hello_ack` 之後送出：結果先寫在本機的狀態檔，收到 `ack` 才標為已回報（at-least-once）。Kairos 以 (`upgrade_id`, `state`) 去重，並以 hello 的 `agent_version` 交叉確認（收到 `succeeded` 而版本不是目標版本時記 `KRS-W8402`）。
@@ -622,7 +622,7 @@ K {"type":"hello_ack","seq":1,"proto":2,"offline_after_ms":75000,"features":["me
 
 ### 遠端管理：回滾檔的簽章資料與降級回滾
 
-0.11.0 之後的版本（向量中的版本字串 `0.11.1` 是暫填的）。Pulse 在 hello 的 `install.rollback` 宣告自動回滾的能力（第一則 `archived`：目前版本的套件在 root 專屬的本機封存中；第二則 `degraded`：上一次自動回滾是降級回滾，套件資料庫仍與執行檔不一致）；`hello_ack` 與沒有這個欄位時相同，較舊的 Kairos 忽略它。Kairos 的 `upgrade_offer` 在附 `rollback_artifact` 時另附 `rollback_bundle`（回滾檔所屬發佈的 `SHA256SUMS` 與簽章；向量中是 `kairos-proto/testdata/release` 的 0.9.1 發佈，簽章是真實的；目標版本的 `sha256sums`、`signature` 只是示意，不是真實的簽章），較舊的 Pulse 忽略這個欄位。最後一則是降級回滾的 `upgrade_status`：`state` 仍是 `rolled_back`，代碼不同（`PLS-W8418`，暫定），`detail` 以 `degraded:` 開頭、接著是以逗號分隔的原因：
+0.12.0 起（向量中的版本字串 `0.11.1` 只是範例，與實際的發佈版本無關）。Pulse 在 hello 的 `install.rollback` 宣告自動回滾的能力（第一則 `archived`：目前版本的套件在 root 專屬的本機封存中；第二則 `degraded`：上一次自動回滾是降級回滾，套件資料庫仍與執行檔不一致）；`hello_ack` 與沒有這個欄位時相同，較舊的 Kairos 忽略它。Kairos 的 `upgrade_offer` 在附 `rollback_artifact` 時另附 `rollback_bundle`（回滾檔所屬發佈的 `SHA256SUMS` 與簽章；向量中是 `kairos-proto/testdata/release` 的 0.9.1 發佈，簽章是真實的；目標版本的 `sha256sums`、`signature` 只是示意，不是真實的簽章），較舊的 Pulse 忽略這個欄位。最後一則是降級回滾的 `upgrade_status`：`state` 仍是 `rolled_back`，代碼不同（`PLS-W8418`，暫定），`detail` 以 `degraded:` 開頭、接著是以逗號分隔的原因：
 
 ```
 P {"type":"hello","seq":1,"proto":1,"proto_min":1,"proto_max":2,"features":["metrics","durable","renew","inventory","processes","config","upgrade"],"agent_id":"6f1c0e4a-1b2c-4d3e-9f00-112233445566","hostname":"web-01","agent_version":"0.11.1","heartbeat_interval_ms":15000,"ts":"2026-12-10T02:00:00.001Z","os":{"name":"Ubuntu","version":"24.04","arch":"x86_64"},"install":{"method":"deb","upgrade":"ready","config":"enabled","external_url":"none","rollback":"archived"}}

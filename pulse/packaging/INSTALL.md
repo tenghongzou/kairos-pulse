@@ -49,7 +49,7 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
   `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。**套件**的完整性以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。**腳本本身**不在這個保證之內（驗證的邏輯就在腳本裡）：Kairos 0.11 之後的版本，主控台顯示的指令帶著腳本的 SHA-256，下載後先比對、相符才以 root 執行——請複製整行，不要省略 `sha256sum -c` 那一段；這個雜湊來自主控台，所以對腳本的信任在主控台與 Kairos 的下載目錄上（`kairos/PKI.md` 第 17 節）。更早的 Kairos 顯示的指令沒有這一段，請自行比對（雜湊取自以發佈公鑰驗證過的 `SHA256SUMS`，如上方的範例）。根 CA 與發佈公鑰都要從另一個管道取得。
 - 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
 - **遠端管理（0.9.0）**：腳本另外把 `--allowed-signers` 的檔案複製到 `/etc/kairos-pulse/allowed_signers`（root 644），作為遠端升級的信任錨（已經放在那裡時不動）。不接受 Kairos 推送的升級：`--no-remote-upgrade`；不接受下發的設定：`--no-remote-config`（兩者都寫進 `/opt/pulse/pulse.toml`，見第 10.1 節）。
-- **回滾的種子（0.11.0 之後的版本）**：接受遠端升級時，腳本另外把剛安裝的套件交給 `pulse upgrade archive-current --seed` 驗證後封存到 root 專用的 `/var/lib/pulse-upgrade/archive/`，並以服務帳號把這次發佈的 `SHA256SUMS` 與簽章保存到 `/var/lib/pulse/upgrade/releases/<版本>/`——這台主機**第一次**遠端升級失敗時就能經套件管理員裝回現在這一版（套件資料庫保持一致），不依賴 Kairos 的版本庫有這個版本。做不到時只提醒，不影響安裝（屆時回滾只換回執行檔，見第 10.1 節「回滾與套件資料庫」）。
+- **回滾的種子（0.12.0 起）**：接受遠端升級時，腳本另外把剛安裝的套件交給 `pulse upgrade archive-current --seed` 驗證後封存到 root 專用的 `/var/lib/pulse-upgrade/archive/`，並以服務帳號把這次發佈的 `SHA256SUMS` 與簽章保存到 `/var/lib/pulse/upgrade/releases/<版本>/`——這台主機**第一次**遠端升級失敗時就能經套件管理員裝回現在這一版（套件資料庫保持一致），不依賴 Kairos 的版本庫有這個版本。做不到時只提醒，不影響安裝（屆時回滾只換回執行檔，見第 10.1 節「回滾與套件資料庫」）。
 - 安裝字串會短暫出現在 `pulse enroll` 的命令列（`ps` 看得到）；token 有使用次數與期限，部署完成後由管理者停用（`kairos enroll-token disable`）。
 
 ### A.2 deb／rpm 套件（Linux）
@@ -110,7 +110,7 @@ ansible-playbook -i inventory.ini packaging/ansible/site-pulse.yml --ask-vault-p
 
 - 變數：`pulse_dist_dir`、`pulse_allowed_signers`（必填）、`pulse_version`（目錄中有多個版本時）、`pulse_install_string`、`pulse_start`（預設 `true`）。`pulse enroll` 的工作以 `no_log` 執行，安裝字串不會出現在 Ansible 的輸出。
 - 結果：已註冊（0）、等待核准（7，申請編號在主控台「註冊申請」）、已註冊過（11）都視為成功。
-- **套件的暫存位置**（0.11.0 之後的 role）：套件複製到 `tempfile` 模組建立的 `/var/tmp/pulse-install.<隨機>/`（root 擁有、0700；role 會檢查），檔案為 `root:root 0600`，核對 SHA-256 與安裝都從這裡進行，結束時不論成敗都移除。0.11.0（含）以前的 role 直接放在 `/var/tmp/<套件檔名>`——任何本機帳號都能寫的目錄下、可以預測的路徑——請更新 role。role 必須以 root 執行（`become: true`）；不是的話在複製之前就停止。
+- **套件的暫存位置**（0.12.0 起的 role）：套件複製到 `tempfile` 模組建立的 `/var/tmp/pulse-install.<隨機>/`（root 擁有、0700；role 會檢查），檔案為 `root:root 0600`，核對 SHA-256 與安裝都從這裡進行，結束時不論成敗都移除。0.11.0（含）以前的 role 直接放在 `/var/tmp/<套件檔名>`——任何本機帳號都能寫的目錄下、可以預測的路徑——請更新 role。role 必須以 root 執行（`become: true`）；不是的話在複製之前就停止。
 - 0.11.0（含）以前的 role 在驗證簽章時多送了一個換行（`command` 的 `stdin_add_newline` 預設為 `true`），簽章驗證一律失敗、不會安裝任何東西；已修正。
 - 測試範圍：`ansible-playbook --syntax-check`、套件選擇邏輯（ansible-core 2.21），以及在 Debian 12（deb、`apt`）與 Rocky Linux 9（rpm、`dnf`）的容器內以 ansible-core 2.14 對本機各執行一次（測試用的空套件與臨時簽章金鑰：驗證簽章 → 暫存目錄 → 複製 → 核對 → 安裝 → 移除暫存目錄；非 root 執行時在檢查暫存目錄的步驟停止並移除目錄）。另以容器模擬「控制端經 SSH 連到受管主機」各執行一次（控制端 ansible-core 2.14；受管主機是帶 systemd 與 sshd 的 Debian 12 與 Rocky Linux 9 容器；連線帳號是一般使用者、以 `become`〔sudo〕取得 root；套件是只含一個 `pulse.service` 的測試套件）：整個 role 成功，暫存目錄為 root、0700 且用完移除，`pulse.service` 已啟用並啟動、handler 的重新啟動成功；role 執行期間以連線帳號反覆嘗試列出、讀取、寫入、搬走暫存目錄，全部被拒；不用 `become` 時在檢查暫存目錄的步驟停止並移除目錄。**還沒有實測的**：`pulse enroll`（測試套件不是真正的 Pulse，沒有接上 Kairos）、真正的 Pulse 套件經這個 role 安裝、實體主機或 VM；沒有 Windows（MSI）的支援。
 
@@ -750,7 +750,7 @@ external_ca = "/etc/kairos-pulse/repo-ca.pem"   # 省略時用作業系統信任
 
 下載的檔案與從 Kairos 下載的一樣，要通過本機信任錨（`allowed_signers`）的簽章與雜湊驗證才會安裝；不在白名單的 URL 一律拒絕（`pulse upgrade status`／主控台顯示 `url_not_allowed`，`PLS-W8411`）。不跟隨重新導向、不使用 HTTP 代理。
 
-**回滾與套件資料庫（0.11.0 之後的版本；`crates/kairos-proto/REMOTE.md` 第 4.4.2、4.5.2、17.10 節）**：
+**回滾與套件資料庫（0.12.0 起；`crates/kairos-proto/REMOTE.md` 第 4.4.2、4.5.2、17.10 節）**：
 
 - tar 安裝的回滾是換回 `pulse.prev`（與被替換的 unit），不需要其他東西。
 - deb／rpm 要讓 `dpkg -l`／`rpm -q` 在回滾之後仍然正確，必須經套件管理員把舊版的套件裝回去。輔助程式依序使用：**(1) 主機上的套件封存** `/var/lib/pulse-upgrade/archive/`（root 專用；每次遠端升級成功後自動封存剛裝好的那一份，只保留 1 份；一行安裝腳本在安裝時也會封存）、(2) Kairos 提議中附的回滾檔（Kairos 的版本庫有這台主機目前的版本時才有），兩者都要通過本機信任錨的簽章驗證，而且必須是目前安裝的那個版本、同一個 commit、套件中的執行檔與安裝的完全相同；都沒有或不合格時 (3) 只換回執行檔 `pulse.prev`。

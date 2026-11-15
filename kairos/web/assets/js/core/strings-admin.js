@@ -305,7 +305,7 @@ export const ADMIN_STRINGS = {
   'adm.audit.break.hash_mismatch': '內容被修改',
   'adm.audit.break.prev_mismatch': '前一筆被刪除或順序被改',
   'adm.audit.break.missing_hash': '缺少雜湊（繞過 Kairos 直接寫入的紀錄）',
-  // 這兩則的範圍在 0.11.0 之後擴大（鏈尾與錨點指標受 HMAC 保護）；設計包尚未收錄，文案為工程暫行
+  // 這兩則的範圍自 0.12.0 起擴大（鏈尾與錨點指標受 HMAC 保護）；設計包尚未收錄，文案為工程暫行
   'adm.audit.break.anchor_mismatch': '最前面幾筆被刪除，或保留期限清除的接點被改寫',
   'adm.audit.break.head_mismatch': '最後幾筆被刪除，或鏈尾指標被刪除或改寫',
   'adm.audit.break.missing_hmac': '啟用 HMAC 之後的紀錄缺少 HMAC',

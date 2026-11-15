@@ -27,7 +27,7 @@ pub(crate) const SCHEMA_V12_INSTALL_EXTERNAL_URL: &str = "
 ALTER TABLE hosts ADD COLUMN install_external_url TEXT;
 ";
 
-/// schema v13（0.11.0 之後的版本）：hello 的 `install.rollback`（REMOTE.md 第 2.1 節；ADR-0003 階段 2）——
+/// schema v13（0.12.0 起）：hello 的 `install.rollback`（REMOTE.md 第 2.1 節；ADR-0003 階段 2）——
 /// Pulse 宣告自動回滾的能力（`archived`／`binary_only`／`none`／`degraded`；NULL＝沒有宣告，較舊的 Pulse）。
 /// 只新增一個可為 NULL 的欄位，不修改既有的資料。PostgreSQL 的對等步驟在 `store/postgres/schema.rs` 的
 /// `SCHEMA_V13`

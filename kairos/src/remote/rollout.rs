@@ -775,7 +775,7 @@ pub fn classify(h: &UpgradeHost, ctx: &ReleaseContext, opts: &RolloutOptions) ->
             .by_version
             .get(&current.to_string())
             .is_some_and(|list| pick_artifact(list, method, &arch).is_some());
-        // 本機封存（Pulse 0.11.0 之後的版本宣告）優先於版本庫：封存的是這台主機實際安裝過的那一份套件，
+        // 本機封存（Pulse 0.12.0 起宣告）優先於版本庫：封存的是這台主機實際安裝過的那一份套件，
         // 回滾不依賴 Kairos。沒有宣告、宣告其他值或不認得的值：看版本庫有沒有主機目前的版本
         e.rollback = if h.install_rollback.as_deref() == Some(INSTALL_ROLLBACK_ARCHIVED) {
             RollbackVia::Archive

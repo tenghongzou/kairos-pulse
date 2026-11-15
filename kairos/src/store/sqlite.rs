@@ -757,7 +757,7 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 12,
         sql: remote::SCHEMA_V12_INSTALL_EXTERNAL_URL,
     },
-    // v13（0.11.0 之後的版本）：hosts.install_rollback（hello 的 install.rollback；ADR-0003 階段 2；SQL 在
+    // v13（0.12.0 起）：hosts.install_rollback（hello 的 install.rollback；ADR-0003 階段 2；SQL 在
     // store/sqlite/remote.rs）
     Migration {
         version: 13,
@@ -2947,7 +2947,7 @@ pub(crate) struct InventoryRow {
     /// 寫入時**不沿用舊值**：hello 帶 `install.upgrade`（0.9.0 起的 Pulse 一定帶）而沒有這個欄位時清成
     /// NULL——Pulse 降回舊版後是「未知」，不是上一次宣告的值
     pub(crate) install_external_url: Option<String>,
-    /// hello 的 `install.rollback`（0.11.0 之後的 Pulse；schema v13）。與 `install_external_url` 相同，寫入時
+    /// hello 的 `install.rollback`（0.12.0 起的 Pulse；schema v13）。與 `install_external_url` 相同，寫入時
     /// 不沿用舊值：hello 帶 `install.upgrade` 而沒有這個欄位時清成 NULL
     pub(crate) install_rollback: Option<String>,
     /// 除了 last_seen 與 last_report（隨每次 heartbeat、report 改變）之外所有欄位的雜湊

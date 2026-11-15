@@ -2066,7 +2066,7 @@ fn upgrade_from_v9_to_v11_adds_the_rollout_approval_columns() {
         .map(|c| c.unwrap())
         .collect();
     assert!(host_cols.iter().any(|c| c == "install_external_url"));
-    // v13（0.11.0 之後的版本）：hosts.install_rollback，同樣只新增一個可為 NULL 的欄位
+    // v13（0.12.0 起）：hosts.install_rollback，同樣只新增一個可為 NULL 的欄位
     assert!(host_cols.iter().any(|c| c == "install_rollback"));
     let r = conn.get_rollout("r-20261020-0001").unwrap().unwrap();
     assert_eq!(
