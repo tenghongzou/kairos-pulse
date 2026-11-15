@@ -498,6 +498,15 @@ pub fn valid_address(a: &str) -> bool {
         })
 }
 
+/// `EHLO` 的參數是否合理（安全稽核 E4）：主機名稱或位址字面值——只有 ASCII 英數字與 `.`、`-`、`:`、
+/// `[`、`]`，1～255 個字元。這個值原樣寫進 SMTP 命令列，不可含 CR、LF、空白或其他控制字元
+pub fn valid_helo(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
 /// 組成郵件（純文字、UTF-8、base64；緊急另加 `Importance: high`、`X-Priority: 1`，§2.1.1）
 pub fn compose_mail(from: &str, to: &[String], msg: &Message, now_ms: i64, id: &str) -> String {
     let date = chrono::DateTime::from_timestamp_millis(now_ms)
@@ -636,6 +645,12 @@ fn smtp_config(channel: &Channel) -> Result<SmtpConfig, String> {
     if security == "none" && password.is_some() {
         return Err("security = none 時不可設定密碼（密碼會以明文傳送）".into());
     }
+    // 安全稽核 E4：API 已在儲存時驗證；這裡再擋一次（較舊版本存下的管道、直接改資料庫的值）
+    let helo = get("helo").unwrap_or("kairos");
+    if !valid_helo(helo) {
+        return Err("helo 必須是主機名稱或位址（不可含空白、換行或其他符號）".into());
+    }
+    let helo = helo.to_string();
     Ok(SmtpConfig {
         host,
         port,
@@ -644,7 +659,7 @@ fn smtp_config(channel: &Channel) -> Result<SmtpConfig, String> {
         password,
         from,
         to,
-        helo: get("helo").unwrap_or("kairos").to_string(),
+        helo,
     })
 }
 
@@ -943,5 +958,56 @@ mod tests {
         for bad in ["a", "a@", "@b", "a b@c", "a@b\r\nBcc: x@y", "<a@b>"] {
             assert!(!valid_address(bad), "{bad}");
         }
+    }
+
+    /// 安全稽核 E4：helo 原樣寫進 `EHLO` 命令列——含換行、空白或其他符號的值在送出前就被拒絕
+    /// （含較舊版本存下、沒有經過 API 驗證的管道）
+    #[test]
+    fn helo_with_line_breaks_or_spaces_is_rejected_before_sending() {
+        for ok in ["kairos", "monitor.example.com", "[192.0.2.1]", "[IPv6:2001:db8::1]"] {
+            assert!(valid_helo(ok), "{ok}");
+        }
+        let long = "a".repeat(256);
+        for bad in [
+            "",
+            "a b",
+            "a\r\nMAIL FROM:<x@y>",
+            "a\nb",
+            "a\tb",
+            "a\0b",
+            "名稱",
+            "a;b",
+            long.as_str(),
+        ] {
+            assert!(!valid_helo(bad), "{bad:?}");
+        }
+        let channel = |helo: &str| Channel {
+            channel_id: "c1".into(),
+            name: "mail".into(),
+            kind: crate::alerts::model::ChannelKind::Email,
+            enabled: true,
+            config: serde_json::json!({
+                "host": "smtp.example.com", "from": "k@example.com",
+                "to": ["ops@example.com"], "helo": helo,
+            }),
+            secrets: serde_json::json!({}),
+            state: "ok".into(),
+            consecutive_failures: 0,
+            failed_since: None,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: None,
+            last_error: None,
+            created_at: 0,
+            created_by: String::new(),
+            updated_at: 0,
+            updated_by: String::new(),
+        };
+        assert_eq!(
+            smtp_config(&channel("mon.example.com")).unwrap().helo,
+            "mon.example.com"
+        );
+        assert!(smtp_config(&channel("x\r\nRSET")).is_err());
+        assert!(smtp_config(&channel("x y")).is_err());
     }
 }

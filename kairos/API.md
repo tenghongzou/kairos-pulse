@@ -1382,7 +1382,7 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 | `kind` | `config` | `secrets` |
 |---|---|---|
-| `email` | `host`、`port`、`security`（`starttls`／`tls`／`none`）、`username`、`from`、`to[]`（1～50）、`helo` | `password` |
+| `email` | `host`、`port`、`security`（`starttls`／`tls`／`none`）、`username`、`from`、`to[]`（1～50）、`helo`（`EHLO` 的名稱，預設 `kairos`；只接受英數字與 `.`、`-`、`:`、方括號，最多 255 個字元，否則 `400 channel_invalid`） | `password` |
 | `webhook` | `format`（`kairos`／`slack`／`teams`／`line`）、`method`（`POST`／`PUT`）、`allow_http`、`line_to` | `url`、`headers`（物件）、`hmac_secret`、`line_token` |
 | 共用 | `timeout_secs`（1～60，預設 10）、`timezone`、`show_ip`（`full`／`subnet`／`none`）、`min_severity`、`notify_ack`、`ca_file` | |
 
