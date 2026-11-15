@@ -225,6 +225,7 @@ if [ "$REMOTE_UPGRADE" = 1 ]; then
         install -d -o pulse -g pulse -m 755 /var/lib/pulse
         seed_as_pulse() {
             # $1 = 目的檔名；內容從 stdin
+            # shellcheck disable=SC2016 # $1、$2、$d 刻意留給以 pulse 身分執行的內層 sh 展開
             setpriv --reuid pulse --regid pulse --init-groups sh -c '
                 umask 027
                 d=/var/lib/pulse/upgrade/releases/$1
