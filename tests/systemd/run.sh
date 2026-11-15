@@ -541,7 +541,7 @@ scenario_degraded() {
         check "l/$th：archive-current 拒絕被改過的套件" \
             "$(hx "$th" sh -c "/opt/pulse/pulse upgrade archive-current --package /root/repair/bad/$rb --sums /root/repair/SHA256SUMS --signature /root/repair/SHA256SUMS.sig 2>&1; echo \" exit=\$?\"" | tr '\n' ' ')" \
             '沒有通過驗證.* exit=1'
-        check "l/$th：被拒絕後沒有封存" "$(archive_entry "$th")" '^$'
+        check "l/$th：被拒絕後沒有封存" "[$(archive_entry "$th")]" '^\[\]$'
         check "l/$th：archive-current 封存目前的版本" \
             "$(hx "$th" sh -c "/opt/pulse/pulse upgrade archive-current --package /root/repair/$rb --sums /root/repair/SHA256SUMS --signature /root/repair/SHA256SUMS.sig 2>&1; echo \" exit=\$?\"" | tr '\n' ' ')" \
             '已封存 .*generation 1.* exit=0'

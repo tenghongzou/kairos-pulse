@@ -376,7 +376,14 @@ struct Inner {
     download_log: LogThrottle,
     /// 外部 URL 下載失敗後，到這個時間才重試
     url_retry_at: Option<Instant>,
+    /// 這條連線的 hello 宣告的 `install.rollback`（[`UpgradeAgent::install_info`] 設定）
+    declared_rollback: Option<&'static str>,
+    /// 上一次檢查「宣告是否已過時」的時間（[`UpgradeAgent::rollback_changed`]）
+    rollback_checked_at: Option<Instant>,
 }
+
+/// 多久檢查一次 hello 宣告的 `install.rollback` 是否已過時
+const ROLLBACK_RECHECK: Duration = Duration::from_secs(30);
 
 /// 遠端升級的狀態（跨連線保留）
 pub struct UpgradeAgent {
@@ -494,6 +501,8 @@ impl UpgradeAgent {
                 state_error,
                 download_log: LogThrottle::new(DOWNLOAD_LOG_WINDOW),
                 url_retry_at: None,
+                declared_rollback: None,
+                rollback_checked_at: None,
             }),
         });
         {
@@ -578,7 +587,10 @@ impl UpgradeAgent {
     /// `external_url`（REMOTE.md 第 2.1 節）只宣告本機的 `upgrade.url_allowlist` 有沒有有效的項目
     /// （`none`／`allowlist`），**不回報白名單的內容**；不論 `upgrade` 的狀態都送
     pub fn install_info(&self) -> InstallInfo {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        let rollback = Self::rollback_of(&inner);
+        inner.declared_rollback = Some(rollback);
+        inner.rollback_checked_at = None;
         InstallInfo {
             method: Some(inner.env.detection.method.to_string()),
             upgrade: Some(inner.env.detection.upgrade.to_string()),
@@ -586,8 +598,37 @@ impl UpgradeAgent {
             external_url: Some(
                 kairos_proto::mgmt::url::allowlist_state(&inner.env.url_allowlist).to_string(),
             ),
-            rollback: Some(Self::rollback_of(&inner).to_string()),
+            rollback: Some(rollback.to_string()),
         }
+    }
+
+    /// 這條連線的 hello 宣告的 `install.rollback` 已經過時（REMOTE.md 第 17.10.6 節）：輔助程式在交易結束時
+    /// 才寫出提示，而健康確認要求 Pulse 先連上 Kairos——升級成功（封存）或降級回滾之後，這條連線的宣告還是
+    /// 交易結束前的值。回 `true` 時呼叫端結束這條連線，重新連線的 hello 帶新的值。沒有進行中的升級、
+    /// 沒有待送的狀態時才檢查，最多每 [`ROLLBACK_RECHECK`] 一次
+    pub fn rollback_changed(&self, now: Instant) -> bool {
+        let mut inner = self.lock();
+        let Some(declared) = inner.declared_rollback else {
+            return false;
+        };
+        if inner.file.current.is_some() || !inner.file.outbox.is_empty() {
+            return false;
+        }
+        if inner
+            .rollback_checked_at
+            .is_some_and(|t| now.saturating_duration_since(t) < ROLLBACK_RECHECK)
+        {
+            return false;
+        }
+        inner.rollback_checked_at = Some(now);
+        let current = Self::rollback_of(&inner);
+        if current != declared {
+            log::info!(
+                "自動回滾的能力改變（install.rollback {declared} → {current}）：重新連線以更新宣告"
+            );
+            return true;
+        }
+        false
     }
 
     /// hello 的 `install.rollback`（[`rollback_state`]；與其他 `install` 欄位相同，每次連線前重新計算）

@@ -69,7 +69,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 - **套件回滾失敗不再直接 `rollback_failed`**：套件管理員裝回舊版失敗（含交易部分完成）時，輔助程式先以 `pulse.prev` 緊急復原並確認舊版恢復；`pulse.prev` 也不能用才是 `rollback_failed`。輔助程式不自動修復套件資料庫。
 - **降級回滾**（`PLS-W8418`）：deb／rpm 因健康確認失敗而回滾、卻只換回了執行檔時，`upgrade_status` 的 `state` 仍是 `rolled_back`，代碼改為 `PLS-W8418`，`detail` 以 `degraded:<原因>,…` 開頭（`no_rollback_package`、`rollback_not_verified`、`rollback_commit_mismatch`、`rollback_binary_mismatch`、`rollback_archive_unusable`、`rollback_signer_revoked`、`rollback_copy_changed`、`package_rollback_failed`，以及一定會有的 `package_db_inconsistent`）。**行為變更**：先前這種情況回報的是一般的 `PLS-W8407`（`detail` 有 `binary_restored_package_db_shows_<版本>`）。`pulse upgrade status` 顯示「需要修復套件」與修復的命令，`pulse status` 的「升級」列為警告（結束代碼 8）直到重新安裝套件或下一次成功的升級。
 - **金鑰到期與撤銷分開處理**（REMOTE.md 第 4.2.3 節）：已綁定的回滾套件（含本機封存）在簽署金鑰只是到期（那一行還在信任錨中）時照常使用；金鑰被撤銷（那一行已刪除）或信任錨讀不到時，不再經套件管理員回滾，改換回 `pulse.prev`（降級回滾，`rollback_signer_revoked`）。
-- **hello 宣告自動回滾的能力**（`install.rollback`：`archived`／`binary_only`／`none`／`degraded`；REMOTE.md 第 2.1、17.10.6 節），`pulse upgrade status` 多一行「自動回滾」。
+- **hello 宣告自動回滾的能力**（`install.rollback`：`archived`／`binary_only`／`none`／`degraded`；REMOTE.md 第 2.1、17.10.6 節），`pulse upgrade status` 多一行「自動回滾」。宣告的值在連線期間改變（升級成功後的封存、降級回滾、`archive-current`）時，Pulse 會重新連線以更新宣告。
 
 ### 相容性
 

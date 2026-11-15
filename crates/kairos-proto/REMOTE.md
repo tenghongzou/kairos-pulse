@@ -1833,6 +1833,8 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 
 Pulse（服務帳號）每次連線前算出 hello 的 `install.rollback`（第 2.1 節）：`install.upgrade` 不是 `ready` → `none`；tar → `binary_only`；deb／rpm → 提示的 `binary_sha256` 等於**這個行程的執行檔**（啟動時算一次）才採用——`archived` 照用，`degraded` 另外要求現在的套件資料庫狀態（Pulse 自己以 `dpkg-query`／`rpm -q` 查，不需要 root）仍等於提示的 `pkg_db`；其他情況 `binary_only`。`pulse upgrade status` 的「自動回滾」與「需要修復套件」、`pulse status` 的「升級」列用同一個判斷。
 
+**宣告過時時重新連線**：提示在交易結束時才寫出，而健康確認要求 Pulse 先連上 Kairos，所以升級成功（封存）或降級回滾之後，那條連線的 hello 宣告的還是交易結束前的值。Pulse 在沒有進行中的升級、也沒有待送的 `upgrade_status` 時，最多每 30 秒重算一次；與這條連線宣告的值不同就結束連線並立刻重新連線（與套用需要重新連線的設定鍵相同的路徑），新的 hello 帶新的值。`archive-current`、手動重新安裝套件之後也一樣，不需要重新啟動服務。
+
 這個檔案在服務帳號可寫的目錄裡：**輔助程式只寫、從不依據它做決定**（延續 `degraded` 的標示是唯一讀它的地方，只影響下一份提示的 `state`）。被竄改的後果限於 Kairos 的顯示與資格預覽不正確（INV-6、INV-11）。
 
 #### 17.10.7 上限與清理

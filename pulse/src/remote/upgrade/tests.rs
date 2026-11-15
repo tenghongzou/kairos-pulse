@@ -1403,9 +1403,19 @@ fn hello_declares_the_rollback_capability_from_the_helper_hint() {
     let v = agent.view();
     assert_eq!(v.rollback.as_deref(), Some("archived"));
     assert!(!v.package_repair_needed);
-    // 與其他 install 欄位相同：每次連線前重新計算
+    // 宣告之後提示改變（輔助程式在交易結束時才寫出，那時 Pulse 已經連上）：要求重新連線以更新宣告；
+    // 檢查有間隔，重新連線（新的 hello）之後不再要求
+    let now = Instant::now();
+    assert!(!agent.rollback_changed(now), "沒有改變");
     write("degraded", OWN, Some("0.9.2 ii"));
+    assert!(
+        !agent.rollback_changed(now + Duration::from_secs(5)),
+        "30 秒內不重複檢查"
+    );
+    assert!(agent.rollback_changed(now + Duration::from_secs(31)));
+    // 與其他 install 欄位相同：每次連線前重新計算
     assert_eq!(agent.install_info().rollback.as_deref(), Some("degraded"));
+    assert!(!agent.rollback_changed(now + Duration::from_secs(120)));
     assert!(agent.view().package_repair_needed);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -73,7 +73,8 @@ impl MgmtConn {
 
     /// 需要結束這條連線、重建取樣與連線（套用了需要重新連線的鍵）
     pub fn wants_reconnect(&self) -> bool {
-        self.reconnect_now
+        // 另外：hello 宣告的 install.rollback 已經過時（升級成功後的封存、降級回滾；REMOTE.md 第 17.10.6 節）
+        self.reconnect_now || self.mgmt.upgrade.rollback_changed(Instant::now())
     }
 
     /// 下一次需要 [`MgmtConn::pop`] 的時間；沒有時 `None`
