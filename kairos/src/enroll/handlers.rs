@@ -156,20 +156,14 @@ impl Ctx<'_> {
     /// L4p：每個來源的輪詢與撤回。額度由輪詢的目標速率推得（動態 `poll_after_ms` 讓守規則的主機合計不超過
     /// `poll_target_per_ip_per_sec`），留 [`POLL_IP_HEADROOM`] 倍的餘裕；批次部署來源再乘以倍率
     fn check_l4p(&self) -> Result<(), EnrollError> {
-        let c = &self.svc.config.enroll;
-        let rate = f64::from(c.poll_target_per_ip_per_sec.max(1))
-            * POLL_IP_HEADROOM
-            * self.svc.multiplier(self.src);
+        let (capacity, rate) = l4p_bucket(
+            self.svc.config.enroll.poll_target_per_ip_per_sec,
+            self.svc.multiplier(self.src),
+        );
         self.svc
             .limits
             .l4p
-            .take(
-                &self.src,
-                rate * POLL_IP_BURST_SECS,
-                rate,
-                Instant::now(),
-                self.max_wait(),
-            )
+            .take(&self.src, capacity, rate, Instant::now(), self.max_wait())
             .map_err(|w| {
                 self.svc
                     .stats
@@ -273,6 +267,14 @@ impl Ctx<'_> {
         let dynamic = pending * 1000 / u64::from(c.poll_target_per_ip_per_sec.max(1));
         base.max(dynamic).min(max)
     }
+}
+
+/// L4p 的 (可連續的次數, 每秒補充)：`poll_target_per_ip_per_sec` × [`POLL_IP_HEADROOM`] × 批次部署來源的
+/// 倍率，可連續 [`POLL_IP_BURST_SECS`] 秒的量。設定驗證保證目標速率至少是 1；0 只會出現在測試中
+/// （只剩 1 次、不補充，結果不受測試機的速度影響）
+pub(super) fn l4p_bucket(target_per_sec: u32, multiplier: f64) -> (f64, f64) {
+    let rate = f64::from(target_per_sec) * POLL_IP_HEADROOM * multiplier;
+    (rate * POLL_IP_BURST_SECS, rate)
 }
 
 fn shutting_down() -> EnrollError {

@@ -132,7 +132,7 @@ impl Root {
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
         };
         let crl = params.signed_by(&self.issuer()).unwrap();
-        crate::pki::x509::pem_encode("X509 CRL", &crl.der().to_vec())
+        crate::pki::x509::pem_encode("X509 CRL", crl.der())
     }
 }
 
@@ -906,36 +906,26 @@ async fn poll_and_withdraw_are_rate_limited_per_source_and_honor_blocks() {
     let challenge_path = format!("/v1/enroll/requests/{missing}/withdraw/challenge");
     let withdraw_path = format!("/v1/enroll/requests/{missing}/withdraw");
 
-    // 每秒 1 × 4 次、可連續 120 次；L3（新連線）放寬，確定 429 來自 L4p
-    let env = Env::new("l4p", |c| {
-        c.enroll.poll_target_per_ip_per_sec = 1;
-        c.enroll.max_new_connections_per_ip_burst = 10_000;
-        c.enroll.max_new_connections_per_ip_per_sec = 1000;
-    })
-    .await;
-    let mut limited_at = None;
-    for i in 0..400 {
-        let (s, _, v) = env.call("GET", &poll_path, None, Some("x")).await;
-        if s == 429 {
-            assert_eq!(code(&v), "rate_limited", "{v}");
-            assert_eq!(v["error"]["scope"], "ip");
-            assert!(v["error"]["retry_after_ms"].as_u64().unwrap() >= 1000);
-            limited_at = Some(i);
-            break;
-        }
-        assert_eq!((s, code(&v)), (404, "request_not_found"), "{v}");
-    }
-    let at = limited_at.expect("輪詢沒有被每個來源的限速擋下");
-    assert!(at >= 120, "可連續 120 次：第 {at} 次就被擋");
-    // 撤回的兩個請求與輪詢共用額度
-    let mut limited = 0;
+    // 額度的算式：預設每秒 5 × 4 次、可連續 600 次；批次部署來源 × 10
+    assert_eq!(super::handlers::l4p_bucket(5, 1.0), (600.0, 20.0));
+    assert_eq!(super::handlers::l4p_bucket(5, 10.0), (6000.0, 200.0));
+    // 目標速率設為 0（只在測試中可能）：L4p 只剩 1 次、不補充，結果不受測試機的速度影響。
+    // 預設的 L3（新連線）遠高於這裡的請求數，429 只可能來自 L4p
+    let env = Env::new("l4p", |c| c.enroll.poll_target_per_ip_per_sec = 0).await;
+    let (s, _, v) = env.call("GET", &poll_path, None, Some("x")).await;
+    assert_eq!((s, code(&v)), (404, "request_not_found"), "{v}");
     for _ in 0..3 {
-        let (s, v) = env.post(&challenge_path, &json!({})).await;
-        limited += usize::from((s, code(&v)) == (429, "rate_limited"));
-        let (s, v) = env.post(&withdraw_path, &json!({})).await;
-        limited += usize::from((s, code(&v)) == (429, "rate_limited"));
+        let (s, headers, v) = env.call("GET", &poll_path, None, Some("x")).await;
+        assert_eq!((s, code(&v)), (429, "rate_limited"), "{v}");
+        assert_eq!(v["error"]["scope"], "ip");
+        assert!(v["error"]["retry_after_ms"].as_u64().unwrap() >= 1000);
+        assert!(headers.iter().any(|(k, _)| k == "retry-after"));
     }
-    assert!(limited >= 4, "撤回沒有計入每個來源的限速：{limited}");
+    // 撤回的兩個請求與輪詢共用額度
+    for path in [&challenge_path, &withdraw_path] {
+        let (s, v) = env.post(path, &json!({})).await;
+        assert_eq!((s, code(&v)), (429, "rate_limited"), "{path}：{v}");
+    }
     // 被限速的請求不計入 L7，也沒有佔用每筆申請（L10）的表
     assert_eq!(env.svc().limits.l7.sizes().2, 0);
     assert_eq!(env.svc().limits.l10.len(), 0);
