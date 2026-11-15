@@ -21,11 +21,14 @@
 #   <N>-test.7     同 test.2（崩潰），版本高於 test.6（crash-rollback 的目標；不需要 fault-injection）
 #   <N>-test.8     同 test.1，只改版本號，版本高於 test.7（late-resume 的目標：健康確認的期限已過才接續 →
 #                  升級成功；正式的建置，接續的輔助程式就是它）
+#   <N>-test.10    同 test.2（崩潰），版本高於 test.8，**以第二把發佈金鑰 release2 簽章**（金鑰輪替之後的發佈；
+#                  情境 key-revoked），另外它的 prerm／%preun 在主機上有 /etc/kp-systest-prerm-fail 時以 1 結束
+#                  （失敗的版本帶著壞掉的維護指令碼；情境 pkg-rollback-fails 的 rpm）
 #   evil-a         test.1 的檔案，SHA256SUMS 改以「沒有人信任」的金鑰 evil-a 簽章（Kairos 匯入時拒絕）
 #   <N>-test.9     test.1 的檔案改名為 test.9，以 evil-b 簽章：Kairos 的信任錨有 evil-b（匯入成功），
 #                  Pulse 的信任錨沒有（Pulse 拒絕，PLS-E8401）
-# 金鑰（<工作目錄>/keys/）：release（Pulse 與 Kairos 都信任）、evil-a、evil-b；allowed_signers（Pulse）、
-# kairos_allowed_signers（Kairos：release＋evil-b）。
+# 金鑰（<工作目錄>/keys/）：release、release2（Pulse 與 Kairos 都信任；release2 是輪替後的第二把）、evil-a、
+# evil-b；allowed_signers（Pulse：release＋release2）、kairos_allowed_signers（Kairos：release＋release2＋evil-b）。
 #
 # 版本號的修改只在 <工作目錄>/src/ 的暫時 clone 中提交，不影響這個 repo。已建置過的版本沿用
 # （REBUILD=1 全部重建）。docker volume：BUILD_VOLUME（預設 kp-systemd-test-build）與共用的 sync-cargo。
@@ -63,20 +66,25 @@ unset TEST_FEATURES
 KEYS=$WORK/keys
 mkdir -p "$KEYS"
 chmod 700 "$KEYS"
-for k in release evil-a evil-b; do
+for k in release release2 evil-a evil-b; do
     [ -f "$KEYS/$k" ] || ssh-keygen -q -t ed25519 -N '' -C "kp systemd test $k" -f "$KEYS/$k"
 done
 signer() {
     printf 'release@kairos-pulse namespaces="kairos-pulse-release" %s\n' "$(cut -d' ' -f1,2 "$KEYS/$1.pub")"
 }
-signer release >"$KEYS/allowed_signers"
 {
     signer release
+    signer release2
+} >"$KEYS/allowed_signers"
+{
+    signer release
+    signer release2
     signer evil-b
 } >"$KEYS/kairos_allowed_signers"
 
 # ---- 原始碼（暫時的 clone；版本號與崩潰的修改只提交在這裡）-----------------------
-# $1 名稱、$2 版本、$3 crash（1 = 無參數啟動時立刻結束）
+# $1 名稱、$2 版本、$3 crash（1 = 無參數啟動時立刻結束）、$4 prerm（1 = 維護指令碼 prerm／%preun 在主機上有
+# /etc/kp-systest-prerm-fail 時以 1 結束）
 prepare_src() {
     d=$WORK/src/$1
     rm -rf "$d"
@@ -102,26 +110,38 @@ prepare_src() {
         grep -q 'kp systemd test: crash build' "$d/pulse/src/main.rs" || die "無法加入崩潰的修改"
         changed=1
     fi
+    if [ "${4:-0}" = 1 ]; then
+        # 失敗的版本帶著壞掉的維護指令碼：主機上有記號檔時 prerm（deb）／%preun（rpm）以 1 結束。沒有記號檔時
+        # 與正式的指令碼相同
+        sed -i 's|^set -e$|&\nif [ -e /etc/kp-systest-prerm-fail ]; then\n    echo "kp systemd test: prerm fails on request" >\&2\n    exit 1\nfi|' \
+            "$d/pulse/packaging/pkg/preremove.sh"
+        grep -q 'kp systemd test: prerm fails' "$d/pulse/packaging/pkg/preremove.sh" || die "無法加入 prerm 的修改"
+        changed=1
+    fi
     if [ "$changed" = 1 ]; then
         git -C "$d" -c user.name="kp systemd test" -c user.email="kp-systemd-test@invalid" \
             commit -q -am "test: $1（只用於 tests/systemd，不提交到 repo）"
     fi
 }
 
-# $1 名稱（dist 目錄）、$2 版本、$3 crash、$4 測試用的 feature（TEST_FEATURES；空＝正式的建置）
+# $1 名稱（dist 目錄）、$2 版本、$3 crash、$4 測試用的 feature（TEST_FEATURES；空＝正式的建置）、
+# $5 簽章的金鑰（預設 release）、$6 prerm（見 prepare_src）
 build_pulse() {
     out=$WORK/dist/$1
     features=${4:-}
+    key=${5:-release}
+    variant="key=$key prerm=${6:-0}"
     if [ -f "$out/SHA256SUMS.sig" ] && [ -z "${REBUILD:-}" ] && [ "$(cat "$out/.base" 2>/dev/null)" = "$BASE" ] &&
-        [ "$(cat "$out/.features" 2>/dev/null)" = "$features" ]; then
+        [ "$(cat "$out/.features" 2>/dev/null)" = "$features" ] &&
+        [ "$(cat "$out/.variant" 2>/dev/null || echo "key=release prerm=0")" = "$variant" ]; then
         say "沿用 $out"
         return
     fi
-    say "建置 Pulse $2（$1${features:+；測試用建置：$features}）"
-    prepare_src "$1" "$2" "${3:-0}"
+    say "建置 Pulse $2（$1${features:+；測試用建置：$features}；$variant）"
+    prepare_src "$1" "$2" "${3:-0}" "${6:-0}"
     rm -rf "$out"
     mkdir -p "$out"
-    (cd "$WORK/src/$1" && DIST_DIR="$out" SIGNING_KEY="$KEYS/release" TEST_FEATURES="$features" \
+    (cd "$WORK/src/$1" && DIST_DIR="$out" SIGNING_KEY="$KEYS/$key" TEST_FEATURES="$features" \
         sh pulse/packaging/build-release.sh) >"$WORK/build-$1.log" 2>&1 ||
         die "建置失敗，見 $WORK/build-$1.log"
     # 打包腳本的檢查（packaging/check-release-binary.sh）確實執行過：正式的建置不含故障注入、測試用建置含
@@ -134,6 +154,7 @@ build_pulse() {
     fi
     echo "$BASE" >"$out/.base"
     echo "$features" >"$out/.features"
+    echo "$variant" >"$out/.variant"
     rm -rf "$WORK/src/$1"
 }
 
@@ -163,10 +184,11 @@ build_pulse "$NEXT_VERSION-test.5" "$NEXT_VERSION-test.5" 0 fault-injection
 build_pulse "$NEXT_VERSION-test.6" "$NEXT_VERSION-test.6" 0 fault-injection
 build_pulse "$NEXT_VERSION-test.7" "$NEXT_VERSION-test.7" 1
 build_pulse "$NEXT_VERSION-test.8" "$NEXT_VERSION-test.8"
+build_pulse "$NEXT_VERSION-test.10" "$NEXT_VERSION-test.10" 1 "" release2 1
 
 # 正式的建置與測試用建置都以「要安裝的檔案」再確認一次（取出 tar.gz 內的執行檔）
 for d in "$BASE_VERSION" "$NEXT_VERSION-test.1" "$NEXT_VERSION-test.2" "$NEXT_VERSION-test.3" "$NEXT_VERSION-test.4" \
-    "$NEXT_VERSION-test.7" "$NEXT_VERSION-test.8"; do
+    "$NEXT_VERSION-test.7" "$NEXT_VERSION-test.8" "$NEXT_VERSION-test.10"; do
     sh "$REPO/packaging/check-release-binary.sh" --archive "$WORK/dist/$d"/pulse-*-linux-x86_64.tar.gz >/dev/null ||
         die "$d 應該是正式的建置，卻含測試用 feature 的程式"
 done

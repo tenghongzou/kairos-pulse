@@ -8,7 +8,7 @@
 #   SKIP_BUILD=1        不執行 build.sh（沿用 WORK/dist）
 #   SCENARIOS="…"       要執行的情境（預設全部，依序）：rollback-first upgrade rollback archive-tamper reboot
 #                       reboot-rollback signature tamper degraded tamper-resume crash-replace crash-rollback
-#                       unsafe-path late-resume
+#                       unsafe-path late-resume key-revoked pkg-rollback-fails
 #                       （none：只建立環境，搭配 KEEP=1 手動檢查）
 #   LATE_AFTER=30       情境 late-resume：主機在健康確認的期限過後幾秒才開機
 #   REUSE=1             沿用 KEEP=1 留下的環境（不重建容器、不重新安裝），只執行 SCENARIOS
@@ -29,7 +29,7 @@ P=${PREFIX:-kp-systest}
 NET=$P-net
 API_PORT=${API_PORT:-19443}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-120}
-SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback archive-tamper reboot reboot-rollback signature tamper degraded tamper-resume crash-replace crash-rollback unsafe-path late-resume}
+SCENARIOS=${SCENARIOS:-rollback-first upgrade rollback archive-tamper reboot reboot-rollback signature tamper degraded tamper-resume crash-replace crash-rollback unsafe-path late-resume key-revoked pkg-rollback-fails}
 HOSTS="deb rpm tar"
 V0=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/pulse/Cargo.toml" | head -n 1)
 # 測試用的較新版本：<V0 的下一個 PATCH>-test.N（例如 0.10.0 → 0.10.1-test.1；與 build.sh 相同的算法），
@@ -46,6 +46,9 @@ T7=$TV-test.7
 # test.8：正常的版本，高於 test.7（情境 late-resume 的目標）
 T8=$TV-test.8
 T9=$TV-test.9
+# test.10：崩潰，以第二把發佈金鑰 release2 簽章，prerm／%preun 在有記號檔時失敗（情境 key-revoked、
+# pkg-rollback-fails）
+T10=$TV-test.10
 # 情境 late-resume：主機在健康確認的期限過後多久才開機（秒）
 LATE_AFTER=${LATE_AFTER:-30}
 # 輔助程式 root 專用的工作目錄
@@ -1084,6 +1087,255 @@ scenario_late_resume() {
     done
 }
 
+# cancel_paused <原因>：取消暫停中的推送（它的主機仍算在未結束的推送中，新的推送會 409 rollout_overlap）
+cancel_paused() {
+    api GET "/api/v1/rollouts?state=paused" >/dev/null
+    for rid in $(body | jq -r '.data[].id'); do
+        api POST "/api/v1/rollouts/$rid/cancel" "$(jq -n -c --arg r "systest：$1" '{reason: $r}')" >/dev/null
+    done
+}
+
+# anchor_line <金鑰> [<選項>]：allowed_signers 的一行（與 build.sh 的 signer 相同的 principal 與 namespace）
+anchor_line() {
+    printf 'release@kairos-pulse namespaces="kairos-pulse-release"%s %s\n' "${2:+,$2}" "$(cut -d' ' -f1,2 "$KEYS/$1.pub")"
+}
+
+# set_anchor <keep｜expired｜revoked>：三台主機的信任錨中，第一把發佈金鑰 release 的那一行——照常、valid-before
+# 已過（自然到期）、整行刪除（撤銷；REMOTE.md 第 4.2.3 節）。第二把 release2（輪替後的金鑰）一律保留。之後
+# 重新啟動 Pulse 並等它重新連線
+set_anchor() {
+    case "$1" in
+    keep)
+        anchor_line release
+        anchor_line release2
+        ;;
+    expired)
+        anchor_line release 'valid-before="20200101"'
+        anchor_line release2
+        ;;
+    revoked) anchor_line release2 ;;
+    *) die "set_anchor：未知的狀態 $1" ;;
+    esac >"$WORK/anchor.$1"
+    for ah in $HOSTS; do
+        docker cp "$WORK/anchor.$1" "$P-$ah:/tmp/anchor.new"
+        hx "$ah" install -o root -g root -m 644 /tmp/anchor.new /etc/kairos-pulse/allowed_signers
+        hx "$ah" rm -f /tmp/anchor.new
+        hx "$ah" systemctl restart pulse.service
+    done
+    sleep 5
+    for ah in $HOSTS; do
+        wait_install "$ah" "^$ah ready true " >/dev/null
+    done
+}
+
+# pkg_versions <主機>：套件資料庫中 pulse 的每一筆版本（rpm 的交易只完成一部分時會有兩筆），以空白分隔
+pkg_versions() {
+    # shellcheck disable=SC2016 # ${Version} 是 dpkg-query 的格式，不是 shell 變數
+    case "$1" in
+    deb) hx deb dpkg-query -W -f='${Version} ${db:Status-Abbrev}\n' pulse 2>&1 | tr '\n' ' ' ;;
+    rpm) hx rpm rpm -q --qf '%{VERSION}-%{RELEASE}\n' pulse 2>&1 | sort | tr '\n' ' ' ;;
+    esac
+}
+
+# repair_package <情境> <主機> <版本>：降級回滾之後的修復（REMOTE.md 第 4.5.2 節）——重新安裝目前版本的套件，
+# 再以 pulse upgrade archive-current 封存；之後 hello 應該宣告 archived、不再需要修復
+repair_package() {
+    rp=$(basename "$(ls "$DIST/$3"/pulse-*-linux-x86_64."$2")")
+    rp_re=$(printf '%s' "$3" | sed 's/-/[~-]/; s/\./\\./g')
+    hx "$2" rm -rf /root/repair
+    hx "$2" mkdir -p /root/repair
+    docker cp "$DIST/$3/$rp" "$P-$2:/root/repair/$rp"
+    docker cp "$DIST/$3/SHA256SUMS" "$P-$2:/root/repair/SHA256SUMS"
+    docker cp "$DIST/$3/SHA256SUMS.sig" "$P-$2:/root/repair/SHA256SUMS.sig"
+    if [ "$2" = deb ]; then
+        hx deb sh -c "DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold /root/repair/$rp" >"$LOGS/$1-$2-repair.log" 2>&1 ||
+            fail "$1/$2：修復時 dpkg -i 失敗（$LOGS/$1-$2-repair.log）"
+    else
+        hx rpm rpm -U --replacepkgs --oldpackage "/root/repair/$rp" >"$LOGS/$1-$2-repair.log" 2>&1 ||
+            fail "$1/$2：修復時 rpm -U 失敗（$LOGS/$1-$2-repair.log）"
+    fi
+    check "$1/$2：修復後套件資料庫只有 $3" "$(pkg_versions "$2")" "^$rp_re-1( ii)? \$"
+    check "$1/$2：修復後以 archive-current 封存目前的版本" \
+        "$(hx "$2" sh -c "/opt/pulse/pulse upgrade archive-current --package /root/repair/$rp --sums /root/repair/SHA256SUMS --signature /root/repair/SHA256SUMS.sig 2>&1; echo \" exit=\$?\"" | tr '\n' ' ')" \
+        ' exit=0'
+    hx "$2" systemctl restart pulse.service
+    check "$1/$2：修復後 hello 宣告 archived、不再需要修復" "$(wait_rollback_declared "$2" '^archived false$')" '^archived false$'
+    check "$1/$2：修復後仍宣告 upgrade" "$(wait_install "$2" "^$2 ready true ")" "^$2 ready true "
+    hx "$2" rm -rf /root/repair
+}
+
+# rollout_pause <推送>：「state pause_cause」
+rollout_pause() {
+    api GET "/api/v1/rollouts/$1" >/dev/null
+    body | jq -r '"\(.data.state) \(.data.pause_cause // "-")"'
+}
+
+# host_degraded <推送> <主機>：Kairos 的推送主機列記下的降級原因（以逗號分隔；沒有時是 -）
+host_degraded() {
+    api GET "/api/v1/rollouts/$1/hosts" >/dev/null
+    body | jq -r --arg a "$(agent_of "$2")" '.data[] | select(.agent_id == $a) | ((.degraded // []) | join(",")) as $d | if $d == "" then "-" else $d end'
+}
+
+# degraded_checks <情境> <推送> <主機> <舊版> <原因（grep -E，detail 中 degraded: 之後的開頭）>：降級回滾的共同
+# 檢查——結果與代碼、執行檔回到舊版而服務正常、沒有留下進行中的交易、本機與 Kairos 的顯示
+degraded_checks() {
+    dc_re=$(printf '%s' "$4" | sed 's/\./\\./g')
+    check "$1/$3：Kairos 的主機狀態是降級回滾" "$(host_state "$2" "$3")" "^rolled_back PLS-W8418 degraded:$5"
+    check "$1/$3：Kairos 的推送主機列記下降級的原因" "$(host_degraded "$2" "$3")" "^$5"
+    check "$1/$3：執行檔回到 $4" "$(hx "$3" /opt/pulse/pulse --version 2>&1 | awk '{print $2}')" "^$dc_re\$"
+    check "$1/$3：systemctl is-active pulse" "$(hx "$3" systemctl is-active pulse.service 2>&1)" '^active$'
+    check "$1/$3：交易紀錄的回滾方式是換回執行檔" \
+        "$(hx "$3" sh -c "cat $HW/*-*-*-*-*/state.json" 2>/dev/null | jq -r '"\(.step) \(.rollback_intent.via) \(.result.code)"' 2>&1)" \
+        '^done binary PLS-W8418$'
+    check "$1/$3：以 pulse.prev 換回" "$(helper_log "$3" | grep -c '以替換前保留的 /opt/pulse/pulse.prev 換回')" '^[1-9]'
+    check "$1/$3：進行中交易的指標已清除、request.json 已刪除" \
+        "$(hx "$3" sh -c "ls $HW/active.json /var/lib/pulse/upgrade/request.json 2>/dev/null | wc -l")" '^0$'
+    check "$1/$3：輔助程式留下的提示是 degraded" \
+        "$(hx "$3" cat /var/lib/pulse/upgrade/rollback.json 2>&1 | jq -r .state 2>&1)" '^degraded$'
+    check "$1/$3：pulse upgrade status 提示修復套件" \
+        "$(hx "$3" /opt/pulse/pulse upgrade status 2>&1 | grep -c '需要修復套件（PLS-W8418）')" '^1$'
+    check "$1/$3：pulse status 以非 0 的結束代碼表示需要處理" \
+        "$(hx "$3" sh -c '/opt/pulse/pulse status >/tmp/status.out 2>&1; echo $?; grep -c PLS-W8418 /tmp/status.out' | tr '\n' ' ')" '^[1-9][0-9]* [1-9]'
+    check "$1/$3：hello 宣告 degraded、Kairos 標示需要修復套件" \
+        "$(wait_rollback_declared "$3" '^degraded true$')" '^degraded true$'
+}
+
+# 情境 m（ADR-0003 的 INV-7、決策點 D1；REMOTE.md 第 4.2.3、17.10.4 節）：發佈金鑰輪替。新的版本 test.10 以
+# 第二把金鑰 release2 簽章；主機目前的版本（與它的封存、本機紀錄、版本庫裡的簽章）是第一把 release 簽的。
+#   m1（對照）：release 那一行還在、valid-before 已過（自然到期）→ deb／rpm 仍以本機封存經套件管理員回滾
+#   m2：release 那一行被刪除（撤銷）→ 封存（deb）與提議的 rollback_bundle（rpm：先移除封存與本機紀錄）都
+#       不得再使用 → 以 pulse.prev 回復＝降級回滾，推送自動暫停，主機標示需要修復套件
+# tar 沒有套件層級的回滾，兩次都是一般的回滾。結束時把信任錨改回、修復套件並重新封存
+scenario_key_revoked() {
+    need $T10
+    cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    cur_re=$(printf '%s' "$cur" | sed 's/\./\\./g')
+    say "情境 m：發佈金鑰輪替後 $cur → $T10（崩潰）——舊金鑰自然到期仍以封存回滾；舊金鑰撤銷 → 降級回滾"
+    cancel_paused "key-revoked 之前取消暫停的推送"
+    for kh in deb rpm; do
+        check "m/$kh：開始前有 $cur 的封存" "$(archive_entry "$kh")" "^$cur_re [a-z]+ [0-9]+\$"
+    done
+    # m1：自然到期
+    set_anchor expired
+    id=$(rollout "systest key expired" $T10)
+    wait_rollout "$id" 1200 || fail "m1：推送沒有在 1200 秒內結束"
+    collect_logs m1
+    for kh in $HOSTS; do
+        verify m1 "$id" "$kh" rolled_back PLS-W8407 "$cur"
+        not_degraded m1 "$id" "$kh"
+    done
+    for kh in deb rpm; do
+        check "m1/$kh：金鑰到期仍以本機封存回滾" "$(helper_log "$kh" | grep -c '回滾來源：本機封存的 ')" '^1$'
+        check "m1/$kh：經套件管理員回滾" "$(helper_log "$kh" | grep -o '經套件管理員裝回.*' | head -n 1)" \
+            "經套件管理員裝回 $cur（(dpkg -i|rpm -U --oldpackage --replacepkgs)）"
+        check "m1/$kh：封存沒有被標記為撤銷" \
+            "$(hx "$kh" cat $HW/archive/index.json 2>/dev/null | jq -r '.entries[0].revoked_at // "-"' 2>&1)" '^-$'
+    done
+    check "m1：推送沒有因為降級回滾而暫停" "$(rollout_pause "$id")" ' -$'
+    # m2：撤銷。rpm 先移除封存與本機紀錄：回滾檔只剩提議的 rollback_bundle 這個來源
+    cancel_paused "key-revoked：m1 結束"
+    hx rpm sh -c "rm -rf $HW/archive /var/lib/pulse/upgrade/releases /var/lib/pulse/upgrade/rollback.json"
+    set_anchor revoked
+    id=$(rollout "systest key revoked" $T10)
+    wait_rollout "$id" 1200 || fail "m2：推送沒有在 1200 秒內結束"
+    collect_logs m2
+    verify m2 "$id" tar rolled_back PLS-W8407 "$cur"
+    not_degraded m2 "$id" tar
+    degraded_checks m2 "$id" deb "$cur" 'rollback_signer_revoked,package_db_inconsistent'
+    degraded_checks m2 "$id" rpm "$cur" '(no_rollback_package|rollback_not_verified),package_db_inconsistent'
+    check "m2/deb：輔助程式不使用簽署金鑰已撤銷的封存" \
+        "$(helper_log deb | grep -c '本機封存不使用（rollback_signer_revoked）')" '^1$'
+    check "m2/deb：封存索引記下撤銷的時間" \
+        "$(hx deb cat $HW/archive/index.json 2>/dev/null | jq -r '.entries[0].revoked_at | type' 2>&1)" '^(string|number)$'
+    check "m2/rpm：Pulse 不採用以撤銷的金鑰簽的 rollback_bundle" \
+        "$(hx rpm sh -c 'cat /opt/pulse/logs/pulse-*.log | grep -c "本機紀錄與提議的 rollback_bundle 都沒有通過驗證" || true')" '^[1-9]'
+    t10_pkg=$(printf '%s' "$T10" | sed 's/-/[~-]/; s/\./\\./g')
+    for kh in deb rpm; do
+        check "m2/$kh：沒有執行套件管理員回滾" "$(helper_log "$kh" | grep -c '經套件管理員裝回')" '^0$'
+        check "m2/$kh：套件資料庫停在失敗的版本（不一致）" "$(pkg_version "$kh")" "^$t10_pkg-1\$"
+    done
+    check "m2：推送因為降級回滾而自動暫停" "$(rollout_pause "$id")" '^paused rollback_degraded$'
+    # 復原：信任錨改回、修復套件並重新封存（之後的情境照常）
+    cancel_paused "key-revoked 結束"
+    set_anchor keep
+    for kh in deb rpm; do
+        repair_package m2 "$kh" "$cur"
+    done
+}
+
+# arm_unpack_failure <主機>：輔助程式換上新版（紀錄到 replaced）之後，把套件中的一個檔案設為不可變更
+# （chattr +i）：之後套件管理員裝回舊版時在解包途中失敗（模擬解包中斷：磁碟或檔案系統在回滾當下出問題）。
+# 升級本身不受影響（那時還沒有設）
+arm_unpack_failure() {
+    deadline=$(($(date +%s) + 600))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if hx "$1" sh -c "grep -qs '\"step\": \"replaced\"' $HW/*/state.json" 2>/dev/null; then
+            if hx "$1" chattr +i /opt/pulse/README.md; then
+                info "$1：輔助程式在 replaced，已把 /opt/pulse/README.md 設為不可變更"
+                echo "$1" >>"$WORK/armed"
+                return 0
+            fi
+            return 1
+        fi
+        sleep 1
+    done
+    info "$1：等不到輔助程式的 replaced"
+    return 1
+}
+
+# 情境 n（ADR-0003 第 5.4 節最後一列；REMOTE.md 第 4.5.2 節「套件回滾失敗先以 pulse.prev 緊急復原」）：
+# 健康確認失敗後，套件管理員裝回舊版的命令本身失敗。
+#   deb：解包中斷——換上新版之後把套件中的一個檔案設為不可變更，dpkg -i 舊版在解包時失敗並還原自己做到一半的部分
+#   rpm：失敗的版本帶著壞掉的維護指令碼——test.10 的 %preun 在有記號檔時以 1 結束，rpm -U --oldpackage 已經
+#        裝上舊版的檔案、卻無法移除失敗的版本（交易只完成一部分，套件資料庫有兩筆）
+# 兩者都先以 pulse.prev 緊急復原（服務回到舊版）、回報降級回滾（package_rollback_failed）、推送自動暫停、主機
+# 標示需要修復套件；輔助程式不自動修復套件資料庫。tar 是一般的回滾
+scenario_pkg_rollback_fails() {
+    need $T10
+    cur=$(hx deb /opt/pulse/pulse --version | awk '{print $2}')
+    cur_re=$(printf '%s' "$cur" | sed 's/\./\\./g')
+    cur_pkg=$(printf '%s' "$cur" | sed 's/-/[~-]/; s/\./\\./g')
+    t10_pkg=$(printf '%s' "$T10" | sed 's/-/[~-]/; s/\./\\./g')
+    say "情境 n：套件管理員的回滾失敗 $cur → $T10（崩潰）——deb：解包中斷；rpm：失敗版本的 %preun 失敗 → 以 pulse.prev 緊急復原（降級回滾）"
+    cancel_paused "pkg-rollback-fails 之前取消暫停的推送"
+    for nh in deb rpm; do
+        check "n/$nh：開始前有 $cur 的封存" "$(archive_entry "$nh")" "^$cur_re [a-z]+ [0-9]+\$"
+    done
+    rm -f "$WORK/armed"
+    hx rpm touch /etc/kp-systest-prerm-fail
+    id=$(rollout "systest pkg rollback fails" $T10)
+    arm_unpack_failure deb || true
+    if grep -qx deb "$WORK/armed" 2>/dev/null; then
+        pass "n/deb：已在換上新版之後設下解包的障礙"
+    else
+        fail "n/deb：沒有在換上新版之後設下解包的障礙"
+    fi
+    wait_rollout "$id" 1200 || fail "n：推送沒有在 1200 秒內結束"
+    collect_logs n
+    verify n "$id" tar rolled_back PLS-W8407 "$cur"
+    not_degraded n "$id" tar
+    for nh in deb rpm; do
+        degraded_checks n "$id" "$nh" "$cur" 'package_rollback_failed,package_db_inconsistent'
+        check "n/$nh：先嘗試經套件管理員裝回" "$(helper_log "$nh" | grep -c "經套件管理員裝回 $cur")" '^1$'
+        check "n/$nh：套件回滾失敗後以 pulse.prev 緊急復原" \
+            "$(helper_log "$nh" | grep -c '套件回滾失敗（.*）：改以 pulse.prev 緊急復原（降級回滾）')" '^1$'
+    done
+    # deb：dpkg 還原了自己做到一半的部分，套件資料庫仍是失敗的版本
+    check "n/deb：套件資料庫停在失敗的版本" "$(pkg_versions deb)" "^$t10_pkg-1 "
+    # rpm：舊版已裝上、失敗的版本移除不了：兩筆都在
+    check "n/rpm：套件資料庫有舊版與失敗的版本兩筆（交易只完成一部分）" "$(pkg_versions rpm)" \
+        "^$cur_pkg-1 $t10_pkg-1 \$|^$t10_pkg-1 $cur_pkg-1 \$"
+    check "n/rpm：detail 照實附上套件資料庫的狀態" "$(host_state "$id" rpm)" 'package_db_shows_'
+    check "n：推送因為降級回滾而自動暫停" "$(rollout_pause "$id")" '^paused rollback_degraded$'
+    # 修復：移除障礙後重新安裝目前版本的套件
+    cancel_paused "pkg-rollback-fails 結束"
+    hx deb chattr -i /opt/pulse/README.md
+    hx rpm rm -f /etc/kp-systest-prerm-fail
+    for nh in deb rpm; do
+        repair_package n "$nh" "$cur"
+    done
+}
+
 # ---- 0. 發佈物 --------------------------------------------------------------
 if [ -z "${SKIP_BUILD:-}" ]; then
     say "建置發佈物（tests/systemd/build.sh）"
@@ -1225,8 +1477,8 @@ fi
 TOKEN=$(kx api-token create --name "systest-$(date +%s)" --role admin --json | jq -r .data.token)
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || die "無法建立 API token"
 
-say "匯入版本庫：$V0、$T1、$T2、$T3、$T4、$T5、$T6、$T7、$T8（臨時金鑰 release 簽章）"
-for v in "$V0" $T1 $T2 $T3 $T4 $T5 $T6 $T7 $T8; do
+say "匯入版本庫：$V0、$T1、$T2、$T3、$T4、$T5、$T6、$T7、$T8（臨時金鑰 release 簽章）、$T10（release2 簽章）"
+for v in "$V0" $T1 $T2 $T3 $T4 $T5 $T6 $T7 $T8 $T10; do
     [ -f "$DIST/$v/SHA256SUMS.sig" ] || continue
     s=$(import_release "$DIST/$v" "$v")
     case "$s" in
@@ -1287,6 +1539,8 @@ for s in $SCENARIOS; do
     crash-rollback) scenario_crash_rollback ;;
     unsafe-path) scenario_unsafe_path ;;
     late-resume) scenario_late_resume ;;
+    key-revoked) scenario_key_revoked ;;
+    pkg-rollback-fails) scenario_pkg_rollback_fails ;;
     none) ;;
     *) die "未知的情境 $s" ;;
     esac
