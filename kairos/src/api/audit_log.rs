@@ -304,8 +304,44 @@ fn integrity_of(c: &dyn Store) -> StoreResult<Value> {
         ..AuditFilter::default()
     };
     let (rows, _) = c.audit_query(&f, 1)?;
+    let last_details = rows
+        .first()
+        .and_then(|r| r.details.as_deref())
+        .and_then(|d| serde_json::from_str::<Value>(d).ok())
+        .unwrap_or(Value::Null);
+    // 重新錨定過（`kairos audit reanchor`；指標還在＝未驗證的區段還沒被保留期限清除）：時間、執行者、原因，
+    // 以及「稽核日誌完整性」告警因此保持開啟到什麼時候。`unverified` 取自最近一次驗證的結果
+    let reanchor = match c.audit_reanchor_point()? {
+        Some(p) => {
+            let f = AuditFilter {
+                action: Some(audit::ACTION_REANCHOR.into()),
+                before_id: Some(p.event_id + 1),
+                ..AuditFilter::default()
+            };
+            let (events, _) = c.audit_query(&f, 1)?;
+            let reason = events
+                .first()
+                .filter(|r| r.id == p.event_id)
+                .and_then(|r| r.details.as_deref())
+                .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                .and_then(|d| d.get("reason").cloned())
+                .unwrap_or(Value::Null);
+            let unverified = (last_details["reanchor"]["event_id"] == json!(p.event_id))
+                .then(|| last_details["reanchor"]["unverified"].clone());
+            Some(json!({
+                "event_id": p.event_id,
+                "at": http::ts_ms(p.at),
+                "by": p.by,
+                "reason": reason,
+                "unverified": unverified,
+                "alert_until": http::ts_ms(p.at + audit::REANCHOR_ALERT_HOLD_MS),
+            }))
+        }
+        None => None,
+    };
     Ok(json!({
         "hmac_since_id": since,
+        "reanchor": reanchor,
         "last_verify": rows.first().map(|r| {
             let d = r
                 .details
@@ -367,10 +403,80 @@ async fn verify(
                 "hmac": report.hmac.status,
                 "hmac_since_id": report.hmac.since_id,
                 "broken": report.broken.as_ref().map(|b| json!({"id": b.id, "reason": b.reason})),
+                "reanchor": report.reanchor.as_ref().map(|r| json!({"event_id": r.event_id, "unverified": r.unverified})),
             })),
         },
         now_ms,
     )
     .await;
     Ok(http::ok(now, report.json()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 列表的 meta.integrity.reanchor：重新錨定的時間、執行者、原因、未驗證的筆數與告警保持到什麼時候
+    #[test]
+    fn integrity_reports_the_reanchor_with_reason_and_unverified_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "kairos-audit-integrity-{}-{}",
+            std::process::id(),
+            crate::registry::next_conn_id()
+        ));
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let cfg = dir.join("kairos.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[storage]\ndata_dir = \"{}\"\n",
+                data.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let conn = crate::token_cli::open(Some(&cfg), true).unwrap().unwrap();
+        audit::ensure_key(&data).unwrap();
+        let ev = |action: &'static str, details: Value| audit::Audit {
+            actor: "ops（uid 1000）",
+            category: "audit",
+            action,
+            result: "ok",
+            details: Some(details),
+            ..Default::default()
+        };
+        for i in 0..3 {
+            conn.audit_append(i, &ev("audit.query", json!({}))).unwrap();
+        }
+        assert_eq!(integrity_of(&*conn).unwrap()["reanchor"], Value::Null);
+        let at = 1_800_000_000_000;
+        let id = conn
+            .audit_reanchor(at, &ev(audit::ACTION_REANCHOR, json!({"reason": "事故"})))
+            .unwrap()
+            .unwrap();
+        let v = integrity_of(&*conn).unwrap();
+        let r = &v["reanchor"];
+        assert_eq!(r["event_id"], id);
+        assert_eq!(r["by"], "ops（uid 1000）");
+        assert_eq!(r["reason"], "事故");
+        assert_eq!(r["at"], http::ts_ms(at));
+        assert_eq!(
+            r["alert_until"],
+            http::ts_ms(at + audit::REANCHOR_ALERT_HOLD_MS)
+        );
+        // 還沒有驗證過：筆數未知；驗證（寫入 audit.verify 的 details.reanchor）之後帶出
+        assert_eq!(r["unverified"], Value::Null);
+        let report = conn.audit_verify().unwrap();
+        conn.audit_append(
+            at + 1,
+            &ev(
+                "audit.verify",
+                json!({"reanchor": {"event_id": id, "unverified": report.reanchor.unwrap().unverified}}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(integrity_of(&*conn).unwrap()["reanchor"]["unverified"], 3);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

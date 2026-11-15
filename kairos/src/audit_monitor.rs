@@ -159,6 +159,16 @@ pub async fn self_verify(db: &Arc<EnrollDb>, bus: &EventBus) -> Option<bool> {
     Some(published_ok)
 }
 
+/// 「稽核日誌完整性」告警事件的標題：重新錨定後的保持期間（原因 `reanchored`）不是鏈又斷了，
+/// 標題直接寫出是重新錨定（`summary` 已含執行者、時間與未驗證的筆數）
+pub fn alert_title(reason: &str, summary: &str) -> String {
+    if reason == "reanchored" {
+        format!("稽核鏈已重新錨定（不是新的斷裂）：{summary}")
+    } else {
+        format!("稽核日誌完整性驗證失敗：{summary}")
+    }
+}
+
 /// 斷點原因的說明（CLI、日誌、告警事件共用）
 pub fn describe(reason: &str) -> &'static str {
     match reason {
@@ -382,6 +392,19 @@ mod tests {
         }
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_alert_title_tells_a_reanchor_from_a_break() {
+        assert!(
+            alert_title("hmac_mismatch", "第 42 筆：HMAC 不符")
+                .starts_with("稽核日誌完整性驗證失敗：")
+        );
+        let t = alert_title("reanchored", "稽核鏈已由 ops 在 … 重新錨定");
+        assert!(
+            t.starts_with("稽核鏈已重新錨定") && !t.contains("驗證失敗"),
+            "{t}"
+        );
     }
 
     #[test]

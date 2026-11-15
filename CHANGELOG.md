@@ -71,7 +71,8 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
   - 不帶 `--confirm` 時只顯示目前的驗證結果與將要做的事，不改任何東西；執行需要 `--reason <原因>` 與 `--confirm "重新錨定稽核鏈"`，以及資料目錄的 `audit-hmac.key`（沒有金鑰的人不能用它把被動過的鏈洗白）。鏈完整時不做任何事。
   - 寫入一筆 `audit.reanchor` 事件（執行者、原因、重新錨定前的驗證結果、舊的鏈尾與錨點指標），以 HMAC 簽章；之後的驗證從這一筆起算。**既有的紀錄一筆都不刪除、不修改**，在驗證結果中標示為「重新錨定之前、完整性未驗證」（`kairos audit verify` 的輸出與 API 的 `reanchor` 物件：`event_id`、`at`、`by`、`unverified`）。
   - 重新錨定不能被抹除：事件被刪除或修改、指標被改寫是新的斷點原因 `reanchor_mismatch`；指標被刪除時驗證回到原本的斷點。「稽核日誌完整性」告警（`sys.audit_integrity`，不可靜音）在重新錨定後保持開啟 24 小時（原因 `reanchored`），並記一行 ERROR `audit.reanchored`（隨日誌外送）；執行中的 Kairos 在 1 分鐘內察覺。
-  - SQLite 與 PostgreSQL 行為相同；**沒有 schema 變更**（指標在 `meta.audit_reanchor`）。主控台目前以原始字串顯示 `reanchor_mismatch`、`reanchored` 兩個原因（文案待補）。
+  - SQLite 與 PostgreSQL 行為相同；**沒有 schema 變更**（指標在 `meta.audit_reanchor`）。
+  - **主控台（S18 稽核日誌）只顯示狀態，沒有執行的入口**：重新錨定過時，「完整性」卡片多一則說明（時間、執行者、原因；「第 N 筆之前的 M 筆是重新錨定之前的紀錄，完整性未驗證」；24 小時內寫明「稽核日誌完整性」告警的原因是這次重新錨定、不是鏈又斷了），頁首與驗證結果寫出驗證從哪一筆起算，清單標出重新錨定的那一筆與它之前（未驗證）的列；驗證失敗時說明可以在 Kairos 主機上以 CLI 重新錨定。列表 API 的 `meta.integrity` 多 `reanchor`（`event_id`、`at`、`by`、`reason`、`unverified`、`alert_until`）。告警事件的標題在重新錨定的保持期間為「稽核鏈已重新錨定（不是新的斷裂）：…」。斷點原因 `reanchor_mismatch` 與擴大後的 `head_mismatch`、`anchor_mismatch` 有對應的文案（工程暫行，設計包尚未收錄）。
 
 ### 升級注意
 

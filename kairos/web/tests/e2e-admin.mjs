@@ -229,6 +229,60 @@ export function registerAdmin({ test, newPage, login, waitTitle, axe, shot, URL0
     assert.equal(last.type, 'chain');
     assert.ok(last.count >= 1 && /^[0-9a-f]{64}$/.test(last.last_hash));
     assert.equal(JSON.parse(lines[0]).type, 'event');
+    // 重新錨定（kairos audit reanchor）的呈現：以攔截的 API 回應模擬「已重新錨定」。主控台只顯示狀態，
+    // 沒有執行的入口；24 小時內寫明告警的原因是重新錨定；清單標出那一筆與它之前（未驗證）的列
+    await page.goto(`${URL0}/audit`);
+    await page.locator('tbody tr[data-key]').nth(3).waitFor();
+    const keys = await page.locator('tbody tr[data-key]').evaluateAll((rows) => rows.slice(0, 4).map((r) => Number(r.dataset.key)));
+    // 清單新到舊：第 3 列當成重新錨定的那一筆，第 4 列在它之前（未驗證），第 2 列在它之後
+    const [, afterId, , firstId] = keys;
+    const reanchorAt = new Date(Date.now() - 3600_000).toISOString();
+    const ra = { event_id: keys[2], at: reanchorAt, by: 'ops（uid 1000）', reason: '事故 2026-11：資料庫還原後重新錨定', unverified: 7, alert_until: new Date(Date.now() + 23 * 3600_000).toISOString() };
+    await page.route('**/api/v1/audit?*', async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      if (body.meta && body.meta.integrity) body.meta.integrity.reanchor = ra;
+      await route.fulfill({ response: res, json: body });
+    });
+    await page.route('**/api/v1/audit/verify', async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      body.data.reanchor = { event_id: ra.event_id, at: ra.at, by: ra.by, unverified: ra.unverified };
+      await route.fulfill({ response: res, json: body });
+    });
+    await page.goto(`${URL0}/audit`);
+    await page.locator('tbody tr[data-key]').first().waitFor();
+    const box = page.locator('#audit-reanchor');
+    await box.getByText(`第 ${ra.event_id} 筆之前的 ${ra.unverified} 筆是重新錨定之前的紀錄`, { exact: false }).waitFor();
+    await box.getByText('原因：事故 2026-11：資料庫還原後重新錨定').waitFor();
+    await box.getByText('由 ops（uid 1000） 在 Kairos 主機上執行', { exact: false }).waitFor();
+    await box.getByText('原因是這次重新錨定，不是稽核鏈又斷了', { exact: false }).waitFor();
+    await page.locator('.k-integrity-head', { hasText: `重新錨定（第 ${ra.event_id} 筆起）` }).waitFor();
+    // 清單：重新錨定那一筆與之前的列
+    await page.locator(`tbody tr[data-key="${ra.event_id}"]`).getByText('重新錨定', { exact: true }).waitFor();
+    await page.locator(`tbody tr[data-key="${firstId}"]`).getByText('未驗證', { exact: true }).waitFor();
+    assert.equal(await page.locator(`tbody tr[data-key="${afterId}"]`).getByText('未驗證', { exact: true }).count(), 0);
+    // 沒有執行重新錨定的入口
+    assert.equal(await page.getByRole('button', { name: /重新錨定稽核鏈|執行重新錨定/ }).count(), 0);
+    await page.getByRole('button', { name: '驗證完整性' }).click();
+    await page.getByText(`重新錨定：驗證從第 ${ra.event_id} 筆起算；之前的 ${ra.unverified} 筆完整性未驗證。`).waitFor();
+    await axe(page, '稽核日誌：已重新錨定');
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await axe(page, '稽核日誌：已重新錨定（深色）');
+    await page.emulateMedia({ colorScheme: 'light' });
+    // 斷裂時：說明可以在主機上重新錨定（主控台不提供）；重新錨定的紀錄被動過是獨立的原因
+    // （後註冊的攔截優先）
+    await page.route('**/api/v1/audit/verify', async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      body.data.ok = false;
+      body.data.broken = { id: ra.event_id, reason: 'reanchor_mismatch', product_code: 'KRS-E6201' };
+      await route.fulfill({ response: res, json: body });
+    });
+    await page.getByRole('button', { name: '驗證完整性' }).click();
+    await page.getByText('原因：重新錨定的紀錄被刪除或換掉，或它的指標被改寫').waitFor();
+    await page.getByText('主控台不提供這個操作', { exact: false }).waitFor();
+    await axe(page, '稽核日誌：重新錨定的紀錄不符');
     await ctx.close();
     // 維運者：只看得到自己的操作，沒有驗證與匯出
     const o = await newPage();
