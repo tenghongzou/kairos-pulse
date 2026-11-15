@@ -1619,6 +1619,8 @@ CLI：`kairos releases import <目錄> [--external <base_url>]`（讀取目錄�
 | 20 | `record_done` | `done`（含結果）；`result.json` 尚未寫出；指標還在 | `done`：不再做任何替換或回滾 | 寫出同一份結果、清理、刪除指標 |
 | 21 | `result_written` | `done`；`result.json` 已寫出；`request.json` 還在 | 同上 | 同上（結果相同） |
 | 22 | `request_removed` | `done`；`request.json` 已刪除；指標還在 | 不會被觸發；下一個請求到來時：指標指向 `done` 的交易 → 只清除指標（不覆寫 `result.json`），再照常處理新的請求 | 新的請求照常執行 |
+| 23 | `archive_staged`（deb／rpm；0.11.0 之後的版本） | 健康確認已通過；新版的套件已寫進 `archive/<發佈檔 SHA-256>/`，**封存索引還沒有它**；紀錄仍是 `replaced`（時間上在第 14 列之後、第 20 列之前；第 17.10.3 節） | `replaced`：同第 14 列，重新做健康確認（至少 120 秒）；通過後重新封存——同一個主鍵的目錄整個換掉，再提交索引 | `succeeded`；索引恰好提交一次（generation 加一），沒有殘留的暫存目錄。接續時不健康 → 回滾，這個版本不進索引（留下的目錄不在索引中，不是回滾目標，下一次提交時清除） |
+| 24 | `archive_committed`（deb／rpm；0.11.0 之後的版本） | 封存索引已提交（新版的條目、generation 已加一），舊的條目可能還沒清除；紀錄仍是 `replaced` | `replaced`：同上；通過後封存發現索引已經只有這一筆、套件完好 → 不再提交，只清除不在索引中的目錄 | `succeeded`；generation 不再增加。接續時不健康 → 回滾到舊版：索引留著新版的條目，但它的版本與 commit 不是之後執行的輔助程式自己的，不會被選用（第 17.10.4 節） |
 
 任何一列接續之後，`pulse.prev` 都是替換前的版本（或交易還沒動手、`pulse.prev` 沒被改過）。斷電時「改名尚未落盤」的情況等同於上一列（例如第 7 列的記錄遺失＝第 6 列），因為每一步都先 fsync 才進行下一步。
 
@@ -1755,6 +1757,126 @@ v1 由 0.9.0 的輔助程式寫入（0.10.0 開發期間的版本另加了欄位
 **故障注入只在測試用建置**的實測：`tests/systemd/build.sh` 建置的 8 個 Pulse 發佈中，6 個正式的建置（`<V0>`、test.1～test.4、test.7）在打包時通過「不含測試用 feature」的檢查，test.5、test.6（`TEST_FEATURES=fault-injection`）通過反向的檢查（`pulse 0.10.1-test.5 (76a42da) [fault-injection]`）；`TEST_FEATURES=fault-injection sh packaging/release.sh` 在刪除或建置任何東西之前以「測試用的 feature 不可用於正式發佈」結束。對同一份原始碼的 debug 建置：預設建置 `check-release-binary.sh` 回 0、`--features fault-injection` 的建置回 1（`--test-build` 相反）。**反向驗證**：在暫時的 clone 把 `pulse/Cargo.toml` 改成 `default = ["fault-injection"]`（模擬 feature 經由 `TEST_FEATURES` 以外的途徑被開啟）後照正式的方式執行 `pulse/packaging/build-release.sh`（沒有 `TEST_FEATURES`）：建置完成後以「含測試用 feature 的程式，中止打包」結束（結束代碼 1），輸出目錄沒有任何檔案。
 
 **沒有驗證的**：真正的斷電（頁面快取遺失）；系統層只實測 22 個當機點中的 2 個（其餘由單元測試涵蓋）；由 0.9.0 的輔助程式開始、0.10.0 接續的交易（v1 → v2）只有單元測試，沒有在實機上以真的 0.9.0 套件跑過；aarch64；GitHub 上的 CI（新增的步驟沒有在 GitHub 跑過）；發佈包的可重現性檢查（`packaging/check-reproducible.sh`）沒有重跑。
+
+### 17.10 root 的本機封存與回滾來源（0.11.0 之後的版本；ADR-0003 階段 1、2）
+
+第 4.4.2 節定義回滾來源的順序與資格；這一節是其中第 1 項（root 的本機封存）的檔案格式、寫入順序、損毀時的處理與上限，以及階段 1、2 的實作紀錄。程式：`pulse/src/remote/upgrade/helper/archive.rs`（封存）、`helper.rs`（`prepare` 的來源評估、`verify_rollback_hint`、`rollback`／`restore_and_confirm` 的降級、`archive_installed`、`archive_current`、`rollback_hint`）；紀錄的格式在 `kairos-proto` 的 `release::ReleaseRecord`（ADR-0003 第 7.1 節 Q3：Windows 的版本槽沿用同一種內容）。
+
+#### 17.10.1 檔案
+
+全部在 `/var/lib/pulse-upgrade/archive/`（root:root 0700；與交易的工作目錄同一個根目錄，服務帳號無法讀寫）：
+
+| 路徑 | 內容 |
+|---|---|
+| `index.json`（0600） | **提交紀錄**：`schema`（`pulse.upgrade-archive/v1`）、`checksum`（與交易紀錄相同的算法）、`generation`（每次提交加一）、`updated_at`、`entries`（`ReleaseRecord` 的陣列；保留 1 份）。**只有索引中的條目是回滾目標** |
+| `<發佈檔 SHA-256>/`（0700） | 一份封存：`package`（套件本身）、`SHA256SUMS`、`SHA256SUMS.sig`、發佈清單（OTA 才有）、`record.json`（條目的複本，只是快取，不作為依據） |
+| `.staging-<…>/` | 封存到一半的暫存目錄（下一次提交時清除） |
+
+條目（`kairos-pulse.release-record/v1`）：`artifact_sha256`（**主鍵**：套件整包的 SHA-256）、`version`、`commit`、`artifact`（發佈時的檔名）、`binary_sha256`（套件中 `/opt/pulse/pulse` 的 SHA-256）、`source`（`ota`：遠端升級成功後封存；`seed`：一行安裝腳本在安裝時封存；`install`：本機管理者以 `pulse upgrade archive-current` 封存）、`policy`（驗證當時的信任政策：簽署金鑰的指紋、principal、那一行的 `valid-after`／`valid-before`、信任錨檔案的 SHA-256、驗證時間）、`revoked_at`（選用封存時偵測到簽署金鑰已撤銷的時間）、`generation`（提交它的那一次）、`archived_at`。
+
+#### 17.10.2 什麼時候封存
+
+- **遠端升級成功**（deb／rpm）：健康確認通過之後、記下 `done` 之前，把工作目錄裡驗證過的發佈檔（雜湊等於交易紀錄的 `artifact.sha256`）連同 `SHA256SUMS`、簽章、清單封存。條件：目前安裝的執行檔的雜湊等於交易紀錄的 `new_binary_sha256`。**沒有通過健康確認的版本不封存**（INV-10）：回滾的那一版從來不會進索引。tar 不封存（回滾是 `pulse.prev`）。由 v1 轉換的交易（沒有雜湊）不封存。
+- **安裝時的種子**：`pulse-install.sh` 安裝套件後執行 `pulse upgrade archive-current --seed …`（第 17.10.5 節）。
+- **本機管理者**：`pulse upgrade archive-current …`（手動安裝套件的主機、封存損毀之後補上）。
+
+封存失敗（空間不足、目錄不安全、寫入錯誤）**不影響升級的結果**：輔助程式記 `WARN`，之後的回滾往下一個來源退。
+
+#### 17.10.3 寫入順序與當機點
+
+1. 檢查大小（1 bytes～發佈檔的大小上限）與可用空間（套件大小加 16 MiB；`statvfs` 取不到時不檢查）。
+2. 在 `.staging-<主鍵>/` 寫好 `package`（複製後以主鍵核對雜湊）、簽章資料、`record.json`，每個檔案都是「寫暫存檔 → fsync → 改名 → fsync 目錄」；fsync 暫存目錄後改名為 `<主鍵>/`（同名的舊目錄整個換掉），fsync `archive/`。**checkpoint `archive_staged`**（第 17.9.4 節第 23 列）：索引還沒有它，不是回滾目標。
+3. 寫入新的 `index.json`（generation 加一，條目只留這一筆；耐久寫入）。**這一次原子寫入就是提交**。**checkpoint `archive_committed`**（第 24 列）。
+4. 清除 `archive/` 中不在索引裡的目錄（被取代的條目、暫存目錄；只處理名稱是 64 個十六進位字元或 `.staging-` 開頭的目錄，其他項目不動）。
+
+重做：索引已經只有這一筆、封存的套件完好時不再提交（generation 不變），只做第 4 步。OTA 的封存在交易紀錄仍是 `replaced` 時進行，所以途中中斷時接續的是第 17.9.4 節第 14 列（重新確認健康），通過後重做封存；接續時不健康就回滾，索引可能留著新版的條目——它的版本與 commit 不是之後執行的輔助程式自己的，第 17.10.4 節的資格擋下它，下一次成功的升級取代它。
+
+**交易期間不清除回滾目標**：交易使用的回滾套件在替換前已經從封存複製到那筆交易的工作目錄（`rollback.pkg`，雜湊記在交易紀錄），之後的接續與回滾只用那一份；所以第 4 步清除舊條目不影響任何進行中的交易。
+
+#### 17.10.4 選用、損毀與缺失
+
+輔助程式在 `prepare`（替換之前）評估（第 4.4.2 節第 1 項）：
+
+| 情況 | 處理（交易紀錄的 `rollback_declined`，降級回滾時寫進 `detail`） |
+|---|---|
+| 沒有 `archive/`、沒有 `index.json`，或索引中沒有「輔助程式自己的版本與 commit」的條目 | 沒有封存：不記原因，評估下一個來源 |
+| `archive/` 不安全（不是目錄、符號連結、擁有者不是 root、群組或其他人可寫）；`index.json` 讀不到（含符號連結、硬連結）、不是合法的內容、`checksum` 不符、schema 不認得、條目不合規定 | `rollback_archive_unusable`，評估下一個來源 |
+| 條目的 `binary_sha256` 不等於目前安裝的執行檔 | `rollback_binary_mismatch` |
+| 條目的目錄不見、不安全，或 `package` 不見、不是一般檔案、整包雜湊不等於主鍵 | `rollback_archive_unusable` |
+| 簽署金鑰已不在信任錨中 | `rollback_signer_revoked`；索引記下 `revoked_at`（generation 不變） |
+| 全部符合 | 複製到工作目錄的 `rollback.pkg`、核對雜湊，交易紀錄的 `rollback.source = "archive"` |
+
+輔助程式不修復損毀的封存，也不因為封存損毀而讓升級失敗；下一次成功的升級（或 `archive-current`）會以新的索引與條目取代它。**不重新驗證簽章的有效期間**：封存時已完整驗證，之後只看金鑰是否仍列在信任錨（第 4.2.3 節）。
+
+#### 17.10.5 `pulse upgrade archive-current` 與安裝時的種子
+
+`pulse upgrade archive-current --package <套件> --sums <SHA256SUMS> --signature <SHA256SUMS.sig> [--seed]`（需要 root；deb／rpm）：把**目前安裝的版本**的套件封存起來。資格與遠端升級的回滾來源相同——會以 root 重跑維護指令碼的套件層級回滾一律需要官方簽章（INV-3、INV-8）：
+
+1. `SHA256SUMS` 以本機信任錨完整驗證，套件（檔名必須是發佈時的檔名）列在其中、雜湊相符、平台與格式相符；
+2. 版本與 commit 是這個執行檔自己的；
+3. 套件中的 `/opt/pulse/pulse` 與目前安裝的執行檔位元組相同（套件先複製到 `archive/` 下 root 專用的暫存目錄，之後的檢查與封存都用那一份）；
+4. 套件資料庫查得到 `pulse`，deb 的狀態必須是已安裝（`ii`）。
+
+有進行中的遠端升級（`active.json`）時拒絕。成功後寫出提示（第 17.10.6 節）。結束代碼：0 已封存（或已是目前的版本）、1 無法封存、10 需要 root。
+
+`pulse-install.sh`（deb／rpm）在安裝套件、放好信任錨之後：(1) 以服務帳號把這次發佈的 `SHA256SUMS`、簽章寫到 `/var/lib/pulse/upgrade/releases/<版本>/`（本機紀錄，只是提示）；(2) 執行 `archive-current --seed`。兩者失敗都只提醒、不影響安裝。直接 `apt install ./x.deb`／`dnf install ./x.rpm` 的主機沒有種子：第一次遠端升級的回滾靠提議的 `rollback_bundle`（版本庫有目前的版本時），或事後執行 `archive-current`。
+
+#### 17.10.6 給 Pulse 的提示（`rollback.json`）與 `install.rollback`
+
+輔助程式（root）在每筆交易結束時、以及 `archive-current` 成功後，相對請求目錄的 fd 原子地寫出 `/var/lib/pulse/upgrade/rollback.json`（deb／rpm；0644）：`schema`（`pulse.upgrade-rollback/v1`）、`state`、`binary_sha256`（當時 `/opt/pulse/pulse` 的 SHA-256）、`pkg_db`（當時套件資料庫的狀態，與交易紀錄的 `pkg_db_*` 相同的查詢）、`updated_at`。
+
+| `state` | 條件（依序） |
+|---|---|
+| `degraded` | 剛結束的交易是降級回滾；或先前的提示是 `degraded`，而執行檔與套件資料庫都與當時相同 |
+| `archived` | 封存索引可用，有條目的 `binary_sha256` 等於目前安裝的執行檔，封存的套件完好 |
+| `binary_only` | 其他 |
+
+Pulse（服務帳號）每次連線前算出 hello 的 `install.rollback`（第 2.1 節）：`install.upgrade` 不是 `ready` → `none`；tar → `binary_only`；deb／rpm → 提示的 `binary_sha256` 等於**這個行程的執行檔**（啟動時算一次）才採用——`archived` 照用，`degraded` 另外要求現在的套件資料庫狀態（Pulse 自己以 `dpkg-query`／`rpm -q` 查，不需要 root）仍等於提示的 `pkg_db`；其他情況 `binary_only`。`pulse upgrade status` 的「自動回滾」與「需要修復套件」、`pulse status` 的「升級」列用同一個判斷。
+
+這個檔案在服務帳號可寫的目錄裡：**輔助程式只寫、從不依據它做決定**（延續 `degraded` 的標示是唯一讀它的地方，只影響下一份提示的 `state`）。被竄改的後果限於 Kairos 的顯示與資格預覽不正確（INV-6、INV-11）。
+
+#### 17.10.7 上限與清理
+
+- 份數：索引只保留 1 筆（目前安裝的版本），每次提交時清除其餘的目錄；磁碟用量的上限是一個套件（≤ 發佈檔的大小上限）加簽章資料，另加提交當下暫存目錄的一份。
+- 空間：封存前要求可用空間 ≥ 套件大小＋16 MiB；不足就不封存（`WARN`，`insufficient_space`）。
+- 交易的工作目錄清理（第 17.9.8 節）只處理 UUID 名稱的目錄，不會動 `archive/`；套件移除（purge）時與 `/var/lib/pulse-upgrade` 一起刪除。
+
+#### 17.10.8 降級回滾在交易紀錄中的表示
+
+- `rollback`（綁定欄位）多了 `source`（`archive`／`hint`；不屬於綁定的雜湊）；`rollback_declined`：沒有採用套件層級來源的原因；`policy`：驗證發佈檔當時的信任政策（封存時寫進條目）。
+- `rollback_intent` 多了 `degraded`：降級回滾的原因。寫入意圖時就決定（沒有回滾套件、簽署金鑰已撤銷）；套件回滾失敗時，輔助程式**先把意圖改寫為 `via: binary` 與原因並寫入紀錄，再換回 `pulse.prev`**——之後中斷的話，接續時直接換回執行檔，不再執行套件管理員。這一次改寫沒有另外的 checkpoint：在它之前中斷，接續時重做套件管理員（可重複執行），失敗就再走同一條路。
+- 這些欄位由兩個版本的輔助程式讀寫（替換後接續的是新版）：缺少的欄位取預設值；0.11.0 以前的輔助程式開始、新版接續的交易沒有 `source` 與 `policy`，回滾當下的撤銷檢查照常（紀錄有簽署者指紋），成功後封存的條目只有簽署者指紋。
+
+#### 17.10.9 實作與驗證
+
+**與 ADR-0003 字面不同之處**：
+
+| ADR-0003 | 實作 | 理由 |
+|---|---|---|
+| 第 5.4 節：降級回滾只列「套件管理員命令失敗」與撤銷 | deb／rpm **只要是以 `pulse.prev` 回滾**（含本來就沒有合格的回滾套件）都回報為降級回滾 | 結果相同（套件資料庫與執行檔不一致）；第 8.1 節「不再把只換回執行檔誤報為完整的回滾」。影響：勾選「允許無法自動回滾」的推送在第一台失敗時會暫停 |
+| 第 6.3 節規則 3：主機標為明確的原因 | 主機 `failed`（`reason: offer_too_large`）並暫停推送 | `failed` 可以重試；同一版本的其他主機會遇到同樣的問題 |
+| 第 9.3 節：封存索引含撤銷狀態、政策快照 | 相同；另外回滾當下才偵測到的撤銷不寫回索引 | 回滾途中不多一次寫入；下一次選用時會記下 |
+| P9 `install.rollback` 由 Pulse 回報 | Pulse 依輔助程式留下的提示（`rollback.json`）回報 | 服務帳號讀不到 root 的封存；提示只影響顯示（第 17.10.6 節） |
+| 第 9.2 節：種子紀錄寫入發佈檔雜湊 | 種子紀錄只有 `SHA256SUMS` 與簽章（與 Pulse 既有的本機紀錄相同格式）；發佈檔雜湊記在種子封存的條目 | 本機紀錄只是提示，雜湊綁定在 root 的封存 |
+| Kairos 對降級回滾「開告警」 | 由既有的系統規則「升級推送已暫停」（`pause_cause: rollback_degraded`）開，沒有新的告警規則 | 不新增規則；主機層級另有 `package_repair_needed` |
+
+**INV-1～INV-11 與測試的對照**（`pulse` 的 `remote::upgrade::helper::tests`／`fault_tests`、`remote::upgrade::tests`；`kairos` 的 `remote::tests`、`remote::rollout_tests`；`kairos-proto` 的 `mgmt::tests`；`tests/e2e`；`tests/systemd`）：
+
+| 不變條件 | 測試 |
+|---|---|
+| INV-1 回滾目標由特權元件自己決定 | `a_staged_rollback_package_is_only_used_when_it_is_the_installed_version_commit_and_binary`（版本、commit 以輔助程式自己的為準）；既有的 `tampered_from_version_is_refused_before_anything_changes`、`resuming_after_a_reboot_uses_the_version_recorded_before_the_replacement`；systemd `tamper` |
+| INV-2 內容綁定 | 同上（執行檔雜湊）；`a_damaged_or_missing_archive_is_not_used_and_the_next_source_is_evaluated`（封存的執行檔、整包雜湊）；`rollback_only_uses_copies_that_match_the_recorded_hashes`；`archive_current_seeds_the_archive_only_with_the_installed_signed_package` |
+| INV-3 新的特權內容在取得時完整驗證 | `a_staged_rollback_package_signed_by_an_expired_or_unknown_key_is_not_used`；`rollback_bundle_and_local_record_are_hints_verified_with_the_local_trust_anchor`（Pulse）；`archive_current_…`；proto `rollback_bundle_vector_verifies_and_older_peers_ignore_it` |
+| INV-4 Kairos 不選擇、回滾不需要網路 | `a_successful_upgrade_archives_the_package_and_the_next_rollback_uses_it`（沒有任何 Kairos 提供的回滾檔）；Pulse 的九種提示（都不通過時照常升級）；e2e `rollback_bundle_is_offered_and_a_degraded_rollback_is_surfaced`；輔助程式不連網路（unit 的 `RestrictAddressFamilies=AF_UNIX`，既有） |
+| INV-5 來源有資格與順序，只往下退 | `a_damaged_or_missing_archive_…`（封存 → 提示 → `pulse.prev`）；`a_failed_package_rollback_falls_back_to_the_saved_binary_and_is_reported_as_degraded`（含 `pulse.prev` 也不能用 → `rollback_failed`）；systemd `archive-tamper`、`degraded` |
+| INV-6 信任的紀錄只在特權專屬位置、耐久 | `a_successful_upgrade_archives_…`（0700／0600）；`a_damaged_or_missing_archive_…`（符號連結、權限過寬、checksum）；故障注入矩陣第 23、24 列；`hello_declares_the_rollback_capability_from_the_helper_hint`（提示只影響回報）；既有的第 17.9.5、17.9.7 節測試 |
+| INV-7 到期與撤銷 | `a_revoked_signer_is_not_used_at_rollback_time_but_an_expired_one_is`（提示來源，回滾當下）；`an_archived_package_survives_key_expiry_but_not_revocation`（封存：選用時與回滾當下 × 到期／撤銷）；proto `lists_fingerprint` |
+| INV-8 本機管理者安裝的版本只豁免執行檔層級 | `archive_current_…`（種子必須通過簽章驗證才封存；不合格的八種情況）；沒有種子的 deb 只換回執行檔（故障注入矩陣 `DebNoRollback`） |
+| INV-9 自動回滾與遠端降版的界線 | INV-1 的測試（回滾套件不能是其他版本）；既有的降版政策測試（`offers_are_declined_by_local_policy`、輔助程式的 `check_version_policy`）不變 |
+| INV-10 只有提交過的版本是回滾目標 | 故障注入矩陣的 `final_state`（成功才有條目、恰好提交一次；回滾的版本沒有條目）、第 23 列（已寫入、未提交 → 不是目標）；`a_damaged_or_missing_archive_…` 的 `index-missing`；`archiving_is_bounded_and_never_fails_the_upgrade` |
+| INV-11 低權限輸入不決定信任結論、交易身分、回滾目標、特權路徑 | Pulse 的九種提示、`hello_declares_…`；A2 的六種情況；既有的 `method_and_target_come_from_the_helper_and_the_recorded_state`、`an_unfinished_transaction_is_resumed_even_if_the_request_names_another_upgrade`；systemd `tamper`、`tamper-resume`、`degraded`（服務帳號暫存的簽章被換掉） |
+
+驗證的結果（測試數、系統層的情境）記在 `CHANGELOG.md` 的未發佈區塊與 ADR-0003 第 14 節。第 17.9.4 節的對照表現在是 24 列（第 17.9.10 節的數字是 0.10.0、0.10.1 當時的紀錄）。
 
 ## 18. Windows 的遠端升級：0.10.0 不實作的評估與需要的實機驗證（待使用者決定）
 
