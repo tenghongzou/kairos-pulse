@@ -675,30 +675,64 @@ pub enum ReadError {
     Invalid(String),
 }
 
-/// 讀取並解析狀態檔
+/// 讀取並解析狀態檔（`pulse status`、服務啟動時讀上一次的狀態）。只接受一般檔案、最多讀
+/// [`MAX_FILE_BYTES`]：路徑是 FIFO 或裝置檔時不會卡住，也不會無上限地讀入
 pub fn read(path: &Path) -> Result<StatusFile, ReadError> {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
+    read_with(path, false)
+}
+
+/// 以 root 讀取服務帳號可控的狀態檔（升級輔助程式的健康確認；安全稽核 A4）：除了 [`read`] 的限制，
+/// 另外不跟隨符號連結、不接受有多個硬連結的檔案
+pub fn read_untrusted(path: &Path) -> Result<StatusFile, ReadError> {
+    read_with(path, true)
+}
+
+fn read_with(path: &Path, untrusted: bool) -> Result<StatusFile, ReadError> {
+    use std::io::Read as _;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // O_NONBLOCK：路徑是沒有寫入端的 FIFO 時 open 不會永久等待
+        let nofollow = if untrusted { libc::O_NOFOLLOW } else { 0 };
+        options.custom_flags(libc::O_NONBLOCK | nofollow);
+    }
+    let file = match options.open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::Missing),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             return Err(ReadError::PermissionDenied(e));
         }
         Err(e) => return Err(ReadError::Io(e)),
     };
+    let meta = file.metadata().map_err(ReadError::Io)?;
+    if !meta.is_file() {
+        return Err(ReadError::Invalid("不是一般檔案".into()));
+    }
+    #[cfg(unix)]
+    if untrusted {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() > 1 {
+            return Err(ReadError::Invalid("檔案有多個硬連結".into()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = untrusted;
     if meta.len() > MAX_FILE_BYTES {
         return Err(ReadError::Invalid(format!(
             "檔案過大（{} bytes）",
             meta.len()
         )));
     }
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::Missing),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            return Err(ReadError::PermissionDenied(e));
-        }
-        Err(e) => return Err(ReadError::Io(e)),
-    };
+    // 大小在檢查之後仍可能改變：讀取本身也設上限
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ReadError::Io)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(ReadError::Invalid("檔案過大".into()));
+    }
     parse(&bytes)
 }
 
@@ -772,6 +806,48 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["status.json"], "暫存檔應已改名或刪除");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 安全稽核 A4：狀態檔的位置是 FIFO、裝置檔或符號連結時，讀取不會卡住、不會無上限讀入；
+    /// 以 root 讀取（`read_untrusted`）時另外不跟隨符號連結、不接受硬連結
+    #[cfg(unix)]
+    #[test]
+    fn reading_refuses_fifos_devices_and_untrusted_links() {
+        let dir = temp_dir("untrusted");
+        let real = dir.join("status.json");
+        write_atomically(&real, &serde_json::to_vec(&sample()).unwrap()).unwrap();
+        assert!(read(&real).is_ok());
+        assert!(read_untrusted(&real).is_ok());
+
+        // FIFO（沒有寫入端）：立刻回錯誤，不等待
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: c 是有效的 C 字串
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(matches!(read(&fifo), Err(ReadError::Invalid(_))));
+        assert!(matches!(read_untrusted(&fifo), Err(ReadError::Invalid(_))));
+
+        // 裝置檔：不讀入內容
+        let zero = std::path::Path::new("/dev/zero");
+        assert!(matches!(read(zero), Err(ReadError::Invalid(_))));
+        assert!(matches!(read_untrusted(zero), Err(ReadError::Invalid(_))));
+
+        // 符號連結：`pulse status` 照舊跟隨，root 的健康確認不跟隨
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read(&link).is_ok());
+        assert!(matches!(read_untrusted(&link), Err(ReadError::Io(_))));
+
+        // 硬連結：root 的健康確認不接受
+        let hard = dir.join("hard.json");
+        fs::hard_link(&real, &hard).unwrap();
+        assert!(matches!(read_untrusted(&hard), Err(ReadError::Invalid(_))));
+
+        // 超過上限的一般檔案
+        let big = dir.join("big.json");
+        fs::write(&big, vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
+        assert!(matches!(read_untrusted(&big), Err(ReadError::Invalid(_))));
         fs::remove_dir_all(&dir).unwrap();
     }
 
