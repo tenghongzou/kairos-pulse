@@ -48,6 +48,7 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
   `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。套件的完整性仍以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。根 CA 與發佈公鑰都要從另一個管道取得。
 - 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
 - **遠端管理（0.9.0）**：腳本另外把 `--allowed-signers` 的檔案複製到 `/etc/kairos-pulse/allowed_signers`（root 644），作為遠端升級的信任錨（已經放在那裡時不動）。不接受 Kairos 推送的升級：`--no-remote-upgrade`；不接受下發的設定：`--no-remote-config`（兩者都寫進 `/opt/pulse/pulse.toml`，見第 10.1 節）。
+- **回滾的種子（0.11.0 之後的版本）**：接受遠端升級時，腳本另外把剛安裝的套件交給 `pulse upgrade archive-current --seed` 驗證後封存到 root 專用的 `/var/lib/pulse-upgrade/archive/`，並以服務帳號把這次發佈的 `SHA256SUMS` 與簽章保存到 `/var/lib/pulse/upgrade/releases/<版本>/`——這台主機**第一次**遠端升級失敗時就能經套件管理員裝回現在這一版（套件資料庫保持一致），不依賴 Kairos 的版本庫有這個版本。做不到時只提醒，不影響安裝（屆時回滾只換回執行檔，見第 10.1 節「回滾與套件資料庫」）。
 - 安裝字串會短暫出現在 `pulse enroll` 的命令列（`ps` 看得到）；token 有使用次數與期限，部署完成後由管理者停用（`kairos enroll-token disable`）。
 
 ### A.2 deb／rpm 套件（Linux）
@@ -745,6 +746,22 @@ external_ca = "/etc/kairos-pulse/repo-ca.pem"   # 省略時用作業系統信任
 ```
 
 下載的檔案與從 Kairos 下載的一樣，要通過本機信任錨（`allowed_signers`）的簽章與雜湊驗證才會安裝；不在白名單的 URL 一律拒絕（`pulse upgrade status`／主控台顯示 `url_not_allowed`，`PLS-W8411`）。不跟隨重新導向、不使用 HTTP 代理。
+
+**回滾與套件資料庫（0.11.0 之後的版本；`crates/kairos-proto/REMOTE.md` 第 4.4.2、4.5.2、17.10 節）**：
+
+- tar 安裝的回滾是換回 `pulse.prev`（與被替換的 unit），不需要其他東西。
+- deb／rpm 要讓 `dpkg -l`／`rpm -q` 在回滾之後仍然正確，必須經套件管理員把舊版的套件裝回去。輔助程式依序使用：**(1) 主機上的套件封存** `/var/lib/pulse-upgrade/archive/`（root 專用；每次遠端升級成功後自動封存剛裝好的那一份，只保留 1 份；一行安裝腳本在安裝時也會封存）、(2) Kairos 提議中附的回滾檔（Kairos 的版本庫有這台主機目前的版本時才有），兩者都要通過本機信任錨的簽章驗證，而且必須是目前安裝的那個版本、同一個 commit、套件中的執行檔與安裝的完全相同；都沒有或不合格時 (3) 只換回執行檔 `pulse.prev`。
+- 第 (3) 種是**降級回滾**（`PLS-W8418`）：Pulse 已恢復運作，但套件資料庫仍顯示失敗的那個版本（弱點掃描與之後的套件操作會看到錯誤的版本）。`pulse upgrade status` 顯示「需要修復套件」，`pulse status` 的「升級」列為警告（結束代碼非 0），Kairos 的主機詳情標示「需要修復套件」並暫停那個推送。**修復**：重新安裝目前版本的套件——先依第 2 節驗證發佈包，再 `sudo dpkg -i pulse-<版本>-<commit>-linux-<arch>.deb`（rpm：`sudo rpm -U --replacepkgs --oldpackage …rpm`）；`pulse.toml`、身分與狀態不受影響。或找出新版失敗的原因後再推送一次：升級成功時套件資料庫恢復一致。輔助程式不會自動修復套件資料庫。套件回滾本身失敗（例如維護指令碼失敗）時也是先換回 `pulse.prev`、回報降級回滾。
+- **手動安裝套件的主機**（A.2；沒有用一行安裝腳本）沒有封存：第一次遠端升級的回滾靠 Kairos 附的回滾檔。要讓它不依賴 Kairos，安裝後執行一次（三個檔案都來自同一次發佈；需要信任錨已放好）：
+
+  ```bash
+  sudo /opt/pulse/pulse upgrade archive-current \
+    --package pulse-<版本>-<commit>-linux-<arch>.deb --sums SHA256SUMS --signature SHA256SUMS.sig
+  ```
+
+  套件沒有通過驗證（簽章、雜湊、不是目前安裝的版本或 commit、套件中的執行檔與安裝的不同）就不會封存。`pulse upgrade status` 的「自動回滾」顯示目前的方式。
+- **金鑰到期與撤銷**：信任錨中某把金鑰只是到期（那一行還在、`valid-before` 已過）時，已封存的套件照常可以用來回滾；把那一行**刪除**（撤銷）之後，輔助程式不再以 root 執行那把金鑰簽的套件，回滾改為只換回執行檔（降級回滾，原因 `rollback_signer_revoked`）。撤銷之後請以新金鑰簽署的版本升級，或手動重新安裝套件。
+- `/var/lib/pulse/upgrade/` 下的 `releases/`、`rollback.json` 是服務帳號可寫的提示，刪除不影響安全性（輔助程式不信任它們）；`/var/lib/pulse-upgrade/archive/` 可以整個刪除（之後的回滾改用其他來源），不要手動修改其中的檔案——內容不符時輔助程式不會使用它。
 
 不要遠端升級：`pulse.toml` 寫入 `[upgrade] enabled = false`（或 `systemctl disable --now pulse-upgrade.path`）。不要集中設定：`[remote_config] enabled = false`。這兩個區段只能寫在 `pulse.toml`（輔助程式只讀它；環境變數只能關閉、不能開啟）。
 
