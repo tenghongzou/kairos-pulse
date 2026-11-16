@@ -46,7 +46,7 @@ sudo PULSE_INSTALL_STRING='pulse-enroll:v1:eyJzIjoia2Fpcm9z…' sh pulse-install
       --allowed-signers /etc/kairos-pulse/allowed_signers
   ```
 
-  `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。**套件**的完整性以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。**腳本本身**不在這個保證之內（驗證的邏輯就在腳本裡）：Kairos 0.11 之後的版本，主控台顯示的指令帶著腳本的 SHA-256，下載後先比對、相符才以 root 執行——請複製整行，不要省略 `sha256sum -c` 那一段；這個雜湊來自主控台，所以對腳本的信任在主控台與 Kairos 的下載目錄上（`kairos/PKI.md` 第 17 節）。0.12.0 之後的 Kairos 設定了 `[remote] allowed_signers` 時，會先以發佈公鑰驗證下載目錄的 `SHA256SUMS.sig`、並確認簽章涵蓋的 `SHA256SUMS` 列出這個腳本且雜湊相符，通過才顯示指令（沒有通過時主控台不顯示指令，管理員會看到原因與 `KRS-W2014`）；Kairos 沒有設定 `allowed_signers` 時不做這項驗證，指令照常顯示。更早的 Kairos 顯示的指令沒有這一段，請自行比對（雜湊取自以發佈公鑰驗證過的 `SHA256SUMS`，如上方的範例）。根 CA 與發佈公鑰都要從另一個管道取得。
+  `kairos-ca.pem` 是 Kairos 的根 CA（`pki.server_ca_path`），8444 的伺服器憑證由它簽發、不在系統的信任清單中；`--ca-file` 讓 curl／wget 以它驗證 HTTPS。**套件**的完整性以發佈公鑰（`--allowed-signers`）驗證 `SHA256SUMS.sig`，不依賴 HTTPS 或 Kairos。**腳本本身**不在這個保證之內（驗證的邏輯就在腳本裡）：Kairos 0.11 之後的版本，主控台顯示的指令帶著腳本的 SHA-256，下載後先比對、相符才以 root 執行——請複製整行，不要省略 `sha256sum -c` 那一段；這個雜湊來自主控台，所以對腳本的信任在主控台與 Kairos 的下載目錄上（`kairos/PKI.md` 第 17 節）。0.13.0 起的 Kairos 設定了 `[remote] allowed_signers` 時，會先以發佈公鑰驗證下載目錄的 `SHA256SUMS.sig`、並確認簽章涵蓋的 `SHA256SUMS` 列出這個腳本且雜湊相符，通過才顯示指令（沒有通過時主控台不顯示指令，管理員會看到原因與 `KRS-W2014`）；Kairos 沒有設定 `allowed_signers` 時不做這項驗證，指令照常顯示。更早的 Kairos 顯示的指令沒有這一段，請自行比對（雜湊取自以發佈公鑰驗證過的 `SHA256SUMS`，如上方的範例）。根 CA 與發佈公鑰都要從另一個管道取得。
 - 已安裝過的主機再執行：升級套件（保留 `pulse.toml`、`identity/`、`agent.id`），已註冊時不重新註冊。只安裝不註冊：`--no-enroll`；不啟動服務：`--no-start`。
 - **遠端管理（0.9.0）**：腳本另外把 `--allowed-signers` 的檔案複製到 `/etc/kairos-pulse/allowed_signers`（root 644），作為遠端升級的信任錨（已經放在那裡時不動）。不接受 Kairos 推送的升級：`--no-remote-upgrade`；不接受下發的設定：`--no-remote-config`（兩者都寫進 `/opt/pulse/pulse.toml`，見第 10.1 節）。
 - **回滾的種子（0.12.0 起）**：接受遠端升級時，腳本另外把剛安裝的套件交給 `pulse upgrade archive-current --seed` 驗證後封存到 root 專用的 `/var/lib/pulse-upgrade/archive/`，並以服務帳號把這次發佈的 `SHA256SUMS` 與簽章保存到 `/var/lib/pulse/upgrade/releases/<版本>/`——這台主機**第一次**遠端升級失敗時就能經套件管理員裝回現在這一版（套件資料庫保持一致），不依賴 Kairos 的版本庫有這個版本。做不到時只提醒，不影響安裝（屆時回滾只換回執行檔，見第 10.1 節「回滾與套件資料庫」）。
@@ -412,7 +412,7 @@ unit 重點（內容見 `pulse.service`）：
 
 | 設定 | 值 | 理由 |
 |---|---|---|
-| `User`／`Group` | `pulse` | 不以 root 執行。0.12.0 之後的版本：常駐程式發現自己是 root、而 `logs/` 屬於其他帳號時拒絕啟動（`PLS-E8208`，結束代碼 3）——手動測試請用 `sudo -u pulse /opt/pulse/pulse`；確定要以 root 執行的部署（例如容器）把 `logs/`、`buffer/`、`identity/` 改為 root 擁有即可 |
+| `User`／`Group` | `pulse` | 不以 root 執行。0.13.0 起：常駐程式發現自己是 root、而 `logs/` 屬於其他帳號時拒絕啟動（`PLS-E8208`，結束代碼 3）——手動測試請用 `sudo -u pulse /opt/pulse/pulse`；確定要以 root 執行的部署（例如容器）把 `logs/`、`buffer/`、`identity/` 改為 root 擁有即可 |
 | `WorkingDirectory` | `/opt/pulse` | `pulse.toml`、`agent.id`、憑證與 `logs/` 都以工作目錄解析 |
 | `StandardOutput` | `null` | 日誌只保留 `logs/` 一份（理由見下） |
 | `KillSignal`／`TimeoutStopSec` | `SIGINT`／`10` | Pulse 送出 `close_notify` 後約 1 秒內結束 |
@@ -420,7 +420,7 @@ unit 重點（內容見 `pulse.service`）：
 | `RestartPreventExitStatus` | `2 3 4` | 重試也不會成功的錯誤不重啟：2 命令列參數錯誤、3 設定錯誤（`pulse.toml` 語法、型別、範圍錯誤等）、4 憑證錯誤（`ca_cert`、客戶端憑證或私鑰無法讀取、格式錯誤、不成對，SAN 與 agent_id 不符，`agent.id` 無法讀取或內容不合法）。`systemctl status pulse` 顯示 `status=2`／`3`／`4`，原因在 `journalctl -u pulse`，修正後 `systemctl restart pulse` |
 | `NotifyAccess` | `main` | 只用來以 sd_notify 更新 `systemctl status` 的 `Status:` 文字（見 8.1）；不送 `READY=1`，所以 `Type` 仍為 `simple` |
 | `ProtectSystem=strict` + `ReadWritePaths=/opt/pulse/logs -/opt/pulse/buffer` | | 其餘檔案系統唯讀；因此 `agent.id` 必須在安裝時產生（第 5.1 節）。`-` 表示 `buffer/` 不存在時不影響啟動（Pulse 改為 at-most-once 並記 `ERROR`） |
-| 兩行 `ExecStartPre=-+/usr/bin/install …`（建立 `/run/pulse-hw`、複製 `/sys/class/dmi/id/product_serial`）＋`RuntimeDirectory=pulse` | `/run/pulse-hw`（`root:pulse` 0750）與其中的 `product_serial`（`root:pulse` 0440）；`/run/pulse`（0750，擁有者 `pulse`；`RuntimeDirectoryPreserve=yes`） | 0.12.0 之後的版本把序號複製到 **root 擁有**的 `/run/pulse-hw/`（先前是擁有者為 `pulse` 的 `/run/pulse/`）：以 root 執行的這一步不在服務帳號可寫的目錄中寫入。新版執行檔兩個位置都讀，舊的 unit 不必急著換；手動安裝（tar）的主機請依第 10 節換上新的 `pulse.service`。 0.8.0 起的主機資產需要系統序號，但 `/sys/class/dmi/id/product_serial` 只有 root 能讀（0400）。前綴 `+` 讓這一行以 root、不受沙箱限制執行，把序號複製成 `pulse` 可讀的檔案；Pulse 本身仍以 `pulse` 執行、沒有任何 capability。前綴 `-` 表示複製失敗（例如沒有 DMI 的虛擬機）不影響啟動，Pulse 不送序號並記一次 `PLS-I8009`。不想送序號時在 `pulse.toml` 設定 `[inventory] hardware_serials = false`（這幾行可保留） |
+| 兩行 `ExecStartPre=-+/usr/bin/install …`（建立 `/run/pulse-hw`、複製 `/sys/class/dmi/id/product_serial`）＋`RuntimeDirectory=pulse` | `/run/pulse-hw`（`root:pulse` 0750）與其中的 `product_serial`（`root:pulse` 0440）；`/run/pulse`（0750，擁有者 `pulse`；`RuntimeDirectoryPreserve=yes`） | 0.13.0 起把序號複製到 **root 擁有**的 `/run/pulse-hw/`（先前是擁有者為 `pulse` 的 `/run/pulse/`）：以 root 執行的這一步不在服務帳號可寫的目錄中寫入。新版執行檔兩個位置都讀，舊的 unit 不必急著換；手動安裝（tar）的主機請依第 10 節換上新的 `pulse.service`。 0.8.0 起的主機資產需要系統序號，但 `/sys/class/dmi/id/product_serial` 只有 root 能讀（0400）。前綴 `+` 讓這一行以 root、不受沙箱限制執行，把序號複製成 `pulse` 可讀的檔案；Pulse 本身仍以 `pulse` 執行、沒有任何 capability。前綴 `-` 表示複製失敗（例如沒有 DMI 的虛擬機）不影響啟動，Pulse 不送序號並記一次 `PLS-I8009`。不想送序號時在 `pulse.toml` 設定 `[inventory] hardware_serials = false`（這幾行可保留） |
 
 ### 7.1 為什麼選擇 `StandardOutput=null`
 

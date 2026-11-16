@@ -72,7 +72,7 @@ StateDirectoryMode=0755
 # 主機資產的系統序號（0.8.0，METRICS.md 第 4.5 節、第 17 節 D4）：/sys/class/dmi/id/product_serial
 # 只有 root 能讀，而 Pulse 以 pulse 使用者、沒有任何 capability 執行。啟動前以 root 執行一次複製
 # （前綴 + 不受下方的沙箱與 User= 限制；前綴 - 表示失敗不影響啟動，例如沒有 DMI 的虛擬機），
-# 放到 /run/pulse-hw/product_serial，Pulse 讀這個檔案。0.12.0 之後的版本（安全稽核 A2）：目的地改為
+# 放到 /run/pulse-hw/product_serial，Pulse 讀這個檔案。0.13.0 起（安全稽核 A2）：目的地改為
 # root 擁有的目錄（root:pulse 0750，檔案 root:pulse 0440）——root 不在服務帳號可寫的目錄中寫入，
 # 服務帳號無法事先在目的地放符號連結；-T 讓 install 一律把目的地當成檔案。舊版 unit 複製到
 # /run/pulse/product_serial，Pulse 仍會讀它（新版執行檔搭配舊 unit 時）。

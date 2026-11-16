@@ -523,7 +523,7 @@ systemctl list-timers kairos-crl.timer
 
 部署方式（`ExecStartPost`）二擇一：
 
-- **CA 與 Kairos 在同一台主機**（範例預設）：以 root 執行 `openssl crl -in agents.crl -out /opt/kairos/agents.crl.new`，設定擁有者與權限（`root:kairos` 644）後再 `mv` 覆寫。0.12.0 之後的範例不再用 `install` 直接複製：來源檔在 CA 帳號可寫的目錄中，直接複製會跟隨符號連結；經 `openssl crl` 解析再輸出，只有合法的 CRL 會被寫到 `/opt/kairos`。**已安裝舊範例的主機**：`/etc/systemd/system/kairos-crl.service` 不會隨套件更新，請重新安裝這個 unit（或在 drop-in 中以新的四行 `ExecStartPost=` 取代）。代理 CA 的私鑰因此放在伺服器上，伺服器被入侵時攻擊者可以簽發代理憑證，請依組織政策評估。
+- **CA 與 Kairos 在同一台主機**（範例預設）：以 root 執行 `openssl crl -in agents.crl -out /opt/kairos/agents.crl.new`，設定擁有者與權限（`root:kairos` 644）後再 `mv` 覆寫。0.13.0 起的範例不再用 `install` 直接複製：來源檔在 CA 帳號可寫的目錄中，直接複製會跟隨符號連結；經 `openssl crl` 解析再輸出，只有合法的 CRL 會被寫到 `/opt/kairos`。**已安裝舊範例的主機**：`/etc/systemd/system/kairos-crl.service` 不會隨套件更新，請重新安裝這個 unit（或在 drop-in 中以新的四行 `ExecStartPost=` 取代）。代理 CA 的私鑰因此放在伺服器上，伺服器被入侵時攻擊者可以簽發代理憑證，請依組織政策評估。
 - **CA 在另一台管理主機**：在 Kairos 主機建立部署帳號與只放 CRL 的目錄，讓部署帳號可寫、`kairos` 群組可讀，並把 `auth.crl` 指向該目錄：
 
   ```bash

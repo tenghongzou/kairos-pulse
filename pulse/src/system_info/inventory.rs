@@ -20,7 +20,7 @@ use kairos_proto::{
 use super::DiskEntry;
 use super::readings::{InterfaceReading, prioritized_filesystems, prioritized_interfaces};
 
-/// Linux：unit 的 `ExecStartPre=+` 複製出的系統序號（D4）。0.12.0 之後的 unit 複製到 root 擁有的
+/// Linux：unit 的 `ExecStartPre=+` 複製出的系統序號（D4）。0.13.0 起的 unit 複製到 root 擁有的
 /// `/run/pulse-hw/`（安全稽核 A2：root 不在服務帳號可寫的目錄中寫入）。
 /// 改變位置時同時改 `packaging/pulse.service`（測試比對兩者）
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux 專用（測試在各平台都跑）
