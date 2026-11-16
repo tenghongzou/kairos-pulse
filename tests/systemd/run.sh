@@ -1379,8 +1379,9 @@ scenario_ansible() {
     : >"$AW/known_hosts"
     for oh in adeb arpm; do
         wait_boot "$oh"
-        # Debian 的映像不帶主機金鑰（不把金鑰留在映像裡）：開機後產生
-        hx "$oh" sh -c 'ssh-keygen -A >/dev/null 2>&1; systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service'
+        # Debian 的映像不帶主機金鑰（不把金鑰留在映像裡）：開機後產生。開機時 ssh.service 因為沒有金鑰而連續
+        # 失敗、碰到啟動次數上限（start-limit-hit），要先 reset-failed，否則接下來的 restart 會被拒絕
+        hx "$oh" sh -c 'ssh-keygen -A >/dev/null 2>&1; systemctl reset-failed ssh.service sshd.service >/dev/null 2>&1; systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service'
         docker cp "$AW/id_ed25519.pub" "$P-$oh:/home/ops/.ssh/authorized_keys"
         hx "$oh" sh -c 'chown ops:ops /home/ops/.ssh/authorized_keys && chmod 600 /home/ops/.ssh/authorized_keys'
         # 主機金鑰經 docker exec（可信的管道）取得，控制端照常檢查主機金鑰
