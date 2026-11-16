@@ -41,10 +41,11 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 | `<N>-test.5`、`<N>-test.6` | 同 test.1，另以 `TEST_FEATURES=fault-injection` 開啟 Pulse 的編譯期 feature（REMOTE.md 第 17.9.9 節）：**測試用建置**，升級輔助程式可以在指定的當機點停住。`pulse --version` 結尾有 `[fault-injection]` |
 | `evil-a` | test.1 的檔案，`SHA256SUMS` 以沒有人信任的金鑰簽章 |
 | `<N>-test.9` | test.1 的檔案改名為 test.9，以只有 Kairos 信任的金鑰簽章 |
+| `<N>-test.10` | 同 test.2（崩潰），版本高於 test.8，**以第二把發佈金鑰 `release2` 簽章**（金鑰輪替之後的發佈）；另外它的 prerm／`%preun` 在主機上有 `/etc/kp-systest-prerm-fail` 時以 1 結束（情境 `key-revoked`、`pkg-rollback-fails`） |
 
 簽章一律用測試時以 `ssh-keygen -t ed25519` 產生的臨時金鑰（`packaging/sign-release.sh`，namespace
-`kairos-pulse-release`）；Pulse 的信任錨（`/etc/kairos-pulse/allowed_signers`）只有 `release`，Kairos 的
-`[remote] allowed_signers` 有 `release` 與 `evil-b`。**不使用正式的離線發佈金鑰。**
+`kairos-pulse-release`）；Pulse 的信任錨（`/etc/kairos-pulse/allowed_signers`）有 `release` 與輪替後的第二把
+`release2`，Kairos 的 `[remote] allowed_signers` 另有 `evil-b`。**不使用正式的離線發佈金鑰。**
 
 **故障注入只在 test.5、test.6**：其餘版本（含安裝在主機上的 `<V0>`，情境 b0～f 用到的全部版本，以及 test.7、test.8）都是與正式發佈
 相同方式建置的執行檔。打包腳本對每一個版本執行 `packaging/check-release-binary.sh`——正式的建置含故障注入的
@@ -91,6 +92,11 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 | `crash-rollback`（h） | test.6 → test.7（崩潰） | 當機點（第 17 列）：掛鉤 `rollback_restored`。新版崩潰 → 輔助程式記下回滾的意圖、還原（tar：換回 `pulse.prev`；deb／rpm：以回滾套件經套件管理員裝回），在**已還原、還沒記下 `rolling_back`** 時停住；腳本確認紀錄是 `rollback_intent`（`cause: health`，`via` 為 `binary`／`package`）、執行檔已是 test.6，然後 `docker kill` 並重新啟動。開機後「接續上次中斷的回滾：重新還原」（冪等重做）→ 三台 `rolled_back`（`PLS-W8407`，`detail` 為「<原因>; resumed」），deb／rpm 的套件資料庫也是 test.6 |
 | `unsafe-path`（i） | —（不送出推送） | hello 之前的路徑預檢（REMOTE.md 第 2.1、17.9.7 節；0.10.0）。每台主機：`chmod g+w /opt/pulse` 後重新啟動 Pulse → Kairos 看到 `install.upgrade = unsafe_path`、沒有協商 `upgrade`；`pulse upgrade status` 顯示 `PLS-E8405` 與 `unsafe_path: /opt/pulse: writable by group or others`；資格預覽（`POST /api/v1/rollouts/preview`）為 `eligible: 0`、`skipped: {"unsafe_path": 1}`。改回原本的權限並重新啟動 → `ready`、協商 `upgrade`、預覽可升級 1 台。合規時不誤報由 `run.sh` 一開始的檢查涵蓋（三台真實安裝、服務帳號與 unit 的沙箱下都必須是 `ready`） |
 | `late-resume`（j；0.10.1） | test.6 → test.8 | 健康確認的期限已過才接續（REMOTE.md 第 17.9.3 節「接續 `replaced` 時的健康確認」、第 17.9.4 節第 13 列）：掛鉤 `record_replaced`。輔助程式在**已記下 `replaced`（期限已定）、還沒重新啟動服務**時停住；腳本確認紀錄是 `replaced`、`service_restarted = false`、有 `boot_id`，然後 `docker kill`，**等到紀錄的 `deadline_unix` 過後 30 秒**（`LATE_AFTER=`）才重新啟動容器。開機後輔助程式（已是 test.8）「接續上次中斷的升級」：日誌有「健康確認的期限已過（N 秒前）：仍以 120 秒做與正常流程相同的健康確認」、補送重新啟動、健康確認通過 → 三台 `succeeded`（`PLS-I8416`），沒有回滾，`pulse.prev` 仍是 test.6，指標已清除。0.10.0 的輔助程式在這個情境會直接回滾 |
+| `key-revoked`（m；0.12.0 之後） | 目前的版本 → test.10（崩潰；以第二把發佈金鑰 `release2` 簽章） | **發佈金鑰輪替**（ADR-0003 的 INV-7、決策點 D1；REMOTE.md 第 4.2.3、17.10.4 節）。m1（對照）：信任錨中第一把金鑰 `release` 那一行還在、`valid-before` 已過（自然到期）→ deb／rpm 仍以本機封存經套件管理員回滾（`PLS-W8407`，不是降級回滾，封存沒有被標記撤銷，推送沒有暫停）。m2：`release` 那一行被刪除（撤銷）→ deb 的封存「不使用（`rollback_signer_revoked`）」、rpm（先移除封存與本機紀錄）不採用以撤銷的金鑰簽的 `rollback_bundle` → 兩台以 `pulse.prev` 回復＝降級回滾（`PLS-W8418`，`degraded:rollback_signer_revoked,…`／`no_rollback_package`／`rollback_not_verified`），套件資料庫停在 test.10、主機標示需要修復套件、推送自動暫停（`rollback_degraded`）。tar 兩次都是一般的回滾。結束時把信任錨改回、重新安裝目前版本的套件並以 `archive-current` 重新封存 |
+| `pkg-rollback-fails`（n；0.12.0 之後） | 目前的版本 → test.10（崩潰） | **套件管理員裝回舊版的命令本身失敗**（ADR-0003 第 5.4 節最後一列；REMOTE.md 第 4.5.2 節）。deb：輔助程式換上新版（`replaced`）之後把套件中的一個檔案設為不可變更（`chattr +i`），`dpkg -i` 舊版在解包途中失敗；rpm：test.10 的 `%preun` 在主機上有 `/etc/kp-systest-prerm-fail` 時以 1 結束，`rpm -U --oldpackage` 裝上了舊版卻移除不了失敗的版本（套件資料庫有兩筆）。兩者都先嘗試經套件管理員裝回、失敗後以 `pulse.prev` 緊急復原：`rolled_back`、`PLS-W8418`、`degraded:package_rollback_failed,package_db_inconsistent`（rpm 的 `detail` 另附 `package_db_shows_…`），服務回到舊版，推送自動暫停。tar 是一般的回滾。結束時移除障礙、修復套件並重新封存 |
+| `ansible`（o；0.12.0 之後） | —（不送出推送） | **`packaging/ansible` 的 role**（安全稽核 N12；Pulse 的 INSTALL.md 第 A.4 節）：以這一輪建置的真正 deb／rpm 套件與測試環境的 Kairos，由控制端容器（`images/ansible.Dockerfile`）經 SSH（一般帳號 `ops`＋become）對兩台全新的受管主機（`images/managed.Dockerfile`：Debian 12、Rocky Linux 9，systemd 為 PID 1、有 sshd）執行。o1：發佈公鑰不對 → 停在控制端驗證簽章的步驟，受管主機沒有改變；o2：不用 become → 停在檢查暫存目錄的步驟並移除目錄；o3：整個 role（驗證簽章 → root 擁有、0700、連線帳號進不去的暫存目錄 → 核對雜湊 → apt／dnf 安裝 → `pulse enroll` → 啟動並連上 Kairos，安裝字串不出現在 Ansible 的輸出）；o4：再執行一次不重新註冊。SSH 金鑰臨時產生，結束時連同三個容器一起刪除。**Rocky 的受管主機映像把 `/etc/shadow`、`/etc/gshadow` 由 0000 改成 0400**：Ubuntu 宿主機的 AppArmor 設定檔套用到容器內的 `unix_chkpwd`、沒有放行 `dac_override`，否則非 root 帳號的 sudo 與 sshd 回報「PAM account management error」（說明在 `images/managed.Dockerfile`；真正的 Rocky 主機沒有這個情況） |
+
+**這三個情境（m、n、o）的驗證狀態（2026-11-16）**：`key-revoked`、`pkg-rollback-fails` 只在 2026-11-15 於 kp-build 單獨執行過一次（commit `9d3dddb`）：通過 122、失敗 2，兩個失敗都是 deb 主機「修復後套件資料庫只有 <版本>」的比對樣式少算了 `dpkg-query` 狀態縮寫後面的空白（已修正，修正後還沒有重跑）。`ansible` 還沒有在建置機執行過，Rocky 映像對 PAM 的處理也還沒有實測。三者併入全套之後的完整執行同樣還沒有做（0.12.0 的全套是 487 通過、0 失敗，不含這三個情境）。驗證通過後請刪除這一段。
 
 每個情境結束後的日誌：`logs/<情境>-<主機>.log`（`pulse upgrade status`、`journalctl -u pulse-upgrade`、
 輔助程式的 `upgrade.log`、Pulse 日誌中與升級有關的行）、`logs/<情境>-kairos.log`。
@@ -101,13 +107,13 @@ KEEP=1 sh tests/systemd/run.sh                # 結束時保留容器（除錯�
 
 ## 沒有涵蓋
 
-- 回滾來源（ADR-0003）：金鑰到期／撤銷時的封存與回滾（`key-expired`、`key-revoked`）、套件管理員裝回舊版失敗
-  （`pkg-rollback-fails`）、回滾套件的執行檔或 commit 不符（`binary-mismatch`）、封存的當機點（第 23、24 列）
-  沒有系統層的情境，由單元測試涵蓋（`helper::tests` 的 `an_archived_package_survives_key_expiry_but_not_revocation`、
-  `a_revoked_signer_is_not_used_at_rollback_time_but_an_expired_one_is`、
-  `a_failed_package_rollback_falls_back_to_the_saved_binary_and_is_reported_as_degraded`、
+- 回滾來源（ADR-0003）：回滾套件的執行檔或 commit 不符（`binary-mismatch`）、封存的當機點（第 23、24 列）
+  沒有系統層的情境，由單元測試涵蓋（`helper::tests` 的
   `a_staged_rollback_package_is_only_used_when_it_is_the_installed_version_commit_and_binary` 與故障注入矩陣）。
-  降級回滾造成的推送自動暫停由 Kairos 的測試與 `tests/e2e` 涵蓋（情境 l 不經推送）。
+  金鑰到期／撤銷與套件管理員裝回舊版失敗已有情境 m、n（上表；單元測試
+  `an_archived_package_survives_key_expiry_but_not_revocation`、
+  `a_revoked_signer_is_not_used_at_rollback_time_but_an_expired_one_is`、
+  `a_failed_package_rollback_falls_back_to_the_saved_binary_and_is_reported_as_degraded` 仍然涵蓋同樣的邏輯）。
 
 - 真正的斷電（頁面快取遺失、fsync 之前的寫入消失）：情境 g、h、i 只終止行程。
 - 重新開機後 `boot_id` 的改變（情境 i）：容器的 `/proc/sys/kernel/random/boot_id` 是宿主機核心的，`docker kill`／
