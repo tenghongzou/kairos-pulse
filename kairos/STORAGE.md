@@ -325,6 +325,8 @@ $ sudo -u kairos kairos hosts list --config /opt/kairos/kairos.toml --offline-fo
 2. 原始 report 已刪光時，5 分鐘彙總最舊的一天；
 3. 再來是 1 小時彙總最舊的一天。
 
+容量上限是全體主機共用的，沒有每台主機的配額（安全稽核 N9）：單一主機以速率上限持續送出最大的 report，會讓全體主機最舊的原始資料提早被刪除。啟用 mTLS 時只有已註冊的主機送得進來；出現 `KRS-W4202` 而資料量沒有對應的成長理由時，請檢查是否有單一主機異常大量送出 report。
+
 刪到上限的 95% 以下才停止（避免在上限附近每幾秒刪一次）。主機清冊、序列、`meta` 與 `api_tokens` 不會被刪除。0.4 起以設計包的代碼 `KRS-W4202`（容量已滿，提早刪除最舊的資料；`copywriting.md` §4.2 範例 68）記錄：
 
 - 開始：`WARN`「警告 KRS-W4202：資料庫已達容量上限，正在提早刪除最舊的資料：已使用 … bytes，超過 storage.max_total_bytes（… bytes）…」；

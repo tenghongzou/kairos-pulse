@@ -135,6 +135,7 @@ CLI 需要停止 Kairos 的原因：執行中的 Kairos 在記憶體中有這台
 | 已轉出的指標（Prometheus 已抓取的序列、已推送到 OTLP collector 的資料） | 在 Prometheus／collector 端處理（依其保存期限，或以其刪除 API，例如 Prometheus 的 `delete_series`）；Kairos 停止輸出這台主機 |
 | 匯出、診斷包、個資匯出的檔案 | 由取得的人處理 |
 | Pulse 主機上的資料 | 在主機上完全移除 Pulse（第 1 節 #15） |
+| SQLite 資料庫檔案中已釋放的頁面與 WAL（`kairos.db`、`kairos.db-wal`） | 刪除是邏輯上的：Kairos 沒有啟用 `secure_delete`，被刪除的列所在的頁面在被新資料覆寫之前，仍可能以原始位元組留在資料庫檔案的空閒頁與 WAL 中（透過 API 與主控台讀不到，能直接讀取檔案的人才看得到）。需要實體清除時，在離峰時間停止 Kairos，以 `sqlite3 kairos.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"` 重寫資料庫（需要約等同資料庫大小的暫時空間），並依儲存媒體的方式處理舊的區塊。PostgreSQL 後端由 `VACUUM` 與該資料庫的保存政策處理 |
 
 刪除之後，同一台主機若再次以有效的身分連線（例如沒有撤銷的外部 CA 憑證、或未啟用 mTLS 的測試環境），會從頭建立新的清冊資料。請先在主機上移除 Pulse。
 
