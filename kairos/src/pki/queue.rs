@@ -19,6 +19,8 @@ use crate::store::prelude::*;
 
 pub const QUEUE_SCHEMA: &str = "kairos-csr-queue/v1";
 pub const SIGNED_SCHEMA: &str = "kairos-signed-certs/v1";
+/// 一次匯入的憑證張數上限（安全稽核 N3）
+pub const MAX_IMPORT_ITEMS: usize = 10_000;
 
 /// 匯出待簽發的申請
 pub fn export(
@@ -106,8 +108,16 @@ pub fn import(
     if signed["schema"] != SIGNED_SCHEMA {
         return Err(format!("輸入檔不是 {SIGNED_SCHEMA}"));
     }
+    // 整批在同一個寫入者中逐筆處理：設上限，避免一次匯入長時間佔住寫入者（安全稽核 N3）
+    let items = signed["items"].as_array().cloned().unwrap_or_default();
+    if items.len() > MAX_IMPORT_ITEMS {
+        return Err(format!(
+            "一次最多匯入 {MAX_IMPORT_ITEMS} 張憑證（輸入檔有 {} 張），請分批匯入",
+            items.len()
+        ));
+    }
     let mut out = Vec::new();
-    for item in signed["items"].as_array().cloned().unwrap_or_default() {
+    for item in items {
         let request_id = item["request_id"]
             .as_str()
             .unwrap_or_default()
@@ -449,6 +459,26 @@ mod import_tests {
 
     fn der(pem: &str) -> Vec<u8> {
         certificates_in(pem.as_bytes()).unwrap().remove(0)
+    }
+
+    /// 安全稽核 N3：一次匯入的張數有上限，超過時整批拒絕、什麼都不寫
+    #[test]
+    fn signed_imports_are_capped() {
+        let (dir, conn) = db();
+        let item = serde_json::json!({ "request_id": "x", "certificate": "AA" });
+        let over = serde_json::json!({
+            "schema": SIGNED_SCHEMA,
+            "items": vec![item.clone(); MAX_IMPORT_ITEMS + 1],
+        });
+        let e = import(&conn, &over, &[], "root", 1).unwrap_err();
+        assert!(e.contains("最多匯入"), "{e}");
+        let at_limit = serde_json::json!({
+            "schema": SIGNED_SCHEMA,
+            "items": vec![item; 3],
+        });
+        assert_eq!(import(&conn, &at_limit, &[], "root", 1).unwrap().len(), 3);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
