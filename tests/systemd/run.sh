@@ -1488,7 +1488,7 @@ echo never' >"$AW/tmpdir-$oh.txt" 2>&1 &
     check "o4：再執行一次仍成功" "$rc $(grep -c 'failed=0' "$LOGS/ansible-o4-again.log")" '^0 2$'
     for oh in adeb arpm; do
         check "o4/$oh：沒有重新註冊（agent.id 不變）、服務照常" \
-            "$(hx "$oh" sh -c 'cat /opt/pulse/agent.id; echo; systemctl is-active pulse.service' 2>&1 | tr -d '\r' | tr '\n' ' ')" \
+            "$(hx "$oh" sh -c 'cat /opt/pulse/agent.id; echo; systemctl is-active pulse.service' 2>&1 | tr -d '\r' | tr '\n' ' ' | tr -s ' ')" \
             "^$(agent_of "$oh") active \$"
     done
     for oh in adeb arpm; do
