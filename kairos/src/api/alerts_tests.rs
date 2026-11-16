@@ -946,6 +946,44 @@ async fn alerts_end_to_end_over_https() {
 
 /// 管道的機密無法解開（金鑰檔遺失或與資料庫不成對）：API 顯示 `secrets_unavailable`、不嘗試發送、
 /// 發布內部事件並開「通知管道失敗」事件（`KRS-E5110`）；測試通知的限速（每管道 60 秒 3 次）
+/// 安全稽核 E3：未儲存管道的測試會真的連出去，要留下稽核（只記主機與連接埠）
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn testing_an_unsaved_channel_is_audited_without_secrets() {
+    let hook = FakeHttp::start().await;
+    let f = fixture_alerts("alerts-unsaved-test", |c| c.alerts.warmup_secs = 0).await;
+    let addr = f.addr();
+    let admin = token(&f, Role::Admin);
+    let body = json!({
+        "kind": "webhook",
+        "config": { "format": "kairos", "allow_http": true },
+        "secrets": { "url": format!("http://{}/hook/path-secret-1?k=query-secret-1", hook.addr) },
+    });
+    let r = call(
+        addr,
+        "POST",
+        "/api/v1/channels/test",
+        Some(&admin),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let conn = f.admin();
+    let (result, details): (String, String) = conn
+        .query_row(
+            "SELECT result, coalesce(details, '') FROM audit_events WHERE action = 'channel.test'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(result, "ok");
+    let details: Value = serde_json::from_str(&details).unwrap();
+    assert_eq!(details["unsaved"], true);
+    assert_eq!(details["kind"], "webhook");
+    assert_eq!(details["destination"], hook.addr.to_string());
+    let text = details.to_string();
+    assert!(!text.contains("path-secret-1") && !text.contains("query-secret-1"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undecryptable_channel_secrets_and_test_rate_limit() {
     let hook = FakeHttp::start().await;

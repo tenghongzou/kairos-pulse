@@ -21,9 +21,7 @@ use crate::alerts::engine::ActionError;
 use crate::alerts::model::{
     Category, Channel, ChannelKind, NotifyPolicy, Rule, Scope, Severity, SilenceKind,
 };
-use crate::alerts::notify::transport::{
-    CODE_CHANNEL_CONFIG, parse_url, valid_address, valid_helo,
-};
+use crate::alerts::notify::transport::{CODE_CHANNEL_CONFIG, parse_url, valid_address, valid_helo};
 use crate::alerts::ops::{self, SilenceInput};
 use crate::alerts::rules::{self, CODE_RULE_INVALID, kind};
 use crate::alerts::secrets::{masked, scrub};
@@ -2398,6 +2396,34 @@ async fn test_channel(
             id,
             if o.ok { "ok" } else { "failed" },
             json!({ "severity": severity, "code": o.code }),
+        )
+        .await;
+    } else {
+        // 未儲存的管道沒有發送紀錄，但仍然會真的連出去：寫稽核，留下「誰測了哪個目的地」
+        // （安全稽核 E3；只記主機與連接埠，不記路徑、查詢字串與秘密）
+        let destination = match ch.kind {
+            ChannelKind::Email => format!(
+                "{}:{}",
+                ch.config["host"].as_str().unwrap_or_default(),
+                ch.config["port"]
+            ),
+            ChannelKind::Webhook => ch.secrets["url"]
+                .as_str()
+                .and_then(|u| crate::alerts::notify::transport::parse_url(u.trim(), true).ok())
+                .map(|t| format!("{}:{}", t.host, t.port))
+                .unwrap_or_default(),
+        };
+        c.audit(
+            "channel.test",
+            None,
+            if o.ok { "ok" } else { "failed" },
+            json!({
+                "severity": severity,
+                "code": o.code,
+                "unsaved": true,
+                "kind": ch.kind,
+                "destination": destination,
+            }),
         )
         .await;
     }
