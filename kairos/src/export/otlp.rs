@@ -466,12 +466,8 @@ pub fn tls_config(eff: &Effective) -> Result<Arc<ClientConfig>, String> {
     }
     let ca = o.ca_file.trim();
     if !ca.is_empty() {
-        let certs = CertificateDer::pem_file_iter(ca)
-            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-            .map_err(|e| format!("無法讀取 export.otlp.ca_file {ca}：{e}"))?;
-        if certs.is_empty() {
-            return Err(format!("export.otlp.ca_file {ca} 中沒有憑證"));
-        }
+        // 只讀一般檔案、有大小上限，錯誤訊息不透露檔案是否存在（安全稽核 E5）
+        let certs = crate::alerts::notify::transport::read_ca_file(ca, "export.otlp.ca_file")?;
         for c in certs {
             roots
                 .add(c)

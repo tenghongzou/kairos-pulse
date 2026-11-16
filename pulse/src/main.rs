@@ -473,6 +473,26 @@ fn run_agent(print_id: bool, external_stop: Option<CancellationToken>) -> u8 {
         return print_agent_id(&config);
     }
 
+    // 安全稽核 N15：常駐程式不以 root 在其他帳號擁有的 logs/ 中寫入（那個帳號可以把日誌檔換成符號連結）
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid 沒有前置條件，也不會失敗
+        let euid = unsafe { libc::geteuid() };
+        if let Some(owner) =
+            log_files::root_with_foreign_log_dir(euid, Path::new(log_files::LOG_DIR))
+        {
+            eprintln!(
+                "錯誤 {}：以 root 啟動，但日誌目錄 {} 屬於 uid {owner}：請以該服務帳號啟動（發佈包的 \
+                 pulse.service 已設定 User=pulse；手動執行時用 sudo -u pulse），或確定要以 root 執行時\
+                 把工作目錄下的 logs/、buffer/、identity/ 改為 root 擁有",
+                codes::E_ROOT_WITH_SERVICE_DIR,
+                log_files::LOG_DIR
+            );
+            // 重試也不會成功：以 EXIT_CONFIG 結束，systemd 不重新啟動（RestartPreventExitStatus）
+            return EXIT_CONFIG;
+        }
+    }
+
     // 日誌清除的日期基準必須在初始化日誌之前決定：fern 一初始化就會建立今天的日誌檔，
     // 時鐘被誤校到未來時，那個檔案不能被當成「最新日誌檔的日期」
     let mut retention =
@@ -1518,25 +1538,51 @@ mod tests {
 
     #[test]
     fn unit_copies_the_system_serial_where_pulse_reads_it() {
-        // METRICS.md D4：ExecStartPre=+（root、不受沙箱限制）把序號複製到 RuntimeDirectory，
-        // 複製的目的地與 Pulse 讀取的位置相同，且失敗不影響啟動（前綴 -）
+        // METRICS.md D4：ExecStartPre=+（root、不受沙箱限制）把序號複製到 Pulse 讀取的位置，且失敗不影響
+        // 啟動（前綴 -）。安全稽核 A2：目的地在 root 擁有的目錄（不是擁有者為 pulse 的 RuntimeDirectory），
+        // 目錄與檔案的擁有者都是 root、pulse 只有群組讀取權，install 以 -T 把目的地當成檔案
         let unit = include_str!("../packaging/pulse.service");
-        let pre = unit
+        let pres: Vec<Vec<&str>> = unit
             .lines()
-            .find_map(|l| l.strip_prefix("ExecStartPre="))
-            .expect("pulse.service 應以 ExecStartPre= 複製序號");
-        assert!(pre.starts_with("-+") || pre.starts_with("+-"), "{pre}");
-        let args: Vec<&str> = pre.split_whitespace().collect();
-        assert_eq!(args.last(), Some(&system_info::inventory::SERIAL_COPY_PATH));
-        assert!(args.contains(&"/sys/class/dmi/id/product_serial"), "{pre}");
-        assert!(args.windows(2).any(|w| w == ["-o", "pulse"]), "{pre}");
+            .filter_map(|l| l.strip_prefix("ExecStartPre="))
+            .map(|l| {
+                assert!(l.starts_with("-+") || l.starts_with("+-"), "{l}");
+                l.split_whitespace().collect()
+            })
+            .collect();
+        let serial = Path::new(system_info::inventory::SERIAL_COPY_PATH);
+        let dir = serial.parent().unwrap().to_str().unwrap();
+        let [mkdir, copy] = pres.as_slice() else {
+            panic!("pulse.service 應有建立目錄與複製序號兩行 ExecStartPre=：{pres:?}");
+        };
+        // 第一行：建立 root:pulse 0750 的目錄
+        assert!(mkdir.contains(&"-d"), "{mkdir:?}");
+        assert_eq!(mkdir.last(), Some(&dir));
+        assert!(mkdir.windows(2).any(|w| w == ["-m", "0750"]), "{mkdir:?}");
+        // 第二行：複製序號
+        assert!(copy.contains(&"-T"), "{copy:?}");
+        assert_eq!(copy.last().map(Path::new), Some(serial));
+        assert!(
+            copy.contains(&"/sys/class/dmi/id/product_serial"),
+            "{copy:?}"
+        );
+        assert!(copy.windows(2).any(|w| w == ["-m", "0440"]), "{copy:?}");
+        for line in [mkdir, copy] {
+            assert!(line.windows(2).any(|w| w == ["-o", "root"]), "{line:?}");
+            assert!(line.windows(2).any(|w| w == ["-g", "pulse"]), "{line:?}");
+        }
+        // root 寫入的目錄不在服務帳號擁有的 RuntimeDirectory／StateDirectory 之下
         let runtime = unit
             .lines()
             .find_map(|l| l.strip_prefix("RuntimeDirectory="))
             .expect("pulse.service 應設定 RuntimeDirectory");
+        let service_owned = Path::new("/run").join(runtime);
+        assert!(!serial.starts_with(&service_owned), "{serial:?}");
+        assert_eq!(serial.parent().unwrap().parent(), Some(Path::new("/run")));
+        // 舊 unit 的位置（新版執行檔仍會讀）在 RuntimeDirectory 之下
         assert_eq!(
-            Path::new(system_info::inventory::SERIAL_COPY_PATH).parent(),
-            Some(Path::new("/run").join(runtime).as_path())
+            Path::new(system_info::inventory::SERIAL_COPY_PATH_LEGACY).parent(),
+            Some(service_owned.as_path())
         );
         assert!(unit.lines().any(|l| l == "RuntimeDirectoryPreserve=yes"));
     }

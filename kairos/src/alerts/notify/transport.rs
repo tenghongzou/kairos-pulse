@@ -96,6 +96,50 @@ fn native_roots() -> &'static Vec<CertificateDer<'static>> {
     })
 }
 
+/// `ca_file` 的大小上限（一般的 CA bundle 遠小於此；作業系統完整的信任清單約 200 KiB）
+pub const MAX_CA_FILE_BYTES: u64 = 1024 * 1024;
+
+/// 讀取 `ca_file`（通知管道與 OTLP 共用；安全稽核 E5）。
+///
+/// 這個路徑可由主控台的管理員設定，所以：只讀一般檔案（FIFO、裝置檔會讓讀取卡住或無上限讀入）、
+/// 最多 [`MAX_CA_FILE_BYTES`]；回傳給 API 的錯誤訊息不分「不存在／無法讀取／不是憑證」，避免拿它探測
+/// Kairos 主機上的檔案，詳細原因只寫進 Kairos 的日誌。`what` 是設定的名稱（`ca_file`、
+/// `export.otlp.ca_file`）
+pub fn read_ca_file(path: &str, what: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    use std::io::Read as _;
+    let detail = (|| -> Result<Vec<CertificateDer<'static>>, String> {
+        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("不是一般檔案".into());
+        }
+        if meta.len() > MAX_CA_FILE_BYTES {
+            return Err(format!("超過 {MAX_CA_FILE_BYTES} bytes"));
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| e.to_string())?
+            .take(MAX_CA_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > MAX_CA_FILE_BYTES {
+            return Err(format!("超過 {MAX_CA_FILE_BYTES} bytes"));
+        }
+        let certs = CertificateDer::pem_slice_iter(&bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("PEM 無法解析：{e}"))?;
+        if certs.is_empty() {
+            return Err("其中沒有憑證".into());
+        }
+        Ok(certs)
+    })();
+    detail.map_err(|e| {
+        log::warn!("無法使用 {what} {path}：{e}");
+        format!(
+            "無法使用 {what} {path}：檔案不存在、無法讀取、不是 1 MiB 以內的一般檔案，或其中沒有 PEM 憑證（詳細原因見 Kairos 的日誌）"
+        )
+    })
+}
+
 /// 用戶端的 TLS 設定：作業系統的 CA ＋ 管道指定的 `ca_file`
 pub fn client_config(ca_file: Option<&str>) -> Result<Arc<ClientConfig>, String> {
     let mut roots = RootCertStore::empty();
@@ -103,13 +147,7 @@ pub fn client_config(ca_file: Option<&str>) -> Result<Arc<ClientConfig>, String>
         let _ = roots.add(c.clone());
     }
     if let Some(path) = ca_file.map(str::trim).filter(|p| !p.is_empty()) {
-        let certs = CertificateDer::pem_file_iter(path)
-            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-            .map_err(|e| format!("無法讀取 ca_file {path}: {e}"))?;
-        if certs.is_empty() {
-            return Err(format!("ca_file {path} 中沒有憑證"));
-        }
-        for c in certs {
+        for c in read_ca_file(path, "ca_file")? {
             roots
                 .add(c)
                 .map_err(|e| format!("ca_file {path} 的憑證無法使用: {e}"))?;
@@ -498,6 +536,15 @@ pub fn valid_address(a: &str) -> bool {
         })
 }
 
+/// `EHLO` 的參數是否合理（安全稽核 E4）：主機名稱或位址字面值——只有 ASCII 英數字與 `.`、`-`、`:`、
+/// `[`、`]`，1～255 個字元。這個值原樣寫進 SMTP 命令列，不可含 CR、LF、空白或其他控制字元
+pub fn valid_helo(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
 /// 組成郵件（純文字、UTF-8、base64；緊急另加 `Importance: high`、`X-Priority: 1`，§2.1.1）
 pub fn compose_mail(from: &str, to: &[String], msg: &Message, now_ms: i64, id: &str) -> String {
     let date = chrono::DateTime::from_timestamp_millis(now_ms)
@@ -636,6 +683,12 @@ fn smtp_config(channel: &Channel) -> Result<SmtpConfig, String> {
     if security == "none" && password.is_some() {
         return Err("security = none 時不可設定密碼（密碼會以明文傳送）".into());
     }
+    // 安全稽核 E4：API 已在儲存時驗證；這裡再擋一次（較舊版本存下的管道、直接改資料庫的值）
+    let helo = get("helo").unwrap_or("kairos");
+    if !valid_helo(helo) {
+        return Err("helo 必須是主機名稱或位址（不可含空白、換行或其他符號）".into());
+    }
+    let helo = helo.to_string();
     Ok(SmtpConfig {
         host,
         port,
@@ -644,7 +697,7 @@ fn smtp_config(channel: &Channel) -> Result<SmtpConfig, String> {
         password,
         from,
         to,
-        helo: get("helo").unwrap_or("kairos").to_string(),
+        helo,
     })
 }
 
@@ -890,6 +943,35 @@ pub async fn send(
 mod tests {
     use super::*;
 
+    /// 安全稽核 E5：`ca_file` 只讀一般檔案、有大小上限，錯誤訊息不分原因
+    #[test]
+    fn ca_file_reads_only_bounded_regular_files_and_errors_are_uniform() {
+        const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+        let good = format!("{MANIFEST}/../pulse/testdata/server-ca.pem");
+        assert!(!read_ca_file(&good, "ca_file").unwrap().is_empty());
+
+        let dir = std::env::temp_dir().join(format!("kairos-e5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.pem");
+        std::fs::write(&big, vec![b'a'; MAX_CA_FILE_BYTES as usize + 1]).unwrap();
+        let not_pem = format!("{MANIFEST}/../pulse/testdata/not-pem.txt");
+        let missing = dir.join("missing.pem");
+
+        // 不存在、目錄、過大、不是憑證：訊息除了路徑以外完全相同（不能拿來探測檔案）
+        let generic = |p: &str| read_ca_file(p, "ca_file").unwrap_err().replace(p, "<p>");
+        let expect = generic(missing.to_str().unwrap());
+        assert_eq!(generic(dir.to_str().unwrap()), expect);
+        assert_eq!(generic(big.to_str().unwrap()), expect);
+        assert_eq!(generic(&not_pem), expect);
+        // 裝置檔不會被讀進來（先前 /dev/zero 會無上限累積）
+        #[cfg(unix)]
+        assert_eq!(generic("/dev/zero"), expect);
+
+        assert!(client_config(Some(&good)).is_ok());
+        assert!(client_config(Some(big.to_str().unwrap())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn urls_are_parsed_and_http_is_refused_by_default() {
         let t = parse_url("https://hooks.example.com/services/T0/B1/x?y=1", false).unwrap();
@@ -943,5 +1025,61 @@ mod tests {
         for bad in ["a", "a@", "@b", "a b@c", "a@b\r\nBcc: x@y", "<a@b>"] {
             assert!(!valid_address(bad), "{bad}");
         }
+    }
+
+    /// 安全稽核 E4：helo 原樣寫進 `EHLO` 命令列——含換行、空白或其他符號的值在送出前就被拒絕
+    /// （含較舊版本存下、沒有經過 API 驗證的管道）
+    #[test]
+    fn helo_with_line_breaks_or_spaces_is_rejected_before_sending() {
+        for ok in [
+            "kairos",
+            "monitor.example.com",
+            "[192.0.2.1]",
+            "[IPv6:2001:db8::1]",
+        ] {
+            assert!(valid_helo(ok), "{ok}");
+        }
+        let long = "a".repeat(256);
+        for bad in [
+            "",
+            "a b",
+            "a\r\nMAIL FROM:<x@y>",
+            "a\nb",
+            "a\tb",
+            "a\0b",
+            "名稱",
+            "a;b",
+            long.as_str(),
+        ] {
+            assert!(!valid_helo(bad), "{bad:?}");
+        }
+        let channel = |helo: &str| Channel {
+            channel_id: "c1".into(),
+            name: "mail".into(),
+            kind: crate::alerts::model::ChannelKind::Email,
+            enabled: true,
+            config: serde_json::json!({
+                "host": "smtp.example.com", "from": "k@example.com",
+                "to": ["ops@example.com"], "helo": helo,
+            }),
+            secrets: serde_json::json!({}),
+            state: "ok".into(),
+            consecutive_failures: 0,
+            failed_since: None,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: None,
+            last_error: None,
+            created_at: 0,
+            created_by: String::new(),
+            updated_at: 0,
+            updated_by: String::new(),
+        };
+        assert_eq!(
+            smtp_config(&channel("mon.example.com")).unwrap().helo,
+            "mon.example.com"
+        );
+        assert!(smtp_config(&channel("x\r\nRSET")).is_err());
+        assert!(smtp_config(&channel("x y")).is_err());
     }
 }

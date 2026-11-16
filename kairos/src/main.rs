@@ -1855,6 +1855,45 @@ Max open files            1024                 524288               files     \n
         assert!(unit.lines().any(|l| l.trim() == "Restart=on-failure"));
     }
 
+    #[test]
+    fn crl_unit_does_not_copy_a_service_account_file_as_root() {
+        // 安全稽核 N16：以 root（「+」前綴）執行的部署步驟不用 install／cp 直接複製 CA 帳號目錄中的
+        // 檔案（會跟隨符號連結），而是經 openssl crl 解析後輸出；其餘的 root 步驟只操作 /opt/kairos 下
+        // 的絕對路徑
+        let unit = include_str!("../packaging/kairos-crl.service");
+        let root_steps: Vec<Vec<&str>> = unit
+            .lines()
+            .filter_map(|l| l.strip_prefix("ExecStartPost=+"))
+            .map(|l| l.split_whitespace().collect())
+            .collect();
+        assert_eq!(root_steps.len(), 4, "{root_steps:?}");
+        for step in &root_steps {
+            let program = step[0].rsplit('/').next().unwrap();
+            assert!(
+                !matches!(program, "install" | "cp" | "cat" | "sh" | "bash"),
+                "{step:?}"
+            );
+            let relative: Vec<&&str> = step[1..]
+                .iter()
+                .filter(|a| !a.starts_with('-') && !a.starts_with('/') && **a != "agents.crl")
+                .filter(|a| !matches!(**a, "crl" | "644" | "root:kairos"))
+                .collect();
+            assert!(relative.is_empty(), "{step:?}");
+        }
+        // 讀取來源的只有 openssl crl（解析失敗就不輸出，後面的步驟不執行）
+        let readers: Vec<&Vec<&str>> = root_steps
+            .iter()
+            .filter(|s| s.contains(&"agents.crl"))
+            .collect();
+        assert_eq!(readers.len(), 1, "{readers:?}");
+        assert!(readers[0][0].ends_with("/openssl") && readers[0][1] == "crl");
+        assert_eq!(
+            readers[0].last(),
+            Some(&"/opt/kairos/agents.crl.new"),
+            "{readers:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_refuses_unauthenticated_non_loopback_listen() {
         // S1：未啟用 mTLS 又監聽非 loopback 位址時拒絕啟動，且在建立資料目錄與監聽之前

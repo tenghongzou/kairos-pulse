@@ -21,7 +21,7 @@ use crate::alerts::engine::ActionError;
 use crate::alerts::model::{
     Category, Channel, ChannelKind, NotifyPolicy, Rule, Scope, Severity, SilenceKind,
 };
-use crate::alerts::notify::transport::{CODE_CHANNEL_CONFIG, parse_url, valid_address};
+use crate::alerts::notify::transport::{CODE_CHANNEL_CONFIG, parse_url, valid_address, valid_helo};
 use crate::alerts::ops::{self, SilenceInput};
 use crate::alerts::rules::{self, CODE_RULE_INVALID, kind};
 use crate::alerts::secrets::{masked, scrub};
@@ -1806,6 +1806,17 @@ pub fn validate_channel(
                     "security 必須是 starttls、tls 或 none".into(),
                 ));
             }
+            // 安全稽核 E4：helo 會原樣放進 `EHLO <helo>` 這一行，不可含換行、空白或控制字元
+            if cfg.get("helo").is_some_and(|v| {
+                !v.as_str()
+                    .is_some_and(|h| h.trim().is_empty() || valid_helo(h.trim()))
+            }) {
+                return Err(bad(
+                    "config.helo",
+                    "helo 必須是主機名稱或位址（英數字、「.」「-」「:」與方括號，最多 255 個字元）"
+                        .into(),
+                ));
+            }
             if !valid_address(s("from")) {
                 return Err(bad("config.from", "寄件者（from）的格式不正確".into()));
             }
@@ -2387,6 +2398,34 @@ async fn test_channel(
             json!({ "severity": severity, "code": o.code }),
         )
         .await;
+    } else {
+        // 未儲存的管道沒有發送紀錄，但仍然會真的連出去：寫稽核，留下「誰測了哪個目的地」
+        // （安全稽核 E3；只記主機與連接埠，不記路徑、查詢字串與秘密）
+        let destination = match ch.kind {
+            ChannelKind::Email => format!(
+                "{}:{}",
+                ch.config["host"].as_str().unwrap_or_default(),
+                ch.config["port"]
+            ),
+            ChannelKind::Webhook => ch.secrets["url"]
+                .as_str()
+                .and_then(|u| crate::alerts::notify::transport::parse_url(u.trim(), true).ok())
+                .map(|t| format!("{}:{}", t.host, t.port))
+                .unwrap_or_default(),
+        };
+        c.audit(
+            "channel.test",
+            None,
+            if o.ok { "ok" } else { "failed" },
+            json!({
+                "severity": severity,
+                "code": o.code,
+                "unsaved": true,
+                "kind": ch.kind,
+                "destination": destination,
+            }),
+        )
+        .await;
     }
     let _ = c.api;
     Ok(http::ok(
@@ -2527,5 +2566,19 @@ mod tests {
             )
             .is_err()
         );
+        // 安全稽核 E4：helo 不可含換行、空白或其他符號
+        let mail = |helo: Value| {
+            validate_channel(
+                ChannelKind::Email,
+                &json!({"host": "h", "from": "a@b.c", "to": ["a@b.c"], "helo": helo}),
+                &json!({}),
+            )
+        };
+        assert!(mail(json!("mon.example.com")).is_ok());
+        assert!(mail(json!("")).is_ok(), "空字串＝使用預設值");
+        for bad in [json!("a\r\nRSET"), json!("a b"), json!("a\nb"), json!(5)] {
+            let e = mail(bad.clone()).unwrap_err();
+            assert_eq!(e.details.unwrap()["parameter"], "config.helo", "{bad}");
+        }
     }
 }

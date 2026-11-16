@@ -899,7 +899,7 @@ kp-build（PVE VM，4 vCPU、約 4 GB RAM、本機虛擬磁碟，Ubuntu）2026-1
 | `POST /api/v1/pki/crl` | `PkiQueue` | 上傳 CRL（DER 或 PEM，base64）：S15 的四項檢查，第 1～3 項不過 400（`KRS-E1206`）；撤銷筆數較少時需 `confirm`（L3） |
 | `GET /api/v1/pki/signing-queue` | `read` | 已核准、待簽發的申請（離線模式） |
 | `GET /api/v1/pki/signing-queue/export` | `PkiQueue` | `kairos-csr-queue/v1` 檔案（`PKI.md` 第 6 節） |
-| `POST /api/v1/pki/signing-queue/import` | `PkiQueue` | 匯入 `kairos-signed-certs/v1`；逐張結果（`issued`／`rejected` 與原因） |
+| `POST /api/v1/pki/signing-queue/import` | `PkiQueue` | 匯入 `kairos-signed-certs/v1`；逐張結果（`issued`／`rejected` 與原因）。一次最多 10,000 張，超過時 400（`body`），請分批匯入（CLI 的匯入相同） |
 | `POST /api/v1/pki/certificates/import` | `PkiQueue` | （0.9.0〔草稿〕）手動簽發（外部 CA）的既有憑證匯入簽發紀錄，見第 15.1 節 |
 | `GET /api/v1/pki/revocations/export` | `PkiQueue` | `kairos-revocations/v1`（離線產生 CRL 用） |
 
@@ -1142,7 +1142,7 @@ kairos pki sign --profile server|issuing-ca|client --ca-cert <檔案> --ca-key <
 | `PUT /api/v1/directory/mappings` | `directory:write` | `mappings: [{"group_dn": "CN=IT-Ops,OU=Groups,…", "role": "operator@group:B廠產線"}]` 取代全部（L1）；DN 以小寫、去除 `,`／`=` 前後空白比對 |
 | `POST /api/v1/directory/test` | `directory:write` | 「以帳號測試登入」：`username`、`password`，回這個帳號的 DN、群組與會得到的角色（`ok: true`），或錯誤的 `product_code`、`reason`、`detail`（給管理員看的細節）；不建立工作階段。失敗計入來源的失敗額度 |
 
-- **驗證流程**：連線（LDAPS 或 `ldap://`＋StartTLS；**一律驗證伺服器憑證鏈與名稱**，只信任 `ldap.ca_file` 中的 CA，不使用系統的信任清單、沒有略過驗證的選項）→ 以服務帳號 bind（`ldap.bind_dn`＋`ldap.bind_password_file`；沒有設定時匿名）→ 在 `ldap.user_base` 以 `(&<user_filter>(<login_attribute>=<帳號>))` 搜尋（帳號依 RFC 4515 跳脫）→ 搜尋結果必須恰好一筆 → 以該 DN 與輸入的密碼 bind → 讀取 `ldap.group_attribute`（AD 為 `memberOf`）。**空密碼一律拒絕**（LDAP 以空密碼 bind 會成為匿名 bind 而回成功）。主要伺服器連不上（或憑證問題）時依序改試 `ldap.fallback_urls`。
+- **驗證流程**：連線（LDAPS 或 `ldap://`＋StartTLS；**一律驗證伺服器憑證鏈與名稱**，只信任 `ldap.ca_file` 中的 CA，不使用系統的信任清單、沒有略過驗證的選項）→ 以服務帳號 bind（`ldap.bind_dn`＋`ldap.bind_password_file`；沒有設定時匿名）→ 在 `ldap.user_base` 以 `(&<user_filter>(<login_attribute>=<帳號>))` 搜尋（帳號依 RFC 4515 跳脫）→ 搜尋結果必須恰好一筆 → 以該 DN 與輸入的密碼 bind → 讀取 `ldap.group_attribute`（AD 為 `memberOf`）。**空密碼一律拒絕**（LDAP 以空密碼 bind 會成為匿名 bind 而回成功）。**`ldap.group_attribute` 必須是使用者自己改不了的屬性**（AD 的 `memberOf` 由目錄維護；設成使用者可自行修改的屬性等於讓人自行升權）。Kairos 以帳號字串對應身分：目錄中把舊帳號名稱重新發給另一個人之前，請先在 Kairos 刪除該使用者（否則新的人會繼承舊帳號在 Kairos 的個人角色、TOTP 與 token）；目錄端停用帳號不會即時反映到已登入的工作階段與 token，要立即生效請在 Kairos 停用該使用者（安全稽核 N10）。主要伺服器連不上（或憑證問題）時依序改試 `ldap.fallback_urls`。
 - **未加密**：`ldap://` 沒有 StartTLS 時拒絕啟動，除非 `ldap.allow_plaintext = true`（設計包 S17：需要管理員明確確認；密碼會以明文經過網路）。
 - **權限**：個人指派＋所屬群組的對應；群組在登入時讀取並保存在工作階段中（AD 的群組異動在下次登入或工作階段逾時後生效，見第 12.11 節）。
 - 純 Rust 實作：`ldap3` 0.12（`tls-rustls-ring`，與其他連接埠共用 rustls 0.23＋ring），`cargo deny` 通過。
@@ -1382,13 +1382,15 @@ GET /api/v1/alerts?view=active&severity=emergency,critical&limit=100
 
 | `kind` | `config` | `secrets` |
 |---|---|---|
-| `email` | `host`、`port`、`security`（`starttls`／`tls`／`none`）、`username`、`from`、`to[]`（1～50）、`helo` | `password` |
+| `email` | `host`、`port`、`security`（`starttls`／`tls`／`none`）、`username`、`from`、`to[]`（1～50）、`helo`（`EHLO` 的名稱，預設 `kairos`；只接受英數字與 `.`、`-`、`:`、方括號，最多 255 個字元，否則 `400 channel_invalid`） | `password` |
 | `webhook` | `format`（`kairos`／`slack`／`teams`／`line`）、`method`（`POST`／`PUT`）、`allow_http`、`line_to` | `url`、`headers`（物件）、`hmac_secret`、`line_token` |
 | 共用 | `timeout_secs`（1～60，預設 10）、`timezone`、`show_ip`（`full`／`subnet`／`none`）、`min_severity`、`notify_ack`、`ca_file` | |
 
 回應的 `secrets` 只有遮蔽值（`url` 為 `https://主機/…`，其餘 `••••`）。`PUT` 時沒有提供的機密欄位沿用原本的值、值為 `null` 時刪除；**目的地改變時**（SMTP 的 `host`／`port`／`security`、Webhook 實際送出的網址或 LINE 格式的切換、`ca_file`）會被送到目的地的機密（`password`、`headers`、`line_token`）不能沿用，必須在同一次請求重新提供或以 `null` 清除，否則 `400 channel_secret_required`（`details.parameter`：`secrets.<欄位>`，`details.reason`：`destination_changed`；`kairos/ALERTS.md` 第 6 節「目的地改變時機密不沿用」，0.12.0 起）。列表與詳情另有 `state`（`ok`／`failed`／`secrets_unavailable`／`disabled`；`secrets_unavailable`〔0.7〕：機密無法解開——資料目錄的 `alerts-secrets.key` 遺失或與資料庫不成對——`last_error_code` 為 `KRS-E5110`，不會嘗試發送，「通知管道失敗」系統規則以 `KRS-E5110` 開事件；還原金鑰檔並重新啟動，或重新輸入全部機密後恢復）、`consecutive_failures`、`failed_since`、`last_attempt_at`、`last_success_at`、`last_error_code`、`last_error`（已移除機密）、`rules_using`；詳情另有 `rules[]` 與最近 20 筆 `deliveries`。
 
 `POST /api/v1/channels/{id}/test`（`severity`，預設 `emergency`）：以真實範本與假資料送出，回 `ok`、`product_code`、`message`、`response_code`、`elapsed_ms`，並記在發送紀錄。
+
+**目的地沒有位址限制（安全稽核 E3）**：通知管道與 OTLP 匯出常見的目的地就是內部網路（內部的 SMTP、聊天閘道、collector），所以 Kairos 不限制 loopback、私有網段或連結本機位址——有 `channels:write`／`export:write` 的人（預設只有管理員）可以讓 Kairos 對它連得到的任何位址送出通知格式的請求。Kairos 不跟隨重新導向、2xx 的回應本文不回顯（非 2xx 回顯前 300 字）。需要限制時請在 Kairos 主機的對外防火牆處理。測試都會寫稽核（`channel.test`）；未儲存管道的測試另記 `unsaved: true`、`kind` 與 `destination`（只有主機與連接埠）。
 
 **限速（0.7）**：測試通知會真的送到值班群組或信箱。同一個管道 60 秒內最多 3 次（不分使用者）、同一個使用者 10 分鐘內最多 10 次（不分管道，含 `POST /api/v1/channels/test` 的未儲存管道）。超過時回 429 `rate_limited`（`KRS-W5111`）、`Retry-After`，`details`：`scope`（`channel`／`user`）、`limit`、`window_secs`；不送出、不寫發送紀錄。計數只在記憶體中（重新啟動後歸零）。
 

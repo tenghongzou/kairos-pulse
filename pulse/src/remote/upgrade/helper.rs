@@ -2673,7 +2673,8 @@ impl<'a> Helper<'a> {
                         last = format!("service_{}", s.active);
                         false
                     } else {
-                        match crate::status_file::read(&status_path) {
+                        // 狀態檔由服務帳號寫入，這裡是 root：不跟隨連結、只讀一般檔案、有大小上限（安全稽核 A4）
+                        match crate::status_file::read_untrusted(&status_path) {
                             Ok(f) => {
                                 let acked_after = f
                                     .reporting

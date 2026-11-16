@@ -39,8 +39,13 @@ ExecStart=/bin/mv -f agents.crl.new agents.crl
 #    Kairos 在下一個重載週期（server.reload_interval_secs，預設 30 秒）自動載入，不需重新啟動。
 #
 # (a) CA 與 Kairos 在同一台主機（CA 私鑰放在伺服器上，風險較高，見 INSTALL 第 6 節）：
-#     以 root 執行部署步驟（「+」前綴）；先寫暫存檔再 mv，Kairos 不會讀到寫一半的檔案
-ExecStartPost=+/usr/bin/install -o root -g kairos -m 644 agents.crl /opt/kairos/agents.crl.new
+#     以 root 執行部署步驟（「+」前綴）；先寫暫存檔再 mv，Kairos 不會讀到寫一半的檔案。
+#     來源 agents.crl 在 CA 帳號可寫的目錄中，所以 root 不直接複製它（複製會跟隨符號連結，把任意
+#     檔案的內容放到 kairos 讀得到的位置）：改由 openssl 解析後重新輸出，只有合法的 CRL 才會被寫出
+#     （安全稽核 N16）。目的地 /opt/kairos 必須是 root 擁有、kairos 不可寫的目錄（INSTALL 第 4 節）
+ExecStartPost=+/usr/bin/openssl crl -in agents.crl -out /opt/kairos/agents.crl.new
+ExecStartPost=+/bin/chown root:kairos /opt/kairos/agents.crl.new
+ExecStartPost=+/bin/chmod 644 /opt/kairos/agents.crl.new
 ExecStartPost=+/bin/mv -f /opt/kairos/agents.crl.new /opt/kairos/agents.crl
 #
 # (b) CA 在另一台管理主機：以 scp 傳到 Kairos 主機上「部署帳號可寫、kairos 群組可讀」的目錄，
