@@ -1154,7 +1154,7 @@ repair_package() {
         hx rpm rpm -U --replacepkgs --oldpackage "/root/repair/$rp" >"$LOGS/$1-$2-repair.log" 2>&1 ||
             fail "$1/$2：修復時 rpm -U 失敗（$LOGS/$1-$2-repair.log）"
     fi
-    check "$1/$2：修復後套件資料庫只有 $3" "$(pkg_versions "$2")" "^$rp_re-1( ii)? \$"
+    check "$1/$2：修復後套件資料庫只有 $3" "$(pkg_versions "$2")" "^$rp_re-1( ii ?)? \$"
     check "$1/$2：修復後以 archive-current 封存目前的版本" \
         "$(hx "$2" sh -c "/opt/pulse/pulse upgrade archive-current --package /root/repair/$rp --sums /root/repair/SHA256SUMS --signature /root/repair/SHA256SUMS.sig 2>&1; echo \" exit=\$?\"" | tr '\n' ' ')" \
         ' exit=0'
