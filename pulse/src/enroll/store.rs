@@ -738,7 +738,11 @@ mod tests {
             matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
             "{err:?}"
         );
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "不應寫到連結目標");
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            0,
+            "不應寫到連結目標"
+        );
 
         // 真正的目錄：寫入成功、權限正確、沒有殘留的暫存檔；既有的同名符號連結被取代而不是被跟隨
         let real = base.join("real");
