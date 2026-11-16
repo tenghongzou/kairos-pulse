@@ -194,6 +194,7 @@ CLI 需要停止 Kairos 的原因：執行中的 Kairos 在記憶體中有這台
 | `KRS-E4205` | 錯誤 | 無法刪除主機資料：主機仍連線中（409 `host_online`）、刪除沒有完成（503）、找不到資料（CLI） |
 | `KRS-E4005` | 錯誤 | 要求假名化（`pseudonymize`）但 `data/privacy.key` 無法建立或讀取，Kairos 不啟動 |
 | `KRS-W2012` | 警告 | `enroll.download_dir` 不完整（缺 `pulse-install.sh`、`SHA256SUMS` 或 `SHA256SUMS.sig`），S12 不顯示一行安裝指令（只對管理員顯示） |
+| `KRS-W2013` | 警告 | `enroll.download_dir` 的安裝腳本與同目錄 `SHA256SUMS` 不符，S12 不顯示一行安裝指令（只對管理員顯示；工程暫定號，0.12.0 與 `KRS-W2012` 共用） |
 
 既有代碼：Kairos 執行中時 `kairos hosts purge` 以 `KRS-E4304`（資料庫正在使用中）拒絕。號碼依設計包 `copywriting.md` §3.2 的子類別（40 資料目錄、42 保留與清除）選用尚未被 Kairos 與 Pulse 佔用的號碼。
 

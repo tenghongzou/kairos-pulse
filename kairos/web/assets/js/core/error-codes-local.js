@@ -5,9 +5,19 @@
 // 找不到才查這裡。設計包收錄後：重新執行 sync-design.mjs（它會列出這裡已經可以刪除的代碼），再把條目刪掉。
 // 設計包已收錄、但說明需要補充的代碼放在檔案後半的 LOCAL_ERROR_CODE_SUPPLEMENTS。
 //
+// - KRS-W2013：下載目錄的安裝腳本與 SHA256SUMS 不符（0.12.0 與缺檔共用 KRS-W2012）。**暫定號**，正式分配與
+//   三段式由設計包定案。
 // - KRS-W8417：版本庫的檔案遺失。ADR-0002 決策點 7／U10（2026-11-13 核定）：照工程的號碼正式採用；
 //   三段式是 ADR 的草稿，最終文案由設計包定案。
 export const LOCAL_ERROR_CODES = {
+  'KRS-W2013': {
+    level: 'W',
+    text: '設定了下載目錄（`enroll.download_dir`），三個必要的檔案都在，但安裝腳本沒有通過檢查：`pulse-install.sh` 與同目錄 `SHA256SUMS` 記錄的雜湊不符，或不是一般檔案、超過 4 MiB、讀不到。Kairos 照常啟動，主控台的 `downloads.available` 為 `false`、`product_code` 為此碼，S12 不顯示一行安裝指令（只對管理員顯示這則警告）；啟動時記一次。0.12.0 與缺檔共用 `KRS-W2012`。暫定號。安全稽核 C3',
+    title: '不顯示一行安裝指令：安裝腳本與 SHA256SUMS 不符',
+    reason: '下載目錄裡的 `pulse-install.sh` 與同一個目錄的 `SHA256SUMS` 記錄的雜湊不同：腳本被修改過，或目錄裡混了不同發佈版本的檔案。一行安裝指令會以 root 執行這個腳本，所以 Kairos 不提供指令；8444 的下載端點與 `pulse enroll` 不受影響。',
+    fix: '1. 取得同一個發佈版本的 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 與套件，一起重新放進 `enroll.download_dir`（不需要重新啟動 Kairos）。
+2. 確認這個目錄只有管理者可寫（`kairos/PKI.md` 第 17 節）；腳本不是自己換的時，先查明是誰改的。',
+  },
   'KRS-W8417': {
     level: 'W',
     text: '版本庫的檔案遺失：資料庫記錄已存入的發佈檔不存在或大小與記錄不符（`file_problem`：`missing`／`size_mismatch`）。子類別 84（遠端升級），只有 Kairos 端、不鏡像；「不存在」與「大小不符」同號。系統健康的「遠端管理」、Pulse 版本庫、資格預覽的 `artifact_missing`、核准時的 409 `artifact_missing`、推送中等待檔案的主機。0.10。ADR-0002 決策點 7',

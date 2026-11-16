@@ -44,8 +44,11 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(15);
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
 /// 讀檔的區塊大小
 const CHUNK: usize = 64 * 1024;
-/// 下載目錄不完整的代碼
+/// 下載目錄不完整（無法讀取，或缺 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig`）的代碼
 pub const CODE_INCOMPLETE: &str = "KRS-W2012";
+/// 三個檔案都在，但安裝腳本沒有通過檢查（與同目錄 `SHA256SUMS` 記錄的雜湊不符、不是一般檔案、超過大小上限
+/// 或讀不到）的代碼。**工程暫定號**（0.12.0 與缺檔共用 `KRS-W2012`；正式分配由設計包定案）
+pub const CODE_SCRIPT_MISMATCH: &str = "KRS-W2013";
 
 /// 副檔名 → `Content-Type`
 pub fn content_type(name: &str) -> &'static str {
@@ -133,6 +136,8 @@ pub struct Status {
     pub available: bool,
     /// 不可用的原因（給管理者）
     pub reason: Option<String>,
+    /// 設定了目錄卻不可用時的產品代碼（[`CODE_INCOMPLETE`]、[`CODE_SCRIPT_MISMATCH`]）；沒有設定目錄或可用時 `None`
+    pub code: Option<&'static str>,
     /// 目錄中可下載的檔案（依名稱排序）
     pub files: Vec<String>,
     /// `pulse-install.sh` 的 SHA-256（可用時才有）
@@ -147,6 +152,7 @@ pub fn status(dir: Option<&Path>) -> Status {
             reason: Some(
                 "沒有設定 enroll.download_dir（下載端點未啟用，/agent/ 回 404）".to_string(),
             ),
+            code: None,
             files: Vec::new(),
             install_script_sha256: None,
         };
@@ -165,6 +171,7 @@ pub fn status(dir: Option<&Path>) -> Status {
                     "無法讀取 enroll.download_dir（{}）：{e}",
                     dir.display()
                 )),
+                code: Some(CODE_INCOMPLETE),
                 files: Vec::new(),
                 install_script_sha256: None,
             };
@@ -184,6 +191,7 @@ pub fn status(dir: Option<&Path>) -> Status {
                 dir.display(),
                 missing.join("、")
             )),
+            code: Some(CODE_INCOMPLETE),
             files,
             install_script_sha256: None,
         };
@@ -192,12 +200,14 @@ pub fn status(dir: Option<&Path>) -> Status {
         Ok(hash) => Status {
             available: true,
             reason: None,
+            code: None,
             files,
             install_script_sha256: Some(hash),
         },
         Err(why) => Status {
             available: false,
             reason: Some(format!("enroll.download_dir（{}）：{why}", dir.display())),
+            code: Some(CODE_SCRIPT_MISMATCH),
             files,
             install_script_sha256: None,
         },
@@ -240,7 +250,7 @@ pub fn status_json(dir: Option<&Path>, base_url: &str) -> Value {
     json!({
         "available": s.available,
         "reason": s.reason,
-        "product_code": (dir.is_some() && !s.available).then_some(CODE_INCOMPLETE),
+        "product_code": s.code,
         "base_url": s.available.then(|| base_url.to_string()),
         "install_script": s.available.then(|| format!("{base_url}/{SCRIPT}")),
         "install_script_sha256": s.install_script_sha256,
@@ -393,7 +403,9 @@ mod tests {
     #[test]
     fn status_requires_the_signed_checksums_and_the_script() {
         let s = status(None);
+        assert_eq!(s.code, None, "沒有設定下載目錄不是警告");
         assert!(!s.available && s.reason.unwrap().contains("enroll.download_dir"));
+        assert!(status_json(None, "https://k:8444/agent")["product_code"].is_null());
         let d = dir("status");
         std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\n").unwrap();
         std::fs::write(d.join(".hidden"), "x").unwrap();
@@ -408,6 +420,12 @@ mod tests {
             "{s:?}"
         );
         assert_eq!(s.files, ["pulse-install.sh"], "隱藏檔與子目錄不列出");
+        // 缺檔是 KRS-W2012
+        assert_eq!(s.code, Some(CODE_INCOMPLETE));
+        assert_eq!(
+            status_json(Some(&d), "https://k:8444/agent")["product_code"],
+            "KRS-W2012"
+        );
         let hash = kairos_proto::enroll::sha256_hex(b"#!/bin/sh\n");
         std::fs::write(
             d.join("SHA256SUMS"),
@@ -422,6 +440,7 @@ mod tests {
         assert_eq!(v["available"], true);
         assert_eq!(v["install_script"], "https://k:8444/agent/pulse-install.sh");
         assert_eq!(v["files"].as_array().unwrap().len(), 3);
+        assert!(v["product_code"].is_null(), "可用時沒有代碼");
         // 安全稽核 C3：一行安裝指令要帶的腳本雜湊
         assert_eq!(v["install_script_sha256"], hash.as_str());
         let _ = std::fs::remove_dir_all(&d);
@@ -441,8 +460,11 @@ mod tests {
         let s = status(Some(&d));
         assert!(!s.available, "{s:?}");
         assert!(s.reason.as_ref().unwrap().contains("SHA256SUMS"), "{s:?}");
+        // 「不相符」有自己的代碼，不再與缺檔共用 KRS-W2012
+        assert_eq!(s.code, Some(CODE_SCRIPT_MISMATCH));
         let v = status_json(Some(&d), "https://k:8444/agent");
         assert_eq!(v["available"], false);
+        assert_eq!(v["product_code"], "KRS-W2013");
         assert!(v["base_url"].is_null() && v["install_script_sha256"].is_null());
         // SHA256SUMS 沒有列出腳本（舊的發佈包）：以實際內容的雜湊為準
         std::fs::write(d.join("SHA256SUMS"), "x  other\n").unwrap();
@@ -460,7 +482,10 @@ mod tests {
             std::fs::remove_file(d.join("pulse-install.sh")).unwrap();
             std::fs::write(d.join("real.sh"), "#!/bin/sh\n").unwrap();
             std::os::unix::fs::symlink(d.join("real.sh"), d.join("pulse-install.sh")).unwrap();
-            assert!(!status(Some(&d)).available);
+            let s = status(Some(&d));
+            assert!(!s.available);
+            // 符號連結不算目錄中的檔案：歸在缺檔
+            assert_eq!(s.code, Some(CODE_INCOMPLETE), "{s:?}");
         }
         let _ = std::fs::remove_dir_all(&d);
     }

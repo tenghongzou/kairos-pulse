@@ -346,7 +346,7 @@ impl EnrollService {
             } else {
                 warn!(
                     "警告 {}：{}",
-                    downloads::CODE_INCOMPLETE,
+                    st.code.unwrap_or(downloads::CODE_INCOMPLETE),
                     st.reason.unwrap_or_default()
                 );
             }
