@@ -336,13 +336,23 @@ impl EnrollService {
         });
         svc.refresh_revoked_external(now);
         if let Some(dir) = svc.download_dir() {
-            let st = downloads::status(Some(&dir));
+            let st = downloads::status(Some(&dir), &svc.download_trust(true), now / 1000);
             if st.available {
                 info!(
                     "下載端點 /agent/：{}（{} 個檔案）",
                     dir.display(),
                     st.files.len()
                 );
+                match &st.signature {
+                    downloads::SignatureState::Verified { fingerprint, .. } => info!(
+                        "下載目錄的 SHA256SUMS.sig 已通過 [remote] allowed_signers 的驗證（簽署金鑰 {fingerprint}）"
+                    ),
+                    _ => {
+                        if let Some(w) = &st.warning {
+                            warn!("{w}");
+                        }
+                    }
+                }
             } else {
                 warn!(
                     "警告 {}：{}",
@@ -513,8 +523,28 @@ impl EnrollService {
             .unwrap_or_else(|_| self.enroll_endpoint());
         downloads::status_json(
             self.download_dir().as_deref(),
+            &self.download_trust(false),
+            self.now_ms() / 1000,
             &format!("https://{endpoint}/agent"),
         )
+    }
+
+    /// 驗證下載目錄的簽章所用的信任設定：`[remote] allowed_signers`（與匯入版本庫用的是同一份；安全稽核 C3
+    /// 加強）。每次查詢重新讀取（換掉檔案不需要重新啟動）；`log_rejected`：把不能用的行記成 WARN（只在啟動時）
+    fn download_trust(&self, log_rejected: bool) -> downloads::SignerTrust {
+        let remote = &self.config.remote;
+        let Some(path) = remote.allowed_signers_path(&self.data_dir) else {
+            return downloads::SignerTrust::NotConfigured;
+        };
+        let read = if log_rejected {
+            crate::remote::releases::load_trust(&path, remote.principals())
+        } else {
+            crate::remote::releases::read_trust(&path, remote.principals())
+        };
+        match read {
+            Ok(t) => downloads::SignerTrust::Configured(t),
+            Err(e) => downloads::SignerTrust::Unavailable(e),
+        }
     }
 
     /// 這張（外部 CA 簽發、匯入的）憑證是否已撤銷：8443 在 hello 時拒絕（PKI.md 第 16 節）

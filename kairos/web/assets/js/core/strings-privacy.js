@@ -52,10 +52,13 @@ export const PRIVACY_STRINGS = {
   'token.done.commandDownloadHint':
     'kairos-ca.pem 是 Kairos 的根 CA（pki.server_ca_path），allowed_signers 是發佈公鑰；兩者都請從另一個管道取得，不要和套件從同一處下載。指令會先比對安裝腳本的 SHA-256，相符才執行；請從這裡複製整行指令，不要省略比對的部分。',
   'token.done.commandManual': '已先以安裝套件（MSI、deb、rpm）安裝 Pulse 時，改為執行：',
-  // KRS-W2012（設定了下載目錄但缺檔）、KRS-W2013（安裝腳本與 SHA256SUMS 不符；工程暫定號）：只對管理員顯示
+  // KRS-W2012（設定了下載目錄但缺檔）、KRS-W2013（安裝腳本與 SHA256SUMS 不符；工程暫定號）、KRS-W2014
+  // （SHA256SUMS.sig 沒有通過 [remote] allowed_signers 的驗證；工程暫定號）：只對管理員顯示
   // （維運者無法處理下載目錄，D53 / §31.7 #9）
   'token.done.downloadsIncomplete': '不顯示一行安裝指令：enroll.download_dir 缺少 pulse-install.sh、SHA256SUMS 或 SHA256SUMS.sig',
   'token.done.downloadsScriptMismatch': '不顯示一行安裝指令：下載目錄的 pulse-install.sh 與 SHA256SUMS 不符',
+  'token.done.downloadsSignature': '不顯示一行安裝指令：下載目錄的 SHA256SUMS.sig 沒有通過發佈公鑰的驗證',
+  'token.done.signatureVerified': 'Kairos 已用發佈公鑰（remote.allowed_signers）驗證下載目錄的 SHA256SUMS.sig 與安裝腳本。',
   'token.done.downloadsIncompleteBody': '請把同一版發佈包的這三個檔案一起放進下載目錄。',
 
   // ---- S14 匯入憑證 ----

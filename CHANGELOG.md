@@ -52,6 +52,13 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 
 ## [Unreleased]
 
+### 安全
+
+- **設定了 `[remote] allowed_signers` 時，下載目錄的 `SHA256SUMS.sig` 通過驗證才顯示一行安裝指令**（安全稽核 C3 加強；Kairos）：0.12.0 的指令帶著安裝腳本的 SHA-256，並要求腳本與同目錄 `SHA256SUMS` 相符，但 `SHA256SUMS` 本身沒有人驗證——只能改寫 `enroll.download_dir` 的人換掉 `pulse-install.sh`、再把 `SHA256SUMS` 改成一致，主控台就會顯示帶著新雜湊的指令。現在 Kairos 以 `[remote] allowed_signers`（匯入 Pulse 版本庫時用的同一份發佈公鑰、同一段驗證程式）驗證下載目錄的 `SHA256SUMS.sig`，並要求簽章涵蓋的 `SHA256SUMS` 列出 `pulse-install.sh` 而且雜湊相符；通過才提供指令。沒有通過時主控台 API 的 `downloads.available` 為 `false`（沒有 `base_url`、`install_script`、`install_script_sha256`），`downloads.reason` 說明原因，`product_code` 為 `KRS-W2014`（工程暫定號），S12 不顯示指令、對管理員顯示警告；啟動時記同一則警告。`allowed_signers` 設定了卻讀不到時同樣不提供（不退回不驗證）。API 的 `downloads` 多三個欄位：`signature`（`verified`／`failed`／`not_checked`）、`signer`（簽署者與金鑰指紋）、`warning`。
+  - **沒有設定 `allowed_signers` 的既有部署行為不變**：照常顯示指令（`signature: "not_checked"`），只多一則啟動時的警告與 `downloads.warning`（主控台對管理員顯示）。建議設定。
+  - **有設定的部署要注意**：下載目錄必須是官方發佈包原本的 `SHA256SUMS`、`SHA256SUMS.sig` 與同一版的 `pulse-install.sh`，而且簽署金鑰列在 `allowed_signers`；自行重新簽署的發佈要把自己的公鑰加進去（必要時設定 `remote.extra_principals`）。目前的打包腳本會把 `pulse-install.sh` 列進 `SHA256SUMS`；`SHA256SUMS` 沒有列出腳本的發佈包（簽章對腳本沒有保證）在有設定時不會顯示指令，沒有設定時與 0.12.0 相同。
+  - 範圍與限制：只影響主控台與 API 是否提供指令；8444 的 `GET /agent/<檔名>` 照常提供檔案，目標主機上的腳本仍自行以發佈公鑰驗證套件。Kairos 本身被完全入侵，或同時能改寫下載目錄與 `allowed_signers` 時，這項檢查沒有幫助（`kairos/PKI.md` 第 17 節）。不需要改資料庫（schema 不變）。
+
 ### 變更
 
 - **下載目錄的安裝腳本與 `SHA256SUMS` 不符時改用專屬的代碼 `KRS-W2013`**（Kairos；0.12.0 安全稽核 C3 的後續待辦）：0.12.0 起 `enroll.download_dir` 的 `pulse-install.sh` 與同目錄 `SHA256SUMS` 記錄的雜湊不符（或不是一般檔案、超過 4 MiB）時不提供一行安裝指令，當時沿用缺檔的 `KRS-W2012`。現在兩種情況分開：缺檔或無法讀取目錄仍是 `KRS-W2012`，「不相符」是 `KRS-W2013`（啟動時的警告、主控台 API 的 `downloads.product_code`、S12 對管理員顯示的警告標題與說明）。行為不變，只有代碼與文案不同；以 `product_code == "KRS-W2012"` 判斷「下載目錄有問題」的腳本要改為同時接受 `KRS-W2013`（或改看 `downloads.available`）。**`KRS-W2013` 是工程暫定號**，正式分配與三段式文案由設計包定案。
@@ -61,6 +68,7 @@ Kairos 與 Pulse 混用版本時的相容性。「0.1.0」泛指 0.2.0 之前以
 | 代碼 | 意義 |
 |---|---|
 | `KRS-W2013`（暫定） | `enroll.download_dir` 的 `pulse-install.sh` 與同目錄 `SHA256SUMS` 不符（或不是一般檔案、超過大小上限），不提供一行安裝指令 |
+| `KRS-W2014`（暫定） | 設定了 `[remote] allowed_signers`，但 `enroll.download_dir` 的 `SHA256SUMS.sig` 沒有通過驗證（或簽章涵蓋的 `SHA256SUMS` 沒有列出安裝腳本、`allowed_signers` 無法使用），不提供一行安裝指令 |
 
 ## [0.12.0] - 2026-11-15
 

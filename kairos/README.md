@@ -469,7 +469,7 @@ Kairos 採用最嚴格的 CRL 檢查（fail closed），以安全性優先：
 | `privacy.process_command` | `KAIROS__PRIVACY__PROCESS_COMMAND` | `redact` | 行程排行的命令列：`keep`、`redact`（遮蔽密碼、token、帶帳密的網址）、`drop` |
 | `privacy.process_user` | `KAIROS__PRIVACY__PROCESS_USER` | `keep` | 行程的執行身分：`keep`、`pseudonymize`、`drop` |
 | `privacy.inventory_network` | `KAIROS__PRIVACY__INVENTORY_NETWORK` | `keep` | 資產的網路介面：`keep`、`truncate`（位址截到 /24、/48，MAC 只留廠商碼）、`drop` |
-| `enroll.download_dir` | `KAIROS__ENROLL__DOWNLOAD_DIR` | `""` | （0.9.0〔草稿〕）8444 的下載端點 `/agent/<檔名>` 提供的目錄（Pulse 的 `pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig`）；空字串＝不提供（ENROLL.md 第 19.4 節第 3 項） |
+| `enroll.download_dir` | `KAIROS__ENROLL__DOWNLOAD_DIR` | `""` | （0.9.0〔草稿〕）8444 的下載端點 `/agent/<檔名>` 提供的目錄（Pulse 的 `pulse-install.sh`、套件、`SHA256SUMS`、`SHA256SUMS.sig`）；空字串＝不提供（ENROLL.md 第 19.4 節第 3 項）。同時設定了 `remote.allowed_signers` 時，主控台只在這個目錄的 `SHA256SUMS.sig` 通過驗證後才顯示一行安裝指令（PKI.md 第 17 節） |
 | `cluster.node_id` | `KAIROS__CLUSTER__NODE_ID` | `""`（主機名稱的第一段，轉成小寫，其他字元改為 `-`） | 節點名稱（0.9.0）：協商了 feature `cluster` 的 Pulse 在 `hello_ack.server_node` 收到它，`pulse status` 顯示連到哪個節點。1～63 個字元的 `[a-z0-9-]`，不以 `-` 開頭或結尾，不合法時拒絕啟動。叢集模式下是節點在叢集中的名稱，必須唯一（兩台主機重複時後啟動的拒絕啟動，`KRS-E8503`） |
 | `cluster.enabled` | `KAIROS__CLUSTER__ENABLED` | `false` | （0.10.0〔草稿〕）叢集模式（高可用，階段 A：主動／備援；見「叢集模式」與 INSTALL 附錄 H）。需要 `storage.backend = "postgres"`，且不可同時設定 `storage.jsonl_mirror = true`（否則 `KRS-E0202`，結束代碼 3）。啟用後不自動建立金鑰檔：先在第一個節點執行 `kairos cluster init` |
 | `cluster.mode` | `KAIROS__CLUSTER__MODE` | `active_passive` | `active_passive`（主動／備援）。`active_active`（多主動連線層）尚未實作，`enabled = true` 時拒絕啟動 |
@@ -699,7 +699,7 @@ kairos config show --effective enroll pki.policy   # 生效值與來源（環境
 - 撤銷：Kairos 自己產生簽發 CA 的 CRL（`data/pki/crl/issuing.crl`，每 `pki.crl_refresh_hours` 小時與每次撤銷），8443 立即重新載入。新憑證第一次連線後舊憑證以 `superseded` 撤銷；主機自行除役（`pulse deregister`）時以 `cessationOfOperation` 撤銷。
 - 防護：8444 有連線、來源、token、agent、全域多層速率限制（`[enroll]` 的 L1～L10，`429` 附 `Retry-After`）、無效 token 的來源封鎖（寫入資料庫）、時鐘偏差檢查、待核准佇列上限；8444 在自己的 runtime 上執行，1 萬台規模的註冊尖峰下 report 的 `ack` p99 維持在數十毫秒（PKI.md 第 12 節）。
 - 主控台修改的 `enroll.mode`、`enroll.auto_pause_*`、`pki.policy.*` 存在資料庫、優先於 `kairos.toml`（環境變數最優先）；啟動時以 `INFO` 列出被覆寫的設定檔設定，`kairos config reset <設定鍵>` 改用設定檔的值。
-- 下載端點（0.9.0〔草稿〕）：設定 `enroll.download_dir` 後，8444 的 `/agent/<檔名>` 提供 Pulse 的發佈檔案，主控台的「建立 token」顯示一行安裝指令（`curl --cacert` 下載 `pulse-install.sh`，以 `--base-url https://<註冊端點>/agent --ca-file` 安裝；完整性仍以發佈公鑰驗證）。同時下載數受 `enroll.max_downloads_per_ip`／`max_downloads` 限制（L11，429）。沒有設定時回 404，Pulse 以安裝套件安裝後執行 `pulse enroll`。
+- 下載端點（0.9.0〔草稿〕）：設定 `enroll.download_dir` 後，8444 的 `/agent/<檔名>` 提供 Pulse 的發佈檔案，主控台的「建立 token」顯示一行安裝指令（`curl --cacert` 下載 `pulse-install.sh`，以 `--base-url https://<註冊端點>/agent --ca-file` 安裝；完整性仍以發佈公鑰驗證）。設定了 `[remote] allowed_signers` 時，Kairos 先以它驗證下載目錄的 `SHA256SUMS.sig` 與安裝腳本，通過才顯示指令（`KRS-W2014`；沒有設定時照常顯示並提出警告，PKI.md 第 17 節）。同時下載數受 `enroll.max_downloads_per_ip`／`max_downloads` 限制（L11，429）。沒有設定時回 404，Pulse 以安裝套件安裝後執行 `pulse enroll`。
 - 手動簽發的既有憑證（0.9.0〔草稿〕）：`kairos pki certificates import <檔案或目錄>` 或主控台「憑證 › 匯入憑證」加入簽發紀錄，之後可以在 S14 撤銷（PKI.md 第 16 節）。
 
 ## 個資保護（0.9.0〔草稿〕，商業審計 S6）

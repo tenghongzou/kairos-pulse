@@ -62,13 +62,8 @@ pub struct Trust {
 
 /// 讀取並解析 `allowed_signers`（大小上限 64 KiB）。不能用的行另記 WARN；沒有任何可用的行時錯誤
 pub fn load_trust(path: &Path, extra_principals: Vec<String>) -> Result<Trust, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("{}：{e}", path.display()))?;
-    if meta.len() > MAX_ALLOWED_SIGNERS_BYTES {
-        return Err(format!("{} 超過 64 KiB", path.display()));
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}：{e}", path.display()))?;
-    let signers = AllowedSigners::parse(&text);
-    for r in &signers.rejected {
+    let trust = read_trust(path, extra_principals)?;
+    for r in &trust.signers.rejected {
         log::warn!(
             "remote.allowed_signers {} 第 {} 行不使用：{}",
             path.display(),
@@ -76,6 +71,18 @@ pub fn load_trust(path: &Path, extra_principals: Vec<String>) -> Result<Trust, S
             r.reason
         );
     }
+    Ok(trust)
+}
+
+/// [`load_trust`] 不記日誌的部分：每次查詢都要重新讀取的呼叫端使用（主控台 API 的 `downloads`，
+/// `enroll::downloads`），不能用的行不重複記 WARN
+pub fn read_trust(path: &Path, extra_principals: Vec<String>) -> Result<Trust, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}：{e}", path.display()))?;
+    if meta.len() > MAX_ALLOWED_SIGNERS_BYTES {
+        return Err(format!("{} 超過 64 KiB", path.display()));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}：{e}", path.display()))?;
+    let signers = AllowedSigners::parse(&text);
     if !signers.has_usable_entry(release::RELEASE_NAMESPACE) {
         return Err(format!(
             "{} 沒有可用的 ssh-ed25519 金鑰（需要 namespaces=\"{}\"）",

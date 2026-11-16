@@ -149,6 +149,9 @@ export function registerPrivacy({ test, newPage, login, waitTitle, axe, shot, Fa
     assert.ok(cmd.includes(check), cmd);
     assert.ok(cmd.indexOf('pulse-install.sh &&') < cmd.indexOf(check), cmd);
     await page.getByText('指令會先比對安裝腳本的 SHA-256', { exact: false }).waitFor();
+    // 安全稽核 C3 加強：測試用的 Kairos 沒有設定 [remote] allowed_signers——指令照常顯示，管理員另外看到
+    // 「沒有驗證下載目錄的簽章」的警語（API 的 downloads.warning）
+    assert.match(await page.locator('#tk-one-sig').innerText(), /沒有設定 \[remote\] allowed_signers/);
     assert.match(cmd, /PULSE_INSTALL_STRING='pulse-enroll:v1:/);
     await page.getByText('已先以安裝套件（MSI、deb、rpm）安裝 Pulse 時，改為執行：').waitFor();
     await axe(page, 'S12 建立完成（一行安裝指令）');

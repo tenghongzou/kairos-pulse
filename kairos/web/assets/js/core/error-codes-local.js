@@ -7,6 +7,8 @@
 //
 // - KRS-W2013：下載目錄的安裝腳本與 SHA256SUMS 不符（0.12.0 與缺檔共用 KRS-W2012）。**暫定號**，正式分配與
 //   三段式由設計包定案。
+// - KRS-W2014：下載目錄的 SHA256SUMS.sig 沒有通過 [remote] allowed_signers 的驗證（安全稽核 C3 加強）。
+//   **暫定號**，正式分配與三段式由設計包定案。
 // - KRS-W8417：版本庫的檔案遺失。ADR-0002 決策點 7／U10（2026-11-13 核定）：照工程的號碼正式採用；
 //   三段式是 ADR 的草稿，最終文案由設計包定案。
 export const LOCAL_ERROR_CODES = {
@@ -17,6 +19,13 @@ export const LOCAL_ERROR_CODES = {
     reason: '下載目錄裡的 `pulse-install.sh` 與同一個目錄的 `SHA256SUMS` 記錄的雜湊不同：腳本被修改過，或目錄裡混了不同發佈版本的檔案。一行安裝指令會以 root 執行這個腳本，所以 Kairos 不提供指令；8444 的下載端點與 `pulse enroll` 不受影響。',
     fix: '1. 取得同一個發佈版本的 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 與套件，一起重新放進 `enroll.download_dir`（不需要重新啟動 Kairos）。
 2. 確認這個目錄只有管理者可寫（`kairos/PKI.md` 第 17 節）；腳本不是自己換的時，先查明是誰改的。',
+  },
+  'KRS-W2014': {
+    level: 'W',
+    text: '設定了下載目錄（`enroll.download_dir`）與 `[remote] allowed_signers`，但下載目錄的 `SHA256SUMS.sig` 沒有通過驗證：簽章與 `SHA256SUMS` 不符、簽署金鑰不在 `allowed_signers` 或已過期、簽章涵蓋的 `SHA256SUMS` 沒有列出 `pulse-install.sh` 或雜湊不符，或 `allowed_signers` 本身無法使用。Kairos 照常啟動，主控台的 `downloads.available` 為 `false`、`product_code` 為此碼、`signature` 為 `failed`，S12 不顯示一行安裝指令（只對管理員顯示這則警告）；啟動時記一次。沒有設定 `allowed_signers` 時不驗證、不會出現此碼。暫定號。安全稽核 C3',
+    title: '不顯示一行安裝指令：下載目錄的簽章沒有通過驗證',
+    reason: 'Kairos 以 `[remote] allowed_signers` 的發佈公鑰驗證下載目錄的 `SHA256SUMS.sig`，沒有通過：目錄裡的 `SHA256SUMS` 或簽章不是官方發佈包原本的檔案（被修改過，或混了不同版本），或簽署這次發佈的公鑰不在 `allowed_signers`。一行安裝指令會以 root 執行下載目錄裡的腳本，所以 Kairos 不提供指令；8444 的下載端點與 `pulse enroll` 不受影響。',
+    fix: '1. 取得同一個發佈版本的 `pulse-install.sh`、`SHA256SUMS`、`SHA256SUMS.sig` 與套件，一起重新放進 `enroll.download_dir`（不需要重新啟動 Kairos）。\n2. 發佈包沒有問題時，確認 `[remote] allowed_signers` 指向的檔案存在、Kairos 的服務帳號讀得到，而且列出了簽署這次發佈的公鑰（金鑰輪替後要加入新的公鑰）。\n3. 檔案不是自己換的時，先查明是誰改了下載目錄（`kairos/PKI.md` 第 17 節：目錄應該只有管理者可寫）。',
   },
   'KRS-W8417': {
     level: 'W',

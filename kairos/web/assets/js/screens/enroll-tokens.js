@@ -5,8 +5,9 @@
 // - 安裝指令：註冊端點不提供下載時（`downloads.available = false`，INTEGRATION §27.4 #3）隱藏 Linux 一行指令、
 //   MSI 下載與「下載指令檔」，改顯示「以安裝套件安裝後執行 pulse enroll --install-string …」。0.9 起設定了
 //   enroll.download_dir 時另顯示一行指令（curl 下載 pulse-install.sh，以 --base-url 指向 8444 的下載端點）；
-//   設定了但缺檔（downloads.product_code = KRS-W2012）或安裝腳本與 SHA256SUMS 不符（KRS-W2013）時的警告只對
-//   管理員顯示（維運者無法處理下載目錄）。
+//   設定了但缺檔（downloads.product_code = KRS-W2012）、安裝腳本與 SHA256SUMS 不符（KRS-W2013）或下載目錄的
+//   SHA256SUMS.sig 沒有通過 [remote] allowed_signers 的驗證（KRS-W2014）時的警告只對管理員顯示（維運者無法處理
+//   下載目錄）。沒有設定 allowed_signers 時照常顯示指令，另對管理員顯示 downloads.warning。
 // - 註冊端點不是開放（僅續簽、關閉）時，安裝字串與指令的「複製」停用，token 仍可建立（S12 模式提示）。
 // - 權限：建立、停用需要 enroll.tokens:write；自動核准需要 enroll.tokens:auto_approve（維運者看到停用的選項與原因）。
 // - 0.7.0 隱藏：「時鐘偏差暫不受理」與「排隊中」的主機清單（只有計數，沒有清單 API）、「已簽發未上線」的主機清單、
@@ -31,6 +32,7 @@ const EXPIRY_DAYS = [1, 7, 30, 90];
 const DOWNLOADS_PROBLEM_TITLES = {
   'KRS-W2012': 'token.done.downloadsIncomplete',
   'KRS-W2013': 'token.done.downloadsScriptMismatch',
+  'KRS-W2014': 'token.done.downloadsSignature',
 };
 
 function splitList(text) {
@@ -215,7 +217,8 @@ function showCreated(data, onCreated) {
   const cmd = install ? `pulse enroll --install-string '${install}'` : '';
   // 下載端點可用時（enroll.download_dir；API 的 downloads.base_url）另顯示一行安裝指令
   const dlBase = data.downloads && data.downloads.available ? data.downloads.base_url : null;
-  // 設定了下載目錄卻不可用時的代碼：KRS-W2012（缺檔）、KRS-W2013（安裝腳本與 SHA256SUMS 不符）
+  // 設定了下載目錄卻不可用時的代碼：KRS-W2012（缺檔）、KRS-W2013（安裝腳本與 SHA256SUMS 不符）、
+  // KRS-W2014（SHA256SUMS.sig 沒有通過 allowed_signers 的驗證）
   const downloadsProblem = data.downloads && !data.downloads.available && DOWNLOADS_PROBLEM_TITLES[data.downloads.product_code] ? data.downloads.product_code : null;
   // 指令帶著安裝腳本的 SHA-256（downloads.install_script_sha256），下載後先比對、相符才以 root 執行：
   // 驗證套件簽章的邏輯在腳本裡，腳本本身要靠這個雜湊。沒有雜湊（格式不對）時不顯示一行指令
@@ -251,9 +254,15 @@ function showCreated(data, onCreated) {
           h('p', { class: 'ds-field__label', id: 'tk-one-l' }, t('token.done.commandDownload')),
           h('p', { class: 'ds-field__hint' }, t('token.done.commandDownloadHint')),
           codeBlock(oneLiner, { labelledby: 'tk-one-l', copy: blocked ? null : () => oneLiner, copyLabel: t('token.done.copyCommand'), id: 'tk-oneliner' }),
+          // 下載目錄的簽章：已由 Kairos 驗證，或沒有設定 allowed_signers（警語只對管理員顯示）
+          data.downloads.signature === 'verified'
+            ? h('p', { class: 'ds-field__hint', id: 'tk-one-sig' }, t('token.done.signatureVerified'))
+            : data.downloads.warning && session.can('enroll.mode:write')
+              ? h('p', { class: 'ds-field__hint', id: 'tk-one-sig' }, data.downloads.warning)
+              : null,
         )
       : null,
-    // 設定了下載目錄但不可用（KRS-W2012、KRS-W2013）：只對管理員（enroll.mode:write，S21 註冊端點的設定）顯示；維運者只看到 pulse enroll
+    // 設定了下載目錄但不可用（KRS-W2012、KRS-W2013、KRS-W2014）：只對管理員（enroll.mode:write，S21 註冊端點的設定）顯示；維運者只看到 pulse enroll
     !oneLiner && downloadsProblem && session.can('enroll.mode:write')
       ? inlineAlert({ kind: 'warning', title: t(DOWNLOADS_PROBLEM_TITLES[downloadsProblem]), body: data.downloads.reason || t('token.done.downloadsIncompleteBody'), code: downloadsProblem })
       : null,

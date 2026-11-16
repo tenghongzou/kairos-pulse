@@ -234,7 +234,7 @@ node_lost_secs = 20           # 心跳超過這個時間的節點視為失聯（
 config_enabled = true         # 宣告 feature config（集中設定）
 upgrade_enabled = true        # 宣告 feature upgrade（遠端升級）
 releases_dir = "releases"     # Pulse 版本庫的發佈檔（相對路徑以資料目錄解析；0700）；kairos db backup 不含它
-allowed_signers = ""          # 匯入發佈版本時驗證簽章的信任錨（ssh-keygen 的 allowed_signers 格式，相對路徑以資料目錄解析）；空＝只檢查格式與雜湊（主控台警告），每台 Pulse 仍以本機的信任錨驗證
+allowed_signers = ""          # 匯入發佈版本時驗證簽章的信任錨（ssh-keygen 的 allowed_signers 格式，相對路徑以資料目錄解析）；空＝只檢查格式與雜湊（主控台警告），每台 Pulse 仍以本機的信任錨驗證。有設定時，主控台的一行安裝指令也要 enroll.download_dir 的 SHA256SUMS.sig 通過這份信任錨的驗證才顯示
 extra_principals = []         # 除 release@kairos-pulse 外另外接受的 principal（以自己的金鑰重新簽署時）
 max_concurrent_downloads = 100 # 同時經 8443 下載發佈檔的主機數，1..=10000；超過時回 rate_limited（retry_after_ms）
 max_release_bytes = 134217728 # 單一發佈檔的上限（bytes），1 MiB～128 MiB
